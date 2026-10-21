@@ -168,6 +168,11 @@ struct SqlColumn {
   // Empty: derived from type/precision/scale/temporal/binary as before (a
   // column created by an older build, an expression column, ENUM/SET).
   std::string declared;
+  // GENERATED ALWAYS AS (expr): the expression's text, "" for a plain column.
+  // VIRTUAL or STORED: both are held in the row here, worked out at every
+  // write, so a read is a plain read either way.
+  std::string generated;
+  bool generated_virtual = false;
 };
 
 // MariaDB's `Extra` for a column in SHOW COLUMNS / DESCRIBE / information_schema.
@@ -281,6 +286,13 @@ struct SqlForeignKey {
   std::string ref_column;
   std::string on_delete = "NO ACTION";
   std::string on_update = "NO ACTION";
+};
+
+// CHECK (expr): refused when expr is false for a row written (NULL passes, as in SQL).
+struct SqlCheck {
+  std::string name;
+  std::string expr;
+  bool column_level = false;   // `col INT CHECK (...)`: printed on the column's line
 };
 
 struct SqlProbeIndex {
@@ -1518,6 +1530,13 @@ struct SqlTable {
   mutable std::vector<ColumnStore> col_data;
   std::vector<SqlIndex> indices;
   std::vector<SqlForeignKey> foreign_keys;
+  std::vector<SqlCheck> checks;
+  // Generated columns or CHECKs: a row written is worked out and tried (apply_row_rules).
+  bool has_rules() const {
+    if (!checks.empty()) return true;
+    for (const auto& c : columns) if (!c.generated.empty()) return true;
+    return false;
+  }
   mutable std::shared_ptr<aios::hal::Mutex> probe_mu = std::make_shared<aios::hal::Mutex>();
   // The table's own statement lock: readers take it shared as they resolve
   // the table, a table-scoped write takes it exclusive (sql_database.cpp,
@@ -1986,6 +2005,11 @@ class SqlDatabase {
   // server-wide writer lock it holds is released, and its @variables go.
   void abandon_open_transaction();
   void reset_session();
+  // The session's TEMPORARY tables, dropped (abandon_open_transaction).
+  void drop_session_temp_tables();
+  // A table's generated columns worked out and its CHECKs tried for the row
+  // about to be inserted (*row) or row `at` of the table (row null).
+  bool apply_row_rules(SqlTable* t, SqlRow* row, size_t at, std::string* err);
   void shrink_session_buffers(bool idle = false);
   void clear_checkpoint_pool();
   // The wire's entry: the answer as the result cache holds it. A cached
@@ -2367,7 +2391,7 @@ class SqlDatabase {
   // Concurrent transactions (AIOS_TXN_CONCURRENT=1): a statement run, taken back and run again around another
   // transaction's rows; and the rows a SELECT ... FOR UPDATE claims.
   SqlQueryResult execute_gateway_concurrent(const std::string& sql_query, const std::string& session_db, int begins = -1);
-  uint64_t claim_locked_rows(const std::string& sql, const std::string& session_db);
+  uint64_t claim_locked_rows(const std::string& sql, const std::string& session_db, std::string* run_sql);
   void frames_release(size_t from);
   SqlQueryResult execute_savepoint_statement(const std::string& sql);
   // A statement with triggers runs in one: undone if it fails, kept if done().

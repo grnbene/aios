@@ -529,6 +529,7 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   if (starts("SAVEPOINT ") && has("does not exist")) { *code = 1305; *sqlstate = "42000"; return; }
   if (starts("Deadlock found when trying to get lock")) { *code = 1213; *sqlstate = "40001"; return; }
   if (starts("Lock wait timeout exceeded")) { *code = 1205; *sqlstate = "HY000"; return; }
+  if (starts("Statement aborted because lock(s) could not be acquired immediately")) { *code = 3572; *sqlstate = "HY000"; return; }
   if (starts("Incorrect number of arguments for")) { *code = 1318; *sqlstate = "42000"; return; }
   if (starts("Can't update table") && has("stored function/trigger")) { *code = 1442; *sqlstate = "HY000"; return; }
   if (starts("Result consisted of more than one row")) { *code = 1172; *sqlstate = "42000"; return; }
@@ -554,6 +555,8 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   else if (starts("Access denied") || starts("access denied") || has("read-only") || has("read only")) { *code = 1044; *sqlstate = "42000"; }
   else if (has("ambiguous")) { *code = 1052; *sqlstate = "23000"; }
   else if (has("division by zero") || has("Division by 0")) { *code = 1365; *sqlstate = "22012"; }
+  else if (starts("CONSTRAINT `") && has("` failed for `")) { *code = 4025; *sqlstate = "23000"; }
+  else if (starts("The value specified for generated column")) { *code = 1906; *sqlstate = "HY000"; }
   else if (has("cannot be null") || has("NOT NULL")) { *code = 1048; *sqlstate = "23000"; }
   else if (has("doesn't yet support")) { *code = 1235; *sqlstate = "42000"; }   // ER_NOT_SUPPORTED_YET
 }
