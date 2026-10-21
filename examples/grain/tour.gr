@@ -1,0 +1,76 @@
+# Everything grain has, in one program that checks its own answers.
+# Run: aios grain run examples/grain/tour.gr
+
+let failures = 0
+fn check(label, got, want) {
+  if got == want {
+    print("  ok   ", label, "=", repr(got))
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+
+print("numbers")
+check("int stays int", 6 * 7, 42)
+check("division is real", 7 / 2, 3.5)
+check("modulo", 17 % 5, 2)
+check("precedence", 2 + 3 * 4, 14)
+check("unary and parens", -(2 + 3) * 2, -10)
+check("int equals real", 2 == 2.0, true)
+check("big integer", 9007199254740993 + 1, 9007199254740994)
+check("mixed promotes", 1 + 0.5, 1.5)
+
+print("truth")
+check("zero is not false", 0 and true, true)
+check("empty string is not false", "" and true, true)
+check("nil is false", nil or "fallback", "fallback")
+check("short circuit", false and nope_is_never_read, false)
+check("not", not nil, true)
+
+print("strings")
+check("concat", "gr" + "ain", "grain")
+check("index", "grain"[1], "r")
+check("negative index", "grain"[-1], "n")
+check("slice", slice("grain", 1, 4), "rai")
+check("split then join", join(split("a,b,c", ","), "-"), "a-b-c")
+
+print("lists and maps")
+let xs = [3, 1, 2]
+push(xs, 4)
+check("push", xs, [3, 1, 2, 4])
+check("sort", sort(xs), [1, 2, 3, 4])
+check("concat", [1] + [2], [1, 2])
+check("index assignment", (fn () { let a = [0, 0] a[1] = 9 return a })(), [0, 9])
+let m = {a: 1, b: 2}
+m.c = 3
+check("field set", m.c, 3)
+check("keys keep order", keys(m), ["a", "b", "c"])
+check("missing key is nil", m["zz"], nil)
+check("has distinguishes", has(m, "zz"), false)
+
+print("control flow")
+check("while", (fn () { let n = 0 let i = 0 while i < 5 { n = n + i i = i + 1 } return n })(), 10)
+check("for over list", (fn () { let n = 0 for v in [1,2,3] { n = n + v } return n })(), 6)
+check("for over map walks keys", (fn () { let out = [] for k in {x: 1, y: 2} { push(out, k) } return out })(), ["x", "y"])
+check("for over string", (fn () { let out = [] for c in "abc" { push(out, c) } return out })(), ["a","b","c"])
+check("break", (fn () { let n = 0 for v in range(0, 100) { if v == 5 { break } n = v } return n })(), 4)
+check("continue", (fn () { let n = 0 for v in range(0, 10) { if v % 2 == 0 { continue } n = n + v } return n })(), 25)
+check("else if chain", (fn (x) { if x < 0 { return "neg" } else if x == 0 { return "zero" } else { return "pos" } })(0), "zero")
+
+print("functions")
+fn fact(n) { if n <= 1 { return 1 } return n * fact(n - 1) }
+check("recursion", fact(10), 3628800)
+check("first class", (fn (f) { return f(6) })(fn (x) { return x * 7 }), 42)
+check("closure captures", (fn () { let k = 10 return fn (x) { return x + k } })()(5), 15)
+check("shadowing in a block", (fn () { let v = 1 { let v = 2 } return v })(), 1)
+check("no return means nil", (fn () { let unused = 1 })(), nil)
+
+print("the machine")
+check("sys.arch is a string", type(sys.arch), "string")
+check("sys.cpus is an int", type(sys.cpus), "int")
+check("this machine has cores", sys.cpus > 0, true)
+check("this machine has memory", sys.memory > 0, true)
+
+print("")
+if failures == 0 { print("tour: every check agreed") } else { print("tour:", failures, "WRONG") }

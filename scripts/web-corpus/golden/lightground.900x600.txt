@@ -1,0 +1,14 @@
+# page lightground.html  viewport=900x600
+# title A light ground and no ink
+# content 900x213  background=fff0f0f2  links=1
+text      24    46   400    42  #ff1a1a1a  30px,bold         "A light ground and no ink"
+text      24   102   816    21  #ff1a1a1a  15px              "The page never named a text colour. On a dark default sheet that used to come out #d8d8d8 on #f0f0f2 —"
+text      24   123   104    21  #ff1a1a1a  15px              "grey on grey."
+text      24   156    24    21  #ff1a1a1a  15px              "An "
+text      48   156    88    21  #ff0b57a4  15px             u link=0  "inline link"
+text     136   156    80    21  #ff1a1a1a  15px              " and some "
+text     216   157    48    19  #ff1a1a1a  14px,mono         "code()"
+text     264   156     8    21  #ff1a1a1a  15px              "."
+link     48   156    88    21  file:///somewhere  "inline link"
+# glyph-gaps (none)
+

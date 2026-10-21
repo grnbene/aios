@@ -1,0 +1,50 @@
+<!doctype html>
+<html><head><title>Anchored menus</title><style>
+/* An anchored dropdown, which is the shape every application menu has: a
+   shrink-to-fit `inline-flex` wrapper that is `position: relative`, and a menu
+   absolutely positioned against it. Three things have to be right at once —
+   the wrapper must be as wide as its BUTTON and not as wide as the row, `calc`
+   with a viewport unit has to be a viewport unit, and shrink-to-fit for an
+   absolute box is min/max-content, not "clamp to the containing block". Get any
+   one wrong and the menu lands somewhere else entirely. */
+* { box-sizing: border-box; }
+body { margin: 0; background: #111; color: #ddd; font: 14px sans-serif; }
+.bar { display: flex; align-items: center; gap: 12px; padding: 20px 40px; }
+.spacer { flex: 1; }
+.wrap { position: relative; display: inline-flex; }
+.pill { width: 40px; height: 28px; background: #333; border-radius: 999px; }
+.menu {
+  position: absolute; top: calc(100% + 6px); right: 0;
+  background: #224466; border: 1px solid #4a4a4a; border-radius: 12px;
+  display: flex; flex-direction: row; gap: 2px; padding: 4px;
+  max-width: calc(100vw - 20px);
+}
+.item { flex: none; width: 38px; height: 38px; background: #882222; border: 0; }
+/* Opening UPWARD and anchored LEFT — the composer's half of the same pattern. */
+.up { position: absolute; bottom: calc(100% + 6px); left: 0;
+      background: #664422; display: flex; flex-direction: column;
+      min-width: 190px; padding: 4px; }
+.row { height: 24px; background: #7a5a2a; }
+/* An ordinary relative block, so the easy case stays honest beside the hard one. */
+.rel { position: relative; height: 80px; margin: 30px 40px; background: #1a1a1a; }
+.br { position: absolute; right: 8px; bottom: 8px; width: 50px; height: 20px; background: #226644; }
+.tl { position: absolute; left: 0; top: 0; width: 40px; height: 16px; background: #442266; }
+/* `inline-block` with a BLOCK inside it is still atomic: it sits on the line
+   and shrinks to fit, rather than being promoted to a block of its own. */
+.chip { display: inline-block; background: #333; padding: 2px 8px; }
+.full { width: calc(100vw - 80px); height: 12px; background: #557; margin: 0 40px; }
+</style></head><body>
+<div class="bar">
+  <span>left</span><div class="spacer"></div>
+  <div class="wrap"><div class="pill"></div>
+    <div class="menu"><i class="item"></i><i class="item"></i><i class="item"></i></div>
+  </div>
+</div>
+<p style="margin:0 40px">Text with a <span class="chip"><b>chip</b></span> in it.</p>
+<div class="full"></div>
+<div class="rel"><div class="br"></div><div class="tl"></div>
+  <div class="wrap" style="position:relative"><div class="pill"></div>
+    <div class="up"><div class="row"></div><div class="row"></div></div>
+  </div>
+</div>
+</body></html>

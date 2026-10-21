@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><title>What this screen is</title><link rel="stylesheet" href="site.css">
+<style>
+p { color: #b03a4a; }
+@media (prefers-color-scheme: dark)  { p { color: #0f8a6a; } }
+@media (prefers-color-scheme: light) { p { color: #0000ff; } }
+@media (orientation: portrait)  { p { font-size: 40px; } }
+@media (orientation: landscape) { p { font-weight: bold; } }
+@media (hover: none) { p { text-decoration: line-through; } }
+@media (min-width: 700px) { .wide { font-size: 21px; } }
+@media (max-width: 500px) { .narrow { font-size: 21px; } }
+</style></head>
+<body><div class="wrap">
+<p>Green and bold: this machine is dark, landscape, and has a pointer.</p>
+<p class="wide">Twenty-one at 1024, fifteen at 420.</p>
+<p class="narrow">Fifteen at 1024, twenty-one at 420.</p>
+</div></body></html>

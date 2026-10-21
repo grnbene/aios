@@ -1,0 +1,18 @@
+# Where grain spends time, one workload per line. Same file on the host
+# (aios grain run) and the Pi (metal/tools/pi-grain.py) - compare ratios.
+fn timed(label, f) {
+  let t = clock()
+  let r = f()
+  print(label, int(clock() - t), "ms", r)
+}
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+timed("calls   fib(22)      ", fn () { return fib(22) })
+timed("loop    while 300k   ", fn () { let i = 0 let s = 0 while i < 300000 { s = s + i i = i + 1 } return s })
+timed("natives len() 100k   ", fn () { let l = [1, 2, 3] let s = 0 for i in range(0, 100000) { s = s + len(l) } return s })
+timed("lists   push 100k    ", fn () { let l = [] for i in range(0, 100000) { push(l, i) } return len(l) })
+timed("strings concat 20k   ", fn () { let s = "" for i in range(0, 20000) { s = s + "x" } return len(s) })
+timed("maps    field 100k   ", fn () { let m = {a: 1, b: 2} let s = 0 for i in range(0, 100000) { s = s + m.a + m.b } return s })
+timed("hofs    map/filter   ", fn () { return len(filter(map(range(0, 50000), fn (x) { return x * 3 }), fn (x) { return x % 2 == 0 })) })

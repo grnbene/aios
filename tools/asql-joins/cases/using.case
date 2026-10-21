@@ -1,0 +1,48 @@
+-- JOIN ... USING (columns), inner and LEFT
+-- setup
+CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(40), region VARCHAR(10));
+CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amount DECIMAL(10,2), status INT);
+CREATE TABLE items (order_id INT, line INT, sku VARCHAR(10), qty INT, PRIMARY KEY (order_id, line));
+CREATE TABLE products (sku VARCHAR(10) PRIMARY KEY, title VARCHAR(40), price DECIMAL(10,2));
+CREATE TABLE regions (code VARCHAR(10) PRIMARY KEY, label VARCHAR(20));
+INSERT INTO customers VALUES (1,'Acme','N'),(2,'Bolt','S'),(3,'Crane','N'),(4,'Dune',NULL),(5,'Echo','W');
+INSERT INTO orders VALUES (10,1,100.00,0),(11,1,250.50,1),(12,2,75.25,0),(13,3,10.00,1),(14,NULL,99.99,0),(15,9,5.00,0),(16,2,75.25,1);
+INSERT INTO items VALUES (10,1,'A',2),(10,2,'B',1),(11,1,'A',5),(12,1,'C',1),(13,1,'Z',3),(16,1,'B',4),(16,2,'C',2);
+INSERT INTO products VALUES ('A','Anvil',10.00),('B','Bucket',2.50),('C','Cable',1.25),('D','Drill',99.00);
+INSERT INTO regions VALUES ('N','North'),('S','South'),('E','East');
+CREATE VIEW v_lines AS SELECT c.name, i.sku FROM customers c JOIN orders o ON o.cust_id = c.id JOIN items i ON i.order_id = o.id;
+
+-- query
+SELECT o.id, p.title FROM items i JOIN products p USING (sku) JOIN orders o ON o.id = i.order_id WHERE i.sku = 'B'
+-- expect
+10|Bucket
+16|Bucket
+
+-- query
+SELECT a.qty, b.qty FROM items a JOIN items b USING (order_id, line) WHERE a.order_id = 16
+-- expect
+4|4
+2|2
+
+-- query
+SELECT i.order_id, p.title FROM items i LEFT JOIN products p USING (sku)
+-- expect
+10|Anvil
+10|Bucket
+11|Anvil
+12|Cable
+13|NULL
+16|Bucket
+16|Cable
+
+-- query
+SELECT sku, title FROM items JOIN products USING (sku) WHERE order_id = 10
+-- expect
+A|Anvil
+B|Bucket
+
+-- query
+SELECT * FROM items JOIN products USING (sku) WHERE order_id = 16
+-- expect
+B|16|1|4|Bucket|2.5000
+C|16|2|2|Cable|1.2500

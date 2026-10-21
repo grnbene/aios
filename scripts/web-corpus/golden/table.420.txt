@@ -1,0 +1,18 @@
+# page table.html  viewport=420
+# title Table columns
+# content 420x225  background=ffffffff  links=0
+text      16    36   377    33  #ff202020  24px,bold         "Ports this machine listens on"
+text      24    85    56    21  #ff202020  15px,bold         "Service"
+text     128    85    32    21  #ff202020  15px,bold         "Port"
+text     176    85    73    21  #ff202020  15px,bold         "Transport"
+text      24   114    88    21  #ff202020  15px              "assay serve"
+text     128   114    32    21  #ff202020  15px              "4317"
+text     176   114    32    21  #ff202020  15px              "HTTP"
+text      24   143    72    21  #ff202020  15px              "assay mcp"
+text     128   143    32    21  #ff202020  15px              "8830"
+text     176   143    32    21  #ff202020  15px              "HTTP"
+text      24   172    48    21  #ff202020  15px              "bridge"
+text     128   172    32    21  #ff202020  15px              "4318"
+text     176   172    40    21  #ff202020  15px              "stdio"
+# glyph-gaps (none)
+

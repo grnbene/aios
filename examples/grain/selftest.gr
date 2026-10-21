@@ -1,0 +1,226 @@
+# The builtins, each checked against an answer known independently of grain
+# (published digests, textbook values, hand-worked strings) - so a run that
+# prints only "ok" means the machine computed them, not that it agreed with
+# itself. Runs the same on a hosted aios and on the Pi, where the file checks
+# land on the SD card.
+# Run: aios grain run examples/grain/selftest.gr
+#      metal/tools/pi-grain.py examples/grain/selftest.gr --diff
+
+let failures = 0
+let checks = 0
+fn check(label, got, want) {
+  checks = checks + 1
+  if got == want {
+    print("  ok   ", label)
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+fn near(label, got, want) {
+  checks = checks + 1
+  if type(got) != "string" and abs(got - want) < 0.000000001 {
+    print("  ok   ", label)
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+
+print("strings")
+check("split", split("a,b,,c", ","), ["a", "b", "", "c"])
+check("join", join(["x", "y", "z"], "-"), "x-y-z")
+check("upper/lower", upper("MiXeD") + lower("MiXeD"), "MIXEDmixed")
+check("trim", trim("  pad  ") + "|" + ltrim("  l") + "|" + rtrim("r  "), "pad|l|r")
+check("replace every", replace("a.b.c", ".", "::"), "a::b::c")
+check("slice", slice("abcdef", 1, 4), "bcd")
+check("find", find("hello", "ll"), 2)
+check("index_of/last", [index_of("abcabc", "c"), last_index_of("abcabc", "c")], [2, 5])
+check("starts/ends/contains", [starts_with("grain", "gr"), ends_with("grain", "in"), contains("grain", "rai")], [true, true, true])
+check("pad", pad_left("7", 3, "0") + pad_right("x", 3, "."), "007x..")
+check("repeat", repeat("ab", 3), "ababab")
+check("ord/chr", [ord("A"), chr(97)], [65, "a"])
+check("chars", chars("hey"), ["h", "e", "y"])
+check("classes", [is_digit("7"), is_alpha("q"), is_alnum("_"), is_space("\t")], [true, true, false, true])
+check("utf-8 length is bytes", len("é"), 2)
+
+print("numbers")
+check("floor/ceil/trunc", [floor(-2.5), ceil(-2.5), trunc(-2.5)], [-3, -2, -2])
+check("round half away", [round(2.5), round(-2.5)], [3, -3])
+check("round to places", round(3.14159, 2), 3.14)
+check("abs/sign/clamp", [abs(-4), sign(-9), clamp(15, 0, 10)], [4, -1, 10])
+check("min/max", [min(3, 1, 2), max(3, 1, 2)], [1, 3])
+check("int() truncates", int(7.9), 7)
+check("int() parses", int("42"), 42)
+check("real() parses", real("2.5"), 2.5)
+near("sqrt 2", sqrt(2), 1.4142135623730951)
+near("pow", pow(2, 0.5), 1.4142135623730951)
+near("sin pi/6", sin(PI / 6), 0.5)
+near("cos pi/3", cos(PI / 3), 0.5)
+near("tan pi/4", tan(PI / 4), 1.0)
+near("asin/acos/atan", asin(1) + acos(1) + atan(1), PI / 2 + PI / 4)
+near("atan2", atan2(1, -1), 3 * PI / 4)
+near("exp/log", log(exp(3)), 3.0)
+near("log2/log10", log2(1024) + log10(0.001), 7.0)
+near("hypot", hypot(3, 4), 5.0)
+near("deg/rad", deg(rad(90)), 90.0)
+near("e", E, 2.718281828459045)
+near("lerp", lerp(10, 20, 0.25), 12.5)
+near("smoothstep mid", smoothstep(0, 1, 0.5), 0.5)
+
+print("collections")
+check("range", range(1, 10, 3), [1, 4, 7])
+check("map/filter/reduce", reduce(filter(map(range(1, 6), fn (x) { return x * x }), fn (x) { return x % 2 == 1 }), fn (a, b) { return a + b }, 0), 35)
+check("sort strings", sort(["pear", "apple", "fig"]), ["apple", "fig", "pear"])
+check("reverse", reverse([1, 2, 3]), [3, 2, 1])
+check("flatten", flatten([1, [2, [3]]]), [1, 2, [3]])
+check("zip", zip([1, 2], ["a", "b"]), [[1, "a"], [2, "b"]])
+check("enumerate", enumerate(["p", "q"]), [[0, "p"], [1, "q"]])
+check("take/drop", [take([1, 2, 3, 4], 2), drop([1, 2, 3, 4], 3)], [[1, 2], [4]])
+check("unique", unique([3, 1, 3, 2, 1]), [3, 1, 2])
+check("insert/remove_at", remove_at(insert([1, 3], 1, 2), 0), 1)
+check("any/all", [any([1, 2], fn (x) { return x > 1 }), all([1, 2], fn (x) { return x > 1 })], [true, false])
+check("find_if", find_if([4, 9, 16], fn (x) { return x > 5 }), 9)
+let m = {b: 2, a: 1}
+check("keys/values", [keys(m), values(m)], [["b", "a"], [2, 1]])
+check("merge later wins", merge({a: 1, b: 1}, {b: 2}), {a: 1, b: 2})
+check("entries round trip", from_entries(entries(m)), m)
+
+print("encodings")
+check("json out", json_stringify({n: 1, s: "q\"", l: [true, nil]}), "{\"n\":1,\"s\":\"q\\\"\",\"l\":[true,null]}")
+check("json in", json_parse("{\"a\":[1,2.5,\"x\"],\"b\":false}"), {a: [1, 2.5, "x"], b: false})
+check("base64 (RFC 4648)", base64_encode("foobar"), "Zm9vYmFy")
+check("base64 padding", base64_encode("fo"), "Zm8=")
+check("base64 back", base64_decode("Zm9vYg=="), "foob")
+check("hex", hex_encode("AZ"), "415a")
+check("hex back", hex_decode("6869"), "hi")
+check("url encode", url_encode("a b&c/d"), "a%20b%26c%2Fd")
+check("url decode", url_decode("x%3Dy%2Bz"), "x=y+z")
+
+print("crypto (published digests)")
+check("sha256 abc", sidecar_sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+check("sha256 empty", sidecar_sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+check("keccak256 empty", sidecar_keccak256(""), "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+near("haversine London-Paris km", round(sidecar_haversine(51.5074, -0.1278, 48.8566, 2.3522) / 1000), 344)
+
+print("errors")
+check("pcall catches", pcall(fn () { error("boom") }).ok, false)
+check("error message kept", contains(pcall(fn () { error("boom") }).error, "boom"), true)
+check("pcall ok path", pcall(fn () { return 5 }).value, 5)
+check("pcall passes args", pcall(fn (a, b) { return a - b }, 9, 4).value, 5)
+check("wrong type is an error", pcall(fn () { return upper(3) }).ok, false)
+
+print("randomness and time")
+seed(1234)
+let r1 = [rand(), rand(), rand()]
+seed(1234)
+check("seed replays", [rand(), rand(), rand()], r1)
+check("rand in [0,1)", all(r1, fn (x) { return x >= 0 and x < 1 }), true)
+let t0 = time_ms()
+sleep(20)
+let dt = time_ms() - t0
+check("sleep(20) takes 20-200 ms", dt >= 20 and dt < 200, true)
+check("wall clock is after 2025", time() > 1735689600, true)
+
+print("canvas")
+let cv = canvas_create(16, 8)
+check("size", [canvas_width(cv), canvas_height(cv)], [16, 8])
+canvas_set_fill_color(cv, color_rgb(255, 0, 0))
+canvas_fill_rect(cv, 2, 2, 4, 4)
+check("filled pixel is red", color_to_hex(canvas_get_pixel(cv, 3, 3)), "#ff0000")
+check("outside stays clear", canvas_get_pixel(cv, 10, 6) == canvas_get_pixel(cv, 0, 0), true)
+check("ppm header", slice(canvas_to_ppm(cv), 0, 2), "P6")
+check("hex round trip", color_to_hex(color_hex("#12ab9f")), "#12ab9f")
+check("alpha round trip", color_to_hex(color_hex("#12ab9f80")), "#12ab9f80")
+
+print("files")
+let path = "GRTEST.TXT"
+if file_exists(path) { delete_file(path) }
+check("absent before", file_exists(path), false)
+check("write returns bytes", write_file(path, "line one\n"), 9)
+check("exists after write", file_exists(path), true)
+check("read back", read_file(path), "line one\n")
+append_file(path, "line two\n")
+check("append", read_file(path), "line one\nline two\n")
+let big = repeat("0123456789abcdef", 4096)
+write_file(path, big)
+check("64 KB write spans clusters", read_file(path) == big, true)
+write_file(path, "short")
+check("overwrite shrinks", read_file(path), "short")
+let names = map(list_dir(), fn (e) { return upper(e.name) })
+check("list_dir sees it", contains(join(names, ","), "GRTEST.TXT"), true)
+let entry = find_if(list_dir(), fn (e) { return upper(e.name) == "GRTEST.TXT" })
+check("list_dir size", entry.size, 5)
+check("delete", delete_file(path), true)
+check("gone after delete", file_exists(path), false)
+check("reading a missing file is an error", pcall(fn () { return read_file(path) }).ok, false)
+
+print("bitwise & compound assignment")
+check("bitwise and", 0b1100 & 0b1010, 0b1000)
+check("bitwise or", 0b1100 | 0b0011, 0b1111)
+check("bitwise xor", 0b1100 ^ 0b1010, 0b0110)
+check("bitwise not", ~0, -1)
+check("bitwise not non-zero", ~42, -43)
+check("bitwise shift left", 1 << 4, 16)
+check("bitwise shift right", 32 >> 2, 8)
+check("hex and binary literals", [0xff, 0XFF, 0b101, 0b0], [255, 255, 5, 0])
+check("shift by 63", 1 << 63, -9223372036854775807 - 1)
+check("shift out left", 1 << 64, 0)
+check("shift out right keeps sign", [-8 >> 99, 8 >> 99, -8 >> 1], [-1, 0, -4])
+check("negative shift is an error", pcall(fn () { return 1 << -1 }).ok, false)
+check("bits are integers only", pcall(fn () { return 1.5 | 0 }).ok, false)
+check("xor is not power", 2 ^ 3, 1)
+check("&& and || are and/or", [true && false, false || true], [false, true])
+let comp = 10
+comp += 5
+check("compound add", comp, 15)
+comp -= 3
+check("compound sub", comp, 12)
+comp *= 2
+check("compound mul", comp, 24)
+comp /= 4
+check("compound div", comp, 6)
+comp %= 4
+check("compound mod", comp, 2)
+comp = 0b1100
+comp &= 0b1010
+check("compound bitand", comp, 0b1000)
+comp |= 0b0011
+check("compound bitor", comp, 0b1011)
+comp ^= 0b0001
+check("compound bitxor", comp, 0b1010)
+comp <<= 2
+check("compound shl", comp, 0b101000)
+comp >>= 3
+check("compound shr", comp, 0b101)
+let hits = 0
+fn slot() { hits += 1 return 1 }
+let cells = [10, 20, 30]
+cells[slot()] += 5
+check("a[k] op= v evaluates k once", [cells, hits], [[10, 25, 30], 1])
+let holder = {n: 1}
+fn pick() { hits += 1 return holder }
+pick().n *= 7
+check("a.f op= v evaluates a once", [holder.n, hits], [7, 2])
+let words = "a"
+words += "b"
+check("+= on strings", words, "ab")
+
+print("ternary & string interpolation")
+check("ternary true branch", true ? "yes" : "no", "yes")
+check("ternary false branch", false ? "yes" : "no", "no")
+check("ternary nested", 10 > 5 ? (2 > 1 ? "a" : "b") : "c", "a")
+let person = "Alice"
+let age = 30
+check("f-string basic", f"name={person}, age={age}", "name=Alice, age=30")
+check("f-string expr", f"calc: {10 + 20 * 2}", "calc: 50")
+check("f-string doubled braces", f"json: {{\"key\": {age}}}", "json: {\"key\": 30}")
+check("f-string backslash braces", f"\{{age}\}", "{30}")
+check("f-string map literal inside", f"{len({a: 1, b: 2})} keys", "2 keys")
+check("f-string brace in a string inside", f"{'}' + 'x'}", "}x")
+check("f-string ternary inside", f"{age > 18 ? 'adult' : 'minor'}", "adult")
+check("f-string alone", f"{age}", "30")
+
+print("")
+if failures == 0 { print("selftest:", checks, "checks, all agreed") } else { print("selftest:", failures, "of", checks, "WRONG") }
+

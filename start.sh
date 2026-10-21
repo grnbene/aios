@@ -1,0 +1,2 @@
+tmux kill-session -t aios 2>/dev/null; tmux new-session -d -s aios "DISPLAY=:0 XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority} qemu-system-x86_64 -name AOS -smp 4 -m 1024 -bios /usr/share/ovmf/OVMF.fd -drive file=/tmp/aios-vm4.img,if=virtio,format=raw -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -boot c -enable-kvm -cpu host -vga std -display gtk -serial stdio -serial unix:/tmp/aios-mind.sock,server,nowait -monitor unix:/tmp/aios-monitor.sock,server,nowait; echo '[qemu exited]'; sleep 3600" && sleep 3 && pgrep -af "name AOS" | grep -v pgrep | cut -c1-120
+

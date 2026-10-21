@@ -1,0 +1,1573 @@
+#version 450
+// The display, as a shader.
+//
+// This is the machine's picture of itself computed on the GPU: every pixel of
+// the background is a function of its coordinates and the clock, which is what
+// a fragment program is for and what a CPU rasteriser spends its whole frame
+// budget on. The UI the compositor draws — text, panels, windows — arrives as
+// an overlay image and is blended over the top here, so the composite happens
+// on the GPU as well and nothing is copied back across the bus.
+//
+// Compiled to SPIR-V by scripts/build-shaders.sh and checked in beside it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D out_image;
+// The compositor's layer arrives as a BUFFER, not an image: a linear image
+// with storage usage is not something every driver will make (NVIDIA will
+// not), and a buffer of packed pixels is universally supported.
+layout(std430, binding = 1) readonly buffer Overlay { uint pixels[]; };
+
+// A scene this machine COMPOSED, as data. Flat vec4s and hand-computed offsets
+// rather than a struct array: std430 with mixed scalar members is exactly where
+// a buffer silently stops agreeing with its shader, and this one is written by
+// C++ on the other side of a file.
+//
+//   v[0] sky at the horizon        v[4] ground rgb,   w = ground kind
+//   v[1] sky overhead              v[5] fog rgb,      w = density
+//   v[2] sun dir,   w = sharpness  v[6] camera: radius, height, fov, spin
+//   v[3] sun rgb,   w = intensity  v[7] x = how many solids
+//   then 3 vec4s per solid: (kind,x,y,z) (sx,sy,sz,-) (r,g,b,gloss)
+layout(std430, binding = 2) readonly buffer SceneDesc { vec4 v[]; } sd;
+
+// The scene, as it was last computed. The background is a raymarch — at 1080p
+// it is the whole frame budget. So it is marched at REDUCED RESOLUTION into
+// this buffer — every frame, all of it — and the composite pass reads it back
+// bilinearly at the display's own resolution. Device-local: it is never touched
+// by the host.
+layout(std430, binding = 3) buffer SceneCache { uint cached[]; };
+
+const int SOLID_BASE = 9;   // eight header vec4s, then the solids' bound
+const int SOLID_STRIDE = 5;
+// A bound the compiler can see. The description can hold fewer; it must not
+// hold more, and the C++ side clamps to the same number.
+const int MAX_SOLIDS = 64;
+
+layout(push_constant) uniform Params {
+  uint width;
+  uint height;
+  uint scene;        // 0 beach, 1 lattice, 2 core
+  uint have_overlay;
+  uint bgra;         // the presented image's channel order is B,G,R,A
+  float backdrop;    // 1.0 = the scene is the picture; below that it is behind
+                     // an interface and must not compete with it
+  float seconds;
+  // This shader runs TWICE per frame, and `pass` says which.
+  //
+  //  pass 0 — march. Dispatched over a grid 1/scale the width and height of the
+  //           screen, sampling the scene at the centre of each scale x scale
+  //           block and writing it to SceneCache. Cost falls by scale squared.
+  //  pass 1 — composite. Full screen: SceneCache read back bilinearly, with the
+  //           interface blended over the top at its own full resolution.
+  //
+  // Why reduced resolution and not a reduced RATE. Two cheaper-looking things
+  // were built and measured first, and both are worse:
+  //
+  //  - Recomputing the whole background every Nth frame and showing the last
+  //    one in between. The picture then holds still for N frames and jumps.
+  //    Measured on the ocean scene at N = 15: 201 of 220 sampled frames were
+  //    bit-identical, and the ones that moved moved by 11.7 grey levels at once.
+  //    That is the visible stepping this replaced.
+  //
+  //  - Refreshing a scattered 1/N of the PIXELS each frame, full resolution.
+  //    The motion is then continuous, but neighbouring pixels are up to N frames
+  //    apart in time and the difference sits still in screen space, so the eye
+  //    reads it as a fixed dither. Measured as the amplitude of the alternating
+  //    component on the ocean: 0.35 grey levels marching everything, 3.5 to 4.1
+  //    at the very gentlest spread (every other pixel, one frame of age), 4 to
+  //    10 beyond that. Dispersing the lattice did not rescue it — one frame of
+  //    that scene's specular ripple simply IS about four grey levels.
+  //
+  // Marching a smaller picture keeps every pixel on screen at the same instant,
+  // so there is no temporal structure to see at all. What it costs is spatial
+  // detail, and that is the honest trade: a softer background that moves
+  // cleanly, rather than a sharp one that shimmers.
+  uint pass;
+  uint scale;        // 1 = full resolution; 2 = quarter the work; 3 = a ninth
+  uint cache_w;      // the marched picture's width, ceil(width / scale)
+  uint cache_h;
+  // The hour of the day on the shoreline, as a fraction: 0 midnight, 0.25
+  // dawn, 0.5 midday, 0.75 dusk, 1 midnight again. Scene 0 used to be a night
+  // scene and nothing else — every colour in it was a literal — so "the beach
+  // at dusk" could not be answered ON THIS BEACH at all and had to be handed to
+  // the composed renderer, which has a sea and a sky but no sand, no wash, no
+  // surf line and no palm. One number moves the whole picture; the geometry
+  // under it never changes.
+  float tod;
+} p;
+
+const float PI = 3.14159265;
+
+// An exact integer hash. This was fract(sin(dot(v, k)) * 43758.5453), the
+// shadertoy standby, and it visibly failed here: at these coordinates the sine
+// quantises, so whole runs of neighbouring lattice cells drew the SAME value
+// and the sea and the plasma came out as flat rectangles with hard edges. A bit
+// mix over the integer cell has no precision to lose.
+uint uhash(uvec2 q) {
+  q *= uvec2(1597334673u, 3812015801u);
+  uint n = q.x ^ q.y;
+  n ^= n >> 16; n *= 2246822519u;
+  n ^= n >> 13; n *= 3266489917u;
+  n ^= n >> 16;
+  return n;
+}
+
+float hash21(vec2 v) {
+  // Biased into the positives so a negative cell hashes as well as any other.
+  return float(uhash(uvec2(ivec2(floor(v)) + 65536))) * (1.0 / 4294967296.0);
+}
+
+float noise(vec2 v) {
+  vec2 i = floor(v), f = fract(v);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x),
+             mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y);
+}
+
+// Turned between octaves as well as scaled: with a pure doubling every octave
+// shares the same axes and the sum keeps the grid's own horizontals and
+// verticals, which is the other half of why the water looked tiled.
+float fbm(vec2 v) {
+  const mat2 turn = mat2(0.80, 0.60, -0.60, 0.80);
+  float sum = 0.0, amp = 0.5;
+  for (int i = 0; i < 5; ++i) { sum += amp * noise(v); v = turn * v * 2.03; amp *= 0.5; }
+  return sum;
+}
+
+// A horizon with a moon over moving water. The reflection is the moon's column
+// broken up by the same noise field that makes the swell.
+
+// A square pyramid on a plain under a low sun, raymarched from its signed
+// distance. This one is here because a person asked the machine to show them a
+// pyramid and it had nothing to show: the machine can now be TOLD what to put
+// on its own display, by name, and this is one of the things it knows how to
+// draw. Every pixel is still a function of coordinates and the clock.
+float sd_pyramid(vec3 p3, float h) {
+  // Half-width 1 at the base, apex at h. Folded into one octant so three
+  // planes describe all four faces.
+  float m2 = h * h + 0.25;
+  p3.xz = abs(p3.xz);
+  p3.xz = (p3.z > p3.x) ? p3.zx : p3.xz;
+  p3.xz -= 0.5;
+  vec3 q = vec3(p3.z, h * p3.y - 0.5 * p3.x, h * p3.x + 0.5 * p3.y);
+  float s = max(-q.x, 0.0);
+  float t = clamp((q.y - 0.5 * p3.z) / (m2 + 0.25), 0.0, 1.0);
+  float a = m2 * (q.x + s) * (q.x + s) + q.y * q.y;
+  float b = m2 * (q.x + 0.5 * t) * (q.x + 0.5 * t) + (q.y - m2 * t) * (q.y - m2 * t);
+  float d2 = min(q.y, -q.x * m2 - q.y * 0.5) > 0.0 ? 0.0 : min(a, b);
+  return sqrt((d2 + q.z * q.z) / m2) * sign(max(q.z, -p3.y));
+}
+
+// Only the pyramid is marched. The plain is a plane and a plane has an exact
+// intersection, so it gets one — marching it starved the step size near the
+// ground, ran the loop out of iterations, and drew the horizon as a set of
+// concentric rings.
+float pyramid_sd(vec3 p3) { return sd_pyramid(p3, 1.25); }
+
+vec3 pyramid_normal(vec3 p3) {
+  const vec2 e = vec2(0.0015, 0.0);
+  return normalize(vec3(pyramid_sd(p3 + e.xyy) - pyramid_sd(p3 - e.xyy),
+                        pyramid_sd(p3 + e.yxy) - pyramid_sd(p3 - e.yxy),
+                        pyramid_sd(p3 + e.yyx) - pyramid_sd(p3 - e.yyx)));
+}
+
+// How much of the sun reaches a point: one march toward it, started off the
+// surface by an amount that grows with distance. Started at a fixed 0.03 the
+// surface shadowed ITSELF and the whole pyramid came out black.
+float sun_reach(vec3 at, vec3 sun, float bias) {
+  float tt = bias;
+  float shade = 1.0;
+  for (int i = 0; i < 48; ++i) {
+    float d = pyramid_sd(at + sun * tt);
+    if (d < 0.001) return 0.0;
+    // A soft edge for free: the closest the ray ever came, over how far it had
+    // gone, is a penumbra.
+    shade = min(shade, 14.0 * d / tt);
+    tt += clamp(d, 0.02, 0.6);
+    if (tt > 14.0) break;
+  }
+  return clamp(shade, 0.0, 1.0);
+}
+
+vec3 pyramid(vec2 uv, float t, float aspect) {
+  // A slow orbit, so it is obviously alive without being restless.
+  float ang = 0.9 + 0.13 * sin(t * 0.09);
+  vec3 eye = vec3(3.6 * sin(ang), 1.75 + 0.20 * sin(t * 0.06), 3.6 * cos(ang));
+  vec3 target = vec3(0.0, 0.66, 0.0);
+  vec3 fwd = normalize(target - eye);
+  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+  vec3 up = cross(fwd, right);
+  vec2 ndc = (uv - 0.5) * vec2(aspect, -1.0) * 2.0;
+  vec3 ray = normalize(fwd + ndc.x * 0.60 * right + ndc.y * 0.60 * up);
+
+  // To the SIDE and a little behind: one face lit, one face in shade, and the
+  // shadow falls across the plain where a person can see it. Directly behind
+  // the camera lit everything evenly and the thing read as a flat triangle.
+  vec3 sun = normalize(vec3(0.72, 0.44, -0.24));
+
+  float horizon = clamp(ray.y * 2.6 + 0.30, 0.0, 1.0);
+  vec3 sky = mix(vec3(0.62, 0.47, 0.34), vec3(0.16, 0.26, 0.48), horizon);
+  sky += vec3(1.0, 0.82, 0.55) * pow(max(0.0, dot(ray, sun)), 48.0) * 0.9;
+
+  // The plane, exactly.
+  float t_ground = (ray.y < -1e-4) ? (-eye.y / ray.y) : -1.0;
+  // The pyramid, marched.
+  float t_pyr = -1.0;
+  {
+    float travelled = 0.06;
+    for (int i = 0; i < 128; ++i) {
+      vec3 at = eye + ray * travelled;
+      float d = pyramid_sd(at);
+      if (d < 0.0006 * travelled + 0.0004) { t_pyr = travelled; break; }
+      travelled += d;
+      if (travelled > 40.0) break;
+    }
+  }
+
+  bool on_pyr = t_pyr > 0.0 && (t_ground < 0.0 || t_pyr < t_ground);
+  bool on_ground = !on_pyr && t_ground > 0.0;
+  if (!on_pyr && !on_ground) return sky;
+
+  float travelled = on_pyr ? t_pyr : t_ground;
+  vec3 at = eye + ray * travelled;
+  vec3 n = on_pyr ? pyramid_normal(at) : vec3(0.0, 1.0, 0.0);
+  float lit = clamp(dot(n, sun), 0.0, 1.0);
+  float shade = sun_reach(at, sun, on_pyr ? 0.02 + 0.004 * travelled : 0.02);
+
+  vec3 albedo = on_ground
+      ? mix(vec3(0.42, 0.34, 0.26), vec3(0.30, 0.25, 0.20), fbm(at.xz * 0.9))
+      : mix(vec3(0.80, 0.70, 0.50), vec3(0.60, 0.50, 0.36), fbm(at.xz * 2.4 + at.y * 3.0));
+  vec3 col = albedo * (0.22 + 1.05 * lit * shade);
+  col += vec3(0.18, 0.24, 0.36) * clamp(0.5 + 0.5 * n.y, 0.0, 1.0) * 0.28;   // sky bounce
+  float fog = 1.0 - exp(-travelled * 0.030);
+  return mix(col, sky, fog);
+}
+
+vec3 tide(vec2 uv, float t, float aspect) {
+  vec3 sky = mix(vec3(0.016, 0.031, 0.078), vec3(0.055, 0.086, 0.184), pow(1.0 - uv.y, 1.6));
+  vec2 moon = vec2(0.72, 0.24);
+  // In units of screen height, so the moon is round on any display shape.
+  float d = length((uv - moon) * vec2(aspect, 1.0));
+  sky += vec3(0.95, 0.94, 0.85) * smoothstep(0.062, 0.055, d);
+  sky += vec3(0.35, 0.42, 0.55) * 0.35 * exp(-d * 9.0);
+  sky += vec3(0.9) * 0.55 * smoothstep(0.9985, 1.0, hash21(floor(uv * 900.0))) * (1.0 - uv.y * 1.4);
+
+  if (uv.y < 0.56) return sky;
+
+  float depth = (uv.y - 0.56) / 0.44;
+  vec2 w = vec2(uv.x * aspect * 16.0, depth * 8.0 - t * 0.45);
+  float swell = fbm(w) * (0.35 + depth * 0.9);
+  vec3 sea = mix(vec3(0.020, 0.055, 0.098), vec3(0.043, 0.125, 0.184), depth);
+  sea += swell * 0.16;
+  float column = exp(-abs(uv.x - moon.x) * (26.0 - depth * 18.0));
+  sea += vec3(0.85, 0.86, 0.78) * column * (0.16 + swell * 0.75) * depth;
+  return mix(sky, sea, smoothstep(0.0, 0.02, depth));
+}
+
+// --------------------------------------------------------------------------
+// The beach: the machine's own shoreline, on the device.
+//
+// The painter draws this scene on the CPU as a STILL — it is cached once per
+// display size and copied from then on, because recomputing a 1920x1080 sea
+// every frame costs a third of a core. A still sea is the one thing a sea
+// cannot be. So the picture is computed here instead, where it is a function
+// of coordinates and the clock and costs a GPU nothing, and the water moves,
+// the cloud deck drifts, and the wash runs up the sand and drains back.
+//
+// The model is the painter's: the sea is a PLANE IN THE WORLD, not a texture
+// on the screen. A pixel below the horizon has a distance that follows
+// 1/(y - horizon), which gives the wave texture its foreshortening for free,
+// and the moon's path is the SPECULAR of that surface rather than a painted
+// cone, so it breaks into separate glints on the swell. What is added here is
+// time: each swell travels at the speed its own wavelength gives it in deep
+// water (c = sqrt(g/k), so the long swells outrun the short chop), the cloud
+// deck is advected by a wind, and the shore line breathes with the tide.
+// --------------------------------------------------------------------------
+
+// Where the water meets the sand in this column, in units of screen height.
+// The three sines are the shape of the beach; the fourth is the tide, which
+// takes half a minute to come in and go back out.
+float beach_shore(float ux, float t) {
+  return 0.740 + 0.028 * sin(ux * 10.6 + 0.5)
+               + 0.012 * sin(ux * 27.8 + 2.1)
+               + 0.005 * sin(ux * 78.7 + 0.9)
+               + 0.010 * sin(t * 0.21);
+}
+
+// Distance from p to the segment ab. The palm is drawn out of these.
+float beach_seg(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+
+// The palm, as coverage in 0..1. Screen units: x has already been multiplied
+// by the aspect, so a circle here is a circle on the glass.
+//
+// Drawn as curves rather than as a wedge of angles: a frond is a spine that
+// falls away under its own weight with leaflets hanging off both sides of it,
+// and five straight spokes out of an atan2 test come out as triangles. The
+// whole thing sways — a palm in a sea breeze is never still — and the sway
+// grows along the trunk and again along each frond, so the crown moves a long
+// way and the roots do not move at all.
+float beach_palm(vec2 s, float aspect, float t) {
+  // Nothing outside the crown's reach pays for any of this.
+  if (s.x > 0.36 * aspect + 0.25 || s.y > 0.86) return 0.0;
+
+  const float PI = 3.14159265;
+  float sway = 0.010 * sin(t * 0.53) + 0.004 * sin(t * 0.91 + 1.7);
+  vec2 base  = vec2(0.085 * aspect, 0.800);
+  vec2 crown = vec2(0.145 * aspect + sway, 0.205);
+  float bend = 0.055 * aspect;
+  float cov = 0.0;
+
+  // Trunk: a quadratic that leans away from the wind, thick at the sand and
+  // thin at the crown, its bark showing as slight swells.
+  vec2 prev = base;
+  for (int i = 1; i <= 18; ++i) {
+    float u = float(i) / 18.0;
+    vec2 at = vec2(base.x + (crown.x - base.x) * u - bend * (u - u * u) * 4.0 + sway * u * u,
+                   base.y + (crown.y - base.y) * u);
+    float thick = 0.0055 * aspect * (1.0 - 0.45 * u) * (1.0 + 0.10 * sin(u * 46.0));
+    cov = max(cov, smoothstep(thick + 0.0009, thick - 0.0009, beach_seg(s, prev, at)));
+    prev = at;
+  }
+
+  // Nine fronds. Each is longest a third of the way out — which is where a
+  // frond is widest — serrated along its length, because a frond's edge is a
+  // row of separate leaflets and a smooth outline reads as a leaf, not a palm.
+  float reach = 0.205 * aspect;
+  for (int f = 0; f < 9; ++f) {
+    float a0 = -2.90 + float(f) * 0.4625;
+    float lf = 1.0 - 0.42 * abs(float(f) - 3.0) / 5.0;
+    float len = reach * lf;
+    float droop = 0.30 + 0.85 * pow(cos(a0) * 0.5 + 0.5, 0.6);
+    // The tip of a long frond lags the crown and whips further than it does.
+    float whip = sway * (2.2 + 1.6 * sin(t * 0.77 + float(f)));
+    const int STEPS = 56;
+    // A leaflet has to be at least half the gap to the next one wide or the
+    // blade comes out as a fish bone: the painter gets away with hairlines
+    // because it stamps one every PIXEL along the spine, and twenty-six of
+    // them along a frond is not that. Half the spacing is what closes the
+    // blade while leaving each leaflet's own tip visible on the edge, which
+    // is where a palm reads as a palm.
+    float leaf_w = 0.92 * len / float(STEPS);
+    vec2 p0 = crown;
+    for (int i = 1; i <= STEPS; ++i) {
+      float u = float(i) / float(STEPS);
+      vec2 at = vec2(crown.x + cos(a0) * len * u + whip * u * u,
+                     crown.y + sin(a0) * len * u + droop * len * u * u * 0.85);
+      // The spine, tapering.
+      float spine = 0.0022 * (1.0 - 0.70 * u);
+      cov = max(cov, smoothstep(spine + 0.0010, spine - 0.0010, beach_seg(s, p0, at)));
+      // Direction of travel, for the leaflets to lie back against.
+      vec2 dir = normalize(at - p0 + vec2(1e-6));
+      p0 = at;
+      // Serration is the leaflets being of DIFFERENT lengths, not one blade
+      // with a wobble on its outline: alternate ones reach further.
+      float serr = 0.84 + 0.16 * fract(float(i) * 0.5) + 0.06 * sin(float(i) * 2.3);
+      float blade = 0.034 * aspect * lf * serr * pow(sin(PI * pow(u, 0.72)), 0.85);
+      for (int side = -1; side <= 1; side += 2) {
+        // Perpendicular to the spine, then swept back along it by 40 degrees.
+        vec2 n = vec2(-dir.y * float(side) * 0.77 - dir.x * 0.64,
+                       dir.x * float(side) * 0.77 - dir.y * 0.64);
+        vec2 tip = at + n * blade + vec2(0.0, 0.22 * blade);   // leaflets hang
+        float d = beach_seg(s, at, tip);
+        // Tapered: fat where it leaves the spine, a point at its own tip.
+        float along = clamp(dot(s - at, tip - at) / max(dot(tip - at, tip - at), 1e-9), 0.0, 1.0);
+        // Tapered only a little: taper it hard and the leaflets stop
+        // touching one another past the half-way point and the frond comes
+        // back as a row of chevrons. A leaflet has to stay at least half the
+        // spacing wide for its whole length or the blade is not a blade.
+        // A SHORT leaflet has to be a THIN one. Held at the spacing width
+        // all the way to the tip of the frond — where the blade goes to
+        // nothing — each one degenerates to a disc the width of the gap
+        // between them, and the last third of every frond came back as a
+        // string of beads.
+        float w = min(leaf_w, 0.42 * blade) * (1.0 - 0.28 * along);
+        cov = max(cov, smoothstep(w + 0.0010, w - 0.0010, d));
+      }
+    }
+  }
+  return cov;
+}
+
+
+// ---- the shoreline's light ------------------------------------------------
+// Every colour the beach paints is read out of here rather than written into
+// the place it is used, so the time of day is ONE number and the sand, the sea,
+// the cloud, the foam and the body in the sky all move together. Four anchors
+// around the day, mixed: whatever falls between two of them is a real hour and
+// not a switch between two pictures.
+struct BeachLight {
+  vec2 body;        // the sun or the moon, in uv
+  float body_r;
+  float glow;
+  float lunar;      // 1 the moon (maria, limb darkening), 0 the sun (a disc)
+  float stars;
+  vec3 body_rgb, glow_rgb;
+  vec3 sky_zenith, sky_horizon;
+  vec3 sea_base, sea_lift, sea_crest, sea_haze, glint_rgb;
+  vec3 cloud_dark, cloud_lit, cloud_rim;
+  vec3 sand_far, sand_near;
+  vec3 foam, glaze, palm_rgb;
+};
+
+BeachLight beach_light(float tod) {
+  // key 0 midnight, 1 dawn, 2 midday, 3 dusk, 4 midnight again.
+  // x,y where it stands in the sky; z its radius; w how hard it glows.
+  const vec4 A_body[5] = vec4[5](vec4(0.720, 0.170, 0.062, 1.00),
+                                 vec4(0.720, 0.408, 0.050, 1.25),
+                                 vec4(0.720, 0.080, 0.030, 0.55),
+                                 vec4(0.720, 0.416, 0.056, 1.40),
+                                 vec4(0.720, 0.170, 0.062, 1.00));
+  // x how lunar it is, y how many stars are through it.
+  const vec2 A_kind[5] = vec2[5](vec2(1.0, 1.00), vec2(0.0, 0.16), vec2(0.0, 0.00),
+                                 vec2(0.0, 0.22), vec2(1.0, 1.00));
+  const vec3 A_body_rgb[5] = vec3[5](vec3(0.960, 0.965, 0.930), vec3(1.000, 0.880, 0.700),
+                                     vec3(1.000, 0.990, 0.940), vec3(1.000, 0.600, 0.280),
+                                     vec3(0.960, 0.965, 0.930));
+  const vec3 A_glow_rgb[5] = vec3[5](vec3(0.620, 0.720, 0.880), vec3(1.000, 0.550, 0.340),
+                                     vec3(1.000, 0.940, 0.780), vec3(1.000, 0.400, 0.160),
+                                     vec3(0.620, 0.720, 0.880));
+  const vec3 A_zenith[5]  = vec3[5](vec3(0.012, 0.028, 0.070), vec3(0.075, 0.135, 0.300),
+                                    vec3(0.145, 0.320, 0.660), vec3(0.055, 0.070, 0.215),
+                                    vec3(0.012, 0.028, 0.070));
+  const vec3 A_horizon[5] = vec3[5](vec3(0.097, 0.143, 0.235), vec3(0.930, 0.590, 0.470),
+                                    vec3(0.620, 0.760, 0.900), vec3(0.920, 0.420, 0.190),
+                                    vec3(0.097, 0.143, 0.235));
+  const vec3 A_sea[5]     = vec3[5](vec3(0.020, 0.052, 0.098), vec3(0.045, 0.068, 0.100),
+                                    vec3(0.035, 0.115, 0.175), vec3(0.040, 0.052, 0.086),
+                                    vec3(0.020, 0.052, 0.098));
+  // How much a swell's own height lifts the water's colour. Not a scale of the
+  // base — at night the blue lifts by four fifths of itself and the red by half
+  // again, and collapsing the two into one number visibly darkened the sea.
+  const vec3 A_lift[5]    = vec3[5](vec3(0.030, 0.055, 0.080), vec3(0.055, 0.050, 0.055),
+                                    vec3(0.050, 0.090, 0.110), vec3(0.050, 0.045, 0.048),
+                                    vec3(0.030, 0.055, 0.080));
+  const vec3 A_crest[5]   = vec3[5](vec3(0.070, 0.105, 0.150), vec3(0.170, 0.135, 0.120),
+                                    vec3(0.150, 0.210, 0.240), vec3(0.190, 0.110, 0.070),
+                                    vec3(0.070, 0.105, 0.150));
+  const vec3 A_haze[5]    = vec3[5](vec3(0.075, 0.105, 0.160), vec3(0.420, 0.360, 0.400),
+                                    vec3(0.480, 0.620, 0.740), vec3(0.460, 0.270, 0.220),
+                                    vec3(0.075, 0.105, 0.160));
+  const vec3 A_glint[5]   = vec3[5](vec3(0.950, 1.020, 1.100), vec3(1.150, 0.880, 0.660),
+                                    vec3(1.300, 1.280, 1.200), vec3(1.200, 0.680, 0.340),
+                                    vec3(0.950, 1.020, 1.100));
+  const vec3 A_cl_dark[5] = vec3[5](vec3(0.030, 0.042, 0.078), vec3(0.200, 0.185, 0.235),
+                                    vec3(0.520, 0.560, 0.640), vec3(0.150, 0.120, 0.190),
+                                    vec3(0.030, 0.042, 0.078));
+  const vec3 A_cl_lit[5]  = vec3[5](vec3(0.340, 0.380, 0.450), vec3(0.950, 0.740, 0.660),
+                                    vec3(0.980, 0.985, 1.000), vec3(0.920, 0.560, 0.420),
+                                    vec3(0.340, 0.380, 0.450));
+  const vec3 A_cl_rim[5]  = vec3[5](vec3(0.300, 0.310, 0.290), vec3(1.000, 0.620, 0.400),
+                                    vec3(1.000, 1.000, 0.960), vec3(1.000, 0.500, 0.220),
+                                    vec3(0.300, 0.310, 0.290));
+  const vec3 A_sand_f[5]  = vec3[5](vec3(0.085, 0.072, 0.058), vec3(0.230, 0.185, 0.155),
+                                    vec3(0.520, 0.455, 0.360), vec3(0.195, 0.140, 0.120),
+                                    vec3(0.085, 0.072, 0.058));
+  const vec3 A_sand_n[5]  = vec3[5](vec3(0.300, 0.242, 0.176), vec3(0.520, 0.430, 0.330),
+                                    vec3(0.840, 0.760, 0.600), vec3(0.460, 0.330, 0.235),
+                                    vec3(0.300, 0.242, 0.176));
+  const vec3 A_foam[5]    = vec3[5](vec3(0.620, 0.720, 0.800), vec3(0.860, 0.820, 0.820),
+                                    vec3(0.960, 0.980, 1.000), vec3(0.880, 0.740, 0.680),
+                                    vec3(0.620, 0.720, 0.800));
+  const vec3 A_glaze[5]   = vec3[5](vec3(0.340, 0.400, 0.460), vec3(0.600, 0.540, 0.540),
+                                    vec3(0.660, 0.740, 0.820), vec3(0.620, 0.440, 0.360),
+                                    vec3(0.340, 0.400, 0.460));
+  const vec3 A_palm[5]    = vec3[5](vec3(0.012, 0.024, 0.051), vec3(0.055, 0.045, 0.060),
+                                    vec3(0.130, 0.160, 0.105), vec3(0.048, 0.030, 0.042),
+                                    vec3(0.012, 0.024, 0.051));
+
+  float u = clamp(tod, 0.0, 1.0) * 4.0;
+  int i = int(min(floor(u), 3.0));
+  // Eased rather than linear: the hours either side of a keyframe are the ones
+  // where the light is actually settled, and the change belongs in between.
+  float f = smoothstep(0.0, 1.0, u - float(i));
+
+  BeachLight L;
+  vec4 b = mix(A_body[i], A_body[i + 1], f);
+  L.body = b.xy; L.body_r = b.z; L.glow = b.w;
+  vec2 kk = mix(A_kind[i], A_kind[i + 1], f);
+  L.lunar = kk.x; L.stars = kk.y;
+  L.body_rgb   = mix(A_body_rgb[i], A_body_rgb[i + 1], f);
+  L.glow_rgb   = mix(A_glow_rgb[i], A_glow_rgb[i + 1], f);
+  L.sky_zenith = mix(A_zenith[i],   A_zenith[i + 1],   f);
+  L.sky_horizon= mix(A_horizon[i],  A_horizon[i + 1],  f);
+  L.sea_base   = mix(A_sea[i],      A_sea[i + 1],      f);
+  L.sea_lift   = mix(A_lift[i],     A_lift[i + 1],     f);
+  L.sea_crest  = mix(A_crest[i],    A_crest[i + 1],    f);
+  L.sea_haze   = mix(A_haze[i],     A_haze[i + 1],     f);
+  L.glint_rgb  = mix(A_glint[i],    A_glint[i + 1],    f);
+  L.cloud_dark = mix(A_cl_dark[i],  A_cl_dark[i + 1],  f);
+  L.cloud_lit  = mix(A_cl_lit[i],   A_cl_lit[i + 1],   f);
+  L.cloud_rim  = mix(A_cl_rim[i],   A_cl_rim[i + 1],   f);
+  L.sand_far   = mix(A_sand_f[i],   A_sand_f[i + 1],   f);
+  L.sand_near  = mix(A_sand_n[i],   A_sand_n[i + 1],   f);
+  L.foam       = mix(A_foam[i],     A_foam[i + 1],     f);
+  L.glaze      = mix(A_glaze[i],    A_glaze[i + 1],    f);
+  L.palm_rgb   = mix(A_palm[i],     A_palm[i + 1],     f);
+  return L;
+}
+
+vec3 beach(vec2 uv, float t, float aspect, float hpx) {
+  const float y_horizon = 0.460;
+  BeachLight L = beach_light(p.tod);
+  // "moon" throughout: at night it IS the moon, and at every other hour it is
+  // the sun standing where the moon stood. The geometry does not care which.
+  vec2  moon = L.body;
+  float mr = L.body_r;
+  // How high it stands over the water. The specular path and the haze both
+  // need it, and it is what changes when the hour does.
+  float body_up = max(y_horizon - moon.y, 0.004);
+
+  vec2 s = vec2(uv.x * aspect, uv.y);              // screen units, round circles
+  float d_moon = length(s - vec2(moon.x * aspect, moon.y));
+  float yy = uv.y - y_horizon;                     // below the horizon, positive
+  vec3 c;
+
+  if (yy < 0.0) {
+    // ---- the night sky ---------------------------------------------------
+    // Warmed toward the horizon: air scatters the moon's light along the
+    // longest path through it, which is the way you are looking when you look
+    // out to sea.
+    float k = uv.y / y_horizon;                    // 0 zenith, 1 horizon
+    float lift = k * k * k;                        // stays dark until low
+    c = mix(L.sky_zenith, L.sky_horizon, lift);
+
+    // Stars, thinned near the horizon haze where the sky drowns them.
+    if (k < 0.94 && L.stars > 0.02) {
+      vec2 g = floor(uv * vec2(hpx * aspect, hpx) * 0.75);
+      float u = hash21(g);
+      if (u > 0.9988) {
+        float br = 0.35 + 0.65 * hash21(g.yx + 13.0);
+        // Stars twinkle because the air between is moving, and each one
+        // twinkles on its own clock.
+        br *= 0.72 + 0.28 * sin(t * (1.7 + 3.1 * hash21(g + 7.0)) + u * 400.0);
+        c += br * L.stars * (1.0 - k * 0.75) * vec3(0.85, 0.90, 1.00);
+      }
+    }
+
+    // The moon: maria as broad soft patches, and a limb that darkens the way
+    // a lit sphere does rather than a ring stuck on the edge.
+    // Two-lobe halo: a tight corona and a wide bloom. One lobe reads as a
+    // hard disc of glow with a visible edge. Computed on BOTH sides of the
+    // limb: added only outside it, the pixel just inside the disc lost the
+    // whole corona and the moon came back with a dark ring bitten out of its
+    // edge. max(e, 0) keeps it flat across the disc rather than blowing up.
+    {
+      float e = max((d_moon - mr) / mr, 0.0);
+      float a = (0.55 * exp(-e * e * 1.6) + 0.16 * exp(-e * 0.75)) * L.glow;
+      c += a * L.glow_rgb;
+    }
+    if (d_moon < mr + 3.0 / hpx) {
+      vec2 n = (s - vec2(moon.x * aspect, moon.y)) / mr;
+      float nz = sqrt(max(0.0, 1.0 - dot(n, n)));
+      float maria = clamp(0.5 + 0.5 * sin(n.x * 4.1 + 0.7) * cos(n.y * 3.3 - 0.4)
+                              + 0.25 * sin((n.x + n.y) * 6.0), 0.0, 1.0);
+      // Maria and limb darkening are the MOON's face. The sun has neither —
+      // it is a flat blinding disc — so both are weighted by how lunar the
+      // body in the sky currently is, and at noon the disc comes out plain.
+      float lit = (1.0 - 0.18 * maria * L.lunar)
+                * mix(1.0, 0.55 + 0.45 * pow(nz, 0.45), L.lunar);
+      // The background is marched at a THIRD of the display's resolution when
+      // nobody is at the machine. A limb antialiased over one pixel is a hard
+      // edge at that sample spacing, and the moon came back with a dotted
+      // rim; over three it is round at every rate the desktop marches at.
+      float cov = smoothstep(-2.0 / hpx, 2.0 / hpx, mr - d_moon);
+      c = mix(c, L.body_rgb * lit, cov);
+      // A MOON is the brightest thing in a night sky and the disc replacing
+      // what was behind it is right. A sun is not: its own corona is brighter
+      // than its face, and replacing the halo with a flat disc left the setting
+      // sun looking like a hole punched in its own glow. Put the corona back
+      // over the face, in proportion to how solar the body is.
+      c += (1.0 - L.lunar) * cov * L.glow_rgb * (0.30 + 0.45 * L.glow);
+    }
+
+    // ---- the cloud deck --------------------------------------------------
+    // Cloud sits on a PLANE too, so it crowds toward the horizon the same way
+    // the sea does and for the same reason: a deck seen edge-on is a hundred
+    // miles of it stacked into the last few rows of pixels. The wind carries
+    // it across that plane, not across the screen, so it slows and flattens
+    // as it goes out — which is what makes the sky read as deep rather than
+    // as a texture sliding over glass.
+    {
+      float up = y_horizon - uv.y;
+      float dist = 0.155 / (up + 0.013);
+      vec2 cp = vec2((uv.x - 0.5) * aspect * dist * 2.4 + t * 0.055, dist * 1.35 + t * 0.012);
+      float f = fbm(cp * 1.05);
+      // Detail finer than the pixel it is sampled at cannot be drawn: fading
+      // it out is what keeps the far deck from boiling into noise.
+      float res = clamp(1.35 - dist * 0.055, 0.0, 1.0);
+      f = mix(0.5, f, res);
+      float cover = smoothstep(0.50, 0.72, f) * (0.55 + 0.45 * res);
+      // The rim of a cloud is the bright part: that is where you are looking
+      // through the least of it at the moon behind.
+      float rim = clamp(1.0 - abs(f - 0.60) / 0.16, 0.0, 1.0);
+      float moonlit = exp(-max(0.0, d_moon - mr) * 2.6);
+      vec3 cloud = mix(L.cloud_dark, L.cloud_lit,
+                       0.16 + 0.84 * moonlit * (0.35 + 0.65 * rim));
+      cloud += L.cloud_rim * moonlit * rim * 0.55;
+      c = mix(c, cloud, cover * 0.80);
+    }
+
+  } else {
+    // Where this pixel is on the water plane, and how big a wave looks there.
+    float depth = 0.62 / (yy + 0.9 / hpx);
+    float wx = (uv.x - moon.x) * aspect * depth * 2.6;
+    float y_shore = beach_shore(uv.x, t);
+
+    if (uv.y < y_shore) {
+      // ---- the sea -------------------------------------------------------
+      // Six travelling swells. Every one of them runs mostly ALONG the shore
+      // — the across-shore term is a tenth of the along-shore one — because
+      // that is what a swell does: it arrives in lines parallel to the beach
+      // and only leans a little. Weighting the two evenly turns the sea into
+      // spokes radiating from a vanishing point.
+      const float kz[6] = float[6](0.115, 0.270, 0.640, 1.420, 3.10, 6.40);
+      const float kx[6] = float[6](0.055, -0.098, 0.165, -0.240, 0.420, -0.660);
+      const float amp[6] = float[6](0.50, 0.26, 0.14, 0.075, 0.048, 0.030);
+
+      float dwx_dx = depth * 2.6 / hpx;
+      float ddepth_dy = -depth / ((yy + 0.9 / hpx) * hpx);
+      float dwx_dy = -wx / ((yy + 0.9 / hpx) * hpx);
+      float h = 0.0, sx = 0.0, sz = 0.0;
+      for (int n = 0; n < 6; ++n) {
+        // An octave finer than the pixel it is sampled at cannot be drawn —
+        // sampling it anyway is what puts a fan of rays over the far water,
+        // because the fine detail aliases along the lines of constant world-x
+        // and those lines all meet at the vanishing point. Fading an octave
+        // out as it approaches a pixel wide is what a real horizon does: you
+        // stop being able to resolve ripples a mile out.
+        float rate = abs(kx[n] * dwx_dx) + abs(kz[n] * ddepth_dy + kx[n] * dwx_dy);
+        float fade = clamp(1.55 - rate * 2.6, 0.0, 1.0);
+        if (fade <= 0.0) continue;
+        float a = amp[n] * fade;
+        // Deep water is dispersive: c = sqrt(g/k), so the long swell outruns
+        // the chop riding on it and the surface never repeats.
+        float om = 1.25 * sqrt(kz[n]);
+        float ph = depth * kz[n] + wx * kx[n] - t * om;
+        float cs = cos(ph);
+        h  += a * sin(ph);
+        sx += a * kx[n] * cs;            // tilt across the line of sight
+        sz += a * kz[n] * cs;            // tilt toward the viewer
+      }
+
+      // Base water: dark, and picking up a little of the sky it faces. Crests
+      // catch the sky; troughs are the sea's own colour.
+      float crest = clamp(h * 1.8, 0.0, 1.0);
+      c = L.sea_base + L.sea_lift * (0.5 + 0.5 * h) + crest * L.sea_crest;
+
+      // ---- the moon's path, as specular off the actual facets ------------
+      // A facet sends the moon to the eye when its slope happens to bisect
+      // them. The azimuth a pixel needs depends on its COLUMN alone, which is
+      // why a moon path is a vertical band and not a fan; the elevation it
+      // needs passes through zero where flat water would mirror the moon,
+      // which is where a real path is brightest.
+      float need_x = (uv.x - moon.x) / 0.30;
+      // The elevation a facet needs passes through zero where FLAT water would
+      // mirror the body, and where that is depends on how high the body stands:
+      // 0.42 was the moon's own height baked in, and a sun near the horizon
+      // mirrors far out instead. 1.43 * body_up reproduces the moon exactly at
+      // its old elevation and tracks the sun down to the water.
+      float need_z = 1.448 * body_up - 1.10 * yy;
+      float miss_x = sx * 5.0 - need_x;
+      float miss_z = sz * 1.50 - need_z;
+      // A low body throws a LONG path — the band of slopes that can send it to
+      // the eye is wide when it is on the horizon and narrow when it is
+      // overhead. Tightening this at noon is what stops the midday sea being
+      // one flat sheet of white.
+      float z_tight = 13.0 / (1.0 + 30.0 * max(0.0, 0.26 - body_up));
+      float glint = exp(-miss_x * miss_x * 9.0 - miss_z * miss_z * z_tight);
+      float column = exp(-need_x * need_x * 3.0);
+      c += glint * column * L.glint_rgb;
+      // A broad sheen under the column as well: the water there is simply
+      // brighter, glints or no glints.
+      c += column * L.glint_rgb * vec3(0.032, 0.037, 0.045);
+
+      // The horizon is haze, not the line where one ramp stops.
+      float haze = exp(-yy / 0.055);
+      c = mix(c, L.sea_haze, haze);
+
+      // ---- the break and its foam ----------------------------------------
+      // The set breathes: the break moves out and in over about nine seconds,
+      // and the foam it leaves is ragged on four scales, which is the part
+      // that sells it.
+      float to_shore = y_shore - uv.y;
+      float band = 0.085 * (0.86 + 0.14 * sin(t * 0.68));
+      if (to_shore < band) {
+        float f = 1.0 - to_shore / band;
+        // Four scales of raggedness. The finest one the PAINTER uses has a
+        // period of about four pixels, and the background is marched at half
+        // resolution or a third of it — so on the device that term is finer
+        // than the sample and it came back as stair-steps along the foam
+        // edge rather than as texture in it. Capped at what the march can
+        // actually resolve, and the edge itself softened over a band rather
+        // than clamped to a hard line.
+        float n = 0.5 + 0.5 * sin(uv.x * 105.6 + 1.3 + t * 0.20) * cos(uv.x * 40.3 - 0.7)
+                      + 0.18 * sin(uv.x * 210.0 + 2.2 - t * 0.5)
+                      + 0.10 * sin(uv.x * 420.0 - 1.1 + t * 0.9);
+        float edge = smoothstep(0.0, 1.0, clamp((f - 0.72 + 0.20 * n) * 3.2 + 0.5, 0.0, 1.0));
+        float wash = clamp((f - 0.25) * 1.1, 0.0, 1.0);
+        float a = clamp(edge * 0.62 + wash * wash * 0.22, 0.0, 1.0);
+        c = mix(c, L.foam, a);
+      }
+
+    } else {
+      // ---- wet sand, then dry --------------------------------------------
+      float from_shore = uv.y - y_shore;
+      float k = from_shore / max(0.001, 1.0 - y_shore);
+
+      // The wash: each break sends a sheet of water up the sand and it drains
+      // back. How far it reaches is the tide's own slow beat with a faster one
+      // on top, and the sand it has just left is the wettest thing in the
+      // picture — that drying edge is the only part of a beach that tells you
+      // the sea is moving when you cannot see the sea.
+      // Measured on the running desktop, a surge of 0.03 of the screen moved
+      // 0.7% of the sand's pixels over two and a half seconds: the wet edge
+      // was sliding around under the foam and never got out onto open sand,
+      // so the beach was as dead as the still it replaced. A wash runs a good
+      // way up — most of the way to the berm — and what it leaves behind is
+      // the wettest thing in the picture.
+      float surge = 0.075 * (0.5 + 0.5 * sin(t * 0.68 - 1.2))
+                  + 0.030 * (0.5 + 0.5 * sin(t * 0.31 + 0.4));
+      // The sand dries from the top down after the sheet drains, so the edge
+      // is soft going up the beach and sharp coming back down it.
+      float wet = exp(-max(0.0, from_shore - surge) / 0.060);
+
+      c = mix(L.sand_far, L.sand_near, k);
+      // Ripples the last tide left: ridges running along the shore, opening
+      // out toward your feet because they are nearer.
+      float rip = sin(from_shore * (300.0 / (1.0 + from_shore * 16.0))
+                      + 2.4 * sin(uv.x * 7.0) + 1.3 * fbm(vec2(uv.x * 6.0, from_shore * 9.0)));
+      c *= 1.0 + rip * (0.055 + 0.075 * k) * (1.0 - 0.6 * wet);
+      // Wet sand is darker, smoother, and it MIRRORS: the moon's column
+      // carries on across it, dimmer and shorter.
+      c *= vec3(1.0 - 0.45 * wet, 1.0 - 0.45 * wet, 1.0 - 0.40 * wet);
+      float need_x = (uv.x - moon.x) / 0.30;
+      float column = exp(-need_x * need_x * 3.0);
+      c += column * wet * L.glint_rgb * vec3(0.316, 0.333, 0.364);
+      // The thin sheet still running off it catches the sky as a glaze, and
+      // its leading edge carries a lip of foam.
+      float sheet = smoothstep(0.010, 0.0, from_shore - surge);
+      c = mix(c, L.glaze, sheet * 0.50);
+      // Sea and sand are different branches of an if, so the shore line is a
+      // step in VALUE — and the background is marched at half resolution or a
+      // third, which turned that step into a staircase along the whole beach.
+      // The foam does not stop dead at the water's edge; carrying it a little
+      // way onto the sand makes the two sides meet at the same brightness and
+      // the staircase has nothing to climb.
+      float lip = smoothstep(0.014, 0.0, from_shore);
+      c = mix(c, L.foam, lip * 0.77);
+
+      // Grain, finer in the distance than at your feet, and the odd dry grain
+      // catching the moon outright.
+      vec2 g = uv * vec2(hpx * aspect, hpx);
+      float grain = (hash21(g) - 0.5) * (0.030 + 0.035 * k);
+      c += grain;
+      float spark = hash21(g + 91.0);
+      // A dry grain catching the light outright. It reads at night and at
+      // dusk; in daylight the sand around it is already brighter than the
+      // spark, so it is faded out with the stars rather than left twinkling
+      // through a noon beach.
+      if (spark > 0.9992 && wet < 0.25)
+        c += L.body_rgb * vec3(0.3125, 0.321, 0.301) * max(L.stars, L.lunar)
+           * (0.4 + 0.6 * sin(t * 2.1 + spark * 900.0));
+    }
+  }
+
+  // The palm, in front of all of it.
+  c = mix(c, L.palm_rgb, beach_palm(s, aspect, t));
+  return c;
+}
+
+// A lattice of cells lighting as a wavefront crosses them: the machine's own
+// idea of thinking, and the cheapest thing in the world for a GPU to draw.
+vec3 lattice(vec2 uv, float t, float aspect) {
+  vec2 g = uv * vec2(46.0, 26.0);
+  vec2 cell = floor(g);
+  vec2 f = fract(g) - 0.5;
+  float seed = hash21(cell);
+  float wave = sin(t * 1.35 - (cell.x + cell.y) * 0.22 + seed * 6.28) * 0.5 + 0.5;
+  float dot_r = 0.045 + 0.075 * wave * seed;
+  float node = smoothstep(dot_r, dot_r * 0.35, length(f));
+  float lines = smoothstep(0.030, 0.0, abs(f.x)) + smoothstep(0.030, 0.0, abs(f.y));
+
+  vec3 base = mix(vec3(0.016, 0.031, 0.055), vec3(0.031, 0.070, 0.109), uv.y);
+  vec3 ink = mix(vec3(0.18, 0.85, 0.72), vec3(0.24, 0.55, 0.95), seed);
+  vec3 c = base + ink * node * (0.35 + wave * 0.85);
+  c += ink * lines * 0.055 * wave;
+  float centre = 1.0 - smoothstep(0.0, 0.75, length((uv - 0.5) * vec2(aspect, 1.0)));
+  return c + ink * centre * 0.10;
+}
+
+// A plasma core: a sphere of banded noise with a halo, turning.
+vec3 core(vec2 uv, float t, float aspect) {
+  // Was a hardcoded 1.78: the orb was a circle only on a 16:9 display.
+  vec2 q = (uv - 0.5) * vec2(aspect, 1.0);
+  float r = length(q);
+  vec3 c = mix(vec3(0.020, 0.016, 0.047), vec3(0.008, 0.008, 0.020), r);
+
+  float radius = 0.28;
+  float halo = exp(-pow(max(0.0, r - radius) * 6.0, 1.5));
+  c += vec3(0.36, 0.24, 0.85) * halo * 0.55;
+
+  if (r < radius) {
+    float z = sqrt(max(0.0, radius * radius - r * r)) / radius;
+    vec3 n = normalize(vec3(q / radius, z));
+    // The angle fed the noise directly, so the field jumped where atan wraps at
+    // pi and drew a seam down the orb. Going round on cos/sin instead closes it.
+    float a = atan(n.y, n.x);
+    vec2 ring = vec2(cos(a), sin(a)) * (2.2 + n.z * 1.1);
+    float bands = fbm(ring * 1.7 + vec2(t * 0.22, -t * 0.14));
+    vec3 plasma = mix(vec3(0.25, 0.55, 0.95), vec3(0.95, 0.35, 0.75), bands);
+    plasma = mix(plasma, vec3(1.0, 0.95, 0.85), pow(bands, 6.0) * 0.7);
+    float rim = pow(1.0 - z, 2.2);
+    c = plasma * (0.35 + z * 0.85) + vec3(0.45, 0.55, 1.0) * rim * 0.55;
+  }
+  return c;
+}
+
+// --------------------------------------------------------------------------
+// The composed scene: one raymarcher over a description, instead of one
+// function per picture. Everything that used to be a literal in a scene
+// function — the sky, the light, the ground, what is standing on it — is read
+// from the buffer, so a scene nobody wrote a function for still draws.
+// --------------------------------------------------------------------------
+float sd_sphere(vec3 p3, float r) { return length(p3) - r; }
+
+float sd_box(vec3 p3, vec3 b) {
+  vec3 q = abs(p3) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float sd_torus(vec3 p3, float major, float minor) {
+  return length(vec2(length(p3.xz) - major, p3.y)) - minor;
+}
+
+float sd_cylinder(vec3 p3, float r, float half_h) {
+  vec2 dd = vec2(length(p3.xz) - r, abs(p3.y) - half_h);
+  return min(max(dd.x, dd.y), 0.0) + length(max(dd, 0.0));
+}
+
+// A cone standing on its base: base radius r at y=0, apex at y=h. The exact
+// capped-cone field with the top radius at zero — the hand-rolled version this
+// replaces used a 2D cross product written as a vec3 swizzle and would not
+// compile.
+float sd_cone(vec3 p3, float r, float h) {
+  float hh = max(h, 1e-3) * 0.5;
+  vec3 p = vec3(p3.x, p3.y - hh, p3.z);      // centre it on its own axis
+  vec2 q = vec2(length(p.xz), p.y);
+  vec2 k1 = vec2(0.0, hh);
+  vec2 k2 = vec2(-r, 2.0 * hh);
+  vec2 ca = vec2(q.x - min(q.x, (q.y < 0.0) ? r : 0.0), abs(q.y) - hh);
+  vec2 cb = q - k1 + k2 * clamp(dot(k1 - q, k2) / max(dot(k2, k2), 1e-6), 0.0, 1.0);
+  float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
+}
+
+// Hexagonal Prism (crystals, columns, sci-fi pylons)
+float sd_hex_prism(vec3 p, vec2 h) {
+  const vec3 k = vec3(-0.8660254, 0.5, 0.57735);
+  p = abs(p);
+  p.xz -= 2.0 * min(dot(k.xy, p.xz), 0.0) * k.xy;
+  vec2 d = vec2(
+      length(p.xz - vec2(clamp(p.xz.x, -k.z * h.x, k.z * h.x), h.x)) * sign(p.z - h.x),
+      p.y - h.y);
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+// 3-axis Ellipsoid (organic bodies, smooth rocks, fruits, pebbles)
+float sd_ellipsoid(vec3 p, vec3 r) {
+  float k0 = length(p / r);
+  float k1 = length(p / (r * r));
+  return k0 * (k0 - 1.0) / max(k1, 1e-6);
+}
+
+// Flat Ring / Halo / Planetary Disc
+float sd_ring(vec3 p, float major_r, float minor_r, float thickness) {
+  float dist_xz = length(p.xz) - major_r;
+  vec2 d = vec2(abs(dist_xz) - minor_r, abs(p.y) - thickness);
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+// 8-sided Octahedron / Gemstone
+float sd_octahedron(vec3 p, float s) {
+  p = abs(p);
+  float m = p.x + p.y + p.z - s;
+  vec3 q;
+       if (3.0 * p.x < m) q = p.xyz;
+  else if (3.0 * p.y < m) q = p.yzx;
+  else if (3.0 * p.z < m) q = p.zxy;
+  else return m * 0.57735027;
+  float k = clamp(0.5 * (q.z - q.y + s), 0.0, s);
+  return length(vec3(q.x, q.y - s + k, q.z - k));
+}
+
+// Curved Architectural Arch / Portal / Bridge
+float sd_arch(vec3 p, float outer_r, float inner_r, float half_d) {
+  float r_center = (outer_r + inner_r) * 0.5;
+  float r_thick = (outer_r - inner_r) * 0.5;
+  float d_curve = max(abs(length(vec2(p.x, max(0.0, p.y))) - r_center) - r_thick, abs(p.z) - half_d);
+  float d_legs = max(abs(abs(p.x) - r_center) - r_thick, max(-p.y, abs(p.z) - half_d));
+  return min(d_curve, d_legs);
+}
+
+// 3D Stellated Star / Crystal Cluster
+float sd_star(vec3 p, float r) {
+  float d1 = sd_octahedron(p, r);
+  float d2 = sd_octahedron(p.zxy, r);
+  float d3 = sd_octahedron(p.yzx, r);
+  return min(d1, min(d2, d3));
+}
+
+// ---------------------------------------------------------------------------
+// Terrain
+// ---------------------------------------------------------------------------
+// The flat grounds take an exact ray-plane intersection, which is why they are
+// fast and why they can only ever be flat. Ground WITH relief is a height
+// field, so it is marched instead — and once there is a height field, a river
+// is that field with a channel cut through it and a water line filled in.
+
+// Where the river runs, as a signed distance in the xz plane: a curve rather
+// than a straight cut, or it reads as a canal.
+// Ridged multifractal. fbm sums smooth lobes, which is why fbm terrain reads
+// as dunes whatever you ask it for: mountains have CREASES, and a crease is
+// what you get by folding the noise about zero and squaring the fold. Each
+// octave is weighted by the one above it, so ridgelines stay connected down
+// the scales instead of dissolving into gravel.
+float ridged_lod(vec2 v, int oct) {
+  const mat2 turn = mat2(0.80, 0.60, -0.60, 0.80);
+  float sum = 0.0, amp = 0.5, prev = 1.0;
+  for (int i = 0; i < oct; ++i) {
+    float n = 1.0 - abs(noise(v) * 2.0 - 1.0);
+    n *= n;
+    sum += amp * n * prev;
+    prev = clamp(n, 0.0, 1.0);
+    v = turn * v * 2.06;
+    amp *= 0.52;
+  }
+  return sum;
+}
+float ridged(vec2 v) { return ridged_lod(v, 6); }
+
+// fbm with a chosen octave count. Every octave is four integer hashes, and a
+// terrain sample that runs them all is the single most expensive thing in this
+// shader — a marched ray takes two hundred of them. Detail smaller than a
+// pixel is detail nobody sees, so the far samples take fewer.
+float fbm_lod(vec2 v, int oct) {
+  const mat2 turn = mat2(0.80, 0.60, -0.60, 0.80);
+  float sum = 0.0, amp = 0.5;
+  for (int i = 0; i < oct; ++i) { sum += amp * noise(v); v = turn * v * 2.03; amp *= 0.5; }
+  return sum;
+}
+
+// xz.x is world x and xz.y is world z — the pair, not a 3-vector.
+float river_axis(vec2 xz) {
+  return xz.x + 2.6 * sin(xz.y * 0.13) + 1.1 * sin(xz.y * 0.041 + 1.7);
+}
+
+// The highest this ground can ever reach. A ray above it and climbing cannot
+// hit anything, and a ray below can start where it crosses — which is what
+// stops a sky pixel paying for a hundred and sixty terrain samples to discover
+// it was looking at sky.
+float terrain_ceiling(int kind) {
+  if (kind == 4) return 2.3;
+  if (kind == 5) return 3.2;
+  if (kind == 6) return 5.8;  // Canyon
+  if (kind == 7) return 6.5;  // Volcano
+  if (kind == 8) return 5.5;  // Glacier
+  return 6.8;
+}
+
+float terrain_h_lod(vec2 xz, int kind, int oct) {
+  if (kind == 4) {
+    // Dunes: long smooth swells with one dominant direction.
+    float d = sin(xz.x * 0.11 + fbm_lod(xz * 0.05, min(oct, 3)) * 2.4) * 1.5;
+    return d + fbm_lod(xz * 0.10, oct) * 0.55;
+  }
+  if (kind == 5) {
+    // River: lower hills than open highland, so the valley is the subject
+    // rather than something hidden behind the first ridge, and a channel cut
+    // along the axis with banks that fall away to it.
+    float h = fbm_lod(xz * 0.075, oct) * 2.3 + fbm_lod(xz * 0.24, min(oct, 3)) * 0.5;
+    float a = abs(river_axis(xz));
+    float bank = exp(-a * a * 0.020);          // the valley floor it sits in
+    float cut  = exp(-a * a * 0.085);          // the channel itself
+    h = mix(h, 0.15, clamp(bank, 0.0, 1.0));   // flatten the valley
+    h = mix(h, -1.05, clamp(cut * 1.25, 0.0, 1.0));
+    return h;
+  }
+  if (kind == 6) {
+    // Canyon: Stepped terraced sandstone plateau with deep carved gorge
+    float base_noise = fbm_lod(xz * 0.045, min(oct, 4));
+    float h = base_noise * 4.6;
+    float step_f = floor(h * 1.6) / 1.6;
+    float step_frac = fract(h * 1.6);
+    h = step_f + smoothstep(0.40, 0.60, step_frac) / 1.6;
+    float chasm_axis = xz.x + 3.2 * sin(xz.y * 0.09) + 1.4 * cos(xz.y * 0.035);
+    float chasm = exp(-chasm_axis * chasm_axis * 0.075);
+    h = mix(h, -1.4, clamp(chasm * 1.4, 0.0, 1.0));
+    return h;
+  }
+  if (kind == 7) {
+    // Volcano: Conical stratovolcano with caldera crater at apex
+    float dist = length(xz);
+    float cone = max(0.0, 6.0 - dist * 0.72) + fbm_lod(xz * 0.08, min(oct, 3)) * 0.65;
+    float crater = max(0.0, 2.0 - dist * 1.15) * 2.4;
+    return max(cone - crater, -0.4);
+  }
+  if (kind == 8) {
+    // Glacier: Jagged crystalline ice field with crevasses and seracs
+    float rifts = abs(fbm_lod(xz * 0.09, oct) * 2.0 - 1.0);
+    return ridged_lod(xz * 0.06, oct) * 3.8 + rifts * 1.3 - 0.5;
+  }
+  // Hills/mountains: ridged, so the skyline has edges. A little fbm under it
+  // keeps the lower slopes from looking machined.
+  return ridged_lod(xz * 0.055, oct) * 7.0 - 1.2 + fbm_lod(xz * 0.22, min(oct, 3)) * 0.55;
+}
+
+float terrain_h(vec2 xz, int kind) { return terrain_h_lod(xz, kind, 6); }
+
+// The water plane a river fills to. Above this the channel is dry bank.
+const float kRiverLevel = -0.35;
+
+// How much sun reaches a point on the terrain, against the terrain ITSELF.
+// composed_shadow only ever marched the solids, so a mountain range was lit as
+// though every ridge were transparent: no valley in shade, no side in shadow,
+// which is most of why a height field reads as a bump map rather than land.
+float terrain_shadow(vec3 at, vec3 sun, int kind) {
+  if (sun.y <= 0.02) return 0.0;
+  const float ceil_h = terrain_ceiling(kind);
+  float shade = 1.0;
+  float tt = 0.35;
+  // Three octaves, twenty-four steps, and stop at the ceiling. A shadow is a
+  // soft quantity — it does not need ridgelines resolved, and running it at
+  // full detail for forty-eight steps doubled the cost of every lit pixel.
+  for (int i = 0; i < 24; ++i) {
+    vec3 p = at + sun * tt;
+    if (p.y > ceil_h) break;
+    float gap = p.y - terrain_h_lod(p.xz, kind, 3);
+    if (gap < 0.004) return 0.0;
+    shade = min(shade, 10.0 * gap / tt);
+    tt += clamp(gap * 0.8, 0.25, 3.0);
+    if (tt > 45.0) break;
+  }
+  return clamp(shade, 0.0, 1.0);
+}
+
+// The sky in a direction, so a water surface can REFLECT it rather than being
+// painted a flat blue. Same gradient and sun the camera ray sees.
+vec3 sky_in(vec3 dir, vec3 sky_low, vec3 sky_high, vec3 sun, vec3 sun_rgb, float sun_tight) {
+  float horizon = clamp(dir.y * 2.6 + 0.30, 0.0, 1.0);
+  vec3 c = mix(sky_low, sky_high, horizon);
+  c += sun_rgb * pow(max(0.0, dot(dir, sun)), sun_tight) * 0.9;
+  return c;
+}
+
+float dot2(vec3 v) { return dot(v, v); }
+
+// ---------------------------------------------------------------------------
+// The segment primitives
+// ---------------------------------------------------------------------------
+// Everything above is an axis-aligned lump: a position and a size and no
+// DIRECTION. A limb points somewhere, so these are given two points instead
+// and carry their own orientation in their own data — no rotation to store, no
+// matrix to build, and a taper between two radii is a neck, a tail, a thigh or
+// a horn depending only on where its ends are.
+
+float sd_capsule(vec3 p, vec3 a, vec3 b, float r) {
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+// A cone with round caps between two points: the workhorse of anything grown
+// rather than built.
+float sd_taper(vec3 p, vec3 a, vec3 b, float ra, float rb) {
+  vec3 ba = b - a;
+  float l2 = max(dot(ba, ba), 1e-6);
+  float rr = ra - rb;
+  float a2 = l2 - rr * rr;
+  float il2 = 1.0 / l2;
+  vec3 pa = p - a;
+  float y = dot(pa, ba);
+  float z = y - l2;
+  vec3 xp = pa * l2 - ba * y;
+  float x2 = dot(xp, xp);
+  float y2 = y * y * l2;
+  float z2 = z * z * l2;
+  float k = sign(rr) * rr * rr * x2;
+  if (sign(z) * a2 * z2 > k) return sqrt(max(x2 + z2, 0.0)) * il2 - rb;
+  if (sign(y) * a2 * y2 < k) return sqrt(max(x2 + y2, 0.0)) * il2 - ra;
+  return (sqrt(max(x2 * a2 * il2, 0.0)) + y * rr) * il2 - ra;
+}
+
+// A triangle given thickness: a wing membrane, a fin, a sail. Flat shapes are
+// the other half of a creature and no lump can stand in for one.
+float sd_sail(vec3 p, vec3 a, vec3 b, vec3 c, float th) {
+  vec3 ba = b - a, pa = p - a;
+  vec3 cb = c - b, pb = p - b;
+  vec3 ac = a - c, pc = p - c;
+  vec3 nor = cross(ba, ac);
+  float side = sign(dot(cross(ba, nor), pa)) +
+               sign(dot(cross(cb, nor), pb)) +
+               sign(dot(cross(ac, nor), pc));
+  float d;
+  if (side < 2.0) {
+    // Outside the triangle in plan: the nearest point is on an edge.
+    d = min(min(dot2(ba * clamp(dot(ba, pa) / max(dot2(ba), 1e-6), 0.0, 1.0) - pa),
+                dot2(cb * clamp(dot(cb, pb) / max(dot2(cb), 1e-6), 0.0, 1.0) - pb)),
+            dot2(ac * clamp(dot(ac, pc) / max(dot2(ac), 1e-6), 0.0, 1.0) - pc));
+  } else {
+    float dn = dot(nor, pa);
+    d = dn * dn / max(dot2(nor), 1e-6);
+  }
+  return sqrt(max(d, 0.0)) - th;
+}
+
+// Parts of one body fuse; separate objects do not. k is how far the melding
+// reaches, and at zero this is an ordinary union.
+float smin(float a, float b, float k) {
+  if (k <= 0.0) return min(a, b);
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// One solid's distance, in the solid's own frame.
+float solid_sd(int i, vec3 p3) {
+  vec4 a = sd.v[SOLID_BASE + i * SOLID_STRIDE];
+  vec4 b = sd.v[SOLID_BASE + i * SOLID_STRIDE + 1];
+  int kind = int(a.x + 0.5);
+  if (kind == 6 || kind == 7 || kind == 8) {
+    // The segment kinds read a.yzw as their FIRST point, not as a centre.
+    vec4 d = sd.v[SOLID_BASE + i * SOLID_STRIDE + 3];
+    vec4 e = sd.v[SOLID_BASE + i * SOLID_STRIDE + 4];
+    if (kind == 6) return sd_capsule(p3, a.yzw, d.xyz, max(d.w, 1e-3));
+    if (kind == 7) return sd_taper(p3, a.yzw, d.xyz, max(d.w, 1e-3), max(e.w, 1e-3));
+    return sd_sail(p3, a.yzw, d.xyz, e.xyz, max(d.w, 1e-3));
+  }
+  vec3 local = p3 - a.yzw;
+  if (kind == 0) return sd_sphere(local, max(b.x, 1e-3));
+  if (kind == 1) return sd_box(local, max(b.xyz, vec3(1e-3)));
+  if (kind == 2) {
+    // sd_pyramid is unit-half-base with the apex at h, so the general one is
+    // that field evaluated in scaled space and scaled back.
+    float half_base = max(b.x, 1e-3);
+    float height = max(b.y, 1e-3);
+    return sd_pyramid(local / half_base, height / half_base) * half_base;
+  }
+  if (kind == 3) return sd_torus(local, max(b.x, 1e-3), max(b.y, 1e-3));
+  if (kind == 4) return sd_cylinder(local, max(b.x, 1e-3), max(b.y, 1e-3));
+  if (kind == 5) return sd_cone(local, max(b.x, 1e-3), max(b.y, 1e-3));
+  if (kind == 9) return sd_hex_prism(local, vec2(max(b.x, 1e-3), max(b.y, 1e-3)));
+  if (kind == 10) return sd_ellipsoid(local, max(b.xyz, vec3(1e-3)));
+  if (kind == 11) return sd_ring(local, max(b.x, 1e-3), max(b.y, 1e-3), max(b.z, 1e-3));
+  if (kind == 12) return sd_octahedron(local, max(b.x, 1e-3));
+  if (kind == 13) return sd_arch(local, max(b.x, 1e-3), max(b.y, 1e-3), max(b.z, 1e-3));
+  if (kind == 14) return sd_star(local, max(b.x, 1e-3));
+  return sd_sphere(local, max(b.x, 1e-3));
+}
+
+// x = distance to the nearest solid, y = which one it was.
+//
+// Every march step evaluated EVERY solid, and a ray that never goes near them
+// paid the same as one that lands on one. With a handful of spheres that was
+// affordable; a model made of parts is not. The whole set carries a bounding
+// sphere, computed once on the CPU, and a point outside it is answered with
+// the distance to the bound — which is a true lower bound on the distance to
+// anything inside, so the march stays correct and simply steps past.
+vec2 composed_sd(vec3 p3) {
+  int n = min(int(sd.v[7].x + 0.5), MAX_SOLIDS);
+  if (n <= 0) return vec2(1e9, -1.0);
+  vec3 bc = sd.v[8].xyz;          // bound centre
+  float br = sd.v[8].w;           // bound radius
+  if (br > 0.0) {
+    float outside = length(p3 - bc) - br;
+    if (outside > 0.25) return vec2(outside, -1.0);
+  }
+  float best = 1e9;      // nearest part, for which material to use
+  float acc = 1e9;       // the blended field, which is what the ray marches
+  float which = -1.0;
+  for (int i = 0; i < MAX_SOLIDS; ++i) {
+    if (i >= n) break;
+    float d = solid_sd(i, p3);
+    float k = sd.v[SOLID_BASE + i * SOLID_STRIDE + 1].w;   // this part's blend
+    acc = smin(acc, d, k);
+    if (d < best) { best = d; which = float(i); }
+  }
+  // smin only ever returns LESS than min, so the march understeps rather than
+  // overshooting: blending cannot make it miss a surface.
+  return vec2(acc, which);
+}
+
+// How much of the sun reaches a point, against the composed solids. Same
+// growing bias as the pyramid's: started at a fixed offset a surface shadows
+// ITSELF and everything comes out black.
+float composed_shadow(vec3 at, vec3 sun, float bias) {
+  float tt = bias;
+  float shade = 1.0;
+  for (int i = 0; i < 40; ++i) {
+    float d = composed_sd(at + sun * tt).x;
+    if (d < 0.001) return 0.0;
+    shade = min(shade, 14.0 * d / tt);
+    tt += clamp(d, 0.02, 0.6);
+    if (tt > 14.0) break;
+  }
+  return clamp(shade, 0.0, 1.0);
+}
+
+vec3 composed(vec2 uv, float t, float aspect) {
+  vec3 sky_low   = sd.v[0].xyz;
+  vec3 sky_high  = sd.v[1].xyz;
+  vec3 sun       = normalize(sd.v[2].xyz);
+  float sun_tight = max(sd.v[2].w, 1.0);
+  vec3 sun_rgb   = sd.v[3].xyz;
+  float sun_amp  = sd.v[3].w;
+  vec3 ground_rgb = sd.v[4].xyz;
+  int ground_kind = int(sd.v[4].w + 0.5);
+  vec3 fog_rgb   = sd.v[5].xyz;
+  float fog_amp  = sd.v[5].w;
+  float cam_r    = max(sd.v[6].x, 0.5);
+  float cam_h    = sd.v[6].y;
+  float cam_fov  = max(sd.v[6].z, 0.15);
+  float cam_spin = sd.v[6].w;
+  float ambient  = max(sd.v[7].y, 0.02);
+
+  float ang = 0.9 + cam_spin * sin(t * 0.09) * 3.0;
+  vec3 eye = vec3(cam_r * sin(ang), cam_h, cam_r * cos(ang));
+  vec3 target = vec3(0.0, max(0.35, cam_h * 0.42), 0.0);
+  // Ground with relief can be TALLER than the camera, and an eye inside a hill
+  // sees nothing but the inside of a hill — every ray hits at once and the
+  // screen is one flat colour. Lift it over whatever is under it, and aim at
+  // the land rather than at a fixed height above a plane that is not there.
+  // Terrain is kinds 3..8. Ocean (9) is a WATER PLANE that was added to the
+  // enum after this test was written, so `>= 3` swept it in and the open sea
+  // was raymarched as a ridged mountain range — which is exactly what came
+  // back on screen when the machine was asked for the ocean at dusk.
+  if (ground_kind >= 3 && ground_kind != 9) {
+    float under = terrain_h(eye.xz, ground_kind);
+    eye.y = max(eye.y, under + 1.6);
+    target.y = terrain_h(target.xz, ground_kind) + 0.35;
+  }
+  vec3 fwd = normalize(target - eye);
+  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+  vec3 up = cross(fwd, right);
+  vec2 ndc = (uv - 0.5) * vec2(aspect, -1.0) * 2.0;
+  vec3 ray = normalize(fwd + ndc.x * cam_fov * right + ndc.y * cam_fov * up);
+
+  vec3 sky = sky_in(ray, sky_low, sky_high, sun, sun_rgb, sun_tight);
+  // A cloud deck, so the sky is not a two-colour ramp with a dot in it. The
+  // ray is projected onto a plane overhead and the noise read there, which
+  // gives cloud that flattens and crowds toward the horizon the way real cloud
+  // does, and costs one fbm.
+  if (ray.y > 0.015) {
+    const float deck = 62.0;
+    vec2 cp = (eye + ray * ((deck - eye.y) / ray.y)).xz;
+    float c = fbm(cp * 0.0075 + vec2(t * 0.0035, t * 0.0012));
+    float cover = smoothstep(0.52, 0.78, c);
+    // Fade them out at the horizon, where the deck is edge-on and the noise
+    // would otherwise smear into a band.
+    cover *= smoothstep(0.015, 0.22, ray.y);
+    // Lit from the same sun as everything else.
+    float glow = pow(max(0.0, dot(ray, sun)), 6.0);
+    vec3 cloud = mix(vec3(0.74, 0.76, 0.80), sun_rgb * 1.15, 0.35 + 0.45 * glow);
+    sky = mix(sky, cloud, cover * 0.72);
+  }
+
+  // A FLAT ground is a plane and gets its exact intersection: marching it
+  // starves the step size near the horizon and draws concentric rings. Ground
+  // with relief has no such shortcut, so kinds 3..5 are marched as a height
+  // field and the hit is refined by bisection — stepping alone leaves a ragged
+  // silhouette on every ridge.
+  float t_ground = -1.0;
+  bool ground_is_terrain = ground_kind >= 3 && ground_kind != 9;
+  bool on_river_water = false;
+  if (ground_kind != 0 && !ground_is_terrain && ray.y < -1e-4) t_ground = -eye.y / ray.y;
+  if (ground_is_terrain) {
+    const float ceil_h = terrain_ceiling(ground_kind);
+    // Where this ray is worth looking at all. Above the ceiling and climbing,
+    // there is nothing to hit: skip the whole march. Above it and falling,
+    // start where it crosses instead of at the camera — that is the stretch of
+    // sky every ray used to sample terrain through, at forty-four integer
+    // hashes a sample.
+    bool worth_marching = true;
+    float tt = 0.4;
+    if (eye.y > ceil_h) {
+      if (ray.y >= -1e-4) worth_marching = false;
+      else tt = max(tt, (ceil_h - eye.y) / ray.y);
+    }
+    float prev = tt;
+    for (int i = 0; i < 128 && worth_marching; ++i) {
+      vec3 at = eye + ray * tt;
+      // Climbed out the top with nothing hit: it is sky from here.
+      if (at.y > ceil_h && ray.y > 0.0) break;
+      // Detail by distance. What is far away is smaller than a pixel, and six
+      // octaves of it is six octaves nobody can see.
+      int oct = tt < 14.0 ? 6 : (tt < 38.0 ? 4 : 2);
+      float gap = at.y - terrain_h_lod(at.xz, ground_kind, oct);
+      if (gap < 0.0) {
+        float lo = prev, hi = tt;
+        for (int k = 0; k < 10; ++k) {
+          float mid = 0.5 * (lo + hi);
+          vec3 m = eye + ray * mid;
+          if (m.y - terrain_h_lod(m.xz, ground_kind, oct) < 0.0) hi = mid; else lo = mid;
+        }
+        t_ground = hi;
+        break;
+      }
+      prev = tt;
+      tt += clamp(gap * 0.6, 0.08, 2.0) + tt * 0.022;
+      if (tt > 90.0) break;
+    }
+    // A river also has a water surface, which is a plane the channel fills to.
+    if (ground_kind == 5 && ray.y < -1e-4) {
+      float t_water = (kRiverLevel - eye.y) / ray.y;
+      if (t_water > 0.0 && (t_ground < 0.0 || t_water < t_ground)) {
+        vec3 w = eye + ray * t_water;
+        // Only where the channel is actually cut below the water line.
+        if (terrain_h(w.xz, ground_kind) < kRiverLevel) {
+          t_ground = t_water;
+          on_river_water = true;
+        }
+      }
+    }
+  }
+
+  float t_solid = -1.0;
+  float which = -1.0;
+  {
+    float travelled = 0.06;
+    for (int i = 0; i < 128; ++i) {
+      vec3 at = eye + ray * travelled;
+      vec2 h = composed_sd(at);
+      if (h.x < 0.0006 * travelled + 0.0004) { t_solid = travelled; which = h.y; break; }
+      travelled += h.x;
+      if (travelled > 60.0) break;
+    }
+  }
+
+  bool on_solid = t_solid > 0.0 && (t_ground < 0.0 || t_solid < t_ground);
+  bool on_ground = !on_solid && t_ground > 0.0;
+  if (!on_solid && !on_ground) return sky;
+
+  float travelled = on_solid ? t_solid : t_ground;
+  vec3 at = eye + ray * travelled;
+
+  vec3 n;
+  vec3 albedo;
+  float gloss;
+  if (on_solid) {
+    const vec2 e = vec2(0.0015, 0.0);
+    n = normalize(vec3(composed_sd(at + e.xyy).x - composed_sd(at - e.xyy).x,
+                       composed_sd(at + e.yxy).x - composed_sd(at - e.yxy).x,
+                       composed_sd(at + e.yyx).x - composed_sd(at - e.yyx).x));
+    vec4 mat = sd.v[SOLID_BASE + int(which + 0.5) * SOLID_STRIDE + 2];
+    albedo = mat.xyz;
+    gloss = mat.w;
+  } else if (ground_kind == 2 || ground_kind == 9 || on_river_water) {
+    // Water & Ocean
+    vec2 w = (ground_kind == 9) ? (at.xz * 0.45 + vec2(t * 0.4, -t * 0.55))
+           : (on_river_water ? (at.xz * 0.9 + vec2(0.0, -t * 1.4))
+                             : (at.xz * 0.55 + vec2(0.0, -t * 0.35)));
+    float bump = fbm(w);
+    float bx = fbm(w + vec2(0.06, 0.0)) - bump;
+    float bz = fbm(w + vec2(0.0, 0.06)) - bump;
+    float ramp = (ground_kind == 9) ? 6.5 : (on_river_water ? 3.0 : 5.0);
+    n = normalize(vec3(-bx * ramp, 1.0, -bz * ramp));
+
+    float depth = on_river_water
+        ? clamp((kRiverLevel - terrain_h(at.xz, ground_kind)) * 0.85, 0.0, 1.0)
+        : 1.0;
+    vec3 shallow = (ground_kind == 9) ? vec3(0.05, 0.35, 0.55) : vec3(0.16, 0.34, 0.33);
+    vec3 deep    = (ground_kind == 9) ? vec3(0.01, 0.06, 0.18) : (on_river_water ? vec3(0.03, 0.10, 0.16) : ground_rgb);
+    albedo = mix(shallow, deep, depth) * (0.85 + bump * 0.30);
+
+    // Reflection, weighted by grazing angle.
+    vec3 refl = reflect(ray, n);
+    refl.y = abs(refl.y);
+    vec3 mirror = sky_in(refl, sky_low, sky_high, sun, sun_rgb, sun_tight);
+    float fres = pow(1.0 - clamp(dot(n, -ray), 0.0, 1.0), 4.0);
+    albedo = mix(albedo, mirror, clamp(0.10 + fres * 0.80, 0.0, 0.92));
+
+    // Foam where the water runs out or along wave crests.
+    if (ground_kind == 9) {
+      float wave_crest = smoothstep(0.58, 0.78, bump);
+      albedo = mix(albedo, vec3(0.92, 0.96, 1.0), wave_crest * 0.85);
+    } else if (on_river_water) {
+      float shore = 1.0 - smoothstep(0.02, 0.32, depth);
+      albedo = mix(albedo, vec3(0.86, 0.90, 0.92), shore * (0.35 + 0.35 * bump));
+    }
+    gloss = (ground_kind == 9) ? 0.85 : 0.72;
+  } else if (ground_is_terrain) {
+    // The surface normal of the height field, from its own gradient.
+    vec2 e2 = vec2(0.06, 0.0);
+    float hL = terrain_h(at.xz - e2.xy, ground_kind);
+    float hR = terrain_h(at.xz + e2.xy, ground_kind);
+    float hD = terrain_h(at.xz - e2.yx, ground_kind);
+    float hU = terrain_h(at.xz + e2.yx, ground_kind);
+    n = normalize(vec3(hL - hR, 2.0 * e2.x, hD - hU));
+    float slope = clamp(1.0 - n.y, 0.0, 1.0);
+
+    // Land is not one colour. Rock on anything steep, the ground's own colour
+    // on the flats, and snow on the high FLAT ground only — snow does not sit
+    // on a cliff face, and terrain that whitens by altitude alone looks dipped.
+    vec3 rock  = mix(ground_rgb, vec3(0.32, 0.30, 0.29), 0.72);
+    vec3 scree = mix(ground_rgb, vec3(0.46, 0.43, 0.40), 0.45);
+    albedo = mix(ground_rgb, scree, smoothstep(0.10, 0.30, slope));
+    albedo = mix(albedo, rock, smoothstep(0.28, 0.62, slope));
+    albedo *= mix(0.86, 1.14, fbm(at.xz * 0.9));
+    gloss = 0.05;
+
+    if (ground_kind == 3) {
+      float high = smoothstep(2.4, 4.6, at.y);
+      float flat_enough = smoothstep(0.55, 0.85, n.y);
+      albedo = mix(albedo, vec3(0.92, 0.94, 0.97), high * flat_enough);
+    } else if (ground_kind == 5) {
+      float wet = smoothstep(kRiverLevel + 0.55, kRiverLevel, at.y);
+      albedo = mix(albedo, albedo * 0.55, wet);
+    } else if (ground_kind == 6) {
+      // Canyon: Layered sandstone & iron sediment strata bands
+      float strata = sin(at.y * 14.0 + fbm(at.xz * 0.4) * 3.2);
+      vec3 red_clay = vec3(0.64, 0.28, 0.16);
+      vec3 ochre = vec3(0.72, 0.48, 0.22);
+      vec3 cream = vec3(0.82, 0.76, 0.60);
+      vec3 strata_col = mix(red_clay, ochre, smoothstep(-0.6, 0.2, strata));
+      strata_col = mix(strata_col, cream, smoothstep(0.4, 0.85, strata));
+      albedo = mix(albedo, strata_col, 0.75);
+    } else if (ground_kind == 7) {
+      // Volcano: Basalt ash + glowing incandescent lava crater bed
+      float dist_center = length(at.xz);
+      if (dist_center < 1.75 && at.y < 0.35) {
+        float lava_pulse = fbm(at.xz * 3.5 + vec2(t * 0.35, t * 0.18));
+        vec3 magma = mix(vec3(0.95, 0.22, 0.02), vec3(1.0, 0.82, 0.12), smoothstep(0.35, 0.75, lava_pulse));
+        albedo = magma;
+        gloss = 0.65;
+      } else {
+        vec3 basalt = vec3(0.12, 0.12, 0.14);
+        albedo = mix(albedo, basalt, 0.80);
+      }
+    } else if (ground_kind == 8) {
+      // Glacier: Crystalline glacial ice with subsurface blue sheen
+      vec3 ice_deep = vec3(0.18, 0.48, 0.75);
+      vec3 ice_surface = vec3(0.85, 0.92, 0.98);
+      albedo = mix(ice_deep, ice_surface, smoothstep(-0.2, 3.5, at.y));
+      gloss = 0.85;
+    }
+  } else {
+    n = vec3(0.0, 1.0, 0.0);
+    albedo = ground_rgb * mix(0.82, 1.12, fbm(at.xz * 0.9));
+    gloss = 0.04;
+  }
+
+  float lit = clamp(dot(n, sun), 0.0, 1.0);
+  float shade = composed_shadow(at, sun, on_solid ? 0.02 + 0.004 * travelled : 0.02);
+  // Terrain shadows itself and everything standing on it.
+  if (ground_is_terrain && !on_solid) shade = min(shade, terrain_shadow(at, sun, ground_kind));
+  vec3 col = albedo * (ambient + sun_amp * lit * shade) * sun_rgb;
+  // The sky bounce is the other half of an unlit surface, so it scales with
+  // the ambient too — at night it is most of what there is to see.
+  col += albedo * mix(sky_low, sky_high, 0.5) * clamp(0.5 + 0.5 * n.y, 0.0, 1.0) * ambient * 2.4;
+
+  if (gloss > 0.01) {
+    vec3 h = normalize(sun - ray);
+    float spec = pow(clamp(dot(n, h), 0.0, 1.0), mix(8.0, 220.0, gloss));
+    col += sun_rgb * spec * gloss * sun_amp * shade;
+    // What the surface mirrors of the sky, strongest at a glancing angle.
+    float fres = pow(1.0 - clamp(dot(n, -ray), 0.0, 1.0), 4.0);
+    col = mix(col, mix(sky_low, sky_high, 0.6), fres * gloss * 0.7);
+  }
+
+  float fog = 1.0 - exp(-travelled * max(fog_amp, 0.0));
+  return mix(col, fog_rgb, fog);
+}
+
+void main() {
+  const float aspect = float(p.width) / float(max(1u, p.height));
+
+  if (p.pass == 0u) {
+    // ---- march pass: one invocation per marched sample ----
+    const uvec2 g = gl_GlobalInvocationID.xy;
+    if (g.x >= p.cache_w || g.y >= p.cache_h) return;
+    // The centre of the block this sample stands for, in screen coordinates.
+    const vec2 uv = ((vec2(g) + 0.5) * float(p.scale)) / vec2(p.width, p.height);
+
+    vec3 c;
+    if (p.scene == 1u) c = lattice(uv, p.seconds, aspect);
+    else if (p.scene == 2u) c = core(uv, p.seconds, aspect);
+    else if (p.scene == 3u) c = pyramid(uv, p.seconds, aspect);
+    else if (p.scene == 4u) c = composed(uv, p.seconds, aspect);
+    // Scene 0 is the machine's own shoreline. It used to be `tide` — a
+    // generic ocean by the same name — which is why the painter was given
+    // scene 0 back and the device was left out of it. The device draws the
+    // painter's picture now, and draws it MOVING.
+    else c = beach(uv, p.seconds, aspect, float(p.height));
+
+    // Behind an interface, the scene is a backdrop. The canvas paints its own
+    // scrims and glows for legibility against a DARK background — computed at
+    // full strength this scene is far brighter than that art expects, and every
+    // one of those scrims then reads as a hard dark box over it. Dimmed, and
+    // fading toward the edges, it sits behind the interface the way the
+    // painter's own background did.
+    //
+    // Applied BEFORE the cache is written, so a composite pass reading the
+    // cache back gets a finished backdrop rather than something the dimming has
+    // to be re-applied to. A change of backdrop strength therefore has to
+    // refresh the whole cache, and the C++ side does that.
+    if (p.backdrop < 1.0) {
+      vec2 vd = (uv - 0.5) * vec2(aspect, 1.0);
+      float vign = 1.0 - 0.55 * clamp(dot(vd, vd) * 1.5, 0.0, 1.0);
+      c *= p.backdrop * vign;
+    }
+    vec3 q8 = clamp(c, 0.0, 1.0) * 255.0 + 0.5;
+    cached[g.y * p.cache_w + g.x] =
+        (uint(q8.r) << 16) | (uint(q8.g) << 8) | uint(q8.b);
+    return;
+  }
+
+  // ---- composite pass: the frame that is actually presented ----
+  const uvec2 xy = gl_GlobalInvocationID.xy;
+  if (xy.x >= p.width || xy.y >= p.height) return;
+
+  // The marched picture, read back bilinearly. Nearest would put the block
+  // structure of the reduced resolution straight on the screen as visible
+  // stair-stepping; interpolating costs three more reads and the background
+  // reads as soft rather than as blocky.
+  vec3 c;
+  {
+    const vec2 at = (vec2(xy) + 0.5) / float(p.scale) - 0.5;
+    const vec2 f = fract(clamp(at, vec2(0.0), vec2(p.cache_w - 1, p.cache_h - 1)));
+    const ivec2 i0 = ivec2(floor(clamp(at, vec2(0.0), vec2(p.cache_w - 1, p.cache_h - 1))));
+    const ivec2 i1 = min(i0 + 1, ivec2(int(p.cache_w) - 1, int(p.cache_h) - 1));
+    vec3 t[4];
+    const ivec2 taps[4] = ivec2[4](ivec2(i0.x, i0.y), ivec2(i1.x, i0.y),
+                                   ivec2(i0.x, i1.y), ivec2(i1.x, i1.y));
+    for (int k = 0; k < 4; ++k) {
+      uint q = cached[uint(taps[k].y) * p.cache_w + uint(taps[k].x)];
+      t[k] = vec3(float((q >> 16) & 0xFFu), float((q >> 8) & 0xFFu),
+                  float(q & 0xFFu)) / 255.0;
+    }
+    c = mix(mix(t[0], t[1], f.x), mix(t[2], t[3], f.x), f.y);
+  }
+
+  // The compositor's own layer, over the top. It is ARGB8888 as the rasteriser
+  // packs it, and its alpha is what that rasteriser left: opaque where it drew,
+  // clear where it did not.
+  if (p.have_overlay != 0u) {
+    uint packed_pixel = pixels[xy.y * p.width + xy.x];
+    float a = float((packed_pixel >> 24) & 0xFFu) / 255.0;
+    if (a > 0.0) {
+      vec3 rgb = vec3(float((packed_pixel >> 16) & 0xFFu),
+                      float((packed_pixel >> 8) & 0xFFu),
+                      float(packed_pixel & 0xFFu)) / 255.0;
+      c = mix(c, rgb, a);
+    }
+  }
+
+  c = clamp(c, 0.0, 1.0);
+  // This shader declares its target rgba8, so component 0 of the store lands in
+  // the image's first component. On a surface that hands back B8G8R8A8 that is
+  // blue, and the machine would present its own picture with red and blue
+  // traded. Write the order the image actually has.
+  imageStore(out_image, ivec2(xy), p.bgra != 0u ? vec4(c.bgr, 1.0) : vec4(c, 1.0));
+}

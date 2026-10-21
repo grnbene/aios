@@ -1,0 +1,98 @@
+### [[ string tests
+x=abc; [[ $x == abc ]] && echo eq; [[ $x != abd ]] && echo ne; [[ -z "" && -n $x ]] && echo zn; [[ $x ]] && echo nonempty
+### [[ patterns
+f=main.cpp; [[ $f == *.cpp ]] && echo cpp; [[ $f == "*.cpp" ]] || echo literal; [[ $f == m?in.* ]] && echo q
+### [[ =~ and BASH_REMATCH
+v=release-1.22.3; if [[ $v =~ ^release-([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then echo "${BASH_REMATCH[0]} ${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"; fi; [[ abc =~ x ]] || echo nomatch
+### [[ =~ alternation group
+for w in foo bar baz; do [[ $w =~ ^(foo|baz)$ ]] && echo "hit $w"; done
+### [[ numeric and logic
+n=10; [[ $n -gt 5 && ( $n -lt 20 || $n -eq 0 ) ]] && echo range; [[ ! $n -eq 3 ]] && echo not3; [[ 2 < 10 ]] && echo strless || echo strmore
+### [[ file tests
+[[ -f a.txt ]] && echo file; [[ -d sub ]] && echo dir; [[ -e nope ]] || echo missing; [[ -s a.txt && -r a.txt ]] && echo sr
+### [[ no splitting
+x="a b"; [[ $x == "a b" ]] && echo same; y=; [[ $y == "" ]] && echo empty
+### [[ -v
+a=1; [[ -v a ]] && echo set; [[ -v nope ]] || echo unset; arr=(x y); [[ -v arr[1] ]] && echo el
+### (( ))
+i=3; (( i > 2 )) && echo big; (( i++ )); echo $i; (( j = i * 2 )); echo $j; (( 0 )) || echo zero; ((k=5)); echo $k
+### (( )) and set -e
+set -e; x=0; (( x++ )) || true; echo $x; (( x > 0 )) && echo pos
+### for (( ))
+for ((i=0; i<3; i++)); do echo $i; done; for (( j=10; j>0; j-=4 )) ; do printf "%s " $j; done; echo
+### brace expansion lists
+echo {a,b,c}; echo x{1,2}y; echo {a,b}{1,2}; echo pre{,.bak}; echo {x,{y,z}}
+### brace expansion ranges
+echo {1..5}; echo {5..1}; echo {a..e}; echo {0..10..3}; echo {01..03}; echo {-2..2}
+### brace non-expansion
+echo {} {a} '{a,b}' "{1..3}" {a..}; x=1; echo {$x,2}
+### brace in for and mkdir
+mkdir -p d/{x,y}/z; ls d; for i in {1..3}; do printf "%s," $i; done; echo
+### $'...' quoting
+echo $'a\tb'; printf '%s\n' $'line1\nline2'; x=$'it\'s'; echo "$x"; echo $'\x41\101'
+### here-string
+cat <<< "hello there"; read a b <<< "one two three"; echo "$a|$b"; x=5; bc_like=$(cat <<<$x); echo $bc_like; wc -l <<< "q"
+### arrays basic
+a=(one "two three" four); echo ${#a[@]}; echo ${a[1]}; echo "${a[@]}"; for x in "${a[@]}"; do echo "[$x]"; done; echo ${a[-1]}
+### arrays append and set
+a=(x); a+=(y z); a[5]=w; echo "${a[@]}"; echo ${#a[@]}; a[0]=X; echo $a ${a[0]}; b=(); echo "${#b[@]}"; for e in "${b[@]}"; do echo never; done; echo end
+### arrays indices and slices
+a=(a b c d e); echo "${!a[@]}"; echo "${a[@]:1:2}"; echo "${a[@]:3}"; echo "${a[*]}"; IFS=,; echo "${a[*]}"
+### arrays per-element ops
+f=(x.c y.c z.h); echo "${f[@]%.c}"; echo "${f[@]/./_}"; echo "${f[@]^^}"; echo "${#f[1]}"
+### arrays from command and glob
+files=(*.txt); echo "${#files[@]} ${files[0]}"; lines=($(printf "p q\nr\n")); echo "${#lines[@]}"
+### arrays multi-line literal
+a=(
+  one
+  two # comment
+  "three four"
+)
+echo "${#a[@]}: ${a[2]}"
+### arrays in functions
+f() { local -a xs=("$@"); echo "${#xs[@]} ${xs[1]}"; }; f p "q r" s; g() { local arr=(1 2 3); echo "${arr[@]}"; }; g
+### associative arrays
+declare -A m; m[apple]=red; m[banana]=yellow; m+=([cherry]=dark); echo ${m[apple]} ${#m[@]}; for k in $(printf "%s\n" "${!m[@]}" | sort); do echo "$k=${m[$k]}"; done; [[ -v m[banana] ]] && echo has
+### associative literal
+declare -A c=([a]=1 [b]=2); echo "${c[b]}${c[a]}"; c[a]=$(( c[a] + 10 )); echo ${c[a]}
+### array element arithmetic
+n=(1 2 3); i=1; n[i+1]=9; echo "${n[@]}"; echo $(( n[0] + n[2] )); (( n[0]++ )); echo ${n[0]}
+### read -a and mapfile
+IFS=, read -ra parts <<< "a,b,,c"; echo "${#parts[@]} ${parts[3]}"; printf "l1\nl2\nl3\n" > m.txt; mapfile -t L < m.txt; echo "${#L[@]} ${L[2]}"; readarray -t R < <(printf "x\ny\n"); echo "${R[@]}"
+### NAME+= string
+s=ab; s+=cd; s+="e f"; echo "$s"; n=1; n+=1; echo $n
+### |& pipes stderr
+{ echo out; echo err >&2; } |& sort; ls nope |& grep -c "No such"
+### process substitution
+diff <(printf "a\nb\n") <(printf "a\nc\n"); echo $?; while read l; do echo "got $l"; done < <(printf "1\n2\n"); cat <(echo one) <(echo two)
+### indirect expansion
+name=target; target=hit; echo ${!name}; pre_a=1; pre_b=2; echo ${!pre_*}
+### $@ slices
+set -- a b c d; echo "${@:2}"; echo "${@:2:2}"; echo ${#@}; f() { echo "${@: -1}"; }; f x y z
+### empty "$@"
+set --; for x in "$@"; do echo never; done; printf "[%s]" "$@"; echo; f() { echo $#; }; f "$@"
+### let
+let x=4*2 y=x+1; echo $x $y; let "z = 0" || echo zero
+### declare -p
+a=(1 "2 3"); declare -p a; declare -A m=([k]=v); declare -p m; s=x; declare -p s
+### agent style script
+set -euo pipefail
+files=()
+for f in *.txt; do [[ -f $f ]] && files+=("$f"); done
+echo "found ${#files[@]}"
+for f in "${files[@]}"; do
+  n=$(wc -l < "$f")
+  if (( n > 0 )); then printf "%-10s %3d\n" "$f" "$n"; fi
+done
+count=0
+while IFS= read -r line; do ((++count)); done < a.txt
+echo "lines: $count"
+[[ $count -ge 1 ]] && echo ok
+### set -euo keeps the positionals
+set -- a b; set -euo pipefail; echo "$1 $#"; set +eu -o xtrace 2>/dev/null; set +x; echo "$2"
+### printf %s of a long argument (past 511 bytes)
+x=$(head -c 900 /dev/zero | tr "\0" a); printf %s "$x" | wc -c; printf "%s|%s\n" "$x" b | wc -c
+### head -c -N drops the last N bytes; tail -c +N starts at byte N
+printf "a\nb\n" | head -c -1 | od -c; printf abcdef | tail -c +3; echo
+### bash -n / sh -n / -o noexec parse a script and never run it (test.sh syntax-checks every script this way)
+printf '. /nonexistent/vm.env\necho RAN-IT\n' > ok.sh; printf 'if true; then\necho x\n' > bad.sh; bash -n ok.sh; echo "ok $?"; bash -n bad.sh 2>/dev/null; echo "bad $?"; sh -n ok.sh; echo "sh $?"; sh -o noexec -c 'echo RAN-IT'; echo "o $?"

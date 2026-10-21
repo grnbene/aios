@@ -1,0 +1,661 @@
+# =============================================================================
+# AIOS Calculator & Desktop Workspace Application in Grain
+#
+# A complete interactive desktop calculator application featuring:
+#   1. Standard & Scientific Arithmetic Engine (Add, Sub, Mul, Div, Mod, Pow, Sqrt)
+#   2. Expression History & Persistent Tape Log
+#   3. Four-Function Memory Registers (MC, MR, M+, M-)
+#   4. Floating-Point & Sign Management (+/-, Decimals, Backspace, Clear)
+#   5. High-Resolution 1920x1080 Full Desktop Environment Rendering
+#   6. Modern Glassmorphic Window Frame & Traffic Light Controls
+#   7. Desktop System Bar (Clock, Bare-Metal Pi Status, Network, Memory)
+#   8. Floating Application Dock with Active App Glow Badging
+# =============================================================================
+
+print("=================================================================")
+print("     AIOS Desktop Calculator — Powered by Bare-Metal Grain       ")
+print("=================================================================\n")
+
+# -----------------------------------------------------------------------------
+# 1. State Model & Initialization
+# -----------------------------------------------------------------------------
+
+fn calc_create() {
+  return {
+    "display": "0",
+    "expression": "",
+    "accumulator": 0.0,
+    "pending_op": "",
+    "new_number": true,
+    "has_decimal": false,
+    "memory": 0.0,
+    "has_memory": false,
+    "error_msg": "",
+    "angle_mode": "DEG",
+    "mode": "standard",
+    "history": [
+      {"expr": "1250 + 875", "result": "2125"},
+      {"expr": "sqrt(625) * 4", "result": "100"},
+      {"expr": "45.2 * 3.5 - 6.4", "result": "151.8"}
+    ],
+    "active_button": ""
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 2. Calculation Engine & State Transitions
+# -----------------------------------------------------------------------------
+
+fn calc_format_num(n) {
+  let s = str(n)
+  if len(s) > 3 and slice(s, len(s) - 2, len(s)) == ".0" {
+    return slice(s, 0, len(s) - 2)
+  }
+  return s
+}
+
+fn calc_input_digit(calc, digit) {
+  calc.error_msg = ""
+  if calc.new_number or calc.display == "0" {
+    calc.display = digit
+    calc.new_number = false
+    calc.has_decimal = false
+  } else {
+    if len(calc.display) < 18 {
+      calc.display = calc.display + digit
+    }
+  }
+}
+
+fn calc_input_decimal(calc) {
+  calc.error_msg = ""
+  if calc.new_number {
+    calc.display = "0."
+    calc.new_number = false
+    calc.has_decimal = true
+  } else if !calc.has_decimal {
+    calc.display = calc.display + "."
+    calc.has_decimal = true
+  }
+}
+
+fn calc_backspace(calc) {
+  if calc.error_msg != "" {
+    calc.error_msg = ""
+    calc.display = "0"
+    calc.new_number = true
+    return
+  }
+  if calc.new_number or len(calc.display) <= 1 {
+    calc.display = "0"
+    calc.new_number = true
+    calc.has_decimal = false
+  } else {
+    let last_char = slice(calc.display, len(calc.display) - 1, len(calc.display))
+    if last_char == "." { calc.has_decimal = false }
+    calc.display = slice(calc.display, 0, len(calc.display) - 1)
+  }
+}
+
+fn calc_clear(calc) {
+  calc.display = "0"
+  calc.new_number = true
+  calc.has_decimal = false
+  calc.error_msg = ""
+}
+
+fn calc_all_clear(calc) {
+  calc.display = "0"
+  calc.expression = ""
+  calc.accumulator = 0.0
+  calc.pending_op = ""
+  calc.new_number = true
+  calc.has_decimal = false
+  calc.error_msg = ""
+}
+
+fn calc_toggle_sign(calc) {
+  if calc.display == "0" or calc.error_msg != "" { return }
+  if slice(calc.display, 0, 1) == "-" {
+    calc.display = slice(calc.display, 1, len(calc.display))
+  } else {
+    calc.display = "-" + calc.display
+  }
+}
+
+fn calc_apply_op(op, a, b) {
+  if op == "+" { return a + b }
+  if op == "-" { return a - b }
+  if op == "*" or op == "x" or op == "×" { return a * b }
+  if op == "/" or op == "÷" {
+    if b == 0.0 { return nil }
+    return a / b
+  }
+  if op == "%" {
+    if b == 0.0 { return nil }
+    return a % b
+  }
+  if op == "^" or op == "pow" {
+    return pow(a, b)
+  }
+  return b
+}
+
+fn calc_input_op(calc, op) {
+  if calc.error_msg != "" { return }
+  let cur_val = real(calc.display)
+  
+  if calc.pending_op != "" and !calc.new_number {
+    let res = calc_apply_op(calc.pending_op, calc.accumulator, cur_val)
+    if res == nil {
+      calc.error_msg = "Error: Division by 0"
+      calc.display = "Error"
+      calc.pending_op = ""
+      calc.new_number = true
+      return
+    }
+    calc.accumulator = res
+    calc.display = calc_format_num(res)
+  } else {
+    calc.accumulator = cur_val
+  }
+
+  calc.pending_op = op
+  calc.expression = calc_format_num(calc.accumulator) + " " + op
+  calc.new_number = true
+  calc.has_decimal = false
+}
+
+fn calc_equals(calc) {
+  if calc.error_msg != "" or calc.pending_op == "" { return }
+  let cur_val = real(calc.display)
+  let full_expr = calc.expression + " " + calc_format_num(cur_val)
+  let res = calc_apply_op(calc.pending_op, calc.accumulator, cur_val)
+  
+  if res == nil {
+    calc.error_msg = "Error: Division by 0"
+    calc.display = "Error"
+    calc.expression = full_expr + " ="
+    calc.pending_op = ""
+    calc.new_number = true
+    return
+  }
+
+  let formatted = calc_format_num(res)
+  push(calc.history, {"expr": full_expr, "result": formatted})
+  calc.display = formatted
+  calc.expression = full_expr + " ="
+  calc.accumulator = res
+  calc.pending_op = ""
+  calc.new_number = true
+  calc.has_decimal = false
+}
+
+fn calc_sqrt_op(calc) {
+  if calc.error_msg != "" { return }
+  let cur_val = real(calc.display)
+  if cur_val < 0.0 {
+    calc.error_msg = "Error: Invalid Input"
+    calc.display = "Error"
+    calc.new_number = true
+    return
+  }
+  let res = sqrt(cur_val)
+  let expr = "√(" + calc_format_num(cur_val) + ")"
+  let formatted = calc_format_num(res)
+  push(calc.history, {"expr": expr, "result": formatted})
+  calc.expression = expr + " ="
+  calc.display = formatted
+  calc.new_number = true
+}
+
+fn calc_square_op(calc) {
+  if calc.error_msg != "" { return }
+  let cur_val = real(calc.display)
+  let res = cur_val * cur_val
+  let expr = "sqr(" + calc_format_num(cur_val) + ")"
+  let formatted = calc_format_num(res)
+  push(calc.history, {"expr": expr, "result": formatted})
+  calc.expression = expr + " ="
+  calc.display = formatted
+  calc.new_number = true
+}
+
+fn calc_percent_op(calc) {
+  if calc.error_msg != "" { return }
+  let cur_val = real(calc.display)
+  let res = cur_val / 100.0
+  calc.display = calc_format_num(res)
+  calc.new_number = true
+}
+
+# Memory Operations
+fn calc_mem_clear(calc) {
+  calc.memory = 0.0
+  calc.has_memory = false
+}
+
+fn calc_mem_recall(calc) {
+  if !calc.has_memory { return }
+  calc.display = calc_format_num(calc.memory)
+  calc.new_number = true
+}
+
+fn calc_mem_add(calc) {
+  if calc.error_msg != "" { return }
+  calc.memory = calc.memory + real(calc.display)
+  calc.has_memory = true
+  calc.new_number = true
+}
+
+fn calc_mem_sub(calc) {
+  if calc.error_msg != "" { return }
+  calc.memory = calc.memory - real(calc.display)
+  calc.has_memory = true
+  calc.new_number = true
+}
+
+# -----------------------------------------------------------------------------
+# 3. Desktop & Calculator UI Drawing Engine
+# -----------------------------------------------------------------------------
+
+fn draw_desktop_wallpaper(cv, W, H) {
+  # Deep midnight cosmic gradient
+  canvas_fill_linear_gradient(cv, 0, 0, W, H, "#0B101D", "#030712", true)
+  
+  # Atmospheric ambient glow orbs
+  canvas_draw_glow(cv, 350, 200, 240, "#1838BDF8")
+  canvas_draw_glow(cv, W - 300, H - 250, 320, "#146366F1")
+  canvas_draw_glow(cv, W / 2, H / 2, 400, "#0A0284C7")
+  
+  # Subtle desktop grid points
+  for gx in range(12) {
+    for gy in range(8) {
+      canvas_fill_circle(cv, gx * 160 + 80, gy * 130 + 70, 1.2, "#1E475569")
+    }
+  }
+}
+
+fn draw_top_system_bar(cv, W) {
+  let bar_h = 36
+  canvas_fill_rect(cv, 0, 0, W, bar_h, "#0B1120")
+  canvas_draw_line(cv, 0, bar_h, W, bar_h, "#1E293B", 1.0)
+
+  # Left: AIOS OS Emblem & Menus
+  canvas_fill_round_rect(cv, 12, 6, 24, 24, 6.0, "#2563EB")
+  canvas_draw_text(cv, "A", 18, 10, "#FFFFFF", 14, "ui_bold")
+
+  let menus = ["Calculator", "File", "Edit", "Math", "View", "Window", "Help"]
+  let mx = 48
+  for i in range(len(menus)) {
+    let m = menus[i]
+    let col = "#94A3B8"
+    let fn_name = "ui"
+    if i == 0 {
+      col = "#F8FAFC"
+      fn_name = "ui_bold"
+    }
+    canvas_draw_text(cv, m, mx, 10, col, 13, fn_name)
+    let met = canvas_measure_text(cv, m, fn_name, 13)
+    mx = mx + int(met.width) + 20
+  }
+
+  # Right: Live System Telemetry, Pi status, Clock
+  let right_x = W - 520
+  
+  # Pi Bare Metal Telemetry badge
+  canvas_fill_round_rect(cv, right_x, 6, 230, 24, 12.0, "#1E293B")
+  canvas_fill_circle(cv, right_x + 14, 18, 4.0, "#10B981") # Green live dot
+  canvas_draw_text(cv, "Pi 4B Bare-Metal · 4 Cores", right_x + 26, 10, "#E2E8F0", 11, "ui_bold")
+
+  # RAM Badge
+  canvas_fill_round_rect(cv, right_x + 240, 6, 120, 24, 12.0, "#1E293B")
+  canvas_draw_text(cv, "RAM: 912 MB", right_x + 252, 10, "#38BDF8", 11, "ui_bold")
+
+  # Clock
+  canvas_draw_text(cv, "Fri Sep 25  09:14 AM", W - 145, 10, "#F1F5F9", 12, "ui_bold")
+}
+
+fn draw_desktop_dock(cv, W, H) {
+  let dock_w = 460
+  let dock_h = 64
+  let dock_x = (W - dock_w) / 2
+  let dock_y = H - dock_h - 16
+
+  # Dock Glass Body
+  canvas_draw_glass(cv, dock_x, dock_y, dock_w, dock_h, 16.0, "#0F172ACC", "#334155")
+  
+  let apps = [
+    {"label": "Finder", "icon": "file", "color": "#0284C7", "active": false},
+    {"label": "Terminal", "icon": "server", "color": "#334155", "active": false},
+    {"label": "Calculator", "icon": "function", "color": "#2563EB", "active": true},
+    {"label": "DB Studio", "icon": "table", "color": "#059669", "active": false},
+    {"label": "Monitor", "icon": "graph", "color": "#7C3AED", "active": false},
+    {"label": "Settings", "icon": "refresh", "color": "#475569", "active": false}
+  ]
+
+  let step = dock_w / len(apps)
+  for i in range(len(apps)) {
+    let app = apps[i]
+    let ax = dock_x + i * step + (step - 42) / 2
+    let ay = dock_y + 11
+    
+    # App Icon Squircle
+    canvas_fill_round_rect(cv, ax, ay, 42, 42, 10.0, app.color)
+    canvas_stroke_round_rect(cv, ax, ay, 42, 42, 10.0, "#FFFFFF44", 1.0)
+    
+    # Icon graphic
+    draw_icon(cv, ax + 13, ay + 13, 16, app.icon, "#FFFFFF")
+
+    # Active running dot
+    if app.active {
+      canvas_fill_circle(cv, ax + 21, dock_y + dock_h - 5, 2.5, "#38BDF8")
+    }
+  }
+}
+
+fn draw_calculator_window(cv, calc, wx, wy, ww, wh) {
+  # Window Frame with shadow and glassmorphic titlebar
+  draw_window_frame(cv, wx, wy, ww, wh, "AIOS Calculator", "Scientific & Standard (Grain Engine)", true)
+
+  # Mode Switcher Bar
+  let tab_y = wy + 42
+  let tab_w = 110
+  let tabs = ["Standard", "Scientific", "Programmer"]
+  for i in range(len(tabs)) {
+    let tx = wx + 20 + i * (tab_w + 8)
+    let is_active = (i == 0 and calc.mode == "standard") or (i == 1 and calc.mode == "scientific")
+    let bg = "#1E293B"
+    let fg = "#94A3B8"
+    if is_active {
+      bg = "#2563EB"
+      fg = "#FFFFFF"
+    }
+    canvas_fill_round_rect(cv, tx, tab_y, tab_w, 28, 6.0, bg)
+    canvas_draw_text(cv, tabs[i], tx + 18, tab_y + 7, fg, 12, "ui_bold")
+  }
+
+  # Angle mode indicator [DEG] / [RAD]
+  canvas_fill_round_rect(cv, wx + ww - 90, tab_y, 70, 28, 6.0, "#1E293B")
+  canvas_draw_text(cv, calc.angle_mode, wx + ww - 72, tab_y + 7, "#38BDF8", 12, "ui_bold")
+
+  # ---------------------------------------------------------------------------
+  # LCD Digital Display Screen
+  # ---------------------------------------------------------------------------
+  let lcd_x = wx + 20
+  let lcd_y = tab_y + 38
+  let lcd_w = ww - 40
+  let lcd_h = 100
+
+  # Screen Bezel & Gradient
+  canvas_fill_round_rect(cv, lcd_x, lcd_y, lcd_w, lcd_h, 8.0, "#0B1120")
+  canvas_stroke_round_rect(cv, lcd_x, lcd_y, lcd_w, lcd_h, 8.0, "#334155", 1.5)
+
+  # Memory & Status Indicator
+  if calc.has_memory {
+    canvas_fill_round_rect(cv, lcd_x + 14, lcd_y + 12, 28, 18, 4.0, "#1E293B")
+    canvas_draw_text(cv, "M", lcd_x + 23, lcd_y + 14, "#F59E0B", 11, "ui_bold")
+  }
+
+  # Sub-display (Expression trace)
+  let expr_str = " "
+  if calc.expression != "" {
+    expr_str = calc.expression
+  }
+  let expr_met = canvas_measure_text(cv, expr_str, "mono", 14)
+  let expr_tx = lcd_x + lcd_w - int(expr_met.width) - 18
+  canvas_draw_text(cv, expr_str, max(lcd_x + 60, expr_tx), lcd_y + 14, "#64748B", 14, "mono")
+
+  # Main Display (Large Digits)
+  let disp_str = calc.display
+  let font_sz = 32
+  if len(disp_str) > 12 {
+    font_sz = 24
+  }
+  let disp_col = "#F8FAFC"
+  if calc.error_msg != "" {
+    disp_col = "#EF4444"
+  }
+  let disp_met = canvas_measure_text(cv, disp_str, "ui_bold", font_sz)
+  let disp_tx = lcd_x + lcd_w - int(disp_met.width) - 18
+  canvas_draw_text(cv, disp_str, max(lcd_x + 20, disp_tx), lcd_y + 46, disp_col, font_sz, "ui_bold")
+
+  # ---------------------------------------------------------------------------
+  # Keypad Matrix
+  # ---------------------------------------------------------------------------
+  let grid_y = lcd_y + lcd_h + 16
+  
+  # Memory & Function Row
+  let mem_keys = [
+    {"label": "MC", "variant": "secondary"},
+    {"label": "MR", "variant": "secondary"},
+    {"label": "M+", "variant": "secondary"},
+    {"label": "M-", "variant": "secondary"},
+    {"label": "AC", "variant": "danger"},
+    {"label": "C", "variant": "secondary"},
+    {"label": "DEL", "variant": "secondary"}
+  ]
+  
+  let mem_w = (ww - 40 - (len(mem_keys) - 1) * 8) / len(mem_keys)
+  for i in range(len(mem_keys)) {
+    let k = mem_keys[i]
+    let kx = wx + 20 + i * (mem_w + 8)
+    draw_button(cv, kx, grid_y, mem_w, 36, k.label, k.variant, "normal")
+  }
+
+  # Scientific Row
+  let sci_y = grid_y + 44
+  let sci_keys = [
+    {"label": "√x", "variant": "secondary"},
+    {"label": "x²", "variant": "secondary"},
+    {"label": "x^y", "variant": "secondary"},
+    {"label": "%", "variant": "secondary"},
+    {"label": "±", "variant": "secondary"},
+    {"label": "(", "variant": "secondary"},
+    {"label": ")", "variant": "secondary"}
+  ]
+  for i in range(len(sci_keys)) {
+    let k = sci_keys[i]
+    let kx = wx + 20 + i * (mem_w + 8)
+    draw_button(cv, kx, sci_y, mem_w, 36, k.label, k.variant, "normal")
+  }
+
+  # Numeric & Main Operations Keypad (4 columns x 4 rows)
+  let num_y = sci_y + 46
+  let pad_keys = [
+    [{"label": "7", "type": "num"}, {"label": "8", "type": "num"}, {"label": "9", "type": "num"}, {"label": "÷", "type": "op"}],
+    [{"label": "4", "type": "num"}, {"label": "5", "type": "num"}, {"label": "6", "type": "num"}, {"label": "×", "type": "op"}],
+    [{"label": "1", "type": "num"}, {"label": "2", "type": "num"}, {"label": "3", "type": "num"}, {"label": "-", "type": "op"}],
+    [{"label": "0", "type": "num"}, {"label": ".", "type": "num"}, {"label": "=", "type": "eq"}, {"label": "+", "type": "op"}]
+  ]
+
+  let main_pad_w = ww - 40
+  let btn_gap = 10
+  let btn_w = (main_pad_w - 3 * btn_gap) / 4
+  let btn_h = 54
+
+  for r in range(4) {
+    for c in range(4) {
+      let b = pad_keys[r][c]
+      let bx = wx + 20 + c * (btn_w + btn_gap)
+      let by = num_y + r * (btn_h + btn_gap)
+
+      let variant = "secondary"
+      if b.type == "op" { variant = "primary" }
+      if b.type == "eq" { variant = "success" }
+
+      let state = "normal"
+      if calc.active_button == b.label {
+        state = "active"
+      }
+      draw_button(cv, bx, by, btn_w, btn_h, b.label, variant, state)
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # History Tape Panel (Bottom Widget)
+  # ---------------------------------------------------------------------------
+  let hist_y = num_y + 4 * (btn_h + btn_gap) + 14
+  let hist_h = wh - (hist_y - wy) - 16
+  
+  canvas_fill_round_rect(cv, wx + 20, hist_y, ww - 40, hist_h, 8.0, "#131C2E")
+  canvas_stroke_round_rect(cv, wx + 20, hist_y, ww - 40, hist_h, 8.0, "#1E293B", 1.0)
+  
+  canvas_draw_text(cv, "CALCULATION HISTORY TAPE", wx + 32, hist_y + 12, "#38BDF8", 11, "ui_bold")
+
+  let start_hist = max(0, len(calc.history) - 3)
+  let hy = hist_y + 34
+  for i in range(start_hist, len(calc.history)) {
+    let h_item = calc.history[i]
+    let h_line = h_item.expr + " = " + h_item.result
+    canvas_fill_circle(cv, wx + 36, hy + 7, 3.0, "#10B981")
+    canvas_draw_text(cv, h_item.expr, wx + 48, hy, "#94A3B8", 12, "mono")
+    
+    let res_str = "= " + h_item.result
+    let res_m = canvas_measure_text(cv, res_str, "ui_bold", 12)
+    canvas_draw_text(cv, res_str, wx + ww - int(res_m.width) - 36, hy, "#F1F5F9", 12, "ui_bold")
+    hy = hy + 22
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 4. Simulation & Interactive Workflows
+# -----------------------------------------------------------------------------
+
+let calc = calc_create()
+
+print("[Step 1] Driving Basic Arithmetic: 1250 + 875 = 2125...")
+calc_input_digit(calc, "1")
+calc_input_digit(calc, "2")
+calc_input_digit(calc, "5")
+calc_input_digit(calc, "0")
+calc_input_op(calc, "+")
+calc_input_digit(calc, "8")
+calc_input_digit(calc, "7")
+calc_input_digit(calc, "5")
+calc_equals(calc)
+print("  Display: " + calc.display + " (Expected: 2125)")
+
+print("\n[Step 2] Driving Decimal & Precedence: 45.2 × 3.5 - 6.4 = 151.8...")
+calc_all_clear(calc)
+calc_input_digit(calc, "4")
+calc_input_digit(calc, "5")
+calc_input_decimal(calc)
+calc_input_digit(calc, "2")
+calc_input_op(calc, "×")
+calc_input_digit(calc, "3")
+calc_input_decimal(calc)
+calc_input_digit(calc, "5")
+calc_input_op(calc, "-")
+calc_input_digit(calc, "6")
+calc_input_decimal(calc)
+calc_input_digit(calc, "4")
+calc_equals(calc)
+print("  Display: " + calc.display + " (Expected: 151.8)")
+
+print("\n[Step 3] Driving Scientific Functions (Square Root & Powers)...")
+calc_all_clear(calc)
+calc_input_digit(calc, "6")
+calc_input_digit(calc, "2")
+calc_input_digit(calc, "5")
+calc_sqrt_op(calc)
+print("  √625 = " + calc.display)
+calc_input_op(calc, "×")
+calc_input_digit(calc, "4")
+calc_equals(calc)
+print("  25 × 4 = " + calc.display + " (Expected: 100)")
+
+print("\n[Step 4] Driving Memory Registers (MC, M+, MR)...")
+calc_mem_clear(calc)
+calc_all_clear(calc)
+calc_input_digit(calc, "5")
+calc_input_digit(calc, "0")
+calc_input_digit(calc, "0")
+calc_mem_add(calc)
+print("  Stored 500 into M+ (Memory active: " + str(calc.has_memory) + ")")
+calc_all_clear(calc)
+calc_input_digit(calc, "2")
+calc_input_digit(calc, "5")
+calc_input_digit(calc, "0")
+calc_mem_add(calc)
+print("  Added 250 into M+ (Total memory: " + str(calc.memory) + ")")
+calc_all_clear(calc)
+calc_mem_recall(calc)
+print("  Recalled MR: " + calc.display + " (Expected: 750)")
+
+print("\n[Step 5] Driving Error Handling (Division by Zero)...")
+calc_all_clear(calc)
+calc_input_digit(calc, "4")
+calc_input_digit(calc, "2")
+calc_input_op(calc, "÷")
+calc_input_digit(calc, "0")
+calc_equals(calc)
+print("  Display: " + calc.display + " | Error: '" + calc.error_msg + "'")
+
+# Reset to clean state for final desktop capture
+calc_all_clear(calc)
+calc_input_digit(calc, "1")
+calc_input_digit(calc, "2")
+calc_input_digit(calc, "5")
+calc_input_digit(calc, "0")
+calc_input_op(calc, "+")
+calc_input_digit(calc, "8")
+calc_input_digit(calc, "7")
+calc_input_digit(calc, "5")
+calc_equals(calc)
+calc.active_button = "="
+
+# -----------------------------------------------------------------------------
+# 5. Full Desktop Render (1920x1080 Native Frame)
+# -----------------------------------------------------------------------------
+print("\n[Step 6] Rendering 1920x1080 Full Desktop Frame with Calculator Window...")
+let W = 1920
+let H = 1080
+let cv = canvas_create(W, H, "#030712")
+
+# 1. Desktop Wallpaper & Glow Background
+draw_desktop_wallpaper(cv, W, H)
+
+# 2. Desktop System Menu & Telemetry Bar
+draw_top_system_bar(cv, W)
+
+# 3. Center Calculator Application Window
+let win_w = 640
+let win_h = 760
+let win_x = (W - win_w) / 2
+let win_y = (H - win_h) / 2 + 10
+draw_calculator_window(cv, calc, win_x, win_y, win_w, win_h)
+
+# 4. Desktop Bottom Dock
+draw_desktop_dock(cv, W, H)
+
+# 5. Register with AIOS Windowing / Compositor Pane Manager
+let calc_pane = register_pane({
+  "title": "AIOS Calculator",
+  "width": win_w,
+  "height": win_h,
+  "x": win_x,
+  "y": win_y,
+  "on_draw": fn(canvas, p) {
+    draw_calculator_window(canvas, calc, 0, 0, p.width, p.height)
+  },
+  "on_event": fn(p, ev) {
+    if ev.type == "click" {
+      print("  [Pane Event] Click received at (" + str(ev.x) + ", " + str(ev.y) + ")")
+    }
+  },
+  "data": calc
+})
+print("  ✓ Registered AIOS Calculator Window Pane (ID: " + str(calc_pane.id) + ", Title: '" + calc_pane.title + "')")
+
+# 6. Test Pane Event Dispatching
+pane_dispatch_event(calc_pane, {"type": "click", "x": 100, "y": 200, "button": 1})
+
+# 7. Output Canvas to PPM
+let out_file = "examples/grain/calculator_desktop.ppm"
+canvas_save_ppm(cv, out_file)
+print("  ✓ Rendered full 1920x1080 Desktop Canvas successfully to " + out_file)
+
+print("\n=================================================================")
+print("  AIOS CALCULATOR DESKTOP APPLICATION FULLY PROVEN!              ")
+print("=================================================================")

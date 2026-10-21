@@ -1,0 +1,51 @@
+# Two closures over ONE variable must see each other's writes.
+fn counter() {
+  let n = 0
+  let inc = fn () { n = n + 1 return n }
+  let get = fn () { return n }
+  return [inc, get]
+}
+let c = counter()
+let inc = c[0]
+let get = c[1]
+inc() inc() inc()
+print("shared upvalue:", get(), "(want 3)")
+
+# Two separate calls must NOT share.
+let d = counter()
+d[0]()
+print("independent:", get(), d[1](), "(want 3 1)")
+
+# The classic: each iteration must capture its OWN loop variable.
+let fns = []
+for i in range(0, 5) {
+  push(fns, fn () { return i * i })
+}
+let squares = []
+for f in fns { push(squares, f()) }
+print("per-iteration capture:", squares, "(want [0, 1, 4, 9, 16])")
+
+# A closure over a closure: the middle function never mentions x.
+fn outer(x) {
+  fn middle() {
+    fn inner() { return x * 10 }
+    return inner
+  }
+  return middle()
+}
+print("two levels up:", outer(7)(), "(want 70)")
+
+# Higher-order functions.
+fn map_over(xs, f) {
+  let out = []
+  for x in xs { push(out, f(x)) }
+  return out
+}
+fn fold(xs, start, f) {
+  let acc = start
+  for x in xs { acc = f(acc, x) }
+  return acc
+}
+let nums = range(1, 6)
+print("map:", map_over(nums, fn (n) { return n * n }))
+print("fold:", fold(nums, 0, fn (a, b) { return a + b }), "(want 15)")

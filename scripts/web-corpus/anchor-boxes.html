@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><title>anchors that are boxes</title>
+<style>
+.nav { display: flex; flex-wrap: wrap; justify-content: space-between; }
+.nav a { display: block; padding: 15px; white-space: nowrap; }
+.cell { display: inline-block; }
+</style></head>
+<body>
+<a href="https://example.com/block" style="display:block">A block anchor</a>
+<div class="nav"><a href="https://example.com/one">One</a><a href="https://example.com/two">Two</a></div>
+<p>An <a class="cell" href="https://example.com/cell">inline-block anchor</a> inside a paragraph, and an <a href="https://example.com/plain">ordinary one</a>.</p>
+</body></html>

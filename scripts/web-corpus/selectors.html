@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><title>Selector matching</title><link rel="stylesheet" href="site.css">
+<style>
+ul > li { color: #202020; }
+li:first-child { font-weight: bold; }
+li:last-child { font-style: italic; }
+li:nth-child(2) { color: #b03a4a; }
+h2 + p { color: #0f6ab0; }
+h2 ~ p { font-size: 15px; }
+p:not(.fine) { line-height: 1.5; }
+[data-state] { text-decoration: underline; }
+[type="submit"] { font-weight: bold; }
+[href^="https"] { font-style: italic; }
+[href$=".pdf"] { text-decoration: line-through; }
+[href*="wiki"] { font-size: 17px; }
+[lang|="en"] { color: #0f6ab0; }
+[class~="tag"] { font-weight: bold; }
+::-webkit-scrollbar { width: 10px; }
+</style></head>
+<body><div class="wrap">
+<h2>Matched by shape, not by tag</h2>
+<p>Adjacent to the heading, so this one is blue.</p>
+<p>A later sibling, so this one is only resized.</p>
+<ul><li>First, bold</li><li>Second, red</li><li>Third, italic</li></ul>
+<p data-state="open">Carries an attribute.</p>
+<button type="submit">Submit, bold</button>
+<button type="button">Button, NOT bold</button>
+<p><a href="https://example.com/a">https, italic</a>
+<a href="/paper.pdf">pdf, struck</a>
+<a href="/wiki/thing">wiki, seventeen</a>
+<a href="/plain">plain, untouched</a></p>
+<p lang="en-GB">Dash-matched language, blue.</p>
+<p lang="ender">Not a language match, so not blue.</p>
+<p class="tag important">A word in the list, bold.</p>
+<p class="tagged">Not the word, so not bold.</p>
+<p class="fine">Excluded from the :not rule.</p>
+</div></body></html>

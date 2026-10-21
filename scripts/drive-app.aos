@@ -1,0 +1,67 @@
+# Application Verification Script on AOS
+# Proves AOS functions as a general-purpose operating system for standard applications:
+# boot -> app creation -> memory allocation -> data persistence -> IPC/network -> GPU compute -> state recovery -> permissions enforcement
+
+# 1. Boot and Device Initialization
+info
+devices
+
+# 2. Application Process Creation
+entity create data_ingest_service                => app
+entity create storage_worker                     => worker
+entity relate $app $worker provides
+
+# 3. Capability Permission Grants (Least Privilege Model)
+cap grant $app kernel * schedule
+cap grant $app compute * execute
+cap grant $app memory * allocate
+cap grant $app storage * write
+cap grant $app state * allocate
+cap grant $app channel * allocate
+cap grant $app kernel * checkpoint
+
+# 4. Memory Allocation (Private & Persistent Memory Fabric)
+mem alloc $app 4096 persistent                    => app_buffer
+mem write $app $app_buffer 0 "sensor_telemetry_payload_batch_1042"
+mem read $app $app_buffer 0 35
+expect "sensor_telemetry_payload_batch_1042"
+
+# 5. Persistent Data Storage (Object Store)
+store put $app "service telemetry configuration v1.0" service=data_ingest rate=1000hz => cfg_obj
+store history $cfg_obj
+
+# 6. IPC Channel Creation & Communication Setup
+state create $app working "status=OK rate=1000hz batch=1042" => state_obj
+channel create $app 8 512                         => ipc_chan
+channel admit $app $ipc_chan $worker consume
+channel subscribe $worker $ipc_chan
+channel publish $app $ipc_chan $state_obj
+channel consume $worker $ipc_chan
+expect "status=OK"
+
+# 7. Signal Processing & Matrix Compute on Accelerator (CPU/GPU)
+tensor create $app f32 2x2 1.0 2.0 3.0 4.0        => input_matrix
+tensor create $app f32 2x2 2.0 0.0 0.0 2.0        => scale_matrix
+tensor create $app f32 2x2                        => output_matrix
+graph create $app                                 => compute_pipe
+graph op $app $compute_pipe matmul in=$input_matrix:f32:2x2 in=$scale_matrix:f32:2x2 out=$output_matrix:f32:2x2
+graph plan $app $compute_pipe
+graph run $app $compute_pipe
+tensor show $app $output_matrix f32 2x2
+
+# 8. Memory Isolation & Permission Enforcement Verification
+! mem read $worker $app_buffer 0 35
+
+# 9. Process Checkpoint & State Recovery
+checkpoint $app                                  => app_snapshot
+entity terminate $app
+! entity show $app
+
+# 10. Restore Process & Resume Operation
+restore $app_snapshot
+entity show $app
+mem read $app $app_buffer 0 35
+expect "sensor_telemetry_payload_batch_1042"
+tensor show $app $output_matrix f32 2x2
+
+info

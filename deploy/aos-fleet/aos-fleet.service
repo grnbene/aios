@@ -1,0 +1,15 @@
+[Unit]
+Description=AOS fleet member (hub from /etc/aos/fleet.env)
+After=network-online.target
+Wants=network-online.target
+# Waits for the cluster key at /etc/aos/fleet.key (root:<user> 0640).
+ConditionPathExists=/etc/aos/fleet.key
+
+[Service]
+User=@USER@
+ExecStart=/opt/aos/bin/fleet-member.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

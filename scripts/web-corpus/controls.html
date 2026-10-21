@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><title>Controls and generated boxes</title><link rel="stylesheet" href="site.css">
+<style>
+select { padding: 6px 10px; border-radius: 8px; }
+.seg + .seg::before { content: ' · '; color: #909090; }
+.req::after { content: ' *'; color: #b03a4a; }
+.q::before { content: '\201C'; }
+.q::after { content: '\201D'; }
+.lbl::before { content: attr(data-name) ': '; color: #0f8a6a; }
+.host { position: relative; height: 90px; background: rgba(0,0,0,0.06); border-radius: 10px; }
+.mid { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+       background: #0f8a6a; color: #fff; padding: 6px 12px; border-radius: 999px; }
+.nudge { transform: translateY(10px); }
+</style></head>
+<body><div class="wrap">
+<h2>A dropdown, closed</h2>
+<p>Mode:
+  <select name="mode"><option>One asset per photo</option><option selected>Many per photo</option></select>
+  Empty: <select name="e"></select>
+  First: <select name="f"><option>Alpha</option><option>Beta</option></select>
+</p>
+<h2>Generated boxes</h2>
+<p><span class="seg">27k</span><span class="seg">2 calls</span><span class="seg">$0.034</span></p>
+<p class="req">A required field</p>
+<p class="q">a quotation, in marks the page supplies</p>
+<p class="lbl" data-name="Host">arch-qbc</p>
+<h2>Translated</h2>
+<div class="host"><span class="mid">centred by translate</span></div>
+<p class="nudge">nudged ten down.</p>
+</div></body></html>

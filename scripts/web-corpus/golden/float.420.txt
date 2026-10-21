@@ -1,0 +1,22 @@
+# page float.html  viewport=420
+# title file:///float.html
+# content 420x252  background=ff121212  links=0
+rect     220     0   200   100  #ffcc3333
+text     220     0     8    21  #ffd8d8d8  15px              "R"
+rect       0     0   100    60  #ff3333cc
+text       0     0     8    21  #ffd8d8d8  15px              "L"
+text     110     0    80    21  #ffd8d8d8  15px              "alpha beta"
+text     110    21    88    21  #ffd8d8d8  15px              "gamma delta"
+text     110    42    56    21  #ffd8d8d8  15px              "epsilon"
+text       0    63   200    21  #ffd8d8d8  15px              "zeta eta theta iota kappa"
+text       0    84   184    21  #ffd8d8d8  15px              "lambda mu nu xi omicron"
+text       0   105   192    21  #ffd8d8d8  15px              "pi rho sigma tau upsilon"
+text       0   126   384    21  #ffd8d8d8  15px              "phi chi psi omega alpha beta gamma delta epsilon"
+text       0   147   416    21  #ffd8d8d8  15px              "zeta eta theta iota kappa lambda mu nu xi omicron pi"
+text       0   168   400    21  #ffd8d8d8  15px              "rho sigma tau upsilon phi chi psi omega alpha beta"
+text       0   189   416    21  #ffd8d8d8  15px              "gamma delta epsilon zeta eta theta iota kappa lambda"
+text       0   210    40    21  #ffd8d8d8  15px              "mu nu"
+rect       0   231   420    21  #ffcccccc
+text       0   231    56    21  #ffd8d8d8  15px              "cleared"
+# glyph-gaps (none)
+

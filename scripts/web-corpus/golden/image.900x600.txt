@@ -1,0 +1,8 @@
+# page image.html  viewport=900x600
+# title A photograph on a page
+# content 900x214  background=ffffffff  links=0
+text      16    36   287    33  #ff202020  24px,bold         "A photograph on a page"
+image     16    81    96    72  #ff202020  src=file:///photo.jpg alt="a gradient with a red ellipse"
+text      16   165   568    21  #ff202020  15px              "Baseline JPEG, 4:2:0. Before the decoder existed this was the alt text."
+# glyph-gaps (none)
+

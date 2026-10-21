@@ -1,0 +1,24 @@
+fn f(n) { f = fn (x) { return "replaced " + str(x) } return n * 2 }
+print(f(3), f(4))
+fn mk(n) { return fn () { return n } }
+let fs = []
+for i in range(0, 5) { push(fs, mk(i)) }
+print(map(fs, fn (g) { return g() }))
+fn build(n) { if n == 0 { return [] } let l = build(n - 1) push(l, str(n)) return l }
+print(build(6))
+fn chain(n) { if n == 0 { return "x" } return chain(n - 1) + "y" }
+print(len(chain(150)))
+fn ret_map(n) { return {n: n, s: str(n), l: [n]} }
+let acc = 0
+for i in range(0, 200) { acc = acc + ret_map(i).n }
+print(acc)
+fn once() { return fn (v) { return v + 1 } }
+print(once()(41))
+fn self_drop() { let g = fn (x) { return x * 3 } return g(g(2)) }
+print(self_drop())
+fn tail(n, a) { if n == 0 { return a } return tail(n - 1, a + n) }
+print(tail(190, 0))
+let counter = 0
+fn bump() { counter = counter + 1 return counter }
+for i in range(0, 1000) { bump() }
+print(counter)

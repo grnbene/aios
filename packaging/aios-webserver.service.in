@@ -1,0 +1,31 @@
+[Unit]
+Description=aios-webserver — HTTP/HTTPS front for php-fpm and static files
+After=network-online.target php-fpm.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated, unprivileged user (install-asql.sh creates aios:aios). The one
+# privilege kept is binding ports below 1024 (:80/:443); nothing else.
+User=aios
+Group=aios
+ExecStart=/opt/aios/bin/aios-webserver /etc/aios/webserver.conf
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

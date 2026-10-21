@@ -1,0 +1,20 @@
+# Drive Network File Ingress & Automated Ingestion Subsystem end to end.
+
+# 0. Create schema for ingress targets
+sql query "CREATE TABLE IF NOT EXISTS customer_orders (id TEXT PRIMARY KEY, customer_id TEXT, amount REAL, status TEXT)"
+sql query "DELETE FROM customer_orders WHERE id = 'ord_103'"
+
+# 1. Ingest SQL payload string directly
+ingress ingest customer=cust_acme filename="customer_batch.sql" payload="INSERT INTO customer_orders VALUES ('ord_103', 'cust_acme', 540.00, 'SHIPPED');"
+
+# 2. Ingest structured application payload
+ingress ingest customer=cust_stark filename="telemetry_config.json" payload="{\"sample_rate\": 100, \"mode\": \"streaming\"}"
+
+# 3. View network ingress log
+ingress log
+
+# 4. Verify SQL DB tables updated from auto-ingest
+sql query "SELECT * FROM customer_orders"
+
+# 5. Verify subsystem matrix
+subsystems

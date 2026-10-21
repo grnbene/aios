@@ -1,0 +1,19 @@
+# page pseudo.html  viewport=900x600
+# title Functional pseudo-classes
+# content 900x413  background=ffffffff  links=0
+text      16    36   143    33  #ff0f6ab0  24px,bold         "Blue by :is"
+text      16    85    90    26  #ff0f6ab0  19px,bold         "Also blue"
+text      16   127    64    22  #ff202020  16px,bold         "Not blue"
+text      16   161   176    21  #ff202020  15px,bold         "Bold, listed in :where"
+text      16   194   192    21  #ff202020  15px,italic       "Italic, excluded by :not"
+text      16   239   163    23  #ff202020  17px,bold         "Bold and seventeen"
+rect      32   297     4     4  #ff202020
+text      46   289    72    21  #ff202020  15px,bold         "one, bold"
+rect      32   321     4     4  #ff202020
+text      46   313    80    21  #ff202020  15px              "two, plain"
+rect      32   345     4     4  #ffb03a4a
+text      46   337   152    21  #ffb03a4a  15px,bold         "three, bold and red"
+rect      32   369     4     4  #ff202020
+text      46   361    88    21  #ff202020  15px              "four, plain"
+# glyph-gaps (none)
+

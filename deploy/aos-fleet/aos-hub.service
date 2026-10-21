@@ -1,0 +1,24 @@
+[Unit]
+# The fleet's rendezvous + relay (chi-il-1 in deploy/aos-fleet-sync.sh's
+# roster, which restarts it as `aos-hub` after copying a new /opt/aos/aios).
+# Install: sudo deploy/aos-fleet/install.sh <user> hub
+Description=AOS fleet hub (rendezvous + relay)
+After=network-online.target
+Wants=network-online.target
+# The cluster key, read by aios itself (`@FILE`), never on a command line.
+ConditionPathExists=/etc/aos/fleet.key
+
+[Service]
+User=@USER@
+Environment=AOS_HUB_PORT=7420
+# Overrides (AOS_HUB_PORT=...) without editing the unit.
+EnvironmentFile=-/etc/aos/fleet.env
+ExecStart=/opt/aos/aios --root /opt/aos/hub-root exec "fleet hub ${AOS_HUB_PORT} @/etc/aos/fleet.key" "sleep 4000000"
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/opt/aos/hub-root
+
+[Install]
+WantedBy=multi-user.target

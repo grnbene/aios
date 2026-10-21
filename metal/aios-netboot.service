@@ -1,0 +1,27 @@
+[Unit]
+Description=aios Raspberry Pi 3 netboot server (ProxyDHCP + TFTP on br0)
+Documentation=file:///repos/mcp-tools/aios/metal/serve-netboot.sh
+After=network-online.target
+Wants=network-online.target
+
+# DHCP "static" mode, not ProxyDHCP: the office router intermittently ignores
+# the Pi boot ROM's DISCOVERs (captured 2026-09-24: 5 DISCOVERs, only our
+# proxy answered, the ROM gave up). A proxy cannot supply an address, so the
+# board stalled until power-cycled. In static mode dnsmasq answers ONLY the
+# listed MAC (the Pi's boot ROM) with address + boot info in one offer; every
+# other host on the LAN is ignored and keeps using the router.
+[Service]
+# ProxyDHCP never hands out leases (the LAN router still does); it only adds
+# the "Raspberry Pi Boot" PXE offer that tells the Pi's bootcode.bin where
+# TFTP is. build-arm64.sh publishes kernel8.img into the TFTP root.
+ExecStart=/usr/sbin/dnsmasq --no-daemon --interface=br0 --bind-dynamic --port=0 \
+  --enable-tftp --tftp-no-blocksize --tftp-root=/repos/mcp-tools/aios/build/tftpboot \
+  --dhcp-range=10.60.60.0,static,255.255.255.0,1h \
+  --dhcp-host=b8:27:eb:40:68:c2,10.60.60.167,1h \
+  --dhcp-option=3,10.60.60.1 --dhcp-option=6,1.1.1.1,8.8.8.8 \
+  --dhcp-boot=bootcode.bin "--pxe-service=0,Raspberry Pi Boot" --log-dhcp --user=arch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# page anchored.html  viewport=900x600
+# title Anchored menus
+# content 900x243  background=ff111111  links=0
+text      40    24    28    19  #ffdddddd  14px              "left"
+rect     820    20    40    28  #ff333333  r=999
+rect     732    54   128    48  #ff224466  r=12
+border   732    54   128    48  #ff4a4a4a  r=12
+rect     737    59    38    38  #ff882222
+rect     777    59    38    38  #ff882222
+rect     817    59    38    38  #ff882222
+rect     124    68    44    23  #ff333333
+text     132    70    28    19  #ffdddddd  14px,bold         "chip"
+text      40    80    84    19  #ffdddddd  14px              "Text with a "
+text     168    80    49    19  #ffdddddd  14px              " in it."
+rect      40    91   820    12  #ff555577
+rect      40   133   820    80  #ff1a1a1a
+rect      40   133    40    28  #ff333333  r=999
+rect      40    71   190    56  #ff664422
+rect      44    75   182    24  #ff7a5a2a
+rect      44    99   182    24  #ff7a5a2a
+rect     802   185    50    20  #ff226644
+rect      40   133    40    16  #ff442266
+# glyph-gaps (none)
+

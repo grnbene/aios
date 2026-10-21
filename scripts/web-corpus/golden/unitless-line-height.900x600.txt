@@ -1,0 +1,10 @@
+# page unitless-line-height.html  viewport=900x600
+# title Unitless line-height
+# content 900x76  background=ff121212  links=0
+rect       0     0   900    76  #ff222222
+rect       0     0   900    56  #ff333333
+text       0     0   480    56  #ffd8d8d8  28px              "Big text with inherited factor 2"
+rect       0    56   900    20  #ff444444
+text       0    56   170    20  #ffd8d8d8  10px              "Small text with inherited factor 2"
+# glyph-gaps (none)
+

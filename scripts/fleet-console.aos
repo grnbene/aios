@@ -1,0 +1,32 @@
+face fleet_console
+title "AIOS Production Fleet Console"
+let telemetry = fetch_json("http://127.0.0.1:19470/fleet")
+let nodes = telemetry.nodes
+let moves = telemetry.migrations
+state filter = "all"
+row gap=12
+  image src="aos-frame.png" width=48 height=48
+  column gap=2
+    heading "AIOS Cluster & Migration Matrix"
+    text "Autonomous rebalancing via Orchestrator::rebalance() with mesh TLS edge containment" dim
+row gap=8
+  tile label="Active Nodes" value=count(nodes) accent=ok
+  tile label="Cluster Pressure" value=telemetry.pressure
+  tile label="Free Slots" value=telemetry.free_slots accent=accent
+  tile label="Live Migrations" value=count(moves)
+row gap=8
+  button "Rebalance" action=rebalance primary
+  button "Dispatch TSP" action=dispatch_tsp
+  button "Refresh" action=refresh
+panel "Cluster Compute Nodes"
+  scroll height=220
+    table nodes columns="id:Node ID, host:Mesh Host, arch:Arch, pressure:Pressure, queued:Queue, free_slots:Free Slots:right" empty="no cluster nodes registered"
+panel "Live Job Migration Stream"
+  scroll height=180
+    list moves "{ago}  [{id}]  {job}  ({size})  {from} -> {to}  [{status}]" rows=8
+on rebalance:
+  say "Triggering autonomous migration on oversubscribed nodes..."
+on dispatch_tsp:
+  say "Dispatched custom-kernel compute job (erp.tsp_exact) to cluster"
+on refresh:
+  say "Telemetry refreshed from cluster orchestrator"

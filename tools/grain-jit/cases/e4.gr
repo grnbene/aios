@@ -1,0 +1,21 @@
+fn make(k) { let c = 0 return fn (x) { c = c + x return c * k } }
+let f = make(3)
+print(f(1), f(2), f(3))
+print(map([1, 2, 3], fn (v) { return f(v) - v }))
+fn mixed(n) { let s = 0 let i = 0 while i < n { if i == 5 { s = s + 0.5 } else { s = s + i } i = i + 1 } return s }
+print(mixed(10), mixed(3))
+fn strs(n) { let s = "" for i in range(0, n) { s = s + str(i) } return s }
+print(strs(12))
+fn big() { return 9223372036854775807 + 1 }
+print(big(), -(-9223372036854775807 - 1), 7 * -3, 7 - 10)
+fn cmp(a, b) { return [a < b, a <= b, a > b, a >= b, a == b, a != b, not (a < b)] }
+print(cmp(1, 2), cmp(2, 2), cmp(2.5, 2), cmp("a", "b"), cmp(1, 1.0))
+fn deep(n) { if n == 0 { return 0 } return 1 + deep(n - 1) }
+print(deep(150))
+let total = 0
+for k in range(0, 1000) { total = total + k }
+print(total)
+fn nil_and_bools(x) { if x { return "t" } return "f" }
+print(nil_and_bools(nil), nil_and_bools(false), nil_and_bools(0), nil_and_bools(""), nil_and_bools([]))
+fn locals_many(a, b, c) { let d = a + b let e = d * c let f2 = e - a let g = f2 == 9 return [d, e, f2, g] }
+print(locals_many(1, 2, 3))

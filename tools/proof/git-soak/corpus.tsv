@@ -1,0 +1,12 @@
+# name	url	pin	variants
+# The corpus the git soak draws from. `pin` is the commit every sample is confined to (history reachable from it),
+# so a finding replays against the same objects tomorrow. "-" means unresolved: scripts/soak-fetch-corpus.ps1
+# resolves it once to the mirror's default-branch tip and writes it back here; commit the result.
+# variants: repacks of the same objects (deep = --window=100 --depth=250, ref = REF_DELTA instead of OFS_DELTA),
+# read-only, skipped for mirrors with a pack over --variant-max-mb.
+mcp-tools	C:/Dev/mcp-tools	bd1012d6b1ca312d790b6014a2f3dca32e2b5ed4	deep,ref
+assay	C:/Dev/assay	9d3dcd734ccc329b3af1c3d94a7f3e89e122143b	deep,ref
+zlib	https://github.com/madler/zlib.git	767c4c947852e143f582c85f14cf573411df1b35	deep,ref
+libgit2	https://github.com/libgit2/libgit2.git	0551dfd4ad989b6a3d5683c0d4cf326c6efef929	deep,ref
+curl	https://github.com/curl/curl.git	15ad1b85653afe2fa7ba8249e93581bc86cb52b9	deep,ref
+git	https://github.com/git/git.git	6de20f6092dcf9bdb1c8efe03db4b70c82b423dd	

@@ -1,0 +1,19 @@
+# page flex.html  viewport=900x600
+# title Flex row
+# content 900x210  background=ffffffff  links=0
+rect      16    16   868    49  #fff2f2f2
+text      26    30    40    21  #ff202020  15px              "Label"
+text      78    30   104    21  #ff202020  15px              "Grows to fill"
+rect     814    26    60    29  #ff0f6ab0
+text     824    30    40    21  #ffffffff  15px              "Badge"
+border    16    81   308   113  #ffd0d0d0
+text      29   110    50    26  #ff202020  19px,bold         "First"
+text      29   148   256    21  #ff202020  15px              "One of three that share the row."
+border   340    81   252   113  #ffd0d0d0
+text     353   110    60    26  #ff202020  19px,bold         "Second"
+text     353   148   200    21  #ff202020  15px              "Same edges, same padding."
+border   608    81   276   113  #ffd0d0d0
+text     621   110    50    26  #ff202020  19px,bold         "Third"
+text     621   148   224    21  #ff202020  15px              "Wraps when the row runs out."
+# glyph-gaps (none)
+

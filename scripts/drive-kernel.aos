@@ -1,0 +1,208 @@
+# Drive the kernel end to end. Every line acts AS an entity through the kernel
+# API; lines starting with ! are expected to be REFUSED by the kernel.
+info
+devices
+
+# ---- entities: identity, relationships -------------------------------------
+entity create sensor            => sensor
+entity create mind              => mind
+entity create archive           => archive
+entity relate $mind $sensor consumes
+entity show $mind
+
+# ---- capabilities: no root, only what was granted ----------------------------
+cap list $mind
+# a fresh entity cannot compute or schedule: it was never granted that
+graph create $mind              => g0
+tensor create $mind f32 2 1 2   => t0
+graph op $mind $g0 scale in=$t0:f32:2 out=$t0:f32:2 scalar=2
+! graph run $mind $g0
+cap grant $mind kernel * schedule
+! graph run $mind $g0
+cap grant $mind compute * execute
+graph run $mind $g0
+tensor show $mind $t0 f32 2
+# allocation is bounded by the capability's scope: drop the default budget,
+# grant 4 KiB, and the fabric refuses the fifth kilobyte
+cap find $sensor memory *
+set defaultmem
+cap revoke $defaultmem
+cap grant $sensor memory * allocate 0 4096
+mem alloc $sensor 2048
+mem alloc $sensor 2048
+! mem alloc $sensor 1
+# delegation can only attenuate; a bare entity cannot touch another's memory
+mem alloc $mind 64                 => shared
+mem write $mind $shared 0 "held by mind"
+! mem read $sensor $shared 0 12
+mem share $mind $shared $sensor read
+mem read $sensor $shared 0 12
+expect "held by mind"
+! mem write $sensor $shared 0 "sensor wrote"
+# time-bounded authority
+cap grant $sensor kernel * checkpoint 1
+cap check $sensor kernel * checkpoint
+
+# ---- memory fabric: types and migration keep identity -----------------------
+mem alloc $mind 4096 persistent    => pm
+mem write $mind $pm 0 "persistent bytes survive the process"
+mem migrate $mind $pm system
+mem read $mind $pm 0 36
+expect "persistent bytes survive"
+mem migrate $mind $pm shared
+mem read $mind $pm 0 36
+expect "persistent bytes survive"
+mem list $mind
+
+# ---- compute: a real graph on the CPU device ----------------------------------
+tensor create $mind f32 2x3 1 2 3 4 5 6         => A
+tensor create $mind f32 3x2 7 8 9 10 11 12      => B
+tensor create $mind f32 2x2                     => C
+tensor create $mind f32 2x2                     => D
+tensor create $mind f32 1                       => S
+graph create $mind                              => g
+graph op $mind $g matmul in=$A:f32:2x3 in=$B:f32:3x2 out=$C:f32:2x2 par=2 prio=200
+graph op $mind $g relu in=$C:f32:2x2 out=$D:f32:2x2
+graph op $mind $g softmax in=$D:f32:2x2 out=$D:f32:2x2
+graph op $mind $g reduce-sum in=$C:f32:2x2 out=$S:f32:1 prio=50
+graph show $g
+graph plan $mind $g
+# step two operations, checkpoint mid-graph, then resume
+graph run $mind $g 2
+entity show $mind
+graph run $mind $g
+tensor show $mind $C f32 2x2
+tensor show $mind $D f32 2x2
+tensor show $mind $S f32 1
+
+# ---- state and channels: communication is shared state -------------------------
+state create $sensor working "reading: 21.5C"      => reading
+# the sensor's 4 KiB budget is spent; a channel region needs more than that
+! channel create $sensor 8 256
+cap grant $sensor memory * allocate
+channel create $sensor 8 256                        => ch
+! channel subscribe $mind $ch
+channel admit $sensor $ch $mind consume
+channel subscribe $mind $ch
+channel publish $sensor $ch $reading
+state set $sensor $reading "reading: 22.0C"
+channel publish $sensor $ch $reading
+channel consume $mind $ch
+expect "21.5C"
+channel consume $mind $ch
+expect "22.0C"
+! channel consume $mind $ch
+! channel publish $mind $ch $reading
+channel list
+
+# ---- checkpoint / restore: identity and state survive death ---------------------
+state create $mind persistent "I am the mind; I remember" => memory
+state attach $mind $memory $shared
+cap grant $mind kernel * checkpoint
+checkpoint $mind
+set ckpt
+entity terminate $mind
+! entity show $mind
+! mem read $sensor $shared 0 12
+restore $ckpt
+entity show $mind
+state get $mind $memory
+expect "I remember"
+mem read $mind $shared 0 12
+expect "held by mind"
+tensor show $mind $C f32 2x2
+cap list $mind
+# And PUT IT BACK while it is still running. `restore` refuses over an entity
+# that is here and `entity terminate` refuses a resident outright, so between
+# them there was no way to rewind a live entity to a moment it had been. This
+# is that: contents replaced, 128-bit identity and execution position kept.
+state set $mind $memory "I am the mind; I have forgotten"
+state get $mind $memory
+expect "forgotten"
+rewind $ckpt
+entity show $mind
+state get $mind $memory
+expect "I remember"
+mem read $mind $shared 0 12
+expect "held by mind"
+
+# ---- intelligence: replaceable minds behind one ABI -----------------------------
+channel create $mind 16 4096                        => out
+state create $mind context "the room is warm and the sensor reports 22.0C"
+mind bind $mind echo out=$out
+mind cycle $mind
+expect "echo("
+mind bind $mind plugin ./mind_reflect.so out=$out
+mind cycle $mind 2
+expect "reflect: 1"
+expect "ops on the kernel's compute fabric"
+mind bind $mind plugin ./mind_fast_graph.so out=$out
+mind cycle $mind 2
+expect "fast_graph: 1"
+expect "vector search top lane"
+mind bind $mind extern ./aios-mind-peer out=$out
+mind cycle $mind
+expect "peer saw 1"
+channel consume $mind $out
+channel consume $mind $out
+channel consume $mind $out
+channel consume $mind $out
+channel consume $mind $out
+channel consume $mind $out
+expect "peer saw"
+mind unbind $mind
+
+# ---- storage: objects, similarity, relationships, history ------------------------
+cap grant $archive storage * read,write
+store put $archive "thermal reading in the server room" room=server kind=reading   => o1
+store put $archive "thermal reading in the lab" room=lab kind=reading derived=$o1  => o2
+store put $archive "network switch firmware upgraded" kind=change rel=$o1:7        => o3
+store similar "thermal reading server room" 2
+store history $o2
+store related $o1
+store meta kind reading
+! store snapshot $mind $memory
+cap grant $mind storage * write
+store snapshot $mind $memory
+set snap
+store history $snap
+store snapshot $mind $memory
+set snap2
+store history $snap2
+store list
+
+# ---- git: version control as a subsystem, with a kernel identity ----------------
+# The object database is storage the kernel owns, so reaching it at all is
+# capability-checked; a bare entity holds no storage authority.
+entity create scribe            => scribe
+# nothing is registered yet: the subsystem says so instead of guessing
+! git log as=$mind
+# the machine versions its own checkpoints, in a repository registered with the kernel
+git init root/checkpoints as=$mind
+git repos
+! git commit as=$mind nothing is staged yet
+git add . as=$mind
+git commit as=$mind the machine commits its own checkpoint
+git log as=$mind
+git status as=$mind
+git fsck as=$mind
+# the registry is the kernel's, not the command's: a bare entity reads the same
+# repositories through its own authority, and may not write to the database
+git repos as=$scribe
+! git init root/scribe-repo as=$scribe
+! git commit as=$scribe scribe may only read
+# a repository that is not there is a clear refusal, not a crash
+! git use nosuchrepo
+! git cat-file 0123456789abcdef0123456789abcdef01234567
+info
+
+# ---- self-improvement & machine authority policy --------------------------------
+cap request storage * write
+! cap request kernel * write
+! edit /host/repos/aios/src/kernel/surface.cpp foo bar
+authority refusals
+info
+
+# The last word: capture the mind AFTER its git work, so the image carries the
+# machine's repository registry into the next process.
+checkpoint $mind

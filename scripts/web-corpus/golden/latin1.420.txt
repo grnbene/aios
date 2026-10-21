@@ -1,0 +1,12 @@
+# page latin1.html  viewport=420
+# title Ångström
+# content 420x261  background=ffffffff  links=0
+text      16    16   375    44  #ff202020  32px,bold         "Ångström, Ω and the em"
+text      16    60    68    44  #ff202020  32px,bold         "dash"
+text      16   116   384    21  #ff202020  15px              "Naïve façade, crème brûlée, Señor Muñoz — with a"
+text      16   137   360    21  #ff202020  15px              "curly “quotation”, an ellipsis… and a résumé."
+text      16   158   360    21  #ff202020  15px              "The atlas either draws these or reports them."
+text      16   191   376    21  #ff202020  15px              "Arrows: ← ↑ → ↓ · Bullets: • ◦ ▪ · Maths: ± × ÷"
+text      16   212    24    21  #ff202020  15px              "≈ ∞"
+# glyph-gaps (none)
+

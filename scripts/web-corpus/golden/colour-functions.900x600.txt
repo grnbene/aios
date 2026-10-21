@@ -1,0 +1,25 @@
+# page colour-functions.html  viewport=900x600
+# title file:///colour-functions.html
+# content 900x210  background=ff121212  links=0
+rect       0     0   900    21  #ff008000
+text       0     0    24    21  #ffd8d8d8  15px              "hsl"
+rect       0    21   900    21  #800000ff
+text       0    21    32    21  #ffd8d8d8  15px              "hsla"
+rect       0    42   900    21  #ffff0000
+text       0    42    24    21  #ffd8d8d8  15px              "hwb"
+rect       0    63   900    21  #ffbf5702
+text       0    63    24    21  #ffd8d8d8  15px              "lab"
+rect       0    84   900    21  #ffd83a22
+text       0    84    24    21  #ffd8d8d8  15px              "lch"
+rect       0   105   900    21  #ffe57f4e
+text       0   105    40    21  #ffd8d8d8  15px              "oklab"
+rect       0   126   900    21  #ff0081f1
+text       0   126    40    21  #ffd8d8d8  15px              "oklch"
+rect       0   147   900    21  #ff800080
+text       0   147    24    21  #ffd8d8d8  15px              "mix"
+rect       0   168   900    21  #ff5147d2
+text       0   168    32    21  #ffd8d8d8  15px              "mix2"
+rect       0   189   900    21  #ffadd8e6
+text       0   189    72    21  #ffd8d8d8  15px              "lightblue"
+# glyph-gaps (none)
+

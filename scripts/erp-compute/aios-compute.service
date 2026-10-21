@@ -1,0 +1,22 @@
+[Unit]
+Description=aios compute service — ERP route kernels on the loopback interface
+After=network.target
+
+[Service]
+Type=simple
+User=aios
+Group=aios
+WorkingDirectory=/opt/aios
+# A CPU compute server: no accelerator probing. Statically linked glibc cannot
+# safely dlopen an OpenCL/CUDA runtime, and there is none on this host anyway.
+Environment=AIOS_NO_ACCEL=1
+ExecStart=/opt/aios/bin/aios --root /opt/aios/root exec 'compute serve port=7311 lanes=8 max_points=15'
+Restart=always
+RestartSec=2
+LimitNOFILE=4096
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/aios/root
+
+[Install]
+WantedBy=multi-user.target

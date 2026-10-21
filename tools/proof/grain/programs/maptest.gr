@@ -1,0 +1,25 @@
+fn show(m) { print(json_stringify(m)) print(str(keys(m))) }
+let m = {}
+for i in range(20) {
+  m["k" + str(i)] = i * i
+  if i == 3 or i == 8 or i == 9 or i == 15 { show(m) }
+}
+m.k2 = "two"
+m["k12"] = [1, 2, 3]
+print(str(m.k2) + " " + str(m["k12"]) + " " + str(has(m, "k19")) + " " + str(has(m, "nope")))
+for k in ["k0", "k5", "k19", "k10", "nope"] { del(m, k) }
+show(m)
+for i in range(20) { if has(m, "k" + str(i)) { del(m, "k" + str(i)) } }
+show(m)
+m.z = 1  m.a = 2  m.z = 3
+show(m)
+let small = {b: 1, a: 2}
+small.c = 3
+del(small, "a")
+small.a = 9
+show(small)
+print(str(merge({x: 1, y: 2}, {y: 3, w: 4, v: 5, u: 6, t: 7, s: 8, r: 9, q: 10})))
+let big = {}
+for i in range(1000) { big["key" + str(i % 300)] = i }
+print(str(len(big)) + " " + str(big.key0) + " " + str(big.key299) + " " + str(big["key150"]))
+print(str(entries({one: 1, two: 2})))

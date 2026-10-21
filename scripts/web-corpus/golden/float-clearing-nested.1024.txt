@@ -1,0 +1,16 @@
+# page float-clearing-nested.html  viewport=1024
+# title Float clearing and nested floats
+# content 1024x121  background=ff121212  links=0
+rect       0     0   250    91  #ff555555
+rect      10    10   100    50  #ffcc3333
+text      10    10    16    21  #ffd8d8d8  15px              "NL"
+rect     160    10    80    50  #ff3333cc
+text     160    10    16    21  #ffd8d8d8  15px              "NR"
+rect      10    60   230    21  #ff33cc33
+text      10    60    16    21  #ffd8d8d8  15px              "NC"
+rect     904     0   120    60  #ffcccc33
+text     904     0    16    21  #ffd8d8d8  15px              "OR"
+rect       0    91  1024    30  #ff999999
+text       0    91   104    21  #ffd8d8d8  15px              "Cleared outer"
+# glyph-gaps (none)
+

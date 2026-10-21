@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><title>Rounded and translucent</title><link rel="stylesheet" href="site.css">
+<style>
+.card { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.pill { display: inline-block; background: rgba(255,255,255,0.10); border-radius: 999px;
+        padding: 4px 12px; }
+.dot  { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+        background: #19c37d; }
+.sharp { background: rgba(0,0,0,0.4); padding: 10px; }
+.lift { background: rgba(255,255,255,0.08); border-radius: 12px; padding: 14px; margin-top: 14px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.45); }
+.flat { background: rgba(255,255,255,0.08); border-radius: 12px; padding: 14px; margin-top: 14px;
+        box-shadow: none; }
+</style></head>
+<body><div class="wrap">
+<div class="card"><h3>A card</h3><p>A wash six percent above the ground, and a corner radius of twelve.</p></div>
+<p><span class="pill">A pill</span> <span class="dot"></span> a circle at fifty percent.</p>
+<div class="sharp">Square, and forty percent black.</div>
+<div class="lift">Lifted: a shadow six down, eighteen of blur.</div>
+<div class="flat">Flat: the same card with the shadow turned off.</div>
+</div></body></html>

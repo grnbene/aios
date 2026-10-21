@@ -1,0 +1,30 @@
+# Drive Task Durable Ledger & MariaDB SQL Subsystem end to end.
+
+# 1. Create durable tasks for multi-tenant customers
+task create customer=cust_acme name="Sync Customer Acme Accounts" payload="{\"action\": \"full_sync\", \"tables\": [\"users\", \"orders\"]}" priority=1 => task0
+task create customer=cust_stark name="Backup Stark Industries Telemetry" payload="{\"action\": \"db_backup\"}" priority=2 => task1
+
+# 2. List tasks
+task list
+
+# 3. Update task status and record ledger transition
+task status $task0 IN_PROGRESS details="Worker assigned: node-1"
+task status $task0 COMPLETED details="All tables synced to MariaDB"
+
+# 4. View append-only cryptographic ledger history
+task ledger
+
+# 5. Standard SQL Engine: Create and query tables
+sql query "CREATE TABLE customer_orders (id TEXT PRIMARY KEY, customer_id TEXT, amount REAL, status TEXT)"
+sql query "INSERT INTO customer_orders VALUES ('ord_101', 'cust_acme', 1450.50, 'PAID')"
+sql query "INSERT INTO customer_orders VALUES ('ord_102', 'cust_stark', 99000.00, 'PENDING')"
+sql query "SELECT * FROM customer_orders"
+
+# 6. MariaDB Pull Sync: Import SQL statements for customer
+sql pull customer=cust_acme sql="INSERT INTO tasks (id, customer_id, name, payload, status, priority) VALUES ('task_acme_99', 'cust_acme', 'Process Invoice #99', 'invoice_99.pdf', 'PENDING', 1);"
+
+# 7. MariaDB Push Sync: Generate export SQL dump for customer
+sql push customer=cust_acme table=tasks
+
+# 8. Verify subsystem status matrix
+subsystems

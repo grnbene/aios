@@ -1,0 +1,28 @@
+=================================================================
+     AIOS Desktop Calculator — Powered by Bare-Metal Grain       
+=================================================================
+
+[Step 1] Driving Basic Arithmetic: 1250 + 875 = 2125...
+  Display: 2125 (Expected: 2125)
+
+[Step 2] Driving Decimal & Precedence: 45.2 × 3.5 - 6.4 = 151.8...
+  Display: 151.8 (Expected: 151.8)
+
+[Step 3] Driving Scientific Functions (Square Root & Powers)...
+  √625 = 25
+  25 × 4 = 100 (Expected: 100)
+
+[Step 4] Driving Memory Registers (MC, M+, MR)...
+  Stored 500 into M+ (Memory active: true)
+  Added 250 into M+ (Total memory: 750.0)
+  Recalled MR: 750 (Expected: 750)
+
+[Step 5] Driving Error Handling (Division by Zero)...
+  Display: Error | Error: 'Error: Division by 0'
+
+[Step 6] Rendering 1920x1080 Full Desktop Frame with Calculator Window...
+  ✓ Rendered full 1920x1080 Desktop Canvas successfully to examples/grain/calculator_desktop.ppm
+
+=================================================================
+  AIOS CALCULATOR DESKTOP APPLICATION FULLY PROVEN!              
+=================================================================

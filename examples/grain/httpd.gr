@@ -1,0 +1,189 @@
+# A web server, written in grain, running inside AIOS.
+#
+# Nothing below is C++. The request is parsed here, the routes are dispatched
+# here, the response bytes are assembled here. The only things that come from
+# outside the language are listen/accept/read/write, and those go through
+# hal::net -- the same network face the kernel's own node transport uses.
+#
+#   aios grain serve examples/grain/httpd.gr
+#   curl http://127.0.0.1:8080/
+
+let PORT = 8080
+
+# ---------------------------------------------------------------- HTTP request
+
+# The request line and headers, as a map. Header names are lowercased because
+# a client may send Content-Length, content-length, or Content-length and all
+# three mean the same thing.
+fn parse_request(raw) {
+  let lines = split(replace(raw, "\r\n", "\n"), "\n")
+  let first = split(lines[0], " ")
+  if len(first) < 2 { return nil }
+
+  let target = first[1]
+  let path = target
+  let query = ""
+  let q = find(target, "?")
+  if q >= 0 {
+    path = slice(target, 0, q)
+    query = slice(target, q + 1, len(target))
+  }
+
+  let headers = {}
+  let i = 1
+  while i < len(lines) {
+    let line = lines[i]
+    if len(line) == 0 { break }
+    let colon = find(line, ":")
+    if colon > 0 {
+      let name = lower(slice(line, 0, colon))
+      let value = slice(line, colon + 1, len(line))
+      while len(value) > 0 and value[0] == " " { value = slice(value, 1, len(value)) }
+      headers[name] = value
+    }
+    i = i + 1
+  }
+  return {method: first[0], path: path, query: query, headers: headers}
+}
+
+# ?a=1&b=two -> {a: "1", b: "two"}
+fn parse_query(query) {
+  let out = {}
+  if len(query) == 0 { return out }
+  for pair in split(query, "&") {
+    let eq = find(pair, "=")
+    if eq > 0 { out[slice(pair, 0, eq)] = slice(pair, eq + 1, len(pair)) }
+    else { out[pair] = "" }
+  }
+  return out
+}
+
+# --------------------------------------------------------------- HTTP response
+
+fn status_text(code) {
+  if code == 200 { return "OK" }
+  if code == 404 { return "Not Found" }
+  if code == 405 { return "Method Not Allowed" }
+  return "Error"
+}
+
+# Content-Length on every response, and Connection: close. Without the length a
+# client waits for the socket to shut before it believes the body is complete,
+# which turns every request into a timeout.
+fn respond(conn, code, content_type, body) {
+  let head = "HTTP/1.1 " + str(code) + " " + status_text(code) + "\r\n"
+  head = head + "Content-Type: " + content_type + "\r\n"
+  head = head + "Content-Length: " + str(len(body)) + "\r\n"
+  head = head + "Server: grain/aios\r\n"
+  head = head + "Connection: close\r\n\r\n"
+  write(conn, head + body)
+  return code
+}
+
+fn escape(s) {
+  s = replace(s, "&", "&amp;")
+  s = replace(s, "<", "&lt;")
+  return replace(s, ">", "&gt;")
+}
+
+fn json_string(s) { return "\"" + replace(replace(s, "\\", "\\\\"), "\"", "\\\"") + "\"" }
+
+fn json_of(m) {
+  let parts = []
+  for k in keys(m) {
+    let v = m[k]
+    if type(v) == "string" { push(parts, json_string(k) + ": " + json_string(v)) }
+    else { push(parts, json_string(k) + ": " + str(v)) }
+  }
+  return "{" + join(parts, ", ") + "}"
+}
+
+# ------------------------------------------------------------------ the routes
+
+let hits = 0
+
+fn page_index() {
+  return "<!doctype html>\n<html><head><title>grain on AIOS</title>" +
+    "<style>body{font:16px/1.6 system-ui;margin:3rem auto;max-width:44rem;" +
+    "background:#0f1419;color:#e8ecf0}code{background:#1b2430;padding:2px 6px;" +
+    "border-radius:4px}a{color:#6fb7ff}</style></head><body>" +
+    "<h1>This page was served by a program written in grain.</h1>" +
+    "<p>The request was parsed, routed and answered by " +
+    "<code>examples/grain/httpd.gr</code>, running on the AIOS kernel " +
+    "<code>" + slice(sys.kernel, 0, 12) + "</code>.</p>" +
+    "<p>Machine: <code>" + escape(sys.arch) + "</code>, " + str(sys.cpus) +
+    " cores, " + str(int(sys.memory / 1073741824)) + " GiB.</p>" +
+    "<ul><li><a href=\"/api/info\">/api/info</a> — what this machine is, as JSON</li>" +
+    "<li><a href=\"/api/echo?name=sean&amp;n=42\">/api/echo?name=sean&amp;n=42</a> — query parsing</li>" +
+    "<li><a href=\"/api/fib?n=25\">/api/fib?n=25</a> — computed per request</li></ul>" +
+    "<p>Requests served since start: " + str(hits) + "</p></body></html>"
+}
+
+fn fib(n) {
+  let a = 0
+  let b = 1
+  let i = 0
+  while i < n { let next = a + b a = b b = next i = i + 1 }
+  return a
+}
+
+fn route(conn, req) {
+  if req.method != "GET" { return respond(conn, 405, "text/plain", "only GET\n") }
+
+  if req.path == "/" { return respond(conn, 200, "text/html; charset=utf-8", page_index()) }
+
+  if req.path == "/api/info" {
+    return respond(conn, 200, "application/json", json_of({
+      kernel: sys.kernel, arch: sys.arch, host: sys.host,
+      cpus: sys.cpus, memory: sys.memory, entities: sys.entities,
+      served: hits, server: "grain"
+    }) + "\n")
+  }
+
+  if req.path == "/api/echo" {
+    let q = parse_query(req.query)
+    let out = {}
+    for k in keys(q) { out[k] = q[k] }
+    out["path"] = req.path
+    out["from"] = peer(conn)
+    return respond(conn, 200, "application/json", json_of(out) + "\n")
+  }
+
+  if req.path == "/api/fib" {
+    let q = parse_query(req.query)
+    let n = 10
+    if has(q, "n") { n = int(q["n"]) }
+    if n < 0 or n > 90 { return respond(conn, 200, "application/json", "{\"error\": \"n must be 0..90\"}\n") }
+    let started = clock()
+    let value = fib(n)
+    return respond(conn, 200, "application/json",
+      json_of({n: n, fib: value, took_ms: clock() - started}) + "\n")
+  }
+
+  return respond(conn, 404, "text/plain", "no route for " + req.path + "\n")
+}
+
+# ------------------------------------------------------------------- the server
+
+let server = listen(PORT)
+if server == nil { print("could not listen on", PORT) }
+print("grain httpd listening on http://127.0.0.1:" + str(port(server)))
+print("kernel", slice(sys.kernel, 0, 12), "|", sys.arch, "|", sys.cpus, "cores")
+
+while true {
+  let conn = accept(server, 1000)
+  if conn == nil { continue }
+
+  # The header ends at a blank line. Anything longer than 16 KiB of header is
+  # not a browser being polite.
+  let raw = read_until(conn, "\r\n\r\n", 16384, 5000)
+  if raw == nil { close(conn) continue }
+
+  let req = parse_request(raw)
+  if req == nil { respond(conn, 404, "text/plain", "unparseable\n") close(conn) continue }
+
+  hits = hits + 1
+  let code = route(conn, req)
+  print(peer(conn), req.method, req.path, "->", code)
+  close(conn)
+}

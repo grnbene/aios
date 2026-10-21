@@ -1,0 +1,8 @@
+# 2 form(s) in /repos/aios/scripts/web-corpus/form.html
+form 0  submitter=button
+  POST http://example.test/guestbook
+  header Content-Type: application/x-www-form-urlencoded
+  body who=Ada&note=passed+through&token=a+b%26c&subscribe=on&action=sign
+form 1  submitter=button
+  GET http://example.test/search?q=ring+0
+  body (empty)

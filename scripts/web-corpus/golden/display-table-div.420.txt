@@ -1,0 +1,16 @@
+# page display-table-div.html  viewport=420
+# title file:///display-table-div.html
+# content 420x218  background=ff121212  links=0
+rect     212     8   200   100  #ffcccccc
+text     212     8     8    21  #ffd8d8d8  15px              "F"
+text       8    20   112    21  #ffd8d8d8  15px              "text text text"
+rect       8    53   190   112  #fff8f9fa
+border     8    53   190   112  #ffa2a9b1
+text      16    61    64    21  #ffd8d8d8  15px              "Contents"
+rect      32   105     4     4  #ffd8d8d8
+text      46    97    24    21  #ffd8d8d8  15px              "one"
+rect      32   129     4     4  #ffd8d8d8
+text      46   121   144    21  #ffd8d8d8  15px              "two long item here"
+text       8   177    40    21  #ffd8d8d8  15px              "after"
+# glyph-gaps (none)
+

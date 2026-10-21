@@ -1,0 +1,69 @@
+face task_tracker
+title "Task Tracker"
+kind sprint_task key=id
+
+# Figures come from the tasks actually stored. This app used to print
+# "38 hrs", "8 completed", "14.2 pts/wk" and "Sprint 14: 85% on schedule" as
+# literals and seed five invented tasks with real people's addresses.
+
+let tasks = latest(list(sprint_task), id)   # one row per task: a re-put (e.g. marked done) replaces it
+let total = count(tasks)
+let done = count(where(tasks, status, "Done"))
+let open = total - done
+let hours = sum(tasks, hrs)
+let open_hours = hours - sum(where(tasks, status, "Done"), hrs)
+let next_id = "TSK-" + str(total + 1)
+
+state task_title = ""
+state task_assignee = ""
+state task_priority = "P2"
+state task_estimate_hrs = 1
+state done_id = ""
+state status_banner = ""
+
+toolbar gap=8
+  button "New Task" action=on_capture primary
+
+row gap=8
+  tile label="Tasks" value=total
+  tile label="Open" value=open accent=warn
+  tile label="Done" value=done accent=ok
+  tile label="Open hours" value=str(open_hours) + " h" accent=accent
+
+panel "Backlog" pad=12
+  table tasks columns="id:Task, title:Title, assignee:Assignee, priority:Priority, hrs:Hours:right, status:Status" rows=10 empty="No tasks yet"
+
+panel "Add a task" pad=14
+  row gap=8
+    field id=task_title placeholder="What needs doing" width=380 focus
+    field id=task_assignee placeholder="Assignee" width=220
+    select id=task_priority options="P0,P1,P2,P3" label="Priority"
+    slider id=task_estimate_hrs min=1 max=24 step=1 label="Hours"
+    button "Add" action=on_add_task primary
+
+panel "Mark done" pad=14
+  row gap=8
+    field id=done_id placeholder="Task id, e.g. TSK-1" width=220
+    button "Mark done" action=on_done
+
+text "{status_banner}" dim
+
+on on_capture:
+  focus task_title
+
+on on_add_task:
+  if task_title == "":
+    set status_banner = "Give the task a title first."
+    focus task_title
+  else:
+    put sprint_task {id: next_id, title: task_title, assignee: task_assignee, priority: task_priority, hrs: task_estimate_hrs, status: "Open"}
+    set status_banner = "Added " + next_id
+    set task_title = ""
+
+on on_done:
+  if count(where(tasks, id, done_id)) == 0:
+    set status_banner = "No task " + done_id
+  else:
+    put sprint_task {id: done_id, title: find(tasks, id, done_id).title, assignee: find(tasks, id, done_id).assignee, priority: find(tasks, id, done_id).priority, hrs: find(tasks, id, done_id).hrs, status: "Done"}
+    set status_banner = done_id + " marked done"
+    set done_id = ""

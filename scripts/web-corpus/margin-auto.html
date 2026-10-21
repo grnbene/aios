@@ -1,0 +1,21 @@
+<!doctype html>
+<html><head><title>margin auto</title><style>
+body { margin: 0; }
+.col { max-width: 300px; margin: 0 auto; background: #c33; height: 20px; }
+.fixed { width: 200px; margin-left: auto; margin-right: auto; background: #3c3; height: 20px; }
+.right { width: 200px; margin-left: auto; background: #33c; height: 20px; }
+.left { width: 200px; margin-right: auto; background: #cc3; height: 20px; }
+.pad { margin: 6px auto 0; max-width: 300px; min-width: 295px; padding: 0 10px; box-sizing: border-box; background: #3cc; height: 20px; }
+.none { margin: 0 auto; background: #ccc; height: 20px; }
+.col-flex { display: flex; flex-direction: column; }
+.col-flex > .col { background: #909; }
+.nested { padding: 0 96px; }
+</style></head><body>
+<div class="col">max-width centred</div>
+<div class="fixed">width centred</div>
+<div class="right">pushed right</div>
+<div class="left">pinned left</div>
+<div class="pad">padded, shorthand 3 values</div>
+<div class="none">no width: fills</div>
+<div class="col-flex"><div class="nested"><div class="col">in a column flex</div></div></div>
+</body></html>

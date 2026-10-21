@@ -1,0 +1,56 @@
+# build trees
+/build*/
+/Testing/
+CMakeCache.txt
+CMakeFiles/
+
+# runtime state: a root, its stores, logs and keys are made by running aios, never committed
+/aios-root*/
+/store/
+/run/
+/profile/
+/tasks/
+/mail/
+/contacts/
+/calendar/
+/sql_db/
+kernel.identity
+authority.log
+jepa.model
+jepa.model.policy
+*.ppm
+!scripts/web-corpus/golden/*.ppm
+
+# scratch
+/*.png
+/drive*
+.nova/
+__pycache__/
+*.pyc
+/drive-root/
+.agent/
+.assay/
+
+# coding agents and editors: their state, sessions and scratch never belong in the repo
+.claude/
+CLAUDE.local.md
+.cursor/
+.cursorignore
+.codex/
+.aider*
+.continue/
+.windsurf/
+.roo/
+.cline/
+.clinerules/
+.gemini/
+.specstory/
+.history/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# per-machine config: copy the .example beside it
+/v8-local.conf

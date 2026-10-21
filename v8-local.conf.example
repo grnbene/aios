@@ -1,0 +1,8 @@
+# Local aios-webserver vhost for a v8 checkout (loopback only, no TLS).
+# Copy to v8-local.conf (git-ignored) and set root to your v8/server.
+vhost v8.local
+  listen 18080 loopback
+  root /path/to/v8/server
+  index index.php
+  php 127.0.0.1:9000
+}

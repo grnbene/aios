@@ -1,0 +1,17 @@
+# page margin-auto-variants.html  viewport=420
+# title Margin auto variants
+# content 420x190  background=ff121212  links=0
+rect     110     0   200    30  #ffcc3333
+text     110     0    48    21  #ffd8d8d8  15px              "Center"
+rect      60    30   300    30  #ff33cc33
+text      60    30    80    21  #ffd8d8d8  15px              "Max center"
+rect     250    60   150    30  #ff3333cc
+text     250    60    40    21  #ffd8d8d8  15px              "Right"
+rect       0    90   400    40  #ff444444
+rect     340    90    60    40  #ffcccc33
+text     340    90    40    21  #ffd8d8d8  15px              "FAuto"
+rect       0   130   420    60  #ff555555
+rect      60   130    80    21  #ffcc33cc
+text      60   130    40    21  #ffd8d8d8  15px              "GAuto"
+# glyph-gaps (none)
+

@@ -1,0 +1,28 @@
+step 1: F6, which is what the start page has been promising
+        wrote OUTDIR/0-empty-pane.ppm
+        pane content at (15,104) 1410x684
+step 2: click the url bar and type a url into it
+        wrote OUTDIR/1-url-typed.ppm
+step 3: Enter — fetch, parse, cascade, lay out, paint
+        wrote OUTDIR/2-page.ppm
+        title    : Forms that submit
+        url      : file://CORPUS/form.html
+        transport: this machine's own root
+        laid out : 31 fragments, 0 links, 620px tall
+step 4: hover the first link, so it lights and the status names it
+step 5: click #who at screen (191,261)
+        wrote OUTDIR/7-clicked.ppm
+        type     : " Lovelace"
+        key      : Enter
+        wrote OUTDIR/8-keys.ppm
+        now at   : file://CORPUS/form.html
+        title    : Forms that submit
+        laid out : 31 fragments, 0 links, 620px tall
+        message  : Enter: 0 handler(s), the pane keeps it, 0 dom change(s)
+        after    : 31 fragments
+step 6: scroll down three notches
+        wrote OUTDIR/5-scrolled.ppm
+step 7: Backspace, which is back
+        wrote OUTDIR/6-back.ppm
+        back at  : file://CORPUS/form.html
+done

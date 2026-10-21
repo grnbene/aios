@@ -1,0 +1,55 @@
+# Word frequency over real text, then the top few by count.
+let text = "the quick brown fox jumps over the lazy dog the fox barks and the dog sleeps while the fox runs"
+
+let counts = {}
+for w in split(text, " ") {
+  if has(counts, w) { counts[w] = counts[w] + 1 } else { counts[w] = 1 }
+}
+print("distinct words:", len(counts))
+
+# Selection sort over the keys by count, descending. No sort-with-comparator
+# yet, so this is written out -- which is itself a test of the loops.
+let words = keys(counts)
+let n = len(words)
+let i = 0
+while i < n {
+  let best = i
+  let j = i + 1
+  while j < n {
+    if counts[words[j]] > counts[words[best]] { best = j }
+    j = j + 1
+  }
+  let swap = words[i]
+  words[i] = words[best]
+  words[best] = swap
+  i = i + 1
+}
+for w in slice(words, 0, 4) { print("  ", w, counts[w]) }
+
+# break and continue, including out of a nested loop.
+let primes = []
+for candidate in range(2, 40) {
+  let d = 2
+  let is_prime = true
+  while d * d <= candidate {
+    if candidate % d == 0 { is_prime = false break }
+    d = d + 1
+  }
+  if not is_prime { continue }
+  push(primes, candidate)
+}
+print("primes under 40:", primes)
+
+# Maps of maps, field syntax, nested structures.
+let machine = {name: "aios", cores: sys.cpus, tags: ["kernel", "capability"]}
+machine.tags = machine.tags + ["language"]
+print(machine.name, "on", sys.arch, "with", machine.cores, "cores")
+print("tags:", join(machine.tags, ", "))
+print("uptime is a real:", type(sys.uptime_ms), "| cores is an int:", type(sys.cpus))
+
+# Strings.
+let s = "Grain Runs Here"
+print(upper(s), "|", lower(s), "|", len(s), "|", slice(s, 6, 10), "|", find(s, "Runs"))
+print("reversed words:", join(reverse(split(s, " ")), " "))
+print("7 / 2 =", 7 / 2, "| 7 % 2 =", 7 % 2, "| int(7/2) =", int(7 / 2))
+print("sorted:", sort([5, 3, 9, 1, 7]))

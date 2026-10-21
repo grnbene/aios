@@ -1,0 +1,28 @@
+<!doctype html><body><x-widget id=w></x-widget><input id=i><style id=st></style><pre id=o></pre><script>
+var out=document.getElementById('o');function log(s){out.textContent+=s+'\n';}
+function ok(n,c){log((c?'PASS ':'FAIL ')+n);}
+function t(n,f){try{f();}catch(e){log('FAIL '+n+' threw '+e.message);}}
+// React assigns node.defaultValue in strict mode while syncing an input
+t('defaultValue setter',function(){'use strict';var i=document.getElementById('i');i.defaultValue='abc';ok('defaultValue',i.getAttribute('value')==='abc'&&i.defaultValue==='abc');});
+// a custom element keeps non-global names as plain fields
+t('custom element fields',function(){'use strict';var w=document.getElementById('w');var d=document.body;
+ w.target=d;w.name={a:1};w.controls=d;w.form=d;w.content=d;w.label=d;
+ ok('target object',w.target===d);ok('name object',w.name.a===1);ok('controls',w.controls===d);ok('form',w.form===d);ok('content',w.content===d);ok('no attr',!w.hasAttribute('target')&&!w.hasAttribute('name'));
+ w.id='zz';ok('global id still reflects',w.getAttribute('id')==='zz');w.id='w';});
+// styled-components speedy mode: element.sheet / document.styleSheets / insertRule
+t('stylesheet',function(){
+ var st=document.getElementById('st');var sh=st.sheet;ok('sheet exists',!!sh&&sh.ownerNode===st);
+ var found=false;for(var i=0;i<document.styleSheets.length;i++)if(document.styleSheets[i].ownerNode===st)found=true;ok('in document.styleSheets',found);
+ sh.insertRule('.a{color:red}',0);sh.insertRule('.b{color:blue}',1);
+ ok('cssRules',sh.cssRules.length===2&&sh.cssRules[1].selectorText==='.b');ok('text written back',st.textContent.indexOf('.a{color:red}')>=0);
+ sh.deleteRule(0);ok('deleteRule',sh.cssRules.length===1&&st.textContent.indexOf('.a{')<0);
+ var s2=new CSSStyleSheet();s2.replaceSync('p{margin:0}');ok('constructable',s2.cssRules.length===1);});
+// HTMLMediaElement base
+t('media',function(){ok('HTMLMediaElement',typeof HTMLMediaElement==='function');var v=document.createElement('video');ok('video instanceof',v instanceof HTMLMediaElement);ok('canPlayType',v.canPlayType('video/mp4')==='');
+ var p=v.play();ok('play promise',p&&typeof p.then==='function');ok('paused',v.paused===false);v.pause();ok('pause',v.paused===true);});
+// \p{XID_Start}
+t('regexp xid',function(){ok('XID',/^[\p{XID_Start}_]\p{XID_Continue}*$/u.test('foo_1'));});
+// "x.y is not a function" names its callee
+t('callee name',function(){var o={a:{}};try{o.a.nope();ok('threw',false);}catch(e){ok('message '+e.message,e.message==='o.a.nope is not a function');}
+ try{missingFn2();}catch(e){ok('ident '+e.message,e.message.indexOf('missingFn2')>=0);}});
+</script></body>

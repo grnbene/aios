@@ -1,0 +1,24 @@
+# page scroll.html  viewport=900x600
+# title A pane that scrolls
+# content 900x390  background=ff111111  links=0
+rect       0     0   900   138  #ff1a1a1a  r=8  clip=1,1,898x136
+border     0     0   900   138  #ff555555  r=8  clip=1,1,898x136
+text       9    21    64    21  #ffdddddd  15px              "line one"  clip=1,1,898x136
+text       9    54    64    21  #ffdddddd  15px              "line two"  clip=1,1,898x136
+text       9    87    80    21  #ffdddddd  15px              "line three"  clip=1,1,898x136
+text       9   120    72    21  #ffdddddd  15px              "line four"  clip=1,1,898x136
+text       9   153    72    21  #ffdddddd  15px              "line five"  clip=1,1,898x136
+text       9   186    64    21  #ffdddddd  15px              "line six"  clip=1,1,898x136
+text       9   219    80    21  #ffdddddd  15px              "line seven"  clip=1,1,898x136
+text       0   150   432    21  #ff00aa66  15px              "Below the frame. It must not move when the frame does."
+rect       0   183   900   138  #ff1a1a1a  r=8  clip=1,184,898x136
+border     0   183   900   138  #ff555555  r=8  clip=1,184,898x136
+text       9   204   128    21  #ffdddddd  15px              "hidden, not auto"  clip=1,184,898x136
+text       9   237   232    21  #ffdddddd  15px              "so this box is NOT a scroller"  clip=1,184,898x136
+text       9   270    40    21  #ffdddddd  15px              "three"  clip=1,184,898x136
+text       9   303    32    21  #ffdddddd  15px              "four"  clip=1,184,898x136
+text       9   336    32    21  #ffdddddd  15px              "five"  clip=1,184,898x136
+text       9   369    24    21  #ffdddddd  15px              "six"  clip=1,184,898x136
+# scroller 0  1,1 898x136  content=243  max-offset=107
+# glyph-gaps (none)
+

@@ -1,0 +1,10 @@
+# Runs in a FRESH process against the same root: the checkpoint written by
+# drive-kernel.aos restores with the same identity in a new kernel boot.
+info
+echo restoring $CKPT
+restore $CKPT
+set mind
+entity show $mind
+state list $mind
+store list
+info

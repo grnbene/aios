@@ -1,0 +1,21 @@
+[Unit]
+Description=aios Control Plane Gateway & Ingress Dispatcher
+After=network.target aios-compute.service
+
+[Service]
+Type=simple
+User=aios
+Group=aios
+WorkingDirectory=/opt/aios
+Environment=AIOS_NO_ACCEL=1
+EnvironmentFile=-/etc/aios/gateway.env
+ExecStart=/opt/aios/bin/aios --root /opt/aios/root exec 'gateway serve port=7310 require_custom_secret=1'
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/aios/root
+
+[Install]
+WantedBy=multi-user.target

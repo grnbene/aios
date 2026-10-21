@@ -1,0 +1,6 @@
+let t0 = time_ms()
+let rows = []
+for i in range(200000) { push(rows, {id: i, qty: i % 13, price: i % 97}) }
+let tot = 0
+for r in rows { if r.qty > 3 { tot = tot + r.qty * r.price } }
+print("maps 200k: " + str(tot) + " in " + str(time_ms() - t0) + " ms")

@@ -1,0 +1,11 @@
+# page unitless-line-height.html  viewport=420
+# title Unitless line-height
+# content 420x132  background=ff121212  links=0
+rect       0     0   420   132  #ff222222
+rect       0     0   420   112  #ff333333
+text       0     0   345    56  #ffd8d8d8  28px              "Big text with inherited"
+text       0    56   120    56  #ffd8d8d8  28px              "factor 2"
+rect       0   112   420    20  #ff444444
+text       0   112   170    20  #ffd8d8d8  10px              "Small text with inherited factor 2"
+# glyph-gaps (none)
+

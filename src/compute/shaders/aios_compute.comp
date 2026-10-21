@@ -1,0 +1,50 @@
+#version 450
+// The kernels the Vulkan backend dispatches, as GLSL compute shaders.
+//
+// One shader with a branch on the opcode rather than eight pipelines: the
+// dispatch is over the same three buffers every time, and a machine that has
+// to build eight pipelines to add two vectors spends longer creating them than
+// doing the work.
+//
+// Compiled to SPIR-V by scripts/build-shaders.sh; the result is checked in as
+// aios_compute_spv.h, because not every machine that builds this OS has a
+// shader compiler on it, and a backend that silently loses its kernels on such
+// a machine is exactly the failure this file exists to avoid.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer InA { float a[]; };
+layout(std430, binding = 1) readonly  buffer InB { float b[]; };
+layout(std430, binding = 2) writeonly buffer Out { float o[]; };
+
+layout(push_constant) uniform Params {
+  uint op;       // 0 fill, 1 add, 2 mul, 3 scale, 4 relu, 5 copy, 6 matmul
+  uint n;        // element count, for the elementwise ops
+  uint m;        // matmul: rows of A
+  uint k;        // matmul: the inner dimension
+  uint nn;       // matmul: columns of B
+  float scalar;
+} p;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+
+  if (p.op == 6u) {
+    // out[row, col] = sum over t of A[row, t] * B[t, col]
+    if (i >= p.m * p.nn) return;
+    uint row = i / p.nn;
+    uint col = i % p.nn;
+    float acc = 0.0;
+    for (uint t = 0u; t < p.k; ++t) acc += a[row * p.k + t] * b[t * p.nn + col];
+    o[i] = acc;
+    return;
+  }
+
+  if (i >= p.n) return;
+  if      (p.op == 0u) o[i] = p.scalar;
+  else if (p.op == 1u) o[i] = a[i] + b[i];
+  else if (p.op == 2u) o[i] = a[i] * b[i];
+  else if (p.op == 3u) o[i] = a[i] * p.scalar;
+  else if (p.op == 4u) o[i] = max(a[i], 0.0);
+  else if (p.op == 5u) o[i] = a[i];
+}

@@ -1,0 +1,53 @@
+# page grid_areas_showcase.html  viewport=900x600
+# title AIOS Grid Template Areas & Responsive Layout
+# content 900x700  background=ff0f172a  links=0
+rect       0     0   900    62  #ff1e293b  r=8
+border     0     0   900    62  #ff334155  r=8
+text      25    17   453    28  #ff38bdf8  20px,bold         "AIOS Hardware Compositor & Browser Engine"
+text     770    22   105    18  #ff22c55e  13px              "● System Active"
+rect       0    86   260   273  #ff1e293b  r=8
+border     0    86   260   273  #ff334155  r=8
+text      21   107    71    19  #fff8fafc  14px,bold         "Navigation"
+rect      21   138   218    34  #ff0284c7  r=4
+text      33   146   105    18  #ffffffff  13px,bold         "CSS Grid Engine"
+rect      21   178   218    34  #ff0f172a  r=4
+text      33   186   140    18  #ff94a3b8  13px              "DOM Parser & Cascade"
+rect      21   218   218    34  #ff0f172a  r=4
+text      33   226   133    18  #ff94a3b8  13px              "Hardware Compositor"
+rect      21   258   218    34  #ff0f172a  r=4
+text      33   266   161    18  #ff94a3b8  13px              "Memory & Storage Fabric"
+rect      21   298   218    34  #ff0f172a  r=4
+text      33   306   119    18  #ff94a3b8  13px              "Kernel Dispatcher"
+rect     276    86   624   263  #ff1e293b  r=8
+border   276    86   624   263  #ff334155  r=8
+rect     301   111   180   192  #ff0f172a  r=6
+border   301   111   180   192  #ff334155  r=6
+text     318   128   144    21  #fff1f5f9  15px,bold         "Grid Matrix Parser"
+text     318   161    60    39  #ff38bdf8  28px,bold         "100%"
+text     318   206   112    20  #ff94a3b8  13px              "Full support for"
+text     318   226   140    20  #ff94a3b8  13px              "grid-template-areas,"
+text     318   246   119    20  #ff94a3b8  13px              "named tracks, and"
+text     318   266   133    20  #ff94a3b8  13px              "explicit placement."
+rect     497   111   180   192  #ff0f172a  r=6
+border   497   111   180   192  #ff334155  r=6
+text     514   128    96    21  #fff1f5f9  15px,bold         "Track Sizing"
+text     514   161   105    39  #ff38bdf8  28px,bold         "px / fr"
+text     514   206   112    20  #ff94a3b8  13px              "Dynamic fraction"
+text     514   226   119    20  #ff94a3b8  13px              "track computation"
+text     514   246   112    20  #ff94a3b8  13px              "with exact pixel"
+text     514   266   133    20  #ff94a3b8  13px              "border allocations."
+rect     693   111   180   213  #ff0f172a  r=6
+border   693   111   180   213  #ff334155  r=6
+text     710   128   129    21  #fff1f5f9  15px,bold         "Compositor Frame"
+text     710   149    32    21  #fff1f5f9  15px,bold         "rate"
+text     710   182    90    39  #ff38bdf8  28px,bold         "60 FPS"
+text     710   227   112    20  #ff94a3b8  13px              "Direct zero-copy"
+text     710   247   126    20  #ff94a3b8  13px              "glass presentation"
+text     710   267   140    20  #ff94a3b8  13px              "through the hardware"
+text     710   287   133    20  #ff94a3b8  13px              "compositor surface."
+rect       0   375   900    42  #ff1e293b  r=8
+border     0   375   900    42  #ff334155  r=8
+text      25   388   168    16  #ff64748b  12px              "AIOS Userland Browser Engine"
+text     725   388   150    16  #ff64748b  12px              "Status: Operating cleanly"
+# glyph-gaps (none)
+

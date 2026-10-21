@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><title>Margin auto variants</title>
+<style>
+body { margin: 0; }
+.block-center { width: 200px; margin: 0 auto; background: #c33; height: 30px; }
+.block-max { max-width: 300px; margin: 0 auto; background: #3c3; height: 30px; }
+.block-right { width: 150px; margin-left: auto; margin-right: 20px; background: #33c; height: 30px; }
+.flex-row { display: flex; width: 400px; background: #444; height: 40px; }
+.flex-item { margin-left: auto; background: #cc3; width: 60px; }
+.grid-wrap { display: grid; grid-template-columns: 200px; height: 60px; background: #555; }
+.grid-item { justify-self: center; background: #c3c; width: 80px; }
+</style></head>
+<body>
+<div class="block-center">Center</div>
+<div class="block-max">Max center</div>
+<div class="block-right">Right</div>
+<div class="flex-row"><div class="flex-item">FAuto</div></div>
+<div class="grid-wrap"><div class="grid-item">GAuto</div></div>
+</body></html>

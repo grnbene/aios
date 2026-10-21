@@ -1,0 +1,9 @@
+# page dataset.html  viewport=900x600
+# title State an app sets on itself
+# content 900x144  background=ffffffff  links=0
+text       0    12   360    21  #ff202020  15px              "Visible, because body carries data-view=chat."
+text       0    45   305    21  #ff0f8a6a  15px,bold         "Green and bold, by the same attribute."
+text       0    78   328    21  #ffb03a4a  15px              "Red, from data-theme on the html element."
+text       0   111   344    21  #ff202020  15px             u  "Underlined, from a numeric attribute value."
+# glyph-gaps (none)
+

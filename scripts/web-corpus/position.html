@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><title>Out of flow</title><link rel="stylesheet" href="site.css">
+<style>
+.rel { position: relative; height: 120px; background: #eef3f7; margin-top: 12px; }
+.abs { position: absolute; top: 10px; right: 10px; padding: 6px; background: #0f6ab0; color: #fff; z-index: 5; }
+.pinned { position: fixed; bottom: 0; left: 0; padding: 8px; background: #202020; color: #fff; }
+.after { margin-top: 10px; }
+</style></head>
+<body><div class="wrap">
+<div class="rel"><span class="abs">Absolute, top right</span><p>Normal flow inside a relative box.</p></div>
+<p class="after">This paragraph must not move to make room for either box above.</p>
+<div class="pinned">Fixed to the viewport</div>
+</div></body></html>

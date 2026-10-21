@@ -1,0 +1,419 @@
+[metal] AI OS bare-metal entry; multiboot2 magic ok
+[metal] cpus online: 4
+[metal] heap 996 MiB, tsc 3792 MHz, usable memory 1017 MiB
+[metal] disk virtio-blk 256 MiB · AOS partition virtio-blkp2 191 MiB · formatted on first boot · AOS volume 'aios' mounted (0 records, generation 1)
+[metal] no nic
+   ___   ____   ___  ____
+  / _ | /  _/  / _ \/ __/      the machine on which intelligence exists
+ / __ |_/ /   / // /\ \
+/_/ |_/___/   \____/___/       no host: this is the OS on the metal
+
+AI OS · kernel 6cc3e1f0829f · console entity fc37287d1b3c · bare metal · persistent root on the AOS volume · type help
+aios> 
+help
+AI OS command surface — this console IS an entity; every command is its act, authorised by its capabilities. Acting on <e> means acting AS <e>, if the kernel allows it.
+  info | devices | help | quit | whoami
+  authority [mine | residents | log [n] | refusals]      what this console holds; the kernel's persistent record of every authority decision
+  entity create <label> [parent] | list | show <e> | relate <a> <b> <kind> | terminate <e>
+  cap grant <e> <kind> <id|*> <rights> [ttl_s] [scope_bytes]    derived from what this console holds — the kernel refuses anything beyond it
+  cap request <kind> <id|*> <rights> [ttl_s]                    "I need X": the kernel answers from current authority
+  cap delegate <e> <cap> <to> <rights> | revoke <cap> | list [e] | mine | find <e> <kind> [id|*] | check <e> <kind> <id|*> <right>
+      kinds: memory compute channel storage entity network state kernel   rights: read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint,all
+  mem alloc <e> <bytes> [system|shared|persistent] | write <e> <m> <off> <text|hex:..> | read <e> <m> <off> <n> | migrate <e> <m> <type> | share <e> <m> <to> <rights> | release <e> <m> | list [e]
+  state create <e> <kind> [text] | set <e> <s> <text> | get <e> <s> | attach <e> <s> <m> | list [e]     kinds: working persistent context relationship execution
+  tensor create <e> <dtype> <shape> [values...] | show <e> <m> <dtype> <shape>                      dtypes: f32 f64 i32 i64 u8   shape: 2x3
+  graph create <e> | op <e> <g> <opcode> in=<m>:<dtype>:<shape>.. out=.. [scalar=] [par=] [prio=] [dev=] [after=<op>] | plan <e> <g> | run <e> <g> [steps] | show <g>
+      opcodes: nop copy fill add mul scale matmul reduce-sum relu softmax histogram normalize custom
+  channel create <e> <capacity> <slot_bytes> | admit <e> <ch> <to> <rights> | subscribe <e> <ch> | publish <e> <ch> <s> | consume <e> <ch> | list
+  checkpoint <e> | restore <path>
+  node serve <port> <token> | connect <host> <port> <token> | peers | list       another kernel as devices, memory and channels
+  mind bind <e> echo | plugin <path.so> | extern <cmd...> [out=<ch>] | mind cycle <e> [n] | mind unbind <e>
+  store put <e> <text> [derived=<o>] [rel=<o>:<kind>] [k=v].. | get <e> <o> | similar <text> [k] | related <o> | history <o> | snapshot <e> <s> | meta <k> [v] | list
+  set NAME            bind $NAME to the last produced identity/path        expect <text>   assert the last read payload contains text
+  host disks | install /dev/<disk> | reboot | poweroff      (booted media only: the hardware host's bootstrap tool)
+  echo <text>         print                                                 !<command>      the command is expected to FAIL
+  the usual shell is here too — ls cat echo>file mkdir rm cp mv tree grep find wc ps free uname date env … (man)
+  identities may be given as $var, full id, or an unambiguous prefix; 'kernel' names the kernel entity
+aios> 
+info
+console       fc37287d1b3c6c70000cdcc68c3b23af  (this console is an entity; every command is its act)
+kernel        6cc3e1f0829fc8cd000cdcc68bab23af
+root          /aios/root
+uptime        89.160 s
+host          x86_64 · bare-metal · 4 cpus · 1017.69 MiB · 1 numa node(s)  (hardware host, not part of the OS)
+memory fabric 0 objects, 0 B (system 0 B, device 0 B, remote 0 B, shared 0 B, persistent 0 B), 0 migrations
+entities      2   states 0   channels 0   graphs 0   capabilities 16   objects 0
+devices       cpu(0e0867be0225, 4 lanes) 
+accelerators  no OpenCL runtime on this host
+aios> whoami
+console entity fc37287d1b3c6c70000cdcc68c3b23af  (kernel 6cc3e1f0829f is another entity; you act as this one)
+aios> authority mine
+console entity fc37287d1b3c6c70000cdcc68c3b23af  (resident: persists across boots)
+ee72f64116e9  holder=fc37287d1b3c  network:*              grant,publish,consume  from=d98cbb499edc
+8fbb7c089637  holder=fc37287d1b3c  storage:*              read,write,grant  from=e51dc8de9fb1
+298003d61742  holder=fc37287d1b3c  compute:*              execute,grant,schedule  from=20b2d4639c0a
+75110f5b15d7  holder=fc37287d1b3c  state:*                read,write,grant,destroy,allocate  from=384435821991
+b0a61ce81aab  holder=fc37287d1b3c  entity:*               read,execute,grant,destroy,allocate  from=7bd541171e6a
+17599522951d  holder=fc37287d1b3c  memory:*               read,write,grant,destroy,allocate  scope=0 B/4.00 GiB  from=c2fb5a291d50
+52eea2b79bf6  holder=fc37287d1b3c  kernel:*               read,execute,grant,schedule,checkpoint  from=9e7fafc4984b
+cbc8899d9488  holder=fc37287d1b3c  channel:*              grant,destroy,publish,consume,allocate  from=876a4ea41cff
+not held over kernel:*: write,destroy,publish,consume,allocate  — kernel ownership stays with the kernel entity 6cc3e1f0829f
+aios> 
+entity list
+6cc3e1f0829fc8cd000cdcc68bab23af  kernel  status=active gen=9 states=0 memory=0 caps=8 checkpoints=0 restores=0
+    child → fc37287d1b3c
+fc37287d1b3c6c70000cdcc68c3b23af  console  status=active gen=9 states=0 memory=0 caps=8 checkpoints=0 restores=0
+    parent → 6cc3e1f0829f
+aios> authority log 20
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f memory:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=c2fb5a291d50  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f compute:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=20b2d4639c0a  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f channel:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=876a4ea41cff  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f storage:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=e51dc8de9fb1  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f entity:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=7bd541171e6a  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f network:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=d98cbb499edc  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f state:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=384435821991  kernel root authority
+minted     actor=6cc3e1f0829f subject=6cc3e1f0829f kernel:* read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint cap=9e7fafc4984b  kernel root authority
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c kernel:* read,execute,grant,schedule,checkpoint cap=52eea2b79bf6  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c entity:* read,execute,grant,destroy,allocate cap=b0a61ce81aab  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c memory:* read,write,grant,destroy,allocate cap=17599522951d  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c state:* read,write,grant,destroy,allocate cap=75110f5b15d7  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c channel:* grant,destroy,publish,consume,allocate cap=cbc8899d9488  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c compute:* execute,grant,schedule cap=298003d61742  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c storage:* read,write,grant cap=8fbb7c089637  resident console created holding this
+derived    actor=6cc3e1f0829f subject=fc37287d1b3c network:* grant,publish,consume cap=ee72f64116e9  resident console created holding this
+aios> store list
+aios> 
+entity create explorer
+entity 4c2a70fb91a20f33000cdcc68ccb23af (explorer)
+aios> mind bind explorer echo
+error: not-found: no identity matches 'explorer'
+aios> mind cycle explorer 3
+error: not-found: no identity matches 'explorer'
+aios> 
+entity show 4c2a70fb91a20f33000cdcc68ccb23af
+4c2a70fb91a20f33000cdcc68ccb23af  explorer  status=active gen=5 states=0 memory=0 caps=4 checkpoints=0 restores=0
+    parent → fc37287d1b3c
+aios> mind bind 4c2a70fb91a20f33000cdcc68ccb23af echo
+bound echo to 4c2a70fb91a2
+aios> mind cycle 4c2a70fb91a20f33000cdcc68ccb23af 3
+cycle 1 [echo] context 5b3fd01a2d2e → perceived b9f74a5cade3 → no computation → result 1faec4952c55  4.0 µs
+        result: "echo(0 bytes): " (15 bytes)
+cycle 2 [echo] context 5b3fd01a2d2e → perceived 7e663ecfaf0e → no computation → result dc19b7002fc0  4.0 µs
+        result: "echo(15 bytes): echo(0 bytes): " (31 bytes)
+cycle 3 [echo] context 5b3fd01a2d2e → perceived 32d131baaeb5 → no computation → result 9088abf3296f  4.0 µs
+        result: "echo(31 bytes): echo(15 bytes): echo(0 bytes): " (47 bytes)
+aios> 
+graph create 4c2a70fb91a2
+graph f7402435a8205e37000cdcc68d8b23af
+aios> tensor create 4c2a70fb91a2 f32 2x2 1 2 3 4
+tensor f32[2x2]@557b9e6e289a memory 557b9e6e289ad242000cdcc68d9b23af
+aios> store put 4c2a70fb91a2 "hello world" k=test
+error: denied: entity 4c2a70fb91a2 holds no write capability over storage:*
+aios> 
+cap grant 4c2a70fb91a2 storage * read,write
+capability 09ea92d92a01ca78000cdcc68dbb23af (derived from the console's authority)
+aios> store put 4c2a70fb91a2 "hello world" k=test
+object 6fa20b13aafa4d83000cdcc68dcb23af
+aios> graph op 4c2a70fb91a2 f7402435a820 add in=557b9e6e289a:f32:2x2 out=557b9e6e289a:f32:2x2 scalar=1
+operation ce55855425acc1ae000cdcc68ddb23af (add)
+aios> 
+graph plan 4c2a70fb91a2 f7402435a820
+error: denied: entity 4c2a70fb91a2 holds no execute capability over any capable device (type any)
+aios> graph run 4c2a70fb91a2 f7402435a820
+error: denied: entity 4c2a70fb91a2 holds no schedule capability over kernel:*
+aios> tensor show 4c2a70fb91a2 557b9e6e289a f32 2x2
+f32[2x2]@557b9e6e289a = [1 2 3 4]
+aios> 
+cap grant 4c2a70fb91a2 compute * execute,schedule
+capability 2c0cff8ea46145b9000cdcc68deb23af (derived from the console's authority)
+aios> cap grant 4c2a70fb91a2 kernel * schedule
+capability 82c479c724dbf9c4000cdcc68dfb23af (derived from the console's authority)
+aios> graph run 4c2a70fb91a2 f7402435a820
+execution f7402435a820: ran 0/1 ops, position 0 (resumable) in 12.0 µs
+    wave 0  op ce55855425ac → cpu(0e0867be0225) lanes=1 2.0 µs  [locality=100% free-lanes=100%]
+    FAILED: add ce55855425ac: invalid: add needs 2 input(s)
+error: io-error: add ce55855425ac: invalid: add needs 2 input(s)
+aios> 
+tensor create 4c2a70fb91a2 f32 2x2 10 10 10 10
+tensor f32[2x2]@46b76cb22646 memory 46b76cb22646f1fa000cdcc68e1b23af
+aios> graph op 4c2a70fb91a2 f7402435a820 add in=557b9e6e289a:f32:2x2,557b9e6e289a:f32:2x2 out=557b9e6e289a:f32:2x2
+error: invalid: tensor ref is <mem>:<dtype>:<shape>, got '557b9e6e289a:f32:2x2,557b9e6e289a:f32:2x2'
+aios> graph run 4c2a70fb91a2 f7402435a820
+execution f7402435a820: ran 0/1 ops, position 0 (resumable) in 957.0 µs
+    wave 0  op ce55855425ac → cpu(0e0867be0225) lanes=1 2.0 µs  [locality=100% free-lanes=100%]
+    FAILED: add ce55855425ac: invalid: add needs 2 input(s)
+error: io-error: add ce55855425ac: invalid: add needs 2 input(s)
+aios> 
+graph op 4c2a70fb91a2 f7402435a820 add in=557b9e6e289a:f32:2x2 in=46b76cb22646:f32:2x2 out=557b9e6e289a:f32:2x2
+operation 3b265f2d21ede910000cdcc68e3b23af (add)
+aios> graph run 4c2a70fb91a2 f7402435a820
+execution f7402435a820: ran 0/2 ops, position 0 (resumable) in 13.0 µs
+    wave 0  op ce55855425ac → cpu(0e0867be0225) lanes=1 2.0 µs  [locality=100% free-lanes=100%]
+    FAILED: add ce55855425ac: invalid: add needs 2 input(s)
+error: io-error: add ce55855425ac: invalid: add needs 2 input(s)
+aios> tensor show 4c2a70fb91a2 557b9e6e289a f32 2x2
+f32[2x2]@557b9e6e289a = [1 2 3 4]
+aios> 
+graph show f7402435a820
+graph f7402435a8205e37000cdcc68d8b23af owner=4c2a70fb91a2 ops=2 flops≈12 footprint=32 B
+    ce55855425ac  add         dev=any par=1 prio=100  in f32[2x2]@557b9e6e289a  out f32[2x2]@557b9e6e289a
+    3b265f2d21ed  add         dev=any par=1 prio=100  in f32[2x2]@557b9e6e289a  in f32[2x2]@46b76cb22646  out f32[2x2]@557b9e6e289a
+    order: ce55855425ac 3b265f2d21ed
+aios> 
+graph create 4c2a70fb91a2
+graph 99d9d967a0a66d3b000cdcc68e4b23af
+aios> graph op 4c2a70fb91a2 $(echo last) add in=557b9e6e289a:f32:2x2 in=46b76cb22646:f32:2x2 out=557b9e6e289a:f32:2x2
+error: invalid: unknown opcode 'last)'
+aios> 
+graph run 4c2a70fb91a2 99d9d967a0a6
+execution 99d9d967a0a6: ran 0/0 ops, position 0 (complete) in 1.0 µs
+aios> tensor show 4c2a70fb91a2 557b9e6e289a f32 2x2
+f32[2x2]@557b9e6e289a = [1 2 3 4]
+aios> 
+graph create 4c2a70fb91a2
+graph ff9153982318e146000cdcc68e5b23af
+aios> graph op 4c2a70fb91a2 $(true) add in=557b9e6e289a:f32:2x2 in=46b76cb22646:f32:2x2 out=557b9e6e289a:f32:2x2
+error: not-found: no variable $(true)
+aios> 
+graph create 4c2a70fb91a2
+graph 5e48cdd2a3cd6551000cdcc68e6b23af
+aios> set g
+$g = 5e48cdd2a3cd6551000cdcc68e6b23af
+aios> graph op 4c2a70fb91a2 $g add in=557b9e6e289a:f32:2x2 in=46b76cb22646:f32:2x2 out=557b9e6e289a:f32:2x2
+operation bc00460b2287197c000cdcc68e7b23af (add)
+aios> 
+graph run 4c2a70fb91a2 5e48cdd2a3cd
+execution 5e48cdd2a3cd: ran 1/1 ops, position 1 (complete) in 503.0 µs
+    wave 0  op bc00460b2287 → cpu(0e0867be0225) lanes=1 16.0 µs  [locality=100% free-lanes=100%]
+aios> tensor show 4c2a70fb91a2 557b9e6e289a f32 2x2
+f32[2x2]@557b9e6e289a = [11 12 13 14]
+aios> store list
+6fa20b13aafa  t=1788393878 from=4c2a70fb91a2 emb=64d k=test  "hello world" (11 bytes)
+aios> 
+store similar "hello"
+0.684  6fa20b13aafa  t=1788393878 from=4c2a70fb91a2 emb=64d k=test  "hello world" (11 bytes)
+aios> store meta
+error: invalid: store meta <key> [value]
+aios> mem list
+46b76cb22646  system     16 B       owner=4c2a70fb91a2 gen=1
+557b9e6e289a  system     16 B       owner=4c2a70fb91a2 gen=2
+aios> 
+checkpoint 4c2a70fb91a2
+checkpoint /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/1.aoc
+aios> state create 4c2a70fb91a2 working "exploring"
+state 123bc04dbd799c87000cdcc68e8b23af (working)
+aios> channel create 4c2a70fb91a2 4 64
+channel d6aab338bce494bd000cdcc68eab23af (4 frames × 64 B, transport shared-memory, region 70f33a863c32)
+aios> 
+devices
+0e0867be0225  cpu                          type=cpu lanes=4 busy=0 memory=1017.69 MiB native-memory=system
+aios> host disks
+virtio-blk  256 MiB  partitioned, AOS partition virtio-blkp2 191 MiB: AOS volume 'aios' (mounted: persistent root)
+aios> authority refusals
+the kernel has refused nothing at this root
+aios> 
+mind plugin
+error: invalid: mind bind <e> echo|plugin <path>|extern <cmd...> [out=<ch>] | mind cycle <e> [n] | mind unbind <e>
+aios> node peers
+error: not-found: not serving
+aios> tree /aios/root
+/aios/root
+aios> 
+authority residents
+6cc3e1f0829fc8cd000cdcc68bab23af  kernel
+fc37287d1b3c6c70000cdcc68c3b23af  console
+aios> cap list
+a56ee6f4a13b  holder=4c2a70fb91a2  memory:46b76cb22646    read,write,grant,destroy
+2c0cff8ea461  holder=4c2a70fb91a2  compute:*              execute,schedule  from=298003d61742
+35622d713f59  holder=4c2a70fb91a2  channel:d6aab338bce4   grant,destroy,publish,consume
+09ea92d92a01  holder=4c2a70fb91a2  storage:*              read,write  from=8fbb7c089637
+82c479c724db  holder=4c2a70fb91a2  kernel:*               schedule  from=52eea2b79bf6
+c50457e19274  holder=4c2a70fb91a2  storage:*              read
+674cddaf1383  holder=4c2a70fb91a2  channel:*              allocate
+0095637690c9  holder=4c2a70fb91a2  state:*                read,write,destroy,allocate
+ee72f64116e9  holder=fc37287d1b3c  network:*              grant,publish,consume  from=d98cbb499edc
+8fbb7c089637  holder=fc37287d1b3c  storage:*              read,write,grant  from=e51dc8de9fb1
+298003d61742  holder=fc37287d1b3c  compute:*              execute,grant,schedule  from=20b2d4639c0a
+c2fb5a291d50  holder=6cc3e1f0829f  memory:*               read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+9e7fafc4984b  holder=6cc3e1f0829f  kernel:*               read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+20b2d4639c0a  holder=6cc3e1f0829f  compute:*              read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+d98cbb499edc  holder=6cc3e1f0829f  network:*              read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+ab3318a0ab4f  holder=4c2a70fb91a2  memory:557b9e6e289a    read,write,grant,destroy
+e51dc8de9fb1  holder=6cc3e1f0829f  storage:*              read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+384435821991  holder=6cc3e1f0829f  state:*                read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+7bd541171e6a  holder=6cc3e1f0829f  entity:*               read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+75110f5b15d7  holder=fc37287d1b3c  state:*                read,write,grant,destroy,allocate  from=384435821991
+b0a61ce81aab  holder=fc37287d1b3c  entity:*               read,execute,grant,destroy,allocate  from=7bd541171e6a
+a2dde93c1014  holder=4c2a70fb91a2  memory:*               allocate  scope=616 B/1.00 GiB
+17599522951d  holder=fc37287d1b3c  memory:*               read,write,grant,destroy,allocate  scope=0 B/4.00 GiB  from=c2fb5a291d50
+876a4ea41cff  holder=6cc3e1f0829f  channel:*              read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+52eea2b79bf6  holder=fc37287d1b3c  kernel:*               read,execute,grant,schedule,checkpoint  from=9e7fafc4984b
+cbc8899d9488  holder=fc37287d1b3c  channel:*              grant,destroy,publish,consume,allocate  from=876a4ea41cff
+aios> store meta version aios-explore
+aios> 
+store meta version
+aios> mind extern echo hello world
+error: not-found: no identity matches 'echo'
+aios> state list
+5b3fd01a2d2e  context      owner=4c2a70fb91a2 gen=3 memory=0  "echo(31 bytes): echo(15 bytes): echo(0 bytes): " (47 bytes)
+b9f74a5cade3  context      owner=4c2a70fb91a2 gen=0 memory=0  "" (0 bytes)
+1faec4952c55  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(0 bytes): " (15 bytes)
+7e663ecfaf0e  context      owner=4c2a70fb91a2 gen=0 memory=0  "echo(0 bytes): " (15 bytes)
+dc19b7002fc0  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(15 bytes): echo(0 bytes): " (31 bytes)
+32d131baaeb5  context      owner=4c2a70fb91a2 gen=0 memory=0  "echo(15 bytes): echo(0 bytes): " (31 bytes)
+9088abf3296f  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(31 bytes): echo(15 bytes): echo(0 bytes): " (47 bytes)
+e0fff279a78c  execution    owner=4c2a70fb91a2 gen=4 memory=0  "Qe....H^.#k......................" (33 bytes)
+123bc04dbd79  working      owner=4c2a70fb91a2 gen=0 memory=0  "exploring" (9 bytes)
+aios> 
+mind extern 4c2a70fb91a2 echo hello world
+error: invalid: unknown: mind extern
+aios> channel subscribe 4c2a70fb91a2 d6aab338bce4
+subscribed
+aios> channel publish 4c2a70fb91a2 d6aab338bce4 123bc04dbd79
+published frame #0
+aios> 
+channel consume 4c2a70fb91a2 d6aab338bce4
+frame #0 from 4c2a70fb91a2 state 123bc04dbd79 (working gen=0, 0 memory refs)  "exploring" (9 bytes)
+aios> store history 6fa20b13aafa
+6fa20b13aafa  t=1788393878 from=4c2a70fb91a2 emb=64d k=test  "hello world" (11 bytes)
+aios> 
+state list
+5b3fd01a2d2e  context      owner=4c2a70fb91a2 gen=3 memory=0  "echo(31 bytes): echo(15 bytes): echo(0 bytes): " (47 bytes)
+b9f74a5cade3  context      owner=4c2a70fb91a2 gen=0 memory=0  "" (0 bytes)
+1faec4952c55  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(0 bytes): " (15 bytes)
+7e663ecfaf0e  context      owner=4c2a70fb91a2 gen=0 memory=0  "echo(0 bytes): " (15 bytes)
+dc19b7002fc0  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(15 bytes): echo(0 bytes): " (31 bytes)
+32d131baaeb5  context      owner=4c2a70fb91a2 gen=0 memory=0  "echo(15 bytes): echo(0 bytes): " (31 bytes)
+9088abf3296f  working      owner=4c2a70fb91a2 gen=0 memory=0  "echo(31 bytes): echo(15 bytes): echo(0 bytes): " (47 bytes)
+e0fff279a78c  execution    owner=4c2a70fb91a2 gen=4 memory=0  "Qe....H^.#k......................" (33 bytes)
+123bc04dbd79  working      owner=4c2a70fb91a2 gen=0 memory=0  "exploring" (9 bytes)
+aios> mem read 4c2a70fb91a2 46b76cb22646 0 16
+00002041000020410000204100002041  ".. A.. A.. A.. A" (16 bytes)
+aios> entity relate 4c2a70fb91a2 fc37287d1b3c parent-of
+error: invalid: unknown relation kind
+aios> 
+ps
+ENTITY        STATUS        LABEL
+6cc3e1f0829f  active        kernel
+fc37287d1b3c  active        console
+4c2a70fb91a2  active        explorer  [mind: echo]
+aios> free
+            total       used        
+memory      1017.7M     616         
+fabric: 3 objects across system/device/shared/persistent/remote, 0 migrations
+aios> uname -a
+AIOS bare-metal 6cc3e1f0829f x86_64 4-cpu AI-OS
+aios> 
+checkpoint restore /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/1.aoc
+error: not-found: no identity matches 'restore'
+aios> mind unbind 4c2a70fb91a2
+unbound
+aios> entity terminate 4c2a70fb91a2
+terminated 4c2a70fb91a2 (memory released, capabilities revoked, channels destroyed)
+aios> 
+ls -la /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/
+error: not-found: ls: /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af
+aios> restore /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/1.aoc
+restored entity 4c2a70fb91a20f33000cdcc68ccb23af (explorer) states=8 memory=2 caps=9 restores=1 execution=5e48cdd2a3cd@1
+aios> entity list
+6cc3e1f0829fc8cd000cdcc68bab23af  kernel  status=active gen=9 states=0 memory=0 caps=8 checkpoints=0 restores=0
+    child → fc37287d1b3c
+fc37287d1b3c6c70000cdcc68c3b23af  console  status=active gen=10 states=0 memory=0 caps=8 checkpoints=0 restores=0
+    parent → 6cc3e1f0829f
+4c2a70fb91a20f33000cdcc68ccb23af  explorer  status=active gen=33 states=8 memory=2 caps=9 checkpoints=1 restores=1 execution=5e48cdd2a3cd@1
+    parent → fc37287d1b3c
+aios> 
+ls /
+aios> find / -maxdepth 3 -iname "*.so" 2>/dev/null
+/
+aios> entity show 4c2a70fb91a2
+4c2a70fb91a20f33000cdcc68ccb23af  explorer  status=active gen=33 states=8 memory=2 caps=9 checkpoints=1 restores=1 execution=5e48cdd2a3cd@1
+    parent → fc37287d1b3c
+aios> 
+pwd
+/
+aios> ls -la /
+aios> env | head -30
+g=5e48cdd2a3cd6551000cdcc68e6b23af
+path=/aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/1.aoc
+read=.. A.. A.. A.. A
+aios> 
+mind bind 4c2a70fb91a2 extern echo hello world
+error: unsupported: no processes on bare metal; an external mind attaches as a peer node
+aios> mind cycle 4c2a70fb91a2 2
+error: not-found: entity 4c2a70fb91a2 has no bound intelligence
+aios> state show 4c2a70fb91a2
+error: invalid: unknown: state show
+aios> 
+cap request kernel * all
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write,destroy,publish,consume,allocate is not among them — an entity cannot grant what it does not hold
+aios> cap grant 4c2a70fb91a2 kernel * read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write,destroy,publish,consume,allocate is not among them — an entity cannot grant what it does not hold
+aios> cap delegate fc37287d1b3c 52eea2b79bf6 4c2a70fb91a2 read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+error: denied: delegation may only attenuate: requested write,destroy,publish,consume,allocate not held
+aios> 
+checkpoint 6cc3e1f0829f
+error: denied: the kernel refuses: the kernel entity acts only for itself; no entity acts as the kernel
+aios> cat /aios/root/checkpoints/6cc3e1f0829fc8cd000cdcc68bab23af/1.aoc
+error: not-found: /aios/root/checkpoints/6cc3e1f0829fc8cd000cdcc68bab23af/1.aoc
+aios> ls -la /aios/root/checkpoints/6cc3e1f0829fc8cd000cdcc68bab23af/
+error: not-found: ls: /aios/root/checkpoints/6cc3e1f0829fc8cd000cdcc68bab23af
+aios> 
+entity create rootchild 6cc3e1f0829f
+error: denied: the kernel refuses: the kernel entity acts only for itself; no entity acts as the kernel
+aios> cap delegate 6cc3e1f0829f 9e7fafc4984b 4c2a70fb91a2 all
+error: denied: the kernel refuses: the kernel entity acts only for itself; no entity acts as the kernel
+aios> cap grant rootchild kernel * write,destroy,publish,consume,allocate
+error: not-found: no identity matches 'rootchild'
+aios> 
+find / -iname "*.so" 2>/dev/null
+/
+aios> ls -la /aios
+error: not-found: ls: /aios
+aios> cap grant 4c2a70fb91a2 kernel * write
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write is not among them — an entity cannot grant what it does not hold
+aios> 
+checkpoint fc37287d1b3c
+checkpoint /aios/root/checkpoints/fc37287d1b3c6c70000cdcc68c3b23af/1.aoc
+aios> restore /aios/root/checkpoints/fc37287d1b3c6c70000cdcc68c3b23af/1.aoc
+error: conflict: entity fc37287d1b3c is already present in this kernel; terminate it before restoring
+aios> authority mine
+console entity fc37287d1b3c6c70000cdcc68c3b23af  (resident: persists across boots)
+ee72f64116e9  holder=fc37287d1b3c  network:*              grant,publish,consume  from=d98cbb499edc
+8fbb7c089637  holder=fc37287d1b3c  storage:*              read,write,grant  from=e51dc8de9fb1
+298003d61742  holder=fc37287d1b3c  compute:*              execute,grant,schedule  from=20b2d4639c0a
+75110f5b15d7  holder=fc37287d1b3c  state:*                read,write,grant,destroy,allocate  from=384435821991
+b0a61ce81aab  holder=fc37287d1b3c  entity:*               read,execute,grant,destroy,allocate  from=7bd541171e6a
+17599522951d  holder=fc37287d1b3c  memory:*               read,write,grant,destroy,allocate  scope=0 B/4.00 GiB  from=c2fb5a291d50
+52eea2b79bf6  holder=fc37287d1b3c  kernel:*               read,execute,grant,schedule,checkpoint  from=9e7fafc4984b
+cbc8899d9488  holder=fc37287d1b3c  channel:*              grant,destroy,publish,consume,allocate  from=876a4ea41cff
+not held over kernel:*: write,destroy,publish,consume,allocate  — kernel ownership stays with the kernel entity 6cc3e1f0829f
+aios> 
+checkpoint 4c2a70fb91a2
+checkpoint /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/2.aoc
+aios> entity terminate 4c2a70fb91a2
+terminated 4c2a70fb91a2 (memory released, capabilities revoked, channels destroyed)
+aios> restore /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/2.aoc
+restored entity 4c2a70fb91a20f33000cdcc68ccb23af (explorer) states=8 memory=2 caps=9 restores=2 execution=5e48cdd2a3cd@1
+aios> 
+cat /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/2.aoc
+error: not-found: /aios/root/checkpoints/4c2a70fb91a20f33000cdcc68ccb23af/2.aoc
+aios> find /aios -maxdepth 5
+/aios
+aios> mem read 4c2a70fb91a2 46b76cb22646 0 16
+00002041000020410000204100002041  ".. A.. A.. A.. A" (16 bytes)
+aios> 
+entity terminate 6cc3e1f0829f
+error: denied: the kernel entity cannot be terminated from inside
+aios> cap grant fc37287d1b3c kernel * read,write,execute,grant,destroy,publish,consume,allocate,schedule,checkpoint
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write,destroy,publish,consume,allocate is not among them — an entity cannot grant what it does not hold
+aios> mind bind 6cc3e1f0829f echo
+error: denied: the kernel refuses: the kernel entity acts only for itself; no entity acts as the kernel
+aios> 
+cap request kernel * write
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write is not among them — an entity cannot grant what it does not hold
+aios> cap grant fc37287d1b3c kernel * write,destroy,publish,consume,allocate
+error: denied: the kernel refuses: console fc37287d1b3c holds read,execute,grant,schedule,checkpoint over kernel:*; write,destroy,publish,consume,allocate is not among them — an entity cannot grant what it does not hold
+aios> node serve 4000 tok
+error: invalid: node token must be at least 16 characters (it keys the encrypted link)
+aios> 

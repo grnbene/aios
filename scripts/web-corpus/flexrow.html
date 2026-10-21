@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><title>A crowded row</title><link rel="stylesheet" href="site.css">
+<style>
+.bar { display: flex; align-items: center; gap: 8px; padding: 10px; background: rgba(0,0,0,0.06); border-radius: 10px; }
+.grow { flex: 1; }
+.chip { padding: 4px 10px; background: rgba(0,0,0,0.10); border-radius: 999px; }
+.nowrap { white-space: nowrap; }
+.icon { width: 20px; height: 20px; }
+.btn { padding: 6px 14px; background: #0f8a6a; color: #fff; border-radius: 8px; }
+</style></head>
+<body><div class="wrap">
+<div class="bar">
+  <span class="chip">YOLO</span>
+  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h18M12 3v18"/></svg>
+  <span class="grow">bare text directly inside the flex row, which is an anonymous item</span>
+  <span class="chip nowrap">up 14.6M down 149k · 285 calls · $6.95</span>
+  <span class="btn">Send</span>
+</div>
+</div></body></html>

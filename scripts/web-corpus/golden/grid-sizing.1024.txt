@@ -1,0 +1,24 @@
+# page grid-sizing.html  viewport=1024
+# title Grid track sizing
+# content 1024x189  background=ff121212  links=0
+rect       8     8    72    21  #ffeeeeee
+text       8     8    72    21  #ffd8d8d8  15px              "Auto text"
+rect      90     8    56    63  #ffeeeeee
+text      90     8    24    21  #ffd8d8d8  15px              "Min"
+text      90    29    56    21  #ffd8d8d8  15px              "content"
+text      90    50    32    21  #ffd8d8d8  15px              "item"
+rect     156     8   128    21  #ffeeeeee
+text     156     8   128    21  #ffd8d8d8  15px              "Max content item"
+rect     294     8   100    42  #ffeeeeee
+text     294     8    48    21  #ffd8d8d8  15px              "Capped"
+text     294    29    48    21  #ffd8d8d8  15px              "minmax"
+rect     404     8   204    21  #ffeeeeee
+text     404     8   112    21  #ffd8d8d8  15px              "Fraction track"
+rect       8    91   145    21  #ffccccee
+text       8    91   112    21  #ffd8d8d8  15px              "Spans two rows"
+rect     163    91   145    21  #ffeecccc
+text     163    91    40    21  #ffd8d8d8  15px              "Row 1"
+rect     163   141   145    21  #ffeecccc
+text     163   141    40    21  #ffd8d8d8  15px              "Row 2"
+# glyph-gaps (none)
+

@@ -1,0 +1,22 @@
+# page icons.html  viewport=900x600
+# title Inline SVG icons
+# content 900x186  background=ffffffff  links=0
+text      16    36   442    33  #ff202020  24px,bold         "Icons, drawn from their own markup"
+image     16    87    20    20  #ff202020  src=svg#0 alt=""
+image     48    87    20    20  #ff202020  src=svg#1 alt=""
+image     80    87    20    20  #ff202020  src=svg#2 alt=""
+image    112    87    20    20  #ff202020  src=svg#3 alt=""
+image    144    87    20    20  #ff202020  src=svg#4 alt=""
+text     176    87   336    21  #ff202020  15px              "stroke, fill, curve, polyline, closed path"
+image     16   128    32    32  #ff0f8a6a  src=svg#5 alt=""
+image     60   128    32    32  #ff0f8a6a  src=svg#6 alt=""
+text     104   133   472    21  #ff0f8a6a  15px              "an arc, and a cubic — at thirty-two, tinted by currentColor"
+# inline-image svg#0    20x20  inked=68  digest=a7aa4b05
+# inline-image svg#1    20x20  inked=134  digest=3c011645
+# inline-image svg#2    20x20  inked=244  digest=6acf7705
+# inline-image svg#3    20x20  inked=55  digest=629f3065
+# inline-image svg#4    20x20  inked=108  digest=5776cc45
+# inline-image svg#5    32x32  inked=212  digest=c3de40f5
+# inline-image svg#6    32x32  inked=240  digest=05b95bc5
+# glyph-gaps (none)
+

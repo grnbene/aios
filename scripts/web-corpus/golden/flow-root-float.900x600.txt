@@ -1,0 +1,9 @@
+# page flow-root-float.html  viewport=900x600
+# title flow-root beside float
+# content 900x80  background=ff121212  links=0
+rect       0     0   150    80  #ffcc3333
+text       0     0    40    21  #ffd8d8d8  15px              "Float"
+rect     150     0   750    60  #ff3333cc
+text     150     0   176    21  #ffd8d8d8  15px              "Flow root beside float"
+# glyph-gaps (none)
+

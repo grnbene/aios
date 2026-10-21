@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Assembles the `compute serve` argument string from /etc/aios/asql.conf and
+# execs the engine. The binary takes positional key=value args and reads no
+# environment, so something has to do this translation; doing it here keeps the
+# systemd unit byte-identical on every host and survives systemd 219.
+set -euo pipefail
+
+CONF=${ASQL_CONF:-/etc/aios/asql.conf}
+if [ ! -r "$CONF" ]; then
+  echo "asql-serve: cannot read $CONF" >&2
+  exit 78
+fi
+# shellcheck source=/dev/null
+. "$CONF"
+
+: "${AIOS_BIN:=/opt/aios/bin/aios}"
+: "${AIOS_ROOT:=/opt/aios/root}"
+: "${RPC_PORT:=7311}"
+: "${LANES:=8}"
+: "${SQL:=1}"
+
+args=("compute" "serve" "port=${RPC_PORT}" "lanes=${LANES}" "sql=${SQL}")
+
+# Append key=value only when the value is non-empty, so an unset knob falls
+# through to the engine's own default instead of being pinned to a blank.
+add() { [ -n "${2:-}" ] && args+=("$1=$2") || true; }
+
+add public        "${PUBLIC:-}"
+add max_points    "${MAX_POINTS:-}"
+add sql_db        "${SQL_DB:-}"
+add mysql_port    "${MYSQL_PORT:-}"
+add mysql_bind    "${MYSQL_BIND:-}"
+add mysql_user    "${MYSQL_USER:-}"
+add mysql_pass_file "${MYSQL_PASS_FILE:-}"
+add mysql_socket  "${MYSQL_SOCKET:-}"
+add tables_dir    "${TABLES_DIR:-}"
+add mysql_charset "${MYSQL_CHARSET:-}"
+add mysql_tls_cert "${MYSQL_TLS_CERT:-}"
+add mysql_tls_key "${MYSQL_TLS_KEY:-}"
+add mysql_tls_require "${MYSQL_TLS_REQUIRE:-}"
+add token_file    "${TOKEN_FILE:-}"
+add cdc_host      "${CDC_HOST:-}"
+add cdc_port      "${CDC_PORT:-}"
+add cdc_user      "${CDC_USER:-}"
+add cdc_pass_file "${CDC_PASS_FILE:-}"
+add cdc_db        "${CDC_DB:-}"
+# The engine reads cdc_tables as a FILE of table names, one per line; handed a
+# bare csv it finds no file, seeds nothing and then mirrors every table the
+# binlog mentions. The conf keeps a readable csv, so write the file each start.
+CDC_TABLES_FILE=""
+if [ -n "${CDC_TABLES:-}" ]; then
+  case "$CDC_TABLES" in
+    */*) CDC_TABLES_FILE=${CDC_TABLES#@} ;;
+    *)   CDC_TABLES_FILE="$AIOS_ROOT/cdc_tables.list"
+         [ "${1:-}" = "--print" ] || printf '%s\n' "${CDC_TABLES//,/$'\n'}" > "$CDC_TABLES_FILE" ;;
+  esac
+fi
+add cdc_tables    "$CDC_TABLES_FILE"
+add cdc_log_file  "${CDC_LOG_FILE:-}"
+add cdc_log_pos   "${CDC_LOG_POS:-}"
+
+# Opt-in: only when all three are set in the conf does this host also join
+# the fleet hub before serving compute - `fleet join` also wires
+# serve_machine_sql() so any other fleet member can sql_on() this box's
+# tables (read-only), over the authenticated node link, without exposing
+# mysql_port to the network. Silent no-op (empty exec_cmds) when unset, so
+# every other host's conf keeps working unchanged.
+# `retry`: a hub that is down does not stop the SQL service. Without it the
+# failed join ended `exec` before `compute serve` ran, and the MySQL wire
+# stayed down until the hub came back; now the join keeps trying in the
+# background while the engine serves.
+exec_cmds=()
+if [ -n "${FLEET_HOST:-}" ] && [ -n "${FLEET_PORT:-}" ] && [ -n "${FLEET_KEY_FILE:-}" ]; then
+  exec_cmds+=("fleet join ${FLEET_HOST} ${FLEET_PORT} @${FLEET_KEY_FILE} retry")
+elif [ -n "${FLEET_HOST:-}${FLEET_PORT:-}${FLEET_KEY_FILE:-}" ]; then
+  echo "asql-serve: FLEET_HOST, FLEET_PORT and FLEET_KEY_FILE go together; not joining a fleet" >&2
+fi
+exec_cmds+=("${args[*]}")
+
+if [ "${1:-}" = "--print" ]; then
+  printf '%s --root %s exec' "$AIOS_BIN" "$AIOS_ROOT"
+  for c in "${exec_cmds[@]}"; do printf ' "%s"' "$c"; done
+  printf '\n'
+  exit 0
+fi
+
+exec "$AIOS_BIN" --root "$AIOS_ROOT" exec "${exec_cmds[@]}"

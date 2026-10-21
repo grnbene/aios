@@ -1,0 +1,26 @@
+/* @ID@: the grammar exactly as generated, compiled under another name so aios-ts-pack can read its tables from memory. */
+#define @TSFN@ aios_orig_@ID@
+#include "@PARSER@"
+#include <stddef.h>
+
+struct AiosTsTable {
+  const char *name;
+  const void *data;
+  size_t bytes;
+  unsigned stride;   /* bytes in one element: what the packer shuffles by */
+};
+
+size_t aios_ts_tables_@ID@(const struct AiosTsTable **out) {
+  static const struct AiosTsTable tables[] = {
+#define T1(n) {#n, (const void *)(n), sizeof(n), (unsigned)sizeof((n)[0])}
+#define T2(n) {#n, (const void *)(n), sizeof(n), (unsigned)sizeof((n)[0][0])}
+      T2(ts_parse_table),      T1(ts_small_parse_table), T1(ts_small_parse_table_map), T1(ts_parse_actions),
+      T1(ts_lex_modes),        T1(ts_primary_state_ids), T2(ts_alias_sequences),
+#undef T1
+#undef T2
+  };
+  *out = tables;
+  return sizeof tables / sizeof tables[0];
+}
+
+const TSLanguage *aios_ts_orig_@ID@(void) { return aios_orig_@ID@(); }

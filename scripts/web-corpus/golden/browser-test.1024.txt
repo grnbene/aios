@@ -1,0 +1,53 @@
+# page browser-test.html  viewport=1024
+# title C++ Browser Engine Feature Verification
+# content 1024x680  background=ff0f141c  links=0
+rect       0     0  1024    55  #ff1f293d  r=6
+border     0     0  1024    55  #ff384d6b  r=6
+text      21    15   430    25  #ff58a6ff  18px,bold,mono    "AIOS C++ Web Engine — Runtime & Layout Test"
+rect     896    15   107    24  #ff238636  r=4
+text     904    19    91    16  #ffffffff  12px,bold,mono    "ENGINE ACTIVE"
+rect       0    72   240   184  #ff161b22  r=6
+border     0    72   240   184  #ff30363d  r=6
+border    17    89   206    26  #ff30363d
+text      17    89   120    19  #ff79c0ff  14px,bold,mono    "Grid Areas Test"
+text      17   127    56    18  #ff8b949e  13px,mono         "Layout: "
+text      73   127   135    18  #ff56d364  13px,bold,mono    "grid-template-areas"
+text      17   155    56    18  #ff8b949e  13px,mono         "Tracks: "
+text      73   155   105    18  #ff56d364  13px,bold,mono    "2 cols × 3 rows"
+text      17   183    56    18  #ff8b949e  13px,mono         "Status: "
+text      73   183   127    18  #ff56d364  13px,bold,mono    "Resolved & Aligned"
+text      17   211    35    18  #ff8b949e  13px,mono         "Gap: "
+text      52   211    84    18  #ff56d364  13px,bold,mono    "12px Uniform"
+rect     252    72   772   422  #ff161b22  r=6
+border   252    72   772   422  #ff30363d  r=6
+rect     269    89   738   134  #ff0d1117  r=4
+border   269    89   738   134  #ff21262d  r=4
+text     282   102   225    19  #ffd2a8ff  14px,bold,mono    "Audio Spec Compliance Checks"
+border   282   129   712    27  #ff21262d
+text     282   133   210    18  #ffe6edf3  13px,mono         "Audio.canPlayType('audio/wav')"
+text     853   133   141    18  #ff3fb950  13px,bold,mono    """ (Honest disclaim)"
+border   282   156   712    27  #ff21262d
+text     282   160   252    18  #ffe6edf3  13px,mono         "Audio.duration (unbuffered/unloaded)"
+text     852   160   142    18  #ff3fb950  13px,bold,mono    "NaN (Spec-compliant)"
+border   282   183   712    27  #ff21262d
+text     282   187   154    18  #ffe6edf3  13px,mono         "Audio.play() execution"
+text     910   187    84    18  #ff3fb950  13px,bold,mono    "No fake beep"
+rect     269   235   738   107  #ff0d1117  r=4
+border   269   235   738   107  #ff21262d  r=4
+text     282   248   290    19  #ffd2a8ff  14px,bold,mono    "Self-Reporting & Engine Capabilities"
+border   282   275   712    27  #ff21262d
+text     282   279   161    18  #ffe6edf3  13px,mono         "js_supported_features()"
+text     810   279   184    18  #ff3fb950  13px,bold,mono    "Canvas2D Listed / Accurate"
+border   282   302   712    27  #ff21262d
+text     282   306   154    18  #ffe6edf3  13px,mono         "Observers Audit Status"
+text     796   306   198    18  #ff3fb950  13px,bold,mono    "Stub Registration Disclaimed"
+rect     269   354   738   123  #ff0d1117  r=4
+border   269   354   738   123  #ff21262d  r=4
+text     282   367   136    19  #ffd2a8ff  14px,bold,mono    "Canvas 2D Surface"
+canvas   282   394   360    70  #ffe6edf3
+rect       0   506  1024    38  #ff1f293d  r=6
+border     0   506  1024    38  #ff384d6b  r=6
+text      21   517   231    16  #ff8b949e  12px,mono         "AIOS Compositor • Glass Rendering"
+text     849   517   154    16  #ff8b949e  12px,mono         "1440 × 900 Framebuffer"
+# glyph-gaps (none)
+

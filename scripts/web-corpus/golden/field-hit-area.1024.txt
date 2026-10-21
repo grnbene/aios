@@ -1,0 +1,7 @@
+# page field-hit-area.html  viewport=1024
+# title Form field hit areas
+# content 1024x36  background=ff121212  links=0
+rect       0     0   194    36  #00000000
+text       7     7   180    21  #ffdcdcdc  15px              "search text"
+# glyph-gaps (none)
+

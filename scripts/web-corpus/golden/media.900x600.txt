@@ -1,0 +1,8 @@
+# page media.html  viewport=900x600
+# title What this screen is
+# content 900x151  background=ffffffff  links=0
+text      16    28   538    21  #ff0f8a6a  15px,bold         "Green and bold: this machine is dark, landscape, and has a pointer."
+text      16    61   386    29  #ff0f8a6a  21px,bold         "Twenty-one at 1024, fifteen at 420."
+text      16   102   281    21  #ff0f8a6a  15px,bold         "Fifteen at 1024, twenty-one at 420."
+# glyph-gaps (none)
+

@@ -1,0 +1,12 @@
+# page serif.html  viewport=1024
+# title file:///serif.html
+# content 1024x227  background=ff121212  links=0
+text       8    30   208    42  #ffd8d8d8  30px,bold         "Serif heading"
+text       8    86    88    21  #ffd8d8d8  15px              "Serif body "
+text      96    86    48    21  #ffd8d8d8  15px,italic       "italic"
+text     152    86    32    21  #ffd8d8d8  15px,bold         "bold"
+text       8   119    72    21  #ffd8d8d8  15px              "Sans body"
+text       8   152   161    22  #ffd8d8d8  16px,bold         "Shorthand serif bold"
+text       8   186   117    21  #ffd8d8d8  15px,mono         "Mono fallback"
+# glyph-gaps (none)
+

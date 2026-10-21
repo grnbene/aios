@@ -1,0 +1,20 @@
+# page text.html  viewport=900x600
+# title Type scale
+# content 900x297  background=ffffffff  links=1
+text      16    16   511    44  #ff202020  32px,bold         "A heading at thirty-two pixels"
+text      16    80   313    33  #ff202020  24px,bold         "A heading at twenty-four"
+text      16   129   211    26  #ff202020  19px,bold         "A heading at nineteen"
+text      16   167   360    21  #ff202020  15px              "Body copy sits at the inherited size, and an "
+text     376   167    88    21  #ff0f6ab0  15px             u link=0  "inline link"
+text     464   167   392    21  #ff202020  15px              " on the same line has to share a baseline with it"
+text      16   188   368    21  #ff202020  15px              "rather than sitting on the line's bottom edge."
+text      16   221    32    21  #ff202020  15px,bold         "Bold"
+text      48   221    16    21  #ff202020  15px              ", "
+text      64   221    48    21  #ff202020  15px,italic       "italic"
+text     112   221    48    21  #ff202020  15px              ", and "
+text     160   223   105    18  #ff202020  13px,mono         "monospace(code)"
+text     265   221   144    21  #ff202020  15px              " in one paragraph."
+text      16   254   192    15  #ff707070  11px              "Fine print, eleven pixels, grey."
+link    376   167    88    21  file:///next  "inline link"
+# glyph-gaps (none)
+

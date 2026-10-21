@@ -1,0 +1,124 @@
+face order_desk
+title "Order Desk"
+kind purchase_order key=id
+
+# Every figure is computed from the purchase orders actually stored. This app
+# used to print "$42,850", "3 pending", "1.4 days", "$128,400", "78.4%",
+# "64%", a gauge at 82 and a made-up revenue sparkline, seed four fictional
+# orders on every load, and pre-fill the form with an invented customer.
+
+let orders = latest(list(purchase_order), id)
+let order_count = count(orders)
+let revenue = sum(orders, amount)
+let pending = count(where(orders, status, "Pending"))
+let fulfilled = count(where(orders, status, "Fulfilled"))
+let avg_order = if(order_count > 0, revenue / order_count, 0)
+let largest = if(order_count > 0, max(orders, amount), 0)
+
+state active_tab = "Orders"
+state new_po = ""
+state new_customer = ""
+state new_email = ""
+state new_tier = "Standard"
+state new_qty = 1
+state new_discount = 0
+state new_shipping = "Ground"
+state new_rush = false
+state new_tax_exempt = false
+state status_msg = ""
+
+let unit_price = if(new_tier == "Enterprise", 185.0, if(new_tier == "Professional", 120.0, 65.0))
+let subtotal = new_qty * unit_price
+let discount_amt = round(subtotal * (new_discount / 100.0), 2)
+let discounted_subtotal = subtotal - discount_amt
+let tax_rate = if(new_tax_exempt, 0.0, 0.0825)
+let tax_amt = round(discounted_subtotal * tax_rate, 2)
+let shipping_fee = if(new_shipping == "Overnight", 50.0, if(new_shipping == "Express", 30.0, 12.0))
+let rush_fee = if(new_rush, 75.0, 0.0)
+let grand_total = discounted_subtotal + tax_amt + shipping_fee + rush_fee
+let total_formatted = format_currency(grand_total, "$")
+let subtotal_formatted = format_currency(subtotal, "$")
+let summary = if(order_count == 0, "No orders yet - create one to start the ledger.", str(order_count) + " orders on file")
+
+toolbar gap=8
+  button "New Order" action=on_new_order primary
+  button "Record Order" action=on_submit
+
+tabs id=active_tab options="Orders,Create Order,Financials,By Tier" action=on_tab_change
+
+row gap=12 if=(active_tab == "Orders")
+  column gap=8
+    row gap=8
+      tile label="Orders" value=order_count
+      tile label="Booked" value=format_currency(revenue, "$") accent=ok
+      tile label="Pending" value=pending accent=warn
+      tile label="Fulfilled" value=fulfilled accent=accent
+    panel "Purchase order ledger" pad=12
+      table orders columns="id:Order #, customer:Organization, tier:Tier, qty:Units:right, total:Total:right, status:Status" rows=10 empty="No orders yet"
+    text "{summary}" dim
+    text "{status_msg}" dim
+
+row gap=12 if=(active_tab == "Create Order")
+  column gap=8
+    panel "Organization & Contact" pad=14
+      field id=new_po placeholder="PO number" width=220 focus
+      field id=new_customer placeholder="Customer / organization" width=340
+      field id=new_email placeholder="Billing contact email" width=340
+      select id=new_tier options="Standard,Professional,Enterprise" label="Tier"
+    panel "Volume & Logistics" pad=14
+      slider id=new_qty min=1 max=100 step=1 label="Units"
+      slider id=new_discount min=0 max=30 step=5 label="Discount %"
+      select id=new_shipping options="Ground,Express,Overnight" label="Shipping"
+  column gap=8
+    panel "Cost breakdown" pad=14
+      row gap=8
+        tile label="Subtotal" value=subtotal_formatted
+        tile label="Discount" value=format_currency(discount_amt, "$")
+      row gap=8
+        tile label="Tax" value=format_currency(tax_amt, "$")
+        tile label="Total" value=total_formatted accent=ok
+      spacer size=8
+      button "Record purchase order" action=on_submit primary
+      text "{status_msg}" dim
+
+row gap=12 if=(active_tab == "Financials")
+  column gap=8
+    panel "From the ledger" pad=14
+      row gap=8
+        tile label="Total booked" value=format_currency(revenue, "$") accent=ok
+        tile label="Average order" value=format_currency(avg_order, "$")
+        tile label="Largest order" value=format_currency(largest, "$")
+
+row gap=12 if=(active_tab == "By Tier")
+  column gap=8
+    panel "Orders by tier" pad=14
+      row gap=8
+        tile label="Enterprise" value=count(where(orders, tier, "Enterprise")) accent=accent
+        tile label="Professional" value=count(where(orders, tier, "Professional"))
+        tile label="Standard" value=count(where(orders, tier, "Standard"))
+
+on on_tab_change:
+  set status_msg = ""
+
+on on_new_order:
+  set active_tab = "Create Order"
+  set status_msg = ""
+  focus new_po
+
+on on_submit:
+  if new_po == "":
+    set status_msg = "Enter a PO number first."
+    set active_tab = "Create Order"
+    focus new_po
+  else:
+    if new_customer == "":
+      set status_msg = "Enter the customer first."
+      set active_tab = "Create Order"
+      focus new_customer
+    else:
+      put purchase_order {id: new_po, customer: new_customer, email: new_email, tier: new_tier, qty: new_qty, total: total_formatted, amount: grand_total, status: "Pending"}
+      set status_msg = "Recorded " + new_po + " for " + total_formatted
+      set new_po = ""
+      set new_customer = ""
+      set new_email = ""
+      set active_tab = "Orders"

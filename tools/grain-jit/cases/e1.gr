@@ -1,0 +1,4 @@
+fn inner(x) { return x + "s" }
+fn outer(x) { return inner(x * 2) }
+print("before")
+outer(3)

@@ -1,0 +1,4 @@
+fn fib(n) { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }
+let t0 = time_ms()
+let r = fib(27)
+print("fib(27) = " + str(r) + " in " + str(time_ms() - t0) + " ms")

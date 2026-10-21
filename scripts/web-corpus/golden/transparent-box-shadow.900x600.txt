@@ -1,0 +1,7 @@
+# page transparent-box-shadow.html  viewport=900x600
+# title Box shadow on transparent box
+# content 900x66  background=ffffffff  links=0
+rect       0     6   200    60  #66000000  blur=12
+text       0     0   120    21  #ff1a1a1a  15px              "Transparent box"
+# glyph-gaps (none)
+

@@ -1,0 +1,22 @@
+[Unit]
+# A fleet member run by a user with no sudo (devops in deploy/aos-fleet-sync.sh's
+# roster restarts it with `systemctl --user restart aos-member` after copying
+# a new ~/aos/aios). A systemd --user unit:
+#   install -D -m 644 deploy/aos-fleet/aos-member.service ~/.config/systemd/user/aos-member.service
+#   install -m 600 <cluster key> ~/aos/fleet.key      (and ~/aos/fleet.env for AOS_HUB=...)
+#   systemctl --user daemon-reload && systemctl --user enable --now aos-member
+#   loginctl enable-linger $USER                       (so it runs without a login)
+Description=AOS fleet member (user unit)
+ConditionPathExists=%h/aos/fleet.key
+
+[Service]
+Environment=AOS_HUB=127.0.0.1 AOS_HUB_PORT=7420
+EnvironmentFile=-%h/aos/fleet.env
+# `retry`: a hub that is down when this starts is attached when it comes up,
+# instead of the member sitting detached until the next restart.
+ExecStart=%h/aos/aios --root %h/aos/fleet-root exec "fleet join ${AOS_HUB} ${AOS_HUB_PORT} @%h/aos/fleet.key retry" "sleep 4000000"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

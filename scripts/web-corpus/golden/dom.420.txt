@@ -1,0 +1,12 @@
+# page dom.html  viewport=420
+# title The DOM surface a page uses
+# content 420x137  background=ff111111  links=0
+text       8     8    77    18  #ffdddddd  13px,mono         "onetwothree"
+rect      24    48     4     4  #ffdddddd
+text      38    41     7    18  #ffdddddd  13px,mono         "a"
+rect      24    69     4     4  #ffdddddd
+text      38    62     7    18  #ffdddddd  13px,mono         "b"
+rect       8    95   404    22  #ff1b1b1b
+border     8    95   404    22  #ff2c2c2c
+# glyph-gaps (none)
+

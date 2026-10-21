@@ -1,0 +1,80 @@
+# A Thing's conflicts, side by side: when the systems feeding a SOURCE BY Thing disagree on a field, each
+# conflicted field is drawn as its sides next to each other (thing_conflicts + draw_conflict), with a toggle on
+# each side. Clicking one takes that side (RESOLVE THING .. TAKE), and the Thing's value is that side's from then on.
+#
+#   ASQL_PORT=3307 ASQL_PASSWORD=... ASQL_DB=crm THING=customer aios grain run examples/grain/conflicts.gr
+#
+# Headless it renders to a canvas: the frame before and after a click is saved (CONFLICTS_OUT, default
+# conflicts-before.ppm / conflicts-after.ppm), and CLICK=<source> clicks that side's toggle on the first conflict.
+
+let port = int(getenv("ASQL_PORT", "3307"))
+let login = {user: getenv("ASQL_USER", "root"), password: getenv("ASQL_PASSWORD", ""), database: getenv("ASQL_DB", "")}
+let kind = getenv("THING", "customer")
+let out = getenv("CONFLICTS_OUT", "conflicts")
+
+let row_h = 190
+let width = 760
+let state = {conflicts: [], hits: []}
+
+fn load() {
+  state.conflicts = thing_conflicts(kind, port, login)
+}
+
+fn draw(cv, p) {
+  canvas_clear(cv, "#020617")
+  let open = 0
+  for c in state.conflicts { if c.taken == nil { open = open + 1 } }
+  canvas_draw_text(cv, kind + ": " + str(len(state.conflicts)) + " field(s) the sources disagree on, " + str(open) + " open", 20, 16, "#E2E8F0", 16, "ui_bold")
+  state.hits = []
+  let y = 50
+  for c in state.conflicts {
+    let hits = draw_conflict(cv, 20, y, width - 40, row_h - 16, c)
+    for h in hits { push(state.hits, {conflict: c, source: h.source, x: h.x, y: h.y, w: h.w, h: h.h}) }
+    y = y + row_h
+  }
+  if len(state.conflicts) == 0 {
+    canvas_draw_text(cv, "no conflicts: every source agrees", 20, 60, "#22C55E", 14, "ui")
+  }
+}
+
+fn click(p, ev) {
+  for h in state.hits {
+    if ev.x >= h.x and ev.x <= h.x + h.w and ev.y >= h.y and ev.y <= h.y + h.h {
+      let c = h.conflict
+      asql_exec("RESOLVE THING " + kind + " '" + c.key + "' " + c.field + " TAKE '" + h.source + "'", port, login)
+      print("took " + h.source + " for " + c.key + " " + c.field)
+      load()
+      return true
+    }
+  }
+  return false
+}
+
+load()
+let height = 60 + row_h * max(1, len(state.conflicts))
+let pane = register_pane({title: kind + " conflicts", width: width, height: height, on_draw: draw, on_click: click})
+let cv = pane_render(pane)
+canvas_save_ppm(cv, out + "-before.ppm")
+fn note(c) {
+  if c.taken == nil { return "  (in conflict)" }
+  return "  (took " + c.taken + ")"
+}
+for c in state.conflicts {
+  print(c.key + " " + c.field + ": " + join(map(c.sides, fn (s) { return s.source + "=" + str(s.value) }), ", ") + note(c))
+}
+
+let pick = getenv("CLICK", "")
+if pick != "" {
+  for h in state.hits {
+    if h.source == pick {
+      pane_dispatch_event(pane, {type: "click", x: h.x + 5, y: h.y + 5, button: 1})
+      break
+    }
+  }
+  # the pane redrawn on fresh data (a new canvas, so the first frame stays as it was)
+  let pane2 = register_pane({title: kind + " conflicts", width: width, height: height, on_draw: draw, on_click: click})
+  canvas_save_ppm(pane_render(pane2), out + "-after.ppm")
+  for c in state.conflicts {
+    print("after: " + c.key + " " + c.field + note(c))
+  }
+}

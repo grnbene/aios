@@ -1,0 +1,25 @@
+[Unit]
+# A read-only fleet observer: joins the hub and rewrites the live fleet (every
+# member's identity and load) to /opt/aos/fleet-status.json every 4 s, which
+# aos-fleet-sync.sh --status reads (chi-il-1, atl-ga-1 in its roster).
+# Install: sudo deploy/aos-fleet/install.sh <user> observer
+Description=AOS fleet observer (writes /opt/aos/fleet-status.json)
+After=network-online.target aos-hub.service
+Wants=network-online.target
+ConditionPathExists=/etc/aos/fleet.key
+
+[Service]
+User=@USER@
+# The hub this observer watches: 127.0.0.1 on the hub's own host; set
+# AOS_HUB=<hub address> in /etc/aos/fleet.env anywhere else.
+Environment=AOS_HUB=127.0.0.1 AOS_HUB_PORT=7420
+EnvironmentFile=-/etc/aos/fleet.env
+ExecStart=/opt/aos/aios --root /opt/aos/observer-root exec "fleet observe ${AOS_HUB} ${AOS_HUB_PORT} @/etc/aos/fleet.key /opt/aos/fleet-status.json 4000"
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/opt/aos
+
+[Install]
+WantedBy=multi-user.target

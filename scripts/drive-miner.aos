@@ -1,0 +1,6 @@
+# The miner is a local SHA-256d hashing exercise: it measures, it credits nothing.
+miner status
+miner inspect-hw
+miner work
+miner mine 2 nonces=200000
+miner status

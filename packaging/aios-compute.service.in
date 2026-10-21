@@ -1,0 +1,28 @@
+[Unit]
+Description=AIOS compute service — ASQL in-memory SQL engine
+After=network.target mariadb.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=/opt/aios
+Environment=AIOS_NO_ACCEL=1
+# Transactions run side by side (rows owned as they are written) instead of
+# each holding the one writer lock from BEGIN to COMMIT; see "Transactions"
+# in docs/asql.md. Without it, sessions that wrap their statements in
+# BEGIN ... COMMIT (every ORM, sysbench) serialize on that lock.
+Environment=AIOS_TXN_CONCURRENT=1
+ExecStart=/opt/aios/bin/asql-serve
+Restart=always
+RestartSec=2
+LimitNOFILE=4096
+LimitCORE=infinity
+@MEMORYLIMITS@
+NoNewPrivileges=true
+ProtectSystem=full
+@READWRITEPATHS@
+
+[Install]
+WantedBy=multi-user.target

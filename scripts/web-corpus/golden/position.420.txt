@@ -1,0 +1,13 @@
+# page position.html  viewport=420
+# title Out of flow
+# content 420x228  background=ffffffff  links=0
+rect      16    28   388   120  #ffeef3f7
+text      16    40   272    21  #ff202020  15px              "Normal flow inside a relative box."
+text      16   158   360    21  #ff202020  15px              "This paragraph must not move to make room for"
+text      16   179   136    21  #ff202020  15px              "either box above."
+rect       0   191   184    37  #ff202020
+text       8   199   168    21  #ffffffff  15px              "Fixed to the viewport"
+rect     230    38   164    33  #ff0f6ab0  z=5
+text     236    44   152    21  #ffffffff  15px              "Absolute, top right"  z=5
+# glyph-gaps (none)
+

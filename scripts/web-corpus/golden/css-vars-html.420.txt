@@ -1,0 +1,8 @@
+# page css-vars-html.html  viewport=420
+# title Custom properties on html
+# content 420x44  background=ff223344  links=0
+rect       0     0   204    44  #ff556677
+border     0     0   204    44  #ffffaa33
+text       2     2    96    21  #ffd8d8d8  15px              "Vars on html"
+# glyph-gaps (none)
+

@@ -1,0 +1,18 @@
+# page bubbles.html  viewport=1024
+# title Bubbles against their containing block
+# content 1024x233  background=ff111111  links=0
+rect       2     4   240    43  #ff1b1b1b  r=8
+border     2     4   240    43  #ff333333  r=8
+text      17    16   210    19  #ffdddddd  14px              "Hi — what can I help you with?"
+rect     982    61    40    36  #ff2a2a2a  r=14
+border   982    61    40    36  #ff444444  r=14
+text     995    69    14    20  #fff4f4f4  14px              "hi"
+rect     730   111   292    36  #ff2a2a2a  r=14
+border   730   111   292    36  #ff444444  r=14
+text     743   119   266    20  #fff4f4f4  14px              "name the capital of France in one word"
+rect       2   161   796    62  #ff1b1b1b  r=8
+border     2   161   796    62  #ff333333  r=8
+text      17   173   756    19  #ffdddddd  14px              "A longer agent message, to check that the seventy-eight percent cap is a percentage of the column and not of"
+text      17   192   476    19  #ffdddddd  14px              "the message's own text — which is what made a line that fitted wrap."
+# glyph-gaps (none)
+

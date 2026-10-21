@@ -1,0 +1,18 @@
+# page anchor-boxes.html  viewport=420
+# title anchors that are boxes
+# content 420x154  background=ff121212  links=5
+text       8     8   112    21  #ff6fb6ff  15px             u link=0  "A block anchor"
+text      23    44    24    21  #ff6fb6ff  15px             u link=1  "One"
+text     373    44    24    21  #ff6fb6ff  15px             u link=2  "Two"
+text      32    92   152    21  #ff6fb6ff  15px             u link=3  "inline-block anchor"
+text       8   101    24    21  #ffd8d8d8  15px              "An "
+text     184   101   216    21  #ffd8d8d8  15px              " inside a paragraph, and an"
+text       8   113    96    21  #ff6fb6ff  15px             u link=4  "ordinary one"
+text     104   113     8    21  #ffd8d8d8  15px              "."
+link      8     8   112    21  https://example.com/block  "A block anchor"
+link     23    44    24    21  https://example.com/one  "One"
+link    373    44    24    21  https://example.com/two  "Two"
+link     32    92   152    21  https://example.com/cell  "inline-block anchor"
+link      8   113    96    21  https://example.com/plain  "ordinary one"
+# glyph-gaps (none)
+

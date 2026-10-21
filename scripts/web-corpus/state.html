@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><title>The page at rest</title><link rel="stylesheet" href="site.css">
+<style>
+.label { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #707070; }
+.msg { position: relative; padding: 14px; background: rgba(0,0,0,0.06); border-radius: 10px; margin-bottom: 14px; }
+.act { position: absolute; top: -10px; right: 8px; width: 22px; height: 22px; border-radius: 50%;
+       background: #b03a4a; opacity: 0; }
+.msg:hover .act { opacity: 1; }
+.row:hover { background: #b03a4a; }
+.dim { opacity: 0.55; }
+.gone { opacity: 0; }
+.tight { letter-spacing: -1px; }
+.caps { text-transform: capitalize; }
+input:checked + span { font-weight: bold; color: #0f8a6a; }
+input:disabled + span { text-decoration: line-through; }
+</style></head>
+<body><div class="wrap">
+<p class="label">Conversations</p>
+<div class="msg">A message. Its edit button is at opacity zero and must not be drawn.<span class="act"></span></div>
+<p class="row">A row whose hover background must not be painted.</p>
+<p class="dim">Dimmed to fifty-five percent.</p>
+<p class="gone">At opacity zero: laid out, not painted.</p>
+<p class="tight">Tightened by a pixel.</p>
+<p class="caps">capitalised by the page, not the markup.</p>
+<p><input type="checkbox" name="a" checked><span>checked, so bold and green</span>
+   <input type="checkbox" name="b"><span>unchecked, so plain</span></p>
+<p><input type="text" name="c" disabled value="x"><span>disabled, so struck</span></p>
+</div></body></html>

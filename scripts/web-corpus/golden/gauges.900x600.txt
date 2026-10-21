@@ -1,0 +1,20 @@
+# page gauges.html  viewport=900x600
+# title file:///gauges.html
+# content 900x127  background=ff121212  links=0
+text       8    24    72    21  #ffd8d8d8  15px              "Download "
+rect      80    20   160    16  #00000000
+rect      80    20   160    16  #ffe6e6e6  r=8
+rect      80    20    64    16  #ff0075ff  r=8
+text       8    57    40    21  #ffd8d8d8  15px              "Busy "
+rect      48    53   160    16  #00000000
+rect      48    53   160    16  #ffe6e6e6  r=8
+rect      48    53    48    16  #ff0075ff  r=8
+text       8    90    40    21  #ffd8d8d8  15px              "Disk "
+rect      48    86    80    16  #00000000
+rect      48    86    80    16  #ffe6e6e6  r=8
+rect      48    86    48    16  #ff10a010  r=8
+rect     136    86    80    16  #00000000
+rect     136    86    80    16  #ffe6e6e6  r=8
+rect     136    86    16    16  #ffe04040  r=8
+# glyph-gaps (none)
+

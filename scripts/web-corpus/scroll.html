@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><title>A pane that scrolls</title><style>body{background:#111;color:#ddd;font:15px sans-serif;margin:0;padding:20px}
+.frame{height:120px;overflow:auto;border:1px solid #555;border-radius:8px;padding:8px;background:#1a1a1a}
+.after{margin-top:12px;color:#0a6}
+</style></head><body>
+<div class="frame">
+<p>line one</p><p>line two</p><p>line three</p><p>line four</p><p>line five</p><p>line six</p><p>line seven</p>
+</div>
+<p class="after">Below the frame. It must not move when the frame does.</p>
+<div class="frame" style="overflow:hidden">
+<p>hidden, not auto</p><p>so this box is NOT a scroller</p><p>three</p><p>four</p><p>five</p><p>six</p>
+</div>
+</body></html>

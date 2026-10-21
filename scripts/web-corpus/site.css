@@ -1,0 +1,9 @@
+/* Pulled in with <link>, so the corpus also drives collect_author_css. */
+body { font-family: sans-serif; color: #202020; background: #ffffff; margin: 0; }
+.wrap { padding: 16px; }
+h1 { font-size: 32px; font-weight: bold; margin: 0 0 12px; }
+h2 { font-size: 24px; margin: 20px 0 8px; }
+h3 { font-size: 19px; margin: 16px 0 6px; }
+small, .fine { font-size: 11px; color: #707070; }
+code { font-family: monospace; font-size: 13px; }
+a { color: #0f6ab0; text-decoration: underline; }

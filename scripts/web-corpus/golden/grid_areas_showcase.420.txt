@@ -1,0 +1,77 @@
+# page grid_areas_showcase.html  viewport=420
+# title AIOS Grid Template Areas & Responsive Layout
+# content 420x700  background=ff0f172a  links=0
+rect       0     0   420    90  #ff1e293b  r=8
+border     0     0   420    90  #ff334155  r=8
+text      25    17   288    28  #ff38bdf8  20px,bold         "AIOS Hardware Compositor &"
+text      25    45   154    28  #ff38bdf8  20px,bold         "Browser Engine"
+text     325    27    56    18  #ff22c55e  13px              "● System"
+text     325    45    42    18  #ff22c55e  13px              "Active"
+rect       0   106   260   273  #ff1e293b  r=8
+border     0   106   260   273  #ff334155  r=8
+text      21   127    71    19  #fff8fafc  14px,bold         "Navigation"
+rect      21   158   218    34  #ff0284c7  r=4
+text      33   166   105    18  #ffffffff  13px,bold         "CSS Grid Engine"
+rect      21   198   218    34  #ff0f172a  r=4
+text      33   206   140    18  #ff94a3b8  13px              "DOM Parser & Cascade"
+rect      21   238   218    34  #ff0f172a  r=4
+text      33   246   133    18  #ff94a3b8  13px              "Hardware Compositor"
+rect      21   278   218    34  #ff0f172a  r=4
+text      33   286   161    18  #ff94a3b8  13px              "Memory & Storage Fabric"
+rect      21   318   218    34  #ff0f172a  r=4
+text      33   326   119    18  #ff94a3b8  13px              "Kernel Dispatcher"
+rect     276   106   144   441  #ff1e293b  r=8
+border   276   106   144   441  #ff334155  r=8
+rect     301   131    20   334  #ff0f172a  r=6
+border   301   131    20   334  #ff334155  r=6
+text     318   148    16    21  #fff1f5f9  15px,bold         "G…"
+text     318   169    16    21  #fff1f5f9  15px,bold         "M…"
+text     318   190    16    21  #fff1f5f9  15px,bold         "P…"
+text     318   223    60    39  #ff38bdf8  28px,bold         "100%"
+text     318   268    14    20  #ff94a3b8  13px              "F…"
+text     318   288    14    20  #ff94a3b8  13px              "s…"
+text     318   308    14    20  #ff94a3b8  13px              "f…"
+text     318   328    14    20  #ff94a3b8  13px              "g…"
+text     318   348    14    20  #ff94a3b8  13px              "n…"
+text     318   368    14    20  #ff94a3b8  13px              "t…"
+text     318   388    14    20  #ff94a3b8  13px              "a…"
+text     318   408    14    20  #ff94a3b8  13px              "e…"
+text     318   428    14    20  #ff94a3b8  13px              "p…"
+rect     337   131    20   391  #ff0f172a  r=6
+border   337   131    20   391  #ff334155  r=6
+text     354   148    16    21  #fff1f5f9  15px,bold         "T…"
+text     354   169    16    21  #fff1f5f9  15px,bold         "S…"
+text     354   202    30    39  #ff38bdf8  28px,bold         "px"
+text     354   241    15    39  #ff38bdf8  28px,bold         "/"
+text     354   280    30    39  #ff38bdf8  28px,bold         "fr"
+text     354   325    14    20  #ff94a3b8  13px              "D…"
+text     354   345    14    20  #ff94a3b8  13px              "f…"
+text     354   365    14    20  #ff94a3b8  13px              "t…"
+text     354   385    14    20  #ff94a3b8  13px              "c…"
+text     354   405    14    20  #ff94a3b8  13px              "w…"
+text     354   425    14    20  #ff94a3b8  13px              "e…"
+text     354   445    14    20  #ff94a3b8  13px              "p…"
+text     354   465    14    20  #ff94a3b8  13px              "b…"
+text     354   485    14    20  #ff94a3b8  13px              "a…"
+rect     373   131    20   373  #ff0f172a  r=6
+border   373   131    20   373  #ff334155  r=6
+text     390   148    16    21  #fff1f5f9  15px,bold         "C…"
+text     390   169    16    21  #fff1f5f9  15px,bold         "F…"
+text     390   190    16    21  #fff1f5f9  15px,bold         "r…"
+text     390   223    30    39  #ff38bdf8  28px,bold         "60"
+text     390   262    45    39  #ff38bdf8  28px,bold         "FPS"
+text     390   307    14    20  #ff94a3b8  13px              "D…"
+text     390   327    14    20  #ff94a3b8  13px              "z…"
+text     390   347    14    20  #ff94a3b8  13px              "g…"
+text     390   367    14    20  #ff94a3b8  13px              "p…"
+text     390   387    14    20  #ff94a3b8  13px              "t…"
+text     390   407    14    20  #ff94a3b8  13px              "t…"
+text     390   427    14    20  #ff94a3b8  13px              "h…"
+text     390   447    14    20  #ff94a3b8  13px              "c…"
+text     390   467    14    20  #ff94a3b8  13px              "s…"
+rect       0   563   420    42  #ff1e293b  r=8
+border     0   563   420    42  #ff334155  r=8
+text      25   576   168    16  #ff64748b  12px              "AIOS Userland Browser Engine"
+text     245   576   150    16  #ff64748b  12px              "Status: Operating cleanly"
+# glyph-gaps (none)
+

@@ -1,0 +1,13 @@
+# The program the machine could not express an hour ago.
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+for i in range(0, 10) {
+  print("fib(" + str(i) + ") =", fib(i))
+}
+
+let started = clock()
+let big = fib(24)
+print("fib(24) =", big, "in", int(clock() - started), "ms")

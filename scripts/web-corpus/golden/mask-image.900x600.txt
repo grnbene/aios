@@ -1,0 +1,6 @@
+# page mask-image.html  viewport=900x600
+# title Mask image
+# content 900x40  background=ff121212  links=0
+image      0     0    40    40  #ff0f8a6a  src=file:///icon.svg alt="" mask=true
+# glyph-gaps (none)
+

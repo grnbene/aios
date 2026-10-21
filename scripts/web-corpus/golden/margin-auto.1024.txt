@@ -1,0 +1,19 @@
+# page margin-auto.html  viewport=1024
+# title margin auto
+# content 1024x153  background=ff121212  links=0
+rect     362     0   300    21  #ffcc3333
+text     362     0   136    21  #ffd8d8d8  15px              "max-width centred"
+rect     412    21   200    21  #ff33cc33
+text     412    21   104    21  #ffd8d8d8  15px              "width centred"
+rect     824    42   200    21  #ff3333cc
+text     824    42    96    21  #ffd8d8d8  15px              "pushed right"
+rect       0    63   200    21  #ffcccc33
+text       0    63    88    21  #ffd8d8d8  15px              "pinned left"
+rect     362    90   300    21  #ff33cccc
+text     372    90   208    21  #ffd8d8d8  15px              "padded, shorthand 3 values"
+rect       0   111  1024    21  #ffcccccc
+text       0   111   120    21  #ffd8d8d8  15px              "no width: fills"
+rect     362   132   300    21  #ffcc3333
+text     362   132   128    21  #ffd8d8d8  15px              "in a column flex"
+# glyph-gaps (none)
+

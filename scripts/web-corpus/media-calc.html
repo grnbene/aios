@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><title>Media calc queries</title>
+<style>
+body { margin: 0; }
+.card { width: 200px; height: 50px; background: #888; }
+@media (min-width: calc(500px + 100px)) {
+  .card { background: #0f8a6a; }
+}
+@media (max-width: calc(600px - 100px)) {
+  .card { background: #b03a4a; }
+}
+</style></head>
+<body>
+<div class="card">Card</div>
+</body></html>

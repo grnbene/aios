@@ -1,0 +1,2 @@
+# shell scripts run under Git Bash on Windows too: a CRLF checkout would break them
+*.sh text eol=lf

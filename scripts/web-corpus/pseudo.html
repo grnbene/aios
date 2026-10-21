@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><title>Functional pseudo-classes</title><link rel="stylesheet" href="site.css">
+<style>
+:is(h2, h3) { color: #0f6ab0; }
+p:where(.a, .b) { font-weight: bold; }
+p:not(.a, .b) { font-style: italic; }
+:is(.card) p { font-size: 17px; }
+li:nth-child(2n + 1) { font-weight: bold; }
+li:nth-child(3) { color: #b03a4a; }
+</style></head>
+<body><div class="wrap">
+<h2>Blue by :is</h2>
+<h3>Also blue</h3>
+<h4>Not blue</h4>
+<p class="a">Bold, listed in :where</p>
+<p class="c">Italic, excluded by :not</p>
+<div class="card"><p class="b">Bold and seventeen</p></div>
+<ul><li>one, bold</li><li>two, plain</li><li>three, bold and red</li><li>four, plain</li></ul>
+</div></body></html>

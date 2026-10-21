@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><title>Grid track sizing</title>
+<style>
+.grid1 { display: grid; grid-template-columns: auto min-content max-content minmax(0, 100px) 1fr; gap: 10px; width: 600px; }
+.grid1 > div { background: #eee; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 40px 40px; gap: 10px; width: 300px; margin-top: 20px; }
+.span-row { grid-row: 1 / span 2; background: #cce; }
+.cell { background: #ecc; }
+</style></head>
+<body>
+<div class="grid1">
+  <div>Auto text</div>
+  <div>Min content item</div>
+  <div>Max content item</div>
+  <div>Capped minmax</div>
+  <div>Fraction track</div>
+</div>
+<div class="grid2">
+  <div class="span-row">Spans two rows</div>
+  <div class="cell">Row 1</div>
+  <div class="cell">Row 2</div>
+</div>
+</body></html>

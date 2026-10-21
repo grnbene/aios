@@ -1,0 +1,12 @@
+# page table-colspan.html  viewport=900x600
+# title Table Colspan
+# content 900x182  background=ffffffff  links=0
+text      16    36   299    33  #ff202020  24px,bold         "Colspan and row spacing"
+text      16    81    16    21  #ff202020  15px              "1."
+text      48    81     8    21  #ff202020  15px              "^"
+text      72    81   176    21  #ff202020  15px              "First story title here"
+text      72   102   352    21  #ff202020  15px              "100 points by user 2 hours ago | 42 comments"
+text      16   133    56    21  #ff202020  15px              "Notice:"
+text      72   133   288    21  #ff202020  15px              "Second story title following colspan"
+# glyph-gaps (none)
+

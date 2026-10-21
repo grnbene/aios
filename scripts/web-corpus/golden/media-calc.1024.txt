@@ -1,0 +1,7 @@
+# page media-calc.html  viewport=1024
+# title Media calc queries
+# content 1024x50  background=ff121212  links=0
+rect       0     0   200    50  #ff0f8a6a
+text       0     0    32    21  #ffd8d8d8  15px              "Card"
+# glyph-gaps (none)
+

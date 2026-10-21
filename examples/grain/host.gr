@@ -1,0 +1,45 @@
+# Host-only natives (cli/grain_host.cpp): sockets and sys_exec exist for
+# `aios grain` on a hosted machine, not on the Pi or in the sidecar sandbox.
+# Run: aios grain run examples/grain/host.gr
+
+let failures = 0
+let checks = 0
+fn check(label, got, want) {
+  checks = checks + 1
+  if got == want {
+    print("  ok   ", label)
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+
+print("system")
+check("time_us positive", time_us() > 0, true)
+let exec_res = sys_exec("echo 'grain_test_ok'")
+check("sys_exec echo", trim(exec_res.output), "grain_test_ok")
+check("sys_exec ok", exec_res.ok, true)
+
+print("udp")
+let us = udp_socket()
+if us != nil {
+  let bound = udp_bind(us, "127.0.0.1", 49152)
+  if bound {
+    let sent = udp_send(us, "127.0.0.1", 49152, "grain_udp_packet")
+    check("udp send bytes", sent, 16)
+    let pkt = udp_recv(us, 100)
+    if pkt != nil {
+      check("udp recv payload", pkt.data, "grain_udp_packet")
+      check("udp recv sender port", pkt.port, 49152)
+    }
+  }
+  udp_close(us)
+}
+
+
+print("tcp")
+check("tcp to a closed port is an error", pcall(fn () { return tcp_connect("127.0.0.1", 1, 500) }).ok, false)
+check("sys_exec exit code", sys_exec("exit 3").code, 3)
+
+print("")
+if failures == 0 { print("host:", checks, "checks, all agreed") } else { print("host:", failures, "of", checks, "WRONG") }

@@ -1,0 +1,29 @@
+# page platform.html  viewport=1024
+# title The platform a page script runs against
+# content 1024x234  background=ff111111  links=0
+text       8    20    21    18  #ffdddddd  13px,mono         "one"
+text       8    50    28    18  #ffdddddd  13px,mono         "two "
+text      36    50    28    18  #ffdddddd  13px,bold,mono    "bold"
+rect       8    98   156    26  #ff202020
+border     8    98   156    26  #ff3d3d3d
+text      16   102   140    18  #ffdcdcdc  13px,mono         "init"
+rect     164    98    37    26  #ff202020
+border   164    98    37    26  #ff3d3d3d
+text     172   102    21    18  #ffdcdcdc  13px,mono         "[ ]"
+rect     201    98    44    26  #ff202020
+border   201    98    44    26  #ff3d3d3d
+text     209   102    28    18  #ffdcdcdc  13px,mono         "Y  ▾"
+rect     245    80   156    44  #ff202020
+border   245    80   156    44  #ff3d3d3d
+text     253    84   140    36  #ffdcdcdc  13px,mono         "area"
+rect       8   124   156    26  #ff202020
+border     8   124   156    26  #ff3d3d3d
+text      16   128   140    18  #ffdcdcdc  13px,mono         "v1"
+rect     164   124   156    26  #ff202020
+border   164   124   156    26  #ff3d3d3d
+text     172   128   140    18  #ffdcdcdc  13px,mono         "v 2"
+canvas     8   150    40    30  #ffdddddd
+rect       8   192  1008    22  #ff1b1b1b
+border     8   192  1008    22  #ff2c2c2c
+# glyph-gaps (none)
+

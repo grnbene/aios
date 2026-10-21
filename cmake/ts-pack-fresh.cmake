@@ -1,0 +1,21 @@
+# ctest: every grammar's parser_packed.c was made from the parser.c that is in the tree now.
+#   cmake -DROOT=<source dir> -P cmake/ts-pack-fresh.cmake
+# The packed file's first line carries the SHA-256 of the parser.c it came from (aios-ts-pack writes it).
+include(${ROOT}/cmake/ts-grammars.cmake)
+set(stale 0)
+foreach(grammar IN LISTS AIOS_TS_GRAMMARS)
+  string(REPLACE "|" ";" row "${grammar}")
+  list(GET row 0 id)
+  list(GET row 1 dir)
+  set(dir "${ROOT}/third_party/tree-sitter-grammars/${dir}")
+  file(SHA256 "${dir}/parser.c" want)
+  file(STRINGS "${dir}/parser_packed.c" first LIMIT_COUNT 1)
+  string(FIND "${first}" "${want}" at)
+  if(at EQUAL -1)
+    message(SEND_ERROR "stale: ${dir}/parser_packed.c does not match parser.c; run: cmake --build <build> --target ts-pack")
+    set(stale 1)
+  endif()
+endforeach()
+if(NOT stale)
+  message(STATUS "every parser_packed.c matches its parser.c")
+endif()

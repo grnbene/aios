@@ -1,0 +1,12 @@
+let s = 0
+for v in [1, 2.5, "x", nil, true, [1], 7] { s = s + 1 print(v) }
+for c in "hé" { print(c) }
+for k in {a: 1, b: 2} { print(k) }
+fn nested() { let t = 0 for i in range(0, 50) { for j in range(0, i) { t = t + j } } return t }
+print(nested(), s)
+fn early() { for i in range(0, 100) { if i == 7 { return i } } return -1 }
+print(early())
+fn brk() { let t = 0 for i in range(0, 100) { if i > 5 { break } t = t + i } return t }
+print(brk())
+fn cont() { let t = 0 for i in range(0, 10) { if i % 2 == 0 { continue } t = t + i } return t }
+print(cont())

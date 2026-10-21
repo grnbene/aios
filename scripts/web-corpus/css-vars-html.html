@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><title>Custom properties on html</title>
+<style>
+html {
+  --page-bg: #223344;
+  --card-bg: #556677;
+  --accent: #ffaa33;
+}
+body {
+  margin: 0;
+  background: var(--page-bg);
+}
+.box {
+  width: 200px;
+  height: 40px;
+  background: var(--card-bg);
+  border: 2px solid var(--accent);
+}
+</style></head>
+<body>
+<div class="box">Vars on html</div>
+</body></html>

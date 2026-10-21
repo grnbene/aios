@@ -1,0 +1,34 @@
+# Node A: attaches node B, then computes there, holds memory there, and
+# publishes state into a channel that lives there.
+entity create traveller => t
+cap grant $t kernel * schedule
+cap grant $t compute * execute
+cap grant $t network * publish
+node connect 127.0.0.1 47311 lab-shared-secret
+devices
+tensor create $t f32 2x3 1 2 3 4 5 6       => A
+tensor create $t f32 3x2 7 8 9 10 11 12    => B
+tensor create $t f32 2x2                   => C
+tensor create $t f32 1                     => S
+graph create $t                            => g
+graph op $t $g matmul in=$A:f32:2x3 in=$B:f32:3x2 out=$C:f32:2x2 dev=remote-cpu
+graph op $t $g reduce-sum in=$C:f32:2x2 out=$S:f32:1 dev=remote-cpu
+graph plan $t $g
+graph run $t $g
+tensor show $t $C f32 2x2
+tensor show $t $S f32 1
+# the operands now live on node B (type remote); the identity did not change
+mem list $t
+# explicit remote memory: allocate, write, read back through the mirror
+mem alloc $t 64 remote                      => rm
+mem write $t $rm 0 "bytes held on node B"
+mem read $t $rm 0 20
+expect "bytes held on node B"
+# a channel that lives on node B; publish state into it from here
+channel create $t 8 512 transport=$transport => ch
+state create $t working "published from node A" => st
+channel publish $t $ch $st
+channel consume $t $ch
+expect "published from node A"
+node list
+info

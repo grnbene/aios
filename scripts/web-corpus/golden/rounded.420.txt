@@ -1,0 +1,22 @@
+# page rounded.html  viewport=420
+# title Rounded and translucent
+# content 420x411  background=ffffffff  links=0
+rect      16    16   388   138  #0fffffff  r=12
+border    16    16   388   138  #26ffffff  r=12
+text      31    47    60    26  #ff202020  19px,bold         "A card"
+text      31    85   336    21  #ff202020  15px              "A wash six percent above the ground, and a"
+text      31   106   192    21  #ff202020  15px              "corner radius of twelve."
+rect      16   166    72    29  #1affffff  r=999
+text      28   170    48    21  #ff202020  15px              "A pill"
+rect      96   185    10    10  #ff19c37d  r=9999
+text     106   183   216    21  #ff202020  15px              " a circle at fifty percent."
+rect      16   207   388    41  #66000000
+text      26   217   256    21  #ff202020  15px              "Square, and forty percent black."
+rect      16   268   388    49  #73000000  r=12  blur=18
+rect      16   262   388    49  #14ffffff  r=12
+text      30   276   352    21  #ff202020  15px              "Lifted: a shadow six down, eighteen of blur."
+rect      16   325   388    70  #14ffffff  r=12
+text      30   339   336    21  #ff202020  15px              "Flat: the same card with the shadow turned"
+text      30   360    32    21  #ff202020  15px              "off."
+# glyph-gaps (none)
+

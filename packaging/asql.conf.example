@@ -1,0 +1,79 @@
+# /etc/aios/asql.conf — per-host ASQL configuration.
+#
+# Sourced by /opt/aios/bin/asql-serve, which turns it into the engine's
+# positional key=value arguments. Leave a key empty to use the engine default.
+# This is the ONLY file that should differ between hosts.
+
+AIOS_BIN=/opt/aios/bin/aios
+AIOS_ROOT=/opt/aios/root
+
+# Engine environment. This file is sourced by asql-serve, so an exported
+# variable reaches the engine. The unit already sets AIOS_NO_ACCEL=1 and
+# AIOS_TXN_CONCURRENT=1 (transactions side by side; "Transactions" in
+# docs/asql.md). AIOS_SQL_STRICT=1 refuses an INSERT or UPDATE whose value
+# does not fit its column, as MariaDB's STRICT_TRANS_TABLES does; leave it
+# off for a MariaDB that runs with sql_mode empty ("Strict mode" in the docs).
+#export AIOS_SQL_STRICT=1
+
+# Raw JSON RPC socket, worker lanes, and the ASQL engine toggle.
+RPC_PORT=7311
+LANES=8
+SQL=1
+SQL_DB=sql_db
+PUBLIC=1
+MAX_POINTS=15
+
+# MySQL wire listener. Leave MYSQL_BIND empty to keep the engine default;
+# set 127.0.0.1 to refuse anything that is not loopback.
+MYSQL_PORT=3307
+MYSQL_BIND=127.0.0.1
+MYSQL_USER=erp
+# Unix-domain socket for same-host clients: no TCP stack, about 10 us less per
+# round trip than :3307. Leave empty to disable. The directory is created by
+# install-asql.sh.
+MYSQL_SOCKET=/opt/aios/run/asql.sock
+# Directory where the engine publishes <database>.tables (one table per line),
+# rewritten after each CDC apply that changes a database's tables. The ERP's
+# AIOS_ASQL_TABLES_DIR points here and reads it instead of SHOW TABLES per
+# request. Must be readable by the PHP user. Empty = not published.
+TABLES_DIR=/opt/aios/run/tables
+# 1 = honour each client's connection charset like MariaDB (a latin1 client,
+# e.g. PHP's default, is sent cp1252 bytes). Empty/0 = always UTF-8, as before.
+MYSQL_CHARSET=
+# TLS on the MySQL wire: a PEM certificate chain and its key (RSA or ECDSA,
+# readable by user aios). Clients that ask for SSL get TLS 1.3 / 1.2.
+# MYSQL_TLS_REQUIRE=1 refuses unencrypted logins from other hosts (MariaDB's
+# require_secure_transport); the unix socket and loopback stay open.
+MYSQL_TLS_CERT=
+MYSQL_TLS_KEY=
+MYSQL_TLS_REQUIRE=
+MYSQL_PASS_FILE=/opt/aios/mysql.pass
+# Database aios-asql-console and aios-asql-top open by default (empty = CDC_DB).
+MYSQL_DB=
+TOKEN_FILE=/opt/aios/compute.token
+
+# Upstream MariaDB to replicate from over binlog CDC.
+CDC_HOST=127.0.0.1
+CDC_PORT=3306
+CDC_USER=replicator
+CDC_PASS_FILE=/opt/aios/cdc.pass
+# The source database to mirror. Required whenever CDC_HOST is set.
+CDC_DB=
+
+# Binlog coordinates. Leave both empty to let the engine discover the current
+# position; pin them only when resuming a known stream.
+CDC_LOG_FILE=
+CDC_LOG_POS=
+
+# Table whitelist — only these are ingested, which is what keeps RAM bounded.
+CDC_TABLES=stocktrans,banktrans,clubs_joined,companies,currencies,custbranch,debtorsmaster,debtortrans,debtortranstaxes,debtortype,dispatch,dispatch_status,grns,holdreasons,locationusers,locstock,manufacturer,oms_snoozed,order_cancellations,order_status,paymentterms,periods,pickingfreeze,product_to_manufacturer,productlines,purchdata,purchorderdetails,purchorders,salesman,salesorderdetails,salesorderpaymentmethod,salesorders,salestypes,shippers,stockcategory,stockmaster,stockmoves,stockmovestaxes,suppallocs,suppcredittogrn,suppinvstogrn,suppliers,suppliertype,supptrans,supptranstaxes,systypenames,systypes,taxauthorities,taxauthrates,taxgroups,taxgrouptaxes,territory,trackinginfo,www_users,chartdetails,chartmaster,credit_cards,credit_cards_net,creditorders,custallocns,custcontacts,gltrans,prices,product_description,product_to_image,product_types,quote_details,quotes,reserveinvoice,salesordertopurchaseorder,statements,apikeys
+
+# Fleet membership (optional). With all three set, asql-serve joins this hub
+# before serving, and fleet members can query this engine with sql_on() /
+# ... ON <machine> over the encrypted node link - reads only (compute serve's
+# engine never takes fleet writes). A hub that is down does not hold the SQL
+# service back: the join keeps retrying in the background. Leave all three
+# empty to stay out of any fleet.
+FLEET_HOST=
+FLEET_PORT=
+FLEET_KEY_FILE=

@@ -1,0 +1,12 @@
+# Node B: serves its kernel. A peer kernel becomes a guest entity here.
+info
+node serve 47311 lab-shared-secret
+sleep 25
+echo --- after the peer's session
+node peers
+set guest
+# The guest goes with the session: node_service ends a peer's guest when its
+# connection drops, so it must NOT still resolve here.
+expect-error "not-found" entity show $guest
+info
+

@@ -1,0 +1,5 @@
+let t0 = time_ms()
+let i = 0
+let s = 0
+while i < 500000 { s = s + i % 7  i = i + 1 }
+print("loop 500k: " + str(s) + " in " + str(time_ms() - t0) + " ms")

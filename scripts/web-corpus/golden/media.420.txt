@@ -1,0 +1,9 @@
+# page media.html  viewport=420
+# title What this screen is
+# content 420x172  background=ffffffff  links=0
+text      16    28   385    21  #ff0f8a6a  15px,bold         "Green and bold: this machine is dark, landscape,"
+text      16    49   145    21  #ff0f8a6a  15px,bold         "and has a pointer."
+text      16    82   281    21  #ff0f8a6a  15px,bold         "Twenty-one at 1024, fifteen at 420."
+text      16   115   386    29  #ff0f8a6a  21px,bold         "Fifteen at 1024, twenty-one at 420."
+# glyph-gaps (none)
+

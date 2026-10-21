@@ -1,0 +1,9 @@
+fn m(a, b) { return a % b }
+print(m(7, 3), m(-7, 3), m(7, -3), m(-7, -3), m(0, 5), m(-9223372036854775807 - 1, -1), m(7.5, 2), m(-7.5, 2))
+fn swap() { let a = [1] let b = "s" let t = a a = b b = t a = a b = b let c = {k: a} c = nil a = nil return [b, a, c] }
+print(swap())
+fn drop_last() { let l = [1, 2, 3] l = 5 return l }
+print(drop_last())
+fn churn() { let s = "" let keep = [] for i in range(0, 300) { s = str(i) if i % 50 == 0 { push(keep, s) } } return keep }
+print(churn())
+print(pcall(fn () { return m(1, 0) }).error)

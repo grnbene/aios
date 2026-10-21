@@ -1,0 +1,21 @@
+# /etc/aios/webserver.conf — vhosts for aios-webserver. One block per vhost;
+# `listen N` plain HTTP, `listen N ssl` with cert/key (SNI picks the vhost on
+# a shared port). `root` is served as static files; `index`/`php` stream
+# .php requests to PHP-FPM over FastCGI without holding a body in memory.
+# install-asql.sh enables aios-webserver.service only once this file exists.
+
+vhost erp {
+  listen 18080
+  root /var/www/v8/server
+  index index.php
+  php 127.0.0.1:9000
+}
+
+#vhost erp-ssl {
+#  listen 18443 ssl
+#  cert /etc/letsencrypt/live/example.com/fullchain.pem
+#  key /etc/letsencrypt/live/example.com/privkey.pem
+#  root /var/www/v8/server
+#  index index.php
+#  php 127.0.0.1:9000
+#}

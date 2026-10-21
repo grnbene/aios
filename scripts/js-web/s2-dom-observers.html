@@ -1,0 +1,69 @@
+<!doctype html><body><div id=a><p class=x>hi</p></div><pre id=o></pre><script>
+var out=document.getElementById('o');function log(s){out.textContent+=s+'\n';}
+function ok(n,c){log((c?'PASS ':'FAIL ')+n);}
+function t(n,f){try{f();}catch(e){log('FAIL '+n+' threw '+e.message);}}
+var a=document.getElementById('a');
+// MutationObserver
+t('mo',function(){
+ var recs=[];
+ var mo=new MutationObserver(function(r){recs=recs.concat(r);});
+ mo.observe(a,{childList:true,attributes:true,attributeOldValue:true,subtree:true,characterData:true});
+ a.setAttribute('q','1'); a.setAttribute('q','2');
+ var s=document.createElement('span'); a.appendChild(s);
+ a.firstChild.firstChild.data='yo';
+ a.removeChild(s);
+ ok('mo sync none',recs.length===0);
+ Promise.resolve().then(function(){Promise.resolve().then(function(){
+  ok('mo count '+recs.length,recs.length>=5);   // later sync tests in this page also mutate #a
+  ok('mo attr',recs[0].type==='attributes'&&recs[0].attributeName==='q'&&recs[0].oldValue===null&&recs[1].oldValue==='1');
+  ok('mo add',recs[2].type==='childList'&&recs[2].addedNodes[0]===s&&recs[2].target===a);
+  ok('mo chardata',recs[3].type==='characterData'&&recs[3].target.data==='yo');
+  ok('mo remove',recs[4].removedNodes[0]===s);
+  a.innerHTML='<b>z</b>';
+  ok('takeRecords',mo.takeRecords().length>=1);
+  mo.disconnect();
+ });});
+});
+// custom elements
+t('ce',function(){
+ var ev=[];
+ class XFoo extends HTMLElement{
+  static get observedAttributes(){return ['a'];}
+  constructor(){super();ev.push('ctor');}
+  connectedCallback(){ev.push('conn');}
+  disconnectedCallback(){ev.push('disc');}
+  attributeChangedCallback(n,o,v){ev.push('attr:'+n+':'+o+':'+v);}
+ }
+ var pre=document.createElement('x-foo'); document.body.appendChild(pre); 
+ customElements.define('x-foo',XFoo);
+ ok('ce upgrade '+ev.join(','),ev.join(',')==='ctor,conn');
+ ok('ce proto',pre instanceof XFoo&&customElements.get('x-foo')===XFoo);
+ pre.setAttribute('a','1');
+ ok('ce attr',ev[ev.length-1]==='attr:a:null:1');
+ pre.remove(); ok('ce disc',ev[ev.length-1]==='disc');
+ var n=new XFoo(); ok('ce new',n.localName==='x-foo'&&n instanceof XFoo);
+ var m=document.createElement('x-foo'); ok('ce create',m instanceof XFoo);
+ a.innerHTML='<x-foo></x-foo>'; ok('ce innerHTML',a.firstChild instanceof XFoo);
+ customElements.whenDefined('x-foo').then(function(c){ok('whenDefined',c===XFoo);});
+});
+t('shadow',function(){
+ var h=document.createElement('div'); var sr=h.attachShadow({mode:'open'});
+ sr.innerHTML='<i id=k>s</i>';
+ ok('shadow',h.shadowRoot===sr&&sr.host===h&&sr.mode==='open'&&sr.querySelector('#k').tagName==='I'&&sr instanceof DocumentFragment);
+ ok('closed',document.createElement('p').attachShadow({mode:'closed'}).mode==='closed');
+});
+t('range',function(){
+ var d=document.createElement('div'); d.innerHTML='<p>hello <b>big</b> world</p>'; document.body.appendChild(d);
+ var r=document.createRange(); r.selectNodeContents(d);
+ ok('range str "'+r.toString()+'"',r.toString()==='hello big world');
+ var tn=d.firstChild.firstChild; r.setStart(tn,2); r.setEnd(d.firstChild.lastChild,3);
+ ok('range part "'+r.toString()+'"',r.toString()==='llo big wo');
+ var s=getSelection(); s.removeAllRanges(); s.addRange(r);
+ ok('selection',s.rangeCount===1&&s.toString()==='llo big wo'&&s.anchorNode===tn);
+ ok('frag ctor',new DocumentFragment().nodeType===11);
+});
+t('io',function(){
+ new IntersectionObserver(function(es){ok('io delivered',es[0].isIntersecting&&es[0].target===a);}).observe(a);
+ new ResizeObserver(function(es){ok('ro delivered',es[0].target===a);}).observe(a);
+});
+</script>

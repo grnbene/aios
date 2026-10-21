@@ -1,0 +1,15 @@
+# page grid.html  viewport=1024
+# title Grid tracks
+# content 1024x134  background=ffffffff  links=0
+rect      16    16   482    41  #fff6f6f6
+text      26    26   144    21  #ff202020  15px              "Two fractions wide"
+rect     512    16   241    41  #fff6f6f6
+text     522    26    24    21  #ff202020  15px              "One"
+rect     767    16   241    41  #fff6f6f6
+text     777    26    24    21  #ff202020  15px              "One"
+rect      16    77   240    41  #fff6f6f6
+text      26    87   144    21  #ff202020  15px              "A fixed 240px rail"
+rect     276    77   732    41  #fff6f6f6
+text     286    87   160    21  #ff202020  15px              "The rest of the room"
+# glyph-gaps (none)
+

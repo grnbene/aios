@@ -1,0 +1,13 @@
+#ifndef _AARCH64_CSTRING
+#define _AARCH64_CSTRING
+#include "string.h"
+namespace std {
+  using ::memcpy;
+  using ::memset;
+  using ::memcmp;
+  using ::memmove;
+  using ::strlen;
+  using ::strcmp;
+  using ::strncmp;
+}
+#endif

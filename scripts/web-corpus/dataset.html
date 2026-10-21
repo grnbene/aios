@@ -1,0 +1,17 @@
+<!doctype html>
+<html data-theme="dark"><head><title>State an app sets on itself</title><link rel="stylesheet" href="site.css">
+<style>
+/* The selector half of runtime state. The JS half -- el.dataset.view = 'chat'
+   reaching the cascade -- needs a script, which the layout driver does not run;
+   it is exercised through the pane against the real application. */
+body:not([data-view="chat"]) .only-in-chat { display: none; }
+body[data-view="chat"] .in-chat { color: #0f8a6a; font-weight: bold; }
+html[data-theme="dark"] .themed { color: #b03a4a; }
+body[data-count="3"] .counted { text-decoration: underline; }
+</style></head>
+<body data-view="chat" data-count="3">
+<p class="only-in-chat">Visible, because body carries data-view=chat.</p>
+<p class="in-chat">Green and bold, by the same attribute.</p>
+<p class="themed">Red, from data-theme on the html element.</p>
+<p class="counted">Underlined, from a numeric attribute value.</p>
+</body></html>

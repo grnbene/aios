@@ -1,0 +1,6 @@
+# page center-tag.html  viewport=420
+# title Center tag
+# content 420x21  background=ff121212  links=0
+text      54     0   312    21  #ffd8d8d8  15px              "This text is centered by the center tag"
+# glyph-gaps (none)
+

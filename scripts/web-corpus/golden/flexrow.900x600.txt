@@ -1,0 +1,16 @@
+# page flexrow.html  viewport=900x600
+# title A crowded row
+# content 900x94  background=ffffffff  links=0
+rect      16    16   868    62  #0f000000  r=10
+rect      26    32    52    29  #1a000000  r=999
+text      36    36    32    21  #ff202020  15px              "YOLO"
+image     86    37    20    20  #ff202020  src=svg#0 alt=""
+text     114    26   360    21  #ff202020  15px              "bare text directly inside the flex row, which"
+text     114    47   160    21  #ff202020  15px              "is an anonymous item"
+rect     482    32   324    29  #1a000000  r=999
+text     492    36   304    21  #ff202020  15px              "up 14.6M down 149k · 285 calls · $6.95"
+rect     814    30    60    33  #ff0f8a6a  r=8
+text     828    36    32    21  #ffffffff  15px              "Send"
+# inline-image svg#0    20x20  inked=68  digest=a7aa4b05
+# glyph-gaps (none)
+

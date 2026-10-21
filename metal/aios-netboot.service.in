@@ -1,0 +1,33 @@
+# Template for the Raspberry Pi 3 netboot server. Render it for a site with
+#   AIOS_NETBOOT_PI_MAC=b8:27:eb:xx:xx:xx AIOS_NETBOOT_PI_IP=192.168.1.50 \
+#   AIOS_NETBOOT_GATEWAY=192.168.1.1 metal/serve-netboot.sh --unit > aios-netboot.service
+# (every @VALUE@ below comes from an AIOS_NETBOOT_* variable; serve-netboot.sh
+# lists them and refuses to render with one missing). Install the result as a
+# system unit; it needs root for ports 67/69 and drops to @USER@ after binding.
+#
+# Mode: static DHCP for ONE MAC, not ProxyDHCP. A proxy only adds the PXE
+# offer and relies on the LAN router to hand out the address; a router that
+# ignores the Pi boot ROM's DISCOVERs (seen on the first site, 2026-09-24:
+# five DISCOVERs, only the proxy answered, the ROM gave up) leaves the board
+# stalled until power-cycled. In static mode dnsmasq answers only the listed
+# MAC, with address and boot info in one offer; every other host on the LAN is
+# ignored and keeps using the router. --port=0 turns DNS off.
+[Unit]
+Description=aios Raspberry Pi 3 netboot server (static DHCP for one Pi + TFTP on @IFACE@)
+Documentation=file://@REPO_ROOT@/metal/serve-netboot.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# metal/build-arm64.sh publishes kernel8.img into the TFTP root when it exists.
+ExecStart=/usr/sbin/dnsmasq --no-daemon --interface=@IFACE@ --bind-dynamic --port=0 \
+  --enable-tftp --tftp-no-blocksize --tftp-root=@TFTP_ROOT@ \
+  --dhcp-range=@SUBNET@,static,@NETMASK@,1h \
+  --dhcp-host=@PI_MAC@,@PI_IP@,1h \
+  --dhcp-option=3,@GATEWAY@ --dhcp-option=6,@DNS@ \
+  --dhcp-boot=bootcode.bin "--pxe-service=0,Raspberry Pi Boot" --log-dhcp --user=@USER@
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

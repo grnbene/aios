@@ -1,0 +1,51 @@
+# Test Grain Windowing & Canvas Pane Registration API
+
+fn draw_pane(cv, p) {
+  print("Render callback executing for pane:", p.title)
+  canvas_clear(cv, "#0F172A")
+  draw_window_frame(cv, 0, 0, p.width, p.height, p.title, "Grain Compositor Bridge", true)
+  canvas_fill_rect(cv, 30, 50, 240, 120, "#2563EB")
+  canvas_draw_text(cv, "Interactive Grain Canvas Pane", 45, 80, "#FFFFFF", 14, "ui_bold")
+  canvas_draw_text(cv, "Event status: Ready", 45, 110, "#38BDF8", 12, "mono")
+}
+
+fn handle_event(p, ev) {
+  print("Event callback received event type:", ev.type, "for pane ID:", p.id)
+  if ev.type == "click" {
+    print("Click detected at (" + str(ev.x) + ", " + str(ev.y) + ") button=" + str(ev.button))
+  } else if ev.type == "key" {
+    print("Key event detected key=" + str(ev.key))
+  }
+  return true
+}
+
+let pane = register_pane({
+  "title": "AIOS Grain Studio Window",
+  "width": 640,
+  "height": 480,
+  "on_draw": draw_pane,
+  "on_event": handle_event
+})
+
+print("Successfully registered pane ID:", pane.id, "Title:", pane.title)
+
+# Render pane
+let cv = pane_render(pane)
+print("Rendered pane canvas width:", canvas_width(cv), "height:", canvas_height(cv))
+
+# Dispatch click event
+let click_res = pane_dispatch_event(pane, {"type": "click", "x": 150, "y": 80, "button": 1})
+print("Click event dispatched result:", click_res)
+
+# Dispatch key event
+let key_res = pane_dispatch_event(pane, {"type": "key", "key": 13})
+print("Key event dispatched result:", key_res)
+
+# List panes
+let all_panes = list_panes()
+print("Active registered panes count:", len(all_panes))
+
+# Unregister pane
+let unreg_res = unregister_pane(pane)
+print("Unregistered pane result:", unreg_res)
+print("Active registered panes count after unregister:", len(list_panes()))

@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><title>Forms that submit</title><link rel="stylesheet" href="site.css">
+<style>
+form { display: flex; flex-direction: column; gap: 10px; max-width: 320px; margin-bottom: 20px; }
+label { font-size: 13px; }
+input[type="text"] { padding: 6px; border: 1px solid #c0c0c0; }
+button[type="submit"] { padding: 8px 14px; background: #0f6ab0; color: #ffffff; }
+</style></head>
+<body><div class="wrap">
+<h2>Sign the guestbook</h2>
+<form method="post" action="/guestbook">
+  <label for="who">Your name</label>
+  <input type="text" id="who" name="who" value="Ada">
+  <label for="note">A note</label>
+  <input type="text" id="note" name="note" value="passed through">
+  <input type="hidden" name="token" value="a b&c">
+  <input type="checkbox" name="subscribe" checked>
+  <input type="checkbox" name="ignored">
+  <input type="text" name="disabled_one" value="no" disabled>
+  <input type="text" value="unnamed, so not sent">
+  <button type="submit" name="action" value="sign">Send it</button>
+</form>
+<h2>Search, which is a GET</h2>
+<form action="/search">
+  <input type="text" name="q" value="ring 0">
+  <button type="submit">Search</button>
+</form>
+</div></body></html>

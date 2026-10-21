@@ -1,0 +1,176 @@
+From 3f88bc2f1c71347f79c73804bab695101466dfba Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 02:25:26 +0000
+Subject: [PATCH] createInvoice: atomic, once per order, retried whole on a
+ deadlock (local only, not pushed)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012QYavSX1VaHE1sH2Ai1rWf
+---
+ system/library/weberp/b2b.php | 82 +++++++++++++++++++++++++++++------
+ 1 file changed, 68 insertions(+), 14 deletions(-)
+
+diff --git a/system/library/weberp/b2b.php b/system/library/weberp/b2b.php
+index 6cfbc1f..13af99e 100755
+--- a/system/library/weberp/b2b.php
++++ b/system/library/weberp/b2b.php
+@@ -3595,6 +3595,8 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 		return $result;
+ 	}
+ 
++	private $invoiceAttempts = 0;   // createInvoice's retries after a deadlock
++
+ 	public function createInvoice($order =array()) {
+ 
+ 		$header = $order['order']['header'];
+@@ -3693,11 +3695,39 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 
+ 				if($createinvoice) {
+ 
++					// The number first: getNextTransNo is a stored procedure with its own START TRANSACTION ... COMMIT,
++					// which commits whatever is open - called inside this transaction it committed the transaction
++					// itself, and everything after ran unprotected (a failure left half an invoice). payments.php
++					// reserves its numbers the same way. A number an invoice that fails then takes is not reused.
++					$salesordertype = 10;
++					$transnumber = $this->getNextTransNo($salesordertype);
++
+ 					$this->db->query("START TRANSACTION");
+ 
+-					$salesordertype = 10;
++					// Claim the order: only the invoice that moves salesorders.invoiceno on from what this one read
++					// goes ahead. A second click, a 3PL worker and a person invoicing the same order at once would
++					// each post a whole invoice; now the later ones find the order taken, roll back, and post nothing.
++					// (A compare-and-swap, not a lock: no one waits on it except an invoice of the same order.)
++					// Keyed by orderno alone, so the database finds (and on MariaDB locks) the one row: an invoice of
++					// the same order still open elsewhere is waited for, not read half-done.
++					$claimed_from = (int) ($salesorder['invoiceno'] ?? 0);
++					$this->db->query("update salesorders set invoiceno = if(coalesce(invoiceno, 0) = " . $claimed_from . ", " . (int) $transnumber . ", invoiceno) where orderno = '" . (int) $ordernumber . "'");
++					$claim = $this->db->query("select invoiceno from salesorders where orderno = '" . (int) $ordernumber . "'");
++					if ((int) ($claim->row['invoiceno'] ?? 0) !== (int) $transnumber) {
++						throw new \Exception('ORDER_ALREADY_INVOICED: order ' . $ordernumber . ' was invoiced by another session while this invoice was being made; nothing was posted', 40001);
++					}
++
++					// Without back orders an order is invoiced once. Asked here, after the claim - which makes two
++					// invoices of one order take turns - so a click that arrives after the first invoice committed
++					// sees it (the screen's own check runs before any of this, and two clicks both passed it).
++					if (!$this->config->get('BackOrdersAllowed')) {
++						$prior = $this->db->query("select count(*) as n from debtortrans where type = 10 and order_ = '" . (int) $ordernumber . "' and transno <> '" . (int) $transnumber . "'");
++						if ((int) ($prior->row['n'] ?? 0) > 0) {
++							throw new \Exception('ORDER_ALREADY_INVOICED: order ' . $ordernumber . ' already has an invoice; nothing was posted', 40001);
++						}
++					}
++
+ 					$period = $this->getNextPeriod($today);
+-					$transnumber = $this->getNextTransNo($salesordertype);
+ 					$settled = 0;
+ 
+ 					if(number_format($totals['total'],2,'.','') == '0.00') {
+@@ -4101,7 +4131,14 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 
+ 
+ 					$hasbackorder = false;
+-					foreach($order['order']['details'] as $item) {
++					// Every invoice takes its locstock rows in the same order - by stock code, then line - so two
++					// invoices sharing items cannot each hold one row the other is waiting for (MariaDB's 1213).
++					$invoice_lines = $order['order']['details'];
++					usort($invoice_lines, function ($a, $b) {
++						$c = strcmp((string) ($a['stockid'] ?? ''), (string) ($b['stockid'] ?? ''));
++						return $c !== 0 ? $c : ((int) ($a['orderlineno'] ?? 0) <=> (int) ($b['orderlineno'] ?? 0));
++					});
++					foreach($invoice_lines as $item) {
+ 						if (!isset($item['taxes']) || !is_array($item['taxes'])) {
+ 							$item['taxes'] = array();
+ 						}
+@@ -4173,7 +4210,7 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 									//dropship
+ 									if(!$dropship && $this->itemReducesStock($item['stockid'])){
+ 										$tries = 0;
+-										$limit = 5;
++										$limit = 1;   // a deadlock rolls back the whole invoice: it is retried whole, in the catch below
+ 										$sql = "UPDATE locstock SET
+ 											commited = commited + ".(1 * $pick['picked']).
+ 											", quantity = locstock.quantity - " . (1 * $pick['picked']) .
+@@ -4182,7 +4219,7 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 											try {
+ 												$this->db->query($sql);
+ 												break;
+-											} catch (Exception $e) {
++											} catch (\Exception $e) {
+ 												$errorCode = $e->getCode();
+ 												$isDeadlock = ($errorCode == 1213) || (strpos($e->getMessage(), 'Error No: 1213') !== false);
+ 												if ($isDeadlock && $tries < $limit - 1) {
+@@ -4238,7 +4275,7 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 									if(!$dropship && $this->itemReducesStock($item['stockid'])){
+ 										$complete = 1;
+ 										$tries = 0;
+-										$limit = 5;
++										$limit = 1;   // a deadlock rolls back the whole invoice: it is retried whole, in the catch below
+ 										$sql = "UPDATE locstock
+ 												SET commited = commited + " . (1 * $pick['pick']) . ",
+ 													quantity = quantity - " . (1 * $pick['pick']) . "
+@@ -4250,7 +4287,7 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 											try {
+ 												$this->db->query($sql);
+ 												break;
+-											} catch (Exception $e) {
++											} catch (\Exception $e) {
+ 												$errorCode = $e->getCode();
+ 												$isDeadlock = ($errorCode == 1213) || (strpos($e->getMessage(), 'Error No: 1213') !== false);
+ 												if ($isDeadlock && $tries < $limit - 1) {
+@@ -4336,7 +4373,7 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 										try {
+ 											$this->db->query($sql);
+ 											$updateSuccess = true;
+-										} catch (Exception $e) {
++										} catch (\Exception $e) {
+ 											$errorCode = $e->getCode();
+ 											$isDeadlock = ($errorCode == 1213) || (strpos($e->getMessage(), 'Error No: 1213') !== false);
+ 
+@@ -4376,7 +4413,10 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 						}
+ 
+ 						// stock movements and GL mostings
+-						$qoh = $this->db->query("select sum(quantity) as qoh from locstock where stockid ='{$item['stockid']}' and loccode ='$stocklocation' FOR UPDATE");
++						// No FOR UPDATE: this is the move's quantity-on-hand note, read after this invoice's own decrement.
++						// Locking every bin of the item until COMMIT made two invoices of the same item wait for each other
++						// (and, taken line by line, deadlock) for a figure nothing posts from.
++						$qoh = $this->db->query("select sum(quantity) as qoh from locstock where stockid ='{$item['stockid']}' and loccode ='$stocklocation'");
+ 						$qoh = $qoh->row['qoh'];
+ 
+ 						$item_dispatch = number_format(-1 * $item['dispatch'], $item['decimalplaces'], '.','');
+@@ -4673,13 +4713,27 @@ FROM debtortrans LEFT JOIN salesorders ON debtortrans.order_ = salesorders.order
+ 
+ 				$this->db->query("update oms set status_id = $statusid, invoiced = 1 where orderno ='{$salesorder['orderno']}' ");
+ 				$this->db->query("COMMIT");
+-			} catch (Exception $e) {
+-				// If any exception occurs, rollback the transaction
+-				// return $e;
++			} catch (\Throwable $e) {
++				// \Throwable, not Exception: in namespace Weberp a bare `Exception` is Weberp\Exception, which does
++				// not exist, so this catch matched nothing - no rollback and no log, ever - and every database error
++				// left the invoice as far as it had got.
+ 				$this->db->query("ROLLBACK");
+-				$log = new \Log('invoice.log');
+-				$log->write('CREATE INVOICE '. $e);
+ 				$success = false;
++				$id = null;
++				$code = (int) $e->getCode();
++				// A deadlock (1213) or lock wait timeout (1205) undid the whole invoice: run it again, whole.
++				if (($code === 1213 || $code === 1205) && $this->invoiceAttempts < 3) {
++					$this->invoiceAttempts++;
++					usleep(50000 * $this->invoiceAttempts);
++					try { return $this->createInvoice($order); } finally { $this->invoiceAttempts--; }
++				}
++				if (class_exists('\Log')) {
++					$log = new \Log('invoice.log');
++					$log->write('CREATE INVOICE '. $e);
++				}
++				if ($code === 40001) {
++					return array('success' => false, 'orderno' => $salesorder['orderno'], 'transno' => null, 'id' => null, 'error' => 'already_invoiced', 'message' => $e->getMessage());
++				}
+ 			}
+ 			//end invoice
+ 		}
+-- 
+2.43.0
+

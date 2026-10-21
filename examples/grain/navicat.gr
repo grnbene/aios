@@ -1,0 +1,173 @@
+# =============================================================================
+# DB Studio in Grain — a database client against a REAL local ASQL server
+#
+# Everything this script shows comes from the server it connects to: the
+# table list and columns are introspected (db_schema / db_columns), the grid
+# rows are a SELECT, the row counts are COUNT(*), the edit is an UPDATE that
+# is read back with a fresh SELECT. There is no built-in data set and no
+# "offline" fallback: with no server it says so and stops.
+#
+# It needs a server. The quickest is a throwaway one:
+#
+#   AIOS_NO_ACCEL=1 aios --root /tmp/studio-demo exec "sql serve port=13586 bind=127.0.0.1" &
+#   NAVICAT_PORT=13586 aios grain run examples/grain/navicat.gr
+#
+# NAVICAT_HOST / NAVICAT_PORT / NAVICAT_USER / NAVICAT_PASS / NAVICAT_DB pick
+# the server (defaults 127.0.0.1:3307, user root, database navicat_demo).
+# The script creates and seeds one table, `studio_orders`, in that database —
+# point it at a scratch server, not a production one.
+# =============================================================================
+
+print("=================================================================")
+print("  DB Studio — AIOS Grain, against a live ASQL server            ")
+print("=================================================================\n")
+
+let HOST = getenv("NAVICAT_HOST", "127.0.0.1")
+let PORT = int(getenv("NAVICAT_PORT", "3307"))
+let USER = getenv("NAVICAT_USER", "root")
+let PASS = getenv("NAVICAT_PASS", "")
+let DB = getenv("NAVICAT_DB", "navicat_demo")
+let TABLE = "studio_orders"
+
+# -----------------------------------------------------------------------------
+# 1. Connect — or stop. Nothing below runs on made-up data.
+# -----------------------------------------------------------------------------
+
+print("[Database] Connecting to " + USER + "@" + HOST + ":" + str(PORT) + "...")
+let res = db_connect(HOST, PORT, USER, PASS, "")
+if !res.ok {
+  print("  ✗ No server at " + HOST + ":" + str(PORT) + ": " + res.error)
+  print("    Start one:  aios --root /tmp/studio-demo exec \"sql serve port=" + str(PORT) + " bind=127.0.0.1\"")
+  assert(false, "no database server at " + HOST + ":" + str(PORT))
+}
+let conn = res.conn
+print("  ✓ Connected. Server version: " + res.server_version)
+
+fn run(sql) {
+  let r = db_query(conn, sql)
+  assert(r.ok, sql + " -> " + r.error)
+  return r
+}
+
+run("CREATE DATABASE IF NOT EXISTS " + DB + ";")
+assert(db_select_db(conn, DB), "cannot USE " + DB)
+
+# -----------------------------------------------------------------------------
+# 2. Seed one table so there is something to look at (this IS a write).
+# -----------------------------------------------------------------------------
+
+print("\n[Setup] Seeding " + DB + "." + TABLE + " on the server...")
+run("CREATE TABLE IF NOT EXISTS " + TABLE + " (id INT PRIMARY KEY, order_no VARCHAR(32), customer_name VARCHAR(64), total_amount DECIMAL(10,2), status VARCHAR(20), created_at TIMESTAMP);")
+run("DELETE FROM " + TABLE + ";")
+run("INSERT INTO " + TABLE + " VALUES (1, 'SO-0001', 'Example Customer A', 961.12, 'PAID', '2026-09-24 10:14:00');")
+run("INSERT INTO " + TABLE + " VALUES (2, 'SO-0002', 'Example Customer B', 1450.00, 'PAID', '2026-09-24 10:30:15');")
+run("INSERT INTO " + TABLE + " VALUES (3, 'SO-0003', 'Example Customer C', 2840.50, 'PENDING', '2026-09-24 11:05:22');")
+run("INSERT INTO " + TABLE + " VALUES (4, 'SO-0004', 'Example Customer D', NULL, 'DRAFT', '2026-09-24 12:45:00');")
+
+# -----------------------------------------------------------------------------
+# 3. Introspect: tables, columns, row counts — all asked of the server.
+# -----------------------------------------------------------------------------
+
+let schema = db_schema(conn)
+assert(schema, "db_schema returned nothing")
+print("  ✓ Schema: " + str(len(schema.table_names)) + " table(s): " + str(schema.table_names))
+assert(len(schema.table_names) > 0, "the server reports no tables after CREATE TABLE")
+
+let cols = db_columns(conn, TABLE)
+assert(len(cols) == 6, "expected 6 columns on " + TABLE + ", the server reports " + str(len(cols)))
+let grid_cols = []
+let pk_col = cols[0].name
+for c in cols {
+  push(grid_cols, {"name": c.name, "type": c.type, "width": 150})
+  if c.is_pk { pk_col = c.name }
+}
+print("  ✓ Columns of " + TABLE + ": " + str(len(cols)) + ", primary key " + pk_col)
+
+let tree_nodes = [
+  {"id": "srv", "label": HOST + ":" + str(PORT), "type": "server", "level": 0, "expanded": true, "badge": "ONLINE"},
+  {"id": "db", "label": DB, "type": "database", "level": 1, "expanded": true, "badge": str(len(schema.table_names))}
+]
+for t in schema.table_names {
+  let cnt = run("SELECT COUNT(*) FROM `" + t + "`;")
+  push(tree_nodes, {"id": "tbl_" + t, "label": t, "type": "table", "level": 2, "expanded": false, "badge": str(cnt.rows[0][0])})
+}
+
+# -----------------------------------------------------------------------------
+# 4. The grid: a real SELECT, timed.
+# -----------------------------------------------------------------------------
+
+let t0 = clock()
+let q = run("SELECT * FROM " + TABLE + " ORDER BY id ASC;")
+let latency_ms = clock() - t0
+let rows = q.rows
+assert(len(rows) == 4, "expected the 4 seeded rows back, got " + str(len(rows)))
+print("  ✓ Fetched " + str(len(rows)) + " rows in " + str(floor(latency_ms * 100.0) / 100.0) + " ms")
+
+# -----------------------------------------------------------------------------
+# 5. Typeahead over the introspected schema.
+# -----------------------------------------------------------------------------
+
+print("\n[Typeahead] Suggestions from the live schema...")
+let test_query = "SELECT o.id FROM " + TABLE + " o WHERE o.cu"
+let sugg = sql_suggest(test_query, len(test_query), schema.table_names, schema.all_columns)
+print("  " + str(len(sugg.items)) + " suggestion(s) for '" + sugg.prefix + "':")
+for i in range(min(4, len(sugg.items))) {
+  print("    [" + sugg.items[i].kind + "] " + sugg.items[i].text)
+}
+assert(len(sugg.items) > 0 and sugg.items[0].text == "customer_name", "expected customer_name from the live columns")
+
+# -----------------------------------------------------------------------------
+# 6. Edit a cell, commit it as an UPDATE, read it back from the server.
+# -----------------------------------------------------------------------------
+
+print("\n[Inline Edit] Edit row 1 customer_name and commit...")
+let new_val = rows[0][2] + " (edited)"
+let upd = db_build_update(TABLE, pk_col, str(rows[0][0]), {"customer_name": new_val})
+print("  Executing: " + upd)
+let ur = run(upd)
+assert(ur.affected_rows == 1, "UPDATE touched " + str(ur.affected_rows) + " rows, expected 1")
+let back = run("SELECT customer_name FROM " + TABLE + " WHERE id = 1;")
+assert(back.rows[0][0] == new_val, "read back '" + str(back.rows[0][0]) + "', expected '" + new_val + "'")
+print("  ✓ Server now holds: '" + back.rows[0][0] + "'")
+rows[0][2] = new_val
+
+# -----------------------------------------------------------------------------
+# 7. Export what the server returned.
+# -----------------------------------------------------------------------------
+
+let csv_out = data_to_csv(grid_cols, rows)
+let json_out = data_to_json(grid_cols, rows)
+print("\n[Export] CSV " + str(len(split(csv_out, "\n"))) + " lines, JSON " + str(len(json_out)) + " bytes")
+
+# -----------------------------------------------------------------------------
+# 8. Paint it.
+# -----------------------------------------------------------------------------
+
+let W = 1280
+let H = 800
+let cv = canvas_create(W, H, "#0B0F19")
+let where = DB + " @ " + HOST + ":" + str(PORT)
+draw_window_frame(cv, 0, 0, W, H, "DB Studio — AIOS Grain", where, true)
+draw_menu_bar(cv, 0, 32, W, ["File", "Edit", "View", "Query", "Table", "Help"], 3, true)
+draw_toolbar(cv, 0, 56, W, [
+  {"id": "conn", "label": "Connection", "icon": "server"},
+  {"id": "query", "label": "Query", "icon": "query"},
+  "|",
+  {"id": "run", "label": "Execute", "icon": "play"}
+], "query", true)
+let tree_w = 260
+draw_nav_tree(cv, 0, 98, tree_w, H - 98 - 24, tree_nodes, "tbl_" + TABLE, 0, true)
+let work_x = tree_w + 1
+let work_w = W - work_x
+draw_tab_bar(cv, work_x, 98, work_w, [{"id": "t", "title": TABLE + " (Data View)", "type": "table", "icon": "table", "dirty": false}], 0, true)
+let sql_text = "SELECT * FROM " + TABLE + " ORDER BY id ASC;"
+draw_sql_editor(cv, work_x, 128, work_w, 240, sql_text, 0, len(sql_text), 0, true)
+let grid_y = 128 + 240 + 1
+let page_msg = str(len(rows)) + " rows | " + str(floor(latency_ms * 100.0) / 100.0) + " ms"
+draw_data_grid(cv, work_x, grid_y, work_w, H - grid_y - 24, grid_cols, rows, 0, 2, "id", true, 0, 0, page_msg, true, {}, nil)
+draw_status_bar(cv, 0, H - 24, W, 24, HOST + ":" + str(PORT), DB, "Connected (" + res.server_version + ")", "utf8mb4", true, true)
+let out_path = getenv("NAVICAT_OUT", "/tmp/navicat_rendered.ppm")
+canvas_save_ppm(cv, out_path)
+print("\n[Render] 1280x800 frame -> " + out_path)
+db_close(conn)
+print("\nDone: every value above came from " + HOST + ":" + str(PORT) + ".")

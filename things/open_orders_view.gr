@@ -1,0 +1,362 @@
+# open_orders_view - which orders the v8 ERP's open-orders board can list
+# (apir/orders index(): model oms/orders getOpenOrdersInvDispatch() and
+# getInvoicedOnDispatch()), and a digest of every row PHP reads to render one.
+#
+# Nothing is rendered here. The ERP still renders an order with its own PHP
+# against MariaDB and caches the result per order; this Thing says which orders
+# belong on the board and when a cached one is stale: `h` moves whenever any
+# row that order's payload is built from moves, `g` moves with the tables every
+# order shares (config, setting, statuses, shippers, locations, tax).
+#
+#   open, inv    the user-independent part of each query's WHERE
+#   loc debtorno branchcode salesperson takenby placedfrom    the caller's filters
+#   created confirmed    the ORDER BY
+#   wake_at      the next snooze to end (the invoiced query compares date_end with NOW())
+#
+# ASQL finds rows through an index for `col = ?` and for `col IN (SELECT ...)`,
+# but scans the whole table for `col IN (1, 2, 3)`: so a few orders are read one
+# `=` at a time and many in one pass over the open ones, never through a list.
+
+let SMALL = 250
+let EXCLUDED_DEFAULT = "29,30,40,50,90,93"
+let SEP = "|~|"
+let NUL = "~N~"
+let P = 2147483647
+let OPEN = "(SELECT orderno FROM salesorderdetails WHERE completed = 0)"
+
+let GLOBAL_TABLES = ["config", "setting", "order_status", "shippers", "locations", "taxgroups", "taxauthrates", "taxgrouptaxes", "taxauthorities"]
+let GLOBAL_SET = {}
+for t in GLOBAL_TABLES { GLOBAL_SET[t] = true }
+let ROW_TABLES = ["salesorders", "salesorderdetails", "debtorsmaster", "custbranch", "stockmaster", "pickingfreeze", "oms_snoozed", "salesorderpaymentmethod", "trackinginfo", "tpl3pl_shipments", "authorizations", "salesordertopurchaseorder", "dispatch"]
+let ORDER = ["so", "sd", "dt", "mv", "dm", "cb", "st", "pf", "ls", "sz", "pm", "ti", "tp", "au", "sp", "ps", "po", "ds"]
+
+# Orders a change can reach. The indexed predicate goes first: ASQL plans from it.
+let OPEN_BY_ITEM = "SELECT DISTINCT orderno AS k FROM salesorderdetails WHERE completed = 0 AND stkcode = ?"
+let SENT_BY_ITEM = "SELECT DISTINCT sd.orderno AS k FROM dispatch d JOIN salesorderdetails sd ON sd.orderno = d.invoice WHERE d.cleared = 0 AND d.oclater = 0 AND sd.stkcode = ?"
+let OPEN_BY_DEBTOR = "SELECT DISTINCT sd.orderno AS k FROM salesorderdetails sd JOIN salesorders so ON so.orderno = sd.orderno WHERE sd.completed = 0 AND so.debtorno = ?"
+let SENT_BY_DEBTOR = "SELECT so.orderno AS k FROM dispatch d JOIN salesorders so ON so.orderno = d.invoice WHERE d.cleared = 0 AND d.oclater = 0 AND so.debtorno = ?"
+let OPEN_BY_BRANCH = "SELECT DISTINCT sd.orderno AS k FROM salesorderdetails sd JOIN salesorders so ON so.orderno = sd.orderno WHERE sd.completed = 0 AND so.debtorno = ? AND so.branchcode = ?"
+let SENT_BY_BRANCH = "SELECT so.orderno AS k FROM dispatch d JOIN salesorders so ON so.orderno = d.invoice WHERE d.cleared = 0 AND d.oclater = 0 AND so.debtorno = ? AND so.branchcode = ?"
+
+fn num(v) { if v == nil { return 0 } return v }
+
+# PHP's empty(): what getExcludedStatusIds() treats as "no setting".
+fn php_empty(v) { return v == nil or v == false or v == "" or v == "0" or v == 0 }
+
+# MariaDB compares item codes without case or trailing spaces.
+fn ck(s) { return upper(rtrim(str(s))) }
+
+# An order number as salesorders.orderno reads it (dispatch.invoice is text).
+fn okey(v) {
+  let s = trim(str(v))
+  if len(s) == 0 { return s }
+  for c in chars(s) { if not is_digit(c) { return s } }
+  return str(int(s))
+}
+
+# Every column of a row as one string, NULLs kept distinct from "".
+fn rowtext(cols, t, alias) {
+  let parts = []
+  for c in cols[t] { push(parts, "IFNULL(" + alias + ".`" + c + "`, '" + NUL + "')") }
+  return "CONCAT_WS('" + SEP + "', " + join(parts, ", ") + ")"
+}
+
+fn crcs(row) { return "CRC32(" + row + ") AS a, CRC32(MD5(" + row + ")) AS b" }
+
+# Two independent polynomial hashes of the parts, mod 2^31-1.
+fn fold(parts) {
+  let h1 = 7
+  let h2 = 11
+  for p in parts {
+    for ch in chars(p) {
+      let o = ord(ch)
+      h1 = (h1 * 31 + o) % P
+      h2 = (h2 * 131 + o) % P
+    }
+    h1 = (h1 * 31 + 124) % P
+    h2 = (h2 * 131 + 124) % P
+  }
+  return str(h1) + "-" + str(h2)
+}
+
+# Rows for the orders in ks: one pass over the open orders, or one lookup each.
+fn fetch(sel, col, tail, ks, bulk) {
+  if bulk { return read(sel + " WHERE " + col + " IN " + OPEN + tail) }
+  let out = []
+  for k in ks { for r in read(sel + " WHERE " + col + " = ?" + tail, k) { push(out, r) } }
+  return out
+}
+
+fn add(acc, k, name, a, b) {
+  if not has(acc, k) { return }
+  let m = acc[k]
+  if not has(m, name) { m[name] = [0, 0, 0] }
+  let d = m[name]
+  d[0] = d[0] + 1
+  d[1] = d[1] + int(num(a))
+  d[2] = d[2] + int(num(b))
+}
+
+fn digest_rows(acc, name, rows) {
+  for r in rows { add(acc, okey(r.k), name, r.a, r.b) }
+}
+
+fn part(acc, k, name) {
+  let m = acc[k]
+  if not has(m, name) { return name + ":0" }
+  let d = m[name]
+  return name + ":" + str(d[0]) + "." + str(d[1]) + "." + str(d[2])
+}
+
+fn shared() {
+  let cols = {}
+  for r in read("SELECT TABLE_NAME AS t, COLUMN_NAME AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?) ORDER BY TABLE_NAME, ORDINAL_POSITION", concat(ROW_TABLES, GLOBAL_TABLES)) {
+    let t = lower(r.t)
+    if not has(cols, t) { cols[t] = [] }
+    push(cols[t], r.c)
+  }
+  for t in concat(ROW_TABLES, GLOBAL_TABLES) {
+    if not has(cols, t) { error("open_orders_view: no columns for " + t) }
+  }
+  let g = []
+  for t in GLOBAL_TABLES {
+    let row = rowtext(cols, t, "x")
+    let d = read("SELECT COUNT(*) AS n, SUM(CRC32(" + row + ")) AS a, SUM(CRC32(MD5(" + row + "))) AS b FROM " + t + " x")[0]
+    push(g, t + ":" + str(d.n) + "." + str(num(d.a)) + "." + str(num(d.b)))
+  }
+  let conf = read("SELECT confvalue FROM config WHERE confname = 'OpenOrdersExcludedStatuses' LIMIT 1")
+  let ex = EXCLUDED_DEFAULT
+  if len(conf) > 0 and not php_empty(conf[0].confvalue) { ex = str(conf[0].confvalue) }
+  let excluded = {}
+  for s in split(ex, ",") { excluded[trim(s)] = true }
+  return {cols: cols, g: fold(g), excluded: excluded}
+}
+
+fn enroll() {
+  let out = []
+  for r in read("SELECT DISTINCT orderno FROM salesorderdetails WHERE completed = 0") { push(out, r.orderno) }
+  for r in read("SELECT DISTINCT invoice FROM dispatch WHERE cleared = 0 AND oclater = 0") { push(out, okey(r.invoice)) }
+  return out
+}
+
+fn compute(ks, sh, bulk) {
+  let cols = sh.cols
+  let acc = {}
+  for k in ks { acc[k] = {} }
+  let hdr = {}
+  for r in fetch("SELECT x.orderno AS k, x.fromstkloc, x.debtorno, x.branchcode, x.salesperson, x.takenby, x.placedfrom, x.orderstatusid, x.date_created, x.confirmeddate, " + crcs(rowtext(cols, "salesorders", "x")) + " FROM salesorders x", "x.orderno", "", ks, bulk) {
+    let k = okey(r.k)
+    if has(acc, k) {
+      hdr[k] = r
+      add(acc, k, "so", r.a, r.b)
+    }
+  }
+  let lines = {}
+  for r in fetch("SELECT x.orderno AS k, x.stkcode, x.completed, " + crcs(rowtext(cols, "salesorderdetails", "x")) + " FROM salesorderdetails x", "x.orderno", "", ks, bulk) {
+    let k = okey(r.k)
+    if has(acc, k) {
+      add(acc, k, "sd", r.a, r.b)
+      if not has(lines, k) { lines[k] = [] }
+      push(lines[k], r)
+    }
+  }
+  digest_rows(acc, "dt", fetch("SELECT x.order_ AS k, " + crcs("CONCAT_WS('|', x.transno, x.type)") + " FROM debtortrans x", "x.order_", "", ks, bulk))
+  digest_rows(acc, "mv", fetch("SELECT dt.order_ AS k, " + crcs("CONCAT_WS('|', sm.transno, IFNULL(sm.orderlineref, ''), IFNULL(sm.qty, ''), dt.type)") + " FROM debtortrans dt JOIN stockmoves sm ON sm.transno = dt.transno AND sm.type = 10", "dt.order_", "", ks, bulk))
+  let joined = {}
+  for r in fetch("SELECT so.orderno AS k, dm.debtorno AS dmk, cb.branchcode AS cbk, " + crcs(rowtext(cols, "debtorsmaster", "dm")) + ", CRC32(" + rowtext(cols, "custbranch", "cb") + ") AS c, CRC32(MD5(" + rowtext(cols, "custbranch", "cb") + ")) AS d FROM salesorders so LEFT JOIN debtorsmaster dm ON dm.debtorno = so.debtorno LEFT JOIN custbranch cb ON cb.debtorno = so.debtorno AND cb.branchcode = so.branchcode", "so.orderno", "", ks, bulk) {
+    let k = okey(r.k)
+    if r.dmk != nil { add(acc, k, "dm", r.a, r.b) }
+    if r.cbk != nil { add(acc, k, "cb", r.c, r.d) }
+    joined[k] = r.dmk != nil and r.cbk != nil
+  }
+  digest_rows(acc, "pf", fetch("SELECT x.orderno AS k, " + crcs(rowtext(cols, "pickingfreeze", "x")) + " FROM pickingfreeze x", "x.orderno", "", ks, bulk))
+  digest_rows(acc, "ls", fetch("SELECT pf.orderno AS k, " + crcs("CONCAT_WS('|', ls.loccode, ls.stockid, IFNULL(ls.quantity, ''))") + " FROM pickingfreeze pf JOIN salesorderdetails sd ON sd.orderno = pf.orderno AND sd.orderlineno = pf.linenumber JOIN locstock ls ON ls.stockid = sd.stkcode", "pf.orderno", "", ks, bulk))
+  digest_rows(acc, "sz", fetch("SELECT x.orderno AS k, " + crcs(rowtext(cols, "oms_snoozed", "x")) + " FROM oms_snoozed x", "x.orderno", "", ks, bulk))
+  digest_rows(acc, "pm", fetch("SELECT x.orderno AS k, " + crcs(rowtext(cols, "salesorderpaymentmethod", "x")) + " FROM salesorderpaymentmethod x", "x.orderno", "", ks, bulk))
+  digest_rows(acc, "ti", fetch("SELECT x.transno AS k, " + crcs(rowtext(cols, "trackinginfo", "x")) + " FROM trackinginfo x", "x.transno", "", ks, bulk))
+  digest_rows(acc, "tp", fetch("SELECT x.orderno AS k, " + crcs(rowtext(cols, "tpl3pl_shipments", "x")) + " FROM tpl3pl_shipments x", "x.orderno", "", ks, bulk))
+  digest_rows(acc, "au", fetch("SELECT x.orderno AS k, " + crcs(rowtext(cols, "authorizations", "x")) + " FROM authorizations x", "x.orderno", "", ks, bulk))
+  digest_rows(acc, "sp", fetch("SELECT x.sales_orderno AS k, " + crcs(rowtext(cols, "salesordertopurchaseorder", "x")) + " FROM salesordertopurchaseorder x", "x.sales_orderno", "", ks, bulk))
+  digest_rows(acc, "ps", fetch("SELECT x.sales_orderno AS k, " + crcs("CONCAT_WS('|', po.orderno, IFNULL(po.supplierno, ''), IFNULL(s.bankref, ''))") + " FROM salesordertopurchaseorder x JOIN purchorders po ON po.orderno = x.purchase_orderno LEFT JOIN suppliers s ON s.supplierid = po.supplierno", "x.sales_orderno", "", ks, bulk))
+  digest_rows(acc, "ds", fetch("SELECT x.invoice AS k, " + crcs(rowtext(cols, "dispatch", "x")) + " FROM dispatch x", "x.invoice", "", ks, bulk))
+
+  # Items: the orders' lines joined to stockmaster and to open PO lines, matched here.
+  let items = {}
+  for k in keys(lines) { for l in lines[k] { items[ck(l.stkcode)] = l.stkcode } }
+  let stock = {}
+  let stock_sql = "SELECT x.stockid AS s, " + crcs(rowtext(cols, "stockmaster", "x")) + " FROM stockmaster x"
+  if bulk {
+    for r in read(stock_sql) { stock[ck(r.s)] = r }
+  } else {
+    for i in keys(items) { for r in read(stock_sql + " WHERE x.stockid = ?", items[i]) { stock[ck(r.s)] = r } }
+  }
+  let po = {}
+  for r in read("SELECT p.itemcode AS i, " + crcs("CONCAT_WS('|', p.itemcode, p.orderno, p.podetailitem, CASE WHEN p.podetailitem IN (SELECT purchase_order_line FROM salesordertopurchaseorder) THEN 1 ELSE 0 END)") + " FROM purchorderdetails p WHERE p.completed = 0 AND p.quantityord > p.quantityrecd") {
+    let i = ck(r.i)
+    if has(items, i) {
+      if not has(po, i) { po[i] = [] }
+      push(po[i], r)
+    }
+  }
+
+  let wake = {}
+  for r in fetch("SELECT x.orderno AS k, x.date_end AS w FROM oms_snoozed x", "x.orderno", " AND x.date_end > NOW()", ks, bulk) {
+    let k = okey(r.k)
+    let w = str(r.w)
+    if not has(wake, k) or w < wake[k] { wake[k] = w }
+  }
+  let disp = {}
+  for r in read("SELECT invoice FROM dispatch WHERE cleared = 0 AND oclater = 0") { disp[okey(r.invoice)] = true }
+
+  let out = {}
+  for k in ks {
+    if not has(hdr, k) { continue }
+    let h = hdr[k]
+    let o = 0
+    let c = 0
+    if has(lines, k) {
+      for l in lines[k] {
+        let i = ck(l.stkcode)
+        if has(stock, i) {
+          add(acc, k, "st", stock[i].a, stock[i].b)
+          if str(l.completed) == "0" { o = o + 1 }
+          if str(l.completed) == "1" { c = c + 1 }
+        }
+        if has(po, i) { for p in po[i] { add(acc, k, "po", p.a, p.b) } }
+      }
+    }
+    let status_ok = h.orderstatusid != nil and not has(sh.excluded, str(h.orderstatusid))
+    let both = has(joined, k) and joined[k] and status_ok
+    let open = o > 0 and both
+    let inv = c > 0 and both and has(disp, k)
+    if not open and not inv { continue }
+    let parts = []
+    for name in ORDER { push(parts, part(acc, k, name)) }
+    let w = nil
+    if has(wake, k) { w = wake[k] }
+    let oo = 0
+    if open { oo = 1 }
+    let ii = 0
+    if inv { ii = 1 }
+    out[k] = {open: oo, inv: ii, loc: h.fromstkloc, debtorno: h.debtorno, branchcode: h.branchcode,
+              salesperson: h.salesperson, takenby: h.takenby, placedfrom: h.placedfrom,
+              created: h.date_created, confirmed: h.confirmeddate, h: fold(parts), g: sh.g, wake_at: w}
+  }
+  return out
+}
+
+fn things(ks, sh) {
+  let open = {}
+  for r in read("SELECT DISTINCT orderno FROM salesorderdetails WHERE completed = 0") { open[str(r.orderno)] = true }
+  let disp = {}
+  for r in read("SELECT invoice FROM dispatch WHERE cleared = 0 AND oclater = 0") { disp[okey(r.invoice)] = true }
+  # an order with no open line that is not out on a dispatch cannot be on the board
+  let seen = {}
+  let open_ks = []
+  let sent_ks = []
+  for key in ks {
+    let k = okey(key)
+    if has(seen, k) { continue }
+    seen[k] = true
+    if has(open, k) { push(open_ks, k) } else if has(disp, k) { push(sent_ks, k) }
+  }
+  let out = {}
+  if len(open_ks) > SMALL {
+    let bulk = compute(open_ks, sh, true)
+    for k in keys(bulk) { out[k] = bulk[k] }
+    open_ks = []
+  }
+  let rest = compute(concat(open_ks, sent_ks), sh, false)
+  for k in keys(rest) { out[k] = rest[k] }
+  return out
+}
+
+fn same(a, b, cols) {
+  if a == nil or b == nil { return false }
+  for c in cols { if a[c] != b[c] { return false } }
+  return true
+}
+
+fn whole(a, b) {
+  if a == nil or b == nil { return false }
+  for c in keys(a) { if a[c] != b[c] { return false } }
+  return true
+}
+
+fn ks_of(rows) {
+  let out = []
+  for r in rows { push(out, r.k) }
+  return out
+}
+
+fn by_item(code) { return concat(ks_of(read(OPEN_BY_ITEM, code)), ks_of(read(SENT_BY_ITEM, code))) }
+
+fn open_line(r) { return r != nil and str(r.completed) == "0" and real(num(r.quantityord)) > real(num(r.quantityrecd)) }
+
+# WATCH names the order for the tables that carry it; these reach orders only
+# through a join. The shared tables move `g` on every order.
+fn touched(table, op, before, after, sh) {
+  if table == "stockmoves" {
+    if op == "update" and same(before, after, ["transno", "type", "orderlineref", "qty"]) { return nil }
+    let ks = []
+    for r in [before, after] {
+      if r != nil and str(r.type) == "10" { ks = concat(ks, ks_of(read("SELECT DISTINCT order_ AS k FROM debtortrans WHERE transno = ?", r.transno))) }
+    }
+    return ks
+  }
+  if table == "debtorsmaster" {
+    if op == "update" and whole(before, after) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, concat(ks_of(read(OPEN_BY_DEBTOR, r.debtorno)), ks_of(read(SENT_BY_DEBTOR, r.debtorno)))) } }
+    return ks
+  }
+  if table == "custbranch" {
+    if op == "update" and whole(before, after) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, concat(ks_of(read(OPEN_BY_BRANCH, r.debtorno, r.branchcode)), ks_of(read(SENT_BY_BRANCH, r.debtorno, r.branchcode)))) } }
+    return ks
+  }
+  if table == "stockmaster" {
+    if op == "update" and whole(before, after) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, by_item(r.stockid)) } }
+    return ks
+  }
+  if table == "locstock" {
+    if op == "update" and same(before, after, ["loccode", "stockid", "quantity"]) { return nil }
+    # fillable reads locstock only for lines being picked; pickingfreeze names their item
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, ks_of(read("SELECT DISTINCT orderno AS k FROM pickingfreeze WHERE stockid = ?", r.stockid))) } }
+    return ks
+  }
+  if table == "purchorderdetails" {
+    if not open_line(before) and not open_line(after) { return nil }
+    if op == "update" and same(before, after, ["orderno", "podetailitem", "itemcode"]) and open_line(before) == open_line(after) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, by_item(r.itemcode)) } }
+    return ks
+  }
+  if table == "purchorders" {
+    if op == "update" and same(before, after, ["orderno", "supplierno"]) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, ks_of(read("SELECT sales_orderno AS k FROM salesordertopurchaseorder WHERE purchase_orderno = ?", r.orderno))) } }
+    return ks
+  }
+  if table == "suppliers" {
+    if op == "update" and same(before, after, ["supplierid", "bankref"]) { return nil }
+    let ks = []
+    for r in [before, after] { if r != nil { ks = concat(ks, ks_of(read("SELECT x.sales_orderno AS k FROM salesordertopurchaseorder x JOIN purchorders po ON po.orderno = x.purchase_orderno WHERE po.supplierno = ?", r.supplierid))) } }
+    return ks
+  }
+  if table == "salesordertopurchaseorder" {
+    # WATCH names its own order; the PO line it links also stops counting as uncommitted for everyone
+    let ks = []
+    for r in [before, after] {
+      if r != nil { for p in read("SELECT itemcode FROM purchorderdetails WHERE podetailitem = ?", r.purchase_order_line) { ks = concat(ks, by_item(p.itemcode)) } }
+    }
+    return ks
+  }
+  if has(GLOBAL_SET, table) { return {keys: [], shared: true} }
+  if table == "salesorders" or table == "salesorderdetails" or table == "debtortrans" or table == "pickingfreeze" or table == "oms_snoozed" or table == "salesorderpaymentmethod" or table == "trackinginfo" or table == "tpl3pl_shipments" or table == "authorizations" or table == "dispatch" { return nil }
+  return "all"
+}

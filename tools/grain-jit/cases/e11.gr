@@ -1,0 +1,18 @@
+# new operators, native vs interpreted: shift counts past 63 (lslv/asrv take
+# them mod 64), negative counts, int-only bits, compound targets evaluated once
+fn sh(a, b) { return [a << b, a >> b] }
+print(sh(1, 0), sh(1, 63), sh(1, 64), sh(1, 65), sh(-8, 1), sh(-8, 63), sh(-8, 64), sh(-8, 200))
+print(pcall(fn () { return sh(1, -1) }).error)
+print(pcall(fn () { return 3 & 1.0 }).error, pcall(fn () { return ~2.5 }).error)
+fn bits(n) { let x = 0 for i in range(0, n) { x ^= i << (i % 7) x &= 0xffff x |= 1 } return [x, ~x, x >> 3] }
+print(bits(200))
+let n = 0
+fn idx() { n += 1 return 0 }
+let l = [1]
+for i in range(0, 50) { l[idx()] += i }
+let m = {v: 0}
+fn obj() { n += 1 return m }
+for i in range(0, 50) { obj().v -= i }
+print(l, m.v, n)
+fn fs(a) { return f"{a} {a * 2} {{x}} {a > 1 ? 'big' : 'small'} {len([a, a])}" }
+print(fs(1), fs(3))

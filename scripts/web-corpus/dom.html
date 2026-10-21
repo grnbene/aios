@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><title>The DOM surface a page uses</title><style>body{background:#111;color:#ddd;font:13px monospace}</style></head>
+<body>
+<div id="host" class="alpha beta" data-id="D1" data-title="T1" data-value="V1" data-length="9">
+  <span class="kid" id="k1">one</span><span class="kid" id="k2">two</span><span class="kid" id="k3">three</span>
+</div>
+<ul id="list"><li>a</li><li>b</li></ul>
+<pre id="out"></pre>
+<script>
+var R = [];
+function ok(name, got, want) { R.push((String(got)===String(want) ? "PASS " : "FAIL ") + name + " got=" + got + " want=" + want); }
+var h = document.getElementById('host');
+
+ok('classList.contains(alpha)', h.classList.contains('alpha'), true);
+ok('classList.contains(zzz)', h.classList.contains('zzz'), false);
+h.classList.add('gamma'); ok('classList.add', h.className.indexOf('gamma')>=0, true);
+h.classList.remove('beta'); ok('classList.remove keeps node', !!document.getElementById('host'), true);
+ok('classList.remove drops class', h.classList.contains('beta'), false);
+h.classList.toggle('delta'); ok('classList.toggle on', h.classList.contains('delta'), true);
+
+ok('dataset.id', h.dataset.id, 'D1');
+ok('dataset.title', h.dataset.title, 'T1');
+ok('dataset.value', h.dataset.value, 'V1');
+ok('dataset.length', h.dataset.length, '9');
+h.dataset.id = 'D2'; ok('dataset write', h.getAttribute('data-id'), 'D2');
+
+ok('element.id', h.id, 'host');
+ok('children.length', h.children.length, 3);
+ok('querySelectorAll len', h.querySelectorAll('.kid').length, 3);
+ok('qsa[1].id', h.querySelectorAll('.kid')[1].id, 'k2');
+ok('querySelector', h.querySelector('.kid').id, 'k1');
+ok('closest', h.querySelector('.kid').closest('#host').id, 'host');
+ok('matches', h.matches('.alpha'), true);
+ok('contains(node)', h.contains(document.getElementById('k2')), true);
+ok('textContent', document.getElementById('k1').textContent, 'one');
+
+h.style.color = 'red'; ok('style write', h.getAttribute('style').indexOf('color')>=0, true);
+ok('style read back', h.style.color, 'red');
+
+var li = document.querySelectorAll('#list li');
+ok('nodelist length', li.length, 2);
+var seen = ''; li.forEach(function(n){ seen += n.textContent; }); ok('nodelist forEach', seen, 'ab');
+var made = document.createElement('b'); made.textContent = 'made';
+document.getElementById('list').appendChild(made);
+ok('appendChild', document.getElementById('list').children.length, 3);
+made.remove(); ok('element.remove', document.getElementById('list').children.length, 2);
+
+// The shapes that actually broke: a helper object must not answer with the
+// element's method of the same name.
+ok('classList is not the element', typeof h.classList.add, 'function');
+ok('dataset unknown key', String(h.dataset.nothingHere), 'undefined');
+ok('setAttribute/getAttribute', (h.setAttribute('data-x','9'), h.getAttribute('data-x')), '9');
+ok('removeAttribute', (h.removeAttribute('data-x'), h.hasAttribute('data-x')), false);
+ok('parentNode', document.getElementById('k1').parentNode.id, 'host');
+ok('insertBefore', (function(){ var n=document.createElement('i'); var l=document.getElementById('list');
+   l.insertBefore(n, l.children[0]); return l.children[0].tagName.toLowerCase(); })(), 'i');
+ok('className write', (h.className = 'solo', h.classList.contains('solo')), true);
+
+// A dropdown lives or dies on stopPropagation: the button's own click must not
+// reach the document handler that closes menus on an outside click. And
+// `el.click()` has to take the real event path, or nothing above is reachable
+// from script at all.
+var mbtn = document.createElement('button'); mbtn.id = 'mbtn';
+var mmenu = document.createElement('div'); mmenu.id = 'mmenu';
+document.getElementById('host').appendChild(mbtn);
+document.getElementById('host').appendChild(mmenu);
+var order = '';
+mbtn.addEventListener('click', function(e){ order += '1'; e.stopPropagation(); mmenu.className = 'open'; });
+document.addEventListener('click', function(){ order += 'D'; mmenu.className = ''; });
+mbtn.click();
+ok('element.click dispatches', order.indexOf('1') >= 0, true);
+ok('stopPropagation keeps the menu open', mmenu.className, 'open');
+ok('stopPropagation stops the bubble', order.indexOf('D'), -1);
+
+var imm = '';
+var ibtn = document.createElement('button'); document.getElementById('host').appendChild(ibtn);
+ibtn.addEventListener('click', function(e){ imm += 'a'; e.stopImmediatePropagation(); });
+ibtn.addEventListener('click', function(){ imm += 'b'; });
+ibtn.click();
+ok('stopImmediatePropagation drops later listeners', imm, 'a');
+
+
+document.getElementById('out').textContent = R.join('\n');
+</script></body></html>

@@ -1,0 +1,41 @@
+face system_monitor
+title "System Monitor"
+
+# Every figure here is a reading the kernel answers through machine(key);
+# nothing is typed in. (This app used to print "14.2%", "482 MB",
+# "128 Active", "1,048 Grants", "16 Cores", "Node: arch-qbc" as literals and
+# seeded three invented alerts on every load.)
+
+let cpus = machine("cpus")
+let arch = machine("arch")
+let host_name = machine("host")
+let mem_total = machine("mem_total")
+let mem_free = machine("mem_free")
+let mem_used = mem_total - mem_free
+let mem_pct = if(mem_total > 0, round(mem_used / mem_total * 100), 0)
+let mem_total_text = format_bytes(mem_total)
+let up = machine("uptime_s")
+let up_text = str((up - up % 3600) / 3600) + "h " + str((up % 3600 - up % 60) / 60) + "m"
+let caps = machine("caps")
+let records = machine("records")
+
+row gap=8
+  tile label="Processors" value=cpus accent=accent
+  tile label="Memory in use" value=format_bytes(mem_used) accent=ok
+  tile label="Memory total" value=format_bytes(mem_total)
+  tile label="Uptime" value=up_text
+
+grid 2fr 1fr gap=12
+  column gap=8
+    panel "Memory" pad=12
+      gauge value=mem_pct label="In use (%)" color="#30D158"
+      text "{mem_pct}% of {mem_total_text} in use" dim
+    panel "Kernel" pad=12
+      row gap=8
+        tile label="Capability grants" value=caps
+        tile label="Stored records" value=records
+  column gap=8
+    panel "Machine" pad=12
+      text "Host: {host_name}"
+      text "Architecture: {arch}"
+      text "Processors: {cpus}"

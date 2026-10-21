@@ -1,0 +1,48 @@
+<!doctype html>
+<html><head><title>A page written in 1999</title><style>
+/* The shape of a page that lays out with a table and submits with a form —
+   which is most of the web that is not a single-page application, and is
+   google.com's no-script front page exactly. Every line here is something the
+   engine got wrong: a table that spanned the window instead of shrinking to
+   its columns, `<td width="25%">` ignored, a search field sized by its VALUE
+   instead of its `size`, a hidden input drawn as a box as wide as its token,
+   a cell's first child stretched to the row height, and a light page's form
+   controls painted in this machine's dark colours. */
+body { background: #ffffff; color: #202020; font: 15px sans-serif; margin: 0; }
+.lst { width: 300px; height: 25px; }
+.btn { background: #f3f5f6; border: 1px solid #d2d2d2; }
+.side { color: #1558d6; font-size: 11px; }
+.chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #999;
+        border-radius: 999px; padding: 3px 8px; background: #eee; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #34c759; }
+</style></head><body>
+<center>
+<form action="/search">
+<table cellpadding="0" cellspacing="0">
+ <tr valign="top">
+  <td width="25%">&nbsp;</td>
+  <td align="center" nowrap="">
+    <input type="hidden" name="token" value="a-signing-token-long-enough-to-stretch-a-row">
+    <input type="hidden" name="src" value="hp">
+    <div><input class="lst" name="q" size="40" title="Search"></div>
+    <br>
+    <input class="btn" type="submit" name="go" value="Search">
+    <input class="btn" type="submit" name="lucky" value="I'm Feeling Lucky">
+  </td>
+  <td class="side" align="left" nowrap="" width="25%">Advanced search</td>
+ </tr>
+</table>
+</form>
+</center>
+<!-- A control whose content is BOXES, not a label: it lays its children out
+     rather than being drawn as one word. -->
+<p><button class="chip" type="button"><span class="dot"></span>connected</button>
+   <button type="button">plain</button>
+   <select name="mode"><option>Auto</option><option selected>Manual</option></select>
+   <input type="checkbox" checked> <input type="radio"></p>
+<p><textarea name="note" cols="30" rows="2">a note</textarea></p>
+<table border="1">
+ <tr><th>Service</th><th>Port</th></tr>
+ <tr><td>assay serve</td><td>4317</td></tr>
+</table>
+</body></html>

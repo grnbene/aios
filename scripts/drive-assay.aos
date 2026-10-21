@@ -1,0 +1,10 @@
+# Bind the Assay-backed external intelligence. The kernel sees only an
+# Intelligence; the bridge lives at intelligence/assay/bridge.cjs and needs a
+# model configured (~/.assay/config.json or AIOS_MODEL_* env). Without one the
+# bind succeeds (the bridge answers hello) and the cycle fails with the reason.
+entity create thinker => t
+cap grant $t kernel * schedule
+cap grant $t compute * execute
+state create $t context "You are the first entity of a new operating system. State what you now hold to be true."
+mind bind $t extern node ../intelligence/assay/bridge.cjs
+mind cycle $t

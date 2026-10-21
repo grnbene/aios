@@ -1,0 +1,67 @@
+face notes
+title "Notes"
+kind note key=id
+
+# Only the notes actually saved. This app used to seed three invented notes,
+# show a "3 Notes Stored" badge and "Word count: 24 words" as literals, and
+# claim to be "synchronized with local SSD storage".
+
+let notes = latest(list(note), id)
+let live = where(notes, deleted, false)
+let note_count = count(live)
+let next_id = "NOTE-" + str(count(notes) + 1)
+let chars = len(note_content)
+
+state note_id = ""
+state note_title = ""
+state note_category = "Personal"
+state note_content = ""
+state status_note = ""
+
+toolbar gap=8
+  button "New Note" action=on_new primary
+  button "Save" action=on_save
+  button "Delete" action=on_delete danger
+
+row gap=12
+  column gap=8
+    panel "Notebook" pad=10
+      text "{note_count} notes" dim
+      table live columns="id:ID, title:Title, cat:Tag" rows=10 empty="No notes yet"
+  column gap=8
+    panel "Editor" pad=14
+      row gap=8
+        field id=note_title placeholder="Title" width=320 focus
+        select id=note_category options="Personal,Work,Ideas,Meeting" label="Category"
+      field id=note_content placeholder="Write here..." width=560
+      spacer size=8
+      text "{chars} characters" dim
+
+text "{status_note}" dim
+
+on on_new:
+  set note_id = ""
+  set note_title = ""
+  set note_content = ""
+  set status_note = ""
+  focus note_title
+
+on on_save:
+  if note_title == "":
+    set status_note = "Give the note a title first."
+    focus note_title
+  else:
+    if note_id == "":
+      set note_id = next_id
+    put note {id: note_id, title: note_title, cat: note_category, body: note_content, deleted: false}
+    set status_note = "Saved " + note_id
+
+on on_delete:
+  if note_id == "":
+    set status_note = "Open or save a note before deleting it."
+  else:
+    put note {id: note_id, title: note_title, cat: note_category, body: note_content, deleted: true}
+    set status_note = "Deleted " + note_id
+    set note_id = ""
+    set note_title = ""
+    set note_content = ""

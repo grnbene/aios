@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIOS · ARM64 Build Status</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2b3140;
+    --ink:#e8ecf3; --muted:#9aa4b6; --dim:#6b7688;
+    --ok:#2fbf71; --okbg:#12351f; --bad:#ff5d5d; --badbg:#3a1717;
+    --warn:#f5a623; --warnbg:#3a2c12; --run:#4aa8ff; --runbg:#122b45;
+    --focus:#7cc4ff;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;max-width:100%;}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    overflow-x:hidden; -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:1120px;margin:0 auto;padding:16px 12px 56px;}
+  header.top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:16px;}
+  h1{font-size:19px;margin:0;letter-spacing:.2px;overflow-wrap:anywhere;}
+  h1 .sub{display:block;font-size:12px;color:var(--muted);font-weight:400;margin-top:2px;}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px;margin-bottom:14px;overflow:hidden;
+  }
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);margin:0 0 12px;}
+  .grid{display:grid;grid-template-columns:1fr;gap:14px;}
+  @media(min-width:820px){ .grid.split{grid-template-columns:1.15fr .85fr;} }
+  .hidden{display:none !important;}
+
+  /* ---- badges ---- */
+  .badge{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:12.5px;
+    padding:4px 10px;border-radius:999px;border:1px solid transparent;white-space:nowrap;}
+  .badge .ic{font-weight:700;}
+  .b-ok{background:var(--okbg);color:var(--ok);border-color:#1d5c39;}
+  .b-bad{background:var(--badbg);color:var(--bad);border-color:#6b2a2a;}
+  .b-warn{background:var(--warnbg);color:var(--warn);border-color:#6b521f;}
+  .b-run{background:var(--runbg);color:var(--run);border-color:#2a5a86;}
+  .b-idle{background:var(--panel2);color:var(--muted);border-color:var(--line);}
+
+  .kv{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:10px;}
+  .kv div{min-width:0;}
+  .kv .k{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);}
+  .kv .v{font-size:14px;font-weight:600;overflow-wrap:anywhere;}
+
+  /* ---- stage tracker ---- */
+  .stages{display:flex;flex-direction:column;gap:10px;}
+  @media(min-width:560px){ .stages{flex-direction:row;align-items:flex-start;gap:0;} }
+  .stage{flex:1;display:flex;gap:10px;align-items:flex-start;position:relative;padding:4px 0;min-width:0;}
+  @media(min-width:560px){ .stage{flex-direction:column;align-items:center;text-align:center;padding:0 4px;} }
+  .stage .dot{
+    width:34px;height:34px;min-width:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    font-weight:700;font-size:15px;border:2px solid var(--line);background:var(--panel2);color:var(--dim);
+  }
+  .stage .lab{display:flex;flex-direction:column;gap:2px;min-width:0;}
+  .stage .lab b{font-size:13px;overflow-wrap:anywhere;}
+  .stage .lab span{font-size:11.5px;color:var(--dim);}
+  .stage.done .dot{background:var(--okbg);border-color:var(--ok);color:var(--ok);}
+  .stage.done .lab b{color:var(--ink);}
+  .stage.failed .dot{background:var(--badbg);border-color:var(--bad);color:var(--bad);}
+  .stage.failed .lab b{color:var(--bad);}
+  .stage.current .dot{background:var(--runbg);border-color:var(--run);color:var(--run);}
+  .stage.pending{opacity:.6;}
+  @media(min-width:560px){
+    .stage:not(:last-child)::after{
+      content:"";position:absolute;top:16px;left:calc(50% + 22px);right:calc(-50% + 22px);
+      height:2px;background:var(--line);
+    }
+    .stage.done:not(:last-child)::after{background:var(--ok);}
+  }
+
+  /* ---- toolchain checklist ---- */
+  ul.tools{list-style:none;margin:0;padding:0;}
+  ul.tools li{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line);min-height:44px;}
+  ul.tools li:last-child{border-bottom:0;}
+  ul.tools .tn{flex:1;min-width:0;overflow-wrap:anywhere;font-weight:600;font-size:13.5px;}
+  ul.tools .tn small{display:block;font-weight:400;color:var(--dim);font-size:11.5px;overflow-wrap:anywhere;}
+
+  /* ---- failure panel ---- */
+  .fail-head{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;}
+  .fail-sum{font-size:13.5px;color:var(--ink);margin:10px 0 0;overflow-wrap:anywhere;}
+  .symtable{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;}
+  .symtable td{padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top;}
+  .symtable td.c{text-align:right;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums;}
+  .symtable code{overflow-wrap:anywhere;word-break:break-word;}
+  pre.raw{
+    background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;
+    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#c9d3e2;
+    max-height:240px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:10px 0 0;
+  }
+
+  /* ---- buttons / controls ---- */
+  button, .btn, input[type=file]::file-selector-button, select{
+    font:inherit;font-size:13.5px;font-weight:600;color:var(--ink);
+    background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    min-height:44px;padding:10px 14px;cursor:pointer;touch-action:manipulation;
+  }
+  button:hover,.btn:hover{border-color:#3d465c;background:#232836;}
+  button:focus-visible,.btn:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--focus);outline-offset:2px;}
+  button.pressed{transform:translateY(1px);}
+  button.primary{background:var(--runbg);border-color:#2a5a86;color:#cfe7ff;}
+  button[disabled]{opacity:.55;cursor:not-allowed;}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+  .row > *{min-width:0;}
+  input[type=file]{font-size:12.5px;color:var(--muted);max-width:100%;}
+  textarea{
+    width:100%;min-height:96px;background:#0b0d11;color:var(--ink);border:1px solid var(--line);
+    border-radius:9px;padding:10px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;
+    overflow-wrap:anywhere;resize:vertical;max-width:100%;
+  }
+  input[type=text]{
+    background:#0b0d11;color:var(--ink);border:1px solid var(--line);border-radius:9px;
+    padding:10px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;min-height:44px;
+    flex:1 1 180px;min-width:0;max-width:100%;
+  }
+  label.fl{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);margin:12px 0 6px;}
+
+  /* ---- history ---- */
+  ul.hist{list-style:none;margin:0;padding:0;max-height:320px;overflow-y:auto;overflow-x:hidden;}
+  ul.hist li{margin-bottom:8px;}
+  ul.hist button{
+    width:100%;text-align:left;display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;justify-content:space-between;
+  }
+  ul.hist .hn{font-weight:600;font-size:13px;overflow-wrap:anywhere;}
+  ul.hist .hm{font-size:11px;color:var(--dim);overflow-wrap:anywhere;}
+  ul.hist button[aria-current="true"]{border-color:var(--focus);}
+
+  /* ---- empty / loading ---- */
+  .empty{text-align:center;padding:28px 12px;color:var(--muted);}
+  .empty .big{font-size:30px;margin-bottom:8px;}
+  .empty p{margin:6px auto;max-width:44ch;overflow-wrap:anywhere;}
+  .spinner{
+    width:18px;height:18px;border-radius:50%;border:3px solid var(--line);
+    border-top-color:var(--run);animation:spin .8s linear infinite;display:inline-block;vertical-align:-3px;
+  }
+  @keyframes spin{to{transform:rotate(360deg);}}
+  #pendingIndicator{display:flex;gap:10px;align-items:center;background:var(--runbg);
+    border:1px solid #2a5a86;color:#cfe7ff;border-radius:9px;padding:10px 12px;margin-top:12px;font-size:13px;}
+  .muted{color:var(--muted);font-size:12.5px;}
+  .toast{position:fixed;left:12px;right:12px;bottom:12px;background:var(--badbg);border:1px solid #6b2a2a;
+    color:var(--bad);border-radius:10px;padding:12px 14px;font-size:13px;z-index:50;overflow-wrap:anywhere;}
+  @media(min-width:620px){ .toast{left:auto;right:20px;max-width:420px;} }
+  footer{color:var(--dim);font-size:11.5px;text-align:center;margin-top:8px;overflow-wrap:anywhere;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1>AIOS Build Status<span class="sub">Target: <strong id="hdrTarget">aarch64</strong> · <span id="hdrSrc">no data source connected</span></span></h1>
+    <div class="row">
+      <button id="btnLoadEmbedded" type="button">Load last known run</button>
+      <button id="btnClear" type="button">Clear</button>
+    </div>
+  </header>
+
+  <!-- EMPTY STATE -->
+  <section id="emptyState" class="card" aria-live="polite">
+    <div class="empty">
+      <div class="big" aria-hidden="true">🗂️</div>
+      <p><strong>No build data loaded</strong> — import a log or connect a source.</p>
+      <p class="muted">Load the embedded snapshot of the last ARM64 attempt, or paste / pick a status JSON below.</p>
+      <div class="row" style="justify-content:center;margin-top:14px;">
+        <button id="btnEmptyLoad" type="button" class="primary">Load last known run</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- DASHBOARD -->
+  <main id="dashboard" class="hidden">
+
+    <!-- 1. SUMMARY -->
+    <section class="card" aria-labelledby="hSum">
+      <h2 id="hSum">Latest build attempt</h2>
+      <div class="fail-head">
+        <div>
+          <div style="font-size:16px;font-weight:700;overflow-wrap:anywhere;" id="sumName">—</div>
+          <div class="muted" id="sumId">—</div>
+        </div>
+        <span id="sumBadge" class="badge b-idle"><span class="ic">•</span><span class="t">unknown</span></span>
+      </div>
+      <div class="kv">
+        <div><div class="k">Target</div><div class="v" id="sumTarget">—</div></div>
+        <div><div class="k">Duration</div><div class="v" id="sumDur">—</div></div>
+        <div><div class="k">Reached stage</div><div class="v" id="sumStage">—</div></div>
+        <div><div class="k">Halted by</div><div class="v" id="sumHalt">—</div></div>
+      </div>
+    </section>
+
+    <div class="grid split">
+      <!-- 3. STAGES -->
+      <section class="card" aria-labelledby="hStage">
+        <h2 id="hStage">Stage progress</h2>
+        <div class="stages" id="stageTracker" role="list"></div>
+      </section>
+
+      <!-- 2. TOOLCHAIN -->
+      <section class="card" aria-labelledby="hTools">
+        <h2 id="hTools">Toolchain &amp; dependencies</h2>
+        <ul class="tools" id="toolList"></ul>
+      </section>
+    </div>
+
+    <!-- 4. FAILURE DETAIL -->
+    <section class="card" aria-labelledby="hFail">
+      <h2 id="hFail">Failure detail</h2>
+      <div class="fail-head">
+        <span class="badge b-idle" id="failBadge"><span class="ic">•</span><span class="t">none</span></span>
+        <button id="btnFailToggle" type="button" aria-expanded="true" aria-controls="failBody">Collapse</button>
+      </div>
+      <p class="fail-sum" id="failSum"><span class="muted">No failure recorded for this run.</span></p>
+      <div id="failBody">
+        <table class="symtable" id="failTable" aria-label="Top unresolved symbols"></table>
+        <pre class="raw" id="failRaw"></pre>
+      </div>
+    </section>
+
+    <div class="grid split">
+      <!-- 5. HISTORY -->
+      <section class="card" aria-labelledby="hHist">
+        <h2 id="hHist">Run history</h2>
+        <ul class="hist" id="histList"></ul>
+      </section>
+
+      <!-- 6 + 7. RETRY + IMPORT -->
+      <section class="card" aria-labelledby="hAct">
+        <h2 id="hAct">Re-run &amp; import</h2>
+
+        <label class="fl" for="cmdInput">Build command</label>
+        <div class="row">
+          <input type="text" id="cmdInput" value="bash metal/build-arm64.sh" placeholder="&lt;build-command&gt;" spellcheck="false">
+          <button id="btnRetry" class="primary" type="button">Re-run build</button>
+        </div>
+        <div id="pendingIndicator" class="hidden" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="pendingText">Build queued — awaiting first status update…</span>
+        </div>
+
+        <label class="fl" for="fileInput">Import status JSON (file)</label>
+        <input type="file" id="fileInput" accept=".json,application/json">
+
+        <label class="fl" for="pasteBox">Import status JSON (paste)</label>
+        <textarea id="pasteBox" placeholder='{"target":"aarch64","builds":[ ... ]}' spellcheck="false"></textarea>
+        <div class="row" style="margin-top:10px;">
+          <button id="btnPasteLoad" type="button">Load pasted JSON</button>
+        </div>
+        <p class="muted" style="margin-top:10px;">Live source: <code>arm64-build-status.json</code> (sibling file). Absent ⇒ empty state.</p>
+      </section>
+    </div>
+
+    <footer id="footer">—</footer>
+  </main>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ============ embedded snapshot: the real observed ARM64 run ============ */
+  var EMBEDDED = {
+    "schema": "aios.arm64-build-status/1",
+    "generatedAt": "2026-09-22T20:36:00-04:00",
+    "target": "aarch64",
+    "source": "embedded snapshot (bgtasks logs)",
+    "builds": [
+      {
+        "id": "bg-20260922192450-f5ee39",
+        "name": "arm64-full-userland-build-2",
+        "status": "failed",
+        "startedAt": "2026-09-22T19:24:00-04:00",
+        "durationMs": 441000,
+        "haltedStage": "link",
+        "haltedBy": "linker (ld) — missing implementations + no aarch64 libc on link line",
+        "stages": [
+          {"id":"configure","label":"Configure","state":"done","note":"toolchain 13 resolved at /usr/bin/aarch64-linux-gnu-g++"},
+          {"id":"compile","label":"Compile","state":"done","note":"188 objects; 0 compile errors (warnings only)"},
+          {"id":"link","label":"Link","state":"failed","note":"ld exit 1 — 3728 undefined references"},
+          {"id":"package","label":"Package","state":"pending","note":"not reached — .elf absent, .bin stale (18:41)"}
+        ],
+        "tools": [
+          {"name":"aarch64-linux-gnu-g++","state":"pass","detail":"/usr/bin/aarch64-linux-gnu-g++ — cross compiler present"},
+          {"name":"aarch64-linux-gnu-gcc","state":"pass","detail":"/usr/bin/aarch64-linux-gnu-gcc"},
+          {"name":"qemu-system-aarch64","state":"pass","detail":"/usr/bin/qemu-system-aarch64 — boot harness present"},
+          {"name":"ld / binutils","state":"pass","detail":"/usr/bin/ld"},
+          {"name":"make / cmake","state":"pass","detail":"/usr/bin/make, /usr/bin/cmake"},
+          {"name":"bare-metal aarch64 libc (libc.a/libm/libpthread)","state":"missing","detail":"Not on ARM link line ⇒ ~1900 of 3728 unresolved refs (__libc_single_threaded, memchr, strtod, pthread_*, sqrtf/sin/cos). STL needs glibc >= 2.38 (__isoc23_*)."},
+          {"name":"ARM metal HAL shim (aios::hal::Mutex/Thread/net_*/tpm_*/pci_*/process_*)","state":"missing","detail":"hal_metal_arm64/hal_net_arm64/hal_thread_arm64/hal_host_arm64 do not yet define the surface the full userland calls — Mutex::lock/unlock alone account for 753 refs."}
+        ],
+        "failure": {
+          "summary": "Link failed with 3728 undefined references — two classes: (a) ~1900 libc/libm/libpthread symbols missing from the link line; (b) the aios::hal:: host surface not implemented by the ARM metal HAL.",
+          "topSymbols": [
+            {"sym":"__libc_single_threaded","count":560},
+            {"sym":"aios::hal::Mutex::unlock()","count":439},
+            {"sym":"aios::hal::Mutex::lock()","count":314},
+            {"sym":"memchr","count":254},
+            {"sym":"aios::hal::Thread::~Thread()","count":127},
+            {"sym":"pthread_mutex_unlock","count":125},
+            {"sym":"strtod","count":117},
+            {"sym":"__snprintf_chk","count":90},
+            {"sym":"aios::hal::Thread::Thread(std::function<void ()>)","count":84},
+            {"sym":"pthread_mutex_lock","count":82},
+            {"sym":"__nl_langinfo_l","count":75},
+            {"sym":"__isoc23_strtol","count":63},
+            {"sym":"stderr","count":59},
+            {"sym":"aios::hal::Mutex::~Mutex()","count":54},
+            {"sym":"aios::hal::Thread::join()","count":50}
+          ],
+          "raw": "ld: ... undefined reference to `__libc_single_threaded'   (x560)\nld: ... undefined reference to `aios::hal::Mutex::unlock()' (x439)\nld: ... undefined reference to `memchr'                    (x254)\nld: ... undefined reference to `pthread_mutex_unlock'      (x125)\nld: libgcc_eh.a(unwind-dw2-fde-dip.o): undefined reference to `free'\nld: libgcc.a(lse-init.o): undefined reference to `__getauxval'\nBUILD_EXIT=1"
+        }
+      },
+      {
+        "id": "bg-20260922191852-a141a1",
+        "name": "arm64-full-userland-build",
+        "status": "failed",
+        "startedAt": "2026-09-22T19:18:00-04:00",
+        "durationMs": 320000,
+        "haltedStage": "link",
+        "haltedBy": "linker (ld) — 3728 undefined references",
+        "stages": [
+          {"id":"configure","label":"Configure","state":"done","note":"ok"},
+          {"id":"compile","label":"Compile","state":"done","note":"164 objects, 0 errors"},
+          {"id":"link","label":"Link","state":"failed","note":"ld exit 1 — 3728 undefined references"},
+          {"id":"package","label":"Package","state":"pending","note":"not reached"}
+        ],
+        "tools": [
+          {"name":"aarch64-linux-gnu-g++","state":"pass","detail":"present"},
+          {"name":"qemu-system-aarch64","state":"pass","detail":"present"},
+          {"name":"bare-metal aarch64 libc","state":"missing","detail":"not linked"},
+          {"name":"ARM metal HAL shim","state":"missing","detail":"incomplete"}
+        ],
+        "failure": {
+          "summary": "First full-userland ARM link attempt: 3728 undefined references, BUILD_EXIT=1. Same two classes as the run above.",
+          "topSymbols": [
+            {"sym":"__libc_single_threaded","count":560},
+            {"sym":"aios::hal::Mutex::unlock()","count":439},
+            {"sym":"aios::hal::Mutex::lock()","count":314}
+          ],
+          "raw":"BUILD_EXIT=1  (3728 undefined references)"
+        }
+      },
+      {
+        "id": "bg-20260922184554-689ac7",
+        "name": "arm-build-full",
+        "status": "succeeded",
+        "startedAt": "2026-09-22T18:45:00-04:00",
+        "durationMs": 84000,
+        "haltedStage": null,
+        "haltedBy": null,
+        "stages": [
+          {"id":"configure","label":"Configure","state":"done","note":"ok"},
+          {"id":"compile","label":"Compile","state":"done","note":"6 src units only"},
+          {"id":"link","label":"Link","state":"done","note":"exit 0 — 1.4M ELF, 0 undefined"},
+          {"id":"package","label":"Package","state":"done","note":"bin emitted"}
+        ],
+        "tools": [
+          {"name":"aarch64-linux-gnu-g++","state":"pass","detail":"present"},
+          {"name":"qemu-system-aarch64","state":"pass","detail":"present"}
+        ],
+        "failure": null
+      },
+      {
+        "id": "bg-20260922183950-665404",
+        "name": "x86-metal-build",
+        "status": "failed",
+        "startedAt": "2026-09-22T18:39:00-04:00",
+        "durationMs": null,
+        "haltedStage": "compile",
+        "haltedBy": "g++ — cli/commands.cpp incomplete-type errors (pre-existing in tree)",
+        "stages": [
+          {"id":"configure","label":"Configure","state":"done","note":"ok"},
+          {"id":"compile","label":"Compile","state":"failed","note":"cli/commands.cpp:2208/2259/2310 — 'std::ifstream' has initializer but incomplete type"},
+          {"id":"link","label":"Link","state":"pending","note":"not reached"},
+          {"id":"package","label":"Package","state":"pending","note":"not reached"}
+        ],
+        "tools": [
+          {"name":"g++ (host x86)","state":"pass","detail":"present"},
+          {"name":"<fstream> completeness under build flags","state":"missing","detail":"pre-existing; cli/commands.cpp is untouched by the ARM work"}
+        ],
+        "failure": {
+          "summary": "x86 metal build stopped at compile: 'variable std::ifstream ... has initializer but incomplete type' in cli/commands.cpp (lines 2208/2259/2310). Pre-existing in this tree, not caused by the ARM port.",
+          "topSymbols": [],
+          "raw":"cli/commands.cpp:2259:28: error: variable 'std::ifstream cf' has initializer but incomplete type\naios/cli/commands.cpp:2310:26: error: variable 'std::ifstream pf' has initializer but incomplete type"
+        }
+      }
+    ]
+  };
+
+  /* ============ state ============ */
+  var state = { data: null, currentId: null };
+
+  var $ = function(id){ return document.getElementById(id); };
+  function el(tag, cls, txt){ var e=document.createElement(tag); if(cls)e.className=cls; if(txt!=null)e.textContent=txt; return e; }
+  function on(node, ev, fn){ if(node) node.addEventListener(ev, fn, {passive: ev!=='click'}); }
+  /* press feedback only — never the activation path, so no double-fire */
+  function pressFeedback(node){
+    on(node,'pointerdown',function(){ node.classList.add('pressed'); });
+    on(node,'pointerup',function(){ node.classList.remove('pressed'); });
+    on(node,'pointercancel',function(){ node.classList.remove('pressed'); });
+  }
+
+  var ICON = { pass:'✓', fail:'✕', failed:'✕', missing:'!', running:'◌', succeeded:'✓', pending:'◌', done:'✓', incomplete:'◌' };
+  var BADGE = { succeeded:'b-ok', failed:'b-bad', running:'b-run', incomplete:'b-warn' };
+
+  function statusBadge(node, status){
+    var s = String(status||'unknown').toLowerCase();
+    var cls = BADGE[s] || 'b-idle';
+    node.className = 'badge ' + cls;
+    node.innerHTML = '';
+    node.appendChild(el('span','ic', ICON[s] || '•'));
+    node.appendChild(el('span','t', s));
+  }
+  function fmtDur(ms){
+    if(ms==null) return '—';
+    var s = Math.round(ms/1000), m = Math.floor(s/60), r = s%60;
+    return m>0 ? (m+'m '+r+'s') : (r+'s');
+  }
+
+  /* ============ renderers ============ */
+  function renderSummary(b){
+    $('sumName').textContent = b.name || b.id || '—';
+    $('sumId').textContent = b.id || '—';
+    statusBadge($('sumBadge'), b.status);
+    $('sumTarget').textContent = (state.data && state.data.target) || '—';
+    $('sumDur').textContent = fmtDur(b.durationMs);
+    $('sumStage').textContent = b.haltedStage ? labelOf(b,'halted') : 'all stages';
+    $('sumHalt').textContent = b.haltedBy || '—';
+  }
+  function labelOf(b, kind){
+    var s = (b.stages||[]).map(function(x){return x.label+' ('+x.state+')';}).join(' → ');
+    return s || '—';
+  }
+
+  function renderStages(b){
+    var box = $('stageTracker'); box.innerHTML='';
+    (b.stages||[]).forEach(function(st, i){
+      var wrapEl = el('div','stage ' + (st.state||'pending'));
+      wrapEl.setAttribute('role','listitem');
+      var dot = el('div','dot', ICON[st.state] || '•');
+      dot.setAttribute('aria-hidden','true');
+      var lab = el('div','lab');
+      lab.appendChild(el('b',null, st.label));
+      lab.appendChild(el('span',null, st.state + (st.note ? ' · ' + st.note : '')));
+      wrapEl.appendChild(dot); wrapEl.appendChild(lab);
+      box.appendChild(wrapEl);
+    });
+  }
+
+  function renderTools(b){
+    var ul = $('toolList'); ul.innerHTML='';
+    var tools = b.tools || [];
+    if(!tools.length){ ul.appendChild(el('li',null,'No toolchain data in this run.')); return; }
+    tools.forEach(function(t){
+      var li = el('li');
+      var bd = el('span','badge ' + (t.state==='pass'?'b-ok':(t.state==='missing'?'b-warn':'b-bad')));
+      bd.appendChild(el('span','ic', ICON[t.state] || '•'));
+      bd.appendChild(el('span','t', t.state || 'unknown'));
+      var nm = el('div','tn');
+      nm.appendChild(document.createTextNode(t.name || '(unnamed)'));
+      if(t.detail) nm.appendChild(el('small',null,t.detail));
+      li.appendChild(bd); li.appendChild(nm);
+      ul.appendChild(li);
+    });
+  }
+
+  function renderFailure(b){
+    var f = b.failure;
+    var failed = (b.status==='failed' || b.status==='incomplete');
+    statusBadge($('failBadge'), failed ? 'failed' : (b.status||'none'));
+    $('failSum').innerHTML = '';
+    if(!f){ $('failSum').appendChild(el('span','muted','No failure recorded for this run.')); }
+    else { $('failSum').appendChild(document.createTextNode(f.summary || 'Failure recorded.')); }
+
+    var tbl = $('failTable'); tbl.innerHTML='';
+    var syms = (f && f.topSymbols) || [];
+    if(syms.length){
+      var h = el('tr'); h.appendChild(el('td',null,'Unresolved symbol')); h.appendChild(el('td','c',null));
+      syms.forEach(function(s){
+        var tr = el('tr');
+        var td1 = el('td'); td1.appendChild(el('code',null, s.sym));
+        tr.appendChild(td1);
+        tr.appendChild(el('td','c', '×' + s.count));
+        tbl.appendChild(tr);
+      });
+    }
+    $('failRaw').textContent = (f && f.raw) || (f ? '<error output>' : '');
+  }
+
+  function renderHistory(){
+    var ul = $('histList'); ul.innerHTML='';
+    var builds = (state.data && state.data.builds) || [];
+    if(!builds.length){ ul.appendChild(el('li',null,'No runs recorded.')); return; }
+    builds.slice().reverse().forEach(function(b){
+      var li = el('li');
+      var btn = el('button');
+      btn.type='button';
+      btn.setAttribute('aria-current', String(b.id===state.currentId));
+      var left = el('div');
+      left.appendChild(el('div','hn', b.name || b.id));
+      left.appendChild(el('div','hm', (b.id||'') + ' · ' + fmtDur(b.durationMs) + (b.haltedStage ? ' · halted at ' + b.haltedStage : ''))); 
+      var bd = el('span','badge ' + (BADGE[b.status]||'b-idle'));
+      bd.appendChild(el('span','ic', ICON[b.status]||'•'));
+      bd.appendChild(el('span','t', b.status||'unknown'));
+      btn.appendChild(left); btn.appendChild(bd);
+      on(btn,'click',function(){ selectRun(b.id); });
+      pressFeedback(btn);
+      li.appendChild(btn); ul.appendChild(li);
+    });
+  }
+
+  function renderAll(){
+    var d = state.data;
+    if(!d || !d.builds || !d.builds.length){ showEmpty(); return; }
+    var cur = d.builds.filter(function(b){ return b.id===state.currentId; })[0] || d.builds[d.builds.length-1];
+    state.currentId = cur.id;
+    $('emptyState').classList.add('hidden');
+    $('dashboard').classList.remove('hidden');
+    $('hdrTarget').textContent = d.target || '—';
+    $('hdrSrc').textContent = d.source || 'loaded';
+    $('footer').textContent = 'source: ' + (d.source||'—') + ' · generated ' + (d.generatedAt||'—') + ' · schema ' + (d.schema||'—');
+    renderSummary(cur);
+    renderStages(cur);
+    renderTools(cur);
+    renderFailure(cur);
+    renderHistory();
+  }
+  function selectRun(id){ state.currentId = id; renderAll(); }
+
+  function showEmpty(){
+    $('dashboard').classList.add('hidden');
+    $('emptyState').classList.remove('hidden');
+  }
+
+  /* ============ loading ============ */
+  function loadStatus(obj){
+    if(!obj || typeof obj !== 'object') throw new Error('status payload is not an object');
+    if(obj.builds && !Array.isArray(obj.builds)) throw new Error('"builds" must be an array');
+    state.data = obj;
+    state.currentId = obj.builds && obj.builds.length ? obj.builds[obj.builds.length-1].id : null;
+    try{ window.localStorage.setItem('aios.arm64build.status', JSON.stringify(obj)); }catch(e){}
+    renderAll();
+  }
+  function clearStatus(){
+    state.data=null; state.currentId=null;
+    try{ window.localStorage.removeItem('aios.arm64build.status'); }catch(e){}
+    showEmpty();
+  }
+  function toast(msg){
+    var t = el('div','toast', msg);
+    document.body.appendChild(t);
+    setTimeout(function(){ if(t.parentNode) t.parentNode.removeChild(t); }, 6000);
+  }
+
+  /* live source: sibling arm64-build-status.json; absent => empty state */
+  function tryLiveSource(){
+    if(typeof fetch !== 'function'){ showEmpty(); return; }
+    fetch('arm64-build-status.json', {cache:'no-store'})
+      .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(function(j){ loadStatus(j); })
+      .catch(function(){ showEmpty(); });
+  }
+
+  /* ============ retry (pending state) ============ */
+  var pendingTimer = null;
+  function beginRetry(){
+    var cmd = ($('cmdInput').value || '').trim() || '<build-command>';
+    $('pendingIndicator').classList.remove('hidden');
+    $('pendingText').textContent = 'Build queued — "' + cmd + '" — awaiting first status update…';
+    $('btnRetry').disabled = true;
+    // No live executor is connected in this standalone dashboard: the run is
+    // recorded as "running" then settled as "incomplete" (no source connected).
+    var run = {
+      id: 'local-' + Date.now(),
+      name: 'manual re-run',
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      durationMs: null,
+      haltedStage: null, haltedBy: null,
+      stages: [
+        {id:'configure',label:'Configure',state:'current',note:'queued'},
+        {id:'compile',label:'Compile',state:'pending',note:'pending'},
+        {id:'link',label:'Link',state:'pending',note:'pending'},
+        {id:'package',label:'Package',state:'pending',note:'pending'}
+      ],
+      tools: (state.data && state.data.builds && state.data.builds[0].tools) || [],
+      failure: null
+    };
+    if(!state.data) state.data = { schema:'aios.arm64-build-status/1', target:'aarch64', source:'manual', builds:[] };
+    if(!Array.isArray(state.data.builds)) state.data.builds = [];
+    state.data.builds.push(run);
+    state.currentId = run.id;
+    renderAll();
+    if(pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(function(){
+      run.status = 'incomplete';
+      run.haltedBy = 'no live source connected (dashboard standalone)';
+      run.stages[0].state = 'done';
+      run.stages[1].state = 'failed';
+      run.stages[1].note = 'no executor attached';
+      $('pendingIndicator').classList.add('hidden');
+      $('btnRetry').disabled = false;
+      renderAll();
+    }, 6000);
+  }
+
+  /* ============ wire up ============ */
+  on($('btnRetry'),'click', beginRetry);
+  on($('btnLoadEmbedded'),'click', function(){ try{ loadStatus(EMBEDDED); }catch(e){ toast(String(e.message||e)); } });
+  on($('btnEmptyLoad'),'click', function(){ try{ loadStatus(EMBEDDED); }catch(e){ toast(String(e.message||e)); } });
+  on($('btnClear'),'click', clearStatus);
+  on($('btnFailToggle'),'click', function(){
+    var b = $('failBody'), btn = $('btnFailToggle');
+    var open = !b.classList.contains('hidden');
+    b.classList.toggle('hidden', open);
+    btn.setAttribute('aria-expanded', String(!open));
+    btn.textContent = open ? 'Expand' : 'Collapse';
+  });
+
+  on($('btnPasteLoad'),'click', function(){
+    var txt = $('pasteBox').value;
+    if(!txt.trim()){ toast('Paste a status JSON first.'); return; }
+    try{ loadStatus(JSON.parse(txt)); }
+    catch(e){ toast('Invalid JSON: ' + (e.message||e)); }
+  });
+  on($('fileInput'),'change', function(ev){
+    var f = ev.target.files && ev.target.files[0];
+    if(!f) return;
+    var reader = new FileReader();
+    reader.onload = function(){ try{ loadStatus(JSON.parse(String(reader.result))); }catch(e){ toast('Invalid JSON file: '+(e.message||e)); } };
+    reader.onerror = function(){ toast('Could not read that file.'); };
+    reader.readAsText(f);
+  });
+
+  [
+    $('btnRetry'),$('btnLoadEmbedded'),$('btnEmptyLoad'),$('btnClear'),
+    $('btnFailToggle'),$('btnPasteLoad'),$('fileInput'),$('cmdInput')
+  ].forEach(pressFeedback);
+
+  /* testable surface */
+  window.ArmBuild = {
+    loadStatus: loadStatus, clear: clearStatus, showEmpty: showEmpty,
+    embedded: EMBEDDED,
+    getState: function(){ return { currentId: state.currentId, hasData: !!state.data, target: state.data && state.data.target }; }
+  };
+
+  tryLiveSource();
+})();
+</script>
+</body>
+</html>

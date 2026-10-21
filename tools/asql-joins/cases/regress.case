@@ -1,0 +1,303 @@
+-- join shapes that must keep their results (and new forms mixed with the old)
+-- setup
+CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(40), region VARCHAR(10));
+CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amount DECIMAL(10,2), status INT);
+CREATE TABLE items (order_id INT, line INT, sku VARCHAR(10), qty INT, PRIMARY KEY (order_id, line));
+CREATE TABLE products (sku VARCHAR(10) PRIMARY KEY, title VARCHAR(40), price DECIMAL(10,2));
+CREATE TABLE regions (code VARCHAR(10) PRIMARY KEY, label VARCHAR(20));
+INSERT INTO customers VALUES (1,'Acme','N'),(2,'Bolt','S'),(3,'Crane','N'),(4,'Dune',NULL),(5,'Echo','W');
+INSERT INTO orders VALUES (10,1,100.00,0),(11,1,250.50,1),(12,2,75.25,0),(13,3,10.00,1),(14,NULL,99.99,0),(15,9,5.00,0),(16,2,75.25,1);
+INSERT INTO items VALUES (10,1,'A',2),(10,2,'B',1),(11,1,'A',5),(12,1,'C',1),(13,1,'Z',3),(16,1,'B',4),(16,2,'C',2);
+INSERT INTO products VALUES ('A','Anvil',10.00),('B','Bucket',2.50),('C','Cable',1.25),('D','Drill',99.00);
+INSERT INTO regions VALUES ('N','North'),('S','South'),('E','East');
+CREATE VIEW v_lines AS SELECT c.name, i.sku FROM customers c JOIN orders o ON o.cust_id = c.id JOIN items i ON i.order_id = o.id;
+
+-- query
+SELECT c.name, o.id FROM customers c JOIN orders o ON o.cust_id = c.id
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Crane|13
+Bolt|16
+
+-- query
+SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.cust_id = c.id
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Bolt|16
+Crane|13
+Dune|NULL
+Echo|NULL
+
+-- query
+SELECT c.name, o.id FROM customers c RIGHT JOIN orders o ON o.cust_id = c.id
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Bolt|16
+Crane|13
+NULL|14
+NULL|15
+
+-- query
+SELECT c.name FROM customers c LEFT JOIN orders o ON o.cust_id = c.id WHERE o.id IS NULL
+-- expect
+Dune
+Echo
+
+-- query
+SELECT c.name, SUM(i.qty * p.price) FROM customers c JOIN orders o ON o.cust_id = c.id JOIN items i ON i.order_id = o.id JOIN products p ON p.sku = i.sku GROUP BY c.name
+-- expect
+Acme|72.5000
+Bolt|13.7500
+
+-- query
+SELECT c.name, o.id, i.sku, p.title FROM customers c LEFT JOIN orders o ON o.cust_id = c.id LEFT JOIN items i ON i.order_id = o.id LEFT JOIN products p ON p.sku = i.sku
+-- expect
+Acme|10|A|Anvil
+Acme|10|B|Bucket
+Acme|11|A|Anvil
+Bolt|12|C|Cable
+Bolt|16|B|Bucket
+Bolt|16|C|Cable
+Crane|13|Z|NULL
+Dune|NULL|NULL|NULL
+Echo|NULL|NULL|NULL
+
+-- query
+SELECT a.id, b.id FROM orders a JOIN orders b ON a.cust_id = b.cust_id AND a.id < b.id
+-- expect
+10|11
+12|16
+
+-- query
+SELECT a.id, b.id FROM orders a JOIN orders b ON a.amount < b.amount AND b.status = 1
+-- expect
+10|11
+12|11
+13|11
+13|16
+14|11
+15|11
+15|13
+15|16
+16|11
+
+-- query
+SELECT c.name, o.id FROM customers c JOIN orders o ON o.cust_id = c.id OR o.amount > 200
+-- expect
+Acme|10
+Acme|11
+Bolt|11
+Bolt|12
+Bolt|16
+Crane|11
+Crane|13
+Dune|11
+Echo|11
+
+-- query
+SELECT c.id, r.code FROM customers c CROSS JOIN regions r
+-- expect
+1|E
+1|N
+1|S
+2|E
+2|N
+2|S
+3|E
+3|N
+3|S
+4|E
+4|N
+4|S
+5|E
+5|N
+5|S
+
+-- query
+SELECT c.name, o.id FROM customers c CROSS JOIN orders o WHERE o.cust_id = c.id AND o.status = 0
+-- expect
+Acme|10
+Bolt|12
+
+-- query
+SELECT c.name, o.id FROM customers c JOIN orders o WHERE o.cust_id = c.id
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Crane|13
+Bolt|16
+
+-- query
+SELECT c.name, r.label, o.id FROM customers c LEFT JOIN regions r ON r.code = c.region, orders o WHERE o.cust_id = c.id
+-- expect
+Acme|North|10
+Acme|North|11
+Bolt|South|12
+Crane|North|13
+Bolt|South|16
+
+-- query
+SELECT c.name, o.id FROM customers c, orders o WHERE o.cust_id = c.id OR (c.id = 4 AND o.id = 14)
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Crane|13
+Dune|14
+Bolt|16
+
+-- query
+SELECT c.name, o.id FROM regions r, customers c RIGHT JOIN orders o ON o.cust_id = c.id WHERE r.code = 'N'
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Crane|13
+Bolt|16
+
+-- query
+SELECT c.name, t.n FROM customers c JOIN (SELECT cust_id, COUNT(*) AS n FROM orders GROUP BY cust_id) t ON t.cust_id = c.id
+-- expect
+Acme|2
+Bolt|2
+Crane|1
+
+-- query
+SELECT c.name, t.n FROM customers c, (SELECT cust_id, COUNT(*) AS n FROM orders GROUP BY cust_id) t WHERE t.cust_id = c.id
+-- expect
+Acme|2
+Bolt|2
+Crane|1
+
+-- query
+WITH t AS (SELECT cust_id, SUM(amount) AS s FROM orders GROUP BY cust_id) SELECT c.name, t.s FROM customers c JOIN t ON t.cust_id = c.id
+-- expect
+Acme|350.5000
+Bolt|150.5000
+Crane|10
+
+-- query
+SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id AND o.status = 1)
+-- expect
+Acme
+Bolt
+Crane
+
+-- query
+SELECT c.name FROM customers c WHERE c.id IN (SELECT o.cust_id FROM orders o, items i WHERE i.order_id = o.id AND i.sku = 'C')
+-- expect
+Bolt
+
+-- query
+SELECT a.order_id, a.line, b.line FROM items a JOIN items b ON a.order_id = b.order_id AND a.line <> b.line
+-- expect
+10|1|2
+10|2|1
+16|1|2
+16|2|1
+
+-- query
+SELECT o.id, c.name FROM orders o LEFT JOIN customers c ON c.id = o.cust_id
+-- expect
+10|Acme
+11|Acme
+12|Bolt
+13|Crane
+14|NULL
+15|NULL
+16|Bolt
+
+-- query
+SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.cust_id = c.id AND o.status = 1
+-- expect
+Acme|11
+Bolt|16
+Crane|13
+Dune|NULL
+Echo|NULL
+
+-- query
+SELECT c.name, o.id FROM customers c FULL OUTER JOIN orders o ON o.cust_id = c.id
+-- expect
+Acme|10
+Acme|11
+Bolt|12
+Bolt|16
+Crane|13
+Dune|NULL
+Echo|NULL
+NULL|14
+NULL|15
+
+-- query
+SELECT c.name, COALESCE(SUM(o.amount), 0) FROM customers c LEFT JOIN orders o ON o.cust_id = c.id GROUP BY c.name
+-- expect
+Acme|350.5000
+Bolt|150.5000
+Crane|10
+Dune|0
+Echo|0
+
+-- query
+SELECT c.name, (SELECT MAX(o.amount) FROM orders o JOIN items i ON i.order_id = o.id WHERE o.cust_id = c.id) FROM customers c
+-- expect
+Acme|250.5000
+Bolt|75.2500
+Crane|10
+Dune|NULL
+Echo|NULL
+
+-- query
+SELECT v.name, p.title FROM v_lines v JOIN products p ON p.sku = v.sku
+-- expect
+Acme|Anvil
+Acme|Bucket
+Acme|Anvil
+Bolt|Cable
+Bolt|Bucket
+Bolt|Cable
+
+-- query
+SELECT v.name, p.title FROM v_lines v, products p WHERE p.sku = v.sku
+-- expect
+Acme|Anvil
+Acme|Bucket
+Acme|Anvil
+Bolt|Cable
+Bolt|Bucket
+Bolt|Cable
+
+-- query
+SELECT c.name, r.label FROM customers c LEFT JOIN (regions r JOIN customers c2 ON c2.region = r.code AND c2.id = 1) ON r.code = c.region
+-- expect
+Acme|North
+Bolt|NULL
+Crane|North
+Dune|NULL
+Echo|NULL
+
+-- query
+SELECT c.name FROM customers c, orders o WHERE o.cust_id = c.id AND o.status = 0 UNION SELECT c.name FROM customers c JOIN orders o ON o.cust_id = c.id WHERE o.status = 1
+-- expect
+Acme
+Bolt
+Crane
+
+-- query
+SELECT COUNT(*) FROM regions NATURAL JOIN products
+-- expect
+12
+
+-- query
+SELECT o.id, i.line, p.title FROM orders o JOIN items i ON i.order_id = o.id JOIN products p USING (sku) WHERE o.status = 1
+-- expect
+11|1|Anvil
+16|1|Bucket
+16|2|Cable

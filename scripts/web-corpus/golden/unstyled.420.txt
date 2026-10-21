@@ -1,0 +1,30 @@
+# page unstyled.html  viewport=420
+# title No author CSS at all
+# content 420x398  background=ff121212  links=1
+text       8    30   385    42  #ffd8d8d8  30px,bold         "The engine's own opinion"
+text       8    86   400    21  #ffd8d8d8  15px              "A page with no stylesheet still has to read like a"
+text       8   107   400    21  #ffd8d8d8  15px              "document. On this machine's dark ground that means"
+text       8   128   384    21  #ffd8d8d8  15px              "light text, and every heading inherits it rather"
+text       8   149   312    21  #ffd8d8d8  15px              "than carrying its own near-white value."
+border    34   182   378    42  #ff3a3a3a
+text      49   182   344    21  #ffd8d8d8  15px              "A quotation, indented, with a rule down its"
+text      49   203    80    21  #ffd8d8d8  15px              "left edge."
+rect       8   236   404    64  #ff1b1b1b
+border     8   236   404    64  #ff2c2c2c
+text      19   247   108    21  #ffdcdcdc  15px,mono         "a code block"
+text      19   268   162    21  #ffdcdcdc  15px,mono         "  keeps its spaces"
+text       8   312    56    21  #ffd8d8d8  15px              "Inline "
+text      64   313    48    19  #ffd8d8d8  14px,mono         "code()"
+text     112   312    32    21  #ffd8d8d8  15px              ", a "
+text     144   312    32    21  #ff6fb6ff  15px             u link=0  "link"
+text     176   312    48    21  #ffd8d8d8  15px              ", and "
+text     224   312    48    21  #fff7f0c0  15px              "a mark"
+text     272   312     8    21  #ffd8d8d8  15px              "."
+border     8   345   118    33  #ff4a4a4a
+border     9   346    66    31  #ff4a4a4a
+text      18   351    48    21  #ffd8d8d8  15px,bold         "Header"
+border    75   346    50    31  #ff4a4a4a
+text      84   351    32    21  #ffd8d8d8  15px              "Cell"
+link    144   312    32    21  file:///link  "link"
+# glyph-gaps (none)
+

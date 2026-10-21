@@ -1,0 +1,15 @@
+<!doctype html><body><pre id=o></pre><script>
+var out=document.getElementById('o');function log(s){out.textContent+=s+'\n';}
+function ok(n,c){log((c?'PASS ':'FAIL ')+n);}
+ok('types', typeof BroadcastChannel==='function' && typeof FileReader==='function' && typeof EventSource==='function');
+var a=new BroadcastChannel('x'),b=new BroadcastChannel('x'),got=[];
+b.onmessage=function(e){got.push(e.data.k);ok('bc message',e.data.k===1);};
+a.addEventListener('message',function(){ok('bc no self echo',false);});
+a.postMessage({k:1});
+var fr=new FileReader();
+fr.onload=function(){ok('filereader text',fr.result==='hello'&&fr.readyState===2);
+ var f2=new FileReader();f2.onload=function(){ok('filereader dataurl',f2.result==='data:text/plain;base64,aGVsbG8=');};f2.readAsDataURL(new Blob(['hello'],{type:'text/plain'}));};
+fr.readAsText(new Blob(['hello']));
+var es=new EventSource('data:text/event-stream,data%3A%20hi%0A%0A');
+ok('es state',es.readyState===0&&es.url.indexOf('data:')===0);es.close();ok('es closed',es.readyState===2);
+</script>

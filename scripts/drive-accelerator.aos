@@ -1,0 +1,45 @@
+# AOS-008: the same graph on the accelerator device (OpenCL). Operands start
+# in system memory; the scheduler migrates them to device memory for the
+# device, and results come back through the fabric unchanged in identity.
+devices
+entity create worker => w
+cap grant $w kernel * schedule
+cap grant $w compute * execute
+tensor create $w f32 2x3 1 2 3 4 5 6          => A
+tensor create $w f32 3x2 7 8 9 10 11 12       => B
+tensor create $w f32 2x2                      => C
+tensor create $w f32 2x2                      => D
+tensor create $w f32 1                        => S
+graph create $w                               => g
+# pin every operation to the accelerator by its id (operator diagnostic; entities normally say only "gpu"/"any")
+echo pinning to the OpenCL device by name prefix
+graph op $w $g matmul in=$A:f32:2x3 in=$B:f32:3x2 out=$C:f32:2x2 dev=ocl-cpu
+graph op $w $g relu in=$C:f32:2x2 out=$D:f32:2x2 dev=ocl-cpu
+graph op $w $g softmax in=$D:f32:2x2 out=$D:f32:2x2 dev=ocl-cpu
+graph op $w $g reduce-sum in=$C:f32:2x2 out=$S:f32:1 dev=ocl-cpu
+graph plan $w $g
+graph run $w $g
+tensor show $w $C f32 2x2
+tensor show $w $S f32 1
+tensor show $w $D f32 2x2
+mem list $w
+# the bytes moved to device memory; write through the fabric and recompute: the device re-uploads by generation
+tensor create $w f32 2x2 10 10 10 10          => E
+graph create $w                               => g2
+graph op $w $g2 add in=$C:f32:2x2 in=$E:f32:2x2 out=$C:f32:2x2 dev=ocl-cpu
+graph run $w $g2
+tensor show $w $C f32 2x2
+# bring the result back to system memory: same identity, contents intact
+mem migrate $w $C system
+tensor show $w $C f32 2x2
+# byte histogram + normalize on the accelerator, as the reflect mind does
+mem alloc $w 32                                => bytes
+mem write $w $bytes 0 "aaaabbbbccccddddeeeeffffgggghhhh"
+tensor create $w f32 256                       => H
+tensor create $w f32 256                       => P
+graph create $w                                => g3
+graph op $w $g3 histogram in=$bytes:u8:32 out=$H:f32:256 dev=ocl-cpu
+graph op $w $g3 normalize in=$H:f32:256 out=$P:f32:256 dev=ocl-cpu
+graph run $w $g3
+mem read $w $H 388 16
+info
