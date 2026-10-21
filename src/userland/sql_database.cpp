@@ -6036,7 +6036,9 @@ struct BatchStore {
   std::unordered_map<double, int32_t> by_num;
   std::unordered_map<std::string, int32_t> by_text;
   void add_value(Val&& v) {
-    if (v.numeric && !v.null && v.num == std::floor(v.num) && std::fabs(v.num) < 1e15 && !v.approx) {
+    // Only a value whose text IS that whole number: a DECIMAL sum of 3.00 kept as the double 3 answered "3".
+    if (v.numeric && !v.null && v.num == std::floor(v.num) && std::fabs(v.num) < 1e15 && !v.approx &&
+        v.str() == std::to_string((long long)v.num)) {
       num.push_back(v.num);
       other.push_back(-1);
     } else {
@@ -32111,11 +32113,28 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
   if (vx_trace_on()) vx_trace("subquery per key: aggregate " + std::to_string((hal_now_ns() - bt0) / 1000) + " us");
   const size_t kc = ks.col;
   const ColumnStore& kcs = t.col_data[kc];
+  // The key's number in row r. A dictionary- or run-coded INT column (CodeCol)
+  // holds codes, not values: typed_int on it read the code, so every key came
+  // out one (or more) off and each outer row got its neighbour's answer.
+  // Its value is the entry the code names.
+  const bool coded_key = ks.kind == vx::Source::CodeCol;
+  std::vector<int64_t> key_of;
+  if (!text_key) {
+    key_of.resize(first.size());
+    for (size_t g = 0; g < first.size(); ++g) {
+      const uint32_t r = first[g];
+      if (kcs.is_null(r)) continue;
+      if (!coded_key) { key_of[g] = vx::typed_int(kcs, r); continue; }
+      double d = 0;
+      if (!parse_number(t.cell(r, kc), &d) || d != std::floor(d) || std::fabs(d) >= 9.2e18) return false;
+      key_of[g] = (int64_t)d;
+    }
+  }
   out->num.reserve(first.size());
   out->other.reserve(first.size());
   int64_t lo = INT64_MAX, hi = INT64_MIN;
   if (!text_key)
-    for (uint32_t r : first) if (!kcs.is_null(r)) { const int64_t v = vx::typed_int(kcs, r); lo = std::min(lo, v); hi = std::max(hi, v); }
+    for (size_t g = 0; g < first.size(); ++g) if (!kcs.is_null(first[g])) { lo = std::min(lo, key_of[g]); hi = std::max(hi, key_of[g]); }
   // An array when the keys fill their range (every order of a table), a hash
   // when they are few and spread out (a page's 7 orders among 400k numbers
   // made a 1.6 MB array each time).
@@ -32129,9 +32148,9 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
     const int32_t i = (int32_t)out->size();
     out->add_value(std::move(values[g][0]));
     if (text_key) out->by_text.emplace(collate_key(t.cell(r, kc)), i);
-    else if (out->dense) out->slot[(size_t)(vx::typed_int(kcs, r) - lo)] = i;
+    else if (out->dense) out->slot[(size_t)(key_of[g] - lo)] = i;
     else {
-      const double d = (double)vx::typed_int(kcs, r);
+      const double d = (double)key_of[g];
       out->by_num.emplace(d == 0 ? 0.0 : d, i);
     }
   }
