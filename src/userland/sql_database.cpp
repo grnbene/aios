@@ -852,10 +852,10 @@ thread_local bool tls_autocommit = true;
 thread_local std::string tls_tx_isolation;
 // The session's TEMPORARY tables: visible key (db.name, lower-cased) -> the key of the table that holds it.
 // A TEMPORARY table lives in tables_ under a hidden name (temp_table_hidden_name) that only this map reaches:
-// this session's alone, ahead of a stored table of the same name, dropped with the session, never in the
-// redo log (nothing of it survives the session anyway).
+// this session's alone, ahead of a stored table of the same name, dropped with the session. Its statements are
+// logged and replicated like any other (a permanent table filled from it has to replay), as MariaDB's
+// statement-based replication carries them; a replay or a replica makes its own.
 thread_local std::unordered_map<std::string, std::string> tls_temp_tables;
-thread_local bool g_stmt_temp_touch = false;   // the running statement reached a TEMPORARY table
 thread_local std::unordered_map<std::string, std::string> tls_prepared_statements;   // PREPARE name FROM ...
 static bool hidden_table_name(const std::string& n) { return n.size() > 4 && n[0] == '\x01' && n.compare(1, 3, "tmp") == 0; }
 
@@ -5954,6 +5954,11 @@ void fit_decimal_scales(std::vector<SqlColumn>& columns, const std::vector<SqlRo
 // table (see SqlColumnOrigin); an expression gives the empty origin.
 SqlColumnOrigin item_origin(const SqlExpr* e, const std::vector<QuerySource>& sources) {
   SqlColumnOrigin org;
+  // COUNT(...) and a literal that is not NULL never answer NULL: flagged NOT NULL, as MariaDB flags them.
+  if (e && ((e->op == ExprOp::Func && !e->window && upper_of(e->name) == "COUNT"sv) || (e->op == ExprOp::Literal && !e->literal.null))) {
+    org.not_null = 1;
+    return org;
+  }
   if (!e || e->op != ExprOp::Column || e->bound_depth != 0 || e->bound_src < 0 || (size_t)e->bound_src >= sources.size()) return org;
   const QuerySource& qs = sources[(size_t)e->bound_src];
   if (!qs.table || e->bound_col < 0 || (size_t)e->bound_col >= qs.table->columns.size()) return org;
@@ -5966,6 +5971,9 @@ SqlColumnOrigin item_origin(const SqlExpr* e, const std::vector<QuerySource>& so
   org.scale = col.type == SqlDataType::Decimal ? (int)col.scale : -1;
   org.temporal = col.temporal;
   org.binary = col.binary;
+  org.not_null = (col.not_null || col.is_primary_key) && !qs.table->inferred_types ? 1 : 0;
+  org.primary = col.is_primary_key && !qs.table->inferred_types ? 1 : 0;
+  org.auto_inc = col.auto_increment ? 1 : 0;
   if (!col.declared.empty()) {
     const std::string dec = lower_of(col.declared);
     org.is_unsigned = dec.find("unsigned") != std::string::npos;
@@ -19429,7 +19437,7 @@ SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::string&
     auto h = tls_temp_tables.find(make_table_key(target_db, target_table));
     if (h != tls_temp_tables.end()) {
       auto it = tables_.find(h->second);
-      if (it != tables_.end()) { g_stmt_temp_touch = true; table_lock_shared(&it->second); return &it->second; }
+      if (it != tables_.end()) { table_lock_shared(&it->second); return &it->second; }
     }
   }
 
@@ -19608,7 +19616,7 @@ const SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::s
     auto h = tls_temp_tables.find(key);
     if (h != tls_temp_tables.end()) {
       auto ht = tables_.find(h->second);
-      if (ht != tables_.end()) { g_stmt_temp_touch = true; table_lock_shared(&ht->second); return &ht->second; }
+      if (ht != tables_.end()) { table_lock_shared(&ht->second); return &ht->second; }
     }
   }
   auto it = tables_.find(key);
@@ -19654,9 +19662,8 @@ SqlTable* SqlDatabase::find_table(const std::string& name, const std::string& db
   std::string key = make_table_key(target_db, target_table);
   if (!tls_temp_tables.empty()) {   // the session's TEMPORARY table of this name first
     auto h = tls_temp_tables.find(key);
-    if (h != tls_temp_tables.end()) { auto ht = tables_.find(h->second); if (ht != tables_.end()) { g_stmt_temp_touch = true; return &ht->second; } }
+    if (h != tls_temp_tables.end()) { auto ht = tables_.find(h->second); if (ht != tables_.end()) return &ht->second; }
   }
-  if (hidden_table_name(target_table)) g_stmt_temp_touch = true;
   auto it = tables_.find(key);
   if (it != tables_.end()) return &it->second;
   std::string want_tbl = lower_of(target_table);
@@ -22829,7 +22836,6 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
     SqlQueryResult b = execute_gateway_query("BEGIN", session_db);
     if (!b.success) return b;
   }
-  if (g_rw_depth == 0) g_stmt_temp_touch = false;
   if (txn_concurrent() && g_rw_depth == 0) return execute_gateway_concurrent(sql_query, session_db, begins ? 1 : 0);
   // A transaction takes the one writer lock for its whole life. BEGIN used to
   // wait for it INSIDE the statement lock: with one transaction open, a second
@@ -23061,10 +23067,6 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
           if (at < recs.size())
             recs[at].second += kRedoInsertIdTag + std::to_string(tls_statement_insert_id) + "*/";
         }
-        if (g_stmt_temp_touch) {   // a session's TEMPORARY table: nothing of it outlives the session, nothing to replay
-          g_stmt_redo.clear();
-          if (tls_txn.open && tls_txn.redo.size() > redo_mark) tls_txn.redo.resize(redo_mark);
-        }
         if (!dml_had_no_effect(sql_query, res, has_triggers_.load(std::memory_order_relaxed)))   // a no-op is logged nowhere: replaying it does nothing
           for (const auto& rec : g_stmt_redo) append_redo(rec.second, rec.first);
         g_stmt_redo.clear();
@@ -23126,14 +23128,14 @@ void SqlDatabase::abandon_open_transaction() {
 }
 
 void SqlDatabase::drop_session_temp_tables() {
-  if (tls_temp_tables.empty()) return;
-  std::unordered_map<std::string, std::string> mine;
-  mine.swap(tls_temp_tables);
-  for (const auto& kv : mine) {
-    auto it = tables_.find(kv.second);
-    if (it == tables_.end()) continue;
-    const std::string db = it->second.database, name = it->second.name;
-    execute_gateway_query("DROP TABLE `" + db + "`.`" + name + "`", db);
+  // Each by its visible name, so the log and a replica see DROP TEMPORARY TABLE (never the hidden name).
+  while (!tls_temp_tables.empty()) {
+    const std::string key = tls_temp_tables.begin()->first;
+    const size_t dot = key.rfind('.');
+    const std::string db = dot == std::string::npos ? std::string("aios_db") : key.substr(0, dot);
+    const std::string name = dot == std::string::npos ? key : key.substr(dot + 1);
+    SqlQueryResult r = execute_gateway_query("DROP TEMPORARY TABLE IF EXISTS `" + db + "`.`" + name + "`", db);
+    if (!r.success) tls_temp_tables.erase(key);   // never left to loop on
   }
 }
 
@@ -24777,6 +24779,18 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
           for (const auto& k : doomed) active_data_->on_table_dropped(tables_.at(k));
         for (const auto& k : doomed) tables_.erase(k);
         for (const auto& k : doomed_views) views_.erase(k);
+        // and its procedures, functions, triggers and events, as MariaDB drops them with the database
+        {
+          bool any = false;
+          {
+            hal::LockGuard g(programs_mu_);
+            for (auto it = programs_.begin(); it != programs_.end();) {
+              if (lower_of(it->second->db) == want) { it = programs_.erase(it); any = true; }
+              else ++it;
+            }
+          }
+          if (any) { refresh_program_flags(); save_programs(); }
+        }
         views_gen_.fetch_add(1, std::memory_order_acq_rel);
         for (auto it = databases_.begin(); it != databases_.end();) {
           if (lower_of(*it) == want) it = databases_.erase(it);
@@ -42794,7 +42808,6 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
     std::string tdb, ttb;
     split_qualified_name(name, effective_database(), &tdb, &ttb);
     temp_visible = make_table_key(tdb, ttb);
-    g_stmt_temp_touch = true;
     if (tls_temp_tables.count(temp_visible)) {
       if (if_not_exists) { SqlQueryResult r; r.formatted_table = "Table '" + ttb + "' already exists."; return r; }
       return make_error("table already exists: " + ttb);
@@ -42939,7 +42952,7 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
     // column MariaDB does not have.
     if (p.is_word("PRIMARY") || p.is_word("UNIQUE") || p.is_word("KEY") ||
         p.is_word("INDEX") || p.is_word("CONSTRAINT") || p.is_word("FOREIGN") ||
-        p.is_word("FULLTEXT") || p.is_word("SPATIAL")) {
+        p.is_word("FULLTEXT") || p.is_word("SPATIAL") || (p.is_word("CHECK") && p.is_punct("(", 1))) {
       // What kind of key it is can come after `CONSTRAINT name`: the words
       // are read wherever they stand. Taken from the first word alone,
       // `CONSTRAINT c2 FOREIGN KEY (...) REFERENCES ...` lost its foreign key
@@ -43432,7 +43445,6 @@ SqlQueryResult SqlDatabase::execute_drop(const std::string& sql) {
     if (h != tls_temp_tables.end()) {
       const std::string hidden = h->second;
       tls_temp_tables.erase(h);
-      g_stmt_temp_touch = true;
       auto ht = tables_.find(hidden);
       if (ht == tables_.end()) { SqlQueryResult r; r.formatted_table = "Table dropped."; return r; }
       return execute_drop("DROP TABLE `" + ht->second.database + "`.`" + ht->second.name + "`");

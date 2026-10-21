@@ -215,6 +215,9 @@ struct SqlColumnOrigin {
   uint8_t binary = 0;      // BLOB family 1, BINARY/VARBINARY 2
   uint8_t mysql_type = 0;  // declared mysql type (MYSQL_TYPE_TINY, LONG, LONGLONG, etc.)
   uint8_t is_unsigned = 0; // declared UNSIGNED: the wire marks it so (UNSIGNED_FLAG)
+  uint8_t not_null = 0;    // NOT NULL or part of the primary key (NOT_NULL_FLAG): a client sizes "NULL" into a column without it
+  uint8_t primary = 0;     // in the primary key (PRI_KEY_FLAG)
+  uint8_t auto_inc = 0;    // AUTO_INCREMENT (AUTO_INCREMENT_FLAG)
 };
 
 // A consumer of a SELECT's rows as they are produced: the wire server sets
