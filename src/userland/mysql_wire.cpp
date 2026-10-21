@@ -1735,6 +1735,16 @@ std::vector<WireCol> wire_columns(const SqlQueryResult& res, size_t num_cols) {
     else if (temporal == 2) wcols[c] = {MYSQL_TYPE_DATETIME, 63, 19, 0x80, 0};
     else wcols[c] = {MYSQL_TYPE_TIME, 63, 10, 0x80, 0};
   }
+  // What the column is in its table: NOT NULL (a client that sizes "NULL" into a nullable column padded every
+  // primary key to four), PRI_KEY, AUTO_INCREMENT - as MariaDB flags them.
+  for (size_t c = 0; c < num_cols; ++c) {
+    const SqlColumnOrigin* org = c < res.column_origins.size() ? &res.column_origins[c] : nullptr;
+    if (!org) continue;
+    if (org->not_null) wcols[c].flags |= 0x0001;
+    if (org->org_table.empty()) continue;
+    if (org->primary) wcols[c].flags |= 0x0002;
+    if (org->auto_inc) wcols[c].flags |= 0x0200;
+  }
   return wcols;
 }
 
