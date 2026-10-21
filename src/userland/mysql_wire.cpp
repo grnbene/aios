@@ -556,6 +556,7 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   else if (has("ambiguous")) { *code = 1052; *sqlstate = "23000"; }
   else if (has("division by zero") || has("Division by 0")) { *code = 1365; *sqlstate = "22012"; }
   else if (starts("CONSTRAINT `") && has("` failed for `")) { *code = 4025; *sqlstate = "23000"; }
+  else if (starts("Unknown prepared statement handler")) { *code = 1243; *sqlstate = "HY000"; }
   else if (starts("The value specified for generated column")) { *code = 1906; *sqlstate = "HY000"; }
   else if (has("cannot be null") || has("NOT NULL")) { *code = 1048; *sqlstate = "23000"; }
   else if (has("doesn't yet support")) { *code = 1235; *sqlstate = "42000"; }   // ER_NOT_SUPPORTED_YET

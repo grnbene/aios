@@ -592,7 +592,8 @@ struct Run {
       }
       const int ci = trig_col(target.substr(4));
       if (ci < 0) { cond->kind = Condition::Exception; cond->message = "Unknown column '" + target.substr(4) + "' in 'NEW'"; return false; }
-      new_row->values[(size_t)ci] = v.null ? sql_null() : v.str();
+      const SqlColumn& col = trig_table->columns[(size_t)ci];
+      new_row->values[(size_t)ci] = v.null ? sql_null() : sql_normalize_value(col.type, col.scale, val_store_text(v, col.type));
       return true;
     }
     if (Val* var = find_var(target)) { *var = v; return true; }
@@ -1335,6 +1336,34 @@ std::vector<SqlQueryResult> sql_run_procedure(SqlDatabase& db, const SqlDatabase
   return std::move(run.result_sets);
 }
 
+namespace psm {
+// The value as the function's RETURNS type gives it back: a DECIMAL(p,s) at s
+// places (RETURNS DECIMAL(8,2) answered 22.000 for 22.00), an integer type
+// whole, a CHAR / VARCHAR / TEXT as text.
+Val as_returns_type(const Val& v, const std::string& returns) {
+  if (v.null || returns.empty()) return v;
+  const std::string d = lower_of(returns);
+  auto kind = [&]() { size_t i = 0; while (i < d.size() && std::isalpha((unsigned char)d[i])) ++i; return d.substr(0, i); }();
+  if (kind == "decimal" || kind == "numeric" || kind == "dec") {
+    int scale = 0;
+    const size_t comma = d.find(',');
+    if (comma != std::string::npos) scale = std::atoi(d.c_str() + comma + 1);
+    const std::string text = sql_normalize_value(SqlDataType::Decimal, scale, v.str());
+    double n = 0;
+    parse_number(text, &n);
+    return val_num_with_text(n, text);
+  }
+  if (kind == "int" || kind == "integer" || kind == "bigint" || kind == "smallint" || kind == "tinyint" || kind == "mediumint") {
+    double n = v.numeric ? v.num : 0;
+    if (!v.numeric && !parse_number(v.str(), &n)) n = 0;
+    return val_num(std::round(n));
+  }
+  if (kind == "char" || kind == "varchar" || kind == "text" || kind == "tinytext" || kind == "mediumtext" || kind == "longtext")
+    return val_text(v.str());
+  return v;
+}
+}  // namespace psm
+
 Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<Val>& args,
                      const std::string& session_db, std::string* err) {
   DepthGuard dg;
@@ -1350,7 +1379,7 @@ Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const
   run.run_list(psm::body_of(f), false);
   if (!run.error.empty()) { *err = run.error; return val_null(); }
   if (!run.returned) { *err = "No RETURN found in FUNCTION " + f.db + "." + f.name; return val_null(); }
-  return run.ret;
+  return psm::as_returns_type(run.ret, f.returns);
 }
 
 Val sql_run_aggregate(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<std::vector<Val>>& rows,
@@ -1370,7 +1399,7 @@ Val sql_run_aggregate(SqlDatabase& db, const SqlDatabase::StoredProgram& f, cons
   run.run_list(psm::body_of(f), false);
   if (!run.error.empty()) { *err = run.error; return val_null(); }
   if (!run.returned) { *err = "No RETURN found in FUNCTION " + f.db + "." + f.name; return val_null(); }
-  return run.ret;
+  return psm::as_returns_type(run.ret, f.returns);
 }
 
 // One row's trigger. new_row may be changed by a BEFORE trigger.
