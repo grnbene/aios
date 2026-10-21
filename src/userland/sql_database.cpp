@@ -786,6 +786,7 @@ struct RowUndo {
   std::vector<std::string> row;    // Inserted: the row as stored; Deleted: as it was; Changed: as it was before
   size_t col = 0;                  // Changed: the cell, and its value before and after
   std::string before, after;
+  bool relative = false;           // Changed by col = col +/- k: taken back by subtracting k, so another's change stays
 };
 // Set while a ROLLBACK (or a failed statement's frame) takes changes back: those statements are not logged
 // again, fire no triggers and write no redo (the changes they undo never reached the redo log either).
@@ -804,8 +805,9 @@ thread_local SqlDatabase* g_undo_db = nullptr;   // the database whose tables th
 // conflict. A cycle of waits is a deadlock (1213, the waiting transaction rolled back); 50 s is a lock wait
 // timeout (1205). Rows of a table with no primary key have no owner. Reads take nothing: they see the latest
 // value, as this engine's readers always have.
+// On unless AIOS_TXN_CONCURRENT=0: transactions own rows, not the whole store (see below).
 static bool txn_concurrent() {
-  static const bool on = [] { const char* v = std::getenv("AIOS_TXN_CONCURRENT"); return v && *v && *v != '0'; }();
+  static const bool on = [] { const char* v = std::getenv("AIOS_TXN_CONCURRENT"); return !(v && *v == '0'); }();
   return on;
 }
 // SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE in concurrent mode: it claims rows, so it is never
@@ -829,6 +831,10 @@ static bool locking_read(const std::string& q) {
   }
   return false;
 }
+// innodb_lock_wait_timeout: how long a statement waits for a row another transaction holds (seconds).
+thread_local int64_t tls_lock_wait_timeout = 50;
+// The running statement's own wait: -1 the session's, 0 NOWAIT, n WAIT n (claim_locked_rows reads them).
+thread_local int64_t g_stmt_lock_wait = -1;
 thread_local uint64_t g_txn_id = 0;                // this session's open transaction (concurrent mode), 0 none
 thread_local uint64_t g_row_conflict = 0;          // the transaction a write of this statement ran into
 thread_local const SqlTable* g_delta_table = nullptr;   // the running UPDATE's relative assignments
@@ -840,6 +846,18 @@ thread_local bool tls_fk_checks = true;            // the session's FOREIGN_KEY_
 // The session's sql_mode has NO_AUTO_VALUE_ON_ZERO (a dump sets it so its rows keep id 0): an AUTO_INCREMENT
 // column given 0 then stores 0. Otherwise 0, as NULL, takes the next value - as on MariaDB.
 thread_local bool tls_no_auto_value_on_zero = false;
+// SET autocommit=0: a write with no transaction open opens one, which lasts until COMMIT / ROLLBACK.
+thread_local bool tls_autocommit = true;
+// SET TRANSACTION ISOLATION LEVEL ...: reported back; "" is REPEATABLE-READ, the default.
+thread_local std::string tls_tx_isolation;
+// The session's TEMPORARY tables: visible key (db.name, lower-cased) -> the key of the table that holds it.
+// A TEMPORARY table lives in tables_ under a hidden name (temp_table_hidden_name) that only this map reaches:
+// this session's alone, ahead of a stored table of the same name, dropped with the session, never in the
+// redo log (nothing of it survives the session anyway).
+thread_local std::unordered_map<std::string, std::string> tls_temp_tables;
+thread_local bool g_stmt_temp_touch = false;   // the running statement reached a TEMPORARY table
+static bool hidden_table_name(const std::string& n) { return n.size() > 4 && n[0] == '\x01' && n.compare(1, 3, "tmp") == 0; }
+
 thread_local std::vector<std::pair<std::string, std::string>> g_stmt_redo;
 namespace {
 struct RowOwners {
@@ -2367,6 +2385,41 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
       i = end + 1;
       continue;
     }
+    // Bit literal: b'1010' / B'1010' / 0b1010 - the number it spells (a string of bytes in MariaDB, but every
+    // use here is arithmetic: b'1010' + 0, a BIT column's value).
+    if ((c == 'b' || c == 'B') && i + 1 < sql.size() && sql[i + 1] == '\'' && (i == 0 || !(std::isalnum((unsigned char)sql[i - 1]) || sql[i - 1] == '_' || sql[i - 1] == '`'))) {
+      size_t j = i + 2;
+      while (j < sql.size() && (sql[j] == '0' || sql[j] == '1')) ++j;
+      if (j < sql.size() && sql[j] == '\'') {
+        unsigned long long v = 0;
+        for (size_t k = i + 2; k < j; ++k) v = (v << 1) | (unsigned)(sql[k] - '0');
+        Token t;
+        t.kind = Tok::Num;
+        t.text = std::to_string(v);
+        t.up = t.text;
+        t.start_pos = i;
+        t.end_pos = j + 1;
+        out->push_back(std::move(t));
+        i = j + 1;
+        continue;
+      }
+    }
+    if (c == '0' && i + 1 < sql.size() && (sql[i + 1] == 'b' || sql[i + 1] == 'B') && i + 2 < sql.size() && (sql[i + 2] == '0' || sql[i + 2] == '1')) {
+      size_t j = i + 2;
+      unsigned long long v = 0;
+      while (j < sql.size() && (sql[j] == '0' || sql[j] == '1')) { v = (v << 1) | (unsigned)(sql[j] - '0'); ++j; }
+      if (!(j < sql.size() && (std::isalnum((unsigned char)sql[j]) || sql[j] == '_'))) {
+        Token t;
+        t.kind = Tok::Num;
+        t.text = std::to_string(v);
+        t.up = t.text;
+        t.start_pos = i;
+        t.end_pos = j;
+        out->push_back(std::move(t));
+        i = j;
+        continue;
+      }
+    }
     // Hex literal: 0x... or 0X...
     if (c == '0' && i + 1 < sql.size() && (sql[i + 1] == 'x' || sql[i + 1] == 'X')) {
       size_t j = i + 2;
@@ -2951,6 +3004,7 @@ struct ParsedSelectBranch {
 struct ParsedSelectStatement {
   std::vector<ParsedSelectBranch> branches;
   std::vector<bool> union_is_all;
+  std::vector<uint8_t> union_kind;   // per joint: 0 UNION, 1 INTERSECT, 2 EXCEPT
   // `(SELECT ..) UNION (SELECT ..) ORDER BY .. LIMIT ..`: the ORDER BY / LIMIT
   // after a parenthesised last branch belongs to the whole union, not to it.
   std::string union_tail;
@@ -3575,7 +3629,15 @@ class SqlParser {
       p_++;
       return make_op_call("__BINARY", {parse_unary()});
     }
-    return parse_postfix();
+    ExprPtr e = parse_postfix();
+    // x COLLATE name: a _bin collation compares bytes (as BINARY x does); any
+    // other is the case-insensitive comparison every value gets here.
+    while (!failed() && e && is_word("COLLATE") && peek(1).kind == Tok::Ident) {
+      p_++;
+      const std::string coll = lower_of(next().text);
+      if (coll.find("_bin") != std::string::npos || coll == "binary") e = make_op_call("__BINARY", {e});
+    }
+    return e;
   }
 
   ExprPtr parse_postfix() {
@@ -4848,16 +4910,19 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
   int paren_depth = 0;
   std::vector<size_t> union_indices;
   std::vector<bool> union_is_all;
+  std::vector<uint8_t> union_kind;
 
   for (size_t i = 0; i < toks.size(); ++i) {
     if (toks[i].kind == Tok::Punct && toks[i].text == "(") {
       paren_depth++;
     } else if (toks[i].kind == Tok::Punct && toks[i].text == ")") {
       if (paren_depth > 0) paren_depth--;
-    } else if (paren_depth == 0 && toks[i].kind == Tok::Ident && toks[i].up == "UNION"sv) {
+    } else if (paren_depth == 0 && toks[i].kind == Tok::Ident && !toks[i].quoted &&
+               (toks[i].up == "UNION"sv || toks[i].up == "INTERSECT"sv || toks[i].up == "EXCEPT"sv)) {
       union_indices.push_back(i);
       bool is_all = (i + 1 < toks.size() && toks[i + 1].kind == Tok::Ident && toks[i + 1].up == "ALL"sv);
       union_is_all.push_back(is_all);
+      union_kind.push_back(toks[i].up == "UNION"sv ? 0 : toks[i].up == "INTERSECT"sv ? 1 : 2);
     }
   }
 
@@ -4875,6 +4940,7 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
   }
 
   stmt.union_is_all = union_is_all;
+  stmt.union_kind = union_kind;
   size_t b0_start = toks[0].start_pos;
   size_t b0_end = toks[union_indices[0] - 1].end_pos;
   std::string b0_sql = clean_sql.substr(b0_start, b0_end - b0_start);
@@ -4902,7 +4968,7 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
     }
 
     if (branch_start_tok > branch_end_tok) {
-      stmt.error = "expected SELECT after UNION";
+      stmt.error = "expected SELECT after " + std::string(toks[u_idx].up);
       return stmt;
     }
 
@@ -5799,11 +5865,17 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
     case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div: case ExprOp::Mod:
     case ExprOp::Neg:
       return infer_item_exact(e, sources) ? SqlDataType::Decimal : SqlDataType::Real;
+    // A truth value is an integer (1, 0, NULL): the client right-aligns it and binds it as a number.
+    case ExprOp::Eq: case ExprOp::Ne: case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt: case ExprOp::Ge:
+    case ExprOp::And: case ExprOp::Or: case ExprOp::Not: case ExprOp::Like: case ExprOp::In: case ExprOp::Between:
+    case ExprOp::IsNull: case ExprOp::Regexp: case ExprOp::Exists:
+      return SqlDataType::Int;
     case ExprOp::Func: {
       std::string up = upper_of(e->name);
       if (up == "COUNT"sv || up == "LAST_INSERT_ID"sv || up == "ROW_COUNT"sv ||
-          up == "FOUND_ROWS"sv || up == "CONNECTION_ID"sv)
+          up == "FOUND_ROWS"sv || up == "CONNECTION_ID"sv || up == "__INTDIV"sv || up == "__BITNOT"sv)
         return SqlDataType::Int;
+      if (up == "__BINARY"sv && e->args.size() == 1) return infer_item_type(e->args[0].get(), sources);
       // Whole numbers by definition: dates and strings measured in whole units.
       if (up == "DATEDIFF"sv || up == "TO_DAYS"sv || up == "LENGTH"sv || up == "CHAR_LENGTH"sv ||
           up == "YEAR"sv || up == "MONTH"sv || up == "DAY"sv || up == "DAYOFMONTH"sv || up == "HOUR"sv ||
@@ -5983,6 +6055,7 @@ inline NestedResult run_nested_select(SqlDatabase* db, const std::string& sql,
 // Evaluates a subquery once and, when it turned out to read nothing from the
 // query around it, keeps the answer for every row that follows.
 SqlTable* find_cte_table(const std::string& name);   // below: a CTE / ephemeral table in scope
+std::string undo_literal(const std::string& v);      // below: a cell as an SQL literal
 
 bool fast_in_subquery(const EvalCtx& ctx, const ParsedSelectStatement& st, NestedResult* out);
 bool fast_in_subquery_scan(const EvalCtx& ctx, const ParsedSelectStatement& st, const std::function<void(size_t)>& reserve,
@@ -7134,6 +7207,33 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
   }
 
   if (up == "SUM"sv || up == "AVG"sv) {
+    if (e->negated) {
+      // SUM(DISTINCT x) / AVG(DISTINCT x): each distinct non-NULL value once (it used to add every row).
+      SumAcc acc;
+      std::unordered_set<std::string> seen;
+      std::vector<Val> pre;
+      const bool have_pre = group_values(e->args[0].get(), ctx, &pre);
+      if (have_pre && ctx.err && !ctx.err->empty()) return val_null();
+      EvalCtx inner = ctx;
+      inner.group = nullptr;
+      char nb[48];
+      for (size_t gi = 0; gi < ctx.group->size(); ++gi) {
+        Val v;
+        if (have_pre) v = std::move(pre[gi]);
+        else { inner.row = &(*ctx.group)[gi]; v = eval_expr(e->args[0].get(), inner); }
+        if (v.null) continue;
+        std::string key;
+        if (v.numeric) { snprintf(nb, sizeof nb, "%.17g", v.num); key = nb; }
+        else {
+          double d = 0;
+          if (parse_number(v.str(), &d)) { snprintf(nb, sizeof nb, "%.17g", d); key = nb; }
+          else key = collate_key(v.str());
+        }
+        if (!seen.insert(key).second) continue;
+        acc.add(v);
+      }
+      return acc.finish(up == "AVG"sv);
+    }
     {
       Val fast;
       if (vx::sum_typed_group(e, ctx, up == "AVG"sv, &fast)) return fast;
@@ -8657,12 +8757,20 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       }
       return false;
     };
+    // A month or day the calendar does not have (2024-02-30) is no date: NULL, as MariaDB answers (with a warning).
+    auto calendar_ok = [](const DateParts& p) {
+      if (p.month == 0 && p.day == 0) return true;   // the zero date
+      if (p.month < 1 || p.month > 12 || p.day < 1) return false;
+      static const unsigned md[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+      const bool leap = (p.year % 4 == 0 && p.year % 100 != 0) || p.year % 400 == 0;
+      return p.day <= md[p.month - 1] + (p.month == 2 && leap ? 1u : 0u);
+    };
     if (target.rfind("DATETIME", 0) == 0) {
       DateParts p;
       std::string src = a_ptr[0].str();
       std::string nd;
       if (numeric_date_text(a_ptr[0], &nd)) src = nd;
-      if (!split_datetime(src, &p)) return val_null();
+      if (!split_datetime(src, &p) || !calendar_ok(p)) return val_null();
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d", p.year, p.month, p.day,
                     p.hour, p.minute, p.second);
@@ -8674,7 +8782,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       std::string nd;
       if (numeric_date_text(a_ptr[0], &nd)) src = nd;
       DateParts p;
-      if (!split_datetime(src, &p)) return val_null();
+      if (!split_datetime(src, &p) || !calendar_ok(p)) return val_null();
       char buf[16];
       std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", p.year, p.month, p.day);
       Val dv = val_text(buf);
@@ -10396,9 +10504,11 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
 #else
         if (vlow == "version_compile_machine") return val_text("x86_64");
 #endif
-        if (vlow == "tx_isolation" || vlow == "transaction_isolation") return val_text("REPEATABLE-READ");
+        if (vlow == "tx_isolation" || vlow == "transaction_isolation") return val_text(tls_tx_isolation.empty() ? std::string("REPEATABLE-READ") : tls_tx_isolation);
         if (vlow == "foreign_key_checks") return val_num(tls_fk_checks ? 1 : 0);
-        if (vlow == "autocommit" || vlow == "unique_checks") return val_num(1);
+        if (vlow == "autocommit") return val_num(tls_autocommit ? 1 : 0);
+        if (vlow == "innodb_lock_wait_timeout" || vlow == "lock_wait_timeout") return val_num((double)tls_lock_wait_timeout);
+        if (vlow == "unique_checks") return val_num(1);
         if (vlow == "sql_mode") return val_text(sql_mode_text());
         if (vlow == "lower_case_table_names") return val_num(0);
         if (vlow == "max_allowed_packet") return val_num(67108864);
@@ -11433,6 +11543,107 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
     return std::string();
   }
   return std::string();
+}
+
+// Without strict mode MariaDB stores the nearest value a column can hold
+// and warns: an integer clamped to its type's range, a DECIMAL to its
+// precision, text cut to its length, an ENUM member the column lacks as ''
+// (a SET's unknown members dropped). The value used to go in as it came -
+// a TINYINT holding 300, an UNSIGNED holding -1.
+std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
+  if (sql_is_null(v) || v.empty()) return v;
+  const char k0 = c.declared.empty() ? 0 : (char)std::tolower((unsigned char)c.declared[0]);
+  if (c.type == SqlDataType::Int) {
+    if (c.declared.empty()) return v;
+    char* end = nullptr;
+    errno = 0;
+    const double dv = std::strtod(v.c_str(), &end);
+    if (!end || end == v.c_str()) return v;
+    const std::string d = lower_of(c.declared);
+    const bool uns = d.find(" unsigned") != std::string::npos;
+    double lo = -9223372036854775808.0, hi = 9223372036854775807.0;
+    if (d.rfind("tinyint", 0) == 0) { lo = uns ? 0 : -128; hi = uns ? 255 : 127; }
+    else if (d.rfind("smallint", 0) == 0) { lo = uns ? 0 : -32768; hi = uns ? 65535 : 32767; }
+    else if (d.rfind("mediumint", 0) == 0) { lo = uns ? 0 : -8388608; hi = uns ? 16777215 : 8388607; }
+    else if (d.rfind("int", 0) == 0) { lo = uns ? 0 : -2147483648.0; hi = uns ? 4294967295.0 : 2147483647.0; }
+    else if (d.rfind("bigint", 0) == 0) { lo = uns ? 0 : lo; hi = uns ? 18446744073709551615.0 : hi; }
+    else return v;
+    const double r = std::round(dv);
+    if (r < lo) return lo == 0 ? std::string("0") : std::to_string((long long)lo);
+    if (r > hi) {
+      if (hi >= 9223372036854775807.0) return uns ? std::string("18446744073709551615") : std::string("9223372036854775807");
+      return std::to_string((long long)hi);
+    }
+    return v;
+  }
+  if (c.type == SqlDataType::Decimal && c.precision > 0) {
+    char* end = nullptr;
+    const double dv = std::strtod(v.c_str(), &end);
+    if (!end || end == v.c_str()) return v;
+    const int intdigits = (int)c.precision - (int)c.scale;
+    if (std::fabs(dv) < std::pow(10.0, intdigits) && !(dv < 0 && lower_of(c.declared).find(" unsigned") != std::string::npos)) return v;
+    if (dv < 0 && lower_of(c.declared).find(" unsigned") != std::string::npos) return std::string(c.scale ? "0." : "0") + std::string(c.scale, '0');
+    std::string m = dv < 0 ? "-" : "";
+    m += std::string((size_t)std::max(intdigits, 0), '9');
+    if (intdigits <= 0) m += "0";
+    if (c.scale) m += "." + std::string(c.scale, '9');
+    return m;
+  }
+  if (c.type != SqlDataType::Text) return v;
+  if (k0 == 'v' || k0 == 'c' || k0 == 'b') {   // varchar / char / varbinary / binary (n)
+    const size_t a = c.declared.find('(');
+    if (a == std::string::npos) return v;
+    const long n = std::atol(c.declared.c_str() + a + 1);
+    if (n < 0 || v.size() <= (size_t)n) return v;
+    // Cut at n characters (UTF-8 aware), never inside a sequence.
+    size_t i = 0;
+    long chars = 0;
+    while (i < v.size() && chars < n) {
+      const unsigned char ch = (unsigned char)v[i];
+      i += ch < 0x80 ? 1 : ch < 0xE0 ? 2 : ch < 0xF0 ? 3 : 4;
+      ++chars;
+    }
+    return v.substr(0, std::min(i, v.size()));
+  }
+  if (k0 == 'e' || k0 == 's') {
+    const std::string d = lower_of(c.declared);
+    const bool is_enum = d.rfind("enum", 0) == 0;
+    if (!is_enum && d.rfind("set", 0) != 0) return v;
+    std::vector<std::string> members;
+    const size_t a = d.find('(');
+    for (size_t i = a == std::string::npos ? d.size() : a + 1; i < d.size();) {
+      if (d[i] != '\'') { ++i; continue; }
+      std::string m;
+      ++i;
+      while (i < d.size()) {
+        if (d[i] == '\'' && i + 1 < d.size() && d[i + 1] == '\'') { m += '\''; i += 2; continue; }
+        if (d[i] == '\'') { ++i; break; }
+        m += d[i++];
+      }
+      members.push_back(m);
+    }
+    if (members.empty()) return v;
+    if (is_enum) {
+      const std::string lv = lower_of(v);
+      for (const auto& m : members) if (m == lv) return v;
+      char* end = nullptr;
+      const long idx = std::strtol(v.c_str(), &end, 10);
+      if (end && *end == 0 && idx >= 1 && (size_t)idx <= members.size()) return v;
+      return std::string();
+    }
+    std::string out;
+    size_t start = 0;
+    while (start <= v.size()) {
+      const size_t comma = v.find(',', start);
+      const std::string part = v.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+      const std::string lp = lower_of(part);
+      for (const auto& m : members) if (m == lp && !part.empty()) { out += (out.empty() ? "" : ",") + part; break; }
+      if (comma == std::string::npos) break;
+      start = comma + 1;
+    }
+    return out;
+  }
+  return v;
 }
 
 std::string sql_normalize_value(SqlDataType t, int scale, const std::string& v) {
@@ -16838,6 +17049,7 @@ static void row_undo_changed(const SqlTable* t, size_t r, size_t c, const std::s
   // a relative assignment of the running UPDATE shares the row; anything else takes it (keyed as it was, and as
   // it will be when the key itself changes)
   const bool delta = g_delta_table == t && c < g_delta_cols.size() && g_delta_cols[c] && !t->columns[c].is_primary_key;
+  u.relative = delta;
   row_claim(t, u.row, delta);
   if (t->columns[c].is_primary_key) {
     std::vector<std::string> moved = u.row;
@@ -18326,6 +18538,41 @@ static std::string_view first_word_upper(const std::string& sql, size_t* from, c
   *from = j;
   return k > cap ? std::string_view() : std::string_view(buf, k);
 }
+// SET autocommit = 1 | ON | TRUE (any scope), which commits an open transaction.
+static bool sets_autocommit_on(const std::string& sql) {
+  const std::string low = lower_of(sql);
+  size_t at = low.find("autocommit");
+  if (at == std::string::npos) return false;
+  at += 10;
+  while (at < low.size() && ascii_space(low[at])) ++at;
+  if (at < low.size() && low[at] == ':') ++at;
+  if (at >= low.size() || low[at] != '=') return false;
+  ++at;
+  while (at < low.size() && ascii_space(low[at])) ++at;
+  return low.compare(at, 1, "1") == 0 || low.compare(at, 2, "on") == 0 || low.compare(at, 4, "true") == 0;
+}
+// A statement MariaDB commits an open transaction before: DDL (but not a TEMPORARY table's) and SET autocommit=1.
+static bool statement_commits_implicitly(const std::string& sql) {
+  char b[16];
+  size_t at = 0;
+  const std::string_view w = first_word_upper(sql, &at, b, sizeof b, false);
+  if (w == "SET"sv) return sets_autocommit_on(sql);
+  if (w == "CREATE"sv || w == "DROP"sv || w == "ALTER"sv || w == "TRUNCATE"sv || w == "RENAME"sv) {
+    char b2[16];
+    const std::string_view w2 = first_word_upper(sql, &at, b2, sizeof b2, false);
+    return w2 != "TEMPORARY"sv;
+  }
+  return false;
+}
+// With autocommit off: a statement that opens a transaction when none is - a write, or a locking read.
+static bool statement_opens_transaction(const std::string& sql) {
+  char b[16];
+  size_t at = 0;
+  const std::string_view w = first_word_upper(sql, &at, b, sizeof b, true);
+  if (w == "INSERT"sv || w == "UPDATE"sv || w == "DELETE"sv || w == "REPLACE"sv || w == "LOAD"sv) return true;
+  if (w == "SELECT"sv || w == "WITH"sv) return strcase_contains_sv(sql, "for update") || strcase_contains_sv(sql, "lock in share") || strcase_contains_sv(sql, "for share");
+  return false;
+}
 bool statement_only_reads(const std::string& sql) {
   char b[16];
   size_t at = 0;
@@ -18669,6 +18916,7 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       SqlColumn{"TABLE_COMMENT", SqlDataType::Text}
     };
     for (const auto& kv : tables_) {
+      if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
       std::string db = kv.second.database.empty() ? "aios_db" : kv.second.database;
       std::string ct = kv.second.create_time.empty() ? sql_null() : kv.second.create_time;
       t.append_row(SqlRow{{
@@ -18713,6 +18961,7 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       SqlColumn{"GENERATION_EXPRESSION", SqlDataType::Text}
     };
     for (const auto& kv : tables_) {
+      if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
       std::string db = kv.second.database.empty() ? "aios_db" : kv.second.database;
       for (size_t ci = 0; ci < kv.second.columns.size(); ++ci) {
         const auto& col = kv.second.columns[ci];
@@ -18773,6 +19022,7 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       SqlColumn{"EXPRESSION", SqlDataType::Text}
     };
     for (const auto& kv : tables_) {
+      if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
       std::string db = kv.second.database.empty() ? "aios_db" : kv.second.database;
       size_t seq = 1;
       for (const auto& col : kv.second.columns) {
@@ -18810,6 +19060,7 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       SqlColumn{"REFERENCED_COLUMN_NAME", SqlDataType::Text}
     };
     for (const auto& kv : tables_) {
+      if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
       std::string db = kv.second.database.empty() ? "aios_db" : kv.second.database;
       size_t seq = 1;
       for (const auto& col : kv.second.columns) {
@@ -18968,6 +19219,15 @@ SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::string&
   std::string want_tbl = lower_of(target_table);
   std::string want_db = lower_of(target_db);
 
+  // The session's TEMPORARY table of this name, ahead of a stored one.
+  if (!tls_temp_tables.empty()) {
+    auto h = tls_temp_tables.find(make_table_key(target_db, target_table));
+    if (h != tls_temp_tables.end()) {
+      auto it = tables_.find(h->second);
+      if (it != tables_.end()) { g_stmt_temp_touch = true; table_lock_shared(&it->second); return &it->second; }
+    }
+  }
+
   if (want_db == "information_schema") {
     if (want_tbl == "columns") return const_cast<SqlTable*>(info_schema_columns());
     info_schema_cache_[want_tbl] = build_info_schema_table(want_tbl);
@@ -19024,6 +19284,96 @@ SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::string&
   return nullptr;
 }
 
+// ---- row rules: generated columns and CHECK constraints -------------------
+//
+// For one row written to a table: every GENERATED column worked out from the
+// row (in column order, so a later one may read an earlier one) and every
+// CHECK tried; a CHECK that comes out false is error 4025, as MariaDB raises
+// it. NULL passes a CHECK, as in SQL. The row is the one about to be inserted
+// (*row, not in the table yet - read through a one-row scratch table shaped
+// like it) or row `at` of the table as it stands after an UPDATE's
+// assignments. Tables with no rules never get here (has_rules()).
+namespace {
+struct RowRules {
+  std::string shape;                 // the rules' texts: parsed again when they change
+  std::vector<ExprPtr> gen;          // per column, null for a plain one
+  std::vector<ExprPtr> checks;
+  SqlTable scratch;                  // one row, the table's columns
+};
+thread_local std::unordered_map<std::string, RowRules> tls_row_rules;   // by table key
+}  // namespace
+
+bool SqlDatabase::apply_row_rules(SqlTable* t, SqlRow* row, size_t at, std::string* err) {
+  std::string shape;
+  for (const auto& c : t->columns) { shape += c.name; shape += '\x1f'; shape += c.generated; shape += '\x1e'; }
+  for (const auto& ck : t->checks) { shape += ck.name; shape += '\x1f'; shape += ck.expr; shape += '\x1e'; }
+  RowRules& rr = tls_row_rules[make_table_key(t->database, t->name)];
+  if (rr.shape != shape) {
+    rr.gen.assign(t->columns.size(), nullptr);
+    rr.checks.clear();
+    auto parse = [&](const std::string& text, ExprPtr* out) -> bool {
+      ParsedSelectStatement st = parse_select_sql("SELECT " + text);
+      if (!st.ok || st.branches.size() != 1 || st.branches[0].items.size() != 1 || !st.branches[0].items[0].expr) {
+        *err = "cannot read the expression (" + text + ")" + (st.error.empty() ? "" : ": " + st.error);
+        return false;
+      }
+      *out = st.branches[0].items[0].expr;
+      return true;
+    };
+    for (size_t c = 0; c < t->columns.size(); ++c)
+      if (!t->columns[c].generated.empty() && !parse(t->columns[c].generated, &rr.gen[c])) { rr.shape.clear(); return false; }
+    for (const auto& ck : t->checks) {
+      ExprPtr e;
+      if (!parse(ck.expr, &e)) { rr.shape.clear(); return false; }
+      rr.checks.push_back(e);
+    }
+    rr.scratch = SqlTable();
+    rr.scratch.name = t->name;
+    rr.scratch.database = t->database;
+    rr.scratch.columns = t->columns;
+    for (auto& c : rr.scratch.columns) { c.is_primary_key = false; c.auto_increment = false; }
+    rr.shape = shape;
+  }
+  SqlTable* src = t;
+  size_t ridx = at;
+  if (row) {
+    rr.scratch.clear_rows();
+    rr.scratch.ensure_columns();
+    row->values.resize(t->columns.size(), sql_null());
+    rr.scratch.append_row(*row);
+    src = &rr.scratch;
+    ridx = 0;
+  }
+  std::vector<QuerySource> sources{{t->name, src}};
+  JoinedRow jr;
+  jr.parts.push_back(ridx);
+  std::string eerr;
+  EvalCtx ctx;
+  ctx.db = this;
+  ctx.sources = &sources;
+  ctx.row = &jr;
+  ctx.err = &eerr;
+  for (size_t c = 0; c < rr.gen.size(); ++c) {
+    if (!rr.gen[c]) continue;
+    Val v = eval_expr(rr.gen[c].get(), ctx);
+    if (!eerr.empty()) { *err = "generated column '" + t->columns[c].name + "': " + eerr; return false; }
+    const SqlColumn& col = t->columns[c];
+    std::string text = v.null ? sql_null() : sql_normalize_value(col.type, col.scale, val_store_text(v, col.type));
+    if (row) { row->values[c] = text; rr.scratch.set_cell(0, c, text); }
+    else if (t->cell(at, c) != text) t->set_cell(at, c, text);
+  }
+  for (size_t k = 0; k < rr.checks.size(); ++k) {
+    Val v = eval_expr(rr.checks[k].get(), ctx);
+    if (!eerr.empty()) { *err = "CHECK constraint '" + t->checks[k].name + "': " + eerr; return false; }
+    if (v.null || val_truthy(v)) continue;
+    const SqlCheck& ck = t->checks[k];
+    *err = "CONSTRAINT `" + (ck.column_level ? t->name + "." + ck.name : ck.name) + "` failed for `" +
+           (t->database.empty() ? std::string("aios_db") : t->database) + "`.`" + t->name + "`";
+    return false;
+  }
+  return true;
+}
+
 bool SqlDatabase::is_stored_table(const SqlTable* t) const {
   if (!t) return false;
   auto it = tables_.find(make_table_key(t->database, t->name));
@@ -19049,6 +19399,13 @@ const SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::s
   }
 
   std::string key = make_table_key(target_db, target_table);
+  if (!tls_temp_tables.empty()) {   // the session's TEMPORARY table of this name, ahead of a stored one
+    auto h = tls_temp_tables.find(key);
+    if (h != tls_temp_tables.end()) {
+      auto ht = tables_.find(h->second);
+      if (ht != tables_.end()) { g_stmt_temp_touch = true; table_lock_shared(&ht->second); return &ht->second; }
+    }
+  }
   auto it = tables_.find(key);
   if (it != tables_.end()) { table_lock_shared(&it->second); return &it->second; }
 
@@ -19090,6 +19447,11 @@ SqlTable* SqlDatabase::find_table(const std::string& name, const std::string& db
   std::string target_db, target_table;
   split_qualified_name(name, db.empty() ? effective_database() : db, &target_db, &target_table);
   std::string key = make_table_key(target_db, target_table);
+  if (!tls_temp_tables.empty()) {   // the session's TEMPORARY table of this name first
+    auto h = tls_temp_tables.find(key);
+    if (h != tls_temp_tables.end()) { auto ht = tables_.find(h->second); if (ht != tables_.end()) { g_stmt_temp_touch = true; return &ht->second; } }
+  }
+  if (hidden_table_name(target_table)) g_stmt_temp_touch = true;
   auto it = tables_.find(key);
   if (it != tables_.end()) return &it->second;
   std::string want_tbl = lower_of(target_table);
@@ -21722,9 +22084,12 @@ static bool starts_user_var_set(const std::string& q) {
   size_t j = i + 3;
   while (j < q.size() && std::isspace((unsigned char)q[j])) ++j;
   if (j + 1 < q.size() && q[j] == '@' && q[j + 1] != '@') return true;
-  // SET [SESSION] FOREIGN_KEY_CHECKS = 0 alone: the one server setting kept
-  // per session goes the same way (it was accepted and ignored).
-  return strcase_contains_sv(q, "foreign_key_checks");
+  // The server settings kept per session go the same way: foreign_key_checks, autocommit, sql_mode, the
+  // isolation level, the lock wait (the rest were accepted and ignored).
+  for (const char* v : {"foreign_key_checks", "autocommit", "sql_mode", "tx_isolation", "transaction_isolation",
+                        "lock_wait_timeout"})
+    if (strcase_contains_sv(q, v) && !strcase_contains_sv(q, "transaction isolation")) return true;
+  return false;
 }
 
 // BEGIN / START TRANSACTION, after any leading whitespace and comments.
@@ -21753,7 +22118,8 @@ static bool starts_transaction(const std::string& sql) {
 
 // SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE: the rows of its first table that the WHERE matches,
 // claimed for the open transaction (concurrent mode). Returns the transaction in the way, or 0.
-uint64_t SqlDatabase::claim_locked_rows(const std::string& sql, const std::string& session_db) {
+uint64_t SqlDatabase::claim_locked_rows(const std::string& sql, const std::string& session_db, std::string* run_sql) {
+  run_sql->clear();
   std::vector<Token> toks;
   std::string terr;
   if (!tokenize_sql(sql, &toks, &terr) || toks.empty() || toks[0].up != "SELECT"sv) return 0;
@@ -21776,6 +22142,13 @@ uint64_t SqlDatabase::claim_locked_rows(const std::string& sql, const std::strin
     if (!lock_at && u == "LOCK"sv && i + 2 < toks.size() && toks[i + 1].up == "IN"sv && toks[i + 2].up == "SHARE"sv) { lock_at = i; shared = true; }
   }
   if (!lock_at || !from || from + 1 >= toks.size()) return 0;
+  // NOWAIT / WAIT n / SKIP LOCKED after the lock words
+  bool skip_locked = false;
+  for (size_t k = lock_at + 2; k < toks.size() && toks[k].kind == Tok::Ident; ++k) {
+    if (toks[k].up == "NOWAIT"sv) g_stmt_lock_wait = 0;
+    else if (toks[k].up == "WAIT"sv && k + 1 < toks.size() && toks[k + 1].kind == Tok::Num) g_stmt_lock_wait = std::atoll(toks[k + 1].text.c_str());
+    else if (toks[k].up == "SKIP"sv && k + 1 < toks.size() && toks[k + 1].up == "LOCKED"sv) skip_locked = true;
+  }
   // FROM name [AS] [alias]
   size_t i = from + 1;
   std::string name = toks[i].text;
@@ -21804,10 +22177,46 @@ uint64_t SqlDatabase::claim_locked_rows(const std::string& sql, const std::strin
   if (trace) fprintf(stderr, "[for update] %s -> %s, %zu row(s)\n", q.c_str(), r.success ? "ok" : r.error_message.c_str(), r.rows.size());
   if (!r.success) return 0;
   const std::string tkey = make_table_key(t->database, t->name);
+  // The key a write claims (row_claim_key): the table's key, then each key
+  // value lower-cased and closed with \x1f. Spelled without the closing
+  // separators here, a FOR UPDATE never met the UPDATE it was meant to hold.
+  std::vector<const SqlRow*> skipped;
   for (const auto& row : r.rows) {
     std::string key = tkey;
-    for (const auto& v : row.values) { key += '\x1f'; key += v; }
-    if (uint64_t other = claim_row(key, shared, g_txn_id)) return other;
+    key += '\x1f';
+    for (const auto& v : row.values) { for (char ch : v) key += char_lower(ch); key += '\x1f'; }
+    if (uint64_t other = claim_row(key, shared, g_txn_id)) {
+      if (!skip_locked) return other;
+      skipped.push_back(&row);
+    }
+  }
+  if (skipped.empty()) return 0;
+  // SKIP LOCKED: the statement runs without the rows another transaction holds.
+  std::vector<std::string> pk;
+  for (const auto& c : t->columns) if (c.is_primary_key) pk.push_back(c.name);
+  const std::string qa = "`" + (alias.empty() ? t->name : alias) + "`.`";
+  std::string pred = "NOT (";
+  for (size_t k = 0; k < skipped.size(); ++k) {
+    pred += k ? " OR (" : "(";
+    for (size_t c = 0; c < pk.size() && c < skipped[k]->values.size(); ++c)
+      pred += (c ? " AND " : "") + qa + pk[c] + "` = " + undo_literal(skipped[k]->values[c]);
+    pred += ")";
+  }
+  pred += ")";
+  if (where) {
+    const size_t a = toks[where].end_pos, b = where_end ? toks[where_end].start_pos : toks[lock_at].start_pos;
+    *run_sql = sql.substr(0, toks[where].start_pos) + "WHERE (" + sql.substr(a, b - a) + ") AND " + pred + " " + sql.substr(b);
+  } else {
+    size_t tail = lock_at;
+    int d = 0;
+    for (size_t k = from + 1; k < lock_at; ++k) {
+      if (toks[k].kind == Tok::Punct && toks[k].text == "(") { ++d; continue; }
+      if (toks[k].kind == Tok::Punct && toks[k].text == ")") { --d; continue; }
+      if (d) continue;
+      const std::string& u = toks[k].up;
+      if (u == "GROUP"sv || u == "ORDER"sv || u == "LIMIT"sv || u == "HAVING"sv || u == "WINDOW"sv) { tail = k; break; }
+    }
+    *run_sql = sql.substr(0, toks[tail].start_pos) + "WHERE " + pred + " " + sql.substr(toks[tail].start_pos);
   }
   return 0;
 }
@@ -22205,6 +22614,17 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
     SqlQueryResult c = execute_gateway_query("COMMIT", session_db);
     if (!c.success) return c;
   }
+  // DDL and SET autocommit=1 commit an open transaction first, as MariaDB does; with autocommit off, a
+  // write with no transaction open opens one (tls_autocommit), which lasts until COMMIT / ROLLBACK.
+  if (g_rw_depth == 0 && tls_txn.open && !begins && statement_commits_implicitly(sql_query)) {
+    SqlQueryResult c = execute_gateway_query("COMMIT", session_db);
+    if (!c.success) return c;
+  }
+  if (g_rw_depth == 0 && !tls_autocommit && !tls_txn.open && statement_opens_transaction(sql_query)) {
+    SqlQueryResult b = execute_gateway_query("BEGIN", session_db);
+    if (!b.success) return b;
+  }
+  if (g_rw_depth == 0) g_stmt_temp_touch = false;
   if (txn_concurrent() && g_rw_depth == 0) return execute_gateway_concurrent(sql_query, session_db, begins ? 1 : 0);
   // A transaction takes the one writer lock for its whole life. BEGIN used to
   // wait for it INSIDE the statement lock: with one transaction open, a second
@@ -22367,8 +22787,10 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
   bool scoped = writes && table_locks_on() && !has_stored_functions() && simple_dml_text(sql_query);
   if (lock_trace_on() && writes) fprintf(stderr, "[lock] %s: %s\n", scoped ? "scoped" : "exclusive", sql_query.substr(0, 60).c_str());
   const auto started = std::chrono::steady_clock::now();
+  g_stmt_lock_wait = -1;
   for (;;) {
     uint64_t wait_on = 0;
+    std::string run_sql;   // the statement as it runs: SKIP LOCKED leaves out the rows it could not take
     {
       StatementLock lock(rw_lock_, writes && !scoped);
       tls_table_scoped = scoped;
@@ -22396,11 +22818,11 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
       if (!writes && tls_txn.open && g_txn_id) {
         const std::string up = upper_of(sql_query);
         if (up.find("FOR UPDATE") != std::string::npos || up.find("FOR SHARE") != std::string::npos || up.find("LOCK IN SHARE MODE") != std::string::npos)
-          wait_on = claim_locked_rows(sql_query, session_db);
+          wait_on = claim_locked_rows(sql_query, session_db, &run_sql);
       }
       SqlQueryResult res;
       if (!wait_on) {
-        res = out_of_memory_is_an_error([&] { return execute_gateway_query_unguarded(sql_query, session_db); });
+        res = out_of_memory_is_an_error([&] { return execute_gateway_query_unguarded(run_sql.empty() ? sql_query : run_sql, session_db); });
         if (tls_escalate) {   // nothing written: once more, under the exclusive lock
           scoped = false;
           g_stmt_redo.clear();
@@ -22434,6 +22856,10 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
           if (at < recs.size())
             recs[at].second += kRedoInsertIdTag + std::to_string(tls_statement_insert_id) + "*/";
         }
+        if (g_stmt_temp_touch) {   // a session's TEMPORARY table: nothing of it outlives the session, nothing to replay
+          g_stmt_redo.clear();
+          if (tls_txn.open && tls_txn.redo.size() > redo_mark) tls_txn.redo.resize(redo_mark);
+        }
         if (!dml_had_no_effect(sql_query, res, has_triggers_.load(std::memory_order_relaxed)))   // a no-op is logged nowhere: replaying it does nothing
           for (const auto& rec : g_stmt_redo) append_redo(rec.second, rec.first);
         g_stmt_redo.clear();
@@ -22460,11 +22886,19 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
           at = w == o.waits_for.end() ? 0 : w->second;
         }
       }
-      while (!deadlock && o.open.count(wait_on)) {
-        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(50)) { timed_out = true; break; }
-        o.cv.wait_for_ms(lk, 200);
+      // NOWAIT asks for no wait at all; WAIT n for n seconds; otherwise the session's innodb_lock_wait_timeout.
+      const int64_t limit_s = g_stmt_lock_wait >= 0 ? g_stmt_lock_wait : tls_lock_wait_timeout;
+      bool nowait = false;
+      if (!deadlock && limit_s == 0 && o.open.count(wait_on)) nowait = true;
+      while (!deadlock && !nowait && o.open.count(wait_on)) {
+        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(limit_s)) { timed_out = true; break; }
+        o.cv.wait_for_ms(lk, 20);
       }
       if (me) o.waits_for.erase(me);
+      if (nowait) {
+        lk.unlock();
+        return make_error("Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.");
+      }
     }
     if (deadlock) {
       execute_gateway_concurrent("ROLLBACK", session_db);
@@ -22476,10 +22910,26 @@ SqlQueryResult SqlDatabase::execute_gateway_concurrent(const std::string& sql_qu
 
 void SqlDatabase::abandon_open_transaction() {
   if (tls_txn.open) execute_gateway_query("ROLLBACK", "");
+  drop_session_temp_tables();
   tls_user_vars.reset();   // a connection's @variables end with it
   tls_fk_checks = true;    // and its session settings
   tls_no_auto_value_on_zero = false;
   tls_sql_mode_set = false;
+  tls_autocommit = true;
+  tls_tx_isolation.clear();
+  tls_lock_wait_timeout = 50;
+}
+
+void SqlDatabase::drop_session_temp_tables() {
+  if (tls_temp_tables.empty()) return;
+  std::unordered_map<std::string, std::string> mine;
+  mine.swap(tls_temp_tables);
+  for (const auto& kv : mine) {
+    auto it = tables_.find(kv.second);
+    if (it == tables_.end()) continue;
+    const std::string db = it->second.database, name = it->second.name;
+    execute_gateway_query("DROP TABLE `" + db + "`.`" + name + "`", db);
+  }
 }
 
 void SqlDatabase::reset_session() {
@@ -24024,6 +24474,61 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       }
       return execute_create_table(q);
     }
+    // INSERT / REPLACE / DELETE ... RETURNING <select list>: the rows the
+    // statement wrote or removed, read through the list. A DELETE's are
+    // selected first (the same WHERE / ORDER BY / LIMIT, under this
+    // statement's lock); an INSERT's are the rows it appended, read back
+    // from the table through a scope-local table of them.
+    if (verb == "INSERT" || verb == "REPLACE" || verb == "DELETE") {
+      size_t ret_at = 0;
+      int depth = 0;
+      for (size_t i = 1; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+        if (toks[i].kind == Tok::Punct) { if (toks[i].text == "(") ++depth; else if (toks[i].text == ")") --depth; continue; }
+        if (depth == 0 && toks[i].kind == Tok::Ident && !toks[i].quoted && toks[i].up == "RETURNING"sv) { ret_at = i; break; }
+      }
+      if (ret_at) {
+        std::string head = q.substr(0, toks[ret_at].start_pos);
+        std::string list = trim(q.substr(toks[ret_at].end_pos));
+        while (!list.empty() && (list.back() == ';' || std::isspace((unsigned char)list.back()))) list.pop_back();
+        if (list.empty()) return make_error("RETURNING needs a select list");
+        if (verb == "DELETE") {
+          SqlQueryResult sel = execute_select("SELECT " + list + " " + head.substr(toks[0].end_pos));
+          if (!sel.success) return sel;
+          SqlQueryResult del = execute_delete(head);
+          if (!del.success) return del;
+          sel.rows_affected = del.rows_affected;
+          return sel;
+        }
+        std::string tname;
+        for (size_t i = 1; i + 1 < toks.size(); ++i)
+          if (toks[i].up == "INTO"sv || (i == 1 && toks[i].kind == Tok::Ident && toks[i].up != "IGNORE"sv && toks[i].up != "DELAYED"sv && toks[i].up != "LOW_PRIORITY"sv && toks[i].up != "HIGH_PRIORITY"sv)) {
+            size_t k = toks[i].up == "INTO"sv ? i + 1 : i;
+            tname = toks[k].text;
+            while (k + 2 < toks.size() && toks[k + 1].kind == Tok::Punct && toks[k + 1].text == ".") { tname += "." + toks[k + 2].text; k += 2; }
+            break;
+          }
+        SqlTable* t = find_table(tname);
+        if (!t) return make_error("table not found: " + tname);
+        const size_t n0 = t->row_count();
+        SqlQueryResult ins = execute_insert(head);
+        if (defer_redo && ins.rows_affected > 0) append_redo(deferred_redo.second, deferred_redo.first);
+        if (!ins.success) return ins;
+        auto written = std::make_shared<SqlTable>();
+        written->name = t->name;
+        written->database = t->database;
+        written->columns = t->columns;
+        for (auto& c : written->columns) { c.is_primary_key = false; c.auto_increment = false; }
+        written->ensure_columns();
+        for (size_t r = n0; r < t->row_count(); ++r) written->append_row(t->get_row(r));
+        cte_stack().emplace_back();
+        cte_stack().back()[t->name] = written;
+        struct Pop { SqlCteStack& st; ~Pop() { st.pop_back(); } } pop{cte_stack()};
+        SqlQueryResult sel = execute_select("SELECT " + list + " FROM `" + t->name + "`");
+        if (!sel.success) return sel;
+        sel.rows_affected = ins.rows_affected;
+        return sel;
+      }
+    }
     if (verb == "INSERT" || verb == "REPLACE" || verb == "UPDATE" || verb == "DELETE")
       tokenize_handoff_move(q, std::move(toks));   // the statement's own parse takes these
     if (verb == "INSERT" || verb == "REPLACE") {
@@ -24384,6 +24889,18 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
           return r;
         }
       }
+      if (verb == "SET") {
+        // SET [SESSION | GLOBAL] TRANSACTION ISOLATION LEVEL <level>: kept, reported by @@tx_isolation.
+        for (size_t i = 1; i + 3 < toks.size(); ++i) {
+          if (toks[i].up != "TRANSACTION"sv || toks[i + 1].up != "ISOLATION"sv || toks[i + 2].up != "LEVEL"sv) continue;
+          std::string lvl;
+          for (size_t k = i + 3; k < toks.size() && toks[k].kind == Tok::Ident; ++k) lvl += (lvl.empty() ? "" : "-") + std::string(toks[k].up);
+          if (lvl != "READ-UNCOMMITTED" && lvl != "READ-COMMITTED" && lvl != "REPEATABLE-READ" && lvl != "SERIALIZABLE")
+            return make_error("unsupported isolation level: " + lvl);
+          tls_tx_isolation = lvl;
+          break;
+        }
+      }
       SqlQueryResult r;
       r.formatted_table = verb + " statement executed.";
       return r;
@@ -24395,6 +24912,34 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
     if (verb == "DELIMITER" || verb == "CREATE_TRIGGER_SKIPPED") {
       SqlQueryResult r;
       r.formatted_table = "DELIMITER directive ignored.";
+      return r;
+    }
+    if (verb == "RENAME" && toks.size() > 1 && toks[1].up == "TABLE"sv) {
+      // RENAME TABLE a TO b [, c TO d]: each an ALTER TABLE ... RENAME TO, in order.
+      SqlParser rp(toks);
+      rp.take_word("RENAME");
+      rp.take_word("TABLE");
+      std::vector<std::pair<std::string, std::string>> pairs;
+      do {
+        std::string from, to;
+        if (!rp.parse_name(&from)) return make_error(rp.error());
+        if (!rp.take_word("TO")) return make_error("expected TO in RENAME TABLE");
+        if (!rp.parse_name(&to)) return make_error(rp.error());
+        pairs.push_back({from, to});
+      } while (rp.take_punct(","));
+      auto q = [](const std::string& n) {
+        std::string out;
+        for (size_t k = 0, from = 0; k <= n.size(); ++k)
+          if (k == n.size() || n[k] == '.') { out += (from ? ".`" : "`") + n.substr(from, k - from) + "`"; from = k + 1; }
+        return out;
+      };
+      for (const auto& pr : pairs) {
+        if (find_table(pr.second)) return make_error("Table '" + pr.second + "' already exists");
+        SqlQueryResult r = execute_alter("ALTER TABLE " + q(pr.first) + " RENAME TO " + q(pr.second));
+        if (!r.success) return r;
+      }
+      SqlQueryResult r;
+      r.formatted_table = std::to_string(pairs.size()) + " table(s) renamed.";
       return r;
     }
     return make_error("unsupported statement: " + toks[0].text);
@@ -24579,7 +25124,9 @@ void SqlDatabase::undo_row_changes(size_t mark) {
       if (u.col < now.size()) now[u.col] = u.after;
       const std::string col = undo_ident(t.columns[u.col].name);
       std::string otherwise = col;
-      if (sql_type_numeric(t.columns[u.col].type) && undo_plain_number(u.before) && undo_plain_number(u.after))
+      // A relative change (col = col + k) shares its row with other transactions' relative changes: taking it back
+      // subtracts k from whatever is there. An absolute SET held the row alone: back to the value before.
+      if (u.relative && sql_type_numeric(t.columns[u.col].type) && undo_plain_number(u.before) && undo_plain_number(u.after))
         otherwise = col + " - (" + u.after + " - " + u.before + ")";
       const std::string unchanged = sql_is_null(u.after) ? col + " IS NULL" : col + " = " + undo_literal(u.after);
       sql = "UPDATE " + qname + " SET " + col + " = CASE WHEN " + unchanged + " THEN " + undo_literal(u.before) +
@@ -24846,6 +25393,29 @@ SqlQueryResult SqlDatabase::execute_set_user_vars(const std::string& sql) {
         else if (v == "1" || v == "on" || v == "true") tls_fk_checks = true;
         else if (v.rfind("@", 0) == 0) { const Val uv = user_var_get(v); tls_fk_checks = uv.null ? true : (uv.numeric ? uv.num != 0 : (lower_of(uv.str()) != "off" && uv.str() != "0")); }
         else return make_error("Variable 'foreign_key_checks' can't be set to the value of '" + v + "'");
+      }
+      if (lower_of(sys) == "autocommit") {
+        std::string v = lower_of(trim(p.substr(eq + eqlen)));
+        if (v.size() >= 2 && (v.front() == '\'' || v.front() == '"') && v.back() == v.front()) v = v.substr(1, v.size() - 2);
+        if (v == "0" || v == "off" || v == "false") tls_autocommit = false;
+        else if (v == "1" || v == "on" || v == "true") tls_autocommit = true;   // an open transaction was committed by the gateway
+        else return make_error("Variable 'autocommit' can't be set to the value of '" + v + "'");
+      }
+      if (lower_of(sys) == "innodb_lock_wait_timeout" || lower_of(sys) == "lock_wait_timeout") {
+        std::string v = trim(p.substr(eq + eqlen));
+        if (v.size() >= 2 && (v.front() == '\'' || v.front() == '"') && v.back() == v.front()) v = v.substr(1, v.size() - 2);
+        char* end = nullptr;
+        const long long n = std::strtoll(v.c_str(), &end, 10);
+        if (!end || *end || n < 0) return make_error("Variable 'innodb_lock_wait_timeout' can't be set to the value of '" + v + "'");
+        tls_lock_wait_timeout = n;
+      }
+      if (lower_of(sys) == "tx_isolation" || lower_of(sys) == "transaction_isolation") {
+        std::string v = upper_of(trim(p.substr(eq + eqlen)));
+        if (v.size() >= 2 && (v.front() == '\'' || v.front() == '"') && v.back() == v.front()) v = v.substr(1, v.size() - 2);
+        std::replace(v.begin(), v.end(), ' ', '-');
+        if (v != "READ-UNCOMMITTED" && v != "READ-COMMITTED" && v != "REPEATABLE-READ" && v != "SERIALIZABLE")
+          return make_error("Variable 'tx_isolation' can't be set to the value of '" + v + "'");
+        tls_tx_isolation = v;
       }
       // And sql_mode's NO_AUTO_VALUE_ON_ZERO, the one mode that changes what a row stores.
       if (lower_of(sys) == "sql_mode") {
@@ -41129,6 +41699,44 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
     if (u + 1 >= stmt.branches.size()) break;
     SqlQueryResult next_res = execute_parsed_select_single(db, stmt.branches[u + 1]);
     if (!next_res.success) return next_res;
+    const uint8_t kind = u < stmt.union_kind.size() ? stmt.union_kind[u] : 0;
+
+    if (kind != 0) {
+      // INTERSECT / EXCEPT: the left rows that have (or have no) match on the
+      // right, by every cell's collation key. ALL keeps as many of a row as
+      // both sides have (INTERSECT) or as the left has over the right (EXCEPT);
+      // without ALL each distinct row once.
+      auto row_key = [](const SqlRow& row) {
+        std::string key;
+        for (const auto& v : row.values) {
+          append_collate_key(key, sql_display(v));
+          key += '\x01';
+        }
+        return key;
+      };
+      std::unordered_map<std::string, size_t> right;
+      for (const auto& r : next_res.rows) ++right[row_key(r)];
+      std::unordered_set<std::string> seen;
+      std::vector<SqlRow> kept;
+      for (auto& row : res.rows) {
+        const std::string k = row_key(row);
+        auto hit = right.find(k);
+        const bool on_right = hit != right.end() && hit->second > 0;
+        bool take;
+        if (kind == 1) {
+          take = on_right;
+          if (take && is_all) --hit->second;
+        } else {
+          take = !on_right;
+          if (on_right && is_all) --hit->second;
+        }
+        if (!take) continue;
+        if (!is_all && !seen.insert(k).second) continue;
+        kept.push_back(std::move(row));
+      }
+      res.rows.swap(kept);
+      continue;
+    }
 
     if (is_all) {
       for (auto& r : next_res.rows) {
@@ -41804,6 +42412,28 @@ std::string default_clause(const std::string& d) {
 // only things MariaDB allows there) at the parser's position: consumed, and
 // its text returned. Anything else - an inline foreign key's `ON UPDATE
 // CASCADE` - is left alone and "" comes back.
+// The text inside the parentheses at the parser's position - the `(a + b)`
+// of a CHECK or a GENERATED ALWAYS AS - consumed; "" when not at one.
+static std::string take_paren_text(SqlParser& p, const std::vector<Token>& toks, const std::string& sql) {
+  if (!p.is_punct("(")) return {};
+  const size_t open = p.pos();
+  int depth = 0;
+  do {
+    if (p.is_punct("(")) ++depth;
+    else if (p.is_punct(")")) --depth;
+    p.next();
+  } while (depth > 0 && !p.at_end());
+  const size_t close = p.pos() - 1;
+  if (close <= open || close >= toks.size() || toks[close].text != ")") return {};
+  const size_t a = toks[open].end_pos, b = toks[close].start_pos;
+  return b > a ? trim(sql.substr(a, b - a)) : std::string();
+}
+
+// The hidden name a session's TEMPORARY table is stored under (see tls_temp_tables).
+static std::string temp_table_hidden_name(const std::string& visible) {
+  return std::string("\x01tmp") + std::to_string((unsigned long long)SqlDatabase::current_session_id()) + "\x01" + visible;
+}
+
 std::string take_on_update(SqlParser& p, const std::vector<Token>& toks, const std::string& sql) {
   if (!p.is_word("ON") || !p.is_word("UPDATE", 1)) return {};
   bool function = false;
@@ -41852,7 +42482,7 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
   if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
   SqlParser p(toks);
   if (!p.take_word("CREATE")) return make_error("expected CREATE");
-  p.take_word("TEMPORARY");
+  const bool temporary = p.take_word("TEMPORARY");
   if (!p.take_word("TABLE")) return make_error("only CREATE TABLE is supported");
   bool if_not_exists = false;
   if (p.take_word("IF")) {
@@ -41861,6 +42491,22 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
   }
   std::string name;
   if (!p.parse_name(&name)) return make_error(p.error());
+  // A TEMPORARY table: this session's alone, under a hidden name the session's map reaches (tls_temp_tables).
+  std::string temp_visible;
+  if (temporary) {
+    std::string tdb, ttb;
+    split_qualified_name(name, effective_database(), &tdb, &ttb);
+    temp_visible = make_table_key(tdb, ttb);
+    g_stmt_temp_touch = true;
+    if (tls_temp_tables.count(temp_visible)) {
+      if (if_not_exists) { SqlQueryResult r; r.formatted_table = "Table '" + ttb + "' already exists."; return r; }
+      return make_error("table already exists: " + ttb);
+    }
+    name = "`" + tdb + "`.`" + temp_table_hidden_name(ttb) + "`";
+    std::string hdb, htb;
+    split_qualified_name(name, tdb, &hdb, &htb);
+    name = hdb + "." + htb;
+  }
 
   if (find_table(name) || find_view(name)) {
     if (if_not_exists) {
@@ -41972,6 +42618,7 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
     if (!made.success) return made;
     SqlTable* t = resolve_table(name);
     if (!t) return make_error("CREATE TABLE ... SELECT: the table was not made");
+    if (!temp_visible.empty()) tls_temp_tables[temp_visible] = make_table_key(t->database, t->name);
     t->reserve(t->row_count() + r.rows.size());
     for (const auto& row : r.rows) t->append_row(row);
     invalidate_table_index(t->name, t->database);
@@ -42025,6 +42672,14 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
         else index.name = word;
       }
       if (index.name.empty() && !constraint.empty() && !primary) index.name = constraint;
+      if (check) {
+        const std::string x = take_paren_text(p, toks, sql);
+        if (x.empty()) return make_error("CHECK needs a parenthesised condition");
+        SqlCheck ck;
+        ck.name = constraint.empty() ? "CONSTRAINT_" + std::to_string(table.checks.size() + 1) : constraint;
+        ck.expr = x;
+        table.checks.push_back(std::move(ck));
+      }
       if (!check && p.take_punct("(")) {
         do {
           std::string cn;
@@ -42148,6 +42803,26 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
             col.auto_increment = true;
             continue;
           }
+          if (p.take_word("CHECK")) {
+            const std::string x = take_paren_text(p, toks, sql);
+            if (x.empty()) return make_error("CHECK needs a parenthesised condition");
+            SqlCheck ck;
+            ck.name = col.name;
+            ck.expr = x;
+            ck.column_level = true;
+            table.checks.push_back(std::move(ck));
+            continue;
+          }
+          if (p.is_word("GENERATED") || (p.is_word("AS") && p.is_punct("(", 1))) {
+            if (p.take_word("GENERATED")) p.take_word("ALWAYS");
+            if (!p.take_word("AS")) return make_error("expected AS after GENERATED ALWAYS");
+            col.generated = take_paren_text(p, toks, sql);
+            if (col.generated.empty()) return make_error("GENERATED ALWAYS AS needs a parenthesised expression");
+            col.generated_virtual = true;
+            if (p.take_word("STORED") || p.take_word("PERSISTENT")) col.generated_virtual = false;
+            else p.take_word("VIRTUAL");
+            continue;
+          }
           if (p.take_word("DEFAULT")) {
             std::string derr;
             col.default_value = column_with_on_update(read_column_default(p, toks, sql, &derr), column_on_update_text(col.default_value));
@@ -42216,6 +42891,7 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
   // CREATE_TIME, in the same clock and zone as NOW().
   table.create_time = format_datetime((std::time_t)(kernel_.host().wall_ns() / 1000000000ull), false);
   tables_[make_table_key(target_db, target_table)] = table;
+  if (!temp_visible.empty()) tls_temp_tables[temp_visible] = make_table_key(target_db, target_table);
   checkpoint();
   SqlQueryResult res;
   res.formatted_table = "Table '" + name + "' created successfully.";
@@ -42435,6 +43111,7 @@ SqlQueryResult SqlDatabase::execute_drop(const std::string& sql) {
   if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
   SqlParser p(toks);
   p.take_word("DROP");
+  const bool temporary = p.take_word("TEMPORARY");
   if (!p.take_word("TABLE")) return make_error("only DROP TABLE is supported");
   bool if_exists = false;
   if (p.take_word("IF")) {
@@ -42449,6 +43126,36 @@ SqlQueryResult SqlDatabase::execute_drop(const std::string& sql) {
     names.push_back(n);
   } while (p.take_punct(","));
   if (!p.take_word("RESTRICT")) p.take_word("CASCADE");
+  // The session's TEMPORARY table of that name goes first (its hidden table dropped, the map entry gone);
+  // DROP TEMPORARY TABLE names nothing else.
+  if (names.size() == 1 && (temporary || !tls_temp_tables.empty())) {
+    std::string tdb, ttb;
+    split_qualified_name(names[0], effective_database(), &tdb, &ttb);
+    auto h = tls_temp_tables.find(make_table_key(tdb, ttb));
+    if (h != tls_temp_tables.end()) {
+      const std::string hidden = h->second;
+      tls_temp_tables.erase(h);
+      g_stmt_temp_touch = true;
+      auto ht = tables_.find(hidden);
+      if (ht == tables_.end()) { SqlQueryResult r; r.formatted_table = "Table dropped."; return r; }
+      return execute_drop("DROP TABLE `" + ht->second.database + "`.`" + ht->second.name + "`");
+    }
+    if (temporary) {
+      if (if_exists) { SqlQueryResult r; r.formatted_table = "No such temporary table."; return r; }
+      return make_error("Unknown table '" + tdb + "." + ttb + "'");
+    }
+  } else if (temporary) {
+    SqlQueryResult last;
+    std::string first_err;
+    for (const auto& n : names) {
+      SqlQueryResult r = execute_drop(std::string("DROP TEMPORARY TABLE ") + (if_exists ? "IF EXISTS " : "") + n);
+      if (!r.success && first_err.empty()) first_err = r.error_message;
+      if (r.success) last = std::move(r);
+    }
+    if (!first_err.empty()) return make_error(first_err);
+    last.formatted_table = std::to_string(names.size()) + " table(s) dropped.";
+    return last;
+  }
   // One table at a time, as MariaDB drops them: a table another table's
   // foreign key still names stays (FOREIGN_KEY_CHECKS=1) and the statement
   // ends with 1451, the others listed are dropped.
@@ -42664,6 +43371,63 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
   }
 
   if (p.take_word("ADD")) {
+    // ADD [CONSTRAINT [name]] CHECK (expr)
+    if (p.is_word("CHECK") || (p.is_word("CONSTRAINT") && (p.is_word("CHECK", 1) || p.is_word("CHECK", 2)))) {
+      std::string cname;
+      if (p.take_word("CONSTRAINT") && !p.is_word("CHECK")) p.parse_name(&cname);
+      p.take_word("CHECK");
+      const std::string x = take_paren_text(p, toks, sql);
+      if (x.empty()) return make_error("CHECK needs a parenthesised condition");
+      SqlCheck ck;
+      ck.name = cname.empty() ? "CONSTRAINT_" + std::to_string(t->checks.size() + 1) : cname;
+      ck.expr = x;
+      // Every row there already must pass it, as MariaDB requires.
+      t->checks.push_back(ck);
+      for (size_t r = 0; r < t->row_count(); ++r) {
+        std::string rerr;
+        if (!apply_row_rules(t, nullptr, r, &rerr)) { t->checks.pop_back(); return make_error(rerr); }
+      }
+      checkpoint();
+      SqlQueryResult res;
+      res.formatted_table = "Constraint '" + ck.name + "' added to '" + t->name + "'.";
+      return res;
+    }
+    if (p.take_word("PRIMARY")) {
+      p.take_word("KEY");
+      if (!p.take_punct("(")) return make_error("expected '(' after PRIMARY KEY");
+      std::vector<std::string> cols;
+      do {
+        std::string cn;
+        if (!p.parse_name(&cn)) return make_error(p.error());
+        if (t->get_column_index(cn) < 0) return make_error("no such column: " + cn);
+        if (p.take_punct("(")) { while (!p.at_end() && !p.is_punct(")")) p.next(); p.take_punct(")"); }
+        if (p.take_word("ASC") || p.take_word("DESC")) {}
+        cols.push_back(cn);
+      } while (p.take_punct(","));
+      if (!p.take_punct(")")) return make_error("expected ')' after key columns");
+      for (const auto& c : t->columns) if (c.is_primary_key) return make_error("Multiple primary key defined");
+      // The key's values must be unique and NOT NULL over the rows there already.
+      std::vector<int> pk;
+      for (const auto& cn : cols) pk.push_back(t->get_column_index(cn));
+      std::unordered_set<std::string> seen;
+      for (size_t r = 0; r < t->row_count(); ++r) {
+        std::string k;
+        for (int ci : pk) {
+          const std::string& cell = t->cell(r, (size_t)ci);
+          if (sql_is_null(cell)) return make_error("Column '" + t->columns[(size_t)ci].name + "' cannot be null");
+          k += cell; k += '\x1f';
+        }
+        if (!seen.insert(k).second) return make_error("Duplicate entry for key 'PRIMARY'");
+      }
+      for (int ci : pk) { t->columns[(size_t)ci].is_primary_key = true; t->columns[(size_t)ci].not_null = true; }
+      t->mutation_seq = sql_next_mutation_seq();
+      t->layout_seq = t->mutation_seq;
+      invalidate_table_index(t->name, t->database);
+      checkpoint();
+      SqlQueryResult res;
+      res.formatted_table = "Primary key added to '" + t->name + "'.";
+      return res;
+    }
     if (p.is_word("INDEX") || p.is_word("KEY") || p.is_word("UNIQUE") ||
         (p.is_word("CONSTRAINT")) || p.is_word("FOREIGN") ||
         p.is_word("FULLTEXT") || p.is_word("SPATIAL")) {
@@ -42937,6 +43701,42 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
       checkpoint();
       SqlQueryResult res;
       res.formatted_table = "Index '" + iname + "' dropped from '" + t->name + "'.";
+      return res;
+    }
+    if (p.take_word("PRIMARY")) {
+      p.take_word("KEY");
+      bool had = false;
+      for (auto& c : t->columns) if (c.is_primary_key) { c.is_primary_key = false; had = true; }
+      if (!had) return make_error("Can't DROP INDEX `PRIMARY`; check that it exists");
+      t->mutation_seq = sql_next_mutation_seq();
+      t->layout_seq = t->mutation_seq;
+      invalidate_table_index(t->name, t->database);
+      checkpoint();
+      SqlQueryResult res;
+      res.formatted_table = "Primary key dropped from '" + t->name + "'.";
+      return res;
+    }
+    if (p.is_word("CONSTRAINT") || p.is_word("CHECK")) {
+      p.next();
+      std::string cname;
+      if (!p.parse_name(&cname)) return make_error(p.error());
+      auto ck = std::find_if(t->checks.begin(), t->checks.end(), [&](const SqlCheck& c) { return lower_of(c.name) == lower_of(cname); });
+      if (ck != t->checks.end()) {
+        t->checks.erase(ck);
+        checkpoint();
+        SqlQueryResult res;
+        res.formatted_table = "Constraint '" + cname + "' dropped from '" + t->name + "'.";
+        return res;
+      }
+      auto fk = std::find_if(t->foreign_keys.begin(), t->foreign_keys.end(),
+                             [&](const SqlForeignKey& f) { return lower_of(f.constraint_name) == lower_of(cname); });
+      if (fk == t->foreign_keys.end()) return make_error("Constraint `" + cname + "` does not exist");
+      t->foreign_keys.erase(std::remove_if(t->foreign_keys.begin(), t->foreign_keys.end(),
+                                           [&](const SqlForeignKey& f) { return lower_of(f.constraint_name) == lower_of(cname); }),
+                            t->foreign_keys.end());
+      checkpoint();
+      SqlQueryResult res;
+      res.formatted_table = "Constraint '" + cname + "' dropped from '" + t->name + "'.";
       return res;
     }
     if (p.take_word("FOREIGN")) {
@@ -43285,6 +44085,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
         table_lock_shared(&kv.second);
         if (lower_of(kv.second.database) == target_db_low) {
           if (!like_pat.empty() && !like_match(kv.second.name, like_pat)) continue;
+          if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
           all_entries[kv.second.name] = "BASE TABLE";
         }
       }
@@ -43601,7 +44402,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
     const std::vector<std::pair<std::string, std::string>> all_vars = {
       {"auto_increment_increment", "1"},
       {"auto_increment_offset", "1"},
-      {"autocommit", "ON"},
+      {"autocommit", tls_autocommit ? "ON" : "OFF"},
       {"character_set_client", cs_in},
       {"character_set_connection", cs_in},
       {"character_set_database", "utf8mb4"},
@@ -44260,12 +45061,18 @@ Result<std::string> SqlDatabase::table_ddl(const std::string& name, const std::s
     const SqlColumn& c = t->columns[i];
     std::string l = "  `" + c.name + "` ";
     l += sql_mysql_column_type(c);
-    if (c.not_null || c.is_primary_key) l += " NOT NULL";
-    if (c.auto_increment) l += " AUTO_INCREMENT";
-    const std::string dc = default_clause(c.default_value);
-    // a nullable column with no default of its own: MariaDB spells it out
-    if (dc.empty() && !c.not_null && !c.is_primary_key && !c.auto_increment) l += " DEFAULT NULL";
-    l += dc;
+    if (!c.generated.empty()) {
+      l += " GENERATED ALWAYS AS (" + c.generated + ")" + (c.generated_virtual ? " VIRTUAL" : " STORED");
+    } else {
+      if (c.not_null || c.is_primary_key) l += " NOT NULL";
+      if (c.auto_increment) l += " AUTO_INCREMENT";
+      const std::string dc = default_clause(c.default_value);
+      // a nullable column with no default of its own: MariaDB spells it out
+      if (dc.empty() && !c.not_null && !c.is_primary_key && !c.auto_increment) l += " DEFAULT NULL";
+      l += dc;
+    }
+    for (const auto& ck : t->checks)
+      if (ck.column_level && lower_of(ck.name) == lower_of(c.name)) l += " CHECK (" + ck.expr + ")";
     if (c.is_primary_key) keys.push_back(c.name);
     lines.push_back(std::move(l));
   }
@@ -44304,6 +45111,8 @@ Result<std::string> SqlDatabase::table_ddl(const std::string& name, const std::s
       lines.push_back(l);
     }
   }
+  for (const auto& ck : t->checks)
+    if (!ck.column_level) lines.push_back("  CONSTRAINT `" + ck.name + "` CHECK (" + ck.expr + ")");
   std::string out = "CREATE TABLE `" + t->name + "` (\n";
   for (size_t i = 0; i < lines.size(); ++i) out += lines[i] + (i + 1 < lines.size() ? ",\n" : "\n");
   out += ")";
@@ -45061,11 +45870,14 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (!err->empty()) return false;
       const SqlColumn& c = t->columns[d.col];
       if (c.not_null && v.null) { *err = "column '" + c.name + "' cannot be NULL"; return false; }
-      if (sql_strict() && !g_cdc_thread && !redo_replaying_)
-        if (std::string se = strict_cell_error(c, v.null ? sql_null() : sql_normalize_value(c.type, c.scale, val_store_text(v, c.type))); !se.empty()) { *err = se; return false; }
-      dup_cur->set_cell(0, d.col, val_store_text(v, c.type));
+      std::string text = val_store_text(v, c.type);
+      if (sql_strict() && !g_cdc_thread && !redo_replaying_) {
+        if (std::string se = strict_cell_error(c, v.null ? sql_null() : sql_normalize_value(c.type, c.scale, text)); !se.empty()) { *err = se; return false; }
+      } else if (!g_cdc_thread && !redo_replaying_) text = lenient_cell_value(c, text);
+      dup_cur->set_cell(0, d.col, text);
     }
     *out = dup_cur->get_row(0);
+    if (t->has_rules() && !apply_row_rules(t, out, SIZE_MAX, err)) return false;
     bump_on_update(cur, out);
     return true;
   };
@@ -45187,14 +45999,22 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     for (size_t i = 0; i < t->columns.size(); ++i)
       if (t->columns[i].type != SqlDataType::Text)
         row.values[i] = sql_normalize_value(t->columns[i].type, t->columns[i].scale, row.values[i]);
-    if (sql_strict() && !g_cdc_thread && !redo_replaying_ && !seeding_)
+    if (sql_strict() && !g_cdc_thread && !redo_replaying_ && !seeding_) {
       for (size_t i = 0; i < t->columns.size(); ++i)
         if (std::string se = strict_cell_error(t->columns[i], row.values[i]); !se.empty()) return make_error(se);
+    } else if (!g_cdc_thread && !redo_replaying_ && !seeding_) {
+      for (size_t i = 0; i < t->columns.size(); ++i) row.values[i] = lenient_cell_value(t->columns[i], row.values[i]);
+    }
     if (!ins_trig.empty()) {
       if (!sql_fire_triggers(*this, ins_trig, "BEFORE", *t, nullptr, &row, &trig_err)) return make_error(trig_err);
       for (size_t i = 0; i < t->columns.size(); ++i)
         if (t->columns[i].type != SqlDataType::Text)
           row.values[i] = sql_normalize_value(t->columns[i].type, t->columns[i].scale, row.values[i]);
+    }
+    // Generated columns and CHECKs, after the BEFORE triggers (which may have changed what they read).
+    if (t->has_rules()) {
+      std::string rerr;
+      if (!apply_row_rules(t, &row, SIZE_MAX, &rerr)) return make_error(rerr);
     }
 
     // Collisions on the UNIQUE keys (after the primary key's, below).
@@ -47254,6 +48074,8 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
     if (!p.parse_name(&cn)) return make_error(p.error());
     int ci = t->get_column_index(cn);
     if (ci < 0) return make_error("no such column: " + cn);
+    if (!t->columns[(size_t)ci].generated.empty())
+      return make_error("The value specified for generated column '" + t->columns[(size_t)ci].name + "' in table '" + t->name + "' has been ignored");
     if (!p.take_punct("=")) return make_error("expected '=' in SET");
     ExprPtr v = p.parse_expr();
     if (p.failed()) return make_error(p.error());
@@ -47359,7 +48181,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
     }
     if (ok && table_lock_rows(t)) {
       std::shared_ptr<RowIndex> ri = find_row_index(*t);
-      if (t->delta_buffer.count.load(std::memory_order_relaxed) != 0 || !ri) {
+      if (t->delta_buffer.count.load(std::memory_order_relaxed) != 0 || !ri || t->has_rules()) {
         release_table_locks();   // not this way after all: nothing read or written yet
       } else {
         SqlQueryResult res;
@@ -47389,9 +48211,10 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
             const SqlColumn& col = t->columns[c.col];
             if (col.not_null && v.null) return make_error("column '" + col.name + "' cannot be NULL");
             *out = val_store_text(v, col.type);
-            if (sql_strict())
+            if (sql_strict()) {
               if (std::string se = strict_cell_error(col, sql_normalize_value(col.type, col.scale, *out)); !se.empty())
                 return make_error(se);
+            } else *out = lenient_cell_value(col, *out);
             return std::nullopt;
           };
           std::vector<std::string> vals(cells.size());
@@ -47736,7 +48559,8 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
         if (!err.empty()) return make_error(err);
         const SqlColumn& c = t->columns[a.col];
         if (c.not_null && v.null) return make_error("column '" + c.name + "' cannot be NULL");
-        const std::string nv = val_store_text(v, c.type);
+        std::string nv = val_store_text(v, c.type);
+        if (!sql_strict() && !g_cdc_thread && !redo_replaying_) nv = lenient_cell_value(c, nv);
         const std::string norm = sql_normalize_value(c.type, c.scale, nv);
         if (sql_strict() && !g_cdc_thread && !redo_replaying_)
           if (std::string se = strict_cell_error(c, norm); !se.empty()) return make_error(se);
@@ -47745,6 +48569,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
       }
       if (row_changed) really_changed = 1;
       if (row_changed) for (const OnUpd& o : on_updates) t->set_cell(ridx, o.col, eval_kept_expr(o.text));
+      if (t->has_rules() && !apply_row_rules(t, nullptr, ridx, &err)) return make_error(err);
       if (std::string kerr; !keys_still_unique(ridx, saved_cells, &kerr) || !fk_row_ok(ridx, saved_cells, &kerr)) return make_error(kerr);
       if (!upd_trig.empty() && !fire_update(ridx, before_img, &err)) return make_error(err);
       if (watched) {
@@ -47819,7 +48644,8 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
         if (!err.empty()) return make_error(err);
         const SqlColumn& c = t->columns[a.col];
         if (c.not_null && v.null) return make_error("column '" + c.name + "' cannot be NULL");
-        const std::string nv = val_store_text(v, c.type);
+        std::string nv = val_store_text(v, c.type);
+        if (!sql_strict() && !g_cdc_thread && !redo_replaying_) nv = lenient_cell_value(c, nv);
         const std::string norm = sql_normalize_value(c.type, c.scale, nv);
         if (sql_strict() && !g_cdc_thread && !redo_replaying_)
           if (std::string se = strict_cell_error(c, norm); !se.empty()) return make_error(se);
@@ -47828,6 +48654,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
       }
       if (row_changed) ++really_changed;
       if (row_changed) for (const OnUpd& o : on_updates) t->set_cell(ri, o.col, eval_kept_expr(o.text));
+      if (t->has_rules() && !apply_row_rules(t, nullptr, ri, &err)) return make_error(err);
       if (std::string kerr; !keys_still_unique(ri, saved_cells, &kerr) || !fk_row_ok(ri, saved_cells, &kerr)) return make_error(kerr);
       if (!upd_trig.empty() && !fire_update(ri, before_img, &err)) return make_error(err);
       if (watched) {
@@ -47916,6 +48743,8 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
     }
     int ci = t->get_column_index(cn);
     if (ci < 0) return make_error("no such column: " + cn);
+    if (!t->columns[(size_t)ci].generated.empty())
+      return make_error("The value specified for generated column '" + t->columns[(size_t)ci].name + "' in table '" + t->name + "' has been ignored");
     if (!p.take_punct("=")) return make_error("expected '=' in SET");
     const size_t e0 = p.pos();
     ExprPtr v = p.parse_expr();
@@ -47965,9 +48794,10 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
     SqlRow before = t->get_row(ri);
     bool differs = false;
     for (size_t a = 0; a < sets.size(); ++a) {
-      const std::string& v = row.values[pk_cols.size() + a];
+      std::string v = row.values[pk_cols.size() + a];
       const SqlColumn& c = t->columns[sets[a].col];
       if (c.not_null && sql_is_null(v)) return make_error("column '" + c.name + "' cannot be NULL");
+      if (!sql_strict() && !g_cdc_thread && !redo_replaying_) v = lenient_cell_value(c, v);
       const std::string norm = sql_normalize_value(c.type, c.scale, v);
       if (sql_strict() && !g_cdc_thread && !redo_replaying_)
         if (std::string se = strict_cell_error(c, norm); !se.empty()) return make_error(se);
@@ -47975,6 +48805,10 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
         t->set_cell(ri, sets[a].col, v);
         differs = true;
       }
+    }
+    if (t->has_rules()) {
+      std::string rerr;
+      if (!apply_row_rules(t, nullptr, ri, &rerr)) return make_error(rerr);
     }
     // ON UPDATE columns the statement did not assign take its time in a row it changed.
     if (differs)
@@ -48586,6 +49420,7 @@ constexpr uint32_t kDeclTypeTrailerMagic = 0x41514454;  // "AQDT"
 // When the table was created (information_schema CREATE_TIME). A file written
 // before it existed simply has none, and the table reports NULL.
 constexpr uint32_t kCreateTimeTrailerMagic = 0x41514354;  // "AQCT"
+constexpr uint32_t kRulesTrailerMagic = 0x41515255;       // "AQRU": generated columns and CHECK constraints
 
 template <typename T>
 void put_pod_vec(Writer& w, const std::vector<T>& v) {
@@ -48913,6 +49748,11 @@ uint64_t table_shape_signature(const SqlTable& t) {
     for (const auto& fk : t.foreign_keys)
       sig += fk.constraint_name + '\x1f' + fk.column + '\x1f' + fk.ref_table + '\x1f' + fk.ref_column + '\x1f' + fk.on_delete + '\x1f' + fk.on_update + '\x1e';
   }
+  if (t.has_rules()) {
+    sig += '\x1b';
+    for (const auto& c : t.columns) { sig += c.generated; sig += (char)('0' + c.generated_virtual); sig += '\x1f'; }
+    for (const auto& ck : t.checks) { sig += ck.name; sig += '\x1f'; sig += ck.expr; sig += (char)('0' + ck.column_level); sig += '\x1e'; }
+  }
   uint64_t h = 1469598103934665603ull;
   for (unsigned char ch : sig) { h ^= ch; h *= 1099511628211ull; }
   return h;
@@ -49058,6 +49898,13 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     if (!t.create_time.empty()) {
       w.u32(kCreateTimeTrailerMagic);
       w.str(t.create_time);
+    }
+    if (t.has_rules()) {
+      w.u32(kRulesTrailerMagic);
+      w.u32((uint32_t)t.columns.size());
+      for (const auto& col : t.columns) { w.str(col.generated); w.u8(col.generated_virtual ? 1 : 0); }
+      w.u32((uint32_t)t.checks.size());
+      for (const auto& ck : t.checks) { w.str(ck.name); w.str(ck.expr); w.u8(ck.column_level ? 1 : 0); }
     }
     const std::string file = hex_of(kv.first) + ".g" + std::to_string(gen) + ".tbl";
     ti.tail = w.take();
@@ -49289,7 +50136,22 @@ bool SqlDatabase::load_tables_v4() {
     if (trailer == kCreateTimeTrailerMagic && r.ok()) {
       std::string ct = r.str();
       if (r.ok()) t.create_time = std::move(ct);
+      trailer = r.ok() && r.remaining() >= 4 ? r.u32() : 0;
     }
+    if (trailer == kRulesTrailerMagic && r.ok()) {
+      const uint32_t nc = r.u32();
+      std::vector<std::pair<std::string, bool>> gen;
+      for (uint32_t i = 0; i < nc && r.ok(); ++i) { std::string g = r.str(); const bool v = r.u8() != 0; gen.push_back({std::move(g), v}); }
+      const uint32_t nk = r.ok() ? r.u32() : 0;
+      std::vector<SqlCheck> checks;
+      for (uint32_t i = 0; i < nk && r.ok(); ++i) { SqlCheck ck; ck.name = r.str(); ck.expr = r.str(); ck.column_level = r.u8() != 0; checks.push_back(std::move(ck)); }
+      if (r.ok() && gen.size() == t.columns.size()) {
+        for (size_t i = 0; i < gen.size(); ++i) { t.columns[i].generated = gen[i].first; t.columns[i].generated_virtual = gen[i].second; }
+        t.checks = std::move(checks);
+      }
+    }
+    // A TEMPORARY table of a session that ended with the process: never loaded.
+    if (hidden_table_name(t.name)) continue;
     // An older file's zone maps were keyed by an older collation (no PAD
     // SPACE, or lower-cased ASCII only): pruning on them could skip a segment
     // that matches. Rebuild them from the data; the table is rewritten at the
