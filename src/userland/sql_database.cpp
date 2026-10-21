@@ -856,6 +856,7 @@ thread_local std::string tls_tx_isolation;
 // redo log (nothing of it survives the session anyway).
 thread_local std::unordered_map<std::string, std::string> tls_temp_tables;
 thread_local bool g_stmt_temp_touch = false;   // the running statement reached a TEMPORARY table
+thread_local std::unordered_map<std::string, std::string> tls_prepared_statements;   // PREPARE name FROM ...
 static bool hidden_table_name(const std::string& n) { return n.size() > 4 && n[0] == '\x01' && n.compare(1, 3, "tmp") == 0; }
 
 thread_local std::vector<std::pair<std::string, std::string>> g_stmt_redo;
@@ -2972,6 +2973,7 @@ struct WindowSpec {
 
 struct ParsedSelectBranch {
   bool distinct = false;
+  bool rollup = false;   // GROUP BY ... WITH ROLLUP (rewritten to a union of levels before it runs; see rollup_rewrite)
   std::vector<SelectItem> items;
   struct SourceSpec {
     std::string table_name;
@@ -3525,6 +3527,63 @@ class SqlParser {
       for (const auto& o : ops) {
         if (is_punct(o.sym)) {
           p_++;
+          // x op ANY / SOME / ALL (SELECT ...): the subquery's one column as
+          // the set compared against. Read as the equivalent plain subquery:
+          // `= ANY` is IN, `<> ALL` is NOT IN, `> ANY` is > the set's MIN,
+          // `> ALL` is > its MAX (true of an empty set), and so on.
+          if ((is_word("ANY") || is_word("SOME") || is_word("ALL")) && is_punct("(", 1) && src_) {
+            const bool all = is_word("ALL");
+            p_++;
+            std::string sub;
+            if (!take_subquery_text(&sub)) { fail("expected a subquery after " + std::string(all ? "ALL" : "ANY")); return left; }
+            const std::string sym = o.sym;
+            std::string text;
+            // The subquery's single item as a named column of a derived table.
+            std::vector<Token> st;
+            std::string terr;
+            std::string item, rest;
+            if (tokenize_sql(sub, &st, &terr) && !st.empty() && st[0].up == "SELECT"sv) {
+              int d = 0;
+              size_t fi = 0;
+              for (size_t k = 1; k < st.size() && st[k].kind != Tok::End; ++k) {
+                if (st[k].kind == Tok::Punct && st[k].text == "(") ++d;
+                else if (st[k].kind == Tok::Punct && st[k].text == ")") --d;
+                else if (d == 0 && st[k].kind == Tok::Ident && !st[k].quoted && st[k].up == "FROM"sv) { fi = k; break; }
+              }
+              size_t i0 = 1;
+              if (i0 < st.size() && st[i0].up == "DISTINCT"sv) ++i0;
+              if (fi > i0) {
+                item = trim(sub.substr(st[i0].start_pos, st[fi].start_pos - st[i0].start_pos));
+                rest = sub.substr(st[fi].start_pos);
+              }
+            }
+            if (item.empty()) { fail("ANY / ALL needs a SELECT of one column"); return left; }
+            const std::string set = "(SELECT (" + item + ") AS __v " + rest + ") __q";
+            const std::string lhs = "(" + left->source_text + ")";
+            if (sym == "=" && !all) text = lhs + " IN (" + sub + ")";
+            else if ((sym == "<>" || sym == "!=") && all) text = lhs + " NOT IN (" + sub + ")";
+            else if (all && sym == "=")
+              text = "((SELECT COUNT(*) FROM " + set + ") = 0 OR (" + lhs + " = (SELECT MIN(__v) FROM " + set + ") AND " + lhs + " = (SELECT MAX(__v) FROM " + set + ")))";
+            else if (!all && (sym == "<>" || sym == "!="))
+              text = "(" + lhs + " <> (SELECT MIN(__v) FROM " + set + ") OR " + lhs + " <> (SELECT MAX(__v) FROM " + set + "))";
+            else {
+              const bool gt = sym == ">" || sym == ">=";
+              const char* agg = all ? (gt ? "MAX" : "MIN") : (gt ? "MIN" : "MAX");
+              text = lhs + " " + sym + " (SELECT " + agg + "(__v) FROM " + set + ")";
+              // ALL over a set with a NULL in it is unknown at best, never true
+              if (all) text = "((SELECT COUNT(*) FROM " + set + ") = 0 OR (" + text + " AND (SELECT COUNT(*) - COUNT(__v) FROM " + set + ") = 0))";
+            }
+            std::vector<Token> tt;
+            if (!tokenize_sql(text, &tt, &terr)) { fail(terr); return left; }
+            SqlParser sp(tt);
+            sp.set_source(&text);
+            ExprPtr e = sp.parse_expr();
+            if (sp.failed() || !e) { fail(sp.failed() ? sp.error() : "cannot read ANY / ALL"); return left; }
+            e->source_text = left->source_text + " " + sym + " " + (all ? "ALL (" : "ANY (") + sub + ")";
+            left = e;
+            more = true;
+            break;
+          }
           ExprPtr right = parse_bitor();
           // BINARY on either side compares bytes: BINARY 'a' = 'A' is 0.
           if (is_binary_cast(left) || is_binary_cast(right)) {
@@ -3534,6 +3593,9 @@ class SqlParser {
           } else {
             auto e = make(o.op);
             e->args = {left, right};
+            // As written, for the column name a client reads it back by: IF(sal>100,'hi','lo') had no `sal>100`.
+            if (left && right && !left->source_text.empty() && !right->source_text.empty())
+              e->source_text = left->source_text + o.sym + right->source_text;
             left = e;
           }
           more = true;
@@ -4269,7 +4331,7 @@ class SqlParser {
 
   bool at_subquery() const {
     if (!is_punct("(")) return false;
-    if (is_word("SELECT", 1)) return true;
+    if (is_word("SELECT", 1) || (is_word("VALUES", 1) && is_punct("(", 2))) return true;
     if (!is_punct("(", 1)) return false;
 
     // We have at least two opening parens: `((...`
@@ -4783,6 +4845,7 @@ class SqlParser {
       } while (take_punct(","));
     }
 
+    if (!out->group_by.empty() && is_word("WITH") && is_word("ROLLUP", 1)) { p_ += 2; out->rollup = true; }
     if (take_word("HAVING")) {
       out->having = parse_expr();
       if (failed()) return false;
@@ -4867,7 +4930,7 @@ bool parse_plain_select_tokens(const std::string& sql, const std::vector<Token>&
   for (const Token& t : toks) {
     if (t.kind == Tok::Punct && t.text == "(") ++depth;
     else if (t.kind == Tok::Punct && t.text == ")") { if (depth > 0) --depth; }
-    else if (depth == 0 && t.kind == Tok::Ident && t.up == "UNION"sv) return false;
+    else if (depth == 0 && t.kind == Tok::Ident && !t.quoted && (t.up == "UNION"sv || t.up == "INTERSECT"sv || t.up == "EXCEPT"sv)) return false;
   }
   SqlParser p(toks);
   p.set_source(&sql);
@@ -4877,8 +4940,87 @@ bool parse_plain_select_tokens(const std::string& sql, const std::vector<Token>&
     out->ok = false;
     return true;
   }
+  if (branch.rollup) return false;   // WITH ROLLUP: parse_select_sql rewrites it
   out->branches.push_back(std::move(branch));
   out->ok = true;
+  return true;
+}
+
+// GROUP BY a, b WITH ROLLUP: the grouped rows, then a subtotal row per group
+// of a (b NULL) and a grand total (a, b NULL). Run as the union of one grouped
+// SELECT per level, each aggregating the base rows afresh, the dropped group
+// columns NULL in it; ordered as MariaDB orders a rollup (each group's
+// subtotal after its rows, the grand total last) unless the statement orders
+// itself. Every non-aggregate select item has to be one of the GROUP BY
+// expressions, as it would be under ONLY_FULL_GROUP_BY.
+static bool rollup_rewrite(const std::string& sql, const ParsedSelectStatement& stmt, std::string* out, std::string* err) {
+  const ParsedSelectBranch& b = stmt.branches[0];
+  std::vector<Token> toks;
+  std::string terr;
+  if (!tokenize_sql(sql, &toks, &terr)) { *err = terr; return false; }
+  // The clauses as text: FROM ... up to GROUP; HAVING ...; ORDER BY / LIMIT after.
+  int depth = 0;
+  size_t from_at = 0, group_at = 0, rollup_at = 0, having_at = 0, tail_at = 0;
+  for (size_t i = 0; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+    if (toks[i].kind == Tok::Punct) { if (toks[i].text == "(") ++depth; else if (toks[i].text == ")") --depth; continue; }
+    if (depth || toks[i].kind != Tok::Ident || toks[i].quoted) continue;
+    const std::string& u = toks[i].up;
+    if (!from_at && u == "FROM"sv) from_at = i;
+    else if (from_at && !group_at && u == "GROUP"sv) group_at = i;
+    else if (group_at && !rollup_at && u == "ROLLUP"sv) rollup_at = i;
+    else if (rollup_at && !having_at && !tail_at && u == "HAVING"sv) having_at = i;
+    else if (rollup_at && !tail_at && (u == "ORDER"sv || u == "LIMIT"sv)) tail_at = i;
+  }
+  if (!from_at || !group_at || !rollup_at) { *err = "WITH ROLLUP: cannot read the statement's clauses"; return false; }
+  const std::string from_where = sql.substr(toks[from_at].start_pos, toks[group_at].start_pos - toks[from_at].start_pos);
+  const std::string having = having_at ? sql.substr(toks[having_at].start_pos, (tail_at ? toks[tail_at].start_pos : sql.size()) - toks[having_at].start_pos) : std::string();
+  std::string tail = tail_at ? sql.substr(toks[tail_at].start_pos) : std::string();
+  while (!tail.empty() && (tail.back() == ';' || std::isspace((unsigned char)tail.back()))) tail.pop_back();
+  // Each select item: a group expression (its index), or an aggregate.
+  auto same = [](const std::string& a, const std::string& b) {
+    std::string x, y;
+    for (char c : a) if (!std::isspace((unsigned char)c) && c != '`') x += (char)std::tolower((unsigned char)c);
+    for (char c : b) if (!std::isspace((unsigned char)c) && c != '`') y += (char)std::tolower((unsigned char)c);
+    return x == y;
+  };
+  std::vector<int> item_group(b.items.size(), -1);
+  for (size_t i = 0; i < b.items.size(); ++i) {
+    const SelectItem& it = b.items[i];
+    if (it.star || !it.expr) { *err = "WITH ROLLUP: every select item has to be a GROUP BY column or an aggregate"; return false; }
+    for (size_t g = 0; g < b.group_by.size(); ++g)
+      if (same(it.expr->source_text, b.group_by[g]->source_text) || (!it.label.empty() && same(it.label, b.group_by[g]->source_text))) { item_group[i] = (int)g; break; }
+    if (item_group[i] < 0 && !expr_has_aggregate(it.expr)) { *err = "WITH ROLLUP: '" + it.expr->source_text + "' is neither a GROUP BY column nor an aggregate"; return false; }
+  }
+  std::string u;
+  for (size_t level = b.group_by.size() + 1; level-- > 0;) {
+    std::string sel = "(SELECT ";
+    for (size_t i = 0; i < b.items.size(); ++i) {
+      const SelectItem& it = b.items[i];
+      const std::string label = it.label.empty() ? it.expr->source_text : it.label;
+      sel += i ? ", " : "";
+      if (item_group[i] >= 0 && (size_t)item_group[i] >= level) sel += "NULL AS `" + label + "`";
+      else sel += it.expr->source_text + " AS `" + label + "`";
+    }
+    sel += " " + from_where;
+    if (level > 0) {
+      sel += " GROUP BY ";
+      for (size_t g = 0; g < level; ++g) sel += (g ? ", " : "") + b.group_by[g]->source_text;
+    }
+    if (!having.empty()) sel += " " + having;
+    sel += ")";
+    u += (u.empty() ? "" : " UNION ALL ") + sel;
+  }
+  std::string order;
+  if (!tail_at || toks[tail_at].up != "ORDER"sv) {
+    for (size_t g = 0; g < b.group_by.size(); ++g) {
+      // the group column's label in the union, when the select list carries it
+      std::string lab;
+      for (size_t i = 0; i < b.items.size(); ++i) if (item_group[i] == (int)g) { lab = b.items[i].label.empty() ? b.items[i].expr->source_text : b.items[i].label; break; }
+      if (lab.empty()) continue;
+      order += (order.empty() ? " ORDER BY " : ", ") + std::string("`") + lab + "` IS NULL, `" + lab + "`";
+    }
+  }
+  *out = "SELECT * FROM (" + u + ") __rollup" + order + (tail.empty() ? "" : " " + tail);
   return true;
 }
 
@@ -4936,6 +5078,11 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
     }
     stmt.branches.push_back(std::move(branch));
     stmt.ok = true;
+    if (stmt.branches[0].rollup) {   // GROUP BY ... WITH ROLLUP: the union of its levels (rollup_rewrite)
+      std::string rw, rerr;
+      if (!rollup_rewrite(clean_sql, stmt, &rw, &rerr)) { stmt.ok = false; stmt.error = rerr; return stmt; }
+      return parse_select_sql(rw);
+    }
     return stmt;
   }
 
@@ -5879,7 +6026,19 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
       // Whole numbers by definition: dates and strings measured in whole units.
       if (up == "DATEDIFF"sv || up == "TO_DAYS"sv || up == "LENGTH"sv || up == "CHAR_LENGTH"sv ||
           up == "YEAR"sv || up == "MONTH"sv || up == "DAY"sv || up == "DAYOFMONTH"sv || up == "HOUR"sv ||
-          up == "MINUTE"sv || up == "SECOND"sv || up == "WEEK"sv || up == "QUARTER"sv)
+          up == "MINUTE"sv || up == "SECOND"sv || up == "WEEK"sv || up == "QUARTER"sv ||
+          up == "TIMESTAMPDIFF"sv || up == "EXTRACT"sv || up == "INSTR"sv || up == "LOCATE"sv || up == "POSITION"sv ||
+          up == "FIELD"sv || up == "FIND_IN_SET"sv || up == "ASCII"sv || up == "ORD"sv || up == "CRC32"sv ||
+          up == "SIGN"sv || up == "BIT_COUNT"sv || up == "STRCMP"sv || up == "GET_LOCK"sv || up == "RELEASE_LOCK"sv ||
+          up == "IS_FREE_LOCK"sv || up == "IS_USED_LOCK"sv || up == "PERIOD_DIFF"sv || up == "PERIOD_ADD"sv ||
+          up == "DAYOFWEEK"sv || up == "DAYOFYEAR"sv || up == "WEEKDAY"sv || up == "WEEKOFYEAR"sv || up == "YEARWEEK"sv ||
+          up == "MICROSECOND"sv || up == "TIME_TO_SEC"sv || up == "TO_SECONDS"sv || up == "ROW_NUMBER"sv ||
+          up == "RANK"sv || up == "DENSE_RANK"sv || up == "NTILE"sv || up == "ISNULL"sv || up == "INTERVAL"sv ||
+          up == "BIT_AND"sv || up == "BIT_OR"sv || up == "BIT_XOR"sv || up == "OCTET_LENGTH"sv || up == "BIT_LENGTH"sv ||
+          up == "CHARACTER_LENGTH"sv || up == "INET_ATON"sv || up == "JSON_CONTAINS"sv || up == "JSON_VALID"sv ||
+          up == "JSON_LENGTH"sv || up == "JSON_DEPTH"sv || up == "JSON_CONTAINS_PATH"sv || up == "JSON_EXISTS"sv ||
+          up == "JSON_OVERLAPS"sv || up == "REGEXP_INSTR"sv || up == "UNIX_TIMESTAMP"sv || up == "__IS"sv ||
+          up == "__NULLSAFE_EQ"sv || up == "__BINCMP"sv || up == "__BINLIKE"sv)
         return SqlDataType::Int;
       if ((up == "SUM"sv || up == "AVG"sv || up == "ROUND"sv || up == "TRUNCATE"sv || up == "ABS"sv) &&
           infer_item_exact(e, sources))
@@ -8758,19 +8917,29 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       return false;
     };
     // A month or day the calendar does not have (2024-02-30) is no date: NULL, as MariaDB answers (with a warning).
-    auto calendar_ok = [](const DateParts& p) {
-      if (p.month == 0 && p.day == 0) return true;   // the zero date
-      if (p.month < 1 || p.month > 12 || p.day < 1) return false;
+    // Read off the text as written (split_datetime rolls 2024-02-30 over to March 1).
+    auto calendar_ok = [](const std::string& src) {
+      long n[3] = {0, 0, 0};
+      size_t i = 0, k = 0;
+      while (i < src.size() && std::isspace((unsigned char)src[i])) ++i;
+      for (; k < 3 && i < src.size(); ++k) {
+        if (!std::isdigit((unsigned char)src[i])) return true;   // not Y-M-D text: the parser decides
+        while (i < src.size() && std::isdigit((unsigned char)src[i])) n[k] = n[k] * 10 + (src[i++] - '0');
+        if (k < 2) { if (i < src.size() && !std::isdigit((unsigned char)src[i])) ++i; else if (k == 0 && n[0] >= 10000000) return true; }
+      }
+      if (k < 3) return true;   // a compact number (20240230): the parser decides
+      if (n[1] == 0 && n[2] == 0) return true;   // the zero date
+      if (n[1] < 1 || n[1] > 12 || n[2] < 1) return false;
       static const unsigned md[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-      const bool leap = (p.year % 4 == 0 && p.year % 100 != 0) || p.year % 400 == 0;
-      return p.day <= md[p.month - 1] + (p.month == 2 && leap ? 1u : 0u);
+      const bool leap = (n[0] % 4 == 0 && n[0] % 100 != 0) || n[0] % 400 == 0;
+      return (unsigned)n[2] <= md[n[1] - 1] + (n[1] == 2 && leap ? 1u : 0u);
     };
     if (target.rfind("DATETIME", 0) == 0) {
       DateParts p;
       std::string src = a_ptr[0].str();
       std::string nd;
       if (numeric_date_text(a_ptr[0], &nd)) src = nd;
-      if (!split_datetime(src, &p) || !calendar_ok(p)) return val_null();
+      if (!calendar_ok(src) || !split_datetime(src, &p)) return val_null();
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d", p.year, p.month, p.day,
                     p.hour, p.minute, p.second);
@@ -8782,7 +8951,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       std::string nd;
       if (numeric_date_text(a_ptr[0], &nd)) src = nd;
       DateParts p;
-      if (!split_datetime(src, &p) || !calendar_ok(p)) return val_null();
+      if (!calendar_ok(src) || !split_datetime(src, &p)) return val_null();
       char buf[16];
       std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", p.year, p.month, p.day);
       Val dv = val_text(buf);
@@ -18874,6 +19043,39 @@ SqlTable SqlDatabase::build_mysql_user_table() const {
   return t;
 }
 
+// The next AUTO_INCREMENT value a table would hand out, as its text; NULL for
+// a table with no such column. One more than the largest value stored, read
+// off the column's zone maps (or its cells when the maps are not current).
+static std::string table_auto_increment_text(const SqlTable& t) {
+  for (size_t c = 0; c < t.columns.size(); ++c) {
+    if (!t.columns[c].auto_increment) continue;
+    if (t.row_count() == 0 || c >= t.col_data.size()) return "1";
+    const ColumnStore& cs = t.col_data[c];
+    double mx = 0;
+    bool any = false;
+    constexpr size_t kZone = 2048;   // kVxMorselZone, defined further down
+    const size_t segs = (cs.size() + kZone - 1) / kZone;
+    if (cs.size() == t.row_count() && cs.zone_maps.size() == segs && segs > 0) {
+      bool usable = true;
+      for (const auto& zm : cs.zone_maps) {
+        if (!zm.has_stats) { usable = false; break; }
+        if (zm.all_null || zm.min_double > zm.max_double) continue;
+        if (!any || zm.max_double > mx) { mx = zm.max_double; any = true; }
+      }
+      if (usable) return any ? sql_format_double(std::floor(mx) + 1, 0) : "1";
+    }
+    for (size_t r = 0; r < t.row_count(); ++r) {
+      const std::string& v = t.cell(r, c);
+      if (sql_is_null(v)) continue;
+      double d = 0;
+      if (!parse_number(v, &d)) continue;
+      if (!any || d > mx) { mx = d; any = true; }
+    }
+    return any ? sql_format_double(std::floor(mx) + 1, 0) : "1";
+  }
+  return sql_null();
+}
+
 SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) const {
   SqlTable t;
   t.name = table_name;
@@ -18919,10 +19121,13 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       if (hidden_table_name(kv.second.name)) continue;   // a session's TEMPORARY table
       std::string db = kv.second.database.empty() ? "aios_db" : kv.second.database;
       std::string ct = kv.second.create_time.empty() ? sql_null() : kv.second.create_time;
+      size_t data = 0;
+      for (const auto& cs : kv.second.col_data) data += cs.estimate_memory_bytes();
+      const size_t rows = kv.second.row_count();
       t.append_row(SqlRow{{
         "def", db, kv.second.name, "BASE TABLE", "InnoDB", "10", "Dynamic",
-        std::to_string(kv.second.row_count()), "0", "0", "0", "0", "0",
-        sql_null(), ct, sql_null(), sql_null(),
+        std::to_string(rows), std::to_string(rows ? data / rows : 0), std::to_string(data), "0", "0", "0",
+        table_auto_increment_text(kv.second), ct, sql_null(), sql_null(),
         "utf8mb4_general_ci", sql_null(), "", ""
       }});
     }
@@ -24913,6 +25118,98 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       SqlQueryResult r;
       r.formatted_table = "DELIMITER directive ignored.";
       return r;
+    }
+    // PREPARE name FROM 'text' | @var; EXECUTE name [USING @a, @b]; DEALLOCATE / DROP PREPARE name. The
+    // statement is kept by name for the session; EXECUTE puts each variable's value in for a ? and runs it.
+    if (verb == "PREPARE" && toks.size() > 3 && toks[2].up == "FROM"sv) {
+      std::string text;
+      if (toks[3].kind == Tok::Str) text = toks[3].text;
+      else if (toks[3].kind == Tok::Ident && toks[3].text.rfind("@", 0) == 0) { const Val v = user_var_get(toks[3].text); if (!v.null) text = v.str(); }
+      if (text.empty()) return make_error("PREPARE needs a statement text or a @variable holding one");
+      tls_prepared_statements[lower_of(toks[1].text)] = text;
+      SqlQueryResult r;
+      r.formatted_table = "Statement prepared";
+      return r;
+    }
+    if ((verb == "DEALLOCATE" || verb == "DROP") && toks.size() > 2 && toks[1].up == "PREPARE"sv) {
+      if (!tls_prepared_statements.erase(lower_of(toks[2].text))) return make_error("Unknown prepared statement handler (" + toks[2].text + ") given to DEALLOCATE PREPARE");
+      SqlQueryResult r;
+      r.formatted_table = "Statement deallocated";
+      return r;
+    }
+    if (verb == "EXECUTE" && toks.size() > 1 && toks[1].kind == Tok::Ident) {
+      auto it = tls_prepared_statements.find(lower_of(toks[1].text));
+      if (it == tls_prepared_statements.end()) return make_error("Unknown prepared statement handler (" + toks[1].text + ") given to EXECUTE");
+      std::vector<std::string> vals;
+      if (toks.size() > 2 && toks[2].up == "USING"sv)
+        for (size_t i = 3; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+          if (toks[i].kind == Tok::Punct) continue;
+          const Val v = toks[i].kind == Tok::Ident && toks[i].text.rfind("@", 0) == 0 ? user_var_get(toks[i].text)
+                        : toks[i].kind == Tok::Str ? val_text(toks[i].text) : val_cell(toks[i].text);
+          vals.push_back(v.null ? std::string("NULL") : undo_literal(v.str()));
+        }
+      // each ? outside quotes takes the next value
+      const std::string& src = it->second;
+      std::string bound;
+      size_t k = 0;
+      char q = 0;
+      for (size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (q) { bound += c; if (c == '\\' && i + 1 < src.size()) bound += src[++i]; else if (c == q) q = 0; continue; }
+        if (c == '\'' || c == '"' || c == '`') { q = c; bound += c; continue; }
+        if (c == '?') {
+          if (k >= vals.size()) return make_error("Incorrect arguments to EXECUTE");
+          bound += vals[k++];
+          continue;
+        }
+        bound += c;
+      }
+      if (k != vals.size()) return make_error("Incorrect arguments to EXECUTE");
+      return execute_gateway_query_unguarded(bound, session_db);
+    }
+    // VALUES (1, 'a'), (2, 'b'): a table of those rows, its columns named after the first row's values.
+    if (verb == "VALUES" && toks.size() > 1 && toks[1].kind == Tok::Punct && toks[1].text == "(") {
+      std::string sel;
+      size_t i = 1;
+      size_t row = 0;
+      while (i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == "(") {
+        int d = 0;
+        size_t j = i;
+        for (; j < toks.size() && toks[j].kind != Tok::End; ++j) {
+          if (toks[j].kind == Tok::Punct && toks[j].text == "(") ++d;
+          else if (toks[j].kind == Tok::Punct && toks[j].text == ")" && --d == 0) break;
+        }
+        if (j >= toks.size() || toks[j].kind == Tok::End) return make_error("VALUES: unbalanced parentheses");
+        // the row's expressions, split at the commas outside brackets
+        std::vector<std::string> cells;
+        {
+          int dd = 0;
+          size_t a = toks[i].end_pos;
+          for (size_t k = i + 1; k <= j; ++k) {
+            if (toks[k].kind == Tok::Punct && toks[k].text == "(") ++dd;
+            else if (toks[k].kind == Tok::Punct && toks[k].text == ")") { if (dd == 0) { cells.push_back(trim(q.substr(a, toks[k].start_pos - a))); break; } --dd; }
+            else if (dd == 0 && toks[k].kind == Tok::Punct && toks[k].text == ",") { cells.push_back(trim(q.substr(a, toks[k].start_pos - a))); a = toks[k].end_pos; }
+          }
+        }
+        sel += row ? " UNION ALL SELECT " : "SELECT ";
+        for (size_t c = 0; c < cells.size(); ++c) {
+          sel += c ? ", " : "";
+          sel += cells[c];
+          if (row == 0) {
+            std::string label = cells[c];
+            if (label.size() >= 2 && (label.front() == '\'' || label.front() == '"') && label.back() == label.front()) label = label.substr(1, label.size() - 2);
+            sel += " AS `" + label + "`";
+          }
+        }
+        ++row;
+        i = j + 1;
+        if (i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == ",") ++i;
+      }
+      if (i < toks.size() && toks[i].kind != Tok::End && !(toks[i].kind == Tok::Punct && toks[i].text == ";")) {
+        // ORDER BY / LIMIT after the rows
+        sel = "SELECT * FROM (" + sel + ") __values " + q.substr(toks[i].start_pos);
+      }
+      return execute_select(sel);
     }
     if (verb == "RENAME" && toks.size() > 1 && toks[1].up == "TABLE"sv) {
       // RENAME TABLE a TO b [, c TO d]: each an ALTER TABLE ... RENAME TO, in order.
@@ -44003,7 +44300,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
           res.rows.push_back(SqlRow{{
             st.name, "InnoDB", "10", "Dynamic", std::to_string(rows),
             std::to_string(rows ? data / rows : 0), std::to_string(data), "0", std::to_string(index), "0",
-            sql_null(), ct, sql_null(), sql_null(), "utf8mb3_general_ci", sql_null(), "", ""
+            table_auto_increment_text(st), ct, sql_null(), sql_null(), "utf8mb4_general_ci", sql_null(), "", ""
           }});
         }
       }
@@ -44150,27 +44447,33 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
     if (!t) return make_error("table not found: " + name);
     SqlQueryResult res;
     res.is_result_set = true;
+    // The columns MariaDB 10.11 shows (Ignored last, no Visible / Expression), the numbers as numbers.
     res.columns = {
       "Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
       "Collation", "Cardinality", "Sub_part", "Packed", "Null",
-      "Index_type", "Comment", "Index_comment", "Visible", "Expression"
+      "Index_type", "Comment", "Index_comment", "Ignored"
     };
+    res.column_types = {SqlDataType::Text, SqlDataType::Int, SqlDataType::Text, SqlDataType::Int, SqlDataType::Text,
+                        SqlDataType::Text, SqlDataType::Int, SqlDataType::Int, SqlDataType::Text, SqlDataType::Text,
+                        SqlDataType::Text, SqlDataType::Text, SqlDataType::Text, SqlDataType::Text};
     size_t pk_seq = 1;
     for (const auto& col : t->columns) {
       if (col.is_primary_key) {
         res.rows.push_back(SqlRow{{
           t->name, "0", "PRIMARY", std::to_string(pk_seq++), col.name,
           "A", std::to_string(t->row_count()), sql_null(), sql_null(), "",
-          "BTREE", "", "", "YES", sql_null()
+          "BTREE", "", "", "NO"
         }});
       }
     }
     for (const auto& idx : t->indices) {
       for (size_t ic = 0; ic < idx.columns.size(); ++ic) {
+        int ci = t->get_column_index(idx.columns[ic]);
+        const bool nullable = ci >= 0 && !t->columns[(size_t)ci].not_null && !t->columns[(size_t)ci].is_primary_key;
         res.rows.push_back(SqlRow{{
           t->name, idx.is_unique ? "0" : "1", idx.name, std::to_string(ic + 1),
           idx.columns[ic], "A", std::to_string(t->row_count()), sql_null(), sql_null(),
-          "YES", idx.type.empty() ? "BTREE" : idx.type, "", "", "YES", sql_null()
+          nullable ? "YES" : "", idx.type.empty() ? "BTREE" : idx.type, "", "", "NO"
         }});
       }
     }
