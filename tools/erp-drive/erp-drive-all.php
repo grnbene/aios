@@ -129,10 +129,12 @@ $arg_for = function (\ReflectionParameter $p) use ($v) {
 };
 
 $only = getenv('ONLY');
+$routes = getenv('MODELS') ? array_map('trim', explode(',', getenv('MODELS'))) : [];   // MODELS=oms/orders,weberp/items: those routes only
 $all = []; $called = 0; $errs = []; $refused = 0; $empty = 0; $models = 0;
 foreach ($dirs as $dir) {
   foreach (glob(DIR_APPLICATION . 'model/' . trim($dir) . '/*.php') as $file) {
     $route = trim($dir) . '/' . basename($file, '.php');
+    if ($routes && !in_array($route, $routes, true)) continue;
     if (preg_match('/[^a-zA-Z0-9_\/]/', $route)) continue;   // the loader drops other names
     $class = 'Model' . preg_replace('/[^a-zA-Z0-9]/', '', $route);
     // The file must declare the class the loader expects, and one no earlier file declared (a stale copy of a model
