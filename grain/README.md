@@ -226,6 +226,8 @@ stops with an error in its window instead of freezing the desktop.
 | interpreter | yes | yes | yes | yes | yes |
 | JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
-Built and tested so far: macOS arm64 (56 of 56 cases, a signed .app passing strict verification, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
-(this README, `.github/workflows/grain.yml`, `scripts/build-linux.sh`) and not
-yet built.
+Built and tested so far: macOS arm64 (57 of 57 cases, a signed .app passing
+strict verification, the live HTTPS checks, the window test on a real macOS
+window with both Homebrew's sdl2-compat and SDL 2.32, and
+`tools/grain-desktop/check.sh` on the aios desktop). Linux and Windows are set
+up (`grain/CMakeLists.txt`, `scripts/build-linux.sh`) and not yet built.
