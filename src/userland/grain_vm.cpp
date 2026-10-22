@@ -47,6 +47,10 @@ Value Value::list(std::vector<Value> v) {
   return Value::object(Type::List, std::make_shared<ListObj>(std::move(v)));
 }
 
+Value Value::bytes(std::vector<uint8_t> v) {
+  return Value::object(Type::Bytes, std::make_shared<BytesObj>(std::move(v)));
+}
+
 Value Value::id128(const aios::Id128& id) {
   return Value::object(Type::Id128, std::make_shared<Id128Obj>(id));
 }
@@ -140,6 +144,12 @@ std::vector<Value> g_empty_items;
 const std::string& Value::str() const {
   if (type != Type::Str || !obj) return kEmpty;
   return static_cast<StrObj*>(obj.get())->text;
+}
+
+std::vector<uint8_t>& Value::bytes_data() const {
+  static std::vector<uint8_t> empty;
+  if (type != Type::Bytes || !obj) { empty.clear(); return empty; }
+  return static_cast<BytesObj*>(obj.get())->data;
 }
 
 std::vector<Value>& Value::list_items() const {
@@ -278,6 +288,15 @@ std::string Value::to_text() const {
       auto* bm = static_cast<BoundMethodObj*>(obj.get());
       return "<method " + bm->name + ">";
     }
+    case Type::Bytes: {
+      // <bytes 5: 68 65 6c 6c 6f>, the first 32 shown
+      const auto& d = static_cast<BytesObj*>(obj.get())->data;
+      static const char* hex = "0123456789abcdef";
+      std::string out = "<bytes " + std::to_string(d.size()) + ":";
+      for (size_t k = 0; k < d.size() && k < 32; ++k) { out += ' '; out += hex[d[k] >> 4]; out += hex[d[k] & 15]; }
+      if (d.size() > 32) out += " ...";
+      return out + ">";
+    }
   }
   return "?";
 }
@@ -311,6 +330,8 @@ bool Value::equals(const Value& o) const {
       return static_cast<FrameObj*>(obj.get())->id == static_cast<FrameObj*>(o.obj.get())->id;
     case Type::MemoryObject:
       return static_cast<MemObj*>(obj.get())->id == static_cast<MemObj*>(o.obj.get())->id;
+    case Type::Bytes:
+      return static_cast<BytesObj*>(obj.get())->data == static_cast<BytesObj*>(o.obj.get())->data;
     case Type::Entity:
       return static_cast<EntityObj*>(obj.get())->id == static_cast<EntityObj*>(o.obj.get())->id;
     case Type::List: {
@@ -978,6 +999,12 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         if (both_int(a, b)) { S.stack.push_back(Value::integer(a.i + b.i)); break; }
         if (numeric_pair(a, b)) { S.stack.push_back(Value::real(a.as_double() + b.as_double())); break; }
         if (a.type == Type::Str && b.type == Type::Str) { S.stack.push_back(Value::string(a.str() + b.str())); break; }
+        if (a.type == Type::Bytes && b.type == Type::Bytes) {
+          std::vector<uint8_t> out = a.bytes_data();
+          out.insert(out.end(), b.bytes_data().begin(), b.bytes_data().end());
+          S.stack.push_back(Value::bytes(std::move(out)));
+          break;
+        }
         if (a.type == Type::List && b.type == Type::List) {
           std::vector<Value> out = a.list_items();
           const auto& more = b.list_items();
@@ -1033,7 +1060,8 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         }
         if (both_int(a, b)) {
           if (b.i == 0) { fail(line, "modulo by zero"); break; }
-          S.stack.push_back(Value::integer(a.i % b.i));
+          // INT64_MIN % -1 traps on x86 (SIGFPE); the answer is 0 everywhere.
+          S.stack.push_back(Value::integer(b.i == -1 ? 0 : a.i % b.i));
         } else {
           if (b.as_double() == 0.0) { fail(line, "modulo by zero"); break; }
           S.stack.push_back(Value::real(std::fmod(a.as_double(), b.as_double())));
@@ -1182,6 +1210,18 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           S.stack.push_back(v ? *v : Value::nil());
           break;
         }
+        if (target.type == Type::Bytes) {
+          if (!key.is_number()) { fail(line, "a bytes index must be a number"); break; }
+          const auto& d = target.bytes_data();
+          int64_t at = key.as_int();
+          if (at < 0) at += (int64_t)d.size();
+          if (at < 0 || at >= (int64_t)d.size()) {
+            fail(line, "index " + std::to_string(key.as_int()) + " is outside bytes of " + std::to_string(d.size()));
+            break;
+          }
+          S.stack.push_back(Value::integer(d[(size_t)at]));
+          break;
+        }
         if (target.type == Type::Str) {
           if (!key.is_number()) { fail(line, "a string index must be a number"); break; }
           const std::string& s = target.str();
@@ -1204,6 +1244,14 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           if (at < 0) at += (int64_t)items.size();
           if (at < 0 || at >= (int64_t)items.size()) { fail(line, "list index out of range"); break; }
           items[(size_t)at] = v;
+        } else if (target.type == Type::Bytes) {
+          if (!key.is_number()) { fail(line, "a bytes index must be a number"); break; }
+          auto& d = target.bytes_data();
+          int64_t at = key.as_int();
+          if (at < 0) at += (int64_t)d.size();
+          if (at < 0 || at >= (int64_t)d.size()) { fail(line, "bytes index out of range"); break; }
+          if (v.type != Type::Int || v.i < 0 || v.i > 255) { fail(line, "a byte is a whole number from 0 to 255"); break; }
+          d[(size_t)at] = (uint8_t)v.i;
         } else if (target.type == Type::Map) {
           if (key.type != Type::Str) { fail(line, "a map key must be a string"); break; }
           static_cast<MapObj*>(target.obj.get())->put(key.str(), v);
@@ -1345,6 +1393,12 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           std::vector<Value> keys;
           for (auto& [k, v] : static_cast<MapObj*>(seq.obj.get())->entries) keys.push_back(Value::string(k));
           S.stack.push_back(Value::list(std::move(keys)));
+          break;
+        }
+        if (seq.type == Type::Bytes) {
+          std::vector<Value> out;
+          for (uint8_t byte : seq.bytes_data()) out.push_back(Value::integer(byte));
+          S.stack.push_back(Value::list(std::move(out)));
           break;
         }
         if (seq.type == Type::Str) {

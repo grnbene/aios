@@ -1,0 +1,35 @@
+# ptr, raw reads and writes, and extern fn: what only an unsafe host allows.
+extern fn labs(x: i64) -> i64
+extern fn strlen(s: ptr) -> i64
+extern fn abs(x: i32) -> i32
+extern fn sqrt(x: f64) -> f64
+
+native fn c_abs(x: i64) -> i64 { return labs(x) + abs(0 - 3) as i64 }
+native fn c_len(b: bytes) -> i64 { return strlen(b as ptr) }
+native fn c_sqrt(x: f64) -> f64 { return sqrt(x) * 2.0 }
+native fn raw_sum(p: ptr, n: i64) -> i64 {
+  let t = 0
+  for i in 0..n { t += rd8(p, i) }
+  return t
+}
+native fn raw_fill(p: ptr, n: i64) -> i64 {
+  for i in 0..n { wr8(p, i, i * 3) }
+  return n
+}
+native fn ptr_math(p: ptr) -> i64 { return ((p as i64) + 8) as i64 - (p as i64) }
+
+test("calls C from native code", fn () {
+  expect_eq(c_abs(-40), 43)
+  expect_eq(c_len(bytes("grain\0")), 5)
+  expect_eq(c_sqrt(16.0), 8.0)
+})
+
+test("reads and writes raw memory through a ptr", fn () {
+  let p = mem_alloc(16)
+  expect_eq(raw_fill(p, 10), 10)
+  expect_eq(bytes_hex(mem_read(p, 4)), "00030609")
+  expect_eq(raw_sum(p, 10), 3 * 45)
+  mem_free(p)
+  expect_eq(raw_sum(bytes([1, 2, 3, 4]), 4), 10)
+  expect_eq(ptr_math(bytes_ptr(bytes(1))), 8)
+})

@@ -43,7 +43,7 @@ using ObjRef = std::shared_ptr<Obj>;
 
 enum class Type : uint8_t {
   Nil, Bool, Int, Real, Str, List, Map, Fn, Native, Extern,
-  Id128, Capability, Channel, StateFrame, MemoryObject, Entity, BoundMethod
+  Id128, Capability, Channel, StateFrame, MemoryObject, Entity, BoundMethod, Bytes
 };
 
 const char* type_name(Type t);
@@ -65,6 +65,7 @@ struct Value {
   static Value object(Type t, ObjRef o) { Value x; x.type = t; x.i = 0; x.obj = std::move(o); return x; }
   static Value string(std::string s);
   static Value list(std::vector<Value> v);
+  static Value bytes(std::vector<uint8_t> v);
   static Value id128(const aios::Id128& id);
   static Value id128(const std::string& hex);
 
@@ -80,6 +81,7 @@ struct Value {
   const aios::Id128& as_id128() const;
   const std::string& str() const;
   std::vector<Value>& list_items() const;
+  std::vector<uint8_t>& bytes_data() const;   // a Bytes value's contents, mutable and shared
   std::string to_text() const;      // what `print` shows
   std::string repr() const;         // what a value inside a list shows
   bool equals(const Value& o) const;
@@ -103,6 +105,15 @@ class StrObj final : public Obj {
  public:
   explicit StrObj(std::string s) : Obj(Type::Str), text(std::move(s)) {}
   std::string text;
+};
+
+// A fixed-size run of mutable bytes: binary files, wire protocols, pixels. Like
+// a list it is shared by reference, so a function that fills a buffer fills the
+// caller's. Strings stay the way to hold text; bytes are for data that is not.
+class BytesObj final : public Obj {
+ public:
+  explicit BytesObj(std::vector<uint8_t> v) : Obj(Type::Bytes), data(std::move(v)) {}
+  std::vector<uint8_t> data;
 };
 
 class ListObj final : public Obj {
@@ -325,6 +336,18 @@ struct Diagnostic {
 // Every stage reports the same way: a result, and the diagnostics that stopped
 // it. Nothing throws across a stage boundary, because the REPL has to survive
 // a bad line and ask for the next one.
+// `native fn` compiles a typed subset of grain to machine code. It is off until
+// the host turns it on: generated code is a thing a sandbox must opt in to.
+// `unsafe` adds what can touch memory grain does not own: `ptr`, rd/wr through
+// a ptr, `extern fn`, and casting bytes to a ptr. Without it a native function
+// can only read and write the `bytes` it is given, bounds-checked.
+struct NativePolicy {
+  bool allow = false;
+  bool unsafe = false;
+};
+void set_native_policy(NativePolicy policy);
+NativePolicy native_policy();
+
 struct CompileResult {
   std::shared_ptr<FnObj> script;   // null when it did not compile
   std::vector<Diagnostic> errors;
@@ -469,6 +492,7 @@ void install_hash_builtins(Vm& vm);    // sha256, sha1, sha512, sha384, md5, kec
 void install_regex_builtins(Vm& vm);   // regex_test/match/find_all/replace/split (grain_std_regex.cpp)
 void install_time_builtins(Vm& vm);    // now, date_parts/format/parse/make (grain_std_time.cpp)
 void install_text_builtins(Vm& vm);    // format, sort_by, group_by, uuid (grain_std_text.cpp)
+void install_bytes_builtins(Vm& vm);   // bytes, bytes_get/set, pack/unpack, bytes_* (grain_std_bytes.cpp)
 void install_path_builtins(Vm& vm);    // path_join, basename, dirname, extname, mkdir, ... (grain_std_path.cpp)
 
 // The bridges that make this a language ON aios rather than beside it: the
@@ -535,6 +559,25 @@ bool pane_closed(Vm& vm, uint64_t id, std::string& error);
 // Unregisters every pane of `vm`, with no callbacks: for an embedder that is
 // done with the VM (its program ended, or its app was closed).
 void drop_panes(const Vm& vm);
+
+// A ui.pane shown in a browser instead of a window (grain_face.cpp renders it, grain_webui.cpp
+// serves it). The program is the same one a desktop window runs: its `view` is called, its
+// widgets become HTML, and a click or Enter in the browser calls the same grain function.
+struct WebPaneInfo {
+  uint64_t id = 0;
+  std::string title;
+  int width = 0, height = 0;
+  int refresh = 0;           // seconds between redraws the page asks for (the pane's "refresh" option); 0 = none
+};
+// The first ui.pane the program made, if it made one.
+bool web_pane_first(const Vm& vm, WebPaneInfo& out);
+// Calls the pane's view and returns the widgets as an HTML fragment. `version` changes on every
+// render: an event names the version it was shown, so one from an old page is ignored.
+bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, std::string& error);
+// A click or Enter: `fields` are the texts typed in the browser's fields, `action` the button or
+// field the page named (empty: only the fields changed). Call web_pane_render afterwards.
+bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& action,
+                    const std::vector<std::pair<std::string, std::string>>& fields, std::string& error);
 
 }  // namespace aios::userland::grain
 

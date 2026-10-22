@@ -613,6 +613,9 @@ target_compile_definitions(aios_webserver_lib PRIVATE AIOS_WEBSERVER_NO_MAIN=1)
 target_link_libraries(aios_webserver_lib PUBLIC aios)
 target_link_libraries(aios-cli PRIVATE aios_webserver_lib)
 
+# A site written in grain, served by the web server (scripts/grain-web): routes, JSON, forms, native fn, and failures.
+add_test(NAME web.grain COMMAND ${CMAKE_SOURCE_DIR}/scripts/grain-web-check.sh $<TARGET_FILE:aios-webserver>)
+
 add_executable(aios-agent-control tools/aios-agent-control.cpp)
 target_link_libraries(aios-agent-control PRIVATE aios)
 

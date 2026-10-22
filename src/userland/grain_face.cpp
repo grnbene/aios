@@ -243,6 +243,203 @@ class FacePane final : public PaneDriver {
 
   fc::Runtime& runtime() { return rt_; }
 
+  // ---- the same program in a browser: widgets as HTML, events from fields and actions ----
+
+  uint64_t version() const { return version_; }
+  int refresh() const { return refresh_; }
+  void set_refresh(int s) { refresh_ = s; }
+
+  bool render_html(Vm& vm, std::string& html, std::string& error) {
+    vm_ = &vm;
+    web_ = true;
+    Value tree = call(view_, error);
+    if (!error.empty()) { error = "view(): " + error; return false; }
+    actions_.clear();
+    ++version_;
+    html.clear();
+    if (!html_widget(tree, html, error, 0)) { error = "view(): " + error; return false; }
+    return true;
+  }
+
+  bool web_event(Vm& vm, uint64_t version, const std::string& action,
+                 const std::vector<std::pair<std::string, std::string>>& fields, std::string& error) {
+    vm_ = &vm;
+    web_ = true;
+    for (const auto& kv : fields) web_fields_[kv.first] = kv.second;
+    if (action.empty() || version != version_) return true;   // only the fields changed, or a page from before the last render
+    auto it = actions_.find(action);
+    if (it == actions_.end()) return true;
+    std::string err;
+    const auto [fn, who] = it->second;
+    call(fn, err);
+    if (!err.empty()) { error = who + ": " + err; return false; }
+    return true;
+  }
+
+  bool web() const { return web_; }
+  std::string web_field(const std::string& id) const { auto it = web_fields_.find(id); return it == web_fields_.end() ? std::string() : it->second; }
+  void web_set_field(const std::string& id, const std::string& text) { web_fields_[id] = text; }
+
+  static std::string esc(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+      switch (c) {
+        case '&': o += "&amp;"; break;
+        case '<': o += "&lt;"; break;
+        case '>': o += "&gt;"; break;
+        case '"': o += "&quot;"; break;
+        case '\'': o += "&#39;"; break;
+        default: o += c;
+      }
+    }
+    return o;
+  }
+
+ private:
+  // An option read from a widget's opts map.
+  static const Value* opt(const Value& widget, const char* key) {
+    auto m = as_map(widget);
+    Value* o = m ? m->find("opts") : nullptr;
+    auto om = o ? as_map(*o) : nullptr;
+    return om ? om->find(key) : nullptr;
+  }
+  static int opt_int(const Value& w, const char* key, int dflt) { const Value* v = opt(w, key); return v && v->is_number() ? (int)v->as_int() : dflt; }
+  static std::string opt_str(const Value& w, const char* key) { const Value* v = opt(w, key); return v ? v->to_text() : std::string(); }
+  static bool opt_flag(const Value& w, const char* key) { const Value* v = opt(w, key); return v && v->truthy(); }
+  // A colour or CSS keyword that cannot break out of an attribute.
+  static std::string safe_css(const std::string& s) {
+    std::string o;
+    for (char c : s) if (std::isalnum((unsigned char)c) || c == '#' || c == '-' || c == '.' || c == '(' || c == ')' || c == ',' || c == '%' || c == ' ') o += c;
+    return o;
+  }
+
+  bool html_widget(const Value& v, std::string& out, std::string& error, int depth) {
+    auto m = as_map(v);
+    Value* type_v = m ? m->find("widget") : nullptr;
+    if (!type_v || type_v->type != Type::Str) {
+      error = std::string("a widget (ui.column, ui.text, ...) is expected, got a ") + type_name(v.type);
+      return false;
+    }
+    if (depth > 200) { error = "the widgets nest more than 200 deep"; return false; }
+    const std::string& type = type_v->str();
+    Value* label = m->find("label");
+    const std::string label_text = label ? label->to_text() : std::string();
+    if (type == "column" || type == "row") {
+      out += "<div class=\"w-" + type + "\" style=\"gap:" + std::to_string(opt_int(v, "gap", 8)) + "px;padding:" + std::to_string(opt_int(v, "pad", 0)) + "px\">";
+      if (Value* kids = m->find("children"); kids && kids->type == Type::List)
+        for (const auto& c : kids->list_items()) if (!html_widget(c, out, error, depth + 1)) return false;
+      out += "</div>";
+      return true;
+    }
+    if (type == "text") {
+      std::string cls = "w-text";
+      if (opt_flag(v, "dim")) cls += " dim";
+      if (opt_flag(v, "bold")) cls += " bold";
+      std::string style;
+      if (const int size = opt_int(v, "size", 0)) style += "font-size:" + std::to_string(size) + "px;";
+      if (const std::string color = safe_css(opt_str(v, "color")); !color.empty()) style += "color:" + color + ";";
+      out += "<div class=\"" + cls + "\"" + (style.empty() ? "" : " style=\"" + style + "\"") + ">" + esc(label_text) + "</div>";
+      return true;
+    }
+    if (type == "button") {
+      Value* fn = m->find("on_click");
+      const std::string act = fn ? action_for(*fn, "the button \"" + label_text + "\"") : std::string();
+      out += std::string("<button type=\"button\" class=\"w-btn") + (opt_flag(v, "primary") ? " primary" : "") + "\" data-act=\"" + esc(act) + "\">" + esc(label_text) + "</button>";
+      return true;
+    }
+    if (type == "field") {
+      Value* idv = m->find("id");
+      const std::string id = idv ? idv->to_text() : std::string();
+      auto have = web_fields_.find(id);
+      const std::string value = have != web_fields_.end() ? have->second : opt_str(v, "value");
+      if (have == web_fields_.end()) web_fields_[id] = value;
+      std::string enter;
+      if (const Value* e = opt(v, "on_enter"); e && is_callable(*e)) enter = action_for(*e, "the field \"" + id + "\"'s on_enter");
+      out += "<input class=\"w-field\" type=\"text\" data-id=\"" + esc(id) + "\" value=\"" + esc(value) + "\" placeholder=\"" + esc(opt_str(v, "placeholder")) + "\"";
+      if (!enter.empty()) out += " data-enter=\"" + esc(enter) + "\"";
+      if (opt_flag(v, "focus")) out += " data-focus=\"1\"";
+      if (const int width = opt_int(v, "width", 0)) out += " style=\"width:" + std::to_string(width) + "px;flex:none\"";
+      out += " autocomplete=\"off\">";
+      return true;
+    }
+    if (type == "tile") {
+      std::string accent = opt_str(v, "accent");
+      std::string cls = "w-tile", style;
+      if (accent == "ok" || accent == "warn" || accent == "bad") cls += " " + accent;
+      else if (!accent.empty()) style = " style=\"color:" + safe_css(accent) + "\"";
+      Value* val = m->find("value");
+      out += "<div class=\"" + cls + "\"><div class=\"tv\"" + style + ">" + esc(val ? val->to_text() : std::string()) + "</div><div class=\"tl\">" + esc(label_text) + "</div></div>";
+      return true;
+    }
+    if (type == "table") return html_table(v, out, error);
+    error = "ui." + type + " has no web rendering";
+    return false;
+  }
+
+  // columns "key:Header, key:Header:right"; every field of the first row when left out
+  bool html_table(const Value& v, std::string& out, std::string& error) {
+    auto m = as_map(v);
+    Value* data = m->find("data");
+    if (!data || data->type != Type::List) { error = "ui.table() has no rows"; return false; }
+    struct Col { std::string key, head; bool right = false; };
+    std::vector<Col> cols;
+    const std::string spec = opt_str(v, "columns");
+    size_t at = 0;
+    while (at < spec.size()) {
+      size_t comma = spec.find(',', at);
+      if (comma == std::string::npos) comma = spec.size();
+      std::string item = spec.substr(at, comma - at);
+      at = comma + 1;
+      std::vector<std::string> parts;
+      size_t p = 0;
+      while (p <= item.size()) {
+        size_t colon = item.find(':', p);
+        if (colon == std::string::npos) colon = item.size();
+        std::string part = item.substr(p, colon - p);
+        const size_t b = part.find_first_not_of(' '), e = part.find_last_not_of(' ');
+        parts.push_back(b == std::string::npos ? "" : part.substr(b, e - b + 1));
+        p = colon + 1;
+      }
+      if (parts.empty() || parts[0].empty()) continue;
+      Col c;
+      c.key = parts[0];
+      c.head = parts.size() > 1 && !parts[1].empty() ? parts[1] : parts[0];
+      c.right = parts.size() > 2 && parts[2] == "right";
+      cols.push_back(c);
+    }
+    const auto& rows = data->list_items();
+    if (cols.empty() && !rows.empty())
+      if (auto first = as_map(rows[0])) for (const auto& kv : first->entries) cols.push_back({kv.first, kv.first, false});
+    out += "<table class=\"w-table\"><thead><tr>";
+    for (const auto& c : cols) out += std::string("<th") + (c.right ? " class=\"r\"" : "") + ">" + esc(c.head) + "</th>";
+    out += "</tr></thead><tbody>";
+    const int limit = opt_int(v, "rows", 0);
+    int shown = 0;
+    for (const auto& row : rows) {
+      if (limit > 0 && shown >= limit) break;
+      auto rm = as_map(row);
+      out += "<tr>";
+      for (const auto& c : cols) {
+        Value* cell = rm ? rm->find(c.key) : nullptr;
+        out += std::string("<td") + (c.right ? " class=\"r\"" : "") + ">" + esc(cell ? cell->to_text() : std::string()) + "</td>";
+      }
+      out += "</tr>";
+      ++shown;
+    }
+    if (rows.empty()) {
+      const std::string empty = opt_str(v, "empty");
+      out += "<tr><td class=\"empty\" colspan=\"" + std::to_string(std::max<size_t>(cols.size(), 1)) + "\">" + esc(empty.empty() ? "nothing here" : empty) + "</td></tr>";
+    }
+    out += "</tbody></table>";
+    return true;
+  }
+
+  bool web_ = false;
+  uint64_t version_ = 0;
+  int refresh_ = 0;
+  std::map<std::string, std::string> web_fields_;
+
  private:
   // The program's widgets as this frame's face document, laid out at the pane's size.
   bool lay_out(std::string& error) {
@@ -281,7 +478,8 @@ class FacePane final : public PaneDriver {
 
   Value fields() {
     auto m = std::make_shared<MapObj>();
-    for (const auto& kv : rt_.field_vars()) m->put(kv.first, Value::string(kv.second));
+    if (web_) { for (const auto& kv : web_fields_) m->put(kv.first, Value::string(kv.second)); }
+    else for (const auto& kv : rt_.field_vars()) m->put(kv.first, Value::string(kv.second));
     return Value::object(Type::Map, m);
   }
 
@@ -377,7 +575,9 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   int w = 640, h = 480;
   if (Value* v = o->find("width")) { if (!want_number(*v, error, "ui.pane")) return Value::nil(); w = (int)v->as_int(); }
   if (Value* v = o->find("height")) { if (!want_number(*v, error, "ui.pane")) return Value::nil(); h = (int)v->as_int(); }
-  return register_driven_pane(vm, title, w, h, std::make_shared<FacePane>(*view, w, h));
+  auto pane = std::make_shared<FacePane>(*view, w, h);
+  if (Value* r = o->find("refresh"); r && r->is_number()) pane->set_refresh((int)r->as_int());   // a browser redraws this often (seconds); a window already redraws
+  return register_driven_pane(vm, title, w, h, pane);
 }
 
 FacePane* face_pane_of(Vm& vm, const Value& pane, std::string& error, const char* who) {
@@ -390,6 +590,7 @@ FacePane* face_pane_of(Vm& vm, const Value& pane, std::string& error, const char
 Value bi_ui_field_text(Vm& vm, std::vector<Value>& args, std::string& error) {
   FacePane* p = face_pane_of(vm, args[0], error, "ui.field_text");
   if (!p || !want_str(args[1], error, "ui.field_text")) return Value::nil();
+  if (p->web()) return Value::string(p->web_field(args[1].str()));
   for (const auto& kv : p->runtime().field_vars())
     if (kv.first == args[1].str()) return Value::string(kv.second);
   return Value::string("");
@@ -399,6 +600,7 @@ Value bi_ui_field_text(Vm& vm, std::vector<Value>& args, std::string& error) {
 Value bi_ui_set_field(Vm& vm, std::vector<Value>& args, std::string& error) {
   FacePane* p = face_pane_of(vm, args[0], error, "ui.set_field");
   if (!p || !want_str(args[1], error, "ui.set_field")) return Value::nil();
+  if (p->web()) { p->web_set_field(args[1].str(), args[2].to_text()); return Value::nil(); }
   p->runtime().set_field_var(args[1].str(), args[2].to_text());
   return Value::nil();
 }
@@ -443,6 +645,44 @@ void install_face_builtins(Vm& vm) {
   add("set_field", 3, 3, bi_ui_set_field);
   add("layout", 1, 1, bi_ui_layout);
   vm.define_global("ui", Value::object(Type::Map, ui));
+}
+
+
+// ---- the browser side of a pane -------------------------------------------------
+
+namespace {
+FacePane* web_face(const Vm& vm, uint64_t id) {
+  return dynamic_cast<FacePane*>(pane_driver(vm, Value::integer((int64_t)id)).get());
+}
+}  // namespace
+
+bool web_pane_first(const Vm& vm, WebPaneInfo& out) {
+  for (const auto& p : pane_list(vm)) {
+    if (FacePane* f = web_face(vm, p.id)) {
+      out.id = p.id;
+      out.title = p.title;
+      out.width = p.width;
+      out.height = p.height;
+      out.refresh = f->refresh();
+      return true;
+    }
+  }
+  return false;
+}
+
+bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f) { error = "that pane is not a ui.pane"; return false; }
+  if (!f->render_html(vm, html, error)) return false;
+  version = f->version();
+  return true;
+}
+
+bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& action,
+                    const std::vector<std::pair<std::string, std::string>>& fields, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f) { error = "that pane is not a ui.pane"; return false; }
+  return f->web_event(vm, version, action, fields, error);
 }
 
 }  // namespace aios::userland::grain

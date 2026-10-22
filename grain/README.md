@@ -23,6 +23,7 @@ grain check *.gr             compile only and report every error
 grain dis hello.gr           show the bytecode the compiler emitted
 grain --steps 1000000 ...    stop a program after that many instructions
 grain --no-jit ...           interpret everything
+grain --safe ...             native fn on bytes only: no ptr, extern fn, ffi or plugins
 ```
 
 Exit status: 0 the program ran to its end, 1 it did not compile, 2 it stopped
@@ -46,6 +47,148 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
 | Widgets | `ui.column`, `ui.row`, `ui.text`, `ui.button`, `ui.field`, `ui.table`, `ui.tile` in a `ui.pane` |
+
+## One program, a window or a web page
+
+A program built from `ui.pane` is written once and runs both ways. The pane's
+`view` describes the screen as widgets; a window paints them, and a browser
+gets them as HTML.
+
+```
+grain counter.gr                   a window (counter.gr: ui.pane + run_panes())
+grain serve counter.gr             the same program in a browser, at http://127.0.0.1:8080/
+grain build counter.gr -o counter  one file: ./counter is a window, ./counter --web [port] a web page
+```
+
+In the browser each visitor gets their own copy of the program (a session, kept
+by a cookie): a button or Enter calls the same grain function it would in a
+window, with the field texts, on the server, and the page redraws. State is a
+session's own and lives in the program's variables. Your functions, `ui.set_field`
+and `ui.field_text` behave as they do in a window. A pane option `"refresh": 5`
+makes a page redraw every 5 seconds, for a view that shows a clock or a feed (a
+window already redraws sixty times a second). Edit the file and the next page
+load starts a session on the new code.
+
+`grain serve` is for your own machine: it binds 127.0.0.1, shows a program's
+errors in the page, and the program has everything the standalone grain has.
+`aios-webserver` serves the same program to the world with `grain_ui app.gr` in
+a vhost ([docs/network.md](../docs/network.md)): files confined to the vhost's
+root, errors only in the log, gzip, TLS.
+
+Only `ui.pane` programs have a web form. A pane drawn by hand with `create_pane`
+and `on_draw` paints pixels, and the web side shows widgets, so it says so
+instead of guessing. The page script is a few dozen lines inline, with no
+library. The cookie is `HttpOnly` and `SameSite=Strict`, text from the program
+is escaped, and an event must carry `X-Grain-UI: 1`, which a page on another
+site cannot add, so a link elsewhere cannot press your buttons.
+
+## Going low-level
+
+Four layers, from the safest up. The standard library has the first; the
+standalone `grain` program adds the rest (a sandboxed host, such as the aios
+desktop or the web server, gets none of them unless it opts in).
+
+### Bytes
+
+`bytes` is a fixed-size run of mutable bytes, shared by reference like a list.
+Indexing, `len`, `slice`, `+`, `for` and `==` work on it; every access is
+bounds-checked.
+
+```grain
+let b = bytes(16)                          # 16 zero bytes; also bytes("text"), bytes([1, 2, 3])
+bytes_set(b, 0, "u32be", 0xCAFEBABE)       # a number at an offset, in a byte order
+bytes_get(b, 0, "u16le")                   # types: u8 i8 u16le u16be i32le ... u64be f32le f64be
+let p = pack(">HH4s", 80, 443, "grain")    # like Python's struct: b B h H i I q Q f d s x, < or >
+unpack(">HH", p)                           # -> [80, 443]
+bytes_fill(b, 0)  bytes_copy(dst, 0, src)  bytes_find(b, "needle")  bytes_hex(b)  bytes_concat([a, b])
+read_bytes("file.bin")  write_bytes("out.bin", b)
+```
+
+A `u64` above 2^63 reads as its negative twin: grain's integers are signed
+64-bit.
+
+### Native functions
+
+`native fn` compiles a typed slice of grain to machine code - the inner loop you
+would otherwise write in C. About 20x faster than the VM on recursive code, and
+it follows the C calling convention, so one native function calls another.
+
+```grain
+native fn checksum(b: bytes) -> i64 {
+  let h = 0
+  for i in 0..b.len { h = (h * 31 + b[i]) & 0xFFFFFFFF }
+  return h
+}
+print(checksum(bytes("hello world")))
+```
+
+Types are written out and nothing converts silently: `i64`, `f64`, `bool`,
+`bytes` (and `ptr`, below). `x as f64` converts. Arithmetic wraps; shifts by 64
+or more shift everything out. Statements: `let`, assignment and `+= -= ...`,
+`if / else if / else`, `while`, `for i in a..b` (b excluded), `break`,
+`continue`, `return`. Expressions: `+ - * / % & | ^ ~ << >>`, comparisons, `and
+or not`, `b[i]` (a byte), `b.len`, `sqrt(x)`, `fabs(x)`, and typed access at an
+offset: `rd8 rd16 rd32 rd64 rdi8 rdi16 rdi32 rdf64` and `wr8 wr16 wr32 wr64
+wrf64` (little-endian, in native byte order). A native function can call
+itself and the ones declared above it. It takes and returns numbers and bools;
+a `bytes` argument is the caller's buffer, so it can fill one in place.
+
+What stops the program with an error, never the process: division by zero, an
+index or `rd`/`wr` outside the bytes, a byte outside 0..255, and recursion past
+256 KB of native stack. Not covered: native code does not count against
+`--steps`, so a native `while true {}` is a real infinite loop.
+
+The compiler reports mistakes the way grain does, with the line:
+
+```
+bad.gr:1: the two sides of an operator: i64 and f64 do not mix (convert with `as`)
+bad.gr:3: an if wants a bool, got i64 (compare it, e.g. `x != 0`)
+```
+
+x86-64 on Linux and macOS only so far; elsewhere `native fn` says so.
+
+**Unsafe**, which `--safe` turns off: `ptr` (an address), `rd`/`wr` through a
+`ptr`, `x as ptr`, and `extern fn name(a: i64, b: f64, s: ptr) -> i32`, which
+declares a C function from the running program for native code to call
+(`i32` is allowed only there). `grain --safe prog.gr` allows `native fn` on
+bytes and nothing else; `--no-native` refuses it altogether.
+
+### Calling C from grain
+
+```grain
+let libc = ffi_open()                                  # the program itself, and so libc; or ffi_open("libm.so.6")
+let strlen = ffi_fn(libc, "strlen", "u64(cstr)")
+print(strlen("grain"))                                 # 5
+let snprintf = ffi_fn(libc, "snprintf", "int(bytes, u64, cstr, ...)")
+```
+
+Types: `void i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr cstr bytes`. `cstr` is a
+string in and a string out; `bytes` passes the address of a buffer the C code may
+fill. `...` ends a variadic signature. `ffi_sym`, `ffi_ptr`, `ffi_errno`,
+`mem_alloc`, `mem_free`, `mem_read`, `mem_write`, `cstr_at`, `bytes_ptr` cover
+addresses. A wrong signature crashes the process, as in C. No structs by value,
+callbacks into grain, or Windows yet; x86-64 and AArch64 (no variadic calls
+on Apple Silicon).
+
+### Plugins in C and C++
+
+Include `include/grain_plugin.h`, build a shared library, and `load_plugin`:
+
+```c
+#include "grain_plugin.h"
+static void add(grain_call* c) { grain_return_int(c, grain_arg_int(c, 0) + grain_arg_int(c, 1)); }
+GRAIN_PLUGIN(reg) { grain_register(reg, "add", 2, 2, add); return 0; }
+```
+
+```
+c++ -O2 -shared -fPIC -I grain/include vec.cpp -o libvec.so
+grain: load_plugin("./libvec.so")   # registers add(); returns the names
+```
+
+A plugin is handed a function table, so it needs no symbols from grain and
+survives upgrades (`GRAIN_PLUGIN_ABI`). It can read numbers, strings, bytes
+(the caller's buffer, writable) and lists, return numbers, strings and bytes, and
+raise errors. `examples/plugin/vec.cpp` is a working one.
 
 ## Windows
 
@@ -73,11 +216,19 @@ Events: `mouse_down`, `mouse_up`, `click` (`x`, `y`, `button`), `mouse_move`,
 `close`. Coordinates are the pane's own, on any screen density.
 `run_panes({frames: n, script: [events...]})` stops after n frames and plays
 the scripted input first - the window test does this headless with
-`SDL_VIDEODRIVER=dummy`.
+`GRAIN_VIDEO=dummy` (no display is opened; `SDL_VIDEODRIVER=dummy` works too).
 
-Windows need SDL2 when grain is built (`brew install sdl2`, `apt install
-libsdl2-dev`, `vcpkg install sdl2:x64-windows-static`); without it grain builds
-the same and `run_panes()` says it has no display.
+Windows on Linux need nothing: grain speaks the X11 protocol itself (it also
+works on Wayland desktops, through XWayland), so there is no library to install.
+On macOS and Windows grain still uses SDL2 when it is built with it (`brew
+install sdl2`, `vcpkg install sdl2:x64-windows-static`); without it grain builds
+the same and `run_panes()` says it has no display. Linux typed text is the key's
+own character in the active keyboard layout (the display's layout switch, e.g.
+Alt+Shift, picks it; shift, caps lock and AltGr apply, and Cyrillic, Greek,
+Arabic, Hebrew and the other layouts' keys type their own letters). Several
+keyboards work at once, and a keyboard or layout change is picked up while the
+program runs. There are no input methods, so compose sequences and CJK input
+are not supported.
 
 ### Widgets
 
@@ -179,7 +330,7 @@ language-servers = ["grain"]
 ## Shipping a program
 
 ```
-grain build app.gr -o app                       # one executable: the runtime with app.gr packed onto it
+grain build app.gr -o app                       # one executable: the runtime with app.gr packed onto it (./app --web serves a ui.pane program to a browser)
 grain build app.gr -o app --include assets      # files the program reads with bundle_file("assets/x.png")
 grain build app.gr --app -o App.app             # macOS: an application bundle that can be signed
 grain build app.gr --runtime grain.exe -o app   # for another OS: pack onto that OS's grain
@@ -198,9 +349,10 @@ than run.
   strict signature check, so it cannot be notarized. `--app` leaves the
   runtime untouched and puts the program in `Contents/Resources`; sign and
   notarize the .app as any other.
-- **Programs with windows**: a program that opens windows needs SDL2 wherever it
-  runs, unless grain was built with `-DGRAIN_SDL2_STATIC=ON`, which compiles
-  SDL2 2.32.10 from its release and links it in. Use that for releases.
+- **Programs with windows**: on Linux nothing is needed beyond the file. On macOS
+  and Windows a program that opens windows needs SDL2 wherever it runs, unless
+  grain was built with `-DGRAIN_SDL2_STATIC=ON`, which compiles SDL2 2.32.10
+  from its release and links it in. Use that for releases.
 
 ## Building
 
@@ -272,5 +424,9 @@ stops with an error in its window instead of freezing the desktop.
 Built and tested so far: macOS arm64 (57 of 57 cases, a signed .app passing
 strict verification, the live HTTPS checks, the window test on a real macOS
 window with both Homebrew's sdl2-compat and SDL 2.32, and
-`tools/grain-desktop/check.sh` on the aios desktop). Linux and Windows are set
-up (`grain/CMakeLists.txt`, `scripts/build-linux.sh`) and not yet built.
+`tools/grain-desktop/check.sh` on the aios desktop). Linux x86_64 (Ubuntu 24.04, GCC 13): 58 of 58 cases; windows are drawn through
+the X11 protocol with no library (checked on a real X server: typing, clicks,
+resize, close), and `grain build` makes a windowed app
+(`grain/examples/sysmon.gr`) that runs with no grain installed and links no
+library but libc and libstdc++. Windows is set
+up (`grain/CMakeLists.txt`) and not yet built.

@@ -1,0 +1,12 @@
+# Typed through a fake X server with two keyboard layouts (x11_layouts.py runs it).
+let texts = []
+let keys = []
+let p = create_pane({"title": "layouts", "width": 120, "height": 80,
+  "on_draw": fn (cv) { canvas_clear(cv, "#000000") },
+  "on_event": fn (p, e) {
+    if e.type == "text" { push(texts, e.text) }
+    if e.type == "key" { push(keys, e.key) }
+  }})
+run_panes()
+print("text:", join(texts, ""))
+print("keys:", join(keys, " "))

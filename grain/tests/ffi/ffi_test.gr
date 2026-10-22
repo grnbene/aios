@@ -1,0 +1,69 @@
+# Calling C: libc and libm through ffi_fn, with every kind of argument.
+let libc = ffi_open()
+
+test("calls functions with integer and string arguments", fn () {
+  expect_eq(ffi_fn(libc, "strlen", "u64(cstr)")("grain"), 5)
+  expect_eq(ffi_fn(libc, "labs", "i64(i64)")(-42), 42)
+  expect_eq(ffi_fn(libc, "abs", "int(int)")(-7), 7)
+  expect_eq(chr(ffi_fn(libc, "toupper", "int(int)")(ord("q"))), "Q")
+  expect_eq(ffi_fn(libc, "getenv", "cstr(cstr)")("GRAIN_NO_SUCH_VARIABLE"), nil)
+})
+
+test("passes and returns floats", fn () {
+  expect_eq(ffi_fn(libc, "sqrt", "f64(f64)")(144.0), 12.0)
+  expect_eq(ffi_fn(libc, "powf", "f32(f32, f32)")(2.0, 10.0), 1024.0)
+})
+
+test("calls variadic functions", fn () {
+  let snprintf = ffi_fn(libc, "snprintf", "int(bytes, u64, cstr, ...)")
+  let buf = bytes(128)
+  let n = snprintf(buf, 128, "%d %s %.3f %c", 42, "hi", 3.14159, 65)
+  expect_eq(bytes_str(buf, 0, n), "42 hi 3.142 A")
+})
+
+test("puts arguments past the registers on the stack", fn () {
+  let snprintf = ffi_fn(libc, "snprintf", "int(bytes, u64, cstr, ...)")
+  let buf = bytes(128)
+  let n = snprintf(buf, 128, "%d %d %d %d %d %d %d", 1, 2, 3, 4, 5, 6, 7)
+  expect_eq(bytes_str(buf, 0, n), "1 2 3 4 5 6 7")
+  n = snprintf(buf, 128, "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)
+  expect_eq(bytes_str(buf, 0, n), "1 2 3 4 5 6 7 8 9 10")
+})
+
+test("lets C fill a buffer grain owns", fn () {
+  let pipe = ffi_fn(libc, "pipe", "int(bytes)")
+  let fds = bytes(8)
+  expect_eq(pipe(fds), 0)
+  let r = bytes_get(fds, 0, "i32le")
+  let w = bytes_get(fds, 4, "i32le")
+  expect_eq(ffi_fn(libc, "write", "i64(int, cstr, u64)")(w, "through a pipe", 14), 14)
+  let got = bytes(32)
+  let m = ffi_fn(libc, "read", "i64(int, bytes, u64)")(r, got, 32)
+  expect_eq(bytes_str(got, 0, m), "through a pipe")
+  ffi_fn(libc, "close", "int(int)")(r)
+  ffi_fn(libc, "close", "int(int)")(w)
+})
+
+test("reads and writes raw memory", fn () {
+  let p = mem_alloc(16)
+  expect_eq(mem_write(p, bytes("raw memory!")), 11)
+  expect_eq(cstr_at(p), "raw memory!")
+  expect_eq(bytes_str(mem_read(p, 3)), "raw")
+  expect_eq(bytes_ptr(bytes(4)) != 0, true)
+  mem_free(p)
+})
+
+test("reports errno", fn () {
+  expect_eq(ffi_fn(libc, "open", "int(cstr, int)")("/no/such/file/anywhere", 0), -1)
+  expect_eq(ffi_errno(), 2)
+})
+
+test("checks its arguments before calling", fn () {
+  let f = ffi_fn(libc, "abs", "int(int)")
+  expect_error(fn () { return f("x") }, "wanted a whole number")
+  expect_error(fn () { return f(5000000000) }, "does not fit")
+  expect_error(fn () { return f(1, 2) }, "takes 1")
+  expect_error(fn () { return ffi_fn(libc, "no_such_function_anywhere", "int()") }, "no symbol")
+  expect_error(fn () { return ffi_fn(libc, "abs", "nonsense") }, "signature looks like")
+  expect_error(fn () { return ffi_fn(libc, "abs", "quux(int)") }, "unknown return type")
+})

@@ -96,6 +96,11 @@ Each directive goes on its own line:
 | `php <host:port>` or `php unix:/path.sock` | PHP-FPM FastCGI upstream. Without it the vhost serves static files only. |
 | `max_body_size <bytes>` | Refuse a larger `Content-Length` with 413. Default 0, meaning unlimited. |
 | `deny <4xx/5xx> <regex>` | Refuse paths that match (ECMAScript regex, case-insensitive, matched against the %-decoded, `//`-collapsed path) with that status. |
+| `grain <script>` | Send requests that are not a static file (or PHP) to the script's `handle(req)` - see [Serving grain](#serving-grain). The script is relative to `root` or absolute. |
+| `grain_ui <program.gr>` | Serve a grain `ui.pane` program as a web page: `GET` the page, `POST /_ui/event` for clicks and Enter, one session per browser (see [Serving a grain app](#serving-a-grain-app)). |
+| `grain_native safe` | Allow `native fn` (the memory-safe kind) in the vhost's grain scripts. Off by default. |
+| `grain_max_body <bytes>` | A request body up to this size is read before the handler runs and is `req.body`; a bigger or chunked one is streamed with `body_read()`. Default 1 MiB. `max_body_size` still bounds both (413). |
+| `grain_steps <n>` | Instructions one grain request may run before it is stopped with a 500. Default 200000000. |
 
 Vhosts that share a port share one listener. The **first vhost declared on a
 port decides** that port's `ssl` and `loopback` settings
@@ -225,6 +230,90 @@ php says hi; uri=/upload method=POST body=3000000 https=
 `php unix:/run/php/pool.sock` is the Unix-socket form.
 
 There's no generic HTTP reverse proxy: the only upstream protocol is FastCGI.
+
+### Serving grain
+
+A vhost with `grain app.gr` runs a site written in [grain](../grain/README.md).
+A request for a file that exists is served as a file as before; anything else
+goes to `handle(req)` in the script. The script's own source is never served.
+
+```grain
+fn handle(req) {
+  if req.path == "/hello" { return text("hello " + req.query.name) }
+  if req.method == "POST" { return json({"you_sent": req.form}) }
+  if req.path == "/old"   { return redirect("/hello") }
+  return {"status": 404, "headers": {"content-type": "text/plain"}, "body": "no route for " + req.path}
+}
+```
+
+`req` is a map: `method`, `path`, `target`, `query_string`, `query` (a map; a
+repeated name keeps its last value), `headers` (a map, names in lower case),
+`body` (bytes), `text` (the body as a string), `form` (a map, when the body is
+`application/x-www-form-urlencoded`), `ip`, `host`, `https`.
+
+`handle` returns a string (200, `text/html`), bytes (200,
+`application/octet-stream`), `nil` (204), or a response map `{status, headers,
+body}`. A `body` that is a list or a map is sent as JSON. `text(s)`, `json(v)`
+and `redirect(url)` build the common ones, each with an optional status
+(`redirect` defaults to 302). A header name or value with a line break in it is
+dropped, and the server sets `Content-Length` and `Connection` itself.
+
+Each request runs the script in a fresh VM, so requests share nothing but what
+they keep in files, and one that fails cannot affect another. A script may use
+the standard library and the HTTP client; its files are confined to the vhost's
+`root` (`read_file`, `write_file`, `list_dir`, ... take paths relative to it,
+and `..` or an absolute path is an error). It has no sockets, processes,
+windows, FFI or plugins. A script that fails to compile, raises an error,
+returns something that is not a response, or runs past `grain_steps` gets a
+500 whose cause goes to the log (stderr), never to the client.
+
+With `grain_native safe`, `native fn` in the script compiles to machine code and
+a handler can do its hot work at native speed (`native fn fib` is about 20x
+the VM) on `bytes` and numbers only: no `ptr`, `extern fn`, FFI or plugins.
+Native code is not counted by `grain_steps`, and native calls take turns, so
+keep native functions short. Each recompile of an edited script keeps its
+native code in memory until the server restarts.
+
+A body larger than `grain_max_body`, or sent chunked, is not read up front:
+`req.body`, `req.text` and `req.form` are `nil`, `req.streamed` is true, and the
+handler pulls it with `body_read(n)`, which returns up to n bytes and an empty
+`bytes` at the end. `body_read` works on small bodies too. The vhost's
+`max_body_size` bounds the total either way (413), and a handler that leaves
+part of a body unread gets its connection closed after the response.
+
+The compiled script is kept and reused between requests (one is lent to one
+request at a time, and the pool is dropped when the file changes), and a
+response is gzipped when the client accepts it and it is at least 256 bytes.
+`scripts/grain-web-check.sh` drives the whole thing.
+
+### Serving a grain app
+
+`grain_ui app.gr` serves a program that builds its screen with `ui.pane` (the
+same program `grain app.gr` opens as a window and `grain serve app.gr` shows
+on localhost) to browsers. A file that exists is served as a file; anything
+else is the app's page, and `/_ui/event` takes its events. The program's source
+is never served.
+
+Each browser gets its own copy of the program, tied to it by an `HttpOnly`,
+`SameSite=Strict` cookie (`Secure` over TLS). A click or Enter in the page posts
+the fields' text and the action to the server, which calls the program's own
+grain function and answers with the redrawn widgets; the page replaces them,
+keeping the focused field and its caret. A pane option `"refresh": n` makes the
+page redraw every n seconds. An event needs the header `X-Grain-UI: 1`, which a
+page on another site cannot add, so cross-site requests cannot press the app's
+buttons. The program's text is HTML-escaped, and the page carries a
+`Content-Security-Policy` that allows only its own inline script and style.
+
+The program runs with the standard library and the HTTP client and its files
+confined to the vhost's `root`, as a `grain` script does, and each event is held to `grain_steps`
+instructions. At most 256 sessions are kept (the least recently used goes) and
+one idle for 30 minutes is dropped; a session whose program file changed starts
+over on the new code. A failure is logged and the browser gets "internal server
+error". Pages and events are gzipped when the client accepts it.
+
+Only `ui.pane` programs have a web form: a pane drawn by hand with `create_pane`
+paints pixels and is window-only. Not done: sessions are not shared between
+server processes, and they are lost when the server restarts.
 
 ### TLS on the web server
 

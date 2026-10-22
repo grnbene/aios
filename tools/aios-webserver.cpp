@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -29,10 +30,13 @@
 #include "aios/hal/net.hpp"
 #include "aios/net/fastcgi_client.hpp"
 #include "aios/net/gzip.hpp"
+#include "aios/net/grain_serve.hpp"
 #include "aios/net/http_stream.hpp"
 #include "aios/net/tls.hpp"
 #include "aios/net/tls_conn.hpp"
 #include "aios/net/tls_sni.hpp"
+#include "aios/userland/grain.hpp"
+#include "aios/userland/grain_webui.hpp"
 
 using namespace aios;
 
@@ -61,6 +65,12 @@ struct VhostConfig {
   std::string php_host;   // empty = static-only vhost
   uint16_t php_port = 0;
   bool php_off = false;       // isolate PHP (503) while keeping static files live
+  // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
+  std::string grain_app;      // relative to root, or absolute; empty = no grain on this vhost
+  std::string grain_ui_app;   // `grain_ui <script>`: a ui.pane program shown as a web page, one session per browser
+  bool grain_native = false;  // `grain_native safe`: native fn (safe kind only) in this vhost's scripts
+  int64_t grain_max_body = 1 << 20;        // a request body up to this is handed over whole; a bigger one is streamed (body_read)
+  uint64_t grain_steps = 200000000;        // instructions one request may run
   bool php_lockdown = false;  // also lock disable_functions, allow_url_fopen=0, and open_basedir=root
   std::vector<std::string> php_admin_values;  // extra PHP_ADMIN_VALUE directives
   bool cors = false;
@@ -147,6 +157,18 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
             cur->php_port = uint16_t(std::atoi(hp.substr(colon + 1).c_str()));
           }
         }
+      } else if (tok == "grain") {
+        ls >> cur->grain_app;
+      } else if (tok == "grain_ui") {
+        ls >> cur->grain_ui_app;
+      } else if (tok == "grain_native") {
+        std::string mode;
+        ls >> mode;
+        cur->grain_native = mode == "safe" || mode == "on";
+      } else if (tok == "grain_max_body") {
+        ls >> cur->grain_max_body;
+      } else if (tok == "grain_steps") {
+        ls >> cur->grain_steps;
       } else if (tok == "php_off") {
         cur->php_off = true;
       } else if (tok == "php_lockdown") {
@@ -619,6 +641,188 @@ bool serve_php(hal::Connection& conn, net::ConnReader& reader, const net::HttpRe
   return true;
 }
 
+// A response whose whole body is in memory: gzip when the client takes it and it pays, a real Content-Length, the
+// vhost's headers. `close_after` says an unread request body is still on the wire. Returns false when the connection
+// must be closed.
+bool write_buffered(hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh, int status,
+                    const std::vector<std::pair<std::string, std::string>>& headers, std::vector<uint8_t> payload, bool close_after) {
+  net::HttpResponseHead rh;
+  rh.status = status;
+  rh.status_text = status == 200 ? "OK" : status == 201 ? "Created" : status == 204 ? "No Content" : status == 301 ? "Moved Permanently"
+                 : status == 302 ? "Found" : status == 303 ? "See Other" : status == 304 ? "Not Modified" : status == 400 ? "Bad Request"
+                 : status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed"
+                 : status == 409 ? "Conflict" : status == 422 ? "Unprocessable Entity" : status == 429 ? "Too Many Requests"
+                 : status >= 500 ? "Server Error" : "Status";
+  rh.headers.push_back({"X-Content-Type-Options", "nosniff"});
+  std::string content_type;
+  bool has_encoding = false;
+  for (const auto& h : headers) {
+    if (ieq(h.first, "Content-Type")) content_type = h.second;
+    if (ieq(h.first, "Content-Encoding")) has_encoding = true;
+    rh.headers.push_back({h.first, h.second});
+  }
+  // The body is already in memory, so it is compressed whole and sent with its real length.
+  if (!has_encoding && payload.size() >= 256 && !net::ResponseWriter::status_has_no_body(status)) {
+    const std::string mime = trim(content_type.substr(0, content_type.find(';')));
+    if (net::negotiate_content_encoding(head.header("Accept-Encoding").value_or(""), mime) == "gzip") {
+      net::GzipStreamEncoder gz;
+      auto packed = gz.feed(ByteSpan(payload.data(), payload.size()));
+      auto tail = gz.finish();
+      packed.insert(packed.end(), tail.begin(), tail.end());
+      if (packed.size() < payload.size()) {
+        payload.assign(packed.begin(), packed.end());
+        rh.headers.push_back({"Content-Encoding", "gzip"});
+      }
+      rh.headers.push_back({"Vary", "Accept-Encoding"});
+    }
+  }
+  if (close_after) rh.headers.push_back({"Connection", "close"});
+  apply_vhost_headers(rh, vh);
+  net::ResponseWriter w(conn, rh, int64_t(payload.size()));
+  if (head.method == "HEAD") w.suppress_body();
+  if (w.write_head() && head.method != "HEAD" && !payload.empty()) w.write_body_chunk(ByteSpan(payload.data(), payload.size()));
+  w.finish();
+  return !close_after;
+}
+
+// Hands the request to the vhost's grain script. Returns false when the connection must be closed
+// (the body was not read to its end).
+bool serve_grain(hal::Host& host, hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
+                 const VhostConfig& vh, const std::string& path_only, const std::string& query, const std::string& client_ip) {
+  net::GrainRequest req;
+  req.method = head.method;
+  req.target = head.target;
+  req.path = path_only;
+  req.query = query;
+  req.client_ip = client_ip;
+  req.host = head.header("Host").value_or(vh.server_name);
+  req.https = vh.ssl;
+  for (const auto& h : head.headers)
+    if (valid_header_token(h.name) && !has_ctl_or_nul(h.value)) req.headers.push_back({h.name, h.value});
+  // A body up to grain_max_body is read first and handed over whole (req.body). A bigger or chunked one
+  // is left on the wire and the handler pulls it with body_read(); what was read to find that out is
+  // served first. The vhost's max_body_size bounds both.
+  net::RequestBodyReader body(reader, head);
+  std::vector<uint8_t> prefix;
+  size_t prefix_at = 0;
+  int64_t consumed = 0;   // bytes the handler has been given (or buffered) so far, for max_body_size
+  bool too_large = false;
+  while (!body.done() && (int64_t)prefix.size() <= vh.grain_max_body) {
+    auto r = body.next(64 * 1024, 60000);
+    if (!r.ok()) { write_simple_response(conn, 400, "Bad Request", "the request body could not be read"); return false; }
+    if (r->empty()) break;
+    prefix.insert(prefix.end(), r->begin(), r->end());
+    if (vh.max_body_size > 0 && (int64_t)prefix.size() > vh.max_body_size) {
+      write_simple_response(conn, 413, "Payload Too Large", "body exceeds this vhost's configured limit");
+      return false;
+    }
+  }
+  const bool streamed = !body.done() || (int64_t)prefix.size() > vh.grain_max_body;
+  if (streamed) req.body_streamed = true; else req.body = prefix;
+  req.read_body = [&](size_t max, std::vector<uint8_t>& out) -> int {
+    out.clear();
+    if (prefix_at < prefix.size()) {
+      const size_t n = std::min(max, prefix.size() - prefix_at);
+      out.assign(prefix.begin() + (long)prefix_at, prefix.begin() + (long)(prefix_at + n));
+      prefix_at += n;
+      consumed += (int64_t)n;
+      return 0;
+    }
+    if (body.done()) return 0;
+    auto r = body.next(std::min<size_t>(max, 256 * 1024), 60000);
+    if (!r.ok()) return 1;
+    consumed += (int64_t)r->size();
+    if (vh.max_body_size > 0 && consumed > vh.max_body_size) { too_large = true; return 2; }
+    out.assign(r->begin(), r->end());
+    return 0;
+  };
+  net::GrainSite site;
+  site.host = &host;
+  site.root = vh.root;
+  site.app = vh.grain_app;
+  site.max_steps = vh.grain_steps;
+  net::GrainResponse res;
+  if (!net::grain_serve_request(site, req, res)) {
+    std::fprintf(stderr, "aios-webserver: %s %s: %s\n", head.method.c_str(), head.target.c_str(), res.error.c_str());
+    if (res.body_error == 2 || too_large) { write_simple_response(conn, 413, "Payload Too Large", "body exceeds this vhost's configured limit"); return false; }
+    if (res.body_error == 1) { write_simple_response(conn, 400, "Bad Request", "the request body could not be read"); return false; }
+    net::HttpResponseHead rh500;
+    rh500.status = 500;
+    rh500.status_text = "Internal Server Error";
+    rh500.headers.push_back({"Content-Type", "text/plain"});
+    rh500.headers.push_back({"X-Content-Type-Options", "nosniff"});
+    apply_vhost_headers(rh500, vh);
+    const std::string msg = "internal server error";   // the cause goes to the log, not to the client
+    net::ResponseWriter w(conn, rh500, int64_t(msg.size()));
+    if (head.method == "HEAD") w.suppress_body();
+    if (w.write_head()) w.write_body_chunk(span_of(msg));
+    w.finish();
+    return body.done();   // an unread body is still on the wire: close rather than read it as the next request
+  }
+  return write_buffered(conn, head, vh, res.status, res.headers, std::move(res.body), !body.done());
+}
+
+// One WebUi per vhost with `grain_ui`: it keeps the browser sessions.
+std::mutex g_webui_mutex;
+std::map<const VhostConfig*, std::shared_ptr<aios::userland::grain::WebUi>> g_webuis;
+
+std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const VhostConfig& vh) {
+  namespace g = aios::userland::grain;
+  std::lock_guard<std::mutex> lock(g_webui_mutex);
+  auto& slot = g_webuis[&vh];
+  if (slot) return slot;
+  const std::string app = !vh.grain_ui_app.empty() && vh.grain_ui_app[0] == '/' ? vh.grain_ui_app : vh.root + "/" + vh.grain_ui_app;
+  g::WebUi::Host h;
+  h.origin = vh.grain_ui_app;
+  h.max_steps = vh.grain_steps;
+  h.current_version = [&host, app](std::string& version, std::string& error) {
+    auto st = host.stat(app);
+    if (!st.ok() || st->is_dir) { error = "cannot read the program " + app; return false; }
+    version = std::to_string(st->mtime_ns) + ":" + std::to_string(st->size);
+    return true;
+  };
+  h.load_source = [&host, app](std::string& source, std::string& version, std::string& error) {
+    auto st = host.stat(app);
+    auto data = host.read_file(app);
+    if (!st.ok() || !data.ok()) { error = "cannot read the program " + app; return false; }
+    version = std::to_string(st->mtime_ns) + ":" + std::to_string(st->size);
+    source.assign(data->begin(), data->end());
+    return true;
+  };
+  h.setup = [&host, root = vh.root](g::Vm& vm) -> std::shared_ptr<void> {
+    auto files = net::make_rooted_files(host, root);   // the program's files stay under the vhost's root
+    vm.files = files.get();
+    g::install_core_builtins(vm);
+    g::install_http_builtins(vm);
+    return files;
+  };
+  slot = std::make_shared<g::WebUi>(std::move(h));
+  slot->log = [name = vh.server_name](const std::string& msg) { std::fprintf(stderr, "aios-webserver: %s: grain_ui: %s\n", name.c_str(), msg.c_str()); };
+  return slot;
+}
+
+// A ui.pane program for browsers: GET the page, POST /_ui/event.
+bool serve_grain_ui(hal::Host& host, hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
+                    const VhostConfig& vh, const std::string& path_only) {
+  namespace g = aios::userland::grain;
+  g::WebUi::Request req;
+  req.method = head.method;
+  req.path = path_only;
+  req.cookie = head.header("Cookie").value_or("");
+  req.xhr = head.header("X-Grain-UI").value_or("") == "1";
+  req.https = vh.ssl;
+  net::RequestBodyReader body(reader, head);
+  while (!body.done()) {   // an event is a few fields: more than 256 KiB is not one
+    auto r = body.next(64 * 1024, 60000);
+    if (!r.ok()) { write_simple_response(conn, 400, "Bad Request", "the request body could not be read"); return false; }
+    if (r->empty()) break;
+    req.body.append(reinterpret_cast<const char*>(r->data()), r->size());
+    if (req.body.size() > 256 * 1024) { write_simple_response(conn, 413, "Payload Too Large", "an event is a few fields"); return false; }
+  }
+  g::WebUi::Response res = webui_for(host, vh)->handle(req);
+  return write_buffered(conn, head, vh, res.status, res.headers, std::vector<uint8_t>(res.body.begin(), res.body.end()), false);
+}
+
 std::string percent_decode_once(const std::string& raw) {
   std::string out;
   out.reserve(raw.size());
@@ -862,7 +1066,32 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       }
     }
 
-    if (is_php) {
+    // grain: never serve the script's own source, and send what is neither a file nor PHP to its handler
+    bool is_grain = false, is_grain_ui = false;
+    if (!vh->grain_ui_app.empty()) {
+      if (ends_with_ci(path_only, ".gr")) {
+        write_simple_response(*conn, 404, "Not Found", "not found");
+        break;
+      }
+      const bool is_file = exists_as_file(host, vh->root + path_only) ||
+                           (path_only == "/" && exists_as_file(host, vh->root + "/" + vh->index));
+      is_grain_ui = !is_php && (path_only == "/_ui/event" || !is_file);
+    }
+    if (!is_grain_ui && !vh->grain_app.empty()) {
+      if (ends_with_ci(path_only, ".gr")) {
+        write_simple_response(*conn, 404, "Not Found", "not found");
+        break;
+      }
+      const bool is_file = exists_as_file(host, vh->root + path_only) ||
+                           (path_only == "/" && exists_as_file(host, vh->root + "/" + vh->index));
+      is_grain = !is_php && !is_file;
+    }
+
+    if (is_grain_ui) {
+      if (!serve_grain_ui(host, *conn, reader, head, *vh, path_only)) break;
+    } else if (is_grain) {
+      if (!serve_grain(host, *conn, reader, head, *vh, path_only, query, conn->peer())) break;
+    } else if (is_php) {
       if (is_php_rce_payload(head.target, query)) {
         write_simple_response(*conn, 403, "Forbidden", "forbidden");
         break;
@@ -910,6 +1139,11 @@ int aios_webserver_run(int argc, char** argv) {
       "    cors_max_age <seconds>         # Default: 1000\n"
       "    add_header <Name> <Value>      # Extra response header on every response\n"
       "    max_body_size <bytes>\n"
+      "    grain <script.gr>              # Requests that are not a static file or PHP go to the script's handle(req)\n"
+      "    grain_ui <program.gr>          # A ui.pane program as a web page: one session per browser, events at /_ui/event\n"
+      "    grain_native safe              # Allow native fn (memory-safe kind) in grain scripts\n"
+      "    grain_max_body <bytes>         # Default: 1 MiB. A request body up to this is req.body; a bigger one is streamed with body_read()\n"
+      "    grain_steps <n>                # Instructions one request may run. Default: 200000000\n"
       "    deny <status> <path-regex>\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
@@ -923,6 +1157,11 @@ int aios_webserver_run(int argc, char** argv) {
   if (vhosts.empty()) { std::fprintf(stderr, "no vhost blocks found in %s\n", argv[1]); return 1; }
 
   auto host = hal::make_host();
+
+  // `native fn` in a handler is compiled to machine code, so it is off unless a vhost asks, and then
+  // only the memory-safe kind (bytes, no ptr / extern / ffi).
+  for (const auto& vh : vhosts)
+    if (vh.grain_native) aios::userland::grain::set_native_policy({/*allow=*/true, /*unsafe=*/false});
 
   for (auto& vh : vhosts) {
     if (!vh.ssl) continue;

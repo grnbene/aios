@@ -1,0 +1,10 @@
+bytes_test.gr
+  ok   makes bytes from a size, a string, a list and bytes
+  ok   indexes, assigns, iterates and compares
+  ok   refuses what would corrupt memory
+  ok   reads and writes numbers at an offset in either byte order
+  ok   rejects a type with no byte order
+  ok   packs and unpacks like a struct
+  ok   copies, fills, finds and joins
+  ok   reads and writes files as bytes
+8 passed, 0 failed

@@ -594,6 +594,27 @@ StmtP Parser::statement() {
     return entity_declaration();
   }
 
+  // `native fn name(..) -> T { .. }` and `extern fn name(..) -> T` are typed code for the
+  // machine, compiled by grain_native.cpp. Take their tokens whole: the body is its own language.
+  if (t.kind == Tok::Ident && (t.text == "native" || t.text == "extern") && peek(1).kind == Tok::Fn) {
+    auto s = std::make_unique<Stmt>();
+    s->kind = StmtKind::NativeFn;
+    s->line = t.line;
+    const bool is_extern = t.text == "extern";
+    int depth = 0;
+    bool in_body = false;
+    while (!check(Tok::End)) {
+      const Token& k = peek();
+      if (is_extern && k.kind == Tok::Newline) break;
+      if (k.kind == Tok::LBrace) { ++depth; in_body = true; }
+      s->native_tokens.push_back(k);
+      advance();
+      if (k.kind == Tok::RBrace && --depth == 0 && in_body) break;
+    }
+    if (!is_extern && (!in_body || depth != 0)) error_at(t, "a native fn needs a body in { }");
+    return s;
+  }
+
   // `fn name(..) { .. }` is sugar for `let name = fn name(..) { .. }`. Naming
   // the lambda as well is what makes a stack trace say `fib` and not `<fn>`.
   if (t.kind == Tok::Fn && peek(1).kind == Tok::Ident) {

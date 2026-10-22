@@ -24,7 +24,7 @@ function(grain_case name workdir status)
             -DEXPECTED=${EXPECTED_DIR}/${name}.out -DACTUAL=${CMAKE_CURRENT_BINARY_DIR}/actual/${name}.out
             -DSTATUS=${status} -P ${RUNNER})
   set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
-    COMMAND ${CMAKE_COMMAND} -E env SDL_VIDEODRIVER=dummy ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
+    COMMAND ${CMAKE_COMMAND} -E env GRAIN_VIDEO=dummy SDL_VIDEODRIVER=dummy ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
             -DEXPECTED=${EXPECTED_DIR}/${name}.out -DSTATUS=${status} -DUPDATE=1 -P ${RUNNER}
     PARENT_SCOPE)
 endfunction()
@@ -86,12 +86,20 @@ endif()
 # Panes as windows (run_panes), driven by scripted input through SDL's own event
 # queue, headless: SDL's dummy video driver needs no screen. Only in a grain
 # built with SDL2.
-if(GRAIN_SDL2_TARGET)
+if(GRAIN_SDL2_TARGET OR GRAIN_NATIVE_DISPLAY)
   grain_case(window.panes ${CMAKE_CURRENT_SOURCE_DIR}/window 0 run panes.gr)
-  set_tests_properties(grain.window.panes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
+  set_tests_properties(grain.window.panes PROPERTIES ENVIRONMENT "GRAIN_VIDEO=dummy;SDL_VIDEODRIVER=dummy" TIMEOUT 60)
   # Face widgets (ui.*) in a pane: fields, Enter, buttons found by ui.layout, and a view that fails.
   grain_case(window.face ${CMAKE_CURRENT_SOURCE_DIR}/window 2 run face.gr)
-  set_tests_properties(grain.window.face PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
+  set_tests_properties(grain.window.face PROPERTIES ENVIRONMENT "GRAIN_VIDEO=dummy;SDL_VIDEODRIVER=dummy" TIMEOUT 60)
+endif()
+
+# Keyboard layouts on Linux's own X11 backend: a fake X server with US and Russian
+# layouts (and AltGr levels) sends key events that name the active layout.
+if(GRAIN_NATIVE_DISPLAY AND Python3_Interpreter_FOUND)
+  add_test(NAME grain.window.x11_layouts
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/window/x11_layouts.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/window/layouts.gr)
+  set_tests_properties(grain.window.x11_layouts PROPERTIES TIMEOUT 60)
 endif()
 
 # grain build: one executable from a program and its assets, run from elsewhere.
@@ -105,6 +113,46 @@ set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
 # The developer tools.
 set(TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 grain_case(tools.test ${TOOLS}/runner 1 test)
+# The bytes type and its typed reads, writes, pack and unpack.
+grain_case(lowlevel.bytes ${CMAKE_CURRENT_SOURCE_DIR}/bytes 0 test)
+# A plugin written in C++ against include/grain_plugin.h, built here and loaded by a grain
+# program that sits beside it (the test is copied next to the library it loads).
+if(NOT WIN32)
+  set(PLUGIN_DIR ${CMAKE_CURRENT_BINARY_DIR}/plugins)
+  add_library(grain_plugin_vec MODULE ${CMAKE_CURRENT_SOURCE_DIR}/../examples/plugin/vec.cpp)
+  target_include_directories(grain_plugin_vec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  set_target_properties(grain_plugin_vec PROPERTIES PREFIX "lib" CXX_VISIBILITY_PRESET hidden
+                        LIBRARY_OUTPUT_DIRECTORY ${PLUGIN_DIR})
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin_test.gr ${PLUGIN_DIR}/plugin_test.gr COPYONLY)
+  grain_case(lowlevel.plugin ${PLUGIN_DIR} 0 test)
+  set(GRAIN_PLUGIN_TARGET grain_plugin_vec)
+endif()
+# Native functions: typed code compiled to machine code (x86-64 Linux/macOS so far).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT WIN32)
+  grain_case(lowlevel.native ${CMAKE_CURRENT_SOURCE_DIR}/native 0 test)
+  grain_case(lowlevel.native_errors ${CMAKE_CURRENT_SOURCE_DIR}/native 1 check bad.gr)
+  # An unsafe program under --safe: ptr, extern fn and raw access are refused, with the reason.
+  grain_case(lowlevel.native_safe ${CMAKE_CURRENT_SOURCE_DIR}/native 1 --safe check unsafe_test.gr)
+endif()
+# A ui.pane program in a browser (`grain serve`): the protocol with Python, and the page script in a real
+# Chrome when there is one. Both start their own servers on free ports.
+if(NOT WIN32 AND Python3_Interpreter_FOUND)
+  add_test(NAME grain.web.ui COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/web_ui_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr)
+  set_tests_properties(grain.web.ui PROPERTIES TIMEOUT 60)
+  find_program(GRAIN_CHROME NAMES google-chrome chromium chromium-browser chrome)
+  if(GRAIN_CHROME)
+    add_test(NAME grain.web.browser COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/browser_test.py $<TARGET_FILE:grain> ${GRAIN_CHROME}
+             ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr ${CMAKE_CURRENT_SOURCE_DIR}/../examples/sysmon.gr)
+    set_tests_properties(grain.web.browser PROPERTIES TIMEOUT 120)
+  else()
+    message(STATUS "grain: no Chrome found, so the in-browser test (grain.web.browser) is not run")
+  endif()
+endif()
+
+# Calling C from grain (the standalone grain only; not on Windows yet).
+if(NOT WIN32)
+  grain_case(lowlevel.ffi ${CMAKE_CURRENT_SOURCE_DIR}/ffi 0 test)
+endif()
 grain_case(tools.fmt_check_clean ${TOOLS} 0 fmt --check fmt_expected.gr)
 grain_case(tools.fmt_check_dirty ${TOOLS} 1 fmt --check fmt_input.gr)
 add_test(NAME grain.tools.fmt COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> -DINPUT=${TOOLS}/fmt_input.gr
@@ -118,7 +166,7 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 # Last, so it rewrites every case above (each headless: a window case shows on SDL's dummy display).
-add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
+add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain ${GRAIN_PLUGIN_TARGET}
   COMMENT "rewriting grain/tests/expected from the current build")
 
 # Panes belong to the VM that registered them (two VMs in one process).

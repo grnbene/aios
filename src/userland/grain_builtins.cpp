@@ -58,8 +58,9 @@ Value bi_len(Vm&, std::vector<Value>& args, std::string& error) {
     case Type::Str: return Value::integer((int64_t)v.str().size());
     case Type::List: return Value::integer((int64_t)v.list_items().size());
     case Type::Map: return Value::integer((int64_t)static_cast<MapObj*>(v.obj.get())->entries.size());
+    case Type::Bytes: return Value::integer((int64_t)v.bytes_data().size());
     default:
-      error = std::string("len() wants a string, list or map, got a ") + type_name(v.type);
+      error = std::string("len() wants a string, list, map or bytes, got a ") + type_name(v.type);
       return Value::nil();
   }
 }
@@ -302,8 +303,9 @@ Value bi_replace(Vm&, std::vector<Value>& args, std::string& error) {
 Value bi_slice(Vm&, std::vector<Value>& args, std::string& error) {
   const Value& v = args[0];
   const int64_t size = v.type == Type::Str ? (int64_t)v.str().size()
+                     : v.type == Type::Bytes ? (int64_t)v.bytes_data().size()
                      : v.type == Type::List ? (int64_t)v.list_items().size() : -1;
-  if (size < 0) { error = std::string("slice() wants a string or list, got a ") + type_name(v.type); return Value::nil(); }
+  if (size < 0) { error = std::string("slice() wants a string, list or bytes, got a ") + type_name(v.type); return Value::nil(); }
   int64_t from = args.size() > 1 ? args[1].as_int() : 0;
   int64_t to = args.size() > 2 ? args[2].as_int() : size;
   if (from < 0) from += size;
@@ -311,6 +313,10 @@ Value bi_slice(Vm&, std::vector<Value>& args, std::string& error) {
   from = std::max<int64_t>(0, std::min(from, size));
   to = std::max<int64_t>(from, std::min(to, size));
   if (v.type == Type::Str) return Value::string(v.str().substr((size_t)from, (size_t)(to - from)));
+  if (v.type == Type::Bytes) {
+    const auto& d = v.bytes_data();
+    return Value::bytes(std::vector<uint8_t>(d.begin() + from, d.begin() + to));
+  }
   const auto& items = v.list_items();
   return Value::list(std::vector<Value>(items.begin() + from, items.begin() + to));
 }
@@ -5574,6 +5580,28 @@ Value bi_read_file(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::string(std::move(out));
 }
 
+// read_bytes(path) -> bytes, the file as it is (read_file's text is bytes too, but a string).
+Value bi_read_bytes(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "read_bytes")) return Value::nil();
+  Files* f = files_of(vm, error, "read_bytes");
+  if (!f) return Value::nil();
+  std::string out, why;
+  if (!f->read(args[0].str(), out, why)) { error = file_error("read_bytes", args[0].str(), why); return Value::nil(); }
+  return Value::bytes(std::vector<uint8_t>(out.begin(), out.end()));
+}
+
+// write_bytes(path, bytes) -> how many were written
+Value bi_write_bytes(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "write_bytes")) return Value::nil();
+  if (args[1].type != Type::Bytes) { error = std::string("write_bytes() wants bytes, got a ") + type_name(args[1].type); return Value::nil(); }
+  Files* f = files_of(vm, error, "write_bytes");
+  if (!f) return Value::nil();
+  const auto& d = args[1].bytes_data();
+  std::string why;
+  if (!f->write(args[0].str(), std::string(d.begin(), d.end()), false, why)) { error = file_error("write_bytes", args[0].str(), why); return Value::nil(); }
+  return Value::integer(static_cast<int64_t>(d.size()));
+}
+
 Value write_or_append(Vm& vm, std::vector<Value>& args, std::string& error, bool append) {
   const char* who = append ? "append_file" : "write_file";
   if (!want_str(args[0], error, who)) return Value::nil();
@@ -5758,6 +5786,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_global("PI", Value::real(3.14159265358979323846));
   vm.define_global("E", Value::real(2.71828182845904523536));
   install_hash_builtins(vm);
+  install_bytes_builtins(vm);
   install_regex_builtins(vm);
   install_time_builtins(vm);
   install_text_builtins(vm);
@@ -6070,6 +6099,8 @@ void install_core_builtins(Vm& vm) {
   // Files (through Vm::files - see grain.hpp)
   vm.define_native("read_file", 1, 1, bi_read_file);
   vm.define_native("write_file", 2, 2, bi_write_file);
+  vm.define_native("read_bytes", 1, 1, bi_read_bytes);
+  vm.define_native("write_bytes", 2, 2, bi_write_bytes);
   vm.define_native("append_file", 2, 2, bi_append_file);
   vm.define_native("list_dir", 0, 1, bi_list_dir);
   vm.define_native("delete_file", 1, 1, bi_delete_file);

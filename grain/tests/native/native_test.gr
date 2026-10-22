@@ -1,0 +1,288 @@
+# native fn: typed code compiled to machine code, checked against the same code run by the VM.
+
+native fn add(a: i64, b: i64) -> i64 { return a + b }
+native fn fib(n: i64) -> i64 {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+fn vm_fib(n) { if n < 2 { return n } return vm_fib(n - 1) + vm_fib(n - 2) }
+
+native fn arith(a: i64, b: i64) -> i64 {
+  return (a * b - a % b) % 1000 + (a & b) + (a | b) + (a ^ b) - ~a
+}
+fn vm_arith(a, b) { return (a * b - a % b) % 1000 + (a & b) + (a | b) + (a ^ b) - ~a }
+
+native fn shifts(x: i64, n: i64) -> i64 { return (x << n) - (x >> n) }
+fn vm_shifts(x, n) { return (x << n) - (x >> n) }
+
+native fn divide(a: i64, b: i64) -> i64 { return a / b }
+native fn modulo(a: i64, b: i64) -> i64 { return a % b }
+native fn neg(a: i64) -> i64 { return -a }
+
+native fn cmp_i(a: i64, b: i64) -> i64 {
+  let r = 0
+  if a < b { r += 1 }
+  if a <= b { r += 2 }
+  if a > b { r += 4 }
+  if a >= b { r += 8 }
+  if a == b { r += 16 }
+  if a != b { r += 32 }
+  return r
+}
+fn vm_cmp(a, b) {
+  let r = 0
+  if a < b { r += 1 }
+  if a <= b { r += 2 }
+  if a > b { r += 4 }
+  if a >= b { r += 8 }
+  if a == b { r += 16 }
+  if a != b { r += 32 }
+  return r
+}
+
+native fn logic(a: bool, b: bool) -> bool { return (a and not b) or (b and not a) }
+
+native fn flt(x: f64, y: f64) -> f64 { return (x + y) * (x - y) / 2.0 + sqrt(y) - fabs(-x) }
+native fn cmp_f(a: f64, b: f64) -> i64 {
+  let r = 0
+  if a < b { r += 1 }
+  if a <= b { r += 2 }
+  if a > b { r += 4 }
+  if a >= b { r += 8 }
+  if a == b { r += 16 }
+  if a != b { r += 32 }
+  return r
+}
+native fn casts(x: f64, n: i64) -> f64 { return (x as i64) as f64 + n as f64 / 4.0 }
+
+native fn loops(n: i64) -> i64 {
+  let total = 0
+  for i in 0..n {
+    if i % 2 == 0 { continue }
+    if i > 15 { break }
+    for j in 0..i { total += j }
+  }
+  let k = 0
+  while true {
+    k += 1
+    if k >= 10 { break }
+  }
+  return total * 100 + k
+}
+fn vm_loops(n) {
+  let total = 0
+  for i in range(0, n) {
+    if i % 2 == 0 { continue }
+    if i > 15 { break }
+    for j in range(0, i) { total += j }
+  }
+  let k = 0
+  while true {
+    k += 1
+    if k >= 10 { break }
+  }
+  return total * 100 + k
+}
+
+native fn elseif(x: i64) -> i64 {
+  if x < 0 { return -1 } else if x == 0 { return 0 } else { return 1 }
+}
+native fn shadow(x: i64) -> i64 {
+  let y = x
+  if x > 0 {
+    let y = 100
+    return y
+  }
+  return y
+}
+
+# working on bytes
+native fn checksum(b: bytes) -> i64 {
+  let h = 0
+  let i = 0
+  while i < b.len {
+    h = (h * 31 + b[i]) & 0xFFFFFFFF
+    i += 1
+  }
+  return h
+}
+native fn fill_ramp(b: bytes, step: i64) -> i64 {
+  for i in 0..b.len { b[i] = (i * step) & 255 }
+  return b.len
+}
+native fn put_get(b: bytes) -> i64 {
+  wr32(b, 0, 0xCAFEBABE)
+  wr16(b, 4, 0xBEEF)
+  wr64(b, 8, -2)
+  wrf64(b, 16, 2.5)
+  wr8(b, 24, 200)
+  return rd32(b, 0) + rd16(b, 4) + rd64(b, 8) + rdi8(b, 24) + (rdf64(b, 16) as i64)
+}
+native fn signed_reads(b: bytes) -> i64 { return rdi8(b, 0) * 1000000 + rdi16(b, 0) * 1000 + rdi32(b, 0) % 1000 }
+native fn past_end(b: bytes, i: i64) -> i64 { return b[i] }
+native fn write_past(b: bytes, i: i64, v: i64) -> i64 { b[i] = v return 0 }
+native fn rd_past(b: bytes, off: i64) -> i64 { return rd32(b, off) }
+native fn wr_past(b: bytes, off: i64) -> i64 { wr64(b, off, 1) return 0 }
+
+# many arguments: past the six integer registers and the eight float registers
+native fn many_ints(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64) -> i64 {
+  return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9
+}
+native fn many_floats(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64, j: f64) -> f64 {
+  return a + b * 2.0 + c * 3.0 + d * 4.0 + e * 5.0 + f * 6.0 + g * 7.0 + h * 8.0 + i * 9.0 + j * 10.0
+}
+native fn mixed(a: i64, x: f64, b: bytes, c: i64, y: f64) -> f64 { return a as f64 * x + b.len as f64 + c as f64 * y }
+native fn calls_many(n: i64) -> i64 {
+  return many_ints(n, n + 1, n + 2, n + 3, n + 4, n + 5, n + 6, n + 7, n + 8) + (many_floats(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0) as i64)
+}
+native fn through(b: bytes, k: i64) -> i64 { return checksum(b) + k }
+
+native fn forever(n: i64) -> i64 { return forever(n + 1) + 1 }
+
+test("adds, recurses and agrees with the VM on fib", fn () {
+  expect_eq(add(40, 2), 42)
+  expect_eq(fib(20), vm_fib(20))
+  expect_eq(neg(5), -5)
+})
+
+test("wraps on overflow", fn () {
+  expect_eq(add(9223372036854775807, 1), -9223372036854775807 - 1)
+})
+
+test("agrees with the VM on integer arithmetic over a grid", fn () {
+  for a in [-1000, -17, -1, 0, 1, 5, 17, 99, 4096] {
+    for b in [-13, -1, 1, 2, 7, 64, 255] {
+      expect_eq(arith(a, b), vm_arith(a, b), "arith(" + str(a) + ", " + str(b) + ")")
+      expect_eq(cmp_i(a, b), vm_cmp(a, b))
+    }
+  }
+})
+
+test("agrees with the VM on shifts, counts past 63 included", fn () {
+  for x in [-8, -1, 0, 1, 3, 1000, 4611686018427387904] {
+    for n in [0, 1, 4, 31, 32, 62, 63, 64, 99, 200] {
+      expect_eq(shifts(x, n), vm_shifts(x, n), "shifts(" + str(x) + ", " + str(n) + ")")
+    }
+  }
+})
+
+test("divides and takes remainders, INT64_MIN / -1 included", fn () {
+  expect_eq(divide(7, 2), 3)
+  expect_eq(divide(-7, 2), -3)
+  expect_eq(modulo(7, 3), 1)
+  expect_eq(modulo(-7, 3), -1)
+  expect_eq(divide(-9223372036854775807 - 1, -1), -9223372036854775807 - 1)
+  expect_eq(modulo(-9223372036854775807 - 1, -1), 0)
+})
+
+test("stops with an error, not a crash, on division by zero", fn () {
+  expect_error(fn () { return divide(1, 0) }, "division by zero")
+  expect_error(fn () { return modulo(1, 0) }, "division by zero")
+  expect_eq(divide(8, 2), 4)   # and keeps working afterwards
+})
+
+test("combines bools", fn () {
+  expect_eq(logic(true, false), true)
+  expect_eq(logic(true, true), false)
+  expect_eq(logic(false, false), false)
+  expect_eq(logic(false, true), true)
+})
+
+test("does floating point, and NaN compares false", fn () {
+  expect_eq(flt(5.0, 3.0), (5.0 + 3.0) * (5.0 - 3.0) / 2.0 + sqrt(3.0) - 5.0)
+  expect_eq(cmp_f(1.0, 2.0), 1 + 2 + 32)
+  expect_eq(cmp_f(2.0, 2.0), 2 + 8 + 16)
+  expect_eq(cmp_f(3.5, 2.0), 4 + 8 + 32)
+  expect_eq(cmp_f(-1.5, -1.5), 2 + 8 + 16)
+  expect_eq(casts(7.9, 6), 7.0 + 1.5)
+  expect_eq(casts(-7.9, 2), -7.0 + 0.5)
+})
+
+test("a NaN is unordered", fn () {
+  let nan = 0.0 * (1e308 * 10.0)       # inf * 0
+  expect_eq(cmp_f(nan, 1.0), 32)
+  expect_eq(cmp_f(1.0, nan), 32)
+  expect_eq(cmp_f(nan, nan), 32)
+})
+
+test("loops with break and continue, as the VM runs them", fn () {
+  for n in [0, 1, 2, 5, 16, 40, 100] { expect_eq(loops(n), vm_loops(n)) }
+})
+
+test("else-if chains and shadowing", fn () {
+  expect_eq([elseif(-5), elseif(0), elseif(9)], [-1, 0, 1])
+  expect_eq(shadow(5), 100)
+  expect_eq(shadow(-5), -5)
+})
+
+test("sums bytes with a checksum", fn () {
+  let h = 0
+  for c in bytes("hello world") { h = (h * 31 + c) & 4294967295 }
+  expect_eq(checksum(bytes("hello world")), h)
+  expect_eq(checksum(bytes(0)), 0)
+})
+
+test("fills the callers bytes", fn () {
+  let b = bytes(6)
+  expect_eq(fill_ramp(b, 100), 6)
+  expect_eq(bytes_hex(b), "0064c82c90f4")   # i * 100 & 255
+})
+
+test("reads and writes typed values in bytes, little endian", fn () {
+  let b = bytes(32)
+  expect_eq(put_get(b), 3405691582 + 48879 + -2 + -56 + 2)
+  expect_eq(bytes_get(b, 0, "u32le"), 3405691582)
+  expect_eq(bytes_get(b, 8, "i64le"), -2)
+  expect_eq(bytes_get(b, 16, "f64le"), 2.5)
+  expect_eq(bytes_get(b, 24, "u8"), 200)
+})
+
+test("reads signed values", fn () {
+  let b = bytes([0xFF, 0xFF, 0xFF, 0xFF])
+  expect_eq(signed_reads(b), -1 * 1000000 + -1 * 1000 + -1)
+})
+
+test("checks every access to bytes", fn () {
+  let b = bytes(8)
+  expect_error(fn () { return past_end(b, 8) }, "outside the bytes")
+  expect_error(fn () { return past_end(b, -1) }, "outside the bytes")
+  expect_error(fn () { return write_past(b, 8, 1) }, "outside the bytes")
+  expect_error(fn () { return write_past(b, 0, 256) }, "0 to 255")
+  expect_error(fn () { return write_past(b, 0, -1) }, "0 to 255")
+  expect_error(fn () { return rd_past(b, 5) }, "outside the bytes")
+  expect_error(fn () { return rd_past(b, -1) }, "outside the bytes")
+  expect_error(fn () { return wr_past(b, 1) }, "outside the bytes")
+  expect_eq(rd_past(bytes([1, 0, 0, 0, 9]), 1), 9 * 16777216)   # bytes 1..4, little endian
+  expect_eq(past_end(b, 7), 0)
+  expect_eq(rd_past(b, 4), 0)
+})
+
+test("passes more arguments than registers hold", fn () {
+  expect_eq(many_ints(1, 2, 3, 4, 5, 6, 7, 8, 9), 1 + 4 + 9 + 16 + 25 + 36 + 49 + 64 + 81)
+  expect_eq(many_floats(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0), 385.0)
+  expect_eq(mixed(3, 1.5, bytes(10), 4, 0.25), 3 * 1.5 + 10 + 4 * 0.25)
+  expect_eq(calls_many(0), (0 * 1 + 1 * 2 + 2 * 3 + 3 * 4 + 4 * 5 + 5 * 6 + 6 * 7 + 7 * 8 + 8 * 9) + 385)
+  expect_eq(through(bytes("hello world"), 1), checksum(bytes("hello world")) + 1)
+})
+
+test("stops runaway recursion instead of crashing", fn () {
+  expect_error(fn () { return forever(0) }, "too deep")
+  expect_eq(add(1, 2), 3)
+})
+
+test("checks its arguments from grain", fn () {
+  expect_error(fn () { return add("1", 2) }, "wanted a whole number")
+  expect_error(fn () { return add(1.5, 2) }, "wanted a whole number")
+  expect_error(fn () { return add(1) }, "takes 2")
+  expect_error(fn () { return checksum("text") }, "wanted bytes")
+  expect_error(fn () { return logic(1, 0) }, "true or false")
+})
+
+test("is faster than the VM", fn () {
+  let t0 = time_us()
+  vm_fib(24)
+  let t1 = time_us()
+  fib(24)
+  let t2 = time_us()
+  expect_eq((t2 - t1) < (t1 - t0), true)
+})

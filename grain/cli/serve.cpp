@@ -1,0 +1,147 @@
+// A small HTTP/1.1 server for one program: GET the page, POST its events. Each connection is
+// handled on its own thread and closed after the response; WebUi keeps the sessions.
+#include "serve.hpp"
+
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+#include "aios/userland/grain_webui.hpp"
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+namespace grain_cli {
+
+namespace g = aios::userland::grain;
+
+#if defined(_WIN32)
+
+int serve_ui(const std::string&, std::function<bool(std::string&, std::string&, std::string&)>, std::function<void(g::Vm&)>, const ServeOptions&) {
+  std::cerr << "grain: serving to a browser is not available on Windows yet\n";
+  return 2;
+}
+
+#else
+
+namespace {
+
+bool read_request(int fd, std::string& head, std::string& body) {
+  std::string buf;
+  char tmp[4096];
+  size_t end = std::string::npos;
+  while ((end = buf.find("\r\n\r\n")) == std::string::npos) {
+    if (buf.size() > 64 * 1024) return false;
+    const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
+    if (n <= 0) return false;
+    buf.append(tmp, (size_t)n);
+  }
+  head = buf.substr(0, end);
+  body = buf.substr(end + 4);
+  // Content-Length, case-insensitively
+  size_t want = 0;
+  std::string lower = head;
+  for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+  const size_t cl = lower.find("\r\ncontent-length:");
+  if (cl != std::string::npos) want = (size_t)std::strtoull(head.c_str() + cl + 17, nullptr, 10);
+  if (want > 1 << 20) return false;
+  while (body.size() < want) {
+    const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
+    if (n <= 0) return false;
+    body.append(tmp, (size_t)n);
+  }
+  body.resize(want);
+  return true;
+}
+
+std::string header_of(const std::string& head, const char* name) {
+  std::string lower = head;
+  for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+  const std::string key = std::string("\r\n") + name + ":";
+  const size_t at = lower.find(key);
+  if (at == std::string::npos) return "";
+  size_t b = at + key.size();
+  while (b < head.size() && head[b] == ' ') ++b;
+  const size_t e = head.find("\r\n", b);
+  return head.substr(b, e == std::string::npos ? std::string::npos : e - b);
+}
+
+void send_all(int fd, const std::string& data) {
+  size_t off = 0;
+  while (off < data.size()) {
+    const ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+    if (n <= 0) return;
+    off += (size_t)n;
+  }
+}
+
+void answer(int fd, g::WebUi& ui) {
+  std::string head, body;
+  if (!read_request(fd, head, body)) { ::close(fd); return; }
+  const size_t sp1 = head.find(' '), sp2 = head.find(' ', sp1 + 1);
+  g::WebUi::Request req;
+  req.method = head.substr(0, sp1);
+  std::string target = sp1 == std::string::npos || sp2 == std::string::npos ? "/" : head.substr(sp1 + 1, sp2 - sp1 - 1);
+  req.path = target.substr(0, target.find('?'));
+  req.cookie = header_of(head, "cookie");
+  req.xhr = header_of(head, "x-grain-ui") == "1";
+  req.body = body;
+  g::WebUi::Response res;
+  if (req.path == "/favicon.ico") { res.status = 204; }
+  else res = ui.handle(req);
+  const char* reason = res.status == 200 ? "OK" : res.status == 204 ? "No Content" : res.status == 403 ? "Forbidden" : res.status == 405 ? "Method Not Allowed" : "Error";
+  std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason + "\r\n";
+  for (const auto& h : res.headers) out += h.first + ": " + h.second + "\r\n";
+  out += "Content-Length: " + std::to_string(res.body.size()) + "\r\nConnection: close\r\n\r\n";
+  if (req.method != "HEAD") out += res.body;
+  send_all(fd, out);
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
+}
+
+}  // namespace
+
+int serve_ui(const std::string& name,
+             std::function<bool(std::string&, std::string&, std::string&)> load_source,
+             std::function<void(g::Vm&)> setup, const ServeOptions& opt) {
+  g::WebUi::Host host;
+  host.origin = name;
+  host.show_errors = opt.show_errors;
+  host.load_source = load_source;
+  host.current_version = [load_source](std::string& version, std::string& error) {
+    std::string source;
+    return load_source(source, version, error);   // a program on disk is small; reading it is the version check
+  };
+  host.setup = [setup](g::Vm& vm) -> std::shared_ptr<void> { setup(vm); return nullptr; };
+  auto ui = std::make_shared<g::WebUi>(std::move(host));
+
+  const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0) { std::cerr << "grain: cannot open a socket\n"; return 2; }
+  const int yes = 1;
+  ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+  sockaddr_in addr;
+  std::memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)opt.port);
+  if (::inet_pton(AF_INET, opt.host.c_str(), &addr.sin_addr) != 1) { std::cerr << "grain: " << opt.host << " is not an IPv4 address\n"; return 64; }
+  if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || ::listen(listener, 64) != 0) {
+    std::cerr << "grain: cannot listen on " << opt.host << ":" << opt.port << "\n";
+    return 2;
+  }
+  std::cout << "grain: " << name << " is at http://" << opt.host << ":" << opt.port << "/  (Ctrl-C to stop)\n" << std::flush;
+  for (;;) {
+    const int fd = ::accept(listener, nullptr, nullptr);
+    if (fd < 0) continue;
+    std::thread([fd, ui]() { answer(fd, *ui); }).detach();
+  }
+}
+
+#endif
+
+}  // namespace grain_cli

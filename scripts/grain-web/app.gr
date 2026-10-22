@@ -1,0 +1,46 @@
+# A small site written in grain.
+native fn fib(n: i64) -> i64 {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+fn handle(req) {
+  let p = req.path
+  if p == "/hello" {
+    let who = req.query.name
+    return text("hello " + (who == nil ? "world" : who))
+  }
+  if p == "/echo" {
+    return json({"method": req.method, "query": req.query, "form": req.form, "len": len(req.body), "ua": req.headers["user-agent"]})
+  }
+  if p == "/fib" { return text(str(fib(int(req.query.n)))) }
+  if p == "/old" { return redirect("/hello") }
+  if p == "/count" {
+    let n = 0
+    if file_exists("data/count") { n = int(read_file("data/count")) }
+    write_file("data/count", str(n + 1))
+    return {"status": 200, "headers": {"x-count": str(n + 1)}, "body": "visits: " + str(n + 1)}
+  }
+  if p == "/upload" {
+    let total = 0
+    while true {
+      let chunk = body_read(4096)
+      if len(chunk) == 0 { break }
+      total += len(chunk)
+    }
+    return json({"streamed": req.streamed, "bytes": total, "body_is_nil": req.body == nil})
+  }
+  if p == "/big" {
+    let s = ""
+    for i in range(0, 500) { s = s + "0123456789" }
+    return text(s)
+  }
+  if p == "/escape" { return read_file("../app.gr") }
+  if p == "/boom" { return 1 / 0 }
+  if p == "/loop" { while true { } }
+  if p == "/crlf" { return {"headers": {"x-evil": "a\r\nSet-Cookie: pwned=1"}, "body": "ok"} }
+  if p == "/bytes" { return bytes([72, 105, 0, 255]) }
+  if p == "/none" { return nil }
+  if p == "/list" { return {"status": 201, "body": [1, 2, {"a": true}]} }
+  return {"status": 404, "headers": {"content-type": "text/plain"}, "body": "no route for " + p}
+}
