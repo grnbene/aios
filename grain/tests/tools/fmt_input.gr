@@ -1,0 +1,22 @@
+# grain fmt fixture: everything here is laid out wrong on purpose.
+fn area(w, h) {
+      return w * h   
+}
+let shapes = [
+{"w": 2, "h": 3},
+      {"w": 4, "h": 5}
+]
+
+
+
+for s in shapes {
+if area(s.w, s.h) > 10 {
+print("big:", s.w, "x", s.h)
+} else {
+    print("small:", "#not a comment", s.w)   # a real comment { with a brace
+}
+}
+let text = "a long string " +
+"continued " +
+"over three lines"
+print(text)

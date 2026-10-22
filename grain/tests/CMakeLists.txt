@@ -99,6 +99,21 @@ add_test(NAME grain.build.hello COMMAND ${CMAKE_COMMAND} ${BUILD_ARGS} -P ${CMAK
 set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
   COMMAND ${CMAKE_COMMAND} ${BUILD_ARGS} -DUPDATE=1 -P ${CMAKE_CURRENT_SOURCE_DIR}/run_build.cmake)
 
+# The developer tools.
+set(TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+grain_case(tools.test ${TOOLS}/runner 1 test)
+grain_case(tools.fmt_check_clean ${TOOLS} 0 fmt --check fmt_expected.gr)
+grain_case(tools.fmt_check_dirty ${TOOLS} 1 fmt --check fmt_input.gr)
+add_test(NAME grain.tools.fmt COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> -DINPUT=${TOOLS}/fmt_input.gr
+         -DEXPECTED=${TOOLS}/fmt_expected.gr -DWORK=${CMAKE_CURRENT_BINARY_DIR}/work/tools.fmt -P ${TOOLS}/run_fmt.cmake)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME grain.tools.lsp COMMAND ${CMAKE_COMMAND} -DGRAIN=${Python3_EXECUTABLE} "-DARGS=${TOOLS}/lsp_client.py@@$<TARGET_FILE:grain>"
+           -DWORKDIR=${TOOLS} -DEXPECTED=${EXPECTED_DIR}/tools.lsp.out -DSTATUS=0 -P ${RUNNER})
+  set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
+    COMMAND ${CMAKE_COMMAND} -DGRAIN=${Python3_EXECUTABLE} "-DARGS=${TOOLS}/lsp_client.py@@$<TARGET_FILE:grain>"
+            -DWORKDIR=${TOOLS} -DEXPECTED=${EXPECTED_DIR}/tools.lsp.out -DSTATUS=0 -DUPDATE=1 -P ${RUNNER})
+endif()
+
 # Last, so it rewrites every case above (each headless: a window case shows on SDL's dummy display).
 add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
   COMMENT "rewriting grain/tests/expected from the current build")

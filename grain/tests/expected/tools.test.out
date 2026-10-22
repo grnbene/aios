@@ -1,0 +1,11 @@
+math_test.gr
+  ok   adds
+  FAIL wrong on purpose: expected 5, got 4 (two and two)
+  ok   errors are caught
+  FAIL a program error fails the test: cannot call a nil -- only a function or a native is callable
+  ok   runs after a failure
+sub/broken_test.gr
+  FAIL sub/broken_test.gr:1: expected a name after let
+sub/deep_test.gr
+  ok   nested dir
+4 passed, 3 failed

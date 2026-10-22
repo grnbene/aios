@@ -26,6 +26,7 @@
 
 #include "aios/userland/grain.hpp"
 #include "bundle.hpp"
+#include "tools.hpp"
 #include "grain_net.hpp"
 #include "host.hpp"
 #if defined(GRAIN_HAVE_SDL2)
@@ -58,6 +59,9 @@ void usage(std::ostream& o) {
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
     << "  grain build <file.gr> [-o out]    make one executable of the program (see grain build)\n"
+    << "  grain test [file | dir]...        run the tests in *_test.gr files\n"
+    << "  grain fmt [--check] <file | dir>  lay source out the one grain way\n"
+    << "  grain lsp                         a language server for editors, on stdin/stdout\n"
     << "  grain version                     print the version\n"
     << "\n"
     << "options (before the subcommand):\n"
@@ -98,6 +102,14 @@ void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& scri
   vm.step_limit = opt.steps;
   vm.jit_enabled = opt.jit;
 }
+
+}  // namespace
+
+namespace grain_cli {
+void prepare_vm(g::Vm& vm, const std::vector<std::string>& script_args) { prepare(vm, Options{}, script_args); }
+}  // namespace grain_cli
+
+namespace {
 
 int run_file(const Options& opt, const std::string& path, const std::vector<std::string>& script_args) {
   std::string source;
@@ -237,6 +249,9 @@ int main(int argc, char** argv) {
     return check_files(rest);
   }
   if (sub == "build") return grain_cli::build_command(rest);
+  if (sub == "test") return grain_cli::test_command(rest);
+  if (sub == "fmt") return grain_cli::fmt_command(rest);
+  if (sub == "lsp") return grain_cli::lsp_command(rest);
   if (sub == "dis") {
     if (rest.size() != 1) { std::cerr << "grain dis <file.gr>\n"; return kExitUsage; }
     return disassemble(rest[0]);

@@ -305,6 +305,8 @@ class Vm {
   void define_native(const std::string& name, int min_args, int max_args, NativeFn fn);
   void define_global(const std::string& name, Value v);
   Value* find_global(const std::string& name);
+  // Every global's name, sorted (what an editor offers to complete).
+  std::vector<std::string> global_names() const;
   // Drops every global not named in `keep`: a sandbox, since what a program
   // cannot name it cannot call. Only before the first run - the global inline
   // cache assumes globals are never erased once a chunk has looked one up.

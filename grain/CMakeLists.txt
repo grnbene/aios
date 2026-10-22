@@ -59,6 +59,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/x509.cpp
   ${AIOS_ROOT}/src/core/base64.cpp
   ${AIOS_ROOT}/src/core/result.cpp
+  ${AIOS_ROOT}/src/core/json.cpp
   ${AIOS_ROOT}/src/userland/grain_sockets.cpp
   ${AIOS_ROOT}/src/crypto/sha256.cpp
   ${AIOS_ROOT}/src/crypto/sha1.cpp
@@ -108,7 +109,7 @@ else()
   target_compile_options(grain_lang PRIVATE -Wall -Wno-unused-parameter)
 endif()
 
-add_executable(grain cli/main.cpp cli/host.cpp cli/bundle.cpp)
+add_executable(grain cli/main.cpp cli/host.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
 target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli)
 target_link_libraries(grain PRIVATE grain_lang)
 

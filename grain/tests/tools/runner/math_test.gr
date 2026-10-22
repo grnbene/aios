@@ -1,0 +1,7 @@
+# grain test fixture: passing and failing tests, an error caught, a test after a failure.
+fn add(a, b) { return a + b }
+test("adds", fn () { expect_eq(add(2, 3), 5) })
+test("wrong on purpose", fn () { expect_eq(add(2, 2), 5, "two and two") })
+test("errors are caught", fn () { expect_error(fn () { return upper(nil) }, "wants a string") })
+test("a program error fails the test", fn () { let x = nil  x() })
+test("runs after a failure", fn () { expect(add(1, 1) == 2) })

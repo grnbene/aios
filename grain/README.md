@@ -86,6 +86,53 @@ per-user directory (`~/Library/Caches/grain`, `~/.cache/grain`,
 `%LOCALAPPDATA%\grain`) when you put one there, otherwise the system's store
 (on Windows, exported there from the system's root certificates).
 
+## Tools
+
+```
+grain test [file | dir]...        run every *_test.gr: each test on its own, failures with their message
+grain fmt [--check] <file | dir>  lay source out the one grain way (in place; --check only lists)
+grain lsp                         a language server: diagnostics, formatting, symbols, completion
+```
+
+A test file registers tests and states what must hold:
+
+```grain
+test("parses ISO dates", fn () {
+  expect_eq(date_format(date_parse("2026-10-22T14:05:09Z"), "%F", "utc"), "2026-10-22")
+})
+test("refuses nonsense", fn () { expect_error(fn () { return date_parse("soon") }, "ISO 8601") })
+```
+
+`grain fmt` indents two spaces a bracket level (brackets opened together share
+one), hangs a continued expression one level, trims trailing space and long
+runs of blank lines, and never touches strings or comments. It rewrites a file
+only when the result compiles to exactly the same program, so it cannot
+change what a program does; one that does not compile is reported and left alone.
+
+`grain lsp` works with any editor's LSP client. For Neovim (0.10+):
+
+```lua
+vim.filetype.add({ extension = { gr = "grain" } })
+vim.api.nvim_create_autocmd("FileType", { pattern = "grain", callback = function()
+  vim.lsp.start({ name = "grain", cmd = { "grain", "lsp" } })
+end })
+```
+
+For Helix (`languages.toml`):
+
+```toml
+[language-server.grain]
+command = "grain"
+args = ["lsp"]
+
+[[language]]
+name = "grain"
+scope = "source.grain"
+file-types = ["gr"]
+comment-token = "#"
+language-servers = ["grain"]
+```
+
 ## Shipping a program
 
 ```
@@ -169,6 +216,6 @@ standalone grain has the portable standard library only.
 | interpreter | yes | yes | yes | yes | yes |
 | JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
-Built and tested so far: macOS arm64 (51 of 51 cases, a signed .app passing strict verification, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
+Built and tested so far: macOS arm64 (56 of 56 cases, a signed .app passing strict verification, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
 (this README, `.github/workflows/grain.yml`, `scripts/build-linux.sh`) and not
 yet built.
