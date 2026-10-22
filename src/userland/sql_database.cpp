@@ -46541,7 +46541,12 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       SqlQueryResult res;
       res.is_result_set = true;
       res.columns = {"View", "Create View", "character_set_client", "collation_connection"};
-      std::string create_sql = "CREATE ALGORITHM=" + v->algorithm + " DEFINER=" + v->definer + " SQL SECURITY " + v->security + " VIEW `" + v->name + "` AS " + v->query_sql;
+      std::string definer_q = v->definer;
+      if (definer_q.find('`') == std::string::npos) {   // DEFINER=`user`@`host`, as MariaDB prints it
+        const size_t at = definer_q.find('@');
+        definer_q = at == std::string::npos ? "`" + definer_q + "`" : "`" + definer_q.substr(0, at) + "`@`" + definer_q.substr(at + 1) + "`";
+      }
+      std::string create_sql = "CREATE ALGORITHM=" + v->algorithm + " DEFINER=" + definer_q + " SQL SECURITY " + v->security + " VIEW `" + v->name + "` AS " + v->query_sql;
       res.rows.push_back(SqlRow{{v->name, create_sql, "utf8mb4", "utf8mb4_general_ci"}});
       res.rows_affected = 1;
       res.formatted_table = create_sql + "\n";
@@ -46555,7 +46560,12 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       SqlQueryResult res;
       res.is_result_set = true;
       res.columns = {"View", "Create View", "character_set_client", "collation_connection"};
-      std::string create_sql = "CREATE ALGORITHM=" + v->algorithm + " DEFINER=" + v->definer + " SQL SECURITY " + v->security + " VIEW `" + v->name + "` AS " + v->query_sql;
+      std::string definer_q = v->definer;
+      if (definer_q.find('`') == std::string::npos) {   // DEFINER=`user`@`host`, as MariaDB prints it
+        const size_t at = definer_q.find('@');
+        definer_q = at == std::string::npos ? "`" + definer_q + "`" : "`" + definer_q.substr(0, at) + "`@`" + definer_q.substr(at + 1) + "`";
+      }
+      std::string create_sql = "CREATE ALGORITHM=" + v->algorithm + " DEFINER=" + definer_q + " SQL SECURITY " + v->security + " VIEW `" + v->name + "` AS " + v->query_sql;
       res.rows.push_back(SqlRow{{v->name, create_sql, "utf8mb4", "utf8mb4_general_ci"}});
       res.rows_affected = 1;
       res.formatted_table = create_sql + "\n";
@@ -47420,6 +47430,13 @@ Result<std::string> SqlDatabase::table_ddl(const std::string& name, const std::s
     if (c.is_primary_key) keys.push_back(c.name);
     lines.push_back(std::move(l));
   }
+  for (const auto& ix : t->indices)   // declared order: PRIMARY KEY (b, a) prints b, a
+    if (lower_of(ix.name) == "primary" && ix.columns.size() == keys.size() && !keys.empty()) {
+      bool all = true;
+      for (const auto& cn : ix.columns) if (std::find_if(keys.begin(), keys.end(), [&](const std::string& k) { return lower_of(k) == lower_of(cn); }) == keys.end()) all = false;
+      if (all) keys = ix.columns;
+      break;
+    }
   if (!keys.empty()) {
     std::string l = "  PRIMARY KEY (";
     for (size_t i = 0; i < keys.size(); ++i) l += (i ? "," : "") + std::string("`") + keys[i] + "`";
