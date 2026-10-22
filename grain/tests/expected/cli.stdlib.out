@@ -1,0 +1,86 @@
+regex
+  ok    test
+  ok    test no
+  ok    ignore case
+  ok    match text
+  ok    match start
+  ok    match end
+  ok    groups
+  ok    no match is nil
+  ok    named
+  ok    unmatched group is nil
+  ok    find_all
+  ok    replace all
+  ok    replace groups
+  ok    replace named
+  ok    replace $& and $$
+  ok    replace with fn
+  ok    split
+  ok    split empty pattern
+  ok    empty matches advance
+  ok    utf-8 offsets are bytes
+  ok    unicode class
+  ok    bad pattern is an error
+  ok    bad flag is an error
+time
+  ok    epoch parts
+  ok    parse Z
+  ok    format back
+  ok    offset parsed
+  ok    date only is midnight utc
+  ok    parts
+  ok    leap day yearday
+  ok    make utc
+  ok    make date
+  ok    before 1970
+  ok    not a date
+  ok    not iso
+  ok    local round trip
+  ok    now is recent
+format
+  ok    positional
+  ok    indexed
+  ok    named
+  ok    fixed
+  ok    width right
+  ok    width left
+  ok    center fill
+  ok    zero pad
+  ok    thousands
+  ok    thousands fixed
+  ok    hex
+  ok    percent
+  ok    sign
+  ok    braces
+  ok    too few values
+collections
+  ok    sort_by
+  ok    sort_by desc stable
+  ok    sort_by text
+  ok    group_by keys
+  ok    group_by members
+  ok    uuid shape
+  ok    uuid differs
+paths
+  ok    join
+  ok    join absolute restarts
+  ok    basename
+  ok    basename trailing slash
+  ok    dirname
+  ok    dirname of a name
+  ok    dirname of root child
+  ok    extname
+  ok    dotfile has no extension
+  ok    normalize
+  ok    normalize above root
+  ok    normalize relative up
+directories
+  ok    mkdir parents
+  ok    is_dir
+  ok    mkdir again is fine
+  ok    rmdir not empty fails
+  ok    rmdir
+  ok    rmdir outer
+  ok    gone
+  ok    abspath is absolute
+stdlib: 79 checks, all agreed

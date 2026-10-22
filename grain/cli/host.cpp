@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -70,6 +71,31 @@ struct HostFiles final : g::Files {
   bool exists(const std::string& path) override {
     std::error_code ec;
     return std::filesystem::is_regular_file(path, ec);
+  }
+  bool make_dir(const std::string& path, bool parents, std::string& error) override {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) return true;   // already there is not a failure
+    const bool made = parents ? std::filesystem::create_directories(path, ec) : std::filesystem::create_directory(path, ec);
+    if (!made || ec) { error = ec ? ec.message() : "not made"; return false; }
+    return true;
+  }
+  bool remove_dir(const std::string& path, std::string& error) override {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(path, ec)) { error = "no such directory"; return false; }
+    if (!std::filesystem::is_empty(path, ec)) { error = ec ? ec.message() : "not empty"; return false; }
+    if (!std::filesystem::remove(path, ec)) { error = ec ? ec.message() : "not removed"; return false; }
+    return true;
+  }
+  bool is_dir(const std::string& path) override {
+    std::error_code ec;
+    return std::filesystem::is_directory(path, ec);
+  }
+  bool absolute(const std::string& path, std::string& out, std::string& error) override {
+    std::error_code ec;
+    const auto p = std::filesystem::absolute(path, ec);
+    if (ec) { error = ec.message(); return false; }
+    out = p.generic_string();
+    return true;
   }
 };
 
@@ -197,6 +223,25 @@ void install_args(g::Vm& vm, const std::vector<std::string>& args) {
 void install_process(g::Vm& vm) {
   vm.define_native("sys_exec", 1, 1, bi_sys_exec);
   vm.define_native("exec", 1, 1, bi_exec);
+}
+
+std::string state_dir() {
+  auto env = [](const char* name) -> std::string {
+    const char* v = std::getenv(name);
+    return v && *v ? std::string(v) : std::string();
+  };
+#if defined(_WIN32)
+  const std::string base = env("LOCALAPPDATA");
+  return base.empty() ? std::string() : base + "\\grain";
+#elif defined(__APPLE__)
+  const std::string home = env("HOME");
+  return home.empty() ? std::string() : home + "/Library/Caches/grain";
+#else
+  const std::string xdg = env("XDG_CACHE_HOME");
+  if (!xdg.empty()) return xdg + "/grain";
+  const std::string home = env("HOME");
+  return home.empty() ? std::string() : home + "/.cache/grain";
+#endif
 }
 
 }  // namespace grain_cli

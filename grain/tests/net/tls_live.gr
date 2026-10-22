@@ -1,0 +1,8 @@
+# Live HTTPS checks, run by hand (they need the internet):  grain run tls_live.gr
+# A real site must verify; badssl.com's broken certificates must each be refused.
+let ok = http_get("https://example.com/")
+print("example.com:", ok.status, contains(ok.body, "Example Domain"))
+for host in ["self-signed", "expired", "wrong.host", "untrusted-root"] {
+  let r = pcall(fn () { return http_get("https://" + host + ".badssl.com/", {"timeout_ms": 15000}) })
+  print(host + " refused:", not r.ok, r.ok ? "" : r.error)
+}

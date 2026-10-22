@@ -253,6 +253,25 @@ struct Files {
   virtual bool list(const std::string& path, std::vector<FileEntry>& out, std::string& error) = 0;
   virtual bool remove(const std::string& path, std::string& error) = 0;
   virtual bool exists(const std::string& path) = 0;
+  // Directories. Storage without them (or an embedder that has not said how)
+  // refuses by name rather than pretending.
+  virtual bool make_dir(const std::string& path, bool parents, std::string& error) {
+    (void)path; (void)parents;
+    error = "this machine's storage cannot make directories";
+    return false;
+  }
+  virtual bool remove_dir(const std::string& path, std::string& error) {
+    (void)path;
+    error = "this machine's storage cannot remove directories";
+    return false;
+  }
+  virtual bool is_dir(const std::string& path) { (void)path; return false; }
+  // The path made absolute against the working directory; false where there is none.
+  virtual bool absolute(const std::string& path, std::string& out, std::string& error) {
+    (void)path; (void)out;
+    error = "this machine's storage has no working directory";
+    return false;
+  }
 };
 
 // Cycles spent in the native call path's pieces (filled on the Pi only).
@@ -332,9 +351,12 @@ class Vm {
 // Everything a grain built without aios has (grain_builtins.cpp).
 void install_core_builtins(Vm& vm);
 
-// Message digests over a string's bytes, as hex (grain_std_hash.cpp); part of
-// install_core_builtins.
-void install_hash_builtins(Vm& vm);
+// Parts of install_core_builtins, one file each:
+void install_hash_builtins(Vm& vm);    // sha256, sha1, sha512, sha384, md5, keccak256, hmac_sha256 (grain_std_hash.cpp)
+void install_regex_builtins(Vm& vm);   // regex_test/match/find_all/replace/split (grain_std_regex.cpp)
+void install_time_builtins(Vm& vm);    // now, date_parts/format/parse/make (grain_std_time.cpp)
+void install_text_builtins(Vm& vm);    // format, sort_by, group_by, uuid (grain_std_text.cpp)
+void install_path_builtins(Vm& vm);    // path_join, basename, dirname, extname, mkdir, ... (grain_std_path.cpp)
 
 // The bridges that make this a language ON aios rather than beside it: the
 // sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL
@@ -349,6 +371,13 @@ void install_builtins(Vm& vm);
 // network unless its embedder hands it one; `aios grain` and the Pi's
 // console do.
 void install_socket_builtins(Vm& vm);
+
+// http_get / http_post / http_request over hal::net and TLS (grain_std_http.cpp).
+// Like sockets, granted by the embedder rather than part of every VM. https
+// verifies against <root>/ssl/ca-certificates.crt when present, else the
+// system's store; the root is process-wide and set once by the embedder.
+void install_http_builtins(Vm& vm);
+void set_http_trust_root(const std::string& root);
 
 // Windowing & Canvas Pane Registration API (register_pane, pane_render, pane_dispatch_event, ...)
 void install_window_builtins(Vm& vm);

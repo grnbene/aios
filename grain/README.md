@@ -29,12 +29,29 @@ Exit status: 0 the program ran to its end, 1 it did not compile, 2 it stopped
 on a runtime error, 64 the command line was wrong. A first line starting with
 `#!` is a comment, so `#!/usr/bin/env grain` makes a script executable.
 
-What the program can see of the machine: `sys` (`os`, `arch`, `cpus`,
-`memory`, `host`, `version`), `args`, files relative to the working directory
-(`read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`,
-`file_exists`), `sys_exec(command)` through the system shell and
-`exec([program, args...])` without one, TCP/UDP sockets and a small HTTP-style
-server (`listen`, `accept`, `read_until`, `write`).
+## The standard library
+
+| Area | Functions |
+|---|---|
+| The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep`, `clock`, `time_us` |
+| Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists` (relative to the working directory) |
+| Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
+| Processes | `sys_exec(command)` through the system shell, `exec([program, args...])` without one: `{ok, code, output}` |
+| Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); TCP/UDP sockets; a small server (`listen`, `accept`, `read_until`, `write`) |
+| Text | `format("{:>8.2f}", x)`, `regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split` (ECMAScript patterns), `upper`, `lower`, `trim`, `split`, `join`, `replace`, `pad_left`, ... |
+| Data | `json_parse`, `json_stringify`, `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
+| Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
+| Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid` |
+| Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
+| Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
+
+Strings are bytes: `len`, indexing, `slice`, `find` and regex offsets count
+bytes of UTF-8.
+
+https verifies certificates against `ssl/ca-certificates.crt` in grain's
+per-user directory (`~/Library/Caches/grain`, `~/.cache/grain`,
+`%LOCALAPPDATA%\grain`) when you put one there, otherwise the system's store
+(on Windows, exported there from the system's root certificates).
 
 ## Building
 
@@ -71,7 +88,9 @@ timings:
 
 - the language's examples (`examples/grain`), with the JIT and with `--no-jit`
 - the native-code comparison cases (`tools/grain-jit/cases`)
-- the `grain` command itself (`grain/tests/cli`)
+- the `grain` command itself and the standard library (`grain/tests/cli`)
+- the HTTP client against a local server (`grain/tests/net`, needs Python 3);
+  `grain run grain/tests/net/tls_live.gr` checks HTTPS against real sites by hand
 
 After a deliberate change in behaviour, rewrite the expectations with
 `cmake --build build-grain --target grain-update-expected` and review the diff
@@ -91,6 +110,6 @@ standalone grain has the portable standard library only.
 | interpreter | yes | yes | yes | yes | yes |
 | JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
-Built and tested so far: macOS arm64 (47 of 47 cases). The others are set up
+Built and tested so far: macOS arm64 (49 of 49 cases, and the live HTTPS checks). The others are set up
 (this README, `.github/workflows/grain.yml`, `scripts/build-linux.sh`) and not
 yet built.

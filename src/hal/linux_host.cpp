@@ -12,7 +12,11 @@
 #include <malloc.h>
 #include <signal.h>
 #include "aios/hal/host.hpp"
+// AIOS_HAL_HOST_ONLY: the host layer on its own (the standalone grain build), without
+// the telemetry it feeds aios's world model. aios itself never defines it.
+#if !defined(AIOS_HAL_HOST_ONLY)
 #include "aios/intelligence/world_model.hpp"
+#endif
 #include <cstdio>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -818,6 +822,7 @@ unsigned long long read_procs_running() {
   return 0;
 }
 
+#if !defined(AIOS_HAL_HOST_ONLY)
 intelligence::SubstrateTelemetry linux_telemetry() {
   intelligence::SubstrateTelemetry t;
   static unsigned long long last_idle = 0, last_total = 0;
@@ -964,6 +969,7 @@ intelligence::SubstrateTelemetry linux_telemetry() {
   t.timestamp_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
   return t;
 }
+#endif  // !AIOS_HAL_HOST_ONLY
 
 // Hosted, this process does not own the scheduler, so there is no actuation
 // sink — but the recorder still needs real work to have happened between the
@@ -1000,6 +1006,7 @@ extern "C" void linux_set_settle_pressure(int level) {
 }
 extern "C" int linux_settle_pressure() { return g_settle_pressure.load(); }
 
+#if !defined(AIOS_HAL_HOST_ONLY)
 // Traffic with drops in it: a datagram socket with a receive buffer far smaller
 // than what is about to be sent into it, so the kernel discards the overflow and
 // counts what it discarded. Nothing here is simulated — the loss dim 6 reports
@@ -1089,6 +1096,7 @@ struct RegisterHostedTelemetry {
     intelligence::set_substrate_settle(&linux_settle);
   }
 } g_register_hosted_telemetry;
+#endif  // !AIOS_HAL_HOST_ONLY
 }  // namespace
 
 }  // namespace aios::hal
