@@ -27,6 +27,9 @@
 #include "aios/userland/grain.hpp"
 #include "grain_net.hpp"
 #include "host.hpp"
+#if defined(GRAIN_HAVE_SDL2)
+#include "display_sdl.hpp"
+#endif
 
 #ifndef GRAIN_VERSION
 #define GRAIN_VERSION "0.0.0-dev"
@@ -166,6 +169,9 @@ int disassemble(const std::string& path) {
 
 int main(int argc, char** argv) {
   g::set_http_trust_root(grain_cli::state_dir());
+#if defined(GRAIN_HAVE_SDL2)
+  g::set_display(&grain_cli::sdl_display());   // run_panes() opens real windows
+#endif
   std::vector<std::string> a(argv + 1, argv + argc);
   Options opt;
   size_t i = 0;

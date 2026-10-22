@@ -46,8 +46,24 @@ jobs:
           - { name: windows-x64,   os: windows-2022 }
     steps:
       - uses: actions/checkout@v4
+      # SDL2 for windows (run_panes); grain builds without it, and its window test is then skipped.
+      - name: SDL2 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2
+      - name: SDL2 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+      - name: SDL2 (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install sdl2:x64-windows-static
       - name: configure
-        run: cmake -S grain -B build-grain -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          extra=""
+          if [ "$RUNNER_OS" = Windows ]; then
+            extra="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static"
+          fi
+          cmake -S grain -B build-grain -DCMAKE_BUILD_TYPE=Release $extra
       - name: build
         run: cmake --build build-grain --config Release --parallel
       - name: test

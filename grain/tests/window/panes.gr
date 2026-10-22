@@ -1,0 +1,53 @@
+# A pane shown as a window (run_panes), driven by scripted input that goes
+# through the display's own event queue. Run headless with SDL_VIDEODRIVER=dummy.
+let clicks = 0
+let log = []
+let last_canvas = nil
+let size = [0, 0]
+
+let pane = create_pane({
+  "title": "grain panes test",
+  "width": 200,
+  "height": 100,
+  "on_draw": fn (cv, p) {
+    last_canvas = cv
+    size = [canvas_width(cv), canvas_height(cv)]
+    canvas_clear(cv, "#204080")
+    canvas_fill_rect(cv, 10, 10, 20 + clicks * 10, 20, "#ff0000")
+  },
+  "on_event": fn (p, e) {
+    if e.type == "mouse_move" { return nil }
+    let line = e.type
+    if e.type == "click" or e.type == "mouse_down" or e.type == "mouse_up" { line = line + " " + e.button + " at " + str(e.x) + "," + str(e.y) }
+    if e.type == "key" { line = line + " " + e.key + (e.shift ? " +shift" : "") }
+    if e.type == "text" { line = line + " " + repr(e.text) }
+    if e.type == "wheel" { line = line + " dy=" + str(e.dy) }
+    if e.type == "resize" { line = line + " " + str(e.width) + "x" + str(e.height) }
+    push(log, line)
+  },
+  "on_click": fn (p, e) { clicks = clicks + 1 },
+  "on_key": fn (p, e) {
+    if e.key == "escape" { unregister_pane(p.id) }
+  }
+})
+
+let id = pane.id
+let ran = run_panes({"frames": 120, "script": [
+  {"type": "mouse_down", "pane": id, "x": 15, "y": 12, "button": "left"},
+  {"type": "mouse_up", "pane": id, "x": 15, "y": 12, "button": "left"},
+  {"type": "mouse_down", "pane": id, "x": 40, "y": 30, "button": "right"},
+  {"type": "mouse_up", "pane": id, "x": 40, "y": 30, "button": "right"},
+  {"type": "key", "pane": id, "key": "A", "shift": true},
+  {"type": "text", "pane": id, "text": "hé"},
+  {"type": "wheel", "pane": id, "dx": 0, "dy": -3},
+  {"type": "resize", "pane": id, "width": 300, "height": 150},
+  {"type": "key", "pane": id, "key": "Escape"}
+]})
+
+print("run_panes returned:", ran)
+for line in log { print(" ", line) }
+print("clicks:", clicks)
+print("last frame size:", size)
+print("background drawn to the new size:", canvas_get_pixel(last_canvas, 290, 140) == 0xFF204080)
+print("bar drawn to clicks:", canvas_get_pixel(last_canvas, 45, 15) == 0xFFFF0000, canvas_get_pixel(last_canvas, 55, 15) == 0xFF204080)
+print("panes left:", len(list_panes()))

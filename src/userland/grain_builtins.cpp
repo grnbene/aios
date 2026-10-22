@@ -6014,13 +6014,29 @@ static std::shared_ptr<GrainPane> get_pane_from_value(const Value& v) {
       if (id_val && id_val->type == Type::Int) target_id = (uint64_t)id_val->i;
     }
   }
-  if (target_id > 0) {
-    for (const auto& p : g_grain_panes) {
-      if (p->id == target_id) return p;
-    }
+  // A pane that is not registered (never was, or closed since) is no pane: falling
+  // back to the newest one closed or redrew a window nobody named.
+  for (const auto& p : g_grain_panes) {
+    if (p->id == target_id) return p;
   }
-  if (!g_grain_panes.empty()) return g_grain_panes.back();
   return nullptr;
+}
+
+// How many arguments a callback takes (-1: a native, or not known). A pane's
+// draw callback is fn(canvas) or fn(canvas, pane); calling it with two and,
+// when that failed, again with one ran every callback that raised an error
+// twice and lost its message.
+static int callable_arity(const Value& f) {
+  if (f.type != Type::Fn || !f.obj) return -1;
+  const Obj* o = f.obj.get();
+  if (o->is_closure) return static_cast<const ClosureObj*>(o)->fn ? static_cast<const ClosureObj*>(o)->fn->arity : -1;
+  return static_cast<const FnObj*>(o)->arity;
+}
+
+// Calls a pane callback with (first, second), or (first) when it takes one.
+static Value call_pane_cb(Vm& vm, const Value& cb, const Value& first, const Value& second, std::string& error) {
+  if (callable_arity(cb) == 1) return vm.call(cb, {first}, error);
+  return vm.call(cb, {first, second}, error);
 }
 
 Value bi_register_pane(Vm&, std::vector<Value>& args, std::string& error) {
@@ -6136,14 +6152,10 @@ Value bi_pane_render(Vm& vm, std::vector<Value>& args, std::string& error) {
 
   if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
     std::string err;
-    Value res = vm.call(pane->draw_cb, { cv_val, pane_map_val }, err);
+    call_pane_cb(vm, pane->draw_cb, cv_val, pane_map_val, err);
     if (!err.empty()) {
-      err.clear();
-      res = vm.call(pane->draw_cb, { cv_val }, err);
-      if (!err.empty()) {
-        error = "pane_render() callback failed: " + err;
-        return cv_val;
-      }
+      error = "pane_render(): the draw callback failed: " + err;
+      return Value::nil();
     }
   }
 
@@ -6183,35 +6195,19 @@ Value bi_pane_dispatch_event(Vm& vm, std::vector<Value>& args, std::string& erro
   Value* type_v = ev_map->find("type");
   if (type_v && type_v->type == Type::Str) ev_type = type_v->str();
 
-  if (pane->event_cb.type == Type::Fn || pane->event_cb.type == Type::Native) {
+  // Callbacks take (pane, event) or just (event). One that raises an error
+  // stops the dispatch and the error is the caller's, not swallowed.
+  auto deliver = [&](const Value& cb, const char* which) -> bool {
+    if (cb.type != Type::Fn && cb.type != Type::Native) return true;
     std::string err;
-    Value res = vm.call(pane->event_cb, { pane_map_val, ev_val }, err);
-    if (!err.empty()) {
-      err.clear();
-      res = vm.call(pane->event_cb, { ev_val }, err);
-    }
-    if (err.empty() && res.type != Type::Nil) last_result = res;
-  }
-
-  if (ev_type == "click" && (pane->click_cb.type == Type::Fn || pane->click_cb.type == Type::Native)) {
-    std::string err;
-    Value res = vm.call(pane->click_cb, { pane_map_val, ev_val }, err);
-    if (!err.empty()) {
-      err.clear();
-      res = vm.call(pane->click_cb, { ev_val }, err);
-    }
-    if (err.empty() && res.type != Type::Nil) last_result = res;
-  }
-
-  if (ev_type == "key" && (pane->key_cb.type == Type::Fn || pane->key_cb.type == Type::Native)) {
-    std::string err;
-    Value res = vm.call(pane->key_cb, { pane_map_val, ev_val }, err);
-    if (!err.empty()) {
-      err.clear();
-      res = vm.call(pane->key_cb, { ev_val }, err);
-    }
-    if (err.empty() && res.type != Type::Nil) last_result = res;
-  }
+    Value res = callable_arity(cb) == 1 ? vm.call(cb, {ev_val}, err) : vm.call(cb, {pane_map_val, ev_val}, err);
+    if (!err.empty()) { error = std::string("pane_dispatch_event(): the ") + which + " callback failed: " + err; return false; }
+    if (res.type != Type::Nil) last_result = res;
+    return true;
+  };
+  if (!deliver(pane->event_cb, "event")) return Value::nil();
+  if (ev_type == "click" && !deliver(pane->click_cb, "click")) return Value::nil();
+  if (ev_type == "key" && !deliver(pane->key_cb, "key")) return Value::nil();
 
   return last_result;
 }
@@ -6256,7 +6252,122 @@ Value bi_pane_get(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, pane_to_map(pane));
 }
 
+// --- the panes as a display sees them --------------------------------------
+
+static Display* g_display = nullptr;
+
+void set_display(Display* d) { g_display = d; }
+Display* display() { return g_display; }
+
+std::vector<PaneInfo> pane_list() {
+  std::vector<PaneInfo> out;
+  for (const auto& p : g_grain_panes) {
+    if (!p->visible) continue;
+    PaneInfo info;
+    info.id = p->id;
+    info.title = p->title;
+    info.x = p->x;
+    info.y = p->y;
+    info.width = p->width;
+    info.height = p->height;
+    out.push_back(std::move(info));
+  }
+  return out;
+}
+
+static std::shared_ptr<GrainPane> pane_by_id(uint64_t id) {
+  for (const auto& p : g_grain_panes)
+    if (p->id == id) return p;
+  return nullptr;
+}
+
+bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, int& height, std::string& error) {
+  auto pane = pane_by_id(id);
+  if (!pane) { error = "pane " + std::to_string(id) + " is not registered"; return false; }
+  if (!pane->canvas) {
+    pane->canvas = std::make_shared<GrainCanvas>();
+    pane->canvas->width = (uint32_t)pane->width;
+    pane->canvas->height = (uint32_t)pane->height;
+    pane->canvas->pixels.assign((size_t)pane->width * pane->height, 0x00000000);
+  }
+  if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
+    Value cv_val = Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", pane->canvas));
+    call_pane_cb(vm, pane->draw_cb, cv_val, Value::object(Type::Map, pane_to_map(pane)), error);
+    if (!error.empty()) { error = "\"" + pane->title + "\" draw callback: " + error; return false; }
+  }
+  const auto cv = pane->canvas;   // the callback may have closed the pane; its canvas is still this frame's
+  width = (int)cv->width;
+  height = (int)cv->height;
+  argb.assign(cv->pixels.begin(), cv->pixels.end());
+  return true;
+}
+
+bool pane_event(Vm& vm, uint64_t id, const Value& event, std::string& error) {
+  auto pane = pane_by_id(id);
+  if (!pane) return true;   // closed by an earlier event of the same batch: nothing to deliver to
+  std::vector<Value> args{Value::object(Type::Extern, std::make_shared<ExternObj>("grain_pane", pane)), event};
+  bi_pane_dispatch_event(vm, args, error);
+  return error.empty();
+}
+
+bool pane_resized(Vm& vm, uint64_t id, int width, int height, std::string& error) {
+  auto pane = pane_by_id(id);
+  if (!pane) return true;
+  if (width < 1 || height < 1) return true;   // minimised: keep the last size
+  pane->width = width;
+  pane->height = height;
+  if (!pane->canvas) pane->canvas = std::make_shared<GrainCanvas>();
+  pane->canvas->width = (uint32_t)width;
+  pane->canvas->height = (uint32_t)height;
+  pane->canvas->pixels.assign((size_t)width * height, 0x00000000);
+  auto ev = std::make_shared<MapObj>();
+  ev->put("type", Value::string("resize"));
+  ev->put("width", Value::integer(width));
+  ev->put("height", Value::integer(height));
+  return pane_event(vm, id, Value::object(Type::Map, ev), error);
+}
+
+bool pane_closed(Vm& vm, uint64_t id, std::string& error) {
+  auto pane = pane_by_id(id);
+  if (!pane) return true;
+  auto ev = std::make_shared<MapObj>();
+  ev->put("type", Value::string("close"));
+  const bool ok = pane_event(vm, id, Value::object(Type::Map, ev), error);
+  g_grain_panes.erase(std::remove(g_grain_panes.begin(), g_grain_panes.end(), pane), g_grain_panes.end());
+  return ok;
+}
+
+// run_panes([options]): shows every registered pane on the embedder's display
+// until each is closed (by its window, or by the program unregistering it).
+// options: frames (stop after that many), script (a list of input events played
+// first, each with a "pane" naming its target).
+Value bi_run_panes(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!g_display) {
+    error = "run_panes(): this grain has no display (the standalone grain shows windows when it was built with SDL2)";
+    return Value::nil();
+  }
+  DisplayRun run;
+  if (!args.empty() && args[0].type != Type::Nil) {
+    if (args[0].type != Type::Map) { error = std::string("run_panes() wants its options as a map, got a ") + type_name(args[0].type); return Value::nil(); }
+    auto* m = static_cast<MapObj*>(args[0].obj.get());
+    if (Value* v = m->find("frames")) {
+      if (!want_number(*v, error, "run_panes")) return Value::nil();
+      run.max_frames = v->as_int();
+    }
+    if (Value* v = m->find("script")) {
+      if (!want_list(*v, error, "run_panes")) return Value::nil();
+      for (const auto& e : v->list_items()) {
+        if (e.type != Type::Map) { error = "run_panes(): each scripted event is a map"; return Value::nil(); }
+        run.script.push_back(e);
+      }
+    }
+  }
+  if (!g_display->run(vm, run, error)) return Value::nil();
+  return Value::boolean(true);
+}
+
 void install_window_builtins(Vm& vm) {
+  vm.define_native("run_panes", 0, 1, bi_run_panes);
   vm.define_native("register_pane", 1, 6, bi_register_pane);
   vm.define_native("pane_register", 1, 6, bi_register_pane);
   vm.define_native("window_register", 1, 6, bi_register_pane);

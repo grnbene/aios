@@ -382,5 +382,39 @@ void set_http_trust_root(const std::string& root);
 // Windowing & Canvas Pane Registration API (register_pane, pane_render, pane_dispatch_event, ...)
 void install_window_builtins(Vm& vm);
 
+// Where panes are shown. The embedder supplies it - real windows in the
+// standalone grain (SDL2), the desktop inside aios - and run_panes() hands it
+// the VM; with none, run_panes() says so instead of returning as if shown.
+struct DisplayRun {
+  int64_t max_frames = 0;           // 0: until every pane is closed
+  // Input played to the windows before the user's, in order (scripted UI, and
+  // how the display is tested without a person at it). Each is an event map as
+  // a pane receives it: {type: "mouse_down", pane, x, y, button}, ...
+  std::vector<Value> script;
+};
+class Display {
+ public:
+  virtual ~Display() = default;
+  virtual bool run(Vm& vm, const DisplayRun& run, std::string& error) = 0;
+};
+void set_display(Display* d);   // not owned
+Display* display();
+
+// What a Display uses of the panes a program registered (grain_builtins.cpp).
+struct PaneInfo {
+  uint64_t id = 0;
+  std::string title;
+  int x = 0, y = 0, width = 0, height = 0;
+};
+std::vector<PaneInfo> pane_list();
+// Runs the pane's draw callback, then copies its canvas out (ARGB, row-major).
+bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, int& height, std::string& error);
+// Delivers an event map to the pane's callbacks (event, then click or key).
+bool pane_event(Vm& vm, uint64_t id, const Value& event, std::string& error);
+// The window was resized: the pane's canvas follows, then it gets a "resize" event.
+bool pane_resized(Vm& vm, uint64_t id, int width, int height, std::string& error);
+// The window was closed: the pane gets a "close" event and is unregistered.
+bool pane_closed(Vm& vm, uint64_t id, std::string& error);
+
 }  // namespace aios::userland::grain
 
