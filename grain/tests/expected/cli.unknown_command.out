@@ -9,6 +9,9 @@ usage:
   grain check <file.gr>...          compile only and report every error
   grain dis <file.gr>               show the bytecode the compiler emitted
   grain build <file.gr> [-o out]    make one executable of the program (see grain build)
+  grain test [file | dir]...        run the tests in *_test.gr files
+  grain fmt [--check] <file | dir>  lay source out the one grain way
+  grain lsp                         a language server for editors, on stdin/stdout
   grain version                     print the version
 
 options (before the subcommand):

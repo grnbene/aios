@@ -360,6 +360,14 @@ Value* Vm::find_global(const std::string& name) {
   return it == st_->globals.end() ? nullptr : &it->second;
 }
 
+std::vector<std::string> Vm::global_names() const {
+  std::vector<std::string> names;
+  names.reserve(st_->globals.size());
+  for (const auto& kv : st_->globals) names.push_back(kv.first);
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
 void Vm::retain_globals(const std::vector<std::string>& keep) {
   for (auto it = st_->globals.begin(); it != st_->globals.end();) {
     if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) it = st_->globals.erase(it);
