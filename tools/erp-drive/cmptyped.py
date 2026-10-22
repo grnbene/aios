@@ -11,7 +11,9 @@ for a in sys.argv[2:]:
     opt[k] = v
 def conn(spec, user, pw):
     h, p = spec.split(':')
-    return pymysql.connect(host=h, port=int(p), user=user, password=pw, database=os.environ.get('DBNAME','versioneight'), connect_timeout=30, read_timeout=600)
+    # bytes for text, not str: the ERP holds latin1 bytes in utf8 columns, and decoding them killed the
+    # connection (every statement after it "errored")
+    return pymysql.connect(host=h, port=int(p), user=user, password=pw, database=os.environ.get('DBNAME','versioneight'), connect_timeout=30, read_timeout=600, use_unicode=False)
 A = conn(opt['asql'], os.environ.get('AUSER','root'), os.environ.get('APASS','')); M = conn(opt['maria'], os.environ.get('MUSER','devops'), os.environ.get('MPASS',''))
 def run(c, q):
     cur = c.cursor()
@@ -19,6 +21,8 @@ def run(c, q):
         cur.execute(q)
         return cur.fetchall(), None
     except Exception as e:
+        try: c.ping(reconnect=True)   # a protocol error leaves the connection unusable; the next statement gets a fresh one
+        except Exception: pass
         return None, f'{type(e).__name__}: {str(e)[:100]}'
 seen = set(); n = 0; cells = 0; bad = collections.Counter(); ex = {}
 errs = []
