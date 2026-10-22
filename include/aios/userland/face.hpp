@@ -219,6 +219,19 @@ class Runtime {
 
   // AST Hot-Patching & Self-Modification
   bool hot_patch(const std::string& new_source);
+  // A new document for the same running face: what is typed in its fields,
+  // its focus and its state stay. An embedder that builds the widget tree
+  // itself (a grain program) adopts each tree it builds; hot_patch adopts
+  // the parsed source.
+  void adopt(Face f);
+
+  // An embedder's values, read by the face by name like a `let` (a table's
+  // rows, `table rows_1`). They stay until given again.
+  void provide(const std::string& name, Value v);
+  // Actions the embedder answers itself, before any `on <action>:` rule:
+  // returns true when it took the action. A face whose actions are all the
+  // embedder's needs no rules for them.
+  void set_action_handler(std::function<bool(const std::string& action)> handler);
 
   // What happened, for a status line and for the look.
   const std::vector<std::string>& faults() const { return faults_; }
@@ -256,6 +269,7 @@ class Runtime {
   std::string message_;
   std::vector<Placed> placed_;
   std::vector<PaintCmd> paint_;
+  std::function<bool(const std::string&)> action_handler_;
   std::string focus_;
   bool dirty_ = false;
   bool loaded_ = false;

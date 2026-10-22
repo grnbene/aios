@@ -1,0 +1,11 @@
+buttons found: true true
+items: 3
+  A-1 Anchor bolt 12
+  B-22 received 1
+  C-3 received 1
+said: received C-3
+count presses: 2
+sku field: "kept" qty field: "1"
+on the glass: true true true
+face.gr:64: "bad": view(): a widget (ui.column, ui.text, ...) is expected, got a int
+  in face.gr (line 64)

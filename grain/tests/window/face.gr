@@ -1,0 +1,65 @@
+# Face widgets in a pane (ui.*): built from grain values every frame, laid out
+# and painted by face, driven by scripted input. Run headless with SDL_VIDEODRIVER=dummy.
+let items = [{"sku": "A-1", "name": "Anchor bolt", "qty": 12}]
+let said = "nothing yet"
+let presses = 0
+
+fn receive(f) {
+  if f.sku == "" { said = "scan a SKU first"; return nil }
+  push(items, {"sku": f.sku, "name": "received", "qty": int(f.qty)})
+  said = "received " + f.sku
+  ui.set_field(p, "sku", "")
+}
+
+let p = ui.pane({"title": "Stock", "width": 640, "height": 420, "view": fn () {
+  return ui.column({"gap": 12}, [
+    ui.row({"gap": 12}, [ui.tile("Items", len(items)), ui.tile("Said", said, {"accent": "warn"})]),
+    ui.row({"gap": 8}, [
+      ui.field("sku", {"placeholder": "Scan or type a SKU", "focus": true, "on_enter": receive}),
+      ui.field("qty", {"value": "1", "width": 80}),
+      ui.button("Receive", receive, {"primary": true}),
+      ui.button("Count", fn () { presses = presses + 1 })]),
+    ui.text("Braces {stay} as \"typed\""),
+    ui.table(items, {"columns": "sku:SKU, name:Name, qty:On hand:right"})])
+}})
+let id = p.id
+
+# One frame, so the layout says where the buttons are.
+run_panes({"frames": 1})
+fn centre(label) {
+  for b in ui.layout(p) {
+    if b.box and b.widget == "button" and b.text == label { return [b.x + b.width / 2, b.y + b.height / 2] }
+  }
+  return nil
+}
+let rc = centre("Receive")
+let cc = centre("Count")
+print("buttons found:", rc != nil, cc != nil)
+
+run_panes({"frames": 30, "script": [
+  {"type": "text", "pane": id, "text": "B-22"},
+  {"type": "key", "pane": id, "key": "return"},
+  {"type": "text", "pane": id, "text": "C-3"},
+  {"type": "mouse_down", "pane": id, "x": rc[0], "y": rc[1], "button": "left"},
+  {"type": "mouse_up", "pane": id, "x": rc[0], "y": rc[1], "button": "left"},
+  {"type": "mouse_down", "pane": id, "x": cc[0], "y": cc[1], "button": "left"},
+  {"type": "mouse_up", "pane": id, "x": cc[0], "y": cc[1], "button": "left"},
+  {"type": "mouse_down", "pane": id, "x": cc[0], "y": cc[1], "button": "left"},
+  {"type": "mouse_up", "pane": id, "x": cc[0], "y": cc[1], "button": "left"},
+  {"type": "text", "pane": id, "text": "kept"}
+]})
+
+print("items:", len(items))
+for it in items { print(" ", it.sku, it.name, it.qty) }
+print("said:", said)
+print("count presses:", presses)
+print("sku field:", repr(ui.field_text(p, "sku")), "qty field:", repr(ui.field_text(p, "qty")))
+let texts = []
+for b in ui.layout(p) { if not b.box { push(texts, b.text) } }
+print("on the glass:", contains(texts, "Braces {stay} as \"typed\""), contains(texts, "C-3"), contains(texts, "received C-3"))
+
+# A view that returns something that is not a widget stops with what it got.
+let q = ui.pane({"title": "bad", "view": fn () { return 42 }})
+unregister_pane(p)
+run_panes({"frames": 2})
+print("not reached")

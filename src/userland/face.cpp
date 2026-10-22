@@ -1474,6 +1474,7 @@ struct StateSnapshot {
 struct Runtime::Impl {
   std::map<std::string, Value> state;    // persistent
   std::map<std::string, Value> lets;     // reactive
+  std::map<std::string, Value> given;    // the embedder's, by name (Runtime::provide)
   std::map<std::string, std::string> fields;
   std::map<std::string, EditorState> editors;
   std::map<std::string, Value> scope;    // loop variables and record fields while evaluating a template
@@ -1616,6 +1617,8 @@ struct Ev {
     if (s != I.scope.end()) return s->second;
     auto l = I.lets.find(name);
     if (l != I.lets.end()) return l->second;
+    auto g = I.given.find(name);
+    if (g != I.given.end()) return g->second;
     auto st = I.state.find(name);
     if (st != I.state.end()) return st->second;
     auto f = fields.find(name);
@@ -5430,7 +5433,7 @@ void Runtime::run_action(const std::string& action) {
   if (!loaded_) load();
   Impl& I = *impl_;
   Ev ev{I, host_, faults_, message_, focus_, I.fields, dirty_};
-  bool any = false;
+  bool any = action_handler_ && action_handler_(action);
   for (const auto& h : face_.handlers) {
     if (h.event != action) continue;
     any = true;
@@ -6020,17 +6023,48 @@ bool Runtime::hot_patch(const std::string& new_source) {
     for (const auto& err : new_face.errors) faults_.push_back("hot_patch: " + err);
     return false;
   }
-  face_ = std::move(new_face);
-  if (impl_) {
-    for (const auto& kk : face_.kinds) impl_->kind_keys[kk.first] = kk.second;
-    impl_->types = face_.types;
-    Ev ev{*impl_, host_, faults_, message_, focus_, impl_->fields, dirty_};
-    for (const auto& l : face_.lets) {
-      impl_->lets[l.first] = l.second ? ev.eval(*l.second) : Value::null();
-    }
-  }
+  adopt(std::move(new_face));
   dirty_ = true;
   return true;
+}
+
+void Runtime::adopt(Face f) {
+  face_ = std::move(f);
+  placed_.clear();   // it points into the old tree; the next frame lays out the new one
+  if (!impl_) return;
+  for (const auto& kk : face_.kinds) impl_->kind_keys[kk.first] = kk.second;
+  impl_->types = face_.types;
+  Ev ev{*impl_, host_, faults_, message_, focus_, impl_->fields, dirty_};
+  for (const auto& l : face_.lets) impl_->lets[l.first] = l.second ? ev.eval(*l.second) : Value::null();
+  if (!loaded_) return;   // load() seeds the fields of the first document
+  // A field the new document brings starts at its value=; one it kept keeps
+  // what was typed. Tab follows the new document's order.
+  impl_->field_order.clear();
+  std::vector<const Widget*> stack;
+  for (auto it = face_.widgets.rbegin(); it != face_.widgets.rend(); ++it) stack.push_back(it->get());
+  while (!stack.empty()) {
+    const Widget* w = stack.back();
+    stack.pop_back();
+    if (w->type == "field" || w->type == "input") {
+      const std::string id = w->attr("id", w->attr("name", ""));
+      if (!id.empty()) {
+        if (!impl_->fields.count(id)) {
+          std::string init_val = w->attr("value", "");
+          for (const auto& kv : w->exprs) if (kv.first == "value" && kv.second) init_val = ev.eval(*kv.second).text();
+          impl_->fields[id] = init_val;
+          if (w->flag("focus") && focus_.empty()) focus_ = id;
+        }
+        impl_->field_order.push_back(id);
+      }
+    }
+    for (auto it = w->children.rbegin(); it != w->children.rend(); ++it) stack.push_back(it->get());
+  }
+}
+
+void Runtime::provide(const std::string& name, Value v) { impl_->given[name] = std::move(v); }
+
+void Runtime::set_action_handler(std::function<bool(const std::string& action)> handler) {
+  action_handler_ = std::move(handler);
 }
 
 const char* face_language_reference() {
