@@ -34,6 +34,7 @@
 #include "ffi.hpp"
 #include "host.hpp"
 #include "plugin.hpp"
+#include "open_client.hpp"
 #include "serve.hpp"
 #if defined(GRAIN_HAVE_X11)
 #include "display_x11.hpp"
@@ -66,6 +67,7 @@ void usage(std::ostream& o) {
     << "  grain eval <source...>            run one line and print its value\n"
     << "  grain repl                        read and run lines until EOF or .quit\n"
     << "  grain serve <file.gr> [--port N]  the program's ui.pane in a browser, not a window\n"
+    << "  grain open <url>                  a ui.pane program running on a server, in a native window (no HTML)\n"
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
     << "  grain build <file.gr> [-o out]    make one executable of the program (see grain build)\n"
@@ -298,6 +300,17 @@ int main(int argc, char** argv) {
     std::string source;
     for (size_t k = 0; k < rest.size(); ++k) { if (k) source += " "; source += rest[k]; }
     return eval_line(opt, source);
+  }
+  if (sub == "open") {   // grain open <url>: a remote ui.pane program in a native window
+    if (rest.empty()) { std::cerr << "grain: open wants the URL of a grain app\n"; return kExitUsage; }
+    auto compiled = g::compile_source(grain_cli::kOpenClientSource, "<open>");
+    if (!compiled.ok()) { report_compile("<open>", compiled.errors); return kExitCompile; }
+    g::Vm vm;
+    DropPanes drop{vm};
+    prepare(vm, opt, rest);
+    auto r = vm.run(compiled.script);
+    if (!r.ok) { report_runtime("<open>", r); return kExitRuntime; }
+    return kExitOk;
   }
   if (sub == "serve") {   // grain serve app.gr [--port N] [--host H]: the program's ui.pane in a browser
     if (rest.empty()) { std::cerr << "grain: serve wants a program\n"; return kExitUsage; }

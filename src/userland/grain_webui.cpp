@@ -139,32 +139,38 @@ body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-ap
 // Sends the fields with every event, swaps the widgets in, keeps the focused field and its caret.
 const char* kScript = R"JS(
 (function(){
-  var app=document.getElementById('app'),v=app.dataset.v,busy=false,again=null;
+  var app=document.getElementById('app'),seq=app.dataset.seq,busy=false,again=null;
   function fields(){var p=new URLSearchParams();app.querySelectorAll('input[data-id]').forEach(function(i){p.append('f.'+i.dataset.id,i.value)});return p}
+  function apply(d){
+    if(d.html===undefined)return;
+    seq=String(d.seq);
+    var a=document.activeElement,id=a&&a.dataset&&a.dataset.id,s=a&&a.selectionStart,e=a&&a.selectionEnd;
+    app.innerHTML=d.html;
+    if(id){var n=app.querySelector('input[data-id="'+id.replace(/"/g,'\\"')+'"]');if(n){n.focus();try{n.setSelectionRange(s,e)}catch(x){}}}
+    else{var f=app.querySelector('input[data-focus]');if(f&&!document.activeElement.dataset.id)f.focus()}
+  }
   function send(action){
     if(busy){again=action;return}
-    busy=true;var p=fields();p.append('v',v);p.append('action',action||'');
-    fetch('/_ui/event',{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'same-origin'})
+    busy=true;var p=fields();p.append('action',action||'');
+    fetch(location.pathname,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'same-origin'})
       .then(function(r){return r.json()}).then(function(d){
-        if(d.html!==undefined){
-          var a=document.activeElement,id=a&&a.dataset&&a.dataset.id,s=a&&a.selectionStart,e=a&&a.selectionEnd;
-          app.innerHTML=d.html;v=String(d.v);
-          if(id){var n=app.querySelector('input[data-id="'+id.replace(/"/g,'\\"')+'"]');if(n){n.focus();try{n.setSelectionRange(s,e)}catch(x){}}}
-          else{var f=app.querySelector('input[data-focus]');if(f&&!document.activeElement.dataset.id)f.focus()}
-        }else if(d.error){app.insertAdjacentHTML('afterbegin','<div class="error"></div>');app.firstChild.textContent=d.error}
+        if(d.html!==undefined){if(String(d.seq)!==seq)apply(d)}
+        else if(d.error){app.insertAdjacentHTML('afterbegin','<div class="error"></div>');app.firstChild.textContent=d.error}
       }).catch(function(){}).then(function(){busy=false;if(again!==null){var x=again;again=null;send(x)}});
   }
   app.addEventListener('click',function(e){var b=e.target.closest('[data-act]');if(b)send(b.dataset.act)});
   app.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.dataset&&e.target.dataset.enter){e.preventDefault();send(e.target.dataset.enter)}});
   var f=app.querySelector('input[data-focus]');if(f)f.focus();
-  var r=parseInt(app.dataset.refresh||'0',10);if(r>0)setInterval(function(){if(!document.hidden)send('')},r*1000);
+  // The server pushes whenever the data changes - a timer, another viewer, anything. EventSource reconnects by itself.
+  if(window.EventSource){var es=new EventSource(location.pathname);es.onmessage=function(m){try{var d=JSON.parse(m.data);if(String(d.seq)!==seq&&!(document.activeElement&&document.activeElement.dataset&&document.activeElement.dataset.id&&busy))apply(d)}catch(x){}}}
+  else{var r=parseInt(app.dataset.refresh||'0',10);if(r>0)setInterval(function(){if(!document.hidden)send('')},r*1000)}
 })();
 )JS";
 
 }  // namespace
 
 struct WebUi::Session {
-  std::mutex mu;                 // one event at a time, and the VM is not thread safe
+  std::mutex mu;                 // one event, timer or render at a time; the VM is not thread safe
   std::unique_ptr<Vm> vm;
   std::shared_ptr<void> keep;    // what the host's setup made (its files)
   std::vector<std::string> printed;
@@ -172,12 +178,30 @@ struct WebUi::Session {
   uint64_t pane = 0;
   WebPaneInfo info;
   Clock::time_point last = Clock::now();
+  Clock::time_point last_look = Clock::now();
+
+  // What the viewers see, and a counter that moves when it changes.
+  uint64_t seq = 1;
+  std::string last_tree;         // the widgets as data: what changed is decided on this
+  std::string last_html;
+  uint64_t html_seq = 0;         // the seq last_html is for
+  std::mutex push_mu;
+  std::condition_variable push_cv;
+  int streams = 0;               // open event streams: a session with a viewer is not idle
 };
 
 WebUi::WebUi(Host host) : host_(std::move(host)) {}
-WebUi::~WebUi() = default;
 
-size_t WebUi::sessions() const { std::lock_guard<std::mutex> lock(mu_); return sessions_.size(); }
+WebUi::~WebUi() {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    stop_ = true;
+  }
+  stop_cv_.notify_all();
+  if (ticker_.joinable()) ticker_.join();
+}
+
+size_t WebUi::sessions() const { std::lock_guard<std::mutex> lock(mu_); return sessions_.size() + (shared_ ? 1 : 0); }
 
 void WebUi::report(const std::string& msg) const {
   if (log) log(msg);
@@ -187,7 +211,8 @@ void WebUi::report(const std::string& msg) const {
 void WebUi::reap_locked() {
   const auto now = Clock::now();
   for (auto it = sessions_.begin(); it != sessions_.end();) {
-    if (std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last).count() > host_.idle_seconds) it = sessions_.erase(it);
+    const bool watched = it->second->streams > 0;
+    if (!watched && std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last).count() > host_.idle_seconds) it = sessions_.erase(it);
     else ++it;
   }
   while (sessions_.size() >= host_.max_sessions && !sessions_.empty()) {   // the least recently used goes
@@ -195,6 +220,61 @@ void WebUi::reap_locked() {
     for (auto it = sessions_.begin(); it != sessions_.end(); ++it) if (it->second->last < oldest->second->last) oldest = it;
     sessions_.erase(oldest);
   }
+}
+
+// Re-renders the widgets as data; when they differ from the last render the viewers have something new.
+bool WebUi::refresh_locked(Session& s) {
+  std::string tree, err;
+  uint64_t v = 0;
+  if (!web_pane_render_tree(*s.vm, s.pane, tree, v, err)) { report(err); return false; }
+  if (tree == s.last_tree) return false;
+  s.last_tree = std::move(tree);
+  {
+    std::lock_guard<std::mutex> lock(s.push_mu);
+    ++s.seq;
+  }
+  s.push_cv.notify_all();
+  return true;
+}
+
+// The frame for one viewer: {"seq":N,"html":"..."} or {"seq":N,"tree":{...}}.
+void WebUi::frame_locked(Session& s, bool tree, std::string& out) {
+  if (tree) { out = "{\"seq\":" + std::to_string(s.seq) + ",\"tree\":" + s.last_tree + "}"; return; }
+  if (s.html_seq != s.seq || s.last_html.empty()) {
+    std::string html, err;
+    uint64_t v = 0;
+    if (web_pane_render(*s.vm, s.pane, html, v, err)) { s.last_html = std::move(html); s.html_seq = s.seq; }
+    else report(err);
+  }
+  out = "{\"seq\":" + std::to_string(s.seq) + ",\"html\":" + json_string(s.last_html) + "}";
+}
+
+void WebUi::start_ticker() {
+  if (ticker_.joinable()) return;
+  ticker_ = std::thread([this]() {
+    std::unique_lock<std::mutex> lock(mu_);
+    while (!stop_) {
+      stop_cv_.wait_for(lock, std::chrono::milliseconds(50));
+      if (stop_) break;
+      std::vector<std::shared_ptr<Session>> all;
+      for (auto& kv : sessions_) all.push_back(kv.second);
+      if (shared_) all.push_back(shared_);
+      lock.unlock();
+      for (auto& s : all) {
+        const bool clocked = s->info.refresh > 0;   // a view that reads the clock: look again every `refresh` seconds
+        if (s->vm->timers.empty() && !clocked) continue;
+        std::unique_lock<std::mutex> turn(s->mu, std::try_to_lock);
+        if (!turn.owns_lock()) continue;   // an event is running; the next tick
+        s->vm->steps = 0;
+        std::string err;
+        bool look = run_timers(*s->vm, err);
+        if (clocked && Clock::now() - s->last_look >= std::chrono::seconds(s->info.refresh)) { look = true; s->last_look = Clock::now(); }
+        if (look) refresh_locked(*s);
+        if (!err.empty()) report(err);
+      }
+      lock.lock();
+    }
+  });
 }
 
 std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
@@ -217,19 +297,26 @@ std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
   auto run = s->vm->run(compiled.script);
   if (!run.ok) { error = "the program failed: " + run.error + " (line " + std::to_string(run.line) + ")"; return nullptr; }
   if (!web_pane_first(*s->vm, s->info)) {
-    error = "the program made no ui.pane, so there is nothing to show in a browser (a canvas pane made with create_pane is window-only)";
+    error = "the program made no ui.pane, so there is nothing to show (a canvas pane made with create_pane is window-only)";
     return nullptr;
   }
   s->pane = s->info.id;
+  s->vm->steps = 0;
+  std::string tree, err;
+  uint64_t v = 0;
+  if (!web_pane_render_tree(*s->vm, s->pane, tree, v, err)) { error = err; return nullptr; }
+  s->last_tree = std::move(tree);
   return s;
 }
 
 std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::string& new_id, std::string& error) {
   std::string version;
   if (!host_.current_version(version, error)) return nullptr;
-  const std::string id = cookie_value(req.cookie, "grain_sid");
+  const std::string id = cookie_value(req.cookie, host_.cookie_name);
   {
     std::lock_guard<std::mutex> lock(mu_);
+    if (shared_ && shared_->version == version) { shared_->last = Clock::now(); return shared_; }
+    if (shared_) shared_.reset();   // the program changed: the shared copy starts over
     auto it = sessions_.find(id);
     if (it != sessions_.end() && it->second->version == version) {
       it->second->last = Clock::now();
@@ -239,11 +326,62 @@ std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::stri
   }
   auto s = make_session(error);   // outside the lock: it runs the program
   if (!s) return nullptr;
-  new_id = random_hex(16);
   std::lock_guard<std::mutex> lock(mu_);
+  if (s->info.shared) {
+    if (!shared_) shared_ = s;     // the first to finish starting is the copy everyone shares
+    start_ticker();
+    return shared_;
+  }
   reap_locked();
+  new_id = random_hex(16);
   sessions_[new_id] = s;
+  start_ticker();
   return s;
+}
+
+bool WebUi::open_stream(const Request& req, Stream& out, std::vector<std::pair<std::string, std::string>>& headers,
+                        std::string& first, std::string& error) {
+  std::string new_id;
+  std::shared_ptr<Session> s = session_for(req, new_id, error);
+  if (!s) { report(error); return false; }
+  headers = {{"Content-Type", "text/event-stream"}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}, {"X-Accel-Buffering", "no"}};
+  if (!new_id.empty()) headers.push_back({"Set-Cookie", host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "")});
+  out.session = s;
+  out.tree = req.tree;
+  {
+    std::lock_guard<std::mutex> turn(s->mu);
+    refresh_locked(*s);
+    frame_locked(*s, out.tree, first);
+    out.seen = s->seq;
+    ++s->streams;
+  }
+  first = "data: " + first + "\n\n";
+  return true;
+}
+
+bool WebUi::next_frame(Stream& st, int timeout_ms, std::string& frame) {
+  Session& s = *st.session;
+  {
+    std::unique_lock<std::mutex> lock(s.push_mu);
+    s.push_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return s.seq != st.seen; });
+    if (s.seq == st.seen) { frame.clear(); return true; }
+  }
+  std::string body;
+  {
+    std::lock_guard<std::mutex> turn(s.mu);
+    frame_locked(s, st.tree, body);
+    st.seen = s.seq;
+  }
+  frame = "data: " + body + "\n\n";
+  return true;
+}
+
+void WebUi::close_stream(Stream& st) {
+  if (!st.session) return;
+  std::lock_guard<std::mutex> turn(st.session->mu);
+  if (st.session->streams > 0) --st.session->streams;
+  st.session->last = Clock::now();
+  st.session.reset();
 }
 
 WebUi::Response WebUi::handle(const Request& req) {
@@ -256,7 +394,7 @@ WebUi::Response WebUi::handle(const Request& req) {
     return res;
   };
   if (req.path == "/favicon.ico") { res.status = 204; return res; }   // a browser asks for it unprompted: not a reason to start a session
-  const bool is_event = req.path == "/_ui/event";
+  const bool is_event = req.path == "/_ui/event" || (req.method == "POST" && req.xhr);
   if (is_event && req.method != "POST") return fail(405, "/_ui/event takes POST");
   if (!is_event && req.method != "GET" && req.method != "HEAD") return fail(405, "only GET and HEAD show the page");
   if (is_event && !req.xhr) return fail(403, "an event must carry X-Grain-UI: 1");
@@ -265,9 +403,11 @@ WebUi::Response WebUi::handle(const Request& req) {
   std::shared_ptr<Session> s = session_for(req, new_id, error);
   if (!s) return fail(500, error);
   std::string cookie_header;
-  if (!new_id.empty()) {
-    cookie_header = "grain_sid=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "");
-  }
+  if (!new_id.empty()) cookie_header = host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "");
+  auto finish_headers = [&](const char* type) {
+    res.headers = {{"Content-Type", type}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}};
+    if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
+  };
 
   std::lock_guard<std::mutex> turn(s->mu);
   s->last = Clock::now();
@@ -275,34 +415,42 @@ WebUi::Response WebUi::handle(const Request& req) {
   vm.steps = 0;
 
   if (is_event) {
-    uint64_t v = 0;
     std::string action;
     std::vector<std::pair<std::string, std::string>> fields;
     for (auto& [k, val] : parse_pairs(req.body)) {
-      if (k == "v") v = std::strtoull(val.c_str(), nullptr, 10);
-      else if (k == "action") action = val;
+      if (k == "action") action = val;
       else if (k.rfind("f.", 0) == 0) fields.push_back({k.substr(2), val});
     }
     std::string err;
-    std::string json_error;
-    if (!web_pane_event(vm, s->pane, v, action, fields, err)) json_error = err;
-    std::string html;
-    uint64_t nv = 0;
-    if (!web_pane_render(vm, s->pane, html, nv, err)) { report(err); res.status = 200; res.headers = {{"Content-Type", "application/json"}}; res.body = "{\"error\":" + json_string(host_.show_errors ? err : "the program failed") + "}"; return res; }
-    if (!json_error.empty()) report(json_error);
-    res.headers = {{"Content-Type", "application/json"}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}};
-    if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
-    res.body = "{\"v\":" + std::to_string(nv) + ",\"html\":" + json_string(html) + (json_error.empty() ? "" : ",\"error\":" + json_string(host_.show_errors ? json_error : "the program failed")) + "}";
+    const bool ok = web_pane_event(vm, s->pane, 0, action, fields, err);
+    if (!ok) report(err);
+    refresh_locked(*s);   // viewers other than this one see the change too
+    std::string frame;
+    frame_locked(*s, req.tree, frame);
+    finish_headers(req.tree ? "application/x-grain-ui+json" : "application/json");
+    if (!ok) frame = frame.substr(0, frame.size() - 1) + ",\"error\":" + json_string(host_.show_errors ? err : "the program failed") + "}";
+    res.body = frame;
     return res;
   }
 
-  std::string html, err;
-  uint64_t nv = 0;
-  if (!web_pane_render(vm, s->pane, html, nv, err)) return fail(500, err);
+  refresh_locked(*s);
+  // ?poll=N: a native client asking whether anything changed since N, without a render or a payload
+  if (req.query.rfind("poll=", 0) == 0) {
+    const uint64_t since = std::strtoull(req.query.c_str() + 5, nullptr, 10);
+    if (since == s->seq) { res.status = 204; return res; }
+  }
+  std::string frame;
+  frame_locked(*s, req.tree, frame);
+  if (req.tree) {
+    finish_headers("application/x-grain-ui+json");
+    res.body = "{\"seq\":" + std::to_string(s->seq) + ",\"title\":" + json_string(s->info.title) + ",\"width\":" + std::to_string(s->info.width) +
+               ",\"height\":" + std::to_string(s->info.height) + ",\"refresh\":" + std::to_string(s->info.refresh) + ",\"shared\":" + (s->info.shared ? "true" : "false") + ",\"tree\":" + s->last_tree + "}";
+    return res;
+  }
   const int width = s->info.width > 0 ? s->info.width : 720;
   std::string page = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
                      esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle + "</style></head><body><div id=\"app\" style=\"--w:" +
-                     std::to_string(width) + "px\" data-v=\"" + std::to_string(nv) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\">" + html +
+                     std::to_string(width) + "px\" data-seq=\"" + std::to_string(s->seq) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\">" + s->last_html +
                      "</div><script>" + kScript + "</script></body></html>";
   res.headers = {{"Content-Type", "text/html; charset=utf-8"},
                  {"Cache-Control", "no-store"},

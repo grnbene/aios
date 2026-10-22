@@ -6,6 +6,9 @@
 //     return {"status": 404, "body": "no such page"}
 //   }
 //
+// A script with no handle() is a page: what it prints is the response. One that builds a ui.pane
+// is a web app (see grain_webui.hpp).
+//
 // The script is compiled once per version of the file and run for each request
 // in a VM of its own: there is no state between requests except what it keeps
 // in files, so two requests can never see each other's variables and a crash in
@@ -320,6 +323,9 @@ bool grain_serve_request(const GrainSite& site, const GrainRequest& req, GrainRe
   vm.define_native("json", 1, 2, bi_json);
   vm.define_native("redirect", 1, 2, bi_redirect);
   vm.define_native("body_read", 0, 1, bi_body_read);
+  // A program written for a window also loads here (to be told it is a web app): no loop to run, no arguments.
+  vm.define_native("run_panes", 0, 1, [](g::Vm&, std::vector<g::Value>&, std::string&) { return g::Value::nil(); });
+  vm.define_global("args", g::Value::list({}));
 
   t_request = &req;
   t_body_error = 0;
@@ -328,7 +334,17 @@ bool grain_serve_request(const GrainSite& site, const GrainRequest& req, GrainRe
   auto run = vm.run(script);
   if (!run.ok) { out.error = "the site's script failed: " + run.error + " (line " + std::to_string(run.line) + ")"; return false; }
   g::Value* handle = vm.find_global("handle");
-  if (!handle || handle->type != g::Type::Fn) { out.error = "the site's script defines no handle(req) function"; return false; }
+  if (!handle || handle->type != g::Type::Fn) {
+    // A page script: what it prints is the page, as a PHP file's output is.
+    g::WebPaneInfo pane;
+    if (g::web_pane_first(vm, pane)) { out.ui_app = true; return true; }   // it builds a ui.pane: a web app
+    std::string text;
+    for (const auto& line : printed) text += line + "\n";
+    out.status = 200;
+    out.headers.push_back({"Content-Type", "text/html; charset=utf-8"});
+    out.body.assign(text.begin(), text.end());
+    return true;
+  }
 
   // the request, as the script sees it
   auto r = std::make_shared<g::MapObj>();

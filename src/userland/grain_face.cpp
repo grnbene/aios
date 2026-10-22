@@ -18,6 +18,7 @@
 // frames by the field's id; a button's or a field's Enter calls the grain
 // function it was given, with the pane's field texts as a map.
 #include <cctype>
+#include <cstdio>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -248,6 +249,8 @@ class FacePane final : public PaneDriver {
   uint64_t version() const { return version_; }
   int refresh() const { return refresh_; }
   void set_refresh(int s) { refresh_ = s; }
+  bool shared() const { return shared_; }
+  void set_shared(bool v) { shared_ = v; }
 
   bool render_html(Vm& vm, std::string& html, std::string& error) {
     vm_ = &vm;
@@ -255,9 +258,134 @@ class FacePane final : public PaneDriver {
     Value tree = call(view_, error);
     if (!error.empty()) { error = "view(): " + error; return false; }
     actions_.clear();
+    path_.clear();
     ++version_;
     html.clear();
     if (!html_widget(tree, html, error, 0)) { error = "view(): " + error; return false; }
+    return true;
+  }
+
+  bool render_tree(Vm& vm, std::string& json, std::string& error) {
+    vm_ = &vm;
+    web_ = true;
+    Value tree = call(view_, error);
+    if (!error.empty()) { error = "view(): " + error; return false; }
+    actions_.clear();
+    path_.clear();
+    ++version_;
+    json.clear();
+    if (!json_widget(tree, json, error, 0)) { error = "view(): " + error; return false; }
+    return true;
+  }
+
+  static std::string jstr(const std::string& s) {
+    std::string o = "\"";
+    for (unsigned char c : s) {
+      switch (c) {
+        case '"': o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n"; break;
+        case '\r': o += "\\r"; break;
+        case '\t': o += "\\t"; break;
+        default:
+          if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+          else o += (char)c;
+      }
+    }
+    return o + "\"";
+  }
+
+  // Any grain value as JSON: table rows and option values.
+  static void value_json(const Value& v, std::string& out, int depth) {
+    if (depth > 32) { out += "null"; return; }
+    switch (v.type) {
+      case Type::Nil: out += "null"; return;
+      case Type::Bool: out += v.b ? "true" : "false"; return;
+      case Type::Int: out += std::to_string(v.i); return;
+      case Type::Real: {
+        if (!(v.d == v.d) || v.d > 1e308 || v.d < -1e308) { out += "null"; return; }
+        out += v.to_text();
+        return;
+      }
+      case Type::Str: out += jstr(v.str()); return;
+      case Type::List: {
+        out += "[";
+        bool first = true;
+        for (const auto& e : v.list_items()) { if (!first) out += ","; first = false; value_json(e, out, depth + 1); }
+        out += "]";
+        return;
+      }
+      case Type::Map: {
+        out += "{";
+        bool first = true;
+        for (const auto& kv : as_map(v)->entries) {
+          if (is_callable(kv.second)) continue;
+          if (!first) out += ",";
+          first = false;
+          out += jstr(kv.first) + ":";
+          value_json(kv.second, out, depth + 1);
+        }
+        out += "}";
+        return;
+      }
+      default: out += jstr(v.to_text()); return;
+    }
+  }
+
+  bool json_widget(const Value& v, std::string& out, std::string& error, int depth) {
+    auto m = as_map(v);
+    Value* type_v = m ? m->find("widget") : nullptr;
+    if (!type_v || type_v->type != Type::Str) {
+      error = std::string("a widget (ui.column, ui.text, ...) is expected, got a ") + type_name(v.type);
+      return false;
+    }
+    if (depth > 200) { error = "the widgets nest more than 200 deep"; return false; }
+    const std::string& type = type_v->str();
+    out += "{\"widget\":" + jstr(type);
+    Value* label = m->find("label");
+    if (label) out += ",\"label\":" + jstr(label->to_text());
+    // the options that are data; a function (on_enter, on_click) becomes an action name
+    out += ",\"opts\":{";
+    bool first = true;
+    if (Value* o = m->find("opts"); o && o->type == Type::Map) {
+      for (const auto& kv : as_map(*o)->entries) {
+        if (is_callable(kv.second)) continue;
+        if (!first) out += ",";
+        first = false;
+        out += jstr(kv.first) + ":";
+        value_json(kv.second, out, 0);
+      }
+    }
+    out += "}";
+    if (Value* fn = m->find("on_click")) out += ",\"act\":" + jstr(action_for(*fn, "the button \"" + (label ? label->to_text() : std::string()) + "\""));
+    if (type == "field") {
+      Value* idv = m->find("id");
+      const std::string id = idv ? idv->to_text() : std::string();
+      auto have = web_fields_.find(id);
+      const std::string value = have != web_fields_.end() ? have->second : opt_str(v, "value");
+      if (have == web_fields_.end()) web_fields_[id] = value;
+      out += ",\"id\":" + jstr(id) + ",\"value\":" + jstr(value);
+      if (const Value* e = opt(v, "on_enter"); e && is_callable(*e)) out += ",\"enter\":" + jstr(action_for(*e, "the field \"" + id + "\"'s on_enter"));
+    } else if (Value* val = m->find("value")) {
+      out += ",\"value\":";
+      value_json(*val, out, 0);
+    }
+    if (Value* data = m->find("data")) { out += ",\"data\":"; value_json(*data, out, 0); }
+    if (Value* kids = m->find("children"); kids && kids->type == Type::List) {
+      out += ",\"children\":[";
+      bool firstk = true;
+      const std::string here = path_;
+      size_t at = 0;
+      for (const auto& c : kids->list_items()) {
+        if (!firstk) out += ",";
+        firstk = false;
+        path_ = here + "/" + std::to_string(at++);
+        if (!json_widget(c, out, error, depth + 1)) return false;
+      }
+      path_ = here;
+      out += "]";
+    }
+    out += "}";
     return true;
   }
 
@@ -266,7 +394,8 @@ class FacePane final : public PaneDriver {
     vm_ = &vm;
     web_ = true;
     for (const auto& kv : fields) web_fields_[kv.first] = kv.second;
-    if (action.empty() || version != version_) return true;   // only the fields changed, or a page from before the last render
+    (void)version;
+    if (action.empty()) return true;   // only the fields changed
     auto it = actions_.find(action);
     if (it == actions_.end()) return true;
     std::string err;
@@ -327,8 +456,15 @@ class FacePane final : public PaneDriver {
     const std::string label_text = label ? label->to_text() : std::string();
     if (type == "column" || type == "row") {
       out += "<div class=\"w-" + type + "\" style=\"gap:" + std::to_string(opt_int(v, "gap", 8)) + "px;padding:" + std::to_string(opt_int(v, "pad", 0)) + "px\">";
-      if (Value* kids = m->find("children"); kids && kids->type == Type::List)
-        for (const auto& c : kids->list_items()) if (!html_widget(c, out, error, depth + 1)) return false;
+      if (Value* kids = m->find("children"); kids && kids->type == Type::List) {
+        const std::string here = path_;
+        size_t at = 0;
+        for (const auto& c : kids->list_items()) {
+          path_ = here + "/" + std::to_string(at++);
+          if (!html_widget(c, out, error, depth + 1)) return false;
+        }
+        path_ = here;
+      }
       out += "</div>";
       return true;
     }
@@ -436,6 +572,8 @@ class FacePane final : public PaneDriver {
   }
 
   bool web_ = false;
+  std::string path_;           // where the widget being rendered sits (for stable action names)
+  bool shared_ = false;
   uint64_t version_ = 0;
   int refresh_ = 0;
   std::map<std::string, std::string> web_fields_;
@@ -503,7 +641,19 @@ class FacePane final : public PaneDriver {
 
   // `who` names it in an error: the button "Receive", the field "sku"'s on_enter.
   std::string action_for(const Value& fn, const std::string& who) {
-    const std::string name = "grain_action_" + std::to_string(actions_.size() + 1);
+    std::string name;
+    if (web_) {
+      // In a browser (or a native client) several viewers share one program, and each render happens when the data
+      // changes, so an action must keep its name from one render to the next: it is where the widget sits and what
+      // it says. An old page pressing a button that has since moved or changed finds no such action and does nothing.
+      static const char* hex = "0123456789abcdef";
+      size_t h = std::hash<std::string>()(path_ + "|" + who);
+      name = "a";
+      for (int k = 0; k < 12; ++k) { name += hex[h & 15]; h >>= 4; }
+      while (actions_.count(name)) name += "x";
+    } else {
+      name = "grain_action_" + std::to_string(actions_.size() + 1);
+    }
     actions_[name] = {fn, who};
     return name;
   }
@@ -576,6 +726,7 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (Value* v = o->find("width")) { if (!want_number(*v, error, "ui.pane")) return Value::nil(); w = (int)v->as_int(); }
   if (Value* v = o->find("height")) { if (!want_number(*v, error, "ui.pane")) return Value::nil(); h = (int)v->as_int(); }
   auto pane = std::make_shared<FacePane>(*view, w, h);
+  if (Value* sh = o->find("shared")) pane->set_shared(sh->truthy());   // one copy of the program for every visitor: they all see the same live data
   if (Value* r = o->find("refresh"); r && r->is_number()) pane->set_refresh((int)r->as_int());   // a browser redraws this often (seconds); a window already redraws
   return register_driven_pane(vm, title, w, h, pane);
 }
@@ -664,6 +815,7 @@ bool web_pane_first(const Vm& vm, WebPaneInfo& out) {
       out.width = p.width;
       out.height = p.height;
       out.refresh = f->refresh();
+      out.shared = f->shared();
       return true;
     }
   }
@@ -674,6 +826,14 @@ bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, 
   FacePane* f = web_face(vm, id);
   if (!f) { error = "that pane is not a ui.pane"; return false; }
   if (!f->render_html(vm, html, error)) return false;
+  version = f->version();
+  return true;
+}
+
+bool web_pane_render_tree(Vm& vm, uint64_t id, std::string& json, uint64_t& version, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f) { error = "that pane is not a ui.pane"; return false; }
+  if (!f->render_tree(vm, json, error)) return false;
   version = f->version();
   return true;
 }

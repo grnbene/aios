@@ -40,6 +40,7 @@ struct GrainResponse {
   std::vector<std::pair<std::string, std::string>> headers;
   std::vector<uint8_t> body;
   std::string error;           // set when the script failed: the caller answers 500
+  bool ui_app = false;         // the script has no handle() but builds a ui.pane: serve it as a web app (grain_webui) instead
   int body_error = 0;          // 1 the request body could not be read, 2 it was too large (400 / 413 rather than 500)
 };
 

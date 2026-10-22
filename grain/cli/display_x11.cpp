@@ -851,6 +851,7 @@ class X11Display final : public g::Display {
         }
       }
       if (!sync(vm, error)) return false;
+      { std::string timer_error; g::run_timers(vm, timer_error); if (!timer_error.empty()) { error = "run_panes(): " + timer_error; return false; } }   // data that changes on its own; the draw below shows it
       for (auto& [id, w] : windows_)
         if (!draw(vm, id, w, error)) return false;
       if (headless_) {

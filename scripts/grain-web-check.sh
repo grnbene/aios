@@ -11,6 +11,9 @@ cp -r "$HERE/grain-web/." "$WORK/"
 mkdir -p "$WORK/data"
 PORT=$((20000 + RANDOM % 20000))
 UIPORT=$((PORT + 1))
+LIVEPORT=$((PORT + 2))
+mkdir -p "$WORK/live"
+cp "$HERE/../grain/tests/web/live.gr" "$WORK/live/live.gr"
 mkdir -p "$WORK/ui"
 cp "$HERE/../grain/tests/web/counter.gr" "$WORK/ui/counter.gr"
 echo "static next to the app" > "$WORK/ui/readme.txt"
@@ -30,6 +33,12 @@ vhost ui {
   root $WORK/ui
   index none.html
   grain_ui counter.gr
+}
+vhost live {
+  listen $LIVEPORT loopback
+  root $WORK/live
+  index none.html
+  grain_ui live.gr
 }
 CONF
 "$BIN" "$WORK/web.conf" > "$WORK/server.log" 2>&1 &
@@ -92,6 +101,12 @@ check "grain_ui does not serve the source" "404"                 "$(code http://
 if command -v python3 >/dev/null; then
   if GRAIN_WEB_PORT=$UIPORT python3 "$HERE/../grain/tests/web/web_ui_test.py" > "$WORK/ui.out" 2>&1; then echo "ok   grain_ui: $(grep -c '^ok' "$WORK/ui.out") protocol checks"
   else echo "FAIL grain_ui:"; cat "$WORK/ui.out"; FAILED=1; fi
+fi
+
+# live data through the server: pushed updates, shared state, nothing asked for
+if command -v python3 >/dev/null; then
+  if GRAIN_WEB_PORT=$LIVEPORT python3 "$HERE/../grain/tests/web/live_test.py" > "$WORK/live.out" 2>&1; then echo "ok   live data: $(grep -c '^ok' "$WORK/live.out") checks (pushed over a held connection)"
+  else echo "FAIL live data:"; cat "$WORK/live.out"; FAILED=1; fi
 fi
 
 exit $FAILED

@@ -18,6 +18,8 @@
 // yearday 1-366, offset the zone's distance from UTC in seconds.
 #include <chrono>
 #include <cmath>
+#include <thread>
+#include <algorithm>
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -295,7 +297,93 @@ Value bi_date_make(Vm&, std::vector<Value>& args, std::string& error) {
 
 }  // namespace
 
+// ---- timers: data that changes on its own -------------------------------------------------
+
+double wall_ms() {
+  return (double)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+
+namespace {
+
+bool callable(const Value& v) { return v.type == Type::Fn || v.type == Type::Native || v.type == Type::BoundMethod; }
+
+Value add_timer(Vm& vm, std::vector<Value>& args, std::string& error, bool repeat, const char* who) {
+  if (!args[0].is_number() || args[0].as_double() < 0) { error = std::string(who) + "() wants a number of seconds"; return Value::nil(); }
+  if (!callable(args[1])) { error = std::string(who) + "() wants a function to call"; return Value::nil(); }
+  if (vm.timers.size() >= 1000) { error = std::string(who) + "(): too many timers"; return Value::nil(); }
+  Vm::Timer t;
+  t.id = vm.next_timer_id++;
+  t.period_ms = repeat ? std::max(args[0].as_double() * 1000.0, 1.0) : 0.0;
+  t.due_ms = wall_ms() + args[0].as_double() * 1000.0;
+  t.fn = args[1];
+  vm.timers.push_back(t);
+  return Value::integer((int64_t)t.id);
+}
+
+Value bi_every(Vm& vm, std::vector<Value>& args, std::string& error) { return add_timer(vm, args, error, true, "every"); }
+Value bi_after(Vm& vm, std::vector<Value>& args, std::string& error) { return add_timer(vm, args, error, false, "after"); }
+
+Value bi_cancel(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Int) { error = "cancel() wants a timer from every() or after()"; return Value::nil(); }
+  const auto before = vm.timers.size();
+  vm.timers.erase(std::remove_if(vm.timers.begin(), vm.timers.end(), [&](const Vm::Timer& t) { return (int64_t)t.id == args[0].i; }), vm.timers.end());
+  return Value::boolean(vm.timers.size() != before);
+}
+
+// wait(seconds): sleep, firing timers as they come due - for a program with no window or server loop to do it
+Value bi_wait(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!args[0].is_number() || args[0].as_double() < 0) { error = "wait() wants a number of seconds"; return Value::nil(); }
+  const double end = wall_ms() + args[0].as_double() * 1000.0;
+  for (;;) {
+    double next = -1;
+    run_timers(vm, error, &next);
+    if (!error.empty()) return Value::nil();
+    const double now = wall_ms();
+    if (now >= end) break;
+    double nap = end - now;
+    if (next >= 0) nap = std::min(nap, next);
+    std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(std::max(nap, 0.5) * 1000.0)));
+  }
+  return Value::nil();
+}
+
+}  // namespace
+
+bool run_timers(Vm& vm, std::string& error, double* until_next_ms) {
+  bool ran = false;
+  const double now = wall_ms();
+  std::vector<Vm::Timer> due;
+  for (auto& t : vm.timers)
+    if (t.due_ms <= now) due.push_back(t);
+  for (auto& t : due) {
+    // reschedule (or drop) before calling, so a timer that cancels itself, or is slow, behaves
+    for (auto it = vm.timers.begin(); it != vm.timers.end(); ++it) {
+      if (it->id != t.id) continue;
+      if (it->period_ms > 0) it->due_ms = std::max(it->due_ms + it->period_ms, now);
+      else vm.timers.erase(it);
+      break;
+    }
+    std::string err;
+    vm.call(t.fn, {}, err);
+    ran = true;
+    if (!err.empty()) {
+      if (error.empty()) error = "a timer's function failed: " + err;
+      vm.timers.erase(std::remove_if(vm.timers.begin(), vm.timers.end(), [&](const Vm::Timer& x) { return x.id == t.id; }), vm.timers.end());   // a failing timer is not kept
+    }
+  }
+  if (until_next_ms) {
+    *until_next_ms = -1;
+    const double after = wall_ms();
+    for (const auto& t : vm.timers) *until_next_ms = *until_next_ms < 0 ? std::max(t.due_ms - after, 0.0) : std::min(*until_next_ms, std::max(t.due_ms - after, 0.0));
+  }
+  return ran;
+}
+
 void install_time_builtins(Vm& vm) {
+  vm.define_native("every", 2, 2, bi_every);
+  vm.define_native("after", 2, 2, bi_after);
+  vm.define_native("cancel", 1, 1, bi_cancel);
+  vm.define_native("wait", 1, 1, bi_wait);
   vm.define_native("now", 0, 0, bi_now);
   vm.define_native("date_parts", 1, 2, bi_date_parts);
   vm.define_native("date_format", 2, 3, bi_date_format);

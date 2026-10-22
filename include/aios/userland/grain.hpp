@@ -457,6 +457,18 @@ class Vm {
   uint64_t step_limit = 0;   // 0 = no limit
   uint64_t steps = 0;
 
+  // Data that changes on its own. `every(seconds, fn)` and `after(seconds, fn)` register here; whatever
+  // runs the program - a window's frame loop, the web server, `wait(seconds)` - calls run_timers() often
+  // and fires what is due. A view that reads the data shows the change without being told.
+  struct Timer {
+    uint64_t id = 0;
+    double due_ms = 0;
+    double period_ms = 0;   // 0: once
+    Value fn;
+  };
+  std::vector<Timer> timers;
+  uint64_t next_timer_id = 1;
+
   // Compile functions to native code where the machine can run it (AArch64:
   // the Pi's kernel, or any arm64 host). Off = interpret everything, which is
   // also the reference the native code is checked against.
@@ -490,6 +502,11 @@ void install_core_builtins(Vm& vm);
 // Parts of install_core_builtins, one file each:
 void install_hash_builtins(Vm& vm);    // sha256, sha1, sha512, sha384, md5, keccak256, hmac_sha256 (grain_std_hash.cpp)
 void install_regex_builtins(Vm& vm);   // regex_test/match/find_all/replace/split (grain_std_regex.cpp)
+// Fires the VM's due timers. True when at least one ran (the program's data may have changed); an
+// error in a timer's function goes to `error` and that timer is dropped. `until_next_ms` (if given)
+// is how long until the next one is due, or -1 when there are none.
+bool run_timers(Vm& vm, std::string& error, double* until_next_ms = nullptr);
+double wall_ms();   // the clock timers use: milliseconds, monotonic
 void install_time_builtins(Vm& vm);    // now, date_parts/format/parse/make (grain_std_time.cpp)
 void install_text_builtins(Vm& vm);    // format, sort_by, group_by, uuid (grain_std_text.cpp)
 void install_bytes_builtins(Vm& vm);   // bytes, bytes_get/set, pack/unpack, bytes_* (grain_std_bytes.cpp)
@@ -568,12 +585,17 @@ struct WebPaneInfo {
   std::string title;
   int width = 0, height = 0;
   int refresh = 0;           // seconds between redraws the page asks for (the pane's "refresh" option); 0 = none
+  bool shared = false;       // the pane's "shared" option: one copy of the program for every visitor, so they all see the same live data
 };
 // The first ui.pane the program made, if it made one.
 bool web_pane_first(const Vm& vm, WebPaneInfo& out);
 // Calls the pane's view and returns the widgets as an HTML fragment. `version` changes on every
 // render: an event names the version it was shown, so one from an old page is ignored.
 bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, std::string& error);
+// The same widgets as data rather than HTML, for a native client (`grain open`): a JSON object
+// {"widget", "opts", "label", "id", "act", "enter", "value", "data", "children"} per widget, where "act"
+// and "enter" name the action to send back for a button or a field's Enter. `version` as above.
+bool web_pane_render_tree(Vm& vm, uint64_t id, std::string& json, uint64_t& version, std::string& error);
 // A click or Enter: `fields` are the texts typed in the browser's fields, `action` the button or
 // field the page named (empty: only the fields changed). Call web_pane_render afterwards.
 bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& action,
