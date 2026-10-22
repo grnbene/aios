@@ -403,12 +403,13 @@ void set_display(Display* d);   // not owned
 Display* display();
 
 // What a Display uses of the panes a program registered (grain_builtins.cpp).
+// Panes belong to the VM that registered them: each call sees only `vm`'s.
 struct PaneInfo {
   uint64_t id = 0;
   std::string title;
   int x = 0, y = 0, width = 0, height = 0;
 };
-std::vector<PaneInfo> pane_list();
+std::vector<PaneInfo> pane_list(const Vm& vm);
 // Runs the pane's draw callback, then copies its canvas out (ARGB, row-major).
 bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, int& height, std::string& error);
 // Delivers an event map to the pane's callbacks (event, then click or key).

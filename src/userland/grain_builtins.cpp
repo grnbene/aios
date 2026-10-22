@@ -5962,10 +5962,37 @@ struct GrainPane {
   Value key_cb;
   Value custom_data;
   uint32_t compositor_window_id = 0;
+  const Vm* owner = nullptr;   // the VM that registered it: its callbacks are that VM's closures
 };
 
+// Every VM's panes, each tagged with its owner. Inside aios several VMs live at
+// once (a desktop app, `aios grain run` on the command threads), so the list
+// is locked, and every pane call sees only its own VM's panes: one VM must
+// never run another's callbacks.
 static std::vector<std::shared_ptr<GrainPane>> g_grain_panes;
 static uint64_t g_next_grain_pane_id = 1;
+static aios::hal::Mutex g_grain_panes_mu;
+
+static std::vector<std::shared_ptr<GrainPane>> panes_of(const Vm& vm) {
+  std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
+  std::vector<std::shared_ptr<GrainPane>> out;
+  for (const auto& p : g_grain_panes)
+    if (p->owner == &vm) out.push_back(p);
+  return out;
+}
+
+static void add_pane(const std::shared_ptr<GrainPane>& pane) {
+  std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
+  pane->id = g_next_grain_pane_id++;
+  g_grain_panes.push_back(pane);
+}
+
+static bool remove_pane(const std::shared_ptr<GrainPane>& pane) {
+  std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
+  const auto before = g_grain_panes.size();
+  g_grain_panes.erase(std::remove(g_grain_panes.begin(), g_grain_panes.end(), pane), g_grain_panes.end());
+  return g_grain_panes.size() != before;
+}
 
 static std::shared_ptr<MapObj> pane_to_map(const std::shared_ptr<GrainPane>& pane) {
   auto map = std::make_shared<MapObj>();
@@ -5991,15 +6018,12 @@ static std::shared_ptr<MapObj> pane_to_map(const std::shared_ptr<GrainPane>& pan
   return map;
 }
 
-static std::shared_ptr<GrainPane> get_pane_from_value(const Value& v) {
+static std::shared_ptr<GrainPane> get_pane_from_value(const Vm& vm, const Value& v) {
+  uint64_t target_id = 0;
   if (v.type == Type::Extern && v.obj) {
     auto ext = std::dynamic_pointer_cast<ExternObj>(v.obj);
-    if (ext && ext->kind_name == "grain_pane") {
-      return std::static_pointer_cast<GrainPane>(ext->ptr);
-    }
-  }
-  uint64_t target_id = 0;
-  if (v.type == Type::Int) {
+    if (ext && ext->kind_name == "grain_pane") target_id = std::static_pointer_cast<GrainPane>(ext->ptr)->id;
+  } else if (v.type == Type::Int) {
     target_id = (uint64_t)v.i;
   } else if (v.type == Type::Str) {
     // strtoull, not stoull: bare metal builds with exceptions off.
@@ -6014,9 +6038,9 @@ static std::shared_ptr<GrainPane> get_pane_from_value(const Value& v) {
       if (id_val && id_val->type == Type::Int) target_id = (uint64_t)id_val->i;
     }
   }
-  // A pane that is not registered (never was, or closed since) is no pane: falling
-  // back to the newest one closed or redrew a window nobody named.
-  for (const auto& p : g_grain_panes) {
+  // A pane that is not registered (never was, closed since, or another VM's) is
+  // no pane: falling back to the newest one closed or redrew a window nobody named.
+  for (const auto& p : panes_of(vm)) {
     if (p->id == target_id) return p;
   }
   return nullptr;
@@ -6039,15 +6063,15 @@ static Value call_pane_cb(Vm& vm, const Value& cb, const Value& first, const Val
   return vm.call(cb, {first, second}, error);
 }
 
-Value bi_register_pane(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_register_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.empty()) {
     error = "register_pane(): expects options map or (title, [width, height], draw_cb, [event_cb])";
     return Value::nil();
   }
 
   auto pane = std::make_shared<GrainPane>();
-  pane->id = g_next_grain_pane_id++;
-  pane->title = "Grain Pane " + std::to_string(pane->id);
+  pane->owner = &vm;
+  pane->title.clear();
   pane->width = 800;
   pane->height = 600;
   pane->x = 50;
@@ -6105,25 +6129,21 @@ Value bi_register_pane(Vm&, std::vector<Value>& args, std::string& error) {
   pane->canvas->height = (uint32_t)pane->height;
   pane->canvas->pixels.resize((size_t)pane->width * pane->height, 0x00000000);
 
-  g_grain_panes.push_back(pane);
+  add_pane(pane);
+  if (pane->title.empty()) pane->title = "Grain Pane " + std::to_string(pane->id);
   return Value::object(Type::Map, pane_to_map(pane));
 }
 
-Value bi_unregister_pane(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_unregister_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.empty()) { error = "unregister_pane(): wants pane ID or map"; return Value::boolean(false); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "unregister_pane(): pane not found"; return Value::boolean(false); }
-
-  auto it = std::remove_if(g_grain_panes.begin(), g_grain_panes.end(),
-                           [pane](const std::shared_ptr<GrainPane>& p) { return p->id == pane->id; });
-  bool removed = (it != g_grain_panes.end());
-  g_grain_panes.erase(it, g_grain_panes.end());
-  return Value::boolean(removed);
+  return Value::boolean(remove_pane(pane));
 }
 
-Value bi_list_panes(Vm&, std::vector<Value>&, std::string&) {
+Value bi_list_panes(Vm& vm, std::vector<Value>&, std::string&) {
   std::vector<Value> list;
-  for (const auto& pane : g_grain_panes) {
+  for (const auto& pane : panes_of(vm)) {
     list.push_back(Value::object(Type::Map, pane_to_map(pane)));
   }
   return Value::list(std::move(list));
@@ -6131,7 +6151,7 @@ Value bi_list_panes(Vm&, std::vector<Value>&, std::string&) {
 
 Value bi_pane_render(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.empty()) { error = "pane_render(): wants pane ID or handle"; return Value::nil(); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "pane_render(): pane not found"; return Value::nil(); }
 
   std::shared_ptr<GrainCanvas> cv = pane->canvas;
@@ -6164,7 +6184,7 @@ Value bi_pane_render(Vm& vm, std::vector<Value>& args, std::string& error) {
 
 Value bi_pane_dispatch_event(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.size() < 2) { error = "pane_dispatch_event(): wants (pane, event)"; return Value::boolean(false); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "pane_dispatch_event(): pane not found"; return Value::boolean(false); }
 
   std::shared_ptr<MapObj> ev_map;
@@ -6212,16 +6232,16 @@ Value bi_pane_dispatch_event(Vm& vm, std::vector<Value>& args, std::string& erro
   return last_result;
 }
 
-Value bi_pane_get_canvas(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_pane_get_canvas(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.empty()) { error = "pane_get_canvas(): wants pane"; return Value::nil(); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "pane_get_canvas(): pane not found"; return Value::nil(); }
   return Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", pane->canvas));
 }
 
-Value bi_pane_set_bounds(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_pane_set_bounds(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.size() < 3) { error = "pane_set_bounds(): wants (pane, w, h) or (pane, x, y, w, h)"; return Value::nil(); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "pane_set_bounds(): pane not found"; return Value::nil(); }
 
   if (args.size() >= 5) {
@@ -6245,9 +6265,9 @@ Value bi_pane_set_bounds(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, pane_to_map(pane));
 }
 
-Value bi_pane_get(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_pane_get(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args.empty()) { error = "pane_get(): wants pane"; return Value::nil(); }
-  auto pane = get_pane_from_value(args[0]);
+  auto pane = get_pane_from_value(vm, args[0]);
   if (!pane) { error = "pane_get(): pane not found"; return Value::nil(); }
   return Value::object(Type::Map, pane_to_map(pane));
 }
@@ -6259,9 +6279,9 @@ static Display* g_display = nullptr;
 void set_display(Display* d) { g_display = d; }
 Display* display() { return g_display; }
 
-std::vector<PaneInfo> pane_list() {
+std::vector<PaneInfo> pane_list(const Vm& vm) {
   std::vector<PaneInfo> out;
-  for (const auto& p : g_grain_panes) {
+  for (const auto& p : panes_of(vm)) {
     if (!p->visible) continue;
     PaneInfo info;
     info.id = p->id;
@@ -6275,14 +6295,14 @@ std::vector<PaneInfo> pane_list() {
   return out;
 }
 
-static std::shared_ptr<GrainPane> pane_by_id(uint64_t id) {
-  for (const auto& p : g_grain_panes)
+static std::shared_ptr<GrainPane> pane_by_id(const Vm& vm, uint64_t id) {
+  for (const auto& p : panes_of(vm))
     if (p->id == id) return p;
   return nullptr;
 }
 
 bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, int& height, std::string& error) {
-  auto pane = pane_by_id(id);
+  auto pane = pane_by_id(vm, id);
   if (!pane) { error = "pane " + std::to_string(id) + " is not registered"; return false; }
   if (!pane->canvas) {
     pane->canvas = std::make_shared<GrainCanvas>();
@@ -6303,7 +6323,7 @@ bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, in
 }
 
 bool pane_event(Vm& vm, uint64_t id, const Value& event, std::string& error) {
-  auto pane = pane_by_id(id);
+  auto pane = pane_by_id(vm, id);
   if (!pane) return true;   // closed by an earlier event of the same batch: nothing to deliver to
   std::vector<Value> args{Value::object(Type::Extern, std::make_shared<ExternObj>("grain_pane", pane)), event};
   bi_pane_dispatch_event(vm, args, error);
@@ -6311,7 +6331,7 @@ bool pane_event(Vm& vm, uint64_t id, const Value& event, std::string& error) {
 }
 
 bool pane_resized(Vm& vm, uint64_t id, int width, int height, std::string& error) {
-  auto pane = pane_by_id(id);
+  auto pane = pane_by_id(vm, id);
   if (!pane) return true;
   if (width < 1 || height < 1) return true;   // minimised: keep the last size
   pane->width = width;
@@ -6328,12 +6348,12 @@ bool pane_resized(Vm& vm, uint64_t id, int width, int height, std::string& error
 }
 
 bool pane_closed(Vm& vm, uint64_t id, std::string& error) {
-  auto pane = pane_by_id(id);
+  auto pane = pane_by_id(vm, id);
   if (!pane) return true;
   auto ev = std::make_shared<MapObj>();
   ev->put("type", Value::string("close"));
   const bool ok = pane_event(vm, id, Value::object(Type::Map, ev), error);
-  g_grain_panes.erase(std::remove(g_grain_panes.begin(), g_grain_panes.end(), pane), g_grain_panes.end());
+  remove_pane(pane);
   return ok;
 }
 

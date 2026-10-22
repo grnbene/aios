@@ -114,8 +114,8 @@ class SdlDisplay final : public g::Display {
   }
 
   // Windows for new panes; none for panes the program closed.
-  bool sync(std::string& error) {
-    const auto panes = g::pane_list();
+  bool sync(const g::Vm& vm, std::string& error) {
+    const auto panes = g::pane_list(vm);
     for (auto it = windows_.begin(); it != windows_.end();) {
       const bool alive = std::any_of(panes.begin(), panes.end(), [&](const g::PaneInfo& p) { return p.id == it->first; });
       if (alive) { ++it; continue; }
@@ -281,7 +281,7 @@ class SdlDisplay final : public g::Display {
       }
       case SDL_QUIT: {
         // The application was asked to quit (Cmd-Q, the last window on some systems): every pane closes.
-        for (const auto& p : g::pane_list())
+        for (const auto& p : g::pane_list(vm))
           if (!g::pane_closed(vm, p.id, error)) return false;
         return true;
       }
@@ -320,13 +320,13 @@ class SdlDisplay final : public g::Display {
     size_t scripted = 0;
     for (int64_t frame = 0; opts.max_frames <= 0 || frame < opts.max_frames; ++frame) {
       const uint32_t started = SDL_GetTicks();
-      if (!sync(error)) return false;
+      if (!sync(vm, error)) return false;
       if (windows_.empty()) return true;   // every pane closed: run_panes() is done
       if (scripted < opts.script.size() && !push_scripted(vm, opts.script[scripted++], error)) return false;
       SDL_Event e;
       while (SDL_PollEvent(&e))
         if (!translate(vm, e, error)) return false;
-      if (!sync(error)) return false;
+      if (!sync(vm, error)) return false;
       for (auto& [id, w] : windows_)
         if (!draw(vm, id, w, error)) return false;
       const uint32_t spent = SDL_GetTicks() - started;
