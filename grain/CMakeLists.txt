@@ -60,6 +60,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/core/base64.cpp
   ${AIOS_ROOT}/src/core/result.cpp
   ${AIOS_ROOT}/src/core/json.cpp
+  ${AIOS_ROOT}/src/core/ids.cpp
   ${AIOS_ROOT}/src/userland/grain_sockets.cpp
   ${AIOS_ROOT}/src/crypto/sha256.cpp
   ${AIOS_ROOT}/src/crypto/sha1.cpp
