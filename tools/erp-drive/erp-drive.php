@@ -27,6 +27,7 @@ class TimedDB {
       if (preg_match('/^\s*WITH\s/i', $sql)) $sql = preg_replace('/\)\s*SELECT\s+(?!SQL_NO_CACHE)/i', ') SELECT SQL_NO_CACHE ', $sql, 1);
       else $sql = preg_replace('/^\s*SELECT\s/i', 'SELECT SQL_NO_CACHE ', $sql, 1);
     }
+    if ($lf = getenv('LOG')) file_put_contents($lf, $sql . "\n;;;\n", FILE_APPEND);
     $t = hrtime(true);
     try { $r = $this->a->query($sql, $params); $err = null; }
     catch (\Throwable $e) { $r = null; $err = $e->getMessage(); }
@@ -43,7 +44,7 @@ class TimedDB {
 // Anything the models read from config/session that this drive does not set is null.
 class Bag { public $data = []; function get($k) { return $this->data[$k] ?? null; } function set($k, $v) { $this->data[$k] = $v; } function has($k) { return isset($this->data[$k]); } function __call($n, $a) { return null; } }
 
-$raw = new DB\MySQLi(getenv('DBHOST') ?: '127.0.0.1', getenv('DBUSER') ?: 'root', getenv('DBPASS') ?: '', 'summitholding', $port);
+$raw = new DB\MySQLi(getenv('DBHOST') ?: '127.0.0.1', getenv('DBUSER') ?: 'root', getenv('DBPASS') ?: '', getenv('DBNAME') ?: 'summitholding', $port);
 $db = new TimedDB($raw, $nocache);
 $registry = new Registry();
 $registry->set('db', $db);

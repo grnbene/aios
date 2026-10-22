@@ -3,7 +3,7 @@
 ASQL and on MariaDB through PyMySQL (INT -> int, DECIMAL -> Decimal, DATE/DATETIME -> datetime,
 an unparsable value -> an exception), compared value AND Python type, cell by cell.
   python3 cmptyped.py STMT_DIR [asql=127.0.0.1:13401] [maria=127.0.0.1:3306]"""
-import sys, glob, hashlib, decimal, collections
+import os, sys, glob, hashlib, decimal, collections
 import pymysql
 opt = {'asql': '127.0.0.1:13401', 'maria': '127.0.0.1:3306'}
 for a in sys.argv[2:]:
@@ -11,8 +11,8 @@ for a in sys.argv[2:]:
     opt[k] = v
 def conn(spec, user, pw):
     h, p = spec.split(':')
-    return pymysql.connect(host=h, port=int(p), user=user, password=pw, database='summitholding', connect_timeout=30, read_timeout=600)
-A = conn(opt['asql'], 'root', ''); M = conn(opt['maria'], 'bench', 'bench')
+    return pymysql.connect(host=h, port=int(p), user=user, password=pw, database=os.environ.get('DBNAME','versioneight'), connect_timeout=30, read_timeout=600)
+A = conn(opt['asql'], 'root', ''); M = conn(opt['maria'], os.environ.get('MUSER','devops'), os.environ.get('MPASS',''))
 def run(c, q):
     cur = c.cursor()
     try:

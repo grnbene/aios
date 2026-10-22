@@ -46,3 +46,23 @@ Claude), never push; no test suites, drive it with probes.
    DUMP, and the same statements on MariaDB; fix every mismatch/error and the
    slowest statements. Keep the OLTP/durability probes green.
 2. Then the gaps above, MVCC last (biggest).
+
+## Result on the real ERP (22:40 EDT)
+
+- Snapshot engine: `$S/hk/v8.sh $S/build/aios-engine.16k` (port 3398, root
+  `$S/v8root/root-v8-full`, `--upstream-db=sql_db`), RSS 1.9 GB for 858
+  tables. Tunnel to chi-il-1's live MariaDB: `ssh -N -L 33060:127.0.0.1:3306
+  chi-il-1` (user devops, password `$S/cdc.pass` = /opt/aios/cdc.pass there).
+- `tools/erp-drive/erp-drive.php` (ModelOmsOrders, 12 calls, 1824 statements,
+  2.1 s on ASQL) and `erp-drive-oms2.php` (purchases + warehouse models, 280
+  statements): every distinct statement (1341 + 277) compared cell by cell and
+  by Python type with `cmptyped.py STMT_DIR asql=127.0.0.1:3398
+  maria=127.0.0.1:33060` (MUSER/MPASS/DBNAME env): all identical to MariaDB,
+  no errors on either side.
+- One SIGSEGV seen once on a cold engine during the first two-pass drive
+  (compile_pred_impl under fill_subquery/find_probe_candidates, right after
+  "built key index salesorderdetails.orderno in the background"); not
+  reproduced in 4 further drives (one under gdb, `$S/hk/v8gdb.log`). Suspect a
+  race with the background key-index build. Worth a loop under gdb next.
+- Slowest real statement: the open-orders 8-way join with the `dispatched`
+  CTE, ~150 ms warm (route JOIN_SCAN); the rest are a few ms.
