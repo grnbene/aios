@@ -122,7 +122,7 @@ else()
   target_compile_options(grain_lang PRIVATE -Wall -Wno-unused-parameter)
 endif()
 
-add_executable(grain cli/main.cpp cli/host.cpp cli/ffi.cpp cli/plugin.cpp cli/serve.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
+add_executable(grain cli/main.cpp cli/host.cpp cli/ffi.cpp cli/plugin.cpp cli/serve.cpp cli/open_client.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
 target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(grain PRIVATE grain_lang ${CMAKE_DL_LIBS})
 

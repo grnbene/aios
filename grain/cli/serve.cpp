@@ -72,13 +72,14 @@ std::string header_of(const std::string& head, const char* name) {
   return head.substr(b, e == std::string::npos ? std::string::npos : e - b);
 }
 
-void send_all(int fd, const std::string& data) {
+bool send_all(int fd, const std::string& data) {
   size_t off = 0;
   while (off < data.size()) {
     const ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-    if (n <= 0) return;
+    if (n <= 0) return false;
     off += (size_t)n;
   }
+  return true;
 }
 
 void answer(int fd, g::WebUi& ui) {
@@ -89,9 +90,31 @@ void answer(int fd, g::WebUi& ui) {
   req.method = head.substr(0, sp1);
   std::string target = sp1 == std::string::npos || sp2 == std::string::npos ? "/" : head.substr(sp1 + 1, sp2 - sp1 - 1);
   req.path = target.substr(0, target.find('?'));
+  req.query = target.find('?') == std::string::npos ? "" : target.substr(target.find('?') + 1);
   req.cookie = header_of(head, "cookie");
   req.xhr = header_of(head, "x-grain-ui") == "1";
+  req.tree = header_of(head, "accept").find("application/x-grain-ui") != std::string::npos;
+  req.stream = header_of(head, "accept").find("text/event-stream") != std::string::npos;
   req.body = body;
+  if (req.stream && req.method == "GET") {
+    // The page asked to be told when the data changes: hold the connection and send each change as it happens.
+    g::WebUi::Stream stream;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string frame, error;
+    if (ui.open_stream(req, stream, headers, frame, error)) {
+      std::string out = "HTTP/1.1 200 OK\r\n";
+      for (const auto& h : headers) out += h.first + ": " + h.second + "\r\n";
+      out += "Connection: close\r\n\r\n" + frame;
+      bool alive = send_all(fd, out);
+      while (alive && ui.next_frame(stream, 15000, frame)) alive = send_all(fd, frame.empty() ? std::string(": keepalive\n\n") : frame);
+      ui.close_stream(stream);
+      ::close(fd);
+      return;
+    }
+    send_all(fd, "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    ::close(fd);
+    return;
+  }
   g::WebUi::Response res;
   if (req.path == "/favicon.ico") { res.status = 204; }
   else res = ui.handle(req);

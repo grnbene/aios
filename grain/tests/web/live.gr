@@ -1,0 +1,39 @@
+# Live data. Nothing here sends, polls or listens: the variables change, and every screen showing them follows -
+# in a window, in any number of browsers, in a native client. "shared" means everyone sees the same data.
+let seconds = 0
+let load = []
+let board = []
+
+every(1, fn () {
+  seconds = seconds + 1
+  push(load, {"at": seconds, "load": (seconds * 37) % 100})
+  if len(load) > 6 { load = slice(load, 1) }
+})
+
+fn say(f) {
+  if f.words == "" { return nil }
+  push(board, {"who": f.who == "" ? "someone" : f.who, "said": f.words})
+  if len(board) > 8 { board = slice(board, 1) }
+  ui.set_field(p, "words", "")
+}
+
+let p = ui.pane({"title": "Live", "shared": true, "width": 560, "height": 520, "view": fn () {
+  let rows = []
+  for r in load { rows = [r] + rows }
+  let talk = []
+  for m in board { talk = [m] + talk }
+  return ui.column({"gap": 12, "pad": 16}, [
+    ui.text("Live data", {"size": 20, "bold": true}),
+    ui.row({"gap": 12}, [
+      ui.tile("Seconds up", seconds, {"accent": "ok"}),
+      ui.tile("Load now", len(load) > 0 ? str(load[len(load) - 1].load) + "%" : "-"),
+      ui.tile("Messages", len(board))]),
+    ui.table(rows, {"columns": "at:Second, load:Load:right", "empty": "waiting for the first tick"}),
+    ui.text("Say something - everyone watching sees it as you send it", {"dim": true}),
+    ui.row({"gap": 8}, [
+      ui.field("who", {"placeholder": "name", "width": 120}),
+      ui.field("words", {"placeholder": "a message", "on_enter": say}),
+      ui.button("Send", say, {"primary": true})]),
+    ui.table(talk, {"columns": "who:Who, said:Said", "empty": "nobody has spoken yet"})])
+}})
+run_panes()

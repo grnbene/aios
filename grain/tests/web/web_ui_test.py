@@ -34,13 +34,12 @@ class Browser:
     def __init__(self):
         status, headers, html = request("GET", "/")
         self.cookie = headers["set-cookie"].split(";")[0]
-        self.v = int(re.search(r'data-v="(\d+)"', html).group(1))
         self.html = html
     def event(self, action, **fields):
-        body = urllib.parse.urlencode([("v", self.v), ("action", action)] + [("f." + k, v) for k, v in fields.items()])
+        body = urllib.parse.urlencode([("action", action)] + [("f." + k, v) for k, v in fields.items()])
         status, _, text = request("POST", "/_ui/event", body, {"X-Grain-UI": "1", "Cookie": self.cookie, "Content-Type": "application/x-www-form-urlencoded"})
         d = json.loads(text)
-        self.v = d["v"]; self.html = d["html"]
+        self.html = d["html"]
         return d
     def text(self): return re.sub(r"<[^>]+>", "|", self.html)
     def action(self, label): return re.search(r'data-act="([^"]+)">' + re.escape(label) + "<", self.html).group(1)
@@ -74,12 +73,8 @@ try:
     d = a.event("", note="a draft")
     check("fields travel with every event", True, 'value="a draft"' in d["html"])
 
-    stale = a.v - 1
-    body = urllib.parse.urlencode([("v", stale), ("action", a.action("Reset"))])
-    _, _, text = request("POST", "/_ui/event", body, {"X-Grain-UI": "1", "Cookie": a.cookie})
-    answer = json.loads(text)
-    check("an event from an old page is ignored", True, "Clicked 2 times" in answer["html"])
-    a.v, a.html = answer["v"], answer["html"]   # the page that sent it adopts the redraw
+    _, _, text = request("POST", "/_ui/event", urllib.parse.urlencode([("action", "a-from-an-old-page")]), {"X-Grain-UI": "1", "Cookie": a.cookie})
+    check("an action that no longer exists does nothing", True, "Clicked 2 times" in json.loads(text)["html"])
     a.event(a.action("Reset"))
     check("Reset", True, "Clicked 0 times" in a.html)
 
@@ -87,7 +82,7 @@ try:
     check("another browser has its own session", True, "Clicked 0 times" in b.html and "no notes yet" in b.text())
     check("and a session never leaks into another", False, "hello world" in b.text())
 
-    check("an event without X-Grain-UI is refused", 403, request("POST", "/_ui/event", "v=1&action=x", {"Cookie": a.cookie})[0])
+    check("an event without X-Grain-UI is refused", 403, request("POST", "/_ui/event", "action=x", {"Cookie": a.cookie})[0])
     check("GET on the event endpoint is refused", 405, request("GET", "/_ui/event", None, {"Cookie": a.cookie})[0])
     check("POST to the page is refused", 405, request("POST", "/", "x=1")[0])
     check("a bogus cookie starts a fresh session", 200, request("GET", "/", None, {"Cookie": "grain_sid=deadbeef"})[0])

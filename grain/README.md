@@ -48,6 +48,41 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
 | Widgets | `ui.column`, `ui.row`, `ui.text`, `ui.button`, `ui.field`, `ui.table`, `ui.tile` in a `ui.pane` |
 
+## Live data
+
+Write the data, write the view, and the screen follows the data. Nothing in the
+program sends, polls, listens or says how to update.
+
+```grain
+let seconds = 0
+every(1, fn () { seconds = seconds + 1 })       # the data changes on its own
+
+ui.pane({"title": "Live", "shared": true, "view": fn () {
+  return ui.tile("Seconds up", seconds)          # the view just reads it
+}})
+run_panes()
+```
+
+`every(seconds, fn)` and `after(seconds, fn)` make data that changes by itself
+(`cancel(id)` stops one; `wait(seconds)` sleeps while they fire, for a script with
+no window). Whatever runs the program fires them: a window's frame loop, `grain
+serve`, aios-webserver. A window redraws every frame, so a change shows at once.
+For a browser or a native client the server does the watching: when the data
+behind a view changes - a timer, another viewer pressing a button, anything - the
+widgets are re-rendered, and if the screen is different every viewer is sent it
+(server-sent events for a browser, one cheap "has it changed" request a quarter
+second for `grain open`). A change that does not alter the screen sends nothing.
+
+A pane made with `"shared": true` is one copy of the program for everyone, so
+every viewer sees the same live data and one viewer's change reaches the others
+as it happens (`examples/live.gr` is a clock and a message board that does just
+that). Without it each visitor has a copy of their own, as before.
+
+A view that reads the clock instead of data (an uptime computed inside `view`)
+has nothing that changes, so give the pane `"refresh": n` and the server looks
+again every n seconds. `examples/live.gr` is the model: data that changes, a
+view that shows it.
+
 ## One program, a window or a web page
 
 A program built from `ui.pane` is written once and runs both ways. The pane's
@@ -58,15 +93,16 @@ gets them as HTML.
 grain counter.gr                   a window (counter.gr: ui.pane + run_panes())
 grain serve counter.gr             the same program in a browser, at http://127.0.0.1:8080/
 grain build counter.gr -o counter  one file: ./counter is a window, ./counter --web [port] a web page
+grain open https://host/app.gr     a program running on a server, drawn in a native window (no HTML)
 ```
 
 In the browser each visitor gets their own copy of the program (a session, kept
-by a cookie): a button or Enter calls the same grain function it would in a
+by a cookie; or one shared copy, with `"shared": true`): a button or Enter calls the same grain function it would in a
 window, with the field texts, on the server, and the page redraws. State is a
 session's own and lives in the program's variables. Your functions, `ui.set_field`
 and `ui.field_text` behave as they do in a window. A pane option `"refresh": 5`
-makes a page redraw every 5 seconds, for a view that shows a clock or a feed (a
-window already redraws sixty times a second). Edit the file and the next page
+makes the server look again every 5 seconds, for a view that reads a clock
+instead of data (see Live data). Edit the file and the next page
 load starts a session on the new code.
 
 `grain serve` is for your own machine: it binds 127.0.0.1, shows a program's

@@ -1,18 +1,24 @@
 #pragma once
-// A grain program with a ui.pane, served to browsers (grain_webui.cpp).
+// A grain program with a ui.pane, served to browsers and native clients (grain_webui.cpp).
 //
-// The same program a desktop window runs: `ui.pane({"view": fn () { ... }})` and
-// `run_panes()`. Each browser gets its own copy of the program (a session, kept by a
-// cookie), shows what `view` returns as HTML, and sends clicks, Enter and field text
-// back; the program's own functions run on the server and the page redraws.
+// The program is the one a desktop window runs. Its `view` is shown, and when its data changes - because
+// someone pressed a button, because a timer (`every`, `after`) fired, because another viewer changed shared
+// data - every screen showing it is updated. Nothing in the program says how: no sockets, no hooks, no polling.
+// The data is the program's own variables; what is on screen follows it.
 //
-// This is the host-independent part: it takes a request and gives a response, so the
-// standalone `grain serve` and aios-webserver's `grain_ui` directive are thin wrappers.
+// Behind that: each visitor gets a copy of the program (a session, kept by a cookie), or, for a pane made with
+// "shared": true, all of them share one. A ticker fires timers and re-renders; a change is pushed to browsers
+// over server-sent events (and a native client polls for it cheaply).
+//
+// This is the host-independent part: a request in, a response out. The standalone `grain serve` and
+// aios-webserver's `grain_ui` directive are thin wrappers.
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -30,18 +36,22 @@ class WebUi {
     // Gives a new session's VM its builtins and its files. The returned object lives as long as the session.
     std::function<std::shared_ptr<void>(Vm&)> setup;
     std::string origin = "app.gr";      // the program's name, for error messages
-    uint64_t max_steps = 200000000;     // instructions one event or render may run; 0 = unlimited
+    std::string cookie_name = "grain_sid";   // one per program, so two apps on a host keep their own sessions
+    uint64_t max_steps = 200000000;     // instructions one event, render or timer may run; 0 = unlimited
     size_t max_sessions = 256;          // the least recently used goes first
-    int idle_seconds = 1800;            // a session untouched this long is dropped
+    int idle_seconds = 1800;            // a session with nobody watching and untouched this long is dropped
     bool show_errors = false;           // put a program's error in the page (for development); otherwise only the log
   };
 
   struct Request {
     std::string method;
     std::string path;
+    std::string query;       // after the '?'
     std::string cookie;      // the Cookie header
     bool xhr = false;        // the request carries "X-Grain-UI: 1", which a cross-site page cannot add
     bool https = false;
+    bool tree = false;       // Accept: application/x-grain-ui - the widgets as data for a native client, not HTML
+    bool stream = false;     // Accept: text/event-stream - the caller wants updates pushed (use open_stream)
     std::string body;        // application/x-www-form-urlencoded, for POST
   };
 
@@ -51,26 +61,52 @@ class WebUi {
     std::string body;
   };
 
+  struct Session;
+
+  // An open server-sent-events stream. The caller loops on next_frame() and writes each frame to the client.
+  struct Stream {
+    std::shared_ptr<Session> session;
+    uint64_t seen = 0;
+    bool tree = false;
+  };
+
   explicit WebUi(Host host);
   ~WebUi();
 
-  // GET anything but /_ui/...: the page. POST /_ui/event: an event, answered with the redrawn widgets.
+  // GET: the page (or, for a native client, the widgets as data; `?poll=N` answers 204 until something changed
+  // since N). POST with X-Grain-UI: 1: an event, answered with the redrawn widgets.
   Response handle(const Request& req);
+
+  // For a request with `stream` set: opens the stream. `headers` go on the 200 (Content-Type: text/event-stream
+  // and a Set-Cookie for a new session); `first` is the current frame. False with `error` when there is none.
+  bool open_stream(const Request& req, Stream& out, std::vector<std::pair<std::string, std::string>>& headers,
+                   std::string& first, std::string& error);
+  // Waits up to timeout_ms for the data to change. True with a frame to send; True with an empty frame when nothing
+  // changed (send a comment to keep the connection alive); False when the stream should end.
+  bool next_frame(Stream& st, int timeout_ms, std::string& frame);
+  void close_stream(Stream& st);
 
   size_t sessions() const;
   // Where errors are reported (stderr when empty).
   std::function<void(const std::string&)> log;
 
  private:
-  struct Session;
   Host host_;
   mutable std::mutex mu_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
+  std::shared_ptr<Session> shared_;     // the one copy, for a pane with "shared": true
+  std::thread ticker_;
+  bool stop_ = false;
+  std::condition_variable stop_cv_;
 
   std::shared_ptr<Session> session_for(const Request& req, std::string& new_id, std::string& error);
   std::shared_ptr<Session> make_session(std::string& error);
   void reap_locked();
   void report(const std::string& msg) const;
+  void start_ticker();
+  void tick();
+  bool refresh_locked(Session& s);           // re-render; true (and a new seq) when what is on screen changed
+  void frame_locked(Session& s, bool tree, std::string& out);
 };
 
 }  // namespace aios::userland::grain

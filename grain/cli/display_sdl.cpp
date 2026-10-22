@@ -327,6 +327,7 @@ class SdlDisplay final : public g::Display {
       while (SDL_PollEvent(&e))
         if (!translate(vm, e, error)) return false;
       if (!sync(vm, error)) return false;
+      { std::string timer_error; g::run_timers(vm, timer_error); if (!timer_error.empty()) { error = "run_panes(): " + timer_error; return false; } }   // data that changes on its own; the draw below shows it
       for (auto& [id, w] : windows_)
         if (!draw(vm, id, w, error)) return false;
       const uint32_t spent = SDL_GetTicks() - started;

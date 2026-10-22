@@ -66,7 +66,8 @@ struct VhostConfig {
   uint16_t php_port = 0;
   bool php_off = false;       // isolate PHP (503) while keeping static files live
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
-  std::string grain_app;      // relative to root, or absolute; empty = no grain on this vhost
+  std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
+  bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
   std::string grain_ui_app;   // `grain_ui <script>`: a ui.pane program shown as a web page, one session per browser
   bool grain_native = false;  // `grain_native safe`: native fn (safe kind only) in this vhost's scripts
   int64_t grain_max_body = 1 << 20;        // a request body up to this is handed over whole; a bigger one is streamed (body_read)
@@ -158,7 +159,10 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
           }
         }
       } else if (tok == "grain") {
-        ls >> cur->grain_app;
+        std::string arg;
+        ls >> arg;
+        if (arg == "on") cur->grain_files = true;
+        else cur->grain_app = arg;
       } else if (tok == "grain_ui") {
         ls >> cur->grain_ui_app;
       } else if (tok == "grain_native") {
@@ -688,7 +692,8 @@ bool write_buffered(hal::Connection& conn, const net::HttpRequestHead& head, con
 // Hands the request to the vhost's grain script. Returns false when the connection must be closed
 // (the body was not read to its end).
 bool serve_grain(hal::Host& host, hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
-                 const VhostConfig& vh, const std::string& path_only, const std::string& query, const std::string& client_ip) {
+                 const VhostConfig& vh, const std::string& app, const std::string& path_only, const std::string& query,
+                 const std::string& client_ip, bool* ui_app = nullptr) {
   net::GrainRequest req;
   req.method = head.method;
   req.target = head.target;
@@ -739,10 +744,12 @@ bool serve_grain(hal::Host& host, hal::Connection& conn, net::ConnReader& reader
   net::GrainSite site;
   site.host = &host;
   site.root = vh.root;
-  site.app = vh.grain_app;
+  site.app = app;
   site.max_steps = vh.grain_steps;
   net::GrainResponse res;
-  if (!net::grain_serve_request(site, req, res)) {
+  const bool ran = net::grain_serve_request(site, req, res);
+  if (ran && res.ui_app && ui_app) { *ui_app = true; return true; }   // the script builds a ui.pane: the caller serves it as a web app
+  if (!ran) {
     std::fprintf(stderr, "aios-webserver: %s %s: %s\n", head.method.c_str(), head.target.c_str(), res.error.c_str());
     if (res.body_error == 2 || too_large) { write_simple_response(conn, 413, "Payload Too Large", "body exceeds this vhost's configured limit"); return false; }
     if (res.body_error == 1) { write_simple_response(conn, 400, "Bad Request", "the request body could not be read"); return false; }
@@ -764,16 +771,23 @@ bool serve_grain(hal::Host& host, hal::Connection& conn, net::ConnReader& reader
 
 // One WebUi per vhost with `grain_ui`: it keeps the browser sessions.
 std::mutex g_webui_mutex;
-std::map<const VhostConfig*, std::shared_ptr<aios::userland::grain::WebUi>> g_webuis;
+std::map<std::pair<const VhostConfig*, std::string>, std::shared_ptr<aios::userland::grain::WebUi>> g_webuis;
+// Which .gr files turned out to build a ui.pane (a web app, not a page), by the file's version.
+std::map<std::string, std::string> g_ui_scripts;
 
-std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const VhostConfig& vh) {
+std::string script_version(hal::Host& host, const std::string& path) {
+  auto st = host.stat(path);
+  return st.ok() ? std::to_string(st->mtime_ns) + ":" + std::to_string(st->size) : std::string();
+}
+
+std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const VhostConfig& vh, const std::string& script, const std::string& app) {
   namespace g = aios::userland::grain;
   std::lock_guard<std::mutex> lock(g_webui_mutex);
-  auto& slot = g_webuis[&vh];
+  auto& slot = g_webuis[{&vh, script}];
   if (slot) return slot;
-  const std::string app = !vh.grain_ui_app.empty() && vh.grain_ui_app[0] == '/' ? vh.grain_ui_app : vh.root + "/" + vh.grain_ui_app;
   g::WebUi::Host h;
-  h.origin = vh.grain_ui_app;
+  h.origin = script;
+  h.cookie_name = "grain_sid_" + std::to_string(std::hash<std::string>()(vh.server_name + vh.root + script) % 100000000);
   h.max_steps = vh.grain_steps;
   h.current_version = [&host, app](std::string& version, std::string& error) {
     auto st = host.stat(app);
@@ -794,6 +808,7 @@ std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const V
     vm.files = files.get();
     g::install_core_builtins(vm);
     g::install_http_builtins(vm);
+    vm.define_global("args", g::Value::list({}));   // a program written for the command line still loads
     return files;
   };
   slot = std::make_shared<g::WebUi>(std::move(h));
@@ -803,13 +818,15 @@ std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const V
 
 // A ui.pane program for browsers: GET the page, POST /_ui/event.
 bool serve_grain_ui(hal::Host& host, hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
-                    const VhostConfig& vh, const std::string& path_only) {
+                    const VhostConfig& vh, const std::string& path_only, const std::string& query, const std::string& script, const std::string& app) {
   namespace g = aios::userland::grain;
   g::WebUi::Request req;
   req.method = head.method;
   req.path = path_only;
   req.cookie = head.header("Cookie").value_or("");
   req.xhr = head.header("X-Grain-UI").value_or("") == "1";
+  req.tree = head.header("Accept").value_or("").find("application/x-grain-ui") != std::string::npos;
+  req.stream = head.header("Accept").value_or("").find("text/event-stream") != std::string::npos;
   req.https = vh.ssl;
   net::RequestBodyReader body(reader, head);
   while (!body.done()) {   // an event is a few fields: more than 256 KiB is not one
@@ -819,7 +836,26 @@ bool serve_grain_ui(hal::Host& host, hal::Connection& conn, net::ConnReader& rea
     req.body.append(reinterpret_cast<const char*>(r->data()), r->size());
     if (req.body.size() > 256 * 1024) { write_simple_response(conn, 413, "Payload Too Large", "an event is a few fields"); return false; }
   }
-  g::WebUi::Response res = webui_for(host, vh)->handle(req);
+  req.query = query;
+  auto ui = webui_for(host, vh, script, app);
+  if (req.stream && head.method == "GET") {
+    // The page asked to be told when the data changes: hold the connection and send each change as it happens.
+    g::WebUi::Stream stream;
+    std::vector<std::pair<std::string, std::string>> sh;
+    std::string frame, error;
+    if (!ui->open_stream(req, stream, sh, frame, error)) { write_simple_response(conn, 500, "Internal Server Error", "internal server error"); return false; }
+    net::HttpResponseHead rh;
+    rh.status = 200;
+    rh.status_text = "OK";
+    for (auto& h : sh) rh.headers.push_back({h.first, h.second});
+    apply_vhost_headers(rh, vh);
+    net::ResponseWriter w(conn, rh, std::nullopt);   // chunked: it has no end
+    bool alive = w.write_head() && w.write_body_chunk(span_of(frame));
+    while (alive && ui->next_frame(stream, 15000, frame)) alive = w.write_body_chunk(span_of(frame.empty() ? std::string(": keepalive\n\n") : frame));
+    ui->close_stream(stream);
+    return false;   // the stream ended: the connection is done
+  }
+  g::WebUi::Response res = ui->handle(req);
   return write_buffered(conn, head, vh, res.status, res.headers, std::vector<uint8_t>(res.body.begin(), res.body.end()), false);
 }
 
@@ -1066,6 +1102,37 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       }
     }
 
+    // `grain on`: a .gr file is run, not sent. A script with handle(req) answers the request, one that prints is a
+    // page, and one that builds a ui.pane is a web app (its events post back to its own URL).
+    if (vh->grain_files && !is_php) {
+      std::string script;
+      if (ends_with_ci(path_only, ".gr")) script = path_only;
+      else if (path_only.back() == '/' && ends_with_ci(vh->index, ".gr")) script = path_only + vh->index;
+      if (!script.empty()) {
+        if (!exists_as_file(host, vh->root + script)) { write_simple_response(*conn, 404, "Not Found", "not found"); break; }
+        const std::string full = vh->root + script;
+        const std::string version = script_version(host, full);
+        bool ui = head.method == "POST" && head.header("X-Grain-UI").value_or("") == "1";
+        if (!ui) {
+          std::lock_guard<std::mutex> lock(g_webui_mutex);
+          auto it = g_ui_scripts.find(full);
+          ui = it != g_ui_scripts.end() && it->second == version;
+        }
+        if (!ui) {
+          bool became_ui = false;
+          if (!serve_grain(host, *conn, reader, head, *vh, script.substr(1), path_only, query, conn->peer(), &became_ui)) break;   // relative to root
+          if (became_ui) {
+            std::lock_guard<std::mutex> lock(g_webui_mutex);
+            g_ui_scripts[full] = version;
+            ui = true;
+          }
+        }
+        if (ui && !serve_grain_ui(host, *conn, reader, head, *vh, path_only, query, script, full)) break;
+        if (!head.keep_alive) break;
+        continue;
+      }
+    }
+
     // grain: never serve the script's own source, and send what is neither a file nor PHP to its handler
     bool is_grain = false, is_grain_ui = false;
     if (!vh->grain_ui_app.empty()) {
@@ -1088,9 +1155,11 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
     }
 
     if (is_grain_ui) {
-      if (!serve_grain_ui(host, *conn, reader, head, *vh, path_only)) break;
+      const std::string& ui_script = vh->grain_ui_app;
+      const std::string ui_path = !ui_script.empty() && ui_script[0] == '/' ? ui_script : vh->root + "/" + ui_script;
+      if (!serve_grain_ui(host, *conn, reader, head, *vh, path_only, query, ui_script, ui_path)) break;
     } else if (is_grain) {
-      if (!serve_grain(host, *conn, reader, head, *vh, path_only, query, conn->peer())) break;
+      if (!serve_grain(host, *conn, reader, head, *vh, vh->grain_app, path_only, query, conn->peer())) break;
     } else if (is_php) {
       if (is_php_rce_payload(head.target, query)) {
         write_simple_response(*conn, 403, "Forbidden", "forbidden");
@@ -1139,6 +1208,7 @@ int aios_webserver_run(int argc, char** argv) {
       "    cors_max_age <seconds>         # Default: 1000\n"
       "    add_header <Name> <Value>      # Extra response header on every response\n"
       "    max_body_size <bytes>\n"
+      "    grain on                       # Run .gr files under root like .php files: handle(req), or what they print, or a ui.pane app\n"
       "    grain <script.gr>              # Requests that are not a static file or PHP go to the script's handle(req)\n"
       "    grain_ui <program.gr>          # A ui.pane program as a web page: one session per browser, events at /_ui/event\n"
       "    grain_native safe              # Allow native fn (memory-safe kind) in grain scripts\n"

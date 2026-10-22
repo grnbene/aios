@@ -298,8 +298,7 @@ Each browser gets its own copy of the program, tied to it by an `HttpOnly`,
 `SameSite=Strict` cookie (`Secure` over TLS). A click or Enter in the page posts
 the fields' text and the action to the server, which calls the program's own
 grain function and answers with the redrawn widgets; the page replaces them,
-keeping the focused field and its caret. A pane option `"refresh": n` makes the
-page redraw every n seconds. An event needs the header `X-Grain-UI: 1`, which a
+keeping the focused field and its caret. An event needs the header `X-Grain-UI: 1`, which a
 page on another site cannot add, so cross-site requests cannot press the app's
 buttons. The program's text is HTML-escaped, and the page carries a
 `Content-Security-Policy` that allows only its own inline script and style.
@@ -310,6 +309,23 @@ instructions. At most 256 sessions are kept (the least recently used goes) and
 one idle for 30 minutes is dropped; a session whose program file changed starts
 over on the new code. A failure is logged and the browser gets "internal server
 error". Pages and events are gzipped when the client accepts it.
+
+**Live data.** The program does not have to wait for a click to change: `every(1,
+fn () { ... })` changes its data on a timer, and a pane made with `"shared": true`
+is one copy for every visitor. A ticker in the server fires the program's timers
+and re-renders; when the widgets differ from the last render every viewer is
+sent the new ones - over a held connection (`text/event-stream`, chunked) to a
+browser, which `EventSource` reconnects on its own, and by `?poll=N` (204 until
+something changed) to a native client. Nothing in the program sends or listens. A
+pane with `"refresh": n` is looked at every n seconds for views that read the
+clock. A session with a viewer attached is never idle-dropped.
+
+**Native clients.** `Accept: application/x-grain-ui` asks for the widgets as JSON
+(`{"seq", "title", "width", "height", "tree"}`, a button carrying the `act` to post
+back) instead of HTML; `grain open https://host/app.gr` draws them in a native
+window with the same renderer a local program uses. Events post to the page's own
+URL with `X-Grain-UI: 1`, and an action is named by where its widget sits and what
+it says, so several viewers of one program never invalidate each other.
 
 Only `ui.pane` programs have a web form: a pane drawn by hand with `create_pane`
 paints pixels and is window-only. Not done: sessions are not shared between
