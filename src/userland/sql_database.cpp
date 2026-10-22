@@ -22087,7 +22087,11 @@ void SqlDatabase::maintain_storage() {
         t.compact_delta_buffer();
         for (size_t c = 0; c < t.columns.size() && c < t.col_data.size(); ++c) {
           ColumnStore& cs = t.col_data[c];
-          cs.optimize_encoding(t.columns[c].type, t.columns[c].scale, t.columns[c].temporal);
+          if (cs.encoding == ColumnEncoding::DictBitPacked && cs.dict.coded()) {
+            cs.compact_dictionary();
+          } else {
+            cs.optimize_encoding(t.columns[c].type, t.columns[c].scale, t.columns[c].temporal);
+          }
           if (cs.encoding == ColumnEncoding::DictBitPacked && !cs.shared_dict && cs.size() > 0 && !cs.seg_packed_) {
             const uint8_t need = code_bits_for(cs.dict.size() ? cs.dict.size() - 1 : 0);
             if (need < cs.bit_width_) repack_codes(cs, need);
@@ -31219,7 +31223,17 @@ bool segment_may_match(const Pred& p, const ColumnStore& cs, size_t seg) {
     if (zm.min_str.empty() && zm.max_str.empty()) return true;
     const std::string lo = collate_key(p.slo);
     switch (p.op) {
-      case ExprOp::Eq: return pad_compare_ci(lo, zm.min_str) >= 0 && pad_compare_ci(lo, zm.max_str) <= 0;
+      case ExprOp::Eq: {
+        if (zm.bloom_filter != 0) {
+          uint64_t h = fnv1a(p.slo);
+          uint64_t hl = fnv1a(lo);
+          if (!zm.test_bloom(h) && !zm.test_bloom(hl)) {
+            g_prune_by_bloom = true;
+            return false;
+          }
+        }
+        return pad_compare_ci(lo, zm.min_str) >= 0 && pad_compare_ci(lo, zm.max_str) <= 0;
+      }
       case ExprOp::Lt: return pad_compare_ci(zm.min_str, lo) < 0;
       case ExprOp::Le: return pad_compare_ci(zm.min_str, lo) <= 0;
       case ExprOp::Gt: return pad_compare_ci(zm.max_str, lo) > 0;
@@ -42148,7 +42162,24 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               xk_tnum[n == 0 ? 0.0 : n].push_back((uint32_t)ri);
             }
           }
-        } else if (best_ki < 0) {
+        }
+        // One key, on a typed integer column, and no index: the joined rows
+        // hashed by the integer itself, built instead of the text keys below.
+        std::unordered_map<int64_t, std::vector<uint32_t>> int_hash_tbl;
+        bool single_int_hash = false;
+        if (best_ki < 0 && !xk_join && !js.table->inferred_types && prep_jkeys.size() == 1 && prep_jkeys[0].column >= 0 &&
+            (size_t)prep_jkeys[0].column < js.table->col_data.size()) {
+          const ColumnStore& jcs = js.table->col_data[prep_jkeys[0].column];
+          if (vx::typed_integer(jcs) && jcs.size() == js.table->row_count()) {
+            single_int_hash = true;
+            int_hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
+            for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
+              if (jcs.is_null(ri)) continue;
+              int_hash_tbl[vx::typed_int(jcs, ri)].push_back((uint32_t)ri);
+            }
+          }
+        }
+        if (best_ki < 0 && !xk_join && !single_int_hash) {
           // Fallback: build dynamic hash table if no probe index exists
           hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
           for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
@@ -42266,6 +42297,31 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           }
         }
 
+        bool direct_num_join = false;
+        size_t dn_base_src = 0;
+        size_t dn_base_col = 0;
+        const ColumnStore* dn_base_cs = nullptr;
+        bool dn_base_is_int = false;
+
+        if (best_ki >= 0 && !direct_code_join && !link_to_parent && !link_to_kids && prep_jkeys[best_ki].idx &&
+            prep_jkeys[best_ki].idx->numeric_column) {
+          const SqlExpr* bval = prep_jkeys[best_ki].value;
+          if (bval && bval->op == ExprOp::Column &&
+              lookup_column_here(basectx, *bval, &dn_base_src, &dn_base_col) == ColumnLookup::Found &&
+              dn_base_src < baseonly.size() && baseonly[dn_base_src].table) {
+            const SqlTable& bt = *baseonly[dn_base_src].table;
+            if (!bt.inferred_types && dn_base_col < bt.col_data.size() && bt.col_data[dn_base_col].size() == bt.row_count()) {
+              const ColumnStore& bcs = bt.col_data[dn_base_col];
+              if (vx::typed_integer(bcs) || bcs.encoding == ColumnEncoding::TypedDouble ||
+                  bcs.encoding == ColumnEncoding::DecimalScaled) {
+                direct_num_join = true;
+                dn_base_cs = &bcs;
+                dn_base_is_int = vx::typed_integer(bcs);
+              }
+            }
+          }
+        }
+
         // The joined rows whose keys equal this base row's.
         auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
           out.clear();
@@ -42293,6 +42349,14 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               if (cb < 0 || (size_t)cb >= prep_jkeys[best_ki].idx->by_code.size()) return;
               const auto& cands = prep_jkeys[best_ki].idx->by_code[(size_t)cb];
               match_cands.assign(cands.begin(), cands.end());
+            } else if (direct_num_join) {
+              const size_t base_ri = (dn_base_src < base.parts.size()) ? base.parts[dn_base_src] : kNullRow;
+              if (base_ri == kNullRow || base_ri >= dn_base_cs->size() || dn_base_cs->is_null(base_ri)) return;
+              double num = 0.0;
+              if (dn_base_is_int) num = (double)vx::typed_int(*dn_base_cs, base_ri);
+              else if (!dn_base_cs->get_double(base_ri, &num)) return;
+              probe_gather_matches(prep_jkeys[best_ki].idx.get(), Val(num), match_cands);
+              if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
             } else {
               Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
               if (want.null) return;
@@ -42363,6 +42427,18 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               std::sort(out.begin(), out.end());
               out.erase(std::unique(out.begin(), out.end()), out.end());
             }
+          } else if (single_int_hash) {
+            Val want = eval_expr(prep_jkeys[0].value, vctx);
+            if (want.null) return;
+            // The probe as a number; one with a fraction, or past int64, equals no integer.
+            double d = 0.0;
+            if (want.numeric) d = want.num;
+            else if (!parse_number(want.str(), &d)) return;
+            if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0) || d != std::trunc(d)) return;
+            const int64_t iv = (int64_t)d;
+            auto hit = int_hash_tbl.find(iv);
+            if (hit != int_hash_tbl.end()) out.assign(hit->second.begin(), hit->second.end());
+            if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
           } else {
             std::string probe_key;
             for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {

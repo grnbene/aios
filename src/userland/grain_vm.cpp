@@ -47,6 +47,91 @@ Value Value::list(std::vector<Value> v) {
   return Value::object(Type::List, std::make_shared<ListObj>(std::move(v)));
 }
 
+Value Value::id128(const aios::Id128& id) {
+  return Value::object(Type::Id128, std::make_shared<Id128Obj>(id));
+}
+
+Value Value::id128(const std::string& hex) {
+  aios::Id128 id;
+  if (!aios::Id128::parse(hex, id)) {
+    std::string padded = hex;
+    if (padded.rfind("0x", 0) == 0 || padded.rfind("0X", 0) == 0) padded = padded.substr(2);
+    while (padded.size() < 32) padded.push_back('0');
+    if (!aios::Id128::parse(padded, id)) {
+      id = aios::Id128{0, 0};
+    }
+  }
+  return Value::id128(id);
+}
+
+const aios::Id128& Value::as_id128() const {
+  static const aios::Id128 kNullId{};
+  if (type != Type::Id128 || !obj) return kNullId;
+  return static_cast<const Id128Obj*>(obj.get())->id;
+}
+
+bool ChannelObj::publish(Value payload, aios::Id128 publisher, aios::Id128 frame_id) {
+  if (frame_id.is_null()) {
+    static uint64_t frame_seq = 1;
+    frame_id = aios::Id128{id.hi, ++frame_seq};
+  }
+  uint64_t ts = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+  auto frame = std::make_shared<FrameObj>(frame_id, ++generation, publisher, std::move(payload), ts);
+  if (ring.size() >= capacity) {
+    ring.erase(ring.begin());
+    ++dropped;
+    ++tail;
+  }
+  ring.push_back(std::move(frame));
+  ++head;
+  return true;
+}
+
+std::shared_ptr<FrameObj> ChannelObj::consume() {
+  if (ring.empty()) return nullptr;
+  auto f = ring.front();
+  ring.erase(ring.begin());
+  ++tail;
+  return f;
+}
+
+bool MemObj::write(size_t offset, const std::string& data) {
+  if (offset + data.size() > buffer.size()) {
+    buffer.resize(offset + data.size(), 0);
+    size = buffer.size();
+  }
+  std::memcpy(buffer.data() + offset, data.data(), data.size());
+  ++generation;
+  return true;
+}
+
+std::string MemObj::read(size_t offset, size_t len) const {
+  if (offset >= buffer.size()) return "";
+  size_t actual_len = std::min(len, buffer.size() - offset);
+  return std::string(reinterpret_cast<const char*>(buffer.data() + offset), actual_len);
+}
+
+bool MemObj::migrate(const std::string& new_provider) {
+  provider = new_provider;
+  ++generation;
+  return true;
+}
+
+Value EntityObj::get_field(const std::string& k) const {
+  if (k == "id" || k == "identity") return Value::id128(id);
+  if (k == "name") return Value::string(name);
+  auto it = fields.find(k);
+  if (it != fields.end()) return it->second;
+  auto hit = handlers.find(k);
+  if (hit != handlers.end()) return hit->second;
+  return Value::nil();
+}
+
+void EntityObj::set_field(const std::string& k, Value v) {
+  fields[k] = std::move(v);
+}
+
 namespace {
 const std::string kEmpty;
 std::vector<Value> g_empty_items;
@@ -168,6 +253,31 @@ std::string Value::to_text() const {
       // after closing it should not be told it is looking at a live socket.
       return "<" + e->kind_name + (e->ptr ? "" : " closed") + ">";
     }
+    case Type::Id128: return as_id128().str();
+    case Type::Capability: {
+      auto* c = static_cast<CapObj*>(obj.get());
+      return "<capability " + c->id.short_str() + " " + c->resource + " rights=" + std::to_string(c->rights) + ">";
+    }
+    case Type::Channel: {
+      auto* ch = static_cast<ChannelObj*>(obj.get());
+      return "<channel " + ch->name + " id=" + ch->id.short_str() + " gen=" + std::to_string(ch->generation) + ">";
+    }
+    case Type::StateFrame: {
+      auto* f = static_cast<FrameObj*>(obj.get());
+      return "<frame gen=" + std::to_string(f->generation) + " payload=" + f->payload.to_text() + ">";
+    }
+    case Type::MemoryObject: {
+      auto* m = static_cast<MemObj*>(obj.get());
+      return "<memory " + m->id.short_str() + " " + std::to_string(m->size) + "B (" + m->provider + ")>";
+    }
+    case Type::Entity: {
+      auto* ent = static_cast<EntityObj*>(obj.get());
+      return "<entity " + ent->name + " id=" + ent->id.short_str() + ">";
+    }
+    case Type::BoundMethod: {
+      auto* bm = static_cast<BoundMethodObj*>(obj.get());
+      return "<method " + bm->name + ">";
+    }
   }
   return "?";
 }
@@ -175,7 +285,9 @@ std::string Value::to_text() const {
 // Inside a container a string has to be quoted, or ["a, b"] and ["a", "b"]
 // print the same and neither can be read back.
 std::string Value::repr() const {
-  return type == Type::Str ? quote(str()) : to_text();
+  if (type == Type::Str) return quote(str());
+  if (type == Type::Id128) return "id128(\"" + as_id128().str() + "\")";
+  return to_text();
 }
 
 bool Value::equals(const Value& o) const {
@@ -190,6 +302,17 @@ bool Value::equals(const Value& o) const {
     case Type::Nil: return true;
     case Type::Bool: return b == o.b;
     case Type::Str: return str() == o.str();
+    case Type::Id128: return as_id128() == o.as_id128();
+    case Type::Capability:
+      return static_cast<CapObj*>(obj.get())->id == static_cast<CapObj*>(o.obj.get())->id;
+    case Type::Channel:
+      return static_cast<ChannelObj*>(obj.get())->id == static_cast<ChannelObj*>(o.obj.get())->id;
+    case Type::StateFrame:
+      return static_cast<FrameObj*>(obj.get())->id == static_cast<FrameObj*>(o.obj.get())->id;
+    case Type::MemoryObject:
+      return static_cast<MemObj*>(obj.get())->id == static_cast<MemObj*>(o.obj.get())->id;
+    case Type::Entity:
+      return static_cast<EntityObj*>(obj.get())->id == static_cast<EntityObj*>(o.obj.get())->id;
     case Type::List: {
       const auto& x = list_items();
       const auto& y = o.list_items();
@@ -458,6 +581,116 @@ void* native_for(FnObj& fn) {
   }
   return fn.jit_code;
 }
+
+Value method_channel_publish(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* ch = static_cast<ChannelObj*>(bm.receiver.obj.get());
+  if (args.empty()) { error = "publish() expects a payload"; return Value::nil(); }
+  aios::Id128 pub_id{};
+  if (args.size() > 1 && args[1].is_id128()) pub_id = args[1].as_id128();
+  ch->publish(args[0], pub_id);
+  return Value::boolean(true);
+}
+
+Value method_channel_consume(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string&) {
+  auto* ch = static_cast<ChannelObj*>(bm.receiver.obj.get());
+  auto f = ch->consume();
+  if (!f) return Value::nil();
+  return Value::object(Type::StateFrame, f);
+}
+
+Value method_channel_stats(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string&) {
+  auto* ch = static_cast<ChannelObj*>(bm.receiver.obj.get());
+  auto m = std::make_shared<MapObj>();
+  m->put("name", Value::string(ch->name));
+  m->put("id", Value::id128(ch->id));
+  m->put("capacity", Value::integer((int64_t)ch->capacity));
+  m->put("generation", Value::integer((int64_t)ch->generation));
+  m->put("head", Value::integer((int64_t)ch->head));
+  m->put("tail", Value::integer((int64_t)ch->tail));
+  m->put("dropped", Value::integer((int64_t)ch->dropped));
+  return Value::object(Type::Map, m);
+}
+
+Value method_cap_attenuate(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* cap = static_cast<CapObj*>(bm.receiver.obj.get());
+  if (args.empty() || args[0].type != Type::Int) { error = "attenuate() expects integer rights"; return Value::nil(); }
+  uint16_t narrower = static_cast<uint16_t>(args[0].as_int());
+  if ((narrower & ~cap->rights) != 0) {
+    error = "capability attenuation error: cannot escalate rights";
+    return Value::nil();
+  }
+  static uint64_t cap_seq = 1;
+  aios::Id128 child_id{cap->id.hi, ++cap_seq};
+  auto child = cap->attenuate(narrower, child_id);
+  return Value::object(Type::Capability, child);
+}
+
+Value method_cap_can(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* cap = static_cast<CapObj*>(bm.receiver.obj.get());
+  if (args.empty() || args[0].type != Type::Int) { error = "can() expects integer rights bitmask"; return Value::nil(); }
+  return Value::boolean(cap->can(static_cast<uint16_t>(args[0].as_int())));
+}
+
+Value method_cap_has_expired(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  auto* cap = static_cast<CapObj*>(bm.receiver.obj.get());
+  uint64_t gen = args.empty() ? 0 : (uint64_t)args[0].as_int();
+  return Value::boolean(cap->has_expired(gen));
+}
+
+Value method_mem_write(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* mem = static_cast<MemObj*>(bm.receiver.obj.get());
+  if (args.size() < 2 || args[0].type != Type::Int || args[1].type != Type::Str) {
+    error = "write() expects (offset, string)";
+    return Value::nil();
+  }
+  mem->write((size_t)args[0].as_int(), args[1].str());
+  return Value::boolean(true);
+}
+
+Value method_mem_read(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* mem = static_cast<MemObj*>(bm.receiver.obj.get());
+  if (args.size() < 2 || args[0].type != Type::Int || args[1].type != Type::Int) {
+    error = "read() expects (offset, length)";
+    return Value::nil();
+  }
+  return Value::string(mem->read((size_t)args[0].as_int(), (size_t)args[1].as_int()));
+}
+
+Value method_mem_migrate(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* mem = static_cast<MemObj*>(bm.receiver.obj.get());
+  if (args.empty() || args[0].type != Type::Str) {
+    error = "migrate() expects target provider string";
+    return Value::nil();
+  }
+  mem->migrate(args[0].str());
+  return Value::boolean(true);
+}
+
+Value method_entity_dispatch(Vm& vm, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* ent = static_cast<EntityObj*>(bm.receiver.obj.get());
+  if (args.empty() || args[0].type != Type::Str) {
+    error = "dispatch() expects event name string";
+    return Value::nil();
+  }
+  const std::string& event = args[0].str();
+  auto it = ent->handlers.find(event);
+  if (it == ent->handlers.end()) {
+    return Value::nil();
+  }
+  Value event_arg = args.size() > 1 ? args[1] : Value::nil();
+  return vm.call(it->second, {bm.receiver, event_arg}, error);
+}
+
+Value method_entity_handler_call(Vm& vm, BoundMethodObj& bm, std::vector<Value>& args, std::string& error) {
+  auto* ent = static_cast<EntityObj*>(bm.receiver.obj.get());
+  auto it = ent->handlers.find(bm.name);
+  if (it == ent->handlers.end()) {
+    return Value::nil();
+  }
+  Value event_arg = args.empty() ? Value::nil() : args[0];
+  return vm.call(it->second, {bm.receiver, event_arg}, error);
+}
+
 }  // namespace
 
 void Vm::close_upvalues_from(size_t from) {
@@ -516,6 +749,22 @@ bool Vm::invoke(const Value& callee, uint8_t argc, int line) {
     if (jit_enabled) {
       if (void* code = native_for(*closure->fn)) return run_native(code, base);
     }
+    return true;
+  }
+  if (callee.type == Type::BoundMethod && callee.obj) {
+    auto* bm = static_cast<BoundMethodObj*>(callee.obj.get());
+    if (argc < bm->min_args || (bm->max_args >= 0 && argc > bm->max_args)) {
+      fail(line, bm->name + "() takes " + std::to_string(bm->min_args) +
+           (bm->max_args == bm->min_args ? "" : "-" + (bm->max_args < 0 ? std::string("any") : std::to_string(bm->max_args))) +
+           " argument(s), got " + std::to_string((int)argc));
+      return false;
+    }
+    std::vector<Value> args(S.stack.end() - argc, S.stack.end());
+    std::string err;
+    Value out = bm->fn(*this, *bm, args, err);
+    S.stack.resize(S.stack.size() - argc - 1);
+    if (!err.empty()) { fail(line, err); return false; }
+    S.stack.push_back(std::move(out));
     return true;
   }
   fail(line, std::string("cannot call a ") + type_name(callee.type) +
@@ -701,6 +950,10 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         } else if (a.type == Type::Str && b.type == Type::Str) {
           const int r = a.str().compare(b.str());
           cmp = r < 0 ? -1 : (r > 0 ? 1 : 0);
+        } else if (a.type == Type::Id128 && b.type == Type::Id128) {
+          const auto& x = a.as_id128();
+          const auto& y = b.as_id128();
+          cmp = x < y ? -1 : (y < x ? 1 : 0);
         } else {
           fail(line, std::string("cannot compare ") + type_name(a.type) + " with " + type_name(b.type));
           break;
@@ -965,20 +1218,121 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
       case Op::FieldGet: {
         const std::string& name = chunk.constants[read_short()].str();
         Value target = pop();
-        if (target.type != Type::Map) {
-          fail(line, std::string("a ") + type_name(target.type) + " has no field '" + name + "'");
+        if (target.type == Type::Map) {
+          Value* v = static_cast<MapObj*>(target.obj.get())->find(name);
+          S.stack.push_back(v ? *v : Value::nil());
           break;
         }
-        Value* v = static_cast<MapObj*>(target.obj.get())->find(name);
-        S.stack.push_back(v ? *v : Value::nil());
+        if (target.type == Type::Id128) {
+          const auto& id = target.as_id128();
+          if (name == "hi") { S.stack.push_back(Value::integer((int64_t)id.hi)); break; }
+          if (name == "lo") { S.stack.push_back(Value::integer((int64_t)id.lo)); break; }
+          if (name == "str" || name == "hex") { S.stack.push_back(Value::string(id.str())); break; }
+          if (name == "short") { S.stack.push_back(Value::string(id.short_str())); break; }
+        }
+        if (target.type == Type::Capability && target.obj) {
+          auto* cap = static_cast<CapObj*>(target.obj.get());
+          if (name == "id") { S.stack.push_back(Value::id128(cap->id)); break; }
+          if (name == "resource") { S.stack.push_back(Value::string(cap->resource)); break; }
+          if (name == "rights") { S.stack.push_back(Value::integer((int64_t)cap->rights)); break; }
+          if (name == "expiry" || name == "expires") { S.stack.push_back(Value::integer((int64_t)cap->expiry)); break; }
+          if (name == "parent") { S.stack.push_back(Value::id128(cap->parent_id)); break; }
+          if (name == "holder") { S.stack.push_back(Value::string(cap->holder)); break; }
+          if (name == "attenuate") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "attenuate", 1, 1, method_cap_attenuate)));
+            break;
+          }
+          if (name == "can") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "can", 1, 1, method_cap_can)));
+            break;
+          }
+          if (name == "has_expired") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "has_expired", 0, 1, method_cap_has_expired)));
+            break;
+          }
+        }
+        if (target.type == Type::Channel && target.obj) {
+          auto* ch = static_cast<ChannelObj*>(target.obj.get());
+          if (name == "id") { S.stack.push_back(Value::id128(ch->id)); break; }
+          if (name == "name") { S.stack.push_back(Value::string(ch->name)); break; }
+          if (name == "capacity") { S.stack.push_back(Value::integer((int64_t)ch->capacity)); break; }
+          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)ch->generation)); break; }
+          if (name == "head") { S.stack.push_back(Value::integer((int64_t)ch->head)); break; }
+          if (name == "tail") { S.stack.push_back(Value::integer((int64_t)ch->tail)); break; }
+          if (name == "dropped") { S.stack.push_back(Value::integer((int64_t)ch->dropped)); break; }
+          if (name == "publish") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "publish", 1, 2, method_channel_publish)));
+            break;
+          }
+          if (name == "consume") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "consume", 0, 0, method_channel_consume)));
+            break;
+          }
+          if (name == "stats") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "stats", 0, 0, method_channel_stats)));
+            break;
+          }
+        }
+        if (target.type == Type::StateFrame && target.obj) {
+          auto* f = static_cast<FrameObj*>(target.obj.get());
+          if (name == "id") { S.stack.push_back(Value::id128(f->id)); break; }
+          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)f->generation)); break; }
+          if (name == "publisher") { S.stack.push_back(Value::id128(f->publisher)); break; }
+          if (name == "payload") { S.stack.push_back(f->payload); break; }
+          if (name == "timestamp") { S.stack.push_back(Value::integer((int64_t)f->timestamp)); break; }
+        }
+        if (target.type == Type::MemoryObject && target.obj) {
+          auto* mem = static_cast<MemObj*>(target.obj.get());
+          if (name == "id") { S.stack.push_back(Value::id128(mem->id)); break; }
+          if (name == "size") { S.stack.push_back(Value::integer((int64_t)mem->size)); break; }
+          if (name == "provider") { S.stack.push_back(Value::string(mem->provider)); break; }
+          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)mem->generation)); break; }
+          if (name == "write") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "write", 2, 2, method_mem_write)));
+            break;
+          }
+          if (name == "read") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "read", 2, 2, method_mem_read)));
+            break;
+          }
+          if (name == "migrate") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "migrate", 1, 1, method_mem_migrate)));
+            break;
+          }
+        }
+        if (target.type == Type::Entity && target.obj) {
+          auto* ent = static_cast<EntityObj*>(target.obj.get());
+          if (name == "id" || name == "identity") { S.stack.push_back(Value::id128(ent->id)); break; }
+          if (name == "name") { S.stack.push_back(Value::string(ent->name)); break; }
+          if (name == "dispatch") {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "dispatch", 1, 2, method_entity_dispatch)));
+            break;
+          }
+          if (ent->handlers.find(name) != ent->handlers.end()) {
+            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, name, 0, 1, method_entity_handler_call)));
+            break;
+          }
+          Value val = ent->get_field(name);
+          S.stack.push_back(val);
+          break;
+        }
+        fail(line, std::string("a ") + type_name(target.type) + " has no field '" + name + "'");
         break;
       }
       case Op::FieldSet: {
         const std::string& name = chunk.constants[read_short()].str();
         Value v = pop(), target = pop();
-        if (target.type != Type::Map) { fail(line, "only a map has fields to set"); break; }
-        static_cast<MapObj*>(target.obj.get())->put(name, v);
-        S.stack.push_back(v);
+        if (target.type == Type::Map) {
+          static_cast<MapObj*>(target.obj.get())->put(name, v);
+          S.stack.push_back(v);
+          break;
+        }
+        if (target.type == Type::Entity && target.obj) {
+          static_cast<EntityObj*>(target.obj.get())->set_field(name, v);
+          S.stack.push_back(v);
+          break;
+        }
+        fail(line, std::string("cannot set field on a ") + type_name(target.type));
         break;
       }
 

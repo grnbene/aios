@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<syntax name="grain">
+	<meta>
+		<name>Grain</name>
+		<type>script</type>
+		<preferred-file-extension>gr</preferred-file-extension>
+		<scriptable shebang="#!/usr/bin/env aios grain run" />
+	</meta>
+
+	<detectors>
+		<extension priority="1.0">gr</extension>
+		<match-content lines="1" priority="1.0">^#!\s*.*grain</match-content>
+	</detectors>
+
+	<indentation>
+		<increase>
+			<expression>(\{[^}\"']*$)|(\[[^\]\"']*$)|(\([^)\"']*$)</expression>
+		</increase>
+		<decrease>
+			<expression>^\s*[\}\]\)]</expression>
+		</decrease>
+	</indentation>
+
+	<comments>
+		<single>
+			<expression>//</expression>
+		</single>
+		<single>
+			<expression>#</expression>
+		</single>
+	</comments>
+
+	<brackets>
+		<pair open="{" close="}" />
+		<pair open="[" close="]" />
+		<pair open="(" close=")" />
+	</brackets>
+
+	<surrounding-pairs>
+		<pair open="{" close="}" />
+		<pair open="[" close="]" />
+		<pair open="(" close=")" />
+		<pair open="&apos;" close="&apos;" />
+		<pair open="&quot;" close="&quot;" />
+	</surrounding-pairs>
+
+	<scopes>
+		<include syntax="self" collection="comments" />
+		<include syntax="self" collection="definitions" />
+		<include syntax="self" collection="strings" />
+		<include syntax="self" collection="numbers" />
+		<include syntax="self" collection="constants" />
+		<include syntax="self" collection="keywords" />
+		<include syntax="self" collection="substrate-types" />
+		<include syntax="self" collection="builtins" />
+		<include syntax="self" collection="methods" />
+		<include syntax="self" collection="identifiers" />
+		<include syntax="self" collection="operators" />
+	</scopes>
+
+	<collections>
+		<!-- Comments -->
+		<collection name="comments">
+			<scope name="grain.comment.line.double-slash" spell-check="true">
+				<expression>//(.*)$</expression>
+				<capture number="1" name="grain.comment.content" />
+			</scope>
+			<scope name="grain.comment.line.hash" spell-check="true">
+				<expression>#(.*)$</expression>
+				<capture number="1" name="grain.comment.content" />
+			</scope>
+		</collection>
+
+		<!-- Definitions with Symbols -->
+		<collection name="definitions">
+			<!-- entity Name { -->
+			<scope name="grain.definition.entity">
+				<symbol type="class">
+					<context behavior="subtree" />
+				</symbol>
+				<starts-with>
+					<expression>\b(entity)\s+([a-zA-Z_][a-zA-Z0-9_]*)</expression>
+					<capture number="1" name="grain.keyword.construct" />
+					<capture number="2" name="grain.identifier.type.entity" />
+				</starts-with>
+				<ends-with>
+					<expression>(?&lt;=\})</expression>
+				</ends-with>
+				<subscopes>
+					<include syntax="self" />
+				</subscopes>
+			</scope>
+
+			<!-- on event_name(Type param) { -->
+			<scope name="grain.definition.handler">
+				<symbol type="event">
+					<context behavior="subtree" />
+				</symbol>
+				<starts-with>
+					<expression>\b(on)\s+([a-zA-Z_][a-zA-Z0-9_]*)</expression>
+					<capture number="1" name="grain.keyword.construct" />
+					<capture number="2" name="grain.identifier.function.handler" />
+				</starts-with>
+				<ends-with>
+					<expression>(?&lt;=\})</expression>
+				</ends-with>
+				<subscopes>
+					<include syntax="self" />
+				</subscopes>
+			</scope>
+
+			<!-- fn name(...) { -->
+			<scope name="grain.definition.function">
+				<symbol type="function">
+					<context behavior="subtree" />
+				</symbol>
+				<starts-with>
+					<expression>\b(fn)\s+([a-zA-Z_][a-zA-Z0-9_]*)</expression>
+					<capture number="1" name="grain.keyword.construct" />
+					<capture number="2" name="grain.identifier.function" />
+				</starts-with>
+				<ends-with>
+					<expression>(?&lt;=\})</expression>
+				</ends-with>
+				<subscopes>
+					<include syntax="self" />
+				</subscopes>
+			</scope>
+		</collection>
+
+		<!-- Strings -->
+		<collection name="strings">
+			<!-- Formatted strings f"..." -->
+			<scope name="grain.string.interpolated">
+				<starts-with>
+					<expression>\b[fF]&quot;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</starts-with>
+				<ends-with>
+					<expression>&quot;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</ends-with>
+				<subscopes>
+					<scope name="grain.string.escape">
+						<expression>\\(\\{|\\}|[&quot;\\/bfnrt]|u[0-9a-fA-F]{4})</expression>
+					</scope>
+					<scope name="grain.interpolation">
+						<starts-with>
+							<expression>\{</expression>
+							<capture number="0" name="grain.interpolation.delimiter" />
+						</starts-with>
+						<ends-with>
+							<expression>\}</expression>
+							<capture number="0" name="grain.interpolation.delimiter" />
+						</ends-with>
+						<subscopes>
+							<include syntax="self" />
+						</subscopes>
+					</scope>
+				</subscopes>
+			</scope>
+
+			<!-- Double quoted string -->
+			<scope name="grain.string.double-quoted">
+				<starts-with>
+					<expression>&quot;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</starts-with>
+				<ends-with>
+					<expression>&quot;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</ends-with>
+				<subscopes>
+					<scope name="grain.string.escape">
+						<expression>\\([\\&quot;0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})</expression>
+					</scope>
+				</subscopes>
+			</scope>
+
+			<!-- Single quoted string -->
+			<scope name="grain.string.single-quoted">
+				<starts-with>
+					<expression>&apos;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</starts-with>
+				<ends-with>
+					<expression>&apos;</expression>
+					<capture number="0" name="grain.string.delimiter" />
+				</ends-with>
+				<subscopes>
+					<scope name="grain.string.escape">
+						<expression>\\([\\&apos;0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})</expression>
+					</scope>
+				</subscopes>
+			</scope>
+		</collection>
+
+		<!-- Numbers -->
+		<collection name="numbers">
+			<scope name="grain.value.number.hex">
+				<expression>\b0x[0-9a-fA-F_]+\b</expression>
+			</scope>
+			<scope name="grain.value.number.binary">
+				<expression>\b0b[01_]+\b</expression>
+			</scope>
+			<scope name="grain.value.number.decimal">
+				<expression>\b[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?\b</expression>
+			</scope>
+		</collection>
+
+		<!-- Constants -->
+		<collection name="constants">
+			<scope name="grain.value.boolean">
+				<strings>
+					<string>true</string>
+					<string>false</string>
+				</strings>
+			</scope>
+			<scope name="grain.value.null">
+				<strings>
+					<string>nil</string>
+				</strings>
+			</scope>
+			<scope name="grain.identifier.variable.language.this">
+				<strings>
+					<string>this</string>
+				</strings>
+			</scope>
+			<scope name="grain.identifier.constant.substrate">
+				<strings>
+					<string>write_only</string>
+					<string>read_only</string>
+					<string>read_write</string>
+					<string>grant</string>
+					<string>never</string>
+					<string>shared_mem</string>
+					<string>ram</string>
+					<string>persistent</string>
+					<string>current_generation</string>
+				</strings>
+			</scope>
+		</collection>
+
+		<!-- Keywords -->
+		<collection name="keywords">
+			<scope name="grain.keyword.control">
+				<strings>
+					<string>let</string>
+					<string>return</string>
+					<string>if</string>
+					<string>else</string>
+					<string>while</string>
+					<string>for</string>
+					<string>in</string>
+					<string>break</string>
+					<string>continue</string>
+					<string>fn</string>
+					<string>entity</string>
+					<string>on</string>
+				</strings>
+			</scope>
+		</collection>
+
+		<!-- Substrate Types -->
+		<collection name="substrate-types">
+			<scope name="grain.identifier.type.substrate">
+				<strings>
+					<string>Id128</string>
+					<string>Capability</string>
+					<string>StateChannel</string>
+					<string>StateFrame</string>
+					<string>MemoryObject</string>
+					<string>Entity</string>
+				</strings>
+			</scope>
+		</collection>
+
+		<!-- Built-in Functions -->
+		<collection name="builtins">
+			<scope name="grain.identifier.function.substrate">
+				<strings>
+					<string>id128</string>
+					<string>memory_allocate</string>
+				</strings>
+			</scope>
+			<scope name="grain.identifier.function.builtin">
+				<strings>
+					<string>print</string>
+					<string>len</string>
+					<string>type</string>
+					<string>repr</string>
+					<string>str</string>
+					<string>int</string>
+					<string>real</string>
+					<string>bool</string>
+					<string>list</string>
+					<string>map</string>
+					<string>keys</string>
+					<string>values</string>
+					<string>entries</string>
+					<string>has</string>
+					<string>get</string>
+					<string>set</string>
+					<string>del</string>
+					<string>push</string>
+					<string>pop</string>
+					<string>shift</string>
+					<string>unshift</string>
+					<string>slice</string>
+					<string>join</string>
+					<string>split</string>
+					<string>sort</string>
+					<string>reverse</string>
+					<string>range</string>
+					<string>abs</string>
+					<string>min</string>
+					<string>max</string>
+					<string>floor</string>
+					<string>ceil</string>
+					<string>round</string>
+					<string>sqrt</string>
+					<string>sin</string>
+					<string>cos</string>
+					<string>tan</string>
+					<string>pow</string>
+					<string>log</string>
+					<string>exp</string>
+					<string>random</string>
+					<string>now</string>
+					<string>clock</string>
+					<string>read_file</string>
+					<string>write_file</string>
+					<string>append_file</string>
+					<string>delete_file</string>
+					<string>list_files</string>
+					<string>file_exists</string>
+					<string>is_dir</string>
+					<string>mkdir</string>
+					<string>env</string>
+					<string>exec</string>
+					<string>spawn</string>
+					<string>sys</string>
+				</strings>
+			</scope>
+		</collection>
+
+		<!-- Substrate & General Methods -->
+		<collection name="methods">
+			<scope name="grain.identifier.method.substrate">
+				<expression>\.(publish|consume|stats|attenuate|can|has_expired|read|write|migrate|dispatch)\b</expression>
+				<capture number="1" name="grain.identifier.method.substrate.name" />
+			</scope>
+			<scope name="grain.identifier.property">
+				<expression>\.([a-zA-Z_][a-zA-Z0-9_]*)</expression>
+				<capture number="1" name="grain.identifier.property.name" />
+			</scope>
+		</collection>
+
+		<!-- Identifiers & Scoped Names -->
+		<collection name="identifiers">
+			<scope name="grain.identifier.namespace">
+				<expression>\b[a-zA-Z_][a-zA-Z0-9_]*(::[a-zA-Z_][a-zA-Z0-9_]*)+\b</expression>
+			</scope>
+			<scope name="grain.identifier.type">
+				<expression>\b[A-Z][a-zA-Z0-9_]*\b</expression>
+			</scope>
+			<scope name="grain.identifier.function.call">
+				<expression>\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?=\()</expression>
+				<capture number="1" name="grain.identifier.function.call.name" />
+			</scope>
+		</collection>
+
+		<!-- Operators -->
+		<collection name="operators">
+			<scope name="grain.operator.scope">
+				<expression>::</expression>
+			</scope>
+			<scope name="grain.operator.comparison">
+				<expression>(==|!=|&lt;=|&gt;=|&lt;|&gt;)</expression>
+			</scope>
+			<scope name="grain.operator.assignment">
+				<expression>(&lt;&lt;=|&gt;&gt;=|\+=|-=|\*=|/=|%=|\^=|&amp;=|\|=|=)</expression>
+			</scope>
+			<scope name="grain.operator.bitwise">
+				<expression>(&lt;&lt;|&gt;&gt;|\^|&amp;|\||~)</expression>
+			</scope>
+			<scope name="grain.operator.arithmetic">
+				<expression>(\+|-|\*|/|%)</expression>
+			</scope>
+			<scope name="grain.operator.logical">
+				<expression>!</expression>
+			</scope>
+		</collection>
+	</collections>
+</syntax>

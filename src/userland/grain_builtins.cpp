@@ -175,12 +175,15 @@ Value bi_sort(Vm&, std::vector<Value>& args, std::string& error) {
   std::vector<Value> items = args[0].list_items();
   bool comparable = true;
   for (const Value& v : items)
-    if (!v.is_number() && v.type != Type::Str) comparable = false;
-  if (!comparable) { error = "sort() needs a list of numbers or a list of strings"; return Value::nil(); }
+    if (!v.is_number() && v.type != Type::Str && v.type != Type::Id128) comparable = false;
+  if (!comparable) { error = "sort() needs a list of numbers, strings, or id128 values"; return Value::nil(); }
   std::stable_sort(items.begin(), items.end(), [](const Value& a, const Value& b) {
     if (a.is_number() && b.is_number()) return a.as_double() < b.as_double();
     if (a.type == Type::Str && b.type == Type::Str) return a.str() < b.str();
-    return a.is_number() && !b.is_number();   // numbers before strings, deterministically
+    if (a.type == Type::Id128 && b.type == Type::Id128) return a.as_id128() < b.as_id128();
+    if (a.is_number() && !b.is_number()) return true;
+    if (a.type == Type::Str && b.type == Type::Id128) return true;
+    return false;
   });
   return Value::list(std::move(items));
 }
@@ -5620,6 +5623,135 @@ Value bi_file_exists(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::boolean(f->exists(args[0].str()));
 }
 
+Value bi_entity_assemble(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args.size() < 3 || args[0].type != Type::Str || args[1].type != Type::Map || args[2].type != Type::Map) {
+    error = "__entity_assemble expects (name, fields, handlers)";
+    return Value::nil();
+  }
+  const std::string& name = args[0].str();
+  auto* f_map = static_cast<MapObj*>(args[1].obj.get());
+  auto* h_map = static_cast<MapObj*>(args[2].obj.get());
+
+  aios::Id128 id{};
+  Value* id_val = f_map->find("identity");
+  if (id_val && id_val->is_id128()) {
+    id = id_val->as_id128();
+  } else if (id_val && id_val->type == Type::Str) {
+    aios::Id128::parse(id_val->str(), id);
+  }
+  if (id.is_null()) {
+    static uint64_t entity_seq = 0x1000;
+    id = aios::Id128{0xfeedfacecafe0001ull, ++entity_seq};
+  }
+
+  auto ent = std::make_shared<EntityObj>(name, id);
+  for (const auto& [k, v] : f_map->entries) {
+    ent->fields[k] = v;
+  }
+  for (const auto& [k, v] : h_map->entries) {
+    ent->handlers[k] = v;
+  }
+  return Value::object(Type::Entity, ent);
+}
+
+Value bi_id128(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args.empty()) {
+    static uint64_t id_counter = 0x8000;
+    aios::Id128 gen_id{0xbeefc00112345678ull, ++id_counter};
+    return Value::id128(gen_id);
+  }
+  if (args.size() == 1) {
+    if (args[0].type == Type::Str) {
+      aios::Id128 id;
+      std::string s = args[0].str();
+      if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) s = s.substr(2);
+      while (s.size() < 32) s.push_back('0');
+      if (!aios::Id128::parse(s, id)) {
+        error = "id128(): '" + args[0].str() + "' is not a valid hex identity";
+        return Value::nil();
+      }
+      return Value::id128(id);
+    }
+    if (args[0].is_id128()) return args[0];
+  }
+  if (args.size() == 2 && args[0].type == Type::Int && args[1].type == Type::Int) {
+    aios::Id128 id{(uint64_t)args[0].as_int(), (uint64_t)args[1].as_int()};
+    return Value::id128(id);
+  }
+  error = "id128() expects 0 args, 1 hex string, or (hi, lo) integers";
+  return Value::nil();
+}
+
+Value bi_Capability(Vm&, std::vector<Value>& args, std::string&) {
+  std::string res = "default";
+  uint16_t rights = 1;
+  uint64_t expires = 0;
+  std::string holder = "";
+  if (!args.empty() && args[0].type == Type::Map) {
+    auto* m = static_cast<MapObj*>(args[0].obj.get());
+    if (Value* v = m->find("resource")) res = v->to_text();
+    if (Value* v = m->find("rights")) rights = (uint16_t)v->as_int();
+    if (Value* v = m->find("expires")) expires = (uint64_t)v->as_int();
+    if (Value* v = m->find("expiry")) expires = (uint64_t)v->as_int();
+    if (Value* v = m->find("holder")) holder = v->to_text();
+  } else if (!args.empty()) {
+    res = args[0].to_text();
+    if (args.size() > 1 && args[1].type == Type::Int) rights = (uint16_t)args[1].as_int();
+    if (args.size() > 2 && args[2].type == Type::Int) expires = (uint64_t)args[2].as_int();
+  }
+  static uint64_t cap_cnt = 0x2000;
+  aios::Id128 id{0xca9ab11177000001ull, ++cap_cnt};
+  auto cap = std::make_shared<CapObj>(id, res, rights, expires, aios::Id128{}, holder);
+  return Value::object(Type::Capability, cap);
+}
+
+Value bi_StateChannel(Vm&, std::vector<Value>& args, std::string&) {
+  std::string name = "channel";
+  uint32_t capacity = 256;
+  if (!args.empty() && args[0].type == Type::Map) {
+    auto* m = static_cast<MapObj*>(args[0].obj.get());
+    if (Value* v = m->find("name")) name = v->str();
+    if (Value* v = m->find("capacity")) capacity = (uint32_t)v->as_int();
+    if (Value* v = m->find("provider")) name += std::string(":") + v->to_text();
+  } else if (!args.empty()) {
+    name = args[0].to_text();
+    if (args.size() > 1 && args[1].type == Type::Int) capacity = (uint32_t)args[1].as_int();
+  }
+  static uint64_t ch_cnt = 0x3000;
+  aios::Id128 id{0xc4a44e1000000001ull, ++ch_cnt};
+  auto ch = std::make_shared<ChannelObj>(name, id, capacity);
+  return Value::object(Type::Channel, ch);
+}
+
+Value bi_memory_allocate(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args.empty() || args[0].type != Type::Int) {
+    error = "memory_allocate expects (size, [provider])";
+    return Value::nil();
+  }
+  size_t sz = (size_t)args[0].as_int();
+  std::string prov = "ram";
+  if (args.size() > 1 && args[1].type == Type::Str) prov = args[1].str();
+  static uint64_t mem_cnt = 0x4000;
+  aios::Id128 id{0x3e30410000000001ull, ++mem_cnt};
+  auto mem = std::make_shared<MemObj>(id, sz, prov);
+  return Value::object(Type::MemoryObject, mem);
+}
+
+Value bi_StateFrame(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args.empty()) {
+    error = "StateFrame expects payload";
+    return Value::nil();
+  }
+  uint64_t gen = 1;
+  aios::Id128 pub{};
+  if (args.size() > 1 && args[1].type == Type::Int) gen = (uint64_t)args[1].as_int();
+  if (args.size() > 2 && args[2].is_id128()) pub = args[2].as_id128();
+  static uint64_t frame_cnt = 0x5000;
+  aios::Id128 id{0xf4a3e00000000001ull, ++frame_cnt};
+  auto f = std::make_shared<FrameObj>(id, gen, pub, args[0], 0);
+  return Value::object(Type::StateFrame, f);
+}
+
 }  // namespace
 
 void install_core_builtins(Vm& vm) {
@@ -5942,6 +6074,31 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("list_dir", 0, 1, bi_list_dir);
   vm.define_native("delete_file", 1, 1, bi_delete_file);
   vm.define_native("file_exists", 1, 1, bi_file_exists);
+
+  // AIOS Substrate Primitives
+  vm.define_native("__entity_assemble", 3, 3, bi_entity_assemble);
+  vm.define_native("id128", 0, 2, bi_id128);
+  vm.define_native("Capability", 0, 4, bi_Capability);
+  vm.define_native("capability", 0, 4, bi_Capability);
+  vm.define_native("cap_mint", 0, 4, bi_Capability);
+  vm.define_native("StateChannel", 0, 2, bi_StateChannel);
+  vm.define_native("channel_create", 0, 2, bi_StateChannel);
+  vm.define_native("StateFrame", 1, 3, bi_StateFrame);
+  vm.define_native("state_frame", 1, 3, bi_StateFrame);
+  vm.define_native("memory_allocate", 1, 2, bi_memory_allocate);
+  vm.define_native("MemoryObject", 1, 2, bi_memory_allocate);
+
+  // Architecture Constants & Substrate Globals
+  vm.define_global("read_only", Value::integer(1));
+  vm.define_global("write_only", Value::integer(2));
+  vm.define_global("read_write", Value::integer(3));
+  vm.define_global("grant", Value::integer(8));
+  vm.define_global("all_rights", Value::integer(63));
+  vm.define_global("never", Value::integer(0));
+  vm.define_global("shared_mem", Value::string("shared_mem"));
+  vm.define_global("ram", Value::string("ram"));
+  vm.define_global("persistent", Value::string("persistent"));
+  vm.define_global("current_generation", Value::integer(1));
 
   install_window_builtins(vm);
 }

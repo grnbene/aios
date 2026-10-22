@@ -20,7 +20,8 @@ enum class Tok : uint8_t {
   AmpEq, PipeEq, CaretEq, LtLtEq, GtGtEq,
   EqEq, BangEq, Lt, LtEq, Gt, GtEq,
   LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-  Comma, Dot, Colon, Question
+  Comma, Dot, Colon, ColonColon, Question,
+  Entity, On
 };
 
 const char* tok_name(Tok t);

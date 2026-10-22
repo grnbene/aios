@@ -26,6 +26,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "aios/core/ids.hpp"
+
 namespace aios::userland::grain {
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,10 @@ class Obj;
 struct Value;
 using ObjRef = std::shared_ptr<Obj>;
 
-enum class Type : uint8_t { Nil, Bool, Int, Real, Str, List, Map, Fn, Native, Extern };
+enum class Type : uint8_t {
+  Nil, Bool, Int, Real, Str, List, Map, Fn, Native, Extern,
+  Id128, Capability, Channel, StateFrame, MemoryObject, Entity, BoundMethod
+};
 
 const char* type_name(Type t);
 
@@ -50,7 +55,7 @@ struct Value {
     int64_t i;
     double d;
   };
-  ObjRef obj;  // Str, List, Map, Fn, Native
+  ObjRef obj;  // Str, List, Map, Fn, Native, Id128, Cap, Channel, Frame, Mem, Entity, BoundMethod
 
   Value() : type(Type::Nil), i(0) {}
   static Value nil() { return Value(); }
@@ -60,8 +65,11 @@ struct Value {
   static Value object(Type t, ObjRef o) { Value x; x.type = t; x.i = 0; x.obj = std::move(o); return x; }
   static Value string(std::string s);
   static Value list(std::vector<Value> v);
+  static Value id128(const aios::Id128& id);
+  static Value id128(const std::string& hex);
 
   bool is_number() const { return type == Type::Int || type == Type::Real; }
+  bool is_id128() const { return type == Type::Id128; }
   // Only nil and false are false. An empty string and 0 are values, and a
   // language that calls them false makes `if count` mean two different things
   // depending on whether count is a number or a list.
@@ -69,6 +77,7 @@ struct Value {
   double as_double() const { return type == Type::Int ? (double)i : type == Type::Real ? d : 0.0; }
   int64_t as_int() const { return type == Type::Int ? i : type == Type::Real ? (int64_t)d : 0; }
 
+  const aios::Id128& as_id128() const;
   const std::string& str() const;
   std::vector<Value>& list_items() const;
   std::string to_text() const;      // what `print` shows
@@ -120,6 +129,106 @@ class MapObj final : public Obj {
   Value* find(const std::string& k);
   void put(const std::string& k, Value v);
   bool erase(const std::string& k);
+};
+
+// ---------------------------------------------------------------------------
+// Substrate & Architecture Objects (AIOS Native)
+// ---------------------------------------------------------------------------
+
+class Id128Obj final : public Obj {
+ public:
+  explicit Id128Obj(aios::Id128 id) : Obj(Type::Id128), id(id) {}
+  aios::Id128 id;
+};
+
+class CapObj final : public Obj {
+ public:
+  CapObj(aios::Id128 id, std::string res, uint16_t rights, uint64_t exp = 0, aios::Id128 parent = {}, std::string holder = "")
+      : Obj(Type::Capability), id(id), resource(std::move(res)), rights(rights), expiry(exp), parent_id(parent), holder(std::move(holder)) {}
+  aios::Id128 id;
+  std::string resource;
+  uint16_t rights = 0;
+  uint64_t expiry = 0;
+  aios::Id128 parent_id;
+  std::string holder;
+
+  bool can(uint16_t r) const { return (rights & r) == r; }
+  bool has_expired(uint64_t current_gen) const { return expiry != 0 && current_gen >= expiry; }
+  std::shared_ptr<CapObj> attenuate(uint16_t narrower_rights, const aios::Id128& new_id) const {
+    if ((narrower_rights & ~rights) != 0) return nullptr;
+    return std::make_shared<CapObj>(new_id, resource, narrower_rights, expiry, id, holder);
+  }
+};
+
+class FrameObj final : public Obj {
+ public:
+  FrameObj(aios::Id128 id, uint64_t gen, aios::Id128 pub, Value pay, uint64_t ts = 0)
+      : Obj(Type::StateFrame), id(id), generation(gen), publisher(pub), payload(std::move(pay)), timestamp(ts) {}
+  aios::Id128 id;
+  uint64_t generation = 0;
+  aios::Id128 publisher;
+  Value payload;
+  uint64_t timestamp = 0;
+};
+
+class ChannelObj final : public Obj {
+ public:
+  ChannelObj(std::string name, aios::Id128 id, uint32_t cap = 256)
+      : Obj(Type::Channel), name(std::move(name)), id(id), capacity(cap) {}
+  std::string name;
+  aios::Id128 id;
+  uint32_t capacity = 256;
+  uint64_t generation = 0;
+  uint64_t head = 0;
+  uint64_t tail = 0;
+  uint64_t dropped = 0;
+  std::vector<std::shared_ptr<FrameObj>> ring;
+
+  bool publish(Value payload, aios::Id128 publisher = {}, aios::Id128 frame_id = {});
+  std::shared_ptr<FrameObj> consume();
+};
+
+class MemObj final : public Obj {
+ public:
+  MemObj(aios::Id128 id, size_t sz, std::string prov = "ram")
+      : Obj(Type::MemoryObject), id(id), size(sz), provider(std::move(prov)), buffer(sz, 0) {}
+  aios::Id128 id;
+  size_t size = 0;
+  std::string provider;
+  std::vector<uint8_t> buffer;
+  uint64_t generation = 0;
+
+  bool write(size_t offset, const std::string& data);
+  std::string read(size_t offset, size_t len) const;
+  bool migrate(const std::string& new_provider);
+};
+
+class EntityObj final : public Obj {
+ public:
+  EntityObj(std::string name, aios::Id128 id)
+      : Obj(Type::Entity), name(std::move(name)), id(id) {}
+  std::string name;
+  aios::Id128 id;
+  std::unordered_map<std::string, Value> fields;
+  std::unordered_map<std::string, Value> handlers;
+
+  Value get_field(const std::string& k) const;
+  void set_field(const std::string& k, Value v);
+};
+
+class Vm;
+
+class BoundMethodObj final : public Obj {
+ public:
+  using MethodFn = Value (*)(Vm& vm, BoundMethodObj& bm, std::vector<Value>& args, std::string& error);
+  BoundMethodObj(Value rec, std::string name, int min_a, int max_a, MethodFn f)
+      : Obj(Type::BoundMethod), receiver(std::move(rec)), name(std::move(name)),
+        min_args(min_a), max_args(max_a), fn(f) {}
+  Value receiver;
+  std::string name;
+  int min_args = 0;
+  int max_args = -1;
+  MethodFn fn = nullptr;
 };
 
 // ---------------------------------------------------------------------------

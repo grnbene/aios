@@ -1,5 +1,6 @@
 // AIOS — Native Microsoft TDS 7.4 wire client implementation ([MS-TDS]).
 #include "aios/userland/tds_wire.hpp"
+#include "aios/userland/sql_database.hpp"
 #include "aios/hal/host.hpp"
 #include "aios/net/tls.hpp"
 #include "aios/net/tls_conn.hpp"
@@ -234,11 +235,10 @@ std::string hex2(unsigned v) {
   return b;
 }
 
-std::string num_text(double v) {
-  char b[64];
-  auto r = std::to_chars(b, b + sizeof b, v);
-  return std::string(b, r.ptr);
-}
+// The shortest text that reads back as the same double, as the SQL engine
+// prints a DOUBLE. (std::to_chars for floating point needs GCC 11; the el7
+// build's manylinux2014 image has GCC 10.)
+std::string num_text(double v) { return sql_format_double(v, 0); }
 
 // An exact decimal: a magnitude of `len` little-endian bytes, `scale` digits after the point.
 std::string decimal_text(bool positive, const uint8_t* mag, size_t len, int scale) {
