@@ -1,0 +1,32 @@
+// The theoretical next-gen system component from your prompt
+entity StateMonitor {
+    identity: id128("7bd4b2f7e1f9"),
+    channel:  StateChannel(provider = shared_mem),
+    
+    capability: Capability {
+        resource: hardware::uart0,
+        rights:   write_only,
+        expires:  never
+    }
+
+    on frame_received(StateFrame frame) {
+        // High-level abstraction with bare-metal speed
+        if (frame.generation == current_generation) {
+            this.channel.publish(frame.payload);
+        }
+    }
+}
+
+print("StateMonitor loaded successfully!")
+print("  Identity:", StateMonitor.identity)
+print("  Channel:", StateMonitor.channel.name)
+print("  Capability Resource:", StateMonitor.capability.resource)
+print("  Capability Rights:", StateMonitor.capability.rights)
+
+// Simulate receiving a state frame
+let incoming = StateFrame("hardware_interrupt_packet_0", 1)
+StateMonitor.dispatch("frame_received", incoming)
+
+// Consume from the monitor's channel
+let published = StateMonitor.channel.consume()
+print("  Dispatched frame processed & published:", published.payload)

@@ -72,6 +72,13 @@ const char* type_name(Type t) {
     case Type::Fn: return "fn";
     case Type::Native: return "native";
     case Type::Extern: return "handle";
+    case Type::Id128: return "id128";
+    case Type::Capability: return "capability";
+    case Type::Channel: return "channel";
+    case Type::StateFrame: return "frame";
+    case Type::MemoryObject: return "memory";
+    case Type::Entity: return "entity";
+    case Type::BoundMethod: return "method";
   }
   return "?";
 }
@@ -444,6 +451,29 @@ class Compiler {
     }
   }
 
+  void compile_entity_handler(const std::string& entity_name, const OnHandler& h) {
+    std::string fn_name = entity_name + "." + h.event;
+    Scope fn_scope(scope_, fn_name);
+    fn_scope.fn_->arity = 2;  // this, param
+    Scope* saved = scope_;
+    scope_ = &fn_scope;
+    begin_block();
+    add_local("this", h.line);
+    add_local(h.param.empty() ? "_arg" : h.param, h.line);
+    for (const auto& s : h.body) statement(*s);
+    emit(Op::Nil, h.line);
+    emit(Op::Return, h.line);
+    scope_ = saved;
+
+    const size_t k = chunk().add_constant(Value::object(Type::Fn, fn_scope.fn_));
+    if (k > 0xffff) { error(h.line, "too many functions in one function"); return; }
+    emit_op_wide(Op::Closure, k, h.line);
+    for (const auto& uv : fn_scope.upvalues_) {
+      emit_byte(uv.from_local ? 1 : 0, h.line);
+      emit_byte(uv.index, h.line);
+    }
+  }
+
   // --- statements ---------------------------------------------------------
 
   void statement(const Stmt& s) {
@@ -558,6 +588,30 @@ class Compiler {
         if (scope_->loops_.empty()) { error(s.line, "continue outside a loop"); return; }
         pop_to_loop_depth(s.line);
         emit_loop(scope_->loops_.back().continue_target, s.line);
+        return;
+      }
+
+      case StmtKind::EntityDecl: {
+        const auto& def = *s.entity_def;
+        emit_op_wide(Op::GetGlobal, name_constant("__entity_assemble", s.line), s.line);
+        emit_constant(Value::string(def.name), s.line);
+        for (const auto& f : def.fields) {
+          emit_constant(Value::string(f.first), s.line);
+          expression(*f.second);
+        }
+        emit_op_wide(Op::BuildMap, (uint16_t)def.fields.size(), s.line);
+        for (const auto& h : def.handlers) {
+          emit_constant(Value::string(h->event), h->line);
+          compile_entity_handler(def.name, *h);
+        }
+        emit_op_wide(Op::BuildMap, (uint16_t)def.handlers.size(), s.line);
+        emit_op_arg(Op::Call, 3, s.line);
+
+        if (scope_->depth_ == 0 && !scope_->enclosing_) {
+          emit_op_wide(Op::DefineGlobal, name_constant(def.name, s.line), s.line);
+        } else {
+          add_local(def.name, s.line);
+        }
         return;
       }
     }

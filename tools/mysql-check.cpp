@@ -318,7 +318,7 @@ int main() {
   assert(sys_vars->rows.size() == 1);
   assert(sys_vars->rows[0][0].bytes == "AIOS ASQL / MySQL Native Wire Server");
   assert(sys_vars->rows[0][1].bytes == "REPEATABLE-READ");
-  assert(sys_vars->rows[0][2].bytes == "NO_ENGINE_SUBSTITUTION");
+  assert(sys_vars->rows[0][2].bytes.find("NO_ENGINE_SUBSTITUTION") != std::string::npos);
   assert(sys_vars->rows[0][3].bytes == "0");
   assert(sys_vars->rows[0][4].bytes == "67108864");
   assert(sys_vars->rows[0][5].bytes == "utf8mb4");

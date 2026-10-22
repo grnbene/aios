@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<completions>
+	<provider>
+		<syntax>grain</syntax>
+		<set>grain.keywords</set>
+		<set>grain.substrate.types</set>
+		<set>grain.substrate.builtins</set>
+		<set>grain.substrate.methods</set>
+		<set>grain.builtins</set>
+	</provider>
+
+	<!-- Keywords & Snippets -->
+	<set name="grain.keywords" symbol="keyword">
+		<completion string="entity">
+			<behavior>
+				<append> $[Name] {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="on">
+			<behavior>
+				<append> $[event_name]($[frame]) {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="fn">
+			<behavior>
+				<append> $[name]($[args]) {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="let">
+			<behavior>
+				<append> $[name] = $[value]</append>
+			</behavior>
+		</completion>
+		<completion string="if">
+			<behavior>
+				<append> ($[condition]) {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="else" />
+		<completion string="while">
+			<behavior>
+				<append> ($[condition]) {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="for">
+			<behavior>
+				<append> $[item] in $[sequence] {\n\t$[body]\n}</append>
+			</behavior>
+		</completion>
+		<completion string="return" />
+		<completion string="break" />
+		<completion string="continue" />
+		<completion string="true" />
+		<completion string="false" />
+		<completion string="nil" />
+		<completion string="this" />
+	</set>
+
+	<!-- Substrate Types -->
+	<set name="grain.substrate.types" symbol="type">
+		<completion string="Id128" />
+		<completion string="Capability" />
+		<completion string="StateChannel" />
+		<completion string="StateFrame" />
+		<completion string="MemoryObject" />
+		<completion string="Entity" />
+	</set>
+
+	<!-- Substrate Builtins & Constructors -->
+	<set name="grain.substrate.builtins" symbol="function">
+		<completion string="id128">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="Capability">
+			<behavior>
+				<arguments prefix=" { " suffix=" }" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="StateChannel">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="StateFrame">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="memory_allocate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="write_only" symbol="constant" />
+		<completion string="read_only" symbol="constant" />
+		<completion string="read_write" symbol="constant" />
+		<completion string="grant" symbol="constant" />
+		<completion string="never" symbol="constant" />
+		<completion string="shared_mem" symbol="constant" />
+		<completion string="ram" symbol="constant" />
+		<completion string="persistent" symbol="constant" />
+		<completion string="current_generation" symbol="constant" />
+	</set>
+
+	<!-- Substrate Methods -->
+	<set name="grain.substrate.methods" symbol="method">
+		<completion string="publish">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="consume">
+			<behavior>
+				<arguments prefix="()" suffix="" separator="" />
+			</behavior>
+		</completion>
+		<completion string="stats">
+			<behavior>
+				<arguments prefix="()" suffix="" separator="" />
+			</behavior>
+		</completion>
+		<completion string="attenuate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="can">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="has_expired">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="write">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="migrate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="dispatch">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+	</set>
+
+	<!-- Standard Built-in Functions -->
+	<set name="grain.builtins" symbol="function">
+		<completion string="print">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="len">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="type">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="repr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="str">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="int">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="real">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bool">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="keys">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="values">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="push">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pop">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sort">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="range">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+	</set>
+</completions>

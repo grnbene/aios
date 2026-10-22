@@ -1,0 +1,155 @@
+# AIOS Substrate Language Verification Tour
+# Rigorously tests 128-bit identities, capability enforcement, memory fabric,
+# state streaming ring-buffers, FIFO/drop mechanics, and entity event dispatch.
+
+let failures = 0
+fn check(label, got, want) {
+  if got == want {
+    print("  ok   ", label, "=", repr(got))
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+
+print("1. 128-bit Immutable Identities (id128)")
+let id_a = id128("7bd4b2f7e1f9")
+let id_b = id128("7bd4b2f7e1f9")
+let id_c = id128()
+check("id128 equality", id_a == id_b, true)
+check("id128 difference", id_a != id_c, true)
+check("id128 string prefix", slice(id_a.str, 0, 12), "7bd4b2f7e1f9")
+check("id128 short form", id_a.short, "7bd4b2f7e1f9")
+check("id128 type", type(id_a), "id128")
+
+# Verify sorting / comparison of id128 values
+let id_low = id128(10, 20)
+let id_high = id128(10, 30)
+check("id128 less-than", id_low < id_high, true)
+check("id128 greater-than", id_high > id_low, true)
+let id_list = [id_high, id_low]
+let sorted_ids = sort(id_list)
+check("id128 list sorting", sorted_ids[0] == id_low and sorted_ids[1] == id_high, true)
+
+print("\n2. Capability-Based Authority")
+let cap = Capability {
+    resource: hardware::uart0,
+    rights:   write_only,
+    expires:  never
+}
+check("capability type", type(cap), "capability")
+check("capability resource", cap.resource, "hardware::uart0")
+check("capability rights", cap.rights, write_only)
+check("capability can write", cap.can(write_only), true)
+check("capability can read", cap.can(read_only), false)
+
+# Attenuate capability to narrower rights
+let child_cap = cap.attenuate(write_only)
+check("attenuated cap rights", child_cap.rights, write_only)
+check("attenuated cap parent", child_cap.parent, cap.id)
+
+print("\n3. State Channels & Ring-Buffer Streaming")
+let ch = StateChannel {
+    name: "state-ring",
+    capacity: 3
+}
+check("channel type", type(ch), "channel")
+check("channel capacity", ch.capacity, 3)
+
+# Publish 5 frames into a channel of capacity 3: verifies overflow & drops
+for i in range(1, 6) {
+    ch.publish("packet_" + str(i))
+}
+
+let stats = ch.stats()
+check("channel head after 5 pushes", stats.head, 5)
+check("channel tail after drops", stats.tail, 2)
+check("channel dropped count", stats.dropped, 2)
+
+# Consume remaining 3 frames (FIFO order: 3, 4, 5)
+let f1 = ch.consume()
+let f2 = ch.consume()
+let f3 = ch.consume()
+check("fifo frame 1 payload", f1.payload, "packet_3")
+check("fifo frame 2 payload", f2.payload, "packet_4")
+check("fifo frame 3 payload", f3.payload, "packet_5")
+
+# Starvation test: buffer is now empty
+let empty_frame = ch.consume()
+check("starvation returns nil", empty_frame, nil)
+
+print("\n4. Decoupled Memory Fabric")
+let mem = memory_allocate(64, "ram")
+check("memory type", type(mem), "memory")
+check("memory size", mem.size, 64)
+check("memory provider", mem.provider, "ram")
+
+mem.write(0, "aios-substrate")
+check("memory read", mem.read(0, 14), "aios-substrate")
+
+# Overwrite at offset
+mem.write(5, "_FABRIC_")
+check("memory read after overwrite", mem.read(0, 14), "aios-_FABRIC_e")
+
+# Migrate to shared memory: provider changes, generation increments, id is preserved
+let mem_id_before = mem.id
+let gen_before = mem.generation
+mem.migrate("shared_mem")
+check("memory provider after migration", mem.provider, "shared_mem")
+check("memory id preserved", mem.id, mem_id_before)
+check("memory generation incremented", mem.generation > gen_before, true)
+check("memory contents intact after migration", mem.read(0, 14), "aios-_FABRIC_e")
+
+print("\n5. First-Class Entity Definition, State Mutation & Multi-Dispatch")
+entity StateMonitor {
+    identity: id128("7bd4b2f7e1f9"),
+    channel:  StateChannel { name: "monitor-out", capacity: 64 },
+    capability: Capability {
+        resource: hardware::uart0,
+        rights:   write_only,
+        expires:  never
+    },
+    counter: 0,
+
+    on frame_received(StateFrame frame) {
+        if (frame.generation == current_generation) {
+            this.counter = this.counter + 1
+            this.channel.publish("processed#" + str(this.counter) + ":" + str(frame.payload))
+        }
+    },
+
+    on ping(msg) {
+        this.counter = this.counter + 10
+        this.channel.publish("pong:" + str(msg))
+    }
+}
+
+check("entity type", type(StateMonitor), "entity")
+check("entity name", StateMonitor.name, "StateMonitor")
+check("entity identity", StateMonitor.identity, id128("7bd4b2f7e1f9"))
+check("entity initial counter", StateMonitor.counter, 0)
+
+# Dispatch frame_received
+StateMonitor.dispatch("frame_received", StateFrame("sensor_reading", 1))
+check("entity counter mutated", StateMonitor.counter, 1)
+
+let out1 = StateMonitor.channel.consume()
+check("entity output 1", out1.payload, "processed#1:sensor_reading")
+
+# Dispatch ping
+StateMonitor.dispatch("ping", "keepalive_req")
+check("entity counter after ping", StateMonitor.counter, 11)
+
+let out2 = StateMonitor.channel.consume()
+check("entity output 2", out2.payload, "pong:keepalive_req")
+
+# Dispatch unknown event returns nil without crashing
+let unknown_res = StateMonitor.dispatch("non_existent_event", "foo")
+check("unknown event returns nil", unknown_res, nil)
+
+print("\n------------------------------------------------------------")
+if failures == 0 {
+  print("ALL SUBSTRATE CHECKS PASSED: 100% verified without mocks or stubs!")
+} else {
+  print("FAILURES:", failures)
+}
