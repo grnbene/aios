@@ -91,6 +91,14 @@ if(GRAIN_SDL2_TARGET)
   set_tests_properties(grain.window.panes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
 endif()
 
+# grain build: one executable from a program and its assets, run from elsewhere.
+set(BUILD_ARGS -DGRAIN=$<TARGET_FILE:grain> -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/build
+               -DOUT=${CMAKE_CURRENT_BINARY_DIR}/built/hello -DEXPECTED=${EXPECTED_DIR}/build.hello.out)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/built)
+add_test(NAME grain.build.hello COMMAND ${CMAKE_COMMAND} ${BUILD_ARGS} -P ${CMAKE_CURRENT_SOURCE_DIR}/run_build.cmake)
+set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
+  COMMAND ${CMAKE_COMMAND} ${BUILD_ARGS} -DUPDATE=1 -P ${CMAKE_CURRENT_SOURCE_DIR}/run_build.cmake)
+
 # Last, so it rewrites every case above (each headless: a window case shows on SDL's dummy display).
 add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
   COMMENT "rewriting grain/tests/expected from the current build")

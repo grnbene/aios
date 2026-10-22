@@ -1,0 +1,5 @@
+# Built into one executable by grain build (tests/run_build.cmake), then run.
+print("args:", args)
+print("files:", bundle_files())
+print(trim(bundle_file("assets/greet.txt")))
+print("missing asset is an error:", not pcall(fn () { return bundle_file("nope") }).ok)

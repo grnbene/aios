@@ -1,0 +1,4 @@
+args: ["first", "second arg"]
+files: ["assets/greet.txt", "hello.gr"]
+greeting: hello from an asset
+missing asset is an error: true
