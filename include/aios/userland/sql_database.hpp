@@ -117,6 +117,7 @@ bool like_match(std::string_view s, std::string_view p);
 // changes. Everything that reads a default goes through these four.
 constexpr char kDefaultExprMark = '\x1f';
 constexpr char kOnUpdateMark = '\x1e';
+constexpr char kNoDefaultMark = '\x1d';   // ALTER ... DROP DEFAULT on a nullable column: no default at all (not DEFAULT NULL)
 // The default alone, mark and all (empty: none).
 inline std::string column_default_part(const std::string& d) {
   const size_t i = d.find(kOnUpdateMark);
@@ -128,7 +129,10 @@ inline std::string column_on_update_text(const std::string& d) {
   return i == std::string::npos ? std::string() : d.substr(i + 1);
 }
 inline bool column_default_is_expr(const std::string& d) { return !d.empty() && d[0] == kDefaultExprMark; }
-inline bool column_has_default(const std::string& d) { return !column_default_part(d).empty(); }
+inline bool column_has_default(const std::string& d) {
+  const std::string p = column_default_part(d);
+  return !p.empty() && !(p.size() == 1 && p[0] == kNoDefaultMark);
+}
 // What a client is shown: the expression as written (`current_timestamp()`), or the value.
 inline std::string column_default_text(const std::string& d) {
   const std::string part = column_default_part(d);
@@ -173,6 +177,7 @@ struct SqlColumn {
   // write, so a read is a plain read either way.
   std::string generated;
   bool generated_virtual = false;
+  std::string comment;   // COMMENT 'text' as declared
 };
 
 // MariaDB's `Extra` for a column in SHOW COLUMNS / DESCRIBE / information_schema.
@@ -279,7 +284,10 @@ struct SqlIndex {
   std::string name;
   std::vector<std::string> columns;
   bool is_unique = false;
-  std::string type = "BTREE";
+  std::string type = "BTREE";   // BTREE, FULLTEXT, SPATIAL
+  std::vector<uint16_t> sub_parts;   // parallel to columns when any: a prefix length `col(10)`, 0 for none
+  std::string comment;
+  uint16_t sub_part(size_t i) const { return i < sub_parts.size() ? sub_parts[i] : 0; }
 };
 
 struct SqlForeignKey {
@@ -1512,14 +1520,19 @@ struct MatViewWatchList {
 struct SqlTable {
   std::string name;
   std::string create_time;
+  // The AUTO_INCREMENT counter as MariaDB keeps it: one past the largest id handed out, kept across deletes,
+  // ALTER TABLE ... AUTO_INCREMENT = n and restarts (0: not known yet; the largest stored id then decides).
+  long long auto_increment_next = 0;
+  std::string comment;   // COMMENT='text' table option
   // Stamped by every write (sql_next_mutation_seq); the store checkpoint
   // compares it with the stamp of the file it last wrote for this table.
   uint64_t mutation_seq = 0;
   std::vector<size_t> cluster_columns() const;
-  bool rows_in_key_order(const std::vector<size_t>& cols) const;
+  bool rows_in_key_order(const std::vector<size_t>& cols, size_t from = 0) const;
   std::vector<size_t> scan_order_key() const;   // see the .cpp
-  mutable uint64_t key_order_seq_ = ~0ull;   // the mutation_seq it was last known at; ~0 never
+  mutable uint64_t key_order_seq_ = ~0ull;   // the layout_seq it was last known at; ~0 never
   mutable bool key_order_ok_ = true;
+  mutable size_t key_order_rows_ = 0;        // the row count it was known for: appended rows are checked from there
   // Stamped only when rows already stored change place or value (UPDATE,
   // DELETE, re-encoding) - not by appends. An index over the first N rows
   // stays valid while it holds; appended rows are its tail.
