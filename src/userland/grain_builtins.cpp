@@ -6118,6 +6118,7 @@ struct GrainPane {
   Value click_cb;
   Value key_cb;
   Value custom_data;
+  std::shared_ptr<PaneDriver> driver;   // set: native code draws it and takes its events
   uint32_t compositor_window_id = 0;
   uint64_t owner = 0;   // the serial of the VM that registered it: its callbacks are that VM's closures
 };
@@ -6335,7 +6336,13 @@ Value bi_pane_render(Vm& vm, std::vector<Value>& args, std::string& error) {
   Value cv_val = Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", cv));
   Value pane_map_val = Value::object(Type::Map, pane_to_map(pane));
 
-  if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
+  if (pane->driver) {
+    std::string err;
+    if (!pane->driver->draw(vm, cv->pixels, (int)cv->width, (int)cv->height, err)) {
+      error = "pane_render(): " + err;
+      return Value::nil();
+    }
+  } else if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
     std::string err;
     call_pane_cb(vm, pane->draw_cb, cv_val, pane_map_val, err);
     if (!err.empty()) {
@@ -6390,6 +6397,10 @@ Value bi_pane_dispatch_event(Vm& vm, std::vector<Value>& args, std::string& erro
     if (res.type != Type::Nil) last_result = res;
     return true;
   };
+  if (pane->driver) {
+    std::string err;
+    if (!pane->driver->event(vm, ev_val, err)) { error = "pane_dispatch_event(): " + err; return Value::nil(); }
+  }
   if (!deliver(pane->event_cb, "event")) return Value::nil();
   if (ev_type == "click" && !deliver(pane->click_cb, "click")) return Value::nil();
   if (ev_type == "key" && !deliver(pane->key_cb, "key")) return Value::nil();
@@ -6437,6 +6448,26 @@ Value bi_pane_get(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, pane_to_map(pane));
 }
 
+Value register_driven_pane(Vm& vm, const std::string& title, int width, int height, std::shared_ptr<PaneDriver> driver) {
+  auto pane = std::make_shared<GrainPane>();
+  pane->owner = vm.serial();
+  pane->width = width > 0 ? width : 800;
+  pane->height = height > 0 ? height : 600;
+  pane->driver = std::move(driver);
+  pane->canvas = std::make_shared<GrainCanvas>();
+  pane->canvas->width = (uint32_t)pane->width;
+  pane->canvas->height = (uint32_t)pane->height;
+  pane->canvas->pixels.assign((size_t)pane->width * pane->height, 0x00000000);
+  add_pane(pane);
+  pane->title = title.empty() ? "Grain Pane " + std::to_string(pane->id) : title;
+  return Value::object(Type::Map, pane_to_map(pane));
+}
+
+std::shared_ptr<PaneDriver> pane_driver(const Vm& vm, const Value& pane) {
+  auto p = get_pane_from_value(vm, pane);
+  return p ? p->driver : nullptr;
+}
+
 // --- the panes as a display sees them --------------------------------------
 
 static Display* g_display = nullptr;
@@ -6475,7 +6506,13 @@ bool pane_frame(Vm& vm, uint64_t id, std::vector<uint32_t>& argb, int& width, in
     pane->canvas->height = (uint32_t)pane->height;
     pane->canvas->pixels.assign((size_t)pane->width * pane->height, 0x00000000);
   }
-  if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
+  if (pane->driver) {
+    const auto cv = pane->canvas;
+    if (!pane->driver->draw(vm, cv->pixels, (int)cv->width, (int)cv->height, error)) {
+      error = "\"" + pane->title + "\": " + error;
+      return false;
+    }
+  } else if (pane->draw_cb.type == Type::Fn || pane->draw_cb.type == Type::Native) {
     Value cv_val = Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", pane->canvas));
     call_pane_cb(vm, pane->draw_cb, cv_val, Value::object(Type::Map, pane_to_map(pane)), error);
     if (!error.empty()) { error = "\"" + pane->title + "\" draw callback: " + error; return false; }
@@ -6553,6 +6590,7 @@ Value bi_run_panes(Vm& vm, std::vector<Value>& args, std::string& error) {
 
 void install_window_builtins(Vm& vm) {
   vm.define_native("run_panes", 0, 1, bi_run_panes);
+  install_face_builtins(vm);
   vm.define_native("register_pane", 1, 6, bi_register_pane);
   vm.define_native("pane_register", 1, 6, bi_register_pane);
   vm.define_native("window_register", 1, 6, bi_register_pane);

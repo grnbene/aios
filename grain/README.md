@@ -45,6 +45,7 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
+| Widgets | `ui.column`, `ui.row`, `ui.text`, `ui.button`, `ui.field`, `ui.table`, `ui.tile` in a `ui.pane` |
 
 ## Windows
 
@@ -77,6 +78,48 @@ the scripted input first - the window test does this headless with
 Windows need SDL2 when grain is built (`brew install sdl2`, `apt install
 libsdl2-dev`, `vcpkg install sdl2:x64-windows-static`); without it grain builds
 the same and `run_panes()` says it has no display.
+
+### Widgets
+
+`ui.pane` is a pane whose `view` returns widgets instead of painting pixels.
+It is called every frame; face (the aios desktop's own layout and drawing) lays
+out what it returns, so a program describes what is on the screen from its
+data and never computes a coordinate.
+
+```grain
+let items = []
+fn add(f) {
+  if f.sku == "" { return nil }
+  push(items, {"sku": f.sku, "qty": int(f.qty)})
+  ui.set_field(p, "sku", "")
+}
+let p = ui.pane({"title": "Stock", "width": 640, "height": 420, "view": fn () {
+  return ui.column({"gap": 12}, [
+    ui.row({"gap": 12}, [ui.tile("Items", len(items))]),
+    ui.row({"gap": 8}, [
+      ui.field("sku", {"placeholder": "SKU", "focus": true, "on_enter": add}),
+      ui.field("qty", {"value": "1", "width": 80}),
+      ui.button("Add", add, {"primary": true})]),
+    ui.table(items, {"columns": "sku:SKU, qty:On hand:right"})])
+}})
+run_panes()
+```
+
+| Builder | Options |
+|---|---|
+| `ui.column([children])`, `ui.column(options, [children])`, `ui.row` the same | `gap`, `pad` |
+| `ui.text(words, options)` | `size`, `dim`, `bold`, `color` |
+| `ui.button(label, fn, options)` | `primary` |
+| `ui.field(id, options)` | `placeholder`, `value` (its first text), `width`, `focus`, `on_enter` (a function) |
+| `ui.table(rows, options)` | `columns` (`"key:Header, key:Header:right"`; every field when left out), `rows` (how many show), `empty` |
+| `ui.tile(label, value, options)` | `accent` (`ok`, `warn`, `bad` or a colour) |
+
+What is typed into a field stays across frames by its id. A button's function
+and a field's `on_enter` are called with the pane's field texts as a map when
+they take one argument (`fn (f) { f.sku }`). `ui.field_text(pane, id)` and
+`ui.set_field(pane, id, text)` read and replace a field; `ui.layout(pane)` says
+where the last frame put each widget. An error in `view` or in a widget's
+function stops `run_panes` with it, naming the button or field.
 
 Strings are bytes: `len`, indexing, `slice`, `find` and regex offsets count
 bytes of UTF-8.

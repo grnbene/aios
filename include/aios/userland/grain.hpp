@@ -494,6 +494,9 @@ void set_http_trust_root(const std::string& root);
 
 // Windowing & Canvas Pane Registration API (register_pane, pane_render, pane_dispatch_event, ...)
 void install_window_builtins(Vm& vm);
+// Face widgets as grain values, shown in a pane (`ui.column`, `ui.button`, ..., `ui.pane`;
+// grain_face.cpp). Part of the window builtins.
+void install_face_builtins(Vm& vm);
 
 // Where panes are shown. The embedder supplies it - real windows in the
 // standalone grain (SDL2), the desktop inside aios - and run_panes() hands it

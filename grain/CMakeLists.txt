@@ -69,7 +69,16 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/keccak256.cpp
   ${AIOS_ROOT}/src/crypto/hmac_sha256.cpp
   ${AIOS_ROOT}/src/userland/glyph_engine.cpp
-  ${AIOS_ROOT}/src/userland/font_atlas.cpp)
+  ${AIOS_ROOT}/src/userland/font_atlas.cpp
+  # face widgets (ui.*): face's layout and painting, its type and pixels, PNG for its images
+  ${AIOS_ROOT}/src/userland/grain_face.cpp
+  ${AIOS_ROOT}/src/userland/face.cpp
+  ${AIOS_ROOT}/src/userland/pixels.cpp
+  ${AIOS_ROOT}/src/userland/web_type.cpp
+  ${AIOS_ROOT}/src/userland/web_image.cpp
+  ${AIOS_ROOT}/src/userland/web_dom.cpp
+  ${AIOS_ROOT}/src/userland/web_svg.cpp
+  ${AIOS_ROOT}/src/net/deflate.cpp)
 
 # The host: the machine (files, clocks, randomness - what TLS asks of it), threads
 # and sleeping, processes, sockets - one file of each per OS.
