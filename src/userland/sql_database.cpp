@@ -6316,6 +6316,32 @@ SqlColumnOrigin item_origin(const SqlExpr* e, const std::vector<QuerySource>& so
     org.not_null = 1;
     return org;
   }
+  // MIN(d) / MAX(d) of a DATE, DATETIME or DECIMAL column answers in that
+  // column's type: the temporal kind and scale carry over so the wire sends
+  // DATE, not text (a client read MIN(trandate) as a string). Nothing else of
+  // the column does: it is not that column, has no key and may be NULL.
+  if (e && e->op == ExprOp::Func && !e->window && e->args.size() == 1 && e->args[0] &&
+      (upper_of(e->name) == "MIN"sv || upper_of(e->name) == "MAX"sv)) {
+    const SqlColumnOrigin inner = item_origin(e->args[0].get(), sources);
+    org.temporal = inner.temporal;
+    org.scale = inner.scale;
+    org.binary = inner.binary;
+    return org;
+  }
+  // DATE(x), CURDATE(), LAST_DAY(x), FROM_DAYS(n) answer a DATE; NOW() and
+  // its kin a DATETIME: typed so on the wire (DATE(trandate) AS summary_date
+  // reached the client as a string).
+  if (e && e->op == ExprOp::Func && !e->window) {
+    const std::string up = upper_of(e->name);
+    if (up == "DATE"sv || up == "CURDATE"sv || up == "CURRENT_DATE"sv || up == "LAST_DAY"sv || up == "FROM_DAYS"sv || up == "MAKEDATE"sv) {
+      org.temporal = 1;
+      return org;
+    }
+    if (up == "NOW"sv || up == "SYSDATE"sv || up == "CURRENT_TIMESTAMP"sv || up == "LOCALTIMESTAMP"sv || up == "UTC_TIMESTAMP"sv) {
+      org.temporal = 2;
+      return org;
+    }
+  }
   if (!e || e->op != ExprOp::Column || e->bound_depth != 0 || e->bound_src < 0 || (size_t)e->bound_src >= sources.size()) return org;
   const QuerySource& qs = sources[(size_t)e->bound_src];
   if (!qs.table || e->bound_col < 0 || (size_t)e->bound_col >= qs.table->columns.size()) return org;
@@ -6380,6 +6406,23 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
     if (agg && upper_of(it->name) == "COUNT"sv) return SqlDataType::Int;
     const SqlExpr* col = it;
     if (agg) { if (it->args.size() != 1 || !it->args[0]) return SqlDataType::Text; col = it->args[0].get(); }
+    // `(SELECT DATEDIFF(NOW(), MAX(trandate)) ...)`: a function typed by what
+    // it is (the Func case below); it went out as text, MariaDB sends an integer.
+    if (col->op == ExprOp::Func && !is_aggregate_name(upper_of(col->name))) return infer_item_type(col, sources);
+    // `SUM(amount * -1)`, `-balance`: the column's own type through
+    // whole-number arithmetic, as MariaDB keeps it (DECIMAL stays DECIMAL).
+    for (int guard = 0; guard < 4 && col->op != ExprOp::Column; ++guard) {
+      if (col->op == ExprOp::Neg && col->args.size() == 1 && col->args[0]) { col = col->args[0].get(); continue; }
+      if ((col->op == ExprOp::Mul || col->op == ExprOp::Add || col->op == ExprOp::Sub) && col->args.size() == 2 && col->args[0] && col->args[1]) {
+        auto whole = [](const SqlExpr* x) {
+          if (x->op == ExprOp::Neg && x->args.size() == 1 && x->args[0]) x = x->args[0].get();   // `* -1`
+          return x->op == ExprOp::Literal && x->literal.numeric && !x->literal.null && x->literal.num == std::floor(x->literal.num);
+        };
+        if (whole(col->args[1].get())) { col = col->args[0].get(); continue; }
+        if (whole(col->args[0].get())) { col = col->args[1].get(); continue; }
+      }
+      break;
+    }
     if (col->op != ExprOp::Column || !g_type_db) return SqlDataType::Text;
     for (const auto& sp : b.sources) {
       if (sp.is_derived()) continue;
@@ -11467,6 +11510,36 @@ static NumType nt_of(const SqlExpr* e, const EvalCtx& ctx, int depth = 0) {
       if (agg && upper_of(it->name) == "COUNT"sv) return {1, 0};
       const SqlExpr* col = it;
       if (agg) { if (it->args.size() != 1 || !it->args[0]) return {}; col = it->args[0].get(); }
+      // A function whose answer is a whole number whatever its arguments
+      // (`(SELECT DATEDIFF(NOW(), MAX(trandate)) FROM stockmoves WHERE ...)`
+      // went out as text; MariaDB sends an integer).
+      if (col->op == ExprOp::Func) {
+        static const char* const kIntFuncs[] = {"DATEDIFF", "TIMESTAMPDIFF", "PERIOD_DIFF", "TO_DAYS", "YEAR", "MONTH", "DAY",
+                                                "DAYOFMONTH", "DAYOFWEEK", "DAYOFYEAR", "WEEKDAY", "WEEK", "YEARWEEK", "QUARTER",
+                                                "HOUR", "MINUTE", "SECOND", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH",
+                                                "OCTET_LENGTH", "BIT_LENGTH", "SIGN", "FLOOR", "CEIL", "CEILING", "ASCII", "ORD",
+                                                "LOCATE", "INSTR", "POSITION", "FIELD", "FIND_IN_SET", "STRCMP", "UNIX_TIMESTAMP"};
+        const std::string up = upper_of(col->name);
+        for (const char* f : kIntFuncs)
+          if (up == f && !(up == "UNIX_TIMESTAMP" && !col->args.empty())) return {1, 0};
+        return {};
+      }
+      // `SUM(amount * -1)`, `-balance`, `qty + 0`: the column's type, scale and
+      // all, as MariaDB keeps it through whole-number arithmetic.
+      for (int guard = 0; guard < 4 && col->op != ExprOp::Column; ++guard) {
+        if (col->op == ExprOp::Neg && col->args.size() == 1 && col->args[0]) { col = col->args[0].get(); continue; }
+        if ((col->op == ExprOp::Mul || col->op == ExprOp::Add || col->op == ExprOp::Sub) && col->args.size() == 2 && col->args[0] && col->args[1]) {
+          const SqlExpr* l = col->args[0].get();
+          const SqlExpr* r = col->args[1].get();
+          auto whole = [](const SqlExpr* x) {
+          if (x->op == ExprOp::Neg && x->args.size() == 1 && x->args[0]) x = x->args[0].get();   // `* -1`
+          return x->op == ExprOp::Literal && x->literal.numeric && !x->literal.null && x->literal.num == std::floor(x->literal.num);
+        };
+          if (whole(r)) { col = l; continue; }
+          if (whole(l)) { col = r; continue; }
+        }
+        break;
+      }
       if (col->op != ExprOp::Column) return {};
       for (const auto& sp : b.sources) {
         if (sp.is_derived()) continue;
