@@ -87,6 +87,12 @@ void report_runtime(const std::string& origin, const g::Vm::RunResult& r) {
   for (size_t i = 0; i < r.trace.size(); ++i) std::cerr << (i == 0 ? "  in " : "  from ") << r.trace[i] << "\n";
 }
 
+// A VM's panes leave the registry with it: the registry outlives every VM.
+struct DropPanes {
+  g::Vm& vm;
+  ~DropPanes() { g::drop_panes(vm); }
+};
+
 // One VM set up the same way for a file, a one-liner and the REPL, so the three
 // cannot disagree about what the language has.
 void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& script_args) {
@@ -117,6 +123,7 @@ int run_file(const Options& opt, const std::string& path, const std::vector<std:
   auto compiled = g::compile_source(source, path);
   if (!compiled.ok()) { report_compile(path, compiled.errors); return kExitCompile; }
   g::Vm vm;
+  DropPanes drop{vm};
   prepare(vm, opt, script_args);
   auto r = vm.run(compiled.script);
   if (!r.ok) { report_runtime(path, r); return kExitRuntime; }
@@ -127,6 +134,7 @@ int eval_line(const Options& opt, const std::string& source) {
   auto compiled = g::compile_source(source, "<eval>", true);
   if (!compiled.ok()) { report_compile("<eval>", compiled.errors); return kExitCompile; }
   g::Vm vm;
+  DropPanes drop{vm};
   prepare(vm, opt, {});
   auto r = vm.run(compiled.script);
   if (!r.ok) { report_runtime("<eval>", r); return kExitRuntime; }
@@ -140,6 +148,7 @@ int repl(const Options& opt) {
   const bool tty = isatty(fileno(stdin)) != 0;
   if (tty) std::cout << "grain " GRAIN_VERSION " - .quit or EOF to leave\n";
   g::Vm vm;
+  DropPanes drop{vm};
   prepare(vm, opt, {});
   std::string line;
   int status = kExitOk;
@@ -165,6 +174,7 @@ int run_pack(const grain_cli::Pack& pack, const std::vector<std::string>& script
   auto compiled = g::compile_source(pack.files.at(name), name);
   if (!compiled.ok()) { report_compile(name, compiled.errors); return kExitCompile; }
   g::Vm vm;
+  DropPanes drop{vm};
   prepare(vm, Options{}, script_args);
   grain_cli::install_bundle_builtins(vm, pack);
   auto r = vm.run(compiled.script);

@@ -43,6 +43,23 @@ int main() {
   check("with its own callback", a.find_global("drawn") && a.find_global("drawn")->as_int() == 1);
   r = run(a, "unregister_pane(pa.id)");
   check("its own VM can close it", r.ok && g::pane_list(a).empty() && g::pane_list(b).size() == 1);
+  // A VM that ends with a pane registered: a later VM, even one at the same
+  // address, must not inherit it; drop_panes clears it.
+  uint64_t old_serial = 0;
+  {
+    g::Vm c;
+    g::install_core_builtins(c);
+    run(c, "create_pane({\"title\": \"C\"})");
+    old_serial = c.serial();
+  }
+  {
+    g::Vm d;
+    g::install_core_builtins(d);
+    check("a new VM does not inherit a dead VM's panes", g::pane_list(d).empty() && d.serial() != old_serial);
+    run(d, "create_pane({\"title\": \"D\"})");
+    g::drop_panes(d);
+    check("drop_panes clears a VM's panes", g::pane_list(d).empty());
+  }
   std::printf("%s\n", failures ? "pane isolation: FAILED" : "pane isolation: all agreed");
   return failures ? 1 : 0;
 }

@@ -116,6 +116,7 @@ int test_command(const std::vector<std::string>& args) {
     std::vector<Registered> tests;
     g_tests = &tests;
     g::Vm vm;
+    struct Drop { g::Vm& vm; ~Drop() { g::drop_panes(vm); } } drop{vm};   // the file's panes go with its VM
     prepare_vm(vm, {});
     vm.define_native("test", 2, 2, bi_test);
     vm.define_native("expect", 1, 2, bi_expect);

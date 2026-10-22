@@ -1,0 +1,12 @@
+# tools/grain-desktop: resized by dragging its corner, then closed by its close button.
+write_file("rc.log", "")
+fn log(line) { append_file("rc.log", line + "\n") }
+create_pane({
+  "title": "resize and close", "width": 200, "height": 120,
+  "on_draw": fn (cv) { canvas_clear(cv, "#204020") canvas_fill_rect(cv, canvas_width(cv) - 30, canvas_height(cv) - 30, 20, 20, "#ffff00") },
+  "on_event": fn (p, e) {
+    if e.type == "resize" { log("resize " + str(e.width) + "x" + str(e.height)) }
+    if e.type == "close" { log("close") }
+  }
+})
+run_panes()
