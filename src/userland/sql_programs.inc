@@ -1571,11 +1571,6 @@ static std::string program_create_shown(const SqlDatabase::StoredProgram& p) {
   }
   return t;
 }
-static std::string definer_shown(const std::string& d) {   // `root`@`localhost` as root@localhost
-  std::string out;
-  for (char ch : d) if (ch != '`') out += ch;
-  return out;
-}
 
 SqlQueryResult SqlDatabase::show_create_program(char kind, const std::string& name) {
   auto p = find_program(kind, name);

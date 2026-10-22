@@ -251,10 +251,10 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
       // Challenge/response on the cluster key so only fleet members attach.
       uint8_t nonce[16]; im->host->random(MutableByteSpan(nonce, 16));
       if (!wr(*member->c, member->send, Challenge, ByteSpan(nonce, 16))) continue;
-      uint8_t t; ByteBuffer p;
-      if (!rd(*member->c, t, p, 10000) || t != Attach) continue;
-      Reader r(p); ByteSpan proof = r.bytes(); Id128 id = r.id();
-      if (!r.ok()) continue;
+      uint8_t at; ByteBuffer ap;   // the Attach frame
+      if (!rd(*member->c, at, ap, 10000) || at != Attach) continue;
+      Reader ar(ap); ByteSpan proof = ar.bytes(); Id128 id = ar.id();
+      if (!ar.ok()) continue;
       auto refuse = [&](const std::string& why) { wr(*member->c, member->send, RErr, ByteSpan((const uint8_t*)why.data(), why.size())); };
       std::string admit_key = im->key;
       const MemberCred* cred = nullptr;
@@ -270,16 +270,16 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
       if (im->require_attest) {
         // The quote follows the id: attested, signature, signer, then the PCRs it covers.
         capability::TPMQuote q;
-        if (r.remaining() == 0) { refuse("this hub requires a TPM quote (join with attest=1)"); continue; }
-        ByteSpan att = r.bytes(), sig = r.bytes(), pub = r.bytes();
-        uint32_t npcr = r.u32();
+        if (ar.remaining() == 0) { refuse("this hub requires a TPM quote (join with attest=1)"); continue; }
+        ByteSpan att = ar.bytes(), sig = ar.bytes(), pub = ar.bytes();
+        uint32_t npcr = ar.u32();
         q.attested.assign(att.begin(), att.end()); q.signature.assign(sig.begin(), sig.end()); q.signer_public.assign(pub.begin(), pub.end());
-        for (uint32_t i = 0; i < npcr && r.ok() && i < 24; ++i) {
-          capability::PcrValue v; v.index = r.u32(); ByteSpan d = r.raw(32);
+        for (uint32_t i = 0; i < npcr && ar.ok() && i < 24; ++i) {
+          capability::PcrValue v; v.index = ar.u32(); ByteSpan d = ar.raw(32);
           if (d.size() == 32) std::memcpy(v.digest.data(), d.data(), 32);
           q.pcrs.push_back(v);
         }
-        if (!r.ok()) { refuse("the quote is malformed"); continue; }
+        if (!ar.ok()) { refuse("the quote is malformed"); continue; }
         if (!cred || cred->ak.size() != 65) { refuse("no attestation key is listed for this member"); continue; }
         if (q.signer_public != std::vector<uint8_t>(cred->ak.begin(), cred->ak.end())) { refuse("the quote is signed by a key not listed for this member"); continue; }
         auto v = capability::HardwareAttestor::verify_quote_standalone(q, std::vector<uint8_t>(nonce, nonce + 16));
@@ -690,13 +690,13 @@ Result<void> RelayClient::attach(const std::string& hub_host, uint16_t hub_port,
     uint64_t last_ping = now_ms();
     while (raw->running) {
       // --- read frames until the link drops ---
-      uint8_t t; ByteBuffer p; bool dropped = false;
+      uint8_t t; ByteBuffer p;
       while (raw->running) {
         // Heartbeat: prove we are alive so the hub does not reap us. Runs on
         // every idle poll too, so an otherwise-silent member still beats.
         uint64_t now = now_ms();
         if (now - last_ping >= HEARTBEAT_MS) { raw->send_frame(Ping, {}); last_ping = now; }
-        if (!rd(*raw->c, t, p, 250)) { if (raw->c->alive()) continue; dropped = true; break; }
+        if (!rd(*raw->c, t, p, 250)) { if (raw->c->alive()) continue; break; }
         raw->handle_frame(t, p);
       }
       if (!raw->running) break;

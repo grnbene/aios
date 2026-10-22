@@ -867,8 +867,8 @@ Result<void> CudaComputeBackend::execute(const Operation& op, MemoryFabric& fabr
   // current past the generation the write is about to bump.
   auto finish_to = [&](void* host, const MemoryID& id, uint64_t offset, CUdeviceptr src, size_t bytes) -> Result<void> {
     if (bytes) {
-      CUresult r = api.MemcpyDtoH(host, src, bytes);
-      if (r != CUDA_SUCCESS_) return Result<void>(Status::IoError, "cuMemcpyDtoH: " + api.error_text(r));
+      CUresult cr = api.MemcpyDtoH(host, src, bytes);
+      if (cr != CUDA_SUCCESS_) return Result<void>(Status::IoError, "cuMemcpyDtoH: " + api.error_text(cr));
     }
     if (auto* dm = card_copy(id); dm && src == dm->buf.ptr + offset) card_written.push_back(id);
     return Ok();

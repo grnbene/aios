@@ -123,6 +123,13 @@ struct BinlogColumnMeta {
   bool nullable = true;
   bool is_pk = false;
   std::vector<std::string> enum_values;
+  // A latin1 (cp1252) text column: the binlog carries its bytes as stored, and
+  // the store is UTF-8, so they are converted as MariaDB converts them for a
+  // utf8 client. The binlog itself does not say (binlog_row_metadata=NO_LOG).
+  bool latin1 = false;
+  // FLOAT(M,D) / DOUBLE(M,D): the D decimals MariaDB shows the value with;
+  // -1 for a plain FLOAT / DOUBLE.
+  int shown_decimals = -1;
 };
 
 // Schema and column structure recorded in TABLE_MAP_EVENT
@@ -309,6 +316,14 @@ class BinlogConsumer {
   Result<void> send_binlog_dump();
   Result<void> discover_master_pos(std::string* out_file = nullptr);
   Result<void> introspect_table_columns(BinlogTableMap& map);
+  // Each mirrored table's column charsets, read from the master's
+  // information_schema once per table ("db.table" -> latin1 by ordinal) and
+  // dropped when DDL arrives. Only successful reads are kept.
+  std::unordered_map<std::string, std::vector<bool>> latin1_columns_;
+  bool tz_checked_ = false;   // the master's and this host's zones were compared
+  bool master_tz_fixed_ = false;   // the master's @@time_zone is a fixed offset, not SYSTEM
+  int master_tz_offset_ = 0;       // that offset, seconds east of UTC
+  void check_master_time_zone();
 
   // Packet IO helpers
   Result<void> write_packet(const uint8_t* data, size_t n, uint8_t seq);

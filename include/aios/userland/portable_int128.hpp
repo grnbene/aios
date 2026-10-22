@@ -33,7 +33,8 @@ inline bool __builtin_mul_overflow(AIOS_INT128 a, AIOS_INT128 b, AIOS_INT128* ou
 // bit-exact (and, for MSVC's long double, which is just double, unnecessary) 128-bit float conversion.
 inline AIOS_INT128 aios_i128_from_ld(long double x) { return AIOS_INT128(static_cast<long long>(x)); }
 #else
-using AIOS_INT128 = __int128;
-using AIOS_UINT128 = unsigned __int128;
+// __extension__: GCC's -Wpedantic reports every __int128 otherwise.
+__extension__ typedef __int128 AIOS_INT128;
+__extension__ typedef unsigned __int128 AIOS_UINT128;
 inline AIOS_INT128 aios_i128_from_ld(long double x) { return (AIOS_INT128)x; }
 #endif

@@ -209,23 +209,45 @@ std::string decode_date(const uint8_t* p) {
   return format_date(year, month, day);
 }
 
-// TIMESTAMP2: 4 bytes big-endian unix epoch seconds (UTC) + fractional bytes.
-std::string decode_timestamp2(const uint8_t* p, uint8_t fsp = 0) {
-  uint32_t epoch = read_be32(p);
+// A TIMESTAMP is an instant (unix seconds); MariaDB shows it in the session's
+// zone, and the mirror's rows are what the master's default session reads -
+// seeded that way, and what every client of the master sees. That zone is the
+// master's @@time_zone: SYSTEM (its host's zone, which must be this host's -
+// check_master_time_zone says so at connect when it is not) or a fixed offset.
+// Seconds 0 is the zero value '0000-00-00 00:00:00', not 1970.
+std::string timestamp_text(uint32_t epoch, bool fixed_zone, int fixed_offset) {
+  if (epoch == 0) return "0000-00-00 00:00:00";
   time_t t = (time_t)epoch;
-  struct tm tmv;
-  gmtime_r(&t, &tmv);
-  return format_datetime(tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec) +
-         fraction_suffix(p + 4, fsp);
+  struct tm tmv {};
+  bool ok = false;
+  if (fixed_zone) {
+    t += fixed_offset;
+    ok = gmtime_r(&t, &tmv) != nullptr;
+  } else {
+    ok = localtime_r(&t, &tmv) != nullptr;
+  }
+  if (!ok) return std::string();
+  return format_datetime(tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+// TIMESTAMP2: 4 bytes big-endian unix epoch seconds + fractional bytes.
+std::string decode_timestamp2(const uint8_t* p, uint8_t fsp, bool fixed_zone, int fixed_offset) {
+  return timestamp_text(read_be32(p), fixed_zone, fixed_offset) + fraction_suffix(p + 4, fsp);
 }
 
 // Legacy TIMESTAMP: 4 bytes little-endian unix epoch seconds.
-std::string decode_timestamp_legacy(const uint8_t* p) {
-  uint32_t epoch = read_le32(p);
-  time_t t = (time_t)epoch;
-  struct tm tmv;
-  gmtime_r(&t, &tmv);
-  return format_datetime(tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+std::string decode_timestamp_legacy(const uint8_t* p, bool fixed_zone, int fixed_offset) {
+  return timestamp_text(read_le32(p), fixed_zone, fixed_offset);
+}
+
+// CHAR's table-map metadata packs the declared length in BYTES with the real
+// type: byte 0 is real_type XOR ((length & 0x300) >> 4), byte 1 is length's
+// low 8 bits (Field_string::save_field_metadata). A column longer than 255
+// bytes - CHAR(120) in utf8mb3 is 360 - has a 2-byte length on each value.
+size_t char_length_prefix(uint16_t meta) {
+  const uint8_t b0 = (uint8_t)(meta >> 8), b1 = (uint8_t)(meta & 0xff);
+  const size_t max_bytes = (b0 & 0x30) != 0x30 ? ((size_t)((b0 & 0x30) ^ 0x30) << 4) | b1 : b1;
+  return max_bytes > 255 ? 2 : 1;
 }
 
 // YEAR: 1 byte, stored as (year - 1900), 0 means the zero-year.
@@ -282,7 +304,7 @@ std::string decode_time2(const uint8_t* p, uint8_t fsp = 0) {
   int n = std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d", neg ? "-" : "", hour, minute, second);
   std::string out(buf, n > 0 ? (size_t)n : 0);
   if (fsp > 0) {
-    char fr[8];
+    char fr[16];
     std::snprintf(fr, sizeof(fr), "%06u", micros);
     out += "." + std::string(fr, fsp > 6 ? 6 : fsp);
   }
@@ -316,6 +338,14 @@ size_t new_decimal_byte_length(uint16_t meta) {
 // 3.14159265 arrived as 3.141593, 1e-7 as 0.000000, 1e20 with 21 digits.
 std::string shortest_float_text(float f) { return sql_format_double((double)f, 6); }
 std::string shortest_double_text(double d) { return sql_format_double(d, 0); }
+// FLOAT(M,D) / DOUBLE(M,D) as MariaDB shows them: the value to D places.
+// FLOAT(10,6) 42.607594 is the float 42.60759353...; six significant digits
+// made it 42.6076, shown as 42.607600.
+std::string fixed_decimals_text(double d, int decimals) {
+  char buf[512];
+  std::snprintf(buf, sizeof(buf), "%.*f", decimals, d);
+  return buf;
+}
 
 // Parse ENUM or SET member values from column type definition like "enum('ftp','api')"
 std::vector<std::string> parse_mysql_enum_values(const std::string& type_str) {
@@ -468,12 +498,6 @@ void write_le32(std::vector<uint8_t>* v, uint32_t x) {
   v->push_back((uint8_t)((x >> 8) & 0xff));
   v->push_back((uint8_t)((x >> 16) & 0xff));
   v->push_back((uint8_t)((x >> 24) & 0xff));
-}
-
-void write_le64(std::vector<uint8_t>* v, uint64_t x) {
-  for (int i = 0; i < 8; ++i) {
-    v->push_back((uint8_t)((x >> (8 * i)) & 0xff));
-  }
 }
 
 void write_bytes(std::vector<uint8_t>* v, const std::string& s) {
@@ -1090,10 +1114,43 @@ Result<void> BinlogConsumer::send_checksum_config() {
   return Ok();
 }
 
+// The zone TIMESTAMP values are shown in (see timestamp_text): the master's
+// @@time_zone. A fixed offset is used as it is; SYSTEM is the master host's
+// zone, which this host must share - compared here by the offset each side
+// has now, and said loudly when they differ (run ASQL with TZ set to the
+// master's zone), since every TIMESTAMP mirrored would be off by the gap.
+void BinlogConsumer::check_master_time_zone() {
+  if (tz_checked_) return;
+  MariaWireSession sess(config_.host, config_.port);
+  auto cr = sess.connect(config_.user, config_.password, config_.database);
+  if (!cr.ok()) return;   // asked again at the next connect
+  auto qr = sess.query("SELECT @@time_zone, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())");
+  if (!qr.ok() || !qr->ok || qr->rows.empty() || qr->rows[0].size() < 2) return;
+  tz_checked_ = true;
+  const std::string zone = qr->rows[0][0].bytes;
+  const long master_off = std::strtol(qr->rows[0][1].bytes.c_str(), nullptr, 10);
+  if (to_upper_str(zone) != "SYSTEM") {
+    master_tz_fixed_ = true;
+    master_tz_offset_ = (int)master_off;
+    fprintf(stderr, "[cdc] master time_zone %s: TIMESTAMP values shown at %+ld s\n", zone.c_str(), master_off);
+    return;
+  }
+  master_tz_fixed_ = false;
+  time_t now = time(nullptr);
+  struct tm lt {};
+  long local_off = 0;
+  if (localtime_r(&now, &lt)) local_off = lt.tm_gmtoff;
+  if (local_off != master_off)
+    fprintf(stderr, "[cdc] WARNING: the master's zone is %+ld s from UTC and this host's is %+ld s: every mirrored "
+                    "TIMESTAMP is shown in this host's zone - run ASQL with TZ set to the master's zone\n",
+            master_off, local_off);
+}
+
 Result<void> BinlogConsumer::connect_and_dump() {
   if (config_.auto_discover_position && active_binlog_file_.empty()) {
     discover_master_pos();
   }
+  check_master_time_zone();
 
   auto cr = connect_and_authenticate();
   if (!cr.ok()) return cr;
@@ -1364,8 +1421,56 @@ Result<void> BinlogConsumer::introspect_table_columns(BinlogTableMap& map) {
   const SqlTable* local_tbl = db_.find_table(map.table_name, db_name);
   if (local_tbl && !local_tbl->columns.empty()) {
     for (size_t i = 0; i < local_tbl->columns.size() && i < map.columns.size(); ++i) {
-      map.columns[i].name = local_tbl->columns[i].name;
-      map.columns[i].is_pk = local_tbl->columns[i].is_primary_key;
+      const SqlColumn& lc = local_tbl->columns[i];
+      map.columns[i].name = lc.name;
+      map.columns[i].is_pk = lc.is_primary_key;
+      // "float(10,6)" / "double(12,4)": shown to D places.
+      const std::string decl = to_lower_str(lc.declared);
+      if ((decl.rfind("float(", 0) == 0 || decl.rfind("double(", 0) == 0) && decl.find(',') != std::string::npos)
+        map.columns[i].shown_decimals = lc.scale;
+    }
+  }
+
+  // Which columns are latin1: the binlog carries their cp1252 bytes as stored.
+  // Asked of the master once per table; a read that fails is not kept, so the
+  // next map of the table asks again rather than mirroring raw bytes for good.
+  {
+    const std::string key = to_lower_str(db_name + "." + map.table_name);
+    auto it = latin1_columns_.find(key);
+    if (it == latin1_columns_.end() && !config_.host.empty()) {
+      MariaWireSession sess(config_.host, config_.port);
+      auto cr = sess.connect(config_.user, config_.password, db_name);
+      std::string why;
+      if (cr.ok()) {
+        auto lit = [](const std::string& v) {
+          std::string o = "'";
+          for (char ch : v) { if (ch == '\'' || ch == '\\') o += '\\'; o += ch; }
+          return o + "'";
+        };
+        auto qr = sess.query("SELECT CHARACTER_SET_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " +
+                             lit(db_name) + " AND TABLE_NAME = " + lit(map.table_name) + " ORDER BY ORDINAL_POSITION");
+        if (qr.ok() && qr->ok && !qr->rows.empty()) {
+          std::vector<bool> flags;
+          for (const auto& row : qr->rows) flags.push_back(!row.empty() && to_lower_str(row[0].bytes) == "latin1");
+          it = latin1_columns_.emplace(key, std::move(flags)).first;
+        } else {
+          why = qr.ok() ? (qr->ok ? "no columns listed" : qr->error_message) : qr.error().message;
+        }
+      } else {
+        why = cr.error().message;
+      }
+      if (it == latin1_columns_.end())
+        fprintf(stderr, "[cdc] %s: cannot read column charsets from the master (%s); its latin1 text is not converted until it can\n",
+                key.c_str(), why.c_str());
+    }
+    if (it != latin1_columns_.end()) {
+      if (it->second.size() == map.columns.size()) {
+        for (size_t i = 0; i < map.columns.size(); ++i) map.columns[i].latin1 = it->second[i];
+      } else {
+        fprintf(stderr, "[cdc] %s: the binlog maps %zu columns, the master lists %zu; charsets re-read\n",
+                key.c_str(), map.columns.size(), it->second.size());
+        latin1_columns_.erase(it);
+      }
     }
   }
 
@@ -1562,6 +1667,11 @@ Result<void> BinlogConsumer::handle_query_event(const uint8_t* p, size_t len, ui
       total_events_applied_++;
       return Ok();
     }
+    // A column added, dropped, retyped or a table renamed: its charsets are
+    // read again at its next table map.
+    if (qupper.rfind("ALTER", 0) == 0 || qupper.rfind("CREATE", 0) == 0 || qupper.rfind("DROP", 0) == 0 ||
+        qupper.rfind("RENAME", 0) == 0)
+      latin1_columns_.clear();
 
     if (config_.replicate_ddl) {
       // Only table DDL, only for a mirrored table of the source database,
@@ -1774,9 +1884,10 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
             }
             case binlog_type::VAR_STRING:
             case binlog_type::STRING: {
-              if (idx < len) {
-                uint8_t slen = p[idx++];
-                idx += slen;
+              const size_t lp = char_length_prefix(map.columns[c].meta);
+              if (idx + lp <= len) {
+                uint32_t slen = lp == 2 ? read_le16(p + idx) : p[idx];
+                idx += lp + slen;
               }
               break;
             }
@@ -1876,7 +1987,8 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
           if (idx + 4 <= len) {
             float f;
             std::memcpy(&f, p + idx, 4);
-            val_str = shortest_float_text(f);
+            val_str = map.columns[c].shown_decimals >= 0 ? fixed_decimals_text((double)f, map.columns[c].shown_decimals)
+                                                         : shortest_float_text(f);
             idx += 4;
           }
           break;
@@ -1884,7 +1996,8 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
           if (idx + 8 <= len) {
             double d;
             std::memcpy(&d, p + idx, 8);
-            val_str = shortest_double_text(d);
+            val_str = map.columns[c].shown_decimals >= 0 ? fixed_decimals_text(d, map.columns[c].shown_decimals)
+                                                         : shortest_double_text(d);
             idx += 8;
           }
           break;
@@ -1905,11 +2018,10 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
         }
         case binlog_type::VAR_STRING:
         case binlog_type::STRING: {
-          if (idx < len) {
-            uint16_t str_len = p[idx++];
-            if (str_len > 128 && idx < len) {
-              str_len = (str_len & 0x7f) | ((uint16_t)p[idx++] << 7);
-            }
+          const size_t lp = char_length_prefix(map.columns[c].meta);
+          if (idx + lp <= len) {
+            uint32_t str_len = lp == 2 ? read_le16(p + idx) : p[idx];
+            idx += lp;
             if (idx + str_len <= len) {
               val_str = std::string((const char*)p + idx, str_len);
               idx += str_len;
@@ -1957,12 +2069,12 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
           break;
         }
         case binlog_type::TIMESTAMP:
-          if (idx + 4 <= len) { val_str = decode_timestamp_legacy(p + idx); idx += 4; }
+          if (idx + 4 <= len) { val_str = decode_timestamp_legacy(p + idx, master_tz_fixed_, master_tz_offset_); idx += 4; }
           break;
         case binlog_type::TIMESTAMP2: {
           uint8_t fsp = (uint8_t)map.columns[c].meta;
           size_t fb = frac_bytes_for_fsp(fsp);
-          if (idx + 4 + fb <= len) { val_str = decode_timestamp2(p + idx, fsp); idx += 4 + fb; }
+          if (idx + 4 + fb <= len) { val_str = decode_timestamp2(p + idx, fsp, master_tz_fixed_, master_tz_offset_); idx += 4 + fb; }
           break;
         }
         case binlog_type::YEAR:
@@ -2037,6 +2149,19 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
         }
       }
 
+      if (map.columns[c].latin1 && !val_str.empty()) {
+        switch (ctype) {
+          case binlog_type::VARCHAR: case binlog_type::VAR_STRING: case binlog_type::STRING:
+          case binlog_type::BLOB: case binlog_type::TINY_BLOB: case binlog_type::MEDIUM_BLOB:
+          case binlog_type::LONG_BLOB: {
+            bool high = false;
+            for (unsigned char ch : val_str) if (ch >= 0x80) { high = true; break; }
+            if (high) val_str = cp1252_bytes_to_utf8(val_str);
+            break;
+          }
+          default: break;
+        }
+      }
       out_row->push_back({col_name, val_str});
     }
 

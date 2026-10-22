@@ -53,7 +53,7 @@ struct Tcb {
 }  // namespace
 
 std::string Ipv4::str() const {
-  auto d = [](uint8_t v) { char b[4]; int n = 0; if (v >= 100) b[n++] = '0' + v / 100; if (v >= 10) b[n++] = '0' + (v / 10) % 10; b[n++] = '0' + v % 10; return std::string(b, n); };
+  auto d = [](uint8_t v) { char t[4]; int n = 0; if (v >= 100) t[n++] = '0' + v / 100; if (v >= 10) t[n++] = '0' + (v / 10) % 10; t[n++] = '0' + v % 10; return std::string(t, n); };
   return d(b[0]) + "." + d(b[1]) + "." + d(b[2]) + "." + d(b[3]);
 }
 bool parse_ipv4(const std::string& s, Ipv4& out) {
@@ -166,7 +166,8 @@ struct NetStack::Impl {
 
   // ---- ICMP ----
   void icmp_input(const Ipv4& src, const uint8_t* p, size_t len) {
-    if (len < 8) return; owner.stats_.icmp_rx++;
+    if (len < 8) return;
+    owner.stats_.icmp_rx++;
     if (p[0] == 0) { icmp_reply = true; icmp_id = r16(p + 4); icmp_seq = r16(p + 6); }     // echo reply
     else if (p[0] == 8) {                                                                  // echo request → reply
       std::vector<uint8_t> r(p, p + len); r[0] = 0; w16(&r[2], 0); w16(&r[2], ip_checksum(r.data(), r.size()));
@@ -184,7 +185,8 @@ struct NetStack::Impl {
     ip_send(dst, IPPROTO_UDP, seg.data(), seg.size());
   }
   void udp_input(const Ipv4& src, const uint8_t* p, size_t len) {
-    if (len < 8) return; owner.stats_.udp_rx++;
+    if (len < 8) return;
+    owner.stats_.udp_rx++;
     uint16_t dport = r16(p + 2); size_t dlen = r16(p + 4); if (dlen < 8 || dlen > len) dlen = len;
     udp_in.push_back({dport, src, std::vector<uint8_t>(p + 8, p + dlen)});
     if (udp_in.size() > 16) udp_in.pop_front();
@@ -300,7 +302,8 @@ struct NetStack::Impl {
     t.last_tx_ns = now_ns();
   }
   void tcp_input(const Ipv4& src, const uint8_t* p, size_t len) {
-    if (len < 20) return; owner.stats_.tcp_rx++;
+    if (len < 20) return;
+    owner.stats_.tcp_rx++;
     uint16_t sport = r16(p), dport = r16(p + 2);
     uint32_t seq = r32(p + 4), ack = r32(p + 8);
     size_t hl = (p[12] >> 4) * 4; if (hl < 20 || hl > len) return;

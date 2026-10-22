@@ -109,6 +109,45 @@ static std::vector<uint8_t> make_write_rows_event_v1(uint64_t table_id, size_t c
   return header;
 }
 
+// TABLE_MAP_EVENT with per-column metadata bytes, as MariaDB writes it.
+static std::vector<uint8_t> make_table_map_event_meta(uint64_t table_id, const std::string& schema, const std::string& table,
+                                                      const std::vector<uint8_t>& types, const std::vector<uint8_t>& meta,
+                                                      uint32_t next_pos) {
+  std::vector<uint8_t> body;
+  for (int i = 0; i < 6; ++i) body.push_back((uint8_t)((table_id >> (8 * i)) & 0xff));
+  body.push_back(0); body.push_back(0);
+  body.push_back((uint8_t)schema.size());
+  body.insert(body.end(), schema.begin(), schema.end());
+  body.push_back(0);
+  body.push_back((uint8_t)table.size());
+  body.insert(body.end(), table.begin(), table.end());
+  body.push_back(0);
+  body.push_back((uint8_t)types.size());
+  body.insert(body.end(), types.begin(), types.end());
+  body.push_back((uint8_t)meta.size());
+  body.insert(body.end(), meta.begin(), meta.end());
+  body.insert(body.end(), (types.size() + 7) / 8, 0xff);   // all nullable
+  auto header = make_event_header(binlog_event::TABLE_MAP_EVENT, (uint32_t)body.size(), next_pos);
+  header.insert(header.end(), body.begin(), body.end());
+  return header;
+}
+
+// WRITE_ROWS_EVENT_V1 whose row image is given as its raw bytes.
+static std::vector<uint8_t> make_write_rows_raw(uint64_t table_id, size_t col_count, const std::vector<uint8_t>& image,
+                                                uint32_t next_pos) {
+  std::vector<uint8_t> body;
+  for (int i = 0; i < 6; ++i) body.push_back((uint8_t)((table_id >> (8 * i)) & 0xff));
+  body.push_back(0); body.push_back(0);
+  body.push_back((uint8_t)col_count);
+  const size_t bmp = (col_count + 7) / 8;
+  body.insert(body.end(), bmp, 0xff);
+  body.insert(body.end(), bmp, 0x00);
+  body.insert(body.end(), image.begin(), image.end());
+  auto header = make_event_header(binlog_event::WRITE_ROWS_EVENT_V1, (uint32_t)body.size(), next_pos);
+  header.insert(header.end(), body.begin(), body.end());
+  return header;
+}
+
 int main() {
   std::cout << "========================================================================\n";
   std::cout << "  AIOS ASQL: Native MySQL Binlog CDC Streaming & Sync Verification Suite\n";
@@ -291,6 +330,60 @@ int main() {
   // Test Whitelist SQL config
   auto set_wl = db.execute_local_query("SET REPLICATION WHITELIST = orders, users, products, telemetry;");
   assert(set_wl.success);
+
+  // 8. Row images MariaDB writes for chartmaster-shaped tables. CHAR(120) in
+  // utf8mb3 is 360 bytes, so each value has a 2-byte length (the 1-byte read
+  // took the high length byte as text and every later column slid);
+  // FLOAT(10,6) is shown to 6 places; TIMESTAMP is an instant shown in the
+  // master's zone (SYSTEM: this host's), and its zero is 0000-00-00.
+  std::cout << "[Step 8] Testing CHAR > 255 bytes, FLOAT(M,D) and TIMESTAMP decoding...\n";
+  setenv("TZ", "America/New_York", 1);
+  tzset();
+  db.execute_local_query("CREATE TABLE cm (accountcode VARCHAR(20) PRIMARY KEY, accountname CHAR(120), grp CHAR(30), "
+                         "lat FLOAT(10,6), ts TIMESTAMP NULL);");
+  consumer.set_table_whitelist({"orders", "users", "products", "cm"});
+  {
+    const std::vector<uint8_t> types = {binlog_type::VARCHAR, binlog_type::STRING, binlog_type::STRING,
+                                        binlog_type::FLOAT, binlog_type::TIMESTAMP2};
+    // VARCHAR(20) utf8mb3: 60 (LE16). CHAR(120) utf8mb3 = 360 = 0x168: 0xfe ^ 0x10, 0x68.
+    // CHAR(30) utf8mb3 = 90: 0xfe, 90. FLOAT: 4. TIMESTAMP2: fsp 0.
+    const std::vector<uint8_t> meta = {60, 0, 0xee, 0x68, 0xfe, 90, 4, 0};
+    auto map_cm = make_table_map_event_meta(103, "aios_db", "cm", types, meta, 2000);
+    assert(consumer.ingest_raw_event(map_cm.data(), map_cm.size()).ok());
+    auto image = [](const std::string& code, const std::string& name, const std::string& grp, float lat, uint32_t ts) {
+      std::vector<uint8_t> b;
+      b.push_back((uint8_t)code.size()); b.insert(b.end(), code.begin(), code.end());
+      b.push_back((uint8_t)(name.size() & 0xff)); b.push_back((uint8_t)(name.size() >> 8));
+      b.insert(b.end(), name.begin(), name.end());
+      b.push_back((uint8_t)grp.size()); b.insert(b.end(), grp.begin(), grp.end());
+      uint8_t fb[4]; std::memcpy(fb, &lat, 4); b.insert(b.end(), fb, fb + 4);
+      b.push_back((uint8_t)(ts >> 24)); b.push_back((uint8_t)(ts >> 16)); b.push_back((uint8_t)(ts >> 8)); b.push_back((uint8_t)ts);
+      return b;
+    };
+    auto r1 = make_write_rows_raw(103, 5, image("4517-0", "Sales - Parts - Tire Service", "Sales", 42.607594f, 1721411561u), 2100);
+    assert(consumer.ingest_raw_event(r1.data(), r1.size()).ok());
+    auto r2 = make_write_rows_raw(103, 5, image("1179-1", "Copmuters & Hardware - Accum Depreciation",
+                                                 "Property, Plant and Equipment", -79.017822f, 0u), 2200);
+    assert(consumer.ingest_raw_event(r2.data(), r2.size()).ok());
+  }
+  auto sel_cm = db.execute_local_query("SELECT accountcode, accountname, grp, lat, ts FROM cm ORDER BY accountcode;");
+  assert(sel_cm.success && sel_cm.rows.size() == 2);
+  for (const auto& r : sel_cm.rows) {
+    for (const auto& v : r.values) std::cout << "  | " << v;
+    std::cout << "\n";
+  }
+  assert(sel_cm.rows[0].values[0] == "1179-1");
+  assert(sel_cm.rows[0].values[1] == "Copmuters & Hardware - Accum Depreciation");
+  assert(sel_cm.rows[0].values[2] == "Property, Plant and Equipment");
+  assert(sel_cm.rows[0].values[3] == "-79.017822");
+  assert(sel_cm.rows[0].values[4] == "0000-00-00 00:00:00");
+  assert(sel_cm.rows[1].values[0] == "4517-0");
+  assert(sel_cm.rows[1].values[1] == "Sales - Parts - Tire Service");
+  assert(sel_cm.rows[1].values[2] == "Sales");
+  assert(sel_cm.rows[1].values[3] == "42.607594");
+  assert(sel_cm.rows[1].values[4] == "2024-07-19 13:52:41");
+  std::cout << "  [PASS] CHAR(120) utf8mb3 read with its 2-byte length; FLOAT(10,6) to 6 places; TIMESTAMP in the "
+               "zone, zero kept.\n\n";
 
   std::cout << "========================================================================\n";
   std::cout << "  ALL NATIVE MYSQL BINLOG CDC SYNC CHECKS PASSED (100% SUCCESS)         \n";

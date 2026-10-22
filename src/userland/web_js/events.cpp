@@ -182,11 +182,6 @@ void remove_listener_id(Page& P, int id) {
     if (P.listeners[i].id == id) { P.listeners.erase(P.listeners.begin() + static_cast<long>(i)); return; }
 }
 
-bool listener_callable(const Value& fn) {
-  if (fn.is_callable()) return true;
-  return false;
-}
-
 Value add_event_listener(Page& P, CallArgs& a) {
   const void* key = key_of(a.this_value);
   if (!key) {

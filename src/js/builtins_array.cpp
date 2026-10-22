@@ -43,19 +43,6 @@ bool this_array_like(Context& ctx, const Value& v, Object** o, uint64_t* len) {
   return ctx.length_of(*o, len);
 }
 
-bool append_value(Context& ctx, Object* o, const Value& v) {
-  if (o->cls == Class::Array && is_dense_array(o) && o->extensible && static_cast<ArrayObject*>(o)->length_writable && !ctx.intr.array_proto->has_index_props) {
-    ArrayObject* a = static_cast<ArrayObject*>(o);
-    a->elems.push_back(v);
-    ++a->length_;
-    return true;
-  }
-  uint64_t len;
-  if (!ctx.length_of(o, &len)) return false;
-  if (!set_idx(ctx, o, len, v)) return false;
-  return set_length(ctx, o, len + 1);
-}
-
 // ---- constructor and statics ----
 
 Value array_ctor(Context& ctx, CallArgs& a) {

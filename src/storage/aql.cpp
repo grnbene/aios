@@ -518,7 +518,6 @@ AqlQueryResult execute_aql(const ObjectStore& store, const AqlQuery& query, hal:
   if (groups.empty()) groups.push_back(query.predicates);
 
   const bool as_of_none = !query.has_as_of;
-  bool seeded_by_range = false;
   // When the answer is going to come from walking an ordering, enumerating
   // every id first is pure waste: store.list() reads every sealed block to
   // produce a list the ordered walk does not need.
@@ -589,7 +588,6 @@ AqlQueryResult execute_aql(const ObjectStore& store, const AqlQuery& query, hal:
         }
         candidates = std::move(intersected);
       }
-      seeded_by_range = true;
 
       if (query.count_only && groups[0].size() == index_sets.size() && as_of_none && !query.has_near &&
           !query.has_related && !query.has_history) {

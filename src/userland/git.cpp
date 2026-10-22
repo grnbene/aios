@@ -40,7 +40,7 @@ std::string git_local_tz(uint64_t when) {
   // The offset is local minus UTC, read off the broken-down times (no timegm needed).
   long days = local.tm_year == utc.tm_year ? local.tm_yday - utc.tm_yday : (local.tm_year > utc.tm_year ? 1 : -1);
   long mins = days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
-  char buf[8];
+  char buf[24];
   long a = mins < 0 ? -mins : mins;
   std::snprintf(buf, sizeof buf, "%c%02ld%02ld", mins < 0 ? '-' : '+', a / 60, a % 60);
   return buf;
@@ -802,12 +802,12 @@ Result<void> Git::load_index() {
         q = nl + 1;
         const size_t sp = counts.find(' ');
         if (sp == std::string::npos) return false;
-        const long count = std::strtol(counts.c_str(), nullptr, 10);
+        const long entries = std::strtol(counts.c_str(), nullptr, 10);
         const long subs = std::strtol(counts.c_str() + sp + 1, nullptr, 10);
         const std::string path = parent.empty() ? name : parent + "/" + name;
-        if (count >= 0) {
+        if (entries >= 0) {
           if (qe - q < 20) return false;
-          cache_tree_[path] = {count, raw_to_hex(q)};
+          cache_tree_[path] = {entries, raw_to_hex(q)};
           q += 20;
         }
         for (long i = 0; i < subs; ++i) if (!node(path)) return false;

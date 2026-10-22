@@ -99,7 +99,7 @@ class FabricListener final : public Listener {
   Fabric& f_; uint16_t port_;
 };
 
-Fabric::Fabric(FrameDevice& dev, uint64_t (*now_ns)()) : dev_(dev), now_(now_ns) {}
+Fabric::Fabric(FrameDevice& dev, uint64_t (*clock_ns)()) : dev_(dev), now_(clock_ns) {}
 
 bool Fabric::send_frame(const Mac& dst, uint8_t flags, uint32_t session, uint16_t port, uint32_t seq, uint32_t ack, const uint8_t* payload, size_t len) {
   uint8_t frame[HDR + MAX_PAYLOAD];

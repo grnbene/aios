@@ -10,6 +10,7 @@
 // truncated IDAT, an IHDR claiming 40000x40000, a palette index past the end
 // of the palette. Each of those comes back as an error, and the page draws the
 // image's alt text instead.
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -798,9 +799,9 @@ Result<Bitmap> decode_jpeg(ByteSpan bytes) {
           g = (int)(Y - 0.344136f * Cb - 0.714136f * Cr + 0.5f);
           b = (int)(Y + 1.772f * Cb + 0.5f);
         }
-        if (r < 0) r = 0; if (r > 255) r = 255;
-        if (g < 0) g = 0; if (g > 255) g = 255;
-        if (b < 0) b = 0; if (b > 255) b = 255;
+        r = std::clamp(r, 0, 255);
+        g = std::clamp(g, 0, 255);
+        b = std::clamp(b, 0, 255);
         out.pixels[(size_t)y * width + x] = argb(255, (uint8_t)r, (uint8_t)g, (uint8_t)b);
       }
     }

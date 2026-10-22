@@ -17418,12 +17418,17 @@ void ColumnStore::dict_to_scaled(int dec_scale) {
   scale_factor = (double)sf;
   inv_scale_factor = (dec_scale > 0 ? -1.0 : 1.0) / (double)sf;   // negative: decimal_fixed()
   bit_width_ = bits;
-  packed_data.assign(((row_count_ * bit_width_ + 7) >> 3) + 8, 0);
+  // A 32-bit code lives in data32, so the dictionary's codes go before the
+  // scaled ones are written, not after: clearing data32 afterwards read every
+  // value of a full-width column back as `lo` (DECIMAL(15,8) 30.00000000 is
+  // 3e9 scaled, and a table of weights came back all 0.00000000).
+  data32.clear(); data32.shrink_to_fit();
+  if (bit_width_ == 32) { packed_data.clear(); data32.assign(row_count_, 0); }
+  else packed_data.assign(((row_count_ * bit_width_ + 7) >> 3) + 8, 0);
   for (size_t r = 0; r < row_count_; ++r) {
     if (is_null(r) || codes[r] >= scaled.size()) continue;
     write_code(r, (uint32_t)(scaled[codes[r]] - lo));
   }
-  data32.clear(); data32.shrink_to_fit();
   dict.clear(); dict.shrink_to_fit();
   id_index.clear();
     id_tag.clear();

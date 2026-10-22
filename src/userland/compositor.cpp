@@ -139,7 +139,6 @@ constexpr uint32_t err     = 0xFFFF6B6B;  // --err
 
 #if defined(AIOS_METAL)
 extern "C" uint64_t metal_monotonic_ms();
-extern "C" uint64_t metal_wall_seconds();
 #endif
 
 // Milliseconds since the machine started: for anything that blinks or ticks.
@@ -149,27 +148,6 @@ uint64_t steady_ms() {
 #else
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
-#endif
-}
-
-// What the machine can honestly put in the corner of the taskbar. A hosted
-// kernel has the host's clock; a bare-metal one has no RTC driver yet, so all
-// it truly knows is how long it has been up — and it says so rather than
-// showing a plausible-looking time it made up.
-std::string clock_text() {
-#if defined(AIOS_METAL)
-  uint64_t sod = metal_wall_seconds() % 86400;
-  char b[9];
-  b[0] = static_cast<char>('0' + sod / 36000); b[1] = static_cast<char>('0' + (sod / 3600) % 10); b[2] = ':';
-  b[3] = static_cast<char>('0' + (sod % 3600) / 600); b[4] = static_cast<char>('0' + (sod % 600) / 60); b[5] = ':';
-  b[6] = static_cast<char>('0' + (sod % 60) / 10); b[7] = static_cast<char>('0' + sod % 10); b[8] = 0;
-  return "UP " + std::string(b, 8);
-#else
-  auto t = std::time(nullptr);
-  auto tm = *std::localtime(&t);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%a %b %d  %H:%M:%S", &tm);
-  return buf;
 #endif
 }
 
@@ -222,7 +200,6 @@ constexpr int TAB_X0_MARGIN = 14;  // clearance between the Launch chip and the 
 // Proportional type has no cell width: "Shell" and "Machine" are not 5 and 7
 // times anything. Every width here is measured with the face that draws it, and
 // the hit test calls the same function, so a click still lands on the word.
-int top_app_pad() { return 38; }
 
 // The power control and what it opens. Three options, each one wired to a real
 // path: Restart and Power off go down to the machine's own reset and ACPI S5
@@ -6252,14 +6229,14 @@ void HardwareCompositor::render_database_window(WindowSurface& win, Kernel& k) {
       tab_x += tw + 6;
     }
 
-    int body_y = tab_y + 34;
-    int body_h = my + mh - 52 - body_y;
-    draw_rect_to(win.buffer, w, h, mx + 12, body_y, mw - 24, body_h, 0xFF0D1117);
-    draw_rect_outline_to(win.buffer, w, h, mx + 12, body_y, mw - 24, body_h, tok::line_up);
+    int dlg_body_y = tab_y + 34;
+    int dlg_body_h = my + mh - 52 - dlg_body_y;
+    draw_rect_to(win.buffer, w, h, mx + 12, dlg_body_y, mw - 24, dlg_body_h, 0xFF0D1117);
+    draw_rect_outline_to(win.buffer, w, h, mx + 12, dlg_body_y, mw - 24, dlg_body_h, tok::line_up);
 
     if (win.db_designer_tab == 0) {
       const DesignerColGeom g = designer_col_geom(*this, mx, mw);
-      int hy = body_y + 6;
+      int hy = dlg_body_y + 6;
       draw_label_to(win.buffer, w, h, g.name_x, hy, "NAME", tok::faint);
       draw_label_to(win.buffer, w, h, g.type_x, hy, "TYPE", tok::faint);
       draw_label_to(win.buffer, w, h, g.null_x, hy, "NULL", tok::faint);
@@ -6272,7 +6249,7 @@ void HardwareCompositor::render_database_window(WindowSurface& win, Kernel& k) {
       // focused): a table with more columns than the sheet holds used to have
       // its tail simply not drawn, and so not editable at all.
       const int total = static_cast<int>(win.db_designer_edits.size());
-      const int fit = designer_rows_fit(ry, body_y, body_h);
+      const int fit = designer_rows_fit(ry, dlg_body_y, dlg_body_h);
       int max_scroll = total > fit ? total - fit : 0;
       if (win.db_designer_scroll > max_scroll) win.db_designer_scroll = max_scroll;
       if (win.db_designer_scroll < 0) win.db_designer_scroll = 0;
@@ -6315,10 +6292,10 @@ void HardwareCompositor::render_database_window(WindowSurface& win, Kernel& k) {
     } else if (win.db_designer_tab == 1) {
       SqlDatabase* sql_mgr = sql_engine(k);
       SqlTable* t = sql_mgr ? sql_mgr->resolve_table(win.db_designer_table) : nullptr;
-      int ry = body_y + 10;
+      int ry = dlg_body_y + 10;
       if (t) {
         for (const auto& ix : t->indices) {
-          if (ry + 22 > body_y + body_h - 60) break;
+          if (ry + 22 > dlg_body_y + dlg_body_h - 60) break;
           std::string cols;
           for (size_t ci = 0; ci < ix.columns.size(); ++ci) { if (ci) cols += ", "; cols += ix.columns[ci]; }
           std::string line = (ix.is_unique ? "[unique] " : "[index]  ") + ix.name + "  (" + cols + ")";
@@ -6328,7 +6305,7 @@ void HardwareCompositor::render_database_window(WindowSurface& win, Kernel& k) {
         }
       }
       // New index form, pinned to the bottom of the tab body.
-      int form_y = body_y + body_h - 46;
+      int form_y = dlg_body_y + dlg_body_h - 46;
       draw_rect_outline_to(win.buffer, w, h, mx + 12, form_y - 6, mw - 24, 1, tok::line_up);
       bool name_f = win.db_designer_index_field_focus == 0;
       bool cols_f = win.db_designer_index_field_focus == 1;
@@ -6347,17 +6324,17 @@ void HardwareCompositor::render_database_window(WindowSurface& win, Kernel& k) {
     } else {
       SqlDatabase* sql_mgr = sql_engine(k);
       SqlTable* t = sql_mgr ? sql_mgr->resolve_table(win.db_designer_table) : nullptr;
-      int ry = body_y + 10;
+      int ry = dlg_body_y + 10;
       if (t) {
         for (const auto& fk : t->foreign_keys) {
-          if (ry + 22 > body_y + body_h - 70) break;
+          if (ry + 22 > dlg_body_y + dlg_body_h - 70) break;
           std::string line = fk.constraint_name + ": " + fk.column + " -> " + fk.ref_table + "(" + fk.ref_column + ") ON DELETE " + fk.on_delete;
           draw_text_to(win.buffer, w, h, mx + 20, ry, fit_text(*this, line, mw - 24 - 60, Face::Mono), tok::text, Face::Mono);
           draw_text_to(win.buffer, w, h, mx + mw - 40, ry, "drop", tok::err, Face::UiBold);
           ry += 24;
         }
       }
-      int form_y = body_y + body_h - 56;
+      int form_y = dlg_body_y + dlg_body_h - 56;
       draw_rect_outline_to(win.buffer, w, h, mx + 12, form_y - 6, mw - 24, 1, tok::line_up);
       static const char* const kFkFields[4] = {"NAME", "COLUMN", "REF TABLE", "REF COL"};
       const std::string* kFkVals[4] = {&win.db_designer_new_fk_name, &win.db_designer_new_fk_col,
@@ -8516,24 +8493,24 @@ void HardwareCompositor::render_mail_window(WindowSurface& win, Kernel& k) {
     draw_text_to(win.buffer, w, h, mx + 28, diag_y + 5, fit_text(*this, diag, mw - 56, Face::UiSmall), diag_col, Face::UiSmall);
 
     // Action buttons footer
-    int btn_y = my + mh - 36;
+    int dlg_btn_y = my + mh - 36;
     // Cancel button
-    draw_pill_to(win.buffer, w, h, mx + 20, btn_y, 64, 24, tok::panel2, tok::line_up);
-    draw_text_to(win.buffer, w, h, mx + 32, btn_y + 4, "Cancel", tok::dim, Face::UiSmall);
+    draw_pill_to(win.buffer, w, h, mx + 20, dlg_btn_y, 64, 24, tok::panel2, tok::line_up);
+    draw_text_to(win.buffer, w, h, mx + 32, dlg_btn_y + 4, "Cancel", tok::dim, Face::UiSmall);
 
     // Test Connection button
-    draw_pill_to(win.buffer, w, h, mx + 92, btn_y, 124, 24, tok::panel2, tok::line_up);
-    draw_text_to(win.buffer, w, h, mx + 102, btn_y + 4, "Test Connection", tok::accent, Face::UiSmall);
+    draw_pill_to(win.buffer, w, h, mx + 92, dlg_btn_y, 124, 24, tok::panel2, tok::line_up);
+    draw_text_to(win.buffer, w, h, mx + 102, dlg_btn_y + 4, "Test Connection", tok::accent, Face::UiSmall);
 
     // Delete Account button (if editing existing)
     if (win.mail_store && !win.mail_acc_email.empty() && win.mail_store->get_account(win.mail_acc_email.text)) {
-      draw_pill_to(win.buffer, w, h, mx + 224, btn_y, 106, 24, 0xFF2A1515, 0xFF7A2020);
-      draw_text_to(win.buffer, w, h, mx + 234, btn_y + 4, "Delete Account", 0xFFFF5555, Face::UiSmall);
+      draw_pill_to(win.buffer, w, h, mx + 224, dlg_btn_y, 106, 24, 0xFF2A1515, 0xFF7A2020);
+      draw_text_to(win.buffer, w, h, mx + 234, dlg_btn_y + 4, "Delete Account", 0xFFFF5555, Face::UiSmall);
     }
 
     // Save & Connect button
-    draw_pill_to(win.buffer, w, h, mx + mw - 146, btn_y, 126, 24, 0xFF0A84FF, 0);
-    draw_text_to(win.buffer, w, h, mx + mw - 136, btn_y + 4, "Sign In & Connect", 0xFFFFFFFF, Face::UiBold);
+    draw_pill_to(win.buffer, w, h, mx + mw - 146, dlg_btn_y, 126, 24, 0xFF0A84FF, 0);
+    draw_text_to(win.buffer, w, h, mx + mw - 136, dlg_btn_y + 4, "Sign In & Connect", 0xFFFFFFFF, Face::UiBold);
   }
 }
 

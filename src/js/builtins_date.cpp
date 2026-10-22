@@ -132,11 +132,6 @@ std::string pad(long v, int width) {
   return s;
 }
 
-std::string year_string(double y) {
-  if (y >= 0) return pad(static_cast<long>(y), 4);
-  return "-" + pad(static_cast<long>(-y), 6);
-}
-
 // ---- parsing ----
 
 bool parse_iso(const std::string& s, double* out, bool* date_only, bool* has_offset, double* offset_ms, bool* invalid) {
