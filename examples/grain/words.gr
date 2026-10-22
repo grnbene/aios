@@ -43,7 +43,7 @@ print("primes under 40:", primes)
 # Maps of maps, field syntax, nested structures.
 let machine = {name: "aios", cores: sys.cpus, tags: ["kernel", "capability"]}
 machine.tags = machine.tags + ["language"]
-print(machine.name, "on", sys.arch, "with", machine.cores, "cores")
+print(machine.name, "knows its arch:", len(sys.arch) > 0, "| has cores:", machine.cores > 0)
 print("tags:", join(machine.tags, ", "))
 print("uptime is a real:", type(sys.uptime_ms), "| cores is an int:", type(sys.cpus))
 

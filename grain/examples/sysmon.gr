@@ -1,0 +1,28 @@
+# sysmon: a small window showing this machine, refreshed every second.
+#   grain build examples/sysmon.gr -o sysmon && ./sysmon
+let started = time_us()
+let notes = []
+
+fn seconds() { return int((time_us() - started) / 1000000) }
+
+let p = ui.pane({"title": "sysmon", "width": 520, "height": 360, "refresh": 1, "view": fn () {
+  return ui.column({"gap": 12, "pad": 16}, [
+    ui.text(sys.host, {"size": 20, "bold": true}),
+    ui.row({"gap": 12}, [
+      ui.tile("OS", sys.os),
+      ui.tile("Arch", sys.arch),
+      ui.tile("CPUs", sys.cpus),
+      ui.tile("Up", str(seconds()) + "s", {"accent": "ok"})]),
+    ui.row({"gap": 8}, [
+      ui.field("note", {"placeholder": "write a note", "focus": true, "on_enter": add_note}),
+      ui.button("Add", add_note, {"primary": true})]),
+    ui.table(notes, {"columns": "at:At, text:Note", "empty": "no notes yet"})])
+}})
+
+fn add_note(f) {
+  if f.note == "" { return nil }
+  push(notes, {"at": date_format(now(), "%T", "local"), "text": f.note})
+  ui.set_field(p, "note", "")
+}
+
+run_panes()

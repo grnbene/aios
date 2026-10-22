@@ -1,0 +1,12 @@
+bad.gr:1: the two sides of an operator: i64 and f64 do not mix (convert with `as`)
+bad.gr:2: wrong_return() returns f64 but this is i64
+bad.gr:3: an if wants a bool, got i64 (compare it, e.g. `x != 0`)
+bad.gr:4: "nope" is not declared
+bad.gr:5: "add3" is not a native function (declare it above this one)
+bad.gr:6: too_many() takes 1 argument(s), got 2
+bad.gr:7: "string" is not a type (i64, f64, bool, bytes or ptr)
+bad.gr:8: only a bytes variable can be indexed
+bad.gr:9: "b" is bytes but this is i64
+bad.gr:10: no_value() returns nothing, so `return` takes no value
+bad.gr:11: break outside a loop
+bad.gr:12: a native function cannot return bytes

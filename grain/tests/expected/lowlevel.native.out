@@ -1,0 +1,25 @@
+native_test.gr
+  ok   adds, recurses and agrees with the VM on fib
+  ok   wraps on overflow
+  ok   agrees with the VM on integer arithmetic over a grid
+  ok   agrees with the VM on shifts, counts past 63 included
+  ok   divides and takes remainders, INT64_MIN / -1 included
+  ok   stops with an error, not a crash, on division by zero
+  ok   combines bools
+  ok   does floating point, and NaN compares false
+  ok   a NaN is unordered
+  ok   loops with break and continue, as the VM runs them
+  ok   else-if chains and shadowing
+  ok   sums bytes with a checksum
+  ok   fills the callers bytes
+  ok   reads and writes typed values in bytes, little endian
+  ok   reads signed values
+  ok   checks every access to bytes
+  ok   passes more arguments than registers hold
+  ok   stops runaway recursion instead of crashing
+  ok   checks its arguments from grain
+  ok   is faster than the VM
+unsafe_test.gr
+  ok   calls C from native code
+  ok   reads and writes raw memory through a ptr
+22 passed, 0 failed

@@ -41,6 +41,9 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_jit_arm64.cpp
   ${AIOS_ROOT}/src/userland/grain_builtins.cpp
   ${AIOS_ROOT}/src/userland/grain_std_hash.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_bytes.cpp
+  ${AIOS_ROOT}/src/userland/grain_native.cpp
+  ${AIOS_ROOT}/src/userland/grain_webui.cpp
   ${AIOS_ROOT}/src/userland/grain_std_regex.cpp
   ${AIOS_ROOT}/src/userland/grain_std_time.cpp
   ${AIOS_ROOT}/src/userland/grain_std_text.cpp
@@ -119,14 +122,25 @@ else()
   target_compile_options(grain_lang PRIVATE -Wall -Wno-unused-parameter)
 endif()
 
-add_executable(grain cli/main.cpp cli/host.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
-target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli)
-target_link_libraries(grain PRIVATE grain_lang)
+add_executable(grain cli/main.cpp cli/host.cpp cli/ffi.cpp cli/plugin.cpp cli/serve.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
+target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(grain PRIVATE grain_lang ${CMAKE_DL_LIBS})
+
+# Windows for panes (run_panes). On Linux grain speaks the X11 protocol itself
+# (cli/display_x11.cpp): no library, and the same on Wayland through XWayland.
+# Elsewhere SDL2 is used until grain has its own window code there.
+set(GRAIN_NATIVE_DISPLAY OFF)
+if(UNIX AND NOT APPLE)
+  set(GRAIN_NATIVE_DISPLAY ON)
+endif()
 
 # Windows for panes (run_panes) through SDL2, when it is installed: Homebrew's
 # sdl2, a distribution's libsdl2-dev, or vcpkg's sdl2 on Windows. Without it
 # grain builds the same and run_panes() says it has no display.
-option(GRAIN_WITH_SDL2 "Show panes as windows through SDL2 when SDL2 is found" ON)
+option(GRAIN_WITH_SDL2 "Show panes as windows through SDL2 when SDL2 is found (not on Linux, which has its own)" ON)
+if(GRAIN_NATIVE_DISPLAY)
+  set(GRAIN_WITH_SDL2 OFF)
+endif()
 # For a program you ship (grain build): SDL2 compiled from its release and
 # linked in, so the executable needs no SDL on the machine it runs on. Fetches
 # SDL's own repository at a release tag; a build without network access uses
@@ -160,7 +174,11 @@ elseif(GRAIN_WITH_SDL2)
     endif()
   endif()
 endif()
-if(GRAIN_SDL2_TARGET)
+if(GRAIN_NATIVE_DISPLAY)
+  target_sources(grain PRIVATE cli/display_x11.cpp)
+  target_compile_definitions(grain PRIVATE GRAIN_HAVE_X11)
+  message(STATUS "grain: panes show as windows (X11 protocol, no library)")
+elseif(GRAIN_SDL2_TARGET)
   target_sources(grain PRIVATE cli/display_sdl.cpp)
   target_link_libraries(grain PRIVATE ${GRAIN_SDL2_TARGET})
   target_compile_definitions(grain PRIVATE GRAIN_HAVE_SDL2)

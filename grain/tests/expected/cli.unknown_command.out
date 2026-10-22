@@ -6,6 +6,7 @@ usage:
   grain run <file.gr> [args...]     run a program; `args` holds what follows it
   grain eval <source...>            run one line and print its value
   grain repl                        read and run lines until EOF or .quit
+  grain serve <file.gr> [--port N]  the program's ui.pane in a browser, not a window
   grain check <file.gr>...          compile only and report every error
   grain dis <file.gr>               show the bytecode the compiler emitted
   grain build <file.gr> [-o out]    make one executable of the program (see grain build)
@@ -17,3 +18,5 @@ usage:
 options (before the subcommand):
   --steps <n>                       stop a program after n instructions
   --no-jit                          interpret everything
+  --safe                            native fn only on bytes: no ptr, extern fn, ffi or plugins
+  --no-native                       refuse native fn altogether

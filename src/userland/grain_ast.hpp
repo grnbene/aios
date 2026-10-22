@@ -75,7 +75,8 @@ struct EntityDef {
 };
 
 enum class StmtKind : uint8_t {
-  Expression, Let, Block, If, While, ForIn, Return, Break, Continue, EntityDecl
+  Expression, Let, Block, If, While, ForIn, Return, Break, Continue, EntityDecl,
+  NativeFn   // `native fn` / `extern fn`: its tokens, compiled to machine code (grain_native.cpp)
 };
 
 struct Stmt {
@@ -88,6 +89,7 @@ struct Stmt {
   std::vector<StmtP> other;   // else branch
   ExprP iterable;             // ForIn
   std::unique_ptr<EntityDef> entity_def;
+  std::vector<Token> native_tokens;   // NativeFn
 };
 
 }  // namespace aios::userland::grain

@@ -1,0 +1,20 @@
+let n = 0
+let notes = []
+let p = ui.pane({"title": "Counter", "width": 480, "height": 360, "view": fn () {
+  return ui.column({"gap": 12, "pad": 16}, [
+    ui.text("Clicked " + str(n) + " times", {"size": 20, "bold": true}),
+    ui.row({"gap": 8}, [
+      ui.button("Add one", fn (f) { n = n + 1 }, {"primary": true}),
+      ui.button("Reset", fn () { n = 0 })]),
+    ui.row({"gap": 8}, [
+      ui.field("note", {"placeholder": "a note", "focus": true, "on_enter": add_note}),
+      ui.button("Save", add_note)]),
+    ui.row({"gap": 12}, [ui.tile("Notes", len(notes), {"accent": "ok"}), ui.tile("Count", n)]),
+    ui.table(notes, {"columns": "text:Note, n:At count:right", "empty": "no notes yet"})])
+}})
+fn add_note(f) {
+  if f.note == "" { return nil }
+  push(notes, {"text": f.note, "n": n})
+  ui.set_field(p, "note", "")
+}
+run_panes()

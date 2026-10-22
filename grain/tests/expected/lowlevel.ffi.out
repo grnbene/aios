@@ -1,0 +1,10 @@
+ffi_test.gr
+  ok   calls functions with integer and string arguments
+  ok   passes and returns floats
+  ok   calls variadic functions
+  ok   puts arguments past the registers on the stack
+  ok   lets C fill a buffer grain owns
+  ok   reads and writes raw memory
+  ok   reports errno
+  ok   checks its arguments before calling
+8 passed, 0 failed

@@ -1,0 +1,12 @@
+unsafe_test.gr:2: extern fn is unsafe, and this program is not allowed it
+unsafe_test.gr:3: extern fn is unsafe, and this program is not allowed it
+unsafe_test.gr:3: ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:4: extern fn is unsafe, and this program is not allowed it
+unsafe_test.gr:5: extern fn is unsafe, and this program is not allowed it
+unsafe_test.gr:8: ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:8: bytes as ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:10: ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:12: reading or writing through a ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:15: ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:16: reading or writing through a ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:19: ptr is unsafe, and this program is not allowed it

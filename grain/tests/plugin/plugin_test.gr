@@ -1,0 +1,31 @@
+# A plugin written in C++ (examples/plugin/vec.cpp), loaded at run time.
+let names = load_plugin("./libgrain_plugin_vec.so")
+
+test("registers what the plugin names", fn () {
+  expect_eq(names, ["dot", "fnv1a", "upcase"])
+})
+
+test("calls into the plugin with lists, bytes and numbers", fn () {
+  expect_eq(dot([1, 2, 3], [4, 5, 6]), 32.0)
+  expect_eq(dot([0.5, 2], [4, 0.25]), 2.5)
+  expect_eq(fnv1a(bytes("")), -3750763034362895579)
+  expect_eq(fnv1a(bytes("a")), -5808556873153909620)
+})
+
+test("lets the plugin fill the callers buffer", fn () {
+  let b = bytes("hello, grain")
+  expect_eq(upcase(b), 12)
+  expect_eq(bytes_str(b), "HELLO, GRAIN")
+})
+
+test("turns a plugin's error into an error naming the call", fn () {
+  expect_error(fn () { return dot([1], [1, 2]) }, "dot(): the lists differ in length")
+  expect_error(fn () { return dot(1, 2) }, "wants two lists")
+  expect_error(fn () { return fnv1a("text") }, "wants bytes")
+  expect_error(fn () { return dot([1]) }, "takes 2")
+})
+
+test("refuses what is not a plugin", fn () {
+  expect_error(fn () { return load_plugin("/no/such/plugin.so") }, "load_plugin")
+  expect_error(fn () { return load_plugin("libm.so.6") }, "no grain_plugin_init")
+})

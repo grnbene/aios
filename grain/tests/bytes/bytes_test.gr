@@ -1,0 +1,106 @@
+# The bytes type: construction, indexing, typed reads and writes, pack/unpack.
+test("makes bytes from a size, a string, a list and bytes", fn () {
+  expect_eq(len(bytes(4)), 4)
+  expect_eq(bytes(3)[1], 0)
+  expect_eq(bytes_hex(bytes("hi")), "6869")
+  expect_eq(bytes_hex(bytes([1, 255, 16])), "01ff10")
+  let a = bytes("abc")
+  let c = bytes(a)
+  c[0] = 122
+  expect_eq(bytes_str(a), "abc")
+  expect_eq(bytes_str(c), "zbc")
+  expect_eq(type(a), "bytes")
+})
+
+test("indexes, assigns, iterates and compares", fn () {
+  let b = bytes([10, 20, 30])
+  expect_eq(b[0], 10)
+  expect_eq(b[-1], 30)
+  b[1] = 99
+  let total = 0
+  for x in b { total = total + x }
+  expect_eq(total, 139)
+  expect_eq(bytes([1, 2]) == bytes([1, 2]), true)
+  expect_eq(bytes([1, 2]) == bytes([1, 3]), false)
+  expect_eq(bytes_hex(bytes([1]) + bytes([2, 3])), "010203")
+  expect_eq(bytes_hex(slice(bytes([1, 2, 3, 4]), 1, 3)), "0203")
+})
+
+test("refuses what would corrupt memory", fn () {
+  let b = bytes(2)
+  expect_error(fn () { return b[2] }, "outside bytes")
+  expect_error(fn () { b[0] = 256 }, "0 to 255")
+  expect_error(fn () { b[0] = "x" }, "0 to 255")
+  expect_error(fn () { return bytes(-1) }, "size")
+  expect_error(fn () { return bytes([1, 300]) }, "0 to 255")
+  expect_error(fn () { return bytes_get(b, 1, "u16le") }, "outside bytes")
+  expect_error(fn () { return bytes_set(b, 0, "u8", 300) }, "does not fit")
+})
+
+test("reads and writes numbers at an offset in either byte order", fn () {
+  let b = bytes(16)
+  bytes_set(b, 0, "u32be", 0xCAFEBABE)
+  expect_eq(bytes_hex(slice(b, 0, 4)), "cafebabe")
+  expect_eq(bytes_get(b, 0, "u32be"), 3405691582)
+  expect_eq(bytes_get(b, 0, "u32le"), 3199925962)
+  expect_eq(bytes_get(b, 0, "u16be"), 0xCAFE)
+  expect_eq(bytes_get(b, 0, "i16be"), -13570)
+  expect_eq(bytes_get(b, 0, "i8"), -54)
+  expect_eq(bytes_get(b, 0, "u8"), 202)
+  bytes_set(b, 4, "i64le", -2)
+  expect_eq(bytes_get(b, 4, "i64le"), -2)
+  expect_eq(bytes_get(b, 4, "u8"), 254)
+  bytes_set(b, 0, "f64be", 1.5)
+  expect_eq(bytes_hex(slice(b, 0, 8)), "3ff8000000000000")
+  expect_eq(bytes_get(b, 0, "f64be"), 1.5)
+  bytes_set(b, 8, "f32le", 0.25)
+  expect_eq(bytes_get(b, 8, "f32le"), 0.25)
+})
+
+test("rejects a type with no byte order", fn () {
+  expect_error(fn () { return bytes_get(bytes(4), 0, "u32") }, "byte order")
+  expect_error(fn () { return bytes_get(bytes(4), 0, "z32le") }, "not a type")
+})
+
+test("packs and unpacks like a struct", fn () {
+  let p = pack(">HH4s", 80, 443, "grain")
+  expect_eq(bytes_hex(p), "005001bb6772" + "6169")
+  let back = unpack(">HH4s", p)
+  expect_eq(back[0], 80)
+  expect_eq(back[1], 443)
+  expect_eq(bytes_str(back[2]), "grai")
+  expect_eq(pack_size("<bBhHiIqQfd"), 1 + 1 + 2 + 2 + 4 + 4 + 8 + 8 + 4 + 8)
+  expect_eq(bytes_hex(pack("<2Bx", 1, 2)), "010200")
+  expect_eq(unpack("<4B", bytes([9, 8, 7, 6]))[3], 6)
+  expect_eq(unpack("<H", bytes([0, 0, 1, 2]), 2)[0], 513)
+  expect_error(fn () { return pack("<B", 256) }, "does not fit")
+  expect_error(fn () { return pack("<BB", 1) }, "more values")
+  expect_error(fn () { return pack("<B", 1, 2) }, "more value")
+  expect_error(fn () { return unpack("<I", bytes(2)) }, "needs 4 bytes")
+})
+
+test("copies, fills, finds and joins", fn () {
+  let b = bytes(6)
+  bytes_fill(b, 7)
+  expect_eq(bytes_hex(b), "070707070707")
+  bytes_fill(b, 1, 2, 4)
+  expect_eq(bytes_hex(b), "070701010707")
+  expect_eq(bytes_copy(b, 0, bytes([9, 9, 9]), 1, 2), 2)
+  expect_eq(bytes_hex(b), "090901010707")
+  bytes_copy(b, 1, b, 0, 4)   # overlapping
+  expect_eq(bytes_hex(b), "090909010107")
+  expect_eq(bytes_find(bytes("hello world"), "world"), 6)
+  expect_eq(bytes_find(bytes("hello"), "z"), -1)
+  expect_eq(bytes_hex(bytes_concat([bytes([1]), bytes([2]), bytes([3])])), "010203")
+  expect_eq(bytes_hex(bytes_from_hex("de:ad be ef")), "deadbeef")
+  expect_error(fn () { return bytes_copy(bytes(2), 1, bytes(4)) }, "run past")
+})
+
+test("reads and writes files as bytes", fn () {
+  let name = "bytes_test_tmp.bin"
+  write_bytes(name, bytes([0, 255, 10, 13, 0]))
+  let back = read_bytes(name)
+  expect_eq(len(back), 5)
+  expect_eq(bytes_hex(back), "00ff0a0d00")
+  delete_file(name)
+})

@@ -11,6 +11,7 @@
 // anything that needs a second pass over the whole chunk.
 #include <cstring>
 
+#include "grain_native.hpp"
 #include "grain_parser.hpp"
 
 namespace aios::userland::grain {
@@ -77,6 +78,7 @@ const char* type_name(Type t) {
     case Type::Channel: return "channel";
     case Type::StateFrame: return "frame";
     case Type::MemoryObject: return "memory";
+    case Type::Bytes: return "bytes";
     case Type::Entity: return "entity";
     case Type::BoundMethod: return "method";
   }
@@ -496,6 +498,22 @@ class Compiler {
         return;
       }
 
+      case StmtKind::NativeFn: {
+        if (!natives_) natives_ = new_native_module();
+        std::string name;
+        Value fn;
+        std::vector<Diagnostic> problems;
+        if (!compile_native_decl(*natives_, s.native_tokens, name, fn, problems)) {
+          for (const auto& d : problems) error(d.line ? d.line : s.line, d.message);
+          return;
+        }
+        if (name.empty()) return;   // an extern fn declares a C function for native code and binds nothing
+        emit_constant(fn, s.line);
+        if (scope_->depth_ == 0 && !scope_->enclosing_) emit_op_wide(Op::DefineGlobal, name_constant(name, s.line), s.line);
+        else add_local(name, s.line);
+        return;
+      }
+
       case StmtKind::Block:
         begin_block();
         for (const auto& b : s.body) statement(*b);
@@ -629,6 +647,7 @@ class Compiler {
 
   std::vector<Diagnostic>* errors_;
   Scope* scope_ = nullptr;
+  std::shared_ptr<NativeModule> natives_;   // the `native fn`s of this compilation, so one can call another
 };
 
 }  // namespace

@@ -1,0 +1,7 @@
+plugin_test.gr
+  ok   registers what the plugin names
+  ok   calls into the plugin with lists, bytes and numbers
+  ok   lets the plugin fill the callers buffer
+  ok   turns a plugin's error into an error naming the call
+  ok   refuses what is not a plugin
+5 passed, 0 failed

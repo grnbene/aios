@@ -10,7 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -21,6 +23,7 @@
 #define isatty _isatty
 #define fileno _fileno
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -28,8 +31,13 @@
 #include "bundle.hpp"
 #include "tools.hpp"
 #include "grain_net.hpp"
+#include "ffi.hpp"
 #include "host.hpp"
-#if defined(GRAIN_HAVE_SDL2)
+#include "plugin.hpp"
+#include "serve.hpp"
+#if defined(GRAIN_HAVE_X11)
+#include "display_x11.hpp"
+#elif defined(GRAIN_HAVE_SDL2)
 #include "display_sdl.hpp"
 #endif
 
@@ -46,6 +54,7 @@ constexpr int kExitOk = 0, kExitCompile = 1, kExitRuntime = 2, kExitUsage = 64;
 struct Options {
   uint64_t steps = 0;     // 0: run until the program ends
   bool jit = true;
+  bool safe = false;      // --safe / --no-native: nothing that can touch memory grain does not own
 };
 
 void usage(std::ostream& o) {
@@ -56,6 +65,7 @@ void usage(std::ostream& o) {
     << "  grain run <file.gr> [args...]     run a program; `args` holds what follows it\n"
     << "  grain eval <source...>            run one line and print its value\n"
     << "  grain repl                        read and run lines until EOF or .quit\n"
+    << "  grain serve <file.gr> [--port N]  the program's ui.pane in a browser, not a window\n"
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
     << "  grain build <file.gr> [-o out]    make one executable of the program (see grain build)\n"
@@ -66,7 +76,9 @@ void usage(std::ostream& o) {
     << "\n"
     << "options (before the subcommand):\n"
     << "  --steps <n>                       stop a program after n instructions\n"
-    << "  --no-jit                          interpret everything\n";
+    << "  --no-jit                          interpret everything\n"
+    << "  --safe                            native fn only on bytes: no ptr, extern fn, ffi or plugins\n"
+    << "  --no-native                       refuse native fn altogether\n";
 }
 
 bool read_source(const std::string& path, std::string& out) {
@@ -102,6 +114,10 @@ void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& scri
   aios::cli::install_grain_net(vm);
   g::install_http_builtins(vm);
   grain_cli::install_process(vm);
+  if (!opt.safe) {
+    grain_cli::install_ffi(vm);
+    grain_cli::install_plugins(vm);
+  }
   grain_cli::install_sys(vm, GRAIN_VERSION);
   grain_cli::install_args(vm, script_args);
   vm.files = &grain_cli::host_files();
@@ -169,8 +185,28 @@ int repl(const Options& opt) {
 }
 
 // A program packed onto this executable (grain build): it gets every argument.
+// serve [--port N] [--host H] and `--web [port]`: the program in a browser, not a window.
+int serve_program(const std::string& name, std::function<bool(std::string&, std::string&, std::string&)> load,
+                  std::function<void(g::Vm&)> setup, const std::vector<std::string>& opts) {
+  grain_cli::ServeOptions so;
+  for (size_t k = 0; k < opts.size(); ++k) {
+    if (opts[k] == "--port" && k + 1 < opts.size()) so.port = std::atoi(opts[++k].c_str());
+    else if (opts[k] == "--host" && k + 1 < opts.size()) so.host = opts[++k];
+    else if (opts[k] == "--hide-errors") so.show_errors = false;
+    else if (!opts[k].empty() && std::isdigit((unsigned char)opts[k][0])) so.port = std::atoi(opts[k].c_str());
+    else { std::cerr << "grain: unknown serve option " << opts[k] << "\n"; return kExitUsage; }
+  }
+  return grain_cli::serve_ui(name, std::move(load), std::move(setup), so);
+}
+
 int run_pack(const grain_cli::Pack& pack, const std::vector<std::string>& script_args) {
   const std::string& name = pack.main_name;
+  if (!script_args.empty() && script_args[0] == "--web") {   // the same program, in a browser
+    return serve_program(name,
+        [&pack](std::string& source, std::string& version, std::string&) { source = pack.files.at(pack.main_name); version = "pack"; return true; },
+        [&pack](g::Vm& vm) { prepare(vm, Options{}, {}); grain_cli::install_bundle_builtins(vm, pack); },
+        std::vector<std::string>(script_args.begin() + 1, script_args.end()));
+  }
   auto compiled = g::compile_source(pack.files.at(name), name);
   if (!compiled.ok()) { report_compile(name, compiled.errors); return kExitCompile; }
   g::Vm vm;
@@ -206,7 +242,10 @@ int disassemble(const std::string& path) {
 
 int main(int argc, char** argv) {
   g::set_http_trust_root(grain_cli::state_dir());
-#if defined(GRAIN_HAVE_SDL2)
+  g::set_native_policy({/*allow=*/true, /*unsafe=*/true});   // the standalone grain trusts its own programs
+#if defined(GRAIN_HAVE_X11)
+  g::set_display(&grain_cli::x11_display());   // run_panes() opens real windows
+#elif defined(GRAIN_HAVE_SDL2)
   g::set_display(&grain_cli::sdl_display());   // run_panes() opens real windows
 #endif
   std::vector<std::string> a(argv + 1, argv + argc);
@@ -225,6 +264,12 @@ int main(int argc, char** argv) {
       if (!end || *end) { std::cerr << "grain: --steps wants a number\n"; return kExitUsage; }
     } else if (a[i] == "--no-jit") {
       opt.jit = false;
+    } else if (a[i] == "--safe") {
+      g::set_native_policy({/*allow=*/true, /*unsafe=*/false});
+      opt.safe = true;
+    } else if (a[i] == "--no-native") {
+      g::set_native_policy({/*allow=*/false, /*unsafe=*/false});
+      opt.safe = true;
     } else if (a[i] == "--help") {
       usage(std::cout);
       return kExitOk;
@@ -253,6 +298,23 @@ int main(int argc, char** argv) {
     std::string source;
     for (size_t k = 0; k < rest.size(); ++k) { if (k) source += " "; source += rest[k]; }
     return eval_line(opt, source);
+  }
+  if (sub == "serve") {   // grain serve app.gr [--port N] [--host H]: the program's ui.pane in a browser
+    if (rest.empty()) { std::cerr << "grain: serve wants a program\n"; return kExitUsage; }
+    const std::string path = rest[0];
+    return serve_program(path,
+        [path](std::string& source, std::string& version, std::string& error) {
+          if (!read_source(path, source)) { error = "cannot read " + path; return false; }
+#if defined(_WIN32)
+          version = std::to_string(source.size()) + ":" + std::to_string(std::hash<std::string>()(source));
+#else
+          struct stat st;
+          version = ::stat(path.c_str(), &st) == 0 ? std::to_string((long long)st.st_mtime) + ":" + std::to_string((long long)st.st_size) : std::to_string(source.size());
+#endif
+          return true;
+        },
+        [opt](g::Vm& vm) { prepare(vm, opt, {}); },
+        std::vector<std::string>(rest.begin() + 1, rest.end()));
   }
   if (sub == "check") {
     if (rest.empty()) { std::cerr << "grain check <file.gr>...\n"; return kExitUsage; }

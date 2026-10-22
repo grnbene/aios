@@ -1,0 +1,83 @@
+# weather: current conditions and a 5 day forecast from open-meteo.com (no key).
+#   grain build examples/weather.gr -o weather && ./weather [city]
+let place = nil
+let cur = nil
+let days = []
+let err = ""
+
+fn describe(code) {
+  if code == 0 { return "Clear" }
+  if code <= 2 { return "Partly cloudy" }
+  if code == 3 { return "Overcast" }
+  if code == 45 or code == 48 { return "Fog" }
+  if code >= 51 and code <= 57 { return "Drizzle" }
+  if code >= 61 and code <= 67 { return "Rain" }
+  if code >= 71 and code <= 77 { return "Snow" }
+  if code >= 80 and code <= 82 { return "Showers" }
+  if code == 85 or code == 86 { return "Snow showers" }
+  if code >= 95 { return "Thunderstorm" }
+  return "Weather " + str(code)
+}
+
+fn get_json(url) {
+  let r = http_get(url)
+  if not r.ok { error("open-meteo answered " + str(r.status) + " " + r.reason) }
+  return json_parse(r.body)
+}
+
+fn load(city) {
+  let g = pcall(fn () {
+    return get_json("https://geocoding-api.open-meteo.com/v1/search?count=1&name=" + url_encode(city))
+  })
+  if not g.ok { err = g.error return nil }
+  if g.value.results == nil { err = "no place called " + city return nil }
+  let hit = g.value.results[0]
+  let w = pcall(fn () {
+    return get_json("https://api.open-meteo.com/v1/forecast?latitude=" + str(hit.latitude) +
+      "&longitude=" + str(hit.longitude) +
+      "&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code" +
+      "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max" +
+      "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=5")
+  })
+  if not w.ok { err = w.error return nil }
+  let d = w.value.daily
+  let rows = []
+  for i in range(0, len(d.time)) {
+    push(rows, {"day": date_format(date_parse(d.time[i]), "%a %b %d", "utc"),
+      "sky": describe(d.weather_code[i]),
+      "hi": str(round(d.temperature_2m_max[i])) + "°",
+      "lo": str(round(d.temperature_2m_min[i])) + "°",
+      "rain": str(d.precipitation_probability_max[i]) + "%"})
+  }
+  place = hit.name + (hit.admin1 != nil ? ", " + hit.admin1 : "")
+  cur = w.value.current
+  days = rows
+  err = ""
+}
+
+fn search(f) {
+  if trim(f.city) != "" { load(trim(f.city)) }
+}
+
+let p = ui.pane({"title": "Weather", "width": 560, "height": 460, "view": fn () {
+  let body = []
+  if err != "" { push(body, ui.text(err, {"color": "#f38ba8"})) }
+  if cur != nil {
+    push(body, ui.text(place, {"size": 22, "bold": true}))
+    push(body, ui.text(describe(cur.weather_code), {"dim": true}))
+    push(body, ui.row({"gap": 12}, [
+      ui.tile("Now", str(round(cur.temperature_2m)) + "°F", {"accent": "ok"}),
+      ui.tile("Feels like", str(round(cur.apparent_temperature)) + "°F"),
+      ui.tile("Humidity", str(cur.relative_humidity_2m) + "%"),
+      ui.tile("Wind", str(round(cur.wind_speed_10m)) + " mph")]))
+    push(body, ui.table(days, {"columns": "day:Day, sky:Sky, hi:High:right, lo:Low:right, rain:Rain:right"}))
+  }
+  return ui.column({"gap": 12, "pad": 16}, [
+    ui.row({"gap": 8}, [
+      ui.field("city", {"placeholder": "City", "value": "", "focus": true, "on_enter": search}),
+      ui.button("Search", search, {"primary": true})]),
+    ui.column({"gap": 12}, body)])
+}})
+
+load(len(args) > 0 ? args[0] : "Chicago")
+run_panes()
