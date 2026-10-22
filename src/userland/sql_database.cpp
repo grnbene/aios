@@ -85,6 +85,9 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #endif
 #include <fcntl.h>
 #include <unistd.h>
+#if !defined(AIOS_METAL) && !defined(__wasi__)
+#include <sys/file.h>   // flock: one engine per store
+#endif
 #endif
 #include <sys/stat.h>
 #if defined(_WIN32)
@@ -23002,12 +23005,51 @@ void SqlDatabase::things_tick() {
 
 void warm_column_index(const SqlTable& t, size_t col);   // after the vectorized executor
 
+namespace {
+// One process per store. A restart that started the new engine a second
+// after signalling the old one had both on the same directory: the old one's
+// shutdown checkpoint swept the files the new one was still reading, and 467
+// tables came up "unreadable". The lock file is held for the life of the
+// process (the kernel drops it when the process dies, however it dies), so a
+// second engine is refused with the holder's pid instead of being let in.
+Result<void> lock_store_root(const std::string& root) {
+#if defined(_WIN32) || defined(AIOS_METAL) || defined(__wasi__)
+  (void)root;
+  return Ok();
+#else
+  static aios::hal::Mutex mu;
+  static std::unordered_map<std::string, int> held;   // root -> fd, per process
+  std::lock_guard<aios::hal::Mutex> g(mu);
+  if (held.count(root)) return Ok();
+  const std::string path = root + "/LOCK";
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0) return Result<void>(Status::IoError, path + ": " + std::strerror(errno));
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    char who[32] = {0};
+    const ssize_t n = ::pread(fd, who, sizeof who - 1, 0);
+    ::close(fd);
+    std::string holder = n > 0 ? std::string(who, (size_t)n) : std::string("another process");
+    while (!holder.empty() && (holder.back() == '\n' || holder.back() == ' ')) holder.pop_back();
+    return Result<void>(Status::IoError, root + " is open by pid " + holder + ": refusing to open the store twice");
+  }
+  const std::string pid = std::to_string((long)::getpid()) + "\n";
+  if (::ftruncate(fd, 0) == 0) (void)!::pwrite(fd, pid.data(), pid.size(), 0);
+  held[root] = fd;   // kept open: the lock lives as long as the process
+  return Ok();
+#endif
+}
+}  // namespace
+
 Result<void> SqlDatabase::init(const std::string& db_dir) {
   install_crash_handler();
   tune_process_allocator();
   metrics_.start_time_ns = kernel_.host().monotonic_ns();
   root_path_ = kernel_.config().root + "/" + db_dir;
   kernel_.host().make_dir(root_path_);
+  if (auto lk = lock_store_root(root_path_); !lk.ok()) {
+    std::fprintf(stderr, "sql store: %s\n", lk.error().message.c_str());
+    return lk;
+  }
   wal_path_ = root_path_ + "/write_behind.wal";
   redo_path_ = root_path_ + "/redo.log";
   load_profiles();
@@ -29756,6 +29798,20 @@ uint8_t tri_of(const Val& v) { return v.null ? kN : (val_truthy(v) ? kT : kF); }
 
 }  // namespace vx
 
+// A subquery's parsed statement from a per-thread cache, parsed and kept on a
+// miss. Returned by value and inserted after the cap check: the caller keeps
+// the statement alive even if a subquery nested under it fills the cache and
+// clears it, and no reference into the map outlives that clear.
+std::shared_ptr<ParsedSelectStatement> cached_parse(
+    std::unordered_map<std::string, std::shared_ptr<ParsedSelectStatement>>& cache, const std::string& sql) {
+  auto it = cache.find(sql);
+  if (it != cache.end() && it->second) return it->second;
+  if (cache.size() > 256) cache.clear();
+  auto sp = std::make_shared<ParsedSelectStatement>(parse_select_sql(sql));
+  cache[sql] = sp;
+  return sp;
+}
+
 bool deps_current(SqlDatabase* db, const std::vector<SubTabDep>& deps) {
   if (!db || deps.empty()) return false;
   for (const auto& d : deps) {
@@ -29775,12 +29831,12 @@ bool constant_subqueries_ok(SqlDatabase* db, const SqlExpr* e, std::vector<SubTa
     if (!db || e->subquery_sql.empty()) return false;
     const ParsedSelectStatement* st = e->parsed_subquery.get();
     if (!st) {
+      // A copy, not a reference into the map: a nested subquery compiled under
+      // this one can clear the map, and the old `auto& sp = parsed[sql]` then
+      // wrote the new statement into a freed node (a one-off SIGSEGV in
+      // _M_release after the 257th distinct subquery on a thread).
       static thread_local std::unordered_map<std::string, std::shared_ptr<ParsedSelectStatement>> parsed;
-      auto& sp = parsed[e->subquery_sql];
-      if (!sp) {
-        if (parsed.size() > 256) parsed.clear();
-        sp = std::make_shared<ParsedSelectStatement>(parse_select_sql(e->subquery_sql));
-      }
+      std::shared_ptr<ParsedSelectStatement> sp = cached_parse(parsed, e->subquery_sql);
       st = sp.get();
     }
     if (!st || !st->ok || st->branches.size() != 1 || !st->union_tail.empty()) return false;
@@ -30403,11 +30459,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       }
       if (!cached_t) {
         static thread_local std::unordered_map<std::string, std::shared_ptr<ParsedSelectStatement>> parsed;
-        auto& sp = parsed[e->subquery_sql];
-        if (!sp) {
-          if (parsed.size() > 256) parsed.clear();
-          sp = std::make_shared<ParsedSelectStatement>(parse_select_sql(e->subquery_sql));
-        }
+        std::shared_ptr<ParsedSelectStatement> sp = cached_parse(parsed, e->subquery_sql);
         const ColumnStore* ics = nullptr;
         std::vector<uint8_t> seen;
         bool any = false, has_null = false, text_inner = true;
@@ -30501,11 +30553,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         }
         if (!cached_n) {
           static thread_local std::unordered_map<std::string, std::shared_ptr<ParsedSelectStatement>> parsed;
-          auto& sp = parsed[e->subquery_sql];
-          if (!sp) {
-            if (parsed.size() > 256) parsed.clear();
-            sp = std::make_shared<ParsedSelectStatement>(parse_select_sql(e->subquery_sql));
-          }
+          std::shared_ptr<ParsedSelectStatement> sp = cached_parse(parsed, e->subquery_sql);
           std::vector<int64_t> ints;
           bool has_null = false;
           std::vector<SubTabDep> deps;
@@ -52233,7 +52281,16 @@ bool get_column(Reader& r, ColumnStore& c, uint32_t magic = kColStoreMagic) {
   }
   if (c.encoding == ColumnEncoding::SegmentFOR || c.encoding == ColumnEncoding::ALP) {
     if (!aqt4 || !seg_layout_sound(c)) return false;
-  } else if ((uint8_t)c.encoding > (uint8_t)ColumnEncoding::ALP) {
+  } else if (c.encoding == ColumnEncoding::TemporalDays || c.encoding == ColumnEncoding::TemporalSeconds) {
+    // Days or seconds since base_int64, bit-packed like FOR (data32 at 32
+    // bits). The reader refused these two as "unknown" while the writer
+    // produced them: every table with a date column converted at a
+    // checkpoint came back as "damaged column data" at the next start.
+    if (c.bit_width_ < 1 || c.bit_width_ > 32) return false;
+    if (c.bit_width_ == 32 ? c.data32.size() < c.row_count_
+                           : c.packed_data.size() < ((c.row_count_ * c.bit_width_ + 7) >> 3) + 8)
+      return false;
+  } else if ((uint8_t)c.encoding > (uint8_t)ColumnEncoding::TemporalSeconds) {
     return false;
   }
   return r.ok();
@@ -52645,8 +52702,14 @@ bool SqlDatabase::load_tables_v4() {
     uint32_t ncd = r.u32();
     t.col_data.resize(ncd);
     bool good = r.ok();
-    for (uint32_t c = 0; c < ncd && good; ++c) good = get_column(r, t.col_data[c], magic);
-    if (!good) { damaged.push_back({file, "damaged column data"}); continue; }   // skipped, not guessed at
+    uint32_t bad_col = 0;
+    for (uint32_t c = 0; c < ncd && good; ++c) { good = get_column(r, t.col_data[c], magic); if (!good) bad_col = c; }
+    if (!good) {   // skipped, not guessed at; the column and its encoding named so the cause can be found
+      const std::string cname = bad_col < t.columns.size() ? t.columns[bad_col].name : std::to_string(bad_col);
+      damaged.push_back({file, "damaged column data: " + t.database + "." + t.name + "." + cname + " encoding " +
+                                   std::to_string((int)t.col_data[bad_col].encoding)});
+      continue;
+    }
     uint32_t trailer = r.remaining() >= 4 ? r.u32() : 0;
     if (trailer == kIndexTrailerMagic) {
       trailer = 0;
