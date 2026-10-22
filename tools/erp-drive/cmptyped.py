@@ -12,7 +12,7 @@ for a in sys.argv[2:]:
 def conn(spec, user, pw):
     h, p = spec.split(':')
     return pymysql.connect(host=h, port=int(p), user=user, password=pw, database=os.environ.get('DBNAME','versioneight'), connect_timeout=30, read_timeout=600)
-A = conn(opt['asql'], 'root', ''); M = conn(opt['maria'], os.environ.get('MUSER','devops'), os.environ.get('MPASS',''))
+A = conn(opt['asql'], os.environ.get('AUSER','root'), os.environ.get('APASS','')); M = conn(opt['maria'], os.environ.get('MUSER','devops'), os.environ.get('MPASS',''))
 def run(c, q):
     cur = c.cursor()
     try:
