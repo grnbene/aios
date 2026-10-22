@@ -492,8 +492,15 @@ int main(int argc, char** argv) {
   std::string cmd;
   for (size_t i = 0; i < args.size(); ++i) {
     if (i > 0) cmd += " ";
-    if (args[i].find(' ') != std::string::npos || args[i].find('\t') != std::string::npos) {
-      cmd += "\"" + args[i] + "\"";
+    if (args[i].find(' ') != std::string::npos || args[i].find('\t') != std::string::npos ||
+        args[i].find('"') != std::string::npos || args[i].find('\'') != std::string::npos) {
+      std::string escaped = "\"";
+      for (char ch : args[i]) {
+        if (ch == '"' || ch == '\\') escaped += '\\';
+        escaped += ch;
+      }
+      escaped += "\"";
+      cmd += escaped;
     } else {
       cmd += args[i];
     }

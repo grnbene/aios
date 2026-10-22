@@ -36,6 +36,7 @@ class Parser {
   ExprP lambda();
 
   StmtP statement();
+  StmtP entity_declaration();
   std::vector<StmtP> block_body();
 
   std::vector<Token> toks_;

@@ -224,8 +224,43 @@ ExprP Parser::primary() {
       return e;
     }
     case Tok::Ident: {
+      std::string full_name = t.text;
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::Name; e->text = t.text; e->line = t.line;
+      while (match(Tok::ColonColon)) {
+        if (check(Tok::Ident)) {
+          full_name += "::" + peek().text;
+          advance();
+        } else {
+          error_at(peek(), "expected identifier after '::'");
+        }
+      }
+      if (check(Tok::LBrace)) {
+        size_t look = 1;
+        while (peek(look).kind == Tok::Newline) ++look;
+        if (peek(look).kind == Tok::RBrace ||
+            ((peek(look).kind == Tok::Ident || peek(look).kind == Tok::Str) && peek(look + 1).kind == Tok::Colon)) {
+          ExprP map_arg = map_literal();
+          auto call = std::make_unique<Expr>();
+          call->kind = ExprKind::Call;
+          call->line = t.line;
+          auto callee = std::make_unique<Expr>();
+          callee->kind = ExprKind::Name;
+          callee->text = full_name;
+          callee->line = t.line;
+          call->a = std::move(callee);
+          call->items.push_back(std::move(map_arg));
+          return call;
+        }
+      }
+      auto e = std::make_unique<Expr>();
+      if (full_name.find("::") != std::string::npos) {
+        e->kind = ExprKind::StrLit;
+        e->text = full_name;
+      } else {
+        e->kind = ExprKind::Name;
+        e->text = full_name;
+      }
+      e->line = t.line;
       return e;
     }
     case Tok::LParen: {
@@ -344,11 +379,30 @@ ExprP Parser::postfix(ExprP left) {
       call->a = std::move(left);
       skip_newlines();
       if (!check(Tok::RParen)) {
+        std::unique_ptr<Expr> named_map;
         for (;;) {
           skip_newlines();
-          call->items.push_back(expression());
+          if (check(Tok::Ident) && peek(1).kind == Tok::Assign) {
+            std::string arg_name = peek().text;
+            advance();  // eat name
+            advance();  // eat '='
+            skip_newlines();
+            ExprP val = expression();
+            if (!named_map) {
+              named_map = std::make_unique<Expr>();
+              named_map->kind = ExprKind::MapLit;
+              named_map->line = line;
+            }
+            named_map->keys.push_back(arg_name);
+            named_map->items.push_back(std::move(val));
+          } else {
+            call->items.push_back(expression());
+          }
           skip_newlines();
           if (!match(Tok::Comma)) break;
+        }
+        if (named_map) {
+          call->items.push_back(std::move(named_map));
         }
       }
       skip_newlines();
@@ -536,6 +590,10 @@ StmtP Parser::statement() {
     return s;
   }
 
+  if (t.kind == Tok::Entity) {
+    return entity_declaration();
+  }
+
   // `fn name(..) { .. }` is sugar for `let name = fn name(..) { .. }`. Naming
   // the lambda as well is what makes a stack trace say `fib` and not `<fn>`.
   if (t.kind == Tok::Fn && peek(1).kind == Tok::Ident) {
@@ -643,6 +701,78 @@ StmtP Parser::statement() {
   s->kind = StmtKind::Expression;
   s->line = t.line;
   s->expr = expression();
+  return s;
+}
+
+StmtP Parser::entity_declaration() {
+  const Token t = advance();  // eat 'entity'
+  auto s = std::make_unique<Stmt>();
+  s->kind = StmtKind::EntityDecl;
+  s->line = t.line;
+
+  auto def = std::make_unique<EntityDef>();
+  def->line = t.line;
+  if (check(Tok::Ident)) {
+    def->name = peek().text;
+    advance();
+  } else {
+    error_at(peek(), "expected entity name after 'entity'");
+  }
+
+  skip_newlines();
+  expect(Tok::LBrace, "'{' after entity name");
+  skip_newlines();
+
+  while (!check(Tok::RBrace) && !check(Tok::End)) {
+    skip_newlines();
+    if (check(Tok::RBrace)) break;
+
+    if (check(Tok::On)) {
+      advance();  // eat 'on'
+      auto h = std::make_unique<OnHandler>();
+      h->line = peek().line;
+      if (check(Tok::Ident)) {
+        h->event = peek().text;
+        advance();
+      } else {
+        error_at(peek(), "expected event name after 'on'");
+      }
+      expect(Tok::LParen, "'(' after event name");
+      if (check(Tok::Ident)) {
+        std::string first_id = peek().text;
+        advance();
+        if (check(Tok::Ident)) {
+          h->param_type = first_id;
+          h->param = peek().text;
+          advance();
+        } else {
+          h->param = first_id;
+        }
+      }
+      expect(Tok::RParen, "')' after event parameter");
+      skip_newlines();
+      expect(Tok::LBrace, "'{' for 'on' handler body");
+      h->body = block_body();
+      def->handlers.push_back(std::move(h));
+      if (match(Tok::Comma)) skip_newlines();
+    } else if (check(Tok::Ident) || check(Tok::Str)) {
+      std::string field_name = peek().text;
+      advance();
+      expect(Tok::Colon, "':' after field name");
+      skip_newlines();
+      ExprP val_expr = expression();
+      def->fields.push_back({field_name, std::move(val_expr)});
+      if (match(Tok::Comma)) {
+        skip_newlines();
+      }
+    } else {
+      error_at(peek(), "expected field or 'on' handler in entity definition");
+      advance();
+    }
+    skip_newlines();
+  }
+  expect(Tok::RBrace, "'}' at end of entity definition");
+  s->entity_def = std::move(def);
   return s;
 }
 

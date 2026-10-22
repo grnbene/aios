@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CompilerFlags</key>
+	<string></string>
+	<key>CompilerScript</key>
+	<false/>
+	<key>ConsoleType</key>
+	<integer>0</integer>
+	<key>CustomTabMode</key>
+	<false/>
+	<key>Diagnostics</key>
+	<array>
+		<dict>
+			<key>Command</key>
+			<string></string>
+			<key>KeyEquivalent</key>
+			<string></string>
+			<key>Name</key>
+			<string>Grain Compiler &amp; Runtime</string>
+			<key>Options</key>
+			<integer>4</integer>
+			<key>OutputMode</key>
+			<integer>0</integer>
+			<key>OutputRegex</key>
+			<string>^(?&lt;file&gt;[^\s].*?):(?&lt;line&gt;\d+): (?&lt;message&gt;.*)$</string>
+			<key>OutputScriptUUID</key>
+			<string></string>
+			<key>Type</key>
+			<integer>0</integer>
+			<key>UpdateMode</key>
+			<integer>3</integer>
+			<key>uuid</key>
+			<string>8C38F7A1-4201-4475-BC2A-399FE752EA49</string>
+		</dict>
+	</array>
+	<key>Docs</key>
+	<array/>
+	<key>Enabled</key>
+	<true/>
+	<key>FileExtensions</key>
+	<array>
+		<string>gr</string>
+	</array>
+	<key>Grammar</key>
+	<string>source.grain</string>
+	<key>Name</key>
+	<string>Grain</string>
+	<key>OutputEncoding</key>
+	<integer>0</integer>
+	<key>RequiresExternalComponents</key>
+	<false/>
+	<key>RunCommand</key>
+	<string>/Users/skyblade/Docker/aios/build/aios grain run "$CR_FILENAME"</string>
+	<key>SoftTabs</key>
+	<false/>
+	<key>TabWidth</key>
+	<integer>4</integer>
+	<key>Templates</key>
+	<array>
+		<dict>
+			<key>Default</key>
+			<integer>1</integer>
+			<key>Extension</key>
+			<string>gr</string>
+			<key>Name</key>
+			<string>Substrate Entity</string>
+			<key>NameOnCreation</key>
+			<false/>
+			<key>Template</key>
+			<string>entity SystemMonitor {
+    identity: id128(),
+    channel:  StateChannel(provider = shared_mem),
+
+    capability: Capability {
+        resource: hardware::uart0,
+        rights:   read_write,
+        expires:  never
+    },
+
+    on frame_received(frame) {
+        if (frame.generation == current_generation) {
+            this.channel.publish(frame.payload)
+        }
+    }
+}
+
+let incoming = StateFrame("init_ping", 1)
+SystemMonitor.dispatch("frame_received", incoming)
+let received = SystemMonitor.channel.consume()
+print("Received frame:", received.payload)
+</string>
+		</dict>
+	</array>
+	<key>uuid</key>
+	<string>EA62FFF4-8EB3-4595-B4BC-5DB4E861A425</string>
+</dict>
+</plist>

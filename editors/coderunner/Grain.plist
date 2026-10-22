@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>fileTypes</key>
+	<array>
+		<string>gr</string>
+	</array>
+	<key>name</key>
+	<string>Grain</string>
+	<key>scopeName</key>
+	<string>source.grain</string>
+	<key>uuid</key>
+	<string>7BD4B2F7-E1F9-4B52-9A8C-328AE5E95E10</string>
+	<key>patterns</key>
+	<array>
+		<!-- Comments -->
+		<dict>
+			<key>match</key>
+			<string>(//|#).*$</string>
+			<key>name</key>
+			<string>comment.line.grain</string>
+		</dict>
+
+		<!-- Formatted String literals: f"..." or f'...' -->
+		<dict>
+			<key>begin</key>
+			<string>\b[fF]\"</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>string.interpolated.grain</string>
+				</dict>
+			</dict>
+			<key>end</key>
+			<string>\"</string>
+			<key>endCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>string.interpolated.grain</string>
+				</dict>
+			</dict>
+			<key>name</key>
+			<string>string.interpolated.grain</string>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>match</key>
+					<string>\\(\\{|\\}|["\\/bfnrt]|u[0-9a-fA-F]{4})</string>
+					<key>name</key>
+					<string>constant.character.escape.grain</string>
+				</dict>
+				<dict>
+					<key>begin</key>
+					<string>\{</string>
+					<key>beginCaptures</key>
+					<dict>
+						<key>0</key>
+						<dict>
+							<key>name</key>
+							<string>punctuation.section.embedded.begin.grain</string>
+						</dict>
+					</dict>
+					<key>end</key>
+					<string>\}</string>
+					<key>endCaptures</key>
+					<dict>
+						<key>0</key>
+						<dict>
+							<key>name</key>
+							<string>punctuation.section.embedded.end.grain</string>
+						</dict>
+					</dict>
+					<key>patterns</key>
+					<array>
+						<dict>
+							<key>include</key>
+							<string>$self</string>
+						</dict>
+					</array>
+				</dict>
+			</array>
+		</dict>
+
+		<!-- Double quoted strings -->
+		<dict>
+			<key>begin</key>
+			<string>\"</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.begin.grain</string>
+				</dict>
+			</dict>
+			<key>end</key>
+			<string>\"</string>
+			<key>endCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.end.grain</string>
+				</dict>
+			</dict>
+			<key>name</key>
+			<string>string.quoted.double.grain</string>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>match</key>
+					<string>\\([\\"0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})</string>
+					<key>name</key>
+					<string>constant.character.escape.grain</string>
+				</dict>
+			</array>
+		</dict>
+
+		<!-- Single quoted strings -->
+		<dict>
+			<key>begin</key>
+			<string>\'</string>
+			<key>beginCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.begin.grain</string>
+				</dict>
+			</dict>
+			<key>end</key>
+			<string>\'</string>
+			<key>endCaptures</key>
+			<dict>
+				<key>0</key>
+				<dict>
+					<key>name</key>
+					<string>punctuation.definition.string.end.grain</string>
+				</dict>
+			</dict>
+			<key>name</key>
+			<string>string.quoted.single.grain</string>
+			<key>patterns</key>
+			<array>
+				<dict>
+					<key>match</key>
+					<string>\\([\\'0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})</string>
+					<key>name</key>
+					<string>constant.character.escape.grain</string>
+				</dict>
+			</array>
+		</dict>
+
+		<!-- Numeric constants -->
+		<dict>
+			<key>match</key>
+			<string>\b0x[0-9a-fA-F_]+\b</string>
+			<key>name</key>
+			<string>constant.numeric.hex.grain</string>
+		</dict>
+		<dict>
+			<key>match</key>
+			<string>\b0b[01_]+\b</string>
+			<key>name</key>
+			<string>constant.numeric.binary.grain</string>
+		</dict>
+		<dict>
+			<key>match</key>
+			<string>\b[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?\b</string>
+			<key>name</key>
+			<string>constant.numeric.decimal.grain</string>
+		</dict>
+
+		<!-- Substrate Constants & Built-in Literals -->
+		<dict>
+			<key>match</key>
+			<string>\b(true|false|nil)\b</string>
+			<key>name</key>
+			<string>constant.language.grain</string>
+		</dict>
+		<dict>
+			<key>match</key>
+			<string>\b(this)\b</string>
+			<key>name</key>
+			<string>variable.language.this.grain</string>
+		</dict>
+		<dict>
+			<key>match</key>
+			<string>\b(write_only|read_only|read_write|grant|never|shared_mem|ram|persistent|current_generation)\b</string>
+			<key>name</key>
+			<string>support.constant.substrate.grain</string>
+		</dict>
+
+		<!-- Entity declaration: entity Name { -->
+		<dict>
+			<key>match</key>
+			<string>\b(entity)\s+([a-zA-Z_][a-zA-Z0-9_]*)</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>keyword.declaration.entity.grain</string>
+				</dict>
+				<key>2</key>
+				<dict>
+					<key>name</key>
+					<string>entity.name.type.entity.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- Event handler declaration: on event_name(Type param) { -->
+		<dict>
+			<key>match</key>
+			<string>\b(on)\s+([a-zA-Z_][a-zA-Z0-9_]*)</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>keyword.declaration.handler.grain</string>
+				</dict>
+				<key>2</key>
+				<dict>
+					<key>name</key>
+					<string>entity.name.function.handler.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- Function declaration: fn name(...) { -->
+		<dict>
+			<key>match</key>
+			<string>\b(fn)\s+([a-zA-Z_][a-zA-Z0-9_]*)</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>keyword.declaration.function.grain</string>
+				</dict>
+				<key>2</key>
+				<dict>
+					<key>name</key>
+					<string>entity.name.function.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- Keywords -->
+		<dict>
+			<key>match</key>
+			<string>\b(let|return|if|else|while|for|in|break|continue|fn|entity|on)\b</string>
+			<key>name</key>
+			<string>keyword.control.grain</string>
+		</dict>
+
+		<!-- Substrate Types / Struct Names -->
+		<dict>
+			<key>match</key>
+			<string>\b(Id128|Capability|StateChannel|StateFrame|MemoryObject|Entity)\b</string>
+			<key>name</key>
+			<string>support.type.substrate.grain</string>
+		</dict>
+
+		<!-- Substrate Native Built-ins -->
+		<dict>
+			<key>match</key>
+			<string>\b(id128|memory_allocate|StateChannel|StateFrame|Capability)\b</string>
+			<key>name</key>
+			<string>support.function.substrate.grain</string>
+		</dict>
+
+		<!-- Standard Built-in Functions -->
+		<dict>
+			<key>match</key>
+			<string>\b(print|len|type|repr|str|int|real|bool|list|map|keys|values|entries|has|get|set|del|push|pop|shift|unshift|slice|join|split|sort|reverse|range|abs|min|max|floor|ceil|round|sqrt|sin|cos|tan|pow|log|exp|random|now|clock|read_file|write_file|append_file|delete_file|list_files|file_exists|is_dir|mkdir|env|exec|spawn|sys)\b</string>
+			<key>name</key>
+			<string>support.function.builtin.grain</string>
+		</dict>
+
+		<!-- Substrate Methods -->
+		<dict>
+			<key>match</key>
+			<string>\.(publish|consume|stats|attenuate|can|has_expired|read|write|migrate|dispatch)\b</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>support.function.member.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- General Method / Field Access -->
+		<dict>
+			<key>match</key>
+			<string>\.([a-zA-Z_][a-zA-Z0-9_]*)</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>variable.other.member.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- Scoped Identifiers (e.g. hardware::uart0) -->
+		<dict>
+			<key>match</key>
+			<string>\b[a-zA-Z_][a-zA-Z0-9_]*(::[a-zA-Z_][a-zA-Z0-9_]*)+\b</string>
+			<key>name</key>
+			<string>entity.name.namespace.grain</string>
+		</dict>
+
+		<!-- Capitalized Types -->
+		<dict>
+			<key>match</key>
+			<string>\b[A-Z][a-zA-Z0-9_]*\b</string>
+			<key>name</key>
+			<string>entity.name.type.grain</string>
+		</dict>
+
+		<!-- Function calls: name(...) -->
+		<dict>
+			<key>match</key>
+			<string>\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?=\()</string>
+			<key>captures</key>
+			<dict>
+				<key>1</key>
+				<dict>
+					<key>name</key>
+					<string>entity.name.function.call.grain</string>
+				</dict>
+			</dict>
+		</dict>
+
+		<!-- Operators -->
+		<dict>
+			<key>match</key>
+			<string>(==|!=|&lt;=|&gt;=|&lt;&lt;=|&gt;&gt;=|\+=|-=|\*=|/=|%=|\^=|&amp;=|\|=|::|-&gt;|=&gt;|&lt;&lt;|&gt;&gt;|&lt;|&gt;|=|\+|-|\*|/|%|\^|&amp;|\||~|!)</string>
+			<key>name</key>
+			<string>keyword.operator.grain</string>
+		</dict>
+
+		<!-- Punctuation -->
+		<dict>
+			<key>match</key>
+			<string>(\(|\)|\{|\}|\[|\]|,|;|:|\.)</string>
+			<key>name</key>
+			<string>punctuation.separator.grain</string>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -59,8 +59,23 @@ struct Expr {
   std::string fn_name = "<fn>";
 };
 
+struct OnHandler {
+  std::string event;
+  std::string param_type;
+  std::string param;
+  std::vector<StmtP> body;
+  int line = 0;
+};
+
+struct EntityDef {
+  std::string name;
+  std::vector<std::pair<std::string, ExprP>> fields;
+  std::vector<std::unique_ptr<OnHandler>> handlers;
+  int line = 0;
+};
+
 enum class StmtKind : uint8_t {
-  Expression, Let, Block, If, While, ForIn, Return, Break, Continue
+  Expression, Let, Block, If, While, ForIn, Return, Break, Continue, EntityDecl
 };
 
 struct Stmt {
@@ -72,6 +87,7 @@ struct Stmt {
   std::vector<StmtP> body;    // Block, loop body, if-then
   std::vector<StmtP> other;   // else branch
   ExprP iterable;             // ForIn
+  std::unique_ptr<EntityDef> entity_def;
 };
 
 }  // namespace aios::userland::grain
