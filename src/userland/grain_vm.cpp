@@ -360,6 +360,8 @@ Value* Vm::find_global(const std::string& name) {
   return it == st_->globals.end() ? nullptr : &it->second;
 }
 
+uint64_t Vm::serial() const { return st_->serial; }
+
 std::vector<std::string> Vm::global_names() const {
   std::vector<std::string> names;
   names.reserve(st_->globals.size());

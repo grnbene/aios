@@ -6,6 +6,7 @@
 #include "aios/userland/font_atlas.hpp"
 #include "aios/userland/glyph_engine.hpp"
 #include "aios/userland/task_ledger.hpp"
+#include "aios/userland/grain.hpp"
 #include "aios/userland/sql_database.hpp"
 #include "aios/userland/machine_sql.hpp"
 #include "aios/userland/mysql_binlog.hpp"
@@ -19,6 +20,7 @@
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -418,6 +420,23 @@ const char* const CURSOR_ROWS[] = {
   "      XX    ",
 };
 
+}  // namespace
+
+// A grain program open on the desktop (`grain open`, see grain_open): its VM,
+// kept while it has panes, its files and what it printed.
+struct GrainDesktopApp {
+  std::string path;                     // as it was opened
+  std::string dir;                      // its directory: the program's relative paths start there
+  std::unique_ptr<grain::Files> files;
+  std::unique_ptr<grain::Vm> vm;
+  std::vector<std::string> output;      // printed since the tick last showed it at the terminal
+  bool attached = false;                // run_panes() asked for its panes to be shown
+  std::string failed;                   // what stopped it: its windows show this instead of a frame
+  bool failure_reported = false;
+};
+
+namespace {
+std::string grain_key_name(int key, bool* ctrl);   // the desktop's key codes as grain names them (with grain_open)
 }  // namespace
 
 HardwareCompositor::HardwareCompositor(uint32_t screen_width, uint32_t screen_height)
@@ -11141,6 +11160,7 @@ void HardwareCompositor::render_window_content(WindowSurface& win, Kernel& k) {
     case WindowType::Contacts: render_contacts_window(win, k); break;
     case WindowType::Calendar: render_calendar_window(win, k); break;
     case WindowType::FaceApp: render_face_app_window(win, k); break;
+    case WindowType::Grain: render_grain_window(win); break;
     case WindowType::Inspector: render_inspector_window(win, k); break;
     default: clear_buffer(win.buffer, tok::panel, win.content_width(), win.content_height()); break;
   }
@@ -12343,6 +12363,7 @@ void HardwareCompositor::pump_mail_windows() {
 
 void HardwareCompositor::render_desktop(Kernel& k) {
   kernel_ = &k;
+  grain_tick();   // grain programs' input, windows and output, outside the state lock
   // The size this machine is set to draw at, read once. Before the kernel is
   // in hand there is no aos.conf to read it from.
   if (!ui_scale_loaded_) { ui_scale_loaded_ = true; load_ui_scale(); }
@@ -13018,6 +13039,20 @@ bool HardwareCompositor::run_ui_action(UiAction a) {
 
 void HardwareCompositor::submit_command(const std::string& cmd) {
   if (cmd.empty()) return;
+  // A grain program with windows runs on the desktop's own thread, where its
+  // panes are drawn - not on the command thread the dispatcher would use.
+  if (cmd.rfind("grain open ", 0) == 0) {
+    {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      for (auto& w : windows_)
+        if (w.type == WindowType::Terminal) { w.lines.push_back("aios> " + cmd); w.scroll_y = 0; }
+    }
+    std::string path = cmd.substr(11);
+    while (!path.empty() && path.back() == ' ') path.pop_back();
+    while (!path.empty() && path.front() == ' ') path.erase(path.begin());
+    if (kernel_) grain_open(path, *kernel_);
+    return;
+  }
   {
     std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
     for (auto& w : windows_) {
@@ -14558,6 +14593,27 @@ void HardwareCompositor::input_mouse_motion(int x, int y) {
   // Same for motion: while the sheet is up the pointer is a nib and nothing
   // else. Hover, window drags and text selection are not what it is for.
   if (draw_mode_) { draw_pointer_move(x, y); return; }
+  // Over a Grain window's content (or dragging from one), the pointer is the program's.
+  if (!grain_apps_.empty()) {
+    std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+    for (auto it = windows_.rbegin(); it != windows_.rend(); ++it) {
+      const WindowSurface& w = *it;
+      if (!w.visible || w.minimized) continue;
+      const int cx = x - w.bounds.x - 1, cy = y - w.bounds.y - 26;
+      const bool inside = cx >= 0 && cy >= 0 && cx < w.content_width() && cy < w.content_height();
+      const bool topmost_here = x >= w.bounds.x && y >= w.bounds.y && x < w.bounds.x + w.bounds.width && y < w.bounds.y + w.bounds.height;
+      if (w.type == WindowType::Grain && (w.window_id == grain_press_win_ || inside)) {
+        GrainQueued q;
+        q.window_id = w.window_id;
+        q.type = "mouse_move";
+        q.x = cx;
+        q.y = cy;
+        grain_queue(q);
+        break;
+      }
+      if (topmost_here) break;   // another window is in front of anything below
+    }
+  }
   // The top edge reveals the view switcher, on every face.
   view_bar_track(x, y);
   // Text being selected by dragging: the caret follows the pointer and the
@@ -14793,6 +14849,25 @@ void HardwareCompositor::input_mouse_button(int x, int y, bool down, int button)
   }
   if (!down) {
     mouse_down_ = false;
+    // A button that went down in a Grain window comes up there: mouse_up, and a
+    // click when it is still over the window's content.
+    if (grain_press_win_ != 0) {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      for (const auto& w : windows_) {
+        if (w.window_id != grain_press_win_ || w.type != WindowType::Grain) continue;
+        GrainQueued q;
+        q.window_id = w.window_id;
+        q.x = x - w.bounds.x - 1;
+        q.y = y - w.bounds.y - 26;
+        q.type = "mouse_up";
+        grain_queue(q);
+        if (q.x >= 0 && q.y >= 0 && q.x < w.content_width() && q.y < w.content_height()) {
+          q.type = "click";
+          grain_queue(q);
+        }
+      }
+      grain_press_win_ = 0;
+    }
     // The selection stops growing when the button comes up. A drag that never
     // moved leaves anchor and caret together, which is no selection at all.
     text_dragging_ = false;
@@ -15128,6 +15203,15 @@ void HardwareCompositor::input_mouse_button(int x, int y, bool down, int button)
         calendar_click(w, rel_x, rel_y, to_run);
       } else if (w.type == WindowType::FaceApp) {
         face_app_click(w, rel_x, rel_y);
+      } else if (w.type == WindowType::Grain) {
+        // Content starts one pixel in from the frame (see content_width).
+        GrainQueued q;
+        q.window_id = w.window_id;
+        q.type = "mouse_down";
+        q.x = rel_x - 1;
+        q.y = rel_y;
+        grain_queue(q);
+        grain_press_win_ = w.window_id;
       } else if (w.type == WindowType::Inspector) {
         inspector_click(w, rel_x, rel_y, to_run);
       }
@@ -15192,6 +15276,14 @@ void HardwareCompositor::input_mouse_wheel(int notches) {
   // front, which made a long table unreadable.
   {
     WindowSurface* win = focused_window();
+    if (win && win->type == WindowType::Grain) {
+      GrainQueued q;
+      q.window_id = win->window_id;
+      q.type = "wheel";
+      q.dy = notches;
+      grain_queue(q);
+      return;
+    }
     if (win && win->type == WindowType::Database && win->db_show_designer && win->db_designer_tab == 0) {
       // The designer sheet is in front: the wheel scrolls its column rows.
       win->db_designer_scroll -= notches;
@@ -15455,6 +15547,14 @@ void HardwareCompositor::input_text(const std::string& text) {
     face_app_text(*this, *win, text);
     return;
   }
+  if (win->type == WindowType::Grain) {
+    GrainQueued q;
+    q.window_id = win->window_id;
+    q.type = "text";
+    q.text = text;
+    grain_queue(q);
+    return;
+  }
   if (win->type == WindowType::Inspector) {
     inspector_text(*this, *win, text);
     return;
@@ -15647,6 +15747,16 @@ bool HardwareCompositor::input_key(int key) {
     std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
     WindowSurface* win = focused_window();
     if (win) {
+      // A grain program has its own keys, Escape among them (its "close", often).
+      if (win->type == WindowType::Grain) {
+        GrainQueued q;
+        q.window_id = win->window_id;
+        q.type = "key";
+        q.key = "escape";
+        q.shift = shift_held_;
+        grain_queue(q);
+        return true;
+      }
       if (win->type == WindowType::Terminal && terminal_has_selection(*win)) {
         terminal_clear_selection(*win);
         return true;
@@ -15754,6 +15864,15 @@ bool HardwareCompositor::input_key(int key) {
     }
     if (win && win->type == WindowType::FaceApp) {
       if (face_app_key(*this, *win, key)) return true;
+    }
+    if (win && win->type == WindowType::Grain) {
+      GrainQueued q;
+      q.window_id = win->window_id;
+      q.type = "key";
+      q.key = grain_key_name(key, &q.ctrl);
+      q.shift = shift_held_;
+      q.alt = word_wise_;
+      if (!q.key.empty()) { grain_queue(q); return true; }
     }
     if (win && win->type == WindowType::Inspector) {
       if (inspector_key(*this, *win, key)) return true;
@@ -17110,5 +17229,427 @@ bool HardwareCompositor::run_desktop_tui(Kernel& k, CommandDispatcher dispatcher
   return true;
 }
 #endif
+
+
+// ---- grain programs on the desktop -----------------------------------------
+// `grain open file.gr` at the terminal runs a grain program here, on the
+// desktop's own thread, and keeps its VM for as long as it has panes. Its
+// run_panes() shows them as Grain windows: every frame the pane's on_draw
+// paints its canvas and the canvas is the window's content; clicks, keys and
+// typing in the window are the pane's events. The program's code after
+// run_panes() runs at once (the desktop, not the program, owns the loop), and
+// a callback is held to kGrainStepsPerCall instructions so a runaway one stops
+// with an error instead of freezing the desktop.
+
+namespace {
+
+constexpr uint64_t kGrainStepsPerCall = 50000000;
+
+// A desktop program's files: this machine's storage, paths relative to the
+// program's own directory.
+class GrainDesktopFiles final : public grain::Files {
+ public:
+  GrainDesktopFiles(hal::Host& host, std::string base) : h_(host), base_(std::move(base)) {}
+  bool read(const std::string& path, std::string& out, std::string& error) override {
+    if (is_dir(path)) { error = "is a directory"; return false; }
+    auto r = h_.read_file(at(path));
+    if (!r.ok()) { error = r.error().message; return false; }
+    out.assign(reinterpret_cast<const char*>(r->data()), r->size());
+    return true;
+  }
+  bool write(const std::string& path, const std::string& data, bool append, std::string& error) override {
+    const ByteSpan bytes(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    auto r = append ? h_.append_file(at(path), bytes) : h_.write_file(at(path), bytes);
+    if (!r.ok()) { error = r.error().message; return false; }
+    return true;
+  }
+  bool list(const std::string& path, std::vector<grain::FileEntry>& out, std::string& error) override {
+    const std::string dir = at(path);
+    auto names = h_.list_dir(dir);
+    if (!names.ok()) { error = names.error().message; return false; }
+    for (const auto& n : *names) {
+      grain::FileEntry e;
+      e.name = n;
+      if (auto st = h_.stat(dir + "/" + n); st.ok()) {
+        e.dir = st->is_dir;
+        e.size = st->is_dir ? 0 : static_cast<int64_t>(st->size);
+      }
+      out.push_back(std::move(e));
+    }
+    std::sort(out.begin(), out.end(), [](const grain::FileEntry& a, const grain::FileEntry& b) { return a.name < b.name; });
+    return true;
+  }
+  bool remove(const std::string& path, std::string& error) override {
+    auto st = h_.stat(at(path));
+    if (!st.ok() || st->is_dir) { error = "no such file"; return false; }
+    auto r = h_.remove(at(path));
+    if (!r.ok()) { error = r.error().message; return false; }
+    return true;
+  }
+  bool exists(const std::string& path) override {
+    auto st = h_.stat(at(path));
+    return st.ok() && !st->is_dir;
+  }
+  bool make_dir(const std::string& path, bool parents, std::string& error) override {
+    const std::string full = at(path);
+    if (is_dir(path)) return true;
+    if (!parents) {
+      auto r = h_.make_dir(full);
+      if (!r.ok()) { error = r.error().message; return false; }
+      return true;
+    }
+    for (size_t i = 1; i <= full.size(); ++i) {
+      if (i != full.size() && full[i] != '/') continue;
+      const std::string prefix = full.substr(0, i);
+      if (h_.stat(prefix).ok()) continue;
+      auto r = h_.make_dir(prefix);
+      if (!r.ok()) { error = r.error().message; return false; }
+    }
+    return true;
+  }
+  bool remove_dir(const std::string& path, std::string& error) override {
+    if (!is_dir(path)) { error = "no such directory"; return false; }
+    auto names = h_.list_dir(at(path));
+    if (names.ok() && !names->empty()) { error = "not empty"; return false; }
+    auto r = h_.remove(at(path));
+    if (!r.ok()) { error = r.error().message; return false; }
+    return true;
+  }
+  bool is_dir(const std::string& path) override {
+    auto st = h_.stat(at(path));
+    return st.ok() && st->is_dir;
+  }
+  bool absolute(const std::string& path, std::string& out, std::string&) override {
+    out = at(path);
+    return true;
+  }
+
+ private:
+  std::string at(const std::string& p) const { return p.empty() ? base_ : p[0] == '/' ? p : base_ + "/" + p; }
+  hal::Host& h_;
+  std::string base_;
+};
+
+// run_panes() in a desktop program: its panes are to be shown, by the desktop.
+class DesktopGrainDisplay final : public grain::Display {
+ public:
+  explicit DesktopGrainDisplay(std::vector<std::unique_ptr<GrainDesktopApp>>& apps) : apps_(apps) {}
+  bool run(grain::Vm& vm, const grain::DisplayRun&, std::string& error) override {
+    for (auto& a : apps_) {
+      if (a->vm.get() == &vm) { a->attached = true; return true; }
+    }
+    error = "run_panes(): on the desktop a program shows its panes when it is opened with `grain open <file.gr>`";
+    return false;
+  }
+
+ private:
+  std::vector<std::unique_ptr<GrainDesktopApp>>& apps_;
+};
+
+// The desktop's key codes as grain names them (SDL's names, lower case): what
+// the standalone grain delivers, so a program behaves the same in both.
+std::string grain_key_name(int key, bool* ctrl) {
+  using namespace aios::hal;
+  *ctrl = false;
+  switch (key) {
+    case KeyBackspace: return "backspace";
+    case KeyTab: return "tab";
+    case KeyEnter: return "return";
+    case KeyEscape: return "escape";
+    case KeyDelete: return "delete";
+    case KeyUp: return "up";
+    case KeyDown: return "down";
+    case KeyLeft: return "left";
+    case KeyRight: return "right";
+    case KeyHome: return "home";
+    case KeyEnd: return "end";
+    case KeyPageUp: return "pageup";
+    case KeyPageDown: return "pagedown";
+    default: break;
+  }
+  if (key >= KeyF1 && key <= KeyF12) return "f" + std::to_string(key - KeyF1 + 1);
+  if (key >= 1 && key <= 26) { *ctrl = true; return std::string(1, static_cast<char>('a' + key - 1)); }
+  if (key >= 32 && key < 127) return std::string(1, static_cast<char>(std::tolower(key)));
+  return "";
+}
+
+}  // namespace
+
+void HardwareCompositor::grain_queue(GrainQueued ev) {
+  grain_pending_.push_back(std::move(ev));
+  mark_dirty();
+}
+
+void HardwareCompositor::grain_open(const std::string& spec, Kernel& k) {
+  auto say = [this](const std::string& line) {
+    std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+    for (auto& w : windows_)
+      if (w.type == WindowType::Terminal) w.lines.push_back(line);
+    canvas_state_.answer_lines.push_back(line);
+    mark_dirty();
+  };
+  hal::Host& host = k.host();
+  std::string path = spec;
+  if (!path.empty() && path[0] != '/' && !host.exists(path) && !k.config().root.empty() && host.exists(k.config().root + "/" + spec))
+    path = k.config().root + "/" + spec;
+  auto bytes = host.read_file(path);
+  if (!bytes.ok()) { say("grain open: cannot read " + spec + ": " + bytes.error().message); return; }
+  const std::string source(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+  auto compiled = grain::compile_source(source, spec);
+  if (!compiled.ok()) {
+    for (const auto& d : compiled.errors) say(spec + ":" + std::to_string(d.line) + ": " + d.message);
+    return;
+  }
+  if (!grain_display_) grain_display_ = std::make_unique<DesktopGrainDisplay>(grain_apps_);
+  grain::set_display(grain_display_.get());
+
+  auto app = std::make_unique<GrainDesktopApp>();
+  app->path = spec;
+  const size_t slash = path.rfind('/');
+  app->dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+  app->files = std::make_unique<GrainDesktopFiles>(host, app->dir);
+  app->vm = std::make_unique<grain::Vm>();
+  grain::Vm& vm = *app->vm;
+  grain::install_builtins(vm);
+  grain::install_socket_builtins(vm);
+  grain::set_http_trust_root(k.config().root);
+  grain::install_http_builtins(vm);
+  auto sys = std::make_shared<grain::MapObj>();
+  const auto& topo = host.topology();
+  sys->put("arch", grain::Value::string(topo.arch));
+  sys->put("host", grain::Value::string(topo.host_name));
+  sys->put("cpus", grain::Value::integer(static_cast<int64_t>(topo.logical_cpus)));
+  sys->put("memory", grain::Value::integer(static_cast<int64_t>(topo.total_memory)));
+  sys->put("kernel", grain::Value::string(k.self().str()));
+  sys->put("desktop", grain::Value::boolean(true));
+  vm.define_global("sys", grain::Value::object(grain::Type::Map, sys));
+  vm.files = app->files.get();
+  vm.sink = &app->output;
+  vm.step_limit = kGrainStepsPerCall;
+  GrainDesktopApp* raw = app.get();
+  grain_apps_.push_back(std::move(app));
+
+  vm.steps = 0;
+  const auto r = vm.run(compiled.script);
+  for (const auto& line : raw->output) say(line);
+  raw->output.clear();
+  auto drop_app = [this, raw]() {
+    grain::drop_panes(*raw->vm);
+    grain_apps_.erase(std::remove_if(grain_apps_.begin(), grain_apps_.end(),
+                                     [raw](const std::unique_ptr<GrainDesktopApp>& a) { return a.get() == raw; }),
+                      grain_apps_.end());
+  };
+  if (!r.ok) {
+    say(spec + ":" + std::to_string(r.line) + ": " + r.error);
+    for (size_t i = 0; i < r.trace.size(); ++i) say((i == 0 ? "  in " : "  from ") + r.trace[i]);
+    drop_app();
+    return;
+  }
+  const size_t panes = grain::pane_list(vm).size();
+  if (!raw->attached || panes == 0) {
+    say(raw->attached ? spec + ": run_panes() was called with no panes registered"
+                      : spec + " ran to its end without calling run_panes(), so it shows no windows");
+    drop_app();
+    return;
+  }
+  say("grain open: " + spec + " - " + std::to_string(panes) + " window(s)");
+  mark_dirty();
+}
+
+void HardwareCompositor::grain_tick() {
+  if (grain_apps_.empty()) return;
+  auto say = [this](const std::string& line) {
+    std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+    for (auto& w : windows_)
+      if (w.type == WindowType::Terminal) w.lines.push_back(line);
+    canvas_state_.answer_lines.push_back(line);
+  };
+  auto fail = [](GrainDesktopApp& app, const std::string& error) {
+    if (app.failed.empty()) app.failed = error;
+  };
+
+  // 1. Input queued by the handlers (under the state lock), delivered here outside it.
+  std::vector<GrainQueued> events;
+  {
+    std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+    events.swap(grain_pending_);
+  }
+  for (const auto& q : events) {
+    GrainDesktopApp* app = nullptr;
+    uint64_t pane = 0;
+    {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      for (const auto& w : windows_)
+        if (w.window_id == q.window_id && w.type == WindowType::Grain) { app = w.grain_app; pane = w.grain_pane_id; }
+    }
+    if (!app || !app->failed.empty()) continue;
+    auto ev = std::make_shared<grain::MapObj>();
+    ev->put("type", grain::Value::string(q.type));
+    ev->put("pane", grain::Value::integer(static_cast<int64_t>(pane)));
+    if (q.type == "mouse_down" || q.type == "mouse_up" || q.type == "click" || q.type == "mouse_move") {
+      ev->put("x", grain::Value::integer(q.x));
+      ev->put("y", grain::Value::integer(q.y));
+      if (q.type != "mouse_move") ev->put("button", grain::Value::string("left"));
+    } else if (q.type == "wheel") {
+      ev->put("dx", grain::Value::real(0.0));
+      ev->put("dy", grain::Value::real(q.dy));
+    } else if (q.type == "key") {
+      ev->put("key", grain::Value::string(q.key));
+      ev->put("shift", grain::Value::boolean(q.shift));
+      ev->put("ctrl", grain::Value::boolean(q.ctrl));
+      ev->put("alt", grain::Value::boolean(q.alt));
+      ev->put("meta", grain::Value::boolean(false));
+    } else if (q.type == "text") {
+      ev->put("text", grain::Value::string(q.text));
+    }
+    std::string err;
+    app->vm->steps = 0;
+    if (!grain::pane_event(*app->vm, pane, grain::Value::object(grain::Type::Map, ev), err)) fail(*app, err);
+  }
+
+  // 2. Windows follow the panes, app by app.
+  std::vector<GrainDesktopApp*> apps;
+  for (auto& a : grain_apps_) apps.push_back(a.get());
+  for (GrainDesktopApp* app : apps) {
+    grain::Vm& vm = *app->vm;
+    // Closed by the person (a hidden Grain window): the pane hears "close" and goes.
+    std::vector<uint64_t> closed_by_user;
+    {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      for (auto it = windows_.begin(); it != windows_.end();) {
+        if (it->type == WindowType::Grain && it->grain_app == app && !it->visible) {
+          closed_by_user.push_back(it->grain_pane_id);
+          it = windows_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (uint64_t id : closed_by_user) {
+      std::string err;
+      app->vm->steps = 0;
+      if (app->failed.empty() && !grain::pane_closed(vm, id, err)) fail(*app, err);
+      if (app->failed.empty()) continue;
+      grain::drop_panes(vm);   // a program that failed is closed with its window
+    }
+    const auto panes = grain::pane_list(vm);
+    // New panes get windows; windows whose pane the program closed go.
+    std::vector<grain::PaneInfo> need;
+    {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      for (const auto& p : panes) {
+        const bool shown = std::any_of(windows_.begin(), windows_.end(), [&](const WindowSurface& w) {
+          return w.type == WindowType::Grain && w.grain_app == app && w.grain_pane_id == p.id;
+        });
+        if (!shown) need.push_back(p);
+      }
+      windows_.erase(std::remove_if(windows_.begin(), windows_.end(), [&](const WindowSurface& w) {
+                       return w.type == WindowType::Grain && w.grain_app == app &&
+                              std::none_of(panes.begin(), panes.end(), [&](const grain::PaneInfo& p) { return p.id == w.grain_pane_id; });
+                     }),
+                     windows_.end());
+    }
+    for (const auto& p : need) {
+      int open_grain = 0;
+      {
+        std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+        for (const auto& w : windows_) open_grain += w.type == WindowType::Grain;
+      }
+      const int offset = 30 * (open_grain % 8);   // each new window a step down and right of the last
+      // A window opens on a desktop, so the start page steps aside for it (as
+      // the dock's apps do) and the new window comes to the front, with the keyboard.
+      if (canvas_mode_) {
+        canvas_mode_ = false;
+        if (current_workspace_ == CockpitWorkspace::Blank) switch_workspace(CockpitWorkspace::Code);
+      }
+      auto made = create_window(p.title, 140 + offset, 90 + offset, p.width + 2, p.height + 27, WindowType::Grain);
+      if (!made.ok()) { fail(*app, "cannot open a window: " + made.error().message); continue; }
+      {
+        std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+        for (auto& w : windows_)
+          if (w.window_id == *made) { w.grain_app = app; w.grain_pane_id = p.id; }
+      }
+      bring_to_front(*made);
+    }
+    for (const auto& line : app->output) say(line);
+    app->output.clear();
+    if (!app->failed.empty() && !app->failure_reported) {
+      say(app->path + ": " + app->failed);
+      app->failure_reported = true;
+    }
+  }
+  // 3. A program with no panes left is done.
+  for (GrainDesktopApp* app : apps) {
+    if (!grain::pane_list(*app->vm).empty()) continue;
+    {
+      std::lock_guard<aios::hal::Mutex> lock(state_mutex_);
+      windows_.erase(std::remove_if(windows_.begin(), windows_.end(),
+                                    [app](const WindowSurface& w) { return w.type == WindowType::Grain && w.grain_app == app; }),
+                     windows_.end());
+    }
+    say(app->path + ": closed");
+    grain::drop_panes(*app->vm);
+    grain_apps_.erase(std::remove_if(grain_apps_.begin(), grain_apps_.end(),
+                                     [app](const std::unique_ptr<GrainDesktopApp>& a) { return a.get() == app; }),
+                      grain_apps_.end());
+  }
+  if (!grain_apps_.empty()) mark_dirty();   // the programs draw every frame: keep painting
+}
+
+void HardwareCompositor::render_grain_window(WindowSurface& win) {
+  const int W = win.content_width(), H = win.content_height();
+  if (W <= 0 || H <= 0) return;
+  if (static_cast<int>(win.buffer.size()) != W * H) win.buffer.assign(static_cast<size_t>(W) * static_cast<size_t>(H), tok::panel);
+  GrainDesktopApp* app = win.grain_app;
+  if (!app) return;
+  if (!app->failed.empty()) {
+    clear_buffer(win.buffer, tok::panel, W, H);
+    draw_text_to(win.buffer, W, H, 12, 12, "Stopped:", tok::text, Face::UiBold);   // the title bar names the program
+    // The error, word-wrapped to the window's width (a word longer than a line is cut where it must be).
+    const int room = W - 24;
+    int y = 36;
+    std::string line;
+    std::istringstream words(app->failed);
+    auto put = [&](const std::string& l) { if (y < H - 16) draw_text_to(win.buffer, W, H, 12, y, l, tok::dim, Face::UiSmall); y += 18; };
+    for (std::string word; words >> word;) {
+      const std::string trial = line.empty() ? word : line + " " + word;
+      if (text_width(trial, Face::UiSmall) <= room) { line = trial; continue; }
+      if (!line.empty()) put(line);
+      line = word;
+      while (line.size() > 1 && text_width(line, Face::UiSmall) > room) {
+        size_t cut = line.size() - 1;
+        while (cut > 1 && text_width(line.substr(0, cut), Face::UiSmall) > room) --cut;
+        put(line.substr(0, cut));
+        line = line.substr(cut);
+      }
+    }
+    if (!line.empty()) put(line);
+    return;
+  }
+  grain::Vm& vm = *app->vm;
+  // The pane follows its window's size; the program hears "resize".
+  for (const auto& p : grain::pane_list(vm)) {
+    if (p.id != win.grain_pane_id) continue;
+    if (p.width != W || p.height != H) {
+      std::string err;
+      vm.steps = 0;
+      if (!grain::pane_resized(vm, p.id, W, H, err)) { app->failed = err; return; }
+    }
+    break;
+  }
+  std::vector<uint32_t> px;
+  int pw = 0, ph = 0;
+  std::string err;
+  vm.steps = 0;
+  if (!grain::pane_frame(vm, win.grain_pane_id, px, pw, ph, err)) {
+    if (!err.empty()) app->failed = err;
+    return;
+  }
+  for (int y = 0; y < H; ++y) {
+    uint32_t* row = win.buffer.data() + static_cast<size_t>(y) * static_cast<size_t>(W);
+    for (int x = 0; x < W; ++x)
+      row[x] = (x < pw && y < ph) ? (px[static_cast<size_t>(y) * static_cast<size_t>(pw) + static_cast<size_t>(x)] | 0xFF000000u) : tok::panel;
+  }
+}
 
 }  // namespace aios::userland

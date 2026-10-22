@@ -209,6 +209,16 @@ added (`install_builtins` = `install_core_builtins` + `install_aios_builtins`):
 the sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL. A
 standalone grain has the portable standard library only.
 
+On the aios desktop, `grain open file.gr` at the terminal runs a program with
+windows: its panes are desktop windows (moved, resized, closed like any
+other), drawn by its `on_draw` and fed its input. The program is the same as
+in the standalone grain, with one difference: `run_panes()` returns at once,
+because the desktop, not the program, runs the loop - code after it runs, and
+the program lives while it has panes. Its relative paths start at its own
+directory. A callback is held to 50 million instructions, so a runaway one
+stops with an error in its window instead of freezing the desktop.
+`tools/grain-desktop/check.sh` drives this headless.
+
 ## Status
 
 | | macOS arm64 | macOS x86_64 | Linux x86_64 | Linux arm64 | Windows x64 |

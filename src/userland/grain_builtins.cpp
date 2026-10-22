@@ -5962,7 +5962,7 @@ struct GrainPane {
   Value key_cb;
   Value custom_data;
   uint32_t compositor_window_id = 0;
-  const Vm* owner = nullptr;   // the VM that registered it: its callbacks are that VM's closures
+  uint64_t owner = 0;   // the serial of the VM that registered it: its callbacks are that VM's closures
 };
 
 // Every VM's panes, each tagged with its owner. Inside aios several VMs live at
@@ -5977,7 +5977,7 @@ static std::vector<std::shared_ptr<GrainPane>> panes_of(const Vm& vm) {
   std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
   std::vector<std::shared_ptr<GrainPane>> out;
   for (const auto& p : g_grain_panes)
-    if (p->owner == &vm) out.push_back(p);
+    if (p->owner == vm.serial()) out.push_back(p);
   return out;
 }
 
@@ -5985,6 +5985,14 @@ static void add_pane(const std::shared_ptr<GrainPane>& pane) {
   std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
   pane->id = g_next_grain_pane_id++;
   g_grain_panes.push_back(pane);
+}
+
+void drop_panes(const Vm& vm) {
+  std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
+  const uint64_t owner = vm.serial();
+  g_grain_panes.erase(std::remove_if(g_grain_panes.begin(), g_grain_panes.end(),
+                                     [owner](const std::shared_ptr<GrainPane>& p) { return p->owner == owner; }),
+                      g_grain_panes.end());
 }
 
 static bool remove_pane(const std::shared_ptr<GrainPane>& pane) {
@@ -6070,7 +6078,7 @@ Value bi_register_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   }
 
   auto pane = std::make_shared<GrainPane>();
-  pane->owner = &vm;
+  pane->owner = vm.serial();
   pane->title.clear();
   pane->width = 800;
   pane->height = 600;

@@ -307,6 +307,8 @@ class Vm {
   Value* find_global(const std::string& name);
   // Every global's name, sorted (what an editor offers to complete).
   std::vector<std::string> global_names() const;
+  // This VM's number, unique for the life of the process (never an address, which a later VM can reuse).
+  uint64_t serial() const;
   // Drops every global not named in `keep`: a sandbox, since what a program
   // cannot name it cannot call. Only before the first run - the global inline
   // cache assumes globals are never erased once a chunk has looked one up.
@@ -418,6 +420,9 @@ bool pane_event(Vm& vm, uint64_t id, const Value& event, std::string& error);
 bool pane_resized(Vm& vm, uint64_t id, int width, int height, std::string& error);
 // The window was closed: the pane gets a "close" event and is unregistered.
 bool pane_closed(Vm& vm, uint64_t id, std::string& error);
+// Unregisters every pane of `vm`, with no callbacks: for an embedder that is
+// done with the VM (its program ended, or its app was closed).
+void drop_panes(const Vm& vm);
 
 }  // namespace aios::userland::grain
 

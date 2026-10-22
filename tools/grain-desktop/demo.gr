@@ -1,0 +1,33 @@
+# tools/grain-desktop: opened with `grain open` in the headless desktop; logs every event it gets.
+let clicks = 0
+let typed = ""
+write_file("events.log", "")
+fn log(line) { append_file("events.log", line + "\n") }
+create_pane({
+  "title": "grain on the desktop",
+  "width": 300,
+  "height": 160,
+  "on_draw": fn (cv) {
+    canvas_clear(cv, "#1e2a44")
+    canvas_fill_rect(cv, 10, 10, 20 + clicks * 40, 30, "#ff3030")
+  },
+  "on_event": fn (p, e) {
+    if e.type == "mouse_move" { return nil }
+    let line = e.type
+    if e.type == "click" or e.type == "mouse_down" or e.type == "mouse_up" { line = line + " at " + str(e.x) + "," + str(e.y) }
+    if e.type == "key" { line = line + " " + e.key }
+    if e.type == "text" { typed = typed + e.text  line = line + " " + repr(e.text) }
+    if e.type == "wheel" { line = line + " dy=" + str(e.dy) }
+    log(line)
+  },
+  "on_click": fn (p, e) { clicks = clicks + 1 },
+  "on_key": fn (p, e) {
+    if e.key == "escape" {
+      log("typed: " + typed + ", clicks: " + str(clicks))
+      unregister_pane(p.id)
+    }
+  }
+})
+print("demo: showing its window")
+run_panes()
+print("demo: run_panes returned at once on the desktop")

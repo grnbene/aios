@@ -19,6 +19,8 @@
 #include "aios/userland/contacts_client.hpp"
 #include "aios/userland/calendar_client.hpp"
 #include "aios/userland/face.hpp"
+
+namespace aios::userland::grain { class Display; }
 #include "aios/userland/patch_transaction.hpp"
 #include "aios/userland/web.hpp"
 #include "aios/userland/button_suite.hpp"
@@ -103,6 +105,7 @@ enum class WindowType {
   Calendar,   // native C++ Apple Calendar / iCal & agenda
   FaceApp,    // native Face application runner & interactive app desk
   Inspector,  // universal in-desktop behavioral inspector & diagnostic studio
+  Grain,      // a grain program's pane: `grain open file.gr`, its frames drawn by the program
   Custom
 };
 
@@ -546,6 +549,12 @@ struct WindowSurface {
   std::vector<std::string> face_app_list;
   int face_app_selected_index = 0;
   uint64_t face_app_disk_mark = 0;
+
+  // --- A grain program's pane (WindowType::Grain) ---------------------------
+  // The program (its VM) belongs to the compositor's grain_apps_; the window
+  // shows one of its panes, by id, and draws what the pane's on_draw paints.
+  struct GrainDesktopApp* grain_app = nullptr;
+  uint64_t grain_pane_id = 0;
   bool face_app_needs_reload = false;
 
   // --- Universal In-Desktop Inspector & Studio (WindowType::Inspector) ------
@@ -1173,6 +1182,25 @@ class HardwareCompositor {
   void face_app_reload(WindowSurface& win, Kernel& k);
   void face_app_click(WindowSurface& win, int rel_x, int rel_y);
 
+  // grain programs on the desktop. `grain open file.gr` (typed at the
+  // terminal) runs the program here, on the desktop's own thread, and keeps its
+  // VM while it has panes; run_panes() in it shows them as Grain windows. Input
+  // to those windows is queued under the state lock and delivered by
+  // grain_tick(), once a frame, outside it - a callback that opens a pane or
+  // prints must be able to reach the compositor.
+  void grain_open(const std::string& path, Kernel& k);
+  void grain_tick();
+  void render_grain_window(WindowSurface& win);
+  struct GrainQueued {
+    uint32_t window_id = 0;
+    std::string type;          // mouse_down, mouse_up, click, mouse_move, wheel, key, text
+    int x = 0, y = 0;
+    double dy = 0;
+    std::string key, text;
+    bool ctrl = false, shift = false, alt = false;
+  };
+  void grain_queue(GrainQueued ev);   // the state lock is held by the caller
+
   // Native Universal In-Desktop Inspector & Studio
   void render_inspector_window(WindowSurface& win, Kernel& k);
   void inspector_click(WindowSurface& win, int rel_x, int rel_y, std::string& to_run);
@@ -1694,6 +1722,11 @@ class HardwareCompositor {
   void render_draw_face();
   std::string start_url_;
   std::vector<std::string> scripted_;
+  // grain programs open on the desktop, and their queued input (see grain_open).
+  std::vector<std::unique_ptr<struct GrainDesktopApp>> grain_apps_;
+  std::vector<GrainQueued> grain_pending_;
+  uint32_t grain_press_win_ = 0;   // the Grain window a button went down in, for its mouse_up and click
+  std::unique_ptr<aios::userland::grain::Display> grain_display_;
   bool headless_ = false;
   // Everything a console in another process leaves in the run directory for
   // this desktop to act on. Called once a frame from render_desktop, which is

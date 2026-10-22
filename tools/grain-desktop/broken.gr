@@ -1,0 +1,3 @@
+# tools/grain-desktop: its draw callback fails; its window must say so and the desktop carry on.
+create_pane({"title": "broken", "width": 220, "height": 100, "on_draw": fn (cv) { let x = nil  x() }})
+run_panes()
