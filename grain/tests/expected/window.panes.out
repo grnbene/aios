@@ -1,0 +1,17 @@
+run_panes returned: true
+  mouse_down left at 15,12
+  mouse_up left at 15,12
+  click left at 15,12
+  mouse_down right at 40,30
+  mouse_up right at 40,30
+  click right at 40,30
+  key a +shift
+  text "hé"
+  wheel dy=-3.0
+  resize 300x150
+  key escape
+clicks: 2
+last frame size: [300, 150]
+background drawn to the new size: true
+bar drawn to clicks: true true
+panes left: 0

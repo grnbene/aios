@@ -44,6 +44,39 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid` |
 | Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
+| Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
+
+## Windows
+
+A pane is a window: its `on_draw(canvas, pane)` paints a frame (about 60 a
+second), and input arrives as events. `run_panes()` returns when every pane has
+been closed - by its window, or by the program with `unregister_pane`.
+
+```grain
+let n = 0
+create_pane({
+  "title": "Counter", "width": 240, "height": 120,
+  "on_draw": fn (cv) {
+    canvas_clear(cv, "#1e1e2e")
+    canvas_fill_text(cv, "clicked " + str(n) + " times", 20, 60, "#ffffff")
+  },
+  "on_click": fn (p, e) { n = n + 1 },
+  "on_key": fn (p, e) { if e.key == "escape" { unregister_pane(p.id) } }
+})
+run_panes()
+```
+
+Events: `mouse_down`, `mouse_up`, `click` (`x`, `y`, `button`), `mouse_move`,
+`wheel` (`dx`, `dy`), `key` and `key_up` (`key`, `shift`, `ctrl`, `alt`,
+`meta`), `text` (`text`, what was typed), `resize` (`width`, `height`) and
+`close`. Coordinates are the pane's own, on any screen density.
+`run_panes({frames: n, script: [events...]})` stops after n frames and plays
+the scripted input first - the window test does this headless with
+`SDL_VIDEODRIVER=dummy`.
+
+Windows need SDL2 when grain is built (`brew install sdl2`, `apt install
+libsdl2-dev`, `vcpkg install sdl2:x64-windows-static`); without it grain builds
+the same and `run_panes()` says it has no display.
 
 Strings are bytes: `len`, indexing, `slice`, `find` and regex offsets count
 bytes of UTF-8.
@@ -110,6 +143,6 @@ standalone grain has the portable standard library only.
 | interpreter | yes | yes | yes | yes | yes |
 | JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
-Built and tested so far: macOS arm64 (49 of 49 cases, and the live HTTPS checks). The others are set up
+Built and tested so far: macOS arm64 (50 of 50 cases, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
 (this README, `.github/workflows/grain.yml`, `scripts/build-linux.sh`) and not
 yet built.

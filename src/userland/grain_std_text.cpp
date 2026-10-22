@@ -153,7 +153,8 @@ Value bi_format(Vm&, std::vector<Value>& args, std::string& error) {
       if (next >= args.size()) { error = "format(): more {} than values (" + std::to_string(args.size() - 1) + ")"; return Value::nil(); }
       v = &args[next++];
     } else if (std::all_of(key.begin(), key.end(), [](char k) { return k >= '0' && k <= '9'; })) {
-      const size_t at = static_cast<size_t>(std::stoul(key)) + 1;
+      // strtoull, not stoul: bare metal builds with exceptions off (and the digits were checked above).
+      const size_t at = static_cast<size_t>(std::strtoull(key.c_str(), nullptr, 10)) + 1;
       if (at >= args.size()) { error = "format(): {" + key + "} but only " + std::to_string(args.size() - 1) + " value(s)"; return Value::nil(); }
       v = &args[at];
     } else {

@@ -24,7 +24,7 @@ function(grain_case name workdir status)
             -DEXPECTED=${EXPECTED_DIR}/${name}.out -DACTUAL=${CMAKE_CURRENT_BINARY_DIR}/actual/${name}.out
             -DSTATUS=${status} -P ${RUNNER})
   set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
-    COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
+    COMMAND ${CMAKE_COMMAND} -E env SDL_VIDEODRIVER=dummy ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
             -DEXPECTED=${EXPECTED_DIR}/${name}.out -DSTATUS=${status} -DUPDATE=1 -P ${RUNNER}
     PARENT_SCOPE)
 endfunction()
@@ -67,8 +67,6 @@ grain_case(cli.unknown_command ${CLI_CASES} 64 frobnicate)
 grain_case(cli.version ${CLI_CASES} 0 version)
 grain_case(cli.dis ${CLI_CASES} 0 dis args.gr)
 
-add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
-  COMMENT "rewriting grain/tests/expected from the current build")
 
 # The HTTP client against a local server (tests/net): needs Python 3 to run the
 # server, and nothing beyond this machine. The live HTTPS checks
@@ -84,3 +82,15 @@ if(Python3_Interpreter_FOUND)
 else()
   message(STATUS "grain: no Python 3, so the HTTP client test (grain.net.http_local) is not run")
 endif()
+
+# Panes as windows (run_panes), driven by scripted input through SDL's own event
+# queue, headless: SDL's dummy video driver needs no screen. Only in a grain
+# built with SDL2.
+if(GRAIN_SDL2_TARGET)
+  grain_case(window.panes ${CMAKE_CURRENT_SOURCE_DIR}/window 0 run panes.gr)
+  set_tests_properties(grain.window.panes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
+endif()
+
+# Last, so it rewrites every case above (each headless: a window case shows on SDL's dummy display).
+add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
+  COMMENT "rewriting grain/tests/expected from the current build")
