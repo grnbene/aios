@@ -17,6 +17,7 @@
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/face.hpp"
 #include "aios/userland/web.hpp"
+#include "aios/userland/web_type.hpp"
 
 namespace aios::userland {
 
@@ -216,11 +217,6 @@ HostBindings surface_bindings(Kernel& k, Surface who, const std::string& dream);
 // The dream a surface url belongs to (…/dreams/<name>/…), or "".
 std::string dream_of_url(const std::string& url);
 
-// The characters in `text` this display cannot draw and has no stand-in for
-// (they would come out as '?'), each once, space-separated. What a look at a
-// surface reports back to the mind that wrote it.
-std::string display_glyph_gaps(const std::string& text);
-
 // Bind a pane's browser to the machine for whatever it is about to show, as
 // the dream's own entity when the url is a dream's surface.
 void web_pane_bind(HardwareCompositor& c, WebPane& pane, Kernel& k, const std::string& url, int view_h);
@@ -247,28 +243,7 @@ constexpr int kWebKeyZoomIn = 0x1100, kWebKeyZoomOut = 0x1101, kWebKeyZoomReset 
 // command surface, so both paths land in the same place.
 void web_pane_go(HardwareCompositor& c, WindowSurface& win, Kernel& k, const std::string& url);
 
-// ---------------------------------------------------------------------------
-// Type at an arbitrary pixel size.
-//
-// The atlas ships four faces at one size each (UI and UI_BOLD at 15px, MONO at
-// 14px, UI_SMALL at 11px), because it is 8-bit coverage rasterised at build
-// time by FreeType and there is no font engine in ring 0. A document asks for
-// 30px headings and 12px captions, so anything that is not the face's own size
-// is resampled from its coverage — bilinearly, which keeps the antialiasing
-// that made the desktop's text look like text.
-int web_text_width(const std::string& text, const web::FontKey& f);
-int web_line_height(const web::FontKey& f);
-int web_ascent(const web::FontKey& f);
-// A rectangle a draw is confined to, in buffer coordinates. `overflow: hidden`
-// is a promise a page makes about where its content stops, and the painter used
-// to ignore it entirely: layout computed a clip for every fragment inside such
-// a box and nothing ever read it, so a long line ran straight over whatever was
-// beside it.
-struct DrawClip {
-  int x0 = -(1 << 28), y0 = -(1 << 28), x1 = 1 << 28, y1 = 1 << 28;
-  bool has(int x, int y) const { return x >= x0 && x < x1 && y >= y0 && y < y1; }
-};
-
+// Measuring text, DrawClip and drawing into a buffer: userland/web_type.hpp.
 void web_draw_text(HardwareCompositor& c, std::vector<uint32_t>& buf, int bw, int bh, int x, int y,
                    const std::string& text, uint32_t color, const web::FontKey& f,
                    const DrawClip& clip = DrawClip{});

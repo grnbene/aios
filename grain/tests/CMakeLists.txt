@@ -89,6 +89,9 @@ endif()
 if(GRAIN_SDL2_TARGET)
   grain_case(window.panes ${CMAKE_CURRENT_SOURCE_DIR}/window 0 run panes.gr)
   set_tests_properties(grain.window.panes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
+  # Face widgets (ui.*) in a pane: fields, Enter, buttons found by ui.layout, and a view that fails.
+  grain_case(window.face ${CMAKE_CURRENT_SOURCE_DIR}/window 2 run face.gr)
+  set_tests_properties(grain.window.face PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 60)
 endif()
 
 # grain build: one executable from a program and its assets, run from elsewhere.

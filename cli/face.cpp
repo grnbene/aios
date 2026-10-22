@@ -160,9 +160,8 @@ FaceLook face_look(Session& s, const std::string& url, int frames, const std::ve
   // of why what it draws is poor — and a model running on this machine can
   // read images, so a path to a PNG is something it can open and look at.
   if (!rt.paint_cmds().empty()) {
-    userland::HardwareCompositor surface((uint32_t)pane_w, (uint32_t)pane_h);
     std::vector<uint32_t> px((size_t)pane_w * (size_t)pane_h, 0xFF0F1318u);
-    rt.paint(surface, px, pane_w, pane_h, 0, 0);
+    rt.paint(px, pane_w, pane_h, 0, 0);
     // Encoded at full size. This used to be halved and 2x2-averaged, because
     // the encoder stored its pixels rather than compressing them and a full
     // pane was seven megabytes. It filters and deflates now — the same picture
@@ -191,9 +190,8 @@ FaceLook face_look(Session& s, const std::string& url, int frames, const std::ve
   // whether any of it moved. Each finding carries its number so the correction
   // that follows is aimed at something real rather than at "make it better".
   if (!rt.paint_cmds().empty() && pane_w > 0 && pane_h > 0) {
-    userland::HardwareCompositor surf((uint32_t)pane_w, (uint32_t)pane_h);
     std::vector<uint32_t> a((size_t)pane_w * (size_t)pane_h, 0xFF0F1318u);
-    rt.paint(surf, a, pane_w, pane_h, 0, 0);
+    rt.paint(a, pane_w, pane_h, 0, 0);
 
     // The background is whatever colour the most pixels are, not the colour
     // that was cleared: a face that lays down a full-pane gradient and draws on
@@ -264,7 +262,7 @@ FaceLook face_look(Session& s, const std::string& url, int frames, const std::ve
     if (rt.has_frame_rule()) {
       tick();
       std::vector<uint32_t> b((size_t)pane_w * (size_t)pane_h, 0xFF0F1318u);
-      rt.paint(surf, b, pane_w, pane_h, 0, 0);
+      rt.paint(b, pane_w, pane_h, 0, 0);
       size_t moved = 0;
       for (int y = ry; y < ry + rh; ++y)
         for (int x = rx; x < rx + rw; ++x) {
