@@ -39503,6 +39503,22 @@ static std::string derived_pushdown_sql(const ParsedSelectBranch& outer, const P
   const ParsedSelectStatement inner_st = parse_select_sql(src.subquery_sql);
   if (!inner_st.ok || inner_st.branches.size() != 1 || !inner_st.union_tail.empty()) return "";
   const ParsedSelectBranch& in = inner_st.branches[0];
+  // `SELECT <row-wise items> FROM (inner) x LIMIT n [OFFSET m]` and nothing
+  // else outside: the derived table is the inner's first n+m rows in the
+  // inner's own order, whatever the inner's shape, and the outer LIMIT then
+  // runs over those as written. Every row used to be made into the table
+  // first: a page of 50,000 off an 845k-row join with two correlated
+  // subqueries per row took 100 s; the same SELECT with the LIMIT on it, 1 s.
+  if (!outer.where && outer.limit >= 0 && outer.limit < (1LL << 40) && outer.offset >= 0 && outer.offset < (1LL << 40) &&
+      outer.order_by.empty() && !outer.distinct && in.limit < 0 && in.offset == 0) {
+    bool rowwise = true;
+    for (const SelectItem& it : outer.items)
+      if (it.expr && (expr_has_aggregate(it.expr) || expr_has_window(it.expr.get()) || expr_assigns(it.expr.get()))) rowwise = false;
+    std::string body = src.subquery_sql;
+    while (!body.empty() && (body.back() == ';' || body.back() == ' ' || body.back() == '\n' || body.back() == '\t' || body.back() == '\r')) body.pop_back();
+    if (rowwise && !body.empty() && body.back() != ')')   // a parenthesized inner would need the LIMIT inside
+      return body + " LIMIT " + std::to_string(outer.limit + outer.offset);
+  }
   if (in.group_by.empty() || in.having || !in.order_by.empty() || in.limit >= 0 || in.offset != 0 || in.distinct ||
       !in.windows.empty())
     return "";
