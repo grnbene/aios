@@ -9,10 +9,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <vector>
 
-#include "aios/userland/compositor.hpp"
 #include "aios/userland/face.hpp"
 
 using namespace aios;
@@ -101,9 +101,8 @@ int main() {
   for (int i = 0; i < 10; ++i) game_rt.frame(16.0, 1000, 700);
 
   // Rasterize game to compositor buffer
-  HardwareCompositor comp;
   std::vector<uint32_t> game_buf(1000 * 700, 0);
-  game_rt.paint(comp, game_buf, 1000, 700, 0, 0);
+  game_rt.paint(game_buf, 1000, 700, 0, 0);
 
   size_t game_colored_px = 0;
   for (uint32_t px : game_buf) {

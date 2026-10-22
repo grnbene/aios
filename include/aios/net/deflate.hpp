@@ -12,6 +12,7 @@
 #include <string>
 
 #include "aios/core/bytes.hpp"
+#include "aios/core/result.hpp"
 
 namespace aios::net {
 
@@ -37,5 +38,10 @@ bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect);
 // byte, `expect` (when known) sizes `out` once. False, with the reason in
 // `why`, on anything that does not check out.
 bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* end_offset, size_t expect, std::string* why);
+
+// A whole zlib stream (RFC 1950: header, deflate blocks, Adler-32): what a PNG's
+// image data is. The system zlib where the build has one, else the in-tree
+// inflater; the checksum is checked, so damaged data is an error, never pixels.
+Result<ByteBuffer> zlib_inflate(ByteSpan data);
 
 }  // namespace aios::net
