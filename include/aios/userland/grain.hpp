@@ -327,8 +327,21 @@ class Vm {
   void close_upvalues_from(size_t from);
 };
 
-// Installs print/len/str/num/type/push/keys/range/... plus the handful of
-// bridges that make this a language ON this machine rather than beside it.
+// The portable standard library: print/len/str/num/type/push/keys/range/...,
+// strings, math, JSON, files (through Vm::files), the canvas and its widgets.
+// Everything a grain built without aios has (grain_builtins.cpp).
+void install_core_builtins(Vm& vm);
+
+// Message digests over a string's bytes, as hex (grain_std_hash.cpp); part of
+// install_core_builtins.
+void install_hash_builtins(Vm& vm);
+
+// The bridges that make this a language ON aios rather than beside it: the
+// sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL
+// (grain_aios.cpp).
+void install_aios_builtins(Vm& vm);
+
+// Both: what every VM inside aios gets.
 void install_builtins(Vm& vm);
 
 // udp_* / tcp_* over hal::net (grain_sockets.cpp). Separate from

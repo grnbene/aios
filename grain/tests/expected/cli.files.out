@@ -1,0 +1,5 @@
+exists after write: true
+lines: 2
+content: "first line\nsecond line\n"
+listed: true
+exists after delete: false

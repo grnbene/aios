@@ -1,0 +1,5 @@
+# Never ends: only --steps stops it.
+let n = 0
+while true {
+  n = n + 1
+}

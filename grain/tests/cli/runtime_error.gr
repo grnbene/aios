@@ -1,0 +1,5 @@
+# Compiles, then fails when it calls nil.
+let f = nil
+print("before the call")
+f()
+print("never printed")

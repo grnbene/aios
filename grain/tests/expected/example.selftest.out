@@ -1,0 +1,143 @@
+strings
+  ok    split
+  ok    join
+  ok    upper/lower
+  ok    trim
+  ok    replace every
+  ok    slice
+  ok    find
+  ok    index_of/last
+  ok    starts/ends/contains
+  ok    pad
+  ok    repeat
+  ok    ord/chr
+  ok    chars
+  ok    classes
+  ok    utf-8 length is bytes
+numbers
+  ok    floor/ceil/trunc
+  ok    round half away
+  ok    round to places
+  ok    abs/sign/clamp
+  ok    min/max
+  ok    int() truncates
+  ok    int() parses
+  ok    real() parses
+  ok    sqrt 2
+  ok    pow
+  ok    sin pi/6
+  ok    cos pi/3
+  ok    tan pi/4
+  ok    asin/acos/atan
+  ok    atan2
+  ok    exp/log
+  ok    log2/log10
+  ok    hypot
+  ok    deg/rad
+  ok    e
+  ok    lerp
+  ok    smoothstep mid
+collections
+  ok    range
+  ok    map/filter/reduce
+  ok    sort strings
+  ok    reverse
+  ok    flatten
+  ok    zip
+  ok    enumerate
+  ok    take/drop
+  ok    unique
+  ok    insert/remove_at
+  ok    any/all
+  ok    find_if
+  ok    keys/values
+  ok    merge later wins
+  ok    entries round trip
+encodings
+  ok    json out
+  ok    json in
+  ok    base64 (RFC 4648)
+  ok    base64 padding
+  ok    base64 back
+  ok    hex
+  ok    hex back
+  ok    url encode
+  ok    url decode
+crypto (published digests)
+  ok    sha256 abc
+  ok    sha256 empty
+  ok    keccak256 empty
+  ok    haversine London-Paris km
+errors
+  ok    pcall catches
+  ok    error message kept
+  ok    pcall ok path
+  ok    pcall passes args
+  ok    wrong type is an error
+randomness and time
+  ok    seed replays
+  ok    rand in [0,1)
+  ok    wall clock is after 2025
+canvas
+  ok    size
+  ok    filled pixel is red
+  ok    outside stays clear
+  ok    ppm header
+  ok    hex round trip
+  ok    alpha round trip
+files
+  ok    absent before
+  ok    write returns bytes
+  ok    exists after write
+  ok    read back
+  ok    append
+  ok    64 KB write spans clusters
+  ok    overwrite shrinks
+  ok    list_dir sees it
+  ok    list_dir size
+  ok    delete
+  ok    gone after delete
+  ok    reading a missing file is an error
+bitwise & compound assignment
+  ok    bitwise and
+  ok    bitwise or
+  ok    bitwise xor
+  ok    bitwise not
+  ok    bitwise not non-zero
+  ok    bitwise shift left
+  ok    bitwise shift right
+  ok    hex and binary literals
+  ok    shift by 63
+  ok    shift out left
+  ok    shift out right keeps sign
+  ok    negative shift is an error
+  ok    bits are integers only
+  ok    xor is not power
+  ok    && and || are and/or
+  ok    compound add
+  ok    compound sub
+  ok    compound mul
+  ok    compound div
+  ok    compound mod
+  ok    compound bitand
+  ok    compound bitor
+  ok    compound bitxor
+  ok    compound shl
+  ok    compound shr
+  ok    a[k] op= v evaluates k once
+  ok    a.f op= v evaluates a once
+  ok    += on strings
+ternary & string interpolation
+  ok    ternary true branch
+  ok    ternary false branch
+  ok    ternary nested
+  ok    f-string basic
+  ok    f-string expr
+  ok    f-string doubled braces
+  ok    f-string backslash braces
+  ok    f-string map literal inside
+  ok    f-string brace in a string inside
+  ok    f-string ternary inside
+  ok    f-string alone
+
+selftest: 131 checks, all agreed

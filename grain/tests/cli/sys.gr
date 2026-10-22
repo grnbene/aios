@@ -1,0 +1,7 @@
+# `sys` describes the machine. Its values differ between machines, so this
+# prints only what must hold on every one of them.
+print("os known:", contains(["macos", "linux", "windows", "freebsd"], sys.os))
+print("arch named:", type(sys.arch) == "string" and len(sys.arch) > 0)
+print("cpus at least one:", sys.cpus >= 1)
+print("memory reported:", sys.memory > 0)
+print("version is a string:", type(sys.version) == "string")

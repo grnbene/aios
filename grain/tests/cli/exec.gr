@@ -1,0 +1,5 @@
+# sys_exec runs a command line through the host's shell (sh, or cmd on Windows).
+let r = sys_exec("echo hello")
+print("ok:", r.ok, "code:", r.code, "output:", repr(trim(r.output)))
+let f = sys_exec("exit 3")
+print("ok:", f.ok, "code:", f.code)

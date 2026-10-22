@@ -1,0 +1,51 @@
+numbers
+  ok    int stays int = 42
+  ok    division is real = 3.5
+  ok    modulo = 2
+  ok    precedence = 14
+  ok    unary and parens = -10
+  ok    int equals real = true
+  ok    big integer = 9007199254740994
+  ok    mixed promotes = 1.5
+truth
+  ok    zero is not false = true
+  ok    empty string is not false = true
+  ok    nil is false = "fallback"
+  ok    short circuit = false
+  ok    not = true
+strings
+  ok    concat = "grain"
+  ok    index = "r"
+  ok    negative index = "n"
+  ok    slice = "rai"
+  ok    split then join = "a-b-c"
+lists and maps
+  ok    push = [3, 1, 2, 4]
+  ok    sort = [1, 2, 3, 4]
+  ok    concat = [1, 2]
+  ok    index assignment = [0, 9]
+  ok    field set = 3
+  ok    keys keep order = ["a", "b", "c"]
+  ok    missing key is nil = nil
+  ok    has distinguishes = false
+control flow
+  ok    while = 10
+  ok    for over list = 6
+  ok    for over map walks keys = ["x", "y"]
+  ok    for over string = ["a", "b", "c"]
+  ok    break = 4
+  ok    continue = 25
+  ok    else if chain = "zero"
+functions
+  ok    recursion = 3628800
+  ok    first class = 42
+  ok    closure captures = 15
+  ok    shadowing in a block = 1
+  ok    no return means nil = nil
+the machine
+  ok    sys.arch is a string = "string"
+  ok    sys.cpus is an int = "int"
+  ok    this machine has cores = true
+  ok    this machine has memory = true
+
+tour: every check agreed

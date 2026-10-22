@@ -1,0 +1,5 @@
+before
+e1.gr:1: cannot add int and string
+  in inner (line 1)
+  from outer (line 2)
+  from e1.gr (line 4)

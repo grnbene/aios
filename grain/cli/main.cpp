@@ -1,0 +1,219 @@
+// The standalone `grain` program: the language without aios around it.
+//
+// The same lexer, parser, compiler, VM and standard library `aios grain` runs,
+// with the host operating system where aios would be: files on the host's own
+// filesystem, its processes, its sockets, and a `sys` map describing it. What
+// only exists inside aios (the sidecar, ASQL, the SAT solver) is not here.
+//
+// Exit status: 0 the program ran to its end, 1 it did not compile, 2 it stopped
+// on a runtime error, 64 the command line was wrong.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
+
+#include "aios/userland/grain.hpp"
+#include "grain_net.hpp"
+#include "host.hpp"
+
+#ifndef GRAIN_VERSION
+#define GRAIN_VERSION "0.0.0-dev"
+#endif
+
+namespace g = aios::userland::grain;
+
+namespace {
+
+constexpr int kExitOk = 0, kExitCompile = 1, kExitRuntime = 2, kExitUsage = 64;
+
+struct Options {
+  uint64_t steps = 0;     // 0: run until the program ends
+  bool jit = true;
+};
+
+void usage(std::ostream& o) {
+  o << "grain " GRAIN_VERSION " - a small, fast, embeddable language\n"
+    << "\n"
+    << "usage:\n"
+    << "  grain <file.gr> [args...]         run a program (same as grain run)\n"
+    << "  grain run <file.gr> [args...]     run a program; `args` holds what follows it\n"
+    << "  grain eval <source...>            run one line and print its value\n"
+    << "  grain repl                        read and run lines until EOF or .quit\n"
+    << "  grain check <file.gr>...          compile only and report every error\n"
+    << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
+    << "  grain version                     print the version\n"
+    << "\n"
+    << "options (before the subcommand):\n"
+    << "  --steps <n>                       stop a program after n instructions\n"
+    << "  --no-jit                          interpret everything\n";
+}
+
+bool read_source(const std::string& path, std::string& out) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  out = ss.str();
+  return true;
+}
+
+void report_compile(const std::string& origin, const std::vector<g::Diagnostic>& errs) {
+  for (const auto& d : errs) std::cerr << origin << ":" << d.line << ": " << d.message << "\n";
+}
+
+void report_runtime(const std::string& origin, const g::Vm::RunResult& r) {
+  std::cerr << origin << ":" << r.line << ": " << r.error << "\n";
+  for (size_t i = 0; i < r.trace.size(); ++i) std::cerr << (i == 0 ? "  in " : "  from ") << r.trace[i] << "\n";
+}
+
+// One VM set up the same way for a file, a one-liner and the REPL, so the three
+// cannot disagree about what the language has.
+void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& script_args) {
+  g::install_core_builtins(vm);
+  g::install_socket_builtins(vm);
+  g::install_window_builtins(vm);
+  aios::cli::install_grain_net(vm);
+  grain_cli::install_process(vm);
+  grain_cli::install_sys(vm, GRAIN_VERSION);
+  grain_cli::install_args(vm, script_args);
+  vm.files = &grain_cli::host_files();
+  vm.step_limit = opt.steps;
+  vm.jit_enabled = opt.jit;
+}
+
+int run_file(const Options& opt, const std::string& path, const std::vector<std::string>& script_args) {
+  std::string source;
+  if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; return kExitUsage; }
+  auto compiled = g::compile_source(source, path);
+  if (!compiled.ok()) { report_compile(path, compiled.errors); return kExitCompile; }
+  g::Vm vm;
+  prepare(vm, opt, script_args);
+  auto r = vm.run(compiled.script);
+  if (!r.ok) { report_runtime(path, r); return kExitRuntime; }
+  return kExitOk;
+}
+
+int eval_line(const Options& opt, const std::string& source) {
+  auto compiled = g::compile_source(source, "<eval>", true);
+  if (!compiled.ok()) { report_compile("<eval>", compiled.errors); return kExitCompile; }
+  g::Vm vm;
+  prepare(vm, opt, {});
+  auto r = vm.run(compiled.script);
+  if (!r.ok) { report_runtime("<eval>", r); return kExitRuntime; }
+  if (r.value.type != g::Type::Nil) std::cout << r.value.repr() << "\n";
+  return kExitOk;
+}
+
+// One VM for the whole session: `let x = 1` on one line is still there on the
+// next. Each line is its own script, compiled against what earlier lines left.
+int repl(const Options& opt) {
+  const bool tty = isatty(fileno(stdin)) != 0;
+  if (tty) std::cout << "grain " GRAIN_VERSION " - .quit or EOF to leave\n";
+  g::Vm vm;
+  prepare(vm, opt, {});
+  std::string line;
+  int status = kExitOk;
+  for (;;) {
+    if (tty) std::cout << "> " << std::flush;
+    if (!std::getline(std::cin, line)) break;
+    if (line == ".quit" || line == ".exit") break;
+    if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+    auto compiled = g::compile_source(line, "<repl>", true);
+    if (!compiled.ok()) { report_compile("<repl>", compiled.errors); status = kExitCompile; continue; }
+    auto r = vm.run(compiled.script);
+    if (!r.ok) { report_runtime("<repl>", r); status = kExitRuntime; continue; }
+    if (r.value.type != g::Type::Nil) std::cout << r.value.repr() << "\n";
+  }
+  if (tty) std::cout << "\n";
+  // Piped in, a REPL is a script read line by line: its status is whether every line ran.
+  return tty ? kExitOk : status;
+}
+
+int check_files(const std::vector<std::string>& paths) {
+  int status = kExitOk;
+  for (const auto& path : paths) {
+    std::string source;
+    if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; status = kExitUsage; continue; }
+    auto compiled = g::compile_source(source, path);
+    if (!compiled.ok()) { report_compile(path, compiled.errors); if (status == kExitOk) status = kExitCompile; }
+  }
+  return status;
+}
+
+int disassemble(const std::string& path) {
+  std::string source;
+  if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; return kExitUsage; }
+  auto compiled = g::compile_source(source, path);
+  if (!compiled.ok()) { report_compile(path, compiled.errors); return kExitCompile; }
+  std::cout << g::disassemble(*compiled.script);
+  return kExitOk;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::vector<std::string> a(argv + 1, argv + argc);
+  Options opt;
+  size_t i = 0;
+  for (; i < a.size() && a[i].rfind("--", 0) == 0; ++i) {
+    if (a[i] == "--steps" && i + 1 < a.size()) {
+      char* end = nullptr;
+      opt.steps = std::strtoull(a[++i].c_str(), &end, 10);
+      if (!end || *end) { std::cerr << "grain: --steps wants a number\n"; return kExitUsage; }
+    } else if (a[i] == "--no-jit") {
+      opt.jit = false;
+    } else if (a[i] == "--help") {
+      usage(std::cout);
+      return kExitOk;
+    } else if (a[i] == "--version") {
+      std::cout << "grain " GRAIN_VERSION "\n";
+      return kExitOk;
+    } else {
+      std::cerr << "grain: unknown option " << a[i] << "\n";
+      usage(std::cerr);
+      return kExitUsage;
+    }
+  }
+  if (i >= a.size()) { usage(std::cerr); return kExitUsage; }
+  const std::string sub = a[i];
+  const std::vector<std::string> rest(a.begin() + static_cast<long>(i) + 1, a.end());
+
+  if (sub == "help" || sub == "-h") { usage(std::cout); return kExitOk; }
+  if (sub == "version") { std::cout << "grain " GRAIN_VERSION "\n"; return kExitOk; }
+  if (sub == "repl") return repl(opt);
+  if (sub == "run") {
+    if (rest.empty()) { std::cerr << "grain run <file.gr> [args...]\n"; return kExitUsage; }
+    return run_file(opt, rest[0], std::vector<std::string>(rest.begin() + 1, rest.end()));
+  }
+  if (sub == "eval") {
+    if (rest.empty()) { std::cerr << "grain eval <source...>\n"; return kExitUsage; }
+    std::string source;
+    for (size_t k = 0; k < rest.size(); ++k) { if (k) source += " "; source += rest[k]; }
+    return eval_line(opt, source);
+  }
+  if (sub == "check") {
+    if (rest.empty()) { std::cerr << "grain check <file.gr>...\n"; return kExitUsage; }
+    return check_files(rest);
+  }
+  if (sub == "dis") {
+    if (rest.size() != 1) { std::cerr << "grain dis <file.gr>\n"; return kExitUsage; }
+    return disassemble(rest[0]);
+  }
+  // `grain prog.gr args...`: a file is run, the way an interpreter is used from a shebang line.
+  if (sub.size() > 3 && sub.compare(sub.size() - 3, 3, ".gr") == 0) return run_file(opt, sub, rest);
+  std::cerr << "grain: unknown command " << sub << "\n";
+  usage(std::cerr);
+  return kExitUsage;
+}
