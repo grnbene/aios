@@ -117,3 +117,8 @@ endif()
 # Last, so it rewrites every case above (each headless: a window case shows on SDL's dummy display).
 add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
   COMMENT "rewriting grain/tests/expected from the current build")
+
+# Panes belong to the VM that registered them (two VMs in one process).
+add_executable(grain-pane-isolation pane_isolation.cpp)
+target_link_libraries(grain-pane-isolation PRIVATE grain_lang)
+add_test(NAME grain.pane_isolation COMMAND grain-pane-isolation)
