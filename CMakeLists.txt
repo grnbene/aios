@@ -436,6 +436,12 @@ target_link_libraries(aios-face-realworld-check PRIVATE aios)
 
 add_executable(aios-face-app-language-check tools/face-app-language-check.cpp)
 target_link_libraries(aios-face-app-language-check PRIVATE aios)
+# Faces pixel for pixel against tools/face-render-check.expected (layout and painting).
+add_executable(aios-face-render-check tools/face-render-check.cpp)
+target_link_libraries(aios-face-render-check PRIVATE aios)
+target_include_directories(aios-face-render-check PRIVATE tools)
+target_compile_definitions(aios-face-render-check PRIVATE AIOS_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME face.render.check COMMAND aios-face-render-check)
 
 add_executable(aios-control-plane-gateway-check tools/control-plane-gateway-check.cpp)
 target_link_libraries(aios-control-plane-gateway-check PRIVATE aios)

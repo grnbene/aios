@@ -14,7 +14,7 @@
 #include <cmath>
 #include <cstring>
 
-#include "aios/userland/git.hpp"
+#include "aios/net/deflate.hpp"
 #include "aios/userland/web.hpp"
 
 namespace aios::userland::web {
@@ -139,7 +139,7 @@ Result<Bitmap> decode_png(ByteSpan bytes) {
   if (idat.empty()) return Result<Bitmap>(Status::Invalid, "png: no image data");
   if (colour_type == 3 && !palette_count) return Result<Bitmap>(Status::Invalid, "png: palette image with no palette");
 
-  auto raw_r = aios::userland::zlib_inflate(ByteSpan(idat.data(), idat.size()));
+  auto raw_r = net::zlib_inflate(ByteSpan(idat.data(), idat.size()));
   if (!raw_r.ok()) return Result<Bitmap>(Status::Invalid, std::string("png: ") + raw_r.error().message);
   const ByteBuffer& raw = *raw_r;
 

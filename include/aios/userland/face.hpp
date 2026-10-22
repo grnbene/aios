@@ -42,8 +42,6 @@
 
 namespace aios::userland {
 
-class HardwareCompositor;
-
 namespace face {
 
 // ---- values -----------------------------------------------------------------
@@ -177,7 +175,7 @@ class Runtime {
   // the layout for a pane this size. Paint afterwards with paint().
   void frame(double dt_ms, int width, int height);
   // Paint the last laid-out frame into a buffer at an offset.
-  void paint(HardwareCompositor& c, std::vector<uint32_t>& buf, int buf_w, int buf_h, int ox, int oy) const;
+  void paint(std::vector<uint32_t>& buf, int buf_w, int buf_h, int ox, int oy) const;
 
   // Input & Pointer Pipeline.
   void click(int x, int y);

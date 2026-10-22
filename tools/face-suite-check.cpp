@@ -13,7 +13,6 @@
 #include <unordered_set>
 #include "aios/kernel/kernel.hpp"
 #include "aios/storage/object_store.hpp"
-#include "aios/userland/compositor.hpp"
 #include "aios/userland/face.hpp"
 
 using namespace aios;
@@ -382,9 +381,8 @@ paint fill
   check(!r4.paint_cmds().empty(), "Paint commands generated for 2D primitives");
 
   // Rasterize to compositor buffer
-  HardwareCompositor comp;
   std::vector<uint32_t> buf(1000 * 600, 0);
-  r4.paint(comp, buf, 1000, 600, 0, 0);
+  r4.paint(buf, 1000, 600, 0, 0);
 
   // Check that canvas buffer received non-background pixels
   size_t non_empty_px = 0;
