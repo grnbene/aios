@@ -3,7 +3,7 @@ diagnostics: [(3, 'expected a name after let')]
 after the fix: []
 formatting: 'fn twice(x) {\n  return x * 2\n}\nlet total = twice(3)\n'
 symbols: [('twice', 12, 0), ('total', 13, 3)]
-completion: 349 items; True
+completion: over 300 items: True with the library's names and the file's: True
 unknown request: -32601
 shutdown: None
 exit status: 0
