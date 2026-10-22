@@ -10,7 +10,6 @@
 #include <iostream>
 #include <vector>
 
-#include "aios/userland/compositor.hpp"
 #include "aios/userland/face.hpp"
 
 using namespace aios;
@@ -192,10 +191,9 @@ on confirm_rebalance:
   check(modal_hidden, "Modal dialog hidden when show=false");
 
   // Paint into compositor buffer to ensure end-to-end rendering pipeline succeeds
-  HardwareCompositor comp;
   std::vector<uint32_t> buf(800 * 600, 0);
-  r1.paint(comp, buf, 800, 600, 0, 0);
-  r2.paint(comp, buf, 800, 600, 0, 0);
+  r1.paint(buf, 800, 600, 0, 0);
+  r2.paint(buf, 800, 600, 0, 0);
 
   if (failures == 0) {
     std::printf("\n>>> PROVEN: All Dedicated Face Primitives (Badge, Sparkline, Scrubber, Modal) verified!\n");

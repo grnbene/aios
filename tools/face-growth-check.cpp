@@ -10,7 +10,6 @@
 #include <iostream>
 #include <vector>
 
-#include "aios/userland/compositor.hpp"
 #include "aios/userland/face.hpp"
 
 using namespace aios;
@@ -119,9 +118,8 @@ row gap=16
   check(found_image_placed, "Image widget placed in layout");
 
   // Paint into a buffer to verify compositor paint execution
-  HardwareCompositor comp;
   std::vector<uint32_t> buf(800 * 600, 0);
-  r2.paint(comp, buf, 800, 600, 0, 0);
+  r2.paint(buf, 800, 600, 0, 0);
   check(buf[100 * 800 + 100] != 0, "Image painted to compositor buffer");
 
   // -------------------------------------------------------------------------

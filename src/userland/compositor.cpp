@@ -7,6 +7,7 @@
 #include "aios/userland/glyph_engine.hpp"
 #include "aios/userland/task_ledger.hpp"
 #include "aios/userland/grain.hpp"
+#include "aios/userland/pixels.hpp"
 #include "aios/userland/sql_database.hpp"
 #include "aios/userland/machine_sql.hpp"
 #include "aios/userland/mysql_binlog.hpp"
@@ -682,64 +683,15 @@ void HardwareCompositor::clear_buffer(std::vector<uint32_t>& buf, uint32_t color
 }
 
 void HardwareCompositor::draw_rect_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y, int w, int h, uint32_t color) {
-  // Clipped on BOTH sides. A rect that starts past the right or bottom edge —
-  // which is what happens the moment a window is narrower than the content
-  // drawn into it, and every window is, on a screen smaller than the one the
-  // layout was written for — leaves x1 < x0, and std::fill over a reversed
-  // range never reaches its end: it overwrites memory for as long as the
-  // machine is powered on. On a hosted build that is a segfault; on the metal
-  // it is a kernel that stops answering with no way to ask why.
-  if (w <= 0 || h <= 0 || buf_w <= 0 || buf_h <= 0) return;
-  int x0 = std::max(0, x);
-  int y0 = std::max(0, y);
-  int x1 = std::min(buf_w, x + w);
-  int y1 = std::min(buf_h, y + h);
-  if (x1 <= x0 || y1 <= y0) return;
-  if (buf.size() < static_cast<size_t>(buf_w) * static_cast<size_t>(buf_h)) return;
-  for (int py = y0; py < y1; ++py) {
-    uint32_t* row = &buf[py * buf_w + x0];
-    std::fill(row, row + (x1 - x0), color);
-  }
+  px::fill_rect(buf, buf_w, buf_h, x, y, w, h, color);
 }
 
 void HardwareCompositor::draw_rect_outline_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y, int w, int h, uint32_t color) {
-  draw_rect_to(buf, buf_w, buf_h, x, y, w, 1, color);
-  draw_rect_to(buf, buf_w, buf_h, x, y + h - 1, w, 1, color);
-  draw_rect_to(buf, buf_w, buf_h, x, y, 1, h, color);
-  draw_rect_to(buf, buf_w, buf_h, x + w - 1, y, 1, h, color);
+  px::rect_outline(buf, buf_w, buf_h, x, y, w, h, color);
 }
 
 void HardwareCompositor::draw_rounded_rect_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y, int w, int h, int radius, uint32_t color) {
-  if (w <= 0 || h <= 0) return;
-  int r = radius;
-  if (r < 0) r = 0;
-  if (r * 2 > w) r = w / 2;
-  if (r * 2 > h) r = h / 2;
-  // The interior is exact; only the corners need coverage. Three rects and
-  // four small arcs, rather than the old stack of shrinking rectangles that
-  // made every rounded corner a visible staircase.
-  draw_rect_to(buf, buf_w, buf_h, x + r, y, w - 2 * r, h, color);
-  draw_rect_to(buf, buf_w, buf_h, x, y + r, r, h - 2 * r, color);
-  draw_rect_to(buf, buf_w, buf_h, x + w - r, y + r, r, h - 2 * r, color);
-  if (!r) return;
-  const double rr = r;
-  const int cx[4] = {x, x + w - r, x, x + w - r};
-  const int cy[4] = {y, y, y + h - r, y + h - r};
-  for (int c = 0; c < 4; ++c) {
-    double ox = (c == 0 || c == 2) ? x + rr : x + w - rr;
-    double oy = (c == 0 || c == 1) ? y + rr : y + h - rr;
-    for (int dy = 0; dy < r; ++dy) {
-      for (int dx = 0; dx < r; ++dx) {
-        int px = cx[c] + dx, py = cy[c] + dy;
-        double ddx = px + 0.5 - ox, ddy = py + 0.5 - oy;
-        double d = std::sqrt(ddx * ddx + ddy * ddy);
-        double cov = rr + 0.5 - d;
-        if (cov <= 0.0) continue;
-        if (cov > 1.0) cov = 1.0;
-        blend_to(buf, buf_w, buf_h, px, py, color, static_cast<int>(cov * 255.0 + 0.5));
-      }
-    }
-  }
+  px::rounded_rect(buf, buf_w, buf_h, x, y, w, h, radius, color);
 }
 
 void HardwareCompositor::draw_gradient_v_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y, int w, int h, uint32_t c1, uint32_t c2) {
@@ -828,66 +780,8 @@ char ascii_for(uint32_t cp) {
 }  // namespace
 
 namespace {
-struct GammaTables {
-  uint16_t srgb_to_lin[256];
-  uint8_t lin_to_srgb[65536];
-  uint8_t font_cov_smooth[256];
-
-  GammaTables() {
-    for (int i = 0; i < 256; ++i) {
-      double v = i / 255.0;
-      double lin = std::pow(v, 2.2);
-      srgb_to_lin[i] = static_cast<uint16_t>(std::round(lin * 65535.0));
-
-      if (i == 0) {
-        font_cov_smooth[0] = 0;
-      } else {
-        // The coverage transfer curve.
-        //
-        // This was 0.80, called "stem darkening". Below 1.0 it INFLATES partial
-        // coverage: a pixel the rasteriser reported a quarter covered is drawn
-        // a third inked, a half-covered one nearly three fifths. Applied to
-        // every edge pixel of every glyph at once, that is not darkening a
-        // stem, it is spreading one — and a spread edge is what reads as out of
-        // focus.
-        //
-        // Above 1.0 the opposite: partial coverage is held back, so the edge
-        // falls away faster and the stem keeps its own width. Dumped the same
-        // text-heavy frame at 0.80, 1.00, 1.25 and 1.45 and compared them: the
-        // smear thins out all the way up, but past about 1.25 the strokes
-        // themselves start going faint, which costs more readability than the
-        // haze did. 1.25 is where it stops being blurry without becoming weak.
-        static const double kCovGamma = [] {
-          if (const char* e = std::getenv("AIOS_FONT_GAMMA")) {
-            const double g = std::atof(e);
-            if (g > 0.2 && g < 4.0) return g;
-          }
-          return 1.25;
-        }();
-        double smoothed = std::pow(v, kCovGamma);
-        int sc = static_cast<int>(std::round(smoothed * 255.0));
-        font_cov_smooth[i] = static_cast<uint8_t>(sc > 255 ? 255 : sc);
-      }
-    }
-    // The 64K reverse table used to cost 65536 std::pow() calls before main(),
-    // on every boot, with no FPU help on the metal. It only ever holds 256
-    // distinct values, so build it from the 256 thresholds instead: output j
-    // begins at the first linear index that rounds up to j, i.e.
-    // ceil(65535 * ((j - 0.5)/255)^2.2). Bit-identical to the pow() loop,
-    // 256 transcendentals instead of 65536.
-    int at = 0;
-    for (int j = 1; j <= 255; ++j) {
-      double edge = (j - 0.5) / 255.0;
-      double start_d = std::ceil(std::pow(edge, 2.2) * 65535.0);
-      int start = start_d < 0.0 ? 0 : (start_d > 65536.0 ? 65536 : static_cast<int>(start_d));
-      for (; at < start && at <= 65535; ++at) lin_to_srgb[at] = static_cast<uint8_t>(j - 1);
-      if (start > at) at = start;
-    }
-    for (; at <= 65535; ++at) lin_to_srgb[at] = 255;
-  }
-};
-
-static const GammaTables g_gamma;
+// The gamma tables are shared with everything that draws (userland/pixels).
+static const px::GammaTables& g_gamma = px::gamma();
 }  // namespace
 
 // The blend itself, with the bounds already established. Text goes through
@@ -954,10 +848,7 @@ void HardwareCompositor::blend_srgb_to(std::vector<uint32_t>& buf, int buf_w, in
 
 void HardwareCompositor::blend_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y,
                                   uint32_t color, int alpha) {
-  if (alpha <= 0 || x < 0 || y < 0 || x >= buf_w || y >= buf_h) return;
-  size_t at = static_cast<size_t>(y) * static_cast<size_t>(buf_w) + static_cast<size_t>(x);
-  if (at >= buf.size()) return;
-  blend_px(buf[at], color, static_cast<uint32_t>(alpha));
+  px::blend(buf, buf_w, buf_h, x, y, color, alpha);
 }
 
 int HardwareCompositor::glyph_advance(char c, Face f) const {
@@ -1232,36 +1123,7 @@ void HardwareCompositor::draw_pill_to(std::vector<uint32_t>& buf, int buf_w, int
 
 void HardwareCompositor::draw_round_outline_to(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y,
                                                int w, int h, int radius, uint32_t edge) {
-  if (w <= 0 || h <= 0) return;
-  int r = radius;
-  if (r < 0) r = 0;
-  if (r * 2 > w) r = w / 2;
-  if (r * 2 > h) r = h / 2;
-  draw_rect_to(buf, buf_w, buf_h, x + r, y, w - 2 * r, 1, edge);
-  draw_rect_to(buf, buf_w, buf_h, x + r, y + h - 1, w - 2 * r, 1, edge);
-  draw_rect_to(buf, buf_w, buf_h, x, y + r, 1, h - 2 * r, edge);
-  draw_rect_to(buf, buf_w, buf_h, x + w - 1, y + r, 1, h - 2 * r, edge);
-  if (!r) return;
-  const double rr = r;
-  const int cx[4] = {x, x + w - r, x, x + w - r};
-  const int cy[4] = {y, y, y + h - r, y + h - r};
-  for (int c = 0; c < 4; ++c) {
-    double ox = (c == 0 || c == 2) ? x + rr : x + w - rr;
-    double oy = (c == 0 || c == 1) ? y + rr : y + h - rr;
-    for (int dy = 0; dy < r; ++dy) {
-      for (int dx = 0; dx < r; ++dx) {
-        int px = cx[c] + dx, py = cy[c] + dy;
-        double ddx = px + 0.5 - ox, ddy = py + 0.5 - oy;
-        double d = std::sqrt(ddx * ddx + ddy * ddy);
-        // A one-pixel-wide arc, its edges feathered by how far the pixel's
-        // centre is from the ideal curve.
-        double cov = 1.0 - std::fabs(d - (rr - 0.5));
-        if (cov <= 0.0) continue;
-        if (cov > 1.0) cov = 1.0;
-        blend_to(buf, buf_w, buf_h, px, py, edge, static_cast<int>(cov * 255.0 + 0.5));
-      }
-    }
-  }
+  px::round_outline(buf, buf_w, buf_h, x, y, w, h, radius, edge);
 }
 
 void HardwareCompositor::draw_app_icon(std::vector<uint32_t>& buf, int buf_w, int buf_h, int x, int y, WindowType type, int size) {
@@ -10446,7 +10308,7 @@ void HardwareCompositor::render_face_app_window(WindowSurface& win, Kernel& k) {
 
   if (win.face_app_runtime) {
     win.face_app_runtime->frame(16.7, W, H - 36);
-    win.face_app_runtime->paint(*this, win.buffer, W, H, 0, 36);
+    win.face_app_runtime->paint(win.buffer, W, H, 0, 36);
 
     const auto& errs = win.face_app_runtime->face().errors;
     if (!errs.empty()) {

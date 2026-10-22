@@ -8,7 +8,6 @@
 // same pixels and the mind is told when it asked for more than fits.
 #include "aios/userland/face.hpp"
 #include "aios/hal/sync.hpp"
-#include "aios/storage/aql.hpp"
 #include <cctype>
 
 #include <algorithm>
@@ -25,8 +24,8 @@
 #include <set>
 #include <sstream>
 
-#include "aios/userland/compositor.hpp"
-#include "aios/userland/web_pane.hpp"
+#include "aios/userland/pixels.hpp"
+#include "aios/userland/web_type.hpp"
 
 namespace aios::userland::face {
 
@@ -4860,16 +4859,16 @@ void Runtime::frame(double dt_ms, int width, int height) {
   for (const auto& h : face_.handlers) if (h.event == "frame") for (const auto& s : h.body) { ev.exec(*s, paint_); if (ev.stop) break; }
 }
 
-void Runtime::paint(HardwareCompositor& c, std::vector<uint32_t>& buf, int buf_w, int buf_h, int ox, int oy) const {
+void Runtime::paint(std::vector<uint32_t>& buf, int buf_w, int buf_h, int ox, int oy) const {
   const Impl& I = *impl_;
-  c.draw_rect_to(buf, buf_w, buf_h, ox, oy, last_w_, last_h_, kBg);
+  px::fill_rect(buf, buf_w, buf_h, ox, oy, last_w_, last_h_, kBg);
   for (const auto& op : I.ops) {
     switch (op.k) {
-      case DrawOp::K::Rect: c.draw_rect_to(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.color); break;
-      case DrawOp::K::Outline: c.draw_rect_outline_to(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.color); break;
-      case DrawOp::K::Round: c.draw_rounded_rect_to(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.r, op.color); break;
-      case DrawOp::K::RoundOutline: c.draw_round_outline_to(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.r, op.color); break;
-      case DrawOp::K::Text: web_draw_text(c, buf, buf_w, buf_h, ox + op.x, oy + op.y, op.text, op.color, op.font); break;
+      case DrawOp::K::Rect: px::fill_rect(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.color); break;
+      case DrawOp::K::Outline: px::rect_outline(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.color); break;
+      case DrawOp::K::Round: px::rounded_rect(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.r, op.color); break;
+      case DrawOp::K::RoundOutline: px::round_outline(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.w, op.h, op.r, op.color); break;
+      case DrawOp::K::Text: web_draw_text_px(buf, buf_w, buf_h, ox + op.x, oy + op.y, op.text, op.color, op.font); break;
       case DrawOp::K::BitmapImage:
         if (op.bitmap && op.bitmap->w > 0 && op.bitmap->h > 0) {
           const auto& bm = *op.bitmap;
@@ -4887,7 +4886,7 @@ void Runtime::paint(HardwareCompositor& c, std::vector<uint32_t>& buf, int buf_w
               uint8_t a = (uint8_t)(pixel >> 24);
               if (!a) continue;
               if (a == 255) buf[(size_t)dst_y * (size_t)buf_w + (size_t)dst_x] = pixel;
-              else c.blend_to(buf, buf_w, buf_h, dst_x, dst_y, pixel, a);
+              else px::blend(buf, buf_w, buf_h, dst_x, dst_y, pixel, a);
             }
           }
         }
@@ -4905,12 +4904,12 @@ void Runtime::paint(HardwareCompositor& c, std::vector<uint32_t>& buf, int buf_w
       const int a = (int)((color >> 24) & 0xFF);
       if (!a) return;
       if (a == 255) buf[(size_t)by * (size_t)buf_w + (size_t)bx] = color;
-      else c.blend_to(buf, buf_w, buf_h, bx, by, color, a);
+      else px::blend(buf, buf_w, buf_h, bx, by, color, a);
     };
     auto fill = [&](int x, int y, int w, int h, uint32_t color) {
       int x0 = std::max(0, x), y0 = std::max(0, y), x1 = std::min(pw, x + w), y1 = std::min(ph, y + h);
       if (x1 <= x0 || y1 <= y0) return;
-      if (((color >> 24) & 0xFF) == 255) c.draw_rect_to(buf, buf_w, buf_h, px0 + x0, py0 + y0, x1 - x0, y1 - y0, color);
+      if (((color >> 24) & 0xFF) == 255) px::fill_rect(buf, buf_w, buf_h, px0 + x0, py0 + y0, x1 - x0, y1 - y0, color);
       else for (int yy = y0; yy < y1; ++yy) for (int xx = x0; xx < x1; ++xx) put(xx, yy, color);
     };
     // A polygon, with COVERAGE rather than a yes/no per pixel: four sub-rows per
@@ -5063,7 +5062,7 @@ void Runtime::paint(HardwareCompositor& c, std::vector<uint32_t>& buf, int buf_w
         case PaintCmd::K::Text: {
           const int x = (int)std::lround(p.a), y = (int)std::lround(p.b);
           if (y + p.px < 0 || y > ph) break;
-          web_draw_text(c, buf, buf_w, buf_h, px0 + x, py0 + y, p.text, p.color, font_of(p.px, p.px >= 20));
+          web_draw_text_px(buf, buf_w, buf_h, px0 + x, py0 + y, p.text, p.color, font_of(p.px, p.px >= 20));
           break;
         }
         case PaintCmd::K::Tensor: {

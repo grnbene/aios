@@ -572,4 +572,34 @@ bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) {
   return true;
 }
 
+Result<ByteBuffer> zlib_inflate(ByteSpan data) {
+  if (data.size() < 6) return Result<ByteBuffer>(Status::Corrupt, "zlib stream too short");
+  const uint8_t cmf = data[0], flg = data[1];
+  if ((cmf & 0x0f) != 8) return Result<ByteBuffer>(Status::Corrupt, "not a deflate stream");
+  if (((uint32_t)cmf << 8 | flg) % 31 != 0) return Result<ByteBuffer>(Status::Corrupt, "bad zlib header check");
+  if (flg & 0x20) return Result<ByteBuffer>(Status::Unsupported, "zlib preset dictionary");
+#if defined(AIOS_HAVE_ZLIB)
+  {
+    ByteBuffer out;
+    size_t used = 0;
+    if (zlib_inflate_z(data, &out, &used, 0)) return out;
+  }
+#endif
+  ByteBuffer out;
+  size_t inner_end = 0;
+  std::string why;
+  if (!inflate_raw_tree(data, 2, out, &inner_end, 0, &why))
+    return Result<ByteBuffer>(Status::Corrupt, why.empty() ? std::string("the deflate data is damaged") : why);
+  if (inner_end + 4 > data.size()) return Result<ByteBuffer>(Status::Corrupt, "zlib stream ends before its checksum");
+  const uint8_t* t = data.data() + inner_end;
+  const uint32_t want = ((uint32_t)t[0] << 24) | ((uint32_t)t[1] << 16) | ((uint32_t)t[2] << 8) | (uint32_t)t[3];
+  uint32_t a = 1, b = 0;   // Adler-32
+  for (size_t i = 0; i < out.size(); ++i) {
+    a = (a + out[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  if (((b << 16) | a) != want) return Result<ByteBuffer>(Status::Corrupt, "zlib checksum does not match: the data is damaged");
+  return out;
+}
+
 }  // namespace aios::net
