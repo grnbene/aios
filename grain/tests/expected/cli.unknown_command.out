@@ -8,6 +8,7 @@ usage:
   grain repl                        read and run lines until EOF or .quit
   grain check <file.gr>...          compile only and report every error
   grain dis <file.gr>               show the bytecode the compiler emitted
+  grain build <file.gr> [-o out]    make one executable of the program (see grain build)
   grain version                     print the version
 
 options (before the subcommand):

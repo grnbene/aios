@@ -25,6 +25,7 @@
 #endif
 
 #include "aios/userland/grain.hpp"
+#include "bundle.hpp"
 #include "grain_net.hpp"
 #include "host.hpp"
 #if defined(GRAIN_HAVE_SDL2)
@@ -56,6 +57,7 @@ void usage(std::ostream& o) {
     << "  grain repl                        read and run lines until EOF or .quit\n"
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
+    << "  grain build <file.gr> [-o out]    make one executable of the program (see grain build)\n"
     << "  grain version                     print the version\n"
     << "\n"
     << "options (before the subcommand):\n"
@@ -145,6 +147,19 @@ int repl(const Options& opt) {
   return tty ? kExitOk : status;
 }
 
+// A program packed onto this executable (grain build): it gets every argument.
+int run_pack(const grain_cli::Pack& pack, const std::vector<std::string>& script_args) {
+  const std::string& name = pack.main_name;
+  auto compiled = g::compile_source(pack.files.at(name), name);
+  if (!compiled.ok()) { report_compile(name, compiled.errors); return kExitCompile; }
+  g::Vm vm;
+  prepare(vm, Options{}, script_args);
+  grain_cli::install_bundle_builtins(vm, pack);
+  auto r = vm.run(compiled.script);
+  if (!r.ok) { report_runtime(name, r); return kExitRuntime; }
+  return kExitOk;
+}
+
 int check_files(const std::vector<std::string>& paths) {
   int status = kExitOk;
   for (const auto& path : paths) {
@@ -173,6 +188,12 @@ int main(int argc, char** argv) {
   g::set_display(&grain_cli::sdl_display());   // run_panes() opens real windows
 #endif
   std::vector<std::string> a(argv + 1, argv + argc);
+  {
+    grain_cli::Pack pack;
+    std::string why;
+    if (grain_cli::find_own_pack(pack, why)) return run_pack(pack, a);
+    if (!why.empty()) { std::cerr << argv[0] << ": " << why << "\n"; return kExitRuntime; }
+  }
   Options opt;
   size_t i = 0;
   for (; i < a.size() && a[i].rfind("--", 0) == 0; ++i) {
@@ -215,6 +236,7 @@ int main(int argc, char** argv) {
     if (rest.empty()) { std::cerr << "grain check <file.gr>...\n"; return kExitUsage; }
     return check_files(rest);
   }
+  if (sub == "build") return grain_cli::build_command(rest);
   if (sub == "dis") {
     if (rest.size() != 1) { std::cerr << "grain dis <file.gr>\n"; return kExitUsage; }
     return disassemble(rest[0]);

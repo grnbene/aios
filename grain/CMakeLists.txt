@@ -108,7 +108,7 @@ else()
   target_compile_options(grain_lang PRIVATE -Wall -Wno-unused-parameter)
 endif()
 
-add_executable(grain cli/main.cpp cli/host.cpp)
+add_executable(grain cli/main.cpp cli/host.cpp cli/bundle.cpp)
 target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli)
 target_link_libraries(grain PRIVATE grain_lang)
 
@@ -116,7 +116,24 @@ target_link_libraries(grain PRIVATE grain_lang)
 # sdl2, a distribution's libsdl2-dev, or vcpkg's sdl2 on Windows. Without it
 # grain builds the same and run_panes() says it has no display.
 option(GRAIN_WITH_SDL2 "Show panes as windows through SDL2 when SDL2 is found" ON)
-if(GRAIN_WITH_SDL2)
+# For a program you ship (grain build): SDL2 compiled from its release and
+# linked in, so the executable needs no SDL on the machine it runs on. Fetches
+# SDL's own repository at a release tag; a build without network access uses
+# the installed SDL2 instead (leave this OFF). On Linux the X11 and Wayland
+# development headers must be installed for SDL to talk to a desktop.
+option(GRAIN_SDL2_STATIC "Build SDL2 from source and link it statically" OFF)
+if(GRAIN_WITH_SDL2 AND GRAIN_SDL2_STATIC)
+  include(FetchContent)
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  set(SDL_TEST OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(SDL2
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-2.32.10
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(SDL2)
+  set(GRAIN_SDL2_TARGET SDL2::SDL2-static)
+elseif(GRAIN_WITH_SDL2)
   find_package(SDL2 CONFIG QUIET)
   if(TARGET SDL2::SDL2)
     set(GRAIN_SDL2_TARGET SDL2::SDL2)

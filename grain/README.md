@@ -86,6 +86,32 @@ per-user directory (`~/Library/Caches/grain`, `~/.cache/grain`,
 `%LOCALAPPDATA%\grain`) when you put one there, otherwise the system's store
 (on Windows, exported there from the system's root certificates).
 
+## Shipping a program
+
+```
+grain build app.gr -o app                       # one executable: the runtime with app.gr packed onto it
+grain build app.gr -o app --include assets      # files the program reads with bundle_file("assets/x.png")
+grain build app.gr --app -o App.app             # macOS: an application bundle that can be signed
+grain build app.gr --runtime grain.exe -o app   # for another OS: pack onto that OS's grain
+```
+
+The program is compiled first, so a build never ships one that does not
+compile. The result runs with no grain installed: every argument goes to the
+program (`args`). `bundle_file(name)` reads a packed file, `bundle_files()`
+lists them. A pack carries a SHA-256, and a damaged one is refused rather
+than run.
+
+- **Windows and Linux**: the single file is the thing to ship; sign the .exe
+  with signtool after building (the runtime finds its program in front of the
+  signature).
+- **macOS**: a single file runs as built, but appended bytes fail Apple's
+  strict signature check, so it cannot be notarized. `--app` leaves the
+  runtime untouched and puts the program in `Contents/Resources`; sign and
+  notarize the .app as any other.
+- **Programs with windows**: a program that opens windows needs SDL2 wherever it
+  runs, unless grain was built with `-DGRAIN_SDL2_STATIC=ON`, which compiles
+  SDL2 2.32.10 from its release and links it in. Use that for releases.
+
 ## Building
 
 Needs CMake 3.20 and a C++20 compiler: GCC 10, Clang 12 (Apple Clang 13) or
@@ -143,6 +169,6 @@ standalone grain has the portable standard library only.
 | interpreter | yes | yes | yes | yes | yes |
 | JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
-Built and tested so far: macOS arm64 (50 of 50 cases, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
+Built and tested so far: macOS arm64 (51 of 51 cases, a signed .app passing strict verification, the live HTTPS checks, and the window test on a real macOS window with both Homebrew's sdl2-compat and SDL 2.32). The others are set up
 (this README, `.github/workflows/grain.yml`, `scripts/build-linux.sh`) and not
 yet built.
