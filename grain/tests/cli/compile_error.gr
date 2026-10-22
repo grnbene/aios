@@ -1,0 +1,2 @@
+# Does not compile: let needs a name.
+let = 5

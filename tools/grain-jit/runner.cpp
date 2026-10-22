@@ -32,7 +32,7 @@ static int run_one(char** argv) {
   std::ifstream in(argv[1]); std::stringstream ss; ss << in.rdbuf();
   auto c = compile_source(ss.str(), argv[1]);
   if (!c.ok()) { for (auto& d : c.errors) std::cerr << d.line << ": " << d.message << "\n"; return 1; }
-  Vm vm; install_builtins(vm);
+  Vm vm; install_core_builtins(vm);
   if (std::getenv("GRAIN_NOJIT")) vm.jit_enabled = false;
   vm.step_limit = std::getenv("GRAIN_STEPS") ? std::strtoull(std::getenv("GRAIN_STEPS"), nullptr, 10) : 200000000;
   vm.files = &files;

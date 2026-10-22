@@ -1,0 +1,5 @@
+os known: true
+arch named: true
+cpus at least one: true
+memory reported: true
+version is a string: true

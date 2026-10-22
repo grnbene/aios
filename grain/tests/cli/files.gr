@@ -1,0 +1,16 @@
+# Files on the host's own filesystem, relative to the working directory.
+let name = "files_case_scratch.txt"
+if file_exists(name) { delete_file(name) }
+write_file(name, "first line\n")
+append_file(name, "second line\n")
+print("exists after write:", file_exists(name))
+let text = read_file(name)
+print("lines:", len(split(trim(text), "\n")))
+print("content:", repr(text))
+let found = false
+for e in list_dir(".") {
+  if e.name == name { found = true }
+}
+print("listed:", found)
+delete_file(name)
+print("exists after delete:", file_exists(name))

@@ -1,0 +1,6 @@
+[1, 1] [-9223372036854775808, 0] [0, 0] [0, 0] [-16, -4] [0, -1] [0, -1] [0, -1]
+negative shift count
+bitwise operations take integers, got int and real cannot bitwise invert a real
+[3035, -3036, 379]
+[1226] -1225 100
+1 2 {x} small 2 3 6 {x} big 2

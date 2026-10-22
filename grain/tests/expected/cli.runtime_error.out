@@ -1,0 +1,3 @@
+before the call
+runtime_error.gr:4: cannot call a nil -- only a function or a native is callable
+  in runtime_error.gr (line 4)

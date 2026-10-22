@@ -1,0 +1,70 @@
+# Golden tests: each case's output and exit status, checked in under expected/.
+# `cmake --build <dir> --target grain-update-expected` rewrites them from the
+# current build - for a deliberate change in behaviour, reviewed in the diff.
+set(GRAIN_EXAMPLES ${AIOS_ROOT}/examples/grain)
+set(GRAIN_JIT_CASES ${AIOS_ROOT}/tools/grain-jit/cases)
+set(EXPECTED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/expected)
+set(RUNNER ${CMAKE_CURRENT_SOURCE_DIR}/run_case.cmake)
+set(GRAIN_UPDATE_COMMANDS)
+
+# grain_case(<name> <workdir> <expected exit> <grain args...>)
+# A case runs in <workdir>; a case whose program writes files names "WRITES:<script dir>"
+# instead, and runs in a work directory of its own in the build tree with its
+# script copied there - so parallel cases never share a scratch file, the source
+# can be read-only, and error messages still name the script the same short way.
+function(grain_case name workdir status)
+  string(JOIN "@@" args_escaped ${ARGN})
+  set(copy "")
+  if(workdir MATCHES "^WRITES:(.*)$")
+    set(copy -DCOPY_FROM=${CMAKE_MATCH_1})
+    set(workdir ${CMAKE_CURRENT_BINARY_DIR}/work/${name})
+  endif()
+  add_test(NAME grain.${name}
+    COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
+            -DEXPECTED=${EXPECTED_DIR}/${name}.out -DACTUAL=${CMAKE_CURRENT_BINARY_DIR}/actual/${name}.out
+            -DSTATUS=${status} -P ${RUNNER})
+  set(GRAIN_UPDATE_COMMANDS ${GRAIN_UPDATE_COMMANDS}
+    COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${args_escaped}" -DWORKDIR=${workdir} ${copy}
+            -DEXPECTED=${EXPECTED_DIR}/${name}.out -DSTATUS=${status} -DUPDATE=1 -P ${RUNNER}
+    PARENT_SCOPE)
+endfunction()
+
+# The language's own examples, natively compiled where the machine can and interpreted.
+foreach(ex tour closures words fib)   # conflicts.gr reads Things: aios only
+  grain_case(example.${ex} ${GRAIN_EXAMPLES} 0 run ${ex}.gr)
+  grain_case(example.${ex}.interp ${GRAIN_EXAMPLES} 0 --no-jit run ${ex}.gr)
+endforeach()
+grain_case(example.selftest WRITES:${GRAIN_EXAMPLES} 0 run selftest.gr)          # its file checks write
+grain_case(example.selftest.interp WRITES:${GRAIN_EXAMPLES} 0 --no-jit run selftest.gr)
+
+# The native-code comparison cases (tools/grain-jit). Some end in a runtime
+# error on purpose (a runaway loop the step limit stops, a fault deep in native
+# code), so their exit status is the one recorded with their output, and they
+# run under the 200M-step limit their runner gave them.
+file(GLOB jit_cases RELATIVE ${GRAIN_JIT_CASES} ${GRAIN_JIT_CASES}/*.gr)
+foreach(f ${jit_cases})
+  get_filename_component(n ${f} NAME_WE)
+  grain_case(jit.${n} ${GRAIN_JIT_CASES} recorded --steps 200000000 run ${f})
+  grain_case(jit.${n}.interp ${GRAIN_JIT_CASES} recorded --steps 200000000 --no-jit run ${f})
+endforeach()
+
+# What the standalone program itself promises.
+set(CLI_CASES ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+grain_case(cli.args ${CLI_CASES} 0 run args.gr one "two words" 3)
+grain_case(cli.shortcut ${CLI_CASES} 0 args.gr via-shortcut)
+grain_case(cli.sys ${CLI_CASES} 0 run sys.gr)
+grain_case(cli.files WRITES:${CLI_CASES} 0 run files.gr)
+grain_case(cli.exec ${CLI_CASES} 0 run exec.gr)
+grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
+grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
+grain_case(cli.check_ok ${CLI_CASES} 0 check args.gr sys.gr files.gr)
+grain_case(cli.check_error ${CLI_CASES} 1 check args.gr compile_error.gr)
+grain_case(cli.steps ${CLI_CASES} 2 --steps 1000 run forever.gr)
+grain_case(cli.eval ${CLI_CASES} 0 eval "1 + 2 * 3")
+grain_case(cli.missing_file ${CLI_CASES} 64 run no_such_file.gr)
+grain_case(cli.unknown_command ${CLI_CASES} 64 frobnicate)
+grain_case(cli.version ${CLI_CASES} 0 version)
+grain_case(cli.dis ${CLI_CASES} 0 dis args.gr)
+
+add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
+  COMMENT "rewriting grain/tests/expected from the current build")

@@ -1,0 +1,29 @@
+== fn args.gr (0 param(s), 55 bytes, 7 constant(s)) ==
+0000    2 GETGLOBAL 0  ; "print"
+0003    | CONST 1  ; "args:"
+0006    | GETGLOBAL 2  ; "len"
+0009    | GETGLOBAL 3  ; "args"
+0012    | CALL 1
+0014    | CALL 2
+0016    | POP
+0017    3 GETGLOBAL 3  ; "args"
+0020    | ITERPREP
+0021    | CONST 4  ; 0
+0024    | ITERNEXT 1
+0026    | JUMPF -> 50
+0029    | POP
+0030    4 GETGLOBAL 0  ; "print"
+0033    | CONST 5  ; "  ["
+0036    | GETLOCAL 3
+0038    | ADD
+0039    | CONST 6  ; "]"
+0042    | ADD
+0043    | CALL 1
+0045    | POP
+0046    3 POP
+0047    | LOOP -> 24
+0050    | POP
+0051    | POP
+0052    | POP
+0053    0 NIL
+0054    | RET

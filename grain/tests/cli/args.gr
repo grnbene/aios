@@ -1,0 +1,5 @@
+# `args` holds what followed the script's name on the command line.
+print("args:", len(args))
+for a in args {
+  print("  [" + a + "]")
+}

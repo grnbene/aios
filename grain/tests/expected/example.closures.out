@@ -1,0 +1,6 @@
+shared upvalue: 3 (want 3)
+independent: 3 1 (want 3 1)
+per-iteration capture: [0, 1, 4, 9, 16] (want [0, 1, 4, 9, 16])
+two levels up: 70 (want 70)
+map: [1, 4, 9, 16, 25]
+fold: 15 (want 15)

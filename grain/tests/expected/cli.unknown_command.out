@@ -1,0 +1,15 @@
+grain: unknown command frobnicate
+grain 0.1.0 - a small, fast, embeddable language
+
+usage:
+  grain <file.gr> [args...]         run a program (same as grain run)
+  grain run <file.gr> [args...]     run a program; `args` holds what follows it
+  grain eval <source...>            run one line and print its value
+  grain repl                        read and run lines until EOF or .quit
+  grain check <file.gr>...          compile only and report every error
+  grain dis <file.gr>               show the bytecode the compiler emitted
+  grain version                     print the version
+
+options (before the subcommand):
+  --steps <n>                       stop a program after n instructions
+  --no-jit                          interpret everything

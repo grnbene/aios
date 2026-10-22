@@ -31,13 +31,15 @@
 #include <cstring>
 #include <vector>
 
-#if defined(__aarch64__) && !defined(AIOS_METAL)
+#if defined(__aarch64__) && !defined(AIOS_METAL) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
 
 namespace aios::userland::grain::jit {
 
-#if defined(__aarch64__)
+// Windows on Arm (clang-cl defines __aarch64__ too) interprets until the JIT has
+// a VirtualAlloc/FlushInstructionCache allocator of its own.
+#if defined(__aarch64__) && !defined(_WIN32)
 
 namespace {
 
@@ -896,7 +898,7 @@ void release(void* code) {
 #endif
 }
 
-#else   // not AArch64: interpret everything
+#else   // not AArch64 (or Windows on Arm): interpret everything
 
 Entry compile(const FnObj&) { return nullptr; }
 void release(void*) {}
