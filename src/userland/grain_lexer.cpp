@@ -25,6 +25,7 @@ const Keyword KEYWORDS[] = {
   {"in", Tok::In}, {"fn", Tok::Fn}, {"return", Tok::Return},
   {"break", Tok::Break}, {"continue", Tok::Continue}, {"let", Tok::Let},
   {"true", Tok::True}, {"false", Tok::False}, {"nil", Tok::NilLit},
+  {"entity", Tok::Entity}, {"on", Tok::On},
 };
 
 }  // namespace
@@ -60,7 +61,9 @@ const char* tok_name(Tok t) {
     case Tok::LBrace: return "{"; case Tok::RBrace: return "}";
     case Tok::LBracket: return "["; case Tok::RBracket: return "]";
     case Tok::Comma: return ","; case Tok::Dot: return "."; case Tok::Colon: return ":";
+    case Tok::ColonColon: return "::";
     case Tok::Question: return "?";
+    case Tok::Entity: return "entity"; case Tok::On: return "on";
     case Tok::Error: return "bad character";
   }
   return "?";
@@ -86,6 +89,7 @@ void Lexer::skip_run() {
     // that genuinely wants to wrap without a bracket to hide behind.
     if (c == '\\' && peek(1) == '\n') { advance(); advance(); continue; }
     if (c == '#') { while (peek() && peek() != '\n') advance(); continue; }
+    if (c == '/' && peek(1) == '/') { while (peek() && peek() != '\n') advance(); continue; }
     return;
   }
 }
@@ -246,7 +250,9 @@ Token Lexer::next() {
     case ']': return Token{Tok::RBracket, "", 0, 0, start_line};
     case ',': return Token{Tok::Comma, "", 0, 0, start_line};
     case '.': return Token{Tok::Dot, "", 0, 0, start_line};
-    case ':': return Token{Tok::Colon, "", 0, 0, start_line};
+    case ':':
+      if (peek() == ':') { advance(); return Token{Tok::ColonColon, "::", 0, 0, start_line}; }
+      return Token{Tok::Colon, "", 0, 0, start_line};
     case '?': return Token{Tok::Question, "", 0, 0, start_line};
     case ';': return Token{Tok::Newline, "", 0, 0, start_line};
     case '=': return two('=', Tok::EqEq, Tok::Assign);

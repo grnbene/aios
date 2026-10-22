@@ -1,0 +1,11 @@
+{
+    "identifier": "aios.grain",
+    "name": "Grain",
+    "author": "AIOS Core Team",
+    "organization": "AIOS",
+    "description": "Syntax highlighting, symbol navigation, and code completions for Grain (.gr) substrate programs",
+    "version": "1.0.0",
+    "categories": ["languages", "syntaxes"],
+    "license": "MIT",
+    "main": ""
+}
