@@ -37,6 +37,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #include "aios/channel/rpc_value.hpp"
 #include "aios/storage/aql.hpp"
 #include "aios/net/gzip.hpp"
+#include "aios/net/deflate.hpp"
 #include "aios/core/bytes.hpp"
 #include "aios/crypto/sha1.hpp"
 #include "aios/crypto/sha256.hpp"
@@ -13455,8 +13456,10 @@ void store_pack(const uint8_t* raw, size_t n, ByteBuffer& out, bool dense) {
 }
 
 // A packed file back to its plain bytes; false, with the reason, on anything
-// that does not check out (a damaged file is not guessed at).
-bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why) {
+// that does not check out (a damaged file is not guessed at). With `end`,
+// bytes after the last chunk are allowed (the parts a checkpoint appended:
+// store_parts) and `end` says where the packed image stops.
+bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why, size_t* end = nullptr) {
   auto fail = [&](const char* w) { if (why) *why = w; return false; };
   if (in.size() < kStorePackHeader || !store_is_packed(in)) return fail("not a packed table file");
   const uint8_t* base = in.data();
@@ -13482,7 +13485,8 @@ bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why) {
     if (p.kind == 0 && p.stored != p.len) return fail("plain chunk of the wrong size");
     at = p.in_at + p.stored;
   }
-  if (at != in.size()) return fail("bytes after the last chunk");
+  if (end) *end = at;
+  else if (at != in.size()) return fail("bytes after the last chunk");
   out.resize((size_t)n);
   std::atomic<bool> bad{false};
   auto run = [&](size_t b0, size_t b1) {
@@ -14986,6 +14990,13 @@ std::string_view ColumnStore::get_view(size_t row) const {
         if (next_off >= off && next_off <= text_arena.size()) return std::string_view(text_arena.data() + off, next_off - off);
       }
       return std::string_view(get(row));
+    case ColumnEncoding::BlockCompressed:
+      if (const size_t sealed = block_rows_sealed(); row >= sealed && row - sealed + 1 < arena_offsets.size()) {   // the open tail
+        const size_t t = row - sealed;
+        const uint32_t off = arena_offsets[t], next_off = arena_offsets[t + 1];
+        if (next_off >= off && next_off <= text_arena.size()) return std::string_view(text_arena.data() + off, next_off - off);
+      }
+      return std::string_view(get(row));
     default:
       return std::string_view(get(row));
   }
@@ -15028,11 +15039,32 @@ static bool blk_get_varint(const uint8_t*& p, const uint8_t* end, uint32_t* out)
   }
   return false;
 }
+// The block's payload packed with `codec` (ColumnStore::BlockCodec). Deflate
+// at zlib's level 6: the in-tree encoder (net/deflate.cpp), so the
+// bare-metal build packs a block exactly as a host with zlib would.
+static std::vector<uint8_t> block_compress(const uint8_t* raw, size_t n, uint8_t codec) {
+  if (codec == ColumnStore::kBlockDeflate) {
+    ByteBuffer out;
+    out.reserve(n / 3 + 64);
+    net::deflate_raw_append(ByteSpan(raw, n), 6, out);
+    out.shrink_to_fit();
+    return out;
+  }
+  return lz4_compress(raw, n);
+}
+// The payload back to its `raw` bytes (exactly blk.raw_size of them); false on a damaged block.
+static bool block_decompress(const ColumnStore::CompressedBlock& blk, uint8_t* dst, size_t raw) {
+  if (raw == 0) return true;
+  if (blk.codec == ColumnStore::kBlockDeflate)
+    return net::inflate_raw_exact(ByteSpan(blk.compressed_bytes.data(), blk.compressed_bytes.size()), dst, raw);
+  if (blk.codec != ColumnStore::kBlockLz4) return false;
+  return lz4_decompress(blk.compressed_bytes.data(), blk.compressed_bytes.size(), dst, raw);
+}
 static bool block_decode(const ColumnStore::CompressedBlock& blk, std::vector<std::string>& rows) {
   const bool legacy = !blk.offsets.empty();
   const size_t raw = legacy ? (blk.offsets.size() > blk.num_rows ? blk.offsets[blk.num_rows] : 0) : blk.raw_size;
   std::vector<uint8_t> dst(raw);
-  if (raw != 0 && !lz4_decompress(blk.compressed_bytes.data(), blk.compressed_bytes.size(), dst.data(), dst.size())) return false;
+  if (!block_decompress(blk, dst.data(), raw)) return false;
   rows.clear();
   rows.reserve(blk.num_rows);
   if (legacy) {
@@ -15216,7 +15248,25 @@ const std::string& ColumnStore::get(size_t row) const {
     }
 
     case ColumnEncoding::BlockCompressed: {
-      for (const auto& blk : compressed_blocks) {
+      // A row of the open tail: its bytes are in the arena, not in a block.
+      if (const size_t sealed = block_rows_sealed(); row >= sealed) {
+        const size_t t = row - sealed;
+        if (t + 1 < arena_offsets.size()) {
+          const uint32_t off = arena_offsets[t], next_off = arena_offsets[t + 1];
+          if (next_off >= off && next_off <= text_arena.size()) {
+            std::string& s = get_scratch_str();
+            s.assign(text_arena.data() + off, next_off - off);
+            return s;
+          }
+        }
+        return sql_null();
+      }
+      // Blocks hold kBlockRows rows each but for the last (a legacy file's may differ): found by division, checked.
+      size_t bi = std::min(row / kBlockRows, compressed_blocks.size() - 1);
+      while (bi > 0 && row < compressed_blocks[bi].start_row) --bi;
+      while (bi + 1 < compressed_blocks.size() && row >= compressed_blocks[bi].start_row + compressed_blocks[bi].num_rows) ++bi;
+      {
+        const auto& blk = compressed_blocks[bi];
         if (row >= blk.start_row && row < blk.start_row + blk.num_rows) {
           size_t local_idx = row - blk.start_row;
           // get() is const and runs on the scan thread pool, so the cache is
@@ -15236,17 +15286,17 @@ const std::string& ColumnStore::get(size_t row) const {
           }
           std::vector<std::string> rows_unpacked;
           if (block_decode(blk, rows_unpacked)) {
-            if (local_idx >= rows_unpacked.size()) break;
+            if (local_idx >= rows_unpacked.size()) return sql_null();
             std::string& s = get_scratch_str();
             s = rows_unpacked[local_idx];
             {
               std::lock_guard<aios::hal::Mutex> lk(cache_mu);
+              ++block_decodes;
               if (block_lru_cache.size() > 64) block_lru_cache.clear();
               block_lru_cache.emplace(blk.start_row, std::move(rows_unpacked));
             }
             return s;
           }
-          break;
         }
       }
       return sql_null();
@@ -16280,6 +16330,23 @@ bool ColumnStore::append_encoded(const std::string& val) {
       arena_offsets.push_back((uint32_t)text_arena.size());
       row_count_++;
       mark();
+      break;
+    }
+    case ColumnEncoding::BlockCompressed: {
+      // Onto the open tail; sealed into a block of its own once it holds
+      // kBlockRows rows. A block from before AQT6 (CSR offsets beside it)
+      // is read the old way but appended to like any other.
+      const size_t sealed = block_rows_sealed();
+      if (r < sealed) return false;   // a column whose blocks do not cover its rows: not one to append to in place
+      if (arena_offsets.empty()) { if (r != sealed) return false; arena_offsets.push_back(0); }
+      else if (arena_offsets.size() != r - sealed + 1) return false;
+      if (!null && text_arena.size() + val.size() > 0xFFFFFFFFull) return false;
+      if (!null) { grow_column_vec(text_arena, text_arena.size() + val.size()); text_arena.insert(text_arena.end(), val.begin(), val.end()); }
+      grow_column_vec(arena_offsets, arena_offsets.size() + 1);
+      arena_offsets.push_back((uint32_t)text_arena.size());
+      row_count_++;
+      mark();
+      seal_block_tail(false);
       break;
     }
     case ColumnEncoding::FSST: {
@@ -18170,28 +18237,39 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
   if (avg_len > 16.0 || ndv > 65536) {
     encoding = ColumnEncoding::BlockCompressed;
     compressed_blocks.clear();
-    size_t chunk_rows = 512;
-    for (size_t start = 0; start < row_count_; start += chunk_rows) {
-      size_t count = std::min(chunk_rows, row_count_ - start);
-      CompressedBlock blk;
-      blk.start_row = start;
-      blk.num_rows = count;
-      std::vector<uint8_t> uncompressed;   // a varint length per row, then the rows
-      std::vector<uint8_t> body;
-      for (size_t i = 0; i < count; ++i) {
-        size_t r = start + i;
-        if (is_null(r)) { blk_put_varint(uncompressed, 0); continue; }
-        const std::string& s = old_values[r];
-        blk_put_varint(uncompressed, (uint32_t)s.size());
-        body.insert(body.end(), s.data(), s.data() + s.size());
+    text_arena.clear(); text_arena.shrink_to_fit();
+    arena_offsets.clear(); arena_offsets.shrink_to_fit();
+    const size_t chunk_rows = kBlockRows;
+    const size_t nblocks = (row_count_ + chunk_rows - 1) / chunk_rows;
+    compressed_blocks.resize(nblocks);
+    // Each block on its own: the blocks of a 2 GB log table are packed on
+    // every core (deflate is several times LZ4's CPU), under the lock.
+    const uint8_t codec = block_codec_pref;
+    auto pack = [&](size_t b0, size_t b1, size_t) {
+      std::vector<uint8_t> uncompressed, body;
+      for (size_t b = b0; b < b1; ++b) {
+        const size_t start = b * chunk_rows, count = std::min(chunk_rows, row_count_ - start);
+        CompressedBlock& blk = compressed_blocks[b];
+        blk.start_row = start;
+        blk.num_rows = count;
+        blk.codec = codec;
+        uncompressed.clear(); body.clear();   // a varint length per row, then the rows
+        for (size_t i = 0; i < count; ++i) {
+          size_t r = start + i;
+          if (is_null(r)) { blk_put_varint(uncompressed, 0); continue; }
+          const std::string& s = old_values[r];
+          blk_put_varint(uncompressed, (uint32_t)s.size());
+          body.insert(body.end(), s.data(), s.data() + s.size());
+        }
+        uncompressed.insert(uncompressed.end(), body.begin(), body.end());
+        blk.raw_size = static_cast<uint32_t>(uncompressed.size());
+        blk.compressed_bytes = block_compress(uncompressed.data(), uncompressed.size(), codec);
+        blk.compressed_bytes.shrink_to_fit();
       }
-      uncompressed.insert(uncompressed.end(), body.begin(), body.end());
-      blk.raw_size = static_cast<uint32_t>(uncompressed.size());
-      blk.compressed_bytes = lz4_compress(uncompressed.data(), uncompressed.size());
-      blk.compressed_bytes.shrink_to_fit();
-      compressed_blocks.push_back(std::move(blk));
-    }
-    compressed_blocks.shrink_to_fit();
+    };
+    if (nblocks >= 8 && !SqlThreadPool::is_in_worker_thread()) SqlThreadPool::instance().parallel_for_static(nblocks, 4, pack);
+    else pack(0, nblocks, 0);
+    block_decodes = 0;
     data32.clear(); data32.shrink_to_fit();
     dict.clear(); dict.shrink_to_fit();
     id_index.clear();
@@ -18253,6 +18331,75 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     id_tag.clear();
   id_index_count = 0;
   build_zone_maps();
+}
+
+void ColumnStore::seal_block_tail(bool force) {
+  if (encoding != ColumnEncoding::BlockCompressed || arena_offsets.size() < 2) return;
+  const size_t tail_rows = arena_offsets.size() - 1;
+  if (!force && tail_rows < kBlockRows) return;
+  const size_t sealed = block_rows_sealed();
+  std::vector<uint8_t> uncompressed;   // a varint length per row, then the rows
+  uncompressed.reserve(text_arena.size() + 2 * tail_rows);
+  for (size_t t = 0; t < tail_rows; ++t) blk_put_varint(uncompressed, is_null(sealed + t) ? 0u : arena_offsets[t + 1] - arena_offsets[t]);
+  for (size_t t = 0; t < tail_rows; ++t) {
+    if (is_null(sealed + t)) continue;
+    uncompressed.insert(uncompressed.end(), text_arena.begin() + arena_offsets[t], text_arena.begin() + arena_offsets[t + 1]);
+  }
+  CompressedBlock blk;
+  blk.start_row = sealed;
+  blk.num_rows = tail_rows;
+  blk.codec = block_codec_pref;
+  blk.raw_size = (uint32_t)uncompressed.size();
+  blk.compressed_bytes = block_compress(uncompressed.data(), uncompressed.size(), blk.codec);
+  blk.compressed_bytes.shrink_to_fit();
+  compressed_blocks.push_back(std::move(blk));
+  text_arena.clear(); text_arena.shrink_to_fit();
+  arena_offsets.clear(); arena_offsets.shrink_to_fit();
+}
+
+size_t ColumnStore::recode_blocks() {
+  if (encoding != ColumnEncoding::BlockCompressed) return 0;
+  std::vector<size_t> todo;
+  for (size_t b = 0; b < compressed_blocks.size(); ++b)
+    if (compressed_blocks[b].codec != block_codec_pref || !compressed_blocks[b].offsets.empty()) todo.push_back(b);
+  if (todo.empty()) return 0;
+  std::atomic<size_t> done{0};
+  auto run = [&](size_t i0, size_t i1, size_t) {
+    std::vector<std::string> rows;
+    std::vector<uint8_t> uncompressed, body;
+    for (size_t i = i0; i < i1; ++i) {
+      CompressedBlock& blk = compressed_blocks[todo[i]];
+      if (!block_decode(blk, rows)) continue;   // left as it is: a damaged block is not made worse
+      uncompressed.clear(); body.clear();
+      for (size_t t = 0; t < blk.num_rows; ++t) {
+        if (is_null(blk.start_row + t)) { blk_put_varint(uncompressed, 0); continue; }
+        blk_put_varint(uncompressed, (uint32_t)rows[t].size());
+        body.insert(body.end(), rows[t].begin(), rows[t].end());
+      }
+      uncompressed.insert(uncompressed.end(), body.begin(), body.end());
+      blk.offsets.clear(); blk.offsets.shrink_to_fit();   // a pre-AQT6 block becomes a current one
+      blk.raw_size = (uint32_t)uncompressed.size();
+      blk.codec = block_codec_pref;
+      blk.compressed_bytes = block_compress(uncompressed.data(), uncompressed.size(), blk.codec);
+      blk.compressed_bytes.shrink_to_fit();
+      ++done;
+    }
+  };
+  if (todo.size() >= 8 && !SqlThreadPool::is_in_worker_thread()) SqlThreadPool::instance().parallel_for_static(todo.size(), 4, run);
+  else run(0, todo.size(), 0);
+  {
+    std::lock_guard<aios::hal::Mutex> lk(block_cache_mutex(this));
+    block_lru_cache.clear();
+  }
+  epoch = sql_next_mutation_seq();   // the same values, a new layout: per-column caches key on it
+  return done.load();
+}
+
+const char* ColumnStore::block_codec_name() const {
+  if (compressed_blocks.empty()) return "";
+  bool lz4 = false, deflate = false;
+  for (const auto& b : compressed_blocks) (b.codec == kBlockDeflate ? deflate : lz4) = true;
+  return lz4 && deflate ? "mixed" : deflate ? "deflate" : "lz4";
 }
 
 size_t ColumnStore::estimate_memory_bytes() const {
@@ -18371,6 +18518,7 @@ void SqlTable::ensure_columns() {
     size_t rows = col_data.empty() ? 0 : col_data[0].size();
     while (col_data.size() < columns.size()) {
       col_data.emplace_back();
+      col_data.back().block_codec_pref = text_codec;
       if (rows > 0) {
         col_data.back().resize(rows, sql_null());
       }
@@ -18976,6 +19124,7 @@ void SqlTable::cluster_by_key() {
 void SqlTable::optimize_storage(bool cluster) {
   compact_delta_buffer();
   ensure_columns();
+  for (auto& cd : col_data) cd.block_codec_pref = text_codec;   // the blocks written below take the table's TEXT_CODEC
   if (cluster) cluster_by_key();
   // New encodings, new dictionary codes: anything keyed on this table's
   // contents (per-code caches, the saved file) must see a change.
@@ -21829,6 +21978,7 @@ void SqlDatabase::maintain_storage() {
   constexpr uint64_t kRefreshBudgetNs = 8 * 1000000ull;
   size_t refreshed = 0;
   bool trimmed_tables = false;
+  size_t recode_budget = (size_t)256 << 20;   // bytes of block columns transcoded to their TEXT_CODEC this checkpoint
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
     bool changed = false;
@@ -21885,6 +22035,22 @@ void SqlDatabase::maintain_storage() {
         cs.reencode_pending = false;
         cs.typed_tried = true;
         changed = true;
+      }
+      // The table's TEXT_CODEC reaches its block columns here: blocks packed
+      // another way (the option changed; a file from before the codec byte
+      // on a DEFLATE table) are transcoded, about 256 MB of columns a
+      // checkpoint, under the lock. The open tail is left to fill.
+      cs.block_codec_pref = t.text_codec;
+      if (cs.encoding == ColumnEncoding::BlockCompressed && recode_budget > 0 &&
+          std::any_of(cs.compressed_blocks.begin(), cs.compressed_blocks.end(),
+                      [&](const ColumnStore::CompressedBlock& b) { return b.codec != cs.block_codec_pref || !b.offsets.empty(); })) {
+        const uint64_t recode_t0 = kernel_.host().monotonic_ns();
+        const size_t before_bytes = cs.estimate_memory_bytes();
+        const size_t n = cs.recode_blocks();
+        recode_budget -= std::min(recode_budget, std::max<size_t>(before_bytes, 1));
+        static const bool store_trace_c = std::getenv("AIOS_STORE_TRACE") != nullptr;
+        if (store_trace_c) fprintf(stderr, "[store] %s.%s: %zu block(s) transcoded to %s at checkpoint (%zu -> %zu bytes, %.1f ms)\n", t.name.c_str(), t.columns[c].name.c_str(), n, cs.block_codec_name(), before_bytes, cs.estimate_memory_bytes(), (kernel_.host().monotonic_ns() - recode_t0) / 1e6);
+        if (n) changed = true;
       }
       if (cs.zone_maps.empty() && cs.size() > 0) {
         static const bool store_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
@@ -45075,6 +45241,14 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
   // rest are accepted as MariaDB accepts them for InnoDB.
   while (!p.at_end() && !p.is_punct(";")) {
     if (p.take_word("COMMENT")) { p.take_punct("="); if (p.peek().kind == Tok::Str) table.comment = p.next().text; else p.next(); continue; }
+    if (p.take_word("TEXT_CODEC")) {   // ASQL's own: how the table's block-compressed text columns are packed
+      p.take_punct("=");
+      const std::string v = p.at_end() ? "" : upper_of(p.next().text);
+      if (v == "LZ4") table.text_codec = ColumnStore::kBlockLz4;
+      else if (v == "DEFLATE") table.text_codec = ColumnStore::kBlockDeflate;
+      else return make_error("TEXT_CODEC takes LZ4 or DEFLATE");
+      continue;
+    }
     if (p.take_word("AUTO_INCREMENT")) {
       p.take_punct("=");
       if (p.peek().kind == Tok::Num) table.auto_increment_next = std::max<long long>(1, std::strtoll(p.next().text.c_str(), nullptr, 10));
@@ -45565,12 +45739,27 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
     static const char* const kOpts[] = {"ENGINE", "DEFAULT", "CHARSET", "CHARACTER", "COLLATE", "COMMENT", "ROW_FORMAT", "CHECKSUM",
                                         "PACK_KEYS", "MAX_ROWS", "MIN_ROWS", "AVG_ROW_LENGTH", "KEY_BLOCK_SIZE", "DELAY_KEY_WRITE",
                                         "STATS_PERSISTENT", "STATS_AUTO_RECALC", "AUTO_INCREMENT", "CONNECTION", "DATA", "INDEX", "INSERT_METHOD",
-                                        "ENCRYPTED", "PAGE_COMPRESSED", "TRANSACTIONAL", "TABLESPACE", "STORAGE", "UNION"};
+                                        "ENCRYPTED", "PAGE_COMPRESSED", "TRANSACTIONAL", "TABLESPACE", "STORAGE", "UNION", "TEXT_CODEC"};
     bool any = false;
     for (;;) {
       bool hit = false;
       for (const char* o : kOpts) if (q.is_word(o) && !(std::string(o) == "INDEX" || std::string(o) == "DATA" || std::string(o) == "UNION")) hit = true;
       if (!hit) break;
+      if (q.take_word("TEXT_CODEC")) {
+        // ASQL's own: LZ4 (the default) or DEFLATE for the table's block-compressed text columns. The columns
+        // follow it from their next block on; the blocks they hold are transcoded by the next checkpoints.
+        q.take_punct("=");
+        const std::string v = q.at_end() ? "" : upper_of(q.next().text);
+        uint8_t codec = 0;
+        if (v == "LZ4") codec = ColumnStore::kBlockLz4;
+        else if (v == "DEFLATE") codec = ColumnStore::kBlockDeflate;
+        else { q.fail_exact("TEXT_CODEC takes LZ4 or DEFLATE"); return -1; }
+        t->text_codec = codec;
+        for (auto& cd : t->col_data) cd.block_codec_pref = codec;
+        t->mutation_seq = sql_next_mutation_seq();
+        any = true;
+        continue;
+      }
       if (q.take_word("AUTO_INCREMENT")) {
         q.take_punct("=");
         if (q.peek().kind != Tok::Num) return -1;
@@ -45603,7 +45792,7 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
   {
     const size_t at = p.pos();
     const int took = table_option(p);
-    if (took < 0) return make_error("AUTO_INCREMENT needs a number");
+    if (took < 0) return make_error(p.failed() ? p.error() : "AUTO_INCREMENT needs a number");
     if (took == 1 && (p.at_end() || p.is_punct(";"))) {
       checkpoint();
       SqlQueryResult res;
@@ -46334,8 +46523,16 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
         const ColumnStore& cs = t.col_data[c];
         const size_t bytes = cs.estimate_memory_bytes();
         const size_t rows = cs.size();
+        // A block column names its blocks' codec and how many blocks have
+        // been decoded since it was loaded or encoded (Block/lz4 r=12): the
+        // reading an operator sizes TEXT_CODEC by.
+        std::string enc = vx_encoding_name(cs.encoding);
+        if (cs.encoding == ColumnEncoding::BlockCompressed) {
+          enc += "/"; enc += cs.block_codec_name();
+          enc += " r=" + std::to_string(cs.block_decodes);
+        }
         res.rows.push_back(SqlRow{{kv.first, t.columns[c].name, sql_engine_column_type(t.columns[c]),
-                                   vx_encoding_name(cs.encoding), std::to_string(rows),
+                                   enc, std::to_string(rows),
                                    std::to_string(vx::dict_coded(cs) ? vx::dict_size(cs) : 0), std::to_string(bytes),
                                    [&] { char b[32]; std::snprintf(b, sizeof(b), "%.2f", rows ? (double)bytes / (double)rows : 0.0); return std::string(b); }()}});
       }
@@ -46729,6 +46926,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
     }
     opts += " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci";
     if (const SqlTable* tt = resolve_table(name); tt && !tt->comment.empty()) opts += " COMMENT=" + sql_quote_literal(tt->comment);
+    if (const SqlTable* tt = resolve_table(name); tt && tt->text_codec == ColumnStore::kBlockDeflate) opts += " TEXT_CODEC=DEFLATE";
     SqlQueryResult res;
     res.is_result_set = true;
     res.columns = {"Table", "Create Table"};
@@ -52052,13 +52250,14 @@ constexpr uint32_t kStoreMagicV3 = 0x51534C33;  // "QSL3"
 // by the next save.
 // ---------------------------------------------------------------------------
 namespace {
+constexpr uint32_t kColStoreMagicV7 = 0x41515437; // "AQT7": a codec byte per compressed block (LZ4 or deflate); a block column may carry an open tail
 constexpr uint32_t kColStoreMagicV6 = 0x41515436; // "AQT6": compressed blocks keep lengths in the payload, compact FSST boundaries
 constexpr uint32_t kColStoreMagicV5 = 0x41515435; // "AQT5": compact RLE runs
 constexpr uint32_t kColStoreMagicV4 = 0x41515434; // "AQT4": AQT3 and each column's segment layout (SegmentFOR, ALP)
 constexpr uint32_t kColStoreMagicV3 = 0x41515433; // "AQT3": zone maps keyed by general_ci weight
 constexpr uint32_t kColStoreMagicV2 = 0x41515432; // "AQT2": keyed lower-cased, PAD SPACE
 constexpr uint32_t kColStoreMagicV1 = 0x41515431; // "AQT1": keyed on lowered text
-constexpr uint32_t kColStoreMagic = kColStoreMagicV6;
+constexpr uint32_t kColStoreMagic = kColStoreMagicV7;
 constexpr uint32_t kManifestMagic = 0x41514D31;   // "AQM1"
 // After the columns: the table's secondary indices (UNIQUE ones enforced) and
 // foreign keys. They were never written: a table kept them only while its
@@ -52076,6 +52275,26 @@ constexpr uint32_t kCreateTimeTrailerMagic = 0x41514354;  // "AQCT"
 constexpr uint32_t kRulesTrailerMagic = 0x41515255;       // "AQRU": generated columns and CHECK constraints
 constexpr uint32_t kAutoIncTrailerMagic = 0x41514149;     // "AQAI": the AUTO_INCREMENT counter
 constexpr uint32_t kCommentTrailerMagic = 0x4151434d;     // "AQCM": table/column/index comments, index prefix lengths and types
+constexpr uint32_t kTextCodecTrailerMagic = 0x41515443;   // "AQTC": the TEXT_CODEC table option
+// After the manifest's entries: where each entry's file validly ends (u64
+// each, in entry order). A file is its packed image and then the parts
+// appended to it; a part past this length is one a checkpoint wrote but
+// never named (a crash before its manifest), and is not read. A loader from
+// before parts stops at the entries and reads only whole images.
+constexpr uint32_t kManifestLengthsMagic = 0x41514d4c;    // "AQML"
+// A part appended to a table file by a checkpoint whose only change to the
+// table was appended rows (snapshot_tables_v4): the rows [from, to) as
+// text, one length-prefixed cell after another, row-major, store_pack'ed.
+//   u32 magic, u64 gen, u64 from, u64 to, u32 ncols, u64 payload bytes, u64 hash of the payload, payload
+// The loader appends them to the table through the same path an INSERT
+// takes (ColumnStore::push_back), so the columns come back encoded as they
+// would be after those inserts.
+constexpr uint32_t kPartMagic = 0x41514150;               // "AQAP"
+constexpr size_t kPartHeader = 4 + 8 + 8 + 8 + 4 + 8 + 8;
+// Parts are appended while they stay a small share of the table; past this
+// the next checkpoint writes the table whole again (the parts fold in).
+constexpr size_t kPartMaxRowsFloor = 50000;    // appended rows a table may hold as parts, at least ...
+constexpr uint32_t kPartMaxCount = 64;         // ... and at most this many parts
 inline bool table_has_comments(const SqlTable& t) {
   if (!t.comment.empty()) return true;
   for (const auto& col : t.columns) if (!col.comment.empty()) return true;
@@ -52226,6 +52445,7 @@ void put_column(Writer& w, const ColumnStore& c) {
   for (const auto& b : c.compressed_blocks) {
     w.u64(b.start_row); w.u64(b.num_rows);
     put_pod_vec(w, b.compressed_bytes); put_pod_vec(w, b.offsets); w.u32(b.raw_size);
+    w.u8(b.codec);   // AQT7
   }
   // AQT4
   put_pod_vec(w, c.seg_base); put_pod_vec(w, c.seg_bits); put_pod_vec(w, c.seg_byte_at);
@@ -52363,6 +52583,18 @@ bool get_column(Reader& r, ColumnStore& c, uint32_t magic = kColStoreMagic) {
     if (!get_pod_vec(r, b.compressed_bytes) || !get_pod_vec(r, b.offsets)) return false;
     if (magic >= kColStoreMagicV6) b.raw_size = r.u32();
     else b.raw_size = b.offsets.empty() ? 0 : b.offsets.back();
+    b.codec = magic >= kColStoreMagicV7 ? r.u8() : (uint8_t)ColumnStore::kBlockLz4;
+    if (b.codec > ColumnStore::kBlockDeflate) return false;
+  }
+  if (c.encoding == ColumnEncoding::BlockCompressed) {
+    // The blocks cover the rows from the first, in order; what is left is the open tail (AQT7), in the arena.
+    size_t at = 0;
+    for (const auto& b : c.compressed_blocks) { if (b.start_row != at) return false; at += b.num_rows; }
+    if (at > c.row_count_) return false;
+    const size_t tail = c.row_count_ - at;
+    if (tail == 0 ? !c.arena_offsets.empty() : c.arena_offsets.size() != tail + 1) return false;
+    if (!c.arena_offsets.empty() && (c.arena_offsets.front() != 0 || c.arena_offsets.back() != c.text_arena.size())) return false;
+    for (size_t i = 1; i < c.arena_offsets.size(); ++i) if (c.arena_offsets[i] < c.arena_offsets[i - 1]) return false;
   }
   if (aqt4) {
     if (!get_pod_vec(r, c.seg_base) || !get_pod_vec(r, c.seg_bits) || !get_pod_vec(r, c.seg_byte_at)) return false;
@@ -52524,7 +52756,51 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       state.still_ns = still;
       dense_budget -= std::min(dense_budget, std::max<size_t>(prev->second.bytes, 1));
     }
+    state.layout = t.layout_seq;
+    // Only appended since the file was written (its layout stands, no row
+    // it holds changed, rows only grew, same shape): the new rows go to the
+    // file as a part. An append-only table (an audit log) was re-encoded and
+    // rewritten whole - 2 GB of it - at every checkpoint that added rows.
+    // The parts stay a bounded share of the table (kPartMaxRowsFloor,
+    // kPartMaxCount, a quarter of the base rows); past that, or when a row
+    // already stored changes, the table is written whole and the parts fold
+    // in. A file whose size is not what the last manifest recorded (a part
+    // a crash left unnamed) is written whole too, never appended behind.
+    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && prev->second.layout == t.layout_seq &&
+        prev->second.seq != state.seq && state.rows > prev->second.rows && prev->second.shape == state.shape &&
+        prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount &&
+        prev->second.part_rows + (state.rows - prev->second.rows) <= std::max(kPartMaxRowsFloor, prev->second.base_rows / 4)) {
+      auto st = kernel_.host().stat(dir + "/" + prev->second.file);
+      if (st.ok() && (uint64_t)st->size == prev->second.file_bytes) {
+        CheckpointImage::TableImage ti;
+        ti.key = kv.first;
+        ti.file = prev->second.file;
+        ti.dense = prev->second.dense;
+        ti.append = true;
+        ti.rows_from = prev->second.rows;
+        ti.rows_to = state.rows;
+        ti.ncols = t.col_data.size();
+        ti.part_cells.reserve((ti.rows_to - ti.rows_from) * ti.ncols);
+        for (size_t r = ti.rows_from; r < ti.rows_to; ++r)
+          for (size_t c = 0; c < ti.ncols; ++c) ti.part_cells.push_back(t.col_data[c].get(r));
+        for (const auto& cell : ti.part_cells) img.bytes += cell.size();
+        state.file = prev->second.file;
+        state.dense = prev->second.dense;
+        state.bytes = prev->second.bytes;
+        state.base_rows = prev->second.base_rows;
+        state.part_rows = prev->second.part_rows + (ti.rows_to - ti.rows_from);
+        state.parts = prev->second.parts + 1;
+        state.file_bytes = prev->second.file_bytes;   // write_checkpoint adds the part's bytes
+        static const bool store_trace_p = std::getenv("AIOS_STORE_TRACE") != nullptr;
+        if (store_trace_p) fprintf(stderr, "[store] %s: %zu row(s) appended to %s as part %u (%zu of %zu rows in parts)\n", t.name.c_str(), ti.rows_to - ti.rows_from, ti.file.c_str(), state.parts, state.part_rows, state.rows);
+        img.tables.push_back(std::move(ti));
+        entries.emplace_back(kv.first, state.file);
+        saved_now[kv.first] = state;
+        continue;
+      }
+    }
     state.dense = dense;
+    state.base_rows = state.rows;
     ++rewritten;
     unpacked_tables_.erase(kv.first);   // written packed now
     CheckpointImage::TableImage ti;
@@ -52586,6 +52862,10 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       w.u32(kAutoIncTrailerMagic);
       w.u64((uint64_t)t.auto_increment_next);
     }
+    if (t.text_codec != 0) {
+      w.u32(kTextCodecTrailerMagic);
+      w.u8(t.text_codec);
+    }
     if (table_has_comments(t)) {
       w.u32(kCommentTrailerMagic);
       w.str(t.comment);
@@ -52607,15 +52887,89 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.file = file;
     saved_now[kv.first] = state;
   }
+  // The manifest is finished by write_checkpoint (manifest_bytes), once every
+  // file's valid length is known; the databases it names are taken here, under the lock.
+  img.databases.assign(databases_.begin(), databases_.end());
+  return Ok();
+}
+
+// The manifest naming this generation: its entries, then where each entry's file validly ends (kManifestLengthsMagic).
+std::vector<uint8_t> SqlDatabase::manifest_bytes(const CheckpointImage& img) const {
   Writer m;
   m.u32(kManifestMagic);
-  m.u64(gen);
-  m.u32((uint32_t)databases_.size());
-  for (const auto& d : databases_) m.str(d);
-  m.u32((uint32_t)entries.size());
-  for (const auto& e : entries) { m.str(e.first); m.str(e.second); }
-  img.manifest = m.take();
-  return Ok();
+  m.u64(img.gen);
+  m.u32((uint32_t)img.databases.size());
+  for (const auto& d : img.databases) m.str(d);
+  m.u32((uint32_t)img.entries.size());
+  for (const auto& e : img.entries) { m.str(e.first); m.str(e.second); }
+  m.u32(kManifestLengthsMagic);
+  for (const auto& e : img.entries) {
+    auto sv = img.saved.find(e.first);
+    m.u64(sv == img.saved.end() ? 0 : sv->second.file_bytes);   // 0: the whole file (none of it is a part)
+  }
+  return m.take();
+}
+
+// One part (kPartMagic) holding `cells` (rows * ncols, row-major) as rows [from, to) of the table, for generation gen.
+static std::vector<uint8_t> store_part_bytes(uint64_t gen, size_t from, size_t to, size_t ncols, const std::vector<std::string>& cells, bool dense) {
+  Writer w;
+  for (const auto& cell : cells) w.str(cell);
+  std::vector<uint8_t> plain = w.take();
+  ByteBuffer packed;
+  store_pack(plain.data(), plain.size(), packed, dense);
+  std::vector<uint8_t> out;
+  out.resize(kPartHeader + packed.size());
+  uint8_t* p = out.data();
+  store_put(p, kPartMagic, 4); p += 4;
+  store_put(p, gen, 8); p += 8;
+  store_put(p, from, 8); p += 8;
+  store_put(p, to, 8); p += 8;
+  store_put(p, ncols, 4); p += 4;
+  store_put(p, packed.size(), 8); p += 8;
+  store_put(p, store_hash64(packed.data(), packed.size()), 8); p += 8;
+  std::memcpy(p, packed.data(), packed.size());
+  return out;
+}
+
+// The parts of a table file after its packed image, within [at, limit): each
+// one checked (header, hash, generation at most `gen`, rows following on)
+// and its rows appended to `t` the way an INSERT appends them. Stops at the
+// first part that does not check out: what follows is not guessed at. False,
+// with why, when a part that checks out cannot be applied (rows not following
+// on, the wrong column count): the table is not loaded half.
+static bool store_parts(ByteSpan file, size_t at, size_t limit, uint64_t gen, SqlTable& t, size_t* parts, size_t* part_rows, bool* recoded, std::string* why) {
+  *parts = 0; *part_rows = 0; *recoded = false;
+  t.ensure_columns();
+  while (at + kPartHeader <= limit) {
+    const uint8_t* p = file.data() + at;
+    if ((uint32_t)store_get(p, 4) != kPartMagic) break;
+    const uint64_t pgen = store_get(p + 4, 8), from = store_get(p + 12, 8), to = store_get(p + 20, 8);
+    const uint32_t ncols = (uint32_t)store_get(p + 28, 4);
+    const uint64_t len = store_get(p + 32, 8), hash = store_get(p + 40, 8);
+    if (pgen > gen) break;   // written by a checkpoint whose manifest never landed: its rows are in the redo log
+    if (len > limit - at - kPartHeader) break;   // truncated
+    const uint8_t* payload = p + kPartHeader;
+    if (store_hash64(payload, (size_t)len) != hash) break;
+    if (from != t.row_count() || to < from) { if (why) *why = "a part's rows do not follow the table's"; return false; }
+    if (ncols != t.col_data.size()) { if (why) *why = "a part with the wrong column count"; return false; }
+    ByteBuffer plain;
+    std::string uw;
+    if (!store_unpack(ByteSpan(payload, (size_t)len), plain, &uw)) { if (why) *why = "a part that does not unpack: " + uw; return false; }
+    Reader r(ByteSpan(plain.data(), plain.size()));
+    for (uint64_t row = from; row < to; ++row) {
+      for (uint32_t c = 0; c < ncols; ++c) {
+        std::string cell = r.str();
+        if (!r.ok()) { if (why) *why = "a part shorter than its rows"; return false; }
+        const uint32_t before = t.col_data[c].recodes;
+        t.col_data[c].push_back(cell);
+        if (t.col_data[c].recodes != before) *recoded = true;
+      }
+    }
+    ++*parts;
+    *part_rows += (size_t)(to - from);
+    at += kPartHeader + (size_t)len;
+  }
+  return true;
 }
 
 // The files of a snapshot, then the manifest that names them: on the
@@ -52636,9 +52990,18 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
     ~ShedWbuf() { if (b.capacity() > (size_t)32 << 20) std::vector<uint8_t>().swap(b); }
   } shed_wbuf{checkpoint_wbuf_};
   for (auto& ti : img.tables) {
+    auto sv = img.saved.find(ti.key);
+    if (ti.append) {
+      // The rows appended since the file was written, as one part on its end.
+      const std::vector<uint8_t> part = store_part_bytes(img.gen, ti.rows_from, ti.rows_to, ti.ncols, ti.part_cells, ti.dense);
+      auto ar = h.append_file(dir + "/" + ti.file, ByteSpan(part.data(), part.size()));
+      if (!ar.ok()) return ar;
+      if (sv != img.saved.end()) sv->second.file_bytes += part.size();
+      std::vector<std::string>().swap(ti.part_cells);
+      continue;
+    }
     checkpoint_wbuf_.clear();
     Writer w(checkpoint_wbuf_);
-    auto sv = img.saved.find(ti.key);
     if (sv != img.saved.end() && sv->second.bytes) w.buf().reserve(sv->second.bytes + sv->second.bytes / 8);
     w.raw(ByteSpan(ti.head.data(), ti.head.size()));
     for (const auto& c : ti.cols) put_column(w, c);
@@ -52649,6 +53012,7 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
     store_pack(w.buf().data(), w.buf().size(), packed, ti.dense);
     auto wr = h.write_file(dir + "/" + ti.file, ByteSpan(packed.data(), packed.size()));
     if (!wr.ok()) return wr;
+    if (sv != img.saved.end()) sv->second.file_bytes = packed.size();   // the whole file is the image: parts start here
     // The copies stay for the next snapshot of this table, within the pool's
     // budget (AIOS_CHECKPOINT_POOL_MB); beyond it they go now.
     size_t sz = 0;
@@ -52664,6 +53028,7 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
     checkpoint_pool_bytes_ = 0;
   }
   const uint64_t w1 = h.monotonic_ns();
+  img.manifest = manifest_bytes(img);
   auto mw = h.write_file(dir + "/MANIFEST", ByteSpan(img.manifest.data(), img.manifest.size()));
   if (!mw.ok()) return mw;
   const uint64_t w2 = h.monotonic_ns();
@@ -52750,25 +53115,38 @@ bool SqlDatabase::load_tables_v4() {
   // A table whose file cannot be read is left out - and its file moved aside below, not left for the next checkpoint
   // to sweep away as "not in the manifest": that deleted the only copy of a damaged table without a word.
   std::vector<std::pair<std::string, std::string>> damaged;   // file, why
-  for (uint32_t i = 0; i < nt && m.ok(); ++i) {
-    std::string key = m.str(), file = m.str();
+  // The entries, then (kManifestLengthsMagic) where each one's file validly
+  // ends: a manifest from before parts has no lengths, and its files are
+  // whole images (0: all of the file).
+  std::vector<std::pair<std::string, std::string>> manifest_entries;
+  for (uint32_t i = 0; i < nt && m.ok(); ++i) { std::string key = m.str(), file = m.str(); manifest_entries.emplace_back(std::move(key), std::move(file)); }
+  std::vector<uint64_t> valid_lengths(manifest_entries.size(), 0);
+  if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
+    for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
+  for (size_t ei = 0; ei < manifest_entries.size(); ++ei) {
+    const std::string& key = manifest_entries[ei].first;
+    const std::string& file = manifest_entries[ei].second;
     auto tf = kernel_.host().read_file(dir + "/" + file);
     if (!tf.ok()) { damaged.push_back({file, "unreadable: " + tf.error().message}); continue; }
     ByteBuffer plain;
     ByteSpan body(tf->data(), tf->size());
     const bool packed = store_is_packed(body);
+    size_t image_end = tf->size();   // where the packed image stops: parts, if any, follow
+    std::shared_ptr<ByteBuffer> file_bytes_kept;   // the file while its parts are read
     if (packed) {
       std::string why;
-      if (!store_unpack(body, plain, &why)) {
+      if (!store_unpack(body, plain, &why, &image_end)) {
         damaged.push_back({file, why});
         continue;
       }
+      if (image_end < tf->size()) file_bytes_kept = std::make_shared<ByteBuffer>(std::move(*tf));
       ByteBuffer().swap(*tf);
       body = ByteSpan(plain.data(), plain.size());
     }
+    const uint64_t valid_end = valid_lengths[ei] ? std::min<uint64_t>(valid_lengths[ei], file_bytes_kept ? file_bytes_kept->size() : image_end) : (file_bytes_kept ? file_bytes_kept->size() : image_end);
     Reader r(body);
     const uint32_t magic = r.u32();
-    if (magic != kColStoreMagic && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3 && magic != kColStoreMagicV2 && magic != kColStoreMagicV1) {
+    if (magic != kColStoreMagic && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3 && magic != kColStoreMagicV2 && magic != kColStoreMagicV1) {
       damaged.push_back({file, "not a table file this version reads"});
       continue;
     }
@@ -52874,21 +53252,54 @@ bool SqlDatabase::load_tables_v4() {
         if (im.size() == t.indices.size())
           for (size_t i = 0; i < im.size(); ++i) { t.indices[i].comment = im[i].comment; if (!im[i].type.empty()) t.indices[i].type = im[i].type; t.indices[i].sub_parts = im[i].sub; }
       }
+      trailer = r.ok() && r.remaining() >= 4 ? r.u32() : 0;
     }
+    if (trailer == kTextCodecTrailerMagic && r.ok()) {
+      const uint8_t codec = r.u8();
+      if (r.ok() && codec <= ColumnStore::kBlockDeflate) t.text_codec = codec;
+      trailer = r.ok() && r.remaining() >= 4 ? r.u32() : 0;
+    }
+    for (auto& cd : t.col_data) cd.block_codec_pref = t.text_codec;
     // A TEMPORARY table of a session that ended with the process: never loaded.
     if (hidden_table_name(t.name)) continue;
     // An older file's zone maps were keyed by an older collation (no PAD
     // SPACE, or lower-cased ASCII only): pruning on them could skip a segment
     // that matches. Rebuild them from the data; the table is rewritten at the
     // next checkpoint.
-    if (magic != kColStoreMagic && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3)
+    if (magic != kColStoreMagic && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3)
       for (auto& cd : t.col_data) cd.build_zone_maps();
     t.ensure_columns();
+    const size_t base_rows = t.row_count();
+    // The parts appended since the image was written: their rows go on the
+    // table as an INSERT's would. A part a crash left unnamed by any
+    // manifest (past valid_end, or of a later generation) is not read.
+    size_t parts = 0, part_rows = 0;
+    bool part_recoded = false;
+    if (file_bytes_kept && image_end < valid_end) {
+      std::string why;
+      if (!store_parts(ByteSpan(file_bytes_kept->data(), file_bytes_kept->size()), image_end, (size_t)valid_end, gen, t, &parts, &part_rows, &part_recoded, &why)) {
+        damaged.push_back({file, "parts not loaded: " + why});
+        continue;
+      }
+      if (parts) {
+        t.mutation_seq = sql_next_mutation_seq();
+        if (part_recoded) t.layout_seq = t.mutation_seq;
+        static const bool store_trace_l = std::getenv("AIOS_STORE_TRACE") != nullptr;
+        if (store_trace_l) fprintf(stderr, "[store] %s.%s: %zu row(s) from %zu part(s) appended to the %zu of its image\n", t.database.c_str(), t.name.c_str(), part_rows, parts, base_rows);
+      }
+    }
+    file_bytes_kept.reset();
     // Re-saved as-is later only if its zone maps are current and it is
     // packed (an AQT1 file, or one written before store_pack, gets rewritten
     // at the next checkpoint).
-    if (magic == kColStoreMagic) {
-      saved_tables_[key] = SavedTableFile{file, t.mutation_seq, t.row_count(), table_shape_signature(t)};
+    if (magic == kColStoreMagic || magic == kColStoreMagicV6) {   // an AQT6 file reads back complete: re-saved only when the table changes
+      SavedTableFile st{file, t.mutation_seq, t.row_count(), table_shape_signature(t)};
+      st.layout = t.layout_seq;
+      st.base_rows = base_rows;
+      st.part_rows = part_rows;
+      st.parts = (uint32_t)parts;
+      st.file_bytes = packed ? valid_end : 0;   // the image, then the parts read: where the next part goes
+      saved_tables_[key] = st;
       if (!packed) unpacked_tables_.insert(key);   // converted per checkpoint (maintain_storage)
     } else {
       unpacked_tables_.insert(key);   // legacy format: upgrade to AQT6 and pack

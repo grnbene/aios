@@ -920,18 +920,45 @@ struct ColumnStore {
   std::vector<char> text_arena;
   std::vector<uint32_t> arena_offsets; // CSR layout (size: row_count_ + 1)
 
-  // BlockCompressed storage (LZ4 64KB chunks):
+  // BlockCompressed storage: 512-row blocks, each compressed on its own.
+  // The codec is per block: LZ4 (decodes at memory speed) or raw deflate
+  // (about four times smaller on the text of a log table, several times
+  // the CPU to read back). A table chooses with TEXT_CODEC = LZ4 | DEFLATE
+  // (SqlTable::text_codec); the column keeps the choice in block_codec_pref
+  // and applies it to every block it writes from then on.
+  enum BlockCodec : uint8_t { kBlockLz4 = 0, kBlockDeflate = 1 };
   struct CompressedBlock {
     size_t start_row = 0;
     size_t num_rows = 0;
     uint32_t raw_size = 0;          // bytes once decompressed
-    // lz4( one varint length per row, then the rows' bytes ): no offset array to keep beside it
+    uint8_t codec = kBlockLz4;      // BlockCodec (AQT7; every older file's block is LZ4)
+    // codec( one varint length per row, then the rows' bytes ): no offset array to keep beside it
     std::vector<uint8_t> compressed_bytes;
     // A block written before AQT6: its payload is the rows' bytes only and these are its CSR offsets (num_rows + 1).
     std::vector<uint32_t> offsets;
   };
   std::vector<CompressedBlock> compressed_blocks;
+  // Rows appended since the last block was sealed (an open tail): their
+  // bytes in text_arena, CSR offsets in arena_offsets (tail rows + 1). The
+  // tail becomes a block at kBlockRows rows. Before it, an append to a block
+  // column decoded the whole column into a dictionary and the next
+  // checkpoint re-encoded it whole: a write-only log table of 2 GB paid
+  // both for every batch of inserts.
+  static constexpr size_t kBlockRows = 512;
+  size_t block_rows_sealed() const { return compressed_blocks.empty() ? 0 : compressed_blocks.back().start_row + compressed_blocks.back().num_rows; }
+  uint8_t block_codec_pref = kBlockLz4;   // the codec for blocks written from now on
+  // Blocks decoded (cache misses) since the column was loaded or encoded:
+  // SHOW ASQL STORAGE shows it, so an operator can see whether a table's
+  // blocks are read before putting it on DEFLATE.
+  mutable uint64_t block_decodes = 0;
   mutable std::unordered_map<size_t, std::vector<std::string>> block_lru_cache;
+  // The open tail sealed into a block (when it holds at least kBlockRows rows, or `force` and any at all).
+  void seal_block_tail(bool force);
+  // Every block transcoded to block_codec_pref (decode, encode again); blocks already in it are left alone.
+  // Returns how many were transcoded.
+  size_t recode_blocks();
+  // The blocks' codecs as one word: "lz4", "deflate", "mixed" ("" for a column without blocks).
+  const char* block_codec_name() const;
 
   // SegmentFOR and ALP: per 2048-row segment the base its offsets count
   // from and their bit width; seg_byte_at[s] is where segment s starts in
@@ -1524,6 +1551,12 @@ struct SqlTable {
   // ALTER TABLE ... AUTO_INCREMENT = n and restarts (0: not known yet; the largest stored id then decides).
   long long auto_increment_next = 0;
   std::string comment;   // COMMENT='text' table option
+  // TEXT_CODEC = LZ4 | DEFLATE table option (ColumnStore::BlockCodec): how
+  // this table's block-compressed text columns are packed. LZ4 unless
+  // said otherwise; DEFLATE for a table written far more than it is read
+  // (an audit log), whose blocks then take about a quarter of the memory.
+  // Kept in the store (AQTC trailer) and shown by SHOW CREATE TABLE.
+  uint8_t text_codec = 0;
   // Stamped by every write (sql_next_mutation_seq); the store checkpoint
   // compares it with the stamp of the file it last wrote for this table.
   uint64_t mutation_seq = 0;
@@ -1908,7 +1941,16 @@ class SqlDatabase {
   // Store format 4 (per-table files of encoded columns, under a manifest).
   // dense: the file is deflate-packed (a table that had stopped changing); else LZ4, the checkpoint's fast form.
   // still_ns: since when the table has not changed (monotonic).
-  struct SavedTableFile { std::string file; uint64_t seq = 0; size_t rows = 0; uint64_t shape = 0; size_t bytes = 0; bool dense = false; uint64_t still_ns = 0; };
+  // layout: the table's layout_seq when the file was written - moved only
+  // by a change to rows already stored, so while it stands and rows were
+  // only appended, the checkpoint appends them to the file as a part
+  // (write_checkpoint) instead of writing the table whole. base_rows: the
+  // rows of the whole image; part_rows: rows appended as parts since;
+  // file_bytes: where the valid file ends (the manifest records it).
+  struct SavedTableFile {
+    std::string file; uint64_t seq = 0; size_t rows = 0; uint64_t shape = 0; size_t bytes = 0; bool dense = false; uint64_t still_ns = 0;
+    uint64_t layout = 0; size_t base_rows = 0; size_t part_rows = 0; uint64_t file_bytes = 0; uint32_t parts = 0;
+  };
   Result<void> save_tables_v4();
   bool load_tables_v4();
   Result<void> save_views();
@@ -1929,9 +1971,15 @@ class SqlDatabase {
     uint64_t gen = 0;
     // A changed table: its header and trailers serialized, its columns
     // copied (memcpy under the lock; serialized by the writer thread).
-    struct TableImage { std::string key, file; std::vector<uint8_t> head, tail; std::vector<ColumnStore> cols; bool dense = false; };
+    struct TableImage {
+      std::string key, file; std::vector<uint8_t> head, tail; std::vector<ColumnStore> cols; bool dense = false;
+      // An append-only change: rows [rows_from, rows_to) as text, row-major
+      // (rows * ncols cells), appended to the file as a part; cols stays empty.
+      bool append = false; size_t rows_from = 0, rows_to = 0, ncols = 0; std::vector<std::string> part_cells;
+    };
     std::vector<TableImage> tables;
     std::vector<uint8_t> manifest;
+    std::vector<std::string> databases;                                  // databases_ as of the snapshot (the manifest names them)
     std::vector<std::pair<std::string, std::string>> entries;            // key -> file
     std::unordered_map<std::string, SavedTableFile> saved;
     std::string cdc_text;        // cdc_position as of the snapshot ("" = unchanged)
@@ -1942,6 +1990,7 @@ class SqlDatabase {
   Result<void> flush_impl(bool async, bool maintain = true);
   Result<void> snapshot_tables_v4(CheckpointImage& img);   // under the exclusive statement lock
   Result<void> write_checkpoint(CheckpointImage& img);     // off the lock
+  std::vector<uint8_t> manifest_bytes(const CheckpointImage& img) const;   // the manifest naming img's generation
   bool rotate_redo(CheckpointImage& img);
   void checkpoint_loop();
   void checkpoint_wait_idle();

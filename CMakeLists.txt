@@ -734,6 +734,12 @@ target_link_libraries(aios-engine PRIVATE aios)
 add_executable(aios-compute-wire-bench tools/compute-wire-bench.cpp)
 target_link_libraries(aios-compute-wire-bench PRIVATE aios)
 
+add_executable(aios-asql-codec-bench tools/asql-codec-bench.cpp)
+target_link_libraries(aios-asql-codec-bench PRIVATE aios)
+
+add_executable(aios-asql-append-check tools/asql-append-check.cpp)
+target_link_libraries(aios-asql-append-check PRIVATE aios)
+
 add_executable(aios-asql-top tools/asql-top.cpp)
 target_link_libraries(aios-asql-top PRIVATE aios)
 
