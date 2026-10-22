@@ -66,3 +66,13 @@ Claude), never push; no test suites, drive it with probes.
   race with the background key-index build. Worth a loop under gdb next.
 - Slowest real statement: the open-orders 8-way join with the `dispatched`
   CTE, ~150 ms warm (route JOIN_SCAN); the rest are a few ms.
+
+## Real-schema SHOW CREATE TABLE deltas (557 tables, 81 identical after 16l)
+
+387 `NOT NULL DEFAULT ''` lost (store seeded by the older engine; re-seed from
+MariaDB with the current engine restores it), 194 ROW_FORMAT=DYNAMIC and 150
+`USING BTREE` not persisted, 63 float shown as double (same seeding cause), 36
+per-column CHARACTER SET utf8mb3, 12 FULLTEXT keys seeded as plain KEY, 60
+index COMMENTs. None of these change query results; they matter for
+mysqldump/migration tooling. A `SYNC SCHEMA` that re-reads DDL from the CDC
+source would fix the seeding-era ones without a reload.
