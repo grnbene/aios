@@ -944,7 +944,7 @@ SceneDescription compose_scene(const std::string& request) {
   }
 
   // ---- what is standing on it --------------------------------------------
-  float tint[3];
+  float tint[3] = {0.0f, 0.0f, 0.0f};
   const bool tinted = colour_in(q, tint);
   std::string subject;
 
@@ -955,8 +955,6 @@ SceneDescription compose_scene(const std::string& request) {
     s.gloss = gloss;
     return s;
   };
-
-  const bool plural = mentions(q, "s ") || (!q.empty() && q[q.size() - 1] == 's');
 
   if (mentions(q, "dragon") || mentions(q, "wyvern") || mentions(q, "drake")) {
     // A creature, not an arrangement: laid out as a skeleton with flesh hung

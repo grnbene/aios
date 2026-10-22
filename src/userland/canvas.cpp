@@ -212,21 +212,6 @@ std::string accelerator_brief(Kernel& k) {
 
 namespace {
 
-// Every compute device the fabric holds, named by the device itself, with the
-// lane count it reports. No device = the empty string, and the caller says
-// "no accelerator" rather than naming a card this machine may not have.
-std::string device_summary(Kernel& k, bool brief) {
-  std::string out;
-  for (Device* d : k.devices().all()) {
-    if (!d) continue;
-    if (!out.empty()) out += "  |  ";
-    out += ascii(d->name());
-    if (!brief) out += " (" + dec(d->capacity().lanes) + " lanes)";
-  }
-  return out;
-}
-
-
 std::string fit(const HardwareCompositor& S, std::string t, int room, Face face) {
   if (room <= 0) return std::string();
   t = ascii(t);
@@ -2541,12 +2526,12 @@ static void draw_unblink_mind_start_page(HardwareCompositor& S, std::vector<uint
     // The trail, behind it along the ring, tapering away.
     const float dir = (o.speed >= 0.0f) ? -1.0f : 1.0f;
     for (int t = 1; t <= 9; ++t) {
-      const float f = (float)t / 9.0f;
+      const float tf = (float)t / 9.0f;
       float tx, ty, td;
-      orbit_at(o, ang + dir * f * 0.42f, &tx, &ty, &td);
+      orbit_at(o, ang + dir * tf * 0.42f, &tx, &ty, &td);
       if ((td >= 0.0f) != near_half) continue;
-      const float fade = (1.0f - f) * (1.0f - f);
-      emblem_body(buf, iw, ih, tx, ty, o.r * (0.55f + 0.30f * (1.0f - f)) * (0.72f + 0.28f * (0.5f + 0.5f * td)),
+      const float fade = (1.0f - tf) * (1.0f - tf);
+      emblem_body(buf, iw, ih, tx, ty, o.r * (0.55f + 0.30f * (1.0f - tf)) * (0.72f + 0.28f * (0.5f + 0.5f * td)),
                   tint(o.rgb), fade * 0.34f * lit * load_dim, on_gpu);
     }
     emblem_body(buf, iw, ih, px, py, o.r * (0.78f + 0.34f * (0.5f + 0.5f * depth)),
@@ -2786,7 +2771,7 @@ static void draw_unblink_mind_start_page(HardwareCompositor& S, std::vector<uint
 
   auto hero_card = [&](TileKind kind, int cx, int cy, int card_w, int card_h) {
     const HeroFace* hf = &hero_faces[0];
-    for (const HeroFace& f : hero_faces) if (f.kind == kind) { hf = &f; break; }
+    for (const HeroFace& face : hero_faces) if (face.kind == kind) { hf = &face; break; }
 
     // Deep slate glass card background & outline
     S.draw_rect_to(buf, iw, ih, cx, cy, card_w, card_h, 0xF80F172A);
@@ -2836,11 +2821,11 @@ static void draw_unblink_mind_start_page(HardwareCompositor& S, std::vector<uint
   // ---------------------------------------------------------------------------
   // Workstation & Co-Pilot Telemetry HUD
   // ---------------------------------------------------------------------------
-  auto telemetry_tile = [&](int box_x, int ws_y, int box_w, int ws_h) {
+  auto telemetry_tile = [&](int tile_x, int ws_y, int tile_w, int ws_h) {
     const WorkstationState& a = st.apps;
-    S.draw_rect_to(buf, iw, ih, box_x, ws_y, box_w, ws_h, 0xF80F172A);
-    S.draw_round_outline_to(buf, iw, ih, box_x, ws_y, box_w, ws_h, 8, 0xFF334155);
-    S.draw_rect_to(buf, iw, ih, box_x + 12, ws_y, box_w - 24, 2, 0xFF38BDF8);
+    S.draw_rect_to(buf, iw, ih, tile_x, ws_y, tile_w, ws_h, 0xF80F172A);
+    S.draw_round_outline_to(buf, iw, ih, tile_x, ws_y, tile_w, ws_h, 8, 0xFF334155);
+    S.draw_rect_to(buf, iw, ih, tile_x + 12, ws_y, tile_w - 24, 2, 0xFF38BDF8);
 
     // Row one: Editor workspace state
     std::string ed;
@@ -2874,31 +2859,31 @@ static void draw_unblink_mind_start_page(HardwareCompositor& S, std::vector<uint
     const int ctl_room = kTileRight;
     if (ws_h < 52) {
       // Folded: the label, and the one reading that changed most recently.
-      S.draw_label_to(buf, iw, ih, box_x + 16, ws_y + 11, "WORKSTATION TELEMETRY", 0xFF94A3B8, 2);
+      S.draw_label_to(buf, iw, ih, tile_x + 16, ws_y + 11, "WORKSTATION TELEMETRY", 0xFF94A3B8, 2);
       std::string one = a.has_editor ? ed : db;
-      int room = box_w - 32 - S.label_width("WORKSTATION TELEMETRY", 2) - 24 - ctl_room;
+      int room = tile_w - 32 - S.label_width("WORKSTATION TELEMETRY", 2) - 24 - ctl_room;
       if (room > 20) {
         std::string vis = fit(S, one, room, Face::UiSmall);
-        S.draw_text_to(buf, iw, ih, box_x + box_w - 16 - ctl_room - S.text_width(vis, Face::UiSmall),
+        S.draw_text_to(buf, iw, ih, tile_x + tile_w - 16 - ctl_room - S.text_width(vis, Face::UiSmall),
                        ws_y + 10, vis, a.has_editor ? ed_col : db_col, Face::UiSmall);
       }
       return;
     }
-    S.draw_label_to(buf, iw, ih, box_x + 16, ws_y + 9, "WORKSTATION TELEMETRY & SUBSTRATE LOG", 0xFF94A3B8, 2);
+    S.draw_label_to(buf, iw, ih, tile_x + 16, ws_y + 9, "WORKSTATION TELEMETRY & SUBSTRATE LOG", 0xFF94A3B8, 2);
     // The value column starts after the WIDEST label, measured. It was a flat
     // 66px, which fits "EDIT" and "SQL" and is painted straight through by
     // "SUBSTRATE".
     int label_col = 0;
     for (const char* l : {"EDIT", "SQL", "HOST", "KERNEL", "SUBSTRATE"})
       label_col = std::max(label_col, S.label_width(l, 1));
-    const int value_x = box_x + 16 + label_col + 14;
-    int hud_room = box_x + box_w - ctl_room - 16 - value_x;
-    S.draw_label_to(buf, iw, ih, box_x + 16, ws_y + 28, "EDIT", 0xFF94A3B8, 1);
+    const int value_x = tile_x + 16 + label_col + 14;
+    int hud_room = tile_x + tile_w - ctl_room - 16 - value_x;
+    S.draw_label_to(buf, iw, ih, tile_x + 16, ws_y + 28, "EDIT", 0xFF94A3B8, 1);
     if (hud_room > 20) {
       S.draw_text_to(buf, iw, ih, value_x, ws_y + 26, fit(S, ed, hud_room, Face::Mono), ed_col, Face::Mono);
     }
     if (ws_h >= 68) {
-      S.draw_label_to(buf, iw, ih, box_x + 16, ws_y + 49, "SQL", 0xFF94A3B8, 1);
+      S.draw_label_to(buf, iw, ih, tile_x + 16, ws_y + 49, "SQL", 0xFF94A3B8, 1);
       if (hud_room > 20) {
         S.draw_text_to(buf, iw, ih, value_x, ws_y + 47, fit(S, db, hud_room, Face::Mono), db_col, Face::Mono);
       }
@@ -2913,7 +2898,7 @@ static void draw_unblink_mind_start_page(HardwareCompositor& S, std::vector<uint
     const int line = S.line_height(Face::Mono) + 6;
     auto row = [&](const char* label, const std::string& value, uint32_t ink) {
       if (sy + line > ws_y + ws_h - 6) return;
-      S.draw_label_to(buf, iw, ih, box_x + 16, sy + 2, label, 0xFF94A3B8, 1);
+      S.draw_label_to(buf, iw, ih, tile_x + 16, sy + 2, label, 0xFF94A3B8, 1);
       if (hud_room > 20)
         S.draw_text_to(buf, iw, ih, value_x, sy, fit(S, value, hud_room, Face::Mono), ink, Face::Mono);
       sy += line;
@@ -3724,8 +3709,8 @@ void paint_canvas(HardwareCompositor& S, std::vector<uint32_t>& out, uint32_t W,
     // the entity beside it ("ATTENUAT4e5f805beb01").
     int kind_w = 0;
     for (int kk = AuthorityEvent::Minted; kk <= AuthorityEvent::Attenuated; ++kk) {
-      const int w = S.label_width(authority_event_name((AuthorityEvent::Kind)kk), 1);
-      if (w > kind_w) kind_w = w;
+      const int lw = S.label_width(authority_event_name((AuthorityEvent::Kind)kk), 1);
+      if (lw > kind_w) kind_w = lw;
     }
     const int id_at = 16 + kind_w + 10;
     // Newest first: what just happened is what a person came to see.
@@ -3783,12 +3768,12 @@ void paint_canvas(HardwareCompositor& S, std::vector<uint32_t>& out, uint32_t W,
         for (const auto& d : *dirs) {
           auto files = k.host().list_dir(base + "/" + d);
           if (!files.ok()) continue;
-          for (const auto& f : *files) {
-            if (f.size() < 5 || f.substr(f.size() - 4) != ".aoc") continue;
+          for (const auto& fname : *files) {
+            if (fname.size() < 5 || fname.substr(fname.size() - 4) != ".aoc") continue;
             CanvasState::Snapshot snap;
-            snap.path = base + "/" + d + "/" + f;
+            snap.path = base + "/" + d + "/" + fname;
             snap.entity = d.size() >= 12 ? d.substr(0, 12) : d;
-            snap.ordinal = atoi(f.c_str());
+            snap.ordinal = atoi(fname.c_str());
             auto info = k.host().stat(snap.path);
             if (info.ok()) snap.bytes = info->size;
             // The host boundary reports no modification time, so the ordinal in

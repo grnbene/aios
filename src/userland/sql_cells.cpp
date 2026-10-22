@@ -971,12 +971,13 @@ void CellEngine::load() {
       else if (tag == "stats") std::sscanf(rest.c_str(), "%llu\t%llu\t%llu\t%llu", (unsigned long long*)&changes, (unsigned long long*)&run, (unsigned long long*)&failed, (unsigned long long*)&created);
       else if (tag == "edges") next_job_id_ = std::max(next_job_id_, (uint64_t)std::strtoull(rest.c_str(), nullptr, 10));
       else if (tag == "inflight") {   // id, key, bit, rise|fall
-        std::vector<std::string> f;
+        std::vector<std::string> fields;
         size_t b = 0;
-        for (size_t e; (e = rest.find('\t', b)) != std::string::npos; b = e + 1) f.push_back(rest.substr(b, e - b));
-        f.push_back(rest.substr(b));
-        if (f.size() == 4)
-          pend.push_back({std::strtoull(f[0].c_str(), nullptr, 10), f[1], (size_t)std::strtoull(f[2].c_str(), nullptr, 10), f[3] == "rise"});
+        for (size_t e; (e = rest.find('\t', b)) != std::string::npos; b = e + 1) fields.push_back(rest.substr(b, e - b));
+        fields.push_back(rest.substr(b));
+        if (fields.size() == 4)
+          pend.push_back({std::strtoull(fields[0].c_str(), nullptr, 10), fields[1], (size_t)std::strtoull(fields[2].c_str(), nullptr, 10),
+                          fields[3] == "rise"});
       }
       else if (tag == "acted") {
         const size_t t2 = rest.find('\t');

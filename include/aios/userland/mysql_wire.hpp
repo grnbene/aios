@@ -22,6 +22,7 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +41,10 @@ class Sha256 {
 namespace userland {
 
 class SqlDatabase;
+
+// A latin1 column's bytes as UTF-8. MariaDB's latin1 is cp1252, and it
+// converts every byte of it, valid-looking UTF-8 sequences included.
+std::string cp1252_bytes_to_utf8(std::string_view s);
 
 // Cryptographic scrambles for MySQL auth plugins.
 std::vector<uint8_t> mysql_native_scramble(const std::string& password,

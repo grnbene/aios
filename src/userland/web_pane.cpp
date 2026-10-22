@@ -1103,8 +1103,8 @@ HostBindings surface_bindings(Kernel& k, Surface who, const std::string& dream) 
       for (const auto& id : kp->store().list()) {
         auto o = kp->store().get(id);
         if (!o.ok()) continue;
-        const std::string k = o->meta("kind");
-        if (!k.empty()) counts[k]++;
+        const std::string obj_kind = o->meta("kind");
+        if (!obj_kind.empty()) counts[obj_kind]++;
       }
       std::string out = "[";
       bool first = true;

@@ -3,6 +3,8 @@
 // the encoding cannot hold exactly stays as it was.
 
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include <string>
 #include <vector>
 #include "aios/kernel/kernel.hpp"
@@ -28,7 +30,36 @@ static std::vector<std::string> dump(SqlDatabase& db, const std::string& sql) {
   return out;
 }
 
+// A DECIMAL(15,8) column whose scaled values need all 32 bits (30.00000000 is
+// 3e9 scaled), saved and read back by a fresh engine: the dictionary-to-scaled
+// re-encode used to clear the 32-bit codes it had just written, and every
+// weight came back 0.00000000.
+static void full_width_survives_reload() {
+  char root[] = "/tmp/aios-asql-decfixed-reload-XXXXXX";
+  if (!mkdtemp(root)) { expect(false, "temp root for the reload"); return; }
+  const std::vector<std::string> want = {"1|1.00000000|", "2|30.00000000|", "3|0.00000000|", "4|21.47483648|", "5|40.00000000|"};
+  {
+    KernelConfig cfg; cfg.root = root;
+    auto k = Kernel::boot(cfg);
+    if (!k.ok()) { expect(false, "boot for the reload"); return; }
+    SqlDatabase db(**k);
+    db.init("sql_db");
+    db.execute_local_query("CREATE TABLE weights (id INT PRIMARY KEY, w DECIMAL(15,8) NOT NULL);");
+    db.execute_local_query("INSERT INTO weights VALUES (1, 1.0), (2, 30.0), (3, 0.0), (4, 21.47483648), (5, 40.0);");
+    expect(dump(db, "SELECT id, w FROM weights ORDER BY id;") == want, "DECIMAL(15,8) before the save");
+    db.execute_local_query("FLUSH TABLES;");
+  }
+  KernelConfig cfg; cfg.root = root;
+  auto k = Kernel::boot(cfg);
+  if (!k.ok()) { expect(false, "boot after the save"); return; }
+  SqlDatabase db(**k);
+  db.init("sql_db");
+  expect(dump(db, "SELECT id, w FROM weights ORDER BY id;") == want, "DECIMAL(15,8) at full 32-bit width reads back after a reload");
+}
+
 int main() {
+  full_width_survives_reload();
+
   KernelConfig cfg;
   cfg.root = "/tmp/aios-asql-decfixed-test";
   auto k_res = Kernel::boot(cfg);

@@ -223,7 +223,7 @@ struct Engine {
   // float itself, `overflow` other than visible, a flex or grid item, a table
   // cell -- gets a fresh list and leaves the outer one as it found it.
   struct FloatBox { int x, y, w, h; bool right; };
-  std::vector<FloatBox> floats_;
+  std::vector<FloatBox> floats_{};
   struct FloatScope {
     std::vector<FloatBox>* slot;
     std::vector<FloatBox> saved;
@@ -296,7 +296,7 @@ struct Engine {
 
   // The `<a>` currently being walked, so every word inside it becomes part of
   // the same link even when the anchor wraps three elements deep.
-  std::string open_href;
+  std::string open_href{};
 
 
   // A length in pixels. `vw` and `vh` are percentages of the VIEWPORT, which
@@ -320,8 +320,8 @@ struct Engine {
     int width = -1;
   };
   mutable std::array<MeasureKey, 4096> measure_cache_{};
-  mutable std::unordered_map<const Node*, int> min_content_cache_;
-  mutable std::unordered_map<const Node*, int> max_content_cache_;
+  mutable std::unordered_map<const Node*, int> min_content_cache_{};
+  mutable std::unordered_map<const Node*, int> max_content_cache_{};
 
   static bool font_eq(const FontKey& a, const FontKey& b) {
     return a.px == b.px && a.bold == b.bold && a.italic == b.italic &&
@@ -366,7 +366,7 @@ struct Engine {
     bool fixed;        // against the viewport rather than an ancestor
     int z;             // the stacking level it paints at
   };
-  std::vector<OutOfFlow> pending_;
+  std::vector<OutOfFlow> pending_{};
 
   // The stacking level fragments are being emitted at, and the clip in force.
   int z_ = 0;
@@ -600,11 +600,11 @@ struct Engine {
       // A leading `(...)` group (possibly several joined by `and`) is the condition.
       size_t cond_end = k;
       int d = 0;
-      for (size_t m = k; m < entry.size(); ++m) {
-        if (entry[m] == '(') ++d;
-        else if (entry[m] == ')') { --d; if (d == 0) cond_end = m + 1; }
-        else if (d == 0 && entry[m] == ' ' && m + 4 <= entry.size() && entry.compare(m, 5, " and ") == 0) { m += 4; }
-        else if (d == 0 && entry[m] != ' ' && m >= cond_end) break;
+      for (size_t j = k; j < entry.size(); ++j) {
+        if (entry[j] == '(') ++d;
+        else if (entry[j] == ')') { --d; if (d == 0) cond_end = j + 1; }
+        else if (d == 0 && entry[j] == ' ' && j + 4 <= entry.size() && entry.compare(j, 5, " and ") == 0) { j += 4; }
+        else if (d == 0 && entry[j] != ' ' && j >= cond_end) break;
       }
       if (cond_end > k) media = entry.substr(k, cond_end - k);
       const std::string len = entry.substr(cond_end > k ? cond_end : k);
@@ -1260,21 +1260,21 @@ struct Engine {
       // if even that item does not fit in what is left, the line drops below
       // the nearest float and tries again, which is how text flows past the
       // bottom of a picture.
-      int x = flow_x, width = flow_w;
+      int band_x = flow_x, band_w = flow_w;
       if (!floats_.empty()) {
         for (int guard = 0; guard < 64; ++guard) {
           const int band = items[i].h > 0 ? items[i].h : 18;
           int lo, hi;
           float_room(cursor_y, band, flow_x, flow_x + flow_w, lo, hi);
-          x = lo;
-          width = hi - lo;
+          band_x = lo;
+          band_w = hi - lo;
           const int first_w = items[i].w;
-          if (width >= first_w || width >= flow_w) break;
+          if (band_w >= first_w || band_w >= flow_w) break;
           const int below = next_float_end(cursor_y);
           if (below < 0) break;
           cursor_y = below;
         }
-        if (width < 16) width = 16;
+        if (band_w < 16) band_w = 16;
       }
 
       size_t line_start = i;
@@ -1300,11 +1300,11 @@ struct Engine {
         // column, where a bold 16px SKU drew on top of the item's name and the
         // two read as one garbled word. What does not fit is not drawn; the
         // machine's look step reports the cut so the mind can widen the box.
-        if (line_w == 0 && w > width && it.kind == InlineItem::Kind::Word && it.text.size() > 1 &&
+        if (line_w == 0 && w > band_w && it.kind == InlineItem::Kind::Word && it.text.size() > 1 &&
             it.style.white_space != WhiteSpace::Nowrap) {
           const int ell_w = measure("\u2026", it.style);
           std::string cut = it.text;
-          while (!cut.empty() && measure(cut, it.style) + ell_w > width) {
+          while (!cut.empty() && measure(cut, it.style) + ell_w > band_w) {
             size_t at = cut.size() - 1;
             while (at > 0 && ((unsigned char)cut[at] & 0xC0) == 0x80) --at;
             cut.erase(at);
@@ -1319,7 +1319,7 @@ struct Engine {
         // `white-space: nowrap` -- the item says its line is not to be broken, so
         // it stays on this one and overflows rather than becoming a column of
         // single words.
-        if (line_w > 0 && line_w + w > width && it.style.white_space != WhiteSpace::Nowrap) break;
+        if (line_w > 0 && line_w + w > band_w && it.style.white_space != WhiteSpace::Nowrap) break;
         line_w += w;
         if (it.h > max_h) max_h = it.h;
         if (it.ascent > max_ascent) max_ascent = it.ascent;
@@ -1343,9 +1343,9 @@ struct Engine {
       }
       if (max_h <= 0) max_h = 18;
 
-      int pen_x = x;
-      if (align == Align::Center && visible_w < width) pen_x = x + (width - visible_w) / 2;
-      else if (align == Align::Right && visible_w < width) pen_x = x + (width - visible_w);
+      int pen_x = band_x;
+      if (align == Align::Center && visible_w < band_w) pen_x = band_x + (band_w - visible_w) / 2;
+      else if (align == Align::Right && visible_w < band_w) pen_x = band_x + (band_w - visible_w);
 
       // One Text fragment per run of items sharing a face, a colour and a
       // link. Merging them is not an optimisation: an underline has to be
@@ -2437,10 +2437,10 @@ struct Engine {
             it->st.height.is_auto() && !it->auto_t && !it->auto_b)
           imposed_h_ = row_h;
         if (it->anonymous) {
-          std::vector<InlineItem> run;
+          std::vector<InlineItem> anon_items;
           WidthScope icb(&inline_cb_w_, it->w);
-          collect_inline(*it->node, it->st, run, depth + 1);
-          h = flow_inline(run, pen, cursor_y, it->w, it->st.text_align);
+          collect_inline(*it->node, it->st, anon_items, depth + 1);
+          h = flow_inline(anon_items, pen, cursor_y, it->w, it->st.text_align);
         } else {
           // The size flexing settled on, as a border-box width: layout_box
           // honours a declared width, so state it. Margins are the page's own.
@@ -3612,8 +3612,8 @@ struct Engine {
       for (size_t i = frag_start; i < doc.fragments.size(); ++i) {
         Fragment& f = doc.fragments[i];
         int nx = cx, ny = cy, nw = cw, nh = ch;
-        if (cs.overflow_x == Overflow::Visible) { nx = f.clipped ? f.clip_x : -1 << 28; nw = f.clipped ? f.clip_w : 1 << 29; }
-        if (!clips_y) { ny = f.clipped ? f.clip_y : -1 << 28; nh = f.clipped ? f.clip_h : 1 << 29; }
+        if (cs.overflow_x == Overflow::Visible) { nx = f.clipped ? f.clip_x : -(1 << 28); nw = f.clipped ? f.clip_w : 1 << 29; }
+        if (!clips_y) { ny = f.clipped ? f.clip_y : -(1 << 28); nh = f.clipped ? f.clip_h : 1 << 29; }
         if (f.clipped) {
           const int x0 = nx > f.clip_x ? nx : f.clip_x;
           const int y0 = ny > f.clip_y ? ny : f.clip_y;

@@ -1146,10 +1146,6 @@ Object* g_response_proto = nullptr;
 Object* g_request_proto = nullptr;
 Object* g_stream_proto = nullptr;
 
-ResponseObject* as_response(const Value& v) {
-  if (v.is_object() && v.as_object()->cls == js::Class::Host && static_cast<HostObject*>(v.as_object())->host_kind == HostKind::Response) return static_cast<ResponseObject*>(v.as_object());
-  return nullptr;
-}
 RequestObject* as_request(const Value& v) {
   if (v.is_object() && v.as_object()->cls == js::Class::Host && static_cast<HostObject*>(v.as_object())->host_kind == HostKind::Request) return static_cast<RequestObject*>(v.as_object());
   return nullptr;

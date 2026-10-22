@@ -8,7 +8,9 @@
 #include "aios/crypto/portable_uint128.hpp"
 #define AIOS_U128 aios::crypto::portable::U128
 #else
-#define AIOS_U128 unsigned __int128
+// __extension__: GCC's -Wpedantic reports every unsigned __int128 otherwise.
+__extension__ typedef unsigned __int128 aios_u128_t;
+#define AIOS_U128 aios_u128_t
 #endif
 
 namespace aios::crypto {
@@ -142,12 +144,6 @@ bool fe_is_negative(const fe f) {
   uint8_t s[32];
   fe_tobytes(s, f);
   return (s[0] & 1) != 0;
-}
-
-bool fe_equal(const fe a, const fe b) {
-  fe d;
-  fe_sub(d, a, b);
-  return fe_is_zero(d);
 }
 
 // z^(p-2), the ref10 addition chain.

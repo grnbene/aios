@@ -454,7 +454,6 @@ static void escape_into(std::string& out, const std::string& s, bool attr) {
     else if (c == '<' && !attr) out += "&lt;";
     else if (c == '>' && !attr) out += "&gt;";
     else if (c == '"' && attr) out += "&quot;";
-    else if (c == 0xC2 && false) out += c;
     else out += c;
   }
 }

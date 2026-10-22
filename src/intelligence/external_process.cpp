@@ -507,7 +507,7 @@ Result<std::unique_ptr<Intelligence>> spawn_external_intelligence(const std::vec
   // A machine can tune how long the kernel waits on a reply before it treats the
   // channel as faulted and (on the next exchange) respawns the peer. Lower it on
   // a fast local model; raise it for a slow remote one.
-  if (const char* env = std::getenv("AIOS_BRIDGE_TIMEOUT_MS")) { char* end = nullptr; unsigned long v = std::strtoul(env, &end, 10); if (end != env && v > 0) timeout_ms = v; }
+  if (const char* tmo = std::getenv("AIOS_BRIDGE_TIMEOUT_MS")) { char* end = nullptr; unsigned long v = std::strtoul(tmo, &end, 10); if (end != tmo && v > 0) timeout_ms = v; }
   auto l = launch_peer(argv, env, (int)timeout_ms);
   if (!l.ok()) return Result<std::unique_ptr<Intelligence>>(l.status(), l.error().message);
   return std::unique_ptr<Intelligence>(new ExternalIntelligence(argv, env, l->pid, l->in_fd, l->out_fd, l->name, timeout_ms));

@@ -178,12 +178,6 @@ std::vector<std::string> split_commas(const std::string& s) {
   return out;
 }
 
-bool is_plain_ident(const std::string& s) {
-  if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-  for (char c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
-  return true;
-}
-
 // ---- exact decimals: values are summed in units of 1e-9 ----
 using I128 = AIOS_INT128;
 const I128 kUnit = 1000000000;

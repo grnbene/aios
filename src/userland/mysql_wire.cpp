@@ -48,26 +48,6 @@ namespace aios::userland {
 
 namespace {
 
-// Helper: convert string to uppercase
-std::string to_upper_wire(std::string s) {
-  for (char& c : s) {
-    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-  }
-  return s;
-}
-
-std::string trim_wire(const std::string& s) {
-  size_t start = 0;
-  while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
-    ++start;
-  }
-  size_t end = s.size();
-  while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r' || s[end - 1] == '\n' || s[end - 1] == ';')) {
-    --end;
-  }
-  return s.substr(start, end - start);
-}
-
 // Minimum-length integer helpers
 [[maybe_unused]] uint64_t u24(const uint8_t* p) {
   return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16);
@@ -588,6 +568,8 @@ std::string quote_literal(const std::string& s) {
 }
 
 }  // namespace
+
+std::string cp1252_bytes_to_utf8(std::string_view s) { return cp1252_to_utf8(s); }
 
 // --- SHA-256 Implementation --------------------------------------------------
 namespace {

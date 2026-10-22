@@ -1165,20 +1165,20 @@ Result<void> TlsClient::connect_over(std::unique_ptr<hal::Connection> conn, cons
     s.send_keys.set(ByteSpan(c_hs.data(), c_hs.size()));
   }
   if (cert_requested) {
-    ByteBuffer body;
-    body.push_back((uint8_t)cert_req_ctx.size());
-    raw(body, ByteSpan(cert_req_ctx.data(), cert_req_ctx.size()));
+    ByteBuffer cert_body;
+    cert_body.push_back((uint8_t)cert_req_ctx.size());
+    raw(cert_body, ByteSpan(cert_req_ctx.data(), cert_req_ctx.size()));
     ByteBuffer list;
     const uint16_t alg = client_sig_alg(s.client_key, server_sig_algs, true);
     const bool present = !s.client_chain.empty() && alg != 0;
     if (present)
       for (const auto& cert : s.client_chain) { be24(list, (uint32_t)cert.der.size()); raw(list, bspan(cert.der)); be16(list, 0); }
-    be24(body, (uint32_t)list.size());
-    raw(body, bspan(list));
+    be24(cert_body, (uint32_t)list.size());
+    raw(cert_body, bspan(list));
     ByteBuffer msg;
     msg.push_back(HS_CERTIFICATE);
-    be24(msg, (uint32_t)body.size());
-    raw(msg, bspan(body));
+    be24(msg, (uint32_t)cert_body.size());
+    raw(msg, bspan(cert_body));
     raw(s.transcript, bspan(msg));
     if (auto rr = s.send_record(REC_HANDSHAKE, bspan(msg)); !rr.ok()) return rr;
     if (present) {

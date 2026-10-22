@@ -260,7 +260,6 @@ RupCheck check_rup(const std::vector<std::vector<int>>& formula, const std::vect
   for (const auto& c : formula) ck.add(c);
   for (int l : cube) ck.add({l});
   if (ck.settle_units(0)) { out.verified = true; out.why = "formula and cube conflict by propagation alone"; return out; }
-  size_t units_done = ck.cls.size();
   size_t i = 0;
   std::vector<int> lemma;
   while (i < n) {
@@ -297,7 +296,6 @@ RupCheck check_rup(const std::vector<std::vector<int>>& formula, const std::vect
     const int v0 = ck.value(lemma[0]);
     const int v1 = lemma.size() > 1 ? ck.value(lemma[1]) : -1;
     ck.add(lemma);
-    units_done = ck.cls.size();
     if (v0 < 0) { out.verified = true; return out; }
     if (v0 == 0 && v1 < 0) {
       const size_t mark = ck.trail.size();
