@@ -41,6 +41,24 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_jit_arm64.cpp
   ${AIOS_ROOT}/src/userland/grain_builtins.cpp
   ${AIOS_ROOT}/src/userland/grain_std_hash.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_regex.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_time.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_text.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_path.cpp
+  ${AIOS_ROOT}/src/js/regexp.cpp
+  ${AIOS_ROOT}/src/js/unicode.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_http.cpp
+  ${AIOS_ROOT}/src/channel/http_client.cpp
+  ${AIOS_ROOT}/src/net/tls.cpp
+  ${AIOS_ROOT}/src/net/tls_conn.cpp
+  ${AIOS_ROOT}/src/node/secure.cpp
+  ${AIOS_ROOT}/src/crypto/aes_gcm.cpp
+  ${AIOS_ROOT}/src/crypto/curve25519.cpp
+  ${AIOS_ROOT}/src/crypto/nistp.cpp
+  ${AIOS_ROOT}/src/crypto/rsa.cpp
+  ${AIOS_ROOT}/src/crypto/x509.cpp
+  ${AIOS_ROOT}/src/core/base64.cpp
+  ${AIOS_ROOT}/src/core/result.cpp
   ${AIOS_ROOT}/src/userland/grain_sockets.cpp
   ${AIOS_ROOT}/src/crypto/sha256.cpp
   ${AIOS_ROOT}/src/crypto/sha1.cpp
@@ -51,19 +69,23 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/glyph_engine.cpp
   ${AIOS_ROOT}/src/userland/font_atlas.cpp)
 
-# The host: threads and sleeping, processes, sockets - one file of each per OS.
+# The host: the machine (files, clocks, randomness - what TLS asks of it), threads
+# and sleeping, processes, sockets - one file of each per OS.
 if(WIN32)
   set(GRAIN_HOST_SOURCES
+    ${AIOS_ROOT}/src/hal/win_host.cpp
     ${AIOS_ROOT}/src/hal/win_sync.cpp
     ${AIOS_ROOT}/src/hal/win_process.cpp
     ${AIOS_ROOT}/src/hal/win_net.cpp)
 elseif(APPLE)
   set(GRAIN_HOST_SOURCES
+    ${AIOS_ROOT}/src/hal/mac_host.cpp
     ${AIOS_ROOT}/src/hal/posix_sync.cpp
     ${AIOS_ROOT}/src/hal/posix_process.cpp
     ${AIOS_ROOT}/src/hal/mac_net.cpp)
 else()
   set(GRAIN_HOST_SOURCES
+    ${AIOS_ROOT}/src/hal/linux_host.cpp
     ${AIOS_ROOT}/src/hal/posix_sync.cpp
     ${AIOS_ROOT}/src/hal/posix_process.cpp
     ${AIOS_ROOT}/src/hal/linux_net.cpp)
@@ -73,6 +95,8 @@ add_library(grain_lang STATIC ${GRAIN_LANG_SOURCES} ${GRAIN_HOST_SOURCES} ${AIOS
 target_include_directories(grain_lang PUBLIC ${AIOS_ROOT}/include PRIVATE ${AIOS_ROOT}/cli)
 find_package(Threads REQUIRED)
 target_link_libraries(grain_lang PUBLIC Threads::Threads)
+# The host layer without the telemetry it feeds aios's world model (src/hal/linux_host.cpp).
+target_compile_definitions(grain_lang PRIVATE AIOS_HAL_HOST_ONLY)
 if(WIN32)
   target_link_libraries(grain_lang PUBLIC ws2_32)   # win_net.cpp: Winsock
   target_compile_definitions(grain_lang PUBLIC NOMINMAX _CRT_SECURE_NO_WARNINGS)

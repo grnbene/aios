@@ -54,6 +54,7 @@ grain_case(cli.args ${CLI_CASES} 0 run args.gr one "two words" 3)
 grain_case(cli.shortcut ${CLI_CASES} 0 args.gr via-shortcut)
 grain_case(cli.sys ${CLI_CASES} 0 run sys.gr)
 grain_case(cli.files WRITES:${CLI_CASES} 0 run files.gr)
+grain_case(cli.stdlib WRITES:${CLI_CASES} 0 run stdlib.gr)
 grain_case(cli.exec ${CLI_CASES} 0 run exec.gr)
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
@@ -68,3 +69,18 @@ grain_case(cli.dis ${CLI_CASES} 0 dis args.gr)
 
 add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain
   COMMENT "rewriting grain/tests/expected from the current build")
+
+# The HTTP client against a local server (tests/net): needs Python 3 to run the
+# server, and nothing beyond this machine. The live HTTPS checks
+# (tests/net/tls_live.gr) need the internet and are run by hand.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  set(HTTP_ARGS -DPYTHON=${Python3_EXECUTABLE} -DGRAIN=$<TARGET_FILE:grain> -DNET_DIR=${CMAKE_CURRENT_SOURCE_DIR}/net
+                -DPORT_FILE=${CMAKE_CURRENT_BINARY_DIR}/http_port.txt -DEXPECTED=${EXPECTED_DIR}/net.http_local.out)
+  add_test(NAME grain.net.http_local COMMAND ${CMAKE_COMMAND} ${HTTP_ARGS} -P ${CMAKE_CURRENT_SOURCE_DIR}/run_http.cmake)
+  set_tests_properties(grain.net.http_local PROPERTIES TIMEOUT 60)
+  add_custom_target(grain-update-expected-http
+    COMMAND ${CMAKE_COMMAND} ${HTTP_ARGS} -DUPDATE=1 -P ${CMAKE_CURRENT_SOURCE_DIR}/run_http.cmake DEPENDS grain)
+else()
+  message(STATUS "grain: no Python 3, so the HTTP client test (grain.net.http_local) is not run")
+endif()

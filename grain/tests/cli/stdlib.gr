@@ -1,0 +1,116 @@
+# The portable standard library's newer parts. Every check compares with a
+# value worked out independently (published digests, the calendar, ECMAScript's
+# own answers), so a wrong result says WRONG rather than becoming the golden.
+let failures = 0
+let checks = 0
+fn check(label, got, want) {
+  checks = checks + 1
+  if got == want {
+    print("  ok   ", label)
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+fn fails(f) { return not pcall(f).ok }
+
+print("regex")
+check("test", regex_test("^h.llo$", "hello"), true)
+check("test no", regex_test("^h.llo$", "help"), false)
+check("ignore case", regex_test("HELLO", "hello", "i"), true)
+let m = regex_match("(\\d+)-(\\d+)", "tel 555-0199 x")
+check("match text", m.text, "555-0199")
+check("match start", m.start, 4)
+check("match end", m.end, 12)
+check("groups", m.groups, ["555", "0199"])
+check("no match is nil", regex_match("z+", "abc"), nil)
+let n = regex_match("(?<y>\\d{4})-(?<mo>\\d{2})", "on 2026-10-22")
+check("named", n.named.y + "/" + n.named.mo, "2026/10")
+check("unmatched group is nil", regex_match("a(b)?c", "ac").groups, [nil])
+check("find_all", map(regex_find_all("\\d+", "a1 b22 c333"), fn (x) { return x.text }), ["1", "22", "333"])
+check("replace all", regex_replace("o", "foo boo", "0"), "f00 b00")
+check("replace groups", regex_replace("(\\w+)@(\\w+)", "ann@x bob@y", "$2:$1"), "x:ann y:bob")
+check("replace named", regex_replace("(?<w>\\w+)", "hi", "<$<w>>"), "<hi>")
+check("replace $& and $$", regex_replace("\\d", "a1", "[$&$$]"), "a[1$]")
+check("replace with fn", regex_replace("\\d+", "2 and 30", fn (x) { return str(int(x.text) * 2) }), "4 and 60")
+check("split", regex_split("\\s*,\\s*", "a , b,c ,d"), ["a", "b", "c", "d"])
+check("split empty pattern", regex_split("", "abc"), ["a", "b", "c"])
+check("empty matches advance", len(regex_find_all("x*", "ab")), 3)
+check("utf-8 offsets are bytes", regex_match("l+", "héllo").start, 3)
+check("unicode class", regex_test("^\\p{L}+$", "héllo", "u"), true)
+check("bad pattern is an error", fails(fn () { return regex_test("(", "x") }), true)
+check("bad flag is an error", fails(fn () { return regex_test("a", "a", "q") }), true)
+
+print("time")
+check("epoch parts", date_format(0, "%Y-%m-%d %H:%M:%S %a", "utc"), "1970-01-01 00:00:00 Thu")
+let t = date_parse("2026-10-22T14:05:09.250Z")
+check("parse Z", t, 1792677909.25)
+check("format back", date_format(t, "%F %T.%L %A %B %j %I%p %z", "utc"), "2026-10-22 14:05:09.250 Thursday October 295 02PM +0000")
+check("offset parsed", date_parse("2026-10-22T16:05:09+02:00"), 1792677909)
+check("date only is midnight utc", date_parse("2000-02-29"), 951782400)
+check("parts", date_parts(951782400, "utc").weekday, 2)
+check("leap day yearday", date_parts(951782400, "utc").yearday, 60)
+check("make utc", date_make(2026, 10, 22, 14, 5, 9, "utc"), 1792677909)
+check("make date", date_make(1999, 12, 31, "utc"), 946598400)
+check("before 1970", date_format(-86400, "%F", "utc"), "1969-12-31")
+check("not a date", fails(fn () { return date_parse("2026-02-30") }), true)
+check("not iso", fails(fn () { return date_parse("10/22/2026") }), true)
+check("local round trip", date_make(2026, 7, 4, 12, 0, 0) == date_parse("2026-07-04T12:00:00", "local"), true)
+check("now is recent", now() > 1700000000, true)
+
+print("format")
+check("positional", format("{} of {}", 3, 4), "3 of 4")
+check("indexed", format("{1} {0}", "a", "b"), "b a")
+check("named", format("{name} is {age}", {"name": "Ann", "age": 41}), "Ann is 41")
+check("fixed", format("{:.2f}", 3.14159), "3.14")
+check("width right", format("[{:>6}]", 42), "[    42]")
+check("width left", format("[{:<6}]", "ab"), "[ab    ]")
+check("center fill", format("[{:*^7}]", "ab"), "[**ab***]")
+check("zero pad", format("{:08.3f}", -2.5), "-002.500")
+check("thousands", format("{:,}", 1234567), "1,234,567")
+check("thousands fixed", format("{:,.2f}", 1234567.891), "1,234,567.89")
+check("hex", format("{:x} {:X} {:o} {:b}", 255, 255, 8, 5), "ff FF 10 101")
+check("percent", format("{:.1%}", 0.256), "25.6%")
+check("sign", format("{:+} {:+}", 5, -5), "+5 -5")
+check("braces", format("{{}} {}", 1), "{} 1")
+check("too few values", fails(fn () { return format("{} {}", 1) }), true)
+
+print("collections")
+let people = [{"n": "b", "a": 30}, {"n": "a", "a": 25}, {"n": "c", "a": 30}]
+check("sort_by", map(sort_by(people, fn (p) { return p.a }), fn (p) { return p.n }), ["a", "b", "c"])
+check("sort_by desc stable", map(sort_by(people, fn (p) { return p.a }, "desc"), fn (p) { return p.n }), ["b", "c", "a"])
+check("sort_by text", map(sort_by(people, fn (p) { return p.n }), fn (p) { return p.n }), ["a", "b", "c"])
+let g = group_by(people, fn (p) { return p.a })
+check("group_by keys", keys(g), ["30", "25"])
+check("group_by members", len(g["30"]), 2)
+let u = uuid()
+check("uuid shape", regex_test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", u), true)
+check("uuid differs", u != uuid(), true)
+
+print("paths")
+check("join", path_join("a", "b", "c.txt"), "a/b/c.txt")
+check("join absolute restarts", path_join("a", "/x", "y"), "/x/y")
+check("basename", basename("a/b/c.txt"), "c.txt")
+check("basename trailing slash", basename("a/b/"), "b")
+check("dirname", dirname("a/b/c.txt"), "a/b")
+check("dirname of a name", dirname("c.txt"), ".")
+check("dirname of root child", dirname("/c"), "/")
+check("extname", extname("c.tar.gz"), ".gz")
+check("dotfile has no extension", extname(".profile"), "")
+check("normalize", path_normalize("a/./b//../c/"), "a/c")
+check("normalize above root", path_normalize("/../x"), "/x")
+check("normalize relative up", path_normalize("../a/.."), "..")
+
+print("directories")
+let d = "stdlib_case_dir"
+if is_dir(d) { rmdir(path_join(d, "inner")) rmdir(d) }
+check("mkdir parents", mkdir(path_join(d, "inner"), true), true)
+check("is_dir", is_dir(path_join(d, "inner")), true)
+check("mkdir again is fine", mkdir(d), true)
+check("rmdir not empty fails", fails(fn () { return rmdir(d) }), true)
+check("rmdir", rmdir(path_join(d, "inner")), true)
+check("rmdir outer", rmdir(d), true)
+check("gone", is_dir(d), false)
+check("abspath is absolute", path_join("rel", abspath("x")) == abspath("x"), true)
+
+if failures == 0 { print("stdlib:", checks, "checks, all agreed") } else { print("stdlib:", failures, "of", checks, "WRONG") }

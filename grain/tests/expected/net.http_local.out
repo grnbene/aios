@@ -1,0 +1,13 @@
+get: 200 true "hello, grain" x-test: "a, b"
+own agent: "hello, mine/1"
+redirects: hello, grain
+no follow: 302
+too many: true
+chunked: "chunk one, chunk two"
+404: 404 false "no such page"
+post: POST /echo application/x-www-form-urlencoded a=1
+303 to get: hello, grain
+307 keeps post: POST /echo - kept
+refused is an error: true
+bad scheme: http_get("ftp://x"): unsupported scheme: ftp
+quit: bye

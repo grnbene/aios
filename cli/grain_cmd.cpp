@@ -79,6 +79,31 @@ struct HostFiles final : grain::Files {
     std::error_code ec;
     return std::filesystem::is_regular_file(path, ec);
   }
+  bool make_dir(const std::string& path, bool parents, std::string& error) override {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) return true;   // already there is not a failure
+    const bool made = parents ? std::filesystem::create_directories(path, ec) : std::filesystem::create_directory(path, ec);
+    if (!made || ec) { error = ec ? ec.message() : "not made"; return false; }
+    return true;
+  }
+  bool remove_dir(const std::string& path, std::string& error) override {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(path, ec)) { error = "no such directory"; return false; }
+    if (!std::filesystem::is_empty(path, ec)) { error = ec ? ec.message() : "not empty"; return false; }
+    if (!std::filesystem::remove(path, ec)) { error = ec ? ec.message() : "not removed"; return false; }
+    return true;
+  }
+  bool is_dir(const std::string& path) override {
+    std::error_code ec;
+    return std::filesystem::is_directory(path, ec);
+  }
+  bool absolute(const std::string& path, std::string& out, std::string& error) override {
+    std::error_code ec;
+    const auto p = std::filesystem::absolute(path, ec);
+    if (ec) { error = ec.message(); return false; }
+    out = p.generic_string();
+    return true;
+  }
 };
 
 HostFiles g_host_files;
@@ -121,6 +146,8 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
   vm.files = &g_host_files;
 #if !defined(AIOS_METAL)
   install_grain_host(vm);
+  grain::set_http_trust_root(k.config().root);   // https verifies against the machine's own store first
+  grain::install_http_builtins(vm);
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif
@@ -210,6 +237,8 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
     vm.files = &g_host_files;
   #if !defined(AIOS_METAL)
   install_grain_host(vm);
+  grain::set_http_trust_root(k.config().root);   // https verifies against the machine's own store first
+  grain::install_http_builtins(vm);
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif

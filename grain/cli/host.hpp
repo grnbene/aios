@@ -23,4 +23,10 @@ void install_args(aios::userland::grain::Vm& vm, const std::vector<std::string>&
 // one; both return {ok, code, output}.
 void install_process(aios::userland::grain::Vm& vm);
 
+// This user's grain directory for kept state: ~/Library/Caches/grain (macOS),
+// $XDG_CACHE_HOME/grain or ~/.cache/grain (Linux), %LOCALAPPDATA%\grain
+// (Windows). https looks for ssl/ca-certificates.crt there before the system's
+// store. Empty when the environment names no home.
+std::string state_dir();
+
 }  // namespace grain_cli

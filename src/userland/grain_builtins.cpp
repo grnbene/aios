@@ -5625,7 +5625,11 @@ Value bi_file_exists(Vm& vm, std::vector<Value>& args, std::string& error) {
 void install_core_builtins(Vm& vm) {
   vm.define_global("PI", Value::real(3.14159265358979323846));
   vm.define_global("E", Value::real(2.71828182845904523536));
-  install_hash_builtins(vm);   // sha256/sha1/sha512/sha384/md5/keccak256/hmac_sha256 (grain_std_hash.cpp)
+  install_hash_builtins(vm);
+  install_regex_builtins(vm);
+  install_time_builtins(vm);
+  install_text_builtins(vm);
+  install_path_builtins(vm);
 
   vm.define_native("print", 0, -1, bi_print);
   vm.define_native("len", 1, 1, bi_len);

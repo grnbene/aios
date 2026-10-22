@@ -1,0 +1,23 @@
+# grain's HTTP client against tests/net/server.py, which writes its port to the
+# file named by args[0] once it listens and stops at GET /quit.
+let waited = 0
+while not file_exists(args[0]) and waited < 200 {   # up to 10 s
+  sleep(50)
+  waited = waited + 1
+}
+let base = "http://127.0.0.1:" + trim(read_file(args[0]))
+let r = http_get(base + "/hello")
+print("get:", r.status, r.ok, repr(r.body), "x-test:", repr(r.headers["x-test"]))
+print("own agent:", repr(http_get(base + "/hello", {"headers": {"User-Agent": "mine/1"}}).body))
+print("redirects:", http_get(base + "/r1").body)
+print("no follow:", http_get(base + "/r1", {"follow_redirects": false}).status)
+print("too many:", contains(pcall(fn () { return http_get(base + "/loop") }).error, "more than 5 redirects"))
+print("chunked:", repr(http_get(base + "/chunked").body))
+let nf = http_get(base + "/missing")
+print("404:", nf.status, nf.ok, repr(nf.body))
+print("post:", http_post(base + "/echo", "a=1", {"headers": {"Content-Type": "application/x-www-form-urlencoded"}}).body)
+print("303 to get:", http_post(base + "/see-other", "x").body)
+print("307 keeps post:", http_post(base + "/keep", "kept").body)
+print("refused is an error:", not pcall(fn () { return http_get("http://127.0.0.1:1/", {"timeout_ms": 3000}) }).ok)
+print("bad scheme:", pcall(fn () { return http_get("ftp://x") }).error)
+print("quit:", http_get(base + "/quit").body)

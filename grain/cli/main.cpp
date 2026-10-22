@@ -85,6 +85,7 @@ void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& scri
   g::install_socket_builtins(vm);
   g::install_window_builtins(vm);
   aios::cli::install_grain_net(vm);
+  g::install_http_builtins(vm);
   grain_cli::install_process(vm);
   grain_cli::install_sys(vm, GRAIN_VERSION);
   grain_cli::install_args(vm, script_args);
@@ -164,6 +165,7 @@ int disassemble(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  g::set_http_trust_root(grain_cli::state_dir());
   std::vector<std::string> a(argv + 1, argv + argc);
   Options opt;
   size_t i = 0;
