@@ -481,13 +481,13 @@ std::vector<std::string> split_statements(const std::string& q) {
       i = e - 1;
       continue;
     }
+    if (c == ';') prev_word.clear();   // `END; IF ...` is a new IF, not END IF
     if (c == ';' && depth <= 0) {
       out.push_back(q.substr(start, i - start));
       start = i + 1;
       head.clear();
       compound = false;
       depth = 0;
-      prev_word.clear();
     }
   }
   std::string tail = q.substr(start);
@@ -557,6 +557,9 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   else if (has("division by zero") || has("Division by 0")) { *code = 1365; *sqlstate = "22012"; }
   else if (starts("CONSTRAINT `") && has("` failed for `")) { *code = 4025; *sqlstate = "23000"; }
   else if (starts("Unknown prepared statement handler")) { *code = 1243; *sqlstate = "HY000"; }
+  else if (starts("BIGINT value is out of range")) { *code = 1690; *sqlstate = "22003"; }
+  else if (starts("Cannot execute statement in a READ ONLY transaction")) { *code = 1792; *sqlstate = "25006"; }
+  else if (starts("Result consisted of more than one row")) { *code = 1172; *sqlstate = "42000"; }
   else if (starts("The value specified for generated column")) { *code = 1906; *sqlstate = "HY000"; }
   else if (has("cannot be null") || has("NOT NULL")) { *code = 1048; *sqlstate = "23000"; }
   else if (has("doesn't yet support")) { *code = 1235; *sqlstate = "42000"; }   // ER_NOT_SUPPORTED_YET
@@ -1690,6 +1693,10 @@ std::vector<WireCol> wire_columns(const SqlQueryResult& res, size_t num_cols) {
     if (!numeric_col && org && org->binary == 1) { wcols[c] = {MYSQL_TYPE_BLOB, 63, 65535, (uint16_t)(0x10 | 0x80), 0}; continue; }
     if (!numeric_col && org && org->binary == 2) { wcols[c] = {MYSQL_TYPE_VAR_STRING, 63, 255, 0x80, 0}; continue; }
     if (!numeric_col && !(temporal >= 1 && temporal <= 3)) {
+      if (org && org->mysql_type == 13) {   // YEAR: a number to the client, four digits
+        wcols[c] = {MYSQL_TYPE_YEAR, 63, 4, 0x8060, 0};
+        continue;
+      }
       if (org && org->mysql_type == 252) {
         wcols[c] = {MYSQL_TYPE_BLOB, def_charset, 65535, 0x0010, 0};
       } else if (org && org->mysql_type == 254) {
@@ -1726,14 +1733,20 @@ std::vector<WireCol> wire_columns(const SqlQueryResult& res, size_t num_cols) {
         else if (mtype == MYSQL_TYPE_LONG) len = uns ? 10 : 11;
         wcols[c] = {mtype, 63, len, (uint16_t)(0x8000 | (uns ? 0x0020 : 0)), 0};
       } else if (dt == SqlDataType::Real) {
-        wcols[c] = {MYSQL_TYPE_DOUBLE, 63, 22, 0x8000, 31};
+        if (org && org->mysql_type == 4) wcols[c] = {MYSQL_TYPE_FLOAT, 63, 12, 0x8000, 31};
+        else wcols[c] = {MYSQL_TYPE_DOUBLE, 63, 22, 0x8000, 31};
       } else {
         const int scale = std::max(max_frac, org && org->scale >= 0 ? org->scale : 0);
         wcols[c] = {MYSQL_TYPE_NEWDECIMAL, 63, 67, 0x8000, (uint8_t)std::min(scale, 30)};
       }
     } else if (temporal == 1) wcols[c] = {MYSQL_TYPE_DATE, 63, 10, 0x80, 0};
-    else if (temporal == 2) wcols[c] = {MYSQL_TYPE_DATETIME, 63, 19, 0x80, 0};
-    else wcols[c] = {MYSQL_TYPE_TIME, 63, 10, 0x80, 0};
+    else {
+      // DATETIME(n) / TIMESTAMP(n) / TIME(n): the declared places, which a client formats the value by
+      // (decimals 0 made mysqlnd drop the .678 of a DATETIME(3)).
+      const uint8_t fsp = (uint8_t)std::min(org && org->scale > 0 ? org->scale : 0, 6);
+      if (temporal == 2) wcols[c] = {org && org->mysql_type == 7 ? MYSQL_TYPE_TIMESTAMP : MYSQL_TYPE_DATETIME, 63, (uint32_t)(19 + (fsp ? fsp + 1 : 0)), 0x80, fsp};
+      else wcols[c] = {MYSQL_TYPE_TIME, 63, (uint32_t)(10 + (fsp ? fsp + 1 : 0)), 0x80, fsp};
+    }
   }
   // What the column is in its table: NOT NULL (a client that sizes "NULL" into a nullable column padded every
   // primary key to four), PRI_KEY, AUTO_INCREMENT - as MariaDB flags them.
@@ -1840,6 +1853,7 @@ void put_binary_cell(std::vector<uint8_t>* b, std::string_view v, const WireCol&
       b->push_back((uint8_t)d);
       return;
     }
+    case MYSQL_TYPE_TIMESTAMP:
     case MYSQL_TYPE_DATETIME: {
       const unsigned y = (unsigned)two_digits(v, 0) * 100u + two_digits(v, 2), m = two_digits(v, 5), d = two_digits(v, 8);
       const unsigned hh = two_digits(v, 11), mi = two_digits(v, 14), ss = two_digits(v, 17);
@@ -3132,6 +3146,51 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       cap_session = true;
       rows_charged = 0;
       send_ok(client_conn, 1);
+      return true;
+    }
+    // SHOW GRANTS [FOR 'user'[@'host']]: the user's credential read back as
+    // the privileges it stands for (it used to answer ALL PRIVILEGES for
+    // anyone). An operator session with no user named is root.
+    if (w.size() >= 2 && up(w[0]) == "SHOW" && up(w[1]) == "GRANTS" && cap_users_ && cap_guard_) {
+      std::string name, host = "%";
+      if (w.size() >= 4 && up(w[2]) == "FOR") {
+        name = quoted(w[3]) ? w[3].substr(1) : w[3].substr(0, w[3].find('@'));
+        if (w.size() >= 6 && w[4] == "@") host = quoted(w[5]) ? w[5].substr(1) : w[5];
+        else if (!quoted(w[3]) && w[3].find('@') != std::string::npos) host = w[3].substr(w[3].find('@') + 1);
+      } else if (cap_session) {
+        name = username;
+      } else {
+        return false;   // the engine answers for the operator (root)
+      }
+      AsqlUser user;
+      if (!cap_users_->find(name, &user)) { send_err(client_conn, 1, 1141, "42000", "There is no such grant defined for user '" + name + "' on host '" + host + "'"); return true; }
+      const std::string who = "'" + name + "'@'" + host + "'";
+      std::vector<std::vector<std::string>> rows;
+      rows.push_back({"GRANT USAGE ON *.* TO " + who});
+      AsqlAuthority a;
+      std::string verr;
+      if (!user.credential.empty() && asql_verify(*cap_guard_, user.credential, &a, &verr)) {
+        using R = aios::sidecar::CapabilityRight;
+        const uint32_t r = a.rights;
+        std::string privs;
+        auto add = [&](const char* p) { privs += (privs.empty() ? "" : ", ") + std::string(p); };
+        if ((r & 0x2F) == 0x2F) privs = "ALL PRIVILEGES";
+        else {
+          if (r & (uint32_t)R::READ) add("SELECT");
+          if (r & (uint32_t)R::WRITE) { add("INSERT"); add("UPDATE"); }
+          if (r & (uint32_t)R::DELETE_OP) add("DELETE");
+          if (r & (uint32_t)R::EXECUTE) add("EXECUTE");
+          if (r & (uint32_t)R::ADMIN) { add("CREATE"); add("DROP"); add("ALTER"); add("INDEX"); add("REFERENCES"); add("CREATE VIEW"); add("TRIGGER"); add("EVENT"); add("LOCK TABLES"); }
+        }
+        const std::string opt = (r & (uint32_t)R::DELEGATE) ? " WITH GRANT OPTION" : "";
+        for (const auto& sc : a.scopes) {
+          std::string on = sc.db == "*" ? "*.*" : "`" + sc.db + "`." + (sc.table == "*" ? "*" : "`" + sc.table + "`");
+          if (privs.empty()) continue;
+          if (on == "*.*") rows[0][0] = "GRANT " + privs + " ON *.* TO " + who + opt;
+          else rows.push_back({"GRANT " + privs + " ON " + on + " TO " + who + opt});
+        }
+      }
+      send_text_rows({"Grants for " + name + "@" + host}, rows);
       return true;
     }
     // CREATE USER / ALTER USER / DROP USER / SHOW USERS: named users in front

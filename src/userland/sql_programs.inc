@@ -31,7 +31,7 @@ using Nodes = std::vector<Node>;
 struct Node {
   enum Kind {
     Block, DeclareVar, DeclareCursor, DeclareHandler, DeclareCondition, Set, SelectInto, If, Case, While, Repeat,
-    Loop, Leave, Iterate, Return, Open, Fetch, Close, Signal, Call, Sql
+    Loop, Leave, Iterate, Return, Open, Fetch, Close, Signal, Call, Sql, GetDiag
   } kind = Sql;
   std::string label;                 // Block / Loop / While / Repeat
   std::string text;                  // Sql / Call / SelectInto (without INTO) / Return / cursor query / signal state
@@ -255,6 +255,27 @@ class Parser {
       end_stmt();
       return n;
     }
+    // GET [CURRENT] DIAGNOSTICS [CONDITION n] target = item [, target = item ...]
+    if (word("GET") && (word("DIAGNOSTICS", i_ + 1) || (word("CURRENT", i_ + 1) && word("DIAGNOSTICS", i_ + 2)))) {
+      n.kind = Node::GetDiag;
+      ++i_;
+      take("CURRENT");
+      take("DIAGNOSTICS");
+      if (take("CONDITION")) { n.cond = "condition"; if (!at_end()) ++i_; }   // the condition number: the one being handled
+      size_t e = stmt_end(i_);
+      while (i_ < e) {
+        std::string target = t_[i_++].text;
+        if (!(i_ < e && punct("=", i_))) { fail("GET DIAGNOSTICS: expected target = item"); return n; }
+        ++i_;
+        if (i_ >= e) { fail("GET DIAGNOSTICS: expected an item"); return n; }
+        n.names.push_back(target);
+        n.exprs.push_back(upper_of(t_[i_++].text));
+        if (i_ < e && punct(",", i_)) ++i_;
+      }
+      i_ = e;
+      end_stmt();
+      return n;
+    }
     if (word("SIGNAL") || word("RESIGNAL")) {
       n.kind = Node::Signal;
       ++i_;
@@ -463,6 +484,10 @@ struct Run {
   std::vector<std::map<std::string, Cursor>> cursors;
   struct Handler { std::vector<std::string> conds; bool exit = false; const Node* body = nullptr; size_t scope = 0; };
   std::vector<Handler> handlers;
+  int list_depth = 0;                // nesting of run_list calls: the outermost list is the routine's body
+  Condition handling;                // the condition a handler body is running for (GET DIAGNOSTICS CONDITION 1)
+  bool in_handler = false;
+  long long last_row_count = 0;      // the last statement's rows (GET DIAGNOSTICS ... = ROW_COUNT)
   std::map<std::string, std::string> named_conditions;
   // trigger rows
   const SqlTable* trig_table = nullptr;
@@ -564,6 +589,7 @@ struct Run {
     if (!bind(sql, &bound)) { cond->kind = Condition::Exception; cond->message = error; error.clear(); return false; }
     *res = db.execute_local_query_unguarded(bound, session_db);
     if (!res->success) { cond->kind = Condition::Exception; cond->message = res->error_message; return false; }
+    last_row_count = res->is_result_set ? -1 : (long long)res->rows_affected;
     return true;
   }
   bool eval(const std::string& expr, Val* out, Condition* cond) {
@@ -627,7 +653,13 @@ struct Run {
       // A handler's body runs with the handlers outside it in force, not its own.
       std::vector<Handler> saved(handlers.begin() + (long)i, handlers.end());
       handlers.resize(i);
+      const Condition outer = handling;
+      const bool outer_in = in_handler;
+      handling = c;
+      in_handler = true;
       run_list(body->kind == Node::Block ? body->body : Nodes{*body}, body->kind == Node::Block);
+      handling = outer;
+      in_handler = outer_in;
       handlers.insert(handlers.end(), saved.begin(), saved.end());
       if (!error.empty()) return false;
       if (ex && flow == Normal) { flow = Exit; exit_scope = scope; }
@@ -642,6 +674,7 @@ struct Run {
 
   void run_list(const Nodes& nodes, bool new_scope) {
     if (new_scope) { scopes.emplace_back(); cursors.emplace_back(); }
+    ++list_depth;
     const size_t my_scope = scopes.size() - 1;
     const size_t handlers_at = handlers.size();
     for (const Node& n : nodes) {
@@ -649,7 +682,11 @@ struct Run {
       if (!error.empty() || flow != Normal) break;
     }
     handlers.resize(std::min(handlers.size(), handlers_at));
-    if (flow == Exit && exit_scope == my_scope) flow = Normal;   // EXIT leaves the block that declared it
+    // EXIT leaves the block that declared the handler: the list that opened that scope (or the routine's
+    // body). An IF branch or a loop body shares its enclosing scope and must not swallow the exit - it did,
+    // and the statements after the IF ran on as if nothing had been raised.
+    if (flow == Exit && exit_scope == my_scope && (new_scope || list_depth == 1)) flow = Normal;
+    --list_depth;
     if (new_scope) { scopes.pop_back(); cursors.pop_back(); }
   }
 
@@ -789,6 +826,25 @@ struct Run {
         for (size_t i = 0; i < n.names.size(); ++i)
           if (!assign(n.names[i], cell_val(cur->rows, cur->at, i), &c)) { raise(c); return; }
         cur->at++;
+        return;
+      }
+      case Node::GetDiag: {
+        for (size_t k = 0; k < n.names.size(); ++k) {
+          const std::string& item = n.exprs[k];
+          Val v;
+          if (n.cond == "condition") {
+            if (item == "MESSAGE_TEXT") v = val_text(handling.message);
+            else if (item == "RETURNED_SQLSTATE") v = val_text(handling.kind == Condition::NotFound ? "02000" : handling.sqlstate.empty() ? "HY000" : handling.sqlstate);
+            else if (item == "MYSQL_ERRNO") v = val_num(handling.kind == Condition::NotFound ? 1329 : !handling.sqlstate.empty() ? 1644 : 1105);
+            else if (item == "CLASS_ORIGIN" || item == "SUBCLASS_ORIGIN") v = val_text(handling.sqlstate.rfind("45", 0) == 0 ? "" : "ISO 9075");
+            else { c.kind = Condition::Exception; c.message = "GET DIAGNOSTICS: unknown condition item " + item; raise(c); return; }
+          } else {
+            if (item == "ROW_COUNT") v = val_num((double)last_row_count);
+            else if (item == "NUMBER") v = val_num(in_handler ? 1 : 0);
+            else { c.kind = Condition::Exception; c.message = "GET DIAGNOSTICS: unknown statement item " + item; raise(c); return; }
+          }
+          if (!assign(n.names[k], v, &c)) { raise(c); return; }
+        }
         return;
       }
       case Node::Close: {
@@ -1487,6 +1543,39 @@ void SqlDatabase::run_due_events() {
 
 // ---- Listing ----------------------------------------------------------------
 
+// The CREATE text as MariaDB shows it back: CREATE DEFINER=`u`@`h` KIND `name` ... (the definer spelled
+// out, the name quoted), from the text the program was created with.
+static std::string program_create_shown(const SqlDatabase::StoredProgram& p) {
+  std::string t = p.create_text;
+  const std::string up = upper_of(t);
+  if (up.rfind("CREATE", 0) != 0) return t;
+  size_t i = 6;
+  while (i < t.size() && std::isspace((unsigned char)t[i])) ++i;
+  if (up.compare(i, 8, "DEFINER=") != 0 && up.compare(i, 7, "DEFINER") != 0) t = "CREATE DEFINER=" + p.definer + " " + t.substr(i);
+  const char* kw = p.kind == 'P' ? "PROCEDURE" : p.kind == 'F' ? "FUNCTION" : p.kind == 'T' ? "TRIGGER" : "EVENT";
+  const std::string up2 = upper_of(t);
+  size_t k = up2.find(std::string(" ") + kw + " ");
+  if (k == std::string::npos) return t;
+  k += 1 + std::strlen(kw);
+  while (k < t.size() && std::isspace((unsigned char)t[k])) ++k;
+  if (k < t.size() && t[k] != '`') {
+    size_t e = k;
+    while (e < t.size() && (std::isalnum((unsigned char)t[e]) || t[e] == '_' || t[e] == '$' || t[e] == '.')) ++e;
+    if (e > k) {
+      std::string nm = t.substr(k, e - k);
+      const size_t dot = nm.rfind('.');
+      const std::string q = dot == std::string::npos ? "`" + nm + "`" : "`" + nm.substr(0, dot) + "`.`" + nm.substr(dot + 1) + "`";
+      t = t.substr(0, k) + q + t.substr(e);
+    }
+  }
+  return t;
+}
+static std::string definer_shown(const std::string& d) {   // `root`@`localhost` as root@localhost
+  std::string out;
+  for (char ch : d) if (ch != '`') out += ch;
+  return out;
+}
+
 SqlQueryResult SqlDatabase::show_create_program(char kind, const std::string& name) {
   auto p = find_program(kind, name);
   if (!p) return make_error(std::string(kind_word(kind)) + " " + name + " does not exist");
@@ -1494,15 +1583,15 @@ SqlQueryResult SqlDatabase::show_create_program(char kind, const std::string& na
   r.is_result_set = true;
   if (kind == 'T') {
     r.columns = {"Trigger", "sql_mode", "SQL Original Statement", "character_set_client", "collation_connection", "Database Collation", "Created"};
-    r.rows.push_back(SqlRow{{p->name, "", p->create_text, "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci",
+    r.rows.push_back(SqlRow{{p->name, sql_mode_text(), program_create_shown(*p), "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci",
                              format_datetime((std::time_t)(p->created_ns / 1000000000ull), false)}});
   } else if (kind == 'E') {
     r.columns = {"Event", "sql_mode", "time_zone", "Create Event", "character_set_client", "collation_connection", "Database Collation"};
-    r.rows.push_back(SqlRow{{p->name, "", "SYSTEM", p->create_text, "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci"}});
+    r.rows.push_back(SqlRow{{p->name, sql_mode_text(), "SYSTEM", program_create_shown(*p), "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci"}});
   } else {
     r.columns = {kind == 'P' ? "Procedure" : "Function", "sql_mode", kind == 'P' ? "Create Procedure" : "Create Function",
                  "character_set_client", "collation_connection", "Database Collation"};
-    r.rows.push_back(SqlRow{{p->name, "", p->create_text, "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci"}});
+    r.rows.push_back(SqlRow{{p->name, sql_mode_text(), program_create_shown(*p), "utf8mb4", "utf8mb4_general_ci", "utf8mb4_general_ci"}});
   }
   r.rows_affected = 1;
   r.formatted_table = format_result_table(r.columns, r.rows);
