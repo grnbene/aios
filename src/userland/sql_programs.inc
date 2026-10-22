@@ -217,6 +217,7 @@ class Parser {
       n.kind = word("LEAVE") ? Node::Leave : Node::Iterate;
       ++i_;
       if (!at_end() && t_[i_].kind == Tok::Ident) n.label = t_[i_++].text;
+      if (n.label.empty()) { fail(std::string(n.kind == Node::Leave ? "LEAVE" : "ITERATE") + " needs a label"); return n; }
       end_stmt();
       return n;
     }

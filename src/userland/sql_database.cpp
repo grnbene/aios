@@ -1227,7 +1227,7 @@ std::string sql_format_double(double v, int sig) {
   const int decpt = exp10 + 1;           // value = 0.DIGITS x 10^decpt
   const int len = (int)digits.size();
   std::string out;
-  if (decpt >= -14 && decpt <= 15) {
+  if (decpt >= -14 && (decpt <= 15 || len >= decpt)) {
     if (decpt <= 0) out = "0." + std::string((size_t)-decpt, '0') + digits;
     else if (decpt >= len) out = digits + std::string((size_t)(decpt - len), '0');
     else out = digits.substr(0, (size_t)decpt) + "." + digits.substr((size_t)decpt);
@@ -3106,6 +3106,7 @@ struct SqlExpr {
   std::string qualifier;       // table or alias in front of a column
   std::vector<ExprPtr> args;
   bool negated = false;        // NOT LIKE / NOT IN / NOT BETWEEN / IS NOT NULL / DISTINCT
+  bool uv_double = false;      // a @variable unset when parsed: its values read as DOUBLE, as MariaDB types them
   std::string source_text;     // how it was written, for the output header
   std::vector<OrderKey> group_order_by; // for GROUP_CONCAT (... ORDER BY ...)
   std::string separator = ",";          // for GROUP_CONCAT (... SEPARATOR ...)
@@ -4415,6 +4416,7 @@ class SqlParser {
       auto e = make(ExprOp::Column);
       e->name = t.text;
       e->source_text = t.text;
+      if (is_user_var_name(e->name)) e->uv_double = user_var_get(e->name).null;
       p_++;
       while (is_punct(".") && (peek(1).kind == Tok::Ident || is_punct("*", 1))) {
         if (is_punct("*", 1)) {
@@ -6561,6 +6563,15 @@ static bool item_is_string(const SqlExpr* e, const std::vector<QuerySource>& sou
 
 Val eval_expr(const SqlExpr* e, const EvalCtx& ctx);
 double val_as_number(const Val& v);
+static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v);
+// An exact number widened to `scale` places (no change when it has them, or is not exact).
+static Val widen_exact(Val v, int scale) {
+  if (v.null || !v.numeric || v.approx || scale <= 0) return v;
+  AIOS_INT128 x = 0;
+  int sc = 0, ds = 0;
+  if (exact_internal_of(v, &x, &sc, &ds) && ds < scale) return val_exact_fine(x, sc, std::min(scale, 38));
+  return v;
+}
 
 struct ParsedSelectBranch;
 struct ParsedSelectStatement;
@@ -7817,11 +7828,11 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
         if (!seen.insert(key).second) continue;
         acc.add(v);
       }
-      return acc.finish(up == "AVG"sv);
+      return up == "SUM"sv ? nt_adjust(e, ctx, acc.finish(false)) : acc.finish(true);
     }
     {
       Val fast;
-      if (vx::sum_typed_group(e, ctx, up == "AVG"sv, &fast)) return fast;
+      if (vx::sum_typed_group(e, ctx, up == "AVG"sv, &fast)) return up == "SUM"sv ? nt_adjust(e, ctx, std::move(fast)) : fast;
     }
     size_t s = 0, c = 0;
     bool is_col = (e->args[0]->op == ExprOp::Column && resolve_column(ctx, *e->args[0], &s, &c));
@@ -9583,7 +9594,9 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:%02d:%02d", p.year, p.month, p.day,
                     p.hour, p.minute, p.second);
-      return val_text(buf);
+      Val dv = val_text(buf);
+      dv.temporal = 2;
+      return dv;
     }
     if (target.rfind("DATE", 0) == 0) {
       // read as a date and written in full: CAST('2024-3-5' AS DATE) is 2024-03-05
@@ -9601,7 +9614,9 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     if (target.rfind("TIME", 0) == 0) {
       long long secs = 0;
       if (!time_seconds_of(a_ptr[0].str(), &secs)) return val_null();
-      return val_text(format_seconds_as_time(secs));
+      Val tv = val_text(format_seconds_as_time(secs));
+      tv.temporal = 3;
+      return tv;
     }
     if (target.rfind("CHAR", 0) == 0 || target.rfind("NCHAR", 0) == 0 ||
         target.rfind("BINARY", 0) == 0) {
@@ -10131,14 +10146,14 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     const std::string& repl = a_ptr[2].str();
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
-      std::regex re(pattern);
+      std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
       std::string out = std::regex_replace(subject, re, repl);
       return val_text(out);
     } catch (const std::regex_error&) {
       return val_text(subject);
     }
 #else
-    std::regex re(pattern);
+    std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
     std::string out = std::regex_replace(subject, re, repl);
     return val_text(out);
 #endif
@@ -10149,13 +10164,13 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     const std::string& pattern = a_ptr[1].str();
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
-      std::regex re(pattern);
+      std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
       return val_num(std::regex_search(subject, re) ? 1 : 0);
     } catch (const std::regex_error&) {
       return val_num(0);
     }
 #else
-    std::regex re(pattern);
+    std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
     return val_num(std::regex_search(subject, re) ? 1 : 0);
 #endif
   }
@@ -10165,7 +10180,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     const std::string& pattern = a_ptr[1].str();
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
-      std::regex re(pattern);
+      std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
       std::smatch m;
       if (std::regex_search(subject, m, re)) {
         return val_text(m.str());
@@ -10175,7 +10190,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       return val_null();
     }
 #else
-    std::regex re(pattern);
+    std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
     std::smatch m;
     if (std::regex_search(subject, m, re)) {
       return val_text(m.str());
@@ -10189,7 +10204,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     const std::string& pattern = a_ptr[1].str();
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
-      std::regex re(pattern);
+      std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
       std::smatch m;
       if (std::regex_search(subject, m, re)) {
         return val_num((double)(m.position() + 1));
@@ -10199,7 +10214,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       return val_num(0);
     }
 #else
-    std::regex re(pattern);
+    std::regex re(pattern, (a_ptr[0].bin || a_ptr[1].bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase));
     std::smatch m;
     if (std::regex_search(subject, m, re)) {
       return val_num((double)(m.position() + 1));
@@ -10547,7 +10562,9 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     std::string out = "[";
     for (size_t i = 0; i < arg_count; ++i) {
       if (i) out += ", ";
-      json_append_member(out, a_ptr[i]);
+      const SqlExpr* va = i < e->args.size() ? e->args[i].get() : nullptr;
+      if (va && va->op == ExprOp::Literal && (upper_of(va->source_text) == "TRUE" || upper_of(va->source_text) == "FALSE")) out += upper_of(va->source_text) == "TRUE" ? "true" : "false";
+      else json_append_member(out, a_ptr[i]);
     }
     out += ']';
     Val v = val_text(out);
@@ -10808,14 +10825,20 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       static const char* kCode = "01230120022455012623010202";  // A..Z
       std::string out;
       char last = '0';
-      for (char raw : in) {
-        char ch = char_upper(raw);
+      for (size_t i = 0; i < in.size();) {
+        const unsigned char b = (unsigned char)in[i];
+        const size_t n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+        if (n > 1) {   // a letter beyond ASCII: kept (uppercased) as the first letter, coded 0 after it
+          if (out.empty()) { out += utf8_case(in.substr(i, n), true); last = '0'; }
+          i += n;
+          continue;
+        }
+        const char ch = char_upper((char)b);
+        ++i;
         if (ch < 'A' || ch > 'Z') continue;
-        char code = kCode[ch - 'A'];
+        const char code = kCode[ch - 'A'];
         if (out.empty()) { out += ch; last = code; continue; }
-        if (code != '0' && code != last) out += code;
-        if (ch != 'H' && ch != 'W') last = code;
-        if (out.size() >= 4) break;
+        if (code != '0' && code != last) { out += code; last = code; }
       }
       if (out.empty()) return std::string();
       while (out.size() < 4) out += '0';
@@ -11563,7 +11586,11 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
     case ExprOp::Literal: return e->literal;
     case ExprOp::Star: return val_num(1);
     case ExprOp::Column: {
-      if (is_user_var_name(e->name)) return user_var_get(e->name);
+      if (is_user_var_name(e->name)) {
+        Val uv = user_var_get(e->name);
+        if (e->uv_double && uv.numeric && !uv.approx) return val_approx(uv.num);
+        return uv;
+      }
       if (e->name.rfind("@@", 0) == 0 || (!e->qualifier.empty() && e->qualifier.rfind("@@", 0) == 0)) {
         std::string var = e->name;
         if (var.rfind("@@", 0) == 0) var = var.substr(2);
@@ -11948,8 +11975,8 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
       if (exact_arith(e->op, l, r, &exact)) return exact;
       // Binary from here: a DOUBLE operand, a string (MySQL reads it as a
       // DOUBLE), or an exact value too wide for 128 bits.
-      double ln = l.numeric ? l.num : numeric_prefix_of(l.str());
-      double rn = r.numeric ? r.num : numeric_prefix_of(r.str());
+      double ln = val_as_number(l);   // a text value's numeric reading: its prefix, an ENUM's position, a date's digits
+      double rn = val_as_number(r);
       double dres = 0;
       switch (e->op) {
         case ExprOp::Add: dres = ln + rn; break;
@@ -12046,14 +12073,15 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
       if (l.null || r.null) return val_null();
       bool m = false;
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+      const auto rflags = (l.bin || r.bin) ? std::regex::ECMAScript : (std::regex::ECMAScript | std::regex::icase);
       try {
-        std::regex re(r.str());
+        std::regex re(r.str(), rflags);
         m = std::regex_search(l.str(), re);
       } catch (const std::regex_error&) {
         m = false;
       }
 #else
-      std::regex re(r.str());
+      std::regex re(r.str(), rflags);
       m = std::regex_search(l.str(), re);
 #endif
       return val_num(e->negated ? !m : m);
@@ -29692,6 +29720,7 @@ struct Pred {
   bool eq_negated = true;            // ... unless negated (then eq_codes is not a row list)
   std::string slo, shi;              // TextCmp: the constants as text
   bool num_lit = false;              // TextCmp against a number: compares numeric prefixes
+  bool numeric_col = false;          // ... on a column declared numeric: its cells are numbers, the zone map's bounds hold
   bool temporal = false;             // TextCmp on a DATE/DATETIME column: compared as times
   std::unordered_set<double> num_set;  // InNum: a typed numeric column's value is one of these
   int64_t tlo = 0, thi = 0;          // ... the constants' time keys
@@ -30770,7 +30799,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         Val v;
         if (!constant_value(e->args[i].get(), local, base, &v)) { ok = false; break; }
         if (v.null) continue;   // NULL is IN nothing
-        nums.insert(v.numeric ? v.num : numeric_prefix_of(v.str()));
+        nums.insert(val_as_number(v));
       }
       if (ok) {
         p.kind = Pred::InNum;
@@ -30830,6 +30859,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         p.op = e->op;
         p.negated = e->negated;
         p.num_lit = a.numeric;
+        p.numeric_col = sql_type_numeric(t.columns[col].type) && !t.columns[col].temporal && !t.inferred_types;
         if (a.numeric) { p.lo = a.num; if (e->op == ExprOp::Between) p.hi = b.num; }
         else { p.slo = a.str(); if (e->op == ExprOp::Between) p.shi = b.str(); }
         const uint8_t tk = t.columns[col].temporal;
@@ -30871,7 +30901,7 @@ bool segment_may_match(const Pred& p, const ColumnStore& cs, size_t seg) {
   if (zm.all_null) return false;              // a comparison with NULL is never true
   if (p.negated) return true;                 // NOT BETWEEN: not worth the cases
   if (p.kind == Pred::NumCmp || (p.kind == Pred::TextCmp && p.num_lit)) {
-    if (p.kind == Pred::TextCmp) return true; // numeric prefixes of text: not in the map
+    if (p.kind == Pred::TextCmp && !p.numeric_col) return true; // numeric prefixes of text: not in the map
     if (zm.min_double > zm.max_double) return true;
     auto tol = [](double v) { return std::fabs(v) * 1e-12 + 1e-300; };
     const double mn = zm.min_double - tol(zm.min_double), mx = zm.max_double + tol(zm.max_double);
@@ -33159,6 +33189,7 @@ struct Agg {
   std::vector<uint32_t> canon;       // CountDistinct on a CodeCol: code -> collation class
   std::vector<int> min_rank;         // Min/Max on a Text CodeCol: code -> collation rank
   std::shared_ptr<const NumProg> prog;   // SUM/AVG of arithmetic the column kernels can do
+  int static_scale = -1;             // SUM/AVG of a DECIMAL-typed expression: the scale its type gives the result
 };
 
 struct AggState {
@@ -33205,6 +33236,9 @@ bool plan_agg(const SqlExpr* node, const SqlTable& t, const EvalCtx& local, cons
     a.col_rules = true;
     a.col_type = t.columns[a.src.col].type;
     a.col_scale = t.columns[a.src.col].scale;
+  } else if (a.kind == Agg::Sum || a.kind == Agg::Avg) {
+    const NumType nt = nt_of(node->args[0].get(), local);
+    if (nt.k == 2) a.static_scale = nt.s;
   }
   if (a.kind == Agg::CountDistinct && a.src.kind == Source::CodeCol) {
     // One class per collation-distinct value; the extra last slot is the
@@ -33386,7 +33420,8 @@ Val finish(const Agg& a, AggState& st, RowReader& rd) {
       }
       if (st.exact) {
         Val out;
-        if (exact_sum_value(st.etotal, st.escale, st.dscale, st.count, !sum, &out)) return out;
+        if (exact_sum_value(st.etotal, st.escale, st.dscale, st.count, !sum, &out))
+          return a.static_scale > 0 ? widen_exact(std::move(out), a.static_scale + (sum ? 0 : 4)) : out;
       }
       return val_approx(sum ? st.total : st.total / (double)st.count);
     }
@@ -43741,16 +43776,20 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
   // A DECIMAL column of a union has one scale, its widest branch's: 1.5 and
   // 2.25 print as 1.50 and 2.25, as MariaDB prints them.
   for (size_t ci = 0; ci < res.columns.size() && ci < res.column_types.size(); ++ci) {
-    if (res.column_types[ci] != SqlDataType::Decimal) continue;
+    // an integer branch beside a decimal one makes the column DECIMAL too: 1 UNION 2.5 is 1.0 and 2.5
+    if (res.column_types[ci] != SqlDataType::Decimal && res.column_types[ci] != SqlDataType::Int) continue;
     int scale = 0;
+    bool all_numbers = true;
     for (const auto& r : res.rows) {
       if (ci >= r.values.size() || sql_is_null(r.values[ci])) continue;
       const std::string& v = r.values[ci];
-      if (v.find_first_of("eE") != std::string::npos) { scale = -1; break; }
+      double d = 0;
+      if (v.find_first_of("eE") != std::string::npos || !parse_number(v, &d)) { all_numbers = false; break; }
       const size_t dot = v.find('.');
       if (dot != std::string::npos) scale = std::max(scale, (int)(v.size() - dot - 1));
     }
-    if (scale <= 0 || scale > 38) continue;
+    if (!all_numbers || scale <= 0 || scale > 38) continue;
+    res.column_types[ci] = SqlDataType::Decimal;
     for (auto& r : res.rows) {
       if (ci >= r.values.size() || sql_is_null(r.values[ci])) continue;
       std::string& v = r.values[ci];
@@ -45342,6 +45381,7 @@ SqlQueryResult SqlDatabase::execute_truncate(const std::string& sql) {
   SqlQueryResult res;
   const size_t removed = t->row_count();
   t->clear_rows();
+  t->auto_increment_next = 0;   // TRUNCATE starts the counter over, as InnoDB does
   notify_table_reset(*t);
   invalidate_table_index(t->name, t->database);
   checkpoint();
@@ -47519,7 +47559,7 @@ static void promote_int_columns_now(SqlTable& t) {
   bool changed = false;
   for (size_t c = 0; c < t.col_data.size() && c < t.columns.size(); ++c) {
     ColumnStore& cs = t.col_data[c];
-    if (t.columns[c].type != SqlDataType::Int || cs.typed_tried || cs.reencode_pending || cs.shared_dict ||
+    if (!sql_type_numeric(t.columns[c].type) || t.columns[c].temporal || cs.typed_tried || cs.reencode_pending || cs.shared_dict ||
         cs.encoding != ColumnEncoding::DictBitPacked || cs.size() == 0)
       continue;
     cs.optimize_encoding(t.columns[c].type, t.columns[c].scale, t.columns[c].temporal);
@@ -48333,6 +48373,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
         row.values[ci] = val_store_text(tuple[i], t->columns[ci].type);
       }
     }
+    if (t->auto_increment_next - 1 > row_index_p->auto_max) row_index_p->auto_max = t->auto_increment_next - 1;
 
     for (size_t i = 0; i < t->columns.size(); ++i) {
       const SqlColumn& c = t->columns[i];
@@ -48401,7 +48442,13 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (ucoll < 0) { ucoll = r; ucoll_key = u; }
       if (std::find(ucoll_rows.begin(), ucoll_rows.end(), (size_t)r) == ucoll_rows.end()) ucoll_rows.push_back((size_t)r);
     }
-    if (ucoll >= 0 && insert_ignore && !replace) continue;
+    if (ucoll >= 0 && insert_ignore && !replace) {
+      if (tuples.size() > 1 && generated && (long long)generated == row_index_p->auto_max) {
+        row_index_p->auto_max--;
+        if (t->auto_increment_next == (long long)generated + 1) t->auto_increment_next = (long long)generated;
+      }
+      continue;
+    }
     if (ucoll >= 0 && replace) {
       // REPLACE removes every row the new one collides with, then inserts it.
       std::string pk_now = row_key(row, pk_cols);
@@ -48454,7 +48501,14 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       else hit = row_index_p->pk_to_row.find(pk_key);
       const bool found = !via_map ? big_hit >= 0 : (hit != row_index_p->pk_to_row.end() && row_index_p->row_of(hit->second) < t->row_count());
       const size_t found_row = !via_map ? (size_t)(big_hit < 0 ? 0 : big_hit) : (found ? row_index_p->row_of(hit->second) : 0);
-      if (found && insert_ignore && !replace) { replaced = true; continue; }
+      if (found && insert_ignore && !replace) {
+        if (tuples.size() > 1 && generated && (long long)generated == row_index_p->auto_max) {
+          row_index_p->auto_max--;
+          if (t->auto_increment_next == (long long)generated + 1) t->auto_increment_next = (long long)generated;
+        }
+        replaced = true;
+        continue;
+      }
       if (found) {
         // Concurrent mode: a row another open transaction holds is waited for (the statement is taken back and
         // run again once it ends), as InnoDB's duplicate check waits on the record's lock; only a row that is
@@ -48609,9 +48663,15 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
 
   if (!fk_actions.empty())
     if (std::string fke = fk_run_actions(fk_actions); !fke.empty()) return make_error(fke);
-  if (inserted >= 65536 && !tls_txn.open && !redo_replaying_) {
-    promote_int_columns_now(*t);
-    invalidate_table_index(t->name, t->database);
+  if (inserted > 0 && !tls_txn.open && !redo_replaying_) {
+    const size_t now = t->row_count(), before = now - inserted;
+    bool crossed = inserted >= 65536;
+    for (size_t th = 2048; th <= (1u << 26) && !crossed; th *= 4) if (before < th && now >= th) crossed = true;
+    if (crossed) {
+      t->compact_delta_buffer();
+      promote_int_columns_now(*t);
+      invalidate_table_index(t->name, t->database);
+    }
   }
   // No id generated: the last row's own, unless the statement set one itself
   // (ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)).
