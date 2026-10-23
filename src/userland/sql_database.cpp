@@ -2448,20 +2448,12 @@ bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* 
 // and handing it back is a copy of small strings, not a rescan.
 thread_local std::string tl_last_sql;
 thread_local std::vector<Token> tl_last_toks;
-// The gateway's tokens are remembered only once it hands the statement to a
-// path that tokenizes again (tokenize_remember): a plain SELECT runs from
-// the gateway's own tokens, and copying them for nothing was a malloc and
-// a string copy per token on every statement.
 // The tokens of a statement one layer is about to hand to the next, which
 // tokenizes the same text (the gateway to the local executor, that to the
 // INSERT / UPDATE / DELETE code): taken by the next tokenize_sql of that
 // text, moved, not rescanned. A statement was tokenized three times.
 thread_local std::string tl_handoff_sql;
 thread_local std::vector<Token> tl_handoff_toks;
-void tokenize_handoff(const std::string& sql, const std::vector<Token>& toks) {
-  tl_handoff_sql = sql;
-  tl_handoff_toks = toks;
-}
 void tokenize_handoff_move(const std::string& sql, std::vector<Token>&& toks) {
   tl_handoff_sql = sql;
   tl_handoff_toks = std::move(toks);
@@ -2480,11 +2472,6 @@ bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* 
   return true;
 }
 bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* err) { return tokenize_sql(sql, out, err, true); }
-void tokenize_remember(const std::string& sql, const std::vector<Token>& toks) {
-  if (sql.size() < 64 || sql.size() > (64u << 10) || sql == tl_last_sql) return;
-  tl_last_sql = sql;
-  tl_last_toks = toks;
-}
 // A statement's token vector, with the capacity of the last one this thread
 // used: the vector of a 100-character statement is 2 KB, past what malloc
 // serves from its thread cache, and it was allocated and freed per statement.
@@ -2981,7 +2968,7 @@ bool exact_internal_of(const Val& v, AIOS_INT128* out, int* scale, int* dscale) 
   if (!exact_decimal_of(v, &d, &ds)) return false;
   *dscale = ds;
   if (v.x_scale > ds && v.x_scale <= 38) {
-    const AIOS_INT128 x = (AIOS_INT128)(((unsigned __int128)(uint64_t)v.x_hi << 64) | (unsigned __int128)v.x_lo);
+    const AIOS_INT128 x = (AIOS_INT128)(((AIOS_UINT128)(uint64_t)v.x_hi << 64) | (AIOS_UINT128)v.x_lo);
     if (scale_down_half_up(x, v.x_scale - ds) == d) { *out = x; *scale = v.x_scale; return true; }
   }
   *out = d;
@@ -3017,7 +3004,7 @@ Val val_exact_fine(AIOS_INT128 x, int s, int ds) {
   }
   if (s > 38) return val_exact(scale_down_half_up(x, s - ds), ds);
   Val v = val_exact(scale_down_half_up(x, s - ds), ds);
-  const unsigned __int128 u = (unsigned __int128)x;
+  const AIOS_UINT128 u = (AIOS_UINT128)x;
   v.x_scale = (int8_t)s;
   v.x_lo = (uint64_t)u;
   v.x_hi = (int64_t)(uint64_t)(u >> 64);
@@ -3197,9 +3184,9 @@ Val round_value(const Val& x, long long d, bool truncate) {
     // A negative zero keeps its sign, as MariaDB prints it: ROUND(-0.001e0, 2) is -0.00 and TRUNCATE(-1e-5, 3)
     // is -0.000 (as a bare DOUBLE -0 prints -0 - Val::str).
     std::snprintf(buf, sizeof(buf), "%.*f", (int)ad, out);
-    Val v = val_num_with_text(out, buf);
-    v.approx = true;
-    return v;
+    Val r = val_num_with_text(out, buf);
+    r.approx = true;
+    return r;
   }
   return val_approx(out);
 }
@@ -5370,10 +5357,10 @@ static bool rollup_rewrite(const std::string& sql, const ParsedSelectStatement& 
   std::string tail = tail_at ? sql.substr(toks[tail_at].start_pos) : std::string();
   while (!tail.empty() && (tail.back() == ';' || std::isspace((unsigned char)tail.back()))) tail.pop_back();
   // Each select item: a group expression (its index), or an aggregate.
-  auto same = [](const std::string& a, const std::string& b) {
+  auto same = [](const std::string& p, const std::string& q) {
     std::string x, y;
-    for (char c : a) if (!std::isspace((unsigned char)c) && c != '`') x += (char)std::tolower((unsigned char)c);
-    for (char c : b) if (!std::isspace((unsigned char)c) && c != '`') y += (char)std::tolower((unsigned char)c);
+    for (char c : p) if (!std::isspace((unsigned char)c) && c != '`') x += (char)std::tolower((unsigned char)c);
+    for (char c : q) if (!std::isspace((unsigned char)c) && c != '`') y += (char)std::tolower((unsigned char)c);
     return x == y;
   };
   std::vector<int> item_group(b.items.size(), -1);
@@ -5841,12 +5828,6 @@ struct JoinBufAlloc {
 };
 using JoinedRows = std::vector<JoinedRow, JoinBufAlloc<JoinedRow>>;
 
-// The all-NULL row a LEFT JOIN pads with when the right side has no match.
-const SqlRow& null_row_for(const SqlTable& t) {
-  static SqlRow dummy;
-  return dummy;
-}
-
 struct EvalCtx {
   const std::vector<QuerySource>* sources = nullptr;
   const JoinedRow* row = nullptr;
@@ -6159,32 +6140,6 @@ struct ProbeCandidate {
   bool has_low = true;
   bool has_high = true;
 };
-
-// Every usable equality, not just the first. Which one to look up by matters
-// enormously: `WHERE linenumber = 1 AND orderno = 902137` offers two, and
-// linenumber picks out a third of the table while orderno picks out two rows.
-// Taking whichever appeared first in the text made the index almost worthless.
-void find_probe_equalities(const SqlExpr* where, const EvalCtx& local,
-                           std::vector<ProbeKey>* out) {
-  std::vector<const SqlExpr*> parts;
-  collect_conjuncts(where, &parts);
-  for (const SqlExpr* p : parts) {
-    if (!p || p->op != ExprOp::Eq || p->args.size() != 2) continue;
-    for (int side = 0; side < 2; ++side) {
-      const SqlExpr* col = p->args[side].get();
-      const SqlExpr* val = p->args[1 - side].get();
-      if (!col || col->op != ExprOp::Column) continue;
-      size_t s = 0, c = 0;
-      if (lookup_column_here(local, *col, &s, &c) != ColumnLookup::Found) continue;
-      if (expr_reads_local(val, local)) continue;
-      ProbeKey k;
-      k.column = (int)c;
-      k.value = val;
-      out->push_back(k);
-      break;  // this conjunct is spoken for
-    }
-  }
-}
 
 
 
@@ -6796,14 +6751,6 @@ static bool item_is_string(const SqlExpr* e, const std::vector<QuerySource>& sou
 Val eval_expr(const SqlExpr* e, const EvalCtx& ctx);
 double val_as_number(const Val& v);
 static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v);
-// An exact number widened to `scale` places (no change when it has them, or is not exact).
-static Val widen_exact(Val v, int scale) {
-  if (v.null || !v.numeric || v.approx || scale <= 0) return v;
-  AIOS_INT128 x = 0;
-  int sc = 0, ds = 0;
-  if (exact_internal_of(v, &x, &sc, &ds) && ds < scale) return val_exact_fine(x, sc, std::min(scale, 38));
-  return v;
-}
 
 struct ParsedSelectBranch;
 struct ParsedSelectStatement;
@@ -7497,6 +7444,10 @@ bool probe_day_bound(const Val& v, bool high, Val* out) {
   return true;
 }
 
+// Every usable equality, not just the first. Which one to look up by matters
+// enormously: `WHERE linenumber = 1 AND orderno = 902137` offers two, and
+// linenumber picks out a third of the table while orderno picks out two rows.
+// Taking whichever appeared first in the text made the index almost worthless.
 void find_probe_candidates(const SqlExpr* where, const EvalCtx& local, const EvalCtx& eval_ctx,
                            std::vector<ProbeCandidate>* out) {
   std::vector<const SqlExpr*> parts;
@@ -8735,7 +8686,8 @@ bool mysql_str_to_date(const std::string& s, const std::string& fmt, std::string
                   mo = (int)jp.month; d = (int)jp.day; }
                 have_date = true; break;
       case 'H': case 'k': case 'h': case 'I': case 'l':
-                if (!read_int(2, &hh)) return false; have_time = true; break;
+                if (!read_int(2, &hh)) return false;
+                have_time = true; break;
       case 'i': if (!read_int(2, &mi)) return false; have_time = true; break;
       case 'S': case 's': if (!read_int(2, &ss)) return false; have_time = true; break;
       case 'p': if (si < s.size()) { has_ampm = true; pm = char_upper(s[si]) == 'P'; si += 2; }
@@ -8748,9 +8700,9 @@ bool mysql_str_to_date(const std::string& s, const std::string& fmt, std::string
     if (pm && hh < 12) hh += 12;
     else if (!pm && hh == 12) hh = 0;
   }
-  char buf[32];
+  char buf[64];
   if (!have_date) {   // a time alone: STR_TO_DATE('5:04 PM', '%l:%i %p') is 17:04:00
-    if (!have_time) return false;
+    if (!have_time || hh > 23 || mi > 59 || ss > 59) return false;
     std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mi, ss);
     *out = buf;
     return true;
@@ -9202,73 +9154,6 @@ bool json_path_extract(const std::string& doc, const std::string& path, std::str
   std::string arr = "[";
   for (size_t i = 0; i < found.size(); ++i) { if (i) arr += ", "; arr += found[i]; }
   *out = arr + "]";
-  return true;
-}
-
-bool json_path_extract_old(const std::string& doc, const std::string& path, std::string* out) {
-  if (path.empty() || path[0] != '$') return false;
-  std::string cur = doc;
-  size_t pi = 1;
-  while (pi < path.size()) {
-    std::string key;
-    long long index = -1;
-    if (path[pi] == '.') {
-      pi++;
-      size_t start = pi;
-      while (pi < path.size() && path[pi] != '.' && path[pi] != '[') pi++;
-      key = path.substr(start, pi - start);
-      if (key.size() >= 2 && key.front() == '"' && key.back() == '"') key = key.substr(1, key.size() - 2);
-    } else if (path[pi] == '[') {
-      size_t close = path.find(']', pi);
-      if (close == std::string::npos) return false;
-      index = std::atoll(path.c_str() + pi + 1);
-      pi = close + 1;
-    } else {
-      return false;
-    }
-
-    size_t i = 0;
-    while (i < cur.size() && std::isspace((unsigned char)cur[i])) i++;
-    if (i >= cur.size()) return false;
-    bool matched = false;
-    if (!key.empty() && cur[i] == '{') {
-      i++;
-      while (i < cur.size()) {
-        while (i < cur.size() && (std::isspace((unsigned char)cur[i]) || cur[i] == ',')) i++;
-        if (i >= cur.size() || cur[i] == '}') break;
-        size_t key_start = i;
-        if (!json_skip_value(cur, &i)) return false;
-        std::string raw_key = cur.substr(key_start, i - key_start);
-        if (raw_key.size() >= 2 && raw_key.front() == '"') raw_key = raw_key.substr(1, raw_key.size() - 2);
-        while (i < cur.size() && (std::isspace((unsigned char)cur[i]) || cur[i] == ':')) i++;
-        size_t val_start = i;
-        if (!json_skip_value(cur, &i)) return false;
-        if (json_unescape(raw_key) == key) {
-          cur = cur.substr(val_start, i - val_start);
-          matched = true;
-          break;
-        }
-      }
-    } else if (index >= 0 && cur[i] == '[') {
-      i++;
-      long long at = 0;
-      while (i < cur.size()) {
-        while (i < cur.size() && (std::isspace((unsigned char)cur[i]) || cur[i] == ',')) i++;
-        if (i >= cur.size() || cur[i] == ']') break;
-        size_t val_start = i;
-        if (!json_skip_value(cur, &i)) return false;
-        if (at == index) {
-          cur = cur.substr(val_start, i - val_start);
-          matched = true;
-          break;
-        }
-        at++;
-      }
-    }
-    if (!matched) return false;
-    while (!cur.empty() && std::isspace((unsigned char)cur.back())) cur.pop_back();
-  }
-  *out = cur;
   return true;
 }
 
@@ -13030,6 +12915,8 @@ void sql_set_session_mode(const std::string& mode) {
                         m.find("TRADITIONAL") != std::string::npos;
 }
 
+std::string canonical_temporal(const SqlColumn& c, const std::string& v);
+
 // The reason a value may not go into a column under sql_strict(), or "".
 // An integer column's range by its declared type, exactly: TINYINT .. BIGINT, signed or UNSIGNED. False for a
 // declaration that is not one of them.
@@ -13128,22 +13015,10 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
   }
   if (c.temporal == 1 || c.temporal == 2) {
     // YYYY-MM-DD[ HH:MM:SS[.frac]]; the zero date is allowed, as it is without NO_ZERO_DATE.
-    auto bad = [&]() { return "Incorrect " + std::string(c.temporal == 1 ? "date" : "datetime") + " value: '" + v + "' for column '" + c.name + "' at row 1"; };
-    if (v == "0000-00-00" || v == "0000-00-00 00:00:00") return std::string();
-    if (v.size() < 10 || v[4] != '-' || v[7] != '-') return bad();
-    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u}) if (!std::isdigit((unsigned char)v[i])) return bad();
-    const int y = std::atoi(v.substr(0, 4).c_str()), mo = std::atoi(v.substr(5, 2).c_str()), da = std::atoi(v.substr(8, 2).c_str());
-    static const int mdays[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    if (mo < 1 || mo > 12 || da < 1 || da > mdays[mo] + (mo == 2 && leap ? 1 : 0)) return bad();
-    if (v.size() > 10) {
-      if (v.size() < 19 || (v[10] != ' ' && v[10] != 'T') || v[13] != ':' || v[16] != ':') return bad();
-      for (size_t i : {11u, 12u, 14u, 15u, 17u, 18u}) if (!std::isdigit((unsigned char)v[i])) return bad();
-      const int h = std::atoi(v.substr(11, 2).c_str()), mi = std::atoi(v.substr(14, 2).c_str()), s = std::atoi(v.substr(17, 2).c_str());
-      if (h > 23 || mi > 59 || s > 59) return bad();
-      if (v.size() > 19 && (v[19] != '.' || v.size() == 20)) return bad();
-      for (size_t i = 20; i < v.size(); ++i) if (!std::isdigit((unsigned char)v[i])) return bad();
-    }
+    // Whatever canonical_temporal reads ('2026-6-1', '2026-06-01T12:00:00', '20260601') goes in as it reads it;
+    // what it cannot place on the calendar ('2026-02-30', '', 'soon') is refused, as STRICT_TRANS_TABLES refuses it.
+    if (canonical_temporal(c, v).empty())
+      return "Incorrect " + std::string(c.temporal == 1 ? "date" : "datetime") + " value: '" + v + "' for column '" + c.name + "' at row 1";
     return std::string();
   }
   if (c.type == SqlDataType::Int || c.type == SqlDataType::Decimal || c.type == SqlDataType::Real) {
@@ -13193,7 +13068,7 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
 // A DATE / DATETIME / TIME value as MariaDB stores it: '2024-1-5' is '2024-01-05', '20240105131415' is
 // '2024-01-05 13:14:15', a date alone into a DATETIME gains ' 00:00:00', fractional seconds are cut (not rounded)
 // to the column's precision, a TIME of '1314' is '00:13:14' and 'D HH:MM:SS' counts the days in. Empty when the
-// text is not a value this reads (left as it came).
+// text is not a value of the column's kind: unreadable, or a day its month does not have.
 std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   int fsp = 0;
   if (const size_t lp = c.declared.find('('); lp != std::string::npos) fsp = std::atoi(c.declared.c_str() + lp + 1);
@@ -13209,6 +13084,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   if (neg) s = s.substr(1);
   // the digit groups and what separated them
   std::vector<long long> g;
+  std::vector<size_t> glen;   // how many digits each group was written with: '0001' is the year 1, '01' is 2001
   std::vector<char> sep;   // the separator before each group (0 for the first)
   std::string frac;
   for (size_t i = 0; i < s.size();) {
@@ -13218,6 +13094,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
       if (!sep.empty() && sep.back() == '.' && !g.empty()) { frac = s.substr(i, j - i); i = j; break; }   // the fraction
       if (j - i > 14) return std::string();
       g.push_back(std::atoll(s.substr(i, j - i).c_str()));
+      glen.push_back(j - i);
       i = j;
       continue;
     }
@@ -13255,13 +13132,20 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
       if (digits.size() == 6 || digits.size() == 12) y = two(y);
     } else if (g.size() >= 3) {
       y = g[0]; mo = g[1]; d = g[2];
-      if (g[0] < 100 && !(sep.size() > 0 && g[0] == 0)) y = two(g[0]);
+      if (glen[0] <= 2 && !(sep.size() > 0 && g[0] == 0)) y = two(g[0]);   // a year of two digits or fewer
       if (g.size() >= 4) hh = g[3];
       if (g.size() >= 5) mi = g[4];
       if (g.size() >= 6) ss = g[5];
       if (g.size() > 6) return std::string();
     } else return std::string();
+    if (y < 0 || mo < 0 || d < 0 || hh < 0 || mi < 0 || ss < 0) return std::string();
     if (mo > 12 || d > 31 || hh > 23 || mi > 59 || ss > 59 || y > 9999) return std::string();
+    // A zero month or day is a date here, as in MariaDB without NO_ZERO_IN_DATE; February 30 is not.
+    if (mo >= 1 && d >= 1) {
+      static const int mdays[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+      const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+      if (d > mdays[mo] + (mo == 2 && leap ? 1 : 0)) return std::string();
+    }
     if (c.temporal == 1) std::snprintf(out, sizeof out, "%04lld-%02lld-%02lld", y, mo, d);
     else std::snprintf(out, sizeof out, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld", y, mo, d, hh, mi, ss);
   }
@@ -13274,11 +13158,25 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   return res;
 }
 
+// A temporal column's zero value: what MariaDB stores for one that is not a date, at the column's precision.
+std::string zero_temporal(const SqlColumn& c) {
+  int fsp = 0;
+  if (const size_t lp = c.declared.find('('); lp != std::string::npos) fsp = std::atoi(c.declared.c_str() + lp + 1);
+  fsp = std::max(0, std::min(fsp, 6));
+  if (c.temporal == 1) return "0000-00-00";
+  std::string z = c.temporal == 3 ? "00:00:00" : "0000-00-00 00:00:00";
+  if (fsp > 0) z += "." + std::string((size_t)fsp, '0');
+  return z;
+}
+
 std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
   if (sql_is_null(v)) return v;
-  if (c.temporal && !v.empty()) {
-    const std::string canon = canonical_temporal(c, v);
+  if (c.temporal) {
+    const std::string canon = v.empty() ? std::string() : canonical_temporal(c, v);
     if (!canon.empty()) return canon;
+    // Not a date, time or date-time of the column's kind ('', '2026-02-30', 'soon'): MariaDB without
+    // strict mode stores the zero value and warns.
+    return zero_temporal(c);
   }
   if (c.declared.size() > 5 && c.declared.compare(0, 5, "char(") == 0 && !v.empty() && v.back() == ' ') {
     std::string s = v;
@@ -15233,7 +15131,7 @@ void temporal_format(int64_t v, bool with_time, std::string& s) {
   const int64_t days = with_time ? temporal_floor_div(v, 86400) : v;
   int64_t y; unsigned mo, d;
   temporal_civil_from_days(days, &y, &mo, &d);
-  char buf[24];
+  char buf[64];   // a year past 9999 or before 0 prints wider than 4 digits
   if (with_time) {
     const unsigned sod = (unsigned)(v - days * 86400);
     std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02u:%02u:%02u", (int)y, mo, d, sod / 3600, sod / 60 % 60, sod % 60);
@@ -15414,7 +15312,7 @@ const std::string& ColumnStore::get(size_t row) const {
       else if (sf == 10000) dec_places = 4;
       else {
         int64_t tmp = sf;
-        while (tmp > 1) { dec_places++; tmp /= 10; }
+        while (tmp > 1 && dec_places < 18) { dec_places++; tmp /= 10; }   // an int64 scale has at most 18 places
       }
       if (dec_places == 0) {
         s = std::to_string(sv);
@@ -16020,15 +15918,18 @@ void ColumnStore::push_back(const std::string& val) {
   if ((r + 1) % kSegRows == 0) seal_segment(*this);
 }
 
+// Every caller has just cleared the dictionary these were built from, so their memory goes too: clear() kept it,
+// and a 6,000-row date column turned TemporalSeconds still held 213 KB of them next to its 12 KB of codes.
 void ColumnStore::drop_dict_derived() {
-  id_index.clear();
-  id_tag.clear();
+  auto release = [](auto& v) { std::remove_reference_t<decltype(v)>().swap(v); };
+  release(id_index);
+  release(id_tag);
   id_index_count = 0;
-  dict_doubles.clear();
-  dict_doubles_valid.clear();
-  dict_ints.clear();
-  dict_ints_valid.clear();
-  sorted_dict_indices.clear();
+  release(dict_doubles);
+  release(dict_doubles_valid);
+  release(dict_ints);
+  release(dict_ints_valid);
+  release(sorted_dict_indices);
   sorted_built = false;
 }
 
@@ -18497,7 +18398,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
   // in memory and on disk: LZ4's output is what the store's deflate cannot
   // shrink further. Both are measured on a sample of the column.
   if ((avg_len > 16.0 || ndv > 65536) && non_null_count >= 1024) {
-    constexpr size_t kBlockRows = 512, kSampleBlocks = 32;
+    constexpr size_t kSampleBlocks = 32;   // of the store's own kBlockRows
     const size_t nblocks = (row_count_ + kBlockRows - 1) / kBlockRows;
     const size_t take = std::min(nblocks, kSampleBlocks);
     size_t sample_rows = 0, block_bytes = 0, plain_bytes = 0;
@@ -23225,8 +23126,8 @@ void SqlDatabase::redo_wait_durable() {
       // MariaDB's group commit took four.
       if (open_txns_.load(std::memory_order_relaxed) > 1) {
         static const uint64_t max_ns = [] {
-          const char* e = std::getenv("AIOS_GROUP_COMMIT_US");
-          return (uint64_t)(e && *e ? std::strtoull(e, nullptr, 10) : 100) * 1000ull;
+          const char* env = std::getenv("AIOS_GROUP_COMMIT_US");
+          return (uint64_t)(env && *env ? std::strtoull(env, nullptr, 10) : 100) * 1000ull;
         }();
         constexpr uint64_t kGroupIdleNs = 20000;
         // Short sleeps, not a spin: yielding in a loop here was 80,000
@@ -27300,11 +27201,11 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       const std::string& src = it->second;
       std::string bound;
       size_t k = 0;
-      char q = 0;
+      char quote = 0;
       for (size_t i = 0; i < src.size(); ++i) {
         const char c = src[i];
-        if (q) { bound += c; if (c == '\\' && i + 1 < src.size()) bound += src[++i]; else if (c == q) q = 0; continue; }
-        if (c == '\'' || c == '"' || c == '`') { q = c; bound += c; continue; }
+        if (quote) { bound += c; if (c == '\\' && i + 1 < src.size()) bound += src[++i]; else if (c == quote) quote = 0; continue; }
+        if (c == '\'' || c == '"' || c == '`') { quote = c; bound += c; continue; }
         if (c == '?') {
           if (k >= vals.size()) return make_error("Incorrect arguments to EXECUTE");
           bound += vals[k++];
@@ -27372,7 +27273,7 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
         if (!rp.parse_name(&to)) return make_error(rp.error());
         pairs.push_back({from, to});
       } while (rp.take_punct(","));
-      auto q = [](const std::string& n) {
+      auto quoted = [](const std::string& n) {
         std::string out;
         for (size_t k = 0, from = 0; k <= n.size(); ++k)
           if (k == n.size() || n[k] == '.') { out += (from ? ".`" : "`") + n.substr(from, k - from) + "`"; from = k + 1; }
@@ -27380,7 +27281,7 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       };
       for (const auto& pr : pairs) {
         if (find_table(pr.second)) return make_error("Table '" + pr.second + "' already exists");
-        SqlQueryResult r = execute_alter("ALTER TABLE " + q(pr.first) + " RENAME TO " + q(pr.second));
+        SqlQueryResult r = execute_alter("ALTER TABLE " + quoted(pr.first) + " RENAME TO " + quoted(pr.second));
         if (!r.success) return r;
       }
       SqlQueryResult r;
@@ -30420,7 +30321,7 @@ bool worth_per_code(const ColumnStore& cs) {
 
 // ---- WHERE -----------------------------------------------------------------
 
-enum : uint8_t { kF = 0, kT = 1, kN = 2 };
+constexpr uint8_t kF = 0, kT = 1, kN = 2;
 
 struct Pred {
   enum Kind { And, Or, Not, PerCode, NumCmp, TextCmp, InNum, IsNullCol, InSub, InSubCode, ColCmp, ConcatLike, Row } kind = Row;
@@ -31647,7 +31548,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       const bool cacheable = !sh.statement_time;
       const std::string key = expr_signature(e) + "#" + std::to_string((uintptr_t)&cs) + "#" +
                               std::to_string(cs.epoch);
-      CachedTruth have{{}, kN, false};
+      CachedTruth have{{}, kN, false, {}};
       bool have_any = false;
       if (cacheable) {
         std::lock_guard<aios::hal::Mutex> lk(g_truth_mu);
@@ -32387,8 +32288,7 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
       };
       if (p.exact_ints) {
         static thread_local std::vector<int64_t> xa, xb;
-        static thread_local std::vector<uint32_t> codes;
-        if (xa.size() < n) { xa.resize(n); xb.resize(n); codes.resize(n); }
+        if (xa.size() < n) { xa.resize(n); xb.resize(n); }
         auto read = [&](const ColumnStore& cs, int64_t* o) { typed_ints(cs, start, start + n, o); };
         read(ca, xa.data());
         read(cb, xb.data());
@@ -33333,7 +33233,6 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
         else for (uint32_t k : lcodes) add_range((int64_t)k, (int64_t)k);
         covered = ci->tail_upto;
         if (!ci->patched.empty()) {
-          auto exact_int = [](double v) { return v == std::floor(v) && std::fabs(v) <= 9e18; };
           apply_patches(*ci, &rows, 0, [&](size_t r) {
             if (r >= cs.size() || cs.is_null(r)) return false;
             if (ci->typed) {
@@ -34304,187 +34203,6 @@ struct RowReader {
   }
 };
 
-void accumulate(const Agg& a, AggState& st, size_t r, RowReader& rd) {
-  const ColumnStore& cs = rd.t.col_data[a.src.col];
-  switch (a.kind) {
-    case Agg::CountStar:
-      st.count++;
-      return;
-    case Agg::Count:
-      if (a.col_rules) { if (!cs.is_null(r)) st.count++; return; }
-      if (!rd.val(a.src, r).null) st.count++;
-      return;
-    case Agg::CountDistinct: {
-      if (a.src.kind == Source::CodeCol) {
-        const size_t nd = a.src.code_val.size();
-        size_t k = cs.is_null(r) ? nd : code_at(cs, r);
-        if (k > nd) return;
-        const Val& v = k < nd ? a.src.code_val[k] : a.src.null_val;
-        if (!v.null) st.ids.insert(a.canon[k]);
-        return;
-      }
-      if (a.col_rules && typed_integer(cs) && a.col_type == SqlDataType::Int) {
-        if (!cs.is_null(r)) st.ids.insert((uint64_t)typed_int(cs, r));
-        return;
-      }
-      if (a.col_rules) {
-        if (!cs.is_null(r)) st.strs.insert(collate_key(cs.get(r)));
-        return;
-      }
-      Val v = rd.val(a.src, r);
-      if (!v.null) st.strs.insert(collate_key(v.str()));
-      return;
-    }
-    case Agg::Sum:
-    case Agg::Avg: {
-      if (a.col_rules) {
-        if (cs.is_null(r)) return;
-        // eval_aggregate's column branch: rows whose stored text is empty or
-        // not a number are skipped; a DECIMAL column sums exactly (scaled
-        // integers), the rest as the doubles parse_number reads - which a
-        // typed read equals.
-        double d = 0;
-        bool have;
-        const std::string* txt = nullptr;
-        if (a.src.kind == Source::TypedCol) { d = typed_value(cs, r); have = true; }
-        else {
-          txt = a.src.kind == Source::CodeCol ? &dict_entry(cs, code_at(cs, r)) : &cs.get(r);
-          have = !txt->empty() && parse_number(*txt, &d);
-          if (txt->empty()) return;
-        }
-        // DECIMAL sums exactly as scaled integers; an integer column too, at scale 0 (MariaDB's SUM of a BIGINT is
-        // a DECIMAL: 4000 ids near 2^63 add up to every digit, not to 1.39e20)
-        if ((a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int) && st.dec_exact) {
-          AIOS_INT128 v = 0;
-          bool ok;
-          if (a.col_type == SqlDataType::Int) {
-            if (typed_integer(cs)) { v = (AIOS_INT128)typed_int(cs, r); ok = true; }
-            else ok = decimal_to_scaled(txt ? *txt : cs.get(r), 0, &v);
-          } else if (cs.encoding == ColumnEncoding::DecimalScaled &&
-              std::llround(cs.scale_factor) == (long long)std::llround(std::pow(10.0, a.col_scale))) {
-            v = (AIOS_INT128)(cs.base_int64 + (int64_t)cs.read_code(r));
-            ok = true;
-          } else if (typed_integer(cs)) {
-            v = (AIOS_INT128)typed_int(cs, r);
-            ok = scale_up_exact(&v, a.col_scale);
-          } else if (txt) {
-            ok = decimal_to_scaled(*txt, a.col_scale, &v);
-          } else {
-            ok = decimal_to_scaled(cs.get(r), a.col_scale, &v);
-          }
-          if (ok && !__builtin_add_overflow(st.etotal, v, &st.etotal)) {} else st.dec_exact = false;
-        }
-        if (have) { st.total += d; st.count++; }
-        return;
-      }
-      Val v = rd.val(a.src, r);
-      if (v.null) return;
-      st.total += v.numeric ? v.num : numeric_prefix_of(v.str());
-      st.count++;
-      if (!st.exact) return;
-      AIOS_INT128 x = 0;
-      int xs = 0, ds = 0;
-      if (!exact_internal_of(v, &x, &xs, &ds)) { st.exact = false; return; }
-      st.dscale = std::max(st.dscale, ds);
-      if (xs > st.escale) { if (!scale_up_exact(&st.etotal, xs - st.escale)) { st.exact = false; return; } st.escale = xs; }
-      else if (!scale_up_exact(&x, st.escale - xs)) { st.exact = false; return; }
-      if (__builtin_add_overflow(st.etotal, x, &st.etotal)) st.exact = false;
-      return;
-    }
-    case Agg::Min:
-    case Agg::Max: {
-      const bool is_min = a.kind == Agg::Min;
-      if (a.col_rules && a.src.kind == Source::TypedCol && a.mm_ints) {
-        if (cs.is_null(r)) return;
-        const int64_t x = typed_int(cs, r);
-        if (!st.has || (is_min ? x < st.best_int : x > st.best_int)) { st.has = true; st.best_int = x; st.best_row = (int64_t)r; }
-        return;
-      }
-      if (a.col_rules && a.src.kind == Source::TypedCol) {
-        if (cs.is_null(r)) return;
-        double d = typed_value(cs, r);
-        if (!st.has || (is_min ? d < st.best_num : d > st.best_num)) { st.has = true; st.best_num = d; st.best_row = (int64_t)r; }
-        return;
-      }
-      if (!a.min_rank.empty()) {
-        if (cs.is_null(r)) return;
-        uint32_t k = code_at(cs, r);
-        if (k >= a.min_rank.size()) return;
-        int rk = a.min_rank[k];
-        if (rk < 0) return;
-        if (!st.has || (is_min ? rk < st.best_rank : rk > st.best_rank)) { st.has = true; st.best_rank = rk; st.best_row = (int64_t)r; }
-        return;
-      }
-      Val v = rd.val(a.src, r);
-      if (v.null) return;
-      if (!st.has) { st.best = v; st.has = true; return; }
-      int c = compare_vals(v, st.best);
-      if (c != -2 && (is_min ? c < 0 : c > 0)) st.best = v;
-      return;
-    }
-  }
-}
-
-Val finish(const Agg& a, AggState& st, RowReader& rd) {
-  switch (a.kind) {
-    case Agg::CountStar:
-    case Agg::Count:
-      return val_num((double)st.count);
-    case Agg::CountDistinct:
-      return val_num((double)(st.ids.size() + st.strs.size()));
-    case Agg::Sum:
-    case Agg::Avg: {
-      const bool sum = a.kind == Agg::Sum;
-      if (st.count == 0) return val_null();
-      if (a.col_rules) {
-        if (a.col_type == SqlDataType::Decimal && st.dec_exact) {
-          std::string text;
-          if (sum) text = scaled_to_decimal(st.etotal, a.col_scale);
-          else {
-            AIOS_INT128 num = st.etotal * 10000, den = (AIOS_INT128)st.count;
-            AIOS_INT128 q = num / den, rem = num % den;
-            if ((rem < 0 ? -rem : rem) * 2 >= den) q += (num < 0 ? -1 : 1);
-            text = scaled_to_decimal(q, a.col_scale + 4);
-          }
-          double d = 0;
-          parse_number(text, &d);
-          return val_num_with_text(d, text);
-        }
-        const bool int_col = a.col_type == SqlDataType::Int;
-        if (int_col && st.dec_exact) {
-          if (sum) {
-            const std::string text = scaled_to_decimal(st.etotal, 0);
-            double d = 0;
-            parse_number(text, &d);
-            return val_num_with_text(d, text);
-          }
-          AIOS_INT128 num = st.etotal;
-          if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)st.count, 1), 4);
-        }
-        if (int_col && !sum && std::fabs(st.total) < 9e15) {
-          AIOS_INT128 num = (AIOS_INT128)(long long)st.total;
-          if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)st.count, 1), 4);
-        }
-        Val out = val_num(sum ? st.total : st.total / (double)st.count);
-        if (!int_col) out.approx = true;
-        return out;
-      }
-      if (st.exact) {
-        Val out;
-        if (exact_sum_value(st.etotal, st.escale, st.dscale, st.count, !sum, &out))
-          return a.static_scale > 0 ? widen_exact(std::move(out), a.static_scale + (sum ? 0 : 4)) : out;
-      }
-      return val_approx(sum ? st.total : st.total / (double)st.count);
-    }
-    case Agg::Min:
-    case Agg::Max:
-      if (!st.has) return val_null();
-      if (st.best_row >= 0) return eval_expr(a.src.expr, rd.ev.at((size_t)st.best_row));
-      return st.best;
-  }
-  return val_null();
-}
-
 // ---- vectorized aggregation ---------------------------------------------------
 //
 // Group ids are assigned per morsel in parallel and renumbered in order of each
@@ -35265,11 +34983,11 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             return slot_first[a] < slot_first[b];
           });
 
-          const size_t G = hit_slots.size();
-          first_row->resize(G);
-          values->assign(G, aggs.size());
+          const size_t hits = hit_slots.size();
+          first_row->resize(hits);
+          values->assign(hits, aggs.size());
           RowReader rd_main(t, base);
-          for (size_t g = 0; g < G; ++g) {
+          for (size_t g = 0; g < hits; ++g) {
             const uint32_t id = hit_slots[g];
             (*first_row)[g] = slot_first[id];
             for (size_t ai = 0; ai < aggs.size(); ++ai) {
@@ -36497,24 +36215,24 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
     // into `SUM(a) - SUM(a)`). Anything that could answer differently the
     // second time - RAND, UUID, a variable, a subquery - is never shared.
     std::vector<std::string> agg_keys;
-    auto structural_key = [](auto& self, const SqlExpr* e, std::string* out) -> bool {
+    auto structural_key = [](auto& self, const SqlExpr* e, std::string* key_out) -> bool {
       if (!e || e->op == ExprOp::Subquery || e->op == ExprOp::Exists || !e->subquery_sql.empty() || !e->group_order_by.empty()) return false;
       if (e->name.rfind("@", 0) == 0) return false;
       if (e->op == ExprOp::Func) {
         const std::string up = upper_of(e->name);
         if (up == "RAND" || up == "RANDOM" || up == "UUID" || up == "UUID_SHORT" || up == "SLEEP") return false;
       }
-      *out += '(';
-      *out += std::to_string((int)e->op);
-      *out += ',' + e->name + ',' + e->qualifier + ',' + (e->negated ? "n" : "p") + ',' + e->separator;
+      *key_out += '(';
+      *key_out += std::to_string((int)e->op);
+      *key_out += ',' + e->name + ',' + e->qualifier + ',' + (e->negated ? "n" : "p") + ',' + e->separator;
       if (e->op == ExprOp::Literal) {
         const Val& v = e->literal;
-        *out += v.null ? ",N" : (v.numeric ? ",#" : ",$");
-        *out += v.approx ? "a" : "e";
-        if (!v.null) *out += ':' + v.str();
+        *key_out += v.null ? ",N" : (v.numeric ? ",#" : ",$");
+        *key_out += v.approx ? "a" : "e";
+        if (!v.null) *key_out += ':' + v.str();
       }
-      for (const auto& a : e->args) if (!self(self, a.get(), out)) return false;
-      *out += ')';
+      for (const auto& a : e->args) if (!self(self, a.get(), key_out)) return false;
+      *key_out += ')';
       return true;
     };
     for (const SqlExpr* n : nodes) {
@@ -36700,9 +36418,9 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
                   for (size_t c = 0; c < nd; ++c) if (!sk.code_null[c]) order.push_back((uint32_t)c);
                   std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return compare_vals_ordered(s.code_val[x], s.code_val[y]) < 0; });
                   double rank = 0;
-                  for (size_t i = 0; i < order.size(); ++i) {
-                    if (i > 0 && compare_vals_ordered(s.code_val[order[i - 1]], s.code_val[order[i]]) != 0) ++rank;
-                    sk.code_num[order[i]] = rank;
+                  for (size_t j = 0; j < order.size(); ++j) {
+                    if (j > 0 && compare_vals_ordered(s.code_val[order[j - 1]], s.code_val[order[j]]) != 0) ++rank;
+                    sk.code_num[order[j]] = rank;
                   }
                 }
               } else if (sk.type == SqlDataType::Text) {
@@ -36851,17 +36569,17 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
           ks.push_back({(uint32_t)off, (uint32_t)(arena.size() - off), r});
         }
         const bool desc = k.desc;
-        const char* base = arena.data();
+        const char* keys_at = arena.data();
         // PAD SPACE, as pad_compare_ci: the longer key's rest against spaces.
         auto key_cmp = [&](const KeyRef& a, const KeyRef& b) {
           const size_t n = std::min(a.len, b.len);
-          const int c = n ? std::memcmp(base + a.off, base + b.off, n) : 0;
+          const int c = n ? std::memcmp(keys_at + a.off, keys_at + b.off, n) : 0;
           if (c != 0 || a.len == b.len) return c;
           const bool a_longer = a.len > b.len;
           const KeyRef& L = a_longer ? a : b;
           const int sign = a_longer ? 1 : -1;
           for (size_t i = n; i < L.len; ++i) {
-            const unsigned char w = (unsigned char)base[L.off + i];
+            const unsigned char w = (unsigned char)keys_at[L.off + i];
             if (w != 0x20) return w < 0x20 ? -sign : sign;
           }
           return 0;
@@ -38094,11 +37812,11 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
         mn = std::min(mn, x); mx = std::max(mx, x);
       }
       const uint64_t span = mn > mx ? 1 : (uint64_t)(mx - mn) + 2;   // + the NULL slot
-      int b = 1;
-      while (b < 64 && (1ull << b) <= span) ++b;
+      int width = 1;
+      while (width < 64 && (1ull << width) <= span) ++width;
       lo[j] = mn > mx ? 0 : (int64_t)mn;
-      bits[j] = b;
-      total += b;
+      bits[j] = width;
+      total += width;
       if (total > 64) return false;
     }
     out->resize(n);
@@ -38804,12 +38522,12 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
                 return desc ? -kc.ex[r] : kc.ex[r];
               };
               auto bound = [&](size_t pos, bool following, AIOS_INT128 off, AIOS_INT128* out) -> bool {
-                const AIOS_INT128 b = xkey(pos) + (following ? off : -off);
+                const AIOS_INT128 edge = xkey(pos) + (following ? off : -off);
                 if (kc.int_col && kc.ex_scale == 0 && kc.cls[idx[ps + pos]] != 0) {
-                  const AIOS_INT128 v = desc ? -b : b;   // the bound as the column's own number
-                  const AIOS_INT128 lo = kc.unsigned_vals ? 0 : (AIOS_INT128)INT64_MIN;
-                  const AIOS_INT128 hi = kc.unsigned_vals ? (((AIOS_INT128)1 << 64) - 1) : (AIOS_INT128)INT64_MAX;
-                  if (v < lo || v > hi) {
+                  const AIOS_INT128 v = desc ? -edge : edge;   // the bound as the column's own number
+                  const AIOS_INT128 min_v = kc.unsigned_vals ? 0 : (AIOS_INT128)INT64_MIN;
+                  const AIOS_INT128 max_v = kc.unsigned_vals ? (((AIOS_INT128)1 << 64) - 1) : (AIOS_INT128)INT64_MAX;
+                  if (v < min_v || v > max_v) {
                     const SqlExpr* oe = w.spec.order_by.empty() ? nullptr : w.spec.order_by[0].expr.get();
                     const std::string name = oe && !oe->source_text.empty() ? oe->source_text : std::string("ORDER BY key");
                     const bool plus = following != desc;
@@ -38818,25 +38536,25 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
                     return false;
                   }
                 }
-                *out = b;
+                *out = edge;
                 return true;
               };
               auto first_at_least_x = [&](AIOS_INT128 x) { size_t a = 0, z = m; while (a < z) { size_t mid = (a + z) / 2; if (xkey(mid) < x) a = mid + 1; else z = mid; } return (long long)a; };
               auto last_at_most_x = [&](AIOS_INT128 x) { size_t a = 0, z = m; while (a < z) { size_t mid = (a + z) / 2; if (xkey(mid) <= x) a = mid + 1; else z = mid; } return (long long)a - 1; };
-              AIOS_INT128 b = 0;
+              AIOS_INT128 x_at = 0;
               const bool null_row = kc.cls[idx[ps + k]] == 0;
               switch (f.start) {
                 case WindowSpec::UnboundedPreceding: l = 0; break;
-                case WindowSpec::Preceding: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, false, off_s, &b)) return false; l = first_at_least_x(b); break;
+                case WindowSpec::Preceding: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, false, off_s, &x_at)) return false; l = first_at_least_x(x_at); break;
                 case WindowSpec::CurrentRow: l = (long long)gstart[k]; break;
-                case WindowSpec::Following: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, true, off_s, &b)) return false; l = first_at_least_x(b); break;
+                case WindowSpec::Following: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, true, off_s, &x_at)) return false; l = first_at_least_x(x_at); break;
                 case WindowSpec::UnboundedFollowing: l = (long long)m; break;
               }
               switch (f.end) {
                 case WindowSpec::UnboundedPreceding: h = -1; break;
-                case WindowSpec::Preceding: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, false, off_e, &b)) return false; h = last_at_most_x(b); break;
+                case WindowSpec::Preceding: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, false, off_e, &x_at)) return false; h = last_at_most_x(x_at); break;
                 case WindowSpec::CurrentRow: h = (long long)gend[k] - 1; break;
-                case WindowSpec::Following: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, true, off_e, &b)) return false; h = last_at_most_x(b); break;
+                case WindowSpec::Following: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, true, off_e, &x_at)) return false; h = last_at_most_x(x_at); break;
                 case WindowSpec::UnboundedFollowing: h = (long long)m - 1; break;
               }
               if (l < 0) l = 0;
@@ -40473,13 +40191,13 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
   if (ng > 1 && shape.uniq_col.size() == sources.size()) {
     for (const Key& K : keys) {
       if (shape.uniq_col[K.src] != (int)K.col) continue;
-      bool all = true;
+      bool under_k = true;   // every key's source sits under K's
       for (const Key& O : keys) {
         int t = (int)O.src;
         while (t >= 0 && t != (int)K.src) t = shape.parent[(size_t)t];
-        if (t != (int)K.src) { all = false; break; }
+        if (t != (int)K.src) { under_k = false; break; }
       }
-      if (all) { by_row = (int)K.src; break; }
+      if (under_k) { by_row = (int)K.src; break; }
     }
   }
   for (size_t ki = 0; ki < ng && by_row < 0; ++ki) {
@@ -42386,7 +42104,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           const SqlTable& btbl = *sources[0].table;
 
           // The same probe-index trick the single-table, no-join path already
-          // uses (find_probe_equalities + get_or_build_probe_index) applies
+          // uses (find_probe_candidates + get_or_build_probe_index) applies
           // just as well here: a pushed-down base predicate like
           // `completed = '0'` is still a plain column-equals-constant, and
           // walking every row of a 300-400K row table to evaluate it through
@@ -44799,7 +44517,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     // open-orders page that is 3,660 groups x 198 columns.
     bool keep_items = false;
     for (const OrderKey& k : order_by) if (k.ordinal > 0) keep_items = true;
-    auto push_out_value = [keep_items](OutRow& o, Val&& v, std::vector<Val>& items) {
+    auto push_out_value = [keep_items](OutRow& o, Val&& v, std::vector<Val>& kept) {
       if (v.null) {
         o.row.values.push_back(sql_null());
       } else if (keep_items) {
@@ -44808,7 +44526,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         (void)v.str();
         o.row.values.push_back(std::move(v.text));
       }
-      if (keep_items) items.push_back(std::move(v));
+      if (keep_items) kept.push_back(std::move(v));
     };
     // A select item that is a stored column prints as that cell of the
     // group's row -- eval_expr reads it from g[0] too -- so it is copied
@@ -45023,22 +44741,6 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
   if (!order_by.empty()) {
     auto cmp = row_less;
-    (void)cmp;
-    auto cmp_unused = [&order_by, &order_types](const OutRow& a, const OutRow& b) {
-      for (size_t i = 0; i < order_by.size(); ++i) {
-        if (i >= a.sort_keys.size() || i >= b.sort_keys.size()) break;
-        const Val& x = a.sort_keys[i];
-        const Val& y = b.sort_keys[i];
-        // NULLs sort first ascending, as MySQL does.
-        if (x.null && y.null) continue;
-        if (x.null) return !order_by[i].descending;
-        if (y.null) return order_by[i].descending;
-        int c = compare_vals_as(order_types[i], x, y);
-        if (c == 0) continue;
-        return order_by[i].descending ? c > 0 : c < 0;
-      }
-      return false;
-    };
     if (limit >= 0 && (size_t)(offset + limit) < out_rows.size()) {
       std::partial_sort(out_rows.begin(), out_rows.begin() + (size_t)(offset + limit), out_rows.end(), cmp);
     } else {
@@ -48051,8 +47753,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
         if (!tt->columns[c].auto_increment) continue;
         long long mx = 0;
         for (size_t r = 0; r < tt->row_count(); ++r) {
-          const std::string& v = tt->cell(r, c);
-          if (!sql_is_null(v)) mx = std::max(mx, std::strtoll(v.c_str(), nullptr, 10));
+          const std::string& cell = tt->cell(r, c);
+          if (!sql_is_null(cell)) mx = std::max(mx, std::strtoll(cell.c_str(), nullptr, 10));
         }
         if (auto ri = get_or_sync_row_index(*tt)) mx = std::max(mx, ri->auto_max);
         mx = std::max(mx, tt->auto_increment_next - 1);
@@ -48835,7 +48537,8 @@ SqlQueryResult SqlDatabase::execute_explain(const std::string& sql) {
     extra_oss << "Using Radix Hash Join (L1 cache-partitioned); ";
   }
   if (is_analyze) {
-    extra_oss << "Actual Time=" << (actual_duration_us / 1000.0) << "ms Rows=" << actual_rows << " Route=" << route_str;
+    extra_oss << "Actual Time=" << (actual_duration_us / 1000.0) << "ms Rows=" << actual_rows << " Route=" << route_str
+              << " ZonePruned=" << zone_pruned << " BloomPruned=" << bloom_pruned;
   } else {
     extra_oss << "Estimated Engine Route=" << (is_parallel ? "PARALLEL_MORSEL_SCAN" : "POINT_LOOKUP");
   }
@@ -52234,9 +51937,9 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
   if (!upd_trig.empty()) undo.emplace(*this, *t);
   // A row's triggers around its assignments: BEFORE sees NEW with them applied
   // and may change it (a failure puts the row back); AFTER sees the result.
-  auto fire_update = [&](size_t r, const SqlRow& before_img, std::string* terr) -> bool {
+  auto fire_update = [&](size_t r, const SqlRow& before_img, std::string* trig_err) -> bool {
     SqlRow new_img = t->get_row(r);
-    if (!sql_fire_triggers(*this, upd_trig, "BEFORE", *t, &before_img, &new_img, terr)) {
+    if (!sql_fire_triggers(*this, upd_trig, "BEFORE", *t, &before_img, &new_img, trig_err)) {
       for (size_t c = 0; c < before_img.values.size(); ++c)
         if (t->cell(r, c) != before_img.values[c]) t->set_cell(r, c, before_img.values[c]);
       return false;
@@ -52246,7 +51949,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
       if (t->cell(r, c) != v) t->set_cell(r, c, v);
     }
     SqlRow after_img = t->get_row(r);
-    return sql_fire_triggers(*this, upd_trig, "AFTER", *t, &before_img, &after_img, terr);
+    return sql_fire_triggers(*this, upd_trig, "AFTER", *t, &before_img, &after_img, trig_err);
   };
 
   std::vector<QuerySource> sources{{name, t}};
@@ -53191,7 +52894,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   if (!del_trig.empty()) undo.emplace(*this, *t);
   std::vector<SqlRow> del_imgs;
   if (!del_trig.empty() && !to_delete.empty()) {
-    std::string terr;
+    terr.clear();
     del_imgs.reserve(to_delete.size());
     for (size_t ri : to_delete) {
       del_imgs.push_back(t->get_row(ri));
@@ -53219,7 +52922,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   t->erase_rows(to_delete);   // one pass per column, encodings kept
   uint64_t deleted = to_delete.size();
   if (!del_imgs.empty()) {
-    std::string terr;
+    terr.clear();
     for (const SqlRow& img : del_imgs)
       if (!sql_fire_triggers(*this, del_trig, "AFTER", *t, &img, nullptr, &terr)) return make_error(terr);
   }
@@ -54345,7 +54048,9 @@ bool SqlDatabase::load_tables_v4() {
   std::vector<uint64_t> valid_lengths(manifest_entries.size(), 0);
   if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
     for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
+  set_startup_phase("loading tables", 0, manifest_entries.size());
   for (size_t ei = 0; ei < manifest_entries.size(); ++ei) {
+    startup_progress(ei);
     const std::string& key = manifest_entries[ei].first;
     const std::string& file = manifest_entries[ei].second;
     auto tf = kernel_.host().read_file(dir + "/" + file);
@@ -54378,12 +54083,12 @@ bool SqlDatabase::load_tables_v4() {
     for (uint32_t c = 0; c < ncol && r.ok(); ++c) {
       SqlColumn col;
       col.name = r.str();
-      uint32_t packed = r.u32();
-      col.type = (SqlDataType)(packed & 0x3f);
-      col.binary = (uint8_t)((packed >> 6) & 3);
-      col.precision = (uint8_t)((packed >> 8) & 0xff);
-      col.scale = (uint8_t)((packed >> 16) & 0xff);
-      col.temporal = (uint8_t)((packed >> 24) & 0xff);
+      uint32_t type_word = r.u32();
+      col.type = (SqlDataType)(type_word & 0x3f);
+      col.binary = (uint8_t)((type_word >> 6) & 3);
+      col.precision = (uint8_t)((type_word >> 8) & 0xff);
+      col.scale = (uint8_t)((type_word >> 16) & 0xff);
+      col.temporal = (uint8_t)((type_word >> 24) & 0xff);
       col.is_primary_key = r.u8() != 0; col.not_null = r.u8() != 0; col.auto_increment = r.u8() != 0;
       col.default_value = r.str();
       t.columns.push_back(col);
@@ -54438,13 +54143,13 @@ bool SqlDatabase::load_tables_v4() {
     }
     if (trailer == kRulesTrailerMagic && r.ok()) {
       const uint32_t nc = r.u32();
-      std::vector<std::pair<std::string, bool>> gen;
-      for (uint32_t i = 0; i < nc && r.ok(); ++i) { std::string g = r.str(); const bool v = r.u8() != 0; gen.push_back({std::move(g), v}); }
+      std::vector<std::pair<std::string, bool>> generated;
+      for (uint32_t i = 0; i < nc && r.ok(); ++i) { std::string g = r.str(); const bool v = r.u8() != 0; generated.push_back({std::move(g), v}); }
       const uint32_t nk = r.ok() ? r.u32() : 0;
       std::vector<SqlCheck> checks;
       for (uint32_t i = 0; i < nk && r.ok(); ++i) { SqlCheck ck; ck.name = r.str(); ck.expr = r.str(); ck.column_level = r.u8() != 0; checks.push_back(std::move(ck)); }
-      if (r.ok() && gen.size() == t.columns.size()) {
-        for (size_t i = 0; i < gen.size(); ++i) { t.columns[i].generated = gen[i].first; t.columns[i].generated_virtual = gen[i].second; }
+      if (r.ok() && generated.size() == t.columns.size()) {
+        for (size_t i = 0; i < generated.size(); ++i) { t.columns[i].generated = generated[i].first; t.columns[i].generated_virtual = generated[i].second; }
         t.checks = std::move(checks);
       }
       trailer = r.ok() && r.remaining() >= 4 ? r.u32() : 0;
@@ -54463,10 +54168,10 @@ bool SqlDatabase::load_tables_v4() {
       struct IxMeta { std::string comment, type; std::vector<uint16_t> sub; };
       std::vector<IxMeta> im;
       for (uint32_t i = 0; i < ni && r.ok(); ++i) {
-        IxMeta m; m.comment = r.str(); m.type = r.str();
+        IxMeta meta; meta.comment = r.str(); meta.type = r.str();
         const uint32_t ns = r.ok() ? r.u32() : 0;
-        for (uint32_t k = 0; k < ns && r.ok(); ++k) m.sub.push_back((uint16_t)r.u32());
-        im.push_back(std::move(m));
+        for (uint32_t k = 0; k < ns && r.ok(); ++k) meta.sub.push_back((uint16_t)r.u32());
+        im.push_back(std::move(meta));
       }
       if (r.ok() && cc.size() == t.columns.size()) {
         t.comment = std::move(tc);
@@ -54926,6 +54631,22 @@ Result<size_t> SqlDatabase::repair_schema_from_source(const std::string& host, u
   return fixed;
 }
 
+void SqlDatabase::set_startup_phase(const std::string& phase, size_t done, size_t total) {
+  std::lock_guard<std::mutex> g(startup_mu_);
+  startup_phase_ = phase;
+  startup_done_.store(done, std::memory_order_relaxed);
+  startup_total_.store(total, std::memory_order_relaxed);
+}
+
+std::string SqlDatabase::startup_status() const {
+  std::string phase;
+  { std::lock_guard<std::mutex> g(startup_mu_); phase = startup_phase_; }
+  if (phase.empty()) phase = "starting";
+  const size_t total = startup_total_.load(std::memory_order_relaxed);
+  if (total == 0) return phase;
+  return phase + " (" + std::to_string(std::min(startup_done_.load(std::memory_order_relaxed), total)) + " of " + std::to_string(total) + ")";
+}
+
 Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                              const std::string& password, const std::string& database,
                                              const std::vector<std::string>& tables, std::vector<std::string>* log) {
@@ -55018,7 +54739,10 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
   // CREATE DATABASE, which would also switch the engine's current database.
   databases_.insert(database);
   size_t seeded = 0;
+  set_startup_phase("seeding tables", 0, todo.size());
+  size_t seed_at = 0;
   for (const auto& t : todo) {
+    startup_progress(seed_at++);
     const std::string key = lower_ascii(database + "." + t);
     ScopedSessionDb in_tenant(database);         // every statement below acts in the source's database
     seeds[key] = {"-", 0};                       // started; not trusted until it finishes

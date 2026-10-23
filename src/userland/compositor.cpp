@@ -1272,7 +1272,7 @@ void HardwareCompositor::draw_app_icon(std::vector<uint32_t>& buf, int buf_w, in
       draw_pill_to(buf, buf_w, buf_h, rx, y + size - 7, 3, 3, 0xFFFCD34D, 0xFFFEF08A);
       break;
     }
-    case WindowType::Miner: {
+    case WindowType::Mining: {
       // Miner / Crypto: Dark gold squircle, golden pickaxe / coin
       draw_rounded_rect_to(buf, buf_w, buf_h, x, y, size, size, r, 0xFF292006);
       draw_round_outline_to(buf, buf_w, buf_h, x, y, size, size, r, 0xFFCA8A04);
@@ -10989,7 +10989,7 @@ void HardwareCompositor::render_inspector_window(WindowSurface& win, Kernel& k) 
 void HardwareCompositor::render_window_content(WindowSurface& win, Kernel& k) {
   switch (win.type) {
     case WindowType::Terminal: render_terminal_window(win, k); break;
-    case WindowType::Miner: render_miner_window(win, k); break;
+    case WindowType::Mining: render_miner_window(win, k); break;
     case WindowType::Tasks: render_tasks_window(win, k); break;
     case WindowType::Hardware: render_hardware_window(win, k); break;
     case WindowType::Editor: render_editor_window(win, k); break;
@@ -15010,7 +15010,7 @@ void HardwareCompositor::input_mouse_button(int x, int y, bool down, int button)
             }
           }
         }
-      } else if (w.type == WindowType::Miner && rel_y >= w.content_height() - 54 && rel_y <= w.content_height() - 10) {
+      } else if (w.type == WindowType::Mining && rel_y >= w.content_height() - 54 && rel_y <= w.content_height() - 10) {
         // The same three rects the pane drew, from the same function. The
         // daemon button's width does not depend on which label it is wearing,
         // so this hit test does not need to know the daemon's state.

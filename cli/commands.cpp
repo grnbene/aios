@@ -2562,6 +2562,81 @@ void cmd_compute(Ctx& c, const Args& a) {
       const std::string cdc_db_seed = has_kv(a, "cdc_db") ? kv(a, "cdc_db") : std::string();
       if (has_kv(a, "cdc_host") && cdc_db_seed.empty())
         fail(Status::Invalid, "compute serve: cdc_host= needs cdc_db=<the source database to mirror>");
+      // The MySQL wire server (Navicat, DBeaver, the mysql client, the ERP), started before anything loads.
+      uint16_t mysql_port = has_kv(a, "mysql_port") ? (uint16_t)to_u64(kv(a, "mysql_port")) : (has_kv(a, "port_mysql") ? (uint16_t)to_u64(kv(a, "port_mysql")) : 3307);
+      std::string mysql_bind = has_kv(a, "mysql_bind") ? kv(a, "mysql_bind") : (has_kv(a, "public") && kv(a, "public") == "1" ? "0.0.0.0" : "0.0.0.0");
+      if (has_kv(a, "mysql_loopback") && kv(a, "mysql_loopback") == "1") mysql_bind = "127.0.0.1";
+
+      std::string mysql_user = has_kv(a, "mysql_user") ? kv(a, "mysql_user") : std::string();
+      std::string mysql_pass = has_kv(a, "mysql_pass") ? kv(a, "mysql_pass") : std::string();
+      // A password in the unit file shows up in `systemctl cat` and in `ps`;
+      // a file readable only by the service user does not.
+      if (has_kv(a, "mysql_pass_file")) {
+        if (read_first_line(kv(a, "mysql_pass_file"), mysql_pass)) {
+        } else {
+          c.o << "compute mysql wire server: cannot read " << kv(a, "mysql_pass_file") << "\n";
+        }
+      }
+
+      // Without an account this port accepted any credentials at all. It is
+      // now kept on the loopback until one is configured, rather than opened
+      // to the internet unauthenticated.
+      if (mysql_user.empty() && mysql_bind != "127.0.0.1") {
+        c.o << "compute mysql wire server: no mysql_user set, binding 127.0.0.1 only"
+               " (set mysql_user= and mysql_pass_file= to accept remote clients)\n";
+        mysql_bind = "127.0.0.1";
+      }
+
+      mysql_server = std::make_unique<userland::MysqlWireServer>(c.k, *sql_db, mysql_port, mysql_bind);
+      if (!mysql_user.empty()) mysql_server->add_account(mysql_user, mysql_pass);
+      mysql_server->set_trust_loopback(!has_kv(a, "mysql_strict_loopback") ||
+                                       kv(a, "mysql_strict_loopback") != "1");
+      // Capability credentials (user "cap"): signed with this machine's
+      // capability key, revocations kept beside it. mysql_capabilities=0 turns
+      // them off; mysql_cap_remote=1 accepts them from other hosts, in the clear.
+      if (!has_kv(a, "mysql_capabilities") || kv(a, "mysql_capabilities") != "0") {
+        const std::string cap_root = c.k.config().root;
+        const std::string cap_key = userland::asql_load_capability_key(cap_root);
+        if (cap_key.empty()) {
+          c.o << "compute mysql wire server: no capability key (set AIOS_CAPABILITY_KEY or make " << cap_root
+              << "/capability.key writable); capability logins are off\n";
+        } else {
+          asql_cap_guard = std::make_unique<sidecar::CapabilityGuard>(cap_key, cap_root + "/capability-state");
+          mysql_server->set_capability_guard(asql_cap_guard.get());
+          asql_cap_users = std::make_unique<userland::AsqlUserStore>(cap_root + "/capability-users");
+          mysql_server->set_capability_users(asql_cap_users.get());
+          mysql_server->set_capability_remote(has_kv(a, "mysql_cap_remote") && kv(a, "mysql_cap_remote") == "1");
+          c.o << "compute mysql wire server: capability logins on (user cap"
+              << (has_kv(a, "mysql_cap_remote") && kv(a, "mysql_cap_remote") == "1" ? ", remote allowed" : ", this host only")
+              << "; named users in " << cap_root << "/capability-users)\n";
+        }
+      }
+      if (has_kv(a, "mysql_socket")) mysql_server->set_unix_socket(kv(a, "mysql_socket"));
+      if (has_kv(a, "mysql_charset")) mysql_server->set_charset_aware(kv(a, "mysql_charset") == "1");
+      if (has_kv(a, "max_connections")) mysql_server->set_max_connections(to_u64(kv(a, "max_connections")));
+      if (has_kv(a, "query_memory_mb")) sql_db->set_query_memory_budget((size_t)to_u64(kv(a, "query_memory_mb")) << 20);
+      // TLS: mysql_tls_cert=<chain.pem> mysql_tls_key=<key.pem> [mysql_tls_require=1]
+      if (has_kv(a, "mysql_tls_cert") && has_kv(a, "mysql_tls_key")) {
+        mysql_server->set_tls(kv(a, "mysql_tls_cert"), kv(a, "mysql_tls_key"), has_kv(a, "mysql_tls_require") && kv(a, "mysql_tls_require") == "1");
+        c.o << "compute mysql wire server: TLS offered (" << kv(a, "mysql_tls_cert") << ")"
+            << (has_kv(a, "mysql_tls_require") && kv(a, "mysql_tls_require") == "1" ? ", required for remote clients" : "") << "\n";
+      }
+      // Listening from here on, before the store loads: a client logs in and is told what the engine is doing
+      // (MysqlWireServer::set_starting) until it is up.
+      mysql_server->set_starting(true);
+      auto ms_res = mysql_server->start();
+      if (ms_res.ok()) {
+        mysql_server->start_background();
+        mysql_wire_up = true;
+        if (!mysql_server->unix_socket().empty())
+          c.o << "compute mysql wire server listening on unix socket " << mysql_server->unix_socket() << "\n";
+        c.o << "compute mysql wire server listening on " << mysql_bind << ":" << mysql_port
+            << (mysql_user.empty() ? " (loopback, no password)" : " (password required for user " + mysql_user + ")")
+            << "\n";
+      } else {
+        c.o << "compute mysql wire server failed to bind " << mysql_bind << ":" << mysql_port << ": " << ms_res.error().message << "\n";
+      }
+      sql_db->set_startup_phase("opening the store");
       need(sql_db->init(db_dir));
       sql_db->scan_local_stores();  // discover databases dropped into the root (not just sql_db/)
       c.o << "compute sql op attached: " << db_dir << " (" << sql_db->list_tables().size() << " table(s), reads only)\n";
@@ -2646,6 +2721,7 @@ void cmd_compute(Ctx& c, const Args& a) {
           log("compute sql: whitelist - " + std::to_string(have) + " of " + std::to_string(cdc_want.size()) + " table(s) present" +
               (sd.ok() ? ", " + std::to_string(*sd) + " seeded now" : std::string()));
           // Tables already here: their column metadata re-read from the master.
+          sql_db->set_startup_phase("re-reading table definitions from the master");
           std::vector<std::string> rep_log;
           auto rp = sql_db->repair_schema_from_source(cdc_host, cdc_port, cdc_user, cdc_pass, cdc_db_seed, cdc_want, &rep_log);
           for (const auto& l : rep_log) log("compute sql: schema - " + l);
@@ -2669,6 +2745,7 @@ void cmd_compute(Ctx& c, const Args& a) {
           change += ", SOURCE_LOG_POS = " + kv(a, "cdc_log_pos");
         }
         change += ";";
+        sql_db->set_startup_phase("starting replication");
         auto cr = sql_db->execute_query(change);
         if (cr.success) {
           // The whitelist as the table names read above. It used to pass the
@@ -2692,82 +2769,15 @@ void cmd_compute(Ctx& c, const Args& a) {
         }
       }
 
-      // Auto-start background MySQL Wire Protocol Server (for Navicat, DBeaver, and MySQL CLI clients)
-      uint16_t mysql_port = has_kv(a, "mysql_port") ? (uint16_t)to_u64(kv(a, "mysql_port")) : (has_kv(a, "port_mysql") ? (uint16_t)to_u64(kv(a, "port_mysql")) : 3307);
-      std::string mysql_bind = has_kv(a, "mysql_bind") ? kv(a, "mysql_bind") : (has_kv(a, "public") && kv(a, "public") == "1" ? "0.0.0.0" : "0.0.0.0");
-      if (has_kv(a, "mysql_loopback") && kv(a, "mysql_loopback") == "1") mysql_bind = "127.0.0.1";
-
-      std::string mysql_user = has_kv(a, "mysql_user") ? kv(a, "mysql_user") : std::string();
-      std::string mysql_pass = has_kv(a, "mysql_pass") ? kv(a, "mysql_pass") : std::string();
-      // A password in the unit file shows up in `systemctl cat` and in `ps`;
-      // a file readable only by the service user does not.
-      if (has_kv(a, "mysql_pass_file")) {
-        if (read_first_line(kv(a, "mysql_pass_file"), mysql_pass)) {
-        } else {
-          c.o << "compute mysql wire server: cannot read " << kv(a, "mysql_pass_file") << "\n";
-        }
-      }
-
-      // Without an account this port accepted any credentials at all. It is
-      // now kept on the loopback until one is configured, rather than opened
-      // to the internet unauthenticated.
-      if (mysql_user.empty() && mysql_bind != "127.0.0.1") {
-        c.o << "compute mysql wire server: no mysql_user set, binding 127.0.0.1 only"
-               " (set mysql_user= and mysql_pass_file= to accept remote clients)\n";
-        mysql_bind = "127.0.0.1";
-      }
-
-      mysql_server = std::make_unique<userland::MysqlWireServer>(c.k, *sql_db, mysql_port, mysql_bind);
-      if (!mysql_user.empty()) mysql_server->add_account(mysql_user, mysql_pass);
-      mysql_server->set_trust_loopback(!has_kv(a, "mysql_strict_loopback") ||
-                                       kv(a, "mysql_strict_loopback") != "1");
-      // Capability credentials (user "cap"): signed with this machine's
-      // capability key, revocations kept beside it. mysql_capabilities=0 turns
-      // them off; mysql_cap_remote=1 accepts them from other hosts, in the clear.
-      if (!has_kv(a, "mysql_capabilities") || kv(a, "mysql_capabilities") != "0") {
-        const std::string cap_root = c.k.config().root;
-        const std::string cap_key = userland::asql_load_capability_key(cap_root);
-        if (cap_key.empty()) {
-          c.o << "compute mysql wire server: no capability key (set AIOS_CAPABILITY_KEY or make " << cap_root
-              << "/capability.key writable); capability logins are off\n";
-        } else {
-          asql_cap_guard = std::make_unique<sidecar::CapabilityGuard>(cap_key, cap_root + "/capability-state");
-          mysql_server->set_capability_guard(asql_cap_guard.get());
-          asql_cap_users = std::make_unique<userland::AsqlUserStore>(cap_root + "/capability-users");
-          mysql_server->set_capability_users(asql_cap_users.get());
-          mysql_server->set_capability_remote(has_kv(a, "mysql_cap_remote") && kv(a, "mysql_cap_remote") == "1");
-          c.o << "compute mysql wire server: capability logins on (user cap"
-              << (has_kv(a, "mysql_cap_remote") && kv(a, "mysql_cap_remote") == "1" ? ", remote allowed" : ", this host only")
-              << "; named users in " << cap_root << "/capability-users)\n";
-        }
-      }
-      if (has_kv(a, "mysql_socket")) mysql_server->set_unix_socket(kv(a, "mysql_socket"));
-      // Where <database>.tables lists are published for same-host clients (the ERP
-      // reads them in place of SHOW TABLES). Each is rewritten after the CDC apply
-      // that changed that database's tables.
       if (has_kv(a, "tables_dir")) {
+        // Where <database>.tables lists are published for same-host clients (the ERP
+        // reads them in place of SHOW TABLES). Each is rewritten after the CDC apply
+        // that changed that database's tables.
         sql_db->set_table_list_dir(kv(a, "tables_dir"));
         sql_db->publish_table_lists();
         c.o << "compute table lists published to " << kv(a, "tables_dir") << "\n";
       }
-      if (has_kv(a, "mysql_charset")) mysql_server->set_charset_aware(kv(a, "mysql_charset") == "1");
-      if (has_kv(a, "max_connections")) mysql_server->set_max_connections(to_u64(kv(a, "max_connections")));
-      if (has_kv(a, "query_memory_mb")) sql_db->set_query_memory_budget((size_t)to_u64(kv(a, "query_memory_mb")) << 20);
-      // TLS: mysql_tls_cert=<chain.pem> mysql_tls_key=<key.pem> [mysql_tls_require=1]
-      if (has_kv(a, "mysql_tls_cert") && has_kv(a, "mysql_tls_key")) {
-        mysql_server->set_tls(kv(a, "mysql_tls_cert"), kv(a, "mysql_tls_key"), has_kv(a, "mysql_tls_require") && kv(a, "mysql_tls_require") == "1");
-        c.o << "compute mysql wire server: TLS offered (" << kv(a, "mysql_tls_cert") << ")"
-            << (has_kv(a, "mysql_tls_require") && kv(a, "mysql_tls_require") == "1" ? ", required for remote clients" : "") << "\n";
-      }
-      auto ms_res = mysql_server->start();
-      if (ms_res.ok()) {
-        mysql_server->start_background();
-        mysql_wire_up = true;
-        if (!mysql_server->unix_socket().empty())
-          c.o << "compute mysql wire server listening on unix socket " << mysql_server->unix_socket() << "\n";
-        c.o << "compute mysql wire server listening on " << mysql_bind << ":" << mysql_port
-            << (mysql_user.empty() ? " (loopback, no password)" : " (password required for user " + mysql_user + ")")
-            << "\n";
+      if (mysql_wire_up) {
         // Advertise this node's databases in the fleet telemetry so peers can
         // find them without any static connections.ini configuration. Read-only
         // here means "a peer's write would get overwritten by the next CDC
@@ -2775,9 +2785,10 @@ void cmd_compute(Ctx& c, const Args& a) {
         // any table. A standalone store with no cdc_host has nothing to
         // overwrite it, so it is the fleet's honest primary for this data.
         sql_db->sync_telemetry_registry(o.port, mysql_port, /*read_only=*/has_kv(a, "cdc_host"));
-      } else {
-        c.o << "compute mysql wire server failed to bind " << mysql_bind << ":" << mysql_port << ": " << ms_res.error().message << "\n";
+        mysql_server->set_starting(false);
+        c.o << "compute mysql wire server: answering queries\n";
       }
+      sql_db->set_startup_phase("ready");
     }
     // The rpc "sql" op (see compute_serve's is_read_only_sql) is hardcoded
     // read-only and always will be; the mysql wire server started just above,
@@ -5466,7 +5477,6 @@ void cmd_fleet(Ctx& c, const Args& a) {
     std::string path = a.size() > 5 ? c.r.expand(a[5]) : std::string("/opt/aos/fleet-status.json");
     uint32_t interval = a.size() > 6 ? (uint32_t)to_u64(a[6]) : 4000;
     std::string hub = c.r.expand(a[2]) + ":" + c.r.expand(a[3]);
-    Orchestrator& orch = orch_for(c.k);
     c.o << "observing the fleet via " << hub << "; writing " << path << " every " << interval << "ms (stop to end)\n";
     auto dbj = [](const std::vector<NodeTelemetry::HostedDbInfo>& dbs) {
       std::string s = "[";
@@ -8198,7 +8208,7 @@ void cmd_horizon(Ctx& c, const Args& a) {
       while ((at = text.find("http", at)) != std::string::npos) {
         size_t end = at;
         // no isspace: libc's ctype is a hosted symbol the bare-metal image cannot link
-        auto space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
+        auto space = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v'; };
         while (end < text.size() && !space(text[end]) && text[end] != '"' && text[end] != '\'' && text[end] != ')' && text[end] != '>' && text[end] != ']' && text[end] != '`') ++end;
         std::string u = text.substr(at, end - at);
         while (!u.empty() && (u.back() == '.' || u.back() == ',' || u.back() == ';' || u.back() == '*')) u.pop_back();
@@ -10389,11 +10399,11 @@ Result<void> run_line(Session& s, const std::string& raw) {
           std::string help_text;
           { Out h([&](const std::string& t) { help_text += t; }); print_help(h); }
           bool found = false;
-          for (auto& line : split(help_text, '\n')) {
+          for (auto& help_line : split(help_text, '\n')) {
             std::string clean;
-            for (size_t i = 0; i < line.size(); ++i) {
-              if (line[i] == '\033') { while (i < line.size() && line[i] != 'm') ++i; continue; }
-              clean.push_back(line[i]);
+            for (size_t i = 0; i < help_line.size(); ++i) {
+              if (help_line[i] == '\033') { while (i < help_line.size() && help_line[i] != 'm') ++i; continue; }
+              clean.push_back(help_line[i]);
             }
             std::string t = clean;
             t.erase(0, t.find_first_not_of(" \t"));

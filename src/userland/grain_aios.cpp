@@ -560,8 +560,7 @@ AsqlLogin asql_login(const std::vector<Value>& args, size_t at) {
   if (!m) return l;
   if (Value* v = m->find("user")) l.user = v->to_text();
   if (Value* v = m->find("password")) l.password = v->to_text();
-  if (Value* v = m->find("database")) l.database = v->to_text();
-  else if (Value* v = m->find("db")) l.database = v->to_text();
+  if (Value* v = m->find("database"); v || (v = m->find("db"))) l.database = v->to_text();
   return l;
 }
 
