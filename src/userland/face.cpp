@@ -3508,9 +3508,18 @@ struct Layout {
       else { ++sharers; const std::string fr = kids[i]->attr("fr", kids[i]->attr("grow", "1")); float f = (float)std::atof(fr.c_str()); weight[i] = f > 0 ? f : 1.0f; }
     }
     int room = avail_w - gap * (int)(kids.size() - 1);
-    if (rigid > room) {
+    // What the sharing ones need at least: a slider, a bar or a select squeezed to a few pixels is no widget at all.
+    // Without this, rigid neighbours that fit with 10 px to spare left a slider 10 px wide.
+    int min_share = 0;
+    std::vector<int> share_min(kids.size(), 0);
+    for (size_t i = 0; i < kids.size(); ++i) {
+      if (natural_w(*kids[i]) >= 0) continue;
+      share_min[i] = std::max(0, kids[i]->attr_int("min_width", kids[i]->type == "slider" ? 140 : 80));
+      min_share += share_min[i];
+    }
+    if (rigid + min_share > room) {
       // shrink the rigid ones in proportion, but never under 40
-      int over = rigid - room;
+      int over = rigid + min_share - room;
       int shrinkable = 0;
       for (size_t i = 0; i < kids.size(); ++i) if (natural_w(*kids[i]) >= 0) shrinkable += std::max(0, widths[i] - 40);
       for (size_t i = 0; i < kids.size() && shrinkable > 0; ++i) {
@@ -3525,6 +3534,18 @@ struct Layout {
     float wsum = 0;
     for (size_t i = 0; i < kids.size(); ++i) if (natural_w(*kids[i]) < 0) wsum += weight[i];
     for (size_t i = 0; i < kids.size(); ++i) if (natural_w(*kids[i]) < 0) widths[i] = wsum > 0 ? (int)((float)spare * weight[i] / wsum) : spare / std::max(1, sharers);
+    if (spare >= min_share)   // the room is there: no sharing one below its minimum (weights may have given it less)
+      for (size_t i = 0; i < kids.size(); ++i)
+        if (natural_w(*kids[i]) < 0 && widths[i] < share_min[i]) {
+          int need = share_min[i] - widths[i];
+          for (size_t j = 0; j < kids.size() && need > 0; ++j) {
+            if (j == i || natural_w(*kids[j]) >= 0) continue;
+            const int give = std::min(need, std::max(0, widths[j] - share_min[j]));
+            widths[j] -= give;
+            widths[i] += give;
+            need -= give;
+          }
+        }
     // First pass: heights. Second: place with vertical alignment.
     int pen = x;
     int tallest = 0;
