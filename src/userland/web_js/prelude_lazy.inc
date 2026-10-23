@@ -1,5 +1,5 @@
 // The platform objects (Intl, Streams, crypto.subtle, navigator extras, ...) web_js.cpp installs lazily: kLazyStub registers
-// accessors for their names and evaluates kLazyChunk the first time any is touched. Readable sources: edit in place here.
+// accessors for their names and evaluates kLazyChunkParts, joined, the first time any is touched. Readable sources: edit in place here.
 const char kLazyStub[] = R"JS(// Platform objects a page may probe for (Intl, Streams, crypto.subtle, navigator.clipboard, ...). They live in one
 // separate script, evaluated the first time any of them is touched: parsing it costs ~18 ms, and most pages never ask.
 (function (window) {
@@ -56,7 +56,8 @@ const char kLazyStub[] = R"JS(// Platform objects a page may probe for (Intl, St
 })(globalThis);
 )JS";
 
-const char kLazyChunk[] = R"JS((function (window) {
+// In two literals: one past 64 KB is more than C++ promises to compile. web_js.cpp joins them where it evaluates them.
+const char* const kLazyChunkParts[] = {R"JS((function (window) {
   'use strict';
   function def(name, value) { Object.defineProperty(window, name, { value: value, writable: true, configurable: true, enumerable: false }); }
   // ---- DOMException, geometry, small platform objects ------------------------------------------------------
@@ -620,7 +621,7 @@ const char kLazyChunk[] = R"JS((function (window) {
       var comps = [];
       if (o.dateStyle || o.timeStyle) { var ds = { weekday: 'long', month: o.dateStyle === 'full' || o.dateStyle === 'long' ? 'long' : o.dateStyle === 'medium' ? 'short' : 'numeric', day: 'numeric', year: 'numeric' }; if (o.dateStyle !== 'full') delete ds.weekday; comps = o.dateStyle ? ['weekday', 'month', 'day', 'year'].filter(function (k) { return ds[k]; }) : []; if (o.timeStyle) comps = comps.concat(['hour', 'minute', 'second', 'dayPeriod']); }
       else comps = ['weekday', 'month', 'day', 'year', 'hour', 'minute', 'second', 'dayPeriod', 'timeZoneName'].filter(function (k) { return o[k] !== undefined; });
-      var found = [];
+)JS", R"JS(      var found = [];
       comps.forEach(function (k) {
         var oo = { timeZone: o.timeZone }; if (o.hour12 !== undefined) oo.hour12 = o.hour12;
         if (o.dateStyle || o.timeStyle) { oo[k] = k === 'weekday' ? 'long' : k === 'month' ? (o.dateStyle === 'full' || o.dateStyle === 'long' ? 'long' : o.dateStyle === 'medium' ? 'short' : 'numeric') : k === 'dayPeriod' ? undefined : (k === 'hour' || k === 'day' || k === 'year' ? 'numeric' : '2-digit'); }
@@ -1090,4 +1091,4 @@ const char kLazyChunk[] = R"JS((function (window) {
     }
   })();
 })(globalThis);
-)JS";
+)JS"};

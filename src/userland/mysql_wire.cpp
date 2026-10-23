@@ -321,22 +321,18 @@ constexpr uint32_t CAP_FOUND_ROWS = 1u << 1;
 constexpr uint32_t CAP_LONG_FLAG = 1u << 2;
 constexpr uint32_t CAP_CONNECT_WITH_DB = 1u << 3;
 constexpr uint32_t CAP_PROTOCOL_41 = 1u << 9;
-constexpr uint32_t CAP_SSL = 1u << 11;
 constexpr uint32_t CAP_TRANSACTIONS = 1u << 13;
 constexpr uint32_t CAP_SECURE_CONNECTION = 1u << 15;
 constexpr uint32_t CAP_MULTI_STATEMENTS = 1u << 16;
 constexpr uint32_t CAP_MULTI_RESULTS = 1u << 17;
 constexpr uint32_t CAP_PLUGIN_AUTH = 1u << 19;
-constexpr uint32_t CAP_CONNECT_ATTRS = 1u << 20;
 constexpr uint32_t CAP_PLUGIN_AUTH_LENENC_CLIENT_DATA = 1u << 21;
-constexpr uint32_t CAP_DEPRECATE_EOF = 1u << 24;
 
 constexpr uint8_t HANDSHAKE_PROTOCOL = 0x0a;
 
 uint64_t g_wire_started_ns = 0;   // when the first listener came up, for COM_STATISTICS' uptime
 
 // MySQL Command constants
-constexpr uint8_t COM_SLEEP = 0x00;
 constexpr uint8_t COM_QUIT = 0x01;
 constexpr uint8_t COM_INIT_DB = 0x02;
 constexpr uint8_t COM_QUERY = 0x03;
@@ -378,7 +374,6 @@ constexpr uint8_t MYSQL_TYPE_TIME = 0x0b;
 constexpr uint8_t MYSQL_TYPE_DATETIME = 0x0c;
 constexpr uint8_t MYSQL_TYPE_YEAR = 0x0d;
 constexpr uint8_t MYSQL_TYPE_NEWDECIMAL = 0xf6;
-constexpr uint8_t MYSQL_TYPE_VARCHAR = 0x0f;
 constexpr uint8_t MYSQL_TYPE_BLOB = 0xfc;
 constexpr uint8_t MYSQL_TYPE_VAR_STRING = 0xfd;
 constexpr uint8_t MYSQL_TYPE_STRING = 0xfe;

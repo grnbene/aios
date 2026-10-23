@@ -1127,7 +1127,6 @@ Result<size_t> ObjectStore::refresh_locked() {
         // would silently stop replay here forever, dropping every record a
         // live process appends after its first sealed block.
         const uint64_t footer_total = 8 + (uint64_t)len;   // magic+len already read
-        ByteSpan raw_body;
         ByteBuffer owned;
         uint64_t crc_read = 0;
         bool have_it = false;

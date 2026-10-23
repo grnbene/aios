@@ -806,7 +806,7 @@ HostBindings surface_bindings(Kernel& k, Surface who, const std::string& dream) 
   auto actor = std::make_shared<Surface>(who);
   const std::string storage_key = dream;
 
-  h.store_put = [kp, actor, dream](const std::string& kind, const std::string& json) -> std::string {
+  h.store_put = [actor, dream](const std::string& kind, const std::string& json) -> std::string {
     StoredObject o;
     o.payload = ByteBuffer(json.begin(), json.end());
     o.embedding = text_embedding(embed_text_of(kind, json));

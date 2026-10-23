@@ -1603,7 +1603,10 @@ void install_globals(Page& P) {
   }
   // The rarely-touched platform objects load on first use (see kLazyStub); the stub reaches their source through this.
   c.define_data(c.global(), c.atom_ascii("__aiosLazySource"),
-                Value::Obj(c.new_host_function("", [pp](Context& cc, CallArgs&) -> Value { return Value::String(cc.new_string_utf8(kLazyChunk)); }, 0)), js::kConfigurable);
+                Value::Obj(c.new_host_function("", [](Context& cc, CallArgs&) -> Value {
+                  static const std::string chunk = std::string(kLazyChunkParts[0]) + kLazyChunkParts[1];
+                  return Value::String(cc.new_string_utf8(chunk));
+                }, 0)), js::kConfigurable);
   if (!c.eval_script(kLazyStub, "aios:prelude-lazy", &r)) fault(P, "platform prelude");
   P.new_budget();
 }
