@@ -42,6 +42,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_builtins.cpp
   ${AIOS_ROOT}/src/userland/grain_std_hash.cpp
   ${AIOS_ROOT}/src/userland/grain_std_bytes.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_decimal.cpp
   ${AIOS_ROOT}/src/userland/grain_native.cpp
   ${AIOS_ROOT}/src/userland/grain_webui.cpp
   ${AIOS_ROOT}/src/userland/grain_std_regex.cpp

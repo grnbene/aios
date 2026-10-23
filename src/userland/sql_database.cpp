@@ -3636,6 +3636,8 @@ class SqlParser {
       ExprPtr right = parse_xor();
       auto e = make(ExprOp::Or);
       e->args = {left, right};
+      if (left && right && !left->source_text.empty() && !right->source_text.empty())
+        e->source_text = left->source_text + " OR " + right->source_text;
       left = e;
     }
     return left;
@@ -3664,6 +3666,9 @@ class SqlParser {
       ExprPtr right = parse_not();
       auto e = make(ExprOp::And);
       e->args = {left, right};
+      // As written, for a name built without the statement's text: SUM(a<=d AND b>=d) was `SUM()`.
+      if (left && right && !left->source_text.empty() && !right->source_text.empty())
+        e->source_text = left->source_text + " AND " + right->source_text;
       left = e;
     }
     return left;
@@ -3673,6 +3678,7 @@ class SqlParser {
     if (take_word("NOT")) {
       auto e = make(ExprOp::Not);
       e->args = {parse_not()};
+      if (e->args[0] && !e->args[0]->source_text.empty()) e->source_text = "NOT " + e->args[0]->source_text;
       return e;
     }
     return parse_comparison();
@@ -35098,14 +35104,21 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
       const uint64_t span = hi >= lo ? (uint64_t)(hi - lo) + 1 : 0;
       // A small key range over enough rows: each lane accumulates straight into its own slot arrays, one pass and
       // no group ids, and the lanes merge after. Every lane clears all the slots, so it needs rows to pay for them.
+      // Only aggregates whose partial totals merge (AggMode::Par) can be split across the lanes: merge_arrays
+      // folds nothing else, so a SUM evaluated row by row (`SUM(startdate <= d AND enddate >= d)`) kept the
+      // total it started with and came back 0 for every group. The others go the general way, in row order.
+      std::vector<AggPlan> plans;
+      bool all_par = true;
       if (span > 0 && span <= 65536 && span * lanes <= (uint64_t)sel.work_rows()) {
-        const size_t S = (size_t)span + 1;
-        std::vector<AggPlan> plans;
-        std::vector<uint8_t> nulls;
         for (const Agg& a : aggs) {
           plans.push_back(plan_mode(a, t));
-          nulls.push_back(has_nulls(t.col_data[a.src.col]));
+          if (plans.back().mode != AggMode::Par) { all_par = false; break; }
         }
+      }
+      if (span > 0 && span <= 65536 && span * lanes <= (uint64_t)sel.work_rows() && all_par) {
+        const size_t S = (size_t)span + 1;
+        std::vector<uint8_t> nulls;
+        for (const Agg& a : aggs) nulls.push_back(has_nulls(t.col_data[a.src.col]));
         std::vector<AggArrays> slot_totals(aggs.size());
         for (size_t ai = 0; ai < aggs.size(); ++ai) init_arrays(aggs[ai], plans[ai], S, slot_totals[ai]);
         std::vector<uint32_t> slot_first(S, UINT32_MAX);

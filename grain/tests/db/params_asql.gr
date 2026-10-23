@@ -1,0 +1,32 @@
+# db_query's ? parameters against a running ASQL (or MariaDB): every value comes back as it went in, quotes and
+# backslashes included, and a ? inside quotes or a comment is left alone.   grain params_asql.gr <port> [password]
+let port = int(args[0])
+let pass = len(args) > 1 ? args[1] : ""
+let fails = 0
+fn check(name, ok) {
+  if ok { print("ok   " + name) } else { print("FAIL " + name) fails += 1 }
+}
+
+let db = db_connect("127.0.0.1", port, "g", pass)
+check("connects", db.ok)
+if not db.ok { print(db.error) error("no connection") }
+db_query(db, "CREATE DATABASE IF NOT EXISTS grain_params")
+db_query(db, "DROP TABLE IF EXISTS grain_params.t")
+check("creates a table", db_query(db, "CREATE TABLE grain_params.t (id INT PRIMARY KEY, s VARCHAR(100), n DECIMAL(10,2))").ok)
+
+let nasty = "it's a \\ back'slash \" and '' quotes; DROP TABLE t; --"
+let w = db_query(db, "INSERT INTO grain_params.t (id, s, n) VALUES (?, ?, ?), (?, ?, ?)", [1, nasty, "12.50", 2, nil, 3])
+check("inserts with parameters", w.ok and w.affected_rows == 2)
+let r = db_query(db, "SELECT s, n FROM grain_params.t WHERE id = ?", [1])
+check("a string with quotes and backslashes comes back as it went in", len(r.rows) == 1 and r.rows[0][0] == nasty)
+check("a decimal string is a number", r.rows[0][1] == "12.50")
+check("nil is NULL", db_query(db, "SELECT s FROM grain_params.t WHERE id = ?", [2]).rows[0][0] == nil)
+check("a list fills IN (?)", len(db_query(db, "SELECT id FROM grain_params.t WHERE id IN (?) ORDER BY id", [[1, 2, 9]]).rows) == 2)
+check("a ? inside quotes is text, not a parameter", db_query(db, "SELECT '?', id FROM grain_params.t WHERE id = ?", [1]).rows[0][0] == "?")
+check("a ? in a comment is left alone", db_query(db, "SELECT id /* ? */ FROM grain_params.t WHERE id = ? -- ?\n", [2]).rows[0][0] == "2")
+check("too few parameters is an error", not pcall(db_query, db, "SELECT ?, ?", [1]).ok)
+check("too many parameters is an error", not pcall(db_query, db, "SELECT ?", [1, 2]).ok)
+check("an empty list is an error", not pcall(db_query, db, "SELECT 1 FROM grain_params.t WHERE id IN (?)", [[]]).ok)
+db_query(db, "DROP DATABASE grain_params")
+if fails > 0 { error(str(fails) + " failed") }
+print("all passed")

@@ -53,6 +53,8 @@ class WebUi {
     bool tree = false;       // Accept: application/x-grain-ui - the widgets as data for a native client, not HTML
     bool stream = false;     // Accept: text/event-stream - the caller wants updates pushed (use open_stream)
     std::string body;        // application/x-www-form-urlencoded, for POST
+    std::vector<std::pair<std::string, std::string>> headers;   // every header, names lowercased: a pane's routes read them
+    std::string remote;      // the client's address, as the server saw it
   };
 
   struct Response {

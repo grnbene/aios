@@ -458,7 +458,39 @@ class FacePane final : public PaneDriver {
     return true;
   }
 
-  static std::string jstr(const std::string& s) {
+  static bool valid_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+      const unsigned char c = (unsigned char)s[i];
+      const size_t n = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 4;
+      if (n == 4 || (n == 1 && c < 0xC2)) return false;   // a stray continuation byte, 0xF8 and up, or an overlong pair
+      uint32_t cp = n == 0 ? c : n == 1 ? (c & 0x1F) : n == 2 ? (c & 0x0F) : (c & 0x07);
+      for (size_t k = 1; k <= n; ++k) {
+        if (i + k >= s.size() || ((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+      }
+      if ((n == 2 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) || (n == 3 && (cp < 0x10000 || cp > 0x10FFFF))) return false;
+      i += n + 1;
+    }
+    return true;
+  }
+
+  // Text that is not UTF-8 is read as Windows-1252 (a stored latin1 '®' is 0xAE), so the JSON stays JSON.
+  static std::string from_cp1252(const std::string& s) {
+    static const uint16_t high[32] = {0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F,
+                                      0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178};
+    std::string o;
+    for (unsigned char c : s) {
+      const uint32_t cp = c < 0x80 ? c : c < 0xA0 ? high[c - 0x80] : c;
+      if (cp < 0x80) o += (char)cp;
+      else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
+      else { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+    }
+    return o;
+  }
+
+  static std::string jstr(const std::string& raw) {
+    const std::string s = valid_utf8(raw) ? raw : from_cp1252(raw);
     std::string o = "\"";
     for (unsigned char c : s) {
       switch (c) {
@@ -1364,6 +1396,7 @@ bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& ac
 
 bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                            const std::string& query, const std::string& body,
+                           const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
                            int& status, std::string& res_body, std::string& content_type, std::string& error) {
   FacePane* f = web_face(vm, id);
   if (!f || f->routes().type != Type::Map) return false;
@@ -1377,6 +1410,14 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
   req_m->put("path", Value::string(path));
   req_m->put("query", Value::string(query));
   req_m->put("body", Value::string(body));
+  auto hdr_m = std::make_shared<MapObj>();
+  for (const auto& [name, value] : headers) {
+    std::string key = name;
+    for (char& c : key) c = (char)std::tolower((unsigned char)c);
+    if (!hdr_m->find(key)) hdr_m->put(key, Value::string(value));   // a repeated header: the first one counts
+  }
+  req_m->put("headers", Value::object(Type::Map, hdr_m));
+  req_m->put("remote", Value::string(remote));
 
   std::vector<Value> args = {Value::object(Type::Map, req_m)};
   Value ret = vm.call(*handler, args, error);
