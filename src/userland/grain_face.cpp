@@ -18,6 +18,7 @@
 // frames by the field's id; a button's or a field's Enter calls the grain
 // function it was given, with the pane's field texts as a map.
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <map>
@@ -144,6 +145,91 @@ Value bi_ui_tile(Vm&, std::vector<Value>& args, std::string& error) {
   m->put("label", Value::string(args[0].to_text()));
   m->put("value", args[1]);
   return Value::object(Type::Map, m);
+}
+
+// heading(words, options): a title.
+Value bi_ui_heading(Vm&, std::vector<Value>& args, std::string& error) {
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, "ui.heading")) return Value::nil();
+  auto m = widget_map("heading", opts);
+  m->put("label", Value::string(args[0].to_text()));
+  return Value::object(Type::Map, m);
+}
+
+// badge(words, options): a small status pill. accent: ok, warn, bad or a colour; dot: true for a leading dot.
+Value bi_ui_badge(Vm&, std::vector<Value>& args, std::string& error) {
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, "ui.badge")) return Value::nil();
+  auto m = widget_map("badge", opts);
+  m->put("label", Value::string(args[0].to_text()));
+  return Value::object(Type::Map, m);
+}
+
+// progress(value, options) / gauge(value, options): a filled bar. max (100), min (0), label, accent.
+// A progress bar's label shows the percentage, a gauge's the value.
+Value value_bar(const char* type, std::vector<Value>& args, std::string& error) {
+  const std::string who = std::string("ui.") + type;
+  if (!args[0].is_number()) { error = who + "() wants a number"; return Value::nil(); }
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, who.c_str())) return Value::nil();
+  auto m = widget_map(type, opts);
+  m->put("value", args[0]);
+  return Value::object(Type::Map, m);
+}
+Value bi_ui_progress(Vm&, std::vector<Value>& args, std::string& error) { return value_bar("progress", args, error); }
+Value bi_ui_gauge(Vm&, std::vector<Value>& args, std::string& error) { return value_bar("gauge", args, error); }
+
+// spark(numbers, options) / chart(numbers, options): a line over a series. height, min, max, accent.
+// A sparkline is small and bare; a chart is taller and, in a browser, filled under the line.
+Value series_widget(const char* type, std::vector<Value>& args, std::string& error) {
+  const std::string who = std::string("ui.") + type;
+  if (!want_list(args[0], error, who.c_str())) return Value::nil();
+  for (const auto& v : args[0].list_items())
+    if (!v.is_number() && v.type != Type::Nil) { error = who + "() wants a list of numbers, and one is a " + type_name(v.type); return Value::nil(); }
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, who.c_str())) return Value::nil();
+  auto m = widget_map(std::string(type) == "spark" ? "sparkline" : "chart", opts);
+  m->put("data", args[0]);
+  return Value::object(Type::Map, m);
+}
+Value bi_ui_spark(Vm&, std::vector<Value>& args, std::string& error) { return series_widget("spark", args, error); }
+Value bi_ui_chart(Vm&, std::vector<Value>& args, std::string& error) { return series_widget("chart", args, error); }
+
+// bars(rows, options): a bar chart, one labelled bar a row, each against the largest. rows: a map of
+// label -> number, or a list of [label, number]. Made of gauges, so a window, a browser and a native client
+// all draw it. accent, gap.
+Value bi_ui_bars(Vm&, std::vector<Value>& args, std::string& error) {
+  std::vector<std::pair<std::string, double>> items;
+  if (args[0].type == Type::Map) {
+    for (const auto& kv : as_map(args[0])->entries) items.push_back({kv.first, kv.second.as_double()});
+  } else if (args[0].type == Type::List) {
+    for (const auto& r : args[0].list_items()) {
+      if (r.type != Type::List || r.list_items().size() < 2) { error = "ui.bars() wants [label, number] pairs or a map"; return Value::nil(); }
+      items.push_back({r.list_items()[0].to_text(), r.list_items()[1].as_double()});
+    }
+  } else { error = std::string("ui.bars() wants a map or a list of pairs, got a ") + type_name(args[0].type); return Value::nil(); }
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, "ui.bars")) return Value::nil();
+  double hi = 0;
+  for (const auto& it : items) hi = std::max(hi, it.second);
+  if (hi <= 0) hi = 1;
+  auto om = as_map(opts);
+  std::vector<Value> kids;
+  for (const auto& it : items) {
+    auto bo = std::make_shared<MapObj>();
+    bo->put("label", Value::string(it.first));
+    bo->put("max", Value::real(hi));
+    if (om) for (const char* k : {"accent", "prefix", "suffix"}) if (Value* a = om->find(k)) bo->put(k, *a);
+    auto g = widget_map("gauge", Value::object(Type::Map, bo));
+    const bool whole = std::fabs(it.second - std::round(it.second)) < 1e-9 && std::fabs(it.second) < 9e15;
+    g->put("value", whole ? Value::integer((int64_t)std::llround(it.second)) : Value::real(it.second));
+    kids.push_back(Value::object(Type::Map, g));
+  }
+  auto co = std::make_shared<MapObj>();
+  co->put("gap", Value::integer(om && om->find("gap") ? om->find("gap")->as_int() : 10));
+  auto col = widget_map("column", Value::object(Type::Map, co));
+  col->put("children", Value::list(std::move(kids)));
+  return Value::object(Type::Map, col);
 }
 
 // ---- grain values as face values -------------------------------------------
@@ -409,6 +495,25 @@ class FacePane final : public PaneDriver {
   std::string web_field(const std::string& id) const { auto it = web_fields_.find(id); return it == web_fields_.end() ? std::string() : it->second; }
   void web_set_field(const std::string& id, const std::string& text) { web_fields_[id] = text; }
 
+  static std::string nice_num(double x) {
+    if (!(x == x)) return "";
+    const bool neg = x < 0;
+    double a = neg ? -x : x;
+    const bool whole = std::fabs(a - std::round(a)) < 1e-9;
+    char buf[64];
+    if (whole) std::snprintf(buf, sizeof buf, "%.0f", a);
+    else std::snprintf(buf, sizeof buf, "%.2f", a);
+    std::string digits = buf, frac;
+    const size_t dot = digits.find('.');
+    if (dot != std::string::npos) { frac = digits.substr(dot); digits.resize(dot); while (!frac.empty() && (frac.back() == '0' || frac.back() == '.')) frac.pop_back(); }
+    std::string grouped;
+    for (size_t i = 0; i < digits.size(); ++i) {
+      if (i && (digits.size() - i) % 3 == 0) grouped += ',';
+      grouped += digits[i];
+    }
+    return (neg ? "-" : "") + grouped + frac;
+  }
+
   static std::string esc(const std::string& s) {
     std::string o;
     o.reserve(s.size() + 8);
@@ -509,6 +614,83 @@ class FacePane final : public PaneDriver {
       return true;
     }
     if (type == "table") return html_table(v, out, error);
+    if (type == "heading") {
+      out += "<div class=\"w-heading\"" + std::string(opt_int(v, "size", 0) ? " style=\"font-size:" + std::to_string(opt_int(v, "size", 0)) + "px\"" : "") + ">" + esc(label_text) + "</div>";
+      return true;
+    }
+    if (type == "badge") {
+      const std::string accent = opt_str(v, "accent");
+      std::string cls = "w-badge";
+      std::string style;
+      if (accent == "ok" || accent == "warn" || accent == "bad") cls += " " + accent;
+      else if (!accent.empty()) style = " style=\"--c:" + safe_css(accent) + "\"";
+      if (opt_flag(v, "dot")) cls += " dot";
+      out += "<span class=\"" + cls + "\"" + style + ">" + esc(label_text) + "</span>";
+      return true;
+    }
+    if (type == "progress" || type == "gauge") {
+      Value* val = m->find("value");
+      const double x = val ? val->as_double() : 0;
+      const Value* mx = opt(v, "max");
+      const Value* mn = opt(v, "min");
+      const double hi = mx && mx->is_number() ? mx->as_double() : 100.0, lo = mn && mn->is_number() ? mn->as_double() : 0.0;
+      double frac = hi > lo ? (x - lo) / (hi - lo) : 0;
+      frac = std::max(0.0, std::min(1.0, frac));
+      const std::string label = opt_str(v, "label");
+      const std::string accent = opt_str(v, "accent");
+      std::string fill = "var(--accent)";
+      if (accent == "ok" || accent == "warn" || accent == "bad") fill = "var(--" + accent + ")";
+      else if (!accent.empty()) fill = safe_css(accent);
+      char pct[32];
+      std::snprintf(pct, sizeof pct, "%.1f", frac * 100.0);
+      out += "<div class=\"w-bar\">";
+      if (!label.empty() || type == "progress") {
+        const std::string shown = type == "progress" ? std::to_string((int)(frac * 100.0 + 0.5)) + "%"
+                                                     : opt_str(v, "prefix") + (val && val->is_number() ? nice_num(val->as_double()) : val ? val->to_text() : std::string()) + opt_str(v, "suffix");
+        out += "<div class=\"bl\"><span>" + esc(label) + "</span><span class=\"bv\">" + esc(shown) + "</span></div>";
+      }
+      out += "<div class=\"bt\"><div class=\"bf\" style=\"width:" + std::string(pct) + "%;background:" + fill + "\"></div></div></div>";
+      return true;
+    }
+    if (type == "sparkline" || type == "chart") {
+      Value* data = m->find("data");
+      std::vector<double> pts;
+      if (data && data->type == Type::List) for (const auto& x : data->list_items()) pts.push_back(x.type == Type::Nil ? 0.0 : x.as_double());
+      const bool big = type == "chart";
+      const int h = opt_int(v, "height", big ? 120 : 36);
+      const std::string accent = opt_str(v, "accent");
+      std::string stroke = "var(--accent)";
+      if (accent == "ok" || accent == "warn" || accent == "bad") stroke = "var(--" + accent + ")";
+      else if (!accent.empty()) stroke = safe_css(accent);
+      out += "<div class=\"w-" + std::string(big ? "chart" : "spark") + "\" style=\"height:" + std::to_string(h) + "px\">";
+      if (pts.size() >= 2) {
+        double lo = pts[0], hi = pts[0];
+        for (double p : pts) { lo = std::min(lo, p); hi = std::max(hi, p); }
+        if (const Value* mn = opt(v, "min"); mn && mn->is_number()) lo = mn->as_double();
+        if (const Value* mx = opt(v, "max"); mx && mx->is_number()) hi = mx->as_double();
+        if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
+        // A 1000 x 100 box stretched to the widget: the line keeps its width at any size.
+        std::string line;
+        char b[64];
+        for (size_t i = 0; i < pts.size(); ++i) {
+          const double px = (double)i * 1000.0 / (double)(pts.size() - 1);
+          const double py = 96.0 - (pts[i] - lo) / (hi - lo) * 92.0;
+          std::snprintf(b, sizeof b, "%s%.1f,%.1f", i ? " " : "", px, py);
+          line += b;
+        }
+        out += "<svg viewBox=\"0 0 1000 100\" preserveAspectRatio=\"none\">";
+        if (big) out += "<polygon points=\"0,100 " + line + " 1000,100\" fill=\"" + stroke + "\" fill-opacity=\"0.14\"/>";
+        out += "<polyline points=\"" + line + "\" fill=\"none\" stroke=\"" + stroke + "\" stroke-width=\"" + std::string(big ? "2.5" : "2") +
+               "\" vector-effect=\"non-scaling-stroke\" stroke-linejoin=\"round\"/></svg>";
+        if (big) {
+          char lab[96];
+          std::snprintf(lab, sizeof lab, "<div class=\"ax\"><span>%s</span><span>%s</span></div>", esc(opt_str(v, "prefix") + nice_num(hi)).c_str(), esc(opt_str(v, "prefix") + nice_num(lo)).c_str());
+          out += lab;
+        }
+      }
+      out += "</div>";
+      return true;
+    }
     error = "ui." + type + " has no web rendering";
     return false;
   }
@@ -518,7 +700,7 @@ class FacePane final : public PaneDriver {
     auto m = as_map(v);
     Value* data = m->find("data");
     if (!data || data->type != Type::List) { error = "ui.table() has no rows"; return false; }
-    struct Col { std::string key, head; bool right = false; };
+    struct Col { std::string key, head; bool right = false; bool badge = false; };
     std::vector<Col> cols;
     const std::string spec = opt_str(v, "columns");
     size_t at = 0;
@@ -542,6 +724,7 @@ class FacePane final : public PaneDriver {
       c.key = parts[0];
       c.head = parts.size() > 1 && !parts[1].empty() ? parts[1] : parts[0];
       c.right = parts.size() > 2 && parts[2] == "right";
+      c.badge = parts.size() > 2 && parts[2] == "badge";
       cols.push_back(c);
     }
     const auto& rows = data->list_items();
@@ -558,7 +741,19 @@ class FacePane final : public PaneDriver {
       out += "<tr>";
       for (const auto& c : cols) {
         Value* cell = rm ? rm->find(c.key) : nullptr;
-        out += std::string("<td") + (c.right ? " class=\"r\"" : "") + ">" + esc(cell ? cell->to_text() : std::string()) + "</td>";
+        const std::string text = cell ? cell->to_text() : std::string();
+        if (c.badge && !text.empty()) {
+          // badges: {"open": "warn", ...} names each value's colour; otherwise the accent, or none
+          std::string accent;
+          if (const Value* bm = opt(v, "badges"); bm && bm->type == Type::Map)
+            if (Value* a = as_map(*bm)->find(text)) accent = a->to_text();
+          std::string cls = "w-badge", style;
+          if (accent == "ok" || accent == "warn" || accent == "bad") cls += " " + accent;
+          else if (!accent.empty()) style = " style=\"--c:" + safe_css(accent) + "\"";
+          out += "<td><span class=\"" + cls + "\"" + style + ">" + esc(text) + "</span></td>";
+        } else {
+          out += std::string("<td") + (c.right ? " class=\"r\"" : "") + ">" + esc(text) + "</td>";
+        }
       }
       out += "</tr>";
       ++shown;
@@ -671,6 +866,8 @@ class FacePane final : public PaneDriver {
     if (Value* o = m->find("opts"); o && o->type == Type::Map) {
       for (const auto& kv : as_map(*o)->entries) {
         if (kv.first == "on_enter") continue;
+        // A structured option (a table's "badges" map) is for the renderers that use it; face has no use for it.
+        if (kv.second.type == Type::Map || kv.second.type == Type::List) continue;
         std::string text;
         if (!attr_text(kv.first, kv.second, text, error)) { error = "ui." + w->type + "(): " + error; return nullptr; }
         w->attrs.emplace_back(kv.first, text);
@@ -684,7 +881,13 @@ class FacePane final : public PaneDriver {
     if (Value* id = m->find("id")) w->attrs.emplace_back("id", id->str());
     if (Value* fn = m->find("on_click")) w->attrs.emplace_back("action", action_for(*fn, "the button \"" + w->label + "\""));
     if (Value* val = m->find("value")) w->attrs.emplace_back("value", val->to_text());
-    if (Value* data = m->find("data")) {
+    if (Value* data = m->find("data"); data && (w->type == "sparkline" || w->type == "chart")) {
+      // A line's points, as face reads them: numbers, comma-separated.
+      std::string pts;
+      for (const auto& v : data->list_items()) { if (!pts.empty()) pts += ","; pts += v.type == Type::Nil ? "0" : v.to_text(); }
+      w->attrs.emplace_back("data", pts);
+      if (w->type == "chart" && w->attr("height", "").empty()) w->attrs.emplace_back("height", "120");
+    } else if (Value* data = m->find("data")) {
       // A table reads its rows by name, as `table items` reads a let.
       const std::string name = "grain_rows_" + std::to_string(++provided_);
       rt_.provide(name, to_face(*data));
@@ -791,6 +994,13 @@ void install_face_builtins(Vm& vm) {
   add("field", 1, 2, bi_ui_field);
   add("table", 1, 2, bi_ui_table);
   add("tile", 2, 3, bi_ui_tile);
+  add("heading", 1, 2, bi_ui_heading);
+  add("badge", 1, 2, bi_ui_badge);
+  add("progress", 1, 2, bi_ui_progress);
+  add("gauge", 1, 2, bi_ui_gauge);
+  add("spark", 1, 2, bi_ui_spark);
+  add("chart", 1, 2, bi_ui_chart);
+  add("bars", 1, 2, bi_ui_bars);
   add("pane", 1, 1, bi_ui_pane);
   add("field_text", 2, 2, bi_ui_field_text);
   add("set_field", 3, 3, bi_ui_set_field);

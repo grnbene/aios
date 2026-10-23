@@ -1,0 +1,21 @@
+# Every widget, in a window (grain widgets.gr), a browser (grain serve widgets.gr) or a native client (grain open).
+let n = 0
+let history = [3, 5, 4, 8, 6, 9, 7, 11, 10, 14]
+every(1, fn () {
+  n = n + 1
+  history = slice(history, 1) + [(n * 7) % 15]
+})
+let p = ui.pane({"title": "Widgets", "width": 760, "height": 760, "view": fn () {
+  return ui.column({"gap": 14, "pad": 20}, [
+    ui.row({"gap": 10}, [ui.heading("Widgets"), ui.badge("live", {"accent": "ok", "dot": true}), ui.badge("beta"), ui.badge("3 alerts", {"accent": "bad"})]),
+    ui.text("Text, " + "dim text and bold text", {"dim": true}),
+    ui.row({"gap": 12}, [ui.tile("Ticks", n, {"accent": "ok"}), ui.tile("Warn", 3, {"accent": "warn"}), ui.tile("Bad", 1, {"accent": "bad"})]),
+    ui.progress(n % 100, {"label": "Upload"}),
+    ui.gauge(42, {"max": 60, "label": "Temperature", "suffix": " C", "accent": "warn"}),
+    ui.row({"gap": 12}, [ui.spark(history), ui.spark(history, {"accent": "ok"})]),
+    ui.chart(history, {"height": 120, "min": 0}),
+    ui.bars({"North": 120, "South": 340, "East": 210, "West": 90}, {"prefix": "$"}),
+    ui.row({"gap": 8}, [ui.field("q", {"placeholder": "type here"}), ui.button("Go", fn () { n = 0 }, {"primary": true})]),
+    ui.table([{"k": "a", "s": "open"}, {"k": "b", "s": "shipped"}], {"columns": "k:Key, s:State:badge", "badges": {"open": "warn", "shipped": "ok"}})])
+}})
+run_panes()

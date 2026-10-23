@@ -85,6 +85,12 @@ view that shows it.
 
 ## Databases, and live query results
 
+`examples/ops_board.gr` is the whole idea in one program: an operations board over
+ASQL queries that every window and browser keeps current as `examples/ops_feed.gr`
+plays a busy store. The board has no code that sends, polls or listens.
+
+![The live operations board](../screenshots/grain-ops-board.png)
+
 ```grain
 let db = db_connect("127.0.0.1", 3307, "erp", password, "versioneight")   # ASQL, MariaDB or MySQL
 let r = db_query(db, "SELECT stockid, description FROM stockmaster LIMIT 5")
@@ -320,8 +326,13 @@ run_panes()
 | `ui.text(words, options)` | `size`, `dim`, `bold`, `color` |
 | `ui.button(label, fn, options)` | `primary` |
 | `ui.field(id, options)` | `placeholder`, `value` (its first text), `width`, `focus`, `on_enter` (a function) |
-| `ui.table(rows, options)` | `columns` (`"key:Header, key:Header:right"`; every field when left out), `rows` (how many show), `empty` |
+| `ui.table(rows, options)` | `columns` (`"key:Header, key:Header:right, key:Header:badge"`; every field when left out), `rows` (how many show), `empty`, `badges` (value -> accent for a `badge` column) |
 | `ui.tile(label, value, options)` | `accent` (`ok`, `warn`, `bad` or a colour) |
+| `ui.heading(words, options)` | `size` |
+| `ui.badge(words, options)` | `accent`, `dot` (a leading dot) |
+| `ui.progress(value, options)` / `ui.gauge(value, options)` | `max` (100), `min` (0), `label`, `accent`, `prefix`, `suffix`; a progress bar shows the percentage, a gauge the value |
+| `ui.spark(numbers, options)` / `ui.chart(numbers, options)` | `height`, `min`, `max`, `accent`, `prefix` (the chart's axis) |
+| `ui.bars(rows, options)` | a bar chart: a map of label -> number or `[label, number]` pairs, each bar against the largest; `accent`, `prefix`, `suffix`, `gap` |
 
 What is typed into a field stays across frames by its id. A button's function
 and a field's `on_enter` are called with the pane's field texts as a map when

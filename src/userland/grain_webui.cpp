@@ -134,6 +134,20 @@ body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-ap
 .w-table td{padding:7px 12px;border-bottom:1px solid var(--line)}.w-table tr:last-child td{border-bottom:0}
 .w-table .r{text-align:right}.w-table .empty{color:var(--dim);text-align:center;padding:18px}
 .error{color:var(--bad);white-space:pre-wrap;font-family:ui-monospace,monospace}
+.w-heading{font-size:22px;font-weight:700;letter-spacing:-.01em}
+.w-badge{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;font-size:11px;font-weight:650;letter-spacing:.05em;text-transform:uppercase;padding:3px 10px;border-radius:999px;color:var(--c,var(--accent));background:color-mix(in srgb,var(--c,var(--accent)) 14%,transparent)}
+.w-badge.ok{--c:var(--ok)}.w-badge.warn{--c:var(--warn)}.w-badge.bad{--c:var(--bad)}
+.w-badge.dot::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.w-bar{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1 1 auto}
+.w-bar .bl{display:flex;justify-content:space-between;font-size:12px;color:var(--dim)}.w-bar .bv{font-variant-numeric:tabular-nums;color:var(--ink);font-weight:600}
+.w-bar .bt{height:10px;border-radius:6px;background:var(--line);overflow:hidden}.w-bar .bf{height:100%;border-radius:6px;transition:width .5s ease}
+.w-spark,.w-chart{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px 8px;min-width:120px;flex:1 1 auto}
+.w-spark svg,.w-chart svg{width:100%;height:100%;display:block}
+.w-chart{padding:10px 12px 10px 44px}.w-chart .ax{position:absolute;left:8px;top:8px;bottom:8px;display:flex;flex-direction:column;justify-content:space-between;font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+.w-tile .tv{font-variant-numeric:tabular-nums}
+.w-row>.w-column{flex:1 1 0;min-width:0}
+.w-bar .bl{gap:12px}.w-bar .bl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.w-table td .w-badge{font-size:10px;padding:2px 8px}
 )CSS";
 
 // Sends the fields with every event, swaps the widgets in, keeps the focused field and its caret.

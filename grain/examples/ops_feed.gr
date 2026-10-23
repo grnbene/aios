@@ -1,0 +1,46 @@
+# A busy store, for the live board to watch: orders arrive, stock runs down and is restocked, orders ship.
+#   GRAIN_DB=host:port:user:password:database grain ops_feed.gr [seconds]
+let spec = getenv("GRAIN_DB")
+if spec == nil { spec = "127.0.0.1:3307:erp::shop" }
+let part = split(spec, ":")
+let db = db_connect(part[0], int(part[1]), part[2], part[3], part[4])
+if not db.ok { error("cannot reach the database: " + db.error) }
+fn run(sql) { let r = db_query(db, sql) if not r.ok { print("! " + r.error + " :: " + sql) } return r }
+
+let seed = int(time_us() % 2147483647)
+fn rnd(n) { seed = (seed * 1103515245 + 12345) % 2147483648 return int(seed / 65536) % n }   # the high bits: the low ones of this generator cycle quickly
+
+run("CREATE TABLE IF NOT EXISTS ops_stock (sku VARCHAR(12) PRIMARY KEY, name VARCHAR(40), on_hand INT, reorder INT, price DECIMAL(10,2))")
+run("CREATE TABLE IF NOT EXISTS ops_orders (id INT PRIMARY KEY, placed DATETIME, customer VARCHAR(30), region VARCHAR(12), total DECIMAL(12,2), status VARCHAR(10))")
+run("CREATE TABLE IF NOT EXISTS ops_lines (order_id INT, line INT, sku VARCHAR(12), qty INT, price DECIMAL(10,2), PRIMARY KEY (order_id, line))")
+let products = [["TIR-205", "All-season tire 205/55R16", 89.00], ["TIR-225", "Performance tire 225/45R17", 139.00],
+  ["BAT-H6", "Battery H6 AGM", 189.00], ["OIL-5W30", "Synthetic oil 5W-30, 5 qt", 32.00], ["WIP-22", "Wiper blades 22in", 18.50],
+  ["BRK-F", "Front brake pads", 64.00], ["FLT-OIL", "Oil filter", 9.75], ["LGT-H11", "Headlight bulb H11", 21.00]]
+if int(run("SELECT COUNT(*) FROM ops_stock").rows[0][0]) == 0 {
+  for p in products { run("INSERT INTO ops_stock VALUES ('" + p[0] + "', '" + p[1] + "', " + str(60 + rnd(80)) + ", 40, " + str(p[2]) + ")") }
+}
+let customers = ["Lakeview Auto", "Rt 9 Tire", "Northside Fleet", "Harbor Garage", "Pine St Motors", "Quick Lube 12", "Eastgate Service", "Summit Wheels"]
+let regions = ["North", "South", "East", "West"]
+let next_id = int(run("SELECT COALESCE(MAX(id), 1000) FROM ops_orders").rows[0][0]) + 1
+let seconds = len(args) > 0 ? int(args[0]) : 600
+let started = time_us()
+print("feeding orders from #" + str(next_id) + " for " + str(seconds) + "s")
+while (time_us() - started) / 1000000 < seconds {
+  let lines = 1 + rnd(3)
+  let total = 0.0
+  for l in range(1, lines + 1) {
+    let p = products[rnd(len(products))]
+    let qty = 1 + rnd(4)
+    total = total + qty * p[2]
+    run("INSERT INTO ops_lines VALUES (" + str(next_id) + ", " + str(l) + ", '" + p[0] + "', " + str(qty) + ", " + str(p[2]) + ")")
+    run("UPDATE ops_stock SET on_hand = GREATEST(on_hand - " + str(qty) + ", 0) WHERE sku = '" + p[0] + "'")
+  }
+  run("INSERT INTO ops_orders VALUES (" + str(next_id) + ", NOW(), '" + customers[rnd(len(customers))] + "', '" + regions[rnd(len(regions))] + "', " + format("{:.2f}", total) + ", 'open')")
+  next_id += 1
+  # the warehouse ships what is ready, old and new, and now and then a customer cancels
+  if rnd(3) == 0 { run("UPDATE ops_orders SET status = 'shipped' WHERE status = 'open' AND id = " + str(next_id - 1 - rnd(12))) }
+  if rnd(2) == 0 { run("UPDATE ops_orders SET status = 'shipped' WHERE status = 'open' ORDER BY id LIMIT 1") }
+  if rnd(12) == 0 { run("UPDATE ops_orders SET status = 'cancelled' WHERE status = 'open' AND id = " + str(next_id - 1 - rnd(6))) }
+  if rnd(9) == 0 { run("UPDATE ops_stock SET on_hand = on_hand + 60 WHERE on_hand < reorder ORDER BY on_hand LIMIT 1") }
+  wait(0.3 + rnd(10) / 10.0)
+}
