@@ -1359,13 +1359,22 @@ class FlatDoubleSet {
   size_t count_ = 0;
 };
 
+bool text_is_wide_number(std::string_view v);
+std::string canonical_decimal(std::string_view s);
+
 struct InLookupSet {
   std::unordered_set<std::string> str_set;
   FlatDoubleSet num_set;        // the list's numbers
   FlatDoubleSet text_num_set;   // its strings, read as numbers
+  // Exact numbers a double cannot carry (past 2^53, more than 15 digits): kept by their digits, not in num_set,
+  // where 9007199254740993 would be found by ...992. wide_dbl holds their doubles, for an approximate probe.
+  std::unordered_set<std::string> wide_exact;
+  FlatDoubleSet wide_dbl;
   bool has_null = false;
   bool has_numeric = false;
   bool has_string = false;
+
+  static bool is_wide(const Val& v) { return v.numeric && !v.approx && v.text_valid && text_is_wide_number(v.text); }
 
   void insert(const Val& v) {
     if (v.null) {
@@ -1373,8 +1382,12 @@ struct InLookupSet {
       return;
     }
     if (v.numeric) {
-      num_set.insert(v.num);
       has_numeric = true;
+      if (is_wide(v)) {
+        std::string c = canonical_decimal(v.text);
+        if (!c.empty()) { wide_exact.insert(std::move(c)); wide_dbl.insert(v.num); return; }
+      }
+      num_set.insert(v.num);
     } else {
       const std::string& s = v.str();
       str_set.insert(collate_key(s));
@@ -1397,14 +1410,26 @@ struct InLookupSet {
     // A number meets the list's numbers and its strings as numbers; a string
     // meets the strings as strings and only the real numbers as numbers.
     if (l.numeric) {
+      if (!wide_exact.empty()) {
+        if (is_wide(l)) {   // an exact wide number meets only the same digits
+          const std::string c = canonical_decimal(l.text);
+          if (!c.empty()) return wide_exact.count(c) > 0 || text_num_set.contains(l.num);
+        } else if (l.approx && wide_dbl.contains(l.num)) {
+          return true;      // a DOUBLE compares as a double
+        }
+      } else if (is_wide(l) && has_numeric && num_set.contains(l.num)) {
+        return false;       // the list holds only numbers a double carries exactly: none of them is this one
+      }
       if (has_numeric && num_set.contains(l.num)) return true;
       return text_num_set.contains(l.num);
     }
     const std::string& s = l.str();
     if (has_string && str_set.find(collate_key(s)) != str_set.end()) return true;
     if (has_numeric) {
+      // a string against numbers is read as a number; a plain number's digits decide against a wide one
+      if (!wide_exact.empty()) { const std::string c = canonical_decimal(s); if (!c.empty() && wide_exact.count(c)) return true; }
       double d = 0;
-      if (parse_number(s, &d) && num_set.contains(d)) return true;
+      if (parse_number(s, &d) && num_set.contains(d)) return !text_is_wide_number(s);
     }
     return false;
   }
@@ -1941,6 +1966,92 @@ static bool temporal_number(const std::string& v, double* out) {
   return true;
 }
 
+// Two exact numbers as decimal text, compared exactly: -1, 0, 1, or 2 when either is not plain decimal text
+// (an exponent, a word). A double holds 53 bits, so BIGINTs past 2^53 - 9007199254740993 against ...992, two
+// BIGINT UNSIGNED near 2^64 - and decimals of more than 15 significant digits tie as doubles while differing.
+static int decimal_text_compare(std::string_view a, std::string_view b) {
+  struct D { bool neg = false; std::string_view whole, frac; };
+  auto split = [](std::string_view s, D* d) -> bool {
+    size_t i = 0;
+    while (i < s.size() && s[i] == ' ') ++i;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) { d->neg = s[i] == '-'; ++i; }
+    const size_t w0 = i;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+    d->whole = s.substr(w0, i - w0);
+    if (i < s.size() && s[i] == '.') {
+      const size_t f0 = ++i;
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+      d->frac = s.substr(f0, i - f0);
+    }
+    if (i != s.size() || (d->whole.empty() && d->frac.empty())) return false;
+    while (!d->whole.empty() && d->whole[0] == '0') d->whole.remove_prefix(1);
+    while (!d->frac.empty() && d->frac.back() == '0') d->frac.remove_suffix(1);
+    if (d->whole.empty() && d->frac.empty()) d->neg = false;   // -0 is 0
+    return true;
+  };
+  D x, y;
+  if (!split(a, &x) || !split(b, &y)) return 2;
+  if (x.neg != y.neg) return x.neg ? -1 : 1;
+  int m;   // magnitude order
+  if (x.whole.size() != y.whole.size()) m = x.whole.size() < y.whole.size() ? -1 : 1;
+  else {
+    const int w = x.whole.compare(y.whole);
+    if (w != 0) m = w < 0 ? -1 : 1;
+    else { const int f = x.frac.compare(y.frac); m = f < 0 ? -1 : f > 0 ? 1 : 0; }
+  }
+  return x.neg ? -m : m;
+}
+
+bool text_is_wide_number(std::string_view v) {
+  // significant digits of the number's one spelling: past 15 a double may not hold it; at 16, from 2^53 on
+  std::string c = canonical_decimal(v);
+  if (c.empty()) return false;
+  if (c[0] == '-') c.erase(0, 1);
+  const bool whole = c.find('.') == std::string::npos;
+  std::string digits;
+  for (char ch : c) if (ch != '.') digits += ch;
+  size_t z = 0;
+  while (z < digits.size() && digits[z] == '0') ++z;
+  digits.erase(0, z);
+  if (digits.size() <= 15) return false;
+  if (whole && digits.size() == 16) return digits.compare("9007199254740992") >= 0;
+  return true;
+}
+
+// An exact number's digits in one spelling - no sign on zero, no leading zeros, no trailing fraction zeros - so two
+// spellings of one number are one key; empty when the text is not plain decimal.
+std::string canonical_decimal(std::string_view s) {
+  size_t i = 0;
+  while (i < s.size() && s[i] == ' ') ++i;
+  bool neg = false;
+  if (i < s.size() && (s[i] == '-' || s[i] == '+')) { neg = s[i] == '-'; ++i; }
+  std::string whole, frac;
+  while (i < s.size() && s[i] >= '0' && s[i] <= '9') whole += s[i++];
+  if (i < s.size() && s[i] == '.') { ++i; while (i < s.size() && s[i] >= '0' && s[i] <= '9') frac += s[i++]; }
+  if (i != s.size() || (whole.empty() && frac.empty())) return std::string();
+  size_t z = 0;
+  while (z < whole.size() && whole[z] == '0') ++z;
+  whole.erase(0, z);
+  while (!frac.empty() && frac.back() == '0') frac.pop_back();
+  if (whole.empty()) whole = "0";
+  std::string out = (neg && !(whole == "0" && frac.empty())) ? "-" : "";
+  out += whole;
+  if (!frac.empty()) out += "." + frac;
+  return out;
+}
+
+// a.num == b.num: whether the doubles may have hidden a difference, and if so the exact answer.
+static int exact_numeric_tie(const Val& a, const Val& b) {
+  if (a.approx || b.approx) return 0;   // FLOAT/DOUBLE values are the doubles
+  if (std::fabs(a.num) < 9007199254740992.0) {
+    // below 2^53 an integer is exact; only a long decimal can still differ
+    if (a.text_valid && b.text_valid && a.text.size() <= 16 && b.text.size() <= 16) return 0;
+    if (!a.text_valid || !b.text_valid) return 0;
+  }
+  const int c = decimal_text_compare(a.sv(), b.sv());
+  return c == 2 ? 0 : c;
+}
+
 int compare_vals(const Val& a, const Val& b) {
   if (a.null || b.null) return -2;
   if ((a.temporal || b.temporal) && !a.numeric && !b.numeric) {
@@ -1950,7 +2061,7 @@ int compare_vals(const Val& a, const Val& b) {
   if (a.numeric && b.numeric) {
     if (a.num < b.num) return -1;
     if (a.num > b.num) return 1;
-    return 0;
+    return exact_numeric_tie(a, b);
   }
   // One side is a number and the other is not: MySQL compares them as numbers,
   // converting the string. This is what makes an int orderno match the
@@ -1997,7 +2108,7 @@ static int compare_vals_ordered(const Val& a, const Val& b) {
   if (ca == 1) {
     if (a.num < b.num) return -1;
     if (a.num > b.num) return 1;
-    return 0;
+    return exact_numeric_tie(a, b);
   }
   if (a.bin || b.bin) { const int m = a.str().compare(b.str()); return m < 0 ? -1 : m > 0 ? 1 : 0; }
   return case_insensitive_compare(a.str(), b.str());
@@ -2085,7 +2196,7 @@ static int compare_vals_as(SqlDataType t, const Val& a, const Val& b) {
   // sorted 999 above 2587 as text. A text column's cells are never numbers
   // here (they are read as text), so a string still sorts as a string.
   if (t == SqlDataType::Text) {
-    if (a.numeric && b.numeric && !a.null && !b.null) return a.num < b.num ? -1 : (a.num > b.num ? 1 : 0);
+    if (a.numeric && b.numeric && !a.null && !b.null) return a.num < b.num ? -1 : (a.num > b.num ? 1 : exact_numeric_tie(a, b));
     if (a.bin || b.bin) { const int m = a.str().compare(b.str()); return m < 0 ? -1 : m > 0 ? 1 : 0; }   // BINARY x / COLLATE _bin: bytes
     return case_insensitive_compare(a.str(), b.str());
   }
@@ -2097,7 +2208,14 @@ static int compare_vals_as(SqlDataType t, const Val& a, const Val& b) {
   double x = 0, y = 0;
   const bool xn = a.numeric ? (x = a.num, true) : (!a.null && parse_number(a.str(), &x));
   const bool yn = b.numeric ? (y = b.num, true) : (!b.null && parse_number(b.str(), &y));
-  if (xn && yn) return x < y ? -1 : (x > y ? 1 : 0);
+  if (xn && yn) {
+    if (x != y) return x < y ? -1 : 1;
+    // equal as doubles: past 2^53 (or 15 digits) exact numbers may still differ, and their digits decide
+    if (a.approx || b.approx) return 0;
+    if (std::fabs(x) < 9007199254740992.0 && (!a.text_valid || a.text.size() <= 16) && (!b.text_valid || b.text.size() <= 16)) return 0;
+    const int c = decimal_text_compare(a.sv(), b.sv());
+    return c == 2 ? 0 : c;
+  }
   return compare_vals_ordered(a, b);
 }
 
@@ -6714,6 +6832,7 @@ static std::string last_name_part(const std::string& s);
 namespace vx {
 bool nondeterministic_func(const std::string& up);
 bool dict_coded(const ColumnStore& cs);
+bool wide_numbers(const ColumnStore& cs);
 size_t dict_size(const ColumnStore& cs);
 uint32_t code_at(const ColumnStore& cs, size_t r);
 const std::string& dict_entry(const ColumnStore& cs, uint32_t k);
@@ -29154,6 +29273,64 @@ bool typed_integer(const ColumnStore& cs) {
          cs.encoding == ColumnEncoding::FOR || cs.encoding == ColumnEncoding::SegmentFOR;
 }
 
+// Whether a column holds an exact number a double cannot carry: an integer at or past 2^53 (a BIGINT id near
+// 9.2e18, a BIGINT UNSIGNED near 2^64) or a decimal with more than 15 significant digits. The typed and per-code
+// paths read numbers as doubles, where 9007199254740993 equals 9007199254740992; for such a column they stand
+// aside and the evaluator, which compares exact numbers by their digits (compare_vals), answers. Worked out
+// from the column itself - segment bounds where it has them, its rows or dictionary otherwise - and kept until
+// the column changes.
+
+bool wide_numbers(const ColumnStore& cs) {
+  struct Known { uint64_t epoch; size_t rows, dict; bool wide; };
+  static aios::hal::Mutex mu;
+  static std::unordered_map<uint64_t, Known> known;
+  const DictArena& d = cs.shared_dict ? cs.shared_dict->dict : cs.dict;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu);
+    auto it = known.find(cs.uid.v);
+    if (it != known.end() && it->second.epoch == cs.epoch && it->second.rows == cs.size() && it->second.dict == d.size()) return it->second.wide;
+  }
+  constexpr double k53 = 9007199254740992.0;
+  bool wide = false;
+  switch (cs.encoding) {
+    case ColumnEncoding::TypedInt32: case ColumnEncoding::TypedDouble: case ColumnEncoding::ALP:
+    case ColumnEncoding::TemporalDays: case ColumnEncoding::TemporalSeconds:
+      break;   // 32-bit integers, doubles (already what they are), dates
+    case ColumnEncoding::Constant:
+      wide = text_is_wide_number(cs.constant_val);
+      break;
+    default:
+      if (dict_coded(cs)) {
+        for (size_t c = 1; c < d.size() && !wide; ++c) wide = text_is_wide_number(dict_view(cs, (uint32_t)c));
+        break;
+      }
+      if (typed_numeric(cs)) {
+        // segment bounds where they are kept (a bound past 2^53 may be a loose one: then only maybe, which is
+        // enough to step aside), the rows after them one by one
+        constexpr size_t kSeg = 2048;
+        size_t covered = 0;
+        for (size_t sgi = 0; sgi < cs.zone_maps.size() && !wide; ++sgi) {
+          const auto& zm = cs.zone_maps[sgi];
+          if (!zm.has_stats) break;
+          if (!zm.all_null && (zm.max_double >= k53 || zm.min_double <= -k53)) wide = true;
+          covered = std::min(cs.size(), (sgi + 1) * kSeg);
+        }
+        for (size_t r = covered; r < cs.size() && !wide; ++r) {
+          double v = 0;
+          if (!cs.is_null(r) && cs.get_double(r, &v) && (v >= k53 || v <= -k53)) wide = true;
+        }
+        break;
+      }
+      // text kept whole (a numeric column stored as text): its values
+      for (size_t r = 0; r < cs.size() && !wide; ++r) if (!cs.is_null(r)) wide = text_is_wide_number(cs.get(r));
+      break;
+  }
+  std::lock_guard<aios::hal::Mutex> lk(mu);
+  if (known.size() > 65536) known.clear();
+  known[cs.uid.v] = Known{cs.epoch, cs.size(), d.size(), wide};
+  return wide;
+}
+
 // The number a non-NULL row of a typed column holds - the same double
 // numeric_prefix_of() would read from the text get() prints for it. (A
 // DecimalScaled value is divided, not multiplied by the inverse: the quotient
@@ -29996,8 +30173,23 @@ void codes_equal_to(const ColIndex& ci, const Val& want, std::vector<uint32_t>* 
   auto ascending_from = [&](size_t from) { std::sort(out->begin() + (long)from, out->end()); };
   const size_t from = out->size();
   // a fingerprint hit is checked against the dictionary entry it names, by the same rule the map's key encoded
+  // An exact number is matched by its digits where both sides are plain decimal text: as doubles,
+  // 9007199254740993 is 9007199254740992 and two BIGINT UNSIGNED near 2^64 are one number.
+  // A quoted plain number against a number column is read as that column's type, exactly, as MariaDB does
+  // (`bigid = '9007199254740993'` finds that id alone).
+  const bool quoted_number = !want.numeric && !ci.text && decimal_text_compare(want.sv(), want.sv()) != 2;
+  const bool exact = (want.numeric && !want.approx) || quoted_number;
+  const std::string want_text = exact ? want.str() : std::string();
   auto num_is = [&](double d) {
-    return [&cs, d](uint32_t code) { bool hd = false; const double np = numeric_prefix_of(dict_entry(cs, code), &hd); return hd && np == d; };
+    return [&cs, d, exact, &want_text](uint32_t code) {
+      const std::string& entry = dict_entry(cs, code);
+      bool hd = false;
+      const double np = numeric_prefix_of(entry, &hd);
+      if (!hd || np != d) return false;
+      if (!exact) return true;
+      const int c = decimal_text_compare(entry, want_text);
+      return c == 2 || c == 0;   // not plain decimal (an exponent, '12abc'): the numeric reading decided
+    };
   };
   if (ci.text) {
     if (want.numeric) {
@@ -33707,10 +33899,15 @@ void accumulate(const Agg& a, AggState& st, size_t r, RowReader& rd) {
           have = !txt->empty() && parse_number(*txt, &d);
           if (txt->empty()) return;
         }
-        if (a.col_type == SqlDataType::Decimal && st.dec_exact) {
+        // DECIMAL sums exactly as scaled integers; an integer column too, at scale 0 (MariaDB's SUM of a BIGINT is
+        // a DECIMAL: 4000 ids near 2^63 add up to every digit, not to 1.39e20)
+        if ((a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int) && st.dec_exact) {
           AIOS_INT128 v = 0;
           bool ok;
-          if (cs.encoding == ColumnEncoding::DecimalScaled &&
+          if (a.col_type == SqlDataType::Int) {
+            if (typed_integer(cs)) { v = (AIOS_INT128)typed_int(cs, r); ok = true; }
+            else ok = decimal_to_scaled(txt ? *txt : cs.get(r), 0, &v);
+          } else if (cs.encoding == ColumnEncoding::DecimalScaled &&
               std::llround(cs.scale_factor) == (long long)std::llround(std::pow(10.0, a.col_scale))) {
             v = (AIOS_INT128)(cs.base_int64 + (int64_t)cs.read_code(r));
             ok = true;
@@ -33722,7 +33919,7 @@ void accumulate(const Agg& a, AggState& st, size_t r, RowReader& rd) {
           } else {
             ok = decimal_to_scaled(cs.get(r), a.col_scale, &v);
           }
-          if (ok) st.etotal += v; else st.dec_exact = false;
+          if (ok && !__builtin_add_overflow(st.etotal, v, &st.etotal)) {} else st.dec_exact = false;
         }
         if (have) { st.total += d; st.count++; }
         return;
@@ -33795,6 +33992,16 @@ Val finish(const Agg& a, AggState& st, RowReader& rd) {
           return val_num_with_text(d, text);
         }
         const bool int_col = a.col_type == SqlDataType::Int;
+        if (int_col && st.dec_exact) {
+          if (sum) {
+            const std::string text = scaled_to_decimal(st.etotal, 0);
+            double d = 0;
+            parse_number(text, &d);
+            return val_num_with_text(d, text);
+          }
+          AIOS_INT128 num = st.etotal;
+          if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)st.count, 1), 4);
+        }
         if (int_col && !sum && std::fabs(st.total) < 9e15) {
           AIOS_INT128 num = (AIOS_INT128)(long long)st.total;
           if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)st.count, 1), 4);
@@ -33948,12 +34155,12 @@ AggPlan plan_mode(const Agg& a, const SqlTable& t) {
           p.code_num_ok[k] = !txt.empty() && parse_number(txt, &d);
           p.code_num[k] = d;
         }
-        if (a.col_type == SqlDataType::Decimal) {
+        if (a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int) {   // exact sums: scaled integers (scale 0 for an integer)
           p.code_scaled.assign(nd, 0);
           p.code_scaled_ok.assign(nd, 0);
           for (size_t k = 0; k < nd; ++k) {
             AIOS_INT128 v = 0;
-            p.code_scaled_ok[k] = decimal_to_scaled(dict_entry(cs, (uint32_t)k), a.col_scale, &v);
+            p.code_scaled_ok[k] = decimal_to_scaled(dict_entry(cs, (uint32_t)k), a.col_type == SqlDataType::Int ? 0 : a.col_scale, &v);
             p.code_scaled[k] = v;
           }
         }
@@ -34084,7 +34291,7 @@ inline void acc_row(const Agg& a, const AggPlan& p, AggArrays& A, uint32_t g, si
           if (k >= p.code_num.size() || p.code_empty[k]) return;
           have = p.code_num_ok[k];
           d = p.code_num[k];
-          if (a.col_type == SqlDataType::Decimal && A.ok[g]) {
+          if ((a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int) && A.ok[g]) {
             if (p.code_scaled_ok[k]) A.isum[g] += p.code_scaled[k]; else A.ok[g] = 0;
           }
         } else if (a.src.kind == Source::TypedCol) {
@@ -34104,9 +34311,9 @@ inline void acc_row(const Agg& a, const AggPlan& p, AggArrays& A, uint32_t g, si
           const std::string& txt = cs.get(r);
           if (txt.empty()) return;
           have = parse_number(txt, &d);
-          if (a.col_type == SqlDataType::Decimal && A.ok[g]) {
+          if ((a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int) && A.ok[g]) {
             AIOS_INT128 v = 0;
-            if (decimal_to_scaled(txt, a.col_scale, &v)) A.isum[g] += v; else A.ok[g] = 0;
+            if (decimal_to_scaled(txt, a.col_type == SqlDataType::Int ? 0 : a.col_scale, &v)) A.isum[g] += v; else A.ok[g] = 0;
           }
         }
         if (have) { A.num[g] += d; A.cnt[g]++; }
@@ -34237,6 +34444,18 @@ Val finish_arrays(const Agg& a, const AggPlan& p, AggArrays& A, size_t g, RowRea
         }
         const bool int_col = a.col_type == SqlDataType::Int;
         const double total = A.num[g];
+        // exact where every value was an integer read exactly (a typed integer column, or codes / text that parsed)
+        const bool int_exact = int_col && A.ok[g] && (p.need_ints || p.need_codes || a.src.kind == Source::RowExpr || a.src.kind == Source::CodeCol);
+        if (int_exact) {
+          if (sum) {
+            const std::string text = scaled_to_decimal(A.isum[g], 0);
+            double d = 0;
+            parse_number(text, &d);
+            return val_num_with_text(d, text);
+          }
+          AIOS_INT128 num = A.isum[g];
+          if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)A.cnt[g], 1), 4);
+        }
         if (int_col && !sum && std::fabs(total) < 9e15) {
           AIOS_INT128 num = (AIOS_INT128)(long long)total;
           if (scale_up_exact(&num, 5)) return val_exact(scale_down_half_up(num / (AIOS_INT128)A.cnt[g], 1), 4);
@@ -35987,6 +36206,18 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
                   double d = 0;
                   if (!v.null) d = v.numeric ? v.num : (parse_number(v.str(), &d) ? d : 0);
                   sk.code_num[c] = d;
+                }
+                // Numbers a double cannot tell apart (past 2^53, or more than 15 digits): the key is each code's
+                // exact rank instead - the codes ordered by their digits once, the rows then sorted as before.
+                if (wide_numbers(cs)) {
+                  std::vector<uint32_t> order;
+                  for (size_t c = 0; c < nd; ++c) if (!sk.code_null[c]) order.push_back((uint32_t)c);
+                  std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return compare_vals_ordered(s.code_val[x], s.code_val[y]) < 0; });
+                  double rank = 0;
+                  for (size_t i = 0; i < order.size(); ++i) {
+                    if (i > 0 && compare_vals_ordered(s.code_val[order[i - 1]], s.code_val[order[i]]) != 0) ++rank;
+                    sk.code_num[order[i]] = rank;
+                  }
                 }
               } else if (sk.type == SqlDataType::Text) {
                 sk.kind = SortKey::Rank;
@@ -37743,6 +37974,28 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
     }
     bool has_num = false, has_txt = false;
     for (size_t r = 0; r < n; ++r) { has_num |= k.cls[r] == 1; has_txt |= k.cls[r] == 2; }
+    // Numbers a double cannot tell apart (past 2^53, more than 15 digits): each number becomes its exact rank among
+    // the column's numbers - ordered by value, ties broken by their digits - and sorts as numbers do.
+    bool wide = false;
+    for (size_t r = 0; r < n && !wide; ++r) if (k.cls[r] == 1) wide = text_is_wide_number(cell_at(r));
+    if (wide) {
+      std::vector<uint32_t> order;
+      for (size_t r = 0; r < n; ++r) if (k.cls[r] == 1) order.push_back((uint32_t)r);
+      auto cmp = [&](uint32_t a, uint32_t bb) {
+        if (k.num[a] != k.num[bb]) return k.num[a] < k.num[bb] ? -1 : 1;
+        const int c = decimal_text_compare(cell_at(a), cell_at(bb));
+        return c == 2 ? 0 : c;
+      };
+      std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t bb) { return cmp(a, bb) < 0; });
+      std::vector<double> rank(n, 0);
+      double rk = 0;
+      for (size_t i = 0; i < order.size(); ++i) {
+        if (i > 0 && cmp(order[i - 1], order[i]) != 0) ++rk;
+        rank[order[i]] = rk;
+      }
+      for (uint32_t r : order) { k.num[r] = rank[r]; k.txt[r] = &cell_at(r); }
+      k.ranked = true;   // a RANGE frame's arithmetic reads the number itself (txt), not its rank
+    }
     if (has_txt && !has_num) {
       std::unordered_map<std::string_view, uint32_t> ids;
       std::vector<const std::string*> distinct;
@@ -42461,6 +42714,18 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           }
         }
 
+        // Numbers a double cannot carry on either side of the main key: matches are confirmed by their digits.
+        bool best_wide = false;
+        if (best_ki >= 0 && prep_jkeys[best_ki].column >= 0 && (size_t)prep_jkeys[best_ki].column < js.table->col_data.size()) {
+          best_wide = vx::wide_numbers(js.table->col_data[(size_t)prep_jkeys[best_ki].column]);
+          const SqlExpr* bval = prep_jkeys[best_ki].value;
+          size_t bs = 0, bc = 0;
+          if (!best_wide && bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &bs, &bc) == ColumnLookup::Found &&
+              bs < baseonly.size() && baseonly[bs].table && bc < baseonly[bs].table->col_data.size())
+            best_wide = vx::wide_numbers(baseonly[bs].table->col_data[bc]);
+          else if (!best_wide && bval && bval->op != ExprOp::Column && bval->op != ExprOp::Literal)
+            best_wide = true;   // an expression: its values are not known ahead
+        }
         // The joined rows whose keys equal this base row's.
         auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
           out.clear();
@@ -42500,6 +42765,23 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
               if (want.null) return;
               probe_gather_matches(prep_jkeys[best_ki].idx.get(), want, match_cands);
+            }
+            // The index finds numbers by their double, which joins 9007199254740993 to ...992 and every BIGINT
+            // UNSIGNED near 2^64 to its neighbours. Where either side holds such numbers, each candidate's key is
+            // checked against this row's by its digits.
+            if (best_wide && !link_to_parent && !link_to_kids && !direct_code_join && !match_cands.empty()) {
+              const Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
+              const ColumnStore& jcs = js.table->col_data[(size_t)prep_jkeys[best_ki].column];
+              size_t w = 0;
+              for (size_t mi = 0; mi < match_cands.size(); ++mi) {
+                const size_t mr = match_cands[mi];
+                if (mr >= jcs.size() || jcs.is_null(mr)) continue;
+                const std::string& cell = jcs.get(mr);
+                double d = 0;
+                if (!parse_number(cell, &d)) { match_cands[w++] = mr; continue; }
+                if (compare_vals(want, val_num_with_text(d, cell)) == 0) match_cands[w++] = mr;
+              }
+              match_cands.resize(w);
             }
             std::vector<Val> other(prep_jkeys.size());
             bool other_ready = false;
