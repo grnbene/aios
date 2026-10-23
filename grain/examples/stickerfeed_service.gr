@@ -39,9 +39,9 @@ fn secret(name) {
 }
 
 // ---- PHP 7.4, as the feed's arithmetic and tests use it --------------------------------------
-// Numbers are decimal text (grain's dec_* functions), exact. PHP does this arithmetic in doubles and
-// number_format() rounds through 15 significant digits, which gives the same digits as exact decimals
-// for every value a price, cost or quantity takes.
+// Numbers are grain decimals, exact. PHP does this arithmetic in doubles and number_format() rounds
+// through 15 significant digits, which gives the same digits as exact decimals for every value a price,
+// cost or quantity takes.
 
 // trim() with PHP's default characters
 fn php_trim(s) {
@@ -62,57 +62,74 @@ fn php_truthy(v) {
   if v == nil { return false }
   let t = type(v)
   if t == "bool" { return v }
-  if t == "int" or t == "real" { return v != 0 }
+  if t == "int" or t == "real" or t == "decimal" { return v != 0 }
   if t == "string" { return v != "" and v != "0" }
   if t == "list" { return len(v) > 0 }
   if t == "map" { return len(keys(v)) > 0 }
   return true
 }
 
-// A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
-fn num(v) {
-  if v == nil or v == false { return "0" }
-  if v == true { return "1" }
-  if type(v) != "string" { return decimal(v) }
-  let p = decimal_prefix(v)
-  return p == nil ? "0" : p.value
+// The number a string starts with, as PHP 7.4 reads one: {d, whole}, or nil when it starts with none.
+// whole: the string is that number and nothing after it (is_numeric; trailing space does not count).
+let NUMBER_PREFIX = "^[ \t\n\r\v\f]*[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?"
+fn num_prefix(s) {
+  let m = regex_match(NUMBER_PREFIX, s)
+  if m == nil { return nil }
+  return {"d": decimal(m.text), "whole": m.end == len(s)}
 }
 
-// is_numeric(): the string is a number and nothing after it (trailing space included)
+// A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
+fn num(v) {
+  if v == nil or v == false { return decimal(0) }
+  if v == true { return decimal(1) }
+  let t = type(v)
+  if t == "decimal" { return v }
+  if t != "string" { return decimal(v) }
+  let p = num_prefix(v)
+  return p == nil ? decimal(0) : p.d
+}
+
+// is_numeric($s): the number when the string is one and nothing more
 fn numeric_str(s) {
   if s == nil { return nil }
-  let p = decimal_prefix(s)
-  if p == nil or p.rest != "" { return nil }
-  return p.value
+  let p = num_prefix(s)
+  if p == nil or not p.whole { return nil }
+  return p.d
 }
 
 // (int) $v
-fn num_int(v) { return int(dec_round(num(v), 0, "down")) }
-
-fn dec_max(a, b) { return dec_cmp(a, b) >= 0 ? a : b }
+fn num_int(v) { return int(num(v)) }
 
 // number_format($v, $places, '.', '') on PHP 7.4: a string that is not numeric at all is refused
 // (a warning and NULL); a leading-numeric one counts as its number; null and false as 0. The value is
-// rounded to 15 significant digits first, then half up.
+// rounded to 15 significant digits first, then half away from zero, and a zero has no sign.
 fn nf(v, places) {
-  let d = "0"
-  if v == true { d = "1" }
+  let d = decimal(0)
+  if v == true { d = decimal(1) }
   else if v != nil and v != false {
     if type(v) == "string" {
-      let p = decimal_prefix(v)
+      let p = num_prefix(v)
       if p == nil { return nil }
-      d = p.value
+      d = p.d
     } else {
       d = decimal(v)
     }
   }
-  return dec_format(dec_round_sig(d, 15), places)
+  // significant digits: the mantissa's, without leading zeros
+  let t = replace(str(abs(d)), ".", "")
+  let lead = 0
+  while lead < len(t) - 1 and char_at(t, lead) == "0" { lead = lead + 1 }
+  let digits = len(t) - lead
+  if digits > 15 and scale(d) - (digits - 15) >= 0 { d = round(d, scale(d) - (digits - 15)) }
+  d = round(d, places)
+  if d == 0 { d = decimal(0) }
+  return format("{:." + str(places) + "f}", d)
 }
 
 // $v > 0 and $v == 0 on PHP 7.4: a string compares by its leading number
-fn gt0(v) { return v != nil and v != false and dec_cmp(num(v), "0") > 0 }
+fn gt0(v) { return v != nil and v != false and num(v) > 0 }
 
-fn eq0(v) { return v == nil or v == false or (v != true and dec_cmp(num(v), "0") == 0) }
+fn eq0(v) { return v == nil or v == false or (v != true and num(v) == 0) }
 
 // in_array($v, $list) for the strings the ERP keeps: two numeric strings compare as numbers ("07" == "7")
 fn php_in(v, list) {
@@ -123,7 +140,7 @@ fn php_in(v, list) {
     if a == b { return true }
     if an != nil {
       let bn = numeric_str(b)
-      if bn != nil and dec_cmp(an, bn) == 0 { return true }
+      if bn != nil and an == bn { return true }
     }
   }
   return false
@@ -169,12 +186,12 @@ fn conn(which) {
 
 // One statement, its ? filled from params. A read whose connection broke is tried once more on a new
 // one; a write is not, since it may have been applied.
-fn run(which, sql, params) {
-  let r = pcall(db_query, conn(which), sql, params)
+fn run(which, sql, params, opts) {
+  let r = pcall(db_query, conn(which), sql, params, opts)
   if not r.ok {
     conns[which] = nil
     if which != "read" { error(r.error) }
-    r = pcall(db_query, conn(which), sql, params)
+    r = pcall(db_query, conn(which), sql, params, opts)
     if not r.ok {
       conns[which] = nil
       error(r.error)
@@ -184,7 +201,9 @@ fn run(which, sql, params) {
   return r.value
 }
 
-fn rows(sql, params) { return run("read", sql, params).rows }
+// rows only: the feed reads a quarter of a million of them, and records would double that
+let ROWS = {"records": false}
+fn rows(sql, params) { return run("read", sql, params, ROWS).rows }
 
 fn first_row(sql, params) {
   let r = rows(sql, params)
@@ -212,7 +231,7 @@ fn sum_by(rs, k, v) {
   for r in rs {
     let key = ck(r[k])
     let cur = g[key]
-    g[key] = cur == nil ? num(r[v]) : dec_add(cur, num(r[v]))
+    g[key] = cur == nil ? num(r[v]) : cur + num(r[v])
   }
   return g
 }
@@ -254,15 +273,15 @@ fn build(brands, levels, only) {
   let so_open = {}
   for r in rows("SELECT stkcode, SUM(quantity) AS q, SUM(qtyinvoiced) AS i FROM salesorderdetails WHERE completed != 1 AND orderno in (select orderno from salesorders where fromstkloc = '01')" + o("stkcode") + " GROUP BY stkcode", op([])) {
     let key = ck(r[0])
-    let v = dec_sub(num(r[1]), num(r[2]))
-    so_open[key] = so_open[key] == nil ? v : dec_add(so_open[key], v)
+    let v = num(r[1]) - num(r[2])
+    so_open[key] = so_open[key] == nil ? v : so_open[key] + v
   }
   let has_rga_type = len(rows("SHOW COLUMNS FROM rgaorders LIKE 'rga_type'", nil)) > 0
   let rga = {}
   for r in rows("SELECT rgaorderdetails.itemcode, sum(quantityord) AS o, sum(quantityrecd) AS r FROM rgaorderdetails JOIN rgaorders ON rgaorderdetails.orderno = rgaorders.orderno WHERE rgaorderdetails.completed != 1 AND rgaorderdetails.quantityrecd < rgaorderdetails.quantityord" + (has_rga_type ? " AND rgaorders.rga_type = 'RT'" : "") + " AND rgaorders.intostocklocation = '01'" + o("rgaorderdetails.itemcode") + " GROUP BY rgaorderdetails.itemcode", op([])) {
     let key = ck(r[0])
-    let v = dec_sub(num(r[1]), num(r[2]))
-    rga[key] = rga[key] == nil ? v : dec_add(rga[key], v)
+    let v = num(r[1]) - num(r[2])
+    rga[key] = rga[key] == nil ? v : rga[key] + v
   }
   let remote = sum_by(rows("select stockid, SUM(quantity) AS q from primarymixedinventory where loccode in ('03','62','64','67')" + o("stockid") + " GROUP BY stockid", op([])), 0, 1)
 
@@ -279,9 +298,8 @@ fn build(brands, levels, only) {
 
     // $avail = QTY_ON_HAND - getOnSalesOrder() + remote: the one row a SUM without GROUP BY returns, where
     // a falsy sum counts as 0, which is the number it already is
-    let onorder = dec_add(so_open[key] == nil ? "0" : so_open[key], rga[key] == nil ? "0" : rga[key])
-    let avail = dec_sub(qoh01[key] == nil ? "0" : qoh01[key], onorder)
-    avail = dec_add(avail, remote[key] == nil ? "0" : remote[key])
+    let onorder = (so_open[key] == nil ? 0 : so_open[key]) + (rga[key] == nil ? 0 : rga[key])
+    let avail = decimal(qoh01[key] == nil ? 0 : qoh01[key]) - onorder + (remote[key] == nil ? 0 : remote[key])
 
     let brand = nil
     let m = mfg[ck(item[1])]
@@ -310,7 +328,7 @@ fn build(brands, levels, only) {
     if sz != nil { size = sz[1] }
     if not php_truthy(size) { size = item[5] }
 
-    if dec_cmp(avail, "5") >= 0 and dec_cmp(avail, "8") <= 0 { avail = "9" }
+    if avail >= 5 and avail <= 8 { avail = decimal(9) }
 
     push(out, {
       "Brand": php_trim(brand),
@@ -370,7 +388,7 @@ fn make_pricer(only) {
       if locs[key] == nil { locs[key] = {} }
       let l = locs[key]
       let lk = ck(r[1])
-      l[lk] = l[lk] == nil ? num(r[2]) : dec_add(l[lk], num(r[2]))
+      l[lk] = l[lk] == nil ? num(r[2]) : l[lk] + num(r[2])
     }
     c.locs = locs
     c.demand = sum_by(rows("SELECT salesorderdetails.stkcode, SUM(salesorderdetails.quantity-salesorderdetails.qtyinvoiced) AS dem FROM salesorderdetails INNER JOIN salesorders ON salesorders.orderno = salesorderdetails.orderno INNER JOIN shippers on salesorders.shipvia = shipper_id WHERE salesorderdetails.completed=0 AND salesorders.quotation=0 AND shippername <> 'dropship'" + o("salesorderdetails.stkcode") + " GROUP BY salesorderdetails.stkcode", op([])), 0, 1)
@@ -451,7 +469,7 @@ fn make_pricer(only) {
       let s = sm[key]
       if s == nil { return nil }
       let po = c.lastpo[key]
-      nextcost = dec_max(dec_max(num(s[3]), num(s[2])), (po == nil or po[1] == nil) ? "0" : num(po[1]))
+      nextcost = max(num(s[3]), num(s[2]), (po == nil or po[1] == nil) ? decimal(0) : num(po[1]))
     }
     return nextcost
   }
@@ -463,18 +481,18 @@ fn make_pricer(only) {
     let c = costs()
     let key = ck(stockid)
     let locs = c.locs[key]
-    let dem = c.demand[key] == nil ? "0" : c.demand[key]
-    let total = "0"
+    let dem = c.demand[key] == nil ? decimal(0) : c.demand[key]
+    let total = decimal(0)
     if locs != nil {
-      for lk in keys(locs) { total = dec_sub(dec_add(total, locs[lk]), dem) }
+      for lk in keys(locs) { total = total + locs[lk] - dem }
     }
     let s = sm[key]
     let ac = nil
     if s != nil {
       let l = c.last25[key]
-      ac = dec_max(num(s[2]), (l == nil or l[1] == nil) ? "0" : num(l[1]))
+      ac = max(num(s[2]), (l == nil or l[1] == nil) ? decimal(0) : num(l[1]))
     }
-    let cost = dec_cmp(total, "0") > 0 ? ac : next_cost(stockid)
+    let cost = total > 0 ? ac : next_cost(stockid)
     let f = c.forced[key]
     if f != nil and php_truthy(f[1]) { cost = f[1] }
     return nf(cost, 2)
@@ -504,7 +522,7 @@ fn make_pricer(only) {
       if b == nil { return nil }
       start = num(b)
     }
-    let calc = num_int(row[3]) == 1 ? dec_add(start, num(row[4])) : dec_mul(start, num(row[4]))
+    let calc = num_int(row[3]) == 1 ? start + num(row[4]) : start * num(row[4])
     return nf(calc, 2)
   }
 
@@ -581,7 +599,7 @@ fn unseal(v) {
 // StickerFeedCredentials::validateBearer(): the API vendor whose token this is, unless it has expired
 fn validate_bearer(token) {
   if not php_truthy(token) { return nil }
-  let r = run("read", "SELECT * FROM sticker_feed_exclusions WHERE connection_type = 'api' AND access_token_enc IS NOT NULL AND access_token_enc != ''", nil)
+  let r = run("read", "SELECT * FROM sticker_feed_exclusions WHERE connection_type = 'api' AND access_token_enc IS NOT NULL AND access_token_enc != ''", nil, nil)
   let now_s = date_format(now(), "%F %T", "local")
   for v in r.records {
     let stored = unseal(v.access_token_enc)
@@ -596,14 +614,14 @@ fn validate_bearer(token) {
 
 fn log_event(vendor_id, action, result, status, detail) {
   run("write", "INSERT INTO sticker_feed_connection_log (vendor_id, action, result, http_status, error_detail, actor_userid, created_at) VALUES (?, ?, ?, ?, ?, NULL, NOW())",
-      [num_int(vendor_id), action, result, status, detail == nil ? nil : slice(php_str(detail), 0, 2000)])
+      [num_int(vendor_id), action, result, status, detail == nil ? nil : slice(php_str(detail), 0, 2000)], nil)
 }
 
 // checkRateLimit(): PHP counts the log's rows for this action, and it logs a successful feed as "send",
 // so only failed calls count against a vendor - kept as it is.
 fn rate_limited(action, vendor_id, limit, window) {
   let r = run("write", "SELECT COUNT(*) as count FROM sticker_feed_connection_log WHERE vendor_id = ? AND action = ? AND created_at >= FROM_UNIXTIME(?)",
-              [php_str(vendor_id), action, int(now()) - window])
+              [php_str(vendor_id), action, int(now()) - window], ROWS)
   return num_int(r.rows[0][0]) >= limit
 }
 
@@ -636,18 +654,9 @@ fn authenticate(req, function) {
 }
 
 // ---- the endpoints ----------------------------------------------------------------------------
-
-let stats = {"feed": 0, "stock_check": 0, "errors": 0}
-let recent = []
-let last_error = ""
-
-fn note(endpoint, status, items, ms) {
-  push(recent, {
-    "time": date_format(now(), "%T", "local"), "endpoint": endpoint, "status": str(status),
-    "items": str(items), "ms": str(round(ms))
-  })
-  if len(recent) > 12 { recent = slice(recent, len(recent) - 12) }
-}
+// Each request runs in a worker VM of its own (the pane's "workers"), so a full feed does not hold up a
+// stock check. A worker's changes to globals stay in the worker: what happened is in the connection
+// log, which the ops view reads.
 
 fn client_exclusions(client_id) {
   let brands = []
@@ -714,7 +723,7 @@ fn feed(req) {
   // date('Y-m-d G:i:s'): the hour without a leading zero
   let t = now()
   let lastsent = date_format(t, "%Y-%m-%d ", "local") + str(int(date_format(t, "%H", "local"))) + date_format(t, ":%M:%S", "local")
-  run("write", "update sticker_feed_exclusions set lastsent = ?, lastfile = ? where id = ?", [lastsent, str(len(out)) + " items", client_id])
+  run("write", "update sticker_feed_exclusions set lastsent = ?, lastfile = ? where id = ?", [lastsent, str(len(out)) + " items", client_id], nil)
   log_event(client_id, "send", "success", 200, "feed pulled")
   return reply(200, {"items": out})
 }
@@ -768,54 +777,64 @@ fn stock_check(req) {
   return reply(200, {"items": out, "not_found": missing})
 }
 
-// One request; anything unexpected is answered as PHP's catch answers it, and the cause is kept.
-// Like the PHP, the method is not checked: a GET has no JSON body and is told so.
+// One request; anything unexpected is answered as PHP's catch answers it, and the cause goes to the
+// server's log. Like the PHP, the method is not checked: a GET has no JSON body and is told so.
 fn guarded(endpoint, handler) {
   return fn (req) {
-    let t0 = now()
     let r = pcall(handler, req)
-    let ms = (now() - t0) * 1000.0
     if not r.ok {
-      stats.errors = stats.errors + 1
-      last_error = date_format(now(), "%T", "local") + " " + endpoint + ": " + r.error
-      print("stickerfeed: " + endpoint + ": " + r.error)
-      note(endpoint, 500, 0, ms)
+      print("stickerfeed: " + date_format(now(), "%F %T", "local") + " " + endpoint + ": " + r.error)
       return reply(500, {"error": "server_error", "error_description": "Unexpected error"})
     }
-    stats[slice(endpoint, 1)] = stats[slice(endpoint, 1)] + 1
-    let j = r.value.json
-    let n = (j != nil and type(j.items) == "list") ? len(j.items) : 0
-    note(endpoint, r.value.status, n, ms)
     return r.value
   }
 }
 
 // ---- the ops view ---------------------------------------------------------------------------
+// The view runs in the program's own VM. It opens a connection for each look and closes it, so the
+// program holds none: the workers copy the globals the routes name, and a connection cannot be copied.
+
+fn look(cfg, sql) {
+  let c = db_connect(cfg.host, cfg.port, cfg.user, cfg.password, cfg.db)
+  if not c.ok { error("cannot connect to " + cfg.host + ":" + str(cfg.port) + ": " + c.error) }
+  let r = pcall(db_query, c, sql)
+  db_close(c)
+  if not r.ok { error(r.error) }
+  if not r.value.ok { error(r.value.error) }
+  return r.value
+}
 
 fn mirror_state() {
-  let r = pcall(run, "read", "SHOW SLAVE STATUS", nil)
+  let r = pcall(look, ASQL, "SHOW SLAVE STATUS")
   if not r.ok { return "ASQL unreachable: " + r.error }
   if len(r.value.records) == 0 { return "ASQL is not replicating" }
   let s = r.value.records[0]
   return "replicating: io " + php_str(s.Slave_IO_Running) + ", sql " + php_str(s.Slave_SQL_Running) + ", " + php_str(s.Seconds_Behind_Master) + " s behind"
 }
 
+// today's calls and the latest ones, from the connection log the endpoints write
+fn log_state() {
+  if WRITE.host == "" { return {"error": "STICKERFEED_WRITE_HOST is not set: there is no log to read", "today": [], "recent": []} }
+  let today_r = pcall(look, WRITE, "SELECT action, result, COUNT(*) AS n FROM sticker_feed_connection_log WHERE created_at >= CURDATE() GROUP BY action, result ORDER BY action, result")
+  let recent_r = pcall(look, WRITE, "SELECT l.created_at, l.vendor_id, l.action, l.result, l.http_status, l.error_detail FROM sticker_feed_connection_log l ORDER BY l.id DESC LIMIT 12")
+  if not today_r.ok or not recent_r.ok { return {"error": "cannot read the log: " + (today_r.ok ? recent_r.error : today_r.error), "today": [], "recent": []} }
+  return {"error": "", "today": today_r.value.records, "recent": recent_r.value.records}
+}
+
 let mirror = mirror_state()
-every(10, fn () { mirror = mirror_state() })
+let calls = log_state()
+every(10, fn () {
+  mirror = mirror_state()
+  calls = log_state()
+})
 
 fn view() {
-  let rev = []
-  for r in recent { rev = [r] + rev }
   return ui.column({"gap": 14, "pad": 12}, [
     ui.heading("StickerFeed vendor API", {"size": 24}),
     ui.text("Reads ASQL at " + ASQL.host + ":" + str(ASQL.port) + " (" + mirror + "). Writes the log to " + (WRITE.host == "" ? "nowhere: STICKERFEED_WRITE_HOST is not set" : WRITE.host + ":" + str(WRITE.port)) + ".", {"dim": true}),
-    ui.row({"gap": 12}, [
-      ui.tile("Feeds served", stats.feed),
-      ui.tile("Stock checks", stats.stock_check),
-      ui.tile("Errors", stats.errors, {"accent": stats.errors > 0 ? "bad" : "ok"})
-    ]),
-    last_error == "" ? ui.text("No errors.", {"dim": true}) : ui.text(last_error, {"color": "bad"}),
-    ui.table(rev, {"columns": "time:Time, endpoint:Endpoint, status:Status, items:Items:right, ms:ms:right", "empty": "No requests yet."})
+    calls.error == "" ? ui.text("Calls today, from sticker_feed_connection_log:", {"bold": true}) : ui.text(calls.error, {"color": "bad"}),
+    ui.table(calls.today, {"columns": "action:Action, result:Result:badge, n:Calls:right", "empty": "No calls today.", "badges": {"success": "ok", "fail": "warn"}}),
+    ui.table(calls.recent, {"columns": "created_at:When, vendor_id:Vendor:right, action:Action, result:Result:badge, http_status:Status:right, error_detail:Detail", "empty": "No calls yet.", "badges": {"success": "ok", "fail": "warn"}})
   ])
 }
 
@@ -824,7 +843,8 @@ ui.pane({
   "width": 900,
   "height": 600,
   "shared": true,
-  "refresh": 5,
+  "workers": true,
+  "refresh": 10,
   "routes": {
     "/feed": guarded("/feed", feed),
     "/stock_check": guarded("/stock_check", stock_check)

@@ -146,7 +146,7 @@ class Copier {
   bool value(const Value& v, Value& out, std::string& error) {
     if (!v.obj) { out = v; return true; }
     switch (v.type) {
-      case Type::Str: case Type::Id128: case Type::Native:
+      case Type::Str: case Type::Id128: case Type::Native: case Type::Decimal:
         out = v;   // never changed once made: shared, not copied
         return true;
       case Type::Extern: {
@@ -497,6 +497,25 @@ Value bi_task_done(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 }  // namespace
+
+void WorkerCall::run() {
+  result = vm->call(fn, args, error);
+  if (error.empty()) check_no_panes(*vm, error);
+  if (!error.empty()) result = Value::nil();
+  fn = Value::nil();
+  args.clear();
+  vm.reset();   // its globals go with it; the result and what it printed stay
+}
+
+std::unique_ptr<WorkerCall> prepare_worker_call(Vm& vm, const Value& fn, std::vector<Value> args, std::string& error) {
+  auto call = std::make_unique<WorkerCall>();
+  call->vm = make_worker(vm, &call->printed);
+  Copier copier(vm, *call->vm);
+  bool ok = copier.value(fn, call->fn, error);
+  call->args = std::move(args);   // plain data made for this call: nothing in it belongs to `vm`
+  if (!ok || !copier.finish(error)) return nullptr;
+  return call;
+}
 
 void install_parallel_builtins(Vm& vm) {
   vm.define_native("parallel_map", 2, 2, bi_parallel_map);

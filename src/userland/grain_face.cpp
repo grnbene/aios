@@ -329,6 +329,7 @@ fc::Value to_face(const Value& v, int depth = 0) {
     case Type::Bool: return fc::Value::boolean(v.b);
     case Type::Int:
     case Type::Real: return fc::Value::num(v.as_double());
+    case Type::Decimal: return fc::Value::str(v.to_text());   // the digits it has, not a double's approximation
     case Type::Str: return fc::Value::str(v.str());
     case Type::List: {
       fc::Value out = fc::Value::make_list();
@@ -431,6 +432,10 @@ class FacePane final : public PaneDriver {
   void set_theme(const std::string& t) { theme_ = t; }
   const Value& routes() const { return routes_; }
   void set_routes(const Value& r) { routes_ = r; }
+  bool workers() const { return workers_; }
+  bool api_only() const { return api_only_; }
+  void set_api_only(bool v) { api_only_ = v; }
+  void set_workers(bool v) { workers_ = v; }
 
   bool render_html(Vm& vm, std::string& html, std::string& error) {
     vm_ = &vm;
@@ -514,6 +519,7 @@ class FacePane final : public PaneDriver {
       case Type::Nil: out += "null"; return;
       case Type::Bool: out += v.b ? "true" : "false"; return;
       case Type::Int: out += std::to_string(v.i); return;
+      case Type::Decimal: out += decimal_text(v); return;
       case Type::Real: {
         if (!(v.d == v.d) || v.d > 1e308 || v.d < -1e308) { out += "null"; return; }
         out += v.to_text();
@@ -1097,6 +1103,8 @@ class FacePane final : public PaneDriver {
   std::string css_;
   std::string theme_;
   Value routes_ = Value::nil();
+  bool api_only_ = false;  // no page: only its routes answer (serve_routes)
+  bool workers_ = false;   // routes run in worker VMs, not one at a time in this one
 
  private:
   // The program's widgets as this frame's face document, laid out at the pane's size.
@@ -1245,6 +1253,17 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   auto o = as_map(args[0]);
   if (!o) { error = std::string("ui.pane() wants its options as a map, got a ") + type_name(args[0].type); return Value::nil(); }
   Value* view = o->find("view");
+  // An API with no page (serve_routes) has routes and nothing to show.
+  Value no_view;
+  bool api_only = false;
+  if (!view && (o->find("routes") || o->find("api"))) {
+    no_view = Value::object(Type::Native, std::make_shared<NativeObj>("no_view", 0, 0, [](Vm& v, std::vector<Value>&, std::string& e) {
+      std::vector<Value> none{Value::list({})};
+      return bi_ui_column(v, none, e);
+    }));
+    view = &no_view;
+    api_only = true;
+  }
   if (!view || !is_callable(*view)) {
     error = "ui.pane() wants \"view\": a function that returns the widgets to show";
     return Value::nil();
@@ -1262,6 +1281,8 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (Value* th = o->find("theme")) pane->set_theme(th->to_text());
   if (Value* r = o->find("routes")) pane->set_routes(*r);
   else if (Value* a = o->find("api")) pane->set_routes(*a);
+  pane->set_api_only(api_only);
+  if (Value* wk = o->find("workers")) pane->set_workers(wk->truthy());   // each route request in a VM of its own, on its own thread: a slow one does not hold up the rest
   return register_driven_pane(vm, title, w, h, pane);
 }
 
@@ -1343,6 +1364,25 @@ void install_face_builtins(Vm& vm) {
   add("set_field", 3, 3, bi_ui_set_field);
   add("layout", 1, 1, bi_ui_layout);
   vm.define_global("ui", Value::object(Type::Map, ui));
+  // serve_routes({"/path": fn(req) {...}}, options?): a program that is only an API. The routes of a pane with
+  // nothing to show, shared (one copy of the program) and with workers (each request in a VM of its own, so a
+  // slow route does not hold up the others). options: title, workers (false for routes that share the
+  // program's globals, one request at a time), and the rest of ui.pane's.
+  vm.define_native("serve_routes", 1, 2, [](Vm& v, std::vector<Value>& args, std::string& error) -> Value {
+    if (!as_map(args[0])) { error = std::string("serve_routes() wants its routes as a map of path to function, got a ") + type_name(args[0].type); return Value::nil(); }
+    auto o = std::make_shared<MapObj>();
+    o->put("title", Value::string("api"));
+    o->put("shared", Value::boolean(true));
+    o->put("workers", Value::boolean(true));
+    if (args.size() > 1) {
+      auto given = as_map(args[1]);
+      if (!given) { error = std::string("serve_routes() wants its options as a map, got a ") + type_name(args[1].type); return Value::nil(); }
+      for (const auto& kv : given->entries) o->put(kv.first, kv.second);
+    }
+    o->put("routes", args[0]);
+    std::vector<Value> pane_args{Value::object(Type::Map, o)};
+    return bi_ui_pane(v, pane_args, error);
+  });
 }
 
 
@@ -1371,6 +1411,11 @@ bool web_pane_first(const Vm& vm, WebPaneInfo& out) {
   return false;
 }
 
+bool web_pane_api_only(Vm& vm, uint64_t id) {
+  FacePane* f = web_face(vm, id);
+  return f && f->api_only();
+}
+
 bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, std::string& error) {
   FacePane* f = web_face(vm, id);
   if (!f) { error = "that pane is not a ui.pane"; return false; }
@@ -1394,38 +1439,12 @@ bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& ac
   return f->web_event(vm, version, action, fields, error);
 }
 
-bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
-                           const std::string& query, const std::string& body,
-                           const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
-                           int& status, std::string& res_body, std::string& content_type, std::string& error) {
-  FacePane* f = web_face(vm, id);
-  if (!f || f->routes().type != Type::Map) return false;
-  auto rm = as_map(f->routes());
-  Value* handler = rm ? rm->find(path) : nullptr;
-  if (!handler) handler = rm ? rm->find("*") : nullptr;
-  if (!handler || !is_callable(*handler)) return false;
-
-  auto req_m = std::make_shared<MapObj>();
-  req_m->put("method", Value::string(method));
-  req_m->put("path", Value::string(path));
-  req_m->put("query", Value::string(query));
-  req_m->put("body", Value::string(body));
-  auto hdr_m = std::make_shared<MapObj>();
-  for (const auto& [name, value] : headers) {
-    std::string key = name;
-    for (char& c : key) c = (char)std::tolower((unsigned char)c);
-    if (!hdr_m->find(key)) hdr_m->put(key, Value::string(value));   // a repeated header: the first one counts
-  }
-  req_m->put("headers", Value::object(Type::Map, hdr_m));
-  req_m->put("remote", Value::string(remote));
-
-  std::vector<Value> args = {Value::object(Type::Map, req_m)};
-  Value ret = vm.call(*handler, args, error);
-  if (!error.empty()) return false;
-
+namespace {
+// What a route's return value says about the response: a map with status / content_type / body / json, a
+// list or number as JSON, a string as text.
+void route_response(const Value& ret, int& status, std::string& res_body, std::string& content_type) {
   status = 200;
   content_type = "application/json; charset=utf-8";
-
   if (ret.type == Type::Map) {
     auto m = as_map(ret);
     if (Value* s = m->find("status")) status = (int)s->as_int();
@@ -1441,10 +1460,6 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
       FacePane::value_json(ret, out, 0);
       res_body = std::move(out);
     }
-  } else if (ret.type == Type::List) {
-    std::string out;
-    FacePane::value_json(ret, out, 0);
-    res_body = std::move(out);
   } else if (ret.type == Type::Str) {
     res_body = ret.str();
     content_type = "text/plain; charset=utf-8";
@@ -1453,6 +1468,64 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
     FacePane::value_json(ret, out, 0);
     res_body = std::move(out);
   }
+}
+
+Value route_request(const std::string& method, const std::string& path, const std::string& query, const std::string& body,
+                    const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote) {
+  auto req_m = std::make_shared<MapObj>();
+  req_m->put("method", Value::string(method));
+  req_m->put("path", Value::string(path));
+  req_m->put("query", Value::string(query));
+  req_m->put("body", Value::string(body));
+  auto hdr_m = std::make_shared<MapObj>();
+  for (const auto& [name, value] : headers) {
+    std::string key = name;
+    for (char& c : key) c = (char)std::tolower((unsigned char)c);
+    if (!hdr_m->find(key)) hdr_m->put(key, Value::string(value));   // a repeated header: the first one counts
+  }
+  req_m->put("headers", Value::object(Type::Map, hdr_m));
+  req_m->put("remote", Value::string(remote));
+  return Value::object(Type::Map, req_m);
+}
+
+const Value* route_handler(FacePane* f, const std::string& path) {
+  if (!f || f->routes().type != Type::Map) return nullptr;
+  auto rm = as_map(f->routes());
+  Value* handler = rm ? rm->find(path) : nullptr;
+  if (!handler) handler = rm ? rm->find("*") : nullptr;
+  return handler && is_callable(*handler) ? handler : nullptr;
+}
+}  // namespace
+
+bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
+                           const std::string& query, const std::string& body,
+                           const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
+                           int& status, std::string& res_body, std::string& content_type, std::string& error) {
+  const Value* handler = route_handler(web_face(vm, id), path);
+  if (!handler) return false;
+  std::vector<Value> args = {route_request(method, path, query, body, headers, remote)};
+  Value ret = vm.call(*handler, args, error);
+  if (!error.empty()) return false;
+  route_response(ret, status, res_body, content_type);
+  return true;
+}
+
+bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
+                            const std::string& query, const std::string& body,
+                            const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
+                            RouteJob& job, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f || !f->workers()) return false;
+  const Value* handler = route_handler(f, path);
+  if (!handler) return false;
+  job.call = prepare_worker_call(vm, *handler, {route_request(method, path, query, body, headers, remote)}, error);
+  if (!job.call) { error = "route " + path + ": " + error; return false; }
+  return true;
+}
+
+bool web_pane_route_finish(RouteJob& job, int& status, std::string& res_body, std::string& content_type, std::string& error) {
+  if (!job.call->error.empty()) { error = job.call->error; return false; }
+  route_response(job.call->result, status, res_body, content_type);
   return true;
 }
 

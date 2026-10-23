@@ -1,0 +1,8 @@
+# import "file.gr": run once, relative to the importing file, shared by every importer.
+import "mods/a.gr"
+import("mods/a.gr")
+import "./mods/../mods/a.gr"
+print("A_VALUE", A_VALUE, twice(4))
+let r = pcall(a_fails)
+print("error ok", r.ok)
+print("missing", pcall(fn () { import("mods/nope.gr") }).ok)

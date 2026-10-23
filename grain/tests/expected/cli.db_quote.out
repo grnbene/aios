@@ -1,0 +1,16 @@
+  ok    quote and backslash
+  ok    double quote
+  ok    newline, return, nul, ctrl-z
+  ok    plain text is untouched
+  ok    string literal
+  ok    injection stays a string
+  ok    nil
+  ok    int
+  ok    bool
+  ok    decimal keeps its scale
+  ok    real
+  ok    bytes
+  ok    list for IN
+  ok    empty list matches nothing
+  ok    a map is refused
+db_quote: 15 checks, all agreed

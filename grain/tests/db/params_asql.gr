@@ -26,7 +26,7 @@ check("a ? inside quotes is text, not a parameter", db_query(db, "SELECT '?', id
 check("a ? in a comment is left alone", db_query(db, "SELECT id /* ? */ FROM grain_params.t WHERE id = ? -- ?\n", [2]).rows[0][0] == "2")
 check("too few parameters is an error", not pcall(db_query, db, "SELECT ?, ?", [1]).ok)
 check("too many parameters is an error", not pcall(db_query, db, "SELECT ?", [1, 2]).ok)
-check("an empty list is an error", not pcall(db_query, db, "SELECT 1 FROM grain_params.t WHERE id IN (?)", [[]]).ok)
+check("an empty list is NULL, so IN (?) matches nothing", len(db_query(db, "SELECT 1 FROM grain_params.t WHERE id IN (?)", [[]]).rows) == 0)
 db_query(db, "DROP DATABASE grain_params")
 if fails > 0 { error(str(fails) + " failed") }
 print("all passed")
