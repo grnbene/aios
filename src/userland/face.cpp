@@ -3941,10 +3941,50 @@ int Layout::lay(const Widget& w, int x, int y, int avail_w, int avail_h, size_t 
       if (range <= 0.00001) range = 1.0;
 
       uint32_t color = accent_of(w, kAccent);
+      const bool big = t == "chart";
       int inner_x = x + 8;
       int inner_w = avail_w - 16;
       int inner_y = y + 6;
       int inner_h = h - 12;
+      if (big) {
+        // A chart: its range at the left, as a browser shows it, and the area under the line filled lightly.
+        const std::string prefix = attr_text(w, "prefix", "");
+        auto label = [&](double v) {
+          if (std::fabs(v - std::round(v)) < 1e-9 && std::fabs(v) < 1e15) {
+            std::string d = std::to_string((long long)std::llround(std::fabs(v))), g;
+            for (size_t i = 0; i < d.size(); ++i) { if (i && (d.size() - i) % 3 == 0) g += ','; g += d[i]; }
+            return (v < 0 ? "-" : "") + prefix + g;
+          }
+          return prefix + fmt_num(v);
+        };
+        const web::FontKey lf = font_of(10, false);
+        const std::string top = label(max_v), bottom = label(min_v);
+        const int lw = std::max(text_w(top, lf), text_w(bottom, lf)) + 12;
+        bool cut;
+        text_line(top, x + 8, y + 6, lw, lf, kDim, &w, cut);
+        text_line(bottom, x + 8, y + h - 6 - line_h(lf), lw, lf, kDim, &w, cut);
+        inner_x = x + 8 + lw;
+        inner_w = avail_w - 16 - lw;
+        inner_y = y + 10;
+        inner_h = h - 20;
+        // the fill: the accent laid over the panel at 14%, one column at a time from the line down
+        auto mix = [](uint32_t a, uint32_t b, double f) {
+          auto ch = [&](int sh) { return (uint32_t)(((a >> sh) & 0xFF) * (1 - f) + ((b >> sh) & 0xFF) * f) & 0xFF; };
+          return 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+        };
+        const uint32_t fill = mix(kPanel, color, 0.14);
+        if (inner_w > 2) {
+          for (int cx = 0; cx <= inner_w; ++cx) {
+            const double pos = (double)cx * (points.size() - 1) / inner_w;
+            const size_t i0 = std::min(points.size() - 2, (size_t)pos);
+            const double f = pos - (double)i0;
+            const double v = points[i0] * (1 - f) + points[i0 + 1] * f;
+            int py = inner_y + inner_h - (int)(((v - min_v) / range) * inner_h);
+            py = std::clamp(py, inner_y, inner_y + inner_h);
+            rect(inner_x + cx, py, 1, inner_y + inner_h - py, fill);
+          }
+        }
+      }
 
       int prev_px = inner_x;
       int prev_py = inner_y + inner_h - (int)(((points[0] - min_v) / range) * inner_h);
@@ -3962,7 +4002,7 @@ int Layout::lay(const Widget& w, int x, int y, int avail_w, int avail_h, size_t 
           for (int s = 0; s <= steps; ++s) {
             int lx = prev_px + (dx * s) / steps;
             int ly = prev_py + (dy * s) / steps;
-            rect(lx, ly, 2, 2, color);
+            rect(lx, ly, big ? 3 : 2, big ? 3 : 2, color);
           }
         }
         prev_px = cur_px;
