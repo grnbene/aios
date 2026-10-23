@@ -19087,6 +19087,49 @@ void SqlTable::append_row(const std::vector<std::string>& in_vals) {
   append_row_canonical_impl(this, tls_vals);
 }
 
+// A load's rows, column by column. Each column's store is its own (its dictionary, codes and segments), so the
+// columns of a batch can be filled at once; what is per table - the mutation counters, the layout - is settled
+// here, on one thread, around them. Anything that watches rows as they arrive (a transaction's undo log, a live
+// view) or a column that shares a dictionary with another goes the one-row-at-a-time way.
+void SqlTable::append_rows_bulk(std::vector<std::vector<std::string>>& rows) {
+  if (rows.empty()) return;
+  ensure_columns();
+  compact_delta_buffer();
+  bool serial = !watch_list->empty() || row_undo_on(this) || col_data.size() < 2 || rows.size() < 256;
+  for (const auto& cs : col_data) if (cs.shared_dict) serial = true;
+  if (serial) {
+    for (auto& r : rows) append_row(r);
+    rows.clear();
+    return;
+  }
+  mutation_seq = sql_next_mutation_seq();
+  const size_t ncols = col_data.size();
+  std::atomic<size_t> next{0};
+  std::atomic<bool> recoded{false};
+  auto work = [&]() {
+    for (;;) {
+      const size_t c = next.fetch_add(1);
+      if (c >= ncols) return;
+      ColumnStore& cs = col_data[c];
+      const uint32_t before = cs.recodes;
+      const bool normalise = c < columns.size() && columns[c].type != SqlDataType::Text;
+      for (const auto& r : rows) {
+        if (c >= r.size()) cs.push_back(sql_null());
+        else if (normalise) cs.push_back(sql_normalize_value(columns[c].type, columns[c].scale, r[c]));
+        else cs.push_back(r[c]);
+      }
+      if (cs.recodes != before) recoded.store(true);
+    }
+  };
+  const size_t helpers = std::min<size_t>(ncols, std::max(1u, aios::hal::hardware_threads())) - 1;
+  std::vector<aios::hal::Thread> pool;
+  for (size_t i = 0; i < helpers; ++i) pool.emplace_back(work);
+  work();   // this thread is a lane too
+  for (auto& t : pool) if (t.joinable()) t.join();
+  if (recoded.load()) layout_seq = mutation_seq;
+  rows.clear();
+}
+
 // A row already in each column's canonical form (a query's own output): appended without normalising it again.
 void SqlTable::append_row_canonical(std::vector<std::string> vals) {
   append_row_canonical_impl(this, vals);
@@ -54615,7 +54658,10 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
   StatementLock lock(rw_lock_, true);
   const std::string seed_path = root_path_ + "/seed_positions";
   auto seeds = read_seed_positions(kernel_, seed_path);
-  auto say = [log](const std::string& s) { if (log) log->push_back(s); };
+  auto say = [this, log](const std::string& s) {
+    if (log) log->push_back(s);
+    if (seed_progress_) seed_progress_(s);
+  };
 
   // Which tables need a copy: not in the store at all, or a copy that was
   // interrupted (marked "-").
@@ -54783,7 +54829,12 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
     std::string failure;
     std::vector<int> col_at;
     bool mapped = false;
+    auto last_beat = std::chrono::steady_clock::now();
+    std::vector<std::vector<std::string>> pending;   // rows read but not yet in the table: appended 16k at a time, columns in parallel
+    std::chrono::steady_clock::duration in_store{};   // time spent in this sink, against the wire's share of the stream
+    const auto stream_began = std::chrono::steady_clock::now();
     MariaWireSession::RowSink sink = [&](const std::vector<MariaColumn>& cols, std::vector<MariaValue>& row) -> bool {
+      struct Tally { std::chrono::steady_clock::duration& d; std::chrono::steady_clock::time_point t; ~Tally() { d += std::chrono::steady_clock::now() - t; } } tally{in_store, std::chrono::steady_clock::now()};
       if (!mapped) {
         col_at.assign(cols.size(), -1);
         for (size_t i = 0; i < cols.size(); ++i) col_at[i] = tbl->get_column_index(cols[i].name);
@@ -54793,8 +54844,22 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
       for (size_t i = 0; i < row.size() && i < col_at.size(); ++i)
         if (col_at[i] >= 0) vals[(size_t)col_at[i]] = row[i].is_null ? sql_null() : std::move(row[i].bytes);
       if (pk_col >= 0 && !sql_is_null(vals[(size_t)pk_col])) last_pk = vals[(size_t)pk_col];
-      tbl->append_row(vals);
+      pending.push_back(std::move(vals));
+      if (pending.size() >= 16384) tbl->append_rows_bulk(pending);
       ++rows_copied;
+      // A table of millions of rows is minutes of silence otherwise: say how far it is, every few seconds.
+      if (seed_progress_ && (rows_copied & 0xFFFF) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_beat >= std::chrono::seconds(5)) {
+          last_beat = now;
+          const double total = std::chrono::duration<double>(now - stream_began).count();
+          const double store = std::chrono::duration<double>(in_store).count();
+          char split[96];
+          std::snprintf(split, sizeof split, " (%.0f rows/s; %.0f%% storing, %.0f%% reading the wire)", rows_copied / std::max(total, 0.001),
+                        100.0 * store / std::max(total, 0.001), 100.0 * (total - store) / std::max(total, 0.001));
+          seed_progress_(t + ": " + std::to_string(rows_copied) + " rows so far" + split);
+        }
+      }
       return true;
     };
     std::string select = "SELECT * FROM " + quote_ident(t);
@@ -54809,6 +54874,7 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
       select += " ORDER BY " + quote_ident(pk_name);
     }
     auto streamed = src.query(select, &sink);
+    tbl->append_rows_bulk(pending);   // the last batch - and, after a broken stream, the rows that did arrive
     if (!streamed.ok()) failure = streamed.error().message;
     else if (!streamed->ok) failure = streamed->error_message;
     if (!failure.empty()) {
@@ -54828,6 +54894,7 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
         goto again;
       }
     }
+    const auto streamed_at = std::chrono::steady_clock::now();
     invalidate_table_index(t, database);
     seeding_ = false; bulk_load_ = false;
     if (!failure.empty()) {
@@ -54835,10 +54902,18 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
       continue;
     }
     optimize_table_storage(t, database);
+    const auto optimized_at = std::chrono::steady_clock::now();
     if (!find_view(t, database)) {
       if (SqlTable* seeded_tbl = resolve_table(t, database)) notify_table_reset(*seeded_tbl);
     }
     auto fl = flush_now();                       // the rows are durable before the table is trusted
+    {
+      auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+      char phases[128];
+      std::snprintf(phases, sizeof phases, "%s: streamed in %.1fs, packed in %.1fs, saved in %.1fs", t.c_str(), secs(stream_began, streamed_at),
+                    secs(streamed_at, optimized_at), secs(optimized_at, std::chrono::steady_clock::now()));
+      say(phases);
+    }
     if (!fl.ok()) { say(t + ": copied, but the store did not save: " + fl.error().message); continue; }
     seeds[key] = {table_snap_file, table_snap_pos};
     write_seed_positions(kernel_, seed_path, seeds);

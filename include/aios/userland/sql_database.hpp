@@ -1646,6 +1646,9 @@ struct SqlTable {
   void append_row(const std::vector<std::string>& vals);
   void append_row(const SqlRow& r);
   void append_row_canonical(std::vector<std::string> vals);   // already in each column's form: no normalising
+  // A load's rows (each one a value per column, as append_row takes them), appended column by column with the
+  // columns spread over the cores; the rows are consumed. The same result as append_row for each, in order.
+  void append_rows_bulk(std::vector<std::vector<std::string>>& rows);
   void append_row_hot(const std::vector<std::string>& vals);
   void append_row_hot(const SqlRow& r);
   void compact_delta_buffer() const;
@@ -2156,6 +2159,9 @@ class SqlDatabase {
   Result<size_t> repair_schema_from_source(const std::string& host, uint16_t port, const std::string& user,
                                            const std::string& password, const std::string& database,
                                            const std::vector<std::string>& tables, std::vector<std::string>* log);
+  // Told of each seed line as it happens - including a row count every few seconds while a big table streams -
+  // so a long seed shows it is alive instead of printing its whole log at the end.
+  void set_seed_progress(std::function<void(const std::string&)> f) { seed_progress_ = std::move(f); }
   Result<size_t> seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                   const std::string& password, const std::string& database,
                                   const std::vector<std::string>& tables, std::vector<std::string>* log);
@@ -2285,6 +2291,7 @@ class SqlDatabase {
   std::string active_host_ = "127.0.0.1";
   uint16_t active_port_ = 3306;
   bool bulk_load_ = false;
+  std::function<void(const std::string&)> seed_progress_;
   bool seeding_ = false;                 // seed_from_source: rows go straight to the store, not the redo log
   uint64_t store_generation_ = 0;        // the manifest generation last saved or loaded
   uint64_t checkpoint_seq_ = 0;          // the highest generation snapshotted or seen as a rotated log
