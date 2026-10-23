@@ -550,9 +550,10 @@ int main(int argc, char** argv) {
     // first, each with its binlog point, as compute serve does.
     if (!want.empty()) {
       db.set_mirror_source(SqlDatabase::MirrorSource{bcfg.host, bcfg.port, bcfg.user, bcfg.password, upstream_db, want});
-      std::vector<std::string> seed_log;
-      auto sd = db.seed_from_source(bcfg.host, bcfg.port, bcfg.user, bcfg.password, upstream_db, want, &seed_log);
-      for (const auto& line : seed_log) std::cout << "    seed: " << line << "\n";
+      // Each line as it happens (flushed): a seed of millions of rows is minutes, and its log used to appear only at the end.
+      db.set_seed_progress([](const std::string& line) { std::cout << "    seed: " << line << std::endl; });
+      auto sd = db.seed_from_source(bcfg.host, bcfg.port, bcfg.user, bcfg.password, upstream_db, want, nullptr);
+      db.set_seed_progress(nullptr);
       if (!sd.ok()) std::cerr << "  [!] seed from the upstream failed: " << sd.error().message << "\n";
       else std::cout << "  ✓ Seeded " << *sd << " table(s) from the upstream\n";
     }
