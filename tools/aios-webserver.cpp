@@ -808,6 +808,7 @@ std::shared_ptr<aios::userland::grain::WebUi> webui_for(hal::Host& host, const V
     vm.files = files.get();
     g::install_core_builtins(vm);
     g::install_http_builtins(vm);
+    g::install_db_builtins(vm);
     vm.define_global("args", g::Value::list({}));   // a program written for the command line still loads
     return files;
   };

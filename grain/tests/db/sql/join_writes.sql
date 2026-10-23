@@ -1,0 +1,27 @@
+-- multi-table UPDATE and DELETE, with and without primary keys, NULLs and duplicate rows
+CREATE DATABASE IF NOT EXISTS shop;
+USE shop;
+DROP TABLE IF EXISTS jw_a;
+DROP TABLE IF EXISTS jw_b;
+DROP TABLE IF EXISTS jw_p;
+CREATE TABLE jw_a (k INT, v INT, note VARCHAR(10));
+CREATE TABLE jw_b (k INT, flag INT);
+CREATE TABLE jw_p (id INT PRIMARY KEY, k INT, v INT);
+INSERT INTO jw_a VALUES (1, 10, NULL), (1, 10, NULL), (2, 20, 'x'), (3, NULL, 'y'), (4, 40, NULL);
+INSERT INTO jw_b VALUES (1, 1), (3, 1), (5, 0);
+INSERT INTO jw_p VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300), (4, 9, 900);
+UPDATE jw_a JOIN jw_b ON jw_a.k = jw_b.k SET jw_a.v = 99 WHERE jw_b.flag = 1;
+SELECT k, v, note FROM jw_a ORDER BY k, v, note;
+UPDATE jw_p JOIN jw_b ON jw_p.k = jw_b.k SET jw_p.v = jw_p.v + 1;
+SELECT id, k, v FROM jw_p ORDER BY id;
+UPDATE jw_a, jw_b SET jw_a.note = 'joined' WHERE jw_a.k = jw_b.k AND jw_a.note IS NULL;
+SELECT k, v, note FROM jw_a ORDER BY k, v, note;
+DELETE jw_a FROM jw_a JOIN jw_b ON jw_a.k = jw_b.k;
+SELECT k, v, note FROM jw_a ORDER BY k, v, note;
+DELETE jw_p FROM jw_p JOIN jw_b ON jw_p.k = jw_b.k WHERE jw_b.flag = 1;
+SELECT id, k, v FROM jw_p ORDER BY id;
+SELECT COUNT(*), SUM(v), MIN(k), MAX(k) FROM jw_a;
+INSERT INTO jw_a VALUES (7, NULL, NULL), (7, NULL, NULL);
+INSERT INTO jw_b VALUES (7, 1);
+DELETE jw_a FROM jw_a JOIN jw_b ON jw_a.k = jw_b.k WHERE jw_a.v IS NULL;
+SELECT k, v, note FROM jw_a ORDER BY k, v, note;

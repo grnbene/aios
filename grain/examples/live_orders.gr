@@ -1,0 +1,26 @@
+# Orders, live from ASQL. Nothing here sends, polls or listens: live() keeps the query's answer current (it
+# reruns only when ASQL says the table was written), and every window or browser showing it follows.
+#   grain live_orders.gr            a window
+#   grain serve live_orders.gr      every browser sees the same orders, updated as they change
+# GRAIN_DB=host:port:user:password:database (default 127.0.0.1:3307:erp::shop)
+let spec = getenv("GRAIN_DB")
+if spec == nil { spec = "127.0.0.1:3307:erp::shop" }
+let part = split(spec, ":")
+let db = db_connect(part[0], int(part[1]), part[2], part[3], part[4])
+if not db.ok { error("cannot reach the database: " + db.error) }
+
+let orders = live(db, "SELECT id, customer, qty FROM orders ORDER BY id DESC LIMIT 20")
+
+let p = ui.pane({"title": "Orders (live)", "shared": true, "width": 560, "height": 460, "view": fn () {
+  let units = 0
+  for o in orders.records { units += int(o.qty) }
+  return ui.column({"gap": 12, "pad": 16}, [
+    ui.text("Orders, as they happen", {"size": 20, "bold": true}),
+    ui.row({"gap": 12}, [
+      ui.tile("Orders shown", len(orders.records), {"accent": "ok"}),
+      ui.tile("Units", units),
+      ui.tile("Changes seen", orders.changes)]),
+    orders.error != "" ? ui.text(orders.error, {"color": "#ef6b6b"}) : ui.text("watching: " + orders.watching, {"dim": true}),
+    ui.table(orders.records, {"columns": "id:Order, customer:Customer, qty:Qty:right", "empty": "no orders yet"})])
+}})
+run_panes()

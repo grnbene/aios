@@ -1,0 +1,47 @@
+# The same statements on ASQL and on MariaDB; every SELECT's answer compared.
+#   grain differential.gr <asql port> <asql password> <mariadb port> <mariadb password> <script.sql>...
+# A script is statements separated by ";\n". A line starting "--" is a comment.
+let asql = db_connect("127.0.0.1", int(args[0]), "g", args[1])
+let maria = db_connect("127.0.0.1", int(args[2]), "g", args[3])
+if not asql.ok { error("asql: " + asql.error) }
+if not maria.ok { error("mariadb: " + maria.error) }
+let bad = 0
+let checked = 0
+fn norm(r) {
+  if not r.ok { return "ERROR" }
+  return json_stringify(r.rows)
+}
+for i in range(4, len(args)) {
+  let text = read_file(args[i])
+  let stmts = []
+  for part in split(text, ";\n") {
+    let lines = []
+    for l in split(part, "\n") { if not starts_with(trim(l), "--") { push(lines, l) } }
+    let st = trim(join(lines, "\n"))
+    if st != "" { push(stmts, st) }
+  }
+  for st in stmts {
+    let x = db_query(asql, st)
+    let y = db_query(maria, st)
+    let is_select = starts_with(upper(st), "SELECT")
+    if is_select {
+      checked += 1
+      if norm(x) != norm(y) {
+        bad += 1
+        print("DIFF " + args[i] + ": " + st)
+        print("  asql:    " + (x.ok ? norm(x) : x.error))
+        print("  mariadb: " + (y.ok ? norm(y) : y.error))
+      }
+    } else if x.ok != y.ok {
+      bad += 1
+      print("DIFF " + args[i] + " (one refused): " + st)
+      print("  asql:    " + (x.ok ? "ok, " + str(x.affected_rows) + " row(s)" : x.error))
+      print("  mariadb: " + (y.ok ? "ok, " + str(y.affected_rows) + " row(s)" : y.error))
+    } else if x.ok and x.affected_rows != y.affected_rows {
+      bad += 1
+      print("DIFF " + args[i] + " (rows affected): " + st + "  asql " + str(x.affected_rows) + ", mariadb " + str(y.affected_rows))
+    }
+  }
+}
+print(bad == 0 ? "ok   " + str(checked) + " answers the same on ASQL and MariaDB" : "FAIL " + str(bad) + " difference(s)")
+if bad > 0 { error("differential failed") }

@@ -306,11 +306,15 @@ int main() {
     g_failures++;
   }
 
+  // MariaDB updates a join view's columns when they all come from one table (it updates dispatch's two rows here,
+  // checked against MariaDB 10.11), even with no primary key on it.
   auto upd_view = db.execute_local_query("UPDATE v_order_dispatch SET dispatch_cleared = 1;");
-  if (!upd_view.success && upd_view.error_message.find("not updatable") != std::string::npos) {
-    std::cout << "  [ok] UPDATE on VIEW rejected\n";
+  auto upd_check = db.execute_local_query("SELECT COUNT(*) FROM dispatch WHERE cleared = 1;");
+  if (upd_view.success && upd_view.rows_affected == 2 && upd_check.success && !upd_check.rows.empty() &&
+      upd_check.rows[0].values[0] == "3") {
+    std::cout << "  [ok] UPDATE through a join VIEW updates its base table, as MariaDB does\n";
   } else {
-    std::cout << "  [FAIL] UPDATE on VIEW: " << upd_view.error_message << "\n";
+    std::cout << "  [FAIL] UPDATE on VIEW: " << (upd_view.success ? "updated " + std::to_string(upd_view.rows_affected) + " row(s)" : upd_view.error_message) << "\n";
     g_failures++;
   }
 

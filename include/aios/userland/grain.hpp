@@ -531,6 +531,9 @@ void install_socket_builtins(Vm& vm);
 // verifies against <root>/ssl/ca-certificates.crt when present, else the
 // system's store; the root is process-wide and set once by the embedder.
 void install_http_builtins(Vm& vm);
+// db_connect, db_query, db_close and live(): the MySQL/MariaDB/ASQL wire protocol, and query results that stay
+// current (grain_std_db.cpp). Like http, the network is a capability the embedder grants.
+void install_db_builtins(Vm& vm);
 void set_http_trust_root(const std::string& root);
 
 // Windowing & Canvas Pane Registration API (register_pane, pane_render, pane_dispatch_event, ...)

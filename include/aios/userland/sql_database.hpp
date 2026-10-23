@@ -906,6 +906,10 @@ struct ColumnStore {
   bool sorted_built = false;
 
   // Cached numeric representations for dictionary entries:
+  // Everything derived from the dictionary's entries by position - the value -> code index, the numeric
+  // readings per code, the sorted order. Whatever clears or rewrites the dictionary drops these with it: they
+  // are rebuilt on use, and a stale one answers for a different value at the same code.
+  void drop_dict_derived();
   mutable std::vector<double> dict_doubles;
   mutable std::vector<uint8_t> dict_doubles_valid;
   mutable std::vector<int64_t> dict_ints;

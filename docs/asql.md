@@ -389,6 +389,17 @@ engine writes the file owner-only (0600) whenever it saves it, as
 
 ---
 
+## `ASQL_CHANGES()`: has a table been written
+
+`SELECT ASQL_CHANGES('orders', 'order_lines')` returns a token that changes
+whenever any of the named tables is written: an INSERT moves its row count, an
+UPDATE the written column's version, a DELETE (or a rebuild) the table's
+`mutation_seq`, and the token carries all three per table. A table that does not
+exist reads as `-`. It reads no rows, and the statement is never cached (the
+query cache would otherwise keep its first answer, since the statement names no
+table in a FROM). grain's `live()` asks it every tick and reruns its query only
+when it moves.
+
 ## Write modes: local, write-through, write-behind
 
 `WriteSyncMode` has three values (`sql_database.hpp:26`). What each one does is

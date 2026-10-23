@@ -1,0 +1,72 @@
+# Random writes against ASQL; after each, a battery of queries (ORDER BY on numbers and text, MIN/MAX of both,
+# GROUP BY, COUNT(DISTINCT), equality lookups, SUM) checked against what grain works out from the rows themselves.
+#   grain query_fuzz.gr <port> <password> [steps] [seed]
+let a = db_connect("127.0.0.1", int(args[0]), "g", args[1], "shop")
+let steps = len(args) > 2 ? int(args[2]) : 300
+let seed = len(args) > 3 ? int(args[3]) : 7
+fn rnd(n) { seed = (seed * 1103515245 + 12345) % 2147483648 return seed % n }
+fn rows(q) { let r = db_query(a, q) if not r.ok { error(q + ": " + r.error) } return r.rows }
+db_query(a, "DROP TABLE IF EXISTS qf")
+db_query(a, "CREATE TABLE qf (id INT PRIMARY KEY, v INT, s VARCHAR(12))")
+let bad = 0
+fn expect(step, what, got, want) {
+  if got != want {
+    bad += 1
+    if bad <= 8 { print("BAD step", step, what, "got", got, "want", want) }
+  }
+}
+for step in range(0, steps) {
+  let op = rnd(12)
+  let st = ""
+  if op < 5 { let v = rnd(30) st = "INSERT IGNORE INTO qf VALUES (" + str(rnd(80)) + ", " + str(v) + ", 'k" + str(rnd(15)) + "')" }
+  else if op < 7 { st = "DELETE FROM qf WHERE id = " + str(rnd(80)) }
+  else if op < 8 { st = "DELETE FROM qf WHERE s = 'k" + str(rnd(15)) + "'" }
+  else if op < 9 and rnd(3) == 0 { st = "DELETE FROM qf" }
+  else if op < 11 { st = "UPDATE qf SET v = " + str(rnd(30)) + " WHERE id = " + str(rnd(80)) }
+  else { st = "UPDATE qf SET s = 'k" + str(rnd(15)) + "' WHERE id = " + str(rnd(80)) }
+  db_query(a, st)
+  # the rows, read the plainest way
+  let data = rows("SELECT id + 0, v + 0, CONCAT(s, '') FROM qf")
+  let ids = []
+  let vs = []
+  let ss = []
+  let sum = 0
+  let groups = {}
+  for r in data {
+    push(ids, int(r[0])) push(vs, int(r[1])) push(ss, r[2]) sum += int(r[1])
+    groups[r[2]] = (groups[r[2]] == nil ? 0 : groups[r[2]]) + 1
+  }
+  ids = sort(ids)
+  let sorted_s = sort(ss)
+  let distinct = keys(groups)
+  let gl = []
+  for k in sort(distinct) { push(gl, [k, str(groups[k])]) }
+  # what the engine says
+  let got_ids = []
+  for r in rows("SELECT id FROM qf ORDER BY id") { push(got_ids, int(r[0])) }
+  expect(step, "ORDER BY id", got_ids, ids)
+  let got_s = []
+  for r in rows("SELECT s FROM qf ORDER BY s, id") { push(got_s, r[0]) }
+  expect(step, "ORDER BY s", got_s, sorted_s)
+  let mm = rows("SELECT MIN(id), MAX(id), MIN(s), MAX(s), MIN(v), MAX(v), COUNT(*), SUM(v), COUNT(DISTINCT s) FROM qf")[0]
+  if len(ids) > 0 {
+    let svs = sort(vs)
+    expect(step, "MIN/MAX/COUNT/SUM/DISTINCT", mm, [str(ids[0]), str(ids[len(ids) - 1]), sorted_s[0], sorted_s[len(sorted_s) - 1], str(svs[0]), str(svs[len(svs) - 1]), str(len(ids)), str(sum), str(len(distinct))])
+  } else {
+    expect(step, "aggregates of nothing", mm, [nil, nil, nil, nil, nil, nil, "0", nil, "0"])
+  }
+  expect(step, "GROUP BY s", rows("SELECT s, COUNT(*) FROM qf GROUP BY s ORDER BY s"), gl)
+  let probe = "k" + str(rnd(15))
+  let n_probe = groups[probe] == nil ? 0 : groups[probe]
+  expect(step, "WHERE s = " + probe, rows("SELECT COUNT(*) FROM qf WHERE s = '" + probe + "'")[0][0], str(n_probe))
+  let pv = rnd(30)
+  let n_pv = 0
+  for x in vs { if x == pv { n_pv += 1 } }
+  expect(step, "WHERE v = " + str(pv), rows("SELECT COUNT(*) FROM qf WHERE v = " + str(pv))[0][0], str(n_pv))
+  let pid = rnd(80)
+  let has = 0
+  for x in ids { if x == pid { has = 1 } }
+  expect(step, "WHERE id = " + str(pid), rows("SELECT COUNT(*) FROM qf WHERE id = " + str(pid))[0][0], str(has))
+}
+print(bad == 0 ? "ok   " + str(steps) + " random steps, every query right" : "FAIL " + str(bad) + " wrong answers")
+if bad > 0 { error("query fuzz failed") }
