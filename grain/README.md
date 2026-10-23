@@ -70,8 +70,8 @@ serve`, aios-webserver. A window redraws every frame, so a change shows at once.
 For a browser or a native client the server does the watching: when the data
 behind a view changes - a timer, another viewer pressing a button, anything - the
 widgets are re-rendered, and if the screen is different every viewer is sent it
-(server-sent events for a browser, one cheap "has it changed" request a quarter
-second for `grain open`). A change that does not alter the screen sends nothing.
+(server-sent events, to a browser and to `grain open` alike; a native client asks
+only when a server will not stream). A change that does not alter the screen sends nothing.
 
 A pane made with `"shared": true` is one copy of the program for everyone, so
 every viewer sees the same live data and one viewer's change reaches the others
@@ -82,6 +82,23 @@ A view that reads the clock instead of data (an uptime computed inside `view`)
 has nothing that changes, so give the pane `"refresh": n` and the server looks
 again every n seconds. `examples/live.gr` is the model: data that changes, a
 view that shows it.
+
+## Streams a server pushes
+
+```grain
+let id = events("https://example.com/feed", {"headers": {"authorization": token}}, fn (data) {
+  latest = json_parse(data)          # each event's data, on the program's own thread
+})
+events_close(id)
+```
+
+`events` holds a server-sent-events connection on a thread of its own (HTTP or
+HTTPS, chunked or not) and hands each event's data to the function as it
+arrives, through the same loop that fires timers - a window's frames, `grain
+serve`, the web server, or `wait()`. A dropped connection is made again a second
+later; a refused one is reported once, as `{"error": ...}`. `grain open` follows a
+served program this way: the server pushes the new widgets and the window draws
+them, with nothing asked.
 
 ## Databases, and live query results
 

@@ -165,6 +165,9 @@ Value bi_http_request(Vm&, std::vector<Value>& args, std::string& error) {
 
 }  // namespace
 
+std::string grain_http_trust_root() { return trust_root(); }
+void install_events_builtins(Vm& vm);   // grain_std_events.cpp
+
 void set_http_trust_root(const std::string& root) {
   std::lock_guard<std::mutex> lk(g_root_mu);
   g_trust_root = root;
@@ -174,6 +177,7 @@ void install_http_builtins(Vm& vm) {
   vm.define_native("http_get", 1, 2, bi_http_get);
   vm.define_native("http_post", 2, 3, bi_http_post);
   vm.define_native("http_request", 1, 1, bi_http_request);
+  install_events_builtins(vm);   // server-sent events: the same capability, a stream instead of one answer
 }
 
 }  // namespace aios::userland::grain

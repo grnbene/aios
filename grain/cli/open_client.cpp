@@ -93,6 +93,7 @@ fn take(d) {
   if d == nil { return nil }
   if d.error != nil { notice = d.error }
   if d.tree == nil { return nil }
+  if d.seq != nil and d.seq < seq { return nil }   # older than what is shown (the stream got there first)
   seq = d.seq
   if tree != nil { updates += 1 }
   tree = d.tree
@@ -118,7 +119,9 @@ if first == nil { error("grain open: " + notice) }
 info = {"title": first.title, "width": first.width, "height": first.height}
 take(first)
 
-# The server tells us when the data changed - a timer there, another viewer, anything - and the window follows.
+# The server tells us when the data changed - a timer there, another viewer, anything - and the window follows:
+# it pushes the new widgets down a held connection (events). A server that will not stream is asked instead.
+let polling = false
 fn poll() {
   let sep = url == nil ? "?" : (find(url, "?") >= 0 ? "&" : "?")
   take(call_server("GET", "", url + sep + "poll=" + str(seq)))
@@ -131,7 +134,16 @@ fn view(f) {
 }
 
 pane = ui.pane({"title": info.title == "" ? url : info.title, "width": info.width, "height": info.height, "view": view})
-every(0.25, poll)
+let stream_headers = {"accept": "text/event-stream, application/x-grain-ui", "x-grain-ui": "1"}
+if cookie != "" { stream_headers["cookie"] = cookie }
+events(url, {"headers": stream_headers}, fn (data) {
+  if type(data) == "map" {      # the stream was refused: ask instead
+    if not polling { polling = true every(0.25, poll) }
+    return nil
+  }
+  let d = pcall(fn () { return json_parse(data) })
+  if d.ok and type(d.value) == "map" and d.value.seq > seq { take(d.value) }   # sequences only rise: an older frame than the one shown is stale
+})
 for e in script { e["pane"] = pane.id }
 if max_frames > 0 or len(script) > 0 { run_panes({"frames": max_frames > 0 ? max_frames : 60, "script": script}) }
 else { run_panes() }
