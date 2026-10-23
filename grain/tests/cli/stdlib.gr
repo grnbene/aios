@@ -113,4 +113,14 @@ check("rmdir outer", rmdir(d), true)
 check("gone", is_dir(d), false)
 check("abspath is absolute", path_join("rel", abspath("x")) == abspath("x"), true)
 
+print("integer division")
+check("idiv", idiv(7, 2), 3)
+check("idiv exact", idiv(8, 2), 4)
+check("idiv truncates toward zero", idiv(-7, 2), -3)
+check("idiv negative divisor", idiv(7, -2), -3)
+check("idiv matches %", idiv(-7, 2) * 2 + -7 % 2, -7)
+check("idiv min / -1 wraps", idiv(-9223372036854775807 - 1, -1), -9223372036854775807 - 1)
+check("idiv by zero", fails(fn () { return idiv(1, 0) }), true)
+check("idiv wants integers", fails(fn () { return idiv(7.5, 2) }), true)
+
 if failures == 0 { print("stdlib:", checks, "checks, all agreed") } else { print("stdlib:", failures, "of", checks, "WRONG") }

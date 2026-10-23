@@ -83,4 +83,13 @@ directories
   ok    rmdir outer
   ok    gone
   ok    abspath is absolute
-stdlib: 79 checks, all agreed
+integer division
+  ok    idiv
+  ok    idiv exact
+  ok    idiv truncates toward zero
+  ok    idiv negative divisor
+  ok    idiv matches %
+  ok    idiv min / -1 wraps
+  ok    idiv by zero
+  ok    idiv wants integers
+stdlib: 87 checks, all agreed

@@ -343,6 +343,21 @@ Value bi_abs(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::real(std::fabs(args[0].d));
 }
 
+// `/` always gives a real, so whole-number division is its own call. It
+// truncates toward zero, which is what makes idiv(a, b) * b + a % b == a.
+// Integers only, as for the bit operations: idiv(7.5, 2) is an error, not a
+// quiet truncation.
+Value bi_idiv(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Int || args[1].type != Type::Int) {
+    error = std::string("idiv() takes integers, got ") + type_name(args[0].type) + " and " + type_name(args[1].type);
+    return Value::nil();
+  }
+  if (args[1].i == 0) { error = "idiv(): division by zero"; return Value::nil(); }
+  // INT64_MIN / -1 traps on x86 (SIGFPE); arithmetic wraps, so it stays INT64_MIN.
+  if (args[1].i == -1) return Value::integer((int64_t)(0 - (uint64_t)args[0].i));
+  return Value::integer(args[0].i / args[1].i);
+}
+
 Value bi_min(Vm&, std::vector<Value>& args, std::string& error) {
   const Value* best = nullptr;
   auto consider = [&](const Value& v) { if (!best || v.as_double() < best->as_double()) best = &v; };
@@ -5883,6 +5898,7 @@ void install_core_builtins(Vm& vm) {
 
   // Math
   vm.define_native("abs", 1, 1, bi_abs);
+  vm.define_native("idiv", 2, 2, bi_idiv);
   vm.define_native("min", 1, -1, bi_min);
   vm.define_native("max", 1, -1, bi_max);
   vm.define_native("floor", 1, 1, bi_floor);
