@@ -303,9 +303,13 @@ the scripted input first - the window test does this headless with
 
 Windows on Linux need nothing: grain speaks the X11 protocol itself (it also
 works on Wayland desktops, through XWayland), so there is no library to install.
-On macOS and Windows grain still uses SDL2 when it is built with it (`brew
-install sdl2`, `vcpkg install sdl2:x64-windows-static`); without it grain builds
-the same and `run_panes()` says it has no display. Linux typed text is the key's
+On Windows grain calls the Win32 API directly (user32 and gdi32, which are part
+of Windows): no library there either, and typed text is what the keyboard's
+layout types, Cyrillic, AltGr and characters outside the BMP included.
+`scripts/grain-win-check.sh` cross-compiles grain with MinGW and drives a real
+window under Wine. On macOS grain still uses SDL2 when it is built with it
+(`brew install sdl2`); without it grain builds the same and `run_panes()` says
+it has no display. Linux typed text is the key's
 own character in the active keyboard layout (the display's layout switch, e.g.
 Alt+Shift, picks it; shift, caps lock and AltGr apply, and Cyrillic, Greek,
 Arabic, Hebrew and the other layouts' keys type their own letters). Several
@@ -437,8 +441,8 @@ than run.
   strict signature check, so it cannot be notarized. `--app` leaves the
   runtime untouched and puts the program in `Contents/Resources`; sign and
   notarize the .app as any other.
-- **Programs with windows**: on Linux nothing is needed beyond the file. On macOS
-  and Windows a program that opens windows needs SDL2 wherever it runs, unless
+- **Programs with windows**: on Linux and Windows nothing is needed beyond the
+  file. On macOS a program that opens windows needs SDL2 wherever it runs, unless
   grain was built with `-DGRAIN_SDL2_STATIC=ON`, which compiles SDL2 2.32.10
   from its release and links it in. Use that for releases.
 

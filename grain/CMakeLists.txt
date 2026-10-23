@@ -114,7 +114,7 @@ target_link_libraries(grain_lang PUBLIC Threads::Threads)
 # The host layer without the telemetry it feeds aios's world model (src/hal/linux_host.cpp).
 target_compile_definitions(grain_lang PRIVATE AIOS_HAL_HOST_ONLY)
 if(WIN32)
-  target_link_libraries(grain_lang PUBLIC ws2_32)   # win_net.cpp: Winsock
+  target_link_libraries(grain_lang PUBLIC ws2_32 bcrypt crypt32 iphlpapi)   # Winsock; random bytes; the system trust store; interfaces - all part of Windows
   target_compile_definitions(grain_lang PUBLIC NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 if(MSVC)
@@ -130,9 +130,11 @@ target_link_libraries(grain PRIVATE grain_lang ${CMAKE_DL_LIBS})
 
 # Windows for panes (run_panes). On Linux grain speaks the X11 protocol itself
 # (cli/display_x11.cpp): no library, and the same on Wayland through XWayland.
-# Elsewhere SDL2 is used until grain has its own window code there.
+# On Windows it calls the Win32 API (cli/display_win32.cpp): user32 and gdi32 are
+# the operating system, not a library. On macOS SDL2 is used until grain has its
+# own Cocoa code.
 set(GRAIN_NATIVE_DISPLAY OFF)
-if(UNIX AND NOT APPLE)
+if((UNIX AND NOT APPLE) OR WIN32)
   set(GRAIN_NATIVE_DISPLAY ON)
 endif()
 
@@ -176,7 +178,12 @@ elseif(GRAIN_WITH_SDL2)
     endif()
   endif()
 endif()
-if(GRAIN_NATIVE_DISPLAY)
+if(GRAIN_NATIVE_DISPLAY AND WIN32)
+  target_sources(grain PRIVATE cli/display_win32.cpp)
+  target_link_libraries(grain PRIVATE user32 gdi32)
+  target_compile_definitions(grain PRIVATE GRAIN_HAVE_WIN32)
+  message(STATUS "grain: panes show as windows (Win32 API, no library)")
+elseif(GRAIN_NATIVE_DISPLAY)
   target_sources(grain PRIVATE cli/display_x11.cpp)
   target_compile_definitions(grain PRIVATE GRAIN_HAVE_X11)
   message(STATUS "grain: panes show as windows (X11 protocol, no library)")

@@ -149,7 +149,8 @@ std::string self_path() {
     if (n < buf.size()) { buf.resize(n); break; }
     buf.resize(buf.size() * 2);
   }
-  return fs::path(buf).u8string();
+  const auto u8 = fs::path(buf).u8string();   // char8_t in C++20
+  return std::string(u8.begin(), u8.end());
 #elif defined(__APPLE__)
   uint32_t size = 0;
   _NSGetExecutablePath(nullptr, &size);
