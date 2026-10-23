@@ -1,4 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
+# A static library reached by several paths (aios, through aios_git_cli and aios_sh_lib) is named once on the link
+# line where the linker needs it once; Apple's ld warned "ignoring duplicate libraries" for every executable.
+if(POLICY CMP0156)
+  cmake_policy(SET CMP0156 NEW)
+endif()
+# On macOS the libraries taken from Homebrew (zstd, libdeflate) are built for the macOS they were installed on, so a
+# binary that links them runs on that macOS and later, whatever older default the SDK names; the linker said so once
+# per object. Say the same up front. -DCMAKE_OSX_DEPLOYMENT_TARGET or MACOSX_DEPLOYMENT_TARGET still decides.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+  execute_process(COMMAND sw_vers -productVersion OUTPUT_VARIABLE AIOS_MACOS_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REGEX MATCH "^[0-9]+" AIOS_MACOS_MAJOR "${AIOS_MACOS_VERSION}")
+  if(AIOS_MACOS_MAJOR)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${AIOS_MACOS_MAJOR}.0" CACHE STRING "Minimum macOS the binaries run on" FORCE)
+  endif()
+endif()
 project(aios LANGUAGES CXX C)
 
 # AIOS — a software computer architecture. Phase 1 runs on a Linux host; the

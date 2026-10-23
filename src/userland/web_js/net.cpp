@@ -98,7 +98,7 @@ struct HeadersObject final : HostObject {
   HeadersObject() : HostObject(HostKind::Headers) {}
   std::vector<std::pair<std::string, std::string>> items;   // names lower-cased
 
-  std::string get(const std::string& name) const {
+  std::string header_get(const std::string& name) const {
     std::string out;
     bool any = false;
     for (const auto& kv : items)
@@ -109,7 +109,7 @@ struct HeadersObject final : HostObject {
     for (const auto& kv : items) if (kv.first == name) return true;
     return false;
   }
-  void set(const std::string& name, const std::string& value) {
+  void header_set(const std::string& name, const std::string& value) {
     bool placed = false;
     for (size_t i = 0; i < items.size(); ++i) {
       if (items[i].first != name) continue;
@@ -189,7 +189,7 @@ void install_headers(Page& P) {
     HeadersObject* h = this_headers(*pp, a);
     if (!h) return Value::Exception();
     const std::string name = lower(arg_text(*pp, a, 0));
-    return h->has(name) ? str_val(*pp, h->get(name)) : Value::Null();
+    return h->has(name) ? str_val(*pp, h->header_get(name)) : Value::Null();
   });
   def_method(P, hp, "has", 1, [pp](Context&, CallArgs& a) -> Value {
     HeadersObject* h = this_headers(*pp, a);
@@ -199,7 +199,7 @@ void install_headers(Page& P) {
   def_method(P, hp, "set", 2, [pp](Context&, CallArgs& a) -> Value {
     HeadersObject* h = this_headers(*pp, a);
     if (!h) return Value::Exception();
-    h->set(lower(arg_text(*pp, a, 0)), trim(arg_text(*pp, a, 1)));
+    h->header_set(lower(arg_text(*pp, a, 0)), trim(arg_text(*pp, a, 1)));
     return Value::Undefined();
   });
   def_method(P, hp, "append", 2, [pp](Context&, CallArgs& a) -> Value {
@@ -223,12 +223,12 @@ void install_headers(Page& P) {
     return make_array(*pp, out);
   });
   // iteration: sorted by name, duplicates combined, as the spec has it
-  auto sorted = [pp](HeadersObject* h) {
+  auto sorted = [](HeadersObject* h) {
     std::vector<std::pair<std::string, std::string>> out;
     std::vector<std::string> names;
     for (const auto& kv : h->items) if (std::find(names.begin(), names.end(), kv.first) == names.end()) names.push_back(kv.first);
     std::sort(names.begin(), names.end());
-    for (const auto& n : names) out.emplace_back(n, h->get(n));
+    for (const auto& n : names) out.emplace_back(n, h->header_get(n));
     return out;
   };
   auto iter = [pp, sorted](CallArgs& a, int kind) -> Value {
@@ -1172,8 +1172,8 @@ ResponseObject* new_response(Page& P, int status, const std::string& status_text
   r->url = url;
   r->body = body;
   r->headers = new_headers(P);
-  if (!content_type.empty()) r->headers->set("content-type", content_type);
-  r->headers->set("content-length", std::to_string(body.size()));
+  if (!content_type.empty()) r->headers->header_set("content-type", content_type);
+  r->headers->header_set("content-length", std::to_string(body.size()));
   return r;
 }
 
@@ -1256,11 +1256,11 @@ void install_body_methods(Page& P, Object* proto, bool is_response) {
       if (is_response) {
         ResponseObject* r = this_response(*pp, a);
         if (!r) return Value::Exception();
-        return read_body(*pp, r->body, r->headers->get("content-type"), how, &r->body_used, c);
+        return read_body(*pp, r->body, r->headers->header_get("content-type"), how, &r->body_used, c);
       }
       RequestObject* r = this_request(*pp, a);
       if (!r) return Value::Exception();
-      return read_body(*pp, r->body, r->headers->get("content-type"), how, &r->body_used, c);
+      return read_body(*pp, r->body, r->headers->header_get("content-type"), how, &r->body_used, c);
     });
   }
 }
@@ -1304,7 +1304,7 @@ void install_response(Page& P) {
       if (!pp->ctx.get(init, pp->ctx.atom_ascii("headers"), &h)) return Value::Exception();
       HeadersObject* extra = new_headers(*pp);
       if (!fill_headers(*pp, extra, h)) return Value::Exception();
-      for (auto& kv : extra->items) r->headers->set(kv.first, kv.second);
+      for (auto& kv : extra->items) r->headers->header_set(kv.first, kv.second);
     }
     return Value::Obj(r);
   });
@@ -1322,7 +1322,7 @@ void install_response(Page& P) {
   });
   def_method(P, ctor, "redirect", 1, [pp](Context&, CallArgs& a) -> Value {
     ResponseObject* r = new_response(*pp, a.argc > 1 ? static_cast<int>(pp->number(a[1])) : 302, "Found", "", "", "");
-    r->headers->set("location", arg_text(*pp, a, 0));
+    r->headers->header_set("location", arg_text(*pp, a, 0));
     return Value::Obj(r);
   });
   install_body_methods(P, rp, true);
@@ -1440,7 +1440,7 @@ void install_request(Page& P) {
         std::string ct;
         if (!encode_body(*pp, v, &r->body, &ct)) return false;
         r->has_body = true;
-        if (!ct.empty() && !r->headers->has("content-type")) r->headers->set("content-type", ct);
+        if (!ct.empty() && !r->headers->has("content-type")) r->headers->header_set("content-type", ct);
       }
       if (!field("signal", &v)) return false;
       if (!v.is_undefined()) r->signal = v;
@@ -1705,7 +1705,7 @@ void install_xhr(Page& P) {
       x->status = ok ? 200 : 0;
       x->response_text = data;
       x->response_url = x->url;
-      x->resp_headers->set("content-type", type);
+      x->resp_headers->header_set("content-type", type);
     } else if (pp->fetch) {
       auto got = pp->fetch(x->url, opt);
       if (got.ok()) {
@@ -1713,8 +1713,8 @@ void install_xhr(Page& P) {
         x->status = got->status > 0 ? got->status : 200;
         x->response_text.assign(got->body.begin(), got->body.end());
         x->response_url = got->final_url.empty() ? x->url : got->final_url;
-        if (!got->content_type.empty()) x->resp_headers->set("content-type", got->content_type);
-        x->resp_headers->set("content-length", std::to_string(got->body.size()));
+        if (!got->content_type.empty()) x->resp_headers->header_set("content-type", got->content_type);
+        x->resp_headers->header_set("content-length", std::to_string(got->body.size()));
         line += "  -> " + std::to_string(x->status) + ", " + std::to_string(got->body.size()) + " bytes";
       } else {
         line += "  -> " + got.error().message;
@@ -1734,7 +1734,7 @@ void install_xhr(Page& P) {
     } else if (rt == "arraybuffer") {
       x->response = blob_arraybuffer_value(*pp, x->response_text);
     } else if (rt == "blob") {
-      x->response = Value::Obj(new_blob(*pp, x->response_text, x->resp_headers->get("content-type")));
+      x->response = Value::Obj(new_blob(*pp, x->response_text, x->resp_headers->header_get("content-type")));
     } else {
       x->response = str_val(*pp, x->response_text);
     }
@@ -1767,7 +1767,7 @@ void install_xhr(Page& P) {
     XhrObject* x = this_xhr(*pp, a);
     if (!x) return Value::Exception();
     const std::string n = lower(arg_text(*pp, a, 0));
-    return x->ready >= 2 && x->resp_headers->has(n) ? str_val(*pp, x->resp_headers->get(n)) : Value::Null();
+    return x->ready >= 2 && x->resp_headers->has(n) ? str_val(*pp, x->resp_headers->header_get(n)) : Value::Null();
   });
   def_method(P, xp, "getAllResponseHeaders", 0, [pp](Context&, CallArgs& a) -> Value {
     XhrObject* x = this_xhr(*pp, a);

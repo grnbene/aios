@@ -95,7 +95,6 @@ class NetStack {
  private:
   friend class TcpSocket;
   std::unique_ptr<Impl> d_;
-  FrameDevice& dev_;
   NetConfig cfg_;
   NetStats stats_;
   bool up_ = false;

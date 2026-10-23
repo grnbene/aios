@@ -1408,7 +1408,7 @@ bool SatSolver::walk() {
   walk_props_mark_ = stats_.propagations;
   uint64_t ticks = 0;
   std::vector<double> probs;
-  for (uint64_t f = 0; ticks < budget && !unsat.empty(); ++f) {
+  while (ticks < budget && !unsat.empty()) {
     const uint32_t k = unsat[(size_t)(rng.next() % unsat.size())];
     const CRef c = cls[k];
     const uint32_t sz = csize(c);

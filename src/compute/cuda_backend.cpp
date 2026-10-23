@@ -35,7 +35,6 @@ constexpr CUresult CUDA_SUCCESS_ = 0;
 // a guess, and are spelled here because nothing links against the SDK.
 constexpr int ATTR_MULTIPROCESSOR_COUNT = 16;
 constexpr int ATTR_CLOCK_RATE = 13;               // kHz
-constexpr int ATTR_WARP_SIZE = 10;
 constexpr int ATTR_MAX_THREADS_PER_BLOCK = 1;
 constexpr int ATTR_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr int ATTR_COMPUTE_CAPABILITY_MINOR = 76;

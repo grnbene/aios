@@ -798,15 +798,6 @@ std::string pad_right(const std::string& s, size_t width) {
   return s + std::string(width - s.size(), ' ');
 }
 
-inline uint64_t fnv1a_hash(const std::string& s) {
-  uint64_t h = 14695981039346656037ULL;
-  for (char c : s) {
-    h ^= static_cast<uint8_t>(c);
-    h *= 1099511628211ULL;
-  }
-  return h;
-}
-
 thread_local std::string tls_session_database;
 
 // One row change a transaction (or an undo frame) made, kept so a ROLLBACK can take back exactly that change and
@@ -6800,22 +6791,6 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
     }
   }
   return out;
-}
-
-inline NestedResult run_nested_select(SqlDatabase* db, const std::string& sql,
-                                      const EvalCtx& outer) {
-  if (!db) {
-    NestedResult out;
-    out.error = "no database for subquery";
-    return out;
-  }
-  ParsedSelectStatement parsed = parse_select_sql(sql);
-  if (!parsed.ok) {
-    NestedResult out;
-    out.error = parsed.error.empty() ? std::string("subquery parse failed") : parsed.error;
-    return out;
-  }
-  return run_nested_parsed_select(db, parsed, outer);
 }
 
 // Evaluates a subquery once and, when it turned out to read nothing from the
@@ -18405,7 +18380,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     constexpr size_t kSampleBlocks = 32;   // of the store's own kBlockRows
     const size_t nblocks = (row_count_ + kBlockRows - 1) / kBlockRows;
     const size_t take = std::min(nblocks, kSampleBlocks);
-    size_t sample_rows = 0, block_bytes = 0, plain_bytes = 0;
+    size_t sample_rows = 0, block_bytes = 0;
     std::vector<std::string_view> sample;
     std::vector<uint8_t> raw;
     for (size_t k = 0; k < take; ++k) {
@@ -18420,7 +18395,6 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       }
       whole.insert(whole.end(), raw.begin(), raw.end());
       block_bytes += lz4_compress(whole.data(), whole.size()).size();
-      plain_bytes += raw.size();
       sample_rows += count;
     }
     SymbolCoder coder;
@@ -32551,12 +32525,6 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
       for (size_t i = 0; i < n; ++i) out[i] = (live && !live[i]) ? kF : tri_of(eval_expr(p.expr, ev.at(start + i)));
       return;
   }
-}
-
-bool pred_has_row_eval(const Pred& p) {
-  if (p.kind == Pred::Row) return true;
-  for (const auto& k : p.kids) if (pred_has_row_eval(k)) return true;
-  return false;
 }
 
 static inline void mask_out_nulls(const ColumnStore& cs, size_t start, size_t n, uint64_t* mask_out) {

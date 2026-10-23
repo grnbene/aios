@@ -198,7 +198,7 @@ struct ParseError {
 
 class Parser {
  public:
-  Parser(const std::u16string& src, bool unicode, bool vmode, bool icase, Program& prog) : s_(src), unicode_(unicode), vmode_(vmode), icase_(icase), prog_(prog) {}
+  Parser(const std::u16string& src, bool unicode, bool vmode, Program& prog) : s_(src), unicode_(unicode), vmode_(vmode), prog_(prog) {}
 
   Node* parse(std::string* err) {
     prescan();
@@ -221,7 +221,7 @@ class Parser {
  private:
   const std::u16string& s_;
   size_t pos_ = 0;
-  bool unicode_, vmode_, icase_;
+  bool unicode_, vmode_;
   Program& prog_;
   bool failed_ = false;
   std::string error_;
@@ -1253,7 +1253,7 @@ std::unique_ptr<Program> compile(const std::u16string& pattern, const std::u16st
     *flag = true;
   }
   if (prog->unicode && prog->unicode_sets) { *error = "Invalid flags"; return nullptr; }
-  Parser parser(pattern, prog->unicode || prog->unicode_sets, prog->unicode_sets, prog->icase, *prog);
+  Parser parser(pattern, prog->unicode || prog->unicode_sets, prog->unicode_sets, *prog);
   Node* root = parser.parse(error);
   if (!root) return nullptr;
   prog->ncaps = parser.total_caps();

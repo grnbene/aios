@@ -197,7 +197,6 @@ const TopApp TOP_APPS[] = {
   {"Apps", WindowType::FaceApp},
   {"Studio", WindowType::Inspector},
 };
-constexpr int TAB_X0_MARGIN = 14;  // clearance between the Launch chip and the first tab
 // Proportional type has no cell width: "Shell" and "Machine" are not 5 and 7
 // times anything. Every width here is measured with the face that draws it, and
 // the hit test calls the same function, so a click still lands on the word.
@@ -795,11 +794,6 @@ static inline void blend_px_lin(uint32_t& dst, uint32_t color, uint32_t lin_sr, 
   uint32_t b = g_gamma.lin_to_srgb[lin_b];
 
   dst = 0xFF000000u | (r << 16) | (g << 8) | b;
-}
-
-static inline void blend_px(uint32_t& dst, uint32_t color, uint32_t alpha) {
-  blend_px_lin(dst, color, g_gamma.srgb_to_lin[(color >> 16) & 0xFF],
-               g_gamma.srgb_to_lin[(color >> 8) & 0xFF], g_gamma.srgb_to_lin[color & 0xFF], alpha);
 }
 
 // Straight sRGB source-over -- see the header for why this exists beside the
@@ -7131,13 +7125,6 @@ bool HardwareCompositor::browser_open(Kernel& k, const std::string& url) {
 // Native C++ AetherMail Client (Apple-style Mail Client)
 // ===========================================================================
 
-static const char* const MAIL_CHIPS[] = {
-  "+ Compose", "Reply", "Reply All", "Forward", "Flag", "Delete", "Archive",
-  // What a message actually says, and what the sender wanted it to look like.
-  // A person gets to choose which they are reading, always.
-  "Plain/HTML", "Load Images", "Check Mail", "Accounts"
-};
-
 static const char* const MAIL_PRESET_LABELS[] = {
   "iCloud", "Gmail", "Outlook", "Fastmail", "Yahoo", "Custom"
 };
@@ -8139,7 +8126,6 @@ void HardwareCompositor::render_mail_window(WindowSurface& win, Kernel& k) {
       if (!painted_html) {
       const auto& display_lines = win.mail_body_lines_cache;
       int text_y = div_y + 14;
-      int lines_rendered = 0;
       for (size_t li = win.mail_body_scroll; li < display_lines.size(); ++li) {
         if (text_y + 18 > body_y + body_h - 10) break;
         const auto& dline = display_lines[li];
@@ -8152,7 +8138,6 @@ void HardwareCompositor::render_mail_window(WindowSurface& win, Kernel& k) {
                        tok::text, Face::Ui);
         }
         text_y += 20;
-        lines_rendered++;
       }
 
       int visible_lines = std::max(1, (body_y + body_h - 10 - div_y - 14) / 20);

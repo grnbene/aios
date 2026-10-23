@@ -94,9 +94,6 @@ std::string format_time_now() {
   return std::string(buf);
 }
 
-// How many of the newest INBOX messages a sync pulls down.
-constexpr int kSyncFetchLimit = 30;
-
 // True randomness for the keyring key/nonce. Bare metal has no /dev/urandom,
 // so this mirrors hal_metal.cpp's own random(): RDRAND when the CPU has it,
 // RDTSC-mixed as a fallback. MailStore only ever gets a root directory, never

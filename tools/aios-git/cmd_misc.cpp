@@ -688,14 +688,12 @@ int cmd_apply(Ctx& c) {
           c.err << "Applying patch " << np << " with " << rejected.size() << " reject" << (rejected.size() == 1 ? "" : "s") << "...\n";
           std::ostringstream rej;
           rej << "diff a/" << np << " b/" << np << "\t(rejected hunks)\n";
-          size_t n = 0;
           for (size_t k : rejected) {
             const Hunk& h = fp.hunks[k];
             auto range = [](long s, long cnt) { return std::to_string(s) + (cnt == 1 ? "" : "," + std::to_string(cnt)); };
             rej << "@@ -" << range(h.old_start, h.old_count) << " +" << range(h.new_start, h.new_count) << " @@\n";
             for (auto& l : h.lines) rej << l << "\n";
             c.err << "Rejected hunk #" << k + 1 << ".\n";
-            ++n;
           }
           reject_text = rej.str();
           failed = true;
