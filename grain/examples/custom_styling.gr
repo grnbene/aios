@@ -1,0 +1,105 @@
+// Custom Styling Showcase in Grain
+// Demonstrates:
+// 1. Pane-level custom CSS stylesheet: "css" / "style" in ui.pane()
+// 2. Custom CSS classes via "class" / "cls" on any widget
+// 3. Custom inline styles via "style" on cards, buttons, text, tiles, etc.
+
+let glow_color = "#38bdf8"
+let count = 0
+let aura_active = true
+
+fn view() {
+  return ui.column([
+    // Hero banner with custom class and inline gradient
+    ui.card([
+      ui.row([
+        ui.badge("GRAIN CSS ENGINE", { "accent": "ok", "dot": true }),
+        ui.badge("ULTRA STYLED", { "class": "neon-badge" })
+      ], { "gap": 10 }),
+      ui.heading("Cybernetic Ops Console", { "class": "cyber-glow", "size": 32 }),
+      ui.text("Fully customizable styling: inject global stylesheets, custom classes, keyframes, and inline CSS directly from Grain code.", {
+        "dim": true
+      })
+    ], {
+      "class": "hero-card"
+    }),
+
+    ui.divider(),
+
+    // Interactive controls with custom styles
+    ui.row([
+      ui.card([
+        ui.text("LIVE STYLING CONTROLS", { "bold": true, "size": 13, "color": "accent" }),
+        ui.switch("aura", "Neon Aura Effect", {
+          "checked": aura_active,
+          "on_change": fn(v) {
+            aura_active = (v == "1")
+          }
+        }),
+        ui.slider("boost", 0, 100, {
+          "label": "Glow Intensity",
+          "value": 75,
+          "class": "custom-slider"
+        }),
+        ui.row([
+          ui.button("PULSE EFFECT", fn() {
+            count = count + 1
+          }, { "class": "cyber-btn", "grow": true }),
+          ui.button("RESET COUNTER", fn() {
+            count = 0
+          }, { "variant": "ghost" })
+        ], { "gap": 10 })
+      ], { "grow": true, "class": aura_active ? "aura-card glow-active" : "aura-card" }),
+
+      ui.card([
+        ui.text("TELEMETRY", { "bold": true, "size": 13, "color": "accent" }),
+        ui.row([
+          ui.tile(count, "Interactions", { "accent": "ok", "sub": "+100% reactive", "class": "glass-tile" }),
+          ui.tile("99.98%", "System SLA", { "accent": "#a855f7", "sub": "Nominal", "class": "glass-tile" })
+        ], { "gap": 12 }),
+        ui.progress(78, { "accent": "#38bdf8", "label": "Buffer Allocation", "class": "neon-bar" })
+      ], { "grow": true, "class": "aura-card" })
+    ], { "gap": 16 }),
+
+    // Custom styled cards row
+    ui.card([
+      ui.row([
+        ui.text("CUSTOM GRADIENT BUTTONS", { "bold": true }),
+        ui.badge("INLINE CSS", { "class": "pill-tag" })
+      ], { "justify": "between", "align": "center" }),
+      ui.row([
+        ui.button("Cosmic Violet", fn() {}, {
+          "style": "background: linear-gradient(135deg, #8b5cf6 0%, #ec4899 100%); color: #fff; border: none; box-shadow: 0 4px 15px rgba(236,72,153,0.35);"
+        }),
+        ui.button("Emerald Beam", fn() {}, {
+          "style": "background: linear-gradient(135deg, #10b981 0%, #06b6d4 100%); color: #fff; border: none; box-shadow: 0 4px 15px rgba(6,182,212,0.35);"
+        }),
+        ui.button("Solar Flare", fn() {}, {
+          "style": "background: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%); color: #fff; border: none; box-shadow: 0 4px 15px rgba(239,68,68,0.35);"
+        })
+      ], { "gap": 12 })
+    ], { "style": "border: 1px dashed rgba(56,189,248,0.3); background: rgba(15,23,42,0.6);" })
+  ], { "gap": 18 })
+}
+
+// Custom CSS stylesheet injected into the HTML <head>
+let custom_stylesheet =
+  ".cyber-glow { background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: -0.02em; font-weight: 800; }\n" +
+  ".hero-card { background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.85) 100%) !important; border: 1px solid rgba(56, 189, 248, 0.25) !important; box-shadow: 0 8px 32px -4px rgba(56, 189, 248, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.1) !important; }\n" +
+  ".neon-badge { background: rgba(192, 132, 252, 0.15) !important; color: #c084fc !important; border: 1px solid rgba(192, 132, 252, 0.4) !important; box-shadow: 0 0 10px rgba(192, 132, 252, 0.3) !important; }\n" +
+  ".aura-card { transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1) !important; }\n" +
+  ".glow-active { border-color: rgba(56, 189, 248, 0.4) !important; box-shadow: 0 0 25px rgba(56, 189, 248, 0.2), inset 0 0 15px rgba(56, 189, 248, 0.05) !important; }\n" +
+  ".cyber-btn { background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; color: #fff !important; letter-spacing: 0.04em !important; box-shadow: 0 4px 15px rgba(37, 99, 235, 0.4) !important; }\n" +
+  ".cyber-btn:hover { transform: translateY(-2px) scale(1.02) !important; box-shadow: 0 6px 20px rgba(37, 99, 235, 0.6) !important; }\n" +
+  ".glass-tile { background: rgba(255, 255, 255, 0.03) !important; border: 1px solid rgba(255, 255, 255, 0.08) !important; }\n" +
+  ".pill-tag { background: rgba(56, 189, 248, 0.15) !important; color: #38bdf8 !important; border: 1px solid rgba(56, 189, 248, 0.3) !important; }\n"
+
+let p = ui.pane({
+  "title": "Grain Cybernetic Ops Console",
+  "width": 840,
+  "height": 720,
+  "shared": true,
+  "refresh": 1,
+  "css": custom_stylesheet,
+  "view": view
+})

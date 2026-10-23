@@ -1281,6 +1281,18 @@ std::string scaled_to_decimal(AIOS_INT128 v, int scale) {
   return (neg && !zero ? "-" : "") + out;
 }
 
+// A DECIMAL kept scaled, as the double its text reads as. x / 10^places is one correctly rounded division while x
+// is a whole double (below 2^53); past that (123456789.123456789) x itself was rounded on the way, the quotient
+// could land an ulp from the text's double, and a join or IN keyed by the text's double missed it. The text decides.
+inline double scaled_decimal_double(int64_t x, double sf) {
+  if (sf <= 0.0) sf = 1.0;
+  if (x < ((int64_t)1 << 53) && x > -((int64_t)1 << 53)) return (double)x / sf;
+  int places = 0;
+  for (double t = sf; t > 1.5; t /= 10) ++places;
+  const std::string text = scaled_to_decimal((AIOS_INT128)x, places);
+  return std::strtod(text.c_str(), nullptr);
+}
+
 // A set of doubles in one flat array (open addressing): the node-per-value
 // std::unordered_set it replaces made an IN (subquery) over 250k keys a
 // malloc per key to build and a free per key to drop - over half of a
@@ -1312,6 +1324,14 @@ class FlatDoubleSet {
   }
   bool empty() const { return count_ == 0; }
   size_t size() const { return count_; }
+  template <class F> void for_each(F&& f) const {
+    for (uint64_t k : slots_) {
+      if (k == kEmpty) continue;
+      double d;
+      std::memcpy(&d, &k, sizeof d);
+      f(d);
+    }
+  }
   // Room for n keys at once: a 250k-value IN set grew through 15 rehashes.
   void reserve(size_t n) {
     size_t want = 16;
@@ -1370,6 +1390,9 @@ struct InLookupSet {
   // where 9007199254740993 would be found by ...992. wide_dbl holds their doubles, for an approximate probe.
   std::unordered_set<std::string> wide_exact;
   FlatDoubleSet wide_dbl;
+  // Its strings that are such numbers ('9007199254740993'): a number meets them by their digits (MariaDB reads
+  // the string as the number's type), a string still as a string.
+  std::unordered_set<std::string> wide_text;
   bool has_null = false;
   bool has_numeric = false;
   bool has_string = false;
@@ -1393,6 +1416,10 @@ struct InLookupSet {
       str_set.insert(collate_key(s));
       has_string = true;
       double d = 0;
+      if (s.size() > 15 && text_is_wide_number(s)) {   // 16+ digits: a short string never is one
+        std::string c = canonical_decimal(s);
+        if (!c.empty() && parse_number(s, &d)) { wide_text.insert(std::move(c)); wide_dbl.insert(d); return; }
+      }
       if (v.has_prefix && v.prefix_num != 0) text_num_set.insert(v.prefix_num);   // 0x2A reads as 42, '42abc' as 42
       else if (parse_number(s, &d)) text_num_set.insert(d);
     }
@@ -1410,10 +1437,10 @@ struct InLookupSet {
     // A number meets the list's numbers and its strings as numbers; a string
     // meets the strings as strings and only the real numbers as numbers.
     if (l.numeric) {
-      if (!wide_exact.empty()) {
+      if (!wide_exact.empty() || !wide_text.empty()) {
         if (is_wide(l)) {   // an exact wide number meets only the same digits
           const std::string c = canonical_decimal(l.text);
-          if (!c.empty()) return wide_exact.count(c) > 0 || text_num_set.contains(l.num);
+          if (!c.empty()) return wide_exact.count(c) > 0 || wide_text.count(c) > 0 || text_num_set.contains(l.num);
         } else if (l.approx && wide_dbl.contains(l.num)) {
           return true;      // a DOUBLE compares as a double
         }
@@ -2040,6 +2067,25 @@ std::string canonical_decimal(std::string_view s) {
   return out;
 }
 
+// How long a value's text is, without making it for a number that has none: a number below 1e15 printed
+// is at most 15 characters, and only a longer one can hold more than a double carries.
+static size_t text_len_cheap(const Val& v) {
+  if (v.text_valid) return v.text.size();
+  if (v.numeric) return std::fabs(v.num) >= 1e15 ? 16 : 0;
+  return v.sv().size();
+}
+
+// Two exact numbers whose text a double may not carry (16 or more characters): their order by the digits, or 2
+// when that does not apply (a DOUBLE, a number without its text, text with an exponent). Their doubles cannot
+// decide it: two may tie while the numbers differ (9007199254740993 and ...992), and a DECIMAL's double, worked
+// out from its scaled integer, may even land on the other side of a literal's (9999999999999999.97 read above
+// 9999999999999999.98).
+static int exact_text_order(const Val& a, const Val& b) {
+  if (a.approx || b.approx || !a.text_valid || !b.text_valid) return 2;
+  if (a.text.size() <= 15 && b.text.size() <= 15) return 2;
+  return decimal_text_compare(a.text, b.text);
+}
+
 // a.num == b.num: whether the doubles may have hidden a difference, and if so the exact answer.
 static int exact_numeric_tie(const Val& a, const Val& b) {
   if (a.approx || b.approx) return 0;   // FLOAT/DOUBLE values are the doubles
@@ -2059,6 +2105,7 @@ int compare_vals(const Val& a, const Val& b) {
     if (temporal_key(a.sv(), &ka) && temporal_key(b.sv(), &kb)) return ka < kb ? -1 : (ka > kb ? 1 : 0);
   }
   if (a.numeric && b.numeric) {
+    if (const int x = exact_text_order(a, b); x != 2) return x;
     if (a.num < b.num) return -1;
     if (a.num > b.num) return 1;
     return exact_numeric_tie(a, b);
@@ -2075,6 +2122,15 @@ int compare_vals(const Val& a, const Val& b) {
     // a DATE or DATETIME against a number: compared as its YYYYMMDD[HHMMSS] reading (12346 <= LAST_DAY(ts) holds)
     if (!a.numeric && a.temporal) temporal_number(a.str(), &da);
     if (!b.numeric && b.temporal) temporal_number(b.str(), &db);
+    // An exact number against text that is a plain decimal: MariaDB reads the text as the number's own type, so
+    // the digits decide (`bigid = '9007199254740993'` finds that id and not ...992; `d < '9999999999999999.93'`
+    // holds for .92 alone). Only a number of 16 or more characters can differ from its double.
+    const Val& num = a.numeric ? a : b;
+    const Val& txt = a.numeric ? b : a;
+    if (!num.approx && !txt.temporal && (text_len_cheap(num) > 15 || text_len_cheap(txt) > 15)) {
+      const int c = decimal_text_compare(a.sv(), b.sv());
+      if (c != 2) return c;
+    }
     if (da < db) return -1;
     if (da > db) return 1;
     return 0;
@@ -2106,6 +2162,7 @@ static int compare_vals_ordered(const Val& a, const Val& b) {
   if (ca != cb) return ca < cb ? -1 : 1;
   if (ca == 0) return 0;
   if (ca == 1) {
+    if (const int x = exact_text_order(a, b); x != 2) return x;
     if (a.num < b.num) return -1;
     if (a.num > b.num) return 1;
     return exact_numeric_tie(a, b);
@@ -2196,7 +2253,10 @@ static int compare_vals_as(SqlDataType t, const Val& a, const Val& b) {
   // sorted 999 above 2587 as text. A text column's cells are never numbers
   // here (they are read as text), so a string still sorts as a string.
   if (t == SqlDataType::Text) {
-    if (a.numeric && b.numeric && !a.null && !b.null) return a.num < b.num ? -1 : (a.num > b.num ? 1 : exact_numeric_tie(a, b));
+    if (a.numeric && b.numeric && !a.null && !b.null) {
+      if (const int x = exact_text_order(a, b); x != 2) return x;
+      return a.num < b.num ? -1 : (a.num > b.num ? 1 : exact_numeric_tie(a, b));
+    }
     if (a.bin || b.bin) { const int m = a.str().compare(b.str()); return m < 0 ? -1 : m > 0 ? 1 : 0; }   // BINARY x / COLLATE _bin: bytes
     return case_insensitive_compare(a.str(), b.str());
   }
@@ -2209,6 +2269,7 @@ static int compare_vals_as(SqlDataType t, const Val& a, const Val& b) {
   const bool xn = a.numeric ? (x = a.num, true) : (!a.null && parse_number(a.str(), &x));
   const bool yn = b.numeric ? (y = b.num, true) : (!b.null && parse_number(b.str(), &y));
   if (xn && yn) {
+    if (a.numeric && b.numeric) { if (const int o = exact_text_order(a, b); o != 2) return o; }
     if (x != y) return x < y ? -1 : 1;
     // equal as doubles: past 2^53 (or 15 digits) exact numbers may still differ, and their digits decide
     if (a.approx || b.approx) return 0;
@@ -12209,6 +12270,21 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
       const Val& l = operand_val(e->args[0].get(), ctx, lt);
       const Val& r = operand_val(e->args[1].get(), ctx, rt);
       int c = compare_vals(l, r);
+      // A DOUBLE literal against an exact integer, equal as doubles: MariaDB converts the literal to the
+      // integer's type when it is a whole number and compares exactly (`bigid = 9.007199254740993e15` is
+      // 9007199254740992, the double's own value, and does not find ...993).
+      if (c == 0 && l.numeric && r.numeric && l.approx != r.approx) {
+        const Val& dv = l.approx ? l : r;
+        const Val& iv = l.approx ? r : l;
+        const SqlExpr* lit = e->args[l.approx ? 0 : 1].get();
+        if (lit && lit->op == ExprOp::Literal && std::fabs(dv.num) >= 9007199254740992.0 && std::fabs(dv.num) < 1e38 &&
+            iv.sv().find('.') == std::string_view::npos) {
+          char buf[64];
+          std::snprintf(buf, sizeof buf, "%.0f", dv.num);   // past 2^53 a double is a whole number, printed exactly
+          const int x = decimal_text_compare(l.approx ? std::string_view(buf) : l.sv(), l.approx ? r.sv() : std::string_view(buf));
+          if (x != 2) c = x;
+        }
+      }
       // A date compared with text that is no date: the text is read as a date
       // and fails to the zero date, as MySQL converts it (dt > 'abc' holds;
       // compared as text, 'abc' sorted after every date).
@@ -12489,9 +12565,18 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
           if (x.temporal && temporal_number(x.str(), &t)) return t;
           return x.has_prefix ? x.prefix_num : numeric_prefix_of(x.str());
         };
+        // as numbers - by the digits where both are exact decimals a double may not carry (16+ characters):
+        // `bigid BETWEEN 9007199254740993 AND '9007199254740993'` is that id alone
+        auto cmp_num = [](const Val& x, const Val& y, double dx, double dy) {
+          if (!x.approx && !y.approx && (text_len_cheap(x) > 15 || text_len_cheap(y) > 15)) {
+            const int c = decimal_text_compare(x.sv(), y.sv());
+            if (c != 2) return c;
+          }
+          return dx < dy ? -1 : dx > dy ? 1 : 0;
+        };
         const double xv = v.null ? 0 : num_of(v), xl = lo.null ? 0 : num_of(lo), xh = hi.null ? 0 : num_of(hi);
-        a = v.null || lo.null ? -2 : (xv < xl ? -1 : xv > xl ? 1 : 0);
-        b = v.null || hi.null ? -2 : (xv < xh ? -1 : xv > xh ? 1 : 0);
+        a = v.null || lo.null ? -2 : cmp_num(v, lo, xv, xl);
+        b = v.null || hi.null ? -2 : cmp_num(v, hi, xv, xh);
       } else {
         a = compare_vals(v, lo);
         b = compare_vals(v, hi);
@@ -12940,6 +13025,51 @@ void sql_set_session_mode(const std::string& mode) {
 }
 
 // The reason a value may not go into a column under sql_strict(), or "".
+// An integer column's range by its declared type, exactly: TINYINT .. BIGINT, signed or UNSIGNED. False for a
+// declaration that is not one of them.
+static bool int_type_range(const std::string& declared_lower, AIOS_INT128* lo, AIOS_INT128* hi) {
+  const std::string& d = declared_lower;
+  const bool uns = d.find(" unsigned") != std::string::npos;
+  auto set = [&](AIOS_INT128 l, AIOS_INT128 h) { *lo = l; *hi = h; return true; };
+  if (d.rfind("tinyint", 0) == 0) return uns ? set(0, 255) : set(-128, 127);
+  if (d.rfind("smallint", 0) == 0) return uns ? set(0, 65535) : set(-32768, 32767);
+  if (d.rfind("mediumint", 0) == 0) return uns ? set(0, 16777215) : set(-8388608, 8388607);
+  if (d.rfind("bigint", 0) == 0) return uns ? set(0, ((AIOS_INT128)1 << 64) - 1) : set(INT64_MIN, INT64_MAX);
+  if (d.rfind("int", 0) == 0) return uns ? set(0, 4294967295LL) : set(-2147483648LL, 2147483647LL);
+  return false;
+}
+
+// Plain decimal text (no exponent, no words) rounded half away from zero to a whole number, exactly - a double
+// cannot tell 9223372036854775807 from 2^63, which BIGINT cannot hold. 0: not plain decimal; 1: *out holds it;
+// 2: more than 38 digits, past every integer type (*out's sign says which side).
+static int plain_rounded_int(const std::string& v, AIOS_INT128* out) {
+  const std::string c = canonical_decimal(v);
+  if (c.empty()) return 0;
+  const bool neg = c[0] == '-';
+  const size_t dot = c.find('.');
+  const std::string ip = c.substr(neg ? 1 : 0, (dot == std::string::npos ? c.size() : dot) - (neg ? 1 : 0));
+  if (ip.size() > 38) { *out = neg ? -1 : 1; return 2; }
+  AIOS_INT128 x = 0;
+  for (char ch : ip) x = x * 10 + (ch - '0');
+  if (dot != std::string::npos && dot + 1 < c.size() && c[dot + 1] >= '5') ++x;
+  *out = neg ? -x : x;
+  return 1;
+}
+
+// Plain decimal text against DECIMAL(prec, scale), once rounded to its places as it is stored: 1 past what the
+// column holds, 0 within it, -1 not plain decimal (the caller reads it as a number). A double held
+// 9999999999999999.97 as 1e16 and called it past DECIMAL(18,2).
+static int decimal_text_out_of_range(const std::string& v, int prec, int scale) {
+  const std::string c = canonical_decimal(v);
+  if (c.empty()) return -1;
+  const std::string r = sql_normalize_value(SqlDataType::Decimal, scale, c);
+  const bool neg = !r.empty() && r[0] == '-';
+  const size_t dot = r.find('.');
+  std::string ip = r.substr(neg ? 1 : 0, (dot == std::string::npos ? r.size() : dot) - (neg ? 1 : 0));
+  while (!ip.empty() && ip[0] == '0') ip.erase(0, 1);
+  return (int)ip.size() > prec - scale ? 1 : 0;
+}
+
 std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
   if (sql_is_null(v)) return c.not_null ? "Column '" + c.name + "' cannot be null" : std::string();
   const std::string d = lower_of(c.declared);
@@ -13021,6 +13151,12 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
              " value: '" + v + "' for column '" + c.name + "' at row 1";
     const std::string range = "Out of range value for column '" + c.name + "' at row 1";
     if (c.type == SqlDataType::Int) {
+      AIOS_INT128 ilo = 0, ihi = 0, x = 0;
+      if (int_type_range(d, &ilo, &ihi)) {
+        const int pr = plain_rounded_int(v, &x);
+        if (pr == 2 || (pr == 1 && (x < ilo || x > ihi))) return range;
+        if (pr == 1) return std::string();
+      }
       const double r = std::round(dv);
       double lo = -9223372036854775808.0, hi = 9223372036854775807.0;
       if (kind == "tinyint") { lo = uns ? 0 : -128; hi = uns ? 255 : 127; }
@@ -13033,8 +13169,9 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
       return std::string();
     }
     if (c.type == SqlDataType::Decimal && c.precision > 0) {
+      const int out = decimal_text_out_of_range(v, (int)c.precision, (int)c.scale);
       const int intdigits = (int)c.precision - (int)c.scale;
-      if (std::fabs(dv) >= std::pow(10.0, intdigits)) return range;
+      if (out == 1 || (out < 0 && std::fabs(dv) >= std::pow(10.0, intdigits))) return range;
     }
     if (uns && dv < 0) return range;
     return std::string();
@@ -13156,6 +13293,16 @@ std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
     if (!end || end == v.c_str()) return v;
     const std::string d = lower_of(c.declared);
     const bool uns = d.find(" unsigned") != std::string::npos;
+    {
+      // plain decimal text: its rounded value against the type's range exactly, clamped to the nearer end
+      AIOS_INT128 ilo = 0, ihi = 0, x = 0;
+      const int pr = int_type_range(d, &ilo, &ihi) ? plain_rounded_int(v, &x) : 0;
+      if (pr != 0) {
+        if (x < ilo) return scaled_to_decimal(ilo, 0);
+        if (x > ihi) return scaled_to_decimal(ihi, 0);
+        return v;
+      }
+    }
     double lo = -9223372036854775808.0, hi = 9223372036854775807.0;
     if (d.rfind("tinyint", 0) == 0) { lo = uns ? 0 : -128; hi = uns ? 255 : 127; }
     else if (d.rfind("smallint", 0) == 0) { lo = uns ? 0 : -32768; hi = uns ? 65535 : 32767; }
@@ -13176,7 +13323,9 @@ std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
     const double dv = std::strtod(v.c_str(), &end);
     if (!end || end == v.c_str()) return v;
     const int intdigits = (int)c.precision - (int)c.scale;
-    if (std::fabs(dv) < std::pow(10.0, intdigits) && !(dv < 0 && lower_of(c.declared).find(" unsigned") != std::string::npos)) return v;
+    const int out = decimal_text_out_of_range(v, (int)c.precision, (int)c.scale);
+    const bool fits = out == 0 || (out < 0 && std::fabs(dv) < std::pow(10.0, intdigits));
+    if (fits && !(dv < 0 && lower_of(c.declared).find(" unsigned") != std::string::npos)) return v;
     if (dv < 0 && lower_of(c.declared).find(" unsigned") != std::string::npos) return std::string(c.scale ? "0." : "0") + std::string(c.scale, '0');
     std::string m = dv < 0 ? "-" : "";
     m += std::string((size_t)std::max(intdigits, 0), '9');
@@ -15510,7 +15659,7 @@ bool ColumnStore::get_double(size_t row, double* out_val) const {
       if (out_val) *out_val = static_cast<double>(base_int64 + static_cast<int64_t>(read_code(row)));
       return true;
     case ColumnEncoding::DecimalScaled:
-      if (out_val) *out_val = static_cast<double>(base_int64 + static_cast<int64_t>(read_code(row))) / (scale_factor > 0.0 ? scale_factor : 1.0);
+      if (out_val) *out_val = scaled_decimal_double(base_int64 + static_cast<int64_t>(read_code(row)), scale_factor);
       return true;
     case ColumnEncoding::SegmentFOR:
       if (out_val) *out_val = static_cast<double>(segfor_value(row));
@@ -29215,7 +29364,7 @@ void typed_values(const ColumnStore& cs, size_t start, size_t end, double* out) 
       if (cs.encoding == ColumnEncoding::FOR)
         for (size_t i = 0; i < n; ++i) out[i] = (double)(cs.base_int64 + (int64_t)codes[i]);
       else
-        for (size_t i = 0; i < n; ++i) out[i] = (double)(cs.base_int64 + (int64_t)codes[i]) / cs.scale_factor;
+        for (size_t i = 0; i < n; ++i) out[i] = scaled_decimal_double(cs.base_int64 + (int64_t)codes[i], cs.scale_factor);
       return;
     }
     case ColumnEncoding::SegmentFOR: {
@@ -29305,19 +29454,21 @@ bool wide_numbers(const ColumnStore& cs) {
         break;
       }
       if (typed_numeric(cs)) {
-        // segment bounds where they are kept (a bound past 2^53 may be a loose one: then only maybe, which is
-        // enough to step aside), the rows after them one by one
+        // segment bounds where they are kept (a bound past the limit may be a loose one: then only maybe, which is
+        // enough to step aside), the rows after them one by one. The limit: 2^53 for integers; for a DECIMAL kept
+        // scaled, 10^15 of its scaled integers - 123456789.123456789 is small, but has 18 digits.
+        const double lim = cs.encoding == ColumnEncoding::DecimalScaled ? 1e15 / cs.scale_factor : k53;
         constexpr size_t kSeg = 2048;
         size_t covered = 0;
         for (size_t sgi = 0; sgi < cs.zone_maps.size() && !wide; ++sgi) {
           const auto& zm = cs.zone_maps[sgi];
           if (!zm.has_stats) break;
-          if (!zm.all_null && (zm.max_double >= k53 || zm.min_double <= -k53)) wide = true;
+          if (!zm.all_null && (zm.max_double >= lim || zm.min_double <= -lim)) wide = true;
           covered = std::min(cs.size(), (sgi + 1) * kSeg);
         }
         for (size_t r = covered; r < cs.size() && !wide; ++r) {
           double v = 0;
-          if (!cs.is_null(r) && cs.get_double(r, &v) && (v >= k53 || v <= -k53)) wide = true;
+          if (!cs.is_null(r) && cs.get_double(r, &v) && (v >= lim || v <= -lim)) wide = true;
         }
         break;
       }
@@ -29341,7 +29492,7 @@ double typed_value(const ColumnStore& cs, size_t r) {
     case ColumnEncoding::TypedInt64: return (double)cs.int64_data[r];
     case ColumnEncoding::FOR: return (double)(cs.base_int64 + (int64_t)cs.read_code(r));
     case ColumnEncoding::TypedDouble: return cs.double_data[r];
-    case ColumnEncoding::DecimalScaled: return (double)(cs.base_int64 + (int64_t)cs.read_code(r)) / cs.scale_factor;
+    case ColumnEncoding::DecimalScaled: return scaled_decimal_double(cs.base_int64 + (int64_t)cs.read_code(r), cs.scale_factor);
     case ColumnEncoding::SegmentFOR: return (double)cs.segfor_value(r);
     case ColumnEncoding::ALP: return cs.alp_value(r);
     default: return 0;
@@ -30178,15 +30329,20 @@ void codes_equal_to(const ColIndex& ci, const Val& want, std::vector<uint32_t>* 
   // A quoted plain number against a number column is read as that column's type, exactly, as MariaDB does
   // (`bigid = '9007199254740993'` finds that id alone).
   const bool quoted_number = !want.numeric && !ci.text && decimal_text_compare(want.sv(), want.sv()) != 2;
-  const bool exact = (want.numeric && !want.approx) || quoted_number;
-  const std::string want_text = exact ? want.str() : std::string();
+  // A DOUBLE constant past 2^53 is a whole number, and MariaDB converts it to an integer column's type:
+  // `bigid = 9.007199254740993e15` is 9007199254740992 exactly. Against a DECIMAL entry it stays a double.
+  const bool dbl_whole = want.numeric && want.approx && !ci.text && std::fabs(want.num) >= 9007199254740992.0 && std::fabs(want.num) < 1e38;
+  const bool exact = (want.numeric && !want.approx) || quoted_number || dbl_whole;
+  std::string want_text = exact && !dbl_whole ? want.str() : std::string();
+  if (dbl_whole) { char buf[64]; std::snprintf(buf, sizeof buf, "%.0f", want.num); want_text = buf; }
   auto num_is = [&](double d) {
-    return [&cs, d, exact, &want_text](uint32_t code) {
+    return [&cs, d, exact, dbl_whole, &want_text](uint32_t code) {
       const std::string& entry = dict_entry(cs, code);
       bool hd = false;
       const double np = numeric_prefix_of(entry, &hd);
       if (!hd || np != d) return false;
       if (!exact) return true;
+      if (dbl_whole && entry.find('.') != std::string::npos) return true;   // a DECIMAL against a DOUBLE: as doubles
       const int c = decimal_text_compare(entry, want_text);
       return c == 2 || c == 0;   // not plain decimal (an exponent, '12abc'): the numeric reading decided
     };
@@ -30231,6 +30387,17 @@ struct Pred {
   ExprOp op = ExprOp::Eq;            // NumCmp
   double lo = 0, hi = 0;             // NumCmp (hi for BETWEEN)
   bool negated = false;              // NumCmp BETWEEN
+  // NumCmp / InNum on a column of integers (a typed integer one, or DECIMAL kept scaled) whose numbers or
+  // constants a double cannot carry: compared as those integers. NumCmp: rows in [ilo, ihi] match, or the
+  // rows outside it (iout: <>, NOT BETWEEN); ilo > ihi is the empty range. InNum: int_set, sorted.
+  bool int_mode = false;
+  int64_t ilo = 0, ihi = -1;
+  bool iout = false;
+  std::vector<int64_t> int_set;
+  // InSub from a typed integer subquery whose values or column a double cannot carry: the values, sorted
+  // and distinct, each row's integer looked up among them (int_mode).
+  std::shared_ptr<const std::vector<int64_t>> sub_ints;
+  bool exact_confirm = false;        // InSub (general): a hit by double is confirmed by the row's exact value
   const SqlExpr* expr = nullptr;     // Row
   bool nulls = true;                 // PerCode / NumCmp: the column has NULL rows
   std::vector<uint32_t> eq_codes;    // PerCode from an equality/IN: the codes it matches (sorted)
@@ -30268,6 +30435,140 @@ inline void int_range_of(const Pred& p, int64_t* lo, int64_t* hi) {
     case ExprOp::Ge: *lo = clamp(std::ceil(p.lo)); break;
     default: break;
   }
+}
+
+// The bounds a NumCmp leaf's rows lie in, as integers of the column: its exact range in integer mode,
+// int_range_of's otherwise (Eq: the constant when it is a whole number).
+inline void int_bounds_of(const Pred& p, int64_t* lo, int64_t* hi) {
+  if (p.int_mode) { *lo = p.ilo; *hi = p.ihi; return; }
+  if (p.op == ExprOp::Eq) {
+    const bool whole = p.lo == std::floor(p.lo) && std::fabs(p.lo) <= 9e18;
+    *lo = whole ? (int64_t)p.lo : 0;
+    *hi = whole ? (int64_t)p.lo : -1;
+    return;
+  }
+  int_range_of(p, lo, hi);
+}
+
+// The scale of the integers a typed column keeps its numbers as: 0 for a typed integer column, a DECIMAL's
+// places when it is kept scaled; -1 for anything else (doubles, text).
+int exact_int_scale(const ColumnStore& cs) {
+  if (typed_integer(cs)) return 0;
+  if (cs.encoding == ColumnEncoding::DecimalScaled) {
+    double f = 1;
+    for (int s = 0; s <= 18; ++s, f *= 10) if (f == cs.scale_factor) return s;
+  }
+  return -1;
+}
+
+// A constant's exact value as digits / 10^scale: an exact number, plain decimal text (MariaDB reads
+// `bigid = '9007199254740993'` as that BIGINT), or - against integers only - a DOUBLE, whose value is
+// exactly what it holds (MariaDB converts `bigid = 9.007199254740993e15` to the BIGINT 9007199254740992).
+// False for anything else: text with an exponent or trailing words, more than 38 digits.
+bool exact_constant_of(const Val& v, bool int_col, AIOS_INT128* digits, int* scale) {
+  if (v.null || v.temporal) return false;
+  std::string c;
+  if (v.numeric && v.approx) {
+    if (!int_col || !std::isfinite(v.num) || std::fabs(v.num) >= 1e38) return false;
+    // A double is a binary fraction. Against integers only the two either side of it matter: a whole one is
+    // itself, any other lies strictly between floor and floor + 1, which floor + 0.5 stands for exactly.
+    const double f = std::floor(v.num);
+    *digits = (AIOS_INT128)f;
+    *scale = 0;
+    if (f != v.num) { *digits = *digits * 10 + 5; *scale = 1; }
+    return true;
+  } else if (v.numeric) {
+    AIOS_INT128 x = 0;
+    int sc = 0, ds = 0;
+    c = canonical_decimal(v.sv());
+    if (c.empty()) {
+      if (!exact_internal_of(v, &x, &sc, &ds)) return false;
+      *digits = x;
+      *scale = sc;
+      return true;
+    }
+  } else {
+    c = canonical_decimal(v.sv());
+  }
+  if (c.empty()) return false;
+  const bool neg = c[0] == '-';
+  AIOS_INT128 x = 0;
+  int sc = 0, nd = 0;
+  bool frac = false;
+  for (size_t i = neg ? 1 : 0; i < c.size(); ++i) {
+    if (c[i] == '.') { frac = true; continue; }
+    if (++nd > 38) return false;
+    x = x * 10 + (c[i] - '0');
+    if (frac) ++sc;
+  }
+  *digits = neg ? -x : x;
+  *scale = sc;
+  return true;
+}
+
+// The integers of a column at scale cscale either side of digits / 10^scale: fl the greatest at or below it,
+// ce the least at or above it (equal when it is one of them). Magnitudes past any column's are kept apart
+// from every int64 by staying past them.
+void int_floor_ceil(AIOS_INT128 digits, int scale, int cscale, AIOS_INT128* fl, AIOS_INT128* ce) {
+  const AIOS_INT128 kFar = (AIOS_INT128)1 << 100;
+  auto p10 = [](int n) { AIOS_INT128 p = 1; for (int i = 0; i < n; ++i) p *= 10; return p; };
+  if (scale <= cscale) {
+    AIOS_INT128 m = 0;
+    if (__builtin_mul_overflow(digits, p10(cscale - scale), &m)) m = digits < 0 ? -kFar : kFar;
+    *fl = *ce = m;
+    return;
+  }
+  const int k = scale - cscale;
+  if (k > 38) { *fl = digits < 0 ? -1 : 0; *ce = digits > 0 ? 1 : 0; return; }   // |digits| < 10^38 <= 10^k
+  const AIOS_INT128 d = p10(k);
+  const AIOS_INT128 q = digits / d, r = digits % d;
+  *fl = r < 0 ? q - 1 : q;
+  *ce = r > 0 ? q + 1 : q;
+}
+
+// Integer mode for a NumCmp on column cs: the exact range for p.op over the constants a (and b for BETWEEN).
+// False when a constant cannot be read exactly - the caller leaves the row to the evaluator.
+bool set_int_mode(Pred& p, const ColumnStore& cs, const Val& a, const Val* b) {
+  const int cscale = exact_int_scale(cs);
+  if (cscale < 0) return false;
+  AIOS_INT128 da = 0, db = 0, fa = 0, ca = 0, fb = 0, cb = 0;
+  int sa = 0, sb = 0;
+  if (!exact_constant_of(a, cscale == 0, &da, &sa)) return false;
+  if (b && !exact_constant_of(*b, cscale == 0, &db, &sb)) return false;
+  int_floor_ceil(da, sa, cscale, &fa, &ca);
+  if (b) int_floor_ceil(db, sb, cscale, &fb, &cb);
+  const AIOS_INT128 kLow = -((AIOS_INT128)1 << 100), kHigh = (AIOS_INT128)1 << 100;
+  AIOS_INT128 lo = kLow, hi = kHigh;
+  bool out = false;
+  switch (p.op) {
+    case ExprOp::Eq: lo = ca; hi = fa; break;
+    case ExprOp::Ne: lo = ca; hi = fa; out = true; break;
+    case ExprOp::Lt: hi = ca - 1; break;
+    case ExprOp::Le: hi = fa; break;
+    case ExprOp::Gt: lo = fa + 1; break;
+    case ExprOp::Ge: lo = ca; break;
+    case ExprOp::Between: if (!b) return false; lo = ca; hi = fb; out = p.negated; break;
+    default: return false;
+  }
+  if (lo < (AIOS_INT128)INT64_MIN) lo = INT64_MIN;
+  if (hi > (AIOS_INT128)INT64_MAX) hi = INT64_MAX;
+  if (lo > hi || lo > (AIOS_INT128)INT64_MAX || hi < (AIOS_INT128)INT64_MIN) { p.ilo = 0; p.ihi = -1; }
+  else { p.ilo = (int64_t)lo; p.ihi = (int64_t)hi; }
+  p.iout = out;
+  p.int_mode = true;
+  return true;
+}
+
+// Whether a comparison of column cs with these constants needs integer mode: the column holds numbers a
+// double cannot carry, or a constant is one (5.0000000000000001 is not 5; 9007199254740993 is not ...992).
+bool needs_int_mode(const ColumnStore& cs, const Val& a, const Val* b) {
+  if (exact_int_scale(cs) < 0) return false;
+  auto wide = [](const Val& v) {
+    if (v.null) return false;
+    if (v.numeric && v.approx) return std::fabs(v.num) >= 9007199254740992.0;
+    return text_is_wide_number(v.sv());
+  };
+  return wide_numbers(cs) || wide(a) || (b && wide(*b));
 }
 
 uint8_t tri_of(const Val& v) { return v.null ? kN : (val_truthy(v) ? kT : kF); }
@@ -30717,7 +31018,8 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       const ColumnStore& cs = t.col_data[col];
       Val v;
       if (typed_numeric(cs) && sql_type_numeric(t.columns[col].type) &&
-          constant_value(e->args[1].get(), local, base, &v) && !v.null) {
+          constant_value(e->args[1].get(), local, base, &v) && !v.null &&
+          (!needs_int_mode(cs, v, nullptr) || (p.op = ExprOp::Eq, set_int_mode(p, cs, v, nullptr)))) {
         p.kind = Pred::NumCmp;
         p.col = col;
         p.op = ExprOp::Eq;
@@ -31028,6 +31330,8 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
           int64_t blo = 0;
           std::vector<uint64_t> bits;
           std::vector<double> sub_vals;
+          std::shared_ptr<const std::vector<int64_t>> sorted_ints;   // every value, sorted and distinct
+          bool wide = false;                                          // one of them is past 2^53
         };
         static thread_local std::unordered_map<std::string, CachedInNumSub> num_sub_cache;
         const CachedInNumSub* cached_n = nullptr;
@@ -31063,10 +31367,12 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
               for (int64_t v : ints) set->num_set.insert((double)v);
             }
             set->has_numeric = !ints.empty();
-            if (ints.size() <= 4096) {
+            for (int64_t v : ints) entry.wide = entry.wide || v >= ((int64_t)1 << 53) || v <= -((int64_t)1 << 53);
+            if (ints.size() <= 4096 || entry.wide) {
               std::sort(ints.begin(), ints.end());
               ints.erase(std::unique(ints.begin(), ints.end()), ints.end());
               if (ints.size() <= 1024) for (int64_t v : ints) entry.sub_vals.push_back((double)v);
+              if (entry.wide) entry.sorted_ints = std::make_shared<const std::vector<int64_t>>(ints);
             }
             entry.sub = std::move(set);
             if (num_sub_cache.size() > 128) num_sub_cache.clear();
@@ -31075,15 +31381,34 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
             cached_n = &slot;
           }
         }
-        if (cached_n) {
+        // Values or column past what a double carries: each row's integer against the values, exactly. A
+        // column of anything but integers then leaves it to the evaluator's set below.
+        const bool exact = cached_n && (cached_n->wide || wide_numbers(cs));
+        if (cached_n && (!exact || typed_integer(cs))) {
           p.kind = Pred::InSub;
           p.col = col;
           p.negated = e->negated;
           p.nulls = has_nulls(cs);
           p.sub = cached_n->sub;
-          p.blo = cached_n->blo;
-          p.bits = cached_n->bits;
-          if (!e->negated) p.sub_vals = cached_n->sub_vals;
+          if (exact) {
+            std::shared_ptr<const std::vector<int64_t>> ints = cached_n->sorted_ints;
+            if (!ints) {
+              // the column is wide, the values are not and were kept as a bitmap or doubles: read them back
+              auto v = std::make_shared<std::vector<int64_t>>();
+              for (size_t w = 0; w < cached_n->bits.size(); ++w)
+                for (uint64_t m = cached_n->bits[w]; m; m &= m - 1) v->push_back(cached_n->blo + (int64_t)(w * 64 + (size_t)__builtin_ctzll(m)));
+              cached_n->sub->num_set.for_each([&](double d) { v->push_back((int64_t)d); });   // below 2^53: exact
+              std::sort(v->begin(), v->end());
+              v->erase(std::unique(v->begin(), v->end()), v->end());
+              ints = std::move(v);
+            }
+            p.int_mode = true;
+            p.sub_ints = std::move(ints);
+          } else {
+            p.blo = cached_n->blo;
+            p.bits = cached_n->bits;
+          }
+          if (!e->negated && !exact) p.sub_vals = cached_n->sub_vals;
           p.expr = e;
           return p;
         }
@@ -31122,6 +31447,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
           p.col = col;
           p.negated = e->negated;
           p.nulls = has_nulls(cs);
+          p.exact_confirm = wide_numbers(cs) || !set->wide_exact.empty() || !set->wide_text.empty();
           p.sub = std::move(set);
           p.expr = e;
           return p;
@@ -31326,12 +31652,30 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
     if (numeric_col && e->op == ExprOp::In && !e->negated && e->subquery_sql.empty() && e->args.size() >= 2 &&
         e->args[0]->op == ExprOp::Column) {
       std::unordered_set<double> nums;
+      std::vector<Val> vals;
       bool ok = true;
+      bool exact = false;   // integer mode: the column or a value is past what a double carries
       for (size_t i = 1; i < e->args.size() && ok; ++i) {
         Val v;
         if (!constant_value(e->args[i].get(), local, base, &v)) { ok = false; break; }
         if (v.null) continue;   // NULL is IN nothing
         nums.insert(val_as_number(v));
+        exact = exact || needs_int_mode(cs, v, nullptr);
+        vals.push_back(std::move(v));
+      }
+      if (ok && exact) {
+        // each value as the column's integer; one that is not a whole one of them matches no row
+        const int cscale = exact_int_scale(cs);
+        for (const Val& v : vals) {
+          AIOS_INT128 d = 0, fl = 0, ce = 0;
+          int sc = 0;
+          if (!exact_constant_of(v, cscale == 0, &d, &sc)) { p.kind = Pred::Row; return p; }   // not exact: the evaluator
+          int_floor_ceil(d, sc, cscale, &fl, &ce);
+          if (fl == ce && fl >= (AIOS_INT128)INT64_MIN && fl <= (AIOS_INT128)INT64_MAX) p.int_set.push_back((int64_t)fl);
+        }
+        std::sort(p.int_set.begin(), p.int_set.end());
+        p.int_set.erase(std::unique(p.int_set.begin(), p.int_set.end()), p.int_set.end());
+        p.int_mode = true;
       }
       if (ok) {
         p.kind = Pred::InNum;
@@ -31355,6 +31699,13 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       bool ok = constant_value(e->args[1].get(), local, base, &a) && as_number(a, &p.lo);
       if (ok && e->op == ExprOp::Between)
         ok = e->args.size() == 3 && constant_value(e->args[2].get(), local, base, &b) && as_number(b, &p.hi);
+      const Val* bp = e->op == ExprOp::Between ? &b : nullptr;
+      if (ok && needs_int_mode(cs, a, bp)) {
+        p.op = e->op;
+        p.negated = e->negated;
+        ok = set_int_mode(p, cs, a, bp);
+        if (!ok) { p.int_mode = false; p.negated = false; p.kind = Pred::Row; return p; }   // not exact: the evaluator
+      }
       if (ok) {
         p.kind = Pred::NumCmp;
         p.col = col;
@@ -32008,6 +32359,18 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
     }
     case Pred::NumCmp: {
       const ColumnStore& cs = t.col_data[p.col];
+      if (p.int_mode) {
+        // the integers the column keeps, against the exact range
+        static thread_local std::vector<int64_t> intsv;
+        if (intsv.size() < n) intsv.resize(n);
+        int64_t* xs = intsv.data();
+        typed_ints(cs, start, start + n, xs);
+        const int64_t lo = p.ilo, hi = p.ihi;
+        if (p.iout) for (size_t i = 0; i < n; ++i) out[i] = xs[i] < lo || xs[i] > hi;
+        else for (size_t i = 0; i < n; ++i) out[i] = xs[i] >= lo && xs[i] <= hi;
+        if (p.nulls) set_null_rows(cs, start, n, out, kN);
+        return;
+      }
       static thread_local std::vector<double> valsv;
       if (valsv.size() < n) valsv.resize(n);
       double* vals = valsv.data();
@@ -32074,6 +32437,14 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
     }
     case Pred::InNum: {
       const ColumnStore& cs = t.col_data[p.col];
+      if (p.int_mode) {
+        std::vector<int64_t> xs(n);
+        typed_ints(cs, start, start + n, xs.data());
+        for (size_t i = 0; i < n; ++i)
+          out[i] = (p.nulls && cs.is_null(start + i)) ? kN
+                   : (std::binary_search(p.int_set.begin(), p.int_set.end(), xs[i]) ? kT : kF);
+        return;
+      }
       std::vector<double> vals(n);
       typed_values(cs, start, start + n, vals.data());
       for (size_t i = 0; i < n; ++i)
@@ -32097,8 +32468,21 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
       // No values at all: NOT IN holds and IN fails, even for a NULL.
       const bool empty_set = !S.has_null && !S.has_numeric && !S.has_string;
       const uint8_t null_ans = empty_set ? (p.negated ? kT : kF) : kN;
+      if (p.int_mode) {
+        // exact: the row's integer among the values
+        std::vector<int64_t> xs(n);
+        typed_ints(cs, start, start + n, xs.data());
+        const std::vector<int64_t>& ints = *p.sub_ints;
+        for (size_t i = 0; i < n; ++i) {
+          if (live && !live[i]) { out[i] = kF; continue; }
+          if (p.nulls && cs.is_null(start + i)) { out[i] = null_ans; continue; }
+          out[i] = std::binary_search(ints.begin(), ints.end(), xs[i]) ? yes : no;
+        }
+        return;
+      }
       const bool bitmap = !p.bits.empty();
       const uint64_t span = (uint64_t)p.bits.size() * 64;
+      const bool approx_col = cs.encoding == ColumnEncoding::TypedDouble || cs.encoding == ColumnEncoding::ALP;
       for (size_t i = 0; i < n; ++i) {
         if (live && !live[i]) { out[i] = kF; continue; }
         if (p.nulls && cs.is_null(start + i)) { out[i] = null_ans; continue; }
@@ -32108,7 +32492,14 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
           const uint64_t o = (uint64_t)((int64_t)v - p.blo);
           hit = v == std::floor(v) && o < span && (p.bits[o >> 6] >> (o & 63) & 1);
         } else {
-          hit = (S.has_numeric && S.num_set.contains(v)) || S.text_num_set.contains(v);
+          hit = (S.has_numeric && S.num_set.contains(v)) || S.text_num_set.contains(v) || (p.exact_confirm && S.wide_dbl.contains(v));
+        }
+        // Numbers a double cannot carry, on either side: a value equal to one of the set's is equal as a double
+        // too, so only a hit can be wrong; the row's exact value decides it.
+        if (hit && p.exact_confirm) {
+          Val rv = val_num_with_text(v, cs.get(start + i));
+          rv.approx = approx_col;
+          hit = S.contains(rv);
         }
         out[i] = hit ? yes : no;
       }
@@ -32472,7 +32863,7 @@ static void eval_pred_bitmask(const Pred& p, const SqlTable& t, size_t start, si
     if (is_and) bitmask_and_words(mask_out, other, num_words);
     else bitmask_or_words(mask_out, other, num_words);
     return;
-  } else if (p.kind == Pred::NumCmp) {
+  } else if (p.kind == Pred::NumCmp && !p.int_mode) {   // integer mode: eval_pred's loop below
     const ColumnStore& cs = t.col_data[p.col];
     static thread_local std::vector<double> valsv;
     if (valsv.size() < n) valsv.resize(n);
@@ -32829,6 +33220,7 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
       if (!built && !worth) continue;
       std::unique_lock<aios::hal::Mutex> held;
       auto ci = col_index(t, q->col, true, &held);
+      if (q->int_mode && !ci->typed) continue;   // exact integers need the index kept by them
       // Count first (offsets / bounds); gather only if it is a lookup.
       size_t n = 0;
       if (q->kind == Pred::PerCode)
@@ -32839,10 +33231,13 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
       // 15 s each (adm.salesman.getTotalSales).
       // A long list: its whole numbers sorted, and walked along the index once.
       std::vector<int64_t> many;
-      if (q->kind == Pred::InNum && q->num_set.size() > 64 && ci->typed) {
-        many.reserve(q->num_set.size());
-        for (double v : q->num_set) if (v == std::floor(v) && std::fabs(v) <= 9e18) many.push_back((int64_t)v);
-        std::sort(many.begin(), many.end());
+      if (q->kind == Pred::InNum && (q->num_set.size() > 64 || q->int_mode) && ci->typed) {
+        if (q->int_mode) many = q->int_set;   // exact: integer mode's values, sorted
+        else {
+          many.reserve(q->num_set.size());
+          for (double v : q->num_set) if (v == std::floor(v) && std::fabs(v) <= 9e18) many.push_back((int64_t)v);
+          std::sort(many.begin(), many.end());
+        }
         n = rows_equal_to_sorted(*ci, cs, many, nullptr, total / 32);
       } else if (q->kind == Pred::InNum)
         for (double v : q->num_set) { n += count_equal_to(*ci, cs, v); if (n >= total / 32) break; }
@@ -32850,14 +33245,15 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
         for (double v : q->sub_vals) { n += count_equal_to(*ci, cs, v); if (n >= total / 32) break; }
       int64_t rlo = INT64_MIN, rhi = INT64_MAX;
       if (range_cmp) {
-        int_range_of(*q, &rlo, &rhi);
+        int_bounds_of(*q, &rlo, &rhi);
         n = count_in_range(*ci, cs, rlo, rhi);
       }
       if ((q->kind != Pred::NumCmp || range_cmp) && n >= total / 32) continue;
       std::vector<uint32_t> rows;
       if (range_cmp) rows_in_range(*ci, cs, rlo, rhi, &rows);
+      else if (q->kind == Pred::NumCmp && q->int_mode) { if (q->ilo <= q->ihi) rows_in_range(*ci, cs, q->ilo, q->ihi, &rows); }
       else if (q->kind == Pred::NumCmp) rows_equal_to(*ci, cs, q->lo, &rows);
-      else if (q->kind == Pred::InNum && !many.empty()) { rows_equal_to_sorted(*ci, cs, many, &rows, SIZE_MAX); std::sort(rows.begin(), rows.end()); }
+      else if (q->kind == Pred::InNum && (!many.empty() || q->int_mode)) { rows_equal_to_sorted(*ci, cs, many, &rows, SIZE_MAX); std::sort(rows.begin(), rows.end()); }
       else if (q->kind == Pred::InNum) { for (double v : q->num_set) rows_equal_to(*ci, cs, v, &rows); std::sort(rows.begin(), rows.end()); }
       else if (q->kind == Pred::InSub) { for (double v : q->sub_vals) rows_equal_to(*ci, cs, v, &rows); std::sort(rows.begin(), rows.end()); }
       else {
@@ -32881,7 +33277,8 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
         };
         auto exact_int = [](double v) { return v == std::floor(v) && std::fabs(v) <= 9e18; };
         if (range_cmp) add_range(rlo, rhi);
-        else if (q->kind == Pred::NumCmp) { if (exact_int(q->lo)) add_range((int64_t)q->lo, (int64_t)q->lo); }
+        else if (q->kind == Pred::NumCmp) { int64_t a = 0, b = -1; int_bounds_of(*q, &a, &b); if (a <= b) add_range(a, b); }
+        else if (q->kind == Pred::InNum && q->int_mode) { for (int64_t v : q->int_set) add_range(v, v); }
         else if (q->kind == Pred::InNum) { for (double v : q->num_set) if (exact_int(v)) add_range((int64_t)v, (int64_t)v); }
         else if (q->kind == Pred::InSub) { for (double v : q->sub_vals) add_range((int64_t)v, (int64_t)v); }
         else for (uint32_t k : lcodes) add_range((int64_t)k, (int64_t)k);
@@ -32893,7 +33290,8 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
             if (ci->typed) {
               const int64_t x = typed_int(cs, r);
               if (range_cmp) return x >= rlo && x <= rhi;
-              if (q->kind == Pred::NumCmp) return exact_int(q->lo) && x == (int64_t)q->lo;
+              if (q->kind == Pred::NumCmp) { int64_t a = 0, b = -1; int_bounds_of(*q, &a, &b); return x >= a && x <= b; }
+              if (q->kind == Pred::InNum && q->int_mode) return std::binary_search(q->int_set.begin(), q->int_set.end(), x);
               if (q->kind == Pred::InNum) { for (double v : q->num_set) if (exact_int(v) && x == (int64_t)v) return true; return false; }
               if (q->kind == Pred::InSub) { for (double v : q->sub_vals) if (x == (int64_t)v) return true; return false; }
               return false;
@@ -32923,14 +33321,14 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
         const size_t ntail = total - best_covered;
         if (q.kind == Pred::NumCmp || q.kind == Pred::InNum || q.kind == Pred::InSub) {
           int64_t rlo = INT64_MIN, rhi = INT64_MAX;
-          if (q.kind == Pred::NumCmp && q.op != ExprOp::Eq) int_range_of(q, &rlo, &rhi);
+          if (q.kind == Pred::NumCmp) int_bounds_of(q, &rlo, &rhi);
           for (size_t r = best_covered; r < total; ++r) {
             if (cs.is_null(r)) continue;
             const int64_t v = typed_int(cs, r);
             bool hit;
-            if (q.kind == Pred::InNum) hit = q.num_set.count((double)v) > 0;
+            if (q.kind == Pred::InNum && q.int_mode) hit = std::binary_search(q.int_set.begin(), q.int_set.end(), v);
+            else if (q.kind == Pred::InNum) hit = q.num_set.count((double)v) > 0;
             else if (q.kind == Pred::InSub) hit = std::binary_search(q.sub_vals.begin(), q.sub_vals.end(), (double)v);
-            else if (q.op == ExprOp::Eq) hit = (double)v == q.lo;
             else hit = v >= rlo && v <= rhi;
             if (hit) cand.push_back((uint32_t)r);
           }
@@ -33767,6 +34165,7 @@ struct Agg {
   std::vector<int> min_rank;         // Min/Max on a Text CodeCol: code -> collation rank
   std::shared_ptr<const NumProg> prog;   // SUM/AVG of arithmetic the column kernels can do
   int static_scale = -1;             // SUM/AVG of a DECIMAL-typed expression: the scale its type gives the result
+  bool mm_ints = false;              // Min/Max on a typed column of integers a double cannot carry: compared as them
 };
 
 struct AggState {
@@ -33781,6 +34180,7 @@ struct AggState {
   // MIN/MAX
   bool has = false;
   double best_num = 0;
+  int64_t best_int = 0;              // mm_ints
   int best_rank = 0;
   Val best;
   int64_t best_row = -1;
@@ -33828,6 +34228,10 @@ bool plan_agg(const SqlExpr* node, const SqlTable& t, const EvalCtx& local, cons
     // rank, a NULL-valued entry ranks -1 and is skipped by the readers.
     a.min_rank = dict_rank_of(t, a.src);
   }
+  // 9007199254740993 is not ...992, nor are two ids near 2^63 one number: their MIN / MAX by the integers kept
+  if ((a.kind == Agg::Min || a.kind == Agg::Max) && a.src.kind == Source::TypedCol && a.col_rules &&
+      a.src.col < t.col_data.size() && exact_int_scale(t.col_data[a.src.col]) >= 0 && wide_numbers(t.col_data[a.src.col]))
+    a.mm_ints = true;
   *out = a;
   return true;
 }
@@ -33941,6 +34345,12 @@ void accumulate(const Agg& a, AggState& st, size_t r, RowReader& rd) {
     case Agg::Min:
     case Agg::Max: {
       const bool is_min = a.kind == Agg::Min;
+      if (a.col_rules && a.src.kind == Source::TypedCol && a.mm_ints) {
+        if (cs.is_null(r)) return;
+        const int64_t x = typed_int(cs, r);
+        if (!st.has || (is_min ? x < st.best_int : x > st.best_int)) { st.has = true; st.best_int = x; st.best_row = (int64_t)r; }
+        return;
+      }
       if (a.col_rules && a.src.kind == Source::TypedCol) {
         if (cs.is_null(r)) return;
         double d = typed_value(cs, r);
@@ -34057,6 +34467,7 @@ struct AggArrays {
   std::vector<std::unordered_set<int64_t>> ids;       // COUNT(DISTINCT) integers
   std::vector<std::unordered_set<std::string>> strs;  // COUNT(DISTINCT) text
   std::vector<Val> best;                // MIN/MAX through the evaluator
+  std::vector<int64_t> ibest;           // MIN/MAX of Agg::mm_ints
   std::vector<uint8_t> has;
   std::vector<uint8_t> exact;           // expression SUM still exact
   std::vector<AIOS_INT128> etot;
@@ -34106,7 +34517,8 @@ AggPlan plan_mode(const Agg& a, const SqlTable& t) {
       break;
     case Agg::Min:
     case Agg::Max:
-      if (a.col_rules && typed) { p.mode = AggMode::Par; p.need_nums = true; }
+      if (a.col_rules && typed && a.mm_ints) { p.mode = AggMode::Par; p.need_ints = true; }
+      else if (a.col_rules && typed) { p.mode = AggMode::Par; p.need_nums = true; }
       else if (!a.min_rank.empty()) { p.mode = AggMode::Par; p.need_codes = true; }
       break;
     case Agg::Sum:
@@ -34190,7 +34602,8 @@ void init_arrays(const Agg& a, const AggPlan& p, size_t G, AggArrays& A) {
     case Agg::Min: case Agg::Max:
       A.has.assign(G, 0);
       A.row.assign(G, -1);
-      if (p.need_nums) A.num.assign(G, 0);
+      if (p.need_ints) A.ibest.assign(G, 0);
+      else if (p.need_nums) A.num.assign(G, 0);
       else if (p.need_codes) A.rank.assign(G, 0);
       else A.best.assign(G, val_null());
       break;
@@ -34250,6 +34663,12 @@ inline void acc_row(const Agg& a, const AggPlan& p, AggArrays& A, uint32_t g, si
     case Agg::Min:
     case Agg::Max: {
       const bool is_min = a.kind == Agg::Min;
+      if (p.need_ints) {
+        if (nulls && cs.is_null(r)) return;
+        const int64_t x = c.ints[i];
+        if (!A.has[g] || (is_min ? x < A.ibest[g] : x > A.ibest[g])) { A.has[g] = 1; A.ibest[g] = x; A.row[g] = (int64_t)r; }
+        return;
+      }
       if (p.need_nums) {
         if (nulls && cs.is_null(r)) return;
         double d = c.nums[i];
@@ -34363,7 +34782,10 @@ void merge_arrays(const Agg& a, const AggPlan& p, AggArrays& dst, const AggArray
         const bool is_min = a.kind == Agg::Min;
         bool take;
         if (!dst.has[g]) take = true;
-        else if (p.need_nums) {
+        else if (p.need_ints) {
+          const int64_t x = src.ibest[g], y = dst.ibest[g];
+          take = (is_min ? x < y : x > y) || (x == y && src.row[g] < dst.row[g]);
+        } else if (p.need_nums) {
           double x = src.num[g], y = dst.num[g];
           take = (is_min ? x < y : x > y) || (x == y && src.row[g] < dst.row[g]);
         } else if (p.need_codes) {
@@ -34376,7 +34798,8 @@ void merge_arrays(const Agg& a, const AggPlan& p, AggArrays& dst, const AggArray
         if (take) {
           dst.has[g] = 1;
           dst.row[g] = src.row[g];
-          if (p.need_nums) dst.num[g] = src.num[g];
+          if (p.need_ints) dst.ibest[g] = src.ibest[g];
+          else if (p.need_nums) dst.num[g] = src.num[g];
           else if (p.need_codes) dst.rank[g] = src.rank[g];
           else dst.best[g] = src.best[g];
         }
@@ -34481,7 +34904,7 @@ inline double typed_value_at(const ColumnStore& cs, size_t r) {
     case ColumnEncoding::TypedInt64: return (double)cs.int64_data[r];
     case ColumnEncoding::TypedDouble: return cs.double_data[r];
     case ColumnEncoding::FOR: return (double)(cs.base_int64 + (int64_t)code_at(cs, r));
-    case ColumnEncoding::DecimalScaled: return (double)(cs.base_int64 + (int64_t)code_at(cs, r)) / cs.scale_factor;
+    case ColumnEncoding::DecimalScaled: return scaled_decimal_double(cs.base_int64 + (int64_t)code_at(cs, r), cs.scale_factor);
     case ColumnEncoding::SegmentFOR: return (double)cs.segfor_value(r);
     case ColumnEncoding::ALP: return cs.alp_value(r);
     default: return 0.0;
@@ -35088,7 +35511,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             // Single-group kernels: a tight loop instead of a call per row.
             if (a.kind == Agg::CountStar) { A.cnt[0] += n; continue; }
             if (a.kind == Agg::Count && a.col_rules && !nulls[ai]) { A.cnt[0] += n; continue; }
-            if ((a.kind == Agg::Min || a.kind == Agg::Max) && (p.need_nums || p.need_codes)) {
+            if ((a.kind == Agg::Min || a.kind == Agg::Max) && (p.need_nums || p.need_codes || p.need_ints)) {
               if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
               else decode_for(a, p, cs, start, end, cols[ai]);
               const bool is_min = a.kind == Agg::Min;
@@ -35097,7 +35520,10 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 const size_t r = dense ? start + j : rows[j];
                 if (nn && cs.is_null(r)) continue;
                 const size_t i = r - start;
-                if (p.need_nums) {
+                if (p.need_ints) {
+                  const int64_t x = cols[ai].ints[i];
+                  if (!A.has[0] || (is_min ? x < A.ibest[0] : x > A.ibest[0])) { A.has[0] = 1; A.ibest[0] = x; A.row[0] = (int64_t)r; }
+                } else if (p.need_nums) {
                   double d = cols[ai].nums[i];
                   if (!A.has[0] || (is_min ? d < A.num[0] : d > A.num[0])) { A.has[0] = 1; A.num[0] = d; A.row[0] = (int64_t)r; }
                 } else {
@@ -35351,6 +35777,7 @@ struct SortKey {
   std::vector<int> rank;             // Rank: code -> collation rank
   std::vector<double> code_num;      // Num on a dict column: code -> number
   std::vector<uint8_t> code_null;
+  bool ints = false;                 // Num on a typed column of integers a double cannot carry: sorted by them
 };
 
 }  // namespace vx
@@ -36191,7 +36618,10 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
           sk.col = sh.cols[0];
           const ColumnStore& cs = t.col_data[sk.col];
           const bool numeric = sql_type_numeric(t.columns[sk.col].type);
-          if (numeric && typed_numeric(cs)) sk.kind = SortKey::Num;
+          if (numeric && typed_numeric(cs)) {
+            sk.kind = SortKey::Num;
+            sk.ints = exact_int_scale(cs) >= 0 && wide_numbers(cs);   // 9007199254740993 sorts after ...992
+          }
           else if (dict_coded(cs) && worth_per_code(cs)) {
             Source s = make_source(sk.expr, t, local, base);
             if (s.kind == Source::CodeCol) {
@@ -36234,14 +36664,20 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
         // One pass over the selected rows; each thread keeps only its best
         // `want` rows (a bounded heap) when a page was asked for.
         const size_t nk = keys.size();
-        struct Cand { double k[4]; uint8_t nulls; uint32_t row; };
+        union KeyVal { double d; int64_t i; };   // i: a key of SortKey::ints
+        struct Cand { KeyVal k[4]; uint8_t nulls; uint32_t row; };
         auto cand_less = [&](const Cand& a, const Cand& b) {
           for (size_t j = 0; j < nk; ++j) {
             bool xn = (a.nulls >> j) & 1, yn = (b.nulls >> j) & 1;
             if (xn && yn) continue;
             if (xn) return !keys[j].desc;
             if (yn) return keys[j].desc;
-            double x = a.k[j], y = b.k[j];
+            if (keys[j].ints) {
+              const int64_t x = a.k[j].i, y = b.k[j].i;
+              if (x == y) continue;
+              return keys[j].desc ? x > y : x < y;
+            }
+            double x = a.k[j].d, y = b.k[j].d;
             if (x == y) continue;
             return keys[j].desc ? x > y : x < y;
           }
@@ -36263,6 +36699,7 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
           auto& H = best[tid];
           std::vector<uint32_t> rows;
           std::vector<std::vector<double>> nums(nk);
+          std::vector<std::vector<int64_t>> ints(nk);
           std::vector<std::vector<uint32_t>> codes(nk);
           for (size_t m = m0; m < m1; ++m) {
             const size_t n = selection.rows_of(m, rows);
@@ -36274,7 +36711,8 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
             for (size_t j = 0; !sparse && j < nk; ++j) {
               const SortKey& k = keys[j];
               const ColumnStore& cs = t.col_data[k.col];
-              if (k.kind == SortKey::Num && k.code_num.empty()) { nums[j].resize(end - start); typed_values(cs, start, end, nums[j].data()); }
+              if (k.kind == SortKey::Num && k.ints) { ints[j].resize(end - start); typed_ints(cs, start, end, ints[j].data()); }
+              else if (k.kind == SortKey::Num && k.code_num.empty()) { nums[j].resize(end - start); typed_values(cs, start, end, nums[j].data()); }
               else { codes[j].resize(end - start); decode_codes(cs, start, end, codes[j].data()); }
             }
             for (size_t i = 0; i < n; ++i) {
@@ -36287,6 +36725,11 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
                 const ColumnStore& cs = t.col_data[k.col];
                 bool isnull = cs.is_null(r);
                 double v = 0;
+                if (!isnull && k.ints) {
+                  c.k[j].i = sparse ? typed_int(cs, r) : ints[j][r - start];
+                  continue;
+                }
+                if (isnull) c.k[j].i = 0;
                 if (!isnull) {
                   if (k.kind == SortKey::Num && k.code_num.empty()) v = sparse ? typed_value(cs, r) : nums[j][r - start];
                   else {
@@ -36295,7 +36738,7 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
                     else { int rk = cd < k.rank.size() ? k.rank[cd] : -1; isnull = rk < 0; v = rk; }
                   }
                 }
-                c.k[j] = v;
+                if (!k.ints) c.k[j].d = v;
                 if (isnull) c.nulls |= (uint8_t)(1u << j);
               }
               if (!bounded) { H.push_back(c); continue; }
@@ -37551,6 +37994,32 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     } else {
       return nullptr;
     }
+    // Numbers a double cannot tell apart (9007199254740993 and ...992, ids near 2^63): each row's key becomes its
+    // exact rank among the selected rows' numbers - the integers a typed column keeps, a dictionary entry's digits.
+    // These windows only order and group by their keys (no frame arithmetic), which ranks keep.
+    if (numeric && vx::wide_numbers(cs)) {
+      const bool ints = vx::exact_int_scale(cs) >= 0;
+      if (!ints && !vx::dict_coded(cs)) return nullptr;
+      std::vector<uint32_t> order;
+      order.reserve(n);
+      for (size_t i = 0; i < n; ++i) if (k[i] != kNull) order.push_back((uint32_t)i);
+      std::vector<int64_t> iv;
+      if (ints) { iv.resize(n); for (uint32_t i : order) iv[i] = vx::typed_int(cs, rows[i]); }
+      auto cmp = [&](uint32_t a, uint32_t bb) -> int {
+        if (ints) return iv[a] < iv[bb] ? -1 : iv[a] > iv[bb] ? 1 : 0;
+        if (k[a] != k[bb]) return k[a] < k[bb] ? -1 : 1;
+        const int c = decimal_text_compare(vx::dict_view(cs, vx::code_at(cs, rows[a])), vx::dict_view(cs, vx::code_at(cs, rows[bb])));
+        return c == 2 ? 0 : c;
+      };
+      std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t bb) { const int c = cmp(a, bb); return c ? c < 0 : a < bb; });
+      double rk = 0;
+      std::vector<double> rank(n, kNull);
+      for (size_t i = 0; i < order.size(); ++i) {
+        if (i > 0 && cmp(order[i - 1], order[i]) != 0) ++rk;
+        rank[order[i]] = rk;
+      }
+      for (uint32_t i : order) k[i] = rank[i];
+    }
     return &keyed.emplace(col, std::move(k)).first->second;
   };
   // Keys that are whole numbers in a small span (ranked texts, ids, codes) packed into one integer, most
@@ -37954,7 +38423,17 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
   // A column of text and NULLs only is ranked: each text's place among the column's distinct texts (in the
   // collation's order, equal texts one place) becomes its number, so it sorts as numbers do - packed below -
   // instead of a case-insensitive string compare per comparison (200k orders partitioned by customer: 3.5M of them).
-  struct KeyCol { std::vector<uint8_t> cls; std::vector<double> num; std::vector<const std::string*> txt; bool ranked = false; };
+  struct KeyCol {
+    std::vector<uint8_t> cls; std::vector<double> num; std::vector<const std::string*> txt; bool ranked = false;
+    // Numbers a double cannot carry: each one exactly, as an integer at scale ex_scale, for a RANGE frame's
+    // arithmetic (9007199254740993 - 1 is ...992; as doubles it was ...992 - 1). int_col: an integer column,
+    // whose bounds MariaDB works out as BIGINT and refuses past its range.
+    bool wide = false;
+    std::vector<AIOS_INT128> ex;
+    int ex_scale = 0;
+    bool int_col = false;
+    bool unsigned_vals = false;   // ... holding a value past INT64_MAX: BIGINT UNSIGNED
+  };
   std::unordered_map<size_t, KeyCol> keycols;
   auto make_keycol = [&](auto&& cell_at, bool str) {
     KeyCol k;
@@ -37995,6 +38474,34 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
       }
       for (uint32_t r : order) { k.num[r] = rank[r]; k.txt[r] = &cell_at(r); }
       k.ranked = true;   // a RANGE frame's arithmetic reads the number itself (txt), not its rank
+      // ... exactly: every number as an integer at the widest scale among them
+      int sc = 0;
+      for (uint32_t r : order) {
+        const std::string c = canonical_decimal(cell_at(r));
+        const size_t dot = c.find('.');
+        if (dot != std::string::npos) sc = std::max(sc, (int)(c.size() - dot - 1));
+      }
+      bool ok = sc <= 18;
+      k.ex.assign(n, 0);
+      for (size_t i = 0; i < order.size() && ok; ++i) {
+        const uint32_t r = order[i];
+        const std::string c = canonical_decimal(cell_at(r));
+        const bool neg = !c.empty() && c[0] == '-';
+        AIOS_INT128 x = 0;
+        int frac = -1, digits = 0;
+        for (size_t j = neg ? 1 : 0; j < c.size() && ok; ++j) {
+          if (c[j] == '.') { frac = 0; continue; }
+          if (++digits > 36) ok = false;
+          x = x * 10 + (c[j] - '0');
+          if (frac >= 0) ++frac;
+        }
+        for (int f = frac < 0 ? 0 : frac; f < sc && ok; ++f) x *= 10;
+        if (c.empty()) ok = false;
+        k.ex[r] = neg ? -x : x;
+        if (!neg && x > (AIOS_INT128)INT64_MAX) k.unsigned_vals = true;
+      }
+      k.wide = ok;
+      k.ex_scale = sc;
     }
     if (has_txt && !has_num) {
       std::unordered_map<std::string_view, uint32_t> ids;
@@ -38027,7 +38534,9 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
   auto keycol = [&](size_t c) -> const KeyCol& {
     auto f = keycols.find(c);
     if (f != keycols.end()) return f->second;
-    return keycols.emplace(c, make_keycol([&](size_t r) -> const std::string& { return r1.rows[r].values[c]; }, is_string(c))).first->second;
+    KeyCol k = make_keycol([&](size_t r) -> const std::string& { return r1.rows[r].values[c]; }, is_string(c));
+    k.int_col = c < r1.column_types.size() && r1.column_types[c] == SqlDataType::Int;
+    return keycols.emplace(c, std::move(k)).first->second;
   };
   // SUM / AVG / COUNT arguments as numbers, once: each value's double, and - when every value of the column is
   // an exact decimal - its digits as one integer at the column's widest scale, so a frame's sum is a difference
@@ -38210,6 +38719,78 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
           const bool numeric_bounds = f.start == WindowSpec::Preceding || f.start == WindowSpec::Following ||
                                       f.end == WindowSpec::Preceding || f.end == WindowSpec::Following;
           if (numeric_bounds && w.order.size() != 1) { err = "RANGE with an offset needs exactly one ORDER BY key"; return false; }
+          if (numeric_bounds && okeys[0]->wide) {
+            // Exact: the keys as integers at the column's scale, the offsets brought to it. An integer column's
+            // bound is a BIGINT, and past BIGINT's range MariaDB refuses the statement (error 1690).
+            const KeyCol& kc = *okeys[0];
+            const bool desc = w.order[0].second;
+            AIOS_INT128 off_s = 0, off_e = 0;
+            auto offset = [&](double v, AIOS_INT128* out) -> bool {
+              char buf[64];
+              std::snprintf(buf, sizeof buf, "%.15g", v);
+              const std::string c = canonical_decimal(buf);
+              if (c.empty() || c[0] == '-') return false;
+              const size_t dot = c.find('.');
+              const int fs = dot == std::string::npos ? 0 : (int)(c.size() - dot - 1);
+              if (fs > kc.ex_scale) return false;   // finer than the column: the double frame below decides
+              AIOS_INT128 x = 0;
+              for (char ch : c) if (ch != '.') x = x * 10 + (ch - '0');
+              for (int i = fs; i < kc.ex_scale; ++i) x *= 10;
+              *out = x;
+              return true;
+            };
+            const bool exact_ok = offset(f.start_n, &off_s) && offset(f.end_n, &off_e);
+            if (exact_ok) {
+              // key in the window's own direction: DESC negated, so PRECEDING is always smaller
+              auto xkey = [&](size_t pos) -> AIOS_INT128 {
+                const size_t r = idx[ps + pos];
+                if (kc.cls[r] == 0) return desc ? ((AIOS_INT128)1 << 120) : -((AIOS_INT128)1 << 120);   // NULLs sort first, or last DESC
+                return desc ? -kc.ex[r] : kc.ex[r];
+              };
+              auto bound = [&](size_t pos, bool following, AIOS_INT128 off, AIOS_INT128* out) -> bool {
+                const AIOS_INT128 b = xkey(pos) + (following ? off : -off);
+                if (kc.int_col && kc.ex_scale == 0 && kc.cls[idx[ps + pos]] != 0) {
+                  const AIOS_INT128 v = desc ? -b : b;   // the bound as the column's own number
+                  const AIOS_INT128 lo = kc.unsigned_vals ? 0 : (AIOS_INT128)INT64_MIN;
+                  const AIOS_INT128 hi = kc.unsigned_vals ? (((AIOS_INT128)1 << 64) - 1) : (AIOS_INT128)INT64_MAX;
+                  if (v < lo || v > hi) {
+                    const SqlExpr* oe = w.spec.order_by.empty() ? nullptr : w.spec.order_by[0].expr.get();
+                    const std::string name = oe && !oe->source_text.empty() ? oe->source_text : std::string("ORDER BY key");
+                    const bool plus = following != desc;
+                    err = std::string(kc.unsigned_vals ? "BIGINT UNSIGNED" : "BIGINT") + " value is out of range in '" + name +
+                          (plus ? " + " : " - ") + scaled_to_decimal(off, 0) + "'";
+                    return false;
+                  }
+                }
+                *out = b;
+                return true;
+              };
+              auto first_at_least_x = [&](AIOS_INT128 x) { size_t a = 0, z = m; while (a < z) { size_t mid = (a + z) / 2; if (xkey(mid) < x) a = mid + 1; else z = mid; } return (long long)a; };
+              auto last_at_most_x = [&](AIOS_INT128 x) { size_t a = 0, z = m; while (a < z) { size_t mid = (a + z) / 2; if (xkey(mid) <= x) a = mid + 1; else z = mid; } return (long long)a - 1; };
+              AIOS_INT128 b = 0;
+              const bool null_row = kc.cls[idx[ps + k]] == 0;
+              switch (f.start) {
+                case WindowSpec::UnboundedPreceding: l = 0; break;
+                case WindowSpec::Preceding: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, false, off_s, &b)) return false; l = first_at_least_x(b); break;
+                case WindowSpec::CurrentRow: l = (long long)gstart[k]; break;
+                case WindowSpec::Following: if (null_row) { l = (long long)gstart[k]; break; } if (!bound(k, true, off_s, &b)) return false; l = first_at_least_x(b); break;
+                case WindowSpec::UnboundedFollowing: l = (long long)m; break;
+              }
+              switch (f.end) {
+                case WindowSpec::UnboundedPreceding: h = -1; break;
+                case WindowSpec::Preceding: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, false, off_e, &b)) return false; h = last_at_most_x(b); break;
+                case WindowSpec::CurrentRow: h = (long long)gend[k] - 1; break;
+                case WindowSpec::Following: if (null_row) { h = (long long)gend[k] - 1; break; } if (!bound(k, true, off_e, &b)) return false; h = last_at_most_x(b); break;
+                case WindowSpec::UnboundedFollowing: h = (long long)m - 1; break;
+              }
+              if (l < 0) l = 0;
+              if (h > (long long)m - 1) h = (long long)m - 1;
+              *lo = (size_t)l;
+              *hi = (size_t)std::max<long long>(h, 0);
+              if (h < l) { *lo = 1; *hi = 0; }
+              return true;
+            }
+          }
           switch (f.start) {
             case WindowSpec::UnboundedPreceding: l = 0; break;
             case WindowSpec::Preceding: l = first_at_least(range_key(k) - f.start_n); break;
@@ -42759,7 +43340,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               double num = 0.0;
               if (dn_base_is_int) num = (double)vx::typed_int(*dn_base_cs, base_ri);
               else if (!dn_base_cs->get_double(base_ri, &num)) return;
-              probe_gather_matches(prep_jkeys[best_ki].idx.get(), Val(num), match_cands);
+              // val_num, not Val(num): Val is an aggregate, and Val(num) put the number in its first member -
+              // `null` - so every key but 0 probed as NULL and a join of two typed tables met almost nothing
+              probe_gather_matches(prep_jkeys[best_ki].idx.get(), val_num(num), match_cands);
               if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
             } else {
               Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
@@ -48870,12 +49453,10 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (!named || at >= tuple.size() || tuple[at].null || zero) { big_needs_ai = true; break; }
     }
   }
-  if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
-  // A big table builds its key map a chunk per INSERT statement, within the
-  // row-index memory budget; complete, the map answers the duplicate check
-  // (via_map below) where the column index plus a string-keyed tail map was
-  // the largest single piece of an INSERT.
-  else if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) sync_row_index(*t, pk_cols, ai_idx, 16384);
+  if (!pk_cols.empty() || ai_idx >= 0) {
+    if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
+    else if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) sync_row_index(*t, pk_cols, ai_idx);
+  }
   auto find_big_pk = [&](const SqlRow& row, const std::string& pk_key) -> long long {
     // Candidates from whichever key column narrows them most for this row:
     // salesorderdetails' key starts with orderlineno, and every order has a
@@ -51102,7 +51683,10 @@ void SqlDatabase::grow_row_index(const SqlTable& t) {
     if (t.columns[i].is_primary_key) pk_cols.push_back((int)i);
     if (t.columns[i].auto_increment) ai_idx = (int)i;
   }
-  if (!pk_cols.empty()) sync_row_index(t, pk_cols, ai_idx, 16384);
+  if (!pk_cols.empty() || ai_idx >= 0) {
+    if (t.row_count() * 24 <= kRowIndexBudgetBytes / 2) sync_row_index(t, pk_cols, ai_idx);
+    else sync_row_index(t, pk_cols, ai_idx, 16384);
+  }
 }
 
 // A SELECT asks with this. It hands back what is already indexed and nothing
@@ -51164,6 +51748,20 @@ std::string SqlDatabase::row_key(const SqlRow& r, const std::vector<int>& pk_col
 
 std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTable& t, const std::vector<int>& pk_cols,
                                                                    int ai_idx, size_t max_rows) {
+  if (pk_cols.empty() && ai_idx < 0) {
+    std::string tkey = lower_of(t.name);
+    std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+    auto it = table_row_indices_.find(tkey);
+    if (it == table_row_indices_.end()) {
+      auto idx = std::make_shared<RowIndex>();
+      idx->table = t.name;
+      idx->rows_indexed = t.row_count();
+      table_row_indices_[tkey] = idx;
+      return idx;
+    }
+    it->second->rows_indexed = t.row_count();
+    return it->second;
+  }
   std::string tkey = lower_of(t.name);
   std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
   auto it = table_row_indices_.find(tkey);
@@ -51817,21 +52415,35 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
   // map finds the row. The vectorized selection (index lookup, candidate
   // check) ran first for every UPDATE by key and was 4% of a write session.
   const bool by_key = order_by.empty() && extract_pk_equality(where, *t, pk_cols, target_pk_key);
-  // A big table's key map grows a chunk per UPDATE by key, within the
-  // row-index budget, as an INSERT grows it: without it every such UPDATE
-  // found its row through the vectorized selection - a sixth of the time a
-  // single-row UPDATE held its table.
-  if (by_key && t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);
-  bool is_point_pk_update = by_key && find_row_index(*t) != nullptr;
+  bool is_point_pk_update = false;
+  std::shared_ptr<RowIndex> row_idx = nullptr;
+  if (by_key && !pk_cols.empty()) {
+    if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);
+    row_idx = get_or_sync_row_index(*t);
+    if (row_idx) {
+      auto hit = row_idx->pk_to_row.find(target_pk_key);
+      if (hit != row_idx->pk_to_row.end() && row_idx->row_of(hit->second) < t->row_count()) {
+        is_point_pk_update = true;
+      }
+    }
+  }
   bool dml_found = false;
   if (!is_point_pk_update) {
     dml_found = dml_matching_rows(this, *t, name, where.get(), order_by.empty() ? limit : -1, &dml_rows, &err);
     if (!err.empty()) return make_error(err);
-    is_point_pk_update = !dml_found && order_by.empty() && extract_pk_equality(where, *t, pk_cols, target_pk_key);
+    if (!dml_found && by_key) {
+      if (!row_idx) row_idx = get_or_sync_row_index(*t);
+      if (row_idx) {
+        auto hit = row_idx->pk_to_row.find(target_pk_key);
+        if (hit != row_idx->pk_to_row.end() && row_idx->row_of(hit->second) < t->row_count()) {
+          is_point_pk_update = true;
+        }
+      }
+    }
   }
 
   if (is_point_pk_update) {
-    std::shared_ptr<RowIndex> row_idx = get_or_sync_row_index(*t);
+    if (!row_idx) row_idx = get_or_sync_row_index(*t);
     auto hit = row_idx->pk_to_row.find(target_pk_key);
     if (hit != row_idx->pk_to_row.end() && row_idx->row_of(hit->second) < t->row_count()) {
       size_t ridx = row_idx->row_of(hit->second);
@@ -52449,28 +53061,36 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   // The whole key given and the row map complete: the key path below, one
   // probe, ahead of the vectorized selection (as execute_update does).
   bool key_first = false;
+  std::shared_ptr<RowIndex> del_idx = nullptr;
+  std::string pkk;
   if (where && order_by.empty()) {
     std::vector<int> pkc;
     for (size_t i = 0; i < t->columns.size(); ++i)
       if (t->columns[i].is_primary_key) pkc.push_back((int)i);
-    std::string pkk;
-    key_first = !pkc.empty() && extract_pk_equality(where, *t, pkc, pkk);
-    if (key_first && t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);   // as execute_update
-    key_first = key_first && find_row_index(*t) != nullptr;
+    if (!pkc.empty() && extract_pk_equality(where, *t, pkc, pkk)) {
+      if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);
+      del_idx = get_or_sync_row_index(*t);
+      if (del_idx) {
+        auto hit = del_idx->pk_to_row.find(pkk);
+        if (hit != del_idx->pk_to_row.end() && del_idx->row_of(hit->second) < t->row_count()) {
+          key_first = true;
+        }
+      }
+    }
   }
   const bool dml_found = key_first ? false : dml_matching_rows(this, *t, name, where.get(), order_by.empty() ? limit : -1, &to_delete, &err);
   if (!err.empty()) return make_error(err);
   // DELETE ... WHERE <the whole primary key> = ...: the row through the key
   // index, not a scan evaluating the predicate on every row.
-  bool point = false;
+  bool point = key_first;
   if (!dml_found && where && order_by.empty()) {
     std::vector<int> pk_cols;
     for (size_t i = 0; i < t->columns.size(); ++i)
       if (t->columns[i].is_primary_key) pk_cols.push_back((int)i);
-    std::string pk_key;
-    if (extract_pk_equality(where, *t, pk_cols, pk_key)) {
+    std::string pk_key = pkk;
+    if (point || extract_pk_equality(where, *t, pk_cols, pk_key)) {
       point = true;
-      std::shared_ptr<RowIndex> idx = get_or_sync_row_index(*t);
+      std::shared_ptr<RowIndex> idx = del_idx ? del_idx : get_or_sync_row_index(*t);
       auto hit = idx->pk_to_row.find(pk_key);
       if (hit != idx->pk_to_row.end() && idx->row_of(hit->second) < t->row_count()) {
         const size_t at = idx->row_of(hit->second);

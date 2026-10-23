@@ -19,7 +19,7 @@ namespace {
 constexpr size_t kNoRow = (size_t)-1;
 constexpr uint32_t kNone = UINT32_MAX;
 constexpr size_t kPerGroupWrites = 64;      // more dirty groups than this: the view table is written whole
-constexpr size_t kTierRowCap = 1000000;     // larger tables are re-encoded only by the engine's own maintenance
+constexpr size_t kTierRowCap = 25000;       // larger tables are re-encoded only by maintenance/boot, not live idle ticks
 
 uint64_t now_ns() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
