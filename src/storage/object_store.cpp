@@ -7,13 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <unordered_set>
-#if !defined(AIOS_METAL) && defined(__GLIBC__)
-#include <malloc.h>
-#endif
-#if defined(AIOS_HAVE_LIBDEFLATE)
-#include <libdeflate.h>
-#endif
-#if defined(AIOS_HAVE_ZLIB)
+#if defined(AIOS_HAVE_ZLIB) || defined(AIOS_HAVE_LIBDEFLATE)
 #include "aios/net/gzip.hpp"
 #endif
 
@@ -100,15 +94,8 @@ constexpr uint32_t kPayloadZMagic = 0x5A4F5341u;
 bool inflate_payload(const uint8_t* z, size_t n, uint32_t plain, ByteBuffer& out) {
   if (plain == 0 || plain > (1u << 28)) return false;
 #if defined(AIOS_HAVE_LIBDEFLATE)
-  struct D {
-    libdeflate_decompressor* d = libdeflate_alloc_decompressor();
-    ~D() { if (d) libdeflate_free_decompressor(d); }
-  };
-  thread_local D dec;
-  if (!dec.d) return false;
   out.resize(plain);
-  size_t got = 0;
-  return libdeflate_deflate_decompress(dec.d, z, n, out.data(), plain, &got) == LIBDEFLATE_SUCCESS && got == plain;
+  return net::host_inflate_raw_exact(ByteSpan(z, n), out.data(), plain);
 #elif defined(AIOS_HAVE_ZLIB)
   size_t consumed = 0;
   out.clear();
@@ -180,18 +167,13 @@ void StoredObject::encode(Writer& w) const {
   }
 #if defined(AIOS_HAVE_LIBDEFLATE)
   if (payload.size() >= 64) {
-    struct C {
-      libdeflate_compressor* c = libdeflate_alloc_compressor(5);
-      ~C() { if (c) libdeflate_free_compressor(c); }
-    };
-    thread_local C comp;
-    if (comp.c) {
+    {
       ByteBuffer comp_buf;
       comp_buf.resize(8 + payload.size());
       std::memcpy(comp_buf.data(), &kPayloadZMagic, 4);
       uint32_t orig_sz = (uint32_t)payload.size();
       std::memcpy(comp_buf.data() + 4, &orig_sz, 4);
-      size_t stored = libdeflate_deflate_compress(comp.c, payload.data(), payload.size(), comp_buf.data() + 8, payload.size());
+      size_t stored = net::host_deflate_raw(ByteSpan(payload.data(), payload.size()), comp_buf.data() + 8, payload.size(), 5);
       if (stored > 0 && 8 + stored < payload.size()) {
         comp_buf.resize(8 + stored);
         w.bytes(ByteSpan(comp_buf.data(), comp_buf.size()));
@@ -2395,18 +2377,14 @@ Result<VacuumStats> ObjectStore::vacuum() {
   index_revision_ = 0;
 
   // The freed index memory goes back to the OS now, not whenever the allocator decides to.
-#if !defined(AIOS_METAL) && defined(__GLIBC__)   // malloc_trim is glibc's (see the <malloc.h> include)
-  malloc_trim(0);
-#endif
+  host_.release_free_memory();   // the host's allocator gives pages back (malloc_trim on glibc)
 
   // Replay & reindex the compacted log
   load_known_spans_locked();
   auto ref_res = refresh_locked();
   if (!ref_res.ok()) return ref_res.error();
   // The replay builds the new indexes through a high-water of temporaries: trim again once they are gone.
-#if !defined(AIOS_METAL) && defined(__GLIBC__)   // malloc_trim is glibc's (see the <malloc.h> include)
-  malloc_trim(0);
-#endif
+  host_.release_free_memory();   // the host's allocator gives pages back (malloc_trim on glibc)
 
   // Only now, with the new log in place, its index installed, and the replay
   // of that log proven, is the side image redundant. Removing it earlier left

@@ -182,7 +182,7 @@ int  aios_crypto_ed25519_verify(const uint8_t pubkey[32], const uint8_t* data, s
                                 const uint8_t sig[64]);
 
 /* -------------------------------------------------------------------------
- * 11. Binary Telemetry & Multi-Agent Inspection ABI
+ * 11. Binary Telemetry & Trace Inspection ABI
  * ------------------------------------------------------------------------- */
 
 /* Record a fast binary telemetry span directly via C-ABI */

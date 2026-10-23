@@ -1,5 +1,7 @@
 // JSON. See include/aios/core/json.hpp.
 #include "aios/core/json.hpp"
+#include "aios/core/numparse.hpp"
+#include "aios/hal/host.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -182,8 +184,8 @@ class Parser {
       if (p_ == es) return fail("invalid number");
     }
     std::string text(t_.substr(s, p_ - s));
-    if (is_int && text.size() < 19) { out = Value::integer(std::strtoll(text.c_str(), nullptr, 10)); return true; }
-    double d = std::strtod(text.c_str(), nullptr);
+    if (is_int && text.size() < 19) { out = Value::integer(aios::num::to_ll(text.c_str(), nullptr, 10)); return true; }
+    double d = aios::hal::parse_double(text.c_str(), nullptr);
     if (!(d > -1.7976931348623157e308 && d < 1.7976931348623157e308)) return fail("number out of range");
     out = Value::number(d);
     return true;

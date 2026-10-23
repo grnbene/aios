@@ -1,11 +1,8 @@
 #include "aios/crypto/x509.hpp"
 
 #include <cstring>
-#ifdef _WIN32
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
+#include <string>
+#include <vector>
 
 #include "aios/core/base64.hpp"
 #include "aios/crypto/sha256.hpp"
@@ -14,6 +11,89 @@
 
 namespace aios::crypto {
 namespace {
+
+// IP addresses as text, read and written here rather than by the host's inet_pton / inet_ntop (the core does not
+// call the host's network library). Dotted IPv4; IPv6 with one "::" and an optional dotted IPv4 tail.
+bool ipv4_from_text(const std::string& s, uint8_t out[4]) {
+  int part = 0, val = -1;
+  for (size_t i = 0; i <= s.size(); ++i) {
+    if (i == s.size() || s[i] == '.') {
+      if (val < 0 || part > 3) return false;
+      out[part++] = (uint8_t)val;
+      val = -1;
+    } else if (s[i] >= '0' && s[i] <= '9') {
+      if (val == 0) return false;   // no leading zeros, as inet_pton
+      val = (val < 0 ? 0 : val) * 10 + (s[i] - '0');
+      if (val > 255) return false;
+    } else return false;
+  }
+  return part == 4;
+}
+bool ipv6_from_text(const std::string& s, uint8_t out[16]) {
+  uint16_t head[8], tail[8];
+  int nh = 0, nt = 0;
+  bool gap = false;
+  size_t i = 0;
+  if (s.compare(0, 2, "::") == 0) { gap = true; i = 2; }
+  else if (!s.empty() && s[0] == ':') return false;
+  while (i < s.size()) {
+    size_t j = i;
+    while (j < s.size() && s[j] != ':') ++j;
+    std::string g = s.substr(i, j - i);
+    if (g.find('.') != std::string::npos) {   // the last 32 bits as a dotted quad
+      uint8_t v4[4];
+      if (j != s.size() || !ipv4_from_text(g, v4)) return false;
+      uint16_t* dst = gap ? tail : head; int& n = gap ? nt : nh;
+      if (n + 2 > 8) return false;
+      dst[n++] = (uint16_t)(v4[0] << 8 | v4[1]);
+      dst[n++] = (uint16_t)(v4[2] << 8 | v4[3]);
+      i = j;
+      break;
+    }
+    if (g.empty() || g.size() > 4) return false;
+    unsigned v = 0;
+    for (char c : g) {
+      int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+      if (d < 0) return false;
+      v = v * 16 + (unsigned)d;
+    }
+    uint16_t* dst = gap ? tail : head; int& n = gap ? nt : nh;
+    if (n >= 8) return false;
+    dst[n++] = (uint16_t)v;
+    if (j == s.size()) { i = j; break; }
+    if (s.compare(j, 2, "::") == 0) { if (gap) return false; gap = true; i = j + 2; if (i == s.size()) break; }
+    else { i = j + 1; if (i == s.size()) return false; }
+  }
+  if (gap ? nh + nt > 7 : nh != 8) return false;
+  uint16_t all[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int k = 0; k < nh; ++k) all[k] = head[k];
+  for (int k = 0; k < nt; ++k) all[8 - nt + k] = tail[k];
+  for (int k = 0; k < 8; ++k) { out[2 * k] = (uint8_t)(all[k] >> 8); out[2 * k + 1] = (uint8_t)all[k]; }
+  return true;
+}
+std::string ip_to_text(const std::vector<uint8_t>& ip) {
+  if (ip.size() == 4) return std::to_string(ip[0]) + "." + std::to_string(ip[1]) + "." + std::to_string(ip[2]) + "." + std::to_string(ip[3]);
+  if (ip.size() != 16) return "?";
+  uint16_t g[8];
+  for (int k = 0; k < 8; ++k) g[k] = (uint16_t)(ip[2 * k] << 8 | ip[2 * k + 1]);
+  int best = -1, best_len = 1;   // the longest run of two or more zero groups becomes "::" (RFC 5952)
+  for (int k = 0; k < 8;) {
+    if (g[k] != 0) { ++k; continue; }
+    int e = k;
+    while (e < 8 && g[e] == 0) ++e;
+    if (e - k > best_len) { best = k; best_len = e - k; }
+    k = e;
+  }
+  static const char* hx = "0123456789abcdef";
+  auto group = [&](uint16_t v) { std::string t; bool lead = true; for (int sh = 12; sh >= 0; sh -= 4) { int d = (v >> sh) & 15; if (d || !lead || sh == 0) { t += hx[d]; lead = false; } } return t; };
+  std::string out;
+  for (int k = 0; k < 8; ++k) {
+    if (k == best) { out += "::"; k += best_len - 1; continue; }
+    if (!out.empty() && out.back() != ':') out += ":";
+    out += group(g[k]);
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // DER: tag, length, value. Nothing here allocates a parse tree; the reader
@@ -398,11 +478,11 @@ bool x509_covers_host(const Certificate& cert, const std::string& host) {
     std::string h = host;
     if (h.size() > 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
     uint8_t a4[4], a6[16];
-    if (::inet_pton(AF_INET, h.c_str(), a4) == 1) {
+    if (ipv4_from_text(h, a4)) {
       for (const auto& ip : cert.ip_addresses) if (ip.size() == 4 && std::memcmp(ip.data(), a4, 4) == 0) return true;
       return false;
     }
-    if (::inet_pton(AF_INET6, h.c_str(), a6) == 1) {
+    if (ipv6_from_text(h, a6)) {
       for (const auto& ip : cert.ip_addresses) if (ip.size() == 16 && std::memcmp(ip.data(), a6, 16) == 0) return true;
       return false;
     }
@@ -437,9 +517,7 @@ ChainResult x509_verify_chain(const std::vector<Certificate>& chain, const std::
     std::string names;
     for (auto& n : leaf.dns_names) names += (names.empty() ? "" : ", ") + n;
     for (auto& ip : leaf.ip_addresses) {
-      char b[64] = {0};
-      ::inet_ntop(ip.size() == 4 ? AF_INET : AF_INET6, ip.data(), b, sizeof b);
-      names += (names.empty() ? "" : ", ") + std::string(b);
+      names += (names.empty() ? "" : ", ") + ip_to_text(ip);
     }
     r.why = "the certificate is for " + (names.empty() ? leaf.subject_cn : names) + ", not " + host;
     return r;

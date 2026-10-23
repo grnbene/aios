@@ -66,7 +66,7 @@ class SshSigner {
   virtual std::string describe() const = 0;      // "/Users/x/.ssh/id_ed25519" or "agent: comment"
   // The SSH signature blob (string alg, string sig) over `data`. `algorithm` is the public key algorithm
   // being used (rsa-sha2-512 / rsa-sha2-256 for an RSA key; the key type otherwise). A file signer whose key is
-  // encrypted asks for the passphrase here (once, through hal::tty_prompt), not before: a key the server would
+  // encrypted asks for the passphrase here (once, through hal::tty_ask), not before: a key the server would
   // not take is never unlocked.
   virtual Result<ByteBuffer> sign(ByteSpan data, const std::string& algorithm) = 0;
 };

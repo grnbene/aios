@@ -138,6 +138,13 @@ class Host {
     if (exists(path)) return Result<void>(Status::Conflict, path + ": File exists");
     return write_file(path, data);
   }
+  // The same for a secret (a signing key): readable by this account only from the moment it exists - not created
+  // open and narrowed afterwards. The default, for a substrate without that notion, narrows straight after.
+  virtual Result<void> create_exclusive_private(const std::string& path, ByteSpan data) {
+    auto r = create_exclusive(path, data);
+    if (!r.ok()) return r;
+    return set_access(path, FileAccess::Private);
+  }
   // The same without waiting for the medium: a lock file git renames into place (a ref), which git does not sync
   // unless core.fsync asks for references.
   virtual Result<void> create_exclusive_unsynced(const std::string& path, ByteSpan data) { return create_exclusive(path, data); }
@@ -278,6 +285,11 @@ void compute_yield();
 // serial console. The core says things this way rather than reaching for stdio
 // itself, which is what the zero-host gate is about.
 void host_note(const std::string& text);
+
+// A decimal or hexadecimal floating-point number read from text, correctly rounded (strtod's grammar and answer);
+// *end past what was read. Exact decimal-to-binary conversion is the host C library's on a hosted machine, which the
+// core may not call itself; bare metal brings its own.
+double parse_double(const char* s, char** end);
 
 // Runtime-bound host libraries (an accelerator runtime, a plugin). Handles are
 // opaque; a null handle means the library is not present on this host.

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "aios/hal/sync.hpp"
+#include "aios/hal/host.hpp"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -46,6 +47,7 @@ private:
   // of tables (14 partitions, nothing published to most of them).
   EventMessage* ring_{nullptr};
   bool mapped_{false};
+  hal::Mapping mapping_{};   // the ring's pages, from the host (zero until touched)
   std::atomic<uint64_t> head_sequence_{0};
 };
 

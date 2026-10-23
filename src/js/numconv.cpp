@@ -1,5 +1,7 @@
 // Number <-> string conversions with ECMAScript's rules (Number::toString, StringToNumber).
 #include <algorithm>
+#include "aios/core/numparse.hpp"
+#include "aios/hal/host.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,13 +19,13 @@ void shortest_digits(double d, std::string* digits, int* n) {
   char buf[64];
   for (int prec = 1; prec <= 17; ++prec) {
     std::snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
-    if (std::strtod(buf, nullptr) == d || prec == 17) break;
+    if (aios::hal::parse_double(buf, nullptr) == d || prec == 17) break;
   }
   // buf is d.ddddde[+-]xx
   std::string s(buf);
   size_t e = s.find('e');
   std::string mant = s.substr(0, e);
-  int exp10 = std::atoi(s.c_str() + e + 1);
+  int exp10 = aios::num::to_int(s.c_str() + e + 1);
   digits->clear();
   for (char c : mant) if (c >= '0' && c <= '9') digits->push_back(c);
   while (digits->size() > 1 && digits->back() == '0') digits->pop_back();
@@ -155,7 +157,7 @@ bool parse_decimal_ascii(const std::string& s, double* out) {
     if (ed == 0) return false;
   }
   if (i != s.size()) return false;
-  *out = std::strtod(s.c_str(), nullptr);
+  *out = aios::hal::parse_double(s.c_str(), nullptr);
   return true;
 }
 

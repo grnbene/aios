@@ -10,8 +10,8 @@
 
 namespace aios::hal {
 
-// Writes `prompt`, reads one line (without its newline). `echo` false hides what is typed and restores the
+// Writes `question`, reads one line (without its newline). `echo` false hides what is typed and restores the
 // terminal afterwards, even when interrupted. Status::NotFound when this process has no controlling terminal.
-Result<std::string> tty_prompt(const std::string& prompt, bool echo);
+Result<std::string> tty_ask(const std::string& question, bool echo);
 
 }  // namespace aios::hal

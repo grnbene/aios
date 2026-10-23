@@ -214,7 +214,7 @@ Result<ToolResult> run_tool(const std::vector<std::string>& argv, uint32_t timeo
 }
 
 Result<ToolResult> run_tool(const ProcessSpawn& in, uint32_t timeout_ms) {
-  if (in.argv.empty()) return Result<ToolResult>(Status::Invalid, "a tool needs a program to run");
+  if (in.argv.empty()) return Result<ToolResult>(Status::Invalid, "nothing to run: no program was named");
   const auto& argv = in.argv;
   auto out_path = scratch_path(".out");
   if (!out_path.ok()) return out_path.error();

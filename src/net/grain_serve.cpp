@@ -38,7 +38,8 @@
 #include <cctype>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <mutex>   // std::lock_guard
+#include "aios/hal/sync.hpp"
 
 #include "aios/userland/grain.hpp"
 
@@ -257,12 +258,12 @@ struct ScriptPool {
   std::string version;
   std::vector<std::shared_ptr<g::FnObj>> idle;
 };
-std::mutex g_pool_mutex;
+aios::hal::Mutex g_pool_mutex;   // the host layer's lock: the core does not call pthreads itself
 std::map<std::string, ScriptPool> g_pools;
 constexpr size_t kPoolMax = 64;
 
 std::shared_ptr<g::FnObj> borrow(const std::string& path, const std::string& version) {
-  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  std::lock_guard<aios::hal::Mutex> lock(g_pool_mutex);
   ScriptPool& pool = g_pools[path];
   if (pool.version != version) { pool.version = version; pool.idle.clear(); }
   if (pool.idle.empty()) return nullptr;
@@ -272,7 +273,7 @@ std::shared_ptr<g::FnObj> borrow(const std::string& path, const std::string& ver
 }
 
 void give_back(const std::string& path, const std::string& version, std::shared_ptr<g::FnObj> script) {
-  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  std::lock_guard<aios::hal::Mutex> lock(g_pool_mutex);
   ScriptPool& pool = g_pools[path];
   if (pool.version == version && pool.idle.size() < kPoolMax) pool.idle.push_back(std::move(script));
 }

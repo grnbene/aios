@@ -1,17 +1,8 @@
 #include "aios/crypto/signed_chain.hpp"
 
-#if defined(_WIN32)
-#include <windows.h>
-#include <bcrypt.h>
-#else
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include <cstring>
 
-#ifndef __wasi__
-#include <fstream>
-#endif
+#include "aios/hal/host.hpp"
 
 #include "aios/channel/rpc_value.hpp"
 #include "aios/crypto/sha256.hpp"
@@ -56,35 +47,18 @@ std::string sha256_hex(std::string_view data) {
 
 #ifndef __wasi__  // no files there: a WebAssembly engine signs with a seed (open_seed)
 Result<void> Ed25519Signer::open(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (in) {
-    in.read(reinterpret_cast<char*>(seed_.data()), seed_.size());
-    if (in.gcount() != static_cast<std::streamsize>(seed_.size()))
-      return Result<void>(Status::Invalid, "signing key " + path + " is not 32 bytes");
+  // Through the host (the core opens no files itself): the key that is there, or a new one made from the host's
+  // randomness and written readable by this account alone, created only if nobody else made it first.
+  hal::Host& host = hal::process_host();
+  if (host.exists(path)) {
+    auto bytes = host.read_file(path);
+    if (!bytes.ok()) return Result<void>(Status::IoError, "cannot read signing key " + path + ": " + bytes.error().message);
+    if (bytes->size() < seed_.size()) return Result<void>(Status::Invalid, "signing key " + path + " is not 32 bytes");
+    std::memcpy(seed_.data(), bytes->data(), seed_.size());
   } else {
-#if defined(_WIN32)
-    if (BCryptGenRandom(nullptr, seed_.data(), static_cast<ULONG>(seed_.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-      return Result<void>(Status::IoError, "cannot generate random signing key");
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return Result<void>(Status::IoError, "cannot create signing key " + path);
-    DWORD written = 0;
-    bool ok = WriteFile(h, seed_.data(), static_cast<DWORD>(seed_.size()), &written, nullptr) && written == seed_.size();
-    ok = FlushFileBuffers(h) && ok;
-    CloseHandle(h);
-    if (!ok) return Result<void>(Status::IoError, "cannot write signing key " + path);
-#else
-    const int r = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (r < 0) return Result<void>(Status::IoError, "cannot read /dev/urandom");
-    const ssize_t got = ::read(r, seed_.data(), seed_.size());
-    ::close(r);
-    if (got != static_cast<ssize_t>(seed_.size())) return Result<void>(Status::IoError, "short read from /dev/urandom");
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) return Result<void>(Status::IoError, "cannot create signing key " + path);
-    bool ok = ::write(fd, seed_.data(), seed_.size()) == static_cast<ssize_t>(seed_.size());
-    ok = ::fsync(fd) == 0 && ok;
-    ::close(fd);
-    if (!ok) return Result<void>(Status::IoError, "cannot write signing key " + path);
-#endif
+    host.random(MutableByteSpan(seed_.data(), seed_.size()));
+    auto w = host.create_exclusive_private(path, ByteSpan(seed_.data(), seed_.size()));
+    if (!w.ok()) return Result<void>(Status::IoError, "cannot write signing key " + path + ": " + w.error().message);
   }
   pub_ = ed25519_public_from_seed(seed_);
   ready_ = true;

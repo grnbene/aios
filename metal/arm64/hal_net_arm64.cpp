@@ -182,7 +182,7 @@ Result<LocalAccount> local_account() {
   return Result<LocalAccount>(Status::Unsupported, "no accounts on the arm64 metal substrate");
 }
 std::string local_hostname() { return {}; }
-Result<std::string> tty_prompt(const std::string&, bool) {
+Result<std::string> tty_ask(const std::string&, bool) {
   return Result<std::string>(Status::Unsupported, "no terminal to ask on the arm64 metal substrate");
 }
 Result<std::unique_ptr<Connection>> net_connect_unix(const std::string&, int) {

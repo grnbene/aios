@@ -2,6 +2,7 @@
 // Win32 headers other than the standard library (besides the other win_*.cpp
 // HAL files). Mirrors linux_host.cpp / mac_host.cpp's contract exactly; see
 // aios/hal/host.hpp for what each method promises.
+#include <cstdlib>
 #include "aios/hal/host.hpp"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -127,6 +128,16 @@ class WindowsHost final : public Host {
     return Ok();
   }
 
+  std::string env(const char* name) override {
+    char buf[4096];
+    const DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+    if (n == 0) return {};
+    if (n < sizeof buf) return std::string(buf, n);
+    std::string big(n, '\0');
+    const DWORD m = GetEnvironmentVariableA(name, big.data(), n);
+    big.resize(m < n ? m : 0);
+    return big;
+  }
   Result<void> set_access(const std::string& path, FileAccess access) override {
     // NTFS has no POSIX mode bits; the one real distinction this host can make
     // is read-only vs not. Private and Executable both stay writable by the
@@ -446,6 +457,7 @@ void compute_yield() {}   // a hosted job has a thread of its own; nothing to ke
 std::unique_ptr<Host> make_host() { return std::make_unique<WindowsHost>(); }
 
 void host_note(const std::string& text) { std::fputs(text.c_str(), stderr); std::fflush(stderr); }
+double parse_double(const char* s, char** end) { return std::strtod(s, end); }
 
 void* load_library(const std::string& name) {
   last_library_error.clear();

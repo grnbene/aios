@@ -1,5 +1,7 @@
 // Number, Math and the global functions (parseInt, URI coding, eval, ...).
 #include <algorithm>
+#include "aios/core/numparse.hpp"
+#include "aios/hal/host.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -171,13 +173,13 @@ std::string to_exponential(double x, int f, bool shortest) {
     char buf[64];
     for (int prec = 1; prec <= 17; ++prec) {
       std::snprintf(buf, sizeof buf, "%.*e", prec - 1, x);
-      if (std::strtod(buf, nullptr) == x || prec == 17) break;
+      if (aios::hal::parse_double(buf, nullptr) == x || prec == 17) break;
     }
     std::string s(buf);
     size_t e = s.find('e');
     for (size_t i = 0; i < e; ++i) if (s[i] >= '0' && s[i] <= '9') digits.push_back(s[i]);
     while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
-    n = std::atoi(s.c_str() + e + 1) + 1;
+    n = aios::num::to_int(s.c_str() + e + 1) + 1;
   } else {
     exact_digits(x, &digits, &n);
     digits = round_digits(digits, &n, f + 1);
@@ -363,7 +365,7 @@ Value parse_int(Context& ctx, CallArgs& a) {
   if (i == start) return Value::Number(NAN);
   double v = 0;
   if (radix == 10) {
-    v = std::strtod(digits.c_str(), nullptr);
+    v = aios::hal::parse_double(digits.c_str(), nullptr);
   } else {
     for (char c : digits) {
       int d = c >= '0' && c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;

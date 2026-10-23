@@ -1,3 +1,4 @@
+#include "aios/hal/host.hpp"
 #include "aios/channel/agent_control_serve.hpp"
 #include "aios/channel/rpc_value.hpp"
 #include "aios/crypto/hmac_sha256.hpp"
@@ -11,7 +12,6 @@
 #include <cctype>
 #include <cstring>
 #include <deque>
-#include <fstream>
 #include <map>
 #include <memory>
 
@@ -310,9 +310,17 @@ class CycleLog {
 
  private:
   void load() {
-    std::ifstream f(path_);
-    std::string line;
-    while (std::getline(f, line)) {
+    // through the host (the core opens no files itself); no file yet is no records yet
+    auto bytes = hal::process_host().read_file(path_);
+    if (!bytes.ok()) return;
+    const std::string text(bytes->begin(), bytes->end());
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t nl = text.find('\n', at);
+      if (nl == std::string::npos) nl = text.size();
+      std::string line = text.substr(at, nl - at);
+      at = nl + 1;
+      if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.empty()) continue;
       auto v = rpc_parse(line);
       if (!v.ok() || v->kind() != RpcValue::Kind::Object || !v->has("entity")) continue;  // a torn last line is skipped
@@ -322,8 +330,8 @@ class CycleLog {
   void append_to_file(const std::string& entity, const RpcValue& rec) {
     RpcValue line = rec;
     line.set("entity", RpcValue::text(entity));
-    std::ofstream f(path_, std::ios::app);
-    if (f) f << line.render() << "\n";
+    const std::string text = line.render() + "\n";
+    (void)hal::process_host().append_file(path_, ByteSpan(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
   }
   std::string path_;
   mutable hal::Mutex mu_;

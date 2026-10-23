@@ -36,7 +36,7 @@ void note_signal(int sig) { g_caught = sig; }
 
 }  // namespace
 
-Result<std::string> tty_prompt(const std::string& prompt, bool echo) {
+Result<std::string> tty_ask(const std::string& question, bool echo) {
   int fd = ::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (fd < 0) return Result<std::string>(Status::NotFound, "no terminal to ask (/dev/tty: " + std::string(std::strerror(errno)) + ")");
 
@@ -55,8 +55,8 @@ Result<std::string> tty_prompt(const std::string& prompt, bool echo) {
   int read_errno = 0;
   {
     EchoGuard guard(fd, !echo);
-    for (size_t off = 0; off < prompt.size();) {
-      ssize_t w = ::write(fd, prompt.data() + off, prompt.size() - off);
+    for (size_t off = 0; off < question.size();) {
+      ssize_t w = ::write(fd, question.data() + off, question.size() - off);
       if (w < 0 && errno == EINTR && !g_caught) continue;
       if (w <= 0) break;
       off += (size_t)w;

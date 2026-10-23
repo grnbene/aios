@@ -1,5 +1,6 @@
 // console, queueMicrotask, atob/btoa and the value inspector the console prints with.
 #include <algorithm>
+#include "aios/hal/host.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -260,8 +261,8 @@ int g_group_indent = 0;
 
 void emit(Context& ctx, const std::string& text) {
   // AIOS_JS_ERRORS=1 mirrors the page's console to stderr: a framework that catches its own exception shows only its console.error.
-  static const bool mirror = std::getenv("AIOS_JS_ERRORS") != nullptr;
-  if (mirror) std::fprintf(stderr, "[console] %s\n", text.c_str());
+  static const bool mirror = !aios::hal::process_host().env("AIOS_JS_ERRORS").empty();
+  if (mirror) aios::hal::host_note("[console] " + text + "\n");
   if (!ctx.print) return;
   std::string indent(static_cast<size_t>(g_group_indent) * 2, ' ');
   std::string out;

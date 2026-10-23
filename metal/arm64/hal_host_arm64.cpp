@@ -157,6 +157,8 @@ bool is_identity(const std::string& path) {
 constexpr const char* kIdentityFile = "KERNELID.BIN";
 }  // namespace
 
+#include "aios/hal/parse_double_portable.inc"
+double parse_double(const char* s, char** end) { return aios_parse_double_portable(s, end); }
 void host_note(const std::string& text) {
   kputs(text.c_str());
   kputs("\n");

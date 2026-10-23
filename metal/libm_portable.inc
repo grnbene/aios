@@ -320,3 +320,65 @@ double sinh(double x) { return (exp(x) - exp(-x)) * 0.5; }
 float sinhf(float x) { return static_cast<float>(sinh(static_cast<double>(x))); }
 double cosh(double x) { return (exp(x) + exp(-x)) * 0.5; }
 float coshf(float x) { return static_cast<float>(cosh(static_cast<double>(x))); }
+
+/* What the JavaScript engine's Math object and number formatting also ask for. log1p and expm1 keep their
+ * precision near 0 the classic way: the rounding of 1+x (or e^x) is measured and divided back out. */
+double log1p(double x) {
+  const double u = 1.0 + x;
+  if (u == 1.0) return x;
+  return log(u) * (x / (u - 1.0));
+}
+double expm1(double x) {
+  if (fabs(x) < 1e-5) return x + x * x * 0.5 + x * x * x / 6.0;
+  const double u = exp(x);
+  if (u == 1.0) return x;
+  if (u - 1.0 == -1.0) return -1.0;
+  return (u - 1.0) * x / log(u);
+}
+double asinh(double x) {
+  const double a = fabs(x);
+  const double r = a > 1e8 ? log(a) + 0.6931471805599453 : log1p(a + a * a / (1.0 + sqrt(1.0 + a * a)));
+  return libm_detail::copy_sign(r, x);
+}
+double acosh(double x) {
+  if (x < 1.0) return libm_detail::kNaN;
+  if (x > 1e8) return log(x) + 0.6931471805599453;
+  const double t = x - 1.0;
+  return log1p(t + sqrt(2.0 * t + t * t));
+}
+double atanh(double x) {
+  const double a = fabs(x);
+  if (a > 1.0) return libm_detail::kNaN;
+  if (a == 1.0) return libm_detail::copy_sign(libm_detail::kInf, x);
+  return libm_detail::copy_sign(0.5 * log1p(2.0 * a / (1.0 - a)), x);
+}
+double cbrt(double x) {
+  if (x == 0.0 || !libm_detail::is_finite(x)) return x;
+  const double a = fabs(x);
+  double y = libm_detail::from_bits(libm_detail::bits(a) / 3 + 0x2A9F7893782DA1CEull);   /* a first guess from the exponent */
+  for (int i = 0; i < 4; ++i) y = y - (y * y * y - a) / (3.0 * y * y);                     /* Newton */
+  return libm_detail::copy_sign(y, x);
+}
+double frexp(double x, int* e) {
+  *e = 0;
+  if (x == 0.0 || !libm_detail::is_finite(x)) return x;
+  int extra = 0;
+  if ((libm_detail::bits(x) & 0x7FF0000000000000ull) == 0) { x *= libm_detail::scale2(1.0, 54); extra = -54; }   /* subnormal */
+  const uint64_t b = libm_detail::bits(x);
+  *e = (int)((b >> 52) & 0x7FF) - 1022 + extra;
+  return libm_detail::from_bits((b & 0x800FFFFFFFFFFFFFull) | 0x3FE0000000000000ull);
+}
+double nearbyint(double x) {   /* round half to even, the default rounding mode */
+  if (!libm_detail::is_finite(x) || fabs(x) >= 4503599627370496.0) return x;
+  const double f = floor(x), d = x - f;
+  double r = d > 0.5 ? f + 1.0 : d < 0.5 ? f : (fmod(f, 2.0) == 0.0 ? f : f + 1.0);
+  return r == 0.0 ? libm_detail::copy_sign(0.0, x) : r;
+}
+double nextafter(double x, double y) {
+  if (libm_detail::is_nan(x) || libm_detail::is_nan(y)) return x + y;
+  if (x == y) return y;
+  if (x == 0.0) return libm_detail::copy_sign(libm_detail::from_bits(1), y);
+  uint64_t b = libm_detail::bits(x);
+  b = ((x < y) == (x > 0.0)) ? b + 1 : b - 1;
+  return libm_detail::from_bits(b);
+}

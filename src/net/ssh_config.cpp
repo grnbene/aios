@@ -7,6 +7,7 @@
 // values already obtained kept. Paths and tokens are expanded after reading, with
 // the final host name, port and user, as ssh does when it uses them.
 #include "aios/net/ssh_config.hpp"
+#include "aios/core/numparse.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -415,7 +416,7 @@ struct Resolver {
       if (auto r = need(1); !r.ok()) return r;
       long n;
       if (allow_none && lower(args[0]) == "none") n = 0;
-      else n = time ? convtime(args[0]) : (convtime(args[0]) >= 0 && args[0].find_first_not_of("0123456789") == std::string::npos ? std::stol(args[0]) : -1);
+      else n = time ? convtime(args[0]) : (convtime(args[0]) >= 0 && args[0].find_first_not_of("0123456789") == std::string::npos ? (long)aios::num::to_ll(args[0]) : -1);
       if (n < 0) return R(Status::Invalid, at + ": invalid " + (time ? "time" : "number") + " value.");
       if (active && !slot) slot = n;
       return Ok();
@@ -446,7 +447,7 @@ struct Resolver {
     if (kw == "user") return first(o.user);
     if (kw == "port") {
       if (auto r = need(1); !r.ok()) return r;
-      long n = args[0].find_first_not_of("0123456789") == std::string::npos && args[0].size() <= 5 ? std::stol(args[0]) : -1;
+      long n = args[0].find_first_not_of("0123456789") == std::string::npos && args[0].size() <= 5 ? (long)aios::num::to_ll(args[0]) : -1;
       if (lower(args[0]) == "ssh") n = 22;
       if (n < 1 || n > 65535) return R(Status::Invalid, at + ": Bad port '" + args[0] + "'.");
       if (active && !o.port) o.port = (uint16_t)n;

@@ -875,9 +875,9 @@ class FileSigner final : public SshSigner {
   Result<void> unlock() {
     auto pem = host_.read_file(path_);
     if (!pem.ok()) return Result<void>(Status::NotFound, path_ + ": " + pem.error().message);
-    if (batch_) return Result<void>(Status::Denied, path_ + ": the key is encrypted and BatchMode allows no passphrase prompt");
+    if (batch_) return Result<void>(Status::Denied, path_ + ": the key is encrypted and BatchMode allows no passphrase to be asked for");
     for (int attempt = 0; attempt < 3; ++attempt) {
-      auto pass = hal::tty_prompt("Enter passphrase for key '" + path_ + "': ", false);
+      auto pass = hal::tty_ask("Enter passphrase for key '" + path_ + "': ", false);
       if (!pass.ok()) return Result<void>(Status::Denied, path_ + ": the key is encrypted and there is no terminal to ask for its passphrase");
       if (pass->empty()) return Result<void>(Status::Denied, path_ + ": no passphrase given");
       auto id = ssh_parse_private_key(ByteSpan(pem->data(), pem->size()), *pass);
@@ -945,9 +945,9 @@ Result<std::unique_ptr<SshSigner>> ssh_file_signer(hal::Host& host, const std::s
   }
   if (pub) return R(std::unique_ptr<SshSigner>(new FileSigner(host, path, batch, pub->first, std::move(pub->second), std::nullopt)));
   // nothing names the public half: unlock it now, as ssh does
-  if (batch) return R(Status::Denied, path + ": the key is encrypted, has no .pub beside it, and BatchMode allows no prompt");
+  if (batch) return R(Status::Denied, path + ": the key is encrypted, has no .pub beside it, and BatchMode allows no question at the terminal");
   for (int attempt = 0; attempt < 3; ++attempt) {
-    auto pass = hal::tty_prompt("Enter passphrase for key '" + path + "': ", false);
+    auto pass = hal::tty_ask("Enter passphrase for key '" + path + "': ", false);
     if (!pass.ok()) return R(Status::Denied, path + ": the key is encrypted and there is no terminal to ask for its passphrase");
     if (pass->empty()) return R(Status::Denied, path + ": no passphrase given");
     auto id = ssh_parse_private_key(text, *pass);

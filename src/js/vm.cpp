@@ -1,5 +1,6 @@
 // The bytecode interpreter.
 #include <cstdio>
+#include "aios/hal/host.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -1491,7 +1492,7 @@ bool vm_eval_source(Context& ctx, const std::u16string& source, const std::strin
   }
   Context::VM& vm = *ctx.vm;
 #ifndef AIOS_METAL
-  if (std::getenv("AIOS_JS_DUMP")) std::fputs(vm_disassemble(code).c_str(), stderr);
+  if (!aios::hal::process_host().env("AIOS_JS_DUMP").empty()) aios::hal::host_note(vm_disassemble(code));
 #endif
   if (!vm_reserve(ctx, 2 + code->nlocals + code->max_stack)) return false;
   Function* fn = ctx.heap.make<Function>();

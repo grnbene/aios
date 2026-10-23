@@ -54,7 +54,7 @@ struct SshResolved {
   int server_alive_interval_s = 0;
   int server_alive_count_max = 3;
   int connection_attempts = 1;
-  bool batch_mode = false;                             // never prompt
+  bool batch_mode = false;                             // never ask at the terminal
   bool pubkey_authentication = true;
   bool password_authentication = true;
   bool kbd_interactive_authentication = true;
