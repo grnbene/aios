@@ -1044,7 +1044,6 @@ int cmd_log(Ctx& c) {
   }
   auto abbrev_id = [&](const std::string& oid) { return pr.abbrev_commit ? short_id(c, pr, oid) : oid; };
   // each commit is printed as the walk reaches it, so a reader that goes away stops the walk
-  const bool picks = !dopt.pickaxe_s.empty() || dopt.has_pickaxe_s || !dopt.pickaxe_g.empty() || !dopt.filter.empty();
   if (c.hide_merges) {
     // whatchanged: a commit with no diff to show (a merge, an empty commit) is not shown and, as cmd_log_walk puts
     // max_count back for it, not counted
@@ -1301,9 +1300,9 @@ int cmd_diff(Ctx& c) {
         auto t = c.host().read_symlink(c.abs_path(f));
         s.text = t.ok() ? *t : "";
       } else {
-        auto r = c.host().read_file(c.abs_path(f));
-        if (!r.ok()) die(c, "Could not access '" + f + "'");
-        s.text.assign((const char*)r->data(), r->size());
+        auto rf = c.host().read_file(c.abs_path(f));
+        if (!rf.ok()) die(c, "Could not access '" + f + "'");
+        s.text.assign((const char*)rf->data(), rf->size());
       }
       return s;
     };

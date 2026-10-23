@@ -276,8 +276,12 @@ struct Test {
     if (op == "-ot") return os::mtime(host_path(st.cwd, l)) < os::mtime(host_path(st.cwd, r));
     long long x = 0, y = 0;
     if (!parse_int(l, x) || !parse_int(r, y)) { error = true; return false; }
-    if (op == "-eq") return x == y; if (op == "-ne") return x != y; if (op == "-lt") return x < y;
-    if (op == "-le") return x <= y; if (op == "-gt") return x > y; if (op == "-ge") return x >= y;
+    if (op == "-eq") return x == y;
+    if (op == "-ne") return x != y;
+    if (op == "-lt") return x < y;
+    if (op == "-le") return x <= y;
+    if (op == "-gt") return x > y;
+    if (op == "-ge") return x >= y;
     error = true;
     return false;
   }
@@ -354,7 +358,7 @@ int u_cat(Shell&, State& st, const std::vector<std::string>& argv, const Io& io)
   // -n: numbered a line at a time as the lines arrive, the count running on across files
   BufferedOut out{io, {}};
   int status = each_stream(st, o.args, io, "cat", [&](const std::string&, Fd f) {
-    each_line(f, out, [&](const std::string& l, bool) { char b[16]; std::snprintf(b, sizeof b, "%6lld\t", ++ln); out.put(b + l + "\n"); });
+    each_line(f, out, [&](const std::string& l, bool) { char b[32]; std::snprintf(b, sizeof b, "%6lld\t", ++ln); out.put(b + l + "\n"); });
   });
   out.flush();
   return status;
@@ -991,7 +995,7 @@ int u_uniq(Shell&, State& st, const std::vector<std::string>& argv, const Io& io
   size_t count = 0;
   auto emit = [&]() {
     if (!count || (o.has('d') && count < 2) || (o.has('u') && count != 1)) return;
-    if (o.has('c')) { char b[16]; std::snprintf(b, sizeof b, "%7zu ", count); out.put(b); }
+    if (o.has('c')) { char b[32]; std::snprintf(b, sizeof b, "%7zu ", count); out.put(b); }
     out.put(prev + "\n");
   };
   int status = each_stream(st, in, io, "uniq", [&](const std::string&, Fd f) {
@@ -1155,7 +1159,7 @@ int u_nl(Shell&, State& st, const std::vector<std::string>& argv, const Io& io) 
   int status = each_stream(st, o.args, io, "nl", [&](const std::string&, Fd f) {
     each_line(f, out, [&](const std::string& l, bool) {
       if (l.empty() && !all) { out.put("\n"); return; }
-      char b[16]; std::snprintf(b, sizeof b, "%6lld\t", ++n);
+      char b[32]; std::snprintf(b, sizeof b, "%6lld\t", ++n);
       out.put(b + l + "\n");
     });
   });

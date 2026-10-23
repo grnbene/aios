@@ -189,7 +189,6 @@ class Blame {
   std::unordered_map<std::string, int> commit_ix_;
   std::vector<Origin> origins_;
   std::map<std::pair<int, std::string>, int> origin_ix_;
-  std::unordered_map<std::string, std::vector<GitTreeEntry>> tree_cache_;
   struct PathHit { bool found = false; std::string oid; uint32_t mode = 0; };
   std::unordered_map<std::string, PathHit> path_memo_;   // tree id + '\0' + path below it
   std::unordered_map<std::string, Meta> meta_cache_;
@@ -214,7 +213,6 @@ class Blame {
   void parse_args(std::vector<std::string>& revs);
   int commit_of(const std::string& oid);
   int origin_of(int commit, const std::string& path);
-  const std::vector<GitTreeEntry>& tree_entries(const std::string& tree);
   bool find_path(const std::string& tree, const std::string& path, std::string& oid, uint32_t& mode);
   bool find_path_from(const std::string& tree, const std::string& path, size_t pos, std::string& oid, uint32_t& mode);
   const std::string& text_of(int org);
@@ -420,15 +418,6 @@ int Blame::origin_of(int commit, const std::string& path) {
   if (!commits_[(size_t)commit].origins.empty()) commits_[(size_t)commit].multi_path = true;
   commits_[(size_t)commit].origins.push_back(ix);
   return ix;
-}
-
-const std::vector<GitTreeEntry>& Blame::tree_entries(const std::string& tree) {
-  auto it = tree_cache_.find(tree);
-  if (it != tree_cache_.end()) return it->second;
-  auto r = c_.repo->read_tree(tree);
-  std::vector<GitTreeEntry> v;
-  if (r.ok()) v = *r;
-  return tree_cache_.emplace(tree, std::move(v)).first->second;
 }
 
 bool Blame::find_path(const std::string& tree, const std::string& path, std::string& oid, uint32_t& mode) {

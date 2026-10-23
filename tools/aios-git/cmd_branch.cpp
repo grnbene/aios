@@ -437,15 +437,6 @@ GitTreeMerge run_tree_merge(Ctx& c, const std::string& base, const std::string& 
 
 namespace {
 
-std::string merge_base_tree(Ctx& c, const std::string& a, const std::string& b, bool& unrelated) {
-  auto bases = merge_bases(c, a, b);
-  unrelated = bases.empty();
-  if (bases.empty()) return "";
-  if (bases.size() == 1) return read_commit(c, bases[0]).tree;
-  // several bases (criss-cross): the library merges them into a virtual base itself
-  return "";
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------

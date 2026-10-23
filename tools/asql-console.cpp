@@ -119,6 +119,7 @@ void print_result(const MariaResult& res) {
   std::cout << text_rows.size() << " row(s) in set\n";
 }
 
+#if defined(AIOS_HAVE_EDITLINE)
 const char* kSqlKeywords[] = {
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE",
     "ORDER", "BY", "GROUP", "HAVING", "LIMIT", "OFFSET", "JOIN", "LEFT",
@@ -129,7 +130,6 @@ const char* kSqlKeywords[] = {
     "DESC", "ENGINE", "STATUS", "GLOBAL", "PROCESSLIST",
 };
 
-#if defined(AIOS_HAVE_EDITLINE)
 // Rebuilt after connect and after every USE, so Tab-completion offers this
 // database's real table names, not just SQL keywords.
 std::vector<std::string> g_completion_words;
@@ -165,7 +165,6 @@ std::string history_file_path() {
   const char* home = std::getenv("HOME");
   return std::string(home ? home : ".") + "/.aios_asql_history";
 }
-#endif
 
 // Fetch this database's table names for completion. Best-effort: a failure
 // here just means Tab won't offer them, not a console error.
@@ -178,6 +177,7 @@ std::vector<std::string> fetch_table_names(MariaWireSession& session) {
   }
   return names;
 }
+#endif
 
 }  // namespace
 
