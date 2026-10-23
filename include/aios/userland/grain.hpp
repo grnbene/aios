@@ -589,6 +589,7 @@ struct WebPaneInfo {
   int width = 0, height = 0;
   int refresh = 0;           // seconds between redraws the page asks for (the pane's "refresh" option); 0 = none
   bool shared = false;       // the pane's "shared" option: one copy of the program for every visitor, so they all see the same live data
+  std::string css;           // custom CSS stylesheet injected into <style>
 };
 // The first ui.pane the program made, if it made one.
 bool web_pane_first(const Vm& vm, WebPaneInfo& out);

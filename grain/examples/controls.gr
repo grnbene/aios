@@ -1,0 +1,105 @@
+# Grain Interactive Controls Showcase
+# Full set of controls: ui.slider, ui.switch, ui.checkbox, ui.select, ui.field, ui.button, ui.card, ui.divider
+
+let refresh_rate = 50
+let auto_pilot = true
+let sound_fx = false
+let priority = "high"
+let actions_log = []
+
+fn log_event(name, val) {
+  push(actions_log, {"time": date_format(now(), "%T", "local"), "control": name, "value": str(val)})
+  if len(actions_log) > 8 { actions_log = slice(actions_log, 1) }
+}
+
+fn on_slider_change(f) {
+  refresh_rate = int(f.rate)
+  log_event("Slider (Rate)", str(refresh_rate) + "%")
+}
+
+fn on_switch_change(f) {
+  auto_pilot = f.auto_sync == "1"
+  log_event("Switch (Auto-Pilot)", auto_pilot ? "ON" : "OFF")
+}
+
+fn on_check_change(f) {
+  sound_fx = f.sound == "1"
+  log_event("Checkbox (Sound)", sound_fx ? "ENABLED" : "MUTED")
+}
+
+fn on_select_change(f) {
+  priority = f.priority_sel
+  log_event("Select (Priority)", priority)
+}
+
+fn on_quick_action(btn) {
+  log_event("Button Clicked", "Triggered manual sync")
+}
+
+let p = ui.pane({"title": "Grain Interactive Controls", "shared": true, "width": 960, "height": 720, "view": fn () {
+  let rev_logs = []
+  for r in actions_log { rev_logs = [r] + rev_logs }
+
+  let status_accent = auto_pilot ? "ok" : "warn"
+
+  return ui.column({"gap": 18, "pad": 8}, [
+    # Top Header
+    ui.row({"justify": "between", "align": "center"}, [
+      ui.row({"gap": 12, "align": "center"}, [
+        ui.heading("Grain Control Deck"),
+        ui.badge("Interactive Controls", {"accent": "accent"}),
+        ui.badge(auto_pilot ? "Auto-Pilot Active" : "Manual Mode", {"accent": status_accent, "dot": true})
+      ]),
+      ui.text(sys.os + " • " + sys.arch, {"dim": true, "mono": true})
+    ]),
+
+    # KPI Status Summary
+    ui.row({"gap": 14}, [
+      ui.tile("Throttle Rate", str(refresh_rate) + "%", {"accent": refresh_rate > 75 ? "warn" : "ok", "sub": "Live slider position"}),
+      ui.tile("Auto-Pilot", auto_pilot ? "ENGAGED" : "OFF", {"accent": status_accent, "sub": "Toggle switch state"}),
+      ui.tile("Priority Queue", upper(priority), {"accent": priority == "critical" ? "bad" : "ok", "sub": "Dropdown selection"}),
+      ui.tile("Audio Alerts", sound_fx ? "ON" : "MUTED", {"sub": "Checkbox option"})
+    ]),
+
+    # Main Controls Card Grid
+    ui.row({"gap": 16}, [
+      # Left Card: Interactive Controls
+      ui.card({"grow": true, "gap": 16}, [
+        ui.text("Live Control Suite", {"bold": true, "size": 16}),
+        ui.divider(),
+
+        # Sliders
+        ui.slider("rate", 0, 100, {"value": refresh_rate, "label": "Engine Throttle", "on_change": on_slider_change}),
+
+        ui.divider(),
+
+        # Toggles & Checkboxes
+        ui.row({"justify": "between", "align": "center"}, [
+          ui.switch("auto_sync", "Autonomous Mode", {"checked": auto_pilot, "on_change": on_switch_change}),
+          ui.checkbox("sound", "Enable Audio Chimes", {"checked": sound_fx, "on_change": on_check_change})
+        ]),
+
+        ui.divider(),
+
+        # Dropdowns & Buttons
+        ui.row({"gap": 12, "align": "end"}, [
+          ui.select("priority_sel", ["normal", "elevated", "high", "critical"], {"value": priority, "label": "Stream Priority", "on_change": on_select_change}),
+          ui.button("Emergency Flush", on_quick_action, {"variant": "bad"}),
+          ui.button("Sync Now", on_quick_action, {"primary": true})
+        ])
+      ]),
+
+      # Right Card: Real-Time Event Audit Log
+      ui.card({"grow": true, "gap": 12}, [
+        ui.row({"justify": "between", "align": "center"}, [
+          ui.text("Event Audit Log", {"bold": true, "size": 16}),
+          ui.badge(str(len(actions_log)) + " Events", {"dim": true})
+        ]),
+        ui.divider(),
+        ui.table(rev_logs, {"columns": "time:Time, control:Control, value:Value", "empty": "Interact with controls on the left to see live events!"})
+      ])
+    ])
+  ])
+}})
+
+run_panes()
