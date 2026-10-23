@@ -177,22 +177,22 @@ int main(int argc, char** argv) {
   s.out = &out;
   if (const char* tool = std::getenv("AIOS_HOST_TOOL")) {
     std::string toolpath = tool;
-    s.host = [toolpath](const std::vector<std::string>& args, Out& o, Surface&) -> Result<void> {
+    s.host = [toolpath](const std::vector<std::string>& cmd, Out& o, Surface&) -> Result<void> {
       o.flush();
       pid_t pid = fork();
-      if (pid == 0) { std::vector<char*> av{const_cast<char*>(toolpath.c_str())}; for (auto& a : args) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr); execv(av[0], av.data()); _exit(127); }
+      if (pid == 0) { std::vector<char*> av{const_cast<char*>(toolpath.c_str())}; for (auto& a : cmd) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr); execv(av[0], av.data()); _exit(127); }
       int st = 0; waitpid(pid, &st, 0);
       if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return Result<void>(Status::IoError, "host tool exited with status " + std::to_string(WIFEXITED(st) ? WEXITSTATUS(st) : -1));
       return Ok();
     };
   } else {
-    s.host = [](const std::vector<std::string>& args, Out& o, Surface&) -> Result<void> {
-      if (args.empty()) return Result<void>(Status::Invalid, "empty host command");
+    s.host = [](const std::vector<std::string>& cmd, Out& o, Surface&) -> Result<void> {
+      if (cmd.empty()) return Result<void>(Status::Invalid, "empty host command");
       o.flush();
       pid_t pid = fork();
       if (pid == 0) {
         std::vector<char*> av;
-        for (auto& a : args) av.push_back(const_cast<char*>(a.c_str()));
+        for (auto& a : cmd) av.push_back(const_cast<char*>(a.c_str()));
         av.push_back(nullptr);
         execvp(av[0], av.data());
         _exit(127);

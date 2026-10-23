@@ -105,8 +105,14 @@ int main() {
   std::vector<std::vector<std::string>> before;
   for (const char* q : queries) before.push_back(dump(db, q));
 
-  size_t mem_before = tbl->col_data[1].estimate_memory_bytes() + tbl->col_data[2].estimate_memory_bytes();
-  std::printf("rows=%zu  price+qty memory before: %zu bytes (%.2f bytes/row)\n", rows, mem_before, (double)mem_before / rows);
+  // The engine may pack the columns while the rows go in (it does now), so what the packing is measured against
+  // is the text the two columns hold, not an earlier form of the column.
+  size_t text_bytes = 0;
+  for (size_t r = 0; r < rows; ++r)
+    for (size_t c : {1u, 2u}) if (!tbl->col_data[c].is_null(r)) text_bytes += tbl->col_data[c].get(r).size();
+  std::printf("rows=%zu  price+qty as text: %zu bytes (%.2f bytes/row); encodings before optimize: %s, %s\n", rows, text_bytes,
+              (double)text_bytes / rows, tbl->col_data[1].encoding == ColumnEncoding::DecimalScaled ? "DecimalScaled" : "other",
+              tbl->col_data[2].encoding == ColumnEncoding::DecimalScaled ? "DecimalScaled" : "other");
 
   for (size_t c = 0; c < tbl->col_data.size(); ++c)
     tbl->col_data[c].optimize_encoding(tbl->columns[c].type, tbl->columns[c].scale);
@@ -116,7 +122,7 @@ int main() {
   expect(tbl->col_data[1].encoding == ColumnEncoding::DecimalScaled && tbl->col_data[1].decimal_fixed(), "price is DecimalScaled (fixed places)");
   expect(tbl->col_data[2].encoding == ColumnEncoding::DecimalScaled && tbl->col_data[2].decimal_fixed(), "qty is DecimalScaled (fixed places)");
   expect(tbl->col_data[3].encoding != ColumnEncoding::DecimalScaled, "huge (span > 32 bits) stays on the dictionary");
-  expect(mem_after < mem_before, "memory dropped");
+  expect(mem_after * 2 < text_bytes, "packed in under half the bytes of its text");
 
   for (size_t i = 0; i < before.size(); ++i) {
     expect(dump(db, queries[i]) == before[i], queries[i]);

@@ -2159,6 +2159,12 @@ class SqlDatabase {
   Result<size_t> seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                   const std::string& password, const std::string& database,
                                   const std::vector<std::string>& tables, std::vector<std::string>* log);
+  // Where a starting engine is: what the wire server tells a client that connects before it answers queries.
+  // init() reports "loading tables", seed_from_source() "seeding tables", each with its count; the server that
+  // owns the engine sets the rest (its own steps, and ready once they are done).
+  void set_startup_phase(const std::string& phase, size_t done = 0, size_t total = 0);
+  void startup_progress(size_t done) { startup_done_.store(done, std::memory_order_relaxed); }
+  std::string startup_status() const;
   // Replication's place in the master's binlog, kept beside the store so a
   // restart resumes rather than skipping whatever happened while it was down.
   Result<void> save_cdc_position();
@@ -2197,6 +2203,10 @@ class SqlDatabase {
   TaskLedger* ledger_;
   std::string root_path_;
   MirrorSource mirror_source_;
+  mutable std::mutex startup_mu_;
+  std::string startup_phase_;
+  std::atomic<size_t> startup_done_{0};
+  std::atomic<size_t> startup_total_{0};
   std::unordered_map<std::string, SqlTable> tables_;
   std::unordered_map<std::string, SqlView> views_;
   // Stored programs (PROCEDURE, FUNCTION, TRIGGER, EVENT), each kept as the
