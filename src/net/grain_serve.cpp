@@ -319,6 +319,7 @@ bool grain_serve_request(const GrainSite& site, const GrainRequest& req, GrainRe
   vm.step_limit = site.max_steps;
   g::install_core_builtins(vm);
   g::install_http_builtins(vm);
+  g::install_db_builtins(vm);
   vm.define_native("text", 1, 2, bi_text);
   vm.define_native("json", 1, 2, bi_json);
   vm.define_native("redirect", 1, 2, bi_redirect);

@@ -115,6 +115,7 @@ void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& scri
   g::install_window_builtins(vm);
   aios::cli::install_grain_net(vm);
   g::install_http_builtins(vm);
+  g::install_db_builtins(vm);
   grain_cli::install_process(vm);
   if (!opt.safe) {
     grain_cli::install_ffi(vm);

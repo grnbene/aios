@@ -83,6 +83,28 @@ has nothing that changes, so give the pane `"refresh": n` and the server looks
 again every n seconds. `examples/live.gr` is the model: data that changes, a
 view that shows it.
 
+## Databases, and live query results
+
+```grain
+let db = db_connect("127.0.0.1", 3307, "erp", password, "versioneight")   # ASQL, MariaDB or MySQL
+let r = db_query(db, "SELECT stockid, description FROM stockmaster LIMIT 5")
+r.rows        # [["A-1", "Widget"], ...]   (strings; nil for NULL)
+r.records     # [{stockid: "A-1", description: "Widget"}, ...]
+
+let late = live(db, "SELECT orderno, debtorno FROM salesorders WHERE late = 1")
+ui.table(late.records)    # stays current; nothing else to write
+```
+
+`db_connect` speaks the MySQL wire protocol itself (`mysql_native_password`, and
+`caching_sha2_password`'s fast path), with no client library. `live(db, sql)`
+returns a map whose `rows`, `records`, `columns`, `error` and `changes` are
+rewritten in place whenever the query's answer changes, so any view reading it
+redraws, in a window or in every browser at once. Against ASQL a tick is one
+`ASQL_CHANGES()` lookup over the tables the query reads (guessed from its FROM
+and JOINs, or given as `live(db, sql, {"tables": [...]})`); the query runs only
+when one of them was written. Against another server it runs every tick
+(`every`, default 1 second). `live.runs` counts how often the query itself ran.
+
 ## One program, a window or a web page
 
 A program built from `ui.pane` is written once and runs both ways. The pane's

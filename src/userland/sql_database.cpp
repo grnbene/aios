@@ -9825,6 +9825,22 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   }
   if (up == "DATABASE"sv || up == "SCHEMA"sv) return val_text(ctx.db ? ctx.db->effective_database() : "aios_db");
   if (up == "VERSION"sv) return val_text("5.7.44-aios-asql");
+  // ASQL_CHANGES('orders', 'order_lines', ...): a token that changes whenever any of the tables is written. An
+  // append moves the row count, an UPDATE moves the written column's epoch, a DELETE (or a rebuild) the table's
+  // mutation_seq; the token is all three, per table. A live query asks for it - no rows read - and runs the real
+  // query only when it differs from last time. A table that does not exist reads as "-".
+  if (up == "ASQL_CHANGES"sv) {
+    std::string token;
+    for (size_t k = 0; k < arg_count; ++k) {
+      if (k) token += ",";
+      const SqlTable* t = (!a_ptr[k].null && ctx.db) ? static_cast<const SqlDatabase*>(ctx.db)->find_table(a_ptr[k].str()) : nullptr;
+      if (!t) { token += "-"; continue; }
+      uint64_t newest_column = 0;
+      for (const auto& c : t->col_data) newest_column = std::max<uint64_t>(newest_column, c.epoch);
+      token += std::to_string(t->mutation_seq) + ":" + std::to_string(t->row_count()) + ":" + std::to_string(newest_column);
+    }
+    return val_text(token);
+  }
   // The id the wire handshake gave this connection (0 for a statement run
   // in-process, outside any client connection).
   if (up == "CONNECTION_ID"sv) return val_num((double)SqlDatabase::current_session_id());
@@ -15532,7 +15548,7 @@ void ColumnStore::materialize_to_dict_packed() {
   text_arena.clear();
   arena_offsets.clear();
   compressed_blocks.clear();
-  dict.clear();
+  dict.clear(); drop_dict_derived();
   dict.push_back(sql_null());
   id_index.clear();
     id_tag.clear();
@@ -15730,6 +15746,18 @@ void ColumnStore::push_back(const std::string& val) {
   if ((r + 1) % kSegRows == 0) seal_segment(*this);
 }
 
+void ColumnStore::drop_dict_derived() {
+  id_index.clear();
+  id_tag.clear();
+  id_index_count = 0;
+  dict_doubles.clear();
+  dict_doubles_valid.clear();
+  dict_ints.clear();
+  dict_ints_valid.clear();
+  sorted_dict_indices.clear();
+  sorted_built = false;
+}
+
 void ColumnStore::clear() {
   epoch = sql_next_mutation_seq();
   row_count_ = 0;
@@ -15742,7 +15770,7 @@ void ColumnStore::clear() {
   nulls_known = -1;
   data32.clear();
   packed_data.clear();
-  dict.clear();
+  dict.clear(); drop_dict_derived();
   dict.push_back(sql_null());
   id_index.clear();
     id_tag.clear();
@@ -17429,7 +17457,7 @@ void ColumnStore::dict_to_scaled(int dec_scale) {
     if (is_null(r) || codes[r] >= scaled.size()) continue;
     write_code(r, (uint32_t)(scaled[codes[r]] - lo));
   }
-  dict.clear(); dict.shrink_to_fit();
+  dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
   id_index.clear();
     id_tag.clear();
   id_index_count = 0;
@@ -17507,7 +17535,7 @@ void ColumnStore::apply_permutation(const std::vector<uint32_t>& perm) {
   // The rest (RLE, SegmentFOR, ALP, RawArena, FSST, ...): a dictionary of the permuted values, which
   // optimize_encoding then re-encodes.
   encoding = ColumnEncoding::DictBitPacked;
-  dict.clear();
+  dict.clear(); drop_dict_derived();
   dict.push_back(sql_null());
   id_index.clear();
     id_tag.clear();
@@ -17587,7 +17615,7 @@ void ColumnStore::dict_to_temporal() {
     write_code(r, (uint32_t)(vals[codes[r]] - lo));
   }
   if (bit_width_ == 32) packed_data.clear();
-  dict.clear(); dict.shrink_to_fit();
+  dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
   id_index.clear();
   id_index_count = 0;
   sorted_dict_indices.clear();
@@ -17658,7 +17686,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     constant_val = *unique_vals.begin();
     data32.clear(); data32.shrink_to_fit();
     packed_data.clear(); packed_data.shrink_to_fit();
-    dict.clear(); dict.shrink_to_fit();
+    dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
     id_index.clear();
     id_tag.clear();
     id_index_count = 0;
@@ -17707,7 +17735,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
         else packed_data.assign(((row_count_ * bit_width_ + 7) >> 3) + 8, 0);
         for (size_t r = 0; r < row_count_; ++r)
           if (!is_null(r)) write_code(r, static_cast<uint32_t>(tvals[r] - lo));
-        dict.clear(); dict.shrink_to_fit();
+        dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
         id_index.clear();
         id_index_count = 0;
         sorted_dict_indices.clear();
@@ -17738,7 +17766,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
   if (row_count_ >= 32 && rle_profitable && try_temporal(true, rle_data_bytes)) return;
   if (row_count_ >= 32 && rle_profitable) {
     encoding = ColumnEncoding::RLE;
-    dict.clear();
+    dict.clear(); drop_dict_derived();
     dict.push_back(sql_null());
     id_index.clear();
     id_tag.clear();
@@ -17880,7 +17908,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       bit_width_ = 0;
       data32.clear(); data32.shrink_to_fit();
       packed_data.clear();
-      dict.clear(); dict.shrink_to_fit();
+      dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
       id_index.clear();
     id_tag.clear();
       id_index_count = 0;
@@ -17903,7 +17931,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       pack_column_codes(*this, [&](size_t r) {
         return static_cast<uint32_t>(parsed_ints[r] - min_v);
       });
-      dict.clear(); dict.shrink_to_fit();
+      dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
       id_index.clear();
     id_tag.clear();
       id_index_count = 0;
@@ -17945,7 +17973,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       for (size_t r = 0; r < row_count_; ++r) {
         if (!is_null(r)) write_code(r, static_cast<uint32_t>(sv[r] - lo));
       }
-      dict.clear(); dict.shrink_to_fit();
+      dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
       id_index.clear();
       id_index_count = 0;
       int32_data.clear(); int64_data.clear(); double_data.clear();
@@ -18026,7 +18054,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
         pack_column_codes(*this, [&](size_t r) {
           return static_cast<uint32_t>(scaled_vals[r] - min_sv);
         });
-        dict.clear(); dict.shrink_to_fit();
+        dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
         id_index.clear();
     id_tag.clear();
         id_index_count = 0;
@@ -18087,7 +18115,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     base_int64 = 0;
     bit_width_ = 0;
     data32.clear(); data32.shrink_to_fit();
-    dict.clear(); dict.shrink_to_fit();
+    dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
     id_index.clear();
     id_tag.clear();
     id_index_count = 0;
@@ -18114,7 +18142,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
   // Rule 5: ndv <= 65536 or ndv < 80% -> Exact Sub-Byte Dictionary Bit-Packing
   auto encode_dict = [&]() {
     encoding = ColumnEncoding::DictBitPacked;
-    dict.clear();
+    dict.clear(); drop_dict_derived();
     dict.push_back(sql_null());
     id_index.clear();
     id_tag.clear();
@@ -18179,7 +18207,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     double_data.shrink_to_fit();
     data32.clear(); data32.shrink_to_fit();
     packed_data.clear(); packed_data.shrink_to_fit();
-    dict.clear(); dict.shrink_to_fit();
+    dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
     id_index.clear();
     id_tag.clear();
     id_index_count = 0;
@@ -18276,7 +18304,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     else pack(0, nblocks, 0);
     block_decodes = 0;
     data32.clear(); data32.shrink_to_fit();
-    dict.clear(); dict.shrink_to_fit();
+    dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
     id_index.clear();
     id_tag.clear();
     id_index_count = 0;
@@ -18307,7 +18335,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       fsst_set_boundaries(std::move(bounds));
       fsst_table.drop_index();   // decompress() reads the symbols only; compress() rebuilds this on the next append
       data32.clear(); data32.shrink_to_fit();
-      dict.clear(); dict.shrink_to_fit();
+      dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
       id_index.clear();
     id_tag.clear();
       id_index_count = 0;
@@ -18331,7 +18359,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
   text_arena.shrink_to_fit();
   arena_offsets.shrink_to_fit();
   data32.clear(); data32.shrink_to_fit();
-  dict.clear(); dict.shrink_to_fit();
+  dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
   id_index.clear();
     id_tag.clear();
   id_index_count = 0;
@@ -25346,7 +25374,8 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
           "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP",
           "UNIX_TIMESTAMP", "RAND", "UUID", "UUID_SHORT", "CONNECTION_ID", "LAST_INSERT_ID", "FOUND_ROWS",
           "ROW_COUNT", "DATABASE", "USER", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "SLEEP",
-          "BENCHMARK", "GET_LOCK", "RELEASE_LOCK", "IS_FREE_LOCK", "IS_USED_LOCK", "RELEASE_ALL_LOCKS"};
+          "BENCHMARK", "GET_LOCK", "RELEASE_LOCK", "IS_FREE_LOCK", "IS_USED_LOCK", "RELEASE_ALL_LOCKS",
+          "ASQL_CHANGES"};   // it reads tables the statement does not name in a FROM, so nothing would invalidate its answer
       if (kUncacheable.count(std::string_view(t.up))) cacheable = false;
     }
     if (!t.text.empty() && t.text[0] == '@') cacheable = false;
@@ -28888,7 +28917,7 @@ static_assert(kVxMorsel == kVxMorselZone, "morsels and zone-map segments must co
 
 // Different on every call: never evaluated once for many rows.
 bool nondeterministic_func(const std::string& up) {
-  return up == "SYSDATE"sv || up == "RAND"sv || up == "UUID"sv || up == "UUID_SHORT"sv || up == "SLEEP"sv ||
+  return up == "ASQL_CHANGES"sv || up == "SYSDATE"sv || up == "RAND"sv || up == "UUID"sv || up == "UUID_SHORT"sv || up == "SLEEP"sv ||
          up == "BENCHMARK"sv || up == "LAST_INSERT_ID"sv || up == "FOUND_ROWS"sv || up == "ROW_COUNT"sv ||
          up == "GET_LOCK"sv || up == "RELEASE_LOCK"sv || up == "IS_FREE_LOCK"sv || up == "IS_USED_LOCK"sv ||
          up == "RELEASE_ALL_LOCKS"sv || up == "__ASSIGN"sv;
@@ -29602,6 +29631,13 @@ void colidx_after_erase(const ColumnStore& cs, uint64_t old_epoch, const std::ve
       std::inplace_merge(ci->gaps.begin(), ci->gaps.begin() + (long)old, ci->gaps.end());
     }
     ci->rows_covered -= added;
+    if (ci->rows_covered == 0) {
+      // Every row the index held is gone (a DELETE of the whole table, or of all it had indexed). What is left is
+      // only gaps; rows appended next were merged against them wrongly - ORDER BY put a new row first and MAX
+      // missed it. Nothing is worth keeping: marked stale, it is built afresh on next use.
+      ci->layout = 0;
+      return;
+    }
     ci->layout = cs.epoch;
     const size_t entries = ci->sorted_rows.size() + (ci->offs.empty() ? 0 : ci->offs.back());
     if (ci->gaps.size() <= std::max<size_t>(1024, entries / 64)) return;
@@ -33090,7 +33126,18 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     // the column's type: the same on every statement until the dictionary
     // changes. Worked out once per column, not per statement - a one-row
     // SUM(quantity) spent ~200 of its 290 us evaluating all 756 of them.
-    struct BareCodes { uint64_t layout = 0; size_t nd = 0; int type = -1; SharedVals vals; Val null_val; };
+    // A code with no row when the values were worked out (its rows all deleted) has no value in them. An INSERT of
+    // that value later reuses the code without moving the column's epoch (appends never do), so a cache keyed on
+    // the epoch would go on reading the row as NULL: ORDER BY put it first and MIN / MAX skipped it. A cache that
+    // had such codes is checked, once rows were added, against the representative rows - kept up incrementally, so
+    // the check reads only the new rows - and worked out again when one came back.
+    auto revived = [&](size_t built_rows, const std::vector<uint32_t>& dead) {
+      if (dead.empty() || built_rows >= cs.size()) return false;
+      auto now = rep_rows(t, col);
+      for (uint32_t k : dead) if (k < now->of_code.size() && now->of_code[k] >= 0) return true;
+      return false;
+    };
+    struct BareCodes { uint64_t layout = 0; size_t nd = 0; int type = -1; SharedVals vals; Val null_val; size_t rows = 0; std::vector<uint32_t> dead; };
     static aios::hal::Mutex bare_mu;
     static std::unordered_map<uint64_t, std::shared_ptr<const BareCodes>> bare_cache;   // by ColumnStore::uid
     if (s.bare_column && !t.inferred_types) {
@@ -33102,6 +33149,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
             it->second->type == (int)t.columns[col].type)
           hit = it->second;
       }
+      if (hit && revived(hit->rows, hit->dead)) hit.reset();
       if (hit) {
         s.kind = Source::CodeCol;
         s.code_val = hit->vals;
@@ -33112,7 +33160,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     // An expression of the column (`SUBSTRING(stockid, 1, 6)`): its value
     // per code kept the same way, by the expression's structure - a GROUP BY
     // of it over 30k item codes evaluated all 30k on every statement.
-    struct ExprCodes { uint64_t layout = 0; size_t nd = 0; int type = -1; SharedVals vals; Val null_val; };
+    struct ExprCodes { uint64_t layout = 0; size_t nd = 0; int type = -1; SharedVals vals; Val null_val; size_t rows = 0; std::vector<uint32_t> dead; };
     static aios::hal::Mutex expr_mu;
     static std::unordered_map<std::string, std::shared_ptr<const ExprCodes>> expr_cache;   // uid|structure
     std::string ekey;
@@ -33123,7 +33171,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
         std::lock_guard<aios::hal::Mutex> lk(expr_mu);
         auto it = expr_cache.find(ekey);
         if (it != expr_cache.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
-            it->second->type == (int)t.columns[col].type) {
+            it->second->type == (int)t.columns[col].type && !revived(it->second->rows, it->second->dead)) {
           s.kind = Source::CodeCol;
           s.code_val = it->second->vals;
           s.null_val = it->second->null_val;
@@ -33133,6 +33181,8 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
       }
     }
     auto rr = rep_rows(t, col);
+    std::vector<uint32_t> dead;   // codes with no row: no value worked out for them (see `revived`)
+    for (size_t k = 1; k < rr->of_code.size(); ++k) if (rr->of_code[k] < 0) dead.push_back((uint32_t)k);
     RowEval ev(base);
     s.kind = Source::CodeCol;
     auto cv = std::make_shared<std::vector<Val>>(rr->of_code.size(), val_null());
@@ -33151,6 +33201,8 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
       bc->type = (int)t.columns[col].type;
       bc->vals = s.code_val;
       bc->null_val = s.null_val;
+      bc->rows = rr->rows;
+      bc->dead = dead;
       std::lock_guard<aios::hal::Mutex> lk(bare_mu);
       if (bare_cache.size() > 4096) bare_cache.clear();
       bare_cache[cs.uid.v] = std::move(bc);
@@ -33162,6 +33214,8 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
       ec->type = (int)t.columns[col].type;
       ec->vals = s.code_val;
       ec->null_val = s.null_val;
+      ec->rows = rr->rows;
+      ec->dead = dead;
       s.expr_key = ekey;
       std::lock_guard<aios::hal::Mutex> lk(expr_mu);
       if (expr_cache.size() > 256) expr_cache.clear();
@@ -33182,11 +33236,18 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
 // its 3.8 ms sorting them, for one-row answers.
 struct DictDerived {
   uint64_t layout = 0; size_t nd = 0; int type = -1;
+  size_t valued = 0;             // codes with a value when built: one that comes back (see `revived`) changes it
   std::vector<uint32_t> canon;   // code -> collation class; last slot = the NULL-row value
   std::vector<int> rank;         // code -> collation rank; -1 where the value is NULL
 };
 static aios::hal::Mutex dict_derived_mu;
 static std::unordered_map<uint64_t, std::shared_ptr<DictDerived>> dict_derived_cache;   // by ColumnStore::uid
+
+static size_t valued_codes(const SharedVals& v) {
+  size_t n = 0;
+  for (size_t k = 0; k < v.size(); ++k) if (!v[k].null) ++n;
+  return n;
+}
 
 // The cache entry for s (a CodeCol) when it can be shared, else null.
 std::shared_ptr<DictDerived> dict_derived_for(const SqlTable& t, const Source& s) {
@@ -33198,13 +33259,15 @@ std::shared_ptr<DictDerived> dict_derived_for(const SqlTable& t, const Source& s
     static std::unordered_map<std::string, std::shared_ptr<DictDerived>> expr_derived;
     std::lock_guard<aios::hal::Mutex> lk(dict_derived_mu);
     auto it = expr_derived.find(s.expr_key);
+    const size_t valued = valued_codes(s.code_val);
     if (it != expr_derived.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
-        it->second->type == (int)t.columns[s.col].type)
+        it->second->type == (int)t.columns[s.col].type && it->second->valued == valued)
       return it->second;
     auto d = std::make_shared<DictDerived>();
     d->layout = cs.epoch;
     d->nd = dict_size(cs);
     d->type = (int)t.columns[s.col].type;
+    d->valued = valued;
     if (expr_derived.size() > 256) expr_derived.clear();
     expr_derived[s.expr_key] = d;
     return d;
@@ -33212,14 +33275,16 @@ std::shared_ptr<DictDerived> dict_derived_for(const SqlTable& t, const Source& s
   if (!s.bare_column) return nullptr;
   std::lock_guard<aios::hal::Mutex> lk(dict_derived_mu);
   auto it = dict_derived_cache.find(cs.uid.v);
+  const size_t valued = valued_codes(s.code_val);
   if (it != dict_derived_cache.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
-      it->second->type == (int)t.columns[s.col].type && it->second->nd == s.code_val.size())
+      it->second->type == (int)t.columns[s.col].type && it->second->nd == s.code_val.size() && it->second->valued == valued)
     return it->second;
   if (dict_size(cs) != s.code_val.size()) return nullptr;
   auto d = std::make_shared<DictDerived>();
   d->layout = cs.epoch;
   d->nd = dict_size(cs);
   d->type = (int)t.columns[s.col].type;
+  d->valued = valued;
   if (dict_derived_cache.size() > 4096) dict_derived_cache.clear();
   dict_derived_cache[cs.uid.v] = d;
   return d;
@@ -36123,13 +36188,32 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
         std::vector<uint8_t> dup;
         if (distinct && !page.empty()) {
           const size_t nr = page.size();
+          // A string column compares by its collation, as GROUP BY does ('B-7' and 'b-7' are one value under the
+          // default case-insensitive collation): such rows are compared by their collation keys.
+          std::vector<uint8_t> fold(nc, 0);
+          bool any_fold = false;
+          for (size_t i = 0; i < nc && i < hdr.column_is_string.size(); ++i)
+            if (hdr.column_is_string[i]) { fold[i] = 1; any_fold = true; }
+          std::vector<std::string> keys;
+          if (any_fold) keys.resize(nr);
           std::vector<std::pair<uint64_t, uint32_t>> hs;
           hs.reserve(nr);
           for (size_t pi = 0; pi < nr; ++pi) {
             load(page[pi]);
             uint64_t h = 1469598103934665603ULL;
-            for (size_t i = 0; i < nc; ++i)
-              h = (h ^ (nulls[i] ? 0x9e3779b97f4a7c15ULL : std::hash<std::string_view>{}(cells[i]))) * 1099511628211ULL;
+            if (any_fold) {
+              std::string& k = keys[pi];
+              for (size_t i = 0; i < nc; ++i) {
+                if (nulls[i]) k.push_back('\x01');
+                else if (fold[i]) { k.push_back('\x02'); append_collate_key(k, cells[i]); }
+                else { k.push_back('\x03'); k.append(cells[i].data(), cells[i].size()); }
+                k.push_back('\x00');
+              }
+              h = std::hash<std::string>{}(k);
+            } else {
+              for (size_t i = 0; i < nc; ++i)
+                h = (h ^ (nulls[i] ? 0x9e3779b97f4a7c15ULL : std::hash<std::string_view>{}(cells[i]))) * 1099511628211ULL;
+            }
             hs.emplace_back(h, (uint32_t)pi);
           }
           std::sort(hs.begin(), hs.end());
@@ -36141,6 +36225,11 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
             while (j < nr && hs[j].first == hs[i].first) ++j;
             for (size_t a = i; j - i > 1 && a < j; ++a) {
               if (dup[hs[a].second]) continue;
+              if (any_fold) {
+                for (size_t b = a + 1; b < j; ++b)
+                  if (!dup[hs[b].second] && keys[hs[a].second] == keys[hs[b].second]) dup[hs[b].second] = 1;
+                continue;
+              }
               load(page[hs[a].second]);
               other.swap(cells);
               other_null.swap(nulls);
@@ -36646,11 +36735,33 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
     // Rows hashed, the equal hashes compared: no key string and no hash
     // node per row.
     const size_t nr = rows_out.size();
+    // A string column compares by its collation, as GROUP BY does: 'B-7' and 'b-7' are one value under the
+    // default case-insensitive collation, and DISTINCT kept both. Such rows are compared by their collation
+    // keys; a result with no string column keeps the plain comparison.
+    std::vector<uint8_t> fold(res.columns.size(), 0);
+    bool any_fold = false;
+    for (size_t c = 0; c < fold.size() && c < res.column_is_string.size(); ++c)
+      if (res.column_is_string[c]) { fold[c] = 1; any_fold = true; }
+    std::vector<std::string> keys;
+    if (any_fold) {
+      keys.resize(nr);
+      for (size_t i = 0; i < nr; ++i) {
+        std::string& k = keys[i];
+        const auto& vals = rows_out[i].row.values;
+        for (size_t c = 0; c < vals.size(); ++c) {
+          if (c < fold.size() && fold[c] && !sql_is_null(vals[c])) { k.push_back('\x02'); append_collate_key(k, vals[c]); }
+          else k += vals[c];
+          k.push_back('\x00');
+        }
+      }
+    }
+    auto same = [&](uint32_t a, uint32_t b) { return any_fold ? keys[a] == keys[b] : rows_out[a].row.values == rows_out[b].row.values; };
     std::vector<std::pair<uint64_t, uint32_t>> hs;
     hs.reserve(nr);
     for (size_t i = 0; i < nr; ++i) {
       uint64_t h = 1469598103934665603ULL;
-      for (const auto& v : rows_out[i].row.values) h = (h ^ std::hash<std::string>{}(v)) * 1099511628211ULL;
+      if (any_fold) h = std::hash<std::string>{}(keys[i]);
+      else for (const auto& v : rows_out[i].row.values) h = (h ^ std::hash<std::string>{}(v)) * 1099511628211ULL;
       hs.emplace_back(h, (uint32_t)i);
     }
     std::sort(hs.begin(), hs.end());
@@ -36661,7 +36772,7 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
       for (size_t a = i; j - i > 1 && a < j; ++a) {
         if (dup[hs[a].second]) continue;
         for (size_t b = a + 1; b < j; ++b)
-          if (!dup[hs[b].second] && rows_out[hs[a].second].row.values == rows_out[hs[b].second].row.values) dup[hs[b].second] = 1;
+          if (!dup[hs[b].second] && same(hs[a].second, hs[b].second)) dup[hs[b].second] = 1;
       }
       i = j;
     }
@@ -51690,6 +51801,12 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
   std::vector<int> pk_cols;
   for (size_t i = 0; i < t->columns.size(); ++i)
     if (t->columns[i].is_primary_key) pk_cols.push_back((int)i);
+  // A table with no primary key (MariaDB updates one through a join all the same): a row is known by all its
+  // values. Two identical rows are matched alike by any join, so each is updated as the other is.
+  const bool no_key = pk_cols.empty();
+  if (no_key)
+    for (size_t i = 0; i < t->columns.size(); ++i)
+      if (t->columns[i].generated.empty()) pk_cols.push_back((int)i);
   if (pk_cols.empty()) return make_error("a multi-table UPDATE needs a primary key on " + t->name);
   std::string sel = "SELECT ";
   for (size_t i = 0; i < pk_cols.size(); ++i)
@@ -51703,7 +51820,20 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
   }
   SqlQueryResult r = execute_local_query(sel);
   if (!r.success) return r;
-  std::shared_ptr<RowIndex> idx = get_or_sync_row_index(*t);
+  std::shared_ptr<RowIndex> idx = no_key ? nullptr : get_or_sync_row_index(*t);
+  std::unordered_map<std::string, std::vector<size_t>> by_values;   // no_key: the rows holding each set of values
+  // A row's values as one key, NULL included (row_key is a primary key's, which is never NULL).
+  auto values_key = [&](auto&& value_of) {
+    std::string k;
+    for (int c : pk_cols) {
+      const std::string v = sql_normalize_value(t->columns[(size_t)c].type, t->columns[(size_t)c].scale, value_of((size_t)c));
+      if (sql_is_null(v)) { k += '\x01'; continue; }
+      k += '\x02' + std::to_string(v.size()) + ':' + v;
+    }
+    return k;
+  };
+  if (no_key)
+    for (size_t ri = 0, n = t->row_count(); ri < n; ++ri) by_values[values_key([&](size_t c) { return t->cell(ri, c); })].push_back(ri);
   std::unordered_set<std::string> done;
   uint64_t changed = 0, matched = 0;
   const bool watched = things_watch(*t);
@@ -51718,11 +51848,17 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
       const SqlColumn& c = t->columns[(size_t)pk_cols[i]];
       key.values[(size_t)pk_cols[i]] = sql_normalize_value(c.type, c.scale, row.values[i]);
     }
-    const std::string k = row_key(key, pk_cols);
+    const std::string k = no_key ? values_key([&](size_t c) { return key.values[c]; }) : row_key(key, pk_cols);
     if (k.empty() || !done.insert(k).second) continue;
-    auto hit = idx->pk_to_row.find(k);
-    if (hit == idx->pk_to_row.end() || idx->row_of(hit->second) >= t->row_count()) continue;
-    const size_t ri = idx->row_of(hit->second);
+    std::vector<size_t> targets;
+    if (no_key) {
+      auto it = by_values.find(k);
+      if (it != by_values.end()) targets = it->second;
+    } else {
+      auto hit = idx->pk_to_row.find(k);
+      if (hit != idx->pk_to_row.end() && idx->row_of(hit->second) < t->row_count()) targets.push_back(idx->row_of(hit->second));
+    }
+    for (const size_t ri : targets) {
     SqlRow before = t->get_row(ri);
     bool differs = false;
     for (size_t a = 0; a < sets.size(); ++a) {
@@ -51772,6 +51908,7 @@ SqlQueryResult SqlDatabase::execute_update_join(const std::string& sql, const st
     if (watched) {
       SqlRow after = t->get_row(ri);
       notify_row_change(*t, &before, &after, ri);
+    }
     }
   }
   if (changed > 0) {
@@ -51856,7 +51993,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
       }
       return out + "'";
     };
-    struct Doomed { std::string table; std::vector<std::string> pk; std::vector<std::vector<std::string>> keys; };
+    struct Doomed { std::string table; std::vector<std::string> pk; std::vector<std::vector<std::string>> keys; bool by_values = false; };
     std::vector<Doomed> doomed;
     for (const auto& target : targets) {
       const ParsedSelectBranch::SourceSpec* hit = nullptr;
@@ -51872,7 +52009,13 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
       Doomed d;
       d.table = hit->table_name;
       for (const auto& c : tt->columns) if (c.is_primary_key) d.pk.push_back(c.name);
-      if (d.pk.empty()) return make_error("a multi-table DELETE needs a primary key on " + tt->name);
+      if (d.pk.empty()) {
+        // No primary key (MariaDB deletes through a join all the same): a row is known by all its values,
+        // compared NULL-safely, so a row with a NULL in it is still found.
+        d.by_values = true;
+        for (const auto& c : tt->columns) if (c.generated.empty()) d.pk.push_back(c.name);
+        if (d.pk.empty()) return make_error("a multi-table DELETE needs a primary key on " + tt->name);
+      }
       const std::string a = hit->alias.empty() ? hit->table_name : hit->alias;
       std::string sel = "SELECT DISTINCT ";
       for (size_t i = 0; i < d.pk.size(); ++i) sel += (i ? ", " : "") + backquote(a) + ".`" + d.pk[i] + "`";
@@ -51881,7 +52024,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
       if (!r.success) return r;
       for (const auto& row : r.rows) {
         bool null_key = false;
-        for (const auto& v : row.values) if (sql_is_null(v)) null_key = true;
+        if (!d.by_values) for (const auto& v : row.values) if (sql_is_null(v)) null_key = true;
         if (!null_key) d.keys.push_back(row.values);
       }
       doomed.push_back(std::move(d));
@@ -51891,7 +52034,14 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
       for (size_t at = 0; at < d.keys.size(); at += 500) {
         std::string stmt = "DELETE FROM " + backquote(d.table) + " WHERE ";
         const size_t upto = std::min(d.keys.size(), at + 500);
-        if (d.pk.size() == 1) {
+        auto value = [&](const std::string& v) { return sql_is_null(v) ? std::string("NULL") : literal(v); };
+        if (d.by_values) {
+          for (size_t k = at; k < upto; ++k) {
+            stmt += k > at ? " OR (" : "(";
+            for (size_t c = 0; c < d.pk.size(); ++c) stmt += (c ? " AND `" : "`") + d.pk[c] + "` <=> " + value(d.keys[k][c]);
+            stmt += ")";
+          }
+        } else if (d.pk.size() == 1) {
           stmt += "`" + d.pk[0] + "` IN (";
           for (size_t k = at; k < upto; ++k) stmt += (k > at ? ", " : "") + literal(d.keys[k][0]);
           stmt += ")";

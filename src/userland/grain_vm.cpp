@@ -1505,6 +1505,16 @@ Value Vm::call(const Value& callee, const std::vector<Value>& args, std::string&
     std::vector<Value> arg_copy = args;
     return nat->fn(*this, arg_copy, error);
   }
+  // A bound method (an FFI or native function, a plugin's, live()'s tick) is called as the interpreter calls it.
+  if (callee.type == Type::BoundMethod && callee.obj) {
+    auto* bm = static_cast<BoundMethodObj*>(callee.obj.get());
+    if ((int)args.size() < bm->min_args || (bm->max_args >= 0 && (int)args.size() > bm->max_args)) {
+      error = bm->name + "() takes " + std::to_string(bm->min_args) + " argument(s), got " + std::to_string(args.size());
+      return Value::nil();
+    }
+    std::vector<Value> arg_copy = args;
+    return bm->fn(*this, *bm, arg_copy, error);
+  }
 
   std::shared_ptr<ClosureObj> owned;
   ClosureObj* closure = closure_of(callee, owned);

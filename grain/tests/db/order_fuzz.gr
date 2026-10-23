@@ -1,0 +1,63 @@
+# Random inserts, deletes and updates against ASQL, with ORDER BY, MAX and MIN checked against a model after
+# every step - queries in between, so the engine's incremental column indexes are built and then kept up.
+#   grain order_fuzz.gr <port> <password> [steps] [seed]
+let a = db_connect("127.0.0.1", int(args[0]), "g", args[1], "shop")
+let steps = len(args) > 2 ? int(args[2]) : 400
+let seed = len(args) > 3 ? int(args[3]) : 7
+fn rnd(n) { seed = (seed * 1103515245 + 12345) % 2147483648 return seed % n }
+db_query(a, "DROP TABLE IF EXISTS fz")
+db_query(a, "CREATE TABLE fz (id INT PRIMARY KEY, v INT, s VARCHAR(12))")
+let model = {}
+fn sorted_ids() { let k = [] for x in keys(model) { push(k, int(x)) } return sort(k) }
+let bad = 0
+for step in range(0, steps) {
+  let op = rnd(10)
+  if op < 4 {
+    let id = rnd(60)
+    if model[str(id)] == nil {
+      let v = rnd(1000)
+      db_query(a, "INSERT INTO fz VALUES (" + str(id) + ", " + str(v) + ", 'k" + str(v) + "')")
+      model[str(id)] = v
+    }
+  } else if op < 6 {
+    let id = rnd(60)
+    db_query(a, "DELETE FROM fz WHERE id = " + str(id))
+    let m2 = {}
+    for k in keys(model) { if k != str(id) { m2[k] = model[k] } }
+    model = m2
+  } else if op < 7 {
+    db_query(a, "DELETE FROM fz WHERE id < " + str(rnd(60)))
+    let lim = 0
+  } else if op < 8 and rnd(4) == 0 {
+    db_query(a, "DELETE FROM fz")
+    model = {}
+  } else {
+    let id = rnd(60)
+    let v = rnd(1000)
+    db_query(a, "UPDATE fz SET v = " + str(v) + " WHERE id = " + str(id))
+    if model[str(id)] != nil { model[str(id)] = v }
+  }
+  # the engine's own truth for range deletes the model did not apply
+  let truth = []
+  for r in db_query(a, "SELECT id FROM fz ORDER BY id + 0").rows { push(truth, int(r[0])) }
+  let m3 = {}
+  for k in keys(model) { m3[k] = model[k] }
+  model = {}
+  for t in truth { model[str(t)] = m3[str(t)] }
+  let ord = []
+  for r in db_query(a, "SELECT id FROM fz ORDER BY id").rows { push(ord, int(r[0])) }
+  let desc = []
+  for r in db_query(a, "SELECT id FROM fz ORDER BY id DESC").rows { push(desc, int(r[0])) }
+  let mx = db_query(a, "SELECT MAX(id), MIN(id), COUNT(*) FROM fz").rows[0]
+  let want = sorted_ids()
+  let rev = []
+  for x in want { rev = [x] + rev }
+  let wmax = len(want) > 0 ? str(want[len(want) - 1]) : nil
+  let wmin = len(want) > 0 ? str(want[0]) : nil
+  if ord != want or desc != rev or mx[0] != wmax or mx[1] != wmin or int(mx[2]) != len(want) {
+    bad += 1
+    if bad <= 5 { print("BAD at step", step, "op", op, "order", ord, "want", want, "max/min/count", mx) }
+  }
+}
+print(bad == 0 ? "ok   " + str(steps) + " random steps, ORDER BY / MAX / MIN always right" : "FAIL " + str(bad) + " of " + str(steps) + " steps wrong")
+if bad > 0 { error("order fuzz failed") }

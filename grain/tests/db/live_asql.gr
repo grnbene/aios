@@ -1,0 +1,55 @@
+# live() against a running ASQL: a query's result follows writes made by anyone, and an unchanged table costs
+# one ASQL_CHANGES() lookup, not the query.   grain live_asql.gr <port> <password>
+let port = int(args[0])
+let pass = args[1]
+let fails = 0
+fn check(name, ok) {
+  if ok { print("ok   " + name) } else { print("FAIL " + name) fails += 1 }
+}
+
+let admin = db_connect("127.0.0.1", port, "g", pass)
+check("connects", admin.ok)
+if not admin.ok { print(admin.error) error("no connection") }
+db_query(admin, "CREATE DATABASE IF NOT EXISTS shop")
+db_query(admin, "DROP TABLE IF EXISTS shop.orders")
+let made = db_query(admin, "CREATE TABLE shop.orders (id INT PRIMARY KEY, customer VARCHAR(40), qty INT)")
+check("creates a table", made.ok)
+db_query(admin, "INSERT INTO shop.orders VALUES (1, 'ada', 3), (2, 'bob', 5)")
+
+let r = db_query(admin, "SELECT id, customer, qty FROM shop.orders ORDER BY id")
+check("a query answers rows and records", len(r.rows) == 2 and r.records[1].customer == "bob" and r.columns == ["id", "customer", "qty"])
+check("ASQL_CHANGES is there", db_query(admin, "SELECT ASQL_CHANGES('shop.orders')").ok)
+
+let viewer = db_connect("127.0.0.1", port, "g", pass)
+let orders = live(viewer, "SELECT id, customer, qty FROM shop.orders ORDER BY id", {"every": 0.1})
+check("live() has the first answer at once", len(orders.records) == 2)
+check("it watches ASQL changes, not polling", orders.watching == "asql changes")
+
+let before = orders.changes
+let runs = orders.runs
+wait(0.5)
+check("an unchanged table changes nothing", orders.changes == before)
+check("and does not even run the query (one ASQL_CHANGES lookup a tick)", orders.runs == runs)
+
+# someone else writes; the live value follows with nothing asked of it
+db_query(admin, "INSERT INTO shop.orders VALUES (3, 'cy', 7)")
+wait(0.4)
+check("an insert by another connection shows up", len(orders.records) == 3 and orders.records[2].customer == "cy")
+db_query(admin, "UPDATE shop.orders SET qty = 99 WHERE id = 1")
+wait(0.4)
+check("an update shows up", orders.records[0].qty == "99")
+db_query(admin, "DELETE FROM shop.orders WHERE id = 2")
+wait(0.4)
+check("a delete shows up", len(orders.records) == 2)
+check("each change counted once", orders.changes == before + 3)
+
+# a write to another table does not rerun this query
+db_query(admin, "CREATE TABLE shop.other (id INT PRIMARY KEY)")
+db_query(admin, "INSERT INTO shop.other VALUES (1)")
+let c = orders.changes
+let rr = orders.runs
+wait(0.4)
+check("a write to another table does not run this query", orders.changes == c and orders.runs == rr)
+
+if fails > 0 { error(str(fails) + " check(s) failed") }
+print("all live checks passed")
