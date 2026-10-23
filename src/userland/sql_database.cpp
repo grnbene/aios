@@ -17463,41 +17463,45 @@ void ColumnStore::erase(size_t row) {
   if (!null_bitmap.empty() && (row_count_ & 7)) null_bitmap.back() &= (uint8_t)((1u << (row_count_ & 7)) - 1);
 }
 
+// Room for `sz` rows. A vector's own reserve() allocates exactly what it is asked for, and the binlog applies a
+// row at a time: each insert into an 11-million-row audittrail copied every column whole (~180 ms an event on
+// chi-il-1, a day's restore never caught up). Growing by half again amortises it, as push_back does.
 void ColumnStore::reserve(size_t sz) {
   if (sz <= row_count_) return;
+  auto grow = [](auto& v, size_t n) { if (n > v.capacity()) v.reserve(std::max(n, v.capacity() + v.capacity() / 2)); };
   if (encoding == ColumnEncoding::DictBitPacked) {
-    if (bit_width_ == 32) data32.reserve(sz);
-    else if (bit_width_ > 0) packed_data.reserve(((sz * bit_width_ + 7) >> 3) + 8);
+    if (bit_width_ == 32) grow(data32, sz);
+    else if (bit_width_ > 0) grow(packed_data, ((sz * bit_width_ + 7) >> 3) + 8);
   } else if (encoding == ColumnEncoding::TypedInt32) {
-    int32_data.reserve(sz);
+    grow(int32_data, sz);
   } else if (encoding == ColumnEncoding::TypedInt64) {
-    int64_data.reserve(sz);
+    grow(int64_data, sz);
   } else if (encoding == ColumnEncoding::TypedDouble) {
-    double_data.reserve(sz);
+    grow(double_data, sz);
   } else if (encoding == ColumnEncoding::RawArena) {
-    arena_offsets.reserve(sz + 1);
+    grow(arena_offsets, sz + 1);
   } else if (encoding == ColumnEncoding::FOR || encoding == ColumnEncoding::TemporalDays ||
              encoding == ColumnEncoding::TemporalSeconds || encoding == ColumnEncoding::DecimalScaled) {
-    if (bit_width_ == 32) data32.reserve(sz);
-    else if (bit_width_ > 0) packed_data.reserve(((sz * bit_width_ + 7) >> 3) + 8);
+    if (bit_width_ == 32) grow(data32, sz);
+    else if (bit_width_ > 0) grow(packed_data, ((sz * bit_width_ + 7) >> 3) + 8);
   } else if (encoding == ColumnEncoding::SegmentFOR || encoding == ColumnEncoding::ALP) {
     const size_t nsegs = (sz + kSegRows - 1) / kSegRows;
-    seg_base.reserve(nsegs);
-    seg_bits.reserve(nsegs);
-    seg_byte_at.reserve(nsegs + 1);
-    if (encoding == ColumnEncoding::ALP) alp_exp.reserve(nsegs);
+    grow(seg_base, nsegs);
+    grow(seg_bits, nsegs);
+    grow(seg_byte_at, nsegs + 1);
+    if (encoding == ColumnEncoding::ALP) grow(alp_exp, nsegs);
   } else if (encoding == ColumnEncoding::RLE) {
-    rle_seg_base_rows.reserve((sz + 31) / 32);
+    grow(rle_seg_base_rows, (sz + 31) / 32);
   } else if (encoding == ColumnEncoding::FSST) {
     if (!fsst_offsets.empty()) {
-      fsst_offsets.reserve(sz + 1);   // already the wide form
+      grow(fsst_offsets, sz + 1);   // already the wide form
     } else {
-      fsst_off_rel.reserve(sz + 1);   // the compact form: 2 bytes a boundary and one base per 16
-      fsst_off_base.reserve((sz + 16) >> 4);
+      grow(fsst_off_rel, sz + 1);   // the compact form: 2 bytes a boundary and one base per 16
+      grow(fsst_off_base, (sz + 16) >> 4);
     }
   }
-  null_bitmap.reserve((sz + 7) >> 3);
-  zone_maps.reserve((sz + kSegRows - 1) / kSegRows);
+  grow(null_bitmap, (sz + 7) >> 3);
+  grow(zone_maps, (sz + kSegRows - 1) / kSegRows);
 }
 
 void ColumnStore::resize(size_t sz, const std::string& val) {
