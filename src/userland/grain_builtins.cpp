@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
+#include <mutex>
 #include <random>
 #include <sstream>
 #if !defined(_WIN32)
@@ -2027,10 +2029,6 @@ inline FontCut lookup_face_cut(const std::string& font_name, int font_size = 17)
   return {&fonts::UI, 17};
 }
 
-const fonts::Face& lookup_face(const std::string& font_name, int font_size = 17) {
-  return *lookup_face_cut(font_name, font_size).face;
-}
-
 inline int cov_at(const uint8_t* cov, const fonts::Glyph& g, float sx, float sy) {
   int x0 = (int)(sx < 0 ? sx - 1 : sx);
   int y0 = (int)(sy < 0 ? sy - 1 : sy);
@@ -2522,11 +2520,11 @@ void draw_text_aa(GrainCanvas& cv, const std::string& text, double start_x, doub
               if (a_byte > 0) {
                 size_t idx = (size_t)py * cv.width + (size_t)px;
                 if (cv.fill_gradient) {
-                  uint32_t col = sample_gradient(*cv.fill_gradient, px + 0.5, py + 0.5);
-                  uint32_t lsr = g_grain_gamma.srgb_to_lin[(col >> 16) & 0xFF];
-                  uint32_t lsg = g_grain_gamma.srgb_to_lin[(col >> 8) & 0xFF];
-                  uint32_t lsb = g_grain_gamma.srgb_to_lin[col & 0xFF];
-                  blend_px_lin(cv.pixels[idx], col, lsr, lsg, lsb, a_byte);
+                  uint32_t rgb = sample_gradient(*cv.fill_gradient, px + 0.5, py + 0.5);
+                  uint32_t lsr = g_grain_gamma.srgb_to_lin[(rgb >> 16) & 0xFF];
+                  uint32_t lsg = g_grain_gamma.srgb_to_lin[(rgb >> 8) & 0xFF];
+                  uint32_t lsb = g_grain_gamma.srgb_to_lin[rgb & 0xFF];
+                  blend_px_lin(cv.pixels[idx], rgb, lsr, lsg, lsb, a_byte);
                 } else {
                   blend_px_lin(cv.pixels[idx], color, lin_sr, lin_sg, lin_sb, a_byte);
                 }
@@ -2557,11 +2555,11 @@ void draw_text_aa(GrainCanvas& cv, const std::string& text, double start_x, doub
               if (a_byte > 0) {
                 size_t idx = (size_t)py * cv.width + (size_t)px;
                 if (cv.fill_gradient) {
-                  uint32_t col = sample_gradient(*cv.fill_gradient, px + 0.5, py + 0.5);
-                  uint32_t lsr = g_grain_gamma.srgb_to_lin[(col >> 16) & 0xFF];
-                  uint32_t lsg = g_grain_gamma.srgb_to_lin[(col >> 8) & 0xFF];
-                  uint32_t lsb = g_grain_gamma.srgb_to_lin[col & 0xFF];
-                  blend_px_lin(cv.pixels[idx], col, lsr, lsg, lsb, a_byte);
+                  uint32_t rgb = sample_gradient(*cv.fill_gradient, px + 0.5, py + 0.5);
+                  uint32_t lsr = g_grain_gamma.srgb_to_lin[(rgb >> 16) & 0xFF];
+                  uint32_t lsg = g_grain_gamma.srgb_to_lin[(rgb >> 8) & 0xFF];
+                  uint32_t lsb = g_grain_gamma.srgb_to_lin[rgb & 0xFF];
+                  blend_px_lin(cv.pixels[idx], rgb, lsr, lsg, lsb, a_byte);
                 } else {
                   blend_px_lin(cv.pixels[idx], color, lin_sr, lin_sg, lin_sb, a_byte);
                 }
@@ -6465,27 +6463,22 @@ Value bi_register_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (args[0].type == Type::Map && args[0].obj) {
     auto m = std::dynamic_pointer_cast<MapObj>(args[0].obj);
     if (m) {
-      if (Value* v = m->find("title")) pane->title = v->str();
-      else if (Value* v = m->find("name")) pane->title = v->str();
-      if (Value* v = m->find("width")) pane->width = (int)v->as_int();
-      else if (Value* v = m->find("w")) pane->width = (int)v->as_int();
-      if (Value* v = m->find("height")) pane->height = (int)v->as_int();
-      else if (Value* v = m->find("h")) pane->height = (int)v->as_int();
-      if (Value* v = m->find("x")) pane->x = (int)v->as_int();
-      if (Value* v = m->find("y")) pane->y = (int)v->as_int();
-      
-      if (Value* v = m->find("on_draw")) pane->draw_cb = *v;
-      else if (Value* v = m->find("draw")) pane->draw_cb = *v;
-      else if (Value* v = m->find("render")) pane->draw_cb = *v;
+      // the first of these names the map has
+      auto pick = [&](std::initializer_list<const char*> names) -> Value* {
+        for (const char* n : names)
+          if (Value* v = m->find(n)) return v;
+        return nullptr;
+      };
+      if (Value* v = pick({"title", "name"})) pane->title = v->str();
+      if (Value* v = pick({"width", "w"})) pane->width = (int)v->as_int();
+      if (Value* v = pick({"height", "h"})) pane->height = (int)v->as_int();
+      if (Value* v = pick({"x"})) pane->x = (int)v->as_int();
+      if (Value* v = pick({"y"})) pane->y = (int)v->as_int();
 
-      if (Value* v = m->find("on_event")) pane->event_cb = *v;
-      else if (Value* v = m->find("event")) pane->event_cb = *v;
-
-      if (Value* v = m->find("on_click")) pane->click_cb = *v;
-      else if (Value* v = m->find("click")) pane->click_cb = *v;
-
-      if (Value* v = m->find("on_key")) pane->key_cb = *v;
-      else if (Value* v = m->find("key")) pane->key_cb = *v;
+      if (Value* v = pick({"on_draw", "draw", "render"})) pane->draw_cb = *v;
+      if (Value* v = pick({"on_event", "event"})) pane->event_cb = *v;
+      if (Value* v = pick({"on_click", "click"})) pane->click_cb = *v;
+      if (Value* v = pick({"on_key", "key"})) pane->key_cb = *v;
 
       if (Value* v = m->find("data")) pane->custom_data = *v;
     }

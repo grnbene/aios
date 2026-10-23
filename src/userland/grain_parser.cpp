@@ -638,7 +638,7 @@ StmtP Parser::statement() {
   // machine, compiled by grain_native.cpp. Take their tokens whole: the body is its own language.
   if (t.kind == Tok::Ident && (t.text == "native" || t.text == "extern") && peek(1).kind == Tok::Fn) {
     auto s = std::make_unique<Stmt>();
-    s->kind = StmtKind::NativeFn;
+    s->kind = StmtKind::NativeDecl;
     s->line = t.line;
     const bool is_extern = t.text == "extern";
     int depth = 0;

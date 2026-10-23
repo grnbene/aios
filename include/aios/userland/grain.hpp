@@ -160,14 +160,14 @@ class MapObj final : public Obj {
 
 class Id128Obj final : public Obj {
  public:
-  explicit Id128Obj(aios::Id128 id) : Obj(Type::Id128), id(id) {}
+  explicit Id128Obj(aios::Id128 ident) : Obj(Type::Id128), id(ident) {}
   aios::Id128 id;
 };
 
 class CapObj final : public Obj {
  public:
-  CapObj(aios::Id128 id, std::string res, uint16_t rights, uint64_t exp = 0, aios::Id128 parent = {}, std::string holder = "")
-      : Obj(Type::Capability), id(id), resource(std::move(res)), rights(rights), expiry(exp), parent_id(parent), holder(std::move(holder)) {}
+  CapObj(aios::Id128 ident, std::string res, uint16_t rts, uint64_t exp = 0, aios::Id128 parent = {}, std::string hold = "")
+      : Obj(Type::Capability), id(ident), resource(std::move(res)), rights(rts), expiry(exp), parent_id(parent), holder(std::move(hold)) {}
   aios::Id128 id;
   std::string resource;
   uint16_t rights = 0;
@@ -185,8 +185,8 @@ class CapObj final : public Obj {
 
 class FrameObj final : public Obj {
  public:
-  FrameObj(aios::Id128 id, uint64_t gen, aios::Id128 pub, Value pay, uint64_t ts = 0)
-      : Obj(Type::StateFrame), id(id), generation(gen), publisher(pub), payload(std::move(pay)), timestamp(ts) {}
+  FrameObj(aios::Id128 ident, uint64_t gen, aios::Id128 pub, Value pay, uint64_t ts = 0)
+      : Obj(Type::StateFrame), id(ident), generation(gen), publisher(pub), payload(std::move(pay)), timestamp(ts) {}
   aios::Id128 id;
   uint64_t generation = 0;
   aios::Id128 publisher;
@@ -196,8 +196,8 @@ class FrameObj final : public Obj {
 
 class ChannelObj final : public Obj {
  public:
-  ChannelObj(std::string name, aios::Id128 id, uint32_t cap = 256)
-      : Obj(Type::Channel), name(std::move(name)), id(id), capacity(cap) {}
+  ChannelObj(std::string nm, aios::Id128 ident, uint32_t cap = 256)
+      : Obj(Type::Channel), name(std::move(nm)), id(ident), capacity(cap) {}
   std::string name;
   aios::Id128 id;
   uint32_t capacity = 256;
@@ -213,8 +213,8 @@ class ChannelObj final : public Obj {
 
 class MemObj final : public Obj {
  public:
-  MemObj(aios::Id128 id, size_t sz, std::string prov = "ram")
-      : Obj(Type::MemoryObject), id(id), size(sz), provider(std::move(prov)), buffer(sz, 0) {}
+  MemObj(aios::Id128 ident, size_t sz, std::string prov = "ram")
+      : Obj(Type::MemoryObject), id(ident), size(sz), provider(std::move(prov)), buffer(sz, 0) {}
   aios::Id128 id;
   size_t size = 0;
   std::string provider;
@@ -228,8 +228,8 @@ class MemObj final : public Obj {
 
 class EntityObj final : public Obj {
  public:
-  EntityObj(std::string name, aios::Id128 id)
-      : Obj(Type::Entity), name(std::move(name)), id(id) {}
+  EntityObj(std::string nm, aios::Id128 ident)
+      : Obj(Type::Entity), name(std::move(nm)), id(ident) {}
   std::string name;
   aios::Id128 id;
   std::unordered_map<std::string, Value> fields;
@@ -244,8 +244,8 @@ class Vm;
 class BoundMethodObj final : public Obj {
  public:
   using MethodFn = Value (*)(Vm& vm, BoundMethodObj& bm, std::vector<Value>& args, std::string& error);
-  BoundMethodObj(Value rec, std::string name, int min_a, int max_a, MethodFn f)
-      : Obj(Type::BoundMethod), receiver(std::move(rec)), name(std::move(name)),
+  BoundMethodObj(Value rec, std::string nm, int min_a, int max_a, MethodFn f)
+      : Obj(Type::BoundMethod), receiver(std::move(rec)), name(std::move(nm)),
         min_args(min_a), max_args(max_a), fn(f) {}
   Value receiver;
   std::string name;

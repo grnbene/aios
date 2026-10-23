@@ -76,7 +76,7 @@ struct EntityDef {
 
 enum class StmtKind : uint8_t {
   Expression, Let, Block, If, While, ForIn, Return, Break, Continue, EntityDecl,
-  NativeFn   // `native fn` / `extern fn`: its tokens, compiled to machine code (grain_native.cpp)
+  NativeDecl   // `native fn` / `extern fn`: its tokens, compiled to machine code (grain_native.cpp)
 };
 
 struct Stmt {

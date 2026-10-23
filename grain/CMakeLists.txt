@@ -115,6 +115,14 @@ add_library(grain_lang STATIC ${GRAIN_LANG_SOURCES} ${GRAIN_HOST_SOURCES} ${AIOS
 target_include_directories(grain_lang PUBLIC ${AIOS_ROOT}/include PRIVATE ${AIOS_ROOT}/cli)
 find_package(Threads REQUIRED)
 target_link_libraries(grain_lang PUBLIC Threads::Threads)
+# shm_open/shm_unlink (linux_host.cpp) live in librt before glibc 2.34 (CentOS 7, Ubuntu 20.04);
+# newer glibc folds it into libc and an empty librt still links.
+if(UNIX AND NOT APPLE)
+  find_library(GRAIN_RT_LIB rt)
+  if(GRAIN_RT_LIB)
+    target_link_libraries(grain_lang PUBLIC ${GRAIN_RT_LIB})
+  endif()
+endif()
 # The host layer without the telemetry it feeds aios's world model (src/hal/linux_host.cpp).
 target_compile_definitions(grain_lang PRIVATE AIOS_HAL_HOST_ONLY)
 if(WIN32)

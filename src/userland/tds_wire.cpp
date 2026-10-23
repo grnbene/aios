@@ -1,6 +1,7 @@
 // AIOS — Native Microsoft TDS 7.4 wire client implementation ([MS-TDS]).
 #include "aios/userland/tds_wire.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "aios/userland/portable_int128.hpp"
 #include "aios/hal/host.hpp"
 #include "aios/net/tls.hpp"
 #include "aios/net/tls_conn.hpp"
@@ -242,7 +243,7 @@ std::string num_text(double v) { return sql_format_double(v, 0); }
 
 // An exact decimal: a magnitude of `len` little-endian bytes, `scale` digits after the point.
 std::string decimal_text(bool positive, const uint8_t* mag, size_t len, int scale) {
-  unsigned __int128 v = 0;
+  AIOS_UINT128 v = 0;
   for (size_t i = len; i-- > 0;) v = (v << 8) | mag[i];
   std::string digits;
   do { digits.push_back(char('0' + int(v % 10))); v /= 10; } while (v != 0);
