@@ -1,0 +1,135 @@
+# Numbers a double cannot carry, on ASQL and on MariaDB, answer for answer: BIGINTs past 2^53 and near 2^63,
+# BIGINT UNSIGNED near 2^64, DECIMAL(30,10) - in a table of few values (dictionary coded) and one of many (typed
+# integers). Sorting, grouping, DISTINCT, filters, IN, joins, subqueries, windows, MIN/MAX/SUM.
+#   grain wide_numbers.gr <asql port> <asql password> <mariadb port> <mariadb password>
+let asql = db_connect("127.0.0.1", int(args[0]), "g", args[1])
+let maria = db_connect("127.0.0.1", int(args[2]), "g", args[3])
+if not asql.ok { error("asql: " + asql.error) }
+if not maria.ok { error("mariadb: " + maria.error) }
+
+let seed = 7
+fn rnd(n) {
+  seed = (seed * 1103515245 + 12345) % 2147483648
+  return int(seed / 65536) % n
+}
+fn pick(xs) { return xs[rnd(len(xs))] }
+fn setup(st) {
+  let x = db_query(asql, st)
+  let y = db_query(maria, st)
+  if not x.ok { error("asql setup: " + x.error + " in " + slice(st, 0, 120)) }
+  if not y.ok { error("mariadb setup: " + y.error + " in " + slice(st, 0, 120)) }
+}
+fn norm(r) { return r.ok ? json_stringify(r.rows) : "ERROR" }
+let bad = 0
+let checked = 0
+fn both(st) {
+  let x = db_query(asql, st)
+  let y = db_query(maria, st)
+  checked += 1
+  if norm(x) != norm(y) {
+    bad += 1
+    if bad <= 20 {
+      print("DIFF " + st)
+      print("  asql:    " + slice(x.ok ? norm(x) : x.error, 0, 300))
+      print("  mariadb: " + slice(y.ok ? norm(y) : y.error, 0, 300))
+    }
+  }
+}
+
+# Big numbers are written as text: grain's integers are 64-bit, and 2^64 - k is not one of them.
+fn near53(k) { return "90071992547409" + str(92 + k) }                       # k in 0..7
+fn near63(k) { return "92233720368547758" + (k < 10 ? "0" : "") + str(k) }    # 9223372036854775800 + k, k in 0..7
+fn near64(k) { return "184467440737095516" + (k < 10 ? "0" : "") + str(k) }   # 18446744073709551600 + k, k in 0..15
+let decs = ["12345678901234567890.0000000001", "12345678901234567890.0000000002", "12345678901234567890", "-12345678901234567890.0000000001", "0.0000000001", "1.5", "NULL"]
+
+setup("CREATE DATABASE IF NOT EXISTS fz")
+setup("USE fz")
+for t in ["wn_few", "wn_many", "wn_join"] { setup("DROP TABLE IF EXISTS " + t) }
+setup("CREATE TABLE wn_few (id INT PRIMARY KEY, b BIGINT, u BIGINT UNSIGNED, d DECIMAL(30,10), g INT)")
+setup("CREATE TABLE wn_many (id INT PRIMARY KEY, b BIGINT, u BIGINT UNSIGNED, g INT)")
+setup("CREATE TABLE wn_join (id INT PRIMARY KEY, b BIGINT, u BIGINT UNSIGNED)")
+
+# few distinct values: dictionary coded
+let id = 1
+for chunk in range(0, 6) {
+  let rows = []
+  for j in range(0, 500) {
+    let k = rnd(4)
+    let b = k == 0 ? near53(rnd(8)) : (k == 1 ? "-" + near53(rnd(8)) : (k == 2 ? near63(rnd(8)) : (rnd(6) == 0 ? "NULL" : str(rnd(11) - 5))))
+    let u = rnd(7) == 0 ? "NULL" : near64(rnd(16))
+    push(rows, "(" + str(id) + ", " + b + ", " + u + ", " + pick(decs) + ", " + str(rnd(10)) + ")")
+    id += 1
+  }
+  setup("INSERT INTO wn_few VALUES " + join(rows, ", "))
+}
+# many distinct values: typed integers (more than a segment of rows)
+id = 1
+for chunk in range(0, 12) {
+  let rows = []
+  for j in range(0, 1000) {
+    let off = rnd(6000)
+    # 2^53 - 3000 .. 2^53 + 3000, and 2^62 + 3k
+    let b = rnd(2) == 0 ? str(9007199254737992 + off) : str(4611686018427387904 + off * 3)
+    if rnd(97) == 0 { b = "NULL" }
+    let r = str(rnd(1600))
+    while len(r) < 4 { r = "0" + r }
+    let u = "1844674407370955" + r   # 18446744073709550000 + r, below 2^64
+    push(rows, "(" + str(id) + ", " + b + ", " + u + ", " + str(rnd(8)) + ")")
+    id += 1
+  }
+  setup("INSERT INTO wn_many VALUES " + join(rows, ", "))
+}
+let jrows = []
+for j in range(1, 401) {
+  let b = rnd(3) == 0 ? str(9007199254737992 + rnd(6000)) : near53(rnd(8))
+  push(jrows, "(" + str(j) + ", " + b + ", " + near64(rnd(16)) + ")")
+}
+setup("INSERT INTO wn_join VALUES " + join(jrows, ", "))
+
+for tc in [["wn_few", ["b", "u", "d"]], ["wn_many", ["b", "u"]]] {
+  let t = tc[0]
+  for col in tc[1] {
+    both("SELECT " + col + ", COUNT(*) FROM " + t + " GROUP BY " + col + " ORDER BY " + col + " LIMIT 60")
+    both("SELECT " + col + ", COUNT(*) FROM " + t + " GROUP BY " + col + " ORDER BY " + col + " DESC LIMIT 60")
+    both("SELECT " + col + ", COUNT(*) FROM " + t + " GROUP BY " + col + " ORDER BY COUNT(*) DESC, " + col + " LIMIT 30")
+    both("SELECT id, " + col + " FROM " + t + " ORDER BY " + col + ", id LIMIT 40")
+    both("SELECT id, " + col + " FROM " + t + " ORDER BY " + col + " DESC, id LIMIT 40")
+    both("SELECT id FROM " + t + " ORDER BY " + col + ", id LIMIT 20 OFFSET 1500")
+    both("SELECT DISTINCT " + col + " FROM " + t + " ORDER BY 1 LIMIT 60")
+    both("SELECT MIN(" + col + "), MAX(" + col + "), COUNT(DISTINCT " + col + "), SUM(" + col + ") FROM " + t)
+    both("SELECT g, MIN(" + col + "), MAX(" + col + "), SUM(" + col + "), COUNT(*) FROM " + t + " GROUP BY g ORDER BY g")
+    both("SELECT id, " + col + ", RANK() OVER (ORDER BY " + col + ") FROM " + t + " WHERE g = 1 ORDER BY 3, id LIMIT 40")
+  }
+}
+for x in [near53(1), near53(0), "-" + near53(1), near63(6), near63(7), "4611686018427387907"] {
+  for t in ["wn_few", "wn_many"] {
+    for op in ["=", "<>", "<", "<=", ">", ">="] { both("SELECT COUNT(*) FROM " + t + " WHERE b " + op + " " + x) }
+    both("SELECT COUNT(*) FROM " + t + " WHERE b = '" + x + "'")
+    both("SELECT COUNT(*) FROM " + t + " WHERE b IN (" + x + ", 3)")
+    both("SELECT COUNT(*) FROM " + t + " WHERE b BETWEEN " + x + " AND " + x + " + 2")
+  }
+}
+for x in [near64(15), near64(14), near64(3), "9223372036854775808"] {
+  for t in ["wn_few", "wn_many"] {
+    both("SELECT COUNT(*) FROM " + t + " WHERE u = " + x)
+    both("SELECT COUNT(*) FROM " + t + " WHERE u > " + x)
+    both("SELECT COUNT(*) FROM " + t + " WHERE u <= " + x)
+  }
+}
+for x in slice(decs, 0, 3) { both("SELECT COUNT(*) FROM wn_few WHERE d = " + x) both("SELECT COUNT(*) FROM wn_few WHERE d > " + x) }
+for t in ["wn_few", "wn_many"] {
+  both("SELECT COUNT(*) FROM " + t + " JOIN wn_join ON wn_join.b = " + t + ".b")
+  both("SELECT COUNT(*) FROM wn_join JOIN " + t + " ON " + t + ".u = wn_join.u")
+  both("SELECT wn_join.id, COUNT(" + t + ".id) FROM wn_join LEFT JOIN " + t + " ON " + t + ".b = wn_join.b GROUP BY wn_join.id ORDER BY wn_join.id LIMIT 60")
+  both("SELECT COUNT(*) FROM " + t + " WHERE b IN (SELECT b FROM wn_join)")
+  both("SELECT COUNT(*) FROM " + t + " WHERE u IN (SELECT u FROM wn_join)")
+  both("SELECT COUNT(*) FROM wn_join WHERE b NOT IN (SELECT b FROM " + t + " WHERE b IS NOT NULL AND g = 2)")
+  both("SELECT COUNT(*) FROM " + t + " x WHERE EXISTS (SELECT 1 FROM wn_join WHERE wn_join.b = x.b)")
+  both("SELECT wn_join.id, (SELECT COUNT(*) FROM " + t + " WHERE " + t + ".b = wn_join.b) FROM wn_join ORDER BY wn_join.id LIMIT 60")
+  both("SELECT wn_join.id, (SELECT MAX(" + t + ".id) FROM " + t + " WHERE " + t + ".u = wn_join.u) FROM wn_join ORDER BY wn_join.id LIMIT 60")
+  both("SELECT b + 1, b - 1, b * 1 FROM " + t + " WHERE id < 15 ORDER BY id")
+  both("SELECT GREATEST(b, " + near53(1) + "), LEAST(u, " + near64(14) + ") FROM " + t + " WHERE id < 15 ORDER BY id")
+  both("SELECT AVG(b) FROM " + t)
+}
+print(bad == 0 ? "ok   " + str(checked) + " answers with numbers past what a double holds, the same on ASQL and MariaDB" : "FAIL " + str(bad) + " difference(s) in " + str(checked) + " answers")
+if bad > 0 { error("wide numbers differ") }
