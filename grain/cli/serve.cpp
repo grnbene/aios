@@ -99,6 +99,27 @@ void answer(int fd, g::WebUi& ui) {
   req.tree = header_of(head, "accept").find("application/x-grain-ui") != std::string::npos;
   req.stream = header_of(head, "accept").find("text/event-stream") != std::string::npos;
   req.body = body;
+  for (size_t at = head.find("\r\n"); at != std::string::npos;) {
+    const size_t b = at + 2, e = head.find("\r\n", b);
+    const std::string line = head.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    const size_t colon = line.find(':');
+    if (colon != std::string::npos) {
+      std::string name = line.substr(0, colon), value = line.substr(colon + 1);
+      for (char& c : name) c = (char)std::tolower((unsigned char)c);
+      while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
+      while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
+      req.headers.push_back({name, value});
+    }
+    at = e;
+  }
+  sockaddr_storage peer{};
+  socklen_t peer_len = sizeof peer;
+  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
+    char ip[INET6_ADDRSTRLEN] = {0};
+    if (peer.ss_family == AF_INET) ::inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(&peer)->sin_addr, ip, sizeof ip);
+    else if (peer.ss_family == AF_INET6) ::inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(&peer)->sin6_addr, ip, sizeof ip);
+    req.remote = ip;
+  }
   if (req.stream && req.method == "GET") {
     // The page asked to be told when the data changes: hold the connection and send each change as it happens.
     g::WebUi::Stream stream;
@@ -121,7 +142,7 @@ void answer(int fd, g::WebUi& ui) {
   g::WebUi::Response res;
   if (req.path == "/favicon.ico") { res.status = 204; }
   else res = ui.handle(req);
-  const char* reason = res.status == 200 ? "OK" : res.status == 204 ? "No Content" : res.status == 403 ? "Forbidden" : res.status == 405 ? "Method Not Allowed" : "Error";
+  const char* reason = res.status == 200 ? "OK" : res.status == 204 ? "No Content" : res.status == 400 ? "Bad Request" : res.status == 401 ? "Unauthorized" : res.status == 403 ? "Forbidden" : res.status == 404 ? "Not Found" : res.status == 405 ? "Method Not Allowed" : res.status == 429 ? "Too Many Requests" : "Error";
   std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason + "\r\n";
   for (const auto& h : res.headers) out += h.first + ": " + h.second + "\r\n";
   out += "Content-Length: " + std::to_string(res.body.size()) + "\r\nConnection: close\r\n\r\n";

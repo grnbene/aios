@@ -117,6 +117,8 @@ set(TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 grain_case(tools.test ${TOOLS}/runner 1 test)
 # The bytes type and its typed reads, writes, pack and unpack.
 grain_case(lowlevel.bytes ${CMAKE_CURRENT_SOURCE_DIR}/bytes 0 test)
+# Decimals: exact arithmetic, rounding modes and formatting on decimal text; \x escapes.
+grain_case(std.decimal ${CMAKE_CURRENT_SOURCE_DIR}/decimal 0 test)
 # A plugin written in C++ against include/grain_plugin.h, built here and loaded by a grain
 # program that sits beside it (the test is copied next to the library it loads).
 if(NOT WIN32)

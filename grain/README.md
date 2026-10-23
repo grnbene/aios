@@ -545,7 +545,7 @@ stops with an error in its window instead of freezing the desktop.
 | | macOS arm64 | macOS x86_64 | Linux x86_64 | Linux arm64 | Windows x64 |
 |---|---|---|---|---|---|
 | interpreter | yes | yes | yes | yes | yes |
-| JIT | not yet (needs `MAP_JIT`) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
+| JIT | yes (`MAP_JIT`; tools/grain-jit cases match the interpreter, no leaks) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
 Built and tested so far: macOS arm64 (57 of 57 cases, a signed .app passing
 strict verification, the live HTTPS checks, the window test on a real macOS

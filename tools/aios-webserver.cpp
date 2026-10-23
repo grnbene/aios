@@ -829,6 +829,8 @@ bool serve_grain_ui(hal::Host& host, hal::Connection& conn, net::ConnReader& rea
   req.tree = head.header("Accept").value_or("").find("application/x-grain-ui") != std::string::npos;
   req.stream = head.header("Accept").value_or("").find("text/event-stream") != std::string::npos;
   req.https = vh.ssl;
+  for (const auto& h : head.headers) req.headers.push_back({h.name, h.value});
+  req.remote = conn.peer();
   net::RequestBodyReader body(reader, head);
   while (!body.done()) {   // an event is a few fields: more than 256 KiB is not one
     auto r = body.next(64 * 1024, 60000);

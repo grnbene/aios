@@ -530,6 +530,7 @@ double wall_ms();   // the clock timers use: milliseconds, monotonic
 void install_time_builtins(Vm& vm);    // now, date_parts/format/parse/make (grain_std_time.cpp)
 void install_text_builtins(Vm& vm);    // format, sort_by, group_by, uuid (grain_std_text.cpp)
 void install_bytes_builtins(Vm& vm);   // bytes, bytes_get/set, pack/unpack, bytes_* (grain_std_bytes.cpp)
+void install_decimal_builtins(Vm& vm); // decimal, decimal_prefix, dec_add/sub/mul/div/cmp/round/format (grain_std_decimal.cpp)
 void install_path_builtins(Vm& vm);    // path_join, basename, dirname, extname, mkdir, ... (grain_std_path.cpp)
 // parallel_map, spawn, await, task_done: grain on every core, each worker a VM of its own (grain_std_parallel.cpp).
 void install_parallel_builtins(Vm& vm);
@@ -629,8 +630,10 @@ bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& ac
                     const std::vector<std::pair<std::string, std::string>>& fields, std::string& error);
 // If the pane defined custom HTTP routes (ui.pane({"routes": {"/path": fn(req)}})),
 // delivers the request and fills status, res_body, and content_type. Returns true if handled.
+// The handler gets {method, path, query, body, headers (names lowercased), remote}.
 bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                            const std::string& query, const std::string& body,
+                           const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
                            int& status, std::string& res_body, std::string& content_type, std::string& error);
 
 }  // namespace aios::userland::grain

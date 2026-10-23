@@ -22,7 +22,12 @@
 // On the Pi the heap is mapped executable (MAP_NORMAL|MAP_EXEC) and the code
 // is made visible to instruction fetch with the architectural clean/invalidate
 // sequence (__builtin___clear_cache). On an arm64 Linux host (how this is
-// developed under qemu-aarch64) code pages come from mmap.
+// developed under qemu-aarch64) code pages come from mmap. macOS on Apple
+// Silicon refuses writable+executable pages unless they are mapped MAP_JIT,
+// and then a thread sees them either writable or executable, never both:
+// pthread_jit_write_protect_np(0) opens them for writing on this thread only,
+// (1) makes them executable again, and sys_icache_invalidate publishes the
+// code. A hardened-runtime signature needs com.apple.security.cs.allow-jit.
 #include "grain_jit.hpp"
 
 #include <cstddef>
@@ -33,6 +38,10 @@
 
 #if defined(__aarch64__) && !defined(AIOS_METAL) && !defined(_WIN32)
 #include <sys/mman.h>
+#endif
+#if defined(__aarch64__) && defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
 #endif
 
 namespace aios::userland::grain::jit {
@@ -84,7 +93,9 @@ struct Layout {
   uint32_t fn_jit;           // FnObj::jit_code
   uint32_t fn_arity;         // FnObj::arity (int)
   uint32_t fn_chunk;         // FnObj::chunk
-  uint32_t sp_use_count;     // shared_ptr control block: use count (int)
+  uint32_t sp_use_count;     // shared_ptr control block: use count
+  bool sp_wide;              // the count is a long (libc++), not an int (libstdc++)
+  uint32_t sp_last;          // the count's stored value when one owner is left: 1, or 0 where it holds owners - 1 (libc++)
   bool ok;
 };
 template <class T, class M> uint32_t member_off(const T& o, const M& m) {
@@ -102,14 +113,27 @@ const Layout& layout() {
     l.fn_arity = member_off(*fn, fn->arity);
     l.fn_chunk = member_off(*fn, fn->chunk);
     // shared_ptr = {element*, control block*}; the control block's use count
-    // follows its vtable pointer. Checked, not assumed.
+    // follows its vtable pointer: an int counting owners (libstdc++), or a
+    // long counting owners - 1 (libc++). Checked, not assumed: two owners
+    // here, then three, then two again.
     auto** raw = reinterpret_cast<void**>(&c.fn);
     const char* ctrl = static_cast<const char*>(raw[1]);
     l.sp_use_count = 8;
-    const int before = *reinterpret_cast<const int*>(ctrl + 8);
-    std::shared_ptr<FnObj> extra = c.fn;
-    const int after = *reinterpret_cast<const int*>(ctrl + 8);
-    l.ok = raw[0] == fn.get() && before == 2 && after == 3 && sizeof(std::shared_ptr<FnObj>) == 16 &&
+    auto count = [&] {
+      return l.sp_wide ? static_cast<long long>(*reinterpret_cast<const long*>(ctrl + 8))
+                       : static_cast<long long>(*reinterpret_cast<const int*>(ctrl + 8));
+    };
+    l.sp_wide = sizeof(long) == 8 && *reinterpret_cast<const long*>(ctrl + 8) == 1;
+    l.sp_last = l.sp_wide ? 0 : 1;
+    const long long before = count();
+    bool counts = false;
+    {
+      std::shared_ptr<FnObj> extra = c.fn;
+      const long long during = count();
+      counts = before == static_cast<long long>(l.sp_last) + 1 && during == before + 1;
+    }
+    counts = counts && count() == before;
+    l.ok = raw[0] == fn.get() && counts && sizeof(std::shared_ptr<FnObj>) == 16 &&
            l.fn_jit % 8 == 0 && l.closure_fn % 8 == 0 && l.fn_arity % 4 == 0;
     return l;
   }();
@@ -165,6 +189,9 @@ struct Asm {
   void ldr_w(Reg t, Reg n, uint32_t off) { w(0xB9400000u | ((off / 4) << 10) | (n << 5) | t); }   // off % 4 == 0
   void ldxr_w(Reg t, Reg n) { w(0x885F7C00u | (n << 5) | t); }
   void stxr_w(Reg s, Reg t, Reg n) { w(0x88007C00u | (s << 16) | (n << 5) | t); }
+  void ldxr_x(Reg t, Reg n) { w(0xC85F7C00u | (n << 5) | t); }
+  void stxr_x(Reg s, Reg t, Reg n) { w(0xC8007C00u | (s << 16) | (n << 5) | t); }
+  void cmp_imm(Reg n, uint32_t imm) { w(0xF100001Fu | (imm << 10) | (n << 5)); }
   void clrex() { w(0xD503305Fu); }
   void add_imm_w(Reg d, Reg n, uint32_t imm) { w(0x11000000u | (imm << 10) | (n << 5) | d); }
   void sub_imm_w(Reg d, Reg n, uint32_t imm) { w(0x51000000u | (imm << 10) | (n << 5) | d); }
@@ -375,26 +402,44 @@ class Compiler {
     a_.patch(done, a_.here());
   }
 
-  // ++use_count of the control block in `ctrl` (non-null). LL/SC.
-  void ref_inc(Reg ctrl) {
-    a_.add_imm(X15, ctrl, layout().sp_use_count);
+  // ++use_count of the control block in `ctrl` (non-null), with `addr`,
+  // `v` and `status` as scratch. LL/SC, at the width layout() measured.
+  void count_inc(Reg ctrl, Reg addr, Reg v, Reg status) {
+    const Layout& L = layout();
+    a_.add_imm(addr, ctrl, L.sp_use_count);
     const size_t again = a_.here();
-    a_.ldxr_w(X16, X15);
-    a_.add_imm_w(X16, X16, 1);
-    a_.stxr_w(X17, X16, X15);
-    a_.patch(a_.cbnz_w(X17), again);
+    if (L.sp_wide) { a_.ldxr_x(v, addr); a_.add_imm(v, v, 1); a_.stxr_x(status, v, addr); }
+    else { a_.ldxr_w(v, addr); a_.add_imm_w(v, v, 1); a_.stxr_w(status, v, addr); }
+    a_.patch(a_.cbnz_w(status), again);
   }
+  // --use_count unless it is the last owner; returns the branch taken when it
+  // is (nothing changed, the exclusive monitor still open: clrex there).
+  size_t count_dec_unless_last(Reg ctrl, Reg addr, Reg v, Reg status) {
+    const Layout& L = layout();
+    a_.add_imm(addr, ctrl, L.sp_use_count);
+    const size_t again = a_.here();
+    size_t last;
+    if (L.sp_wide) {
+      a_.ldxr_x(v, addr);
+      a_.cmp_imm(v, L.sp_last);
+      last = a_.bcond(LE);
+      a_.sub_imm(v, v, 1);
+      a_.stxr_x(status, v, addr);
+    } else {
+      a_.ldxr_w(v, addr);
+      a_.cmp_imm_w(v, L.sp_last);
+      last = a_.bcond(LS);
+      a_.sub_imm_w(v, v, 1);
+      a_.stxr_w(status, v, addr);
+    }
+    a_.patch(a_.cbnz_w(status), again);
+    return last;
+  }
+  void ref_inc(Reg ctrl) { count_inc(ctrl, X15, X16, X17); }
   // --use_count, unless it is the last reference: then nothing has been
   // changed and control goes to the slow path (the destructor runs in C++).
   void ref_dec_or_slow(Reg ctrl, std::vector<size_t>& slow) {
-    a_.add_imm(X15, ctrl, layout().sp_use_count);
-    const size_t again = a_.here();
-    a_.ldxr_w(X16, X15);
-    a_.cmp_imm_w(X16, 1);
-    const size_t last = a_.bcond(LS);
-    a_.sub_imm_w(X16, X16, 1);
-    a_.stxr_w(X17, X16, X15);
-    a_.patch(a_.cbnz_w(X17), again);
+    const size_t last = count_dec_unless_last(ctrl, X15, X16, X17);
     const size_t done = a_.b();
     a_.patch(last, a_.here());
     a_.clrex();
@@ -636,7 +681,6 @@ class Compiler {
   // by the VM on first use): owner check, slot, copy - with the refcount
   // increment done here, LL/SC, when the value is an object.
   void emit_get_global(size_t ip) {
-    const Layout& L = layout();
     const uint32_t k = static_cast<uint32_t>(rd16(ip + 1));
     const Chunk& ch = fn_.chunk;
     const auto cache_off = static_cast<uint32_t>(offsetof(Chunk, global_cache));
@@ -654,13 +698,7 @@ class Compiler {
       slow.push_back(a_.bcond(HS));
       a_.ldr(X13, X12, kCtrlOff);
       const size_t plain = a_.cbz_x(X13);
-      // ++use_count
-      a_.add_imm(X14, X13, L.sp_use_count);
-      const size_t again = a_.here();
-      a_.ldxr_w(X10, X14);
-      a_.add_imm_w(X10, X10, 1);
-      a_.stxr_w(X11, X10, X14);
-      a_.patch(a_.cbnz_w(X11), again);
+      count_inc(X13, X14, X10, X11);
       a_.patch(plain, a_.here());
       a_.ldr(X10, X12, 0);
       a_.ldr(X11, X12, kPayOff);
@@ -736,7 +774,6 @@ class Compiler {
   // slot (whose closure reference is released, LL/SC, unless it is the last).
   // Otherwise Vm::jit_return does it.
   void emit_return(size_t ip) {
-    const Layout& L = layout();
     std::vector<size_t> slow;
     a_.ldr(X9, X19, 40);                         // &open upvalues
     a_.ldr(X10, X9, 0);
@@ -762,14 +799,7 @@ class Compiler {
     // need the destructor, so leave it to the VM)
     a_.ldr(X13, X20, kCtrlOff);
     const size_t no_ref = a_.cbz_x(X13);
-    a_.add_imm(X14, X13, L.sp_use_count);
-    const size_t again = a_.here();
-    a_.ldxr_w(X10, X14);
-    a_.cmp_imm_w(X10, 1);
-    const size_t last = a_.bcond(LS);
-    a_.sub_imm_w(X10, X10, 1);
-    a_.stxr_w(X11, X10, X14);
-    a_.patch(a_.cbnz_w(X11), again);
+    const size_t last = count_dec_unless_last(X13, X14, X10, X11);
     a_.patch(no_ref, a_.here());
     // result -> callee slot; pop the frame
     a_.ldr(X10, X12, 0);
@@ -864,9 +894,29 @@ class Compiler {
 void* alloc_exec(size_t bytes) {
 #if defined(AIOS_METAL)
   return std::malloc(bytes);             // the kernel maps all of RAM executable
+#elif defined(__APPLE__)
+  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+  return p == MAP_FAILED ? nullptr : p;
 #else
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+// Write `bytes` of code at `mem` (the allocation's size goes in front of it,
+// see compile()) and make it fetchable.
+void install(uint8_t* mem, size_t alloc, const void* words, size_t bytes) {
+  uint8_t* code = mem + 16;
+#if defined(__APPLE__)
+  pthread_jit_write_protect_np(0);
+  *reinterpret_cast<size_t*>(mem) = alloc;
+  std::memcpy(code, words, bytes);
+  pthread_jit_write_protect_np(1);
+  sys_icache_invalidate(code, bytes);
+#else
+  *reinterpret_cast<size_t*>(mem) = alloc;
+  std::memcpy(code, words, bytes);
+  __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code + bytes));
 #endif
 }
 
@@ -881,11 +931,8 @@ Entry compile(const FnObj& fn) {
   // Remember the size in front of the code so release() can hand it back.
   auto* mem = static_cast<uint8_t*>(alloc_exec(bytes + 16));
   if (!mem) return nullptr;
-  *reinterpret_cast<size_t*>(mem) = bytes + 16;
-  uint8_t* code = mem + 16;
-  std::memcpy(code, words.data(), bytes);
-  __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code + bytes));
-  return reinterpret_cast<Entry>(code);
+  install(mem, bytes + 16, words.data(), bytes);
+  return reinterpret_cast<Entry>(mem + 16);
 }
 
 void release(void* code) {

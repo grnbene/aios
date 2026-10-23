@@ -512,6 +512,9 @@ target_link_libraries(aios-asql-dict-coding-check PRIVATE aios)
 add_executable(aios-asql-literal-compare-check tools/asql-literal-compare-check.cpp)
 target_link_libraries(aios-asql-literal-compare-check PRIVATE aios)
 
+add_executable(aios-asql-grouped-expr-check tools/asql-grouped-expr-check.cpp)
+target_link_libraries(aios-asql-grouped-expr-check PRIVATE aios)
+
 add_executable(aios-asql-wide-number-check tools/asql-wide-number-check.cpp)
 target_link_libraries(aios-asql-wide-number-check PRIVATE aios)
 
@@ -882,6 +885,7 @@ add_test(NAME asql.import.check COMMAND aios-asql-import-check)
 add_test(NAME asql.segment_encoding.check COMMAND aios-asql-segment-encoding-check)
 add_test(NAME asql.dict_coding.check COMMAND aios-asql-dict-coding-check)
 add_test(NAME asql.literal_compare.check COMMAND aios-asql-literal-compare-check)
+add_test(NAME asql.grouped_expr.check COMMAND aios-asql-grouped-expr-check)
 add_test(NAME asql.wide_number.check COMMAND aios-asql-wide-number-check)
 add_test(NAME asql.admission.check COMMAND aios-asql-admission-check)
 add_test(NAME asql.enhancements.check COMMAND aios-asql-enhancements-check)

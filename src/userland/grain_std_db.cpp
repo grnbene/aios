@@ -4,6 +4,7 @@
 //   let r = db_query(db, "select stockid, description from stock limit 5")
 //   r.rows            [[...], ...]   (strings, nil for NULL)
 //   r.records         [{stockid: ..., description: ...}, ...]
+//   db_query(db, "select * from stock where id = ? and loc in (?)", [id, ["01", "03"]])   ? filled as literals
 //
 //   let late = live(db, "select orderno, customer from orders where late = 1")
 //   ui.table(late.records)          # stays current: nothing else to write
@@ -20,6 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -348,13 +351,104 @@ Value bi_db_connect(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 // db_query(db, sql) -> {ok, error, columns, rows, records, affected_rows, last_insert_id}
+// A value as an SQL literal for a ? placeholder. A string's quote is doubled rather than backslashed,
+// so it stays a quote whether or not the server treats backslash as an escape.
+bool sql_literal(const Value& v, std::string& out, std::string& error) {
+  switch (v.type) {
+    case Type::Nil: out += "NULL"; return true;
+    case Type::Bool: out += v.b ? "1" : "0"; return true;
+    case Type::Int: out += std::to_string(v.i); return true;
+    case Type::Real: {
+      if (!(v.d == v.d) || v.d > 1.7976931348623157e308 || v.d < -1.7976931348623157e308) { error = "db_query(): a parameter is not a finite number"; return false; }
+      char buf[40];
+      for (int prec = 1; prec <= 17; ++prec) {
+        std::snprintf(buf, sizeof buf, "%.*g", prec, v.d);
+        if (std::strtod(buf, nullptr) == v.d) break;
+      }
+      out += buf;
+      return true;
+    }
+    case Type::Str: {
+      out += '\'';
+      for (char c : v.str()) {
+        switch (c) {
+          case '\'': out += "''"; break;
+          case '\\': out += "\\\\"; break;
+          case '\0': out += "\\0"; break;
+          case '\n': out += "\\n"; break;
+          case '\r': out += "\\r"; break;
+          case '\x1a': out += "\\Z"; break;
+          default: out += c;
+        }
+      }
+      out += '\'';
+      return true;
+    }
+    default: error = std::string("db_query(): a parameter cannot be a ") + type_name(v.type); return false;
+  }
+}
+
+// Fills each ? outside quotes, backticks and comments with the next parameter, as a literal. A list fills
+// one ? with its items, comma-separated, for IN (?).
+bool bind_params(const std::string& sql, const std::vector<Value>& params, std::string& out, std::string& error) {
+  size_t next = 0;
+  for (size_t i = 0; i < sql.size(); ++i) {
+    const char c = sql[i];
+    if (c == '\'' || c == '"' || c == '`') {
+      size_t j = i + 1;
+      while (j < sql.size() && sql[j] != c) j += (sql[j] == '\\' && c != '`' && j + 1 < sql.size()) ? 2 : 1;
+      out.append(sql, i, j + 1 - i);
+      i = j;
+      continue;
+    }
+    if ((c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') || c == '#') {
+      size_t j = sql.find('\n', i);
+      if (j == std::string::npos) j = sql.size() - 1;
+      out.append(sql, i, j + 1 - i);
+      i = j;
+      continue;
+    }
+    if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+      size_t j = sql.find("*/", i + 2);
+      j = j == std::string::npos ? sql.size() - 1 : j + 1;
+      out.append(sql, i, j + 1 - i);
+      i = j;
+      continue;
+    }
+    if (c != '?') { out += c; continue; }
+    if (next >= params.size()) { error = "db_query(): more ? in the statement than parameters (" + std::to_string(params.size()) + ")"; return false; }
+    const Value& p = params[next++];
+    if (p.type == Type::List) {
+      const auto& items = p.list_items();
+      if (items.empty()) { error = "db_query(): an empty list cannot fill a ?"; return false; }
+      for (size_t k = 0; k < items.size(); ++k) {
+        if (k) out += ",";
+        if (items[k].type == Type::List) { error = "db_query(): a list inside a list cannot fill a ?"; return false; }
+        if (!sql_literal(items[k], out, error)) return false;
+      }
+    } else if (!sql_literal(p, out, error)) {
+      return false;
+    }
+  }
+  if (next != params.size()) { error = "db_query(): " + std::to_string(params.size()) + " parameters for " + std::to_string(next) + " ?"; return false; }
+  return true;
+}
+
+// db_query(db, sql, params?): params is a list, one value per ? in sql
 Value bi_db_query(Vm&, std::vector<Value>& args, std::string& error) {
   auto s = session_of(args[0]);
   if (!s || !s->open()) { error = "db_query() wants a connection from db_connect() that is still open"; return Value::nil(); }
   if (!want_str(args[1], error, "db_query")) return Value::nil();
+  std::string sql = args[1].str();
+  if (args.size() > 2 && args[2].type != Type::Nil) {
+    if (!want_list(args[2], error, "db_query")) return Value::nil();
+    std::string bound;
+    if (!bind_params(sql, args[2].list_items(), bound, error)) return Value::nil();
+    sql = std::move(bound);
+  }
   QueryResult r;
   std::string why;
-  if (!s->query(args[1].str(), r, why)) { error = "db_query(): " + why; return Value::nil(); }
+  if (!s->query(sql, r, why)) { error = "db_query(): " + why; return Value::nil(); }
   return result_value(r);
 }
 
@@ -488,7 +582,7 @@ Value bi_live(Vm& vm, std::vector<Value>& args, std::string& error) {
 
 void install_db_builtins(Vm& vm) {
   vm.define_native("db_connect", 4, 5, bi_db_connect);
-  vm.define_native("db_query", 2, 2, bi_db_query);
+  vm.define_native("db_query", 2, 3, bi_db_query);
   vm.define_native("db_close", 1, 1, bi_db_close);
   vm.define_native("live", 2, 3, bi_live);
 }

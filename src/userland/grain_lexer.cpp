@@ -116,6 +116,17 @@ Token Lexer::string_token(bool is_fstr) {
       case 't': out.push_back('\t'); break;
       case 'r': out.push_back('\r'); break;
       case '0': out.push_back('\0'); break;
+      case 'x': {   // \xHH: one byte, two hex digits
+        auto hex = [](char h) { return h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1; };
+        const int hi = hex(peek());
+        if (hi < 0) return Token{Tok::Error, "\\x wants two hex digits", 0, 0, start_line};
+        advance();
+        const int lo = hex(peek());
+        if (lo < 0) return Token{Tok::Error, "\\x wants two hex digits", 0, 0, start_line};
+        advance();
+        out.push_back((char)(hi * 16 + lo));
+        break;
+      }
       case '\\': out.push_back('\\'); break;
       case '"': out.push_back('"'); break;
       case '\'': out.push_back('\''); break;

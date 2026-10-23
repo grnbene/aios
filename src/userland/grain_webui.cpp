@@ -881,7 +881,7 @@ WebUi::Response WebUi::handle(const Request& req) {
     Vm& vm = *s->vm;
     int status = 200;
     std::string res_body, content_type, route_err;
-    if (web_pane_handle_route(vm, s->pane, req.method, req.path, req.query, req.body, status, res_body, content_type, route_err)) {
+    if (web_pane_handle_route(vm, s->pane, req.method, req.path, req.query, req.body, req.headers, req.remote, status, res_body, content_type, route_err)) {
       res.status = status;
       res.headers = {{"Content-Type", content_type}, {"Access-Control-Allow-Origin", "*"}, {"X-Content-Type-Options", "nosniff"}};
       if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
