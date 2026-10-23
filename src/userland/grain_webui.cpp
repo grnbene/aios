@@ -457,7 +457,7 @@ const char* kScript = R"JS(
     busy=true;var p=fields();p.append('action',action||'');
     fetch(location.pathname,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'same-origin'})
       .then(function(r){return r.json()}).then(function(d){
-        if(d.html!==undefined){if(String(d.seq)!==seq)apply(d,true)}
+        if(d.html!==undefined){apply(d,true)}   // always: the event stream may have shown this seq already, but only an action's answer clears a field
         else if(d.error){app.insertAdjacentHTML('afterbegin','<div class="error"></div>');app.firstChild.textContent=d.error}
       }).catch(function(){}).then(function(){busy=false;if(again!==null){var x=again;again=null;send(x)}});
   }
