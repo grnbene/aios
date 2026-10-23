@@ -1,0 +1,71 @@
+# Operations, live. The board below is a view over ASQL queries; live() keeps each answer current (it reruns
+# only when ASQL says one of its tables was written), and every window and browser showing the board follows.
+# Nothing here sends, polls or listens.
+#   grain ops_board.gr                         a window
+#   grain serve ops_board.gr                   every browser sees the same board as the store works
+#   grain open http://host:8080/               the board, drawn natively from a server
+# GRAIN_DB=host:port:user:password:database (default 127.0.0.1:3307:erp::shop)
+let spec = getenv("GRAIN_DB")
+if spec == nil { spec = "127.0.0.1:3307:erp::shop" }
+let part = split(spec, ":")
+let db = db_connect(part[0], int(part[1]), part[2], part[3], part[4])
+if not db.ok { error("cannot reach the database: " + db.error) }
+
+let kpi = live(db, "SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(AVG(total), 0), SUM(status = 'open'), SUM(status = 'shipped') FROM ops_orders", {"every": 0.5})
+let pace = live(db, "SELECT FLOOR(UNIX_TIMESTAMP(placed) / 10) AS b, COUNT(*), SUM(total) FROM ops_orders GROUP BY b ORDER BY b DESC LIMIT 36", {"every": 0.5, "tables": ["ops_orders"]})
+let top = live(db, "SELECT sku, SUM(qty) AS units FROM ops_lines GROUP BY sku ORDER BY units DESC, sku LIMIT 6", {"every": 0.5})
+let regions = live(db, "SELECT region, SUM(total) FROM ops_orders GROUP BY region ORDER BY region", {"every": 0.5})
+let stock = live(db, "SELECT sku, name, on_hand, reorder FROM ops_stock ORDER BY on_hand / reorder, sku", {"every": 0.5})
+let recent = live(db, "SELECT id, customer, region, total, status FROM ops_orders ORDER BY id DESC LIMIT 10", {"every": 0.5})
+
+fn money(x) { return "$" + format("{:,.0f}", real(x)) }
+fn n(r, i) { return len(r.rows) > 0 and r.rows[0][i] != nil ? real(r.rows[0][i]) : 0.0 }
+
+let p = ui.pane({"title": "Operations, live", "shared": true, "width": 980, "height": 900, "view": fn () {
+  # orders and revenue per 10 seconds, oldest first
+  let counts = []
+  let revenue = []
+  for r in pace.rows { counts = [int(r[1])] + counts revenue = [real(r[2])] + revenue }
+  let units = []
+  for r in top.rows { push(units, [r[0], int(r[1])]) }
+  let by_region = []
+  for r in regions.rows { push(by_region, [r[0], round(real(r[1]))]) }
+  let low = 0
+  let gauges = []
+  for r in stock.rows {
+    let have = int(r[2])
+    let want = int(r[3])
+    if have < want { low += 1 }
+    if len(gauges) < 5 {
+      push(gauges, ui.gauge(have, {"max": want * 3, "label": r[0] + "  " + r[1], "accent": have < want ? "bad" : (have < want * 2 ? "warn" : "ok")}))
+    }
+  }
+  let rows = []
+  for r in recent.records {
+    push(rows, {"id": "#" + r.id, "customer": r.customer, "region": r.region, "total": money(r.total), "status": r.status})
+  }
+  return ui.column({"gap": 16, "pad": 20}, [
+    ui.row({"gap": 12}, [
+      ui.heading("Operations"),
+      ui.badge("live", {"accent": "ok", "dot": true}),
+      ui.text("every screen follows the database as it changes", {"dim": true})]),
+    ui.row({"gap": 12}, [
+      ui.tile("Orders", int(n(kpi, 0)), {"accent": "ok"}),
+      ui.tile("Revenue", money(n(kpi, 1))),
+      ui.tile("Average order", money(n(kpi, 2))),
+      ui.tile("Open", int(n(kpi, 3)), {"accent": n(kpi, 3) > 12 ? "warn" : "ok"}),
+      ui.tile("Low stock", low, {"accent": low > 0 ? "bad" : "ok"})]),
+    ui.text("Revenue per 10 seconds", {"bold": true}),
+    ui.chart(revenue, {"height": 150, "min": 0, "prefix": "$"}),
+    ui.row({"gap": 24}, [
+      ui.column({"gap": 10}, [ui.text("Units by product", {"bold": true}), ui.bars(units)]),
+      ui.column({"gap": 10}, [ui.text("Revenue by region", {"bold": true}), ui.bars(by_region, {"accent": "#7c5cff", "prefix": "$"})]),
+      ui.column({"gap": 10}, [ui.text("Stock, lowest first", {"bold": true})] + gauges)]),
+    ui.row({"gap": 12}, [
+      ui.text("Latest orders", {"bold": true}),
+      ui.text(str(len(counts) > 0 ? counts[len(counts) - 1] : 0) + " in the last 10 seconds", {"dim": true}),
+      ui.spark(counts, {"height": 24, "min": 0})]),
+    ui.table(rows, {"columns": "id:Order, customer:Customer, region:Region, total:Total:right, status:Status:badge",
+      "badges": {"open": "warn", "shipped": "ok", "cancelled": "bad"}, "empty": "waiting for the first order"})])
+}})
+run_panes()

@@ -63,6 +63,12 @@ fn build(node) {
     return ui.row(o, kids)
   }
   if w == "text" { return ui.text(node.label, o) }
+  if w == "heading" { return ui.heading(node.label, o) }
+  if w == "badge" { return ui.badge(node.label, o) }
+  if w == "progress" { return ui.progress(node.value == nil ? 0 : node.value, o) }
+  if w == "gauge" { return ui.gauge(node.value == nil ? 0 : node.value, o) }
+  if w == "sparkline" { return ui.spark(node.data == nil ? [] : node.data, o) }
+  if w == "chart" { return ui.chart(node.data == nil ? [] : node.data, o) }
   if w == "tile" { return ui.tile(node.label, node.value, o) }
   if w == "table" { return ui.table(node.data == nil ? [] : node.data, o) }
   if w == "button" {
