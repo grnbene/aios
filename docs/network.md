@@ -327,8 +327,9 @@ window with the same renderer a local program uses. Events post to the page's ow
 URL with `X-Grain-UI: 1`, and an action is named by where its widget sits and what
 it says, so several viewers of one program never invalidate each other.
 
-Only `ui.pane` programs have a web form: a pane drawn by hand with `create_pane`
-paints pixels and is window-only. Not done: sessions are not shared between
+A pane drawn by hand (`create_pane` with `on_draw`) is sent as pictures: each
+changed frame as a PNG down the same stream (up to ten a second while watched),
+with the page's mouse, wheel and keys posted back as the pane's events. Not done: sessions are not shared between
 server processes, and they are lost when the server restarts.
 
 ### TLS on the web server
