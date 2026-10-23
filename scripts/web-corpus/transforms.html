@@ -1,0 +1,18 @@
+<!doctype html><html><head><style>
+body{background:#fff;margin:20px;font:16px sans-serif;color:#202124}
+.row{display:flex;gap:40px;align-items:center;margin:30px 0}
+.card{width:140px;padding:12px;background:#e8f0fe;border:2px solid #1a73e8;border-radius:8px}
+.r{transform:rotate(15deg)}
+.s{transform:scale(1.5)}
+.k{transform:skewX(-20deg);background:#fce8e6;border-color:#d93025}
+.p{rotate:-30deg;scale:0.8}
+.o{transform-origin:top left;transform:rotate(10deg)}
+.m{transform:matrix(1,0.2,0,1,0,0)}
+.outer{transform:rotate(-10deg)}
+.inner{transform:rotate(-20deg);background:#e6f4ea;border-color:#188038}
+.t{transform:translate(20px,10px) rotate(45deg)}
+</style></head><body>
+<div class="row"><div class="card r">rotated 15&deg; <a href="#x">a link</a></div><div class="card s">scaled 1.5</div><div class="card k">skewX -20</div></div>
+<div class="row"><div class="card p">rotate/scale props</div><div class="card o">origin top left</div><div class="card m">matrix</div></div>
+<div class="row"><div class="card outer">outer -10<div class="card inner">inner -20</div></div><div class="card t">translate+rotate</div></div>
+</body></html>

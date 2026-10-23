@@ -437,6 +437,7 @@ Value method_live_tick(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string
 // live(db, sql, options?) -> a map kept current: {rows, records, columns, ok, error, changes, runs, changed_at, watching}
 // options: every (seconds between looks, default 1), tables (what the query reads, when the guess is wrong)
 Value bi_live(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (vm.worker) { error = "live(): a worker (parallel_map, spawn) has no loop to keep a result current; use db_query, or live() in the program itself"; return Value::nil(); }
   if (!session_of(args[0])) { error = "live() wants a connection from db_connect()"; return Value::nil(); }
   if (!want_str(args[1], error, "live")) return Value::nil();
   double every = 1.0;

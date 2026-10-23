@@ -197,6 +197,7 @@ Value method_events_tick(Vm& vm, BoundMethodObj& bm, std::vector<Value>&, std::s
 
 // events(url, options, fn) -> id
 Value bi_events(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (vm.worker) { error = "events(): a worker (parallel_map, spawn) has no loop to deliver events; open the stream in the program itself"; return Value::nil(); }
   if (!want_str(args[0], error, "events")) return Value::nil();
   const Value& fn = args.size() > 2 ? args[2] : args[1];
   if (fn.type != Type::Fn && fn.type != Type::Native && fn.type != Type::BoundMethod) { error = "events() wants a function to give each event to"; return Value::nil(); }

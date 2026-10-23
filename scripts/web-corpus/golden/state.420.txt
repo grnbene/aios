@@ -1,6 +1,6 @@
 # page state.html  viewport=420
 # title The page at rest
-# content 420x444  background=ffffffff  links=0
+# content 420x436  background=ffffffff  links=0
 text      16    28   106    15  #ff707070  11px,track2.10    "CONVERSATIONS"
 rect      16    55   388    70  #0f000000  r=10
 text      30    69   360    21  #ff202020  15px              "A message. Its edit button is at opacity zero"
@@ -12,18 +12,18 @@ text      16   193   232    21  #ff202020  15px              "Dimmed to fifty-fi
 text      16   226   312    21  #ff202020  15px              "At opacity zero: laid out, not painted."  op=0
 text      16   259   147    21  #ff202020  15px,track-1      "Tightened by a pixel."
 text      16   292   320    21  #ff202020  15px              "Capitalised By The Page, Not The Markup."
-rect      16   325    40    29  #ffffffff
-border    16   325    40    29  #ff767676
-text      24   329    24    21  #ff000000  15px              "[x]"
-text      56   342   209    21  #ff0f8a6a  15px,bold         "checked, so bold and green"
-rect     273   325    40    29  #ffffffff
-border   273   325    40    29  #ff767676
-text     281   329    24    21  #ff000000  15px              "[ ]"
-text     313   342    80    21  #ff202020  15px              "unchecked,"
-text      16   354    64    21  #ff202020  15px              "so plain"
-rect      16   387   176    29  #ffffffff
-border    16   387   176    29  #ff767676
-text      24   391   160    21  #ff000000  15px              "x"
-text     192   404   152    21  #ff202020  15px             s  "disabled, so struck"
+rect      20   328    13    13  #00000000
+image     20   328    13    13  #ff000000  src=control#0 alt=""
+text      36   329   209    21  #ff0f8a6a  15px,bold         "checked, so bold and green"
+rect     257   328    13    13  #00000000
+image    257   328    13    13  #ff000000  src=control#1 alt=""
+text     273   329   104    21  #ff202020  15px              "unchecked, so"
+text      16   350    40    21  #ff202020  15px              "plain"
+rect      16   383   166    25  #fffafafa  r=2
+border    16   383   166    25  #ffd6d6d6  r=2
+text      19   385   160    21  #ff6d6d6d  15px              "x"
+text     182   385   152    21  #ff202020  15px             s  "disabled, so struck"
+# inline-image control#0 13x13  inked=169  digest=73c46666
+# inline-image control#1 13x13  inked=169  digest=3f2e84ce
 # glyph-gaps (none)
 

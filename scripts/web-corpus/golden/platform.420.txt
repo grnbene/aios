@@ -1,29 +1,31 @@
 # page platform.html  viewport=420
 # title The platform a page script runs against
-# content 420x234  background=ff111111  links=0
+# content 420x244  background=ff111111  links=0
 text       8    20    21    18  #ffdddddd  13px,mono         "one"
 text       8    50    28    18  #ffdddddd  13px,mono         "two "
 text      36    50    28    18  #ffdddddd  13px,bold,mono    "bold"
-rect       8    98   156    26  #ff202020
-border     8    98   156    26  #ff3d3d3d
-text      16   102   140    18  #ffdcdcdc  13px,mono         "init"
-rect     164    98    37    26  #ff202020
-border   164    98    37    26  #ff3d3d3d
-text     172   102    21    18  #ffdcdcdc  13px,mono         "[ ]"
-rect     201    98    44    26  #ff202020
-border   201    98    44    26  #ff3d3d3d
-text     209   102    28    18  #ffdcdcdc  13px,mono         "Y  ▾"
-rect     245    80   156    44  #ff202020
-border   245    80   156    44  #ff3d3d3d
-text     253    84   140    36  #ffdcdcdc  13px,mono         "area"
-rect       8   124   156    26  #ff202020
-border     8   124   156    26  #ff3d3d3d
-text      16   128   140    18  #ffdcdcdc  13px,mono         "v1"
-rect     164   124   156    26  #ff202020
-border   164   124   156    26  #ff3d3d3d
-text     172   128   140    18  #ffdcdcdc  13px,mono         "v 2"
-canvas     8   150    40    30  #ffdddddd
-rect       8   192   404    22  #ff1b1b1b
-border     8   192   404    22  #ff2c2c2c
+rect       8   108   146    22  #ff202020  r=2
+border     8   108   146    22  #ff3d3d3d  r=2
+text      11   110   140    18  #ffdcdcdc  13px,mono         "init"
+rect     158   107    13    13  #00000000
+image    158   107    13    13  #ffdcdcdc  src=control#0 alt=""
+rect     174   108    35    22  #ff202020  r=3
+image    192   116    10     6  #ffdcdcdc  src=control#1 alt=""
+border   174   108    35    22  #ff3d3d3d  r=3
+text     179   110    25    18  #ffdcdcdc  13px,mono         "Y"
+rect     209    80   146    40  #ff202020  r=2
+border   209    80   146    40  #ff3d3d3d  r=2
+text     212    82   140    18  #ffdcdcdc  13px,mono         "area"
+rect       8   130   146    22  #ff202020  r=2
+border     8   130   146    22  #ff3d3d3d  r=2
+text      11   132   140    18  #ffdcdcdc  13px,mono         "v1"
+rect     154   130   146    22  #ff202020  r=2
+border   154   130   146    22  #ff3d3d3d  r=2
+text     157   132   140    18  #ffdcdcdc  13px,mono         "v 2"
+canvas     8   152    40    30  #ffdddddd
+rect       8   202   404    22  #ff1b1b1b
+border     8   202   404    22  #ff2c2c2c
+# inline-image control#0 13x13  inked=169  digest=e223bab2
+# inline-image control#1 10x6  inked=28  digest=40b42655
 # glyph-gaps (none)
 

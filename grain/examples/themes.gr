@@ -1,0 +1,108 @@
+// Grain Themes & Utility Styling Showcase
+// Zero dependencies, zero build step, pure native CSS tokens & Grain styling functions!
+
+let themes = ["cyber", "nord", "matrix", "sunset", "glass"]
+let current_theme = "cyber"
+let count = 0
+let auto_pulse = true
+
+// Reusable styling "mixins" in pure Grain!
+fn neon_border(color) {
+  return "border: 1px solid " + color + "; box-shadow: 0 0 15px " + color + ";"
+}
+
+fn view() {
+  return ui.column({ "gap": 18, "pad": 8, "theme": current_theme }, [
+    // Header Hero with gradient text and shimmer
+    ui.card([
+      ui.row([
+        ui.badge("DESIGN SYSTEM 2.0", { "accent": "ok", "dot": true }),
+        ui.badge(current_theme, { "class": "caps glow" })
+      ], { "gap": 10 }),
+      ui.heading("Theming & Zero-SCSS Engine", { "class": "gradient-text", "size": 32 }),
+      ui.text("Instant theme switching, live CSS variables, native browser nesting, and built-in utility classes.", { "dim": true })
+    ], { "class": "hover-lift shimmer" }),
+
+    ui.divider(),
+
+    // Theme Switcher Bar
+    ui.card([
+      ui.row([
+        ui.text("SWITCH THEME IN REAL TIME:", { "bold": true, "class": "caps" }),
+        ui.row([
+          ui.button("CYBER", fn() { current_theme = "cyber" }, { "variant": current_theme == "cyber" ? "primary" : "ghost" }),
+          ui.button("NORD", fn() { current_theme = "nord" }, { "variant": current_theme == "nord" ? "primary" : "ghost" }),
+          ui.button("MATRIX", fn() { current_theme = "matrix" }, { "variant": current_theme == "matrix" ? "primary" : "ghost" }),
+          ui.button("SUNSET", fn() { current_theme = "sunset" }, { "variant": current_theme == "sunset" ? "primary" : "ghost" }),
+          ui.button("GLASS", fn() { current_theme = "glass" }, { "variant": current_theme == "glass" ? "primary" : "ghost" })
+        ], { "gap": 8 })
+      ], { "justify": "between", "align": "center" })
+    ], { "class": "flat" }),
+
+    // Controls and Telemetry in split cards
+    ui.row([
+      ui.card([
+        ui.text("UTILITY CLASS CONTROLS", { "bold": true, "size": 13, "color": "accent" }),
+        ui.switch("pulse", "Continuous Ambient Pulse", {
+          "checked": auto_pulse,
+          "on_change": fn(v) { auto_pulse = (v == "1") }
+        }),
+        ui.slider("scale", 10, 100, {
+          "label": "Glow Radius",
+          "value": 45
+        }),
+        ui.row([
+          ui.button("Increment Counter", fn() { count = count + 1 }, { "class": "hover-lift glow", "grow": true, "primary": true }),
+          ui.button("Reset", fn() { count = 0 }, { "variant": "ghost" })
+        ], { "gap": 10 })
+      ], { "grow": true, "class": auto_pulse ? "hover-lift glow" : "hover-lift" }),
+
+      ui.card([
+        ui.text("THEMED TELEMETRY", { "bold": true, "size": 13, "color": "accent" }),
+        ui.row([
+          ui.tile(count, "Events Recorded", { "accent": "ok", "sub": "Real-time sync", "class": "hover-lift" }),
+          ui.tile(current_theme, "Active Theme", { "accent": "accent", "sub": "Reactive token", "class": "hover-lift" })
+        ], { "gap": 12 }),
+        ui.progress(65, { "label": "Engine Capacity", "accent": "ok" })
+      ], { "grow": true, "class": "glass hover-lift" })
+    ], { "gap": 16 }),
+
+    // Side-by-side isolated themes demo (nesting different themes on the same page!)
+    ui.card([
+      ui.text("INDEPENDENT PER-CONTAINER THEMES", { "bold": true, "class": "caps" }),
+      ui.text("Containers can override themes independently of the page!", { "dim": true }),
+      ui.row([
+        ui.card([
+          ui.badge("MATRIX SUBTREE", { "accent": "ok" }),
+          ui.heading("Matrix Terminal", { "size": 18 }),
+          ui.text("Deep dark background with emerald accents.", { "dim": true }),
+          ui.button("Execute", fn() {}, { "primary": true })
+        ], { "grow": true, "theme": "matrix", "class": "hover-lift" }),
+
+        ui.card([
+          ui.badge("SUNSET SUBTREE", { "accent": "warn" }),
+          ui.heading("Sunset Horizon", { "size": 18 }),
+          ui.text("Twilight violet with coral orange accents.", { "dim": true }),
+          ui.button("Engage", fn() {}, { "primary": true })
+        ], { "grow": true, "theme": "sunset", "class": "hover-lift" }),
+
+        ui.card([
+          ui.badge("NORD SUBTREE", { "accent": "accent" }),
+          ui.heading("Nordic Frost", { "size": 18 }),
+          ui.text("Clean polar slate with frost-blue accents.", { "dim": true }),
+          ui.button("Connect", fn() {}, { "primary": true })
+        ], { "grow": true, "theme": "nord", "class": "hover-lift" })
+      ], { "gap": 14 })
+    ], { "class": "sunken" })
+  ])
+}
+
+let p = ui.pane({
+  "title": "Grain Theming Engine",
+  "width": 900,
+  "height": 780,
+  "theme": "cyber",
+  "shared": true,
+  "refresh": 1,
+  "view": view
+})

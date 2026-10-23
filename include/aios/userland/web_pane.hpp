@@ -184,6 +184,7 @@ struct WebPane {
   size_t render_buf_size = 0;   // when the frame last looked for pictures to fetch
   // Cached document fragments hash to avoid hashing thousands of text fragments per frame
   const void* cached_frag_ptr = nullptr;
+  uint64_t cached_layout_gen = 0;
   size_t cached_frag_size = 0;
   int cached_content_h = 0;
   int cached_content_w = 0;

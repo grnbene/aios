@@ -5685,7 +5685,7 @@ Value bi_entity_assemble(Vm&, std::vector<Value>& args, std::string& error) {
     aios::Id128::parse(id_val->str(), id);
   }
   if (id.is_null()) {
-    static uint64_t entity_seq = 0x1000;
+    static std::atomic<uint64_t> entity_seq{0x1000};
     id = aios::Id128{0xfeedfacecafe0001ull, ++entity_seq};
   }
 
@@ -5701,7 +5701,7 @@ Value bi_entity_assemble(Vm&, std::vector<Value>& args, std::string& error) {
 
 Value bi_id128(Vm&, std::vector<Value>& args, std::string& error) {
   if (args.empty()) {
-    static uint64_t id_counter = 0x8000;
+    static std::atomic<uint64_t> id_counter{0x8000};
     aios::Id128 gen_id{0xbeefc00112345678ull, ++id_counter};
     return Value::id128(gen_id);
   }
@@ -5744,7 +5744,7 @@ Value bi_Capability(Vm&, std::vector<Value>& args, std::string&) {
     if (args.size() > 1 && args[1].type == Type::Int) rights = (uint16_t)args[1].as_int();
     if (args.size() > 2 && args[2].type == Type::Int) expires = (uint64_t)args[2].as_int();
   }
-  static uint64_t cap_cnt = 0x2000;
+  static std::atomic<uint64_t> cap_cnt{0x2000};
   aios::Id128 id{0xca9ab11177000001ull, ++cap_cnt};
   auto cap = std::make_shared<CapObj>(id, res, rights, expires, aios::Id128{}, holder);
   return Value::object(Type::Capability, cap);
@@ -5762,7 +5762,7 @@ Value bi_StateChannel(Vm&, std::vector<Value>& args, std::string&) {
     name = args[0].to_text();
     if (args.size() > 1 && args[1].type == Type::Int) capacity = (uint32_t)args[1].as_int();
   }
-  static uint64_t ch_cnt = 0x3000;
+  static std::atomic<uint64_t> ch_cnt{0x3000};
   aios::Id128 id{0xc4a44e1000000001ull, ++ch_cnt};
   auto ch = std::make_shared<ChannelObj>(name, id, capacity);
   return Value::object(Type::Channel, ch);
@@ -5776,7 +5776,7 @@ Value bi_memory_allocate(Vm&, std::vector<Value>& args, std::string& error) {
   size_t sz = (size_t)args[0].as_int();
   std::string prov = "ram";
   if (args.size() > 1 && args[1].type == Type::Str) prov = args[1].str();
-  static uint64_t mem_cnt = 0x4000;
+  static std::atomic<uint64_t> mem_cnt{0x4000};
   aios::Id128 id{0x3e30410000000001ull, ++mem_cnt};
   auto mem = std::make_shared<MemObj>(id, sz, prov);
   return Value::object(Type::MemoryObject, mem);
@@ -5791,7 +5791,7 @@ Value bi_StateFrame(Vm&, std::vector<Value>& args, std::string& error) {
   aios::Id128 pub{};
   if (args.size() > 1 && args[1].type == Type::Int) gen = (uint64_t)args[1].as_int();
   if (args.size() > 2 && args[2].is_id128()) pub = args[2].as_id128();
-  static uint64_t frame_cnt = 0x5000;
+  static std::atomic<uint64_t> frame_cnt{0x5000};
   aios::Id128 id{0xf4a3e00000000001ull, ++frame_cnt};
   auto f = std::make_shared<FrameObj>(id, gen, pub, args[0], 0);
   return Value::object(Type::StateFrame, f);
@@ -5808,6 +5808,7 @@ void install_core_builtins(Vm& vm) {
   install_time_builtins(vm);
   install_text_builtins(vm);
   install_path_builtins(vm);
+  install_parallel_builtins(vm);
 
   vm.define_native("print", 0, -1, bi_print);
   vm.define_native("len", 1, 1, bi_len);
@@ -6613,6 +6614,7 @@ bool pane_closed(Vm& vm, uint64_t id, std::string& error) {
 // options: frames (stop after that many), script (a list of input events played
 // first, each with a "pane" naming its target).
 Value bi_run_panes(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (vm.worker) { error = "run_panes(): a worker (parallel_map, spawn) has no windows; show panes from the program itself"; return Value::nil(); }
   if (!g_display) {
     error = "run_panes(): this grain has no display (the standalone grain shows windows on Linux, Windows, and on macOS when built with SDL2)";
     return Value::nil();

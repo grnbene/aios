@@ -1,7 +1,9 @@
 # page dom.html  viewport=900x600
 # title The DOM surface a page uses
 # content 900x137  background=ff111111  links=0
-text       8     8    77    18  #ffdddddd  13px,mono         "onetwothree"
+text       8     8    21    18  #ffdddddd  13px,mono         "one"
+text      29     8    21    18  #ffdddddd  13px,mono         "two"
+text      50     8    35    18  #ffdddddd  13px,mono         "three"
 rect      24    48     4     4  #ffdddddd
 text      38    41     7    18  #ffdddddd  13px,mono         "a"
 rect      24    69     4     4  #ffdddddd

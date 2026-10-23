@@ -208,6 +208,7 @@ int main(int argc, char** argv) {
       if (f.opacity != 255) std::printf("  op=%u", (unsigned)f.opacity);
       if (f.z) std::printf("  z=%d", f.z);
       if (f.clipped) std::printf("  clip=%d,%d,%dx%d", f.clip_x, f.clip_y, f.clip_w, f.clip_h);
+      if (f.xform >= 0) std::printf("  xf=%d", f.xform);
       std::printf("\n");
     }
 
@@ -219,6 +220,12 @@ int main(int argc, char** argv) {
     // The scrollable boxes. A frame with more inside it than fits is a
     // structural fact about the page, and a golden that cannot see one cannot
     // tell a scroll pane from content that was simply cut off.
+    // The transformed boxes: what each one's fragments are drawn through (scale, rotate, skew about its origin).
+    for (size_t i = 0; i < doc.transforms.size(); ++i) {
+      const auto& g = doc.transforms[i];
+      std::printf("# transform %zu  parent=%d  origin=%.1f,%.1f  matrix=%.3f,%.3f,%.3f,%.3f,%.1f,%.1f\n", i, g.parent,
+                  g.ox, g.oy, g.a, g.b, g.c, g.d, g.e, g.f);
+    }
     for (size_t i = 0; i < doc.scrollers.size(); ++i) {
       const auto& sa = doc.scrollers[i];
       std::printf("# scroller %zu  %d,%d %dx%d  content=%d  max-offset=%d\n", i, sa.x, sa.y, sa.w,

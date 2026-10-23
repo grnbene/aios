@@ -28,15 +28,6 @@
 
 namespace aios::userland::grain {
 
-// An open upvalue names a slot in the running value stack. Closing it copies
-// the value out, so the closure keeps working after the frame is gone.
-class Upvalue {
- public:
-  size_t slot = 0;
-  Value closed;
-  bool is_closed = false;
-};
-
 // --- values ----------------------------------------------------------------
 
 Value Value::string(std::string s) {
@@ -76,7 +67,7 @@ const aios::Id128& Value::as_id128() const {
 
 bool ChannelObj::publish(Value payload, aios::Id128 publisher, aios::Id128 frame_id) {
   if (frame_id.is_null()) {
-    static uint64_t frame_seq = 1;
+    static std::atomic<uint64_t> frame_seq{1};
     frame_id = aios::Id128{id.hi, ++frame_seq};
   }
   uint64_t ts = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -506,6 +497,11 @@ Value* Vm::find_global(const std::string& name) {
 
 uint64_t Vm::serial() const { return st_->serial; }
 
+Value Vm::upvalue_value(const Upvalue& uv) const {
+  if (uv.is_closed) return uv.closed;
+  return uv.slot < st_->stack.size() ? st_->stack[uv.slot] : Value::nil();
+}
+
 std::vector<std::string> Vm::global_names() const {
   std::vector<std::string> names;
   names.reserve(st_->globals.size());
@@ -560,16 +556,20 @@ JitProfile g_jit_profile;
 #if defined(AIOS_METAL) && defined(__aarch64__)
 static inline uint64_t prof_now() { uint64_t v; asm volatile("mrs %0, pmccntr_el0" : "=r"(v)); return v; }
 #define PROF_BEGIN() const uint64_t prof_t0 = prof_now()
-#define PROF_END(field) (g_jit_profile.field += prof_now() - prof_t0, ++g_jit_profile.field##_n)
+#define PROF_END(field) (worker ? void() : void((g_jit_profile.field += prof_now() - prof_t0, ++g_jit_profile.field##_n)))
+// One counter for the whole process, so only the program's own thread counts: a worker VM
+// (parallel_map, spawn) runs on another core at the same time.
+#define PROF_COUNT(expr) (worker ? void() : void(expr))
 #else
 #define PROF_BEGIN() do {} while (0)
 #define PROF_END(field) do {} while (0)
+#define PROF_COUNT(expr) do {} while (0)   // nothing reads the counters off the Pi
 #endif
 
 bool Vm::step_one(size_t ip) {
   PROF_BEGIN();
   st_->frames.back().ip = ip;
-  ++g_jit_profile.step_by_op[st_->frames.back().chunk->code[ip] & 63];
+  PROF_COUNT(++g_jit_profile.step_by_op[st_->frames.back().chunk->code[ip] & 63]);
   const bool ok = execute_loop(0, true);
   PROF_END(step);
   return ok;
@@ -640,7 +640,7 @@ Value method_cap_attenuate(Vm&, BoundMethodObj& bm, std::vector<Value>& args, st
     error = "capability attenuation error: cannot escalate rights";
     return Value::nil();
   }
-  static uint64_t cap_seq = 1;
+  static std::atomic<uint64_t> cap_seq{1};
   aios::Id128 child_id{cap->id.hi, ++cap_seq};
   auto child = cap->attenuate(narrower, child_id);
   return Value::object(Type::Capability, child);
@@ -796,7 +796,7 @@ bool Vm::invoke(const Value& callee, uint8_t argc, int line) {
 // The native code's Call and Return (grain_jit_arm64.cpp): the interpreter's
 // own semantics without an interpreter entry per call.
 bool Vm::jit_call(size_t ip) {
-  ++g_jit_profile.slow_calls;
+  PROF_COUNT(++g_jit_profile.slow_calls);
   State& S = *st_;
   Frame& f = S.frames.back();
   f.ip = ip + 2;                                   // where the interpreter leaves it: traces name this call

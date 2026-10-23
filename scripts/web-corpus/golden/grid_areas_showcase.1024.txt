@@ -24,25 +24,25 @@ rect     301   111   222   192  #ff0f172a  r=6
 border   301   111   222   192  #ff334155  r=6
 text     318   128   144    21  #fff1f5f9  15px,bold         "Grid Matrix Parser"
 text     318   161    60    39  #ff38bdf8  28px,bold         "100%"
-text     318   206   112    20  #ff94a3b8  13px              "Full support for"
-text     318   226   182    20  #ff94a3b8  13px              "grid-template-areas, named"
-text     318   246   140    20  #ff94a3b8  13px              "tracks, and explicit"
-text     318   266    70    20  #ff94a3b8  13px              "placement."
+text     318   207   112    18  #ff94a3b8  13px              "Full support for"
+text     318   227   182    18  #ff94a3b8  13px              "grid-template-areas, named"
+text     318   247   140    18  #ff94a3b8  13px              "tracks, and explicit"
+text     318   267    70    18  #ff94a3b8  13px              "placement."
 rect     539   111   222   172  #ff0f172a  r=6
 border   539   111   222   172  #ff334155  r=6
 text     556   128    96    21  #fff1f5f9  15px,bold         "Track Sizing"
 text     556   161   105    39  #ff38bdf8  28px,bold         "px / fr"
-text     556   206   154    20  #ff94a3b8  13px              "Dynamic fraction track"
-text     556   226   154    20  #ff94a3b8  13px              "computation with exact"
-text     556   246   175    20  #ff94a3b8  13px              "pixel border allocations."
+text     556   207   154    18  #ff94a3b8  13px              "Dynamic fraction track"
+text     556   227   154    18  #ff94a3b8  13px              "computation with exact"
+text     556   247   175    18  #ff94a3b8  13px              "pixel border allocations."
 rect     777   111   222   192  #ff0f172a  r=6
 border   777   111   222   192  #ff334155  r=6
 text     794   128   169    21  #fff1f5f9  15px,bold         "Compositor Frame rate"
 text     794   161    90    39  #ff38bdf8  28px,bold         "60 FPS"
-text     794   206   154    20  #ff94a3b8  13px              "Direct zero-copy glass"
-text     794   226   168    20  #ff94a3b8  13px              "presentation through the"
-text     794   246   133    20  #ff94a3b8  13px              "hardware compositor"
-text     794   266    56    20  #ff94a3b8  13px              "surface."
+text     794   207   154    18  #ff94a3b8  13px              "Direct zero-copy glass"
+text     794   227   168    18  #ff94a3b8  13px              "presentation through the"
+text     794   247   133    18  #ff94a3b8  13px              "hardware compositor"
+text     794   267    56    18  #ff94a3b8  13px              "surface."
 rect       0   375  1024    42  #ff1e293b  r=8
 border     0   375  1024    42  #ff334155  r=8
 text      25   388   168    16  #ff64748b  12px              "AIOS Userland Browser Engine"

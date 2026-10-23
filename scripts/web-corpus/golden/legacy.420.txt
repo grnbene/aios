@@ -1,43 +1,45 @@
 # page legacy.html  viewport=420
 # title A page written in 1999
-# content 420x294  background=ffffffff  links=0
+# content 420x286  background=ffffffff  links=0
 text       0    12     8    21  #ff202020  15px              " "
-rect      83    12   316    33  #ffffffff
-border    83    12   316    33  #ff767676
-rect      99    66    62    25  #fff3f5f6
-border    99    66    62    25  #ffd2d2d2
-text     106    68    48    21  #ff000000  15px              "Search"
-rect     169    66   150    25  #fff3f5f6
-border   169    66   150    25  #ffd2d2d2
-text     176    68   136    21  #ff000000  15px              "I'm Feeling Lucky"
-text     335    12    90    15  #ff1558d6  11px              "Advanced search"
-rect       0   115    98    29  #ffeeeeee  r=999
-border     0   115    98    29  #ff999999  r=999
-rect       9   125     8     8  #ff34c759  r=9999
-text      21   119    72    21  #ff000000  15px              "connected"
-rect     106   119    54    25  #ffefefef
-border   106   119    54    25  #ff767676
-text     113   121    40    21  #ff000000  15px              "plain"
-rect     168   115    88    29  #ffffffff
-border   168   115    88    29  #ff767676
-text     176   119    72    21  #ff000000  15px              "Manual  ▾"
-rect     264   115    40    29  #ffffffff
-border   264   115    40    29  #ff767676
-text     272   119    24    21  #ff000000  15px              "[x]"
-rect     312   115    40    29  #ffffffff
-border   312   115    40    29  #ff767676
-text     320   119    24    21  #ff000000  15px              "( )"
-rect       0   156   256    50  #ffffffff
-border     0   156   256    50  #ff767676
-text       8   160   240    42  #ff000000  15px              "a note"
-border     0   218   158    64  #ff4a4a4a
-border     1   219   106    31  #ff4a4a4a
-text      10   224    56    21  #ff202020  15px,bold         "Service"
-border   107   219    50    31  #ff4a4a4a
-text     116   224    32    21  #ff202020  15px,bold         "Port"
-border     1   250   106    31  #ff4a4a4a
-text      10   255    88    21  #ff202020  15px              "assay serve"
-border   107   250    50    31  #ff4a4a4a
-text     116   255    32    21  #ff202020  15px              "4317"
+rect      85    12   306    29  #ffffffff  r=2
+border    85    12   306    29  #ff767676  r=2
+rect      99    62    62    25  #fff3f5f6  r=3
+border    99    62    62    25  #ffd2d2d2  r=3
+text     106    64    48    21  #ff000000  15px              "Search"
+rect     169    62   150    25  #fff3f5f6  r=3
+border   169    62   150    25  #ffd2d2d2  r=3
+text     176    64   136    21  #ff000000  15px              "I'm Feeling Lucky"
+text     334    12    90    15  #ff1558d6  11px              "Advanced search"
+rect       0   111    98    29  #ffeeeeee  r=999
+border     0   111    98    29  #ff999999  r=999
+rect       9   121     8     8  #ff34c759  r=9999
+text      21   115    72    21  #ff000000  15px              "connected"
+rect     106   113    54    25  #ffefefef  r=3
+border   106   113    54    25  #ff767676  r=3
+text     113   115    40    21  #ff000000  15px              "plain"
+rect     168   113    76    25  #ffffffff  r=3
+image    227   122    10     6  #ff000000  src=control#0 alt=""
+border   168   113    76    25  #ff767676  r=3
+text     173   115    66    21  #ff000000  15px              "Manual"
+rect     256   114    13    13  #00000000
+image    256   114    13    13  #ff000000  src=control#1 alt=""
+rect     285   114    13    13  #00000000
+image    285   114    13    13  #ff000000  src=control#2 alt=""
+rect       0   152   246    46  #ffffffff  r=2
+border     0   152   246    46  #ff767676  r=2
+text       3   154   240    21  #ff000000  15px              "a note"
+border     0   210   158    64  #ff4a4a4a
+border     1   211   106    31  #ff4a4a4a
+text      10   216    56    21  #ff202020  15px,bold         "Service"
+border   107   211    50    31  #ff4a4a4a
+text     116   216    32    21  #ff202020  15px,bold         "Port"
+border     1   242   106    31  #ff4a4a4a
+text      10   247    88    21  #ff202020  15px              "assay serve"
+border   107   242    50    31  #ff4a4a4a
+text     116   247    32    21  #ff202020  15px              "4317"
+# inline-image control#0 10x6  inked=28  digest=a5fc1875
+# inline-image control#1 13x13  inked=169  digest=73c46666
+# inline-image control#2 13x13  inked=145  digest=db4d5f76
 # glyph-gaps (none)
 

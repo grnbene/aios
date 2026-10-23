@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <functional>
 
 #include "aios/channel/http_client.hpp"
@@ -36,8 +37,13 @@ constexpr uint32_t kInk = 0xFFD8D8D8;
 constexpr uint32_t kFaint = 0xFF8A8A8A;
 constexpr uint32_t kLockOk = 0xFF57C77E;
 constexpr uint32_t kErrorInk = 0xFFE8746A;
+// Scrollbars follow the page's ground, as Chrome's do: a dark bar on a white page stood out like a tear in it.
 constexpr uint32_t kScrollTrack = 0xFF181818;
 constexpr uint32_t kScrollThumb = 0xFF4A4A4A;
+constexpr uint32_t kScrollTrackLight = 0xFFF1F1F1;
+constexpr uint32_t kScrollThumbLight = 0xFFC1C1C1;
+// Chrome's focus ring on a light page; the chrome's own blue on a dark one.
+constexpr uint32_t kFocusRingLight = 0xFF005FCC;
 
 constexpr int kChromeH = 34;
 constexpr int kStatusH = 20;
@@ -136,6 +142,89 @@ web::Node* field_ancestor(web::Node* n) {
       return p;
     }
   return nullptr;
+}
+
+// ---- checkboxes and radios: what a click on one does ----------------------------------------------------------
+
+bool checkable(const web::Node* n) {
+  if (!n || n->kind != web::Node::Kind::Element || n->tag != "input" || n->has_attr("disabled")) return false;
+  std::string type = n->attr("type");
+  for (auto& ch : type) ch = (char)std::tolower((unsigned char)ch);
+  return type == "checkbox" || type == "radio";
+}
+
+web::Node* find_checkable(web::Node* n, int depth = 0) {
+  if (!n || depth > 64) return nullptr;
+  if (checkable(n)) return n;
+  for (const auto& kid : n->children)
+    if (web::Node* hit = find_checkable(kid.get(), depth + 1)) return hit;
+  return nullptr;
+}
+
+web::Node* find_by_id(web::Node* n, const std::string& id, int depth = 0) {
+  if (!n || id.empty() || depth > 256) return nullptr;
+  if (n->kind == web::Node::Kind::Element && n->attr_ref("id") == id) return n;
+  for (const auto& kid : n->children)
+    if (web::Node* hit = find_by_id(kid.get(), id, depth + 1)) return hit;
+  return nullptr;
+}
+
+// The checkbox or radio a click acts on: the control itself, or the one its <label> names with `for` or holds.
+web::Node* toggle_target(web::Node* clicked) {
+  for (web::Node* p = clicked; p; p = p->parent) {
+    if (checkable(p)) return p;
+    if (p->kind == web::Node::Kind::Element && p->tag == "label") {
+      if (p->has_attr("for")) {
+        web::Node* root = p;
+        while (root->parent) root = root->parent;
+        web::Node* named = find_by_id(root, p->attr("for"));
+        return checkable(named) ? named : nullptr;
+      }
+      return find_checkable(p);
+    }
+  }
+  return nullptr;
+}
+
+void set_checked(web::Node* n, bool on) {
+  for (auto it = n->attrs.begin(); it != n->attrs.end(); ++it)
+    if (it->name == "checked") {
+      if (!on) n->attrs.erase(it);
+      return;
+    }
+  if (on) n->attrs.push_back({"checked", ""});
+}
+
+// A checkbox flips; a radio is checked and every other radio of its name in the same form (or document) is not.
+// Returns each touched control's state before, so a click a handler prevents can be put back.
+std::vector<std::pair<web::Node*, bool>> activate_checkable(web::Node* t) {
+  std::vector<std::pair<web::Node*, bool>> before;
+  std::string type = t->attr("type");
+  for (auto& ch : type) ch = (char)std::tolower((unsigned char)ch);
+  if (type == "checkbox") {
+    before.push_back({t, t->has_attr("checked")});
+    set_checked(t, !t->has_attr("checked"));
+    return before;
+  }
+  const std::string name = t->attr("name");
+  if (!name.empty()) {
+    web::Node* scope = web::enclosing_form(t);
+    if (!scope) { scope = t; while (scope->parent) scope = scope->parent; }
+    std::function<void(web::Node*)> walk = [&](web::Node* n) {
+      if (!n) return;
+      if (n != t && n->kind == web::Node::Kind::Element && n->tag == "input" && n->attr("name") == name &&
+          n->has_attr("checked") && web::enclosing_form(n) == web::enclosing_form(t)) {
+        std::string ty = n->attr("type");
+        for (auto& ch : ty) ch = (char)std::tolower((unsigned char)ch);
+        if (ty == "radio") { before.push_back({n, true}); set_checked(n, false); }
+      }
+      for (const auto& kid : n->children) walk(kid.get());
+    };
+    walk(scope);
+  }
+  before.push_back({t, t->has_attr("checked")});
+  set_checked(t, true);
+  return before;
 }
 
 std::string field_value(const web::Node* n) {
@@ -1542,7 +1631,9 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
       mix(k.host().monotonic_ns() / 500000000ULL);          // the caret blinks
     }
     for (const auto& sc : doc.scrollers) mix((uint64_t)(int64_t)pane.scroll_offset_of(sc.node));
-    if (pane.cached_frag_ptr != doc.fragments.data() || pane.cached_frag_size != doc.fragments.size() ||
+    mix(doc.layout_gen);   // a new layout is a new picture, whatever its fragments hash to
+    if (pane.cached_layout_gen != doc.layout_gen ||
+        pane.cached_frag_ptr != doc.fragments.data() || pane.cached_frag_size != doc.fragments.size() ||
         pane.cached_content_h != doc.content_height || pane.cached_content_w != doc.content_width) {
       uint64_t fh = 0xcbf29ce484222325ull;
       for (const auto& f : doc.fragments) {
@@ -1553,6 +1644,7 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
         if (!f.text.empty()) fh = (fh ^ std::hash<std::string>{}(f.text)) * 0x100000001b3ull;
       }
       pane.cached_frag_ptr = doc.fragments.data();
+      pane.cached_layout_gen = doc.layout_gen;
       pane.cached_frag_size = doc.fragments.size();
       pane.cached_content_h = doc.content_height;
       pane.cached_content_w = doc.content_width;
@@ -1570,6 +1662,9 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   if (!unchanged) {
   if (zoomed) { s_zoom_scratch.assign((size_t)w * (size_t)h, 0); win.buffer.swap(s_zoom_scratch); }
   c.clear_buffer(win.buffer, doc.dom ? doc.background : 0xFF141414, w, h);
+  // A light ground or a dark one, judged the way layout chose the UA sheet: the scrollbars and focus ring follow it.
+  const uint32_t ground = doc.dom ? doc.background : 0xFF141414;
+  const bool light_page = (((ground >> 16) & 0xFF) * 2126 + ((ground >> 8) & 0xFF) * 7152 + (ground & 0xFF) * 722) / 10000 > 140;
   if (s_find_open && s_cached_find_gen != s_find_gen) {
     s_cached_find_marks = find_hits(doc);
     s_cached_find_gen = s_find_gen;
@@ -1578,7 +1673,132 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   const std::vector<FindHit>& find_marks = s_find_open ? s_cached_find_marks : kNoFindHits;
   size_t find_at = 0;
 
-  for (const auto& f : doc.fragments) {
+  // Boxes with a 2D transform (Document::transforms) are drawn the first time paint order reaches one: everything
+  // inside it, offscreen, then put on the page through its matrix. Offscreen means twice, once over black and once
+  // over white: the difference between the two is each pixel's coverage, which is what lets every routine below
+  // paint into the scratch exactly as it paints the page, antialiased edges included.
+  const size_t n_xf = doc.transforms.size();
+  std::vector<char> xf_done(n_xf, 0);
+  std::function<void(const std::vector<size_t>&, int)> paint_list;
+  static thread_local std::vector<std::vector<uint32_t>> s_xf_pool;   // two buffers per nesting depth
+  int xf_depth = 0;
+  auto in_group = [&](int g, int top) {
+    while (g >= 0 && g != top) g = doc.transforms[(size_t)g].parent;
+    return g == top;
+  };
+  auto render_group = [&](int gi, const std::vector<size_t>& sub) {
+    if (sub.empty() || xf_depth >= 8) return;
+    const auto& g = doc.transforms[(size_t)gi];
+    // Where it is drawn untransformed, in window pixels, with room for a shadow's blur.
+    int x0 = 1 << 30, y0 = 1 << 30, x1 = -(1 << 30), y1 = -(1 << 30);
+    int shift_y = 0;
+    bool first = true;
+    for (size_t fi : sub) {
+      const auto& f = doc.fragments[fi];
+      int inner = 0;
+      if (f.scroller >= 0 && (size_t)f.scroller < doc.scrollers.size())
+        inner = pane.scroll_offset_of(doc.scrollers[(size_t)f.scroller].node);
+      const int fy = view_y + f.y - pane.scroll - inner;
+      if (first) { shift_y = view_y - pane.scroll - inner; first = false; }
+      x0 = std::min(x0, f.x); y0 = std::min(y0, fy);
+      x1 = std::max(x1, f.x + std::max(f.w, 1)); y1 = std::max(y1, fy + std::max(f.h, 1));
+    }
+    x0 = std::max(0, x0 - 48); y0 = std::max(0, y0 - 48);
+    x1 = std::min(w, x1 + 48); y1 = std::min(h, y1 + 48);
+    if (x1 <= x0 || y1 <= y0) return;
+    // Sized once for the deepest nesting allowed: a nested group must never reallocate the pool under the
+    // references an enclosing one holds.
+    if (s_xf_pool.size() < 16) s_xf_pool.resize(16);
+    std::vector<uint32_t>& black = s_xf_pool[(size_t)(2 * xf_depth)];
+    std::vector<uint32_t>& white = s_xf_pool[(size_t)(2 * xf_depth + 1)];
+    const size_t need = (size_t)w * (size_t)h;
+    if (black.size() != need) black.assign(need, 0xFF000000u);
+    if (white.size() != need) white.assign(need, 0xFFFFFFFFu);
+    for (int yy = y0; yy < y1; ++yy) {
+      std::fill(black.begin() + (ptrdiff_t)((size_t)yy * w + x0), black.begin() + (ptrdiff_t)((size_t)yy * w + x1), 0xFF000000u);
+      std::fill(white.begin() + (ptrdiff_t)((size_t)yy * w + x0), white.begin() + (ptrdiff_t)((size_t)yy * w + x1), 0xFFFFFFFFu);
+    }
+    ++xf_depth;
+    for (int pass = 0; pass < 2; ++pass) {
+      std::vector<uint32_t>& scratch = pass == 0 ? black : white;
+      for (size_t k = 0; k < n_xf; ++k) if ((int)k != gi && in_group((int)k, gi)) xf_done[k] = 0;   // nested ones, again
+      find_at = 0;
+      win.buffer.swap(scratch);
+      paint_list(sub, gi);
+      win.buffer.swap(scratch);
+    }
+    --xf_depth;
+    find_at = 0;
+    // The map in window pixels, and back.
+    const float ox = g.ox, oy = g.oy + (float)shift_y;
+    const float det = g.a * g.d - g.b * g.c;
+    if (std::fabs(det) < 1e-6f) return;   // scaled to nothing: nothing to draw
+    const float ia = g.d / det, ib = -g.b / det, ic = -g.c / det, id = g.a / det;
+    float dx0 = 1e30f, dy0 = 1e30f, dx1 = -1e30f, dy1 = -1e30f;
+    for (int k = 0; k < 4; ++k) {
+      const float px = (float)((k & 1) ? x1 : x0) - ox, py = (float)((k & 2) ? y1 : y0) - oy;
+      const float qx = ox + g.a * px + g.c * py + g.e, qy = oy + g.b * px + g.d * py + g.f;
+      dx0 = std::min(dx0, qx); dy0 = std::min(dy0, qy); dx1 = std::max(dx1, qx); dy1 = std::max(dy1, qy);
+    }
+    // Inside the page area, and inside whatever its ancestors' `overflow` cuts it to.
+    int cx0 = 0, cy0 = view_y, cx1 = view_w, cy1 = view_y + view_h;
+    if (xf_depth > 0) { cx0 = 0; cy0 = 0; cx1 = w; cy1 = h; }   // into an enclosing group's scratch: it clips later
+    const int px0 = std::max(cx0, (int)std::floor(dx0)), py0 = std::max(cy0, (int)std::floor(dy0));
+    const int px1 = std::min(cx1, (int)std::ceil(dx1)), py1 = std::min(cy1, (int)std::ceil(dy1));
+    auto sample = [&](const std::vector<uint32_t>& buf, uint32_t outside, float sx, float sy, float out[3]) {
+      // Bilinear, reading `outside` (what an empty pixel of this scratch is) beyond what was drawn.
+      const int ix = (int)std::floor(sx), iy = (int)std::floor(sy);
+      const float fx = sx - (float)ix, fy = sy - (float)iy;
+      auto at = [&](int x, int y) -> uint32_t {
+        if (x < x0 || y < y0 || x >= x1 || y >= y1) return outside;
+        return buf[(size_t)y * (size_t)w + (size_t)x];
+      };
+      const uint32_t p00 = at(ix, iy), p10 = at(ix + 1, iy), p01 = at(ix, iy + 1), p11 = at(ix + 1, iy + 1);
+      for (int ch = 0; ch < 3; ++ch) {
+        const int sh = 16 - 8 * ch;
+        const float top = (float)((p00 >> sh) & 0xFF) * (1 - fx) + (float)((p10 >> sh) & 0xFF) * fx;
+        const float bot = (float)((p01 >> sh) & 0xFF) * (1 - fx) + (float)((p11 >> sh) & 0xFF) * fx;
+        out[ch] = top * (1 - fy) + bot * fy;
+      }
+    };
+    for (int py = py0; py < py1; ++py) {
+      for (int px = px0; px < px1; ++px) {
+        const float u = (float)px + 0.5f - ox - g.e, v = (float)py + 0.5f - oy - g.f;
+        const float sx = ox + ia * u + ic * v - 0.5f, sy = oy + ib * u + id * v - 0.5f;
+        if (sx < (float)x0 - 1 || sy < (float)y0 - 1 || sx > (float)x1 || sy > (float)y1) continue;
+        float kb[3], kw[3];
+        sample(black, 0xFF000000u, sx, sy, kb);
+        sample(white, 0xFFFFFFFFu, sx, sy, kw);
+        const float cover = 1.0f - ((kw[0] - kb[0]) + (kw[1] - kb[1]) + (kw[2] - kb[2])) / (3.0f * 255.0f);
+        if (cover <= 0.004f) continue;
+        uint32_t& dst = win.buffer[(size_t)py * (size_t)w + (size_t)px];
+        const float a = cover > 1.0f ? 1.0f : cover;
+        uint32_t outp = 0xFF000000u;
+        for (int ch = 0; ch < 3; ++ch) {
+          const int sh = 16 - 8 * ch;
+          float col = kb[ch] / a;                          // what was drawn, before it was laid over black
+          if (col > 255.0f) col = 255.0f;
+          const float d = (float)((dst >> sh) & 0xFF);
+          outp |= (uint32_t)std::lround(col * a + d * (1.0f - a)) << sh;
+        }
+        dst = outp;
+      }
+    }
+  };
+  paint_list = [&](const std::vector<size_t>& list, int current) {
+  for (size_t fi_ : list) {
+    const auto& f = doc.fragments[fi_];
+    if (f.xform != current) {
+      // The first of a transformed box's fragments: the whole box, through its matrix, now.
+      int top = f.xform;
+      while (top >= 0 && doc.transforms[(size_t)top].parent != current) top = doc.transforms[(size_t)top].parent;
+      if (top < 0 || xf_done[(size_t)top]) continue;
+      xf_done[(size_t)top] = 1;
+      std::vector<size_t> sub;
+      for (size_t fj : list) if (in_group(doc.fragments[fj].xform, top)) sub.push_back(fj);
+      render_group(top, sub);
+      continue;
+    }
     // A box inside a scroll pane is drawn at its laid-out position minus that
     // pane's own offset. The pane's frame does not carry a scroller id, so it
     // stays put while its contents move under it.
@@ -1964,31 +2184,76 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
           web_draw_text(c, win.buffer, w, h, f.x, y, f.text, ink, f.font, clip);
         }
         int asc = web_ascent(f.font);
+        // Decoration lines scale with the type, as a browser draws them from the face's metrics: about a
+        // fourteenth of the size thick, an underline a tenth of the size below the baseline, in the full ink.
+        const int deco_t = std::max(1, (int)std::lround(f.font.px / 14.0f));
         if (f.underline) {
-          int uy = y + asc + 2;
-          if (uy >= view_y && uy < view_y + view_h)
-            c.draw_rect_to(win.buffer, w, h, f.x, uy, f.w, 1, hot ? ink : ((ink & 0x00FFFFFF) | 0xB0000000));
+          const int uy = y + asc + std::max(1, (int)std::lround(f.font.px * 0.1f));
+          const int top = std::max(uy, clip.y0), bot = std::min(uy + deco_t, clip.y1);
+          if (bot > top) c.draw_rect_to(win.buffer, w, h, f.x, top, f.w, bot - top, ink);
         }
         if (f.strike) {
-          int sy = y + asc * 2 / 3;
-          if (sy >= view_y && sy < view_y + view_h) c.draw_rect_to(win.buffer, w, h, f.x, sy, f.w, 1, ink);
+          const int sy = y + asc - (int)std::lround(f.font.px * 0.3f);
+          const int top = std::max(sy, clip.y0), bot = std::min(sy + deco_t, clip.y1);
+          if (bot > top) c.draw_rect_to(win.buffer, w, h, f.x, top, f.w, bot - top, ink);
         }
         break;
       }
     }
   }
+  };
+  {
+    std::vector<size_t> all(doc.fragments.size());
+    for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+    paint_list(all, -1);
+  }
+
+  // Inner scroll areas (`overflow: auto`/`scroll` with more in them than fits): a thin bar inside the right edge,
+  // so a person can see the box scrolls and how far along it is.
+  for (const auto& sa : doc.scrollers) {
+    if (sa.content_h <= sa.h || sa.h < 16 || sa.w < 16) continue;
+    const int top = sa.y - pane.scroll + kChromeH;
+    if (top + sa.h <= view_y || top >= view_y + view_h) continue;
+    const int off = pane.scroll_offset_of(sa.node);
+    const int max_off = sa.max_offset();
+    int thumb_h = (int)((int64_t)sa.h * sa.h / sa.content_h);
+    if (thumb_h < 12) thumb_h = 12;
+    if (thumb_h > sa.h - 4) thumb_h = sa.h - 4;
+    const int thumb_y = top + 2 + (max_off > 0 ? (int)((int64_t)off * (sa.h - 4 - thumb_h) / max_off) : 0);
+    const int bar_x = sa.x + sa.w - 8;
+    DrawClip area;
+    area.x0 = std::max(0, sa.x);
+    area.x1 = std::min(view_w, sa.x + sa.w);
+    area.y0 = std::max(view_y, top);
+    area.y1 = std::min(view_y + view_h, top + sa.h);
+    if (area.x1 <= area.x0 || area.y1 <= area.y0) continue;
+    const uint32_t thumb = light_page ? kScrollThumbLight : kScrollThumb;
+    for (int py = std::max(area.y0, thumb_y); py < std::min(area.y1, thumb_y + thumb_h); ++py)
+      for (int px = std::max(area.x0, bar_x); px < std::min(area.x1, bar_x + 6); ++px) {
+        // rounded ends: the corners of the 6px bar are left out
+        const bool corner = (px == bar_x || px == bar_x + 5) && (py == thumb_y || py == thumb_y + thumb_h - 1);
+        if (!corner && py >= 0 && py < h && px >= 0 && px < w) win.buffer[(size_t)py * (size_t)w + (size_t)px] = thumb;
+      }
+  }
 
   // The focused field, marked: a ring around its box and a caret after its
   // text. Without this a person types and has no idea which box is listening --
   // and a field whose placeholder still shows looks like it took nothing.
+  // The ring follows the control's own corners: a pill gets a pill-shaped ring.
   if (web::Node* focused = live_field(pane)) {
+    bool ringed = false;
     for (const auto& f : doc.fragments) {
       if (f.node != focused) continue;
       int y = f.y - pane.scroll + kChromeH;
       if (f.kind == web::Fragment::Kind::Border || f.kind == web::Fragment::Kind::Rect) {
-        if (y + f.h > view_y && y < view_y + view_h)
-          c.draw_rect_outline_to(win.buffer, w, h, f.x - 1, y - 1, f.w + 2, (f.h > 0 ? f.h : 20) + 2,
-                                 kFieldFocus);
+        if (!ringed && y + f.h > view_y && y < view_y + view_h) {
+          DrawClip page;
+          page.x0 = 0; page.x1 = view_w; page.y0 = view_y; page.y1 = view_y + view_h;
+          const int fh = f.h > 0 ? f.h : 20;
+          stroke_round_rect(c, win.buffer, w, h, f.x - 2, y - 2, f.w + 4, fh + 4,
+                            light_page ? kFocusRingLight : kFieldFocus, f.radius > 0 ? f.radius + 2 : 3, 2, 2, 2, 2, page);
+          ringed = true;
+        }
         continue;
       }
       if (f.kind != web::Fragment::Kind::Text) continue;
@@ -2029,12 +2294,12 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
 
   // -- the scrollbar -------------------------------------------------------
   if (doc.content_height > view_h) {
-    c.draw_rect_to(win.buffer, w, h, view_w, view_y, kScrollW, view_h, kScrollTrack);
+    c.draw_rect_to(win.buffer, w, h, view_w, view_y, kScrollW, view_h, light_page ? kScrollTrackLight : kScrollTrack);
     int thumb_h = view_h * view_h / doc.content_height;
     if (thumb_h < 20) thumb_h = 20;
     int span = view_h - thumb_h;
     int thumb_y = view_y + (max_scroll > 0 ? pane.scroll * span / max_scroll : 0);
-    c.draw_rounded_rect_to(win.buffer, w, h, view_w + 2, thumb_y, kScrollW - 4, thumb_h, 2, kScrollThumb);
+    c.draw_rounded_rect_to(win.buffer, w, h, view_w + 2, thumb_y, kScrollW - 4, thumb_h, 2, light_page ? kScrollThumbLight : kScrollThumb);
   }
 
   if (zoomed) {
@@ -2050,11 +2315,11 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
       for (int rx = 0; rx < real_view_w; ++rx) win.buffer[dst + (size_t)rx] = s_zoom_scratch[src + (size_t)s_zoom_xs[(size_t)rx]];
     }
     if (doc.content_height > view_h) {
-      c.draw_rect_to(win.buffer, real_w, real_h, real_view_w, kChromeH, kScrollW, real_view_h, kScrollTrack);
+      c.draw_rect_to(win.buffer, real_w, real_h, real_view_w, kChromeH, kScrollW, real_view_h, light_page ? kScrollTrackLight : kScrollTrack);
       int thumb_h = std::max(20, (int)((int64_t)real_view_h * view_h / doc.content_height));
       int span = real_view_h - thumb_h;
       int thumb_y = kChromeH + (max_scroll > 0 ? pane.scroll * span / max_scroll : 0);
-      c.draw_rounded_rect_to(win.buffer, real_w, real_h, real_view_w + 2, thumb_y, kScrollW - 4, thumb_h, 2, kScrollThumb);
+      c.draw_rounded_rect_to(win.buffer, real_w, real_h, real_view_w + 2, thumb_y, kScrollW - 4, thumb_h, 2, light_page ? kScrollThumbLight : kScrollThumb);
     }
   }
   if (s_find_open) {
@@ -2399,7 +2664,26 @@ void web_pane_click(HardwareCompositor& c, WindowSurface& win, Kernel& k, int re
     const int hit_link = pane.browser->link_at(rel_x, page_y);
     run_page_work(win.web, view_w, "click", [clicked, hit_link, vw = view_w](WebPane& p, int& wrote) {
       bool prevented = false;
+      // A checkbox or radio changes BEFORE the click's handlers run, so they read the new state; a handler that
+      // prevents the click puts it back, and one that does not is followed by `input` and `change`.
+      // (dispatch() SETS its count of DOM writes, so each call gets its own and they are added up.)
+      web::Node* box = toggle_target(clicked);
+      std::vector<std::pair<web::Node*, bool>> was;
+      if (box) was = activate_checkable(box);
       const int ran = p.browser->js()->dispatch(clicked, "click", &wrote, nullptr, &prevented);
+      if (box) {
+        ++wrote;   // the control's own change, or putting it back: either way the page is drawn again
+        if (prevented) {
+          for (const auto& [n, on] : was) set_checked(n, on);
+        } else {
+          int more = 0;
+          p.browser->js()->dispatch(box, "input", &more);
+          wrote += more;
+          more = 0;
+          p.browser->js()->dispatch(box, "change", &more);
+          wrote += more;
+        }
+      }
       // The handler may have sent a form or navigated, and if it did not take
       // the click, the click still does what it always does: a submit button
       // sends its form and a link goes where it points. A handler used to
@@ -2429,6 +2713,33 @@ void web_pane_click(HardwareCompositor& c, WindowSurface& win, Kernel& k, int re
       if (!p.browser->js()->last_error().empty())
         p.message += " - handler failed: " + p.browser->js()->last_error();
       p.error = false;
+    });
+    return;
+  }
+
+  // A checkbox or radio (or its label) with no click handler on the way: it changes, the page's `input` and
+  // `change` listeners run, and the page is laid out again to show it.
+  // A script that listens for `input` or `change` (not `click`) still hears about it, as in a browser.
+  if (web::Node* box = toggle_target(clicked)) {
+    run_page_work(win.web, view_w, "a checkbox", [box, clicked](WebPane& p, int& wrote) {
+      const auto was = activate_checkable(box);
+      wrote = 1;
+      if (!p.browser->js()) return;
+      // dispatch() SETS its count of DOM writes, so each call gets its own and they are added up.
+      bool prevented = false;
+      int more = 0;
+      p.browser->js()->dispatch(clicked, "click", &more, nullptr, &prevented);
+      wrote += more;
+      if (prevented) {
+        for (const auto& [n, on] : was) set_checked(n, on);
+        return;
+      }
+      more = 0;
+      p.browser->js()->dispatch(box, "input", &more);
+      wrote += more;
+      more = 0;
+      p.browser->js()->dispatch(box, "change", &more);
+      wrote += more;
     });
     return;
   }

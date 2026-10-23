@@ -1,0 +1,60 @@
+# page control-marks.html  viewport=900x600
+# title Checkboxes, radios and controls drawn as a browser draws them
+# content 900x245  background=ffffffff  links=0
+rect      20    31    13    13  #00000000
+image     20    31    13    13  #ff000000  src=control#0 alt=""
+text      36    32    32    22  #ff1a1a1a  16px              " on "
+rect      72    31    13    13  #00000000
+image     72    31    13    13  #ff000000  src=control#1 alt=""
+text      88    32    40    22  #ff1a1a1a  16px              " off "
+rect     133    31    13    13  #00000000
+image    133    31    13    13  #ff000000  src=control#2 alt=""
+text     149    32    40    22  #ff1a1a1a  16px              " one "
+rect     194    31    13    13  #00000000
+image    194    31    13    13  #ff000000  src=control#3 alt=""
+text     210    32    32    22  #ff1a1a1a  16px              " two"
+rect      20    69    13    13  #00000000
+image     20    69    13    13  #ff000000  src=control#4 alt=""
+text      36    70    64    22  #ff1a1a1a  16px              " accent "
+rect     105    69    13    13  #00000000
+image    105    69    13    13  #ff000000  src=control#5 alt=""
+text     121    70    64    22  #ff1a1a1a  16px              " accent "
+rect     185    66   160    16  #00000000
+rect     185    70   160     8  #ffefefef  r=4
+rect     185    70    64     8  #ffc2185b  r=4
+border   185    70   160     8  #ffb2b2b2  r=4
+rect      20   107    13    13  #00000000
+image     20   107    13    13  #ff6d6d6d  src=control#6 alt=""
+text      36   108    80    22  #ff1a1a1a  16px              " disabled "
+rect     120   107    13    13  #00000000
+image    120   107    13    13  #ff6d6d6d  src=control#7 alt=""
+text     136   108   104    22  #ff1a1a1a  16px              " disabled on "
+rect     240   106   166    26  #fffafafa  r=2
+border   240   106   166    26  #ffd6d6d6  r=2
+text     243   108   160    22  #ff6d6d6d  16px              "read only"
+border    20   147    22    22  #ff333333  r=9999
+text      45   157   144    22  #ff1a1a1a  16px              " drawn by the page"
+rect      16   191    38    26  #ffefefef  r=3
+border    16   191    38    26  #ff767676  r=3
+text      23   193    24    22  #ff000000  16px              "One"
+rect      62   191    38    26  #ffefefef  r=3
+border    62   191    38    26  #ff767676  r=3
+text      69   193    24    22  #ff000000  16px              "Two"
+rect     108   191    46    26  #ffefefef  r=3
+border   108   191    46    26  #ff767676  r=3
+text     115   193    32    22  #ff000000  16px              "Send"
+rect     154   191    60    26  #ffffffff  r=3
+image    197   201    10     6  #ff000000  src=control#8 alt=""
+border   154   191    60    26  #ff767676  r=3
+text     159   193    50    22  #ff000000  16px              "Pick"
+# inline-image control#0 13x13  inked=169  digest=73c46666
+# inline-image control#1 13x13  inked=169  digest=3f2e84ce
+# inline-image control#2 13x13  inked=145  digest=48f48846
+# inline-image control#3 13x13  inked=145  digest=db4d5f76
+# inline-image control#4 13x13  inked=169  digest=22643f9b
+# inline-image control#5 13x13  inked=145  digest=dd52d9aa
+# inline-image control#6 13x13  inked=169  digest=4ba34f3e
+# inline-image control#7 13x13  inked=169  digest=2fc30cf9
+# inline-image control#8 10x6  inked=28  digest=a5fc1875
+# glyph-gaps (none)
+

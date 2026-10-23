@@ -441,6 +441,20 @@ struct Style {
   bool has_content = false;
   Length translate_x, translate_y;
   bool has_translate = false;
+  // `transform` with more in it than translation -- scale, rotate, skew, matrix -- as the functions were written,
+  // applied about `transform-origin` when the box is painted. A list of translations alone stays in
+  // translate_x/translate_y above, which layout applies by moving the box. The standalone `rotate` and `scale`
+  // properties come first, as CSS orders them (translate, rotate, scale, then transform).
+  struct TransformFn {
+    enum class Kind : uint8_t { Translate, Scale, Rotate, Skew, Matrix } kind = Kind::Translate;
+    Length tx, ty;                    // Translate
+    float v[6] = {0, 0, 0, 0, 0, 0};  // Scale: sx sy. Rotate: radians. Skew: x y radians. Matrix: a b c d e f
+  };
+  std::vector<TransformFn> transform_fns;
+  float rotate_rad = 0.0f;            // the `rotate` property
+  float scale_x = 1.0f, scale_y = 1.0f;   // the `scale` property
+  Length origin_x, origin_y;          // `transform-origin`; auto = the centre
+  bool has_xf() const { return !transform_fns.empty() || rotate_rad != 0.0f || scale_x != 1.0f || scale_y != 1.0f; }
   float opacity = 1.0f;
   float effective_opacity = 1.0f;
   // `letter-spacing`. Inherited, like the rest of the type properties: a page
@@ -454,6 +468,10 @@ struct Style {
   Length width;
   Length height;
   int line_height = 0;              // 0: derive it from the face
+  // `appearance: none`: a control the page draws itself, so the engine paints no checkbox or radio mark of its own.
+  bool appearance_none = false;
+  // `accent-color` (inherited): the fill of a checked checkbox or radio and of a gauge's bar. 0 = the browser's own.
+  uint32_t accent = 0;
   bool list_bullet = true;          // list-style-type: none turns it off
   Position position = Position::Static;
   // `top` / `right` / `bottom` / `left`, unresolved: an absolute box's offsets
@@ -616,6 +634,8 @@ struct Fragment {
   // is what makes a pane scroll under its own frame instead of the whole page
   // moving. The innermost area wins.
   int scroller = -1;
+  // Which transformed box (Document::transforms) this is drawn through, innermost; -1 for none.
+  int xform = -1;
 };
 
 // A box with `overflow: auto` or `scroll` and more inside it than fits. The
@@ -651,6 +671,21 @@ struct Document {
   std::string base;                 // what relative urls resolve against
   std::vector<Fragment> fragments;
   std::vector<Link> links;
+  // Moves on every layout. What a painter keys a cached frame on: a relayout can keep every fragment's count and
+  // size and still change what is drawn (a checkbox ticked, a class swapped, an inline picture redrawn).
+  uint64_t layout_gen = 0;
+  // Boxes drawn through a 2D transform -- `scale`, `rotate`, `skew`, `matrix` (a translation alone just moves the
+  // box). The box keeps its place in the flow; its fragments carry the group's index and the painter draws them
+  // through x' = ox + a (x - ox) + c (y - oy) + e, y' = oy + b (x - ox) + d (y - oy) + f, where (ox, oy) is the
+  // transform-origin in page coordinates. A transformed box inside another nests: `parent` is the enclosing one.
+  struct TransformGroup {
+    int parent = -1;
+    float ox = 0, oy = 0;
+    float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+    size_t frag_from = 0, frag_to = 0;   // the fragments it covered while layout ran (before the stacking sort)
+    size_t link_from = 0, link_to = 0;
+  };
+  std::vector<TransformGroup> transforms;
   // Pictures the page carries in its own markup rather than fetching: an inline
   // <svg>, rasterised at layout time and keyed by a name only this document
   // uses. The pane looks here before it looks in the fetched-image store.
@@ -692,6 +727,9 @@ ByteBuffer encode_png(const uint32_t* argb, int w, int h);
 // paints with `stroke="currentColor"`, so without it they come out black on a
 // dark ground, which is to say invisible.
 Result<Bitmap> rasterise_svg(const Node& svg, int w, int h, uint32_t current);
+// A CSS colour value (`#rgb[a]`, `#rrggbb[aa]`, `rgb()`/`rgba()`, `hsl()`, the modern functions, a name) as ARGB.
+// False when it is not a colour. The cascade's own parser, for SVG's paint attributes.
+bool css_colour(const std::string& value, uint32_t& out);
 
 // Nearest-neighbour box resample, for fitting an image into the space layout
 // gave it. Good enough for a page; a real resampler is a separate job.

@@ -1,7 +1,7 @@
 # page shell.html  viewport=900x600
 # title An application shell
 # content 900x1175  background=ff121212  links=0
-rect       0     0   900   600  #ff111111  clip=0,0,900x600
+rect       0     0   900   600  #ff111111
 rect       0     0   200   600  #ff181818  clip=0,0,900x600
 text      10    10    49    19  #ffdddddd  14px              "sidebar"  clip=0,0,900x600
 rect     200     0   700    44  #ff202020  clip=0,0,900x600

@@ -310,6 +310,7 @@ bool callable(const Value& v) { return v.type == Type::Fn || v.type == Type::Nat
 Value add_timer(Vm& vm, std::vector<Value>& args, std::string& error, bool repeat, const char* who) {
   if (!args[0].is_number() || args[0].as_double() < 0) { error = std::string(who) + "() wants a number of seconds"; return Value::nil(); }
   if (!callable(args[1])) { error = std::string(who) + "() wants a function to call"; return Value::nil(); }
+  if (vm.worker) { error = std::string(who) + "(): a worker (parallel_map, spawn) has no loop to fire timers; set them in the program itself"; return Value::nil(); }
   if (vm.timers.size() >= 1000) { error = std::string(who) + "(): too many timers"; return Value::nil(); }
   Vm::Timer t;
   t.id = vm.next_timer_id++;

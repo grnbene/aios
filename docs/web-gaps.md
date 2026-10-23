@@ -1,70 +1,48 @@
-# Web Engine Visual Polish vs Chrome — Gap Analysis & Improvements
+# Web engine vs Chrome: what is left
 
-This document tracks visual fidelity, typography, styling, and rendering differences between AIOS's native web engine and modern desktop Chrome (tested across content-heavy sites: documentation, news, encyclopedias, blogs, and shops).
+How the engine's pages differ from desktop Chrome's, and what was done about it. Checked on 2026-10-23 by
+rendering the same pages in `aios-web-shot` (the browser pane, painted offscreen) and in headless Chrome side by
+side, and held by the layout goldens in `scripts/web-corpus` (`scripts/drive-web.sh`, 159 checks), which carry a
+page for each item below.
 
----
+## Closed
 
-## 1. Ranked Visual Gaps & Fixes
+| Gap | What the engine does now | Where |
+|---|---|---|
+| Checkboxes and radios drawn as `[x]` / `(*)` | Chrome's 13px controls: a 2px-rounded box with a tick, a ring with a dot, in Chrome's colours for a light or a dark page, `accent-color` honoured, greyed when disabled, nothing drawn under `appearance: none`. A click (or a click on the `<label>`) checks it, unchecks the other radios of its name, and fires `click`, `input` and `change`; `preventDefault()` puts it back. | `web_layout.cpp` `control_mark`, `web_pane.cpp` `activate_checkable` |
+| Buttons, fields, dropdowns | Chrome's UA values: field padding 1px 2px with a 2px radius, buttons and dropdowns 3px, labels centred in buttons, a drawn chevron on a closed `<select>`, disabled controls muted, a hover shade on buttons. A control's CSS margins are kept (a row of buttons is spaced). A control sits on the line by its label's baseline. | `web_css.cpp` UA sheet, `web_layout.cpp` Field items |
+| Gauges | `<progress>`/`<meter>` as an 8px rounded track with an edge, Chrome's fill colours, `accent-color`. | `web_layout.cpp` |
+| Line height | `line-height` is honoured below the face's own height (a 1.1 heading is set tight); the leading is split above and below the text (half-leading), a line is as tall as its highest ascent plus its deepest descent, and `line-height: normal` resets instead of inheriting. An inline-block sits on its last line's baseline. | `web_layout.cpp` `text_box`, line builder, `last_baseline` |
+| Kerning | DejaVu's `kern` pairs (Latin and punctuation, all eight sans and serif faces) are applied when text is measured and drawn. Generated from the same font files as the atlas by `metal/tools/mkkern.py`. | `font_kerning.cpp`, `web_type.cpp` |
+| Focus ring | 2px, following the control's own radius, Chrome's `#005FCC` on a light page. | `web_pane.cpp` |
+| Scrollbars | The page's bar follows its ground (light track and thumb on a light page). An inner `overflow: auto/scroll` box with more in it than fits shows a thumb inside its edge. A scroll pane's own border and background are no longer clipped away by its own overflow. | `web_pane.cpp`, `web_layout.cpp` |
+| Underlines | Full ink, thickness and offset scaled with the font size (strike-through likewise). | `web_pane.cpp` |
+| SVG | `<use>` (of an element, or a `<symbol>` with its viewBox), nested `<svg>`, `transform` (translate, scale, rotate, skew, matrix), linear and radial gradients (units, `gradientTransform`, `href` chains, `stop-opacity`), `fill-opacity` / `stroke-opacity` / `opacity`, `style="fill: ..."`, every CSS colour form, `fill-rule="evenodd"`, `preserveAspectRatio` (align, meet, slice, none). | `web_svg.cpp` |
+| CSS transforms | `scale`, `rotate`, `skew`, `matrix`, `matrix3d` (its 2D part), `rotateX/Y` (flattened as Chrome does without perspective), the standalone `rotate` and `scale` properties, `transform-origin`, nesting. The box keeps its place in the flow; its fragments are painted offscreen and composited through the matrix, and links inside it are hit where they are drawn. | `web_css.cpp`, `web_layout.cpp` `add_transform`, `web_pane.cpp` `render_group` |
+| Repaint after a change | A relayout that kept every fragment's count and size (a ticked checkbox, a swapped class) left the old picture on screen; the frame cache now follows a layout generation. Inline pictures are no longer appended again on every relayout. Text is one fragment per element, so a click on a `<label>` or a `<span>` with a handler reaches that element. | `web_pane.cpp`, `web_layout.cpp` |
 
-### Rank 1: Form Controls (Checkboxes, Radios, Inputs, Buttons, Dropdowns)
-- **Problem**:
-  - `<input type="checkbox">` and `<input type="radio">` were historically rendered as raw ASCII strings `"[x]"` / `"[ ]"` and `"(*)"` / `"( )"` with full text measurement (~24px wide). In modern Chrome, checkboxes are crisp 14×14px rounded rects with clean white checkmarks, and radio buttons are circular badges with centered dots.
-  - Form buttons (`<button>`, `<input type="submit">`) were completely sharp rectangles with flat fills, missing standard rounded borders (`border-radius: 4px`), proper vertical centering of button text, and subtle hover/active affordances.
-  - Select dropdowns had basic triangle glyphs without proper padding or platform-native styling.
-- **Fix / Status**:
-  - Implemented real painted control representations for checkbox and radio inputs in `web_layout.cpp` and `web_pane.cpp` matching Chrome's native 14px size, border radius (3px for checkbox, 7px/circle for radio), accent fill (`#0075FF`), and custom checkmark/bullet graphics.
-  - Added rounded border styling and proper vertical centering for form buttons.
+## Left
 
-### Rank 2: Line Heights & Vertical Rhythm
-- **Problem**:
-  - `web_layout.cpp` enforced `line_h = st.line_height > base ? st.line_height : base;` which clamped any compact line-height (e.g. `line-height: 1.1` or `1.2` on large headings, or compact data tables) to the base font line-height. This prevented authors from setting tighter leading on headings, making multi-line headers disproportionately tall compared to Chrome.
-  - `pane_metrics()` was artificially adding `+ 3` to `web_line_height(f)` and `+ 1` to `web_ascent(f)`.
-- **Fix / Status**:
-  - Respect explicit `st.line_height > 0` directly so tight headings and custom line heights match Chrome's layout exactly.
-  - Normalized line height calculations so body and heading text maintain correct baseline alignment.
-
-### Rank 3: Letter Spacing, Tracking & Glyph Advances
-- **Problem**:
-  - The atlas face DejaVu Sans has wider character advances (approx. 8.25px avg at 16px) compared to Chrome's default Linux sans font (Noto Sans / Roboto / Arial at approx. 7.29px avg at 16px).
-  - This made live window text look spaced out (tracked too widely), causing paragraphs to wrap lines sooner than in Chrome.
-- **Fix / Status**:
-  - Fine-tuned text measurement and tracking in `web_pane.cpp` so font advances and word spacing more closely track standard browser proportions.
-
-### Rank 4: Focus Rings & Active States
-- **Problem**:
-  - Focus indicators for inputs and active controls were hardcoded 1px rectangular outlines (`draw_rect_outline_to`) that ignored the element's `border-radius`, creating mismatched sharp blue boxes around rounded inputs and pills.
-- **Fix / Status**:
-  - Made focus rings honor `f.radius` and draw matching rounded focus rings (`stroke_round_rect` with Chrome's focus color `#5B8DD9` or system focus ring).
-
-### Rank 5: Scrollbars & Inner Scroll Areas
-- **Problem**:
-  - Page scrollbar track was hardcoded to dark black (`0xFF181818`) even on light pages, standing out jarringly against white backgrounds.
-  - Sub-elements with `overflow: auto / scroll` did not render scrollbars, giving no visual cue that content was scrollable.
-- **Fix / Status**:
-  - Made main scrollbar track and thumb adapt dynamically to the page ground color (light subtle track `#F1F1F1` with `#C1C1C1` thumb on light pages; dark track `#181818` with `#4A4A4A` thumb on dark pages).
-  - Supported scroll indicators for inner scroll areas (`doc.scrollers`).
-
-### Rank 6: Link & Underline Styling
-- **Problem**:
-  - Link underlines were drawn with a hardcoded alpha mask `0xB0` on an offset `y + asc + 2`, which produced faint/washed-out underlines on light grounds and didn't scale with font size.
-- **Fix / Status**:
-  - Adjusted underline alpha and positioning relative to font metrics and link ink color.
-
-### Rank 7: Icons (Inline SVG & Icon Fonts)
-- **Problem**:
-  - SVG rasterizer (`web_svg.cpp`) handles basic paths and shapes, but complex SVGs with `<defs>`, `<use>`, clipping paths, or non-uniform scaling (`preserveAspectRatio="xMidYMid meet"`) occasionally dropped elements or scaled disproportionately.
-- **Fix / Status**:
-  - Enhanced SVG attribute handling and ensured currentColor cascades properly into all icon fill/stroke contexts.
-
-### Rank 8: Images & Aspect Ratios
-- **Problem**:
-  - Missing or failing images rendered a generic outline box; images without explicit dimensions caused layout reflows until fetched.
-- **Fix / Status**:
-  - Clean fallbacks with proper bounding boxes and alt text typography.
-
----
-
-## 2. Summary of Remaining Gaps
-1. **Subpixel Text Antialiasing & Kerning**: Atlas-based bitmap coverage produces clean grayscale antialiasing, but lacks LCD subpixel RGB hinting and kerning pairs from HarfBuzz/FreeType.
-2. **Complex SVG Filters & Gradients**: Linear/radial gradients in SVG icons fall back to solid fills or first stops.
-3. **Hardware-accelerated CSS Animations & Transforms**: Transforms (`transform: rotate/scale`) are currently laid out in standard box coords without 2D matrix transformation during composite.
+1. **The typeface.** The atlas is DejaVu, whose advances are about 13% wider than the faces Chrome uses by default
+   (Arial, Helvetica, Liberation Sans). Advances are narrowed by 6% and spaces set at 0.26em as a fit, but text still
+   sets wider than Chrome's: a 40px bold heading 420px wide takes three lines where Chrome takes two. The real fix is
+   to cut a metric-compatible sans (Liberation Sans or Arimo, both freely licensed) into the atlas with
+   `metal/tools/mkfont.py` and kern it with `mkkern.py`.
+2. **Shaping beyond pairs.** Kerning comes from the `kern` table only: no GPOS contextual positioning, no ligatures
+   (`fi`, `fl`), no complex-script shaping. Monospace text is not kerned (correctly).
+3. **Subpixel (LCD) antialiasing: not done, on purpose.** Text is grayscale-antialiased, as Chrome on macOS draws it.
+   LCD antialiasing depends on the panel's subpixel order, and this engine's output is scaled (zoom), rotated (CSS
+   transforms), streamed as pictures and shown on displays it cannot ask; on any of those it turns into colour fringes.
+4. **Transforms.**
+   - Transformed content is resampled after it is painted, not re-rasterised in place, so rotated text is slightly
+     softer than Chrome's.
+   - Clicks on elements inside a rotated or scaled box are tested against their untransformed boxes. Links are mapped.
+   - No perspective or 3D.
+   - Transitions and `@keyframes` animations are not implemented at all, for transforms or anything else.
+5. **SVG** does not draw clip paths, masks, patterns, filters, markers, `<text>`, a radial gradient's focal point, or
+   the `reflect` / `repeat` spread methods.
+6. **States.** `:active` never matches, so a pressed button has no pressed look. `:hover` applies on the frame after
+   the pointer moves.
+7. **Missing images** show their alt text in a box; Chrome shows a broken-image icon beside the alt text.
+8. **A page that sets no background** is drawn on the engine's dark ground (the machine's own look), where Chrome uses
+   white. A deliberate difference, not a gap.

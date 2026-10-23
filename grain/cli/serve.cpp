@@ -1,12 +1,15 @@
 // A small HTTP/1.1 server for one program: GET the page, POST its events. Each connection is
-// handled on its own thread and closed after the response; WebUi keeps the sessions.
+// handled on its own thread and closed after the response; WebUi keeps the sessions. A thread per
+// connection rather than a fixed pool: an event stream holds its connection for as long as someone
+// watches, and a pool would cap the viewers at its size.
 #include "serve.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <thread>
 #include <vector>
+
+#include "aios/hal/sync.hpp"
 
 #include "aios/userland/grain_webui.hpp"
 
@@ -152,16 +155,31 @@ int serve_ui(const std::string& name,
   std::memset(&addr, 0, sizeof addr);
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)opt.port);
-  if (::inet_pton(AF_INET, opt.host.c_str(), &addr.sin_addr) != 1) { std::cerr << "grain: " << opt.host << " is not an IPv4 address\n"; return 64; }
+  if (opt.host.empty() || opt.host == "0.0.0.0" || opt.host == "*") {
+    addr.sin_addr.s_addr = INADDR_ANY;
+  } else if (::inet_pton(AF_INET, opt.host.c_str(), &addr.sin_addr) != 1) {
+    std::cerr << "grain: " << opt.host << " is not an IPv4 address\n";
+    return 64;
+  }
   if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || ::listen(listener, 64) != 0) {
     std::cerr << "grain: cannot listen on " << opt.host << ":" << opt.port << "\n";
     return 2;
   }
-  std::cout << "grain: " << name << " is at http://" << opt.host << ":" << opt.port << "/  (Ctrl-C to stop)\n" << std::flush;
+  if (opt.host == "0.0.0.0" || opt.host == "*" || opt.host.empty()) {
+    std::cout << "grain: " << name << " is listening on all IPs at port " << opt.port << "  (Ctrl-C to stop)\n" << std::flush;
+  } else {
+    std::cout << "grain: " << name << " is at http://" << opt.host << ":" << opt.port << "/  (Ctrl-C to stop)\n" << std::flush;
+  }
   for (;;) {
     const int fd = ::accept(listener, nullptr, nullptr);
     if (fd < 0) continue;
-    std::thread([fd, ui]() { answer(fd, *ui); }).detach();
+    aios::hal::Thread conn([fd, ui]() { answer(fd, *ui); });
+    if (!conn.joinable()) {   // no thread to be had (the process is at its limit): this client is turned away, not left hanging
+      std::cerr << "grain: cannot start a thread for a connection; closing it\n";
+      ::close(fd);
+      continue;
+    }
+    conn.detach();
   }
 }
 

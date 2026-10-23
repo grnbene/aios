@@ -1,36 +1,36 @@
 # page form.html  viewport=420
 # title Forms that submit
-# content 420x611  background=ffffffff  links=0
+# content 420x591  background=ffffffff  links=0
 text      16    36   235    33  #ff202020  24px,bold         "Sign the guestbook"
 text      16    77    63    18  #ff202020  13px              "Your name"
-rect      16   105   320    35  #ffffffff
-border    16   105   320    35  #ffc0c0c0
+rect      16   105   320    35  #ffffffff  r=2
+border    16   105   320    35  #ffc0c0c0  r=2
 text      23   112   306    21  #ff000000  15px              "Ada"
 text      16   150    42    18  #ff202020  13px              "A note"
-rect      16   178   320    35  #ffffffff
-border    16   178   320    35  #ffc0c0c0
+rect      16   178   320    35  #ffffffff  r=2
+border    16   178   320    35  #ffc0c0c0  r=2
 text      23   185   306    21  #ff000000  15px              "passed through"
-rect      16   223   320    29  #ffffffff
-border    16   223   320    29  #ff767676
-text      24   227   304    21  #ff000000  15px              "[x]"
-rect      16   262   320    29  #ffffffff
-border    16   262   320    29  #ff767676
-text      24   266   304    21  #ff000000  15px              "[ ]"
-rect      16   301   320    35  #ffffffff
-border    16   301   320    35  #ffc0c0c0
-text      23   308   306    21  #ff000000  15px              "no"
-rect      16   346   320    35  #ffffffff
-border    16   346   320    35  #ffc0c0c0
-text      23   353   306    21  #ff000000  15px              "unnamed, so not sent"
-rect      16   391   320    39  #ff0f6ab0
-border    16   391   320    39  #ff767676
-text      31   400    56    21  #ffffffff  15px              "Send it"
-text      16   450   286    33  #ff202020  24px,bold         "Search, which is a GET"
-rect      16   491   320    35  #ffffffff
-border    16   491   320    35  #ffc0c0c0
-text      23   498   306    21  #ff000000  15px              "ring 0"
-rect      16   536   320    39  #ff0f6ab0
-border    16   536   320    39  #ff767676
-text      31   545    48    21  #ffffffff  15px              "Search"
+rect      20   226   313    13  #00000000
+image     20   226   313    13  #ff000000  src=control#0 alt=""
+rect      20   255   313    13  #00000000
+image     20   255   313    13  #ff000000  src=control#1 alt=""
+rect      16   281   320    35  #fffafafa  r=2
+border    16   281   320    35  #ffc0c0c0  r=2
+text      23   288   306    21  #ff6d6d6d  15px              "no"
+rect      16   326   320    35  #ffffffff  r=2
+border    16   326   320    35  #ffc0c0c0  r=2
+text      23   333   306    21  #ff000000  15px              "unnamed, so not sent"
+rect      16   371   320    39  #ff0f6ab0  r=3
+border    16   371   320    39  #ff767676  r=3
+text     148   380    56    21  #ffffffff  15px              "Send it"
+text      16   430   286    33  #ff202020  24px,bold         "Search, which is a GET"
+rect      16   471   320    35  #ffffffff  r=2
+border    16   471   320    35  #ffc0c0c0  r=2
+text      23   478   306    21  #ff000000  15px              "ring 0"
+rect      16   516   320    39  #ff0f6ab0  r=3
+border    16   516   320    39  #ff767676  r=3
+text     152   525    48    21  #ffffffff  15px              "Search"
+# inline-image control#0 313x13  inked=169  digest=97aca98e
+# inline-image control#1 313x13  inked=169  digest=dde5d116
 # glyph-gaps (none)
 

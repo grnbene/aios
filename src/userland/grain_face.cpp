@@ -427,6 +427,10 @@ class FacePane final : public PaneDriver {
   void set_shared(bool v) { shared_ = v; }
   const std::string& css() const { return css_; }
   void set_css(const std::string& c) { css_ = c; }
+  const std::string& theme() const { return theme_; }
+  void set_theme(const std::string& t) { theme_ = t; }
+  const Value& routes() const { return routes_; }
+  void set_routes(const Value& r) { routes_ = r; }
 
   bool render_html(Vm& vm, std::string& html, std::string& error) {
     vm_ = &vm;
@@ -642,6 +646,8 @@ class FacePane final : public PaneDriver {
     std::string custom_cls = opt_str(v, "class");
     if (custom_cls.empty()) custom_cls = opt_str(v, "cls");
     if (!custom_cls.empty()) cls += " " + esc(custom_cls);
+    std::string theme = opt_str(v, "theme");
+    if (!theme.empty()) cls += " theme-" + esc(theme);
     std::string custom_style = opt_str(v, "style");
     if (!custom_style.empty()) {
       if (!style.empty() && style.back() != ';') style += ";";
@@ -1057,6 +1063,8 @@ class FacePane final : public PaneDriver {
   std::map<std::string, std::string> web_fields_;
   std::unordered_set<std::string> web_set_fields_;
   std::string css_;
+  std::string theme_;
+  Value routes_ = Value::nil();
 
  private:
   // The program's widgets as this frame's face document, laid out at the pane's size.
@@ -1219,6 +1227,9 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (Value* r = o->find("refresh"); r && r->is_number()) pane->set_refresh((int)r->as_int());   // a browser redraws this often (seconds); a window already redraws
   if (Value* c = o->find("css")) pane->set_css(c->to_text());
   else if (Value* s = o->find("style")) pane->set_css(s->to_text());
+  if (Value* th = o->find("theme")) pane->set_theme(th->to_text());
+  if (Value* r = o->find("routes")) pane->set_routes(*r);
+  else if (Value* a = o->find("api")) pane->set_routes(*a);
   return register_driven_pane(vm, title, w, h, pane);
 }
 
@@ -1321,6 +1332,7 @@ bool web_pane_first(const Vm& vm, WebPaneInfo& out) {
       out.refresh = f->refresh();
       out.shared = f->shared();
       out.css = f->css();
+      out.theme = f->theme();
       return true;
     }
   }
@@ -1348,6 +1360,59 @@ bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& ac
   FacePane* f = web_face(vm, id);
   if (!f) { error = "that pane is not a ui.pane"; return false; }
   return f->web_event(vm, version, action, fields, error);
+}
+
+bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
+                           const std::string& query, const std::string& body,
+                           int& status, std::string& res_body, std::string& content_type, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f || f->routes().type != Type::Map) return false;
+  auto rm = as_map(f->routes());
+  Value* handler = rm ? rm->find(path) : nullptr;
+  if (!handler) handler = rm ? rm->find("*") : nullptr;
+  if (!handler || !is_callable(*handler)) return false;
+
+  auto req_m = std::make_shared<MapObj>();
+  req_m->put("method", Value::string(method));
+  req_m->put("path", Value::string(path));
+  req_m->put("query", Value::string(query));
+  req_m->put("body", Value::string(body));
+
+  std::vector<Value> args = {Value::object(Type::Map, req_m)};
+  Value ret = vm.call(*handler, args, error);
+  if (!error.empty()) return false;
+
+  status = 200;
+  content_type = "application/json; charset=utf-8";
+
+  if (ret.type == Type::Map) {
+    auto m = as_map(ret);
+    if (Value* s = m->find("status")) status = (int)s->as_int();
+    if (Value* ct = m->find("content_type")) content_type = ct->to_text();
+    if (Value* b = m->find("body")) {
+      res_body = b->to_text();
+    } else if (Value* j = m->find("json")) {
+      std::string out;
+      FacePane::value_json(*j, out, 0);
+      res_body = std::move(out);
+    } else {
+      std::string out;
+      FacePane::value_json(ret, out, 0);
+      res_body = std::move(out);
+    }
+  } else if (ret.type == Type::List) {
+    std::string out;
+    FacePane::value_json(ret, out, 0);
+    res_body = std::move(out);
+  } else if (ret.type == Type::Str) {
+    res_body = ret.str();
+    content_type = "text/plain; charset=utf-8";
+  } else {
+    std::string out;
+    FacePane::value_json(ret, out, 0);
+    res_body = std::move(out);
+  }
+  return true;
 }
 
 }  // namespace aios::userland::grain

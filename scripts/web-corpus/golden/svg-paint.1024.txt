@@ -1,0 +1,13 @@
+# page svg-paint.html  viewport=1024
+# title SVG use, gradients, transforms, opacity
+# content 1024x89  background=ffffffff  links=0
+image     16    16    48    48  #ffd93025  src=svg#0 alt=""
+image     72    16    48    48  #ffd93025  src=svg#1 alt=""
+image    128    16    48    48  #ffd93025  src=svg#2 alt=""
+image    184    32    64    32  #ffd93025  src=svg#3 alt=""
+# inline-image svg#0    48x48  inked=751  digest=64b8f295
+# inline-image svg#1    48x48  inked=1600  digest=c92600bd
+# inline-image svg#2    48x48  inked=823  digest=ed574052
+# inline-image svg#3    64x32  inked=1176  digest=5cca1f85
+# glyph-gaps (none)
+

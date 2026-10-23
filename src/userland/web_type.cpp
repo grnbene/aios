@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "aios/userland/font_atlas.hpp"
+#include "aios/userland/font_kerning.hpp"
 #include "aios/userland/glyph_engine.hpp"
 #include "aios/userland/pixels.hpp"
 
@@ -244,6 +245,20 @@ int web_ascent(const web::FontKey& f) {
   return a < 5 ? 5 : a;
 }
 
+constexpr float kAdvanceFit = 0.94f;
+
+// The pair adjustment between two neighbours (font_kerning.hpp), fitted the way the advances are. A monospace face
+// is not kerned, nor is anything next to a space.
+float kern_adj(uint32_t left, uint32_t right, const web::FontKey& f) {
+  if (f.mono || left == ' ' || right == ' ' || left == 0x00A0 || right == 0x00A0) return 0.0f;
+  using fonts::KernFamily;
+  const KernFamily fam = f.serif ? (f.bold ? (f.italic ? KernFamily::SerifBoldItalic : KernFamily::SerifBold)
+                                           : (f.italic ? KernFamily::SerifItalic : KernFamily::Serif))
+                                 : (f.bold ? (f.italic ? KernFamily::SansBoldItalic : KernFamily::SansBold)
+                                           : (f.italic ? KernFamily::SansItalic : KernFamily::Sans));
+  return fonts::kern_px(fam, left, right, f.px) * kAdvanceFit;
+}
+
 float glyph_adv(const fonts::Glyph& g, uint32_t cp, const web::FontKey& f, float scale) {
   if (f.mono) return (float)g.adv * scale + f.tracking;
   if (cp == ' ' || cp == 0x00A0) {
@@ -255,7 +270,7 @@ float glyph_adv(const fonts::Glyph& g, uint32_t cp, const web::FontKey& f, float
   }
   // DejaVu Sans glyph advances are metrically wide (~8.25px vs Chrome's ~7.3px at 16px).
   // Scaling advances by ~0.94 matches standard browser proportions so lines are not tracked wide.
-  float a = (float)g.adv * scale * 0.94f;
+  float a = (float)g.adv * scale * kAdvanceFit;
   float min_adv = (float)g.w * scale;
   if (a < min_adv) a = min_adv;
   return a + f.tracking;
@@ -267,9 +282,12 @@ int web_text_width(const std::string& text, const web::FontKey& f) {
   CharWalk walk(text);
   uint32_t cp;
   float w = 0;
+  uint32_t prev = 0;
   while (walk.next(cp)) {
     if (cp == '\n') break;
+    if (prev) w += kern_adj(prev, cp, f);
     w += glyph_adv(*glyph_for(*ch.face, cp).g, cp, f, scale);
+    prev = cp;
   }
   // Rounded UP, not to nearest. A width is asked for in order to fit text into
   // it, and a measurement that rounds down by half a pixel per run makes a box
@@ -312,8 +330,11 @@ void web_draw_text_px(std::vector<uint32_t>& buf, int bw, int bh, int x, int y,
   float pen = (float)x;
   CharWalk walk(text);
   uint32_t glyph_cp;
+  uint32_t prev_cp = 0;
   while (walk.next(glyph_cp)) {
     if (glyph_cp == '\n') break;
+    if (prev_cp) pen += kern_adj(prev_cp, glyph_cp, f);
+    prev_cp = glyph_cp;
     const Drawn drawn = glyph_for(face, glyph_cp);
     const fonts::Glyph& g = *drawn.g;
     if (g.w && g.h && drawn.cov) {
