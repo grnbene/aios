@@ -1,0 +1,8 @@
+# The same routes, one request at a time (workers: false).
+fn doubled(text) { return decimal(text) * 2 }
+serve_routes({
+  "/slow": fn (req) { sleep(800)  return {"done": true} },
+  "/fast": fn (req) { return {"doubled": doubled(req.query)} },
+  "/len": fn (req) { return {"n": len(req.body)} },
+  "/boom": fn (req) { return error("this route fails") }
+}, {"workers": false})

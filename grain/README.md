@@ -35,15 +35,17 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Area | Functions |
 |---|---|
 | The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep`, `clock`, `time_us` |
-| Numbers | `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
+| Numbers | `a..b` is `range(a, b)`; `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
+| Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`; `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
 | Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists` (relative to the working directory) |
 | Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
 | Processes | `sys_exec(command)` through the system shell, `exec([program, args...])` without one: `{ok, code, output}` |
 | Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); TCP/UDP sockets; a small server (`listen`, `accept`, `read_until`, `write`) |
+| Strings | escapes `\n \t \r \0 \a \b \f \v \e`, `\xHH` (one byte), `\u{1F600}` (a code point, as UTF-8); `utf8_valid(text or bytes)` |
 | Text | `format("{:>8.2f}", x)`, `regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split` (ECMAScript patterns), `upper`, `lower`, `trim`, `split`, `join`, `replace`, `pad_left`, ... |
 | Data | `json_parse`, `json_stringify`, `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
 | Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
-| Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid` |
+| Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_cbc_decrypt(key, iv, data)` (PKCS#7, what `openssl_decrypt` reads; nil when the padding is wrong) and `hash_equals(a, b)` (in constant time, for secrets) |
 | Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
 | Every core | `parallel_map(list, fn)`, `spawn(fn, args...)` -> task, `await(task)`, `task_done(task)` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
@@ -150,6 +152,24 @@ let late = live(db, "SELECT orderno, debtorno FROM salesorders WHERE late = 1")
 ui.table(late.records)    # stays current; nothing else to write
 ```
 
+Values go in as parameters, never pasted into the SQL: each `?` is filled with
+the next value of a list, quoted for you. A string is escaped, `nil` is `NULL`, a
+decimal keeps its digits, and a list becomes `a, b, c` for `IN (?)`.
+
+```grain
+db_query(db, "SELECT * FROM stockmaster WHERE stockid = ? AND units IN (?)", [id, ["each", "box"]])
+db_escape("it's")                     # it\'s  - what mysqli::real_escape_string gives, to build SQL by hand
+db_quote(["a", nil, 1])               # 'a', NULL, 1
+```
+
+Quoting uses backslash escapes, the default `sql_mode`; a server running `NO_BACKSLASH_ESCAPES` needs the values checked by hand. A `?` inside a string, a quoted name or a comment is left alone, and a query
+given no list is sent exactly as written. A big result is built as `rows` and as
+`records` unless you say otherwise, which costs twice the time and memory:
+`db_query(db, sql, [], {"records": false})` (or `"rows": false`) builds one, and
+`{"decimals": true}` returns DECIMAL columns as exact decimals instead of strings
+(see below). The options can follow the SQL directly when there are no parameters:
+`db_query(db, sql, {"records": false})`.
+
 `db_connect` speaks the MySQL wire protocol itself (`mysql_native_password`, and
 `caching_sha2_password`'s fast path), with no client library. `live(db, sql)`
 returns a map whose `rows`, `records`, `columns`, `error` and `changes` are
@@ -159,6 +179,70 @@ redraws, in a window or in every browser at once. Against ASQL a tick is one
 and JOINs, or given as `live(db, sql, {"tables": [...]})`); the query runs only
 when one of them was written. Against another server it runs every tick
 (`every`, default 1 second). `live.runs` counts how often the query itself ran.
+
+## Exact decimals
+
+Money is not a real: `0.1 + 0.2 == 0.3` is false for reals in every language, and a
+price rounded as a real rounds the wrong way half the time. A decimal is exact.
+
+```grain
+let price = decimal("19.99")
+let total = price * 3 + decimal("0.05")     # 60.02
+round(total / 7, 2)                         # 8.57 - half away from zero, as PHP's round() does
+decimal("2.50") == decimal("2.5")           # true: the scale only decides how it prints
+format("{:,.2f}", decimal("1234567.891"))   # 1,234,567.89
+```
+
+A decimal is an integer mantissa (128 bits, 38 digits) and a scale of up to 30. An
+int mixes freely; a real does not, because 0.1 as a real is not 0.1 - say
+`decimal(x)` if you mean it (a real becomes the shortest decimal that reads back as
+it). `+ - %` take the larger scale, `*` adds the scales (rounding past 30), and `/`
+keeps at least 12 places; `dec_div(a, b, places)` picks them. `round(d, places)`
+rounds half away from zero. Overflow and division by zero stop the program with an
+error rather than answering wrongly. They cross into workers, `json_stringify` and
+`db_query(..., {"decimals": true})` with every digit. There is no decimal literal
+yet: write `decimal("0.5")`.
+
+## Programs in several files
+
+```grain
+import "lib/money.gr"        # the same as import("lib/money.gr")
+```
+
+runs another file in the program, once, and what it defines at its top level is
+defined here. The path is relative to the file that imports it (the main program's
+directory for the main program); a file importing its importer, or two files
+importing a third, is fine. `grain build` finds the imports and packs them. A
+mistake inside the file names it: the message while it loads, and the stack trace
+after (its functions are listed as `lib/money.gr:name`). Imports are found when the
+program runs, not when it is checked.
+
+## An API with no page
+
+```grain
+fn doubled(text) { return decimal(text) * 2 }
+serve_routes({
+  "/slow":  fn (req) { sleep(800)  return {"done": true} },
+  "/stock": fn (req) { return {"doubled": doubled(req.query)} }
+})
+```
+
+`grain serve api.gr` answers `/stock?2.5` with JSON, and anything else with 404. A
+route gets `req.method`, `req.path`, `req.query`, `req.body`, `req.headers` (names
+lowercased: `req.headers.authorization`) and `req.remote` (the client's address), and returns a map
+(or list, or string): `{"status": 201, "content_type": "text/csv", "body": "..."}`
+sets the response, otherwise the value is sent as JSON.
+
+Each request runs in a worker VM of its own, on its own thread, the way
+`parallel_map` workers do: a route that takes eight seconds does not hold up the
+others. What follows from that is the workers' rule - the handler and the globals
+and functions it names are copied in as they are when the request arrives, so it can
+read the program's values but what it changes is its own; a database connection
+cannot be copied, so open it inside the handler. Routes that must share the
+program's variables run one request at a time with `serve_routes(routes,
+{"workers": false})`. The same options work on a page: `ui.pane({"routes": {...},
+"workers": true, ...})`. `grain serve --max-body 10m` (or `GRAIN_MAX_BODY`) sets the
+largest request body, 1 MB by default; a bigger one gets 413.
 
 ## One program, a window or a web page
 

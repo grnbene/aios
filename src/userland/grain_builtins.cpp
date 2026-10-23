@@ -84,6 +84,11 @@ Value bi_int(Vm&, std::vector<Value>& args, std::string& error) {
   const Value& v = args[0];
   if (v.type == Type::Int) return v;
   if (v.type == Type::Real) return Value::integer((int64_t)v.d);
+  if (v.type == Type::Decimal) {
+    int64_t n = 0;
+    if (!decimal_to_int(v, n)) { error = "int(): the decimal does not fit in 64 bits"; return Value::nil(); }
+    return Value::integer(n);
+  }
   if (v.type == Type::Bool) return Value::integer(v.b ? 1 : 0);
   if (v.type == Type::Str) {
     const std::string& s = v.str();
@@ -108,6 +113,7 @@ Value bi_int(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 Value bi_real(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type == Type::Decimal) return Value::real(decimal_to_double(args[0]));
   const Value& v = args[0];
   if (v.is_number()) return Value::real(v.as_double());
   if (v.type == Type::Str) {
@@ -338,9 +344,46 @@ Value bi_chr(Vm&, std::vector<Value>& args, std::string& error) {
 // --- arithmetic ------------------------------------------------------------
 
 Value bi_abs(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "abs")) return Value::nil();
+  if (!want_numeric(args[0], error, "abs")) return Value::nil();
+  if (args[0].type == Type::Decimal) {
+    Value r = args[0];
+    if (decimal_compare(r, Value::integer(0)) < 0) decimal_negate(args[0], r, error);
+    return r;
+  }
   if (args[0].type == Type::Int) return Value::integer(args[0].i < 0 ? -args[0].i : args[0].i);
   return Value::real(std::fabs(args[0].d));
+}
+
+// utf8_valid(text or bytes) -> bool: is every byte part of well-formed UTF-8
+// (no overlong forms, no surrogates, nothing past U+10FFFF)? A string can hold
+// any bytes, so this is how a program asks before it hands one to something
+// that insists on text.
+Value bi_utf8_valid(Vm&, std::vector<Value>& args, std::string& error) {
+  const uint8_t* p = nullptr;
+  size_t n = 0;
+  if (args[0].type == Type::Str) { p = (const uint8_t*)args[0].str().data(); n = args[0].str().size(); }
+  else if (args[0].type == Type::Bytes) { p = args[0].bytes_data().data(); n = args[0].bytes_data().size(); }
+  else { error = std::string("utf8_valid() wants a string or bytes, got a ") + type_name(args[0].type); return Value::nil(); }
+  size_t i = 0;
+  while (i < n) {
+    const uint8_t c = p[i];
+    size_t len;
+    uint32_t cp;
+    if (c < 0x80) { ++i; continue; }
+    else if (c >= 0xC2 && c <= 0xDF) { len = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07; }
+    else return Value::boolean(false);
+    if (i + len > n) return Value::boolean(false);
+    for (size_t k = 1; k < len; ++k) {
+      if ((p[i + k] & 0xC0) != 0x80) return Value::boolean(false);
+      cp = (cp << 6) | (p[i + k] & 0x3F);
+    }
+    if ((len == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)))
+      return Value::boolean(false);
+    i += len;
+  }
+  return Value::boolean(true);
 }
 
 // `/` always gives a real, so whole-number division is its own call. It
@@ -358,13 +401,85 @@ Value bi_idiv(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::integer(args[0].i / args[1].i);
 }
 
+// ---- import --------------------------------------------------------------------------------------
+
+std::string import_dir(const std::string& path) {
+  const size_t slash = path.find_last_of("/\\");
+  return slash == std::string::npos ? "" : path.substr(0, slash);
+}
+
+// a/b/../c.gr -> a/c.gr, ./x.gr -> x.gr: one spelling per file, so importing it two ways runs it once.
+std::string import_normalize(const std::string& path) {
+  std::vector<std::string> parts;
+  size_t i = 0;
+  const bool absolute = !path.empty() && path[0] == '/';
+  while (i <= path.size()) {
+    size_t j = path.find('/', i);
+    if (j == std::string::npos) j = path.size();
+    const std::string part = path.substr(i, j - i);
+    if (part == "..") { if (!parts.empty() && parts.back() != "..") parts.pop_back(); else if (!absolute) parts.push_back(part); }
+    else if (!part.empty() && part != ".") parts.push_back(part);
+    i = j + 1;
+  }
+  std::string out = absolute ? "/" : "";
+  for (size_t k = 0; k < parts.size(); ++k) out += (k ? "/" : "") + parts[k];
+  return out;
+}
+
+// import "lib.gr": runs another file in this program, once, so its functions and values are defined here.
+// The path is relative to the file that imports it. Everything it defines at its top level is global, as if it
+// had been written in place; a name it shares with the program is the later definition's. An error inside it
+// names it: in the message while it loads, and in the stack trace after (its functions are listed as lib.gr:name).
+Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "import")) return Value::nil();
+  std::string path = args[0].str();
+  if (path.empty()) { error = "import(): an empty path"; return Value::nil(); }
+  if (path[0] != '/' && !(path.size() > 2 && path[1] == ':') && !vm.base_dir.empty()) path = vm.base_dir + "/" + path;
+  path = import_normalize(path);
+  for (const auto& done : vm.imported) if (done == path) return Value::nil();
+  std::string source, why;
+  if (!(vm.packed_source && vm.packed_source(path, source))) {
+    if (!vm.files) { error = "import(): this program has no file storage to import \"" + path + "\" from"; return Value::nil(); }
+    if (!vm.files->read(path, source, why)) { error = "import(\"" + path + "\"): " + why; return Value::nil(); }
+  }
+  vm.imported.push_back(path);   // before it runs: a file that imports its importer finds it already loaded
+  CompileResult compiled = compile_source(source, path, false);
+  if (!compiled.ok()) {
+    error = "import(\"" + path + "\") does not compile:";
+    for (const auto& d : compiled.errors) error += "\n  " + path + ":" + std::to_string(d.line) + ": " + d.message;
+    return Value::nil();
+  }
+  // Name its functions after the file, so a trace through them says where they are.
+  std::vector<FnObj*> todo;
+  for (const Value& c : compiled.script->chunk.constants)
+    if (c.type == Type::Fn && c.obj && !c.obj->is_closure) todo.push_back(static_cast<FnObj*>(c.obj.get()));
+  while (!todo.empty()) {
+    FnObj* f = todo.back();
+    todo.pop_back();
+    f->name = path + ":" + f->name;
+    for (const Value& c : f->chunk.constants)
+      if (c.type == Type::Fn && c.obj && !c.obj->is_closure) todo.push_back(static_cast<FnObj*>(c.obj.get()));
+  }
+  const std::string saved_dir = vm.base_dir;
+  vm.base_dir = import_dir(path);
+  Value ignored = vm.call(Value::object(Type::Fn, compiled.script), {}, why);
+  vm.base_dir = saved_dir;
+  if (!why.empty()) { error = "import(\"" + path + "\"): " + why; return Value::nil(); }
+  (void)ignored;
+  return Value::nil();
+}
+
 Value bi_min(Vm&, std::vector<Value>& args, std::string& error) {
   const Value* best = nullptr;
-  auto consider = [&](const Value& v) { if (!best || v.as_double() < best->as_double()) best = &v; };
+  auto consider = [&](const Value& v) {
+    if (!best) { best = &v; return; }
+    const bool exact = (v.type == Type::Decimal || best->type == Type::Decimal) && is_exact_number(v) && is_exact_number(*best);
+    if (exact ? decimal_compare(v, *best) < 0 : v.as_double() < best->as_double()) best = &v;
+  };
   if (args.size() == 1 && args[0].type == Type::List) {
-    for (const Value& v : args[0].list_items()) { if (!want_number(v, error, "min")) return Value::nil(); consider(v); }
+    for (const Value& v : args[0].list_items()) { if (!want_numeric(v, error, "min")) return Value::nil(); consider(v); }
   } else {
-    for (const Value& v : args) { if (!want_number(v, error, "min")) return Value::nil(); consider(v); }
+    for (const Value& v : args) { if (!want_numeric(v, error, "min")) return Value::nil(); consider(v); }
   }
   if (!best) { error = "min() of nothing"; return Value::nil(); }
   return *best;
@@ -372,23 +487,37 @@ Value bi_min(Vm&, std::vector<Value>& args, std::string& error) {
 
 Value bi_max(Vm&, std::vector<Value>& args, std::string& error) {
   const Value* best = nullptr;
-  auto consider = [&](const Value& v) { if (!best || v.as_double() > best->as_double()) best = &v; };
+  auto consider = [&](const Value& v) {
+    if (!best) { best = &v; return; }
+    const bool exact = (v.type == Type::Decimal || best->type == Type::Decimal) && is_exact_number(v) && is_exact_number(*best);
+    if (exact ? decimal_compare(v, *best) > 0 : v.as_double() > best->as_double()) best = &v;
+  };
   if (args.size() == 1 && args[0].type == Type::List) {
-    for (const Value& v : args[0].list_items()) { if (!want_number(v, error, "max")) return Value::nil(); consider(v); }
+    for (const Value& v : args[0].list_items()) { if (!want_numeric(v, error, "max")) return Value::nil(); consider(v); }
   } else {
-    for (const Value& v : args) { if (!want_number(v, error, "max")) return Value::nil(); consider(v); }
+    for (const Value& v : args) { if (!want_numeric(v, error, "max")) return Value::nil(); consider(v); }
   }
   if (!best) { error = "max() of nothing"; return Value::nil(); }
   return *best;
 }
 
 Value bi_floor(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "floor")) return Value::nil();
+  if (!want_numeric(args[0], error, "floor")) return Value::nil();
+  if (args[0].type == Type::Decimal) {
+    int64_t t = 0;
+    if (!decimal_to_int(args[0], t)) { error = "floor(): the decimal does not fit in 64 bits"; return Value::nil(); }
+    return Value::integer(decimal_compare(args[0], decimal_from_int(t)) < 0 ? t - 1 : t);
+  }
   return Value::integer((int64_t)std::floor(args[0].as_double()));
 }
 
 Value bi_ceil(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "ceil")) return Value::nil();
+  if (!want_numeric(args[0], error, "ceil")) return Value::nil();
+  if (args[0].type == Type::Decimal) {
+    int64_t t = 0;
+    if (!decimal_to_int(args[0], t)) { error = "ceil(): the decimal does not fit in 64 bits"; return Value::nil(); }
+    return Value::integer(decimal_compare(args[0], decimal_from_int(t)) > 0 ? t + 1 : t);
+  }
   return Value::integer((int64_t)std::ceil(args[0].as_double()));
 }
 
@@ -974,7 +1103,21 @@ Value bi_from_entries(Vm&, std::vector<Value>& args, std::string& error) {
 // --- advanced math ---------------------------------------------------------
 
 Value bi_round(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "round")) return Value::nil();
+  if (!want_numeric(args[0], error, "round")) return Value::nil();
+  if (args[0].type == Type::Decimal) {
+    // exact, half away from zero: round(2.675d, 2) is 2.68, which no real can say
+    int places = 0;
+    if (args.size() > 1) {
+      if (!want_number(args[1], error, "round")) return Value::nil();
+      places = (int)args[1].as_int();
+    }
+    Value r;
+    if (!decimal_round(args[0], places, r, error)) return Value::nil();
+    if (args.size() > 1) return r;
+    int64_t n = 0;
+    if (!decimal_to_int(r, n)) { error = "round(): the decimal does not fit in 64 bits"; return Value::nil(); }
+    return Value::integer(n);
+  }
   double d = args[0].as_double();
   if (args.size() > 1) {
     if (!want_number(args[1], error, "round")) return Value::nil();
@@ -986,12 +1129,18 @@ Value bi_round(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 Value bi_trunc(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "trunc")) return Value::nil();
+  if (!want_numeric(args[0], error, "trunc")) return Value::nil();
+  if (args[0].type == Type::Decimal) {
+    int64_t n = 0;
+    if (!decimal_to_int(args[0], n)) { error = "trunc(): the decimal does not fit in 64 bits"; return Value::nil(); }
+    return Value::integer(n);
+  }
   return Value::integer((int64_t)std::trunc(args[0].as_double()));
 }
 
 Value bi_sign(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_number(args[0], error, "sign")) return Value::nil();
+  if (!want_numeric(args[0], error, "sign")) return Value::nil();
+  if (args[0].type == Type::Decimal) return Value::integer(decimal_compare(args[0], Value::integer(0)));
   double d = args[0].as_double();
   if (d > 0.0) return Value::integer(1);
   if (d < 0.0) return Value::integer(-1);
@@ -1425,6 +1574,7 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
     case Type::Nil: out += "null"; break;
     case Type::Bool: out += v.b ? "true" : "false"; break;
     case Type::Int: out += std::to_string(v.i); break;
+    case Type::Decimal: out += decimal_text(v); break;   // a JSON number with every digit it has
     case Type::Real: {
       char buf[64];
       if (std::isnan(v.d) || std::isinf(v.d)) {
@@ -5819,12 +5969,12 @@ void install_core_builtins(Vm& vm) {
   vm.define_global("E", Value::real(2.71828182845904523536));
   install_hash_builtins(vm);
   install_bytes_builtins(vm);
-  install_decimal_builtins(vm);
   install_regex_builtins(vm);
   install_time_builtins(vm);
   install_text_builtins(vm);
   install_path_builtins(vm);
   install_parallel_builtins(vm);
+  install_decimal_builtins(vm);
 
   vm.define_native("print", 0, -1, bi_print);
   vm.define_native("len", 1, 1, bi_len);
@@ -5900,6 +6050,8 @@ void install_core_builtins(Vm& vm) {
   // Math
   vm.define_native("abs", 1, 1, bi_abs);
   vm.define_native("idiv", 2, 2, bi_idiv);
+  vm.define_native("import", 1, 1, bi_import);
+  vm.define_native("utf8_valid", 1, 1, bi_utf8_valid);
   vm.define_native("min", 1, -1, bi_min);
   vm.define_native("max", 1, -1, bi_max);
   vm.define_native("floor", 1, 1, bi_floor);

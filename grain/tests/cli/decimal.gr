@@ -1,0 +1,92 @@
+# Exact decimals, string escapes, a..b ranges and utf8_valid. Each check compares with a value worked out by hand.
+let failures = 0
+let checks = 0
+fn check(label, got, want) {
+  checks = checks + 1
+  if got == want and type(got) == type(want) {
+    print("  ok   ", label)
+  } else {
+    failures = failures + 1
+    print("  WRONG", label, "got", repr(got), "wanted", repr(want))
+  }
+}
+fn fails(f) { return not pcall(f).ok }
+fn d(s) { return decimal(s) }
+
+print("decimal")
+check("0.1 + 0.2", str(d("0.1") + d("0.2")), "0.3")
+check("0.1 + 0.2 == 0.3", d("0.1") + d("0.2") == d("0.3"), true)
+check("reals still disagree", 0.1 + 0.2 == 0.3, false)
+check("keeps its scale", str(d("1.50")), "1.50")
+check("1.50 == 1.5", d("1.50") == d("1.5"), true)
+check("equals an int", d("3.0") == 3, true)
+check("never equals a real", d("1.5") == 1.5, false)
+check("scale", scale(d("1.250")), 3)
+check("multiply adds scales", str(d("19.99") * 3), "59.97")
+check("multiply two", str(d("1.5") * d("2.25")), "3.375")
+check("subtract", str(7 - d("19.99")), "-12.99")
+check("negate", str(-d("2.5")), "-2.5")
+check("divide keeps 12 places", str(d("10") / 3), "3.333333333333")
+check("dec_div", str(dec_div(10, 3, 2)), "3.33")
+check("dec_div rounds half up", str(dec_div(d("7.00"), 8, 1)), "0.9")
+check("dec_div negative", str(dec_div(-7, 8, 1)), "-0.9")
+check("modulo keeps the dividend's sign", str(d("-7.5") % 2), "-1.5")
+check("round half up", str(round(d("2.675"), 2)), "2.68")
+check("round half away from zero", str(round(d("-2.675"), 2)), "-2.68")
+check("round to an int", round(d("2.5")), 3)
+check("round to an int, negative", round(d("-2.5")), -3)
+check("round keeps a coarser scale", str(round(d("1.5"), 4)), "1.5")
+check("floor", floor(d("-1.5")), -2)
+check("ceil", ceil(d("-1.5")), -1)
+check("trunc", trunc(d("-3.9")), -3)
+check("abs", str(abs(d("-4.20"))), "4.20")
+check("max mixes ints and decimals", str(max(d("19.99"), 3, d("20"))), "20")
+check("min of a list", str(min([d("19.99"), 3])), "3")
+check("compare", d("19.99") > 19 and d("19.99") < d("19.991"), true)
+check("sign", sign(d("-0.001")), -1)
+check("int()", int(d("-3.9")), -3)
+check("real()", real(d("19.99")), 19.99)
+check("from a real is its shortest form", str(decimal(0.1)), "0.1")
+check("from an exponent", str(decimal("1e3")), "1000")
+check("from a small exponent", str(decimal("2.5E-2")), "0.025")
+check("padded to a scale", str(decimal(2, 3)), "2.000")
+check("rounded to a scale", str(decimal("1.005", 2)), "1.01")
+check("json", json_stringify({p: d("19.90")}), "{\"p\":19.90}")
+check("format .2f is exact", format("{:.2f}", d("2.675")), "2.68")
+check("format pads", format("{:.3f}", d("1.5")), "1.500")
+check("format groups", format("{:>12,.2f}", d("1234567.891")), "1,234,567.89")
+check("format negative", format("{:.1f}", d("-0.05")), "-0.1")
+check("37 digits fit", str(d("9999999999999999999999999999999999999") + 1), "10000000000000000000000000000000000000")
+check("mixing with a real fails", fails(fn () { return d("1") + 0.5 }), true)
+check("overflow fails", fails(fn () { return d("99999999999999999999999999999999999999") * 100 }), true)
+check("division by zero fails", fails(fn () { return d("1") / 0 }), true)
+check("junk fails", fails(fn () { return decimal("1.2.3") }), true)
+check("a worker can use one", parallel_map([1, 2, 3], fn (x) { return decimal("0.5") * x }), [d("0.5"), d("1.0"), d("1.5")])
+
+print("integer division")
+check("idiv", idiv(-7, 2), -3)
+
+print("string escapes")
+check("\\x", "\x41\x7a", "Az")
+check("\\u", "\u{e9}", "é")
+check("\\u astral", len("\u{1F600}"), 4)
+check("\\0 is a byte", len("a\0b"), 3)
+check("\\e", "\e[0m", chr(27) + "[0m")
+check("\\v \\f", "\v\f", chr(11) + chr(12))
+
+print("ranges")
+check("a..b", 0..4, [0, 1, 2, 3])
+check("binds looser than +", (1..2 + 2), [1, 2, 3])
+check("in a for", (fn () { let t = 0  for i in 1..5 { t += i }  return t })(), 10)
+check("empty", len(3..3), 0)
+check("field before a range", ({n: 3}).n..5, [3, 4])
+
+print("utf8")
+check("valid", utf8_valid("héllo \u{1F600}"), true)
+check("lone continuation", utf8_valid("\x80"), false)
+check("overlong", utf8_valid("\xc0\x80"), false)
+check("surrogate", utf8_valid("\xed\xa0\x80"), false)
+check("truncated", utf8_valid("\xe2\x82"), false)
+check("bytes", utf8_valid(bytes("abc")), true)
+
+if failures == 0 { print("decimal:", checks, "checks, all agreed") } else { print("decimal:", failures, "of", checks, "WRONG") }

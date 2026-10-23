@@ -81,10 +81,29 @@ bool render(const Value& v, const Spec& sp, std::string& out, std::string& error
     body = v.to_text();
     if (sp.precision >= 0 && static_cast<int>(body.size()) > sp.precision) body.resize(static_cast<size_t>(sp.precision));
   } else {
-    if (!v.is_number()) { error = std::string("format(): {:") + t + "} wants a number, got a " + type_name(v.type); return false; }
-    const double d = v.as_double();
-    const bool neg = v.type == Type::Int ? v.i < 0 : std::signbit(d);
-    if (t == 'd' || t == 'x' || t == 'X' || t == 'o' || t == 'b') {
+    if (!v.is_number() && v.type != Type::Decimal) { error = std::string("format(): {:") + t + "} wants a number, got a " + type_name(v.type); return false; }
+    const double d = v.type == Type::Decimal ? decimal_to_double(v) : v.as_double();
+    const bool neg = v.type == Type::Decimal ? decimal_compare(v, Value::integer(0)) < 0
+                   : v.type == Type::Int ? v.i < 0 : std::signbit(d);
+    if (v.type == Type::Decimal && (t == 'f' || (!t && sp.precision >= 0))) {
+      // exact: {:.2f} of a decimal rounds half away from zero on its digits, not on a real's
+      Value r = v;
+      if (sp.precision >= 0 && !decimal_round(v, sp.precision, r, error)) return false;
+      body = decimal_text(r);
+      if (!body.empty() && body[0] == '-') body.erase(0, 1);
+      if (sp.precision >= 0) {
+        const size_t dot = body.find('.');
+        const size_t have = dot == std::string::npos ? 0 : body.size() - dot - 1;
+        if (have < (size_t)sp.precision) {
+          if (dot == std::string::npos && sp.precision > 0) body += ".";
+          body.append((size_t)sp.precision - have, '0');
+        }
+      }
+      if (sp.group) {
+        const size_t dot = body.find('.');
+        body = group_thousands(body.substr(0, dot)) + (dot == std::string::npos ? "" : body.substr(dot));
+      }
+    } else if (t == 'd' || t == 'x' || t == 'X' || t == 'o' || t == 'b') {
       if (v.type != Type::Int && d != std::floor(d)) { error = std::string("format(): {:") + t + "} wants a whole number, got " + v.to_text(); return false; }
       const int64_t n = v.type == Type::Int ? v.i : static_cast<int64_t>(d);
       const uint64_t mag = n < 0 ? 0 - static_cast<uint64_t>(n) : static_cast<uint64_t>(n);

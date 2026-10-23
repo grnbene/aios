@@ -56,6 +56,10 @@ grain_case(cli.sys ${CLI_CASES} 0 run sys.gr)
 grain_case(cli.files WRITES:${CLI_CASES} 0 run files.gr)
 grain_case(cli.stdlib WRITES:${CLI_CASES} 0 run stdlib.gr)
 grain_case(cli.exec ${CLI_CASES} 0 run exec.gr)
+grain_case(cli.decimal ${CLI_CASES} 0 run decimal.gr)                    # decimals, string escapes, a..b, utf8_valid
+grain_case(cli.decimal.interp ${CLI_CASES} 0 --no-jit run decimal.gr)
+grain_case(cli.db_quote ${CLI_CASES} 0 run db_quote.gr)
+grain_case(cli.modules ${CLI_CASES} 0 run modules.gr)                    # import
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
 grain_case(cli.parallel ${CLI_CASES} 0 run parallel.gr)                # parallel_map, spawn, await
@@ -117,8 +121,6 @@ set(TOOLS ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 grain_case(tools.test ${TOOLS}/runner 1 test)
 # The bytes type and its typed reads, writes, pack and unpack.
 grain_case(lowlevel.bytes ${CMAKE_CURRENT_SOURCE_DIR}/bytes 0 test)
-# Decimals: exact arithmetic, rounding modes and formatting on decimal text; \x escapes.
-grain_case(std.decimal ${CMAKE_CURRENT_SOURCE_DIR}/decimal 0 test)
 # A plugin written in C++ against include/grain_plugin.h, built here and loaded by a grain
 # program that sits beside it (the test is copied next to the library it loads).
 if(NOT WIN32)
@@ -143,6 +145,8 @@ endif()
 if(NOT WIN32 AND Python3_Interpreter_FOUND)
   add_test(NAME grain.web.ui COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/web_ui_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr)
   set_tests_properties(grain.web.ui PROPERTIES TIMEOUT 60)
+  add_test(NAME grain.web.api COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/api_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/api.gr)
+  set_tests_properties(grain.web.api PROPERTIES TIMEOUT 60)
   add_test(NAME grain.web.native_client COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/native_client_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr)
   set_tests_properties(grain.web.native_client PROPERTIES TIMEOUT 120)
   add_test(NAME grain.web.widgets COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/widgets_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/../examples/widgets.gr)

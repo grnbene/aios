@@ -1,0 +1,72 @@
+decimal
+  ok    0.1 + 0.2
+  ok    0.1 + 0.2 == 0.3
+  ok    reals still disagree
+  ok    keeps its scale
+  ok    1.50 == 1.5
+  ok    equals an int
+  ok    never equals a real
+  ok    scale
+  ok    multiply adds scales
+  ok    multiply two
+  ok    subtract
+  ok    negate
+  ok    divide keeps 12 places
+  ok    dec_div
+  ok    dec_div rounds half up
+  ok    dec_div negative
+  ok    modulo keeps the dividend's sign
+  ok    round half up
+  ok    round half away from zero
+  ok    round to an int
+  ok    round to an int, negative
+  ok    round keeps a coarser scale
+  ok    floor
+  ok    ceil
+  ok    trunc
+  ok    abs
+  ok    max mixes ints and decimals
+  ok    min of a list
+  ok    compare
+  ok    sign
+  ok    int()
+  ok    real()
+  ok    from a real is its shortest form
+  ok    from an exponent
+  ok    from a small exponent
+  ok    padded to a scale
+  ok    rounded to a scale
+  ok    json
+  ok    format .2f is exact
+  ok    format pads
+  ok    format groups
+  ok    format negative
+  ok    37 digits fit
+  ok    mixing with a real fails
+  ok    overflow fails
+  ok    division by zero fails
+  ok    junk fails
+  ok    a worker can use one
+integer division
+  ok    idiv
+string escapes
+  ok    \x
+  ok    \u
+  ok    \u astral
+  ok    \0 is a byte
+  ok    \e
+  ok    \v \f
+ranges
+  ok    a..b
+  ok    binds looser than +
+  ok    in a for
+  ok    empty
+  ok    field before a range
+utf8
+  ok    valid
+  ok    lone continuation
+  ok    overlong
+  ok    surrogate
+  ok    truncated
+  ok    bytes
+decimal: 66 checks, all agreed

@@ -31,6 +31,13 @@ inline bool want_number(const Value& v, std::string& error, const char* who) {
   return false;
 }
 
+// A number or an exact decimal: for the functions that take either (abs, min, max, round, ...).
+inline bool want_numeric(const Value& v, std::string& error, const char* who) {
+  if (v.is_number() || v.type == Type::Decimal) return true;
+  error = std::string(who) + "() wants a number, got a " + type_name(v.type);
+  return false;
+}
+
 // A pane drawn and driven by native code instead of grain callbacks (a face
 // pane, grain_face.cpp). It still belongs to the VM that made it, and the
 // closures it calls are that VM's.

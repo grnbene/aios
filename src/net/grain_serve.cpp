@@ -317,6 +317,10 @@ bool grain_serve_request(const GrainSite& site, const GrainRequest& req, GrainRe
   std::vector<std::string> printed;
   vm.sink = &printed;
   vm.files = &files;
+  {   // import "lib.gr" from the script's own directory
+    const size_t slash = site.app.find_last_of('/');
+    if (slash != std::string::npos) vm.base_dir = site.app.substr(0, slash);
+  }
   vm.step_limit = site.max_steps;
   g::install_core_builtins(vm);
   g::install_http_builtins(vm);

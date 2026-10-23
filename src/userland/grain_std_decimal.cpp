@@ -1,442 +1,303 @@
-// grain's decimals: exact base-10 numbers for money and quantities, carried as text so they go
-// to and from a database or JSON as they are.
+// Exact decimal numbers for grain: money, quantities, anything where 0.1 + 0.2 must be 0.3.
 //
-//   decimal(v)                    v as a decimal ("12.50" -> "12.5", 3 -> "3", 0.1 -> "0.1"), or nil
-//                                 when v is not a number; spaces around it are allowed
-//   decimal_prefix(s)             the number a string starts with, read the way MySQL and PHP read one
-//                                 ("12abc", " 7", "1e3x"): {value, rest}, or nil when it starts with none
-//   dec_add(a, b) dec_sub dec_mul exact
-//   dec_div(a, b, places, mode?)  the quotient rounded to that many places
-//   dec_cmp(a, b)                 -1, 0 or 1
-//   dec_round(a, places, mode?)   modes: "half_up" (the default: halves away from zero), "half_even",
-//                                 "down" (toward zero), "floor", "ceil"
-//   dec_round_sig(a, digits)      to that many significant digits, halves away from zero
-//   dec_format(a, places)         fixed places, rounded half up: dec_format("2.675", 2) is "2.68",
-//                                 dec_format("-0.004", 2) is "0.00"
+//   let price = decimal("19.99")
+//   let total = price * 3 + decimal("0.05")      # 60.02, exactly
+//   round(total / 7, 2)                          # half away from zero, as PHP's round() does
+//   decimal("2.50") == 2.5d                      # (no literal yet: decimal("2.5"))  equal: 2.50 is 2.5
 //
-// An operand is a decimal string, an int, or a real (taken at its shortest exact text, so 0.1 is
-// "0.1"). Results are strings in one form: no exponent, no trailing zeros after the point, no "-0".
-// A string that is not a number is an error naming the function; it never counts as 0.
+// A decimal is an integer mantissa (128 bits, 38 digits) and a scale (digits after the point, 0..30). The
+// rules, so a result is never a surprise:
+//   - + - and % align to the larger scale; * adds the scales (past 30 it rounds half-up to 30)
+//   - / keeps at least 12 digits (more if an operand has them), rounded half away from zero; dec_div(a, b, n)
+//     picks the scale
+//   - an int mixes freely (it is a decimal with scale 0); a real does not - decimal(x) says that is meant
+//   - 1.50 == 1.5; the scale only decides how it prints, so a price keeps its two places
+//   - overflow past 38 digits and division by zero stop the program with an error, never a wrong answer
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
 
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
 
 namespace aios::userland::grain {
+namespace {
+
+constexpr int kMaxScale = 30;
+constexpr int kMinDivScale = 12;
+
+using I = AIOS_INT128;
+
+// 10^n for n up to 38 (10^38 < 2^127).
+I pow10(int n) {
+  I r = 1;
+  for (int k = 0; k < n; ++k) r = r * 10;
+  return r;
+}
+
+I iabs(I v) { return v < 0 ? -v : v; }
+
+// n / d rounded half away from zero.
+I round_div(I n, I d) {
+  I q = n / d, r = n % d;
+  if (iabs(r) * 2 >= iabs(d)) q += ((n < 0) != (d < 0)) ? -1 : 1;
+  return q;
+}
+
+struct Dec { I m = 0; int s = 0; };
+
+bool get(const Value& v, Dec& d) {
+  if (v.type == Type::Int) { d.m = v.i; d.s = 0; return true; }
+  if (v.type == Type::Decimal) {
+    auto* o = static_cast<const DecimalObj*>(v.obj.get());
+    d.m = o->mant; d.s = o->scale;
+    return true;
+  }
+  return false;
+}
+
+Value make(I m, int s) { return Value::object(Type::Decimal, std::make_shared<DecimalObj>(m, s)); }
+
+bool mul_checked(I a, I b, I& out) { return !__builtin_mul_overflow(a, b, &out); }
+
+// The mantissa of m (at scale `from`) at scale `to`; false on overflow.
+bool rescale(I m, int from, int to, I& out) {
+  if (to == from) { out = m; return true; }
+  if (to > from) return mul_checked(m, pow10(to - from), out);
+  out = round_div(m, pow10(from - to));
+  return true;
+}
+
+bool overflow(std::string& error) { error = "decimal overflow (more than 38 digits)"; return false; }
+
+}  // namespace
+
+Value decimal_from_int(int64_t v) { return make(v, 0); }
+
+std::string decimal_text(const Value& v) {
+  Dec d;
+  if (!get(v, d)) return "?";
+  const bool neg = d.m < 0;
+  I a = iabs(d.m);
+  std::string digits;
+  if (a == 0) digits = "0";
+  while (a > 0) { digits.insert(digits.begin(), (char)('0' + (int)(a % 10))); a /= 10; }
+  if (d.s > 0) {
+    if ((int)digits.size() <= d.s) digits.insert(0, (size_t)(d.s + 1 - (int)digits.size()), '0');
+    digits.insert(digits.size() - (size_t)d.s, ".");
+  }
+  return neg ? "-" + digits : digits;
+}
+
+bool decimal_parse(const std::string& text, Value& out, std::string& error) {
+  size_t i = 0, n = text.size();
+  while (i < n && (text[i] == ' ' || text[i] == '\t')) ++i;
+  while (n > i && (text[n - 1] == ' ' || text[n - 1] == '\t')) --n;
+  bool neg = false;
+  if (i < n && (text[i] == '-' || text[i] == '+')) neg = text[i++] == '-';
+  I m = 0;
+  int scale = 0, digits = 0;
+  bool point = false;
+  for (; i < n && text[i] != 'e' && text[i] != 'E'; ++i) {
+    const char c = text[i];
+    if (c == '.' && !point) { point = true; continue; }
+    if (c < '0' || c > '9') { error = "'" + text + "' is not a decimal number"; return false; }
+    ++digits;
+    if (__builtin_mul_overflow(m, (I)10, &m) || __builtin_add_overflow(m, (I)(c - '0'), &m)) return overflow(error);
+    if (point) ++scale;
+  }
+  if (digits == 0) { error = "'" + text + "' is not a decimal number"; return false; }
+  int exp = 0;
+  if (i < n) {   // 1e3, 2.5E-2
+    ++i;
+    bool eneg = false;
+    if (i < n && (text[i] == '-' || text[i] == '+')) eneg = text[i++] == '-';
+    if (i >= n) { error = "'" + text + "' is not a decimal number"; return false; }
+    for (; i < n; ++i) {
+      if (text[i] < '0' || text[i] > '9' || exp > 1000) { error = "'" + text + "' is not a decimal number"; return false; }
+      exp = exp * 10 + (text[i] - '0');
+    }
+    if (eneg) exp = -exp;
+  }
+  scale -= exp;
+  if (scale < 0) {   // 1e3: whole digits
+    I scaled;
+    if (-scale > 38 || !mul_checked(m, pow10(-scale), scaled)) return overflow(error);
+    m = scaled;
+    scale = 0;
+  }
+  while (scale > kMaxScale) {   // 0.1234...: more places than a decimal keeps - rounded, like everything else
+    m = round_div(m, 10);
+    --scale;
+  }
+  out = make(neg ? -m : m, scale);
+  return true;
+}
+
+bool decimal_negate(const Value& a, Value& out, std::string&) {
+  Dec x;
+  get(a, x);
+  out = make(-x.m, x.s);
+  return true;
+}
+
+int decimal_compare(const Value& a, const Value& b) {
+  Dec x, y;
+  get(a, x);
+  get(b, y);
+  const int s = std::max(x.s, y.s);
+  I xm, ym;
+  const bool xo = !rescale(x.m, x.s, s, xm), yo = !rescale(y.m, y.s, s, ym);
+  if (xo || yo) {   // one side is too big to line up: it is the larger in magnitude
+    if (xo && yo) return 0;
+    return xo ? (x.m < 0 ? -1 : 1) : (y.m < 0 ? 1 : -1);
+  }
+  return xm < ym ? -1 : xm > ym ? 1 : 0;
+}
+
+bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::string& error) {
+  Dec x, y;
+  if (!get(a, x) || !get(b, y)) {
+    error = std::string("cannot mix a decimal with a ") + type_name(a.type == Type::Decimal ? b.type : a.type) +
+            " (use decimal(x) to make it exact)";
+    return false;
+  }
+  switch (op) {
+    case '+': case '-': {
+      const int s = std::max(x.s, y.s);
+      I xm, ym, r;
+      if (!rescale(x.m, x.s, s, xm) || !rescale(y.m, y.s, s, ym)) return overflow(error);
+      if (op == '+' ? __builtin_add_overflow(xm, ym, &r) : __builtin_sub_overflow(xm, ym, &r)) return overflow(error);
+      out = make(r, s);
+      return true;
+    }
+    case '*': {
+      I r;
+      if (!mul_checked(x.m, y.m, r)) return overflow(error);
+      int s = x.s + y.s;
+      while (s > kMaxScale) { r = round_div(r, 10); --s; }
+      out = make(r, s);
+      return true;
+    }
+    case '/': {
+      if (y.m == 0) { error = "division by zero"; return false; }
+      const int s = std::max({kMinDivScale, x.s, y.s});
+      // (x.m / 10^x.s) / (y.m / 10^y.s) at scale s = x.m * 10^(s - x.s + y.s) / y.m
+      I num;
+      const int up = s - x.s + y.s;
+      if (up > 38 || !mul_checked(x.m, pow10(up), num)) return overflow(error);
+      out = make(round_div(num, y.m), s);
+      return true;
+    }
+    case '%': {
+      if (y.m == 0) { error = "modulo by zero"; return false; }
+      const int s = std::max(x.s, y.s);
+      I xm, ym;
+      if (!rescale(x.m, x.s, s, xm) || !rescale(y.m, y.s, s, ym)) return overflow(error);
+      out = make(ym == -1 ? 0 : xm % ym, s);
+      return true;
+    }
+  }
+  error = "unknown decimal operator";
+  return false;
+}
+
+bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
+  Dec d;
+  if (!get(v, d)) { error = "round() wants a decimal"; return false; }
+  if (places < 0 || places > kMaxScale) { error = "a decimal rounds to 0..30 places"; return false; }
+  if (places >= d.s) { out = make(d.m, d.s); return true; }   // already that exact: keep its own scale
+  out = make(round_div(d.m, pow10(d.s - places)), places);
+  return true;
+}
+
+double decimal_to_double(const Value& v) {
+  Dec d;
+  if (!get(v, d)) return 0.0;
+  return std::strtod(decimal_text(v).c_str(), nullptr);
+}
+
+bool decimal_to_int(const Value& v, int64_t& out) {
+  Dec d;
+  if (!get(v, d)) return false;
+  const I whole = d.m / pow10(d.s);
+  if (whole > (I)INT64_MAX || whole < (I)INT64_MIN) return false;
+  out = (int64_t)whole;
+  return true;
+}
 
 namespace {
 
-constexpr size_t kMaxDigits = 1000;   // "1e999999" would otherwise be a megabyte of zeros
-
-// sign * mag * 10^-scale; mag is decimal digits with no leading zeros ("" is zero)
-struct Dec {
-  bool neg = false;
-  std::string mag;
-  int scale = 0;
-};
-
-void normalize(Dec& d) {
-  size_t lead = 0;
-  while (lead < d.mag.size() && d.mag[lead] == '0') ++lead;
-  d.mag.erase(0, lead);
-  while (d.scale > 0 && !d.mag.empty() && d.mag.back() == '0') {
-    d.mag.pop_back();
-    --d.scale;
-  }
-  if (d.mag.empty()) {
-    d.neg = false;
-    d.scale = 0;
-  }
-}
-
-bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
-
-// Reads a number at s[i]: [+-] digits [. digits] [e [+-] digits]; an exponent only counts when digits
-// follow it. Leaves i after it. False when there are no digits.
-bool read_number(const std::string& s, size_t& i, Dec& out, std::string& error) {
-  Dec d;
-  size_t p = i;
-  if (p < s.size() && (s[p] == '+' || s[p] == '-')) d.neg = s[p++] == '-';
-  size_t digits = 0;
-  while (p < s.size() && s[p] >= '0' && s[p] <= '9') { d.mag += s[p++]; ++digits; }
-  if (p < s.size() && s[p] == '.') {
-    size_t q = p + 1, frac = 0;
-    std::string f;
-    while (q < s.size() && s[q] >= '0' && s[q] <= '9') { f += s[q++]; ++frac; }
-    if (digits + frac > 0) {
-      d.mag += f;
-      d.scale = (int)frac;
-      digits += frac;
-      p = q;
-    }
-  }
-  if (digits == 0) return false;
-  if (p < s.size() && (s[p] == 'e' || s[p] == 'E')) {
-    size_t q = p + 1;
-    bool eneg = false;
-    if (q < s.size() && (s[q] == '+' || s[q] == '-')) eneg = s[q++] == '-';
-    if (q < s.size() && s[q] >= '0' && s[q] <= '9') {
-      long e = 0;
-      while (q < s.size() && s[q] >= '0' && s[q] <= '9') {
-        if (e < 100000) e = e * 10 + (s[q] - '0');
-        ++q;
-      }
-      long sc = (long)d.scale + (eneg ? e : -e);
-      if (sc < 0) {
-        if ((size_t)-sc + d.mag.size() > kMaxDigits) { error = "a number with more than 1000 digits"; return false; }
-        d.mag.append((size_t)-sc, '0');
-        sc = 0;
-      }
-      if ((size_t)sc > kMaxDigits) { error = "a number with more than 1000 digits"; return false; }
-      d.scale = (int)sc;
-      p = q;
-    }
-  }
-  if (d.mag.size() > kMaxDigits) { error = "a number with more than 1000 digits"; return false; }
-  normalize(d);
-  out = d;
-  i = p;
-  return true;
-}
-
-// The shortest text that reads back as the same double
-std::string real_text(double v) {
-  char buf[40];
-  for (int prec = 1; prec <= 17; ++prec) {
-    std::snprintf(buf, sizeof buf, "%.*g", prec, v);
-    if (std::strtod(buf, nullptr) == v) break;
-  }
-  return buf;
-}
-
-// A whole operand: a decimal string (spaces around it allowed), an int or a finite real
-bool operand(const Value& v, Dec& out, const char* who, std::string& error) {
-  std::string text;
-  if (v.type == Type::Int) text = std::to_string(v.i);
+// decimal(x [, places]): from an int, a string ("19.99", "1e3"), a decimal, or a real - which becomes the
+// shortest decimal that reads back as that real, so decimal(0.1) is 0.1 and not 0.1000000000000000055.
+Value bi_decimal(Vm&, std::vector<Value>& args, std::string& error) {
+  Value out;
+  const Value& v = args[0];
+  if (v.type == Type::Decimal || v.type == Type::Int) out = v.type == Type::Int ? decimal_from_int(v.i) : v;
+  else if (v.type == Type::Str) { if (!decimal_parse(v.str(), out, error)) { error = "decimal(): " + error; return Value::nil(); } }
   else if (v.type == Type::Real) {
-    if (!(v.d == v.d) || v.d > 1.7976931348623157e308 || v.d < -1.7976931348623157e308) {
-      error = std::string(who) + ": " + real_text(v.d) + " is not a number with digits";
-      return false;
+    if (std::isnan(v.d) || std::isinf(v.d)) { error = "decimal(): a real that is not a finite number"; return Value::nil(); }
+    char buf[64];
+    for (int digits = 15; digits <= 17; ++digits) {
+      std::snprintf(buf, sizeof buf, "%.*g", digits, v.d);
+      if (std::strtod(buf, nullptr) == v.d) break;
     }
-    text = real_text(v.d);
-  } else if (v.type == Type::Str) text = v.str();
-  else {
-    error = std::string(who) + ": wants a number or a decimal string, got " + type_name(v.type);
-    return false;
-  }
-  size_t i = 0;
-  while (i < text.size() && is_space(text[i])) ++i;
-  std::string why;
-  if (!read_number(text, i, out, why)) {
-    error = std::string(who) + ": " + (why.empty() ? "\"" + text + "\" is not a number" : why);
-    return false;
-  }
-  while (i < text.size() && is_space(text[i])) ++i;
-  if (i != text.size()) {
-    error = std::string(who) + ": \"" + text + "\" is not a number";
-    return false;
-  }
-  return true;
-}
-
-std::string text_of(const Dec& d) {
-  if (d.mag.empty()) return "0";
-  std::string s = d.mag;
-  if (d.scale > 0) {
-    if ((int)s.size() <= d.scale) s.insert(0, (size_t)(d.scale - (int)s.size() + 1), '0');
-    s.insert(s.size() - (size_t)d.scale, 1, '.');
-  }
-  return d.neg ? "-" + s : s;
-}
-
-// ---- magnitudes: digit strings with no leading zeros ----
-
-int cmp_mag(const std::string& a, const std::string& b) {
-  if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
-  int c = a.compare(b);
-  return c < 0 ? -1 : c > 0 ? 1 : 0;
-}
-
-std::string add_mag(const std::string& a, const std::string& b) {
-  std::string r;
-  int carry = 0;
-  for (size_t k = 0; k < a.size() || k < b.size() || carry; ++k) {
-    int s = carry;
-    if (k < a.size()) s += a[a.size() - 1 - k] - '0';
-    if (k < b.size()) s += b[b.size() - 1 - k] - '0';
-    r.insert(r.begin(), (char)('0' + s % 10));
-    carry = s / 10;
-  }
-  return r;
-}
-
-// a - b, a >= b
-std::string sub_mag(const std::string& a, const std::string& b) {
-  std::string r(a.size(), '0');
-  int borrow = 0;
-  for (size_t k = 0; k < a.size(); ++k) {
-    int s = (a[a.size() - 1 - k] - '0') - borrow - (k < b.size() ? b[b.size() - 1 - k] - '0' : 0);
-    borrow = s < 0;
-    if (s < 0) s += 10;
-    r[r.size() - 1 - k] = (char)('0' + s);
-  }
-  size_t lead = 0;
-  while (lead < r.size() && r[lead] == '0') ++lead;
-  return r.substr(lead);
-}
-
-std::string mul_mag(const std::string& a, const std::string& b) {
-  if (a.empty() || b.empty()) return "";
-  std::vector<int> acc(a.size() + b.size(), 0);
-  for (size_t x = 0; x < a.size(); ++x)
-    for (size_t y = 0; y < b.size(); ++y) acc[x + y + 1] += (a[x] - '0') * (b[y] - '0');
-  for (size_t k = acc.size() - 1; k > 0; --k) {
-    acc[k - 1] += acc[k] / 10;
-    acc[k] %= 10;
-  }
-  std::string r;
-  for (int v : acc) if (!(r.empty() && v == 0)) r += (char)('0' + v);
-  return r;
-}
-
-// quotient and remainder of magnitudes, d non-zero
-void divmod_mag(const std::string& n, const std::string& d, std::string& q, std::string& rem) {
-  q.clear();
-  rem.clear();
-  for (char c : n) {
-    if (!(rem.empty() && c == '0')) rem += c;
-    int digit = 0;
-    while (cmp_mag(rem, d) >= 0) {
-      rem = sub_mag(rem, d);
-      ++digit;
-    }
-    if (!(q.empty() && digit == 0)) q += (char)('0' + digit);
-  }
-}
-
-void align(Dec& a, Dec& b) {
-  if (a.scale < b.scale) { if (!a.mag.empty()) a.mag.append((size_t)(b.scale - a.scale), '0'); a.scale = b.scale; }
-  else if (b.scale < a.scale) { if (!b.mag.empty()) b.mag.append((size_t)(a.scale - b.scale), '0'); b.scale = a.scale; }
-}
-
-Dec add(Dec a, Dec b) {
-  align(a, b);
-  Dec r;
-  r.scale = a.scale;
-  if (a.neg == b.neg) {
-    r.mag = add_mag(a.mag, b.mag);
-    r.neg = a.neg;
-  } else if (cmp_mag(a.mag, b.mag) >= 0) {
-    r.mag = sub_mag(a.mag, b.mag);
-    r.neg = a.neg;
+    if (!decimal_parse(buf, out, error)) { error = "decimal(): " + error; return Value::nil(); }
   } else {
-    r.mag = sub_mag(b.mag, a.mag);
-    r.neg = b.neg;
-  }
-  normalize(r);
-  return r;
-}
-
-int cmp(Dec a, Dec b) {
-  if (a.neg != b.neg) return a.neg ? -1 : 1;
-  align(a, b);
-  int c = cmp_mag(a.mag, b.mag);
-  return a.neg ? -c : c;
-}
-
-enum class Mode { HalfUp, HalfEven, Down, Floor, Ceil };
-
-bool mode_of(const std::vector<Value>& args, size_t at, Mode& m, const char* who, std::string& error) {
-  m = Mode::HalfUp;
-  if (args.size() <= at || args[at].type == Type::Nil) return true;
-  if (args[at].type != Type::Str) { error = std::string(who) + ": the mode is a string"; return false; }
-  const std::string& s = args[at].str();
-  if (s == "half_up") m = Mode::HalfUp;
-  else if (s == "half_even") m = Mode::HalfEven;
-  else if (s == "down") m = Mode::Down;
-  else if (s == "floor") m = Mode::Floor;
-  else if (s == "ceil") m = Mode::Ceil;
-  else { error = std::string(who) + ": mode is half_up, half_even, down, floor or ceil, not \"" + s + "\""; return false; }
-  return true;
-}
-
-// q from |n| / |d| with remainder rem: rounded to a whole number by the mode, for a result of sign neg
-std::string round_quotient(std::string q, const std::string& rem, const std::string& d, bool neg, Mode m) {
-  if (rem.empty()) return q;
-  bool up = false;
-  const int half = cmp_mag(add_mag(rem, rem), d);
-  switch (m) {
-    case Mode::HalfUp: up = half >= 0; break;
-    case Mode::HalfEven: up = half > 0 || (half == 0 && !q.empty() && (q.back() - '0') % 2 == 1); break;
-    case Mode::Down: up = false; break;
-    case Mode::Floor: up = neg; break;
-    case Mode::Ceil: up = !neg; break;
-  }
-  return up ? add_mag(q, "1") : q;
-}
-
-Dec round_to(const Dec& a, int places, Mode m) {
-  if (a.scale <= places) return a;
-  const size_t drop = (size_t)(a.scale - places);
-  std::string q = a.mag.size() > drop ? a.mag.substr(0, a.mag.size() - drop) : "";
-  std::string rem = a.mag.size() > drop ? a.mag.substr(a.mag.size() - drop) : a.mag;
-  size_t lead = 0;
-  while (lead < rem.size() && rem[lead] == '0') ++lead;
-  rem.erase(0, lead);
-  Dec r;
-  r.neg = a.neg;
-  r.mag = round_quotient(q, rem, "1" + std::string(drop, '0'), a.neg, m);
-  r.scale = places;
-  if (places < 0) {   // whole tens, hundreds...
-    if (!r.mag.empty()) r.mag.append((size_t)-places, '0');
-    r.scale = 0;
-  }
-  normalize(r);
-  return r;
-}
-
-bool places_arg(const Value& v, int& places, const char* who, std::string& error) {
-  if (v.type != Type::Int || v.i < -(int64_t)kMaxDigits || v.i > (int64_t)kMaxDigits) {
-    error = std::string(who) + ": places is a whole number from -1000 to 1000";
-    return false;
-  }
-  places = (int)v.i;
-  return true;
-}
-
-Value bi_decimal(Vm&, std::vector<Value>& args, std::string&) {
-  Dec d;
-  std::string ignored;
-  if (!operand(args[0], d, "decimal", ignored)) return Value::nil();
-  return Value::string(text_of(d));
-}
-
-Value bi_decimal_prefix(Vm&, std::vector<Value>& args, std::string& error) {
-  if (!want_str(args[0], error, "decimal_prefix")) return Value::nil();
-  const std::string& s = args[0].str();
-  size_t i = 0;
-  while (i < s.size() && is_space(s[i])) ++i;
-  Dec d;
-  std::string why;
-  if (!read_number(s, i, d, why)) {
-    if (!why.empty()) error = "decimal_prefix: " + why;
+    error = std::string("decimal() cannot convert a ") + type_name(v.type);
     return Value::nil();
   }
-  auto m = std::make_shared<MapObj>();
-  m->put("value", Value::string(text_of(d)));
-  m->put("rest", Value::string(s.substr(i)));
-  return Value::object(Type::Map, m);
+  if (args.size() > 1) {
+    if (!want_number(args[1], error, "decimal")) return Value::nil();
+    // an explicit scale pads (2 -> 2.00) as well as rounds
+    Dec d;
+    get(out, d);
+    const int places = (int)args[1].as_int();
+    if (places < 0 || places > kMaxScale) { error = "decimal(): places from 0 to 30"; return Value::nil(); }
+    I m;
+    if (!rescale(d.m, d.s, places, m)) { overflow(error); error = "decimal(): " + error; return Value::nil(); }
+    out = make(m, places);
+  }
+  return out;
 }
 
-Value bi_dec_add(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a, b;
-  if (!operand(args[0], a, "dec_add", error) || !operand(args[1], b, "dec_add", error)) return Value::nil();
-  return Value::string(text_of(add(a, b)));
-}
-
-Value bi_dec_sub(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a, b;
-  if (!operand(args[0], a, "dec_sub", error) || !operand(args[1], b, "dec_sub", error)) return Value::nil();
-  b.neg = !b.neg;
-  normalize(b);
-  return Value::string(text_of(add(a, b)));
-}
-
-Value bi_dec_mul(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a, b;
-  if (!operand(args[0], a, "dec_mul", error) || !operand(args[1], b, "dec_mul", error)) return Value::nil();
-  Dec r;
-  r.neg = a.neg != b.neg;
-  r.mag = mul_mag(a.mag, b.mag);
-  r.scale = a.scale + b.scale;
-  if (r.mag.size() > kMaxDigits) { error = "dec_mul: a result of more than 1000 digits"; return Value::nil(); }
-  normalize(r);
-  return Value::string(text_of(r));
-}
-
+// dec_div(a, b, places): a / b rounded half away from zero to `places`.
 Value bi_dec_div(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a, b;
-  int places = 0;
-  Mode m;
-  if (!operand(args[0], a, "dec_div", error) || !operand(args[1], b, "dec_div", error)) return Value::nil();
-  if (!places_arg(args[2], places, "dec_div", error) || !mode_of(args, 3, m, "dec_div", error)) return Value::nil();
-  if (b.mag.empty()) { error = "dec_div: division by zero"; return Value::nil(); }
-  if (places < 0) { error = "dec_div: places is 0 or more"; return Value::nil(); }
-  // a/b * 10^places = (A * 10^(b.scale + places)) / (B * 10^a.scale)
-  std::string n = a.mag.empty() ? "" : a.mag + std::string((size_t)(b.scale + places), '0');
-  std::string d = b.mag + std::string((size_t)a.scale, '0');
-  if (n.size() > 3 * kMaxDigits) { error = "dec_div: a result of more than 1000 digits"; return Value::nil(); }
-  std::string q, rem;
-  divmod_mag(n, d, q, rem);
-  Dec r;
-  r.neg = a.neg != b.neg;
-  r.mag = round_quotient(q, rem, d, r.neg, m);
-  r.scale = places;
-  normalize(r);
-  return Value::string(text_of(r));
-}
-
-Value bi_dec_cmp(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a, b;
-  if (!operand(args[0], a, "dec_cmp", error) || !operand(args[1], b, "dec_cmp", error)) return Value::nil();
-  return Value::integer(cmp(a, b));
-}
-
-Value bi_dec_round(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a;
-  int places = 0;
-  Mode m;
-  if (!operand(args[0], a, "dec_round", error)) return Value::nil();
-  if (args.size() > 1 && !places_arg(args[1], places, "dec_round", error)) return Value::nil();
-  if (!mode_of(args, 2, m, "dec_round", error)) return Value::nil();
-  return Value::string(text_of(round_to(a, places, m)));
-}
-
-Value bi_dec_round_sig(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a;
-  if (!operand(args[0], a, "dec_round_sig", error)) return Value::nil();
-  if (args[1].type != Type::Int || args[1].i < 1 || args[1].i > (int64_t)kMaxDigits) {
-    error = "dec_round_sig: digits is a whole number from 1 to 1000";
-    return Value::nil();
+  if (!is_exact_number(args[0]) || !is_exact_number(args[1])) { error = "dec_div() wants decimals or ints"; return Value::nil(); }
+  if (!want_number(args[2], error, "dec_div")) return Value::nil();
+  const int places = (int)args[2].as_int();
+  if (places < 0 || places > kMaxScale) { error = "dec_div(): places from 0 to 30"; return Value::nil(); }
+  Dec x, y;
+  get(args[0], x);
+  get(args[1], y);
+  if (y.m == 0) { error = "dec_div(): division by zero"; return Value::nil(); }
+  I num;
+  const int up = places - x.s + y.s;
+  if (up >= 0) {
+    if (up > 38 || !mul_checked(x.m, pow10(up), num)) { overflow(error); error = "dec_div(): " + error; return Value::nil(); }
+    return make(round_div(num, y.m), places);
   }
-  const int digits = (int)args[1].i;
-  if ((int)a.mag.size() <= digits) return Value::string(text_of(a));
-  // the first digit sits at 10^(size - scale - 1); keep `digits` of them
-  const int places = digits - ((int)a.mag.size() - a.scale);
-  return Value::string(text_of(round_to(a, places, Mode::HalfUp)));
+  // fewer places than the operands carry: divide the divisor up instead
+  I den;
+  if (-up > 38 || !mul_checked(y.m, pow10(-up), den)) { overflow(error); error = "dec_div(): " + error; return Value::nil(); }
+  return make(round_div(x.m, den), places);
 }
 
-Value bi_dec_format(Vm&, std::vector<Value>& args, std::string& error) {
-  Dec a;
-  int places = 0;
-  if (!operand(args[0], a, "dec_format", error)) return Value::nil();
-  if (args.size() > 1 && !places_arg(args[1], places, "dec_format", error)) return Value::nil();
-  if (places < 0) { error = "dec_format: places is 0 or more"; return Value::nil(); }
-  Dec r = round_to(a, places, Mode::HalfUp);
-  std::string s = text_of(r);
-  if (places > 0) {
-    if (r.scale == 0) s += ".";
-    s.append((size_t)(places - r.scale), '0');
-  }
-  return Value::string(s);
+// scale(d): digits after the point, as it prints.
+Value bi_scale(Vm&, std::vector<Value>& args, std::string& error) {
+  Dec d;
+  if (!get(args[0], d)) { error = std::string("scale() wants a decimal, got a ") + type_name(args[0].type); return Value::nil(); }
+  return Value::integer(d.s);
 }
 
 }  // namespace
 
 void install_decimal_builtins(Vm& vm) {
-  vm.define_native("decimal", 1, 1, bi_decimal);
-  vm.define_native("decimal_prefix", 1, 1, bi_decimal_prefix);
-  vm.define_native("dec_add", 2, 2, bi_dec_add);
-  vm.define_native("dec_sub", 2, 2, bi_dec_sub);
-  vm.define_native("dec_mul", 2, 2, bi_dec_mul);
-  vm.define_native("dec_div", 3, 4, bi_dec_div);
-  vm.define_native("dec_cmp", 2, 2, bi_dec_cmp);
-  vm.define_native("dec_round", 1, 3, bi_dec_round);
-  vm.define_native("dec_round_sig", 2, 2, bi_dec_round_sig);
-  vm.define_native("dec_format", 1, 2, bi_dec_format);
+  vm.define_native("decimal", 1, 2, bi_decimal);
+  vm.define_native("dec_div", 3, 3, bi_dec_div);
+  vm.define_native("scale", 1, 1, bi_scale);
 }
 
 }  // namespace aios::userland::grain
