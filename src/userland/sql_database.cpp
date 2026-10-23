@@ -6751,14 +6751,6 @@ static bool item_is_string(const SqlExpr* e, const std::vector<QuerySource>& sou
 Val eval_expr(const SqlExpr* e, const EvalCtx& ctx);
 double val_as_number(const Val& v);
 static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v);
-// An exact number widened to `scale` places (no change when it has them, or is not exact).
-static Val widen_exact(Val v, int scale) {
-  if (v.null || !v.numeric || v.approx || scale <= 0) return v;
-  AIOS_INT128 x = 0;
-  int sc = 0, ds = 0;
-  if (exact_internal_of(v, &x, &sc, &ds) && ds < scale) return val_exact_fine(x, sc, std::min(scale, 38));
-  return v;
-}
 
 struct ParsedSelectBranch;
 struct ParsedSelectStatement;
@@ -12923,6 +12915,8 @@ void sql_set_session_mode(const std::string& mode) {
                         m.find("TRADITIONAL") != std::string::npos;
 }
 
+std::string canonical_temporal(const SqlColumn& c, const std::string& v);
+
 // The reason a value may not go into a column under sql_strict(), or "".
 // An integer column's range by its declared type, exactly: TINYINT .. BIGINT, signed or UNSIGNED. False for a
 // declaration that is not one of them.
@@ -13021,22 +13015,10 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
   }
   if (c.temporal == 1 || c.temporal == 2) {
     // YYYY-MM-DD[ HH:MM:SS[.frac]]; the zero date is allowed, as it is without NO_ZERO_DATE.
-    auto bad = [&]() { return "Incorrect " + std::string(c.temporal == 1 ? "date" : "datetime") + " value: '" + v + "' for column '" + c.name + "' at row 1"; };
-    if (v == "0000-00-00" || v == "0000-00-00 00:00:00") return std::string();
-    if (v.size() < 10 || v[4] != '-' || v[7] != '-') return bad();
-    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u}) if (!std::isdigit((unsigned char)v[i])) return bad();
-    const int y = std::atoi(v.substr(0, 4).c_str()), mo = std::atoi(v.substr(5, 2).c_str()), da = std::atoi(v.substr(8, 2).c_str());
-    static const int mdays[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    if (mo < 1 || mo > 12 || da < 1 || da > mdays[mo] + (mo == 2 && leap ? 1 : 0)) return bad();
-    if (v.size() > 10) {
-      if (v.size() < 19 || (v[10] != ' ' && v[10] != 'T') || v[13] != ':' || v[16] != ':') return bad();
-      for (size_t i : {11u, 12u, 14u, 15u, 17u, 18u}) if (!std::isdigit((unsigned char)v[i])) return bad();
-      const int h = std::atoi(v.substr(11, 2).c_str()), mi = std::atoi(v.substr(14, 2).c_str()), s = std::atoi(v.substr(17, 2).c_str());
-      if (h > 23 || mi > 59 || s > 59) return bad();
-      if (v.size() > 19 && (v[19] != '.' || v.size() == 20)) return bad();
-      for (size_t i = 20; i < v.size(); ++i) if (!std::isdigit((unsigned char)v[i])) return bad();
-    }
+    // Whatever canonical_temporal reads ('2026-6-1', '2026-06-01T12:00:00', '20260601') goes in as it reads it;
+    // what it cannot place on the calendar ('2026-02-30', '', 'soon') is refused, as STRICT_TRANS_TABLES refuses it.
+    if (canonical_temporal(c, v).empty())
+      return "Incorrect " + std::string(c.temporal == 1 ? "date" : "datetime") + " value: '" + v + "' for column '" + c.name + "' at row 1";
     return std::string();
   }
   if (c.type == SqlDataType::Int || c.type == SqlDataType::Decimal || c.type == SqlDataType::Real) {
@@ -13086,7 +13068,7 @@ std::string strict_cell_error(const SqlColumn& c, const std::string& v) {
 // A DATE / DATETIME / TIME value as MariaDB stores it: '2024-1-5' is '2024-01-05', '20240105131415' is
 // '2024-01-05 13:14:15', a date alone into a DATETIME gains ' 00:00:00', fractional seconds are cut (not rounded)
 // to the column's precision, a TIME of '1314' is '00:13:14' and 'D HH:MM:SS' counts the days in. Empty when the
-// text is not a value this reads (left as it came).
+// text is not a value of the column's kind: unreadable, or a day its month does not have.
 std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   int fsp = 0;
   if (const size_t lp = c.declared.find('('); lp != std::string::npos) fsp = std::atoi(c.declared.c_str() + lp + 1);
@@ -13102,6 +13084,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   if (neg) s = s.substr(1);
   // the digit groups and what separated them
   std::vector<long long> g;
+  std::vector<size_t> glen;   // how many digits each group was written with: '0001' is the year 1, '01' is 2001
   std::vector<char> sep;   // the separator before each group (0 for the first)
   std::string frac;
   for (size_t i = 0; i < s.size();) {
@@ -13111,6 +13094,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
       if (!sep.empty() && sep.back() == '.' && !g.empty()) { frac = s.substr(i, j - i); i = j; break; }   // the fraction
       if (j - i > 14) return std::string();
       g.push_back(std::atoll(s.substr(i, j - i).c_str()));
+      glen.push_back(j - i);
       i = j;
       continue;
     }
@@ -13148,7 +13132,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
       if (digits.size() == 6 || digits.size() == 12) y = two(y);
     } else if (g.size() >= 3) {
       y = g[0]; mo = g[1]; d = g[2];
-      if (g[0] < 100 && !(sep.size() > 0 && g[0] == 0)) y = two(g[0]);
+      if (glen[0] <= 2 && !(sep.size() > 0 && g[0] == 0)) y = two(g[0]);   // a year of two digits or fewer
       if (g.size() >= 4) hh = g[3];
       if (g.size() >= 5) mi = g[4];
       if (g.size() >= 6) ss = g[5];
@@ -13156,6 +13140,12 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
     } else return std::string();
     if (y < 0 || mo < 0 || d < 0 || hh < 0 || mi < 0 || ss < 0) return std::string();
     if (mo > 12 || d > 31 || hh > 23 || mi > 59 || ss > 59 || y > 9999) return std::string();
+    // A zero month or day is a date here, as in MariaDB without NO_ZERO_IN_DATE; February 30 is not.
+    if (mo >= 1 && d >= 1) {
+      static const int mdays[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+      const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+      if (d > mdays[mo] + (mo == 2 && leap ? 1 : 0)) return std::string();
+    }
     if (c.temporal == 1) std::snprintf(out, sizeof out, "%04lld-%02lld-%02lld", y, mo, d);
     else std::snprintf(out, sizeof out, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld", y, mo, d, hh, mi, ss);
   }
@@ -13168,11 +13158,25 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   return res;
 }
 
+// A temporal column's zero value: what MariaDB stores for one that is not a date, at the column's precision.
+std::string zero_temporal(const SqlColumn& c) {
+  int fsp = 0;
+  if (const size_t lp = c.declared.find('('); lp != std::string::npos) fsp = std::atoi(c.declared.c_str() + lp + 1);
+  fsp = std::max(0, std::min(fsp, 6));
+  if (c.temporal == 1) return "0000-00-00";
+  std::string z = c.temporal == 3 ? "00:00:00" : "0000-00-00 00:00:00";
+  if (fsp > 0) z += "." + std::string((size_t)fsp, '0');
+  return z;
+}
+
 std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
   if (sql_is_null(v)) return v;
-  if (c.temporal && !v.empty()) {
-    const std::string canon = canonical_temporal(c, v);
+  if (c.temporal) {
+    const std::string canon = v.empty() ? std::string() : canonical_temporal(c, v);
     if (!canon.empty()) return canon;
+    // Not a date, time or date-time of the column's kind ('', '2026-02-30', 'soon'): MariaDB without
+    // strict mode stores the zero value and warns.
+    return zero_temporal(c);
   }
   if (c.declared.size() > 5 && c.declared.compare(0, 5, "char(") == 0 && !v.empty() && v.back() == ' ') {
     std::string s = v;
@@ -15914,15 +15918,18 @@ void ColumnStore::push_back(const std::string& val) {
   if ((r + 1) % kSegRows == 0) seal_segment(*this);
 }
 
+// Every caller has just cleared the dictionary these were built from, so their memory goes too: clear() kept it,
+// and a 6,000-row date column turned TemporalSeconds still held 213 KB of them next to its 12 KB of codes.
 void ColumnStore::drop_dict_derived() {
-  id_index.clear();
-  id_tag.clear();
+  auto release = [](auto& v) { std::remove_reference_t<decltype(v)>().swap(v); };
+  release(id_index);
+  release(id_tag);
   id_index_count = 0;
-  dict_doubles.clear();
-  dict_doubles_valid.clear();
-  dict_ints.clear();
-  dict_ints_valid.clear();
-  sorted_dict_indices.clear();
+  release(dict_doubles);
+  release(dict_doubles_valid);
+  release(dict_ints);
+  release(dict_ints_valid);
+  release(sorted_dict_indices);
   sorted_built = false;
 }
 
@@ -53998,7 +54005,9 @@ bool SqlDatabase::load_tables_v4() {
   std::vector<uint64_t> valid_lengths(manifest_entries.size(), 0);
   if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
     for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
+  set_startup_phase("loading tables", 0, manifest_entries.size());
   for (size_t ei = 0; ei < manifest_entries.size(); ++ei) {
+    startup_progress(ei);
     const std::string& key = manifest_entries[ei].first;
     const std::string& file = manifest_entries[ei].second;
     auto tf = kernel_.host().read_file(dir + "/" + file);
@@ -54579,6 +54588,22 @@ Result<size_t> SqlDatabase::repair_schema_from_source(const std::string& host, u
   return fixed;
 }
 
+void SqlDatabase::set_startup_phase(const std::string& phase, size_t done, size_t total) {
+  std::lock_guard<std::mutex> g(startup_mu_);
+  startup_phase_ = phase;
+  startup_done_.store(done, std::memory_order_relaxed);
+  startup_total_.store(total, std::memory_order_relaxed);
+}
+
+std::string SqlDatabase::startup_status() const {
+  std::string phase;
+  { std::lock_guard<std::mutex> g(startup_mu_); phase = startup_phase_; }
+  if (phase.empty()) phase = "starting";
+  const size_t total = startup_total_.load(std::memory_order_relaxed);
+  if (total == 0) return phase;
+  return phase + " (" + std::to_string(std::min(startup_done_.load(std::memory_order_relaxed), total)) + " of " + std::to_string(total) + ")";
+}
+
 Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                              const std::string& password, const std::string& database,
                                              const std::vector<std::string>& tables, std::vector<std::string>* log) {
@@ -54668,7 +54693,10 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
   // CREATE DATABASE, which would also switch the engine's current database.
   databases_.insert(database);
   size_t seeded = 0;
+  set_startup_phase("seeding tables", 0, todo.size());
+  size_t seed_at = 0;
   for (const auto& t : todo) {
+    startup_progress(seed_at++);
     const std::string key = lower_ascii(database + "." + t);
     ScopedSessionDb in_tenant(database);         // every statement below acts in the source's database
     seeds[key] = {"-", 0};                       // started; not trusted until it finishes
