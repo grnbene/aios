@@ -231,6 +231,12 @@ class MysqlWireServer {
   }
   bool tls_enabled() const { return !tls_cert_.empty() && !tls_key_.empty(); }
   size_t account_count() const { return accounts_.size(); }
+  // While the engine loads, seeds or starts replication the server already listens and logs clients in, so
+  // they can see why nothing answers: every statement gets ER_SERVER_ISNT_AVAILABLE naming the engine's
+  // startup_status(). A ping, USE and the client's own @@version_comment query are answered. set_starting(false)
+  // once the engine is up.
+  void set_starting(bool starting) { starting_.store(starting, std::memory_order_release); }
+  bool starting() const { return starting_.load(std::memory_order_acquire); }
   void set_max_connections(size_t max_conns);
   size_t max_connections() const;
 
@@ -273,6 +279,7 @@ class MysqlWireServer {
   std::unique_ptr<hal::Thread> unix_thread_;
   Result<void> poll_and_serve_on(hal::Listener& listener, int timeout_ms);
   std::atomic<bool> running_{false};
+  std::atomic<bool> starting_{false};
   std::unique_ptr<hal::Thread> bg_thread_;
   uint32_t next_conn_id_ = 1;
   std::atomic<int> active_clients_{0};

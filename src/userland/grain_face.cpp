@@ -710,8 +710,8 @@ class FacePane final : public PaneDriver {
     }
     if (depth > 200) { error = "the widgets nest more than 200 deep"; return false; }
     const std::string& type = type_v->str();
-    Value* label = m->find("label");
-    const std::string label_text = label ? label->to_text() : std::string();
+    const Value* label_val = m->find("label");
+    const std::string label_text = label_val ? label_val->to_text() : std::string();
     if (type == "column" || type == "row" || type == "card") {
       std::string cls = type == "card" ? "w-column w-card" : "w-" + type;
       if (opt_flag(v, "card")) cls += " w-card";
@@ -1215,13 +1215,14 @@ class FacePane final : public PaneDriver {
     if (Value* id = m->find("id")) w->attrs.emplace_back("id", id->str());
     if (Value* fn = m->find("on_click")) w->attrs.emplace_back("action", action_for(*fn, "the button \"" + w->label + "\""));
     if (Value* val = m->find("value")) w->attrs.emplace_back("value", val->to_text());
-    if (Value* data = m->find("data"); data && (w->type == "sparkline" || w->type == "chart")) {
+    Value* data = m->find("data");
+    if (data && (w->type == "sparkline" || w->type == "chart")) {
       // A line's points, as face reads them: numbers, comma-separated.
       std::string pts;
-      for (const auto& v : data->list_items()) { if (!pts.empty()) pts += ","; pts += v.type == Type::Nil ? "0" : v.to_text(); }
+      for (const auto& pt : data->list_items()) { if (!pts.empty()) pts += ","; pts += pt.type == Type::Nil ? "0" : pt.to_text(); }
       w->attrs.emplace_back("data", pts);
       if (w->type == "chart" && w->attr("height", "").empty()) w->attrs.emplace_back("height", "120");
-    } else if (Value* data = m->find("data")) {
+    } else if (data) {
       // A table reads its rows by name, as `table items` reads a let.
       const std::string name = "grain_rows_" + std::to_string(++provided_);
       rt_.provide(name, to_face(*data));

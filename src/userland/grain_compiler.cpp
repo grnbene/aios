@@ -499,7 +499,7 @@ class Compiler {
         return;
       }
 
-      case StmtKind::NativeFn: {
+      case StmtKind::NativeDecl: {
         if (!natives_) natives_ = new_native_module();
         std::string name;
         Value fn;

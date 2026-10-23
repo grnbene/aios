@@ -1,7 +1,8 @@
 // Verifies the temporal column encodings: DATE / DATETIME / TIMESTAMP text packed as
 // days / seconds (TemporalDays / TemporalSeconds) reads back byte for byte through every
-// path, values that are not canonical keep the column off the encoding, and the packed
-// column is smaller than the dictionary it replaces.
+// path, a written value is stored as MariaDB 10.11 stores it (checked against it), a
+// value with no point in time (the zero date) keeps the column off the encoding, and the
+// packed column is smaller than the dictionary it replaces.
 
 #include <cstdio>
 #include <cstdlib>
@@ -84,7 +85,7 @@ int main() {
   check(tbl->col_data[1].encoding == ColumnEncoding::TemporalSeconds, "inputdate is TemporalSeconds");
   check(tbl->col_data[2].encoding == ColumnEncoding::TemporalSeconds, "created_at is TemporalSeconds");
   check(tbl->col_data[3].encoding == ColumnEncoding::TemporalDays, "d is TemporalDays");
-  check(mem(1) < before_dt / 2, "inputdate is less than half its dictionary form");
+  check(mem(1) < before_dt / 2, "inputdate is less than half its dictionary form: " + std::to_string(mem(1)) + " of " + std::to_string(before_dt));
   check(mem(3) < before_d, "d is smaller");
   check(tbl->col_data[1].dict.size() == 0, "no dictionary left on inputdate");
 
@@ -148,7 +149,8 @@ int main() {
   check(tbl->col_data[1].get(100) == "2001-02-03 04:05:06" && tbl->col_data[1].get(102) == want_dt[102], "neighbours intact after the fallback");
   want_dt[101] = "0000-00-00 00:00:00";
   q("INSERT INTO tlog VALUES (9003, '2026-06-01 12:34:56.789', '2026-06-01 12:34:56', '2026-06-01', 'z');");
-  check(tbl->col_data[1].get(N + 2) == "2026-06-01 12:34:56.789", "fractional seconds kept");
+  // a DATETIME without a precision holds whole seconds: MariaDB cuts the fraction (it does not round)
+  check(tbl->col_data[1].get(N + 2) == "2026-06-01 12:34:56", "fractional seconds cut to the column's precision, got " + tbl->col_data[1].get(N + 2));
   q("DELETE FROM tlog WHERE id IN (3, 4, 2500);");
   check(tbl->col_data[3].get(3) == want_d[5] || tbl->col_data[3].encoding != ColumnEncoding::TemporalDays, "erase_rows keeps the rest");
   {
@@ -160,30 +162,25 @@ int main() {
     check(!r.rows.empty() && r.rows[0].values[0] == want_d[2501], "row after a mid-table delete");
   }
 
-  std::printf("[5] columns that are not canonical never enter the encoding\n");
-  const char* odd[] = {"0000-00-00", "2026-02-30", "2026-6-1", "", "2026-06-01T12:00:00", "2026-06-01 12:00:00.5"};
-  for (const char* bad : odd) {
+  std::printf("[5] a written value is stored as MariaDB stores it; the zero date keeps the column off the encoding\n");
+  // What MariaDB 10.11 stores for each into a DATETIME, sql_mode '' (the mirror's): the zero date and text that is
+  // no date at all ('', February 30) are the zero date-time, with a warning; the rest is normalised.
+  struct Odd { const char* in; const char* stored; };
+  const Odd odd[] = {{"0000-00-00", "0000-00-00 00:00:00"}, {"2026-02-30", "0000-00-00 00:00:00"}, {"2026-6-1", "2026-06-01 00:00:00"},
+                     {"", "0000-00-00 00:00:00"}, {"2026-06-01T12:00:00", "2026-06-01 12:00:00"},
+                     {"2026-06-01 12:00:00.5", "2026-06-01 12:00:00"}, {"2026-06-01", "2026-06-01 00:00:00"}};
+  for (const Odd& o : odd) {
     db.execute_local_query("DROP TABLE IF EXISTS todd;");
     db.execute_local_query("CREATE TABLE todd (id INT, d DATETIME);");
     for (size_t i = 0; i < 700; ++i) db.execute_local_query("INSERT INTO todd VALUES (" + std::to_string(i) + ", '" + stamp(i) + "');");
-    db.execute_local_query(std::string("INSERT INTO todd VALUES (9999, '") + bad + "');");
+    db.execute_local_query(std::string("INSERT INTO todd VALUES (9999, '") + o.in + "');");
     SqlTable* t2 = db.resolve_table("todd", "aios_db");
     t2->optimize_storage();
     const ColumnStore& cs = t2->col_data[1];
-    check(cs.encoding != ColumnEncoding::TemporalSeconds && cs.encoding != ColumnEncoding::TemporalDays, std::string("'") + bad + "' keeps the column off the encoding");
-    check(cs.get(700) == bad, std::string("'") + bad + "' reads back, got '" + cs.get(700) + "'");
+    const bool zero = std::string(o.stored).rfind("0000-00-00", 0) == 0;
+    if (zero) check(cs.encoding != ColumnEncoding::TemporalSeconds && cs.encoding != ColumnEncoding::TemporalDays, std::string("'") + o.in + "' (the zero date) keeps the column off the encoding");
+    check(cs.get(700) == o.stored, std::string("'") + o.in + "' is stored as '" + o.stored + "', got '" + cs.get(700) + "'");
     check(cs.get(699) == stamp(699), "neighbour of the odd value");
-  }
-  {
-    // a column of only NULLs and one form must not be mistaken for the other
-    db.execute_local_query("DROP TABLE IF EXISTS tmix;");
-    db.execute_local_query("CREATE TABLE tmix (id INT, d DATETIME);");
-    for (size_t i = 0; i < 700; ++i) db.execute_local_query("INSERT INTO tmix VALUES (" + std::to_string(i) + ", '" + stamp(i) + "');");
-    db.execute_local_query("INSERT INTO tmix VALUES (9999, '2026-06-01');");
-    SqlTable* t3 = db.resolve_table("tmix", "aios_db");
-    t3->optimize_storage();
-    check(t3->col_data[1].encoding != ColumnEncoding::TemporalSeconds, "a date among date-times keeps the column off the encoding");
-    check(t3->col_data[1].get(700) == "2026-06-01", "mixed form reads back");
   }
 
   std::printf("[6] extreme canonical values\n");
@@ -195,7 +192,7 @@ int main() {
     for (size_t i = 0; i < 6; ++i) db.execute_local_query(std::string("INSERT INTO text1 VALUES (") + std::to_string(1000 + i) + ", '" + ds[i] + "');");
     SqlTable* t4 = db.resolve_table("text1", "aios_db");
     t4->optimize_storage();
-    for (size_t i = 0; i < 6; ++i) check(t4->col_data[1].get(400 + i) == ds[i], std::string("extreme ") + ds[i]);
+    for (size_t i = 0; i < 6; ++i) check(t4->col_data[1].get(400 + i) == ds[i], std::string("extreme ") + ds[i] + ", got '" + t4->col_data[1].get(400 + i) + "'");
     std::printf("  span 0001..9999 -> %s\n", enc_name(t4->col_data[1].encoding));
     // narrow the span: leap days and pre-epoch dates inside 32 bits of days
     db.execute_local_query("DROP TABLE IF EXISTS text2;");

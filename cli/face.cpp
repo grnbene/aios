@@ -235,7 +235,6 @@ FaceLook face_look(Session& s, const std::string& url, int frames, const std::ve
       }
     }
     const int pct_ink = total ? (int)((ink * 100 + total / 2) / total) : 0;
-    const int distinct = (int)tally.size();
 
     if (ink == 0) {
       L.findings.push_back("THE PANE IS EMPTY: " + std::to_string(L.painted) +

@@ -95,7 +95,7 @@ struct Rect {
 enum class WindowType {
   Terminal,   // the command surface, the same one the serial console offers
   Tasks,      // entities and devices, from the fabrics
-  Miner,      // the miner's own persisted ledger
+  Mining,     // the miner's own persisted ledger
   Hardware,   // what the HAL says this machine is
   Editor,     // native C++ code & text editor
   Database,   // Navicat-style MariaDB/MySQL studio & data grid

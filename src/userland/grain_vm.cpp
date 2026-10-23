@@ -231,15 +231,15 @@ std::string Value::to_text() const {
     case Type::List: {
       std::string out = "[";
       const auto& items = list_items();
-      for (size_t i = 0; i < items.size(); ++i) { if (i) out += ", "; out += items[i].repr(); }
+      for (size_t k = 0; k < items.size(); ++k) { if (k) out += ", "; out += items[k].repr(); }
       return out + "]";
     }
     case Type::Map: {
       std::string out = "{";
       auto* m = static_cast<MapObj*>(obj.get());
-      for (size_t i = 0; i < m->entries.size(); ++i) {
-        if (i) out += ", ";
-        out += m->entries[i].first + ": " + m->entries[i].second.repr();
+      for (size_t k = 0; k < m->entries.size(); ++k) {
+        if (k) out += ", ";
+        out += m->entries[k].first + ": " + m->entries[k].second.repr();
       }
       return out + "}";
     }
@@ -282,11 +282,11 @@ std::string Value::to_text() const {
     }
     case Type::Bytes: {
       // <bytes 5: 68 65 6c 6c 6f>, the first 32 shown
-      const auto& d = static_cast<BytesObj*>(obj.get())->data;
+      const auto& data = static_cast<BytesObj*>(obj.get())->data;
       static const char* hex = "0123456789abcdef";
-      std::string out = "<bytes " + std::to_string(d.size()) + ":";
-      for (size_t k = 0; k < d.size() && k < 32; ++k) { out += ' '; out += hex[d[k] >> 4]; out += hex[d[k] & 15]; }
-      if (d.size() > 32) out += " ...";
+      std::string out = "<bytes " + std::to_string(data.size()) + ":";
+      for (size_t k = 0; k < data.size() && k < 32; ++k) { out += ' '; out += hex[data[k] >> 4]; out += hex[data[k] & 15]; }
+      if (data.size() > 32) out += " ...";
       return out + ">";
     }
   }

@@ -3493,6 +3493,28 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       send_err(client_conn, 1, 1227, "42000", "ASQL capability: command not available under a capability");
       continue;
     }
+    // The engine is still loading, seeding or starting replication: the client is told so, statement by
+    // statement, instead of finding the port shut. Nothing here reaches the engine.
+    if (starting()) {
+      if (cmd == COM_QUIT) break;
+      if (cmd == COM_PING) { send_ok(client_conn, 1); continue; }
+      if (cmd == COM_INIT_DB) {
+        session_database.assign((const char*)&cmd_pkt[1], cmd_pkt.size() - 1);   // checked by the first query that uses it
+        send_ok(client_conn, 1);
+        continue;
+      }
+      if (cmd == COM_QUERY) {
+        std::string q((const char*)&cmd_pkt[1], cmd_pkt.size() - 1);
+        for (char& ch : q) ch = (char)std::toupper((unsigned char)ch);
+        while (!q.empty() && (q.back() == ';' || q.back() == ' ' || q.back() == '\n')) q.pop_back();
+        if (q == "SELECT @@VERSION_COMMENT" || q == "SELECT @@VERSION_COMMENT LIMIT 1") {   // what the mysql client asks on connecting
+          send_one_value("@@version_comment", "AIOS ASQL / MySQL Native Wire Server (starting: " + db_.startup_status() + ")");
+          continue;
+        }
+      }
+      send_err(client_conn, 1, 3168, "HY000", "ASQL is starting: " + db_.startup_status() + ". It answers queries once it is up.");
+      continue;
+    }
     if (cmd == COM_PROCESS_INFO) {
       // The old command form of SHOW PROCESSLIST: answered as that statement.
       static const char kShow[] = "SHOW PROCESSLIST";
