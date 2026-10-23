@@ -4,21 +4,14 @@
 // locally and synchronised by generation, exactly like accelerator memory.
 #include "aios/node/node.hpp"
 #include "aios/hal/sync.hpp"
+#include "aios/hal/process.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "protocol.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#if !defined(_WIN32)
-#include <sys/wait.h>
-#endif
 #include "aios/hal/sync.hpp"
-
-#if defined(_WIN32)
-#define popen _popen
-#define pclose _pclose
-#endif
 
 namespace aios {
 
@@ -66,30 +59,20 @@ Result<ByteBuffer> RemoteNode::query(const std::string& sql, int timeout_ms) {
 
 int execute_host_command(const std::string& line, std::string& output) {
   output.clear();
-  std::string cmd = line + " 2>&1";
-  FILE* fp = ::popen(cmd.c_str(), "r");
-  if (!fp) {
+  // Through the host's process facility (the core does not popen itself): the shell runs the line, its output and
+  // errors come back together, as `2>&1` gave them. A day's ceiling stands in for popen's none.
+#if defined(_WIN32)
+  std::vector<std::string> argv = {"cmd", "/c", line};
+#else
+  std::vector<std::string> argv = {"/bin/sh", "-c", line};
+#endif
+  auto r = hal::run_tool(argv, 24u * 3600u * 1000u);
+  if (!r.ok()) {
     output = "failed to execute command\n";
     return 127;
   }
-  char buf[4096];
-  while (size_t n = ::fread(buf, 1, sizeof(buf), fp)) {
-    output.append(buf, n);
-  }
-  int status = ::pclose(fp);
-  int exit_code = 0;
-#ifdef WIFEXITED
-  if (WIFEXITED(status)) {
-    exit_code = WEXITSTATUS(status);
-  } else if (WIFSIGNALED(status)) {
-    exit_code = 128 + WTERMSIG(status);
-  } else {
-    exit_code = status;
-  }
-#else
-  exit_code = status;
-#endif
-  return exit_code;
+  output = std::move(r->output);
+  return r->exit_code;
 }
 
 Result<NodeTelemetry> RemoteNode::telemetry() {

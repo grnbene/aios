@@ -277,9 +277,10 @@ class LinuxHost final : public Host {
   // goes into the file itself, not a temp renamed into place: a rename would replace a lock someone else just took.
   Result<void> create_exclusive(const std::string& path, ByteSpan data) override { return create_exclusive_impl(path, data, true); }
   Result<void> create_exclusive_unsynced(const std::string& path, ByteSpan data) override { return create_exclusive_impl(path, data, false); }
-  Result<void> create_exclusive_impl(const std::string& path, ByteSpan data, bool durable) {
+  Result<void> create_exclusive_private(const std::string& path, ByteSpan data) override { return create_exclusive_impl(path, data, true, 0600); }
+  Result<void> create_exclusive_impl(const std::string& path, ByteSpan data, bool durable, int mode = 0644) {
     drop_append_fd(path);
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, (mode_t)mode);
     if (fd < 0) {
       const int e = errno;
       return Result<void>(e == EEXIST ? Status::Conflict : Status::IoError, path + ": " + strerror(e));
@@ -784,6 +785,7 @@ void compute_yield() {}   // a hosted job has a thread of its own; nothing to ke
 std::unique_ptr<Host> make_host() { return std::make_unique<LinuxHost>(); }
 // One line to this substrate's console.
 void host_note(const std::string& text) { std::fputs(text.c_str(), stderr); std::fflush(stderr); }
+double parse_double(const char* s, char** end) { return std::strtod(s, end); }
 
 void* load_library(const std::string& name) { return dlopen(name.c_str(), RTLD_NOW | RTLD_LOCAL); }
 void* library_symbol(void* handle, const std::string& symbol) { return handle ? dlsym(handle, symbol.c_str()) : nullptr; }

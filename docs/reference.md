@@ -13,13 +13,13 @@ Commands: [`app`](#app) [`ask`](#ask) [`asqlcap`](#asqlcap) [`attest`](#attest) 
 
 ## `help`
 
-Dispatched at `cli/commands.cpp:10367`.
+Dispatched at `cli/commands.cpp:10377`.
 
 - **help**: Display this command reference list *(Applications & Shell)*
 
 ## `authority`
 
-Dispatched at `cli/commands.cpp:10404` → `cmd_authority` (`cli/commands.cpp:5730`).
+Dispatched at `cli/commands.cpp:10414` → `cmd_authority` (`cli/commands.cpp:5740`).
 
 - **authority [view]**: Show capability profile and audit log (mine, residents, log, refusals) *(Authority & Security)*
 
@@ -31,7 +31,7 @@ authority [mine|residents|log [n]|refusals]
 
 ## `ask`
 
-Dispatched at `cli/commands.cpp:10405`.
+Dispatched at `cli/commands.cpp:10415`.
 
 - **ask <request>**: Submit natural language task or prompt to resident AI model *(Intelligence & Distributed)*
 
@@ -39,7 +39,7 @@ Dispatched at `cli/commands.cpp:10405`.
 
 Also: `dreams`
 
-Dispatched at `cli/commands.cpp:10416` → `dream_command` (in `cli/`).
+Dispatched at `cli/commands.cpp:10426` → `dream_command` (in `cli/`).
 
 - **dream <what you want>**: Synthesize and render an application or UI from natural language prompt *(Applications & Shell)*
 - **dream list|show|open|remove**: Manage synthesized applications: list, inspect, open, or delete *(Applications & Shell)*
@@ -48,7 +48,7 @@ Dispatched at `cli/commands.cpp:10416` → `dream_command` (in `cli/`).
 
 Also: `organs`
 
-Dispatched at `cli/commands.cpp:10417` → `organ_command` (in `cli/`).
+Dispatched at `cli/commands.cpp:10427` → `organ_command` (in `cli/`).
 
 - **organ grow|call|list|source**: Dynamically synthesize, compile, load, and execute C++ extensions *(Applications & Shell)*
 
@@ -56,7 +56,7 @@ Dispatched at `cli/commands.cpp:10417` → `organ_command` (in `cli/`).
 
 Also: `faces`
 
-Dispatched at `cli/commands.cpp:10418` → `face_command` (in `cli/`).
+Dispatched at `cli/commands.cpp:10428` → `face_command` (in `cli/`).
 
 - **face reference|look|text|source**: Face UI language: view language reference, render UI, or inspect source *(Applications & Shell)*
 
@@ -64,26 +64,26 @@ Dispatched at `cli/commands.cpp:10418` → `face_command` (in `cli/`).
 
 Also: `id`
 
-Dispatched at `cli/commands.cpp:10419`.
+Dispatched at `cli/commands.cpp:10429`.
 
 - **whoami | id**: Show active console entity identity *(System & Environment)*
 - **whoami | id**: Show active console entity identity *(System & Environment)*
 
 ## `info`
 
-Dispatched at `cli/commands.cpp:10420` → `cmd_info` (`cli/commands.cpp:333`).
+Dispatched at `cli/commands.cpp:10430` → `cmd_info` (`cli/commands.cpp:333`).
 
 - **info**: Display OS topology, memory fabric, and entity summary *(System & Environment)*
 
 ## `sysstat`
 
-Dispatched at `cli/commands.cpp:10421` → `cmd_sysstat` (`cli/commands.cpp:501`).
+Dispatched at `cli/commands.cpp:10431` → `cmd_sysstat` (`cli/commands.cpp:501`).
 
 - **sysstat**: Display detailed system statistics and health dashboard *(System & Environment)*
 
 ## `daemon`
 
-Dispatched at `cli/commands.cpp:10422` → `cmd_daemon` (`cli/commands.cpp:816`).
+Dispatched at `cli/commands.cpp:10432` → `cmd_daemon` (`cli/commands.cpp:816`).
 
 - **daemon list|start|status**: Manage background userland services and daemons *(Applications & Shell)*
 
@@ -101,7 +101,7 @@ daemon forget <name>
 
 Also: `keybindings`, `keymap`
 
-Dispatched at `cli/commands.cpp:10423` → `cmd_keys` (`cli/commands.cpp:723`).
+Dispatched at `cli/commands.cpp:10433` → `cmd_keys` (`cli/commands.cpp:723`).
 
 - **keys list|bind|unbind|reset**: Manage input key bindings and shortcuts *(Applications & Shell)*
 
@@ -116,7 +116,7 @@ keys unbind <chord>
 
 Also: `apps`
 
-Dispatched at `cli/commands.cpp:10424` → `cmd_app` (`cli/commands.cpp:1066`).
+Dispatched at `cli/commands.cpp:10434` → `cmd_app` (`cli/commands.cpp:1067`).
 
 - **app list|install|open|stop**: Manage and launch installed applications *(Applications & Shell)*
 
@@ -133,7 +133,7 @@ app open <name>
 
 Also: `javascript`
 
-Dispatched at `cli/commands.cpp:10425` → `cmd_js` (`cli/commands.cpp:1042`).
+Dispatched at `cli/commands.cpp:10435` → `cmd_js` (`cli/commands.cpp:1043`).
 
 - **js <program>|features**: Execute JavaScript code using built-in ECMAScript engine *(Applications & Shell)*
 
@@ -146,7 +146,7 @@ js run <path>
 
 Also: `mine`
 
-Dispatched at `cli/commands.cpp:10426` → `cmd_miner` (`cli/commands.cpp:6076`).
+Dispatched at `cli/commands.cpp:10436` → `cmd_miner` (`cli/commands.cpp:6086`).
 
 Subcommands: `coin` `daemon` `hash` `hw` `info` `inspect-hw` `mine` `reboot-resume` `run` `start` `status` `stop` `wallet` `work`
 
@@ -158,7 +158,7 @@ miner status | work | mine [rounds] [threads] [nonces=N] | hw   (a local hashing
 
 Also: `bitcoin`
 
-Dispatched at `cli/commands.cpp:10427` → `cmd_chain` (`cli/commands.cpp:6194`).
+Dispatched at `cli/commands.cpp:10437` → `cmd_chain` (`cli/commands.cpp:6204`).
 
 - **chain | btc peers|headers|rpc**: Bitcoin client: manage P2P peers, query headers, and execute JSON-RPC *(Applications & Shell)*
 
@@ -166,7 +166,7 @@ Subcommands: `balance` `broadcast` `decode` `eth` `hashrate` `headers` `mine` `p
 
 ## `wallet`
 
-Dispatched at `cli/commands.cpp:10428` → `cmd_wallet` (`cli/commands.cpp:6708`).
+Dispatched at `cli/commands.cpp:10438` → `cmd_wallet` (`cli/commands.cpp:6718`).
 
 - **wallet info|send|history|import**: Crypto wallet: view balances, sign transactions, import private keys *(Applications & Shell)*
 
@@ -183,7 +183,7 @@ wallet status | new [force=1] | import <wif> [force=1] | export | node [url] | w
 
 ## `git`
 
-Dispatched at `cli/commands.cpp:10429` → `cmd_git` (`cli/commands.cpp:8456`).
+Dispatched at `cli/commands.cpp:10439` → `cmd_git` (`cli/commands.cpp:8466`).
 
 - **git init|add|commit|log|status**: Native Git client: repository initialization, commits, and logs *(Applications & Shell)*
 - **git branch|switch <rev>**: Manage, list, and switch repository branches *(Applications & Shell)*
@@ -206,7 +206,7 @@ git
 
 ## `npm`
 
-Dispatched at `cli/commands.cpp:10430` → `cmd_npm` (`cli/commands.cpp:7578`).
+Dispatched at `cli/commands.cpp:10440` → `cmd_npm` (`cli/commands.cpp:7588`).
 
 - **npm install|view <package>**: Install and inspect npm packages directly from npm registry *(Applications & Shell)*
 
@@ -221,7 +221,7 @@ npm install [<package>[@range]] [dir=<path>] [registry=<url>] [deps=0] | npm vie
 
 Also: `pip3`, `python`
 
-Dispatched at `cli/commands.cpp:10431` → `cmd_pip` (`cli/commands.cpp:7635`).
+Dispatched at `cli/commands.cpp:10441` → `cmd_pip` (`cli/commands.cpp:7645`).
 
 - **pip install|view <package>**: Install and inspect Python packages from PyPI with SHA-256 verification *(Applications & Shell)*
 
@@ -236,7 +236,7 @@ pip install <package>[==version] [dir=<path>] [python=3.12] [platform=x86_64] [d
 
 Also: `crates`
 
-Dispatched at `cli/commands.cpp:10432` → `cmd_cargo` (`cli/commands.cpp:7688`).
+Dispatched at `cli/commands.cpp:10442` → `cmd_cargo` (`cli/commands.cpp:7698`).
 
 - **cargo vendor|view <crate>**: Vendor and inspect Rust crates from crates.io with checksum checks *(Applications & Shell)*
 
@@ -252,7 +252,7 @@ cargo vendor <crate>[@version] [dir=<path>] [deps=0] | cargo view <crate>
 
 Also: `gomod`
 
-Dispatched at `cli/commands.cpp:10433` → `cmd_go` (`cli/commands.cpp:8374`).
+Dispatched at `cli/commands.cpp:10443` → `cmd_go` (`cli/commands.cpp:8384`).
 
 - **go get|list|mod verify <module>**: Download, list, and verify Go modules against checksum database *(Applications & Shell)*
 
@@ -266,7 +266,7 @@ go get <module>[@version] [dir=<path>] [deps=0] [sums=0] | go list <module> | go
 
 ## `elf`
 
-Dispatched at `cli/commands.cpp:10434` → `cmd_elf` (`cli/commands.cpp:8356`).
+Dispatched at `cli/commands.cpp:10444` → `cmd_elf` (`cli/commands.cpp:8366`).
 
 - **elf <path>**: Inspect ELF binary headers, sections, and program segments *(Applications & Shell)*
 
@@ -278,7 +278,7 @@ elf <path> — what this machine would have to do to run that file
 
 Also: `look`
 
-Dispatched at `cli/commands.cpp:10435` → `cmd_sense` (`cli/commands.cpp:7792`).
+Dispatched at `cli/commands.cpp:10445` → `cmd_sense` (`cli/commands.cpp:7802`).
 
 - **sense <url>**: Fetch web page via TLS and extract content into semantic store *(Applications & Shell)*
 
@@ -290,7 +290,7 @@ sense <url> [as=$e] [keep=0] [max=<chars>] [show=<chars>] [links=<n>] — look a
 
 Also: `directives`
 
-Dispatched at `cli/commands.cpp:10436` → `cmd_directive` (`cli/commands.cpp:7876`).
+Dispatched at `cli/commands.cpp:10446` → `cmd_directive` (`cli/commands.cpp:7886`).
 
 - **directive add|list|remove**: Manage background directives executed during idle cycles *(Applications & Shell)*
 
@@ -305,7 +305,7 @@ directive list | add <name> <every> as=$e <command…> | remove | enable | disab
 
 ## `horizon`
 
-Dispatched at `cli/commands.cpp:10437` → `cmd_horizon` (`cli/commands.cpp:8013`).
+Dispatched at `cli/commands.cpp:10447` → `cmd_horizon` (`cli/commands.cpp:8023`).
 
 - **horizon scan|show|distil|brief**: Scan external news and feeds, distilling briefings relevant to current tasks *(Applications & Shell)*
 
@@ -319,13 +319,13 @@ horizon show | scan | distil | brief | sources | watch <name> <url> | unwatch <n
 
 ## `identity`
 
-Dispatched at `cli/commands.cpp:10438` → `cmd_identity` (`cli/commands.cpp:7991`).
+Dispatched at `cli/commands.cpp:10448` → `cmd_identity` (`cli/commands.cpp:8001`).
 
 - **identity**: Display or inspect system identity object *(System & Environment)*
 
 ## `ssh`
 
-Dispatched at `cli/commands.cpp:10439` → `cmd_ssh` (`cli/commands.cpp:7358`).
+Dispatched at `cli/commands.cpp:10449` → `cmd_ssh` (`cli/commands.cpp:7368`).
 
 - **ssh <user@host> <cmd> | keygen**: Native SSH-2 client and keypair generation utility *(Applications & Shell)*
 
@@ -340,7 +340,7 @@ ssh <user@host> <command...> — this machine runs a command, it has no terminal
 
 ## `chain`
 
-Dispatched at `cli/commands.cpp:10440` → `cmd_chain` (`cli/commands.cpp:6194`).
+Dispatched at `cli/commands.cpp:10450` → `cmd_chain` (`cli/commands.cpp:6204`).
 
 - **chain | btc peers|headers|rpc**: Bitcoin client: manage P2P peers, query headers, and execute JSON-RPC *(Applications & Shell)*
 
@@ -359,7 +359,7 @@ chain peers | headers | balance | decode <hex> | broadcast <hex> | eth <url> | r
 
 Also: `solve`
 
-Dispatched at `cli/commands.cpp:10441` → `cmd_contract` (`cli/commands.cpp:6899`).
+Dispatched at `cli/commands.cpp:10451` → `cmd_contract` (`cli/commands.cpp:6909`).
 
 - **contract create|solve|watch**: Manage and solve Hash Time-Locked Contracts (HTLC) *(Applications & Shell)*
 
@@ -374,7 +374,7 @@ contract solve [watch N] [threads=N] [space=N] [gpu] [network=<net>] | create ha
 
 Also: `taskledger`
 
-Dispatched at `cli/commands.cpp:10442` → `cmd_task` (`cli/commands.cpp:6989`).
+Dispatched at `cli/commands.cpp:10452` → `cmd_task` (`cli/commands.cpp:6999`).
 
 - **task create|list|show|update**: Task ledger and todo tracking *(Applications & Shell)*
 
@@ -403,7 +403,7 @@ task speak-list
 
 Also: `speech`, `talk`, `listen`
 
-Dispatched at `cli/commands.cpp:10443` → `cmd_voice` (`cli/commands.cpp:7158`).
+Dispatched at `cli/commands.cpp:10453` → `cmd_voice` (`cli/commands.cpp:7168`).
 
 - **voice say|listen|status**: Text-to-speech (TTS) synthesis and speech recognition (STT) *(Intelligence & Distributed)*
 
@@ -431,7 +431,7 @@ voice voices
 
 Also: `asql`, `mariadb`, `db`
 
-Dispatched at `cli/commands.cpp:10444` → `cmd_sql` (`cli/commands.cpp:8868`).
+Dispatched at `cli/commands.cpp:10454` → `cmd_sql` (`cli/commands.cpp:8878`).
 
 - **sql query|serve|import|dump**: ASQL relational database: execute queries, run MySQL server, import/dump *(Channels & Object Store)*
 
@@ -453,7 +453,7 @@ sql tables
 
 Also: `email`, `aethermail`
 
-Dispatched at `cli/commands.cpp:10445` → `cmd_mail` (`cli/commands.cpp:9155`).
+Dispatched at `cli/commands.cpp:10455` → `cmd_mail` (`cli/commands.cpp:9165`).
 
 - **mail sync|list|search|read|send**: Mail client: synchronize accounts, search, read, and compose email *(Applications & Shell)*
 
@@ -494,7 +494,7 @@ status
 
 Also: `gmail`
 
-Dispatched at `cli/commands.cpp:10446` → `cmd_google` (`cli/commands.cpp:9566`).
+Dispatched at `cli/commands.cpp:10456` → `cmd_google` (`cli/commands.cpp:9576`).
 
 - **google auth|status|sync|watch|logout**: Sign in to a Google account (OAuth 2.0) and keep its mail, calendar, contacts and notes in sync *(Applications & Shell)*
 
@@ -515,7 +515,7 @@ logout [account=]
 
 Also: `addressbook`, `aethercontacts`
 
-Dispatched at `cli/commands.cpp:10447` → `cmd_contacts` (`cli/commands.cpp:9794`).
+Dispatched at `cli/commands.cpp:10457` → `cmd_contacts` (`cli/commands.cpp:9804`).
 
 - **contacts list|search|add|show**: Address book and contact management *(Applications & Shell)*
 
@@ -542,7 +542,7 @@ status
 
 Also: `cal`, `agenda`, `aethercalendar`
 
-Dispatched at `cli/commands.cpp:10448` → `cmd_calendar` (`cli/commands.cpp:9874`).
+Dispatched at `cli/commands.cpp:10458` → `cmd_calendar` (`cli/commands.cpp:9884`).
 
 - **calendar agenda|add|show|list**: Calendar and agenda event management *(Applications & Shell)*
 
@@ -559,7 +559,7 @@ calendar list | show <id> | add <title> <date> <time> | delete <id> | categories
 
 Also: `receive`, `upload`
 
-Dispatched at `cli/commands.cpp:10449` → `cmd_ingress` (`cli/commands.cpp:9068`).
+Dispatched at `cli/commands.cpp:10459` → `cmd_ingress` (`cli/commands.cpp:9078`).
 
 - **ingress receive|verify|list**: Receive, verify, and inspect incoming network payloads *(Channels & Object Store)*
 
@@ -579,7 +579,7 @@ ingress verify <payload_id>
 
 Also: `tasks`
 
-Dispatched at `cli/commands.cpp:10450` → `cmd_subsystems` (`cli/commands.cpp:10232`).
+Dispatched at `cli/commands.cpp:10460` → `cmd_subsystems` (`cli/commands.cpp:10242`).
 
 - **subsystems [-v]**: Query hardware subsystem capabilities (-v for device names) *(System & Environment)*
 
@@ -587,7 +587,7 @@ Dispatched at `cli/commands.cpp:10450` → `cmd_subsystems` (`cli/commands.cpp:1
 
 Also: `tpm`
 
-Dispatched at `cli/commands.cpp:10451` → `cmd_attest` (`cli/commands.cpp:10140`).
+Dispatched at `cli/commands.cpp:10461` → `cmd_attest` (`cli/commands.cpp:10150`).
 
 - **attest status|pcrs|quote**: TPM attestation: query status, PCR values, and signed quotes *(System & Environment)*
 
@@ -601,7 +601,7 @@ attest status | attest pcrs [n...] | attest quote [n...] [nonce=<text>]
 
 Also: `pci`
 
-Dispatched at `cli/commands.cpp:10452` → `cmd_bus` (`cli/commands.cpp:10076`).
+Dispatched at `cli/commands.cpp:10462` → `cmd_bus` (`cli/commands.cpp:10086`).
 
 - **bus list|peer <src> <dst>**: List PCI devices/windows or copy data between peer devices *(System & Environment)*
 
@@ -616,7 +616,7 @@ bus list | bus peer <src-slot> <dst-slot> [bytes]
 
 Also: `ui`, `console`, `desktop`
 
-Dispatched at `cli/commands.cpp:10453` → `cmd_gui` (`cli/commands.cpp:1763`).
+Dispatched at `cli/commands.cpp:10463` → `cmd_gui` (`cli/commands.cpp:1764`).
 
 - **gui [desktop [--tui]]**: AIOS desktop environment: start GUI/TUI interface or show options *(Applications & Shell)*
 
@@ -624,7 +624,7 @@ Dispatched at `cli/commands.cpp:10453` → `cmd_gui` (`cli/commands.cpp:1763`).
 
 Also: `unblink`
 
-Dispatched at `cli/commands.cpp:10454` → `cmd_browser` (`cli/commands.cpp:1477`).
+Dispatched at `cli/commands.cpp:10464` → `cmd_browser` (`cli/commands.cpp:1478`).
 
 - **browser <url>|follow <n>|back**: Built-in web browser: fetch, render, and navigate web pages *(Applications & Shell)*
 
@@ -639,25 +639,25 @@ browser follow <n>: '
 
 ## `devices`
 
-Dispatched at `cli/commands.cpp:10455` → `cmd_devices` (`cli/commands.cpp:465`).
+Dispatched at `cli/commands.cpp:10465` → `cmd_devices` (`cli/commands.cpp:465`).
 
 - **devices**: List compute devices (CPU, GPU, NPU, Remote) *(System & Environment)*
 
 ## `storage`
 
-Dispatched at `cli/commands.cpp:10456` → `cmd_storage` (`cli/commands.cpp:417`).
+Dispatched at `cli/commands.cpp:10466` → `cmd_storage` (`cli/commands.cpp:417`).
 
 - **storage**: List storage devices and root volume mount point *(System & Environment)*
 
 ## `network`
 
-Dispatched at `cli/commands.cpp:10457` → `cmd_network` (`cli/commands.cpp:439`).
+Dispatched at `cli/commands.cpp:10467` → `cmd_network` (`cli/commands.cpp:439`).
 
 - **network**: List network interfaces, IP addresses, and link status *(System & Environment)*
 
 ## `entity`
 
-Dispatched at `cli/commands.cpp:10458` → `cmd_entity` (`cli/commands.cpp:1845`).
+Dispatched at `cli/commands.cpp:10468` → `cmd_entity` (`cli/commands.cpp:1846`).
 
 - **entity create|list|show**: Manage persistent system entities *(Entities & Memory Fabric)*
 
@@ -673,7 +673,7 @@ entity terminate <e>
 
 ## `cap`
 
-Dispatched at `cli/commands.cpp:10459` → `cmd_cap` (`cli/commands.cpp:1911`).
+Dispatched at `cli/commands.cpp:10469` → `cmd_cap` (`cli/commands.cpp:1912`).
 
 - **cap grant <e> <kind> <id> <r>**: Grant derived capability rights to an entity *(Authority & Security)*
 - **cap request <kind> <id> <r>**: Request capability rights from kernel *(Authority & Security)*
@@ -693,19 +693,19 @@ cap check <e> <kind> <id|*> <right>
 
 ## `grain`
 
-Dispatched at `cli/commands.cpp:10460` → `cmd_grain` (`cli/commands.cpp:1990`).
+Dispatched at `cli/commands.cpp:10470` → `cmd_grain` (`cli/commands.cpp:1991`).
 
 - **grain run|eval|dis|repl**: Grain language runtime: evaluate code, disassemble bytecode, or start REPL *(Applications & Shell)*
 
 ## `sat`
 
-Dispatched at `cli/commands.cpp:10461` → `run_sat_command` (in `cli/`).
+Dispatched at `cli/commands.cpp:10471` → `run_sat_command` (in `cli/`).
 
 - **sat solve <file>**: Boolean satisfiability (SAT) solver: find model or prove UNSAT *(Compute & Graph Execution)*
 
 ## `mem`
 
-Dispatched at `cli/commands.cpp:10462` → `cmd_mem` (`cli/commands.cpp:1995`).
+Dispatched at `cli/commands.cpp:10472` → `cmd_mem` (`cli/commands.cpp:1996`).
 
 - **mem alloc|read|write**: Allocate, read, or write memory regions (system/shared/persistent/device) *(Entities & Memory Fabric)*
 - **mem migrate|share|list**: Migrate, share, or list allocated memory objects *(Entities & Memory Fabric)*
@@ -724,7 +724,7 @@ mem release <e> <mem>
 
 ## `state`
 
-Dispatched at `cli/commands.cpp:10463` → `cmd_state` (`cli/commands.cpp:2223`).
+Dispatched at `cli/commands.cpp:10473` → `cmd_state` (`cli/commands.cpp:2224`).
 
 - **state create|set|get|list**: Manage entity state objects *(Entities & Memory Fabric)*
 
@@ -741,13 +741,13 @@ state attach <e> <s> <mem>
 
 ## `asqlcap`
 
-Dispatched at `cli/commands.cpp:10464` → `cmd_asqlcap` (`cli/commands.cpp:2125`).
+Dispatched at `cli/commands.cpp:10474` → `cmd_asqlcap` (`cli/commands.cpp:2126`).
 
 Subcommands: `attenuate` `mint` `show` `user`
 
 ## `kv`
 
-Dispatched at `cli/commands.cpp:10465` → `cmd_kv` (`cli/commands.cpp:1283`).
+Dispatched at `cli/commands.cpp:10475` → `cmd_kv` (`cli/commands.cpp:1284`).
 
 - **kv set|get|del|list**: In-memory key-value store backed by StateObjects *(Entities & Memory Fabric)*
 
@@ -762,7 +762,7 @@ kv del <key>
 
 ## `tensor`
 
-Dispatched at `cli/commands.cpp:10466` → `cmd_tensor` (`cli/commands.cpp:2286`).
+Dispatched at `cli/commands.cpp:10476` → `cmd_tensor` (`cli/commands.cpp:2287`).
 
 - **tensor create|show**: Create or inspect typed tensor views (f32, f64, i32, etc.) *(Compute & Graph Execution)*
 
@@ -776,7 +776,7 @@ tensor show <e> <mem> <dtype> <shape>
 
 ## `graph`
 
-Dispatched at `cli/commands.cpp:10467` → `cmd_graph` (`cli/commands.cpp:2383`).
+Dispatched at `cli/commands.cpp:10477` → `cmd_graph` (`cli/commands.cpp:2384`).
 
 - **graph create|op|plan|run**: Build, optimize, schedule, and execute compute graphs *(Compute & Graph Execution)*
 
@@ -794,7 +794,7 @@ graph show <g>
 
 ## `compute`
 
-Dispatched at `cli/commands.cpp:10468` → `cmd_compute` (`cli/commands.cpp:2494`).
+Dispatched at `cli/commands.cpp:10478` → `cmd_compute` (`cli/commands.cpp:2495`).
 
 - **compute kernels|serve**: List compute kernels or serve compute/SQL service over network *(Compute & Graph Execution)*
 
@@ -808,7 +808,7 @@ compute serve: cdc_host= needs cdc_db=<the source database to mirror>
 
 ## `infer`
 
-Dispatched at `cli/commands.cpp:10469` → `cmd_infer` (`cli/commands.cpp:2828`).
+Dispatched at `cli/commands.cpp:10479` → `cmd_infer` (`cli/commands.cpp:2835`).
 
 - **infer load|status|ask|serve**: Run local Qwen2 checkpoint or serve OpenAI-compatible completions API *(Intelligence & Distributed)*
 
@@ -821,7 +821,7 @@ infer load|status|ask|serve  (load model=<dir> [adapter=<dir>] [context=N]; ask 
 
 ## `quota`
 
-Dispatched at `cli/commands.cpp:10470` → `cmd_quota` (`cli/commands.cpp:2339`).
+Dispatched at `cli/commands.cpp:10480` → `cmd_quota` (`cli/commands.cpp:2340`).
 
 - **quota set|list|clear|reset**: Manage execution time and compute quotas per entity *(Authority & Security)*
 
@@ -836,7 +836,7 @@ quota list | quota set <e> budget=<ns> [slice=<ns>] [period=<ns>] | quota clear 
 
 ## `channel`
 
-Dispatched at `cli/commands.cpp:10471` → `cmd_channel` (`cli/commands.cpp:2886`).
+Dispatched at `cli/commands.cpp:10481` → `cmd_channel` (`cli/commands.cpp:2893`).
 
 - **channel create|pub|sub|list**: Manage IPC state channels and ring buffers (pub/sub) *(Channels & Object Store)*
 
@@ -854,7 +854,7 @@ channel consume <e> <ch>
 
 ## `checkpoint`
 
-Dispatched at `cli/commands.cpp:10472` → `cmd_checkpoint` (`cli/commands.cpp:2933`).
+Dispatched at `cli/commands.cpp:10482` → `cmd_checkpoint` (`cli/commands.cpp:2940`).
 
 - **checkpoint <e> | restore <path>**: Create or restore entity state snapshots *(Intelligence & Distributed)*
 
@@ -864,7 +864,7 @@ checkpoint <e>
 
 ## `restore`
 
-Dispatched at `cli/commands.cpp:10473` → `cmd_restore` (`cli/commands.cpp:2955`).
+Dispatched at `cli/commands.cpp:10483` → `cmd_restore` (`cli/commands.cpp:2962`).
 
 - **checkpoint <e> | restore <path>**: Create or restore entity state snapshots *(Intelligence & Distributed)*
 
@@ -874,7 +874,7 @@ restore <path>
 
 ## `rewind`
 
-Dispatched at `cli/commands.cpp:10474` → `cmd_rewind` (`cli/commands.cpp:2942`).
+Dispatched at `cli/commands.cpp:10484` → `cmd_rewind` (`cli/commands.cpp:2949`).
 
 - **rewind <path>**: Restore a running entity to a saved checkpoint image *(Applications & Shell)*
 
@@ -884,7 +884,7 @@ rewind <path>
 
 ## `mind`
 
-Dispatched at `cli/commands.cpp:10475` → `cmd_mind` (`cli/commands.cpp:3021`).
+Dispatched at `cli/commands.cpp:10485` → `cmd_mind` (`cli/commands.cpp:3028`).
 
 - **mind bind|cycle|unbind**: Manage AI backend slot binding (echo, plugin, extern, wire, qwen, jepa) *(Intelligence & Distributed)*
 
@@ -912,7 +912,7 @@ jepa
 
 Also: `llm`, `spark`
 
-Dispatched at `cli/commands.cpp:10476` → `cmd_qwen` (`cli/commands.cpp:4761`).
+Dispatched at `cli/commands.cpp:10486` → `cmd_qwen` (`cli/commands.cpp:4768`).
 
 - **qwen status|ask|local**: Query remote LLM model server or local in-tree model *(Intelligence & Distributed)*
 
@@ -922,7 +922,7 @@ Subcommands: `ask` `cuda` `in-process` `local` `prompt` `query` `status`
 
 Also: `world-model`
 
-Dispatched at `cli/commands.cpp:10477` → `cmd_jepa` (`cli/commands.cpp:4036`).
+Dispatched at `cli/commands.cpp:10487` → `cmd_jepa` (`cli/commands.cpp:4043`).
 
 - **jepa status|record|train|tick**: JEPA world model: inspect latent state, record transitions, train policy *(Intelligence & Distributed)*
 
@@ -937,7 +937,7 @@ jepa import <path>  — reads <path> and <path>.policy
 
 Also: `language`
 
-Dispatched at `cli/commands.cpp:10478` → `cmd_lm` (`cli/commands.cpp:3178`).
+Dispatched at `cli/commands.cpp:10488` → `cmd_lm` (`cli/commands.cpp:3185`).
 
 - **lm status|ask|train|tokenize**: Built-in small language model: status, generation, training, tokenizer *(Intelligence & Distributed)*
 
@@ -960,7 +960,7 @@ ask <request>
 
 Also: `screen`, `show`
 
-Dispatched at `cli/commands.cpp:10479` → `cmd_display` (`cli/commands.cpp:3780`).
+Dispatched at `cli/commands.cpp:10489` → `cmd_display` (`cli/commands.cpp:3787`).
 
 - **display show|set|status|list**: Display manager: inspect framebuffer, resolution, and active views *(Applications & Shell)*
 
@@ -973,7 +973,7 @@ display status | show <ocean|cyber|orb|pyramid>
 
 ## `store`
 
-Dispatched at `cli/commands.cpp:10481` → `cmd_store` (`cli/commands.cpp:4858`).
+Dispatched at `cli/commands.cpp:10491` → `cmd_store` (`cli/commands.cpp:4865`).
 
 - **store put|get|similar|list**: Semantic object store: store, retrieve, search similarity, or list *(Channels & Object Store)*
 
@@ -993,7 +993,7 @@ store meta <key> [value]
 
 ## `expect`
 
-Dispatched at `cli/commands.cpp:10482` → `cmd_expect` (`cli/commands.cpp:5760`).
+Dispatched at `cli/commands.cpp:10492` → `cmd_expect` (`cli/commands.cpp:5770`).
 
 - **expect <text>**: Assertion test: fail unless previous output contains specified text *(Applications & Shell)*
 
@@ -1003,7 +1003,7 @@ expect <substring>
 
 ## `expect-error`
 
-Dispatched at `cli/commands.cpp:10483` → `cmd_expect_error` (`cli/commands.cpp:5770`).
+Dispatched at `cli/commands.cpp:10493` → `cmd_expect_error` (`cli/commands.cpp:5780`).
 
 ```
 expect-error <substring> <cmd...>
@@ -1011,7 +1011,7 @@ expect-error <substring> <cmd...>
 
 ## `node`
 
-Dispatched at `cli/commands.cpp:10484` → `cmd_node` (`cli/commands.cpp:5162`).
+Dispatched at `cli/commands.cpp:10494` → `cmd_node` (`cli/commands.cpp:5169`).
 
 - **node serve|connect|memory|list**: Connect and manage remote peer kernels across network fabric *(Intelligence & Distributed)*
 
@@ -1028,7 +1028,7 @@ node migrate <e> [node-index=0] [keep]   move a running entity to a connected pe
 
 Also: `dht`, `mesh`
 
-Dispatched at `cli/commands.cpp:10485` → `cmd_p2p` (`cli/commands.cpp:5209`).
+Dispatched at `cli/commands.cpp:10495` → `cmd_p2p` (`cli/commands.cpp:5216`).
 
 - **p2p status|peers|ping|mdns**: Peer-to-peer networking: local DHT, mDNS discovery, and node ping *(Intelligence & Distributed)*
 
@@ -1045,7 +1045,7 @@ p2p status|peers|ping|store|find-value|find-node|mdns
 
 ## `fleet`
 
-Dispatched at `cli/commands.cpp:10486` → `cmd_fleet` (`cli/commands.cpp:5381`).
+Dispatched at `cli/commands.cpp:10496` → `cmd_fleet` (`cli/commands.cpp:5388`).
 
 - **fleet hub|join|members|status**: Cluster fleet management: hub discovery, node membership, load balancing *(Intelligence & Distributed)*
 
@@ -1063,7 +1063,7 @@ fleet hub|join|run|members|observe|status|slots|watermarks|plan|tick|watch|repli
 
 ## `gateway`
 
-Dispatched at `cli/commands.cpp:10487` → `cmd_gateway` (`cli/commands.cpp:5628`).
+Dispatched at `cli/commands.cpp:10497` → `cmd_gateway` (`cli/commands.cpp:5635`).
 
 - **gateway serve|token|mint|route**: Token-gated HTTP gateway for remote compute requests *(Authority & Security)*
 
@@ -1082,7 +1082,7 @@ gateway serve|token|route|status
 
 Also: `rss`
 
-Dispatched at `cli/commands.cpp:10488` → `cmd_feed` (`cli/commands.cpp:2079`).
+Dispatched at `cli/commands.cpp:10498` → `cmd_feed` (`cli/commands.cpp:2080`).
 
 - **feed ingest <url>|list**: Ingest and list RSS/Atom feeds into semantic object store *(Channels & Object Store)*
 
@@ -1098,7 +1098,7 @@ feed ingest <url> | feed list [url]
 
 Also: `transaction`
 
-Dispatched at `cli/commands.cpp:10489` → `cmd_tx` (`cli/commands.cpp:7453`).
+Dispatched at `cli/commands.cpp:10499` → `cmd_tx` (`cli/commands.cpp:7463`).
 
 - **tx plan|stage|commit|abort|show**: Atomic multi-file patch transactions (plan, stage, commit, abort) *(Applications & Shell)*
 
@@ -1106,19 +1106,19 @@ Subcommands: `abort` `apply` `commit` `list` `plan` `review` `show` `stage` `sta
 
 ## `watchdog`
 
-Dispatched at `cli/commands.cpp:10490` → `cmd_watchdog` (`cli/commands.cpp:2060`).
+Dispatched at `cli/commands.cpp:10500` → `cmd_watchdog` (`cli/commands.cpp:2061`).
 
 - **watchdog**: System watchdog: monitor health checks, heap, and recovery status *(System & Environment)*
 
 ## `sleep`
 
-Dispatched at `cli/commands.cpp:10491`.
+Dispatched at `cli/commands.cpp:10501`.
 
 - **sleep <sec>**: Pause execution for specified seconds *(System & Environment)*
 
 ## `build`
 
-Dispatched at `cli/commands.cpp:10492`.
+Dispatched at `cli/commands.cpp:10502`.
 
 - **build [test|gate|<args...>]**: Compile system targets, execute test suites, or run audit gates *(Applications & Shell)*
 
@@ -1126,7 +1126,7 @@ Dispatched at `cli/commands.cpp:10492`.
 
 Also: `dualboot`
 
-Dispatched at `cli/commands.cpp:10508` → `cmd_install` (`cli/commands.cpp:9944`).
+Dispatched at `cli/commands.cpp:10518` → `cmd_install` (`cli/commands.cpp:9954`).
 
 - **install dualboot|disk|status**: Bare-metal installer: manage disk partitioning and dual-boot setup *(Applications & Shell)*
 
@@ -1140,13 +1140,13 @@ install [status] | install dualboot | install disk <dev> | install remove
 
 ## `load`
 
-Dispatched at `cli/commands.cpp:10513` → `cmd_load_correct` (`cli/commands.cpp:3731`).
+Dispatched at `cli/commands.cpp:10523` → `cmd_load_correct` (`cli/commands.cpp:3738`).
 
 - **load**: Measure system load and request compute quota from host *(System & Environment)*
 
 ## `host`
 
-Dispatched at `cli/commands.cpp:10514`.
+Dispatched at `cli/commands.cpp:10524`.
 
 - **host <command...>**: Execute command on the underlying host operating system *(Applications & Shell)*
 
@@ -1154,7 +1154,7 @@ Dispatched at `cli/commands.cpp:10514`.
 
 Also: `restart`
 
-Dispatched at `cli/commands.cpp:10526`.
+Dispatched at `cli/commands.cpp:10536`.
 
 - **reboot | poweroff**: Restart or shut down the system substrate *(System & Environment)*
 
@@ -1162,7 +1162,7 @@ Dispatched at `cli/commands.cpp:10526`.
 
 Also: `animate`
 
-Dispatched at `cli/commands.cpp:10549`.
+Dispatched at `cli/commands.cpp:10559`.
 
 - **scene**: Inspect and manage desktop scene graph and layout *(Applications & Shell)*
 
@@ -1170,18 +1170,18 @@ Dispatched at `cli/commands.cpp:10549`.
 
 Also: `shutdown`, `halt`
 
-Dispatched at `cli/commands.cpp:10590`.
+Dispatched at `cli/commands.cpp:10600`.
 
 - **reboot | poweroff**: Restart or shut down the system substrate *(System & Environment)*
 
 ## `set`
 
-Dispatched at `cli/commands.cpp:10608`.
+Dispatched at `cli/commands.cpp:10618`.
 
 - **set NAME**: Bind last produced command output to session variable $NAME *(Applications & Shell)*
 
 ## `echo`
 
-Dispatched at `cli/commands.cpp:10609`.
+Dispatched at `cli/commands.cpp:10619`.
 
 - **echo <text>**: Print text to standard output *(Applications & Shell)*

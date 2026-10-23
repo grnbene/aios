@@ -41,7 +41,6 @@
 #include "aios/userland/patch_transaction.hpp"
 
 #include <cstring>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -917,22 +916,15 @@ int aios_telemetry_get_trace_json(uint64_t trace_id, char* out_json, size_t max_
   if (!out_json || max_len == 0) return AIOS_ERR_INVALID;
 
   auto events = aios::sidecar::get_global_telemetry().query_trace(trace_id);
-  std::ostringstream json;
-  json << "{\"trace_id\":" << trace_id << ",\"events\":[";
-
+  std::string s = "{\"trace_id\":" + std::to_string(trace_id) + ",\"events\":[";
   for (size_t i = 0; i < events.size(); ++i) {
-    if (i > 0) json << ",";
+    if (i > 0) s += ",";
     const auto& ev = events[i];
-    json << "{\"span_id\":" << ev.span_id
-         << ",\"type\":" << ev.event_type
-         << ",\"status\":" << ev.status_code
-         << ",\"duration_us\":" << ev.duration_us
-         << ",\"payload_int\":" << ev.payload_int
-         << ",\"tag\":\"" << json_escape(ev.tag) << "\"}";
+    s += "{\"span_id\":" + std::to_string(ev.span_id) + ",\"type\":" + std::to_string(ev.event_type) +
+         ",\"status\":" + std::to_string(ev.status_code) + ",\"duration_us\":" + std::to_string(ev.duration_us) +
+         ",\"payload_int\":" + std::to_string(ev.payload_int) + ",\"tag\":\"" + json_escape(ev.tag) + "\"}";
   }
-  json << "]}";
-
-  std::string s = json.str();
+  s += "]}";
   if (s.size() + 1 > max_len) return AIOS_ERR_BUFFER_TOO_SMALL;
   std::memcpy(out_json, s.c_str(), s.size() + 1);
   return AIOS_OK;

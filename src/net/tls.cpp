@@ -13,7 +13,8 @@
 #include "aios/crypto/rsa.hpp"
 #include "aios/crypto/sha256.hpp"
 #include "aios/crypto/sha512.hpp"
-#include <mutex>
+#include <mutex>   // std::lock_guard
+#include "aios/hal/sync.hpp"
 #include "aios/node/secure.hpp"   // chacha20_xor, poly1305
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -521,7 +522,7 @@ struct Ticket {
 std::map<std::string, Ticket>& ticket_cache() { static std::map<std::string, Ticket> c; return c; }
 // Connections are made from several threads at once (a page's stylesheets and scripts download together), and every
 // one reads and writes this process-wide map.
-std::mutex& ticket_mutex() { static std::mutex m; return m; }
+aios::hal::Mutex& ticket_mutex() { static aios::hal::Mutex m; return m; }
 
 // Each curve signs with its own hash (RFC 8446 4.2.3): ecdsa_secp256r1_sha256, _secp384r1_sha384, _secp521r1_sha512.
 uint16_t ec_sig_alg(crypto::NistCurve c) {
@@ -659,7 +660,7 @@ Result<void> TlsClient::connect_over(std::unique_ptr<hal::Connection> conn, cons
   Ticket resume;
   bool have_ticket = false;
   {
-    std::lock_guard<std::mutex> lk(ticket_mutex());
+    std::lock_guard<aios::hal::Mutex> lk(ticket_mutex());
     auto it = ticket_cache().find(s.ticket_key);
     if (it != ticket_cache().end()) {
       const uint64_t age_ms = s.host.monotonic_ns() / 1000000ull - it->second.received_ms;
@@ -1590,7 +1591,7 @@ Result<ByteBuffer> TlsClient::read(int timeout_ms) {
               t.sha384 = impl_->sha384; t.suite = impl_->suite;
               t.subject = impl_->subject; t.issuer = impl_->issuer; t.anchor = impl_->anchor;
               if (t.lifetime_s > 0) {
-                std::lock_guard<std::mutex> lk(ticket_mutex());
+                std::lock_guard<aios::hal::Mutex> lk(ticket_mutex());
                 ticket_cache()[impl_->ticket_key] = std::move(t);
               }
             }

@@ -1,5 +1,6 @@
 // JSON.parse and JSON.stringify.
 #include <algorithm>
+#include "aios/hal/host.hpp"
 #include <cmath>
 #include <cstdlib>
 
@@ -86,7 +87,7 @@ struct JsonParser {
     std::string t;
     for (size_t i = start; i < pos; ++i) t.push_back(static_cast<char>(s[i]));
     double d;
-    if (!parse_decimal_ascii(t, &d)) d = std::strtod(t.c_str(), nullptr);
+    if (!parse_decimal_ascii(t, &d)) d = aios::hal::parse_double(t.c_str(), nullptr);
     return Value::Number(d);
   }
 

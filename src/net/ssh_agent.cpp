@@ -7,6 +7,7 @@
 // it reads: a reply is one 4-byte length, one type byte and its fields, each
 // field framed again. Nothing here signs anything itself — it asks.
 #include "aios/net/ssh_agent.hpp"
+#include "aios/hal/host.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -125,10 +126,9 @@ class AgentConnection {
 };
 
 Result<std::string> env_value(const char* name) {
-  const char* v = std::getenv(name);
-  if (v == nullptr || *v == '\0')
-    return Result<std::string>(Status::NotFound, std::string("the environment does not set ") + name);
-  return std::string(v);
+  std::string v = hal::process_host().env(name);
+  if (v.empty()) return Result<std::string>(Status::NotFound, std::string("the environment does not set ") + name);
+  return v;
 }
 
 class Agent final : public SshAgent {

@@ -1,4 +1,5 @@
 #include "aios/sidecar/capability_guard.hpp"
+#include "aios/core/numparse.hpp"
 #include "aios/crypto/hmac_sha256.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/hal/host.hpp"
@@ -82,8 +83,8 @@ bool CapabilityGuard::decode_generations(const std::string& content, std::unorde
     const size_t tab = line.find('\t');
     std::string name;
     if (tab == std::string::npos || !hex_decode(line.substr(0, tab), &name)) return false;
-    char* end = nullptr;
-    unsigned long gen = std::strtoul(line.c_str() + tab + 1, &end, 10);
+    const char* end = nullptr;
+    unsigned long gen = (unsigned long)aios::num::to_ull(line.c_str() + tab + 1, &end, 10);
     if (end == line.c_str() + tab + 1 || *end != '\0' || gen == 0) return false;
     (*out)[name] = (uint32_t)gen;
   }
@@ -108,7 +109,7 @@ void CapabilityGuard::load_generations() {
   if (have_best) { resource_generations_ = std::move(best); return; }
   if (any_file) {
     store_ok_ = false;
-    std::fprintf(stderr, "[capability] %s is damaged or was signed with another key: its revocations are unknown, so every resource check is refused until it is restored or removed\n", generations_file_.c_str());
+    aios::hal::host_note("[capability] " + generations_file_ + " is damaged or was signed with another key: its revocations are unknown, so every resource check is refused until it is restored or removed\n");
   }
 }
 

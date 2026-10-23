@@ -1,4 +1,5 @@
 #include <cctype>
+#include "aios/core/numparse.hpp"
 #include "aios/channel/http_client.hpp"
 #include <cstring>
 #include <memory>
@@ -151,7 +152,7 @@ Result<HttpEndpoint> parse_endpoint(const std::string& url) {
       for (size_t i = 0; i < v.size(); ++i) {
         if (v[i] == '%' && i + 2 < v.size() && std::isxdigit(static_cast<unsigned char>(v[i + 1])) &&
             std::isxdigit(static_cast<unsigned char>(v[i + 2]))) {
-          out += static_cast<char>(std::stoi(v.substr(i + 1, 2), nullptr, 16));
+          out += static_cast<char>(aios::num::to_ll(v.substr(i + 1, 2), 16));
           i += 2;
         } else {
           out += v[i];

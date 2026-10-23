@@ -5,7 +5,6 @@
 #include <vector>
 
 #if defined(AIOS_HAVE_LIBDEFLATE)
-#include <libdeflate.h>
 #endif
 #include "aios/net/gzip.hpp"
 
@@ -541,18 +540,7 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
 
 bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) {
 #if defined(AIOS_HAVE_LIBDEFLATE)
-  {
-    struct D {
-      libdeflate_decompressor* d = libdeflate_alloc_decompressor();
-      ~D() { if (d) libdeflate_free_decompressor(d); }
-    };
-    thread_local D dec;
-    if (dec.d) {
-      size_t got = 0;
-      if (libdeflate_deflate_decompress(dec.d, data.data(), data.size(), out, expect, &got) == LIBDEFLATE_SUCCESS && got == expect) return true;
-      // anything else: zlib or the decoder below says why, and the answer must agree
-    }
-  }
+  if (host_inflate_raw_exact(data, out, expect)) return true;   // anything else: zlib or the decoder below says why, and the answer must agree
 #endif
 #if defined(AIOS_HAVE_ZLIB)
   {

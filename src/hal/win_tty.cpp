@@ -33,13 +33,13 @@ struct Handle {
 
 }  // namespace
 
-Result<std::string> tty_prompt(const std::string& prompt, bool echo) {
+Result<std::string> tty_ask(const std::string& question, bool echo) {
   Handle in(::CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
   Handle out(::CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
   if (in.h == INVALID_HANDLE_VALUE || out.h == INVALID_HANDLE_VALUE)
     return Result<std::string>(Status::NotFound, "no console to ask");
 
-  std::wstring wp = widen(prompt);
+  std::wstring wp = widen(question);
   DWORD wrote = 0;
   ::WriteConsoleW(out.h, wp.data(), (DWORD)wp.size(), &wrote, nullptr);
 

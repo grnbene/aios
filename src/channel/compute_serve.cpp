@@ -480,7 +480,9 @@ struct Service {
     r.set("op", RpcValue::text("ping"));
     r.set("kernel", RpcValue::text(k.self().short_str()));
     RpcValue devs = RpcValue::list();
-    for (auto* d : k.devices().all()) {
+    // The devices registered so far: a liveness check must not be the call that opens the GPU runtime (on a CUDA
+    // machine that compiles kernels for seconds, and the first ping timed out). A job that needs one loads them.
+    for (auto* d : k.devices().all_loaded()) {
       RpcValue dv = RpcValue::object();
       dv.set("name", RpcValue::text(d->name()));
       dv.set("type", RpcValue::text(device_type_name(d->type())));

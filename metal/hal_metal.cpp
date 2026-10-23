@@ -406,6 +406,8 @@ aios::Result<void> metal_adopt_volume() { return aios::hal::g_host ? aios::hal::
 namespace aios::hal {
 
 // No dynamic loading, no network on the first boot.
+#include "aios/hal/parse_double_portable.inc"
+double parse_double(const char* s, char** end) { return aios_parse_double_portable(s, end); }
 void host_note(const std::string& text) { metal_console_write(text.c_str(), text.size()); }
 void* load_library(const std::string&) { return nullptr; }
 void* library_symbol(void*, const std::string&) { return nullptr; }
@@ -432,7 +434,7 @@ Result<LocalAccount> local_account() {
   return Result<LocalAccount>(Status::Unsupported, "no accounts on the x86 metal substrate");
 }
 std::string local_hostname() { return {}; }
-Result<std::string> tty_prompt(const std::string&, bool) {
+Result<std::string> tty_ask(const std::string&, bool) {
   return Result<std::string>(Status::Unsupported, "no terminal to ask on the x86 metal substrate");
 }
 // No filesystem sockets on this substrate. src/ calls these (the ASQL wire

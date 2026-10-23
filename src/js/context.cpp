@@ -1,5 +1,6 @@
 // The engine context: strings, objects, conversions, property access, calls, iteration, jobs and collection.
 #include <algorithm>
+#include "aios/hal/host.hpp"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +49,7 @@ Context::Context() {
   };
   vm_init(*this);
 #ifndef AIOS_METAL
-  if (std::getenv("AIOS_JS_GC_STRESS")) heap.set_stress(true);
+  if (!aios::hal::process_host().env("AIOS_JS_GC_STRESS").empty()) heap.set_stress(true);
 #endif
   init_realm();
 }

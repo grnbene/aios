@@ -64,7 +64,7 @@ struct SshHostKeyPolicy {
 // What ssh does when a server has proved it holds `blob`: Known → Ok. Revoked → refused. Changed → refused with
 // OpenSSH's "REMOTE HOST IDENTIFICATION HAS CHANGED" warning naming the file and line, under every setting
 // (as ssh refuses a changed key for publickey sessions). Unknown → yes refuses; accept-new, no and off record it
-// in the first user file and go on; ask puts OpenSSH's question to the terminal (hal::tty_prompt): "yes" or the
+// in the first user file and go on; ask puts OpenSSH's question to the terminal (hal::tty_ask): "yes" or the
 // key's SHA256 fingerprint records it, anything else (or no terminal, or batch) refuses.
 // `name` is what the host is recorded under (ssh_known_hosts_name, or the HostKeyAlias); `shown` is the name
 // used in messages. Messages that ssh prints as warnings go to `notes`.

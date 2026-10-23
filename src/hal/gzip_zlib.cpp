@@ -177,3 +177,37 @@ bool zlib_inflate_prefix(ByteSpan data, uint8_t* out, size_t max, size_t* got) {
 
 }  // namespace aios::net
 #endif
+
+// libdeflate, the host's fast raw-deflate codec, for the core that may not call it itself (the zero-host gate):
+// the object store's payloads and the inflater's first try. False / 0 where the host has no libdeflate; the
+// caller then uses zlib or the portable codec.
+#if defined(AIOS_HAVE_LIBDEFLATE)
+#include <libdeflate.h>
+namespace aios::net {
+bool host_inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) {
+  struct D {
+    libdeflate_decompressor* d = libdeflate_alloc_decompressor();
+    ~D() { if (d) libdeflate_free_decompressor(d); }
+  };
+  thread_local D dec;
+  if (!dec.d) return false;
+  size_t got = 0;
+  return libdeflate_deflate_decompress(dec.d, data.data(), data.size(), out, expect, &got) == LIBDEFLATE_SUCCESS && got == expect;
+}
+size_t host_deflate_raw(ByteSpan data, uint8_t* out, size_t cap, int level) {
+  struct C {
+    int level = -1;
+    libdeflate_compressor* c = nullptr;
+    ~C() { if (c) libdeflate_free_compressor(c); }
+  };
+  thread_local C comp;
+  if (!comp.c || comp.level != level) {
+    if (comp.c) libdeflate_free_compressor(comp.c);
+    comp.c = libdeflate_alloc_compressor(level);
+    comp.level = level;
+  }
+  if (!comp.c) return 0;
+  return libdeflate_deflate_compress(comp.c, data.data(), data.size(), out, cap);
+}
+}  // namespace aios::net
+#endif

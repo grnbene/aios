@@ -1,5 +1,6 @@
 // The JavaScript tokeniser.
 #include "lexer.hpp"
+#include "aios/hal/host.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -248,7 +249,7 @@ void Lexer::read_number(Token& t) {
         if (at(pos_) == '+' || at(pos_) == '-') s += static_cast<char>(src_[pos_++]);
         while (at(pos_) >= '0' && at(pos_) <= '9') s += static_cast<char>(src_[pos_++]);
       }
-      t.num = std::strtod(s.c_str(), nullptr);
+      t.num = aios::hal::parse_double(s.c_str(), nullptr);
     }
     if (strict) t.error = "Octal literals are not allowed in strict mode.";
   } else {
@@ -279,7 +280,7 @@ void Lexer::read_number(Token& t) {
       ++pos_;
       for (char d : s) t.str += static_cast<char16_t>(d);
     }
-    t.num = std::strtod(s.c_str(), nullptr);
+    t.num = aios::hal::parse_double(s.c_str(), nullptr);
   }
   // A number may not run straight into an identifier or another digit.
   uint32_t nx = at(pos_);

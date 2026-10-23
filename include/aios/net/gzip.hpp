@@ -62,6 +62,12 @@ bool zlib_inflate_prefix(ByteSpan data, uint8_t* out, size_t max, size_t* got);
 // has no libdeflate or it refuses the stream: the caller then inflates with zlib.
 bool zlib_inflate_known(ByteSpan data, uint8_t* out, size_t expect, size_t* consumed, size_t* got);
 #endif
+#if defined(AIOS_HAVE_LIBDEFLATE)
+// The host's libdeflate (src/hal/gzip_zlib.cpp): a raw deflate stream that inflates to exactly `expect` bytes; and
+// `data` compressed raw at `level` into `out`, its size, or 0 when it does not fit in `cap`.
+bool host_inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect);
+size_t host_deflate_raw(ByteSpan data, uint8_t* out, size_t cap, int level);
+#endif
 
 // Picks gzip when the client's Accept-Encoding header allows it and `mime`
 // is a type worth compressing (text/html, application/json, ...); images,

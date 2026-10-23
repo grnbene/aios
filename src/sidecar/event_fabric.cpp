@@ -3,35 +3,21 @@
 #include "aios/hal/sync.hpp"
 #include <cstring>
 #include <algorithm>
-#if defined(_WIN32)
-#include <windows.h>
-#elif !defined(AIOS_METAL) && !defined(__wasi__)
-#include <sys/mman.h>
-#endif
 
 namespace aios::sidecar {
 
 EventPartition::EventPartition(size_t ring_capacity)
     : capacity_(ring_capacity) {
   const size_t bytes = capacity_ * sizeof(EventMessage);
-#if defined(_WIN32)
-  // committed pages are zero and not resident until touched
-  ring_ = static_cast<EventMessage*>(::VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-  mapped_ = ring_ != nullptr;
-#elif !defined(AIOS_METAL) && !defined(__wasi__)
-  void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (p != MAP_FAILED) { ring_ = static_cast<EventMessage*>(p); mapped_ = true; }
-#endif
+  // Pages from the host: zero, and not resident until touched (a 15 MB ring costs what it holds).
+  auto m = hal::process_host().map(bytes, hal::MappingKind::Private);
+  if (m.ok() && m->base) { mapping_ = *m; ring_ = static_cast<EventMessage*>(mapping_.base); mapped_ = true; }
   if (!ring_) ring_ = new EventMessage[capacity_]();   // no mappings here: zeroed the old way
 }
 
 EventPartition::~EventPartition() {
   if (!ring_) return;
-#if defined(_WIN32)
-  if (mapped_) { ::VirtualFree(ring_, 0, MEM_RELEASE); return; }
-#elif !defined(AIOS_METAL) && !defined(__wasi__)
-  if (mapped_) { ::munmap(ring_, capacity_ * sizeof(EventMessage)); return; }
-#endif
+  if (mapped_) { hal::process_host().unmap(mapping_); return; }
   delete[] ring_;
 }
 

@@ -308,7 +308,7 @@ Result<void> ssh_accept_host_key(hal::Host& host, const SshHostKeyPolicy& policy
   if (!c.known_algorithms.empty()) question += "This host key is known by other names or types; its " + label + " key is not.\n";
   question += "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
   for (;;) {
-    auto answer = hal::tty_prompt(question, true);
+    auto answer = hal::tty_ask(question, true);
     if (!answer.ok()) return Result<void>(Status::Denied, "No terminal to ask whether to trust " + shown + "'s " + label + " key " + fp + ".\n" + failed);
     std::string a = *answer;
     while (!a.empty() && (a.back() == ' ' || a.back() == '\r')) a.pop_back();

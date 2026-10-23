@@ -1,5 +1,6 @@
 // Date.
 #include <algorithm>
+#include "aios/core/numparse.hpp"
 #include <cmath>
 #include <cstring>
 
@@ -765,7 +766,7 @@ bool parse_locale_options(Context& ctx, const Value& opts, int defaults, LocaleO
       if (up == "UTC" || up == "GMT" || up == "ETC/UTC" || up == "ETC/GMT") lo->utc = true;
       else if ((tz[0] == '+' || tz[0] == '-') && tz.size() >= 3) {
         const int sign = tz[0] == '-' ? -1 : 1;
-        int hh = std::atoi(tz.substr(1, 2).c_str()), mm = tz.size() >= 6 ? std::atoi(tz.substr(4, 2).c_str()) : 0;
+        int hh = aios::num::to_int(tz.substr(1, 2).c_str()), mm = tz.size() >= 6 ? aios::num::to_int(tz.substr(4, 2).c_str()) : 0;
         lo->fixed_offset_ms = sign * (hh * 60 + mm) * 60000.0;
       } else {
         ctx.throw_range_error("Invalid time zone specified: " + tz);
