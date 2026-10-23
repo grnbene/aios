@@ -94,6 +94,13 @@ void Lexer::skip_run() {
   }
 }
 
+static int hex_digit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
 // A string literal, with the escapes a program actually needs. An unknown
 // escape is an error rather than the character itself: "\d" is far more often
 // a typo than an intent, and silently eating the backslash hides it.
@@ -116,6 +123,38 @@ Token Lexer::string_token(bool is_fstr) {
       case 't': out.push_back('\t'); break;
       case 'r': out.push_back('\r'); break;
       case '0': out.push_back('\0'); break;
+      case 'a': out.push_back('\a'); break;
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      case 'v': out.push_back('\v'); break;
+      case 'e': out.push_back('\x1b'); break;
+      // \xHH is one byte; \u{H..} is one code point, written as UTF-8.
+      case 'x': {
+        int v = 0;
+        for (int k = 0; k < 2; ++k) {
+          const int h = hex_digit(peek());
+          if (h < 0) return Token{Tok::Error, "\\x wants two hex digits", 0, 0, start_line};
+          v = v * 16 + h;
+          advance();
+        }
+        out.push_back((char)v);
+        break;
+      }
+      case 'u': {
+        if (peek() != '{') return Token{Tok::Error, "\\u wants a code point in braces: \\u{1F600}", 0, 0, start_line};
+        advance();
+        uint32_t cp = 0;
+        int n = 0;
+        while (hex_digit(peek()) >= 0 && n < 8) { cp = cp * 16 + (uint32_t)hex_digit(peek()); advance(); ++n; }
+        if (peek() != '}' || n == 0) return Token{Tok::Error, "\\u{...} wants 1 to 6 hex digits and a closing brace", 0, 0, start_line};
+        advance();
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return Token{Tok::Error, "\\u{...} is not a Unicode scalar value", 0, 0, start_line};
+        if (cp < 0x80) out.push_back((char)cp);
+        else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+        else if (cp < 0x10000) { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+        else { out.push_back((char)(0xF0 | (cp >> 18))); out.push_back((char)(0x80 | ((cp >> 12) & 0x3F))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+        break;
+      }
       case '\\': out.push_back('\\'); break;
       case '"': out.push_back('"'); break;
       case '\'': out.push_back('\''); break;

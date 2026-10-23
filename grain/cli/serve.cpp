@@ -35,7 +35,10 @@ int serve_ui(const std::string&, std::function<bool(std::string&, std::string&, 
 
 namespace {
 
-bool read_request(int fd, std::string& head, std::string& body) {
+size_t g_max_body = 1 << 20;
+
+// false: the connection is unusable. too_big: it was a well-formed request with a body past the limit.
+bool read_request(int fd, std::string& head, std::string& body, bool& too_big) {
   std::string buf;
   char tmp[4096];
   size_t end = std::string::npos;
@@ -53,7 +56,7 @@ bool read_request(int fd, std::string& head, std::string& body) {
   for (char& c : lower) c = (char)std::tolower((unsigned char)c);
   const size_t cl = lower.find("\r\ncontent-length:");
   if (cl != std::string::npos) want = (size_t)std::strtoull(head.c_str() + cl + 17, nullptr, 10);
-  if (want > 1 << 20) return false;
+  if (want > g_max_body) { too_big = true; return false; }
   while (body.size() < want) {
     const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
     if (n <= 0) return false;
@@ -87,7 +90,15 @@ bool send_all(int fd, const std::string& data) {
 
 void answer(int fd, g::WebUi& ui) {
   std::string head, body;
-  if (!read_request(fd, head, body)) { ::close(fd); return; }
+  bool too_big = false;
+  if (!read_request(fd, head, body, too_big)) {
+    if (too_big) {
+      static const char refuse[] = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      (void)::send(fd, refuse, sizeof refuse - 1, 0);
+    }
+    ::close(fd);
+    return;
+  }
   const size_t sp1 = head.find(' '), sp2 = head.find(' ', sp1 + 1);
   g::WebUi::Request req;
   req.method = head.substr(0, sp1);
@@ -136,6 +147,7 @@ void answer(int fd, g::WebUi& ui) {
 int serve_ui(const std::string& name,
              std::function<bool(std::string&, std::string&, std::string&)> load_source,
              std::function<void(g::Vm&)> setup, const ServeOptions& opt) {
+  g_max_body = opt.max_body;
   g::WebUi::Host host;
   host.origin = name;
   host.show_errors = opt.show_errors;

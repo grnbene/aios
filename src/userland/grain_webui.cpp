@@ -748,7 +748,7 @@ std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
   s->vm = std::make_unique<Vm>();
   s->vm->sink = &s->printed;
   s->vm->step_limit = host_.max_steps;
-  if (host_.setup) s->keep = host_.setup(*s->vm);
+  if (host_.setup) s->keep = host_.setup(*s->vm);   // the host sets base_dir (where import looks) when it knows the program's directory
   // A window program calls run_panes() and the desktop runs the loop; here the server does, so it returns at once.
   s->vm->define_native("run_panes", 0, 1, [](Vm&, std::vector<Value>&, std::string&) { return Value::nil(); });
   auto run = s->vm->run(compiled.script);
@@ -876,7 +876,36 @@ WebUi::Response WebUi::handle(const Request& req) {
   if (!new_id.empty()) cookie_header = host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "");
 
   // Custom API routes registered on the pane (e.g. ui.pane({"routes": {"/stock_check": fn(req)}}))
-  if (req.path != "/" && req.path != "/_ui/event") {
+  bool api_only = false;
+  {
+    std::lock_guard<std::mutex> turn(s->mu);
+    api_only = web_pane_api_only(*s->vm, s->pane);
+  }
+  if ((req.path != "/" || api_only) && req.path != "/_ui/event") {
+    int status = 200;
+    std::string res_body, content_type, route_err;
+    // A pane made with "workers": true runs each request in a VM of its own, outside the session's lock, so a
+    // slow route does not hold up the others (or the page). Only the copying of the handler is done under it.
+    RouteJob job;
+    bool prepared = false;
+    {
+      std::lock_guard<std::mutex> turn(s->mu);
+      prepared = web_pane_route_prepare(*s->vm, s->pane, req.method, req.path, req.query, req.body, job, route_err);
+    }
+    if (prepared) {
+      job.call->run();
+      if (web_pane_route_finish(job, status, res_body, content_type, route_err)) {
+        res.status = status;
+        res.headers = {{"Content-Type", content_type}, {"Access-Control-Allow-Origin", "*"}, {"X-Content-Type-Options", "nosniff"}};
+        if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
+        res.body = std::move(res_body);
+        return res;
+      }
+      return fail(500, route_err);
+    }
+    if (!route_err.empty()) return fail(500, route_err);
+  }
+  if ((req.path != "/" || api_only) && req.path != "/_ui/event") {
     std::lock_guard<std::mutex> turn(s->mu);
     Vm& vm = *s->vm;
     int status = 200;
@@ -889,6 +918,13 @@ WebUi::Response WebUi::handle(const Request& req) {
       return res;
     }
     if (!route_err.empty()) return fail(500, route_err);
+  }
+
+  if (api_only) {   // serve_routes has no page to fall back to
+    res.status = 404;
+    res.headers = {{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}};
+    res.body = "no such route\n";
+    return res;
   }
 
   const bool is_event = req.path == "/_ui/event" || (req.method == "POST" && req.xhr);

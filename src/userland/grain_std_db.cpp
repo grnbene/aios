@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -41,13 +43,23 @@ namespace {
 constexpr uint32_t kLongPassword = 0x1, kConnectWithDb = 0x8, kProtocol41 = 0x200, kTransactions = 0x2000,
                    kSecureConnection = 0x8000, kMultiResults = 0x20000, kPluginAuth = 0x80000;
 
-struct Column { std::string name; };
+struct Column { std::string name; uint8_t type = 0; };
+
+constexpr uint8_t kTypeDecimal = 0x00, kTypeNewDecimal = 0xF6;
+
+// What a query keeps of its answer: both shapes by default, but a 263k-row result held as rows and as
+// records costs twice the time and memory, so a caller that wants one says so. `decimals` turns DECIMAL
+// columns into exact decimals instead of strings.
+struct QueryOptions {
+  bool rows = true, records = true, decimals = false;
+};
 
 struct QueryResult {
   bool ok = false;
   std::string error;
   std::vector<Column> columns;
-  std::vector<std::vector<std::pair<bool, std::string>>> rows;   // (is_null, text)
+  std::vector<Value> rows;      // each a list of cells: strings, nil for NULL, decimals if asked
+  std::vector<Value> records;   // each a map of column name to cell
   uint64_t affected = 0, insert_id = 0;
 };
 
@@ -112,7 +124,7 @@ class Session {
     return finish_auth(plugin, error);
   }
 
-  bool query(const std::string& sql, QueryResult& out, std::string& error) {
+  bool query(const std::string& sql, QueryResult& out, std::string& error, const QueryOptions& opt = QueryOptions{}) {
     out = QueryResult{};
     seq_ = 0;
     std::vector<uint8_t> cmd{0x03};
@@ -136,20 +148,39 @@ class Session {
       if (!read_packet(p, error)) return false;
       size_t c = 0;
       for (int skip = 0; skip < 4; ++skip) lenstr(p, c);   // catalog, schema, table, org_table
-      out.columns.push_back({lenstr(p, c)});
+      Column col;
+      col.name = lenstr(p, c);
+      lenstr(p, c);   // org_name
+      // the fixed block: its length (0x0c), charset (2), column length (4), then the type (1)
+      if (c + 8 <= p.size()) col.type = p[c + 7];
+      out.columns.push_back(std::move(col));
     }
     if (!read_packet(p, error)) return false;   // EOF after the column definitions
     for (;;) {
       if (!read_packet(p, error)) return false;
       if (!p.empty() && p[0] == 0xFE && p.size() < 9) break;   // EOF: the end of the rows
       if (!p.empty() && p[0] == 0xFF) { out.error = err_text(p); return true; }
-      std::vector<std::pair<bool, std::string>> row;
+      std::vector<Value> cells;
+      if (opt.rows) cells.reserve((size_t)ncols);
+      std::shared_ptr<MapObj> rec;
+      if (opt.records) rec = std::make_shared<MapObj>();
       size_t c = 0;
       for (uint64_t k = 0; k < ncols; ++k) {
-        if (c < p.size() && p[c] == 0xFB) { row.push_back({true, ""}); ++c; }
-        else row.push_back({false, lenstr(p, c)});
+        Value cell;
+        if (c < p.size() && p[c] == 0xFB) ++c;
+        else {
+          cell = Value::string(lenstr(p, c));
+          if (opt.decimals && (out.columns[k].type == kTypeNewDecimal || out.columns[k].type == kTypeDecimal)) {
+            Value exact;
+            std::string ignore;
+            if (decimal_parse(cell.str(), exact, ignore)) cell = std::move(exact);   // more than 30 places or 38 digits stays a string
+          }
+        }
+        if (rec) rec->put(out.columns[k].name, cell);
+        if (opt.rows) cells.push_back(std::move(cell));
       }
-      out.rows.push_back(std::move(row));
+      if (opt.rows) out.rows.push_back(Value::list(std::move(cells)));
+      if (rec) out.records.push_back(Value::object(Type::Map, rec));
     }
     out.ok = true;
     drain_more_results(p, error);
@@ -300,27 +331,15 @@ std::shared_ptr<Session> session_of(const Value& v) {
   return ext->kind_name == "grain_db" ? std::static_pointer_cast<Session>(ext->ptr) : nullptr;
 }
 
-Value result_value(const QueryResult& r) {
+Value result_value(QueryResult& r) {
   auto out = std::make_shared<MapObj>();
   out->put("ok", Value::boolean(r.ok && r.error.empty()));
   out->put("error", Value::string(r.error));
   std::vector<Value> cols;
   for (const auto& c : r.columns) cols.push_back(Value::string(c.name));
-  std::vector<Value> rows, records;
-  for (const auto& row : r.rows) {
-    std::vector<Value> cells;
-    auto rec = std::make_shared<MapObj>();
-    for (size_t k = 0; k < row.size(); ++k) {
-      Value cell = row[k].first ? Value::nil() : Value::string(row[k].second);
-      cells.push_back(cell);
-      if (k < r.columns.size()) rec->put(r.columns[k].name, cell);
-    }
-    rows.push_back(Value::list(std::move(cells)));
-    records.push_back(Value::object(Type::Map, rec));
-  }
   out->put("columns", Value::list(std::move(cols)));
-  out->put("rows", Value::list(std::move(rows)));
-  out->put("records", Value::list(std::move(records)));
+  out->put("rows", Value::list(std::move(r.rows)));
+  out->put("records", Value::list(std::move(r.records)));
   out->put("affected_rows", Value::integer((int64_t)r.affected));
   out->put("last_insert_id", Value::integer((int64_t)r.insert_id));
   return Value::object(Type::Map, out);
@@ -347,14 +366,143 @@ Value bi_db_connect(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, out);
 }
 
-// db_query(db, sql) -> {ok, error, columns, rows, records, affected_rows, last_insert_id}
+// Escapes a string the way mysqli::real_escape_string does, for use between single quotes.
+std::string sql_escape(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\0': o += "\\0"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\\': o += "\\\\"; break;
+      case '\'': o += "\\'"; break;
+      case '"': o += "\\\""; break;
+      case '\x1a': o += "\\Z"; break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+// One value as a SQL literal. A list becomes a comma-separated run, for IN (?).
+bool sql_literal(const Value& v, std::string& out, std::string& error, int depth = 0) {
+  switch (v.type) {
+    case Type::Nil: out += "NULL"; return true;
+    case Type::Bool: out += v.b ? "1" : "0"; return true;
+    case Type::Int: out += std::to_string(v.i); return true;
+    case Type::Decimal: out += decimal_text(v); return true;
+    case Type::Real: {
+      if (!std::isfinite(v.d)) { error = "a real that is not a finite number cannot be a SQL value"; return false; }
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%.17g", v.d);
+      out += buf;
+      return true;
+    }
+    case Type::Str: out += "'" + sql_escape(v.str()) + "'"; return true;
+    case Type::Bytes: {
+      static const char* hex = "0123456789abcdef";
+      out += "X'";
+      for (uint8_t b : v.bytes_data()) { out += hex[b >> 4]; out += hex[b & 15]; }
+      out += "'";
+      return true;
+    }
+    case Type::List: {
+      if (depth > 0) { error = "a list inside a list cannot be a SQL value"; return false; }
+      const auto& items = v.list_items();
+      if (items.empty()) { out += "NULL"; return true; }   // IN (NULL) matches nothing
+      for (size_t k = 0; k < items.size(); ++k) {
+        if (k) out += ", ";
+        if (!sql_literal(items[k], out, error, depth + 1)) return false;
+      }
+      return true;
+    }
+    default:
+      error = std::string("a ") + type_name(v.type) + " cannot be a SQL value";
+      return false;
+  }
+}
+
+// Replaces each ? with the next parameter, quoted. A ? inside a string, a quoted name or a comment is left alone.
+bool bind_params(const std::string& sql, const std::vector<Value>& params, std::string& out, std::string& error) {
+  size_t next = 0;
+  out.reserve(sql.size() + 16 * params.size());
+  for (size_t i = 0; i < sql.size(); ++i) {
+    const char c = sql[i];
+    if (c == '\'' || c == '"' || c == '`') {
+      out += c;
+      for (++i; i < sql.size(); ++i) {
+        out += sql[i];
+        if (sql[i] == '\\' && c != '`' && i + 1 < sql.size()) { out += sql[++i]; continue; }
+        if (sql[i] == c) { if (i + 1 < sql.size() && sql[i + 1] == c) { out += sql[++i]; continue; } break; }
+      }
+    } else if (c == '#' || (c == '-' && i + 2 < sql.size() && sql[i + 1] == '-' && (sql[i + 2] == ' ' || sql[i + 2] == '\t' || sql[i + 2] == '\n'))) {
+      while (i < sql.size() && sql[i] != '\n') out += sql[i++];
+      if (i < sql.size()) out += '\n';
+    } else if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+      const size_t end = sql.find("*/", i + 2);
+      const size_t stop = end == std::string::npos ? sql.size() : end + 2;
+      out.append(sql, i, stop - i);
+      i = stop - 1;
+    } else if (c == '?') {
+      if (next >= params.size()) { error = "the query has more ? than the " + std::to_string(params.size()) + " parameter(s) given"; return false; }
+      if (!sql_literal(params[next++], out, error)) { error = "parameter " + std::to_string(next) + ": " + error; return false; }
+    } else {
+      out += c;
+    }
+  }
+  if (next != params.size()) { error = "the query has " + std::to_string(next) + " ? but " + std::to_string(params.size()) + " parameter(s) were given"; return false; }
+  return true;
+}
+
+// db_escape(text) -> text safe between single quotes (what mysqli::real_escape_string gives)
+Value bi_db_escape(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "db_escape")) return Value::nil();
+  return Value::string(sql_escape(args[0].str()));
+}
+
+// db_quote(value) -> the value as a SQL literal, quotes and all: 'it\'s', 42, NULL, 1.50, (a, b) for a list
+Value bi_db_quote(Vm&, std::vector<Value>& args, std::string& error) {
+  std::string out, why;
+  if (!sql_literal(args[0], out, why)) { error = "db_quote(): " + why; return Value::nil(); }
+  return Value::string(std::move(out));
+}
+
+// db_query(db, sql, params?, options?) -> {ok, error, columns, rows, records, affected_rows, last_insert_id}
+//   params   a list filling the ? in the sql: db_query(db, "select * from stock where stockid = ? and qty > ?", [id, 0])
+//            strings are escaped, nil is NULL, a list becomes a, b, c for IN (?)
+//   options  {rows: false} or {records: false} builds only the other shape (half the time and memory on a big result);
+//            {decimals: true} returns DECIMAL columns as exact decimals instead of strings
 Value bi_db_query(Vm&, std::vector<Value>& args, std::string& error) {
   auto s = session_of(args[0]);
   if (!s || !s->open()) { error = "db_query() wants a connection from db_connect() that is still open"; return Value::nil(); }
   if (!want_str(args[1], error, "db_query")) return Value::nil();
+  QueryOptions opt;
+  const Value* params = args.size() > 2 ? &args[2] : nullptr;
+  const Value* options = args.size() > 3 ? &args[3] : nullptr;
+  if (params && params->type == Type::Map && !options) { options = params; params = nullptr; }   // db_query(db, sql, {records: false})
+  if (params && params->type == Type::Nil) params = nullptr;
+  if (params && params->type != Type::List) { error = std::string("db_query() wants its parameters as a list, got a ") + type_name(params->type); return Value::nil(); }
+  if (options && options->type != Type::Nil) {
+    if (options->type != Type::Map) { error = std::string("db_query() wants its options as a map, got a ") + type_name(options->type); return Value::nil(); }
+    auto* o = static_cast<MapObj*>(options->obj.get());
+    for (const auto& kv : o->entries) {
+      if (kv.first == "rows") opt.rows = kv.second.truthy();
+      else if (kv.first == "records") opt.records = kv.second.truthy();
+      else if (kv.first == "decimals") opt.decimals = kv.second.truthy();
+      else { error = "db_query(): unknown option \"" + kv.first + "\" (rows, records, decimals)"; return Value::nil(); }
+    }
+  }
+  std::string sql = args[1].str();
+  if (params) {   // no list, no binding: a query that never had placeholders is sent exactly as written
+    std::string bound;
+    static const std::vector<Value> none;
+    if (!bind_params(sql, params ? params->list_items() : none, bound, error)) { error = "db_query(): " + error; return Value::nil(); }
+    sql = std::move(bound);
+  }
   QueryResult r;
   std::string why;
-  if (!s->query(args[1].str(), r, why)) { error = "db_query(): " + why; return Value::nil(); }
+  if (!s->query(sql, r, why, opt)) { error = "db_query(): " + why; return Value::nil(); }
   return result_value(r);
 }
 
@@ -408,8 +556,9 @@ Value method_live_tick(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string
   Value* probe = st->find("probe");
   if (probe && probe->type == Type::Str && !probe->str().empty()) {
     QueryResult m;
-    if (s->query(probe->str(), m, why) && m.ok && m.error.empty() && !m.rows.empty() && !m.rows[0].empty()) {
-      const std::string marker = m.rows[0][0].second;
+    if (s->query(probe->str(), m, why, QueryOptions{true, false, false}) && m.ok && m.error.empty() && !m.rows.empty() &&
+        !m.rows[0].list_items().empty()) {
+      const std::string marker = m.rows[0].list_items()[0].to_text();
       Value* last = st->find("marker");
       if (last && last->type == Type::Str && last->str() == marker) return Value::nil();   // unchanged: nothing to do
       st->put("marker", Value::string(marker));
@@ -488,7 +637,9 @@ Value bi_live(Vm& vm, std::vector<Value>& args, std::string& error) {
 
 void install_db_builtins(Vm& vm) {
   vm.define_native("db_connect", 4, 5, bi_db_connect);
-  vm.define_native("db_query", 2, 2, bi_db_query);
+  vm.define_native("db_query", 2, 4, bi_db_query);
+  vm.define_native("db_escape", 1, 1, bi_db_escape);
+  vm.define_native("db_quote", 1, 1, bi_db_quote);
   vm.define_native("db_close", 1, 1, bi_db_close);
   vm.define_native("live", 2, 3, bi_live);
 }

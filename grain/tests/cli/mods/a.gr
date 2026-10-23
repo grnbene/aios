@@ -1,0 +1,5 @@
+import "sub/b.gr"
+import "a.gr"
+let A_VALUE = twice(21)
+fn a_fails() { return 1 / 0 }
+print("a loaded")

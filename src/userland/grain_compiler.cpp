@@ -81,6 +81,7 @@ const char* type_name(Type t) {
     case Type::Bytes: return "bytes";
     case Type::Entity: return "entity";
     case Type::BoundMethod: return "method";
+    case Type::Decimal: return "decimal";
   }
   return "?";
 }

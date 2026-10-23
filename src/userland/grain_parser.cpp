@@ -226,6 +226,24 @@ ExprP Parser::primary() {
     case Tok::Ident: {
       std::string full_name = t.text;
       advance();
+      // import "lib.gr" is import("lib.gr"): a statement that loads another file's functions and values.
+      if (full_name == "import" && check(Tok::Str)) {
+        auto call = std::make_unique<Expr>();
+        call->kind = ExprKind::Call;
+        call->line = t.line;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = ExprKind::Name;
+        callee->text = "import";
+        callee->line = t.line;
+        auto path = std::make_unique<Expr>();
+        path->kind = ExprKind::StrLit;
+        path->text = peek().text;
+        path->line = peek().line;
+        advance();
+        call->a = std::move(callee);
+        call->items.push_back(std::move(path));
+        return call;
+      }
       while (match(Tok::ColonColon)) {
         if (check(Tok::Ident)) {
           full_name += "::" + peek().text;
@@ -425,7 +443,7 @@ ExprP Parser::postfix(ExprP left) {
       left = std::move(idx);
       continue;
     }
-    if (check(Tok::Dot)) {
+    if (check(Tok::Dot) && peek(1).kind != Tok::Dot) {   // `..` is a range, not a field
       const int line = peek().line;
       advance();
       std::string name;
@@ -483,6 +501,28 @@ ExprP Parser::binary(int min_power) {
 // known, rather than in the compiler where it would be a confusing error.
 ExprP Parser::expression() {
   ExprP left = binary(1);
+
+  // `a..b` is range(a, b): the integers from a up to b, b excluded - the same
+  // bounds a native fn's `for i in a..b` takes. It binds looser than any
+  // operator, so `0..n - 1` is 0..(n - 1).
+  if (check(Tok::Dot) && peek(1).kind == Tok::Dot) {
+    const int line = peek().line;
+    advance();
+    advance();
+    skip_newlines();
+    ExprP hi = binary(1);
+    auto callee = std::make_unique<Expr>();
+    callee->kind = ExprKind::Name;
+    callee->text = "range";
+    callee->line = line;
+    auto call = std::make_unique<Expr>();
+    call->kind = ExprKind::Call;
+    call->line = line;
+    call->a = std::move(callee);
+    call->items.push_back(std::move(left));
+    call->items.push_back(std::move(hi));
+    left = std::move(call);
+  }
 
   if (check(Tok::Question)) {
     const int line = peek().line;
