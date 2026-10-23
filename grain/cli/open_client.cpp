@@ -116,16 +116,49 @@ fn send(action, fields) {
 
 let first = call_server("GET", "", url)
 if first == nil { error("grain open: " + notice) }
-if first.canvas == true { error("grain open: this program draws its own pixels; open it in a browser for now") }
-info = {"title": first.title, "width": first.width, "height": first.height}
-take(first)
+let canvas_mode = first.canvas == true
+
+# A program that draws its own pixels: the server sends each new picture (PNG), the window shows it, and this
+# window's mouse and keys go back as the pane's own events - the same ones a local window would give it.
+let picture = nil
+let frames_in = 0
+let held = 0
+fn show(d) {
+  if d == nil { return nil }
+  if d.error != nil { notice = d.error }
+  if d.png == nil { return nil }
+  if d.seq != nil and d.seq < seq { return nil }
+  seq = d.seq
+  let p = pcall(fn () { return image_decode(base64_decode(d.png)) })
+  if p.ok { picture = p.value  frames_in += 1 } else { notice = "a frame that is not a picture: " + str(p.error) }
+}
+fn forward(e) {
+  let t = e.type
+  if t == "click" or t == "resize" or t == "close" { return nil }   # the server makes its own click; size and closing are this window's
+  if t == "mouse_down" { held += 1 }
+  if t == "mouse_up" and held > 0 { held -= 1 }
+  if t == "mouse_move" and held == 0 { return nil }                  # drags only: a hover is not news to the program
+  let parts = []
+  for k in keys(e) {
+    if k != "pane" {
+      let v = e[k]
+      if type(v) == "bool" { v = v ? "1" : "" }
+      push(parts, url_encode(k) + "=" + url_encode(str(v)))
+    }
+  }
+  show(call_server("POST", join(parts, "&"), url))
+}
+
+fn deliver(d) {
+  if canvas_mode { show(d) } else { take(d) }
+}
 
 # The server tells us when the data changed - a timer there, another viewer, anything - and the window follows:
-# it pushes the new widgets down a held connection (events). A server that will not stream is asked instead.
+# it pushes the new widgets (or picture) down a held connection (events). A server that will not stream is asked instead.
 let polling = false
 fn poll() {
   let sep = url == nil ? "?" : (find(url, "?") >= 0 ? "&" : "?")
-  take(call_server("GET", "", url + sep + "poll=" + str(seq)))
+  deliver(call_server("GET", "", url + sep + "poll=" + str(seq)))
 }
 
 fn view(f) {
@@ -134,7 +167,19 @@ fn view(f) {
   return widgets
 }
 
-pane = ui.pane({"title": info.title == "" ? url : info.title, "width": info.width, "height": info.height, "view": view})
+if canvas_mode {
+  show(first)
+  pane = create_pane({"title": first.title == "" ? url : first.title, "width": first.width, "height": first.height,
+    "on_draw": fn (cv, p) {
+      canvas_clear(cv, "#0d1117")
+      if picture != nil { canvas_blit(cv, picture, 0, 0) }
+    },
+    "on_event": fn (p, e) { forward(e) }})
+} else {
+  info = {"title": first.title, "width": first.width, "height": first.height}
+  take(first)
+  pane = ui.pane({"title": info.title == "" ? url : info.title, "width": info.width, "height": info.height, "view": view})
+}
 let stream_headers = {"accept": "text/event-stream, application/x-grain-ui", "x-grain-ui": "1"}
 if cookie != "" { stream_headers["cookie"] = cookie }
 events(url, {"headers": stream_headers}, fn (data) {
@@ -143,7 +188,7 @@ events(url, {"headers": stream_headers}, fn (data) {
     return nil
   }
   let d = pcall(fn () { return json_parse(data) })
-  if d.ok and type(d.value) == "map" and d.value.seq > seq { take(d.value) }   # sequences only rise: an older frame than the one shown is stale
+  if d.ok and type(d.value) == "map" and d.value.seq > seq { deliver(d.value) }   # sequences only rise: an older frame than the one shown is stale
 })
 for e in script { e["pane"] = pane.id }
 if max_frames > 0 or len(script) > 0 { run_panes({"frames": max_frames > 0 ? max_frames : 60, "script": script}) }
@@ -156,7 +201,14 @@ fn flat(node, out) {
   if node.widget == "table" and node.data != nil { for row in node.data { push(out, json_stringify(row)) } }
   if node.children != nil { for c in node.children { flat(c, out) } }
 }
-if dump {
+if dump and canvas_mode {
+  print("picture: " + (picture == nil ? "none" : str(canvas_width(picture)) + "x" + str(canvas_height(picture))))
+  print("frames: " + str(frames_in))
+  for e in script {   # what the picture shows where the script pressed: the program's answer, drawn by it
+    if (e.type == "mouse_down" or e.type == "mouse_move") and picture != nil { print(e.type + " " + str(e.x) + "," + str(e.y) + ": " + color_to_hex(canvas_get_pixel(picture, e.x, e.y))) }
+  }
+  if notice != "" { print("notice: " + notice) }
+} else if dump {
   let lines = []
   flat(tree, lines)
   for l in lines { print(l) }
