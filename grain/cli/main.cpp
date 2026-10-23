@@ -68,7 +68,7 @@ void usage(std::ostream& o) {
     << "  grain run <file.gr> [args...]     run a program; `args` holds what follows it\n"
     << "  grain eval <source...>            run one line and print its value\n"
     << "  grain repl                        read and run lines until EOF or .quit\n"
-    << "  grain serve <file.gr> [--port N]  the program's ui.pane in a browser, not a window\n"
+    << "  grain serve <file.gr> [--port N] [--max-body 10m]  the program's ui.pane in a browser, not a window\n"
     << "  grain open <url>                  a ui.pane program running on a server, in a native window (no HTML)\n"
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
@@ -138,6 +138,12 @@ void prepare_vm(g::Vm& vm, const std::vector<std::string>& script_args) { prepar
 
 namespace {
 
+// Where a program's imports start: its own directory.
+std::string dir_of(const std::string& path) {
+  const size_t slash = path.find_last_of("/\\");
+  return slash == std::string::npos ? "" : path.substr(0, slash);
+}
+
 int run_file(const Options& opt, const std::string& path, const std::vector<std::string>& script_args) {
   std::string source;
   if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; return kExitUsage; }
@@ -146,6 +152,7 @@ int run_file(const Options& opt, const std::string& path, const std::vector<std:
   g::Vm vm;
   DropPanes drop{vm};
   prepare(vm, opt, script_args);
+  vm.base_dir = dir_of(path);
   auto r = vm.run(compiled.script);
   if (!r.ok) { report_runtime(path, r); return kExitRuntime; }
   return kExitOk;
@@ -196,8 +203,17 @@ int serve_program(const std::string& name, std::function<bool(std::string&, std:
   grain_cli::ServeOptions so;
   if (const char* env_host = std::getenv("GRAIN_HOST")) so.host = env_host;
   if (const char* env_port = std::getenv("GRAIN_PORT")) so.port = std::atoi(env_port);
+  // 4096, 64k, 10M, 1g: bytes with an optional k/m/g suffix
+  auto size_arg = [](const std::string& t) -> size_t {
+    char* end = nullptr;
+    size_t n = (size_t)std::strtoull(t.c_str(), &end, 10);
+    switch (end && *end ? std::tolower((unsigned char)*end) : 0) { case 'k': n <<= 10; break; case 'm': n <<= 20; break; case 'g': n <<= 30; break; default: break; }
+    return n;
+  };
+  if (const char* env_body = std::getenv("GRAIN_MAX_BODY")) so.max_body = size_arg(env_body);
   for (size_t k = 0; k < opts.size(); ++k) {
-    if (opts[k] == "--port" && k + 1 < opts.size()) so.port = std::atoi(opts[++k].c_str());
+    if (opts[k] == "--max-body" && k + 1 < opts.size()) so.max_body = size_arg(opts[++k]);
+    else if (opts[k] == "--port" && k + 1 < opts.size()) so.port = std::atoi(opts[++k].c_str());
     else if (opts[k] == "--host" && k + 1 < opts.size()) so.host = opts[++k];
     else if (opts[k] == "--all" || opts[k] == "--all-ips") so.host = "0.0.0.0";
     else if (opts[k] == "--localhost" || opts[k] == "--local") so.host = "127.0.0.1";
@@ -335,7 +351,7 @@ int main(int argc, char** argv) {
 #endif
           return true;
         },
-        [opt](g::Vm& vm) { prepare(vm, opt, {}); },
+        [opt, path](g::Vm& vm) { prepare(vm, opt, {}); vm.base_dir = dir_of(path); },
         std::vector<std::string>(rest.begin() + 1, rest.end()));
   }
   if (sub == "check") {

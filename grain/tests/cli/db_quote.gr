@@ -1,0 +1,24 @@
+# Quoting for SQL: db_escape / db_quote need no server. (Binding ? in db_query is checked against ASQL by
+# scripts/asql-grain-check.sh.)
+let failures = 0
+let checks = 0
+fn check(label, got, want) {
+  checks = checks + 1
+  if got == want { print("  ok   ", label) } else { failures = failures + 1  print("  WRONG", label, "got", repr(got), "wanted", repr(want)) }
+}
+check("quote and backslash", db_escape("it's a \\ day"), "it\\'s a \\\\ day")
+check("double quote", db_escape("say \"hi\""), "say \\\"hi\\\"")
+check("newline, return, nul, ctrl-z", db_escape("a\nb\rc\0d\x1ae"), "a\\nb\\rc\\0d\\Ze")
+check("plain text is untouched", db_escape("héllo"), "héllo")
+check("string literal", db_quote("o'brien"), "'o\\'brien'")
+check("injection stays a string", db_quote("x'; drop table t; --"), "'x\\'; drop table t; --'")
+check("nil", db_quote(nil), "NULL")
+check("int", db_quote(-7), "-7")
+check("bool", db_quote(true), "1")
+check("decimal keeps its scale", db_quote(decimal("1.50")), "1.50")
+check("real", db_quote(0.5), "0.5")
+check("bytes", db_quote(bytes("ab")), "X'6162'")
+check("list for IN", db_quote([1, "a", nil]), "1, 'a', NULL")
+check("empty list matches nothing", db_quote([]), "NULL")
+check("a map is refused", pcall(fn () { return db_quote({a: 1}) }).ok, false)
+if failures == 0 { print("db_quote:", checks, "checks, all agreed") } else { print("db_quote:", failures, "of", checks, "WRONG") }

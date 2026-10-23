@@ -12,6 +12,7 @@ namespace grain_cli {
 struct ServeOptions {
   std::string host = "0.0.0.0";     // listen on all interfaces by default (0.0.0.0)
   int port = 8080;
+  size_t max_body = 1 << 20;        // a request body larger than this is refused with 413 (--max-body, GRAIN_MAX_BODY)
   bool show_errors = true;          // a program's error appears in its page: this is the developer's own machine
 };
 

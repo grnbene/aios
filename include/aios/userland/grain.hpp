@@ -21,12 +21,14 @@
 // walker with extra steps. `grain dis` prints what the compiler actually
 // emitted, so the claim is checkable rather than asserted.
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "aios/core/ids.hpp"
+#include "aios/userland/portable_int128.hpp"
 
 namespace aios::userland::grain {
 
@@ -43,7 +45,7 @@ using ObjRef = std::shared_ptr<Obj>;
 
 enum class Type : uint8_t {
   Nil, Bool, Int, Real, Str, List, Map, Fn, Native, Extern,
-  Id128, Capability, Channel, StateFrame, MemoryObject, Entity, BoundMethod, Bytes
+  Id128, Capability, Channel, StateFrame, MemoryObject, Entity, BoundMethod, Bytes, Decimal
 };
 
 const char* type_name(Type t);
@@ -114,6 +116,16 @@ class BytesObj final : public Obj {
  public:
   explicit BytesObj(std::vector<uint8_t> v) : Obj(Type::Bytes), data(std::move(v)) {}
   std::vector<uint8_t> data;
+};
+
+// An exact decimal number: mantissa / 10^scale, held as a 128-bit integer (38 digits) and a scale from 0 to 30.
+// Immutable, so it is shared between VMs like a string. 1.50 and 1.5 are the same number and compare equal; the
+// scale only decides how it prints. See grain_std_decimal.cpp for the arithmetic and its rules.
+class DecimalObj final : public Obj {
+ public:
+  DecimalObj(AIOS_INT128 m, int s) : Obj(Type::Decimal), mant(m), scale(s) {}
+  AIOS_INT128 mant;
+  int scale;
 };
 
 class ListObj final : public Obj {
@@ -461,6 +473,14 @@ class Vm {
   // Where read_file/write_file/... go. Not owned; null = no file storage.
   Files* files = nullptr;
 
+  // import "lib.gr" (grain_builtins.cpp): relative paths resolve against base_dir - the directory of the program
+  // that is running, set by whatever starts it; empty means the working directory. `imported` is what this VM has
+  // loaded, so a file imported twice (or by a cycle) runs once. packed_source, if set, is asked first: a program
+  // built with `grain build` carries its modules inside itself.
+  std::string base_dir;
+  std::vector<std::string> imported;
+  std::function<bool(const std::string& path, std::string& source)> packed_source;
+
   // A program that loops forever must not take the console with it.
   uint64_t step_limit = 0;   // 0 = no limit
   uint64_t steps = 0;
@@ -533,6 +553,7 @@ void install_bytes_builtins(Vm& vm);   // bytes, bytes_get/set, pack/unpack, byt
 void install_path_builtins(Vm& vm);    // path_join, basename, dirname, extname, mkdir, ... (grain_std_path.cpp)
 // parallel_map, spawn, await, task_done: grain on every core, each worker a VM of its own (grain_std_parallel.cpp).
 void install_parallel_builtins(Vm& vm);
+void install_decimal_builtins(Vm& vm);   // decimal(), dec_div(), scale() (grain_std_decimal.cpp)
 
 // The bridges that make this a language ON aios rather than beside it: the
 // sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL
@@ -627,11 +648,58 @@ bool web_pane_render_tree(Vm& vm, uint64_t id, std::string& json, uint64_t& vers
 // field the page named (empty: only the fields changed). Call web_pane_render afterwards.
 bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& action,
                     const std::vector<std::pair<std::string, std::string>>& fields, std::string& error);
+// ---- decimals (grain_std_decimal.cpp) ----
+// op is one of + - * / %. Either side may be an Int or a Decimal, not a Real. False with `error` set on a
+// mix with a real, an overflow, or division by zero.
+bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::string& error);
+bool decimal_negate(const Value& a, Value& out, std::string& error);
+// -1, 0, 1. Both sides Int or Decimal.
+int decimal_compare(const Value& a, const Value& b);
+std::string decimal_text(const Value& d);
+// "19.99", "-0.5", "1e3", "  7 " -> a Decimal.
+bool decimal_parse(const std::string& text, Value& out, std::string& error);
+Value decimal_from_int(int64_t v);
+// Rounded half away from zero (PHP's round(), and money's) to `places` decimals, 0..30.
+bool decimal_round(const Value& d, int places, Value& out, std::string& error);
+double decimal_to_double(const Value& d);
+bool decimal_to_int(const Value& d, int64_t& out);   // truncated toward zero; false if it does not fit
+inline bool is_decimal(const Value& v) { return v.type == Type::Decimal; }
+// Int or Decimal: what decimal arithmetic accepts.
+inline bool is_exact_number(const Value& v) { return v.type == Type::Int || v.type == Type::Decimal; }
+
 // If the pane defined custom HTTP routes (ui.pane({"routes": {"/path": fn(req)}})),
 // delivers the request and fills status, res_body, and content_type. Returns true if handled.
 bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                            const std::string& query, const std::string& body,
                            int& status, std::string& res_body, std::string& content_type, std::string& error);
+
+// True for a pane made by serve_routes: it has routes and no page.
+bool web_pane_api_only(Vm& vm, uint64_t id);
+
+// A call made in a worker VM: the function and what it reaches are copied (grain_std_parallel.cpp's
+// rules), after which run() needs nothing from the VM they came from, on any thread.
+struct WorkerCall {
+  std::unique_ptr<Vm> vm;
+  Value fn;
+  std::vector<Value> args;
+  std::vector<std::string> printed;
+  Value result;
+  std::string error;
+  void run();
+};
+// Copies `fn` out of `vm` (read only: hold whatever lock keeps `vm` still, and only for this call).
+std::unique_ptr<WorkerCall> prepare_worker_call(Vm& vm, const Value& fn, std::vector<Value> args, std::string& error);
+
+// Routes that run in worker VMs (ui.pane({..., "workers": true}), serve_routes). prepare picks the
+// handler and copies it (call it under the session's lock); the caller then runs the WorkerCall
+// with no lock held and hands it to finish for the response. Returns false, with `error` empty,
+// when this pane has no such route or does not use workers.
+struct RouteJob {
+  std::unique_ptr<WorkerCall> call;
+};
+bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
+                            const std::string& query, const std::string& body, RouteJob& job, std::string& error);
+bool web_pane_route_finish(RouteJob& job, int& status, std::string& res_body, std::string& content_type, std::string& error);
 
 }  // namespace aios::userland::grain
 

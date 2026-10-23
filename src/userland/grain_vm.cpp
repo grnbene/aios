@@ -226,6 +226,7 @@ std::string Value::to_text() const {
     case Type::Nil: return "nil";
     case Type::Bool: return b ? "true" : "false";
     case Type::Int: case Type::Real: return number_text(*this);
+    case Type::Decimal: return decimal_text(*this);
     case Type::Str: return str();
     case Type::List: {
       std::string out = "[";
@@ -307,6 +308,8 @@ bool Value::equals(const Value& o) const {
     if (type == Type::Int && o.type == Type::Int) return i == o.i;
     return as_double() == o.as_double();
   }
+  // A decimal equals an int or decimal of the same value (2.50 == 2.5 == ... 2.5); never a real, which is only approximately anything.
+  if (is_exact_number(*this) && is_exact_number(o)) return decimal_compare(*this, o) == 0;
   if (type != o.type) return false;
   switch (type) {
     case Type::Nil: return true;
@@ -533,6 +536,10 @@ void Vm::emit(const std::string& line) {
 namespace {
 
 bool numeric_pair(const Value& a, const Value& b) { return a.is_number() && b.is_number(); }
+// A decimal on either side with an int or decimal on the other.
+bool decimal_pair(const Value& a, const Value& b) {
+  return (a.type == Type::Decimal || b.type == Type::Decimal) && is_exact_number(a) && is_exact_number(b);
+}
 bool both_int(const Value& a, const Value& b) { return a.type == Type::Int && b.type == Type::Int; }
 
 // Push a copy of `src` without touching its shared_ptr when it has none -
@@ -965,7 +972,9 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         }
         Value b = pop(), a = pop();
         int cmp = 0;
-        if (numeric_pair(a, b)) {
+        if (decimal_pair(a, b)) {
+          cmp = decimal_compare(a, b);
+        } else if (numeric_pair(a, b)) {
           if (both_int(a, b)) cmp = a.i < b.i ? -1 : (a.i > b.i ? 1 : 0);
           else { const double x = a.as_double(), y = b.as_double(); cmp = x < y ? -1 : (x > y ? 1 : 0); }
         } else if (a.type == Type::Str && b.type == Type::Str) {
@@ -998,6 +1007,13 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         Value b = pop(), a = pop();
         if (both_int(a, b)) { S.stack.push_back(Value::integer(a.i + b.i)); break; }
         if (numeric_pair(a, b)) { S.stack.push_back(Value::real(a.as_double() + b.as_double())); break; }
+        if (a.type == Type::Decimal || b.type == Type::Decimal) {
+          Value r;
+          std::string why;
+          if (!decimal_arith('+', a, b, r, why)) { fail(line, why); break; }
+          S.stack.push_back(std::move(r));
+          break;
+        }
         if (a.type == Type::Str && b.type == Type::Str) { S.stack.push_back(Value::string(a.str() + b.str())); break; }
         if (a.type == Type::Bytes && b.type == Type::Bytes) {
           std::vector<uint8_t> out = a.bytes_data();
@@ -1026,6 +1042,13 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           if (x.type == Type::Real && y.type == Type::Real) { x.d = op == Op::Subtract ? x.d - y.d : x.d * y.d; S.stack.pop_back(); break; }
         }
         Value b = pop(), a = pop();
+        if (a.type == Type::Decimal || b.type == Type::Decimal) {
+          Value r;
+          std::string why;
+          if (!decimal_arith(op == Op::Subtract ? '-' : '*', a, b, r, why)) { fail(line, why); break; }
+          S.stack.push_back(std::move(r));
+          break;
+        }
         if (!numeric_pair(a, b)) {
           fail(line, std::string("cannot ") + (op == Op::Subtract ? "subtract " : "multiply ") +
                type_name(a.type) + " and " + type_name(b.type));
@@ -1044,6 +1067,13 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
       // language that has it; `int(a / b)` says what it means.
       case Op::Divide: {
         Value b = pop(), a = pop();
+        if (a.type == Type::Decimal || b.type == Type::Decimal) {
+          Value r;
+          std::string why;
+          if (!decimal_arith('/', a, b, r, why)) { fail(line, why); break; }
+          S.stack.push_back(std::move(r));
+          break;
+        }
         if (!numeric_pair(a, b)) {
           fail(line, std::string("cannot divide ") + type_name(a.type) + " by " + type_name(b.type));
           break;
@@ -1054,6 +1084,13 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
       }
       case Op::Modulo: {
         Value b = pop(), a = pop();
+        if (a.type == Type::Decimal || b.type == Type::Decimal) {
+          Value r;
+          std::string why;
+          if (!decimal_arith('%', a, b, r, why)) { fail(line, why); break; }
+          S.stack.push_back(std::move(r));
+          break;
+        }
         if (!numeric_pair(a, b)) {
           fail(line, std::string("cannot take ") + type_name(a.type) + " modulo " + type_name(b.type));
           break;
@@ -1104,6 +1141,7 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         Value a = pop();
         if (a.type == Type::Int) S.stack.push_back(Value::integer(-a.i));
         else if (a.type == Type::Real) S.stack.push_back(Value::real(-a.d));
+        else if (a.type == Type::Decimal) { Value r; std::string why; decimal_negate(a, r, why); S.stack.push_back(std::move(r)); }
         else { fail(line, std::string("cannot negate a ") + type_name(a.type)); }
         break;
       }

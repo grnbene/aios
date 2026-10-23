@@ -49,6 +49,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_std_text.cpp
   ${AIOS_ROOT}/src/userland/grain_std_path.cpp
   ${AIOS_ROOT}/src/userland/grain_std_parallel.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_decimal.cpp
   ${AIOS_ROOT}/src/js/regexp.cpp
   ${AIOS_ROOT}/src/js/unicode.cpp
   ${AIOS_ROOT}/src/userland/grain_std_http.cpp

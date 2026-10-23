@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <regex>
 #include <sstream>
 #include <system_error>
 
@@ -286,6 +287,26 @@ int build_command(const std::vector<std::string>& a) {
   pack.main_name = fs::path(main_path).filename().generic_string();
   pack.files[pack.main_name] = src;
   std::string error;
+  // import "lib.gr" is found at run time, so the modules a program imports go in with it: each is stored under the
+  // path the importing file spells, relative to the main program's directory.
+  {
+    const fs::path root = fs::path(main_path).parent_path();
+    std::vector<std::pair<std::string, std::string>> todo{{"", src}};   // (directory of the importer, its source)
+    static const std::regex import_re("\\bimport\\s*\\(?\\s*\"([^\"\\n]+)\"");
+    while (!todo.empty()) {
+      auto [dir, text] = todo.back();
+      todo.pop_back();
+      for (std::sregex_iterator it(text.begin(), text.end(), import_re), end; it != end; ++it) {
+        std::string name = (fs::path(dir) / (*it)[1].str()).lexically_normal().generic_string();
+        if (name.rfind("./", 0) == 0) name = name.substr(2);
+        if (pack.files.count(name)) continue;
+        std::string data;
+        if (!read_all((root / name).string(), data)) { std::cerr << "grain build: cannot read the module " << (root / name).string() << " (imported as \"" << (*it)[1].str() << "\")\n"; return kExitFailed; }
+        pack.files[name] = data;
+        todo.emplace_back(fs::path(name).parent_path().generic_string(), std::move(data));
+      }
+    }
+  }
   for (const auto& inc : includes) {
     if (!add_include(inc, pack, error)) { std::cerr << "grain build: " << error << "\n"; return kExitFailed; }
   }
@@ -346,6 +367,13 @@ g::Value bi_bundle_files(g::Vm&, std::vector<g::Value>&, std::string&) {
 
 void install_bundle_builtins(g::Vm& vm, const Pack& pack) {
   g_pack = &pack;
+  // import "lib.gr" finds its modules in the program itself
+  vm.packed_source = [&pack](const std::string& path, std::string& source) {
+    auto it = pack.files.find(path);
+    if (it == pack.files.end()) return false;
+    source = it->second;
+    return true;
+  };
   vm.define_native("bundle_file", 1, 1, bi_bundle_file);
   vm.define_native("bundle_files", 0, 0, bi_bundle_files);
 }
