@@ -22,5 +22,6 @@ for seed in 7 23 99; do run "$GRAIN" "$T/order_fuzz.gr" $PORT checkpass 300 $see
 if [ $# -ge 4 ]; then
   run "$GRAIN" "$T/differential.gr" $PORT checkpass "$3" "$4" "$T"/sql/*.sql
   for seed in 1 2 3 4 5; do run "$GRAIN" "$T/sql_fuzz.gr" $PORT checkpass "$3" "$4" 300 $seed; done
+  run "$GRAIN" "$T/wide_numbers.gr" $PORT checkpass "$3" "$4"
 fi
 exit $FAILED

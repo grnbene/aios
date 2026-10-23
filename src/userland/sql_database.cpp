@@ -6863,6 +6863,34 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
 bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string& alias, const SqlExpr* key_col,
                           const SqlExpr* item, const SqlExpr* where, bool text_key, BatchStore* out, bool first_wins);
 
+// A key as the whole number an integer key column would have to hold to equal it: exactly from an exact
+// number's digits (or a quoted plain number, as MariaDB reads one against an INT), through the double for a
+// DOUBLE or a string's numeric prefix. False: no integer equals it (a fraction, past int64, not a number).
+inline bool exact_int_key_of(const Val& k, int64_t* out) {
+  if (k.null) return false;
+  if (k.numeric && k.approx) {
+    const double d = k.num;
+    if (d != std::floor(d) || !(std::fabs(d) < 9223372036854775808.0)) return false;
+    *out = (int64_t)d;
+    return true;
+  }
+  const std::string s = k.str();
+  const std::string c = canonical_decimal(s);
+  if (!c.empty()) {
+    if (c.find('.') != std::string::npos) return false;
+    errno = 0;
+    const long long v = std::strtoll(c.c_str(), nullptr, 10);
+    if (errno == ERANGE) return false;
+    *out = v;
+    return true;
+  }
+  // no digits to go by (a number held only as its double, or text with a numeric prefix): the double's value
+  const double d = k.numeric ? k.num : numeric_prefix_of(s);
+  if (d != std::floor(d) || !(std::fabs(d) < 9223372036854775808.0)) return false;
+  *out = (int64_t)d;
+  return true;
+}
+
 // Per key, compactly: a whole number below 1e15 as a double (its answer is
 // that number, as its text would read back); anything else as its Val.
 struct BatchStore {
@@ -6873,7 +6901,7 @@ struct BatchStore {
   bool dense = false;
   int64_t lo = 0;
   std::vector<int32_t> slot;
-  std::unordered_map<double, int32_t> by_num;
+  std::unordered_map<int64_t, int32_t> by_num;   // the integer keys, exactly (a double merged neighbours past 2^53)
   std::unordered_map<std::string, int32_t> by_text;
   void add_value(Val&& v) {
     // Only a value whose text IS that whole number: a DECIMAL sum of 3.00 kept as the double 3 answered "3".
@@ -6901,6 +6929,7 @@ struct ScalarBatch {
   bool raw = false;
   std::unordered_map<std::string, Val> by_text;
   std::unordered_map<double, Val> by_num;
+  std::unordered_map<std::string, Val> by_exact;   // keys a double cannot carry, by their digits
   BatchStore store;                   // the direct build's
   bool stored = false;
   // The outer column's own dictionary, when it has one: each of its codes
@@ -6939,18 +6968,26 @@ struct ScalarBatch {
         auto it = store.by_text.find(collate_key(k.str()));
         return it != store.by_text.end() ? from_store(it->second) : empty;
       }
-      const double d = k.numeric ? k.num : numeric_prefix_of(k.str());
+      int64_t key = 0;
+      if (!exact_int_key_of(k, &key)) return empty;   // the store's keys are integers: nothing else equals one
       if (store.dense) {
-        if (d != std::floor(d)) return empty;
-        const uint64_t o = (uint64_t)((int64_t)d - store.lo);
+        if (key < store.lo) return empty;
+        const uint64_t o = (uint64_t)key - (uint64_t)store.lo;
         return o < store.slot.size() ? from_store(store.slot[(size_t)o]) : empty;
       }
-      auto it = store.by_num.find(d == 0 ? 0.0 : d);
+      auto it = store.by_num.find(key);
       return it != store.by_num.end() ? from_store(it->second) : empty;
     }
     if (text_key) {
       auto it = by_text.find(collate_key(k.str()));
       return it != by_text.end() ? as_answer(it->second) : empty;
+    }
+    if (!by_exact.empty() || !(k.numeric && k.approx)) {
+      const std::string ks = k.str();
+      if (text_is_wide_number(ks) && !(k.numeric && k.approx)) {   // a wide exact key meets only the same digits
+        auto ex = by_exact.find(canonical_decimal(ks));
+        return ex != by_exact.end() ? as_answer(ex->second) : empty;
+      }
     }
     const double d = k.numeric ? k.num : numeric_prefix_of(k.str());
     auto it = by_num.find(d == 0 ? 0.0 : d);
@@ -7186,7 +7223,9 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     if (row.values.size() < 2 || sql_is_null(row.values[0])) continue;
     Val v = sql_is_null(row.values[1]) ? val_null() : (vtext ? val_text(row.values[1]) : val_cell(std::move(row.values[1])));
     if (otext) ob->by_text.emplace(collate_key(row.values[0]), std::move(v));
-    else {
+    else if (text_is_wide_number(row.values[0])) {
+      ob->by_exact.emplace(canonical_decimal(row.values[0]), std::move(v));
+    } else {
       double d = 0;
       if (!parse_number(row.values[0], &d)) return nullptr;
       ob->by_num.emplace(d == 0 ? 0.0 : d, std::move(v));
@@ -17842,8 +17881,17 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
         for (size_t k = start; k < s.size(); ++k) {
           if (s[k] < '0' || s[k] > '9') { all_int = false; break; }
         }
+        if (all_int) {
+          // and within int64: a BIGINT UNSIGNED past 9223372036854775807 was clamped to it by the strtoll below,
+          // every such row of the column rewritten as that one number
+          errno = 0;
+          (void)std::strtoll(s.c_str(), nullptr, 10);
+          if (errno == ERANGE) { all_int = false; all_double = false; }
+        }
       }
     }
+    // An exact number a double cannot hold (past 2^53, more than 15 digits) is kept as written, not as a double.
+    if (all_double && !all_int && type != SqlDataType::Real && text_is_wide_number(s)) all_double = false;
     if (all_double && !all_int) {
       char* endp = nullptr;
       std::strtod(s.c_str(), &endp);
@@ -35431,9 +35479,9 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
       const uint32_t r = first[g];
       if (kcs.is_null(r)) continue;
       if (!coded_key) { key_of[g] = vx::typed_int(kcs, r); continue; }
-      double d = 0;
-      if (!parse_number(t.cell(r, kc), &d) || d != std::floor(d) || std::fabs(d) >= 9.2e18) return false;
-      key_of[g] = (int64_t)d;
+      int64_t kv = 0;   // the entry's integer, exactly (through a double, keys past 2^53 met their neighbours)
+      if (!exact_int_key_of(val_text(t.cell(r, kc)), &kv)) return false;
+      key_of[g] = kv;
     }
   }
   out->num.reserve(first.size());
@@ -35455,10 +35503,7 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
     out->add_value(std::move(values[g][0]));
     if (text_key) out->by_text.emplace(collate_key(t.cell(r, kc)), i);
     else if (out->dense) out->slot[(size_t)(key_of[g] - lo)] = i;
-    else {
-      const double d = (double)key_of[g];
-      out->by_num.emplace(d == 0 ? 0.0 : d, i);
-    }
+    else out->by_num.emplace(key_of[g], i);
   }
   return true;
 }
@@ -35494,7 +35539,7 @@ bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string&
     if (kcs.is_null(r)) continue;
     int32_t* at = nullptr;
     std::string tk;
-    double nk = 0;
+    int64_t nk = 0;
     // A later row of a key: with LIMIT 1 the first is the answer; without,
     // that key's subquery is MySQL's error 1242, which the subquery run per
     // row raises - so no batch.
@@ -35505,8 +35550,7 @@ bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string&
       at = &out->slot[(size_t)(vx::typed_int(kcs, r) - lo)];
       if (*at >= 0) { if (!first_wins) return false; continue; }
     } else {
-      nk = (double)vx::typed_int(kcs, r);
-      if (nk == 0) nk = 0;
+      nk = vx::typed_int(kcs, r);
       if (out->by_num.count(nk)) { if (!first_wins) return false; continue; }
     }
     Val v = eval_expr(item, ev.at(r));
@@ -36882,10 +36926,30 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
           continue;
         }
         const ColumnStore& kcs = t.col_data[fk.col];
+        if (fk.kind == FastKey::Int) {
+          // The groups' integers; where one is past 2^53 a double would tie neighbours, so each becomes its exact
+          // rank among them (sorted as int64) - still a number for the sort below.
+          std::vector<std::pair<int64_t, uint32_t>> ints;
+          bool wide = false;
+          for (size_t gi = 0; gi < G; ++gi) {
+            const size_t r = first_row[gi];
+            if (kcs.is_null(r)) { (*kn)[gi * nk + i] = 1; continue; }
+            const int64_t v = typed_int(kcs, r);
+            if (v >= 9007199254740992LL || v <= -9007199254740992LL) wide = true;
+            ints.push_back({v, (uint32_t)gi});
+          }
+          if (!wide) { for (const auto& [v, gi] : ints) (*kv)[gi * nk + i] = (double)v; continue; }
+          std::sort(ints.begin(), ints.end());
+          double rank = 0;
+          for (size_t j = 0; j < ints.size(); ++j) {
+            if (j > 0 && ints[j].first != ints[j - 1].first) ++rank;
+            (*kv)[ints[j].second * nk + i] = rank;
+          }
+          continue;
+        }
         for (size_t gi = 0; gi < G; ++gi) {
           const size_t r = first_row[gi];
           if (kcs.is_null(r)) { (*kn)[gi * nk + i] = 1; continue; }
-          if (fk.kind == FastKey::Int) { (*kv)[gi * nk + i] = (double)typed_int(kcs, r); continue; }
           const uint32_t code = kcs.read_code(r);
           const int rk = code < fk.rank.size() ? fk.rank[code] : -1;
           if (rk < 0) (*kn)[gi * nk + i] = 1;
@@ -37067,11 +37131,8 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
             const size_t r = first_row[gi];
             if (kcs.is_null(r)) k.keys.push_back(val_null());
             else {
-              Val v;
-              v.null = false;
-              v.numeric = true;
-              v.num = (double)typed_int(kcs, r);
-              k.keys.push_back(v);
+              const int64_t iv = typed_int(kcs, r);
+              k.keys.push_back(val_num_with_text((double)iv, std::to_string(iv)));   // the digits too: past 2^53 they decide
             }
             continue;
           }
@@ -39178,7 +39239,9 @@ bool fast_in_subquery(const EvalCtx& ctx, const ParsedSelectStatement& st, Neste
   res.ok = true;
   if (!fast_in_subquery_scan(ctx, st, [&](size_t n) { res.first_column.reserve(n); },
                              [&](const ColumnStore& cs, size_t r) {
-                               res.first_column.push_back(cs.is_null(r) ? val_null() : val_num((double)vx::typed_int(cs, r)));
+                               if (cs.is_null(r)) { res.first_column.push_back(val_null()); return; }
+                               const int64_t iv = vx::typed_int(cs, r);   // with its digits: past 2^53 a double ties neighbours
+                               res.first_column.push_back(val_num_with_text((double)iv, std::to_string(iv)));
                              }))
     return false;
   res.row_count = res.first_column.size();
