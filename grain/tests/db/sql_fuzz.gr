@@ -1,0 +1,242 @@
+# Random SQL on ASQL and on MariaDB, answer for answer: expressions over NULLs, mixed case, decimals and dates;
+# (Strings are grouped trimmed: 'b' and 'b ' are one group under MariaDB's PAD SPACE collation, and which of
+# the two it shows depends on its plan.) WHERE, GROUP BY/HAVING, joins, subqueries, UNION, DISTINCT, LIMIT, window functions; writes mixed in, with
+# the rows they touched compared too. Every query orders its whole answer, so any difference is a difference.
+#   grain sql_fuzz.gr <asql port> <asql password> <mariadb port> <mariadb password> [count] [seed]
+let asql = db_connect("127.0.0.1", int(args[0]), "g", args[1])
+let maria = db_connect("127.0.0.1", int(args[2]), "g", args[3])
+if not asql.ok { error("asql: " + asql.error) }
+if not maria.ok { error("mariadb: " + maria.error) }
+let count = len(args) > 4 ? int(args[4]) : 300
+let seed = len(args) > 5 ? int(args[5]) : 1
+let start_seed = seed
+let log_path = len(args) > 6 ? args[6] : ""
+let log = []
+
+fn rnd(n) {
+  seed = (seed * 1103515245 + 12345) % 2147483648
+  return int(seed / 65536) % n
+}
+fn pick(xs) { return xs[rnd(len(xs))] }
+
+let bad = 0
+let checked = 0
+let shown = 0
+fn norm(r) {
+  if not r.ok { return "ERROR" }
+  return json_stringify(r.rows)
+}
+fn both(st) {
+  push(log, st)
+  let x = db_query(asql, st)
+  let y = db_query(maria, st)
+  if starts_with(st, "SELECT") or starts_with(st, "(SELECT") {
+    checked += 1
+    if norm(x) != norm(y) {
+      bad += 1
+      if shown < 25 {
+        shown += 1
+        print("DIFF " + st)
+        print("  asql:    " + (x.ok ? norm(x) : x.error))
+        print("  mariadb: " + (y.ok ? norm(y) : y.error))
+      }
+    }
+  } else if x.ok != y.ok or (x.ok and x.affected_rows != y.affected_rows) {
+    bad += 1
+    if shown < 25 {
+      shown += 1
+      print("DIFF " + st)
+      print("  asql:    " + (x.ok ? "ok, " + str(x.affected_rows) + " row(s)" : x.error))
+      print("  mariadb: " + (y.ok ? "ok, " + str(y.affected_rows) + " row(s)" : y.error))
+    }
+  }
+  return x
+}
+fn setup(st) {
+  push(log, st)
+  let x = db_query(asql, st)
+  let y = db_query(maria, st)
+  if not x.ok { error("asql setup: " + st + ": " + x.error) }
+  if not y.ok { error("mariadb setup: " + st + ": " + y.error) }
+}
+
+let words = ["'abc'", "'ABC'", "'Abd'", "'b'", "'B '", "''", "'zeta'", "'Zeta'", "'a%b'", "'x_y'", "'  pad'", "'mid dle'", "NULL"]
+let dates = ["'2020-01-01'", "'2020-02-29'", "'2021-12-31'", "'2024-06-15'", "'1999-07-04'", "NULL"]
+fn ival() { return rnd(6) == 0 ? "NULL" : str(rnd(21) - 5) }
+fn dval() { return rnd(6) == 0 ? "NULL" : str(rnd(20001) - 10000) + "." + str(rnd(100)) }
+
+setup("CREATE DATABASE IF NOT EXISTS fz")
+setup("USE fz")
+setup("DROP TABLE IF EXISTS t1")
+setup("DROP TABLE IF EXISTS t2")
+setup("CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b VARCHAR(12), c DECIMAL(8,2), d DATE)")
+setup("CREATE TABLE t2 (id INT PRIMARY KEY, t1id INT, e INT, f VARCHAR(12))")
+let next_id = 1
+let next_id2 = 1
+fn row1() {
+  let r = "(" + str(next_id) + ", " + ival() + ", " + pick(words) + ", " + dval() + ", " + pick(dates) + ")"
+  next_id += 1
+  return r
+}
+fn row2() {
+  let r = "(" + str(next_id2) + ", " + (rnd(8) == 0 ? "NULL" : str(rnd(next_id + 2))) + ", " + ival() + ", " + pick(words) + ")"
+  next_id2 += 1
+  return r
+}
+for k in range(0, 3) {
+  let rows = []
+  for j in range(0, 10) { push(rows, row1()) }
+  setup("INSERT INTO t1 VALUES " + join(rows, ", "))
+  let rows2 = []
+  for j in range(0, 10) { push(rows2, row2()) }
+  setup("INSERT INTO t2 VALUES " + join(rows2, ", "))
+}
+
+# expressions: [sql, kind]
+fn int_expr() {
+  return pick(["a", "id", "a + 1", "a * 2", "a - id", "a % 3", "ABS(a)", "COALESCE(a, 0)", "IFNULL(a, -1)", "LENGTH(b)", "CHAR_LENGTH(b)",
+               "CASE WHEN a > 5 THEN 1 WHEN a < 0 THEN -1 ELSE 0 END", "GREATEST(a, 2)", "LEAST(a, id)", "YEAR(d)", "MONTH(d)", "DAYOFMONTH(d)",
+               "DATEDIFF(d, '2020-01-01')", "FLOOR(c)", "CEIL(c)", "SIGN(c)", "a DIV 2", "NULLIF(a, 0)", "IF(a IS NULL, 7, a)", "LOCATE('b', b)",
+               "(a > 2)", "(b = 'abc')", "(b LIKE 'a%')", "CAST(c AS SIGNED)", "ROUND(c)", "a & 3", "ABS(a) | 4"])
+}
+fn str_expr() {
+  return pick(["b", "UPPER(b)", "LOWER(b)", "CONCAT(b, '-', a)", "CONCAT_WS(',', b, a)", "SUBSTRING(b, 2, 2)", "LEFT(b, 1)", "RIGHT(b, 2)", "TRIM(b)",
+               "REPLACE(b, 'a', 'Q')", "COALESCE(b, 'none')", "REVERSE(b)", "LPAD(b, 5, '*')", "RPAD(a, 3, '0')", "CAST(a AS CHAR)",
+               "DATE_FORMAT(d, '%Y/%m')", "CAST(d AS CHAR)", "CAST(DATE_ADD(d, INTERVAL 40 DAY) AS CHAR)", "CAST(c AS CHAR)", "CONCAT(c)", "HEX(a)", "MD5(b)"])
+}
+fn dec_expr() {
+  return pick(["c", "c * 2", "c + a", "ROUND(c, 1)", "TRUNCATE(c, 0)", "c / 4", "ABS(c)", "COALESCE(c, a)", "c - 0.5", "a * 1.5"])
+}
+fn any_expr() {
+  let k = rnd(3)
+  if k == 0 { return int_expr() }
+  if k == 1 { return str_expr() }
+  return dec_expr()
+}
+fn cond() {
+  let k = rnd(14)
+  if k == 0 { return "a " + pick(["=", "<", ">", "<=", ">=", "<>", "<=>"]) + " " + str(rnd(11) - 3) }
+  if k == 1 { return "b " + pick(["=", "<", ">", "<>"]) + " " + pick(["'abc'", "'b'", "'Zeta'", "''", "'ABD'"]) }
+  if k == 2 { return pick(["a", "b", "c", "d"]) + pick([" IS NULL", " IS NOT NULL"]) }
+  if k == 3 { return "a IN (" + str(rnd(5)) + ", " + str(rnd(9) - 3) + ", NULL)" }
+  if k == 4 { return "a NOT IN (1, 2)" }
+  if k == 5 { return "c BETWEEN " + str(rnd(1000) - 500) + " AND " + str(rnd(10000)) }
+  if k == 6 { return "b LIKE " + pick(["'a%'", "'%b%'", "'_b%'", "'%a\\%b%'", "'Z%'", "'%e'"]) }
+  if k == 7 { return "d " + pick(["<", ">=", "="]) + " " + pick(["'2020-02-29'", "'2021-01-01'"]) }
+  if k == 8 { return "NOT (" + cond() + ")" }
+  if k == 9 { return "(" + cond() + " OR " + cond() + ")" }
+  if k == 10 { return cond() + " AND " + cond() }
+  if k == 11 { return "a IN (SELECT e FROM t2 WHERE " + pick(["e > 0", "f IS NOT NULL", "t1id < 10"]) + ")" }
+  if k == 12 { return pick(["", "NOT "]) + "EXISTS (SELECT 1 FROM t2 WHERE t2.t1id = t1.id" + pick(["", " AND t2.e > 0", " AND t2.f = t1.b"]) + ")" }
+  return int_expr() + " " + pick(["=", ">", "<"]) + " " + str(rnd(6))
+}
+fn order_all(n) {
+  let o = []
+  for i in range(1, n + 1) { push(o, str(i) + pick(["", " DESC"])) }
+  return join(o, ", ")
+}
+
+fn select_rows() {
+  let exprs = []
+  for i in range(0, 1 + rnd(3)) { push(exprs, any_expr()) }
+  push(exprs, "id")
+  let w = rnd(4) == 0 ? "" : " WHERE " + cond()
+  let lim = rnd(4) == 0 ? " LIMIT " + str(rnd(8)) + (rnd(2) == 0 ? " OFFSET " + str(rnd(5)) : "") : ""
+  return "SELECT " + join(exprs, ", ") + " FROM t1" + w + " ORDER BY " + order_all(len(exprs)) + lim
+}
+fn select_group() {
+  let g = pick(["a", "a % 3", "LOWER(TRIM(b))", "YEAR(d)", "c > 0", "a IS NULL", "LENGTH(b)", "LOWER(LEFT(TRIM(b), 1))"])
+  let aggs = []
+  for i in range(0, 1 + rnd(3)) {
+    push(aggs, pick(["COUNT(*)", "COUNT(a)", "COUNT(DISTINCT a)", "SUM(a)", "MIN(a)", "MAX(a)", "SUM(c)", "MIN(c)", "MAX(c)", "MIN(d)", "MAX(d)",
+                     "ROUND(AVG(a), 2)", "ROUND(AVG(c), 2)", "COUNT(DISTINCT LOWER(TRIM(b)))", "GROUP_CONCAT(id ORDER BY id)", "SUM(a > 0)", "BIT_OR(a)", "MAX(LENGTH(b))"]))
+  }
+  let w = rnd(3) == 0 ? "" : " WHERE " + cond()
+  let h = rnd(3) == 0 ? " HAVING COUNT(*) > " + str(rnd(3)) : ""
+  return "SELECT " + g + ", " + join(aggs, ", ") + " FROM t1" + w + " GROUP BY " + g + h + " ORDER BY " + order_all(1 + len(aggs))
+}
+fn select_whole() {
+  let aggs = pick(["COUNT(*), SUM(a), MIN(c), MAX(d)", "COUNT(DISTINCT LOWER(b)), MAX(a), ROUND(AVG(c), 3)", "SUM(c), COUNT(b), MIN(a)"])
+  return "SELECT " + aggs + " FROM t1" + (rnd(2) == 0 ? "" : " WHERE " + cond())
+}
+fn select_join() {
+  let j = pick(["JOIN", "LEFT JOIN", "RIGHT JOIN"])
+  let jon = pick(["t2.t1id = t1.id", "t2.t1id = t1.id AND t2.e > 0", "t2.e = t1.a", "t2.f = t1.b"])
+  let cols = pick(["t1.id, t2.id", "t1.id, t2.id, t1.a + t2.e", "t1.id, t2.id, CONCAT(t1.b, t2.f)", "t1.id, t2.id, COALESCE(t2.e, t1.a)"])
+  let n = cols == "t1.id, t2.id" ? 2 : 3
+  let w = rnd(2) == 0 ? "" : " WHERE " + pick(["t1.a > 0", "t2.e IS NULL", "t1.b = 'abc'", "t2.f LIKE '%e%'", "t1.c > 0 OR t2.e < 2"])
+  return "SELECT " + cols + " FROM t1 " + j + " t2 ON " + jon + w + " ORDER BY " + order_all(n)
+}
+fn select_join_group() {
+  return "SELECT t1.id, COUNT(t2.id), SUM(t2.e), MAX(t2.f IS NULL) FROM t1 LEFT JOIN t2 ON t2.t1id = t1.id" +
+         (rnd(2) == 0 ? "" : " WHERE " + cond()) + " GROUP BY t1.id ORDER BY 1"
+}
+fn select_sub() {
+  let k = rnd(4)
+  if k == 0 { return "SELECT id, (SELECT MAX(e) FROM t2 WHERE t2.t1id = t1.id) FROM t1 ORDER BY 1" }
+  if k == 1 { return "SELECT id, a FROM t1 WHERE a > (SELECT AVG(e) FROM t2) ORDER BY 1" }
+  if k == 2 { return "SELECT x, COUNT(*) FROM (SELECT a % 4 AS x FROM t1 WHERE " + cond() + ") s GROUP BY x ORDER BY 1" }
+  return "SELECT id FROM t1 WHERE id IN (SELECT t1id FROM t2 WHERE e " + pick(["> 0", "IS NULL", "< 3"]) + ") ORDER BY 1"
+}
+fn select_union() {
+  return "SELECT a FROM t1 WHERE " + cond() + pick([" UNION ", " UNION ALL "]) + "SELECT e FROM t2 WHERE " + pick(["e > 1", "f IS NULL", "t1id < 5"]) + " ORDER BY 1"
+}
+fn select_distinct() {
+  let two = rnd(3) == 0
+  let col = two ? pick(["a, YEAR(d)", "a % 3, LOWER(TRIM(b))", "c > 0, a IS NULL"]) : pick(["a", "a % 3", "LOWER(TRIM(b))", "YEAR(d)", "c > 0", "LENGTH(b)"])
+  return "SELECT DISTINCT " + col + " FROM t1" + (rnd(2) == 0 ? "" : " WHERE " + cond()) + " ORDER BY 1" + (two ? ", 2" : "")
+}
+fn select_window() {
+  return "SELECT id, " + pick(["ROW_NUMBER() OVER (ORDER BY a, id)", "RANK() OVER (ORDER BY a)", "DENSE_RANK() OVER (ORDER BY c)",
+                               "SUM(a) OVER (PARTITION BY a % 2 ORDER BY id)", "COUNT(*) OVER (PARTITION BY LOWER(TRIM(b)))",
+                               "LAG(a) OVER (ORDER BY id)", "LEAD(id, 2) OVER (ORDER BY id)", "MAX(c) OVER ()"]) + " FROM t1 ORDER BY 1"
+}
+fn write() {
+  let k = rnd(7)
+  if k == 0 {
+    let rows = []
+    for j in range(0, 1 + rnd(3)) { push(rows, row1()) }
+    return "INSERT INTO t1 VALUES " + join(rows, ", ")
+  }
+  if k == 1 { return "INSERT INTO t2 VALUES " + row2() }
+  if k == 2 { return "UPDATE t1 SET " + pick(["a = a + 1", "b = UPPER(b)", "c = c * 2", "a = NULL", "d = DATE_ADD(d, INTERVAL 1 MONTH)", "b = CONCAT(b, 'x')"]) + " WHERE " + cond() }
+  if k == 3 { return "DELETE FROM t1 WHERE " + cond() + (rnd(3) == 0 ? " ORDER BY id LIMIT 2" : "") }
+  if k == 4 { return "UPDATE t2 SET e = e + 1 WHERE t1id IN (SELECT id FROM t1 WHERE " + cond() + ")" }
+  if k == 5 { return "DELETE FROM t2 WHERE e " + pick(["> 5", "IS NULL", "< -2"]) }
+  return "UPDATE t1 JOIN t2 ON t2.t1id = t1.id SET t1.a = t2.e WHERE t2.e > " + str(rnd(5))
+}
+
+for n in range(0, count) {
+  let k = rnd(20)
+  let st = ""
+  if k < 4 { st = select_rows() }
+  else if k < 7 { st = select_group() }
+  else if k < 8 { st = select_whole() }
+  else if k < 10 { st = select_join() }
+  else if k < 11 { st = select_join_group() }
+  else if k < 13 { st = select_sub() }
+  else if k < 14 { st = select_union() }
+  else if k < 15 { st = select_distinct() }
+  else if k < 16 { st = select_window() }
+  else { st = write() }
+  both(st)
+  if not starts_with(st, "SELECT") {
+    for t in ["t1", "t2"] {
+      let x = db_query(asql, "SELECT * FROM " + t + " ORDER BY id")
+      let y = db_query(maria, "SELECT * FROM " + t + " ORDER BY id")
+      if norm(x) != norm(y) {
+        print("TABLES DIFFER after: " + st)
+        print("  asql " + t + ":    " + norm(x))
+        print("  mariadb " + t + ": " + norm(y))
+        if log_path != "" { write_file(log_path, join(log, ";\n") + ";\n") }
+        error("sql_fuzz: the data went different ways (seed " + str(start_seed) + ")")
+      }
+    }
+  }
+}
+# the tables themselves, after all the writes
+both("SELECT * FROM t1 ORDER BY id")
+both("SELECT * FROM t2 ORDER BY id")
+print(bad == 0 ? "ok   seed " + str(start_seed) + ": " + str(checked) + " answers the same on ASQL and MariaDB" : "FAIL seed " + str(start_seed) + ": " + str(bad) + " difference(s) in " + str(checked) + " answers")
+if bad > 0 and log_path != "" { write_file(log_path, join(log, ";\n") + ";\n") }
+if bad > 0 { error("sql_fuzz failed") }

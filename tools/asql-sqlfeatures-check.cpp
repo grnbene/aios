@@ -487,6 +487,44 @@ int main() {
   expect_rows(db, "parenthesised join group with derived tables",
               "SELECT * FROM ((SELECT 1 AS a) AS dt1 JOIN (SELECT 1 AS a) AS dt2 ON dt1.a = dt2.a);", 1);
 
+  // A join whose inner table has never held a row (no column storage yet), filtered on that table: this read
+  // storage that was not there and took the engine down. (Found by grain/tests/db/sql_fuzz.gr.)
+  run_ok(db, "CREATE TABLE fz_outer (id INT PRIMARY KEY, a INT);");
+  run_ok(db, "CREATE TABLE fz_inner (id INT PRIMARY KEY, outer_id INT, e INT);");
+  run_ok(db, "INSERT INTO fz_outer VALUES (1, 2), (2, 3);");
+  expect_rows(db, "join on a never-filled table, filtered on it", "SELECT fz_outer.id FROM fz_outer JOIN fz_inner ON fz_inner.outer_id = fz_outer.id WHERE fz_inner.e > 1;", 0);
+  {
+    auto u = db.execute_local_query("UPDATE fz_outer JOIN fz_inner ON fz_inner.outer_id = fz_outer.id SET fz_outer.a = fz_inner.e WHERE fz_inner.e > 1;");
+    if (u.success && u.rows_affected == 0) std::cout << "  [ok] UPDATE ... JOIN a never-filled table changes nothing\n";
+    else { std::cout << "  [FAIL] UPDATE ... JOIN a never-filled table: " << (u.success ? std::to_string(u.rows_affected) + " row(s)" : u.error_message) << "\n"; g_failures++; }
+  }
+  // A DELETE moves the inner table's rows up; the join's lookup on the inner key (kept per dictionary code) must
+  // follow them, or each key is paired with whatever row moved into its old place.
+  run_ok(db, "CREATE TABLE fz_t1 (id INT PRIMARY KEY, a INT, b VARCHAR(12), c DECIMAL(8,2), d DATE);");
+  run_ok(db, "CREATE TABLE fz_t2 (id INT PRIMARY KEY, t1id INT, e INT, f VARCHAR(12));");
+  run_ok(db, "INSERT INTO fz_t1 VALUES (21, NULL, 'B ', -3768.32, '1999-07-04'), (22, -1, 'ABC', -2412.74, '2024-06-15'), (23, -3, 'x_y', NULL, '2020-01-01'), "
+             "(24, NULL, 'B ', -8908.50, '2020-01-01'), (25, 12, 'B ', 2281.2, '1999-07-04'), (26, 15, 'ABC', -3814.29, '1999-07-04'), "
+             "(27, 15, 'zeta', -3319.1, '2024-06-15'), (28, NULL, 'ABC', -8678.7, '2021-12-31'), (29, 3, '  pad', 875.29, '2020-02-29'), (30, 10, '', -5281.42, '2021-12-31');");
+  run_ok(db, "INSERT INTO fz_t2 VALUES (21, NULL, -3, 'Zeta'), (22, 27, 4, 'a%b'), (23, 21, 15, 'a%b'), (24, 29, 4, NULL), (25, 23, 8, '  pad'), "
+             "(26, 31, 6, '  pad'), (27, 30, -5, 'zeta'), (28, 31, 4, 'b'), (29, 32, 10, 'ABC'), (30, NULL, 4, NULL);");
+  run_ok(db, "SELECT fz_t1.id, COUNT(fz_t2.id), SUM(fz_t2.e), MAX(fz_t2.f IS NULL) FROM fz_t1 LEFT JOIN fz_t2 ON fz_t2.t1id = fz_t1.id WHERE EXISTS (SELECT 1 FROM fz_t2 WHERE fz_t2.t1id = fz_t1.id AND fz_t2.e > 0) GROUP BY fz_t1.id ORDER BY 1;");
+  run_ok(db, "DELETE FROM fz_t2 WHERE e > 5;");
+  {
+    auto a = db.execute_local_query("SELECT fz_t1.id, fz_t2.id FROM fz_t1 JOIN fz_t2 ON fz_t2.t1id = fz_t1.id ORDER BY 1, 2;");
+    auto b = db.execute_local_query("SELECT fz_t1.id, fz_t2.id FROM fz_t2 JOIN fz_t1 ON fz_t1.id = fz_t2.t1id ORDER BY 1, 2;");
+    auto flat = [](const auto& r) { std::string o; for (auto& row : r.rows) { for (auto& v : row.values) o += v + ","; o += ";"; } return o; };
+    // MariaDB 10.11 on the same statements: (27,22) (29,24) (30,27)
+    if (a.success && b.success && flat(a) == flat(b) && flat(a) == "27,22,;29,24,;30,27,;") std::cout << "  [ok] a join after a DELETE pairs the right rows\n";
+    else { std::cout << "  [FAIL] join after DELETE: " << flat(a) << " vs " << flat(b) << "\n"; g_failures++; }
+  }
+
+  {
+    // `id` is in both tables: MariaDB refuses the bare name (1052). A filter pushed to one table read it from there.
+    auto r = db.execute_local_query("SELECT fz_t1.id, COUNT(fz_t2.id) FROM fz_t1 LEFT JOIN fz_t2 ON fz_t2.t1id = fz_t1.id WHERE a - id = 2 GROUP BY fz_t1.id;");
+    if (!r.success && r.error_message.find("ambiguous") != std::string::npos) std::cout << "  [ok] a bare column two joined tables share is refused as ambiguous\n";
+    else { std::cout << "  [FAIL] ambiguous bare column: " << (r.success ? std::to_string(r.rows.size()) + " row(s)" : r.error_message) << "\n"; g_failures++; }
+  }
+
   std::cout << "\n=== " << (g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES: " + std::to_string(g_failures))
             << " ===\n";
   return g_failures == 0 ? 0 : 1;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # grain against a fresh ASQL engine: live() following writes (ASQL_CHANGES), two random-write fuzzers that check
 # ORDER BY / MIN / MAX / GROUP BY / DISTINCT / lookups against the rows themselves, and - when a MariaDB is given -
-# the same SQL on both, answer for answer.
+# the same SQL on both, answer for answer, then random SQL (sql_fuzz.gr) on both.
 #   asql-grain-check.sh <aios-engine> <grain> [mariadb-port mariadb-password]   (MariaDB account: g)
 set -u
 ENGINE=${1:?usage: asql-grain-check.sh <aios-engine> <grain> [mariadb-port mariadb-password]}
@@ -19,5 +19,8 @@ FAILED=0
 run() { echo "== $*"; "$@" || FAILED=1; }
 run "$GRAIN" "$T/live_asql.gr" $PORT checkpass
 for seed in 7 23 99; do run "$GRAIN" "$T/order_fuzz.gr" $PORT checkpass 300 $seed; run "$GRAIN" "$T/query_fuzz.gr" $PORT checkpass 300 $seed; done
-if [ $# -ge 4 ]; then run "$GRAIN" "$T/differential.gr" $PORT checkpass "$3" "$4" "$T"/sql/*.sql; fi
+if [ $# -ge 4 ]; then
+  run "$GRAIN" "$T/differential.gr" $PORT checkpass "$3" "$4" "$T"/sql/*.sql
+  for seed in 1 2 3 4 5; do run "$GRAIN" "$T/sql_fuzz.gr" $PORT checkpass "$3" "$4" 300 $seed; done
+fi
 exit $FAILED
