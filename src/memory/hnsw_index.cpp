@@ -53,8 +53,8 @@ inline float dot_general_avx2(const float* a, const float* b, size_t dim) {
 
 namespace aios::memory {
 
-HNSWVectorIndex::HNSWVectorIndex(size_t dimension, size_t max_elements, size_t M, size_t ef_construction)
-    : dimension_(dimension), max_elements_(max_elements), M_(M), ef_construction_(ef_construction) {}
+HNSWVectorIndex::HNSWVectorIndex(size_t dimension, size_t M, size_t ef_construction)
+    : dimension_(dimension), M_(M), ef_construction_(ef_construction) {}
 
 // Cosine distance in [0, 2] between unit-normalized vectors: 1.0f - dot.
 // Vectors stored in vectors_ are unit-normalized upon insertion.

@@ -120,14 +120,6 @@ bool ref_exists_name(Ctx& c, const std::string& name) {
   return name == "HEAD" || name == "FETCH_HEAD" || name == "ORIG_HEAD" || name == "MERGE_HEAD" ? read_ref(c, name).has_value() : false;
 }
 
-std::string head_text(Ctx& c) {
-  auto r = c.host().read_file(c.repo->git_dir() + "/HEAD");
-  if (!r.ok()) return "";
-  std::string s((const char*)r->data(), r->size());
-  while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-  return s;
-}
-
 std::string trim_ws(const std::string& s) {
   size_t a = 0, b = s.size();
   while (a < b && std::isspace((unsigned char)s[a])) ++a;

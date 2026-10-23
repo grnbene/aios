@@ -423,7 +423,7 @@ struct NetStack::Impl {
 
 // ---- NetStack facade -----------------------------------------------------
 NetStack::NetStack(FrameDevice& dev, uint64_t (*now_ns)(), uint32_t (*rand32)())
-  : d_(new Impl(*this, dev, now_ns, rand32)), dev_(dev) { d_->mac = dev.mac(); }
+  : d_(new Impl(*this, dev, now_ns, rand32)) { d_->mac = dev.mac(); }
 NetStack::~NetStack() = default;
 
 Result<void> NetStack::configure(const NetConfig& cfg, int dhcp_timeout_ms) {

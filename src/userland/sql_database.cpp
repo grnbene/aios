@@ -798,15 +798,6 @@ std::string pad_right(const std::string& s, size_t width) {
   return s + std::string(width - s.size(), ' ');
 }
 
-inline uint64_t fnv1a_hash(const std::string& s) {
-  uint64_t h = 14695981039346656037ULL;
-  for (char c : s) {
-    h ^= static_cast<uint8_t>(c);
-    h *= 1099511628211ULL;
-  }
-  return h;
-}
-
 thread_local std::string tls_session_database;
 
 // One row change a transaction (or an undo frame) made, kept so a ROLLBACK can take back exactly that change and
@@ -6800,22 +6791,6 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
     }
   }
   return out;
-}
-
-inline NestedResult run_nested_select(SqlDatabase* db, const std::string& sql,
-                                      const EvalCtx& outer) {
-  if (!db) {
-    NestedResult out;
-    out.error = "no database for subquery";
-    return out;
-  }
-  ParsedSelectStatement parsed = parse_select_sql(sql);
-  if (!parsed.ok) {
-    NestedResult out;
-    out.error = parsed.error.empty() ? std::string("subquery parse failed") : parsed.error;
-    return out;
-  }
-  return run_nested_parsed_select(db, parsed, outer);
 }
 
 // Evaluates a subquery once and, when it turned out to read nothing from the
@@ -17502,41 +17477,45 @@ void ColumnStore::erase(size_t row) {
   if (!null_bitmap.empty() && (row_count_ & 7)) null_bitmap.back() &= (uint8_t)((1u << (row_count_ & 7)) - 1);
 }
 
+// Room for `sz` rows. A vector's own reserve() allocates exactly what it is asked for, and the binlog applies a
+// row at a time: each insert into an 11-million-row audittrail copied every column whole (~180 ms an event on
+// chi-il-1, a day's restore never caught up). Growing by half again amortises it, as push_back does.
 void ColumnStore::reserve(size_t sz) {
   if (sz <= row_count_) return;
+  auto grow = [](auto& v, size_t n) { if (n > v.capacity()) v.reserve(std::max(n, v.capacity() + v.capacity() / 2)); };
   if (encoding == ColumnEncoding::DictBitPacked) {
-    if (bit_width_ == 32) data32.reserve(sz);
-    else if (bit_width_ > 0) packed_data.reserve(((sz * bit_width_ + 7) >> 3) + 8);
+    if (bit_width_ == 32) grow(data32, sz);
+    else if (bit_width_ > 0) grow(packed_data, ((sz * bit_width_ + 7) >> 3) + 8);
   } else if (encoding == ColumnEncoding::TypedInt32) {
-    int32_data.reserve(sz);
+    grow(int32_data, sz);
   } else if (encoding == ColumnEncoding::TypedInt64) {
-    int64_data.reserve(sz);
+    grow(int64_data, sz);
   } else if (encoding == ColumnEncoding::TypedDouble) {
-    double_data.reserve(sz);
+    grow(double_data, sz);
   } else if (encoding == ColumnEncoding::RawArena) {
-    arena_offsets.reserve(sz + 1);
+    grow(arena_offsets, sz + 1);
   } else if (encoding == ColumnEncoding::FOR || encoding == ColumnEncoding::TemporalDays ||
              encoding == ColumnEncoding::TemporalSeconds || encoding == ColumnEncoding::DecimalScaled) {
-    if (bit_width_ == 32) data32.reserve(sz);
-    else if (bit_width_ > 0) packed_data.reserve(((sz * bit_width_ + 7) >> 3) + 8);
+    if (bit_width_ == 32) grow(data32, sz);
+    else if (bit_width_ > 0) grow(packed_data, ((sz * bit_width_ + 7) >> 3) + 8);
   } else if (encoding == ColumnEncoding::SegmentFOR || encoding == ColumnEncoding::ALP) {
     const size_t nsegs = (sz + kSegRows - 1) / kSegRows;
-    seg_base.reserve(nsegs);
-    seg_bits.reserve(nsegs);
-    seg_byte_at.reserve(nsegs + 1);
-    if (encoding == ColumnEncoding::ALP) alp_exp.reserve(nsegs);
+    grow(seg_base, nsegs);
+    grow(seg_bits, nsegs);
+    grow(seg_byte_at, nsegs + 1);
+    if (encoding == ColumnEncoding::ALP) grow(alp_exp, nsegs);
   } else if (encoding == ColumnEncoding::RLE) {
-    rle_seg_base_rows.reserve((sz + 31) / 32);
+    grow(rle_seg_base_rows, (sz + 31) / 32);
   } else if (encoding == ColumnEncoding::FSST) {
     if (!fsst_offsets.empty()) {
-      fsst_offsets.reserve(sz + 1);   // already the wide form
+      grow(fsst_offsets, sz + 1);   // already the wide form
     } else {
-      fsst_off_rel.reserve(sz + 1);   // the compact form: 2 bytes a boundary and one base per 16
-      fsst_off_base.reserve((sz + 16) >> 4);
+      grow(fsst_off_rel, sz + 1);   // the compact form: 2 bytes a boundary and one base per 16
+      grow(fsst_off_base, (sz + 16) >> 4);
     }
   }
-  null_bitmap.reserve((sz + 7) >> 3);
-  zone_maps.reserve((sz + kSegRows - 1) / kSegRows);
+  grow(null_bitmap, (sz + 7) >> 3);
+  grow(zone_maps, (sz + kSegRows - 1) / kSegRows);
 }
 
 void ColumnStore::resize(size_t sz, const std::string& val) {
@@ -18449,7 +18428,7 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     constexpr size_t kSampleBlocks = 32;   // of the store's own kBlockRows
     const size_t nblocks = (row_count_ + kBlockRows - 1) / kBlockRows;
     const size_t take = std::min(nblocks, kSampleBlocks);
-    size_t sample_rows = 0, block_bytes = 0, plain_bytes = 0;
+    size_t sample_rows = 0, block_bytes = 0;
     std::vector<std::string_view> sample;
     std::vector<uint8_t> raw;
     for (size_t k = 0; k < take; ++k) {
@@ -18464,7 +18443,6 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
       }
       whole.insert(whole.end(), raw.begin(), raw.end());
       block_bytes += lz4_compress(whole.data(), whole.size()).size();
-      plain_bytes += raw.size();
       sample_rows += count;
     }
     SymbolCoder coder;
@@ -32595,12 +32573,6 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
       for (size_t i = 0; i < n; ++i) out[i] = (live && !live[i]) ? kF : tri_of(eval_expr(p.expr, ev.at(start + i)));
       return;
   }
-}
-
-bool pred_has_row_eval(const Pred& p) {
-  if (p.kind == Pred::Row) return true;
-  for (const auto& k : p.kids) if (pred_has_row_eval(k)) return true;
-  return false;
 }
 
 static inline void mask_out_nulls(const ColumnStore& cs, size_t start, size_t n, uint64_t* mask_out) {

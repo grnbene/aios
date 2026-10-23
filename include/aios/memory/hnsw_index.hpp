@@ -13,7 +13,7 @@ namespace aios::memory {
 // array. The one owner (SemanticIndex) is only reached under the store's lock.
 class HNSWVectorIndex {
  public:
-  HNSWVectorIndex(size_t dimension = 128, size_t max_elements = 100000, size_t M = 16, size_t ef_construction = 200);
+  HNSWVectorIndex(size_t dimension = 128, size_t M = 16, size_t ef_construction = 200);
 
   Result<void> insert(const ObjectID& id, const std::vector<float>& vec);
   std::vector<std::pair<ObjectID, float>> search_knn(const std::vector<float>& query, size_t k = 5, size_t ef_search = 50) const;
@@ -29,7 +29,6 @@ class HNSWVectorIndex {
   using Cand = std::pair<float, Slot>;
 
   size_t dimension_;
-  size_t max_elements_;
   size_t M_;
   size_t ef_construction_;
   int max_layer_ = 0;

@@ -24,7 +24,6 @@ constexpr uint32_t CC_Quote          = 0x00000158;
 constexpr uint32_t CC_FlushContext   = 0x00000165;
 
 constexpr uint32_t TPM_RH_ENDORSEMENT = 0x4000000B;
-constexpr uint32_t TPM_RH_OWNER       = 0x40000001;
 constexpr uint32_t TPM_RS_PW          = 0x40000009;
 
 constexpr uint16_t TPM_ALG_SHA256 = 0x000B;

@@ -8,9 +8,10 @@
 //
 //   POST /feed          Authorization: Bearer <token>, body {} or {"brands": ["NAME", ...]}
 //                       -> {"items": [...]}, exactly what feed() answers
-//   POST /stock_check   Authorization: Bearer <token>, body {"skus": ["STOCKID", ...]} or the
-//                       "lines" placeorder takes ([{"sku": ..., "qty": ...}])
-//                       -> {"items": [...], "not_found": [...]}: the same rows as /feed, for those items
+//   POST /getstock      Authorization: Bearer <token>, body {"sku": "VITEM"}, {"skus": ["VITEM", ...]} or the
+//                       "lines" placeorder takes ([{"sku": ..., "brand": ..., "qty": ...}])
+//                       -> {"items": [...], "not_found": [{"sku": ...}, ...]}: the same rows as /feed, for
+//                       those items; 404 not_found when none of them is in the feed
 //   GET  /              the ops view
 //
 // What it does not do: getItemCost() in PHP also writes stockmaster.actualcost from inside the feed.
@@ -71,12 +72,7 @@ fn php_truthy(v) {
 
 // The number a string starts with, as PHP 7.4 reads one: {d, whole}, or nil when it starts with none.
 // whole: the string is that number and nothing after it (is_numeric; trailing space does not count).
-let NUMBER_PREFIX = "^[ \t\n\r\v\f]*[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?"
-fn num_prefix(s) {
-  let m = regex_match(NUMBER_PREFIX, s)
-  if m == nil { return nil }
-  return {"d": decimal(m.text), "whole": m.end == len(s)}
-}
+fn num_prefix(s) { return decimal_prefix(s) }
 
 // A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
 fn num(v) {
@@ -103,27 +99,26 @@ fn num_int(v) { return int(num(v)) }
 // number_format($v, $places, '.', '') on PHP 7.4: a string that is not numeric at all is refused
 // (a warning and NULL); a leading-numeric one counts as its number; null and false as 0. The value is
 // rounded to 15 significant digits first, then half away from zero, and a zero has no sign.
-fn nf(v, places) {
+// nf_dec() is that number as a decimal of `places` places, for arithmetic that goes on with what
+// number_format() printed: num(nf(v, p)) is nf_dec(v, p), or 0 where nf() gives nil.
+fn nf_dec(v, places) {
   let d = decimal(0)
   if v == true { d = decimal(1) }
   else if v != nil and v != false {
     if type(v) == "string" {
-      let p = num_prefix(v)
+      let p = decimal_prefix(v)
       if p == nil { return nil }
       d = p.d
     } else {
       d = decimal(v)
     }
   }
-  // significant digits: the mantissa's, without leading zeros
-  let t = replace(str(abs(d)), ".", "")
-  let lead = 0
-  while lead < len(t) - 1 and char_at(t, lead) == "0" { lead = lead + 1 }
-  let digits = len(t) - lead
-  if digits > 15 and scale(d) - (digits - 15) >= 0 { d = round(d, scale(d) - (digits - 15)) }
-  d = round(d, places)
-  if d == 0 { d = decimal(0) }
-  return format("{:." + str(places) + "f}", d)
+  return decimal(round_sig(d, 15), places)
+}
+
+fn nf(v, places) {
+  let d = nf_dec(v, places)
+  return d == nil ? nil : str(d)
 }
 
 // $v > 0 and $v == 0 on PHP 7.4: a string compares by its leading number
@@ -155,9 +150,11 @@ fn loose_empty_string(v) {
 }
 
 // MariaDB compares the ERP's codes without case or trailing spaces
+// (PAD SPACE ignores trailing spaces only: 'VTG-VT11366' and 'VTG-VT11366' + CR are two items to it, and locstock
+// holds both)
 fn ck(s) {
   if s == nil { return "" }
-  return upper(rtrim(str(s)))
+  return upper(rtrim(str(s), " "))
 }
 
 // ---- connections ------------------------------------------------------------------------------
@@ -347,6 +344,8 @@ fn build(brands, levels, only) {
 }
 
 // getPLMPrice($stockid, $level): the price-level machinery, with every table it reads loaded once.
+// PHP passes number_format() strings between its steps; here each step hands on the same number as a
+// decimal (nf_dec), and only the feed's own nf() prints it.
 fn make_pricer(only) {
   let o = fn (col) { return only == nil ? "" : " AND " + col + " IN (?)" }
   let op = fn (params) {
@@ -495,7 +494,7 @@ fn make_pricer(only) {
     let cost = total > 0 ? ac : next_cost(stockid)
     let f = c.forced[key]
     if f != nil and php_truthy(f[1]) { cost = f[1] }
-    return nf(cost, 2)
+    return nf_dec(cost, 2)
   }
 
   let plm = nil
@@ -506,7 +505,7 @@ fn make_pricer(only) {
     if st == nil { return nil }
     if php_in(st[1], ["1"]) {
       let r = pricebook(level)[ck(stockid)]
-      if r != nil and php_truthy(r[1]) { return nf(r[1], 2) }
+      if r != nil and php_truthy(r[1]) { return nf_dec(r[1], 2) }
       level = st[2]
     }
     let s = sm[ck(stockid)]
@@ -516,14 +515,14 @@ fn make_pricer(only) {
     let basis = row[2] == nil ? "Cost" : row[2]
     let start = nil
     if lower(basis) == "cost" {
-      start = num(item_cost(stockid))
+      let c = item_cost(stockid)
+      start = c == nil ? decimal(0) : c
     } else {
-      let b = plm(stockid, basis, visited)
-      if b == nil { return nil }
-      start = num(b)
+      start = plm(stockid, basis, visited)
+      if start == nil { return nil }
     }
     let calc = num_int(row[3]) == 1 ? start + num(row[4]) : start * num(row[4])
-    return nf(calc, 2)
+    return nf_dec(calc, 2)
   }
 
   return fn (stockid, level) {
@@ -535,12 +534,37 @@ fn make_pricer(only) {
   }
 }
 
+// in_array($v, $list) over one list many times: its strings, and the numbers among them, read once
+fn php_in_set(list) {
+  let strs = {}
+  let nums = []
+  for x in list {
+    let b = php_str(x)
+    strs[b] = true
+    let bn = numeric_str(b)
+    if bn != nil { push(nums, bn) }
+  }
+  return {"strs": strs, "nums": nums}
+}
+
+fn php_in_set_has(set, v) {
+  let a = php_str(v)
+  if set.strs[a] != nil { return true }
+  if len(set.nums) == 0 { return false }
+  let an = numeric_str(a)
+  if an == nil { return false }
+  for bn in set.nums { if an == bn { return true } }
+  return false
+}
+
 // filterForVendor(): drop the client's brands and items, keep the price of its level
 fn filter_for_vendor(items, excluded_brands, excluded_skus, level) {
+  let brands = php_in_set(excluded_brands)
+  let skus = php_in_set(excluded_skus)
   let out = []
   for item in items {
-    if php_in(item.manufacturer_id, excluded_brands) { continue }
-    if php_in(item.vitem, excluded_skus) { continue }
+    if php_in_set_has(brands, item.manufacturer_id) { continue }
+    if php_in_set_has(skus, item.vitem) { continue }
     let price = item.prices[level]
     if price == nil {
       for k in keys(item.prices) {
@@ -728,11 +752,13 @@ fn feed(req) {
   return reply(200, {"items": out})
 }
 
-// stock_check: the feed's own rows for the items asked about, read now - the check a vendor makes
-// before it places an order. Same token, same access to "feed", same exclusions and price level.
-let STOCK_CHECK_MAX = 500
+// getstock: the feed's own rows for the items asked about, read now - the check a vendor makes before it
+// places an order. Same token, same access to "feed", same exclusions and price level. It speaks the
+// stickerfeedapi's shapes: a line is placeorder's {sku, brand, qty}, a line that fails is echoed back as
+// one (like cannot_fulfill's errors), and nothing found is a 404 not_found, as getorder answers.
+let GETSTOCK_MAX = 500
 
-fn stock_check(req) {
+fn getstock(req) {
   let auth = authenticate(req, "feed")
   if auth.client == nil { return auth.fail }
   let client = auth.client
@@ -741,40 +767,58 @@ fn stock_check(req) {
   let asked = []
   if body != nil and type(body) == "map" {
     if type(body.skus) == "list" {
-      for s in body.skus { push(asked, s) }
+      for s in body.skus { push(asked, {"sku": s}) }
     } else if type(body.lines) == "list" {
-      for l in body.lines { if type(l) == "map" and l.sku != nil { push(asked, l.sku) } }
+      for l in body.lines { if type(l) == "map" and l.sku != nil { push(asked, l) } }
     } else if body.sku != nil {
-      push(asked, body.sku)
+      push(asked, {"sku": body.sku})
     }
   }
-  // placeorder reads a sku as trim(strtoupper())
-  let skus = []
+  // placeorder reads a sku as trim(strtoupper()); the first line for a sku is the one checked
+  let lines = []
   let seen = {}
-  for s in asked {
-    let k = php_trim(upper(php_str(s)))
+  for l in asked {
+    let k = php_trim(upper(php_str(l.sku)))
     if k != "" and seen[k] == nil {
       seen[k] = true
-      push(skus, k)
+      let line = {"sku": k}
+      if l.brand != nil { line.brand = php_str(l.brand) }
+      if l.qty != nil { line.qty = l.qty }
+      push(lines, line)
     }
   }
-  if len(skus) == 0 {
-    log_event(client_id, "stock_check", "fail", 400, "No skus in payload")
-    return reply(400, {"error": "invalid_request", "error_description": "Send {\"skus\": [\"STOCKID\", ...]} or {\"lines\": [{\"sku\": ...}]}"})
+  if len(lines) == 0 {
+    log_event(client_id, "getstock", "fail", 400, "No skus in payload")
+    return reply(400, {"error": "invalid_request", "error_description": "sku, skus or lines is required"})
   }
-  if len(skus) > STOCK_CHECK_MAX {
-    log_event(client_id, "stock_check", "fail", 400, "Too many skus")
-    return reply(400, {"error": "invalid_request", "error_description": "At most " + str(STOCK_CHECK_MAX) + " skus per call"})
+  if len(lines) > GETSTOCK_MAX {
+    log_event(client_id, "getstock", "fail", 400, "Too many skus")
+    return reply(400, {"error": "invalid_request", "error_description": "At most " + str(GETSTOCK_MAX) + " skus per request"})
   }
+  let skus = []
+  for l in lines { push(skus, l.sku) }
   let ex = client_exclusions(client_id)
   let level = resolve_price_level(client.debtorno, client.branchcode)
   let out = filter_for_vendor(build(nil, [level], skus), ex.brands, ex.skus, level)
-  let found = {}
-  for it in out { found[ck(it.vitem)] = true }
+  let by_sku = {}
+  for it in out { by_sku[ck(it.vitem)] = it }
+  // a line that names a brand must match the item's brand, as placeorder requires
+  let items = []
   let missing = []
-  for s in skus { if found[ck(s)] == nil { push(missing, s) } }
-  log_event(client_id, "stock_check", "success", 200, str(len(out)) + " of " + str(len(skus)) + " found")
-  return reply(200, {"items": out, "not_found": missing})
+  for l in lines {
+    let it = by_sku[ck(l.sku)]
+    if it != nil and (l.brand == nil or php_trim(upper(l.brand)) == php_trim(upper(php_str(it.Brand)))) {
+      push(items, it)
+    } else {
+      push(missing, l)
+    }
+  }
+  if len(items) == 0 {
+    log_event(client_id, "getstock", "fail", 404, "0 of " + str(len(lines)) + " found")
+    return reply(404, {"error": "not_found", "error_description": "No items found for supplied skus"})
+  }
+  log_event(client_id, "getstock", "success", 200, str(len(items)) + " of " + str(len(lines)) + " found")
+  return reply(200, {"items": items, "not_found": missing})
 }
 
 // One request; anything unexpected is answered as PHP's catch answers it, and the cause goes to the
@@ -847,7 +891,7 @@ ui.pane({
   "refresh": 10,
   "routes": {
     "/feed": guarded("/feed", feed),
-    "/stock_check": guarded("/stock_check", stock_check)
+    "/getstock": guarded("/getstock", getstock)
   },
   "view": view
 })

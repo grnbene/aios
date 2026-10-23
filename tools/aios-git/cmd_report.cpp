@@ -342,7 +342,7 @@ int cmd_format_patch(Ctx& c) {
     print_diff(c, pairs, DiffOptions{}, m);
     m << "-- \n2.45.0\n\n";
     if (to_stdout) { c.out << m.str(); continue; }
-    char num[8];
+    char num[24];   // "%04zu" of a size_t: up to 20 digits
     std::snprintf(num, sizeof num, "%04zu", k + 1);
     std::string file = std::string(num) + "-" + sanitized_subject(subject) + ".patch";
     std::string dir = out_dir.empty() ? c.cwd : c.abs_path(out_dir);

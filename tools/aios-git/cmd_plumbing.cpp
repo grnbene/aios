@@ -26,7 +26,6 @@ std::string mode6(uint32_t m) {
   std::snprintf(b, sizeof b, "%06o", m);
   return b;
 }
-std::string type_for_mode(uint32_t m) { return m == 040000 ? "tree" : m == 0160000 ? "commit" : "blob"; }
 std::vector<std::string> lines_of(const std::string& s, char sep = '\n') {
   std::vector<std::string> out;
   std::string cur;

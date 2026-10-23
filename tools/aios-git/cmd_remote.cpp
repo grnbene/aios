@@ -965,8 +965,8 @@ int cmd_clone(Ctx& c) {
       // --shared borrows the source's objects (the alternate recorded above): nothing is copied, which is the point of
       // it. It used to record the alternate and then copy the whole store as well.
       const bool borrowed = p.has("shared") && s.kind == Side::Local && s.local;
-      bool taken = borrowed || s.kind == Side::Local && depth == 0 && s.local && filter.empty() &&
-                   take_object_store(s.local->common_dir() + "/objects", c.repo->common_dir() + "/objects", !p.has("no-hardlinks"));
+      bool taken = borrowed || (s.kind == Side::Local && depth == 0 && s.local && filter.empty() &&
+                                take_object_store(s.local->common_dir() + "/objects", c.repo->common_dir() + "/objects", !p.has("no-hardlinks")));
       if (taken && !borrowed)
         for (const auto& alt : s.local->alternate_object_dirs())
           if (!take_object_store(alt, c.repo->common_dir() + "/objects", !p.has("no-hardlinks"))) { taken = false; break; }
@@ -1215,7 +1215,7 @@ int cmd_push(Ctx& c) {
     } else if (dst.rfind("refs/", 0) != 0) {
       std::string m = match_remote_ref(remote_refs(), dst);
       if (!m.empty()) dst = m;
-      else if (src_full.rfind("refs/heads/", 0) == 0 || src_full.empty() && type_of(c, oid) == "commit") dst = "refs/heads/" + dst;
+      else if (src_full.rfind("refs/heads/", 0) == 0 || (src_full.empty() && type_of(c, oid) == "commit")) dst = "refs/heads/" + dst;
       else if (src_full.rfind("refs/tags/", 0) == 0) dst = "refs/tags/" + dst;
       else die(c, "The destination you provided is not a full refname (i.e.,\nstarting with \"refs/\").");
     }

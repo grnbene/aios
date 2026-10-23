@@ -40,10 +40,6 @@ std::string tree_with_paths(Ctx& c, const std::string& base_tree, const std::str
   return write_tree_of(c, ents);
 }
 
-void print_change(Ctx& c, const std::string& label, const std::string& oid) {
-  c.out << label << describe_line(c, cm(c, oid)) << "\n";
-}
-
 std::vector<std::string> children_of(Ctx& c, const std::string& oid) {
   std::vector<std::string> out;
   for (auto& v : visible_commits(c))

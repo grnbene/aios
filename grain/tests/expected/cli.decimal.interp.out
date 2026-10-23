@@ -47,6 +47,25 @@ decimal
   ok    division by zero fails
   ok    junk fails
   ok    a worker can use one
+decimal_prefix and round_sig
+  ok    plain
+  ok    leading space, sign
+  ok    trailing text
+  ok    trailing space is not whole
+  ok    fraction alone
+  ok    point alone after digits
+  ok    exponent
+  ok    an e without digits is not one
+  ok    no number
+  ok    a point alone
+  ok    a sign alone
+  ok    empty
+  ok    round_sig fraction
+  ok    round_sig half away
+  ok    round_sig keeps the whole part
+  ok    round_sig short
+  ok    round_sig int
+  ok    round_sig wants 1+
 integer division
   ok    idiv
 string escapes
@@ -69,4 +88,4 @@ utf8
   ok    surrogate
   ok    truncated
   ok    bytes
-decimal: 66 checks, all agreed
+decimal: 84 checks, all agreed
