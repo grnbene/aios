@@ -45,7 +45,7 @@ try:
     check("a click is answered with a new frame", d.get("canvas") and png_ok(d["png"]))
     c.request("POST", "/", "type=launch_missiles", hdr); check("an event type a window never sends is ignored", c.getresponse().status == 200)
     c.request("GET", "/", headers={"Accept": "application/x-grain-ui", "Cookie": ck}); t = json.loads(c.getresponse().read())
-    check("a native client is told it is a drawn pane", t.get("canvas") is True)
+    check("a native client is told it is a drawn pane, with the picture", t.get("canvas") is True and png_ok(t.get("png", "")))
 finally:
     server.kill(); server.wait()
 sys.exit(1 if failed else 0)

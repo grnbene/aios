@@ -29,6 +29,7 @@ static int setenv(const char* name, const char* value, int) { return ::_putenv_s
 
 
 #include "aios/userland/grain.hpp"
+#include "aios/userland/web.hpp"   // decode_image
 #include "grain_builtins_internal.hpp"
 #include "aios/userland/font_atlas.hpp"
 #include "aios/userland/glyph_engine.hpp"
@@ -2589,6 +2590,22 @@ Value bi_canvas_set_pixels(Vm&, std::vector<Value>& args, std::string& error) {
     cv->pixels[i] = parse_color_value(items[i]);
   }
   return args[0];
+}
+
+// image_decode(data) -> a canvas holding the picture (PNG, JPEG, GIF, BMP); data is bytes or a string of them.
+Value bi_image_decode(Vm&, std::vector<Value>& args, std::string& error) {
+  ByteSpan in;
+  if (args[0].type == Type::Bytes) in = ByteSpan(args[0].bytes_data().data(), args[0].bytes_data().size());
+  else if (args[0].type == Type::Str) in = ByteSpan(reinterpret_cast<const uint8_t*>(args[0].str().data()), args[0].str().size());
+  else { error = std::string("image_decode() wants bytes or a string, found a ") + type_name(args[0].type); return Value::nil(); }
+  auto bm = web::decode_image(in);
+  if (!bm.ok()) { error = "image_decode(): " + bm.error().message; return Value::nil(); }
+  if (bm->empty() || bm->w > 16384 || bm->h > 16384) { error = "image_decode(): no picture of a size a canvas can hold"; return Value::nil(); }
+  auto cv = std::make_shared<GrainCanvas>();
+  cv->width = (uint32_t)bm->w;
+  cv->height = (uint32_t)bm->h;
+  cv->pixels = std::move(bm->pixels);
+  return Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", cv));
 }
 
 Value bi_canvas_set_fill_style(Vm&, std::vector<Value>& args, std::string& error) {
@@ -5937,6 +5954,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("canvas_set_pixel", 4, 4, bi_canvas_set_pixel);
   vm.define_native("canvas_get_pixels", 1, 1, bi_canvas_get_pixels);
   vm.define_native("canvas_set_pixels", 2, 2, bi_canvas_set_pixels);
+  vm.define_native("image_decode", 1, 1, bi_image_decode);
 
   // Styling & Colors
   vm.define_native("canvas_set_fill_style", 2, 2, bi_canvas_set_fill_style);

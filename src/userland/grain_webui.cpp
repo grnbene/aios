@@ -268,6 +268,7 @@ const char* kCanvasScript = R"JS(
   var names={0:'left',1:'middle',2:'right'};
   img.addEventListener('mousedown',function(e){e.preventDefault();var p=pos(e);post({type:'mouse_down',x:p.x,y:p.y,button:names[e.button]||'left'})});
   img.addEventListener('mouseup',function(e){var p=pos(e);post({type:'mouse_up',x:p.x,y:p.y,button:names[e.button]||'left'})});
+  img.addEventListener('mousemove',function(e){if(!e.buttons)return;var p=pos(e);post({type:'mouse_move',x:p.x,y:p.y})});   // drags
   img.addEventListener('contextmenu',function(e){e.preventDefault()});
   img.addEventListener('wheel',function(e){e.preventDefault();post({type:'wheel',dx:String(-Math.sign(e.deltaX)),dy:String(-Math.sign(e.deltaY))})},{passive:false});
   var keys={Enter:'return',Escape:'escape',Backspace:'backspace',Tab:'tab',' ':'space',ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down',Delete:'delete',Home:'home',End:'end',PageUp:'pageup',PageDown:'pagedown'};
@@ -635,10 +636,11 @@ WebUi::Response WebUi::handle(const Request& req) {
     if (since == s->seq) { res.status = 204; return res; }
   }
   if (s->canvas) {
-    if (req.tree) {   // a native client: this program draws its own pixels, which it does not show yet
+    if (req.tree) {   // a native client: the picture as PNG, which it shows in a window of its own and follows by push
       finish_headers("application/x-grain-ui+json");
-      res.body = "{\"seq\":" + std::to_string(s->seq) + ",\"title\":" + json_string(s->info.title) + ",\"width\":" + std::to_string(s->info.width) +
-                 ",\"height\":" + std::to_string(s->info.height) + ",\"canvas\":true}";
+      std::string frame;
+      frame_locked(*s, false, frame);
+      res.body = "{\"title\":" + json_string(s->info.title) + "," + frame.substr(1);
       return res;
     }
     std::string page = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +

@@ -1,0 +1,11 @@
+# Clicks paint a square where they land; a drag paints a trail. Nothing moves by itself.
+let marks = []
+let pane = create_pane({"title": "Paint", "width": 300, "height": 200,
+  "on_draw": fn (cv) {
+    canvas_clear(cv, "#101820")
+    for m in marks { canvas_fill_rect(cv, m[0] - 5, m[1] - 5, 10, 10, m[2]) }
+  },
+  "on_click": fn (p, e) { push(marks, [e.x, e.y, e.button == "right" ? "#ff4040" : "#40ff80"]) },
+  "on_event": fn (p, e) { if e.type == "mouse_move" { push(marks, [e.x, e.y, "#4080ff"]) } if e.type == "key" and e.key == "c" { marks = [] } }
+})
+run_panes()
