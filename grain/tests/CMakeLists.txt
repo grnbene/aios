@@ -58,6 +58,8 @@ grain_case(cli.stdlib WRITES:${CLI_CASES} 0 run stdlib.gr)
 grain_case(cli.exec ${CLI_CASES} 0 run exec.gr)
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
+grain_case(cli.parallel ${CLI_CASES} 0 run parallel.gr)                # parallel_map, spawn, await
+grain_case(cli.parallel.interp ${CLI_CASES} 0 --no-jit run parallel.gr)
 grain_case(cli.check_ok ${CLI_CASES} 0 check args.gr sys.gr files.gr)
 grain_case(cli.check_error ${CLI_CASES} 1 check args.gr compile_error.gr)
 grain_case(cli.steps ${CLI_CASES} 2 --steps 1000 run forever.gr)

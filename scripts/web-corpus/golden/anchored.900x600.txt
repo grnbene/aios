@@ -10,8 +10,8 @@ rect     777    59    38    38  #ff882222
 rect     817    59    38    38  #ff882222
 rect     124    68    44    23  #ff333333
 text     132    70    28    19  #ffdddddd  14px,bold         "chip"
-text      40    80    84    19  #ffdddddd  14px              "Text with a "
-text     168    80    49    19  #ffdddddd  14px              " in it."
+text      40    70    84    19  #ffdddddd  14px              "Text with a "
+text     168    70    49    19  #ffdddddd  14px              " in it."
 rect      40    91   820    12  #ff555577
 rect      40   133   820    80  #ff1a1a1a
 rect      40   133    40    28  #ff333333  r=999

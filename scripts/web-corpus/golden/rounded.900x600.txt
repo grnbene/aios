@@ -7,8 +7,8 @@ text      31    47    60    26  #ff202020  19px,bold         "A card"
 text      31    85   536    21  #ff202020  15px              "A wash six percent above the ground, and a corner radius of twelve."
 rect      16   145    72    29  #1affffff  r=999
 text      28   149    48    21  #ff202020  15px              "A pill"
-rect      96   164    10    10  #ff19c37d  r=9999
-text     106   162   216    21  #ff202020  15px              " a circle at fifty percent."
+rect      96   151    10    10  #ff19c37d  r=9999
+text     106   149   216    21  #ff202020  15px              " a circle at fifty percent."
 rect      16   186   868    41  #66000000
 text      26   196   256    21  #ff202020  15px              "Square, and forty percent black."
 rect      16   247   868    49  #73000000  r=12  blur=18

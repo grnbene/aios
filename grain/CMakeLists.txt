@@ -48,6 +48,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_std_time.cpp
   ${AIOS_ROOT}/src/userland/grain_std_text.cpp
   ${AIOS_ROOT}/src/userland/grain_std_path.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_parallel.cpp
   ${AIOS_ROOT}/src/js/regexp.cpp
   ${AIOS_ROOT}/src/js/unicode.cpp
   ${AIOS_ROOT}/src/userland/grain_std_http.cpp
@@ -75,6 +76,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/hmac_sha256.cpp
   ${AIOS_ROOT}/src/userland/glyph_engine.cpp
   ${AIOS_ROOT}/src/userland/font_atlas.cpp
+  ${AIOS_ROOT}/src/userland/font_kerning.cpp
   # face widgets (ui.*): face's layout and painting, its type and pixels, PNG for its images
   ${AIOS_ROOT}/src/userland/grain_face.cpp
   ${AIOS_ROOT}/src/userland/face.cpp
@@ -82,6 +84,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/web_type.cpp
   ${AIOS_ROOT}/src/userland/web_image.cpp
   ${AIOS_ROOT}/src/userland/web_dom.cpp
+  ${AIOS_ROOT}/src/userland/web_css.cpp
   ${AIOS_ROOT}/src/userland/web_svg.cpp
   ${AIOS_ROOT}/src/net/deflate.cpp)
 

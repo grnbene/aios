@@ -1,0 +1,317 @@
+// StickerFeed Real-Time Inventory & Stock Check Service
+// High-performance warm in-memory feed engine powered by Grain + ASQL.
+// Serves:
+//   POST /stock_check       -> Fast sub-millisecond stock/price/FET slice for vendors (e.g. Dima)
+//   GET  /stock_check?item= -> Point check for a single part number
+//   GET  /feed              -> Pre-computed full catalog feed
+//   GET  /                  -> Real-time Ops & Telemetry Dashboard
+
+let db_host = "127.0.0.1"
+let db_port = 3307
+let db_user = "root"
+let db_pass = "Cbq81toor"
+let db_name = "versioneight"
+
+let catalog = {}
+let full_feed = []
+let total_items = 0
+let total_in_stock = 0
+let total_units = 0
+let last_sync_time = "Not synced yet"
+let last_sync_ms = 0.0
+
+let total_api_requests = 0
+let last_request_time = "None"
+let request_logs = []
+
+let search_sku = "20003483"
+let search_result = nil
+
+// Refresh the entire catalog from ASQL into RAM in under 1 second
+fn refresh_catalog() {
+  let db = db_connect(db_host, db_port, db_user, db_pass, db_name)
+  if (!db.ok) {
+    return { "error": "Cannot connect to ASQL: " + db.error }
+  }
+
+  let t0 = now()
+
+  // 1. Manufacturers map
+  let mfg_res = db_query(db, "SELECT manufacturer_id, name FROM manufacturer")
+  let mfg_map = {}
+  for r in mfg_res.rows { mfg_map[r[0]] = r[1] }
+
+  // 2. Tire sizes
+  let size_res = db_query(db, "SELECT stockid, size FROM tireinfo")
+  let size_map = {}
+  for r in size_res.rows { size_map[r[0]] = r[1] }
+
+  // 3. Primary warehouse stock (01)
+  let qoh_res = db_query(db, "SELECT stockid, SUM(quantity) FROM locstock WHERE loccode = \"01\" GROUP BY stockid")
+  let qoh_map = {}
+  for r in qoh_res.rows { qoh_map[r[0]] = int(r[1]) }
+
+  // 4. Committed sales orders on hold
+  let dem_res = db_query(db, "SELECT sod.stkcode, SUM(sod.quantity - sod.qtyinvoiced) FROM salesorderdetails sod INNER JOIN salesorders so ON so.orderno = sod.orderno INNER JOIN shippers s ON so.shipvia = s.shipper_id WHERE sod.completed = 0 AND so.quotation = 0 AND s.shippername <> \"dropship\" GROUP BY sod.stkcode")
+  let dem_map = {}
+  for r in dem_res.rows { dem_map[r[0]] = int(r[1]) }
+
+  // 5. Secondary / Remote warehouse stock (03, 62, 64, 67)
+  let rem_res = db_query(db, "SELECT stockid, SUM(quantity) FROM primarymixedinventory WHERE loccode IN (\"03\", \"62\", \"64\", \"67\") GROUP BY stockid")
+  let rem_map = {}
+  for r in rem_res.rows { rem_map[r[0]] = int(r[1]) }
+
+  // 6. Wholesale Prices ('W')
+  let pr_res = db_query(db, "SELECT stockid, price FROM prices WHERE typeabbrev = \"W\" AND price > 0")
+  let pr_map = {}
+  for r in pr_res.rows { pr_map[r[0]] = r[1] }
+
+  // 7. Master tires list
+  let items_res = db_query(db, "SELECT sm.stockid, ptm.manufacturer_id, sm.mfgpart, sm.description, sm.sort2, sm.additionalfee FROM stockmaster sm INNER JOIN product_to_manufacturer ptm ON sm.stockid = ptm.stockid WHERE sm.categoryid = \"TIRE\" AND sm.discontinued = 0")
+
+  let new_catalog = {}
+  let new_feed = []
+  let in_stock_count = 0
+  let units_sum = 0
+
+  for r in items_res.rows {
+    let stockid = r[0]
+    let mfg_id = r[1]
+    let mfgpart = r[2]
+    let desc = r[3]
+    let sort2 = r[4]
+    let fet = r[5] != nil ? r[5] : "0.00"
+
+    let qoh = qoh_map[stockid] != nil ? qoh_map[stockid] : 0
+    let dem = dem_map[stockid] != nil ? dem_map[stockid] : 0
+    let rem = rem_map[stockid] != nil ? rem_map[stockid] : 0
+
+    let avail = (qoh - dem) + rem
+    if (avail >= 5 and avail <= 8) { avail = 9 }
+    if (avail < 0) { avail = 0 }
+
+    let brand = mfg_map[mfg_id] != nil ? mfg_map[mfg_id] : "UNKNOWN"
+    let size = size_map[stockid] != nil ? size_map[stockid] : sort2
+    let price = pr_map[stockid] != nil ? pr_map[stockid] : "0.00"
+
+    if (avail > 0) {
+      in_stock_count = in_stock_count + 1
+      units_sum = units_sum + avail
+    }
+
+    let entry = {
+      "stockid": stockid,
+      "item": mfgpart,
+      "brand": brand,
+      "desc": desc,
+      "size": size,
+      "qty": avail,
+      "fet": fet,
+      "price": price
+    }
+
+    push(new_feed, entry)
+    new_catalog[stockid] = entry
+    if (mfgpart != "" and mfgpart != stockid) {
+      new_catalog[mfgpart] = entry
+    }
+  }
+
+  let t1 = now()
+  catalog = new_catalog
+  full_feed = new_feed
+  total_items = len(new_feed)
+  total_in_stock = in_stock_count
+  total_units = units_sum
+  last_sync_time = date_format(now(), "%T", "local")
+  last_sync_ms = (t1 - t0) * 1000.0
+
+  return { "ok": true, "items": total_items, "ms": last_sync_ms }
+}
+
+// Initial warm-up on startup
+refresh_catalog()
+
+fn log_api_call(endpoint, items_checked, found_count, elapsed_ms) {
+  total_api_requests = total_api_requests + 1
+  last_request_time = date_format(now(), "%T", "local")
+  let entry = {
+    "time": last_request_time,
+    "endpoint": endpoint,
+    "requested": str(items_checked) + " item(s)",
+    "found": str(found_count) + " matched",
+    "latency": str(round(elapsed_ms * 100.0) / 100.0) + " ms"
+  }
+  push(request_logs, entry)
+  if (len(request_logs) > 8) {
+    request_logs = slice(request_logs, 1)
+  }
+}
+
+// Fast In-Memory Route Handler for Dima and external vendors
+fn handle_stock_check(req) {
+  let t0 = now()
+  let requested_skus = []
+
+  if (req.method == "POST") {
+    let body_str = req.body
+    let parsed = json_parse(body_str)
+    if (parsed != nil) {
+      if (parsed.items != nil and type(parsed.items) == "list") {
+        requested_skus = parsed.items
+      } else if (parsed.item != nil) {
+        requested_skus = [parsed.item]
+      }
+    }
+  } else if (req.method == "GET") {
+    let q = req.query
+    if (starts_with(q, "item=")) {
+      requested_skus = [slice(q, 5)]
+    }
+  }
+
+  let results = []
+  for sku in requested_skus {
+    let clean_sku = trim(str(sku))
+    if (catalog[clean_sku] != nil) {
+      push(results, catalog[clean_sku])
+    }
+  }
+
+  let t1 = now()
+  let elapsed = (t1 - t0) * 1000.0
+  log_api_call("/stock_check", len(requested_skus), len(results), elapsed)
+
+  return {
+    "status": 200,
+    "json": {
+      "success": true,
+      "count": len(results),
+      "items": results,
+      "latency_ms": elapsed
+    }
+  }
+}
+
+fn handle_feed_dump(req) {
+  let t0 = now()
+  let items = full_feed
+  if (contains(req.query, "in_stock=1")) {
+    let filtered = []
+    for it in full_feed {
+      if (it.qty > 0) { push(filtered, it) }
+    }
+    items = filtered
+  }
+  let t1 = now()
+  let elapsed = (t1 - t0) * 1000.0
+  log_api_call("/feed", len(full_feed), len(items), elapsed)
+
+  return {
+    "status": 200,
+    "json": {
+      "success": true,
+      "total_items": len(items),
+      "items": items,
+      "latency_ms": elapsed
+    }
+  }
+}
+
+// Live Interactive Dashboard for Ops
+fn view() {
+  let rev_logs = []
+  for r in request_logs { rev_logs = [r] + rev_logs }
+
+  let preview_item = search_sku != "" and catalog[search_sku] != nil ? catalog[search_sku] : nil
+
+  return ui.column({ "gap": 18, "pad": 12, "theme": "cyber" }, [
+    // Header Hero Banner
+    ui.card([
+      ui.row([
+        ui.badge("STICKERFEED REAL-TIME ENGINE", { "accent": "ok", "dot": true }),
+        ui.badge("WARM IN-MEMORY CACHE", { "class": "caps glow" }),
+        ui.badge("SUB-MS LATENCY", { "class": "caps" })
+      ], { "gap": 10 }),
+      ui.heading("Vendor Stock & Pricing Engine", { "class": "gradient-text", "size": 32 }),
+      ui.text("High-speed pre-order availability & pricing check for vendors and partners. Zero DB queries on request.", { "dim": true })
+    ], { "class": "hover-lift shimmer" }),
+
+    // Live Metrics KPI Bar
+    ui.row([
+      ui.tile(total_items, "Total Catalog SKUs", { "accent": "accent", "sub": "50k Tire Catalog", "class": "hover-lift" }),
+      ui.tile(total_in_stock, "SKUs in Stock", { "accent": "ok", "sub": "Live Available", "class": "hover-lift" }),
+      ui.tile(total_units, "Total Units Available", { "accent": "warn", "sub": "All Warehouses", "class": "hover-lift" }),
+      ui.tile(total_api_requests, "API Hits Served", { "accent": "ok", "sub": "Pre-order checks", "class": "hover-lift glow" }),
+      ui.tile(str(round(last_sync_ms)) + " ms", "Cache Sync Latency", { "accent": "accent", "sub": "Last: " + last_sync_time, "class": "hover-lift" })
+    ], { "gap": 12 }),
+
+    ui.divider(),
+
+    // Live Part Number Tester Card
+    ui.card([
+      ui.row([
+        ui.text("TEST VENDOR PRE-ORDER CHECK (SIMULATOR)", { "bold": true, "class": "caps" }),
+        ui.button("REFRESH ASQL CACHE", fn() { refresh_catalog() }, { "variant": "ghost", "size": 12 })
+      ], { "justify": "between", "align": "center" }),
+      ui.row([
+        ui.field("lookup_input", {
+          "placeholder": "Enter Part Number or StockID (e.g. 20003483, 773017431)",
+          "value": search_sku,
+          "grow": true
+        }),
+        ui.button("TEST LOOKUP", fn(f) {
+          search_sku = trim(f.lookup_input)
+        }, { "primary": true })
+      ], { "gap": 10 }),
+
+      preview_item != nil ? ui.card([
+        ui.row([
+          ui.badge("MATCH FOUND", { "accent": "ok", "dot": true }),
+          ui.text(preview_item.brand, { "bold": true, "size": 16, "color": "accent" }),
+          ui.text("Part: " + preview_item.item, { "dim": true }),
+          ui.text("SKU: " + preview_item.stockid, { "dim": true })
+        ], { "gap": 14, "align": "center" }),
+        ui.heading(preview_item.desc, { "size": 20 }),
+        ui.row([
+          ui.tile(preview_item.qty, "Units Available", { "accent": "ok", "sub": "Net of holds" }),
+          ui.tile("$" + preview_item.price, "Wholesale Price", { "accent": "accent", "sub": "Price Level W" }),
+          ui.tile("$" + preview_item.fet, "Federal Excise Tax", { "accent": "warn", "sub": "FET per tire" }),
+          ui.tile(preview_item.size, "Tire Size", { "sub": "Dimension" })
+        ], { "gap": 12 }),
+        ui.card([
+          ui.text("VENDORS JSON RESPONSE PREVIEW:", { "bold": true, "class": "caps" }),
+          ui.text(json_stringify(preview_item), { "mono": true, "size": 12, "color": "dim" })
+        ], { "class": "sunken" })
+      ], { "class": "glass hover-lift" }) : ui.text("No matching tire found in in-memory catalog.", { "dim": true })
+    ], { "class": "hover-lift" }),
+
+    // Live API Traffic Log
+    ui.card([
+      ui.row([
+        ui.text("LIVE VENDOR INCOMING REQUESTS", { "bold": true, "class": "caps" }),
+        ui.badge("HOT RAM LOOKUPS", { "accent": "ok" })
+      ], { "justify": "between", "align": "center" }),
+      ui.table(rev_logs, {
+        "columns": "time:Time, endpoint:Endpoint, requested:Items Checked, found:Results:badge, latency:Latency:right",
+        "empty": "No external vendor requests yet. Test via curl or the simulator above!",
+        "badges": { "0 matched": "warn" }
+      })
+    ], { "class": "sunken" })
+  ])
+}
+
+let p = ui.pane({
+  "title": "StickerFeed Live Ops & Stock API",
+  "width": 1020,
+  "height": 840,
+  "theme": "cyber",
+  "shared": true,
+  "refresh": 1,
+  "routes": {
+    "/stock_check": handle_stock_check,
+    "/inventory": handle_stock_check,
+    "/feed": handle_feed_dump
+  },
+  "view": view
+})

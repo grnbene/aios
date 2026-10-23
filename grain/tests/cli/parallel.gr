@@ -1,0 +1,60 @@
+# parallel_map, spawn, await, task_done: each worker is a VM of its own.
+
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+# The same answers as map(), in the same order, functions the worker calls by name included.
+let ns = range(25)
+print(parallel_map(ns, fib) == map(ns, fib))
+print(parallel_map([], fib))
+print(parallel_map([3, 1, 2], str))
+
+# A closure brings what it captured; a global it reads comes as it is now.
+let scale = 10
+fn make_adder(k) { return fn (x) { return x * scale + k } }
+print(parallel_map([1, 2, 3], make_adder(5)))
+
+# Lists, maps and bytes go across and come back; shared structure stays shared.
+let row = {"id": 7, "tags": ["a", "b"]}
+let r = parallel_map([[row, row]], fn (pair) { return pair[0] == pair[1] and len(pair[0].tags) == 2 })
+print(r)
+print(parallel_map([{"a": 1}, {"a": 2}], fn (m) { m.a = m.a * 100; return m }))
+
+# A worker changes its copy: the program's data stays as it was.
+let counter = 0
+let items = [1, 2, 3]
+fn bump(x) { counter = counter + x; push(items, x); return counter }
+print(parallel_map([5], bump), counter, items)
+
+# What workers print comes out in item order.
+parallel_map([1, 2, 3, 4], fn (x) { print("item", x); return x })
+
+# An error names the item it came from; the earliest one wins.
+let e = pcall(parallel_map, [1, 2, 0, 4, 0], fn (x) { if x == 0 { error("zero") } return 10 / x })
+print(e.ok, e.error)
+
+# spawn runs while the program goes on; await waits and gives the result back.
+let t = spawn(fn (n) { return fib(n) }, 20)
+let u = spawn(fib, 21)
+print(await(t), await(u), await(t))
+print(task_done(t))
+let p = spawn(fn () { print("from a task"); return "done" })
+print(await(p))
+let bad = pcall(await, spawn(fn () { return 1 / 0 }))
+print(bad.ok, bad.error)
+
+# Parallel work inside parallel work finishes on its own.
+print(parallel_map([1, 2, 3], fn (k) { return parallel_map(range(k), fn (i) { return i * k }) }))
+print(parallel_map([10, 11], fn (n) { return await(spawn(fib, n)) }))
+
+# What cannot be copied is refused by name; what has no loop in a worker says so.
+let refused = pcall(spawn, fn (task) { return task }, t)
+print(refused.ok, refused.error)
+let timer = pcall(parallel_map, [1], fn (x) { return every(1, fn () { }) })
+print(timer.ok, timer.error)
+
+# A task the program never awaits still runs before the program ends.
+spawn(fn () { return fib(15) })
+print("end")

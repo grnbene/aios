@@ -18,8 +18,8 @@ text      17   183    56    18  #ff8b949e  13px,mono         "Status: "
 text      73   183   127    18  #ff56d364  13px,bold,mono    "Resolved & Aligned"
 text      17   211    35    18  #ff8b949e  13px,mono         "Gap: "
 text      52   211    84    18  #ff56d364  13px,bold,mono    "12px Uniform"
-rect     252    72   648   422  #ff161b22  r=6
-border   252    72   648   422  #ff30363d  r=6
+rect     252    72   648   431  #ff161b22  r=6
+border   252    72   648   431  #ff30363d  r=6
 rect     269    89   614   134  #ff0d1117  r=4
 border   269    89   614   134  #ff21262d  r=4
 text     282   102   225    19  #ffd2a8ff  14px,bold,mono    "Audio Spec Compliance Checks"
@@ -41,13 +41,13 @@ text     686   279   184    18  #ff3fb950  13px,bold,mono    "Canvas2D Listed / 
 border   282   302   588    27  #ff21262d
 text     282   306   154    18  #ffe6edf3  13px,mono         "Observers Audit Status"
 text     672   306   198    18  #ff3fb950  13px,bold,mono    "Stub Registration Disclaimed"
-rect     269   354   614   123  #ff0d1117  r=4
-border   269   354   614   123  #ff21262d  r=4
+rect     269   354   614   132  #ff0d1117  r=4
+border   269   354   614   132  #ff21262d  r=4
 text     282   367   136    19  #ffd2a8ff  14px,bold,mono    "Canvas 2D Surface"
 canvas   282   394   360    70  #ffe6edf3
-rect       0   506   900    38  #ff1f293d  r=6
-border     0   506   900    38  #ff384d6b  r=6
-text      21   517   231    16  #ff8b949e  12px,mono         "AIOS Compositor • Glass Rendering"
-text     725   517   154    16  #ff8b949e  12px,mono         "1440 × 900 Framebuffer"
+rect       0   515   900    38  #ff1f293d  r=6
+border     0   515   900    38  #ff384d6b  r=6
+text      21   526   231    16  #ff8b949e  12px,mono         "AIOS Compositor • Glass Rendering"
+text     725   526   154    16  #ff8b949e  12px,mono         "1440 × 900 Framebuffer"
 # glyph-gaps (none)
 

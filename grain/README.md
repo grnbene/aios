@@ -44,6 +44,7 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 | Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
 | Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid` |
 | Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
+| Every core | `parallel_map(list, fn)`, `spawn(fn, args...)` -> task, `await(task)`, `task_done(task)` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
 | Widgets | `ui.column`, `ui.row`, `ui.text`, `ui.button`, `ui.field`, `ui.table`, `ui.tile` in a `ui.pane` |
@@ -99,6 +100,36 @@ serve`, the web server, or `wait()`. A dropped connection is made again a second
 later; a refused one is reported once, as `{"error": ...}`. `grain open` follows a
 served program this way: the server pushes the new widgets and the window draws
 them, with nothing asked.
+
+## Every core
+
+```grain
+let sizes = parallel_map(files, fn (f) { return len(read_file(f)) })   # map(), over every core
+let t = spawn(fn (n) { return fib(n) }, 32)                            # runs while the program goes on
+...
+print(await(t))                                                        # its result, once it has one
+```
+
+`parallel_map(list, fn)` is `map(list, fn)` with the calls spread over as many
+threads as the machine has cores: the same results in the same order. `spawn(fn,
+args...)` starts one call on another core and returns a task; `await(task)` waits
+for it and gives back what it returned (or raises its error), and `task_done(task)`
+says whether it has finished. A task never awaited still runs to its end before
+the program does.
+
+Each worker is a VM of its own. The function goes to it with what it can reach -
+its arguments, what its closure captured, the globals its code names - copied
+as they are when the work starts, and only the result comes back. So nothing two
+workers do can collide, and a worker that changes a list it was given, a global
+or a captured variable changes its own copy; the program sees what the function
+returns. A socket, a database connection, a task, a channel or an entity cannot
+be copied and is refused by name (open the connection inside the function), and
+a worker has no loop of its own, so `every`, `after`, `live`, `events` and
+`run_panes` refuse there. What a worker prints appears when its result is
+collected: `parallel_map`'s in item order, a task's when it is awaited.
+
+24 calls of `fib(30)` on a 12-core Mac (6 performance, 6 efficiency cores),
+interpreted: `map` 3.0-3.4 s, `parallel_map` 0.66-0.70 s.
 
 ## Databases, and live query results
 

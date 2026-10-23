@@ -2,29 +2,29 @@
 # title Selector matching
 # content 420x554  background=ffffffff  links=4
 text      16    36   364    33  #ff202020  24px,bold         "Matched by shape, not by tag"
-text      16    81   360    23  #ff0f6ab0  15px              "Adjacent to the heading, so this one is blue."
-text      16   116   360    23  #ff202020  15px              "A later sibling, so this one is only resized."
+text      16    82   360    21  #ff0f6ab0  15px              "Adjacent to the heading, so this one is blue."
+text      16   117   360    21  #ff202020  15px              "A later sibling, so this one is only resized."
 rect      32   162     4     4  #ff202020
 text      46   154    88    21  #ff202020  15px,bold         "First, bold"
 rect      32   186     4     4  #ff202020
 text      46   178    88    21  #ff202020  15px              "Second, red"
 rect      32   210     4     4  #ff202020
 text      46   202   104    21  #ff202020  15px,italic       "Third, italic"
-text      16   238   168    23  #ff202020  15px             u  "Carries an attribute."
-rect      16   273   111    25  #ffefefef
-border    16   273   111    25  #ff767676
+text      16   239   168    21  #ff202020  15px             u  "Carries an attribute."
+rect      16   273   111    25  #ffefefef  r=3
+border    16   273   111    25  #ff767676  r=3
 text      23   275    97    21  #ff000000  15px,bold         "Submit, bold"
-rect     135   273   142    25  #ffefefef
-border   135   273   142    25  #ff767676
+rect     135   273   142    25  #ffefefef  r=3
+border   135   273   142    25  #ff767676  r=3
 text     142   275   128    21  #ff000000  15px              "Button, NOT bold"
-text      16   311   104    23  #ff0f6ab0  15px,italic      u link=0  "https, italic"
-text     128   311    88    23  #ff0f6ab0  15px             u s link=1  "pdf, struck"
-text     224   310   135    26  #ff0f6ab0  17px             u link=2  "wiki, seventeen"
-text      16   336   128    23  #ff0f6ab0  15px             u link=3  "plain, untouched"
-text      16   371   224    23  #ff0f6ab0  15px              "Dash-matched language, blue."
-text      16   406   272    23  #ff202020  15px              "Not a language match, so not blue."
-text      16   441   200    23  #ff202020  15px,bold         "A word in the list, bold."
-text      16   476   208    23  #ff202020  15px              "Not the word, so not bold."
+text      16   312   104    21  #ff0f6ab0  15px,italic      u link=0  "https, italic"
+text     128   312    88    21  #ff0f6ab0  15px             u s link=1  "pdf, struck"
+text     224   311   135    23  #ff0f6ab0  17px             u link=2  "wiki, seventeen"
+text      16   337   128    21  #ff0f6ab0  15px             u link=3  "plain, untouched"
+text      16   372   224    21  #ff0f6ab0  15px              "Dash-matched language, blue."
+text      16   407   272    21  #ff202020  15px              "Not a language match, so not blue."
+text      16   442   200    21  #ff202020  15px,bold         "A word in the list, bold."
+text      16   477   208    21  #ff202020  15px              "Not the word, so not bold."
 text      16   511   168    15  #ff707070  11px              "Excluded from the :not rule."
 link     16   310   104    26  https://example.com/a  "https, italic"
 link    128   310    88    26  file:///paper.pdf  "pdf, struck"

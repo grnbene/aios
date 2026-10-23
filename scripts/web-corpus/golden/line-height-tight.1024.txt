@@ -1,0 +1,16 @@
+# page line-height-tight.html  viewport=1024
+# title Tight and loose leading
+# content 1024x328  background=ffffffff  links=0
+text      16    10   330    56  #ff1a1a1a  40px,bold         "A tight heading"
+text      16    54   330    56  #ff1a1a1a  40px,bold         "that wraps onto"
+text      16    98   198    56  #ff1a1a1a  40px,bold         "two lines"
+text      16   165   272    22  #ff1a1a1a  16px              "Loose paragraph text set at double"
+text      16   197   280    22  #ff1a1a1a  16px              "spacing, which centres each line in"
+text      16   229    72    22  #ff1a1a1a  16px              "its box. "
+text      88   229    96    22  #ff1a1a1a  16px              "Normal here."
+border    72   268    70    32  #ffcccccc  r=12
+text      83   273    48    22  #ff1a1a1a  16px              "a pill"
+text      16   273    56    22  #ff1a1a1a  16px              "Before "
+text     142   273   192    22  #ff1a1a1a  16px              " after, on one baseline."
+# glyph-gaps (none)
+

@@ -15,6 +15,8 @@
 // Nothing here measures a glyph. The renderer that owns the font hands in
 // Metrics, so a line breaks against the type that actually gets drawn.
 #include <cctype>
+#include <cstdio>
+#include <functional>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -22,15 +24,22 @@
 #include <array>
 #include <unordered_map>
 
+#include "aios/core/bytes.hpp"
 #include "aios/userland/web.hpp"
 
 namespace aios::userland::web {
 namespace {
 
 constexpr size_t kMaxBoxDepth = 96;
+// A checkbox's and a radio button's box, as Chrome draws them.
+constexpr int kMarkSide = 13;
+// A closed dropdown's chevron: the room kept for it at the right of the label, and its own size.
+constexpr int kChevronRoom = 18;
+constexpr int kChevronW = 10, kChevronH = 6;
 // A page that lays out to more fragments than this is a page nobody is reading
 // past the top of; the cap keeps one document from eating ring 0's heap.
 constexpr size_t kMaxFragments = 60000;
+constexpr size_t kMaxTransforms = 4096;
 
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 
@@ -173,6 +182,10 @@ struct InlineItem {
   int w = 0;
   int h = 0;
   int ascent = 0;
+  // Text only: the half-leading -- how far below the top of the item's line box its glyphs start. CSS splits the
+  // difference between `line-height` and the face's own height evenly above and below the text, and a tight
+  // line-height makes it negative, so the glyphs overflow the box the way they do in a browser.
+  int lead = 0;
   std::string src;
   std::string alt;
   Node* node = nullptr;
@@ -181,6 +194,7 @@ struct InlineItem {
   // padding, this is just where layout finally reads it.
   int fb[4] = {0, 0, 0, 0};   // top, right, bottom, left border
   int fp[4] = {0, 0, 0, 0};   // top, right, bottom, left padding
+  int fm[4] = {0, 0, 0, 0};   // top, right, bottom, left margin: outside the box, inside the item's line footprint
   // The word was wider than its line and was cut with an ellipsis.
   bool cut = false;
   // Box only: the fragments and links this item already produced, laid out at a
@@ -198,6 +212,7 @@ struct Engine {
   const Metrics& m;
   int viewport_w = 1200;
   int viewport_h = 0;          // 0 = unknown: a percentage height has no base
+  bool light_ground = false;   // the page's ground is light: controls take the light-scheme look
   // The definite height of the box being laid out INTO, or -1. `height: 100%`
   // is a percentage of this, and an app shell -- `html,body{height:100%}` then
   // `#app{height:100vh}` then a column of `flex:1` panes -- is a chain of them.
@@ -343,11 +358,21 @@ struct Engine {
     measure_cache_[slot] = {h, fk, s, w};
     return w;
   }
+  // The line box a run of this style's text takes: its `line-height` when it has one (tighter than the face
+  // included -- a 1.1 heading is meant to sit tight), else the face's own.
   int line_h(const Style& st) const {
-    int base = m.line_height(font_of(st));
-    return st.line_height > base ? st.line_height : base;
+    const int base = m.line_height(font_of(st));
+    return st.line_height > 0 ? st.line_height : base;
   }
   int ascent(const Style& st) const { return m.ascent ? m.ascent(font_of(st)) : m.line_height(font_of(st)) * 4 / 5; }
+  // A text item's vertical box: the line-height, with the glyphs centred in it (the half-leading) and the item's
+  // ascent measured from the top of that box, so lines of mixed sizes share one baseline.
+  void text_box(InlineItem& it, const Style& st) const {
+    const int face_h = m.line_height(font_of(st));
+    it.h = line_h(st);
+    it.lead = (it.h - face_h) / 2;
+    it.ascent = ascent(st) + it.lead;
+  }
 
   // Whose box is being emitted. Set as the block walk enters an element, so
   // the single emit funnel can attribute every fragment without touching each
@@ -510,6 +535,9 @@ struct Engine {
       // laid out at, and painted nothing.
       if (doc.fragments[i].clipped) { doc.fragments[i].clip_x += dx; doc.fragments[i].clip_y += dy; }
     }
+    // A transformed box moved with its contents takes its origin along.
+    for (auto& g : doc.transforms)
+      if (g.frag_from >= from && g.frag_to <= to && g.frag_to > g.frag_from) { g.ox += (float)dx; g.oy += (float)dy; }
   }
 
   // The same for link boxes. A link inside a moved box has to move with it, or
@@ -521,6 +549,70 @@ struct Engine {
     for (size_t i = from; i < to; ++i) {
       doc.links[i].x += dx;
       doc.links[i].y += dy;
+    }
+  }
+
+  // Drops the fragments from `n` on, to lay that part out again -- and any transformed box recorded inside them.
+  void truncate_fragments(size_t n) {
+    doc.fragments.resize(n);
+    while (!doc.transforms.empty() && doc.transforms.back().frag_from >= n) doc.transforms.pop_back();
+  }
+
+  // A box with `scale`, `rotate`, `skew` or `matrix` in its transform (or the `rotate`/`scale` properties): its
+  // matrix, composed in CSS order about its transform-origin, recorded as a group its fragments are drawn
+  // through. `[frag_from, end)` and `[link_from, end)` are what the box emitted.
+  void add_transform(const Style& cs, size_t frag_from, size_t link_from, int bx, int by, int bw, int bh) {
+    if (doc.transforms.size() >= kMaxTransforms || frag_from >= doc.fragments.size()) return;
+    struct M { float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0; };
+    auto mul = [](const M& p, const M& q) {   // p then q applied to a point: p * q
+      M o;
+      o.a = p.a * q.a + p.c * q.b; o.b = p.b * q.a + p.d * q.b;
+      o.c = p.a * q.c + p.c * q.d; o.d = p.b * q.c + p.d * q.d;
+      o.e = p.a * q.e + p.c * q.f + p.e; o.f = p.b * q.e + p.d * q.f + p.f;
+      return o;
+    };
+    M m;
+    if (cs.rotate_rad != 0.0f) {
+      M r; r.a = std::cos(cs.rotate_rad); r.b = std::sin(cs.rotate_rad); r.c = -r.b; r.d = r.a;
+      m = mul(m, r);
+    }
+    if (cs.scale_x != 1.0f || cs.scale_y != 1.0f) { M sc; sc.a = cs.scale_x; sc.d = cs.scale_y; m = mul(m, sc); }
+    for (const auto& fn : cs.transform_fns) {
+      M t;
+      switch (fn.kind) {
+        case Style::TransformFn::Kind::Translate:
+          t.e = fn.tx.is_auto() ? 0.0f : (float)len_px(fn.tx, bw, 0);
+          t.f = fn.ty.is_auto() ? 0.0f : (float)len_px(fn.ty, bh, 0);
+          break;
+        case Style::TransformFn::Kind::Scale: t.a = fn.v[0]; t.d = fn.v[1]; break;
+        case Style::TransformFn::Kind::Rotate:
+          t.a = std::cos(fn.v[0]); t.b = std::sin(fn.v[0]); t.c = -t.b; t.d = t.a;
+          break;
+        case Style::TransformFn::Kind::Skew: t.c = std::tan(fn.v[0]); t.b = std::tan(fn.v[1]); break;
+        case Style::TransformFn::Kind::Matrix:
+          t.a = fn.v[0]; t.b = fn.v[1]; t.c = fn.v[2]; t.d = fn.v[3]; t.e = fn.v[4]; t.f = fn.v[5];
+          break;
+      }
+      m = mul(m, t);
+    }
+    if (m.a == 1 && m.b == 0 && m.c == 0 && m.d == 1 && m.e == 0 && m.f == 0) return;   // rotate(0), scale(1)
+    Document::TransformGroup g;
+    g.ox = (float)bx + (float)(cs.origin_x.is_auto() ? bw / 2 : len_px(cs.origin_x, bw, bw / 2));
+    g.oy = (float)by + (float)(cs.origin_y.is_auto() ? bh / 2 : len_px(cs.origin_y, bh, bh / 2));
+    g.a = m.a; g.b = m.b; g.c = m.c; g.d = m.d; g.e = m.e; g.f = m.f;
+    g.frag_from = frag_from;
+    g.frag_to = doc.fragments.size();
+    g.link_from = link_from;
+    g.link_to = doc.links.size();
+    const int gi = (int)doc.transforms.size();
+    doc.transforms.push_back(g);
+    // What it drew belongs to it; a transformed box drawn inside it already has a group, which now nests in this.
+    for (size_t i = frag_from; i < doc.fragments.size(); ++i) {
+      int& x = doc.fragments[i].xform;
+      if (x < 0) { x = gi; continue; }
+      int top = x;
+      while (doc.transforms[(size_t)top].parent >= 0) top = doc.transforms[(size_t)top].parent;
+      if (top != gi) doc.transforms[(size_t)top].parent = gi;
     }
   }
 
@@ -728,8 +820,7 @@ struct Engine {
     it.href = open_href;
     it.node = owning_element(node);
     it.w = measure(it.text, ps);
-    it.h = line_h(ps);
-    it.ascent = ascent(ps);
+    text_box(it, ps);
     out.push_back(std::move(it));
   }
 
@@ -749,8 +840,7 @@ struct Engine {
           it.style = parent;
           it.href = open_href;
           it.w = measure(word, parent);
-          it.h = line_h(parent);
-          it.ascent = ascent(parent);
+          text_box(it, parent);
           out.push_back(std::move(it));
           word.clear();
         };
@@ -760,8 +850,7 @@ struct Engine {
             InlineItem br;
             br.kind = InlineItem::Kind::Break;
             br.style = parent;
-            br.h = line_h(parent);
-            br.ascent = ascent(parent);
+            text_box(br, parent);
             out.push_back(std::move(br));
             continue;
           }
@@ -789,8 +878,7 @@ struct Engine {
           sp.style = parent;
           sp.href = open_href;
           sp.w = measure(" ", parent);
-          sp.h = line_h(parent);
-          sp.ascent = ascent(parent);
+          text_box(sp, parent);
           out.push_back(std::move(sp));
           continue;
         }
@@ -803,8 +891,7 @@ struct Engine {
         w.style = parent;
         w.href = open_href;
         w.w = measure(w.text, parent);
-        w.h = line_h(parent);
-        w.ascent = ascent(parent);
+        text_box(w, parent);
         out.push_back(std::move(w));
       }
       return;
@@ -819,8 +906,7 @@ struct Engine {
       InlineItem br;
       br.kind = InlineItem::Kind::Break;
       br.style = st;
-      br.h = line_h(st);
-      br.ascent = ascent(st);
+      text_box(br, st);
       out.push_back(std::move(br));
       return;
     }
@@ -1027,8 +1113,8 @@ struct Engine {
       std::string label;
       bool checkbox_like = false;
       if (node.tag == "input") {
-        if (type == "checkbox") { checkbox_like = true; label = node.has_attr("checked") ? "[x]" : "[ ]"; }
-        else if (type == "radio") { checkbox_like = true; label = node.has_attr("checked") ? "(*)" : "( )"; }
+        // A checkbox or radio has no label of its own: it is a mark drawn in a 13px box (control_mark below).
+        if (type == "checkbox" || type == "radio") checkbox_like = true;
         else if (type == "submit") label = node.has_attr("value") ? node.attr("value") : "Submit";
         else if (type == "button") label = node.has_attr("value") ? node.attr("value") : "Button";
         else if (type == "password") label = std::string(node.attr("value").size(), '*');
@@ -1057,9 +1143,7 @@ struct Engine {
         if (show) {
           label = show->has_attr("label") ? show->attr("label") : show->inner_text();
         }
-        // The arrow that says this opens. Drawn as type, because the atlas has
-        // the glyph and a control's chevron should scale with its text.
-        label += label.empty() ? "\u25BE" : "  \u25BE";
+        // The chevron that says this opens is drawn beside the label (control_mark), in room kept for it below.
       } else if (node.tag == "progress" || node.tag == "meter") {
         // Drawn as a bar, with no label (its text is only the no-support fallback).
       } else {
@@ -1105,12 +1189,14 @@ struct Engine {
         const int ch = measure("0", st);      // the average advance, as a browser takes it
         content_w = chars * (ch > 0 ? ch : 8);
         if (text_w > content_w) content_w = text_w;
+      } else if (checkbox_like) {
+        content_w = kMarkSide;   // Chrome's 13x13
       } else {
-        const int floor_w = checkbox_like ? 0 : 24;
-        content_w = text_w > floor_w ? text_w : floor_w;
+        content_w = text_w > 24 ? text_w : 24;
+        if (node.tag == "select") content_w = (label.empty() ? 0 : text_w) + kChevronRoom;
       }
 
-      int content_h = line_h(st);
+      int content_h = checkbox_like ? kMarkSide : line_h(st);
       // A gauge is a fixed-size bar a browser draws itself (Chrome: progress
       // 160x16, meter 80x16); its fill is painted where the field box is.
       if (node.tag == "progress" || node.tag == "meter") {
@@ -1145,9 +1231,31 @@ struct Engine {
       if (content_w < 0) content_w = 0;
       if (content_h < 0) content_h = 0;
 
+      // Its margins: outside the box, but part of what the line makes room for -- a row of buttons with
+      // `margin-right: 8px` is spaced, not jammed edge to edge.
+      for (int k = 0; k < 4; ++k) f.fm[k] = st.margin[k];
       f.w = content_w + hpad;
       f.h = content_h + vpad;
+      // A control with a one-line label (a button, a field, a closed dropdown) sits on the line by its label's
+      // baseline, so "Mode:" and the dropdown beside it read as one line of text. The others -- a checkbox, a
+      // gauge, a textarea -- by their bottom edge.
       f.ascent = f.h;
+      if (!checkbox_like && node.tag != "textarea" && node.tag != "progress" && node.tag != "meter") {
+        const int face_h = m.line_height(font_of(st));
+        const int glyph_top = f.fb[0] + f.fp[0] + (content_h - face_h) / 2;
+        const int base = glyph_top + ascent(st);
+        if (base > 0 && base <= f.h) f.ascent = base;
+      }
+      // The margins wrap the box: the item is that much wider and taller, and its baseline that much lower.
+      // A checkbox or radio rests its box on the baseline, its bottom margin hanging below it, as Chrome draws them;
+      // a gauge or textarea sits on its bottom margin edge (CSS 2 10.8.1).
+      const bool on_bottom = f.ascent == f.h;
+      const int box_h = f.h;
+      f.w += f.fm[1] + f.fm[3];
+      f.h += f.fm[0] + f.fm[2];
+      f.ascent = checkbox_like ? f.fm[0] + box_h : on_bottom ? f.h : f.ascent + f.fm[0];
+      if (f.w < 0) f.w = 0;
+      if (f.h < 0) f.h = 0;
       out.push_back(std::move(f));
       return;
     }
@@ -1218,10 +1326,14 @@ struct Engine {
       // the box as wide as the thing hanging off it.
       if (explicit_w < 0 && b.w > want) b.w = want;
       b.h = h;
-      b.ascent = h;
+      // An inline-block sits on the line by the baseline of its last line of text (CSS 2 10.8.1), so its words line
+      // up with the words around it; with no text, or when it clips what is inside it, by its bottom edge.
+      const int base = st.overflow_x == Overflow::Visible && st.overflow_y == Overflow::Visible
+                           ? last_baseline(b.frag_from, b.frag_to, 0) : -1;
+      b.ascent = base >= 0 && base <= h ? base : h;
       if (b.w <= 0 && b.h <= 0) {
         // Nothing came of it -- drop the item rather than reserving a hole.
-        doc.fragments.resize(b.frag_from);
+        truncate_fragments(b.frag_from);
         doc.links.resize(b.link_from);
         return;
       }
@@ -1282,6 +1394,7 @@ struct Engine {
       int line_w = 0;
       int max_h = 0;
       int max_ascent = 0;
+      int max_descent = 0;   // below the baseline: a line is as tall as its highest ascent plus its deepest descent
       bool forced_break = false;
 
       while (i < items.size()) {
@@ -1290,6 +1403,7 @@ struct Engine {
           forced_break = true;
           if (it.h > max_h) max_h = it.h;
           if (it.ascent > max_ascent) max_ascent = it.ascent;
+          if (it.h - it.ascent > max_descent) max_descent = it.h - it.ascent;
           ++i;
           line_end = i;
           break;
@@ -1323,6 +1437,7 @@ struct Engine {
         line_w += w;
         if (it.h > max_h) max_h = it.h;
         if (it.ascent > max_ascent) max_ascent = it.ascent;
+        if (it.h - it.ascent > max_descent) max_descent = it.h - it.ascent;
         ++i;
         line_end = i;
       }
@@ -1341,6 +1456,9 @@ struct Engine {
         visible_w -= items[last - 1].w;
         --last;
       }
+      // Everything on the line shares one baseline, so the line is as tall as what reaches highest above it plus
+      // what reaches lowest below -- not just its tallest item, which let a word's descender hang under an image.
+      if (max_ascent + max_descent > 0) max_h = max_ascent + max_descent;
       if (max_h <= 0) max_h = 18;
 
       int pen_x = band_x;
@@ -1438,15 +1556,18 @@ struct Engine {
           // A field is its own little box: background, border, then its label
           // inset by the padding and border the UA sheet gave it — the same
           // three layers a block box gets, just inline and one item wide.
-          int box_x = pen_x;
-          int box_y = cursor_y + (max_ascent > first.ascent ? max_ascent - first.ascent : 0);
+          // The box inside the item's margins.
+          int box_x = pen_x + first.fm[3];
+          int box_y = cursor_y + (max_ascent > first.ascent ? max_ascent - first.ascent : 0) + first.fm[0];
+          const int fw = first.w - first.fm[1] - first.fm[3];
+          const int fh = first.h - first.fm[0] - first.fm[2];
           if (first.style.has_background && (first.style.background >> 24)) {
             Fragment bg;
             bg.kind = Fragment::Kind::Rect;
             bg.x = box_x;
             bg.y = box_y;
-            bg.w = first.w;
-            bg.h = first.h;
+            bg.w = fw;
+            bg.h = fh;
             bg.color = first.style.background;
             bg.radius = first.style.radius;
             emit(bg);
@@ -1463,15 +1584,15 @@ struct Engine {
             hit.kind = Fragment::Kind::Rect;
             hit.x = box_x;
             hit.y = box_y;
-            hit.w = first.w;
-            hit.h = first.h;
+            hit.w = fw;
+            hit.h = fh;
             hit.color = 0x00000000;
             emit(hit);
           }
           // <progress>/<meter>: a track and the filled part of it. Indeterminate
           // progress (no value) shows a partly filled bar, as a still frame.
           if (first.node && (first.node->tag == "progress" || first.node->tag == "meter") &&
-              first.w > 0 && first.h > 0) {
+              fw > 0 && fh > 0) {
             const Node& g = *first.node;
             auto num = [&](const char* a, double d) {
               if (!g.has_attr(a)) return d;
@@ -1489,34 +1610,75 @@ struct Engine {
             if (prog && v < 0) frac = 0.3;
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
+            // Chrome's gauge: an 8px rounded track with a hairline edge, centred in the 16px box.
+            const int th = fh > 8 ? 8 : fh;
             Fragment track;
             track.kind = Fragment::Kind::Rect;
-            track.x = box_x; track.y = box_y; track.w = first.w; track.h = first.h;
-            track.color = 0xFFE6E6E6;
-            track.radius = first.h / 2;
+            track.x = box_x; track.y = box_y + (fh - th) / 2; track.w = fw; track.h = th;
+            track.color = light_ground ? 0xFFEFEFEF : 0xFF3B3B3B;
+            track.radius = th / 2;
             emit(track);
-            uint32_t fill = 0xFF0075FF;
+            uint32_t fill = first.style.accent ? first.style.accent : 0xFF0075FF;
             if (!prog) {
               const double low = num("low", lo), high = num("high", hi), opt = num("optimum", (lo + hi) / 2);
               const bool good_high = opt > high, good_low = opt < low;
               const bool in_low = v < low, in_high = v > high;
               if (good_high ? in_low || v < high : good_low ? in_high || v > low : in_low || in_high)
                 fill = ((good_high && v < low) || (good_low && v > high) || (!good_high && !good_low && (in_low || in_high)))
-                           ? 0xFFE04040 : 0xFFF0B000;
-              else fill = 0xFF10A010;
+                           ? 0xFFD83B01 : 0xFFFFB900;   // Chrome's even-less-good and suboptimum
+              else fill = 0xFF107C10;                   // and optimum
             }
             Fragment bar = track;
-            bar.w = (int)(first.w * frac);
+            bar.w = (int)(fw * frac);
             bar.color = fill;
             if (bar.w > 0) emit(bar);
+            Fragment edge = track;
+            edge.kind = Fragment::Kind::Border;
+            edge.color = light_ground ? 0xFFB2B2B2 : 0xFF858585;
+            edge.text = std::string(4, (char)1);
+            emit(edge);
+          }
+          // A closed dropdown's chevron, at the right of its box.
+          if (first.node && first.node->tag == "select" && !first.style.appearance_none) {
+            std::string key;
+            const std::string chevron = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 6\">"
+                                        "<path d=\"M1 1 L5 5 L9 1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\"/></svg>";
+            const int cx = box_x + fw - first.fb[1] - first.fp[1] - kChevronW - 2;
+            const int cy = box_y + (fh - kChevronH) / 2;
+            if (raster_mark(chevron, kChevronW, kChevronH, first.style.color, key)) {
+              Fragment mk;
+              mk.kind = Fragment::Kind::Image;
+              mk.x = cx; mk.y = cy; mk.w = kChevronW; mk.h = kChevronH;
+              mk.src = key;
+              mk.color = first.style.color;
+              mk.link = -1;
+              emit(mk);
+            }
+          }
+          // A checkbox or radio: its mark, unless the page draws the control itself (`appearance: none`).
+          if (first.node && first.node->tag == "input" && !first.style.appearance_none && fw > 0 && fh > 0) {
+            std::string key;
+            if (control_mark(*first.node, first.style, fw, fh, key)) {
+              Fragment mk;
+              mk.kind = Fragment::Kind::Image;
+              mk.x = box_x;
+              mk.y = box_y;
+              mk.w = fw;
+              mk.h = fh;
+              mk.src = key;
+              mk.color = first.style.color;
+              mk.font = font_of(first.style);
+              mk.link = -1;
+              emit(mk);
+            }
           }
           if (first.fb[0] || first.fb[1] || first.fb[2] || first.fb[3]) {
             Fragment bd;
             bd.kind = Fragment::Kind::Border;
             bd.x = box_x;
             bd.y = box_y;
-            bd.w = first.w;
-            bd.h = first.h;
+            bd.w = fw;
+            bd.h = fh;
             bd.color = first.style.border_color;
             bd.radius = first.style.radius;
             bd.text.push_back((char)(first.fb[0] > 255 ? 255 : first.fb[0]));
@@ -1531,16 +1693,23 @@ struct Engine {
             tf.text = first.text;
             tf.x = box_x + first.fb[3] + first.fp[3];
             tf.y = box_y + first.fb[0] + first.fp[0];
-            tf.w = first.w - first.fb[1] - first.fb[3] - first.fp[1] - first.fp[3];
-            tf.h = first.h - first.fb[0] - first.fb[2] - first.fp[0] - first.fp[2];
+            tf.w = fw - first.fb[1] - first.fb[3] - first.fp[1] - first.fp[3];
+            tf.h = fh - first.fb[0] - first.fb[2] - first.fp[0] - first.fp[2];
             // One line of label in a box taller than the line -- a button
             // with `height: 36px` -- sits in the MIDDLE of it, not hung from
             // the top edge. A textarea is the one control whose text starts at
             // the top.
-            if (!(first.node && first.node->tag == "textarea")) {
-              const int lh = line_h(first.style);
-              if (tf.h > lh) { tf.y += (tf.h - lh) / 2; tf.h = lh; }
-            }
+            // A label narrower than its box sits where `text-align` puts it: a button's centred (the UA sheet
+            // says so, as Chrome's does), a field's at the start.
+            const int label_w = measure(first.text, first.style);
+            if (label_w < tf.w && first.style.text_align == Align::Center) tf.x += (tf.w - label_w) / 2;
+            else if (label_w < tf.w && first.style.text_align == Align::Right) tf.x += tf.w - label_w;
+            if (label_w < tf.w && first.style.text_align != Align::Left) tf.w = label_w;
+            // The text fragment is the glyphs' own box, as everywhere else.
+            const int face_h = m.line_height(font_of(first.style));
+            if (!(first.node && first.node->tag == "textarea")) tf.y += (tf.h - face_h) / 2;
+            else tf.y += (line_h(first.style) - face_h) / 2;
+            tf.h = face_h;
             tf.color = first.style.color;
             tf.font = font_of(first.style);
             tf.link = -1;
@@ -1552,8 +1721,8 @@ struct Engine {
             ln.text = first.text;
             ln.x = box_x;
             ln.y = box_y;
-            ln.w = first.w;
-            ln.h = first.h;
+            ln.w = fw;
+            ln.h = fh;
             doc.links.push_back(ln);
           }
           pen_x += first.w;
@@ -1574,7 +1743,11 @@ struct Engine {
                  a.style.bold == b.style.bold && a.style.italic == b.style.italic &&
                  a.style.mono == b.style.mono && a.style.serif == b.style.serif &&
                  a.style.underline == b.style.underline &&
-                 a.style.strike == b.style.strike && a.href == b.href;
+                 a.style.strike == b.style.strike && a.href == b.href &&
+                 // One element's text per fragment: a click is hit-tested to the fragment's element, so a <label>
+                 // or a <span> with a handler beside its parent's text has to be its own fragment to be clickable.
+                 // A space takes the element of the word before it.
+                 (a.node == b.node || b.kind == InlineItem::Kind::Space);
         };
         while (run_end < last && same(items[run_start], items[run_end])) ++run_end;
 
@@ -1606,9 +1779,10 @@ struct Engine {
           f.kind = Fragment::Kind::Text;
           f.text = text;
           f.x = pen_x;
-          f.y = cursor_y + (max_ascent - first.ascent);
+          // The glyphs' own box: the top of the item's line box plus its half-leading, as tall as the face.
+          f.y = cursor_y + (max_ascent - first.ascent) + first.lead;
           f.w = run_w;
-          f.h = first.h;
+          f.h = m.line_height(font_of(first.style));
           f.color = first.style.color;
           f.font = font_of(first.style);
           f.underline = first.style.underline;
@@ -2158,6 +2332,75 @@ struct Engine {
     return -1;
   }
 
+  // A checkbox's or radio's mark, as Chrome paints it -- a 2px-rounded square with a white tick, a ring with a dot --
+  // drawn by the SVG rasteriser into the document's picture store, so it is antialiased and scales with the box.
+  // The fill is the page's `accent-color`, or Chrome's own blue; on a dark ground the dark scheme's colours.
+  // False for an input that is neither.
+  bool control_mark(const Node& input, const Style& st, int w, int h, std::string& key) {
+    std::string type = input.attr("type");
+    for (auto& c : type) c = (char)tolower((unsigned char)c);
+    const bool radio = type == "radio";
+    if (!radio && type != "checkbox") return false;
+    const bool on = input.has_attr("checked");
+    auto hex = [](uint32_t c) {
+      char b[8];
+      std::snprintf(b, sizeof b, "#%06x", (unsigned)(c & 0xFFFFFF));
+      return std::string(b);
+    };
+    // A disabled control is greyed, its mark and its edge alike.
+    const bool off = input.has_attr("disabled");
+    const std::string accent = off ? (light_ground ? "#b3b3b3" : "#6b6b6b")
+                                   : st.accent ? hex(st.accent) : (light_ground ? "#0075ff" : "#99c8ff");
+    const std::string paper = light_ground ? "#ffffff" : "#3b3b3b";
+    const std::string edge = off ? (light_ground ? "#c5c5c5" : "#555555") : (light_ground ? "#767676" : "#858585");
+    std::string svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 13 13\">";
+    if (radio) {
+      svg += "<circle cx=\"6.5\" cy=\"6.5\" r=\"6\" fill=\"" + paper + "\" stroke=\"" + (on ? accent : edge) + "\" stroke-width=\"1\"/>";
+      if (on) svg += "<circle cx=\"6.5\" cy=\"6.5\" r=\"3.5\" fill=\"" + accent + "\"/>";
+    } else if (on) {
+      svg += "<rect x=\"0\" y=\"0\" width=\"13\" height=\"13\" rx=\"2\" fill=\"" + accent + "\"/>";
+      svg += "<path d=\"M3.2 6.8 L5.5 9.1 L9.9 4.2\" fill=\"none\" stroke=\"" + paper + "\" stroke-width=\"1.8\"/>";
+    } else {
+      svg += "<rect x=\"0.5\" y=\"0.5\" width=\"12\" height=\"12\" rx=\"2\" fill=\"" + paper + "\" stroke=\"" + edge + "\" stroke-width=\"1\"/>";
+    }
+    svg += "</svg>";
+    return raster_mark(svg, w, h, st.color, key);
+  }
+
+  // Markup for a mark the engine draws itself, rasterised at w x h into the document's picture store under `key`.
+  bool raster_mark(const std::string& svg, int w, int h, uint32_t current, std::string& key) {
+    NodePtr dom = parse_html(span_of(svg));
+    const Node* root = nullptr;
+    std::function<void(const Node&)> find = [&](const Node& n) {
+      if (root) return;
+      if (n.kind == Node::Kind::Element && n.tag == "svg") { root = &n; return; }
+      for (const auto& kid : n.children) if (kid) find(*kid);
+    };
+    if (dom) find(*dom);
+    if (!root) return false;
+    auto bm = rasterise_svg(*root, w, h, current);
+    if (!bm.ok()) return false;
+    key = "control#" + std::to_string(doc.inline_images.size());
+    doc.inline_images.emplace_back(key, std::move(*bm));
+    return true;
+  }
+
+  // The last line of text in a fragment range: its baseline, as an offset from `top`; -1 when there is no text.
+  // Text fragments are the glyphs' own box, so the baseline is the fragment's top plus the face's ascent.
+  int last_baseline(size_t from, size_t to, int top) const {
+    if (to > doc.fragments.size()) to = doc.fragments.size();
+    int best = -1;
+    for (size_t i = from; i < to; ++i) {
+      const Fragment& fr = doc.fragments[i];
+      if (fr.kind != Fragment::Kind::Text || fr.h <= 0) continue;
+      const int lh = m.line_height(fr.font);
+      const int asc = m.ascent ? m.ascent(fr.font) : lh * 4 / 5;
+      const int b = fr.y + (fr.h - lh) / 2 + asc - top;
+      if (b > best) best = b;
+    }
+    return best;
+  }
+
   // Distribute a line's free space onto its flexible items, the way CSS Flexbox
   // 9.7 says: grow or shrink by the factors (shrink scaled by base size), clamp
   // each against its min/max, freeze the violators and repeat. `base`, `lo`,
@@ -2657,7 +2900,7 @@ struct Engine {
         // Re-lay the column with each grower given its share: a grower's height
         // changes what its own children do, so it cannot be fixed up by
         // shifting fragments.
-        doc.fragments.resize(items.front().first);
+        truncate_fragments(items.front().first);
         cursor = y;
         for (size_t k = 0; k < items.size(); ++k) {
           Item& it = items[k];
@@ -3610,6 +3853,9 @@ struct Engine {
       const int cx = box_x + bl, cy = y + bt;
       const int cw = outer_w - bl - br, ch = total - bt - bb;
       for (size_t i = frag_start; i < doc.fragments.size(); ++i) {
+        // The box's own frame -- its shadow, background and border -- is outside what it clips: `overflow` cuts
+        // the CONTENT at the padding box. Clipped with it, a bordered scroll pane lost its whole border.
+        if (i == bg_slot || i == border_slot || i == shadow_slot || i == bgimg_slot) continue;
         Fragment& f = doc.fragments[i];
         int nx = cx, ny = cy, nw = cw, nh = ch;
         if (cs.overflow_x == Overflow::Visible) { nx = f.clipped ? f.clip_x : -(1 << 28); nw = f.clipped ? f.clip_w : 1 << 29; }
@@ -3657,6 +3903,8 @@ struct Engine {
     // `transform: translate(...)`: move the whole box, and everything it drew,
     // AFTER it has a size -- a percentage here is against the box's own width
     // and height, which is the whole point of `translate(-50%, -50%)`.
+    // Scale, rotate, skew: the box keeps its place in the flow and is drawn through its matrix (CSS Transforms 1).
+    if (cs.has_xf()) add_transform(cs, box_mark, link_mark, box_x, y, outer_w, total);
     if (cs.has_translate) {
       const int dx = cs.translate_x.is_auto() ? 0 : len_px(cs.translate_x, outer_w, 0);
       const int dy = cs.translate_y.is_auto() ? 0 : len_px(cs.translate_y, total, 0);
@@ -4034,8 +4282,13 @@ void layout(Document& doc, const Stylesheet& author, const Metrics& m, int viewp
   g_cs_ms = 0; g_cs_n = 0; g_cs_match = 0; g_cs_miss = 0;
   struct CacheOn { CacheOn() { clear_style_cache(); g_style_cache_on = true; } ~CacheOn() { g_style_cache_on = false; clear_style_cache(); } } cache_on_;
   struct Prof { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(); ~Prof() { if (getenv("AIOS_LAYOUT_PROF")) fprintf(stderr, "layout %.0f ms, compute_style %.0f ms in %ld calls, match %.0f ms for %ld misses\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), g_cs_ms, g_cs_n, g_cs_match, g_cs_miss); } } prof_;
+  ++doc.layout_gen;
   doc.fragments.clear();
   doc.links.clear();
+  doc.transforms.clear();
+  // The pictures layout draws itself (inline <svg>, control marks) are drawn again by this pass, under the same
+  // positional keys. Kept, every relayout -- a resize, a script's DOM change -- appended another copy of each.
+  doc.inline_images.clear();
   doc.fragments.reserve(8192);
   doc.links.reserve(2048);
   doc.content_height = 0;
@@ -4094,6 +4347,7 @@ void layout(Document& doc, const Stylesheet& author, const Metrics& m, int viewp
   if (!author_set_ink && light_ground) root.color = 0xFF1A1A1A;
 
   Engine e{doc, ua_stylesheet(light_ground), author, m, viewport_w, viewport_h};
+  e.light_ground = light_ground;
   // The initial containing block is the viewport. Everything `height: 100%`
   // hangs off this; with no viewport height there is nothing definite and a
   // percentage height stays auto.
@@ -4136,6 +4390,22 @@ void layout(Document& doc, const Stylesheet& author, const Metrics& m, int viewp
   }
   doc.content_height = h + gt + gb;
   if (doc.content_width < viewport_w) doc.content_width = viewport_w;
+
+  // A link inside a transformed box is clicked where it is drawn: its box becomes the bounds of its transformed
+  // corners. Inner groups were recorded first, so each applies its own matrix and the outer ones compose on top.
+  for (const auto& g : doc.transforms) {
+    for (size_t i = g.link_from; i < g.link_to && i < doc.links.size(); ++i) {
+      Link& l = doc.links[i];
+      float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+      for (int k = 0; k < 4; ++k) {
+        const float px = (float)(l.x + ((k & 1) ? l.w : 0)) - g.ox, py = (float)(l.y + ((k & 2) ? l.h : 0)) - g.oy;
+        const float qx = g.ox + g.a * px + g.c * py + g.e, qy = g.oy + g.b * px + g.d * py + g.f;
+        x0 = std::min(x0, qx); y0 = std::min(y0, qy); x1 = std::max(x1, qx); y1 = std::max(y1, qy);
+      }
+      l.x = (int)std::floor(x0); l.y = (int)std::floor(y0);
+      l.w = (int)std::ceil(x1) - l.x; l.h = (int)std::ceil(y1) - l.y;
+    }
+  }
 
   // Stacking order. A STABLE sort, so document order still decides between
   // boxes at the same level -- which is what makes the background of a box

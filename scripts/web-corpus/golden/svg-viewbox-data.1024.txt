@@ -1,6 +1,6 @@
 # page svg-viewbox-data.html  viewport=1024
 # title SVG viewBox
-# content 1024x50  background=ff121212  links=0
+# content 1024x59  background=ff121212  links=0
 image      0     0   100    50  #ffd8d8d8  src=data:image/svg+xml,<svg viewBox='0 0 100 50' xmlns='http://www.w3.org/2000/svg'><rect width='100' height='50' fill='red'/></svg> alt="svg test"
 # glyph-gaps (none)
 

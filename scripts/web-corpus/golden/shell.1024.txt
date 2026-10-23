@@ -1,7 +1,7 @@
 # page shell.html  viewport=1024
 # title An application shell
 # content 1024x1265  background=ff121212  links=0
-rect       0     0  1024  1265  #ff111111  clip=0,0,1024x1265
+rect       0     0  1024  1265  #ff111111
 rect       0     0   200  1265  #ff181818  clip=0,0,1024x1265
 text      10    10    49    19  #ffdddddd  14px              "sidebar"  clip=0,0,1024x1265
 rect     200     0   824    44  #ff202020  clip=0,0,1024x1265

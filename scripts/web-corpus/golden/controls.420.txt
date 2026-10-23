@@ -2,18 +2,20 @@
 # title Controls and generated boxes
 # content 420x548  background=ffffffff  links=0
 text      16    36   235    33  #ff202020  24px,bold         "A dropdown, closed"
-text      16   104    48    21  #ff202020  15px              "Mode: "
-rect      64    81   158    35  #ffffffff  r=8
-border    64    81   158    35  #ff767676  r=8
-text      75    88   136    21  #ff000000  15px              "Many per photo  ▾"
-text     222   104    64    21  #ff202020  15px              " Empty: "
-rect     286    81    46    35  #ffffffff  r=8
-border   286    81    46    35  #ff767676  r=8
-text     297    88    24    21  #ff000000  15px              "▾"
-text     332   104    56    21  #ff202020  15px              " First:"
-rect      16   116    86    35  #ffffffff  r=8
-border    16   116    86    35  #ff767676  r=8
-text      27   123    64    21  #ff000000  15px              "Alpha  ▾"
+text      16    88    48    21  #ff202020  15px              "Mode: "
+rect      64    81   152    35  #ffffffff  r=8
+image    193    95    10     6  #ff000000  src=control#0 alt=""
+border    64    81   152    35  #ff767676  r=8
+text      75    88   130    21  #ff000000  15px              "Many per photo"
+text     216    88    64    21  #ff202020  15px              " Empty: "
+rect     280    81    40    35  #ffffffff  r=8
+image    297    95    10     6  #ff000000  src=control#1 alt=""
+border   280    81    40    35  #ff767676  r=8
+text     320    88    56    21  #ff202020  15px              " First:"
+rect      16   116    80    35  #ffffffff  r=8
+image     73   130    10     6  #ff000000  src=control#2 alt=""
+border    16   116    80    35  #ff767676  r=8
+text      27   123    58    21  #ff000000  15px              "Alpha"
 text      16   171   196    33  #ff202020  24px,bold         "Generated boxes"
 text      16   216    24    21  #ff202020  15px              "27k"
 text      40   216    24    21  #ff909090  15px              " · "
@@ -30,5 +32,8 @@ rect      16   397   388    90  #0f000000  r=10
 rect     118   425   184    33  #ff0f8a6a  r=999
 text     130   431   160    21  #ffffffff  15px              "centred by translate"
 text      16   509   128    21  #ff202020  15px              "nudged ten down."
+# inline-image control#0 10x6  inked=28  digest=a5fc1875
+# inline-image control#1 10x6  inked=28  digest=a5fc1875
+# inline-image control#2 10x6  inked=28  digest=a5fc1875
 # glyph-gaps (none)
 

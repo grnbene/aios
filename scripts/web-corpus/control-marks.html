@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><title>Checkboxes, radios and controls drawn as a browser draws them</title>
+<style>
+body { background: #ffffff; margin: 16px; font: 16px sans-serif; }
+.tint { accent-color: #c2185b; }
+.own { appearance: none; width: 18px; height: 18px; border: 2px solid #333; border-radius: 50%; }
+button { margin-right: 8px; }
+</style></head>
+<body>
+<p><label><input type="checkbox" checked> on</label> <label><input type="checkbox"> off</label>
+   <label><input type="radio" name="r" checked> one</label> <label><input type="radio" name="r"> two</label></p>
+<p class="tint"><input type="checkbox" checked> accent <input type="radio" checked> accent
+   <progress value="0.4"></progress></p>
+<p><input type="checkbox" disabled> disabled <input type="checkbox" checked disabled> disabled on
+   <input type="text" value="read only" disabled></p>
+<p><input type="checkbox" class="own"> drawn by the page</p>
+<p><button>One</button><button>Two</button><input type="submit" value="Send"><select><option>Pick</option></select></p>
+</body></html>

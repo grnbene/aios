@@ -299,6 +299,98 @@ body{
 /* Field Groups */
 .w-field-group{display:flex;flex-direction:column;gap:5px;flex:1 1 180px}
 .w-field-label{font-size:11px;font-weight:650;letter-spacing:0.06em;text-transform:uppercase;color:var(--dim)}
+
+/* Built-in Preset Themes */
+[data-theme="cyber"], .theme-cyber{
+  --bg:#050814;--panel:rgba(10,16,32,0.78);--panel-solid:#0c1427;--ink:#f0fdf4;--dim:#7dd3fc;
+  --line:rgba(6,182,212,0.18);--line-strong:rgba(6,182,212,0.38);
+  --accent:#06b6d4;--accent-ink:#020617;--accent-glow:rgba(6,182,212,0.45);
+  --ok:#10b981;--ok-glow:rgba(16,185,129,0.45);--warn:#f59e0b;--bad:#f43f5e;
+}
+body:has([data-theme="cyber"]),body.theme-cyber{
+  background:radial-gradient(ellipse 90% 60% at 50% -20%,rgba(6,182,212,0.18),transparent),
+             radial-gradient(ellipse 60% 40% at 85% 85%,rgba(236,72,153,0.12),transparent),#050814 !important;
+}
+
+[data-theme="nord"], .theme-nord{
+  --bg:#242933;--panel:rgba(46,52,64,0.82);--panel-solid:#2e3440;--ink:#eceff4;--dim:#9aa8be;
+  --line:rgba(236,239,244,0.09);--line-strong:rgba(136,192,208,0.28);
+  --accent:#88c0d0;--accent-ink:#242933;--accent-glow:rgba(136,192,208,0.35);
+  --ok:#a3be8c;--ok-glow:rgba(163,190,140,0.35);--warn:#ebcb8b;--bad:#bf616a;
+}
+body:has([data-theme="nord"]),body.theme-nord{
+  background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(136,192,208,0.14),transparent),#242933 !important;
+}
+
+[data-theme="matrix"], .theme-matrix{
+  --bg:#030704;--panel:rgba(6,20,10,0.8);--panel-solid:#091a0e;--ink:#86efac;--dim:#4ade80;
+  --line:rgba(34,197,94,0.2);--line-strong:rgba(34,197,94,0.45);
+  --accent:#22c55e;--accent-ink:#030704;--accent-glow:rgba(34,197,94,0.45);
+  --ok:#4ade80;--ok-glow:rgba(74,222,128,0.45);--warn:#eab308;--bad:#ef4444;
+}
+body:has([data-theme="matrix"]),body.theme-matrix{
+  background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(34,197,94,0.16),transparent),#030704 !important;
+}
+
+[data-theme="sunset"], .theme-sunset{
+  --bg:#0f0a1c;--panel:rgba(28,18,48,0.78);--panel-solid:#1c1230;--ink:#fdf2f8;--dim:#f472b6;
+  --line:rgba(244,114,182,0.15);--line-strong:rgba(249,115,22,0.35);
+  --accent:#f97316;--accent-ink:#fff;--accent-glow:rgba(249,115,22,0.45);
+  --ok:#10b981;--ok-glow:rgba(16,185,129,0.35);--warn:#fbbf24;--bad:#f43f5e;
+}
+body:has([data-theme="sunset"]),body.theme-sunset{
+  background:radial-gradient(ellipse 90% 60% at 50% -20%,rgba(249,115,22,0.18),transparent),
+             radial-gradient(ellipse 70% 50% at 80% 80%,rgba(236,72,153,0.15),transparent),#0f0a1c !important;
+}
+
+[data-theme="glass"], .theme-glass{
+  --bg:#0b0f19;--panel:rgba(255,255,255,0.04);--panel-solid:rgba(255,255,255,0.08);--ink:#ffffff;--dim:#94a3b8;
+  --line:rgba(255,255,255,0.12);--line-strong:rgba(255,255,255,0.28);
+  --accent:#60a5fa;--accent-ink:#ffffff;--accent-glow:rgba(96,165,250,0.4);
+  --ok:#34d399;--ok-glow:rgba(52,211,153,0.4);--warn:#fbbf24;--bad:#f87171;
+}
+body:has([data-theme="glass"]),body.theme-glass{
+  background:radial-gradient(ellipse 90% 70% at 30% 0%,rgba(99,102,241,0.15),transparent),
+             radial-gradient(ellipse 80% 60% at 70% 100%,rgba(236,72,153,0.12),transparent),#0b0f19 !important;
+}
+
+/* Built-in Utility Classes */
+.glow{box-shadow:0 0 24px var(--accent-glow) !important}
+.glow-ok{box-shadow:0 0 24px var(--ok-glow) !important}
+.glow-text{text-shadow:0 0 16px var(--accent-glow)}
+.gradient-text{
+  background:linear-gradient(135deg,var(--accent) 0%,#c084fc 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:800;
+}
+.glass{
+  background:rgba(255,255,255,0.04) !important;
+  backdrop-filter:blur(20px) saturate(180%) !important;-webkit-backdrop-filter:blur(20px) saturate(180%) !important;
+  border:1px solid var(--line-strong) !important;
+}
+.sunken{
+  background:rgba(0,0,0,0.4) !important;
+  box-shadow:inset 0 2px 8px rgba(0,0,0,0.5) !important;border:1px solid var(--line) !important;
+}
+.flat{box-shadow:none !important;border:1px solid var(--line) !important}
+.hover-lift{
+  transition:transform 0.22s cubic-bezier(0.16,1,0.3,1),box-shadow 0.22s,border-color 0.22s !important;
+}
+.hover-lift:hover{
+  transform:translateY(-3px) !important;box-shadow:0 10px 28px -4px rgba(0,0,0,0.5) !important;
+  border-color:var(--line-strong) !important;
+}
+.hover-glow:hover{
+  border-color:var(--accent) !important;box-shadow:0 0 20px var(--accent-glow) !important;
+}
+.caps{font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--dim)}
+.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shimmer{position:relative;overflow:hidden}
+.shimmer::after{
+  content:"";position:absolute;top:0;right:0;bottom:0;left:0;
+  transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,0.08),transparent);
+  animation:w-shimmer 2.5s infinite;
+}
+@keyframes w-shimmer{100%{transform:translateX(100%)}}
 )CSS";
 
 // Sends the fields with every event, swaps the widgets in, keeps the focused field and its caret.
@@ -506,7 +598,8 @@ struct WebUi::Session {
   std::string version;           // the program's version this session runs
   uint64_t pane = 0;
   WebPaneInfo info;
-  Clock::time_point last = Clock::now();
+  // Touched by requests under `mu` and read by the reaper under the server's lock: atomic, so neither waits on the other.
+  std::atomic<Clock::time_point> last{Clock::now()};
   Clock::time_point last_look = Clock::now();
 
   // What the viewers see, and a counter that moves when it changes.
@@ -516,7 +609,7 @@ struct WebUi::Session {
   uint64_t html_seq = 0;         // the seq last_html is for
   std::mutex push_mu;
   std::condition_variable push_cv;
-  int streams = 0;               // open event streams: a session with a viewer is not idle
+  std::atomic<int> streams{0};   // open event streams: a session with a viewer is not idle (changed under `mu`, read by the reaper)
 
   // A pane drawn by hand: its last frame, and which mouse buttons went down on it (for click).
   bool canvas = false;
@@ -548,12 +641,12 @@ void WebUi::reap_locked() {
   const auto now = Clock::now();
   for (auto it = sessions_.begin(); it != sessions_.end();) {
     const bool watched = it->second->streams > 0;
-    if (!watched && std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last).count() > host_.idle_seconds) it = sessions_.erase(it);
+    if (!watched && std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last.load()).count() > host_.idle_seconds) it = sessions_.erase(it);
     else ++it;
   }
   while (sessions_.size() >= host_.max_sessions && !sessions_.empty()) {   // the least recently used goes
     auto oldest = sessions_.begin();
-    for (auto it = sessions_.begin(); it != sessions_.end(); ++it) if (it->second->last < oldest->second->last) oldest = it;
+    for (auto it = sessions_.begin(); it != sessions_.end(); ++it) if (it->second->last.load() < oldest->second->last.load()) oldest = it;
     sessions_.erase(oldest);
   }
 }
@@ -612,7 +705,7 @@ void WebUi::frame_locked(Session& s, bool tree, std::string& out) {
 
 void WebUi::start_ticker() {
   if (ticker_.joinable()) return;
-  ticker_ = std::thread([this]() {
+  ticker_ = aios::hal::Thread([this]() {
     std::unique_lock<std::mutex> lock(mu_);
     while (!stop_) {
       stop_cv_.wait_for(lock, std::chrono::milliseconds(50));
@@ -622,11 +715,12 @@ void WebUi::start_ticker() {
       if (shared_) all.push_back(shared_);
       lock.unlock();
       for (auto& s : all) {
+        // The session is looked at only with its turn held: its timers, streams and pane change under `mu`.
+        std::unique_lock<std::mutex> turn(s->mu, std::try_to_lock);
+        if (!turn.owns_lock()) continue;   // an event is running; the next tick
         const bool clocked = s->info.refresh > 0;   // a view that reads the clock: look again every `refresh` seconds
         const bool drawn = s->canvas && s->streams > 0;   // a drawn pane may move by itself: looked at 10 times a second while watched
         if (s->vm->timers.empty() && !clocked && !drawn) continue;
-        std::unique_lock<std::mutex> turn(s->mu, std::try_to_lock);
-        if (!turn.owns_lock()) continue;   // an event is running; the next tick
         s->vm->steps = 0;
         std::string err;
         bool look = run_timers(*s->vm, err);
@@ -767,16 +861,41 @@ WebUi::Response WebUi::handle(const Request& req) {
     return res;
   };
   if (req.path == "/favicon.ico") { res.status = 204; return res; }   // a browser asks for it unprompted: not a reason to start a session
-  const bool is_event = req.path == "/_ui/event" || (req.method == "POST" && req.xhr);
-  if (is_event && req.method != "POST") return fail(405, "/_ui/event takes POST");
-  if (!is_event && req.method != "GET" && req.method != "HEAD") return fail(405, "only GET and HEAD show the page");
-  if (is_event && !req.xhr) return fail(403, "an event must carry X-Grain-UI: 1");
+  if (req.method == "OPTIONS") {
+    res.status = 204;
+    res.headers = {{"Access-Control-Allow-Origin", "*"},
+                   {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+                   {"Access-Control-Allow-Headers", "Content-Type, Authorization, X-Grain-UI"}};
+    return res;
+  }
 
   std::string new_id, error;
   std::shared_ptr<Session> s = session_for(req, new_id, error);
   if (!s) return fail(500, error);
   std::string cookie_header;
   if (!new_id.empty()) cookie_header = host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "");
+
+  // Custom API routes registered on the pane (e.g. ui.pane({"routes": {"/stock_check": fn(req)}}))
+  if (req.path != "/" && req.path != "/_ui/event") {
+    std::lock_guard<std::mutex> turn(s->mu);
+    Vm& vm = *s->vm;
+    int status = 200;
+    std::string res_body, content_type, route_err;
+    if (web_pane_handle_route(vm, s->pane, req.method, req.path, req.query, req.body, status, res_body, content_type, route_err)) {
+      res.status = status;
+      res.headers = {{"Content-Type", content_type}, {"Access-Control-Allow-Origin", "*"}, {"X-Content-Type-Options", "nosniff"}};
+      if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
+      res.body = std::move(res_body);
+      return res;
+    }
+    if (!route_err.empty()) return fail(500, route_err);
+  }
+
+  const bool is_event = req.path == "/_ui/event" || (req.method == "POST" && req.xhr);
+  if (is_event && req.method != "POST") return fail(405, "/_ui/event takes POST");
+  if (!is_event && req.method != "GET" && req.method != "HEAD") return fail(405, "only GET and HEAD show the page");
+  if (is_event && !req.xhr) return fail(403, "an event must carry X-Grain-UI: 1");
+
   auto finish_headers = [&](const char* type) {
     res.headers = {{"Content-Type", type}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}};
     if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
@@ -880,9 +999,12 @@ WebUi::Response WebUi::handle(const Request& req) {
   }
   const int width = s->info.width > 0 ? s->info.width : 720;
   std::string custom_css = s->info.css.empty() ? "" : "\n" + s->info.css + "\n";
+  std::string theme_attr;
+  if (!s->info.theme.empty()) theme_attr = " data-theme=\"" + esc(s->info.theme) + "\" class=\"theme-" + esc(s->info.theme) + "\"";
+  std::string body_cls = s->info.theme.empty() ? "" : " class=\"theme-" + esc(s->info.theme) + "\"";
   std::string page = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
-                     esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle + custom_css + "</style></head><body><div id=\"app\" style=\"--w:" +
-                     std::to_string(width) + "px\" data-seq=\"" + std::to_string(s->seq) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\">" + s->last_html +
+                     esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle + custom_css + "</style></head><body" + body_cls + "><div id=\"app\" style=\"--w:" +
+                     std::to_string(width) + "px\" data-seq=\"" + std::to_string(s->seq) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\"" + theme_attr + ">" + s->last_html +
                      "</div><script>" + kScript + "</script></body></html>";
   res.headers = {{"Content-Type", "text/html; charset=utf-8"},
                  {"Cache-Control", "no-store"},

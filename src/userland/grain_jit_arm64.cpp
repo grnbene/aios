@@ -55,15 +55,15 @@ constexpr int kTypeOff = 0, kPayOff = 8, kCtrlOff = 24;   // ctrl block pointer:
 // std::vector<Value> as {begin, finish, end_of_storage} - libstdc++'s layout,
 // checked at run time before the first compile rather than assumed.
 bool vector_layout_ok() {
-  static int verdict = -1;
-  if (verdict < 0) {
+  // A function-local static: worker VMs compile on several threads at once, and the first of them settles it.
+  static const bool verdict = [] {
     std::vector<Value> v;
     v.reserve(8);
     v.resize(3);
     auto** raw = reinterpret_cast<Value**>(&v);
-    verdict = (sizeof(v) == 24 && raw[0] == v.data() && raw[1] == v.data() + 3 && raw[2] == v.data() + v.capacity()) ? 1 : 0;
-  }
-  return verdict == 1;
+    return sizeof(v) == 24 && raw[0] == v.data() && raw[1] == v.data() + 3 && raw[2] == v.data() + v.capacity();
+  }();
+  return verdict;
 }
 
 // Where a ListObj keeps its items vector (the class has a vtable, so this is

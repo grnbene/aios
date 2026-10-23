@@ -1,0 +1,29 @@
+let hit_count = 0
+
+fn handle_stock(req) {
+  hit_count = hit_count + 1
+  return {
+    "status": 200,
+    "json": {
+      "ok": true,
+      "endpoint": "/stock_check",
+      "method": req.method,
+      "body": req.body,
+      "hit_count": hit_count
+    }
+  }
+}
+
+let p = ui.pane({
+  "title": "API Route Test",
+  "shared": true,
+  "routes": {
+    "/stock_check": handle_stock
+  },
+  "view": fn() {
+    return ui.column([
+      ui.heading("API Test Running"),
+      ui.text("Hit count: " + str(hit_count))
+    ])
+  }
+})

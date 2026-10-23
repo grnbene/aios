@@ -10,7 +10,7 @@
 namespace grain_cli {
 
 struct ServeOptions {
-  std::string host = "127.0.0.1";   // loopback by default: a program may run commands and read files
+  std::string host = "0.0.0.0";     // listen on all interfaces by default (0.0.0.0)
   int port = 8080;
   bool show_errors = true;          // a program's error appears in its page: this is the developer's own machine
 };

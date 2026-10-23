@@ -1,0 +1,46 @@
+# page transforms.html  viewport=900x600
+# title file:///transforms.html
+# content 900x404  background=ffffffff  links=2
+rect      20    50   168    72  #ffe8f0fe  r=8  xf=0
+border    20    50   168    72  #ff1a73e8  r=8  xf=0
+text      34    64    96    22  #ff202124  16px              "rotated 15° "  xf=0
+text     130    64     8    22  #ff0b57a4  16px             u link=0  "a"  xf=0
+text      34    86    32    22  #ff0b57a4  16px             u link=1  "link"  xf=0
+rect     228    61   168    50  #ffe8f0fe  r=8  xf=1
+border   228    61   168    50  #ff1a73e8  r=8  xf=1
+text     242    75    80    22  #ff202124  16px              "scaled 1.5"  xf=1
+rect     436    61   168    50  #fffce8e6  r=8  xf=2
+border   436    61   168    50  #ffd93025  r=8  xf=2
+text     450    75    72    22  #ff202124  16px              "skewX -20"  xf=2
+rect      20   152   168    72  #ffe8f0fe  r=8  xf=3
+border    20   152   168    72  #ff1a73e8  r=8  xf=3
+text      34   166    96    22  #ff202124  16px              "rotate/scale"  xf=3
+text      34   188    40    22  #ff202124  16px              "props"  xf=3
+rect     228   163   168    50  #ffe8f0fe  r=8  xf=4
+border   228   163   168    50  #ff1a73e8  r=8  xf=4
+text     242   177   120    22  #ff202124  16px              "origin top left"  xf=4
+rect     436   163   168    50  #ffe8f0fe  r=8  xf=5
+border   436   163   168    50  #ff1a73e8  r=8  xf=5
+text     450   177    48    22  #ff202124  16px              "matrix"  xf=5
+rect      20   254   168   100  #ffe8f0fe  r=8  xf=7
+border    20   254   168   100  #ff1a73e8  r=8  xf=7
+text      34   268    72    22  #ff202124  16px              "outer -10"  xf=7
+rect      34   290   140    50  #ffe6f4ea  r=8  xf=6
+border    34   290   140    50  #ff188038  r=8  xf=6
+text      48   304    72    22  #ff202124  16px              "inner -20"  xf=6
+rect     228   279   168    50  #ffe8f0fe  r=8  xf=8
+border   228   279   168    50  #ff1a73e8  r=8  xf=8
+text     242   293   128    22  #ff202124  16px              "translate+rotate"  xf=8
+link    129    71    14    24  file:///#x  "a"
+link     30    67    38    31  file:///#x  "link"
+# transform 0  parent=-1  origin=104.0,86.0  matrix=0.966,0.259,-0.259,0.966,0.0,0.0
+# transform 1  parent=-1  origin=312.0,86.0  matrix=1.500,0.000,0.000,1.500,0.0,0.0
+# transform 2  parent=-1  origin=520.0,86.0  matrix=1.000,0.000,-0.364,1.000,0.0,0.0
+# transform 3  parent=-1  origin=104.0,188.0  matrix=0.693,-0.400,0.400,0.693,0.0,0.0
+# transform 4  parent=-1  origin=228.0,163.0  matrix=0.985,0.174,-0.174,0.985,0.0,0.0
+# transform 5  parent=-1  origin=520.0,188.0  matrix=1.000,0.200,0.000,1.000,0.0,0.0
+# transform 6  parent=7  origin=104.0,315.0  matrix=0.940,-0.342,0.342,0.940,0.0,0.0
+# transform 7  parent=-1  origin=104.0,304.0  matrix=0.985,-0.174,0.174,0.985,0.0,0.0
+# transform 8  parent=-1  origin=312.0,304.0  matrix=0.707,0.707,-0.707,0.707,20.0,10.0
+# glyph-gaps (none)
+

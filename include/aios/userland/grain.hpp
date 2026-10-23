@@ -294,7 +294,15 @@ class FnObj final : public Obj {
   bool jit_tried = false;
 };
 
-class Upvalue;
+// A variable a closure captured. Open, it is still the enclosing call's stack
+// slot (`slot`, in the VM running that call); closed, the value lives here.
+class Upvalue {
+ public:
+  size_t slot = 0;
+  Value closed;
+  bool is_closed = false;
+};
+
 class ClosureObj final : public Obj {
  public:
   ClosureObj() : Obj(Type::Fn) { is_closure = true; }
@@ -469,6 +477,14 @@ class Vm {
   std::vector<Timer> timers;
   uint64_t next_timer_id = 1;
 
+  // Set on a VM that runs a parallel_map() lane or a spawn()ed task (grain_std_parallel.cpp). A
+  // worker has no loop of its own to fire timers or show panes, so every()/after()/live()/events()
+  // and run_panes() refuse there instead of registering something that would never run.
+  bool worker = false;
+  // spawn()'s tasks this VM started and has not awaited; dropping it (with the VM) waits for them,
+  // so no task is still running grain when the program that started it is gone.
+  std::shared_ptr<void> tasks;
+
   // Compile functions to native code where the machine can run it (AArch64:
   // the Pi's kernel, or any arm64 host). Off = interpret everything, which is
   // also the reference the native code is checked against.
@@ -483,6 +499,10 @@ class Vm {
   bool jit_call(size_t ip);
   void jit_return();
   bool jit_get_global(size_t ip);
+
+  // What a captured variable holds now: its stack slot in this VM while open, its own copy once
+  // closed. How a closure's state is read when it is copied to a worker.
+  Value upvalue_value(const Upvalue& uv) const;
 
  private:
   struct Frame;
@@ -511,6 +531,8 @@ void install_time_builtins(Vm& vm);    // now, date_parts/format/parse/make (gra
 void install_text_builtins(Vm& vm);    // format, sort_by, group_by, uuid (grain_std_text.cpp)
 void install_bytes_builtins(Vm& vm);   // bytes, bytes_get/set, pack/unpack, bytes_* (grain_std_bytes.cpp)
 void install_path_builtins(Vm& vm);    // path_join, basename, dirname, extname, mkdir, ... (grain_std_path.cpp)
+// parallel_map, spawn, await, task_done: grain on every core, each worker a VM of its own (grain_std_parallel.cpp).
+void install_parallel_builtins(Vm& vm);
 
 // The bridges that make this a language ON aios rather than beside it: the
 // sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL
@@ -590,6 +612,7 @@ struct WebPaneInfo {
   int refresh = 0;           // seconds between redraws the page asks for (the pane's "refresh" option); 0 = none
   bool shared = false;       // the pane's "shared" option: one copy of the program for every visitor, so they all see the same live data
   std::string css;           // custom CSS stylesheet injected into <style>
+  std::string theme;         // preset theme (e.g. "cyber", "nord", "matrix", "sunset", "glass")
 };
 // The first ui.pane the program made, if it made one.
 bool web_pane_first(const Vm& vm, WebPaneInfo& out);
@@ -604,6 +627,11 @@ bool web_pane_render_tree(Vm& vm, uint64_t id, std::string& json, uint64_t& vers
 // field the page named (empty: only the fields changed). Call web_pane_render afterwards.
 bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& action,
                     const std::vector<std::pair<std::string, std::string>>& fields, std::string& error);
+// If the pane defined custom HTTP routes (ui.pane({"routes": {"/path": fn(req)}})),
+// delivers the request and fills status, res_body, and content_type. Returns true if handled.
+bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
+                           const std::string& query, const std::string& body,
+                           int& status, std::string& res_body, std::string& content_type, std::string& error);
 
 }  // namespace aios::userland::grain
 

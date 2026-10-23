@@ -8,8 +8,8 @@ text      31    85   336    21  #ff202020  15px              "A wash six percent
 text      31   106   192    21  #ff202020  15px              "corner radius of twelve."
 rect      16   166    72    29  #1affffff  r=999
 text      28   170    48    21  #ff202020  15px              "A pill"
-rect      96   185    10    10  #ff19c37d  r=9999
-text     106   183   216    21  #ff202020  15px              " a circle at fifty percent."
+rect      96   172    10    10  #ff19c37d  r=9999
+text     106   170   216    21  #ff202020  15px              " a circle at fifty percent."
 rect      16   207   388    41  #66000000
 text      26   217   256    21  #ff202020  15px              "Square, and forty percent black."
 rect      16   268   388    49  #73000000  r=12  blur=18

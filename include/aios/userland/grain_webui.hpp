@@ -18,10 +18,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
+#include "aios/hal/sync.hpp"
 #include "aios/userland/grain.hpp"
 
 namespace aios::userland::grain {
@@ -95,7 +95,7 @@ class WebUi {
   mutable std::mutex mu_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
   std::shared_ptr<Session> shared_;     // the one copy, for a pane with "shared": true
-  std::thread ticker_;
+  aios::hal::Thread ticker_;
   bool stop_ = false;
   std::condition_variable stop_cv_;
 

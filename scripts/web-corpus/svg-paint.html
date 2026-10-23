@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><title>SVG use, gradients, transforms, opacity</title>
+<style>body { background: #ffffff; margin: 16px; color: #d93025; }</style></head>
+<body>
+<svg width="48" height="48" viewBox="0 0 24 24"><defs><path id="star" d="M12 2l3 7h7l-6 4 2 7-6-4-6 4 2-7-6-4h7z"/>
+  <symbol id="dot" viewBox="0 0 10 10"><circle cx="5" cy="5" r="5"/></symbol></defs>
+  <use href="#star" fill="currentColor"/><use xlink:href="#dot" x="16" y="16" width="8" height="8" fill="#188038"/></svg>
+<svg width="48" height="48" viewBox="0 0 24 24"><defs>
+  <linearGradient id="lg" x1="0" x2="1"><stop offset="0" stop-color="#4285f4"/><stop offset="100%" style="stop-color:#ea4335"/></linearGradient>
+  <radialGradient id="rg"><stop offset="0" stop-color="#fbbc04"/><stop offset="1" stop-color="#fbbc04" stop-opacity="0"/></radialGradient></defs>
+  <rect width="24" height="12" rx="3" fill="url(#lg)"/><circle cx="12" cy="18" r="6" fill="url(#rg)"/></svg>
+<svg width="48" height="48" viewBox="0 0 24 24"><g transform="rotate(45 12 12)"><rect x="6" y="6" width="12" height="12" fill="#1a73e8" fill-opacity="0.5"/></g>
+  <rect x="2" y="2" width="8" height="8" style="fill:#188038;opacity:0.6"/></svg>
+<svg width="64" height="32" viewBox="0 0 24 24" preserveAspectRatio="none"><circle cx="12" cy="12" r="10" fill="#9334e6"/></svg>
+</body></html>

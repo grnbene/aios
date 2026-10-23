@@ -1,0 +1,22 @@
+true
+[]
+["3", "1", "2"]
+[15, 25, 35]
+[true]
+[{a: 100}, {a: 200}]
+[5] 0 [1, 2, 3]
+item 1
+item 2
+item 3
+item 4
+false parallel_map(): item 2: zero
+6765 10946 6765
+true
+from a task
+done
+false await(): the task failed: division by zero
+[[0], [0, 2], [0, 3, 6]]
+[55, 89]
+false spawn(): a task cannot be sent to a worker, which is a VM of its own; open it inside the function
+false parallel_map(): item 0: every(): a worker (parallel_map, spawn) has no loop to fire timers; set them in the program itself
+end

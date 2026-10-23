@@ -99,6 +99,32 @@ bool parse_number(const std::string& s, size_t& i, float& out) {
   return true;
 }
 
+// An angle as radians: `45deg`, `0.5turn`, `1.2rad`, `100grad`, or a bare 0.
+bool parse_angle(const std::string& s, float& out) {
+  size_t i = 0;
+  float n = 0;
+  while (i < s.size() && s[i] == ' ') ++i;
+  if (!parse_number(s, i, n)) return false;
+  std::string unit = s.substr(i);
+  while (!unit.empty() && unit.back() == ' ') unit.pop_back();
+  const float pi = 3.14159265358979f;
+  if (unit == "deg") out = n * pi / 180.0f;
+  else if (unit == "rad") out = n;
+  else if (unit == "grad") out = n * pi / 200.0f;
+  else if (unit == "turn") out = n * 2.0f * pi;
+  else if (unit.empty() && n == 0) out = 0;
+  else return false;
+  return true;
+}
+
+// A scale: a number, or a percentage of one.
+float scale_factor(const std::string& s) {
+  size_t i = 0;
+  float n = 1;
+  if (!parse_number(s, i, n)) return 1.0f;
+  return i < s.size() && s[i] == '%' ? n / 100.0f : n;
+}
+
 int round_to_int(float v) { return (int)(v < 0 ? v - 0.5f : v + 0.5f); }
 
 struct NamedColour {
@@ -1382,6 +1408,8 @@ bool matches(const Node& el, const Selector& sel) {
 
 }  // namespace
 
+bool css_colour(const std::string& value, uint32_t& out) { return parse_colour(value, out); }
+
 // One attribute term against an element. The value comparisons are the CSS
 // ones: `~=` is a word in a space-separated list (how `class` is written),
 // `|=` is the value or the value followed by a hyphen (how `lang` is written).
@@ -2025,12 +2053,22 @@ dd { margin: 0 0 8px 26px; }
 figure { margin: 14px 0 14px 0; }
 figcaption { font-size: 13px; margin: 4px 0 0 0; }
 mark { background: $MARKBG$; color: $MARKINK$; }
-button, input, select, textarea { display: inline-block; border: 1px solid $CTLEDGE$; padding: 3px 7px 3px 7px;
-      background: $FIELDBG$; color: $FIELDINK$; }
+button, input, select, textarea { display: inline-block; border: 1px solid $CTLEDGE$; padding: 1px 2px 1px 2px;
+      background: $FIELDBG$; color: $FIELDINK$; border-radius: 2px; text-align: left; }
+select { padding: 1px 4px 1px 4px; border-radius: 3px; }
 /* A button is not a field. Every browser paints the two differently -- a field
    is the page's paper, a button is raised off it -- and lumping them together
    made a submit button look like an empty text box. */
-button, input[type=submit], input[type=button], input[type=reset] { background: $BTNFACE$; padding: 1px 6px 1px 6px; }
+button, input[type=submit], input[type=button], input[type=reset] { background: $BTNFACE$; padding: 1px 6px 1px 6px;
+      border-radius: 3px; text-align: center; }
+/* Under the pointer a button darkens a step, as Chrome's do. */
+button:hover, input[type=submit]:hover, input[type=button]:hover, input[type=reset]:hover { background: $BTNHOVER$; }
+/* A disabled control is there but out of reach: Chrome mutes its paper, edge and ink. */
+input:disabled, textarea:disabled, select:disabled, button:disabled { background: $DISBG$; color: $DISINK$;
+      border-color: $DISEDGE$; }
+/* A checkbox or radio is a 13px mark the engine draws (Chrome's size and margins), not a framed field. */
+input[type=checkbox], input[type=radio] { border: 0; padding: 0; background: transparent; margin: 3px 3px 3px 4px; }
+input[type=radio] { margin: 3px 3px 0 5px; }
 /* A hidden input is NOT a control with `display: inline-block` from the rule
    above: it is not rendered at all. Without this every one of them was a box
    on the page, sized to its VALUE -- google.com carries six, and the 44
@@ -2060,6 +2098,10 @@ nav a { text-decoration: none; }
       {"$FIELDINK$", "#dcdcdc", "#000000"},
       {"$CTLEDGE$",  "#3d3d3d", "#767676"},
       {"$BTNFACE$",  "#2f2f2f", "#efefef"},
+      {"$BTNHOVER$", "#3a3a3a", "#e5e5e5"},
+      {"$DISBG$",    "#262626", "#fafafa"},
+      {"$DISINK$",   "#8a8a8a", "#6d6d6d"},
+      {"$DISEDGE$",  "#333333", "#d6d6d6"},
   };
   auto fill = [](bool light) {
     std::string out = kDefault;
@@ -2163,6 +2205,7 @@ void inherit(Style& s, const Style& parent) {
   s.list_bullet = parent.list_bullet;
   s.letter_spacing = parent.letter_spacing;
   s.text_case = parent.text_case;
+  s.accent = parent.accent;
   // Custom properties inherit, and share the parent's list until an element
   // declares one of its own.
   s.custom = parent.custom;
@@ -2217,9 +2260,11 @@ void apply_declaration(Style& s, const Declaration& d, const Style& parent, int 
                          p == "font-weight" || p == "font-style" || p == "line-height" ||
                          p == "letter-spacing" || p == "text-align" || p == "text-transform" ||
                          p == "white-space" || p == "list-style" || p == "list-style-type" ||
-                         p == "cursor" || p == "visibility");
+                         p == "cursor" || p == "visibility" || p == "accent-color");
     const Style& src = (lv == "inherit" || (lv == "unset" && is_inherited)) ? parent : def;
     if (p == "color") { s.color = src.color; return; }
+    if (p == "accent-color") { s.accent = src.accent; return; }
+    if (p == "appearance" || p == "-webkit-appearance") { s.appearance_none = src.appearance_none; return; }
     if (p == "font-size") { s.font_px = src.font_px; return; }
     if (p == "font-weight") { s.bold = src.bold; return; }
     if (p == "font-style") { s.italic = src.italic; return; }
@@ -2488,6 +2533,17 @@ void apply_declaration(Style& s, const Declaration& d, const Style& parent, int 
     if (lv == "hidden" || lv == "collapse") s.hidden = true;
     return;
   }
+  if (p == "appearance" || p == "-webkit-appearance" || p == "-moz-appearance") {
+    s.appearance_none = lv == "none";
+    return;
+  }
+  if (p == "accent-color") {
+    uint32_t c = 0;
+    if (lv == "auto") s.accent = 0;
+    else if (lv == "currentcolor") s.accent = s.color;
+    else if (parse_colour(v, c) && (c >> 24)) s.accent = c;
+    return;
+  }
   if (p == "color") {
     uint32_t c = 0;
     if (lv == "currentcolor") s.color = parent.color;
@@ -2657,6 +2713,8 @@ void apply_declaration(Style& s, const Declaration& d, const Style& parent, int 
     return;
   }
   if (p == "line-height") {
+    // `normal`: the face's own height, and nothing inherited -- 0 says so.
+    if (lv == "normal") { s.line_height = 0; s.line_height_factor = 0.0f; return; }
     size_t k = 0;
     float n = 0;
     if (parse_number(lv, k, n) && trimmed(lv.substr(k)).empty()) {
@@ -2803,9 +2861,133 @@ void apply_declaration(Style& s, const Declaration& d, const Style& parent, int 
     s.content = out;
     return;
   }
+  if (p == "rotate") {
+    float a = 0;
+    s.rotate_rad = parse_angle(lowered(trimmed(v)), a) ? a : 0.0f;
+    return;
+  }
+  if (p == "scale") {
+    const auto parts = split_parts(lowered(trimmed(v)));
+    s.scale_x = s.scale_y = 1.0f;
+    if (!parts.empty() && parts[0] != "none") {
+      s.scale_x = s.scale_y = scale_factor(parts[0]);
+      if (parts.size() > 1) s.scale_y = scale_factor(parts[1]);
+    }
+    return;
+  }
+  if (p == "transform-origin") {
+    // Up to two of: a length, a percentage, left/center/right, top/center/bottom. One vertical keyword alone is y.
+    const auto parts = split_parts(lowered(trimmed(v)));
+    Length half; half.unit = Length::Unit::Percent; half.value = 50;
+    s.origin_x = s.origin_y = half;
+    auto keyword = [](const std::string& t, Length& out, bool& vertical) {
+      vertical = t == "top" || t == "bottom";
+      if (t == "left" || t == "top") { out.unit = Length::Unit::Percent; out.value = 0; return true; }
+      if (t == "center") { out.unit = Length::Unit::Percent; out.value = 50; return true; }
+      if (t == "right" || t == "bottom") { out.unit = Length::Unit::Percent; out.value = 100; return true; }
+      return false;
+    };
+    bool first_vertical = false;
+    for (size_t k = 0; k < parts.size() && k < 2; ++k) {
+      Length l;
+      bool vertical = false;
+      if (!keyword(parts[k], l, vertical)) l = parse_length(parts[k], s.font_px > 0 ? s.font_px : em, root_px);
+      if (k == 0) {
+        first_vertical = vertical;
+        if (vertical) s.origin_y = l; else s.origin_x = l;
+      } else {
+        if (first_vertical) s.origin_x = l; else s.origin_y = l;
+      }
+    }
+    return;
+  }
   if (p == "transform" || p == "translate") {
     const std::string lv2 = lowered(trimmed(v));
-    if (lv2 == "none" || lv2.empty()) { s.has_translate = false; return; }
+    if (lv2 == "none" || lv2.empty()) {
+      s.has_translate = false;
+      if (p == "transform") s.transform_fns.clear();
+      return;
+    }
+    if (p == "transform") {
+      // The whole list, in order. If it is translations only it is left to the path below.
+      std::vector<Style::TransformFn> fns;
+      bool beyond_translate = false;
+      size_t i = 0;
+      while (i < lv2.size()) {
+        const size_t open = lv2.find('(', i);
+        if (open == std::string::npos) break;
+        const size_t close = lv2.find(')', open);
+        if (close == std::string::npos) break;
+        const std::string name = trimmed(lv2.substr(i, open - i));
+        std::vector<std::string> args;
+        {
+          std::string a = lv2.substr(open + 1, close - open - 1);
+          for (auto& ch : a) if (ch == ',') ch = ' ';
+          args = split_parts(a);
+        }
+        i = close + 1;
+        Style::TransformFn f;
+        auto num = [&](size_t k, float dflt) {
+          if (k >= args.size()) return dflt;
+          size_t at = 0;
+          float n = dflt;
+          return parse_number(args[k], at, n) ? n : dflt;
+        };
+        auto ang = [&](size_t k) {
+          float a = 0;
+          return k < args.size() && parse_angle(args[k], a) ? a : 0.0f;
+        };
+        const int fpx = s.font_px > 0 ? s.font_px : em;
+        if (name == "translate" || name == "translatex" || name == "translatey" || name == "translate3d") {
+          f.kind = Style::TransformFn::Kind::Translate;
+          if (name == "translatey") f.ty = args.empty() ? Length{} : parse_length(args[0], fpx, root_px);
+          else {
+            if (!args.empty()) f.tx = parse_length(args[0], fpx, root_px);
+            if (name != "translatex" && args.size() > 1) f.ty = parse_length(args[1], fpx, root_px);
+          }
+        } else if (name == "scale" || name == "scalex" || name == "scaley" || name == "scale3d") {
+          f.kind = Style::TransformFn::Kind::Scale;
+          const float a = args.empty() ? 1.0f : scale_factor(args[0]);
+          const float b = args.size() > 1 ? scale_factor(args[1]) : a;
+          f.v[0] = name == "scaley" ? 1.0f : a;
+          f.v[1] = name == "scalex" ? 1.0f : name == "scaley" ? a : b;
+          beyond_translate = true;
+        } else if (name == "rotate" || name == "rotatez") {
+          f.kind = Style::TransformFn::Kind::Rotate;
+          f.v[0] = ang(0);
+          beyond_translate = true;
+        } else if (name == "rotatex" || name == "rotatey") {
+          // A turn about an axis in the page, with no perspective: what is left on screen is a squash.
+          f.kind = Style::TransformFn::Kind::Scale;
+          const float c = std::cos(ang(0));
+          f.v[0] = name == "rotatey" ? c : 1.0f;
+          f.v[1] = name == "rotatex" ? c : 1.0f;
+          beyond_translate = true;
+        } else if (name == "skew" || name == "skewx" || name == "skewy") {
+          f.kind = Style::TransformFn::Kind::Skew;
+          f.v[0] = name == "skewy" ? 0.0f : ang(0);
+          f.v[1] = name == "skewy" ? ang(0) : name == "skew" ? ang(1) : 0.0f;
+          beyond_translate = true;
+        } else if (name == "matrix" && args.size() == 6) {
+          f.kind = Style::TransformFn::Kind::Matrix;
+          for (int k = 0; k < 6; ++k) f.v[k] = num((size_t)k, 0);
+          beyond_translate = true;
+        } else if (name == "matrix3d" && args.size() == 16) {
+          f.kind = Style::TransformFn::Kind::Matrix;   // the part of it that lands on the page plane
+          f.v[0] = num(0, 1); f.v[1] = num(1, 0); f.v[2] = num(4, 0); f.v[3] = num(5, 1); f.v[4] = num(12, 0); f.v[5] = num(13, 0);
+          beyond_translate = true;
+        } else {
+          continue;   // perspective(), rotate3d(), ...: nothing a flat page shows
+        }
+        fns.push_back(f);
+      }
+      if (beyond_translate) {
+        s.transform_fns = std::move(fns);
+        s.has_translate = false;
+        return;
+      }
+      s.transform_fns.clear();
+    }
     // `translate(x[, y])`, `translateX(x)`, `translateY(y)`, and the standalone
     // `translate: x y` property. Anything else in the list is left alone.
     auto take = [&](const std::string& fn, int which) {

@@ -194,9 +194,13 @@ int repl(const Options& opt) {
 int serve_program(const std::string& name, std::function<bool(std::string&, std::string&, std::string&)> load,
                   std::function<void(g::Vm&)> setup, const std::vector<std::string>& opts) {
   grain_cli::ServeOptions so;
+  if (const char* env_host = std::getenv("GRAIN_HOST")) so.host = env_host;
+  if (const char* env_port = std::getenv("GRAIN_PORT")) so.port = std::atoi(env_port);
   for (size_t k = 0; k < opts.size(); ++k) {
     if (opts[k] == "--port" && k + 1 < opts.size()) so.port = std::atoi(opts[++k].c_str());
     else if (opts[k] == "--host" && k + 1 < opts.size()) so.host = opts[++k];
+    else if (opts[k] == "--all" || opts[k] == "--all-ips") so.host = "0.0.0.0";
+    else if (opts[k] == "--localhost" || opts[k] == "--local") so.host = "127.0.0.1";
     else if (opts[k] == "--hide-errors") so.show_errors = false;
     else if (!opts[k].empty() && std::isdigit((unsigned char)opts[k][0])) so.port = std::atoi(opts[k].c_str());
     else { std::cerr << "grain: unknown serve option " << opts[k] << "\n"; return kExitUsage; }

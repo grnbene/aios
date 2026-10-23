@@ -1,8 +1,8 @@
 # page scroll.html  viewport=420
 # title A pane that scrolls
 # content 420x411  background=ff111111  links=0
-rect       0     0   420   138  #ff1a1a1a  r=8  clip=1,1,418x136
-border     0     0   420   138  #ff555555  r=8  clip=1,1,418x136
+rect       0     0   420   138  #ff1a1a1a  r=8
+border     0     0   420   138  #ff555555  r=8
 text       9    21    64    21  #ffdddddd  15px              "line one"  clip=1,1,418x136
 text       9    54    64    21  #ffdddddd  15px              "line two"  clip=1,1,418x136
 text       9    87    80    21  #ffdddddd  15px              "line three"  clip=1,1,418x136
@@ -12,8 +12,8 @@ text       9   186    64    21  #ffdddddd  15px              "line six"  clip=1,
 text       9   219    80    21  #ffdddddd  15px              "line seven"  clip=1,1,418x136
 text       0   150   384    21  #ff00aa66  15px              "Below the frame. It must not move when the frame"
 text       0   171    40    21  #ff00aa66  15px              "does."
-rect       0   204   420   138  #ff1a1a1a  r=8  clip=1,205,418x136
-border     0   204   420   138  #ff555555  r=8  clip=1,205,418x136
+rect       0   204   420   138  #ff1a1a1a  r=8
+border     0   204   420   138  #ff555555  r=8
 text       9   225   128    21  #ffdddddd  15px              "hidden, not auto"  clip=1,205,418x136
 text       9   258   232    21  #ffdddddd  15px              "so this box is NOT a scroller"  clip=1,205,418x136
 text       9   291    40    21  #ffdddddd  15px              "three"  clip=1,205,418x136
