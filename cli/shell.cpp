@@ -72,8 +72,6 @@ std::string iso_date(uint64_t wall_ns) {
 bool has_flag(const std::vector<std::string>& a, char f) { for (auto& t : a) if (t.size() >= 2 && t[0] == '-' && t[1] != '-') for (char c : t.substr(1)) if (c == f) return true; return false; }
 std::vector<std::string> operands(const std::vector<std::string>& a) { std::vector<std::string> o; for (size_t i = 1; i < a.size(); ++i) if (a[i].empty() || a[i][0] != '-') o.push_back(a[i]); return o; }
 
-std::string printable(ByteSpan b, size_t max) { std::string s; for (size_t i = 0; i < b.size() && i < max; ++i) { char ch = (char)b[i]; s.push_back((ch >= 32 && ch < 127) || ch == '\n' || ch == '\t' ? ch : '.'); } return s; }
-
 }  // namespace
 
 void shell_help(Out& o) {

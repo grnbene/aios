@@ -767,7 +767,7 @@ std::vector<std::string> take_diff_options(Ctx& c, const std::vector<std::string
     } else if (a == "--color-moved" || a.rfind("--color-moved=", 0) == 0) {
       if (a == "--color-moved") {
         int d = 0;
-        if (auto v = c.config.get("diff.colormoved")) d = std::max(0, parse_color_moved(*v));
+        if (auto cfg = c.config.get("diff.colormoved")) d = std::max(0, parse_color_moved(*cfg));
         o.color_moved = d ? d : 3;
       } else {
         o.color_moved = parse_color_moved(a.substr(14));

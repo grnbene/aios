@@ -21,7 +21,6 @@ using aios::userland::GitMergeConflict;
 
 namespace {
 
-std::string str_of(const ByteBuffer& b) { return std::string((const char*)b.data(), b.size()); }
 ByteSpan span(const std::string& s) { return ByteSpan((const uint8_t*)s.data(), s.size()); }
 
 const char* kAlphabet = "zyxwvutsrqponmlk";   // jj's: hex digit d is written as kAlphabet[d]

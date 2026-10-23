@@ -618,7 +618,7 @@ int util_sed(Shell&, State& st, const std::vector<std::string>& argv, const Io& 
         // a file written with CRLF keeps its line endings: the \r is held back from the script and put back
         bool crlf = d.find("\r\n") != std::string::npos;
         Script copy = sc;
-        Run r{copy, io, st, quiet};
+        Run r{copy, io, st, quiet, {}, {}};
         Input in(st, io, {}, sep, status, nullptr);
         for (size_t a = 0; a < d.size();) {
           size_t b = d.find(sep, a);
@@ -639,7 +639,7 @@ int util_sed(Shell&, State& st, const std::vector<std::string>& argv, const Io& 
     }
     // Without -i the output goes out as the input comes in; -s runs the script afresh on each file.
     auto run_one = [&](std::vector<std::string> names) {
-      Run r{sc, io, st, quiet};
+      Run r{sc, io, st, quiet, {}, {}};
       r.stream = true;
       Input in(st, io, std::move(names), sep, status, [&r] { r.flush(); });
       r.process(in);

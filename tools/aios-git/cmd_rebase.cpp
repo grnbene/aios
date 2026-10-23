@@ -1216,7 +1216,6 @@ std::string fork_point(Ctx& c, const std::string& upstream_name, const std::stri
 // ---------------------------------------------------------------------------
 // starting
 // ---------------------------------------------------------------------------
-std::string short_oid_name(Ctx& c, const std::string& oid) { return oid.size() == 40 ? c.abbrev(oid) : oid; }
 
 void print_edit_advice(Ctx& c) {
   c.err << "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'.\n"

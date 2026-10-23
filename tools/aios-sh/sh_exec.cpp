@@ -1211,7 +1211,6 @@ struct Opened {
   }
 };
 
-int depth_condition = 0;   // per thread below
 thread_local int t_condition = 0;   // > 0 while running an if/while condition or the left of && / ||: no errexit
 
 bool apply_redirects(Shell& sh, State& st, const std::vector<Redirect>& rs, Io& io, Opened& opened, const Io& outer) {
@@ -1413,8 +1412,12 @@ class CondEval {
       if (op == ">") return value(a) > value(b);
       if (op == "-eq" || op == "-ne" || op == "-lt" || op == "-le" || op == "-gt" || op == "-ge") {
         long long x = sh_.arith(st_, value(a), io_), y = sh_.arith(st_, value(b), io_);
-        if (op == "-eq") return x == y; if (op == "-ne") return x != y; if (op == "-lt") return x < y;
-        if (op == "-le") return x <= y; if (op == "-gt") return x > y; return x >= y;
+        if (op == "-eq") return x == y;
+        if (op == "-ne") return x != y;
+        if (op == "-lt") return x < y;
+        if (op == "-le") return x <= y;
+        if (op == "-gt") return x > y;
+        return x >= y;
       }
       return test({"test", value(a), op, value(b)}) == 0;   // -nt -ot -ef
     }
@@ -1951,7 +1954,7 @@ int run_builtin(Shell& sh, State& st, const std::vector<std::string>& argv, cons
         st.assoc.erase(name);
       }
       if (is_assoc && !st.assoc.count(name)) { st.assoc[name]; st.arrays.erase(name); }
-      if (is_array && !st.arrays.count(name)) { auto& a = st.arrays[name]; if (st.vars.count(name) && !st.vars[name].value.empty()) a[0] = st.vars[name].value; }
+      if (is_array && !st.arrays.count(name)) { auto& arr = st.arrays[name]; if (st.vars.count(name) && !st.vars[name].value.empty()) arr[0] = st.vars[name].value; }
       if (eq != std::string::npos) assign(sh, st, append ? name + "+" : name, a.substr(eq + 1), io);
       else if (!st.vars.count(name)) st.set(name, "");
       if (exported) st.vars[name].exported = true;
@@ -2069,7 +2072,7 @@ int run_builtin(Shell& sh, State& st, const std::vector<std::string>& argv, cons
       // fields: IFS whitespace runs are one separator; other IFS characters each end a field
       std::vector<std::string> fields;
       size_t pos = 0;
-      auto ws = [&](char ch) { return ifs.find(ch) != std::string::npos && std::isspace(static_cast<unsigned char>(ch)); };
+      auto ws = [&](char byte) { return ifs.find(byte) != std::string::npos && std::isspace(static_cast<unsigned char>(byte)); };
       while (pos < line.size() && ws(line[pos])) ++pos;
       while (pos < line.size()) {
         size_t e = pos;

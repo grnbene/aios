@@ -155,9 +155,11 @@ fn loose_empty_string(v) {
 }
 
 // MariaDB compares the ERP's codes without case or trailing spaces
+// (PAD SPACE ignores trailing spaces only: 'VTG-VT11366' and 'VTG-VT11366' + CR are two items to it, and locstock
+// holds both)
 fn ck(s) {
   if s == nil { return "" }
-  return upper(rtrim(str(s)))
+  return upper(rtrim(str(s), " "))
 }
 
 // ---- connections ------------------------------------------------------------------------------

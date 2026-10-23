@@ -252,12 +252,6 @@ std::vector<FilePatch> parse_patch(Ctx& c, const std::string& text, int strip, b
   return out;
 }
 
-// Re-parse a hunk's no-newline markers precisely from the raw text (they can sit mid-hunk).
-void fix_markers(const std::string& text, std::vector<FilePatch>& patches) {
-  (void)text;
-  (void)patches;
-}
-
 std::vector<std::string> split_keep(const std::string& s, bool& last_no_eol) {
   std::vector<std::string> out;
   size_t i = 0;
@@ -554,7 +548,6 @@ int cmd_apply(Ctx& c) {
         const auto& fp = patches[i];
         if (stats[i].binary) c.out << "-\t-\t";
         else c.out << stats[i].add << "\t" << stats[i].del << "\t";
-        const std::string& old_name = fp.old_path.empty() ? fp.new_path : fp.old_path;
         const std::string& new_name = fp.new_path.empty() ? fp.old_path : fp.new_path;
         if (p.has("z")) c.out << new_name << '\0';
         else c.out << stats[i].name << "\n";
@@ -1277,14 +1270,6 @@ struct Matcher {
     return it != s.end();
   }
 };
-std::string escape_fixed(const std::string& in) {
-  std::string out;
-  for (char ch : in) {
-    if (std::strchr(".^$|()[]{}*+?\\", ch)) out += '\\';
-    out += ch;
-  }
-  return out;
-}
 }  // namespace
 
 int cmd_grep(Ctx& c) {
@@ -1352,7 +1337,6 @@ int cmd_grep(Ctx& c) {
   Pathspec ps = no_index ? Pathspec{} : make_pathspec(c, paths);
   long max_count = p.has("max-count") ? std::atol(p.get("max-count").c_str()) : -1;
   bool any = false;
-  char sep = p.has("null") ? '\0' : ':';
   // grep.c's colors (color.grep.<slot> over git's), used when colors are on: --color, color.grep, color.ui
   struct GrepColors { std::string filename, lineno, sep, match, selected; } gc;
   if (c.color) {
@@ -1374,10 +1358,6 @@ int cmd_grep(Ctx& c) {
     o += col;
     o.append(text);
     o += kColorReset;
-  };
-  auto put_sep = [&](std::string& o) {
-    if (sep == '\0') o += '\0';
-    else paint(o, gc.sep, std::string_view(&sep, 1));
   };
   // grep_next_match: the earliest match of any pattern from `from`, the longest of those starting there
   auto next_match = [&](const std::string& line, size_t from, size_t& b, size_t& e) {
@@ -1412,7 +1392,6 @@ int cmd_grep(Ctx& c) {
              o_break = p.has("break"), o_column = p.has("column");
   // A file's first shown line gets a marker: '\x01' for --break's blank line, '\x02' for "--", written only when an
   // earlier file showed lines (git's show_hunk_mark); the files are searched apart, the marks settled as they are joined.
-  const bool hunk_marks = pre_ctx || post_ctx || o_break || o_funcbody;
   auto search_into = [&](const std::string& shown, const std::string& text, std::string& o) -> bool {
     // grep_source_1: a binary file is searched line by line like any other (counted with -c, named with -l and -L);
     // only a line it would print becomes "Binary file ... matches", and the file ends there. -I skips it outright.
