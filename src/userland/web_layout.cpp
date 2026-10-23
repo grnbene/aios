@@ -571,12 +571,12 @@ struct Engine {
       o.e = p.a * q.e + p.c * q.f + p.e; o.f = p.b * q.e + p.d * q.f + p.f;
       return o;
     };
-    M m;
+    M xf;
     if (cs.rotate_rad != 0.0f) {
       M r; r.a = std::cos(cs.rotate_rad); r.b = std::sin(cs.rotate_rad); r.c = -r.b; r.d = r.a;
-      m = mul(m, r);
+      xf = mul(xf, r);
     }
-    if (cs.scale_x != 1.0f || cs.scale_y != 1.0f) { M sc; sc.a = cs.scale_x; sc.d = cs.scale_y; m = mul(m, sc); }
+    if (cs.scale_x != 1.0f || cs.scale_y != 1.0f) { M sc; sc.a = cs.scale_x; sc.d = cs.scale_y; xf = mul(xf, sc); }
     for (const auto& fn : cs.transform_fns) {
       M t;
       switch (fn.kind) {
@@ -593,13 +593,13 @@ struct Engine {
           t.a = fn.v[0]; t.b = fn.v[1]; t.c = fn.v[2]; t.d = fn.v[3]; t.e = fn.v[4]; t.f = fn.v[5];
           break;
       }
-      m = mul(m, t);
+      xf = mul(xf, t);
     }
-    if (m.a == 1 && m.b == 0 && m.c == 0 && m.d == 1 && m.e == 0 && m.f == 0) return;   // rotate(0), scale(1)
+    if (xf.a == 1 && xf.b == 0 && xf.c == 0 && xf.d == 1 && xf.e == 0 && xf.f == 0) return;   // rotate(0), scale(1)
     Document::TransformGroup g;
     g.ox = (float)bx + (float)(cs.origin_x.is_auto() ? bw / 2 : len_px(cs.origin_x, bw, bw / 2));
     g.oy = (float)by + (float)(cs.origin_y.is_auto() ? bh / 2 : len_px(cs.origin_y, bh, bh / 2));
-    g.a = m.a; g.b = m.b; g.c = m.c; g.d = m.d; g.e = m.e; g.f = m.f;
+    g.a = xf.a; g.b = xf.b; g.c = xf.c; g.d = xf.d; g.e = xf.e; g.f = xf.f;
     g.frag_from = frag_from;
     g.frag_to = doc.fragments.size();
     g.link_from = link_from;

@@ -1721,7 +1721,7 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
     ++xf_depth;
     for (int pass = 0; pass < 2; ++pass) {
       std::vector<uint32_t>& scratch = pass == 0 ? black : white;
-      for (size_t k = 0; k < n_xf; ++k) if ((int)k != gi && in_group((int)k, gi)) xf_done[k] = 0;   // nested ones, again
+      for (size_t j = 0; j < n_xf; ++j) if ((int)j != gi && in_group((int)j, gi)) xf_done[j] = 0;   // nested ones, again
       find_at = 0;
       win.buffer.swap(scratch);
       paint_list(sub, gi);
@@ -1735,8 +1735,8 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
     if (std::fabs(det) < 1e-6f) return;   // scaled to nothing: nothing to draw
     const float ia = g.d / det, ib = -g.b / det, ic = -g.c / det, id = g.a / det;
     float dx0 = 1e30f, dy0 = 1e30f, dx1 = -1e30f, dy1 = -1e30f;
-    for (int k = 0; k < 4; ++k) {
-      const float px = (float)((k & 1) ? x1 : x0) - ox, py = (float)((k & 2) ? y1 : y0) - oy;
+    for (int corner = 0; corner < 4; ++corner) {
+      const float px = (float)((corner & 1) ? x1 : x0) - ox, py = (float)((corner & 2) ? y1 : y0) - oy;
       const float qx = ox + g.a * px + g.c * py + g.e, qy = oy + g.b * px + g.d * py + g.f;
       dx0 = std::min(dx0, qx); dy0 = std::min(dy0, qy); dx1 = std::max(dx1, qx); dy1 = std::max(dy1, qy);
     }

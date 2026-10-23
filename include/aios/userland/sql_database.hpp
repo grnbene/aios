@@ -162,7 +162,7 @@ struct SqlColumn {
   // its text behind kDefaultExprMark and worked out for each row inserted -
   // evaluated once at CREATE TABLE it froze at the moment the table was loaded,
   // and every row written since got that old time.
-  std::string default_value;
+  std::string default_value{};
   // A column of a materialised result (derived table, view) whose expression
   // is a string whatever its values look like: its cells compare as text, not
   // as the numbers they spell.
@@ -171,13 +171,13 @@ struct SqlColumn {
   // ("varchar(20)", "char(3)", "mediumtext", "bigint(20)", "timestamp").
   // Empty: derived from type/precision/scale/temporal/binary as before (a
   // column created by an older build, an expression column, ENUM/SET).
-  std::string declared;
+  std::string declared{};
   // GENERATED ALWAYS AS (expr): the expression's text, "" for a plain column.
   // VIRTUAL or STORED: both are held in the row here, worked out at every
   // write, so a read is a plain read either way.
-  std::string generated;
+  std::string generated{};
   bool generated_virtual = false;
-  std::string comment;   // COMMENT 'text' as declared
+  std::string comment{};   // COMMENT 'text' as declared
 };
 
 // MariaDB's `Extra` for a column in SHOW COLUMNS / DESCRIBE / information_schema.
