@@ -19109,6 +19109,20 @@ void SqlTable::append_row(const std::vector<std::string>& in_vals) {
   append_row_canonical_impl(this, tls_vals);
 }
 
+// Runs fn(0..n-1) with the indices handed out to as many threads as there are cores (this one included).
+// The caller guarantees the calls touch nothing in common.
+static void for_each_parallel(size_t n, const std::function<void(size_t)>& fn) {
+  std::atomic<size_t> next{0};
+  auto work = [&]() {
+    for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
+  };
+  const size_t helpers = std::min<size_t>(n, std::max(1u, aios::hal::hardware_threads())) - (n ? 1 : 0);
+  std::vector<aios::hal::Thread> pool;
+  for (size_t i = 0; i < helpers; ++i) pool.emplace_back(work);
+  work();   // this thread is a lane too
+  for (auto& t : pool) if (t.joinable()) t.join();
+}
+
 // A load's rows, column by column. Each column's store is its own (its dictionary, codes and segments), so the
 // columns of a batch can be filled at once; what is per table - the mutation counters, the layout - is settled
 // here, on one thread, around them. Anything that watches rows as they arrive (a transaction's undo log, a live
@@ -19126,28 +19140,18 @@ void SqlTable::append_rows_bulk(std::vector<std::vector<std::string>>& rows) {
   }
   mutation_seq = sql_next_mutation_seq();
   const size_t ncols = col_data.size();
-  std::atomic<size_t> next{0};
   std::atomic<bool> recoded{false};
-  auto work = [&]() {
-    for (;;) {
-      const size_t c = next.fetch_add(1);
-      if (c >= ncols) return;
-      ColumnStore& cs = col_data[c];
-      const uint32_t before = cs.recodes;
-      const bool normalise = c < columns.size() && columns[c].type != SqlDataType::Text;
-      for (const auto& r : rows) {
-        if (c >= r.size()) cs.push_back(sql_null());
-        else if (normalise) cs.push_back(sql_normalize_value(columns[c].type, columns[c].scale, r[c]));
-        else cs.push_back(r[c]);
-      }
-      if (cs.recodes != before) recoded.store(true);
+  for_each_parallel(ncols, [&](size_t c) {
+    ColumnStore& cs = col_data[c];
+    const uint32_t before = cs.recodes;
+    const bool normalise = c < columns.size() && columns[c].type != SqlDataType::Text;
+    for (const auto& r : rows) {
+      if (c >= r.size()) cs.push_back(sql_null());
+      else if (normalise) cs.push_back(sql_normalize_value(columns[c].type, columns[c].scale, r[c]));
+      else cs.push_back(r[c]);
     }
-  };
-  const size_t helpers = std::min<size_t>(ncols, std::max(1u, aios::hal::hardware_threads())) - 1;
-  std::vector<aios::hal::Thread> pool;
-  for (size_t i = 0; i < helpers; ++i) pool.emplace_back(work);
-  work();   // this thread is a lane too
-  for (auto& t : pool) if (t.joinable()) t.join();
+    if (cs.recodes != before) recoded.store(true);
+  });
   if (recoded.load()) layout_seq = mutation_seq;
   rows.clear();
 }
@@ -19407,7 +19411,9 @@ void SqlTable::optimize_storage(bool cluster) {
   // contents (per-code caches, the saved file) must see a change.
   mutation_seq = sql_next_mutation_seq();
   layout_seq = mutation_seq;
-  for (size_t c = 0; c < columns.size() && c < col_data.size(); ++c) {
+  // Each column is encoded on its own (its dictionary, codes, segments), so a table of many columns uses the
+  // cores - unless a column shares its dictionary with another, which then must not be touched at once.
+  auto optimize_column = [&](size_t c) {
     col_data[c].optimize_encoding(columns[c].type, columns[c].scale, columns[c].temporal);
     if ((col_data[c].encoding == ColumnEncoding::DictBitPacked || col_data[c].encoding == ColumnEncoding::RLE) && !col_data[c].shared_dict && col_data[c].size() > 0) {
       if (col_data[c].encoding == ColumnEncoding::DictBitPacked) {
@@ -19420,7 +19426,12 @@ void SqlTable::optimize_storage(bool cluster) {
       }
       while (col_data[c].code_dictionary((size_t)16 << 20)) {}
     }
-  }
+  };
+  const size_t optimizable = std::min(columns.size(), col_data.size());
+  bool shares = false;
+  for (const auto& cs : col_data) if (cs.shared_dict) shares = true;
+  if (shares || optimizable < 2) for (size_t c = 0; c < optimizable; ++c) optimize_column(c);
+  else for_each_parallel(optimizable, optimize_column);
   col_data.shrink_to_fit();
   if (probe_mu) {
     std::lock_guard<aios::hal::Mutex> lk(*probe_mu);
