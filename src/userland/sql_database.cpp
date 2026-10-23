@@ -30437,6 +30437,14 @@ void vx_trace_line(const std::string& m);
 const char* vx_enc_name(ColumnEncoding e);
 
 Pred compile_pred(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, const EvalCtx& base) {
+  if (t.col_data.size() < t.columns.size()) {
+    // A table that has never held a row has no column storage yet: the typed paths below index it. There are
+    // no rows to test, so the ordinary evaluator - which never runs - is the answer.
+    Pred p;
+    p.kind = Pred::Row;
+    p.expr = e;
+    return p;
+  }
   const uint64_t t0 = vx_trace_enabled() ? (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() : 0;
   Pred p = compile_pred_impl(e, t, local, base);
   if (vx_trace_enabled() && p.kind != Pred::And && p.kind != Pred::Or && p.kind != Pred::Not) {
@@ -32441,6 +32449,12 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
   out->total = t.row_count();
   const bool have_extra = extra && !extra->empty();
   if (!where && !have_extra) { out->all = true; out->count = out->total; return true; }
+  if (t.col_data.size() < t.columns.size()) {   // never held a row (no column storage yet): nothing can match
+    out->total = 0;
+    out->count = 0;
+    out->m_lo = out->m_hi = 0;
+    return true;
+  }
 
   // Active Predicate Filter (Predicate Cell) Fast-Path: O(hits) unpacking from precomputed bitset
   if (db && db->active_data() && !have_extra && where) {
@@ -40859,7 +40873,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   {
     EvalCtx scope;
     scope.sources = &sources;
-    std::string unknown, clause;
+    std::string unknown, clause, ambiguous;
+    const char* amb_clause = "";
     std::function<void(const ExprPtr&, const char*)> walk = [&](const ExprPtr& e, const char* where) {
       if (!e || !unknown.empty()) return;
       if (e->op == ExprOp::Subquery || e->op == ExprOp::Exists) return;   // its own scope
@@ -40880,11 +40895,19 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (owned) { unknown = e->qualifier + "." + e->name; clause = where; return; }
         }
       }
+      // A bare name two joined tables both have: MariaDB refuses it. Some fast paths here read it from the table
+      // they are filtering and answered as if it had been qualified.
+      if (e->op == ExprOp::Column && e->qualifier.empty() && sources.size() > 1 && e->name != "*" && e->name.rfind("@@", 0) != 0 &&
+          !is_user_var_name(e->name) && ambiguous.empty()) {
+        size_t s = 0, c = 0;
+        if (lookup_column_here(scope, *e, &s, &c) == ColumnLookup::Ambiguous) { ambiguous = e->name; amb_clause = where; return; }
+      }
       for (const auto& a : e->args) walk(a, where);
     };
     for (const auto& j : branch.join_conditions) walk(j, "on clause");
     walk(branch.where, "where clause");
     if (!unknown.empty()) return make_error("Unknown column '" + unknown + "' in '" + clause + "'");
+    if (!ambiguous.empty()) return make_error("Column '" + ambiguous + "' in " + (std::string(amb_clause) == "where clause" ? "WHERE" : "ON") + " is ambiguous");
   }
 
   phases.mark("setup");
@@ -50231,6 +50254,16 @@ void SqlDatabase::probe_indices_after_erase(SqlTable& t, std::vector<size_t> era
           if (e->second.empty()) e = idx->by_text.erase(e); else ++e;
         }
         patch(idx->no_numeric_prefix);
+        // The lists by dictionary code are row ids too. Left as they were, a join probing this column after a
+        // DELETE paired each key with whichever rows had moved into the old places.
+        if (!idx->by_code.empty()) {
+          const ColumnStore* cs = idx->column >= 0 && (size_t)idx->column < t.col_data.size() ? &t.col_data[(size_t)idx->column] : nullptr;
+          if (!cs || (cs->encoding != ColumnEncoding::DictBitPacked && cs->encoding != ColumnEncoding::Constant)) {
+            it = t.probe_indices.erase(it);   // no longer coded: its codes mean nothing now; built again when asked
+            continue;
+          }
+          for (auto& ids : idx->by_code) patch(ids);
+        }
         idx->sorted_by_number.clear();
         idx->sorted_by_text.clear();
         idx->sorted_dict_vals.clear();
