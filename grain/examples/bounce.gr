@@ -1,0 +1,25 @@
+# Balls that bounce on their own; a click adds one where it lands. A pane drawn by hand (create_pane with
+# on_draw): a window draws it every frame, and a browser (grain serve bounce.gr) is sent each new picture.
+let balls = [{"x": 120, "y": 80, "dx": 3, "dy": 2, "r": 22, "c": "#5b9bff"}]
+let colors = ["#5b9bff", "#42c581", "#e2a03f", "#ef6b6b", "#b48cff"]
+let clicks = 0
+every(0.05, fn () {
+  for b in balls {
+    b.x = b.x + b.dx
+    b.y = b.y + b.dy
+    if b.x < b.r or b.x > 480 - b.r { b.dx = -b.dx }
+    if b.y < b.r or b.y > 320 - b.r { b.dy = -b.dy }
+  }
+})
+let pane = create_pane({"title": "Bounce", "width": 480, "height": 320,
+  "on_draw": fn (cv) {
+    canvas_clear(cv, "#0f1318")
+    for b in balls { canvas_fill_circle(cv, b.x, b.y, b.r, b.c) }
+    canvas_fill_text(cv, "click to add a ball  (" + str(len(balls)) + ")", 14, 22, "#9aa4b2")
+  },
+  "on_click": fn (p, e) {
+    clicks = clicks + 1
+    push(balls, {"x": e.x, "y": e.y, "dx": 2 + clicks % 3, "dy": -2 - clicks % 2, "r": 14 + (clicks * 7) % 16, "c": colors[clicks % len(colors)]})
+  }
+})
+run_panes()

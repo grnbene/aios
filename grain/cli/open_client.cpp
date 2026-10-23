@@ -116,6 +116,7 @@ fn send(action, fields) {
 
 let first = call_server("GET", "", url)
 if first == nil { error("grain open: " + notice) }
+if first.canvas == true { error("grain open: this program draws its own pixels; open it in a browser for now") }
 info = {"title": first.title, "width": first.width, "height": first.height}
 take(first)
 

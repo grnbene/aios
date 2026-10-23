@@ -156,9 +156,11 @@ errors in the page, and the program has everything the standalone grain has.
 a vhost ([docs/network.md](../docs/network.md)): files confined to the vhost's
 root, errors only in the log, gzip, TLS.
 
-Only `ui.pane` programs have a web form. A pane drawn by hand with `create_pane`
-and `on_draw` paints pixels, and the web side shows widgets, so it says so
-instead of guessing. The page script is a few dozen lines inline, with no
+A pane drawn by hand (`create_pane` with `on_draw`) goes to a browser as
+pictures: the server draws each frame, sends the ones that changed (as PNG, up to
+ten a second while someone watches), and the page's clicks, wheel and keys come
+back as the pane's own events (`examples/bounce.gr`). `grain open` shows widget
+panes only so far. The page script is a few dozen lines inline, with no
 library. The cookie is `HttpOnly` and `SameSite=Strict`, text from the program
 is escaped, and an event must carry `X-Grain-UI: 1`, which a page on another
 site cannot add, so a link elsewhere cannot press your buttons.

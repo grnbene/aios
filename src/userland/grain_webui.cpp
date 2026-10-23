@@ -11,6 +11,8 @@
 // consent, so a link elsewhere cannot click this program's buttons.
 #include "aios/userland/grain_webui.hpp"
 
+#include "aios/net/deflate.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -181,6 +183,104 @@ const char* kScript = R"JS(
 })();
 )JS";
 
+// ---- a pane drawn by hand (create_pane with on_draw): its frames as PNG, pushed as they change ----------
+
+uint32_t crc32_of(const uint8_t* p, size_t n, uint32_t crc = 0) {
+  static uint32_t table[256];
+  static bool made = false;
+  if (!made) {
+    for (uint32_t i = 0; i < 256; ++i) { uint32_t c = i; for (int k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; table[i] = c; }
+    made = true;
+  }
+  crc = ~crc;
+  for (size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
+
+// A frame as PNG: RGB, each row filtered by "up" (UI frames are mostly flat, so the rows repeat), deflated
+// with the tree's own encoder.
+std::string png_of(const std::vector<uint32_t>& argb, int w, int h) {
+  std::vector<uint8_t> raw;
+  raw.reserve((size_t)h * ((size_t)w * 3 + 1));
+  for (int y = 0; y < h; ++y) {
+    raw.push_back(2);   // Up
+    for (int x = 0; x < w; ++x) {
+      const uint32_t p = argb[(size_t)y * (size_t)w + (size_t)x];
+      const uint32_t q = y ? argb[(size_t)(y - 1) * (size_t)w + (size_t)x] : 0;
+      raw.push_back((uint8_t)(((p >> 16) & 0xFF) - ((q >> 16) & 0xFF)));
+      raw.push_back((uint8_t)(((p >> 8) & 0xFF) - ((q >> 8) & 0xFF)));
+      raw.push_back((uint8_t)((p & 0xFF) - (q & 0xFF)));
+    }
+  }
+  std::string out = "\x89PNG\r\n\x1a\n";
+  auto be32 = [](std::string& o, uint32_t v) { for (int i = 3; i >= 0; --i) o.push_back((char)(v >> (8 * i))); };
+  auto chunk = [&](const char* type, const std::string& data) {
+    be32(out, (uint32_t)data.size());
+    std::string td = std::string(type, 4) + data;
+    out += td;
+    be32(out, crc32_of(reinterpret_cast<const uint8_t*>(td.data()), td.size()));
+  };
+  std::string ihdr;
+  be32(ihdr, (uint32_t)w);
+  be32(ihdr, (uint32_t)h);
+  ihdr += std::string("\x08\x02\x00\x00\x00", 5);   // 8 bits, RGB, deflate, no interlace
+  chunk("IHDR", ihdr);
+  aios::ByteBuffer z{0x78, 0x01};
+  net::deflate_raw_append(aios::ByteSpan(raw.data(), raw.size()), 3, z);
+  uint32_t a1 = 1, a2 = 0;
+  for (uint8_t b : raw) { a1 = (a1 + b) % 65521; a2 = (a2 + a1) % 65521; }
+  const uint32_t adler = (a2 << 16) | a1;
+  for (int i = 3; i >= 0; --i) z.push_back((uint8_t)(adler >> (8 * i)));
+  chunk("IDAT", std::string(z.begin(), z.end()));
+  chunk("IEND", "");
+  return out;
+}
+
+std::string base64_of(const std::string& in) {
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string o;
+  o.reserve((in.size() + 2) / 3 * 4);
+  size_t i = 0;
+  for (; i + 2 < in.size(); i += 3) {
+    const uint32_t v = ((uint8_t)in[i] << 16) | ((uint8_t)in[i + 1] << 8) | (uint8_t)in[i + 2];
+    o += t[v >> 18]; o += t[(v >> 12) & 63]; o += t[(v >> 6) & 63]; o += t[v & 63];
+  }
+  if (i < in.size()) {
+    uint32_t v = (uint8_t)in[i] << 16;
+    if (i + 1 < in.size()) v |= (uint8_t)in[i + 1] << 8;
+    o += t[v >> 18]; o += t[(v >> 12) & 63];
+    o += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
+    o += '=';
+  }
+  return o;
+}
+
+// The page of a drawn pane: the frame as an image, mouse and keys sent back as the pane's own events.
+const char* kCanvasScript = R"JS(
+(function(){
+  var img=document.getElementById('cv'),seq=img.dataset.seq;
+  function apply(d){if(d.png){seq=String(d.seq);img.src='data:image/png;base64,'+d.png}}
+  function post(p){
+    fetch(location.pathname,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(p).toString(),credentials:'same-origin'})
+      .then(function(r){return r.json()}).then(function(d){if(String(d.seq)!==seq)apply(d)}).catch(function(){});
+  }
+  function pos(e){var r=img.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*img.naturalWidth/r.width),y:Math.round((e.clientY-r.top)*img.naturalHeight/r.height)}}
+  var names={0:'left',1:'middle',2:'right'};
+  img.addEventListener('mousedown',function(e){e.preventDefault();var p=pos(e);post({type:'mouse_down',x:p.x,y:p.y,button:names[e.button]||'left'})});
+  img.addEventListener('mouseup',function(e){var p=pos(e);post({type:'mouse_up',x:p.x,y:p.y,button:names[e.button]||'left'})});
+  img.addEventListener('contextmenu',function(e){e.preventDefault()});
+  img.addEventListener('wheel',function(e){e.preventDefault();post({type:'wheel',dx:String(-Math.sign(e.deltaX)),dy:String(-Math.sign(e.deltaY))})},{passive:false});
+  var keys={Enter:'return',Escape:'escape',Backspace:'backspace',Tab:'tab',' ':'space',ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down',Delete:'delete',Home:'home',End:'end',PageUp:'pageup',PageDown:'pagedown'};
+  document.addEventListener('keydown',function(e){
+    var k=keys[e.key]||(e.key.length===1?e.key.toLowerCase():null);if(!k)return;
+    if(keys[e.key]||e.ctrlKey||e.metaKey)e.preventDefault();
+    post({type:'key',key:k,shift:e.shiftKey?'1':'',ctrl:e.ctrlKey?'1':'',alt:e.altKey?'1':'',meta:e.metaKey?'1':''});
+    if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey)post({type:'text',text:e.key});
+  });
+  if(window.EventSource){var es=new EventSource(location.pathname);es.onmessage=function(m){try{var d=JSON.parse(m.data);if(String(d.seq)!==seq)apply(d)}catch(x){}}}
+})();
+)JS";
+
 }  // namespace
 
 struct WebUi::Session {
@@ -202,6 +302,13 @@ struct WebUi::Session {
   std::mutex push_mu;
   std::condition_variable push_cv;
   int streams = 0;               // open event streams: a session with a viewer is not idle
+
+  // A pane drawn by hand: its last frame, and which mouse buttons went down on it (for click).
+  bool canvas = false;
+  uint64_t pixels_hash = 0;
+  std::string png_b64;
+  Clock::time_point last_draw = Clock::now();
+  bool button_down[4] = {false, false, false, false};
 };
 
 WebUi::WebUi(Host host) : host_(std::move(host)) {}
@@ -238,6 +345,26 @@ void WebUi::reap_locked() {
 
 // Re-renders the widgets as data; when they differ from the last render the viewers have something new.
 bool WebUi::refresh_locked(Session& s) {
+  if (s.canvas) {
+    std::vector<uint32_t> px;
+    int w = 0, h = 0;
+    std::string err;
+    s.last_draw = Clock::now();
+    if (!pane_frame(*s.vm, s.pane, px, w, h, err) || w < 1 || h < 1) { if (!err.empty()) report(err); return false; }
+    uint64_t hsh = 1469598103934665603ULL ^ ((uint64_t)w << 32 | (uint32_t)h);
+    for (uint32_t p : px) hsh = (hsh ^ p) * 1099511628211ULL;
+    if (hsh == s.pixels_hash && !s.png_b64.empty()) return false;   // the same picture: nothing to send
+    s.pixels_hash = hsh;
+    s.info.width = w;
+    s.info.height = h;
+    s.png_b64 = base64_of(png_of(px, w, h));
+    {
+      std::lock_guard<std::mutex> lock(s.push_mu);
+      ++s.seq;
+    }
+    s.push_cv.notify_all();
+    return true;
+  }
   std::string tree, err;
   uint64_t v = 0;
   if (!web_pane_render_tree(*s.vm, s.pane, tree, v, err)) { report(err); return false; }
@@ -253,6 +380,11 @@ bool WebUi::refresh_locked(Session& s) {
 
 // The frame for one viewer: {"seq":N,"html":"..."} or {"seq":N,"tree":{...}}.
 void WebUi::frame_locked(Session& s, bool tree, std::string& out) {
+  if (s.canvas) {
+    out = "{\"seq\":" + std::to_string(s.seq) + ",\"canvas\":true,\"width\":" + std::to_string(s.info.width) + ",\"height\":" +
+          std::to_string(s.info.height) + ",\"png\":\"" + s.png_b64 + "\"}";
+    return;
+  }
   if (tree) { out = "{\"seq\":" + std::to_string(s.seq) + ",\"tree\":" + s.last_tree + "}"; return; }
   if (s.html_seq != s.seq || s.last_html.empty()) {
     std::string html, err;
@@ -276,13 +408,15 @@ void WebUi::start_ticker() {
       lock.unlock();
       for (auto& s : all) {
         const bool clocked = s->info.refresh > 0;   // a view that reads the clock: look again every `refresh` seconds
-        if (s->vm->timers.empty() && !clocked) continue;
+        const bool drawn = s->canvas && s->streams > 0;   // a drawn pane may move by itself: looked at 10 times a second while watched
+        if (s->vm->timers.empty() && !clocked && !drawn) continue;
         std::unique_lock<std::mutex> turn(s->mu, std::try_to_lock);
         if (!turn.owns_lock()) continue;   // an event is running; the next tick
         s->vm->steps = 0;
         std::string err;
         bool look = run_timers(*s->vm, err);
         if (clocked && Clock::now() - s->last_look >= std::chrono::seconds(s->info.refresh)) { look = true; s->last_look = Clock::now(); }
+        if (drawn && Clock::now() - s->last_draw >= std::chrono::milliseconds(100)) look = true;
         if (look) refresh_locked(*s);
         if (!err.empty()) report(err);
       }
@@ -311,8 +445,18 @@ std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
   auto run = s->vm->run(compiled.script);
   if (!run.ok) { error = "the program failed: " + run.error + " (line " + std::to_string(run.line) + ")"; return nullptr; }
   if (!web_pane_first(*s->vm, s->info)) {
-    error = "the program made no ui.pane, so there is nothing to show (a canvas pane made with create_pane is window-only)";
-    return nullptr;
+    // No widgets: a pane it draws itself (create_pane with on_draw). Its frames go to the page as pictures.
+    const auto panes = pane_list(*s->vm);
+    if (panes.empty()) { error = "the program made no pane, so there is nothing to show"; return nullptr; }
+    s->canvas = true;
+    s->info.id = panes[0].id;
+    s->info.title = panes[0].title;
+    s->info.width = panes[0].width;
+    s->info.height = panes[0].height;
+    s->pane = s->info.id;
+    s->vm->steps = 0;
+    if (!refresh_locked(*s) && s->png_b64.empty()) { error = "the pane's first frame could not be drawn"; return nullptr; }
+    return s;
   }
   s->pane = s->info.id;
   s->vm->steps = 0;
@@ -428,6 +572,43 @@ WebUi::Response WebUi::handle(const Request& req) {
   Vm& vm = *s->vm;
   vm.steps = 0;
 
+  if (is_event && s->canvas) {
+    // the page's mouse and keys, as the pane's own events (a click follows a mouse_up over where it went down)
+    auto m = std::make_shared<MapObj>();
+    std::string type;
+    for (auto& [k, val] : parse_pairs(req.body)) {
+      if (k == "type") type = val;
+      if (k == "x" || k == "y") m->put(k, Value::integer(std::strtoll(val.c_str(), nullptr, 10)));
+      else if (k == "dx" || k == "dy") m->put(k, Value::real(std::strtod(val.c_str(), nullptr)));
+      else if (k == "shift" || k == "ctrl" || k == "alt" || k == "meta") m->put(k, Value::boolean(!val.empty()));
+      else m->put(k, Value::string(val));
+    }
+    static const char* allowed[] = {"mouse_down", "mouse_up", "mouse_move", "wheel", "key", "key_up", "text"};
+    bool ok_type = false;
+    for (const char* a : allowed) if (type == a) ok_type = true;
+    std::string err;
+    if (ok_type) {
+      m->put("pane", Value::integer((int64_t)s->pane));
+      if (!pane_event(vm, s->pane, Value::object(Type::Map, m), err)) report(err);
+      Value* b = m->find("button");
+      const std::string bn = b && b->type == Type::Str ? b->str() : "left";
+      const int bi = bn == "left" ? 1 : bn == "middle" ? 2 : bn == "right" ? 3 : 0;
+      if (type == "mouse_down") s->button_down[bi] = true;
+      if (type == "mouse_up" && s->button_down[bi]) {
+        s->button_down[bi] = false;
+        auto c = std::make_shared<MapObj>(*m);
+        c->put("type", Value::string("click"));
+        if (!pane_event(vm, s->pane, Value::object(Type::Map, c), err)) report(err);
+      }
+    }
+    refresh_locked(*s);
+    std::string frame;
+    frame_locked(*s, false, frame);
+    finish_headers("application/json");
+    res.body = frame;
+    return res;
+  }
+
   if (is_event) {
     std::string action;
     std::vector<std::pair<std::string, std::string>> fields;
@@ -452,6 +633,26 @@ WebUi::Response WebUi::handle(const Request& req) {
   if (req.query.rfind("poll=", 0) == 0) {
     const uint64_t since = std::strtoull(req.query.c_str() + 5, nullptr, 10);
     if (since == s->seq) { res.status = 204; return res; }
+  }
+  if (s->canvas) {
+    if (req.tree) {   // a native client: this program draws its own pixels, which it does not show yet
+      finish_headers("application/x-grain-ui+json");
+      res.body = "{\"seq\":" + std::to_string(s->seq) + ",\"title\":" + json_string(s->info.title) + ",\"width\":" + std::to_string(s->info.width) +
+                 ",\"height\":" + std::to_string(s->info.height) + ",\"canvas\":true}";
+      return res;
+    }
+    std::string page = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
+                       esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle +
+                       "#cv{display:block;margin:24px auto;max-width:calc(100% - 32px);height:auto;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.35);user-select:none;-webkit-user-drag:none}</style></head><body>"
+                       "<img id=\"cv\" alt=\"\" draggable=\"false\" width=\"" + std::to_string(s->info.width) + "\" height=\"" + std::to_string(s->info.height) +
+                       "\" data-seq=\"" + std::to_string(s->seq) + "\" src=\"data:image/png;base64," + s->png_b64 + "\"><script>" + kCanvasScript + "</script></body></html>";
+    res.headers = {{"Content-Type", "text/html; charset=utf-8"},
+                   {"Cache-Control", "no-store"},
+                   {"X-Content-Type-Options", "nosniff"},
+                   {"Content-Security-Policy", "default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'"}};
+    if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
+    res.body = std::move(page);
+    return res;
   }
   std::string frame;
   frame_locked(*s, req.tree, frame);
