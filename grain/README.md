@@ -36,7 +36,7 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 |---|---|
 | The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep`, `clock`, `time_us` |
 | Numbers | `a..b` is `range(a, b)`; `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
-| Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`; `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
+| Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`, `decimal_prefix(s)` (the number a string starts with: `{d, whole}` or nil), `round_sig(d, n)`; `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
 | Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists` (relative to the working directory) |
 | Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
 | Processes | `sys_exec(command)` through the system shell, `exec([program, args...])` without one: `{ok, code, output}` |

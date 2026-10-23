@@ -292,12 +292,67 @@ Value bi_scale(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::integer(d.s);
 }
 
+bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// decimal_prefix(s): the number a string starts with, as PHP and C's strtod read one - leading whitespace,
+// a sign, digits with an optional fraction (or a fraction alone), an optional exponent with digits - as
+// {"d": decimal, "whole": the string is that number and nothing after it}, or nil when it starts with none.
+Value bi_decimal_prefix(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Str) { error = std::string("decimal_prefix() wants a string, got a ") + type_name(args[0].type); return Value::nil(); }
+  const std::string& s = args[0].str();
+  const size_t n = s.size();
+  size_t i = 0;
+  while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\v' || s[i] == '\f')) ++i;
+  const size_t start = i;
+  if (i < n && (s[i] == '+' || s[i] == '-')) ++i;
+  size_t whole_digits = 0, frac_digits = 0;
+  while (i + whole_digits < n && is_digit(s[i + whole_digits])) ++whole_digits;
+  i += whole_digits;
+  if (i < n && s[i] == '.') {
+    while (i + 1 + frac_digits < n && is_digit(s[i + 1 + frac_digits])) ++frac_digits;
+    if (whole_digits > 0 || frac_digits > 0) i += 1 + frac_digits;
+  }
+  if (whole_digits == 0 && frac_digits == 0) return Value::nil();
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {   // an exponent counts only with digits
+    size_t j = i + 1;
+    if (j < n && (s[j] == '+' || s[j] == '-')) ++j;
+    size_t k = j;
+    while (k < n && is_digit(s[k])) ++k;
+    if (k > j) i = k;
+  }
+  std::string text = s.substr(start, i - start);
+  if (whole_digits == 0) text.insert(text[0] == '+' || text[0] == '-' ? 1 : 0, "0");   // ".5": decimal_parse wants a digit first
+  Value d;
+  if (!decimal_parse(text, d, error)) { error = "decimal_prefix(): " + error; return Value::nil(); }
+  auto m = std::make_shared<MapObj>();
+  m->put("d", d);
+  m->put("whole", Value::boolean(i == n));
+  return Value::object(Type::Map, m);
+}
+
+// round_sig(d, n): d with no more than n significant digits, the extra ones rounded off half away from zero -
+// but only digits after the point: a whole part longer than n keeps every digit (as printf's %.*g would not).
+Value bi_round_sig(Vm&, std::vector<Value>& args, std::string& error) {
+  Dec d;
+  if (!get(args[0], d)) { error = std::string("round_sig() wants a decimal, got a ") + type_name(args[0].type); return Value::nil(); }
+  if (!want_number(args[1], error, "round_sig")) return Value::nil();
+  const int64_t n = args[1].as_int();
+  if (n < 1) { error = "round_sig(): at least 1 significant digit"; return Value::nil(); }
+  int digits = 1;
+  for (I a = iabs(d.m); a >= 10; a /= 10) ++digits;
+  const int64_t keep = (int64_t)d.s - (digits - n);
+  if (digits <= n || keep < 0) return make(d.m, d.s);
+  return make(round_div(d.m, pow10(d.s - (int)keep)), (int)keep);
+}
+
 }  // namespace
 
 void install_decimal_builtins(Vm& vm) {
   vm.define_native("decimal", 1, 2, bi_decimal);
   vm.define_native("dec_div", 3, 3, bi_dec_div);
   vm.define_native("scale", 1, 1, bi_scale);
+  vm.define_native("decimal_prefix", 1, 1, bi_decimal_prefix);
+  vm.define_native("round_sig", 2, 2, bi_round_sig);
 }
 
 }  // namespace aios::userland::grain

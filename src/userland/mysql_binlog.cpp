@@ -1301,11 +1301,9 @@ Result<size_t> BinlogConsumer::step(int timeout_ms) {
   // present in this packet rather than decoding only the first one — otherwise
   // the TABLE_MAP/ROWS pair for a transaction is silently halved and rows are
   // dropped at decode for a missing table_id.
-  size_t events_here = 0;
   while (hdr != SIZE_MAX) {
     auto hr = handle_event(pkt.data() + hdr, pkt.size() - hdr);
     if (!hr.ok()) return hr.status();
-    ++events_here;
 
     // Advance to the next event header inside this packet, if the previous
     // event's declared length lands on one.
@@ -2340,14 +2338,13 @@ Result<size_t> BinlogConsumer::sync_views() {
     while (!body.empty() && body.back() == ';') body.pop_back();
     return trim_str(body);
   };
-  size_t changed = 0, checked = 0;
+  size_t changed = 0;
   for (const auto& row : lst->rows) {
     if (row.empty()) continue;
     const std::string name = row[0].bytes;
     auto sc = sess.query("SHOW CREATE VIEW " + bt(name));
     if (!sc.ok() || !sc->ok || sc->rows.empty() || sc->rows[0].size() < 2) continue;
     const std::string create = sc->rows[0][1].bytes;
-    ++checked;
     std::string have_body;
     const bool have = db_.view_body(name, dbn, &have_body);
     const std::string want = body_of(create);

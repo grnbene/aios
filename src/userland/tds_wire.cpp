@@ -18,7 +18,7 @@ namespace aios::userland {
 namespace {
 
 constexpr uint8_t kPktSqlBatch = 0x01, kPktReply = 0x04, kPktLogin7 = 0x10, kPktPrelogin = 0x12;
-constexpr uint8_t kEncOff = 0x00, kEncOn = 0x01, kEncNotSup = 0x02, kEncReq = 0x03;
+constexpr uint8_t kEncOn = 0x01, kEncNotSup = 0x02, kEncReq = 0x03;
 constexpr size_t kMaxReply = size_t(1) << 30;   // a reply past this is not one the gateway can hold
 
 uint16_t le16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }

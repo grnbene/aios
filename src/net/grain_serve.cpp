@@ -419,9 +419,9 @@ bool grain_serve_request(const GrainSite& site, const GrainRequest& req, GrainRe
       return set_body(result, is_json);
     case g::Type::Map: {
       auto* m = static_cast<g::MapObj*>(result.obj.get());
-      if (g::Value* st = m->find("status")) {
-        if (st->type != g::Type::Int || st->i < 100 || st->i > 599) { out.error = "a response's status is a whole number from 100 to 599"; return false; }
-        out.status = (int)st->i;
+      if (g::Value* status = m->find("status")) {
+        if (status->type != g::Type::Int || status->i < 100 || status->i > 599) { out.error = "a response's status is a whole number from 100 to 599"; return false; }
+        out.status = (int)status->i;
       }
       bool has_type = false;
       if (g::Value* hv = m->find("headers")) {

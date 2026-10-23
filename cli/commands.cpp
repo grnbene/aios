@@ -4229,7 +4229,7 @@ void cmd_jepa(Ctx& c, const Args& a) {
     float lo = 1e30f, hi = -1e30f, worst_noise = 0.0f;
     for (float v : ends) {
       float sum = 0.0f, rlo = 1e30f, rhi = -1e30f;
-      float c0 = 0.0f, c2 = 0.0f, c6 = 0.0f, c7 = 0.0f, craw = 0.0f;
+      float c0 = 0.0f, c2 = 0.0f, c6 = 0.0f, c7 = 0.0f;
       uint64_t sw = 0, tk = 0;
       uint32_t held = 0;
       bool took = false;
@@ -4253,7 +4253,6 @@ void cmd_jepa(Ctx& c, const Args& a) {
         // NOT a fresh read: the provider differences against its own previous
         // call, so reading it again here restarts the interval and the rate
         // comes back 0 — which is exactly what this line printed before.
-        craw += s_t1.vector[2] * 4.0f;
         {
           // Taken from the state's own timestamped read, not a fresh one.
           const auto probe = intelligence::last_substrate_telemetry();
@@ -5931,7 +5930,7 @@ size_t run_due_directives(Session& s, bool announce) {
     uint64_t took = (s.kernel->host().monotonic_ns() - started) / 1000000ull;
 
     std::string first;
-    for (size_t i = 0, at = 0; at <= captured.size() && first.empty(); ++i) {
+    for (size_t at = 0; at <= captured.size() && first.empty();) {
       size_t nl = captured.find('\n', at);
       std::string one = captured.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
       // The first line that says something, with the colouring stripped.

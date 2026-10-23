@@ -811,6 +811,7 @@ std::atomic<int> g_settle_pressure{1};
 // reported once and then cleared.
 std::atomic<unsigned long long> g_peak_runnable{0};
 
+#if !defined(AIOS_HAL_HOST_ONLY)
 unsigned long long read_procs_running() {
   if (FILE* f = std::fopen("/proc/stat", "r")) {
     char line[256];
@@ -824,7 +825,6 @@ unsigned long long read_procs_running() {
   return 0;
 }
 
-#if !defined(AIOS_HAL_HOST_ONLY)
 intelligence::SubstrateTelemetry linux_telemetry() {
   intelligence::SubstrateTelemetry t;
   static unsigned long long last_idle = 0, last_total = 0;

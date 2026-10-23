@@ -16,7 +16,6 @@ namespace aios::cli {
 namespace {
 
 template <typename T> T need(Result<T> r) { if (!r.ok()) throw Fail{r.error()}; return std::move(*r); }
-void need(Result<void> r) { if (!r.ok()) throw Fail{r.error()}; }
 
 std::string trim(const std::string& s) {
   size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
@@ -102,7 +101,7 @@ Result<void> ask(Session& s, const std::string& request, const std::string& who_
   // back as an error the mind can see — not fall through to a fresh nested ask
   // (that recurses without bound). run_line checks s.ask_depth; keep it balanced
   // even if a step throws.
-  struct DepthGuard { Session& s; DepthGuard(Session& s) : s(s) { s.ask_depth++; } ~DepthGuard() { s.ask_depth--; } } depth_guard(s);
+  struct DepthGuard { Session& s; DepthGuard(Session& ses) : s(ses) { s.ask_depth++; } ~DepthGuard() { s.ask_depth--; } } depth_guard(s);
 
   // A person watching the log needs to see the machine is working, not stare at
   // silence while a cycle's think step waits on the model. Name the job up front,
