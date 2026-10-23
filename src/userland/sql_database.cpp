@@ -19127,16 +19127,11 @@ void SqlTable::normalize_row(std::vector<std::string>& vals) const {
     if (columns[c].type != SqlDataType::Text) vals[c] = sql_normalize_value(columns[c].type, columns[c].scale, vals[c]);
 }
 
-// TEMP-PROF
-double g_prof[40];
-static inline double prof_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static void append_row_canonical_impl(SqlTable* t, const std::vector<std::string>& vals) {
-  double p0 = prof_now();
   t->mutation_seq = sql_next_mutation_seq();
   t->ensure_columns();
   t->compact_delta_buffer();
   row_undo_inserted(t, vals);
-  g_prof[0] += prof_now() - p0;
   // Straight into the encoded columns (ColumnStore::append_encoded): a row
   // replicated into a 12M-row table used to wait in a delta buffer until the
   // next read, which then decompressed and re-encoded the whole table.
@@ -19147,9 +19142,7 @@ static void append_row_canonical_impl(SqlTable* t, const std::vector<std::string
   for (size_t c = 0; c < t->col_data.size(); ++c) {
     const uint32_t before = t->col_data[c].recodes;
     const int enc_before = (int)t->col_data[c].encoding;
-    double q0 = prof_now();
     t->col_data[c].push_back(c < vals.size() ? vals[c] : sql_null());
-    if (c < 30) g_prof[1 + c] += prof_now() - q0;
     if (t->col_data[c].recodes != before) {
       recoded = true;
       if (store_trace)
@@ -55136,7 +55129,6 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
           char split[96];
           std::snprintf(split, sizeof split, " (%.0f rows/s; %.0f%% storing, %.0f%% reading the wire)", rows_copied / std::max(total, 0.001),
                         100.0 * store / std::max(total, 0.001), 100.0 * (total - store) / std::max(total, 0.001));
-          { std::string pr = " PROF pre=" + std::to_string(g_prof[0]); for (int k = 1; k <= (int)tbl->columns.size() && k < 31; ++k) pr += " c" + std::to_string(k - 1) + "=" + std::to_string(g_prof[k]); seed_progress_(pr); }
           seed_progress_(t + ": " + std::to_string(rows_copied) + " rows so far" + split);
         }
       }
