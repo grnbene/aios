@@ -6596,7 +6596,7 @@ bool pane_closed(Vm& vm, uint64_t id, std::string& error) {
 // first, each with a "pane" naming its target).
 Value bi_run_panes(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!g_display) {
-    error = "run_panes(): this grain has no display (the standalone grain shows windows when it was built with SDL2)";
+    error = "run_panes(): this grain has no display (the standalone grain shows windows on Linux, Windows, and on macOS when built with SDL2)";
     return Value::nil();
   }
   DisplayRun run;

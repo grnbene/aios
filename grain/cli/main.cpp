@@ -36,7 +36,9 @@
 #include "plugin.hpp"
 #include "open_client.hpp"
 #include "serve.hpp"
-#if defined(GRAIN_HAVE_X11)
+#if defined(GRAIN_HAVE_WIN32)
+#include "display_win32.hpp"
+#elif defined(GRAIN_HAVE_X11)
 #include "display_x11.hpp"
 #elif defined(GRAIN_HAVE_SDL2)
 #include "display_sdl.hpp"
@@ -246,7 +248,9 @@ int disassemble(const std::string& path) {
 int main(int argc, char** argv) {
   g::set_http_trust_root(grain_cli::state_dir());
   g::set_native_policy({/*allow=*/true, /*unsafe=*/true});   // the standalone grain trusts its own programs
-#if defined(GRAIN_HAVE_X11)
+#if defined(GRAIN_HAVE_WIN32)
+  g::set_display(&grain_cli::win32_display());   // run_panes() opens real windows
+#elif defined(GRAIN_HAVE_X11)
   g::set_display(&grain_cli::x11_display());   // run_panes() opens real windows
 #elif defined(GRAIN_HAVE_SDL2)
   g::set_display(&grain_cli::sdl_display());   // run_panes() opens real windows
