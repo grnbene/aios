@@ -12,6 +12,8 @@
 //                       "lines" placeorder takes ([{"sku": ..., "brand": ..., "qty": ...}])
 //                       -> {"items": [...], "not_found": [{"sku": ...}, ...]}: the same rows as /feed, for
 //                       those items; 404 not_found when none of them is in the feed
+//   POST /getbrands     Authorization: Bearer <token>, no body -> {"brands": ["NAME", ...]}, the brands the
+//                       client is not excluded from, exactly what getbrands() answers
 //   GET  /              the ops view
 //
 // What it does not do: getItemCost() in PHP also writes stockmaster.actualcost from inside the feed.
@@ -821,6 +823,33 @@ fn getstock(req) {
   return reply(200, {"items": items, "not_found": missing})
 }
 
+// getbrands(), in PHP's order: authenticate, rate limit, the brands the client is not excluded from. An
+// empty list is a 404 with the same body, and the log says so in its result, as PHP logs it. PHP has no
+// ORDER BY: MariaDB answers through the manufacturer.name index, so the list comes back in name order,
+// and the order by name below keeps that order on ASQL, which has no such index.
+fn getbrands(req) {
+  let auth = authenticate(req, "getbrands")
+  let client = auth.client
+  let vid = client == nil ? "" : php_str(client.id)
+  if rate_limited("getbrands", vid, 10, 60) {
+    log_event(vid, "getbrands", "fail", 400, "")
+    return reply(400, {"error": "invalid_request", "error_description": "Rate limit exceeded. Please try again later."})
+  }
+  if client == nil { return auth.fail }
+
+  let client_id = num_int(client.id)
+  let brands = []
+  for r in rows("select upper(name) as `brand` from manufacturer where not manufacturer_id in (select mfg_id from sticker_feed_brands where id = ?) and name <> '' order by name", [str(client_id)]) {
+    push(brands, r[0])
+  }
+  if len(brands) > 0 {
+    log_event(client_id, "getbrands", "success", 200, nil)
+    return reply(200, {"brands": brands})
+  }
+  log_event(client_id, "getbrands", "empty brand list returned", 404, nil)
+  return reply(404, {"brands": brands})
+}
+
 // One request; anything unexpected is answered as PHP's catch answers it, and the cause goes to the
 // server's log. Like the PHP, the method is not checked: a GET has no JSON body and is told so.
 fn guarded(endpoint, handler) {
@@ -891,7 +920,8 @@ ui.pane({
   "refresh": 10,
   "routes": {
     "/feed": guarded("/feed", feed),
-    "/getstock": guarded("/getstock", getstock)
+    "/getstock": guarded("/getstock", getstock),
+    "/getbrands": guarded("/getbrands", getbrands)
   },
   "view": view
 })
