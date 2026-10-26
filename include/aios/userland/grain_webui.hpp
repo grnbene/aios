@@ -28,6 +28,8 @@ namespace aios::userland::grain {
 
 class WebUi {
  public:
+  struct Request;
+  struct Response;
   struct Host {
     // A string that changes when the program does (cheap: a file's mtime and size). A session whose program changed starts over.
     std::function<bool(std::string& version, std::string& error)> current_version;
@@ -41,6 +43,9 @@ class WebUi {
     size_t max_sessions = 256;          // the least recently used goes first
     int idle_seconds = 1800;            // a session with nobody watching and untouched this long is dropped
     bool show_errors = false;           // put a program's error in the page (for development); otherwise only the log
+    // A route given to another machine (on_machine): the request, answered there. Returns false when `member` is this
+    // machine (the route's own handler answers here). Unset: every route answers here.
+    std::function<bool(const std::string& member, const Request& req, Response& res)> forward;
   };
 
   struct Request {

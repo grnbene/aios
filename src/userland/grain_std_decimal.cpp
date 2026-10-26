@@ -345,6 +345,36 @@ Value bi_round_sig(Vm&, std::vector<Value>& args, std::string& error) {
   return make(round_div(d.m, pow10(d.s - (int)keep)), (int)keep);
 }
 
+// is_numeric(v): a number, or a string that is one number and nothing more (leading whitespace allowed, trailing not:
+// PHP 7.4's is_numeric, "1e3" and ".5" count, "12abc" and "" do not).
+Value bi_is_numeric(Vm& vm, std::vector<Value>& args, std::string& error) {
+  const Value& v = args[0];
+  if (v.type == Type::Int || v.type == Type::Decimal) return Value::boolean(true);
+  if (v.type == Type::Real) return Value::boolean(!std::isnan(v.d) && !std::isinf(v.d));
+  if (v.type != Type::Str) return Value::boolean(false);
+  std::vector<Value> one{v};
+  Value p = bi_decimal_prefix(vm, one, error);
+  if (!error.empty() || p.type == Type::Nil) { error.clear(); return Value::boolean(false); }
+  Value* whole = std::static_pointer_cast<MapObj>(p.obj)->find("whole");
+  return Value::boolean(whole && whole->truthy());
+}
+
+// to_number(v [, default]): a number as it is; a string by the number it starts with, as a decimal ("12.50abc" is
+// 12.50, as PHP and C's strtod read it); default (nil when not given) for a string that starts with none, or
+// anything else.
+Value bi_to_number(Vm& vm, std::vector<Value>& args, std::string& error) {
+  const Value& v = args[0];
+  const Value fallback = args.size() > 1 ? args[1] : Value::nil();
+  if (v.type == Type::Int || v.type == Type::Decimal || v.type == Type::Real) return v;
+  if (v.type != Type::Str) return fallback;
+  std::vector<Value> one{v};
+  Value p = bi_decimal_prefix(vm, one, error);
+  if (!error.empty()) { error = "to_number(): " + error.substr(error.find("decimal_prefix(): ") == 0 ? 18 : 0); return Value::nil(); }
+  if (p.type == Type::Nil) return fallback;
+  Value* d = std::static_pointer_cast<MapObj>(p.obj)->find("d");
+  return d ? *d : fallback;
+}
+
 // number_format(v [, places [, dec_point [, thousands_sep]]]): v printed with `places` digits after the point
 // (default 0), groups of three split by thousands_sep (default ",") and the point written dec_point (default ".") -
 // PHP's number_format(). As PHP 7.4 reads v: nil and false are 0, true 1, a string by the number it starts with
@@ -414,6 +444,8 @@ void install_decimal_builtins(Vm& vm) {
   vm.define_native("decimal_prefix", 1, 1, bi_decimal_prefix);
   vm.define_native("round_sig", 2, 2, bi_round_sig);
   vm.define_native("number_format", 1, 4, bi_number_format);
+  vm.define_native("is_numeric", 1, 1, bi_is_numeric);
+  vm.define_native("to_number", 1, 2, bi_to_number);
 }
 
 }  // namespace aios::userland::grain

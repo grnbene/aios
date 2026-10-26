@@ -10,34 +10,8 @@ fn php_trim(s) {
   return trim(str(s), " \t\n\r\0\x0B")
 }
 // A value as PHP 7.4's json_encode() writes it with no flags: "/" as "\/", and every character past ASCII as
-// \uXXXX in lowercase hex (a surrogate pair past U+FFFF). json_stringify writes both as they are, which is the
-// same JSON; this keeps a vendor's bytes the PHP's, character for character.
-fn php_json(v) {
-  let s = replace(json_stringify(v), "/", "\\/")
-  if not regex_test("[^\\x00-\\x7F]", s) { return s }
-  let bs = chars(s)   // bytes: the few descriptions with accents or dashes come through here
-  let out = []
-  let i = 0
-  while i < len(bs) {
-    let b = ord(bs[i])
-    if b < 128 {
-      push(out, bs[i])
-      i = i + 1
-      continue
-    }
-    let n = b >= 240 ? 4 : (b >= 224 ? 3 : 2)
-    let cp = b >= 240 ? b & 7 : (b >= 224 ? b & 15 : b & 31)
-    for k in 1..n { cp = (cp << 6) | (ord(bs[i + k]) & 63) }
-    if cp >= 65536 {
-      push(out, "\\u" + format("{:04x}", 55296 + ((cp - 65536) >> 10)))
-      push(out, "\\u" + format("{:04x}", 56320 + ((cp - 65536) & 1023)))
-    } else {
-      push(out, "\\u" + format("{:04x}", cp))
-    }
-    i = i + n
-  }
-  return join(out, "")
-}
+// \uXXXX in lowercase hex (a surrogate pair past U+FFFF), so a vendor gets the PHP's bytes, character for character.
+fn php_json(v) { return json_stringify(v, {"ascii": true, "escape_slashes": true}) }
 
 // A value as PHP's (string) casts it
 fn php_str(v) {
@@ -57,27 +31,14 @@ fn php_truthy(v) {
   if t == "map" { return len(keys(v)) > 0 }
   return true
 }
-// The number a string starts with, as PHP 7.4 reads one: {d, whole}, or nil when it starts with none.
-// whole: the string is that number and nothing after it (is_numeric; trailing space does not count).
-fn num_prefix(s) { return decimal_prefix(s) }
-
 // A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
 fn num(v) {
   if v == nil or v == false { return decimal(0) }
   if v == true { return decimal(1) }
-  let t = type(v)
-  if t == "decimal" { return v }
-  if t != "string" { return decimal(v) }
-  let p = num_prefix(v)
-  return p == nil ? decimal(0) : p.d
+  return decimal(to_number(v, 0))
 }
 // is_numeric($s): the number when the string is one and nothing more
-fn numeric_str(s) {
-  if s == nil { return nil }
-  let p = num_prefix(s)
-  if p == nil or not p.whole { return nil }
-  return p.d
-}
+fn numeric_str(s) { return s != nil and is_numeric(s) ? to_number(s) : nil }
 // (int) $v
 fn num_int(v) { return int(num(v)) }
 
@@ -119,34 +80,11 @@ fn ck(s) {
 let KEEP_WHOLE = false
 let WHOLE = {}
 // the first row for each key, as a ->row lookup gives it
-fn first_by(rs, k) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    if g[key] == nil { g[key] = r }
-  }
-  return g
-}
+fn first_by(rs, k) { return key_by(rs, fn (r) { return ck(r[k]) }) }
 // numbers summed per key (a GROUP BY stockid whose groups MariaDB would have merged by collation)
-fn sum_by(rs, k, v) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    let cur = g[key]
-    g[key] = cur == nil ? num(r[v]) : cur + num(r[v])
-  }
-  return g
-}
+fn sum_col_by(rs, k, v) { return sum_by(rs, fn (r) { return ck(r[k]) }, fn (r) { return num(r[v]) }) }
 // rows grouped by a key column's ck(), in the order the rows came
-fn group_rows(rs, k) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    if g[key] == nil { g[key] = [] }
-    push(g[key], r)
-  }
-  return g
-}
+fn group_rows(rs, k) { return group_by(rs, fn (r) { return ck(r[k]) }) }
 // The tables every build reads whole - the brands, the price levels, the product lines' price rules, the remote
 // warehouses, the forced costs. A caller that builds over and over (the sticker_item Thing, one item at a time)
 // sets KEEP_WHOLE and clears WHOLE when one of them changes; a request to the feed reads them afresh.
@@ -215,7 +153,7 @@ fn remote_stock(only) {
     push(params, only)
     push(params, only)
   }
-  return sum_by(rows("select stockid, SUM(quantity) AS q from (" +
+  return sum_col_by(rows("select stockid, SUM(quantity) AS q from (" +
     "select l.stockid as stockid, sum(l.quantity) as quantity from locstock l where l.loccode in ('03','62','64','67')" + in_l + " group by l.loccode, l.stockid " +
     "union all " +
     "select x.stockid as stockid, x.quantity as quantity from (select r.loccode as loccode, r.stockid as stockid, r.qty as quantity from remotestock r " +
@@ -227,7 +165,7 @@ fn remote_stock(only) {
 fn build_items(base, levels, only, d, remote_given, defer) {
   // quantity: getOnSalesOrder() and getOnOpenRgaByType() for warehouse 01, primarymixedinventory for the rest
   let qoh01 = input("qoh01", only, fn (ids) {
-    return sum_by(rows("SELECT stockid, SUM(quantity) AS q FROM locstock WHERE loccode IN ('01')" + in_ids("stockid", ids) + " GROUP BY stockid", with_ids([], ids)), 0, 1)
+    return sum_col_by(rows("SELECT stockid, SUM(quantity) AS q FROM locstock WHERE loccode IN ('01')" + in_ids("stockid", ids) + " GROUP BY stockid", with_ids([], ids)), 0, 1)
   })
   let so_open = input("so_open", only, fn (ids) {
     let m = {}
@@ -369,7 +307,7 @@ fn make_pricer(only) {
       return locs
     })
     c.demand = input("demand", only, fn (ids) {
-      return sum_by(rows("SELECT salesorderdetails.stkcode, SUM(salesorderdetails.quantity-salesorderdetails.qtyinvoiced) AS dem FROM salesorderdetails INNER JOIN salesorders ON salesorders.orderno = salesorderdetails.orderno INNER JOIN shippers on salesorders.shipvia = shipper_id WHERE salesorderdetails.completed=0 AND salesorders.quotation=0 AND shippername <> 'dropship'" + in_ids("salesorderdetails.stkcode", ids) + " GROUP BY salesorderdetails.stkcode", with_ids([], ids)), 0, 1)
+      return sum_col_by(rows("SELECT salesorderdetails.stkcode, SUM(salesorderdetails.quantity-salesorderdetails.qtyinvoiced) AS dem FROM salesorderdetails INNER JOIN salesorders ON salesorders.orderno = salesorderdetails.orderno INNER JOIN shippers on salesorders.shipvia = shipper_id WHERE salesorderdetails.completed=0 AND salesorders.quotation=0 AND shippername <> 'dropship'" + in_ids("salesorderdetails.stkcode", ids) + " GROUP BY salesorderdetails.stkcode", with_ids([], ids)), 0, 1)
     })
     // the newest type-25 move's price per item
     c.last25 = input("last25", only, fn (ids) {

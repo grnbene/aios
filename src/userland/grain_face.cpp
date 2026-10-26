@@ -1386,6 +1386,21 @@ void install_face_builtins(Vm& vm) {
   // nothing to show, shared (one copy of the program) and with workers (each request in a VM of its own, so a
   // slow route does not hold up the others). options: title, workers (false for routes that share the
   // program's globals, one request at a time), and the rest of ui.pane's.
+  // on_machine(member, handler): a route value answered by this app on that fleet member (a member id or its
+  // prefix, as `app ... on <member>` names one), the request and the answer carried over the fleet link; on that
+  // member itself, or with "" or nil for member, the handler answers here.
+  vm.define_native("on_machine", 2, 2, [](Vm&, std::vector<Value>& args, std::string& error) -> Value {
+    if (args[0].type != Type::Str && args[0].type != Type::Nil) {
+      error = std::string("on_machine() wants a member id, got a ") + type_name(args[0].type);
+      return Value::nil();
+    }
+    if (!is_callable(args[1])) { error = "on_machine() wants a handler as well (what answers on that machine)"; return Value::nil(); }
+    if (args[0].type == Type::Nil || args[0].str().empty()) return args[1];
+    auto m = std::make_shared<MapObj>();
+    m->put("__on_machine", args[0]);
+    m->put("__handler", args[1]);
+    return Value::object(Type::Map, m);
+  });
   vm.define_native("serve_routes", 1, 2, [](Vm& v, std::vector<Value>& args, std::string& error) -> Value {
     if (!as_map(args[0])) { error = std::string("serve_routes() wants its routes as a map of path to function, got a ") + type_name(args[0].type); return Value::nil(); }
     auto o = std::make_shared<MapObj>();
@@ -1644,6 +1659,18 @@ Value route_request(const std::string& method, const std::string& path, const st
   return Value::object(Type::Map, req_m);
 }
 
+// on_machine(member, handler) makes a route value {"__on_machine": member, "__handler": handler}: the request is
+// answered by the same app on that fleet member, or by the handler when this machine is that member (or none).
+static const Value& on_machine_handler(const Value& v) {
+  if (v.type == Type::Map && v.obj) {
+    auto* m = static_cast<MapObj*>(v.obj.get());
+    if (m->find("__on_machine")) {
+      if (Value* h = m->find("__handler")) return *h;
+    }
+  }
+  return v;
+}
+
 const Value* route_match(FacePane* f, const std::string& method, const std::string& path, std::shared_ptr<MapObj>& out_params) {
   out_params = std::make_shared<MapObj>();
   if (!f || f->routes().type != Type::Map) return nullptr;
@@ -1657,7 +1684,9 @@ const Value* route_match(FacePane* f, const std::string& method, const std::stri
   int best_score = -1;
   std::map<std::string, std::string> best_params;
 
-  for (const auto& [key, handler] : rm->entries) {
+  for (const auto& [key, route_value] : rm->entries) {
+    // on_machine(member, handler): the handler is what runs here (forwarding is decided before, route_machine)
+    const Value& handler = on_machine_handler(route_value);
     if (!is_callable(handler)) continue;
 
     std::string r_method, r_pattern;
@@ -2067,6 +2096,22 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
   }
   route_response(ret, status, res_body, content_type, extra_headers);
   return true;
+}
+
+std::string web_pane_route_machine(Vm& vm, uint64_t id, const std::string& method, const std::string& path) {
+  FacePane* f = web_face(vm, id);
+  std::shared_ptr<MapObj> params;
+  const Value* handler = route_match(f, method, path, params);
+  if (!handler) return "";
+  auto rm = as_map(f->routes());
+  if (!rm) return "";
+  for (const auto& [key, v] : rm->entries) {
+    if (v.type != Type::Map || !v.obj) continue;
+    auto* m = static_cast<MapObj*>(v.obj.get());
+    Value* member = m->find("__on_machine");
+    if (member && m->find("__handler") == handler) return member->to_text();
+  }
+  return "";
 }
 
 bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, const std::string& path,

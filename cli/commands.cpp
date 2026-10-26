@@ -1162,13 +1162,162 @@ void grain_app_command(Ctx& c, const Args& a) {
   if (any_failed) fail(Status::IoError, "app " + (args.empty() ? std::string() : args[0]) + " did not succeed everywhere");
 }
 
+// ---- an app route given to another machine (on_machine), run through the substrate ----------------------------
+// The request is the input buffer of one Custom operation (kernel "app.route"); the scheduler places it on the member's
+// remote device (device_selector "remote:relay:<member>"), the fabric stages the request there, the member's app host
+// answers it in-process into the output buffer, and the answer comes back as the operation's output (trailing zeros
+// left off on the link). No new protocol: a graph, as any other work aios distributes.
+constexpr const char* kAppRouteKernel = "app.route";
+
+ByteBuffer encode_app_request(const std::string& app, const userland::grain::WebUi::Request& q) {
+  ByteBuffer b;
+  Writer w(b);
+  w.str(app); w.str(q.method); w.str(q.path); w.str(q.query); w.str(q.cookie);
+  w.u8((uint8_t)((q.xhr ? 1 : 0) | (q.https ? 2 : 0)));
+  w.str(q.body); w.str(q.remote);
+  w.u32((uint32_t)q.headers.size());
+  for (const auto& h : q.headers) { w.str(h.first); w.str(h.second); }
+  return b;
+}
+bool decode_app_request(ByteSpan in, std::string& app, userland::grain::WebUi::Request& q) {
+  Reader r(in);
+  app = r.str(); q.method = r.str(); q.path = r.str(); q.query = r.str(); q.cookie = r.str();
+  const uint8_t f = r.u8();
+  q.xhr = (f & 1) != 0; q.https = (f & 2) != 0;
+  q.body = r.str(); q.remote = r.str();
+  const uint32_t n = r.u32();
+  for (uint32_t i = 0; i < n && r.ok(); ++i) { std::string k = r.str(); std::string v = r.str(); q.headers.push_back({k, v}); }
+  return r.ok();
+}
+// The answer in its buffer: u32 length of what follows, then status, headers, body. A length past the buffer says
+// the answer did not fit: its size, so the caller can ask again with room for it.
+ByteBuffer encode_app_response(const userland::grain::WebUi::Response& res) {
+  ByteBuffer b;
+  Writer w(b);
+  w.u32(0);
+  w.u32((uint32_t)res.status);
+  w.u32((uint32_t)res.headers.size());
+  for (const auto& h : res.headers) { w.str(h.first); w.str(h.second); }
+  w.str(res.body);
+  const uint32_t len = (uint32_t)(b.size() - 4);
+  for (int i = 0; i < 4; ++i) b[(size_t)i] = (uint8_t)(len >> (8 * i));
+  return b;
+}
+bool decode_app_response(ByteSpan in, userland::grain::WebUi::Response& res) {
+  Reader r(in);
+  (void)r.u32();
+  res.status = (int)r.u32();
+  const uint32_t n = r.u32();
+  for (uint32_t i = 0; i < n && r.ok(); ++i) { std::string k = r.str(); std::string v = r.str(); res.headers.push_back({k, v}); }
+  res.body = r.str();
+  return r.ok();
+}
+
 // serve [port=7480] [all-ips=1]: this machine's app host. Runs until stopped (SIGTERM), its apps with it.
 void cmd_serve(Ctx& c, const Args& a) {
   namespace ga = userland::grain::apps;
   const std::string home = apps_home(c.k);
   auto token = need(ga::host_token(c.k.host(), home));
   auto store = ga::make_dir_store(c.k.host(), home);
-  ga::Host apps(c.k.host(), *store, {[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str()});
+  // An app route given to a fleet member (on_machine) runs there as a graph: this host's own entity builds it.
+  using K = ResourceKind;
+  AuthorityProfile route_profile = {
+      {ResourceRef{K::Kernel, {}}, (uint16_t)R_Schedule, 0},
+      {ResourceRef{K::ComputeDevice, {}}, (uint16_t)R_Execute, 0},
+      {ResourceRef{K::Memory, {}}, (uint16_t)(R_Read | R_Write | R_Allocate | R_Destroy), 4ull << 30},
+  };
+  EntityID route_entity = need(c.me.resident("app-host", route_profile));
+  Surface route_worker = need(c.me.act_as(route_entity));
+  std::mutex reach_mu;   // Kernel::reach is not made for many threads at once; one request reaches a member at a time
+  const uint64_t route_room = [] {
+    const char* e = std::getenv("AIOS_APP_ROUTE_MB");
+    const uint64_t mb = e && *e ? std::strtoull(e, nullptr, 10) : 64;
+    return std::max<uint64_t>(1, mb) << 20;
+  }();
+  ga::Host::Options host_opt{[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str(), nullptr};
+  host_opt.forward = [&c, &route_worker, &reach_mu, route_room](const std::string& app, const std::string& member,
+                                                                  const userland::grain::WebUi::Request& req,
+                                                                  userland::grain::WebUi::Response& res) -> bool {
+    auto answer = [&res](int status, const std::string& why) {
+      res.status = status;
+      res.headers = {{"Content-Type", "text/plain; charset=utf-8"}};
+      res.body = why + "\n";
+      return true;
+    };
+    if (c.k.self().str().compare(0, member.size(), member) == 0) return false;   // this machine is that member
+    if (!c.k.in_fleet()) return answer(503, "this route runs on " + member + ", and this machine is not in a fleet");
+    std::vector<Id128> hits;
+    for (auto& id : c.k.fleet_roster()) if (id.str().compare(0, member.size(), member) == 0) hits.push_back(id);
+    if (hits.size() != 1) return answer(503, (hits.empty() ? "no fleet member " : "more than one fleet member starts with ") + member);
+    {
+      std::lock_guard<std::mutex> g(reach_mu);
+      auto at = c.k.reach(hits[0]);   // its devices join this machine's fabric (once; a dead link is replaced)
+      if (!at.ok()) return answer(503, "cannot reach " + member + ": " + at.error().message);
+    }
+    const ByteBuffer in = encode_app_request(app, req);
+    uint64_t room = route_room;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      auto tin = route_worker.tensor(DType::U8, {(uint64_t)in.size()});
+      if (!tin.ok()) return answer(503, "request buffer: " + tin.error().message);
+      auto tout = route_worker.tensor(DType::U8, {room});
+      if (!tout.ok()) { (void)route_worker.release(tin->memory); return answer(503, "answer buffer: " + tout.error().message); }
+      auto release = [&] { (void)route_worker.release(tin->memory); (void)route_worker.release(tout->memory); };
+      auto wr = route_worker.write(tin->memory, tin->offset, ByteSpan(in.data(), in.size()));
+      auto g = route_worker.create_graph();
+      if (!wr.ok() || !g.ok()) { release(); return answer(503, "graph: " + (wr.ok() ? g.error().message : wr.error().message)); }
+      Operation op;
+      op.code = OpCode::Custom;
+      op.custom_kernel = fnv1a(std::string(kAppRouteKernel));
+      op.requirement.device_selector = "remote:relay:" + hits[0].short_str();
+      op.inputs.push_back(*tin);
+      op.outputs.push_back(*tout);
+      auto added = route_worker.add_operation(*g, op);
+      auto rep = added.ok() ? route_worker.execute(*g) : Result<ExecutionReport>(added.error());
+      (void)c.k.graphs().destroy(*g);
+      if (!rep.ok() || !rep->failure.empty()) {
+        release();
+        return answer(502, "on " + member + ": " + (rep.ok() ? rep->failure : rep.error().message));
+      }
+      auto head = route_worker.read(tout->memory, tout->offset, 4);
+      if (!head.ok() || head->size() < 4) { release(); return answer(502, "on " + member + ": no answer came back"); }
+      const uint64_t len = (uint64_t)(*head)[0] | ((uint64_t)(*head)[1] << 8) | ((uint64_t)(*head)[2] << 16) | ((uint64_t)(*head)[3] << 24);
+      if (len + 4 > room) {   // it did not fit: ask once more with room for it
+        release();
+        room = len + 4;
+        continue;
+      }
+      auto body = route_worker.read(tout->memory, tout->offset, len + 4);
+      release();
+      if (!body.ok() || !decode_app_response(ByteSpan(body->data(), body->size()), res))
+        return answer(502, "on " + member + ": the answer could not be read");
+      return true;
+    }
+    return answer(502, "on " + member + ": the answer kept outgrowing its buffer");
+  };
+  ga::Host apps(c.k.host(), *store, host_opt);
+  // What a member's route given to this machine runs: the request answered by the app here, in-process.
+  for (auto* d : c.k.devices().of_type(DeviceType::CPU)) {
+    need(d->register_kernel(kAppRouteKernel, [&apps](KernelArgs& ka) -> Result<void> {
+      if (ka.op.inputs.empty() || ka.op.outputs.empty()) return Result<void>(Status::Invalid, "app.route takes a request and an answer buffer");
+      const Tensor& tin = ka.op.inputs[0];
+      const Tensor& tout = ka.op.outputs[0];
+      std::string app;
+      userland::grain::WebUi::Request req;
+      if (!decode_app_request(ByteSpan(ka.inputs[0].base + tin.offset, tin.bytes()), app, req))
+        return Result<void>(Status::Corrupt, "app.route: a malformed request");
+      auto res = apps.answer_forwarded(app, req);
+      if (!res.ok()) return res.error();
+      const ByteBuffer out = encode_app_response(*res);
+      uint8_t* dst = ka.outputs[0].base + tout.offset;
+      const uint64_t room = tout.bytes();
+      if (out.size() > room) {   // only the size: the caller asks again with room for it
+        std::memcpy(dst, out.data(), 4);
+        return Ok();
+      }
+      std::memcpy(dst, out.data(), out.size());
+      return Ok();
+    }));
+  }
   ga::ControlServer control(c.k.host(), apps, token);
   const uint16_t port = has_kv(a, "port") ? (uint16_t)to_u64(kv(a, "port")) : 7480;
   const bool all_ips = has_kv(a, "all-ips") && kv(a, "all-ips") != "0";

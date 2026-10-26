@@ -93,6 +93,8 @@ add_test(NAME grain.lang.maps COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/gr
 add_test(NAME grain.lang.adv_features COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_adv_features.gr)
 add_test(NAME grain.lang.spread COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread.gr)
 add_test(NAME grain.lang.number_format COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_number_format.gr)
+add_test(NAME grain.lang.php_style_builtins COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_php_style_builtins.gr)
+add_test(NAME grain.lang.on_machine COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_on_machine.gr)
 
 
 # The HTTP client against a local server (tests/net): needs Python 3 to run the

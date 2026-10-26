@@ -16,6 +16,12 @@ let READS = "stockmaster, product_to_manufacturer, prices, locstock, stockmoves,
             "sticker_feed_exclusions, custbranch, debtorsmaster"
 
 fn deployed(app) {
+  // the feed answered by another member's copy (STICKERFEED_COMPUTE_ON): the Thing is that member's, not built here
+  let elsewhere = setting("STICKERFEED_COMPUTE_ON", "")
+  if elsewhere != "" {
+    print("sticker_item: kept on " + elsewhere + ", where this app's API runs")
+    return true
+  }
   let c = db_connect(setting("ASQL_HOST", "127.0.0.1"), int(setting("ASQL_PORT", "3307")), setting("ASQL_USER", "root"),
                      setting("ASQL_PASSWORD", ""), setting("ASQL_DB", "versioneight"))
   if not c.ok { return "cannot reach ASQL: " + c.error }

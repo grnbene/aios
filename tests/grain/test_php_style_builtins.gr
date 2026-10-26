@@ -1,0 +1,108 @@
+# json_stringify's ascii / escape_slashes options, is_numeric, to_number, key_by and sum_by: their own answers, and
+# the same answers as the sticker feed's grain helpers they replace (kept here, as written, for the comparison).
+fn check(c, msg) { assert_true(c, msg) }
+fn eq(got, want, what) { check(got == want, what + ": got " + str(got) + ", want " + str(want)) }
+
+# ---- json_stringify options (PHP json_encode with no flags) ----
+eq(json_stringify({"a/b": "x/y"}), "{\"a/b\":\"x/y\"}", "slashes as they are by default")
+eq(json_stringify({"a/b": "x/y"}, {"escape_slashes": true}), "{\"a\\/b\":\"x\\/y\"}", "escape_slashes, keys too")
+eq(json_stringify("café", {"ascii": true}), "\"caf\\u00e9\"", "ascii: two-byte")
+eq(json_stringify("—", {"ascii": true}), "\"\\u2014\"", "ascii: three-byte, lowercase hex")
+eq(json_stringify("😀", {"ascii": true}), "\"\\ud83d\\ude00\"", "ascii: a surrogate pair")
+eq(json_stringify([1, "é"], {"indent": 2, "ascii": true}), "[\n  1,\n  \"\\u00e9\"\n]", "indent with ascii")
+eq(json_stringify("a\tb\u{1}"), "\"a\\tb\\u0001\"", "control characters")
+eq(json_stringify({"k\n": 1}), "{\"k\\n\":1}", "a key's control character is escaped too")
+let bad = pcall(fn () { return json_stringify(1, {"nope": true}) })
+check(not bad.ok, "an unknown option is refused")
+
+# the feed's php_json, as written in grain
+fn php_json_old(v) {
+  let s = replace(json_stringify(v), "/", "\\/")
+  if not regex_test("[^\\x00-\\x7F]", s) { return s }
+  let bs = chars(s)
+  let out = []
+  let i = 0
+  while i < len(bs) {
+    let b = ord(bs[i])
+    if b < 128 {
+      push(out, bs[i])
+      i = i + 1
+      continue
+    }
+    let n = b >= 240 ? 4 : (b >= 224 ? 3 : 2)
+    let cp = b >= 240 ? b & 7 : (b >= 224 ? b & 15 : b & 31)
+    for k in 1..n { cp = (cp << 6) | (ord(bs[i + k]) & 63) }
+    if cp >= 65536 {
+      push(out, "\\u" + format("{:04x}", 55296 + ((cp - 65536) >> 10)))
+      push(out, "\\u" + format("{:04x}", 56320 + ((cp - 65536) & 1023)))
+    } else {
+      push(out, "\\u" + format("{:04x}", cp))
+    }
+    i = i + n
+  }
+  return join(out, "")
+}
+let docs = [
+  {"Brand": "GOODYEAR", "desc": "P225/75R16 Wrangler ST 104S", "price": "109.80", "qty": "0"},
+  {"desc": "Pirelli Scorpion™ Verde — all season", "n": 3, "x": nil, "ok": true, "list": ["a/b", "ñ", "日本"]},
+  {"emoji": "😀 tires", "quote": "say \"hi\"", "back": "a\\b", "nl": "a\nb"},
+  [], {}, "plain", 12, decimal("19.995")
+]
+for d in docs { eq(json_stringify(d, {"ascii": true, "escape_slashes": true}), php_json_old(d), "php_json of " + php_json_old(d)) }
+
+# ---- is_numeric (PHP 7.4) and to_number ----
+for s in ["1", "-1", "+1.5", "1e3", ".5", "-.5", " 7", "\t8", "0", "007"] { check(is_numeric(s), "is_numeric " + s) }
+for s in ["", " ", "abc", "12abc", "1 ", "1e", ".", "-", "0x1A", "1,000"] { check(not is_numeric(s), "not is_numeric '" + s + "'") }
+check(is_numeric(5) and is_numeric(2.5) and is_numeric(decimal("1.1")), "numbers are numeric")
+check(not is_numeric(nil) and not is_numeric(true) and not is_numeric([1]), "nil, bool and lists are not")
+eq(to_number("12.50abc"), decimal("12.50"), "leading number")
+eq(str(to_number("12.50abc")), "12.50", "keeps its digits")
+eq(to_number("abc"), nil, "none")
+eq(to_number("abc", 0), 0, "a default")
+eq(to_number(7), 7, "a number as it is")
+eq(to_number(nil, -1), -1, "nil takes the default")
+eq(to_number(" -3e2x"), decimal("-300"), "an exponent")
+
+# the feed's num() and numeric_str(), as written in grain, against the builtins
+fn num_old(v) {
+  if v == nil or v == false { return decimal(0) }
+  if v == true { return decimal(1) }
+  let t = type(v)
+  if t == "decimal" { return v }
+  if t != "string" { return decimal(v) }
+  let p = decimal_prefix(v)
+  return p == nil ? decimal(0) : p.d
+}
+fn numeric_str_old(s) {
+  if s == nil { return nil }
+  let p = decimal_prefix(s)
+  if p == nil or not p.whole { return nil }
+  return p.d
+}
+fn num_new(v) {
+  if v == nil or v == false { return decimal(0) }
+  if v == true { return decimal(1) }
+  return decimal(to_number(v, 0))
+}
+fn numeric_str_new(s) { return s != nil and is_numeric(s) ? to_number(s) : nil }
+let inputs = [nil, true, false, 0, 3, -2.5, decimal("4.40"), "", "x", "0.0000", "12.5abc", "-3", " 4.5", "1e3", ".5", "-.5", "7 ", "0012"]
+for i in 0..500 { push(inputs, str(i * 0.37)); push(inputs, str(i) + "z"); push(inputs, i * 0.125) }
+for v in inputs {
+  eq(str(num_new(v)), str(num_old(v)), "num(" + str(v) + ")")
+  if v == nil or type(v) == "string" { eq(str(numeric_str_new(v)), str(numeric_str_old(v)), "numeric_str(" + str(v) + ")") }
+}
+
+# ---- key_by and sum_by ----
+let rows = [["a", "1.10", "x"], ["B", "2", "y"], ["A", "0.05", "z"], ["b", "3", "w"], ["c", nil, "v"]]
+let first = key_by(rows, fn (r) { return upper(r[0]) })
+eq(first["A"][2], "x", "key_by keeps the first")
+eq(first["B"][2], "y", "key_by keeps the first (B)")
+eq(keys(first), ["A", "B", "C"], "key_by: keys in first-met order")
+let sums = sum_by(rows, fn (r) { return upper(r[0]) }, fn (r) { return r[1] == nil ? nil : decimal(r[1]) })
+eq(str(sums["A"]), "1.15", "sum_by decimals, exact")
+eq(str(sums["B"]), "5", "sum_by")
+eq(sums["C"], 0, "sum_by: a nil value counts as nothing")
+eq(sum_by([1, 2, 3, 4], fn (x) { return x % 2 }, fn (x) { return x })["1"], 4, "sum_by ints")
+let nb = pcall(fn () { return sum_by([1], fn (x) { return 1 }, fn (x) { return "s" }) })
+check(not nb.ok, "sum_by refuses a non-number")
+print("php-style builtins ok")

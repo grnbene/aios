@@ -331,6 +331,7 @@ fn validate_bearer(token) {
 
 // The connection log's table. On a replica (chi) it must be a table the master never writes, or the
 // replica's own rows collide with the master's and stop replication.
+let COMPUTE_ON = env("STICKERFEED_COMPUTE_ON", "")
 let LOG_TABLE = env("STICKERFEED_LOG_TABLE", "sticker_feed_connection_log")
 // Successful calls are not logged (a load or a busy client writes a row per call: 58,000 in a day on chi); failed
 // ones are, and they are what the rate limit counts. STICKERFEED_LOG_SUCCESS=1 logs every call, as the PHP did.
@@ -692,10 +693,13 @@ ui.pane({
   "shared": true,
   "workers": true,
   "refresh": 10,
+  // STICKERFEED_COMPUTE_ON: the fleet member (its id, or a prefix) whose copy of this app answers the API - the request
+  // is carried there through aios (an app.route operation on its device) and its answer given back here as it came.
+  // Unset, or that member being this machine, the routes answer here.
   "routes": {
-    "/feed": guarded("/feed", feed),
-    "/getstock": guarded("/getstock", getstock),
-    "/getbrands": guarded("/getbrands", getbrands)
+    "/feed": on_machine(COMPUTE_ON, guarded("/feed", feed)),
+    "/getstock": on_machine(COMPUTE_ON, guarded("/getstock", getstock)),
+    "/getbrands": on_machine(COMPUTE_ON, guarded("/getbrands", getbrands))
   },
   "view": view
 })
