@@ -32,6 +32,8 @@ class Parser {
   ExprP postfix(ExprP left);
   ExprP primary();
   ExprP list_literal();
+  // `...` written together (three `.` tokens side by side) before an argument or list element: eats it.
+  bool match_spread();
   ExprP map_literal();
   ExprP lambda();
 

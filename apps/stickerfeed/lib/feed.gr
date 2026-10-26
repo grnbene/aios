@@ -88,25 +88,13 @@ fn numeric_str(s) {
 // Emulates PHP (int) cast
 fn num_int(v) { return int(num(v)) }
 
-// Emulates PHP number_format($v, $places, '.', '') with 15-digit precision rounding half-away-from-zero
+// Emulates PHP number_format($v, $places, '.', '') via Grain builtin number_format().
+// Returns nil if string contains no numeric value (matching PHP warning and NULL result).
+// nf_dec() returns the formatted value as an exact decimal of `places` precision for downstream arithmetic.
+fn nf(v, places) { return number_format(v, places, ".", "") }
 fn nf_dec(v, places) {
-  let d = decimal(0)
-  if v == true { d = decimal(1) }
-  else if v != nil and v != false {
-    if type(v) == "string" {
-      let p = decimal_prefix(v)
-      if p == nil { return nil }
-      d = p.d
-    } else {
-      d = decimal(v)
-    }
-  }
-  return decimal(round_sig(d, 15), places)
-}
-
-fn nf(v, places) {
-  let d = nf_dec(v, places)
-  return d == nil ? nil : str(d)
+  let s = nf(v, places)
+  return s == nil ? nil : decimal(s, places)
 }
 
 // PHP comparisons with zero
