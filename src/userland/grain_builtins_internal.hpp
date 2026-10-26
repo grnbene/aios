@@ -54,6 +54,10 @@ Value register_driven_pane(Vm& vm, const std::string& title, int width, int heig
 // The driver of one of `vm`'s panes (a pane map, handle or id), or null.
 std::shared_ptr<PaneDriver> pane_driver(const Vm& vm, const Value& pane);
 
+// The JSON json_parse / json_stringify use (grain_builtins.cpp).
+Value grain_json_parse(const std::string& text, std::string& err);
+std::string grain_json_stringify(const Value& v);
+
 // Safe RFC 7578 Multipart Form Data parsing
 struct MultipartResult {
   std::shared_ptr<MapObj> form = std::make_shared<MapObj>();

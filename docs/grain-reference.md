@@ -342,7 +342,7 @@ ECMAScript-compatible regular expression operations.
 | `hash_equals` | `hash_equals(a, b)` | Timing-safe string comparison to protect against side-channel leaks. |
 | `bcrypt_hash` | `bcrypt_hash(pass, [cost=10])` | Computes a standard `$2b$` OpenBSD bcrypt password hash with random salt. |
 | `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$`, `$2b$` or `$2y$` (PHP `password_hash`) bcrypt hash in constant time. |
-| `jwt_sign` | `jwt_sign(payload_map, secret)` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. |
+| `jwt_sign` | `jwt_sign(payload_map, secret, [expires_in_seconds])` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. With `expires_in_seconds`, sets `iat` and `exp` (the caller's map is not changed). An empty secret is an error. |
 | `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 
 ---
