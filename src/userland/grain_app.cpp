@@ -595,6 +595,23 @@ std::string peer_address(const std::string& p) {
   return c != std::string::npos && p.find(':') == c ? p.substr(0, c) : p;
 }
 
+// Whether the machine's operator lets this app start programs (process_run): AIOS_APP_PROCESS_RUN names it in a
+// comma list, or is "*". Read from the host's environment - the operator's - never from the app's own settings.
+bool process_allowed(hal::Host& host, const std::string& app) {
+  const std::string list = host.env("AIOS_APP_PROCESS_RUN");
+  size_t i = 0;
+  while (i <= list.size()) {
+    size_t j = list.find(',', i);
+    if (j == std::string::npos) j = list.size();
+    std::string name = list.substr(i, j - i);
+    name.erase(0, name.find_first_not_of(" \t"));
+    name.erase(name.find_last_not_of(" \t") + 1);
+    if (name == "*" || (!name.empty() && name == app)) return true;
+    i = j + 1;
+  }
+  return false;
+}
+
 // Whether an Accept-Encoding header takes gzip: listed (or `*`) with a q above zero ("gzip;q=0" refuses it).
 bool accepts_gzip(const std::string& header) {
   double gzip_q = -1, star_q = -1;
@@ -902,6 +919,7 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
     };
     vm.settings = raw->settings;
     vm.kv = raw->kv;
+    vm.allow_process = process_allowed(host_, app);
     vm.stop_flag = raw->stop;
     vm.define_native("app_program", 1, 1, bi_app_program);
     vm.on_print = [this, app](const std::string& line) { log(app, line); };

@@ -59,6 +59,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_std_http.cpp
   ${AIOS_ROOT}/src/userland/grain_std_mail.cpp
   ${AIOS_ROOT}/src/userland/grain_std_kv.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_process.cpp
   ${AIOS_ROOT}/src/net/smtp.cpp
   ${AIOS_ROOT}/src/net/line_stream.cpp
   ${AIOS_ROOT}/src/userland/grain_std_db.cpp

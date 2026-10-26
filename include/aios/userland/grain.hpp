@@ -581,6 +581,9 @@ class Vm {
   // worker has no loop of its own to fire timers or show panes, so every()/after()/live()/events()
   // and run_panes() refuse there instead of registering something that would never run.
   bool worker = false;
+  // process_run may start other programs (grain_std_process.cpp). False unless the host says: a command-line
+  // script's host does; an app host only for apps its operator named (AIOS_APP_PROCESS_RUN); web pages never.
+  bool allow_process = false;
   // spawn()'s tasks this VM started and has not awaited; dropping it (with the VM) waits for them,
   // so no task is still running grain when the program that started it is gone.
   std::shared_ptr<void> tasks;

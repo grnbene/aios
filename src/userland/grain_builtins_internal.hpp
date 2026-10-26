@@ -56,6 +56,8 @@ std::shared_ptr<PaneDriver> pane_driver(const Vm& vm, const Value& pane);
 
 // Where TLS certificates are trusted from (set_http_trust_root), for the http and mail builtins.
 std::string http_trust_root();
+// process_run (grain_std_process.cpp); installed with the core builtins, refusing unless Vm::allow_process.
+void install_process_builtins(Vm& vm);
 // kv_* (grain_std_kv.cpp); installed with the core builtins.
 void install_kv_builtins(Vm& vm);
 // mail_send (grain_std_mail.cpp); installed by install_http_builtins.

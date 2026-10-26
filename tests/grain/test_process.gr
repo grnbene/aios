@@ -1,0 +1,45 @@
+// process_run, from a command-line script (allowed here; hosted apps: scripts/grain-app-process-check.sh).
+// No shell: arguments arrive as written. Exit codes, stdout+stderr, the clean environment, cwd/env options, the
+// timeout, the output limit, errors, a function, a closure and a spawned worker.
+fn check(c, msg) { assert_true(c, msg) }
+
+let r = process_run(["/bin/echo", "a; rm -rf /tmp/nothing", "$HOME", "`id`"])
+check(r.ok and r.code == 0 and r.output == "a; rm -rf /tmp/nothing $HOME `id`\n", "arguments are not parsed by a shell: " + r.output)
+
+let e = process_run(["/bin/sh", "-c", "echo out; echo err 1>&2; exit 3"])
+check(!e.ok and e.code == 3, "the exit code: " + str(e.code))
+check(contains(e.output, "out") and contains(e.output, "err"), "stdout and stderr together: " + e.output)
+
+setenv("GRAIN_PROCESS_TEST_SECRET", "s3cret-value")
+let clean = process_run(["/usr/bin/env"])
+check(!contains(clean.output, "s3cret-value") and contains(clean.output, "PATH="), "a clean environment by default")
+let inherited = process_run(["/usr/bin/env"], {"inherit_env": true})
+check(contains(inherited.output, "GRAIN_PROCESS_TEST_SECRET=s3cret-value"), "inherit_env passes this process's environment")
+let given = process_run(["/usr/bin/env"], {"env": {"FOO": "bar", "PATH": "/bin"}})
+check(contains(given.output, "FOO=bar") and contains(given.output, "PATH=/bin\n"), "env adds and overrides: " + given.output)
+
+check(trim(process_run(["/bin/pwd"], {"cwd": "/tmp"}).output) == "/tmp", "cwd")
+
+let slow = process_run(["/bin/sleep", "5"], {"timeout_ms": 300})
+check(slow.timed_out and !slow.ok and slow.code == -1, "killed at its timeout: " + str(slow))
+
+let big = process_run(["/bin/sh", "-c", "head -c 100000 /dev/zero | tr '\\0' x"], {"max_output": 1000})
+check(big.truncated and len(big.output) == 1000, "output cut at max_output: " + str(len(big.output)))
+
+// (pcall(f, a_list) spreads the list into arguments: a call whose one argument is a list goes in a closure.)
+let missing = pcall(fn () { return process_run(["/nonexistent/program"]) })
+check(missing.ok and missing.value.code == 127 and !missing.value.ok, "a missing program: exit 127, as a shell gives: " + str(missing))
+let as_string = pcall(fn () { return process_run("echo hi") })
+check(!as_string.ok and contains(as_string.error, "list of strings"), "a string is refused: a list of arguments only")
+let empty = pcall(fn () { return process_run([]) })
+check(!empty.ok and contains(empty.error, "name the program"), "an empty list: " + str(empty.error))
+check(!pcall(process_run, ["/bin/echo"], {"env": {"BAD NAME": "x"}}).ok, "a bad environment name")
+check(!pcall(process_run, ["/bin/echo"], {"timeout_ms": 0}).ok, "a zero timeout")
+
+fn count_lines(text) { return int(trim(process_run(["/bin/sh", "-c", "printf '%s' \"$1\" | wc -l", "sh", text]).output)) }
+check(count_lines("a\nb\nc\n") == 3, "in a function, an argument passed as data")
+let runner = fn (prog) { return process_run([prog, "x"]).output }
+check(runner("/bin/echo") == "x\n", "in a closure")
+let task = spawn(fn () { return process_run(["/bin/echo", "worker"]).output })
+check(await(task) == "worker\n", "in a spawned worker")
+print("PASS: test_process")

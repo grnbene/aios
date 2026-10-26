@@ -6759,6 +6759,7 @@ void install_core_builtins(Vm& vm) {
   install_hash_builtins(vm);
   install_bytes_builtins(vm);
   install_kv_builtins(vm);
+  install_process_builtins(vm);   // refuses unless the host set Vm::allow_process
   install_regex_builtins(vm);
   install_time_builtins(vm);
   install_text_builtins(vm);

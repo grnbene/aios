@@ -148,6 +148,7 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
   install_grain_host(vm);
   grain::set_http_trust_root(k.config().root);   // https verifies against the machine's own store first
   grain::install_http_builtins(vm);
+  vm.allow_process = true;   // a script run from the console may start programs (process_run)
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif
@@ -260,6 +261,7 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
   install_grain_host(vm);
   grain::set_http_trust_root(k.config().root);   // https verifies against the machine's own store first
   grain::install_http_builtins(vm);
+  vm.allow_process = true;   // a script run from the console may start programs (process_run)
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif
