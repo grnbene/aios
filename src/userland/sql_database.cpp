@@ -49659,7 +49659,10 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   }
   if (!pk_cols.empty() || ai_idx >= 0) {
     if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
-    else if (t->row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(*t, pk_cols, ai_idx);
+    // A chunk of the key map per insert, never the whole table: this runs under the statement lock, and the first
+    // insert after a restart walked every row (stockmoves, 12.5M: 19 s) with every reader of every table waiting.
+    // The duplicate check answers from the column index (find_big_pk) until the map is whole.
+    else if (t->row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(*t, pk_cols, ai_idx, 16384);
   }
   auto find_big_pk = [&](const SqlRow& row, const std::string& pk_key) -> long long {
     // Candidates from whichever key column narrows them most for this row:
