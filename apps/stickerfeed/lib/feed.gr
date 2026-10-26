@@ -1,21 +1,25 @@
-// The feed's own arithmetic, shared: the service (service.gr) builds the feed with it, and the sticker_item Thing
-// (things/sticker_item.gr) builds each item's row with the very same code. What each importer gives it:
-//   rows(sql, params) / first_row(sql, params)   reads, as lists of the wire's text
-//   has_rga_type()                               whether rgaorders has rga_type
-// and the globals below, which an importer may set after the import (the Thing keeps its inputs: INPUTS = {}).
+// Shared catalog calculation and pricing library.
+//
+// Imported by both service.gr (for dynamic on-demand queries) and things/sticker_item.gr
+// (for ASQL Thing precomputation), ensuring identical pricing and inventory logic.
+//
+// Required caller environment:
+//   - rows(sql, params) / first_row(sql, params): raw SQL row queries
+//   - has_rga_type(): boolean indicating if rgaorders table supports `rga_type`
+//   - Optional global caches: INPUTS, WHOLE, KEEP_WHOLE
 
-// trim() with PHP's default characters
+// Trims whitespace and control characters matching PHP default trim behavior
 fn php_trim(s) {
   if s == nil { return "" }
   return trim(str(s), " \t\n\r\0\x0B")
 }
-// A value as PHP 7.4's json_encode() writes it with no flags: "/" as "\/", and every character past ASCII as
-// \uXXXX in lowercase hex (a surrogate pair past U+FFFF). json_stringify writes both as they are, which is the
-// same JSON; this keeps a vendor's bytes the PHP's, character for character.
+
+// Encodes data to JSON matching PHP 7.4 json_encode() with default flags:
+// Escapes forward slashes as "\/" and non-ASCII UTF-8 characters as lowercase "\uXXXX" hex.
 fn php_json(v) {
   let s = replace(json_stringify(v), "/", "\\/")
   if not regex_test("[^\\x00-\\x7F]", s) { return s }
-  let bs = chars(s)   // bytes: the few descriptions with accents or dashes come through here
+  let bs = chars(s)
   let out = []
   let i = 0
   while i < len(bs) {
@@ -39,14 +43,15 @@ fn php_json(v) {
   return join(out, "")
 }
 
-// A value as PHP's (string) casts it
+// Emulates PHP (string) typecasting rules
 fn php_str(v) {
   if v == nil or v == false { return "" }
   if v == true { return "1" }
   if type(v) == "list" or type(v) == "map" { return "Array" }
   return str(v)
 }
-// if ($v): "", "0", 0, null, false and an empty array are false
+
+// Emulates PHP boolean truthiness evaluation ("", "0", 0, nil, false, [] are false)
 fn php_truthy(v) {
   if v == nil { return false }
   let t = type(v)
@@ -57,11 +62,11 @@ fn php_truthy(v) {
   if t == "map" { return len(keys(v)) > 0 }
   return true
 }
-// The number a string starts with, as PHP 7.4 reads one: {d, whole}, or nil when it starts with none.
-// whole: the string is that number and nothing after it (is_numeric; trailing space does not count).
+
+// Parses leading numeric prefix from strings matching PHP numeric parsing
 fn num_prefix(s) { return decimal_prefix(s) }
 
-// A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
+// Coerces value to exact decimal matching PHP 7.4 numeric evaluation in arithmetic
 fn num(v) {
   if v == nil or v == false { return decimal(0) }
   if v == true { return decimal(1) }
@@ -71,21 +76,19 @@ fn num(v) {
   let p = num_prefix(v)
   return p == nil ? decimal(0) : p.d
 }
-// is_numeric($s): the number when the string is one and nothing more
+
+// Emulates PHP is_numeric($s), returning the parsed decimal if string is strictly numeric
 fn numeric_str(s) {
   if s == nil { return nil }
   let p = num_prefix(s)
   if p == nil or not p.whole { return nil }
   return p.d
 }
-// (int) $v
+
+// Emulates PHP (int) cast
 fn num_int(v) { return int(num(v)) }
 
-// number_format($v, $places, '.', '') on PHP 7.4: a string that is not numeric at all is refused
-// (a warning and NULL); a leading-numeric one counts as its number; null and false as 0. The value is
-// rounded to 15 significant digits first, then half away from zero, and a zero has no sign.
-// nf_dec() is that number as a decimal of `places` places, for arithmetic that goes on with what
-// number_format() printed: num(nf(v, p)) is nf_dec(v, p), or 0 where nf() gives nil.
+// Emulates PHP number_format($v, $places, '.', '') with 15-digit precision rounding half-away-from-zero
 fn nf_dec(v, places) {
   let d = decimal(0)
   if v == true { d = decimal(1) }
@@ -100,16 +103,17 @@ fn nf_dec(v, places) {
   }
   return decimal(round_sig(d, 15), places)
 }
+
 fn nf(v, places) {
   let d = nf_dec(v, places)
   return d == nil ? nil : str(d)
 }
-// $v > 0 and $v == 0 on PHP 7.4: a string compares by its leading number
-fn gt0(v) { return v != nil and v != false and num(v) > 0 }
 
+// PHP comparisons with zero
+fn gt0(v) { return v != nil and v != false and num(v) > 0 }
 fn eq0(v) { return v == nil or v == false or (v != true and num(v) == 0) }
 
-// in_array($v, $list) for the strings the ERP keeps: two numeric strings compare as numbers ("07" == "7")
+// Emulates PHP in_array() where numeric strings evaluate as numbers ("07" == "7")
 fn php_in(v, list) {
   let a = php_str(v)
   let an = numeric_str(a)
@@ -123,17 +127,18 @@ fn php_in(v, list) {
   }
   return false
 }
-// MariaDB compares the ERP's codes without case or trailing spaces
-// (PAD SPACE ignores trailing spaces only: 'VTG-VT11366' and 'VTG-VT11366' + CR are two items to it, and locstock
-// holds both)
+
+// Canonicalizes ERP codes (uppercase and right-trimmed) matching MariaDB case-insensitive collation
 fn ck(s) {
   if s == nil { return "" }
   return upper_rtrim(s)
 }
-// see whole(), below
+
+// Global reference table cache (used when KEEP_WHOLE is enabled by sticker_item Thing)
 let KEEP_WHOLE = false
 let WHOLE = {}
-// the first row for each key, as a ->row lookup gives it
+
+// Groups query results by key, preserving the first encountered row
 fn first_by(rs, k) {
   let g = {}
   for r in rs {
@@ -142,7 +147,8 @@ fn first_by(rs, k) {
   }
   return g
 }
-// numbers summed per key (a GROUP BY stockid whose groups MariaDB would have merged by collation)
+
+// Groups query results by key, summing numeric values in column `v`
 fn sum_by(rs, k, v) {
   let g = {}
   for r in rs {
@@ -152,7 +158,8 @@ fn sum_by(rs, k, v) {
   }
   return g
 }
-// rows grouped by a key column's ck(), in the order the rows came
+
+// Groups query results into lists by key column `k`
 fn group_rows(rs, k) {
   let g = {}
   for r in rs {
@@ -162,20 +169,18 @@ fn group_rows(rs, k) {
   }
   return g
 }
-// The tables every build reads whole - the brands, the price levels, the product lines' price rules, the remote
-// warehouses, the forced costs. A caller that builds over and over (the sticker_item Thing, one item at a time)
-// sets KEEP_WHOLE and clears WHOLE when one of them changes; a request to the feed reads them afresh.
+
+// Retrieves reference tables loaded whole (e.g. manufacturers, sales types, prodlineprice)
 fn whole(name, load) {
   if KEEP_WHOLE and has(WHOLE, name) { return WHOLE[name] }
   let v = load()
   if KEEP_WHOLE { WHOLE[name] = v }
   return v
 }
-// What one table gives the items, kept between builds per item. The sticker_item Thing sets INPUTS to {} and, as
-// writes come in, marks the items a table's change reaches as dirty in the inputs read from that table; a request
-// to the feed leaves it nil and reads everything afresh. input(name, only, load): load(ids) reads the table for
-// those stockids (nil: all of them) into a map by ck(); of `only`, what was never read or is marked is read now.
+
+// Incremental cache manager for per-item table reads during batch or reactive Thing passes
 let INPUTS = nil
+
 fn input(name, only, load) {
   if INPUTS == nil { return load(only) }
   let st = INPUTS[name]
@@ -211,17 +216,16 @@ fn input(name, only, load) {
   }
   return st.v
 }
-// " AND col IN (?)" and its parameter, for a read of some items (ids nil: all of them)
+
+// SQL query helper building " AND col IN (?)" predicates
 fn in_ids(col, ids) { return ids == nil ? "" : " AND " + col + " IN (?)" }
 fn with_ids(params, ids) {
   if ids != nil { push(params, ids) }
   return params
 }
-// the stock the remote locations hold, per stockid: what primarymixedinventory gives for the locations
-// 03, 62, 64 and 67. That view is built whole whatever it is asked, and again after every write anywhere,
-// so its two halves are read here as they are written in it - the locstock sums, and the remote stock grouped by
-// stockid and sort_value, which keeps the first row of each group as the view does - with the stockids asked
-// for taken inside each, which no group spans.
+
+// Computes aggregate inventory across remote warehouses (locations 03, 62, 64, and 67).
+// Combines on-hand locstock with supplier remotestock mappings.
 fn remote_stock(only) {
   let in_l = only == nil ? "" : " and l.stockid in (?)"
   let in_r = only == nil ? "" : " where r.stockid in (?)"
@@ -238,12 +242,20 @@ fn remote_stock(only) {
     "join remotemapping rm on rm.api_id = a.api_id and rm.warehouse = r.loccode" + in_r + " group by r.stockid, rm.sort_value) x " +
     "where x.loccode in ('03','62','64','67')) u GROUP BY stockid", params), 0, 1)
 }
-// everything after the base rows: one build over those items, `only` being the stockids to read the other tables for (nil: whole)
+// Assembles catalog items from base query rows and associated inventory/pricing tables.
+// Arguments:
+//   - base: array of [stockid, manufacturer_id, mfgpart, price, description, sort2, additionalfee]
+//   - levels: list of customer price levels to compute
+//   - only: specific stockids to constrain queries to, or nil for full table scans
+//   - d: current date string (YYYY-MM-DD)
+//   - remote_given: precomputed remote inventory map, or nil to query on-demand
+//   - defer: if true, leaves raw decimal quantity and adds `_k` key for subsequent parallel merging
 fn build_items(base, levels, only, d, remote_given, defer) {
-  // quantity: getOnSalesOrder() and getOnOpenRgaByType() for warehouse 01, primarymixedinventory for the rest
+  // Warehouse 01 physical on-hand quantity
   let qoh01 = input("qoh01", only, fn (ids) {
     return sum_by(rows("SELECT stockid, SUM(quantity) AS q FROM locstock WHERE loccode IN ('01')" + in_ids("stockid", ids) + " GROUP BY stockid", with_ids([], ids)), 0, 1)
   })
+  // Open sales order reservations against Warehouse 01
   let so_open = input("so_open", only, fn (ids) {
     let m = {}
     for r in rows("SELECT stkcode, SUM(quantity) AS q, SUM(qtyinvoiced) AS i FROM salesorderdetails WHERE completed != 1 AND orderno in (select orderno from salesorders where fromstkloc = '01')" + in_ids("stkcode", ids) + " GROUP BY stkcode", with_ids([], ids)) {
@@ -253,6 +265,7 @@ fn build_items(base, levels, only, d, remote_given, defer) {
     }
     return m
   })
+  // Pending uncompleted RGA returns into Warehouse 01
   let rga_type = has_rga_type()
   let rga = input("rga", only, fn (ids) {
     let m = {}
@@ -280,8 +293,8 @@ fn build_items(base, levels, only, d, remote_given, defer) {
     let no = item[0]
     let key = ck(no)
 
-    // $avail = QTY_ON_HAND - getOnSalesOrder() + remote: the one row a SUM without GROUP BY returns, where
-    // a falsy sum counts as 0, which is the number it already is
+    // Available Inventory Formula:
+    // available = locstock(01) - open_sales_orders - pending_rga_returns + remote_warehouses
     let onorder = (so_open[key] == nil ? 0 : so_open[key]) + (rga[key] == nil ? 0 : rga[key])
     let avail = decimal(qoh01[key] == nil ? 0 : qoh01[key]) - onorder + (remote[key] == nil ? 0 : remote[key])
 
@@ -290,7 +303,7 @@ fn build_items(base, levels, only, d, remote_given, defer) {
     if m != nil { brand = m[1] }
     if not php_truthy(brand) { brand = "UNKNOWN" }
 
-    // getSpecialPrices(): the first live special's JSON, else false
+    // Evaluate promotional pricing overrides if active in stockspecials
     let special = false
     let sp = specials[key]
     if sp != nil and sp[1] != nil {
@@ -331,9 +344,8 @@ fn build_items(base, levels, only, d, remote_given, defer) {
   }
   return out
 }
-// getPLMPrice($stockid, $level): the price-level machinery, with every table it reads loaded once.
-// PHP passes number_format() strings between its steps; here each step hands on the same number as a
-// decimal (nf_dec), and only the feed's own nf() prints it.
+// Instantiates a Price Level Manager (PLM) evaluator for resolving customer prices.
+// Pre-loads pricing matrices (salestypes, prodlineprice, prices pricebooks) and cost structures.
 fn make_pricer(only) {
   let salestypes = whole("salestypes", fn () { return first_by(rows("SELECT typeabbrev, ispricebook, fallback FROM salestypes", nil), 0) })
   let plp = whole("plp", fn () {
@@ -442,9 +454,7 @@ fn make_pricer(only) {
     return c
   }
 
-  // getNextCost(): the first supplier, in preferred order, that has it in a remote warehouse, with PHP's
-  // own loop. Its quirks are kept: a price read as the string "0.0000" is truthy, so it stops the search
-  // only through "> 0"; an empty first supplier without a remote API ends the search.
+  // Resolves supplier cost based on preferred vendor priority order and remote stock availability
   let next_cost = fn (stockid) {
     let c = costs()
     let key = ck(stockid)
@@ -474,7 +484,6 @@ fn make_pricer(only) {
       if gt0(nextcost) { break }
     }
     if eq0(nextcost) {
-      // GREATEST(lastcost, materialcost, last completed PO price or 0)
       let s = sm[key]
       if s == nil { return nil }
       let po = c.lastpo[key]
@@ -483,9 +492,7 @@ fn make_pricer(only) {
     return nextcost
   }
 
-  // getItemCost(): stock on hand after demand, then the moving cost or the next cost; a forced cost wins.
-  // getItemDemand() is called once per location but has no location filter, so the whole demand comes
-  // off once for every location the item has - PHP's own arithmetic, kept.
+  // Computes base item cost accounting for available inventory demand, recent PO receipts, or next cost
   let item_cost = fn (stockid) {
     let c = costs()
     let key = ck(stockid)
@@ -543,7 +550,8 @@ fn make_pricer(only) {
     return p
   }
 }
-// resolvePriceLevel(): the branch's level, then the debtor's, then W
+
+// Resolves customer price level hierarchy: Branch pricelevel -> Debtor salestype -> Wholesale ('W')
 fn resolve_price_level(debtorno, branchcode) {
   if not php_truthy(debtorno) { return "W" }
   if php_truthy(branchcode) and lower(php_str(branchcode)) != "all" {
