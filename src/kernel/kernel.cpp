@@ -722,6 +722,7 @@ Result<void> Kernel::fleet_join(const std::string& hub_host, uint16_t hub_port, 
   relay_ = std::make_unique<RelayClient>(cluster_key, self_);
   if (!member_key.empty()) relay_->set_member_key(member_key);
   relay_->set_attest(attest);
+  if (node_key_ok_) relay_->set_signer([this](ByteSpan m) { auto s = node_sign(m); return s.ok() ? ByteBuffer(s->begin(), s->end()) : ByteBuffer(); });
   auto a = relay_->attach(hub_host, hub_port, keep_trying);
   if (!a.ok()) { relay_.reset(); return a.error(); }
   // Peers that open a circuit to us become guests exactly like a direct peer.

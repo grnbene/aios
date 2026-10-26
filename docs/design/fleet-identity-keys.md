@@ -1,6 +1,11 @@
-# Fleet identity keys — design (not yet implemented)
+# Fleet identity keys — design (stages 1–2 implemented)
 
-Status: proposal, 2026-10-26. Replaces the shared cluster key with one key pair per machine, in stages that keep the
+Status: proposal, 2026-10-26. Stage 1 (ce1813e) and stage 2 are in: `tools/fleet-identity-check.cpp`,
+`tools/fleet-signed-attach-check.cpp`. Stage 2 wire format: the hub's challenge is 16 random bytes plus a flags byte
+(bit 0: signatures taken, set when the hub has a members file); a member that sees it appends a 64-byte Ed25519
+signature over `"aios fleet attach v1\0" || challenge || member id` to its 16-byte key proof. A members-file line with
+`ed25519=` admits by that signature only. Upgrade the hub first, then a member, then add its `ed25519=` (from
+`fleet identity` on that machine). Replaces the shared cluster key with one key pair per machine, in stages that keep the
 fleet running throughout.
 
 ## Today

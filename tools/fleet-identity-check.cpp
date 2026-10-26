@@ -8,6 +8,7 @@
 #include <string>
 #include "aios/kernel/kernel.hpp"
 #include "aios/crypto/curve25519.hpp"
+#include "aios/fleet/relay.hpp"
 
 using namespace aios;
 
@@ -48,6 +49,18 @@ int main() {
     if (!k.ok()) { std::printf("second boot failed: %s\n", k.error().message.c_str()); return 1; }
     const crypto::Point32* pub = (*k)->node_public_key();
     CHECK(pub != nullptr && *pub == first, "a restart keeps the same key");
+    // fleet join signs with this key: a hub that lists only the public key (no member key) admits the machine.
+    const std::string members = root + "/hub-members";
+    { std::ofstream f(members, std::ios::trunc); f << (*k)->self().str() << " ed25519=" << hex(ByteSpan(first.data(), first.size())) << "\n"; }
+    RelayHub hub("cluster-key-for-the-check");
+    hub.set_members_file(members);
+    auto port = hub.start(0, true);
+    CHECK(port.ok(), "a hub starts");
+    if (port.ok()) {
+      auto j = (*k)->fleet_join("127.0.0.1", *port, "cluster-key-for-the-check");
+      CHECK(j.ok() && (*k)->in_fleet(), ("fleet join attaches by its identity key: " + (j.ok() ? std::string("ok") : j.error().message)).c_str());
+    }
+    hub.stop();
   }
   {
     // A damaged file: the kernel boots without a key and does not replace it.

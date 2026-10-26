@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <map>
 #include "aios/capability/attestation.hpp"
+#include "aios/crypto/curve25519.hpp"
 #include "aios/core/strbuf.hpp"
 #include <memory>
 
@@ -169,7 +170,12 @@ struct RelayHub::Impl {
 };
 
 namespace {
-struct MemberCred { std::string key; ByteBuffer ak; ByteBuffer pcrs; };
+struct MemberCred {
+  std::string key;
+  ByteBuffer ak, pcrs;
+  bool ed_listed = false;   // the line has ed25519=: this member attaches by signature, its key proof is not enough
+  ByteBuffer ed25519;       // 32 bytes when well formed
+};
 ByteBuffer from_hex(const std::string& h) {
   ByteBuffer out;
   for (size_t i = 0; i + 1 < h.size(); i += 2) {
@@ -179,7 +185,8 @@ ByteBuffer from_hex(const std::string& h) {
   }
   return out;
 }
-// The members file: `<member-id> <key> [ak=<hex>] [pcrs=<hex>]` per line, `#` comments.
+// The members file: `<member-id> <key> [ak=<hex>] [pcrs=<hex>] [ed25519=<hex>]` per line, `#` comments. With
+// ed25519= the key column may be left out: `<member-id> ed25519=<hex>`.
 bool load_members(hal::Host& host, const std::string& path, std::map<std::string, MemberCred>& out) {
   auto b = host.read_file(path);
   if (!b.ok()) return false;
@@ -189,10 +196,12 @@ bool load_members(hal::Host& host, const std::string& path, std::map<std::string
     for (const auto& piece : aios::split_lines(raw, ' ')) if (!piece.empty() && piece != "\r") w.push_back(piece);
     if (w.size() < 2 || w[0][0] == '#') continue;
     MemberCred m;
-    m.key = w[1];
-    for (size_t i = 2; i < w.size(); ++i) {
+    size_t opts = 1;
+    if (w[1].rfind("ed25519=", 0) != 0) { m.key = w[1]; opts = 2; }
+    for (size_t i = opts; i < w.size(); ++i) {
       if (w[i].rfind("ak=", 0) == 0) m.ak = from_hex(w[i].substr(3));
       else if (w[i].rfind("pcrs=", 0) == 0) m.pcrs = from_hex(w[i].substr(5));
+      else if (w[i].rfind("ed25519=", 0) == 0) { m.ed_listed = true; m.ed25519 = from_hex(w[i].substr(8)); }
     }
     out[w[0]] = std::move(m);
   }
@@ -213,6 +222,19 @@ const MemberCred* find_member(const std::map<std::string, MemberCred>& m, const 
     if (!best || k.size() > best_len) { best = &v; best_len = k.size(); }
   }
   return best;
+}
+
+// The hub's challenge: 16 random bytes, then a flags byte. Bit 0: this hub takes a signed attach. A member's key
+// proof (and a TPM quote) covers the whole challenge, so an older member, which proves over whatever it was sent,
+// still attaches.
+constexpr uint8_t kChallengeSigned = 0x01;
+// What a member signs: a fixed label, the hub's challenge and the id it claims.
+ByteBuffer attach_transcript(ByteSpan challenge, const Id128& id) {
+  static const char kLabel[] = "aios fleet attach v1";
+  ByteBuffer t(kLabel, kLabel + sizeof(kLabel));   // with its NUL
+  t.insert(t.end(), challenge.begin(), challenge.end());
+  Writer w(t); w.id(id);
+  return t;
 }
 }  // namespace
 
@@ -248,13 +270,19 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
       if (!c.ok()) continue;
       auto member = std::make_shared<Impl::Member>();
       member->c = std::shared_ptr<hal::Connection>(std::move(*c));
-      // Challenge/response on the cluster key so only fleet members attach.
-      uint8_t nonce[16]; im->host->random(MutableByteSpan(nonce, 16));
-      if (!wr(*member->c, member->send, Challenge, ByteSpan(nonce, 16))) continue;
+      // Challenge/response so only fleet members attach: a key proof (the cluster key, or the member's own key
+      // from the members file), or a signature by the identity key the members file lists for the member.
+      uint8_t nonce[17]; im->host->random(MutableByteSpan(nonce, 16));
+      nonce[16] = im->members_path.empty() ? 0 : kChallengeSigned;
+      if (!wr(*member->c, member->send, Challenge, ByteSpan(nonce, sizeof nonce))) continue;
       uint8_t at; ByteBuffer ap;   // the Attach frame
       if (!rd(*member->c, at, ap, 10000) || at != Attach) continue;
-      Reader ar(ap); ByteSpan proof = ar.bytes(); Id128 id = ar.id();
+      Reader ar(ap); ByteSpan proof_field = ar.bytes(); Id128 id = ar.id();
       if (!ar.ok()) continue;
+      // The proof field: the 16-byte key proof, then (from a member that signs) its 64-byte signature.
+      if (proof_field.size() != 16 && proof_field.size() != 16 + 64) continue;
+      ByteSpan proof(proof_field.data(), 16);
+      ByteSpan sig = proof_field.size() == 80 ? ByteSpan(proof_field.data() + 16, 64) : ByteSpan();
       auto refuse = [&](const std::string& why) { wr(*member->c, member->send, RErr, ByteSpan((const uint8_t*)why.data(), why.size())); };
       std::string admit_key = im->key;
       const MemberCred* cred = nullptr;
@@ -265,8 +293,17 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
         if (!cred) { refuse("not a listed member of this fleet"); continue; }
         admit_key = cred->key;
       }
-      auto expect = crypto::derive_key(admit_key, ByteSpan(nonce, 16));
-      if (!ct_eq(proof, ByteSpan(expect.data(), 16))) { refuse(cred ? "bad member key" : "bad key"); continue; }
+      if (cred && cred->ed_listed) {
+        // Listed with an identity key: only a signature by it admits - a copied member key does not.
+        if (cred->ed25519.size() != 32) { refuse("the hub's members file lists a malformed ed25519 key for this member"); continue; }
+        if (sig.empty()) { refuse("this member is listed with an identity key and must sign its attach (upgrade it)"); continue; }
+        crypto::Point32 pub; std::memcpy(pub.data(), cred->ed25519.data(), 32);
+        crypto::Sig64 s64; std::memcpy(s64.data(), sig.data(), 64);
+        if (!crypto::ed25519_verify(attach_transcript(ByteSpan(nonce, sizeof nonce), id), s64, pub)) { refuse("bad signature: not the identity key listed for this member"); continue; }
+      } else {
+        auto expect = crypto::derive_key(admit_key, ByteSpan(nonce, sizeof nonce));
+        if (!ct_eq(proof, ByteSpan(expect.data(), 16))) { refuse(cred ? "bad member key" : "bad key"); continue; }
+      }
       if (im->require_attest) {
         // The quote follows the id: attested, signature, signer, then the PCRs it covers.
         capability::TPMQuote q;
@@ -282,7 +319,7 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
         if (!ar.ok()) { refuse("the quote is malformed"); continue; }
         if (!cred || cred->ak.size() != 65) { refuse("no attestation key is listed for this member"); continue; }
         if (q.signer_public != std::vector<uint8_t>(cred->ak.begin(), cred->ak.end())) { refuse("the quote is signed by a key not listed for this member"); continue; }
-        auto v = capability::HardwareAttestor::verify_quote_standalone(q, std::vector<uint8_t>(nonce, nonce + 16));
+        auto v = capability::HardwareAttestor::verify_quote_standalone(q, std::vector<uint8_t>(nonce, nonce + sizeof nonce));
         if (!v.ok() || !*v) { refuse("the quote does not verify: " + (v.ok() ? std::string("bad signature") : v.error().message)); continue; }
         const auto signed_digest = capability::HardwareAttestor::signed_pcr_digest(q);
         if (!cred->pcrs.empty() && (cred->pcrs.size() != 32 || signed_digest != std::vector<uint8_t>(cred->pcrs.begin(), cred->pcrs.end()))) {
@@ -431,6 +468,7 @@ struct RelayClient::Impl {
   std::string key;
   std::string member_key;     // per-member attach key; empty: the cluster key
   bool attest = false;
+  std::function<ByteBuffer(ByteSpan)> signer;   // the identity key; empty: key proof only
   Id128 self;
   std::shared_ptr<hal::Connection> c;
   hal::Mutex send;
@@ -553,7 +591,12 @@ struct RelayClient::Impl {
     uint8_t t; ByteBuffer p;
     if (!rd(*conn, t, p, 8000) || t != Challenge) { last_err = "no challenge from the hub"; return false; }
     auto proof = crypto::derive_key(member_key.empty() ? key : member_key, p);
-    ByteBuffer ab; Writer w(ab); w.bytes(ByteSpan(proof.data(), 16)); w.id(self);
+    ByteBuffer proof_field(proof.data(), proof.data() + 16);
+    if (signer && p.size() == 17 && (p[16] & kChallengeSigned)) {
+      ByteBuffer s = signer(attach_transcript(p, self));
+      if (s.size() == 64) proof_field.insert(proof_field.end(), s.begin(), s.end());
+    }
+    ByteBuffer ab; Writer w(ab); w.bytes(proof_field); w.id(self);
     if (attest) {
       // Scoped: the TPM is let go before the hub is waited on.
       capability::HardwareAttestor tpm;
@@ -646,6 +689,7 @@ struct RelayClientHolder { std::shared_ptr<RelayClient::Impl> impl; };
 
 void RelayClient::set_member_key(std::string key) { IM->member_key = std::move(key); }
 void RelayClient::set_attest(bool on) { IM->attest = on; }
+void RelayClient::set_signer(std::function<ByteBuffer(ByteSpan)> sign) { IM->signer = std::move(sign); }
 
 RelayClient::RelayClient(std::string cluster_key, Id128 self) {
   auto im = std::make_shared<Impl>();
