@@ -1,39 +1,36 @@
-# sticker_item - the sticker feed's rows, one Thing per tire, kept current by the engine.
-#
-# The feed (../service.gr) built every item from the raw tables on each request: seconds of CPU a pull. Here the
-# same code (../lib/feed.gr, which both import) runs once per item that a write reaches, and the finished row
-# waits in memory: a pull reads rows that are already right. Nothing is cached or aged: a row is replaced the
-# moment a table it was built from changes, by the same code and the same arithmetic.
-#
-#   mid      the manufacturer id (the feed's brand exclusions are by it)
-#   vitem    the item number as the feed prints it (the sku exclusions are by it)
-#   r_<L>    the item's finished JSON object for price level L, byte for byte what the feed sends
-#
-# Levels are the ones the feed's clients resolve to (shared()); a client on a level that is not here
-# is answered the old way, by building.
-#
-# Which items a write reaches (touched()): a row of a per-item table names its item; an order names
-# its lines' items; a brand its items, a shipper the open lines of its orders; a table every item
-# is priced from (price levels, the remote warehouses) moves all of them; a client or a branch moves the set of levels.
+// sticker_item - ASQL Reactive Materialized View (Thing) for Vendor Catalog Feeds
+//
+// Maintains in-memory, pre-rendered JSON payload rows for each tire SKU across all active customer
+// price levels (e.g. `r_W`, `r_L`). Serves vendor catalog pulls in ~280ms via `SHOW THING sticker_item`.
+//
+// Projected Fields:
+//   mid      Manufacturer ID (used to evaluate vendor brand exclusions)
+//   vitem    Vendor item / SKU code (used to evaluate vendor SKU exclusions)
+//   r_<LVL>  Pre-rendered JSON object string for customer price level <LVL>
+//   wake_at  Timestamp indicating when a pricing or promotional special boundary occurs
+//
+// Lifecycle Hooks:
+//   - enroll(): Identifies candidate tire SKUs from stockmaster (categoryid = 'TIRE').
+//   - shared(): Provides global parameters across all items (distinct customer price levels).
+//   - things(keys, shared): Builds and returns projected records for the requested keys.
+//   - touched(table, op, before, after, shared): Event-driven CDC invalidation handler.
+//     Translates table mutations into dirty SKU keys or global rebuild signals.
 
 import "../lib/feed.gr"
 
-# The date moves an item only where a price or a special of its own starts or ends (wake_at, below), so the
-# engine need not read every item again when the day turns.
+// Instructs the engine that daily transitions only affect items with an active wake_at date
 let DAY_SAFE = true
 
 let BIG_BATCH = 4000
 
-# the tables every item reads whole are kept between refreshes (whole(), in lib/feed.gr) and dropped
-# when one of them changes
+// In-memory cache for reference tables shared across all items during batch builds
 KEEP_WHOLE = true
 WHOLE = {}
 
 let HAS_RGA_TYPE = pcall(read, "SELECT rga_type FROM rgaorders LIMIT 1").ok
 fn has_rga_type() { return HAS_RGA_TYPE }
 
-# The feed's code reads rows by position and its values as the wire carries them (text: a price "0.0000" is
-# a string there, and what PHP does with a string is what that code keeps). read_raw() gives both.
+// Executes raw wire-format SQL queries, returning positional column arrays for high throughput
 fn rows(sql, params) {
   let out = []
   for r in read_raw_with(sql, params) { push(out, values(r)) }
@@ -48,7 +45,7 @@ fn first_row(sql, params) {
 
 fn today() { return read_raw("SELECT CURDATE() AS d")[0].d }
 
-# resolvePriceLevel(), for every client the feed has
+// Discovers the distinct set of price levels assigned to all registered API clients
 fn client_levels() {
   let seen = {}
   let out = []
@@ -63,16 +60,17 @@ fn client_levels() {
   return sort(out)
 }
 
-# the stockids that may be Things: the feed's base query keeps those it wants
+// enroll(): Identifies candidate stockids to track as Things
 fn enroll() {
   let out = []
   for r in read("SELECT stockid FROM stockmaster WHERE categoryid = 'TIRE'") { push(out, r.stockid) }
   return out
 }
 
+// shared(): Context passed to things() and touched()
 fn shared() { return {"levels": client_levels()} }
 
-# The next day, after today, that a price or a special of an item starts or has ended: the item is read again then
+// Computes future calendar boundary dates when promotional specials or price rules activate/expire
 fn next_changes(ids, levels, d) {
   let at = {}
   let note = fn (id, day) {
@@ -95,18 +93,12 @@ fn next_changes(ids, levels, d) {
   return at
 }
 
-# What each table gives each item is kept (input(), copied from the feed): a write marks, in the inputs read
-# from its table, the items it reaches (touched(), below), and a refresh reads again only those - a stock
-# change is three small reads, not fifteen. A pass over every item reads only what was marked or dropped.
+// Incremental cache and dirty-tracking state for table inputs
 INPUTS = {}
 let INPUT_DAY = nil
-# the inputs that are read with the date; a new day drops them
 let DATED = ["base", "specials", "wake"]
-# items touched() has marked since things() last read them; things() reads anything else it is asked about afresh
 let MARKED = {}
-# touched() answered "all" or that the levels moved: the full pass that follows is for what it marked
 let FULL_EXPECTED = false
-# a touched() that did not finish leaves this set: what it would have marked is not known
 let IN_TOUCHED = false
 
 fn drop_input(name) {
@@ -125,9 +117,7 @@ fn mark(id, names) {
   }
 }
 
-# The base query's rows for some items, each of its three tables read by the items' keys and put together here: the
-# join itself, right after a write to prices, rebuilt what it keeps of that table (5 ms; a key read is a tenth of a ms).
-# An item with two manufacturer rows is answered by the join, so which one it keeps stays the engine's choice.
+// Queries the base item row join (stockmaster, product_to_manufacturer, prices) for specific SKU keys
 fn base_rows(sql, ids, d) {
   let pm = {}
   for r in rows("select stockid, manufacturer_id from product_to_manufacturer where stockid IN (?)", [ids]) {
@@ -140,18 +130,17 @@ fn base_rows(sql, ids, d) {
   for r in rows("select stockid, mfgpart, description, sort2, additionalfee from stockmaster where categoryid = 'TIRE' and discontinued = 0 and stockid IN (?)", [ids]) {
     let k = ck(r[0])
     if not has(pm, k) or not has(pr, k) or has(out, k) { continue }
-    # ITEM_NUMBER, VENDOR_1, VENDOR_ITEM_NO, PRICE_LEVEL_6, ITEM_DESCR, SORT_2, FET_PRC_LVL_5
     out[k] = [r[0], pm[k], r[1], pr[k][1], r[2], r[3], r[4]]
   }
   return out
 }
 
+// things(ks, sh): Main projection batch generator. Produces precomputed JSON rows for candidate keys
 fn things(ks, sh) {
   let d = today()
   let levels = sh.levels
   let big = len(ks) > BIG_BATCH
   if IN_TOUCHED or (big and not FULL_EXPECTED) {
-    # a pass nobody's write explained (the first, a REFRESH, a RESUME, a touched() that failed): all afresh
     INPUTS = {}
     WHOLE = {}
     IN_TOUCHED = false
@@ -163,13 +152,11 @@ fn things(ks, sh) {
     INPUT_DAY = d
   }
   if not big {
-    # an item asked about that no write marked (it woke, or is new): read whole
     let all_names = keys(INPUTS)
     for k in ks { if not has(MARKED, ck(k)) { mark(k, all_names) } }
   }
   for k in ks { if has(MARKED, ck(k)) { del(MARKED, ck(k)) } }
 
-  # (the list on each of the three tables: the engine reads each by it, instead of joining whole tables to the one)
   let sql = "select stockmaster.stockid as ITEM_NUMBER, manufacturer_id as VENDOR_1, mfgpart as VENDOR_ITEM_NO, price as PRICE_LEVEL_6, description as ITEM_DESCR, sort2 as SORT_2,additionalfee as FET_PRC_LVL_5 from stockmaster inner join product_to_manufacturer on stockmaster.stockid = product_to_manufacturer.stockid inner join prices on stockmaster.stockid = prices.stockid where stockmaster.categoryid = 'TIRE' and prices.typeabbrev = 'W' and prices.price > 0 and prices.startdate <= ? and prices.enddate >= ?  and discontinued = 0"
   let by_id = input("base", big ? nil : ks, fn (ids) {
     if ids == nil { return first_by(rows(sql + " group by stockmaster.stockid", [d, d]), 0) }
@@ -207,8 +194,7 @@ fn things(ks, sh) {
   return out
 }
 
-# the Thing's own spelling of a stockid, as stockmaster keeps it: the tables are compared without case
-# or trailing spaces, so a row may name an item by another spelling of it
+// Canonicalizes stockids against stockmaster to resolve case or padding differences
 let CANON = {}
 fn canon(v) {
   if v == nil { return nil }
@@ -220,7 +206,7 @@ fn canon(v) {
   return c
 }
 
-# per-item tables: the column that names the item
+// Maps per-item tables to their respective item-identifier column name
 let ITEM_COL = {
   "stockmaster": "stockid", "product_to_manufacturer": "stockid", "prices": "stockid", "locstock": "stockid",
   "stockmoves": "stockid", "purchdata": "stockid", "purchorderdetails": "itemcode", "remotestock": "stockid",
@@ -228,28 +214,27 @@ let ITEM_COL = {
   "salesorderdetails": "stkcode", "rgaorderdetails": "itemcode"
 }
 
-# what prices and remote stock are worked out from, for every item: a change here is a pass over all of them
+// Global tables whose changes invalidate all items or affect customer price level sets
 let EVERY_ITEM = {"salestypes": true, "prodlineprice": true, "remoteapi": true, "remotemapping": true}
 let LEVELS_MOVE = {"sticker_feed_exclusions": true, "custbranch": true, "debtorsmaster": true}
-# the columns of each of those the price levels are worked out from (client_levels, resolve_price_level). An update
-# that leaves them as they were moves no level: the service writes lastsent into sticker_feed_exclusions on every
-# pull, and each one made the Thing work out every client's level again - under the lock every read waits on
+
+// Columns that determine customer price level mappings. Updates leaving these untouched skip re-indexing.
 let LEVEL_COLS = {"sticker_feed_exclusions": ["debtorno", "branchcode"], "custbranch": ["debtorno", "branchcode", "pricelevel"],
                   "debtorsmaster": ["debtorno", "salestype"]}
 
 fn levels_unmoved(t, before, after) {
-  if before == nil or after == nil { return false }   # a row added or removed may be a client, or a branch's level
+  if before == nil or after == nil { return false }
   for c in LEVEL_COLS[t] {
     if str(before[c]) != str(after[c]) { return false }
   }
   return true
 }
 
-# the tables kept whole (whole(), in the feed) that each of these is read into
+// Reference tables cached whole and their corresponding cache keys
 let WHOLE_OF = {"manufacturer": ["mfg"], "salestypes": ["salestypes"], "prodlineprice": ["plp"], "remoteapi": ["rapi"],
                 "remotemapping": ["rapi"], "forcedcostoverride": ["forced"]}
 
-# the inputs (see input()) each per-item table is read into
+// Input caches invalidated when specific tables receive writes
 let TABLE_INPUTS = {
   "stockmaster": ["base", "sm"], "product_to_manufacturer": ["base"], "prices": ["base", "wake", "pb_*"],
   "locstock": ["qoh01", "remote", "locs"], "stockmoves": ["last25"], "purchdata": ["pd"],
@@ -258,11 +243,9 @@ let TABLE_INPUTS = {
   "rgaorderdetails": ["rga"], "salesorders": ["so_open", "demand"], "rgaorders": ["rga"], "shippers": ["demand"],
   "manufacturer": ["remote"]
 }
-# what every item reads from these is read again whole
 let EVERY_INPUTS = {"remoteapi": ["remote", "rs"], "remotemapping": ["remote", "rs"]}
 
-# A whole number, as a decimal, or nil: what the stock sums below can be moved by exactly. (quantity is a DOUBLE: SQL
-# sums those in floating point, which is exact for whole numbers and only for them.)
+// Validates whether a quantity is a whole integer suitable for in-memory delta arithmetic
 fn whole_qty(v) {
   if v == nil { return nil }
   let d = num(v)
@@ -270,8 +253,7 @@ fn whole_qty(v) {
   return decimal(int(d))
 }
 
-# held[key] += by, where what is held for that item is current: false when it is not (never read, marked, or not a
-# whole number), and the item's inputs are read again instead
+// Applies delta quantity adjustment to cached location sums in-place
 fn move_sum(name, key, sub, by) {
   let st = INPUTS[name]
   if st == nil { return true }
@@ -291,9 +273,8 @@ fn move_sum(name, key, sub, by) {
 
 let REMOTE_LOCS = {"03": true, "62": true, "64": true, "67": true}
 
-# A stock quantity changed in place (the same item at the same location, whole numbers before and after): the three
-# sums it is in (warehouse 01's, the remote locations', each location's) move by the change, with nothing read. True
-# when that was all it took.
+// Fast-path handler for in-place locstock quantity updates:
+// Directly adjusts cached sums for warehouse 01, remote locations, and per-location totals without disk reads.
 fn stock_moved(before, after) {
   if before == nil or after == nil { return false }
   if not (ck(before.stockid) == ck(after.stockid)) or not (ck(before.loccode) == ck(after.loccode)) { return false }
@@ -313,6 +294,7 @@ fn stock_moved(before, after) {
   return true
 }
 
+// touched(): ASQL CDC invalidation hook. Evaluates table writes and marks affected item keys dirty
 fn touched(table, op, before, after, sh) {
   IN_TOUCHED = true
   let t = lower(table)
@@ -336,6 +318,7 @@ fn touched(table, op, before, after, sh) {
   return r
 }
 
+// Discovers which item SKU keys are affected by database insert/update/delete events
 fn touched_items(t, before, after) {
   if has(LEVELS_MOVE, t) {
     if levels_unmoved(t, before, after) { return [] }
@@ -348,7 +331,6 @@ fn touched_items(t, before, after) {
   if col != nil {
     for row in [before, after] {
       if row == nil { continue }
-      # only the newest type-25 move's price is read from stockmoves
       if t == "stockmoves" and row["type"] != 25 { continue }
       let c = canon(row[col])
       if c != nil and seen[c] == nil {
@@ -358,7 +340,7 @@ fn touched_items(t, before, after) {
     }
     return out
   }
-  # a brand moves its own items, and the remote stock that names it; a shipper, the open lines of its orders
+  // Manufacturer updates affect branded items and remote stock; shipper updates affect open order lines
   if t == "manufacturer" or t == "shippers" {
     for row in [before, after] {
       if row == nil { continue }
@@ -379,7 +361,7 @@ fn touched_items(t, before, after) {
     }
     return out
   }
-  # an order's lines name the items it moves (its location, its shipper, whether it is a quote)
+  // Sales orders and RGA returns affect their line item SKUs
   let lines = nil
   for row in [before, after] {
     if row == nil { continue }

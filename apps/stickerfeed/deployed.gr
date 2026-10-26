@@ -1,6 +1,8 @@
-# Once the version is up: the sticker_item Thing becomes this version's, in place - the engine builds it beside
-# the one there and switches when its first pass is done, so the feed's held rows never go away. Its program is
-# things/sticker_item.gr with lib/feed.gr in it (app_program), the code the service itself runs.
+// Post-deploy hook.
+// Registers or replaces the `sticker_item` ASQL Thing.
+// ASQL compiles the Thing program in the background alongside any existing version,
+// seamlessly swapping the pointer once the initial population pass finishes.
+// The Thing bundle is assembled by app_program("things/sticker_item.gr") with lib/feed.gr embedded.
 
 fn setting(name, fallback) {
   let v = getenv(name)
@@ -10,6 +12,7 @@ fn setting(name, fallback) {
   return fallback
 }
 
+// Database tables observed by the sticker_item Thing for reactive change tracking.
 let READS = "stockmaster, product_to_manufacturer, prices, locstock, stockmoves, purchdata, purchorderdetails, " +
             "remotestock, tireinfo, stockspecials, forcedcostoverride, salesorderdetails, rgaorderdetails, salesorders, " +
             "rgaorders, shippers, manufacturer, salestypes, prodlineprice, remoteapi, remotemapping, " +
