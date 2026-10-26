@@ -1,0 +1,148 @@
+// defer: cleanups that run when a function returns or raises, last first. In functions, closures, nested functions,
+// loops, if / match blocks, early returns, errors in the body and in a cleanup, recursion, a hot loop the JIT
+// compiles - and `defer` still an ordinary name wherever it is not a statement (apps/stickerfeed uses it so).
+fn check(c, msg) { assert_true(c, msg) }
+
+// Order and timing: after the body, last first.
+let log = []
+fn ordered() {
+  push(log, "start")
+  defer push(log, "first registered")
+  defer { push(log, "second registered") }
+  push(log, "end of body")
+  return "value"
+}
+check(ordered() == "value", "the body's value comes back")
+check(join(log, "|") == "start|end of body|second registered|first registered", "cleanups after the body, last first: " + join(log, "|"))
+
+// Early return: the cleanups registered so far run; one never reached does not.
+let closed = []
+fn early(n) {
+  defer push(closed, "a" + str(n))
+  if n > 0 { return "early" }
+  defer push(closed, "b" + str(n))
+  return "late"
+}
+check(early(1) == "early" and join(closed, ",") == "a1", "early return: only what was registered")
+closed = []
+check(early(0) == "late" and join(closed, ",") == "b0,a0", "full run: both, last first")
+
+// The body raises: cleanups still run, the error comes out after them.
+let released = []
+fn raises() {
+  defer push(released, "lock released")
+  error("boom in the body")
+  return 1
+}
+let r = pcall(raises)
+check(!r.ok and contains(r.error, "boom in the body"), "the body's error propagates: " + str(r.error))
+check(len(released) == 1, "and the cleanup ran first")
+
+// A cleanup raises: the others still run; with a clean body, the cleanup's error comes out.
+let ran = []
+fn bad_cleanup() {
+  defer push(ran, "outer")
+  defer error("cleanup failed")
+  defer push(ran, "inner")
+  return 5
+}
+let r2 = pcall(bad_cleanup)
+check(!r2.ok and contains(r2.error, "cleanup failed") and join(ran, ",") == "inner,outer", "a failing cleanup: the rest run, its error out: " + str(r2.error))
+ran = []
+fn both_fail() {
+  defer error("cleanup error")
+  error("body error")
+}
+let r3 = pcall(both_fail)
+check(!r3.ok and contains(r3.error, "body error") and !contains(r3.error, "cleanup error"), "body and cleanup both fail: the body's error wins")
+
+// Variables are read when the cleanup runs (a closure), not when defer was written.
+let seen = []
+fn reads_late() {
+  let x = 1
+  defer push(seen, x)
+  x = 2
+}
+reads_late()
+check(seen[0] == 2, "a cleanup reads the variable as it is at the end")
+
+// In a loop: each pass registers one; all run at the function's end.
+let order = []
+fn loop_defers() {
+  for i in 0..3 { defer push(order, i) }
+  push(order, "body done")
+}
+loop_defers()
+check(join(order, ",") == "body done,2,1,0", "defer in a loop: " + join(order, ","))
+
+// In if / match block arms and while loops.
+let marks = []
+fn branches(k) {
+  if k == 1 { defer push(marks, "if") }
+  match k {
+    2 => { defer push(marks, "match") }
+    _ => { }
+  }
+  let n = 0
+  while n < 2 { n = n + 1; defer push(marks, "while" + str(n)) }
+  return k
+}
+branches(1); branches(2)
+// n is one variable for the whole function, so both while-cleanups read its last value (a for loop's variable is
+// fresh each pass: see loop_defers above).
+check(join(marks, ",") == "while2,while2,if,while2,while2,match", "if / match / while: " + join(marks, ","))
+
+// Nested functions keep their own cleanups; closures work the same.
+let trail = []
+fn outer() {
+  defer push(trail, "outer")
+  let inner = fn () {
+    defer push(trail, "inner")
+    push(trail, "inner body")
+  }
+  inner()
+  push(trail, "outer body")
+}
+outer()
+check(join(trail, ",") == "inner body,inner,outer body,outer", "a closure's cleanups are its own: " + join(trail, ","))
+let make = fn (tag) { return fn () { defer push(trail, tag); return tag } }
+trail = []
+check(make("c1")() == "c1" and trail[0] == "c1", "a closure made by a closure")
+
+// Recursion: each call its own cleanups.
+let depth_log = []
+fn rec(n) {
+  defer push(depth_log, n)
+  if n == 0 { return 0 }
+  return rec(n - 1) + 1
+}
+check(rec(3) == 3 and join(depth_log, ",") == "0,1,2,3", "recursion unwinds in order: " + join(depth_log, ","))
+
+// Hot: a function with defer, called from a loop the JIT compiles; the answer must be the interpreter's.
+let counter = {"opened": 0, "closed": 0}
+fn use_resource(i) {
+  counter.opened = counter.opened + 1
+  defer { counter.closed = counter.closed + 1 }
+  return i * 2
+}
+let total = 0
+for i in 0..20000 { total = total + use_resource(i) }
+check(total == 20000 * 19999 and counter.opened == 20000 and counter.closed == 20000, "20000 hot calls: every cleanup ran")
+
+// `defer` is still a name where it is not a statement (as in apps/stickerfeed/lib/feed.gr).
+fn build_items(items, defer) {
+  let out = []
+  for x in items {
+    if not defer and x > 1 { push(out, x * 10) }
+    else { push(out, defer ? "kept" : x) }
+  }
+  return out
+}
+check(join(build_items([1, 2], false), ",") == "1,20" and build_items([1], true)[0] == "kept", "a parameter named defer")
+let defer = 3
+defer = defer + 1
+check(defer == 4, "a variable named defer, assigned and read")
+let m = {"defer": 1}
+check(m.defer == 1, "a field named defer")
+
+print("PASS: test_defer")

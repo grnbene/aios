@@ -300,6 +300,16 @@ match op {                                        # as a statement, an arm may b
   _ => {}
 }
 
+# defer: cleanup that runs when the function returns or raises, after the code below it; several run last first.
+# Every one runs even if the body or another cleanup raised; the body's error (else the first cleanup's) comes out.
+# It reads variables as they are when it runs. Only in a function body; elsewhere `defer` is an ordinary name.
+fn export(path) {
+  let lock = acquire(path)
+  defer release(lock)
+  defer { log_info("export done", {"path": path}) }
+  return build(path)                                # release() and the log run after build(), on success or error
+}
+
 # Optional chaining (?.): nil, or anything that is not a map, gives nil instead of an error
 let token = req?.headers?.authorization
 

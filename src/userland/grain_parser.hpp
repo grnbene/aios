@@ -48,6 +48,11 @@ class Parser {
   std::vector<Diagnostic>* errors_;
   size_t pos_ = 0;
   bool panicked_ = false;
+  // `defer` (a contextual keyword: still an ordinary name everywhere else): the function being read, and whether its
+  // body (not a nested function's) holds a defer statement - lambda() then wraps the body (see defer_statement()).
+  int fn_depth_ = 0;
+  bool fn_has_defer_ = false;
+  StmtP defer_statement();
 };
 
 }  // namespace aios::userland::grain
