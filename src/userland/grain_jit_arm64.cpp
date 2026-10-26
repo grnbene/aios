@@ -231,6 +231,8 @@ size_t insn_len(const FnObj& fn, size_t ip) {
     case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
     case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
       return 3;
+    case Op::ListConcat: case Op::CallList:
+      return 0;   // spread: such a function stays with the interpreter
     case Op::Closure: {
       if (ip + 2 >= code.size()) return 0;
       const size_t k = (static_cast<size_t>(code[ip + 1]) << 8) | code[ip + 2];

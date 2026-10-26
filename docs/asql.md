@@ -668,10 +668,12 @@ Thing runs the same functions as the service it serves.
 
 In the program: `read(sql, args...)` runs a SELECT inside the engine (each `?` takes the next argument; a
 list fills an `IN (?)`) and gives records with numbers as numbers; `read_raw(sql, args...)` is the same with
-every value as the text the wire would carry, for a port of code written against the wire. Every table either
+every value as the text the wire would carry, for a port of code written against the wire. `read_with(sql, params)`
+and `read_raw_with(sql, params)` take the `?` values as one list (`nil` for none), as does `read_raw(sql, ...params)`.
+Every table either
 touches must be in `READS`. The builtins a program may name are fixed, as its answers must not depend on
 the clock or the machine: the text, list and math ones, `json_parse`, `json_stringify`, `sort_by`, `upper_rtrim`,
-`format`, the `regex_*` set (`regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split`), and the exact-decimal set (`decimal`, `dec_div`, `scale`, `decimal_prefix`, `round_sig`, `idiv`).
+`format`, the `regex_*` set (`regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split`), and the exact-decimal set (`decimal`, `dec_div`, `scale`, `decimal_prefix`, `round_sig`, `number_format`, `idiv`).
 The statement's quoting reads backslashes, so a program written for it has none (`chr(9)`, not `"\t"`).
 
 ### Conflicts: `SOURCE BY` keeps both sides

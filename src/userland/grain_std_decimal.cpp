@@ -345,6 +345,66 @@ Value bi_round_sig(Vm&, std::vector<Value>& args, std::string& error) {
   return make(round_div(d.m, pow10(d.s - (int)keep)), (int)keep);
 }
 
+// number_format(v [, places [, dec_point [, thousands_sep]]]): v printed with `places` digits after the point
+// (default 0), groups of three split by thousands_sep (default ",") and the point written dec_point (default ".") -
+// PHP's number_format(). As PHP 7.4 reads v: nil and false are 0, true 1, a string by the number it starts with
+// (one that starts with none gives nil, where PHP warns and gives NULL), a real as the shortest decimal that reads
+// back as it. The value is rounded to 15 significant digits first (PHP's pre-rounding: 1.005 gives 1.01), then
+// half away from zero to the places; a zero prints with no sign; places below 0 count as 0.
+Value bi_number_format(Vm& vm, std::vector<Value>& args, std::string& error) {
+  const Value& v = args[0];
+  Value dv;
+  if (v.type == Type::Nil || (v.type == Type::Bool && !v.b)) dv = decimal_from_int(0);
+  else if (v.type == Type::Bool) dv = decimal_from_int(1);
+  else if (v.type == Type::Str) {
+    std::vector<Value> one{v};
+    Value p = bi_decimal_prefix(vm, one, error);
+    if (!error.empty()) { error = "number_format(): " + error; return Value::nil(); }
+    if (p.type == Type::Nil) return Value::nil();
+    Value* d = std::static_pointer_cast<MapObj>(p.obj)->find("d");
+    if (!d) return Value::nil();
+    dv = *d;
+  } else if (v.type == Type::Int || v.type == Type::Decimal || v.type == Type::Real) {
+    std::vector<Value> one{v};
+    dv = bi_decimal(vm, one, error);
+    if (!error.empty()) { error = "number_format(): " + error; return Value::nil(); }
+  } else {
+    error = std::string("number_format() cannot format a ") + type_name(v.type);
+    return Value::nil();
+  }
+  int64_t places = 0;
+  if (args.size() > 1) {
+    if (!want_number(args[1], error, "number_format")) return Value::nil();
+    places = std::max<int64_t>(0, args[1].as_int());
+    if (places > kMaxScale) { error = "number_format(): places from 0 to 30"; return Value::nil(); }
+  }
+  const std::string point = args.size() > 2 && args[2].type == Type::Str ? args[2].str() : std::string(".");
+  const std::string sep = args.size() > 3 && args[3].type == Type::Str ? args[3].str() : std::string(",");
+  if ((args.size() > 2 && args[2].type != Type::Str) || (args.size() > 3 && args[3].type != Type::Str)) {
+    error = "number_format(): the point and the separator are strings";
+    return Value::nil();
+  }
+  std::vector<Value> rs{dv, Value::integer(15)};
+  Value r = bi_round_sig(vm, rs, error);
+  if (!error.empty()) return Value::nil();
+  Dec d;
+  get(r, d);
+  I m;
+  if (!rescale(d.m, d.s, (int)places, m)) { overflow(error); error = "number_format(): " + error; return Value::nil(); }
+  const std::string text = decimal_text(make(m, (int)places));   // "-1234.50"
+  const bool neg = m != 0 && !text.empty() && text[0] == '-';
+  const std::string body = text[0] == '-' ? text.substr(1) : text;
+  const size_t dot = body.find('.');
+  const std::string whole = dot == std::string::npos ? body : body.substr(0, dot);
+  std::string out = neg ? "-" : "";
+  for (size_t i = 0; i < whole.size(); ++i) {
+    if (i > 0 && (whole.size() - i) % 3 == 0) out += sep;
+    out += whole[i];
+  }
+  if (dot != std::string::npos) out += point + body.substr(dot + 1);
+  return Value::string(out);
+}
+
 }  // namespace
 
 void install_decimal_builtins(Vm& vm) {
@@ -353,6 +413,7 @@ void install_decimal_builtins(Vm& vm) {
   vm.define_native("scale", 1, 1, bi_scale);
   vm.define_native("decimal_prefix", 1, 1, bi_decimal_prefix);
   vm.define_native("round_sig", 2, 2, bi_round_sig);
+  vm.define_native("number_format", 1, 4, bi_number_format);
 }
 
 }  // namespace aios::userland::grain

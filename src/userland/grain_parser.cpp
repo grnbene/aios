@@ -476,6 +476,18 @@ ExprP Parser::primary() {
   return e;
 }
 
+bool Parser::match_spread() {
+  const Token& a = peek(0);
+  const Token& b = peek(1);
+  const Token& c = peek(2);
+  if (a.kind != Tok::Dot || b.kind != Tok::Dot || c.kind != Tok::Dot) return false;
+  if (b.line != a.line || c.line != a.line || b.column != a.column + 1 || c.column != a.column + 2) return false;
+  advance();
+  advance();
+  advance();
+  return true;
+}
+
 ExprP Parser::list_literal() {
   const Token t = peek();
   const int line = t.line;
@@ -489,7 +501,10 @@ ExprP Parser::list_literal() {
   if (!check(Tok::RBracket)) {
     for (;;) {
       skip_newlines();
+      const bool spread = match_spread();
       e->items.push_back(expression());
+      if (spread || !e->spread.empty()) e->spread.resize(e->items.size(), 0);
+      if (spread) e->spread.back() = 1;
       skip_newlines();
       if (!match(Tok::Comma)) break;
       skip_newlines();
@@ -603,13 +618,17 @@ ExprP Parser::postfix(ExprP left) {
             named_map->keys.push_back(arg_name);
             named_map->items.push_back(std::move(val));
           } else {
+            const bool spread = match_spread();
             call->items.push_back(expression());
+            if (spread || !call->spread.empty()) call->spread.resize(call->items.size(), 0);
+            if (spread) call->spread.back() = 1;
           }
           skip_newlines();
           if (!match(Tok::Comma)) break;
         }
         if (named_map) {
           call->items.push_back(std::move(named_map));
+          if (!call->spread.empty()) call->spread.resize(call->items.size(), 0);
         }
       }
       skip_newlines();

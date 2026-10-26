@@ -289,7 +289,10 @@ enum class Op : uint8_t {
   Call, Closure, CloseUpvalue, Return,
   BuildList, BuildMap, IndexGet, IndexSet, FieldGet, OptFieldGet, FieldSet,
   IterPrep, IterNext,
-  Halt
+  Halt,
+  // Spread (`f(a, ...xs)`, `[a, ...xs]`): ListConcat n joins the n lists on the stack into one; CallList calls the
+  // value under the list with the list's items as its arguments. Added last so the ops before keep their numbers.
+  ListConcat, CallList
 };
 
 const char* op_name(Op op);
