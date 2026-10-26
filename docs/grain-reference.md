@@ -34,6 +34,7 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | Function | Signature | Description |
 |---|---|---|
 | `print` | `print(...args)` | Prints arguments to stdout separated by spaces, followed by a newline. |
+| `eprint` | `eprint(...args)` | Prints arguments to stderr separated by spaces, followed by a newline. |
 | `type` | `type(val)` | Returns the type name as a string: `"nil"`, `"bool"`, `"int"`, `"real"`, `"decimal"`, `"str"`, `"list"`, `"map"`, `"fn"`, `"bytes"`, `"handle"`. |
 | `str` | `str(val)` | Converts a value to its human-readable string representation. |
 | `repr` | `repr(val)` | Converts a value to its debug string representation (quoting strings). |
@@ -52,6 +53,18 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `debugger` | `debugger()` | Triggers a breakpoint or enters the interactive debugger if active. |
 | `is_stopping` | `is_stopping()` | Returns `true` if a shutdown or termination signal was received. |
 | `should_stop` | `should_stop()` | Alias for `is_stopping()`. |
+
+### Structured Application Logging
+| Function | Signature | Description |
+|---|---|---|
+| `log_debug` | `log_debug(msg, [extra_map])` | Emits a debug-level log message with optional key-value metadata map. |
+| `log_info` | `log_info(msg, [extra_map])` | Emits an info-level log message with optional key-value metadata map. |
+| `log_warn` | `log_warn(msg, [extra_map])` | Emits a warn-level log message with optional key-value metadata map. |
+| `log_error` | `log_error(msg, [extra_map])` | Emits an error-level log message with optional key-value metadata map. |
+| `log_set_level` | `log_set_level(level_str)` | Sets logging threshold: `"debug"`, `"info"`, `"warn"`, or `"error"`. Default is `"info"`. |
+| `log_get_level` | `log_get_level()` | Returns active log level string (`"debug"`, `"info"`, `"warn"`, `"error"`). |
+| `log_set_format` | `log_set_format(format_str)` | Configures output format: `"text"` (ISO timestamp & text) or `"json"` (single-line JSON). |
+| `log_get_format` | `log_get_format()` | Returns active log format string (`"text"` or `"json"`). |
 
 ---
 
