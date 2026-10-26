@@ -12,7 +12,10 @@
 #include <cstring>
 
 #include "aios/core/bytes.hpp"
+#include "aios/core/base64.hpp"
+#include "aios/core/json.hpp"
 #include "aios/crypto/aes_gcm.hpp"
+#include "aios/crypto/bcrypt.hpp"
 #include "aios/crypto/hmac_sha256.hpp"
 #include "aios/crypto/keccak256.hpp"
 #include "aios/crypto/md5.hpp"
@@ -134,6 +137,226 @@ Value bi_random_bytes(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::string(std::move(out));
 }
 
+// --- bcrypt ----------------------------------------------------------------
+
+Value bi_bcrypt_hash(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "bcrypt_hash")) return Value::nil();
+  int64_t cost = 10;
+  if (args.size() > 1) {
+    if (!want_number(args[1], error, "bcrypt_hash")) return Value::nil();
+    cost = args[1].as_int();
+    if (cost < 4 || cost > 31) {
+      error = "bcrypt_hash: cost must be between 4 and 31";
+      return Value::nil();
+    }
+  }
+
+  uint8_t salt[16];
+  int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  bool read_ok = false;
+  if (fd >= 0) {
+    size_t total = 0;
+    while (total < 16) {
+      ssize_t rd = ::read(fd, &salt[total], 16 - total);
+      if (rd <= 0) break;
+      total += rd;
+    }
+    ::close(fd);
+    if (total == 16) read_ok = true;
+  }
+  if (!read_ok) {
+    std::random_device rd;
+    for (size_t i = 0; i < 16; i += 4) {
+      uint32_t r = rd();
+      std::memcpy(&salt[i], &r, 4);
+    }
+  }
+
+  char out60[61];
+  const std::string& pass = args[0].str();
+  if (!crypto::bcrypt_hash(pass.data(), pass.size(), salt, static_cast<unsigned int>(cost), out60)) {
+    error = "bcrypt_hash: failed to generate hash";
+    return Value::nil();
+  }
+  return Value::string(out60);
+}
+
+Value bi_bcrypt_verify(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "bcrypt_verify") || !want_str(args[1], error, "bcrypt_verify")) return Value::nil();
+  const std::string& pass = args[0].str();
+  const std::string& hash = args[1].str();
+  bool ok = crypto::bcrypt_verify(pass.data(), pass.size(), hash.c_str());
+  return Value::boolean(ok);
+}
+
+// --- JWT -------------------------------------------------------------------
+
+static std::string base64url_encode(ByteSpan data) {
+  std::string s = base64_encode(data);
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c == '+') out += '-';
+    else if (c == '/') out += '_';
+    else if (c != '=') out += c;
+  }
+  return out;
+}
+
+static std::string base64url_decode(const std::string& in, bool& ok) {
+  std::string b64;
+  b64.reserve(in.size() + 4);
+  for (char c : in) {
+    if (c == '-') b64 += '+';
+    else if (c == '_') b64 += '/';
+    else b64 += c;
+  }
+  while (b64.size() % 4 != 0) b64 += '=';
+  auto res = base64_decode(b64);
+  if (!res.ok()) {
+    ok = false;
+    return "";
+  }
+  ok = true;
+  return std::string(reinterpret_cast<const char*>(res->data()), res->size());
+}
+
+static Value json_to_grain(const aios::json::Value& jv) {
+  switch (jv.type()) {
+    case aios::json::Value::Type::Null: return Value::nil();
+    case aios::json::Value::Type::Bool: return Value::boolean(jv.boolean_or(false));
+    case aios::json::Value::Type::Number: {
+      double d = jv.num();
+      if (std::floor(d) == d && d >= (double)std::numeric_limits<int64_t>::min() && d <= (double)std::numeric_limits<int64_t>::max()) {
+        return Value::integer(jv.i64());
+      }
+      return Value::real(d);
+    }
+    case aios::json::Value::Type::String: return Value::string(jv.str());
+    case aios::json::Value::Type::Array: {
+      std::vector<Value> list;
+      list.reserve(jv.size());
+      for (const auto& item : jv.items()) list.push_back(json_to_grain(item));
+      return Value::list(std::move(list));
+    }
+    case aios::json::Value::Type::Object: {
+      auto map_obj = std::make_shared<MapObj>();
+      for (const auto& member : jv.members()) {
+        map_obj->put(member.first, json_to_grain(member.second));
+      }
+      return Value::object(Type::Map, map_obj);
+    }
+  }
+  return Value::nil();
+}
+
+static aios::json::Value grain_to_json(const Value& gv) {
+  switch (gv.type) {
+    case Type::Nil: return aios::json::Value::null();
+    case Type::Bool: return aios::json::Value::boolean(gv.b);
+    case Type::Int: return aios::json::Value::integer(gv.i);
+    case Type::Real: return aios::json::Value::number(gv.d);
+    case Type::Str: return aios::json::Value::string(gv.str());
+    case Type::List: {
+      auto arr = aios::json::Value::array();
+      for (const auto& item : gv.list_items()) arr.push(grain_to_json(item));
+      return arr;
+    }
+    case Type::Map: {
+      auto obj = aios::json::Value::object();
+      if (gv.obj) {
+        auto m = std::dynamic_pointer_cast<MapObj>(gv.obj);
+        if (m) {
+          for (const auto& entry : m->entries) {
+            obj.set(entry.first, grain_to_json(entry.second));
+          }
+        }
+      }
+      return obj;
+    }
+    default: return aios::json::Value::string(gv.to_text());
+  }
+}
+
+Value bi_jwt_sign(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Map) { error = "jwt_sign: payload must be a map"; return Value::nil(); }
+  if (!want_str(args[1], error, "jwt_sign")) return Value::nil();
+  const std::string& secret = args[1].str();
+
+  aios::json::Value hdr = aios::json::Value::object();
+  hdr.set("alg", aios::json::Value::string("HS256"));
+  hdr.set("typ", aios::json::Value::string("JWT"));
+  std::string hdr_b64 = base64url_encode(bytes_of(hdr.dump()));
+
+  aios::json::Value payload_json = grain_to_json(args[0]);
+  std::string payload_b64 = base64url_encode(bytes_of(payload_json.dump()));
+
+  std::string signing_input = hdr_b64 + "." + payload_b64;
+  auto sig = crypto::hmac_sha256(bytes_of(secret), bytes_of(signing_input));
+  std::string sig_b64 = base64url_encode(ByteSpan(sig.data(), sig.size()));
+
+  return Value::string(signing_input + "." + sig_b64);
+}
+
+Value bi_jwt_verify(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "jwt_verify") || !want_str(args[1], error, "jwt_verify")) return Value::nil();
+  const std::string& token = args[0].str();
+  const std::string& secret = args[1].str();
+
+  auto out = std::make_shared<MapObj>();
+  auto fail = [&](const std::string& msg) -> Value {
+    out->put("ok", Value::boolean(false));
+    out->put("error", Value::string(msg));
+    return Value::object(Type::Map, out);
+  };
+
+  size_t dot1 = token.find('.');
+  if (dot1 == std::string::npos) return fail("malformed token: missing dot");
+  size_t dot2 = token.find('.', dot1 + 1);
+  if (dot2 == std::string::npos || token.find('.', dot2 + 1) != std::string::npos)
+    return fail("malformed token: expected exactly three parts");
+
+  std::string hdr_b64 = token.substr(0, dot1);
+  std::string payload_b64 = token.substr(dot1 + 1, dot2 - dot1 - 1);
+  std::string sig_b64 = token.substr(dot2 + 1);
+
+  std::string signing_input = hdr_b64 + "." + payload_b64;
+  auto expected_sig = crypto::hmac_sha256(bytes_of(secret), bytes_of(signing_input));
+  std::string expected_b64 = base64url_encode(ByteSpan(expected_sig.data(), expected_sig.size()));
+
+  if (sig_b64.size() != expected_b64.size()) return fail("invalid signature");
+  uint8_t diff = 0;
+  for (size_t i = 0; i < sig_b64.size(); ++i) diff |= (uint8_t)(sig_b64[i] ^ expected_b64[i]);
+  if (diff != 0) return fail("invalid signature");
+
+  bool ok = false;
+  std::string hdr_str = base64url_decode(hdr_b64, ok);
+  if (!ok) return fail("invalid header base64");
+  auto parsed_hdr = aios::json::parse(hdr_str);
+  if (!parsed_hdr.ok() || (*parsed_hdr)["alg"].str_or("") != "HS256")
+    return fail("unsupported or missing algorithm in header");
+
+  std::string payload_str = base64url_decode(payload_b64, ok);
+  if (!ok) return fail("invalid payload base64");
+  auto parsed_payload = aios::json::parse(payload_str);
+  if (!parsed_payload.ok() || parsed_payload->type() != aios::json::Value::Type::Object)
+    return fail("invalid payload JSON");
+
+  int64_t now_sec = static_cast<int64_t>(std::time(nullptr));
+  if (parsed_payload->has("exp")) {
+    int64_t exp = (*parsed_payload)["exp"].i64();
+    if (exp < now_sec) return fail("token has expired");
+  }
+  if (parsed_payload->has("nbf")) {
+    int64_t nbf = (*parsed_payload)["nbf"].i64();
+    if (nbf > now_sec) return fail("token not yet valid");
+  }
+
+  out->put("ok", Value::boolean(true));
+  out->put("payload", json_to_grain(*parsed_payload));
+  return Value::object(Type::Map, out);
+}
+
 }  // namespace
 
 void install_hash_builtins(Vm& vm) {
@@ -147,6 +370,10 @@ void install_hash_builtins(Vm& vm) {
   vm.define_native("md5", 1, 1, bi_md5);
   vm.define_native("keccak256", 1, 1, bi_keccak256);
   vm.define_native("hmac_sha256", 2, 2, bi_hmac_sha256);
+  vm.define_native("bcrypt_hash", 1, 2, bi_bcrypt_hash);
+  vm.define_native("bcrypt_verify", 2, 2, bi_bcrypt_verify);
+  vm.define_native("jwt_sign", 2, 3, bi_jwt_sign);
+  vm.define_native("jwt_verify", 2, 2, bi_jwt_verify);
 }
 
 }  // namespace aios::userland::grain
