@@ -8,6 +8,7 @@
 #include "aios/hal/sync.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -378,6 +379,7 @@ struct ThingGrain {
   bool have_shared = false;
   bool shared_fresh = false;   // shared was just recomputed: a full pass may take it as is
   bool has_touched = false;
+  bool day_safe = false;   // the program says when its Things next change with the date (wake_at): the day turning is no reason to read them all again
   std::vector<std::string> printed;
   struct Notice {
     std::string table, op;
@@ -603,7 +605,7 @@ grain::Value gb_read_target(grain::Vm&, std::vector<grain::Value>& args, std::st
 
 // read(sql, args...): '?' outside quotes takes the next argument; the rows
 // come back as a list of maps keyed by column name.
-grain::Value gb_read(grain::Vm&, std::vector<grain::Value>& args, std::string& error) {
+grain::Value read_impl(std::vector<grain::Value>& args, std::string& error, bool raw) {
   if (!g_grain) { error = "read() only runs inside a Thing's reaction"; return grain::Value::nil(); }
   if (args[0].type != grain::Type::Str) { error = "read() wants a SELECT statement"; return grain::Value::nil(); }
   const std::string& tpl = args[0].str();
@@ -637,9 +639,15 @@ grain::Value gb_read(grain::Vm&, std::vector<grain::Value>& args, std::string& e
   }
   std::unordered_set<const SqlTable*> touched;
   sql_set_read_capture(&touched);
+  static const bool trace_reads = std::getenv("AIOS_THINGS_TRACE_READS") != nullptr;
+  const auto read_t0 = trace_reads ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   SqlQueryResult r = g_grain->db->execute_local_query(sql, g_grain->dbname);
   sql_set_read_capture(nullptr);
   g_grain->queries++;
+  if (trace_reads) {   // AIOS_THINGS_TRACE_READS=1: what a Thing's reads cost, one line each (a refresh is ~25 of them)
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - read_t0).count();
+    if (ms >= 0.5) std::fprintf(stderr, "[things-read] %.2f ms %zu row(s) %.70s\n", ms, r.rows.size(), sql.c_str());
+  }
   if (!r.success) { error = "read(): " + r.error_message; return grain::Value::nil(); }
   for (const SqlTable* t : touched) {
     if (!g_grain->db->is_stored_table(t)) continue;
@@ -653,12 +661,21 @@ grain::Value gb_read(grain::Vm&, std::vector<grain::Value>& args, std::string& e
   rows.reserve(r.rows.size());
   for (const auto& row : r.rows) {
     auto m = std::make_shared<grain::MapObj>();
-    for (size_t i = 0; i < r.columns.size() && i < row.values.size(); ++i)
-      m->put(r.columns[i], cell_value(row.values[i], i < r.column_types.size() ? r.column_types[i] : SqlDataType::Text));
+    for (size_t i = 0; i < r.columns.size() && i < row.values.size(); ++i) {
+      if (raw) m->put(r.columns[i], sql_is_null(row.values[i]) ? grain::Value::nil() : grain::Value::string(row.values[i]));
+      else m->put(r.columns[i], cell_value(row.values[i], i < r.column_types.size() ? r.column_types[i] : SqlDataType::Text));
+    }
     rows.push_back(grain::Value::object(grain::Type::Map, m));
   }
   return grain::Value::list(std::move(rows));
 }
+
+grain::Value gb_read(grain::Vm&, std::vector<grain::Value>& args, std::string& error) { return read_impl(args, error, false); }
+
+// read_raw(sql, args...): read(), with every value as the text the wire would carry (NULL stays nil), for a
+// program that is a port of code written against the wire: a price "0.0000" is a string there, and a
+// string, not a number, is what that code's rules are about.
+grain::Value gb_read_raw(grain::Vm&, std::vector<grain::Value>& args, std::string& error) { return read_impl(args, error, true); }
 
 bool gcall(ThingGrain& g, const char* name, const std::vector<grain::Value>& args, grain::Value* out, std::string* err) {
   grain::Value* f = g.vm.find_global(name);
@@ -692,6 +709,10 @@ const std::vector<std::string>& grain_allowed() {
       "repeat", "char_at", "chars", "is_digit", "is_alpha", "is_alnum", "is_space", "abs", "min", "max", "floor",
       "ceil", "sqrt", "pow", "round", "trunc", "sign", "clamp", "log", "log2", "log10", "exp", "assert", "try_call",
       "pcall", "error", "panic", "is_err", "is_ok", "json_parse", "json_stringify",
+      // exact decimals and text layout: pure functions of their arguments
+      "decimal", "dec_div", "scale", "decimal_prefix", "round_sig", "format", "sort_by", "idiv", "upper_rtrim",
+      // patterns: the same text and pattern give the same answer anywhere
+      "regex_test", "regex_match", "regex_find_all", "regex_replace", "regex_split",
       "sat"};   // deterministic: a reaction replayed after a crash gets the same answer
   return names;
 }
@@ -2054,6 +2075,10 @@ bool ThingEngine::handles(const std::string& sql) const {
   for (const char* v : verbs) if (std::strcmp(a, v) == 0) { verb = true; break; }
   if (!verb) return false;
   if (std::strcmp(b, "THING") == 0) return true;
+  if (std::strcmp(a, "CREATE") == 0 && std::strcmp(b, "OR") == 0) {   // CREATE OR REPLACE THING
+    char c3[8], d4[8];
+    return word(i, c3, sizeof c3) && std::strcmp(c3, "REPLACE") == 0 && word(i, d4, sizeof d4) && std::strcmp(d4, "THING") == 0;
+  }
   return std::strcmp(a, "SHOW") == 0 && std::strcmp(b, "THINGS") == 0;
 }
 
@@ -3131,14 +3156,30 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
   }
   Scan sc(sql);
   if (u.rfind("CREATE", 0) == 0) {
+    // CREATE OR REPLACE THING: a grain Thing that exists is built anew beside the old one, which answers meanwhile
+    std::string stmt = sql;
+    bool or_replace = false;
+    {
+      Scan cs(sql);
+      const size_t p_or = cs.find_kw("OR REPLACE"), p_th = cs.find_kw("THING");
+      if (p_or != std::string::npos && p_th != std::string::npos && p_or < p_th) {
+        or_replace = true;
+        stmt = trim(sql.substr(0, p_or)) + " " + trim(sql.substr(p_or + 10));
+      }
+    }
     Kind k;
     std::string err;
-    if (!parse_create(sql, &k, &err)) return error_result(err);
+    if (!parse_create(stmt, &k, &err)) return error_result(err);
     k.db = db_.effective_database();
     k.created_ns = db_.kernel_.host().wall_ns();
     if (k.type == Kind::Resource && k.cap_table.find('.') == std::string::npos) k.cap_table = lower(k.db) + "." + k.cap_table;
-    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    std::unique_lock<aios::hal::Mutex> lk(mu_);
     MuHeld held;
+    if (or_replace && kinds_.count(k.name)) {
+      if (k.type != Kind::Grain || kinds_.at(k.name).type != Kind::Grain)
+        return error_result("CREATE OR REPLACE THING replaces a grain Thing with a grain Thing; DROP " + k.name + " first");
+      return replace_grain(std::move(k), lk);
+    }
     if (kinds_.count(k.name)) return error_result("a Thing kind named " + k.name + " already exists");
     if (k.type == Kind::Resource) {
       const size_t dot = k.cap_table.find('.');
@@ -3297,6 +3338,7 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     if (dit == kinds_.end()) return error_result("no Thing kind named " + name);
     if (dit->second.type == Kind::Resource && !dit->second.claimed_by.empty())
       return error_result(name + " is claimed by " + dit->second.claimed_by + ": drop that first");
+    if (dit->second.building) return error_result(name + " is a replacement still being built: it takes its name, or goes, by itself");
     if (dit->second.type == Kind::Claims) {
       auto rit = kinds_.find(dit->second.resource);
       if (rit != kinds_.end()) { rit->second.claimed_by.clear(); rit->second.res.clear(); }
@@ -3376,7 +3418,7 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     return show_alerts(name);
   }
   // SHOW THINGS [name] | SHOW THING HISTORY name 'key'
-  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  std::unique_lock<aios::hal::Mutex> lk(mu_);
   settle_all_locked();
   if (sc.find_kw("RECEIPTS") != std::string::npos) return show_receipts();
   size_t alp = sc.find_kw("ALLOCATION");
@@ -3425,6 +3467,62 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
       const size_t sp = ns.find_kw("SINCE");
       if (sp != std::string::npos) since = std::strtoull(trim(name.substr(sp + 5)).c_str(), nullptr, 10);
       SqlQueryResult r = show_json(it->second, since, cp != std::string::npos && jp == std::string::npos);
+      if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+      return r;
+    }
+  }
+  {
+    // SHOW THING name KEYS ('a', 'b', ...): only those Things of a grain kind
+    Scan ns(name);
+    const size_t kp = ns.find_kw("KEYS");
+    if (kp != std::string::npos) {
+      const std::string kind = lower(unquote_ident(trim(name.substr(0, kp))));
+      auto it = kinds_.find(kind);
+      if (it == kinds_.end()) return error_result("no Thing kind named " + kind);
+      if (it->second.type != Kind::Grain && it->second.type != Kind::Mirror)
+        return error_result("SHOW THING .. KEYS: " + kind + " is not a grain Thing");
+      std::vector<std::string> keys;
+      std::string list = trim(name.substr(kp + 4));
+      if (list.size() < 2 || list.front() != '(' || list.back() != ')')
+        return error_result("SHOW THING <name> KEYS ('key', ...)");
+      list = list.substr(1, list.size() - 2);
+      for (size_t i = 0; i < list.size();) {
+        while (i < list.size() && (std::isspace((unsigned char)list[i]) || list[i] == ',')) ++i;
+        if (i >= list.size()) break;
+        std::string v;
+        if (list[i] == '\'' || list[i] == '"') {
+          const char q = list[i++];
+          for (; i < list.size(); ++i) {
+            if (list[i] == '\\' && i + 1 < list.size()) { v += list[++i]; continue; }
+            if (list[i] == q) {
+              if (i + 1 < list.size() && list[i + 1] == q) { v += q; ++i; continue; }   // 'it''s'
+              ++i;
+              break;
+            }
+            v += list[i];
+          }
+        } else {
+          while (i < list.size() && list[i] != ',' && !std::isspace((unsigned char)list[i])) v += list[i++];
+          if (upper(v) == "NULL") v = kNullKey;
+        }
+        keys.push_back(std::move(v));
+      }
+      SqlQueryResult r = show_grain(it->second, &keys);
+      return r;
+    }
+  }
+  {
+    // SHOW THING <grain kind>: the rows as of the kind's version are taken under the lock and copied after it is
+    // let go. Built under the lock and copied there, a 50,000-item kind held every other reader (and every
+    // reaction) for the whole copy and its formatting, so concurrent full reads ran one at a time.
+    auto it = kinds_.find(lower(unquote_ident(name)));
+    if (it != kinds_.end() && (it->second.type == Kind::Grain || it->second.type == Kind::Mirror)) {
+      SqlQueryResult r;
+      r.is_result_set = true;
+      r.columns = grain_columns(it->second);
+      std::shared_ptr<const std::vector<SqlRow>> rows = grain_rows_locked(it->second);
+      lk.unlock();
+      r.rows = *rows;
       if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
       return r;
     }
@@ -4757,6 +4855,7 @@ void ThingEngine::save_locked() {
   auto& host = db_.kernel_.host();
   host.make_dir(things_dir());
   for (const auto& kv : kinds_) {
+    if (kv.second.building) continue;   // (a crash mid-build leaves the Thing it was to replace)
     const std::string text = serialize(kv.second);
     host.write_file(things_dir() + "/" + kv.first + ".thing", ByteSpan((const uint8_t*)text.data(), text.size()));
   }
@@ -4890,9 +4989,9 @@ bool ThingEngine::parse_grain(const std::string& sql, Kind* k, std::string* err)
   std::string body;
   for (size_t i = 1; i + 1 < src.size(); ++i) {
     if (src[i] == '\'' && i + 2 < src.size() && src[i + 1] == '\'') { body += '\''; ++i; continue; }
-    if (src[i] == '\\' && i + 2 < src.size()) {
+    if (src[i] == '\\' && i + 2 < src.size()) {   // MySQL's escapes, as a client's quoting writes them
       const char n = src[++i];
-      body += n == 'n' ? '\n' : n == 't' ? '\t' : n;
+      body += n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : n == '0' ? '\0' : n == 'Z' ? '\x1a' : n == 'b' ? '\b' : n;
       continue;
     }
     body += src[i];
@@ -4912,6 +5011,7 @@ bool ThingEngine::grain_boot(Kind& k, std::string* err) {
   grain::install_builtins(g->vm);
   g->vm.retain_globals(grain_allowed());
   g->vm.define_native("read", 1, -1, gb_read);
+  g->vm.define_native("read_raw", 1, -1, gb_read_raw);
   g->vm.define_native("claims", 2, 2, gb_claims);
   g->vm.define_native("write", 1, -1, gb_write);
   g->vm.define_native("read_target", 1, -1, gb_read_target);
@@ -4947,6 +5047,8 @@ bool ThingEngine::grain_boot(Kind& k, std::string* err) {
     }
   }
   g->has_touched = g->vm.find_global("touched") != nullptr;
+  if (grain::Value* ds = g->vm.find_global("DAY_SAFE")) g->day_safe = ds->truthy();
+  k.time_dependent = !g->day_safe;   // a program may read CURDATE(); unless it names its own wakes, a new day is a full pass
   k.grain = g;
   return true;
 }
@@ -5016,7 +5118,8 @@ bool ThingEngine::put_ginst(Kind& k, const std::string& ck, Kind::GInst fresh, c
   // `alert`: raised when it appears or changes, cleared when it goes.
   const std::string was = it == k.gthings.end() ? std::string() : alert_field(it->second.vals);
   const std::string now_alert = alert_field(fresh.vals);
-  if (!now_alert.empty() && now_alert != was) alert(k.name, fresh.key, "raised", now_alert);
+  if (k.building) {}   // a replacement being built says nothing until it is the Thing
+  else if (!now_alert.empty() && now_alert != was) alert(k.name, fresh.key, "raised", now_alert);
   else if (now_alert.empty() && !was.empty()) alert(k.name, fresh.key, "cleared", was);
   if (it == k.gthings.end()) it = k.gthings.emplace(ck, Kind::GInst{}).first;
   Kind::GInst& gi = it->second;
@@ -5042,6 +5145,9 @@ void ThingEngine::drop_ginst(Kind& k, const std::string& ck, const std::string& 
   dirty_ = true;
 }
 
+// AIOS_THINGS_TRACE_TIME=1: each things() and touched() call's time, to stderr
+static bool things_trace_time() { static const bool on = [] { const char* e = getenv("AIOS_THINGS_TRACE_TIME"); return e && e[0] == '1'; }(); return on; }
+
 bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err) {
   ThingGrain& g = *k.grain;
   GrainScope scope(db_, this, k.db, &k.reads, &k.links);
@@ -5049,7 +5155,11 @@ bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, cons
   kl.reserve(keys.size());
   for (const auto& key : keys) kl.push_back(grain::Value::string(key));
   grain::Value out;
+  const auto t0 = std::chrono::steady_clock::now();
   if (!gcall(g, "things", {grain::Value::list(std::move(kl)), g.shared}, &out, err)) return false;
+  if (things_trace_time())
+    fprintf(stderr, "[things-time] %s: things(%zu key(s)) %.3f ms (%s)\n", k.name.c_str(), keys.size(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), cause.c_str());
   if (out.type != grain::Type::Map) { *err = "things() must return a map of key -> values"; return false; }
   auto* m = static_cast<grain::MapObj*>(out.obj.get());
   const uint64_t now = db_.kernel_.host().wall_ns();
@@ -5077,7 +5187,90 @@ bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, cons
   return true;
 }
 
-bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err) {
+bool ThingEngine::try_replace_unlocked(const std::string& sql, SqlQueryResult* out) {
+  Scan cs(sql);
+  const size_t p_cr = cs.find_kw("CREATE"), p_or = cs.find_kw("OR REPLACE"), p_th = cs.find_kw("THING"), p_gr = cs.find_kw("GRAIN");
+  if (p_cr != 0 || p_or == std::string::npos || p_th == std::string::npos || p_gr == std::string::npos || !(p_or < p_th && p_th < p_gr))
+    return false;
+  const std::string stmt = trim(sql.substr(0, p_or)) + " " + trim(sql.substr(p_or + 10));
+  Kind k;
+  std::string err;
+  if (!parse_create(stmt, &k, &err)) { *out = error_result(err); return true; }
+  if (k.type != Kind::Grain) return false;
+  k.db = db_.effective_database();
+  k.created_ns = db_.kernel_.host().wall_ns();
+  std::unique_lock<aios::hal::Mutex> lk(mu_);
+  auto ex = kinds_.find(k.name);
+  if (ex == kinds_.end() || ex->second.type != Kind::Grain) return false;   // a new one: the ordinary CREATE, under its lock
+  MuHeld held;
+  *out = replace_grain(std::move(k), lk);
+  return true;
+}
+
+// CREATE OR REPLACE THING for a grain Thing that exists. The new version goes in as <name>~next: paused (nothing
+// reacts) but watching, so every change from here on is noted for it. Its first pass runs with the engine's lock
+// let go - the old Thing answers, and writes do not wait - and then, under the lock again, it takes the name and
+// the changes noted meanwhile go through its touched() like any others: nothing is missed, nothing waited.
+SqlQueryResult ThingEngine::replace_grain(Kind&& k, std::unique_lock<aios::hal::Mutex>& lk) {
+  const std::string name = k.name, next = name + "~next";
+  if (kinds_.count(next)) return error_result("a new version of " + name + " is already being built");
+  std::string err;
+  for (const auto& l : k.links)
+    if (!kinds_.count(l.first)) return error_result("LINKS " + l.first + ": no claims Thing by that name");
+  k.declaration = trim(k.declaration);
+  k.name = next;
+  k.paused = true;
+  k.building = true;
+  const uint64_t t0 = db_.kernel_.host().wall_ns();
+  const bool held_before = g_mu_held;
+  // Compiled and its top level run with the lock let go (that may read tables, and a read waits for a writer
+  // that may be waiting for this lock); then in, watching, before its first pass reads anything.
+  g_mu_held = false;
+  lk.unlock();
+  const bool booted = grain_boot(k, &err);
+  lk.lock();
+  if (!booted) { g_mu_held = held_before; return error_result("the new version of " + name + " does not load (the old one stays): " + err); }
+  if (kinds_.count(next)) { g_mu_held = held_before; return error_result("a new version of " + name + " is already being built"); }
+  auto it = kinds_.emplace(next, std::move(k)).first;
+  rebuild_watched();
+  Kind* nk = &it->second;   // map nodes stay put; a building kind cannot be dropped
+  lk.unlock();
+  const bool ok = grain_full(*nk, "replaced", &err, true);
+  lk.lock();
+  g_mu_held = held_before;
+  if (!ok) {
+    kinds_.erase(next);
+    rebuild_watched();
+    return error_result("the new version of " + name + " did not build (the old one stays): " + err);
+  }
+  auto node = kinds_.extract(next);
+  Kind& nkind = node.mapped();
+  nkind.name = name;
+  nkind.paused = false;
+  nkind.building = false;
+  // what the old one had come to: its counters carry on
+  if (auto old = kinds_.find(name); old != kinds_.end()) {
+    nkind.reactions += old->second.reactions;
+    nkind.full_recomputes += old->second.full_recomputes;
+    nkind.created_ns = old->second.created_ns;
+    kinds_.erase(old);
+  }
+  node.key() = name;
+  auto placed = kinds_.insert(std::move(node));
+  rebuild_watched();
+  dirty_ = true;
+  save_locked();
+  SqlQueryResult res;
+  res.rows_affected = placed.position->second.gthings.size();
+  char ms[32];
+  std::snprintf(ms, sizeof ms, "%.0f", (double)(db_.kernel_.host().wall_ns() - t0) / 1e6);
+  res.formatted_table = "Thing " + name + " replaced: " + std::to_string(placed.position->second.gthings.size()) + " things (" + ms +
+                        " ms), the old version answering until now; " + std::to_string(placed.position->second.grain->notices.size()) +
+                        " change(s) made meanwhile to follow.";
+  return res;
+}
+
+bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err, bool keep_notices) {
   if (!k.grain) { *err = "the program is not loaded"; return false; }
   ThingGrain& g = *k.grain;
   const uint64_t t0 = db_.kernel_.host().wall_ns();
@@ -5104,9 +5297,11 @@ bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err
     if (!enrolled.count(e.first)) gone.push_back(e.second.key);
   keys.insert(keys.end(), gone.begin(), gone.end());
   if (!grain_keys(k, keys, cause, err)) return false;
-  k.pending.clear();
-  k.pending_shared = false;
-  g.notices.clear();
+  if (!keep_notices) {
+    k.pending.clear();
+    k.pending_shared = false;
+    g.notices.clear();
+  }
   k.full_recomputes++;
   if (!k.grain_error.empty()) alert(k.name, "", "recovered", "a full pass ran clean");
   k.grain_error.clear();
@@ -5135,23 +5330,32 @@ void ThingEngine::settle_grain(Kind& k) {
   }
   if (!k.pending_full) {
     const std::string day = current_day();
-    if (!day.empty() && day != k.day) { k.pending_full = true; k.full_cause = "the day turned: " + day; }
+    if (!day.empty() && day != k.day) {
+      if (g.day_safe) k.day = day;
+      else { k.pending_full = true; k.full_cause = "the day turned: " + day; }
+    }
   }
-  if (!k.pending_full && !g.notices.empty()) {
+  // touched() hears every change, also once a full pass is coming: a program that keeps what it read (an
+  // item's inputs, a table it reads whole) learns from it what to read again, in that pass too.
+  if (!g.notices.empty()) {
     std::vector<ThingGrain::Notice> ns;
     ns.swap(g.notices);
     GrainScope scope(db_, this, k.db, &k.reads, &k.links);
     for (const auto& n : ns) {
       grain::Value r;
       const std::string cause = n.table + " " + n.op;
-      if (!gcall(g, "touched", {grain::Value::string(n.table), grain::Value::string(n.op), n.before, n.after, g.shared},
-                 &r, &err)) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool ok = gcall(g, "touched", {grain::Value::string(n.table), grain::Value::string(n.op), n.before, n.after, g.shared}, &r, &err);
+      if (things_trace_time())
+        fprintf(stderr, "[things-time] %s: touched(%s) %.3f ms\n", k.name.c_str(), cause.c_str(),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      if (!ok) {
         k.pending_full = true;
         k.full_cause = "after touched() failed: " + err;
         break;
       }
-      if (r.type == grain::Type::Nil) continue;
-      if (r.type == grain::Type::Str && r.str() == "all") { k.pending_full = true; k.full_cause = cause; break; }
+      if (k.pending_full || r.type == grain::Type::Nil) continue;
+      if (r.type == grain::Type::Str && r.str() == "all") { k.pending_full = true; k.full_cause = cause; continue; }
       grain::Value keys = r;
       if (r.type == grain::Type::Map) {
         auto* m = static_cast<grain::MapObj*>(r.obj.get());
@@ -5165,7 +5369,6 @@ void ThingEngine::settle_grain(Kind& k) {
       } else if (keys.type != grain::Type::Nil) {
         k.pending_full = true;
         k.full_cause = "touched() answered neither nil, keys, {keys, shared} nor \"all\"";
-        break;
       }
     }
   }
@@ -5215,26 +5418,68 @@ void ThingEngine::settle_grain(Kind& k) {
   }
 }
 
-SqlQueryResult ThingEngine::show_grain(const Kind& k) {
+// SHOW THING's columns for a grain kind: its key, every field seen, then the bookkeeping.
+std::vector<std::string> ThingEngine::grain_columns(const Kind& k) {
+  std::vector<std::string> cols;
+  cols.push_back(k.key_col);
+  for (const auto& c : k.gcols) cols.push_back(c);
+  for (const char* c : {"version", "updated_at", "last_change"}) cols.push_back(c);
+  return cols;
+}
+
+// One Thing's row. Most Things were written in the same second (a pass writes them all): each second is
+// formatted once, not per row (last_sec / last_text carry it from row to row).
+SqlRow ThingEngine::grain_row(const Kind& k, const Kind::GInst& gi, uint64_t* last_sec, std::string* last_text) {
+  SqlRow row;
+  row.values.reserve(k.gcols.size() + 4);
+  row.values.push_back(gi.key);
+  for (const auto& c : k.gcols) {
+    std::string v = sql_null();
+    for (const auto& f : gi.vals)
+      if (f.first == c) { v = f.second; break; }
+    row.values.push_back(std::move(v));
+  }
+  row.values.push_back(std::to_string(gi.version));
+  const uint64_t sec = gi.updated_ns / 1000000000ull;
+  if (gi.updated_ns == 0) row.values.push_back(sql_null());
+  else {
+    if (sec != *last_sec || last_text->empty()) { *last_sec = sec; *last_text = wall_text(gi.updated_ns); }
+    row.values.push_back(*last_text);
+  }
+  row.values.push_back(gi.history.empty() ? sql_null() : gi.history.back().cause);
+  return row;
+}
+
+std::shared_ptr<const std::vector<SqlRow>> ThingEngine::grain_rows_locked(Kind& k) {
+  // Every change to a grain kind's Things (put_ginst, drop_ginst) moves k.version; a replacement is a new Kind.
+  if (k.shown_rows && k.shown_version == k.version) return k.shown_rows;
+  auto rows = std::make_shared<std::vector<SqlRow>>();
+  rows->reserve(k.gthings.size());
+  uint64_t last_sec = ~0ull;
+  std::string last_text;
+  for (const auto& kv : k.gthings) rows->push_back(grain_row(k, kv.second, &last_sec, &last_text));
+  k.shown_rows = std::move(rows);
+  k.shown_version = k.version;
+  return k.shown_rows;
+}
+
+SqlQueryResult ThingEngine::show_grain(const Kind& k, const std::vector<std::string>* keys) {
   SqlQueryResult res;
   res.is_result_set = true;
-  res.columns.push_back(k.key_col);
-  for (const auto& c : k.gcols) res.columns.push_back(c);
-  for (const char* c : {"version", "updated_at", "last_change"}) res.columns.push_back(c);
-  for (const auto& kv : k.gthings) {
-    const Kind::GInst& gi = kv.second;
-    SqlRow row;
-    row.values.push_back(gi.key);
-    for (const auto& c : k.gcols) {
-      std::string v = sql_null();
-      for (const auto& f : gi.vals)
-        if (f.first == c) { v = f.second; break; }
-      row.values.push_back(v);
+  res.columns = grain_columns(k);
+  if (!keys) {
+    res.rows = *grain_rows_locked(const_cast<Kind&>(k));
+  } else {
+    // KEYS: a lookup per key asked (a key named twice is one row, a key that is no Thing is none), not a walk over all
+    std::set<std::string> seen;
+    uint64_t last_sec = ~0ull;
+    std::string last_text;
+    for (const auto& want : *keys) {
+      const std::string ck = sql_collate_key(want);
+      if (!seen.insert(ck).second) continue;
+      auto f = k.gthings.find(ck);
+      if (f != k.gthings.end()) res.rows.push_back(grain_row(k, f->second, &last_sec, &last_text));
     }
-    row.values.push_back(std::to_string(gi.version));
-    row.values.push_back(wall_text(gi.updated_ns));
-    row.values.push_back(gi.history.empty() ? sql_null() : gi.history.back().cause);
-    res.rows.push_back(std::move(row));
   }
   if (!sql_wire_results()) res.formatted_table = db_.format_result_table(res.columns, res.rows);
   return res;

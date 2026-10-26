@@ -58,6 +58,9 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #include <iomanip>
 #include <cerrno>
 #include <chrono>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
@@ -1943,11 +1946,19 @@ bool temporal_key(std::string_view s, int64_t* out) {
     if (i < s.size() && (s[i] == ' ' || s[i] == 'T')) {
       size_t save = i;
       ++i;
-      if (num(2, &hh) && i < s.size() && s[i] == ':') {
-        ++i;
-        if (!num(2, &mi) || i >= s.size() || s[i] != ':') return false;
-        ++i;
-        if (!num(2, &ss)) return false;
+      // The time as MariaDB reads it: the hour, then minutes and seconds if given ('2026-10-25 17:00' is 17:00:00,
+      // '2026-10-25 17' is 17:00:00). Only HH:MM:SS was read, so '... 17:00' failed here and a DATETIME compared
+      // with it fell to the number-against-text rule ('2026-10-25 17:00' read as 2026): `d >= '2026-10-25 17:00'`
+      // held for every row and `d < ...` for none.
+      if (num(2, &hh)) {
+        if (i < s.size() && s[i] == ':') {
+          ++i;
+          if (!num(2, &mi)) return false;
+          if (i < s.size() && s[i] == ':') {
+            ++i;
+            if (!num(2, &ss)) return false;
+          }
+        }
         if (i < s.size() && s[i] == '.') {
           ++i;
           int nd = 0;
@@ -1968,7 +1979,9 @@ bool temporal_key(std::string_view s, int64_t* out) {
 // A DATE / DATETIME as the number MySQL compares a number with: 2024-02-29
 // is 20240229, 2024-02-29 12:30:45 is 20240229123045. False when it is not
 // one of those two shapes.
-static bool temporal_number(const std::string& v, double* out) {
+static bool temporal_number(const std::string& v_in, double* out) {
+  // 'YYYY-MM-DD HH:MM' and 'YYYY-MM-DD HH' are that time with the rest zero, as MariaDB reads them
+  const std::string v = v_in.size() == 16 ? v_in + ":00" : v_in.size() == 13 ? v_in + ":00:00" : v_in;
   if (v.size() != 10 && v.size() != 19) return false;
   static const char kShape[] = "dddd-dd-dd dd:dd:dd";
   double n = 0;
@@ -13661,7 +13674,8 @@ void store_pack(const uint8_t* raw, size_t n, ByteBuffer& out, bool dense) {
 // that does not check out (a damaged file is not guessed at). With `end`,
 // bytes after the last chunk are allowed (the parts a checkpoint appended:
 // store_parts) and `end` says where the packed image stops.
-bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why, size_t* end = nullptr) {
+// *deflated: some chunk was stored deflated (the file was written in the dense form)
+bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why, size_t* end = nullptr, bool* deflated = nullptr) {
   auto fail = [&](const char* w) { if (why) *why = w; return false; };
   if (in.size() < kStorePackHeader || !store_is_packed(in)) return fail("not a packed table file");
   const uint8_t* base = in.data();
@@ -13689,6 +13703,7 @@ bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why, size_t* end = 
   }
   if (end) *end = at;
   else if (at != in.size()) return fail("bytes after the last chunk");
+  if (deflated) { *deflated = false; for (const Piece& p : pieces) if (p.kind == 2) { *deflated = true; break; } }
   out.resize((size_t)n);
   std::atomic<bool> bad{false};
   auto run = [&](size_t b0, size_t b1) {
@@ -13856,14 +13871,16 @@ void ColumnStore::seg_clear() {
   alp_exc_vals.clear(); alp_exc_vals.shrink_to_fit();
 }
 
-// Sized to the data / segment: grow in segment steps rather than doubling into huge reserves.
+// Sized to the data / segment: grown in segment steps, and by at least a quarter of what it holds - not doubled into
+// huge reserves (release_slack hands back what is left over). Steps alone were a copy of the whole column every
+// 2,048 rows: seeding a 21.6M-row table copied hundreds of GB and held two copies of a column at each step.
 template <class V>
 static inline void grow_column_vec(V& v, size_t need) {
   if (need <= v.capacity()) return;
   constexpr size_t kSegStep = 2048;
   const size_t step = sizeof(typename V::value_type) == 1 ? 8192 :
                       sizeof(typename V::value_type) >= 64 ? 16 : kSegStep;
-  const size_t target = ((need + step - 1) / step) * step;
+  const size_t target = std::max(((need + step - 1) / step) * step, v.capacity() + v.capacity() / 4);
   v.reserve(target);
 }
 
@@ -14139,9 +14156,31 @@ size_t SymbolCoder::encode(std::string_view in, uint8_t* out) const {
 }
 
 bool SymbolCoder::well_formed(const uint8_t* in, size_t n) const {
-  for (size_t i = 0; i < n; ++i) {
-    if (in[i] == 255) { if (++i >= n) return false; }
-    else if (in[i] >= len.size()) return false;
+  const size_t nsym = len.size();
+  size_t i = 0;
+  while (i < n) {
+    // Windows of sixteen bytes that are all symbols (none the escape marker, none past the table) are well formed
+    // as they stand: skipped. This ran a byte at a time over every string of a table as it loaded - a third of the
+    // start on chi-il-1, for its 31-million-row audit trail. A window with an escape or a stray code in it is
+    // walked code by code to its end, then the skipping starts again.
+#if defined(__SSE2__)
+    if (nsym > 0 && nsym <= 255) {
+      const __m128i lim = _mm_set1_epi8((char)(nsym - 1));
+      while (i + 16 <= n) {
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+        // saturating b - (nsym - 1) is zero exactly where the byte is a symbol
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(b, lim), _mm_setzero_si128())) != 0xFFFF) break;
+        i += 16;
+      }
+      if (i >= n) return true;
+    }
+#endif
+    const size_t stop = std::min(n, i + 16);
+    while (i < stop) {
+      if (in[i] == 255) { if (++i >= n) return false; }
+      else if (in[i] >= nsym) return false;
+      ++i;
+    }
   }
   return true;
 }
@@ -14428,59 +14467,69 @@ uint32_t ColumnStore::read_code(size_t row) const {
   return 0;
 }
 
+// Trims spare capacity only where that is cheap. This runs every kSegRows appended rows, and shrink_to_fit copies the
+// whole vector: on a column of a few million rows (its dictionary above all) that was a copy of the column every 2048
+// rows - quadratic in the table, and most of the time a seed, a restart's replay or a replicated insert spent. A big
+// vector keeps its slack (growth is by half, so at most a third of it) until the table is idle, when release_slack()
+// returns it.
+template <class V>
+static inline void trim_if_small(V& v) {
+  if (v.capacity() != v.size() && v.size() * sizeof(typename V::value_type) <= 64 * 1024) v.shrink_to_fit();
+}
+
 static void seal_segment(ColumnStore& cs) {
   if (cs.encoding == ColumnEncoding::DictBitPacked) {
-    if (cs.bit_width_ == 32) cs.data32.shrink_to_fit();
-    else cs.packed_data.shrink_to_fit();
+    if (cs.bit_width_ == 32) trim_if_small(cs.data32);
+    else trim_if_small(cs.packed_data);
     if (cs.seg_packed_) {
-      cs.seg_hdr.shrink_to_fit();
-      cs.seg_tab.shrink_to_fit();
+      trim_if_small(cs.seg_hdr);
+      trim_if_small(cs.seg_tab);
     }
   } else if (cs.encoding == ColumnEncoding::TypedInt32) {
-    cs.int32_data.shrink_to_fit();
+    trim_if_small(cs.int32_data);
   } else if (cs.encoding == ColumnEncoding::TypedInt64) {
-    cs.int64_data.shrink_to_fit();
+    trim_if_small(cs.int64_data);
   } else if (cs.encoding == ColumnEncoding::TypedDouble) {
-    cs.double_data.shrink_to_fit();
+    trim_if_small(cs.double_data);
   } else if (cs.encoding == ColumnEncoding::RawArena) {
-    cs.text_arena.shrink_to_fit();
-    cs.arena_offsets.shrink_to_fit();
+    trim_if_small(cs.text_arena);
+    trim_if_small(cs.arena_offsets);
   } else if (cs.encoding == ColumnEncoding::SegmentFOR) {
-    cs.packed_data.shrink_to_fit();
-    cs.seg_base.shrink_to_fit();
-    cs.seg_bits.shrink_to_fit();
-    cs.seg_byte_at.shrink_to_fit();
+    trim_if_small(cs.packed_data);
+    trim_if_small(cs.seg_base);
+    trim_if_small(cs.seg_bits);
+    trim_if_small(cs.seg_byte_at);
   } else if (cs.encoding == ColumnEncoding::ALP) {
-    cs.packed_data.shrink_to_fit();
-    cs.seg_base.shrink_to_fit();
-    cs.seg_bits.shrink_to_fit();
-    cs.seg_byte_at.shrink_to_fit();
-    cs.alp_exp.shrink_to_fit();
-    cs.alp_exc_rows.shrink_to_fit();
-    cs.alp_exc_vals.shrink_to_fit();
+    trim_if_small(cs.packed_data);
+    trim_if_small(cs.seg_base);
+    trim_if_small(cs.seg_bits);
+    trim_if_small(cs.seg_byte_at);
+    trim_if_small(cs.alp_exp);
+    trim_if_small(cs.alp_exc_rows);
+    trim_if_small(cs.alp_exc_vals);
   } else if (cs.encoding == ColumnEncoding::FOR || cs.encoding == ColumnEncoding::TemporalDays ||
              cs.encoding == ColumnEncoding::TemporalSeconds || cs.encoding == ColumnEncoding::DecimalScaled) {
-    if (cs.bit_width_ == 32) cs.data32.shrink_to_fit();
-    else cs.packed_data.shrink_to_fit();
+    if (cs.bit_width_ == 32) trim_if_small(cs.data32);
+    else trim_if_small(cs.packed_data);
   } else if (cs.encoding == ColumnEncoding::RLE) {
-    cs.rle_codes_data.shrink_to_fit();
-    cs.rle_run_lengths.shrink_to_fit();
-    cs.rle_escape_runs.shrink_to_fit();
-    cs.rle_escape_lengths.shrink_to_fit();
-    cs.rle_seg_base_rows.shrink_to_fit();
+    trim_if_small(cs.rle_codes_data);
+    trim_if_small(cs.rle_run_lengths);
+    trim_if_small(cs.rle_escape_runs);
+    trim_if_small(cs.rle_escape_lengths);
+    trim_if_small(cs.rle_seg_base_rows);
   } else if (cs.encoding == ColumnEncoding::FSST) {
-    cs.fsst_data.shrink_to_fit();
-    cs.fsst_offsets.shrink_to_fit();
-    cs.fsst_off_base.shrink_to_fit();
-    cs.fsst_off_rel.shrink_to_fit();
+    trim_if_small(cs.fsst_data);
+    trim_if_small(cs.fsst_offsets);
+    trim_if_small(cs.fsst_off_base);
+    trim_if_small(cs.fsst_off_rel);
   }
-  cs.null_bitmap.shrink_to_fit();
-  cs.zone_maps.shrink_to_fit();
+  trim_if_small(cs.null_bitmap);
+  trim_if_small(cs.zone_maps);
   if (!cs.zone_maps.empty()) {
-    cs.zone_maps.back().min_str.shrink_to_fit();
-    cs.zone_maps.back().max_str.shrink_to_fit();
+    trim_if_small(cs.zone_maps.back().min_str);
+    trim_if_small(cs.zone_maps.back().max_str);
   }
-  cs.dict.shrink_to_fit();
+  if (cs.dict.memory_bytes() <= 64 * 1024) cs.dict.shrink_to_fit();
 }
 
 template <class V>
@@ -14853,6 +14902,24 @@ inline uint32_t dict_read_varint(const char*& p, const char* end) {
 }
 }  // namespace
 
+void DictArena::push_back_stored(const uint8_t* run, uint64_t n, size_t total) {
+  if (front_coded_) un_front_code();
+  sorted_ = false;
+  const size_t b0 = bytes_.size(), o0 = offs_.size();
+  bytes_.resize(b0 + total);
+  offs_.resize(o0 + (size_t)n);
+  char* dst = bytes_.data() + b0;
+  for (uint64_t i = 0; i < n; ++i) {
+    uint64_t len = 0;
+    for (int k = 0; k < 8; ++k) len |= (uint64_t)run[k] << (8 * k);
+    run += 8;
+    std::memcpy(dst, run, (size_t)len);
+    dst += len;
+    run += len;
+    offs_[o0 + (size_t)i] = (uint32_t)(dst - bytes_.data());
+  }
+}
+
 void DictArena::push_back(std::string_view s) {
   if (front_coded_) un_front_code();
   sorted_ = false;
@@ -15057,9 +15124,25 @@ void DictArena::code_upto(const std::shared_ptr<const SymbolCoder>& c, size_t up
 
 bool DictArena::set_coded(std::shared_ptr<const SymbolCoder> c, std::vector<uint8_t> cbytes, std::vector<uint32_t> coffs) {
   if (!c || size() != 0 || coffs.empty() || coffs[0] != 0 || coffs.back() != cbytes.size()) return false;
-  for (size_t k = 0; k + 1 < coffs.size(); ++k) {
-    if (coffs[k + 1] < coffs[k]) return false;
-    if (!c->well_formed(cbytes.data() + coffs[k], coffs[k + 1] - coffs[k])) return false;
+  // Every entry checked before any is read (a damaged one must not decode past its end); a big dictionary in
+  // slices, one per core: audittrail's 6M-entry querystring dictionary was most of its column's load.
+  auto check = [&](size_t k0, size_t k1) {
+    for (size_t k = k0; k < k1; ++k) {
+      if (coffs[k + 1] < coffs[k]) return false;
+      if (!c->well_formed(cbytes.data() + coffs[k], coffs[k + 1] - coffs[k])) return false;
+    }
+    return true;
+  };
+  const size_t n = coffs.size() - 1;
+  if (n < ((size_t)1 << 18)) {
+    if (!check(0, n)) return false;
+  } else {
+    const size_t lanes = std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency()));
+    std::vector<char> ok(lanes, 0);
+    std::vector<std::thread> th;
+    for (size_t i = 0; i < lanes; ++i) th.emplace_back([&, i] { ok[i] = check(n * i / lanes, n * (i + 1) / lanes); });
+    for (auto& t : th) t.join();
+    for (char o : ok) if (!o) return false;
   }
   coder_ = std::move(c);
   cbytes_ = std::move(cbytes);
@@ -15872,6 +15955,7 @@ void colidx_cell_rewritten(const ColumnStore& cs, size_t row, uint64_t old_epoch
 void ColumnStore::set(size_t row, const std::string& val) {
   if (row >= row_count_) return;
   const uint64_t old_epoch = epoch;
+  const uint64_t old_truth = truth_key();
   epoch = sql_next_mutation_seq();
   // One cell rewritten: its segment's stats follow from the value it replaces
   // and the one it becomes. Rescanning all 2048 rows per cell made a
@@ -15902,6 +15986,7 @@ void ColumnStore::set(size_t row, const std::string& val) {
   if (recoded) refresh_zone_maps(row, row);
   else update_zone_map_cell(*this, row, before);
   colidx_cell_rewritten(*this, row, old_epoch, recoded);
+  if (!recoded && enc_before == ColumnEncoding::DictBitPacked && !shared_dict) { truth_epoch = old_truth; truth_epoch_at = epoch; }
 }
 
 void ColumnStore::push_back(const std::string& val) {
@@ -16823,13 +16908,37 @@ void ColumnStore::refresh_zone_maps(size_t from, size_t to) {
     zm.min_double = 1e300; zm.max_double = -1e300;
     zm.null_count = 0; zm.has_stats = true; zm.bloom_filter = 0;
     bool first = true;
+    // A dictionary column's numeric readings come from a cache of every entry (ensure_dict_doubles / _ints), and
+    // this runs under the exclusive lock: when the cache is not complete (the dictionary grew or was compacted),
+    // building it here read every distinct value of the column through strtod for the sake of 2048 rows - 13 s of
+    // every query waiting, on a column of a few million values. The segment's own values are read instead, by the
+    // same rules the cache uses (text that is empty or NULL, or does not start as a number, has no reading).
+    const bool dict_coded = encoding == ColumnEncoding::DictBitPacked || encoding == ColumnEncoding::RLE;
+    const DictArena& dct = shared_dict ? shared_dict->dict : dict;
+    const bool parse_rows = dict_coded && (dict_doubles.size() < dct.size() || dict_ints.size() < dct.size());
     for (size_t r = start; r < end; ++r) {
       if (is_null(r)) { zm.null_count++; continue; }
-      double d = 0.0;
-      if (get_double(r, &d)) { if (d < zm.min_double) zm.min_double = d; if (d > zm.max_double) zm.max_double = d; }
-      int64_t iv = 0;
-      if (get_int64(r, &iv)) { if (iv < zm.min_int64) zm.min_int64 = iv; if (iv > zm.max_int64) zm.max_int64 = iv; }
       const std::string& sv = get(r);
+      double d = 0.0;
+      int64_t iv = 0;
+      bool has_d, has_i;
+      if (parse_rows) {
+        has_d = has_i = false;
+        if (!sv.empty() && !sql_is_null(sv)) {
+          char* endp = nullptr;
+          d = std::strtod(sv.c_str(), &endp);
+          has_d = endp != sv.c_str();
+          endp = nullptr;
+          const long long ll = std::strtoll(sv.c_str(), &endp, 10);
+          has_i = endp != sv.c_str();
+          iv = static_cast<int64_t>(ll);
+        }
+      } else {
+        has_d = get_double(r, &d);
+        has_i = get_int64(r, &iv);
+      }
+      if (has_d) { if (d < zm.min_double) zm.min_double = d; if (d > zm.max_double) zm.max_double = d; }
+      if (has_i) { if (iv < zm.min_int64) zm.min_int64 = iv; if (iv > zm.max_int64) zm.max_int64 = iv; }
       std::string low = collate_key(sv);
       zm.add_bloom(fnv1a(sv));
       zm.add_bloom(fnv1a(low));
@@ -17244,11 +17353,20 @@ bool ColumnStore::erase_one_row(size_t row) {
 
 void ColumnStore::erase_rows(const std::vector<size_t>& rows) {
   if (rows.empty()) return;
+  // Rows leave a coded column with every code still meaning what it did (the dictionary is not touched): what was
+  // decided per code - a predicate's verdicts, the dictionary's collation ranks - stands (truth_key()).
+  const bool keeps_codes = encoding == ColumnEncoding::DictBitPacked && !shared_dict;
+  const uint64_t old_truth = truth_key(), old_codes = codes_key();
   if (encoding == ColumnEncoding::RLE) {
     materialize_to_dict_packed();
   }
   unpack_segments();
-  if (rows.size() == 1 && erase_one_row(rows[0])) return;
+  auto keep_keys = [&] {
+    if (!keeps_codes || encoding != ColumnEncoding::DictBitPacked) return;
+    truth_epoch = old_truth; truth_epoch_at = epoch;
+    codes_epoch = old_codes; codes_epoch_at = epoch;
+  };
+  if (rows.size() == 1 && erase_one_row(rows[0])) { keep_keys(); return; }
   if (encoding == ColumnEncoding::BlockCompressed) {
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) erase(*it);
     return;
@@ -17442,6 +17560,7 @@ void ColumnStore::erase_rows(const std::vector<size_t>& rows) {
     for (size_t sg = first_seg; sg < segs; ++sg) zone_maps[sg] = SegmentZoneMap();   // has_stats = false
   }
   colidx_after_erase(*this, old_epoch, rows);
+  keep_keys();
 }
 
 void ColumnStore::erase(size_t row) {
@@ -18987,6 +19106,47 @@ static void probe_index_follow(SqlTable& t, size_t c, size_t r, const std::share
   idx->dict_val_offsets.clear();
 }
 
+// Past this a journal is dropped and the table saved whole: a part bigger than the table's own rewrite saves nothing.
+constexpr size_t kJournalMaxBytes = (size_t)64 << 20;
+
+static bool ops_parts_enabled() {
+  static const bool off = [] { const char* e = std::getenv("AIOS_STORE_NO_OPS_PARTS"); return e && *e && *e != '0'; }();
+  return !off;
+}
+
+void SqlTable::journal_begin() {
+  std::lock_guard<aios::hal::Mutex> lk(*journal_mu);
+  std::vector<ChangeJournal::Op>().swap(journal.ops);
+  journal.on = ops_parts_enabled();
+  journal.broken = false;
+  journal.start_seq = journal.last_seq = mutation_seq;
+  journal.bytes = journal.cells = 0;
+}
+
+void SqlTable::stamp_form_change() {
+  std::lock_guard<aios::hal::Mutex> lk(*journal_mu);
+  const uint64_t before = mutation_seq;
+  mutation_seq = sql_next_mutation_seq();
+  if (journal.on && !journal.broken && journal.last_seq == before) journal.last_seq = mutation_seq;
+}
+
+void SqlTable::journal_note(uint64_t before, uint64_t after, ChangeJournal::Op&& op) {
+  std::lock_guard<aios::hal::Mutex> lk(*journal_mu);
+  if (!journal.on || journal.broken) return;
+  size_t add = 16 + op.val.size() + op.rows.size() * 8;
+  for (const auto& c : op.cells) add += 8 + c.size();
+  // a write in between that did not record (before), or one too many: the next save is whole
+  if (before != journal.last_seq || journal.bytes + add > kJournalMaxBytes) {
+    journal.broken = true;
+    std::vector<ChangeJournal::Op>().swap(journal.ops);
+    return;
+  }
+  journal.bytes += add;
+  journal.cells += op.kind == 'E' ? op.rows.size() : op.kind == 'S' ? 1 : 0;
+  journal.ops.push_back(std::move(op));
+  journal.last_seq = after;
+}
+
 void SqlTable::set_cell(size_t r, size_t c, const std::string& val) {
   compact_delta_buffer();
   ensure_columns();
@@ -19032,12 +19192,18 @@ void SqlTable::set_cell(size_t r, size_t c, const std::string& val) {
     }
   }
   // Stored whole: row writers to one table (table_lock_rows) set cells side by side.
+  const uint64_t seq_before = __atomic_load_n(&mutation_seq, __ATOMIC_RELAXED);
   const uint64_t seq = sql_next_mutation_seq();
   __atomic_store_n(&mutation_seq, seq, __ATOMIC_RELAXED);
   // The layout moves only for a key column: another column's value changing leaves every row where it is, in
   // the order it was (what scan_order_key keys on).
   if (c < columns.size() && columns[c].is_primary_key) __atomic_store_n(&layout_seq, seq, __ATOMIC_RELAXED);
   cs.set(r, norm);
+  if (journal.on) {
+    ChangeJournal::Op op;
+    op.kind = 'S'; op.row = r; op.col = (uint32_t)c; op.val = norm;
+    journal_note(seq_before, seq, std::move(op));
+  }
   if (pidx) probe_index_follow(*this, c, r, pidx, old_null, old_text, old_code, enc_before, recodes_before);
   for (auto& w : live) {
     if (c < w->refs.size() && w->refs[c] && r < row_count()) watch_add(*this, *w, r);
@@ -19055,6 +19221,7 @@ void SqlTable::normalize_row(std::vector<std::string>& vals) const {
 }
 
 static void append_row_canonical_impl(SqlTable* t, const std::vector<std::string>& vals) {
+  const uint64_t seq_before = t->mutation_seq;
   t->mutation_seq = sql_next_mutation_seq();
   t->ensure_columns();
   t->compact_delta_buffer();
@@ -19078,6 +19245,13 @@ static void append_row_canonical_impl(SqlTable* t, const std::vector<std::string
     }
   }
   if (recoded) t->layout_seq = t->mutation_seq;
+  if (t->journal.on) {
+    SqlTable::ChangeJournal::Op op;
+    op.kind = 'A';
+    const size_t nr = t->row_count() - 1;
+    for (size_t c = 0; c < t->col_data.size(); ++c) op.cells.push_back(t->col_data[c].get(nr));   // as stored
+    t->journal_note(seq_before, t->mutation_seq, std::move(op));
+  }
   if (!t->watch_list->empty()) {
     const size_t nr = t->row_count() - 1;
     for (auto& w : t->live_watches()) {
@@ -19138,6 +19312,8 @@ void SqlTable::append_rows_bulk(std::vector<std::vector<std::string>>& rows) {
     rows.clear();
     return;
   }
+  const uint64_t seq_before = mutation_seq;
+  const size_t first_new = row_count();
   mutation_seq = sql_next_mutation_seq();
   const size_t ncols = col_data.size();
   std::atomic<bool> recoded{false};
@@ -19153,6 +19329,15 @@ void SqlTable::append_rows_bulk(std::vector<std::vector<std::string>>& rows) {
     if (cs.recodes != before) recoded.store(true);
   });
   if (recoded.load()) layout_seq = mutation_seq;
+  if (journal.on) {
+    ChangeJournal::Op op;
+    op.kind = 'A';
+    const size_t n = row_count();
+    op.cells.reserve((n - first_new) * ncols);
+    for (size_t r = first_new; r < n; ++r)
+      for (size_t c = 0; c < ncols; ++c) op.cells.push_back(col_data[c].get(r));   // as stored
+    journal_note(seq_before, mutation_seq, std::move(op));
+  }
   rows.clear();
 }
 
@@ -19182,9 +19367,18 @@ void SqlTable::erase_rows(const std::vector<size_t>& rows) {
     live = live_watches();
     for (auto& w : live) for (size_t r : rows) if (r < row_count()) watch_add(*this, *w, r);   // the groups losing a row
   }
+  const uint64_t seq_before = mutation_seq;
   mutation_seq = sql_next_mutation_seq();
   layout_seq = mutation_seq;
   for (auto& cs : col_data) cs.erase_rows(rows);
+  if (journal.on) {
+    ChangeJournal::Op op;
+    op.kind = 'E';
+    op.rows.assign(rows.begin(), rows.end());
+    std::sort(op.rows.begin(), op.rows.end());
+    op.rows.erase(std::unique(op.rows.begin(), op.rows.end()), op.rows.end());
+    journal_note(seq_before, mutation_seq, std::move(op));
+  }
   for (auto& w : live) {
     std::lock_guard<aios::hal::Mutex> lk(w->mu);
     w->delta_rows -= (int64_t)rows.size();
@@ -19200,9 +19394,16 @@ void SqlTable::erase_row(size_t r) {
     live = live_watches();
     for (auto& w : live) if (r < row_count()) watch_add(*this, *w, r);
   }
+  const uint64_t seq_before = mutation_seq;
   mutation_seq = sql_next_mutation_seq();
   layout_seq = mutation_seq;
   for (auto& cs : col_data) cs.erase(r);
+  if (journal.on) {
+    ChangeJournal::Op op;
+    op.kind = 'E';
+    op.rows.push_back(r);
+    journal_note(seq_before, mutation_seq, std::move(op));
+  }
   for (auto& w : live) {
     std::lock_guard<aios::hal::Mutex> lk(w->mu);
     w->delta_rows -= 1;
@@ -19411,27 +19612,7 @@ void SqlTable::optimize_storage(bool cluster) {
   // contents (per-code caches, the saved file) must see a change.
   mutation_seq = sql_next_mutation_seq();
   layout_seq = mutation_seq;
-  // Each column is encoded on its own (its dictionary, codes, segments), so a table of many columns uses the
-  // cores - unless a column shares its dictionary with another, which then must not be touched at once.
-  auto optimize_column = [&](size_t c) {
-    col_data[c].optimize_encoding(columns[c].type, columns[c].scale, columns[c].temporal);
-    if ((col_data[c].encoding == ColumnEncoding::DictBitPacked || col_data[c].encoding == ColumnEncoding::RLE) && !col_data[c].shared_dict && col_data[c].size() > 0) {
-      if (col_data[c].encoding == ColumnEncoding::DictBitPacked) {
-        const uint8_t need = code_bits_for(col_data[c].dict.size() ? col_data[c].dict.size() - 1 : 0);
-        if (need < col_data[c].bit_width_ && !col_data[c].seg_packed_) {
-          repack_codes(col_data[c], need);
-          col_data[c].data32.shrink_to_fit();
-          col_data[c].packed_data.shrink_to_fit();
-        }
-      }
-      while (col_data[c].code_dictionary((size_t)16 << 20)) {}
-    }
-  };
-  const size_t optimizable = std::min(columns.size(), col_data.size());
-  bool shares = false;
-  for (const auto& cs : col_data) if (cs.shared_dict) shares = true;
-  if (shares || optimizable < 2) for (size_t c = 0; c < optimizable; ++c) optimize_column(c);
-  else for_each_parallel(optimizable, optimize_column);
+  encode_columns(col_data, columns);
   col_data.shrink_to_fit();
   if (probe_mu) {
     std::lock_guard<aios::hal::Mutex> lk(*probe_mu);
@@ -19440,6 +19621,59 @@ void SqlTable::optimize_storage(bool cluster) {
     probe_indices.clear();
   }
   warm_up_all();
+}
+
+// Each column is encoded on its own (its dictionary, codes, segments), so a table of many columns uses the
+// cores - unless a column shares its dictionary with another, which then must not be touched at once.
+void SqlTable::encode_columns(std::vector<ColumnStore>& cols, const std::vector<SqlColumn>& defs) {
+  auto optimize_column = [&](size_t c) {
+    cols[c].optimize_encoding(defs[c].type, defs[c].scale, defs[c].temporal);
+    if ((cols[c].encoding == ColumnEncoding::DictBitPacked || cols[c].encoding == ColumnEncoding::RLE) && !cols[c].shared_dict && cols[c].size() > 0) {
+      if (cols[c].encoding == ColumnEncoding::DictBitPacked) {
+        const uint8_t need = code_bits_for(cols[c].dict.size() ? cols[c].dict.size() - 1 : 0);
+        if (need < cols[c].bit_width_ && !cols[c].seg_packed_) {
+          repack_codes(cols[c], need);
+          cols[c].data32.shrink_to_fit();
+          cols[c].packed_data.shrink_to_fit();
+        }
+      }
+      while (cols[c].code_dictionary((size_t)16 << 20)) {}
+    }
+  };
+  const size_t optimizable = std::min(defs.size(), cols.size());
+  bool shares = false;
+  for (const auto& cs : cols) if (cs.shared_dict) shares = true;
+  if (shares || optimizable < 2) for (size_t c = 0; c < optimizable; ++c) optimize_column(c);
+  else for_each_parallel(optimizable, optimize_column);
+}
+
+bool SqlTable::take_encoding_copy(std::vector<ColumnStore>* out, uint64_t* seq) {
+  for (const auto& cs : col_data) if (cs.shared_dict) return false;
+  compact_delta_buffer();
+  ensure_columns();
+  for (auto& cd : col_data) cd.block_codec_pref = text_codec;   // the blocks written take the table's TEXT_CODEC
+  *out = col_data;
+  *seq = mutation_seq;
+  return true;
+}
+
+bool SqlTable::install_encoding(std::vector<ColumnStore>& cols, uint64_t seq) {
+  if (mutation_seq != seq || cols.size() != col_data.size()) return false;   // written meanwhile: try another time
+  // Column by column: each ColumnStore stays where it is (what is keyed on its address keeps finding it), its
+  // contents exchanged with the new encoding's - the old ones leave with `cols`
+  for (size_t c = 0; c < cols.size(); ++c) std::swap(col_data[c], cols[c]);
+  // New encodings, new dictionary codes: anything keyed on this table's contents must see a change.
+  stamp_form_change();
+  layout_seq = mutation_seq;
+  col_data.shrink_to_fit();
+  if (probe_mu) {
+    std::lock_guard<aios::hal::Mutex> lk(*probe_mu);
+    probe_indices.clear();
+  } else {
+    probe_indices.clear();
+  }
+  warm_up_all();
+  return true;
 }
 
 void SqlTable::warm_up_all() const {
@@ -22270,7 +22504,6 @@ void SqlDatabase::maintain_storage() {
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
     bool changed = false;
-    bool stats_only = false;   // zone maps only: saved with the table, but no code moved
     for (size_t c = 0; c < t.col_data.size() && c < t.columns.size(); ++c) {
       ColumnStore& cs = t.col_data[c];
       // A dictionary-coded INT column (rows that arrived by INSERT) is given
@@ -22344,7 +22577,6 @@ void SqlDatabase::maintain_storage() {
         static const bool store_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
         if (store_trace) fprintf(stderr, "[store] %s.%s: zone maps rebuilt at checkpoint\n", t.name.c_str(), t.columns[c].name.c_str());
         cs.build_zone_maps();
-        stats_only = true;
       } else if (!cs.zone_maps.empty()) {
         // Segments left without stats by a delete: a few per checkpoint.
         constexpr size_t kSegSize = 2048, kPerCheckpoint = 16;
@@ -22358,7 +22590,6 @@ void SqlDatabase::maintain_storage() {
           ++done;
         }
         refreshed += done;
-        if (done) stats_only = true;
       }
     }
     // A table that lost more than half its rows since the checkpoint last
@@ -22392,9 +22623,11 @@ void SqlDatabase::maintain_storage() {
         trimmed_tables = true;
       }
     }
-    if (stats_only && !changed) t.mutation_seq = sql_next_mutation_seq();
+    // Zone maps rebuilt or refreshed change no value: they reach the file the next time the table is written for a
+    // change, and until then a start refreshes them again. Stamping the table for them wrote it whole at every
+    // checkpoint while segments were left: chi's 30M-row audit log (320 MB under the lock, every 5 minutes, idle).
     if (changed) {
-      t.mutation_seq = sql_next_mutation_seq();
+      t.stamp_form_change();
       t.layout_seq = t.mutation_seq;
       if (t.probe_mu) {
         std::lock_guard<aios::hal::Mutex> lk(*t.probe_mu);
@@ -22420,7 +22653,7 @@ void SqlDatabase::maintain_storage() {
         auto st = kernel_.host().stat(root_path_ + "/tables/" + sv->second.file);
         bytes = st.ok() ? (size_t)st->size : 0;
       }
-      t->second.mutation_seq = sql_next_mutation_seq();   // so this checkpoint writes it, packed
+      t->second.stamp_form_change();   // so this checkpoint writes it, packed
       budget -= std::min(budget, std::max<size_t>(bytes, 1));
       ++it;
     }
@@ -22453,7 +22686,7 @@ void SqlDatabase::maintain_storage() {
         cs.packed_data.shrink_to_fit();
         ++narrowed;
         narrowed_bytes += before - std::min(before, cs.data32.capacity() * 4 + cs.packed_data.capacity());
-        kv.second.mutation_seq = sql_next_mutation_seq();   // saved narrow
+        kv.second.stamp_form_change();   // saved narrow
       }
       // A column filled by INSERT is never re-encoded here, so it never got the per-segment layout optimize_encoding
       // gives: tried once it spans two segments, and again when it has grown a quarter (a write returns a column to
@@ -22462,7 +22695,7 @@ void SqlDatabase::maintain_storage() {
         cs.seg_tried_rows = cs.size();
         if (cs.pack_segments()) {
           ++segpacked;
-          kv.second.mutation_seq = sql_next_mutation_seq();
+          kv.second.stamp_form_change();
         }
       }
     }
@@ -22489,7 +22722,7 @@ void SqlDatabase::maintain_storage() {
       if (!cs.code_dictionary(kCodeChunk)) continue;
       ++coded_steps;
       coded_bytes += plain_before - cs.dict.plain_bytes();
-      if (cs.dict.plain_bytes() == 0) t.mutation_seq = sql_next_mutation_seq();
+      if (cs.dict.plain_bytes() == 0) t.stamp_form_change();
     }
   }
   if (coded_steps && std::getenv("AIOS_STORE_TRACE"))
@@ -22511,6 +22744,19 @@ uint64_t SqlDatabase::checkpoint_secs() {
 }
 
 Result<void> SqlDatabase::flush_locked() { return flush_impl(false); }
+
+bool SqlDatabase::flush_off_lock() {
+  if (checkpoint_writing_.load(std::memory_order_acquire)) return false;
+  StatementLock lock(rw_lock_, true);
+  flush_impl(true);
+  return true;
+}
+
+Result<void> SqlDatabase::flush_for_exit() {
+  StatementLock lock(rw_lock_, true);
+  exit_flush_ = true;
+  return flush_impl(false, false);
+}
 
 // ---- checkpoints off the lock ----
 // A checkpoint used to write every changed table's file while holding the
@@ -22807,7 +23053,7 @@ SqlQueryResult SqlDatabase::export_snapshot(const std::string& name, const std::
     bytes += d->size();
     return std::string();
   };
-  for (const char* f : {"cdc_position", "seed_positions", "indexes.list", "probes.list", "schema_views.db"}) {
+  for (const char* f : {"cdc_position", "seed_positions", "indexes.list", "probes.list", "rowindexes.list", "schema_views.db"}) {
     if (std::string(f) == "cdc_position" && !cdc_file.empty()) {
       // The position taken under the lock, with the snapshot: the live file is rewritten as the stream goes on, and
       // a copy of it could be later than the tables just exported (a mirror seeded from it would skip events).
@@ -23371,6 +23617,7 @@ Result<void> SqlDatabase::replay_redo() {
     applied += replay_redo_file(p.second);
   }
   applied += replay_redo_file(redo_path_);
+  if (applied) std::fprintf(stderr, "asql: %zu redo record(s) replayed\n", applied);
   // Where the live log's records end (the space set aside after them reads
   // as zeros): the next record goes there if no checkpoint rotates the log
   // first (it does, below, whenever anything was applied).
@@ -23449,10 +23696,32 @@ void SqlDatabase::record_cdc_commit(const std::string& file, uint64_t pos) {
     // The held records are shared with writers on other threads.
     StatementLock lock(rw_lock_, true);
     append_redo(std::string(kCdcCommitTag) + file + " " + std::to_string(pos), "");
-    flush_redo_pending();   // the transaction and its commit mark: one fdatasync
+    // The transaction and its commit mark go into the log in one write; the log goes on the medium at most every
+    // 100 ms. A sync per replicated transaction held the stream to what the disk syncs in a second: chi's mirror
+    // fell 800 MB behind its MariaDB on a burst of single-row price updates (350 a second, ~10 ms a sync). What a
+    // crash loses of the unsynced tail is re-read: a start resumes the stream after the last commit mark replayed.
+    const uint64_t now = kernel_.host().monotonic_ns();
+    if (now - cdc_synced_ns_ >= 100000000ull) {
+      flush_redo_pending();
+      cdc_synced_ns_ = now;
+    } else if (!redo_pending_.empty() && !redo_path_.empty()) {
+      redo_write(ByteSpan(reinterpret_cast<const uint8_t*>(redo_pending_.data()), redo_pending_.size()), false);
+      redo_pending_.clear();   // buffered in order; the next sync (or a checkpoint's rotation, rotate_redo) writes it
+    }
   }
-  // A replicated transaction has committed: the Things it touched react now,
-  // once per transaction rather than once per row statement.
+  // A replicated transaction has committed: the Things it touched react - at most every 100 ms, the keys of every
+  // transaction since together. Once per transaction, a burst of single-row price updates (350 a second) ran the
+  // sticker Thing's program 350 times a second on this thread, and the mirror fell behind its MariaDB.
+  cdc_settle_owed_ = true;
+  cdc_settle_if_due();
+}
+
+void SqlDatabase::cdc_settle_if_due() {
+  if (!cdc_settle_owed_) return;
+  const uint64_t now = kernel_.host().monotonic_ns();
+  if (now - cdc_settled_ns_ < 100000000ull) return;
+  cdc_settle_owed_ = false;
+  cdc_settled_ns_ = now;
   things_settle();
 }
 
@@ -23501,10 +23770,35 @@ void SqlDatabase::active_data_tick() {
   if (work.empty()) return;
   bool shed = false;
   for (const auto& w : work) shed = shed || w.release_slack;
+  // A re-encode is the slow part (seconds for a large table, every read waiting behind it): the columns are copied
+  // under the lock, encoded holding nothing, and put back under the lock if the table was not written meanwhile.
+  struct Off { std::string key; std::vector<ColumnStore> cols; std::vector<SqlColumn> defs; uint64_t seq = 0; };
+  std::vector<Off> off;
   {
     StatementLock lock(rw_lock_, true);
+    for (auto& w : work) {
+      if (!w.reencode) continue;
+      auto it = tables_.find(w.key);
+      if (it == tables_.end()) continue;
+      Off o;
+      o.key = w.key;
+      if (!it->second.take_encoding_copy(&o.cols, &o.seq)) continue;   // shares a dictionary: in place, below
+      o.defs = it->second.columns;
+      w.reencode = false;
+      off.push_back(std::move(o));
+    }
     active_data_->tick_apply(work);
   }
+  for (auto& o : off) SqlTable::encode_columns(o.cols, o.defs);
+  if (!off.empty()) {
+    StatementLock lock(rw_lock_, true);
+    for (auto& o : off) {
+      auto it = tables_.find(o.key);
+      if (it != tables_.end() && it->second.install_encoding(o.cols, o.seq))
+        active_data_->note_reencoded(o.key, it->second.mutation_seq);
+    }
+  }
+  off.clear();   // the old columns, swapped out, go here - outside the lock
   // The small blocks a shed vector left in the allocator's arenas, outside the statement lock.
   if (shed) trim_process_memory();
 }
@@ -23583,8 +23877,14 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   }
   wal_path_ = root_path_ + "/write_behind.wal";
   redo_path_ = root_path_ + "/redo.log";
+  const auto init_t0 = std::chrono::steady_clock::now();
+  auto init_lap = [&](const char* what) {
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "asql: %s (%.2f s into the start)\n", what, std::chrono::duration<double>(now - init_t0).count());
+  };
   load_profiles();
   load_tables();
+  init_lap("tables and views loaded");
   load_programs();
   // Every table file was read whole and decoded; the file buffers are freed
   // but their pages are still ours until asked for. (The legacy v3 loader
@@ -23597,9 +23897,11 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   cells_ = std::make_unique<CellEngine>(*this);
   cells_->load();
   active_data_ = std::make_unique<ActiveDataEngine>(*this);
+  init_lap("things and cells loaded");
   g_cdc_thread = true;          // replayed statements react once, below
   replay_redo();
   g_cdc_thread = false;
+  init_lap("redo log replayed");
   // Tables created since the last save exist only after the log replays, and the replay writes through paths
   // that do not always report each row: the active objects are built from the tables as they now are.
   active_data_->load();
@@ -23655,20 +23957,37 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   };
   auto want = read_list("indexes.list");
   auto want_probes = read_list("probes.list");
-  if (!want.empty() || !want_probes.empty()) {
-    index_warm_ = aios::hal::Thread([this, want, want_probes]() {
+  std::vector<std::string> want_rows;
+  if (auto rl = kernel_.host().read_file(root_path_ + "/rowindexes.list"); rl.ok()) {
+    std::string text(rl->begin(), rl->end());
+    for (size_t at = 0; at < text.size();) {
+      size_t nl = text.find('\n', at);
+      if (nl == std::string::npos) nl = text.size();
+      if (nl > at) want_rows.push_back(text.substr(at, nl - at));
+      at = nl + 1;
+    }
+  }
+  if (!want.empty() || !want_probes.empty() || !want_rows.empty()) {
+    index_warm_ = aios::hal::Thread([this, want, want_probes, want_rows]() {
       const uint64_t t0 = kernel_.host().monotonic_ns();
       StatementLock lock(rw_lock_, false);
       // One entry per pool lane at a time, not one after another: built in
       // turn, 17 column and 22 join indexes were still going 200 s after a
       // restart, and the first queries paid for them in CPU.
-      std::vector<std::pair<bool, std::pair<std::string, std::string>>> all;
-      for (const auto& w : want) all.push_back({false, w});
-      for (const auto& w : want_probes) all.push_back({true, w});
+      // (0 a column index, 1 a join index, 2 a table's primary-key row map)
+      std::vector<std::pair<int, std::pair<std::string, std::string>>> all;
+      for (const auto& w : want) all.push_back({0, w});
+      for (const auto& w : want_probes) all.push_back({1, w});
+      for (const auto& w : want_rows) all.push_back({2, {w, std::string()}});
       SqlThreadPool::instance().parallel_for_static(all.size(), 1, [&](size_t b0, size_t b1, size_t) {
         for (size_t i = b0; i < b1; ++i) {
-          const bool probe = all[i].first;
+          const bool probe = all[i].first == 1;
           const auto& w = all[i].second;
+          if (all[i].first == 2) {   // (the row maps are known by the table's own name)
+            for (const auto& kv : tables_)
+              if (lower_of(kv.second.name) == w.first) { grow_row_index(kv.second); break; }
+            continue;
+          }
           auto it = tables_.find(w.first);
           if (it == tables_.end()) continue;
           int c = it->second.get_column_index(w.second);
@@ -23677,7 +23996,7 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
           else if (it->second.col_data[(size_t)c].size() == it->second.row_count()) warm_column_index(it->second, (size_t)c);
         }
       });
-      fprintf(stderr, "asql: warmed %zu column and %zu join indexes in %.1f s\n", want.size(), want_probes.size(),
+      fprintf(stderr, "asql: warmed %zu column, %zu join and %zu primary-key indexes in %.1f s\n", want.size(), want_probes.size(), want_rows.size(),
               (double)(kernel_.host().monotonic_ns() - t0) / 1e9);
       fflush(stderr);
       // The builds' scratch (candidate lists, sort buffers) came from every
@@ -24632,6 +24951,11 @@ namespace { constexpr uint64_t kQmemMaxWaitMs = 30000; }
 
 bool SqlDatabase::qmem_reserve(uint64_t order, size_t* held, size_t bytes, bool may_wait) {
   std::unique_lock<aios::hal::Mutex> lk(qmem_mu_);
+  const size_t budget = qmem_budget_.load(std::memory_order_relaxed);
+  // A per-statement ceiling: a single statement cannot reserve unbounded memory.
+  // When a budget is set, no single statement may exceed the per-statement ceiling (2 * budget).
+  const size_t ceiling = budget > 0 ? budget * 2 : 0;
+  if (ceiling > 0 && *held + bytes > ceiling) return false;
   const uint64_t t0 = kernel_.host().monotonic_ns();
   bool waiting = false;
   for (;;) {
@@ -24805,6 +25129,17 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
   if (g_rw_depth == 0 && !tls_autocommit && !tls_txn.open && statement_opens_transaction(sql_query)) {
     SqlQueryResult b = execute_gateway_query("BEGIN", session_db);
     if (!b.success) return b;
+  }
+  // CREATE OR REPLACE THING of a grain Thing there is: no statement lock, in either transaction mode (see
+  // execute_local_query) - its reads take their own while the old Thing answers
+  if (g_rw_depth == 0 && !tls_txn.open && things_) {
+    size_t i = 0;
+    while (i < sql_query.size() && std::isspace((unsigned char)sql_query[i])) ++i;
+    if (sql_query.size() - i >= 17 && strncasecmp(sql_query.c_str() + i, "CREATE OR REPLACE", 17) == 0) {
+      SqlQueryResult r;
+      ScopedSessionDb in_session(session_db);   // the client's database, as the statement lock's path sets it
+      if (things_->try_replace_unlocked(sql_query.substr(i), &r)) return r;
+    }
   }
   if (txn_concurrent() && g_rw_depth == 0) return execute_gateway_concurrent(sql_query, session_db, begins ? 1 : 0);
   // A transaction takes the one writer lock for its whole life. BEGIN used to
@@ -26353,6 +26688,16 @@ SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, co
     while (i < sql_query.size() && std::isspace((unsigned char)sql_query[i])) ++i;
     if (sql_query.size() - i >= 15 && strncasecmp(sql_query.c_str() + i, "EXPORT SNAPSHOT", 15) == 0)
       return export_snapshot_statement(sql_query.substr(i));
+    // CREATE OR REPLACE THING of a grain Thing there is: built with no statement lock held - its reads take
+    // their own, so the old Thing answers and tables are written while it builds (sql_things.cpp)
+    if (things_ && sql_query.size() - i >= 17 && strncasecmp(sql_query.c_str() + i, "CREATE OR REPLACE", 17) == 0) {
+      SqlQueryResult r;
+      ScopedSessionDb in_session(session_db);
+      if (things_->try_replace_unlocked(sql_query.substr(i), &r)) {
+        if (r.success && r.is_result_set && !sql_wire_results()) r.formatted_table = format_result_table(r.columns, r.rows);
+        return r;
+      }
+    }
   }
   StatementLock lock(rw_lock_, !reads);
   // Only where this statement took the exclusive lock itself (mode 2; a write
@@ -29941,8 +30286,16 @@ void colidx_after_erase(const ColumnStore& cs, uint64_t old_epoch, const std::ve
         added = 1;
       }
     } else {
+      // Every id against the gaps as they were, before any is added: virt_of searches the whole vector, so with this
+      // statement's first ids already pushed (unsorted, past the sorted part) the next row's id came out shifted -
+      // a second multi-row DELETE on a table sent every later lookup of a key to the wrong row (a range or IN
+      // selection returned rows outside it, and the DELETE after it removed the wrong ones).
+      std::vector<uint32_t> ids;
+      ids.reserve(erased.size());
+      for (size_t r : erased) if (r < ci->rows_covered) ids.push_back(ci->virt_of(r));
+      added = ids.size();
       const size_t old = ci->gaps.size();
-      for (size_t r : erased) if (r < ci->rows_covered) { ci->gaps.push_back(ci->virt_of(r)); ++added; }   // virt_of reads [0, old)
+      ci->gaps.insert(ci->gaps.end(), ids.begin(), ids.end());
       std::inplace_merge(ci->gaps.begin(), ci->gaps.begin() + (long)old, ci->gaps.end());
     }
     ci->rows_covered -= added;
@@ -30051,7 +30404,11 @@ void colidx_cell_rewritten(const ColumnStore& cs, size_t row, uint64_t old_epoch
   if (cs.is_null(row)) { if (rr->null_row < 0) rr->null_row = (int64_t)row; }
   else {
     const uint32_t k = cs.read_code(row);
-    if (k >= rr->of_code.size()) { vx::g_rep_cache.erase(it); return; }
+    // a code the write added to the dictionary: this row is its first (and only) one
+    if (k >= rr->of_code.size()) {
+      if (k >= vx::code_space(cs)) { vx::g_rep_cache.erase(it); return; }
+      rr->of_code.resize(vx::code_space(cs), -1);
+    }
     if (rr->of_code[k] < 0 || rr->of_code[k] > (int64_t)row) rr->of_code[k] = (int64_t)row;
   }
   rr->layout = cs.epoch;
@@ -31584,7 +31941,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       // codes, so only codes the dictionary gained since are evaluated.
       const bool cacheable = !sh.statement_time;
       const std::string key = expr_signature(e) + "#" + std::to_string((uintptr_t)&cs) + "#" +
-                              std::to_string(cs.epoch);
+                              std::to_string(cs.truth_key());
       CachedTruth have{{}, kN, false, {}};
       bool have_any = false;
       if (cacheable) {
@@ -31992,12 +32349,12 @@ AIOS_AVX2_TARGET static void scan_eq_u16_mask64(const uint16_t* src, size_t n, u
     __m256i eq1 = _mm256_cmpeq_epi16(v1, vc);
     __m256i eq2 = _mm256_cmpeq_epi16(v2, vc);
     __m256i eq3 = _mm256_cmpeq_epi16(v3, vc);
-    __m128i pk01 = _mm_packs_epi16(_mm_packs_epi16(_mm256_castsi256_si128(eq0), _mm256_extracti128_si256(eq0, 1)),
-                                   _mm_packs_epi16(_mm256_castsi256_si128(eq1), _mm256_extracti128_si256(eq1, 1)));
-    __m128i pk23 = _mm_packs_epi16(_mm_packs_epi16(_mm256_castsi256_si128(eq2), _mm256_extracti128_si256(eq2, 1)),
-                                   _mm_packs_epi16(_mm256_castsi256_si128(eq3), _mm256_extracti128_si256(eq3, 1)));
-    uint32_t m01 = (uint32_t)_mm_movemask_epi8(pk01);
-    uint32_t m23 = (uint32_t)_mm_movemask_epi8(pk23);
+    // Each lane is 0 or -1: packed to bytes they stay 0 / -1, one byte a row. _mm256_packs_epi16 packs within
+    // 128-bit halves, so the 64-bit quarters are put back in row order before the bytes' top bits are read.
+    const __m256i b01 = _mm256_permute4x64_epi64(_mm256_packs_epi16(eq0, eq1), 0xD8);
+    const __m256i b23 = _mm256_permute4x64_epi64(_mm256_packs_epi16(eq2, eq3), 0xD8);
+    const uint32_t m01 = (uint32_t)_mm256_movemask_epi8(b01);
+    const uint32_t m23 = (uint32_t)_mm256_movemask_epi8(b23);
     mask_out[w] = ((uint64_t)m23 << 32) | (uint64_t)m01;
   }
   if (w < num_words) {
@@ -32509,7 +32866,9 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
         }
         return (uint8_t)(a - 1);
       };
-      if (cs.encoding == ColumnEncoding::DictBitPacked) {
+      // In place only on one packed array: a column packed per segment (as a reopened table is) has no single
+      // array and widths differ by segment - read there, `loccode IN (SELECT '03')` found no row on chi.
+      if (cs.encoding == ColumnEncoding::DictBitPacked && !cs.seg_packed_) {
         if (cs.bit_width_ == 8) {
           const uint8_t* __restrict__ src = cs.packed_data.data() + start;
           for (size_t i = 0; i < n; ++i) {
@@ -33728,7 +34087,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
       {
         std::lock_guard<aios::hal::Mutex> lk(bare_mu);
         auto it = bare_cache.find(cs.uid.v);
-        if (it != bare_cache.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
+        if (it != bare_cache.end() && it->second->layout == cs.codes_key() && it->second->nd == dict_size(cs) &&
             it->second->type == (int)t.columns[col].type)
           hit = it->second;
       }
@@ -33753,7 +34112,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
         ekey = std::to_string(cs.uid.v) + "|" + k;
         std::lock_guard<aios::hal::Mutex> lk(expr_mu);
         auto it = expr_cache.find(ekey);
-        if (it != expr_cache.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
+        if (it != expr_cache.end() && it->second->layout == cs.codes_key() && it->second->nd == dict_size(cs) &&
             it->second->type == (int)t.columns[col].type && !revived(it->second->rows, it->second->dead)) {
           s.kind = Source::CodeCol;
           s.code_val = it->second->vals;
@@ -33779,7 +34138,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     if (ev.ctx.err && !ev.ctx.err->empty()) s.kind = Source::RowExpr;
     if (s.kind == Source::CodeCol && s.bare_column && !t.inferred_types) {
       auto bc = std::make_shared<BareCodes>();
-      bc->layout = cs.epoch;
+      bc->layout = cs.codes_key();
       bc->nd = dict_size(cs);
       bc->type = (int)t.columns[col].type;
       bc->vals = s.code_val;
@@ -33792,7 +34151,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     }
     if (s.kind == Source::CodeCol && !ekey.empty() && s.code_val.size() == dict_size(cs)) {
       auto ec = std::make_shared<ExprCodes>();
-      ec->layout = cs.epoch;
+      ec->layout = cs.codes_key();
       ec->nd = dict_size(cs);
       ec->type = (int)t.columns[col].type;
       ec->vals = s.code_val;
@@ -33843,11 +34202,11 @@ std::shared_ptr<DictDerived> dict_derived_for(const SqlTable& t, const Source& s
     std::lock_guard<aios::hal::Mutex> lk(dict_derived_mu);
     auto it = expr_derived.find(s.expr_key);
     const size_t valued = valued_codes(s.code_val);
-    if (it != expr_derived.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
+    if (it != expr_derived.end() && it->second->layout == cs.codes_key() && it->second->nd == dict_size(cs) &&
         it->second->type == (int)t.columns[s.col].type && it->second->valued == valued)
       return it->second;
     auto d = std::make_shared<DictDerived>();
-    d->layout = cs.epoch;
+    d->layout = cs.codes_key();
     d->nd = dict_size(cs);
     d->type = (int)t.columns[s.col].type;
     d->valued = valued;
@@ -33859,12 +34218,12 @@ std::shared_ptr<DictDerived> dict_derived_for(const SqlTable& t, const Source& s
   std::lock_guard<aios::hal::Mutex> lk(dict_derived_mu);
   auto it = dict_derived_cache.find(cs.uid.v);
   const size_t valued = valued_codes(s.code_val);
-  if (it != dict_derived_cache.end() && it->second->layout == cs.epoch && it->second->nd == dict_size(cs) &&
+  if (it != dict_derived_cache.end() && it->second->layout == cs.codes_key() && it->second->nd == dict_size(cs) &&
       it->second->type == (int)t.columns[s.col].type && it->second->nd == s.code_val.size() && it->second->valued == valued)
     return it->second;
   if (dict_size(cs) != s.code_val.size()) return nullptr;
   auto d = std::make_shared<DictDerived>();
-  d->layout = cs.epoch;
+  d->layout = cs.codes_key();
   d->nd = dict_size(cs);
   d->type = (int)t.columns[s.col].type;
   d->valued = valued;
@@ -40950,6 +41309,13 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                           !v_stmt.branches[0].having &&
                           v_stmt.branches[0].limit < 0 &&
                           !v_stmt.branches[0].sources.empty());
+        // An aggregate with no GROUP BY makes the view one row; merged, its SUM/COUNT/AVG would read the caller's rows
+        // instead (COUNT(*) FROM moving_avg_supplier counted stocktrans). A window function needs the view's whole row set.
+        if (mergeable) {
+          for (const auto& it : v_stmt.branches[0].items)
+            if (expr_has_aggregate(it.expr)) { mergeable = false; break; }
+          if (mergeable && branch_has_window(v_stmt.branches[0])) mergeable = false;
+        }
 
         // The view's own ORDER BY stands when the query reads the view alone and orders nothing itself (MariaDB keeps it).
         if (mergeable && branch.order_by.empty() && branch.sources.size() == 1 && !v_stmt.branches[0].order_by.empty() && branch.limit < 0 && !branch.distinct && branch.group_by.empty())
@@ -52837,6 +53203,33 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   if (!t) return make_error("table not found: " + name);
   if (sql_table_in_use_by_trigger(t))
     return make_error("Can't update table '" + t->name + "' in stored function/trigger because it is already used by statement which invoked this stored function/trigger");
+  // DELETE FROM t MATCHING (v1, v2, ...), (...): one row for each tuple, the row whose every column (in the
+  // table's order) is that tuple's value - as `=` compares, a NULL matching a NULL - found in one pass from the
+  // first row. What the mirror applies a keyless table's deletes with (each row named by its whole binlog image):
+  // a DELETE per row scanned the table and rewrote every column, for each row.
+  std::vector<std::vector<std::string>> matching;
+  const bool by_matching = p.take_word("MATCHING");
+  if (by_matching) {
+    do {
+      if (!p.take_punct("(")) return make_error("MATCHING wants (value, ...) for each row");
+      std::vector<std::string> vals;
+      do {
+        bool neg = p.take_punct("-");
+        const Token& tk = p.peek();
+        if (tk.kind == Tok::Str || tk.kind == Tok::Num) vals.push_back((neg ? "-" : "") + p.next().text);
+        else if (!neg && p.take_word("NULL")) vals.push_back(sql_null());
+        else return make_error("MATCHING takes literal values only");
+      } while (p.take_punct(","));
+      if (!p.take_punct(")")) return make_error("expected ) in MATCHING");
+      if (vals.size() != t->columns.size())
+        return make_error("MATCHING: a row has " + std::to_string(vals.size()) + " value(s), " + t->name + " has " +
+                          std::to_string(t->columns.size()) + " column(s)");
+      t->normalize_row(vals);
+      matching.push_back(std::move(vals));
+    } while (p.take_punct(","));
+    if (!p.at_end()) return make_error("unexpected trailing input near '" + p.peek().text + "'");
+  }
+
   // (What a delete here can make stale is this table's indices and cached
   // results - handled after the erase. It used to drop every table's indices
   // and every view up front: a price post, a delete and an insert per item,
@@ -52844,16 +53237,16 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   // every line, ~8 lines a second.)
 
   ExprPtr where;
-  if (p.take_word("WHERE")) {
+  if (!by_matching && p.take_word("WHERE")) {
     where = p.parse_expr();
     if (p.failed()) return make_error(p.error());
   }
   std::vector<OrderKey> order_by;
-  if (p.is_word("ORDER")) {
+  if (!by_matching && p.is_word("ORDER")) {
     if (!p.parse_order_by(&order_by)) return make_error(p.error());
   }
   long long limit = -1;
-  if (p.take_word("LIMIT")) {
+  if (!by_matching && p.take_word("LIMIT")) {
     if (p.peek().kind != Tok::Num) return make_error("LIMIT needs a number");
     limit = std::strtoll(p.next().text.c_str(), nullptr, 10);
   }
@@ -52863,6 +53256,92 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   std::vector<QuerySource> sources{{name, t}};
   std::string err;
   std::vector<size_t> to_delete;
+  if (by_matching && !matching.empty()) {
+    // a row's key: each column as `=` sees it (text without case or trailing spaces), NULL apart from any value
+    const size_t nc = t->columns.size();
+    auto part = [&](size_t c, std::string_view v, std::string* out) {
+      if (v.size() == 1 && v[0] == '\0') { out->append("\x01N", 2); return; }   // NULL
+      out->push_back('\x02');
+      if (t->columns[c].type == SqlDataType::Text) out->append(sql_collate_key(v));
+      else out->append(v.data(), v.size());
+      out->push_back('\x00');
+    };
+    // one column is looked at first in every row: the first that is not text, its values hashed as stored
+    size_t probe = 0;
+    for (size_t c = 0; c < nc; ++c) if (t->columns[c].type != SqlDataType::Text) { probe = c; break; }
+    const bool probe_text = t->columns[probe].type == SqlDataType::Text;
+    std::unordered_map<std::string, size_t> want;
+    std::unordered_set<std::string> probe_vals;
+    for (const auto& img : matching) {
+      std::string k;
+      for (size_t c = 0; c < nc; ++c) part(c, img[c], &k);
+      want[k]++;
+      std::string pv;
+      part(probe, img[probe], &pv);
+      probe_vals.insert(std::move(pv));
+    }
+    size_t left = matching.size();
+    std::string pv, k;
+    const size_t rc = t->row_count();
+    // The rows whose probe column holds one of the images' values, found by the selection a SELECT uses (zone
+    // maps, typed compares, indexes): only those are checked. The walk from the first row stopped once every image
+    // was found, so an image the table does not hold walked all of it, the probe column made text row by row - a
+    // mirror missing a purged audit log's oldest rows read 30M rows per 20,000 deleted (about 50 KB of binlog a
+    // second). An image with NULL there, or a table the selection does not take, is walked as before.
+    std::vector<size_t> cand;
+    bool by_cand = false;
+    {
+      bool null_probe = false;
+      std::set<std::string> vals;
+      for (const auto& img : matching) {
+        if (sql_is_null(img[probe])) { null_probe = true; break; }
+        vals.insert(img[probe]);
+      }
+      if (!null_probe && !vals.empty()) {
+        std::string w = "`";
+        for (char ch : t->columns[probe].name) { if (ch == '`') w += "``"; else w += ch; }
+        w += "` IN (";
+        bool first = true;
+        for (const auto& v : vals) {
+          w += first ? "'" : ", '";
+          first = false;
+          for (char ch : v) { if (ch == '\'') w += "''"; else if (ch == '\\') w += "\\\\"; else w += ch; }
+          w += "'";
+        }
+        w += ")";
+        std::vector<Token> wt;
+        std::string te;
+        if (tokenize_sql(w, &wt, &te, false)) {
+          SqlParser wp(wt);
+          wp.set_source(&w);
+          ExprPtr in_expr = wp.parse_expr();
+          std::string ce;
+          if (in_expr && !wp.failed() && wp.at_end() && dml_matching_rows(this, *t, name, in_expr.get(), -1, &cand, &ce) && ce.empty()) {
+            by_cand = true;
+            std::sort(cand.begin(), cand.end());
+          } else {
+            cand.clear();
+          }
+        }
+      }
+    }
+    auto take = [&](size_t ri) {
+      pv.clear();
+      const std::string_view v = t->cell_view(ri, probe);
+      if (probe_text || (v.size() == 1 && v[0] == '\0')) part(probe, v, &pv);
+      else { pv.push_back('\x02'); pv.append(v.data(), v.size()); pv.push_back('\x00'); }
+      if (!probe_vals.count(pv)) return;
+      k.clear();
+      for (size_t c = 0; c < nc; ++c) part(c, t->cell_view(ri, c), &k);
+      auto w = want.find(k);
+      if (w == want.end() || w->second == 0) return;
+      w->second--;
+      left--;
+      to_delete.push_back(ri);
+    };
+    if (by_cand) { for (size_t ri : cand) { if (left == 0) break; if (ri < rc) take(ri); } }
+    else for (size_t ri = 0; ri < rc && left > 0; ++ri) take(ri);
+  }
   // The whole key given and the row map complete: the key path below, one
   // probe, ahead of the vectorized selection (as execute_update does).
   bool key_first = false;
@@ -52883,7 +53362,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
       }
     }
   }
-  const bool dml_found = key_first ? false : dml_matching_rows(this, *t, name, where.get(), order_by.empty() ? limit : -1, &to_delete, &err);
+  const bool dml_found = (key_first || by_matching) ? by_matching : dml_matching_rows(this, *t, name, where.get(), order_by.empty() ? limit : -1, &to_delete, &err);
   if (!err.empty()) return make_error(err);
   // DELETE ... WHERE <the whole primary key> = ...: the row through the key
   // index, not a scan evaluating the predicate on every row.
@@ -53247,6 +53726,10 @@ constexpr uint32_t kRulesTrailerMagic = 0x41515255;       // "AQRU": generated c
 constexpr uint32_t kAutoIncTrailerMagic = 0x41514149;     // "AQAI": the AUTO_INCREMENT counter
 constexpr uint32_t kCommentTrailerMagic = 0x4151434d;     // "AQCM": table/column/index comments, index prefix lengths and types
 constexpr uint32_t kTextCodecTrailerMagic = 0x41515443;   // "AQTC": the TEXT_CODEC table option
+// "AQTS", the image's last bytes: where each column starts (and the last ends), then the column count and this. A
+// reader that knows it decodes a big table's columns at once, one per core; one that does not reads past it as a
+// trailer it does not know. audittrail (31M rows, three columns) was a 2.2 s start on one core.
+constexpr uint32_t kColumnSpansFooterMagic = 0x41515453;
 // After the manifest's entries: where each entry's file validly ends (u64
 // each, in entry order). A file is its packed image and then the parts
 // appended to it; a part past this length is one a checkpoint wrote but
@@ -53261,6 +53744,13 @@ constexpr uint32_t kManifestLengthsMagic = 0x41514d4c;    // "AQML"
 // takes (ColumnStore::push_back), so the columns come back encoded as they
 // would be after those inserts.
 constexpr uint32_t kPartMagic = 0x41514150;               // "AQAP"
+// A part of a table's writes in their order (snapshot_tables_v4, SqlTable::ChangeJournal): rows erased, cells
+// set, rows appended - the same header as kPartMagic (from and to the row counts before and after), its payload
+// a list of ops: u8 'E', u64 n, n x u64 rows (ascending, numbered as they were) | u8 'S', u64 row, u32 col,
+// str value | u8 'A', u64 n, n * ncols x str cells, row-major. The loader replays them in order. A loader from
+// before these parts stops at the first one and does not load the table's writes after it: turn them off
+// (AIOS_STORE_NO_OPS_PARTS=1) and let a checkpoint write the tables whole before going back to such a binary.
+constexpr uint32_t kOpsPartMagic = 0x4151504f;            // "AQPO"
 constexpr size_t kPartHeader = 4 + 8 + 8 + 8 + 4 + 8 + 8;
 // Parts are appended while they stay a small share of the table; past this
 // the next checkpoint writes the table whole again (the parts fold in).
@@ -53361,12 +53851,19 @@ bool get_dict(Reader& r, DictArena& v, bool aqt4) {
     n = r.u64();
   }
   if (!r.ok() || n > r.remaining()) return false;
-  v.reserve(v.coded_count() + (size_t)n, 0);
-  for (uint64_t i = 0; i < n && r.ok(); ++i) {
-    ByteSpan b = r.bytes();
-    if (!r.ok()) return false;
-    v.push_back(std::string_view(reinterpret_cast<const char*>(b.data()), b.size()));
+  // The plain entries' bytes counted first (each is a length and its bytes), so the arena is sized once: grown
+  // entry by entry it was copied over and over - 0.8 s of a 3.9M-entry dictionary's load.
+  size_t total = 0, run = 0;
+  {
+    Reader peek(r.rest());
+    for (uint64_t i = 0; i < n && peek.ok(); ++i) total += peek.bytes().size();
+    if (!peek.ok() || total > UINT32_MAX) return false;
+    run = peek.position();
   }
+  const ByteSpan stored = r.raw(run);
+  if (!r.ok()) return false;
+  v.reserve(v.coded_count() + (size_t)n, total);
+  v.push_back_stored(stored.data(), n, total);
   v.shrink_to_fit();
   return r.ok();
 }
@@ -53710,14 +54207,15 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     auto prev = saved_tables_.find(kv.first);
     bool dense = false;
     if (prev != saved_tables_.end() && prev->second.seq == state.seq && prev->second.rows == state.rows &&
-        prev->second.shape == state.shape && kernel_.host().exists(dir + "/" + prev->second.file)) {
+        prev->second.shape == state.shape && kernel_.host().exists(dir + "/" + prev->second.file) &&
+        !(prev->second.op_parts && !ops_parts_enabled())) {   // parts of writes, with them turned off: written whole
       // Unchanged. Written in the fast form while it was changing; once it
       // has been still for a while, once more deflated, a few tables a
       // checkpoint. Deflating every checkpoint of the tables being written
       // was 38% of the server's CPU under sysbench write_only, on the cores
       // the statements needed.
       const uint64_t still = prev->second.still_ns ? prev->second.still_ns : now_ns;
-      if (prev->second.dense || now_ns - still < cold_ns || dense_budget == 0) {
+      if (prev->second.dense || now_ns - still < cold_ns || dense_budget == 0 || exit_flush_) {
         entries.emplace_back(kv.first, prev->second.file);
         saved_now[kv.first] = prev->second;
         if (!prev->second.still_ns) saved_now[kv.first].still_ns = now_ns;
@@ -53728,6 +54226,78 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       dense_budget -= std::min(dense_budget, std::max<size_t>(prev->second.bytes, 1));
     }
     state.layout = t.layout_seq;
+    // Rows erased or cells set since the file was written, every one of them in the table's journal: the writes go
+    // to the file as a part, in their order, instead of the table whole. A 30M-row audit log with a few thousand
+    // rows deleted was copied whole under the lock at every checkpoint (1.5 s of every read waiting, and the copy
+    // tripled the process's memory). The same bounds as appended rows; past them it is written whole again.
+    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
+        prev->second.seq != state.seq && prev->second.shape == state.shape && prev->second.file_bytes > 0 &&
+        prev->second.parts < kPartMaxCount) {
+      std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+      const SqlTable::ChangeJournal& j = t.journal;
+      const size_t ncols = t.col_data.size();
+      bool usable = j.on && !j.broken && j.start_seq == prev->second.seq && j.last_seq == t.mutation_seq && !j.ops.empty() && ncols > 0;
+      bool writes = false;   // erased rows or set cells: appends alone take the append path below
+      size_t rows = prev->second.rows, appended = 0;
+      for (const auto& op : j.ops) {
+        if (!usable) break;
+        if (op.kind == 'E') {
+          writes = true;
+          size_t gone = 0;
+          for (uint64_t r : op.rows) if (r < rows) ++gone;
+          rows -= gone;
+        } else if (op.kind == 'S') {
+          writes = true;
+          if (op.row >= rows || op.col >= ncols) usable = false;
+        } else if (op.kind == 'A') {
+          if (op.cells.size() % ncols) { usable = false; break; }
+          rows += op.cells.size() / ncols;
+          appended += op.cells.size() / ncols;
+        } else {
+          usable = false;
+        }
+      }
+      const size_t bound = std::max(kPartMaxRowsFloor, prev->second.base_rows / 4);
+      usable = usable && writes && rows == state.rows && prev->second.part_rows + appended <= bound &&
+               prev->second.op_cells + j.cells <= bound;
+      if (usable) {
+        auto st = kernel_.host().stat(dir + "/" + prev->second.file);
+        if (st.ok() && (uint64_t)st->size == prev->second.file_bytes) {
+          CheckpointImage::TableImage ti;
+          ti.key = kv.first;
+          ti.file = prev->second.file;
+          ti.dense = prev->second.dense;
+          ti.ops = true;
+          ti.rows_from = prev->second.rows;
+          ti.rows_to = state.rows;
+          ti.ncols = ncols;
+          Writer w;
+          for (const auto& op : j.ops) {
+            w.u8(op.kind);
+            if (op.kind == 'E') { w.u64(op.rows.size()); for (uint64_t r : op.rows) w.u64(r); }
+            else if (op.kind == 'S') { w.u64(op.row); w.u32(op.col); w.str(op.val); }
+            else { w.u64(op.cells.size() / ncols); for (const auto& c : op.cells) w.str(c); }
+          }
+          ti.ops_plain = w.take();
+          img.bytes += ti.ops_plain.size();
+          state.file = prev->second.file;
+          state.dense = prev->second.dense;
+          state.bytes = prev->second.bytes;
+          state.base_rows = prev->second.base_rows;
+          state.part_rows = prev->second.part_rows + appended;
+          state.parts = prev->second.parts + 1;
+          state.op_parts = prev->second.op_parts + 1;
+          state.op_cells = prev->second.op_cells + j.cells;
+          state.file_bytes = prev->second.file_bytes;   // write_checkpoint adds the part's bytes
+          static const bool store_trace_o = std::getenv("AIOS_STORE_TRACE") != nullptr;
+          if (store_trace_o) fprintf(stderr, "[store] %s: %zu write(s) (%zu row(s) erased or cell(s) set, %zu appended) added to %s as part %u\n", t.name.c_str(), j.ops.size(), j.cells, appended, ti.file.c_str(), state.parts);
+          img.tables.push_back(std::move(ti));
+          entries.emplace_back(kv.first, state.file);
+          saved_now[kv.first] = state;
+          continue;
+        }
+      }
+    }
     // Only appended since the file was written (its layout stands, no row
     // it holds changed, rows only grew, same shape): the new rows go to the
     // file as a part. An append-only table (an audit log) was re-encoded and
@@ -53737,8 +54307,19 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     // already stored changes, the table is written whole and the parts fold
     // in. A file whose size is not what the last manifest recorded (a part
     // a crash left unnamed) is written whole too, never appended behind.
-    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && prev->second.layout == t.layout_seq &&
+    // The layout also moves when an append or maintenance re-encodes a column (a dictionary grown past its code
+    // width): the rows stored keep their values, and the journal says so when it recorded nothing but appends since
+    // the file. An audit log taking a new value in a few appended rows was written whole for it (320 MB).
+    auto only_appended = [&] {
+      std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+      const SqlTable::ChangeJournal& j = t.journal;
+      if (!j.on || j.broken || j.start_seq != prev->second.seq || j.last_seq != t.mutation_seq || j.ops.empty()) return false;
+      for (const auto& op : j.ops) if (op.kind != 'A') return false;
+      return true;
+    };
+    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
         prev->second.seq != state.seq && state.rows > prev->second.rows && prev->second.shape == state.shape &&
+        (prev->second.layout == t.layout_seq || only_appended()) &&
         prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount &&
         prev->second.part_rows + (state.rows - prev->second.rows) <= std::max(kPartMaxRowsFloor, prev->second.base_rows / 4)) {
       auto st = kernel_.host().stat(dir + "/" + prev->second.file);
@@ -53761,6 +54342,8 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
         state.base_rows = prev->second.base_rows;
         state.part_rows = prev->second.part_rows + (ti.rows_to - ti.rows_from);
         state.parts = prev->second.parts + 1;
+        state.op_parts = prev->second.op_parts;
+        state.op_cells = prev->second.op_cells;
         state.file_bytes = prev->second.file_bytes;   // write_checkpoint adds the part's bytes
         static const bool store_trace_p = std::getenv("AIOS_STORE_TRACE") != nullptr;
         if (store_trace_p) fprintf(stderr, "[store] %s: %zu row(s) appended to %s as part %u (%zu of %zu rows in parts)\n", t.name.c_str(), ti.rows_to - ti.rows_from, ti.file.c_str(), state.parts, state.part_rows, state.rows);
@@ -53858,6 +54441,8 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.file = file;
     saved_now[kv.first] = state;
   }
+  // Every table as this snapshot holds it is what the next one starts from: its journal records from here.
+  for (auto& kv : tables_) kv.second.journal_begin();
   // The manifest is finished by write_checkpoint (manifest_bytes), once every
   // file's valid length is known; the databases it names are taken here, under the lock.
   img.databases.assign(databases_.begin(), databases_.end());
@@ -53902,44 +54487,195 @@ static std::vector<uint8_t> store_part_bytes(uint64_t gen, size_t from, size_t t
   return out;
 }
 
+static std::vector<uint8_t> store_ops_part_bytes(uint64_t gen, size_t from, size_t to, size_t ncols, const std::vector<uint8_t>& plain, bool dense) {
+  ByteBuffer packed;
+  store_pack(plain.data(), plain.size(), packed, dense);
+  std::vector<uint8_t> out(kPartHeader + packed.size());
+  uint8_t* p = out.data();
+  store_put(p, kOpsPartMagic, 4); p += 4;
+  store_put(p, gen, 8); p += 8;
+  store_put(p, from, 8); p += 8;
+  store_put(p, to, 8); p += 8;
+  store_put(p, ncols, 4); p += 4;
+  store_put(p, packed.size(), 8); p += 8;
+  store_put(p, store_hash64(packed.data(), packed.size()), 8); p += 8;
+  std::memcpy(p, packed.data(), packed.size());
+  return out;
+}
+
 // The parts of a table file after its packed image, within [at, limit): each
 // one checked (header, hash, generation at most `gen`, rows following on)
 // and its rows appended to `t` the way an INSERT appends them. Stops at the
 // first part that does not check out: what follows is not guessed at. False,
 // with why, when a part that checks out cannot be applied (rows not following
 // on, the wrong column count): the table is not loaded half.
-static bool store_parts(ByteSpan file, size_t at, size_t limit, uint64_t gen, SqlTable& t, size_t* parts, size_t* part_rows, bool* recoded, std::string* why) {
+// A kOpsPartMagic part's writes, replayed on `t` in their order. The rows parts before it appended are still in
+// the delta buffer, after the columns' rows: a row past the columns is one of those, numbered on from them, as
+// the running table numbered them - so they are erased or set there, without folding them into the columns.
+static bool store_apply_ops(SqlTable& t, ByteSpan plain, uint32_t ncols, size_t* cells, size_t* appended, std::string* why) {
+  // Through the table's own writes, as the statements that made them went (erase_rows, set_cell, append_row): what
+  // they keep in step with the rows - the column indexes, the per-code verdicts, the zone maps - stays in step.
+  Reader r(plain);
+  while (r.remaining() > 0) {
+    const uint8_t kind = r.u8();
+    if (kind == 'E') {
+      const uint64_t n = r.u64();
+      if (!r.ok() || n > r.remaining() / 8) { if (why) *why = "an erase shorter than its rows"; return false; }
+      const size_t total = t.row_count();
+      std::vector<size_t> rows;
+      rows.reserve((size_t)n);
+      for (uint64_t i = 0; i < n; ++i) {
+        const uint64_t row = r.u64();
+        if (row < total) rows.push_back((size_t)row);   // as the running table's erase_rows: a row past the end is none
+      }
+      t.erase_rows(rows);
+      *cells += rows.size();
+    } else if (kind == 'S') {
+      const uint64_t row = r.u64();
+      const uint32_t col = r.u32();
+      std::string val = r.str();
+      if (!r.ok() || col >= ncols || row >= t.row_count()) { if (why) *why = "a set cell that does not read"; return false; }
+      t.set_cell((size_t)row, col, val);
+      *cells += 1;
+    } else if (kind == 'A') {
+      const uint64_t n = r.u64();
+      if (!r.ok()) { if (why) *why = "an append that does not read"; return false; }
+      std::vector<std::string> vals(ncols);
+      for (uint64_t i = 0; i < n; ++i) {
+        for (uint32_t c = 0; c < ncols; ++c) vals[c] = r.str();
+        if (!r.ok()) { if (why) *why = "an append shorter than its rows"; return false; }
+        t.append_row_canonical(vals);   // as stored: not normalised again
+      }
+      *appended += (size_t)n;
+    } else {
+      if (why) *why = "a write of an unknown kind";
+      return false;
+    }
+    if (!r.ok()) { if (why) *why = "a part shorter than its writes"; return false; }
+  }
+  return true;
+}
+
+// A part that checks out (header, hash, generation at most `gen`): its length with the header, or 0.
+static size_t store_part_checks(ByteSpan file, size_t at, size_t limit, uint64_t gen) {
+  if (at + kPartHeader > limit) return 0;
+  const uint8_t* p = file.data() + at;
+  const uint32_t magic = (uint32_t)store_get(p, 4);
+  if (magic != kPartMagic && magic != kOpsPartMagic) return 0;
+  const uint64_t pgen = store_get(p + 4, 8), len = store_get(p + 32, 8), hash = store_get(p + 40, 8);
+  if (pgen > gen || len > limit - at - kPartHeader) return 0;
+  if (store_hash64(p + kPartHeader, (size_t)len) != hash) return 0;
+  return kPartHeader + (size_t)len;
+}
+
+// `later`: from the first part of writes on, the parts are not applied but kept, and replayed once every table is
+// loaded (store_replay_later), through the table's own writes.
+static bool store_parts(ByteSpan file, size_t at, size_t limit, uint64_t gen, SqlTable& t, size_t* parts, size_t* part_rows, bool* recoded, std::string* why,
+                        size_t* op_parts = nullptr, size_t* op_cells = nullptr, std::vector<std::vector<uint8_t>>* later = nullptr) {
   *parts = 0; *part_rows = 0; *recoded = false;
+  if (op_parts) *op_parts = 0;
+  if (op_cells) *op_cells = 0;
   t.ensure_columns();
+  bool keeping = false;
   while (at + kPartHeader <= limit) {
     const uint8_t* p = file.data() + at;
-    if ((uint32_t)store_get(p, 4) != kPartMagic) break;
+    const uint32_t magic = (uint32_t)store_get(p, 4);
+    if (later && (keeping || magic == kOpsPartMagic)) {
+      const size_t n = store_part_checks(file, at, limit, gen);
+      if (!n) { if (why) *why = "a part of writes that fails validation"; return false; }
+      later->emplace_back(p, p + n);
+      keeping = true;
+      at += n;
+      continue;
+    }
+    if (magic == kOpsPartMagic) {
+      const uint64_t pgen = store_get(p + 4, 8), from = store_get(p + 12, 8), to = store_get(p + 20, 8);
+      const uint32_t ncols = (uint32_t)store_get(p + 28, 4);
+      const uint64_t len = store_get(p + 32, 8), hash = store_get(p + 40, 8);
+      if (pgen > gen) { if (why) *why = "a part of writes whose manifest never landed"; return false; }
+      if (len > limit - at - kPartHeader) { if (why) *why = "a part of writes truncated"; return false; }
+      const uint8_t* payload = p + kPartHeader;
+      if (store_hash64(payload, (size_t)len) != hash) { if (why) *why = "a part of writes with hash mismatch"; return false; }
+      if (from != t.row_count()) { if (why) *why = "a part of writes for another row count"; return false; }
+      if (ncols != t.col_data.size()) { if (why) *why = "a part of writes with the wrong column count"; return false; }
+      ByteBuffer plain;
+      std::string uw;
+      if (!store_unpack(ByteSpan(payload, (size_t)len), plain, &uw)) { if (why) *why = "a part of writes that does not unpack: " + uw; return false; }
+      size_t cells = 0, appended = 0;
+      if (!store_apply_ops(t, ByteSpan(plain.data(), plain.size()), ncols, &cells, &appended, why)) return false;
+      *part_rows += appended;
+      if (t.row_count() != to) { if (why) *why = "a part of writes that leaves another row count"; return false; }
+      ++*parts;
+      if (op_parts) ++*op_parts;
+      if (op_cells) *op_cells += cells;
+      *recoded = true;   // rows moved or changed: what is keyed on the layout starts again
+      at += kPartHeader + (size_t)len;
+      continue;
+    }
+    if (magic != kPartMagic) {
+      if (why) *why = "unrecognised part magic";
+      return false;
+    }
     const uint64_t pgen = store_get(p + 4, 8), from = store_get(p + 12, 8), to = store_get(p + 20, 8);
     const uint32_t ncols = (uint32_t)store_get(p + 28, 4);
     const uint64_t len = store_get(p + 32, 8), hash = store_get(p + 40, 8);
-    if (pgen > gen) break;   // written by a checkpoint whose manifest never landed: its rows are in the redo log
-    if (len > limit - at - kPartHeader) break;   // truncated
+    if (pgen > gen) { if (why) *why = "a part whose manifest never landed"; return false; }
+    if (len > limit - at - kPartHeader) { if (why) *why = "a part truncated"; return false; }
     const uint8_t* payload = p + kPartHeader;
-    if (store_hash64(payload, (size_t)len) != hash) break;
+    if (store_hash64(payload, (size_t)len) != hash) { if (why) *why = "a part with hash mismatch"; return false; }
     if (from != t.row_count() || to < from) { if (why) *why = "a part's rows do not follow the table's"; return false; }
     if (ncols != t.col_data.size()) { if (why) *why = "a part with the wrong column count"; return false; }
     ByteBuffer plain;
     std::string uw;
     if (!store_unpack(ByteSpan(payload, (size_t)len), plain, &uw)) { if (why) *why = "a part that does not unpack: " + uw; return false; }
+    // The part's rows go to the table's delta buffer, as they are stored (a cell per column, row after row): the
+    // columns take them when the table is next written or scanned (compact_delta_buffer). Appended to the columns
+    // here, the first part made a text column build its value -> code index over its whole dictionary - 17M
+    // entries for audittrail on chi, most of a 20 s restart - which the first replicated insert after a start
+    // builds anyway, on its own thread, while the rest of the database answers.
     Reader r(ByteSpan(plain.data(), plain.size()));
-    for (uint64_t row = from; row < to; ++row) {
+    std::vector<SqlRow> rows((size_t)(to - from));
+    for (auto& row : rows) {
+      row.values.reserve(ncols);
       for (uint32_t c = 0; c < ncols; ++c) {
-        std::string cell = r.str();
+        row.values.push_back(r.str());
         if (!r.ok()) { if (why) *why = "a part shorter than its rows"; return false; }
-        const uint32_t before = t.col_data[c].recodes;
-        t.col_data[c].push_back(cell);
-        if (t.col_data[c].recodes != before) *recoded = true;
       }
+    }
+    {
+      std::lock_guard<aios::hal::Mutex> lk(*t.delta_buffer.mu);
+      auto& d = t.delta_buffer.rows;
+      if (d.empty()) d = std::move(rows);
+      else d.insert(d.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
+      t.delta_buffer.count.store(d.size(), std::memory_order_relaxed);
     }
     ++*parts;
     *part_rows += (size_t)(to - from);
     at += kPartHeader + (size_t)len;
   }
+  if (at != limit) {
+    if (why) *why = "parts incomplete or damaged before valid length";
+    return false;
+  }
+  return true;
+}
+
+// The parts store_parts kept for later, applied in their order, once the store is loaded (see store_parts).
+static bool store_replay_later(SqlTable& t, const std::vector<std::vector<uint8_t>>& later, size_t* op_parts, size_t* op_cells, size_t* part_rows, std::string* why) {
+  for (const auto& part : later) {
+    size_t parts = 0, rows = 0, ops = 0, cells = 0;
+    bool recoded = false;
+    if (!store_parts(ByteSpan(part.data(), part.size()), 0, part.size(), ~0ull, t, &parts, &rows, &recoded, why, &ops, &cells, nullptr)) return false;
+    if (parts != 1) { if (why) *why = "a kept part that no longer reads"; return false; }
+    *op_parts += ops;
+    *op_cells += cells;
+    *part_rows += rows;
+  }
+  // The rows erased and set leave segments without stats (has_stats false, empty bounds) until maintenance refreshes
+  // them; read straight after a start, `doc = 'x'` skipped such a segment by its empty bounds. Built again here,
+  // as a whole file's are when it is loaded.
+  t.compact_delta_buffer();
+  for (auto& cd : t.col_data) cd.build_zone_maps();
   return true;
 }
 
@@ -53962,6 +54698,15 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   } shed_wbuf{checkpoint_wbuf_};
   for (auto& ti : img.tables) {
     auto sv = img.saved.find(ti.key);
+    if (ti.ops) {
+      // The writes since the file was written, as one part on its end.
+      const std::vector<uint8_t> part = store_ops_part_bytes(img.gen, ti.rows_from, ti.rows_to, ti.ncols, ti.ops_plain, ti.dense);
+      auto ar = h.append_file(dir + "/" + ti.file, ByteSpan(part.data(), part.size()));
+      if (!ar.ok()) return ar;
+      if (sv != img.saved.end()) sv->second.file_bytes += part.size();
+      std::vector<uint8_t>().swap(ti.ops_plain);
+      continue;
+    }
     if (ti.append) {
       // The rows appended since the file was written, as one part on its end.
       const std::vector<uint8_t> part = store_part_bytes(img.gen, ti.rows_from, ti.rows_to, ti.ncols, ti.part_cells, ti.dense);
@@ -53975,8 +54720,14 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
     Writer w(checkpoint_wbuf_);
     if (sv != img.saved.end() && sv->second.bytes) w.buf().reserve(sv->second.bytes + sv->second.bytes / 8);
     w.raw(ByteSpan(ti.head.data(), ti.head.size()));
-    for (const auto& c : ti.cols) put_column(w, c);
+    std::vector<uint64_t> spans;
+    spans.reserve(ti.cols.size() + 1);
+    for (const auto& c : ti.cols) { spans.push_back(w.buf().size()); put_column(w, c); }
+    spans.push_back(w.buf().size());
     w.raw(ByteSpan(ti.tail.data(), ti.tail.size()));
+    for (uint64_t at : spans) w.u64(at);
+    w.u32((uint32_t)ti.cols.size());
+    w.u32(kColumnSpansFooterMagic);
     if (sv != img.saved.end()) sv->second.bytes = w.buf().size();
     // On the medium compressed (store_pack): st's 2.4 GB of table files were
     // 1.0 GB once LZ4 had been over them.
@@ -54064,6 +54815,17 @@ void SqlDatabase::save_index_list() {
       if (pi.first >= 0 && (size_t)pi.first < kv.second.columns.size() && pi.second && pi.second->rows_indexed > 0)
         plist += kv.first + "\t" + kv.second.columns[(size_t)pi.first].name + "\n";
   }
+  // And the primary-key row maps: the first keyed write to a table after a restart built its map (a scan of the
+  // table, on the writer's time - the replication applier's, or the statement's that came first).
+  std::string rlist;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+    for (const auto& kv : table_row_indices_)
+      if (kv.second && kv.second->rows_indexed > 0) rlist += kv.first + "\n";
+  }
+  if (!rlist.empty() && rlist != last_rowindex_list_ &&
+      kernel_.host().write_file(root_path_ + "/rowindexes.list", ByteSpan((const uint8_t*)rlist.data(), rlist.size())).ok())
+    last_rowindex_list_ = rlist;
   if (!plist.empty() && plist != last_probe_list_ &&
       kernel_.host().write_file(root_path_ + "/probes.list", ByteSpan((const uint8_t*)plist.data(), plist.size())).ok())
     last_probe_list_ = plist;
@@ -54095,33 +54857,60 @@ bool SqlDatabase::load_tables_v4() {
   if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
     for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
   set_startup_phase("loading tables", 0, manifest_entries.size());
-  for (size_t ei = 0; ei < manifest_entries.size(); ++ei) {
-    startup_progress(ei);
-    const std::string& key = manifest_entries[ei].first;
+  const auto load_t0 = std::chrono::steady_clock::now();
+  // The tables are independent: each is read, unpacked and decoded on whichever thread takes it, biggest first,
+  // and what each found is put together afterwards in the manifest's order. Decoding the columns was most of a
+  // start (3 s of 4.6 on chi-il-1), one table after another.
+  struct Slot {
+    std::vector<std::pair<std::string, std::string>> damaged;
+    bool has = false;
+    SqlTable t;
+    bool saved = false;
+    SavedTableFile st;
+    bool unpacked = false;
+    double read = 0, unpack = 0, decode = 0, parts = 0, total = 0;
+    std::vector<std::vector<uint8_t>> later;   // parts from the first part of writes on: replayed once all are loaded
+  };
+  std::vector<Slot> slots(manifest_entries.size());
+  std::atomic<size_t> loaded_n{0};
+  auto lap = [](std::chrono::steady_clock::time_point& at) {
+    const auto now = std::chrono::steady_clock::now();
+    const double d = std::chrono::duration<double>(now - at).count();
+    at = now;
+    return d;
+  };
+  auto load_one = [&](size_t ei) {
+    Slot& slot = slots[ei];
     const std::string& file = manifest_entries[ei].second;
+    auto lap_at = std::chrono::steady_clock::now();
+    const auto slot_t0 = lap_at;
     auto tf = kernel_.host().read_file(dir + "/" + file);
-    if (!tf.ok()) { damaged.push_back({file, "unreadable: " + tf.error().message}); continue; }
+    slot.read += lap(lap_at);
+    if (!tf.ok()) { slot.damaged.push_back({file, "unreadable: " + tf.error().message}); return; }
     ByteBuffer plain;
     ByteSpan body(tf->data(), tf->size());
     const bool packed = store_is_packed(body);
     size_t image_end = tf->size();   // where the packed image stops: parts, if any, follow
+    bool image_deflated = false;     // written in the dense form: not deflated again once it is still
     std::shared_ptr<ByteBuffer> file_bytes_kept;   // the file while its parts are read
     if (packed) {
       std::string why;
-      if (!store_unpack(body, plain, &why, &image_end)) {
-        damaged.push_back({file, why});
-        continue;
+      if (!store_unpack(body, plain, &why, &image_end, &image_deflated)) {
+        slot.damaged.push_back({file, why});
+        return;
       }
       if (image_end < tf->size()) file_bytes_kept = std::make_shared<ByteBuffer>(std::move(*tf));
       ByteBuffer().swap(*tf);
       body = ByteSpan(plain.data(), plain.size());
     }
+    slot.unpack += lap(lap_at);
+    const size_t image_plain = body.size();   // what the image holds unpacked (SavedTableFile::bytes)
     const uint64_t valid_end = valid_lengths[ei] ? std::min<uint64_t>(valid_lengths[ei], file_bytes_kept ? file_bytes_kept->size() : image_end) : (file_bytes_kept ? file_bytes_kept->size() : image_end);
     Reader r(body);
     const uint32_t magic = r.u32();
     if (magic != kColStoreMagic && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3 && magic != kColStoreMagicV2 && magic != kColStoreMagicV1) {
-      damaged.push_back({file, "not a table file this version reads"});
-      continue;
+      slot.damaged.push_back({file, "not a table file this version reads"});
+      return;
     }
     SqlTable t;
     t.name = r.str(); t.database = r.str();
@@ -54143,12 +54932,41 @@ bool SqlDatabase::load_tables_v4() {
     t.col_data.resize(ncd);
     bool good = r.ok();
     uint32_t bad_col = 0;
-    for (uint32_t c = 0; c < ncd && good; ++c) { good = get_column(r, t.col_data[c], magic); if (!good) bad_col = c; }
+    // Where each column lies, from the footer (kColumnSpansFooterMagic) if the image has one that fits it.
+    std::vector<uint64_t> spans;
+    if (good && ncd > 1 && body.size() >= 8 + 8 * ((size_t)ncd + 1)) {
+      Reader f(body.subspan(body.size() - 8));
+      const uint32_t fn = f.u32(), fm = f.u32();
+      if (fm == kColumnSpansFooterMagic && fn == ncd) {
+        Reader o(body.subspan(body.size() - 8 - 8 * ((size_t)ncd + 1)));
+        for (uint32_t c = 0; c <= ncd; ++c) spans.push_back(o.u64());
+        bool fits = spans[0] == r.position();
+        for (uint32_t c = 0; c < ncd && fits; ++c) fits = spans[c] <= spans[c + 1];
+        if (!fits || spans[ncd] > body.size() - 8 - 8 * ((size_t)ncd + 1)) spans.clear();
+      }
+    }
+    if (!spans.empty() && spans[ncd] - spans[0] >= ((size_t)32 << 20)) {
+      // a big table: its columns at once, each from its own span, each read to the end of it exactly
+      std::vector<char> col_ok(ncd, 0);
+      std::vector<std::thread> threads;
+      for (uint32_t c = 0; c < ncd; ++c)
+        threads.emplace_back([&, c] {
+          Reader cr(body.subspan(spans[c], spans[c + 1] - spans[c]));
+          col_ok[c] = get_column(cr, t.col_data[c], magic) && cr.remaining() == 0;
+        });
+      for (auto& th : threads) th.join();
+      for (uint32_t c = 0; c < ncd && good; ++c) { good = col_ok[c] != 0; if (!good) bad_col = c; }
+      static const bool spans_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+      if (spans_trace) std::fprintf(stderr, "[store] %s: %u column(s) decoded at once (%.1f MB)\n", t.name.c_str(), ncd, (spans[ncd] - spans[0]) / 1048576.0);
+      if (good) r.raw((size_t)(spans[ncd] - spans[0]));
+    } else {
+      for (uint32_t c = 0; c < ncd && good; ++c) { good = get_column(r, t.col_data[c], magic); if (!good) bad_col = c; }
+    }
     if (!good) {   // skipped, not guessed at; the column and its encoding named so the cause can be found
       const std::string cname = bad_col < t.columns.size() ? t.columns[bad_col].name : std::to_string(bad_col);
-      damaged.push_back({file, "damaged column data: " + t.database + "." + t.name + "." + cname + " encoding " +
+      slot.damaged.push_back({file, "damaged column data: " + t.database + "." + t.name + "." + cname + " encoding " +
                                    std::to_string((int)t.col_data[bad_col].encoding)});
-      continue;
+      return;
     }
     uint32_t trailer = r.remaining() >= 4 ? r.u32() : 0;
     if (trailer == kIndexTrailerMagic) {
@@ -54234,7 +55052,7 @@ bool SqlDatabase::load_tables_v4() {
     }
     for (auto& cd : t.col_data) cd.block_codec_pref = t.text_codec;
     // A TEMPORARY table of a session that ended with the process: never loaded.
-    if (hidden_table_name(t.name)) continue;
+    if (hidden_table_name(t.name)) return;
     // An older file's zone maps were keyed by an older collation (no PAD
     // SPACE, or lower-cased ASCII only): pruning on them could skip a segment
     // that matches. Rebuild them from the data; the table is rewritten at the
@@ -54246,15 +55064,16 @@ bool SqlDatabase::load_tables_v4() {
     // The parts appended since the image was written: their rows go on the
     // table as an INSERT's would. A part a crash left unnamed by any
     // manifest (past valid_end, or of a later generation) is not read.
-    size_t parts = 0, part_rows = 0;
+    slot.decode += lap(lap_at);
+    size_t parts = 0, part_rows = 0, op_parts = 0, op_cells = 0;
     bool part_recoded = false;
     if (file_bytes_kept && image_end < valid_end) {
       std::string why;
-      if (!store_parts(ByteSpan(file_bytes_kept->data(), file_bytes_kept->size()), image_end, (size_t)valid_end, gen, t, &parts, &part_rows, &part_recoded, &why)) {
-        damaged.push_back({file, "parts not loaded: " + why});
-        continue;
+      if (!store_parts(ByteSpan(file_bytes_kept->data(), file_bytes_kept->size()), image_end, (size_t)valid_end, gen, t, &parts, &part_rows, &part_recoded, &why, &op_parts, &op_cells, &slot.later)) {
+        slot.damaged.push_back({file, "parts not loaded: " + why});
+        return;
       }
-      if (parts) {
+      if (parts || !slot.later.empty()) {
         t.mutation_seq = sql_next_mutation_seq();
         if (part_recoded) t.layout_seq = t.mutation_seq;
         static const bool store_trace_l = std::getenv("AIOS_STORE_TRACE") != nullptr;
@@ -54262,6 +55081,7 @@ bool SqlDatabase::load_tables_v4() {
       }
     }
     file_bytes_kept.reset();
+    slot.parts += lap(lap_at);
     // Re-saved as-is later only if its zone maps are current and it is
     // packed (an AQT1 file, or one written before store_pack, gets rewritten
     // at the next checkpoint).
@@ -54271,13 +55091,72 @@ bool SqlDatabase::load_tables_v4() {
       st.base_rows = base_rows;
       st.part_rows = part_rows;
       st.parts = (uint32_t)parts;
+      st.op_parts = (uint32_t)op_parts;
+      st.op_cells = op_cells;
       st.file_bytes = packed ? valid_end : 0;   // the image, then the parts read: where the next part goes
-      saved_tables_[key] = st;
-      if (!packed) unpacked_tables_.insert(key);   // converted per checkpoint (maintain_storage)
+      // A start forgot that a file was already deflated, and the first checkpoint two minutes on copied every big
+      // still table whole under the lock to deflate it again (a 30M-row audit log: a 13 s stall after each restart).
+      st.dense = image_deflated;
+      st.bytes = image_plain;
+      slot.st = st;
+      slot.saved = true;
+      if (!packed) slot.unpacked = true;   // converted per checkpoint (maintain_storage)
     } else {
-      unpacked_tables_.insert(key);   // legacy format: upgrade to AQT6 and pack
+      slot.unpacked = true;   // legacy format: upgrade to AQT6 and pack
     }
-    loaded[key] = std::move(t);
+    slot.total = std::chrono::duration<double>(std::chrono::steady_clock::now() - slot_t0).count();
+    slot.t = std::move(t);
+    slot.has = true;
+  };
+  std::vector<size_t> order(manifest_entries.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return valid_lengths[a] > valid_lengths[b]; });
+  for_each_parallel(order.size(), [&](size_t i) {
+    load_one(order[i]);
+    startup_progress(loaded_n.fetch_add(1) + 1);
+  });
+  double t_read = 0, t_unpack = 0, t_decode = 0, t_parts = 0;
+  if (std::getenv("AIOS_STORE_TRACE")) {   // the tables that took longest: what a start waits for
+    std::vector<size_t> by_time(slots.size());
+    for (size_t i = 0; i < by_time.size(); ++i) by_time[i] = i;
+    std::sort(by_time.begin(), by_time.end(), [&](size_t a, size_t b) { return slots[a].total > slots[b].total; });
+    for (size_t i = 0; i < by_time.size() && i < 8; ++i) {
+      const Slot& sl = slots[by_time[i]];
+      std::fprintf(stderr, "[store] %s: %.2f s (read %.2f, unpack %.2f, decode %.2f)\n", manifest_entries[by_time[i]].first.c_str(), sl.total, sl.read, sl.unpack, sl.decode);
+    }
+  }
+  for (size_t ei = 0; ei < slots.size(); ++ei) {
+    Slot& slot = slots[ei];
+    for (auto& d : slot.damaged) damaged.push_back(std::move(d));
+    t_read += slot.read; t_unpack += slot.unpack; t_decode += slot.decode; t_parts += slot.parts;
+    if (!slot.has) continue;
+    const std::string& key = manifest_entries[ei].first;
+    if (!slot.later.empty()) {
+      // The table's parts of writes (and any after them), here on the loading thread (store_parts says why).
+      size_t op_parts = 0, op_cells = 0, rows = 0;
+      std::string why;
+      if (!store_replay_later(slot.t, slot.later, &op_parts, &op_cells, &rows, &why)) {
+        damaged.push_back({manifest_entries[ei].second, "parts of writes not loaded: " + why});
+        continue;
+      }
+      slot.t.mutation_seq = sql_next_mutation_seq();
+      slot.t.layout_seq = slot.t.mutation_seq;   // rows moved or changed
+      slot.st.seq = slot.t.mutation_seq;
+      slot.st.rows = slot.t.row_count();
+      slot.st.layout = slot.t.layout_seq;
+      slot.st.parts += (uint32_t)slot.later.size();
+      slot.st.op_parts += (uint32_t)op_parts;
+      slot.st.op_cells += op_cells;
+      slot.st.part_rows += rows;
+      static const bool store_trace_r = std::getenv("AIOS_STORE_TRACE") != nullptr;
+      if (store_trace_r) fprintf(stderr, "[store] %s: %zu part(s) replayed after the load (%zu of writes, %zu row(s) erased or cell(s) set)\n", key.c_str(), slot.later.size(), op_parts, op_cells);
+      std::vector<std::vector<uint8_t>>().swap(slot.later);
+    }
+    if (slot.saved) saved_tables_[key] = slot.st;
+    if (slot.unpacked) unpacked_tables_.insert(key);
+    // Writes from here on are what the file lacks: the first checkpoint after a start can add them as a part too.
+    if (slot.saved) slot.t.journal_begin();
+    loaded[key] = std::move(slot.t);
   }
   if (!damaged.empty()) {
     const std::string aside = root_path_ + "/tables-damaged";
@@ -54294,6 +55173,8 @@ bool SqlDatabase::load_tables_v4() {
   }
   tables_ = std::move(loaded);
   store_generation_ = gen;
+  std::fprintf(stderr, "asql: %zu table(s) loaded in %.2f s (thread time: read %.2f, unpack %.2f, decode %.2f, parts %.2f)\n", tables_.size(),
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count(), t_read, t_unpack, t_decode, t_parts);
   return true;
 }
 
@@ -54612,7 +55493,15 @@ Result<size_t> SqlDatabase::repair_schema_from_source(const std::string& host, u
     if (!ddl.ok() || !ddl->ok || ddl->rows.empty() || ddl->rows[0].size() < 2) continue;
     const std::string& text = ddl->rows[0][1].bytes;
     const std::string key = database + "." + t;
-    const std::string h = fnv(text);
+    // hashed without its AUTO_INCREMENT=<next id>, which moves with every insert: with it, every table that took
+    // a row since the last start was read again (and the store written whole after each)
+    std::string stable = text;
+    for (size_t at = stable.find(" AUTO_INCREMENT="); at != std::string::npos; at = stable.find(" AUTO_INCREMENT=", at)) {
+      size_t e = at + 16;
+      while (e < stable.size() && std::isdigit((unsigned char)stable[e])) ++e;
+      stable.erase(at, e - at);
+    }
+    const std::string h = fnv(stable);
     auto it = known.find(key);
     if (it != known.end() && it->second == h) continue;
     todo.push_back({t, text, key, h});
@@ -54632,8 +55521,9 @@ Result<size_t> SqlDatabase::repair_schema_from_source(const std::string& host, u
     // TABLE: the master's types read the way a fresh seed would read them.
     text = "CREATE TABLE " + quote_ident(probe) + " " + text.substr(open);
     execute_local_query("DROP TABLE IF EXISTS " + quote_ident(probe));
-    auto made = import_mysql_sql(text + ";");
-    bulk_load_ = false;
+    // (the statement itself, not import_mysql_sql: an import writes the whole store when it ends, and this ran
+    // once per table - minutes of disk at a start on a big store)
+    auto made = execute_query(text);
     SqlTable* ref = made.success ? resolve_table(probe, database) : nullptr;
     SqlTable* live = resolve_table(t, database);
     if (!ref || !live) { say(t + ": definition did not parse: " + (made.success ? std::string("probe missing") : made.error_message)); continue; }

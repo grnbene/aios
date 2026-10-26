@@ -1,0 +1,18 @@
+# REST API service manifest
+let app = {
+  "name": "store-api",
+  "description": "REST API service with pricing calculations and validation",
+  "main": "main.gr",
+  "kind": "web",
+  "port": 18602,
+  "settings": {
+    "TAX_RATE": "0.08"
+  },
+  "secrets": [
+    "API_KEY"
+  ],
+  "health": {
+    "path": "/health"
+  },
+  "check": "check.gr"
+}

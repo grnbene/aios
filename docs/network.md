@@ -622,6 +622,13 @@ in the nonce and AAD, and a replayed or reordered frame kills the link. **The
 token must be at least 16 characters.** `node serve` listens on **all
 interfaces**; it has no loopback option, so limit access with a firewall.
 
+**Link compression**: during the initial secure handshake (`src/node/secure.cpp`),
+nodes advertise supported transport features (`link_feature_payload()`, feature
+word containing `kFeatDeflate`). When both peers advertise compression support
+(`link_peer_deflates()`), the link frame stream is transparently compressed with
+deflate (`Link::set_compress(true)`), saving bandwidth across WAN for inter-node
+RPC, migration payloads, and relay command streams.
+
 ### Driven: two kernels, two processes
 
 Two `aios shell` processes ran on separate roots (`nA`, `nB`), driven through a

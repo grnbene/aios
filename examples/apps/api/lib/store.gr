@@ -1,0 +1,19 @@
+# Store calculations with exact fixed-point decimals
+
+fn calculate_totals(items, tax_rate_str) {
+  let subtotal = decimal("0.00")
+  for it in items {
+    let unit_price = decimal(it.price)
+    let qty = int(it.qty)
+    subtotal = subtotal + unit_price * qty
+  }
+  let tax_rate = decimal(tax_rate_str)
+  let tax = round(subtotal * tax_rate, 2)
+  let total = subtotal + tax
+  return {
+    "subtotal": format("{:.2f}", subtotal),
+    "tax": format("{:.2f}", tax),
+    "total": format("{:.2f}", total),
+    "item_count": len(items)
+  }
+}

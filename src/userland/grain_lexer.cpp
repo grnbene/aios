@@ -63,6 +63,7 @@ const char* tok_name(Tok t) {
     case Tok::Comma: return ","; case Tok::Dot: return "."; case Tok::Colon: return ":";
     case Tok::ColonColon: return "::";
     case Tok::Question: return "?";
+    case Tok::QuestionDot: return "?.";
     case Tok::Entity: return "entity"; case Tok::On: return "on";
     case Tok::Error: return "bad character";
   }
@@ -77,7 +78,10 @@ char Lexer::peek(size_t ahead) const {
 
 char Lexer::advance() {
   char c = src_[pos_++];
-  if (c == '\n') line_++;
+  if (c == '\n') {
+    line_++;
+    line_start_pos_ = pos_;
+  }
   return c;
 }
 
@@ -106,17 +110,131 @@ static int hex_digit(char c) {
 // a typo than an intent, and silently eating the backslash hides it.
 Token Lexer::string_token(bool is_fstr) {
   const int start_line = line_;
+  const int start_col = static_cast<int>(pos_ >= line_start_pos_ ? pos_ - line_start_pos_ + 1 : 1);
   const char quote = advance();
   std::string out;
+  int brace_depth = 0;
+  char inner_quote = 0;
+  bool inner_quote_escaped = false;
+  bool has_interp = is_fstr;
+
   for (;;) {
     char c = peek();
-    if (c == '\0') return Token{Tok::Error, "unterminated string", 0, 0, start_line};
-    if (c == '\n') return Token{Tok::Error, "unterminated string", 0, 0, start_line};
+    if (c == '\0' || c == '\n') return Token{Tok::Error, "unterminated string", 0, 0, start_line, start_col};
+
+    // If outside an interpolation expression, the matching quote terminates the string.
+    if (brace_depth == 0 && c == quote) {
+      advance();
+      break;
+    }
+
+    // Inside an interpolation expression (brace_depth > 0)
+    if (brace_depth > 0) {
+      if (inner_quote) {
+        if (c == '\\') {
+          advance();
+          char e = peek();
+          if (e == '\0' || e == '\n') return Token{Tok::Error, "unterminated string", 0, 0, start_line, start_col};
+          advance();
+          if (inner_quote_escaped && e == inner_quote) {
+            inner_quote = 0;
+            inner_quote_escaped = false;
+            out.push_back(e);
+          } else {
+            out.push_back('\\');
+            out.push_back(e);
+          }
+          continue;
+        }
+        advance();
+        if (!inner_quote_escaped && c == inner_quote) {
+          inner_quote = 0;
+        }
+        out.push_back(c);
+        continue;
+      }
+
+      // Not currently inside an inner string:
+      if (c == '\\') {
+        advance();
+        char e = peek();
+        if (e == '\0' || e == '\n') return Token{Tok::Error, "unterminated string", 0, 0, start_line, start_col};
+        advance();
+        if (e == '"' || e == '\'') {
+          inner_quote = e;
+          inner_quote_escaped = true;
+          out.push_back(e);
+        } else {
+          out.push_back('\\');
+          out.push_back(e);
+        }
+        continue;
+      }
+
+      if (c == '"' || c == '\'') {
+        advance();
+        inner_quote = c;
+        inner_quote_escaped = false;
+        out.push_back(c);
+        continue;
+      }
+
+      if (c == '{') {
+        advance();
+        brace_depth++;
+        out.push_back('{');
+        continue;
+      }
+
+      if (c == '}') {
+        advance();
+        brace_depth--;
+        out.push_back('}');
+        continue;
+      }
+
+      advance();
+      out.push_back(c);
+      continue;
+    }
+
+    // brace_depth == 0 (string literal text):
+    if (c == '$' && peek(1) == '{') {
+      advance(); // '$'
+      advance(); // '{'
+      out += "${";
+      brace_depth = 1;
+      has_interp = true;
+      continue;
+    }
+
+    if (is_fstr && c == '{') {
+      advance();
+      if (peek() == '{') {
+        advance();
+        out += "{{";
+      } else {
+        out.push_back('{');
+        brace_depth = 1;
+      }
+      continue;
+    }
+
+    if (is_fstr && c == '}') {
+      advance();
+      if (peek() == '}') {
+        advance();
+        out += "}}";
+      } else {
+        out.push_back('}');
+      }
+      continue;
+    }
+
     advance();
-    if (c == quote) break;
     if (c != '\\') { out.push_back(c); continue; }
     char e = peek();
-    if (e == '\0') return Token{Tok::Error, "unterminated string", 0, 0, start_line};
+    if (e == '\0') return Token{Tok::Error, "unterminated string", 0, 0, start_line, start_col};
     advance();
     switch (e) {
       case 'n': out.push_back('\n'); break;
@@ -133,7 +251,7 @@ Token Lexer::string_token(bool is_fstr) {
         int v = 0;
         for (int k = 0; k < 2; ++k) {
           const int h = hex_digit(peek());
-          if (h < 0) return Token{Tok::Error, "\\x wants two hex digits", 0, 0, start_line};
+          if (h < 0) return Token{Tok::Error, "\\x wants two hex digits", 0, 0, start_line, start_col};
           v = v * 16 + h;
           advance();
         }
@@ -141,14 +259,14 @@ Token Lexer::string_token(bool is_fstr) {
         break;
       }
       case 'u': {
-        if (peek() != '{') return Token{Tok::Error, "\\u wants a code point in braces: \\u{1F600}", 0, 0, start_line};
+        if (peek() != '{') return Token{Tok::Error, "\\u wants a code point in braces: \\u{1F600}", 0, 0, start_line, start_col};
         advance();
         uint32_t cp = 0;
         int n = 0;
         while (hex_digit(peek()) >= 0 && n < 8) { cp = cp * 16 + (uint32_t)hex_digit(peek()); advance(); ++n; }
-        if (peek() != '}' || n == 0) return Token{Tok::Error, "\\u{...} wants 1 to 6 hex digits and a closing brace", 0, 0, start_line};
+        if (peek() != '}' || n == 0) return Token{Tok::Error, "\\u{...} wants 1 to 6 hex digits and a closing brace", 0, 0, start_line, start_col};
         advance();
-        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return Token{Tok::Error, "\\u{...} is not a Unicode scalar value", 0, 0, start_line};
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return Token{Tok::Error, "\\u{...} is not a Unicode scalar value", 0, 0, start_line, start_col};
         if (cp < 0x80) out.push_back((char)cp);
         else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
         else if (cp < 0x10000) { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
@@ -158,16 +276,17 @@ Token Lexer::string_token(bool is_fstr) {
       case '\\': out.push_back('\\'); break;
       case '"': out.push_back('"'); break;
       case '\'': out.push_back('\''); break;
+      case '$': out.push_back('$'); break;
       // In an f-string \{ and \} are literal braces - kept doubled so the
       // interpolation parser can tell them from a {expression}. Elsewhere
       // they are the error any other unknown escape is.
-      case '{': if (!is_fstr) return Token{Tok::Error, "unknown escape \\{ (only f-strings have braces to escape)", 0, 0, start_line}; out += "{{"; break;
-      case '}': if (!is_fstr) return Token{Tok::Error, "unknown escape \\} (only f-strings have braces to escape)", 0, 0, start_line}; out += "}}"; break;
+      case '{': if (!is_fstr) return Token{Tok::Error, "unknown escape \\{ (only f-strings have braces to escape)", 0, 0, start_line, start_col}; out += "{{"; break;
+      case '}': if (!is_fstr) return Token{Tok::Error, "unknown escape \\} (only f-strings have braces to escape)", 0, 0, start_line, start_col}; out += "}}"; break;
       default:
-        return Token{Tok::Error, std::string("unknown escape \\") + e, 0, 0, start_line};
+        return Token{Tok::Error, std::string("unknown escape \\") + e, 0, 0, start_line, start_col};
     }
   }
-  return Token{is_fstr ? Tok::FStr : Tok::Str, out, 0, 0, start_line};
+  return Token{has_interp ? Tok::FStr : Tok::Str, out, 0, 0, start_line, start_col};
 }
 
 // Integer unless something in it forces a double: a decimal point or an
@@ -176,6 +295,7 @@ Token Lexer::string_token(bool is_fstr) {
 Token Lexer::number_token() {
   const int start_line = line_;
   const size_t start = pos_;
+  const int start_col = static_cast<int>(start >= line_start_pos_ ? start - line_start_pos_ + 1 : 1);
   // 0x.. and 0b..: at least one digit, and it has to fit in 64 bits -
   // "0x" alone used to be 0 and an overlong literal silently wrapped.
   if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' || peek(1) == 'b' || peek(1) == 'B')) {
@@ -187,14 +307,15 @@ Token Lexer::number_token() {
     while (hex ? is_hex(peek()) : (peek() == '0' || peek() == '1')) advance();
     const std::string digits = src_.substr(digits_at, pos_ - digits_at);
     const std::string text = src_.substr(start, pos_ - start);
-    if (digits.empty()) return Token{Tok::Error, text + " has no digits", 0, 0, start_line};
+    if (digits.empty()) return Token{Tok::Error, text + " has no digits", 0, 0, start_line, start_col};
     if (is_alpha(peek()) || is_digit(peek()))
-      return Token{Tok::Error, std::string("'") + peek() + "' is not a " + (hex ? "hex" : "binary") + " digit", 0, 0, start_line};
+      return Token{Tok::Error, std::string("'") + peek() + "' is not a " + (hex ? "hex" : "binary") + " digit", 0, 0, start_line, start_col};
     size_t first = digits.find_first_not_of('0');
     const size_t sig = first == std::string::npos ? 0 : digits.size() - first;
-    if (sig > (hex ? 16u : 64u)) return Token{Tok::Error, text + " does not fit in 64 bits", 0, 0, start_line};
+    if (sig > (hex ? 16u : 64u)) return Token{Tok::Error, text + " does not fit in 64 bits", 0, 0, start_line, start_col};
     Token t;
     t.line = start_line;
+    t.column = start_col;
     t.text = text;
     t.kind = Tok::Int;
     t.integer = (int64_t)std::strtoull(digits.c_str(), nullptr, hex ? 16 : 2);
@@ -220,6 +341,7 @@ Token Lexer::number_token() {
   const std::string text = src_.substr(start, pos_ - start);
   Token t;
   t.line = start_line;
+  t.column = start_col;
   t.text = text;
   if (real) {
     t.kind = Tok::Real;
@@ -237,33 +359,37 @@ Token Lexer::number_token() {
 
 Token Lexer::next() {
   skip_run();
-  if (pos_ >= src_.size()) return Token{Tok::End, "", 0, 0, line_};
+  if (pos_ >= src_.size()) {
+    int col = static_cast<int>(pos_ >= line_start_pos_ ? pos_ - line_start_pos_ + 1 : 1);
+    return Token{Tok::End, "", 0, 0, line_, col};
+  }
+
+  const size_t start_pos = pos_;
+  const int start_line = line_;
+  const int start_col = static_cast<int>(start_pos >= line_start_pos_ ? start_pos - line_start_pos_ + 1 : 1);
 
   const char c = peek();
-  if (c == '\n') { advance(); return Token{Tok::Newline, "", 0, 0, line_ - 1}; }
+  if (c == '\n') { advance(); return Token{Tok::Newline, "", 0, 0, line_ - 1, start_col}; }
   if (c == '"' || c == '\'') return string_token(false);
   if (is_digit(c)) return number_token();
 
-  if ((c == 'f' || c == 'F') && (peek(1) == '"' || peek(1) == '\'')) {
+  if ((c == 'f' || c == 'F' || c == '$') && (peek(1) == '"' || peek(1) == '\'')) {
     advance();
     return string_token(true);
   }
 
   if (is_alpha(c)) {
-    const size_t start = pos_;
-    const int start_line = line_;
     while (is_alnum(peek())) advance();
-    const std::string word = src_.substr(start, pos_ - start);
+    const std::string word = src_.substr(start_pos, pos_ - start_pos);
     for (const auto& k : KEYWORDS)
-      if (word == k.text) return Token{k.kind, word, 0, 0, start_line};
-    return Token{Tok::Ident, word, 0, 0, start_line};
+      if (word == k.text) return Token{k.kind, word, 0, 0, start_line, start_col};
+    return Token{Tok::Ident, word, 0, 0, start_line, start_col};
   }
 
-  const int start_line = line_;
   advance();
   auto two = [&](char want, Tok both, Tok single) {
-    if (peek() == want) { advance(); return Token{both, "", 0, 0, start_line}; }
-    return Token{single, "", 0, 0, start_line};
+    if (peek() == want) { advance(); return Token{both, "", 0, 0, start_line, start_col}; }
+    return Token{single, "", 0, 0, start_line, start_col};
   };
   switch (c) {
     case '+': return two('=', Tok::PlusEq, Tok::Plus);
@@ -272,49 +398,51 @@ Token Lexer::next() {
     case '/': return two('=', Tok::SlashEq, Tok::Slash);
     case '%': return two('=', Tok::PercentEq, Tok::Percent);
     case '^': return two('=', Tok::CaretEq, Tok::Caret);
-    case '~': return Token{Tok::Tilde, "", 0, 0, start_line};
+    case '~': return Token{Tok::Tilde, "", 0, 0, start_line, start_col};
     case '&':
-      if (peek() == '&') { advance(); return Token{Tok::And, "", 0, 0, start_line}; }
-      if (peek() == '=') { advance(); return Token{Tok::AmpEq, "", 0, 0, start_line}; }
-      return Token{Tok::Amp, "", 0, 0, start_line};
+      if (peek() == '&') { advance(); return Token{Tok::And, "", 0, 0, start_line, start_col}; }
+      if (peek() == '=') { advance(); return Token{Tok::AmpEq, "", 0, 0, start_line, start_col}; }
+      return Token{Tok::Amp, "", 0, 0, start_line, start_col};
     case '|':
-      if (peek() == '|') { advance(); return Token{Tok::Or, "", 0, 0, start_line}; }
-      if (peek() == '=') { advance(); return Token{Tok::PipeEq, "", 0, 0, start_line}; }
-      return Token{Tok::Pipe, "", 0, 0, start_line};
-    case '(': return Token{Tok::LParen, "", 0, 0, start_line};
-    case ')': return Token{Tok::RParen, "", 0, 0, start_line};
-    case '{': return Token{Tok::LBrace, "", 0, 0, start_line};
-    case '}': return Token{Tok::RBrace, "", 0, 0, start_line};
-    case '[': return Token{Tok::LBracket, "", 0, 0, start_line};
-    case ']': return Token{Tok::RBracket, "", 0, 0, start_line};
-    case ',': return Token{Tok::Comma, "", 0, 0, start_line};
-    case '.': return Token{Tok::Dot, "", 0, 0, start_line};
+      if (peek() == '|') { advance(); return Token{Tok::Or, "", 0, 0, start_line, start_col}; }
+      if (peek() == '=') { advance(); return Token{Tok::PipeEq, "", 0, 0, start_line, start_col}; }
+      return Token{Tok::Pipe, "", 0, 0, start_line, start_col};
+    case '(': return Token{Tok::LParen, "", 0, 0, start_line, start_col};
+    case ')': return Token{Tok::RParen, "", 0, 0, start_line, start_col};
+    case '{': return Token{Tok::LBrace, "", 0, 0, start_line, start_col};
+    case '}': return Token{Tok::RBrace, "", 0, 0, start_line, start_col};
+    case '[': return Token{Tok::LBracket, "", 0, 0, start_line, start_col};
+    case ']': return Token{Tok::RBracket, "", 0, 0, start_line, start_col};
+    case ',': return Token{Tok::Comma, "", 0, 0, start_line, start_col};
+    case '.': return Token{Tok::Dot, "", 0, 0, start_line, start_col};
     case ':':
-      if (peek() == ':') { advance(); return Token{Tok::ColonColon, "::", 0, 0, start_line}; }
-      return Token{Tok::Colon, "", 0, 0, start_line};
-    case '?': return Token{Tok::Question, "", 0, 0, start_line};
-    case ';': return Token{Tok::Newline, "", 0, 0, start_line};
+      if (peek() == ':') { advance(); return Token{Tok::ColonColon, "::", 0, 0, start_line, start_col}; }
+      return Token{Tok::Colon, "", 0, 0, start_line, start_col};
+    case '?':
+      if (peek() == '.') { advance(); return Token{Tok::QuestionDot, "?.", 0, 0, start_line, start_col}; }
+      return Token{Tok::Question, "", 0, 0, start_line, start_col};
+    case ';': return Token{Tok::Newline, "", 0, 0, start_line, start_col};
     case '=': return two('=', Tok::EqEq, Tok::Assign);
     case '<':
       if (peek() == '<') {
         advance();
-        if (peek() == '=') { advance(); return Token{Tok::LtLtEq, "", 0, 0, start_line}; }
-        return Token{Tok::LtLt, "", 0, 0, start_line};
+        if (peek() == '=') { advance(); return Token{Tok::LtLtEq, "", 0, 0, start_line, start_col}; }
+        return Token{Tok::LtLt, "", 0, 0, start_line, start_col};
       }
       return two('=', Tok::LtEq, Tok::Lt);
     case '>':
       if (peek() == '>') {
         advance();
-        if (peek() == '=') { advance(); return Token{Tok::GtGtEq, "", 0, 0, start_line}; }
-        return Token{Tok::GtGt, "", 0, 0, start_line};
+        if (peek() == '=') { advance(); return Token{Tok::GtGtEq, "", 0, 0, start_line, start_col}; }
+        return Token{Tok::GtGt, "", 0, 0, start_line, start_col};
       }
       return two('=', Tok::GtEq, Tok::Gt);
     case '!':
-      if (peek() == '=') { advance(); return Token{Tok::BangEq, "", 0, 0, start_line}; }
-      return Token{Tok::Not, "", 0, 0, start_line};
+      if (peek() == '=') { advance(); return Token{Tok::BangEq, "", 0, 0, start_line, start_col}; }
+      return Token{Tok::Not, "", 0, 0, start_line, start_col};
     default: break;
   }
-  return Token{Tok::Error, std::string("unexpected character '") + c + "'", 0, 0, start_line};
+  return Token{Tok::Error, std::string("unexpected character '") + c + "'", 0, 0, start_line, start_col};
 }
 
 std::vector<Token> lex_all(const std::string& source) {

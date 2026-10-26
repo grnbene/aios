@@ -1,0 +1,38 @@
+# Exact fixed-point decimals in Grain
+# 128-bit mantissa, up to 38 digits precision, exact half-up rounding.
+
+print("=== Grain Exact Decimals Demonstration ===")
+
+# 1. Exact arithmetic vs floating point inaccuracies
+let price = decimal("19.99")
+let shipping = decimal("4.95")
+let discount_rate = decimal("0.15")  # 15% discount
+
+let subtotal = price * 3             # exact: 59.97
+let discount = round(subtotal * discount_rate, 2)  # 59.97 * 0.15 = 8.9955 -> 9.00
+let taxable = subtotal - discount
+let tax = round(taxable * decimal("0.0825"), 2)     # 8.25% tax on 50.97 = 4.205025 -> 4.21
+let order_total = taxable + tax + shipping
+
+print("Unit Price: ", format("{:.2f}", price))
+print("Quantity:   ", 3)
+print("Subtotal:   ", format("{:.2f}", subtotal))
+print("Discount:   ", format("-{:.2f}", discount))
+print("Taxable:    ", format("{:.2f}", taxable))
+print("Tax (8.25%):", format("{:.2f}", tax))
+print("Shipping:   ", format("{:.2f}", shipping))
+print("Order Total:", format("${:.2f}", order_total))
+
+# 2. Number formatting with thousand separators
+let large_balance = decimal("123456789.45")
+print("\nFormatted balance: ", format("{:,.2f}", large_balance))
+
+# 3. Equality across trailing zeros
+let d1 = decimal("2.50")
+let d2 = decimal("2.5")
+print("decimal('2.50') == decimal('2.5'):", d1 == d2)
+
+# 4. High-precision division
+# Standard '/' keeps at least 12 decimal places; dec_div(a, b, places) chooses scale
+let unit_rate = dec_div(decimal("100.00"), 3, 6)
+print("100 / 3 at scale 6:", unit_rate)

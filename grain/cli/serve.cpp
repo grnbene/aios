@@ -88,6 +88,44 @@ bool send_all(int fd, const std::string& data) {
   return true;
 }
 
+// The reason phrase on a status line: clients mostly ignore it, but "201 Error" reads as a fault.
+const char* reason_phrase(int status) {
+  switch (status) {
+    case 100: return "Continue";
+    case 200: return "OK";
+    case 201: return "Created";
+    case 202: return "Accepted";
+    case 204: return "No Content";
+    case 206: return "Partial Content";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 304: return "Not Modified";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 413: return "Payload Too Large";
+    case 415: return "Unsupported Media Type";
+    case 418: return "I'm a teapot";
+    case 422: return "Unprocessable Entity";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    default: return status >= 500 ? "Server Error" : status >= 400 ? "Client Error" : status >= 300 ? "Redirect" : status >= 200 ? "OK" : "Informational";
+  }
+}
+
 void answer(int fd, g::WebUi& ui) {
   std::string head, body;
   bool too_big = false;
@@ -146,14 +184,35 @@ void answer(int fd, g::WebUi& ui) {
       ::close(fd);
       return;
     }
-    send_all(fd, "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  }
+  bool headers_sent = false;
+  auto on_headers = [&](int status, const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
+    if (headers_sent) return true;
+    headers_sent = true;
+    const char* reason = reason_phrase(status);
+    std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+    for (const auto& h : headers) out += h.first + ": " + h.second + "\r\n";
+    out += "Connection: close\r\n\r\n";
+    return send_all(fd, out);
+  };
+  auto on_chunk = [&](const std::string& chunk) -> bool {
+    if (!headers_sent) {
+      on_headers(200, {{"Content-Type", "text/event-stream; charset=utf-8"}, {"Cache-Control", "no-cache"}});
+    }
+    return send_all(fd, chunk);
+  };
+
+  g::WebUi::Response res;
+  if (req.path == "/favicon.ico") { res.status = 204; }
+  else res = ui.handle(req, on_headers, on_chunk);
+
+  if (headers_sent) {
+    ::shutdown(fd, SHUT_RDWR);
     ::close(fd);
     return;
   }
-  g::WebUi::Response res;
-  if (req.path == "/favicon.ico") { res.status = 204; }
-  else res = ui.handle(req);
-  const char* reason = res.status == 200 ? "OK" : res.status == 204 ? "No Content" : res.status == 400 ? "Bad Request" : res.status == 401 ? "Unauthorized" : res.status == 403 ? "Forbidden" : res.status == 404 ? "Not Found" : res.status == 405 ? "Method Not Allowed" : res.status == 429 ? "Too Many Requests" : "Error";
+
+  const char* reason = reason_phrase(res.status);
   std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason + "\r\n";
   for (const auto& h : res.headers) out += h.first + ": " + h.second + "\r\n";
   out += "Content-Length: " + std::to_string(res.body.size()) + "\r\nConnection: close\r\n\r\n";

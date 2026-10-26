@@ -77,7 +77,7 @@ class WebUi {
 
   // GET: the page (or, for a native client, the widgets as data; `?poll=N` answers 204 until something changed
   // since N). POST with X-Grain-UI: 1: an event, answered with the redrawn widgets.
-  Response handle(const Request& req);
+  Response handle(const Request& req, StreamHeaderCallback on_headers = nullptr, StreamChunkCallback on_chunk = nullptr);
 
   // For a request with `stream` set: opens the stream. `headers` go on the 200 (Content-Type: text/event-stream
   // and a Set-Cookie for a new session); `first` is the current frame. False with `error` when there is none.

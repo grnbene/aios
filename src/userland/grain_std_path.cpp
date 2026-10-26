@@ -180,6 +180,9 @@ void install_path_builtins(Vm& vm) {
   vm.define_native("basename", 1, 1, bi_basename);
   vm.define_native("dirname", 1, 1, bi_dirname);
   vm.define_native("extname", 1, 1, bi_extname);
+  vm.define_native("path_basename", 1, 1, bi_basename);
+  vm.define_native("path_dirname", 1, 1, bi_dirname);
+  vm.define_native("path_ext", 1, 1, bi_extname);
   vm.define_native("path_normalize", 1, 1, bi_path_normalize);
   vm.define_native("mkdir", 1, 2, bi_mkdir);
   vm.define_native("rmdir", 1, 1, bi_rmdir);

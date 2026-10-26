@@ -23,9 +23,14 @@ if(DEFINED COPY_FROM)
   file(MAKE_DIRECTORY ${WORKDIR})
   file(COPY ${COPY_FROM}/${script} DESTINATION ${WORKDIR})
 endif()
+set(stdin_arg "")
+if(DEFINED INPUT)   # a script of what to type, for the interactive commands
+  set(stdin_arg INPUT_FILE ${INPUT})
+endif()
 execute_process(
   COMMAND ${GRAIN} ${grain_args}
   WORKING_DIRECTORY ${WORKDIR}
+  ${stdin_arg}
   OUTPUT_VARIABLE out
   ERROR_VARIABLE err
   RESULT_VARIABLE status)

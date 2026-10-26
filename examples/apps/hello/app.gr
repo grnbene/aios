@@ -1,0 +1,12 @@
+# The manifest: what this app is and what it needs. `grain app deploy .` sends it, with everything beside it.
+let app = {
+  "name": "hello",
+  "description": "the smallest web app: a greeting, from its settings",
+  "main": "main.gr",
+  "kind": "web",
+  "port": 18601,
+  "settings": {"GREETING": "hello"},
+  "secrets": ["SIGNATURE"],
+  "health": {"path": "/"},
+  "check": "check.gr"
+}

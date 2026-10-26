@@ -1,12 +1,36 @@
-unsafe_test.gr:2: extern fn is unsafe, and this program is not allowed it
-unsafe_test.gr:3: extern fn is unsafe, and this program is not allowed it
-unsafe_test.gr:3: ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:4: extern fn is unsafe, and this program is not allowed it
-unsafe_test.gr:5: extern fn is unsafe, and this program is not allowed it
-unsafe_test.gr:8: ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:8: bytes as ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:10: ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:12: reading or writing through a ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:15: ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:16: reading or writing through a ptr is unsafe, and this program is not allowed it
-unsafe_test.gr:19: ptr is unsafe, and this program is not allowed it
+unsafe_test.gr:2:1: extern fn is unsafe, and this program is not allowed it
+extern fn labs(x: i64) -> i64
+^
+unsafe_test.gr:3:1: extern fn is unsafe, and this program is not allowed it
+extern fn strlen(s: ptr) -> i64
+^
+unsafe_test.gr:3:1: ptr is unsafe, and this program is not allowed it
+extern fn strlen(s: ptr) -> i64
+^
+unsafe_test.gr:4:1: extern fn is unsafe, and this program is not allowed it
+extern fn abs(x: i32) -> i32
+^
+unsafe_test.gr:5:1: extern fn is unsafe, and this program is not allowed it
+extern fn sqrt(x: f64) -> f64
+^
+unsafe_test.gr:8:1: ptr is unsafe, and this program is not allowed it
+native fn c_len(b: bytes) -> i64 { return strlen(b as ptr) }
+^
+unsafe_test.gr:8:1: bytes as ptr is unsafe, and this program is not allowed it
+native fn c_len(b: bytes) -> i64 { return strlen(b as ptr) }
+^
+unsafe_test.gr:10:1: ptr is unsafe, and this program is not allowed it
+native fn raw_sum(p: ptr, n: i64) -> i64 {
+^
+unsafe_test.gr:12:1: reading or writing through a ptr is unsafe, and this program is not allowed it
+  for i in 0..n { t += rd8(p, i) }
+^
+unsafe_test.gr:15:1: ptr is unsafe, and this program is not allowed it
+native fn raw_fill(p: ptr, n: i64) -> i64 {
+^
+unsafe_test.gr:16:1: reading or writing through a ptr is unsafe, and this program is not allowed it
+  for i in 0..n { wr8(p, i, i * 3) }
+^
+unsafe_test.gr:19:1: ptr is unsafe, and this program is not allowed it
+native fn ptr_math(p: ptr) -> i64 { return ((p as i64) + 8) as i64 - (p as i64) }
+^

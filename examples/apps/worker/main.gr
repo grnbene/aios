@@ -1,0 +1,35 @@
+import "lib/queue.gr" as queue
+
+let interval_ms = int(getenv("INTERVAL_MS", "1000"))
+let batch_size = int(getenv("BATCH_SIZE", "5"))
+let token = getenv("WORKER_TOKEN", "(no token)")
+
+print($"Worker starting; interval={interval_ms}ms, batch_size={batch_size}, token {token == '(no token)' ? 'not set' : 'set'}")
+
+let step = 0
+let state_file = "worker_state.json"
+
+while not is_stopping() {
+  step = step + 1
+  let jobs = []
+  for i in 1..(batch_size + 1) {
+    push(jobs, queue.make_job($"step-{step}-item-{i}", "metric_sync"))
+  }
+
+  let completed = []
+  for j in jobs {
+    push(completed, queue.process_job(j))
+  }
+
+  let state = {
+    "last_run": iso8601(),
+    "step": step,
+    "processed": len(completed)
+  }
+  write_file(state_file, json_stringify(state))
+  print($"Step {step}: processed {len(completed)} jobs at {iso8601()}")
+
+  sleep(interval_ms)
+}
+
+print("Worker received stop signal, shutting down gracefully.")

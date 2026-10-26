@@ -1,0 +1,7 @@
+fn calc(x) {
+  return x + 999
+}
+
+fn message() {
+  return "from mod_b"
+}

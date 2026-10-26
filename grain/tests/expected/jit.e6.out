@@ -1,3 +1,5 @@
-e6.gr:1: index 5 is outside a list of 2
-  in g (line 1)
-  from e6.gr (line 2)
+e6.gr:1:19: index 5 is outside a list of 2
+fn g(l) { return l[5] }
+                  ^
+  in g (line 1:19)
+  from e6.gr (line 2:1)

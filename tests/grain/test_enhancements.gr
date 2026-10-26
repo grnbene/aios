@@ -1,0 +1,124 @@
+# Comprehensive verification of new Grain DX features
+
+# 1. Assertions
+assert_eq(1 + 1, 2)
+assert_ne(1 + 1, 3)
+assert_true(10 > 5)
+assert_false(5 > 10)
+
+# 2. String Interpolation ($"...") and formatting
+let user_name = "Alice"
+let count = 42
+let price = decimal("1234.50")
+let s1 = $"User {user_name} has {count} items"
+assert_eq(s1, "User Alice has 42 items")
+
+let s2 = $"Formatted price: {price:,.2f}"
+assert_eq(s2, "Formatted price: 1,234.50")
+
+# 3. Optional Chaining (?.)
+let obj = {"user": {"profile": {"email": "alice@example.com"}}}
+assert_eq(obj?.user?.profile?.email, "alice@example.com")
+assert_eq(obj?.user?.missing?.email, nil)
+assert_eq(obj?.nonexistent?.profile?.email, nil)
+
+let null_val = nil
+assert_eq(null_val?.field, nil)
+
+entity TestEnt {
+  status: "active"
+}
+assert_eq(TestEnt?.status, "active")
+assert_eq(TestEnt?.missing_field, nil)
+
+# 4. Safe Navigation helpers (get, get_in)
+assert_eq(get(obj["user"], "profile"), {"email": "alice@example.com"})
+assert_eq(get(obj["user"], "missing", "default_val"), "default_val")
+assert_eq(get_in(obj, ["user", "profile", "email"]), "alice@example.com")
+assert_eq(get_in(obj, "user.profile.email"), "alice@example.com")
+assert_eq(get_in(obj, "user.missing.email", "not_found"), "not_found")
+assert_eq(get_in(nil, "any.path", "safe"), "safe")
+
+let nested_list = {"items": [{"id": 101, "name": "Sticker A"}]}
+assert_eq(get_in(nested_list, "items.0.name"), "Sticker A")
+
+# 5. Destructuring (Map & List)
+let item = {"sku": "STK-99", "price": 19.99, "qty": 5}
+let { sku, price: item_price, qty } = item
+assert_eq(sku, "STK-99")
+assert_eq(item_price, 19.99)
+assert_eq(qty, 5)
+
+let nums = [100, 200, 300]
+let [ first, second ] = nums
+assert_eq(first, 100)
+assert_eq(second, 200)
+
+# 6. Standard Library UUID & ISO-8601 & Path
+let u1 = uuid_v4()
+let u2 = uuid_v4()
+assert_eq(len(u1), 36)
+assert_eq(len(u2), 36)
+assert_ne(u1, u2)
+
+let iso = iso8601(1700000000)
+assert_eq(iso, "2023-11-14T22:13:20Z")
+
+assert_eq(path_basename("/repos/aios/main.gr"), "main.gr")
+assert_eq(path_dirname("/repos/aios/main.gr"), "/repos/aios")
+assert_eq(path_ext("/repos/aios/main.gr"), ".gr")
+assert_eq(path_join("/repos/aios", "lib", "store.gr"), "/repos/aios/lib/store.gr")
+
+# 7. Response envelope helpers
+let r_json = res_json({"status": "ok"}, 201, {"X-Custom": "header"})
+assert_eq(r_json.status, 201)
+assert_eq(r_json.content_type, "application/json; charset=utf-8")
+assert_eq(r_json.json, {"status": "ok"})
+assert_eq(r_json.headers["X-Custom"], "header")
+
+let r_err = res_error(400, "Bad Request")
+assert_eq(r_err.status, 400)
+assert_eq(r_err.json.error, "Bad Request")
+
+let r_red = res_redirect("/login", 303)
+assert_eq(r_red.status, 303)
+assert_eq(r_red.headers["Location"], "/login")
+
+# 8. Worker stopping flag check
+assert_eq(is_stopping(), false)
+assert_eq(should_stop(), false)
+
+# 9. Destructuring inside a function (locals, not globals)
+fn pick(job) {
+  let started = 1
+  let { id, task: what } = job
+  let [first, second] = [id, what]
+  return first + "/" + second + "/" + str(started)
+}
+assert_eq(pick({"id": "a", "task": "b"}), "a/b/1")
+
+# 9. res_sse: events as text/event-stream, and nothing a handler passes in can add a field or an event
+assert_eq(res_sse([{"event": "ping", "data": "pong"}, {"data": {"status": "ok"}}]).body,
+          "event: ping\ndata: pong\n\ndata: {\"status\":\"ok\"}\n\n")
+assert_eq(res_sse([{"id": "7", "retry": 3000, "event": "tick", "data": "x"}]).body, "id: 7\nevent: tick\nretry: 3000\ndata: x\n\n")
+assert_eq(res_sse([{"data": "line1\nline2"}]).body, "data: line1\ndata: line2\n\n")
+assert_eq(res_sse({"data": "single"}).body, "data: single\n\n")
+assert_eq(res_sse([{"event": "a\nb", "data": "x"}]).body, "event: ab\ndata: x\n\n", "a newline in an event name started a new line")
+assert_eq(res_sse([{"data": "a\rb"}]).body, "data: a\ndata: b\n\n", "a lone CR ended the data line unnoticed")
+assert_eq(res_sse(["hello\n\nevent: x"]).body, "data: hello\ndata: \ndata: event: x\n\n", "a plain string was passed through raw")
+assert_eq(res_sse([]).body, "")
+assert_eq(res_sse([{"data": "x"}]).content_type, "text/event-stream; charset=utf-8")
+assert_eq(res_sse([{"data": "x"}]).headers["Cache-Control"], "no-cache")
+
+# 10. get, get_in, type, iso8601
+assert_eq(get({"a": 1}, "a", 0), 1)
+assert_eq(get({"a": 1}, "b", 9), 9)
+assert_eq(get([5, 6], 9, "d"), "d")
+assert_eq(get(nil, "a", "d"), "d")
+assert_eq(get_in({"a": {"b": [10, 20]}}, ["a", "b", 1], 0), 20)
+assert_eq(get_in({"a": 5}, ["a", "b"], "d"), "d", "get_in went through a number")
+assert_eq(type(decimal("1.5")), "decimal")
+assert_eq(iso8601(0), "1970-01-01T00:00:00Z")
+assert_eq(iso8601(1000000000), "2001-09-09T01:46:40Z")
+
+print("ALL TEST ENHANCEMENTS PASSED!")

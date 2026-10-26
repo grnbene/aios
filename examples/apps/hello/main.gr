@@ -1,0 +1,7 @@
+import "lib/words.gr"
+
+let started = now()
+serve_routes({
+  "/": fn (req) { return {"greeting": greeting(), "up_s": round(now() - started)} },
+  "/signed": fn (req) { return {"signed": getenv("SIGNATURE", "(no signature set)")} }
+})

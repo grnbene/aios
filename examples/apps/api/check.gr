@@ -1,0 +1,25 @@
+# Pre-cutover verification for store-api
+fn check(app) {
+  # 1. Health check
+  let h = http_get(app.url + "/health")
+  if h.status != 200 { return "health check failed: " + str(h.status) }
+
+  # 2. Quote calculation check with exact decimals
+  let payload = json_stringify({
+    "items": [
+      {"sku": "WIDGET-A", "price": "19.99", "qty": 2},
+      {"sku": "WIDGET-B", "price": "5.50", "qty": 1}
+    ]
+  })
+  let res = http_post(app.url + "/quote", payload, {"headers": {"Content-Type": "application/json"}})
+  if res.status != 200 { return "/quote failed with status " + str(res.status) }
+  let data = json_parse(res.body)
+  if data.subtotal != "45.48" { return "Expected subtotal 45.48, got " + str(data.subtotal) }
+  if data.total != "49.12" { return "Expected total 49.12, got " + str(data.total) }
+
+  # 3. Bad payload should return 400
+  let bad = http_post(app.url + "/quote", "invalid json", {"headers": {"Content-Type": "application/json"}})
+  if bad.status != 400 { return "Expected 400 for bad JSON, got " + str(bad.status) }
+
+  return true
+}

@@ -5,6 +5,11 @@
 // these are part of the portable standard library rather than the sidecar.
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+#include <random>
+#include <algorithm>
+#include <cstring>
 
 #include "aios/core/bytes.hpp"
 #include "aios/crypto/aes_gcm.hpp"
@@ -96,11 +101,45 @@ Value bi_hash_equals(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::boolean(diff == 0);
 }
 
+// random_bytes(n): returns a string of n cryptographically secure random bytes
+Value bi_random_bytes(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_number(args[0], error, "random_bytes")) return Value::nil();
+  int64_t n = args[0].as_int();
+  if (n < 0 || n > 1048576) {
+    error = "random_bytes: length must be between 0 and 1048576";
+    return Value::nil();
+  }
+  if (n == 0) return Value::string("");
+  std::string out(static_cast<size_t>(n), '\0');
+  int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  bool read_ok = false;
+  if (fd >= 0) {
+    size_t total = 0;
+    while (total < static_cast<size_t>(n)) {
+      ssize_t rd = ::read(fd, &out[total], static_cast<size_t>(n) - total);
+      if (rd <= 0) break;
+      total += rd;
+    }
+    ::close(fd);
+    if (total == static_cast<size_t>(n)) read_ok = true;
+  }
+  if (!read_ok) {
+    std::random_device rd;
+    for (size_t i = 0; i < static_cast<size_t>(n); i += 4) {
+      uint32_t r = rd();
+      size_t chunk = std::min<size_t>(4, static_cast<size_t>(n) - i);
+      std::memcpy(&out[i], &r, chunk);
+    }
+  }
+  return Value::string(std::move(out));
+}
+
 }  // namespace
 
 void install_hash_builtins(Vm& vm) {
   vm.define_native("aes_cbc_decrypt", 3, 3, bi_aes_cbc_decrypt);
   vm.define_native("hash_equals", 2, 2, bi_hash_equals);
+  vm.define_native("random_bytes", 1, 1, bi_random_bytes);
   vm.define_native("sha256", 1, 1, bi_sha256);
   vm.define_native("sha1", 1, 1, bi_sha1);
   vm.define_native("sha512", 1, 1, bi_sha512);

@@ -111,7 +111,15 @@ void publish(const std::string& uri, const std::string& text) {
   const auto compiled = g::compile_source(text, uri);
   for (const auto& d : compiled.errors) {
     json::Value diag = json::Value::object();
-    diag.set("range", line_range(d.line > 0 ? d.line - 1 : 0));
+    int64_t l = d.line > 0 ? d.line - 1 : 0;
+    if (d.column > 0) {
+      json::Value r = json::Value::object();
+      r.set("start", position(l, d.column - 1));
+      r.set("end", position(l, d.column));
+      diag.set("range", std::move(r));
+    } else {
+      diag.set("range", line_range(l));
+    }
     diag.set("severity", json::Value::integer(1));
     diag.set("source", json::Value::string("grain"));
     diag.set("message", json::Value::string(d.message));

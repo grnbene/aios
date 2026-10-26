@@ -1,0 +1,31 @@
+# Maps keep working at every size: past 8 entries a lookup table takes over from the scan, so this walks both
+# sides of that line and the table's growth, through overwrite, delete and re-add, with insertion order kept.
+fn check(c, msg) { assert_true(c, msg) }
+for size in [0, 1, 7, 8, 9, 16, 17, 100, 5000] {
+  let m = {}
+  for i in 0..size { m["k" + str(i)] = i }
+  check(len(m) == size, "len " + str(size))
+  for i in 0..size { check(m["k" + str(i)] == i, "get " + str(i) + " of " + str(size)) }
+  check(m["nope"] == nil, "absent " + str(size))
+  for i in 0..size { m["k" + str(i)] = i * 2 }                 # overwrite keeps size and order
+  check(len(m) == size, "overwrite len " + str(size))
+  for i in 0..size { check(m["k" + str(i)] == i * 2, "overwrote " + str(i)) }
+  let ks = keys(m)
+  for i in 0..size { check(ks[i] == "k" + str(i), "order " + str(i) + " of " + str(size)) }
+  let removed = 0
+  for i in 0..size { if i % 3 == 0 { del(m, "k" + str(i)); removed = removed + 1 } }
+  check(len(m) == size - removed, "after delete len " + str(size))
+  for i in 0..size {
+    let want = i % 3 == 0 ? nil : i * 2
+    check(m["k" + str(i)] == want, "after delete get " + str(i) + " of " + str(size))
+  }
+  for i in 0..size { if i % 3 == 0 { m["k" + str(i)] = -i } }   # re-add what was deleted
+  check(len(m) == size, "re-add len " + str(size))
+  for i in 0..size { if i % 3 == 0 { check(m["k" + str(i)] == -i, "re-added " + str(i)) } }
+}
+let copy = {"a": 1}
+for i in 0..30 { copy["x" + str(i)] = i }
+let c2 = copy
+c2["a"] = 99
+check(copy["a"] == 99 and has(copy, "x29") and not has(copy, "zzz"), "has / alias")
+print("MAP TABLE TESTS PASSED")

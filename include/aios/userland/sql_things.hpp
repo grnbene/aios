@@ -270,6 +270,7 @@ class ThingEngine {
     // (stock at a location), or claimants (orders whose lines claim it).
     enum Type { Aggregate = 0, Resource = 1, Claims = 2, Grain = 3, Event = 4, Mirror = 5 } type = Aggregate;
     bool paused = false;               // PAUSE THING: notices wait, nothing reacts or fires
+    bool building = false;             // CREATE OR REPLACE THING's new version, before it takes the name: not saved or dropped
     // EVENT (CREATE THING name AT '<when>' GRAIN ... WRITES ... AS '<grain>'): a
     // Thing that acts once. At its time the program's fire(ctx) runs with
     // write() on the WRITES tables, then verify and cleanup; it leaves a
@@ -304,6 +305,10 @@ class ThingEngine {
       std::vector<History> history;
     };
     std::map<std::string, GInst> gthings;       // by collation key ('ABC' and 'abc' are one item)
+    // The rows SHOW THING <name> answers, built at `shown_version` (k.version): a full read takes this under the
+    // lock and copies it after the lock is let go, so readers of a big kind no longer queue behind one another.
+    std::shared_ptr<const std::vector<SqlRow>> shown_rows;
+    uint64_t shown_version = ~0ull;
     // Things that wait for a moment: a program's wake_at ('YYYY-MM-DD HH:MM:SS')
     // wakes that Thing then - its key re-read, cause "woke".
     std::map<std::string, std::set<std::string>> wakes;   // time -> collation keys
@@ -436,9 +441,22 @@ class ThingEngine {
   bool grain_boot(Kind& k, std::string* err);
   void grain_notice(Kind& k, const SqlTable& t, const char* op, const SqlRow* before, const SqlRow* after);
   void settle_grain(Kind& k);
-  bool grain_full(Kind& k, const std::string& cause, std::string* err);
+  // keep_notices: what arrived meanwhile stays to be seen (a replacement built while writes go on)
+  bool grain_full(Kind& k, const std::string& cause, std::string* err, bool keep_notices = false);
+  SqlQueryResult replace_grain(Kind&& k, std::unique_lock<aios::hal::Mutex>& lk);
+ public:
+  // CREATE OR REPLACE THING of a grain Thing that exists, run by the caller outside any statement lock (so the old
+  // Thing is read, and tables written, while the new one builds): false when the statement is not that one, and
+  // the ordinary path takes it.
+  bool try_replace_unlocked(const std::string& sql, SqlQueryResult* out);
+ private:
   bool grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err);
-  SqlQueryResult show_grain(const Kind& k);
+  // every Thing of a grain kind, or (keys given) those Things only, in the order asked, by collation key
+  SqlQueryResult show_grain(const Kind& k, const std::vector<std::string>* keys = nullptr);
+  // The rows of SHOW THING <name> for a grain kind, built once per version of the kind; under mu_.
+  std::shared_ptr<const std::vector<SqlRow>> grain_rows_locked(Kind& k);
+  static std::vector<std::string> grain_columns(const Kind& k);
+  static SqlRow grain_row(const Kind& k, const Kind::GInst& gi, uint64_t* last_sec, std::string* last_text);
   std::string grain_serialize(const Kind& k) const;
   void grain_restore(Kind& k);
   std::string grain_display(const Kind::GInst& g) const;

@@ -128,9 +128,9 @@ void install_machine(grain::Vm& vm, Kernel& k) {
   vm.define_global("sys", grain::Value::object(grain::Type::Map, sys));
 }
 
-void report_errors(Out& o, const std::string& origin, const std::vector<grain::Diagnostic>& errs) {
+void report_errors(Out& o, const std::string& origin, const std::vector<grain::Diagnostic>& errs, const std::string& source = "") {
   for (const auto& d : errs)
-    o << origin << ":" << d.line << ": " << d.message << "\n";
+    o << d.format_snippet(source, origin);
 }
 
 // One path for "compile this text and run it", because the file, the one-liner
@@ -138,7 +138,7 @@ void report_errors(Out& o, const std::string& origin, const std::vector<grain::D
 bool compile_and_run(Kernel& k, Out& o, const std::string& source,
                      const std::string& origin, bool show_value, bool serving = false) {
   auto compiled = grain::compile_source(source, origin, show_value);
-  if (!compiled.ok()) { report_errors(o, origin, compiled.errors); return false; }
+  if (!compiled.ok()) { report_errors(o, origin, compiled.errors, source); return false; }
 
   grain::Vm vm;
   grain::install_builtins(vm);
@@ -171,7 +171,8 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
   for (const auto& line : out_lines) o << line << "\n";
 
   if (!r.ok) {
-    o << origin << ":" << r.line << ": " << r.error << "\n";
+    grain::Diagnostic d{r.line, r.column, r.error};
+    o << d.format_snippet(source, origin);
     for (size_t i = 0; i < r.trace.size(); ++i)
       o << (i == 0 ? "  in " : "  from ") << r.trace[i] << "\n";
     return false;
@@ -181,6 +182,26 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
 }
 
 }  // namespace
+
+// What a hosted app's VMs get inside aios (`aios serve`): everything `grain serve` gives a program here - the
+// machine's SQL (sql(), sql_on() across the fleet), `sys`, files, http, sockets - with no step limit.
+void setup_app_vm(Kernel& k, grain::Vm& vm) {
+  grain::install_builtins(vm);
+  // grain's own database client (params, records, options), as a grain host gives it: an app is the same program
+  // on either host. aios's older db_query (two arguments, rows only) stays for the console's own scripts.
+  grain::install_db_builtins(vm);
+  install_machine(vm, k);
+  vm.files = &g_host_files;
+#if !defined(AIOS_METAL)
+  install_grain_host(vm);
+  grain::set_http_trust_root(k.config().root);
+  grain::install_http_builtins(vm);
+#else
+  grain::install_socket_builtins(vm);
+#endif
+  install_grain_net(vm);
+  vm.step_limit = 0;
+}
 
 // `grain` with no arguments says what it is rather than failing, because the
 // first thing anyone types at a new command is its own name.
@@ -248,13 +269,14 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
       if (line == ".quit" || line == ".exit") break;
       if (line.empty()) continue;
       auto compiled = grain::compile_source(line, "<repl>", true);
-      if (!compiled.ok()) { report_errors(o, "<repl>", compiled.errors); continue; }
+      if (!compiled.ok()) { report_errors(o, "<repl>", compiled.errors, line); continue; }
       std::vector<std::string> out_lines;
       vm.sink = &out_lines;
       auto r = vm.run(compiled.script);
       for (const auto& l : out_lines) o << l << "\n";
       if (!r.ok) {
-        o << "line " << r.line << ": " << r.error << "\n";
+        grain::Diagnostic d{r.line, r.column, r.error};
+        o << d.format_snippet(line, "<repl>");
         for (size_t i = 0; i < r.trace.size(); ++i)
           o << (i == 0 ? "  in " : "  from ") << r.trace[i] << "\n";
       } else if (r.value.type != grain::Type::Nil) {

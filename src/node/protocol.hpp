@@ -30,6 +30,9 @@ constexpr uint32_t MAX_PAYLOAD = 256u << 20;
 // What a node says it speaks, in its handshake (after the kernel lists).
 constexpr uint32_t kFeatureMagic = 0x54414546u;   // 'FEAT'
 constexpr uint32_t kFeatExecBatch = 1u << 0;
+// Frames of 32 KB or more may go deflated (secure link frame 0x7D). Sent only to a peer that advertised it in its
+// handshake payload; every peer that has this bit reads both forms.
+constexpr uint32_t kFeatDeflate = 1u << 1;
 inline bool write_frame(hal::Connection& c, uint8_t t, ByteSpan payload) {
   // One send: a node frame is one transport write, so a peer polling with a
   // zero timeout never sees a header without its payload.

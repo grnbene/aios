@@ -335,7 +335,49 @@ void table_tests() {
 
 }  // namespace
 
+
+// Zone maps refreshed while a dictionary's numeric cache is stale (the dictionary grew since it was read as numbers)
+// read the segment's own values, not the whole dictionary: the stats must be the same as through the cache.
+void zone_refresh_tests() {
+  const std::string nul = sql_null();
+  const std::vector<std::string> odd = {"12", "-7", "3.25", "1e3", "12abc", " 42", "abc", "", nul, "0x1F", "-0", "9223372036854775807",
+                                        "1.5e-3", "  -2.75 ", "NULL", "7.000", "+8"};
+  ColumnStore cs;
+  for (size_t i = 0; i < 2048 * 3; ++i) cs.push_back(odd[i % odd.size()] + (i % 5 == 0 ? std::string() : std::to_string(i % 97)));
+  cs.optimize_encoding(SqlDataType::Text);
+  check(cs.encoding == ColumnEncoding::DictBitPacked, std::string("zone refresh: column is dictionary-coded (") + enc_name(cs.encoding) + ")");
+  cs.build_zone_maps();
+  double d0 = 0;
+  cs.get_double(0, &d0);   // the numeric cache built, as reads build it
+  // rows written in place, again and again: the old values stay in the dictionary until a checkpoint compacts it,
+  // and compacting drops the numeric cache - the state a checkpoint's refresh met on chi
+  for (int round = 0; round < 3; ++round)
+    for (size_t r = 0; r < cs.size(); ++r)
+      cs.set(r, r % 4 == 0 ? std::to_string(round * 100000 + (int)r) + ".25" : (r % 4 == 1 ? "v" + std::to_string(round) + "-" + std::to_string(r) : odd[(r + round) % odd.size()] + std::to_string(round)));
+  check(cs.compact_dictionary(), "zone refresh: the dictionary was compacted");
+  for (auto& z : cs.zone_maps) z.has_stats = false;   // what a write leaves for the checkpoint to refresh
+  const size_t to = cs.size() - 1;
+  ColumnStore cached = cs;
+  double dd = 0; int64_t ii = 0;
+  cached.get_double(0, &dd); cached.get_int64(0, &ii);   // the caches made whole: the path the refresh took before
+  check(cs.dict_doubles.size() < cs.dict.size(), "zone refresh: the dictionary has outgrown its numeric cache");
+  cs.refresh_zone_maps(0, to);
+  cached.refresh_zone_maps(0, to);
+  check(cs.dict_doubles.size() < cs.dict.size(), "zone refresh: refreshing did not build the whole cache");
+  check(cs.zone_maps.size() == cached.zone_maps.size(), "zone refresh: as many segments");
+  for (size_t sg = 0; sg < cs.zone_maps.size() && sg < cached.zone_maps.size(); ++sg) {
+    const SegmentZoneMap &a = cs.zone_maps[sg], &b = cached.zone_maps[sg];
+    const bool same_stats = a.min_int64 == b.min_int64 && a.max_int64 == b.max_int64 && a.min_double == b.min_double &&
+                            a.max_double == b.max_double && a.min_str == b.min_str && a.max_str == b.max_str &&
+                            a.bloom_filter == b.bloom_filter && a.null_count == b.null_count && a.all_null == b.all_null &&
+                            a.has_stats == b.has_stats && a.str_cut == b.str_cut;
+    check(same_stats, "zone refresh: segment " + std::to_string(sg) + " has the same stats either way");
+  }
+}
+
 int main() {
+  std::cout << "-- zone maps refreshed past a stale dictionary cache --\n";
+  zone_refresh_tests();
   std::cout << "-- BlockCompressed: columns --\n";
   column_tests();
   std::cout << "-- FSST: columns --\n";

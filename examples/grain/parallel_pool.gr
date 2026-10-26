@@ -1,0 +1,47 @@
+# Multi-Core Concurrency in Grain
+# Spreading computation across all CPU cores with isolated worker VMs.
+
+print("=== Grain Multi-Core Concurrency ===")
+print("Running on", sys.cpus, "CPU cores under", sys.os)
+
+# 1. CPU-intensive function
+fn compute_primes(limit) {
+  let count = 0
+  for n in 2..limit {
+    let is_prime = true
+    let d = 2
+    while d * d <= n {
+      if n % d == 0 {
+        is_prime = false
+        break
+      }
+      d = d + 1
+    }
+    if is_prime { count = count + 1 }
+  }
+  return {"limit": limit, "primes": count}
+}
+
+# 2. parallel_map: maps over list across available cores, preserving item order
+let limits = [5000, 10000, 15000, 20000]
+print("\nRunning parallel_map over limits:", limits)
+let t0 = now()
+let results = parallel_map(limits, compute_primes)
+let elapsed = now() - t0
+
+for r in results {
+  print("  Primes up to " + str(r.limit) + ": " + str(r.primes))
+}
+print("parallel_map finished in " + str(round(elapsed * 1000)) + " ms")
+
+# 3. spawn & await: background worker tasks
+print("\nSpawning background task on another core...")
+let bg_task = spawn(compute_primes, 25000)
+print("Main thread continues immediately. Task done?", task_done(bg_task))
+
+# Do work while the spawned task computes in the background
+let local_sum = 0
+for i in 1..100000 { local_sum = local_sum + i }
+
+let final_result = await(bg_task)
+print("Task awaited! Result: primes up to " + str(final_result.limit) + " = " + str(final_result.primes))

@@ -12,6 +12,11 @@ namespace grain_cli {
 int fmt_command(const std::vector<std::string>& args);
 int test_command(const std::vector<std::string>& args);
 int lsp_command(const std::vector<std::string>& args);
+// `grain host` and `grain app` (app_cmd.cpp): apps hosted by grain itself.
+int host_command(const std::vector<std::string>& args);
+int app_command(const std::vector<std::string>& args);
+int pkg_command(const std::vector<std::string>& args);
+int debug_command(const std::vector<std::string>& args);
 
 // Sets a VM up as `grain run` does (main.cpp), for the tools that run programs.
 void prepare_vm(aios::userland::grain::Vm& vm, const std::vector<std::string>& script_args);

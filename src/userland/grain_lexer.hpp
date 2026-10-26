@@ -20,7 +20,7 @@ enum class Tok : uint8_t {
   AmpEq, PipeEq, CaretEq, LtLtEq, GtGtEq,
   EqEq, BangEq, Lt, LtEq, Gt, GtEq,
   LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-  Comma, Dot, Colon, ColonColon, Question,
+  Comma, Dot, Colon, ColonColon, Question, QuestionDot,
   Entity, On
 };
 
@@ -32,6 +32,7 @@ struct Token {
   int64_t integer = 0;
   double real = 0;
   int line = 1;
+  int column = 1;
 };
 
 class Lexer {
@@ -49,6 +50,7 @@ class Lexer {
   const std::string& src_;
   size_t pos_ = 0;
   int line_ = 1;
+  size_t line_start_pos_ = 0;
 };
 
 std::vector<Token> lex_all(const std::string& source);

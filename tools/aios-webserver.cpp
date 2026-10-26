@@ -846,19 +846,40 @@ bool serve_grain_ui(hal::Host& host, hal::Connection& conn, net::ConnReader& rea
     g::WebUi::Stream stream;
     std::vector<std::pair<std::string, std::string>> sh;
     std::string frame, error;
-    if (!ui->open_stream(req, stream, sh, frame, error)) { write_simple_response(conn, 500, "Internal Server Error", "internal server error"); return false; }
-    net::HttpResponseHead rh;
-    rh.status = 200;
-    rh.status_text = "OK";
-    for (auto& h : sh) rh.headers.push_back({h.first, h.second});
-    apply_vhost_headers(rh, vh);
-    net::ResponseWriter w(conn, rh, std::nullopt);   // chunked: it has no end
-    bool alive = w.write_head() && w.write_body_chunk(span_of(frame));
-    while (alive && ui->next_frame(stream, 15000, frame)) alive = w.write_body_chunk(span_of(frame.empty() ? std::string(": keepalive\n\n") : frame));
-    ui->close_stream(stream);
-    return false;   // the stream ended: the connection is done
+    if (ui->open_stream(req, stream, sh, frame, error)) {
+      net::HttpResponseHead rh;
+      rh.status = 200;
+      rh.status_text = "OK";
+      for (auto& h : sh) rh.headers.push_back({h.first, h.second});
+      apply_vhost_headers(rh, vh);
+      net::ResponseWriter w(conn, rh, std::nullopt);   // chunked: it has no end
+      bool alive = w.write_head() && w.write_body_chunk(span_of(frame));
+      while (alive && ui->next_frame(stream, 15000, frame)) alive = w.write_body_chunk(span_of(frame.empty() ? std::string(": keepalive\n\n") : frame));
+      ui->close_stream(stream);
+      return false;   // the stream ended: the connection is done
+    }
   }
-  g::WebUi::Response res = ui->handle(req);
+  bool headers_sent = false;
+  std::unique_ptr<net::ResponseWriter> stream_writer;
+  auto on_headers = [&](int status, const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
+    if (headers_sent) return true;
+    headers_sent = true;
+    net::HttpResponseHead rh;
+    rh.status = (uint16_t)status;
+    rh.status_text = status == 200 ? "OK" : status == 204 ? "No Content" : "Response";
+    for (auto& h : headers) rh.headers.push_back({h.first, h.second});
+    apply_vhost_headers(rh, vh);
+    stream_writer = std::make_unique<net::ResponseWriter>(conn, rh, std::nullopt);
+    return stream_writer->write_head();
+  };
+  auto on_chunk = [&](const std::string& chunk) -> bool {
+    if (!headers_sent) {
+      if (!on_headers(200, {{"Content-Type", "text/event-stream; charset=utf-8"}, {"Cache-Control", "no-cache"}})) return false;
+    }
+    return stream_writer ? stream_writer->write_body_chunk(span_of(chunk)) : false;
+  };
+  g::WebUi::Response res = ui->handle(req, on_headers, on_chunk);
+  if (headers_sent) return false;
   return write_buffered(conn, head, vh, res.status, res.headers, std::vector<uint8_t>(res.body.begin(), res.body.end()), false);
 }
 

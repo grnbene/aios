@@ -1,0 +1,1 @@
+fn greeting() { return getenv("GREETING", "hi") + " from " + getenv("GRAIN_APP", "?") + " " + getenv("GRAIN_APP_VERSION", "") }

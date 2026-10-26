@@ -39,11 +39,15 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_compiler.cpp
   ${AIOS_ROOT}/src/userland/grain_vm.cpp
   ${AIOS_ROOT}/src/userland/grain_jit_arm64.cpp
+  ${AIOS_ROOT}/src/userland/grain_jit_x64.cpp
   ${AIOS_ROOT}/src/userland/grain_builtins.cpp
   ${AIOS_ROOT}/src/userland/grain_std_hash.cpp
   ${AIOS_ROOT}/src/userland/grain_std_bytes.cpp
   ${AIOS_ROOT}/src/userland/grain_native.cpp
   ${AIOS_ROOT}/src/userland/grain_webui.cpp
+  ${AIOS_ROOT}/src/userland/grain_app.cpp
+  ${AIOS_ROOT}/src/userland/grain_app_cli.cpp
+  ${AIOS_ROOT}/src/net/http_stream.cpp
   ${AIOS_ROOT}/src/userland/grain_std_regex.cpp
   ${AIOS_ROOT}/src/userland/grain_std_time.cpp
   ${AIOS_ROOT}/src/userland/grain_std_text.cpp
@@ -136,7 +140,7 @@ else()
   target_compile_options(grain_lang PRIVATE -Wall -Wno-unused-parameter)
 endif()
 
-add_executable(grain cli/main.cpp cli/host.cpp cli/ffi.cpp cli/plugin.cpp cli/serve.cpp cli/open_client.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp)
+add_executable(grain cli/main.cpp cli/host.cpp cli/ffi.cpp cli/plugin.cpp cli/serve.cpp cli/open_client.cpp cli/bundle.cpp cli/tools_fmt.cpp cli/tools_test.cpp cli/tools_lsp.cpp cli/app_cmd.cpp cli/pkg_cmd.cpp cli/debug_cmd.cpp)
 target_include_directories(grain PRIVATE ${AIOS_ROOT}/cli ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(grain PRIVATE grain_lang ${CMAKE_DL_LIBS})
 

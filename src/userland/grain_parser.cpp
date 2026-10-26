@@ -39,9 +39,10 @@ int infix_power(Tok t) {
 ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
   const std::string& raw = t.text;
   const int line = t.line;
+  const int col = t.column;
   ExprP result = nullptr;
   auto fail = [&](const std::string& msg) {
-    if (errors && errors->size() < 12) errors->push_back(Diagnostic{line, msg});
+    if (errors && errors->size() < 12) errors->push_back(Diagnostic{line, col, msg});
   };
   auto append_piece = [&](ExprP piece) {
     if (!result) { result = std::move(piece); return; }
@@ -49,6 +50,7 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
     add->kind = ExprKind::Binary;
     add->op = Tok::Plus;
     add->line = line;
+    add->column = col;
     add->a = std::move(result);
     add->b = std::move(piece);
     result = std::move(add);
@@ -60,6 +62,7 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
     e->kind = ExprKind::StrLit;
     e->text = lit;
     e->line = line;
+    e->column = col;
     append_piece(std::move(e));
     lit.clear();
   };
@@ -72,7 +75,13 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
       fail("a lone '}' in a formatted string (write }} for a brace)");
       return result ? std::move(result) : std::make_unique<Expr>();
     }
-    if (c != '{') { lit.push_back(c); ++i; continue; }
+    if (c == '$' && i + 1 < raw.size() && raw[i + 1] == '{') {
+      ++i;
+    } else if (c != '{') {
+      lit.push_back(c);
+      ++i;
+      continue;
+    }
     if (i + 1 < raw.size() && raw[i + 1] == '{') { lit.push_back('{'); i += 2; continue; }
 
     // {expression}: find the matching close brace.
@@ -95,25 +104,81 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
     i = j + 1;
     if (src.find_first_not_of(" \t") == std::string::npos) { fail("empty {} in formatted string"); continue; }
 
-    std::vector<Token> toks = lex_all(src);
-    for (auto& tk : toks) tk.line += line - 1;
-    const size_t errors_before = errors ? errors->size() : 0;
-    Parser inner(std::move(toks), errors);
-    ExprP value = inner.expression();
-    if (!inner.finished() && (!errors || errors->size() == errors_before))
-      fail("unexpected text after the expression in {" + src + "}");
+    std::vector<Token> all_toks = lex_all(src);
+    for (auto& tk : all_toks) tk.line += line - 1;
+    Parser full_inner(all_toks, nullptr);
+    ExprP full_val = full_inner.expression();
+
+    ExprP value = nullptr;
+    std::string spec_part;
+
+    if (full_val && full_inner.finished()) {
+      value = std::move(full_val);
+    } else {
+      size_t colon = std::string::npos;
+      int pdepth = 0;
+      char pquote = 0;
+      for (size_t k = 0; k < src.size(); ++k) {
+        char ch = src[k];
+        if (pquote) {
+          if (ch == '\\') { ++k; continue; }
+          if (ch == pquote) pquote = 0;
+          continue;
+        }
+        if (ch == '"' || ch == '\'') pquote = ch;
+        else if (ch == '(' || ch == '[' || ch == '{') ++pdepth;
+        else if (ch == ')' || ch == ']' || ch == '}') --pdepth;
+        else if (ch == ':' && pdepth == 0) {
+          colon = k;
+          break;
+        }
+      }
+      const std::string expr_part = colon != std::string::npos ? src.substr(0, colon) : src;
+      spec_part = colon != std::string::npos ? src.substr(colon + 1) : "";
+
+      std::vector<Token> toks = lex_all(expr_part);
+      for (auto& tk : toks) tk.line += line - 1;
+      const size_t errors_before = errors ? errors->size() : 0;
+      Parser inner(std::move(toks), errors);
+      value = inner.expression();
+      if (!inner.finished() && (!errors || errors->size() == errors_before))
+        fail("unexpected text after the expression in {" + expr_part + "}");
+    }
 
     flush_lit();
-    auto str_call = std::make_unique<Expr>();
-    str_call->kind = ExprKind::Call;
-    str_call->line = line;
-    auto str_name = std::make_unique<Expr>();
-    str_name->kind = ExprKind::Name;
-    str_name->text = "str";
-    str_name->line = line;
-    str_call->a = std::move(str_name);
-    str_call->items.push_back(std::move(value));
-    append_piece(std::move(str_call));
+    if (!spec_part.empty()) {
+      auto fmt_call = std::make_unique<Expr>();
+      fmt_call->kind = ExprKind::Call;
+      fmt_call->line = line;
+      fmt_call->column = col;
+      auto fmt_name = std::make_unique<Expr>();
+      fmt_name->kind = ExprKind::Name;
+      fmt_name->text = "format";
+      fmt_name->line = line;
+      fmt_name->column = col;
+      fmt_call->a = std::move(fmt_name);
+      auto fmt_spec = std::make_unique<Expr>();
+      fmt_spec->kind = ExprKind::StrLit;
+      fmt_spec->text = "{:" + spec_part + "}";
+      fmt_spec->line = line;
+      fmt_spec->column = col;
+      fmt_call->items.push_back(std::move(fmt_spec));
+      fmt_call->items.push_back(std::move(value));
+      append_piece(std::move(fmt_call));
+    } else {
+      auto str_call = std::make_unique<Expr>();
+      str_call->kind = ExprKind::Call;
+      str_call->line = line;
+      str_call->column = col;
+      auto str_name = std::make_unique<Expr>();
+      str_name->kind = ExprKind::Name;
+      str_name->text = "str";
+      str_name->line = line;
+      str_name->column = col;
+      str_call->a = std::move(str_name);
+      str_call->items.push_back(std::move(value));
+      append_piece(std::move(str_call));
+    }
   }
   flush_lit();
 
@@ -122,6 +187,7 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
     result->kind = ExprKind::StrLit;
     result->text = "";
     result->line = line;
+    result->column = col;
   }
   return result;
 }
@@ -157,7 +223,7 @@ bool Parser::match(Tok k) {
 void Parser::error_at(const Token& t, const std::string& message) {
   if (panicked_) return;   // one complaint per bad construct, not one per token
   panicked_ = true;
-  if (errors_->size() < 12) errors_->push_back(Diagnostic{t.line, message});
+  if (errors_->size() < 12) errors_->push_back(Diagnostic{t.line, t.column, message});
 }
 
 bool Parser::expect(Tok k, const char* what) {
@@ -195,17 +261,17 @@ ExprP Parser::primary() {
   switch (t.kind) {
     case Tok::Int: {
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::IntLit; e->integer = t.integer; e->line = t.line;
+      auto e = std::make_unique<Expr>(); e->kind = ExprKind::IntLit; e->integer = t.integer; e->line = t.line; e->column = t.column;
       return e;
     }
     case Tok::Real: {
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::RealLit; e->real = t.real; e->line = t.line;
+      auto e = std::make_unique<Expr>(); e->kind = ExprKind::RealLit; e->real = t.real; e->line = t.line; e->column = t.column;
       return e;
     }
     case Tok::Str: {
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::StrLit; e->text = t.text; e->line = t.line;
+      auto e = std::make_unique<Expr>(); e->kind = ExprKind::StrLit; e->text = t.text; e->line = t.line; e->column = t.column;
       return e;
     }
     case Tok::FStr: {
@@ -215,12 +281,12 @@ ExprP Parser::primary() {
     case Tok::True: case Tok::False: {
       advance();
       auto e = std::make_unique<Expr>(); e->kind = ExprKind::BoolLit;
-      e->integer = (t.kind == Tok::True) ? 1 : 0; e->line = t.line;
+      e->integer = (t.kind == Tok::True) ? 1 : 0; e->line = t.line; e->column = t.column;
       return e;
     }
     case Tok::NilLit: {
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::NilLit; e->line = t.line;
+      auto e = std::make_unique<Expr>(); e->kind = ExprKind::NilLit; e->line = t.line; e->column = t.column;
       return e;
     }
     case Tok::Ident: {
@@ -231,17 +297,124 @@ ExprP Parser::primary() {
         auto call = std::make_unique<Expr>();
         call->kind = ExprKind::Call;
         call->line = t.line;
+        call->column = t.column;
         auto callee = std::make_unique<Expr>();
         callee->kind = ExprKind::Name;
         callee->text = "import";
         callee->line = t.line;
+        callee->column = t.column;
         auto path = std::make_unique<Expr>();
         path->kind = ExprKind::StrLit;
         path->text = peek().text;
         path->line = peek().line;
+        path->column = peek().column;
         advance();
         call->a = std::move(callee);
         call->items.push_back(std::move(path));
+        if (check(Tok::Ident) && peek().text == "as") {
+          advance();
+          if (check(Tok::Ident)) {
+            auto alias = std::make_unique<Expr>();
+            alias->kind = ExprKind::StrLit;
+            alias->text = peek().text;
+            alias->line = peek().line;
+            alias->column = peek().column;
+            advance();
+            call->items.push_back(std::move(alias));
+          } else {
+            error_at(peek(), "expected identifier after 'as'");
+          }
+        }
+        return call;
+      }
+      if (full_name == "import" && check(Tok::LBrace)) {
+        advance();
+        struct ImportSpec {
+          std::string orig;
+          std::string alias;
+        };
+        std::vector<ImportSpec> symbols;
+        skip_newlines();
+        while (!check(Tok::RBrace) && !check(Tok::End)) {
+          if (!check(Tok::Ident)) { error_at(peek(), "expected identifier in import list"); break; }
+          std::string orig = peek().text;
+          advance();
+          std::string alias = orig;
+          if (check(Tok::Ident) && peek().text == "as") {
+            advance();
+            if (check(Tok::Ident)) {
+              alias = peek().text;
+              advance();
+            } else {
+              error_at(peek(), "expected identifier after 'as'");
+            }
+          }
+          symbols.push_back({orig, alias});
+          skip_newlines();
+          if (!match(Tok::Comma)) break;
+          skip_newlines();
+        }
+        expect(Tok::RBrace, "'}'");
+        skip_newlines();
+        if (check(Tok::Ident) && peek().text == "from") {
+          advance();
+        } else {
+          error_at(peek(), "expected 'from' after import list");
+        }
+        skip_newlines();
+        if (!check(Tok::Str)) {
+          error_at(peek(), "expected file path string after 'from'");
+        }
+        auto call = std::make_unique<Expr>();
+        call->kind = ExprKind::Call;
+        call->line = t.line;
+        call->column = t.column;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = ExprKind::Name;
+        callee->text = "import";
+        callee->line = t.line;
+        callee->column = t.column;
+        auto path = std::make_unique<Expr>();
+        path->kind = ExprKind::StrLit;
+        path->text = peek().text;
+        path->line = peek().line;
+        path->column = peek().column;
+        advance();
+        call->a = std::move(callee);
+        call->items.push_back(std::move(path));
+        auto sym_list = std::make_unique<Expr>();
+        sym_list->kind = ExprKind::ListLit;
+        sym_list->line = t.line;
+        sym_list->column = t.column;
+        for (const auto& sym : symbols) {
+          if (sym.orig == sym.alias) {
+            auto item = std::make_unique<Expr>();
+            item->kind = ExprKind::StrLit;
+            item->text = sym.orig;
+            item->line = t.line;
+            item->column = t.column;
+            sym_list->items.push_back(std::move(item));
+          } else {
+            auto pair = std::make_unique<Expr>();
+            pair->kind = ExprKind::ListLit;
+            pair->line = t.line;
+            pair->column = t.column;
+            auto orig_item = std::make_unique<Expr>();
+            orig_item->kind = ExprKind::StrLit;
+            orig_item->text = sym.orig;
+            orig_item->line = t.line;
+            orig_item->column = t.column;
+            auto alias_item = std::make_unique<Expr>();
+            alias_item->kind = ExprKind::StrLit;
+            alias_item->text = sym.alias;
+            alias_item->line = t.line;
+            alias_item->column = t.column;
+            pair->items.push_back(std::move(orig_item));
+            pair->items.push_back(std::move(alias_item));
+            sym_list->items.push_back(std::move(pair));
+          }
+        }
+        call->items.push_back(std::move(sym_list));
         return call;
       }
       while (match(Tok::ColonColon)) {
@@ -261,10 +434,12 @@ ExprP Parser::primary() {
           auto call = std::make_unique<Expr>();
           call->kind = ExprKind::Call;
           call->line = t.line;
+          call->column = t.column;
           auto callee = std::make_unique<Expr>();
           callee->kind = ExprKind::Name;
           callee->text = full_name;
           callee->line = t.line;
+          callee->column = t.column;
           call->a = std::move(callee);
           call->items.push_back(std::move(map_arg));
           return call;
@@ -279,6 +454,7 @@ ExprP Parser::primary() {
         e->text = full_name;
       }
       e->line = t.line;
+      e->column = t.column;
       return e;
     }
     case Tok::LParen: {
@@ -296,16 +472,19 @@ ExprP Parser::primary() {
   }
   error_at(t, std::string("expected a value, found ") + tok_name(t.kind));
   advance();
-  auto e = std::make_unique<Expr>(); e->kind = ExprKind::NilLit; e->line = t.line;
+  auto e = std::make_unique<Expr>(); e->kind = ExprKind::NilLit; e->line = t.line; e->column = t.column;
   return e;
 }
 
 ExprP Parser::list_literal() {
-  const int line = peek().line;
+  const Token t = peek();
+  const int line = t.line;
+  const int col = t.column;
   advance();                      // [
   auto e = std::make_unique<Expr>();
   e->kind = ExprKind::ListLit;
   e->line = line;
+  e->column = col;
   skip_newlines();
   if (!check(Tok::RBracket)) {
     for (;;) {
@@ -325,11 +504,14 @@ ExprP Parser::list_literal() {
 // `{ "a": 1 }`. A bare name is taken as its own key, so `{x: 1}` needs no
 // quotes -- the keys of a map are almost always identifiers in practice.
 ExprP Parser::map_literal() {
-  const int line = peek().line;
+  const Token t = peek();
+  const int line = t.line;
+  const int col = t.column;
   advance();                      // {
   auto e = std::make_unique<Expr>();
   e->kind = ExprKind::MapLit;
   e->line = line;
+  e->column = col;
   skip_newlines();
   if (!check(Tok::RBrace)) {
     for (;;) {
@@ -358,17 +540,20 @@ ExprP Parser::map_literal() {
 }
 
 ExprP Parser::lambda() {
-  const int line = peek().line;
+  const Token t = peek();
+  const int line = t.line;
+  const int col = t.column;
   advance();                      // fn
   auto e = std::make_unique<Expr>();
   e->kind = ExprKind::Lambda;
   e->line = line;
+  e->column = col;
   if (check(Tok::Ident)) { e->fn_name = peek().text; advance(); }
   expect(Tok::LParen, "'(' after fn");
   if (!check(Tok::RParen)) {
     for (;;) {
       if (check(Tok::Ident)) {
-        e->params.push_back(Param{peek().text, peek().line});
+        e->params.push_back(Param{peek().text, peek().line, peek().column});
         advance();
       } else {
         error_at(peek(), "expected a parameter name");
@@ -389,11 +574,14 @@ ExprP Parser::lambda() {
 ExprP Parser::postfix(ExprP left) {
   for (;;) {
     if (check(Tok::LParen)) {
-      const int line = peek().line;
+      const Token t = peek();
+      const int line = t.line;
+      const int col = t.column;
       advance();
       auto call = std::make_unique<Expr>();
       call->kind = ExprKind::Call;
-      call->line = line;
+      call->line = left ? left->line : line;
+      call->column = left ? left->column : col;
       call->a = std::move(left);
       skip_newlines();
       if (!check(Tok::RParen)) {
@@ -410,6 +598,7 @@ ExprP Parser::postfix(ExprP left) {
               named_map = std::make_unique<Expr>();
               named_map->kind = ExprKind::MapLit;
               named_map->line = line;
+              named_map->column = col;
             }
             named_map->keys.push_back(arg_name);
             named_map->items.push_back(std::move(val));
@@ -429,7 +618,9 @@ ExprP Parser::postfix(ExprP left) {
       continue;
     }
     if (check(Tok::LBracket)) {
-      const int line = peek().line;
+      const Token t = peek();
+      const int line = t.line;
+      const int col = t.column;
       advance();
       skip_newlines();
       ExprP subscript = expression();
@@ -438,13 +629,16 @@ ExprP Parser::postfix(ExprP left) {
       auto idx = std::make_unique<Expr>();
       idx->kind = ExprKind::Index;
       idx->line = line;
+      idx->column = col;
       idx->a = std::move(left);
       idx->b = std::move(subscript);
       left = std::move(idx);
       continue;
     }
     if (check(Tok::Dot) && peek(1).kind != Tok::Dot) {   // `..` is a range, not a field
-      const int line = peek().line;
+      const Token t = peek();
+      const int line = t.line;
+      const int col = t.column;
       advance();
       std::string name;
       if (check(Tok::Ident)) { name = peek().text; advance(); }
@@ -452,6 +646,24 @@ ExprP Parser::postfix(ExprP left) {
       auto f = std::make_unique<Expr>();
       f->kind = ExprKind::Field;
       f->line = line;
+      f->column = col;
+      f->a = std::move(left);
+      f->text = name;
+      left = std::move(f);
+      continue;
+    }
+    if (check(Tok::QuestionDot)) {
+      const Token t = peek();
+      const int line = t.line;
+      const int col = t.column;
+      advance();
+      std::string name;
+      if (check(Tok::Ident)) { name = peek().text; advance(); }
+      else { error_at(peek(), "expected a field name after '?.'"); advance(); }
+      auto f = std::make_unique<Expr>();
+      f->kind = ExprKind::OptField;
+      f->line = line;
+      f->column = col;
       f->a = std::move(left);
       f->text = name;
       left = std::move(f);
@@ -468,6 +680,7 @@ ExprP Parser::unary() {
     e->kind = ExprKind::Unary;
     e->op = t.kind;
     e->line = t.line;
+    e->column = t.column;
     e->a = unary();
     return e;
   }
@@ -480,7 +693,9 @@ ExprP Parser::binary(int min_power) {
     const Tok op = peek().kind;
     const int power = infix_power(op);
     if (power == 0 || power < min_power) return left;
-    const int line = peek().line;
+    const Token op_token = peek();
+    const int line = op_token.line;
+    const int col = op_token.column;
     advance();
     skip_newlines();   // an operator at end of line continues the expression
     // Left-associative: the right side may only take operators that bind
@@ -490,6 +705,7 @@ ExprP Parser::binary(int min_power) {
     e->kind = (op == Tok::And || op == Tok::Or) ? ExprKind::Logical : ExprKind::Binary;
     e->op = op;
     e->line = line;
+    e->column = col;
     e->a = std::move(left);
     e->b = std::move(right);
     left = std::move(e);
@@ -506,7 +722,9 @@ ExprP Parser::expression() {
   // bounds a native fn's `for i in a..b` takes. It binds looser than any
   // operator, so `0..n - 1` is 0..(n - 1).
   if (check(Tok::Dot) && peek(1).kind == Tok::Dot) {
-    const int line = peek().line;
+    const Token dot_tok = peek();
+    const int line = dot_tok.line;
+    const int col = dot_tok.column;
     advance();
     advance();
     skip_newlines();
@@ -515,9 +733,11 @@ ExprP Parser::expression() {
     callee->kind = ExprKind::Name;
     callee->text = "range";
     callee->line = line;
+    callee->column = col;
     auto call = std::make_unique<Expr>();
     call->kind = ExprKind::Call;
     call->line = line;
+    call->column = col;
     call->a = std::move(callee);
     call->items.push_back(std::move(left));
     call->items.push_back(std::move(hi));
@@ -525,7 +745,9 @@ ExprP Parser::expression() {
   }
 
   if (check(Tok::Question)) {
-    const int line = peek().line;
+    const Token q_tok = peek();
+    const int line = q_tok.line;
+    const int col = q_tok.column;
     advance();
     skip_newlines();
     ExprP then_expr = expression();
@@ -537,6 +759,7 @@ ExprP Parser::expression() {
     auto e = std::make_unique<Expr>();
     e->kind = ExprKind::Ternary;
     e->line = line;
+    e->column = col;
     e->a = std::move(left);
     e->b = std::move(then_expr);
     e->c = std::move(else_expr);
@@ -562,7 +785,9 @@ ExprP Parser::expression() {
 
   if (op_tok != Tok::Assign && !is_compound) return left;
 
-  const int line = peek().line;
+  const Token asgn_tok = peek();
+  const int line = asgn_tok.line;
+  const int col = asgn_tok.column;
   advance();
   skip_newlines();
   ExprP value = expression();
@@ -572,6 +797,7 @@ ExprP Parser::expression() {
   // compiler reuses the evaluated target rather than this cloning it.
   auto e = std::make_unique<Expr>();
   e->line = line;
+  e->column = col;
   if (is_compound) e->op = bin_op;
   switch (left->kind) {
     case ExprKind::Name:
@@ -619,15 +845,62 @@ StmtP Parser::statement() {
   if (t.kind == Tok::Let) {
     advance();
     auto s = std::make_unique<Stmt>();
-    s->kind = StmtKind::Let;
     s->line = t.line;
-    if (check(Tok::Ident)) { s->name = peek().text; advance(); }
-    else error_at(peek(), "expected a name after let");
-    if (match(Tok::Assign)) {
+    s->column = t.column;
+    if (check(Tok::LBrace)) {
+      advance();
+      s->kind = StmtKind::Destructure;
+      s->is_destructure_map = true;
+      skip_newlines();
+      while (!check(Tok::RBrace) && !check(Tok::End)) {
+        if (!check(Tok::Ident)) { error_at(peek(), "expected identifier in destructuring pattern"); break; }
+        std::string key = peek().text;
+        std::string var_name = key;
+        advance();
+        if (match(Tok::Colon)) {
+          if (!check(Tok::Ident)) { error_at(peek(), "expected variable name after ':' in destructuring"); break; }
+          var_name = peek().text;
+          advance();
+        }
+        s->keys.push_back(key);
+        s->names.push_back(var_name);
+        skip_newlines();
+        if (!match(Tok::Comma)) break;
+        skip_newlines();
+      }
+      expect(Tok::RBrace, "'}'");
+      expect(Tok::Assign, "'='");
       skip_newlines();
       s->expr = expression();
+      return s;
+    } else if (check(Tok::LBracket)) {
+      advance();
+      s->kind = StmtKind::Destructure;
+      s->is_destructure_map = false;
+      skip_newlines();
+      while (!check(Tok::RBracket) && !check(Tok::End)) {
+        if (!check(Tok::Ident)) { error_at(peek(), "expected identifier in destructuring pattern"); break; }
+        s->names.push_back(peek().text);
+        advance();
+        skip_newlines();
+        if (!match(Tok::Comma)) break;
+        skip_newlines();
+      }
+      expect(Tok::RBracket, "']'");
+      expect(Tok::Assign, "'='");
+      skip_newlines();
+      s->expr = expression();
+      return s;
+    } else {
+      s->kind = StmtKind::Let;
+      if (check(Tok::Ident)) { s->name = peek().text; advance(); }
+      else error_at(peek(), "expected a name after let");
+      if (match(Tok::Assign)) {
+        skip_newlines();
+        s->expr = expression();
+      }
+      return s;
     }
-    return s;
   }
 
   if (t.kind == Tok::Entity) {
@@ -640,6 +913,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::NativeDecl;
     s->line = t.line;
+    s->column = t.column;
     const bool is_extern = t.text == "extern";
     int depth = 0;
     bool in_body = false;
@@ -662,6 +936,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::Let;
     s->line = t.line;
+    s->column = t.column;
     s->name = fn->fn_name;
     s->expr = std::move(fn);
     return s;
@@ -679,6 +954,7 @@ StmtP Parser::statement() {
       auto s = std::make_unique<Stmt>();
       s->kind = StmtKind::Block;
       s->line = t.line;
+      s->column = t.column;
       s->body = block_body();
       return s;
     }
@@ -689,6 +965,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::If;
     s->line = t.line;
+    s->column = t.column;
     s->expr = expression();
     skip_newlines();
     expect(Tok::LBrace, "'{' after the condition");
@@ -716,6 +993,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::While;
     s->line = t.line;
+    s->column = t.column;
     s->expr = expression();
     skip_newlines();
     expect(Tok::LBrace, "'{' after the condition");
@@ -728,6 +1006,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::ForIn;
     s->line = t.line;
+    s->column = t.column;
     if (check(Tok::Ident)) { s->name = peek().text; advance(); }
     else error_at(peek(), "expected a name after for");
     expect(Tok::In, "'in'");
@@ -743,6 +1022,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = StmtKind::Return;
     s->line = t.line;
+    s->column = t.column;
     if (!check(Tok::Newline) && !check(Tok::RBrace) && !check(Tok::End))
       s->expr = expression();
     return s;
@@ -753,6 +1033,7 @@ StmtP Parser::statement() {
     auto s = std::make_unique<Stmt>();
     s->kind = (t.kind == Tok::Break) ? StmtKind::Break : StmtKind::Continue;
     s->line = t.line;
+    s->column = t.column;
     return s;
   }
 
@@ -761,6 +1042,7 @@ StmtP Parser::statement() {
   auto s = std::make_unique<Stmt>();
   s->kind = StmtKind::Expression;
   s->line = t.line;
+  s->column = t.column;
   s->expr = expression();
   return s;
 }
@@ -770,9 +1052,11 @@ StmtP Parser::entity_declaration() {
   auto s = std::make_unique<Stmt>();
   s->kind = StmtKind::EntityDecl;
   s->line = t.line;
+  s->column = t.column;
 
   auto def = std::make_unique<EntityDef>();
   def->line = t.line;
+  def->column = t.column;
   if (check(Tok::Ident)) {
     def->name = peek().text;
     advance();
@@ -789,9 +1073,10 @@ StmtP Parser::entity_declaration() {
     if (check(Tok::RBrace)) break;
 
     if (check(Tok::On)) {
-      advance();  // eat 'on'
+      const Token on_tok = advance();  // eat 'on'
       auto h = std::make_unique<OnHandler>();
-      h->line = peek().line;
+      h->line = on_tok.line;
+      h->column = on_tok.column;
       if (check(Tok::Ident)) {
         h->event = peek().text;
         advance();

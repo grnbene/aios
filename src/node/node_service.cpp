@@ -131,7 +131,7 @@ std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Co
       for (uint64_t k : ks) w.u64(k);
     }
     w.u32(nodeproto::kFeatureMagic);
-    w.u32(nodeproto::kFeatExecBatch);
+    w.u32(nodeproto::kFeatExecBatch | nodeproto::kFeatDeflate);
   }
   std::vector<std::string> tokens;
   { hal::LockGuard g(mu_); tokens = tokens_; }
@@ -140,6 +140,7 @@ std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Co
   auto s = std::make_shared<Session>();
   s->c = c;
   s->link = make_secure_link(c, *key, false);
+  s->link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
   auto guest = k_.spawn("peer:" + c->peer());
   if (!guest.ok()) { reply_error(*s->link, guest.status(), guest.error().message); return nullptr; }
   s->guest = *guest;
