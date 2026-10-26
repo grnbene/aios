@@ -5744,6 +5744,12 @@ void cmd_fleet(Ctx& c, const Args& a) {
     auto p = need(c.me.relay_hub((uint16_t)to_u64(a[2]), fleet_key_arg(c.r.expand(a[3])), loopback, members, require_attest));
     c.s.vars["hub_port"] = std::to_string(p);
     c.o << "fleet hub up on " << (loopback ? "127.0.0.1:" : "0.0.0.0:") << p << " — members attach here; it keeps the roster and relays circuits, seeing only ciphertext\n";
+  } else if (sub == "identity") {
+    // This machine's own key (stage 1 of docs/design/fleet-identity-keys.md): the public half, for the hub's roster.
+    // The private half stays in <root>/node.identity.
+    const crypto::Point32* pub = c.k.node_public_key();
+    if (!pub) fail(Status::NotFound, "this machine has no node identity: " + c.k.node_key_problem());
+    c.o << "kernel=" << c.k.self().str() << " ed25519=" << hex(ByteSpan(pub->data(), pub->size())) << "\n";
   } else if (sub == "join") {
     if (a.size() < 5) fail(Status::Invalid, "fleet join <hub-host> <hub-port> <cluster-key> [retry] [member-key=<key|@FILE|env:NAME>] [attest=1]   join a fleet through a hub; retry: keep trying while the hub is down; member-key: this member's own attach key, for a hub with a members file; attest=1: present a TPM quote");
     bool retry = false;
@@ -5976,7 +5982,7 @@ void cmd_fleet(Ctx& c, const Args& a) {
     }
     if (!any) c.o << "  (no databases discovered — peers may not be in fleet or not running compute serve sql=1)\n";
   } else {
-    fail(Status::Invalid, "fleet hub|join|run|members|observe|status|slots|watermarks|plan|tick|watch|replicate|replicas|log|db");
+    fail(Status::Invalid, "fleet hub|join|identity|run|members|observe|status|slots|watermarks|plan|tick|watch|replicate|replicas|log|db");
   }
 }
 

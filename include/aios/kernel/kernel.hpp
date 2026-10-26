@@ -23,6 +23,7 @@
 #include "aios/intelligence/intelligence.hpp"
 #include "aios/node/node.hpp"
 #include "aios/fleet/telemetry.hpp"
+#include "aios/crypto/curve25519.hpp"
 #include "aios/fleet/relay.hpp"
 #include "aios/kernel/watchdog.hpp"
 #include <atomic>
@@ -82,6 +83,11 @@ class Kernel : private CapabilityObserver {
 
   // Identity of this kernel instance; persistent across boots at the same root.
   const EntityID& self() const { return self_; }
+  // This machine's Ed25519 identity (<root>/node.identity, readable by this account only), made at first start.
+  // Null when the root could not hold it (the kernel still runs; nothing uses the key yet); node_key_problem() says why.
+  const crypto::Point32* node_public_key() const { return node_key_ok_ ? &node_pub_ : nullptr; }
+  const std::string& node_key_problem() const { return node_key_problem_; }
+  Result<crypto::Sig64> node_sign(ByteSpan message) const;
   uint64_t boot_ns() const { return boot_ns_; }
   uint64_t now() const;
   uint64_t uptime_ns() const;
@@ -255,6 +261,7 @@ class Kernel : private CapabilityObserver {
   Kernel() = default;
   Result<void> init(const KernelConfig& cfg);
   Result<void> load_or_create_identity();
+  void load_or_create_node_key();
   Result<void> replay_authority();
   void issued(const Capability& c) override;
   void revoked(const Capability& c) override;
@@ -292,6 +299,10 @@ class Kernel : private CapabilityObserver {
   std::vector<ByteBuffer> replica_images_;   // parallel to replica_meta_
   mutable hal::Mutex replicas_mu_;
   EntityID self_;
+  crypto::Scalar32 node_seed_{};
+  crypto::Point32 node_pub_{};
+  bool node_key_ok_ = false;
+  std::string node_key_problem_;
   uint64_t boot_ns_ = 0;        // wall clock at boot (a timestamp)
   uint64_t boot_mono_ns_ = 0;   // monotonic clock at boot (what uptime counts from)
   mutable hal::Mutex minds_mu_;
