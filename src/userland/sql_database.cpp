@@ -48509,6 +48509,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_query_memory_waiting", std::to_string(query_memory_waiting())},
       {"Asql_query_memory_waits", std::to_string(metrics_.query_memory_waits.load(std::memory_order_relaxed))},
       {"Asql_row_index_mem_bytes", std::to_string(total_row_index_mem)},
+      {"Asql_pk_runs_to_slots", std::to_string(PkMap::runs_to_slots_count().load(std::memory_order_relaxed))},
       {"Asql_row_index_evictions", std::to_string(metrics_.row_index_evictions.load(std::memory_order_relaxed))},
       {"Asql_row_index_rows_indexed", std::to_string(metrics_.row_index_rows_indexed.load(std::memory_order_relaxed))},
       {"Asql_rss_bytes", std::to_string(rss_bytes)},   // the footprint: on macOS resident + compressed + swapped
@@ -51461,7 +51462,7 @@ void SqlDatabase::row_index_after_erase(const SqlTable& t, std::vector<size_t> e
   // Otherwise the gaps are folded into the ids first (the walk this path
   // takes anyway), and the erased rows are found by value as before.
   if (!ri.gaps.empty()) {
-    for (auto& e : ri.pk_to_row) e.second = ri.row_of(e.second);
+    ri.pk_to_row.remap_values([&](size_t v) { return ri.row_of(v); });   // runs stay runs
     ri.gaps.clear();
   }
   // A big table's index is dropped when the deleted rows' keys are not known:
