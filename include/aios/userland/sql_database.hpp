@@ -15,6 +15,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <functional>
+#include <cstring>
+#include <random>
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -1158,13 +1160,13 @@ class PkMap {
   iterator end() { return iterator{this, slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
-  void clear() { slots_.clear(); skeys_.clear(); count_ = used_ = 0; text_ = false; }
+  void clear() { slots_.clear(); khi_.clear(); count_ = used_ = 0; text_ = false; }
   void reserve(size_t n) { if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
     if (slots_.empty()) return end();
     uint64_t ik = 0;
     if (!text_ && !as_int(key, &ik)) return end();   // no integer key is in a text map's keys? they may: fall through
-    const size_t i = locate(key, ik, false);
+    const size_t i = locate(text_ ? hash_text(key) : Hash{ik, 0}, false);
     return i == npos ? end() : iterator{this, i};
   }
   void erase(const std::string& key) {
@@ -1173,7 +1175,6 @@ class PkMap {
   }
   iterator erase(iterator it) {
     slots_[it.i].state = 2;
-    if (text_) { skeys_[it.i].clear(); skeys_[it.i].shrink_to_fit(); }
     --count_;
     ++it;
     return it;
@@ -1183,29 +1184,31 @@ class PkMap {
     uint64_t ik = 0;
     const bool is_int = as_int(key, &ik);
     if (!text_ && !is_int) to_text();
+    const Hash h = text_ ? hash_text(key) : Hash{ik, 0};
     if ((used_ + 1) * 10 > slots_.size() * 7 || slots_.empty()) rehash(count_ + 1);
-    const size_t i = locate(key, ik, true);
+    const size_t i = locate(h, true);
     if (slots_[i].state == 1) return {iterator{this, i}, false};
     if (slots_[i].state == 0) ++used_;
     slots_[i].state = 1;
-    slots_[i].key = ik;
+    slots_[i].key = h.lo;
     slots_[i].second = (uint32_t)v;
-    if (text_) skeys_[i] = key;
+    if (text_) khi_[i] = h.hi;
     ++count_;
     return {iterator{this, i}, true};
   }
-  size_t memory_bytes() const {
-    size_t b = slots_.capacity() * sizeof(Slot) + skeys_.capacity() * sizeof(std::string);
-    for (const auto& s : skeys_) b += s.capacity();
-    return b;
-  }
+  size_t memory_bytes() const { return slots_.capacity() * sizeof(Slot) + khi_.capacity() * sizeof(uint64_t); }
 
  private:
   static constexpr size_t npos = (size_t)-1;
-  bool text_ = false;                 // keys as text: skeys_ runs beside slots_
+  // A key that is not an integer is held as a 128-bit hash of its text - the slot's `key` and `khi_` beside it -
+  // not as the text: a std::string a slot (32 B, and a heap block past 15 characters) made a composite-key row
+  // ~130 bytes of index, 6 GB across a POS order's tables. Two keys share a hash with a chance of 2^-128 a pair
+  // (~1e-24 over 20M keys), and the seed is drawn per process, so no key can be chosen to meet another's.
+  bool text_ = false;                 // keys as hashes of text: khi_ (the high half) runs beside slots_
   std::vector<Slot> slots_;
-  std::vector<std::string> skeys_;
+  std::vector<uint64_t> khi_;
   size_t count_ = 0, used_ = 0;       // live entries; live plus tombstones
+  struct Hash { uint64_t lo, hi; };
   // "<canonical integer>\x1f": what row_key makes of a single INT key.
   static bool as_int(const std::string& key, uint64_t* v) {
     const size_t n = key.size();
@@ -1230,22 +1233,40 @@ class PkMap {
     k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ull; k ^= k >> 33;
     return k;
   }
-  size_t hash_of(const std::string& key, uint64_t ik) const {
-    return text_ ? std::hash<std::string>{}(key) : (size_t)mix(ik);
+  // Two lanes over the same bytes, each fed the other's state, then finished apart.
+  static Hash hash_text(const std::string& key) {
+    static const uint64_t seed = [] {
+      std::random_device rd;
+      return ((uint64_t)rd() << 32) ^ (uint64_t)rd() ^ 0x9e3779b97f4a7c15ull;
+    }();
+    const unsigned char* p = (const unsigned char*)key.data();
+    const size_t n = key.size();
+    uint64_t a = seed ^ (n * 0x9ddfea08eb382d69ull), b = mix(seed + 0xc2b2ae3d27d4eb4full) + n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      uint64_t w;
+      std::memcpy(&w, p + i, 8);
+      a = (a ^ w) * 0x9ddfea08eb382d69ull; a ^= a >> 47;
+      b = (b + w) * 0xc3a5c85c97cb3127ull; b ^= b >> 43; b += a;
+    }
+    uint64_t w = 0;
+    for (size_t k = 0; i + k < n; ++k) w |= (uint64_t)p[i + k] << (8 * k);
+    a = (a ^ w) * 0x9ddfea08eb382d69ull; a ^= a >> 47;
+    b = (b + w) * 0xc3a5c85c97cb3127ull; b ^= b >> 43; b += a;
+    return Hash{mix(a ^ (b >> 7)), mix(b + (a << 3) + n)};
   }
-  bool same(size_t i, const std::string& key, uint64_t ik) const {
-    return text_ ? skeys_[i] == key : slots_[i].key == ik;
-  }
-  // The slot holding `key`, or - when inserting - the first free slot of its chain.
-  size_t locate(const std::string& key, uint64_t ik, bool for_insert) const {
+  size_t hash_of(const Hash& h) const { return text_ ? (size_t)h.lo : (size_t)mix(h.lo); }
+  bool same(size_t i, const Hash& h) const { return slots_[i].key == h.lo && (!text_ || khi_[i] == h.hi); }
+  // The slot holding the key, or - when inserting - the first free slot of its chain.
+  size_t locate(const Hash& h, bool for_insert) const {
     const size_t mask = slots_.size() - 1;
-    size_t i = hash_of(key, ik) & mask;
+    size_t i = hash_of(h) & mask;
     size_t first_free = npos;
     for (size_t n = 0; n < slots_.size(); ++n, i = (i + 1) & mask) {
       const Slot& s = slots_[i];
       if (s.state == 0) return for_insert ? (first_free == npos ? i : first_free) : npos;
       if (s.state == 2) { if (first_free == npos) first_free = i; continue; }
-      if (same(i, key, ik)) return i;
+      if (same(i, h)) return i;
     }
     return for_insert ? first_free : npos;
   }
@@ -1253,39 +1274,37 @@ class PkMap {
     size_t cap = 16;
     while (cap * 2 < live * 3 + 4) cap <<= 1;   // load at most ~2/3 after a rehash (grows again at 0.7)
     std::vector<Slot> old;
-    std::vector<std::string> old_keys;
+    std::vector<uint64_t> old_hi;
     old.swap(slots_);
-    old_keys.swap(skeys_);
+    old_hi.swap(khi_);
     slots_.assign(cap, Slot{});
-    if (text_) skeys_.assign(cap, std::string());
+    if (text_) khi_.assign(cap, 0);
     count_ = used_ = 0;
     for (size_t i = 0; i < old.size(); ++i) {
       if (old[i].state != 1) continue;
-      const std::string& k = text_ ? old_keys[i] : std::string();
-      const size_t j = locate(k, old[i].key, true);
+      const size_t j = locate(Hash{old[i].key, text_ ? old_hi[i] : 0}, true);
       slots_[j] = old[i];
-      if (text_) skeys_[j] = old_keys[i];
+      if (text_) khi_[j] = old_hi[i];
       ++count_; ++used_;
     }
   }
-  // A key that is not an integer: every key from now on is held as text.
+  // A key that is not an integer: every key from now on is held as a hash of its text.
   void to_text() {
     std::vector<Slot> old;
     old.swap(slots_);
     text_ = true;
     slots_.assign(old.size(), Slot{});
-    skeys_.assign(old.size(), std::string());
-    const size_t live = count_;
+    khi_.assign(old.size(), 0);
     count_ = used_ = 0;
     for (const Slot& s : old) {
       if (s.state != 1) continue;
-      const std::string k = std::to_string((int64_t)s.key) + '\x1f';
-      const size_t j = locate(k, s.key, true);
+      const Hash h = hash_text(std::to_string((int64_t)s.key) + '\x1f');
+      const size_t j = locate(h, true);
       slots_[j] = s;
-      skeys_[j] = k;
+      slots_[j].key = h.lo;
+      khi_[j] = h.hi;
       ++count_; ++used_;
     }
-    (void)live;
   }
 };
 

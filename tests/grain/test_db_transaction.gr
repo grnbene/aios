@@ -1,5 +1,9 @@
-let pass = trim(read_file("/Users/skyblade/Docker/mcp/build/asql-local-root/mysql.pass"))
-let db = db_connect("127.0.0.1", 3307, "root", pass)
+// Needs a MySQL-wire server: scripts/grain-db-check.sh starts a throwaway aios SQL server and sets these.
+let port_s = getenv("GRAIN_TEST_DB_PORT")
+let pass_file = getenv("GRAIN_TEST_DB_PASS_FILE")
+assert_true(port_s != nil and pass_file != nil, "GRAIN_TEST_DB_PORT and GRAIN_TEST_DB_PASS_FILE must be set (run scripts/grain-db-check.sh)")
+let pass = trim(read_file(pass_file))
+let db = db_connect("127.0.0.1", int(port_s), "root", pass)
 assert_true(db.ok, "database must connect")
 
 db_query(db, "CREATE DATABASE IF NOT EXISTS test_tx")

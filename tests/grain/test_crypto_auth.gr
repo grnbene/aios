@@ -10,6 +10,15 @@ assert_true(bcrypt_verify(pass, hash), "valid password must verify")
 assert_false(bcrypt_verify("wrong-password", hash), "wrong password must fail verification")
 assert_false(bcrypt_verify("", hash), "empty password must fail verification")
 
+// Hashes made elsewhere: PHP password_hash ($2y$) and the OpenBSD reference vector ($2b$).
+let php_hash = "$2y$05$HvnnBNDMojwKpaZFA21cJ.6eKtPtOCyTepEdagv9JZZMxSFgtVP5u"
+assert_true(bcrypt_verify("correct horse", php_hash), "a PHP $2y$ hash must verify")
+assert_false(bcrypt_verify("correct horsf", php_hash), "a wrong password against a PHP hash must fail")
+let ref_hash = "$2b$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW"
+assert_true(bcrypt_verify("U*U", ref_hash), "the OpenBSD reference vector must verify")
+assert_false(bcrypt_verify("U*V", ref_hash), "a wrong password against the reference vector must fail")
+assert_false(bcrypt_verify("U*U", "$2x$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW"), "an unknown variant must fail")
+
 // 2. JWT signing and verification
 let secret = "super-secret-key-for-signing-tokens"
 let payload = {

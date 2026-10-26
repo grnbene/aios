@@ -56,4 +56,42 @@ let empty_res = http_parse_multipart("", "")
 assert_true(type(empty_res.form) == "map" and len(keys(empty_res.form)) == 0, "empty input returns empty map")
 assert_true(type(empty_res.files) == "map" and len(keys(empty_res.files)) == 0, "empty input returns empty files")
 
+// filename= before name=: the field is still "attach", not the file's name.
+let b2 = "XyZ123"
+let body2 = "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; filename=\"report.csv\"; name=\"attach\"\r\n\r\n" +
+  "a,b\r\n" +
+  "--" + b2 + "--\r\n"
+let p2 = http_parse_multipart(body2, "multipart/form-data; boundary=" + b2)
+assert_true(has(p2.files, "attach"), "a field named after filename= must keep its own name: " + str(keys(p2.files)))
+assert_eq(p2.files.attach.filename, "report.csv", "and its filename")
+
+// Unquoted parameters (RFC 7578 allows a token): name=note
+let body3 = "--" + b2 + "\r\nContent-Disposition: form-data; name=note\r\n\r\nhi\r\n--" + b2 + "--\r\n"
+assert_eq(http_parse_multipart(body3, b2).form.note, "hi", "an unquoted name parameter")
+
+// The boundary only counts at the start of a line: a file holding the boundary text mid-line stays whole.
+let inner = "data --" + b2 + " more"
+let body4 = "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\n\r\n" +
+  inner + "\r\n" +
+  "--" + b2 + "--\r\n"
+let p4 = http_parse_multipart(body4, b2)
+assert_eq(p4.files.f.size, len(inner), "the boundary text inside a file does not cut it: " + str(p4.files.f.size))
+
+// Repeated name[] fields (several files, or a multi-select) all arrive, as a list under the name without [].
+let body5 = "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; name=\"pics[]\"; filename=\"a.png\"\r\n\r\nAAA\r\n" +
+  "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; name=\"pics[]\"; filename=\"b.png\"\r\n\r\nBB\r\n" +
+  "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; name=\"tags[]\"\r\n\r\nred\r\n" +
+  "--" + b2 + "\r\n" +
+  "Content-Disposition: form-data; name=\"tags[]\"\r\n\r\nblue\r\n" +
+  "--" + b2 + "--\r\n"
+let p5 = http_parse_multipart(body5, b2)
+assert_eq(len(p5.files.pics), 2, "two files under pics[]")
+assert_eq(p5.files.pics[1].filename, "b.png", "in order")
+assert_eq(join(p5.form.tags, ","), "red,blue", "two values under tags[]")
+
 print("PASS: test_multipart")
