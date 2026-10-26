@@ -2,7 +2,7 @@
 
 **ASQL** is the high-performance, in-memory relational SQL database engine built natively into **AIOS** (All-In-One System) in dependency-free C++20.
 
-It combines the raw speed of in-memory columnar indexing with broad MariaDB/MySQL dialect coverage (see Known gaps below), wire-protocol compatibility, and real-time zero-copy MySQL Binlog CDC (Change Data Capture) replication.
+It combines the raw speed of in-memory columnar indexing with broad MariaDB/MySQL dialect coverage (see [Engine Capabilities & Differences](#1-engine-capabilities--differences-from-mariadb--innodb)), wire-protocol compatibility, and real-time zero-copy MySQL Binlog CDC (Change Data Capture) replication.
 
 ---
 

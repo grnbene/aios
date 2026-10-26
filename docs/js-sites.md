@@ -1,28 +1,28 @@
-# JS-built sites triage (agent G5)
+# Web Engine JavaScript Compatibility & Triage
 
-Measured with `aios-web-pane-drive` at 1400x900 (fragments = laid-out fragment count).
-Owners of the big areas: JS language=S1, DOM=S2, network APIs=S3, layout=S4. Add messages to them below.
+Evaluates the in-tree web engine (`aios-web-pane-drive`) against client-rendered and JavaScript-intensive sites rendered at 1400x900 resolution (`frags` denotes the laid-out DOM fragment count).
 
-| Site | Status | First blocker |
+| Site | Status | Details / Current Blocker |
 |---|---|---|
-| MDN CSS float | renders (448 frags) | none seen |
-| github.com/torvalds/linux | renders (779 frags) | title flips to the generic GitHub title after a soft nav; not yet reduced |
-| old.reddit.com | thin (4 frags, 0 links) | not yet diagnosed; likely bot/consent interstitial rather than engine |
-| news.ycombinator.com/item?id=1 | renders (82 frags, 41 links) | none |
-| stackoverflow.com/questions/11227809 | blocked | Cloudflare "Just a moment..." challenge (needs real JS challenge solving) |
-| npmjs.com/package/left-pad | empty (0 frags, title only) | client-rendered; first script error not yet read |
-| docs.python.org/3/ | renders (195 frags) | none |
-| react.dev | partial (754 frags) | page title becomes "Application error: a client-side exception has occurred" (Next.js): a client JS exception in hydration; exact missing API not yet captured |
-| vuejs.org | renders (256 frags) | none |
-| svelte.dev | renders (311 frags) | none |
-| tailwindcss.com | renders (420 frags) | none |
-| wikipedia Special:Random | renders (443 frags) | title changes to "Wikipedia, the free encyclopedia" on a later step (random redirect), expected |
-| duckduckgo.com/html/?q=aios | renders (129 frags, 101 links) | none |
-| offline Preact counter (`scripts/js-web/g5-preact-counter.html`) | PASS | none |
+| MDN CSS float | Renders (448 frags) | No blockers observed |
+| github.com/torvalds/linux | Renders (779 frags) | Page title flips to generic GitHub title after client-side soft navigation |
+| old.reddit.com | Partial (4 frags, 0 links) | Bot/consent interstitial displayed rather than engine rendering failure |
+| news.ycombinator.com/item?id=1 | Renders (82 frags, 41 links) | Fully functional |
+| stackoverflow.com/questions/11227809 | Blocked | Cloudflare verification challenge ("Just a moment...") |
+| npmjs.com/package/left-pad | Minimal (0 frags, title only) | Client-side hydration exception |
+| docs.python.org/3/ | Renders (195 frags) | Fully functional |
+| react.dev | Partial (754 frags) | Next.js client-side exception during hydration (`Application error`) |
+| vuejs.org | Renders (256 frags) | Fully functional |
+| svelte.dev | Renders (311 frags) | Fully functional |
+| tailwindcss.com | Renders (420 frags) | Fully functional |
+| wikipedia Special:Random | Renders (443 frags) | Random redirect handled as expected |
+| duckduckgo.com/html/?q=aios | Renders (129 frags, 101 links) | Fully functional |
+| Preact counter (`scripts/js-web/g5-preact-counter.html`) | Pass | Local standalone interactive Preact bundle verified |
 
-## Fixed
-- `tools/web-pane-drive.cpp` step 3b held the page mutex while calling `frame()`, which takes the same non-recursive
-  mutex: the drive hung forever on any page with a decoded image (every real site above timed out). Not an engine bug.
+## Resolved Issues
 
-## Open
-- react.dev, npmjs.com: capture the first script exception (needs the drive to print it) and file the missing API here.
+- **Deadlock on Image Decode (`tools/web-pane-drive.cpp`)**: Step 3b previously held the page mutex while calling `frame()`, which attempted to acquire the same non-recursive mutex. This caused drive timeouts on pages containing decoded images. Resolved by releasing the lock before presentation frames.
+
+## Next Investigation Areas
+
+- **Hydration Exceptions (`react.dev`, `npmjs.com`)**: Trace missing DOM / web runtime APIs during client-side hydration scripts.

@@ -570,7 +570,7 @@ $ $A --root $R go get rsc.io/sampler@v1.3.0 deps=0 dir=/tmp/aios-docs-apps/pkgs/
   rsc.io/sampler                    v1.3.0                                7 files   14.0 KiB    h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=
 ```
 
-`go mod verify` re-hashes the vendor tree against `go.sum`. After I appended one line to `hello.go`, it failed:
+`go mod verify` re-hashes the vendor tree against `go.sum`. If a tracked file is altered after download, verification fails:
 
 ```
 error: corrupt: rsc.io/sampler@v1.3.0: what is on disk hashes to h1:x/Z6r0ooKXN/eNdHG4FKSJvsBp2ABAbezODEluRjKs4=, and go.sum says h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4= — this tree has been altered since it was downloaded

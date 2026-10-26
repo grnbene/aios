@@ -4,24 +4,17 @@ Build one portable binary, install it on any host with two commands.
 
 ## Why it is built the way it is
 
-**glibc is only backward compatible.** The four target hosts are not on the same
-version:
+**glibc is only backward compatible.** Target deployment hosts across clusters span different glibc floors:
 
-| host     | OS              | glibc | systemd | MariaDB  |
-|----------|-----------------|-------|---------|----------|
-| chi-il-1 | AlmaLinux 9.7   | 2.34  | 252     | 10.11.15 |
-| atl-ga-1 | AlmaLinux 9.7   | 2.34  | 252     | 10.11.15 |
-| km       | AlmaLinux 8.10  | 2.28  | 239     | 10.3.39  |
-| sn       | CentOS 7        | 2.17  | 219     | 10.9.8   |
+| Host / Target Group | OS              | glibc | systemd | MariaDB  |
+|---------------------|-----------------|-------|---------|----------|
+| `chi-il-1`, `atl-ga-1` (primary hosts) | AlmaLinux 9.7   | 2.34  | 252     | 10.11.15 |
+| `km` (secondary hosts)                 | AlmaLinux 8.10  | 2.28  | 239     | 10.3.39  |
+| `sn` (legacy hosts)                    | CentOS 7        | 2.17  | 219     | 10.9.8   |
 
-A binary built on AlmaLinux 9 will not start on `km` or `sn`. One built on arch
-(Ubuntu 24.04, glibc 2.39) starts on none of them. So the build happens on an
-el7 host, against the 2.17 floor, and the single artifact runs everywhere.
+A binary built on AlmaLinux 9 will not start on older hosts like `km` or `sn`. One built on newer distributions (e.g. Ubuntu 24.04, glibc 2.39) starts on none of them. Therefore, the release build is compiled against the glibc 2.17 baseline so that a single artifact runs across all hosts.
 
-`sn` cannot build its own — it has gcc 4.8.5, no devtoolset and no cmake. The
-builder is any el7 box with devtoolset-11 (GCC 11.2.1) and cmake3 3.17.5, named
-with `BUILDER=`; there is no default. Use `devops`, never `aat` (production).
-It only ever writes to the builder's `/tmp`.
+Legacy CentOS 7 hosts cannot build the binary directly: CentOS 7 ships with GCC 4.8.5 without modern toolsets. Builds should be produced either in Docker (via `build-centos7.sh`), or on a dedicated EL7 build host with devtoolset-11 (GCC 11.2+) and cmake3 3.17.5+ via `BUILDER=<host>` (e.g. `devops`; never build on production hosts). Builds only write to `/tmp` on the builder.
 
 The link is `-static-libstdc++ -static-libgcc`, **not** fully static:
 `src/compute/opencl_device.cpp:341` documents that a statically linked build

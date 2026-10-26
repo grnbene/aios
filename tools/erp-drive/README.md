@@ -22,7 +22,7 @@ Always compare against the previous binary on its own copy of the same root.
 
 ## Against MariaDB (same data, same schema)
 
-Load st's real schema (`ssh st mysqldump --no-data summitholding`) and the ASQL
+Load the reference production schema (`ssh <host> mysqldump --no-data <db>`) and the ASQL
 copy's rows into a local MariaDB (mysqldump from ASQL piped into mysql), then:
 
 - `php race.php STMT_DIR [N]` - every ERP statement on both, per-statement
