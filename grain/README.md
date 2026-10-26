@@ -47,7 +47,7 @@ For the complete function-by-function reference of all 440+ builtins with parame
 | Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); TCP/UDP sockets; a small server (`listen`, `accept`, `read_until`, `write`) |
 | Strings | escapes `\n \t \r \0 \a \b \f \v \e`, `\xHH` (one byte), `\u{1F600}` (a code point, as UTF-8); `utf8_valid(text or bytes)` |
 | Text | `format("{:>8.2f}", x)`, `regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split` (ECMAScript patterns), `upper`, `lower`, `trim`, `split`, `join`, `replace`, `pad_left`, ... |
-| Data | `json_parse`, `json_stringify(v, {indent, ascii, escape_slashes})` (ascii: `\uXXXX` past ASCII; escape_slashes: `\/`; both is PHP's `json_encode`), `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `key_by(list, fn)` (first item per key), `sum_by(list, key_fn, value_fn)`, `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
+| Data | `json_parse`, `json_stringify(v, {indent, ascii, escape_slashes})` (ascii: `\uXXXX` past ASCII; escape_slashes: `\/`; both is PHP's `json_encode`), `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `key_by(list, fn)` (first item per key), `sum_by(list, key_fn, value_fn)`, `compact(list)` (without its nils), `unique(list)` (first seen kept), `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
 | Numbers in text | `is_numeric(v)` (a number, or a string that is one and nothing more), `to_number(v, [default])` (a string by the number it starts with: `to_number("12.50abc")` is `12.50`) |
 | Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
 | Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_cbc_decrypt(key, iv, data)` (PKCS#7, what `openssl_decrypt` reads; nil when the padding is wrong) and `hash_equals(a, b)` (in constant time, for secrets) |
@@ -284,6 +284,21 @@ print($"[{7:>5}] {{braces}}")                      # [    7] {braces}
 let params = ["A1", 3]
 let rows = read_raw(sql, ...params)               # read_raw(sql, "A1", 3)
 let all = [0, ...params, 9]                       # [0, "A1", 3, 9]; spreading anything but a list is an error
+
+# ?? : the left side unless it is nil (false, 0 and "" are values); the right side is only evaluated when needed
+let limit = settings?.limit ?? 100
+
+# match: the first arm whose pattern == the subject; several patterns per arm; `_` takes the rest (nil without it)
+let kind = match table {
+  "salesorders" => "so",
+  "rgaorders", "rgaorderdetails" => "rga",
+  _ => "other"
+}
+match op {                                        # as a statement, an arm may be a block
+  "insert" => { let n = len(rows)
+                push(log, n) }
+  _ => {}
+}
 
 # Optional chaining (?.): nil, or anything that is not a map, gives nil instead of an error
 let token = req?.headers?.authorization

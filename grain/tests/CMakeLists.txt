@@ -95,6 +95,10 @@ add_test(NAME grain.lang.spread COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/
 add_test(NAME grain.lang.number_format COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_number_format.gr)
 add_test(NAME grain.lang.php_style_builtins COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_php_style_builtins.gr)
 add_test(NAME grain.lang.on_machine COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_on_machine.gr)
+add_test(NAME grain.lang.match_coalesce COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_match_coalesce.gr)
+add_test(NAME grain.lang.spread_jit COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)
+add_test(NAME grain.lang.spread_jit.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)
+add_test(NAME grain.lang.match_coalesce.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_match_coalesce.gr)
 
 
 # The HTTP client against a local server (tests/net): needs Python 3 to run the

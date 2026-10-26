@@ -1,0 +1,103 @@
+# `a ?? b` (a unless it is nil) and `match` (the first arm whose pattern == the subject), at top level, in a
+# function, in a closure, nested, as a call's argument, and as a statement whose arms are blocks with locals.
+fn check(c, msg) { assert_true(c, msg) }
+
+# ---- ?? ----
+let none = nil
+check((none ?? 5) == 5, "nil takes the right side")
+check((3 ?? 5) == 3, "a value stays")
+check((false ?? 5) == false, "false is a value, not nil")
+check((0 ?? 5) == 0, "0 is a value")
+check(("" ?? "x") == "", "an empty string is a value")
+check((none ?? none ?? 7) == 7, "chained")
+let calls = 0
+fn bump() { calls = calls + 1; return 9 }
+let k = 1 ?? bump()
+check(k == 1 and calls == 0, "the right side is not evaluated when the left is a value")
+let m = {"a": 1}
+check((m.b ?? 2) == 2 and (m.a ?? 2) == 1, "a missing key")
+check((m?.x?.y ?? "deep") == "deep", "with ?.")
+check((none ?? 1) + 1 == 2, "?? binds looser than +: (none ?? 1) + 1")
+check(none ?? false or true, "?? is looser than or: none ?? (false or true)")
+
+# ---- match as a value ----
+fn kind(t) {
+  return match t {
+    "salesorders" => "so",
+    "rgaorders", "rgaorderdetails" => "rga"
+    _ => "other"
+  }
+}
+check(kind("salesorders") == "so", "first arm")
+check(kind("rgaorderdetails") == "rga", "second pattern of an arm")
+check(kind("zzz") == "other", "_")
+let nothing = match 4 { 1 => "one", 2 => "two" }
+check(nothing == nil, "no arm and no _: nil")
+let n = 3
+check((match n + 1 { 2 * 2 => "four", _ => "?" }) == "four", "patterns are expressions")
+let seen = 0
+fn subject() { seen = seen + 1; return "b" }
+let r = match subject() { "a" => 1, "b" => 2, "c" => 3 }
+check(r == 2 and seen == 1, "the subject is evaluated once")
+check(str(match 1 { 1 => "x", _ => "y" }) + "!" == "x!", "inside a larger expression")
+fn pair(a, b) { return a + b }
+check(pair(match 2 { 2 => 10, _ => 0 }, match "q" { "q" => 5 }) == 15, "as call arguments (stack temporaries under it)")
+check((match 1 { 1 => match "z" { "z" => "nested", _ => "" }, _ => "" }) == "nested", "nested")
+
+# in a closure, a pattern and an arm reading captured locals
+fn make(limit) {
+  let label = "big"
+  return fn (x) { return match x > limit { true => label, false => "small" } }
+}
+let f = make(10)
+check(f(11) == "big" and f(3) == "small", "in a closure")
+
+# ---- match as a statement, block arms with locals ----
+fn stmt_form(t) {
+  let before = "kept"
+  let out = []
+  match t {
+    "a" => {
+      let x = 1
+      let y = x + 1
+      push(out, y)
+    }
+    "b", "c" => push(out, "bc")
+    _ => {
+      let z = before + "!"
+      push(out, z)
+    }
+  }
+  let after = before + "?"
+  push(out, after)
+  return out
+}
+check(stmt_form("a")[0] == 2 and stmt_form("a")[1] == "kept?", "block arm with locals, the function's locals intact")
+check(stmt_form("c")[0] == "bc", "expression arm in a statement")
+check(stmt_form("q")[0] == "kept!", "_ block reads an outer local")
+
+# break and continue inside a block arm
+let picked = []
+for i in 0..10 {
+  match i % 4 {
+    0 => { continue }
+    3 => { break }
+    _ => { push(picked, i) }
+  }
+}
+check(len(picked) == 2 and picked[0] == 1 and picked[1] == 2, "continue and break from block arms: " + str(picked))
+
+# top-level statement match
+let top = []
+match "x" {
+  "x" => { let w = 5
+    push(top, w) }
+}
+check(len(top) == 1 and top[0] == 5, "top-level statement match")
+
+# a hot loop (the JIT compiles these functions; the answers must be the interpreter's)
+fn classify(i) { return match i % 3 { 0 => "fizz", 1 => nil, _ => "x" } ?? "one" }
+let counts = {"fizz": 0, "one": 0, "x": 0}
+for i in 0..30000 { let c = classify(i); counts[c] = counts[c] + 1 }
+check(counts.fizz == 10000 and counts.one == 10000 and counts.x == 10000, "hot loop: " + str(counts))
+print("match and ?? ok")

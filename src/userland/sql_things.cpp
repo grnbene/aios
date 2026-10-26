@@ -719,7 +719,7 @@ const std::vector<std::string>& grain_allowed() {
   static const std::vector<std::string> names = {
       "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "sort", "reverse", "map",
       "filter", "reduce", "each", "for_each", "any", "all", "find_if", "flatten", "concat", "insert", "remove_at",
-      "zip", "enumerate", "take", "drop", "count", "unique", "dedup", "keys", "values", "has", "del", "merge",
+      "zip", "enumerate", "take", "drop", "count", "unique", "dedup", "compact", "keys", "values", "has", "del", "merge",
       "entries", "from_entries", "split", "join", "upper", "lower", "find", "replace", "slice", "ord", "chr", "trim",
       "ltrim", "rtrim", "starts_with", "ends_with", "contains", "index_of", "last_index_of", "pad_left", "pad_right",
       "repeat", "char_at", "chars", "is_digit", "is_alpha", "is_alnum", "is_space", "abs", "min", "max", "floor",

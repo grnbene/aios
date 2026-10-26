@@ -105,4 +105,13 @@ eq(sums["C"], 0, "sum_by: a nil value counts as nothing")
 eq(sum_by([1, 2, 3, 4], fn (x) { return x % 2 }, fn (x) { return x })["1"], 4, "sum_by ints")
 let nb = pcall(fn () { return sum_by([1], fn (x) { return 1 }, fn (x) { return "s" }) })
 check(not nb.ok, "sum_by refuses a non-number")
+# ---- compact, and unique's string path (first seen kept, in order) ----
+let cm = compact([nil, "a", nil, 0, false, "", nil])
+eq(len(cm), 4, "compact keeps 0, false and empty strings")
+eq(cm[0], "a", "compact keeps order")
+eq(unique(["b", "a", "b", "c", "a"]), ["b", "a", "c"], "unique strings, first seen order")
+eq(unique([1, 1.0, "1", 2]), [1, "1", 2], "unique mixed: 1 and 1.0 are one value, the string another")
+let many = []
+for i in 0..20000 { push(many, "K" + str(i % 5000)) }
+eq(len(unique(many)), 5000, "unique over 20,000 strings")
 print("php-style builtins ok")

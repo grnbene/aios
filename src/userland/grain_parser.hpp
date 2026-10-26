@@ -34,6 +34,9 @@ class Parser {
   ExprP list_literal();
   // `...` written together (three `.` tokens side by side) before an argument or list element: eats it.
   bool match_spread();
+  // `match x { ... }`, as a value or (as_statement) a statement whose arms may be blocks
+  ExprP match_expr(bool as_statement);
+  bool no_brace_call_ = false;   // while a match subject is read: `x {` is not a call of x with a map
   ExprP map_literal();
   ExprP lambda();
 

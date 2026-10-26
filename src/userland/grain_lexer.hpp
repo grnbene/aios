@@ -21,7 +21,8 @@ enum class Tok : uint8_t {
   EqEq, BangEq, Lt, LtEq, Gt, GtEq,
   LParen, RParen, LBrace, RBrace, LBracket, RBracket,
   Comma, Dot, Colon, ColonColon, Question, QuestionDot,
-  Entity, On
+  Entity, On,
+  Match, QuestionQuestion, FatArrow   // `match x { a => ... }`, `a ?? b`
 };
 
 const char* tok_name(Tok t);

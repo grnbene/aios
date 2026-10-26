@@ -25,7 +25,7 @@ const Keyword KEYWORDS[] = {
   {"in", Tok::In}, {"fn", Tok::Fn}, {"return", Tok::Return},
   {"break", Tok::Break}, {"continue", Tok::Continue}, {"let", Tok::Let},
   {"true", Tok::True}, {"false", Tok::False}, {"nil", Tok::NilLit},
-  {"entity", Tok::Entity}, {"on", Tok::On},
+  {"entity", Tok::Entity}, {"on", Tok::On}, {"match", Tok::Match},
 };
 
 }  // namespace
@@ -65,6 +65,7 @@ const char* tok_name(Tok t) {
     case Tok::Question: return "?";
     case Tok::QuestionDot: return "?.";
     case Tok::Entity: return "entity"; case Tok::On: return "on";
+    case Tok::Match: return "match"; case Tok::QuestionQuestion: return "??"; case Tok::FatArrow: return "=>";
     case Tok::Error: return "bad character";
   }
   return "?";
@@ -420,9 +421,12 @@ Token Lexer::next() {
       return Token{Tok::Colon, "", 0, 0, start_line, start_col};
     case '?':
       if (peek() == '.') { advance(); return Token{Tok::QuestionDot, "?.", 0, 0, start_line, start_col}; }
+      if (peek() == '?') { advance(); return Token{Tok::QuestionQuestion, "??", 0, 0, start_line, start_col}; }
       return Token{Tok::Question, "", 0, 0, start_line, start_col};
     case ';': return Token{Tok::Newline, "", 0, 0, start_line, start_col};
-    case '=': return two('=', Tok::EqEq, Tok::Assign);
+    case '=':
+      if (peek() == '>') { advance(); return Token{Tok::FatArrow, "=>", 0, 0, start_line, start_col}; }
+      return two('=', Tok::EqEq, Tok::Assign);
     case '<':
       if (peek() == '<') {
         advance();
