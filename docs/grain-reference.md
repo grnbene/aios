@@ -305,6 +305,9 @@ ECMAScript-compatible regular expression operations.
 |---|---|---|
 | `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. |
 | `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. |
+| `xml_parse` | `xml_parse(xml_str)` | Parses XML into nested map `{tag, attrs, children, text}` with entity decoding and CDATA support. |
+| `xml_escape` | `xml_escape(str)` | Escapes special XML characters (`&`, `<`, `>`, `"`, `'`). |
+| `xml_unescape` | `xml_unescape(str)` | Unescapes standard and numeric XML entities (e.g. `&amp;`, `&#x2603;`). |
 | `base64_encode` | `base64_encode(str_or_bytes)` | Encodes string or bytes to standard Base64. |
 | `base64_decode` | `base64_decode(b64_str)` | Decodes Base64 string to original UTF-8 string. |
 | `hex_encode` | `hex_encode(str_or_bytes)` | Encodes input into lowercase hexadecimal string. |
