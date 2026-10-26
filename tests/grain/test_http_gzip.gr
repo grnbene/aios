@@ -1,0 +1,33 @@
+// The HTTP client and gzip: it asks for gzip and undoes it; it can be told not to; damaged gzip and a body that would
+// inflate past max_bytes are errors. Needs tests/grain/net/gzip_server.py: run scripts/grain-net-check.sh.
+fn check(c, msg) { assert_true(c, msg) }
+let port = getenv("GRAIN_TEST_HTTP_PORT")
+check(port != nil, "GRAIN_TEST_HTTP_PORT must be set (run scripts/grain-net-check.sh)")
+let base = "http://127.0.0.1:" + port
+
+let r = http_get(base + "/gz")
+check(r.ok, "GET /gz")
+let doc = json_parse(r.body)
+check(contains(doc.asked, "gzip"), "the client asked for gzip: " + doc.asked)
+check(len(doc.items) == 500, "and the body came back decoded")
+check(!has(r.headers, "content-encoding"), "the content-encoding header is dropped once decoded")
+
+let raw = http_get(base + "/gz", {"decompress": false})
+check(json_parse(raw.body).asked == "", "decompress: false does not ask for gzip")
+
+let mine = http_get(base + "/gz", {"headers": {"Accept-Encoding": "identity"}})
+check(json_parse(mine.body).asked == "identity", "a caller's own Accept-Encoding is kept")
+
+check(http_get(base + "/plain").body == "plain body", "a plain response is untouched")
+
+let bomb = pcall(http_get, base + "/bomb", {"max_bytes": 1048576})
+check(!bomb.ok and contains(bomb.error, "size limit"), "a body past max_bytes is refused: " + str(bomb.error))
+let big = http_get(base + "/bomb", {"max_bytes": 67108864})
+check(len(big.body) == 67108864, "within max_bytes it inflates")
+
+let bad = pcall(http_get, base + "/badgz")
+check(!bad.ok and contains(bad.error, "gzip"), "a damaged gzip body is an error: " + str(bad.error))
+
+fn fetch_items(u) { return len(json_parse(http_get(u).body).items) }
+check(fetch_items(base + "/gz") == 500, "in a function")
+print("PASS: test_http_gzip")

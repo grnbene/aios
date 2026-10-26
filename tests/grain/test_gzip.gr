@@ -1,0 +1,59 @@
+// gzip / gunzip: the in-tree deflate in RFC 1952 framing. Round trips, streams made by the system gzip(1), damaged
+// and truncated input, the size limit, at top level, in a function and in a closure.
+fn check(c, msg) { assert_true(c, msg) }
+
+// Round trips, strings and bytes, every level.
+let text = repeat("the sticker feed, again and again. ", 2000)
+for level in 1..10 {
+  let z = gzip(text, level)
+  check(type(z) == "bytes", "gzip gives bytes")
+  check(bytes_str(gunzip(z)) == text, "level " + str(level) + " round trips")
+}
+check(len(gzip(text)) < len(text) / 10, "repetitive text shrinks: " + str(len(gzip(text))) + " of " + str(len(text)))
+let bin = bytes_from_hex("00ff10ef7f80")
+check(bytes_hex(gunzip(gzip(bin))) == "00ff10ef7f80", "bytes round trip")
+check(len(gunzip(gzip(""))) == 0, "empty round trips")
+let z = gzip("abc")
+check(bytes_hex(bytes_from_hex(slice(bytes_hex(z), 0, 4))) == "1f8b", "the gzip magic")
+
+// Streams the system gzip made: one member, and two members concatenated (one stream).
+let sys1 = bytes_from_hex("1f8b0800000000000203cb48cdc9c957482bcacf5528ae2c2e49cd5548afca2ce0020045f2e30717000000")
+check(bytes_str(gunzip(sys1)) == "hello from system gzip\n", "a stream made by gzip(1)")
+let sys2 = bytes_from_hex("1f8b08000000000000032b482c2a51c8cf4be502000ca13df9090000001f8b08000000000000032b482c2a512829cfe70200e7013d9709000000")
+check(bytes_str(gunzip(sys2)) == "part one\npart two\n", "two members read as one stream")
+
+// Damage is an error, never a partial result.
+let hex = bytes_hex(sys1)
+let bad_crc = bytes_from_hex(slice(hex, 0, len(hex) - 16) + "00000000" + slice(hex, len(hex) - 8, len(hex)))
+let r1 = pcall(gunzip, bad_crc)
+check(!r1.ok and contains(r1.error, "CRC"), "a wrong CRC: " + str(r1.error))
+let r2 = pcall(gunzip, bytes_from_hex(slice(hex, 0, 40)))
+check(!r2.ok, "a truncated stream")
+let r3 = pcall(gunzip, "plain text, not gzip")
+check(!r3.ok and contains(r3.error, "not gzip"), "not gzip: " + str(r3.error))
+let r4 = pcall(gunzip, bytes_from_hex(hex + "41"))
+check(!r4.ok, "garbage after the stream")
+
+// The size limit: 8 MB of zeros is a few KB compressed; it inflates only up to max_bytes.
+let bomb = gzip(bytes(8 * 1024 * 1024))
+check(len(bomb) < 64 * 1024, "8 MB of zeros compresses small: " + str(len(bomb)))
+let r5 = pcall(gunzip, bomb, 1024 * 1024)
+check(!r5.ok and contains(r5.error, "size limit"), "past max_bytes is refused: " + str(r5.error))
+check(len(gunzip(bomb, 8 * 1024 * 1024)) == 8 * 1024 * 1024, "at the limit it inflates")
+check(!pcall(gzip, "x", 0).ok and !pcall(gzip, "x", 10).ok, "level is 1 to 9")
+check(!pcall(gzip, 42).ok, "gzip of a number is an error")
+
+// In a function and a closure.
+fn pack(s) { return gzip(s, 9) }
+fn unpack_all(list) {
+  let out = []
+  for item in list { push(out, bytes_str(gunzip(item))) }
+  return out
+}
+let packed = [pack("a"), pack("bb"), pack(text)]
+let back = unpack_all(packed)
+check(back[0] == "a" and back[1] == "bb" and back[2] == text, "in functions")
+let make = fn (lvl) { return fn (s) { return bytes_str(gunzip(gzip(s, lvl))) } }
+check(make(3)("closure") == "closure", "in a closure")
+
+print("PASS: test_gzip")

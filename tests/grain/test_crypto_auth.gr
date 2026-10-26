@@ -50,7 +50,7 @@ let expired_payload = {
 let expired_token = jwt_sign(expired_payload, secret)
 let expired_res = jwt_verify(expired_token, secret)
 assert_false(expired_res.ok, "expired token must fail verification")
-assert(find(expired_res.error, "expired") != nil, "error message must mention expired")
+assert(contains(expired_res.error, "expired"), "error message must mention expired")
 
 // expires_in: iat and exp are set; the caller's map is left as it was.
 let base = {"sub": "ttl_user"}
@@ -67,7 +67,7 @@ assert_false(pcall(jwt_verify, ttl_tok, "").ok, "jwt_verify refuses an empty sec
 // exp that is not a number is a malformed token, not "never expires".
 let str_exp = jwt_verify(jwt_sign({"exp": "tomorrow"}, secret), secret)
 assert_false(str_exp.ok, "a string exp must fail")
-assert(find(str_exp.error, "exp is not a number") != nil, "and say why: " + str_exp.error)
+assert(contains(str_exp.error, "exp is not a number"), "and say why: " + str_exp.error)
 
 // A token another HS256 implementation made (Python's hmac + base64url) verifies here.
 let ext = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJleHQiLCJuIjo3fQ.Imm70eFxOJbJK94iT8rX7qvV35_MPPpgbaqfqVqPp6I"

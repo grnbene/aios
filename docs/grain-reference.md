@@ -240,6 +240,8 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 | `bytes_get` | `bytes_get(buf, offset, type)` | Reads typed value from `offset`. Types: `"u8"`, `"i8"`, `"u16le"`, `"u16be"`, `"i32le"`, `"u32be"`, `"i64le"`, `"u64le"`, `"f32le"`, `"f64be"`. |
 | `bytes_set` | `bytes_set(buf, offset, type, val)` | Writes typed value at `offset` in buffer. |
 | `bytes_str` | `bytes_str(buf, [offset, [len]])` | Converts buffer slice to a UTF-8 string. |
+| `gzip` | `gzip(data, [level=6])` | Compresses a string or bytes to gzip (RFC 1952) bytes with the in-tree deflate; level 1 (quick) to 9 (smallest). |
+| `gunzip` | `gunzip(data, [max_bytes=64MB])` | The bytes a gzip stream holds (every member, each CRC-32 checked); an error on damaged data or past `max_bytes`. `bytes_str(gunzip(x))` for text. |
 | `bytes_hex` | `bytes_hex(buf)` | Encodes buffer as lowercase hex string. |
 | `bytes_from_hex`| `bytes_from_hex(hex_str)` | Decodes hex string into a `bytes` buffer. |
 | `bytes_fill` | `bytes_fill(buf, byte_val, [offset, [len]])` | Fills buffer range with a repeated byte. |
@@ -366,6 +368,7 @@ ECMAScript-compatible regular expression operations.
 | `http_get` | `http_get(url, [options])` | Performs HTTP/HTTPS GET request. Returns `{status, body, headers, ok}`. |
 | `http_post` | `http_post(url, body, [options])` | Performs HTTP/HTTPS POST request with payload. |
 | `http_request` | `http_request(options_map)` | Full request: `{"url": ..., "method": "PUT", "headers": {...}, "body": ...}`. |
+| | | The HTTP calls ask for gzip and undo it (the response then reads as plain, its `content-encoding` header dropped). Options: `decompress: false` to get the body as sent, `max_bytes` (default 64 MB) for how large a gzip body may inflate. A grain app served by `aios serve` gzips text-like responses of 1 KB or more for clients that accept it. |
 | `http_parse_multipart` | `http_parse_multipart(body, content_type_or_boundary)` | Parses RFC 7578 multipart form payloads into `{"form": {...}, "files": {...}}` with strict path traversal stripping and size guards. |
 
 ### Server-Sent Events (SSE) Client

@@ -1,6 +1,7 @@
 #include "aios/net/deflate.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <vector>
 
@@ -441,7 +442,8 @@ const uint8_t  kDistExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,
 
 }  // namespace
 
-bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* end_offset, size_t expect, std::string* why) {
+bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* end_offset, size_t expect, std::string* why,
+                      size_t max_out) {
   auto fail = [&](const char* w) { if (why) *why = w; return false; };
   if (offset > whole.size()) return fail("inflate past the end of the buffer");
   ByteSpan data = whole.subspan(offset);
@@ -460,6 +462,7 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
       uint32_t len = (uint32_t)br.d[br.pos] | ((uint32_t)br.d[br.pos + 1] << 8);
       br.pos += 4;
       if (br.pos + len > br.d.size()) return fail("stored block runs past end");
+      if (out.size() + len > max_out) return fail("inflates past the size limit");
       out.insert(out.end(), br.d.begin() + br.pos, br.d.begin() + br.pos + len);
       br.pos += len;
     } else if (type == 1 || type == 2) {
@@ -512,7 +515,11 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
       for (;;) {
         int sym = huff_decode(br, *lit);
         if (sym < 0 || br.bad) return fail("bad literal/length symbol");
-        if (sym < 256) { out.push_back((uint8_t)sym); continue; }
+        if (sym < 256) {
+          if (out.size() >= max_out) return fail("inflates past the size limit");
+          out.push_back((uint8_t)sym);
+          continue;
+        }
         if (sym == 256) break;
         sym -= 257;
         if (sym >= 29) return fail("invalid length symbol");
@@ -522,6 +529,7 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
         uint32_t d = kDistBase[dsym] + br.bits(kDistExtra[dsym]);
         if (d > out.size()) return fail("distance before start of output");
         const size_t at = out.size(), from = at - d;
+        if (at + len > max_out) return fail("inflates past the size limit");
         out.resize(at + len);
         uint8_t* o = out.data();
         if (d >= len) std::memcpy(o + at, o + from, len);            // the two ranges are apart
@@ -537,6 +545,74 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
   return true;
 }
 
+
+uint32_t crc32_ieee(ByteSpan data, uint32_t running) {
+  static const auto table = [] {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t n = 0; n < 256; ++n) {
+      uint32_t c = n;
+      for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      t[n] = c;
+    }
+    return t;
+  }();
+  uint32_t c = running ^ 0xFFFFFFFFu;
+  for (uint8_t b : data) c = table[(c ^ b) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+ByteBuffer gzip_encode(ByteSpan data, int level) {
+  ByteBuffer out = {0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF};   // deflate, no name, no time, OS unknown
+  out.reserve(data.size() / 2 + 32);
+  deflate_raw_append(data, level, out);
+  const uint32_t crc = crc32_ieee(data), size = static_cast<uint32_t>(data.size());
+  for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+  for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(size >> (8 * i)));
+  return out;
+}
+
+bool gzip_decode(ByteSpan data, ByteBuffer& out, size_t max_out, std::string* why) {
+  auto fail = [&](const std::string& w) { if (why) *why = w; return false; };
+  size_t at = 0;
+  int members = 0;
+  while (at < data.size()) {
+    // Trailing zero padding after the last member (tar.gz writers leave it) ends the stream.
+    if (members > 0 && std::all_of(data.begin() + at, data.end(), [](uint8_t b) { return b == 0; })) break;
+    if (data.size() - at < 18) return fail("truncated gzip member");
+    if (data[at] != 0x1F || data[at + 1] != 0x8B) return fail(members ? "garbage after the gzip stream" : "not gzip data (no 1f 8b magic)");
+    if (data[at + 2] != 8) return fail("gzip member is not deflate");
+    const uint8_t flg = data[at + 3];
+    if (flg & 0xE0) return fail("gzip header has reserved flags set");
+    size_t p = at + 10;
+    if (flg & 0x04) {   // FEXTRA
+      if (p + 2 > data.size()) return fail("truncated gzip header");
+      const size_t xlen = data[p] | (data[p + 1] << 8);
+      p += 2 + xlen;
+    }
+    for (uint8_t bit : {uint8_t(0x08), uint8_t(0x10)}) {   // FNAME, FCOMMENT: zero-terminated
+      if (!(flg & bit)) continue;
+      while (p < data.size() && data[p] != 0) ++p;
+      ++p;
+    }
+    if (flg & 0x02) p += 2;   // FHCRC
+    if (p > data.size()) return fail("truncated gzip header");
+    const size_t start = out.size();
+    size_t end = 0;
+    std::string w;
+    if (!inflate_raw_tree(data, p, out, &end, 0, &w, max_out)) return fail("gzip: " + w);
+    if (end + 8 > data.size()) return fail("truncated gzip trailer");
+    uint32_t crc = 0, size = 0;
+    for (int i = 0; i < 4; ++i) crc |= static_cast<uint32_t>(data[end + i]) << (8 * i);
+    for (int i = 0; i < 4; ++i) size |= static_cast<uint32_t>(data[end + 4 + i]) << (8 * i);
+    const ByteSpan got(out.data() + start, out.size() - start);
+    if (crc32_ieee(got) != crc) return fail("gzip CRC-32 does not match: the data is damaged");
+    if (static_cast<uint32_t>(got.size()) != size) return fail("gzip size does not match the trailer");
+    at = end + 8;
+    ++members;
+  }
+  if (members == 0) return fail("empty gzip stream");
+  return true;
+}
 
 bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) {
 #if defined(AIOS_HAVE_LIBDEFLATE)
