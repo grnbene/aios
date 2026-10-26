@@ -22,6 +22,7 @@ grain app deploy ./hello
 ```
 
 Related guides:
+- [Grain standard library reference](grain-reference.md): complete function reference for all builtins.
 - [Running and managing Grain applications](grain-apps.md): deployments, settings, secrets, and rollbacks.
 - [Hosting applications with AIOS](aios-serve.md): running with native ASQL and fleet orchestration.
 

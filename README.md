@@ -81,28 +81,15 @@ Building by hand:
     cmake --build build -j
     scripts/drive.sh                       # clean root -> full kernel drive -> restart in a new process
 
-Several agents (or forks) building on one machine go through the stream scripts,
-not a bare `cmake --build`: `scripts/stream/tree-build.sh <target>` builds the
-shared live tree one build at a time in `build-agents/` (-O1), every compile runs
-in one of the machine's slots at idle priority (`scripts/build-slot.sh`), and a
-fork that only needs the web tools uses `scripts/wt-build.py`, which recompiles
-just the objects that differ from the main build's. Converge type-checks the C++
-a change touched with `scripts/compile-gate.cjs`.
-
-*Tried and removed (2026-10-21).* A content-addressed object cache: `scripts/cc-cache.sh`,
-a POSIX-sh compiler launcher (`-DAIOS_BUILD_CACHE=ON`) driven by a `scripts/build.sh`
-that built only the named targets, one build at a time. It keyed each object on the
-compiler, the flags and the preprocessed text, so a fresh clone recompiled only what
-differed from any earlier build; measured on 272 translation units, one clone's cold
-build took 2 min 8 s and a second clone's 18.6 s with all 272 hits. The stream
-scripts above cover the same need (many agents, one box) and were taken instead.
-It is in git history (commits `bd0393b` and `0366512`) should a shared cache be wanted
-again; ccache is the off-the-shelf version of the same idea.
-
 The main binary is `build/aios` (CMake target `aios-cli`); `--target aios`
 builds only the library. You need CMake 3.20+, GCC 10+ or Clang 13+, and the
 OpenCL headers (`CL/cl.h`, needed to compile; the library is loaded at run time
 only if present).
+
+For concurrent or resource-managed environments, helper build scripts are available:
+`scripts/stream/tree-build.sh <target>` performs incremental builds in a shared tree
+(`build-agents/`), and `scripts/build-slot.sh` runs compiles at idle priority across
+allocated CPU slots.
 
 ## Guides
 
@@ -121,6 +108,10 @@ only if present).
 | [docs/vcs.md](docs/vcs.md) | `aios-git`: working-copy commits (`@`), stacked changes, evolutionary log, structural AST diffs, and fsmonitor |
 | [docs/asql-benchmarks.md](docs/asql-benchmarks.md) | ASQL sysbench and ERP workload benchmarks against MariaDB |
 | [README-ASQL.md](README-ASQL.md) | ASQL's internals and its feature list |
+| [grain/README.md](grain/README.md) | `grain`: the language, syntax, JIT compiler, and core runtime |
+| [docs/grain-reference.md](docs/grain-reference.md) | Grain standard library reference: all 440+ builtins across 18 domains |
+| [docs/grain-apps.md](docs/grain-apps.md) | running and managing Grain applications, deployments, and rollbacks |
+| [docs/grain-app-writing.md](docs/grain-app-writing.md) | writing Grain applications: manifests, routes, workers, and hooks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | the object model and the invariants each layer keeps |
 | [docs/reference.md](docs/reference.md) | every command and subcommand, with its help and usage lines (generated from the code by `scripts/gen-reference.py`) |
 | [docs/tools.md](docs/tools.md) | every program the build produces: drives, checks, benches and servers (generated) |

@@ -34,6 +34,8 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 
 ## The standard library
 
+For the complete function-by-function reference of all 440+ builtins with parameter signatures, see the [**Grain Standard Library Reference**](../docs/grain-reference.md).
+
 | Area | Functions |
 |---|---|
 | The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep(ms)` (milliseconds), `clock`, `time_us` |

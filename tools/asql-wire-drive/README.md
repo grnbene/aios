@@ -23,8 +23,7 @@ CHAR_LENGTH on every evaluation path, SHOW CREATE TABLE, error codes and
 sqlstates, COM_RESET / change_user / persistent `p:` connections, ping,
 COM_STATISTICS, a 20,000-row join, a 17 MB cell, a 20 MB REPEAT.
 
-Known, accepted differences as of 2026-09-30: INT columns are typed
-LONGLONG (the engine keeps no declared width), text charset 33 vs 45, a
-latin1 session is honoured only under `mysql_charset=1`, SHOW CREATE TABLE
-says varchar(255), error message wording, and user variables (`SET @v`) are
-unsupported (the ERP has none).
+Accepted differences: INT columns are typed LONGLONG (the engine keeps no
+declared width), text charset 33 vs 45, a latin1 session is honoured only under
+`mysql_charset=1`, SHOW CREATE TABLE says varchar(255), and error message wording
+may differ from MySQL. (User variables `SET @v = ...` are supported natively).

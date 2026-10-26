@@ -186,8 +186,9 @@ go back to a pack real git reads. On a 100,000-commit history: 37 MiB against gi
     git stack sync           rebase the whole stack onto trunk (fetch first)
     git stack push [remote]  push every change as a branch (its bookmark, else push/<change id>), with leases
 
-Trunk is `change.trunk`, else origin/main, origin/master, main or master. Amending any change in the stack rebases
-the ones above it (see above). converge has stacks for its agents too: the `stack` and `switch_change` tools.
+Trunk is `change.trunk`, else `origin/main`, `origin/master`, `main` or `master`. Amending any change in the stack rebases
+the ones above it (see above). Stacks can also be inspected and navigated programmatically via the `stack` and
+`switch_change` tooling.
 
 ## Signed commits: `commit -S`, `git verify-commit`
 
@@ -200,10 +201,10 @@ the change layer's commits are signed under `commit.gpgsign` too. With `user.sig
 it: `<program> -Y sign -n git -f <key> [-U] <file>`. `git verify-commit` checks against `gpg.ssh.allowedSignersFile`
 and prints what git prints (`Good "git" signature for <principal> with ED25519 key SHA256:...`; a good signature by an
 unlisted key is still a failure). Signatures made here verify with stock git, and stock git's verify here. The library
-side is `aios/userland/git_sign.hpp`; converge checks agents' pushes with it.
+side is `aios/userland/git_sign.hpp`, which validates incoming signed commits and branch pushes.
 
-The Merkle log converge keeps over its receipts is `aios/crypto/merkle_log.hpp` (RFC 9162: leaf and node hashing,
-roots, inclusion and consistency proofs and their verification).
+The Merkle log used for commit and transaction receipts is implemented in `aios/crypto/merkle_log.hpp` (RFC 9162: leaf
+and node hashing, roots, inclusion and consistency proofs and their verification).
 
 ## Refs by compare-and-swap; a snapshot without the lock
 

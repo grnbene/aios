@@ -91,9 +91,9 @@ $ mysql -h 127.0.0.1 -P 13410 -u anyone --table -e "CREATE DATABASE docs; USE do
 +----------+-------+------+
 ```
 
-Stop it with SIGTERM or Ctrl+C. The data survives: I killed the process with
-SIGTERM, started it again on the same root, and every row was back. The redo
-log under `sql_db/` is replayed at start.
+Stop it with SIGTERM or Ctrl+C. Data survives process termination: restarting
+the engine on the same root replays the redo log under `sql_db/` at startup,
+restoring every committed transaction.
 
 ### `compute serve sql=1`: the production path
 
