@@ -1,4 +1,4 @@
-# Fleet identity keys — design (stages 1–3 implemented)
+# Fleet identity keys — design (stages 1–4 implemented)
 
 Status: proposal, 2026-10-26. Stage 1 (ce1813e) and stage 2 are in: `tools/fleet-identity-check.cpp`,
 `tools/fleet-signed-attach-check.cpp`. Stage 2 wire format: the hub's challenge is 16 random bytes plus a flags byte
@@ -20,7 +20,14 @@ Stage 3 as built (`tools/fleet-link-v2-check.cpp`):
   as before. Even with no keys anywhere this gives forward secrecy; the token is still needed (stage 5 retires it).
 - **Policy.** A peer the signed roster lists must offer the exchange and sign with its listed key (no downgrade by
   stripping the offer). An unlisted peer is let in on the token as before, unless `AIOS_FLEET_V2_ONLY=1`, which
-  refuses any peer not completing the exchange with a roster key. App links (`grain_app.cpp`) stay on the token. Replaces the shared cluster key with one key pair per machine, in stages that keep the
+  refuses any peer not completing the exchange with a roster key. App links (`grain_app.cpp`) stay on the token.
+
+Stage 4 as built (`tools/fleet-roles-check.cpp`): roles bind to a link when the peer proved a key the signed roster
+lists and the roster gives it roles; then each request needs its role - `app.route` operations `app-route`; other
+`Exec`/`ExecBatch`, channels, migrate, replicate and state `compute`; memory staging `compute` or `app-route`; command
+lines starting `app ` `app-admin`, other command lines `shell` (and `AIOS_FLEET_SHELL=1` still); `Sql` `sql`.
+Telemetry is open to members. Checked in the node service (`NodeService::role_refusal`) and a member's relay command
+server. A peer with no roles listed, or not proven by a roster key, keeps today's access. Replaces the shared cluster key with one key pair per machine, in stages that keep the
 fleet running throughout.
 
 ## Today

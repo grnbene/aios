@@ -177,6 +177,10 @@ Result<void> Kernel::init(const KernelConfig& cfg) {
     auto id = std::make_shared<LinkIdentity>();
     if (node_key_ok_) id->sign = [this](ByteSpan m) { auto s = node_sign(m); return s.ok() ? ByteBuffer(s->begin(), s->end()) : ByteBuffer(); };
     id->peer_key = [this](const Id128& peer, std::array<uint8_t, 32>& key) { return relay_ && relay_->peer_key(peer, key); };
+    id->peer_roles = [this](const Id128& peer) {
+      std::array<uint8_t, 32> key{};
+      return relay_ && relay_->peer_key(peer, key) ? relay_->peer_roles(peer) : std::string();
+    };
     id->v2_only = host_->env("AIOS_FLEET_V2_ONLY") == "1";
     link_identity_ = id;
     set_link_identity(id);

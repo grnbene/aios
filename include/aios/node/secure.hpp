@@ -51,7 +51,17 @@ struct LinkIdentity {
   std::function<ByteBuffer(ByteSpan)> sign;                               // 64-byte signature; empty: no key
   std::function<bool(const Id128& peer, std::array<uint8_t, 32>& key)> peer_key;   // false: the peer is not in the roster
   bool v2_only = false;   // refuse a peer that does not complete the exchange with a key from the roster
+  // The roles the signed roster gives a peer whose key it lists (`roles=` in the hub's members file); empty: none
+  // listed, the peer keeps full access.
+  std::function<std::string(const Id128& peer)> peer_roles;
 };
+
+// Stage 4: what a peer may ask of this node. `roles` is the roster's comma list for a peer proven by its key; a
+// peer with no roles listed (or not proven) is not limited. The request kinds: "app-route", "app-admin", "sql",
+// "compute", "shell".
+bool roles_allow(const std::string& roles, const std::string& role);
+// The role a command line needs: `app ...` lines are app-admin, anything else is shell.
+const char* command_role(const std::string& line);
 void set_link_identity(std::shared_ptr<const LinkIdentity> id);
 std::shared_ptr<const LinkIdentity> link_identity();
 // After the token handshake, on its secure link. When both sides advertised kFeatIdentity: each sends a fresh X25519

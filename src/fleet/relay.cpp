@@ -954,12 +954,15 @@ void RelayClient::Impl::ensure_command_server(std::shared_ptr<Impl> self_sp) {
         auto skey = secure_handshake_responder(*plain, self_sp->key, *self_sp->host, self_sp->self, peer_kernel, peer_payload, ByteSpan(mine.data(), mine.size()));
         if (!skey.ok()) return;
         auto link = make_secure_link(shared_conn, *skey, false);
+        std::string roles;   // the signed roster's roles for this peer; empty: not limited
         {
           bool upgraded = false; crypto::Key k2{};
           const auto lid = link_identity();
           auto x = link_identity_exchange(*link, *skey, false, self_sp->self, peer_kernel, ByteSpan(peer_payload.data(), peer_payload.size()), *self_sp->host, lid.get(), upgraded, k2);
           if (!x.ok()) { self_sp->host->log_error("fleet: circuit from " + peer_kernel.str() + " refused: " + x.error().message); return; }
           if (upgraded) link = make_secure_link(shared_conn, k2, false);
+          std::array<uint8_t, 32> pk{};
+          if (upgraded && lid && lid->peer_roles && lid->peer_key && lid->peer_key(peer_kernel, pk)) roles = lid->peer_roles(peer_kernel);
         }
         link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
         uint8_t t;
@@ -969,6 +972,15 @@ void RelayClient::Impl::ensure_command_server(std::shared_ptr<Impl> self_sp) {
             Reader r(body);
             std::string line = r.str();
             std::string out;
+            const char* role = command_role(line);
+            if (!roles_allow(roles, role)) {
+              ByteBuffer rep;
+              Writer w(rep);
+              w.u8(static_cast<uint8_t>(Status::Denied));
+              w.str("peer " + peer_kernel.str() + " has no " + role + " role here (its roles: " + roles + ")");
+              if (!link->send(nodeproto::Error, rep)) break;
+              continue;
+            }
             int code = self_sp->command_runner ? self_sp->command_runner(line, out) : fleet_shell_command(line, out);
             ByteBuffer rep;
             Writer w(rep);
