@@ -341,7 +341,7 @@ ECMAScript-compatible regular expression operations.
 | `aes_cbc_decrypt` | `aes_cbc_decrypt(key, iv, data)` | AES-CBC decryption with PKCS#7 unpadding (returns `nil` on bad padding). |
 | `hash_equals` | `hash_equals(a, b)` | Timing-safe string comparison to protect against side-channel leaks. |
 | `bcrypt_hash` | `bcrypt_hash(pass, [cost=10])` | Computes a standard `$2b$` OpenBSD bcrypt password hash with random salt. |
-| `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$` or `$2b$` bcrypt hash in constant time. |
+| `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$`, `$2b$` or `$2y$` (PHP `password_hash`) bcrypt hash in constant time. |
 | `jwt_sign` | `jwt_sign(payload_map, secret)` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. |
 | `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 

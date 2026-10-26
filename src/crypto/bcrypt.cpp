@@ -346,7 +346,8 @@ bool bcrypt_hash(const char* pass, size_t passlen, const uint8_t salt16[16],
 bool bcrypt_verify(const char* pass, size_t passlen, const char* hash) {
   if (!pass || !hash) return false;
   if (std::strlen(hash) != 60) return false;
-  if (std::strncmp(hash, "$2a$", 4) != 0 && std::strncmp(hash, "$2b$", 4) != 0) return false;
+  // $2a$, $2b$ and $2y$ (PHP's password_hash) are the same algorithm for these inputs.
+  if (std::strncmp(hash, "$2a$", 4) != 0 && std::strncmp(hash, "$2b$", 4) != 0 && std::strncmp(hash, "$2y$", 4) != 0) return false;
   if (hash[6] != '$') return false;
 
   unsigned int cost = 0;
@@ -359,15 +360,18 @@ bool bcrypt_verify(const char* pass, size_t passlen, const char* hash) {
 
   uint8_t salt[16];
   if (!decode_bcrypt_base64(salt, 16, hash + 7)) return false;
+  uint8_t want[23];
+  if (!decode_bcrypt_base64(want, 23, hash + 7 + 22)) return false;
 
   char computed[61];
   if (!bcrypt_hash(pass, passlen, salt, cost, computed)) return false;
+  uint8_t got[23];
+  if (!decode_bcrypt_base64(got, 23, computed + 7 + 22)) return false;
 
-  // Constant-time comparison
+  // Constant time, over the hash bytes: another implementation's encoding of the same bytes (the spare low bits of
+  // the last character) still matches.
   uint8_t diff = 0;
-  for (size_t i = 0; i < 60; ++i) {
-    diff |= static_cast<uint8_t>(computed[i] ^ hash[i]);
-  }
+  for (size_t i = 0; i < sizeof(want); ++i) diff |= static_cast<uint8_t>(want[i] ^ got[i]);
   return diff == 0;
 }
 

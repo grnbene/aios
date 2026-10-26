@@ -232,6 +232,55 @@ std::string extract_multipart_boundary(const std::string& content_type) {
   return content_type.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
 }
 
+// One parameter of a Content-Disposition value (`form-data; name="a"; filename="b.txt"`), matched as a whole
+// parameter name - so name= is never found inside filename= - quoted or a bare token. found: it was there.
+static std::string disposition_param(const std::string& v, const std::string& want, bool& found) {
+  found = false;
+  size_t i = v.find(';');
+  while (i != std::string::npos && i < v.size()) {
+    ++i;
+    while (i < v.size() && (v[i] == ' ' || v[i] == '\t')) ++i;
+    size_t eq = v.find('=', i);
+    if (eq == std::string::npos) return {};
+    std::string key = v.substr(i, eq - i);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+    for (char& c : key) c = (char)std::tolower((unsigned char)c);
+    size_t j = eq + 1;
+    while (j < v.size() && (v[j] == ' ' || v[j] == '\t')) ++j;
+    std::string val;
+    if (j < v.size() && v[j] == '"') {
+      ++j;
+      while (j < v.size() && v[j] != '"') {
+        // Only \" is an escape: browsers send a Windows path's backslashes as they are (C:\dir\a.pdf).
+        if (v[j] == '\\' && j + 1 < v.size() && v[j + 1] == '"') ++j;
+        val.push_back(v[j++]);
+      }
+      if (j < v.size()) ++j;   // the closing quote
+      i = v.find(';', j);
+    } else {
+      size_t end = v.find(';', j);
+      val = v.substr(j, end == std::string::npos ? std::string::npos : end - j);
+      while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
+      i = end;
+    }
+    if (key == want) { found = true; return val; }
+  }
+  return {};
+}
+
+// A repeated `name[]` field (several files in one input, a multi-select) collects into a list under `name`;
+// any other name keeps its last value, as before.
+static void put_field(MapObj& into, const std::string& name, Value v) {
+  if (name.size() > 2 && name.compare(name.size() - 2, 2, "[]") == 0) {
+    const std::string base = name.substr(0, name.size() - 2);
+    Value* have = into.find(base);
+    if (have && have->type == Type::List) { have->list_items().push_back(std::move(v)); return; }
+    into.put(base, Value::list(std::vector<Value>{std::move(v)}));
+    return;
+  }
+  into.put(name, std::move(v));
+}
+
 MultipartResult parse_multipart_data(const std::string& body, const std::string& boundary) {
   MultipartResult res;
   if (boundary.empty() || boundary.size() > 128 || body.empty()) return res;
@@ -268,13 +317,20 @@ MultipartResult parse_multipart_data(const std::string& body, const std::string&
     std::string header_str = body.substr(part_start, headers_end - part_start);
     size_t content_start = headers_end + body_offset;
 
-    size_t next_delim = body.find(delimiter, content_start);
+    // The next delimiter is one that starts a line (RFC 2046: CRLF "--" boundary); the boundary's text inside a
+    // part's content, mid-line, is content.
+    size_t next_delim = content_start;
+    for (;;) {
+      next_delim = body.find(delimiter, next_delim);
+      if (next_delim == std::string::npos || next_delim == 0 || body[next_delim - 1] == '\n') break;
+      ++next_delim;
+    }
     if (next_delim == std::string::npos) break;
 
     size_t content_end = next_delim;
     if (content_end >= content_start + 2 && body[content_end - 2] == '\r' && body[content_end - 1] == '\n') {
       content_end -= 2;
-    } else if (content_end >= content_start + 1 && (body[content_end - 1] == '\r' || body[content_end - 1] == '\n')) {
+    } else if (content_end >= content_start + 1 && body[content_end - 1] == '\n') {
       content_end -= 1;
     }
 
@@ -300,21 +356,9 @@ MultipartResult parse_multipart_data(const std::string& body, const std::string&
 
         if (lower_hname == "content-disposition") {
           disposition = h_val;
-          size_t name_pos = h_val.find("name=\"");
-          if (name_pos != std::string::npos) {
-            name_pos += 6;
-            size_t name_end = h_val.find('"', name_pos);
-            if (name_end != std::string::npos) name = h_val.substr(name_pos, name_end - name_pos);
-          }
-          size_t fn_pos = h_val.find("filename=\"");
-          if (fn_pos != std::string::npos) {
-            fn_pos += 10;
-            size_t fn_end = h_val.find('"', fn_pos);
-            if (fn_end != std::string::npos) {
-              filename = h_val.substr(fn_pos, fn_end - fn_pos);
-              is_file = true;
-            }
-          }
+          bool found = false;
+          name = disposition_param(h_val, "name", found);
+          filename = disposition_param(h_val, "filename", is_file);
         } else if (lower_hname == "content-type") {
           content_type = h_val;
         }
@@ -332,9 +376,9 @@ MultipartResult parse_multipart_data(const std::string& body, const std::string&
         file_obj->put("type", Value::string(content_type));
         file_obj->put("size", Value::integer(static_cast<int64_t>(part_content.size())));
         file_obj->put("data", Value::bytes(std::vector<uint8_t>(part_content.begin(), part_content.end())));
-        res.files->put(name, Value::object(Type::Map, file_obj));
+        put_field(*res.files, name, Value::object(Type::Map, file_obj));
       } else {
-        res.form->put(name, Value::string(part_content));
+        put_field(*res.form, name, Value::string(part_content));
       }
     }
 
