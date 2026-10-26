@@ -16,6 +16,7 @@
 #include <shared_mutex>
 #include <functional>
 #include <cstring>
+#include <cstdlib>
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -1148,25 +1149,33 @@ class PkMap {
   struct iterator {
     PkMap* m = nullptr;
     size_t i = 0;
-    Slot* operator->() const { return &m->slots_[i]; }
-    Slot& operator*() const { return m->slots_[i]; }
+    // Runs mode (below): a hit is its own entry (i == 1; end() is i == 0). Read-only in effect - what writes
+    // through an entry (operator[], a walk with begin()) turns the map back into slots first.
+    mutable Slot run_hit{};
+    bool run = false;
+    Slot* operator->() const { return run ? &run_hit : &m->slots_[i]; }
+    Slot& operator*() const { return run ? run_hit : m->slots_[i]; }
     iterator& operator++() { ++i; skip(); return *this; }
     bool operator==(const iterator& o) const { return i == o.i; }
     bool operator!=(const iterator& o) const { return i != o.i; }
     void skip() { while (i < m->slots_.size() && m->slots_[i].state != 1) ++i; }
   };
-  iterator begin() { iterator it{this, 0}; it.skip(); return it; }
-  iterator end() { return iterator{this, slots_.size()}; }
+  iterator begin() { if (runs_) to_slots(); iterator it{this, 0}; it.skip(); return it; }
+  iterator end() { return iterator{this, runs_ ? 0 : slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
   // `hash` is for the tests: a degenerate one makes every key collide, and the map must still be exact.
-  explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash) {}
-  void clear() { slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false; }
-  void reserve(size_t n) { if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
+  explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash), runs_(runs_enabled()) {}
+  void clear() {
+    slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false;
+    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); shape_ = 0;
+  }
+  void reserve(size_t n) { if (runs_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
+    if (runs_) return run_find(key);
     if (slots_.empty()) return end();
     uint64_t ik = 0;
-    if (!text_ && !as_int(key, &ik)) return end();   // no integer key is in a text map's keys? they may: fall through
+    if (!text_ && !int_key(key, &ik)) return end();   // not this map's integer shape: not one of its keys
     if (text_) ik = hash_text(key);
     const size_t i = locate(key, ik, false);
     return i == npos ? end() : iterator{this, i};
@@ -1176,6 +1185,14 @@ class PkMap {
     if (it != end()) erase(it);
   }
   iterator erase(iterator it) {
+    if (runs_) {
+      if (it.i == 0) return it;
+      const uint64_t k = it.run_hit.key;
+      gone_.insert(std::lower_bound(gone_.begin(), gone_.end(), k, int_less), k);
+      --count_;
+      if (gone_.size() * 4 > count_ + 256) to_slots();   // more erased than the runs save
+      return end();
+    }
     slots_[it.i].state = 2;
     if (text_) {
       dead_ += entry_bytes(it.i);
@@ -1185,10 +1202,18 @@ class PkMap {
     ++it;
     return it;
   }
-  uint32_t& operator[](const std::string& key) { return emplace(key, 0).first->second; }
+  uint32_t& operator[](const std::string& key) { if (runs_) to_slots(); return emplace(key, 0).first->second; }
   std::pair<iterator, bool> emplace(const std::string& key, size_t v) {
     uint64_t ik = 0;
-    const bool is_int = as_int(key, &ik);
+    const bool is_int = int_key(key, &ik, true);
+    if (runs_) {
+      if (is_int) {
+        if (run_append(ik, v)) return {run_iter(ik, (uint32_t)v), true};
+        auto have = run_find(key);
+        if (have != end()) return {have, false};
+      }
+      to_slots();   // a text key, or one not after the last: slots from here on
+    }
     if (!text_ && !is_int) to_text();
     if (text_) ik = hash_text(key);
     if ((used_ + 1) * 10 > slots_.size() * 7 || slots_.empty()) rehash(count_ + 1);
@@ -1203,8 +1228,45 @@ class PkMap {
     return {iterator{this, i}, true};
   }
   size_t memory_bytes() const {
-    return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity();
+    return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity() +
+           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t);
   }
+  // Every entry's row id through `fn` (a monotonic renumbering: the row index folding its gaps). In runs mode the
+  // runs are rebuilt from the new ids; slots are rewritten in place.
+  template <class F> void remap_values(F fn) {
+    if (!runs_) {
+      for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
+      return;
+    }
+    // The new runs are built aside; if any entry will not go into runs (an id past 32 bits), the map turns into
+    // slots first and is renumbered there - nothing is dropped.
+    std::vector<Run> fresh;
+    fresh.reserve(runs_v_.size() + gone_.size());
+    size_t g = 0, n = 0;
+    bool ok = true;
+    for (const Run& r : runs_v_) {
+      for (uint32_t j = 0; j < r.n && ok; ++j) {
+        const uint64_t k = r.key + j;
+        while (g < gone_.size() && int_less(gone_[g], k)) ++g;
+        if (g < gone_.size() && gone_[g] == k) continue;
+        ok = append_run(fresh, k, fn((size_t)r.val + j));
+        ++n;
+      }
+      if (!ok) break;
+    }
+    if (!ok) {
+      to_slots();
+      for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
+      return;
+    }
+    runs_v_.swap(fresh);
+    gone_.clear();
+    count_ = n;
+    if (runs_v_.size() * 2 > count_ + 64) to_slots();
+  }
+  bool runs_mode() const { return runs_; }
+  // How many maps have turned from runs back into slots (SHOW STATUS Asql_pk_runs_to_slots).
+  static std::atomic<uint64_t>& runs_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
 
  private:
   static constexpr size_t npos = (size_t)-1;
@@ -1220,7 +1282,122 @@ class PkMap {
   size_t dead_ = 0;                   // bytes of arena_ held by erased keys
   size_t count_ = 0, used_ = 0;       // live entries; live plus tombstones
   uint64_t (*hash_fn_)(const std::string&) = nullptr;
+  // Runs mode: while every key is an integer, arriving in increasing order with the row ids following each other
+  // (an auto-increment table, loaded or replicated in order - most of an ERP's), the map is runs of consecutive keys,
+  // each with the id of its first row: 16 bytes a run instead of a slot (16 B, at ~2/3 load) a key. Erased keys
+  // are listed in `gone_`. Anything else - a text key, a key not after the last, a write through an entry, too many
+  // runs or erased keys - turns it into the slots above for good (to_slots), so what a lookup answers is the same
+  // either way; only the memory differs. AIOS_SQL_PK_RUNS=0 starts every map as slots.
+  struct Run { uint64_t key; uint32_t val; uint32_t n; };   // keys key .. key+n-1 -> ids val .. val+n-1
+  bool runs_ = true;
+  std::vector<Run> runs_v_;
+  std::vector<uint64_t> gone_;   // erased keys, sorted as signed integers
+  static bool runs_enabled() {
+    static const bool on = [] { const char* e = std::getenv("AIOS_SQL_PK_RUNS"); return !(e && e[0] == '0'); }();
+    return on;
+  }
+  static bool int_less(uint64_t a, uint64_t b) { return (int64_t)a < (int64_t)b; }
+  iterator run_iter(uint64_t k, uint32_t v) {
+    iterator it{this, 1};
+    it.run = true;
+    it.run_hit.key = k;
+    it.run_hit.second = v;
+    it.run_hit.state = 1;
+    return it;
+  }
+  iterator run_find(const std::string& key) {
+    uint64_t ik = 0;
+    if (runs_v_.empty() || !int_key(key, &ik)) return end();
+    auto r = std::upper_bound(runs_v_.begin(), runs_v_.end(), ik, [](uint64_t k, const Run& x) { return int_less(k, x.key); });
+    if (r == runs_v_.begin()) return end();
+    --r;
+    const uint64_t off = ik - r->key;
+    if (off >= r->n) return end();
+    if (!gone_.empty() && std::binary_search(gone_.begin(), gone_.end(), ik, int_less)) return end();
+    return run_iter(ik, (uint32_t)(r->val + off));
+  }
+  // Key `k` -> id `v` after the last entry of `rv`, when `k` is after every key there; false otherwise (unchanged).
+  static bool append_run(std::vector<Run>& rv, uint64_t k, size_t v) {
+    if (v > UINT32_MAX) return false;
+    if (!rv.empty()) {
+      Run& last = rv.back();
+      const uint64_t last_key = last.key + last.n - 1;
+      if (!int_less(last_key, k)) return false;
+      if (k == last_key + 1 && v == (size_t)last.val + last.n && last.n < UINT32_MAX) { ++last.n; return true; }
+    }
+    rv.push_back(Run{k, (uint32_t)v, 1});
+    return true;
+  }
+  bool run_append(uint64_t k, size_t v) {
+    if (!append_run(runs_v_, k, v)) return false;
+    ++count_;
+    if (runs_v_.size() * 2 > count_ + 64) to_slots();   // keys too scattered for runs to save anything
+    return true;
+  }
+  // Runs into slots, for good.
+  void to_slots() {
+    if (!runs_) return;
+    runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+    std::vector<Run> rv;
+    rv.swap(runs_v_);
+    std::vector<uint64_t> gone;
+    gone.swap(gone_);
+    runs_ = false;
+    const size_t live = count_;
+    slots_.clear();
+    count_ = used_ = 0;
+    rehash(live);
+    size_t g = 0;
+    for (const Run& r : rv) {
+      for (uint32_t j = 0; j < r.n; ++j) {
+        const uint64_t k = r.key + j;
+        while (g < gone.size() && int_less(gone[g], k)) ++g;
+        if (g < gone.size() && gone[g] == k) continue;
+        const size_t at = place(k);
+        slots_[at] = Slot{k, r.val + j, 1};
+        ++count_; ++used_;
+      }
+    }
+  }
   uint64_t hash_text(const std::string& key) const { return hash_fn_ ? hash_fn_(key) : (uint64_t)std::hash<std::string>{}(key); }
+  // The keys of one map are one shape (one table's primary key): shape_ 1, a single integer; 2, two integers packed
+  // into 64 bits - an (order, line) pair costs what a single integer does, and its keys, arriving in order, can be
+  // runs. 0: no integer key yet. A key of another shape (or a pair out of packing range) makes the map text.
+  int shape_ = 0;
+  static constexpr int kPairLowBits = 24;   // second part 0 .. 16,777,215; first 0 .. 2^39-1
+  // A key's 64-bit form in this map's shape; `adopt`: an empty map takes the key's shape.
+  bool int_key(const std::string& key, uint64_t* v, bool adopt = false) {
+    int shape = 0;
+    if (as_int(key, v)) shape = 1;
+    else if (as_pair(key, v)) shape = 2;
+    else return false;
+    if (shape_ == 0 && adopt && !text_) shape_ = shape;
+    return shape == shape_;
+  }
+  std::string int_text(uint64_t k) const {
+    if (shape_ == 2) return std::to_string(k >> kPairLowBits) + '\x1f' + std::to_string(k & ((1ull << kPairLowBits) - 1)) + '\x1f';
+    return std::to_string((int64_t)k) + '\x1f';
+  }
+  // A canonical integer's digits [p, p+n): no sign handling (the pair's parts are non-negative), no leading zero.
+  static bool canon_uint(const char* p, size_t n, uint64_t* v) {
+    if (n == 0 || n > 19 || (p[0] == '0' && n > 1)) return false;
+    uint64_t a = 0;
+    for (size_t i = 0; i < n; ++i) { if (p[i] < '0' || p[i] > '9') return false; a = a * 10 + (uint64_t)(p[i] - '0'); }
+    *v = a;
+    return true;
+  }
+  // "<a>\x1f<b>\x1f": a two-column integer key, packed (a << 24 | b) when both fit; the packing keeps the key order.
+  static bool as_pair(const std::string& key, uint64_t* v) {
+    const size_t n = key.size();
+    if (n < 4 || key[n - 1] != '\x1f') return false;
+    const size_t mid = key.find('\x1f');
+    if (mid == std::string::npos || mid + 1 >= n - 1) return false;
+    uint64_t a = 0, b = 0;
+    if (!canon_uint(key.data(), mid, &a) || !canon_uint(key.data() + mid + 1, n - 1 - (mid + 1), &b)) return false;
+    if (a >= (1ull << (63 - kPairLowBits)) || b >= (1ull << kPairLowBits)) return false;
+    *v = (a << kPairLowBits) | b;
+    return true;
+  }
   // "<canonical integer>\x1f": what row_key makes of a single INT key.
   static bool as_int(const std::string& key, uint64_t* v) {
     const size_t n = key.size();
@@ -1363,7 +1540,7 @@ class PkMap {
     count_ = used_ = 0;
     for (const Slot& s : old) {
       if (s.state != 1) continue;
-      const std::string k = std::to_string((int64_t)s.key) + '\x1f';
+      const std::string k = int_text(s.key);
       const uint64_t ik = hash_text(k);
       const size_t j = place(ik);
       slots_[j] = s;
