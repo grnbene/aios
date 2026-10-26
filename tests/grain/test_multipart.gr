@@ -1,0 +1,59 @@
+// Test multipart/form-data parsing and security sanitization
+
+let boundary = "---------------------------974767299852498929531610575"
+let ct = "multipart/form-data; boundary=" + boundary
+
+let body = "--" + boundary + "\r\n" +
+  "Content-Disposition: form-data; name=\"username\"\r\n\r\n" +
+  "johndoe\r\n" +
+  "--" + boundary + "\r\n" +
+  "Content-Disposition: form-data; name=\"avatar\"; filename=\"../../etc/passwd\"\r\n" +
+  "Content-Type: image/png\r\n\r\n" +
+  "FAKE_PNG_BINARY_DATA\r\n" +
+  "--" + boundary + "\r\n" +
+  "Content-Disposition: form-data; name=\"doc\"; filename=\"C:\\secret\\financials.pdf\"\r\n" +
+  "Content-Type: application/pdf\r\n\r\n" +
+  "PDF_CONTENT_BYTES\r\n" +
+  "--" + boundary + "\r\n" +
+  "Content-Disposition: form-data; name=\"badfile\"; filename=\".user.ini\"\r\n" +
+  "Content-Type: text/plain\r\n\r\n" +
+  "auto_prepend_file=hack.php\r\n" +
+  "--" + boundary + "--\r\n"
+
+let parsed = http_parse_multipart(body, ct)
+assert_true(type(parsed) == "map", "parsed must be a map")
+assert_eq(parsed.form.username, "johndoe", "form field username must match")
+
+let file1 = parsed.files.avatar
+assert_true(type(file1) == "map", "file avatar must be a map")
+assert_eq(file1.name, "avatar", "file name must match")
+// Path traversal ../../etc/passwd must be stripped to passwd!
+assert_eq(file1.filename, "passwd", "path traversal must be stripped from unix paths")
+assert_eq(file1.type, "image/png", "content-type must match")
+assert_eq(file1.size, 20, "file size must match data length")
+assert_true(type(file1.data) == "bytes", "file data must be bytes type")
+
+let file2 = parsed.files.doc
+assert_eq(file2.filename, "financials.pdf", "windows backslash path traversal must be stripped")
+assert_eq(file2.size, 17, "doc file size must match")
+
+let file3 = parsed.files.badfile
+// Leading dot stripped to prevent dotfile execution/config overwrites (.user.ini -> user.ini)
+assert_eq(file3.filename, "user.ini", "leading dot stripped from dotfiles")
+
+// Scope testing: inside function
+fn parse_in_function(raw_body, raw_ct) {
+  let res = http_parse_multipart(raw_body, raw_ct)
+  if has(res.form, "username") and has(res.files, "avatar") {
+    return res.files.avatar.size
+  }
+  return 0
+}
+assert_eq(parse_in_function(body, ct), 20, "multipart parser must work properly inside functions")
+
+// Edge cases: malformed or empty
+let empty_res = http_parse_multipart("", "")
+assert_true(type(empty_res.form) == "map" and len(keys(empty_res.form)) == 0, "empty input returns empty map")
+assert_true(type(empty_res.files) == "map" and len(keys(empty_res.files)) == 0, "empty input returns empty files")
+
+print("PASS: test_multipart")

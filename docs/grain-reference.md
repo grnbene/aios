@@ -324,6 +324,10 @@ ECMAScript-compatible regular expression operations.
 | `random_bytes` | `random_bytes(count)` | Cryptographically secure random bytes buffer. |
 | `aes_cbc_decrypt` | `aes_cbc_decrypt(key, iv, data)` | AES-CBC decryption with PKCS#7 unpadding (returns `nil` on bad padding). |
 | `hash_equals` | `hash_equals(a, b)` | Timing-safe string comparison to protect against side-channel leaks. |
+| `bcrypt_hash` | `bcrypt_hash(pass, [cost=10])` | Computes a standard `$2b$` OpenBSD bcrypt password hash with random salt. |
+| `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$` or `$2b$` bcrypt hash in constant time. |
+| `jwt_sign` | `jwt_sign(payload_map, secret)` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. |
+| `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 
 ---
 
@@ -346,6 +350,7 @@ ECMAScript-compatible regular expression operations.
 | `http_get` | `http_get(url, [options])` | Performs HTTP/HTTPS GET request. Returns `{status, body, headers, ok}`. |
 | `http_post` | `http_post(url, body, [options])` | Performs HTTP/HTTPS POST request with payload. |
 | `http_request` | `http_request(options_map)` | Full request: `{"url": ..., "method": "PUT", "headers": {...}, "body": ...}`. |
+| `http_parse_multipart` | `http_parse_multipart(body, content_type_or_boundary)` | Parses RFC 7578 multipart form payloads into `{"form": {...}, "files": {...}}` with strict path traversal stripping and size guards. |
 
 ### Server-Sent Events (SSE) Client
 | Function | Signature | Description |
@@ -396,6 +401,7 @@ ECMAScript-compatible regular expression operations.
 | `db_escape` | `db_escape(str)` | Escapes special characters for SQL literals. |
 | `db_quote` | `db_quote(str)` | Wraps string in single quotes with SQL escaping. |
 | `db_close` | `db_close(handle)` | Closes database connection. |
+| `db_transaction` | `db_transaction(conn, fn)` | Executes callback within a transaction (`START TRANSACTION` / `COMMIT`). Automatically rolls back on error (`ROLLBACK`). Supports nested calls via `SAVEPOINT`. |
 | `db_ping` | `db_ping(handle)` | Pings server to verify connection vitality. |
 | `db_connected` | `db_connected(handle)` | Returns `true` if connection handle remains open. |
 | `db_select_db` | `db_select_db(handle, db_name)` | Switches default database on the connection. |
