@@ -6758,6 +6758,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_global("E", Value::real(2.71828182845904523536));
   install_hash_builtins(vm);
   install_bytes_builtins(vm);
+  install_kv_builtins(vm);
   install_regex_builtins(vm);
   install_time_builtins(vm);
   install_text_builtins(vm);

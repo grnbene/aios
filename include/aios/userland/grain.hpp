@@ -34,7 +34,15 @@
 #include "aios/core/ids.hpp"
 #include "aios/userland/portable_int128.hpp"
 
+namespace aios::hal { class Host; }
+
 namespace aios::userland::grain {
+
+// kv_* (grain_std_kv.cpp): a hosted app's key-value store, in memory and journaled at `journal_path`. One store per
+// path in a process: an app restarted gets the same one. `problem` (when given) says why the journal could not be
+// read; the store then runs in memory.
+struct KvStore;
+std::shared_ptr<KvStore> open_kv_store(hal::Host& host, const std::string& journal_path, std::string* problem = nullptr);
 
 // ---------------------------------------------------------------------------
 // Values
@@ -541,6 +549,7 @@ class Vm {
   // see their own), where its print() goes (its log), and the flag its host raises to stop it (sleep() returns at
   // once). Null: the process's environment, `sink`/stdout, nothing to stop.
   std::shared_ptr<VmSettings> settings;
+  std::shared_ptr<KvStore> kv;   // the app's kv_* store; null: the process's, in memory
   std::function<void(const std::string&)> on_print;
   std::shared_ptr<std::atomic<bool>> stop_flag;
 

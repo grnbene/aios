@@ -556,6 +556,7 @@ struct Host::Instance {
   Manifest m;
   Bundle bundle;
   std::shared_ptr<VmSettings> settings = std::make_shared<VmSettings>();
+  std::shared_ptr<KvStore> kv;             // kv_*: shared by every VM of the app, journaled in its data directory
   std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
   std::unique_ptr<AppFiles> files;
   std::function<void(Vm&)> setup;          // every VM of this instance
@@ -878,6 +879,15 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
   for (const auto& s : in->m.secrets)
     if (!in->settings->values.count(s)) log(app, "[host] warning: secret " + s + " is not set on this machine (`grain app secret " + app + " " + s + "`)");
   in->files = std::make_unique<AppFiles>(host_, in->bundle, store_.data_dir(app));
+  {
+    const std::string dir = store_.data_dir(app);
+    if (!dir.empty()) {
+      (void)host_.make_dir(dir);
+      std::string problem;
+      in->kv = open_kv_store(host_, dir + "/kv.journal", &problem);
+      if (!problem.empty()) log(app, "[host] warning: " + problem + " (kv_* keeps its values in memory only)");
+    }
+  }
   Instance* raw = in.get();
   auto setup_vm = opt_.setup_vm;
   in->setup = [raw, setup_vm, this, app](Vm& vm) {
@@ -891,6 +901,7 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
       return true;
     };
     vm.settings = raw->settings;
+    vm.kv = raw->kv;
     vm.stop_flag = raw->stop;
     vm.define_native("app_program", 1, 1, bi_app_program);
     vm.on_print = [this, app](const std::string& line) { log(app, line); };
