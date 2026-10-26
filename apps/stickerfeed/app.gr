@@ -1,5 +1,6 @@
-# The vendor sticker feed: /feed, /getstock, /getbrands for API clients, its ops page at /.
-# Reads the ERP through ASQL (and its sticker_item Thing); writes the connection log to MariaDB.
+// Stickerfeed application manifest.
+// Provides /feed, /getstock, and /getbrands endpoints for vendor ERP systems, plus an ops dashboard at /.
+// Reads catalog and inventory from ASQL; writes audit connection logs to MariaDB.
 let app = {
   "name": "stickerfeed",
   "description": "vendor sticker feed: /feed, /getstock, /getbrands",
@@ -7,9 +8,9 @@ let app = {
   "kind": "web",
   "port": 8571,
   "listen": "local",
-  # what each machine sets (`grain app set` / `app set`): the ASQL to read, the MariaDB to log to
+  // Host configuration overrides (configured via `grain app set` / `app set`)
   "settings": {"ASQL_HOST": "127.0.0.1", "ASQL_PORT": "3307", "ASQL_DB": "versioneight"},
-  # set per machine, never packaged; each may instead be a <NAME>_FILE setting naming a file
+  // Node-specific secrets; can also be provided via <NAME>_FILE pointing to a secret file
   "secrets": ["ASQL_PASSWORD", "STICKERFEED_WRITE_PASSWORD", "STICKERFEED_ENCRYPTION_KEY"],
   "requires": ["db"],
   "health": {"path": "/", "ok": [200]},
