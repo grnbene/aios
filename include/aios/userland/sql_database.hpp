@@ -2764,6 +2764,8 @@ class SqlDatabase {
     std::atomic<uint64_t> current_connections{0};
     std::atomic<uint64_t> rejected_connections{0};
     std::atomic<uint64_t> query_memory_waits{0};      // statements that waited for query memory
+    std::atomic<uint64_t> row_index_evictions{0};     // primary-key row indices dropped to fit the budget
+    std::atomic<uint64_t> row_index_rows_indexed{0};  // rows walked into a primary-key row index (a rebuild walks the whole table)
     std::atomic<uint64_t> query_memory_wait_us{0};
     uint64_t start_time_ns = 0;
   };
@@ -2827,7 +2829,12 @@ class SqlDatabase {
   // 1 GB: at 128 MB one table's index (prices: 878k rows, a 7-column key, ~130 MB) did not fit beside another's, and a
   // replicated stream updating both rebuilt one of them for every statement (chi's mirror applied ~2 KB of binlog a
   // second).
-  static constexpr size_t kRowIndexBudgetBytes = 1024ull * 1024 * 1024;
+  static size_t row_index_budget_bytes();   // AIOS_SQL_ROWINDEX_MB, default 1024
+  // A row index used (inserted into, looked up) this recently is not evicted for the budget: the next statement
+  // on that table would rebuild it whole, and with more hot tables than the budget holds, LRU eviction made every
+  // insert of a replicated stream do exactly that (stockmoves 20 s, stockmovestaxes 11 s per order). The budget
+  // is then overrun, and said so, rather than enforced at that price. AIOS_SQL_ROWINDEX_HOT_S, default 600.
+  static uint64_t row_index_hot_ns();
   void prune_all_probe_indices(size_t max_total_bytes = probe_index_budget_bytes(),
                                const SqlTable* exempt_table = nullptr, int exempt_col = -1);
   // Running total of probe-index bytes. Recomputing it meant walking every
@@ -2900,7 +2907,7 @@ class SqlDatabase {
   // Evicts least-recently-used row indices until the total fits the budget.
   // `exempt` is the one the caller is about to hand back.
   // Caller holds row_index_mu_.
-  void prune_all_row_indices_locked(size_t max_total_bytes = kRowIndexBudgetBytes,
+  void prune_all_row_indices_locked(size_t max_total_bytes = row_index_budget_bytes(),
                                     const std::string& exempt_key = std::string());
   // Returns the index only if one already exists for this table -- the read
   // path must never be what creates it.

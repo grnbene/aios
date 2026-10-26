@@ -48509,6 +48509,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_query_memory_waiting", std::to_string(query_memory_waiting())},
       {"Asql_query_memory_waits", std::to_string(metrics_.query_memory_waits.load(std::memory_order_relaxed))},
       {"Asql_row_index_mem_bytes", std::to_string(total_row_index_mem)},
+      {"Asql_row_index_evictions", std::to_string(metrics_.row_index_evictions.load(std::memory_order_relaxed))},
+      {"Asql_row_index_rows_indexed", std::to_string(metrics_.row_index_rows_indexed.load(std::memory_order_relaxed))},
       {"Asql_rss_bytes", std::to_string(rss_bytes)},   // the footprint: on macOS resident + compressed + swapped
       {"Asql_resident_bytes", std::to_string(get_process_rss_bytes())},
       // A client on another machine cannot read this box's /proc, so the engine
@@ -49657,7 +49659,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   }
   if (!pk_cols.empty() || ai_idx >= 0) {
     if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
-    else if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) sync_row_index(*t, pk_cols, ai_idx);
+    else if (t->row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(*t, pk_cols, ai_idx);
   }
   auto find_big_pk = [&](const SqlRow& row, const std::string& pk_key) -> long long {
     // Candidates from whichever key column narrows them most for this row:
@@ -50686,6 +50688,24 @@ size_t SqlDatabase::probe_index_budget_bytes() {
     const char* e = std::getenv("AIOS_SQL_PROBE_MB");
     const unsigned long mb = e && *e ? std::strtoul(e, nullptr, 10) : 2048;
     return (size_t)(mb ? mb : 2048) << 20;
+  }();
+  return v;
+}
+
+uint64_t SqlDatabase::row_index_hot_ns() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("AIOS_SQL_ROWINDEX_HOT_S");
+    const unsigned long s = e && *e ? std::strtoul(e, nullptr, 10) : 600;
+    return (uint64_t)(s ? s : 600) * 1000000000ull;
+  }();
+  return v;
+}
+
+size_t SqlDatabase::row_index_budget_bytes() {
+  static const size_t v = [] {
+    const char* e = std::getenv("AIOS_SQL_ROWINDEX_MB");
+    const unsigned long mb = e && *e ? std::strtoul(e, nullptr, 10) : 1024;
+    return (size_t)(mb ? mb : 1024) << 20;
   }();
   return v;
 }
@@ -51886,7 +51906,7 @@ void SqlDatabase::grow_row_index(const SqlTable& t) {
     if (t.columns[i].auto_increment) ai_idx = (int)i;
   }
   if (!pk_cols.empty() || ai_idx >= 0) {
-    if (t.row_count() * 24 <= kRowIndexBudgetBytes / 2) sync_row_index(t, pk_cols, ai_idx);
+    if (t.row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(t, pk_cols, ai_idx);
     else sync_row_index(t, pk_cols, ai_idx, 16384);
   }
 }
@@ -51908,26 +51928,38 @@ void SqlDatabase::prune_all_row_indices_locked(size_t max_total_bytes,
                                               const std::string& exempt_key) {
   size_t total = row_indices_memory_bytes_locked();
   if (total <= max_total_bytes) return;
+  const uint64_t now = kernel_.host().monotonic_ns();
+  const uint64_t hot_ns = row_index_hot_ns();
+  bool evicted_any = false;
   while (total > max_total_bytes) {
     uint64_t oldest_ns = UINT64_MAX;
     std::string victim;
     size_t victim_mem = 0;
     for (const auto& kv : table_row_indices_) {
       if (kv.first == exempt_key || !kv.second) continue;
+      if (now - kv.second->last_access_ns < hot_ns) continue;   // in use: see row_index_hot_ns
       if (kv.second->last_access_ns < oldest_ns) {
         oldest_ns = kv.second->last_access_ns;
         victim = kv.first;
         victim_mem = kv.second->estimate_memory_bytes();
       }
     }
-    if (victim.empty()) break;
+    if (victim.empty()) {
+      static std::atomic<bool> said{false};
+      if (!said.exchange(true))
+        std::fprintf(stderr, "asql: primary-key row indices use %zu MB, over the %zu MB budget (AIOS_SQL_ROWINDEX_MB), and all of them "
+                     "are in use: none evicted\n", total >> 20, max_total_bytes >> 20);
+      break;
+    }
+    evicted_any = true;
     // erase() drops only this map's reference; a statement mid-flight holds its
     // own and the index dies when that statement is done with it.
     table_row_indices_.erase(victim);
+    metrics_.row_index_evictions.fetch_add(1, std::memory_order_relaxed);
     if (total >= victim_mem) total -= victim_mem;
     else total = 0;
   }
-  trim_process_memory();
+  if (evicted_any) trim_process_memory();
 }
 
 std::string SqlDatabase::row_key(const SqlRow& r, const std::vector<int>& pk_cols) {
@@ -51970,7 +52002,7 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
   if (it == table_row_indices_.end()) {
     // A NEW index is what costs memory, so the budget is enforced here and not
     // on the lookups that follow.
-    prune_all_row_indices_locked(kRowIndexBudgetBytes, tkey);
+    prune_all_row_indices_locked(row_index_budget_bytes(), tkey);
     auto idx = std::make_shared<RowIndex>();
     idx->table = t.name;
     idx->pk_columns = pk_cols;
@@ -52023,6 +52055,7 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
       }
     }
   }
+  metrics_.row_index_rows_indexed.fetch_add(i - row_index_.rows_indexed, std::memory_order_relaxed);
   row_index_.rows_indexed = i;   // t.row_count() unless capped: the next call carries on from here
   return holder;
 }
@@ -52620,7 +52653,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
   bool is_point_pk_update = false;
   std::shared_ptr<RowIndex> row_idx = nullptr;
   if (by_key && !pk_cols.empty()) {
-    if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);
+    if (t->row_count() * 24 <= row_index_budget_bytes() / 2) grow_row_index(*t);
     row_idx = get_or_sync_row_index(*t);
     if (row_idx) {
       auto hit = row_idx->pk_to_row.find(target_pk_key);
@@ -53383,7 +53416,7 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
     for (size_t i = 0; i < t->columns.size(); ++i)
       if (t->columns[i].is_primary_key) pkc.push_back((int)i);
     if (!pkc.empty() && extract_pk_equality(where, *t, pkc, pkk)) {
-      if (t->row_count() * 24 <= kRowIndexBudgetBytes / 2) grow_row_index(*t);
+      if (t->row_count() * 24 <= row_index_budget_bytes() / 2) grow_row_index(*t);
       del_idx = get_or_sync_row_index(*t);
       if (del_idx) {
         auto hit = del_idx->pk_to_row.find(pkk);
