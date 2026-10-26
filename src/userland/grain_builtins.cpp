@@ -2048,7 +2048,51 @@ class JsonParser {
   }
 };
 
-void json_stringify_helper(const Value& v, std::string& out, int indent_level, int indent_spaces, int depth) {
+// JSON output options: ascii writes every character past ASCII as \uXXXX (lowercase hex; a surrogate pair past
+// U+FFFF; a byte that is no UTF-8 as U+FFFD), escape_slashes writes "/" as "\/" - PHP's json_encode() with no flags.
+enum : int { kJsonAscii = 1, kJsonEscapeSlashes = 2 };
+
+void json_write_string(const std::string& s, std::string& out, int flags) {
+  out += '"';
+  const size_t n = s.size();
+  for (size_t i = 0; i < n; ++i) {
+    const unsigned char c = (unsigned char)s[i];
+    switch (c) {
+      case '"': out += "\\\""; continue;
+      case '\\': out += "\\\\"; continue;
+      case '\b': out += "\\b"; continue;
+      case '\f': out += "\\f"; continue;
+      case '\n': out += "\\n"; continue;
+      case '\r': out += "\\r"; continue;
+      case '\t': out += "\\t"; continue;
+      case '/': out += (flags & kJsonEscapeSlashes) ? "\\/" : "/"; continue;
+      default: break;
+    }
+    char h[16];
+    if (c < 0x20) { std::snprintf(h, sizeof h, "\\u%04x", c); out += h; continue; }
+    if (c < 0x80 || !(flags & kJsonAscii)) { out += (char)c; continue; }
+    // a UTF-8 sequence: its code point, checked
+    const int len = c >= 0xF0 && c < 0xF8 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
+    uint32_t cp = len == 4 ? (c & 7u) : len == 3 ? (c & 15u) : (c & 31u);
+    bool ok = len > 0 && i + (size_t)len <= n;
+    for (int k = 1; ok && k < len; ++k) {
+      const unsigned char cc = (unsigned char)s[i + (size_t)k];
+      if ((cc & 0xC0) != 0x80) ok = false;
+      else cp = (cp << 6) | (cc & 63u);
+    }
+    if (!ok) { out += "\\ufffd"; continue; }
+    i += (size_t)len - 1;
+    if (cp >= 0x10000) {
+      std::snprintf(h, sizeof h, "\\u%04x\\u%04x", 0xD800 + ((cp - 0x10000) >> 10), 0xDC00 + ((cp - 0x10000) & 1023));
+    } else {
+      std::snprintf(h, sizeof h, "\\u%04x", cp);
+    }
+    out += h;
+  }
+  out += '"';
+}
+
+void json_stringify_helper(const Value& v, std::string& out, int indent_level, int indent_spaces, int depth, int flags = 0) {
   if (depth > 128) { out += "null"; return; }
   switch (v.type) {
     case Type::Nil: out += "null"; break;
@@ -2065,31 +2109,7 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       }
       break;
     }
-    case Type::Str: {
-      out += '"';
-      for (char c : v.str()) {
-        switch (c) {
-          case '"': out += "\\\""; break;
-          case '\\': out += "\\\\"; break;
-          case '\b': out += "\\b"; break;
-          case '\f': out += "\\f"; break;
-          case '\n': out += "\\n"; break;
-          case '\r': out += "\\r"; break;
-          case '\t': out += "\\t"; break;
-          default:
-            if ((unsigned char)c < 0x20) {
-              char h[8];
-              std::snprintf(h, sizeof(h), "\\u%04x", (unsigned char)c);
-              out += h;
-            } else {
-              out += c;
-            }
-            break;
-        }
-      }
-      out += '"';
-      break;
-    }
+    case Type::Str: json_write_string(v.str(), out, flags); break;
     case Type::List: {
       const auto& items = v.list_items();
       if (items.empty()) { out += "[]"; break; }
@@ -2097,7 +2117,7 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       if (indent_spaces > 0) out += "\n";
       for (size_t i = 0; i < items.size(); ++i) {
         if (indent_spaces > 0) out.append((indent_level + 1) * indent_spaces, ' ');
-        json_stringify_helper(items[i], out, indent_level + 1, indent_spaces, depth + 1);
+        json_stringify_helper(items[i], out, indent_level + 1, indent_spaces, depth + 1, flags);
         if (i + 1 < items.size()) out += ",";
         if (indent_spaces > 0) out += "\n";
       }
@@ -2112,15 +2132,10 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       if (indent_spaces > 0) out += "\n";
       for (size_t i = 0; i < m->entries.size(); ++i) {
         if (indent_spaces > 0) out.append((indent_level + 1) * indent_spaces, ' ');
-        out += '"';
-        for (char c : m->entries[i].first) {
-          if (c == '"') out += "\\\"";
-          else if (c == '\\') out += "\\\\";
-          else out += c;
-        }
-        out += "\":";
+        json_write_string(m->entries[i].first, out, flags);
+        out += ":";
         if (indent_spaces > 0) out += " ";
-        json_stringify_helper(m->entries[i].second, out, indent_level + 1, indent_spaces, depth + 1);
+        json_stringify_helper(m->entries[i].second, out, indent_level + 1, indent_spaces, depth + 1, flags);
         if (i + 1 < m->entries.size()) out += ",";
         if (indent_spaces > 0) out += "\n";
       }
@@ -2250,14 +2265,30 @@ Value bi_json_parse(Vm&, std::vector<Value>& args, std::string& error) {
   return v;
 }
 
+// json_stringify(v [, indent | {indent, ascii, escape_slashes}])
 Value bi_json_stringify(Vm&, std::vector<Value>& args, std::string& error) {
-  int indent_spaces = 0;
-  if (args.size() > 1) {
+  int indent_spaces = 0, flags = 0;
+  if (args.size() > 1 && args[1].type == Type::Map) {
+    auto* o = static_cast<MapObj*>(args[1].obj.get());
+    for (const auto& kv : o->entries) {
+      if (kv.first == "indent") {
+        if (!want_number(kv.second, error, "json_stringify")) return Value::nil();
+        indent_spaces = std::max(0, (int)kv.second.as_int());
+      } else if (kv.first == "ascii") {
+        if (kv.second.truthy()) flags |= kJsonAscii;
+      } else if (kv.first == "escape_slashes") {
+        if (kv.second.truthy()) flags |= kJsonEscapeSlashes;
+      } else {
+        error = "json_stringify(): no option '" + kv.first + "' (indent, ascii, escape_slashes)";
+        return Value::nil();
+      }
+    }
+  } else if (args.size() > 1) {
     if (!want_number(args[1], error, "json_stringify")) return Value::nil();
     indent_spaces = std::max(0, (int)args[1].as_int());
   }
   std::string out;
-  json_stringify_helper(args[0], out, 0, indent_spaces, 0);
+  json_stringify_helper(args[0], out, 0, indent_spaces, 0, flags);
   return Value::string(out);
 }
 

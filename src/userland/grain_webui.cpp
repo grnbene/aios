@@ -888,6 +888,22 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
     std::lock_guard<std::mutex> turn(s->mu);
     api_only = web_pane_api_only(*s->vm, s->pane);
   }
+  // A route given to another fleet member (on_machine): carried there and its answer given back as it came.
+  if (host_.forward && (req.path != "/" || api_only) && req.path != "/_ui/event") {
+    std::string member;
+    {
+      std::lock_guard<std::mutex> turn(s->mu);
+      member = web_pane_route_machine(*s->vm, s->pane, req.method, req.path);
+    }
+    if (!member.empty()) {
+      Response fwd;
+      if (host_.forward(member, req, fwd)) {
+        if (fwd.status == 502 || fwd.status == 503) report(req.path + " given to " + member + ": " + fwd.body);
+        if (!cookie_header.empty()) fwd.headers.push_back({"Set-Cookie", cookie_header});
+        return fwd;
+      }
+    }
+  }
   if ((req.path != "/" || api_only) && req.path != "/_ui/event") {
     int status = 200;
     std::string res_body, content_type, route_err;

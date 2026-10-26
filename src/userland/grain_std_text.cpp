@@ -243,6 +243,49 @@ Value bi_group_by(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, groups);
 }
 
+// key_by(list, key_fn): a map from each key (as text) to the FIRST item with it, keys in the order first met.
+Value bi_key_by(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "key_by")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  auto out = std::make_shared<MapObj>();
+  for (const auto& item : items) {
+    Value key = vm.call(args[1], {item}, error);
+    if (!error.empty()) return Value::nil();
+    const std::string k = key.to_text();
+    if (!out->find(k)) out->put(k, item);
+  }
+  return Value::object(Type::Map, out);
+}
+
+// sum_by(list, key_fn, value_fn): a map from each key (as text) to the sum of value_fn over its items, as `+` adds:
+// ints stay ints, a decimal makes the sum exact, a real makes it real. A nil value counts as nothing.
+Value bi_sum_by(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "sum_by")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  auto out = std::make_shared<MapObj>();
+  for (const auto& item : items) {
+    Value key = vm.call(args[1], {item}, error);
+    if (!error.empty()) return Value::nil();
+    Value v = vm.call(args[2], {item}, error);
+    if (!error.empty()) return Value::nil();
+    if (v.type == Type::Nil) { if (!out->find(key.to_text())) out->put(key.to_text(), Value::integer(0)); continue; }
+    if (v.type != Type::Int && v.type != Type::Real && v.type != Type::Decimal) {
+      error = std::string("sum_by(): the value function gave a ") + type_name(v.type) + ", not a number";
+      return Value::nil();
+    }
+    const std::string k = key.to_text();
+    Value* cur = out->find(k);
+    if (!cur) { out->put(k, v); continue; }
+    Value sum;
+    if (cur->type == Type::Int && v.type == Type::Int) sum = Value::integer(cur->i + v.i);
+    else if (cur->type == Type::Decimal || v.type == Type::Decimal) {
+      if (!decimal_arith('+', *cur, v, sum, error)) { error = "sum_by(): " + error; return Value::nil(); }
+    } else sum = Value::real(cur->as_double() + v.as_double());
+    *cur = sum;
+  }
+  return Value::object(Type::Map, out);
+}
+
 Value bi_uuid(Vm&, std::vector<Value>&, std::string&) {
   thread_local std::mt19937_64 rng{[] {
 #if defined(AIOS_METAL)
@@ -279,6 +322,8 @@ void install_text_builtins(Vm& vm) {
   vm.define_native("format", 1, -1, bi_format);
   vm.define_native("sort_by", 2, 3, bi_sort_by);
   vm.define_native("group_by", 2, 2, bi_group_by);
+  vm.define_native("key_by", 2, 2, bi_key_by);
+  vm.define_native("sum_by", 3, 3, bi_sum_by);
   vm.define_native("uuid", 0, 0, bi_uuid);
 }
 

@@ -856,6 +856,10 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
     wh.load_source = [raw, main, version](std::string& source, std::string& v, std::string&) { source = raw->bundle.files.at(main); v = version; return true; };
     wh.current_version = [version](std::string& v, std::string&) { v = version; return true; };
     wh.setup = [raw](Vm& vm) -> std::shared_ptr<void> { raw->setup(vm); return nullptr; };
+    if (opt_.forward) {
+      auto fwd = opt_.forward;
+      wh.forward = [fwd, app](const std::string& member, const WebUi::Request& req, WebUi::Response& res) { return fwd(app, member, req, res); };
+    }
     in->ui = std::make_shared<WebUi>(std::move(wh));
     in->ui->log = [this, app](const std::string& msg) { log(app, "[web] " + msg); };
     const int want = port_override >= 0 ? port_override : in->m.port;
@@ -1199,6 +1203,21 @@ Result<std::string> Host::rollback(const std::string& app, std::vector<std::stri
 Result<void> Host::remove(const std::string& app) {
   if (auto s = stop(app); !s.ok()) return s;
   return store_.remove_app(app);
+}
+
+Result<WebUi::Response> Host::answer_forwarded(const std::string& app, const WebUi::Request& req) {
+  std::shared_ptr<Instance> in;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = running_.find(app);
+    if (it != running_.end()) in = it->second;
+  }
+  if (!in || !in->ui || in->state != (int)State::Running)
+    return Result<WebUi::Response>(Status::NotFound, "app " + app + " is not running on " + opt_.machine);
+  in->requests++;
+  WebUi::Response res = in->ui->handle(req);   // no streaming over the link: a route that streams is buffered whole
+  if (res.status >= 500) in->failures++;
+  return res;
 }
 
 std::vector<AppStatus> Host::status() {

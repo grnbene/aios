@@ -1,0 +1,13 @@
+# on_machine(member, handler): a route value for a route given to a fleet member. With no member it is the handler
+# itself; with one, a marker the app host carries there (and answers with the handler when it is that member).
+fn check(c, msg) { assert_true(c, msg) }
+fn h(req) { return {"status": 200, "body": "here"} }
+check(on_machine("", h) == h, "no member: the handler itself")
+check(on_machine(nil, h) == h, "nil member: the handler itself")
+let m = on_machine("7c513d4f845a", h)
+check(type(m) == "map" and m.__on_machine == "7c513d4f845a" and m.__handler == h, "a member: the marker, with the handler")
+let r1 = pcall(fn () { return on_machine(5, h) })
+check(not r1.ok, "a member must be a string")
+let r2 = pcall(fn () { return on_machine("x", 5) })
+check(not r2.ok, "a handler is needed")
+print("on_machine ok")

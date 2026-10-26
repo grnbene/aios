@@ -39,6 +39,7 @@
 #include "aios/hal/net.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/userland/grain.hpp"
+#include "aios/userland/grain_webui.hpp"
 
 namespace aios::userland::grain::apps {
 
@@ -119,7 +120,13 @@ class Host {
     std::function<void(Vm&)> setup_vm;
     std::vector<std::string> capabilities;   // what an app's `requires` may name ("grain" always)
     std::string machine;                     // this machine's name, in status and logs
+    // A web app's route given to a fleet member (on_machine): its request answered there, by the embedder's link
+    // (aios: the fleet). false when `member` is this machine, so the route answers here. Unset: every route here.
+    std::function<bool(const std::string& app, const std::string& member, const WebUi::Request& req, WebUi::Response& res)> forward;
   };
+  // What a forwarded request is answered with on the member it was given to: this host's own app `app`, asked over
+  // its local port as a client would ask it. The caller's link carries the request in and the answer out.
+  Result<WebUi::Response> answer_forwarded(const std::string& app, const WebUi::Request& req);
   Host(hal::Host& host, Store& store, Options opt);
   ~Host();
 
