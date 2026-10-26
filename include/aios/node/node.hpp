@@ -160,5 +160,9 @@ std::string remote_memory_node(Kernel& k);
 
 // Executes a host command using standard process execution and captures output.
 int execute_host_command(const std::string& command, std::string& output);
+// What a fleet peer's command line gets on a machine that installed no runner of its own (and the fallback of
+// `aios serve`'s): refused - holding the fleet's keys is not a shell on every member - unless this machine opts in
+// with AIOS_FLEET_SHELL=1, and then the shell runs it (execute_host_command).
+int fleet_shell_command(const std::string& command, std::string& output);
 
 }  // namespace aios

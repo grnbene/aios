@@ -820,7 +820,7 @@ void RelayClient::Impl::ensure_command_server(std::shared_ptr<Impl> self_sp) {
             Reader r(body);
             std::string line = r.str();
             std::string out;
-            int code = self_sp->command_runner ? self_sp->command_runner(line, out) : execute_host_command(line, out);
+            int code = self_sp->command_runner ? self_sp->command_runner(line, out) : fleet_shell_command(line, out);
             ByteBuffer rep;
             Writer w(rep);
             w.u32(static_cast<uint32_t>(code));

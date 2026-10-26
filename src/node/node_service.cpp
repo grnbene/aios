@@ -396,7 +396,7 @@ bool NodeService::step(Session& sess, int timeout_ms) {
         std::string line = r.str();
         if (!r.ok()) break;
         std::string output;
-        int code = runner_ ? runner_(line, output) : execute_host_command(line, output);
+        int code = runner_ ? runner_(line, output) : fleet_shell_command(line, output);
         w.u32(static_cast<uint32_t>(code)); w.str(output);
         break;
       }

@@ -1351,7 +1351,7 @@ void cmd_serve(Ctx& c, const Args& a) {
       auto words = userland::split_command(line);
       return run_app_line(c.k, std::vector<std::string>(words.begin() + 1, words.end()), out);
     }
-    return execute_host_command(line, out);
+    return fleet_shell_command(line, out);   // anything but `app ...`: refused unless AIOS_FLEET_SHELL=1
   };
   // The node service takes the fleet's circuits (Kernel::fleet_join's acceptor) and answers commands and work alike.
   // The relay's own command server is only for a kernel with no service: running both, each circuit went to
