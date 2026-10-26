@@ -53,6 +53,7 @@ struct Expr {
   ExprP a, b, c;             // operands; Index uses a[b], IndexSet a[b] = c
   std::vector<ExprP> items;  // call arguments, list elements, map values
   std::vector<std::string> keys;   // map keys, parallel to items
+  std::vector<uint8_t> spread;     // Call / ListLit: 1 where the item was written `...x` (its elements go in its place); empty if none
 
   // Lambda body. A named `fn` declaration is a Let of a Lambda, so there is
   // one code path for both and closures work the same either way.

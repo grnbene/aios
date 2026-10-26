@@ -416,7 +416,7 @@ size_t print_one(std::ostringstream& out, const FnObj& fn, size_t at, int& last_
       out << " " << k << "  ; " << c.constants[k].repr() << "\n";
       return at + 3;
     }
-    case Op::BuildList: case Op::BuildMap:
+    case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
       out << " " << ((c.code[at + 1] << 8) | c.code[at + 2]) << "\n";
       return at + 3;
     case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:
@@ -1541,6 +1541,45 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         for (const auto& it : items) if (it.is_container()) { has_c = true; break; }
         S.stack.push_back(Value::list(std::move(items)));
         if (has_c) track_container(S.stack.back().obj);
+        break;
+      }
+      case Op::ListConcat: {
+        const uint16_t n = read_short();
+        const size_t first = S.stack.size() - n;
+        size_t total = 0;
+        bool bad = false;
+        for (size_t k = first; k < S.stack.size(); ++k) {
+          if (S.stack[k].type != Type::List) {
+            fail(line, std::string("... spreads a list, not a ") + type_name(S.stack[k].type));
+            bad = true;
+            break;
+          }
+          total += S.stack[k].list_items().size();
+        }
+        if (bad) break;
+        std::vector<Value> items;
+        items.reserve(total);
+        bool has_c = false;
+        for (size_t k = first; k < S.stack.size(); ++k)
+          for (const auto& it : S.stack[k].list_items()) {
+            if (it.is_container()) has_c = true;
+            items.push_back(it);
+          }
+        S.stack.resize(first);
+        S.stack.push_back(Value::list(std::move(items)));
+        if (has_c) track_container(S.stack.back().obj);
+        break;
+      }
+      case Op::CallList: {
+        // [callee, list] -> [callee, items...], then the call as Call makes it
+        Value args = pop();
+        const auto& items = args.list_items();
+        if (items.size() > 255) { fail(line, "more than 255 arguments"); break; }
+        for (const auto& it : items) S.stack.push_back(it);
+        const uint8_t argc = (uint8_t)items.size();
+        const bool ok = invoke(S.stack[S.stack.size() - argc - 1], argc, line, col);
+        frame = &S.frames.back(); cur = frame->chunk;
+        if (!ok) break;
         break;
       }
       case Op::BuildMap: {

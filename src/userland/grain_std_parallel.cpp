@@ -119,7 +119,7 @@ class Pool {
 size_t next_instruction(const Chunk& c, size_t at) {
   switch ((Op)c.code[at]) {
     case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
     case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
       return at + 3;
     case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:

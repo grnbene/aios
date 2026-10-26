@@ -677,6 +677,22 @@ grain::Value gb_read(grain::Vm&, std::vector<grain::Value>& args, std::string& e
 // string, not a number, is what that code's rules are about.
 grain::Value gb_read_raw(grain::Vm&, std::vector<grain::Value>& args, std::string& error) { return read_impl(args, error, true); }
 
+// read_with(sql, params) / read_raw_with(sql, params): the same, the ? values given as one list (nil: none) - for a
+// caller holding its parameters in a list. A list among them still binds as IN (...), as it does in read().
+grain::Value read_with_impl(std::vector<grain::Value>& args, std::string& error, bool raw) {
+  if (args[1].type != grain::Type::List && args[1].type != grain::Type::Nil) {
+    error = std::string(raw ? "read_raw_with" : "read_with") + "() wants its parameters as a list";
+    return grain::Value::nil();
+  }
+  std::vector<grain::Value> flat;
+  flat.push_back(args[0]);
+  if (args[1].type == grain::Type::List)
+    for (const auto& v : args[1].list_items()) flat.push_back(v);
+  return read_impl(flat, error, raw);
+}
+grain::Value gb_read_with(grain::Vm&, std::vector<grain::Value>& args, std::string& error) { return read_with_impl(args, error, false); }
+grain::Value gb_read_raw_with(grain::Vm&, std::vector<grain::Value>& args, std::string& error) { return read_with_impl(args, error, true); }
+
 bool gcall(ThingGrain& g, const char* name, const std::vector<grain::Value>& args, grain::Value* out, std::string* err) {
   grain::Value* f = g.vm.find_global(name);
   if (!f) { *err = std::string("the program defines no ") + name + "()"; return false; }
@@ -710,7 +726,7 @@ const std::vector<std::string>& grain_allowed() {
       "ceil", "sqrt", "pow", "round", "trunc", "sign", "clamp", "log", "log2", "log10", "exp", "assert", "try_call",
       "pcall", "error", "panic", "is_err", "is_ok", "json_parse", "json_stringify",
       // exact decimals and text layout: pure functions of their arguments
-      "decimal", "dec_div", "scale", "decimal_prefix", "round_sig", "format", "sort_by", "idiv", "upper_rtrim",
+      "decimal", "dec_div", "scale", "decimal_prefix", "round_sig", "number_format", "format", "sort_by", "idiv", "upper_rtrim",
       // patterns: the same text and pattern give the same answer anywhere
       "regex_test", "regex_match", "regex_find_all", "regex_replace", "regex_split",
       "sat"};   // deterministic: a reaction replayed after a crash gets the same answer
@@ -5012,6 +5028,8 @@ bool ThingEngine::grain_boot(Kind& k, std::string* err) {
   g->vm.retain_globals(grain_allowed());
   g->vm.define_native("read", 1, -1, gb_read);
   g->vm.define_native("read_raw", 1, -1, gb_read_raw);
+  g->vm.define_native("read_with", 2, 2, gb_read_with);
+  g->vm.define_native("read_raw_with", 2, 2, gb_read_raw_with);
   g->vm.define_native("claims", 2, 2, gb_claims);
   g->vm.define_native("write", 1, -1, gb_write);
   g->vm.define_native("read_target", 1, -1, gb_read_target);
