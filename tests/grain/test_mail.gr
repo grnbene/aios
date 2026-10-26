@@ -1,0 +1,59 @@
+// mail_send through aios's SMTP client, against tests/grain/net/smtp_sink.py (run scripts/grain-net-check.sh):
+// sign-in, recipients (bcc delivered, never named), text / html / attachments as MIME, UTF-8 subject and names,
+// refusals (bad addresses, header injection, a password in the clear to another machine, a wrong password).
+// scripts/grain-net-check.sh then parses every message the sink kept with Python's email package.
+fn check(c, msg) { assert_true(c, msg) }
+let port = getenv("GRAIN_TEST_SMTP_PORT")
+let out_dir = getenv("GRAIN_TEST_SMTP_DIR")
+check(port != nil and out_dir != nil, "GRAIN_TEST_SMTP_PORT and GRAIN_TEST_SMTP_DIR must be set (run scripts/grain-net-check.sh)")
+let server = {"host": "127.0.0.1", "port": int(port), "security": "none", "user": "app", "password": "s3cret"}
+fn with_server(m) {
+  let all = {}
+  for k in keys(server) { all[k] = server[k] }
+  for k in keys(m) { all[k] = m[k] }
+  return all
+}
+fn kept(n) { return json_parse(read_file(out_dir + "/" + str(n) + ".json")) }
+
+// 1. Plain text, signed in, to + cc + bcc.
+let r1 = mail_send(with_server({"from": "feed@qbc.example", "from_name": "Sticker Feed", "to": "a@x.example",
+  "cc": ["b@x.example"], "bcc": ["audit@x.example"], "subject": "Daily report", "text": "Hello.\n.leading dot line\nBye."}))
+check(r1.ok and r1.recipients == 3 and contains(r1.message_id, "@qbc.example>"), "sent: " + str(r1))
+let m1 = kept(1)
+check(m1.auth == "app", "signed in")
+check(m1.from == "feed@qbc.example", "envelope from")
+check(len(m1.rcpts) == 3 and m1.rcpts[2] == "audit@x.example", "bcc is a recipient: " + str(m1.rcpts))
+check(!contains(m1.data, "audit@x.example"), "bcc is named in no header")
+check(contains(m1.data, "From: \"Sticker Feed\" <feed@qbc.example>"), "From with its name")
+check(contains(m1.data, ".leading dot line"), "a line starting with a dot arrives as written")
+
+// 2. UTF-8 subject and name, text + html alternatives, an attachment with a UTF-8 filename.
+let r2 = mail_send(with_server({"from": "feed@qbc.example", "from_name": "Ünïcode Feed", "to": ["a@x.example"],
+  "subject": "Preise für Reifen ✓", "text": "Grüße", "html": "<p>Grüße</p>",
+  "attachments": [{"filename": "bericht-ü.csv", "type": "text/csv", "data": "sku,qty\n1,2\n"},
+                  {"filename": "logo.bin", "data": bytes_from_hex("00ff7f80")}]}))
+check(r2.ok, "a MIME message sent")
+let m2 = kept(2)
+check(contains(m2.data, "=?UTF-8?B?"), "the UTF-8 subject is encoded")
+check(contains(m2.data, "multipart/mixed") and contains(m2.data, "multipart/alternative"), "mixed around alternative")
+check(contains(m2.data, "filename*=UTF-8''bericht-%C3%BC.csv"), "the UTF-8 filename as RFC 2231")
+
+// 3. Refusals.
+check(!pcall(mail_send, with_server({"from": "feed@qbc.example", "to": "not an address", "subject": "x", "text": "x"})).ok, "a bad address")
+check(!pcall(mail_send, with_server({"from": "feed@qbc.example", "to": "a@x.example\r\nBcc: evil@x.example", "subject": "x", "text": "x"})).ok, "an address with a line break")
+let inj = pcall(mail_send, with_server({"from": "feed@qbc.example", "to": "a@x.example", "subject": "hi\r\nBcc: evil@x.example", "text": "x"}))
+check(!inj.ok and contains(inj.error, "line break"), "a subject with a line break: " + str(inj.error))
+check(!pcall(mail_send, with_server({"from": "feed@qbc.example", "to": "a@x.example", "subject": "x"})).ok, "no body")
+check(!pcall(mail_send, with_server({"from": "feed@qbc.example", "subject": "x", "text": "x"})).ok, "no recipients")
+let clear = pcall(mail_send, {"host": "mail.example.com", "port": 25, "security": "none", "user": "u", "password": "p",
+  "from": "feed@qbc.example", "to": "a@x.example", "subject": "x", "text": "x"})
+check(!clear.ok and contains(clear.error, "never sent unencrypted"), "no password in the clear to another machine: " + str(clear.error))
+let wrong = pcall(mail_send, with_server({"password": "nope", "from": "feed@qbc.example", "to": "a@x.example", "subject": "x", "text": "x"}))
+check(!wrong.ok and contains(wrong.error, "signing in"), "a wrong password: " + str(wrong.error))
+
+// 4. In a function and a closure.
+fn notify(who, what) { return mail_send(with_server({"from": "feed@qbc.example", "to": who, "subject": what, "text": what})).ok }
+check(notify("c@x.example", "from a function"), "in a function")
+let later = fn (s) { return mail_send(with_server({"from": "feed@qbc.example", "to": "d@x.example", "subject": s, "html": "<b>" + s + "</b>"})) }
+check(later("from a closure").ok, "in a closure")
+print("PASS: test_mail")
