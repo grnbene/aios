@@ -135,6 +135,7 @@ void prepare(g::Vm& vm, const Options& opt, const std::vector<std::string>& scri
   g::install_http_builtins(vm);
   g::install_db_builtins(vm);
   grain_cli::install_process(vm);
+  vm.allow_process = !opt.safe;   // a script the user runs may start programs (process_run), as exec() does
   if (!opt.safe) {
     grain_cli::install_ffi(vm);
     grain_cli::install_plugins(vm);
