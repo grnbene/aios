@@ -1855,6 +1855,35 @@ Value bi_cwd(Vm&, std::vector<Value>&, std::string&) {
 
 // --- error handling --------------------------------------------------------
 
+// What `defer` compiles to (grain_parser.cpp, lambda()): __grain_defer(list, fn) registers a cleanup;
+// __grain_run_deferred(body, list) runs the function's body, then its cleanups last first - every one of them, also
+// when the body raised or a cleanup did - and gives back the body's value, else the body's error, else the first
+// cleanup's error.
+Value bi_grain_defer(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::List) { error = "__grain_defer() is what `defer` compiles to; it is not called directly"; return Value::nil(); }
+  args[0].list_items().push_back(args[1]);
+  return Value::nil();
+}
+
+Value bi_grain_run_deferred(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (args[1].type != Type::List) { error = "__grain_run_deferred() is what `defer` compiles to; it is not called directly"; return Value::nil(); }
+  std::string body_error;
+  Value result = vm.call(args[0], {}, body_error);
+  std::string cleanup_error;
+  // Index from the end each time: a cleanup that registers more (it cannot - its own defers are its own) or a list
+  // grown by the body is read as it is now.
+  for (size_t done = 0; done < args[1].list_items().size(); ++done) {
+    const auto& cleanups = args[1].list_items();
+    const Value fn = cleanups[cleanups.size() - 1 - done];
+    std::string e;
+    (void)vm.call(fn, {}, e);
+    if (!e.empty() && cleanup_error.empty()) cleanup_error = "in a deferred cleanup: " + e;
+  }
+  if (!body_error.empty()) { error = body_error; return Value::nil(); }
+  if (!cleanup_error.empty()) { error = cleanup_error; return Value::nil(); }
+  return result;
+}
+
 Value bi_try_call(Vm& vm, std::vector<Value>& args, std::string&) {
   const Value& fn = args[0];
   std::vector<Value> fn_args;
@@ -6910,6 +6939,8 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("clock", 0, 0, bi_clock);
   vm.define_native("try_call", 1, -1, bi_try_call);
   vm.define_native("pcall", 1, -1, bi_try_call);
+  vm.define_native("__grain_defer", 2, 2, bi_grain_defer);
+  vm.define_native("__grain_run_deferred", 2, 2, bi_grain_run_deferred);
   vm.define_native("error", 0, 1, bi_error);
   vm.define_native("panic", 0, 1, bi_error);
   vm.define_native("is_err", 1, 1, bi_is_err);

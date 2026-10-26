@@ -641,8 +641,83 @@ ExprP Parser::lambda() {
   expect(Tok::RParen, "')'");
   skip_newlines();
   expect(Tok::LBrace, "'{'");
+  const bool outer_has_defer = fn_has_defer_;
+  fn_has_defer_ = false;
+  ++fn_depth_;
   e->body = block_body();
+  --fn_depth_;
+  if (fn_has_defer_) {
+    // A body with `defer` runs as
+    //   let __grain_defers = []
+    //   return __grain_run_deferred(fn () { <body> }, __grain_defers)
+    // and each `defer S` in it as __grain_defer(__grain_defers, fn () { S }). The native runs the body, then every
+    // deferred closure, last first, whether the body returned or raised; then gives back the body's value or its
+    // error (else the first cleanup error). Nothing else changes: the interpreter, the JIT and error unwinding are
+    // the same for every function.
+    auto name = [&](const char* n) { auto x = std::make_unique<Expr>(); x->kind = ExprKind::Name; x->text = n; x->line = line; x->column = col; return x; };
+    auto decl = std::make_unique<Stmt>();
+    decl->kind = StmtKind::Let;
+    decl->line = line; decl->column = col;
+    decl->name = "__grain_defers";
+    decl->expr = std::make_unique<Expr>();
+    decl->expr->kind = ExprKind::ListLit;
+    decl->expr->line = line; decl->expr->column = col;
+    auto inner = std::make_unique<Expr>();
+    inner->kind = ExprKind::Lambda;
+    inner->line = line; inner->column = col;
+    inner->fn_name = e->fn_name;
+    inner->body = std::move(e->body);
+    auto call = std::make_unique<Expr>();
+    call->kind = ExprKind::Call;
+    call->line = line; call->column = col;
+    call->a = name("__grain_run_deferred");
+    call->items.push_back(std::move(inner));
+    call->items.push_back(name("__grain_defers"));
+    auto ret = std::make_unique<Stmt>();
+    ret->kind = StmtKind::Return;
+    ret->line = line; ret->column = col;
+    ret->expr = std::move(call);
+    e->body.clear();
+    e->body.push_back(std::move(decl));
+    e->body.push_back(std::move(ret));
+  }
+  fn_has_defer_ = outer_has_defer;
   return e;
+}
+
+// `defer S` / `defer { ... }`: S runs when the function returns or raises, after the code below it; several run last
+// first. S reads variables as they are then (it is a closure), not as they were at the defer.
+StmtP Parser::defer_statement() {
+  const Token t = peek();
+  advance();   // defer
+  if (fn_depth_ == 0) error_at(t, "defer belongs in a function body: it runs when the function returns");
+  fn_has_defer_ = true;
+  auto lam = std::make_unique<Expr>();
+  lam->kind = ExprKind::Lambda;
+  lam->line = t.line; lam->column = t.column;
+  lam->fn_name = "<defer>";
+  if (check(Tok::LBrace)) {
+    advance();
+    lam->body = block_body();
+  } else {
+    StmtP s = statement();
+    if (s) lam->body.push_back(std::move(s));
+  }
+  auto call = std::make_unique<Expr>();
+  call->kind = ExprKind::Call;
+  call->line = t.line; call->column = t.column;
+  auto fname = std::make_unique<Expr>();
+  fname->kind = ExprKind::Name; fname->text = "__grain_defer"; fname->line = t.line; fname->column = t.column;
+  auto list = std::make_unique<Expr>();
+  list->kind = ExprKind::Name; list->text = "__grain_defers"; list->line = t.line; list->column = t.column;
+  call->a = std::move(fname);
+  call->items.push_back(std::move(list));
+  call->items.push_back(std::move(lam));
+  auto st = std::make_unique<Stmt>();
+  st->kind = StmtKind::Expression;
+  st->line = t.line; st->column = t.column;
+  st->expr = std::move(call);
+  return st;
 }
 
 // Calls, indexing and fields all bind tighter than any operator and chain left
@@ -985,6 +1060,13 @@ StmtP Parser::statement() {
 
   if (t.kind == Tok::Entity) {
     return entity_declaration();
+  }
+
+  // `defer` starts a defer statement only when a block or a name follows on the same line (`defer { .. }`,
+  // `defer close(f)`): anywhere else - `let defer = true`, `if defer {`, `defer ? a : b` - it is a name, as before.
+  if (t.kind == Tok::Ident && t.text == "defer" && peek(1).line == t.line &&
+      (peek(1).kind == Tok::LBrace || peek(1).kind == Tok::Ident || peek(1).kind == Tok::If)) {
+    return defer_statement();
   }
 
   // `native fn name(..) -> T { .. }` and `extern fn name(..) -> T` are typed code for the
