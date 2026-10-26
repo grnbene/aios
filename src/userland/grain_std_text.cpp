@@ -22,6 +22,7 @@
 
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
+#include "aios/core/strbuf.hpp"
 
 namespace aios::userland::grain {
 
@@ -330,18 +331,20 @@ std::string unescape_xml(const std::string& in) {
         if (ent == "quot") { out.push_back('"'); i = semi; continue; }
         if (ent == "apos") { out.push_back('\''); i = semi; continue; }
         if (!ent.empty() && ent[0] == '#') {
+          // Every character a digit of its base, and a code point UTF-8 may hold (not a surrogate, not past
+          // U+10FFFF, not NUL); anything else stays as written.
           uint32_t cp = 0;
           bool ok = false;
-          if (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) {
-            try {
-              cp = static_cast<uint32_t>(std::stoul(ent.substr(2), nullptr, 16));
-              ok = true;
-            } catch (...) {}
-          } else {
-            try {
-              cp = static_cast<uint32_t>(std::stoul(ent.substr(1), nullptr, 10));
-              ok = true;
-            } catch (...) {}
+          const bool hex = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X');
+          const size_t from = hex ? 2 : 1;
+          if (ent.size() > from && ent.size() - from <= 8) {
+            ok = true;
+            for (size_t d = from; d < ent.size() && ok; ++d) {
+              const int v = digit_value(ent[d], hex ? 16 : 10);
+              if (v < 0) ok = false;
+              else cp = cp * (hex ? 16 : 10) + (uint32_t)v;
+            }
+            if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) ok = false;
           }
           if (ok) {
             if (cp <= 0x7F) {
@@ -415,13 +418,20 @@ class XmlParser {
 
     skip_misc(err);
     if (!err.empty()) return Value::nil();
-
+    skip_ws();
+    if (pos < s.size()) {
+      err = "xml_parse: content after the root element";
+      return Value::nil();
+    }
     return root;
   }
 
  private:
   const std::string& s;
   size_t pos;
+  // Each element is a native call: nesting past this is refused rather than overflowing the stack.
+  static constexpr int kMaxDepth = 512;
+  int depth = 0;
 
   void skip_ws() {
     while (pos < s.size() && is_xml_space(s[pos])) pos++;
@@ -497,7 +507,8 @@ class XmlParser {
 
   bool is_name_char(char c) const {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == ':' || c == '.';
+           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == ':' || c == '.' ||
+           static_cast<unsigned char>(c) >= 0x80;   // UTF-8: XML names may be any letter
   }
 
   std::string parse_name() {
@@ -513,6 +524,11 @@ class XmlParser {
       return Value::nil();
     }
     pos++; // skip '<'
+    if (++depth > kMaxDepth) {
+      err = "xml_parse: elements nested deeper than " + std::to_string(kMaxDepth);
+      return Value::nil();
+    }
+    struct Leave { int& d; ~Leave() { --d; } } leave{depth};
 
     std::string tag = parse_name();
     if (tag.empty()) {
@@ -579,6 +595,7 @@ class XmlParser {
     pos++; // skip '>'
 
     std::string text_accum;
+    bool closed = false;
 
     while (pos < s.size()) {
       size_t next_lt = s.find('<', pos);
@@ -630,6 +647,7 @@ class XmlParser {
           err = "xml_parse: mismatched closing tag, expected </" + tag + "> but got </" + close_tag + ">";
           return Value::nil();
         }
+        closed = true;
         break;
       } else {
         Value child = parse_element(err);
@@ -638,7 +656,7 @@ class XmlParser {
       }
     }
 
-    if (pos > s.size()) {
+    if (!closed) {
       err = "xml_parse: unclosed tag <" + tag + ">";
       return Value::nil();
     }

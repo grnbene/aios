@@ -2399,7 +2399,8 @@ static void do_log(Vm& vm, int level, const std::string& msg, const Value* extra
         for (const auto& kv : o->entries) {
           if (!first) text += ", ";
           first = false;
-          text += "\"" + kv.first + "\":";
+          json_write_string(kv.first, text, 0);
+          text += ":";
           std::string v_str;
           json_stringify_helper(kv.second, v_str, 0, 0, 0, 0);
           text += v_str;
@@ -2488,6 +2489,17 @@ static std::string sse_one_line(std::string s) {
 }
 
 }  // namespace
+
+// The same JSON json_parse / json_stringify read and write, for other builtins (jwt_sign, jwt_verify).
+Value grain_json_parse(const std::string& text, std::string& err) {
+  JsonParser parser(text);
+  return parser.parse(err);
+}
+std::string grain_json_stringify(const Value& v) {
+  std::string out;
+  json_stringify_helper(v, out, 0, 0, 0, 0);
+  return out;
+}
 
 void format_one_sse_event(const Value& ev, std::string& out) {
   if (ev.type == Type::Map) {

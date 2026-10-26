@@ -87,4 +87,28 @@ fn test_malformed() {
 test_top_level();
 test_scopes();
 test_malformed();
+// Malformed input is an error, not a partial tree.
+let unclosed = pcall(xml_parse, "<a><b/>")
+assert_false(unclosed.ok, "a document that ends inside <a> must be an error")
+let unclosed2 = pcall(xml_parse, "<a>text")
+assert_false(unclosed2.ok, "text with no closing tag must be an error")
+let trailing = pcall(xml_parse, "<a/><b/>")
+assert_false(trailing.ok, "a second root element must be an error")
+let junk = pcall(xml_parse, "<a/>junk")
+assert_false(junk.ok, "text after the root element must be an error")
+assert_eq(xml_parse("<a/>  <!-- c -->\n").tag, "a", "comments and space after the root are fine")
+
+// Deep nesting is refused, not a crash (each level is a native stack frame).
+let deep = pcall(xml_parse, repeat("<a>", 100000) + repeat("</a>", 100000))
+assert_false(deep.ok, "100000 levels of nesting must be refused")
+assert_true(xml_parse(repeat("<a>", 200) + repeat("</a>", 200)).tag == "a", "200 levels parse")
+
+// Non-ASCII names (XML allows them).
+assert_eq(xml_parse("<prüfung wert=\"ä\">ok</prüfung>").attrs["wert"], "ä", "a UTF-8 element and attribute")
+
+// Character references: strict digits, valid code points.
+assert_eq(xml_unescape("&#65;&#x42;&#x1F600;"), "AB😀", "decimal, hex and an astral code point")
+assert_eq(xml_unescape("&#65x;"), "&#65x;", "a reference with a stray character stays as written")
+assert_eq(xml_unescape("&#xD800;"), "&#xD800;", "a surrogate stays as written")
+
 print("PASS: test_xml");

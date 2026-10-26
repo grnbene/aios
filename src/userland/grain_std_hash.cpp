@@ -13,7 +13,6 @@
 
 #include "aios/core/bytes.hpp"
 #include "aios/core/base64.hpp"
-#include "aios/core/json.hpp"
 #include "aios/crypto/aes_gcm.hpp"
 #include "aios/crypto/bcrypt.hpp"
 #include "aios/crypto/hmac_sha256.hpp"
@@ -105,6 +104,26 @@ Value bi_hash_equals(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 // random_bytes(n): returns a string of n cryptographically secure random bytes
+// The OS's random bytes (/dev/urandom), or std::random_device where that cannot be read.
+static void fill_random(uint8_t* out, size_t n) {
+  int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  size_t total = 0;
+  if (fd >= 0) {
+    while (total < n) {
+      ssize_t rd = ::read(fd, out + total, n - total);
+      if (rd <= 0) break;
+      total += static_cast<size_t>(rd);
+    }
+    ::close(fd);
+  }
+  if (total == n) return;
+  std::random_device rd;
+  for (size_t i = 0; i < n; i += 4) {
+    uint32_t r = rd();
+    std::memcpy(out + i, &r, std::min<size_t>(4, n - i));
+  }
+}
+
 Value bi_random_bytes(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[0], error, "random_bytes")) return Value::nil();
   int64_t n = args[0].as_int();
@@ -114,26 +133,7 @@ Value bi_random_bytes(Vm&, std::vector<Value>& args, std::string& error) {
   }
   if (n == 0) return Value::string("");
   std::string out(static_cast<size_t>(n), '\0');
-  int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  bool read_ok = false;
-  if (fd >= 0) {
-    size_t total = 0;
-    while (total < static_cast<size_t>(n)) {
-      ssize_t rd = ::read(fd, &out[total], static_cast<size_t>(n) - total);
-      if (rd <= 0) break;
-      total += rd;
-    }
-    ::close(fd);
-    if (total == static_cast<size_t>(n)) read_ok = true;
-  }
-  if (!read_ok) {
-    std::random_device rd;
-    for (size_t i = 0; i < static_cast<size_t>(n); i += 4) {
-      uint32_t r = rd();
-      size_t chunk = std::min<size_t>(4, static_cast<size_t>(n) - i);
-      std::memcpy(&out[i], &r, chunk);
-    }
-  }
+  fill_random(reinterpret_cast<uint8_t*>(&out[0]), out.size());
   return Value::string(std::move(out));
 }
 
@@ -152,25 +152,7 @@ Value bi_bcrypt_hash(Vm&, std::vector<Value>& args, std::string& error) {
   }
 
   uint8_t salt[16];
-  int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  bool read_ok = false;
-  if (fd >= 0) {
-    size_t total = 0;
-    while (total < 16) {
-      ssize_t rd = ::read(fd, &salt[total], 16 - total);
-      if (rd <= 0) break;
-      total += rd;
-    }
-    ::close(fd);
-    if (total == 16) read_ok = true;
-  }
-  if (!read_ok) {
-    std::random_device rd;
-    for (size_t i = 0; i < 16; i += 4) {
-      uint32_t r = rd();
-      std::memcpy(&salt[i], &r, 4);
-    }
-  }
+  fill_random(salt, sizeof salt);
 
   char out60[61];
   const std::string& pass = args[0].str();
@@ -221,87 +203,40 @@ static std::string base64url_decode(const std::string& in, bool& ok) {
   return std::string(reinterpret_cast<const char*>(res->data()), res->size());
 }
 
-static Value json_to_grain(const aios::json::Value& jv) {
-  switch (jv.type()) {
-    case aios::json::Value::Type::Null: return Value::nil();
-    case aios::json::Value::Type::Bool: return Value::boolean(jv.boolean_or(false));
-    case aios::json::Value::Type::Number: {
-      double d = jv.num();
-      if (std::floor(d) == d && d >= (double)std::numeric_limits<int64_t>::min() && d <= (double)std::numeric_limits<int64_t>::max()) {
-        return Value::integer(jv.i64());
-      }
-      return Value::real(d);
-    }
-    case aios::json::Value::Type::String: return Value::string(jv.str());
-    case aios::json::Value::Type::Array: {
-      std::vector<Value> list;
-      list.reserve(jv.size());
-      for (const auto& item : jv.items()) list.push_back(json_to_grain(item));
-      return Value::list(std::move(list));
-    }
-    case aios::json::Value::Type::Object: {
-      auto map_obj = std::make_shared<MapObj>();
-      for (const auto& member : jv.members()) {
-        map_obj->put(member.first, json_to_grain(member.second));
-      }
-      return Value::object(Type::Map, map_obj);
-    }
-  }
-  return Value::nil();
-}
-
-static aios::json::Value grain_to_json(const Value& gv) {
-  switch (gv.type) {
-    case Type::Nil: return aios::json::Value::null();
-    case Type::Bool: return aios::json::Value::boolean(gv.b);
-    case Type::Int: return aios::json::Value::integer(gv.i);
-    case Type::Real: return aios::json::Value::number(gv.d);
-    case Type::Str: return aios::json::Value::string(gv.str());
-    case Type::List: {
-      auto arr = aios::json::Value::array();
-      for (const auto& item : gv.list_items()) arr.push(grain_to_json(item));
-      return arr;
-    }
-    case Type::Map: {
-      auto obj = aios::json::Value::object();
-      if (gv.obj) {
-        auto m = std::dynamic_pointer_cast<MapObj>(gv.obj);
-        if (m) {
-          for (const auto& entry : m->entries) {
-            obj.set(entry.first, grain_to_json(entry.second));
-          }
-        }
-      }
-      return obj;
-    }
-    default: return aios::json::Value::string(gv.to_text());
-  }
-}
-
+// jwt_sign(payload, secret [, expires_in_seconds]): HS256. With expires_in, `iat` (now) and `exp` (now + it) are set
+// in the payload, over any the map already has.
 Value bi_jwt_sign(Vm&, std::vector<Value>& args, std::string& error) {
   if (args[0].type != Type::Map) { error = "jwt_sign: payload must be a map"; return Value::nil(); }
   if (!want_str(args[1], error, "jwt_sign")) return Value::nil();
   const std::string& secret = args[1].str();
+  if (secret.empty()) { error = "jwt_sign: the secret must not be empty"; return Value::nil(); }
 
-  aios::json::Value hdr = aios::json::Value::object();
-  hdr.set("alg", aios::json::Value::string("HS256"));
-  hdr.set("typ", aios::json::Value::string("JWT"));
-  std::string hdr_b64 = base64url_encode(bytes_of(hdr.dump()));
+  Value payload = args[0];
+  if (args.size() > 2) {
+    if (!want_number(args[2], error, "jwt_sign")) return Value::nil();
+    const int64_t ttl = args[2].as_int();
+    if (ttl <= 0) { error = "jwt_sign: expires_in must be a positive number of seconds"; return Value::nil(); }
+    // A copy: the caller's map is not changed.
+    auto copy = std::make_shared<MapObj>();
+    for (const auto& kv : static_cast<MapObj*>(args[0].obj.get())->entries) copy->put(kv.first, kv.second);
+    const int64_t now_sec = static_cast<int64_t>(std::time(nullptr));
+    copy->put("iat", Value::integer(now_sec));
+    copy->put("exp", Value::integer(now_sec + ttl));
+    payload = Value::object(Type::Map, copy);
+  }
 
-  aios::json::Value payload_json = grain_to_json(args[0]);
-  std::string payload_b64 = base64url_encode(bytes_of(payload_json.dump()));
-
-  std::string signing_input = hdr_b64 + "." + payload_b64;
+  const std::string hdr_b64 = base64url_encode(bytes_of(std::string("{\"alg\":\"HS256\",\"typ\":\"JWT\"}")));
+  const std::string payload_b64 = base64url_encode(bytes_of(grain_json_stringify(payload)));
+  const std::string signing_input = hdr_b64 + "." + payload_b64;
   auto sig = crypto::hmac_sha256(bytes_of(secret), bytes_of(signing_input));
-  std::string sig_b64 = base64url_encode(ByteSpan(sig.data(), sig.size()));
-
-  return Value::string(signing_input + "." + sig_b64);
+  return Value::string(signing_input + "." + base64url_encode(ByteSpan(sig.data(), sig.size())));
 }
 
 Value bi_jwt_verify(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "jwt_verify") || !want_str(args[1], error, "jwt_verify")) return Value::nil();
   const std::string& token = args[0].str();
   const std::string& secret = args[1].str();
+  if (secret.empty()) { error = "jwt_verify: the secret must not be empty"; return Value::nil(); }
 
   auto out = std::make_shared<MapObj>();
   auto fail = [&](const std::string& msg) -> Value {
@@ -330,30 +265,38 @@ Value bi_jwt_verify(Vm&, std::vector<Value>& args, std::string& error) {
   if (diff != 0) return fail("invalid signature");
 
   bool ok = false;
-  std::string hdr_str = base64url_decode(hdr_b64, ok);
+  std::string jerr;
+  const std::string hdr_str = base64url_decode(hdr_b64, ok);
   if (!ok) return fail("invalid header base64");
-  auto parsed_hdr = aios::json::parse(hdr_str);
-  if (!parsed_hdr.ok() || (*parsed_hdr)["alg"].str_or("") != "HS256")
-    return fail("unsupported or missing algorithm in header");
+  Value hdr = grain_json_parse(hdr_str, jerr);
+  const Value* alg = (jerr.empty() && hdr.type == Type::Map) ? static_cast<MapObj*>(hdr.obj.get())->find("alg") : nullptr;
+  if (!alg || alg->type != Type::Str || alg->str() != "HS256") return fail("unsupported or missing algorithm in header");
 
-  std::string payload_str = base64url_decode(payload_b64, ok);
+  const std::string payload_str = base64url_decode(payload_b64, ok);
   if (!ok) return fail("invalid payload base64");
-  auto parsed_payload = aios::json::parse(payload_str);
-  if (!parsed_payload.ok() || parsed_payload->type() != aios::json::Value::Type::Object)
-    return fail("invalid payload JSON");
+  Value payload = grain_json_parse(payload_str, jerr);
+  if (!jerr.empty() || payload.type != Type::Map) return fail("invalid payload JSON");
+  auto* pm = static_cast<MapObj*>(payload.obj.get());
 
-  int64_t now_sec = static_cast<int64_t>(std::time(nullptr));
-  if (parsed_payload->has("exp")) {
-    int64_t exp = (*parsed_payload)["exp"].i64();
-    if (exp < now_sec) return fail("token has expired");
+  // exp / nbf (RFC 7519 NumericDate): a number of seconds; anything else is a malformed token, not "no limit".
+  const double now_sec = static_cast<double>(std::time(nullptr));
+  auto seconds = [](const Value* v, double& out) {
+    if (v->type == Type::Int) { out = static_cast<double>(v->i); return true; }
+    if (v->type == Type::Real) { out = v->d; return true; }
+    return false;
+  };
+  double t = 0;
+  if (const Value* exp = pm->find("exp")) {
+    if (!seconds(exp, t)) return fail("exp is not a number");
+    if (t < now_sec) return fail("token has expired");
   }
-  if (parsed_payload->has("nbf")) {
-    int64_t nbf = (*parsed_payload)["nbf"].i64();
-    if (nbf > now_sec) return fail("token not yet valid");
+  if (const Value* nbf = pm->find("nbf")) {
+    if (!seconds(nbf, t)) return fail("nbf is not a number");
+    if (t > now_sec) return fail("token not yet valid");
   }
 
   out->put("ok", Value::boolean(true));
-  out->put("payload", json_to_grain(*parsed_payload));
+  out->put("payload", payload);
   return Value::object(Type::Map, out);
 }
 

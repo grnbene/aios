@@ -52,6 +52,27 @@ let expired_res = jwt_verify(expired_token, secret)
 assert_false(expired_res.ok, "expired token must fail verification")
 assert(find(expired_res.error, "expired") != nil, "error message must mention expired")
 
+// expires_in: iat and exp are set; the caller's map is left as it was.
+let base = {"sub": "ttl_user"}
+let ttl_tok = jwt_sign(base, secret, 60)
+let ttl_v = jwt_verify(ttl_tok, secret)
+assert_true(ttl_v.ok and ttl_v.payload.exp - ttl_v.payload.iat == 60, "expires_in sets iat and exp 60 s apart")
+assert_false(has(base, "exp"), "the caller's payload map is not changed")
+assert_false(pcall(jwt_sign, base, secret, 0).ok, "expires_in must be positive")
+
+// An empty secret is refused both ways.
+assert_false(pcall(jwt_sign, {"a": 1}, "").ok, "jwt_sign refuses an empty secret")
+assert_false(pcall(jwt_verify, ttl_tok, "").ok, "jwt_verify refuses an empty secret")
+
+// exp that is not a number is a malformed token, not "never expires".
+let str_exp = jwt_verify(jwt_sign({"exp": "tomorrow"}, secret), secret)
+assert_false(str_exp.ok, "a string exp must fail")
+assert(find(str_exp.error, "exp is not a number") != nil, "and say why: " + str_exp.error)
+
+// A token another HS256 implementation made (Python's hmac + base64url) verifies here.
+let ext = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJleHQiLCJuIjo3fQ.Imm70eFxOJbJK94iT8rX7qvV35_MPPpgbaqfqVqPp6I"
+let ext_v = jwt_verify(ext, secret)
+assert_true(ext_v.ok and ext_v.payload.sub == "ext" and ext_v.payload.n == 7, "a token made by another HS256 implementation verifies")
 print("PASS: test_crypto_auth")
 
 // 3. Test inside closures and nested control flow blocks
