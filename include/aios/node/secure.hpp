@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 #include "aios/core/bytes.hpp"
@@ -42,6 +43,24 @@ std::unique_ptr<Link> make_secure_link(std::shared_ptr<hal::Connection> c, const
 // This side's handshake payload feature word (kFeatureMagic + bits) and whether a peer's payload advertises deflate.
 ByteBuffer link_feature_payload();
 bool link_peer_deflates(ByteSpan payload);
+bool link_peer_identity(ByteSpan payload);   // the peer advertised nodeproto::kFeatIdentity
+
+// What the identity exchange needs from this machine: its signing key and the peer keys it trusts (the hub's signed
+// roster). Set once per process by the kernel; links read it when they are made.
+struct LinkIdentity {
+  std::function<ByteBuffer(ByteSpan)> sign;                               // 64-byte signature; empty: no key
+  std::function<bool(const Id128& peer, std::array<uint8_t, 32>& key)> peer_key;   // false: the peer is not in the roster
+  bool v2_only = false;   // refuse a peer that does not complete the exchange with a key from the roster
+};
+void set_link_identity(std::shared_ptr<const LinkIdentity> id);
+std::shared_ptr<const LinkIdentity> link_identity();
+// After the token handshake, on its secure link. When both sides advertised kFeatIdentity: each sends a fresh X25519
+// key, each signs the exchange (both ids, both X25519 keys, a value bound to this session) with its identity key, and
+// the session key becomes HKDF-SHA-256 of the X25519 secret - recorded traffic stays closed even to a later holder of
+// the token or of every identity key. A peer whose key the roster lists must sign with it (and must offer the
+// exchange); with v2_only, every peer must. upgraded: the caller makes a new secure link with `key`.
+Result<void> link_identity_exchange(Link& secure, const crypto::Key& token_session, bool initiator, const Id128& me, const Id128& peer,
+                                    ByteSpan peer_payload, hal::Host& host, const LinkIdentity* id, bool& upgraded, crypto::Key& key);
 Result<crypto::Key> secure_handshake_initiator(Link& plain, const std::string& token, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);
 Result<crypto::Key> secure_handshake_responder(Link& plain, const std::string& token, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);
 Result<crypto::Key> secure_handshake_responder_any(Link& plain, const std::vector<std::string>& tokens, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);

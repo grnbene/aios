@@ -29,6 +29,7 @@
 #include <atomic>
 
 namespace aios {
+struct LinkIdentity;   // aios/node/secure.hpp
 
 class Surface;
 
@@ -87,6 +88,8 @@ class Kernel : private CapabilityObserver {
   // Null when the root could not hold it (the kernel still runs; nothing uses the key yet); node_key_problem() says why.
   const crypto::Point32* node_public_key() const { return node_key_ok_ ? &node_pub_ : nullptr; }
   const std::string& node_key_problem() const { return node_key_problem_; }
+  // The hub's identity key, pinned for the next fleet_join: the member then takes peer keys from rosters it signs.
+  void set_fleet_hub_key(const crypto::Point32& key) { hub_key_ = key; have_hub_key_ = true; }
   Result<crypto::Sig64> node_sign(ByteSpan message) const;
   uint64_t boot_ns() const { return boot_ns_; }
   uint64_t now() const;
@@ -291,6 +294,9 @@ class Kernel : private CapabilityObserver {
   std::unique_ptr<RelayHub> hub_;            // set when this kernel is the fleet hub
   std::unique_ptr<RelayClient> relay_;       // set when this kernel has joined a fleet
   std::string cluster_key_;                  // the one shared secret; also the node-link token
+  bool have_hub_key_ = false;                // fleet join pins the hub's identity key (its signed roster)
+  crypto::Point32 hub_key_{};
+  std::shared_ptr<const LinkIdentity> link_identity_;   // what this kernel installed for its links
   hal::Thread relay_accept_;                 // hands relayed incoming circuits to the node service
   std::atomic<bool> relay_accepting_{false};
   uint32_t slots_ = 0;                       // 0 => report logical_cpus

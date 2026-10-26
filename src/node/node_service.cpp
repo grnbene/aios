@@ -131,7 +131,7 @@ std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Co
       for (uint64_t k : ks) w.u64(k);
     }
     w.u32(nodeproto::kFeatureMagic);
-    w.u32(nodeproto::kFeatExecBatch | nodeproto::kFeatDeflate);
+    w.u32(nodeproto::kFeatExecBatch | nodeproto::kFeatDeflate | nodeproto::kFeatIdentity);
   }
   std::vector<std::string> tokens;
   { hal::LockGuard g(mu_); tokens = tokens_; }
@@ -140,6 +140,13 @@ std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Co
   auto s = std::make_shared<Session>();
   s->c = c;
   s->link = make_secure_link(c, *key, false);
+  {
+    bool upgraded = false; crypto::Key k2{};
+    const auto lid = link_identity();
+    auto x = link_identity_exchange(*s->link, *key, false, k_.self(), peer_kernel, ByteSpan(peer_payload.data(), peer_payload.size()), k_.host(), lid.get(), upgraded, k2);
+    if (!x.ok()) { k_.host().log_error("node: link from " + c->peer() + " refused: " + x.error().message); return nullptr; }
+    if (upgraded) s->link = make_secure_link(c, k2, false);
+  }
   s->link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
   auto guest = k_.spawn("peer:" + c->peer());
   if (!guest.ok()) { reply_error(*s->link, guest.status(), guest.error().message); return nullptr; }

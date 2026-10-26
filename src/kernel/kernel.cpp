@@ -1,4 +1,5 @@
 #include "aios/kernel/kernel.hpp"
+#include "aios/node/secure.hpp"
 #include "aios/compute/backends.hpp"
 #include "aios/compute/erp_kernels.hpp"
 #include "aios/compute/sat_kernels.hpp"
@@ -35,6 +36,8 @@ Result<std::unique_ptr<Kernel>> Kernel::boot(const KernelConfig& cfg) {
 }
 
 Kernel::~Kernel() {
+  // Links stop using this kernel's key and roster before they go.
+  if (link_identity_ && link_identity() == link_identity_) set_link_identity(nullptr);
   // Minds and the node service go first: they hold threads and external
   // resources that reference the kernel.
   relay_accepting_ = false;
@@ -169,6 +172,15 @@ Result<void> Kernel::init(const KernelConfig& cfg) {
   caps_->observe(this);
   AIOS_TRY(load_or_create_identity());
   load_or_create_node_key();
+  {
+    // Every link this process makes signs with this machine's key and checks peers against the hub's signed roster.
+    auto id = std::make_shared<LinkIdentity>();
+    if (node_key_ok_) id->sign = [this](ByteSpan m) { auto s = node_sign(m); return s.ok() ? ByteBuffer(s->begin(), s->end()) : ByteBuffer(); };
+    id->peer_key = [this](const Id128& peer, std::array<uint8_t, 32>& key) { return relay_ && relay_->peer_key(peer, key); };
+    id->v2_only = host_->env("AIOS_FLEET_V2_ONLY") == "1";
+    link_identity_ = id;
+    set_link_identity(id);
+  }
   AIOS_TRY(replay_authority());
   // Kept states (Surface::keep_state: a resident's, by its owner) live in the
   // root, one file per state, so the console's `kv` and `state create ...
@@ -700,6 +712,7 @@ Result<uint16_t> Kernel::relay_hub(uint16_t port, const std::string& cluster_key
     hub_->set_members_file(members_file);
   }
   hub_->set_require_attest(require_attest);
+  if (node_key_ok_) hub_->set_signer([this](ByteSpan m) { auto s = node_sign(m); return s.ok() ? ByteBuffer(s->begin(), s->end()) : ByteBuffer(); });
   auto p = hub_->start(port, loopback_only);
   if (!p.ok()) { hub_.reset(); return p.error(); }
   cluster_key_ = cluster_key;
@@ -722,6 +735,7 @@ Result<void> Kernel::fleet_join(const std::string& hub_host, uint16_t hub_port, 
   relay_ = std::make_unique<RelayClient>(cluster_key, self_);
   if (!member_key.empty()) relay_->set_member_key(member_key);
   relay_->set_attest(attest);
+  if (have_hub_key_) relay_->set_hub_key(hub_key_);
   if (node_key_ok_) relay_->set_signer([this](ByteSpan m) { auto s = node_sign(m); return s.ok() ? ByteBuffer(s->begin(), s->end()) : ByteBuffer(); });
   auto a = relay_->attach(hub_host, hub_port, keep_trying);
   if (!a.ok()) { relay_.reset(); return a.error(); }

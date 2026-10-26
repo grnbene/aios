@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <chrono>
 #include "aios/kernel/kernel.hpp"
 #include "aios/crypto/curve25519.hpp"
 #include "aios/fleet/relay.hpp"
@@ -54,11 +56,19 @@ int main() {
     { std::ofstream f(members, std::ios::trunc); f << (*k)->self().str() << " ed25519=" << hex(ByteSpan(first.data(), first.size())) << "\n"; }
     RelayHub hub("cluster-key-for-the-check");
     hub.set_members_file(members);
+    crypto::Scalar32 hub_seed{}; hub_seed.fill(7);
+    const crypto::Point32 hub_pub = crypto::ed25519_public_from_seed(hub_seed);
+    hub.set_signer([&](ByteSpan m) { auto s = crypto::ed25519_sign(m, hub_seed, hub_pub); return ByteBuffer(s.begin(), s.end()); });
     auto port = hub.start(0, true);
     CHECK(port.ok(), "a hub starts");
     if (port.ok()) {
+      (*k)->set_fleet_hub_key(hub_pub);
       auto j = (*k)->fleet_join("127.0.0.1", *port, "cluster-key-for-the-check");
       CHECK(j.ok() && (*k)->in_fleet(), ("fleet join attaches by its identity key: " + (j.ok() ? std::string("ok") : j.error().message)).c_str());
+      bool signed_roster = false;
+      for (int i = 0; i < 50 && !signed_roster; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); signed_roster = (*k)->relay() && (*k)->relay()->roster_signed(); }
+      std::array<uint8_t, 32> mine{};
+      CHECK(signed_roster && (*k)->relay()->peer_key((*k)->self(), mine) && mine == first, "with hub-key pinned, it takes the signed roster (its own key in it)");
     }
     hub.stop();
   }
