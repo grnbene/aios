@@ -215,9 +215,13 @@ int main() {
     const std::string create =
         "CREATE THING gt GRAIN KEY stockid READS gt_items WATCH gt_items(stockid) AS '"
         "let DAY_SAFE = true\n"
-        "fn enroll() { let out = [] for r in read_raw(\"SELECT stockid FROM gt_items\") { push(out, r.stockid) } return out }\n"
+        "fn enroll() { let out = [] for r in read_raw_with(\"SELECT stockid FROM gt_items\", nil) { push(out, r.stockid) } return out }\n"
         "fn shared() { return 1 }\n"
-        "fn things(ks, sh) { let out = {} for r in read_raw(\"SELECT stockid, price, qty FROM gt_items WHERE stockid IN (?)\", ks) { "
+        // the parameters held in a list: read_raw_with(sql, params), and the same list spread into read_raw (a list
+        // among them still binds as IN (...)); both must read the same rows
+        "fn things(ks, sh) { let ps = [ks, -1] let a = read_raw_with(\"SELECT stockid FROM gt_items WHERE stockid IN (?) AND qty > ?\", ps) "
+        "let b = read_raw(\"SELECT stockid, price, qty FROM gt_items WHERE stockid IN (?) AND qty > ?\", ...ps) if len(a) != len(b) { error(\"read_raw_with and the spread read differ\") } "
+        "let out = {} for r in b { "
         "out[r.stockid] = {\"sum\": str(decimal(r.price) + decimal(r.qty) + decimal(\"0.1\")), \"txt\": r.price, \"fmt\": format(\"{:.2f}\", decimal(r.price) * 3), \"re\": str(regex_test(\"^[AB]$\", r.stockid))} } return out }\n"
         "'";
     auto made = db.execute_gateway_query(create);

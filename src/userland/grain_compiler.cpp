@@ -112,6 +112,7 @@ const char* op_name(Op op) {
     case Op::FieldGet: return "FLDGET"; case Op::OptFieldGet: return "OPTFLDGET"; case Op::FieldSet: return "FLDSET";
     case Op::IterPrep: return "ITERPREP"; case Op::IterNext: return "ITERNEXT";
     case Op::Halt: return "HALT";
+    case Op::ListConcat: return "LISTCAT"; case Op::CallList: return "CALLLIST";
   }
   return "?";
 }
@@ -296,6 +297,24 @@ class Compiler {
 
   // --- expressions --------------------------------------------------------
 
+  // A call's arguments or a list's elements with `...x` among them, as one new list on the stack: each run of plain
+  // items packed into a list, each spread value as it is, then ListConcat joins them (and refuses a spread non-list).
+  void spread_list(const Expr& e) {
+    size_t segments = 0, run = 0;
+    for (size_t i = 0; i < e.items.size(); ++i) {
+      if (i < e.spread.size() && e.spread[i]) {
+        if (run) { emit_op_wide(Op::BuildList, run, e.line, e.column); ++segments; run = 0; }
+        expression(*e.items[i]);
+        ++segments;
+      } else {
+        expression(*e.items[i]);
+        ++run;
+      }
+    }
+    if (run) { emit_op_wide(Op::BuildList, run, e.line, e.column); ++segments; }
+    emit_op_wide(Op::ListConcat, segments, e.line, e.column);
+  }
+
   void expression(const Expr& e) {
     switch (e.kind) {
       case ExprKind::IntLit: emit_constant(Value::integer(e.integer), e.line, e.column); return;
@@ -375,6 +394,11 @@ class Compiler {
 
       case ExprKind::Call: {
         expression(*e.a);
+        if (!e.spread.empty()) {   // f(a, ...xs): the arguments as one list, then the call with its items
+          spread_list(e);
+          emit(Op::CallList, e.line, e.column);
+          return;
+        }
         if (e.items.size() > 255) { error(e.line, e.column, "more than 255 arguments"); return; }
         for (const auto& arg : e.items) expression(*arg);
         emit_op_arg(Op::Call, (uint8_t)e.items.size(), e.line, e.column);
@@ -426,6 +450,7 @@ class Compiler {
 
       case ExprKind::ListLit: {
         if (e.items.size() > 0xffff) { error(e.line, e.column, "list literal longer than 65535"); return; }
+        if (!e.spread.empty()) { spread_list(e); return; }   // [a, ...xs]
         for (const auto& item : e.items) expression(*item);
         emit_op_wide(Op::BuildList, e.items.size(), e.line, e.column);
         return;

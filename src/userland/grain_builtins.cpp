@@ -568,11 +568,12 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
         case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::BitNot: case Op::Shl: case Op::Shr:
         case Op::Dup: case Op::Dup2:
         case Op::CloseUpvalue: case Op::Return: case Op::IndexGet: case Op::IndexSet: case Op::IterPrep: case Op::Halt:
+        case Op::CallList:
           ci += 1; break;
         case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue: case Op::Call: case Op::IterNext:
           ci += 2; break;
         case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
         case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
           ci += 3; break;
         case Op::Closure: {
@@ -616,11 +617,12 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
         case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::BitNot: case Op::Shl: case Op::Shr:
         case Op::Dup: case Op::Dup2:
         case Op::CloseUpvalue: case Op::Return: case Op::IndexGet: case Op::IndexSet: case Op::IterPrep: case Op::Halt:
+        case Op::CallList:
           ci += 1; break;
         case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue: case Op::Call: case Op::IterNext:
           ci += 2; break;
         case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
         case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
           ci += 3; break;
         case Op::Closure: {

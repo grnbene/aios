@@ -1,0 +1,64 @@
+# Spread: `f(a, ...xs, b)` passes a list's items as arguments, `[a, ...xs, b]` puts them in a list. Checked at top
+# level, in a function, in a closure, nested, into native functions, with named arguments, and in a hot loop.
+fn check(c, msg) { assert_true(c, msg) }
+fn three(a, b, c) { return str(a) + "|" + str(b) + "|" + str(c) }
+fn none() { return "none" }
+
+# top level
+let xs = [1, 2, 3]
+check(three(...xs) == "1|2|3", "all three spread")
+check(three(0, ...[5, 6]) == "0|5|6", "plain then spread")
+check(three(...[7], 8, ...[9]) == "7|8|9", "spread, plain, spread")
+check(none(...[]) == "none", "an empty spread is no arguments")
+check(format("{}-{}", ...["a", "b"]) == "a-b", "into a native function")
+check(len([...xs, 4, ...xs]) == 7, "list literal: len")
+check([0, ...xs][3] == 3, "list literal: order")
+check(len([...[]]) == 0, "list literal: empty spread")
+let ys = [...xs]
+ys[0] = 99
+check(xs[0] == 1, "a spread list is a copy")
+
+# in a function, with locals, and the callee a local too
+fn in_fn(list) {
+  let f = three
+  let head = "h"
+  return f(head, ...list)
+}
+check(in_fn([1, 2]) == "h|1|2", "in a function")
+
+# a closure spreading a captured list
+fn make() {
+  let held = ["p", "q", "r"]
+  return fn () { return three(...held) }
+}
+check(make()() == "p|q|r", "in a closure, from an upvalue")
+
+# nested: a spread argument that is itself a spread call's answer
+fn pair(a, b) { return [a, b] }
+check(three(...pair(...["m", "n"]), "o") == "m|n|o", "nested")
+
+# named arguments after a spread
+fn opts(a, b, o) { return str(a) + str(b) + str(o.k) }
+check(opts(...[1, 2], k = 3) == "123", "with a named argument")
+
+# a hot loop (the JIT leaves a function with spread to the interpreter; the answers are the same)
+fn add3(a, b, c) { return a + b + c }
+fn sum_spread(n) {
+  let t = 0
+  for i in 0..n { t = t + add3(...[i, 1, 2]) }
+  return t
+}
+check(sum_spread(5000) == 5000 * 4999 / 2 + 5000 * 3, "hot loop")
+
+# errors: a spread of a non-list, too many arguments, the wrong count
+let r1 = pcall(fn () { return three(...5) })
+check(not r1.ok and contains(r1.error, "spreads a list"), "spread of a number: " + str(r1.error))
+let r2 = pcall(fn () { return [...nil] })
+check(not r2.ok and contains(r2.error, "spreads a list"), "spread of nil in a list")
+let big = []
+for i in 0..300 { push(big, i) }
+let r3 = pcall(fn () { return three(...big) })
+check(not r3.ok and contains(r3.error, "255"), "more than 255 arguments: " + str(r3.error))
+let r4 = pcall(fn () { return three(...[1]) })
+check(not r4.ok, "too few arguments through a spread")
+print("spread ok")
