@@ -93,6 +93,51 @@ int main() {
   SqlQueryResult dup = db.execute_local_query("INSERT INTO t2 VALUES (7,'again')");
   check(!dup.success && dup.error_message.find("uplicate") != std::string::npos, "a duplicate primary key is still refused");
 
+  // What a replicated order does to a big table that stays hot: rows deleted by key and put back, rows updated.
+  // None of it may drop the table's index (the next insert would walk every row of the table again).
+  if (!fill(db, "d1", 120000)) return 1;
+  if (!run(db, "INSERT INTO d1 VALUES (120000,'warm')")) return 1;
+  const uint64_t d_before = status(db, "Asql_row_index_rows_indexed");
+  bool d_ok = true;
+  for (size_t n = 0; n < 20; ++n) {
+    const std::string k = std::to_string(50000 + n * 3);
+    d_ok &= run(db, "DELETE FROM d1 WHERE id = " + k);
+    d_ok &= run(db, "INSERT INTO d1 VALUES (" + k + ",'again')");
+    d_ok &= run(db, "UPDATE d1 SET v = 'upd' WHERE id = " + std::to_string(60000 + n));
+    d_ok &= run(db, "INSERT INTO d1 VALUES (" + std::to_string(120001 + n) + ",'new')");
+  }
+  const uint64_t d_walked = status(db, "Asql_row_index_rows_indexed") - d_before;
+  std::printf("delete/insert/update on a hot 120k-row table: 20 rounds walked %llu rows into its row index\n", (unsigned long long)d_walked);
+  check(d_ok, "the deletes, inserts and updates succeed");
+  check(d_walked < 20 * 4 * 16, "deleting, re-inserting and updating rows of a hot big table does not rebuild its row index");
+
+  // The form the replication applies rows in: INSERT .. ON DUPLICATE KEY UPDATE, on a composite-key table
+  // (stockmovestaxes) and on an auto-increment one (stockmoves), a transaction at a time.
+  {
+    if (!run(db, "CREATE TABLE c1 (stkmoveno INT NOT NULL, taxauthid INT NOT NULL, rate DECIMAL(10,4), PRIMARY KEY (stkmoveno, taxauthid))")) return 1;
+    if (!run(db, "CREATE TABLE a1 (stkmoveno INT NOT NULL AUTO_INCREMENT PRIMARY KEY, stockid VARCHAR(20), qty DECIMAL(12,3))")) return 1;
+    for (size_t from = 0; from < 120000; from += 2000) {
+      std::string c = "INSERT INTO c1 VALUES ", a = "INSERT INTO a1 VALUES ";
+      for (size_t i = from; i < from + 2000; ++i) {
+        c += (i == from ? "(" : ",(") + std::to_string(i) + ",1,5.0000)";
+        a += (i == from ? "(" : ",(") + std::to_string(i + 1) + ",'S" + std::to_string(i % 500) + "',1.000)";
+      }
+      if (!run(db, c) || !run(db, a)) return 1;
+    }
+    const uint64_t o_before = status(db, "Asql_row_index_rows_indexed");
+    bool o_ok = true;
+    for (size_t n = 0; n < 20; ++n) {
+      o_ok &= run(db, "INSERT INTO c1 (stkmoveno, taxauthid, rate) VALUES (" + std::to_string(200000 + n) + ",1,5.0000) ON DUPLICATE KEY UPDATE rate = VALUES(rate)");
+      o_ok &= run(db, "INSERT INTO a1 (stkmoveno, stockid, qty) VALUES (" + std::to_string(200000 + n) + ",'S1',1.000) ON DUPLICATE KEY UPDATE qty = VALUES(qty)");
+      o_ok &= run(db, "UPDATE a1 SET qty = 2.000 WHERE stkmoveno = " + std::to_string(1000 + n));
+      o_ok &= run(db, "DELETE FROM c1 WHERE stkmoveno = " + std::to_string(3000 + n) + " AND taxauthid = 1");
+    }
+    const uint64_t o_walked = status(db, "Asql_row_index_rows_indexed") - o_before;
+    std::printf("ON DUPLICATE KEY UPDATE / UPDATE / DELETE on hot 120k-row tables: 20 rounds walked %llu rows into row indices\n", (unsigned long long)o_walked);
+    check(o_ok, "the replicated-form statements succeed");
+    check(o_walked < 20 * 4 * 16, "applying them does not rebuild a hot big table's row index");
+  }
+
   // The budget still holds: after the hot window, a new table's index makes room by dropping the cold ones.
   std::this_thread::sleep_for(std::chrono::milliseconds(2200));
   const uint64_t evict_mid = status(db, "Asql_row_index_evictions");
