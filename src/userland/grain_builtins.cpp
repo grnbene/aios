@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <cstdlib>
 #include <fstream>
 #include <initializer_list>
@@ -50,6 +51,16 @@ Value bi_print(Vm& vm, std::vector<Value>& args, std::string&) {
     line += args[i].to_text();
   }
   vm.emit(line);
+  return Value::nil();
+}
+
+Value bi_eprint(Vm&, std::vector<Value>& args, std::string&) {
+  std::string line;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i) line += " ";
+    line += args[i].to_text();
+  }
+  std::cerr << line << "\n" << std::flush;
   return Value::nil();
 }
 
@@ -2308,6 +2319,165 @@ Value bi_json_stringify(Vm&, std::vector<Value>& args, std::string& error) {
   std::string out;
   json_stringify_helper(args[0], out, 0, indent_spaces, 0, flags);
   return Value::string(out);
+}
+
+enum LogLevel : int {
+  kLogDebug = 0,
+  kLogInfo = 1,
+  kLogWarn = 2,
+  kLogError = 3
+};
+
+static std::string current_iso8601() {
+  auto now = std::chrono::system_clock::now();
+  std::time_t tt = std::chrono::system_clock::to_time_t(now);
+  std::tm gmt;
+#if defined(_WIN32)
+  gmtime_s(&gmt, &tt);
+#else
+  gmtime_r(&tt, &gmt);
+#endif
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &gmt);
+  return buf;
+}
+
+static const char* log_level_str(int lvl) {
+  switch (lvl) {
+    case kLogDebug: return "DEBUG";
+    case kLogInfo: return "INFO";
+    case kLogWarn: return "WARN";
+    case kLogError: return "ERROR";
+    default: return "INFO";
+  }
+}
+
+static int parse_log_level(std::string s, bool& ok) {
+  for (char& c : s) c = std::tolower(static_cast<unsigned char>(c));
+  ok = true;
+  if (s == "debug") return kLogDebug;
+  if (s == "info") return kLogInfo;
+  if (s == "warn" || s == "warning") return kLogWarn;
+  if (s == "error") return kLogError;
+  ok = false;
+  return kLogInfo;
+}
+
+static void do_log(Vm& vm, int level, const std::string& msg, const Value* extra) {
+  if (level < vm.log_level) return;
+
+  std::string time_str = current_iso8601();
+  const char* lvl_str = log_level_str(level);
+
+  if (vm.log_format == 1) { // JSON
+    std::string json = "{";
+    json += "\"time\":";
+    json_write_string(time_str, json, 0);
+    json += ",\"level\":";
+    json_write_string(lvl_str, json, 0);
+    json += ",\"msg\":";
+    json_write_string(msg, json, 0);
+
+    if (extra && extra->type == Type::Map) {
+      auto* o = static_cast<MapObj*>(extra->obj.get());
+      for (const auto& kv : o->entries) {
+        json += ",";
+        json_write_string(kv.first, json, 0);
+        json += ":";
+        json_stringify_helper(kv.second, json, 0, 0, 0, 0);
+      }
+    }
+    json += "}";
+    vm.emit(json);
+  } else { // Text
+    std::string text = "[" + time_str + "] [" + lvl_str + "] " + msg;
+    if (extra && extra->type == Type::Map) {
+      auto* o = static_cast<MapObj*>(extra->obj.get());
+      if (!o->entries.empty()) {
+        text += " {";
+        bool first = true;
+        for (const auto& kv : o->entries) {
+          if (!first) text += ", ";
+          first = false;
+          text += "\"" + kv.first + "\":";
+          std::string v_str;
+          json_stringify_helper(kv.second, v_str, 0, 0, 0, 0);
+          text += v_str;
+        }
+        text += "}";
+      }
+    }
+    vm.emit(text);
+  }
+}
+
+Value bi_log_set_level(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_set_level")) return Value::nil();
+  bool ok = false;
+  int lvl = parse_log_level(args[0].str(), ok);
+  if (!ok) {
+    error = "log_set_level(): unknown log level '" + args[0].str() + "' (expected 'debug', 'info', 'warn', 'error')";
+    return Value::nil();
+  }
+  vm.log_level = lvl;
+  return Value::nil();
+}
+
+Value bi_log_get_level(Vm& vm, std::vector<Value>&, std::string&) {
+  switch (vm.log_level) {
+    case kLogDebug: return Value::string("debug");
+    case kLogInfo: return Value::string("info");
+    case kLogWarn: return Value::string("warn");
+    case kLogError: return Value::string("error");
+    default: return Value::string("info");
+  }
+}
+
+Value bi_log_set_format(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_set_format")) return Value::nil();
+  std::string f = args[0].str();
+  for (char& c : f) c = std::tolower(static_cast<unsigned char>(c));
+  if (f == "text") {
+    vm.log_format = 0;
+  } else if (f == "json") {
+    vm.log_format = 1;
+  } else {
+    error = "log_set_format(): unknown log format '" + args[0].str() + "' (expected 'text' or 'json')";
+    return Value::nil();
+  }
+  return Value::nil();
+}
+
+Value bi_log_get_format(Vm& vm, std::vector<Value>&, std::string&) {
+  return Value::string(vm.log_format == 1 ? "json" : "text");
+}
+
+Value bi_log_debug(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_debug")) return Value::nil();
+  const Value* extra = args.size() > 1 ? &args[1] : nullptr;
+  do_log(vm, kLogDebug, args[0].str(), extra);
+  return Value::nil();
+}
+
+Value bi_log_info(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_info")) return Value::nil();
+  const Value* extra = args.size() > 1 ? &args[1] : nullptr;
+  do_log(vm, kLogInfo, args[0].str(), extra);
+  return Value::nil();
+}
+
+Value bi_log_warn(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_warn")) return Value::nil();
+  const Value* extra = args.size() > 1 ? &args[1] : nullptr;
+  do_log(vm, kLogWarn, args[0].str(), extra);
+  return Value::nil();
+}
+
+Value bi_log_error(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "log_error")) return Value::nil();
+  const Value* extra = args.size() > 1 ? &args[1] : nullptr;
+  do_log(vm, kLogError, args[0].str(), extra);
+  return Value::nil();
 }
 
 // A field's value must stay on its own line: SSE ends a line at \n, \r or \r\n, so one of those inside an id,
@@ -6584,6 +6754,15 @@ void install_core_builtins(Vm& vm) {
   install_decimal_builtins(vm);
 
   vm.define_native("print", 0, -1, bi_print);
+  vm.define_native("eprint", 0, -1, bi_eprint);
+  vm.define_native("log_set_level", 1, 1, bi_log_set_level);
+  vm.define_native("log_get_level", 0, 0, bi_log_get_level);
+  vm.define_native("log_set_format", 1, 1, bi_log_set_format);
+  vm.define_native("log_get_format", 0, 0, bi_log_get_format);
+  vm.define_native("log_debug", 1, 2, bi_log_debug);
+  vm.define_native("log_info", 1, 2, bi_log_info);
+  vm.define_native("log_warn", 1, 2, bi_log_warn);
+  vm.define_native("log_error", 1, 2, bi_log_error);
   vm.define_native("len", 1, 1, bi_len);
   vm.define_native("type", 1, 1, bi_type);
   vm.define_native("str", 1, 1, bi_str);

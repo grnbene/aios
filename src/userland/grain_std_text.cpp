@@ -316,6 +316,366 @@ Value bi_uuid(Vm&, std::vector<Value>&, std::string&) {
   return Value::string(std::move(s));
 }
 
+std::string unescape_xml(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '&') {
+      size_t semi = in.find(';', i + 1);
+      if (semi != std::string::npos && semi - i <= 10) {
+        std::string ent = in.substr(i + 1, semi - (i + 1));
+        if (ent == "lt") { out.push_back('<'); i = semi; continue; }
+        if (ent == "gt") { out.push_back('>'); i = semi; continue; }
+        if (ent == "amp") { out.push_back('&'); i = semi; continue; }
+        if (ent == "quot") { out.push_back('"'); i = semi; continue; }
+        if (ent == "apos") { out.push_back('\''); i = semi; continue; }
+        if (!ent.empty() && ent[0] == '#') {
+          uint32_t cp = 0;
+          bool ok = false;
+          if (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) {
+            try {
+              cp = static_cast<uint32_t>(std::stoul(ent.substr(2), nullptr, 16));
+              ok = true;
+            } catch (...) {}
+          } else {
+            try {
+              cp = static_cast<uint32_t>(std::stoul(ent.substr(1), nullptr, 10));
+              ok = true;
+            } catch (...) {}
+          }
+          if (ok) {
+            if (cp <= 0x7F) {
+              out.push_back(static_cast<char>(cp));
+            } else if (cp <= 0x7FF) {
+              out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if (cp <= 0xFFFF) {
+              out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+              out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if (cp <= 0x10FFFF) {
+              out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+              out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+              out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            i = semi;
+            continue;
+          }
+        }
+      }
+    }
+    out.push_back(in[i]);
+  }
+  return out;
+}
+
+std::string escape_xml(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  for (char c : in) {
+    switch (c) {
+      case '&': out.append("&amp;"); break;
+      case '<': out.append("&lt;"); break;
+      case '>': out.append("&gt;"); break;
+      case '"': out.append("&quot;"); break;
+      case '\'': out.append("&apos;"); break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+inline bool is_xml_space(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+inline std::string trim_spaces(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() && is_xml_space(s[start])) start++;
+  size_t end = s.size();
+  while (end > start && is_xml_space(s[end - 1])) end--;
+  return s.substr(start, end - start);
+}
+
+class XmlParser {
+ public:
+  explicit XmlParser(const std::string& src) : s(src), pos(0) {}
+
+  Value parse(std::string& err) {
+    skip_prolog(err);
+    if (!err.empty()) return Value::nil();
+    skip_ws();
+    if (pos >= s.size()) {
+      err = "xml_parse: empty or missing root element";
+      return Value::nil();
+    }
+    Value root = parse_element(err);
+    if (!err.empty()) return Value::nil();
+
+    skip_misc(err);
+    if (!err.empty()) return Value::nil();
+
+    return root;
+  }
+
+ private:
+  const std::string& s;
+  size_t pos;
+
+  void skip_ws() {
+    while (pos < s.size() && is_xml_space(s[pos])) pos++;
+  }
+
+  char peek() const { return pos < s.size() ? s[pos] : '\0'; }
+
+  bool starts_with(const char* prefix, size_t len) const {
+    return pos + len <= s.size() && s.compare(pos, len, prefix) == 0;
+  }
+
+  void skip_misc(std::string& err) {
+    while (pos < s.size()) {
+      skip_ws();
+      if (starts_with("<!--", 4)) {
+        pos += 4;
+        size_t end = s.find("-->", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed comment";
+          return;
+        }
+        pos = end + 3;
+      } else if (starts_with("<?", 2)) {
+        pos += 2;
+        size_t end = s.find("?>", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed processing instruction";
+          return;
+        }
+        pos = end + 2;
+      } else {
+        break;
+      }
+    }
+  }
+
+  void skip_prolog(std::string& err) {
+    while (pos < s.size()) {
+      skip_ws();
+      if (starts_with("<!--", 4)) {
+        pos += 4;
+        size_t end = s.find("-->", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed comment";
+          return;
+        }
+        pos = end + 3;
+      } else if (starts_with("<?", 2)) {
+        pos += 2;
+        size_t end = s.find("?>", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed processing instruction";
+          return;
+        }
+        pos = end + 2;
+      } else if (starts_with("<!DOCTYPE", 9) || starts_with("<!doctype", 9)) {
+        pos += 9;
+        int depth = 1;
+        while (pos < s.size() && depth > 0) {
+          if (s[pos] == '<') depth++;
+          else if (s[pos] == '>') depth--;
+          pos++;
+        }
+        if (depth > 0) {
+          err = "xml_parse: unclosed DOCTYPE declaration";
+          return;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+
+  bool is_name_char(char c) const {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == ':' || c == '.';
+  }
+
+  std::string parse_name() {
+    size_t start = pos;
+    while (pos < s.size() && is_name_char(s[pos])) pos++;
+    return s.substr(start, pos - start);
+  }
+
+  Value parse_element(std::string& err) {
+    skip_ws();
+    if (peek() != '<') {
+      err = "xml_parse: expected '<' at start of element";
+      return Value::nil();
+    }
+    pos++; // skip '<'
+
+    std::string tag = parse_name();
+    if (tag.empty()) {
+      err = "xml_parse: expected tag name";
+      return Value::nil();
+    }
+
+    auto attrs_map = std::make_shared<MapObj>();
+    auto children_list = std::make_shared<ListObj>(std::vector<Value>{});
+
+    while (pos < s.size()) {
+      skip_ws();
+      char c = peek();
+      if (c == '>' || (c == '/' && pos + 1 < s.size() && s[pos + 1] == '>')) {
+        break;
+      }
+      std::string attr_name = parse_name();
+      if (attr_name.empty()) {
+        err = "xml_parse: invalid attribute in tag <" + tag + ">";
+        return Value::nil();
+      }
+      skip_ws();
+      std::string attr_val;
+      if (peek() == '=') {
+        pos++; // skip '='
+        skip_ws();
+        char quote = peek();
+        if (quote == '"' || quote == '\'') {
+          pos++; // skip quote
+          size_t val_start = pos;
+          while (pos < s.size() && s[pos] != quote) pos++;
+          if (pos >= s.size()) {
+            err = "xml_parse: unterminated attribute quote for " + attr_name;
+            return Value::nil();
+          }
+          attr_val = unescape_xml(s.substr(val_start, pos - val_start));
+          pos++; // skip quote
+        } else {
+          size_t val_start = pos;
+          while (pos < s.size() && !is_xml_space(s[pos]) && s[pos] != '>' && s[pos] != '/') pos++;
+          attr_val = unescape_xml(s.substr(val_start, pos - val_start));
+        }
+      } else {
+        attr_val = "true";
+      }
+      attrs_map->put(attr_name, Value::string(attr_val));
+    }
+
+    skip_ws();
+    if (peek() == '/' && pos + 1 < s.size() && s[pos + 1] == '>') {
+      pos += 2;
+      auto elem = std::make_shared<MapObj>();
+      elem->put("tag", Value::string(tag));
+      elem->put("attrs", Value::object(Type::Map, attrs_map));
+      elem->put("children", Value::object(Type::List, children_list));
+      elem->put("text", Value::string(""));
+      return Value::object(Type::Map, elem);
+    }
+
+    if (peek() != '>') {
+      err = "xml_parse: expected '>' to close tag <" + tag + ">";
+      return Value::nil();
+    }
+    pos++; // skip '>'
+
+    std::string text_accum;
+
+    while (pos < s.size()) {
+      size_t next_lt = s.find('<', pos);
+      if (next_lt == std::string::npos) {
+        err = "xml_parse: unclosed tag <" + tag + ">";
+        return Value::nil();
+      }
+      if (next_lt > pos) {
+        text_accum.append(unescape_xml(s.substr(pos, next_lt - pos)));
+        pos = next_lt;
+      }
+
+      if (starts_with("<!--", 4)) {
+        pos += 4;
+        size_t end = s.find("-->", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed comment in <" + tag + ">";
+          return Value::nil();
+        }
+        pos = end + 3;
+      } else if (starts_with("<?", 2)) {
+        pos += 2;
+        size_t end = s.find("?>", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed processing instruction in <" + tag + ">";
+          return Value::nil();
+        }
+        pos = end + 2;
+      } else if (starts_with("<![CDATA[", 9)) {
+        pos += 9;
+        size_t end = s.find("]]>", pos);
+        if (end == std::string::npos) {
+          err = "xml_parse: unclosed CDATA in <" + tag + ">";
+          return Value::nil();
+        }
+        text_accum.append(s.substr(pos, end - pos));
+        pos = end + 3;
+      } else if (starts_with("</", 2)) {
+        pos += 2;
+        skip_ws();
+        std::string close_tag = parse_name();
+        skip_ws();
+        if (peek() != '>') {
+          err = "xml_parse: expected '>' in closing tag </" + close_tag + ">";
+          return Value::nil();
+        }
+        pos++; // skip '>'
+        if (close_tag != tag) {
+          err = "xml_parse: mismatched closing tag, expected </" + tag + "> but got </" + close_tag + ">";
+          return Value::nil();
+        }
+        break;
+      } else {
+        Value child = parse_element(err);
+        if (!err.empty()) return Value::nil();
+        children_list->items.push_back(child);
+      }
+    }
+
+    if (pos > s.size()) {
+      err = "xml_parse: unclosed tag <" + tag + ">";
+      return Value::nil();
+    }
+
+    std::string final_text = trim_spaces(text_accum);
+
+    auto elem = std::make_shared<MapObj>();
+    elem->put("tag", Value::string(tag));
+    elem->put("attrs", Value::object(Type::Map, attrs_map));
+    elem->put("children", Value::object(Type::List, children_list));
+    elem->put("text", Value::string(final_text));
+    return Value::object(Type::Map, elem);
+  }
+};
+
+Value bi_xml_parse(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "xml_parse")) return Value::nil();
+  XmlParser parser(args[0].str());
+  std::string err;
+  Value v = parser.parse(err);
+  if (!err.empty()) {
+    error = err;
+    return Value::nil();
+  }
+  return v;
+}
+
+Value bi_xml_escape(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "xml_escape")) return Value::nil();
+  return Value::string(escape_xml(args[0].str()));
+}
+
+Value bi_xml_unescape(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "xml_unescape")) return Value::nil();
+  return Value::string(unescape_xml(args[0].str()));
+}
+
 }  // namespace
 
 void install_text_builtins(Vm& vm) {
@@ -325,6 +685,9 @@ void install_text_builtins(Vm& vm) {
   vm.define_native("key_by", 2, 2, bi_key_by);
   vm.define_native("sum_by", 3, 3, bi_sum_by);
   vm.define_native("uuid", 0, 0, bi_uuid);
+  vm.define_native("xml_parse", 1, 1, bi_xml_parse);
+  vm.define_native("xml_escape", 1, 1, bi_xml_escape);
+  vm.define_native("xml_unescape", 1, 1, bi_xml_unescape);
 }
 
 }  // namespace aios::userland::grain

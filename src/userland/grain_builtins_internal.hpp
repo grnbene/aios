@@ -54,4 +54,13 @@ Value register_driven_pane(Vm& vm, const std::string& title, int width, int heig
 // The driver of one of `vm`'s panes (a pane map, handle or id), or null.
 std::shared_ptr<PaneDriver> pane_driver(const Vm& vm, const Value& pane);
 
+// Safe RFC 7578 Multipart Form Data parsing
+struct MultipartResult {
+  std::shared_ptr<MapObj> form = std::make_shared<MapObj>();
+  std::shared_ptr<MapObj> files = std::make_shared<MapObj>();
+};
+std::string extract_multipart_boundary(const std::string& content_type);
+std::string sanitize_upload_filename(const std::string& raw);
+MultipartResult parse_multipart_data(const std::string& body, const std::string& boundary);
+
 }  // namespace aios::userland::grain

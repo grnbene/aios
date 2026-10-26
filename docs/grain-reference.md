@@ -34,6 +34,7 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | Function | Signature | Description |
 |---|---|---|
 | `print` | `print(...args)` | Prints arguments to stdout separated by spaces, followed by a newline. |
+| `eprint` | `eprint(...args)` | Prints arguments to stderr separated by spaces, followed by a newline. |
 | `type` | `type(val)` | Returns the type name as a string: `"nil"`, `"bool"`, `"int"`, `"real"`, `"decimal"`, `"str"`, `"list"`, `"map"`, `"fn"`, `"bytes"`, `"handle"`. |
 | `str` | `str(val)` | Converts a value to its human-readable string representation. |
 | `repr` | `repr(val)` | Converts a value to its debug string representation (quoting strings). |
@@ -52,6 +53,18 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `debugger` | `debugger()` | Triggers a breakpoint or enters the interactive debugger if active. |
 | `is_stopping` | `is_stopping()` | Returns `true` if a shutdown or termination signal was received. |
 | `should_stop` | `should_stop()` | Alias for `is_stopping()`. |
+
+### Structured Application Logging
+| Function | Signature | Description |
+|---|---|---|
+| `log_debug` | `log_debug(msg, [extra_map])` | Emits a debug-level log message with optional key-value metadata map. |
+| `log_info` | `log_info(msg, [extra_map])` | Emits an info-level log message with optional key-value metadata map. |
+| `log_warn` | `log_warn(msg, [extra_map])` | Emits a warn-level log message with optional key-value metadata map. |
+| `log_error` | `log_error(msg, [extra_map])` | Emits an error-level log message with optional key-value metadata map. |
+| `log_set_level` | `log_set_level(level_str)` | Sets logging threshold: `"debug"`, `"info"`, `"warn"`, or `"error"`. Default is `"info"`. |
+| `log_get_level` | `log_get_level()` | Returns active log level string (`"debug"`, `"info"`, `"warn"`, `"error"`). |
+| `log_set_format` | `log_set_format(format_str)` | Configures output format: `"text"` (ISO timestamp & text) or `"json"` (single-line JSON). |
+| `log_get_format` | `log_get_format()` | Returns active log format string (`"text"` or `"json"`). |
 
 ---
 
@@ -305,6 +318,9 @@ ECMAScript-compatible regular expression operations.
 |---|---|---|
 | `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. |
 | `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. |
+| `xml_parse` | `xml_parse(xml_str)` | Parses XML into nested map `{tag, attrs, children, text}` with entity decoding and CDATA support. |
+| `xml_escape` | `xml_escape(str)` | Escapes special XML characters (`&`, `<`, `>`, `"`, `'`). |
+| `xml_unescape` | `xml_unescape(str)` | Unescapes standard and numeric XML entities (e.g. `&amp;`, `&#x2603;`). |
 | `base64_encode` | `base64_encode(str_or_bytes)` | Encodes string or bytes to standard Base64. |
 | `base64_decode` | `base64_decode(b64_str)` | Decodes Base64 string to original UTF-8 string. |
 | `hex_encode` | `hex_encode(str_or_bytes)` | Encodes input into lowercase hexadecimal string. |
@@ -324,6 +340,10 @@ ECMAScript-compatible regular expression operations.
 | `random_bytes` | `random_bytes(count)` | Cryptographically secure random bytes buffer. |
 | `aes_cbc_decrypt` | `aes_cbc_decrypt(key, iv, data)` | AES-CBC decryption with PKCS#7 unpadding (returns `nil` on bad padding). |
 | `hash_equals` | `hash_equals(a, b)` | Timing-safe string comparison to protect against side-channel leaks. |
+| `bcrypt_hash` | `bcrypt_hash(pass, [cost=10])` | Computes a standard `$2b$` OpenBSD bcrypt password hash with random salt. |
+| `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$` or `$2b$` bcrypt hash in constant time. |
+| `jwt_sign` | `jwt_sign(payload_map, secret)` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. |
+| `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 
 ---
 
@@ -346,6 +366,7 @@ ECMAScript-compatible regular expression operations.
 | `http_get` | `http_get(url, [options])` | Performs HTTP/HTTPS GET request. Returns `{status, body, headers, ok}`. |
 | `http_post` | `http_post(url, body, [options])` | Performs HTTP/HTTPS POST request with payload. |
 | `http_request` | `http_request(options_map)` | Full request: `{"url": ..., "method": "PUT", "headers": {...}, "body": ...}`. |
+| `http_parse_multipart` | `http_parse_multipart(body, content_type_or_boundary)` | Parses RFC 7578 multipart form payloads into `{"form": {...}, "files": {...}}` with strict path traversal stripping and size guards. |
 
 ### Server-Sent Events (SSE) Client
 | Function | Signature | Description |
@@ -396,6 +417,7 @@ ECMAScript-compatible regular expression operations.
 | `db_escape` | `db_escape(str)` | Escapes special characters for SQL literals. |
 | `db_quote` | `db_quote(str)` | Wraps string in single quotes with SQL escaping. |
 | `db_close` | `db_close(handle)` | Closes database connection. |
+| `db_transaction` | `db_transaction(conn, fn)` | Executes callback within a transaction (`START TRANSACTION` / `COMMIT`). Automatically rolls back on error (`ROLLBACK`). Supports nested calls via `SAVEPOINT`. |
 | `db_ping` | `db_ping(handle)` | Pings server to verify connection vitality. |
 | `db_connected` | `db_connected(handle)` | Returns `true` if connection handle remains open. |
 | `db_select_db` | `db_select_db(handle, db_name)` | Switches default database on the connection. |

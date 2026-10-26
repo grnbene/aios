@@ -219,4 +219,156 @@ int bcrypt_pbkdf(const char* pass, size_t passlen, const uint8_t* salt, size_t s
   return 0;
 }
 
+namespace {
+
+static const char Base64Code[] =
+"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+static const uint8_t index_64[128] = {
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255,   0,   1,  54,  55,
+     56,  57,  58,  59,  60,  61,  62,  63, 255, 255,
+    255, 255, 255, 255, 255,   2,   3,   4,   5,   6,
+      7,   8,   9,  10,  11,  12,  13,  14,  15,  16,
+     17,  18,  19,  20,  21,  22,  23,  24,  25,  26,
+     27, 255, 255, 255, 255, 255, 255,  28,  29,  30,
+     31,  32,  33,  34,  35,  36,  37,  38,  39,  40,
+     41,  42,  43,  44,  45,  46,  47,  48,  49,  50,
+     51,  52,  53, 255, 255, 255, 255, 255
+};
+
+static void encode_bcrypt_base64(char *buffer, const uint8_t *data, size_t len) {
+    const uint8_t *p = data;
+    size_t i = 0;
+    while (i < len) {
+        uint32_t c1 = *p++;
+        *buffer++ = Base64Code[(c1 >> 2) & 0x3f];
+        uint32_t c1_rem = (c1 & 0x03) << 4;
+        if (++i >= len) {
+            *buffer++ = Base64Code[c1_rem & 0x3f];
+            break;
+        }
+        uint32_t c2 = *p++;
+        *buffer++ = Base64Code[(c1_rem | (c2 >> 4)) & 0x3f];
+        uint32_t c2_rem = (c2 & 0x0f) << 2;
+        if (++i >= len) {
+            *buffer++ = Base64Code[c2_rem & 0x3f];
+            break;
+        }
+        uint32_t c3 = *p++;
+        *buffer++ = Base64Code[(c2_rem | (c3 >> 6)) & 0x3f];
+        *buffer++ = Base64Code[c3 & 0x3f];
+        ++i;
+    }
+    *buffer = '\0';
+}
+
+static bool decode_bcrypt_base64(uint8_t *buffer, size_t len, const char *data) {
+    const char *p = data;
+    size_t i = 0;
+    while (i < len) {
+        if (!*p || (unsigned char)*p >= 128) return false;
+        uint8_t c1 = index_64[(unsigned char)*p++];
+        if (c1 == 255) return false;
+        if (!*p || (unsigned char)*p >= 128) return false;
+        uint8_t c2 = index_64[(unsigned char)*p++];
+        if (c2 == 255) return false;
+        buffer[i++] = (c1 << 2) | ((c2 & 0x30) >> 4);
+        if (i >= len) break;
+        if (!*p || (unsigned char)*p >= 128) return false;
+        uint8_t c3 = index_64[(unsigned char)*p++];
+        if (c3 == 255) return false;
+        buffer[i++] = ((c2 & 0x0f) << 4) | ((c3 & 0x3c) >> 2);
+        if (i >= len) break;
+        if (!*p || (unsigned char)*p >= 128) return false;
+        uint8_t c4 = index_64[(unsigned char)*p++];
+        if (c4 == 255) return false;
+        buffer[i++] = ((c3 & 0x03) << 6) | c4;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool bcrypt_hash(const char* pass, size_t passlen, const uint8_t salt16[16],
+                 unsigned int cost, char out60[61]) {
+  if (cost < 4 || cost > 31) return false;
+  if (!pass) return false;
+  if (passlen > 72) passlen = 72;
+
+  std::vector<uint8_t> key(passlen + 1, 0);
+  std::memcpy(key.data(), pass, passlen);
+  key[passlen] = 0;
+  uint16_t keybytes = static_cast<uint16_t>(passlen + 1);
+
+  blf_ctx state;
+  Blowfish_initstate(&state);
+  Blowfish_expandstate(&state, salt16, 16, key.data(), keybytes);
+
+  uint64_t rounds = 1ULL << cost;
+  for (uint64_t k = 0; k < rounds; ++k) {
+    Blowfish_expand0state(&state, key.data(), keybytes);
+    Blowfish_expand0state(&state, salt16, 16);
+  }
+
+  uint32_t cdata[6];
+  uint16_t j = 0;
+  const uint8_t magic[24] = {
+    'O', 'r', 'p', 'h', 'e', 'a', 'n', 'B',
+    'e', 'h', 'o', 'l', 'd', 'e', 'r', 'S',
+    'c', 'r', 'y', 'D', 'o', 'u', 'b', 't'
+  };
+  for (int i = 0; i < 6; ++i) {
+    cdata[i] = Blowfish_stream2word(magic, 24, &j);
+  }
+  for (int i = 0; i < 64; ++i) {
+    blf_enc(&state, cdata, 3);
+  }
+
+  uint8_t raw_hash[24];
+  for (int i = 0; i < 6; ++i) {
+    raw_hash[4 * i + 0] = (cdata[i] >> 24) & 0xff;
+    raw_hash[4 * i + 1] = (cdata[i] >> 16) & 0xff;
+    raw_hash[4 * i + 2] = (cdata[i] >> 8) & 0xff;
+    raw_hash[4 * i + 3] = cdata[i] & 0xff;
+  }
+
+  std::snprintf(out60, 8, "$2b$%02u$", cost);
+  encode_bcrypt_base64(out60 + 7, salt16, 16);
+  encode_bcrypt_base64(out60 + 7 + 22, raw_hash, 23);
+  out60[60] = '\0';
+  return true;
+}
+
+bool bcrypt_verify(const char* pass, size_t passlen, const char* hash) {
+  if (!pass || !hash) return false;
+  if (std::strlen(hash) != 60) return false;
+  if (std::strncmp(hash, "$2a$", 4) != 0 && std::strncmp(hash, "$2b$", 4) != 0) return false;
+  if (hash[6] != '$') return false;
+
+  unsigned int cost = 0;
+  if (hash[4] >= '0' && hash[4] <= '9' && hash[5] >= '0' && hash[5] <= '9') {
+    cost = (hash[4] - '0') * 10 + (hash[5] - '0');
+  } else {
+    return false;
+  }
+  if (cost < 4 || cost > 31) return false;
+
+  uint8_t salt[16];
+  if (!decode_bcrypt_base64(salt, 16, hash + 7)) return false;
+
+  char computed[61];
+  if (!bcrypt_hash(pass, passlen, salt, cost, computed)) return false;
+
+  // Constant-time comparison
+  uint8_t diff = 0;
+  for (size_t i = 0; i < 60; ++i) {
+    diff |= static_cast<uint8_t>(computed[i] ^ hash[i]);
+  }
+  return diff == 0;
+}
+
 }  // namespace aios::crypto

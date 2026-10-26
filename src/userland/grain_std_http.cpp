@@ -163,7 +163,186 @@ Value bi_http_request(Vm&, std::vector<Value>& args, std::string& error) {
   return send(req, url, follow, "http_request", error);
 }
 
+// --- Safe RFC 7578 Multipart Form Data ---------------------------------------
+
+Value bi_http_parse_multipart(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "http_parse_multipart") || !want_str(args[1], error, "http_parse_multipart"))
+    return Value::nil();
+  const std::string& body = args[0].str();
+  const std::string& ct = args[1].str();
+  std::string boundary = ct;
+  if (ct.find("boundary=") != std::string::npos) {
+    boundary = extract_multipart_boundary(ct);
+  } else if (boundary.rfind("--", 0) == 0) {
+    boundary = boundary.substr(2);
+  }
+  auto mp = parse_multipart_data(body, boundary);
+  auto out = std::make_shared<MapObj>();
+  out->put("form", Value::object(Type::Map, mp.form));
+  out->put("files", Value::object(Type::Map, mp.files));
+  return Value::object(Type::Map, out);
+}
+
 }  // namespace
+
+std::string sanitize_upload_filename(const std::string& raw) {
+  if (raw.empty()) return "upload.bin";
+  size_t last_slash = raw.find_last_of("/\\");
+  std::string name = (last_slash != std::string::npos) ? raw.substr(last_slash + 1) : raw;
+
+  std::string clean;
+  clean.reserve(name.size());
+  for (unsigned char c : name) {
+    if (c == '\0') break; // null-byte truncation protection
+    if (c >= 32 && c != 127) {
+      clean.push_back((char)c);
+    }
+  }
+
+  // Strip leading dots to prevent hidden/system files (e.g. .user.ini, .htaccess, .env)
+  while (!clean.empty() && (clean.front() == '.' || clean.front() == ' ')) {
+    clean.erase(clean.begin());
+  }
+  // Strip trailing dots and spaces
+  while (!clean.empty() && (clean.back() == '.' || clean.back() == ' ')) {
+    clean.pop_back();
+  }
+
+  if (clean.empty() || clean == "." || clean == "..") {
+    return "upload.bin";
+  }
+  if (clean.size() > 255) clean = clean.substr(0, 255);
+  return clean;
+}
+
+std::string extract_multipart_boundary(const std::string& content_type) {
+  std::string lower_ct = content_type;
+  for (char& c : lower_ct) c = (char)std::tolower((unsigned char)c);
+  size_t pos = lower_ct.find("boundary=");
+  if (pos == std::string::npos) return "";
+  pos += 9;
+  if (pos >= content_type.size()) return "";
+  if (content_type[pos] == '"') {
+    pos++;
+    size_t end = content_type.find('"', pos);
+    if (end == std::string::npos) return "";
+    return content_type.substr(pos, end - pos);
+  }
+  size_t end = content_type.find_first_of(" ;,\r\n\t", pos);
+  return content_type.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+MultipartResult parse_multipart_data(const std::string& body, const std::string& boundary) {
+  MultipartResult res;
+  if (boundary.empty() || boundary.size() > 128 || body.empty()) return res;
+
+  std::string delimiter = "--" + boundary;
+  std::string end_delimiter = delimiter + "--";
+
+  size_t pos = body.find(delimiter);
+  if (pos == std::string::npos) return res;
+
+  size_t part_count = 0;
+  const size_t kMaxParts = 100;
+
+  while (pos != std::string::npos && part_count < kMaxParts) {
+    if (pos + end_delimiter.size() <= body.size() &&
+        body.compare(pos, end_delimiter.size(), end_delimiter) == 0) {
+      break;
+    }
+
+    size_t part_start = pos + delimiter.size();
+    if (part_start >= body.size()) break;
+
+    if (part_start < body.size() && body[part_start] == '\r') part_start++;
+    if (part_start < body.size() && body[part_start] == '\n') part_start++;
+
+    size_t headers_end = body.find("\r\n\r\n", part_start);
+    size_t body_offset = 4;
+    if (headers_end == std::string::npos) {
+      headers_end = body.find("\n\n", part_start);
+      body_offset = 2;
+    }
+    if (headers_end == std::string::npos || headers_end - part_start > 4096) break;
+
+    std::string header_str = body.substr(part_start, headers_end - part_start);
+    size_t content_start = headers_end + body_offset;
+
+    size_t next_delim = body.find(delimiter, content_start);
+    if (next_delim == std::string::npos) break;
+
+    size_t content_end = next_delim;
+    if (content_end >= content_start + 2 && body[content_end - 2] == '\r' && body[content_end - 1] == '\n') {
+      content_end -= 2;
+    } else if (content_end >= content_start + 1 && (body[content_end - 1] == '\r' || body[content_end - 1] == '\n')) {
+      content_end -= 1;
+    }
+
+    std::string part_content = body.substr(content_start, content_end - content_start);
+
+    std::string disposition, name, filename, content_type = "text/plain";
+    bool is_file = false;
+
+    size_t h_at = 0;
+    while (h_at < header_str.size()) {
+      size_t eol = header_str.find('\n', h_at);
+      std::string line = header_str.substr(h_at, eol == std::string::npos ? std::string::npos : eol - h_at);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+
+      size_t colon = line.find(':');
+      if (colon != std::string::npos) {
+        std::string h_name = line.substr(0, colon);
+        std::string h_val = line.substr(colon + 1);
+        while (!h_val.empty() && std::isspace((unsigned char)h_val.front())) h_val.erase(h_val.begin());
+
+        std::string lower_hname = h_name;
+        for (char& c : lower_hname) c = (char)std::tolower((unsigned char)c);
+
+        if (lower_hname == "content-disposition") {
+          disposition = h_val;
+          size_t name_pos = h_val.find("name=\"");
+          if (name_pos != std::string::npos) {
+            name_pos += 6;
+            size_t name_end = h_val.find('"', name_pos);
+            if (name_end != std::string::npos) name = h_val.substr(name_pos, name_end - name_pos);
+          }
+          size_t fn_pos = h_val.find("filename=\"");
+          if (fn_pos != std::string::npos) {
+            fn_pos += 10;
+            size_t fn_end = h_val.find('"', fn_pos);
+            if (fn_end != std::string::npos) {
+              filename = h_val.substr(fn_pos, fn_end - fn_pos);
+              is_file = true;
+            }
+          }
+        } else if (lower_hname == "content-type") {
+          content_type = h_val;
+        }
+      }
+      if (eol == std::string::npos) break;
+      h_at = eol + 1;
+    }
+
+    if (!name.empty()) {
+      if (is_file) {
+        auto file_obj = std::make_shared<MapObj>();
+        std::string safe_fn = sanitize_upload_filename(filename);
+        file_obj->put("name", Value::string(name));
+        file_obj->put("filename", Value::string(safe_fn));
+        file_obj->put("type", Value::string(content_type));
+        file_obj->put("size", Value::integer(static_cast<int64_t>(part_content.size())));
+        file_obj->put("data", Value::bytes(std::vector<uint8_t>(part_content.begin(), part_content.end())));
+        res.files->put(name, Value::object(Type::Map, file_obj));
+      } else {
+        res.form->put(name, Value::string(part_content));
+      }
+    }
+
+    part_count++;
+    pos = next_delim;
+  }
+  return res;
+}
 
 std::string grain_http_trust_root() { return trust_root(); }
 void install_events_builtins(Vm& vm);   // grain_std_events.cpp
@@ -177,6 +356,7 @@ void install_http_builtins(Vm& vm) {
   vm.define_native("http_get", 1, 2, bi_http_get);
   vm.define_native("http_post", 2, 3, bi_http_post);
   vm.define_native("http_request", 1, 1, bi_http_request);
+  vm.define_native("http_parse_multipart", 2, 2, bi_http_parse_multipart);
   install_events_builtins(vm);   // server-sent events: the same capability, a stream instead of one answer
 }
 
