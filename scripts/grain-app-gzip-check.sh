@@ -8,7 +8,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 aios="${1:-$here/build-static/aios}"
 work="$(mktemp -d)"
 host_pid=""
-cleanup() { [ -n "$host_pid" ] && kill "$host_pid" 2>/dev/null && wait "$host_pid" 2>/dev/null; rm -rf "$work"; }
+cleanup() { if [ -n "$host_pid" ]; then kill "$host_pid" 2>/dev/null || true; wait "$host_pid" 2>/dev/null || true; fi; rm -rf "$work"; }
 trap cleanup EXIT
 export AIOS_NO_ACCEL=1
 host_port=$(( 30000 + RANDOM % 10000 )); app_port=$(( host_port + 1 ))

@@ -434,12 +434,15 @@ MultipartResult parse_multipart_data(const std::string& body, const std::string&
 std::string grain_http_trust_root() { return trust_root(); }
 void install_events_builtins(Vm& vm);   // grain_std_events.cpp
 
+std::string http_trust_root() { return trust_root(); }
+
 void set_http_trust_root(const std::string& root) {
   std::lock_guard<std::mutex> lk(g_root_mu);
   g_trust_root = root;
 }
 
 void install_http_builtins(Vm& vm) {
+  install_mail_builtins(vm);   // mail_send: network I/O like the http calls, given wherever they are
   vm.define_native("http_get", 1, 2, bi_http_get);
   vm.define_native("http_post", 2, 3, bi_http_post);
   vm.define_native("http_request", 1, 1, bi_http_request);

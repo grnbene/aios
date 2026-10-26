@@ -9,7 +9,7 @@ aios="${1:-$here/build-static/aios}"
 grain="${2:-$here/build-grain/grain}"
 work="$(mktemp -d)"
 server_pid=""
-cleanup() { [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null && wait "$server_pid" 2>/dev/null; rm -rf "$work"; }
+cleanup() { if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; rm -rf "$work"; }
 trap cleanup EXIT
 umask 077
 head -c 18 /dev/urandom | base64 > "$work/pass"
