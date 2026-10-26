@@ -1,7 +1,9 @@
 // PkMap is the primary-key map of a row index. Every key of a text-mode map used to be held twice - a slot and a
-// std::string beside it - which is what a 20M-row composite-key table (stockmovestaxes) cost: ~100+ bytes a row,
-// 6 GB across the tables of a POS order. This drives it against std::unordered_map through inserts, lookups of
-// present and absent keys, erases, re-inserts and the integer -> text switch, then says what a key costs.
+// std::string beside it - which is what a 20M-row composite-key table (stockmovestaxes) cost: ~130 bytes a row,
+// 6 GB across the tables of a POS order. The text is now kept exactly in one packed arena. This drives it against
+// std::unordered_map through inserts, lookups of present and absent keys, erases, re-inserts, the integer -> text
+// switch and arena compaction - and with a hash that is the same for every key, where only an exact comparison of
+// the key text keeps the keys apart - then says what a key costs.
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -86,6 +88,43 @@ int main() {
     check(ok && m.size() == ref.size(), "1.5M random insert / erase / find steps on text keys agree with the reference");
   }
 
+  {  // Every key hashes alike: the map is exact only if it compares the text.
+    PkMap m([](const std::string&) -> uint64_t { return 7; });
+    std::unordered_map<std::string, uint32_t> ref;
+    bool ok = true;
+    for (int step = 0; step < 60000 && ok; ++step) {
+      const std::string key = comp_key(rng() % 900, rng() % 4);
+      switch (rng() % 4) {
+        case 0: case 1: { auto r = m.emplace(key, (size_t)step); const bool fresh = ref.emplace(key, (uint32_t)step).second; ok = r.second == fresh; break; }
+        case 2: { m.erase(key); ref.erase(key); break; }
+        default: { auto it = m.find(key); auto jt = ref.find(key); ok = (it == m.end()) == (jt == ref.end()) && (it == m.end() || it->second == jt->second); }
+      }
+    }
+    std::vector<std::string> absent;
+    for (uint64_t i = 0; i < 900; ++i) absent.push_back(comp_key(i, 9));
+    check(ok && same(m, ref, absent), "every key hashing alike: 60k random steps stay exact (a false match is impossible)");
+  }
+
+  {  // Churn: keys erased and others added until the arena is compacted, many times over, long keys included.
+    PkMap m;
+    std::unordered_map<std::string, uint32_t> ref;
+    bool ok = true;
+    for (int step = 0; step < 400000 && ok; ++step) {
+      const uint64_t k = rng() % 50000;
+      std::string key = text_key(k);
+      if (k % 9 == 0) key += std::string(150 + k % 400, 'x') + '\x1f';   // varint lengths of two bytes
+      if (rng() % 2) { auto r = m.emplace(key, (size_t)step); ok = r.second == ref.emplace(key, (uint32_t)step).second; }
+      else { m.erase(key); ref.erase(key); }
+    }
+    std::vector<std::string> absent;
+    for (uint64_t i = 0; i < 1000; ++i) absent.push_back("ABSENT" + std::to_string(i) + '\x1f');
+    check(ok && same(m, ref, absent), "400k insert/erase steps with long keys, through arena compactions, agree with the reference");
+    PkMap fresh;
+    for (const auto& kv : ref) fresh.emplace(kv.first, kv.second);
+    std::printf("after the churn: %zu live keys hold %zu bytes; the same keys built fresh hold %zu\n", ref.size(), m.memory_bytes(), fresh.memory_bytes());
+    check(m.memory_bytes() < fresh.memory_bytes() * 3, "erased keys' text is reclaimed: the arena does not grow with the churn");
+  }
+
   {  // What a key costs.
     const size_t n = 2000000;
     PkMap comp, txt, ints;
@@ -93,8 +132,8 @@ int main() {
     for (uint64_t i = 0; i < n; ++i) { comp.emplace(comp_key(12000000 + i, 14), (size_t)i); txt.emplace(text_key(i), (size_t)i); ints.emplace(int_key(i), (size_t)i); }
     const double cb = (double)comp.memory_bytes() / (double)n, tb = (double)txt.memory_bytes() / (double)n, ib = (double)ints.memory_bytes() / (double)n;
     std::printf("bytes a key (sized for 2M): integer %.1f, composite %.1f, text %.1f\n", ib, cb, tb);
-    check(cb <= 64.0, "a composite key costs at most 64 bytes");
-    check(tb <= 64.0, "a text key costs at most 64 bytes");
+    check(cb <= 85.0, "a composite key costs at most 85 bytes (was 132)");
+    check(tb <= 85.0, "a text key costs at most 85 bytes (was 132)");
   }
 
   std::printf("%s\n", failures ? "FAILED" : "all passed");

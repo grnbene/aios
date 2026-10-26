@@ -16,7 +16,6 @@
 #include <shared_mutex>
 #include <functional>
 #include <cstring>
-#include <random>
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -1160,13 +1159,16 @@ class PkMap {
   iterator end() { return iterator{this, slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
-  void clear() { slots_.clear(); khi_.clear(); count_ = used_ = 0; text_ = false; }
+  // `hash` is for the tests: a degenerate one makes every key collide, and the map must still be exact.
+  explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash) {}
+  void clear() { slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false; }
   void reserve(size_t n) { if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
     if (slots_.empty()) return end();
     uint64_t ik = 0;
     if (!text_ && !as_int(key, &ik)) return end();   // no integer key is in a text map's keys? they may: fall through
-    const size_t i = locate(text_ ? hash_text(key) : Hash{ik, 0}, false);
+    if (text_) ik = hash_text(key);
+    const size_t i = locate(key, ik, false);
     return i == npos ? end() : iterator{this, i};
   }
   void erase(const std::string& key) {
@@ -1175,6 +1177,10 @@ class PkMap {
   }
   iterator erase(iterator it) {
     slots_[it.i].state = 2;
+    if (text_) {
+      dead_ += entry_bytes(it.i);
+      if (dead_ > (1u << 20) && dead_ * 2 > arena_.size()) compact();
+    }
     --count_;
     ++it;
     return it;
@@ -1184,31 +1190,37 @@ class PkMap {
     uint64_t ik = 0;
     const bool is_int = as_int(key, &ik);
     if (!text_ && !is_int) to_text();
-    const Hash h = text_ ? hash_text(key) : Hash{ik, 0};
+    if (text_) ik = hash_text(key);
     if ((used_ + 1) * 10 > slots_.size() * 7 || slots_.empty()) rehash(count_ + 1);
-    const size_t i = locate(h, true);
+    const size_t i = locate(key, ik, true);
     if (slots_[i].state == 1) return {iterator{this, i}, false};
     if (slots_[i].state == 0) ++used_;
     slots_[i].state = 1;
-    slots_[i].key = h.lo;
+    slots_[i].key = ik;
     slots_[i].second = (uint32_t)v;
-    if (text_) khi_[i] = h.hi;
+    if (text_) koff_[i] = put_text(key);
     ++count_;
     return {iterator{this, i}, true};
   }
-  size_t memory_bytes() const { return slots_.capacity() * sizeof(Slot) + khi_.capacity() * sizeof(uint64_t); }
+  size_t memory_bytes() const {
+    return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity();
+  }
 
  private:
   static constexpr size_t npos = (size_t)-1;
-  // A key that is not an integer is held as a 128-bit hash of its text - the slot's `key` and `khi_` beside it -
-  // not as the text: a std::string a slot (32 B, and a heap block past 15 characters) made a composite-key row
-  // ~130 bytes of index, 6 GB across a POS order's tables. Two keys share a hash with a chance of 2^-128 a pair
-  // (~1e-24 over 20M keys), and the seed is drawn per process, so no key can be chosen to meet another's.
-  bool text_ = false;                 // keys as hashes of text: khi_ (the high half) runs beside slots_
+  // A key that is not an integer is held as its text, exactly, in one packed arena - a varint length and the
+  // bytes, 4-byte aligned, `koff_[slot]` units in - not as a std::string a slot (32 B, and a heap block past 15
+  // characters), which made a composite-key row ~130 bytes of index. A lookup compares the slot's stored 64-bit
+  // hash first and the full text after it: two keys are the same key only when their text is. The text of an
+  // erased key is reclaimed when the arena is compacted (once half of it is dead) or the map rehashed.
+  bool text_ = false;                 // keys as text: koff_ runs beside slots_, the text in arena_
   std::vector<Slot> slots_;
-  std::vector<uint64_t> khi_;
+  std::vector<uint32_t> koff_;
+  std::vector<char> arena_;
+  size_t dead_ = 0;                   // bytes of arena_ held by erased keys
   size_t count_ = 0, used_ = 0;       // live entries; live plus tombstones
-  struct Hash { uint64_t lo, hi; };
+  uint64_t (*hash_fn_)(const std::string&) = nullptr;
+  uint64_t hash_text(const std::string& key) const { return hash_fn_ ? hash_fn_(key) : (uint64_t)std::hash<std::string>{}(key); }
   // "<canonical integer>\x1f": what row_key makes of a single INT key.
   static bool as_int(const std::string& key, uint64_t* v) {
     const size_t n = key.size();
@@ -1233,76 +1245,130 @@ class PkMap {
     k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ull; k ^= k >> 33;
     return k;
   }
-  // Two lanes over the same bytes, each fed the other's state, then finished apart.
-  static Hash hash_text(const std::string& key) {
-    static const uint64_t seed = [] {
-      std::random_device rd;
-      return ((uint64_t)rd() << 32) ^ (uint64_t)rd() ^ 0x9e3779b97f4a7c15ull;
-    }();
-    const unsigned char* p = (const unsigned char*)key.data();
-    const size_t n = key.size();
-    uint64_t a = seed ^ (n * 0x9ddfea08eb382d69ull), b = mix(seed + 0xc2b2ae3d27d4eb4full) + n;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-      uint64_t w;
-      std::memcpy(&w, p + i, 8);
-      a = (a ^ w) * 0x9ddfea08eb382d69ull; a ^= a >> 47;
-      b = (b + w) * 0xc3a5c85c97cb3127ull; b ^= b >> 43; b += a;
-    }
-    uint64_t w = 0;
-    for (size_t k = 0; i + k < n; ++k) w |= (uint64_t)p[i + k] << (8 * k);
-    a = (a ^ w) * 0x9ddfea08eb382d69ull; a ^= a >> 47;
-    b = (b + w) * 0xc3a5c85c97cb3127ull; b ^= b >> 43; b += a;
-    return Hash{mix(a ^ (b >> 7)), mix(b + (a << 3) + n)};
+  // Text entry at arena_[off*4]: varint length, bytes, zero padding to the next multiple of 4.
+  uint32_t put_text(const std::string& key) {
+    const size_t at = arena_.size();   // always a multiple of 4
+    size_t n = key.size();
+    do { arena_.push_back((char)((n & 0x7f) | (n > 0x7f ? 0x80 : 0))); n >>= 7; } while (n);
+    arena_.insert(arena_.end(), key.begin(), key.end());
+    while (arena_.size() & 3) arena_.push_back(0);
+    return (uint32_t)(at >> 2);
   }
-  size_t hash_of(const Hash& h) const { return text_ ? (size_t)h.lo : (size_t)mix(h.lo); }
-  bool same(size_t i, const Hash& h) const { return slots_[i].key == h.lo && (!text_ || khi_[i] == h.hi); }
-  // The slot holding the key, or - when inserting - the first free slot of its chain.
-  size_t locate(const Hash& h, bool for_insert) const {
+  // The text of slot i: where its bytes start and how long they are.
+  const char* text_of(size_t i, size_t* len) const {
+    const char* p = arena_.data() + (size_t)koff_[i] * 4;
+    size_t n = 0;
+    int shift = 0;
+    for (;; ++p, shift += 7) {
+      n |= (size_t)((unsigned char)*p & 0x7f) << shift;
+      if (!((unsigned char)*p & 0x80)) { ++p; break; }
+    }
+    *len = n;
+    return p;
+  }
+  size_t entry_bytes(size_t i) const {
+    size_t len;
+    const char* p = text_of(i, &len);
+    return (((size_t)(p - (arena_.data() + (size_t)koff_[i] * 4)) + len) + 3) & ~(size_t)3;
+  }
+  bool same(size_t i, const std::string& key, uint64_t ik) const {
+    if (slots_[i].key != ik) return false;
+    if (!text_) return true;
+    size_t len;
+    const char* p = text_of(i, &len);
+    return len == key.size() && std::memcmp(p, key.data(), len) == 0;
+  }
+  // The slot holding `key`, or - when inserting - the first free slot of its chain.
+  size_t locate(const std::string& key, uint64_t ik, bool for_insert) const {
     const size_t mask = slots_.size() - 1;
-    size_t i = hash_of(h) & mask;
+    size_t i = (size_t)mix(ik) & mask;
     size_t first_free = npos;
     for (size_t n = 0; n < slots_.size(); ++n, i = (i + 1) & mask) {
       const Slot& s = slots_[i];
       if (s.state == 0) return for_insert ? (first_free == npos ? i : first_free) : npos;
       if (s.state == 2) { if (first_free == npos) first_free = i; continue; }
-      if (same(i, h)) return i;
+      if (same(i, key, ik)) return i;
     }
     return for_insert ? first_free : npos;
+  }
+  // The first empty slot of the chain: for a map being rebuilt, where no key is there yet.
+  size_t place(uint64_t ik) const {
+    const size_t mask = slots_.size() - 1;
+    size_t i = (size_t)mix(ik) & mask;
+    while (slots_[i].state != 0) i = (i + 1) & mask;
+    return i;
+  }
+  // The live text of `old` into a fresh arena, offsets rewritten: drops what erased keys held.
+  void move_texts(const std::vector<Slot>& old_slots, const std::vector<uint32_t>& old_off, const std::vector<char>& old_arena,
+                  std::vector<char>* arena, std::vector<uint32_t>* off, const std::vector<size_t>& dest) {
+    for (size_t i = 0; i < old_slots.size(); ++i) {
+      if (old_slots[i].state != 1) continue;
+      const char* base = old_arena.data() + (size_t)old_off[i] * 4;
+      const char* p = base;
+      size_t n = 0;
+      int shift = 0;
+      for (;; ++p, shift += 7) {
+        n |= (size_t)((unsigned char)*p & 0x7f) << shift;
+        if (!((unsigned char)*p & 0x80)) { ++p; break; }
+      }
+      const size_t total = (((size_t)(p - base) + n) + 3) & ~(size_t)3;
+      (*off)[dest[i]] = (uint32_t)(arena->size() >> 2);
+      arena->insert(arena->end(), base, base + total);
+    }
   }
   void rehash(size_t live) {
     size_t cap = 16;
     while (cap * 2 < live * 3 + 4) cap <<= 1;   // load at most ~2/3 after a rehash (grows again at 0.7)
     std::vector<Slot> old;
-    std::vector<uint64_t> old_hi;
+    std::vector<uint32_t> old_off;
+    std::vector<char> old_arena;
     old.swap(slots_);
-    old_hi.swap(khi_);
+    old_off.swap(koff_);
+    old_arena.swap(arena_);
     slots_.assign(cap, Slot{});
-    if (text_) khi_.assign(cap, 0);
+    if (text_) koff_.assign(cap, 0);
     count_ = used_ = 0;
+    dead_ = 0;
+    std::vector<size_t> dest(text_ ? old.size() : 0);
     for (size_t i = 0; i < old.size(); ++i) {
       if (old[i].state != 1) continue;
-      const size_t j = locate(Hash{old[i].key, text_ ? old_hi[i] : 0}, true);
+      const size_t j = place(old[i].key);
       slots_[j] = old[i];
-      if (text_) khi_[j] = old_hi[i];
+      if (text_) dest[i] = j;
       ++count_; ++used_;
     }
+    if (text_) move_texts(old, old_off, old_arena, &arena_, &koff_, dest);
   }
-  // A key that is not an integer: every key from now on is held as a hash of its text.
+  // Half of the arena is erased keys' text: the live text moves to a fresh one, slots stay where they are.
+  void compact() {
+    std::vector<char> fresh;
+    fresh.reserve(arena_.size() - dead_ + 16);
+    std::vector<uint32_t> off(koff_.size(), 0);
+    std::vector<size_t> dest(slots_.size());
+    for (size_t i = 0; i < slots_.size(); ++i) dest[i] = i;
+    move_texts(slots_, koff_, arena_, &fresh, &off, dest);
+    arena_.swap(fresh);
+    koff_.swap(off);
+    dead_ = 0;
+  }
+  // A key that is not an integer: every key from now on is held as text.
   void to_text() {
     std::vector<Slot> old;
     old.swap(slots_);
     text_ = true;
     slots_.assign(old.size(), Slot{});
-    khi_.assign(old.size(), 0);
+    koff_.assign(old.size(), 0);
+    arena_.clear();
+    dead_ = 0;
     count_ = used_ = 0;
     for (const Slot& s : old) {
       if (s.state != 1) continue;
-      const Hash h = hash_text(std::to_string((int64_t)s.key) + '\x1f');
-      const size_t j = locate(h, true);
+      const std::string k = std::to_string((int64_t)s.key) + '\x1f';
+      const uint64_t ik = hash_text(k);
+      const size_t j = place(ik);
       slots_[j] = s;
-      slots_[j].key = h.lo;
-      khi_[j] = h.hi;
+      slots_[j].key = ik;
+      koff_[j] = put_text(k);
       ++count_; ++used_;
     }
   }
