@@ -369,6 +369,14 @@ ECMAScript-compatible regular expression operations.
 | `http_post` | `http_post(url, body, [options])` | Performs HTTP/HTTPS POST request with payload. |
 | `http_request` | `http_request(options_map)` | Full request: `{"url": ..., "method": "PUT", "headers": {...}, "body": ...}`. |
 | | | The HTTP calls ask for gzip and undo it (the response then reads as plain, its `content-encoding` header dropped). Options: `decompress: false` to get the body as sent, `max_bytes` (default 64 MB) for how large a gzip body may inflate. A grain app served by `aios serve` gzips text-like responses of 1 KB or more for clients that accept it. |
+| `kv_get` | `kv_get(key, [default])` | The value stored under `key` (a copy), or `default` / nil. `kv_*` is a key-value store for sessions, rate limits and tokens: one per hosted app, shared by its sessions and workers, kept in memory and journaled in the app's data directory (`kv.journal`, replayed at start, compacted as it grows). In a plain `grain` script it is the process's, in memory. |
+| `kv_set` | `kv_set(key, value, [ttl_seconds])` | Stores a string, number, bool, list or map (as JSON; at most 1 MB). A nil value deletes. Keys are 1 to 1024 bytes. |
+| `kv_del` | `kv_del(key)` | Removes a key; whether it was there. |
+| `kv_incr` | `kv_incr(key, [by=1], [ttl_seconds])` | Adds to a whole-number value atomically and returns it; a missing key starts at 0 and takes the ttl (a rate-limit window). |
+| `kv_expire` | `kv_expire(key, ttl_seconds)` | Sets a key's expiry; whether it was there. |
+| `kv_ttl` | `kv_ttl(key)` | Seconds left, -1 for no expiry, nil when missing. |
+| `kv_keys` | `kv_keys([prefix])` | The live keys (with that prefix), sorted. |
+| `kv_mget` | `kv_mget(keys)` | Their values in order, nil for the missing. |
 | `mail_send` | `mail_send({host, port, security, user, password, from, from_name, to, cc, bcc, reply_to, subject, text, html, attachments, timeout_ms})` | Sends email through aios's own SMTP client (kernel sockets and TLS): STARTTLS on 587 (TLS on 465) unless `security` says `"tls"`, `"starttls"` or `"none"`; signs in when `user` is given. `to`/`cc`/`bcc` are an address or a list (bcc delivered, never named); `text` and/or `html`; `attachments` a list of `{filename, data (string or bytes), type}`. UTF-8 subjects, names and filenames are encoded. Returns `{ok, message_id, recipients}`; a line break in any header value, a bad address, or a password over `"none"` to another machine is an error. Keep the password in the app's settings: `getenv("SMTP_PASSWORD")`. |
 | `http_parse_multipart` | `http_parse_multipart(body, content_type_or_boundary)` | Parses RFC 7578 multipart form payloads into `{"form": {...}, "files": {...}}` with strict path traversal stripping and size guards. |
 

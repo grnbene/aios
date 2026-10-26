@@ -1,0 +1,80 @@
+// kv_*: values of every JSON type, defaults, delete, expiry, atomic incr (also from parallel workers), keys / mget,
+// limits, at top level, in a function and a closure. (Kept across restarts: scripts/grain-app-kv-check.sh.)
+fn check(c, msg) { assert_true(c, msg) }
+
+// Values come back as they went in.
+kv_set("s", "text")
+kv_set("n", 42)
+kv_set("r", 2.5)
+kv_set("b", false)
+kv_set("l", [1, "two", [3]])
+kv_set("m", {"user": "sean", "roles": ["admin"], "n": 7})
+check(kv_get("s") == "text" and kv_get("n") == 42 and kv_get("r") == 2.5 and kv_get("b") == false, "scalars")
+check(kv_get("l")[2][0] == 3 and kv_get("m").roles[0] == "admin" and kv_get("m").n == 7, "lists and maps")
+let m = kv_get("m")
+m.user = "changed"
+check(kv_get("m").user == "sean", "a value read is a copy: changing it changes nothing stored")
+check(kv_get("missing") == nil and kv_get("missing", "dflt") == "dflt", "missing: nil or the default")
+check(kv_get("b", "dflt") == false, "a stored false is not the default")
+
+// Delete.
+check(kv_del("s") == true and kv_get("s") == nil and kv_del("s") == false, "kv_del says whether it was there")
+kv_set("n", nil)
+check(kv_get("n") == nil, "setting nil deletes")
+
+// Expiry.
+kv_set("short", "soon gone", 0.3)
+check(kv_get("short") == "soon gone", "there before its ttl")
+let t = kv_ttl("short")
+check(t > 0 and t <= 0.3, "kv_ttl counts down: " + str(t))
+check(kv_ttl("l") == -1, "no expiry: -1")
+check(kv_ttl("nothing") == nil, "missing: nil")
+sleep(400)
+check(kv_get("short") == nil, "gone after its ttl")
+kv_set("later", 1)
+check(kv_expire("later", 0.2) == true and kv_expire("nothing", 1) == false, "kv_expire on a key that is there")
+sleep(300)
+check(kv_get("later") == nil, "kv_expire took effect")
+
+// Counters.
+check(kv_incr("hits") == 1 and kv_incr("hits") == 2 and kv_incr("hits", 10) == 12 and kv_incr("hits", -2) == 10, "kv_incr")
+check(kv_incr("window", 1, 0.3) == 1 and kv_incr("window") == 2, "a counter with a ttl")
+sleep(400)
+check(kv_get("window") == nil and kv_incr("window") == 1, "the window expired and started over")
+kv_set("word", "abc")
+let bad = pcall(kv_incr, "word")
+check(!bad.ok and contains(bad.error, "not a whole number"), "kv_incr on text: " + str(bad.error))
+
+// Atomic across threads: 8 workers each add 500.
+fn add_many(k) {
+  for i in 0..500 { kv_incr(k) }
+  return true
+}
+let tasks = []
+for w in 0..8 { push(tasks, spawn(add_many, "par")) }
+for task in tasks { await(task) }
+check(kv_get("par") == 4000, "8 workers x 500 increments: " + str(kv_get("par")))
+
+// keys and mget.
+kv_set("sess:a", 1)
+kv_set("sess:b", 2)
+kv_set("sess:c", 3, 0.1)
+sleep(200)
+check(join(kv_keys("sess:"), ",") == "sess:a,sess:b", "keys by prefix, sorted, expired left out: " + str(kv_keys("sess:")))
+let got = kv_mget(["sess:a", "nope", "sess:b"])
+check(got[0] == 1 and got[1] == nil and got[2] == 2, "kv_mget in order, nil for the missing")
+
+// Limits and refusals.
+check(!pcall(kv_set, "", 1).ok, "an empty key")
+check(!pcall(kv_set, repeat("k", 1025), 1).ok, "a key over 1024 bytes")
+check(!pcall(kv_set, "big", repeat("x", 1048577)).ok, "a value over 1 MB")
+check(!pcall(kv_set, "raw", bytes(4)).ok, "bytes are refused (base64 them)")
+check(!pcall(kv_set, "ttl0", 1, 0).ok, "a ttl of 0")
+check(!pcall(kv_get, 5).ok, "a key that is not a string")
+
+// In a function and a closure.
+fn remember(user, token) { kv_set("tok:" + token, {"user": user}, 60); return kv_get("tok:" + token).user }
+check(remember("ann", "t1") == "ann", "in a function")
+let limiter = fn (ip, limit) { return kv_incr("rate:" + ip, 1, 60) <= limit }
+check(limiter("1.2.3.4", 2) and limiter("1.2.3.4", 2) and !limiter("1.2.3.4", 2), "a rate limiter in a closure")
+print("PASS: test_kv")
