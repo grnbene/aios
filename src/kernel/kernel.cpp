@@ -6,6 +6,8 @@
 #include "aios/kernel/surface.hpp"
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
 #include <unordered_map>
 
 namespace aios {
@@ -166,6 +168,7 @@ Result<void> Kernel::init(const KernelConfig& cfg) {
   watchdog_ = std::make_unique<KernelWatchdog>(*this);
   caps_->observe(this);
   AIOS_TRY(load_or_create_identity());
+  load_or_create_node_key();
   AIOS_TRY(replay_authority());
   // Kept states (Surface::keep_state: a resident's, by its owner) live in the
   // root, one file per state, so the console's `kv` and `state create ...
@@ -366,6 +369,39 @@ Result<void> Kernel::load_or_create_identity() {
     }
   }
   return Ok();
+}
+
+// node.identity: a magic word and the 32-byte Ed25519 seed, created exclusive and private (never readable by
+// others, not even for a moment). A file that is there but unreadable or malformed is left alone - replacing it
+// would silently change who this machine is - and the kernel runs without a key.
+static constexpr uint32_t kNodeIdentityMagic = 0x4449534Eu;  // "NSID"
+
+void Kernel::load_or_create_node_key() {
+  const std::string path = cfg_.root + "/node.identity";
+  node_key_ok_ = false;
+  if (host_->exists(path)) {
+    auto d = host_->read_file(path);
+    if (!d.ok()) { node_key_problem_ = path + ": " + d.error().message; return; }
+    Reader r(*d);
+    const uint32_t magic = r.u32();
+    if (magic != kNodeIdentityMagic || d->size() != 4 + node_seed_.size()) { node_key_problem_ = path + ": not a node identity file (left as it is)"; return; }
+    std::memcpy(node_seed_.data(), d->data() + 4, node_seed_.size());
+  } else {
+    host_->random(MutableByteSpan(node_seed_.data(), node_seed_.size()));
+    ByteBuffer b; Writer w(b); w.u32(kNodeIdentityMagic);
+    b.insert(b.end(), node_seed_.begin(), node_seed_.end());
+    auto wr = host_->create_exclusive_private(path, b);
+    std::fill(b.begin(), b.end(), 0);
+    if (!wr.ok()) { node_seed_.fill(0); node_key_problem_ = path + ": " + wr.error().message; return; }
+  }
+  node_pub_ = crypto::ed25519_public_from_seed(node_seed_);
+  node_key_ok_ = true;
+  node_key_problem_.clear();
+}
+
+Result<crypto::Sig64> Kernel::node_sign(ByteSpan message) const {
+  if (!node_key_ok_) return Result<crypto::Sig64>(Status::NotFound, "no node identity: " + node_key_problem_);
+  return crypto::ed25519_sign(message, node_seed_, node_pub_);
 }
 
 uint64_t Kernel::now() const { return host_->wall_ns(); }
