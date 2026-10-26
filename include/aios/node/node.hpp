@@ -64,6 +64,7 @@ class NodeService {
   void serve(std::unique_ptr<hal::Connection> c);
   std::shared_ptr<Session> admit(std::shared_ptr<hal::Connection> c);
   bool step(Session& s, int timeout_ms);
+  std::string role_refusal(const Session& s, uint8_t type, const ByteBuffer& payload);
   void end_session(Session& s);   // its guest (and all it holds here) goes with it
   std::vector<std::shared_ptr<Session>> polled_;
   bool polled_mode_ = false;

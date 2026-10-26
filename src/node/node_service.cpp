@@ -111,6 +111,8 @@ struct NodeService::Session {
   EntityID guest;
   size_t slot = 0;
   bool alive = true;
+  Id128 peer;
+  std::string roles;   // the signed roster's roles for this peer (proven by its key); empty: not limited
 };
 
 std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Connection> c) {
@@ -146,6 +148,10 @@ std::shared_ptr<NodeService::Session> NodeService::admit(std::shared_ptr<hal::Co
     auto x = link_identity_exchange(*s->link, *key, false, k_.self(), peer_kernel, ByteSpan(peer_payload.data(), peer_payload.size()), k_.host(), lid.get(), upgraded, k2);
     if (!x.ok()) { k_.host().log_error("node: link from " + c->peer() + " refused: " + x.error().message); return nullptr; }
     if (upgraded) s->link = make_secure_link(c, k2, false);
+    s->peer = peer_kernel;
+    // Roles bind only to a peer that proved its key in the exchange.
+    std::array<uint8_t, 32> pk{};
+    if (upgraded && lid && lid->peer_roles && lid->peer_key && lid->peer_key(peer_kernel, pk)) s->roles = lid->peer_roles(peer_kernel);
   }
   s->link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
   auto guest = k_.spawn("peer:" + c->peer());
@@ -222,6 +228,34 @@ void NodeService::poll() {
   }
 }
 
+// The role a request needs, checked against the peer's roles; empty: allowed. Telemetry is open to every member (it
+// is what `fleet status` reads); staging memory serves both app routes and compute.
+std::string NodeService::role_refusal(const Session& sess, uint8_t t, const ByteBuffer& p) {
+  auto need = [&](const char* role) -> std::string {
+    if (roles_allow(sess.roles, role)) return {};
+    return "peer " + sess.peer.str() + " has no " + role + " role here (its roles: " + sess.roles + ")";
+  };
+  auto exec_role = [&](Reader& r) -> const char* {
+    auto op = Operation::decode(r);
+    return op.ok() && op->code == OpCode::Custom && op->custom_kernel == fnv1a(std::string("app.route")) ? "app-route" : "compute";
+  };
+  switch (t) {
+    case nodeproto::Telemetry: return {};
+    case nodeproto::MemAlloc: case nodeproto::MemWrite: case nodeproto::MemRead: case nodeproto::MemRelease: case nodeproto::MemPatch:
+      return roles_allow(sess.roles, "app-route") ? std::string() : need("compute");
+    case nodeproto::Exec: { Reader r(p); return need(exec_role(r)); }
+    case nodeproto::ExecBatch: {
+      Reader r(p);
+      const uint32_t nw = r.u32();
+      for (uint32_t i = 0; i < nw && r.ok(); ++i) { (void)r.id(); (void)r.u64(); (void)r.bytes(); }
+      return need(exec_role(r));
+    }
+    case nodeproto::Command: { Reader r(p); return need(command_role(r.str())); }
+    case nodeproto::Sql: return need("sql");
+    default: return need("compute");
+  }
+}
+
 // One request from a peer. Returns false when the link is gone (a timeout with
 // nothing pending returns true in polled mode so the caller keeps going).
 bool NodeService::step(Session& sess, int timeout_ms) {
@@ -242,6 +276,11 @@ bool NodeService::step(Session& sess, int timeout_ms) {
     Reader r(p);
     ByteBuffer out; Writer w(out);
     Result<void> st = Ok();
+    // Stage 4: the request kind against the peer's roles, before anything is done for it.
+    if (!sess.roles.empty()) {
+      const std::string why = role_refusal(sess, t, p);
+      if (!why.empty()) { reply_error(link, Status::Denied, why); return true; }
+    }
     switch (t) {
       case nodeproto::MemAlloc: {
         uint64_t size = r.u64();

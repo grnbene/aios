@@ -302,6 +302,23 @@ Result<void> check_peer(const LinkIdentity* id, const Id128& peer, ByteSpan sig,
 }
 }  // namespace
 
+bool roles_allow(const std::string& roles, const std::string& role) {
+  if (roles.empty()) return true;
+  size_t i = 0;
+  while (i <= roles.size()) {
+    size_t j = roles.find(',', i);
+    if (j == std::string::npos) j = roles.size();
+    if (roles.compare(i, j - i, role) == 0 && j - i == role.size()) return true;
+    i = j + 1;
+  }
+  return false;
+}
+const char* command_role(const std::string& line) {
+  size_t i = 0;
+  while (i < line.size() && line[i] == ' ') ++i;
+  return line.compare(i, 4, "app ") == 0 ? "app-admin" : "shell";
+}
+
 void set_link_identity(std::shared_ptr<const LinkIdentity> id) { hal::LockGuard g(g_identity_mu); g_identity = std::move(id); }
 std::shared_ptr<const LinkIdentity> link_identity() { hal::LockGuard g(g_identity_mu); return g_identity; }
 
