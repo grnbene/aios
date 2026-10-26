@@ -29,6 +29,7 @@ __pycache__/
 *.pyc
 /drive-root/
 .agent/
+.agentos/
 .assay/
 
 # coding agents and editors: their state, sessions and scratch never belong in the repo
