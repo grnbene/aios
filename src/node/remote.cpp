@@ -58,7 +58,7 @@ Result<ByteBuffer> RemoteNode::query(const std::string& sql, int timeout_ms) {
 }
 
 int fleet_shell_command(const std::string& line, std::string& output) {
-  static const bool allowed = [] { const char* e = std::getenv("AIOS_FLEET_SHELL"); return e && std::string(e) == "1"; }();
+  static const bool allowed = hal::process_host().env("AIOS_FLEET_SHELL") == "1";
   if (!allowed) {
     output = "this machine runs no shell commands for the fleet (its AIOS_FLEET_SHELL=1 would allow them)\n";
     return 126;
@@ -157,6 +157,14 @@ Result<void> RemoteNode::hello(const std::string& token, const Id128& my_kernel,
   auto key = secure_handshake_initiator(*plain, token, host, my_kernel, kernel_, peer_payload, ByteSpan(mine.data(), mine.size()));
   if (!key.ok()) return key.error();
   link_ = make_secure_link(c_, *key, true);
+  {
+    // Both sides newer: rekey from fresh X25519 keys, each side signing with its identity key.
+    bool upgraded = false; crypto::Key k2{};
+    const auto lid = link_identity();
+    auto x = link_identity_exchange(*link_, *key, true, my_kernel, kernel_, ByteSpan(peer_payload.data(), peer_payload.size()), host, lid.get(), upgraded, k2);
+    if (!x.ok()) { link_.reset(); return x.error(); }
+    if (upgraded) link_ = make_secure_link(c_, k2, true);
+  }
   link_->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
   // A member that only answers commands (an app host's relay command server, RelayClient::ensure_command_server)
   // completes the handshake with nothing to say: no devices. Read as a device count, that was "corrupt: hello reply",

@@ -1,11 +1,26 @@
-# Fleet identity keys — design (stages 1–2 implemented)
+# Fleet identity keys — design (stages 1–3 implemented)
 
 Status: proposal, 2026-10-26. Stage 1 (ce1813e) and stage 2 are in: `tools/fleet-identity-check.cpp`,
 `tools/fleet-signed-attach-check.cpp`. Stage 2 wire format: the hub's challenge is 16 random bytes plus a flags byte
 (bit 0: signatures taken, set when the hub has a members file); a member that sees it appends a 64-byte Ed25519
 signature over `"aios fleet attach v1\0" || challenge || member id` to its 16-byte key proof. A members-file line with
 `ed25519=` admits by that signature only. Upgrade the hub first, then a member, then add its `ed25519=` (from
-`fleet identity` on that machine). Replaces the shared cluster key with one key pair per machine, in stages that keep the
+`fleet identity` on that machine).
+
+Stage 3 as built (`tools/fleet-link-v2-check.cpp`):
+- **Roster.** A hub with an identity key appends to its roster frame, after the ids an older member reads: 'RSTK', a
+  version (hub clock, ms), each member's ed25519 key and `roles=`, and the hub's signature over
+  `"aios fleet roster v1\0" || all of it`. A member that pinned the hub key (`fleet join ... hub-key=<hex|@FILE>`)
+  takes keys only from a roster that key signed and that is not older than the last; anything else leaves the keys
+  it has. A key or role changed in the members file is re-sent within ~2 s.
+- **Links.** Rather than replacing the token handshake, the exchange runs right after it, on its encrypted link, when
+  both hello payloads carry `kFeatIdentity`: A → `X25519_I`; B → `X25519_R || sig_R`; A → `sig_I`, signatures over
+  `"aios link v2 R|I\0" || "aios link v2\0" || id_I || id_R || X25519_I || X25519_R || HMAC(token session, bind)`.
+  Session key = HKDF-SHA-256(X25519 secret, salt = SHA-256(transcript)), one key with the direction in the nonce
+  as before. Even with no keys anywhere this gives forward secrecy; the token is still needed (stage 5 retires it).
+- **Policy.** A peer the signed roster lists must offer the exchange and sign with its listed key (no downgrade by
+  stripping the offer). An unlisted peer is let in on the token as before, unless `AIOS_FLEET_V2_ONLY=1`, which
+  refuses any peer not completing the exchange with a roster key. App links (`grain_app.cpp`) stay on the token. Replaces the shared cluster key with one key pair per machine, in stages that keep the
 fleet running throughout.
 
 ## Today

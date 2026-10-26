@@ -78,11 +78,95 @@ bool ct_eq(ByteSpan a, ByteSpan b) {
 
 // ============================ HUB ===========================================
 
+namespace {
+struct MemberCred {
+  std::string key;
+  ByteBuffer ak, pcrs;
+  bool ed_listed = false;   // the line has ed25519=: this member attaches by signature, its key proof is not enough
+  ByteBuffer ed25519;       // 32 bytes when well formed
+  std::string roles;        // roles=a,b: carried in the signed roster (enforced from stage 4)
+};
+ByteBuffer from_hex(const std::string& h) {
+  ByteBuffer out;
+  for (size_t i = 0; i + 1 < h.size(); i += 2) {
+    int a = aios::digit_value(h[i], 16), b = aios::digit_value(h[i + 1], 16);
+    if (a < 0 || b < 0) return {};
+    out.push_back((uint8_t)(a * 16 + b));
+  }
+  return out;
+}
+// The members file: `<member-id> <key> [ak=<hex>] [pcrs=<hex>] [ed25519=<hex>] [roles=a,b]` per line, `#` comments. With
+// ed25519= the key column may be left out: `<member-id> ed25519=<hex>`.
+bool load_members(hal::Host& host, const std::string& path, std::map<std::string, MemberCred>& out) {
+  auto b = host.read_file(path);
+  if (!b.ok()) return false;
+  out.clear();
+  for (const std::string& raw : aios::split_lines(std::string(b->begin(), b->end()))) {
+    std::vector<std::string> w;
+    for (const auto& piece : aios::split_lines(raw, ' ')) if (!piece.empty() && piece != "\r") w.push_back(piece);
+    if (w.size() < 2 || w[0][0] == '#') continue;
+    MemberCred m;
+    size_t opts = 1;
+    if (w[1].rfind("ed25519=", 0) != 0) { m.key = w[1]; opts = 2; }
+    for (size_t i = opts; i < w.size(); ++i) {
+      if (w[i].rfind("ak=", 0) == 0) m.ak = from_hex(w[i].substr(3));
+      else if (w[i].rfind("pcrs=", 0) == 0) m.pcrs = from_hex(w[i].substr(5));
+      else if (w[i].rfind("ed25519=", 0) == 0) { m.ed_listed = true; m.ed25519 = from_hex(w[i].substr(8)); }
+      else if (w[i].rfind("roles=", 0) == 0) m.roles = w[i].substr(6);
+    }
+    out[w[0]] = std::move(m);
+  }
+  return true;
+}
+// A listed id matches the full 32-hex id exactly, or - only when the file uses
+// the short form `fleet members` prints - a prefix of it. Nested ids are legal
+// (`alpha` and `alphabeta`), so the LONGEST matching key wins; taking the first
+// map hit instead would pick a credential by sort order and refuse a listed
+// machine with `bad member key`, and a one-character id would match any id
+// starting with that character.
+const MemberCred* find_member(const std::map<std::string, MemberCred>& m, const std::string& id) {
+  const MemberCred* best = nullptr;
+  size_t best_len = 0;
+  for (const auto& [k, v] : m) {
+    if (k.empty() || k.size() > id.size()) continue;
+    if (id.compare(0, k.size(), k) != 0) continue;
+    if (!best || k.size() > best_len) { best = &v; best_len = k.size(); }
+  }
+  return best;
+}
+
+// The hub's challenge: 16 random bytes, then a flags byte. Bit 0: this hub takes a signed attach. A member's key
+// proof (and a TPM quote) covers the whole challenge, so an older member, which proves over whatever it was sent,
+// still attaches.
+constexpr uint8_t kChallengeSigned = 0x01;
+// The roster frame: u32 count and the ids (all an older member reads), then - from a hub with an identity key -
+// 'RSTK', a u64 version (the hub's clock, ms), per member its ed25519 key (32 zero bytes: none listed) and roles,
+// and last a 64-byte Ed25519 signature by the hub over "aios fleet roster v1\0" and everything before it.
+constexpr uint32_t kRosterKeysMagic = 0x4B545352u;   // 'RSTK'
+ByteBuffer roster_signed_message(ByteSpan body) {
+  static const char kLabel[] = "aios fleet roster v1";
+  ByteBuffer m(kLabel, kLabel + sizeof(kLabel));
+  m.insert(m.end(), body.begin(), body.end());
+  return m;
+}
+// What a member signs: a fixed label, the hub's challenge and the id it claims.
+ByteBuffer attach_transcript(ByteSpan challenge, const Id128& id) {
+  static const char kLabel[] = "aios fleet attach v1";
+  ByteBuffer t(kLabel, kLabel + sizeof(kLabel));   // with its NUL
+  t.insert(t.end(), challenge.begin(), challenge.end());
+  Writer w(t); w.id(id);
+  return t;
+}
+}  // namespace
+
 struct RelayHub::Impl {
   std::string key;
   std::string members_path;          // per-member keys; empty: the cluster key admits
   bool require_attest = false;
   uint64_t members_checked_ms = 0;
+  std::map<std::string, MemberCred> listed;   // the members file as last read (under mu): keys and roles for the roster
+  std::string listed_print;                   // what changed in it, to re-send the roster when a key or role does
+  std::function<ByteBuffer(ByteSpan)> signer; // the hub's identity key: signs the roster; empty: ids only
   std::unique_ptr<hal::Listener> listener;
   std::unique_ptr<hal::Host> host;
   hal::Thread acceptor;
@@ -129,7 +213,27 @@ struct RelayHub::Impl {
     ByteBuffer body; Writer w(body);
     w.u32((uint32_t)members.size());
     for (auto& m : members) w.id(m->id);
+    if (signer) {
+      w.u32(kRosterKeysMagic);
+      w.u64(host ? host->wall_ns() / 1000000ull : 0);
+      for (auto& m : members) {
+        const MemberCred* c = find_member(listed, m->id.str());
+        uint8_t k[32] = {};
+        if (c && c->ed25519.size() == 32) std::memcpy(k, c->ed25519.data(), 32);
+        w.raw(ByteSpan(k, 32));
+        w.str(c ? c->roles : std::string());
+      }
+      const ByteBuffer msg = roster_signed_message(ByteSpan(body.data(), body.size()));
+      const ByteBuffer sig = signer(ByteSpan(msg.data(), msg.size()));
+      if (sig.size() != 64) return;   // never send keys unsigned
+      body.insert(body.end(), sig.begin(), sig.end());
+    }
     for (auto& m : members) if (m->alive) q(m, Roster, body);
+  }
+  static std::string print_of(const std::map<std::string, MemberCred>& l) {
+    std::string out;
+    for (const auto& [id, c] : l) { out += id; out += ' '; out += hex(ByteSpan(c.ed25519.data(), c.ed25519.size())); out += ' '; out += c.roles; out += '\n'; }
+    return out;
   }
   // Queue one frame for a member; never blocks. False when the member is gone
   // (or was just dropped for not keeping up).
@@ -169,78 +273,11 @@ struct RelayHub::Impl {
   }
 };
 
-namespace {
-struct MemberCred {
-  std::string key;
-  ByteBuffer ak, pcrs;
-  bool ed_listed = false;   // the line has ed25519=: this member attaches by signature, its key proof is not enough
-  ByteBuffer ed25519;       // 32 bytes when well formed
-};
-ByteBuffer from_hex(const std::string& h) {
-  ByteBuffer out;
-  for (size_t i = 0; i + 1 < h.size(); i += 2) {
-    int a = aios::digit_value(h[i], 16), b = aios::digit_value(h[i + 1], 16);
-    if (a < 0 || b < 0) return {};
-    out.push_back((uint8_t)(a * 16 + b));
-  }
-  return out;
-}
-// The members file: `<member-id> <key> [ak=<hex>] [pcrs=<hex>] [ed25519=<hex>]` per line, `#` comments. With
-// ed25519= the key column may be left out: `<member-id> ed25519=<hex>`.
-bool load_members(hal::Host& host, const std::string& path, std::map<std::string, MemberCred>& out) {
-  auto b = host.read_file(path);
-  if (!b.ok()) return false;
-  out.clear();
-  for (const std::string& raw : aios::split_lines(std::string(b->begin(), b->end()))) {
-    std::vector<std::string> w;
-    for (const auto& piece : aios::split_lines(raw, ' ')) if (!piece.empty() && piece != "\r") w.push_back(piece);
-    if (w.size() < 2 || w[0][0] == '#') continue;
-    MemberCred m;
-    size_t opts = 1;
-    if (w[1].rfind("ed25519=", 0) != 0) { m.key = w[1]; opts = 2; }
-    for (size_t i = opts; i < w.size(); ++i) {
-      if (w[i].rfind("ak=", 0) == 0) m.ak = from_hex(w[i].substr(3));
-      else if (w[i].rfind("pcrs=", 0) == 0) m.pcrs = from_hex(w[i].substr(5));
-      else if (w[i].rfind("ed25519=", 0) == 0) { m.ed_listed = true; m.ed25519 = from_hex(w[i].substr(8)); }
-    }
-    out[w[0]] = std::move(m);
-  }
-  return true;
-}
-// A listed id matches the full 32-hex id exactly, or - only when the file uses
-// the short form `fleet members` prints - a prefix of it. Nested ids are legal
-// (`alpha` and `alphabeta`), so the LONGEST matching key wins; taking the first
-// map hit instead would pick a credential by sort order and refuse a listed
-// machine with `bad member key`, and a one-character id would match any id
-// starting with that character.
-const MemberCred* find_member(const std::map<std::string, MemberCred>& m, const std::string& id) {
-  const MemberCred* best = nullptr;
-  size_t best_len = 0;
-  for (const auto& [k, v] : m) {
-    if (k.empty() || k.size() > id.size()) continue;
-    if (id.compare(0, k.size(), k) != 0) continue;
-    if (!best || k.size() > best_len) { best = &v; best_len = k.size(); }
-  }
-  return best;
-}
-
-// The hub's challenge: 16 random bytes, then a flags byte. Bit 0: this hub takes a signed attach. A member's key
-// proof (and a TPM quote) covers the whole challenge, so an older member, which proves over whatever it was sent,
-// still attaches.
-constexpr uint8_t kChallengeSigned = 0x01;
-// What a member signs: a fixed label, the hub's challenge and the id it claims.
-ByteBuffer attach_transcript(ByteSpan challenge, const Id128& id) {
-  static const char kLabel[] = "aios fleet attach v1";
-  ByteBuffer t(kLabel, kLabel + sizeof(kLabel));   // with its NUL
-  t.insert(t.end(), challenge.begin(), challenge.end());
-  Writer w(t); w.id(id);
-  return t;
-}
-}  // namespace
 
 RelayHub::RelayHub(std::string cluster_key) : impl_(new Impl) { impl_->key = std::move(cluster_key); }
 void RelayHub::set_members_file(std::string path) { impl_->members_path = std::move(path); }
 void RelayHub::set_require_attest(bool on) { impl_->require_attest = on; }
+void RelayHub::set_signer(std::function<ByteBuffer(ByteSpan)> sign) { impl_->signer = std::move(sign); }
 RelayHub::~RelayHub() { stop(); }
 uint16_t RelayHub::port() const { return impl_->port; }
 size_t RelayHub::attached() const { hal::LockGuard g(impl_->mu); size_t n = 0; for (auto& m : impl_->members) if (m->alive) ++n; return n; }
@@ -264,6 +301,12 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
           hal::LockGuard g(im->mu);
           for (auto& m : im->members)
             if (m->alive && !find_member(listed, m->id.str())) { m->alive = false; m->close_conn(); }
+          // A key or role changed: members get the new roster now, not at the next attach.
+          std::string print = Impl::print_of(listed);
+          const bool changed = print != im->listed_print;
+          im->listed = std::move(listed);
+          im->listed_print = std::move(print);
+          if (changed) im->push_roster_locked();
         }
       }
       auto c = im->listener->accept(200);
@@ -291,6 +334,7 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
         if (!load_members(*im->host, im->members_path, listed)) { refuse("the hub cannot read its members file"); continue; }
         cred = find_member(listed, id.str());
         if (!cred) { refuse("not a listed member of this fleet"); continue; }
+        { hal::LockGuard g(im->mu); im->listed = listed; im->listed_print = Impl::print_of(listed); }
         admit_key = cred->key;
       }
       if (cred && cred->ed_listed) {
@@ -483,6 +527,13 @@ struct RelayClient::Impl {
 
   mutable hal::Mutex mu;
   std::vector<Id128> roster;
+  // The hub's signed roster keys (set_hub_key): only a roster this key signed, and no older than the last, is used.
+  bool have_hub_key = false;
+  crypto::Point32 hub_key{};
+  uint64_t roster_version = 0;
+  bool roster_signed = false;
+  std::map<std::string, std::pair<crypto::Point32, std::string>> roster_keys;   // full id -> key (zero: none), roles
+  std::string roster_err;
   std::unordered_map<uint64_t, std::shared_ptr<Circuit>> circuits;
   std::deque<std::pair<uint64_t, std::shared_ptr<Circuit>>> incoming;
   struct Pending { std::atomic<bool> done{false}; bool ok = false; uint64_t gc = 0; std::string err; };
@@ -496,7 +547,8 @@ struct RelayClient::Impl {
       // liveness acknowledged; nothing else to do
     } else if (t == Roster) {
       uint32_t n = r.u32(); std::vector<Id128> v; for (uint32_t i = 0; i < n && r.ok(); ++i) v.push_back(r.id());
-      if (r.ok()) { hal::LockGuard g(mu); roster = std::move(v); }
+      if (r.ok()) { hal::LockGuard g(mu); roster = v; }
+      if (r.ok() && have_hub_key) take_roster_keys(p, r, v);
     } else if (t == OpenOk) {
       uint64_t local = r.u64(), gc = r.u64();
       auto cs = std::make_shared<Circuit>();
@@ -579,6 +631,36 @@ struct RelayClient::Impl {
   }
 
   bool send_frame(uint8_t t, ByteSpan p) { return c && wr(*c, send, t, p); }
+
+  // The keys part of a roster, when the pinned hub key signed it. An unsigned or badly signed roster leaves the keys
+  // this member already trusts as they are (dropping them would loosen every check that uses them).
+  void take_roster_keys(const ByteBuffer& p, Reader& r, const std::vector<Id128>& ids) {
+    auto fail = [&](const std::string& why) {
+      hal::LockGuard g(mu);
+      if (roster_err != why && host) host->log_error("fleet: roster keys not taken: " + why);
+      roster_err = why;
+    };
+    if (p.size() < 64 || r.remaining() < 4 + 8 + 64 || r.u32() != kRosterKeysMagic) return fail("the hub does not sign its roster");
+    const uint64_t version = r.u64();
+    std::map<std::string, std::pair<crypto::Point32, std::string>> keys;
+    for (const auto& id : ids) {
+      ByteSpan k = r.raw(32);
+      std::string roles = r.str();
+      if (!r.ok() || k.size() != 32) return fail("malformed roster keys");
+      crypto::Point32 pk{}; std::memcpy(pk.data(), k.data(), 32);
+      keys[id.str()] = {pk, roles};
+    }
+    if (r.remaining() != 64) return fail("malformed roster keys");
+    const ByteBuffer msg = roster_signed_message(ByteSpan(p.data(), p.size() - 64));
+    crypto::Sig64 sig{}; std::memcpy(sig.data(), p.data() + p.size() - 64, 64);
+    if (!crypto::ed25519_verify(ByteSpan(msg.data(), msg.size()), sig, hub_key)) return fail("the roster is not signed by the pinned hub key");
+    hal::LockGuard g(mu);
+    if (version < roster_version) { roster_err = "an older roster was replayed"; return; }
+    roster_version = version;
+    roster_keys = std::move(keys);
+    roster_signed = true;
+    roster_err.clear();
+  }
 
   // Connect to the hub and complete the challenge/response attach on a fresh
   // socket, then swap it in as the live connection. Used for the first attach
@@ -690,6 +772,22 @@ struct RelayClientHolder { std::shared_ptr<RelayClient::Impl> impl; };
 void RelayClient::set_member_key(std::string key) { IM->member_key = std::move(key); }
 void RelayClient::set_attest(bool on) { IM->attest = on; }
 void RelayClient::set_signer(std::function<ByteBuffer(ByteSpan)> sign) { IM->signer = std::move(sign); }
+void RelayClient::set_hub_key(const std::array<uint8_t, 32>& key) { IM->hub_key = key; IM->have_hub_key = true; }
+bool RelayClient::peer_key(const Id128& peer, std::array<uint8_t, 32>& key) const {
+  hal::LockGuard g(IM->mu);
+  auto it = IM->roster_keys.find(peer.str());
+  if (it == IM->roster_keys.end()) return false;
+  static const crypto::Point32 zero{};
+  if (it->second.first == zero) return false;
+  key = it->second.first;
+  return true;
+}
+std::string RelayClient::peer_roles(const Id128& peer) const {
+  hal::LockGuard g(IM->mu);
+  auto it = IM->roster_keys.find(peer.str());
+  return it == IM->roster_keys.end() ? std::string() : it->second.second;
+}
+bool RelayClient::roster_signed() const { hal::LockGuard g(IM->mu); return IM->roster_signed; }
 
 RelayClient::RelayClient(std::string cluster_key, Id128 self) {
   auto im = std::make_shared<Impl>();
@@ -856,6 +954,13 @@ void RelayClient::Impl::ensure_command_server(std::shared_ptr<Impl> self_sp) {
         auto skey = secure_handshake_responder(*plain, self_sp->key, *self_sp->host, self_sp->self, peer_kernel, peer_payload, ByteSpan(mine.data(), mine.size()));
         if (!skey.ok()) return;
         auto link = make_secure_link(shared_conn, *skey, false);
+        {
+          bool upgraded = false; crypto::Key k2{};
+          const auto lid = link_identity();
+          auto x = link_identity_exchange(*link, *skey, false, self_sp->self, peer_kernel, ByteSpan(peer_payload.data(), peer_payload.size()), *self_sp->host, lid.get(), upgraded, k2);
+          if (!x.ok()) { self_sp->host->log_error("fleet: circuit from " + peer_kernel.str() + " refused: " + x.error().message); return; }
+          if (upgraded) link = make_secure_link(shared_conn, k2, false);
+        }
         link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
         uint8_t t;
         ByteBuffer body;

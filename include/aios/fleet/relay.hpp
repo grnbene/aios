@@ -13,6 +13,7 @@
 // This is what replaces "ssh -L and a hardcoded IP": configure one hub and one
 // cluster key, and the fleet finds and reaches itself.
 #include <memory>
+#include <array>
 #include <string>
 #include <vector>
 #include <functional>
@@ -38,6 +39,9 @@ class RelayHub {
   // its listed `pcrs` digest when one is given.
   void set_members_file(std::string path);
   void set_require_attest(bool on);
+  // Sign the roster with the hub's identity key: members that pinned it (`fleet join ... hub-key=`) take the member
+  // keys and roles in it. Without a signer the roster carries ids only.
+  void set_signer(std::function<ByteBuffer(ByteSpan)> sign);
   ~RelayHub();
   Result<uint16_t> start(uint16_t port, bool loopback_only = false);   // loopback_only: 127.0.0.1 alone
   void stop();
@@ -64,6 +68,12 @@ class RelayClient {
   // member's public key (`ed25519=` in its members file). Returns the 64-byte signature, or empty when it cannot.
   // Only used when the hub's challenge says it takes signatures; an older hub gets the key proof alone.
   void set_signer(std::function<ByteBuffer(ByteSpan)> sign);
+  // Pin the hub's identity key: rosters it signs give this member each peer's key (peer_key) and roles. Without it,
+  // the roster's keys are not used.
+  void set_hub_key(const std::array<uint8_t, 32>& key);
+  bool peer_key(const Id128& peer, std::array<uint8_t, 32>& key) const;   // false: not in the signed roster, or no key
+  std::string peer_roles(const Id128& peer) const;
+  bool roster_signed() const;   // a roster signed by the pinned key has arrived
   ~RelayClient();
   // Attach to a hub. After this returns Ok, the roster is populated and
   // incoming circuits are accepted in the background.

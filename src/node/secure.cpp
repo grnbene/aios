@@ -4,6 +4,10 @@
 #include "protocol.hpp"
 #include "aios/hal/host.hpp"
 #include <cstring>
+#include "aios/hal/sync.hpp"
+#include "aios/crypto/curve25519.hpp"
+#include "aios/crypto/hmac_sha256.hpp"
+#include "aios/crypto/sha256.hpp"
 
 namespace aios::crypto {
 
@@ -199,18 +203,20 @@ std::unique_ptr<Link> make_plain_link(std::shared_ptr<hal::Connection> c) { retu
 ByteBuffer link_feature_payload() {
   ByteBuffer b; Writer w(b);
   w.u32(nodeproto::kFeatureMagic);
-  w.u32(nodeproto::kFeatDeflate);
+  w.u32(nodeproto::kFeatDeflate | nodeproto::kFeatIdentity);
   return b;
 }
 
-bool link_peer_deflates(ByteSpan payload) {
+static uint32_t peer_features(ByteSpan payload) {
   // The feature word is the payload's last 8 bytes when present ('FEAT' + bits): after a device list, or alone.
-  if (payload.size() < 8) return false;
+  if (payload.size() < 8) return 0;
   const uint8_t* e = payload.data() + payload.size() - 8;
   uint32_t magic = 0, bits = 0;
   for (int i = 0; i < 4; ++i) { magic |= (uint32_t)e[i] << (8 * i); bits |= (uint32_t)e[4 + i] << (8 * i); }
-  return magic == nodeproto::kFeatureMagic && (bits & nodeproto::kFeatDeflate);
+  return magic == nodeproto::kFeatureMagic ? bits : 0;
 }
+bool link_peer_deflates(ByteSpan payload) { return peer_features(payload) & nodeproto::kFeatDeflate; }
+bool link_peer_identity(ByteSpan payload) { return peer_features(payload) & nodeproto::kFeatIdentity; }
 
 std::unique_ptr<Link> make_secure_link(std::shared_ptr<hal::Connection> c, const crypto::Key& k, bool initiator) { return std::make_unique<SecureLink>(std::move(c), k, initiator); }
 
@@ -262,6 +268,111 @@ Result<crypto::Key> secure_handshake_responder_any(Link& plain, const std::vecto
   ByteBuffer reply(rr.begin(), rr.end()); auto ct = crypto::aead_encrypt(K, nr, span_of(std::string(AAD_RESP)), pt); reply.insert(reply.end(), ct.begin(), ct.end());
   if (!plain.send(HS_RESP, reply)) return Result<crypto::Key>(Status::IoError, "peer closed during handshake");
   return session_key(K, ByteSpan(msg.data(), 16), ByteSpan(rr.data(), 16));
+}
+
+
+// ---- the identity exchange (stage 3 of docs/design/fleet-identity-keys.md) ----
+namespace {
+hal::Mutex g_identity_mu;
+std::shared_ptr<const LinkIdentity> g_identity;
+constexpr uint8_t ID_A = 0x72, ID_B = 0x73, ID_C = 0x74;   // inner frame types on the token-keyed secure link
+
+ByteBuffer cat(std::initializer_list<ByteSpan> parts) {
+  ByteBuffer out;
+  for (ByteSpan p : parts) out.insert(out.end(), p.begin(), p.end());
+  return out;
+}
+ByteSpan label(const char* s) { return ByteSpan(reinterpret_cast<const uint8_t*>(s), std::strlen(s) + 1); }   // with its NUL
+ByteBuffer id_bytes(const Id128& id) { ByteBuffer b; Writer w(b); w.id(id); return b; }
+
+// A peer's signature, checked as the roster says: a listed peer must sign with its listed key; an unlisted one is let
+// through (the token already admitted it) unless this machine is v2-only.
+Result<void> check_peer(const LinkIdentity* id, const Id128& peer, ByteSpan sig, ByteSpan signed_msg) {
+  std::array<uint8_t, 32> pk{};
+  const bool listed = id && id->peer_key && id->peer_key(peer, pk);
+  if (listed) {
+    crypto::Sig64 s{};
+    if (sig.size() != 64) return Result<void>(Status::Denied, "peer " + peer.str() + " is in the roster but did not sign the link");
+    std::memcpy(s.data(), sig.data(), 64);
+    if (!crypto::ed25519_verify(signed_msg, s, pk)) return Result<void>(Status::Denied, "peer " + peer.str() + " did not sign with its roster key");
+    return Ok();
+  }
+  if (id && id->v2_only) return Result<void>(Status::Denied, "peer " + peer.str() + " is not in the signed roster (this machine is v2-only)");
+  return Ok();
+}
+}  // namespace
+
+void set_link_identity(std::shared_ptr<const LinkIdentity> id) { hal::LockGuard g(g_identity_mu); g_identity = std::move(id); }
+std::shared_ptr<const LinkIdentity> link_identity() { hal::LockGuard g(g_identity_mu); return g_identity; }
+
+Result<void> link_identity_exchange(Link& link, const crypto::Key& token_session, bool initiator, const Id128& me, const Id128& peer,
+                                    ByteSpan peer_payload, hal::Host& host, const LinkIdentity* id, bool& upgraded, crypto::Key& key) {
+  upgraded = false;
+  key = token_session;
+  if (!link_peer_identity(peer_payload)) {
+    // An older peer. Refused when the roster lists it (its key says it runs the exchange: someone stripped the
+    // offer) or when this machine takes only v2 peers.
+    std::array<uint8_t, 32> pk{};
+    if (id && id->peer_key && id->peer_key(peer, pk)) return Result<void>(Status::Denied, "peer " + peer.str() + " is in the roster but did not offer the identity exchange");
+    if (id && id->v2_only) return Result<void>(Status::Denied, "peer " + peer.str() + " does not run the identity exchange (this machine is v2-only)");
+    return Ok();
+  }
+  const Id128 id_i = initiator ? me : peer, id_r = initiator ? peer : me;
+  crypto::Scalar32 eph{};
+  host.random(MutableByteSpan(eph.data(), eph.size()));
+  const crypto::Point32 mine = crypto::x25519_base(eph);
+  crypto::Point32 theirs{};
+  // Bound to this token session: only its two ends know token_session.
+  const auto bind = crypto::hmac_sha256(ByteSpan(token_session.data(), token_session.size()), label("aios link v2 bind"));
+  auto transcript = [&](const crypto::Point32& ei, const crypto::Point32& er) {
+    const ByteBuffer a = id_bytes(id_i), b = id_bytes(id_r);
+    return cat({label("aios link v2"), ByteSpan(a.data(), a.size()), ByteSpan(b.data(), b.size()), ByteSpan(ei.data(), 32), ByteSpan(er.data(), 32), ByteSpan(bind.data(), 32)});
+  };
+  auto my_sig = [&](const ByteBuffer& t, const char* role) {
+    if (!id || !id->sign) return ByteBuffer();
+    const ByteBuffer m = cat({label(role), ByteSpan(t.data(), t.size())});
+    ByteBuffer s = id->sign(ByteSpan(m.data(), m.size()));
+    return s.size() == 64 ? s : ByteBuffer();
+  };
+  ByteBuffer T;
+  uint8_t t = 0;
+  ByteBuffer p;
+  if (initiator) {
+    if (!link.send(ID_A, ByteSpan(mine.data(), 32))) return Result<void>(Status::IoError, "peer closed during the identity exchange");
+    if (!link.recv(t, p, 15000)) return Result<void>(Status::IoError, "no identity exchange reply");
+    if (t == nodeproto::Error) { Reader r(p); Status st = (Status)r.u8(); return Result<void>(st, "node: " + r.str()); }
+    if (t != ID_B || p.size() < 32) return Result<void>(Status::Denied, "malformed identity exchange reply");
+    std::memcpy(theirs.data(), p.data(), 32);
+    T = transcript(mine, theirs);
+    const ByteBuffer peer_signed = cat({label("aios link v2 R"), ByteSpan(T.data(), T.size())});
+    AIOS_TRY(check_peer(id, peer, ByteSpan(p.data() + 32, p.size() - 32), ByteSpan(peer_signed.data(), peer_signed.size())));
+    const ByteBuffer s = my_sig(T, "aios link v2 I");
+    if (!link.send(ID_C, ByteSpan(s.data(), s.size()))) return Result<void>(Status::IoError, "peer closed during the identity exchange");
+  } else {
+    if (!link.recv(t, p, 15000) || t != ID_A || p.size() != 32) return Result<void>(Status::Denied, "the peer offered the identity exchange but did not start it");
+    std::memcpy(theirs.data(), p.data(), 32);
+    T = transcript(theirs, mine);
+    const ByteBuffer s = my_sig(T, "aios link v2 R");
+    ByteBuffer b(mine.begin(), mine.end());
+    b.insert(b.end(), s.begin(), s.end());
+    if (!link.send(ID_B, ByteSpan(b.data(), b.size()))) return Result<void>(Status::IoError, "peer closed during the identity exchange");
+    if (!link.recv(t, p, 15000) || t != ID_C) return Result<void>(Status::Denied, "the peer did not finish the identity exchange");
+    const ByteBuffer peer_signed = cat({label("aios link v2 I"), ByteSpan(T.data(), T.size())});
+    AIOS_TRY(check_peer(id, peer, ByteSpan(p.data(), p.size()), ByteSpan(peer_signed.data(), peer_signed.size())));
+  }
+  crypto::Point32 shared{};
+  if (!crypto::x25519(shared, eph, theirs)) return Result<void>(Status::Denied, "the peer's X25519 key is not usable");
+  eph.fill(0);
+  // HKDF-SHA-256 (RFC 5869): extract with the transcript hash as salt, one block of expand.
+  const auto salt = crypto::sha256(ByteSpan(T.data(), T.size()));
+  const auto prk = crypto::hmac_sha256(ByteSpan(salt.data(), 32), ByteSpan(shared.data(), 32));
+  shared.fill(0);
+  ByteBuffer info = cat({label("aios link v2 key")});
+  info.push_back(0x01);
+  const auto okm = crypto::hmac_sha256(ByteSpan(prk.data(), 32), ByteSpan(info.data(), info.size()));
+  std::memcpy(key.data(), okm.data(), 32);
+  upgraded = true;
+  return Ok();
 }
 
 }  // namespace aios

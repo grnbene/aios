@@ -4,6 +4,8 @@
 #include "shell.hpp"
 #include "aios/userland/crash_log.hpp"
 #include "aios/hal/sync.hpp"
+#include "aios/crypto/sha256.hpp"
+#include "aios/crypto/curve25519.hpp"
 // Hosted only: writing an operator status file to the host's filesystem, and
 // finding a host binary beside the running executable. A bare-metal kernel has
 // neither a host filesystem nor a /proc to read its own path out of — and
@@ -5751,7 +5753,15 @@ void cmd_fleet(Ctx& c, const Args& a) {
     if (!pub) fail(Status::NotFound, "this machine has no node identity: " + c.k.node_key_problem());
     c.o << "kernel=" << c.k.self().str() << " ed25519=" << hex(ByteSpan(pub->data(), pub->size())) << "\n";
   } else if (sub == "join") {
-    if (a.size() < 5) fail(Status::Invalid, "fleet join <hub-host> <hub-port> <cluster-key> [retry] [member-key=<key|@FILE|env:NAME>] [attest=1]   join a fleet through a hub; retry: keep trying while the hub is down; member-key: this member's own attach key, for a hub with a members file; attest=1: present a TPM quote");
+    if (a.size() < 5) fail(Status::Invalid, "fleet join <hub-host> <hub-port> <cluster-key> [retry] [member-key=<key|@FILE|env:NAME>] [attest=1] [hub-key=<hex|@FILE>]   join a fleet through a hub; retry: keep trying while the hub is down; member-key: this member's own attach key, for a hub with a members file; attest=1: present a TPM quote; hub-key: the hub's `fleet identity` key - peers' keys are then taken from the rosters it signs");
+    if (has_kv(a, "hub-key")) {
+      std::string h = fleet_key_arg(c.r.expand(kv(a, "hub-key")));
+      while (!h.empty() && (h.back() == '\n' || h.back() == '\r' || h.back() == ' ')) h.pop_back();
+      const ByteBuffer kb = crypto::hex_to_bytes(h);
+      if (h.size() != 64 || kb.size() != 32) fail(Status::Invalid, "hub-key must be 64 hex digits (the hub's `fleet identity` ed25519=)");
+      crypto::Point32 hk{}; std::memcpy(hk.data(), kb.data(), 32);
+      c.k.set_fleet_hub_key(hk);
+    }
     bool retry = false;
     for (size_t i = 5; i < a.size(); ++i) if (a[i] == "retry") retry = true;
     const std::string member_key = has_kv(a, "member-key") ? fleet_key_arg(c.r.expand(kv(a, "member-key"))) : std::string();

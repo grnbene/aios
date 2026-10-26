@@ -33,6 +33,9 @@ constexpr uint32_t kFeatExecBatch = 1u << 0;
 // Frames of 32 KB or more may go deflated (secure link frame 0x7D). Sent only to a peer that advertised it in its
 // handshake payload; every peer that has this bit reads both forms.
 constexpr uint32_t kFeatDeflate = 1u << 1;
+// The peer runs the identity exchange after the handshake (fresh X25519 keys, Ed25519 signatures by each machine's
+// node.identity, the session rekeyed from the X25519 secret): docs/design/fleet-identity-keys.md, stage 3.
+constexpr uint32_t kFeatIdentity = 1u << 2;
 inline bool write_frame(hal::Connection& c, uint8_t t, ByteSpan payload) {
   // One send: a node frame is one transport write, so a peer polling with a
   // zero timeout never sees a header without its payload.
