@@ -47,17 +47,9 @@ fn today() { return read_raw("SELECT CURDATE() AS d")[0].d }
 
 // Discovers the distinct set of price levels assigned to all registered API clients
 fn client_levels() {
-  let seen = {}
-  let out = []
-  for c in read("SELECT debtorno, branchcode FROM sticker_feed_exclusions") {
-    let lv = resolve_price_level(c.debtorno, c.branchcode)
-    if seen[lv] == nil {
-      seen[lv] = true
-      push(out, lv)
-    }
-  }
-  if seen["W"] == nil { push(out, "W") }
-  return sort(out)
+  let out = ["W"]   // W always: the feed's own level
+  for c in read("SELECT debtorno, branchcode FROM sticker_feed_exclusions") { push(out, resolve_price_level(c.debtorno, c.branchcode)) }
+  return sort(unique(out))
 }
 
 // enroll(): Identifies candidate stockids to track as Things
@@ -320,64 +312,34 @@ fn touched(table, op, before, after, sh) {
 
 // Discovers which item SKU keys are affected by database insert/update/delete events
 fn touched_items(t, before, after) {
-  if has(LEVELS_MOVE, t) {
-    if levels_unmoved(t, before, after) { return [] }
-    return {"shared": true}
-  }
+  if has(LEVELS_MOVE, t) { return levels_unmoved(t, before, after) ? [] : {"shared": true} }
   if has(EVERY_ITEM, t) { return "all" }
+  let rows_of = compact([before, after])
   let col = ITEM_COL[t]
-  let out = []
-  let seen = {}
-  if col != nil {
-    for row in [before, after] {
-      if row == nil { continue }
-      if t == "stockmoves" and row["type"] != 25 { continue }
-      let c = canon(row[col])
-      if c != nil and seen[c] == nil {
-        seen[c] = true
-        push(out, c)
-      }
-    }
-    return out
+  if col != nil {   // a per-item table: the item its row names (stock moves only for receipts, type 25)
+    let ids = []
+    for row in rows_of { if t != "stockmoves" or row["type"] == 25 { push(ids, canon(row[col])) } }
+    return unique(compact(ids))
   }
-  // Manufacturer updates affect branded items and remote stock; shipper updates affect open order lines
-  if t == "manufacturer" or t == "shippers" {
-    for row in [before, after] {
-      if row == nil { continue }
-      let found = []
-      if t == "manufacturer" {
-        if row["manufacturer_id"] != nil { found = read_raw("SELECT stockid AS k FROM product_to_manufacturer WHERE manufacturer_id = ?", row["manufacturer_id"]) }
-        if row["name"] != nil { for r in read_raw("SELECT DISTINCT stockid AS k FROM remotestock WHERE brand = ?", row["name"]) { push(found, r) } }
-      } else if row["shipper_id"] != nil {
-        found = read_raw("SELECT DISTINCT d.stkcode AS k FROM salesorderdetails d JOIN salesorders o ON o.orderno = d.orderno WHERE o.shipvia = ? AND d.completed = 0", row["shipper_id"])
+  // Tables that name items through another: a brand's items and remote stock, a shipper's open order lines,
+  // an order's or a return's lines
+  let found = []
+  for row in rows_of {
+    match t {
+      "manufacturer" => {
+        if row["manufacturer_id"] != nil { push(found, ...read_raw("SELECT stockid AS k FROM product_to_manufacturer WHERE manufacturer_id = ?", row["manufacturer_id"])) }
+        if row["name"] != nil { push(found, ...read_raw("SELECT DISTINCT stockid AS k FROM remotestock WHERE brand = ?", row["name"])) }
       }
-      for l in found {
-        let c = canon(l.k)
-        if c != nil and seen[c] == nil {
-          seen[c] = true
-          push(out, c)
-        }
+      "shippers" => {
+        if row["shipper_id"] != nil { push(found, ...read_raw("SELECT DISTINCT d.stkcode AS k FROM salesorderdetails d JOIN salesorders o ON o.orderno = d.orderno WHERE o.shipvia = ? AND d.completed = 0", row["shipper_id"])) }
       }
-    }
-    return out
-  }
-  // Sales orders and RGA returns affect their line item SKUs
-  let lines = nil
-  for row in [before, after] {
-    if row == nil { continue }
-    let ono = row["orderno"]
-    if ono == nil { continue }
-    if t == "salesorders" { lines = read("SELECT DISTINCT stkcode AS k FROM salesorderdetails WHERE orderno = ?", ono) }
-    else if t == "rgaorders" { lines = read("SELECT DISTINCT itemcode AS k FROM rgaorderdetails WHERE orderno = ?", ono) }
-    if lines != nil {
-      for l in lines {
-        let c = canon(l.k)
-        if c != nil and seen[c] == nil {
-          seen[c] = true
-          push(out, c)
-        }
+      "salesorders" => {
+        if row["orderno"] != nil { push(found, ...read("SELECT DISTINCT stkcode AS k FROM salesorderdetails WHERE orderno = ?", row["orderno"])) }
+      }
+      "rgaorders" => {
+        if row["orderno"] != nil { push(found, ...read("SELECT DISTINCT itemcode AS k FROM rgaorderdetails WHERE orderno = ?", row["orderno"])) }
       }
     }
   }
-  return out
+  return unique(compact(map(found, fn (l) { return canon(l.k) })))
 }

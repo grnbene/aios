@@ -17,16 +17,17 @@ namespace {
 
 int infix_power(Tok t) {
   switch (t) {
-    case Tok::Or: return 1;
-    case Tok::And: return 2;
-    case Tok::Pipe: return 3;
-    case Tok::Caret: return 4;
-    case Tok::Amp: return 5;
-    case Tok::EqEq: case Tok::BangEq: return 6;
-    case Tok::Lt: case Tok::LtEq: case Tok::Gt: case Tok::GtEq: return 7;
-    case Tok::LtLt: case Tok::GtGt: return 8;
-    case Tok::Plus: case Tok::Minus: return 9;
-    case Tok::Star: case Tok::Slash: case Tok::Percent: return 10;
+    case Tok::QuestionQuestion: return 1;   // a ?? b: looser than or, so `x ?? y or z` is x ?? (y or z)
+    case Tok::Or: return 2;
+    case Tok::And: return 3;
+    case Tok::Pipe: return 4;
+    case Tok::Caret: return 5;
+    case Tok::Amp: return 6;
+    case Tok::EqEq: case Tok::BangEq: return 7;
+    case Tok::Lt: case Tok::LtEq: case Tok::Gt: case Tok::GtEq: return 8;
+    case Tok::LtLt: case Tok::GtGt: return 9;
+    case Tok::Plus: case Tok::Minus: return 10;
+    case Tok::Star: case Tok::Slash: case Tok::Percent: return 11;
     default: return 0;
   }
 }
@@ -425,7 +426,7 @@ ExprP Parser::primary() {
           error_at(peek(), "expected identifier after '::'");
         }
       }
-      if (check(Tok::LBrace)) {
+      if (check(Tok::LBrace) && !no_brace_call_) {
         size_t look = 1;
         while (peek(look).kind == Tok::Newline) ++look;
         if (peek(look).kind == Tok::RBrace ||
@@ -467,12 +468,72 @@ ExprP Parser::primary() {
     }
     case Tok::LBracket: return list_literal();
     case Tok::LBrace: return map_literal();
+    case Tok::Match: return match_expr(false);
     case Tok::Fn: return lambda();
     default: break;
   }
   error_at(t, std::string("expected a value, found ") + tok_name(t.kind));
   advance();
   auto e = std::make_unique<Expr>(); e->kind = ExprKind::NilLit; e->line = t.line; e->column = t.column;
+  return e;
+}
+
+// match <subject> { <pattern>[, <pattern>...] => <arm>  ...  _ => <arm> }
+// Patterns are expressions, compared with == in order; the first arm whose pattern holds runs. Arms are separated by
+// newlines or commas. As an expression an arm is an expression and the match is its value (nil when no arm holds
+// and there is no `_`); as a statement an arm may also be a `{ block }`.
+ExprP Parser::match_expr(bool as_statement) {
+  const Token t = peek();
+  advance();   // match
+  auto e = std::make_unique<Expr>();
+  e->kind = ExprKind::Match;
+  e->line = t.line;
+  e->column = t.column;
+  e->match_statement = as_statement;
+  const bool saved = no_brace_call_;
+  no_brace_call_ = true;   // `match x {` - that brace opens the arms, not a call of x with a map
+  e->a = expression();
+  no_brace_call_ = saved;
+  skip_newlines();
+  expect(Tok::LBrace, "'{' after the match subject");
+  skip_newlines();
+  bool saw_default = false;
+  while (!check(Tok::RBrace) && !check(Tok::End)) {
+    Expr::MatchArm arm;
+    arm.line = peek().line;
+    arm.column = peek().column;
+    if (check(Tok::Ident) && peek().text == "_" && peek(1).kind == Tok::FatArrow) {
+      advance();
+      if (saw_default) error_at(peek(), "a match has one `_` arm");
+      saw_default = true;
+    } else {
+      if (saw_default) error_at(peek(), "an arm after `_` would never run");
+      for (;;) {
+        arm.patterns.push_back(expression());
+        skip_newlines();
+        if (!match(Tok::Comma)) break;
+        skip_newlines();
+      }
+    }
+    if (!expect(Tok::FatArrow, "'=>' after the arm's pattern")) { synchronise(); break; }
+    skip_newlines();
+    if (check(Tok::LBrace) && as_statement &&
+        !((peek(1).kind == Tok::Ident || peek(1).kind == Tok::Str) && peek(2).kind == Tok::Colon) && peek(1).kind != Tok::RBrace) {
+      advance();
+      arm.is_block = true;
+      arm.block = block_body();
+    } else if (check(Tok::LBrace) && !as_statement && peek(1).kind != Tok::RBrace &&
+               !((peek(1).kind == Tok::Ident || peek(1).kind == Tok::Str) && peek(2).kind == Tok::Colon)) {
+      error_at(peek(), "a block arm needs the match as a statement (as a value, an arm is one expression)");
+      arm.value = expression();
+    } else {
+      arm.value = expression();
+    }
+    e->arms.push_back(std::move(arm));
+    skip_newlines();
+    if (match(Tok::Comma)) skip_newlines();
+  }
+  expect(Tok::RBrace, "'}' to close the match");
   return e;
 }
 
@@ -721,7 +782,7 @@ ExprP Parser::binary(int min_power) {
     // strictly tighter, so a - b - c is (a - b) - c and not a - (b - c).
     ExprP right = binary(power + 1);
     auto e = std::make_unique<Expr>();
-    e->kind = (op == Tok::And || op == Tok::Or) ? ExprKind::Logical : ExprKind::Binary;
+    e->kind = (op == Tok::And || op == Tok::Or || op == Tok::QuestionQuestion) ? ExprKind::Logical : ExprKind::Binary;
     e->op = op;
     e->line = line;
     e->column = col;
@@ -958,6 +1019,16 @@ StmtP Parser::statement() {
     s->column = t.column;
     s->name = fn->fn_name;
     s->expr = std::move(fn);
+    return s;
+  }
+
+  // `match` at the start of a statement: its arms may be blocks, and it leaves no value.
+  if (t.kind == Tok::Match) {
+    auto s = std::make_unique<Stmt>();
+    s->kind = StmtKind::Expression;
+    s->line = t.line;
+    s->column = t.column;
+    s->expr = match_expr(true);
     return s;
   }
 

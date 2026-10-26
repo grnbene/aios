@@ -297,6 +297,52 @@ class Compiler {
 
   // --- expressions --------------------------------------------------------
 
+  // match: the subject is kept on the stack while each pattern is compared with it (==); the first arm that holds
+  // drops it and runs. As a value (statement false) every path leaves one value, nil when nothing matched; as a
+  // statement, none - and only then may an arm be a block, so a block's locals start where the enclosing ones end.
+  void match_code(const Expr& e, bool as_statement) {
+    expression(*e.a);                                    // [s]
+    std::vector<size_t> to_end;
+    bool defaulted = false;
+    for (const auto& arm : e.arms) {
+      size_t next = 0;
+      bool has_next = false;
+      if (!arm.patterns.empty()) {
+        std::vector<size_t> hits;
+        for (const auto& pat : arm.patterns) {
+          emit(Op::Dup, arm.line, arm.column);           // [s s]
+          expression(*pat);                              // [s s p]
+          emit(Op::Equal, arm.line, arm.column);         // [s eq]
+          hits.push_back(emit_jump(Op::JumpIfTrue, arm.line, arm.column));
+          emit(Op::Pop, arm.line, arm.column);           // [s]
+        }
+        next = emit_jump(Op::Jump, arm.line, arm.column);
+        has_next = true;
+        for (size_t h : hits) patch_jump(h);             // [s eq]
+        emit(Op::Pop, arm.line, arm.column);             // [s]
+      }
+      emit(Op::Pop, arm.line, arm.column);               // []
+      if (arm.is_block) {
+        begin_block();
+        for (const auto& st : arm.block) statement(*st);
+        end_block(arm.line);
+      } else if (arm.value) {
+        expression(*arm.value);
+        if (as_statement) emit(Op::Pop, arm.line, arm.column);
+      } else if (!as_statement) {
+        emit(Op::Nil, arm.line, arm.column);
+      }
+      to_end.push_back(emit_jump(Op::Jump, arm.line, arm.column));
+      if (has_next) patch_jump(next);                    // [s]
+      else { defaulted = true; break; }                  // `_`: nothing after it runs
+    }
+    if (!defaulted) {
+      emit(Op::Pop, e.line, e.column);                   // no arm held: drop the subject
+      if (!as_statement) emit(Op::Nil, e.line, e.column);
+    }
+    for (size_t j : to_end) patch_jump(j);
+  }
+
   // A call's arguments or a list's elements with `...x` among them, as one new list on the stack: each run of plain
   // items packed into a list, each spread value as it is, then ListConcat joins them (and refuses a spread non-list).
   void spread_list(const Expr& e) {
@@ -384,6 +430,21 @@ class Compiler {
       // `and` and `or` must not evaluate the right side when the left already
       // decides the answer -- `x != nil and x.name` is the reason.
       case ExprKind::Logical: {
+        if (e.op == Tok::QuestionQuestion) {   // a ?? b: a unless it is nil, and then b (b only evaluated then)
+          expression(*e.a);
+          emit(Op::Dup, e.line, e.column);
+          emit(Op::Nil, e.line, e.column);
+          emit(Op::Equal, e.line, e.column);
+          const size_t keep = emit_jump(Op::JumpIfFalse, e.line, e.column);   // [a, a==nil]
+          emit(Op::Pop, e.line, e.column);
+          emit(Op::Pop, e.line, e.column);
+          expression(*e.b);
+          const size_t done = emit_jump(Op::Jump, e.line, e.column);
+          patch_jump(keep);
+          emit(Op::Pop, e.line, e.column);   // the test; a stays
+          patch_jump(done);
+          return;
+        }
         expression(*e.a);
         const size_t jump = emit_jump(e.op == Tok::And ? Op::JumpIfFalse : Op::JumpIfTrue, e.line, e.column);
         emit(Op::Pop, e.line, e.column);
@@ -446,6 +507,10 @@ class Compiler {
           expression(*e.c);
         }
         emit_op_wide(Op::FieldSet, name_constant(e.text, e.line, e.column), e.line, e.column);
+        return;
+
+      case ExprKind::Match:
+        match_code(e, false);
         return;
 
       case ExprKind::ListLit: {
@@ -525,6 +590,7 @@ class Compiler {
   void statement(const Stmt& s) {
     switch (s.kind) {
       case StmtKind::Expression:
+        if (s.expr->kind == ExprKind::Match && s.expr->match_statement) { match_code(*s.expr, true); return; }
         expression(*s.expr);
         emit(Op::Pop, s.line, s.column);
         return;

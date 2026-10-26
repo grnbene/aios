@@ -35,7 +35,8 @@ enum class ExprKind : uint8_t {
   FieldSet,    // a.b = c
   ListLit,     // [a, b]
   MapLit,      // {k: v}
-  Lambda       // fn (a) { ... } used as a value
+  Lambda,      // fn (a) { ... } used as a value
+  Match        // match x { p1, p2 => v, _ => w }: arms below
 };
 
 struct Param { std::string name; int line = 0; int column = 0; };
@@ -54,6 +55,16 @@ struct Expr {
   std::vector<ExprP> items;  // call arguments, list elements, map values
   std::vector<std::string> keys;   // map keys, parallel to items
   std::vector<uint8_t> spread;     // Call / ListLit: 1 where the item was written `...x` (its elements go in its place); empty if none
+  // Match: the subject is `a`; each arm's patterns are compared with == in order, the first that holds runs its arm.
+  struct MatchArm {
+    std::vector<ExprP> patterns;   // empty: `_`, the arm that takes anything
+    ExprP value;                   // an expression arm
+    std::vector<StmtP> block;      // a `{ ... }` arm (match as a statement only)
+    bool is_block = false;
+    int line = 0, column = 0;
+  };
+  std::vector<MatchArm> arms;
+  bool match_statement = false;    // written as a statement: its arms may be blocks, it leaves no value
 
   // Lambda body. A named `fn` declaration is a Let of a Lambda, so there is
   // one code path for both and closures work the same either way.

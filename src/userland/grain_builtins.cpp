@@ -1289,6 +1289,16 @@ Value bi_unique(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "unique")) return Value::nil();
   const auto& items = args[0].list_items();
   std::vector<Value> out;
+  // Strings only (the usual case: keys, codes): a set of them, first seen kept - comparing each item with every one
+  // kept before was n^2, seconds for the 20,000 item codes a shipper's open orders name.
+  bool all_str = true;
+  for (const auto& it : items) if (it.type != Type::Str) { all_str = false; break; }
+  if (all_str) {
+    std::unordered_set<std::string> seen;
+    seen.reserve(items.size());
+    for (const auto& it : items) if (seen.insert(it.str()).second) out.push_back(it);
+    return Value::list(std::move(out));
+  }
   for (const auto& it : items) {
     bool found = false;
     for (const auto& existing : out) {
@@ -1296,6 +1306,14 @@ Value bi_unique(Vm&, std::vector<Value>& args, std::string& error) {
     }
     if (!found) out.push_back(it);
   }
+  return Value::list(std::move(out));
+}
+
+// compact(list): the list without its nils, in order.
+Value bi_compact(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "compact")) return Value::nil();
+  std::vector<Value> out;
+  for (const auto& it : args[0].list_items()) if (it.type != Type::Nil) out.push_back(it);
   return Value::list(std::move(out));
 }
 
@@ -6575,6 +6593,7 @@ void install_core_builtins(Vm& vm) {
 
   // Collections & Lists
   vm.define_native("push", 1, -1, bi_push);
+  vm.define_native("compact", 1, 1, bi_compact);
   vm.define_native("pop", 1, 1, bi_pop);
   vm.define_native("range", 1, 3, bi_range);
   vm.define_native("sort", 1, 1, bi_sort);

@@ -1,0 +1,30 @@
+# Spread inside functions called from code the JIT compiles. This script itself uses no spread at top level, so it
+# is compiled to native code, and every call below goes from native code into a function that spreads. (Before, a
+# function using spread was left uncompiled, and native code called it as if it were compiled: the wrong callee,
+# "cannot call a string".)
+fn check(c, msg) { assert_true(c, msg) }
+fn rd(p) { return [p, p + 1] }
+fn a(t) {
+  let f = []
+  for row in [1, 2] { push(f, ...rd(row)) }
+  return f
+}
+fn b(x) { let g = [x] return [0, ...g, 9] }
+fn c(t) {
+  let out = []
+  match t {
+    "x" => { push(out, ...rd(10)) }
+    _ => { push(out, ...[t]) }
+  }
+  return out
+}
+fn three(x, y, z) { return x + y + z }
+fn d(xs) { return three(...xs) }
+let r = a("x")
+check(len(r) == 4 and r[3] == 3, "spread in a loop, called from native code: " + str(r))
+check(b(5)[1] == 5 and len(b(5)) == 3, "list spread")
+check(c("x")[1] == 11 and c("q")[0] == "q", "spread in match block arms")
+let total = 0
+for i in 0..20000 { total = total + d([i, 1, 2]) }
+check(total == 20000 * 19999 / 2 + 20000 * 3, "hot: native loop calling a function that spreads")
+print("spread under the JIT ok")
