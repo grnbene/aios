@@ -57,6 +57,15 @@ Result<ByteBuffer> RemoteNode::query(const std::string& sql, int timeout_ms) {
   return call(nodeproto::Sql, body, timeout_ms);
 }
 
+int fleet_shell_command(const std::string& line, std::string& output) {
+  static const bool allowed = [] { const char* e = std::getenv("AIOS_FLEET_SHELL"); return e && std::string(e) == "1"; }();
+  if (!allowed) {
+    output = "this machine runs no shell commands for the fleet (its AIOS_FLEET_SHELL=1 would allow them)\n";
+    return 126;
+  }
+  return execute_host_command(line, output);
+}
+
 int execute_host_command(const std::string& line, std::string& output) {
   output.clear();
   // Through the host's process facility (the core does not popen itself): the shell runs the line, its output and
