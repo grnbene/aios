@@ -19,6 +19,10 @@
 // What it does not do: getItemCost() in PHP also writes stockmaster.actualcost from inside the feed.
 // ASQL takes no writes and a read path should not make them, so that write is left out.
 //
+// Speed: a feed for given brands or items reads every table for those items only. The whole catalog is built in
+// slices on every core, each slice on a connection of its own, while the remote stock is read beside them
+// and added in at the end; the answer is the same bytes as a build in one piece.
+//
 // The connection log and lastsent are written where PHP writes them, the ERP's MariaDB, on a
 // connection of their own (STICKERFEED_WRITE_*); the rate limit reads that log, as PHP does.
 //
@@ -37,7 +41,8 @@ fn secret(name) {
   let v = getenv(name)
   if v != nil and v != "" { return v }
   let f = getenv(name + "_FILE")
-  if f != nil and f != "" { return php_trim(read_file(f)) }
+  // trim, not php_trim: this runs while the settings are read, before lib/feed.gr (which has php_trim) is imported
+  if f != nil and f != "" { return trim(read_file(f)) }
   return ""
 }
 
@@ -46,102 +51,13 @@ fn secret(name) {
 // through 15 significant digits, which gives the same digits as exact decimals for every value a price,
 // cost or quantity takes.
 
-// trim() with PHP's default characters
-fn php_trim(s) {
-  if s == nil { return "" }
-  return trim(str(s), " \t\n\r\0\x0B")
-}
 
-// A value as PHP's (string) casts it
-fn php_str(v) {
-  if v == nil or v == false { return "" }
-  if v == true { return "1" }
-  if type(v) == "list" or type(v) == "map" { return "Array" }
-  return str(v)
-}
 
-// if ($v): "", "0", 0, null, false and an empty array are false
-fn php_truthy(v) {
-  if v == nil { return false }
-  let t = type(v)
-  if t == "bool" { return v }
-  if t == "int" or t == "real" or t == "decimal" { return v != 0 }
-  if t == "string" { return v != "" and v != "0" }
-  if t == "list" { return len(v) > 0 }
-  if t == "map" { return len(keys(v)) > 0 }
-  return true
-}
 
-// The number a string starts with, as PHP 7.4 reads one: {d, whole}, or nil when it starts with none.
-// whole: the string is that number and nothing after it (is_numeric; trailing space does not count).
-fn num_prefix(s) { return decimal_prefix(s) }
 
-// A value as PHP 7.4 uses it in arithmetic: a string by its leading number (0 when it has none), null as 0
-fn num(v) {
-  if v == nil or v == false { return decimal(0) }
-  if v == true { return decimal(1) }
-  let t = type(v)
-  if t == "decimal" { return v }
-  if t != "string" { return decimal(v) }
-  let p = num_prefix(v)
-  return p == nil ? decimal(0) : p.d
-}
 
-// is_numeric($s): the number when the string is one and nothing more
-fn numeric_str(s) {
-  if s == nil { return nil }
-  let p = num_prefix(s)
-  if p == nil or not p.whole { return nil }
-  return p.d
-}
 
-// (int) $v
-fn num_int(v) { return int(num(v)) }
 
-// number_format($v, $places, '.', '') on PHP 7.4: a string that is not numeric at all is refused
-// (a warning and NULL); a leading-numeric one counts as its number; null and false as 0. The value is
-// rounded to 15 significant digits first, then half away from zero, and a zero has no sign.
-// nf_dec() is that number as a decimal of `places` places, for arithmetic that goes on with what
-// number_format() printed: num(nf(v, p)) is nf_dec(v, p), or 0 where nf() gives nil.
-fn nf_dec(v, places) {
-  let d = decimal(0)
-  if v == true { d = decimal(1) }
-  else if v != nil and v != false {
-    if type(v) == "string" {
-      let p = decimal_prefix(v)
-      if p == nil { return nil }
-      d = p.d
-    } else {
-      d = decimal(v)
-    }
-  }
-  return decimal(round_sig(d, 15), places)
-}
-
-fn nf(v, places) {
-  let d = nf_dec(v, places)
-  return d == nil ? nil : str(d)
-}
-
-// $v > 0 and $v == 0 on PHP 7.4: a string compares by its leading number
-fn gt0(v) { return v != nil and v != false and num(v) > 0 }
-
-fn eq0(v) { return v == nil or v == false or (v != true and num(v) == 0) }
-
-// in_array($v, $list) for the strings the ERP keeps: two numeric strings compare as numbers ("07" == "7")
-fn php_in(v, list) {
-  let a = php_str(v)
-  let an = numeric_str(a)
-  for x in list {
-    let b = php_str(x)
-    if a == b { return true }
-    if an != nil {
-      let bn = numeric_str(b)
-      if bn != nil and an == bn { return true }
-    }
-  }
-  return false
-}
 
 // $v != '' on PHP 7.4: null, false, "", 0 and 0.0 equal ''
 fn loose_empty_string(v) {
@@ -151,13 +67,7 @@ fn loose_empty_string(v) {
   return false
 }
 
-// MariaDB compares the ERP's codes without case or trailing spaces
-// (PAD SPACE ignores trailing spaces only: 'VTG-VT11366' and 'VTG-VT11366' + CR are two items to it, and locstock
-// holds both)
-fn ck(s) {
-  if s == nil { return "" }
-  return upper(rtrim(str(s), " "))
-}
+
 
 // ---- connections ------------------------------------------------------------------------------
 
@@ -210,47 +120,34 @@ fn first_row(sql, params) {
   return r[0]
 }
 
+import "lib/feed.gr"
+
+// whether rgaorders has rga_type (asked once)
+let RGA_TYPE = nil
+fn has_rga_type() {
+  if RGA_TYPE == nil { RGA_TYPE = len(rows("SHOW COLUMNS FROM rgaorders LIKE 'rga_type'", nil)) > 0 }
+  return RGA_TYPE
+}
+
 // ---- feedbuilder.php ----------------------------------------------------------------------------
 
 fn today() { return date_format(now(), "%F", "local") }
 
-// the first row for each key, as a ->row lookup gives it
-fn first_by(rs, k) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    if g[key] == nil { g[key] = r }
-  }
-  return g
-}
 
-// numbers summed per key (a GROUP BY stockid whose groups MariaDB would have merged by collation)
-fn sum_by(rs, k, v) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    let cur = g[key]
-    g[key] = cur == nil ? num(r[v]) : cur + num(r[v])
-  }
-  return g
-}
 
-// rows grouped by a key column's ck(), in the order the rows came
-fn group_rows(rs, k) {
-  let g = {}
-  for r in rs {
-    let key = ck(r[k])
-    if g[key] == nil { g[key] = [] }
-    push(g[key], r)
-  }
-  return g
-}
 
 // The whole build for a set of items: what feedbuilder.php's build() reads one item at a time, read
 // once per table. brands: nil or the manufacturer ids to keep; only: nil or the stockids to build.
 // For some items every table is read for those items only; for the catalog, whole.
-fn build(brands, levels, only) {
+fn build(brands, levels, only, post) {
   let d = today()
+  // the catalog will most likely be built in slices: the remote stock, which no slice can read for its items
+  // alone, is read meanwhile
+  let remote_task = nil
+  if only == nil and brands == nil {
+    close_conns()
+    remote_task = spawn(fn () { return remote_stock(nil) })
+  }
   // " AND col IN (?)" and its parameter, when the build is for some items
   let o = fn (col) { return only == nil ? "" : " AND " + col + " IN (?)" }
   let op = fn (params) {
@@ -265,276 +162,79 @@ fn build(brands, levels, only) {
     push(base_params, brands)
   }
   let base = rows("select stockmaster.stockid as ITEM_NUMBER, manufacturer_id as VENDOR_1, mfgpart as VENDOR_ITEM_NO, price as PRICE_LEVEL_6, description as ITEM_DESCR, sort2 as SORT_2,additionalfee as FET_PRC_LVL_5 from stockmaster inner join product_to_manufacturer on stockmaster.stockid = product_to_manufacturer.stockid inner join prices on stockmaster.stockid = prices.stockid where stockmaster.categoryid = 'TIRE' and prices.typeabbrev = 'W' and prices.price > 0 and prices.startdate <= ? and prices.enddate >= ?  and discontinued = 0 " + brandopt + o("stockmaster.stockid") + " group by stockmaster.stockid", op(base_params))
-  if len(base) == 0 { return [] }
-
-  // quantity: getOnSalesOrder() and getOnOpenRgaByType() for warehouse 01, primarymixedinventory for the rest
-  let qoh01 = sum_by(rows("SELECT stockid, SUM(quantity) AS q FROM locstock WHERE loccode IN ('01')" + o("stockid") + " GROUP BY stockid", op([])), 0, 1)
-  let so_open = {}
-  for r in rows("SELECT stkcode, SUM(quantity) AS q, SUM(qtyinvoiced) AS i FROM salesorderdetails WHERE completed != 1 AND orderno in (select orderno from salesorders where fromstkloc = '01')" + o("stkcode") + " GROUP BY stkcode", op([])) {
-    let key = ck(r[0])
-    let v = num(r[1]) - num(r[2])
-    so_open[key] = so_open[key] == nil ? v : so_open[key] + v
+  if len(base) == 0 {
+    if remote_task != nil { await(remote_task) }
+    return []
   }
-  let has_rga_type = len(rows("SHOW COLUMNS FROM rgaorders LIKE 'rga_type'", nil)) > 0
-  let rga = {}
-  for r in rows("SELECT rgaorderdetails.itemcode, sum(quantityord) AS o, sum(quantityrecd) AS r FROM rgaorderdetails JOIN rgaorders ON rgaorderdetails.orderno = rgaorders.orderno WHERE rgaorderdetails.completed != 1 AND rgaorderdetails.quantityrecd < rgaorderdetails.quantityord" + (has_rga_type ? " AND rgaorders.rga_type = 'RT'" : "") + " AND rgaorders.intostocklocation = '01'" + o("rgaorderdetails.itemcode") + " GROUP BY rgaorderdetails.itemcode", op([])) {
-    let key = ck(r[0])
-    let v = num(r[1]) - num(r[2])
-    rga[key] = rga[key] == nil ? v : rga[key] + v
+
+  // A feed for some brands reads every other table for those items only, as one for given items does,
+  // and not the catalog's: the same rows for these items, a fraction of what is read.
+  if only == nil and brands != nil and len(base) <= 20000 {
+    only = []
+    for item in base { push(only, item[0]) }
   }
-  let remote = sum_by(rows("select stockid, SUM(quantity) AS q from primarymixedinventory where loccode in ('03','62','64','67')" + o("stockid") + " GROUP BY stockid", op([])), 0, 1)
 
-  let mfg = first_by(rows("SELECT manufacturer_id, name FROM manufacturer", nil), 0)
-  let specials = first_by(rows("select stockid, prices from stockspecials where ((andor = 1 and startdate <= ? and enddate >= ? ) or (andor = 2 and (qtylimit > qtysold OR qtylimit = 0)))" + o("stockid"), op([d, d])), 0)
-  let sizes = first_by(rows("select stockid, size from tireinfo where 1 = 1" + o("stockid"), op([])), 0)
+  if only == nil and remote_task != nil and len(base) >= PARALLEL_FROM { return build_parallel(base, levels, d, remote_task, post) }
+  let items = build_items(base, levels, only, d, remote_task == nil ? nil : await(remote_task), false)
+  return post == nil ? items : post(items)
+}
 
-  let pricer = make_pricer(only)
+// The catalog is built in slices on every core, each a build for some items (above) that opens a
+// connection of its own, and the slices go back together in the order the base query gave.
+let PARALLEL_FROM = 4000
+let SLICES = 8
 
+// A slice is built without the remote stock, which arrives from its own read while the slices run: its items
+// carry the stock before it as `qty` and their key as `_k`, and the last step below adds the remote stock in.
+fn build_slice(slice, levels, d, post) {
+  let ids = []
+  for item in slice { push(ids, item[0]) }
+  let items = build_items(slice, levels, ids, d, {}, true)
+  return post == nil ? items : post(items)
+}
+
+// a connection cannot be copied to a worker, so the open ones go; the next read opens another
+fn close_conns() {
+  for k in keys(conns) {
+    pcall(db_close, conns[k])
+    conns[k] = nil
+  }
+}
+
+fn build_parallel(base, levels, d, remote_task, post) {
+  close_conns()
+  let per = int((len(base) + SLICES - 1) / SLICES)
+  let slices = []
+  let at = 0
+  while at < len(base) {
+    push(slices, slice(base, at, min(at + per, len(base))))
+    at = at + per
+  }
+  let r = pcall(parallel_map, slices, fn (sl) { return build_slice(sl, levels, d, post) })
+  let remote_all = await(remote_task)
+  if not r.ok {
+    let items = build_items(base, levels, nil, d, remote_all, false)
+    return post == nil ? items : post(items)
+  }
   let out = []
-  for item in base {
-    let no = item[0]
-    let key = ck(no)
-
-    // $avail = QTY_ON_HAND - getOnSalesOrder() + remote: the one row a SUM without GROUP BY returns, where
-    // a falsy sum counts as 0, which is the number it already is
-    let onorder = (so_open[key] == nil ? 0 : so_open[key]) + (rga[key] == nil ? 0 : rga[key])
-    let avail = decimal(qoh01[key] == nil ? 0 : qoh01[key]) - onorder + (remote[key] == nil ? 0 : remote[key])
-
-    let brand = nil
-    let m = mfg[ck(item[1])]
-    if m != nil { brand = m[1] }
-    if not php_truthy(brand) { brand = "UNKNOWN" }
-
-    // getSpecialPrices(): the first live special's JSON, else false
-    let special = false
-    let sp = specials[key]
-    if sp != nil and sp[1] != nil {
-      let j = pcall(json_parse, sp[1])
-      special = j.ok ? j.value : nil
-    }
-
-    let prices = {}
-    for level in levels {
-      if php_truthy(special) and type(special) == "map" and special[level] != nil {
-        prices[level] = special[level]
-      } else {
-        prices[level] = nf(pricer(no, level), 2)
-      }
-    }
-
-    let size = nil
-    let sz = sizes[ck(php_trim(no))]
-    if sz != nil { size = sz[1] }
-    if not php_truthy(size) { size = item[5] }
-
+  for part in r.value { for x in part { push(out, x) } }
+  // $avail = QTY_ON_HAND - getOnSalesOrder() + remote, and a stock of 5 to 8 is told as 9
+  for it in out {
+    let avail = it.qty
+    let rem = remote_all[it._k]
+    if rem != nil { avail = avail + rem }
     if avail >= 5 and avail <= 8 { avail = decimal(9) }
-
-    push(out, {
-      "Brand": php_trim(brand),
-      "item": php_trim(item[2]),
-      "prices": prices,
-      "qty": nf(avail, 0),
-      "vitem": php_trim(no),
-      "Size": php_trim(size),
-      "desc": php_trim(item[4]),
-      "FET": nf(php_trim(item[6]), 2),
-      "BLANK0": "", "BLANK1": "", "BLANK2": "", "BLANK3": "", "BLANK4": "",
-      "manufacturer_id": item[1]
-    })
+    it["qty"] = nf(avail, 0)
+    del(it, "_k")
   }
   return out
 }
 
-// getPLMPrice($stockid, $level): the price-level machinery, with every table it reads loaded once.
-// PHP passes number_format() strings between its steps; here each step hands on the same number as a
-// decimal (nf_dec), and only the feed's own nf() prints it.
-fn make_pricer(only) {
-  let o = fn (col) { return only == nil ? "" : " AND " + col + " IN (?)" }
-  let op = fn (params) {
-    if only != nil { push(params, only) }
-    return params
-  }
-  let salestypes = first_by(rows("SELECT typeabbrev, ispricebook, fallback FROM salestypes", nil), 0)
-  let plp = {}
-  for r in rows("SELECT typeabbrev, line_field, pricebasis, operator, amount FROM prodlineprice", nil) {
-    let k = ck(r[0]) + "|" + ck(r[1])
-    if plp[k] == nil { plp[k] = r }
-  }
-  let sm = first_by(rows("SELECT stockid, lineid, materialcost, lastcost FROM stockmaster WHERE 1 = 1" + o("stockid"), op([])), 0)
-  let pricebooks = {}   // level -> stockid -> price row, read when a level is first asked for
-  let cost_data = nil   // getItemCost()'s tables, read when a cost is first needed
-  let memo = {}
 
-  let pricebook = fn (level) {
-    let pb = pricebooks[level]
-    if pb != nil { return pb }
-    pb = {}
-    // ORDER BY startdate DESC LIMIT 1 per item; a NULL startdate sorts last
-    for r in rows("SELECT stockid, price, startdate FROM prices WHERE typeabbrev = ? AND pricebook = '1' AND (startdate IS NULL OR startdate <= CURDATE()) AND (enddate IS NULL OR enddate >= CURDATE())" + o("stockid"), op([level])) {
-      let key = ck(r[0])
-      let cur = pb[key]
-      if cur == nil or (r[2] != nil and (cur[2] == nil or r[2] > cur[2])) { pb[key] = r }
-    }
-    pricebooks[level] = pb
-    return pb
-  }
 
-  let costs = fn () {
-    if cost_data != nil { return cost_data }
-    let c = {}
-    // qohs: SUM(quantity) per (stockid, loccode)
-    let locs = {}
-    for r in rows("select stockid, loccode, sum(quantity) as qoh from locstock where 1 = 1" + o("stockid") + " group by stockid, loccode", op([])) {
-      let key = ck(r[0])
-      if locs[key] == nil { locs[key] = {} }
-      let l = locs[key]
-      let lk = ck(r[1])
-      l[lk] = l[lk] == nil ? num(r[2]) : l[lk] + num(r[2])
-    }
-    c.locs = locs
-    c.demand = sum_by(rows("SELECT salesorderdetails.stkcode, SUM(salesorderdetails.quantity-salesorderdetails.qtyinvoiced) AS dem FROM salesorderdetails INNER JOIN salesorders ON salesorders.orderno = salesorderdetails.orderno INNER JOIN shippers on salesorders.shipvia = shipper_id WHERE salesorderdetails.completed=0 AND salesorders.quotation=0 AND shippername <> 'dropship'" + o("salesorderdetails.stkcode") + " GROUP BY salesorderdetails.stkcode", op([])), 0, 1)
-    // the newest type-25 move's price per item
-    let last25 = {}
-    for r in rows("SELECT m.stockid, m.price, m.stkmoveno FROM stockmoves m JOIN (SELECT stockid, MAX(stkmoveno) AS mx FROM stockmoves WHERE type = 25" + o("stockid") + " GROUP BY stockid) l ON l.stockid = m.stockid AND l.mx = m.stkmoveno", op([])) {
-      let key = ck(r[0])
-      let cur = last25[key]
-      if cur == nil or int(r[2]) > int(cur[2]) { last25[key] = r }
-    }
-    c.last25 = last25
-    // the newest completed PO line's unit price per item
-    let lastpo = {}
-    for r in rows("SELECT p.itemcode, p.unitprice, p.podetailitem FROM purchorderdetails p JOIN (SELECT itemcode, MAX(podetailitem) AS mx FROM purchorderdetails WHERE completed = 1" + o("itemcode") + " GROUP BY itemcode) l ON l.itemcode = p.itemcode AND l.mx = p.podetailitem", op([])) {
-      let key = ck(r[0])
-      let cur = lastpo[key]
-      if cur == nil or int(r[2]) > int(cur[2]) { lastpo[key] = r }
-    }
-    c.lastpo = lastpo
-    // purchdata in preferred_sort order (a stable sort keeps the table's order for ties; NULL first)
-    let pd = group_rows(rows("select stockid, supplierno, price, preferred_sort from purchdata where 1 = 1" + o("stockid"), op([])), 0)
-    for k in keys(pd) {
-      if len(pd[k]) > 1 { pd[k] = sort_by(pd[k], fn (r) { return r[3] == nil ? -1000000 : int(r[3]) }) }
-    }
-    c.purchdata = pd
-    let rapi = {}
-    for r in rows("select supplierno, warehouse from remoteapi inner join remotemapping on remoteapi.api_id = remotemapping.api_id", nil) {
-      let key = ck(r[0])
-      if rapi[key] == nil { rapi[key] = [] }
-      push(rapi[key], r[1])
-    }
-    c.rapi = rapi
-    // (loccode, stockid) is remotestock's key, so the row PHP reads is the only one, and all it asks of
-    // it is qty > 0
-    let rs = {}
-    for r in rows("select stockid, loccode, qty from remotestock where qty > 0 and loccode in (select warehouse from remotemapping)" + o("stockid"), op([])) {
-      let k = ck(r[0]) + "|" + ck(r[1])
-      if rs[k] == nil { rs[k] = r }
-    }
-    c.remotestock = rs
-    c.forced = first_by(rows("select stockid, cost from forcedcostoverride", nil), 0)
-    cost_data = c
-    return c
-  }
 
-  // getNextCost(): the first supplier, in preferred order, that has it in a remote warehouse, with PHP's
-  // own loop. Its quirks are kept: a price read as the string "0.0000" is truthy, so it stops the search
-  // only through "> 0"; an empty first supplier without a remote API ends the search.
-  let next_cost = fn (stockid) {
-    let c = costs()
-    let key = ck(stockid)
-    let nextcost = 0
-    let iterator = 0
-    let pd = c.purchdata[key]
-    if pd == nil { pd = [] }
-    for p in pd {
-      let whs = c.rapi[ck(p[1])]
-      if whs != nil and len(whs) > 0 {
-        for w in whs {
-          let rr = c.remotestock[key + "|" + ck(w)]
-          if gt0(rr == nil ? nil : rr[2]) {
-            nextcost = p[2]
-            break
-          }
-        }
-        if not php_truthy(nextcost) { nextcost = p[2] }
-      } else {
-        if iterator == 0 {
-          nextcost = nf(p[2], 2)
-          if php_truthy(nextcost) { break }
-        }
-      }
-      iterator = iterator + 1
-      if gt0(nextcost) { break }
-    }
-    if eq0(nextcost) {
-      // GREATEST(lastcost, materialcost, last completed PO price or 0)
-      let s = sm[key]
-      if s == nil { return nil }
-      let po = c.lastpo[key]
-      nextcost = max(num(s[3]), num(s[2]), (po == nil or po[1] == nil) ? decimal(0) : num(po[1]))
-    }
-    return nextcost
-  }
 
-  // getItemCost(): stock on hand after demand, then the moving cost or the next cost; a forced cost wins.
-  // getItemDemand() is called once per location but has no location filter, so the whole demand comes
-  // off once for every location the item has - PHP's own arithmetic, kept.
-  let item_cost = fn (stockid) {
-    let c = costs()
-    let key = ck(stockid)
-    let locs = c.locs[key]
-    let dem = c.demand[key] == nil ? decimal(0) : c.demand[key]
-    let total = decimal(0)
-    if locs != nil {
-      for lk in keys(locs) { total = total + locs[lk] - dem }
-    }
-    let s = sm[key]
-    let ac = nil
-    if s != nil {
-      let l = c.last25[key]
-      ac = max(num(s[2]), (l == nil or l[1] == nil) ? decimal(0) : num(l[1]))
-    }
-    let cost = total > 0 ? ac : next_cost(stockid)
-    let f = c.forced[key]
-    if f != nil and php_truthy(f[1]) { cost = f[1] }
-    return nf_dec(cost, 2)
-  }
 
-  let plm = nil
-  plm = fn (stockid, level, visited) {
-    if php_in(level, visited) { return nil }
-    visited = visited + [level]
-    let st = salestypes[ck(level)]
-    if st == nil { return nil }
-    if php_in(st[1], ["1"]) {
-      let r = pricebook(level)[ck(stockid)]
-      if r != nil and php_truthy(r[1]) { return nf_dec(r[1], 2) }
-      level = st[2]
-    }
-    let s = sm[ck(stockid)]
-    if s == nil { return nil }
-    let row = plp[ck(level) + "|" + ck(s[1])]
-    if row == nil { return nil }
-    let basis = row[2] == nil ? "Cost" : row[2]
-    let start = nil
-    if lower(basis) == "cost" {
-      let c = item_cost(stockid)
-      start = c == nil ? decimal(0) : c
-    } else {
-      start = plm(stockid, basis, visited)
-      if start == nil { return nil }
-    }
-    let calc = num_int(row[3]) == 1 ? start + num(row[4]) : start * num(row[4])
-    return nf_dec(calc, 2)
-  }
-
-  return fn (stockid, level) {
-    let k = ck(stockid) + "|" + ck(level)
-    if has(memo, k) { return memo[k] }
-    let p = plm(stockid, level, [])
-    memo[k] = p
-    return p
-  }
-}
 
 // in_array($v, $list) over one list many times: its strings, and the numbers among them, read once
 fn php_in_set(list) {
@@ -574,26 +274,17 @@ fn filter_for_vendor(items, excluded_brands, excluded_skus, level) {
         break
       }
     }
-    push(out, {
+    let rec = {
       "Brand": item.Brand, "item": item.item, "qty": item.qty, "vitem": item.vitem, "Size": item.Size,
       "desc": item.desc, "FET": item.FET, "BLANK0": "", "BLANK1": "", "BLANK2": "", "BLANK3": "", "BLANK4": "",
       "price": price
-    })
+    }
+    if item._k != nil { rec["_k"] = item._k }
+    push(out, rec)
   }
   return out
 }
 
-// resolvePriceLevel(): the branch's level, then the debtor's, then W
-fn resolve_price_level(debtorno, branchcode) {
-  if not php_truthy(debtorno) { return "W" }
-  if php_truthy(branchcode) and lower(php_str(branchcode)) != "all" {
-    let b = first_row("select pricelevel from custbranch where debtorno = ? and branchcode = ?", [php_str(debtorno), php_str(branchcode)])
-    if b != nil and php_truthy(b[0]) { return b[0] }
-  }
-  let dm = first_row("select salestype from debtorsmaster where debtorno = ?", [php_str(debtorno)])
-  if dm != nil and php_truthy(dm[0]) { return dm[0] }
-  return "W"
-}
 
 // ---- credentials.php and the controller's checks ----------------------------------------------
 
@@ -638,20 +329,29 @@ fn validate_bearer(token) {
   return nil
 }
 
+// The connection log's table. On a replica (chi) it must be a table the master never writes, or the
+// replica's own rows collide with the master's and stop replication.
+let LOG_TABLE = env("STICKERFEED_LOG_TABLE", "sticker_feed_connection_log")
+// Successful calls are not logged (a load or a busy client writes a row per call: 58,000 in a day on chi); failed
+// ones are, and they are what the rate limit counts. STICKERFEED_LOG_SUCCESS=1 logs every call, as the PHP did.
+let LOG_SUCCESS = env("STICKERFEED_LOG_SUCCESS", "0") == "1"
+
 fn log_event(vendor_id, action, result, status, detail) {
-  run("write", "INSERT INTO sticker_feed_connection_log (vendor_id, action, result, http_status, error_detail, actor_userid, created_at) VALUES (?, ?, ?, ?, ?, NULL, NOW())",
+  if result == "success" and not LOG_SUCCESS { return nil }
+  run("write", "INSERT INTO " + LOG_TABLE + " (vendor_id, action, result, http_status, error_detail, actor_userid, created_at) VALUES (?, ?, ?, ?, ?, NULL, NOW())",
       [num_int(vendor_id), action, result, status, detail == nil ? nil : slice(php_str(detail), 0, 2000)], nil)
 }
 
 // checkRateLimit(): PHP counts the log's rows for this action, and it logs a successful feed as "send",
 // so only failed calls count against a vendor - kept as it is.
 fn rate_limited(action, vendor_id, limit, window) {
-  let r = run("write", "SELECT COUNT(*) as count FROM sticker_feed_connection_log WHERE vendor_id = ? AND action = ? AND created_at >= FROM_UNIXTIME(?)",
+  let r = run("write", "SELECT COUNT(*) as count FROM " + LOG_TABLE + " WHERE vendor_id = ? AND action = ? AND created_at >= FROM_UNIXTIME(?)",
               [php_str(vendor_id), action, int(now()) - window], ROWS)
   return num_int(r.rows[0][0]) >= limit
 }
 
-fn reply(status, body) { return {"status": status, "json": body} }
+// Every JSON answer is written as PHP's json_encode() writes it (php_json, lib/feed.gr), so the bytes are the PHP's
+fn reply(status, body) { return {"status": status, "content_type": "application/json; charset=utf-8", "body": php_json(body)} }
 
 // getBearerTokenAndValidate($function): {client} or {fail: the response PHP set}
 fn authenticate(req, function) {
@@ -701,16 +401,86 @@ fn body_json(req) {
   return r.value
 }
 
+// The sticker_item Thing (things/sticker_item.gr) holds each item's finished row for each price level, kept
+// current by the engine as the tables change: a pull reads rows that are already right. {body, count}, the
+// feed's whole answer, or nil where there is no Thing, or none for this level, to be built the long way.
+// `mid` is the manufacturer id as php_str() prints an integer, so "in the list" (PHP's loose compare: "07" is 7)
+// is a lookup in the list's own spellings plus its whole numbers as integers prints them
+fn int_set(list) {
+  let m = {}
+  for e in list {
+    let t = php_str(e)
+    m[t] = true
+    let n = numeric_str(t)
+    if n != nil and n == int(n) { m[str(int(n))] = true }
+  }
+  return m
+}
+
+// The held rows of some items only (SHOW THING .. KEYS, one lookup per item, not the whole feed read and
+// thrown away), filtered for the client as the feed is: their items, or nil when the Thing cannot be read.
+fn held_items(level, skus, ex) {
+  let r = pcall(run, "read", "SHOW THING sticker_item KEYS (?)", [skus], ROWS)
+  if not r.ok { return nil }
+  let mi = -1
+  let vi = -1
+  let ci = -1
+  let at = 0
+  for c in r.value.columns {
+    if c == "mid" { mi = at }
+    else if c == "vitem" { vi = at }
+    else if c == "r_" + level { ci = at }
+    at = at + 1
+  }
+  if mi < 0 or vi < 0 or ci < 0 { return nil }
+  let by_brand = len(ex.brands) > 0 ? int_set(ex.brands) : nil
+  let by_sku = len(ex.skus) > 0 ? php_in_set(ex.skus) : nil
+  let out = []
+  for row in r.value.rows {
+    if by_brand != nil and by_brand[row[mi]] != nil { continue }
+    if by_sku != nil and php_in_set_has(by_sku, row[vi]) { continue }
+    push(out, json_parse(row[ci]))   // the feed's own row: parsed and written again by php_json, the same bytes
+  }
+  return out
+}
+
+fn held_feed(level, limited, ex) {
+  let r = pcall(run, "read", "SHOW THING sticker_item", nil, ROWS)
+  if not r.ok { return nil }
+  let mi = -1
+  let vi = -1
+  let ci = -1
+  let at = 0
+  for c in r.value.columns {
+    if c == "mid" { mi = at }
+    else if c == "vitem" { vi = at }
+    else if c == "r_" + level { ci = at }
+    at = at + 1
+  }
+  if mi < 0 or vi < 0 or ci < 0 or len(r.value.rows) == 0 { return nil }
+  let by_brand = len(ex.brands) > 0 ? int_set(ex.brands) : nil
+  let by_sku = len(ex.skus) > 0 ? php_in_set(ex.skus) : nil
+  let only = limited == nil ? nil : int_set(limited)
+  let parts = []
+  for row in r.value.rows {
+    if only != nil and only[row[mi]] == nil { continue }
+    if by_brand != nil and by_brand[row[mi]] != nil { continue }
+    if by_sku != nil and php_in_set_has(by_sku, row[vi]) { continue }
+    push(parts, row[ci])
+  }
+  return {"body": "{\"items\":[" + join(parts, ",") + "]}", "count": len(parts)}
+}
+
 // feed(), in PHP's order: authenticate, rate limit, payload, brands, build, filter, log
 fn feed(req) {
   let auth = authenticate(req, "feed")
+  if auth.client == nil { return auth.fail }
   let client = auth.client
-  let vid = client == nil ? "" : php_str(client.id)
+  let vid = php_str(client.id)
   if rate_limited("feed", vid, 10, 120) {
     log_event(vid, "feed", "fail", 400, "")
     return reply(400, {"error": "invalid_request", "error_description": "Rate limit exceeded. Please try again later."})
   }
-  if client == nil { return auth.fail }
 
   let client_id = num_int(client.id)
   let ex = client_exclusions(client_id)
@@ -743,15 +513,18 @@ fn feed(req) {
   }
 
   let level = resolve_price_level(client.debtorno, client.branchcode)
-  let items = build(limited, [level], nil)
-  let out = filter_for_vendor(items, ex.brands, ex.skus, level)
+  let held = held_feed(level, limited, ex)
+  let out = nil
+  if held == nil { out = build(limited, [level], nil, fn (its) { return filter_for_vendor(its, ex.brands, ex.skus, level) }) }
 
   // date('Y-m-d G:i:s'): the hour without a leading zero
   let t = now()
   let lastsent = date_format(t, "%Y-%m-%d ", "local") + str(int(date_format(t, "%H", "local"))) + date_format(t, ":%M:%S", "local")
-  run("write", "update sticker_feed_exclusions set lastsent = ?, lastfile = ? where id = ?", [lastsent, str(len(out)) + " items", client_id], nil)
+  let sent_count = held == nil ? len(out) : held.count
+  run("write", "update sticker_feed_exclusions set lastsent = ?, lastfile = ? where id = ?", [lastsent, str(sent_count) + " items", client_id], nil)
   log_event(client_id, "send", "success", 200, "feed pulled")
-  return reply(200, {"items": out})
+  // already text: the worker hands back one string, not the forty thousand records to be copied out and written again
+  return {"status": 200, "content_type": "application/json; charset=utf-8", "body": held == nil ? php_json({"items": out}) : held.body}
 }
 
 // getstock: the feed's own rows for the items asked about, read now - the check a vendor makes before it
@@ -801,7 +574,8 @@ fn getstock(req) {
   for l in lines { push(skus, l.sku) }
   let ex = client_exclusions(client_id)
   let level = resolve_price_level(client.debtorno, client.branchcode)
-  let out = filter_for_vendor(build(nil, [level], skus), ex.brands, ex.skus, level)
+  let out = held_items(level, skus, ex)
+  if out == nil { out = filter_for_vendor(build(nil, [level], skus, nil), ex.brands, ex.skus, level) }
   let by_sku = {}
   for it in out { by_sku[ck(it.vitem)] = it }
   // a line that names a brand must match the item's brand, as placeorder requires
@@ -829,13 +603,13 @@ fn getstock(req) {
 // and the order by name below keeps that order on ASQL, which has no such index.
 fn getbrands(req) {
   let auth = authenticate(req, "getbrands")
+  if auth.client == nil { return auth.fail }
   let client = auth.client
-  let vid = client == nil ? "" : php_str(client.id)
+  let vid = php_str(client.id)
   if rate_limited("getbrands", vid, 10, 60) {
     log_event(vid, "getbrands", "fail", 400, "")
     return reply(400, {"error": "invalid_request", "error_description": "Rate limit exceeded. Please try again later."})
   }
-  if client == nil { return auth.fail }
 
   let client_id = num_int(client.id)
   let brands = []
@@ -888,8 +662,8 @@ fn mirror_state() {
 // today's calls and the latest ones, from the connection log the endpoints write
 fn log_state() {
   if WRITE.host == "" { return {"error": "STICKERFEED_WRITE_HOST is not set: there is no log to read", "today": [], "recent": []} }
-  let today_r = pcall(look, WRITE, "SELECT action, result, COUNT(*) AS n FROM sticker_feed_connection_log WHERE created_at >= CURDATE() GROUP BY action, result ORDER BY action, result")
-  let recent_r = pcall(look, WRITE, "SELECT l.created_at, l.vendor_id, l.action, l.result, l.http_status, l.error_detail FROM sticker_feed_connection_log l ORDER BY l.id DESC LIMIT 12")
+  let today_r = pcall(look, WRITE, "SELECT action, result, COUNT(*) AS n FROM " + LOG_TABLE + " WHERE created_at >= CURDATE() GROUP BY action, result ORDER BY action, result")
+  let recent_r = pcall(look, WRITE, "SELECT l.created_at, l.vendor_id, l.action, l.result, l.http_status, l.error_detail FROM " + LOG_TABLE + " l ORDER BY l.id DESC LIMIT 12")
   if not today_r.ok or not recent_r.ok { return {"error": "cannot read the log: " + (today_r.ok ? recent_r.error : today_r.error), "today": [], "recent": []} }
   return {"error": "", "today": today_r.value.records, "recent": recent_r.value.records}
 }
@@ -905,7 +679,7 @@ fn view() {
   return ui.column({"gap": 14, "pad": 12}, [
     ui.heading("StickerFeed vendor API", {"size": 24}),
     ui.text("Reads ASQL at " + ASQL.host + ":" + str(ASQL.port) + " (" + mirror + "). Writes the log to " + (WRITE.host == "" ? "nowhere: STICKERFEED_WRITE_HOST is not set" : WRITE.host + ":" + str(WRITE.port)) + ".", {"dim": true}),
-    calls.error == "" ? ui.text("Calls today, from sticker_feed_connection_log:", {"bold": true}) : ui.text(calls.error, {"color": "bad"}),
+    calls.error == "" ? ui.text("Calls today, from " + LOG_TABLE + ":", {"bold": true}) : ui.text(calls.error, {"color": "bad"}),
     ui.table(calls.today, {"columns": "action:Action, result:Result:badge, n:Calls:right", "empty": "No calls today.", "badges": {"success": "ok", "fail": "warn"}}),
     ui.table(calls.recent, {"columns": "created_at:When, vendor_id:Vendor:right, action:Action, result:Result:badge, http_status:Status:right, error_detail:Detail", "empty": "No calls yet.", "badges": {"success": "ok", "fail": "warn"}})
   ])

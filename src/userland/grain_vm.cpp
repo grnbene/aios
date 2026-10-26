@@ -20,11 +20,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
+#include <execinfo.h>
+#include <map>
+#include <sys/time.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <unordered_set>
 
 namespace aios::userland::grain {
 
@@ -148,25 +153,64 @@ std::vector<Value>& Value::list_items() const {
   return static_cast<ListObj*>(obj.get())->items;
 }
 
+uint32_t MapObj::hash_of(const std::string& k) {
+  return (uint32_t)std::hash<std::string_view>{}(std::string_view(k));
+}
+
+// The table is rebuilt from the cached hashes: never from the strings.
+void MapObj::rebuild_slots(size_t at_least) {
+  size_t n = 32;
+  while (n < at_least * 2) n <<= 1;
+  slots.assign(n, 0);
+  const size_t mask = n - 1;
+  for (size_t pos = 0; pos < hashes.size(); ++pos) {
+    size_t i = hashes[pos] & mask;
+    while (slots[i]) i = (i + 1) & mask;
+    slots[i] = (uint32_t)(pos + 1);
+  }
+}
+
 Value* MapObj::find(const std::string& k) {
-  if (index.empty()) {
+  if (slots.empty()) {
     const size_t n = k.size();
     for (auto& e : entries)
       if (e.first.size() == n && std::memcmp(e.first.data(), k.data(), n) == 0) return &e.second;
     return nullptr;
   }
-  auto it = index.find(k);
-  return it == index.end() ? nullptr : &entries[it->second].second;
+  const uint32_t h = hash_of(k);
+  const size_t mask = slots.size() - 1;
+  for (size_t i = h & mask;; i = (i + 1) & mask) {
+    const uint32_t s = slots[i];
+    if (!s) return nullptr;
+    const size_t pos = s - 1;
+    if (hashes[pos] == h && entries[pos].first == k) return &entries[pos].second;
+  }
 }
 
 void MapObj::put(const std::string& k, Value v) {
-  if (Value* have = find(k)) { *have = std::move(v); return; }
-  entries.emplace_back(k, std::move(v));
-  if (!index.empty()) index[k] = entries.size() - 1;
-  else if (entries.size() > kIndexFrom) {
-    index.reserve(entries.size() * 2);
-    for (size_t i = 0; i < entries.size(); ++i) index[entries[i].first] = i;
+  if (slots.empty()) {
+    if (Value* have = find(k)) { *have = std::move(v); return; }
+    entries.emplace_back(k, std::move(v));
+    if (entries.size() > kIndexFrom) {
+      hashes.resize(entries.size());
+      for (size_t i = 0; i < entries.size(); ++i) hashes[i] = hash_of(entries[i].first);
+      rebuild_slots(entries.size());
+    }
+    return;
   }
+  const uint32_t h = hash_of(k);
+  size_t mask = slots.size() - 1;
+  size_t i = h & mask;
+  for (;; i = (i + 1) & mask) {
+    const uint32_t s = slots[i];
+    if (!s) break;
+    const size_t pos = s - 1;
+    if (hashes[pos] == h && entries[pos].first == k) { entries[pos].second = std::move(v); return; }
+  }
+  entries.emplace_back(k, std::move(v));
+  hashes.push_back(h);
+  if (entries.size() * 2 > slots.size()) { rebuild_slots(entries.size()); return; }
+  slots[i] = (uint32_t)entries.size();
 }
 
 // Erasing shifts the entries after it, so the index (when there is one) has to
@@ -174,17 +218,18 @@ void MapObj::put(const std::string& k, Value v) {
 // worth more than an O(1) erase that leaves holes.
 bool MapObj::erase(const std::string& k) {
   size_t at = entries.size();
-  if (index.empty()) {
+  if (slots.empty()) {
     for (size_t i = 0; i < entries.size(); ++i) if (entries[i].first == k) { at = i; break; }
-  } else {
-    auto it = index.find(k);
-    if (it != index.end()) at = it->second;
+  } else if (find(k)) {
+    const uint32_t h = hash_of(k);
+    for (size_t pos = 0; pos < entries.size(); ++pos)
+      if (hashes[pos] == h && entries[pos].first == k) { at = pos; break; }
   }
   if (at == entries.size()) return false;
   entries.erase(entries.begin() + (long)at);
-  if (!index.empty()) {
-    index.erase(k);
-    for (auto& [key, pos] : index) if (pos > at) pos--;
+  if (!slots.empty()) {
+    hashes.erase(hashes.begin() + (long)at);   // the positions after it moved down: the table is rebuilt, not patched
+    rebuild_slots(entries.size());
   }
   return true;
 }
@@ -366,7 +411,7 @@ size_t print_one(std::ostringstream& out, const FnObj& fn, size_t at, int& last_
   out << op_name(op);
   switch (op) {
     case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-    case Op::FieldGet: case Op::FieldSet: {
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: {
       const int k = (c.code[at + 1] << 8) | c.code[at + 2];
       out << " " << k << "  ; " << c.constants[k].repr() << "\n";
       return at + 3;
@@ -484,13 +529,34 @@ struct Vm::State {
   jit::Ctx jit_ctx{};
   std::deque<std::vector<Value>> native_args;    // see call_value: one per native nesting depth (deque: growing it must not move the ones in use)
   size_t native_depth = 0;
+  std::vector<std::weak_ptr<Obj>> tracked_containers;
+  size_t gc_prune_at = 4096;
+  bool in_gc = false;
   static uint64_t next_serial() { static std::atomic<uint64_t> n{0}; return ++n; }
   std::string error;
   int error_line = 0;
+  int error_column = 0;
 };
 
 Vm::Vm() : st_(std::make_unique<State>()) { st_->stack.reserve(1024); st_->frames.reserve(256); }
-Vm::~Vm() = default;
+Vm::~Vm() {
+  if (st_) {
+    timers.clear();
+    type_names.clear();
+    st_->globals.clear();
+    st_->stack.clear();
+    st_->frames.clear();
+    st_->open.clear();
+    collect_cycles();
+  }
+}
+
+bool Vm::retire_heap() {
+  tasks.reset();                                   // waits for any spawn() not awaited, as dropping the VM does
+  if (ExternObj::live.load() != 0) return false;   // something holds a handle that is closed by being freed
+  (void)st_.release();                             // the stack, globals and every object they reach: left to the OS
+  return true;
+}
 
 void Vm::define_global(const std::string& name, Value v) { st_->globals[name] = std::move(v); }
 Value* Vm::find_global(const std::string& name) {
@@ -503,6 +569,163 @@ uint64_t Vm::serial() const { return st_->serial; }
 Value Vm::upvalue_value(const Upvalue& uv) const {
   if (uv.is_closed) return uv.closed;
   return uv.slot < st_->stack.size() ? st_->stack[uv.slot] : Value::nil();
+}
+
+// The cycle collector only ever looks at lists, maps, closures and entities, and
+// looks at each once: a flag on the object keeps a hot loop that writes fields
+// from queueing the same map a million times.
+void Vm::track_container(const std::shared_ptr<Obj>& obj) {
+  if (!obj || obj->gc_tracked) return;
+  const bool container = obj->kind == Type::List || obj->kind == Type::Map || obj->kind == Type::Entity ||
+                         (obj->kind == Type::Fn && obj->is_closure);
+  if (!container) return;
+  obj->gc_tracked = true;
+  auto& list = st_->tracked_containers;
+  list.push_back(obj);
+  if (list.size() >= st_->gc_prune_at) {
+    collect_cycles();
+  }
+}
+
+// Breaks reference cycles that nothing outside them can reach, and returns how many
+// objects it emptied. Plain trial deletion: an object is "held from outside" when
+// more references point at it than the tracked objects themselves account for.
+// Those are the roots - and because that is counted from the references themselves,
+// a list a native function is in the middle of walking, a value another VM holds, or
+// a bound method's receiver all count as outside without the collector having to
+// know where they live. What no root reaches is cyclic garbage; its contents are
+// cleared and the ordinary reference counts free it.
+size_t Vm::collect_cycles() {
+  if (st_->in_gc) return 0;
+  st_->in_gc = true;
+  struct InGcGuard { bool& f; ~InGcGuard() { f = false; } } guard{st_->in_gc};
+
+  auto& tracked = st_->tracked_containers;
+  if (tracked.empty()) return 0;
+
+  std::vector<std::shared_ptr<Obj>> nodes;
+  nodes.reserve(tracked.size());
+  for (auto& w : tracked) if (auto sp = w.lock()) nodes.push_back(std::move(sp));
+  struct PtrIndex {
+    struct Slot { Obj* p = nullptr; uint32_t idx = 0; };
+    std::vector<Slot> slots;
+    size_t mask = 0;
+
+    void build(const std::vector<std::shared_ptr<Obj>>& nodes) {
+      size_t cap = 16;
+      while (cap < nodes.size() * 2) cap <<= 1;
+      slots.assign(cap, Slot{nullptr, 0});
+      mask = cap - 1;
+      for (size_t i = 0; i < nodes.size(); ++i) {
+        Obj* p = nodes[i].get();
+        uintptr_t v = reinterpret_cast<uintptr_t>(p);
+        size_t h = (v >> 4) ^ (v >> 9);
+        size_t s = h & mask;
+        while (slots[s].p != nullptr) s = (s + 1) & mask;
+        slots[s].p = p;
+        slots[s].idx = static_cast<uint32_t>(i);
+      }
+    }
+
+    int32_t find(Obj* p) const {
+      if (slots.empty() || !p) return -1;
+      uintptr_t v = reinterpret_cast<uintptr_t>(p);
+      size_t h = (v >> 4) ^ (v >> 9);
+      size_t s = h & mask;
+      while (slots[s].p != nullptr) {
+        if (slots[s].p == p) return static_cast<int32_t>(slots[s].idx);
+        s = (s + 1) & mask;
+      }
+      return -1;
+    }
+  } index;
+  index.build(nodes);
+
+  // every reference a tracked object holds to another tracked object
+  auto each_edge = [&](Obj* o, auto&& visit) {
+    // Only a reference a tracked object holds itself counts as inside. A bound method's receiver is held by the
+    // bound-method object, which other values can share, so it stays "held from outside": never collected from
+    // under whoever still has the method.
+    auto val = [&](const Value& v) { if (v.obj) visit(v.obj.get()); };
+    if (o->kind == Type::List) {
+      for (const auto& x : static_cast<ListObj*>(o)->items) val(x);
+    } else if (o->kind == Type::Map) {
+      for (const auto& e : static_cast<MapObj*>(o)->entries) val(e.second);
+    } else if (o->kind == Type::Fn && o->is_closure) {
+      std::unordered_set<const Upvalue*> seen;       // a shared upvalue holds its value once
+      for (const auto& u : static_cast<ClosureObj*>(o)->upvalues)
+        if (u && u->is_closed && seen.insert(u.get()).second) val(u->closed);
+    } else if (o->kind == Type::Entity) {
+      auto* e = static_cast<EntityObj*>(o);
+      for (const auto& f : e->fields) val(f.second);
+      for (const auto& h : e->handlers) val(h.second);
+    }
+  };
+
+  std::vector<long> held(nodes.size());
+  for (size_t i = 0; i < nodes.size(); ++i)
+    held[i] = nodes[i].use_count() - 1;              // minus the reference `nodes` itself holds
+  for (size_t i = 0; i < nodes.size(); ++i)
+    each_edge(nodes[i].get(), [&](Obj* c) {
+      int32_t idx = index.find(c);
+      if (idx >= 0) --held[static_cast<size_t>(idx)];
+    });
+
+  std::vector<char> live(nodes.size(), 0);
+  std::vector<size_t> work;
+  for (size_t i = 0; i < nodes.size(); ++i) if (held[i] > 0) { live[i] = 1; work.push_back(i); }
+  while (!work.empty()) {
+    const size_t i = work.back(); work.pop_back();
+    each_edge(nodes[i].get(), [&](Obj* c) {
+      int32_t idx = index.find(c);
+      if (idx >= 0 && !live[static_cast<size_t>(idx)]) {
+        live[static_cast<size_t>(idx)] = 1;
+        work.push_back(static_cast<size_t>(idx));
+      }
+    });
+  }
+
+  size_t collected = 0;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (live[i]) continue;
+    ++collected;
+    Obj* o = nodes[i].get();
+    if (o->kind == Type::Map) { auto* m = static_cast<MapObj*>(o); m->clear_all(); }
+    else if (o->kind == Type::List) static_cast<ListObj*>(o)->items.clear();
+    else if (o->kind == Type::Fn && o->is_closure) static_cast<ClosureObj*>(o)->upvalues.clear();
+    else if (o->kind == Type::Entity) { auto* e = static_cast<EntityObj*>(o); e->fields.clear(); e->handlers.clear(); }
+  }
+
+  tracked.clear();
+  for (size_t i = 0; i < nodes.size(); ++i) if (live[i]) tracked.push_back(nodes[i]);
+  st_->gc_prune_at = std::max<size_t>(8192, tracked.size() * 3);
+  return collected;
+}
+
+size_t Vm::frame_depth() const { return st_->frames.size(); }
+
+std::vector<std::string> Vm::stack_trace() const {
+  std::vector<std::string> res;
+  for (auto it = st_->frames.rbegin(); it != st_->frames.rend(); ++it) {
+    std::string name = (it->closure && it->closure->fn) ? it->closure->fn->name : "<unknown>";
+    int line = 0;
+    if (it->chunk && it->ip < it->chunk->lines.size()) line = it->chunk->lines[it->ip];
+    res.push_back(name + " at line " + std::to_string(line));
+  }
+  return res;
+}
+
+std::vector<std::pair<std::string, Value>> Vm::current_locals() const {
+  std::vector<std::pair<std::string, Value>> res;
+  if (st_->frames.empty()) return res;
+  const Frame& fr = st_->frames.back();
+  if (!fr.closure || !fr.closure->fn) return res;
+  for (const auto& d : fr.closure->fn->debug_locals) {
+    if (fr.ip < d.from || fr.ip >= d.to) continue;           // not in scope here
+    const size_t at = fr.base + (size_t)d.slot;
+    if (at < st_->stack.size()) res.push_back({d.name, st_->stack[at]});
+  }
+  return res;
 }
 
 std::vector<std::string> Vm::global_names() const {
@@ -526,6 +749,7 @@ void Vm::define_native(const std::string& name, int min_args, int max_args, Nati
 }
 
 void Vm::emit(const std::string& line) {
+  if (on_print) { on_print(line); return; }
   if (sink) { sink->push_back(line); return; }
   // Flushed per line. A server's log is read while the server is still
   // running, and a buffered stream redirected to a file shows nothing at all
@@ -583,6 +807,68 @@ bool Vm::step_one(size_t ip) {
 }
 
 // The callee's frame is already pushed; run its native code to its Return.
+
+// GRAIN_PROFILE=1: a 1 kHz CPU-time sample of the source line being run, printed to stderr at exit. A builtin's
+// time lands on the line that called it. Off, the cost is one never-taken branch per instruction.
+namespace {
+struct ProfSample { int line; int depth; void* pc[14]; };
+bool g_prof_on = false;
+bool g_prof_native = false;
+const Chunk* volatile g_prof_chunk = nullptr;
+volatile size_t g_prof_ip = 0;
+ProfSample g_prof_buf[1 << 17];
+volatile size_t g_prof_n = 0;
+void prof_tick(int) {
+  const Chunk* c = g_prof_chunk;
+  const size_t n = g_prof_n;
+  const size_t ip = g_prof_ip;
+  if (c && n < (sizeof g_prof_buf / sizeof g_prof_buf[0])) {
+    const size_t at = ip > 0 ? ip - 1 : 0;
+    ProfSample& ps = g_prof_buf[n];
+    ps.line = at < c->lines.size() ? c->lines[at] : 0;
+    ps.depth = g_prof_native ? backtrace(ps.pc, 14) : 0;
+    g_prof_n = n + 1;
+  }
+}
+void prof_report() {
+  std::map<int, size_t> by_line;
+  for (size_t i = 0; i < g_prof_n; ++i) {
+    by_line[g_prof_buf[i].line]++;
+  }
+  std::vector<std::pair<size_t, int>> top;
+  for (auto& kv : by_line) top.push_back({kv.second, kv.first});
+  std::sort(top.rbegin(), top.rend());
+  if (g_prof_native) {
+    // GRAIN_PROFILE=native: every sample's call stack, innermost first, as hex addresses (one line each) to GRAIN_PROFILE_OUT
+    const char* out = std::getenv("GRAIN_PROFILE_OUT");
+    if (FILE* f = std::fopen(out ? out : "grain-profile.stacks", "w")) {
+      for (size_t i = 0; i < g_prof_n; ++i) {
+        for (int d = 0; d < g_prof_buf[i].depth; ++d) std::fprintf(f, "%p ", g_prof_buf[i].pc[d]);
+        std::fprintf(f, "\n");
+      }
+      std::fclose(f);
+    }
+  }
+  std::fprintf(stderr, "grain profile: %zu samples (ms)\n", (size_t)g_prof_n);
+  for (size_t i = 0; i < top.size() && i < 40; ++i) std::fprintf(stderr, "  %6zu ms  line %d\n", top[i].first, top[i].second);
+}
+void prof_start() {
+  static bool once = false;
+  if (once) return;
+  once = true;
+  const char* want = std::getenv("GRAIN_PROFILE");
+  if (!want) return;
+  g_prof_on = true;
+  g_prof_native = std::strcmp(want, "native") == 0;
+  struct sigaction sa; std::memset(&sa, 0, sizeof sa);
+  sa.sa_handler = prof_tick; sa.sa_flags = SA_RESTART;
+  sigaction(SIGPROF, &sa, nullptr);
+  itimerval it; it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 1000; it.it_value = it.it_interval;
+  setitimer(ITIMER_PROF, &it, nullptr);
+  std::atexit(prof_report);
+}
+}  // namespace
+
 bool Vm::run_native(void* code, size_t base) {
 #if UINTPTR_MAX == UINT64_MAX  // the JITs are 64-bit; a 32-bit build (wasm) never runs native code
   static_assert(sizeof(Frame) == jit::kFrameSize, "the native call path writes Frames directly");
@@ -734,9 +1020,9 @@ void Vm::close_upvalues_from(size_t from) {
 // A call: `callee` and its argc arguments are the top of the stack. Natives
 // run to completion here; a grain function gets its frame pushed and - when it
 // has native code - runs to its Return before this returns.
-bool Vm::invoke(const Value& callee, uint8_t argc, int line) {
+bool Vm::invoke(const Value& callee, uint8_t argc, int line, int column) {
   State& S = *st_;
-  auto fail = [&](int l, const std::string& msg) { S.error = msg; S.error_line = l; };
+  auto fail = [&](int l, const std::string& msg) { S.error = msg; S.error_line = l; S.error_column = column; };
   if (callee.type == Type::Native) {
     auto* nat = static_cast<NativeObj*>(callee.obj.get());
     if (argc < nat->min_args || (nat->max_args >= 0 && argc > nat->max_args)) {
@@ -812,7 +1098,9 @@ bool Vm::jit_call(size_t ip) {
   // By reference: invoke() reads the callee before anything can grow the
   // stack, and the slot keeps it alive until the frame is torn down. (A copy
   // was an atomic refcount increment and decrement per call.)
-  return invoke(S.stack[S.stack.size() - argc - 1], argc, chunk.lines[ip]) && S.error.empty();
+  const int line = (ip < chunk.lines.size()) ? chunk.lines[ip] : 0;
+  const int col = (ip < chunk.columns.size()) ? chunk.columns[ip] : 0;
+  return invoke(S.stack[S.stack.size() - argc - 1], argc, line, col) && S.error.empty();
 }
 
 bool Vm::jit_get_global(size_t ip) {
@@ -824,7 +1112,8 @@ bool Vm::jit_get_global(size_t ip) {
   if (!g) {
     S.frames.back().ip = ip + 3;
     S.error = "'" + chunk.constants[k].str() + "' is not defined";
-    S.error_line = chunk.lines[ip];
+    S.error_line = (ip < chunk.lines.size()) ? chunk.lines[ip] : 0;
+    S.error_column = (ip < chunk.columns.size()) ? chunk.columns[ip] : 0;
     return false;
   }
   push_copy(S.stack, *g);
@@ -848,18 +1137,17 @@ void Vm::jit_return() {
 bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
   State& S = *st_;
 
-  auto fail = [&](int line, const std::string& msg) {
-    S.error = msg;
-    S.error_line = line;
-  };
-
   auto frame_line = [&](const Frame& f) {
     const Chunk& c = f.closure->fn->chunk;
     const size_t at = f.ip > 0 ? f.ip - 1 : 0;
     return at < c.lines.size() ? c.lines[at] : 0;
   };
 
-
+  auto frame_col = [&](const Frame& f) {
+    const Chunk& c = f.closure->fn->chunk;
+    const size_t at = f.ip > 0 ? f.ip - 1 : 0;
+    return at < c.columns.size() ? c.columns[at] : 0;
+  };
 
   if (S.frames.size() <= target_frame_depth) return S.error.empty();
   // The current frame and its chunk change only on Call and Return, so they
@@ -868,22 +1156,57 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
   // any Call, not just grain-to-grain ones.)
   Frame* frame = &S.frames.back();
   const Chunk* cur = frame->chunk;
+  prof_start();
   for (;;) {
-    if (step_limit && ++steps > step_limit) {
-      fail(frame_line(S.frames.back()),
-           "step limit of " + std::to_string(step_limit) + " reached");
-      return false;
-    }
-
     const Chunk& chunk = *cur;
-    if (frame->ip >= chunk.code.size()) { fail(0, "ran off the end of a function"); break; }
-
-    // Only a fault reads the line; looking it up per instruction was a load
+    // Only a fault reads the line/col; looking it up per instruction was a load
     // on every step for nothing.
     struct LazyLine {
       const Chunk& c; size_t at;
-      operator int() const { return c.lines[at]; }
+      operator int() const { return at < c.lines.size() ? c.lines[at] : 0; }
     } line{chunk, frame->ip};
+    struct LazyCol {
+      const Chunk& c; size_t at;
+      operator int() const { return at < c.columns.size() ? c.columns[at] : 0; }
+    } col{chunk, frame->ip};
+
+    auto fail = [&](int line_num, const std::string& msg, int col_num = -1) {
+      S.error = msg;
+      S.error_line = line_num;
+      S.error_column = (col_num >= 0) ? col_num : (int)col;
+    };
+
+    if (g_prof_on) { g_prof_chunk = cur; g_prof_ip = frame->ip; }
+    if (step_limit && ++steps > step_limit) {
+      fail(frame_line(S.frames.back()),
+           "step limit of " + std::to_string(step_limit) + " reached",
+           frame_col(S.frames.back()));
+      return false;
+    }
+
+    if (frame->ip >= chunk.code.size()) { fail(0, "ran off the end of a function", 0); break; }
+
+    if (debug_state.enabled) {
+      int cur_line = (frame->ip < chunk.lines.size()) ? chunk.lines[frame->ip] : 0;
+      auto& seen = debug_state.frame_line;
+      seen.resize(S.frames.size(), 0);                      // a frame that just began has seen no line yet
+      if (cur_line > 0 && cur_line != seen.back()) {
+        seen.back() = cur_line;
+        const bool hit_bp = debug_state.breakpoints.count(cur_line) > 0;
+        const bool hit_step = debug_state.step_line;
+        const bool hit_step_over = debug_state.step_over && (S.frames.size() <= debug_state.step_over_depth);
+        if (hit_bp || hit_step || hit_step_over) {
+          debug_state.step_line = false;
+          debug_state.step_over = false;
+          if (debug_state.on_break) {
+            std::string cur_origin = (frame->closure && frame->closure->fn) ? frame->closure->fn->name : "";
+            debug_state.on_break(*this, cur_origin, cur_line);
+            frame = &S.frames.back();                       // the hook may have run code
+          }
+        }
+      }
+    }
+
     const Op op = (Op)chunk.code[frame->ip++];
 
     auto read_byte = [&]() -> uint8_t { return chunk.code[frame->ip++]; };
@@ -1026,6 +1349,9 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           const auto& more = b.list_items();
           out.insert(out.end(), more.begin(), more.end());
           S.stack.push_back(Value::list(std::move(out)));
+          bool has_c = false;
+          for (const auto& item : S.stack.back().list_items()) if (item.is_container()) { has_c = true; break; }
+          if (has_c) track_container(S.stack.back().obj);
           break;
         }
         // No implicit "a" + 1. The one time it is what you meant it saves four
@@ -1154,7 +1480,7 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
 
       case Op::Call: {
         const uint8_t argc = read_byte();
-        const bool ok = invoke(S.stack[S.stack.size() - argc - 1], argc, line);
+        const bool ok = invoke(S.stack[S.stack.size() - argc - 1], argc, line, col);
         frame = &S.frames.back(); cur = frame->chunk;
         if (!ok) break;
         break;
@@ -1185,6 +1511,7 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           }
         }
         S.stack.push_back(Value::object(Type::Fn, closure));
+        track_container(closure);
         break;
       }
 
@@ -1210,20 +1537,26 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         const uint16_t n = read_short();
         std::vector<Value> items(S.stack.end() - n, S.stack.end());
         S.stack.resize(S.stack.size() - n);
+        bool has_c = false;
+        for (const auto& it : items) if (it.is_container()) { has_c = true; break; }
         S.stack.push_back(Value::list(std::move(items)));
+        if (has_c) track_container(S.stack.back().obj);
         break;
       }
       case Op::BuildMap: {
         const uint16_t n = read_short();
         auto m = std::make_shared<MapObj>();
         m->entries.reserve(n);
+        bool has_c = false;
         for (size_t i = 0; i < n; ++i) {
           const Value& k = S.stack[S.stack.size() - 2 * (n - i)];
           const Value& v = S.stack[S.stack.size() - 2 * (n - i) + 1];
+          if (v.is_container()) has_c = true;
           m->put(k.str(), v);
         }
         S.stack.resize(S.stack.size() - 2 * (size_t)n);
         S.stack.push_back(Value::object(Type::Map, m));
+        if (has_c) track_container(m);
         break;
       }
 
@@ -1275,6 +1608,7 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
 
       case Op::IndexSet: {
         Value v = pop(), key = pop(), target = pop();
+        if (v.is_container() && target.obj) track_container(target.obj);
         if (target.type == Type::List) {
           if (!key.is_number()) { fail(line, "a list index must be a number"); break; }
           auto& items = target.list_items();
@@ -1301,114 +1635,242 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         break;
       }
 
-      case Op::FieldGet: {
-        const std::string& name = chunk.constants[read_short()].str();
+            case Op::FieldGet: {
+        const uint16_t const_k = read_short();
+        const std::string& name = chunk.constants[const_k].str();
         Value target = pop();
-        if (target.type == Type::Map) {
-          Value* v = static_cast<MapObj*>(target.obj.get())->find(name);
-          S.stack.push_back(v ? *v : Value::nil());
-          break;
-        }
-        if (target.type == Type::Id128) {
-          const auto& id = target.as_id128();
-          if (name == "hi") { S.stack.push_back(Value::integer((int64_t)id.hi)); break; }
-          if (name == "lo") { S.stack.push_back(Value::integer((int64_t)id.lo)); break; }
-          if (name == "str" || name == "hex") { S.stack.push_back(Value::string(id.str())); break; }
-          if (name == "short") { S.stack.push_back(Value::string(id.short_str())); break; }
-        }
-        if (target.type == Type::Capability && target.obj) {
-          auto* cap = static_cast<CapObj*>(target.obj.get());
-          if (name == "id") { S.stack.push_back(Value::id128(cap->id)); break; }
-          if (name == "resource") { S.stack.push_back(Value::string(cap->resource)); break; }
-          if (name == "rights") { S.stack.push_back(Value::integer((int64_t)cap->rights)); break; }
-          if (name == "expiry" || name == "expires") { S.stack.push_back(Value::integer((int64_t)cap->expiry)); break; }
-          if (name == "parent") { S.stack.push_back(Value::id128(cap->parent_id)); break; }
-          if (name == "holder") { S.stack.push_back(Value::string(cap->holder)); break; }
-          if (name == "attenuate") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "attenuate", 1, 1, method_cap_attenuate)));
-            break;
+        auto resolve_field = [&](const Value& tgt, const std::string& fn, Value& out) -> bool {
+          if (tgt.type == Type::Map && tgt.obj) {
+            Value* v = static_cast<MapObj*>(tgt.obj.get())->find(fn);
+            out = v ? *v : Value::nil();
+            return true;
           }
-          if (name == "can") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "can", 1, 1, method_cap_can)));
-            break;
+          if (tgt.type == Type::Id128) {
+            const auto& id = tgt.as_id128();
+            if (fn == "hi") { out = Value::integer((int64_t)id.hi); return true; }
+            if (fn == "lo") { out = Value::integer((int64_t)id.lo); return true; }
+            if (fn == "str" || fn == "hex") { out = Value::string(id.str()); return true; }
+            if (fn == "short") { out = Value::string(id.short_str()); return true; }
           }
-          if (name == "has_expired") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "has_expired", 0, 1, method_cap_has_expired)));
-            break;
+          if (tgt.type == Type::Capability && tgt.obj) {
+            auto* cap = static_cast<CapObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(cap->id); return true; }
+            if (fn == "resource") { out = Value::string(cap->resource); return true; }
+            if (fn == "rights") { out = Value::integer((int64_t)cap->rights); return true; }
+            if (fn == "expiry" || fn == "expires") { out = Value::integer((int64_t)cap->expiry); return true; }
+            if (fn == "parent") { out = Value::id128(cap->parent_id); return true; }
+            if (fn == "holder") { out = Value::string(cap->holder); return true; }
+            if (fn == "attenuate") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "attenuate", 1, 1, method_cap_attenuate));
+              return true;
+            }
+            if (fn == "can") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "can", 1, 1, method_cap_can));
+              return true;
+            }
+            if (fn == "has_expired") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "has_expired", 0, 1, method_cap_has_expired));
+              return true;
+            }
           }
-        }
-        if (target.type == Type::Channel && target.obj) {
-          auto* ch = static_cast<ChannelObj*>(target.obj.get());
-          if (name == "id") { S.stack.push_back(Value::id128(ch->id)); break; }
-          if (name == "name") { S.stack.push_back(Value::string(ch->name)); break; }
-          if (name == "capacity") { S.stack.push_back(Value::integer((int64_t)ch->capacity)); break; }
-          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)ch->generation)); break; }
-          if (name == "head") { S.stack.push_back(Value::integer((int64_t)ch->head)); break; }
-          if (name == "tail") { S.stack.push_back(Value::integer((int64_t)ch->tail)); break; }
-          if (name == "dropped") { S.stack.push_back(Value::integer((int64_t)ch->dropped)); break; }
-          if (name == "publish") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "publish", 1, 2, method_channel_publish)));
-            break;
+          if (tgt.type == Type::Channel && tgt.obj) {
+            auto* ch = static_cast<ChannelObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(ch->id); return true; }
+            if (fn == "name") { out = Value::string(ch->name); return true; }
+            if (fn == "capacity") { out = Value::integer((int64_t)ch->capacity); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)ch->generation); return true; }
+            if (fn == "head") { out = Value::integer((int64_t)ch->head); return true; }
+            if (fn == "tail") { out = Value::integer((int64_t)ch->tail); return true; }
+            if (fn == "dropped") { out = Value::integer((int64_t)ch->dropped); return true; }
+            if (fn == "publish") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "publish", 1, 2, method_channel_publish));
+              return true;
+            }
+            if (fn == "consume") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "consume", 0, 0, method_channel_consume));
+              return true;
+            }
+            if (fn == "stats") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "stats", 0, 0, method_channel_stats));
+              return true;
+            }
           }
-          if (name == "consume") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "consume", 0, 0, method_channel_consume)));
-            break;
+          if (tgt.type == Type::StateFrame && tgt.obj) {
+            auto* f = static_cast<FrameObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(f->id); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)f->generation); return true; }
+            if (fn == "publisher") { out = Value::id128(f->publisher); return true; }
+            if (fn == "payload") { out = f->payload; return true; }
+            if (fn == "timestamp") { out = Value::integer((int64_t)f->timestamp); return true; }
           }
-          if (name == "stats") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "stats", 0, 0, method_channel_stats)));
-            break;
+          if (tgt.type == Type::MemoryObject && tgt.obj) {
+            auto* mem = static_cast<MemObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(mem->id); return true; }
+            if (fn == "size") { out = Value::integer((int64_t)mem->size); return true; }
+            if (fn == "provider") { out = Value::string(mem->provider); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)mem->generation); return true; }
+            if (fn == "write") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "write", 2, 2, method_mem_write));
+              return true;
+            }
+            if (fn == "read") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "read", 2, 2, method_mem_read));
+              return true;
+            }
+            if (fn == "migrate") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "migrate", 1, 1, method_mem_migrate));
+              return true;
+            }
           }
-        }
-        if (target.type == Type::StateFrame && target.obj) {
-          auto* f = static_cast<FrameObj*>(target.obj.get());
-          if (name == "id") { S.stack.push_back(Value::id128(f->id)); break; }
-          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)f->generation)); break; }
-          if (name == "publisher") { S.stack.push_back(Value::id128(f->publisher)); break; }
-          if (name == "payload") { S.stack.push_back(f->payload); break; }
-          if (name == "timestamp") { S.stack.push_back(Value::integer((int64_t)f->timestamp)); break; }
-        }
-        if (target.type == Type::MemoryObject && target.obj) {
-          auto* mem = static_cast<MemObj*>(target.obj.get());
-          if (name == "id") { S.stack.push_back(Value::id128(mem->id)); break; }
-          if (name == "size") { S.stack.push_back(Value::integer((int64_t)mem->size)); break; }
-          if (name == "provider") { S.stack.push_back(Value::string(mem->provider)); break; }
-          if (name == "generation") { S.stack.push_back(Value::integer((int64_t)mem->generation)); break; }
-          if (name == "write") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "write", 2, 2, method_mem_write)));
-            break;
+          if (tgt.type == Type::Entity && tgt.obj) {
+            auto* ent = static_cast<EntityObj*>(tgt.obj.get());
+            if (fn == "id" || fn == "identity") { out = Value::id128(ent->id); return true; }
+            if (fn == "name") { out = Value::string(ent->name); return true; }
+            if (fn == "dispatch") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "dispatch", 1, 2, method_entity_dispatch));
+              return true;
+            }
+            if (ent->handlers.find(fn) != ent->handlers.end()) {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, fn, 0, 1, method_entity_handler_call));
+              return true;
+            }
+            out = ent->get_field(fn);
+            return true;
           }
-          if (name == "read") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "read", 2, 2, method_mem_read)));
-            break;
-          }
-          if (name == "migrate") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "migrate", 1, 1, method_mem_migrate)));
-            break;
-          }
-        }
-        if (target.type == Type::Entity && target.obj) {
-          auto* ent = static_cast<EntityObj*>(target.obj.get());
-          if (name == "id" || name == "identity") { S.stack.push_back(Value::id128(ent->id)); break; }
-          if (name == "name") { S.stack.push_back(Value::string(ent->name)); break; }
-          if (name == "dispatch") {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, "dispatch", 1, 2, method_entity_dispatch)));
-            break;
-          }
-          if (ent->handlers.find(name) != ent->handlers.end()) {
-            S.stack.push_back(Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(target, name, 0, 1, method_entity_handler_call)));
-            break;
-          }
-          Value val = ent->get_field(name);
-          S.stack.push_back(val);
+          return false;
+        };
+
+        Value val = Value::nil();
+        if (resolve_field(target, name, val)) {
+          S.stack.push_back(std::move(val));
           break;
         }
         fail(line, std::string("a ") + type_name(target.type) + " has no field '" + name + "'");
         break;
       }
+      case Op::OptFieldGet: {
+        const uint16_t const_k = read_short();
+        const std::string& name = chunk.constants[const_k].str();
+        Value target = pop();
+        if (target.type == Type::Nil) {
+          S.stack.push_back(Value::nil());
+          break;
+        }
+        auto resolve_field = [&](const Value& tgt, const std::string& fn, Value& out) -> bool {
+          if (tgt.type == Type::Map && tgt.obj) {
+            Value* v = static_cast<MapObj*>(tgt.obj.get())->find(fn);
+            out = v ? *v : Value::nil();
+            return true;
+          }
+          if (tgt.type == Type::Id128) {
+            const auto& id = tgt.as_id128();
+            if (fn == "hi") { out = Value::integer((int64_t)id.hi); return true; }
+            if (fn == "lo") { out = Value::integer((int64_t)id.lo); return true; }
+            if (fn == "str" || fn == "hex") { out = Value::string(id.str()); return true; }
+            if (fn == "short") { out = Value::string(id.short_str()); return true; }
+          }
+          if (tgt.type == Type::Capability && tgt.obj) {
+            auto* cap = static_cast<CapObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(cap->id); return true; }
+            if (fn == "resource") { out = Value::string(cap->resource); return true; }
+            if (fn == "rights") { out = Value::integer((int64_t)cap->rights); return true; }
+            if (fn == "expiry" || fn == "expires") { out = Value::integer((int64_t)cap->expiry); return true; }
+            if (fn == "parent") { out = Value::id128(cap->parent_id); return true; }
+            if (fn == "holder") { out = Value::string(cap->holder); return true; }
+            if (fn == "attenuate") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "attenuate", 1, 1, method_cap_attenuate));
+              return true;
+            }
+            if (fn == "can") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "can", 1, 1, method_cap_can));
+              return true;
+            }
+            if (fn == "has_expired") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "has_expired", 0, 1, method_cap_has_expired));
+              return true;
+            }
+          }
+          if (tgt.type == Type::Channel && tgt.obj) {
+            auto* ch = static_cast<ChannelObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(ch->id); return true; }
+            if (fn == "name") { out = Value::string(ch->name); return true; }
+            if (fn == "capacity") { out = Value::integer((int64_t)ch->capacity); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)ch->generation); return true; }
+            if (fn == "head") { out = Value::integer((int64_t)ch->head); return true; }
+            if (fn == "tail") { out = Value::integer((int64_t)ch->tail); return true; }
+            if (fn == "dropped") { out = Value::integer((int64_t)ch->dropped); return true; }
+            if (fn == "publish") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "publish", 1, 2, method_channel_publish));
+              return true;
+            }
+            if (fn == "consume") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "consume", 0, 0, method_channel_consume));
+              return true;
+            }
+            if (fn == "stats") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "stats", 0, 0, method_channel_stats));
+              return true;
+            }
+          }
+          if (tgt.type == Type::StateFrame && tgt.obj) {
+            auto* f = static_cast<FrameObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(f->id); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)f->generation); return true; }
+            if (fn == "publisher") { out = Value::id128(f->publisher); return true; }
+            if (fn == "payload") { out = f->payload; return true; }
+            if (fn == "timestamp") { out = Value::integer((int64_t)f->timestamp); return true; }
+          }
+          if (tgt.type == Type::MemoryObject && tgt.obj) {
+            auto* mem = static_cast<MemObj*>(tgt.obj.get());
+            if (fn == "id") { out = Value::id128(mem->id); return true; }
+            if (fn == "size") { out = Value::integer((int64_t)mem->size); return true; }
+            if (fn == "provider") { out = Value::string(mem->provider); return true; }
+            if (fn == "generation") { out = Value::integer((int64_t)mem->generation); return true; }
+            if (fn == "write") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "write", 2, 2, method_mem_write));
+              return true;
+            }
+            if (fn == "read") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "read", 2, 2, method_mem_read));
+              return true;
+            }
+            if (fn == "migrate") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "migrate", 1, 1, method_mem_migrate));
+              return true;
+            }
+          }
+          if (tgt.type == Type::Entity && tgt.obj) {
+            auto* ent = static_cast<EntityObj*>(tgt.obj.get());
+            if (fn == "id" || fn == "identity") { out = Value::id128(ent->id); return true; }
+            if (fn == "name") { out = Value::string(ent->name); return true; }
+            if (fn == "dispatch") {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, "dispatch", 1, 2, method_entity_dispatch));
+              return true;
+            }
+            if (ent->handlers.find(fn) != ent->handlers.end()) {
+              out = Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(tgt, fn, 0, 1, method_entity_handler_call));
+              return true;
+            }
+            out = ent->get_field(fn);
+            return true;
+          }
+          return false;
+        };
+
+        Value val = Value::nil();
+        if (resolve_field(target, name, val)) {
+          S.stack.push_back(std::move(val));
+        } else {
+          S.stack.push_back(Value::nil());
+        }
+        break;
+      }
       case Op::FieldSet: {
-        const std::string& name = chunk.constants[read_short()].str();
+        const uint16_t const_k = read_short();
+        const std::string& name = chunk.constants[const_k].str();
         Value v = pop(), target = pop();
-        if (target.type == Type::Map) {
+        if (v.is_container() && target.obj) track_container(target.obj);
+        if (target.type == Type::Map && target.obj) {
           static_cast<MapObj*>(target.obj.get())->put(name, v);
           S.stack.push_back(v);
           break;
@@ -1495,6 +1957,11 @@ Vm::RunResult Vm::run(const std::shared_ptr<FnObj>& script) {
     const size_t at = f.ip > 0 ? f.ip - 1 : 0;
     return at < c.lines.size() ? c.lines[at] : 0;
   };
+  auto frame_col = [&](const Frame& f) {
+    const Chunk& c = f.closure->fn->chunk;
+    const size_t at = f.ip > 0 ? f.ip - 1 : 0;
+    return at < c.columns.size() ? c.columns[at] : 0;
+  };
 
   auto capture_trace = [&]() {
     const size_t n = S.frames.size();
@@ -1507,7 +1974,11 @@ Vm::RunResult Vm::run(const std::shared_ptr<FnObj>& script) {
         continue;
       }
       const Frame& f = S.frames[i];
-      result.trace.push_back(f.closure->fn->name + " (line " + std::to_string(frame_line(f)) + ")");
+      int fl = frame_line(f);
+      int fc = frame_col(f);
+      std::string pos = "line " + std::to_string(fl);
+      if (fc > 0) pos += ":" + std::to_string(fc);
+      result.trace.push_back(f.closure->fn->name + " (" + pos + ")");
     }
   };
 
@@ -1526,6 +1997,13 @@ Vm::RunResult Vm::run(const std::shared_ptr<FnObj>& script) {
   capture_trace();
   result.error = S.error.empty() ? "stopped" : S.error;
   result.line = S.error_line;
+  result.column = S.error_column;
+  if (result.column == 0 && !S.frames.empty()) {
+    result.column = frame_col(S.frames.back());
+  }
+  if (result.line == 0 && !S.frames.empty()) {
+    result.line = frame_line(S.frames.back());
+  }
   return result;
 }
 
@@ -1581,8 +2059,10 @@ Value Vm::call(const Value& callee, const std::vector<Value>& args, std::string&
 
   std::string prev_error = S.error;
   int prev_error_line = S.error_line;
+  int prev_error_column = S.error_column;
   S.error.clear();
   S.error_line = 0;
+  S.error_column = 0;
 
   bool ok;
   void* code = jit_enabled ? native_for(*closure->fn) : nullptr;
@@ -1594,6 +2074,7 @@ Value Vm::call(const Value& callee, const std::vector<Value>& args, std::string&
     S.stack.resize(base);
     S.error = prev_error;
     S.error_line = prev_error_line;
+    S.error_column = prev_error_column;
     return Value::nil();
   }
 
@@ -1604,6 +2085,7 @@ Value Vm::call(const Value& callee, const std::vector<Value>& args, std::string&
   }
   S.error = prev_error;
   S.error_line = prev_error_line;
+  S.error_column = prev_error_column;
   return ret;
 }
 

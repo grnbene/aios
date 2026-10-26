@@ -484,6 +484,16 @@ its own datadir (see below). The `compute serve` path is read from
   deletes find their row by the primary-key columns in the before image. A
   table with no primary key is matched on every column of the before image
   (`mysql_binlog.cpp:1907-1920`).
+- **A transaction's rows are applied together.** Its inserts into one table go
+  as one multi-row `INSERT ... ON DUPLICATE KEY UPDATE c = VALUES(c)` (row by
+  row again if that fails, so a bad row costs only itself); deletes by a
+  one-column key as one `DELETE ... WHERE k IN (...)`; deletes from a table
+  without a key as one `DELETE FROM t MATCHING (v1, ...), (...)` - an ASQL
+  form that removes one row per tuple, the row whose every column (in the
+  table's order) equals it as `=` compares, found in one pass from the first
+  row. A delete per row scanned the table and rewrote every column each time:
+  a source that deletes and reloads a 31M-row log table nightly left the
+  mirror days behind.
 - **Checksums do not matter.** The consumer sends
   `SET @master_binlog_checksum='NONE'` and a 5 s heartbeat before
   `COM_BINLOG_DUMP`.
@@ -621,6 +631,7 @@ The other statements:
     SHOW THINGS                         every kind
     SHOW THINGS <name> | SHOW THING <name>       every Thing of a kind
     SHOW THING HISTORY <name> '<key>'   what changed it and why
+    SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
     SHOW THING <name> CLOCK             the stamp a client holds after reading everything
     SHOW THING ALERTS [name]
@@ -636,6 +647,32 @@ The other statements:
 Results from Thing statements carry an extra `machine` column (this engine's
 short identity), because the same statements can be sent `ON <machine>` across
 a fleet.
+
+### Grain Things
+
+`CREATE THING <name> GRAIN KEY <column> READS <tables> [WATCH <table>(<column>)[, ...]] AS '<program>'`
+keeps a program's answer per key. The program defines `enroll()` (the keys that may be Things),
+`shared()` (what every key's answer depends on) and `things(keys, shared)` (a map of key to a map of values;
+a key it leaves out is not a Thing), and optionally `touched(table, op, before, after, shared)`, which says
+what a change to a table means: `nil`, a list of keys, `"all"`, or `{shared: true}`. A key's answer replaces
+the old one, so replaying after a crash lands on the same values. `SHOW THING <name>` reads them (a column
+per value). `apps/stickerfeed/things/sticker_item.gr` is a full one (50,000 rows kept for the sticker feed).
+
+`CREATE OR REPLACE THING <name> GRAIN ...` gives a grain Thing a new program without taking it away: the new
+version is built beside the old one (as `<name>~next`, paused but noting every change), its first pass runs with
+no statement lock held - the old Thing is read, and tables are written, all the while - and then it takes the
+name and follows the changes made meanwhile through its `touched()`. A version that does not load or build is
+refused and the old one stays. A program of several files is sent as one text: an app's deploy hook gives it
+`app_program("things/x.gr")`, the file with its imports in place (see `apps/stickerfeed/deployed.gr`), so the
+Thing runs the same functions as the service it serves.
+
+In the program: `read(sql, args...)` runs a SELECT inside the engine (each `?` takes the next argument; a
+list fills an `IN (?)`) and gives records with numbers as numbers; `read_raw(sql, args...)` is the same with
+every value as the text the wire would carry, for a port of code written against the wire. Every table either
+touches must be in `READS`. The builtins a program may name are fixed, as its answers must not depend on
+the clock or the machine: the text, list and math ones, `json_parse`, `json_stringify`, `sort_by`, `upper_rtrim`,
+`format`, the `regex_*` set (`regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split`), and the exact-decimal set (`decimal`, `dec_div`, `scale`, `decimal_prefix`, `round_sig`, `idiv`).
+The statement's quoting reads backslashes, so a program written for it has none (`chr(9)`, not `"\t"`).
 
 ### Conflicts: `SOURCE BY` keeps both sides
 
@@ -1208,6 +1245,35 @@ files runs beside the statements, and the store a restart loads is
 byte-for-byte what a full copy would have written (checked by checksumming
 every column before a kill -9 and after the restart, pool on and off).
 
+A big table that only had rows deleted or cells changed is not copied
+whole either. Each table keeps a journal of its writes since the last
+checkpoint: the rows a statement erased, the cells it set, the rows it
+appended. At the checkpoint those writes go onto the end of the table's
+file as one part (a "part of writes", checked by its own hash), with the
+manifest recording the file's new valid length. A restart loads the
+file's image and replays its parts in order through the table's own
+erase, set and append paths. The journal is dropped, and the table written
+whole as before, when any of these holds:
+
+- the table changed in a way the journal does not record (TRUNCATE, or
+  anything else that rewrites it other than by erase, set and append);
+- the journal passed 64 MB;
+- the rows appended as parts, or the rows erased and cells set as parts,
+  would pass a quarter of the rows the file was written with (at least
+  50,000);
+- the file already holds 64 parts.
+
+Maintenance that only changes how a column is held (narrowed codes, a
+coded dictionary) does not drop it, since it changes no values.
+`AIOS_STORE_NO_OPS_PARTS=1` turns this off. A table whose file already
+holds parts of writes is then written whole at the next checkpoint, even
+if nothing changed it, so a store can go back to a binary that predates
+parts of writes: start once with the setting, let one checkpoint run
+(or shut down cleanly), and the files are whole again.
+`tools/asql-ops-parts-check.cpp` covers deletes, updates, writes to rows
+an append part added, an unrecorded write, 70 checkpoints in a row, a
+second reopen, and the fold back with the setting.
+
 The log is written into space set aside ahead of it: a fresh `redo.log`
 is preallocated to the log's maximum (64 MB, `fallocate`) and each record
 is written at the log's offset, so a COMMIT's `fdatasync` flushes data
@@ -1497,6 +1563,13 @@ These worked over the wire:
 
 `DECIMAL` keeps its declared scale: a `DECIMAL(10,4)` 12.5 reads back
 `12.5000`.
+
+- **DATETIME and DATE comparisons.** Comparisons against text literals accept
+  all truncated datetime shapes supported by MariaDB (`YYYY-MM-DD HH:MM:SS`,
+  `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH`, `YYYY-MM-DD`, with or without `T`, and
+  fractional seconds). Omitted time components default to zero (`17:00` parses
+  as `17:00:00`), properly matching datetime and date values rather than
+  degrading to text-as-number comparisons (`tools/asql-datetime-literal-check.cpp`).
 
 ### Window functions
 

@@ -13,6 +13,8 @@
 #include <ctime>
 #include <iomanip>
 #include <cstdio>
+#include <atomic>
+#include <csignal>
 #include <cstdlib>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -110,6 +112,8 @@ extern "C" [[noreturn]] void metal_power_off();
 #include "../tools/aios-git/git_cli.hpp"
 #include <sstream>
 #include <unistd.h>
+#include "aios/core/base64.hpp"
+#include "aios/userland/grain_app.hpp"
 #include <algorithm>
 #include <functional>
 
@@ -1064,7 +1068,146 @@ void cmd_js(Ctx& c, const Args& a) {
   if (!out.empty() && out.back() != '\n') c.o << "\n";
 }
 
+// ---- grain apps (aios/userland/grain_app.hpp) ----
+//
+// The same apps grain hosts on its own, hosted by this kernel (`serve`) and kept under <root>/apps in grain's own
+// layout: a host's directory moves between a grain and an aios unchanged, and either's `app` command manages
+// either's host. What aios adds is the fleet: `app ... on <member>` / `on ALL` is carried by the node link.
+
+std::atomic<bool> g_serve_stop{false};   // SIGTERM / SIGINT end `serve`, its apps first
+void serve_stop_signal(int) { g_serve_stop.store(true); }
+
+std::string apps_home(Kernel& k) { return k.config().root + "/apps"; }
+
+std::vector<std::string> aios_app_caps() { return {"grain", "http", "db", "files", "process", "aios", "sql", "fleet"}; }
+
+userland::grain::apps::AppCommandEnv aios_app_env(Kernel& k) {
+  userland::grain::apps::AppCommandEnv env;
+  env.home = apps_home(k);
+  env.setup_vm = [&k](userland::grain::Vm& vm) { setup_app_vm(k, vm); };
+  env.capabilities = aios_app_caps();
+  return env;
+}
+
+// What a grain app command answers, here: its output and exit status.
+int run_app_line(Kernel& k, const std::vector<std::string>& args, std::string& out) {
+  std::ostringstream o, e;
+  const int rc = userland::grain::apps::run_app_command(k.host(), args, aios_app_env(k), o, e);
+  out = o.str() + e.str();
+  return rc;
+}
+
+// The words that make `app` a grain-app command (the rest are the packaged services `app` has always managed).
+bool grain_app_word(const std::string& w) {
+  static const char* words[] = {"deploy", "status", "logs", "rollback", "versions", "restart", "set", "unset", "secret",
+                                "settings", "secrets", "check", "pack", "run", "hosts", "add-host", "help"};
+  for (const char* x : words) if (w == x) return true;
+  return false;
+}
+
+bool is_grain_app(Kernel& k, const std::string& name) {
+  return !name.empty() && k.host().exists(apps_home(k) + "/apps/" + name + "/record.json");
+}
+
+// `app ...`: on this machine's host, a host named in <root>/apps/hosts.json, or fleet members (`on <member>|ALL`).
+void grain_app_command(Ctx& c, const Args& a) {
+  std::vector<std::string> args(a.begin() + 1, a.end());
+  for (auto& x : args) x = c.r.expand(x);
+  // `on X` where X is the fleet (ALL) or one of its members: the node link carries the command there
+  std::string on;
+  size_t on_at = args.size();
+  for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == "on") { on = args[i + 1]; on_at = i; }
+  std::vector<Id128> peers;
+  if (!on.empty() && c.k.in_fleet()) {
+    for (auto& id : c.k.fleet_roster())
+      if (on == "ALL" || on == "all" || id.str().compare(0, on.size(), on) == 0) peers.push_back(id);
+  }
+  if (peers.empty() && (on == "ALL" || on == "all")) on.clear();   // ALL without a fleet: this machine
+  if (peers.empty()) {
+    if (on.empty() && on_at < args.size()) args.erase(args.begin() + (long)on_at, args.begin() + (long)on_at + 2);
+    std::string out;
+    const int rc = run_app_line(c.k, args, out);
+    c.o << out;
+    if (rc != 0) fail(Status::IoError, "app " + (args.empty() ? std::string() : args[0]) + " failed");
+    return;
+  }
+  args.erase(args.begin() + (long)on_at, args.begin() + (long)on_at + 2);
+  // A deploy is packed here, where its directory is, and sent whole.
+  if (!args.empty() && args[0] == "deploy" && args.size() > 1 && args[1].rfind("@bundle:", 0) != 0) {
+    auto b = need(userland::grain::apps::pack_dir(c.k.host(), args[1]));
+    need(userland::grain::apps::compile_all(b));
+    const std::string enc = b.encode();
+    args[1] = "@bundle:" + aios::base64_encode(ByteSpan(reinterpret_cast<const uint8_t*>(enc.data()), enc.size()));
+  }
+  std::string line = "app";
+  for (const auto& x : args) line += " " + x;
+  bool any_failed = false;
+  if ((on == "ALL" || on == "all") && c.k.host().exists(apps_home(c.k) + "/host.key")) {   // this machine too, if it hosts apps
+    std::string out;
+    c.o << "== " << c.k.self().short_str() << " (this machine)\n";
+    if (run_app_line(c.k, args, out) != 0) any_failed = true;
+    c.o << out;
+  }
+  for (const auto& id : peers) {
+    c.o << "== " << id.short_str() << "\n";
+    auto at = c.k.reach(id);
+    for (int tries = 0; !at.ok() && tries < 5; ++tries) { hal::sleep_ms(1000); at = c.k.reach(id); }   // a member just (re)started
+    if (!at.ok()) { c.o << "  cannot reach it: " << at.error().message << "\n"; any_failed = true; continue; }
+    auto res = c.k.nodes()[*at]->command(line);
+    if (!res.ok()) { c.o << "  " << res.error().message << "\n"; any_failed = true; continue; }
+    c.o << res->second;
+    if (!res->second.empty() && res->second.back() != '\n') c.o << "\n";
+    if (res->first != 0) any_failed = true;
+  }
+  if (any_failed) fail(Status::IoError, "app " + (args.empty() ? std::string() : args[0]) + " did not succeed everywhere");
+}
+
+// serve [port=7480] [all-ips=1]: this machine's app host. Runs until stopped (SIGTERM), its apps with it.
+void cmd_serve(Ctx& c, const Args& a) {
+  namespace ga = userland::grain::apps;
+  const std::string home = apps_home(c.k);
+  auto token = need(ga::host_token(c.k.host(), home));
+  auto store = ga::make_dir_store(c.k.host(), home);
+  ga::Host apps(c.k.host(), *store, {[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str()});
+  ga::ControlServer control(c.k.host(), apps, token);
+  const uint16_t port = has_kv(a, "port") ? (uint16_t)to_u64(kv(a, "port")) : 7480;
+  const bool all_ips = has_kv(a, "all-ips") && kv(a, "all-ips") != "0";
+  auto bound = need(control.listen(port, !all_ips));
+  const std::string ps = std::to_string(bound) + "\n";
+  (void)c.k.host().write_file(home + "/host.port", ByteSpan(reinterpret_cast<const uint8_t*>(ps.data()), ps.size()));   // host-io: the app host's port, beside its key, for `app` on this machine to find it
+  apps.start_all();
+  // Fleet members ask this host about its apps over the node link; any other line is what it was before.
+  auto runner = [&c](const std::string& line, std::string& out) -> int {
+    if (line.rfind("app ", 0) == 0 || line == "app") {
+      auto words = userland::split_command(line);
+      return run_app_line(c.k, std::vector<std::string>(words.begin() + 1, words.end()), out);
+    }
+    return execute_host_command(line, out);
+  };
+  if (c.k.service()) c.k.service()->set_command_runner(runner);
+  if (c.k.relay()) c.k.relay()->set_command_runner(runner);
+  // (straight out: this command does not return, and what it says belongs in the service's log now)
+  std::cout << "serve: " << store->apps().size() << " app(s) in " << home << "; control on " << (all_ips ? "all IPs" : "127.0.0.1") << " port " << bound
+            << (c.k.in_fleet() ? "; fleet members reach it as `app ... on " + c.k.self().short_str() + "`" : std::string()) << "\n" << std::flush;
+  g_serve_stop.store(false);
+  std::signal(SIGTERM, serve_stop_signal);
+  std::signal(SIGINT, serve_stop_signal);
+  while (!g_serve_stop.load()) hal::sleep_ms(200);
+  apps.shutdown();
+  control.close();
+  std::cout << "serve: stopped\n" << std::flush;
+  std::_Exit(0);
+}
+
 void cmd_app(Ctx& c, const Args& a) {
+  {   // grain apps first: their words, or start/stop/remove of an app this machine's host has
+    const std::string w = a.size() > 1 ? a[1] : "";
+    const bool on_fleet = std::find(a.begin(), a.end(), std::string("on")) != a.end();
+    if (grain_app_word(w) || ((w == "start" || w == "stop" || w == "remove") && a.size() > 2 && (is_grain_app(c.k, a[2]) || on_fleet))) {
+      grain_app_command(c, a);
+      return;
+    }
+  }
   const std::string usage =
       "app list | app install <name> | app add <name> \"<command>\" url=<url> [dir=<path>] [env=K=V] [atboot] | "
       "app start <name> | app stop <name> | app open <name> | app remove <name>";
@@ -2492,6 +2635,11 @@ void cmd_graph(Ctx& c, const Args& a) {
 // one JSON request at a time, and each request runs as a graph through the
 // scheduler. `compute kernels` only registers the ERP kernels on the CPU
 // devices, for a graph built by hand with kernel=erp.tsp_exact.
+namespace {
+std::atomic<bool> g_compute_stop{false};
+void compute_stop_signal(int) { g_compute_stop.store(true); }
+}  // namespace
+
 void cmd_compute(Ctx& c, const Args& a) {
   if (a.size() < 2) fail(Status::Invalid, "compute kernels | compute serve [port=7311] [lanes=N] [max_points=15] [token=T] [public=1] [sql=1] [sql_db=sql_db] [cdc_host=H cdc_port=P cdc_user=U cdc_pass=PW cdc_db=DB cdc_tables=t1,t2,... cdc_log_file=F cdc_log_pos=N]");
   const std::string& sub = a[1];
@@ -2809,7 +2957,21 @@ void cmd_compute(Ctx& c, const Args& a) {
       }
     }
     c.o << "compute service as entity " << e.short_str() << " over " << n << " cpu device(s); kernels: " << erp::kTspExactKernel << ", " << erp::kRouteImproveKernel << ", " << erp::kPoolGreedyKernel << sql_status << "\n";
-    need(channel::compute_serve(c.k, w, o, log, nullptr, sql_db.get()));
+    // SIGTERM (systemd stop, a deploy) ends the service by writing the store out first, so the next start finds
+    // no redo log to replay: the records of the last few minutes took a second and a half to replay on chi-il-1,
+    // on every restart.
+    g_compute_stop.store(false);
+    std::signal(SIGTERM, compute_stop_signal);
+    std::signal(SIGINT, compute_stop_signal);
+    need(channel::compute_serve(c.k, w, o, log, &g_compute_stop, sql_db.get()));
+    if (sql_db && g_compute_stop.load()) {
+      const uint64_t t0 = c.k.host().monotonic_ns();
+      auto flushed = sql_db->flush_for_exit();
+      c.o << "compute sql: " << (flushed.ok() ? "store written" : "store NOT written (" + flushed.error().message + ")") << " in "
+          << fmt_double((double)(c.k.host().monotonic_ns() - t0) / 1e9, 6, true, 2) << " s; stopping\n";
+      std::cout.flush();
+      std::_Exit(flushed.ok() ? 0 : 1);   // the threads the engine started are not waited for one by one
+    }
     return;
   }
   fail(Status::Invalid, "unknown: compute " + sub);
@@ -10441,6 +10603,7 @@ Result<void> run_line(Session& s, const std::string& raw) {
     else if (cmd == "daemon") cmd_daemon(c, a);
     else if (cmd == "keys" || cmd == "keybindings" || cmd == "keymap") cmd_keys(c, a);
     else if (cmd == "app" || cmd == "apps") cmd_app(c, a);
+    else if (cmd == "serve") cmd_serve(c, a);
     else if (cmd == "js" || cmd == "javascript") cmd_js(c, a);
     else if (cmd == "miner" || cmd == "mine") cmd_miner(c, a);
     else if (cmd == "btc" || cmd == "bitcoin") cmd_chain(c, a);   // the Bitcoin chain client, not the hashing exercise

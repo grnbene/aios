@@ -119,7 +119,7 @@ class Pool {
 size_t next_instruction(const Chunk& c, size_t at) {
   switch ((Op)c.code[at]) {
     case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-    case Op::FieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
     case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
       return at + 3;
     case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:
@@ -167,21 +167,28 @@ class Copier {
         auto dst = std::make_shared<ListObj>(std::vector<Value>{});
         seen_[src] = dst;
         dst->items.resize(src->items.size());
-        for (size_t i = 0; i < src->items.size(); ++i)
+        bool has_c = false;
+        for (size_t i = 0; i < src->items.size(); ++i) {
           if (!value(src->items[i], dst->items[i], error)) return false;
+          if (dst->items[i].is_container()) has_c = true;
+        }
         out = Value::object(Type::List, dst);
+        if (has_c) into_.track_container(dst);
         return true;
       }
       case Type::Map: {
         auto src = static_cast<const MapObj*>(v.obj.get());
         auto dst = std::make_shared<MapObj>();
         seen_[src] = dst;
+        bool has_c = false;
         for (const auto& [k, item] : src->entries) {
           Value c;
           if (!value(item, c, error)) return false;
+          if (c.is_container()) has_c = true;
           dst->put(k, std::move(c));
         }
         out = Value::object(Type::Map, dst);
+        if (has_c) into_.track_container(dst);
         return true;
       }
       case Type::Bytes: {
@@ -213,6 +220,7 @@ class Copier {
             dst->upvalues.push_back(copy);
           }
           made = dst;
+          into_.track_container(dst);
         }
         out = Value::object(Type::Fn, made);
         return true;
@@ -312,6 +320,9 @@ std::unique_ptr<Vm> make_worker(Vm& parent, std::vector<std::string>* sink) {
   w->files = parent.files;
   w->step_limit = parent.step_limit;
   w->jit_enabled = parent.jit_enabled;
+  w->settings = parent.settings;
+  w->on_print = parent.on_print;
+  w->stop_flag = parent.stop_flag;
   w->sink = sink;
   for (const auto& name : parent.global_names()) {
     Value* g = parent.find_global(name);

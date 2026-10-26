@@ -51,6 +51,12 @@ kernel's node list (`node list`). These features are **relay only**: the
 roster, `fleet run`, `sql_on()` and the Things' `ON <machine>`/`ON ALL`,
 mirrors, and automatic re-dial of a dropped link (`Kernel::fleet_sync`).
 
+- **Link compression.** Direct node links and fleet relay circuits negotiate
+  stream deflate (`kFeatDeflate`) during secure handshake (`src/fleet/relay.cpp`,
+  `src/node/secure.cpp`). When both peers advertise the feature, frames are
+  transparently compressed (`Link::set_compress(true)`), saving bandwidth
+  across the WAN mesh.
+
 ---
 
 ## Membership and trust
@@ -1008,3 +1014,21 @@ Unit files and the conf itself are covered in
 [asql.md](asql.md#running-it-as-a-service).
 
 ---
+
+## Grain applications on the fleet
+
+See [Hosting applications with AIOS](aios-serve.md), [Running and managing Grain applications](grain-apps.md), and [Writing Grain applications](grain-app-writing.md).
+
+AIOS nodes host Grain applications with the `serve` command (sharing layouts and architecture with standalone `grain host`: see [grain/README.md](../grain/README.md#services-and-apps-grain-host-and-grain-app)). Data and release archives live under `<root>/apps`, and control listens on port 7480. When attached to the fleet hub, `serve` accepts commands routed directly over the cluster mesh, so any authorized member can manage deployments across the fleet:
+
+```bash
+aios --root /opt/aios/apps-root exec "serve port=7480"           # run supervisor (or via systemd)
+app deploy apps/stickerfeed on 7c513d4f845a                       # package locally and deploy over fleet mesh
+app status on ALL                                                 # status across all hosting fleet nodes
+app logs stickerfeed on 7c51                                      # stream logs (node ID prefix matches)
+app rollback stickerfeed on 7c51                                  # instant rollback on target member
+```
+
+Without `on`, `app` commands target the local machine (or use `at <host:port> key=@file` to reach standalone Grain hosts). App VMs hosted under AIOS get full access to kernel features—local SQL (`sql()`), cross-fleet queries (`sql_on()`), `sys`, local files, HTTP, and sockets—as well as Grain's standard database client, keeping apps portable between standalone and fleet machines.
+
+**Production deployment on chi-il-1 (2026-10-24)**: `aios-apps.service` runs `aios --root /opt/aios/apps-root exec "serve port=7480"` as user `aios`, joined to the fleet hub (`AIOS_FLEET_HUB` and `AIOS_FLEET_KEY` from `/etc/aios/apps-fleet.env`). The stickerfeed application was deployed remotely via the hub mesh. A release candidate with an invalid status check was automatically rejected and discarded while 112 concurrent pulls to `/feed` succeeded without interruption; the subsequent valid release performed seamless socket handover, and its `deployed.gr` hook updated the `sticker_item` ASQL Thing in place (`SHOW THING` continuously returned all 49,799 rows within 409 ms throughout the rebuild, cleanly incorporating concurrent stock updates).

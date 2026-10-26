@@ -1,0 +1,9 @@
+fn add(a, b) {
+  let total = a + b
+  return total
+}
+let n = 0
+for i in 0..3 {
+  n = add(n, i)
+}
+print(n)

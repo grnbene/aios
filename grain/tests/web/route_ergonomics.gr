@@ -1,0 +1,90 @@
+serve_routes({
+  "GET /items": fn (req) {
+    let filter = req.query_params?.filter
+    let page = req.query_params?.page
+    return res_json({
+      "action": "list",
+      "filter": filter,
+      "page": page
+    })
+  },
+
+  "POST /items": fn (req) {
+    let item = req.json
+    return res_json({
+      "created": true,
+      "item": item
+    }, 201, {"X-Resource-Id": "1234"})
+  },
+
+  "GET /items/:id": fn (req) {
+    let id = req.params?.id
+    return res_json({
+      "id": id,
+      "found": true
+    })
+  },
+
+  "GET /files/*path": fn (req) {
+    let path = req.params?.path
+    return res_text("File content at " + path, 200, {"Content-Type": "text/plain; charset=utf-8"})
+  },
+
+  "GET /redirect": fn (req) {
+    return res_redirect("/target", 302)
+  },
+
+  "POST /error": fn (req) {
+    return res_error(422, "Validation failed")
+  },
+
+  "GET /events": fn (req) {
+    return res_sse([
+      {"event": "ping", "data": "pong"},
+      {"data": {"status": "ok"}}
+    ])
+  },
+
+  "GET /stream/feed": fn (req, writer) {
+    writer.write_sse({"event": "progress", "data": {"step": 1}})
+    sleep(50)
+    writer.write_sse({"event": "progress", "data": {"step": 2}})
+    sleep(50)
+    writer.write_sse({"event": "done", "data": "finished"})
+  },
+
+  "GET /stream/tail": fn (req) {
+    req.writer.write("log line 1\n")
+    sleep(50)
+    req.writer.write("log line 2\n")
+  },
+
+  "GET /secure": fn (req) {
+    return res_json({
+      "user": req.user,
+      "authorized": true
+    })
+  }
+}, [
+  # Middleware 1, outermost: add a header to every response, including one another middleware cut short
+  fn (req, next) {
+    let res = next(req)
+    if type(res) == "map" {
+      if not has(res, "headers") or type(res.headers) != "map" {
+        res.headers = {}
+      }
+      res.headers["X-Middleware-Applied"] = "1"
+    }
+    return res
+  },
+  # Middleware 2, inside the first: auth check for /secure (a 401 from here still passes back out through the first)
+  fn (req, next) {
+    if req.path == "/secure" and req.headers?.authorization != "Bearer secret" {
+      return res_error(401, "unauthorized")
+    }
+    if req.path == "/secure" {
+      req.user = "admin"
+    }
+    return next(req)
+  }
+])

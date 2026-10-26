@@ -1,5 +1,6 @@
 #!/bin/bash
-# grain's AArch64 native code vs its interpreter, on this (x86) machine.
+# grain's native code vs its interpreter: AArch64's under qemu on this (x86) machine, or with --x86 the x86-64
+# compiler's, built for and run on this machine.
 #
 # Builds grain for aarch64 Linux and runs it under qemu-aarch64-static: every
 # example and every program in cases/ runs twice - native code, then
@@ -10,19 +11,31 @@
 #
 #   tools/grain-jit/check.sh            build + compare
 #   tools/grain-jit/check.sh --no-build compare with the last build
-# Needs: aarch64-linux-gnu-g++, qemu-user-static.
+#   tools/grain-jit/check.sh --x86 <grain build dir>   the x86-64 compiler (grain_jit_x64.cpp), natively: the
+#                                       runner linked against that build's libgrain_lang.a (cmake -S grain -B <dir>)
+# Needs: aarch64-linux-gnu-g++, qemu-user-static (not for --x86).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 S="$(cd "$here/../.." && pwd)"
 out="${GRAIN_JIT_OUT:-/tmp/grain-jit-check}"
-mkdir -p "$out"
 CXX=aarch64-linux-gnu-g++
+RUN=qemu-aarch64-static
+lib=
+if [ "${1:-}" = "--x86" ]; then
+  CXX=g++; RUN=; out="$out-x86"; lib="${2:?--x86 wants the grain build directory}/libgrain_lang.a"; shift 2
+  [ -f "$lib" ] || { echo "no $lib (cmake --build the grain directory first)"; exit 1; }
+fi
+mkdir -p "$out"
 FLAGS=(-std=c++20 -O2 -I"$S/include" -I"$S/src/userland" -I"$S/src")
-if [ "${1:-}" != "--no-build" ]; then
+if [ -n "$lib" ]; then
+  $CXX "${FLAGS[@]}" -c "$here/runner.cpp" -o "$out/runner.o" && $CXX -o "$out/gr" "$out/runner.o" "$lib" -ldl -lpthread -lrt ||
+    { echo "link failed"; exit 1; }
+elif [ "${1:-}" != "--no-build" ]; then
   # The portable standard library only (install_core_builtins): nothing here
   # reaches the sidecar, SQL or the MariaDB client, so everything links.
   srcs=(src/userland/grain_lexer src/userland/grain_parser src/userland/grain_compiler src/userland/grain_vm
-        src/userland/grain_jit_arm64 src/userland/grain_builtins src/userland/grain_std_hash
+        src/userland/grain_jit_arm64 src/userland/grain_jit_x64 src/userland/grain_builtins src/userland/grain_std_hash
+        src/userland/grain_std_decimal src/core/ids
         src/userland/font_atlas src/userland/glyph_engine src/hal/posix_sync
         src/crypto/sha256 src/crypto/sha1 src/crypto/sha512 src/crypto/md5 src/crypto/keccak256 src/crypto/hmac_sha256)
   for f in "${srcs[@]}"; do $CXX "${FLAGS[@]}" -c "$S/$f.cpp" -o "$out/$(basename $f).o" & done
@@ -35,8 +48,8 @@ cd "$out"
 bad=0
 for f in "$S"/examples/grain/{tour,closures,words,fib,selftest,bench}.gr "$here"/cases/*.gr; do
   n=$(basename "$f" .gr)
-  GRAIN_LEAKS=1 qemu-aarch64-static ./gr "$f" > "native.$n" 2> "native.$n.err"; echo "exit $?" >> "native.$n"
-  GRAIN_LEAKS=1 GRAIN_NOJIT=1 qemu-aarch64-static ./gr "$f" > "interp.$n" 2> "interp.$n.err"; echo "exit $?" >> "interp.$n"
+  GRAIN_LEAKS=1 $RUN ./gr "$f" > "native.$n" 2> "native.$n.err"; echo "exit $?" >> "native.$n"
+  GRAIN_LEAKS=1 GRAIN_NOJIT=1 $RUN ./gr "$f" > "interp.$n" 2> "interp.$n.err"; echo "exit $?" >> "interp.$n"
   d=$(diff <(grep -av " ms" "interp.$n") <(grep -av " ms" "native.$n") | grep -c '^[<>]')
   ln=$(grep -a live "native.$n.err" | sed 's/.*: //'); li=$(grep -a live "interp.$n.err" | sed 's/.*: //')
   status=ok; { [ "$d" != 0 ] || [ "$ln" != 0 ] || [ "$li" != 0 ]; } && { status=FAIL; bad=1; }

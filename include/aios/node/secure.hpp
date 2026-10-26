@@ -32,11 +32,16 @@ class Link {
   virtual bool send(uint8_t type, ByteSpan payload) = 0;
   virtual bool recv(uint8_t& type, ByteBuffer& payload, int timeout_ms) = 0;
   virtual std::string peer() const = 0;
+  // The peer reads deflated frames (it advertised nodeproto::kFeatDeflate): large frames go compressed from here on.
+  virtual void set_compress(bool) {}
 };
 std::unique_ptr<Link> make_plain_link(std::shared_ptr<hal::Connection> c);
 // Wraps a link: every frame becomes one encrypted frame; sequence numbers must increase.
 std::unique_ptr<Link> make_secure_link(std::shared_ptr<hal::Connection> c, const crypto::Key& session, bool initiator);
 // Handshake (both directions authenticate the token; derives the session key).
+// This side's handshake payload feature word (kFeatureMagic + bits) and whether a peer's payload advertises deflate.
+ByteBuffer link_feature_payload();
+bool link_peer_deflates(ByteSpan payload);
 Result<crypto::Key> secure_handshake_initiator(Link& plain, const std::string& token, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);
 Result<crypto::Key> secure_handshake_responder(Link& plain, const std::string& token, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);
 Result<crypto::Key> secure_handshake_responder_any(Link& plain, const std::vector<std::string>& tokens, hal::Host& host, const Id128& my_kernel, Id128& peer_kernel, ByteBuffer& peer_hello_payload, ByteSpan my_hello_payload);

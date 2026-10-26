@@ -58,9 +58,22 @@ grain_case(cli.stdlib WRITES:${CLI_CASES} 0 run stdlib.gr)
 grain_case(cli.exec ${CLI_CASES} 0 run exec.gr)
 grain_case(cli.decimal ${CLI_CASES} 0 run decimal.gr)                    # decimals, string escapes, a..b, utf8_valid
 grain_case(cli.decimal.interp ${CLI_CASES} 0 --no-jit run decimal.gr)
+
+# grain debug, driven by a typed script: a breakpoint in a loop fires every time round, and a function's locals have their names
+function(grain_cli_case name workdir status input)
+  add_test(NAME grain.${name}
+    COMMAND ${CMAKE_COMMAND} -DGRAIN=$<TARGET_FILE:grain> "-DARGS=${ARGN}" -DWORKDIR=${workdir} -DINPUT=${input}
+            -DEXPECTED=${EXPECTED_DIR}/${name}.out -DACTUAL=${CMAKE_CURRENT_BINARY_DIR}/actual/${name}.out
+            -DSTATUS=${status} -P ${RUNNER})
+endfunction()
+grain_cli_case(cli.debug ${CLI_CASES} 0 ${CLI_CASES}/dbg_loop.in debug@@dbg_loop.gr)
+# grain pkg check follows imports: one that names no file fails the check
+grain_cli_case(cli.pkg.ok ${CLI_CASES}/pkg_ok 0 /dev/null pkg@@check)
+grain_cli_case(cli.pkg.missing_import ${CLI_CASES}/pkg_bad 2 /dev/null pkg@@check)
 grain_case(cli.db_quote ${CLI_CASES} 0 run db_quote.gr)
 grain_case(cli.modules ${CLI_CASES} 0 run modules.gr)                    # import
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
+grain_case(cli.lex_error ${CLI_CASES} 1 run lex_error.gr)             # the caret sits under the character the lexer refused
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
 grain_case(cli.parallel ${CLI_CASES} 0 run parallel.gr)                # parallel_map, spawn, await
 grain_case(cli.parallel.interp ${CLI_CASES} 0 --no-jit run parallel.gr)
@@ -72,6 +85,12 @@ grain_case(cli.missing_file ${CLI_CASES} 64 run no_such_file.gr)
 grain_case(cli.unknown_command ${CLI_CASES} 64 frobnicate)
 grain_case(cli.version ${CLI_CASES} 0 version)
 grain_case(cli.dis ${CLI_CASES} 0 dis args.gr)
+
+add_test(NAME grain.lang.enhancements COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_enhancements.gr)
+add_test(NAME grain.lang.modules COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_modules.gr)
+add_test(NAME grain.lang.crypto COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_crypto.gr)
+add_test(NAME grain.lang.maps COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_maps.gr)
+add_test(NAME grain.lang.adv_features COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_adv_features.gr)
 
 
 # The HTTP client against a local server (tests/net): needs Python 3 to run the
@@ -147,6 +166,8 @@ if(NOT WIN32 AND Python3_Interpreter_FOUND)
   set_tests_properties(grain.web.ui PROPERTIES TIMEOUT 60)
   add_test(NAME grain.web.api COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/api_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/api.gr)
   set_tests_properties(grain.web.api PROPERTIES TIMEOUT 60)
+  add_test(NAME grain.web.route_ergonomics COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/route_ergonomics_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/route_ergonomics.gr)
+  set_tests_properties(grain.web.route_ergonomics PROPERTIES TIMEOUT 60)
   add_test(NAME grain.web.native_client COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/native_client_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr)
   set_tests_properties(grain.web.native_client PROPERTIES TIMEOUT 120)
   add_test(NAME grain.web.widgets COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/widgets_test.py $<TARGET_FILE:grain> ${CMAKE_CURRENT_SOURCE_DIR}/../examples/widgets.gr)

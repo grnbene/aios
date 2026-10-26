@@ -1,3 +1,5 @@
-e2.gr:1: step limit of 200000000 reached
-  in spin (line 1)
-  from e2.gr (line 2)
+e2.gr:1:36: step limit of 200000000 reached
+fn spin() { let i = 0 while true { i = i + 1 } }
+                                   ^
+  in spin (line 1:36)
+  from e2.gr (line 2:1)

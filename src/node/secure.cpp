@@ -1,4 +1,6 @@
 #include "aios/node/secure.hpp"
+#include "aios/core/bytes.hpp"
+#include "aios/net/deflate.hpp"
 #include "protocol.hpp"
 #include "aios/hal/host.hpp"
 #include <cstring>
@@ -115,20 +117,49 @@ class PlainLink final : public Link {
   std::shared_ptr<hal::Connection> c_;
 };
 constexpr uint8_t ENCRYPTED = 0x7E;
+constexpr uint8_t ENCRYPTED_DEFLATED = 0x7D;   // the plaintext is u32 raw size + raw-deflate of (type byte + payload)
+constexpr size_t kDeflateFrom = 32u << 10;
+constexpr uint64_t kInflateMax = 2ull << 30;   // a frame claiming more than 2 GB raw is refused
+// The tree's own DEFLATE (net/deflate.cpp): nothing linked. Level 1: the link's job is to go fast, and JSON still
+// shrinks to a fraction at it.
+bool deflate_frame(const ByteBuffer& pt, ByteBuffer* out) {
+  out->clear();
+  out->reserve(pt.size() / 4 + 64);
+  const uint32_t raw = (uint32_t)pt.size();
+  for (int i = 0; i < 4; ++i) out->push_back((uint8_t)(raw >> (8 * i)));
+  const size_t n = net::deflate_raw_append(ByteSpan(pt.data(), pt.size()), 1, *out);
+  return n > 0 && n + 4 < pt.size() - pt.size() / 10;   // not worth it unless a tenth smaller: sent as it is
+}
+bool inflate_frame(ByteSpan z, ByteBuffer* out) {
+  if (z.size() < 4) return false;
+  uint64_t raw = 0;
+  for (int i = 0; i < 4; ++i) raw |= (uint64_t)z[i] << (8 * i);
+  if (raw == 0 || raw > kInflateMax) return false;
+  out->clear();
+  size_t end = 0;
+  std::string why;
+  return net::inflate_raw_tree(z, 4, *out, &end, (size_t)raw, &why) && out->size() == raw && end == z.size();
+}
 class SecureLink final : public Link {
  public:
   SecureLink(std::shared_ptr<hal::Connection> c, const crypto::Key& k, bool initiator) : c_(std::move(c)), key_(k), send_dir_(initiator ? 1 : 2), recv_dir_(initiator ? 2 : 1) {}
   bool send(uint8_t t, ByteSpan p) override {
     crypto::Nonce n{}; n[0] = send_dir_; uint64_t seq = ++send_seq_; for (int i = 0; i < 8; ++i) n[1 + i] = (uint8_t)(seq >> (8 * i));
     ByteBuffer pt; pt.push_back(t); pt.insert(pt.end(), p.begin(), p.end());
+    // A large frame to a peer that reads them deflated goes deflated: an 11 MB JSON reply is ~1 MB on the wire.
+    uint8_t ft = ENCRYPTED;
+    if (compress_ && pt.size() >= kDeflateFrom) {
+      ByteBuffer z;
+      if (deflate_frame(pt, &z)) { pt.swap(z); ft = ENCRYPTED_DEFLATED; }
+    }
     uint8_t aad[9]; aad[0] = send_dir_; for (int i = 0; i < 8; ++i) aad[1 + i] = (uint8_t)(seq >> (8 * i));
     ByteBuffer ct = crypto::aead_encrypt(key_, n, ByteSpan(aad, 9), pt);
-    ByteBuffer frame; for (int i = 0; i < 8; ++i) frame.push_back((uint8_t)(seq >> (8 * i))); frame.insert(frame.end(), ct.begin(), ct.end());
-    return nodeproto::write_frame(*c_, ENCRYPTED, frame);
+    ByteBuffer frame; frame.reserve(8 + ct.size()); for (int i = 0; i < 8; ++i) frame.push_back((uint8_t)(seq >> (8 * i))); frame.insert(frame.end(), ct.begin(), ct.end());
+    return nodeproto::write_frame(*c_, ft, frame);
   }
   bool recv(uint8_t& t, ByteBuffer& p, int to) override {
     uint8_t ft; ByteBuffer frame;
-    if (!nodeproto::read_frame(*c_, ft, frame, to) || ft != ENCRYPTED || frame.size() < 8 + 17) return false;
+    if (!nodeproto::read_frame(*c_, ft, frame, to) || (ft != ENCRYPTED && ft != ENCRYPTED_DEFLATED) || frame.size() < 8 + 17) return false;
     uint64_t seq = 0; for (int i = 0; i < 8; ++i) seq |= (uint64_t)frame[i] << (8 * i);
     if (seq <= recv_seq_) return false;                       // replay or reorder: the link is dead
     crypto::Nonce n{}; n[0] = recv_dir_; for (int i = 0; i < 8; ++i) n[1 + i] = frame[i];
@@ -136,15 +167,23 @@ class SecureLink final : public Link {
     auto pt = crypto::aead_decrypt(key_, n, ByteSpan(aad, 9), ByteSpan(frame.data() + 8, frame.size() - 8));
     if (!pt.ok()) return false;
     recv_seq_ = seq;
+    if (ft == ENCRYPTED_DEFLATED) {
+      ByteBuffer raw;
+      if (!inflate_frame(ByteSpan(pt->data(), pt->size()), &raw) || raw.empty()) return false;
+      t = raw[0]; p.assign(raw.begin() + 1, raw.end());
+      return true;
+    }
     t = (*pt)[0]; p.assign(pt->begin() + 1, pt->end());
     return true;
   }
+  void set_compress(bool on) override { compress_ = on; }
   std::string peer() const override { return c_->peer(); }
  private:
   std::shared_ptr<hal::Connection> c_;
   crypto::Key key_;
   uint8_t send_dir_, recv_dir_;
   uint64_t send_seq_ = 0, recv_seq_ = 0;
+  bool compress_ = false;
 };
 constexpr uint8_t HS_INIT = 0x70, HS_RESP = 0x71;
 const char AAD_INIT[] = "aios-node-hello-initiator", AAD_RESP[] = "aios-node-hello-responder";
@@ -156,6 +195,23 @@ crypto::Key session_key(const crypto::Key& base, ByteSpan ri, ByteSpan rr) {
 }  // namespace
 
 std::unique_ptr<Link> make_plain_link(std::shared_ptr<hal::Connection> c) { return std::make_unique<PlainLink>(std::move(c)); }
+
+ByteBuffer link_feature_payload() {
+  ByteBuffer b; Writer w(b);
+  w.u32(nodeproto::kFeatureMagic);
+  w.u32(nodeproto::kFeatDeflate);
+  return b;
+}
+
+bool link_peer_deflates(ByteSpan payload) {
+  // The feature word is the payload's last 8 bytes when present ('FEAT' + bits): after a device list, or alone.
+  if (payload.size() < 8) return false;
+  const uint8_t* e = payload.data() + payload.size() - 8;
+  uint32_t magic = 0, bits = 0;
+  for (int i = 0; i < 4; ++i) { magic |= (uint32_t)e[i] << (8 * i); bits |= (uint32_t)e[4 + i] << (8 * i); }
+  return magic == nodeproto::kFeatureMagic && (bits & nodeproto::kFeatDeflate);
+}
+
 std::unique_ptr<Link> make_secure_link(std::shared_ptr<hal::Connection> c, const crypto::Key& k, bool initiator) { return std::make_unique<SecureLink>(std::move(c), k, initiator); }
 
 // Initiator: random ri; sends ri || AEAD_K(nonce ri[0..12], aad, my_kernel || payload).

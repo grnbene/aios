@@ -163,6 +163,41 @@ void settle(SqlDatabase& db) {
 
 }  // namespace
 
+// A dictionary column with 16-bit codes, each value on a few rows scattered through it: `v = x` must find every
+// one (read back from the store, then rows deleted: the codes are rewritten 8, 16 or 32 bits wide). The vectorized 16-bit compare once dropped half of each 64-row block's matches (its byte packing lost the
+// bits of rows 16-31 and 48-63 and mixed the rest), so most single matches read as no match.
+void make_wide_codes(SqlDatabase& db) {
+  exec(db, "CREATE TABLE widecodes (id INT NOT NULL, v VARCHAR(20))");
+  std::string batch;
+  for (int i = 0; i < 9000; ++i) {
+    batch += (batch.empty() ? "" : ",") + std::string("(") + std::to_string(i) + ",'val-" + std::to_string((i * 7) % 1000) + "')";
+    if (batch.size() > 50000 || i == 8999) { exec(db, "INSERT INTO widecodes VALUES " + batch); batch.clear(); }
+  }
+  settle(db);
+}
+
+void check_wide_codes(SqlDatabase& db) {
+  // a delete with more than 4,096 rows after it rewrites the packed codes at a byte width
+  exec(db, "INSERT INTO widecodes VALUES (50000, 'val-new')");
+  exec(db, "DELETE FROM widecodes WHERE id < 3 OR id = 50000");
+  const SqlTable* t = db.find_table("widecodes", "dictdb");
+  CHECK(t && t->col_data[1].encoding == ColumnEncoding::DictBitPacked && t->col_data[1].bit_width_ == 16,
+        "widecodes.v is not 16-bit dictionary codes (encoding %d, %u bits)", t ? (int)t->col_data[1].encoding : -1,
+        t ? (unsigned)t->col_data[1].bit_width_ : 0u);
+  int wrong = 0;
+  for (int k = 0; k < 1000; ++k) {
+    const std::string got = q1(db, "SELECT COUNT(*) FROM widecodes WHERE v = 'val-" + std::to_string(k) + "'");
+    const std::string ids = q1(db, "SELECT COUNT(id) FROM widecodes WHERE v = 'val-" + std::to_string(k) + "'");
+    const std::string want = (k == 0 || k == 7 || k == 14) ? "8" : "9";   // ids 0, 1, 2 held these and are gone
+    if (got != want || ids != want) {
+      if (++wrong <= 3) std::printf("  [FAIL] v = 'val-%d': COUNT(*) %s, COUNT(id) %s, want %s\n", k, got.c_str(), ids.c_str(), want.c_str());
+    }
+  }
+  CHECK(wrong == 0, "%d of 1000 values of a 16-bit dictionary column miscounted by `v = x`", wrong);
+  std::printf("  16-bit codes: %d of 1000 equality counts wrong\n", wrong);
+  exec(db, "DROP TABLE widecodes");
+}
+
 int main() {
   std::printf("=== ASQL dictionary maintenance check (narrowed codes, coded dictionaries) ===\n");
   setenv("AIOS_STORE_MAINTAIN_MS", "2000", 1);
@@ -205,6 +240,7 @@ int main() {
     CHECK(d.coded() && d.plain_bytes() == 0, "doc dictionary not coded (%zu of %zu)", d.coded_count(), d.size());
     CHECK(t->col_data[2].bit_width_ <= 8, "status codes still %u bits", (unsigned)t->col_data[2].bit_width_);
     verify(db, model, "maintained");
+    make_wide_codes(db);
 
     // Writes after: an existing document (no new entry), new ones (a plain
     // tail), NULLs, appends.
@@ -247,6 +283,7 @@ int main() {
     const SqlTable* t = db2.find_table("dictcheck", "dictdb");
     CHECK(t && t->col_data[1].dict.coded(), "the coded dictionary did not come back coded from the store");
     verify(db2, model, "read back from the store");
+    check_wide_codes(db2);
     Row r{99999, model[0].doc, "open"};
     model.push_back(r);
     exec(db2, "INSERT INTO dictcheck VALUES (99999," + quote(r.doc) + ",'open')");

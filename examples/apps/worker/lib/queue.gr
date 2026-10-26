@@ -1,0 +1,22 @@
+# Task processing library for worker example
+
+fn make_job(id, task_name) {
+  return {
+    "id": id,
+    "uuid": uuid_v4(),
+    "task": task_name,
+    "created_at": iso8601()
+  }
+}
+
+fn process_job(job) {
+  let { id, task } = job
+  let started = now()
+  let elapsed = now() - started
+  return {
+    "id": id,
+    "task": task,
+    "status": "completed",
+    "elapsed_s": elapsed
+  }
+}

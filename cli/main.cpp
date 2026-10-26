@@ -1,5 +1,9 @@
 // The Linux substrate's main: stdout as the sink, files from the filesystem,
 // aios-boot as the host tool when present. Nothing here is the command surface.
+#include <cstdlib>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "cli.hpp"
 #include "model_controller.h"
 #include "aios/userland/compositor.hpp"
@@ -100,6 +104,14 @@ static void pump_services(aios::cli::Session& s) {
 }
 
 int main(int argc, char** argv) {
+#if defined(__GLIBC__)
+  // A thread's heap grows a page at a time unless told otherwise, and a full feed spent a tenth of its time in
+  // mprotect doing it (measured on chi-il-1): grow in 16 MB steps. The pad is also what each thread's heap keeps
+  // when it is done, so it is paid once per arena for good: on chi's app host, under the same load, 64 MB held
+  // 1.4 GB afterwards for feeds 10% faster than 16 MB (240 MB); glibc's 128 KB held 34 MB for feeds 20% slower.
+  // MALLOC_TOP_PAD_ in the environment still wins.
+  if (!std::getenv("MALLOC_TOP_PAD_")) mallopt(M_TOP_PAD, 16 << 20);
+#endif
   std::string root = std::getenv("AIOS_ROOT") ? std::getenv("AIOS_ROOT") : "aios-root";
   std::vector<std::string> args;
   bool quiet = false;

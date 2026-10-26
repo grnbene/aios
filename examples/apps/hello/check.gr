@@ -1,0 +1,7 @@
+# Run after every deploy, against the version just started: true, or what is wrong.
+fn check(app) {
+  let r = http_get(app.url + "/")
+  if r.status != 200 { return "GET / answered " + str(r.status) }
+  if not contains(r.body, "greeting") { return "GET / has no greeting: " + r.body }
+  return true
+}

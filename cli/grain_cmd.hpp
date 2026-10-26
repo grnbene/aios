@@ -7,10 +7,13 @@
 #include <vector>
 
 #include "aios/kernel/kernel.hpp"
+#include "aios/userland/grain.hpp"
 #include "out.hpp"
 
 namespace aios::cli {
 
 Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>& a);
+// A hosted app's VM, as aios sets one up (`aios serve`, grain_app.hpp).
+void setup_app_vm(Kernel& k, userland::grain::Vm& vm);
 
 }  // namespace aios::cli

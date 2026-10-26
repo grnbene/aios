@@ -1,0 +1,63 @@
+Grain Debugger 0.1.0 — debugging dbg_loop.gr
+Type 'c' to continue, 's' to step, 'h' for help.
+
+[DEBUG] Paused at dbg_loop.gr:1
+ > 1 | fn add(a, b) {
+   2 |   let total = a + b
+   3 |   return total
+(grain-dbg) Breakpoint set at line 7
+(grain-dbg) Breakpoint set at line 3
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:7
+   5 | let n = 0
+   6 | for i in 0..3 {
+ > 7 |   n = add(n, i)
+   8 | }
+   9 | print(n)
+(grain-dbg) i = 0
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:3 in add
+   1 | fn add(a, b) {
+   2 |   let total = a + b
+ > 3 |   return total
+   4 | }
+   5 | let n = 0
+(grain-dbg) Locals in current frame:
+  a = 0
+  b = 0
+  total = 0
+(grain-dbg) total = 0
+(grain-dbg) Call stack:
+  #0 add at line 3
+  #1 dbg_loop.gr at line 7
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:7
+   5 | let n = 0
+   6 | for i in 0..3 {
+ > 7 |   n = add(n, i)
+   8 | }
+   9 | print(n)
+(grain-dbg) i = 1
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:3 in add
+   1 | fn add(a, b) {
+   2 |   let total = a + b
+ > 3 |   return total
+   4 | }
+   5 | let n = 0
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:7
+   5 | let n = 0
+   6 | for i in 0..3 {
+ > 7 |   n = add(n, i)
+   8 | }
+   9 | print(n)
+(grain-dbg) 
+[DEBUG] Paused at dbg_loop.gr:3 in add
+   1 | fn add(a, b) {
+   2 |   let total = a + b
+ > 3 |   return total
+   4 | }
+   5 | let n = 0
+(grain-dbg) 3
+[DEBUG] Program finished successfully.

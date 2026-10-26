@@ -709,6 +709,8 @@ class DictArena {
     dst = *this;
   }
   void push_back(std::string_view s);
+  // n entries as a table file stores them, each a little-endian u64 length and its bytes (`total` of them in all)
+  void push_back_stored(const uint8_t* run, uint64_t n, size_t total);
   // src's entry k, coded as it is there when this arena is still all coded
   // entries of the same coder (a compaction keeps them coded).
   void push_from(const DictArena& src, size_t k);
@@ -900,6 +902,15 @@ struct ColumnStore {
   // per-value truth tables) key on it, so an UPDATE of one column no longer
   // throws away every other column's index.
   uint64_t epoch = sql_next_mutation_seq();
+  // What a dictionary code's verdict on a predicate is cached under (the per-code truths): the epoch, except that a
+  // cell rewritten in place under the same codes (set(), nothing recoded) keeps the one before it - no code changed
+  // what it means, so no verdict did. A price UPDATE made the next `price > 0` decide all 300k prices again (12 ms).
+  uint64_t truth_epoch = 0, truth_epoch_at = ~0ull;
+  uint64_t truth_key() const { return truth_epoch_at == epoch ? truth_epoch : epoch; }
+  // The same for what is worked out per code and kept for codes that have rows only (each code's value, the
+  // dictionary's collation ranks): kept by an erase alone, since a rewrite in place can give a code its first row.
+  uint64_t codes_epoch = 0, codes_epoch_at = ~0ull;
+  uint64_t codes_key() const { return codes_epoch_at == epoch ? codes_epoch : epoch; }
 
   // Sorted dictionary for binary search & range scans:
   std::vector<uint32_t> sorted_dict_indices;
@@ -1564,6 +1575,37 @@ struct SqlTable {
   // Stamped by every write (sql_next_mutation_seq); the store checkpoint
   // compares it with the stamp of the file it last wrote for this table.
   uint64_t mutation_seq = 0;
+  // The writes since the table's file was last saved, in the order they were made, so a checkpoint can add them
+  // to the file as a part instead of writing the table whole (snapshot_tables_v4): rows erased (by their places
+  // then), cells set, rows appended (as stored). Only set_cell, erase_rows / erase_row and the appends record; a
+  // write that does not still stamps mutation_seq, and the journal is used only when its last recorded stamp is
+  // the table's current one and each record found the stamp the one before it left - anything else in between
+  // and the table is written whole, as before. On from the checkpoint that saved the table (journal_begin).
+  struct ChangeJournal {
+    struct Op {
+      uint8_t kind = 0;                  // 'E' erase rows, 'S' set a cell, 'A' append rows
+      std::vector<uint64_t> rows;        // E: the rows, ascending, numbered as they were
+      uint64_t row = 0;                  // S
+      uint32_t col = 0;                  // S
+      std::string val;                   // S: as stored
+      std::vector<std::string> cells;    // A: the rows appended, row-major, as stored
+    };
+    bool on = false;
+    bool broken = false;
+    uint64_t start_seq = 0;   // mutation_seq of the save it starts from
+    uint64_t last_seq = 0;    // mutation_seq the newest record left
+    size_t bytes = 0;
+    size_t cells = 0;         // rows erased + cells set: what a part would replay
+    std::vector<Op> ops;
+  };
+  ChangeJournal journal;
+  std::shared_ptr<aios::hal::Mutex> journal_mu = std::make_shared<aios::hal::Mutex>();
+  void journal_begin();
+  // A recorded write: `before` is mutation_seq as the write found it, `after` what it left.
+  void journal_note(uint64_t before, uint64_t after, ChangeJournal::Op&& op);
+  // A change of form, not of rows (stats refreshed, a dictionary compacted, the table re-encoded or packed):
+  // stamped as a write is, so a checkpoint saves it, while the journal stays good - its rows are the same rows.
+  void stamp_form_change();
   std::vector<size_t> cluster_columns() const;
   bool rows_in_key_order(const std::vector<size_t>& cols, size_t from = 0) const;
   std::vector<size_t> scan_order_key() const;   // see the .cpp
@@ -1666,6 +1708,14 @@ struct SqlTable {
   void reserve(size_t sz);
   // Re-encodes every column; `cluster` first sorts the rows into key order (cluster_by_key), which moves them.
   void optimize_storage(bool cluster = true);
+  // optimize_storage(false) in three steps, so the encoding itself holds no lock: take_encoding_copy (under the
+  // exclusive lock: the delta folded in, the columns copied), encode_columns (the copy, holding nothing), then
+  // install_encoding (under the exclusive lock again), which keeps the new columns only if no write came between
+  // - false, and the table as it was, when one did. A table whose columns share a dictionary is not copied (the
+  // copy would still share it with the live table): take_encoding_copy says false and it is re-encoded in place.
+  bool take_encoding_copy(std::vector<ColumnStore>* out, uint64_t* seq);
+  static void encode_columns(std::vector<ColumnStore>& cols, const std::vector<SqlColumn>& defs);
+  bool install_encoding(std::vector<ColumnStore>& cols, uint64_t seq);
   void cluster_by_key();
   void warm_up_all() const;
   // Caller already holds probe_mu. The budget sweep does, and probe_mu is not
@@ -1957,6 +2007,8 @@ class SqlDatabase {
   struct SavedTableFile {
     std::string file; uint64_t seq = 0; size_t rows = 0; uint64_t shape = 0; size_t bytes = 0; bool dense = false; uint64_t still_ns = 0;
     uint64_t layout = 0; size_t base_rows = 0; size_t part_rows = 0; uint64_t file_bytes = 0; uint32_t parts = 0;
+    uint32_t op_parts = 0;   // of the parts, those with erased rows or set cells (kOpsPartMagic)
+    size_t op_cells = 0;     // rows erased + cells set, over those parts
   };
   Result<void> save_tables_v4();
   bool load_tables_v4();
@@ -1972,7 +2024,15 @@ class SqlDatabase {
   // record one changed row. Ordinary statements now only append to the redo
   // log; this is what the interval, a shutdown, or an explicit CHECKPOINT runs.
   Result<void> flush_now();
+  // A checkpoint whose files are written off the statement lock (as a due checkpoint's are): the lock is held for
+  // the snapshot in memory only. False, and nothing done, while the last checkpoint's files are still being
+  // written - waiting for them under the lock is the stall this avoids; the caller asks again shortly.
+  bool flush_off_lock();
   Result<void> flush_locked();   // flush_now's body, for a caller already holding the exclusive statement lock
+  // flush_now for a process about to exit: what changed, in the fast form - no storage upkeep and no deflating of
+  // the tables gone still (the next checkpoint does those). A stop deflated the 2.2 GB audittrail: 38 s.
+  Result<void> flush_for_exit();
+  bool exit_flush_ = false;
   // Checkpoints off the lock (see "checkpoints off the lock" in sql_database.cpp).
   struct CheckpointImage {
     uint64_t gen = 0;
@@ -1983,6 +2043,9 @@ class SqlDatabase {
       // An append-only change: rows [rows_from, rows_to) as text, row-major
       // (rows * ncols cells), appended to the file as a part; cols stays empty.
       bool append = false; size_t rows_from = 0, rows_to = 0, ncols = 0; std::vector<std::string> part_cells;
+      // A change the table's journal holds: its writes in order (kOpsPartMagic), already serialized; appended
+      // to the file as a part the same way.
+      bool ops = false; std::vector<uint8_t> ops_plain;
     };
     std::vector<TableImage> tables;
     std::vector<uint8_t> manifest;
@@ -2146,6 +2209,11 @@ class SqlDatabase {
   // The replication stream's position after a committed transaction, logged
   // beside that transaction's statements so replay restores both together.
   void record_cdc_commit(const std::string& file, uint64_t pos);
+  // The Things, Cells and active data a replicated commit touched react at most every 100 ms, many commits' keys at
+  // once; the replication loop calls this after each step so the last of them react within 100 ms of quiet.
+  void cdc_settle_if_due();
+  uint64_t cdc_settled_ns_ = 0;
+  bool cdc_settle_owed_ = false;
   // The master's column definitions re-read for tables already here: a mirror
   // seeded by an older engine, or a master whose columns were altered since,
   // carries stale metadata (a LONGBLOB mirrored as text is converted for a
@@ -2340,6 +2408,7 @@ class SqlDatabase {
   aios::hal::CondVar things_clock_cv_;
   std::string last_index_list_;
   std::string last_probe_list_;   // probes.list as last written: the join hash indexes to warm at boot
+  std::string last_rowindex_list_;   // rowindexes.list as last written: the tables whose primary-key row map is built at boot
 
   // Schemas that exist, so an empty one still shows in SHOW DATABASES and a
   // dropped one stops showing. Before this a database was only ever inferred
@@ -2424,6 +2493,7 @@ class SqlDatabase {
   void redo_mark_all_synced();
  public:
   void flush_redo_pending();
+  uint64_t cdc_synced_ns_ = 0;   // when a replicated commit last put the redo log on the medium (record_cdc_commit)
  private:
   Result<void> replay_redo();
   Result<void> truncate_redo();
@@ -2754,7 +2824,10 @@ class SqlDatabase {
   // The primary-key row index is the same kind of cache and needs the same
   // kind of ceiling. It costs 110-170 bytes per row of whatever table it
   // covers, so an unbudgeted one is worth ~0.5 GB across this ERP's 4.07M rows.
-  static constexpr size_t kRowIndexBudgetBytes = 128ull * 1024 * 1024;
+  // 1 GB: at 128 MB one table's index (prices: 878k rows, a 7-column key, ~130 MB) did not fit beside another's, and a
+  // replicated stream updating both rebuilt one of them for every statement (chi's mirror applied ~2 KB of binlog a
+  // second).
+  static constexpr size_t kRowIndexBudgetBytes = 1024ull * 1024 * 1024;
   void prune_all_probe_indices(size_t max_total_bytes = probe_index_budget_bytes(),
                                const SqlTable* exempt_table = nullptr, int exempt_col = -1);
   // Running total of probe-index bytes. Recomputing it meant walking every

@@ -228,7 +228,7 @@ size_t insn_len(const FnObj& fn, size_t ip) {
     case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue: case Op::Call: case Op::IterNext:
       return 2;
     case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
-    case Op::FieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
     case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
       return 3;
     case Op::Closure: {
@@ -945,7 +945,8 @@ void release(void* code) {
 #endif
 }
 
-#else   // not AArch64 (or Windows on Arm): interpret everything
+#elif !(defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL))
+// neither AArch64 nor x86-64 (grain_jit_x64.cpp), or Windows: interpret everything
 
 Entry compile(const FnObj&) { return nullptr; }
 void release(void*) {}

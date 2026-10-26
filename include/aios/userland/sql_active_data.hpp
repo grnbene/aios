@@ -94,6 +94,8 @@ class ActiveDataEngine {
   bool tick_due();
   std::vector<TierWork> tick_scan();
   void tick_apply(const std::vector<TierWork>& work);
+  // A re-encode finished off the lock (SqlDatabase::active_data_tick): as tick_apply notes one it did itself.
+  void note_reencoded(const std::string& key, uint64_t seq);
 
  private:
   using I128 = AIOS_INT128;

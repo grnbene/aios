@@ -799,9 +799,20 @@ void RelayClient::Impl::ensure_command_server(std::shared_ptr<Impl> self_sp) {
         auto plain = make_plain_link(shared_conn);
         Id128 peer_kernel;
         ByteBuffer peer_payload;
-        auto skey = secure_handshake_responder(*plain, self_sp->key, *self_sp->host, self_sp->self, peer_kernel, peer_payload, {});
+        // No devices here (a command server), the device list's kernel marker, then this side's feature word: the form
+        // a node's hello payload has, so a caller reads it - it once sent nothing, which callers read as corrupt.
+        ByteBuffer mine;
+        {
+          Writer w(mine);
+          w.u32(0);
+          w.u32(0x4C4E524Bu);
+          const ByteBuffer feat = link_feature_payload();
+          w.raw(ByteSpan(feat.data(), feat.size()));
+        }
+        auto skey = secure_handshake_responder(*plain, self_sp->key, *self_sp->host, self_sp->self, peer_kernel, peer_payload, ByteSpan(mine.data(), mine.size()));
         if (!skey.ok()) return;
         auto link = make_secure_link(shared_conn, *skey, false);
+        link->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
         uint8_t t;
         ByteBuffer body;
         while (self_sp->running && self_sp->command_server_running && link->recv(t, body, 120000)) {

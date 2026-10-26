@@ -1,0 +1,15 @@
+fn helper(x) {
+  return x + 1
+}
+
+fn calc(x) {
+  return helper(x) * 10
+}
+
+fn message() {
+  return "from mod_a"
+}
+
+fn get_name() {
+  return "calc"
+}

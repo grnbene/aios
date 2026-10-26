@@ -1614,6 +1614,13 @@ void ActiveDataEngine::tick_apply(const std::vector<TierWork>& work) {
   }
 }
 
+void ActiveDataEngine::note_reencoded(const std::string& key, uint64_t seq) {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  TableTelemetry& tel = telemetry_[key];
+  tel.seen_seq = seq;   // this was maintenance, not a write
+  tel.reencoded = true;
+}
+
 SqlQueryResult ActiveDataEngine::show_tiering() {
   std::lock_guard<aios::hal::Mutex> lk(mu_);
   SqlQueryResult r;

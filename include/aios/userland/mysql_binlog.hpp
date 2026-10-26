@@ -252,6 +252,25 @@ class BinlogConsumer {
 
   // Manually apply row mutation
   Result<void> apply_mutation(const BinlogRowMutation& mut);
+  // DELETEs by a single-column key, held back and erased together (flush_pending_deletes): a delete rewrites every
+  // column of the table, so one pass for a transaction's worth costs what one row's delete did. Anything else that
+  // changes the mirror, a commit and DDL flush it first, so the order of changes is the binlog's.
+  void flush_pending_deletes();
+  std::string pending_del_db_, pending_del_table_, pending_del_column_;
+  std::vector<std::string> pending_del_keys_;
+  // DELETEs from a table without a primary key, held back the same way: each row named by its whole before-image
+  // (in the table's column order), erased by one DELETE ... MATCHING - one row per image, found in one pass. Each
+  // used to be its own DELETE, a scan of the table and a rewrite of every column: a purge of audittrail (31M
+  // rows, no key) ran at twenty rows a second and left the mirror a day behind.
+  std::vector<std::vector<std::string>> pending_img_rows_;
+  // INSERTs, held back the same way and written as one multi-row INSERT per table (the same columns, in the
+  // binlog's order): a statement per row was most of what a bulk load at the source cost here.
+  std::vector<std::string> pending_ins_cols_;
+  std::vector<std::vector<std::string>> pending_ins_rows_;
+  void flush_pending_inserts();
+  size_t pending_img_bytes_ = 0;
+  bool defer_deletes_ = false;           // set while the stream's row events are applied; a direct apply_mutation() is immediate
+  uint64_t pending_del_since_ms_ = 0;    // when the first held delete arrived: held no longer than a moment past that
 
  private:
   Kernel& kernel_;

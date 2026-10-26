@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "aios/core/json.hpp"
 #include "aios/userland/face.hpp"
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
@@ -432,6 +433,8 @@ class FacePane final : public PaneDriver {
   void set_theme(const std::string& t) { theme_ = t; }
   const Value& routes() const { return routes_; }
   void set_routes(const Value& r) { routes_ = r; }
+  const Value& middleware() const { return middleware_; }
+  void set_middleware(const Value& m) { middleware_ = m; }
   bool workers() const { return workers_; }
   bool api_only() const { return api_only_; }
   void set_api_only(bool v) { api_only_ = v; }
@@ -1103,6 +1106,7 @@ class FacePane final : public PaneDriver {
   std::string css_;
   std::string theme_;
   Value routes_ = Value::nil();
+  Value middleware_ = Value::nil();
   bool api_only_ = false;  // no page: only its routes answer (serve_routes)
   bool workers_ = false;   // routes run in worker VMs, not one at a time in this one
 
@@ -1282,6 +1286,7 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (Value* th = o->find("theme")) pane->set_theme(th->to_text());
   if (Value* r = o->find("routes")) pane->set_routes(*r);
   else if (Value* a = o->find("api")) pane->set_routes(*a);
+  if (Value* mw = o->find("middleware")) pane->set_middleware(*mw);
   pane->set_api_only(api_only);
   if (Value* wk = o->find("workers")) pane->set_workers(wk->truthy());   // each route request in a VM of its own, on its own thread: a slow one does not hold up the rest
   return register_driven_pane(vm, title, w, h, pane);
@@ -1365,6 +1370,18 @@ void install_face_builtins(Vm& vm) {
   add("set_field", 3, 3, bi_ui_set_field);
   add("layout", 1, 1, bi_ui_layout);
   vm.define_global("ui", Value::object(Type::Map, ui));
+  vm.define_native("__route_invoke", 1, 3, [](Vm& v, std::vector<Value>& args, std::string& error) -> Value {
+    if (args.empty()) return Value::nil();
+    const Value& handler = args[0];
+    const Value& req = args.size() > 1 ? args[1] : Value::nil();
+    const Value& writer = args.size() > 2 ? args[2] : Value::nil();
+    if (callable_arity(handler) == 2) {
+      std::vector<Value> call_args = {req, writer};
+      return v.call(handler, call_args, error);
+    }
+    std::vector<Value> call_args = {req};
+    return v.call(handler, call_args, error);
+  });
   // serve_routes({"/path": fn(req) {...}}, options?): a program that is only an API. The routes of a pane with
   // nothing to show, shared (one copy of the program) and with workers (each request in a VM of its own, so a
   // slow route does not hold up the others). options: title, workers (false for routes that share the
@@ -1376,9 +1393,13 @@ void install_face_builtins(Vm& vm) {
     o->put("shared", Value::boolean(true));
     o->put("workers", Value::boolean(true));
     if (args.size() > 1) {
-      auto given = as_map(args[1]);
-      if (!given) { error = std::string("serve_routes() wants its options as a map, got a ") + type_name(args[1].type); return Value::nil(); }
-      for (const auto& kv : given->entries) o->put(kv.first, kv.second);
+      if (args[1].type == Type::List) {
+        o->put("middleware", args[1]);
+      } else {
+        auto given = as_map(args[1]);
+        if (!given) { error = std::string("serve_routes() wants its options as a map or middleware list, got a ") + type_name(args[1].type); return Value::nil(); }
+        for (const auto& kv : given->entries) o->put(kv.first, kv.second);
+      }
     }
     o->put("routes", args[0]);
     std::vector<Value> pane_args{Value::object(Type::Map, o)};
@@ -1443,13 +1464,28 @@ bool web_pane_event(Vm& vm, uint64_t id, uint64_t version, const std::string& ac
 namespace {
 // What a route's return value says about the response: a map with status / content_type / body / json, a
 // list or number as JSON, a string as text.
-void route_response(const Value& ret, int& status, std::string& res_body, std::string& content_type) {
+void route_response(const Value& ret, int& status, std::string& res_body, std::string& content_type,
+                    std::vector<std::pair<std::string, std::string>>* extra_headers = nullptr) {
   status = 200;
   content_type = "application/json; charset=utf-8";
   if (ret.type == Type::Map) {
     auto m = as_map(ret);
-    if (Value* s = m->find("status")) status = (int)s->as_int();
+    if (Value* s = m->find("status")) {
+      if (s->type == Type::Int && s->as_int() >= 100 && s->as_int() <= 599) {
+        status = (int)s->as_int();
+      }
+    }
     if (Value* ct = m->find("content_type")) content_type = ct->to_text();
+    if (extra_headers) {
+      if (Value* h = m->find("headers")) {
+        if (h->type == Type::Map) {
+          auto hm = as_map(*h);
+          for (const auto& [k, v] : hm->entries) {
+            extra_headers->push_back({k, v.to_text()});
+          }
+        }
+      }
+    }
     if (Value* b = m->find("body")) {
       res_body = b->to_text();
     } else if (Value* j = m->find("json")) {
@@ -1471,13 +1507,132 @@ void route_response(const Value& ret, int& status, std::string& res_body, std::s
   }
 }
 
+static std::vector<std::string> split_route_path(const std::string& s) {
+  std::vector<std::string> parts;
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && s[i] == '/') ++i;
+    if (i >= s.size()) break;
+    size_t next = s.find('/', i);
+    if (next == std::string::npos) {
+      parts.push_back(s.substr(i));
+      break;
+    }
+    parts.push_back(s.substr(i, next - i));
+    i = next + 1;
+  }
+  return parts;
+}
+
+static std::string url_decode(const std::string& in, bool plus_as_space = false) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (plus_as_space && in[i] == '+') {
+      out.push_back(' ');
+    } else if (in[i] == '%' && i + 2 < in.size()) {
+      auto hex_val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      int h1 = hex_val(in[i + 1]);
+      int h2 = hex_val(in[i + 2]);
+      if (h1 >= 0 && h2 >= 0) {
+        out.push_back((char)((h1 << 4) | h2));
+        i += 2;
+      } else {
+        out.push_back(in[i]);
+      }
+    } else {
+      out.push_back(in[i]);
+    }
+  }
+  return out;
+}
+
+static std::shared_ptr<MapObj> parse_query_params(const std::string& query) {
+  auto m = std::make_shared<MapObj>();
+  if (query.empty()) return m;
+  size_t at = 0;
+  while (at < query.size()) {
+    size_t amp = query.find('&', at);
+    std::string pair = query.substr(at, amp == std::string::npos ? std::string::npos : amp - at);
+    if (!pair.empty()) {
+      size_t eq = pair.find('=');
+      if (eq != std::string::npos) {
+        std::string k = url_decode(pair.substr(0, eq), true);
+        std::string v = url_decode(pair.substr(eq + 1), true);
+        m->put(k, Value::string(v));
+      } else {
+        std::string k = url_decode(pair, true);
+        m->put(k, Value::string(""));
+      }
+    }
+    if (amp == std::string::npos) break;
+    at = amp + 1;
+  }
+  return m;
+}
+
+static Value json_to_grain_value(const aios::json::Value& j) {
+  if (j.is_null()) return Value::nil();
+  if (j.is_bool()) return Value::boolean(j.boolean_or());
+  if (j.is_number()) {
+    double d = j.num();
+    int64_t i = j.i64();
+    if (d == static_cast<double>(i)) return Value::integer(i);
+    return Value::real(d);
+  }
+  if (j.is_string()) return Value::string(j.str());
+  if (j.is_array()) {
+    std::vector<Value> items;
+    for (const auto& item : j.items()) {
+      items.push_back(json_to_grain_value(item));
+    }
+    return Value::list(std::move(items));
+  }
+  if (j.is_object()) {
+    auto m = std::make_shared<MapObj>();
+    for (const auto& [k, v] : j.members()) {
+      m->put(k, json_to_grain_value(v));
+    }
+    return Value::object(Type::Map, m);
+  }
+  return Value::nil();
+}
+
+static std::string to_upper(std::string s) {
+  for (char& c : s) c = (char)std::toupper((unsigned char)c);
+  return s;
+}
+
 Value route_request(const std::string& method, const std::string& path, const std::string& query, const std::string& body,
-                    const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote) {
+                    const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
+                    const std::shared_ptr<MapObj>& params = nullptr) {
   auto req_m = std::make_shared<MapObj>();
   req_m->put("method", Value::string(method));
   req_m->put("path", Value::string(path));
   req_m->put("query", Value::string(query));
+  req_m->put("raw_query", Value::string(query));
+  req_m->put("query_params", Value::object(Type::Map, parse_query_params(query)));
+  req_m->put("params", Value::object(Type::Map, params ? params : std::make_shared<MapObj>()));
   req_m->put("body", Value::string(body));
+  if (!body.empty()) {
+    auto parsed = aios::json::parse(body);
+    if (parsed.ok()) {
+      Value jv = json_to_grain_value(*parsed);
+      req_m->put("json", jv);
+      req_m->put("body_json", jv);
+    } else {
+      req_m->put("json", Value::nil());
+      req_m->put("body_json", Value::nil());
+    }
+  } else {
+    req_m->put("json", Value::nil());
+    req_m->put("body_json", Value::nil());
+  }
   auto hdr_m = std::make_shared<MapObj>();
   for (const auto& [name, value] : headers) {
     std::string key = name;
@@ -1489,44 +1644,493 @@ Value route_request(const std::string& method, const std::string& path, const st
   return Value::object(Type::Map, req_m);
 }
 
-const Value* route_handler(FacePane* f, const std::string& path) {
+const Value* route_match(FacePane* f, const std::string& method, const std::string& path, std::shared_ptr<MapObj>& out_params) {
+  out_params = std::make_shared<MapObj>();
   if (!f || f->routes().type != Type::Map) return nullptr;
   auto rm = as_map(f->routes());
-  Value* handler = rm ? rm->find(path) : nullptr;
-  if (!handler) handler = rm ? rm->find("*") : nullptr;
-  return handler && is_callable(*handler) ? handler : nullptr;
+  if (!rm) return nullptr;
+
+  const std::string upper_method = to_upper(method);
+  auto path_parts = split_route_path(path);
+
+  const Value* best_handler = nullptr;
+  int best_score = -1;
+  std::map<std::string, std::string> best_params;
+
+  for (const auto& [key, handler] : rm->entries) {
+    if (!is_callable(handler)) continue;
+
+    std::string r_method, r_pattern;
+    size_t sp = key.find(' ');
+    if (sp != std::string::npos) {
+      r_method = to_upper(key.substr(0, sp));
+      r_pattern = key.substr(sp + 1);
+    } else {
+      r_pattern = key;
+    }
+
+    if (!r_method.empty() && r_method != upper_method) continue;
+
+    int method_score = r_method.empty() ? 0 : 1000;
+    std::map<std::string, std::string> params;
+    bool matched = false;
+    int path_score = 0;
+
+    if (r_pattern == "*") {
+      matched = true;
+      path_score = 1;
+      params["*"] = path;
+    } else if (r_pattern == path) {
+      matched = true;
+      path_score = 2000;
+    } else {
+      auto pat_parts = split_route_path(r_pattern);
+      size_t i = 0;
+      matched = true;
+      bool consumed_all = false;
+      for (; i < pat_parts.size(); ++i) {
+        if (pat_parts[i] == "*") {
+          std::string rest;
+          for (size_t k = i; k < path_parts.size(); ++k) {
+            if (!rest.empty()) rest += "/";
+            rest += path_parts[k];
+          }
+          params["*"] = url_decode(rest);
+          path_score += 5;
+          consumed_all = true;
+          break;
+        }
+        if (!pat_parts[i].empty() && pat_parts[i][0] == '*' && pat_parts[i].size() > 1) {
+          std::string var_name = pat_parts[i].substr(1);
+          std::string rest;
+          for (size_t k = i; k < path_parts.size(); ++k) {
+            if (!rest.empty()) rest += "/";
+            rest += path_parts[k];
+          }
+          params[var_name] = url_decode(rest);
+          params["*"] = url_decode(rest);
+          path_score += 5;
+          consumed_all = true;
+          break;
+        }
+        if (i >= path_parts.size()) { matched = false; break; }
+        if (!pat_parts[i].empty() && pat_parts[i][0] == ':') {
+          std::string var_name = pat_parts[i].substr(1);
+          params[var_name] = url_decode(path_parts[i]);
+          path_score += 20;
+        } else if (pat_parts[i] == path_parts[i]) {
+          path_score += 50;
+        } else {
+          matched = false;
+          break;
+        }
+      }
+      if (matched && !consumed_all && (i < pat_parts.size() || i < path_parts.size())) matched = false;
+    }
+
+    if (matched) {
+      int total_score = method_score + path_score;
+      if (total_score > best_score) {
+        best_score = total_score;
+        best_handler = &handler;
+        best_params = std::move(params);
+      }
+    }
+  }
+
+  if (best_handler) {
+    for (const auto& [k, v] : best_params) {
+      out_params->put(k, Value::string(v));
+    }
+    return best_handler;
+  }
+  return nullptr;
 }
 }  // namespace
+
+struct RouteWriterState {
+  std::mutex mu;
+  std::atomic<bool> closed{false};
+  bool streamed = false;
+  bool headers_sent = false;
+  int status = 200;
+  std::string content_type;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::string buffered_body;
+  StreamHeaderCallback on_headers;
+  StreamChunkCallback on_chunk;
+};
+
+static std::mutex g_writers_mu;
+static uint64_t g_next_writer_id = 1;
+static std::unordered_map<uint64_t, std::shared_ptr<RouteWriterState>> g_writers;
+
+static uint64_t register_writer(std::shared_ptr<RouteWriterState> st) {
+  std::lock_guard<std::mutex> lk(g_writers_mu);
+  uint64_t id = g_next_writer_id++;
+  g_writers[id] = std::move(st);
+  return id;
+}
+
+static std::shared_ptr<RouteWriterState> find_writer(uint64_t id) {
+  std::lock_guard<std::mutex> lk(g_writers_mu);
+  auto it = g_writers.find(id);
+  return it != g_writers.end() ? it->second : nullptr;
+}
+
+static void unregister_writer(uint64_t id) {
+  std::lock_guard<std::mutex> lk(g_writers_mu);
+  g_writers.erase(id);
+}
+
+static Value method_writer_write(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (!st || st->closed.load()) return Value::boolean(false);
+  if (args.empty()) return Value::boolean(true);
+  std::string chunk = args[0].to_text();
+
+  std::lock_guard<std::mutex> lk(st->mu);
+  if (st->closed.load()) return Value::boolean(false);
+  st->streamed = true;
+  if (!st->headers_sent) {
+    st->headers_sent = true;
+    if (st->content_type.empty()) st->content_type = "text/plain; charset=utf-8";
+    std::vector<std::pair<std::string, std::string>> hdrs = {
+      {"Content-Type", st->content_type},
+      {"Cache-Control", "no-cache"}
+    };
+    for (const auto& h : st->headers) hdrs.push_back(h);
+    if (st->on_headers) {
+      if (!st->on_headers(st->status, hdrs)) {
+        st->closed = true;
+        return Value::boolean(false);
+      }
+    }
+  }
+  if (st->on_chunk) {
+    if (!st->on_chunk(chunk)) {
+      st->closed = true;
+      return Value::boolean(false);
+    }
+  } else {
+    st->buffered_body += chunk;
+  }
+  return Value::boolean(true);
+}
+
+static Value method_writer_write_sse(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (!st || st->closed.load()) return Value::boolean(false);
+  if (args.empty()) return Value::boolean(true);
+
+  std::string chunk;
+  if (args[0].type == Type::List) {
+    auto l = std::dynamic_pointer_cast<ListObj>(args[0].obj);
+    if (l) {
+      for (const auto& item : l->items) format_one_sse_event(item, chunk);
+    }
+  } else {
+    format_one_sse_event(args[0], chunk);
+  }
+
+  std::lock_guard<std::mutex> lk(st->mu);
+  if (st->closed.load()) return Value::boolean(false);
+  st->streamed = true;
+  if (!st->headers_sent) {
+    st->headers_sent = true;
+    if (st->content_type.empty()) st->content_type = "text/event-stream; charset=utf-8";
+    std::vector<std::pair<std::string, std::string>> hdrs = {
+      {"Content-Type", st->content_type},
+      {"Cache-Control", "no-cache"},
+      {"X-Accel-Buffering", "no"}
+    };
+    for (const auto& h : st->headers) hdrs.push_back(h);
+    if (st->on_headers) {
+      if (!st->on_headers(st->status, hdrs)) {
+        st->closed = true;
+        return Value::boolean(false);
+      }
+    }
+  }
+  if (st->on_chunk) {
+    if (!st->on_chunk(chunk)) {
+      st->closed = true;
+      return Value::boolean(false);
+    }
+  } else {
+    st->buffered_body += chunk;
+  }
+  return Value::boolean(true);
+}
+
+static Value method_writer_write_head(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (!st || st->closed.load()) return Value::boolean(false);
+  int status = !args.empty() && args[0].is_number() ? (int)args[0].as_int() : 200;
+  std::lock_guard<std::mutex> lk(st->mu);
+  st->status = status;
+  if (args.size() > 1 && args[1].type == Type::Map) {
+    auto m = as_map(args[1]);
+    if (m) {
+      for (const auto& kv : m->entries) {
+        std::string k_lower = kv.first;
+        for (char& c : k_lower) c = (char)std::tolower((unsigned char)c);
+        if (k_lower == "content-type") st->content_type = kv.second.to_text();
+        else st->headers.push_back({kv.first, kv.second.to_text()});
+      }
+    }
+  }
+  st->streamed = true;
+  if (!st->headers_sent) {
+    st->headers_sent = true;
+    if (st->content_type.empty()) st->content_type = "text/plain; charset=utf-8";
+    std::vector<std::pair<std::string, std::string>> hdrs = {
+      {"Content-Type", st->content_type},
+      {"Cache-Control", "no-cache"}
+    };
+    for (const auto& h : st->headers) hdrs.push_back(h);
+    if (st->on_headers) {
+      if (!st->on_headers(st->status, hdrs)) {
+        st->closed = true;
+        return Value::boolean(false);
+      }
+    }
+  }
+  return Value::boolean(true);
+}
+
+static Value method_writer_header(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (!st) return Value::nil();
+  if (args.size() >= 2) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    std::string k = args[0].to_text();
+    std::string v = args[1].to_text();
+    std::string k_lower = k;
+    for (char& c : k_lower) c = (char)std::tolower((unsigned char)c);
+    if (k_lower == "content-type") st->content_type = v;
+    else st->headers.push_back({k, v});
+  }
+  return Value::nil();
+}
+
+static Value method_writer_status(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (!st) return Value::nil();
+  if (!args.empty() && args[0].is_number()) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    st->status = (int)args[0].as_int();
+  }
+  return Value::nil();
+}
+
+static Value method_writer_close(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  if (st) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    st->closed = true;
+  }
+  return Value::boolean(true);
+}
+
+static Value method_writer_flush(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  return Value::boolean(st && !st->closed.load());
+}
+
+static Value method_writer_is_closed(Vm&, BoundMethodObj& bm, std::vector<Value>&, std::string&) {
+  uint64_t wid = (uint64_t)bm.receiver.as_int();
+  auto st = find_writer(wid);
+  return Value::boolean(!st || st->closed.load());
+}
+
+static Value make_route_writer(uint64_t wid) {
+  auto m = std::make_shared<MapObj>();
+  Value rec = Value::integer((int64_t)wid);
+  m->put("id", rec);
+  m->put("is_stream", Value::boolean(true));
+  m->put("write", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.write", 1, 1, method_writer_write)));
+  m->put("send", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.send", 1, 1, method_writer_write)));
+  m->put("write_sse", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.write_sse", 1, 1, method_writer_write_sse)));
+  m->put("event", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.event", 1, 2, [](Vm& vm, BoundMethodObj& bm, std::vector<Value>& args, std::string& err) -> Value {
+    if (args.size() == 2) {
+      auto ev = std::make_shared<MapObj>();
+      ev->put("event", args[0]);
+      ev->put("data", args[1]);
+      std::vector<Value> sse_args = {Value::object(Type::Map, ev)};
+      return method_writer_write_sse(vm, bm, sse_args, err);
+    }
+    return method_writer_write_sse(vm, bm, args, err);
+  })));
+  m->put("write_head", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.write_head", 1, 2, method_writer_write_head)));
+  m->put("header", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.header", 2, 2, method_writer_header)));
+  m->put("status", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.status", 1, 1, method_writer_status)));
+  m->put("close", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.close", 0, 0, method_writer_close)));
+  m->put("flush", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.flush", 0, 0, method_writer_flush)));
+  m->put("is_closed", Value::object(Type::BoundMethod, std::make_shared<BoundMethodObj>(rec, "writer.is_closed", 0, 0, method_writer_is_closed)));
+  return Value::object(Type::Map, m);
+}
+
+static Value get_pipeline_runner(Vm& vm, std::string& error) {
+  static const char* kPipelineSrc =
+    "let __runner = fn(middlewares, handler, req, writer) {\n"
+    "  let i = 0\n"
+    "  let step = nil\n"
+    "  step = fn(r) {\n"
+    "    let cur_req = r\n"
+    "    if cur_req == nil { cur_req = req }\n"
+    "    if i < len(middlewares) {\n"
+    "      let m = middlewares[i]\n"
+    "      i = i + 1\n"
+    "      return m(cur_req, step)\n"
+    "    }\n"
+    "    return __route_invoke(handler, cur_req, writer)\n"
+    "  }\n"
+    "  return step(req)\n"
+    "}\n"
+    "__runner\n";
+  static auto compiled = compile_source(kPipelineSrc, "<middleware-runner>", true);
+  if (!compiled.ok() || !compiled.script) {
+    error = "internal error initializing middleware runner";
+    return Value::nil();
+  }
+  Value runner_script = Value::object(Type::Fn, compiled.script);
+  return vm.call(runner_script, {}, error);
+}
+
+static Value execute_route_with_middleware(Vm& vm, const Value& middleware, const Value& handler, const Value& req, const Value& writer, std::string& error) {
+  auto mw_list = middleware.type == Type::List ? std::dynamic_pointer_cast<ListObj>(middleware.obj) : nullptr;
+  if (!mw_list || mw_list->items.empty()) {
+    if (callable_arity(handler) == 2) {
+      std::vector<Value> args = {req, writer};
+      return vm.call(handler, args, error);
+    }
+    std::vector<Value> args = {req};
+    return vm.call(handler, args, error);
+  }
+  Value runner_fn = get_pipeline_runner(vm, error);
+  if (!error.empty()) return Value::nil();
+  std::vector<Value> args = {middleware, handler, req, writer};
+  return vm.call(runner_fn, args, error);
+}
 
 bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                            const std::string& query, const std::string& body,
                            const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
-                           int& status, std::string& res_body, std::string& content_type, std::string& error) {
-  const Value* handler = route_handler(web_face(vm, id), path);
+                           int& status, std::string& res_body, std::string& content_type, std::string& error,
+                           std::vector<std::pair<std::string, std::string>>* extra_headers,
+                           StreamHeaderCallback on_headers,
+                           StreamChunkCallback on_chunk,
+                           bool* out_streamed) {
+  FacePane* f = web_face(vm, id);
+  std::shared_ptr<MapObj> params;
+  const Value* handler = route_match(f, method, path, params);
   if (!handler) return false;
-  std::vector<Value> args = {route_request(method, path, query, body, headers, remote)};
-  Value ret = vm.call(*handler, args, error);
+
+  auto st = std::make_shared<RouteWriterState>();
+  st->on_headers = std::move(on_headers);
+  st->on_chunk = std::move(on_chunk);
+  uint64_t wid = register_writer(st);
+  Value writer_val = make_route_writer(wid);
+
+  Value req = route_request(method, path, query, body, headers, remote, params);
+  if (req.type == Type::Map && req.obj) {
+    static_cast<MapObj*>(req.obj.get())->put("writer", writer_val);
+  }
+
+  Value ret = execute_route_with_middleware(vm, f ? f->middleware() : Value::nil(), *handler, req, writer_val, error);
+  unregister_writer(wid);
   if (!error.empty()) return false;
-  route_response(ret, status, res_body, content_type);
+
+  if (st->streamed) {
+    if (out_streamed) *out_streamed = true;
+    if (st->on_chunk) {
+      status = st->status;
+      res_body.clear();
+      content_type = st->content_type;
+    } else {
+      status = st->status;
+      res_body = std::move(st->buffered_body);
+      content_type = st->content_type;
+      if (extra_headers) {
+        for (const auto& h : st->headers) extra_headers->push_back(h);
+      }
+    }
+    return true;
+  }
+  route_response(ret, status, res_body, content_type, extra_headers);
   return true;
 }
 
 bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                             const std::string& query, const std::string& body,
                             const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
-                            RouteJob& job, std::string& error) {
+                            RouteJob& job, std::string& error,
+                            StreamHeaderCallback on_headers,
+                            StreamChunkCallback on_chunk) {
   FacePane* f = web_face(vm, id);
   if (!f || !f->workers()) return false;
-  const Value* handler = route_handler(f, path);
+  std::shared_ptr<MapObj> params;
+  const Value* handler = route_match(f, method, path, params);
   if (!handler) return false;
-  job.call = prepare_worker_call(vm, *handler, {route_request(method, path, query, body, headers, remote)}, error);
-  if (!job.call) { error = "route " + path + ": " + error; return false; }
+
+  auto st = std::make_shared<RouteWriterState>();
+  st->on_headers = std::move(on_headers);
+  st->on_chunk = std::move(on_chunk);
+  uint64_t wid = register_writer(st);
+  job.writer_id = wid;
+  job.writer_state = st;
+
+  Value writer_val = make_route_writer(wid);
+  Value req = route_request(method, path, query, body, headers, remote, params);
+  if (req.type == Type::Map && req.obj) {
+    static_cast<MapObj*>(req.obj.get())->put("writer", writer_val);
+  }
+
+  auto mw_list = f->middleware().type == Type::List ? std::dynamic_pointer_cast<ListObj>(f->middleware().obj) : nullptr;
+  if (mw_list && !mw_list->items.empty()) {
+    Value runner_fn = get_pipeline_runner(vm, error);
+    if (!error.empty()) { unregister_writer(wid); return false; }
+    job.call = prepare_worker_call(vm, runner_fn, {f->middleware(), *handler, req, writer_val}, error);
+  } else {
+    if (callable_arity(*handler) == 2) {
+      job.call = prepare_worker_call(vm, *handler, {req, writer_val}, error);
+    } else {
+      job.call = prepare_worker_call(vm, *handler, {req}, error);
+    }
+  }
+  if (!job.call) { unregister_writer(wid); error = "route " + path + ": " + error; return false; }
   return true;
 }
 
 bool web_pane_route_finish(RouteJob& job, int& status, std::string& res_body, std::string& content_type, std::string& error) {
+  auto st = std::static_pointer_cast<RouteWriterState>(job.writer_state);
+  if (job.writer_id != 0) unregister_writer(job.writer_id);
+  job.writer_id = 0;
   if (!job.call->error.empty()) { error = job.call->error; return false; }
-  route_response(job.call->result, status, res_body, content_type);
+
+  if (st && st->streamed) {
+    job.streamed = true;
+    if (st->on_chunk) {
+      status = st->status;
+      res_body.clear();
+      content_type = st->content_type;
+    } else {
+      status = st->status;
+      res_body = std::move(st->buffered_body);
+      content_type = st->content_type;
+      for (const auto& h : st->headers) job.headers.push_back(h);
+    }
+    return true;
+  }
+  route_response(job.call->result, status, res_body, content_type, &job.headers);
   return true;
 }
 

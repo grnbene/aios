@@ -144,9 +144,15 @@ Result<void> RemoteNode::hello(const std::string& token, const Id128& my_kernel,
   // Authenticated handshake on the plain link, then everything is encrypted.
   auto plain = make_plain_link(c_);
   ByteBuffer peer_payload;
-  auto key = secure_handshake_initiator(*plain, token, host, my_kernel, kernel_, peer_payload, {});
+  const ByteBuffer mine = link_feature_payload();   // what this side reads (deflated frames), for the peer to use
+  auto key = secure_handshake_initiator(*plain, token, host, my_kernel, kernel_, peer_payload, ByteSpan(mine.data(), mine.size()));
   if (!key.ok()) return key.error();
   link_ = make_secure_link(c_, *key, true);
+  link_->set_compress(link_peer_deflates(ByteSpan(peer_payload.data(), peer_payload.size())));
+  // A member that only answers commands (an app host's relay command server, RelayClient::ensure_command_server)
+  // completes the handshake with nothing to say: no devices. Read as a device count, that was "corrupt: hello reply",
+  // and `fleet run` could not reach the very members that install a command runner.
+  if (peer_payload.empty()) return Ok();
   Reader rd(peer_payload);
   uint32_t n = rd.u32();
   for (uint32_t i = 0; i < n && rd.ok(); ++i) { RemoteDeviceInfo d; d.id = DeviceID{rd.id()}; d.type = (DeviceType)rd.u8(); d.name = rd.str(); d.lanes = rd.u32(); d.memory = rd.u64(); devices_.push_back(d); }

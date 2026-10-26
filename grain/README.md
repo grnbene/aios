@@ -2,7 +2,7 @@
 
 A small, fast, embeddable language: closures, first-class functions, lists and
 maps, integers that stay integers, a standard library with files, processes,
-sockets, JSON, hashing and a 2D canvas, and an AArch64 JIT. It is aios's own
+sockets, JSON, hashing and a 2D canvas, and AArch64 and x86-64 JITs. It is aios's own
 language and also runs on its own on macOS, Linux and Windows.
 
 ```grain
@@ -24,6 +24,8 @@ grain dis hello.gr           show the bytecode the compiler emitted
 grain --steps 1000000 ...    stop a program after that many instructions
 grain --no-jit ...           interpret everything
 grain --safe ...             native fn on bytes only: no ptr, extern fn, ffi or plugins
+GRAIN_PROFILE=1 grain ...    samples the CPU time per source line and prints the top 40 lines to stderr at exit
+GRAIN_PROFILE=native grain ...   the same, and writes each sample's C++ call stack (hex addresses) to GRAIN_PROFILE_OUT
 ```
 
 Exit status: 0 the program ran to its end, 1 it did not compile, 2 it stopped
@@ -34,7 +36,7 @@ on a runtime error, 64 the command line was wrong. A first line starting with
 
 | Area | Functions |
 |---|---|
-| The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep`, `clock`, `time_us` |
+| The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep(ms)` (milliseconds), `clock`, `time_us` |
 | Numbers | `a..b` is `range(a, b)`; `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
 | Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`, `decimal_prefix(s)` (the number a string starts with: `{d, whole}` or nil), `round_sig(d, n)`; `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
 | Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists` (relative to the working directory) |
@@ -132,7 +134,7 @@ a worker has no loop of its own, so `every`, `after`, `live`, `events` and
 collected: `parallel_map`'s in item order, a task's when it is awaited.
 
 24 calls of `fib(30)` on a 12-core Mac (6 performance, 6 efficiency cores),
-interpreted: `map` 3.0-3.4 s, `parallel_map` 0.66-0.70 s.
+interpreted: `map` 3.0-3.4 s, `parallel_map` 0.66-0.70 s. See [**`examples/grain/parallel_pool.gr`**](../examples/grain/parallel_pool.gr) for a complete concurrency walkthrough.
 
 ## Databases, and live query results
 
@@ -201,37 +203,59 @@ keeps at least 12 places; `dec_div(a, b, places)` picks them. `round(d, places)`
 rounds half away from zero. Overflow and division by zero stop the program with an
 error rather than answering wrongly. They cross into workers, `json_stringify` and
 `db_query(..., {"decimals": true})` with every digit. There is no decimal literal
-yet: write `decimal("0.5")`.
+yet: write `decimal("0.5")`. See [**`examples/grain/decimals.gr`**](../examples/grain/decimals.gr) for exact invoicing, tax calculation, and formatting examples.
 
 ## Programs in several files
 
 ```grain
-import "lib/money.gr"        # the same as import("lib/money.gr")
+import "lib/money.gr" as money               # namespaced module: isolated under money.*
+import { calculate_totals as calc_tax } from "lib/tax.gr" # selective aliased import
+import "lib/legacy.gr"                       # top-level export
 ```
 
-runs another file in the program, once, and what it defines at its top level is
-defined here. The path is relative to the file that imports it (the main program's
-directory for the main program); a file importing its importer, or two files
-importing a third, is fine. `grain build` finds the imports and packs them. A
-mistake inside the file names it: the message while it loads, and the stack trace
-after (its functions are listed as `lib/money.gr:name`). Imports are found when the
-program runs, not when it is checked.
+Runs another file in the program, once. Using `as alias` groups the module's top-level
+functions and variables into a map, avoiding namespace collisions across libraries.
+Selective imports (`import { a, b as c } from "file.gr"`) unpack only the requested symbols; asking for a name the file does not define is an error that says so.
+The path is relative to the file that imports it (the main program's directory for the
+main program); circular imports and diamond dependencies resolve safely. `grain build`
+finds the imports and packs them into a single binary.
 
 ## An API with no page
 
 ```grain
-fn doubled(text) { return decimal(text) * 2 }
+import "lib/pricing.gr" as pricing
+
 serve_routes({
-  "/slow":  fn (req) { sleep(800)  return {"done": true} },
-  "/stock": fn (req) { return {"doubled": doubled(req.query)} }
+  "GET /health": fn (req) {
+    return res_json({"status": "ok", "uptime_s": round(now() - started)})
+  },
+
+  "GET /items/:id": fn (req) {
+    return res_json({"item_id": req.params?.id, "query": req.query_params})
+  },
+
+  "POST /quote": fn (req) {
+    let { items } = req.json
+    let quote = pricing.calculate(items)
+    return res_json(quote, 201, {"X-Quote-Id": uuid_v4()})
+  }
 })
 ```
 
-`grain serve api.gr` answers `/stock?2.5` with JSON, and anything else with 404. A
-route gets `req.method`, `req.path`, `req.query`, `req.body`, `req.headers` (names
-lowercased: `req.headers.authorization`) and `req.remote` (the client's address), and returns a map
-(or list, or string): `{"status": 201, "content_type": "text/csv", "body": "..."}`
-sets the response, otherwise the value is sent as JSON.
+`grain serve api.gr` binds routes to HTTP methods and paths. The request map provides
+`req.method`, `req.path`, `req.params` (extracted from `:param` and `*wildcard`), `req.query`,
+`req.query_params` (parsed dictionary), `req.json` (auto-parsed payload), `req.headers`, and
+`req.remote`. Response helpers (`res_json`, `res_text`, `res_html`, `res_error`, `res_redirect`)
+format standard HTTP envelopes and custom headers.
+
+`serve_routes(routes, middleware)` takes an optional list of functions `fn (req, next)`, outermost first. Each
+either returns a response itself (a 401, say) or returns `next(req)`, optionally changing the request going
+in or the response coming out. Put the header-adding one first and it wraps every response, including the
+ones a later middleware cut short.
+
+`res_sse(events)` formats a list of `{"id": ..., "event": "ping", "retry": ..., "data": ...}` maps as `text/event-stream` (one map, or a plain string, is a one-event list). A `data` that is a map or list goes out as JSON, and one with several lines becomes several `data:` lines. Newlines in `id`, `event` and `retry` are dropped, and a plain string is always data, so text from a user cannot add a field or an event. It sends the events as one complete response.
+
+For a response that goes on over time, a route that takes `(req, writer)` (or reads `req.writer`) can write as it goes: `writer.write(text)`, `writer.write_sse(event)`, `writer.write_head(status, headers)`, `writer.header(k, v)`, `writer.status(code)`, `writer.is_closed()`, `writer.close()`. The first write sends the status and headers; `is_closed()` turns true when the client leaves, so a loop that checks it stops instead of working for nobody. See [Writing a Grain application](../docs/grain-app-writing.md#server-sent-events-and-live-streaming).
 
 Each request runs in a worker VM of its own, on its own thread, the way
 `parallel_map` workers do: a route that takes eight seconds does not hold up the
@@ -243,6 +267,51 @@ program's variables run one request at a time with `serve_routes(routes,
 {"workers": false})`. The same options work on a page: `ui.pane({"routes": {...},
 "workers": true, ...})`. `grain serve --max-body 10m` (or `GRAIN_MAX_BODY`) sets the
 largest request body, 1 MB by default; a bigger one gets 413.
+
+## Language ergonomics & stdlib
+
+```grain
+# String interpolation, with format specifiers after a colon
+let name = "Grain"
+let balance = decimal("1234.56")
+print($"Hello {name}, balance: {balance:,.2f}")   # Hello Grain, balance: 1,234.56
+print($"[{7:>5}] {{braces}}")                      # [    7] {braces}
+
+# Optional chaining (?.): nil, or anything that is not a map, gives nil instead of an error
+let token = req?.headers?.authorization
+
+# Destructuring, in a function as well as at the top level
+let { sku, price: cost } = get_product()          # a key, or key: new_name
+let [ head, next ] = [1, 2, 3]                    # takes the first two
+
+# Identifiers, timestamps, and lookup that does not fail
+let id = uuid_v4()                                # 36 characters, version 4
+let ts = iso8601()                                # 2026-10-24T20:43:44Z; iso8601(0) is 1970-01-01T00:00:00Z
+let host = get_in(config, ["network", "host"], "127.0.0.1")   # the default when any step is missing
+let first = get(items, 0, nil)                    # get(map_or_list, key_or_index, default)
+
+# Worker lifecycle supervision
+while not is_stopping() {
+  process_queue()
+  sleep(1000)
+}
+```
+
+What it will not do, so you are not surprised:
+
+- Destructuring a list with fewer items than names, or destructuring `nil`, is a runtime error (`index 2 is outside a list of 2`, `cannot index a nil`). A map missing a key gives `nil` for that name.
+
+Compile errors show where, with a caret under the problem:
+
+```
+lex_error.gr:2:15: unexpected character '$'
+let total = 1 $ 2
+              ^
+```
+
+Column tracking is supported for both compile-stage and runtime errors; runtime error messages and stack traces report exact column positions and display diagnostic carets.
+
+Other helpers: `random_bytes(n)` (n raw bytes from the operating system's random source, up to 1 MiB; use `hex_encode` or `base64_encode` to print them), `sha256(text)` and `hmac_sha256(key, text)` (hex strings), `hash_equals(a, b)` (for strings of the same length it takes the same time wherever they differ, which is what comparing a token or signature needs), `base64_encode`/`base64_decode`, `hex_encode`/`hex_decode`, and the `regex_*` functions. `assert_eq`, `assert_ne`, `assert_true` and `assert_false` stop a program with a message, which is what tests are written with.
 
 ## One program, a window or a web page
 
@@ -496,6 +565,8 @@ per-user directory (`~/Library/Caches/grain`, `~/.cache/grain`,
 grain test [file | dir]...        run every *_test.gr: each test on its own, failures with their message
 grain fmt [--check] <file | dir>  lay source out the one grain way (in place; --check only lists)
 grain lsp                         a language server: diagnostics, formatting, symbols, completion
+grain debug <file.gr>             run script in interactive step-by-step debugger
+grain pkg init|add|list|vendor    package and dependency management (`grain pkg help`)
 ```
 
 A test file registers tests and states what must hold:
@@ -537,6 +608,52 @@ comment-token = "#"
 language-servers = ["grain"]
 ```
 
+### Debugging with `grain debug`
+
+`grain debug <file.gr>` runs a program under an interactive terminal debugger. It always runs interpreted (native code has no line hook), and stops first at the program's first line:
+
+- `s` / `step`: run to the next line, going into calls
+- `n` / `next`: run to the next line in this call, over any calls
+- `c` / `continue`: run until a breakpoint or the end
+- `b <line>` / `d [line]`: set a breakpoint / remove one (or all)
+- `p <name>`: a local or global's value
+- `locals`: the locals in scope in this call, by name
+- `bt` / `where`: the call stack
+- `l` / `list [line]`: source around the current line
+- `q`: quit
+
+A breakpoint fires each time the line is entered, so one in a loop body stops on every pass. A line holding a whole loop on one line stops once. `debugger()` in a program pauses at the next line when run by `grain debug`, and does nothing otherwise. Input comes from stdin, so a session can be scripted: `printf 'b 7\nc\np i\nc\n' | grain debug prog.gr`.
+
+### Packages (`grain pkg`)
+
+A project is a folder with a `grain.pkg` (name, version, `main`, dependencies). Imports are read relative to the file that imports them; `grain pkg` helps with the ones that are not inside the folder.
+
+- `grain pkg init [name]`: writes `grain.pkg`.
+- `grain pkg add <file.gr> [name]`: copies a file into `vendor/<name>.gr` and records it; import it as `import "vendor/<name>.gr"`.
+- `grain pkg list`: prints the manifest.
+- `grain pkg vendor`: finds the imports, reachable from `main`, that live outside the folder and copies them into `vendor/`. It refuses to overwrite a different file of the same name, and prints the import line to change in each importing file; it does not edit your source.
+- `grain pkg check`: compiles `main` and every file it imports, and fails if an import names no file.
+
+### Cycles (`gc()`)
+
+Values are reference counted, so most garbage goes the moment nothing uses it. A cycle (two maps pointing at each other, a list holding itself) keeps itself alive. `gc()` finds cycles that nothing outside them holds, empties them so the counts can free them, and returns how many objects it emptied:
+
+```grain
+let a = {}
+let b = {}
+a["b"] = b
+b["a"] = a   # a cycle
+
+a = nil
+b = nil
+
+let reclaimed = gc()   # 2
+```
+
+Cycle collection runs automatically: a pass starts when the number of tracked containers (lists, maps, closures, entities) reaches a limit that grows with what survived the last pass. Long-running applications, workers and request loops do not accumulate cyclic garbage: a loop that built 3 million cyclic pairs without ever calling `gc()` held at 33 MB, where without the collector it reached 1.4 GB. `gc()` can also be called manually at any time to run a collection immediately. It only empties what no other reference reaches, so it is safe to call anywhere, including inside a callback that is walking a list.
+
+Imported modules are compiled once per source text and shared, so importing the same file again (from another module or another worker) does not re-parse it.
+
 ## Shipping a program
 
 ```
@@ -563,6 +680,62 @@ than run.
   file. On macOS a program that opens windows needs SDL2 wherever it runs, unless
   grain was built with `-DGRAIN_SDL2_STATIC=ON`, which compiles SDL2 2.32.10
   from its release and links it in. Use that for releases.
+
+## Services and apps (`grain host` and `grain app`)
+
+`grain host` is a supervisor that runs Grain programs as managed services,
+restarts them if they fail, and deploys updates with zero downtime. An app is a
+folder with your code and an `app.gr`:
+
+```grain
+let app = {
+  "name": "hello",
+  "main": "main.gr",
+  "kind": "web", "port": 18601,
+  "settings": {"GREETING": "hello"},
+  "secrets": ["SIGNATURE"],
+  "health": {"path": "/"},
+  "check": "check.gr",
+  "deployed": "deployed.gr"
+}
+```
+
+Run the host, then control it with `grain app`:
+
+```
+grain host                          run the supervisor here (or `grain host install` for systemd)
+grain app run ./hello               run directly in the foreground, no host needed
+grain app check ./hello             make sure the manifest and every file compile
+grain app deploy ./hello            stage on a spare port, check health, verify, and swap
+grain app status                    what is running, uptime, errors, restart count
+grain app logs hello -f             follow stdout, stderr, and supervisor events
+grain app set hello GREETING=howdy  change a setting (applies on next start)
+echo -n 'secret' | grain app secret hello SIGNATURE  # encrypted on disk (AES-256-GCM)
+grain app rollback hello            jump back to the previous release
+grain app restart hello
+```
+
+When you deploy a web app, the host launches the new release on a temporary port
+alongside the live one, polls its health check until it responds with any status below 500
+(or one of the codes listed in `health.ok`), and runs `check.gr` against it. If anything fails,
+the staging process is stopped and traffic continues to the old release without dropping a single request. If all
+checks pass, the host hands the listening socket to the new process and drains
+the old one. Every release is saved by the SHA-256 of its files under
+`~/.grain/apps/<name>/versions/`, so `grain app rollback` reverts instantly.
+
+To manage other machines over the network:
+
+```
+grain app add-host web2 10.0.0.5:7480 key=@web2.key
+grain app deploy ./hello at web2
+grain app status --all
+```
+
+Inside AIOS, `aios exec "serve port=7480"` runs the same host engine with
+native access to ASQL and the fleet mesh (`app deploy ... on <node>`). See
+[docs/grain-apps.md](../docs/grain-apps.md) for how the host works,
+[docs/grain-app-writing.md](../docs/grain-app-writing.md) for writing manifests and
+handlers, and [docs/aios-serve.md](../docs/aios-serve.md) for running on AIOS.
 
 ## Building
 
@@ -629,7 +802,7 @@ stops with an error in its window instead of freezing the desktop.
 | | macOS arm64 | macOS x86_64 | Linux x86_64 | Linux arm64 | Windows x64 |
 |---|---|---|---|---|---|
 | interpreter | yes | yes | yes | yes | yes |
-| JIT | yes (`MAP_JIT`; tools/grain-jit cases match the interpreter, no leaks) | no backend yet | no backend yet | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
+| JIT | yes (`MAP_JIT`; tools/grain-jit cases match the interpreter, no leaks) | yes (grain_jit_x64.cpp; not yet run on a Mac) | yes (`tools/grain-jit/check.sh --x86 <build>`: cases match the interpreter, no leaks) | yes (checked under qemu by tools/grain-jit/check.sh) | no backend yet |
 
 Built and tested so far: macOS arm64 (57 of 57 cases, a signed .app passing
 strict verification, the live HTTPS checks, the window test on a real macOS

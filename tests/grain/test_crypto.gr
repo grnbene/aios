@@ -1,0 +1,23 @@
+# sha256, hmac_sha256, hash_equals, base64 and random_bytes, against published vectors (RFC 4231 cases 1 and 2; FIPS 180 "abc").
+
+assert_eq(sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+assert_eq(hmac_sha256(hex_decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), "Hi There"),
+          "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+assert_eq(hmac_sha256("Jefe", "what do ya want for nothing?"),
+          "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+
+assert_eq(hash_equals("abc", "abc"), true)
+assert_eq(hash_equals("abc", "abd"), false)
+assert_eq(base64_decode(base64_encode("hello")), "hello")
+
+# random_bytes: the length asked for, different each time, and refused when out of range
+assert_eq(len(random_bytes(16)), 16)
+assert_eq(len(random_bytes(0)), 0)
+assert_true(random_bytes(16) != random_bytes(16), "two draws of 16 random bytes were equal")
+assert_eq(len(hex_encode(random_bytes(8))), 16)
+let neg = pcall(random_bytes, -1)
+assert_eq(neg.ok, false)
+let big = pcall(random_bytes, 2000000)
+assert_eq(big.ok, false)
+
+print("CRYPTO TESTS PASSED")

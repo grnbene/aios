@@ -68,11 +68,20 @@ Value bi_len(Vm&, std::vector<Value>& args, std::string& error) {
   }
 }
 
-Value bi_type(Vm&, std::vector<Value>& args, std::string&) {
-  return Value::string(type_name(args[0].type));
+// One string per type name, made once per VM and shared (strings are immutable): `type(v) == "string"` on every value a
+// loop touched made a string for each.
+Value bi_type(Vm& vm, std::vector<Value>& args, std::string&) {
+  if (vm.type_names.empty())
+    for (int t = 0; t <= (int)Type::Decimal; ++t) vm.type_names.push_back(Value::string(type_name((Type)t)));
+  const size_t t = (size_t)args[0].type;
+  return t < vm.type_names.size() ? vm.type_names[t] : Value::string(type_name(args[0].type));
 }
 
+// A string is its own text: handed back as is (strings are immutable, so sharing one is safe), as the trims and
+// case changes below hand back what they would not change - ck()'s upper(rtrim(str(s))) over keys already in
+// that form made three copies of every key it was asked about.
 Value bi_str(Vm&, std::vector<Value>& args, std::string&) {
+  if (args[0].type == Type::Str && args[0].obj) return args[0];
   return Value::string(args[0].to_text());
 }
 
@@ -138,18 +147,23 @@ Value bi_real(Vm&, std::vector<Value>& args, std::string& error) {
 
 // --- lists -----------------------------------------------------------------
 
-Value bi_push(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_push(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "push")) return Value::nil();
   auto& items = args[0].list_items();
-  for (size_t i = 1; i < args.size(); ++i) items.push_back(args[i]);
-  return args[0];
+  bool has_c = false;
+  for (size_t i = 1; i < args.size(); ++i) {
+    if (args[i].is_container()) has_c = true;
+    items.push_back(std::move(args[i]));
+  }
+  if (has_c) vm.track_container(args[0].obj);
+  return std::move(args[0]);
 }
 
 Value bi_pop(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "pop")) return Value::nil();
   auto& items = args[0].list_items();
   if (items.empty()) { error = "pop() on an empty list"; return Value::nil(); }
-  Value out = items.back();
+  Value out = std::move(items.back());
   items.pop_back();
   return out;
 }
@@ -267,16 +281,24 @@ Value bi_join(Vm&, std::vector<Value>& args, std::string& error) {
 
 Value bi_upper(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "upper")) return Value::nil();
-  std::string s = args[0].str();
-  for (char& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-  return Value::string(s);
+  const std::string& in = args[0].str();
+  size_t at = 0;
+  while (at < in.size() && !(in[at] >= 'a' && in[at] <= 'z')) ++at;
+  if (at == in.size()) return args[0];
+  std::string s = in;
+  for (size_t i = at; i < s.size(); ++i) if (s[i] >= 'a' && s[i] <= 'z') s[i] = (char)(s[i] - 32);
+  return Value::string(std::move(s));
 }
 
 Value bi_lower(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "lower")) return Value::nil();
-  std::string s = args[0].str();
-  for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-  return Value::string(s);
+  const std::string& in = args[0].str();
+  size_t at = 0;
+  while (at < in.size() && !(in[at] >= 'A' && in[at] <= 'Z')) ++at;
+  if (at == in.size()) return args[0];
+  std::string s = in;
+  for (size_t i = at; i < s.size(); ++i) if (s[i] >= 'A' && s[i] <= 'Z') s[i] = (char)(s[i] + 32);
+  return Value::string(std::move(s));
 }
 
 // -1 for "not here", so a caller can test it without a second call.
@@ -438,20 +460,186 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (path.empty()) { error = "import(): an empty path"; return Value::nil(); }
   if (path[0] != '/' && !(path.size() > 2 && path[1] == ':') && !vm.base_dir.empty()) path = vm.base_dir + "/" + path;
   path = import_normalize(path);
-  for (const auto& done : vm.imported) if (done == path) return Value::nil();
+  std::string as_name;
+  struct ImportSym {
+    std::string orig;
+    std::string alias;
+  };
+  std::vector<ImportSym> symbols_filter;
+  if (args.size() >= 2) {
+    if (args[1].type == Type::Str) {
+      as_name = args[1].str();
+    } else if (args[1].type == Type::List) {
+      for (const auto& item : args[1].list_items()) {
+        if (item.type == Type::Str) {
+          symbols_filter.push_back({item.str(), item.str()});
+        } else if (item.type == Type::List && item.list_items().size() >= 2) {
+          symbols_filter.push_back({item.list_items()[0].str(), item.list_items()[1].str()});
+        }
+      }
+    }
+  }
+
+  // plain: path; as a name: path#name; picking names out: path#* (their values live under __mod_<hash>::)
+  const bool selective = as_name.empty() && !symbols_filter.empty();
+  const std::string import_tag = path + (selective ? "#*" : as_name.empty() ? "" : "#" + as_name);
+  for (const auto& done : vm.imported) {
+    if (done == import_tag || done == path) {
+      if (!symbols_filter.empty()) {
+        // already loaded: the names are where that load put them. Plain-imported, they are top-level globals;
+        // picked out, they are under the module's own prefix. Anything else - another module's, or the
+        // importing program's - is not this file's, so it is an error rather than a quiet wrong binding.
+        const std::string prefix = "__mod_" + std::to_string(std::hash<std::string>{}(path));
+        for (const auto& sym : symbols_filter) {
+          Value* val = vm.find_global(prefix + "::" + sym.orig);
+          if (!val && done == path) val = vm.find_global(sym.orig);
+          if (!val) { error = "import(\"" + path + "\") defines no '" + sym.orig + "'"; return Value::nil(); }
+          vm.define_global(sym.alias, *val);
+        }
+      }
+      return Value::nil();
+    }
+  }
   std::string source, why;
   if (!(vm.packed_source && vm.packed_source(path, source))) {
     if (!vm.files) { error = "import(): this program has no file storage to import \"" + path + "\" from"; return Value::nil(); }
     if (!vm.files->read(path, source, why)) { error = "import(\"" + path + "\"): " + why; return Value::nil(); }
   }
-  vm.imported.push_back(path);   // before it runs: a file that imports its importer finds it already loaded
-  CompileResult compiled = compile_source(source, path, false);
-  if (!compiled.ok()) {
+  vm.imported.push_back(import_tag);   // before it runs: a file that imports its importer finds it already loaded
+
+  struct CachedModule {
+    CompileResult result;
+    size_t hash = 0;
+  };
+  static std::mutex s_mod_cache_mu;
+  static std::unordered_map<std::string, CachedModule> s_mod_cache;
+
+  size_t src_hash = std::hash<std::string>{}(source);
+  CompileResult raw_compiled;
+  {
+    std::lock_guard<std::mutex> lk(s_mod_cache_mu);
+    auto it = s_mod_cache.find(path);
+    if (it != s_mod_cache.end() && it->second.hash == src_hash) {
+      raw_compiled = it->second.result;
+    }
+  }
+  if (!raw_compiled.ok()) {
+    raw_compiled = compile_source(source, path, false);
+    if (raw_compiled.ok()) {
+      std::lock_guard<std::mutex> lk(s_mod_cache_mu);
+      s_mod_cache[path] = {raw_compiled, src_hash};
+    }
+  }
+  if (!raw_compiled.ok()) {
     error = "import(\"" + path + "\") does not compile:";
-    for (const auto& d : compiled.errors) error += "\n  " + path + ":" + std::to_string(d.line) + ": " + d.message;
+    for (const auto& d : raw_compiled.errors) error += "\n  " + path + ":" + std::to_string(d.line) + ": " + d.message;
     return Value::nil();
   }
-  // Name its functions after the file, so a trace through them says where they are.
+
+  CompileResult compiled = raw_compiled;
+  if (!as_name.empty() || !symbols_filter.empty()) {
+    compiled.script = std::make_shared<FnObj>(*raw_compiled.script);
+  }
+
+  std::string mod_prefix;
+  if (!as_name.empty()) {
+    mod_prefix = as_name;
+  } else if (!symbols_filter.empty()) {
+    mod_prefix = "__mod_" + std::to_string(std::hash<std::string>{}(path));
+  }
+
+  std::unordered_set<std::string> defined_names;
+  if (!mod_prefix.empty()) {
+    const auto& code = compiled.script->chunk.code;
+    const auto& consts = compiled.script->chunk.constants;
+    size_t ci = 0;
+    while (ci < code.size()) {
+      Op op = static_cast<Op>(code[ci]);
+      if (op == Op::DefineGlobal && ci + 2 < code.size()) {
+        uint16_t k = (static_cast<uint16_t>(code[ci + 1]) << 8) | code[ci + 2];
+        if (k < consts.size() && consts[k].type == Type::Str) {
+          defined_names.insert(consts[k].str());
+        }
+      }
+      switch (op) {
+        case Op::Nil: case Op::True: case Op::False: case Op::Pop:
+        case Op::Equal: case Op::NotEqual: case Op::Less: case Op::LessEqual: case Op::Greater: case Op::GreaterEqual:
+        case Op::Add: case Op::Subtract: case Op::Multiply: case Op::Divide: case Op::Modulo: case Op::Negate: case Op::Not:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::BitNot: case Op::Shl: case Op::Shr:
+        case Op::Dup: case Op::Dup2:
+        case Op::CloseUpvalue: case Op::Return: case Op::IndexGet: case Op::IndexSet: case Op::IterPrep: case Op::Halt:
+          ci += 1; break;
+        case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue: case Op::Call: case Op::IterNext:
+          ci += 2; break;
+        case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
+        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+        case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
+          ci += 3; break;
+        case Op::Closure: {
+          if (ci + 2 >= code.size()) { ci = code.size(); break; }
+          uint16_t ck = (static_cast<uint16_t>(code[ci + 1]) << 8) | code[ci + 2];
+          if (ck < consts.size() && consts[ck].obj) {
+            const auto* sub = static_cast<const FnObj*>(consts[ck].obj.get());
+            ci += 3 + 2 * sub->upvalue_index.size();
+          } else {
+            ci += 3;
+          }
+          break;
+        }
+        default: ci += 1; break;
+      }
+    }
+  }
+
+  // Rewrite global access opcodes to target namespaced constants, leaving string literals intact.
+  auto rewrite_chunk_globals = [&](Chunk& ch) {
+    if (mod_prefix.empty()) return;
+    auto& code = ch.code;
+    size_t ci = 0;
+    while (ci < code.size()) {
+      Op op = static_cast<Op>(code[ci]);
+      if ((op == Op::GetGlobal || op == Op::SetGlobal || op == Op::DefineGlobal) && ci + 2 < code.size()) {
+        uint16_t k = (static_cast<uint16_t>(code[ci + 1]) << 8) | code[ci + 2];
+        if (k < ch.constants.size() && ch.constants[k].type == Type::Str) {
+          const std::string& old_name = ch.constants[k].str();
+          if (defined_names.count(old_name) > 0) {
+            size_t new_k = ch.add_constant(Value::string(mod_prefix + "::" + old_name));
+            code[ci + 1] = static_cast<uint8_t>((new_k >> 8) & 0xff);
+            code[ci + 2] = static_cast<uint8_t>(new_k & 0xff);
+          }
+        }
+      }
+      switch (op) {
+        case Op::Nil: case Op::True: case Op::False: case Op::Pop:
+        case Op::Equal: case Op::NotEqual: case Op::Less: case Op::LessEqual: case Op::Greater: case Op::GreaterEqual:
+        case Op::Add: case Op::Subtract: case Op::Multiply: case Op::Divide: case Op::Modulo: case Op::Negate: case Op::Not:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::BitNot: case Op::Shl: case Op::Shr:
+        case Op::Dup: case Op::Dup2:
+        case Op::CloseUpvalue: case Op::Return: case Op::IndexGet: case Op::IndexSet: case Op::IterPrep: case Op::Halt:
+          ci += 1; break;
+        case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue: case Op::Call: case Op::IterNext:
+          ci += 2; break;
+        case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
+        case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: case Op::BuildList: case Op::BuildMap:
+        case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
+          ci += 3; break;
+        case Op::Closure: {
+          if (ci + 2 >= code.size()) { ci = code.size(); break; }
+          uint16_t ck = (static_cast<uint16_t>(code[ci + 1]) << 8) | code[ci + 2];
+          if (ck < ch.constants.size() && ch.constants[ck].obj) {
+            const auto* sub = static_cast<const FnObj*>(ch.constants[ck].obj.get());
+            ci += 3 + 2 * sub->upvalue_index.size();
+          } else {
+            ci += 3;
+          }
+          break;
+        }
+        default: ci += 1; break;
+      }
+    }
+  };
+
+  rewrite_chunk_globals(compiled.script->chunk);
   std::vector<FnObj*> todo;
   for (const Value& c : compiled.script->chunk.constants)
     if (c.type == Type::Fn && c.obj && !c.obj->is_closure) todo.push_back(static_cast<FnObj*>(c.obj.get()));
@@ -459,6 +647,7 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
     FnObj* f = todo.back();
     todo.pop_back();
     f->name = path + ":" + f->name;
+    rewrite_chunk_globals(f->chunk);
     for (const Value& c : f->chunk.constants)
       if (c.type == Type::Fn && c.obj && !c.obj->is_closure) todo.push_back(static_cast<FnObj*>(c.obj.get()));
   }
@@ -468,7 +657,25 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
   vm.base_dir = saved_dir;
   if (!why.empty()) { error = "import(\"" + path + "\"): " + why; return Value::nil(); }
   (void)ignored;
-  return Value::nil();
+
+  auto mod_map = std::make_shared<MapObj>();
+  if (!as_name.empty()) {
+    for (const auto& name : defined_names) {
+      std::string prefixed = as_name + "::" + name;
+      Value* val = vm.find_global(prefixed);
+      if (val) mod_map->put(name, *val);
+    }
+    vm.define_global(as_name, Value::object(Type::Map, mod_map));
+  } else if (!symbols_filter.empty()) {
+    for (const auto& sym : symbols_filter) {
+      std::string prefixed = mod_prefix + "::" + sym.orig;
+      Value* val = vm.find_global(prefixed);
+      if (!val) { error = "import(\"" + path + "\") defines no '" + sym.orig + "'"; return Value::nil(); }
+      vm.define_global(sym.alias, *val);
+      mod_map->put(sym.alias, *val);
+    }
+  }
+  return Value::object(Type::Map, mod_map);
 }
 
 Value bi_min(Vm&, std::vector<Value>& args, std::string& error) {
@@ -557,6 +764,7 @@ Value bi_trim(Vm&, std::vector<Value>& args, std::string& error) {
   size_t start = s.find_first_not_of(chars);
   if (start == std::string::npos) return Value::string("");
   size_t end = s.find_last_not_of(chars);
+  if (start == 0 && end + 1 == s.size()) return args[0];
   return Value::string(s.substr(start, end - start + 1));
 }
 
@@ -566,6 +774,7 @@ Value bi_ltrim(Vm&, std::vector<Value>& args, std::string& error) {
   std::string chars = args.size() > 1 && args[1].type == Type::Str ? args[1].str() : " \t\r\n";
   size_t start = s.find_first_not_of(chars);
   if (start == std::string::npos) return Value::string("");
+  if (start == 0) return args[0];
   return Value::string(s.substr(start));
 }
 
@@ -575,7 +784,31 @@ Value bi_rtrim(Vm&, std::vector<Value>& args, std::string& error) {
   std::string chars = args.size() > 1 && args[1].type == Type::Str ? args[1].str() : " \t\r\n";
   size_t end = s.find_last_not_of(chars);
   if (end == std::string::npos) return Value::string("");
+  if (end + 1 == s.size()) return args[0];
   return Value::string(s.substr(0, end + 1));
+}
+
+// upper_rtrim(v) = upper(rtrim(str(v), " ")): a key as MariaDB's default collation compares codes (trailing
+// spaces dropped, case folded), the one call a lookup makes for every key - and the value itself when it is
+// already in that form.
+Value bi_upper_rtrim(Vm&, std::vector<Value>& args, std::string&) {
+  if (args[0].type != Type::Str || !args[0].obj) {
+    std::string t = args[0].to_text();
+    size_t n = t.size();
+    while (n > 0 && t[n - 1] == ' ') --n;
+    t.resize(n);
+    for (char& c : t) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    return Value::string(std::move(t));
+  }
+  const std::string& in = args[0].str();
+  size_t n = in.size();
+  while (n > 0 && in[n - 1] == ' ') --n;
+  bool lower = false;
+  for (size_t i = 0; i < n && !lower; ++i) lower = in[i] >= 'a' && in[i] <= 'z';
+  if (!lower && n == in.size()) return args[0];
+  std::string t = in.substr(0, n);
+  for (char& c : t) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+  return Value::string(std::move(t));
 }
 
 Value bi_starts_with(Vm&, std::vector<Value>& args, std::string& error) {
@@ -938,7 +1171,7 @@ Value bi_concat(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::nil();
 }
 
-Value bi_insert(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_insert(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "insert") || !want_number(args[1], error, "insert")) return Value::nil();
   auto& items = args[0].list_items();
   int64_t idx = args[1].as_int();
@@ -947,6 +1180,7 @@ Value bi_insert(Vm&, std::vector<Value>& args, std::string& error) {
     error = "insert() index out of bounds";
     return Value::nil();
   }
+  if (args[2].is_container()) vm.track_container(args[0].obj);
   items.insert(items.begin() + idx, args[2]);
   return args[0];
 }
@@ -1306,15 +1540,25 @@ Value bi_e(Vm&, std::vector<Value>&, std::string&) {
 
 // --- system & environment --------------------------------------------------
 
-Value bi_getenv(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_getenv(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "getenv")) return Value::nil();
+  if (vm.settings) {   // a hosted app's own settings come first (Vm::settings)
+    std::lock_guard<std::mutex> lk(vm.settings->mu);
+    auto it = vm.settings->values.find(args[0].str());
+    if (it != vm.settings->values.end()) return Value::string(it->second);
+  }
   const char* val = std::getenv(args[0].str().c_str());
   if (val) return Value::string(val);
   return args.size() > 1 ? args[1] : Value::nil();
 }
 
-Value bi_setenv(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_setenv(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "setenv") || !want_str(args[1], error, "setenv")) return Value::nil();
+  if (vm.settings) {   // a hosted app changes its own settings, not the process every app shares
+    std::lock_guard<std::mutex> lk(vm.settings->mu);
+    vm.settings->values[args[0].str()] = args[1].str();
+    return Value::boolean(true);
+  }
   int r = setenv(args[0].str().c_str(), args[1].str().c_str(), 1);
   return Value::boolean(r == 0);
 }
@@ -1331,13 +1575,245 @@ Value bi_time_ms(Vm&, std::vector<Value>&, std::string&) {
   return Value::integer((int64_t)duration_cast<milliseconds>(now).count());
 }
 
-Value bi_sleep(Vm&, std::vector<Value>& args, std::string& error) {
+Value bi_sleep(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[0], error, "sleep")) return Value::nil();
   int64_t ms = args[0].as_int();
+  if (ms > 0 && vm.stop_flag) {   // a hosted app: in slices, so its host's stop is not held up by a long sleep
+    while (ms > 0 && !vm.stop_flag->load()) {
+      const int64_t step = ms < 50 ? ms : 50;
+      aios::hal::sleep_ms((uint32_t)step);
+      ms -= step;
+    }
+    return Value::nil();
+  }
   if (ms > 0) {
     aios::hal::sleep_ms((uint32_t)ms);
   }
   return Value::nil();
+}
+
+Value bi_gc(Vm& vm, std::vector<Value>&, std::string&) {
+  return Value::integer(static_cast<int64_t>(vm.collect_cycles()));
+}
+
+// Stops at the next line when `grain debug` is driving; anywhere else there is nobody to stop for, so it does nothing.
+Value bi_debugger(Vm& vm, std::vector<Value>&, std::string&) {
+  if (!vm.debug_state.on_break) return Value::nil();
+  vm.debug_state.enabled = true;
+  vm.debug_state.step_line = true;
+  return Value::nil();
+}
+
+Value bi_is_stopping(Vm& vm, std::vector<Value>&, std::string&) {
+  return Value::boolean(vm.stop_flag && vm.stop_flag->load());
+}
+
+Value bi_uuid_v4(Vm&, std::vector<Value>&, std::string&) {
+  uint8_t b[16];
+  std::random_device rd;
+  for (int i = 0; i < 16; i += 4) {
+    uint32_t r = rd();
+    std::memcpy(&b[i], &r, 4);
+  }
+  b[6] = (b[6] & 0x0f) | 0x40; // version 4
+  b[8] = (b[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+  char buf[37];
+  std::snprintf(buf, sizeof(buf),
+    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+  return Value::string(buf);
+}
+
+Value bi_iso8601(Vm&, std::vector<Value>& args, std::string& error) {
+  double t = 0;
+  if (args.empty()) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    t = static_cast<double>(ms) / 1000.0;
+  } else {
+    if (!want_number(args[0], error, "iso8601")) return Value::nil();
+    t = args[0].as_double();
+    if (t > 1e11) t /= 1000.0;
+  }
+  time_t sec = static_cast<time_t>(t);
+  struct tm tm_buf;
+#if defined(_WIN32)
+  gmtime_s(&tm_buf, &sec);
+#else
+  gmtime_r(&sec, &tm_buf);
+#endif
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+  return Value::string(buf);
+}
+
+Value bi_get_in(Vm&, std::vector<Value>& args, std::string& error) {
+  Value cur = args[0];
+  const Value& path = args[1];
+  Value def_val = args.size() > 2 ? args[2] : Value::nil();
+  std::vector<std::string> keys;
+  if (path.type == Type::List) {
+    for (const auto& item : path.list_items()) keys.push_back(item.to_text());
+  } else if (path.type == Type::Str) {
+    const std::string& p = path.str();
+    size_t at = 0;
+    while (at < p.size()) {
+      size_t dot = p.find('.', at);
+      if (dot == std::string::npos) { keys.push_back(p.substr(at)); break; }
+      keys.push_back(p.substr(at, dot - at));
+      at = dot + 1;
+    }
+  } else {
+    error = "get_in() wants a list of keys or a dot-separated string path";
+    return Value::nil();
+  }
+  for (const auto& k : keys) {
+    if (cur.type == Type::Nil) return def_val;
+    if (cur.type == Type::Map && cur.obj) {
+      Value* v = static_cast<MapObj*>(cur.obj.get())->find(k);
+      if (!v) return def_val;
+      cur = *v;
+    } else if (cur.type == Type::List && cur.obj) {
+      char* end = nullptr;
+      long idx = std::strtol(k.c_str(), &end, 10);
+      if (*end != '\0') return def_val;
+      const auto& items = cur.list_items();
+      if (idx < 0) idx += (long)items.size();
+      if (idx < 0 || idx >= (long)items.size()) return def_val;
+      cur = items[(size_t)idx];
+    } else {
+      return def_val;
+    }
+  }
+  return cur;
+}
+
+Value bi_get(Vm&, std::vector<Value>& args, std::string& error) {
+  const Value& target = args[0];
+  const Value& key = args[1];
+  Value def_val = args.size() > 2 ? args[2] : Value::nil();
+  if (target.type == Type::Nil) return def_val;
+  if (target.type == Type::Map && target.obj) {
+    if (key.type != Type::Str) { error = "get() map key must be a string"; return Value::nil(); }
+    Value* v = static_cast<MapObj*>(target.obj.get())->find(key.str());
+    return v ? *v : def_val;
+  }
+  if (target.type == Type::List && target.obj) {
+    if (!key.is_number()) return def_val;
+    int64_t at = key.as_int();
+    const auto& items = target.list_items();
+    if (at < 0) at += (int64_t)items.size();
+    if (at < 0 || at >= (int64_t)items.size()) return def_val;
+    return items[(size_t)at];
+  }
+  return def_val;
+}
+
+Value bi_assert_eq(Vm&, std::vector<Value>& args, std::string& error) {
+  const Value& a = args[0];
+  const Value& b = args[1];
+  if (!a.equals(b)) {
+    if (args.size() > 2 && args[2].type == Type::Str) {
+      error = args[2].str() + " (got " + a.repr() + ", expected " + b.repr() + ")";
+    } else {
+      error = "assert_eq failed: got " + a.repr() + ", expected " + b.repr();
+    }
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
+Value bi_assert_ne(Vm&, std::vector<Value>& args, std::string& error) {
+  const Value& a = args[0];
+  const Value& b = args[1];
+  if (a.equals(b)) {
+    if (args.size() > 2 && args[2].type == Type::Str) {
+      error = args[2].str() + " (values are equal: " + a.repr() + ")";
+    } else {
+      error = "assert_ne failed: values are equal (" + a.repr() + ")";
+    }
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
+Value bi_assert_true(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!args[0].truthy()) {
+    error = args.size() > 1 && args[1].type == Type::Str ? args[1].str() : "assert_true failed: condition is not true";
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
+Value bi_assert_false(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].truthy()) {
+    error = args.size() > 1 && args[1].type == Type::Str ? args[1].str() : "assert_false failed: condition is not false";
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
+Value bi_res_json(Vm&, std::vector<Value>& args, std::string&) {
+  int64_t status = args.size() > 1 && args[1].type == Type::Int ? args[1].as_int() : 200;
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("application/json; charset=utf-8"));
+  m->put("json", args[0]);
+  if (args.size() > 2 && args[2].type == Type::Map) {
+    m->put("headers", args[2]);
+  }
+  return Value::object(Type::Map, m);
+}
+
+Value bi_res_text(Vm&, std::vector<Value>& args, std::string&) {
+  int64_t status = args.size() > 1 && args[1].type == Type::Int ? args[1].as_int() : 200;
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("text/plain; charset=utf-8"));
+  m->put("body", Value::string(args[0].to_text()));
+  if (args.size() > 2 && args[2].type == Type::Map) {
+    m->put("headers", args[2]);
+  }
+  return Value::object(Type::Map, m);
+}
+
+Value bi_res_html(Vm&, std::vector<Value>& args, std::string&) {
+  int64_t status = args.size() > 1 && args[1].type == Type::Int ? args[1].as_int() : 200;
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("text/html; charset=utf-8"));
+  m->put("body", Value::string(args[0].to_text()));
+  if (args.size() > 2 && args[2].type == Type::Map) {
+    m->put("headers", args[2]);
+  }
+  return Value::object(Type::Map, m);
+}
+
+Value bi_res_error(Vm&, std::vector<Value>& args, std::string&) {
+  int64_t status = args[0].is_number() ? args[0].as_int() : 500;
+  std::string msg = args.size() > 1 ? args[1].to_text() : "Internal Error";
+  auto err_map = std::make_shared<MapObj>();
+  err_map->put("error", Value::string(msg));
+  err_map->put("status", Value::integer(status));
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("application/json; charset=utf-8"));
+  m->put("json", Value::object(Type::Map, err_map));
+  return Value::object(Type::Map, m);
+}
+
+Value bi_res_redirect(Vm&, std::vector<Value>& args, std::string&) {
+  std::string loc = args[0].to_text();
+  int64_t status = args.size() > 1 && args[1].type == Type::Int ? args[1].as_int() : 302;
+  auto hdrs = std::make_shared<MapObj>();
+  hdrs->put("Location", Value::string(loc));
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("text/plain; charset=utf-8"));
+  m->put("headers", Value::object(Type::Map, hdrs));
+  m->put("body", Value::string("Redirecting to " + loc));
+  return Value::object(Type::Map, m);
 }
 
 Value bi_cwd(Vm&, std::vector<Value>&, std::string&) {
@@ -1781,6 +2257,88 @@ Value bi_json_stringify(Vm&, std::vector<Value>& args, std::string& error) {
   std::string out;
   json_stringify_helper(args[0], out, 0, indent_spaces, 0);
   return Value::string(out);
+}
+
+// A field's value must stay on its own line: SSE ends a line at \n, \r or \r\n, so one of those inside an id,
+// event name or retry would start a field the program never wrote.
+static std::string sse_one_line(std::string s) {
+  s.erase(std::remove_if(s.begin(), s.end(), [](char c) { return c == '\n' || c == '\r'; }), s.end());
+  return s;
+}
+
+}  // namespace
+
+void format_one_sse_event(const Value& ev, std::string& out) {
+  if (ev.type == Type::Map) {
+    auto m = std::dynamic_pointer_cast<MapObj>(ev.obj);
+    if (!m) return;
+    if (Value* id = m->find("id")) {
+      out += "id: " + sse_one_line(id->to_text()) + "\n";
+    }
+    if (Value* event = m->find("event")) {
+      out += "event: " + sse_one_line(event->to_text()) + "\n";
+    }
+    if (Value* retry = m->find("retry")) {
+      out += "retry: " + sse_one_line(retry->to_text()) + "\n";
+    }
+    if (Value* data = m->find("data")) {
+      if (data->type == Type::Map || data->type == Type::List) {
+        std::string j;
+        json_stringify_helper(*data, j, 0, 0, 0);
+        out += "data: " + j + "\n";
+      } else {
+        std::string s = data->to_text();
+        size_t pos = 0;
+        for (;;) {
+          const size_t nl = s.find_first_of("\r\n", pos);
+          out += "data: " + s.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos) + "\n";
+          if (nl == std::string::npos) break;
+          pos = nl + ((s[nl] == '\r' && nl + 1 < s.size() && s[nl + 1] == '\n') ? 2 : 1);
+          if (pos >= s.size()) break;
+        }
+      }
+    }
+    out += "\n";
+  } else if (ev.type == Type::Str) {
+    // always data, whatever it looks like: text from a user must not be able to add fields or events
+    auto one = std::make_shared<MapObj>();
+    one->put("data", ev);
+    format_one_sse_event(Value::object(Type::Map, one), out);
+  } else {
+    out += "data: " + ev.to_text() + "\n\n";
+  }
+}
+
+namespace {
+
+Value bi_res_sse(Vm&, std::vector<Value>& args, std::string&) {
+  int64_t status = args.size() > 1 && args[1].type == Type::Int ? args[1].as_int() : 200;
+  std::string body;
+  if (args[0].type == Type::List) {
+    auto l = std::dynamic_pointer_cast<ListObj>(args[0].obj);
+    if (l) {
+      for (const auto& item : l->items) {
+        format_one_sse_event(item, body);
+      }
+    }
+  } else {
+    format_one_sse_event(args[0], body);
+  }
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(status));
+  m->put("content_type", Value::string("text/event-stream; charset=utf-8"));
+  m->put("body", Value::string(std::move(body)));
+  auto hdrs = std::make_shared<MapObj>();
+  hdrs->put("Cache-Control", Value::string("no-cache"));
+  hdrs->put("X-Accel-Buffering", Value::string("no"));
+  if (args.size() > 2 && args[2].type == Type::Map) {
+    auto given = std::dynamic_pointer_cast<MapObj>(args[2].obj);
+    if (given) {
+      for (const auto& kv : given->entries) hdrs->put(kv.first, kv.second);
+    }
+  }
+  m->put("headers", Value::object(Type::Map, hdrs));
+  return Value::object(Type::Map, m);
 }
 
 Value bi_base64_encode(Vm&, std::vector<Value>& args, std::string& error) {
@@ -6013,6 +6571,8 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("values", 1, 1, bi_values);
   vm.define_native("has", 2, 2, bi_has);
   vm.define_native("del", 2, 2, bi_del);
+  vm.define_native("get", 2, 3, bi_get);
+  vm.define_native("get_in", 2, 3, bi_get_in);
   vm.define_native("merge", 1, -1, bi_merge);
   vm.define_native("entries", 1, 1, bi_entries);
   vm.define_native("from_entries", 1, 1, bi_from_entries);
@@ -6030,6 +6590,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("trim", 1, 2, bi_trim);
   vm.define_native("ltrim", 1, 2, bi_ltrim);
   vm.define_native("rtrim", 1, 2, bi_rtrim);
+  vm.define_native("upper_rtrim", 1, 1, bi_upper_rtrim);
   vm.define_native("starts_with", 2, 2, bi_starts_with);
   vm.define_native("ends_with", 2, 2, bi_ends_with);
   vm.define_native("contains", 2, 2, bi_contains);
@@ -6048,7 +6609,7 @@ void install_core_builtins(Vm& vm) {
   // Math
   vm.define_native("abs", 1, 1, bi_abs);
   vm.define_native("idiv", 2, 2, bi_idiv);
-  vm.define_native("import", 1, 1, bi_import);
+  vm.define_native("import", 1, 2, bi_import);
   vm.define_native("utf8_valid", 1, 1, bi_utf8_valid);
   vm.define_native("min", 1, -1, bi_min);
   vm.define_native("max", 1, -1, bi_max);
@@ -6087,10 +6648,20 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("time", 0, 0, bi_time);
   vm.define_native("time_ms", 0, 0, bi_time_ms);
   vm.define_native("sleep", 1, 1, bi_sleep);
+  vm.define_native("is_stopping", 0, 0, bi_is_stopping);
+  vm.define_native("should_stop", 0, 0, bi_is_stopping);
+  vm.define_native("uuid_v4", 0, 0, bi_uuid_v4);
+  vm.define_native("iso8601", 0, 1, bi_iso8601);
+  vm.define_native("gc", 0, 0, bi_gc);
+  vm.define_native("debugger", 0, 0, bi_debugger);
   vm.define_native("cwd", 0, 0, bi_cwd);
 
   // Error Handling & Verification
   vm.define_native("assert", 1, 2, bi_assert);
+  vm.define_native("assert_eq", 2, 3, bi_assert_eq);
+  vm.define_native("assert_ne", 2, 3, bi_assert_ne);
+  vm.define_native("assert_true", 1, 2, bi_assert_true);
+  vm.define_native("assert_false", 1, 2, bi_assert_false);
   vm.define_native("clock", 0, 0, bi_clock);
   vm.define_native("try_call", 1, -1, bi_try_call);
   vm.define_native("pcall", 1, -1, bi_try_call);
@@ -6098,6 +6669,14 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("panic", 0, 1, bi_error);
   vm.define_native("is_err", 1, 1, bi_is_err);
   vm.define_native("is_ok", 1, 1, bi_is_ok);
+
+  // HTTP Response Helpers
+  vm.define_native("res_json", 1, 3, bi_res_json);
+  vm.define_native("res_text", 1, 3, bi_res_text);
+  vm.define_native("res_html", 1, 3, bi_res_html);
+  vm.define_native("res_error", 1, 2, bi_res_error);
+  vm.define_native("res_redirect", 1, 2, bi_res_redirect);
+  vm.define_native("res_sse", 1, 3, bi_res_sse);
 
   // Structured Data Handling (JSON, Base64, Hex, URL)
   vm.define_native("json_parse", 1, 1, bi_json_parse);
@@ -6427,17 +7006,6 @@ static std::shared_ptr<GrainPane> get_pane_from_value(const Vm& vm, const Value&
     if (p->id == target_id) return p;
   }
   return nullptr;
-}
-
-// How many arguments a callback takes (-1: a native, or not known). A pane's
-// draw callback is fn(canvas) or fn(canvas, pane); calling it with two and,
-// when that failed, again with one ran every callback that raised an error
-// twice and lost its message.
-static int callable_arity(const Value& f) {
-  if (f.type != Type::Fn || !f.obj) return -1;
-  const Obj* o = f.obj.get();
-  if (o->is_closure) return static_cast<const ClosureObj*>(o)->fn ? static_cast<const ClosureObj*>(o)->fn->arity : -1;
-  return static_cast<const FnObj*>(o)->arity;
 }
 
 // Calls a pane callback with (first, second), or (first) when it takes one.

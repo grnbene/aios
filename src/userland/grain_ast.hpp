@@ -31,17 +31,19 @@ enum class ExprKind : uint8_t {
   Index,       // a[b]
   IndexSet,    // a[b] = c
   Field,       // a.b
+  OptField,    // a?.b
   FieldSet,    // a.b = c
   ListLit,     // [a, b]
   MapLit,      // {k: v}
   Lambda       // fn (a) { ... } used as a value
 };
 
-struct Param { std::string name; int line = 0; };
+struct Param { std::string name; int line = 0; int column = 0; };
 
 struct Expr {
   ExprKind kind;
   int line = 0;
+  int column = 0;
 
   int64_t integer = 0;
   double real = 0;
@@ -65,6 +67,7 @@ struct OnHandler {
   std::string param;
   std::vector<StmtP> body;
   int line = 0;
+  int column = 0;
 };
 
 struct EntityDef {
@@ -72,19 +75,24 @@ struct EntityDef {
   std::vector<std::pair<std::string, ExprP>> fields;
   std::vector<std::unique_ptr<OnHandler>> handlers;
   int line = 0;
+  int column = 0;
 };
 
 enum class StmtKind : uint8_t {
-  Expression, Let, Block, If, While, ForIn, Return, Break, Continue, EntityDecl,
+  Expression, Let, Destructure, Block, If, While, ForIn, Return, Break, Continue, EntityDecl,
   NativeDecl   // `native fn` / `extern fn`: its tokens, compiled to machine code (grain_native.cpp)
 };
 
 struct Stmt {
   StmtKind kind;
   int line = 0;
+  int column = 0;
 
   ExprP expr;                 // Expression, Let initialiser, If/While condition, Return
   std::string name;           // Let target, ForIn variable
+  std::vector<std::string> names; // Destructure targets
+  std::vector<std::string> keys;  // Destructure keys
+  bool is_destructure_map = false;
   std::vector<StmtP> body;    // Block, loop body, if-then
   std::vector<StmtP> other;   // else branch
   ExprP iterable;             // ForIn

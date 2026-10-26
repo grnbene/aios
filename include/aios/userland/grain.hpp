@@ -20,11 +20,15 @@
 // The AST in the middle is what makes this a compiler rather than a tree
 // walker with extra steps. `grain dis` prints what the compiler actually
 // emitted, so the claim is checkable rather than asserted.
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "aios/core/ids.hpp"
@@ -87,6 +91,7 @@ struct Value {
   std::string to_text() const;      // what `print` shows
   std::string repr() const;         // what a value inside a list shows
   bool equals(const Value& o) const;
+  bool is_container() const;
 };
 
 // The heap side of a value. One base class with a kind rather than a class per
@@ -101,7 +106,14 @@ class Obj {
   // every call; a flag answers that without an RTTI walk (dynamic_pointer_cast
   // was a measurable share of every call, worst on the Pi's in-order core).
   bool is_closure = false;
+  bool gc_tracked = false;   // already in a Vm's cycle-collector list (see Vm::track_container)
 };
+
+inline bool Value::is_container() const {
+  if (!obj) return false;
+  return type == Type::List || type == Type::Map || type == Type::Entity ||
+         (type == Type::Fn && obj->is_closure);
+}
 
 class StrObj final : public Obj {
  public:
@@ -148,10 +160,19 @@ class MapObj final : public Obj {
   static constexpr size_t kIndexFrom = 8;
   MapObj() : Obj(Type::Map) {}
   std::vector<std::pair<std::string, Value>> entries;
-  std::unordered_map<std::string, size_t> index;   // empty until the map has more than kIndexFrom entries
+  // Past kIndexFrom entries, a lookup table: open addressing over positions in `entries` (slot = position + 1,
+  // 0 = free, a power-of-two size, at most half full), with each entry's hash kept in `hashes` so growing the
+  // table rehashes no strings and a probe compares a number before it compares text. No key is stored twice and
+  // an insert allocates nothing of its own. Both are empty for a small map, which is scanned.
+  std::vector<uint32_t> slots;
+  std::vector<uint32_t> hashes;
   Value* find(const std::string& k);
   void put(const std::string& k, Value v);
   bool erase(const std::string& k);
+  void clear_all() { entries.clear(); slots.clear(); hashes.clear(); }
+ private:
+  static uint32_t hash_of(const std::string& k);
+  void rebuild_slots(size_t at_least);
 };
 
 // ---------------------------------------------------------------------------
@@ -266,7 +287,7 @@ enum class Op : uint8_t {
   Dup, Dup2,   // copy the top one / two values (compound assignment's target, evaluated once)
   Jump, JumpIfFalse, JumpIfTrue, Loop,
   Call, Closure, CloseUpvalue, Return,
-  BuildList, BuildMap, IndexGet, IndexSet, FieldGet, FieldSet,
+  BuildList, BuildMap, IndexGet, IndexSet, FieldGet, OptFieldGet, FieldSet,
   IterPrep, IterNext,
   Halt
 };
@@ -277,6 +298,7 @@ struct Chunk {
   std::vector<uint8_t> code;
   std::vector<Value> constants;
   std::vector<int> lines;   // one per byte of `code`, so a fault names a line
+  std::vector<int> columns; // one per byte of `code`, so a fault names a column
   // GetGlobal/SetGlobal inline cache: constant index -> the global's slot in
   // the Vm that last ran this chunk (map nodes never move and globals are
   // never erased, so the pointer stays good). Saves hashing the name on every
@@ -284,7 +306,11 @@ struct Chunk {
   mutable std::vector<Value*> global_cache;
   mutable uint64_t global_cache_owner = 0;   // Vm serial, never an address: a freed Vm's address comes back
   size_t add_constant(const Value& v);
-  void write(uint8_t byte, int line) { code.push_back(byte); lines.push_back(line); }
+  void write(uint8_t byte, int line, int column = 0) {
+    code.push_back(byte);
+    lines.push_back(line);
+    columns.push_back(column);
+  }
 };
 
 // A compiled function. `upvalue_from_local` says, for each upvalue, whether it
@@ -298,6 +324,9 @@ class FnObj final : public Obj {
   int arity = 0;
   int local_slots = 0;
   Chunk chunk;
+  // Where each named local lives, for the debugger: the stack slot, and the span of code (from, to) it is in scope for.
+  struct DebugLocal { std::string name; int slot; uint32_t from; uint32_t to; };
+  std::vector<DebugLocal> debug_locals;
   std::vector<bool> upvalue_from_local;
   std::vector<uint8_t> upvalue_index;
   // Native code for this function (grain_jit_arm64.cpp), made the first time
@@ -322,15 +351,32 @@ class ClosureObj final : public Obj {
   std::vector<std::shared_ptr<Upvalue>> upvalues;
 };
 
+inline int callable_arity(const Value& f) {
+  if (f.type != Type::Fn || !f.obj) return -1;
+  const Obj* o = f.obj.get();
+  if (o->is_closure) return static_cast<const ClosureObj*>(o)->fn ? static_cast<const ClosureObj*>(o)->fn->arity : -1;
+  return static_cast<const FnObj*>(o)->arity;
+}
+
 // A handle to something the language itself has no words for -- a socket, a
 // listener, a file. grain can hold it, pass it and let it go; only the native
 // that made it can look inside. `kind` is what makes a native able to refuse a
 // listener where a connection was meant, which an opaque pointer alone cannot.
 class ExternObj final : public Obj {
  public:
-  ExternObj(std::string k, std::shared_ptr<void> p) : Obj(Type::Extern), kind_name(std::move(k)), ptr(std::move(p)) {}
+  ExternObj(std::string k, std::shared_ptr<void> p) : Obj(Type::Extern), kind_name(std::move(k)), ptr(std::move(p)) { ++live; }
+  ~ExternObj() override { --live; }
   std::string kind_name;
   std::shared_ptr<void> ptr;
+  // How many exist, in any VM: a connection, socket, canvas or task is cleaned up properly only by being freed,
+  // so Vm::retire_heap() leaves the heap alone to the operating system only when there are none.
+  static inline std::atomic<int> live{0};
+};
+
+// A hosted app's settings (Vm::settings): shared by its VMs, which may run on several threads.
+struct VmSettings {
+  std::mutex mu;
+  std::map<std::string, std::string> values;
 };
 
 class Vm;
@@ -350,7 +396,14 @@ class NativeObj final : public Obj {
 // ---------------------------------------------------------------------------
 struct Diagnostic {
   int line = 0;
+  int column = 0;
   std::string message;
+
+  Diagnostic() = default;
+  Diagnostic(int l, std::string msg) : line(l), column(0), message(std::move(msg)) {}
+  Diagnostic(int l, int col, std::string msg) : line(l), column(col), message(std::move(msg)) {}
+
+  std::string format_snippet(const std::string& source, const std::string& origin = "") const;
 };
 
 // Every stage reports the same way: a result, and the diagnostics that stopped
@@ -449,6 +502,7 @@ class Vm {
     Value value;                  // what the script's last expression produced
     std::string error;
     int line = 0;
+    int column = 0;
     std::vector<std::string> trace;   // innermost call first
   };
   RunResult run(const std::shared_ptr<FnObj>& script);
@@ -472,6 +526,14 @@ class Vm {
 
   // Where read_file/write_file/... go. Not owned; null = no file storage.
   Files* files = nullptr;
+
+  // What a hosted app (grain_app.cpp) gives the VMs it starts - its sessions, its workers - and nothing else does:
+  // its own settings, which getenv()/setenv() use before the process's environment (apps sharing a process each
+  // see their own), where its print() goes (its log), and the flag its host raises to stop it (sleep() returns at
+  // once). Null: the process's environment, `sink`/stdout, nothing to stop.
+  std::shared_ptr<VmSettings> settings;
+  std::function<void(const std::string&)> on_print;
+  std::shared_ptr<std::atomic<bool>> stop_flag;
 
   // import "lib.gr" (grain_builtins.cpp): relative paths resolve against base_dir - the directory of the program
   // that is running, set by whatever starts it; empty means the working directory. `imported` is what this VM has
@@ -505,10 +567,20 @@ class Vm {
   // so no task is still running grain when the program that started it is gone.
   std::shared_ptr<void> tasks;
 
+  // For a program that has finished and whose process is about to end. Waits for the tasks it started, as
+  // dropping the VM would; then, if nothing it holds needs closing properly (a database connection says goodbye
+  // when freed, a socket closes), leaves the heap for the operating system to take back instead of freeing it
+  // object by object - a program with a few hundred thousand records spent a fifth of its run doing that. Returns
+  // false, having freed nothing, when something did need freeing. The VM must not run again after it returns true.
+  bool retire_heap();
+
   // Compile functions to native code where the machine can run it (AArch64:
-  // the Pi's kernel, or any arm64 host). Off = interpret everything, which is
-  // also the reference the native code is checked against.
+  // the Pi's kernel, or any arm64 host; x86-64 hosts). Off = interpret
+  // everything, which is also the reference the native code is checked against.
   bool jit_enabled = true;
+
+  // type()'s answers, one string per type name, made on first use (see bi_type).
+  std::vector<Value> type_names;
 
   // Execute exactly one instruction - the one at `ip` in the current frame -
   // with the interpreter's own semantics. The native code hands every
@@ -524,13 +596,33 @@ class Vm {
   // closed. How a closure's state is read when it is copied to a worker.
   Value upvalue_value(const Upvalue& uv) const;
 
+  // Cycle collection: finds unreachable cycles among tracked containers and breaks them
+  size_t collect_cycles();
+  void track_container(const std::shared_ptr<Obj>& obj);
+
+  // Debugger support
+  struct DebugState {
+    bool enabled = false;
+    bool step_line = false;
+    bool step_over = false;
+    size_t step_over_depth = 0;
+    std::string current_file;
+    std::vector<int> frame_line;   // per call depth: the line that frame was last seen on (a line is entered once per visit)
+    std::unordered_set<int> breakpoints;
+    std::function<void(Vm& vm, const std::string& file, int line)> on_break;
+  };
+  DebugState debug_state;
+  size_t frame_depth() const;
+  std::vector<std::string> stack_trace() const;
+  std::vector<std::pair<std::string, Value>> current_locals() const;
+
  private:
   struct Frame;
   struct State;
   std::unique_ptr<State> st_;
   bool execute_loop(size_t target_frame_depth, bool single_step = false);
   bool run_native(void* code, size_t base);
-  bool invoke(const Value& callee, uint8_t argc, int line);
+  bool invoke(const Value& callee, uint8_t argc, int line, int column = 0);
   void close_upvalues_from(size_t from);
 };
 
@@ -540,7 +632,7 @@ class Vm {
 void install_core_builtins(Vm& vm);
 
 // Parts of install_core_builtins, one file each:
-void install_hash_builtins(Vm& vm);    // sha256, sha1, sha512, sha384, md5, keccak256, hmac_sha256 (grain_std_hash.cpp)
+void install_hash_builtins(Vm& vm);    // sha256, sha1, sha512, sha384, md5, keccak256, hmac_sha256, random_bytes (grain_std_hash.cpp)
 void install_regex_builtins(Vm& vm);   // regex_test/match/find_all/replace/split (grain_std_regex.cpp)
 // Fires the VM's due timers. True when at least one ran (the program's data may have changed); an
 // error in a timer's function goes to `error` and that timer is dropped. `until_next_ms` (if given)
@@ -667,13 +759,22 @@ inline bool is_decimal(const Value& v) { return v.type == Type::Decimal; }
 // Int or Decimal: what decimal arithmetic accepts.
 inline bool is_exact_number(const Value& v) { return v.type == Type::Int || v.type == Type::Decimal; }
 
+using StreamHeaderCallback = std::function<bool(int status, const std::vector<std::pair<std::string, std::string>>& headers)>;
+using StreamChunkCallback = std::function<bool(const std::string& chunk)>;
+
+void format_one_sse_event(const Value& ev, std::string& out);
+
 // If the pane defined custom HTTP routes (ui.pane({"routes": {"/path": fn(req)}})),
 // delivers the request and fills status, res_body, and content_type. Returns true if handled.
 // The handler gets {method, path, query, body, headers (names lowercased), remote}.
 bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                            const std::string& query, const std::string& body,
                            const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
-                           int& status, std::string& res_body, std::string& content_type, std::string& error);
+                           int& status, std::string& res_body, std::string& content_type, std::string& error,
+                           std::vector<std::pair<std::string, std::string>>* res_headers = nullptr,
+                           StreamHeaderCallback on_headers = nullptr,
+                           StreamChunkCallback on_chunk = nullptr,
+                           bool* out_streamed = nullptr);
 
 // True for a pane made by serve_routes: it has routes and no page.
 bool web_pane_api_only(Vm& vm, uint64_t id);
@@ -698,11 +799,17 @@ std::unique_ptr<WorkerCall> prepare_worker_call(Vm& vm, const Value& fn, std::ve
 // when this pane has no such route or does not use workers.
 struct RouteJob {
   std::unique_ptr<WorkerCall> call;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::shared_ptr<void> writer_state;
+  uint64_t writer_id = 0;
+  bool streamed = false;
 };
 bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, const std::string& path,
                             const std::string& query, const std::string& body,
                             const std::vector<std::pair<std::string, std::string>>& headers, const std::string& remote,
-                            RouteJob& job, std::string& error);
+                            RouteJob& job, std::string& error,
+                            StreamHeaderCallback on_headers = nullptr,
+                            StreamChunkCallback on_chunk = nullptr);
 bool web_pane_route_finish(RouteJob& job, int& status, std::string& res_body, std::string& content_type, std::string& error);
 
 }  // namespace aios::userland::grain

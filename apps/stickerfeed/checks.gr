@@ -1,0 +1,9 @@
+# After every deploy, against the version just started: its page answers, and the API refuses a caller without a
+# token the way the old service did.
+fn check(app) {
+  let page = http_get(app.url + "/")
+  if page.status != 200 { return "GET / answered " + str(page.status) }
+  let feed = http_post(app.url + "/feed", "{}", {"headers": {"Content-Type": "application/json"}})
+  if feed.status != 401 { return "POST /feed without a token answered " + str(feed.status) + ", not 401" }
+  return true
+}

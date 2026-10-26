@@ -1,2 +1,4 @@
-forever.gr:4: step limit of 1000 reached
-  in forever.gr (line 4)
+forever.gr:4:3: step limit of 1000 reached
+  n = n + 1
+  ^
+  in forever.gr (line 4:3)

@@ -1,0 +1,26 @@
+import "mod_a.gr" as a
+import "mod_b.gr" as b
+
+assert_eq(a.calc(5), 60)
+assert_eq(a.message(), "from mod_a")
+assert_eq(a.get_name(), "calc")
+
+assert_eq(b.calc(5), 1004)
+assert_eq(b.message(), "from mod_b")
+
+# Test that un-imported helper is not in global scope
+assert_eq(pcall(fn() { return helper(1) }).ok, false)
+
+import { message } from "mod_a.gr"
+assert_eq(message(), "from mod_a")
+
+# A name the file does not define is an error naming the file, even when the importing program has a global of that name
+let message_was = message
+let missing = pcall(fn() { import { nope } from "mod_a.gr"; return nope })
+assert_eq(missing.ok, false)
+assert_true(contains(missing.error, "defines no 'nope'"), "unhelpful error: " + missing.error)
+let shadow = "mine"
+let clash = pcall(fn() { import { shadow } from "mod_a.gr"; return shadow })
+assert_eq(clash.ok, false, "a selective import bound the importer's own global instead of failing")
+
+print("NAMESPACED IMPORT TESTS PASSED!")

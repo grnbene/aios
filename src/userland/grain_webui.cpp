@@ -21,6 +21,7 @@
 
 namespace aios::userland::grain {
 
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -811,6 +812,12 @@ bool WebUi::open_stream(const Request& req, Stream& out, std::vector<std::pair<s
   std::string new_id;
   std::shared_ptr<Session> s = session_for(req, new_id, error);
   if (!s) { report(error); return false; }
+  {
+    // A program that is only serve_routes has no page whose changes to push; an event-stream request is
+    // for one of its own routes (res_sse), so leave it to them.
+    std::lock_guard<std::mutex> turn(s->mu);
+    if (web_pane_api_only(*s->vm, s->pane)) return false;
+  }
   headers = {{"Content-Type", "text/event-stream"}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}, {"X-Accel-Buffering", "no"}};
   if (!new_id.empty()) headers.push_back({"Set-Cookie", host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "")});
   out.session = s;
@@ -851,7 +858,7 @@ void WebUi::close_stream(Stream& st) {
   st.session.reset();
 }
 
-WebUi::Response WebUi::handle(const Request& req) {
+WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_headers, StreamChunkCallback on_chunk) {
   Response res;
   auto fail = [&](int status, const std::string& why) {
     report(why);
@@ -890,13 +897,14 @@ WebUi::Response WebUi::handle(const Request& req) {
     bool prepared = false;
     {
       std::lock_guard<std::mutex> turn(s->mu);
-      prepared = web_pane_route_prepare(*s->vm, s->pane, req.method, req.path, req.query, req.body, req.headers, req.remote, job, route_err);
+      prepared = web_pane_route_prepare(*s->vm, s->pane, req.method, req.path, req.query, req.body, req.headers, req.remote, job, route_err, on_headers, on_chunk);
     }
     if (prepared) {
       job.call->run();
       if (web_pane_route_finish(job, status, res_body, content_type, route_err)) {
         res.status = status;
         res.headers = {{"Content-Type", content_type}, {"Access-Control-Allow-Origin", "*"}, {"X-Content-Type-Options", "nosniff"}};
+        for (const auto& h : job.headers) res.headers.push_back(h);
         if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
         res.body = std::move(res_body);
         return res;
@@ -910,9 +918,12 @@ WebUi::Response WebUi::handle(const Request& req) {
     Vm& vm = *s->vm;
     int status = 200;
     std::string res_body, content_type, route_err;
-    if (web_pane_handle_route(vm, s->pane, req.method, req.path, req.query, req.body, req.headers, req.remote, status, res_body, content_type, route_err)) {
+    std::vector<std::pair<std::string, std::string>> extra_hdrs;
+    bool streamed = false;
+    if (web_pane_handle_route(vm, s->pane, req.method, req.path, req.query, req.body, req.headers, req.remote, status, res_body, content_type, route_err, &extra_hdrs, on_headers, on_chunk, &streamed)) {
       res.status = status;
       res.headers = {{"Content-Type", content_type}, {"Access-Control-Allow-Origin", "*"}, {"X-Content-Type-Options", "nosniff"}};
+      for (const auto& h : extra_hdrs) res.headers.push_back(h);
       if (!cookie_header.empty()) res.headers.push_back({"Set-Cookie", cookie_header});
       res.body = std::move(res_body);
       return res;

@@ -7,6 +7,10 @@
 //
 // Exit status: 0 the program ran to its end, 1 it did not compile, 2 it stopped
 // on a runtime error, 64 the command line was wrong.
+#include <cstdlib>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +80,10 @@ void usage(std::ostream& o) {
     << "  grain test [file | dir]...        run the tests in *_test.gr files\n"
     << "  grain fmt [--check] <file | dir>  lay source out the one grain way\n"
     << "  grain lsp                         a language server for editors, on stdin/stdout\n"
+    << "  grain host                        this machine's app host: runs, restarts and serves its apps\n"
+    << "  grain app deploy|status|logs|...  apps, on this machine or another (`grain app help`)\n"
+    << "  grain pkg init|add|list|vendor    package and dependency management (`grain pkg help`)\n"
+    << "  grain debug <file.gr>             run in interactive step-by-step debugger\n"
     << "  grain version                     print the version\n"
     << "\n"
     << "options (before the subcommand):\n"
@@ -94,19 +102,27 @@ bool read_source(const std::string& path, std::string& out) {
   return true;
 }
 
-void report_compile(const std::string& origin, const std::vector<g::Diagnostic>& errs) {
-  for (const auto& d : errs) std::cerr << origin << ":" << d.line << ": " << d.message << "\n";
+// Each problem as file:line:column: message, then the line and a caret under the column when one is known.
+void report_compile(const std::string& origin, const std::vector<g::Diagnostic>& errs, const std::string& source = "") {
+  for (const auto& d : errs) std::cerr << d.format_snippet(source, origin);
 }
 
-void report_runtime(const std::string& origin, const g::Vm::RunResult& r) {
-  std::cerr << origin << ":" << r.line << ": " << r.error << "\n";
+void report_runtime(const std::string& origin, const g::Vm::RunResult& r, const std::string& source = "") {
+  std::string src = source;
+  if (src.empty() && !origin.empty() && origin[0] != '<') {
+    read_source(origin, src);
+  }
+  g::Diagnostic d{r.line, r.column, r.error};
+  std::cerr << d.format_snippet(src, origin);
   for (size_t i = 0; i < r.trace.size(); ++i) std::cerr << (i == 0 ? "  in " : "  from ") << r.trace[i] << "\n";
 }
 
 // A VM's panes leave the registry with it: the registry outlives every VM.
 struct DropPanes {
   g::Vm& vm;
-  ~DropPanes() { g::drop_panes(vm); }
+  bool done = false;
+  void now() { if (!done) { done = true; g::drop_panes(vm); } }
+  ~DropPanes() { now(); }
 };
 
 // One VM set up the same way for a file, a one-liner and the REPL, so the three
@@ -148,24 +164,26 @@ int run_file(const Options& opt, const std::string& path, const std::vector<std:
   std::string source;
   if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; return kExitUsage; }
   auto compiled = g::compile_source(source, path);
-  if (!compiled.ok()) { report_compile(path, compiled.errors); return kExitCompile; }
+  if (!compiled.ok()) { report_compile(path, compiled.errors, source); return kExitCompile; }
   g::Vm vm;
   DropPanes drop{vm};
   prepare(vm, opt, script_args);
   vm.base_dir = dir_of(path);
   auto r = vm.run(compiled.script);
-  if (!r.ok) { report_runtime(path, r); return kExitRuntime; }
+  if (!r.ok) { report_runtime(path, r, source); return kExitRuntime; }
+  drop.now();
+  vm.retire_heap();   // the program is over; freeing its heap object by object is time spent before the process exits anyway
   return kExitOk;
 }
 
 int eval_line(const Options& opt, const std::string& source) {
   auto compiled = g::compile_source(source, "<eval>", true);
-  if (!compiled.ok()) { report_compile("<eval>", compiled.errors); return kExitCompile; }
+  if (!compiled.ok()) { report_compile("<eval>", compiled.errors, source); return kExitCompile; }
   g::Vm vm;
   DropPanes drop{vm};
   prepare(vm, opt, {});
   auto r = vm.run(compiled.script);
-  if (!r.ok) { report_runtime("<eval>", r); return kExitRuntime; }
+  if (!r.ok) { report_runtime("<eval>", r, source); return kExitRuntime; }
   if (r.value.type != g::Type::Nil) std::cout << r.value.repr() << "\n";
   return kExitOk;
 }
@@ -186,9 +204,9 @@ int repl(const Options& opt) {
     if (line == ".quit" || line == ".exit") break;
     if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
     auto compiled = g::compile_source(line, "<repl>", true);
-    if (!compiled.ok()) { report_compile("<repl>", compiled.errors); status = kExitCompile; continue; }
+    if (!compiled.ok()) { report_compile("<repl>", compiled.errors, line); status = kExitCompile; continue; }
     auto r = vm.run(compiled.script);
-    if (!r.ok) { report_runtime("<repl>", r); status = kExitRuntime; continue; }
+    if (!r.ok) { report_runtime("<repl>", r, line); status = kExitRuntime; continue; }
     if (r.value.type != g::Type::Nil) std::cout << r.value.repr() << "\n";
   }
   if (tty) std::cout << "\n";
@@ -239,7 +257,7 @@ int run_pack(const grain_cli::Pack& pack, const std::vector<std::string>& script
   prepare(vm, Options{}, script_args);
   grain_cli::install_bundle_builtins(vm, pack);
   auto r = vm.run(compiled.script);
-  if (!r.ok) { report_runtime(name, r); return kExitRuntime; }
+  if (!r.ok) { report_runtime(name, r, pack.files.at(name)); return kExitRuntime; }
   return kExitOk;
 }
 
@@ -249,7 +267,7 @@ int check_files(const std::vector<std::string>& paths) {
     std::string source;
     if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; status = kExitUsage; continue; }
     auto compiled = g::compile_source(source, path);
-    if (!compiled.ok()) { report_compile(path, compiled.errors); if (status == kExitOk) status = kExitCompile; }
+    if (!compiled.ok()) { report_compile(path, compiled.errors, source); if (status == kExitOk) status = kExitCompile; }
   }
   return status;
 }
@@ -258,7 +276,7 @@ int disassemble(const std::string& path) {
   std::string source;
   if (!read_source(path, source)) { std::cerr << "grain: cannot read " << path << "\n"; return kExitUsage; }
   auto compiled = g::compile_source(source, path);
-  if (!compiled.ok()) { report_compile(path, compiled.errors); return kExitCompile; }
+  if (!compiled.ok()) { report_compile(path, compiled.errors, source); return kExitCompile; }
   std::cout << g::disassemble(*compiled.script);
   return kExitOk;
 }
@@ -266,6 +284,13 @@ int disassemble(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(__GLIBC__)
+  // A thread's heap grows a page at a time unless told otherwise, and a full feed spent a tenth of its time in
+  // mprotect doing it (measured on chi-il-1): grow in 16 MB steps. The pad is also what each thread's heap keeps
+  // when it is done (64 MB held 1.4 GB on chi's app host after load, 16 MB 240 MB, for feeds 10% slower; see
+  // cli/main.cpp). MALLOC_TOP_PAD_ in the environment still wins.
+  if (!std::getenv("MALLOC_TOP_PAD_")) mallopt(M_TOP_PAD, 16 << 20);
+#endif
   g::set_http_trust_root(grain_cli::state_dir());
   g::set_native_policy({/*allow=*/true, /*unsafe=*/true});   // the standalone grain trusts its own programs
 #if defined(GRAIN_HAVE_WIN32)
@@ -334,7 +359,7 @@ int main(int argc, char** argv) {
     DropPanes drop{vm};
     prepare(vm, opt, rest);
     auto r = vm.run(compiled.script);
-    if (!r.ok) { report_runtime("<open>", r); return kExitRuntime; }
+    if (!r.ok) { report_runtime("<open>", r, grain_cli::kOpenClientSource); return kExitRuntime; }
     return kExitOk;
   }
   if (sub == "serve") {   // grain serve app.gr [--port N] [--host H]: the program's ui.pane in a browser
@@ -362,6 +387,10 @@ int main(int argc, char** argv) {
   if (sub == "test") return grain_cli::test_command(rest);
   if (sub == "fmt") return grain_cli::fmt_command(rest);
   if (sub == "lsp") return grain_cli::lsp_command(rest);
+  if (sub == "host") return grain_cli::host_command(rest);
+  if (sub == "app") return grain_cli::app_command(rest);
+  if (sub == "pkg") return grain_cli::pkg_command(rest);
+  if (sub == "debug") return grain_cli::debug_command(rest);
   if (sub == "dis") {
     if (rest.size() != 1) { std::cerr << "grain dis <file.gr>\n"; return kExitUsage; }
     return disassemble(rest[0]);

@@ -24,7 +24,7 @@ HUB_STATUS_HOST=chi-il-1   # runs the observer that writes fleet-status.json
 # `sudo deploy/aos-fleet/install.sh <user> hub|observer`) and
 # deploy/aos-fleet/aos-member.service (a systemd --user unit running ~/aos/aios).
 ROSTER=(
-  "chi-il-1|chi-il-1|/opt/aos/aios|systemctl restart aos-hub aos-observer"
+  "chi-il-1|chi-il-1|/opt/aios/bin/aios|systemctl restart aos-hub aos-observer"
   "atl-ga-1|atl-ga-1|/opt/aos/aios|systemctl restart aos-observer"
   "devops|devops|/home/devops/aos/aios|XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user restart aos-member"
 )

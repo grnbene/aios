@@ -1,0 +1,14 @@
+# Background worker manifest
+let app = {
+  "name": "worker",
+  "description": "background worker loop processing jobs and writing heartbeats",
+  "main": "main.gr",
+  "kind": "worker",
+  "settings": {
+    "INTERVAL_MS": "1000",
+    "BATCH_SIZE": "5"
+  },
+  "secrets": [
+    "WORKER_TOKEN"
+  ]
+}

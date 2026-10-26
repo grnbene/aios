@@ -261,7 +261,42 @@ int main() {
   auto sel_del = db.execute_local_query("SELECT COUNT(*) FROM orders WHERE id = 10;");
   assert(sel_del.success && sel_del.rows.size() == 1);
   assert(sel_del.rows[0].values[0] == "0");
-  std::cout << "  [PASS] DELETE mutation replicated: Order #10 removed from ASQL.\n\n";
+  std::cout << "  [PASS] DELETE mutation replicated: Order #10 removed from ASQL.\n";
+
+  // A table with a generated column: MariaDB's row image carries that column's value as well. The row must land,
+  // the column computed here (every debtortrans insert was refused: "value specified for generated column").
+  {
+    auto mk = db.execute_local_query("CREATE TABLE ledger (id INT PRIMARY KEY, amt DECIMAL(10,2), qty INT, "
+                                     "total DECIMAL(12,2) GENERATED ALWAYS AS (amt * qty) STORED);");
+    assert(mk.success);
+    consumer.set_table_whitelist({"orders", "users", "ledger"});
+    std::vector<uint8_t> ledger_types = {binlog_type::VARCHAR, binlog_type::VARCHAR, binlog_type::VARCHAR, binlog_type::VARCHAR};
+    auto map_ledger = make_table_map_event(103, "aios_db", "ledger", ledger_types, 700);
+    assert(consumer.ingest_raw_event(map_ledger.data(), map_ledger.size()).ok());
+    auto ins = make_write_rows_event_v1(103, 4, {"1", "2.50", "4", "10.00"}, 720);
+    assert(consumer.ingest_raw_event(ins.data(), ins.size()).ok());
+    BinlogRowMutation gen_ins;
+    gen_ins.kind = BinlogRowMutation::Kind::Insert;
+    gen_ins.schema = "aios_db";
+    gen_ins.table = "ledger";
+    gen_ins.values = {{"id", "2"}, {"amt", "1.25"}, {"qty", "8"}, {"total", "10.00"}};
+    assert(consumer.apply_mutation(gen_ins).ok());
+    BinlogRowMutation gen_upd;
+    gen_upd.kind = BinlogRowMutation::Kind::Update;
+    gen_upd.schema = "aios_db";
+    gen_upd.table = "ledger";
+    gen_upd.values = {{"id", "2"}, {"amt", "3.00"}, {"qty", "8"}, {"total", "24.00"}};
+    gen_upd.before_values = {{"id", "2"}, {"amt", "1.25"}, {"qty", "8"}, {"total", "10.00"}};
+    assert(consumer.apply_mutation(gen_upd).ok());
+    auto rows = db.execute_local_query("SELECT id, total FROM ledger ORDER BY id;");
+    const bool ok = rows.success && rows.rows.size() == 2 && rows.rows[0].values[1] == "10.00" && rows.rows[1].values[1] == "24.00";
+    if (!ok) {
+      std::cout << "  [FAIL] generated column: " << (rows.success ? std::to_string(rows.rows.size()) + " row(s)" : rows.error_message) << "\n";
+      for (const auto& r : rows.rows) std::cout << "    " << r.values[0] << " " << r.values[1] << "\n";
+      return 1;
+    }
+    std::cout << "  [PASS] Rows of a table with a generated column replicate (streamed insert, insert, update), computed here.\n\n";
+  }
 
   // 5. Test Column Whitelisting / Projection
   std::cout << "[Step 5] Testing Column Projection (selective column filtering)...\n";

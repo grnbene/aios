@@ -1,0 +1,34 @@
+import "lib/store.gr" as store
+
+let started_at = now()
+let tax_rate = getenv("TAX_RATE", "0.08")
+
+serve_routes({
+  "GET /health": fn (req) {
+    return res_json({
+      "status": "ok",
+      "uptime_s": round(now() - started_at)
+    })
+  },
+
+  "POST /quote": fn (req) {
+    let payload = req.json
+    if type(payload) != "map" or not has(payload, "items") {
+      return res_error(400, "Invalid payload: 'items' array required")
+    }
+    let quote = store.calculate_totals(payload.items, tax_rate)
+    return res_json(quote)
+  },
+
+  "GET /quote": fn (req) {
+    return res_error(405, "Method Not Allowed")
+  },
+
+  "GET /version": fn (req) {
+    return res_json({
+      "app": "store-api",
+      "tax_rate": tax_rate,
+      "authenticated": req.headers?.authorization != nil
+    })
+  }
+})

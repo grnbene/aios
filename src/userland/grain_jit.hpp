@@ -1,6 +1,6 @@
 // grain -> native code. The interface between the VM (grain_vm.cpp) and the
-// AArch64 compiler (grain_jit_arm64.cpp); on other architectures compile()
-// always says no and everything is interpreted.
+// AArch64 and x86-64 compilers (grain_jit_arm64.cpp, grain_jit_x64.cpp); on
+// other architectures compile() always says no and everything is interpreted.
 #pragma once
 #include <cstddef>
 #include <cstdint>

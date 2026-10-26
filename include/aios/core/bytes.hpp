@@ -46,6 +46,7 @@ class Reader {
   bool ok() const { return ok_; }
   size_t remaining() const { return data_.size() - pos_; }
   size_t position() const { return pos_; }
+  ByteSpan rest() const { return data_.subspan(pos_); }   // what is left to read, without reading it
   uint8_t u8() { uint8_t v = 0; take(&v, 1); return v; }
   uint16_t u16() { uint16_t v = 0; take_le(v); return v; }
   uint32_t u32() { uint32_t v = 0; take_le(v); return v; }

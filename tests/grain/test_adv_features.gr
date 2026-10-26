@@ -1,0 +1,114 @@
+# Test for cycle collection, inline caching, and advanced runtime capabilities
+
+# 1. Cycle Collection
+fn test_cycles() {
+  # Create a circular reference between two maps
+  let a = {"name": "node_a"}
+  let b = {"name": "node_b"}
+  a["partner"] = b
+  b["partner"] = a
+
+  # Also a circular list
+  let l = [1, 2]
+  push(l, l)
+
+  # Break local references
+  a = nil
+  b = nil
+  l = nil
+
+  # Run cycle collector
+  let collected = gc()
+  assert_true(collected >= 3, "expected at least 3 cyclic objects collected, got " + str(collected))
+  print("GC cycle collection passed: collected " + str(collected) + " cyclic objects")
+}
+
+# 1b. The collector must not touch anything still in use. A native function (map) holds
+# the list it is walking and a cycle that something outside still holds must survive.
+fn test_gc_keeps_live_data() {
+  fn probe(x) {
+    gc()
+    return x.v
+  }
+  assert_eq(map([{"v": 1}, {"v": 2}, {"v": 3}], probe), [1, 2, 3], "gc() inside a map callback emptied the list being mapped")
+
+  let keep = {"x": 7}
+  keep["self"] = keep
+  gc()
+  assert_eq(keep.x, 7, "a cycle that is still referenced was collected")
+  assert_eq(keep.self.self.x, 7)
+
+  let a = {"n": 1}
+  let b = {"n": 2, "other": a}
+  a["other"] = b
+  let held = [a]          # a, and b through it, are still reachable from here
+  a = nil
+  b = nil
+  gc()
+  assert_eq(held[0].other.n, 2, "cycle reachable through a list was collected")
+  print("GC keeps live data passed")
+}
+
+# 1c. Cycles are collected without anyone calling gc(): a loop that builds 200,000 of them (two maps each) ends
+# with only what the last stretch left, not all of them. The bound is loose on purpose - it must hold however the
+# thresholds are tuned - and far below what no collection at all would leave.
+fn test_auto_gc() {
+  for i in range(100000) {
+    let a = {}
+    let b = {}
+    a["b"] = b
+    b["a"] = a
+  }
+  let remaining = gc()
+  assert_true(remaining < 40000, "automatic collection left " + str(remaining) + " of 200000 cyclic maps")
+  assert_eq(gc(), 0, "a second gc() found more")
+  print("Auto GC cycle collection passed: remainder " + str(remaining) + " of 200000")
+}
+
+# 2. Inline Caching & Record Access
+fn test_inline_caching() {
+  let records = []
+  for i in range(1000) {
+    push(records, {
+      "id": i,
+      "sku": "ITEM-" + str(i),
+      "price": decimal("19.99"),
+      "qty": 2
+    })
+  }
+
+  let total_qty = 0
+  for item in records {
+    # Repeated access to the same fields utilizes the Chunk::field_cache
+    total_qty = total_qty + item.qty
+    item.active = true
+  }
+
+  assert_eq(total_qty, 2000, "total_qty mismatch")
+  assert_eq(records[0].active, true, "active field should be set")
+  print("Inline caching test passed: 1000 records processed")
+}
+
+# 3. Safe Optional Chaining & Nested Fields
+fn test_opt_chaining() {
+  let user = {
+    "profile": {
+      "address": {
+        "city": "Boston"
+      }
+    }
+  }
+
+  assert_eq(user?.profile?.address?.city, "Boston")
+  assert_eq(user?.profile?.missing?.city, nil)
+  assert_eq(user?.nonexistent, nil)
+  print("Optional chaining test passed")
+}
+
+test_cycles()
+test_gc_keeps_live_data()
+test_auto_gc()
+test_inline_caching()
+test_opt_chaining()
+
+print("ALL ADVANCED RUNTIME TESTS PASSED")

@@ -14,6 +14,10 @@ usage:
   grain test [file | dir]...        run the tests in *_test.gr files
   grain fmt [--check] <file | dir>  lay source out the one grain way
   grain lsp                         a language server for editors, on stdin/stdout
+  grain host                        this machine's app host: runs, restarts and serves its apps
+  grain app deploy|status|logs|...  apps, on this machine or another (`grain app help`)
+  grain pkg init|add|list|vendor    package and dependency management (`grain pkg help`)
+  grain debug <file.gr>             run in interactive step-by-step debugger
   grain version                     print the version
 
 options (before the subcommand):

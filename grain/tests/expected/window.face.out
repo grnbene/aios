@@ -7,5 +7,7 @@ said: received C-3
 count presses: 2
 sku field: "kept" qty field: "1"
 on the glass: true true true
-face.gr:64: "bad": view(): a widget (ui.column, ui.text, ...) is expected, got a int
-  in face.gr (line 64)
+face.gr:64:1: "bad": view(): a widget (ui.column, ui.text, ...) is expected, got a int
+run_panes({"frames": 2})
+^
+  in face.gr (line 64:1)

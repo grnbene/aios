@@ -564,6 +564,7 @@ void BinlogConsumer::set_table_max_rows(const std::string& table, size_t max_row
 // change since and doubled rows in any table without a key. Positions go in
 // only at commits: resuming inside a transaction would skip its TABLE_MAP.
 void BinlogConsumer::note_commit() {
+  flush_pending_deletes();
   {
     hal::LockGuard lock(mu_);
     committed_file_ = active_binlog_file_;
@@ -783,6 +784,7 @@ void BinlogConsumer::enforce_table_limits(const std::string& table_name) {
   std::string tbl_low = to_lower_str(table_name);
   auto it = config_.table_max_rows.find(tbl_low);
   if (it == config_.table_max_rows.end() || it->second == 0) return;
+  flush_pending_deletes();   // the rows held back count too
 
   size_t max_r = it->second;
   const SqlTable* tbl = db_.find_table(table_name);
@@ -1323,8 +1325,11 @@ Result<size_t> BinlogConsumer::step(int timeout_ms) {
   return 1;
 }
 
+// An event handed in directly is applied before this returns: nothing waits for a commit that may never come.
 Result<void> BinlogConsumer::ingest_raw_event(const uint8_t* data, size_t len) {
-  return handle_event(data, len);
+  auto r = handle_event(data, len);
+  flush_pending_deletes();
+  return r;
 }
 
 Result<void> BinlogConsumer::handle_event(const uint8_t* event_data, size_t event_len) {
@@ -1643,6 +1648,7 @@ Result<void> BinlogConsumer::handle_table_map(const uint8_t* p, size_t len, uint
 
 Result<void> BinlogConsumer::handle_query_event(const uint8_t* p, size_t len, uint32_t ts) {
   if (len < 13) return Error(Status::Corrupt, "Truncated QUERY_EVENT");
+  flush_pending_deletes();
   // 4b slave_proxy_id, 4b exec_time, 1b schema_len, 2b err_code, 2b status_vars_len
   uint8_t schema_len = p[8];
   uint16_t status_vars_len = read_le16(p + 11);
@@ -2167,6 +2173,7 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
   };
 
   // Decode rows and apply mutations
+  struct DeferDeletes { bool& f; DeferDeletes(bool& x) : f(x) { f = true; } ~DeferDeletes() { f = false; } } defer_guard(defer_deletes_);
   while (idx < len) {
     BinlogRowMutation mut;
     mut.schema = map.schema_name;
@@ -2198,11 +2205,11 @@ Result<void> BinlogConsumer::decode_rows(const BinlogTableMap& map, const uint8_
   return Ok();
 }
 
-Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut) {
-  if (mut.values.empty() && mut.before_values.empty()) return Ok();
+Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut_in) {
+  if (mut_in.values.empty() && mut_in.before_values.empty()) return Ok();
 
-  std::string table = mut.table;
-  std::string db_name = mut.schema.empty() ? config_.database : mut.schema;
+  std::string table = mut_in.table;
+  std::string db_name = mut_in.schema.empty() ? config_.database : mut_in.schema;
   // Only the table of that name in the source's own database - never a
   // same-named table elsewhere. The old fallback to the engine's default
   // database is exactly where two tenants' `salesman` tables would have met.
@@ -2214,6 +2221,28 @@ Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut) {
               db_name.c_str(), table.c_str());
     return Ok();
   }
+  // A row image carries a generated column's value too (MariaDB logs the whole row). Written back, the engine
+  // refuses it ("The value specified for generated column ... has been ignored") and the row was lost: every
+  // debtortrans insert (total_amount). The new values go without them and the engine computes them, as MariaDB does;
+  // the before image keeps them, to name the row.
+  BinlogRowMutation stripped;
+  const BinlogRowMutation* mp = &mut_in;
+  {
+    auto generated = [&](const std::string& name) {
+      for (const auto& col : tbl->columns)
+        if (!col.generated.empty() && to_lower_str(col.name) == to_lower_str(name)) return true;
+      return false;
+    };
+    bool any = false;
+    if (mut_in.kind != BinlogRowMutation::Kind::Delete)   // a delete's image only names the row
+      for (const auto& kv : mut_in.values) if (generated(kv.first)) { any = true; break; }
+    if (any) {
+      stripped = mut_in;
+      std::erase_if(stripped.values, [&](const std::pair<std::string, std::string>& kv) { return generated(kv.first); });
+      mp = &stripped;
+    }
+  }
+  const BinlogRowMutation& mut = *mp;
   std::vector<std::string> pk_names;
   if (tbl) {
     for (const auto& col : tbl->columns) {
@@ -2253,6 +2282,62 @@ Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut) {
     return w;
   };
 
+  // A delete of rows named by a one-column key waits for its transaction's others; anything else goes after them.
+  if (defer_deletes_ && mut.kind == BinlogRowMutation::Kind::Delete && pk_names.size() == 1) {
+    const auto& image = mut.before_values.empty() ? mut.values : mut.before_values;
+    for (const auto& kv : image) {
+      if (to_lower_str(kv.first) != pk_names[0] || sql_is_null(kv.second)) continue;
+      if (!pending_ins_rows_.empty() || !pending_img_rows_.empty() || (!pending_del_keys_.empty() && (pending_del_db_ != db_name || pending_del_table_ != table))) flush_pending_deletes();
+      pending_del_db_ = db_name; pending_del_table_ = table; pending_del_column_ = kv.first;
+      if (pending_del_keys_.empty()) pending_del_since_ms_ = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      pending_del_keys_.push_back(kv.second);
+      if (pending_del_keys_.size() >= 20000) flush_pending_deletes();
+      return Ok();
+    }
+  }
+  // A delete from a table with no key: its whole image, in the table's column order, every column present.
+  if (defer_deletes_ && mut.kind == BinlogRowMutation::Kind::Delete && pk_names.empty()) {
+    const auto& image = mut.before_values.empty() ? mut.values : mut.before_values;
+    std::vector<std::string> vals;
+    bool whole = true;
+    for (const auto& col : tbl->columns) {
+      if (!col.generated.empty()) { whole = false; break; }
+      const std::string want = to_lower_str(col.name);
+      const std::pair<std::string, std::string>* hit = nullptr;
+      for (const auto& kv : image) if (to_lower_str(kv.first) == want) { hit = &kv; break; }
+      if (!hit) { whole = false; break; }
+      vals.push_back(hit->second);
+    }
+    if (whole && !vals.empty()) {
+      if (!pending_ins_rows_.empty() || !pending_del_keys_.empty() || (!pending_img_rows_.empty() && (pending_del_db_ != db_name || pending_del_table_ != table))) flush_pending_deletes();
+      pending_del_db_ = db_name; pending_del_table_ = table;
+      if (pending_img_rows_.empty()) pending_del_since_ms_ = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      for (const auto& v : vals) pending_img_bytes_ += v.size() + 4;
+      pending_img_rows_.push_back(std::move(vals));
+      if (pending_img_rows_.size() >= 20000 || pending_img_bytes_ >= (8u << 20)) flush_pending_deletes();
+      return Ok();
+    }
+  }
+  if (defer_deletes_ && mut.kind == BinlogRowMutation::Kind::Insert) {
+    bool same = !pending_ins_rows_.empty() && pending_del_db_ == db_name && pending_del_table_ == table &&
+                pending_ins_cols_.size() == mut.values.size();
+    for (size_t i = 0; same && i < mut.values.size(); ++i) same = pending_ins_cols_[i] == mut.values[i].first;
+    if (!same) {
+      flush_pending_deletes();
+      pending_del_db_ = db_name; pending_del_table_ = table;
+      pending_ins_cols_.clear();
+      for (const auto& kv : mut.values) pending_ins_cols_.push_back(kv.first);
+      pending_del_since_ms_ = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    std::vector<std::string> vals;
+    vals.reserve(mut.values.size());
+    for (const auto& kv : mut.values) { pending_img_bytes_ += kv.second.size() + 4; vals.push_back(kv.second); }
+    pending_ins_rows_.push_back(std::move(vals));
+    if (pending_ins_rows_.size() >= 5000 || pending_img_bytes_ >= (8u << 20)) flush_pending_deletes();
+    return Ok();
+  }
+  flush_pending_deletes();
+
   std::string sql;
   if (mut.kind == BinlogRowMutation::Kind::Insert) {
     std::string cols, vals, updates;
@@ -2264,12 +2349,28 @@ Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut) {
     }
     sql = "INSERT INTO " + ident(table) + " (" + cols + ") VALUES (" + vals + ") ON DUPLICATE KEY UPDATE " + updates + ";";
   } else if (mut.kind == BinlogRowMutation::Kind::Update) {
+    // Only the columns that changed. The binlog carries the whole after-image, so an UPDATE of one column used to
+    // assign all of them - the primary key too, which made the updater treat every statement as one that moved
+    // keys and drop the table's key map afterwards (rebuilt in full by the next statement: about a second on a
+    // few million rows). A column whose value is the before-image's is left out; a statement that changes
+    // nothing is not run.
+    const auto& before = mut.before_values.empty() ? mut.values : mut.before_values;
     std::string sets;
     for (size_t i = 0; i < mut.values.size(); ++i) {
-      if (i > 0) sets += ", ";
+      if (!mut.before_values.empty()) {
+        const auto& was = mut.before_values;
+        bool same = false;
+        if (i < was.size() && was[i].first == mut.values[i].first) {
+          same = was[i].second == mut.values[i].second;   // the images list the same columns in the same order
+        } else {
+          for (const auto& w : was) if (w.first == mut.values[i].first) { same = w.second == mut.values[i].second; break; }
+        }
+        if (same) continue;
+      }
+      if (!sets.empty()) sets += ", ";
       sets += ident(mut.values[i].first) + " = " + lit(mut.values[i].second);
     }
-    const auto& before = mut.before_values.empty() ? mut.values : mut.before_values;
+    if (sets.empty()) return Ok();   // nothing changed: the mirror already holds this row
     sql = "UPDATE " + ident(table) + " SET " + sets + " WHERE " + match(before) + ";";
   } else if (mut.kind == BinlogRowMutation::Kind::Delete) {
     const auto& before = mut.before_values.empty() ? mut.values : mut.before_values;
@@ -2292,6 +2393,109 @@ Result<void> BinlogConsumer::apply_mutation(const BinlogRowMutation& mut) {
   }
 
   return Ok();
+}
+
+// One INSERT for the rows held: the single-row statement's ON DUPLICATE KEY UPDATE, each column from VALUES().
+// Should it fail, the rows go one at a time, so one bad row costs only itself (as it did before).
+void BinlogConsumer::flush_pending_inserts() {
+  if (pending_ins_rows_.empty()) return;
+  std::vector<std::vector<std::string>> rows;
+  rows.swap(pending_ins_rows_);
+  pending_img_bytes_ = 0;
+  auto lit = [](const std::string& v) {
+    if (sql_is_null(v)) return std::string("NULL");
+    std::string o = "'";
+    for (char ch : v) { if (ch == '\'') o += "''"; else if (ch == '\\') o += "\\\\"; else o += ch; }
+    return o + "'";
+  };
+  auto ident = [](const std::string& n) {
+    std::string o = "`";
+    for (char ch : n) { if (ch == '`') o += "``"; else o += ch; }
+    return o + "`";
+  };
+  std::string cols, updates;
+  for (size_t i = 0; i < pending_ins_cols_.size(); ++i) {
+    cols += (i ? ", " : "") + ident(pending_ins_cols_[i]);
+    updates += (i ? ", " : "") + ident(pending_ins_cols_[i]) + " = VALUES(" + ident(pending_ins_cols_[i]) + ")";
+  }
+  auto row_text = [&](const std::vector<std::string>& r) {
+    std::string t = "(";
+    for (size_t i = 0; i < r.size(); ++i) t += (i ? ", " : "") + lit(r[i]);
+    return t + ")";
+  };
+  const std::string head = "INSERT INTO " + ident(pending_del_table_) + " (" + cols + ") VALUES ";
+  const std::string tail = " ON DUPLICATE KEY UPDATE " + updates + ";";
+  std::string sql = head;
+  for (size_t i = 0; i < rows.size(); ++i) sql += (i ? ", " : "") + row_text(rows[i]);
+  sql += tail;
+  auto r = db_.execute_local_query(sql, pending_del_db_);
+  if (r.success) { applied_since_commit_ = true; return; }
+  for (const auto& row : rows) {
+    auto one = db_.execute_local_query(head + row_text(row) + tail, pending_del_db_);
+    if (one.success) { applied_since_commit_ = true; continue; }
+    total_apply_failures_++;
+    fprintf(stderr, "[cdc] %s.%s: insert not applied (columns %zu): %s\n", pending_del_db_.c_str(), pending_del_table_.c_str(),
+            pending_ins_cols_.size(), one.error_message.c_str());
+  }
+}
+
+void BinlogConsumer::flush_pending_deletes() {
+  flush_pending_inserts();
+  auto quote = [](const std::string& v) {
+    std::string o = "'";
+    for (char ch : v) { if (ch == '\'') o += "''"; else if (ch == '\\') o += "\\\\"; else o += ch; }
+    return o + "'";
+  };
+  if (!pending_img_rows_.empty()) {
+    std::vector<std::vector<std::string>> imgs;
+    imgs.swap(pending_img_rows_);
+    pending_img_bytes_ = 0;
+    std::string tbl = "`";
+    for (char ch : pending_del_table_) { if (ch == '`') tbl += "``"; else tbl += ch; }
+    tbl += "`";
+    std::string sql = "DELETE FROM " + tbl + " MATCHING ";
+    for (size_t i = 0; i < imgs.size(); ++i) {
+      sql += i ? ", (" : "(";
+      for (size_t c = 0; c < imgs[i].size(); ++c) sql += (c ? ", " : "") + (sql_is_null(imgs[i][c]) ? std::string("NULL") : quote(imgs[i][c]));
+      sql += ")";
+    }
+    sql += ";";
+    auto r = db_.execute_local_query(sql, pending_del_db_);
+    if (r.success) {
+      applied_since_commit_ = true;
+      if (r.rows_affected != imgs.size())
+        fprintf(stderr, "[cdc] %s.%s: %zu row(s) to delete, %llu found\n", pending_del_db_.c_str(), pending_del_table_.c_str(), imgs.size(),
+                (unsigned long long)r.rows_affected);
+    } else {
+      total_apply_failures_++;
+      fprintf(stderr, "[cdc] %s.%s: delete of %zu row(s) not applied: %s\n", pending_del_db_.c_str(), pending_del_table_.c_str(), imgs.size(),
+              r.error_message.c_str());
+    }
+  }
+  if (pending_del_keys_.empty()) return;
+  std::vector<std::string> keys;
+  keys.swap(pending_del_keys_);
+  std::string col = "`";
+  for (char ch : pending_del_column_) { if (ch == '`') col += "``"; else col += ch; }
+  col += "`";
+  std::string tbl = "`";
+  for (char ch : pending_del_table_) { if (ch == '`') tbl += "``"; else tbl += ch; }
+  tbl += "`";
+  constexpr size_t kPerStatement = 5000;
+  for (size_t at = 0; at < keys.size(); at += kPerStatement) {
+    std::string in;
+    const size_t end = std::min(keys.size(), at + kPerStatement);
+    for (size_t i = at; i < end; ++i) { if (i > at) in += ", "; in += quote(keys[i]); }
+    const std::string sql = "DELETE FROM " + tbl + " WHERE " + col + " IN (" + in + ");";
+    auto r = db_.execute_local_query(sql, pending_del_db_);
+    if (r.success) {
+      applied_since_commit_ = true;
+    } else {
+      total_apply_failures_++;
+      fprintf(stderr, "[cdc] %s.%s: delete of %zu row(s) not applied: %s\n", pending_del_db_.c_str(), pending_del_table_.c_str(), end - at,
+              r.error_message.c_str());
+    }
+  }
 }
 
 Result<size_t> BinlogConsumer::sync_views() {
@@ -2429,7 +2633,9 @@ void BinlogConsumer::worker_loop() {
       if (!vs.ok()) fprintf(stderr, "[cdc] view sync: %s\n", vs.error().message.c_str());
     }
     auto r = step(config_.poll_interval_ms);
+    if ((!pending_del_keys_.empty() || !pending_img_rows_.empty() || !pending_ins_rows_.empty()) && cdc_now_ms() - pending_del_since_ms_ >= 250) flush_pending_deletes();   // held deletes wait for their commit, not for long
     db_.publish_table_lists();
+    db_.cdc_settle_if_due();   // reactions owed by commits within the last 100 ms
     if (!r.ok()) {
       // Said once per distinct failure. It used to be swallowed: a replica
       // that could not connect sat at "Connecting to master" indefinitely
@@ -2448,7 +2654,9 @@ void BinlogConsumer::worker_loop() {
     uint64_t now_ms = cdc_now_ms();
     if (now_ms - last_flush_ms >= kCdcFlushIntervalMs) {
       if (total_events_applied_ != applied_at_flush) {
-        db_.flush_now();
+        // The files are written by the checkpoint thread, not under the lock: written here, every read waited for
+        // them (8 s on chi with the connection log busy). The position goes with the files as before.
+        if (!db_.flush_off_lock()) continue;   // the last checkpoint is still being written: again on the next pass
         applied_at_flush = total_events_applied_;
       } else {
         // Nothing applied since the store was last written, so it already
