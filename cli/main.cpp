@@ -220,7 +220,8 @@ int main(int argc, char** argv) {
   // Re-establish fleet membership on every kernel (re)start when configured via
   // env — a supervised kernel then rejoins the hub after any restart, natively
   // (no front-door lock, no external agent). AIOS_FLEET_HUB is "host" or
-  // "host:port" (default port 7420); AIOS_FLEET_KEY is the cluster key.
+  // "host:port" (default port 7420); AIOS_FLEET_KEY is the cluster key; AIOS_FLEET_MEMBER_KEY, when the hub
+  // keeps a members file, this machine's own key.
   if (const char* hub = std::getenv("AIOS_FLEET_HUB")) {
     const char* fkey = std::getenv("AIOS_FLEET_KEY");
     if (*hub && fkey && *fkey) {
@@ -229,7 +230,10 @@ int main(int argc, char** argv) {
       std::string fport = colon == std::string::npos ? std::string("7420") : h.substr(colon + 1);
       // A leading space keeps a boot line out of `history` (and the key with it).
       // `retry`: a hub that is down at boot is attached when it comes up.
-      auto j = run_line(s, " fleet join " + fhost + " " + fport + " " + std::string(fkey) + " retry");
+      // AIOS_FLEET_MEMBER_KEY: this machine's own attach key, for a hub with a members file (best as @FILE).
+      const char* mkey = std::getenv("AIOS_FLEET_MEMBER_KEY");
+      const std::string member = mkey && *mkey ? std::string(" member-key=") + mkey : std::string();
+      auto j = run_line(s, " fleet join " + fhost + " " + fport + " " + std::string(fkey) + " retry" + member);
       if (!j.ok()) std::cerr << "fleet: could not join " << h << " at boot: " << j.error().str() << "\n";
     }
   }

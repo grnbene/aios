@@ -1333,8 +1333,12 @@ void cmd_serve(Ctx& c, const Args& a) {
     }
     return execute_host_command(line, out);
   };
+  // The node service takes the fleet's circuits (Kernel::fleet_join's acceptor) and answers commands and work alike.
+  // The relay's own command server is only for a kernel with no service: running both, each circuit went to
+  // whichever took it first, and one the command server took offered no devices - work given there (an app.route)
+  // found "no device answering" in the caller's fabric.
   if (c.k.service()) c.k.service()->set_command_runner(runner);
-  if (c.k.relay()) c.k.relay()->set_command_runner(runner);
+  else if (c.k.relay()) c.k.relay()->set_command_runner(runner);
   // (straight out: this command does not return, and what it says belongs in the service's log now)
   std::cout << "serve: " << store->apps().size() << " app(s) in " << home << "; control on " << (all_ips ? "all IPs" : "127.0.0.1") << " port " << bound
             << (c.k.in_fleet() ? "; fleet members reach it as `app ... on " + c.k.self().short_str() + "`" : std::string()) << "\n" << std::flush;
@@ -5782,10 +5786,14 @@ void cmd_fleet(Ctx& c, const Args& a) {
     // Join the hub as a read-only observer and continuously write the live
     // fleet — every member's identity and load — to a JSON file the console
     // (or anything else) can serve. Runs until stopped.
-    if (a.size() < 5) fail(Status::Invalid, "fleet observe <hub-host> <hub-port> <key> [status-file=/opt/aos/fleet-status.json] [interval-ms=4000]");
-    need(c.me.fleet_join(c.r.expand(a[2]), (uint16_t)to_u64(c.r.expand(a[3])), fleet_key_arg(c.r.expand(a[4]))));
-    std::string path = a.size() > 5 ? c.r.expand(a[5]) : std::string("/opt/aos/fleet-status.json");
-    uint32_t interval = a.size() > 6 ? (uint32_t)to_u64(a[6]) : 4000;
+    if (a.size() < 5) fail(Status::Invalid, "fleet observe <hub-host> <hub-port> <key> [status-file=/opt/aos/fleet-status.json] [interval-ms=4000] [member-key=<key|@FILE|env:NAME>]");
+    // member-key=: the observer's own attach key, for a hub with a members file
+    const std::string obs_member_key = has_kv(a, "member-key") ? fleet_key_arg(c.r.expand(kv(a, "member-key"))) : std::string();
+    need(c.me.fleet_join(c.r.expand(a[2]), (uint16_t)to_u64(c.r.expand(a[3])), fleet_key_arg(c.r.expand(a[4])), false, obs_member_key));
+    std::vector<std::string> pos;   // status-file, interval-ms: the words after the key that are no name=value
+    for (size_t i = 5; i < a.size(); ++i) if (a[i].rfind("member-key=", 0) != 0) pos.push_back(a[i]);
+    std::string path = pos.size() > 0 ? c.r.expand(pos[0]) : std::string("/opt/aos/fleet-status.json");
+    uint32_t interval = pos.size() > 1 ? (uint32_t)to_u64(pos[1]) : 4000;
     std::string hub = c.r.expand(a[2]) + ":" + c.r.expand(a[3]);
     c.o << "observing the fleet via " << hub << "; writing " << path << " every " << interval << "ms (stop to end)\n";
     auto dbj = [](const std::vector<NodeTelemetry::HostedDbInfo>& dbs) {
