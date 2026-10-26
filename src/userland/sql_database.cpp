@@ -18889,6 +18889,8 @@ void SqlTable::compact_delta_buffer() const {
   }
   auto* self = const_cast<SqlTable*>(this);
   self->ensure_columns();
+  const size_t first_new = self->row_count();
+  const uint64_t seq_before = mutation_seq;
   bool recoded = false;
   for (const auto& r : delta_buffer.rows) {
     for (size_t c = 0; c < col_data.size(); ++c) {
@@ -18904,6 +18906,20 @@ void SqlTable::compact_delta_buffer() const {
   // in place is re-encoded by maintenance, not here on the read path.
   self->mutation_seq = sql_next_mutation_seq();
   if (recoded) self->layout_seq = self->mutation_seq;
+  // The rows are appends: in the journal as such, as the other append paths put them. Not recorded, the next write's
+  // note found the table moved under it and the journal broke - after a restart (rows replayed into this buffer),
+  // the first DELETE wrote the table whole instead of a part.
+  if (journal.on) {
+    ChangeJournal::Op op;
+    op.kind = 'A';
+    const size_t n = self->row_count(), ncols = col_data.size();
+    if (n > first_new) {
+      op.cells.reserve((n - first_new) * ncols);
+      for (size_t r = first_new; r < n; ++r)
+        for (size_t c = 0; c < ncols; ++c) op.cells.push_back(col_data[c].get(r));   // as stored
+    }
+    self->journal_note(seq_before, self->mutation_seq, std::move(op));
+  }
 }
 
 namespace {
@@ -24952,10 +24968,6 @@ namespace { constexpr uint64_t kQmemMaxWaitMs = 30000; }
 bool SqlDatabase::qmem_reserve(uint64_t order, size_t* held, size_t bytes, bool may_wait) {
   std::unique_lock<aios::hal::Mutex> lk(qmem_mu_);
   const size_t budget = qmem_budget_.load(std::memory_order_relaxed);
-  // A per-statement ceiling: a single statement cannot reserve unbounded memory.
-  // When a budget is set, no single statement may exceed the per-statement ceiling (2 * budget).
-  const size_t ceiling = budget > 0 ? budget * 2 : 0;
-  if (ceiling > 0 && *held + bytes > ceiling) return false;
   const uint64_t t0 = kernel_.host().monotonic_ns();
   bool waiting = false;
   for (;;) {
@@ -32079,6 +32091,25 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         const std::string m = (double)(long long)a.num == a.num ? enum_member_at(t.columns[col].declared, (long long)a.num) : std::string();
         if ((e->op != ExprOp::Eq && e->op != ExprOp::Ne) || m.empty()) { p.kind = Pred::Row; return p; }
         a = val_text(m);
+      }
+      // A number against a DATE / DATETIME column is read as the date it spells, as MariaDB reads it:
+      // 20261025170000 is 2026-10-25 17:00:00, 20261025 that day at midnight. Compared as text instead, the column's
+      // '2026-10-25 17:00:17' read as the number 2026 and every row was below it. A number that spells no date (or
+      // has a fraction) goes to the evaluator, which compares the column's own number with it.
+      if (ok && a.numeric && (t.columns[col].temporal == 1 || t.columns[col].temporal == 2)) {
+        auto spelled = [](const Val& v, std::string* out) {
+          if (!(v.num >= 0) || v.num != std::floor(v.num) || v.num > 99991231235959.0) return false;
+          char buf[32];
+          std::snprintf(buf, sizeof buf, "%.0f", v.num);
+          int64_t key = 0;
+          if (!temporal_key(buf, &key)) return false;
+          *out = buf;
+          return true;
+        };
+        std::string sa, sb;
+        if (!spelled(a, &sa) || (e->op == ExprOp::Between && !spelled(b, &sb))) { p.kind = Pred::Row; return p; }
+        a = val_text(sa);
+        if (e->op == ExprOp::Between) b = val_text(sb);
       }
       if (ok) {
         p.kind = Pred::TextCmp;

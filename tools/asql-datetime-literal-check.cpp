@@ -47,7 +47,11 @@ int main() {
       {"<", "'2026-10-25 17:00'", 17 * 3600},     {"<", "'2026-10-25 17'", 17 * 3600},      {">", "'2026-10-25 9:05'", 9 * 3600 + 5 * 60},
       {">=", "'2026-10-25T17:00'", 17 * 3600},    {"<=", "'2026-10-25 17:00:17.5'", 17 * 3600 + 17}, {">=", "'2026-10-25'", 0},
       {"<", "'2026-10-26'", 86400},               {"=", "'2026-10-25 17:00:17'", 17 * 3600 + 17},
-      // (a bare number, `at >= 20261025170000`, answers 0 on an encoded column - open, and older than this check)
+      // a bare number is read as the date it spells, as MariaDB reads it: YYYYMMDDhhmmss, or YYYYMMDD at midnight
+      {">=", "20261025170000", 17 * 3600},        {"<", "20261025170000", 17 * 3600},       {"=", "20261025170017", 17 * 3600 + 17},
+      {">=", "20261025", 0},                      {"<", "20261026", 86400},                 {">", "20261025090500", 9 * 3600 + 5 * 60},
+      // digits in quotes too ('20261025170000' is that datetime)
+      {">=", "'20261025170000'", 17 * 3600},
   };
   auto model = [&](const Case& c) {
     int n = 0;
@@ -74,6 +78,10 @@ int main() {
     const std::string dw = one(db, "SELECT COUNT(*) FROM ev WHERE day >= '2026-05-01'");
     if (dg != dw) ++failures;
     std::printf("  [%s] %s day >= '2026-05-01 00:00': %s, as day >= '2026-05-01': %s\n", dg == dw ? "ok" : "FAIL", pass ? "reopened" : "written", dg.c_str(), dw.c_str());
+    // and a bare number: 20260501 is that date
+    const std::string dn = one(db, "SELECT COUNT(*) FROM ev WHERE day >= 20260501");
+    if (dn != dw) ++failures;
+    std::printf("  [%s] %s day >= 20260501: %s, as day >= '2026-05-01': %s\n", dn == dw ? "ok" : "FAIL", pass ? "reopened" : "written", dn.c_str(), dw.c_str());
     if (pass == 0) db.flush_now();
   }
   if (std::system(("rm -rf " + root).c_str()) != 0) std::printf("could not remove %s\n", root.c_str());
