@@ -1,0 +1,74 @@
+// tests/grain/test_logging.gr
+// Test structured leveled logging builtins across all scopes.
+
+fn test_log_levels() {
+  assert(log_get_level() == "info", "default log level should be info");
+
+  log_set_level("debug");
+  assert(log_get_level() == "debug", "log level should be debug");
+
+  log_set_level("warn");
+  assert(log_get_level() == "warn", "log level should be warn");
+
+  // Invalid log level should error
+  let bad = pcall(fn() { log_set_level("verbose"); });
+  assert(!bad.ok, "unknown log level must error");
+
+  // Reset to debug for testing calls
+  log_set_level("debug");
+}
+
+fn test_log_scopes() {
+  // Top-level
+  log_info("Application starting", {"port": 8080, "env": "prod"});
+  log_debug("Cache initialized", {"entries": 0});
+  log_warn("Slow query detected", {"duration_ms": 120});
+  log_error("Failed to connect", {"error": "timeout"});
+
+  // Inside closures and nested blocks
+  let make_worker = fn(id) {
+    return fn(action) {
+      if (action == "fail") {
+        log_error("Worker failed", {"worker_id": id, "action": action});
+      } else {
+        log_info("Worker processed", {"worker_id": id, "action": action});
+      }
+    };
+  };
+
+  let w = make_worker(7);
+  w("process");
+  w("fail");
+}
+
+fn test_json_format() {
+  log_set_format("json");
+  log_info("JSON structured log", {"status": 200, "user": "admin"});
+
+  let bad_fmt = pcall(fn() { log_set_format("yaml"); });
+  assert(!bad_fmt.ok, "unknown format must error");
+
+  log_set_format("text");
+}
+
+fn test_filtering() {
+  log_set_level("error");
+  // These should be silent
+  log_debug("Silent debug");
+  log_info("Silent info");
+  log_warn("Silent warn");
+  // Only error emits
+  log_error("Emitted error");
+  log_set_level("info");
+}
+
+fn test_eprint() {
+  eprint("Testing stderr output from eprint");
+}
+
+test_log_levels();
+test_log_scopes();
+test_json_format();
+test_filtering();
+test_eprint();
+print("PASS: test_logging");

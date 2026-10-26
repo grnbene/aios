@@ -1656,6 +1656,34 @@ Value route_request(const std::string& method, const std::string& path, const st
   }
   req_m->put("headers", Value::object(Type::Map, hdr_m));
   req_m->put("remote", Value::string(remote));
+
+  auto files_m = std::make_shared<MapObj>();
+  auto form_m = std::make_shared<MapObj>();
+
+  std::string ct_val;
+  for (const auto& [name, value] : headers) {
+    std::string key = name;
+    for (char& c : key) c = (char)std::tolower((unsigned char)c);
+    if (key == "content-type") {
+      ct_val = value;
+      break;
+    }
+  }
+
+  if (!ct_val.empty()) {
+    std::string lower_ct = ct_val;
+    for (char& c : lower_ct) c = (char)std::tolower((unsigned char)c);
+    if (lower_ct.find("multipart/form-data") != std::string::npos) {
+      std::string bnd = extract_multipart_boundary(ct_val);
+      if (!bnd.empty()) {
+        auto mp = parse_multipart_data(body, bnd);
+        files_m = mp.files;
+        form_m = mp.form;
+      }
+    }
+  }
+  req_m->put("files", Value::object(Type::Map, files_m));
+  req_m->put("form", Value::object(Type::Map, form_m));
   return Value::object(Type::Map, req_m);
 }
 

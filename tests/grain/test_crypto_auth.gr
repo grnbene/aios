@@ -1,0 +1,63 @@
+// Test bcrypt password hashing and JWT authentication primitives
+
+// 1. bcrypt hashing and verification
+let pass = "correct-horse-battery-staple"
+let hash = bcrypt_hash(pass, 4) // low cost for fast test execution
+assert(type(hash) == "string", "bcrypt_hash must return a string")
+assert(slice(hash, 0, 4) == "$2b$", "hash must start with $2b$ prefix")
+
+assert_true(bcrypt_verify(pass, hash), "valid password must verify")
+assert_false(bcrypt_verify("wrong-password", hash), "wrong password must fail verification")
+assert_false(bcrypt_verify("", hash), "empty password must fail verification")
+
+// 2. JWT signing and verification
+let secret = "super-secret-key-for-signing-tokens"
+let payload = {
+  "sub": "user_12345",
+  "name": "Alice",
+  "admin": true,
+  "exp": now() + 3600
+}
+
+let token = jwt_sign(payload, secret)
+assert(type(token) == "string", "jwt_sign must return a string")
+assert(len(split(token, ".")) == 3, "JWT must have 3 dot-separated parts")
+
+let verified = jwt_verify(token, secret)
+assert_true(verified.ok, "valid token must verify successfully")
+assert_eq(verified.payload.sub, "user_12345", "payload sub must match")
+assert_eq(verified.payload.name, "Alice", "payload name must match")
+assert_true(verified.payload.admin, "payload admin must match")
+
+// Wrong secret must fail
+let bad_sig = jwt_verify(token, "wrong-secret")
+assert_false(bad_sig.ok, "token with wrong secret must fail")
+
+// Expired token must fail
+let expired_payload = {
+  "sub": "expired_user",
+  "exp": now() - 10
+}
+let expired_token = jwt_sign(expired_payload, secret)
+let expired_res = jwt_verify(expired_token, secret)
+assert_false(expired_res.ok, "expired token must fail verification")
+assert(find(expired_res.error, "expired") != nil, "error message must mention expired")
+
+print("PASS: test_crypto_auth")
+
+// 3. Test inside closures and nested control flow blocks
+fn test_auth_in_closure(pwd, secret_key) {
+  let h = bcrypt_hash(pwd, 4)
+  if bcrypt_verify(pwd, h) {
+    let tok = jwt_sign({"sub": "nested_user", "exp": now() + 300}, secret_key)
+    let v = jwt_verify(tok, secret_key)
+    if v.ok and v.payload.sub == "nested_user" {
+      return true
+    }
+  }
+  return false
+}
+
+assert_true(test_auth_in_closure("secret_in_fn", "jwt_key_123"), "auth workflow inside function must pass")
+
+print("PASS: all scopes verified for crypto & auth")

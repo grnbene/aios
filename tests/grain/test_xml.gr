@@ -1,0 +1,90 @@
+// tests/grain/test_xml.gr
+// Test XML parsing and escaping builtins across all execution scopes.
+
+fn test_top_level() {
+  let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<catalog xmlns:d=\"http://example.com\">\n" +
+            "  <!-- comment here -->\n" +
+            "  <item id=\"item-1\" active=\"true\">\n" +
+            "    <title>Grain Handbook &amp; Guide</title>\n" +
+            "    <price currency=\"USD\">29.99</price>\n" +
+            "    <description><![CDATA[Special <chars> & content!]]></description>\n" +
+            "    <empty_tag self=\"closed\" />\n" +
+            "  </item>\n" +
+            "</catalog>";
+
+  let doc = xml_parse(xml);
+  assert(doc.tag == "catalog", "doc tag must be catalog");
+  assert(doc.attrs["xmlns:d"] == "http://example.com", "xmlns attr");
+  assert(len(doc.children) == 1, "catalog has 1 child");
+
+  let item = doc.children[0];
+  assert(item.tag == "item", "item tag");
+  assert(item.attrs["id"] == "item-1", "id attr");
+  assert(item.attrs["active"] == "true", "active attr");
+  assert(len(item.children) == 4, "item has 4 children");
+
+  let title = item.children[0];
+  assert(title.tag == "title", "title tag");
+  assert(title.text == "Grain Handbook & Guide", "title text with unescaped entity");
+
+  let price = item.children[1];
+  assert(price.tag == "price", "price tag");
+  assert(price.attrs["currency"] == "USD", "currency attr");
+  assert(price.text == "29.99", "price text");
+
+  let desc = item.children[2];
+  assert(desc.tag == "description", "desc tag");
+  assert(desc.text == "Special <chars> & content!", "CDATA text");
+
+  let empty_tag = item.children[3];
+  assert(empty_tag.tag == "empty_tag", "empty_tag tag");
+  assert(empty_tag.attrs["self"] == "closed", "empty_tag attr");
+  assert(len(empty_tag.children) == 0, "empty_tag has 0 children");
+  assert(empty_tag.text == "", "empty_tag text is empty");
+}
+
+fn test_scopes() {
+  // Nested scope & closure
+  let runner = fn(raw_xml) {
+    if (len(raw_xml) > 0) {
+      let node = xml_parse(raw_xml);
+      return fn(attr_name) {
+        return node.attrs[attr_name];
+      };
+    }
+    return fn(k) { return ""; };
+  };
+
+  let get_status = runner("<status code=\"200\" msg=\"OK\">Success</status>");
+  assert(get_status("code") == "200", "closure attr code");
+  assert(get_status("msg") == "OK", "closure attr msg");
+
+  // Escaping & unescaping
+  let raw = "<a href=\"test&val='1'\">Hello & Welcome</a>";
+  let escaped = xml_escape(raw);
+  assert(escaped == "&lt;a href=&quot;test&amp;val=&apos;1&apos;&quot;&gt;Hello &amp; Welcome&lt;/a&gt;", "xml_escape");
+  assert(xml_unescape(escaped) == raw, "xml_unescape roundtrip");
+
+  // Numeric entities
+  let with_num = xml_parse("<val hex=\"&#x41;\" dec=\"&#66;\">&#x2603;</val>");
+  assert(with_num.attrs["hex"] == "A", "numeric hex entity attr");
+  assert(with_num.attrs["dec"] == "B", "numeric dec entity attr");
+  assert(with_num.text == "☃", "numeric unicode entity text (snowman)");
+}
+
+fn test_malformed() {
+  let res1 = pcall(fn() { return xml_parse("<unclosed>test"); });
+  assert(!res1.ok, "unclosed tag must fail in pcall");
+
+  let res2 = pcall(fn() { return xml_parse("<start>content</mismatch>"); });
+  assert(!res2.ok, "mismatched tag must fail in pcall");
+
+  let res3 = pcall(fn() { return xml_parse("   "); });
+  assert(!res3.ok, "empty xml must fail in pcall");
+}
+
+test_top_level();
+test_scopes();
+test_malformed();
+print("PASS: test_xml");

@@ -527,6 +527,12 @@ class Vm {
   std::vector<std::string>* sink = nullptr;
   void emit(const std::string& line);
 
+  // Structured logging configuration:
+  // log_level: 0 = debug, 1 = info, 2 = warn, 3 = error
+  int log_level = 1;
+  // log_format: 0 = text, 1 = json
+  int log_format = 0;
+
   // Where read_file/write_file/... go. Not owned; null = no file storage.
   Files* files = nullptr;
 

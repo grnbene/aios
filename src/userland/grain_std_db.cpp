@@ -191,12 +191,15 @@ class Session {
     if (!conn_) return;
     std::string ignore;
     seq_ = 0;
+    tx_depth = 0;
     write_packet({0x01}, ignore);   // COM_QUIT
     conn_->close();
     conn_.reset();
   }
   bool open() const { return conn_ != nullptr; }
   const std::string& server_version() const { return server_version_; }
+
+  uint32_t tx_depth = 0;
 
  private:
   std::unique_ptr<hal::Connection> conn_;
@@ -511,6 +514,68 @@ Value bi_db_close(Vm&, std::vector<Value>& args, std::string&) {
   return Value::nil();
 }
 
+Value bi_db_transaction(Vm& vm, std::vector<Value>& args, std::string& error) {
+  auto s = session_of(args[0]);
+  if (!s || !s->open()) {
+    error = "db_transaction() wants a connection from db_connect() that is still open";
+    return Value::nil();
+  }
+  if (args.size() < 2 || callable_arity(args[1]) < 0) {
+    error = "db_transaction() wants a function as its second argument";
+    return Value::nil();
+  }
+  const Value& fn = args[1];
+
+  uint32_t depth = s->tx_depth;
+  std::string begin_sql = (depth == 0) ? "START TRANSACTION" : ("SAVEPOINT grain_sp_" + std::to_string(depth));
+  QueryResult begin_r;
+  std::string begin_err;
+  if (!s->query(begin_sql, begin_r, begin_err) || !begin_r.ok) {
+    error = "db_transaction() failed to begin: " + (begin_err.empty() ? begin_r.error : begin_err);
+    return Value::nil();
+  }
+  s->tx_depth++;
+
+  std::vector<Value> fn_args;
+  if (callable_arity(fn) > 0) fn_args.push_back(args[0]);
+
+  std::string call_err;
+  Value result = vm.call(fn, fn_args, call_err);
+
+  if (s->open()) {
+    s->tx_depth--;
+    if (call_err.empty()) {
+      std::string commit_sql = (depth == 0) ? "COMMIT" : ("RELEASE SAVEPOINT grain_sp_" + std::to_string(depth));
+      QueryResult commit_r;
+      std::string commit_err;
+      if (!s->query(commit_sql, commit_r, commit_err) || !commit_r.ok) {
+        std::string rb_sql = (depth == 0) ? "ROLLBACK" : ("ROLLBACK TO SAVEPOINT grain_sp_" + std::to_string(depth));
+        QueryResult rb_r;
+        std::string rb_err;
+        s->query(rb_sql, rb_r, rb_err);
+        error = "db_transaction() failed to commit: " + (commit_err.empty() ? commit_r.error : commit_err);
+        return Value::nil();
+      }
+      return result;
+    } else {
+      std::string rb_sql = (depth == 0) ? "ROLLBACK" : ("ROLLBACK TO SAVEPOINT grain_sp_" + std::to_string(depth));
+      QueryResult rb_r;
+      std::string rb_err;
+      s->query(rb_sql, rb_r, rb_err);
+      error = call_err;
+      return Value::nil();
+    }
+  } else {
+    s->tx_depth = 0;
+    if (!call_err.empty()) {
+      error = call_err;
+    } else {
+      error = "db_transaction(): connection was closed during transaction";
+    }
+    return Value::nil();
+  }
+}
+
 // ---- live(): a query whose result stays current -------------------------------------
 
 // The tables a query reads: the names after FROM and JOIN. Good enough to watch them; live(db, sql, {tables: [...]})
@@ -641,6 +706,7 @@ void install_db_builtins(Vm& vm) {
   vm.define_native("db_escape", 1, 1, bi_db_escape);
   vm.define_native("db_quote", 1, 1, bi_db_quote);
   vm.define_native("db_close", 1, 1, bi_db_close);
+  vm.define_native("db_transaction", 2, 2, bi_db_transaction);
   vm.define_native("live", 2, 3, bi_live);
 }
 

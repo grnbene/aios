@@ -79,6 +79,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/md5.cpp
   ${AIOS_ROOT}/src/crypto/keccak256.cpp
   ${AIOS_ROOT}/src/crypto/hmac_sha256.cpp
+  ${AIOS_ROOT}/src/crypto/bcrypt.cpp
   ${AIOS_ROOT}/src/userland/glyph_engine.cpp
   ${AIOS_ROOT}/src/userland/font_atlas.cpp
   ${AIOS_ROOT}/src/userland/font_kerning.cpp

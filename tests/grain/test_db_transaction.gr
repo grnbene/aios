@@ -1,0 +1,68 @@
+let pass = trim(read_file("/Users/skyblade/Docker/mcp/build/asql-local-root/mysql.pass"))
+let db = db_connect("127.0.0.1", 3307, "root", pass)
+assert_true(db.ok, "database must connect")
+
+db_query(db, "CREATE DATABASE IF NOT EXISTS test_tx")
+db_query(db, "DROP TABLE IF EXISTS test_tx.items")
+db_query(db, "CREATE TABLE test_tx.items (id INT PRIMARY KEY, val VARCHAR(50))")
+
+// 1. Successful transaction commits
+let res1 = db_transaction(db, fn (tx) {
+  db_query(tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [1, "first"])
+  return "success_val"
+})
+assert_eq(res1, "success_val", "db_transaction must return callback result")
+let count1 = int(db_query(db, "SELECT COUNT(*) FROM test_tx.items").rows[0][0])
+assert_eq(count1, 1, "row must be committed")
+
+// 2. Errored transaction rolls back
+let failed_call = pcall(db_transaction, db, fn (tx) {
+  db_query(tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [2, "second"])
+  error("deliberate failure in tx")
+})
+assert_false(failed_call.ok, "pcall must catch error from db_transaction")
+let count2 = int(db_query(db, "SELECT COUNT(*) FROM test_tx.items").rows[0][0])
+assert_eq(count2, 1, "uncommitted row 2 must be rolled back")
+
+// 3. Nested transaction (SAVEPOINT): inner failure rolls back to savepoint
+let res3 = db_transaction(db, fn (tx) {
+  db_query(tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [10, "outer_row"])
+  
+  // Nested transaction that fails
+  let inner_fail = pcall(db_transaction, tx, fn (inner_tx) {
+    db_query(inner_tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [11, "inner_row"])
+    error("inner tx failure")
+  })
+  assert_false(inner_fail.ok, "nested tx failure caught")
+  
+  // Outer continues and commits
+  db_query(tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [12, "outer_row_2"])
+  return "outer_ok"
+})
+assert_eq(res3, "outer_ok", "outer transaction must commit successfully")
+
+let rows3 = db_query(db, "SELECT id FROM test_tx.items ORDER BY id").rows
+assert_eq(len(rows3), 3, "must have exactly 3 rows (1, 10, 12)")
+assert_eq(int(rows3[0][0]), 1, "row 1 present")
+assert_eq(int(rows3[1][0]), 10, "row 10 present")
+assert_eq(int(rows3[2][0]), 12, "row 12 present")
+
+// 4. Test inside closure scope
+fn perform_scoped_tx(d, item_id, item_val) {
+  return db_transaction(d, fn (tx) {
+    db_query(tx, "INSERT INTO test_tx.items (id, val) VALUES (?, ?)", [item_id, item_val])
+    return item_id * 10
+  })
+}
+
+let scoped_res = perform_scoped_tx(db, 99, "scoped")
+assert_eq(scoped_res, 990, "scoped tx returns expected value")
+let r99 = db_query(db, "SELECT val FROM test_tx.items WHERE id = 99").rows
+assert_eq(len(r99), 1, "row 99 committed")
+assert_eq(r99[0][0], "scoped", "row 99 value matches")
+
+// Cleanup
+db_query(db, "DROP DATABASE test_tx")
+db_close(db)
+
+print("PASS: test_db_transaction")
