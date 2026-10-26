@@ -1,5 +1,6 @@
-# After every deploy, against the version just started: its page answers, and the API refuses a caller without a
-# token the way the old service did.
+// Pre-cutover health checks.
+// Verifies that the newly deployed instance serves the status dashboard (HTTP 200)
+// and rejects unauthenticated requests to /feed with HTTP 401.
 fn check(app) {
   let page = http_get(app.url + "/")
   if page.status != 200 { return "GET / answered " + str(page.status) }

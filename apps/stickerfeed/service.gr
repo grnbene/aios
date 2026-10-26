@@ -1,35 +1,23 @@
-// StickerFeed vendor API, read straight from ASQL.
+// Stickerfeed Vendor Web Service
 //
-// The v8 ERP's sticker feed (catalog/controller/apir/tools/stickerfeedapi.php feed(), with
-// system/library/stickerfeed/feedbuilder.php building the items) ported to grain. Every read goes to
-// ASQL, which the binlog keeps current with the live MariaDB, so there is no cache and nothing to
-// refresh: each request reads the rows as they are now. The answer is the PHP's own, field for field,
-// including PHP 7.4's arithmetic and its quirks (see the notes at getItemCost and getNextCost).
+// Serves catalog feeds, stock checks, and brand authorizations for external vendor ERPs.
+// Reads catalog and inventory data from an ASQL read-replica (replicated from MariaDB via binlog CDC).
+// Writes audit connection logs and last-sent timestamps to MariaDB.
 //
-//   POST /feed          Authorization: Bearer <token>, body {} or {"brands": ["NAME", ...]}
-//                       -> {"items": [...]}, exactly what feed() answers
-//   POST /getstock      Authorization: Bearer <token>, body {"sku": "VITEM"}, {"skus": ["VITEM", ...]} or the
-//                       "lines" placeorder takes ([{"sku": ..., "brand": ..., "qty": ...}])
-//                       -> {"items": [...], "not_found": [{"sku": ...}, ...]}: the same rows as /feed, for
-//                       those items; 404 not_found when none of them is in the feed
-//   POST /getbrands     Authorization: Bearer <token>, no body -> {"brands": ["NAME", ...]}, the brands the
-//                       client is not excluded from, exactly what getbrands() answers
-//   GET  /              the ops view
+// API Endpoints:
+//   POST /feed          Body: {} or {"brands": ["NAME", ...]}
+//                       Returns {"items": [...]} full or filtered catalog.
+//   POST /getstock      Body: {"sku": "SKU"}, {"skus": ["A", "B"]}, or {"lines": [{"sku": ...}]}
+//                       Returns {"items": [...], "not_found": [...]}.
+//   POST /getbrands     Body: none
+//                       Returns {"brands": ["NAME", ...]}.
+//   GET  /              Operations dashboard UI.
 //
-// What it does not do: getItemCost() in PHP also writes stockmaster.actualcost from inside the feed.
-// ASQL takes no writes and a read path should not make them, so that write is left out.
-//
-// Speed: a feed for given brands or items reads every table for those items only. The whole catalog is built in
-// slices on every core, each slice on a connection of its own, while the remote stock is read beside them
-// and added in at the end; the answer is the same bytes as a build in one piece.
-//
-// The connection log and lastsent are written where PHP writes them, the ERP's MariaDB, on a
-// connection of their own (STICKERFEED_WRITE_*); the rate limit reads that log, as PHP does.
-//
-// Configuration (environment):
-//   ASQL_HOST (127.0.0.1)  ASQL_PORT (3307)  ASQL_USER (root)  ASQL_PASSWORD or ASQL_PASSWORD_FILE  ASQL_DB (versioneight)
-//   STICKERFEED_WRITE_HOST  _PORT (3306)  _USER  _PASSWORD or _PASSWORD_FILE  _DB (ASQL_DB)
-//   STICKERFEED_KEY_FILE (/var/www/keyfile.txt) or STICKERFEED_ENCRYPTION_KEY: the key the tokens are sealed with
+// Architecture & Concurrency:
+// - Read/Write Separation: Reads are completely read-only against ASQL (eliminating MariaDB table locks).
+// - Precomputed Rows: When available, queries use pre-indexed rows from ASQL Thing `sticker_item`.
+// - Multicore Fallback: If `sticker_item` is unavailable, builds run in parallel across CPU cores.
+// - Compatibility: Output JSON matches legacy PHP 7.4 payload formatting character-for-character.
 
 fn env(name, fallback) {
   let v = getenv(name)
@@ -41,25 +29,11 @@ fn secret(name) {
   let v = getenv(name)
   if v != nil and v != "" { return v }
   let f = getenv(name + "_FILE")
-  // trim, not php_trim: this runs while the settings are read, before lib/feed.gr (which has php_trim) is imported
   if f != nil and f != "" { return trim(read_file(f)) }
   return ""
 }
 
-// ---- PHP 7.4, as the feed's arithmetic and tests use it --------------------------------------
-// Numbers are grain decimals, exact. PHP does this arithmetic in doubles and number_format() rounds
-// through 15 significant digits, which gives the same digits as exact decimals for every value a price,
-// cost or quantity takes.
-
-
-
-
-
-
-
-
-
-// $v != '' on PHP 7.4: null, false, "", 0 and 0.0 equal ''
+// PHP 7.4 loose empty string comparison: nil, false, "", 0, and 0.0 evaluate to true
 fn loose_empty_string(v) {
   if v == nil or v == false or v == "" { return true }
   let t = type(v)
@@ -67,9 +41,7 @@ fn loose_empty_string(v) {
   return false
 }
 
-
-
-// ---- connections ------------------------------------------------------------------------------
+// ---- Database Connections --------------------------------------------------------------------
 
 let ASQL = {
   "host": env("ASQL_HOST", "127.0.0.1"), "port": int(env("ASQL_PORT", "3307")),
@@ -86,15 +58,14 @@ fn conn(which) {
   let c = conns[which]
   if c != nil { return c }
   let cfg = which == "read" ? ASQL : WRITE
-  if cfg.host == "" { error("STICKERFEED_WRITE_HOST is not set: the connection log and lastsent have nowhere to go") }
+  if cfg.host == "" { error("STICKERFEED_WRITE_HOST is not set: audit logging host required") }
   let r = db_connect(cfg.host, cfg.port, cfg.user, cfg.password, cfg.db)
   if not r.ok { error("cannot connect to " + which + " database " + cfg.host + ":" + str(cfg.port) + ": " + r.error) }
   conns[which] = r
   return r
 }
 
-// One statement, its ? filled from params. A read whose connection broke is tried once more on a new
-// one; a write is not, since it may have been applied.
+// Executes a database query. Automatically retries reads once if the connection was dropped.
 fn run(which, sql, params, opts) {
   let r = pcall(db_query, conn(which), sql, params, opts)
   if not r.ok {
@@ -110,7 +81,7 @@ fn run(which, sql, params, opts) {
   return r.value
 }
 
-// rows only: the feed reads a quarter of a million of them, and records would double that
+// Optimization: Fetch rows as lists of column values rather than map records to reduce memory allocation
 let ROWS = {"records": false}
 fn rows(sql, params) { return run("read", sql, params, ROWS).rows }
 
@@ -122,33 +93,32 @@ fn first_row(sql, params) {
 
 import "lib/feed.gr"
 
-// whether rgaorders has rga_type (asked once)
+// Detects whether rgaorders table supports the `rga_type` column (cached check)
 let RGA_TYPE = nil
 fn has_rga_type() {
   if RGA_TYPE == nil { RGA_TYPE = len(rows("SHOW COLUMNS FROM rgaorders LIKE 'rga_type'", nil)) > 0 }
   return RGA_TYPE
 }
 
-// ---- feedbuilder.php ----------------------------------------------------------------------------
-
 fn today() { return date_format(now(), "%F", "local") }
 
 
 
 
-// The whole build for a set of items: what feedbuilder.php's build() reads one item at a time, read
-// once per table. brands: nil or the manufacturer ids to keep; only: nil or the stockids to build.
-// For some items every table is read for those items only; for the catalog, whole.
+// ---- Dynamic Catalog Builder -----------------------------------------------------------------
+
+// Builds catalog items dynamically directly against ASQL.
+// Used as a fallback when precomputed ASQL Thing `sticker_item` is unavailable,
+// or when building a focused slice for specific brands or stockids.
 fn build(brands, levels, only, post) {
   let d = today()
-  // the catalog will most likely be built in slices: the remote stock, which no slice can read for its items
-  // alone, is read meanwhile
+  // For full catalog queries, fetch remote inventory in the background while building base rows
   let remote_task = nil
   if only == nil and brands == nil {
     close_conns()
     remote_task = spawn(fn () { return remote_stock(nil) })
   }
-  // " AND col IN (?)" and its parameter, when the build is for some items
+  // Construct optional SQL filter predicates for specific stockids
   let o = fn (col) { return only == nil ? "" : " AND " + col + " IN (?)" }
   let op = fn (params) {
     if only != nil { push(params, only) }
@@ -167,8 +137,7 @@ fn build(brands, levels, only, post) {
     return []
   }
 
-  // A feed for some brands reads every other table for those items only, as one for given items does,
-  // and not the catalog's: the same rows for these items, a fraction of what is read.
+  // Brand-filtered query optimization: constrain downstream table reads to matching stockids
   if only == nil and brands != nil and len(base) <= 20000 {
     only = []
     for item in base { push(only, item[0]) }
@@ -179,13 +148,11 @@ fn build(brands, levels, only, post) {
   return post == nil ? items : post(items)
 }
 
-// The catalog is built in slices on every core, each a build for some items (above) that opens a
-// connection of its own, and the slices go back together in the order the base query gave.
+// Parallel processing thresholds for full catalog builds
 let PARALLEL_FROM = 4000
 let SLICES = 8
 
-// A slice is built without the remote stock, which arrives from its own read while the slices run: its items
-// carry the stock before it as `qty` and their key as `_k`, and the last step below adds the remote stock in.
+// Computes a catalog slice on an isolated worker thread. Remote warehouse stock is merged subsequently.
 fn build_slice(slice, levels, d, post) {
   let ids = []
   for item in slice { push(ids, item[0]) }
@@ -193,7 +160,7 @@ fn build_slice(slice, levels, d, post) {
   return post == nil ? items : post(items)
 }
 
-// a connection cannot be copied to a worker, so the open ones go; the next read opens another
+// Closes open database handles in the parent process prior to spawning worker threads
 fn close_conns() {
   for k in keys(conns) {
     pcall(db_close, conns[k])
@@ -201,6 +168,7 @@ fn close_conns() {
   }
 }
 
+// Splits the base item list across CPU cores to build items in parallel, then joins the slices
 fn build_parallel(base, levels, d, remote_task, post) {
   close_conns()
   let per = int((len(base) + SLICES - 1) / SLICES)
@@ -218,7 +186,7 @@ fn build_parallel(base, levels, d, remote_task, post) {
   }
   let out = []
   for part in r.value { for x in part { push(out, x) } }
-  // $avail = QTY_ON_HAND - getOnSalesOrder() + remote, and a stock of 5 to 8 is told as 9
+  // Merge remote stock into item quantities; preserve ERP rule rounding stock levels 5..8 to 9
   for it in out {
     let avail = it.qty
     let rem = remote_all[it._k]
@@ -230,13 +198,9 @@ fn build_parallel(base, levels, d, remote_task, post) {
   return out
 }
 
+// ---- Vendor Filtering Helpers -----------------------------------------------------------------
 
-
-
-
-
-
-// in_array($v, $list) over one list many times: its strings, and the numbers among them, read once
+// Builds an optimized lookup set matching PHP's loose in_array semantics (string & integer equality)
 fn php_in_set(list) {
   let strs = {}
   let nums = []
@@ -259,7 +223,7 @@ fn php_in_set_has(set, v) {
   return false
 }
 
-// filterForVendor(): drop the client's brands and items, keep the price of its level
+// Filters catalog items according to vendor exclusions (blocked brands & skus) and resolves pricing level
 fn filter_for_vendor(items, excluded_brands, excluded_skus, level) {
   let brands = php_in_set(excluded_brands)
   let skus = php_in_set(excluded_skus)
@@ -285,12 +249,11 @@ fn filter_for_vendor(items, excluded_brands, excluded_skus, level) {
   return out
 }
 
-
-// ---- credentials.php and the controller's checks ----------------------------------------------
+// ---- Vendor Authentication & Token Decryption ------------------------------------------------
 
 let enc_key = nil
 
-// StickerFeedEncryption::key(): sha256 of the key file's text, else of STICKERFEED_ENCRYPTION_KEY
+// Derives the AES-256 decryption key from STICKERFEED_KEY_FILE or STICKERFEED_ENCRYPTION_KEY
 fn sealing_key() {
   if enc_key != nil { return enc_key }
   let raw = ""
@@ -305,7 +268,7 @@ fn sealing_key() {
   return enc_key
 }
 
-// StickerFeedEncryption::decrypt(): 'enc:' + base64(iv | AES-256-CBC ciphertext); anything else as it is
+// Decrypts an encrypted token string: format 'enc:' + base64(iv[16] | ciphertext)
 fn unseal(v) {
   if v == nil or not starts_with(v, "enc:") { return v }
   let p = pcall(base64_decode, slice(v, 4))
@@ -313,7 +276,7 @@ fn unseal(v) {
   return aes_cbc_decrypt(sealing_key(), slice(p.value, 0, 16), slice(p.value, 16))
 }
 
-// StickerFeedCredentials::validateBearer(): the API vendor whose token this is, unless it has expired
+// Validates a Bearer token against sticker_feed_exclusions, returning the vendor record on success
 fn validate_bearer(token) {
   if not php_truthy(token) { return nil }
   let r = run("read", "SELECT * FROM sticker_feed_exclusions WHERE connection_type = 'api' AND access_token_enc IS NOT NULL AND access_token_enc != ''", nil, nil)
@@ -329,12 +292,13 @@ fn validate_bearer(token) {
   return nil
 }
 
-// The connection log's table. On a replica (chi) it must be a table the master never writes, or the
-// replica's own rows collide with the master's and stop replication.
+// The fleet member (its id, or a prefix) whose copy of this app answers the API routes below (on_machine).
+// Unset, or that member being this machine, they answer here.
 let COMPUTE_ON = env("STICKERFEED_COMPUTE_ON", "")
+
+// Table name used for logging connection attempts and failures.
+// Configured to write to MariaDB. By default only failures are logged to prevent row churn.
 let LOG_TABLE = env("STICKERFEED_LOG_TABLE", "sticker_feed_connection_log")
-// Successful calls are not logged (a load or a busy client writes a row per call: 58,000 in a day on chi); failed
-// ones are, and they are what the rate limit counts. STICKERFEED_LOG_SUCCESS=1 logs every call, as the PHP did.
 let LOG_SUCCESS = env("STICKERFEED_LOG_SUCCESS", "0") == "1"
 
 fn log_event(vendor_id, action, result, status, detail) {
@@ -343,18 +307,17 @@ fn log_event(vendor_id, action, result, status, detail) {
       [num_int(vendor_id), action, result, status, detail == nil ? nil : slice(php_str(detail), 0, 2000)], nil)
 }
 
-// checkRateLimit(): PHP counts the log's rows for this action, and it logs a successful feed as "send",
-// so only failed calls count against a vendor - kept as it is.
+// Checks rate limits based on recent failure records in the audit log
 fn rate_limited(action, vendor_id, limit, window) {
   let r = run("write", "SELECT COUNT(*) as count FROM " + LOG_TABLE + " WHERE vendor_id = ? AND action = ? AND created_at >= FROM_UNIXTIME(?)",
               [php_str(vendor_id), action, int(now()) - window], ROWS)
   return num_int(r.rows[0][0]) >= limit
 }
 
-// Every JSON answer is written as PHP's json_encode() writes it (php_json, lib/feed.gr), so the bytes are the PHP's
+// Formats a JSON response with exact PHP 7.4 character escaping (via php_json in lib/feed.gr)
 fn reply(status, body) { return {"status": status, "content_type": "application/json; charset=utf-8", "body": php_json(body)} }
 
-// getBearerTokenAndValidate($function): {client} or {fail: the response PHP set}
+// Authenticates incoming HTTP request by extracting Bearer token and verifying vendor permissions
 fn authenticate(req, function) {
   let h = req.headers.authorization
   let m = regex_match("^Bearer\\s+(.+)$", php_trim(h == nil ? "" : h), "i")
@@ -380,11 +343,9 @@ fn authenticate(req, function) {
   return {"client": client}
 }
 
-// ---- the endpoints ----------------------------------------------------------------------------
-// Each request runs in a worker VM of its own (the pane's "workers"), so a full feed does not hold up a
-// stock check. A worker's changes to globals stay in the worker: what happened is in the connection
-// log, which the ops view reads.
+// ---- Route Implementations & Data Retrieval ---------------------------------------------------
 
+// Fetches vendor-specific exclusions for brand IDs and individual SKUs
 fn client_exclusions(client_id) {
   let brands = []
   for r in rows("select mfg_id from sticker_feed_brands where id = ?", [client_id]) { push(brands, r[0]) }
@@ -393,7 +354,7 @@ fn client_exclusions(client_id) {
   return {"brands": brands, "skus": skus}
 }
 
-// json_decode(php://input, true), with is_array(): nil when the body is not a JSON object or list
+// Safely parses JSON request body, returning map/list or nil on malformed input
 fn body_json(req) {
   let r = pcall(json_parse, req.body == nil ? "" : req.body)
   if not r.ok { return nil }
@@ -402,11 +363,7 @@ fn body_json(req) {
   return r.value
 }
 
-// The sticker_item Thing (things/sticker_item.gr) holds each item's finished row for each price level, kept
-// current by the engine as the tables change: a pull reads rows that are already right. {body, count}, the
-// feed's whole answer, or nil where there is no Thing, or none for this level, to be built the long way.
-// `mid` is the manufacturer id as php_str() prints an integer, so "in the list" (PHP's loose compare: "07" is 7)
-// is a lookup in the list's own spellings plus its whole numbers as integers prints them
+// Helper set for loose integer/string matching
 fn int_set(list) {
   let m = {}
   for e in list {
@@ -418,8 +375,7 @@ fn int_set(list) {
   return m
 }
 
-// The held rows of some items only (SHOW THING .. KEYS, one lookup per item, not the whole feed read and
-// thrown away), filtered for the client as the feed is: their items, or nil when the Thing cannot be read.
+// Queries precomputed item rows from ASQL Thing `sticker_item` for specific SKUs
 fn held_items(level, skus, ex) {
   let r = pcall(run, "read", "SHOW THING sticker_item KEYS (?)", [skus], ROWS)
   if not r.ok { return nil }
@@ -440,11 +396,12 @@ fn held_items(level, skus, ex) {
   for row in r.value.rows {
     if by_brand != nil and by_brand[row[mi]] != nil { continue }
     if by_sku != nil and php_in_set_has(by_sku, row[vi]) { continue }
-    push(out, json_parse(row[ci]))   // the feed's own row: parsed and written again by php_json, the same bytes
+    push(out, json_parse(row[ci]))
   }
   return out
 }
 
+// Queries the full precomputed catalog from ASQL Thing `sticker_item` for a pricing level
 fn held_feed(level, limited, ex) {
   let r = pcall(run, "read", "SHOW THING sticker_item", nil, ROWS)
   if not r.ok { return nil }
@@ -472,7 +429,7 @@ fn held_feed(level, limited, ex) {
   return {"body": "{\"items\":[" + join(parts, ",") + "]}", "count": len(parts)}
 }
 
-// feed(), in PHP's order: authenticate, rate limit, payload, brands, build, filter, log
+// POST /feed: Generates catalog feed filtered by authorized brands and vendor exclusions
 fn feed(req) {
   let auth = authenticate(req, "feed")
   if auth.client == nil { return auth.fail }
@@ -492,7 +449,7 @@ fn feed(req) {
     return reply(404, {"error": "JSON FORMAT", "error_description": "Invalid JSON in payload"})
   }
 
-  // brand names -> manufacturer ids, less the client's excluded brands
+  // Resolve brand name filter to manufacturer IDs, excluding blocked brands
   let has_brands = type(body) == "map" and has(body, "brands")
   let limited = nil
   let b = has_brands ? body.brands : nil
@@ -518,20 +475,16 @@ fn feed(req) {
   let out = nil
   if held == nil { out = build(limited, [level], nil, fn (its) { return filter_for_vendor(its, ex.brands, ex.skus, level) }) }
 
-  // date('Y-m-d G:i:s'): the hour without a leading zero
+  // Update vendor audit fields in sticker_feed_exclusions: lastsent and lastfile
   let t = now()
   let lastsent = date_format(t, "%Y-%m-%d ", "local") + str(int(date_format(t, "%H", "local"))) + date_format(t, ":%M:%S", "local")
   let sent_count = held == nil ? len(out) : held.count
   run("write", "update sticker_feed_exclusions set lastsent = ?, lastfile = ? where id = ?", [lastsent, str(sent_count) + " items", client_id], nil)
   log_event(client_id, "send", "success", 200, "feed pulled")
-  // already text: the worker hands back one string, not the forty thousand records to be copied out and written again
   return {"status": 200, "content_type": "application/json; charset=utf-8", "body": held == nil ? php_json({"items": out}) : held.body}
 }
 
-// getstock: the feed's own rows for the items asked about, read now - the check a vendor makes before it
-// places an order. Same token, same access to "feed", same exclusions and price level. It speaks the
-// stickerfeedapi's shapes: a line is placeorder's {sku, brand, qty}, a line that fails is echoed back as
-// one (like cannot_fulfill's errors), and nothing found is a 404 not_found, as getorder answers.
+// POST /getstock: Real-time inventory and pricing lookup for requested SKUs
 let GETSTOCK_MAX = 500
 
 fn getstock(req) {
@@ -598,10 +551,7 @@ fn getstock(req) {
   return reply(200, {"items": items, "not_found": missing})
 }
 
-// getbrands(), in PHP's order: authenticate, rate limit, the brands the client is not excluded from. An
-// empty list is a 404 with the same body, and the log says so in its result, as PHP logs it. PHP has no
-// ORDER BY: MariaDB answers through the manufacturer.name index, so the list comes back in name order,
-// and the order by name below keeps that order on ASQL, which has no such index.
+// POST /getbrands: Returns list of authorized brand names for the authenticated vendor
 fn getbrands(req) {
   let auth = authenticate(req, "getbrands")
   if auth.client == nil { return auth.fail }
@@ -625,8 +575,7 @@ fn getbrands(req) {
   return reply(404, {"brands": brands})
 }
 
-// One request; anything unexpected is answered as PHP's catch answers it, and the cause goes to the
-// server's log. Like the PHP, the method is not checked: a GET has no JSON body and is told so.
+// Wraps a route handler with top-level exception catching, logging unexpected errors and returning HTTP 500
 fn guarded(endpoint, handler) {
   return fn (req) {
     let r = pcall(handler, req)
@@ -638,10 +587,9 @@ fn guarded(endpoint, handler) {
   }
 }
 
-// ---- the ops view ---------------------------------------------------------------------------
-// The view runs in the program's own VM. It opens a connection for each look and closes it, so the
-// program holds none: the workers copy the globals the routes name, and a connection cannot be copied.
+// ---- Operations Dashboard ---------------------------------------------------------------------
 
+// Helper for running read queries inside the main UI VM without leaking connection handles
 fn look(cfg, sql) {
   let c = db_connect(cfg.host, cfg.port, cfg.user, cfg.password, cfg.db)
   if not c.ok { error("cannot connect to " + cfg.host + ":" + str(cfg.port) + ": " + c.error) }
@@ -652,6 +600,7 @@ fn look(cfg, sql) {
   return r.value
 }
 
+// Inspects replication status between ASQL and the primary MariaDB database
 fn mirror_state() {
   let r = pcall(look, ASQL, "SHOW SLAVE STATUS")
   if not r.ok { return "ASQL unreachable: " + r.error }
@@ -660,7 +609,7 @@ fn mirror_state() {
   return "replicating: io " + php_str(s.Slave_IO_Running) + ", sql " + php_str(s.Slave_SQL_Running) + ", " + php_str(s.Seconds_Behind_Master) + " s behind"
 }
 
-// today's calls and the latest ones, from the connection log the endpoints write
+// Fetches recent request metrics and errors from the audit log table
 fn log_state() {
   if WRITE.host == "" { return {"error": "STICKERFEED_WRITE_HOST is not set: there is no log to read", "today": [], "recent": []} }
   let today_r = pcall(look, WRITE, "SELECT action, result, COUNT(*) AS n FROM " + LOG_TABLE + " WHERE created_at >= CURDATE() GROUP BY action, result ORDER BY action, result")
