@@ -1229,13 +1229,23 @@ void cmd_serve(Ctx& c, const Args& a) {
   EntityID route_entity = need(c.me.resident("app-host", route_profile));
   Surface route_worker = need(c.me.act_as(route_entity));
   std::mutex reach_mu;   // Kernel::reach is not made for many threads at once; one request reaches a member at a time
+  // At most AIOS_APP_ROUTE_MAX (default 8) forwarded requests at once: each holds an answer buffer (64 MB by default)
+  // and the host has a memory cap. A request over the limit waits up to 20 s for a turn, then answers 503.
+  const int route_max = [] {
+    const char* e = std::getenv("AIOS_APP_ROUTE_MAX");
+    const long v = e && *e ? std::strtol(e, nullptr, 10) : 8;
+    return (int)std::max<long>(1, std::min<long>(v, 256));
+  }();
+  std::mutex slots_mu;
+  std::condition_variable slots_cv;
+  int slots_used = 0;
   const uint64_t route_room = [] {
     const char* e = std::getenv("AIOS_APP_ROUTE_MB");
     const uint64_t mb = e && *e ? std::strtoull(e, nullptr, 10) : 64;
     return std::max<uint64_t>(1, mb) << 20;
   }();
   ga::Host::Options host_opt{[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str(), nullptr};
-  host_opt.forward = [&c, &route_worker, &reach_mu, route_room](const std::string& app, const std::string& member,
+  host_opt.forward = [&c, &route_worker, &reach_mu, route_room, route_max, &slots_mu, &slots_cv, &slots_used](const std::string& app, const std::string& member,
                                                                   const userland::grain::WebUi::Request& req,
                                                                   userland::grain::WebUi::Response& res) -> bool {
     auto answer = [&res](int status, const std::string& why) {
@@ -1254,6 +1264,16 @@ void cmd_serve(Ctx& c, const Args& a) {
       auto at = c.k.reach(hits[0]);   // its devices join this machine's fabric (once; a dead link is replaced)
       if (!at.ok()) return answer(503, "cannot reach " + member + ": " + at.error().message);
     }
+    {
+      std::unique_lock<std::mutex> lk(slots_mu);
+      if (!slots_cv.wait_for(lk, std::chrono::seconds(20), [&] { return slots_used < route_max; }))
+        return answer(503, "too many requests on their way to " + member + " (" + std::to_string(route_max) + " at once); try again");
+      ++slots_used;
+    }
+    struct Slot {
+      std::mutex& m; std::condition_variable& cv; int& used;
+      ~Slot() { { std::lock_guard<std::mutex> g(m); --used; } cv.notify_one(); }
+    } slot{slots_mu, slots_cv, slots_used};
     const ByteBuffer in = encode_app_request(app, req);
     uint64_t room = route_room;
     for (int attempt = 0; attempt < 2; ++attempt) {
