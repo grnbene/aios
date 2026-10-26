@@ -60,6 +60,10 @@ class RelayClient {
   void set_member_key(std::string key);
   // Present a TPM quote over the hub's challenge on every attach.
   void set_attest(bool on);
+  // Sign the hub's challenge with this machine's identity key (Kernel::node_sign), for a hub that lists the
+  // member's public key (`ed25519=` in its members file). Returns the 64-byte signature, or empty when it cannot.
+  // Only used when the hub's challenge says it takes signatures; an older hub gets the key proof alone.
+  void set_signer(std::function<ByteBuffer(ByteSpan)> sign);
   ~RelayClient();
   // Attach to a hub. After this returns Ok, the roster is populated and
   // incoming circuits are accepted in the background.
