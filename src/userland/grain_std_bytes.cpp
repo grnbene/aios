@@ -18,6 +18,7 @@
 
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
+#include "aios/net/deflate.hpp"
 
 namespace aios::userland::grain {
 
@@ -352,9 +353,49 @@ Value bi_pack_size(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::integer(n);
 }
 
+// A string's or bytes' contents, for the compression builtins.
+bool data_of(const Value& v, ByteSpan& out, std::string& error, const char* who) {
+  if (v.type == Type::Str) { out = ByteSpan(reinterpret_cast<const uint8_t*>(v.str().data()), v.str().size()); return true; }
+  if (v.type == Type::Bytes) { out = ByteSpan(v.bytes_data().data(), v.bytes_data().size()); return true; }
+  error = std::string(who) + "() wants a string or bytes, got a " + type_name(v.type);
+  return false;
+}
+
+// gzip(data [, level]): RFC 1952 bytes, the in-tree deflate (level 1 quick .. 9 smallest, 6 the usual).
+Value bi_gzip(Vm&, std::vector<Value>& args, std::string& error) {
+  ByteSpan in;
+  if (!data_of(args[0], in, error, "gzip")) return Value::nil();
+  int level = 6;
+  if (args.size() > 1) {
+    if (!want_number(args[1], error, "gzip")) return Value::nil();
+    if (args[1].as_int() < 1 || args[1].as_int() > 9) { error = "gzip(): level is 1 to 9"; return Value::nil(); }
+    level = static_cast<int>(args[1].as_int());
+  }
+  return Value::bytes(net::gzip_encode(in, level));
+}
+
+// gunzip(data [, max_bytes]): the bytes a gzip stream holds (every member, each CRC-checked). Stops with an error past
+// max_bytes (default 64 MB) rather than inflating a small upload into gigabytes.
+Value bi_gunzip(Vm&, std::vector<Value>& args, std::string& error) {
+  ByteSpan in;
+  if (!data_of(args[0], in, error, "gunzip")) return Value::nil();
+  size_t max_out = 64u << 20;
+  if (args.size() > 1) {
+    if (!want_number(args[1], error, "gunzip")) return Value::nil();
+    if (args[1].as_int() <= 0 || args[1].as_int() > kMaxBytes) { error = "gunzip(): max_bytes is 1 to " + std::to_string(kMaxBytes); return Value::nil(); }
+    max_out = static_cast<size_t>(args[1].as_int());
+  }
+  ByteBuffer out;
+  std::string why;
+  if (!net::gzip_decode(in, out, max_out, &why)) { error = "gunzip(): " + why; return Value::nil(); }
+  return Value::bytes(std::move(out));
+}
+
 }  // namespace
 
 void install_bytes_builtins(Vm& vm) {
+  vm.define_native("gzip", 1, 2, bi_gzip);
+  vm.define_native("gunzip", 1, 2, bi_gunzip);
   vm.define_native("bytes", 1, 1, bi_bytes);
   vm.define_native("bytes_str", 1, 3, bi_bytes_str);
   vm.define_native("bytes_hex", 1, 1, bi_bytes_hex);

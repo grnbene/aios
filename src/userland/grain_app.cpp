@@ -12,6 +12,7 @@
 #include "aios/core/json.hpp"
 #include "aios/crypto/aes_gcm.hpp"
 #include "aios/crypto/sha256.hpp"
+#include "aios/net/deflate.hpp"
 #include "aios/net/http_stream.hpp"
 #include "aios/node/secure.hpp"
 #include "aios/userland/grain_webui.hpp"
@@ -593,6 +594,44 @@ std::string peer_address(const std::string& p) {
   return c != std::string::npos && p.find(':') == c ? p.substr(0, c) : p;
 }
 
+// Whether an Accept-Encoding header takes gzip: listed (or `*`) with a q above zero ("gzip;q=0" refuses it).
+bool accepts_gzip(const std::string& header) {
+  double gzip_q = -1, star_q = -1;
+  size_t i = 0;
+  while (i <= header.size()) {
+    size_t j = header.find(',', i);
+    if (j == std::string::npos) j = header.size();
+    std::string item = header.substr(i, j - i);
+    i = j + 1;
+    double q = 1;
+    if (size_t semi = item.find(';'); semi != std::string::npos) {
+      std::string params = item.substr(semi + 1);
+      item.resize(semi);
+      for (char& c : params) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (size_t qa = params.find("q="); qa != std::string::npos) q = std::atof(params.c_str() + qa + 2);
+    }
+    std::string name;
+    for (char c : item) if (!std::isspace(static_cast<unsigned char>(c))) name.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (name == "gzip" || name == "x-gzip") gzip_q = q;
+    else if (name == "*") star_q = q;
+  }
+  return gzip_q > 0 || (gzip_q < 0 && star_q > 0);
+}
+
+// A response worth compressing: text, JSON, JavaScript, XML or SVG, 1 KB or more, not already encoded.
+bool worth_gzip(const WebUi::Response& res) {
+  if (res.body.size() < 1024 || res.status == 204 || res.status == 304) return false;
+  std::string type;
+  for (const auto& h : res.headers) {
+    std::string k = h.first;
+    for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (k == "content-encoding") return false;
+    if (k == "content-type") { type = h.second; for (char& c : type) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+  }
+  return type.rfind("text/", 0) == 0 || type.find("json") != std::string::npos || type.find("javascript") != std::string::npos ||
+         type.find("xml") != std::string::npos || type.find("svg") != std::string::npos;
+}
+
 const char* reason_of(int s) {
   switch (s) {
     case 200: return "OK"; case 201: return "Created"; case 204: return "No Content"; case 301: return "Moved Permanently";
@@ -695,6 +734,17 @@ void answer(std::shared_ptr<hal::Connection> conn, std::shared_ptr<WebUi> ui, Ho
   }
 
   if (inst && res.status >= 500) inst->failures++;
+  // gzip for a client that takes it: the sticker feed's JSON is ~10x smaller on the wire.
+  std::string accept_enc;
+  for (const auto& h : req.headers) if (h.first == "accept-encoding") accept_enc = h.second;
+  if (worth_gzip(res)) {
+    res.headers.push_back({"Vary", "Accept-Encoding"});
+    if (accepts_gzip(accept_enc)) {
+      const ByteBuffer z = net::gzip_encode(ByteSpan(reinterpret_cast<const uint8_t*>(res.body.data()), res.body.size()), 6);
+      res.body.assign(reinterpret_cast<const char*>(z.data()), z.size());
+      res.headers.push_back({"Content-Encoding", "gzip"});
+    }
+  }
   std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason_of(res.status) + "\r\n";
   for (const auto& h : res.headers) out += h.first + ": " + h.second + "\r\n";
   out += "Content-Length: " + std::to_string(res.body.size()) + "\r\nConnection: close\r\n\r\n";

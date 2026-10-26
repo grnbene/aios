@@ -30,6 +30,7 @@
 #include "aios/hal/host.hpp"
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
+#include "aios/net/deflate.hpp"
 
 namespace aios::userland::grain {
 
@@ -46,6 +47,31 @@ std::string trust_root() {
 std::string lower(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return s;
+}
+
+// How a response body is read: gzip undone (unless decompress: false), and how large it may inflate.
+struct BodyRule {
+  bool decompress = true;
+  size_t max_bytes = 64u << 20;
+};
+
+// A gzip-encoded body, undone: the response then reads as if it had come plain (its content-encoding header
+// dropped). A body that is not valid gzip, or would inflate past the limit, is an error, never a partial body.
+bool decode_body(channel::HttpResponse& r, const BodyRule& rule, std::string& error) {
+  if (!rule.decompress) return true;
+  for (auto it = r.headers.begin(); it != r.headers.end(); ++it) {
+    if (lower(it->first) != "content-encoding") continue;
+    const std::string enc = lower(it->second);
+    if (enc == "identity") { r.headers.erase(it); return true; }
+    if (enc != "gzip" && enc != "x-gzip") return true;   // another coding: left as it came, header and all
+    ByteBuffer out;
+    std::string why;
+    if (!net::gzip_decode(ByteSpan(r.body.data(), r.body.size()), out, rule.max_bytes, &why)) { error = "the gzip response body: " + why; return false; }
+    r.body.assign(out.begin(), out.end());
+    r.headers.erase(it);
+    return true;
+  }
+  return true;
 }
 
 Value response_value(const channel::HttpResponse& r) {
@@ -65,7 +91,8 @@ Value response_value(const channel::HttpResponse& r) {
 }
 
 // Fills `req` from an options map; the url and method may already be set.
-bool apply_options(const Value& opt, channel::HttpRequest& req, std::string& url, bool& follow, const char* who, std::string& error) {
+bool apply_options(const Value& opt, channel::HttpRequest& req, std::string& url, bool& follow, const char* who, std::string& error,
+                   BodyRule& rule) {
   if (opt.type == Type::Nil) return true;
   if (opt.type != Type::Map) { error = std::string(who) + "() wants its options as a map, got a " + type_name(opt.type); return false; }
   auto* m = static_cast<MapObj*>(opt.obj.get());
@@ -87,6 +114,12 @@ bool apply_options(const Value& opt, channel::HttpRequest& req, std::string& url
     req.body.assign(v->str().begin(), v->str().end());
   }
   if (Value* v = m->find("follow_redirects")) follow = v->truthy();
+  if (Value* v = m->find("decompress")) rule.decompress = v->truthy();
+  if (Value* v = m->find("max_bytes")) {
+    if (!want_number(*v, error, who)) return false;
+    if (v->as_int() <= 0) { error = std::string(who) + "(): max_bytes must be positive"; return false; }
+    rule.max_bytes = static_cast<size_t>(v->as_int());
+  }
   if (Value* v = m->find("timeout_ms")) {
     if (!want_number(*v, error, who)) return false;
     if (v->as_int() <= 0) { error = std::string(who) + "(): timeout_ms must be positive"; return false; }
@@ -109,10 +142,13 @@ std::string resolve(const std::string& base, const std::string& loc) {
   return origin + dir + loc;
 }
 
-Value send(channel::HttpRequest& req, std::string url, bool follow, const char* who, std::string& error) {
+Value send(channel::HttpRequest& req, std::string url, bool follow, const char* who, std::string& error, const BodyRule& rule) {
   if (url.empty()) { error = std::string(who) + "() needs a url"; return Value::nil(); }
   const bool has_agent = std::any_of(req.headers.begin(), req.headers.end(), [](const auto& h) { return lower(h.first) == "user-agent"; });
   if (!has_agent) req.headers.emplace_back("User-Agent", "grain");
+  // Ask for gzip when this side will undo it (and the caller did not choose an Accept-Encoding of its own).
+  const bool has_accept = std::any_of(req.headers.begin(), req.headers.end(), [](const auto& h) { return lower(h.first) == "accept-encoding"; });
+  if (rule.decompress && !has_accept) req.headers.emplace_back("Accept-Encoding", "gzip");
   constexpr int kMaxHops = 5;
   for (int hop = 0;; ++hop) {
     auto ep = channel::parse_endpoint(url);
@@ -124,7 +160,11 @@ Value send(channel::HttpRequest& req, std::string url, bool follow, const char* 
     if (!r.ok()) { error = std::string(who) + "(\"" + url + "\"): " + r.error().message; return Value::nil(); }
     const int st = r->status;
     const std::string loc = r->header("Location");
-    if (!follow || loc.empty() || (st != 301 && st != 302 && st != 303 && st != 307 && st != 308)) return response_value(*r);
+    if (!follow || loc.empty() || (st != 301 && st != 302 && st != 303 && st != 307 && st != 308)) {
+      std::string derr;
+      if (!decode_body(*r, rule, derr)) { error = std::string(who) + "(\"" + url + "\"): " + derr; return Value::nil(); }
+      return response_value(*r);
+    }
     if (hop + 1 > kMaxHops) { error = std::string(who) + "(\"" + url + "\"): more than " + std::to_string(kMaxHops) + " redirects"; return Value::nil(); }
     if (st == 303 || ((st == 301 || st == 302) && req.method == "POST")) {
       req.method = "GET";
@@ -139,9 +179,10 @@ Value bi_http_get(Vm&, std::vector<Value>& args, std::string& error) {
   channel::HttpRequest req;
   std::string url = args[0].str();
   bool follow = true;
-  if (!apply_options(args.size() > 1 ? args[1] : Value::nil(), req, url, follow, "http_get", error)) return Value::nil();
+  BodyRule rule;
+  if (!apply_options(args.size() > 1 ? args[1] : Value::nil(), req, url, follow, "http_get", error, rule)) return Value::nil();
   req.method = "GET";
-  return send(req, url, follow, "http_get", error);
+  return send(req, url, follow, "http_get", error, rule);
 }
 
 Value bi_http_post(Vm&, std::vector<Value>& args, std::string& error) {
@@ -149,18 +190,20 @@ Value bi_http_post(Vm&, std::vector<Value>& args, std::string& error) {
   channel::HttpRequest req;
   std::string url = args[0].str();
   bool follow = true;
-  if (!apply_options(args.size() > 2 ? args[2] : Value::nil(), req, url, follow, "http_post", error)) return Value::nil();
+  BodyRule rule;
+  if (!apply_options(args.size() > 2 ? args[2] : Value::nil(), req, url, follow, "http_post", error, rule)) return Value::nil();
   req.method = "POST";
   req.body.assign(args[1].str().begin(), args[1].str().end());
-  return send(req, url, follow, "http_post", error);
+  return send(req, url, follow, "http_post", error, rule);
 }
 
 Value bi_http_request(Vm&, std::vector<Value>& args, std::string& error) {
   channel::HttpRequest req;
   std::string url;
   bool follow = true;
-  if (!apply_options(args[0], req, url, follow, "http_request", error)) return Value::nil();
-  return send(req, url, follow, "http_request", error);
+  BodyRule rule;
+  if (!apply_options(args[0], req, url, follow, "http_request", error, rule)) return Value::nil();
+  return send(req, url, follow, "http_request", error, rule);
 }
 
 // --- Safe RFC 7578 Multipart Form Data ---------------------------------------
