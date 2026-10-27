@@ -254,6 +254,13 @@ class ThingEngine {
     // never run; SET THING <name> LIVE turns it on, SET THING <name> SHADOW back off.
     bool do_shadow = false;
     uint64_t act_clock = 0;                     // the clock up to which every change was checked
+    // Time travel (docs/design/thing-time-travel.md): every change appended to <things dir>/<name>.asof. keep_days
+    // -1 is the default (AIOS_THING_KEEP_DAYS, 30), 0 keeps none. asof_from_ns: the earliest moment AS OF answers.
+    int keep_days = -1;
+    uint64_t asof_from_ns = 0;
+    uint64_t asof_bytes = 0;                    // the log's size, as appended (not saved: read from the file at load)
+    uint64_t asof_trim_at = 0;                  // the size the next size cut waits for (when a base alone is large)
+    std::vector<std::string> asof_gone;         // row keys that left in the change being finished
     std::vector<std::string> out_labels;        // the head's output names when an item is a `*` (from the first run)
     std::string source_by;                      // SOURCE BY: the value column naming the system a row came from
     // RESOLVE THING .. PREFER: field label (or "*") -> the sources in the order preferred
@@ -426,6 +433,14 @@ class ThingEngine {
   // The DO statements for this Thing, KEY and THING.<label> filled in.
   bool act_statements(const Kind& k, const Instance& in, std::vector<std::string>* stmts, std::string* err) const;
   SqlQueryResult set_act_mode(const std::string& name, bool shadow);
+  // Time travel: the change log of a row Thing.
+  bool asof_on(const Kind& k) const;
+  std::string asof_path(const Kind& k) const;
+  void asof_append(Kind& k, const std::string& lines);
+  void asof_start(Kind& k);                     // a fresh log: the state now, as its base
+  void asof_trim(Kind& k);                      // past its days or its size: rewritten from a later cut-off
+  SqlQueryResult asof_show(Kind& k, uint64_t end_ns, const std::vector<std::string>* keys);
+  SqlQueryResult set_keep(const std::string& name, int days);
   SqlQueryResult show_shadow(const std::string& name);
   // The names a row Thing's values go by, as WHEN and DO see them: the key's first, then each output column.
   std::vector<std::string> value_labels(const Kind& k) const;
