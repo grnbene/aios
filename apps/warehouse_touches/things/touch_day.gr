@@ -21,7 +21,6 @@ fn day_of(t) {
   if len(s) < 10 or s < "1970" { return nil }
   return slice(s, 0, 10)
 }
-fn blank(s) { return s == nil or trim(str(s)) == "" }
 fn num(v) { return v == nil ? 0.0 : real(v) }
 fn ival(v) { return v == nil or str(v) == "" ? 0 : int(v) }
 
@@ -49,7 +48,7 @@ fn enroll() {
 fn shared() {
   let m = {}
   for r in read_raw("SELECT userid, realname FROM www_users") {
-    if not blank(r.realname) { m[lower(trim(r.realname))] = r.userid }
+    if not is_blank(r.realname) { m[lower(trim(r.realname))] = r.userid }
   }
   return {"drivers": m}
 }
@@ -61,8 +60,8 @@ fn things(ks, sh) {
   for k in ks {
     let d = str(k)
     want[d] = true
-    if lo == nil or d < lo { lo = d }
-    if hi == nil or d > hi { hi = d }
+    lo = min(lo, d)
+    hi = max(hi, d)
   }
   if lo == nil { return {} }
   let a = lo + " 00:00:00"
@@ -71,27 +70,27 @@ fn things(ks, sh) {
 
   // the user record of a day, made on first use; `uid` is the userid as the row has it
   let user = fn(day, uid) {
-    if day == nil or not has(want, day) or blank(uid) { return nil }
-    if out_days[day] == nil { out_days[day] = {} }
+    if day == nil or not has(want, day) or is_blank(uid) { return nil }
+    let of_day = get_or_put(out_days, day, {})
     let key = lower(uid)
-    let u = out_days[day][key]
+    let u = of_day[key]
     if u == nil {
       u = {"userid": uid, "active": false, "first": nil, "last": nil,
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
            "packed": {}, "staged": {}, "binds": [], "dname": nil, "lasts": {}}
-      out_days[day][key] = u
+      of_day[key] = u
     }
     return u
   }
   let stamp = fn(u, first, last) {
-    if not blank(first) and (u.first == nil or str(first) < u.first) { u.first = str(first) }
-    if not blank(last) and (u.last == nil or str(last) > u.last) { u.last = str(last) }
+    if not is_blank(first) { u.first = min(u.first, str(first)) }
+    if not is_blank(last) { u.last = max(u.last, str(last)) }
   }
   // the latest touch of one source (each stat card shows its own)
   let late = fn(u, src, t) {
-    if not blank(t) and (u.lasts[src] == nil or str(t) > u.lasts[src]) { u.lasts[src] = str(t) }
+    if not is_blank(t) { u.lasts[src] = max(u.lasts[src], str(t)) }
   }
 
   // 1. Receiving
@@ -151,9 +150,9 @@ fn things(ks, sh) {
     let u = user(day_of(r.day), r.userid)
     if u != nil {
       u.active = true
-      let t = blank(r.movetype) ? "other" : str(r.movetype)
-      if u.moves[t] == nil { u.moves[t] = {"pairs": [], "qty": 0.0} }
-      u.moves[t].qty = u.moves[t].qty + num(r.qty)
+      let t = is_blank(r.movetype) ? "other" : str(r.movetype)
+      let mt = get_or_put(u.moves, t, {"pairs": [], "qty": 0.0})
+      mt.qty = mt.qty + num(r.qty)
       stamp(u, r.first_touch, r.last_touch)
       late(u, "movements", r.last_touch)
     }
@@ -162,9 +161,8 @@ fn things(ks, sh) {
                     "FROM binmovements_details " + move_where + "AND binmoveid IS NOT NULL AND stockid IS NOT NULL", a, b) {
     let u = user(day_of(r.day), r.userid)
     if u != nil {
-      let t = blank(r.movetype) ? "other" : str(r.movetype)
-      if u.moves[t] == nil { u.moves[t] = {"pairs": [], "qty": 0.0} }
-      push(u.moves[t].pairs, str(r.binmoveid) + "|" + str(r.stockid))
+      let t = is_blank(r.movetype) ? "other" : str(r.movetype)
+      push(get_or_put(u.moves, t, {"pairs": [], "qty": 0.0}).pairs, str(r.binmoveid) + "|" + str(r.stockid))
     }
   }
 
@@ -176,26 +174,23 @@ fn things(ks, sh) {
                     "WHERE COALESCE(run_deleted, 0) = 0 AND dispnumber IS NOT NULL AND dispnumber <> '' " +
                     "AND ((completed = 1 AND timestopped >= ? AND timestopped <= ?) " +
                     "  OR (force_complete = 1 AND COALESCE(timestopped, '') = '' AND timeassigned >= ? AND timeassigned <= ?))", a, b, a, b) {
-    let stopped_in = ival(r.completed) == 1 and not blank(r.timestopped) and str(r.timestopped) >= a and str(r.timestopped) <= b
+    let stopped_in = ival(r.completed) == 1 and not is_blank(r.timestopped) and str(r.timestopped) >= a and str(r.timestopped) <= b
     let day = stopped_in ? day_of(r.timestopped) : day_of(r.timeassigned)
     if day != nil and has(want, day) {
       let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
       let rk = id + "@" + day
-      if runs[rk] == nil {
-        runs[rk] = {"id": id, "day": day, "disp": int(r.dispnumber), "truck": int(r.truckid),
-                    "manual": 0, "forced": false, "untimed": false, "assigned": nil, "started": nil, "stopped": nil}
-      }
-      let run = runs[rk]
+      let run = runs[rk] ?? get_or_put(runs, rk, {"id": id, "day": day, "disp": int(r.dispnumber), "truck": int(r.truckid),
+                                                  "manual": 0, "forced": false, "untimed": false, "assigned": nil, "started": nil, "stopped": nil})
       run.manual = run.manual + ival(r.manual_pick)
       run.untimed = run.untimed or ival(r.untimed) == 1
       run.forced = run.forced or ival(r.force_complete) == 1
-      if not blank(r.timeassigned) and (run.assigned == nil or str(r.timeassigned) < run.assigned) { run.assigned = str(r.timeassigned) }
-      if not blank(r.timestarted) and (run.started == nil or str(r.timestarted) < run.started) { run.started = str(r.timestarted) }
-      if not blank(r.timestopped) and (run.stopped == nil or str(r.timestopped) > run.stopped) { run.stopped = str(r.timestopped) }
+      if not is_blank(r.timeassigned) { run.assigned = min(run.assigned, str(r.timeassigned)) }
+      if not is_blank(r.timestarted) { run.started = min(run.started, str(r.timestarted)) }
+      if not is_blank(r.timestopped) { run.stopped = max(run.stopped, str(r.timestopped)) }
     }
   }
   let day_runs = {}   // day -> the runs that fall on it (their trucks are the range's truck list)
-  if len(keys(runs)) > 0 {
+  if len(runs) > 0 {
     let disps = []
     let trucks = []
     let is_run = {}
@@ -210,8 +205,7 @@ fn things(ks, sh) {
     for r in read_raw("SELECT DISTINCT d.dispnumber, d.truckid, d.driveruserid FROM dispatch d " +
                       "WHERE d.driveruserid IS NOT NULL AND d.driveruserid <> '' AND d.dispnumber IN (?) AND d.truckid IN (?)", disps, trucks) {
       let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
-      if drivers[id] == nil { drivers[id] = [] }
-      push(drivers[id], r.driveruserid)
+      push(get_or_put(drivers, id, []), r.driveruserid)
     }
     let mapped = fn(driver) {
       let m = sh.drivers[lower(trim(driver))]
@@ -230,11 +224,8 @@ fn things(ks, sh) {
         for driver in unique(ds) {
           let u = driver_user(run.day, driver)
           if u != nil {
-            let mine = u.runs[run.id]
-            if mine == nil {
-              mine = {"k": 0, "manual": run.manual, "forced": run.forced, "untimed": run.untimed, "assigned": run.assigned, "started": run.started, "stopped": run.stopped}
-              u.runs[run.id] = mine
-            }
+            let mine = u.runs[run.id] ?? get_or_put(u.runs, run.id, {"k": 0, "manual": run.manual, "forced": run.forced, "untimed": run.untimed,
+                                                                      "assigned": run.assigned, "started": run.started, "stopped": run.stopped})
             mine.k = mine.k + 1   // one count per name on the dispatch, as the PHP report counts it
           }
         }
@@ -252,24 +243,20 @@ fn things(ks, sh) {
       let dn = str(int(r.dispnumber))
       let id = dn + "-" + str(int(r.truckid))
       let dv = str(r.driver)
-      if per_disp[dn] == nil { per_disp[dn] = {} }
-      if per_disp[dn][id] == nil { per_disp[dn][id] = {} }
-      if per_disp[dn][id][dv] == nil { per_disp[dn][id][dv] = {"units": 0.0, "orders": []} }
-      per_disp[dn][id][dv].units = per_disp[dn][id][dv].units + num(r.units)
-      if r.orderno != nil { push(per_disp[dn][id][dv].orders, str(r.orderno)) }
+      let pd = get_or_put(get_or_put(get_or_put(per_disp, dn, {}), id, {}), dv, {"units": 0.0, "orders": []})
+      pd.units = pd.units + num(r.units)
+      if r.orderno != nil { push(pd.orders, str(r.orderno)) }
     }
     for rk in keys(runs) {
       let run = runs[rk]
-      if day_runs[run.day] == nil { day_runs[run.day] = [] }
-      push(day_runs[run.day], run.id)
+      push(get_or_put(day_runs, run.day, []), run.id)
       let rows_of = per_disp[str(run.disp)]
       if rows_of != nil {
         for id in keys(rows_of) {
           for dv in keys(rows_of[id]) {
             let u = driver_user(run.day, dv)
             if u != nil {
-              if u.units[id] == nil { u.units[id] = {} }
-              u.units[id][dv] = rows_of[id][dv]
+              get_or_put(u.units, id, {})[dv] = rows_of[id][dv]
             }
           }
         }
@@ -312,8 +299,8 @@ fn things(ks, sh) {
 
   let out = {}
   for day in unique(concat(keys(out_days), keys(day_runs))) {
-    let us = out_days[day] == nil ? {} : out_days[day]
-    out[day] = {"users": json_stringify(us), "people": len(keys(us)), "runs": json_stringify(day_runs[day] == nil ? [] : day_runs[day])}
+    let us = out_days[day] ?? {}
+    out[day] = {"users": json_stringify(us), "people": len(us), "runs": json_stringify(day_runs[day] ?? [])}
   }
   return out
 }

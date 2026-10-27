@@ -31,24 +31,12 @@ fn blank_user(userid) {
 }
 
 fn stamp_touch(user, first, last) {
-  if first != nil and first != "" and (user.first_touch == nil or first < user.first_touch) { user.first_touch = first }
-  if last != nil and last != "" and (user.last_touch == nil or last > user.last_touch) { user.last_touch = last }
+  if not is_blank(first) { user.first_touch = min(user.first_touch, first) }
+  if not is_blank(last) { user.last_touch = max(user.last_touch, last) }
 }
 
-fn is_day(d) { return d != nil and regex_test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", str(d)) }
-
-// Every day from start to stop, both included.
-fn days_between(start_date, stop_date) {
-  if not is_day(start_date) or not is_day(stop_date) { return [] }
-  let out = []
-  let t = date_parse(start_date)
-  let end = date_parse(stop_date)
-  while t <= end and len(out) < 4000 {
-    push(out, date_format(t, "%Y-%m-%d", "utc"))
-    t = t + 86400
-  }
-  return out
-}
+// a real calendar day, YYYY-MM-DD ("2026-02-30" is not one)
+fn is_day(d) { return not is_blank(d) and pcall(date_range, str(d), str(d)).ok }
 
 // The PHP report's range: stop defaults to today, start to 29 days before stop (30 days, today included).
 fn report_range(start, stop) {
@@ -60,14 +48,15 @@ fn report_range(start, stop) {
 
 // 'YYYY-MM-DD HH:MM:SS' as seconds (for a load's length), nil when it is not one
 fn secs_of(ts) {
-  if ts == nil { return nil }
+  if is_blank(ts) { return nil }
   let s = str(ts)
-  if len(s) < 19 or slice(s, 0, 4) < "1971" { return nil }
-  return date_make(int(slice(s, 0, 4)), int(slice(s, 5, 7)), int(slice(s, 8, 10)), int(slice(s, 11, 13)), int(slice(s, 14, 16)), int(slice(s, 17, 19)), "utc")
+  if len(s) < 19 or s < "1971" { return nil }
+  return date_parse(slice(s, 0, 19))
 }
 
 fn touch_days(db, start_date, stop_date) {
-  let ds = days_between(start_date, stop_date)
+  if not is_day(start_date) or not is_day(stop_date) { return [] }
+  let ds = date_range(start_date, stop_date)
   if len(ds) == 0 { return [] }
   let quoted = []
   for d in ds { push(quoted, "'" + d + "'") }
@@ -89,16 +78,11 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
   let users = {}
   let days = {}
   let get_user = fn(key, uid) {
-    if users[key] == nil { users[key] = blank_user(uid) }
-    if days[key] == nil { days[key] = {} }
-    return users[key]
+    get_or_put(days, key, {})
+    return users[key] ?? get_or_put(users, key, blank_user(uid))
   }
-  let add_all = fn(m, list) { for v in list { m[v] = true } }
   let sets = {}   // key -> the distinct sets merged across the days
-  let set_of = fn(key) {
-    if sets[key] == nil { sets[key] = {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}} }
-    return sets[key]
-  }
+  let set_of = fn(key) { return get_or_put(sets, key, {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}}) }
   let all_items = {}
   let all_vendors = {}
   let all_orders = {}
@@ -120,29 +104,27 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
           let d = dayrow.users[key]
           for id in keys(d.runs) {
             let r = d.runs[id]
-            if runs[key] == nil { runs[key] = {"uid": d.userid, "dname": d.dname, "runs": {}} }
-            let c = runs[key].runs[id]
+            let c = get_or_put(runs, key, {"uid": d.userid, "dname": d.dname, "runs": {}}).runs[id]
             if c == nil {
               runs[key].runs[id] = {"k": r.k, "manual": r.manual, "forced": r.forced, "untimed": r.untimed, "assigned": r.assigned, "started": r.started, "stopped": r.stopped}
             } else {
               c.manual = c.manual + r.manual
               c.forced = c.forced or r.forced
               c.untimed = c.untimed or r.untimed
-              if r.assigned != nil and (c.assigned == nil or r.assigned < c.assigned) { c.assigned = r.assigned }
-              if r.started != nil and (c.started == nil or r.started < c.started) { c.started = r.started }
-              if r.stopped != nil and (c.stopped == nil or r.stopped > c.stopped) { c.stopped = r.stopped }
+              c.assigned = min(c.assigned, r.assigned)
+              c.started = min(c.started, r.started)
+              c.stopped = max(c.stopped, r.stopped)
             }
           }
           for id in keys(d.units) {
             if not range_trucks[split(id, "-")[1]] { continue }
-            if units[key] == nil { units[key] = {"uid": d.userid, "dname": d.dname, "runs": {}} }
-            if units[key].runs[id] == nil { units[key].runs[id] = d.units[id] }   // the same on every day the run is on
+            get_or_put(get_or_put(units, key, {"uid": d.userid, "dname": d.dname, "runs": {}}).runs, id, d.units[id])   // the same on every day the run is on
           }
         }
       }
       for key in keys(runs) {
         let u = get_user(key, runs[key].uid)
-        if (u.name == nil or u.name == "") and runs[key].dname != nil { u.name = runs[key].dname }
+        u.name = first_present(u.name, runs[key].dname) ?? u.name
         for id in keys(runs[key].runs) {
           let run = runs[key].runs[id]
           u.loads.dispatches = u.loads.dispatches + run.k
@@ -151,8 +133,8 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
           let a = secs_of(run.started)
           let b = secs_of(run.stopped)
           if not run.untimed and a != nil and b != nil and b >= a {
-            load_secs[key] = (load_secs[key] == nil ? 0 : load_secs[key]) + (b - a) * run.k
-            load_timed[key] = (load_timed[key] == nil ? 0 : load_timed[key]) + run.k
+            load_secs[key] = get(load_secs, key, 0) + (b - a) * run.k
+            load_timed[key] = get(load_timed, key, 0) + run.k
           }
           let last_t = run.stopped != nil ? run.stopped : run.assigned
           stamp_touch(u, run.started != nil ? run.started : run.assigned, last_t)
@@ -163,16 +145,16 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
         let by_name = {}
         for id in keys(units[key].runs) {
           for dv in keys(units[key].runs[id]) {
-            if by_name[dv] == nil { by_name[dv] = {"units": 0.0, "orders": {}} }
-            by_name[dv].units = by_name[dv].units + real(units[key].runs[id][dv].units)
-            add_all(by_name[dv].orders, units[key].runs[id][dv].orders)
+            let b = get_or_put(by_name, dv, {"units": 0.0, "orders": {}})
+            b.units = b.units + real(units[key].runs[id][dv].units)
+            add_keys(b.orders, units[key].runs[id][dv].orders)
           }
         }
         let u = get_user(key, units[key].uid)
-        if (u.name == nil or u.name == "") and units[key].dname != nil { u.name = units[key].dname }
+        u.name = first_present(u.name, units[key].dname) ?? u.name
         for dv in keys(by_name) {
           u.loads.scans = u.loads.scans + by_name[dv].units
-          u.loads.orders = u.loads.orders + len(keys(by_name[dv].orders))
+          u.loads.orders = u.loads.orders + len(by_name[dv].orders)
         }
       }
       continue
@@ -186,32 +168,28 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
             u.receiving.scans = u.receiving.scans + d.rec.scans
             u.receiving.qty_in = u.receiving.qty_in + real(d.rec.qty_in)
             u.receiving.qty_out = u.receiving.qty_out + real(d.rec.qty_out)
-            add_all(set_of(key).items, d.rec.items)
-            add_all(set_of(key).vendors, d.rec.vendors)
-            add_all(all_items, d.rec.items)
-            add_all(all_vendors, d.rec.vendors)
+            add_keys(set_of(key).items, d.rec.items)
+            add_keys(set_of(key).vendors, d.rec.vendors)
+            add_keys(all_items, d.rec.items)
+            add_keys(all_vendors, d.rec.vendors)
           }
-          if d.active {   // a receiving, pick, move or sticker touch that day
-            if days[key] == nil { days[key] = {} }
-            days[key][dayrow.day] = true
-          }
+          if d.active { get_or_put(days, key, {})[dayrow.day] = true }   // a receiving, pick, move or sticker touch that day
         } else if part == "pick" and d.pick.lines > 0 {
           let u = get_user(key, d.userid)
           u.picking.lines = u.picking.lines + d.pick.lines
           u.picking.qty = u.picking.qty + real(d.pick.qty)
-          add_all(set_of(key).orders, d.pick.orders)
-          add_all(all_orders, d.pick.orders)
-        } else if part == "moves" and len(keys(d.moves)) > 0 {
+          add_keys(set_of(key).orders, d.pick.orders)
+          add_keys(all_orders, d.pick.orders)
+        } else if part == "moves" and len(d.moves) > 0 {
           let u = get_user(key, d.userid)
           let s = set_of(key)
           for t in keys(d.moves) {
-            if u.movements.by_type[t] == nil { u.movements.by_type[t] = {"moves": 0, "qty": 0.0} }
-            u.movements.by_type[t].qty = u.movements.by_type[t].qty + real(d.moves[t].qty)
+            let bt = get_or_put(u.movements.by_type, t, {"moves": 0, "qty": 0.0})
+            bt.qty = bt.qty + real(d.moves[t].qty)
             u.movements.qty = u.movements.qty + real(d.moves[t].qty)
-            if s.moves[t] == nil { s.moves[t] = {} }
-            add_all(s.moves[t], d.moves[t].pairs)
+            add_keys(get_or_put(s.moves, t, {}), d.moves[t].pairs)
           }
-        } else if part == "sticker" and (len(keys(d.packed)) > 0 or len(keys(d.staged)) > 0 or len(d.binds) > 0) {
+        } else if part == "sticker" and (len(d.packed) > 0 or len(d.staged) > 0 or len(d.binds) > 0) {
           get_user(key, d.userid)
           let s = set_of(key)
           for side in ["packed", "staged"] {
@@ -222,7 +200,7 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
               else if real(mine.f) > have.f { have.f = real(mine.f) }
             }
           }
-          add_all(s.binds, d.binds)
+          add_keys(s.binds, d.binds)
         }
       }
     }
@@ -230,7 +208,7 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
   // first and last touch of receiving, picking, moves and sticker (loads were stamped above); and each source's
   // latest touch over everyone, for its stat card
   let lasts = {}
-  let later = fn(src, t) { if t != nil and t != "" and (lasts[src] == nil or t > lasts[src]) { lasts[src] = t } }
+  let later = fn(src, t) { if not is_blank(t) { lasts[src] = max(lasts[src], t) } }
   for dayrow in rows {
     for key in keys(dayrow.users) {
       let d = dayrow.users[key]
@@ -242,21 +220,21 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
   for key in keys(sets) {
     let u = users[key]
     let s = sets[key]
-    u.receiving.items = len(keys(s.items))
-    u.receiving.vendors = len(keys(s.vendors))
-    u.picking.orders = len(keys(s.orders))
+    u.receiving.items = len(s.items)
+    u.receiving.vendors = len(s.vendors)
+    u.picking.orders = len(s.orders)
     for t in keys(s.moves) {
-      let n = len(keys(s.moves[t]))
+      let n = len(s.moves[t])
       u.movements.by_type[t].moves = u.movements.by_type[t].moves + n
       u.movements.moves = u.movements.moves + n
     }
     for side in ["packed", "staged"] {
       let units = 0.0
       for o in keys(s[side]) { units = units + (s[side][o].t != nil ? real(s[side][o].t) : s[side][o].f) }
-      u.sticker[side] = len(keys(s[side]))
+      u.sticker[side] = len(s[side])
       u.sticker[side + "units"] = units
     }
-    u.sticker.binds = len(keys(s.binds))
+    u.sticker.binds = len(s.binds)
   }
   // real names (www_users holds password hashes too: only the name columns are read)
   let n_res = pcall(db_query, db, "SELECT userid, realname FROM www_users")
@@ -266,8 +244,8 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
       if users[k] != nil and row.realname != nil { users[k].name = trim(row.realname) }
     }
   }
-  let report = rollup(users, days, start_date, stop_date, {"items": len(keys(all_items)), "vendors": len(keys(all_vendors)),
-                      "orders": len(keys(all_orders)), "secs": load_secs, "timed": load_timed})
+  let report = rollup(users, days, start_date, stop_date, {"items": len(all_items), "vendors": len(all_vendors),
+                      "orders": len(all_orders), "secs": load_secs, "timed": load_timed})
   report.lasts = lasts
   return report
 }
@@ -308,8 +286,8 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     for f in ["moves", "qty"] {
       totals.movements[f] = totals.movements[f] + u.movements[f]
       for t in keys(u.movements.by_type) {
-        if totals.movements.by_type[t] == nil { totals.movements.by_type[t] = {"moves": 0, "qty": 0.0} }
-        totals.movements.by_type[t][f] = totals.movements.by_type[t][f] + u.movements.by_type[t][f]
+        let bt = get_or_put(totals.movements.by_type, t, {"moves": 0, "qty": 0.0})
+        bt[f] = bt[f] + u.movements.by_type[t][f]
       }
     }
     push(user_list, u)
@@ -317,15 +295,10 @@ fn rollup(users, days, start_date, stop_date, distinct) {
   totals.loads.avgloadtime = timed_all > 0 ? r1(secs_all / timed_all / 60.0) : 0.0
   totals.loads.avgdispatchunits = totals.loads.dispatches > 0 ? r1(totals.loads.scans / real(totals.loads.dispatches)) : 0.0
   totals.loads.manualpct = totals.loads.scans > 0 ? r1(100.0 * real(totals.loads.manual) / totals.loads.scans) : 0.0
-  totals.active_days = len(keys(all_days))
+  totals.active_days = len(all_days)
   totals.touches_per_day = totals.active_days > 0 ? r1(totals.touches / real(totals.active_days)) : 0.0
-  // busiest first
-  // ties in user id order, so a pushed update does not reshuffle people with the same touches
-  user_list = sort_by(sort_by(user_list, fn(u) { return lower(u.userid) }), fn(u) { return -u.touches })
-  let i = 0
-  while i < len(user_list) {
-    user_list[i].rank = i + 1
-    i += 1
-  }
+  // busiest first; ties in user id order, so a pushed update does not reshuffle people with the same touches
+  user_list = sort_by(user_list, fn(u) { return [-u.touches, lower(u.userid)] })
+  for pair in enumerate(user_list) { pair[1].rank = pair[0] + 1 }
   return {"start": start_date, "stop": stop_date, "users": user_list, "totals": totals}
 }
