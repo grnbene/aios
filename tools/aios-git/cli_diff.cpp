@@ -11,9 +11,6 @@
 #include "aios/userland/git_structural.hpp"
 #include "cli.hpp"
 #include "color.hpp"
-#ifdef AIOS_HAVE_ZLIB
-#include <zlib.h>
-#endif
 
 namespace aios_git {
 
@@ -472,16 +469,6 @@ std::string pprint_rename(const std::string& a, const std::string& b) {
 const char kEn85[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
 
 ByteBuffer deflate_for_patch(const std::string& data) {
-#ifdef AIOS_HAVE_ZLIB
-  // git compresses binary patches with zlib at its default level (core.compression unset: Z_BEST_SPEED);
-  // the same library at the same level gives the same bytes
-  uLongf n = compressBound((uLong)data.size());
-  ByteBuffer z(n);
-  if (compress2(z.data(), &n, (const Bytef*)data.data(), (uLong)data.size(), Z_BEST_SPEED) == Z_OK) {
-    z.resize(n);
-    return z;
-  }
-#endif
   return zlib_deflate(ByteSpan((const uint8_t*)data.data(), data.size()));
 }
 

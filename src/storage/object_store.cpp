@@ -7,9 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <unordered_set>
-#if defined(AIOS_HAVE_ZLIB) || defined(AIOS_HAVE_LIBDEFLATE)
-#include "aios/net/gzip.hpp"
-#endif
+#include "aios/net/deflate.hpp"
 
 namespace aios {
 
@@ -93,17 +91,8 @@ constexpr uint32_t kPayloadZMagic = 0x5A4F5341u;
 // exactly that many (a payload that only happens to start with the magic stays as it is).
 bool inflate_payload(const uint8_t* z, size_t n, uint32_t plain, ByteBuffer& out) {
   if (plain == 0 || plain > (1u << 28)) return false;
-#if defined(AIOS_HAVE_LIBDEFLATE)
   out.resize(plain);
-  return net::host_inflate_raw_exact(ByteSpan(z, n), out.data(), plain);
-#elif defined(AIOS_HAVE_ZLIB)
-  size_t consumed = 0;
-  out.clear();
-  return net::zlib_inflate_raw(ByteSpan(z, n), &out, &consumed, plain) && out.size() == plain;
-#else
-  (void)z; (void)n; (void)out;
-  return false;
-#endif
+  return net::inflate_raw_exact(ByteSpan(z, n), out.data(), plain);
 }
 
 bool payload_is_compressed(const uint8_t* p, size_t n) {
@@ -165,23 +154,19 @@ void StoredObject::encode(Writer& w) const {
     w.bytes(payload);
     return;
   }
-#if defined(AIOS_HAVE_LIBDEFLATE)
   if (payload.size() >= 64) {
-    {
-      ByteBuffer comp_buf;
-      comp_buf.resize(8 + payload.size());
+    ByteBuffer z;
+    net::deflate_raw_append(ByteSpan(payload.data(), payload.size()), 5, z);
+    if (8 + z.size() < payload.size()) {
+      ByteBuffer comp_buf(8 + z.size());
       std::memcpy(comp_buf.data(), &kPayloadZMagic, 4);
-      uint32_t orig_sz = (uint32_t)payload.size();
+      const uint32_t orig_sz = (uint32_t)payload.size();
       std::memcpy(comp_buf.data() + 4, &orig_sz, 4);
-      size_t stored = net::host_deflate_raw(ByteSpan(payload.data(), payload.size()), comp_buf.data() + 8, payload.size(), 5);
-      if (stored > 0 && 8 + stored < payload.size()) {
-        comp_buf.resize(8 + stored);
-        w.bytes(ByteSpan(comp_buf.data(), comp_buf.size()));
-        return;
-      }
+      std::memcpy(comp_buf.data() + 8, z.data(), z.size());
+      w.bytes(ByteSpan(comp_buf.data(), comp_buf.size()));
+      return;
     }
   }
-#endif
   w.bytes(payload);
 }
 Result<StoredObject> StoredObject::decode(Reader& r, bool decompress_payload) {

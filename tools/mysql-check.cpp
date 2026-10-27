@@ -464,9 +464,7 @@ int main() {
       z.set_compression(std::string(algo) == "zstd" ? 2 : 1);
       auto zc = z.connect("root", "", "aios_db");
       if (!zc.ok()) { std::cerr << algo << " connect failed: " << zc.error().message << "\n"; return 1; }
-#if !defined(AIOS_HAVE_ZSTD)
       if (std::string(algo) == "zstd") { std::cout << "  (no zstd in this build: zlib instead)\n"; algo = "zlib"; }
-#endif
       if (std::string(z.compression()) != algo) { std::cerr << "session runs '" << z.compression() << "', not " << algo << "\n"; return 1; }
       auto st = z.query("SHOW STATUS LIKE 'Compression%'");
       assert(st.ok() && st->ok && st->rows.size() == 3);

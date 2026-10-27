@@ -49,6 +49,11 @@ ByteBuffer gzip_encode(ByteSpan data, int level = 6);
 // reason in `why`, on a damaged or truncated stream or one that would
 // inflate past `max_out` bytes.
 bool gzip_decode(ByteSpan data, ByteBuffer& out, size_t max_out, std::string* why);
+// The first bytes of a zlib stream (RFC 1950), at most `max` of them, into `out`: what a reader of a header
+// needs without inflating the rest (a git commit's tree and committer lines). `got` says how many came out (fewer
+// when the stream is shorter). False on a damaged stream.
+bool zlib_inflate_prefix(ByteSpan data, uint8_t* out, size_t max, size_t* got);
+
 // The IEEE CRC-32 gzip, zip and PNG use.
 uint32_t crc32_ieee(ByteSpan data, uint32_t running = 0);
 

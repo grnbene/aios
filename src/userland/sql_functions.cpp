@@ -11,9 +11,6 @@
 #include "aios/core/bytes.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/userland/git.hpp"
-#if defined(AIOS_HAVE_ZLIB)
-#include <zlib.h>
-#endif
 
 namespace aios::userland::sqlfn {
 
@@ -1107,14 +1104,7 @@ std::string sql_crypt_decode(const std::string& data, const std::string& key) {
 std::string compress(const std::string& in) {
   if (in.empty()) return {};
   ByteBuffer z;
-#if defined(AIOS_HAVE_ZLIB)
-  uLongf cap = compressBound((uLong)in.size());
-  z.resize(cap);
-  if (compress2(z.data(), &cap, reinterpret_cast<const Bytef*>(in.data()), (uLong)in.size(), Z_DEFAULT_COMPRESSION) == Z_OK) z.resize(cap);
-  else z = zlib_deflate(span_of(in), 6);
-#else
   z = zlib_deflate(span_of(in), 6);
-#endif
   uint32_t len = (uint32_t)in.size() & 0x3FFFFFFFu;
   std::string out;
   out.reserve(4 + z.size() + 1);

@@ -17,9 +17,6 @@
 #include <string>
 #include <vector>
 
-#if defined(AIOS_HAVE_ZLIB)
-#include <zlib.h>
-#endif
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/net/deflate.hpp"
@@ -32,20 +29,6 @@ namespace {
 
 double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-#if defined(AIOS_HAVE_ZLIB)
-size_t zlib_raw_size(ByteSpan in, int level) {
-  z_stream zs;
-  std::memset(&zs, 0, sizeof(zs));
-  if (deflateInit2(&zs, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return 0;
-  std::vector<uint8_t> out(deflateBound(&zs, (uLong)in.size()));
-  zs.next_in = const_cast<Bytef*>(in.data()); zs.avail_in = (uInt)in.size();
-  zs.next_out = out.data(); zs.avail_out = (uInt)out.size();
-  const int rc = deflate(&zs, Z_FINISH);
-  const size_t n = rc == Z_STREAM_END ? zs.total_out : 0;
-  deflateEnd(&zs);
-  return n;
-}
-#endif
 
 int selftest() {
   std::mt19937_64 rng(7);
@@ -60,9 +43,6 @@ int selftest() {
       std::vector<uint8_t> exact(data.size());
       const bool ok_exact = net::inflate_raw_exact(ByteSpan(z.data(), z.size()), exact.data(), data.size()) && std::memcmp(exact.data(), data.data(), data.size()) == 0;
       size_t zl = 0;
-#if defined(AIOS_HAVE_ZLIB)
-      zl = zlib_raw_size(ByteSpan(data.data(), data.size()), level);
-#endif
       std::printf("  %-28s level %d: %zu -> %zu bytes (zlib %zu, %+.1f%%)  tree %s  exact %s\n", what, level, data.size(), z.size(), zl,
                   zl ? (100.0 * ((double)z.size() - (double)zl) / (double)zl) : 0.0, ok_tree ? "ok" : why.c_str(), ok_exact ? "ok" : "FAIL");
       if (!ok_tree || !ok_exact) ++failures;
@@ -166,17 +146,6 @@ int main(int argc, char** argv) {
     t0 = now_ms(); cs.recode_blocks(); m.deflate_pack_ms = now_ms() - t0;
     m.deflate6 = 0; for (const auto& b : cs.compressed_blocks) m.deflate6 += b.compressed_bytes.size();
     m.scan_hash_deflate = scan(cs, &m.deflate_scan_ms);
-#if defined(AIOS_HAVE_ZLIB)
-    {
-      // zlib's size for the same payloads: decoded through the engine, packed again by zlib
-      std::vector<uint8_t> raw;
-      for (const auto& b : cs.compressed_blocks) {
-        raw.assign(b.raw_size, 0);
-        if (!net::inflate_raw_exact(ByteSpan(b.compressed_bytes.data(), b.compressed_bytes.size()), raw.data(), b.raw_size)) continue;
-        m.zlib6 += zlib_raw_size(ByteSpan(raw.data(), raw.size()), 6);
-      }
-    }
-#endif
     cs.block_codec_pref = ColumnStore::kBlockLz4;   // the table as it was
     cs.recode_blocks();
     all.push_back(m);
