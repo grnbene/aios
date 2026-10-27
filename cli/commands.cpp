@@ -1268,14 +1268,26 @@ void cmd_serve(Ctx& c, const Args& a) {
     // The member: from the hub's roster, a link already made, or its direct route (AIOS_FLEET_DIRECT) - so a member
     // reached straight is served while the hub is down.
     Id128 target;
-    {
-      std::lock_guard<std::mutex> g(reach_mu);
-      auto who = c.k.find_member(member);
-      if (!who.ok()) return answer(503, c.k.in_fleet() ? who.error().message : "this route runs on " + member + ", and this machine cannot reach it: " + who.error().message);
-      target = *who;
-      auto at = c.k.reach(target);   // its devices join this machine's fabric (once; a dead link is replaced)
-      if (!at.ok()) return answer(503, "cannot reach " + member + ": " + at.error().message);
-    }
+    size_t node_at = 0;
+    // The member and a link to it (its devices join this machine's fabric once; a dead link is replaced). A member
+    // that is restarting - its app host updated - is gone from the roster and refuses links for a second or two:
+    // tried for up to 15 s, inside a caller's usual 30 s, before this answers 503.
+    std::string reach_err;
+    auto reach_member = [&]() -> bool {
+      for (int tries = 0; tries < 60; ++tries) {
+        if (tries) hal::sleep_ms(250);
+        std::lock_guard<std::mutex> g(reach_mu);
+        auto who = c.k.find_member(member);
+        if (!who.ok()) { reach_err = c.k.in_fleet() ? who.error().message : "this route runs on " + member + ", and this machine cannot reach it: " + who.error().message; continue; }
+        target = *who;
+        auto at = c.k.reach(target);
+        if (!at.ok()) { reach_err = "cannot reach " + member + ": " + at.error().message; continue; }
+        node_at = *at;
+        return true;
+      }
+      return false;
+    };
+    if (!reach_member()) return answer(503, reach_err);
     {
       std::unique_lock<std::mutex> lk(slots_mu);
       if (!slots_cv.wait_for(lk, std::chrono::seconds(20), [&] { return slots_used < route_max; }))
@@ -1307,9 +1319,34 @@ void cmd_serve(Ctx& c, const Args& a) {
     const ByteBuffer in = encode_app_request(app, req);
     // The request buffer: room for this request (a longer one grows it); what is past it the decoder never reads.
     if (!ensure(rb->tin, rb->in_cap, std::max<uint64_t>(in.size(), 4096))) return answer(503, "request buffer");
+    // The member restarted (its app host was updated, say): the link this machine held to it is dead, and so are the
+    // slot's buffers, which lived in its old process. The first request through it failed ("no reply from node"),
+    // answered 502 - and the sticker feed's PHP front took a 502 as "grain is down" and fell back to its own feed,
+    // minutes long. Such a failure now closes the dead link, reaches the member again, makes the buffers anew and
+    // asks once more; an app's own failure is answered as it is.
+    bool relinked = false;
+    auto link_gone = [](const std::string& why) {
+      return why.find("closed the link") != std::string::npos || why.find("no reply from node") != std::string::npos ||
+             why.find("is not in the fabric") != std::string::npos;
+    };
+    auto relink = [&]() -> bool {
+      relinked = true;
+      drop(rb->tout, rb->out_cap);
+      drop(rb->tin, rb->in_cap);
+      {
+        std::lock_guard<std::mutex> g(reach_mu);
+        if (node_at < c.k.nodes().size() && c.k.nodes()[node_at]->kernel() == target) c.k.nodes()[node_at]->close();
+      }
+      return reach_member() && ensure(rb->tin, rb->in_cap, std::max<uint64_t>(in.size(), 4096));
+    };
     for (int attempt = 0; attempt < 2; ++attempt) {
       if (!ensure(rb->tout, rb->out_cap, std::max<uint64_t>(rb->out_cap, route_room))) return answer(503, "answer buffer");
       auto wr = route_worker.write(rb->tin.memory, rb->tin.offset, ByteSpan(in.data(), in.size()));
+      if (!wr.ok() && !relinked && link_gone(wr.error().message)) {
+        if (!relink()) return answer(503, reach_err.empty() ? "cannot reach " + member + " again after its link closed" : reach_err);
+        --attempt;
+        continue;
+      }
       auto g = route_worker.create_graph();
       if (!wr.ok() || !g.ok()) return answer(503, "graph: " + (wr.ok() ? g.error().message : wr.error().message));
       Operation op;
@@ -1324,8 +1361,14 @@ void cmd_serve(Ctx& c, const Args& a) {
       auto rep = added.ok() ? route_worker.execute(*g) : Result<ExecutionReport>(added.error());
       (void)route_worker.destroy_graph(*g);
       if (!rep.ok() || !rep->failure.empty()) {
+        const std::string why = rep.ok() ? rep->failure : rep.error().message;
+        if (!relinked && link_gone(why)) {
+          if (!relink()) return answer(503, reach_err.empty() ? "cannot reach " + member + " again after its link closed" : reach_err);
+          --attempt;
+          continue;
+        }
         drop(rb->tout, rb->out_cap);   // a failed job may have left the member's copy of it half written
-        return answer(502, "on " + member + ": " + (rep.ok() ? rep->failure : rep.error().message));
+        return answer(502, "on " + member + ": " + why);
       }
       auto head = route_worker.read(rb->tout.memory, rb->tout.offset, 4);
       if (!head.ok() || head->size() < 4) return answer(502, "on " + member + ": no answer came back");
