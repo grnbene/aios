@@ -1464,6 +1464,7 @@ void ThingEngine::apply_partition(Kind& k, const std::string& part, std::vector<
       if (now.count(ik)) continue;
       k.things.erase(ik);
       before_display->erase(ik);
+      k.asof_gone.push_back(ik);
       k.left++;
       k.version++;
       k.departed[ik] = k.version;
@@ -1481,9 +1482,250 @@ void ThingEngine::apply_partition(Kind& k, const std::string& part, std::vector<
   if (!fresh.empty()) k.parts.emplace(part, std::move(fresh));
 }
 
+// ('a', 'b', NULL, 7): the keys a SHOW narrows to ('it''s' and \' as in SQL; NULL is the NULL key).
+static bool parse_key_list(std::string list, std::vector<std::string>* keys, std::string* err) {
+  if (list.size() < 2 || list.front() != '(' || list.back() != ')') { *err = "KEYS ('key', ...)"; return false; }
+  list = list.substr(1, list.size() - 2);
+  for (size_t i = 0; i < list.size();) {
+    while (i < list.size() && (std::isspace((unsigned char)list[i]) || list[i] == ',')) ++i;
+    if (i >= list.size()) break;
+    std::string v;
+    if (list[i] == '\'' || list[i] == '"') {
+      const char q = list[i++];
+      for (; i < list.size(); ++i) {
+        if (list[i] == '\\' && i + 1 < list.size()) { v += list[++i]; continue; }
+        if (list[i] == q) {
+          if (i + 1 < list.size() && list[i + 1] == q) { v += q; ++i; continue; }   // 'it''s'
+          ++i;
+          break;
+        }
+        v += list[i];
+      }
+    } else {
+      while (i < list.size() && list[i] != ',' && !std::isspace((unsigned char)list[i])) v += list[i++];
+      if (upper(v) == "NULL") v = kNullKey;
+    }
+    keys->push_back(std::move(v));
+  }
+  return true;
+}
+
+// ---- Time travel: the change log beside a row Thing (docs/design/thing-time-travel.md) ----------------------------
+namespace {
+int keep_days_default() {
+  const char* e = std::getenv("AIOS_THING_KEEP_DAYS");
+  return e && *e ? std::max(0, std::atoi(e)) : 30;
+}
+uint64_t keep_bytes() {   // AIOS_THING_KEEP_KB is for tests; AIOS_THING_KEEP_MB otherwise (256)
+  if (const char* e = std::getenv("AIOS_THING_KEEP_KB")) if (*e) return std::max<uint64_t>(4, std::strtoull(e, nullptr, 10)) << 10;
+  const char* e = std::getenv("AIOS_THING_KEEP_MB");
+  return (e && *e ? std::max<uint64_t>(1, std::strtoull(e, nullptr, 10)) : 256) << 20;
+}
+// One line of the log, read back: its kind (b, c, g), time, key (as the things map keys it), cause and values.
+struct AsofRec { char kind = 0; uint64_t ns = 0; std::string key, cause; std::vector<std::string> vals; size_t bytes = 0; };
+bool asof_parse(const std::string& line, AsofRec* r) {
+  const std::vector<std::string> f = split_tabs(line);
+  if (f.size() < 4 || f[0].size() != 1) return false;
+  r->kind = f[0][0];
+  r->ns = std::strtoull(f[1].c_str(), nullptr, 10);
+  r->key = f[2] == "N" ? std::string(kNullKey) : unesc(f[2].substr(1));
+  r->cause = unesc(f[3]);
+  r->vals.clear();
+  r->bytes = line.size() + 1;
+  if (r->kind == 'g') return true;
+  if (f.size() < 5) return false;
+  const size_t n = (size_t)std::strtoull(f[4].c_str(), nullptr, 10);
+  for (size_t i = 0; i < n && 5 + i < f.size(); ++i) r->vals.push_back(field_val(f[5 + i]));
+  return true;
+}
+std::string asof_line(char kind, uint64_t ns, const std::string& key, const std::string& cause, const std::vector<std::string>& vals) {
+  std::string o = std::string(1, kind) + "\t" + std::to_string(ns) + "\t" + (key == kNullKey ? std::string("N") : "V" + esc(key)) + "\t" +
+                  esc(cause) + "\t" + std::to_string(vals.size());
+  for (const auto& v : vals) o += "\t" + val_field(v);
+  return o + "\n";
+}
+// Keys in the order a person reads them: numbers by value, then text.
+bool key_before(const std::string& a, const std::string& b) {
+  const bool na = all_digits(a), nb = all_digits(b);
+  if (na && nb && a[0] != '-' && b[0] != '-') return a.size() != b.size() ? a.size() < b.size() : a < b;
+  if (na != nb) return na;
+  return a < b;
+}
+// 'YYYY-MM-DD[ HH:MM[:SS]]', local time: the end of that day, minute or second, in ns (0 when it is not one).
+uint64_t asof_end_ns(const std::string& text) {
+  int Y = 0, M = 0, D = 0, h = 0, m = 0, s = 0;
+  char tail = 0;
+  uint64_t unit = 86400;
+  if (std::sscanf(text.c_str(), "%4d-%2d-%2d %2d:%2d:%2d%c", &Y, &M, &D, &h, &m, &s, &tail) == 6) unit = 1;
+  else if (std::sscanf(text.c_str(), "%4d-%2d-%2d %2d:%2d%c", &Y, &M, &D, &h, &m, &tail) == 5) { unit = 60; s = 0; }
+  else if (std::sscanf(text.c_str(), "%4d-%2d-%2d%c", &Y, &M, &D, &tail) == 3) { unit = 86400; h = m = s = 0; }
+  else return 0;
+  if (M < 1 || M > 12 || D < 1 || D > 31 || h > 23 || m > 59 || s > 60) return 0;
+  std::tm tm_buf{};
+  tm_buf.tm_year = Y - 1900; tm_buf.tm_mon = M - 1; tm_buf.tm_mday = D;
+  tm_buf.tm_hour = h; tm_buf.tm_min = m; tm_buf.tm_sec = s; tm_buf.tm_isdst = -1;
+  const std::time_t t = std::mktime(&tm_buf);
+  if (t == (std::time_t)-1) return 0;
+  return ((uint64_t)t + unit) * 1000000000ull;
+}
+}  // namespace
+
+bool ThingEngine::asof_on(const Kind& k) const {
+  return k.type == Kind::Aggregate && !k.building && (k.keep_days >= 0 ? k.keep_days : keep_days_default()) > 0;
+}
+
+std::string ThingEngine::asof_path(const Kind& k) const { return things_dir() + "/" + k.name + ".asof"; }
+
+void ThingEngine::asof_append(Kind& k, const std::string& lines) {
+  auto& host = db_.kernel_.host();
+  if (k.asof_from_ns == 0) { asof_start(k); return; }   // no log yet: the base is the state now, this change included
+  if (!host.append_file_unsynced(asof_path(k), ByteSpan((const uint8_t*)lines.data(), lines.size())).ok()) return;
+  k.asof_bytes += lines.size();
+  const int days = k.keep_days >= 0 ? k.keep_days : keep_days_default();
+  const uint64_t now = host.wall_ns();
+  // past its size, or a day past its days: rewritten from a later cut-off
+  if (k.asof_bytes > std::max(keep_bytes(), k.asof_trim_at) || now > k.asof_from_ns + ((uint64_t)days + 1) * 86400ull * 1000000000ull) asof_trim(k);
+}
+
+void ThingEngine::asof_start(Kind& k) {
+  auto& host = db_.kernel_.host();
+  host.make_dir(things_dir());
+  const uint64_t now = host.wall_ns();
+  std::string o;
+  for (const auto& kv : k.things) {
+    const Instance& in = kv.second;
+    std::string cause = in.history.empty() ? std::string("log started") : in.history.back().cause;
+    o += asof_line('b', in.updated_ns ? in.updated_ns : now, kv.first, cause, value_row(k, in));
+  }
+  if (!host.write_file(asof_path(k), ByteSpan((const uint8_t*)o.data(), o.size())).ok()) return;
+  k.asof_from_ns = now;
+  k.asof_bytes = o.size();
+  dirty_ = true;
+}
+
+void ThingEngine::asof_trim(Kind& k) {
+  auto& host = db_.kernel_.host();
+  auto f = host.read_file(asof_path(k));
+  if (!f.ok()) { asof_start(k); return; }
+  std::vector<AsofRec> recs;
+  {
+    const std::string text(f->begin(), f->end());
+    size_t a = 0;
+    for (size_t i = 0; i <= text.size(); ++i) {
+      if (i < text.size() && text[i] != '\n') continue;
+      AsofRec r;
+      if (i > a && asof_parse(text.substr(a, i - a), &r)) recs.push_back(std::move(r));
+      a = i + 1;
+    }
+  }
+  const int days = k.keep_days >= 0 ? k.keep_days : keep_days_default();
+  const uint64_t now = host.wall_ns();
+  const uint64_t by_time = now > (uint64_t)days * 86400ull * 1000000000ull ? now - (uint64_t)days * 86400ull * 1000000000ull : 0;
+  // fold every change at or before the cut-off into the base: by time, and by size until what follows is half the cap
+  size_t fold = 0;   // records [0, fold) become the base
+  while (fold < recs.size() && (recs[fold].kind == 'b' || recs[fold].ns <= by_time)) ++fold;
+  uint64_t tail = 0;
+  for (size_t i = fold; i < recs.size(); ++i) tail += recs[i].bytes;
+  while (fold < recs.size() && tail > keep_bytes() / 2) tail -= recs[fold++].bytes;
+  std::map<std::string, const AsofRec*> base;
+  uint64_t cut = k.asof_from_ns;
+  for (size_t i = 0; i < fold; ++i) {
+    if (recs[i].kind == 'g') base.erase(recs[i].key);
+    else base[recs[i].key] = &recs[i];
+    if (recs[i].kind != 'b') cut = std::max(cut, recs[i].ns);
+  }
+  std::string o;
+  for (const auto& kv : base) o += asof_line('b', kv.second->ns, kv.first, kv.second->cause, kv.second->vals);
+  for (size_t i = fold; i < recs.size(); ++i) o += asof_line(recs[i].kind, recs[i].ns, recs[i].key, recs[i].cause, recs[i].vals);
+  if (!host.write_file(asof_path(k), ByteSpan((const uint8_t*)o.data(), o.size())).ok()) return;
+  // The state at the time cut-off is the base whether or not anything changed near it: answering from there on
+  // keeps a quiet Thing from being cut again at every change.
+  k.asof_from_ns = std::max({k.asof_from_ns, cut, by_time});
+  k.asof_bytes = o.size();
+  // A base larger than the cap allows (many keys) would be cut again at every change: the next cut waits for
+  // another half cap of changes.
+  k.asof_trim_at = k.asof_bytes + keep_bytes() / 2;
+  dirty_ = true;
+  fprintf(stderr, "[things] %s: history kept from %s (%llu bytes)\n", k.name.c_str(), wall_text(k.asof_from_ns).c_str(),
+          (unsigned long long)k.asof_bytes);
+}
+
+SqlQueryResult ThingEngine::asof_show(Kind& k, uint64_t end_ns, const std::vector<std::string>* keys) {
+  if (k.type != Kind::Aggregate) return error_result("SHOW THING .. AS OF: " + k.name + " is not a row Thing (its history is SHOW THING HISTORY)");
+  if (!asof_on(k)) return error_result(k.name + " keeps no history to look back in (SET THING " + k.name + " KEEP <n> DAYS keeps it from then on)");
+  if (k.asof_from_ns == 0) asof_start(k);
+  if (end_ns <= k.asof_from_ns) return error_result("the history of " + k.name + " is kept from " + wall_text(k.asof_from_ns) + " (KEEP " +
+                                                    std::to_string(k.keep_days >= 0 ? k.keep_days : keep_days_default()) + " DAYS)");
+  auto f = db_.kernel_.host().read_file(asof_path(k));
+  if (!f.ok()) return error_result("the history of " + k.name + " cannot be read: " + f.error().message);
+  std::map<std::string, AsofRec> state;
+  {
+    const std::string text(f->begin(), f->end());
+    size_t a = 0;
+    for (size_t i = 0; i <= text.size(); ++i) {
+      if (i < text.size() && text[i] != '\n') continue;
+      AsofRec r;
+      if (i > a && asof_parse(text.substr(a, i - a), &r) && (r.kind == 'b' || r.ns < end_ns)) {
+        if (r.kind == 'g') state.erase(r.key);
+        else state[r.key] = std::move(r);
+      }
+      a = i + 1;
+    }
+  }
+  std::set<std::string> want;
+  if (keys) for (const auto& key : *keys) want.insert(key);
+  std::vector<const AsofRec*> rows;
+  for (const auto& kv : state) if (!keys || want.count(kv.first)) rows.push_back(&kv.second);
+  std::stable_sort(rows.begin(), rows.end(), [](const AsofRec* a, const AsofRec* b) { return key_before(a->key, b->key); });
+  SqlQueryResult res;
+  res.is_result_set = true;
+  res.columns = value_labels(k);
+  res.columns.push_back("changed_at");
+  res.columns.push_back("cause");
+  for (const AsofRec* r : rows) {
+    SqlRow row;
+    for (size_t i = 0; i + 2 < res.columns.size(); ++i)
+      row.values.push_back(i == 0 ? (r->key == kNullKey ? sql_null() : r->key) : (i < r->vals.size() ? r->vals[i] : sql_null()));
+    row.values.push_back(wall_text(r->ns));
+    row.values.push_back(r->cause);
+    res.rows.push_back(std::move(row));
+  }
+  if (!sql_wire_results()) res.formatted_table = db_.format_result_table(res.columns, res.rows);
+  return res;
+}
+
+// SET THING <name> KEEP <n> DAYS: how far back AS OF reaches. 0 keeps none (the log is deleted); a Thing that kept
+// none starts its log now.
+SqlQueryResult ThingEngine::set_keep(const std::string& name, int days) {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  MuHeld held;
+  auto it = kinds_.find(lower(name));
+  if (it == kinds_.end()) return error_result("no Thing kind named " + name);
+  Kind& k = it->second;
+  if (k.type != Kind::Aggregate) return error_result(k.name + " is not a row Thing: it keeps its own history");
+  const bool was_on = asof_on(k);
+  k.keep_days = days;
+  if (!asof_on(k)) {
+    db_.kernel_.host().remove(asof_path(k));
+    k.asof_from_ns = 0;
+    k.asof_bytes = 0;
+  } else if (!was_on || k.asof_from_ns == 0) {
+    asof_start(k);
+  } else {
+    asof_trim(k);
+  }
+  dirty_ = true;
+  save_locked();
+  SqlQueryResult res;
+  res.formatted_table = days == 0 ? "Thing " + k.name + " keeps no history now (its log is deleted)."
+                                  : "Thing " + k.name + " keeps " + std::to_string(days) + " days of history, from " + wall_text(k.asof_from_ns) + ".";
+  return res;
+}
+
 void ThingEngine::finish_changes(Kind& k, const std::map<std::string, std::string>& before_display,
                                  const std::string& cause) {
   const uint64_t now = db_.kernel_.host().wall_ns();
+  std::string log;   // the change log's lines for this change (time travel)
   for (const auto& kv : before_display) {
     auto it = k.things.find(kv.first);
     if (it == k.things.end()) continue;
@@ -1497,7 +1739,19 @@ void ThingEngine::finish_changes(Kind& k, const std::map<std::string, std::strin
     k.version++;
     in.stamp = k.version;
     dirty_ = true;
+    if (asof_on(k)) {
+      const std::vector<std::string> vals = value_row(k, in);
+      log += "c\t" + std::to_string(now) + "\t" + (in.key_null ? std::string("N") : "V" + esc(in.key)) + "\t" + esc(cause) + "\t" +
+             std::to_string(vals.size());
+      for (const auto& v : vals) log += "\t" + val_field(v);
+      log += "\n";
+    }
   }
+  if (asof_on(k))
+    for (const std::string& ik : k.asof_gone)
+      log += "g\t" + std::to_string(now) + "\t" + (ik == kNullKey ? std::string("N") : "V" + esc(ik)) + "\t" + esc(cause) + "\n";
+  k.asof_gone.clear();
+  if (!log.empty()) asof_append(k, log);
 }
 
 void ThingEngine::stamp_instance(Kind& k, Instance& in) {
@@ -3358,6 +3612,19 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     std::string t = trim(sql);
     if (!t.empty() && t.back() == ';') t = trim(t.substr(0, t.size() - 1));
     const std::string tu = upper(t);
+    {
+      Scan ks(t);
+      const size_t kp = ks.find_kw("KEEP");
+      if (kp != std::string::npos && tu.find("ALERTS") == std::string::npos) {
+        const size_t tp = ks.find_kw("THING");
+        int days = -1;
+        char unit[16] = {0};
+        if (tp != std::string::npos && std::sscanf(t.c_str() + kp + 4, " %d %15s", &days, unit) == 2 && days >= 0 &&
+            (upper(unit) == "DAYS" || upper(unit) == "DAY"))
+          return set_keep(unquote_ident(trim(t.substr(tp + 5, kp - tp - 5))), days);
+        return error_result("SET THING <name> KEEP <n> DAYS");
+      }
+    }
     for (const char* mode : {" SHADOW", " LIVE"}) {
       const size_t ml = std::strlen(mode);
       if (tu.size() > ml && tu.compare(tu.size() - ml, ml, mode) == 0 && tu.find("ALERTS") == std::string::npos) {
@@ -3594,6 +3861,7 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     }
     db_.kernel_.host().remove(things_dir() + "/" + name + ".thing");
     db_.kernel_.host().remove(things_dir() + "/" + name + ".replay");
+    db_.kernel_.host().remove(things_dir() + "/" + name + ".asof");
     dirty_ = true;
     SqlQueryResult res;
     res.formatted_table = "Thing " + name + " dropped.";
@@ -3678,6 +3946,34 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     if (it == kinds_.end() || it->second.type != Kind::Claims) return error_result("no claims Thing named " + name);
     return show_lines(it->second);
   }
+  {
+    const size_t asp = sc.find_kw("AS");
+    if (asp != std::string::npos && sc.find_kw("OF", asp + 2) != std::string::npos && sc.find_kw("HISTORY") == std::string::npos) {
+      const size_t ofp = sc.find_kw("OF", asp + 2);
+      const size_t thp = sc.find_kw("THING");
+      const std::string kind = lower(unquote_ident(trim(sql.substr(thp + 5, asp - thp - 5))));
+      std::string rest = trim(sql.substr(ofp + 2));
+      if (!rest.empty() && rest.back() == ';') rest = trim(rest.substr(0, rest.size() - 1));
+      std::vector<std::string> keys;
+      bool narrowed = false;
+      {
+        Scan rs(rest);
+        const size_t kp = rs.find_kw("KEYS");
+        if (kp != std::string::npos) {
+          std::string err;
+          if (!parse_key_list(trim(rest.substr(kp + 4)), &keys, &err)) return error_result(err);
+          narrowed = true;
+          rest = trim(rest.substr(0, kp));
+        }
+      }
+      if (rest.size() >= 2 && (rest.front() == '\'' || rest.front() == '"') && rest.back() == rest.front()) rest = rest.substr(1, rest.size() - 2);
+      const uint64_t end_ns = asof_end_ns(rest);
+      if (!end_ns) return error_result("SHOW THING <name> AS OF 'YYYY-MM-DD HH:MM:SS' [KEYS ('key', ...)]: '" + rest + "' is not a time");
+      auto it = kinds_.find(kind);
+      if (it == kinds_.end()) return error_result("no Thing kind named " + kind);
+      return asof_show(it->second, end_ns, narrowed ? &keys : nullptr);
+    }
+  }
   size_t shp = sc.find_kw("SHADOW");
   if (shp != std::string::npos) {
     std::string name = unquote_ident(trim(sql.substr(shp + 6)));
@@ -3729,31 +4025,8 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
       if (it->second.type != Kind::Grain && it->second.type != Kind::Mirror)
         return error_result("SHOW THING .. KEYS: " + kind + " is not a grain Thing");
       std::vector<std::string> keys;
-      std::string list = trim(name.substr(kp + 4));
-      if (list.size() < 2 || list.front() != '(' || list.back() != ')')
-        return error_result("SHOW THING <name> KEYS ('key', ...)");
-      list = list.substr(1, list.size() - 2);
-      for (size_t i = 0; i < list.size();) {
-        while (i < list.size() && (std::isspace((unsigned char)list[i]) || list[i] == ',')) ++i;
-        if (i >= list.size()) break;
-        std::string v;
-        if (list[i] == '\'' || list[i] == '"') {
-          const char q = list[i++];
-          for (; i < list.size(); ++i) {
-            if (list[i] == '\\' && i + 1 < list.size()) { v += list[++i]; continue; }
-            if (list[i] == q) {
-              if (i + 1 < list.size() && list[i + 1] == q) { v += q; ++i; continue; }   // 'it''s'
-              ++i;
-              break;
-            }
-            v += list[i];
-          }
-        } else {
-          while (i < list.size() && list[i] != ',' && !std::isspace((unsigned char)list[i])) v += list[i++];
-          if (upper(v) == "NULL") v = kNullKey;
-        }
-        keys.push_back(std::move(v));
-      }
+      std::string kerr;
+      if (!parse_key_list(trim(name.substr(kp + 4)), &keys, &kerr)) return error_result(kerr);
       SqlQueryResult r = show_grain(it->second, &keys);
       return r;
     }
@@ -4879,6 +5152,8 @@ std::string ThingEngine::serialize(const Kind& k) const {
   }
   for (const auto& d : k.departed) o += "gone\t" + esc(d.first) + "\t" + std::to_string(d.second) + "\n";
   if (!k.do_sql.empty()) o += "act_clock\t" + std::to_string(k.act_clock) + "\n" + "act_shadow\t" + (k.do_shadow ? "1" : "0") + "\n";
+  if (k.keep_days >= 0) o += "keep_days\t" + std::to_string(k.keep_days) + "\n";
+  if (k.asof_from_ns) o += "asof_from\t" + std::to_string(k.asof_from_ns) + "\n";
   if (k.type == Kind::Resource) {
     if (!k.claimed_by.empty()) o += "claimed_by\t" + esc(k.claimed_by) + "\n";
     for (const auto& kv : k.res) {
@@ -5049,6 +5324,10 @@ bool ThingEngine::deserialize(const std::string& text, Kind* k, std::string* err
       k->act_clock = std::strtoull(f[1].c_str(), nullptr, 10);
     } else if (f[0] == "act_shadow" && f.size() >= 2) {
       k->do_shadow = f[1] == "1";   // SET THING .. LIVE|SHADOW since its CREATE
+    } else if (f[0] == "keep_days" && f.size() >= 2) {
+      k->keep_days = std::atoi(f[1].c_str());
+    } else if (f[0] == "asof_from" && f.size() >= 2) {
+      k->asof_from_ns = std::strtoull(f[1].c_str(), nullptr, 10);
     }
   }
   (void)cur_part;
@@ -5156,6 +5435,13 @@ void ThingEngine::load() {
       k.pending_full = true;
       k.full_cause = "parts unresolved at load";
     }
+  }
+  for (auto& kv : kinds_) {
+    Kind& k = kv.second;
+    if (!asof_on(k)) continue;
+    auto st = host.stat(asof_path(k));
+    if (st.ok() && k.asof_from_ns) k.asof_bytes = st->size;
+    else asof_start(k);   // its history starts here: what came before is not known
   }
   rebuild_watched();
   if (!kinds_.empty()) {

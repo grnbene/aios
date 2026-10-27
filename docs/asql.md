@@ -783,6 +783,8 @@ The other statements:
     SHOW THINGS <name> | SHOW THING <name>       every Thing of a kind
     SHOW THING HISTORY <name> '<key>'   what changed it and why
     SHOW THING SHADOW <name>            what a Thing's act would have run (TO .. SHADOW)
+    SHOW THING <name> AS OF '<time>' [KEYS ('k', ...)]   a row Thing as it stood then (see below)
+    SET THING <name> KEEP <n> DAYS      how far back AS OF reaches (30 by default; 0 keeps none)
     SET THING <name> SHADOW | LIVE      hold a Thing's act back, or let it write
     SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
@@ -805,6 +807,21 @@ a fleet.
 To see a running engine's Things from a shell without connecting to it, use
 `grain ps`: it lists each engine on the machine with its Things and their row
 counts (see [What's running on this machine](grain-apps.md#whats-running-on-this-machine-grain-ps)).
+
+### `AS OF`: a Thing as it stood at a moment
+
+A row Thing writes every change of a key (its values after it, and the cause) to a log beside its state file,
+`<root>/sql_db/things/<name>.asof`. `SHOW THING <name> AS OF '2026-10-27 14:15:00'` reads it back: one row per key
+that existed at the end of that second, its values, `changed_at` (when that value was set) and `cause` (what set it,
+the same text as `SHOW THING HISTORY`). `'YYYY-MM-DD HH:MM'` and `'YYYY-MM-DD'` mean the end of that minute or day.
+`KEYS ('123', ...)` narrows it.
+
+How much is kept: 30 days (`AIOS_THING_KEEP_DAYS`, or `SET THING <name> KEEP <n> DAYS`) and at most 256 MB per Thing
+(`AIOS_THING_KEEP_MB`). Past either, the log is rewritten from a later cut-off: the state there, then the changes
+after it. A time before the cut-off is refused with the cut-off named. `KEEP 0 DAYS` deletes the log and keeps none.
+A Thing made before this existed starts its log when the engine first loads it. The log lives on disk only. Grain
+Things, claims and resources keep their own history and have no `AS OF`. Design and costs:
+[design/thing-time-travel.md](design/thing-time-travel.md).
 
 ### `WAIT THING`: told when a Thing changes
 
