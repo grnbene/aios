@@ -347,6 +347,16 @@ ECMAScript-compatible regular expression operations.
 | `jwt_sign` | `jwt_sign(payload_map, secret, [expires_in_seconds])` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. With `expires_in_seconds`, sets `iat` and `exp` (the caller's map is not changed). An empty secret is an error. |
 | `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 
+### Document Generation & Archives (`doc.*`)
+| Function | Signature | Description |
+|---|---|---|
+| `doc.csv` / `csv_format` | `doc.csv(cols, rows)` or `doc.csv(records)` | Formats columns/rows or a list of record maps as an RFC 4180 CSV string. |
+| `doc.parse_csv` / `csv_parse` | `doc.parse_csv(text, [options])` | Parses RFC 4180 CSV into a list of maps, or `{columns, rows}` when `as_table: true`. |
+| `doc.xlsx` / `xlsx_create` | `doc.xlsx(spec)` | Generates an OpenXML `.xlsx` workbook from `{sheet, records, columns, rows, freeze_pane}`. |
+| `doc.pdf` / `pdf_render` | `doc.pdf(html, [css], [options])` | Compiles HTML/CSS into vector PDF 1.4 bytes (`page_width`, `page_height`, margins). |
+| `doc.zip` / `zip_create` | `doc.zip(entries, [level])` | Packages a map of `{"filename": data}` into a PKZIP archive buffer. |
+| `doc.unzip` / `unzip` | `doc.unzip(zip_data)` | Decompresses PKZIP archive bytes into a map of `{"filename": bytes}`. |
+
 ---
 
 ## 11. Concurrency & Parallelism

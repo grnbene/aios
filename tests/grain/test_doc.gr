@@ -1,216 +1,165 @@
-// tests/grain/test_doc.gr
-// Rigorous verification of Grain's native document standard library (doc.*)
-// Tested across all execution scopes:
-// 1. Top-level scope
-// 2. Function bodies
-// 3. Closure bodies
-// 4. Nested blocks & loops
+// doc: CSV formatting and RFC 4180 parsing, OpenXML spreadsheet (xlsx), vector PDF, and in-tree PKZIP.
+// Round trips, quote and newline escaping, cell types, XML package layout, at top level, in a function and a closure.
+fn check(c, msg) { assert_true(c, msg) }
 
-fn check(cond, msg) {
-  assert(cond, msg)
+// --- CSV formatting and RFC 4180 parsing ---
+let cols = ["sku", "description", "qty", "active"]
+let rows = [
+  ["TIRE-001", "All Season 205/55R16", 40, true],
+  ["TIRE-002", "Winter \"Grip\", Studded", 12, false],
+  ["TIRE-003", "Commercial\nHeavy Duty", 8, true],
+  ["TIRE-004", "Standard, Grade A", nil, false]
+]
+
+let formatted = doc.csv(cols, rows)
+check(contains(formatted, "TIRE-001"), "contains TIRE-001")
+check(contains(formatted, "\"Winter \"\"Grip\"\", Studded\""), "quotes and commas escaped properly")
+check(contains(formatted, "\"Commercial\nHeavy Duty\""), "newline preserved in quotes")
+check(contains(formatted, "\"Standard, Grade A\""), "comma field quoted")
+
+let parsed = doc.parse_csv(formatted)
+check(len(parsed) == 4, "parsed 4 rows")
+check(parsed[0].sku == "TIRE-001", "parsed[0].sku")
+check(parsed[0].qty == 40, "parsed[0].qty is integer 40")
+check(parsed[0].active == true, "parsed[0].active is boolean true")
+check(parsed[1].sku == "TIRE-002", "parsed[1].sku")
+check(parsed[1].description == "Winter \"Grip\", Studded", "description unescaped correctly")
+check(parsed[1].qty == 12, "parsed[1].qty is 12")
+check(parsed[1].active == false, "parsed[1].active is false")
+check(parsed[2].description == "Commercial\nHeavy Duty", "newline preserved in parsed")
+check(parsed[3].qty == nil, "nil cell parsed as nil")
+
+let tbl = doc.parse_csv(formatted, {"as_table": true})
+check(len(tbl.columns) == 4, "4 columns in table")
+check(tbl.columns[0] == "sku", "col 0 sku")
+check(len(tbl.rows) == 4, "4 rows in table")
+check(tbl.rows[0][0] == "TIRE-001", "row 0 cell 0")
+
+let records = [
+  {"op": "JACK", "touches": 2040, "rate": 102.0},
+  {"op": "MARCUS", "touches": 2200, "rate": 110.0}
+]
+let rec_csv = doc.csv(records)
+check(contains(rec_csv, "JACK"), "rec_csv contains JACK")
+let rec_parsed = doc.parse_csv(rec_csv)
+check(len(rec_parsed) == 2, "rec_parsed has 2 items")
+check(rec_parsed[0].op == "JACK", "rec_parsed[0].op is JACK")
+check(rec_parsed[0].touches == 2040, "rec_parsed[0].touches is 2040")
+
+// Bad CSV inputs
+check(!pcall(doc.csv, 42).ok, "doc.csv with number is refused")
+check(!pcall(doc.parse_csv, 42).ok, "doc.parse_csv with number is refused")
+
+// --- OpenXML spreadsheet (doc.xlsx) ---
+let data = [
+  {"operator": "Marcus Miller", "touches": 2200, "rate": 110.0, "status": "Lead"},
+  {"operator": "Jack Reynolds", "touches": 2040, "rate": 102.0, "status": "Senior"},
+  {"operator": "Devon Hayes", "touches": 1800, "rate": 90.0, "status": "Standard"}
+]
+
+let xlsx_bytes = doc.xlsx({
+  "sheet": "Warehouse Performance",
+  "records": data,
+  "freeze_pane": "B2"
+})
+check(len(xlsx_bytes) > 1000, "xlsx package length > 1000")
+
+let unzipped = doc.unzip(xlsx_bytes)
+check(has(unzipped, "[Content_Types].xml"), "has Content_Types")
+check(has(unzipped, "xl/workbook.xml"), "has workbook.xml")
+check(has(unzipped, "xl/worksheets/sheet1.xml"), "has sheet1.xml")
+check(has(unzipped, "xl/styles.xml"), "has styles.xml")
+
+let wb_xml = str(unzipped["xl/workbook.xml"])
+check(contains(wb_xml, "Warehouse Performance"), "workbook has sheet name")
+
+let sheet_xml = str(unzipped["xl/worksheets/sheet1.xml"])
+check(contains(sheet_xml, "Marcus Miller"), "sheet1 contains Marcus Miller")
+check(contains(sheet_xml, "2200"), "sheet1 contains 2200")
+check(contains(sheet_xml, "freeze_pane") == false, "no raw string leak")
+check(contains(sheet_xml, "pane xSplit=\"1\" ySplit=\"1\""), "freeze pane B2 parsed correctly")
+
+let styles_xml = str(unzipped["xl/styles.xml"])
+check(contains(styles_xml, "<styleSheet"), "styles.xml has styleSheet root")
+check(contains(styles_xml, "<fonts"), "styles.xml has fonts collection")
+check(contains(styles_xml, "<fills"), "styles.xml has fills collection")
+
+// --- Vector PDF (doc.pdf) ---
+let html = "<div style=\"padding:20px;\"><h1 style=\"color:#0284c7;\">Warehouse Touches Report</h1><table border=\"1\"><tr><th>Operator</th><th>Touches</th></tr><tr><td>Jack</td><td>2040</td></tr></table></div>"
+let pdf = doc.pdf(html, "body { font-family: Helvetica; }", {
+  "page_width": 792.0,
+  "page_height": 612.0
+})
+
+let pdf_str = str(pdf)
+check(slice(pdf_str, 0, 8) == "%PDF-1.4", "PDF header is %PDF-1.4")
+check(contains(pdf_str, "/MediaBox [0 0 792 612]"), "PDF contains letter landscape MediaBox [0 0 792 612]")
+check(contains(pdf_str, "/BaseFont /Helvetica"), "PDF includes Helvetica font descriptor")
+check(contains(pdf_str, "Warehouse Touches Report"), "PDF stream contains heading text")
+check(contains(pdf_str, "Operator"), "PDF stream contains table header")
+check(contains(pdf_str, "Jack"), "PDF stream contains row cell text")
+check(contains(pdf_str, "2040"), "PDF stream contains numeric cell text")
+check(contains(pdf_str, "startxref"), "PDF includes xref offset")
+check(contains(pdf_str, "%%EOF"), "PDF contains %%EOF trailer")
+
+// --- PKZIP (doc.zip / doc.unzip) round-trip ---
+let files = {
+  "manifest.json": "{\"version\": \"1.0.0\", \"app\": \"warehouse_touches\"}",
+  "readme.txt": "AIOS Native Document Suite\nZero external dependencies.",
+  "nested/config.ini": "port=8573\nworkers=4"
 }
 
-// -----------------------------------------------------------------------------
-// 1. CSV Formatting & RFC 4180 Escaping Tests
-// -----------------------------------------------------------------------------
-fn test_csv_module() {
-  // Simple table
-  let cols = ["sku", "description", "qty", "active"]
-  let rows = [
-    ["TIRE-001", "All Season 205/55R16", 40, true],
-    ["TIRE-002", "Winter \"Grip\", Studded", 12, false],
-    ["TIRE-003", "Commercial\nHeavy Duty", 8, true],
-    ["TIRE-004", "Standard, Grade A", nil, false]
-  ]
+let zip_bytes = doc.zip(files, 6)
+check(len(zip_bytes) > 200, "zip bytes > 200")
 
-  let formatted = doc.csv(cols, rows)
-  check(contains(formatted, "TIRE-001"), "contains TIRE-001")
-  check(contains(formatted, "\"Winter \"\"Grip\"\", Studded\""), "quotes and commas escaped properly")
-  check(contains(formatted, "\"Commercial\nHeavy Duty\""), "newline preserved in quotes")
-  check(contains(formatted, "\"Standard, Grade A\""), "comma field quoted")
+let extracted = doc.unzip(zip_bytes)
+check(has(extracted, "manifest.json"), "extracted manifest.json")
+check(has(extracted, "readme.txt"), "extracted readme.txt")
+check(has(extracted, "nested/config.ini"), "extracted nested config")
+check(str(extracted["manifest.json"]) == files["manifest.json"], "manifest content matches")
+check(str(extracted["nested/config.ini"]) == files["nested/config.ini"], "nested content matches")
 
-  // Parse back
-  let parsed = doc.parse_csv(formatted)
-  check(len(parsed) == 4, "parsed 4 rows")
-  check(parsed[0].sku == "TIRE-001", "parsed[0].sku")
-  check(parsed[0].qty == 40, "parsed[0].qty is integer 40")
-  check(parsed[0].active == true, "parsed[0].active is boolean true")
-  check(parsed[1].sku == "TIRE-002", "parsed[1].sku")
-  check(parsed[1].description == "Winter \"Grip\", Studded", "description unescaped correctly")
-  check(parsed[1].qty == 12, "parsed[1].qty is 12")
-  check(parsed[1].active == false, "parsed[1].active is false")
-  check(parsed[2].description == "Commercial\nHeavy Duty", "newline preserved in parsed")
-  check(parsed[3].qty == nil, "nil cell parsed as nil")
+let bad_unzip = pcall(doc.unzip, "not a valid zip buffer")
+check(!bad_unzip.ok, "unzip on non-zip data raises error")
 
-  // Test parse with as_table: true
-  let tbl = doc.parse_csv(formatted, {"as_table": true})
-  check(len(tbl.columns) == 4, "4 columns in table")
-  check(tbl.columns[0] == "sku", "col 0 sku")
-  check(len(tbl.rows) == 4, "4 rows in table")
-  check(tbl.rows[0][0] == "TIRE-001", "row 0 cell 0")
-
-  // Test map/record format input
-  let records = [
-    {"op": "JACK", "touches": 2040, "rate": 102.0},
-    {"op": "MARCUS", "touches": 2200, "rate": 110.0}
-  ]
-  let rec_csv = doc.csv(records)
-  check(contains(rec_csv, "JACK"), "rec_csv contains JACK")
-  let rec_parsed = doc.parse_csv(rec_csv)
-  check(len(rec_parsed) == 2, "rec_parsed has 2 items")
-  check(rec_parsed[0].op == "JACK", "rec_parsed[0].op is JACK")
-  check(rec_parsed[0].touches == 2040, "rec_parsed[0].touches is 2040")
-
-  print("  [OK] test_csv_module passed")
-}
-
-// -----------------------------------------------------------------------------
-// 2. OpenXML Spreadsheet (doc.xlsx) Tests
-// -----------------------------------------------------------------------------
-fn test_xlsx_module() {
-  // Test from list of records
-  let data = [
-    {"operator": "Marcus Miller", "touches": 2200, "rate": 110.0, "status": "Lead"},
-    {"operator": "Jack Reynolds", "touches": 2040, "rate": 102.0, "status": "Senior"},
-    {"operator": "Devon Hayes", "touches": 1800, "rate": 90.0, "status": "Standard"}
-  ]
-
-  let xlsx_bytes = doc.xlsx({
-    "sheet": "Warehouse Performance",
-    "records": data,
-    "freeze_pane": "B2"
-  })
-
-  check(len(xlsx_bytes) > 1000, "xlsx package length > 1000")
-
-  // Unzip and verify OpenXML structure
-  let unzipped = doc.unzip(xlsx_bytes)
-  check(has(unzipped, "[Content_Types].xml"), "has Content_Types")
-  check(has(unzipped, "xl/workbook.xml"), "has workbook.xml")
-  check(has(unzipped, "xl/worksheets/sheet1.xml"), "has sheet1.xml")
-  check(has(unzipped, "xl/styles.xml"), "has styles.xml")
-
-  // Verify sheet XML contains sheet name and cell values
-  let wb_xml = str(unzipped["xl/workbook.xml"])
-  check(contains(wb_xml, "Warehouse Performance"), "workbook has sheet name")
-
-  let sheet_xml = str(unzipped["xl/worksheets/sheet1.xml"])
-  check(contains(sheet_xml, "Marcus Miller"), "sheet1 contains Marcus Miller")
-  check(contains(sheet_xml, "2200"), "sheet1 contains 2200")
-  check(contains(sheet_xml, "freeze_pane") == false, "no raw string leak")
-  check(contains(sheet_xml, "pane xSplit=\"1\" ySplit=\"1\""), "freeze pane B2 parsed correctly")
-
-  let styles_xml = str(unzipped["xl/styles.xml"])
-  check(contains(styles_xml, "<styleSheet"), "styles.xml has styleSheet root")
-  check(contains(styles_xml, "<fonts"), "styles.xml has fonts collection")
-  check(contains(styles_xml, "<fills"), "styles.xml has fills collection")
-
-  print("  [OK] test_xlsx_module passed")
-}
-
-// -----------------------------------------------------------------------------
-// 3. Vector PDF (doc.pdf) Tests
-// -----------------------------------------------------------------------------
-fn test_pdf_module() {
-  let html = "<div style=\"padding:20px;\"><h1 style=\"color:#0284c7;\">Warehouse Touches Report</h1><table border=\"1\"><tr><th>Operator</th><th>Touches</th></tr><tr><td>Jack</td><td>2040</td></tr></table></div>"
-  let pdf = doc.pdf(html, "body { font-family: Helvetica; }", {
-    "page_width": 792.0,
-    "page_height": 612.0
-  })
-
-  let pdf_str = str(pdf)
-  let pdf_head = slice(pdf_str, 0, 8)
-  check(pdf_head == "%PDF-1.4", "PDF header is %PDF-1.4")
-  check(contains(pdf_str, "/MediaBox [0 0 792 612]"), "PDF contains letter landscape MediaBox [0 0 792 612]")
-  check(contains(pdf_str, "/BaseFont /Helvetica"), "PDF includes Helvetica font descriptor")
-  check(contains(pdf_str, "Warehouse Touches Report"), "PDF stream contains heading text")
-  check(contains(pdf_str, "Operator"), "PDF stream contains table header")
-  check(contains(pdf_str, "Jack"), "PDF stream contains row cell text")
-  check(contains(pdf_str, "2040"), "PDF stream contains numeric cell text")
-  check(contains(pdf_str, "startxref"), "PDF includes xref offset")
-  check(contains(pdf_str, "%%EOF"), "PDF contains %%EOF trailer")
-
-  print("  [OK] test_pdf_module passed")
-}
-
-// -----------------------------------------------------------------------------
-// 4. PKZIP (doc.zip / doc.unzip) Round-Trip Tests
-// -----------------------------------------------------------------------------
-fn test_zip_module() {
-  let files = {
-    "manifest.json": "{\"version\": \"1.0.0\", \"app\": \"warehouse_touches\"}",
-    "readme.txt": "AIOS Native Document Suite\nZero external dependencies.",
-    "nested/config.ini": "port=8573\nworkers=4"
-  }
-
-  let zip_bytes = doc.zip(files, 6)
-  check(len(zip_bytes) > 200, "zip bytes > 200")
-
-  let extracted = doc.unzip(zip_bytes)
-  check(has(extracted, "manifest.json"), "extracted manifest.json")
-  check(has(extracted, "readme.txt"), "extracted readme.txt")
-  check(has(extracted, "nested/config.ini"), "extracted nested config")
-  check(str(extracted["manifest.json"]) == files["manifest.json"], "manifest content matches")
-  check(str(extracted["nested/config.ini"]) == files["nested/config.ini"], "nested content matches")
-
-  print("  [OK] test_zip_module passed")
-}
-
-// -----------------------------------------------------------------------------
-// 5. Scoped Execution Verification (Closures, Nested Loops, Blocks)
-// -----------------------------------------------------------------------------
-fn test_scoped_execution() {
-  // Inside closure
-  let make_exporter = fn(format) {
-    return fn(items) {
-      if (format == "csv") {
-        return doc.csv(items)
-      } else if (format == "xlsx") {
-        return doc.xlsx({"records": items})
-      } else if (format == "pdf") {
-        let rows_html = ""
-        for item in items {
-          rows_html = rows_html + "<tr><td>" + item.name + "</td><td>" + str(item.val) + "</td></tr>"
-        }
-        return doc.pdf("<table>" + rows_html + "</table>")
+// --- Scopes: closures, functions, nested loops ---
+let make_exporter = fn(format) {
+  return fn(items) {
+    if (format == "csv") {
+      return doc.csv(items)
+    } else if (format == "xlsx") {
+      return doc.xlsx({"records": items})
+    } else if (format == "pdf") {
+      let rows_html = ""
+      for item in items {
+        rows_html = rows_html + "<tr><td>" + item.name + "</td><td>" + str(item.val) + "</td></tr>"
       }
-      return nil
+      return doc.pdf("<table>" + rows_html + "</table>")
     }
+    return nil
   }
-
-  let sample_items = [{"name": "A", "val": 10}, {"name": "B", "val": 20}]
-  let csv_fn = make_exporter("csv")
-  let xlsx_fn = make_exporter("xlsx")
-  let pdf_fn = make_exporter("pdf")
-
-  let c_out = csv_fn(sample_items)
-  let x_out = xlsx_fn(sample_items)
-  let p_out = pdf_fn(sample_items)
-
-  check(len(c_out) > 0, "closure csv output")
-  check(len(x_out) > 500, "closure xlsx output")
-  check(len(p_out) > 500, "closure pdf output")
-
-  // Inside nested loop
-  for i in 1..3 {
-    for j in 1..2 {
-      let mini_csv = doc.csv([{"i": i, "j": j}])
-      let parsed = doc.parse_csv(mini_csv)
-      check(parsed[0].i == i, "nested loop CSV i matches")
-      check(parsed[0].j == j, "nested loop CSV j matches")
-    }
-  }
-
-  print("  [OK] test_scoped_execution passed")
 }
 
-// -----------------------------------------------------------------------------
-// Run Suite
-// -----------------------------------------------------------------------------
-print("Running Grain doc.* Standard Library Test Suite...")
-test_csv_module()
-test_xlsx_module()
-test_pdf_module()
-test_zip_module()
-test_scoped_execution()
-print("All Grain doc.* standard library tests passed successfully!")
+let sample_items = [{"name": "A", "val": 10}, {"name": "B", "val": 20}]
+let csv_fn = make_exporter("csv")
+let xlsx_fn = make_exporter("xlsx")
+let pdf_fn = make_exporter("pdf")
+
+let c_out = csv_fn(sample_items)
+let x_out = xlsx_fn(sample_items)
+let p_out = pdf_fn(sample_items)
+
+check(len(c_out) > 0, "closure csv output")
+check(len(x_out) > 500, "closure xlsx output")
+check(len(p_out) > 500, "closure pdf output")
+
+for i in 1..3 {
+  for j in 1..2 {
+    let mini_csv = doc.csv([{"i": i, "j": j}])
+    let mini_parsed = doc.parse_csv(mini_csv)
+    check(mini_parsed[0].i == i, "nested loop CSV i matches")
+    check(mini_parsed[0].j == j, "nested loop CSV j matches")
+  }
+}
+
+print("PASS: test_doc")
