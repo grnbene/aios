@@ -764,6 +764,61 @@ Result<void> Kernel::fleet_join(const std::string& hub_host, uint16_t hub_port, 
   return Ok();
 }
 
+void Kernel::add_direct_route(const std::string& member_prefix, const std::string& host, uint16_t port) {
+  for (auto& d : direct_routes_) if (d.member == member_prefix) { d.host = host; d.port = port; return; }
+  direct_routes_.push_back(DirectRoute{member_prefix, host, port});
+}
+
+Result<std::shared_ptr<RemoteNode>> Kernel::open_member(const Id128& kernel_id) {
+  using R = Result<std::shared_ptr<RemoteNode>>;
+  // The link is named for the member ("relay:<id>", its fleet name), not for the way it is carried: devices,
+  // selectors and the remote memory provider keep their names when a direct link is replaced by a hub circuit.
+  const std::string name = "relay:" + kernel_id.short_str();
+  std::string direct_err;
+  for (const auto& d : direct_routes_) {
+    if (kernel_id.str().compare(0, d.member.size(), d.member) != 0) continue;
+    auto c = hal::net_connect(d.host, d.port, 3000);
+    if (!c.ok()) { direct_err = c.error().message; break; }
+    auto n = std::make_shared<RemoteNode>(std::shared_ptr<hal::Connection>(std::move(*c)), name);
+    auto h = n->hello(cluster_key_, self_, *host_);
+    if (!h.ok()) { direct_err = h.error().message; break; }
+    if (n->kernel() != kernel_id) { n->close(); direct_err = "a different kernel (" + n->kernel().short_str() + ") answered there"; break; }
+    return n;
+  }
+  if (!direct_err.empty())
+    std::fprintf(stderr, "fleet: direct link to %s failed (%s); through the hub\n", kernel_id.short_str().c_str(), direct_err.c_str());
+  if (!relay_ || !relay_->attached())
+    return R(Status::Busy, "not attached to a fleet hub" + (direct_err.empty() ? std::string() : "; direct link: " + direct_err));
+  auto conn = relay_->open(kernel_id);
+  if (!conn.ok()) return conn.error();
+  auto n = std::make_shared<RemoteNode>(std::shared_ptr<hal::Connection>(std::move(*conn)), name);
+  // Same token-authenticated, end-to-end-encrypted handshake as a direct link — the hub only ever sees ciphertext.
+  auto h = n->hello(cluster_key_, self_, *host_);
+  if (!h.ok()) return h.error();
+  return n;
+}
+
+Result<Id128> Kernel::find_member(const std::string& prefix) {
+  auto starts = [&prefix](const Id128& id) { return !prefix.empty() && id.str().compare(0, prefix.size(), prefix) == 0; };
+  std::vector<Id128> hits;
+  for (auto& id : fleet_roster()) if (starts(id)) hits.push_back(id);
+  if (hits.empty())   // no hub (or it does not list it): a member already linked is still that member
+    for (auto& n : nodes_) if (starts(n->kernel()) && std::find(hits.begin(), hits.end(), n->kernel()) == hits.end()) hits.push_back(n->kernel());
+  if (hits.empty()) {   // never linked: its direct route says who it is
+    for (const auto& d : direct_routes_) {
+      if (d.member.compare(0, prefix.size(), prefix) != 0 && prefix.compare(0, d.member.size(), d.member) != 0) continue;
+      auto c = hal::net_connect(d.host, d.port, 3000);
+      if (!c.ok()) continue;
+      RemoteNode probe(std::shared_ptr<hal::Connection>(std::move(*c)), d.host);
+      if (probe.hello(cluster_key_, self_, *host_).ok() && starts(probe.kernel())) hits.push_back(probe.kernel());
+      probe.close();
+    }
+  }
+  if (hits.empty()) return Result<Id128>(Status::NotFound, "no fleet member " + prefix);
+  if (hits.size() > 1) return Result<Id128>(Status::Conflict, "more than one fleet member starts with " + prefix);
+  return hits[0];
+}
+
 Result<size_t> Kernel::reach(const Id128& kernel_id) {
   if (kernel_id == self_) return Result<size_t>(Status::Invalid, "that identity is this kernel");
   long stale = -1;
@@ -771,23 +826,10 @@ Result<size_t> Kernel::reach(const Id128& kernel_id) {
     if (nodes_[i]->alive()) return i;   // live link — reuse it
     stale = (long)i; break;             // dead link (hub restart / blip) — replace in place below
   }
-  if (!relay_ || !relay_->attached()) return Result<size_t>(Status::Busy, "not attached to a fleet hub");
-  auto conn = relay_->open(kernel_id);
-  if (!conn.ok()) return conn.error();
-  auto node = std::make_shared<RemoteNode>(std::shared_ptr<hal::Connection>(std::move(*conn)), "relay:" + kernel_id.short_str());
-  // Same token-authenticated, end-to-end-encrypted handshake as a direct link —
-  // the hub only ever saw ciphertext.
-  auto h = node->hello(cluster_key_, self_, *host_);
-  if (!h.ok()) return h.error();
-  node->set_opener([this, kernel_id]() -> Result<std::shared_ptr<RemoteNode>> {
-    if (!relay_ || !relay_->attached()) return Result<std::shared_ptr<RemoteNode>>(Status::Busy, "not attached to a fleet hub");
-    auto c2 = relay_->open(kernel_id);
-    if (!c2.ok()) return c2.error();
-    auto n2 = std::make_shared<RemoteNode>(std::shared_ptr<hal::Connection>(std::move(*c2)), "relay:" + kernel_id.short_str());
-    auto h2 = n2->hello(cluster_key_, self_, *host_);
-    if (!h2.ok()) return h2.error();
-    return n2;
-  });
+  auto opened = open_member(kernel_id);
+  if (!opened.ok()) return opened.error();
+  auto node = *opened;
+  node->set_opener([this, kernel_id]() { return open_member(kernel_id); });
   auto at = attach_remote_node(*this, node);
   if (!at.ok()) return at.error();
   if (stale >= 0) { nodes_[(size_t)stale] = node; return (size_t)stale; }   // swap the dead node out, keep index stable

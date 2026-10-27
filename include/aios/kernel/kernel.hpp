@@ -220,6 +220,13 @@ class Kernel : private CapabilityObserver {
   // Ensure a node link exists to a peer kernel, over a relay circuit, opening
   // and handshaking one if needed. Returns its index in nodes(). Idempotent.
   Result<size_t> reach(const Id128& kernel_id);
+  // A member reached straight at host:port (AIOS_FLEET_DIRECT; that member listens with AIOS_FLEET_LISTEN) rather
+  // than through the hub. Same cluster-key handshake and the same node link: work and memory cross the substrate
+  // member to member. The peer must prove it is that member; if the direct link cannot be made, the hub carries it.
+  void add_direct_route(const std::string& member_prefix, const std::string& host, uint16_t port);
+  // The member whose id starts with `prefix`: from the hub's roster, else a member already linked, else asked of
+  // its direct route. NotFound / Conflict (more than one) otherwise.
+  Result<Id128> find_member(const std::string& prefix);
   // Reach every roster peer not yet connected, so the scheduler sees the whole
   // fleet through nodes(). Best-effort: unreachable peers are skipped.
   void fleet_sync();
@@ -298,6 +305,10 @@ class Kernel : private CapabilityObserver {
   crypto::Point32 hub_key_{};
   std::shared_ptr<const LinkIdentity> link_identity_;   // what this kernel installed for its links
   hal::Thread relay_accept_;                 // hands relayed incoming circuits to the node service
+  struct DirectRoute { std::string member, host; uint16_t port = 0; };
+  std::vector<DirectRoute> direct_routes_;   // members reached straight, not through the hub
+  // A new node link to a member: its direct route first, then a hub circuit.
+  Result<std::shared_ptr<RemoteNode>> open_member(const Id128& kernel_id);
   std::atomic<bool> relay_accepting_{false};
   uint32_t slots_ = 0;                       // 0 => report logical_cpus
   mutable uint64_t heartbeat_ = 0;           // advances each telemetry() report
