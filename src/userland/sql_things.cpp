@@ -2010,22 +2010,51 @@ void ThingEngine::settle_all_locked() {
     if (kv.second.type == Kind::Grain) settle_kind(kv.second);
 }
 
+namespace {
+// Every kind's clock added up: it moves when any Thing changed, so waiters are woken only then.
+template <class M> uint64_t clocks_of(const M& kinds) {
+  uint64_t s = 0;
+  for (const auto& kv : kinds) s += kv.second.version;
+  return s;
+}
+}  // namespace
+
+void ThingEngine::wake_waiters() {
+  {
+    std::lock_guard<std::mutex> g(wait_mu_);
+    ++wait_epoch_;
+  }
+  wait_cv_.notify_all();
+}
+
 void ThingEngine::settle() {
-  std::lock_guard<aios::hal::Mutex> lk(mu_);
-  settle_all_locked();
+  bool moved = false;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    const uint64_t before = clocks_of(kinds_);
+    settle_all_locked();
+    moved = clocks_of(kinds_) != before;
+  }
+  if (moved) wake_waiters();
 }
 
 void ThingEngine::tick() {
-  std::lock_guard<aios::hal::Mutex> lk(mu_);
-  MuHeld held;
-  for (auto& kv : kinds_)
-    if (kv.second.type != Kind::Grain &&
-        (kv.second.time_dependent || kv.second.pending_full || !kv.second.pending.empty() || kv.second.pending_shared ||
-         !kv.second.pending_part_keys.empty() || !kv.second.pending_part_full.empty()))
-      settle_kind(kv.second);
-  settle_links();
-  for (auto& kv : kinds_)
-    if (kv.second.type == Kind::Grain) settle_kind(kv.second);
+  bool moved = false;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    MuHeld held;
+    const uint64_t before = clocks_of(kinds_);
+    for (auto& kv : kinds_)
+      if (kv.second.type != Kind::Grain &&
+          (kv.second.time_dependent || kv.second.pending_full || !kv.second.pending.empty() || kv.second.pending_shared ||
+           !kv.second.pending_part_keys.empty() || !kv.second.pending_part_full.empty()))
+        settle_kind(kv.second);
+    settle_links();
+    for (auto& kv : kinds_)
+      if (kv.second.type == Kind::Grain) settle_kind(kv.second);
+    moved = clocks_of(kinds_) != before;
+  }
+  if (moved) wake_waiters();
 }
 
 std::string ThingEngine::waiting_for(const Kind& k) const {
@@ -2087,7 +2116,7 @@ bool ThingEngine::handles(const std::string& sql) const {
   char a[8], b[8];
   if (!word(i, a, sizeof a) || !word(i, b, sizeof b)) return false;
   static const char* const verbs[] = {"CREATE", "DROP", "SHOW", "REPLAY", "CALL", "PAUSE", "RESUME",
-                                      "REFRESH", "FIRE", "RETRY", "SET", "RESOLVE", "CHECK"};
+                                      "REFRESH", "FIRE", "RETRY", "SET", "RESOLVE", "CHECK", "WAIT"};
   bool verb = false;
   for (const char* v : verbs) if (std::strcmp(a, v) == 0) { verb = true; break; }
   if (!verb) return false;
@@ -3023,6 +3052,14 @@ SqlQueryResult ThingEngine::replay(const std::string& name, const std::string& a
 // every member's answer (unreachable ones listed, not skipped). Every SHOW
 // row names the machine it came from.
 SqlQueryResult ThingEngine::execute(const std::string& sql) {
+  {
+    size_t i = 0;
+    while (i < sql.size() && std::isspace((unsigned char)sql[i])) ++i;
+    if (sql.size() - i >= 4 && upper(sql.substr(i, 4)) == "WAIT")
+      return error_result("WAIT THING waits outside a transaction (inside one it would hold the statement lock the "
+                          "change it waits for needs)");
+  }
+  struct Wake { ThingEngine* e; ~Wake() { e->wake_waiters(); } } wake{this};   // RESOLVE, REFRESH .. may change a Thing
   std::string body, target;
   if (!split_target(sql, &body, &target)) {
     SqlQueryResult r = execute_local(sql);
@@ -5150,6 +5187,7 @@ bool ThingEngine::put_ginst(Kind& k, const std::string& ck, Kind::GInst fresh, c
   gi.history.push_back(History{now, cause, before.empty() ? std::string("(not a Thing)") : before, after});
   if (gi.history.size() > kHistoryKeep) gi.history.erase(gi.history.begin());
   k.version++;
+  gi.stamp = k.version;
   dirty_ = true;
   return true;
 }
@@ -5206,7 +5244,68 @@ bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, cons
   return true;
 }
 
+bool ThingEngine::try_wait_unlocked(const std::string& sql, SqlQueryResult* out) {
+  Scan sc(sql);
+  const size_t p_w = sc.find_kw("WAIT"), p_th = sc.find_kw("THING"), p_si = sc.find_kw("SINCE"), p_to = sc.find_kw("TIMEOUT");
+  if (p_w != 0 || p_th == std::string::npos) return false;
+  if (p_si == std::string::npos || !(p_th < p_si) || (p_to != std::string::npos && p_to < p_si)) {
+    *out = error_result("WAIT THING <name> SINCE <clock> [TIMEOUT <seconds>]");
+    return true;
+  }
+  const std::string kind = lower(unquote_ident(trim(sql.substr(p_th + 5, p_si - p_th - 5))));
+  std::string since_s = trim(sql.substr(p_si + 5, (p_to == std::string::npos ? sql.size() : p_to) - p_si - 5));
+  if (!since_s.empty() && since_s.back() == ';') since_s.pop_back();
+  const uint64_t since = std::strtoull(since_s.c_str(), nullptr, 10);
+  double timeout_s = 30;
+  if (p_to != std::string::npos) timeout_s = std::strtod(sql.c_str() + p_to + 7, nullptr);
+  timeout_s = std::max(0.0, std::min(timeout_s, 3600.0));
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds((int64_t)(timeout_s * 1000));
+  for (;;) {
+    uint64_t epoch;
+    {
+      std::lock_guard<std::mutex> g(wait_mu_);
+      epoch = wait_epoch_;
+    }
+    {
+      // the clock and what moved, read under the engine's lock (taken for this look only)
+      std::lock_guard<aios::hal::Mutex> lk(mu_);
+      auto it = kinds_.find(kind);
+      if (it == kinds_.end()) { *out = error_result("no Thing kind named " + kind); return true; }
+      const Kind& k = it->second;
+      if (k.version != since) {
+        SqlQueryResult r;
+        r.is_result_set = true;
+        r.columns = {"clock", "changed", "whole"};
+        // A clock behind the one asked about is a new version of the kind (CREATE OR REPLACE): every Thing may differ.
+        const bool whole = k.version < since || since == 0 || k.type != Kind::Grain;
+        std::string keys = "[";
+        if (!whole) {
+          bool first = true;
+          for (const auto& g : k.gthings)
+            if (g.second.stamp > since) { keys += (first ? "" : ",") + thing_json_str(g.second.key); first = false; }
+        }
+        keys += "]";
+        r.rows.push_back(SqlRow{{std::to_string(k.version), keys, whole ? "1" : "0"}});
+        if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+        *out = r;
+        return true;
+      }
+    }
+    std::unique_lock<std::mutex> g(wait_mu_);
+    if (wait_epoch_ == epoch && !wait_cv_.wait_until(g, deadline, [&] { return wait_epoch_ != epoch; })) {
+      SqlQueryResult r;   // the time ran out with nothing changed: the same clock back
+      r.is_result_set = true;
+      r.columns = {"clock", "changed", "whole"};
+      r.rows.push_back(SqlRow{{std::to_string(since), "[]", "0"}});
+      if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+      *out = r;
+      return true;
+    }
+  }
+}
+
 bool ThingEngine::try_replace_unlocked(const std::string& sql, SqlQueryResult* out) {
+  struct Wake { ThingEngine* e; ~Wake() { e->wake_waiters(); } } wake{this};   // the new version takes the name
   Scan cs(sql);
   const size_t p_cr = cs.find_kw("CREATE"), p_or = cs.find_kw("OR REPLACE"), p_th = cs.find_kw("THING"), p_gr = cs.find_kw("GRAIN");
   if (p_cr != 0 || p_or == std::string::npos || p_th == std::string::npos || p_gr == std::string::npos || !(p_or < p_th && p_th < p_gr))

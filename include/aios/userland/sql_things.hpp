@@ -100,6 +100,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
@@ -157,6 +158,12 @@ class ThingEngine {
   // CALL THING (a grain Thing's report for inputs given with the call).
   bool handles(const std::string& sql) const;
   SqlQueryResult execute(const std::string& sql);
+
+  // WAIT THING <name> SINCE <clock> [TIMEOUT <seconds>]: returns as soon as the kind's clock differs from <clock>
+  // (at once if it already does), with the new clock and the keys whose Things changed since - or at the timeout,
+  // unchanged. The engine wakes waiters when it commits a change; nothing polls. Run with no statement lock held
+  // (SqlDatabase routes it here first): true when `sql` is a WAIT THING, its answer in *out.
+  bool try_wait_unlocked(const std::string& sql, SqlQueryResult* out);
 
   // Persistence under <db root>/things.
   void load();
@@ -302,6 +309,7 @@ class ThingEngine {
       std::string key;                                          // as the program printed it
       std::vector<std::pair<std::string, std::string>> vals;   // field -> text, in the program's order
       uint64_t version = 0, updated_ns = 0;
+      uint64_t stamp = 0;   // the kind's version when this Thing last changed (WAIT THING names it); 0 after a load
       std::vector<History> history;
     };
     std::map<std::string, GInst> gthings;       // by collation key ('ABC' and 'abc' are one item)
@@ -517,6 +525,12 @@ class ThingEngine {
 
   SqlDatabase& db_;
   mutable aios::hal::Mutex mu_;
+  // WAIT THING: waiters sleep on wait_cv_ until wait_epoch_ moves; wake_waiters() moves it whenever the engine has
+  // committed changes (the end of a settle, a statement, a replacement taking its name).
+  std::mutex wait_mu_;
+  std::condition_variable wait_cv_;
+  uint64_t wait_epoch_ = 0;
+  void wake_waiters();
   std::map<std::string, Kind> kinds_;
   std::unordered_set<std::string> watched_;   // "db.table" of every kind's links
   std::set<std::string> firing_now_;           // events firing in this process (never two firings of one)
