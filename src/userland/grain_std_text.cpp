@@ -13,6 +13,7 @@
 //                                  have it, in the order they came
 //   uuid()                         a random (version 4) UUID
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -196,6 +197,17 @@ bool compare_keys(const Value& a, const Value& b, int& r, std::string& error) {
   }
   if (a.type == Type::Str && b.type == Type::Str) { const int c = a.str().compare(b.str()); r = c < 0 ? -1 : c > 0 ? 1 : 0; return true; }
   if (a.type == Type::Bool && b.type == Type::Bool) { r = (a.b == b.b) ? 0 : a.b ? 1 : -1; return true; }
+  // a list key orders by its first item, then its second on a tie, ...: sort_by(xs, fn(u) { return [-u.n, u.name] })
+  if (a.type == Type::List && b.type == Type::List) {
+    const auto& x = a.list_items();
+    const auto& y = b.list_items();
+    for (size_t k = 0; k < x.size() && k < y.size(); ++k) {
+      if (!compare_keys(x[k], y[k], r, error)) return false;
+      if (r != 0) return true;
+    }
+    r = x.size() < y.size() ? -1 : x.size() > y.size() ? 1 : 0;
+    return true;
+  }
   error = std::string("sort_by(): cannot order a ") + type_name(a.type) + " against a " + type_name(b.type);
   return false;
 }
@@ -694,6 +706,205 @@ Value bi_xml_unescape(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::string(unescape_xml(args[0].str()));
 }
 
+// ---- markup: html_escape, el, html_raw, html_stringify, xml_stringify ---------------------------------------
+//
+// A page or a document is built as nodes and written out once, escaped in one place, instead of strings glued
+// together with escaping remembered at every value:
+//
+//   el("td", {"class": "who", "data-v": lower(name)}, el("b", name), el("small", u.userid))
+//   html_stringify(node)   -> <td class="who" data-v="ann"><b>Ann &amp; co</b><small>ann</small></td>
+//
+// A node is a string or number (text, escaped), nil or false (nothing), a list (each in turn), html_raw(markup)
+// (markup already written, as is), or an element map {tag, attrs, children} - what el() makes, and what
+// xml_parse() hands back (its `text`, when there is one, comes before the children). An attribute that is nil or
+// false is left out, true is written bare (HTML) or ="true" (XML), a list is its items joined by spaces
+// (class lists). HTML knows its empty elements (<br>, <input>, <meta> ...) and leaves <script> and <style>
+// unescaped; XML writes an element with no content as <name/>.
+
+std::string escape_html(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  for (char c : in) {
+    switch (c) {
+      case '&': out.append("&amp;"); break;
+      case '<': out.append("&lt;"); break;
+      case '>': out.append("&gt;"); break;
+      case '"': out.append("&quot;"); break;
+      case '\'': out.append("&#39;"); break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+bool markup_name_ok(const std::string& n) {
+  if (n.empty()) return false;
+  const unsigned char c0 = static_cast<unsigned char>(n[0]);
+  if (!(std::isalpha(c0) || c0 == '_')) return false;
+  for (unsigned char c : n)
+    if (!(std::isalnum(c) || c == '-' || c == '_' || c == ':' || c == '.')) return false;
+  return true;
+}
+
+bool html_void(const std::string& t) {
+  static const char* const kVoid[] = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                                      "source", "track", "wbr"};
+  for (const char* v : kVoid)
+    if (t == v) return true;
+  return false;
+}
+
+struct MarkupWriter {
+  bool html;
+  std::string out;
+  std::string error;
+
+  std::string esc(const std::string& s) const { return html ? escape_html(s) : escape_xml(s); }
+
+  bool attr_text(const Value& v, std::string& text) {
+    if (v.type == Type::Str) { text = v.str(); return true; }
+    if (v.is_number() || v.type == Type::Decimal) { text = v.to_text(); return true; }
+    if (v.type == Type::List) {
+      text.clear();
+      for (const Value& item : v.list_items()) {
+        if (item.type == Type::Nil || (item.type == Type::Bool && !item.b)) continue;
+        std::string one;
+        if (item.type == Type::List || !attr_text(item, one)) {
+          error = "an attribute list holds strings and numbers, not a " + std::string(type_name(item.type));
+          return false;
+        }
+        if (one.empty()) continue;
+        if (!text.empty()) text.push_back(' ');
+        text += one;
+      }
+      return true;
+    }
+    error = std::string("an attribute is a string, number, list, true, false or nil, not a ") + type_name(v.type);
+    return false;
+  }
+
+  bool write(const Value& v, int depth, bool raw_text) {
+    if (depth > 512) { error = "nested more than 512 deep (a node that holds itself?)"; return false; }
+    switch (v.type) {
+      case Type::Nil: return true;
+      case Type::Bool:
+        if (!v.b) return true;
+        error = "true is not a node (a condition that wanted ? node : nil?)";
+        return false;
+      case Type::Str: out += raw_text ? v.str() : esc(v.str()); return true;
+      case Type::Int: case Type::Real: case Type::Decimal: out += v.to_text(); return true;
+      case Type::List:
+        for (const Value& c : v.list_items())
+          if (!write(c, depth + 1, raw_text)) return false;
+        return true;
+      case Type::Map: break;
+      default:
+        error = std::string("a ") + type_name(v.type) + " is not a node";
+        return false;
+    }
+    MapObj* m = static_cast<MapObj*>(v.obj.get());
+    if (Value* r = m->find("raw"); r && !m->find("tag")) {
+      if (r->type != Type::Str) { error = "html_raw() holds a string"; return false; }
+      out += r->str();
+      return true;
+    }
+    Value* tag = m->find("tag");
+    if (!tag || tag->type != Type::Str) { error = "a map node is an element {tag, attrs, children} or html_raw(markup)"; return false; }
+    const std::string& name = tag->str();
+    if (!markup_name_ok(name)) { error = "\"" + name + "\" is not an element name"; return false; }
+    out += '<';
+    out += name;
+    if (Value* a = m->find("attrs"); a && a->type != Type::Nil) {
+      if (a->type != Type::Map) { error = "<" + name + ">'s attrs is a map"; return false; }
+      for (auto& [k, val] : static_cast<MapObj*>(a->obj.get())->entries) {
+        if (!markup_name_ok(k)) { error = "\"" + k + "\" is not an attribute name"; return false; }
+        if (val.type == Type::Nil || (val.type == Type::Bool && !val.b)) continue;
+        out += ' ';
+        out += k;
+        if (val.type == Type::Bool) {
+          if (!html) out += "=\"true\"";
+          continue;
+        }
+        std::string text;
+        if (!attr_text(val, text)) { error = "<" + name + " " + k + ">: " + error; return false; }
+        out += "=\"" + esc(text) + "\"";
+      }
+    }
+    Value* text = m->find("text");
+    Value* kids = m->find("children");
+    const bool has_text = text && text->type == Type::Str && !text->str().empty();
+    const bool has_kids = kids && kids->type != Type::Nil && !(kids->type == Type::List && kids->list_items().empty());
+    if (html && html_void(name)) {
+      if (has_text || has_kids) { error = "<" + name + "> holds nothing"; return false; }
+      out += '>';
+      return true;
+    }
+    if (!html && !has_text && !has_kids) { out += "/>"; return true; }
+    out += '>';
+    const bool raw_inside = html && (name == "script" || name == "style");
+    const size_t body = out.size();
+    if (has_text) out += raw_inside ? text->str() : esc(text->str());
+    if (has_kids && !write(*kids, depth + 1, raw_inside)) return false;
+    if (raw_inside) {
+      // the one thing that ends a script early: written as <\/script, which the script reads the same
+      const std::string close = "</" + name;
+      for (size_t at = out.find(close, body); at != std::string::npos; at = out.find(close, at + 2)) out.insert(at + 1, "\\");
+    }
+    out += "</" + name + ">";
+    return true;
+  }
+};
+
+Value markup_stringify(std::vector<Value>& args, std::string& error, bool html) {
+  MarkupWriter w{html, {}, {}};
+  if (!w.write(args[0], 0, false)) {
+    error = std::string(html ? "html_stringify" : "xml_stringify") + "(): " + w.error;
+    return Value::nil();
+  }
+  return Value::string(std::move(w.out));
+}
+
+Value bi_html_stringify(Vm&, std::vector<Value>& args, std::string& error) { return markup_stringify(args, error, true); }
+Value bi_xml_stringify(Vm&, std::vector<Value>& args, std::string& error) { return markup_stringify(args, error, false); }
+
+// html_escape(v): v as text, safe inside an element or a quoted attribute; nil is "".
+Value bi_html_escape(Vm&, std::vector<Value>& args, std::string&) {
+  if (args[0].type == Type::Nil) return Value::string("");
+  return Value::string(escape_html(args[0].type == Type::Str ? args[0].str() : args[0].to_text()));
+}
+
+// html_raw(markup): markup already written, put in a node tree as it is.
+Value bi_html_raw(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "html_raw")) return Value::nil();
+  auto m = std::make_shared<MapObj>();
+  m->put("raw", args[0]);
+  return Value::object(Type::Map, m);
+}
+
+// el(tag, [attrs], children...): an element node. The second argument is the attrs when it is nil or a map that
+// is not itself a node (no tag, no raw); otherwise it is the first child.
+Value bi_el(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "el")) return Value::nil();
+  if (!markup_name_ok(args[0].str())) { error = "el(): \"" + args[0].str() + "\" is not an element name"; return Value::nil(); }
+  size_t first_child = 1;
+  Value attrs = Value::nil();
+  if (args.size() > 1) {
+    const Value& a = args[1];
+    if (a.type == Type::Nil) {
+      first_child = 2;
+    } else if (a.type == Type::Map) {
+      MapObj* am = static_cast<MapObj*>(a.obj.get());
+      if (!am->find("tag") && !am->find("raw")) { attrs = a; first_child = 2; }
+    }
+  }
+  std::vector<Value> kids(args.begin() + static_cast<std::ptrdiff_t>(std::min(first_child, args.size())), args.end());
+  auto m = std::make_shared<MapObj>();
+  m->put("tag", args[0]);
+  m->put("attrs", attrs.type == Type::Nil ? Value::object(Type::Map, std::make_shared<MapObj>()) : attrs);
+  m->put("children", Value::list(std::move(kids)));
+  return Value::object(Type::Map, m);
+}
+
 }  // namespace
 
 void install_text_builtins(Vm& vm) {
@@ -706,6 +917,11 @@ void install_text_builtins(Vm& vm) {
   vm.define_native("xml_parse", 1, 1, bi_xml_parse);
   vm.define_native("xml_escape", 1, 1, bi_xml_escape);
   vm.define_native("xml_unescape", 1, 1, bi_xml_unescape);
+  vm.define_native("xml_stringify", 1, 1, bi_xml_stringify);
+  vm.define_native("html_stringify", 1, 1, bi_html_stringify);
+  vm.define_native("html_escape", 1, 1, bi_html_escape);
+  vm.define_native("html_raw", 1, 1, bi_html_raw);
+  vm.define_native("el", 1, -1, bi_el);
 }
 
 }  // namespace aios::userland::grain

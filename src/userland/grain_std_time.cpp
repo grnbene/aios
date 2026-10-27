@@ -8,9 +8,11 @@
 //   date_parts(t [, zone])                  -> {year, month, day, hour, minute, second,
 //                                               millisecond, weekday, yearday, offset}
 //   date_format(t, format [, zone])         -> text; %Y %m %d %H %M %S %L %y %j %a %A
-//                                               %b %B %p %I %e %F %T %z %s %%
+//                                               %b %B %p %P %I %e %F %T %z %s %%;
+//                                               %-d %-m %-H %-I %-M %-S %-j unpadded
 //   date_parse(text [, zone])               -> seconds; ISO 8601 date or date-time
 //   date_make(y, mo, d [, h, mi, s] [, zone]) -> seconds
+//   date_range(first_day, last_day)         -> ["YYYY-MM-DD", ...], both ends included
 //
 // zone is "utc" or "local" (the machine's own zone); date_parts, date_format
 // and date_make default to local, date_parse to UTC unless the text carries
@@ -171,8 +173,31 @@ Value bi_date_format(Vm&, std::vector<Value>& args, std::string& error) {
   std::string out;
   for (size_t i = 0; i < f.size(); ++i) {
     if (f[i] != '%' || i + 1 >= f.size()) { out.push_back(f[i]); continue; }
-    const char c = f[++i];
+    char c = f[++i];
+    // %-d, %-m, %-H, %-I, %-M, %-S, %-j: the number without its leading zeros ("Oct 7, 9:05am")
+    if (c == '-') {
+      const char n = i + 1 < f.size() ? f[i + 1] : '\0';
+      int64_t v = -1;
+      switch (n) {
+        case 'd': case 'e': v = p.day; break;
+        case 'm': v = p.month; break;
+        case 'H': v = p.hour; break;
+        case 'I': v = p.hour % 12 == 0 ? 12 : p.hour % 12; break;
+        case 'M': v = p.minute; break;
+        case 'S': v = p.second; break;
+        case 'j': v = p.yearday; break;
+        default: break;
+      }
+      if (v < 0) {
+        error = std::string("date_format(): %-") + (n ? std::string(1, n) : std::string()) + " has no unpadded form (d e m H I M S j)";
+        return Value::nil();
+      }
+      out += std::to_string(v);
+      ++i;
+      continue;
+    }
     switch (c) {
+      case 'P': out += p.hour < 12 ? "am" : "pm"; break;
       case 'Y': out += pad(p.year, 4); break;
       case 'y': out += pad(((p.year % 100) + 100) % 100, 2); break;
       case 'm': out += pad(p.month, 2); break;
@@ -295,6 +320,42 @@ Value bi_date_make(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), sec, local));
 }
 
+// date_range("2026-10-01", "2026-10-31") -> every day from the first to the last, both included, as YYYY-MM-DD;
+// [] when the first is after the last. Calendar days, so no zone and no daylight-saving hour to fall into.
+Value bi_date_range(Vm&, std::vector<Value>& args, std::string& error) {
+  int64_t day[2];
+  for (int k = 0; k < 2; ++k) {
+    if (!want_str(args[k], error, "date_range")) return Value::nil();
+    const std::string& s = args[k].str();
+    auto num = [&](size_t at, size_t n, int64_t& v) {
+      v = 0;
+      for (size_t j = at; j < at + n; ++j) {
+        if (s[j] < '0' || s[j] > '9') return false;
+        v = v * 10 + (s[j] - '0');
+      }
+      return true;
+    };
+    int64_t y = 0, mo = 0, d = 0;
+    static const int kLen[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (s.size() != 10 || s[4] != '-' || s[7] != '-' || !num(0, 4, y) || !num(5, 2, mo) || !num(8, 2, d) || mo < 1 || mo > 12 ||
+        d < 1 || d > kLen[mo - 1] + (mo == 2 && leap(y) ? 1 : 0)) {
+      error = "date_range(): \"" + s + "\" is not a day (YYYY-MM-DD)";
+      return Value::nil();
+    }
+    day[k] = days_from_civil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d));
+  }
+  constexpr int64_t kMaxDays = 100000;   // ~274 years: past that it is a mistake, not a range
+  if (day[1] - day[0] + 1 > kMaxDays) { error = "date_range(): more than 100000 days"; return Value::nil(); }
+  auto list = std::make_shared<ListObj>(std::vector<Value>{});
+  for (int64_t z = day[0]; z <= day[1]; ++z) {
+    int64_t y = 0;
+    unsigned m = 0, d = 0;
+    civil_from_days(z, y, m, d);
+    list->items.push_back(Value::string(pad(y, 4) + "-" + pad(m, 2) + "-" + pad(d, 2)));
+  }
+  return Value::object(Type::List, list);
+}
+
 }  // namespace
 
 // ---- timers: data that changes on its own -------------------------------------------------
@@ -390,6 +451,7 @@ void install_time_builtins(Vm& vm) {
   vm.define_native("date_format", 2, 3, bi_date_format);
   vm.define_native("date_parse", 1, 2, bi_date_parse);
   vm.define_native("date_make", 3, 7, bi_date_make);
+  vm.define_native("date_range", 2, 3, bi_date_range);
 }
 
 }  // namespace aios::userland::grain

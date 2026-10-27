@@ -289,6 +289,44 @@ int main() {
     std::cout << "  -> A grain Thing added decimals exactly, kept the wire's text, and a write moved only its own key.\n";
   }
 
+  std::cout << "[Step 8b] A grain Thing may use is_blank, get_or_put, add_keys, first_present, date_range, string max/min and markup...\n";
+  {
+    assert(db.execute_gateway_query("CREATE TABLE gt_touch (id INT PRIMARY KEY, grp VARCHAR(8), uid VARCHAR(20), at VARCHAR(19))").success);
+    assert(db.execute_gateway_query("INSERT INTO gt_touch VALUES (1,'x','Ann','2026-10-01 08:00'),(2,'x','ann','2026-10-03 09:00'),"
+                                    "(3,'x','','2026-10-02 10:00'),(4,'x',NULL,'2026-09-30 07:00'),(5,'y','Bob','2026-10-05 12:00')").success);
+    const std::string create =
+        "CREATE THING gp GRAIN KEY grp READS gt_touch AS '"
+        "let DAY_SAFE = true\n"
+        "fn enroll() { return unique(map(read_raw_with(\"SELECT grp FROM gt_touch\", nil), fn(r) { return r.grp })) }\n"
+        "fn shared() { return 1 }\n"
+        "fn things(ks, sh) { let acc = {} "
+        "for r in read_raw(\"SELECT grp, uid, at FROM gt_touch WHERE grp IN (?)\", ks) { "
+        "let g = get_or_put(acc, r.grp, {\"seen\": {}, \"first\": nil, \"last\": nil, \"who\": nil}) "
+        "if not is_blank(r.uid) { add_keys(g.seen, [lower(r.uid)]) } "
+        "g.first = min(g.first, r.at) g.last = max(g.last, r.at, nil) g.who = first_present(g.who, r.uid) } "
+        "let out = {} for k in keys(acc) { let g = acc[k] "
+        "out[k] = {\"people\": str(len(g.seen)), \"first\": g.first, \"last\": g.last, \"who\": g.who, "
+        "\"days\": str(len(date_range(slice(g.first, 0, 10), slice(g.last, 0, 10)))), "
+        "\"tag\": html_stringify(el(\"b\", {\"class\": [\"k\", nil]}, g.who + \" <\" + g.last + \">\"))} } return out }\n"
+        "'";
+    auto made = db.execute_gateway_query(create);
+    if (!made.success) std::cerr << made.error_message << "\n";
+    assert(made.success);
+    auto show = db.execute_gateway_query("SHOW THING gp");
+    assert(show.success && show.rows.size() == 2);
+    auto col = [&](const SqlQueryResult& r, const char* name) { for (size_t i = 0; i < r.columns.size(); ++i) if (r.columns[i] == name) return i; return (size_t)-1; };
+    std::map<std::string, std::vector<std::string>> by_key;
+    for (const auto& row : show.rows) by_key[row.values[col(show, "grp")]] = row.values;
+    assert(by_key["x"][col(show, "people")] == "1");                    // Ann and ann are one; '' and NULL are no one
+    assert(by_key["x"][col(show, "first")] == "2026-09-30 07:00");      // min over strings
+    assert(by_key["x"][col(show, "last")] == "2026-10-03 09:00");       // max over strings, nil passed over
+    assert(by_key["x"][col(show, "days")] == "4");                      // date_range 09-30 .. 10-03
+    assert(by_key["x"][col(show, "tag")] == "<b class=\"k\">Ann &lt;2026-10-03 09:00&gt;</b>");
+    assert(by_key["y"][col(show, "people")] == "1" && by_key["y"][col(show, "days")] == "1" && by_key["y"][col(show, "who")] == "Bob");
+    assert(db.execute_gateway_query("DROP THING gp").success);
+    std::cout << "  -> The Thing used the new builtins and its rows are what they compute.\n";
+  }
+
   std::cout << "[Step 9] DELETE ... MATCHING removes one row per image, NULLs and text as = compares them...\n";
   {
     assert(db.execute_gateway_query("CREATE TABLE km_log (at DATETIME, who VARCHAR(20), what TEXT)").success);

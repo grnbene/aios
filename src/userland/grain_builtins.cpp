@@ -695,37 +695,45 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, mod_map);
 }
 
-Value bi_min(Vm&, std::vector<Value>& args, std::string& error) {
+// min/max of numbers, or of strings (by bytes, as < compares them: "2026-10-27 08:05" before "2026-10-27 14:30"),
+// given as arguments or as one list. nil is no value and is passed over (all nil: nil), so a running latest starts
+// as nil: last = max(last, t). Numbers and strings together are an error: there is no order between them.
+static Value extreme(std::vector<Value>& args, std::string& error, const char* who, int want) {
+  const std::vector<Value>& vals = args.size() == 1 && args[0].type == Type::List ? args[0].list_items() : args;
   const Value* best = nullptr;
-  auto consider = [&](const Value& v) {
-    if (!best) { best = &v; return; }
-    const bool exact = (v.type == Type::Decimal || best->type == Type::Decimal) && is_exact_number(v) && is_exact_number(*best);
-    if (exact ? decimal_compare(v, *best) < 0 : v.as_double() < best->as_double()) best = &v;
-  };
-  if (args.size() == 1 && args[0].type == Type::List) {
-    for (const Value& v : args[0].list_items()) { if (!want_numeric(v, error, "min")) return Value::nil(); consider(v); }
-  } else {
-    for (const Value& v : args) { if (!want_numeric(v, error, "min")) return Value::nil(); consider(v); }
+  bool strings = false;
+  bool saw_nil = false;
+  for (const Value& v : vals) {
+    if (v.type == Type::Nil) { saw_nil = true; continue; }   // no value: max(seen, nil) is seen
+    const bool s = v.type == Type::Str;
+    if (!s && !v.is_number() && v.type != Type::Decimal) {
+      error = std::string(who) + "() compares numbers or strings, got a " + type_name(v.type);
+      return Value::nil();
+    }
+    if (!best) { best = &v; strings = s; continue; }
+    if (s != strings) { error = std::string(who) + "() of numbers and strings together"; return Value::nil(); }
+    int c;
+    if (s) {
+      const int r = v.str().compare(best->str());
+      c = r < 0 ? -1 : r > 0 ? 1 : 0;
+    } else if ((v.type == Type::Decimal || best->type == Type::Decimal) && is_exact_number(v) && is_exact_number(*best)) {
+      c = decimal_compare(v, *best);
+    } else {
+      c = v.as_double() < best->as_double() ? -1 : v.as_double() > best->as_double() ? 1 : 0;
+    }
+    if (c == want) best = &v;
   }
-  if (!best) { error = "min() of nothing"; return Value::nil(); }
+  if (!best) {
+    if (saw_nil) return Value::nil();
+    error = std::string(who) + "() of nothing";
+    return Value::nil();
+  }
   return *best;
 }
 
-Value bi_max(Vm&, std::vector<Value>& args, std::string& error) {
-  const Value* best = nullptr;
-  auto consider = [&](const Value& v) {
-    if (!best) { best = &v; return; }
-    const bool exact = (v.type == Type::Decimal || best->type == Type::Decimal) && is_exact_number(v) && is_exact_number(*best);
-    if (exact ? decimal_compare(v, *best) > 0 : v.as_double() > best->as_double()) best = &v;
-  };
-  if (args.size() == 1 && args[0].type == Type::List) {
-    for (const Value& v : args[0].list_items()) { if (!want_numeric(v, error, "max")) return Value::nil(); consider(v); }
-  } else {
-    for (const Value& v : args) { if (!want_numeric(v, error, "max")) return Value::nil(); consider(v); }
-  }
-  if (!best) { error = "max() of nothing"; return Value::nil(); }
-  return *best;
-}
+Value bi_min(Vm&, std::vector<Value>& args, std::string& error) { return extreme(args, error, "min", -1); }
+
+Value bi_max(Vm&, std::vector<Value>& args, std::string& error) { return extreme(args, error, "max", 1); }
 
 Value bi_floor(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_numeric(args[0], error, "floor")) return Value::nil();
@@ -783,6 +791,47 @@ Value bi_trim(Vm&, std::vector<Value>& args, std::string& error) {
   size_t end = s.find_last_not_of(chars);
   if (start == 0 && end + 1 == s.size()) return args[0];
   return Value::string(s.substr(start, end - start + 1));
+}
+
+// is_blank(v): true for nil and for a string of nothing but spaces, tabs and line breaks - a column left empty,
+// whether it came back NULL or ''. Anything else (0, false, an empty list) is a value, so false.
+Value bi_is_blank(Vm&, std::vector<Value>& args, std::string&) {
+  const Value& v = args[0];
+  if (v.type == Type::Nil) return Value::boolean(true);
+  if (v.type != Type::Str) return Value::boolean(false);
+  return Value::boolean(v.str().find_first_not_of(" \t\r\n") == std::string::npos);
+}
+
+// first_present(a, b, ...): the first argument that is not blank (is_blank: nil or only whitespace) - a name that may
+// have come back NULL or '' falls through to the next; nil when every one is blank.
+Value bi_first_present(Vm& vm, std::vector<Value>& args, std::string& error) {
+  for (const Value& v : args) {
+    std::vector<Value> one{v};
+    if (!bi_is_blank(vm, one, error).b) return v;
+  }
+  return Value::nil();
+}
+
+// get_or_put(map, key, value): map[key] when it is there; otherwise value, put at key first. The record a key
+// stands for, made the first time the key is seen. value is worked out before the call either way.
+Value bi_get_or_put(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Map) { error = std::string("get_or_put() wants a map, got a ") + type_name(args[0].type); return Value::nil(); }
+  MapObj* m = static_cast<MapObj*>(args[0].obj.get());
+  const std::string k = args[1].type == Type::Str ? args[1].str() : args[1].to_text();
+  if (Value* have = m->find(k); have && have->type != Type::Nil) return *have;
+  m->put(k, args[2]);
+  return args[2];
+}
+
+// add_keys(map, list, [value]): map[item] = value (true) for every item of list - a map used as a set, len(map)
+// its size. Returns the map.
+Value bi_add_keys(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Map) { error = std::string("add_keys() wants a map, got a ") + type_name(args[0].type); return Value::nil(); }
+  if (args[1].type != Type::List) { error = std::string("add_keys() wants a list of keys, got a ") + type_name(args[1].type); return Value::nil(); }
+  MapObj* m = static_cast<MapObj*>(args[0].obj.get());
+  const Value val = args.size() > 2 ? args[2] : Value::boolean(true);
+  for (const Value& k : args[1].list_items()) m->put(k.type == Type::Str ? k.str() : k.to_text(), val);
+  return args[0];
 }
 
 Value bi_ltrim(Vm&, std::vector<Value>& args, std::string& error) {
@@ -1822,6 +1871,74 @@ Value bi_res_html(Vm&, std::vector<Value>& args, std::string&) {
   if (args.size() > 2 && args[2].type == Type::Map) {
     m->put("headers", args[2]);
   }
+  return Value::object(Type::Map, m);
+}
+
+// res_download(body, filename, [headers]): a file to save - Content-Disposition: attachment with the name (quotes,
+// backslashes and control characters made safe; a name outside ASCII also as filename*=UTF-8''...), the type from
+// the name's extension, and no caching. headers, when given, are added last and win.
+Value bi_res_download(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Str && args[0].type != Type::Bytes) {
+    error = std::string("res_download() wants the body as a string or bytes, got a ") + type_name(args[0].type);
+    return Value::nil();
+  }
+  if (!want_str(args[1], error, "res_download")) return Value::nil();
+  if (args.size() > 2 && args[2].type != Type::Map && args[2].type != Type::Nil) {
+    error = "res_download(): headers is a map";
+    return Value::nil();
+  }
+  const std::string& name = args[1].str();
+  std::string plain;
+  bool ascii = true;
+  for (unsigned char c : name) {
+    if (c < 0x20 || c == 0x7f) continue;
+    if (c >= 0x80) { ascii = false; plain.push_back('_'); continue; }
+    plain.push_back(c == '"' || c == '\\' ? '_' : static_cast<char>(c));
+  }
+  if (plain.empty()) plain = "download";
+  std::string disposition = "attachment; filename=\"" + plain + "\"";
+  if (!ascii) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string enc;
+    for (unsigned char c : name) {
+      if (std::isalnum(c) || c == '.' || c == '-' || c == '_') enc.push_back(static_cast<char>(c));
+      else if (c >= 0x20 && c != 0x7f) { enc.push_back('%'); enc.push_back(hex[c >> 4]); enc.push_back(hex[c & 15]); }
+    }
+    disposition += "; filename*=UTF-8''" + enc;
+  }
+  std::string ext;
+  if (const size_t dot = name.rfind('.'); dot != std::string::npos) {
+    for (char c : name.substr(dot + 1)) ext.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  static const std::pair<const char*, const char*> kTypes[] = {
+      {"pdf", "application/pdf"},
+      {"xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+      {"docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+      {"csv", "text/csv; charset=utf-8"},
+      {"json", "application/json; charset=utf-8"},
+      {"txt", "text/plain; charset=utf-8"},
+      {"html", "text/html; charset=utf-8"},
+      {"xml", "application/xml; charset=utf-8"},
+      {"zip", "application/zip"},
+      {"gz", "application/gzip"},
+      {"png", "image/png"},
+      {"jpg", "image/jpeg"},
+      {"jpeg", "image/jpeg"},
+      {"svg", "image/svg+xml"},
+  };
+  std::string type = "application/octet-stream";
+  for (const auto& [e, t] : kTypes)
+    if (ext == e) { type = t; break; }
+  auto headers = std::make_shared<MapObj>();
+  headers->put("Content-Disposition", Value::string(disposition));
+  headers->put("Cache-Control", Value::string("no-cache, no-store, must-revalidate"));
+  if (args.size() > 2 && args[2].type == Type::Map)
+    for (const auto& [k, v] : static_cast<MapObj*>(args[2].obj.get())->entries) headers->put(k, v);
+  auto m = std::make_shared<MapObj>();
+  m->put("status", Value::integer(200));
+  m->put("content_type", Value::string(type));
+  m->put("headers", Value::object(Type::Map, headers));
+  m->put("body", args[0]);
   return Value::object(Type::Map, m);
 }
 
@@ -6616,6 +6733,38 @@ Value bi_read_bytes(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::bytes(std::vector<uint8_t>(out.begin(), out.end()));
 }
 
+// env(name, [default]): an app setting or environment variable, or default (nil) when it is unset or empty -
+// getenv() hands back "" for a variable set to nothing, which a port or a host never means.
+Value bi_env(Vm& vm, std::vector<Value>& args, std::string& error) {
+  std::vector<Value> one{args[0]};
+  Value v = bi_getenv(vm, one, error);
+  if (!error.empty()) return Value::nil();
+  if (v.type == Type::Str && !v.str().empty()) return v;
+  return args.size() > 1 ? args[1] : Value::nil();
+}
+
+// secret(name, [default]): env(name), or else the contents of the file NAME_FILE names, trimmed (a password kept in
+// a file of its own, mode 600, rather than in the environment). Neither: default, or "".
+Value bi_secret(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "secret")) return Value::nil();
+  std::vector<Value> one{args[0]};
+  Value v = bi_env(vm, one, error);
+  if (!error.empty()) return Value::nil();
+  if (v.type == Type::Str) return v;
+  std::vector<Value> file_arg{Value::string(args[0].str() + "_FILE")};
+  Value path = bi_env(vm, file_arg, error);
+  if (!error.empty()) return Value::nil();
+  if (path.type != Type::Str) return args.size() > 1 ? args[1] : Value::string("");
+  Files* f = files_of(vm, error, "secret");
+  if (!f) return Value::nil();
+  std::string out, why;
+  if (!f->read(path.str(), out, why)) { error = file_error("secret", path.str(), why); return Value::nil(); }
+  const size_t a = out.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return args.size() > 1 ? args[1] : Value::string("");
+  const size_t b = out.find_last_not_of(" \t\r\n");
+  return Value::string(out.substr(a, b - a + 1));
+}
+
 // write_bytes(path, bytes) -> how many were written
 Value bi_write_bytes(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "write_bytes")) return Value::nil();
@@ -6897,6 +7046,10 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("ord", 1, 1, bi_ord);
   vm.define_native("chr", 1, 1, bi_chr);
   vm.define_native("trim", 1, 2, bi_trim);
+  vm.define_native("is_blank", 1, 1, bi_is_blank);
+  vm.define_native("first_present", 1, -1, bi_first_present);
+  vm.define_native("get_or_put", 3, 3, bi_get_or_put);
+  vm.define_native("add_keys", 2, 3, bi_add_keys);
   vm.define_native("ltrim", 1, 2, bi_ltrim);
   vm.define_native("rtrim", 1, 2, bi_rtrim);
   vm.define_native("upper_rtrim", 1, 1, bi_upper_rtrim);
@@ -6953,6 +7106,8 @@ void install_core_builtins(Vm& vm) {
 
   // System & Environment
   vm.define_native("getenv", 1, 2, bi_getenv);
+  vm.define_native("env", 1, 2, bi_env);
+  vm.define_native("secret", 1, 2, bi_secret);
   vm.define_native("setenv", 2, 2, bi_setenv);
   vm.define_native("time", 0, 0, bi_time);
   vm.define_native("time_ms", 0, 0, bi_time_ms);
@@ -6985,6 +7140,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("res_json", 1, 3, bi_res_json);
   vm.define_native("res_text", 1, 3, bi_res_text);
   vm.define_native("res_html", 1, 3, bi_res_html);
+  vm.define_native("res_download", 2, 3, bi_res_download);
   vm.define_native("res_error", 1, 2, bi_res_error);
   vm.define_native("res_redirect", 1, 2, bi_res_redirect);
   vm.define_native("res_sse", 1, 3, bi_res_sse);
