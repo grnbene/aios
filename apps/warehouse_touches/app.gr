@@ -1,0 +1,22 @@
+// Warehouse Touches application manifest.
+// Provides /quickreport (JSON), /quickreportview (HTML), /quickreportpdf (PDF), /quickreportxlsx (XLSX).
+// Reads warehouse scan activity from ASQL / MariaDB replica.
+let app = {
+  "name": "warehouse_touches",
+  "description": "warehouse touches reporting: quickreport, PDF and XLSX export",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8573,
+  "listen": "local",
+  "settings": {
+    "DB_HOST": "127.0.0.1",
+    "DB_PORT": "3307",
+    "DB_USER": "root",
+    "DB_NAME": "versioneight"
+  },
+  "secrets": ["DB_PASSWORD"],
+  "requires": ["db"],
+  "health": {"path": "/health", "ok": [200]},
+  "check": "checks.gr",
+  "max_steps": 0
+}

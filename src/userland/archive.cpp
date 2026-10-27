@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-#include "aios/userland/git.hpp"   // inflate_raw: the same deflate reader, again
+#include "aios/net/deflate.hpp"
 
 namespace aios::userland {
 namespace {
@@ -95,9 +95,10 @@ Result<std::vector<ArchiveEntry>> unzip(ByteSpan zip) {
     if (method == 0) {
       e.data.assign(zip.begin() + (long)data_at, zip.begin() + (long)(data_at + comp_size));
     } else if (method == 8) {
-      auto raw = inflate_raw(zip, data_at, nullptr);
-      if (!raw.ok()) return Result<std::vector<ArchiveEntry>>(raw.error());
-      e.data = *raw;
+      std::string why;
+      if (!net::inflate_raw_tree(zip, data_at, e.data, nullptr, raw_size, &why)) {
+        return Result<std::vector<ArchiveEntry>>(Status::Corrupt, why);
+      }
     } else {
       return Result<std::vector<ArchiveEntry>>(Status::Unsupported,
                                               name + ": compression method " + dec(method));
@@ -114,6 +115,105 @@ Result<std::vector<ArchiveEntry>> unzip(ByteSpan zip) {
   }
   if (out.empty()) return Result<std::vector<ArchiveEntry>>(Status::Corrupt, "no entries in this archive");
   return out;
+}
+
+ByteBuffer zip_create(const std::vector<ArchiveEntry>& entries, int compression_level) {
+  ByteBuffer zip;
+  struct EntryMeta {
+    std::string path;
+    uint32_t crc = 0;
+    uint32_t comp_size = 0;
+    uint32_t raw_size = 0;
+    uint16_t method = 0;
+    uint32_t local_offset = 0;
+    uint32_t external_attr = 0;
+  };
+  std::vector<EntryMeta> meta;
+  meta.reserve(entries.size());
+
+  auto write16 = [&zip](uint16_t val) {
+    zip.push_back(static_cast<uint8_t>(val & 0xFF));
+    zip.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+  };
+  auto write32 = [&zip](uint32_t val) {
+    zip.push_back(static_cast<uint8_t>(val & 0xFF));
+    zip.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+    zip.push_back(static_cast<uint8_t>((val >> 16) & 0xFF));
+    zip.push_back(static_cast<uint8_t>((val >> 24) & 0xFF));
+  };
+
+  for (const auto& e : entries) {
+    EntryMeta m;
+    m.path = e.path;
+    m.raw_size = static_cast<uint32_t>(e.data.size());
+    m.crc = crc32(ByteSpan(e.data.data(), e.data.size()));
+    m.local_offset = static_cast<uint32_t>(zip.size());
+    m.external_attr = e.is_dir ? (0040755u << 16) : ((e.mode ? (e.mode & 0777) : 0644u) | 0100000u) << 16;
+
+    ByteBuffer comp_data;
+    if (!e.is_dir && !e.data.empty() && compression_level > 0) {
+      comp_data = net::deflate_raw(ByteSpan(e.data.data(), e.data.size()), compression_level);
+    }
+    const bool use_deflate = !comp_data.empty() && comp_data.size() < e.data.size();
+    m.method = use_deflate ? 8 : 0;
+    const uint8_t* payload_ptr = use_deflate ? comp_data.data() : e.data.data();
+    m.comp_size = use_deflate ? static_cast<uint32_t>(comp_data.size()) : m.raw_size;
+
+    // Local Header
+    write32(0x04034b50);
+    write16(20);               // version needed
+    write16(0x0800);           // UTF-8 filename flag
+    write16(m.method);
+    write16(0);                // mod time
+    write16(0);                // mod date
+    write32(m.crc);
+    write32(m.comp_size);
+    write32(m.raw_size);
+    write16(static_cast<uint16_t>(m.path.size()));
+    write16(0);                // extra field length
+    zip.insert(zip.end(), m.path.begin(), m.path.end());
+    if (m.comp_size > 0 && payload_ptr) {
+      zip.insert(zip.end(), payload_ptr, payload_ptr + m.comp_size);
+    }
+    meta.push_back(m);
+  }
+
+  // Central Directory
+  size_t cd_start = zip.size();
+  for (const auto& m : meta) {
+    write32(0x02014b50);
+    write16(0x031E);           // UNIX, 3.0
+    write16(20);               // version needed 2.0
+    write16(0x0800);           // UTF-8 flag
+    write16(m.method);
+    write16(0);                // mod time
+    write16(0);                // mod date
+    write32(m.crc);
+    write32(m.comp_size);
+    write32(m.raw_size);
+    write16(static_cast<uint16_t>(m.path.size()));
+    write16(0);                // extra len
+    write16(0);                // comment len
+    write16(0);                // disk start
+    write16(0);                // internal attr
+    write32(m.external_attr);
+    write32(m.local_offset);
+    zip.insert(zip.end(), m.path.begin(), m.path.end());
+  }
+
+  size_t cd_size = zip.size() - cd_start;
+
+  // End of Central Directory Record
+  write32(0x06054b50);
+  write16(0);                  // disk number
+  write16(0);                  // disk with central dir
+  write16(static_cast<uint16_t>(meta.size()));
+  write16(static_cast<uint16_t>(meta.size()));
+  write32(static_cast<uint32_t>(cd_size));
+  write32(static_cast<uint32_t>(cd_start));
+  write16(0);                  // comment length
+
+  return zip;
 }
 
 }  // namespace aios::userland

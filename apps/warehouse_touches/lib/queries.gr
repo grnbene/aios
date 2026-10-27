@@ -1,0 +1,493 @@
+// Warehouse Touches Data Queries & Metrics Engine
+
+fn blank_user(userid) {
+  return {
+    "userid": userid,
+    "name": "",
+    "receiving": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": 0, "vendors": 0},
+    "picking": {"lines": 0, "qty": 0.0, "orders": 0},
+    "movements": {
+      "moves": 0, "qty": 0.0,
+      "by_type": {
+        "item move": {"moves": 0, "qty": 0.0},
+        "dolly move": {"moves": 0, "qty": 0.0},
+        "merge": {"moves": 0, "qty": 0.0}
+      }
+    },
+    "loads": {"scans": 0.0, "orders": 0, "dispatches": 0, "avgloadtime": 0.0, "avgdispatchunits": 0.0, "manual": 0, "manualpct": 0.0, "forced": 0},
+    "sticker": {"packed": 0, "packedunits": 0.0, "staged": 0, "stagedunits": 0.0, "binds": 0},
+    "touches": 0.0,
+    "parts": {"receiving": 0.0, "picking": 0.0, "movements": 0.0, "loads": 0.0, "sticker": 0.0},
+    "active_days": 0,
+    "first_touch": nil,
+    "last_touch": nil,
+    "touches_per_day": 0.0
+  }
+}
+
+fn stamp_touch(user, first, last) {
+  if first != nil and first != "" {
+    if user.first_touch == nil or first < user.first_touch {
+      user.first_touch = first
+    }
+  }
+  if last != nil and last != "" {
+    if user.last_touch == nil or last > user.last_touch {
+      user.last_touch = last
+    }
+  }
+}
+
+fn fetch_warehouse_touches(db, start_date, stop_date, userids) {
+  let start_ts = start_date + " 00:00:00"
+  let stop_ts = stop_date + " 23:59:59"
+
+  let users = {}
+  let days = {}
+
+  let get_user = fn(uid) {
+    if uid == nil or uid == "" { return nil }
+    let key = lower(uid)
+    if users[key] == nil {
+      users[key] = blank_user(uid)
+      days[key] = {}
+    }
+    return users[key]
+  }
+
+  // 1. Receiving
+  let rec_sql = join([
+    "SELECT userid, COUNT(*) AS scans, ",
+    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN qty ELSE 0 END) AS qty_in, ",
+    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN 0 ELSE qty END) AS qty_out, ",
+    "COUNT(DISTINCT stockid) AS items, COUNT(DISTINCT vendor) AS vendors, ",
+    "MIN(date_rec) AS first_touch, MAX(date_rec) AS last_touch ",
+    "FROM recscan ",
+    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' ",
+    "GROUP BY userid"
+  ], "")
+
+  let r_res = pcall(db_query, db, rec_sql, [start_ts, stop_ts])
+  if r_res.ok and r_res.value.records != nil {
+    for row in r_res.value.records {
+      let u = get_user(row.userid)
+      if u != nil {
+        u.receiving.scans = u.receiving.scans + int(row.scans)
+        u.receiving.qty_in = u.receiving.qty_in + real(row.qty_in)
+        u.receiving.qty_out = u.receiving.qty_out + real(row.qty_out)
+        u.receiving.items = u.receiving.items + int(row.items)
+        u.receiving.vendors = u.receiving.vendors + int(row.vendors)
+        stamp_touch(u, row.first_touch, row.last_touch)
+      }
+    }
+  }
+
+  // Receiving active days
+  let r_days_sql = join([
+    "SELECT userid, DATE(date_rec) AS day FROM recscan ",
+    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' ",
+    "GROUP BY userid, DATE(date_rec)"
+  ], "")
+  let rd_res = pcall(db_query, db, r_days_sql, [start_ts, stop_ts])
+  if rd_res.ok and rd_res.value.records != nil {
+    for row in rd_res.value.records {
+      let k = lower(row.userid)
+      if days[k] == nil { days[k] = {} }
+      days[k][str(row.day)] = true
+    }
+  }
+
+  // 2. Picking
+  let merch_filter = join([
+    " AND ((sm.categoryid = 'TIRE' OR pf.stockid = 'FET') ",
+    "OR (sm.categoryid IN ('O','OT')) ",
+    "OR (sm.categoryid NOT IN ('TIRE','O','F','E','X','L') AND pf.stockid NOT IN ('LAB-STORAGE','LAB-T11','LAB-T26')))"
+  ], "")
+
+  let pick_sql = join([
+    "SELECT pf.userid, COUNT(*) AS line_count, SUM(pf.picked) AS qty, COUNT(DISTINCT pf.orderno) AS orders, ",
+    "MIN(pf.date_pickupdate) AS first_touch, MAX(pf.date_pickupdate) AS last_touch ",
+    "FROM pickingfreeze pf ",
+    "INNER JOIN stockmaster sm ON sm.stockid = pf.stockid ",
+    "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 ",
+    "WHERE pf.bin <> 'STAGING' AND pf.picked > 0 AND pf.date_pickupdate >= ? AND pf.date_pickupdate <= ? ",
+    "AND pf.userid IS NOT NULL AND pf.userid <> '' ",
+    merch_filter, " GROUP BY pf.userid"
+  ], "")
+
+  let p_res = pcall(db_query, db, pick_sql, [start_ts, stop_ts])
+  if p_res.ok and p_res.value.records != nil {
+    for row in p_res.value.records {
+      let u = get_user(row.userid)
+      if u != nil {
+        u.picking.lines = u.picking.lines + int(row.line_count)
+        u.picking.qty = u.picking.qty + real(row.qty)
+        u.picking.orders = u.picking.orders + int(row.orders)
+        stamp_touch(u, row.first_touch, row.last_touch)
+      }
+    }
+  }
+
+  let pick_days_sql = join([
+    "SELECT pf.userid, DATE(pf.date_pickupdate) AS day ",
+    "FROM pickingfreeze pf ",
+    "INNER JOIN stockmaster sm ON sm.stockid = pf.stockid ",
+    "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 ",
+    "WHERE pf.bin <> 'STAGING' AND pf.picked > 0 AND pf.date_pickupdate >= ? AND pf.date_pickupdate <= ? ",
+    "AND pf.userid IS NOT NULL AND pf.userid <> '' ",
+    merch_filter, " GROUP BY pf.userid, DATE(pf.date_pickupdate)"
+  ], "")
+  let pd_res = pcall(db_query, db, pick_days_sql, [start_ts, stop_ts])
+  if pd_res.ok and pd_res.value.records != nil {
+    for row in pd_res.value.records {
+      let k = lower(row.userid)
+      if days[k] == nil { days[k] = {} }
+      days[k][str(row.day)] = true
+    }
+  }
+
+  // 3. Bin Movements
+  let move_sql = join([
+    "SELECT user AS userid, LOWER(TRIM(type)) AS movetype, ",
+    "COUNT(DISTINCT binmoveid, stockid) AS moves, SUM(qty) AS qty, ",
+    "MIN(date_created) AS first_touch, MAX(date_created) AS last_touch ",
+    "FROM binmovements_details ",
+    "WHERE date_created >= ? AND date_created <= ? AND `from` <> `to` AND qty > 0 ",
+    "AND user IS NOT NULL AND user <> '' ",
+    "GROUP BY user, LOWER(TRIM(type))"
+  ], "")
+
+  let m_res = pcall(db_query, db, move_sql, [start_ts, stop_ts])
+  if m_res.ok and m_res.value.records != nil {
+    for row in m_res.value.records {
+      let u = get_user(row.userid)
+      if u != nil {
+        let mtype = row.movetype != nil and row.movetype != "" ? row.movetype : "other"
+        if u.movements.by_type[mtype] == nil {
+          u.movements.by_type[mtype] = {"moves": 0, "qty": 0.0}
+        }
+        let m_entry = u.movements.by_type[mtype]
+        m_entry.moves = m_entry.moves + int(row.moves)
+        m_entry.qty = m_entry.qty + real(row.qty)
+
+        u.movements.moves = u.movements.moves + int(row.moves)
+        u.movements.qty = u.movements.qty + real(row.qty)
+        stamp_touch(u, row.first_touch, row.last_touch)
+      }
+    }
+  }
+
+  let move_days_sql = join([
+    "SELECT user AS userid, DATE(date_created) AS day FROM binmovements_details ",
+    "WHERE date_created >= ? AND date_created <= ? AND `from` <> `to` AND qty > 0 ",
+    "AND user IS NOT NULL AND user <> '' GROUP BY user, DATE(date_created)"
+  ], "")
+  let md_res = pcall(db_query, db, move_days_sql, [start_ts, stop_ts])
+  if md_res.ok and md_res.value.records != nil {
+    for row in md_res.value.records {
+      let k = lower(row.userid)
+      if days[k] == nil { days[k] = {} }
+      days[k][str(row.day)] = true
+    }
+  }
+
+  // 4. Loads
+  let driver_map = {}
+  let users_sql_res = pcall(db_query, db, "SELECT userid, realname FROM www_users")
+  if users_sql_res.ok and users_sql_res.value.records != nil {
+    for row in users_sql_res.value.records {
+      if row.realname != nil and row.realname != "" {
+        driver_map[lower(trim(row.realname))] = row.userid
+      }
+    }
+  }
+
+  let load_runs_sql = join([
+    "SELECT dispnumber, truckid, timeassigned, timestarted, timestopped, manual_pick, ",
+    "(COALESCE(force_complete, 0) = 1 OR COALESCE(run_moved, 0) = 1) AS untimed, ",
+    "COALESCE(force_complete, 0) AS forced FROM loadingbays ",
+    "WHERE COALESCE(run_deleted, 0) = 0 AND dispnumber IS NOT NULL AND dispnumber <> '' ",
+    "AND ((completed = 1 AND timestopped >= ? AND timestopped <= ?) ",
+    "  OR (force_complete = 1 AND COALESCE(timestopped, '') = '' AND timeassigned >= ? AND timeassigned <= ?))"
+  ], "")
+
+  let runs_res = pcall(db_query, db, load_runs_sql, [start_ts, stop_ts, start_ts, stop_ts])
+  let runs = {}
+  if runs_res.ok and runs_res.value.records != nil {
+    for row in runs_res.value.records {
+      let id = str(int(row.dispnumber)) + "-" + str(int(row.truckid))
+      if runs[id] == nil {
+        runs[id] = {
+          "dispnumber": int(row.dispnumber), "truckid": int(row.truckid),
+          "assigned": nil, "started": nil, "stopped": nil,
+          "manual": 0, "untimed": false, "forced": false
+        }
+      }
+      let r = runs[id]
+      r.manual = r.manual + int(row.manual_pick)
+      r.untimed = r.untimed or (int(row.untimed) == 1)
+      r.forced = r.forced or (int(row.forced) == 1)
+      if row.timeassigned != nil and (r.assigned == nil or row.timeassigned < r.assigned) {
+        r.assigned = row.timeassigned
+      }
+      if row.timestarted != nil and (r.started == nil or row.timestarted < r.started) {
+        r.started = row.timestarted
+      }
+      if row.timestopped != nil and (r.stopped == nil or row.timestopped > r.stopped) {
+        r.stopped = row.timestopped
+      }
+    }
+  }
+
+  let run_keys = keys(runs)
+  if len(run_keys) > 0 {
+    let disp_ids = []
+    let truck_ids = []
+    for id in run_keys {
+      push(disp_ids, runs[id].dispnumber)
+      push(truck_ids, runs[id].truckid)
+    }
+
+    let disp_drivers_sql = join([
+      "SELECT DISTINCT d.dispnumber, d.truckid, d.driveruserid ",
+      "FROM dispatch d WHERE d.driveruserid IS NOT NULL AND d.driveruserid <> '' ",
+      "AND d.dispnumber IN (?) AND d.truckid IN (?)"
+    ], "")
+
+    let d_res = pcall(db_query, db, disp_drivers_sql, [disp_ids, truck_ids])
+    let drivers_by_run = {}
+    if d_res.ok and d_res.value.records != nil {
+      for row in d_res.value.records {
+        let id = str(int(row.dispnumber)) + "-" + str(int(row.truckid))
+        if drivers_by_run[id] == nil { drivers_by_run[id] = [] }
+        push(drivers_by_run[id], row.driveruserid)
+      }
+    }
+
+    for id in run_keys {
+      let run = runs[id]
+      let driver_list = drivers_by_run[id]
+      if driver_list != nil {
+        for driver in unique(driver_list) {
+          let mapped_uid = driver_map[lower(trim(driver))]
+          if mapped_uid == nil { mapped_uid = driver }
+          let u = get_user(mapped_uid)
+          if u != nil {
+            u.loads.dispatches = u.loads.dispatches + 1
+            u.loads.manual = u.loads.manual + run.manual
+            if run.forced { u.loads.forced = u.loads.forced + 1 }
+            let last_t = run.stopped != nil ? run.stopped : run.assigned
+            stamp_touch(u, run.started != nil ? run.started : run.assigned, last_t)
+            if last_t != nil and len(last_t) >= 10 {
+              let k = lower(u.userid)
+              if days[k] == nil { days[k] = {} }
+              days[k][slice(last_t, 0, 10)] = true
+            }
+          }
+        }
+      }
+    }
+
+    // Units loaded per driver
+    let load_units_sql = join([
+      "SELECT d.driveruserid AS driver, SUM(pf.loaded) AS units, COUNT(DISTINCT pf.orderno) AS orders ",
+      "FROM pickingfreeze pf ",
+      "INNER JOIN stockmaster sm ON sm.stockid = pf.stockid ",
+      "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 ",
+      "INNER JOIN dispatch d ON d.invoice = pf.orderno ",
+      "WHERE pf.loaded > 0 AND d.dispnumber IN (?) AND d.truckid IN (?) ",
+      merch_filter, " GROUP BY d.driveruserid"
+    ], "")
+
+    let lu_res = pcall(db_query, db, load_units_sql, [disp_ids, truck_ids])
+    if lu_res.ok and lu_res.value.records != nil {
+      for row in lu_res.value.records {
+        let mapped_uid = driver_map[lower(trim(row.driver))]
+        if mapped_uid == nil { mapped_uid = row.driver }
+        let u = get_user(mapped_uid)
+        if u != nil {
+          u.loads.scans = u.loads.scans + real(row.units)
+          u.loads.orders = u.loads.orders + int(row.orders)
+        }
+      }
+    }
+  }
+
+  // 5. Sticker Scan Out (Packed & Staged)
+  let pack_sql = join([
+    "SELECT packeduserid AS userid, COUNT(*) AS orders, SUM(CAST(quantity AS DECIMAL(12,2))) AS units, ",
+    "MIN(packedtime) AS first_touch, MAX(packedtime) AS last_touch ",
+    "FROM stickerscanout ",
+    "WHERE statusid <> '99' AND packedtime >= ? AND packedtime <= ? ",
+    "AND packeduserid IS NOT NULL AND packeduserid <> '' ",
+    "GROUP BY packeduserid"
+  ], "")
+
+  let stk_p_res = pcall(db_query, db, pack_sql, [start_ts, stop_ts])
+  if stk_p_res.ok and stk_p_res.value.records != nil {
+    for row in stk_p_res.value.records {
+      let u = get_user(row.userid)
+      if u != nil {
+        u.sticker.packed = u.sticker.packed + int(row.orders)
+        u.sticker.packedunits = u.sticker.packedunits + real(row.units)
+        stamp_touch(u, row.first_touch, row.last_touch)
+      }
+    }
+  }
+
+  let stage_sql = join([
+    "SELECT stageduserid AS userid, COUNT(*) AS orders, SUM(CAST(quantity AS DECIMAL(12,2))) AS units, ",
+    "MIN(stagedtime) AS first_touch, MAX(stagedtime) AS last_touch ",
+    "FROM stickerscanout ",
+    "WHERE statusid <> '99' AND stagedtime >= ? AND stagedtime <= ? ",
+    "AND stageduserid IS NOT NULL AND stageduserid <> '' ",
+    "GROUP BY stageduserid"
+  ], "")
+
+  let stk_s_res = pcall(db_query, db, stage_sql, [start_ts, stop_ts])
+  if stk_s_res.ok and stk_s_res.value.records != nil {
+    for row in stk_s_res.value.records {
+      let u = get_user(row.userid)
+      if u != nil {
+        u.sticker.staged = u.sticker.staged + int(row.orders)
+        u.sticker.stagedunits = u.sticker.stagedunits + real(row.units)
+        stamp_touch(u, row.first_touch, row.last_touch)
+      }
+    }
+  }
+
+  let stk_days_sql = join([
+    "SELECT packeduserid AS userid, DATE(packedtime) AS day FROM stickerscanout ",
+    "WHERE statusid <> '99' AND packedtime >= ? AND packedtime <= ? AND packeduserid IS NOT NULL AND packeduserid <> '' ",
+    "UNION ",
+    "SELECT stageduserid, DATE(stagedtime) FROM stickerscanout ",
+    "WHERE statusid <> '99' AND stagedtime >= ? AND stagedtime <= ? AND stageduserid IS NOT NULL AND stageduserid <> ''"
+  ], "")
+  let stkd_res = pcall(db_query, db, stk_days_sql, [start_ts, stop_ts, start_ts, stop_ts])
+  if stkd_res.ok and stkd_res.value.records != nil {
+    for row in stkd_res.value.records {
+      let k = lower(row.userid)
+      if days[k] == nil { days[k] = {} }
+      days[k][str(row.day)] = true
+    }
+  }
+
+  // Populate Operator Real Names
+  if len(keys(users)) > 0 {
+    let name_query = "SELECT userid, realname FROM www_users"
+    let n_res = pcall(db_query, db, name_query)
+    if n_res.ok and n_res.value.records != nil {
+      for row in n_res.value.records {
+        let k = lower(row.userid)
+        if users[k] != nil and row.realname != nil {
+          users[k].name = trim(row.realname)
+        }
+      }
+    }
+  }
+
+  // Compute User Rollups & Metrics
+  let totals = blank_user("TOTAL")
+  totals.name = "All users"
+  let all_days = {}
+
+  let user_list = []
+  for k in keys(users) {
+    let u = users[k]
+    u.parts.receiving = u.receiving.qty_in + u.receiving.qty_out
+    u.parts.picking = u.picking.qty
+    u.parts.movements = u.movements.qty
+    u.parts.loads = u.loads.scans
+    u.parts.sticker = u.sticker.stagedunits
+
+    u.touches = u.parts.receiving + u.parts.picking + u.parts.movements + u.parts.loads + u.parts.sticker
+
+    let u_days = days[k] != nil ? keys(days[k]) : []
+    u.active_days = len(u_days)
+    u.touches_per_day = u.active_days > 0 ? (u.touches / real(u.active_days)) : 0.0
+
+    if u.loads.dispatches > 0 {
+      u.loads.avgdispatchunits = u.loads.scans / real(u.loads.dispatches)
+    }
+    if u.loads.scans > 0 {
+      u.loads.manualpct = (100.0 * real(u.loads.manual)) / u.loads.scans
+    }
+
+    for d in u_days { all_days[d] = true }
+    stamp_touch(totals, u.first_touch, u.last_touch)
+
+    // Accumulate into totals
+    totals.receiving.scans = totals.receiving.scans + u.receiving.scans
+    totals.receiving.qty_in = totals.receiving.qty_in + u.receiving.qty_in
+    totals.receiving.qty_out = totals.receiving.qty_out + u.receiving.qty_out
+    totals.picking.lines = totals.picking.lines + u.picking.lines
+    totals.picking.qty = totals.picking.qty + u.picking.qty
+    totals.picking.orders = totals.picking.orders + u.picking.orders
+    totals.movements.moves = totals.movements.moves + u.movements.moves
+    totals.movements.qty = totals.movements.qty + u.movements.qty
+    for mt in keys(u.movements.by_type) {
+      if totals.movements.by_type[mt] == nil {
+        totals.movements.by_type[mt] = {"moves": 0, "qty": 0.0}
+      }
+      totals.movements.by_type[mt].moves = totals.movements.by_type[mt].moves + u.movements.by_type[mt].moves
+      totals.movements.by_type[mt].qty = totals.movements.by_type[mt].qty + u.movements.by_type[mt].qty
+    }
+    totals.loads.scans = totals.loads.scans + u.loads.scans
+    totals.loads.orders = totals.loads.orders + u.loads.orders
+    totals.loads.dispatches = totals.loads.dispatches + u.loads.dispatches
+    totals.loads.manual = totals.loads.manual + u.loads.manual
+    totals.loads.forced = totals.loads.forced + u.loads.forced
+    totals.sticker.packed = totals.sticker.packed + u.sticker.packed
+    totals.sticker.packedunits = totals.sticker.packedunits + u.sticker.packedunits
+    totals.sticker.staged = totals.sticker.staged + u.sticker.staged
+    totals.sticker.stagedunits = totals.sticker.stagedunits + u.sticker.stagedunits
+    totals.sticker.binds = totals.sticker.binds + u.sticker.binds
+
+    totals.parts.receiving = totals.parts.receiving + u.parts.receiving
+    totals.parts.picking = totals.parts.picking + u.parts.picking
+    totals.parts.movements = totals.parts.movements + u.parts.movements
+    totals.parts.loads = totals.parts.loads + u.parts.loads
+    totals.parts.sticker = totals.parts.sticker + u.parts.sticker
+    totals.touches = totals.touches + u.touches
+
+    push(user_list, u)
+  }
+
+  totals.active_days = len(keys(all_days))
+  totals.touches_per_day = totals.active_days > 0 ? (totals.touches / real(totals.active_days)) : 0.0
+  if totals.loads.dispatches > 0 {
+    totals.loads.avgdispatchunits = totals.loads.scans / real(totals.loads.dispatches)
+  }
+  if totals.loads.scans > 0 {
+    totals.loads.manualpct = (100.0 * real(totals.loads.manual)) / totals.loads.scans
+  }
+
+  // Sort by touches descending (busiest operator first)
+  let n = len(user_list)
+  let i = 0
+  while i < n {
+    let j = i + 1
+    while j < n {
+      if user_list[j].touches > user_list[i].touches {
+        let tmp = user_list[i]
+        user_list[i] = user_list[j]
+        user_list[j] = tmp
+      }
+      j += 1
+    }
+    i += 1
+  }
+
+  let r_idx = 0
+  while r_idx < n {
+    user_list[r_idx].rank = r_idx + 1
+    r_idx += 1
+  }
+
+  return {
+    "start": start_date,
+    "stop": stop_date,
+    "users": user_list,
+    "totals": totals
+  }
+}

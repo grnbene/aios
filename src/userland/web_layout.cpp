@@ -3997,7 +3997,7 @@ struct Engine {
         if (c->kind == Node::Kind::Element && (c->tag == "td" || c->tag == "th")) n += cell_span(*c);
       if (n > cols) cols = n;
     }
-    if (cols > 24) cols = 24;
+    if (cols > 128) cols = 128;
 
     // What each column wants, the least it can live with, and what a
     // `<td width=...>` pinned it to.

@@ -1,0 +1,163 @@
+// Warehouse Touches Reporting Service
+//
+// Serves warehouse touch metrics, PDF reports, Excel exports and interactive dashboard.
+//
+// Endpoints:
+//   GET /quickreport       JSON API
+//   GET /quickreportview   HTML interactive dashboard
+//   GET /quickreportpdf    Native vector PDF report
+//   GET /quickreportxlsx   Native OpenXML spreadsheet (.xlsx) export
+//   GET /health            Health check
+
+import "lib/queries.gr"
+import "lib/views.gr"
+
+fn env(name, fallback) {
+  let v = getenv(name)
+  if v == nil or v == "" { return fallback }
+  return v
+}
+
+fn secret(name) {
+  let v = getenv(name)
+  if v != nil and v != "" { return v }
+  let f = getenv(name + "_FILE")
+  if f != nil and f != "" { return trim(read_file(f)) }
+  return ""
+}
+
+let DB_CFG = {
+  "host": env("DB_HOST", env("ASQL_HOST", "127.0.0.1")),
+  "port": int(env("DB_PORT", env("ASQL_PORT", "3307"))),
+  "user": env("DB_USER", env("ASQL_USER", "root")),
+  "password": secret("DB_PASSWORD"),
+  "db": env("DB_NAME", env("ASQL_DB", "versioneight"))
+}
+
+let db_conn = nil
+
+fn get_db() {
+  if db_conn != nil { return db_conn }
+  let c = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
+  db_conn = c
+  return c
+}
+
+fn parse_date_params(req) {
+  let q = req.query != nil ? req.query : {}
+  let now_ts = time_us() / 1000000
+  let today_str = slice(str(now()), 0, 10)
+
+  if q.range != nil and contains(str(q.range), "..") {
+    let rparts = split(str(q.range), "..")
+    if len(rparts) >= 2 {
+      return {"start": rparts[0], "stop": rparts[1], "userid": q.userid}
+    }
+  }
+
+  let stop_date = q.stop != nil and q.stop != "" ? q.stop : today_str
+  let start_date = q.start != nil and q.start != "" ? q.start : ""
+
+  if start_date == "" {
+    // Default: 30 days window
+    start_date = stop_date
+  }
+  return {"start": start_date, "stop": stop_date, "userid": q.userid}
+}
+
+// ---- Route Handlers ----------------------------------------------------------
+
+fn handle_health(req) {
+  return {"status": 200, "content_type": "application/json", "body": "{\"status\":\"ok\"}"}
+}
+
+fn handle_quickreport(req) {
+  let p = parse_date_params(req)
+  let db = get_db()
+  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  return {"status": 200, "content_type": "application/json; charset=utf-8", "json": data}
+}
+
+fn handle_quickreportview(req) {
+  let p = parse_date_params(req)
+  let db = get_db()
+  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let html = render_html_dashboard(data, p)
+  return {"status": 200, "content_type": "text/html; charset=utf-8", "body": html}
+}
+
+fn handle_quickreportpdf(req) {
+  let p = parse_date_params(req)
+  let db = get_db()
+  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let pdf_bytes = render_pdf_report(data)
+  let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".pdf"
+
+  return {
+    "status": 200,
+    "content_type": "application/pdf",
+    "headers": {
+      "Content-Disposition": "attachment; filename=\"" + filename + "\"",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*"
+    },
+    "body": pdf_bytes
+  }
+}
+
+fn handle_quickreportxlsx(req) {
+  let p = parse_date_params(req)
+  let db = get_db()
+  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let xlsx_bytes = render_xlsx_report(data)
+  let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".xlsx"
+
+  return {
+    "status": 200,
+    "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "headers": {
+      "Content-Disposition": "attachment; filename=\"" + filename + "\"",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*"
+    },
+    "body": xlsx_bytes
+  }
+}
+
+fn handle_quickreportcsv(req) {
+  let p = parse_date_params(req)
+  let db = get_db()
+  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let csv_str = render_csv_report(data)
+  let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".csv"
+
+  return {
+    "status": 200,
+    "content_type": "text/csv; charset=utf-8",
+    "headers": {
+      "Content-Disposition": "attachment; filename=\"" + filename + "\"",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Access-Control-Allow-Origin": "*"
+    },
+    "body": csv_str
+  }
+}
+
+// ---- UI Pane & HTTP Routes ---------------------------------------------------
+
+ui.pane({
+  "title": "Warehouse Touches",
+  "width": 1000,
+  "height": 700,
+  "shared": true,
+  "workers": true,
+  "routes": {
+    "/": handle_quickreportview,
+    "/health": handle_health,
+    "/quickreport": handle_quickreport,
+    "/quickreportview": handle_quickreportview,
+    "/quickreportpdf": handle_quickreportpdf,
+    "/quickreportxlsx": handle_quickreportxlsx,
+    "/quickreportcsv": handle_quickreportcsv
+  }
+})

@@ -216,6 +216,23 @@ Value bi_ui_select(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, m);
 }
 
+// date_picker(id, [options]) or date(id, [options]): value, mode, min, max, presets, label, on_change
+Value bi_ui_datepicker(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "ui.date_picker")) return Value::nil();
+  if (args[0].str().empty()) { error = "ui.date_picker() wants an id"; return Value::nil(); }
+  const Value opts = arg_or(args, 1);
+  if (!want_opts(opts, error, "ui.date_picker")) return Value::nil();
+  if (auto o = as_map(opts)) {
+    if (Value* e = o->find("on_change"); e && !is_callable(*e)) {
+      error = std::string("ui.date_picker(): on_change wants a function, got a ") + type_name(e->type);
+      return Value::nil();
+    }
+  }
+  auto m = widget_map("datepicker", opts);
+  m->put("id", args[0]);
+  return Value::object(Type::Map, m);
+}
+
 // table(rows) or table(rows, options): columns, rows (how many show), empty.
 Value bi_ui_table(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "ui.table")) return Value::nil();
@@ -579,13 +596,14 @@ class FacePane final : public PaneDriver {
     }
     out += "}";
     if (Value* fn = m->find("on_click")) out += ",\"act\":" + jstr(action_for(*fn, "the button \"" + (label ? label->to_text() : std::string()) + "\""));
-    if (type == "field") {
+    if (type == "field" || type == "datepicker") {
       Value* idv = m->find("id");
       const std::string id = idv ? idv->to_text() : std::string();
       auto have = web_fields_.find(id);
       const std::string value = (have != web_fields_.end() && web_set_fields_.count(id)) ? have->second : opt_str(v, "value");
       out += ",\"id\":" + jstr(id) + ",\"value\":" + jstr(value);
       if (const Value* e = opt(v, "on_enter"); e && is_callable(*e)) out += ",\"enter\":" + jstr(action_for(*e, "the field \"" + id + "\"'s on_enter"));
+      if (const Value* a = opt(v, "on_change"); a && is_callable(*a)) out += ",\"act\":" + jstr(action_for(*a, "the datepicker \"" + id + "\"'s on_change"));
     } else if (Value* val = m->find("value")) {
       out += ",\"value\":";
       value_json(*val, out, 0);
@@ -915,6 +933,45 @@ class FacePane final : public PaneDriver {
         }
       }
       out += "</select></div>";
+      return true;
+    }
+    if (type == "datepicker") {
+      Value* idv = m->find("id");
+      const std::string id = idv ? idv->to_text() : std::string();
+      auto have = web_fields_.find(id);
+      const std::string value = (have != web_fields_.end() && web_set_fields_.count(id)) ? have->second : opt_str(v, "value");
+      const std::string mode = opt_str(v, "mode").empty() ? "single" : opt_str(v, "mode");
+      const std::string label = opt_str(v, "label");
+      const std::string placeholder = opt_str(v, "placeholder").empty() ? (mode == "range" ? "Select date range..." : "Select date...") : opt_str(v, "placeholder");
+      const std::string min_d = opt_str(v, "min");
+      const std::string max_d = opt_str(v, "max");
+      const bool presets = opt(v, "presets") ? opt_flag(v, "presets") : (mode == "range");
+
+      std::string act;
+      if (const Value* fn = opt(v, "on_change"); fn && is_callable(*fn)) {
+        act = action_for(*fn, "the datepicker \"" + id + "\"'s on_change");
+      }
+
+      std::string cls = "w-datepicker-wrap", style;
+      if (const int width = opt_int(v, "width", 0)) style += "width:" + std::to_string(width) + "px;flex:none;";
+      extra_attrs(v, cls, style);
+
+      out += "<div class=\"" + cls + "\"" + (style.empty() ? "" : " style=\"" + style + "\"") + " data-dp=\"1\" data-mode=\"" + esc(mode) + "\"";
+      if (!min_d.empty()) out += " data-min=\"" + esc(min_d) + "\"";
+      if (!max_d.empty()) out += " data-max=\"" + esc(max_d) + "\"";
+      if (presets) out += " data-presets=\"1\"";
+      out += ">";
+      if (!label.empty()) out += "<div class=\"w-dp-label\">" + esc(label) + "</div>";
+      out += "<div class=\"w-dp-box\" tabindex=\"0\" role=\"combobox\" aria-expanded=\"false\">";
+      out += "<svg class=\"w-dp-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"18\" rx=\"3\" ry=\"3\"/><line x1=\"16\" y1=\"2\" x2=\"16\" y2=\"6\"/><line x1=\"8\" y1=\"2\" x2=\"8\" y2=\"6\"/><line x1=\"3\" y1=\"10\" x2=\"21\" y2=\"10\"/></svg>";
+      out += "<span class=\"w-dp-display" + std::string(value.empty() ? " empty" : "") + "\">" + esc(value.empty() ? placeholder : value) + "</span>";
+      if (mode == "range") out += "<span class=\"w-dp-badge\"></span>";
+      out += "<button type=\"button\" class=\"w-dp-clear" + std::string(value.empty() ? "" : " show") + "\" title=\"Clear\" aria-label=\"Clear\">&times;</button>";
+      out += "<svg class=\"w-dp-chevron\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><polyline points=\"6 9 12 15 18 9\"/></svg>";
+      out += "</div>";
+      out += "<input type=\"hidden\" class=\"w-dp-val\" data-id=\"" + esc(id) + "\" value=\"" + esc(value) + "\"";
+      if (!act.empty()) out += " data-act=\"" + esc(act) + "\"";
+      out += "></div>";
       return true;
     }
     if (type == "tile") {
@@ -1338,6 +1395,15 @@ Value bi_ui_layout(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::list(std::move(out));
 }
 
+// html(pane): renders the pane's widgets to HTML string
+Value bi_ui_html(Vm& vm, std::vector<Value>& args, std::string& error) {
+  FacePane* p = face_pane_of(vm, args[0], error, "ui.html");
+  if (!p) return Value::nil();
+  std::string html;
+  if (!p->render_html(vm, html, error)) return Value::nil();
+  return Value::string(html);
+}
+
 }  // namespace
 
 void install_face_builtins(Vm& vm) {
@@ -1356,6 +1422,8 @@ void install_face_builtins(Vm& vm) {
   add("checkbox", 1, 3, bi_ui_checkbox);
   add("slider", 3, 4, bi_ui_slider);
   add("select", 2, 3, bi_ui_select);
+  add("date_picker", 1, 2, bi_ui_datepicker);
+  add("date", 1, 2, bi_ui_datepicker);
   add("table", 1, 2, bi_ui_table);
   add("tile", 2, 3, bi_ui_tile);
   add("heading", 1, 2, bi_ui_heading);
@@ -1369,6 +1437,7 @@ void install_face_builtins(Vm& vm) {
   add("field_text", 2, 2, bi_ui_field_text);
   add("set_field", 3, 3, bi_ui_set_field);
   add("layout", 1, 1, bi_ui_layout);
+  add("html", 1, 1, bi_ui_html);
   vm.define_global("ui", Value::object(Type::Map, ui));
   vm.define_native("__route_invoke", 1, 3, [](Vm& v, std::vector<Value>& args, std::string& error) -> Value {
     if (args.empty()) return Value::nil();
@@ -1502,7 +1571,14 @@ void route_response(const Value& ret, int& status, std::string& res_body, std::s
       }
     }
     if (Value* b = m->find("body")) {
-      res_body = b->to_text();
+      if (b->type == Type::Bytes) {
+        const auto& d = b->bytes_data();
+        res_body.assign(reinterpret_cast<const char*>(d.data()), d.size());
+      } else if (b->type == Type::Str) {
+        res_body = b->str();
+      } else {
+        res_body = b->to_text();
+      }
     } else if (Value* j = m->find("json")) {
       std::string out;
       FacePane::value_json(*j, out, 0);
@@ -1515,6 +1591,10 @@ void route_response(const Value& ret, int& status, std::string& res_body, std::s
   } else if (ret.type == Type::Str) {
     res_body = ret.str();
     content_type = "text/plain; charset=utf-8";
+  } else if (ret.type == Type::Bytes) {
+    const auto& d = ret.bytes_data();
+    res_body.assign(reinterpret_cast<const char*>(d.data()), d.size());
+    content_type = "application/octet-stream";
   } else {
     std::string out;
     FacePane::value_json(ret, out, 0);
