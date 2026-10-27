@@ -89,154 +89,99 @@ fn fmt_short_date(ts) {
 
 // ---- Native 31-Column PDF Report --------------------------------------------
 
+// The PHP report's sections (quickReportColumns): the first column of each section counts toward touches.
+// Each column: [header, counts toward touches, value of a user (or the totals), format "int" | "dec" | "text"].
+fn report_columns(report) {
+  let grand = report.totals.touches > 0 ? real(report.totals.touches) : 1.0
+  let mv = fn(u, t, f) { return u.movements.by_type[t] != nil ? u.movements.by_type[t][f] : 0 }
+  let short = fn(v) { return v == nil or v == "" ? "" : slice(str(v), 5, 16) }
+  return [
+    ["Receiving", [["Qty In", true, fn(u) { return u.receiving.qty_in }, "int"],
+                   ["Qty Out", true, fn(u) { return u.receiving.qty_out }, "int"],
+                   ["Scan Rows", false, fn(u) { return u.receiving.scans }, "int"]]],
+    ["Picking", [["Units", true, fn(u) { return u.picking.qty }, "int"],
+                 ["Orders", false, fn(u) { return u.picking.orders }, "int"],
+                 ["Lines", false, fn(u) { return u.picking.lines }, "int"]]],
+    ["Bin Movements", [["Qty", true, fn(u) { return u.movements.qty }, "int"],
+                       ["Moves", false, fn(u) { return u.movements.moves }, "int"],
+                       ["Item Qty", false, fn(u) { return mv(u, "item move", "qty") }, "int"],
+                       ["Dolly Qty", false, fn(u) { return mv(u, "dolly move", "qty") }, "int"],
+                       ["Merge Qty", false, fn(u) { return mv(u, "merge", "qty") }, "int"]]],
+    ["Loads", [["Units", true, fn(u) { return u.loads.scans }, "int"],
+               ["Orders", false, fn(u) { return u.loads.orders }, "int"],
+               ["Dispatches", false, fn(u) { return u.loads.dispatches }, "int"],
+               ["Avg Disp. Units", false, fn(u) { return u.loads.avgdispatchunits }, "dec"],
+               ["Avg Disp. Min", false, fn(u) { return u.loads.avgloadtime }, "dec"],
+               ["Skipped", false, fn(u) { return u.loads.manual }, "int"],
+               ["Skipped %", false, fn(u) { return u.loads.manualpct }, "dec"],
+               ["Force Comp.", false, fn(u) { return u.loads.forced }, "int"]]],
+    ["Sticker Scan Out", [["Staged Units", true, fn(u) { return u.sticker.stagedunits }, "int"],
+                          ["Staged Orders", false, fn(u) { return u.sticker.staged }, "int"],
+                          ["Packed Orders", false, fn(u) { return u.sticker.packed }, "int"],
+                          ["Packed Units", false, fn(u) { return u.sticker.packedunits }, "int"],
+                          ["Bound Orders", false, fn(u) { return u.sticker.binds }, "int"]]],
+    ["Overall", [["Touches", false, fn(u) { return u.touches }, "int"],
+                 ["Days", false, fn(u) { return u.active_days }, "int"],
+                 ["Per Day", false, fn(u) { return u.touches_per_day }, "dec"],
+                 ["%", false, fn(u) { return 100.0 * real(u.touches) / grand }, "dec"],
+                 ["First", false, fn(u) { return short(u.first_touch) }, "text"],
+                 ["Last", false, fn(u) { return short(u.last_touch) }, "text"]]]
+  ]
+}
+
+// A value as the PHP report prints it: whole numbers with thousands, one decimal (blank when zero), or text.
+fn column_text(value, format) {
+  if format == "text" { return html_escape(value) }
+  if format == "dec" { return value == nil or real(value) == 0.0 ? "" : fmt_num(value, 1) }
+  return fmt_num(value == nil ? 0 : value, 0)
+}
+
+// The PDF: the PHP report's quickReportHtml table and quickReportCss, Letter landscape, title in the page header.
 fn render_pdf_report(report) {
   let css = join([
-    "body { color: #111111; font-family: Helvetica, Arial, sans-serif; margin: 0; padding: 0; }",
-    "div.header { font-size: 10pt; font-weight: bold; margin-bottom: 2mm; color: #111111; }",
-    "div.key { font-size: 7pt; margin-bottom: 2.5mm; color: #444444; }",
-    "span.swatch { display: inline-block; width: 12px; height: 8px; background-color: #ffd966; border: 0.2mm solid #888888; vertical-align: middle; margin-right: 3px; }",
-    "table.touches { border-collapse: collapse; width: 100%; font-size: 5pt; }",
-    "table.touches th { background-color: #e5e7eb; border: 0.2mm solid #9ca3af; padding: 0.6mm 0.3mm; text-align: center; color: #111827; font-weight: bold; }",
-    "table.touches th.contrib { background-color: #ffd966; color: #78350f; }",
-    "table.touches td { border: 0.2mm solid #d1d5db; padding: 0.5mm 0.3mm; text-align: right; color: #1f2937; }",
-    "table.touches td.l { text-align: left; font-weight: 500; }",
-    "table.touches td.t { white-space: nowrap; font-size: 4.5pt; color: #4b5563; }",
-    "table.touches td.contrib { background-color: #fff2cc; font-weight: 600; }",
-    "table.touches tr:nth-child(even) td { background-color: #f9fafb; }",
-    "table.touches tr:nth-child(even) td.contrib { background-color: #fef9c3; }",
-    "table.touches tr.total td { background-color: #e5e7eb; font-weight: bold; border-top: 0.4mm solid #4b5563; }",
-    "table.touches tr.total td.contrib { background-color: #fde68a; font-weight: bold; }",
-    "div.footer { font-size: 6.5pt; text-align: right; color: #6b7280; margin-top: 2mm; }"
+    "table.touches { border-collapse: collapse; width: 100%; font-size: 6.5pt; }",
+    "table.touches th { background-color: #dddddd; border: 0.2mm solid #888888; padding: 0.8mm; text-align: center; }",
+    "table.touches th.contrib { background-color: #ffd966; }",
+    "table.touches td { border: 0.2mm solid #888888; padding: 0.8mm; text-align: right; }",
+    "table.touches td.l { text-align: left; }",
+    "table.touches td.t { white-space: nowrap; font-size: 6pt; }",
+    "table.touches td.contrib { background-color: #fff2cc; }",
+    "table.touches tr.total td { background-color: #eeeeee; font-weight: bold; }",
+    "table.touches tr.total td.contrib { background-color: #ffe699; }",
+    "div.key { font-size: 8pt; margin-bottom: 2mm; }",
+    "span.swatch { display: inline-block; width: 4mm; height: 2.5mm; vertical-align: middle; background-color: #ffd966; border: 0.2mm solid #888888; }"
   ], " ")
-
-  let grand = report.totals.touches > 0 ? report.totals.touches : 1.0
-
-  let parts = [
-    "<div class=\"header\">Warehouse Touches " + html_escape(report.start) + " to " + html_escape(report.stop) + "</div>",
-    "<div class=\"key\"><span class=\"swatch\"></span> Highlighted columns count toward total touches (units)</div>",
-    "<table class=\"touches\"><thead><tr><th rowspan=\"2\">User</th>",
-    "<th colspan=\"3\">Receiving</th>",
-    "<th colspan=\"3\">Picking</th>",
-    "<th colspan=\"5\">Bin Movements</th>",
-    "<th colspan=\"8\">Loads</th>",
-    "<th colspan=\"5\">Sticker Scan Out</th>",
-    "<th colspan=\"6\">Overall</th></tr><tr>",
-    "<th class=\"contrib\">Qty In</th><th class=\"contrib\">Qty Out</th><th>Scans</th>",
-    "<th class=\"contrib\">Units</th><th>Orders</th><th>Lines</th>",
-    "<th class=\"contrib\">Qty</th><th>Moves</th><th>Item Qty</th><th>Dolly Qty</th><th>Merge Qty</th>",
-    "<th class=\"contrib\">Units</th><th>Orders</th><th>Disp.</th><th>Avg Disp. Units</th><th>Avg Disp. Min</th><th>Skipped</th><th>Skipped %</th><th>Force Comp.</th>",
-    "<th class=\"contrib\">Staged Units</th><th>Staged Orders</th><th>Packed Orders</th><th>Packed Units</th><th>Bound Orders</th>",
-    "<th>Touches</th><th>Days</th><th>Per Day</th><th>%</th><th>First</th><th>Last</th>",
-    "</tr></thead><tbody>"
-  ]
-
-  for u in report.users {
-    let r = u.receiving
-    let p = u.picking
-    let m = u.movements
-    let l = u.loads
-    let s = u.sticker
-    let mi = m.by_type["item move"] != nil ? m.by_type["item move"].qty : 0
-    let md = m.by_type["dolly move"] != nil ? m.by_type["dolly move"].qty : 0
-    let mm = m.by_type["merge"] != nil ? m.by_type["merge"].qty : 0
-    let u_pct = fmt_num((100.0 * real(u.touches)) / real(grand), 1)
-
-    push(parts, join([
-      "<tr>",
-      "<td class=\"l\">" + html_escape(u.userid) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(r.qty_in, 0) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(r.qty_out, 0) + "</td>",
-      "<td>" + fmt_num(r.scans, 0) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(p.qty, 0) + "</td>",
-      "<td>" + fmt_num(p.orders, 0) + "</td>",
-      "<td>" + fmt_num(p.lines, 0) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(m.qty, 0) + "</td>",
-      "<td>" + fmt_num(m.moves, 0) + "</td>",
-      "<td>" + fmt_num(mi, 0) + "</td>",
-      "<td>" + fmt_num(md, 0) + "</td>",
-      "<td>" + fmt_num(mm, 0) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(l.scans, 0) + "</td>",
-      "<td>" + fmt_num(l.orders, 0) + "</td>",
-      "<td>" + fmt_num(l.dispatches, 0) + "</td>",
-      "<td>" + fmt_num(l.avgdispatchunits, 1) + "</td>",
-      "<td>" + fmt_num(l.avgloadtime, 1) + "</td>",
-      "<td>" + fmt_num(l.manual, 0) + "</td>",
-      "<td>" + fmt_num(l.manualpct, 1) + "%</td>",
-      "<td>" + fmt_num(l.forced, 0) + "</td>",
-      "<td class=\"contrib\">" + fmt_num(s.stagedunits, 0) + "</td>",
-      "<td>" + fmt_num(s.staged, 0) + "</td>",
-      "<td>" + fmt_num(s.packed, 0) + "</td>",
-      "<td>" + fmt_num(s.packedunits, 0) + "</td>",
-      "<td>" + fmt_num(s.binds, 0) + "</td>",
-      "<td><b>" + fmt_num(u.touches, 0) + "</b></td>",
-      "<td>" + fmt_num(u.active_days, 0) + "</td>",
-      "<td>" + fmt_num(u.touches_per_day, 1) + "</td>",
-      "<td>" + u_pct + "%</td>",
-      "<td class=\"t\">" + fmt_short_date(u.first_touch) + "</td>",
-      "<td class=\"t\">" + fmt_short_date(u.last_touch) + "</td>",
-      "</tr>"
-    ], ""))
+  let sections = report_columns(report)
+  let parts = ["<div class=\"key\"><span class=\"swatch\">&nbsp;&nbsp;&nbsp;</span> Highlighted columns count toward total touches (units)</div>",
+               "<table class=\"touches\"><thead><tr><th rowspan=\"2\">User</th>"]
+  for sec in sections { push(parts, "<th colspan=\"" + str(len(sec[1])) + "\">" + html_escape(sec[0]) + "</th>") }
+  push(parts, "</tr><tr>")
+  for sec in sections {
+    for col in sec[1] { push(parts, "<th" + (col[1] ? " class=\"contrib\"" : "") + ">" + html_escape(col[0]) + "</th>") }
   }
-
-  // Grand Totals Row
-  let t = report.totals
-  let tr = t.receiving
-  let tp = t.picking
-  let tm = t.movements
-  let tl = t.loads
-  let ts = t.sticker
-  let tmi = tm.by_type["item move"] != nil ? tm.by_type["item move"].qty : 0
-  let tmd = tm.by_type["dolly move"] != nil ? tm.by_type["dolly move"].qty : 0
-  let tmm = tm.by_type["merge"] != nil ? tm.by_type["merge"].qty : 0
-
-  push(parts, join([
-    "<tr class=\"total\">",
-    "<td class=\"l\">All users</td>",
-    "<td class=\"contrib\">" + fmt_num(tr.qty_in, 0) + "</td>",
-    "<td class=\"contrib\">" + fmt_num(tr.qty_out, 0) + "</td>",
-    "<td>" + fmt_num(tr.scans, 0) + "</td>",
-    "<td class=\"contrib\">" + fmt_num(tp.qty, 0) + "</td>",
-    "<td>" + fmt_num(tp.orders, 0) + "</td>",
-    "<td>" + fmt_num(tp.lines, 0) + "</td>",
-    "<td class=\"contrib\">" + fmt_num(tm.qty, 0) + "</td>",
-    "<td>" + fmt_num(tm.moves, 0) + "</td>",
-    "<td>" + fmt_num(tmi, 0) + "</td>",
-    "<td>" + fmt_num(tmd, 0) + "</td>",
-    "<td>" + fmt_num(tmm, 0) + "</td>",
-    "<td class=\"contrib\">" + fmt_num(tl.scans, 0) + "</td>",
-    "<td>" + fmt_num(tl.orders, 0) + "</td>",
-    "<td>" + fmt_num(tl.dispatches, 0) + "</td>",
-    "<td>" + fmt_num(tl.avgdispatchunits, 1) + "</td>",
-    "<td>" + fmt_num(tl.avgloadtime, 1) + "</td>",
-    "<td>" + fmt_num(tl.manual, 0) + "</td>",
-    "<td>" + fmt_num(tl.manualpct, 1) + "%</td>",
-    "<td>" + fmt_num(tl.forced, 0) + "</td>",
-    "<td class=\"contrib\">" + fmt_num(ts.stagedunits, 0) + "</td>",
-    "<td>" + fmt_num(ts.staged, 0) + "</td>",
-    "<td>" + fmt_num(ts.packed, 0) + "</td>",
-    "<td>" + fmt_num(ts.packedunits, 0) + "</td>",
-    "<td>" + fmt_num(ts.binds, 0) + "</td>",
-    "<td><b>" + fmt_num(t.touches, 0) + "</b></td>",
-    "<td>" + fmt_num(t.active_days, 0) + "</td>",
-    "<td>" + fmt_num(t.touches_per_day, 1) + "</td>",
-    "<td>100.0%</td>",
-    "<td class=\"t\">" + fmt_short_date(t.first_touch) + "</td>",
-    "<td class=\"t\">" + fmt_short_date(t.last_touch) + "</td>",
-    "</tr>"
-  ], ""))
-
+  push(parts, "</tr></thead><tbody>")
+  let row = fn(u, cls, name) {
+    let cells = ["<tr class=\"" + cls + "\"><td class=\"l\">" + html_escape(name) + "</td>"]
+    for sec in sections {
+      for col in sec[1] {
+        let klass = (col[3] == "text" ? "t" : "") + (col[1] ? " contrib" : "")
+        push(cells, "<td class=\"" + klass + "\">" + column_text(col[2](u), col[3]) + "</td>")
+      }
+    }
+    push(cells, "</tr>")
+    return join(cells, "")
+  }
+  for u in report.users { push(parts, row(u, "", u.userid)) }
+  push(parts, row(report.totals, "total", "All users"))
   push(parts, "</tbody></table>")
-  let html = join(parts, "")
-
-  let options = {
-    "page_size": "letter",
-    "orientation": "landscape",
-    "margin": 18,
+  // mPDF('', 'Letter-L', 0, '', 8, 8, 18, 12, 6, 6): margins in mm, as points
+  let mm = fn(v) { return int(v * 72.0 / 25.4 + 0.5) }
+  return doc.pdf(join(parts, ""), css, {
+    "page_size": "letter", "orientation": "landscape",
+    "margin_left": mm(8), "margin_right": mm(8), "margin_top": mm(18), "margin_bottom": mm(12),
     "header": "Warehouse Touches " + report.start + " to " + report.stop,
-    "footer": "Printed " + report.stop + "   Page {PAGENO} of {nbpg}"
-  }
-
-  return doc.pdf(html, css, options)
+    "footer": "Printed " + date_format(now(), "%Y-%m-%d %H:%M") + "   {PAGENO} / {nbpg}"
+  })
 }
 
 // ---- Native 31-Column OpenXML XLSX Package ----------------------------------
