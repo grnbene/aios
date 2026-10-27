@@ -1774,6 +1774,10 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
     return res;
   }
 
+  if (!s->canvas && req.query.rfind("poll=", 0) != 0) {   // the page opened (not a native client's poll): its URL's query
+    std::string oe;
+    if (!web_pane_on_open(vm, s->pane, req.query, oe)) report(oe);
+  }
   refresh_locked(*s);
   // ?poll=N: a native client asking whether anything changed since N, without a render or a payload
   if (req.query.rfind("poll=", 0) == 0) {

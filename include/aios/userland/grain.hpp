@@ -801,6 +801,8 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
 bool web_pane_api_only(Vm& vm, uint64_t id);
 // The fleet member a ui.pane's "machine" gives the whole pane to ("" when it runs here).
 std::string web_pane_machine(Vm& vm, uint64_t id);
+// The pane's "on_open" with the page request's URL query (true when it has none, or it ran).
+bool web_pane_on_open(Vm& vm, uint64_t id, const std::string& query, std::string& error);
 struct WorkerCall;
 // The pane's "watch" function, copied to a worker VM with `since` as its argument; null (error empty) when it has none.
 std::unique_ptr<WorkerCall> web_pane_watch_prepare(Vm& vm, uint64_t id, const Value& since, std::string& error);
