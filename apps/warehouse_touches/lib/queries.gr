@@ -91,9 +91,9 @@ fn r1(v) { return round(real(v), 1) }
 
 // The report for a range and a span of hours (nil: all), as the PHP report's quickReportData gives it.
 fn fetch_warehouse_touches(db, start_in, stop_in, userids, span) {
-  let range = report_range(start_in, stop_in)
-  let rows = touch_hours(db, range[0], range[1], span)
-  let report = merge_rows(db, rows, range[0], range[1])
+  let dates = report_range(start_in, stop_in)
+  let rows = touch_hours(db, dates[0], dates[1], span)
+  let report = merge_rows(db, rows, dates[0], dates[1])
   report.hours = span
   report.hour = span != nil and span.from == span.to ? span.from : nil   // the PHP page's one hour
   return report
@@ -102,14 +102,14 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids, span) {
 // The same, and the day's profile beside it: what each of the 24 hours holds over the range (the touches the report
 // would give for that hour alone, by source) - from one read of the range's hours.
 fn fetch_with_profile(db, start_in, stop_in, span) {
-  let range = report_range(start_in, stop_in)
-  let rows = touch_hours(db, range[0], range[1], nil)
+  let dates = report_range(start_in, stop_in)
+  let rows = touch_hours(db, dates[0], dates[1], nil)
   let by_hour = group_by(rows, fn(r) { return r.h })
   let profile = map(range(0, 24), fn(h) {
-    let t = merge_rows(nil, by_hour[str(h)] ?? [], range[0], range[1]).totals
+    let t = merge_rows(nil, by_hour[str(h)] ?? [], dates[0], dates[1]).totals
     return {"hour": h, "touches": t.touches, "parts": t.parts}
   })
-  let report = merge_rows(db, filter(rows, fn(r) { return in_span(span, r.h) }), range[0], range[1])
+  let report = merge_rows(db, filter(rows, fn(r) { return in_span(span, r.h) }), dates[0], dates[1])
   report.hours = span
   report.hour = span != nil and span.from == span.to ? span.from : nil
   report.profile = profile
