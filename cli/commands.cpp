@@ -1264,13 +1264,15 @@ void cmd_serve(Ctx& c, const Args& a) {
       return true;
     };
     if (c.k.self().str().compare(0, member.size(), member) == 0) return false;   // this machine is that member
-    if (!c.k.in_fleet()) return answer(503, "this route runs on " + member + ", and this machine is not in a fleet");
-    std::vector<Id128> hits;
-    for (auto& id : c.k.fleet_roster()) if (id.str().compare(0, member.size(), member) == 0) hits.push_back(id);
-    if (hits.size() != 1) return answer(503, (hits.empty() ? "no fleet member " : "more than one fleet member starts with ") + member);
+    // The member: from the hub's roster, a link already made, or its direct route (AIOS_FLEET_DIRECT) - so a member
+    // reached straight is served while the hub is down.
+    Id128 target;
     {
       std::lock_guard<std::mutex> g(reach_mu);
-      auto at = c.k.reach(hits[0]);   // its devices join this machine's fabric (once; a dead link is replaced)
+      auto who = c.k.find_member(member);
+      if (!who.ok()) return answer(503, c.k.in_fleet() ? who.error().message : "this route runs on " + member + ", and this machine cannot reach it: " + who.error().message);
+      target = *who;
+      auto at = c.k.reach(target);   // its devices join this machine's fabric (once; a dead link is replaced)
       if (!at.ok()) return answer(503, "cannot reach " + member + ": " + at.error().message);
     }
     {
@@ -1312,7 +1314,7 @@ void cmd_serve(Ctx& c, const Args& a) {
       Operation op;
       op.code = OpCode::Custom;
       op.custom_kernel = fnv1a(std::string(kAppRouteKernel));
-      op.requirement.device_selector = "remote:relay:" + hits[0].short_str();
+      op.requirement.device_selector = "remote:relay:" + target.short_str();   // the member's link, direct or through the hub
       Tensor tin = rb->tin;
       tin.shape = {(uint64_t)in.size()};   // the request's own bytes, not the buffer's room
       op.inputs.push_back(tin);

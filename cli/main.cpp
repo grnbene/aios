@@ -235,6 +235,28 @@ int main(int argc, char** argv) {
       const std::string member = mkey && *mkey ? std::string(" member-key=") + mkey : std::string();
       auto j = run_line(s, " fleet join " + fhost + " " + fport + " " + std::string(fkey) + " retry" + member);
       if (!j.ok()) std::cerr << "fleet: could not join " << h << " at boot: " << j.error().str() << "\n";
+      // AIOS_FLEET_LISTEN=<port>: members that name this machine in their AIOS_FLEET_DIRECT link to it here, straight,
+      // instead of through the hub. Same cluster key and handshake as a hub circuit; firewall the port to those members.
+      if (const char* lp = std::getenv("AIOS_FLEET_LISTEN"); lp && *lp) {
+        auto l = run_line(s, " node serve " + std::string(lp) + " " + std::string(fkey) + " bind=0.0.0.0");
+        if (!l.ok()) std::cerr << "fleet: could not listen on " << lp << ": " << l.error().str() << "\n";
+      }
+      // AIOS_FLEET_DIRECT=<member>=<host>:<port>[,...]: those members are reached straight at that address; the hub
+      // carries the link only when that fails. Unset it to go back to the hub alone.
+      if (const char* dr = std::getenv("AIOS_FLEET_DIRECT"); dr && *dr) {
+        std::string all = dr;
+        size_t at = 0;
+        while (at <= all.size()) {
+          size_t comma = all.find(',', at);
+          if (comma == std::string::npos) comma = all.size();
+          const std::string one = all.substr(at, comma - at);
+          at = comma + 1;
+          const size_t eq = one.find('='), colon = one.rfind(':');
+          if (one.empty()) continue;
+          if (eq == std::string::npos || colon == std::string::npos || colon < eq) { std::cerr << "fleet: AIOS_FLEET_DIRECT entry '" << one << "' is not <member>=<host>:<port>\n"; continue; }
+          s.kernel->add_direct_route(one.substr(0, eq), one.substr(eq + 1, colon - eq - 1), (uint16_t)std::strtoul(one.c_str() + colon + 1, nullptr, 10));
+        }
+      }
     }
   }
 
