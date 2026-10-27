@@ -2206,6 +2206,13 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
   return true;
 }
 
+bool web_pane_has_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path) {
+  FacePane* f = web_face(vm, id);
+  if (!f) return false;
+  std::shared_ptr<MapObj> params;
+  return route_match(f, method, path, params) != nullptr;
+}
+
 std::string web_pane_route_machine(Vm& vm, uint64_t id, const std::string& method, const std::string& path) {
   FacePane* f = web_face(vm, id);
   std::shared_ptr<MapObj> params;

@@ -134,6 +134,27 @@ ASQL builds the replacement Thing in the background alongside the live one (name
 
 ---
 
+## Routes on another member, and their event streams
+
+`on_machine(member, handler)` gives a route to another fleet member: the request is answered by that member's copy of
+the app and the answer comes back here. A request whose answer is a stream - `Accept: text/event-stream`, what a
+browser's `EventSource` sends - is carried as a stream: the member's route writes (`writer.event`, `writer.write`)
+reach this machine's client as they are written, on a node link of the stream's own (a node `AppStream` request,
+`src/node/protocol.hpp`). When the client leaves, the link is closed, the member's next write fails and its route's
+`writer.is_closed()` turns true. Every other request is carried as one answer, as before.
+
+A page's own `EventSource` to one of its routes reaches that route; before, a `ui.pane` program served it the pane's
+stream of changes instead, whatever the path.
+
+Driven on a private local fleet (hub and two app hosts, 2026-10-27): a route on member A writing an event every
+500 ms, asked through member B, delivered them 0.50 s apart, each from A; a client that left after 1.2 s ended A's
+route ("reader gone"); a plain route on A came back whole through B.
+
+`apps/warehouse_touches` puts the two together: its `/quickreportevents` route waits on the `touch_day` Thing with
+`WAIT THING` (see `docs/asql.md`) and pushes the new figures when a day of the page's range changes.
+
+---
+
 ## Things to keep in mind
 
 - **Compute vs Serve**: ASQL compute tasks, binlog replication, and MySQL wire protocol services run under `compute serve`, while Grain application hosting is managed by `serve`.

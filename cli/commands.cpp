@@ -2,6 +2,7 @@
 #include "model_controller.h"
 #include "grain_cmd.hpp"
 #include "shell.hpp"
+#include "../src/node/protocol.hpp"
 #include "aios/userland/crash_log.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/crypto/sha256.hpp"
@@ -1342,6 +1343,47 @@ void cmd_serve(Ctx& c, const Args& a) {
     }
     return answer(502, "on " + member + ": the answer kept outgrowing its buffer");
   };
+  // A route's stream (server-sent events) from a member: one AppStream on a link of its own, each piece of the
+  // member's route written through as it comes. The member's app answers it (the stream runner below, there).
+  host_opt.forward_stream = [&c, &reach_mu](const std::string& app, const std::string& member, const userland::grain::WebUi::Request& req,
+                                            userland::grain::StreamHeaderCallback on_headers, userland::grain::StreamChunkCallback on_chunk) -> bool {
+    if (c.k.self().str().compare(0, member.size(), member) == 0) return false;   // this machine is that member
+    auto fail = [&](int status, const std::string& why) {
+      on_headers(status, {{"Content-Type", "text/plain; charset=utf-8"}});
+      on_chunk(why + "\n");
+      return true;
+    };
+    std::shared_ptr<RemoteNode> link;
+    {
+      std::lock_guard<std::mutex> g(reach_mu);
+      auto who = c.k.find_member(member);
+      if (!who.ok()) return fail(503, who.error().message);
+      auto at = c.k.reach(*who);
+      if (!at.ok()) return fail(503, "cannot reach " + member + ": " + at.error().message);
+      auto sib = c.k.nodes()[*at]->open_sibling();   // a stream holds its link: the shared one stays free
+      if (!sib.ok()) return fail(503, "cannot open a stream to " + member + ": " + sib.error().message);
+      link = *sib;
+    }
+    const ByteBuffer in = encode_app_request(app, req);
+    bool headed = false;
+    auto r = link->stream(nodeproto::AppStream, ByteSpan(in.data(), in.size()), [&](ByteSpan f) -> bool {
+      Reader rd(f);
+      const uint8_t kind = rd.u8();
+      if (kind == 1) {
+        const int status = (int)rd.u32();
+        const uint32_t n = rd.u32();
+        std::vector<std::pair<std::string, std::string>> hs;
+        for (uint32_t i = 0; i < n && rd.ok(); ++i) { std::string k = rd.str(); std::string v = rd.str(); hs.push_back({k, v}); }
+        headed = true;
+        return on_headers(status, hs);
+      }
+      if (kind == 2) return on_chunk(rd.str());
+      return true;
+    }, 90000);   // the route sends at least a comment every 25 s
+    link->close();
+    if (!r.ok() && !headed) return fail(502, "on " + member + ": " + r.error().message);
+    return true;
+  };
   ga::Host apps(c.k.host(), *store, host_opt);
   // What a member's route given to this machine runs: the request answered by the app here, in-process.
   for (auto* d : c.k.devices().of_type(DeviceType::CPU)) {
@@ -1389,6 +1431,30 @@ void cmd_serve(Ctx& c, const Args& a) {
   // whichever took it first, and one the command server took offered no devices - work given there (an app.route)
   // found "no device answering" in the caller's fabric.
   if (c.k.service()) c.k.service()->set_command_runner(runner);
+  // A member's stream request (AppStream) for one of this host's apps: its route's writes sent back as frames.
+  if (c.k.service())
+    c.k.service()->set_stream_runner([&apps](ByteSpan request, const std::function<bool(ByteSpan)>& emit) -> Result<void> {
+      std::string app;
+      userland::grain::WebUi::Request req;
+      if (!decode_app_request(request, app, req)) return Result<void>(Status::Corrupt, "a malformed app stream request");
+      auto head = [&emit](int status, const std::vector<std::pair<std::string, std::string>>& hs) -> bool {
+        ByteBuffer b;
+        Writer w(b);
+        w.u8(1);
+        w.u32((uint32_t)status);
+        w.u32((uint32_t)hs.size());
+        for (const auto& h : hs) { w.str(h.first); w.str(h.second); }
+        return emit(ByteSpan(b.data(), b.size()));
+      };
+      auto chunk = [&emit](const std::string& s) -> bool {
+        ByteBuffer b;
+        Writer w(b);
+        w.u8(2);
+        w.str(s);
+        return emit(ByteSpan(b.data(), b.size()));
+      };
+      return apps.answer_forwarded_stream(app, req, head, chunk);
+    });
   else if (c.k.relay()) c.k.relay()->set_command_runner(runner);
   // (straight out: this command does not return, and what it says belongs in the service's log now)
   std::cout << "serve: " << store->apps().size() << " app(s) in " << home << "; control on " << (all_ips ? "all IPs" : "127.0.0.1") << " port " << bound

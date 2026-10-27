@@ -123,10 +123,17 @@ class Host {
     // A web app's route given to a fleet member (on_machine): its request answered there, by the embedder's link
     // (aios: the fleet). false when `member` is this machine, so the route answers here. Unset: every route here.
     std::function<bool(const std::string& app, const std::string& member, const WebUi::Request& req, WebUi::Response& res)> forward;
+    // A stream (server-sent events) from such a route, carried as the member's route writes it.
+    std::function<bool(const std::string& app, const std::string& member, const WebUi::Request& req,
+                       StreamHeaderCallback on_headers, StreamChunkCallback on_chunk)> forward_stream;
   };
   // What a forwarded request is answered with on the member it was given to: this host's own app `app`, asked over
   // its local port as a client would ask it. The caller's link carries the request in and the answer out.
   Result<WebUi::Response> answer_forwarded(const std::string& app, const WebUi::Request& req);
+  // The same for a stream: the route's writes go to on_headers / on_chunk as they are made (false from either: the
+  // caller is gone, and the route's writer reads closed).
+  Result<void> answer_forwarded_stream(const std::string& app, const WebUi::Request& req, StreamHeaderCallback on_headers,
+                                       StreamChunkCallback on_chunk);
   Host(hal::Host& host, Store& store, Options opt);
   ~Host();
 

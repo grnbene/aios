@@ -24,6 +24,10 @@ enum Type : uint8_t {
   // Writes, one operation, reads - in ONE round trip: a remote job over a
   // relay pays one crossing, not five (a peer advertises it: kFeatExecBatch).
   ExecBatch = 18,
+  // An app request whose answer is a stream (server-sent events): the member answers with AppStream frames as the
+  // route writes them - a head (u8 1, u32 status, u32 n, n key/value strings), chunks (u8 2, bytes), an end (u8 3) -
+  // on a link of its own (RemoteNode::open_sibling), until the route ends or the caller closes the link.
+  AppStream = 19,
   Error = 0x7F
 };
 constexpr uint32_t MAX_PAYLOAD = 256u << 20;
