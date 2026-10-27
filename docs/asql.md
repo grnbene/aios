@@ -780,6 +780,10 @@ Results from Thing statements carry an extra `machine` column (this engine's
 short identity), because the same statements can be sent `ON <machine>` across
 a fleet.
 
+To see a running engine's Things from a shell without connecting to it, use
+`grain ps`: it lists each engine on the machine with its Things and their row
+counts (see [What's running on this machine](grain-apps.md#whats-running-on-this-machine-grain-ps)).
+
 ### `WAIT THING`: told when a Thing changes
 
 `WAIT THING <name> SINCE <clock> [TIMEOUT <seconds>]` returns as soon as the

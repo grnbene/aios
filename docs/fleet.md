@@ -221,7 +221,11 @@ B> fleet members                    (hub killed)
 is not reachable, keeps attaching in the background on the same backoff, and
 `fleet members` shows the same "reconnecting" line until it attaches.
 
-`fleet members` shows only identities. A member becomes a node-list entry
+`fleet members` shows only identities. To see what a machine itself is running
+(its app hosts, ASQL engines and grain programs), run `grain ps` on it; for apps
+across the fleet, `app status on ALL` (see [What's running on this machine](grain-apps.md#whats-running-on-this-machine-grain-ps)).
+
+A member becomes a node-list entry
 (`relay:<id>`) when something reaches it. `fleet plan`, `tick`, `watch`, `db`,
 `observe` and `sat` call `Kernel::fleet_sync()`, which reaches every roster
 member it doesn't hold a live link to:
