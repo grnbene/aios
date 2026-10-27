@@ -230,14 +230,14 @@ fn source_cells(u) {
   let st = u.sticker
   let rec_extra = u.receiving.qty_out > 0 ? MID + n0(u.receiving.qty_in) + " in / " + n0(u.receiving.qty_out) + " out" : ""
   return {
-    "receiving": small(n0(u.receiving.scans) + " scan rows" + rec_extra),
+    "receiving": small(n0(u.receiving.scans) + " scans" + rec_extra),
     "picking": small(n0(u.picking.orders) + " orders" + MID + n0(u.picking.lines) + " lines"),
     "movements": small(n0(u.movements.moves) + " moves"),
-    "loads": [l.dispatches > 0 ? small(n0(l.dispatches) + " disp" + MID + "avg " + n1(l.avgloadtime) + " min" + MID + "avg " + n1(l.avgdispatchunits) + " units") : nil,
-              l.manual > 0 or l.forced > 0 ? small(n1(l.manualpct) + "% skipped (" + n0(l.manual) + ")" + MID + n0(l.forced) + " force completed") : nil,
-              l.pickuporders > 0 or l.pickupunits > 0 ? small(n0(l.pickuporders) + " pickup orders" + MID + n0(l.pickupunits) + " pickup units (not scanned, credited to taken by)") : nil],
-    "sticker": [small(n0(st.staged) + " staged orders"),
-                small("packed " + n0(st.packed) + " ord" + MID + n0(st.packedunits) + " units" + MID + n0(st.binds) + " bound")]
+    "loads": [l.dispatches > 0 ? small(n0(l.dispatches) + " disp" + MID + n1(l.avgloadtime) + " min" + MID + n1(l.avgdispatchunits) + "/disp") : nil,
+              l.manual > 0 or l.forced > 0 ? small(n1(l.manualpct) + "% skipped" + (l.forced > 0 ? MID + n0(l.forced) + " forced" : "")) : nil,
+              l.pickuporders > 0 or l.pickupunits > 0 ? small(n0(l.pickuporders) + " pickups" + MID + n0(l.pickupunits) + " units") : nil],
+    "sticker": [small(n0(st.staged) + " staged"),
+                small(n0(st.packed) + " packed" + MID + n0(st.binds) + " bound")]
   }
 }
 
@@ -361,12 +361,12 @@ fn live_node(report, sorter, hours) {
     el("div", {"class": "card total"}, el("div", {"class": "label"}, "Total touches"), el("div", {"class": "value"}, n0(t.touches)),
        el("div", {"class": "sub"}, n0(len(report.users)) + " people" + MID + n0(t.active_days) + " active days"), last_line(nil)),
     card(SOURCES[0], n0(pt.receiving), n0(t.receiving.qty_in) + " in / " + n0(t.receiving.qty_out) + " out" + MID +
-                                       n0(t.receiving.scans) + " scan rows" + MID + "under " + n0(t.receiving.vendors) + " vendors"),
+                                       n0(t.receiving.scans) + " scans" + MID + n0(t.receiving.vendors) + " vendors"),
     card(SOURCES[1], n0(pt.picking), n0(t.picking.orders) + " orders" + MID + n0(t.picking.lines) + " lines"),
     card(SOURCES[2], n0(pt.movements), n0(t.movements.moves) + " moves"),
-    card(SOURCES[3], n0(pt.loads), n0(t.loads.dispatches) + " dispatches" + MID + n0(t.loads.pickuporders) + " pickup orders" + MID +
-                                   n0(t.loads.pickupunits) + " pickup units" + MID + n1(t.loads.manualpct) + "% skipped (" + n0(t.loads.manual) + ")"),
-    card(SOURCES[4], n0(pt.sticker), n0(t.sticker.staged) + " staged orders" + MID + n0(t.sticker.stagedunits) + " units staged"))
+    card(SOURCES[3], n0(pt.loads), n0(t.loads.dispatches) + " dispatches" + MID + n0(t.loads.pickuporders) + " pickups (" +
+                                   n0(t.loads.pickupunits) + " units)" + MID + n1(t.loads.manualpct) + "% skipped"),
+    card(SOURCES[4], n0(pt.sticker), n0(t.sticker.staged) + " orders staged"))
 
   let nil_cell = el("span", {"class": "nil"}, "\u{2013}")
   let top = max(1.0, max(concat([0.0], map(report.users, fn(u) { return real(u.touches) }))))
@@ -419,7 +419,7 @@ fn live_node(report, sorter, hours) {
        el("td", {"class": "when"}, when(t.first_touch), el("small", "to " + when(t.last_touch))))
   let pickups = t.loads.pickuporders > 0 or t.loads.pickupunits > 0
   let legend = map(SOURCES, fn(src) {
-    return el("span", dot(src[2]), src[1], src[0] == "loads" and pickups ? [" ", el("small", "(incl. pickup orders, credited to who took the order)")] : nil)
+    return el("span", dot(src[2]), src[1], src[0] == "loads" and pickups ? [" ", el("small", "(incl. pickups)")] : nil)
   })
 
   let panel = el("div", {"class": "panel"},
