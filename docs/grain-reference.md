@@ -673,6 +673,10 @@ actions, the pushed re-render and its in-place update all work as for widgets.
 - **State** such as a sort or a range lives in the program (one copy per viewer unless the pane is `"shared"`), so
   a re-render keeps it; markup pushed into an open page is merged in place, and a `<script>` inside it does not run.
 - **`css`** in the pane's options is added to the page.
+- **Databases with `"workers": true`:** each route runs in a VM copied from the program, and a connection cannot be
+  copied. A view that reads a database opens its own connection per render (`let c = db_connect(cfg)` ... `db_close(c)`)
+  rather than keeping one in a global its routes also use (the copy of such a route fails: "a grain_db cannot be
+  sent to a worker").
 - **`watch`** for a Thing: `"watch": {"thing": "touch_day", "db": DB_CFG, "timeout": 10}` - connect with `db_connect(DB_CFG)`,
   `WAIT THING touch_day SINCE <since> TIMEOUT 10`, close, return the clock: the function below, written for you.
 - **`watch`** in the pane's options is `fn(since)`: the host calls it on a thread of its own, in a VM of its own,

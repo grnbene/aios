@@ -77,11 +77,16 @@ EOF
 cat > "$W/app/service.gr" <<'EOF'
 import "cfg.gr"
 let db = merge(CFG, {"db": "shop"})
+// as warehouse_touches does: routes (in worker VMs) keep a connection in a global; the view opens its own per
+// render, since a connection the view kept in that global could not be copied to a worker
 let conn = nil
-ui.pane({"title": "Watch", "watch": {"thing": "tt", "db": db, "timeout": 5},
+fn get_conn() { if conn == nil { conn = db_connect(db) } return conn }
+ui.pane({"title": "Watch", "watch": {"thing": "tt", "db": db, "timeout": 5}, "workers": true,
+  "routes": {"/n": fn(req) { let x = thing_rows(get_conn(), "tt", ["x"]) return {"status": 200, "content_type": "text/plain", "body": str(x[0].n)} }},
   "view": fn() {
-    if conn == nil { conn = db_connect(db) }
-    let x = find_if(thing_rows(conn, "tt", ["x"]), fn(r) { return true })
+    let c = db_connect(db)
+    let x = find_if(thing_rows(c, "tt", ["x"]), fn(r) { return true })
+    db_close(c)
     return el("p", {"id": "n"}, "x has " + str(x == nil ? 0 : x.n))
   }})
 run_panes()
@@ -102,6 +107,10 @@ c = http.client.HTTPConnection("127.0.0.1", web, timeout=20); c.request("GET", "
 cookie = r.getheader("Set-Cookie").split(";")[0]; html = r.read().decode()
 ok = '<p id="n">x has 2</p>' in html
 print(("ok   " if ok else "FAIL ") + "the view reads the Thing with thing_rows")
+c2 = http.client.HTTPConnection("127.0.0.1", web, timeout=20); c2.request("GET", "/n", headers={"Cookie": cookie}); r2 = c2.getresponse(); body = r2.read().decode()
+route_ok = r2.status == 200 and body == "2"
+print(("ok   " if route_ok else "FAIL ") + "a worker route answers beside the view (%d %s)" % (r2.status, body[:80]))
+ok = ok and route_ok
 frames = []
 def listen():
     c = http.client.HTTPConnection("127.0.0.1", web, timeout=20)
