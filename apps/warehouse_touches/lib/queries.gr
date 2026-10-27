@@ -99,20 +99,42 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids, span) {
   return report
 }
 
-// The same, and the day's profile beside it: what each of the 24 hours holds over the range (the touches the report
-// would give for that hour alone, by source) - from one read of the range's hours.
-fn fetch_with_profile(db, start_in, stop_in, span) {
+fn in_days(sel, day) { return sel == nil or (day >= sel.from and day <= sel.to) }
+
+// The page's report: the range of the form (start, stop), narrowed to a run of its days (sel_days {from, to}, nil:
+// all of them) and to a span of hours (span, nil: all) - and, for the timeline's view, what each of its parts holds:
+//   "hours": profile, each hour of the day over the days picked (the touches that hour alone gives, by source)
+//   "days":  days, each day of the range over the hours picked
+//   "heat":  heat, each hour of each day of the range
+// All from one read of the range's hours; only the view asked for is worked out.
+fn fetch_for_page(db, start_in, stop_in, span, sel_days, view) {
   let dates = report_range(start_in, stop_in)
   let rows = touch_hours(db, dates[0], dates[1], nil)
-  let by_hour = group_by(rows, fn(r) { return r.h })
-  let profile = map(range(0, 24), fn(h) {
-    let t = merge_rows(nil, by_hour[str(h)] ?? [], dates[0], dates[1]).totals
-    return {"hour": h, "touches": t.touches, "parts": t.parts}
-  })
-  let report = merge_rows(db, filter(rows, fn(r) { return in_span(span, r.h) }), dates[0], dates[1])
+  let sel = sel_days != nil and sel_days.from >= dates[0] and sel_days.to <= dates[1] ? sel_days : nil
+  let from = sel == nil ? dates[0] : sel.from
+  let to = sel == nil ? dates[1] : sel.to
+  let report = merge_rows(db, filter(rows, fn(r) { return in_span(span, r.h) and in_days(sel, r.day) }), from, to)
+  let figures = fn(rs) { let t = merge_rows(nil, rs, from, to).totals return {"touches": t.touches, "parts": t.parts} }
+  if view == "days" {
+    let by_day = group_by(filter(rows, fn(r) { return in_span(span, r.h) }), fn(r) { return r.day })
+    report.days = map(date_range(dates[0], dates[1]), fn(d) { return merge({"day": d}, figures(by_day[d] ?? [])) })
+  } else if view == "heat" {
+    let by_cell = key_by(rows, fn(r) { return r.hour })
+    report.heat = map(date_range(dates[0], dates[1]), fn(d) {
+      return {"day": d, "hours": map(range(0, 24), fn(h) {
+        let r = by_cell[d + " " + pad_left(str(h), 2, "0")]
+        return r == nil ? 0 : figures([r]).touches
+      })}
+    })
+  } else {
+    let by_hour = group_by(filter(rows, fn(r) { return in_days(sel, r.day) }), fn(r) { return r.h })
+    report.profile = map(range(0, 24), fn(h) { return merge({"hour": h}, figures(by_hour[str(h)] ?? [])) })
+  }
   report.hours = span
   report.hour = span != nil and span.from == span.to ? span.from : nil
-  report.profile = profile
+  report.sel_days = sel
+  report.range_start = dates[0]
+  report.range_stop = dates[1]
   return report
 }
 

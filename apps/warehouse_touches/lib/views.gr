@@ -267,80 +267,143 @@ fn span_label(span) {
   return at(span.from, "00") + " \u{2013} " + at(span.to, "59")
 }
 
-// Through the day: what each hour of the day holds over the range, a column per hour with its touches stacked by
-// source (receiving at the foot) and scaled to the busiest hour, and under it a slider with two handles over the same
-// hours. Dragging a handle shows the span as it goes (SLIDER_JS) and picks it when let go (the handles are bound
-// fields, their change an action); a click on a column picks that hour (again: all hours). Outside the span the
-// columns dim. Each column's title gives its figures.
-fn timeline_node(report, span, pick) {
-  let profile = report.profile ?? []
-  let top = max(1.0, max(concat([0.0], map(profile, fn(p) { return real(p.touches) }))))
-  let cols = map(profile, fn(p) {
-    let h = p.hour
+// The days picked on the timeline, in words: "All days", "Oct 5", "Oct 5 - Oct 12".
+fn days_label(sel) {
+  if sel == nil { return "All days" }
+  let d = fn(x) { return date_format(x, "%b %-d") }
+  return sel.from == sel.to ? d(sel.from) : d(sel.from) + " \u{2013} " + d(sel.to)
+}
+
+// Columns of stacked bars (one per hour, or per day) and a two-handle slider under them, as the Hours and Days tabs
+// draw them. items: [{touches, parts}]; picked(i): in the selection; none: nothing selected (all); labels(i): [from
+// label, to label]; on_click(i): a column's click; apply(f): the slider let go (f.tl_from, f.tl_to: indexes); axis(i):
+// the label under column i ("" for none); all_text: the label when all are picked; label_class: the label it updates.
+fn bars_node(items, picked, none, lo, hi, labels, on_click, apply, axis, all_text, label_class, extra_class) {
+  let n = len(items)
+  let top = max(1.0, max(concat([0.0], map(items, fn(p) { return real(p.touches) }))))
+  let cols = map(enumerate(items), fn(pair) {
+    let i = pair[0]
+    let p = pair[1]
     let total = real(p.touches)
-    let title = hour_label(h) + ": " + n0(total) + " touches" +
-                join(map(SOURCES, fn(src) { return MID + src[1] + " " + n0(p.parts[src[0]]) }), "")
     let segs = map(SOURCES, fn(src) {
       let v = real(p.parts[src[0]])
       return v > 0 ? el("i", {"style": "height:" + str(round(100.0 * v / max(total, 1.0), 2)) + "%;background:var(" + src[2] + ")"}) : nil
     })
-    let picked = span != nil and span.from == h and span.to == h
-    return el("button", {"type": "button", "class": ["tl-col", in_span(span, h) ? (span == nil ? nil : "on") : "out"], "data-hour": h, "title": title,
-                         "on_click": fn() { pick(picked ? nil : {"from": h, "to": h}) }},
+    let title = labels(i)[0] + ": " + n0(total) + " touches" + join(map(SOURCES, fn(src) { return MID + src[1] + " " + n0(p.parts[src[0]]) }), "")
+    return el("button", {"type": "button", "class": ["tl-col", picked(i) ? (none ? nil : "on") : "out", extra_class(i)], "data-i": i,
+                         "data-fl": labels(i)[0], "data-tl": labels(i)[1], "title": title, "on_click": fn() { on_click(i) }},
               el("span", {"class": "tl-bar", "style": "height:" + str(round(100.0 * total / top, 2)) + "%"}, segs))
   })
-  let axis = map(range(0, 24), fn(h) { return el("span", h % 3 == 0 ? hour_label(h) : "") })
-  let from = span == nil ? 0 : span.from
-  let to = span == nil ? 23 : span.to
-  // the handles let go: both values come with the action (all 24 hours is all hours)
-  let apply = fn(f) {
-    if not is_digit(str(f.tl_from ?? "")) or not is_digit(str(f.tl_to ?? "")) { return nil }
-    let a = int(f.tl_from)
-    let b = int(f.tl_to)
-    let lo = max(0, min(a, b))
-    let hi = min(23, max(a, b))
-    pick(lo == 0 and hi == 23 ? nil : {"from": lo, "to": hi})
-  }
-  return el("div", {"class": "panel tl-panel"},
-    el("div", {"class": "panel-head"},
-      el("h2", "Through the day"),
-      el("div", {"class": "tl-sel"},
-        el("b", span_label(span)), el("span", n0(report.totals.touches) + " touches"),
-        span == nil ? el("span", {"class": "tl-hint"}, "drag the handles, or click an hour") :
-                      el("button", {"type": "button", "class": "btn", "on_click": fn() { pick(nil) }}, "All hours"))),
-    el("div", {"class": "tl"},
-      el("div", {"class": "tl-cols"}, cols),
-      el("div", {"class": "tl-slider"},
-        el("div", {"class": "tl-track"}, el("div", {"class": "tl-fill", "style": "left:" + str(round(100.0 * from / 23.0, 3)) + "%;width:" +
-                                                                         str(round(100.0 * (to - from) / 23.0, 3)) + "%"})),
-        el("input", {"type": "range", "class": "tl-range tl-from", "min": 0, "max": 23, "step": 1, "bind": "tl_from", "value": from,
-                     "aria-label": "From hour", "on_change": apply}),
-        el("input", {"type": "range", "class": "tl-range tl-to", "min": 0, "max": 23, "step": 1, "bind": "tl_to", "value": to,
-                     "aria-label": "To hour", "on_change": apply})),
-      el("div", {"class": "tl-axis"}, axis)))
+  let last = max(1, n - 1)
+  return [
+    el("div", {"class": "tl-cols", "style": "grid-template-columns:repeat(" + str(n) + ", minmax(0, 1fr))"}, cols),
+    el("div", {"class": "tl-slider", "data-max": n - 1, "data-all": all_text, "data-label": label_class,
+               "style": "margin-left:calc(100% / " + str(2 * n) + " - 8px);margin-right:calc(100% / " + str(2 * n) + " - 8px)"},
+      el("div", {"class": "tl-track"}, el("div", {"class": "tl-fill", "style": "left:" + str(round(100.0 * lo / last, 3)) + "%;width:" +
+                                                                       str(round(100.0 * (hi - lo) / last, 3)) + "%"})),
+      el("input", {"type": "range", "class": "tl-range tl-from", "min": 0, "max": n - 1, "step": 1, "bind": "tl_from", "value": lo,
+                   "aria-label": "From", "on_change": apply}),
+      el("input", {"type": "range", "class": "tl-range tl-to", "min": 0, "max": n - 1, "step": 1, "bind": "tl_to", "value": hi,
+                   "aria-label": "To", "on_change": apply})),
+    el("div", {"class": "tl-axis", "style": "grid-template-columns:repeat(" + str(n) + ", minmax(0, 1fr))"}, map(range(0, n), fn(i) { return el("span", axis(i)) }))
+  ]
 }
 
-// The slider as it is dragged: the handles never cross, and the band, the label and the dimmed hours follow the
-// handles before the page asks the server (which it does when a handle is let go - its change).
+// The slider's let-go, as two indexes in 0..last: the pick, or nil for all of them.
+fn slider_pick(f, last) {
+  if not is_digit(str(f.tl_from ?? "")) or not is_digit(str(f.tl_to ?? "")) { return {"ok": false} }
+  let lo = max(0, min(int(f.tl_from), int(f.tl_to)))
+  let hi = min(last, max(int(f.tl_from), int(f.tl_to)))
+  return {"ok": true, "all": lo == 0 and hi == last, "lo": lo, "hi": hi}
+}
+
+// The timeline: tabs (pills) for three ways to see the range, and what is picked in them.
+//   Hours (the default): a column per hour of the day over the days picked; a slider (and a click) picks hours.
+//   Days: a column per day of the form's range over the hours picked; a slider (and a click) picks days - the
+//     report narrows to them, the strip keeps the whole range.
+//   Heatmap: each hour of each day, shaded by its touches; a click picks that day and that hour.
+// state: {view, span, days} (the page's); report: fetch_for_page's.
+fn timeline_node(report, state) {
+  let view = state.view ?? "hours"
+  let tab = fn(id, text) {
+    return el("button", {"type": "button", "class": ["pill", view == id ? "on" : nil], "on_click": fn() { state.view = id }}, text)
+  }
+  let span = state.span
+  let sel = report.sel_days
+  let head = el("div", {"class": "panel-head"},
+    el("div", {"class": "tl-title"}, el("h2", "Through the day"),
+      el("div", {"class": "pills"}, tab("hours", "Hours"), tab("days", "Days"), tab("heat", "Heatmap"))),
+    el("div", {"class": "tl-sel"},
+      el("b", {"class": "tl-lab-days"}, days_label(sel)), el("b", {"class": "tl-lab-hours"}, span_label(span)),
+      el("span", n0(report.totals.touches) + " touches"),
+      sel != nil ? el("button", {"type": "button", "class": "btn", "on_click": fn() { state.days = nil }}, "All days") : nil,
+      span != nil ? el("button", {"type": "button", "class": "btn", "on_click": fn() { state.span = nil }}, "All hours") : nil))
+  let body = nil
+  if view == "days" {
+    let days = report.days ?? []
+    let ds = map(days, fn(d) { return d.day })
+    let n = len(ds)
+    let idx = fn(day) { let i = index_of(join(ds, ","), day) return i < 0 ? 0 : i / 11 }   // 11 = len("YYYY-MM-DD,")
+    let lo = sel == nil ? 0 : idx(sel.from)
+    let hi = sel == nil ? max(0, n - 1) : idx(sel.to)
+    let short = fn(d) { return date_format(d, "%b %-d") }
+    let every = max(1, int(ceil(real(n) / 10.0)))
+    body = bars_node(days, fn(i) { return in_days(sel, ds[i]) }, sel == nil, lo, hi,
+      fn(i) { return [date_format(ds[i], "%a %b %-d"), short(ds[i])] },
+      fn(i) { state.days = sel != nil and sel.from == ds[i] and sel.to == ds[i] ? nil : {"from": ds[i], "to": ds[i]} },
+      fn(f) { let k = slider_pick(f, n - 1) if k.ok { state.days = k.all ? nil : {"from": ds[k.lo], "to": ds[k.hi]} } },
+      fn(i) { return i % every == 0 ? short(ds[i]) : "" }, "All days", "tl-lab-days",
+      fn(i) { let wd = date_format(ds[i], "%a") return wd == "Sat" or wd == "Sun" ? "we" : nil })
+  } else if view == "heat" {
+    let heat = report.heat ?? []
+    let top = max(1.0, max(concat([0.0], flatten(map(heat, fn(r) { return map(r.hours, fn(v) { return real(v) }) })))))
+    let rows = map(heat, fn(r) {
+      let cells = map(range(0, 24), fn(h) {
+        let v = real(r.hours[h])
+        let a = v <= 0 ? 0.0 : 0.12 + 0.88 * pow(v / top, 0.6)
+        let hit = (sel != nil or span != nil) and in_days(sel, r.day) and in_span(span, h)
+        return el("button", {"type": "button", "class": ["hm-cell", hit ? "on" : nil], "style": "--a:" + str(round(a, 3)),
+                             "title": date_format(r.day, "%a %b %-d") + ", " + hour_label(h) + ": " + n0(v) + " touches",
+                             "on_click": fn() { state.days = {"from": r.day, "to": r.day} state.span = {"from": h, "to": h} }})
+      })
+      let wd = date_format(r.day, "%a")
+      return el("div", {"class": ["hm-row", wd == "Sat" or wd == "Sun" ? "we" : nil]}, el("span", {"class": "hm-day"}, date_format(r.day, "%a %-m/%-d")), cells)
+    })
+    body = el("div", {"class": "hm"},
+      el("div", {"class": "hm-rows"}, rows),
+      el("div", {"class": "hm-row hm-axis"}, el("span", {"class": "hm-day"}, ""), map(range(0, 24), fn(h) { return el("span", h % 3 == 0 ? hour_label(h) : "") })))
+  } else {
+    let profile = report.profile ?? []
+    body = bars_node(profile, fn(h) { return in_span(span, h) }, span == nil, span == nil ? 0 : span.from, span == nil ? 23 : span.to,
+      fn(h) { let at = fn(m) { return str(h % 12 == 0 ? 12 : h % 12) + ":" + m + (h < 12 ? "am" : "pm") } return [at("00"), at("59")] },
+      fn(h) { state.span = span != nil and span.from == h and span.to == h ? nil : {"from": h, "to": h} },
+      fn(f) { let k = slider_pick(f, 23) if k.ok { state.span = k.all ? nil : {"from": k.lo, "to": k.hi} } },
+      fn(h) { return h % 3 == 0 ? hour_label(h) : "" }, "All hours", "tl-lab-hours", fn(h) { return nil })
+  }
+  return el("div", {"class": "panel tl-panel"}, head, el("div", {"class": "tl"}, body))
+}
+
+// The slider as it is dragged: the handles never cross, and the band, the label and the dimmed columns follow the
+// handles before the page asks the server (which it does when a handle is let go - its change). The labels come from
+// the columns (data-fl, data-tl), so one script serves hours and days.
 let SLIDER_JS = join([
   "(function () {",
-  "  function at(h, m) { return (h % 12 === 0 ? 12 : h % 12) + ':' + m + (h < 12 ? 'am' : 'pm'); }",
   "  document.addEventListener('input', function (e) {",
   "    var t = e.target;",
   "    if (!t.classList || !t.classList.contains('tl-range')) return;",
   "    var box = t.closest('.tl-slider'), lo = box.querySelector('.tl-from'), hi = box.querySelector('.tl-to');",
-  "    var a = +lo.value, b = +hi.value;",
+  "    var max = +box.dataset.max || 1, a = +lo.value, b = +hi.value;",
   "    if (a > b) { if (t === lo) { hi.value = a; b = a; } else { lo.value = b; a = b; } }",
-  "    lo.style.zIndex = a > 11 ? 3 : 2;   // at the far end the lower handle has to be the one on top",
+  "    lo.style.zIndex = a > max / 2 ? 3 : 2;   // at the far end the lower handle has to be the one on top",
   "    var fill = box.querySelector('.tl-fill');",
-  "    fill.style.left = (a / 23 * 100) + '%'; fill.style.width = ((b - a) / 23 * 100) + '%';",
-  "    var all = a === 0 && b === 23;",
-  "    document.querySelectorAll('.tl-col').forEach(function (c) {",
-  "      var h = +c.dataset.hour;",
-  "      c.classList.toggle('out', h < a || h > b); c.classList.toggle('on', !all && h >= a && h <= b);",
+  "    fill.style.left = (a / max * 100) + '%'; fill.style.width = ((b - a) / max * 100) + '%';",
+  "    var all = a === 0 && b === max, cols = box.parentElement.querySelectorAll('.tl-cols .tl-col');",
+  "    cols.forEach(function (c) {",
+  "      var i = +c.dataset.i;",
+  "      c.classList.toggle('out', i < a || i > b); c.classList.toggle('on', !all && i >= a && i <= b);",
   "    });",
-  "    var label = document.querySelector('.tl-sel b');",
-  "    if (label) label.textContent = all ? 'All hours' : at(a, '00') + ' \u{2013} ' + at(b, '59');",
+  "    var label = document.querySelector('.' + box.dataset.label);",
+  "    if (label && cols[a] && cols[b]) label.textContent = all ? box.dataset.all : (a === b && cols[a].dataset.fl === cols[a].dataset.tl ? cols[a].dataset.fl : cols[a].dataset.fl + ' \u{2013} ' + cols[b].dataset.tl);",
   "  });",
   "})();"
 ], chr(10))
@@ -444,13 +507,26 @@ let PAGE_CSS = join([
   ".hours { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }",
   ".btn.hour { padding: 4px 10px; font-size: 12px; } .btn.hour.on { background: var(--rec); border-color: var(--rec); color: #ffffff; }",
   ".tl-panel { margin-bottom: 20px; }",
+  ".tl-title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }",
+  ".pills { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: var(--head); border: 1px solid var(--line); }",
+  ".pill { padding: 3px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }",
+  ".pill:hover { color: var(--text); } .pill.on { background: var(--rec); color: #ffffff; }",
+  ".tl-sel b + b::before { content: \"\\00b7\"; margin: 0 6px; color: var(--muted); font-weight: 400; }",
+  ".tl-col.we .tl-bar { box-shadow: inset 0 -2px 0 var(--muted); }",
+  ".hm { padding: 2px 0 0; }",
+  ".hm-rows { max-height: 330px; overflow-y: auto; }",
+  ".hm-row { display: grid; grid-template-columns: 64px repeat(24, minmax(0, 1fr)); gap: 2px; margin-bottom: 2px; }",
+  ".hm-day { color: var(--muted); font-size: 10px; line-height: 12px; white-space: nowrap; } .hm-row.we .hm-day { color: var(--text); }",
+  ".hm-cell { height: 12px; padding: 0; border: 0; border-radius: 2px; cursor: pointer; background: rgba(47, 125, 225, var(--a)); box-shadow: inset 0 0 0 1px var(--line); }",
+  ".hm-cell:hover { box-shadow: inset 0 0 0 1px var(--text); } .hm-cell.on { box-shadow: inset 0 0 0 2px var(--text); }",
+  ".hm-axis span { color: var(--muted); font-size: 10px; text-align: center; white-space: nowrap; } .hm-axis { margin-top: 4px; }",
   ".tl-sel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; } .tl-sel b { color: var(--text); font-weight: 600; }",
   ".tl-sel .btn { padding: 4px 10px; font-size: 12px; } .tl-hint { font-size: 12px; opacity: .8; }",
   ".tl { padding: 12px 16px 8px; user-select: none; -webkit-user-select: none; }",
-  ".tl-cols { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 3px; height: 84px; align-items: end; }",
+  ".tl-cols { display: grid; gap: 3px; height: 84px; align-items: end; }",
   ".tl-col { height: 100%; display: flex; align-items: flex-end; padding: 0 1px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; transition: background .15s; }",
   ".tl-col:hover { background: var(--head); box-shadow: inset 0 0 0 1px var(--line); }",
-  ".tl-slider { position: relative; height: 22px; margin: 8px calc(100% / 48 - 8px) 0; }",
+  ".tl-slider { position: relative; height: 22px; margin-top: 8px; }",
   ".tl-track { position: absolute; left: 0; right: 0; top: 9px; height: 4px; border-radius: 2px; background: var(--line); }",
   ".tl-fill { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: var(--rec); transition: left .15s, width .15s; }",
   ".tl-range { position: absolute; left: 0; top: 0; width: 100%; height: 22px; margin: 0; background: none; pointer-events: none; -webkit-appearance: none; appearance: none; z-index: 2; }",
@@ -464,7 +540,7 @@ let PAGE_CSS = join([
   ".tl-bar { width: 100%; min-height: 2px; display: flex; flex-direction: column-reverse; border-radius: 4px 4px 1px 1px; overflow: hidden; background: var(--line); transition: height .5s ease, opacity .2s; }",
   ".tl-bar i { display: block; width: 100%; transition: height .5s ease; }",
   ".tl-col.out .tl-bar { opacity: .28; }",
-  ".tl-axis { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 3px; margin-top: 2px; color: var(--muted); font-size: 11px; }",
+  ".tl-axis { display: grid; gap: 3px; margin-top: 2px; color: var(--muted); font-size: 11px; }",
   ".tl-axis span { text-align: center; white-space: nowrap; overflow: visible; }",
   "@media (max-width: 700px) { .tl-cols { gap: 2px; height: 64px; } .tl-axis { gap: 2px; font-size: 10px; } }",
   ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }",
@@ -539,15 +615,16 @@ fn dashboard_node(report, state) {
       el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
       el("div", {"class": "clock", "aria-live": "off", "data-ui-keep": true}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
       el("form", {"onsubmit": "return false"},
-        el("label", "From"), el("input", {"type": "date", "bind": "start", "value": report.start}),
-        el("label", "To"), el("input", {"type": "date", "bind": "stop", "value": report.stop}),
+        el("label", "From"), el("input", {"type": "date", "bind": "start", "value": report.range_start ?? report.start}),
+        el("label", "To"), el("input", {"type": "date", "bind": "stop", "value": report.range_stop ?? report.stop}),
         el("button", {"type": "button", "class": "btn primary", "on_click": fn(f) {
           let r = report_range(f.start, f.stop)
           state.start = r[0]
           state.stop = r[1]
+          state.days = nil   // a new range: all of its days
         }}, "Run"),
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
-    el("div", {"id": "live"}, live_node(report, state.sorter, timeline_node(report, state.span, fn(sp) { state.span = sp }))),
+    el("div", {"id": "live"}, live_node(report, state.sorter, timeline_node(report, state))),
     el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS))
 }
