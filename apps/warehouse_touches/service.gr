@@ -12,6 +12,20 @@
 import "lib/queries.gr"
 import "lib/views.gr"
 
+fn env(name, fallback) {
+  let v = getenv(name)
+  if v == nil or v == "" { return fallback }
+  return v
+}
+
+fn secret(name) {
+  let v = getenv(name)
+  if v != nil and v != "" { return v }
+  let f = getenv(name + "_FILE")
+  if f != nil and f != "" { return trim(read_file(f)) }
+  return ""
+}
+
 let DB_CFG = {
   "host": env("DB_HOST", env("ASQL_HOST", "127.0.0.1")),
   "port": int(env("DB_PORT", env("ASQL_PORT", "3307"))),
