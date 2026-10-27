@@ -9,19 +9,16 @@ let NBSP = "\u{a0}"
 fn n0(v) { return number_format(v, 0) }
 fn n1(v) { return number_format(v, 1) }
 
-// '2026-10-27 08:20:11' as 'Oct 27 8:20am'
+// '2026-10-27 08:20:11' as 'Oct 27 8:20am'; text that is not a date (0000-00-00) as it is
 fn when(ts) {
-  if is_blank(ts) { return "" }
-  let s = str(ts)
-  if len(s) < 16 or s < "1971" { return s }
-  return date_format(date_parse(slice(s, 0, 16)), "%b %-d %-I:%M%P", "utc")
+  let s = str(ts ?? "")
+  return date_parse(s, {"or": nil}) == nil ? s : date_format(s, "%b %-d %-I:%M%P")
 }
 
 // '2026-10-27' as 'Oct 27, 2026', as PHP's date('M j, Y')
 fn day_text(d) {
-  let s = str(d)
-  if len(s) < 10 or s < "1971" { return s }
-  return date_format(date_parse(slice(s, 0, 10)), "%b %-d, %Y", "utc")
+  let s = str(d ?? "")
+  return date_parse(s, {"or": nil}) == nil ? s : date_format(s, "%b %-d, %Y")
 }
 
 // '2026-10-27 08:20:11' as '10-27 08:20', the exports' first / last columns

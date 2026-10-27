@@ -232,6 +232,7 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `get_in` | `get_in(container, path_list, [default])` | Deep nested traversal over maps and lists with default fallback. |
 | `merge` | `merge(...maps)` | Merges multiple maps (later keys overwrite earlier ones). |
 | `get_or_put` | `get_or_put(map, key, value)` | `map[key]` when it is there (and not `nil`); otherwise puts `value` at `key` and returns it. The record a key stands for, made the first time it is seen: `get_or_put(users, lower(uid), {"userid": uid, "n": 0}).n += 1`. `value` is worked out before the call either way. |
+| `add_into` | `add_into(total, record, [fields])` | Adds `record`'s numbers into `total`'s, field by field and into nested maps (a field `total` lacks starts at `record`'s value; a nested map it lacks starts empty). Text, lists and `nil` are left alone; a total field that is not a number is an error. `fields` names the top-level fields to add. Decimals add exactly. Returns `total`. Things may use it. |
 | `add_keys` | `add_keys(map, list, [value])` | Sets `map[item] = value` (default `true`) for every item: a map used as a set, `len(map)` its size. Returns the map. |
 
 ---
@@ -266,10 +267,11 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 |---|---|---|
 | `now` | `now()` | Returns fractional UNIX epoch timestamp in seconds. |
 | `iso8601` | `iso8601([timestamp])` | Formats timestamp as ISO 8601 string (e.g. `"2026-10-26T14:48:02Z"`). Default is current time. |
-| `date_parts` | `date_parts(ts, [utc])` | Returns map: `{year, month, day, hour, min, sec, wday, yday, isdst}`. |
-| `date_format` | `date_format(ts, fmt, [zone])` | Formats a timestamp (zone `"local"`, the default, or `"utc"`). `%Y %m %d %e %H %I %M %S %L %j %y %a %A %b %B %p %F %T %z %s %%`; `%P` is lowercase am/pm; `%-d %-m %-H %-I %-M %-S %-j` drop the leading zero: `date_format(date_parse("2026-10-07 09:05"), "%b %-d, %Y %-I:%M%P", "utc")` is `"Oct 7, 2026 9:05am"`. |
-| `date_parse` | `date_parse(str, [fmt])` | Parses date/time string into fractional UNIX timestamp. |
-| `date_make` | `date_make(y, m, d, [h, min, s, utc])` | Constructs UNIX timestamp from year, month, day, etc. |
+| `date_parts` | `date_parts(ts, [zone])` | The calendar fields of a timestamp in `zone` (`"local"`, the default, or `"utc"`): `{year, month, day, hour, minute, second, millisecond, weekday, yearday, offset}` - month 1-12, weekday 0 (Sunday) to 6, offset the zone's distance from UTC in seconds. |
+| `date_format` | `date_format(ts, fmt, [zone])` | `ts` may be a date string (`"2026-10-27 08:20:11"`, as a database gives it), written as it reads: read and written in one zone (`"utc"` unless given), so its wall time does not move; a string that is not a date is an error. Formats a timestamp (zone `"local"`, the default, or `"utc"`). `%Y %m %d %e %H %I %M %S %L %j %y %a %A %b %B %p %F %T %z %s %%`; `%P` is lowercase am/pm; `%-d %-m %-H %-I %-M %-S %-j` drop the leading zero: `date_format(date_parse("2026-10-07 09:05"), "%b %-d, %Y %-I:%M%P", "utc")` is `"Oct 7, 2026 9:05am"`. |
+| `date_parse` | `date_parse(str, [zone])` | An ISO 8601 date or date-time (`YYYY-MM-DD[ T]HH:MM[:SS[.fff]][Z\|+HH:MM]`) as seconds since the epoch. Read in `zone` (`"utc"`, the default, or `"local"`) unless the text carries its own offset. Anything else, or a field out of range (`0000-00-00`), is an error - unless the second argument is a map with `or`: `date_parse(row.stopped, {"or": nil})` gives `nil` for a zero date, `""` or `nil` (the map may also hold `zone`). |
+| `date_make` | `date_make(y, m, d, [h, min, s], [zone])` | Seconds since the epoch for a calendar date (and time) in `zone` (`"local"`, the default, or `"utc"`); a field out of range is an error. |
+| `day_add` | `day_add(day, n)` | The day `n` calendar days after (`n` < 0: before) a `YYYY-MM-DD` day: `day_add("2026-10-27", -29)` is `"2026-09-28"`. No zone, so no daylight-saving hour. Things may use it. |
 | `date_range` | `date_range(first_day, last_day)` | Every calendar day from one `YYYY-MM-DD` to another, both included, as `YYYY-MM-DD` strings; `[]` when the first is after the last. No zone, so no daylight-saving hour to skip or repeat. At most 100000 days. |
 | `every` | `every(seconds, fn)` | Recurring timer executing `fn()` every `seconds`. Returns timer ID. |
 | `after` | `after(seconds, fn)` | One-shot delayed timer executing `fn()`. Returns timer ID. |
@@ -478,8 +480,9 @@ Grain interacts with relational data and the ASQL engine through three distinct 
 
 | Function | Signature | Description |
 |---|---|---|
-| `db_connect` | `db_connect(host, port, user, password, [database])` | Connects via MySQL wire protocol (`grain_std_db.cpp:351`, `grain_aios.cpp:333`). Returns `{"ok": bool, "conn": <handle>, "server_version": str, "error": str}`. Either the returned map or the inner `conn` handle can be passed to subsequent `db_*` calls. |
+| `db_connect` | `db_connect(host, port, user, password, [database])` or `db_connect(cfg)` | `cfg` is a map `{host, port, user, password, db}` (`database` for `db`; port 3306 when left out). Connects via MySQL wire protocol (`grain_std_db.cpp:351`, `grain_aios.cpp:333`). Returns `{"ok": bool, "conn": <handle>, "server_version": str, "error": str}`. Either the returned map or the inner `conn` handle can be passed to subsequent `db_*` calls. |
 | `db_query` | `db_query(conn, sql, [params], [options])` | Executes query with optional `?` parameter binding list and options map (`grain_std_db.cpp:474`). Strings are escaped, `nil` binds as `NULL`, lists expand for `IN (?)`. Options: `{rows: bool, records: bool, decimals: bool}`. Returns `{"ok": bool, "columns": [...], "rows": [[...]], "records": [{...}], "affected_rows": int, "last_insert_id": int, "error": str}`. |
+| `thing_rows` | `thing_rows(conn, name, [keys])` | An ASQL Thing's rows - `SHOW THING name [KEYS (...)]` - as maps, the columns that hold JSON (a grain Thing's lists and maps) read back as values. `keys` (text or numbers) are quoted here; `[]` gives `[]`. A name that is not one, or a failed query, is an error. Works with either `db_query` (grain's records, aios's columns and rows). |
 | `db_transaction` | `db_transaction(conn, fn)` | Runs callback `fn(conn)` in a transaction (`grain_std_db.cpp:517`). Manages `START TRANSACTION`/`COMMIT` (or nested `SAVEPOINT grain_sp_<depth>`). Automatically rolls back on runtime error and re-raises. Returns callback result. |
 | `db_escape` | `db_escape(str)` | Escapes special characters (`\0`, `\n`, `\r`, `\\`, `'`, `"`, `\x1a`) for MySQL string literals (`grain_std_db.cpp:463`). |
 | `db_quote` | `db_quote(val)` | Formats value as a safe SQL literal (`grain_std_db.cpp:468`): numbers, `NULL` for `nil`, `'escaped'` for strings. |
@@ -670,6 +673,8 @@ actions, the pushed re-render and its in-place update all work as for widgets.
 - **State** such as a sort or a range lives in the program (one copy per viewer unless the pane is `"shared"`), so
   a re-render keeps it; markup pushed into an open page is merged in place, and a `<script>` inside it does not run.
 - **`css`** in the pane's options is added to the page.
+- **`watch`** for a Thing: `"watch": {"thing": "touch_day", "db": DB_CFG, "timeout": 10}` - connect with `db_connect(DB_CFG)`,
+  `WAIT THING touch_day SINCE <since> TIMEOUT 10`, close, return the clock: the function below, written for you.
 - **`watch`** in the pane's options is `fn(since)`: the host calls it on a thread of its own, in a VM of its own,
   again each time it returns, with what it returned last time (`nil` the first time). It should wait until the
   data may have changed (`WAIT THING t SINCE <since> TIMEOUT 10`) and return something that moves when it does

@@ -77,6 +77,10 @@ struct MarkupHooks {
                     std::string& err)> attr;
   std::function<bool(const Value& node, std::string& out, std::string& err)> widget;
 };
+// db_connect(cfg): one map {host, port, user, password, db (or database)} in place of the five arguments - rewrites
+// `args` to them (both db_connect builtins call it first). false, with error, when the map is not one.
+bool db_connect_args(std::vector<Value>& args, std::string& error);
+
 // An element or html_raw node (a map with a string "tag", or only "raw"), not a ui.* widget.
 bool is_markup_node(const Value& v);
 bool markup_write(const Value& node, bool html, std::string& out, std::string& err, const MarkupHooks* hooks = nullptr);

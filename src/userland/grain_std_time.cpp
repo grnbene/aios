@@ -13,6 +13,9 @@
 //   date_parse(text [, zone])               -> seconds; ISO 8601 date or date-time
 //   date_make(y, mo, d [, h, mi, s] [, zone]) -> seconds
 //   date_range(first_day, last_day)         -> ["YYYY-MM-DD", ...], both ends included
+//   day_add(day, n)                         -> the day n calendar days on
+//   date_parse(text, {zone, or})            -> `or` for a text that is not a date
+//   date_format("2026-10-27 08:20", fmt)    -> a date string written as it reads (read and written in one zone)
 //
 // zone is "utc" or "local" (the machine's own zone); date_parts, date_format
 // and date_make default to local, date_parse to UTC unless the text carries
@@ -163,7 +166,20 @@ Value bi_date_parts(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, m);
 }
 
-Value bi_date_format(Vm&, std::vector<Value>& args, std::string& error) {
+Value date_parse_core(Vm& vm, std::vector<Value>& args, std::string& error);
+
+Value bi_date_format(Vm& vm, std::vector<Value>& args, std::string& error) {
+  // A date string ("2026-10-27 08:20", as a database gives it) is written as it reads: read and written in the same
+  // zone ("utc" unless one is given), so its wall time does not move.
+  if (args[0].type == Type::Str) {
+    bool local = false;
+    if (!zone_arg(args, 2, false, "date_format", error, local)) return Value::nil();
+    std::vector<Value> pa{args[0], Value::string(local ? "local" : "utc")};
+    Value t = date_parse_core(vm, pa, error);
+    if (!error.empty()) { error = "date_format(): " + error.substr(error.find("date_parse(): ") == 0 ? 14 : 0); return Value::nil(); }
+    std::vector<Value> fa{t, args[1], Value::string(local ? "local" : "utc")};
+    return bi_date_format(vm, fa, error);
+  }
   if (!want_number(args[0], error, "date_format") || !want_str(args[1], error, "date_format")) return Value::nil();
   bool local = true;
   if (!zone_arg(args, 2, true, "date_format", error, local)) return Value::nil();
@@ -234,7 +250,7 @@ Value bi_date_format(Vm&, std::vector<Value>& args, std::string& error) {
 // ISO 8601: YYYY-MM-DD, then optionally T or a space, HH:MM, :SS, .fraction,
 // and Z or +HH:MM / -HH:MM / +HHMM. Anything else, or a field out of range,
 // is an error - a date that is guessed at is worse than none.
-Value bi_date_parse(Vm&, std::vector<Value>& args, std::string& error) {
+Value date_parse_core(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "date_parse")) return Value::nil();
   bool local = false;
   if (!zone_arg(args, 1, false, "date_parse", error, local)) return Value::nil();
@@ -320,39 +336,73 @@ Value bi_date_make(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), sec, local));
 }
 
+// date_parse(text, [zone | {zone, or}]): with "or" in the options, a text that is not a date (a database's
+// 0000-00-00, "", nil) gives that value instead of an error: date_parse(row.stopped, {"or": nil}).
+Value bi_date_parse(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (args.size() < 2 || args[1].type != Type::Map) return date_parse_core(vm, args, error);
+  MapObj* o = static_cast<MapObj*>(args[1].obj.get());
+  Value* zone = o->find("zone");
+  Value* fallback = o->find("or");
+  std::vector<Value> pa{args[0]};
+  if (zone && zone->type != Type::Nil) pa.push_back(*zone);
+  if (fallback && args[0].type != Type::Str) return *fallback;
+  Value t = date_parse_core(vm, pa, error);
+  if (!error.empty() && fallback) {
+    if (error.find("is not an ISO 8601 date") == std::string::npos) return Value::nil();   // a bad zone stays an error
+    error.clear();
+    return *fallback;
+  }
+  return t;
+}
+
+// A day, YYYY-MM-DD, as days since 1970-01-01; false when it is not one.
+bool day_number(const std::string& s, int64_t& out) {
+  auto num = [&](size_t at, size_t n, int64_t& v) {
+    v = 0;
+    for (size_t j = at; j < at + n; ++j) {
+      if (s[j] < '0' || s[j] > '9') return false;
+      v = v * 10 + (s[j] - '0');
+    }
+    return true;
+  };
+  int64_t y = 0, mo = 0, d = 0;
+  static const int kLen[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (s.size() != 10 || s[4] != '-' || s[7] != '-' || !num(0, 4, y) || !num(5, 2, mo) || !num(8, 2, d) || mo < 1 || mo > 12 ||
+      d < 1 || d > kLen[mo - 1] + (mo == 2 && leap(y) ? 1 : 0))
+    return false;
+  out = days_from_civil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d));
+  return true;
+}
+
+std::string day_text(int64_t z) {
+  int64_t y = 0;
+  unsigned m = 0, d = 0;
+  civil_from_days(z, y, m, d);
+  return pad(y, 4) + "-" + pad(m, 2) + "-" + pad(d, 2);
+}
+
+// day_add("2026-10-27", -29) -> "2026-09-28": calendar days, no zone and no daylight-saving hour.
+Value bi_day_add(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "day_add") || !want_number(args[1], error, "day_add")) return Value::nil();
+  int64_t z = 0;
+  if (!day_number(args[0].str(), z)) { error = "day_add(): \"" + args[0].str() + "\" is not a day (YYYY-MM-DD)"; return Value::nil(); }
+  const double n = args[1].as_double();
+  if (n != std::floor(n) || std::fabs(n) > 3650000) { error = "day_add(): a whole number of days, within 10000 years"; return Value::nil(); }
+  return Value::string(day_text(z + static_cast<int64_t>(n)));
+}
+
 // date_range("2026-10-01", "2026-10-31") -> every day from the first to the last, both included, as YYYY-MM-DD;
 // [] when the first is after the last. Calendar days, so no zone and no daylight-saving hour to fall into.
 Value bi_date_range(Vm&, std::vector<Value>& args, std::string& error) {
   int64_t day[2];
   for (int k = 0; k < 2; ++k) {
     if (!want_str(args[k], error, "date_range")) return Value::nil();
-    const std::string& s = args[k].str();
-    auto num = [&](size_t at, size_t n, int64_t& v) {
-      v = 0;
-      for (size_t j = at; j < at + n; ++j) {
-        if (s[j] < '0' || s[j] > '9') return false;
-        v = v * 10 + (s[j] - '0');
-      }
-      return true;
-    };
-    int64_t y = 0, mo = 0, d = 0;
-    static const int kLen[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (s.size() != 10 || s[4] != '-' || s[7] != '-' || !num(0, 4, y) || !num(5, 2, mo) || !num(8, 2, d) || mo < 1 || mo > 12 ||
-        d < 1 || d > kLen[mo - 1] + (mo == 2 && leap(y) ? 1 : 0)) {
-      error = "date_range(): \"" + s + "\" is not a day (YYYY-MM-DD)";
-      return Value::nil();
-    }
-    day[k] = days_from_civil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d));
+    if (!day_number(args[k].str(), day[k])) { error = "date_range(): \"" + args[k].str() + "\" is not a day (YYYY-MM-DD)"; return Value::nil(); }
   }
   constexpr int64_t kMaxDays = 100000;   // ~274 years: past that it is a mistake, not a range
   if (day[1] - day[0] + 1 > kMaxDays) { error = "date_range(): more than 100000 days"; return Value::nil(); }
   auto list = std::make_shared<ListObj>(std::vector<Value>{});
-  for (int64_t z = day[0]; z <= day[1]; ++z) {
-    int64_t y = 0;
-    unsigned m = 0, d = 0;
-    civil_from_days(z, y, m, d);
-    list->items.push_back(Value::string(pad(y, 4) + "-" + pad(m, 2) + "-" + pad(d, 2)));
-  }
+  for (int64_t z = day[0]; z <= day[1]; ++z) list->items.push_back(Value::string(day_text(z)));
   return Value::object(Type::List, list);
 }
 
@@ -451,7 +501,8 @@ void install_time_builtins(Vm& vm) {
   vm.define_native("date_format", 2, 3, bi_date_format);
   vm.define_native("date_parse", 1, 2, bi_date_parse);
   vm.define_native("date_make", 3, 7, bi_date_make);
-  vm.define_native("date_range", 2, 3, bi_date_range);
+  vm.define_native("date_range", 2, 2, bi_date_range);
+  vm.define_native("day_add", 2, 2, bi_day_add);
 }
 
 }  // namespace aios::userland::grain

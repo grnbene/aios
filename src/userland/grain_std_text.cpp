@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <random>
 #include <string>
@@ -922,6 +923,20 @@ Value bi_el(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 }  // namespace
+
+bool db_connect_args(std::vector<Value>& args, std::string& error) {
+  if (args.size() != 1 || args[0].type != Type::Map) return true;   // the five arguments: as they are
+  MapObj* m = static_cast<MapObj*>(args[0].obj.get());
+  auto field = [&](const char* k) { Value* v = m->find(k); return v ? *v : Value::nil(); };
+  Value host = field("host"), port = field("port"), user = field("user"), pass = field("password"), db = field("db");
+  if (db.type == Type::Nil) db = field("database");
+  if (host.type != Type::Str || host.str().empty()) { error = "db_connect(): the map has no \"host\""; return false; }
+  if (port.type == Type::Str) port = Value::integer(std::strtoll(port.str().c_str(), nullptr, 10));
+  if (port.type == Type::Nil) port = Value::integer(3306);
+  if (!port.is_number()) { error = "db_connect(): \"port\" is a number"; return false; }
+  args = {host, port, user.type == Type::Nil ? Value::string("") : user, pass.type == Type::Nil ? Value::string("") : pass, db};
+  return true;
+}
 
 bool is_markup_node(const Value& v) {
   if (v.type != Type::Map) return false;
