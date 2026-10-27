@@ -295,7 +295,17 @@ class RemoteDevice final : public Device {
     // A named kernel is a whole job: it runs on this device's job lane - a
     // link of its own - so the shared link (SQL, telemetry, mirrors) is never
     // held for its duration.
-    if (op.code == OpCode::Custom && node_->can_open_sibling()) return execute_job(op, fabric);
+    if (op.code == OpCode::Custom && node_->can_open_sibling()) {
+      auto r = execute_job(op, fabric);
+      // The peer restarted: its devices have new ids, and the one this device stands for is gone from its fabric
+      // ("pinned device ... is not in the fabric"). A named kernel runs on whichever of the peer's devices has it,
+      // so the pin goes and the job is asked once more - instead of every job failing until this side restarts.
+      if (!r.ok() && !unpinned_.load() && r.error().message.find("is not in the fabric") != std::string::npos) {
+        unpinned_.store(true);
+        r = execute_job(op, fabric);
+      }
+      return r;
+    }
     RemoteNode& via = *node_;
     std::vector<Staged> st;
     auto release_temps = [&]() { for (auto& s : st) if (s.temp) { ByteBuffer b; Writer w(b); w.id(s.remote); via.call(nodeproto::MemRelease, b); } };
@@ -325,7 +335,7 @@ class RemoteDevice final : public Device {
   }
   // The op as the peer runs it: pinned to the peer's own device.
   void pin(Operation& rop) const {
-    rop.requirement.affinity = info_.id;
+    rop.requirement.affinity = unpinned_.load() ? DeviceID{} : info_.id;
     rop.requirement.device = DeviceType::Any;
     // The selector that chose THIS device here ('remote', 'remote:host/...')
     // names nothing in the peer's fabric, and its scheduler consults the
@@ -352,6 +362,7 @@ class RemoteDevice final : public Device {
   // `generation` is the local generation the remote copy matches.
   struct JobStage { MemoryID remote; uint64_t size = 0; uint64_t generation = ~0ull; uint64_t last_use = 0; };
   static constexpr size_t kJobStageMax = 32;
+  std::atomic<bool> unpinned_{false};   // the peer no longer has info_.id (it restarted): named kernels go unpinned
 
   // A device with N cores may take N jobs at once: a pool of lanes, each its
   // own session on the peer (so each keeps its own staged operands), up to
@@ -405,6 +416,14 @@ class RemoteDevice final : public Device {
     }
     RemoteNode& via = *job_;
     const uint64_t use = ++job_clock_;
+    // A staged copy whose local buffer has been released is never asked for again (a new buffer has a new id): it
+    // is freed on the peer now. Kept until evicted, an app route's fresh 64 MB answer buffer a request held 32 of
+    // them - 2 GB - on the peer, and its app host was killed for it.
+    for (auto k = job_stage_.begin(); k != job_stage_.end();) {
+      if (fabric.lookup(k->first)) { ++k; continue; }
+      ByteBuffer b; Writer w(b); w.id(k->second.remote); (void)via.call(nodeproto::MemRelease, b);
+      k = job_stage_.erase(k);
+    }
     // One round trip for the whole job where the peer speaks ExecBatch: the
     // uploads and the reads ride with the operation.
     const bool batch = (via.features() & nodeproto::kFeatExecBatch) != 0;
