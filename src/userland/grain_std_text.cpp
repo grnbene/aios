@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -758,6 +759,7 @@ struct MarkupWriter {
   bool html;
   std::string out;
   std::string error;
+  const MarkupHooks* hooks = nullptr;
 
   std::string esc(const std::string& s) const { return html ? escape_html(s) : escape_xml(s); }
 
@@ -803,6 +805,11 @@ struct MarkupWriter {
         return false;
     }
     MapObj* m = static_cast<MapObj*>(v.obj.get());
+    if (m->find("widget")) {
+      if (hooks && hooks->widget) return hooks->widget(v, out, error);
+      error = "a ui.* widget is shown by a ui.pane view, not written as markup";
+      return false;
+    }
     if (Value* r = m->find("raw"); r && !m->find("tag")) {
       if (r->type != Type::Str) { error = "html_raw() holds a string"; return false; }
       out += r->str();
@@ -818,6 +825,15 @@ struct MarkupWriter {
       if (a->type != Type::Map) { error = "<" + name + ">'s attrs is a map"; return false; }
       for (auto& [k, val] : static_cast<MapObj*>(a->obj.get())->entries) {
         if (!markup_name_ok(k)) { error = "\"" + k + "\" is not an attribute name"; return false; }
+        if (hooks && hooks->attr) {
+          const int took = hooks->attr(v, name, k, val, out, error);
+          if (took < 0) { error = "<" + name + " " + k + ">: " + error; return false; }
+          if (took > 0) continue;
+        }
+        if (val.type == Type::Fn || val.type == Type::Native) {
+          error = "<" + name + " " + k + ">: a function is an action, which only a ui.pane view can run";
+          return false;
+        }
         if (val.type == Type::Nil || (val.type == Type::Bool && !val.b)) continue;
         out += ' ';
         out += k;
@@ -906,6 +922,39 @@ Value bi_el(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 }  // namespace
+
+bool is_markup_node(const Value& v) {
+  if (v.type != Type::Map) return false;
+  MapObj* m = static_cast<MapObj*>(v.obj.get());
+  if (m->find("widget")) return false;
+  Value* tag = m->find("tag");
+  if (tag) return tag->type == Type::Str;
+  Value* raw = m->find("raw");
+  return raw && raw->type == Type::Str;
+}
+
+bool markup_write(const Value& node, bool html, std::string& out, std::string& err, const MarkupHooks* hooks) {
+  MarkupWriter w{html, {}, {}, hooks};
+  if (!w.write(node, 0, false)) { err = w.error; return false; }
+  out += w.out;
+  return true;
+}
+
+std::string markup_text(const Value& node) {
+  std::string out;
+  std::function<void(const Value&, int)> walk = [&](const Value& v, int depth) {
+    if (depth > 512) return;
+    if (v.type == Type::Str) { out += v.str(); return; }
+    if (v.is_number() || v.type == Type::Decimal) { out += v.to_text(); return; }
+    if (v.type == Type::List) { for (const Value& c : v.list_items()) walk(c, depth + 1); return; }
+    if (v.type != Type::Map) return;
+    MapObj* m = static_cast<MapObj*>(v.obj.get());
+    if (Value* t = m->find("text"); t && t->type == Type::Str) out += t->str();
+    if (Value* k = m->find("children")) walk(*k, depth + 1);
+  };
+  walk(node, 0);
+  return out;
+}
 
 void install_text_builtins(Vm& vm) {
   vm.define_native("format", 1, -1, bi_format);

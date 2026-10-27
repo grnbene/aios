@@ -633,6 +633,23 @@ All colors in Grain are represented as 32-bit ARGB integers (`0xAARRGGBB`).
 | `pane_get` | `pane_get(pane_id)` | Returns pane state metadata dictionary. |
 | `run_panes` | `run_panes([timeout_ms])` | Starts the window system event dispatch loop. |
 
+### Markup in a `ui.pane` view
+
+A `ui.pane` view may return `el()` / `html_raw()` nodes (see *Building markup*) anywhere a widget goes, and `ui.*`
+widgets may sit inside the markup. In a browser (`grain serve`, an app host) the page is the web UI's: sessions,
+actions, the pushed re-render and its in-place update all work as for widgets.
+
+- **Actions:** a function in `on_click` (any element), `on_change` (an `input` or `select`) or `on_enter` is called
+  like a button's, with the fields as its argument: `el("th", {"on_click": fn() { desc = not desc }}, "Touches")`.
+  Any other function-valued attribute is an error.
+- **Fields:** `bind: "id"` makes an input a field: its value travels with every action (`fn(f) { start = f.start }`)
+  and is kept across renders like a `ui.field`'s.
+- **State** such as a sort or a range lives in the program (one copy per viewer unless the pane is `"shared"`), so
+  a re-render keeps it; markup pushed into an open page is merged in place, and a `<script>` inside it does not run.
+- **`css`** in the pane's options is added to the page.
+- A native client (`application/x-grain-ui+json`) gets markup as `{"widget": "html", "html": ...}`; a desktop
+  face window shows its text for now (`docs/design/one-app-every-surface.md`, stage 4).
+
 ---
 
 ## 17. AIOS Kernel, Capabilities & Sidecars
