@@ -78,6 +78,10 @@ app rollback stickerfeed            # revert to previous release
 
 By default commands act on the local host. To target a standalone `grain host` running outside AIOS, add `at <host:port> key=@file`.
 
+To see everything running on a machine (app hosts and their apps, ASQL engines and their Things, any `grain run` or
+`grain serve`), use `grain ps`, or `aios exec "grain ps"` inside aios. A service that runs as another user needs it
+run as that user; see [What's running on this machine](grain-apps.md#whats-running-on-this-machine-grain-ps).
+
 ---
 
 ## Fleet orchestration (`on <node>`)
