@@ -320,7 +320,8 @@ fn rollup(users, days, start_date, stop_date, distinct) {
   totals.active_days = len(keys(all_days))
   totals.touches_per_day = totals.active_days > 0 ? r1(totals.touches / real(totals.active_days)) : 0.0
   // busiest first
-  user_list = sort_by(user_list, fn(u) { return -u.touches })
+  // ties in user id order, so a pushed update does not reshuffle people with the same touches
+  user_list = sort_by(sort_by(user_list, fn(u) { return lower(u.userid) }), fn(u) { return -u.touches })
   let i = 0
   while i < len(user_list) {
     user_list[i].rank = i + 1
