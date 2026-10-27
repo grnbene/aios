@@ -19,6 +19,7 @@
 
 #include "aios/hal/net.hpp"
 #include "aios/userland/grain.hpp"
+#include "aios/userland/runtime_registry.hpp"
 
 namespace aios::cli {
 
@@ -58,6 +59,7 @@ Value net_listen(Vm&, std::vector<Value>& args, std::string& error) {
   const bool loopback = args.size() < 2 || args[1].truthy();
   auto l = hal::net_listen((uint16_t)port, loopback);
   if (!l.ok()) { error = "listen(" + std::to_string(port) + "): " + l.error().message; return Value::nil(); }
+  aios::userland::runtime::add_port((int)(*l)->port(), "listen");   // grain ps shows it
   return make_handle(kListener, std::shared_ptr<void>(l->release()));
 }
 
@@ -137,7 +139,11 @@ Value net_close(Vm&, std::vector<Value>& args, std::string& error) {
   if (args[0].type != Type::Extern || !args[0].obj) { error = "close() wants a handle"; return Value::nil(); }
   auto* e = static_cast<ExternObj*>(args[0].obj.get());
   if (!e->ptr) return Value::boolean(false);
-  if (e->kind_name == kListener) std::static_pointer_cast<hal::Listener>(e->ptr)->close();
+  if (e->kind_name == kListener) {
+    auto l = std::static_pointer_cast<hal::Listener>(e->ptr);
+    aios::userland::runtime::forget_port((int)l->port());
+    l->close();
+  }
   else if (e->kind_name == kConnection) std::static_pointer_cast<hal::Connection>(e->ptr)->close();
   e->ptr.reset();
   return Value::boolean(true);

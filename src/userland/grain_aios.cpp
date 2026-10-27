@@ -331,6 +331,7 @@ static std::shared_ptr<aios::userland::MariaWireSession> get_db_session(const Va
 }
 
 Value bi_db_connect(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!db_connect_args(args, error)) return Value::nil();
   if (args.size() < 4) {
     error = "db_connect wants (host, port, user, pass, [database])";
     return Value::nil();
@@ -733,7 +734,7 @@ void install_aios_builtins(Vm& vm) {
   vm.define_native("sidecar_cap_mint", 4, 4, bi_sidecar_cap_mint);
   vm.define_native("sidecar_cap_attenuate", 2, 2, bi_sidecar_cap_attenuate);
   vm.define_native("sidecar_patch_check", 1, 1, bi_sidecar_patch_check);
-  vm.define_native("db_connect", 4, 5, bi_db_connect);
+  vm.define_native("db_connect", 1, 5, bi_db_connect);
   vm.define_native("db_query", 2, 2, bi_db_query);
   vm.define_native("db_select_db", 2, 2, bi_db_select_db);
   vm.define_native("db_ping", 1, 1, bi_db_ping);

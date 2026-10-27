@@ -12,6 +12,7 @@
 #include <sstream>
 #include <system_error>
 
+#include "aios/userland/runtime_registry.hpp"
 #include "aios/userland/grain.hpp"
 #include "aios/userland/machine_sql.hpp"
 #if !defined(AIOS_METAL)
@@ -215,6 +216,7 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
       << "  grain eval <source...>     compile one line of source and run it\n"
       << "  grain dis <file.gr>        show the bytecode the compiler emitted\n"
       << "  grain serve <file.gr>      run it with sockets and no step limit\n"
+      << "  grain ps [--json]          the grain programs, app hosts and ASQL engines on this machine\n"
       << "  grain repl                 read lines until EOF or .quit\n"
       << "\n"
       << "  let / fn / if / else / while / for..in / return / break / continue\n"
@@ -223,6 +225,10 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
     return Ok();
   }
 
+  if (sub == "ps") {   // grain ps [--json]: the grain runtimes on this machine (runtime_registry.hpp)
+    o << userland::runtime::ps_text(a.size() > 2 && a[2] == "--json");
+    return Ok();
+  }
   if (sub == "run" || sub == "dis" || sub == "serve") {
     if (a.size() < 3) return Result<void>(Status::Invalid, "grain " + sub + " <file>");
     bool ok = false;
@@ -234,6 +240,7 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
       o << grain::disassemble(*compiled.script);
       return Ok();
     }
+    userland::runtime::announce("aios grain " + sub, a[2], k.config().root);
     if (!compile_and_run(k, o, source, a[2], false, sub == "serve"))
       return Result<void>(Status::Invalid, a[2] + " did not run to completion");
     return Ok();

@@ -16,6 +16,7 @@
 #include "aios/net/http_stream.hpp"
 #include "aios/node/secure.hpp"
 #include "aios/userland/grain_webui.hpp"
+#include "aios/userland/runtime_registry.hpp"
 
 namespace aios::userland::grain::apps {
 
@@ -793,9 +794,34 @@ int http_status(int port, const std::string& path, int timeout_ms) {
 
 Host::Host(hal::Host& host, Store& store, Options opt) : host_(host), store_(store), opt_(std::move(opt)) {
   if (std::find(opt_.capabilities.begin(), opt_.capabilities.end(), "grain") == opt_.capabilities.end()) opt_.capabilities.push_back("grain");
+  // grain ps: this host's apps, kept current in the process's record (runtime_registry.hpp)
+  runtime::keep_current("apps", [this] {
+    auto js = [](const std::string& s) {
+      std::string o = "\"";
+      for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+        else if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+        else o += (char)c;
+      }
+      return o + "\"";
+    };
+    std::string out = "[";
+    bool first = true;
+    for (const auto& a : status()) {
+      if (!first) out += ",";
+      first = false;
+      out += "{\"name\":" + js(a.name) + ",\"state\":" + js(a.state) + ",\"version\":" + js(a.version) + ",\"kind\":" + js(a.kind) +
+             ",\"port\":" + std::to_string(a.port) + ",\"requests\":" + std::to_string(a.requests) + ",\"failures\":" +
+             std::to_string(a.failures) + ",\"restarts\":" + std::to_string(a.restarts) + ",\"error\":" + js(a.last_error) + "}";
+    }
+    return out + "]";
+  });
 }
 
-Host::~Host() { shutdown(); }
+Host::~Host() {
+  runtime::stop_keeping("apps");
+  shutdown();
+}
 
 void Host::log(const std::string& app, const std::string& line) { store_.append_log(app, utc_time(host_.wall_ns()) + "  " + line); }
 
@@ -1538,6 +1564,7 @@ Result<uint16_t> ControlServer::listen(uint16_t port, bool loopback_only) {
   if (!l.ok()) return Result<uint16_t>(l.error());
   listener_ = std::move(*l);
   const uint16_t bound = listener_->port();
+  runtime::add_port(bound, "control");
   accept_ = hal::Thread([this] {
     while (!stop_.load()) {
       auto c = listener_->accept(500);

@@ -12,6 +12,7 @@
 #include "aios/hal/sync.hpp"
 
 #include "aios/userland/grain_webui.hpp"
+#include "aios/userland/runtime_registry.hpp"
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
@@ -256,6 +257,12 @@ int serve_ui(const std::string& name,
   if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || ::listen(listener, 64) != 0) {
     std::cerr << "grain: cannot listen on " << opt.host << ":" << opt.port << "\n";
     return 2;
+  }
+  {
+    sockaddr_in bound{};
+    socklen_t blen = sizeof bound;
+    const int port = ::getsockname(listener, reinterpret_cast<sockaddr*>(&bound), &blen) == 0 ? ntohs(bound.sin_port) : opt.port;
+    aios::userland::runtime::add_port(port, "web");   // grain ps shows it
   }
   if (opt.host == "0.0.0.0" || opt.host == "*" || opt.host.empty()) {
     std::cout << "grain: " << name << " is listening on all IPs at port " << opt.port << "  (Ctrl-C to stop)\n" << std::flush;

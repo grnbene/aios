@@ -949,6 +949,14 @@ add_test(NAME zero-host.gate COMMAND ${CMAKE_SOURCE_DIR}/scripts/zero-host-audit
 # A ui.pane given to another fleet member (ui.pane "machine"), on a private hub and two app hosts on loopback.
 add_test(NAME apps.pane.machine COMMAND ${CMAKE_SOURCE_DIR}/scripts/pane-machine-check.sh $<TARGET_FILE:aios-cli>)
 set_tests_properties(apps.pane.machine PROPERTIES TIMEOUT 180)
+# thing_rows and a pane's "watch": {"thing", "db"} against a local ASQL engine and app host.
+add_test(NAME apps.thing.builtins COMMAND ${CMAKE_SOURCE_DIR}/scripts/thing-builtins-check.sh $<TARGET_FILE:aios-cli>)
+set_tests_properties(apps.thing.builtins PROPERTIES TIMEOUT 180)
+# grain ps: the records grain runtimes, app hosts and ASQL engines write of themselves (runtime_registry.hpp).
+if(TARGET grain)
+  add_test(NAME apps.grain.ps COMMAND ${CMAKE_SOURCE_DIR}/scripts/grain-ps-check.sh $<TARGET_FILE:grain> $<TARGET_FILE:aios-cli>)
+  set_tests_properties(apps.grain.ps PROPERTIES TIMEOUT 180)
+endif()
 set_tests_properties(zero-host.gate PROPERTIES ENVIRONMENT "BUILD=${CMAKE_BINARY_DIR}")
 endif()
 if(NOT APPLE AND AIOS_METAL_TESTS)

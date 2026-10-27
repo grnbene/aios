@@ -350,6 +350,7 @@ Value result_value(QueryResult& r) {
 
 // db_connect(host, port, user, password, database?) -> {ok, conn, error, server_version}
 Value bi_db_connect(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!db_connect_args(args, error)) return Value::nil();
   if (!want_str(args[0], error, "db_connect") || !want_number(args[1], error, "db_connect")) return Value::nil();
   auto s = std::make_shared<Session>();
   std::string why;
@@ -701,7 +702,7 @@ Value bi_live(Vm& vm, std::vector<Value>& args, std::string& error) {
 }  // namespace
 
 void install_db_builtins(Vm& vm) {
-  vm.define_native("db_connect", 4, 5, bi_db_connect);
+  vm.define_native("db_connect", 1, 5, bi_db_connect);
   vm.define_native("db_query", 2, 4, bi_db_query);
   vm.define_native("db_escape", 1, 1, bi_db_escape);
   vm.define_native("db_quote", 1, 1, bi_db_quote);

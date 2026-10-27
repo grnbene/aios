@@ -830,7 +830,7 @@ and `read_raw_with(sql, params)` take the `?` values as one list (`nil` for none
 Every table either
 touches must be in `READS`. The builtins a program may name are fixed, as its answers must not depend on
 the clock or the machine: the text, list and math ones, `json_parse`, `json_stringify`, `sort_by`, `upper_rtrim`,
-`format`, the `regex_*` set (`regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split`), and the exact-decimal set (`decimal`, `dec_div`, `scale`, `decimal_prefix`, `round_sig`, `number_format`, `is_numeric`, `to_number`, `idiv`), and `group_by`, `key_by`, `sum_by`; `is_blank`, `first_present`, `get`, `get_in`, `get_or_put`, `add_keys`, `date_range`, and the markup set
+`format`, the `regex_*` set (`regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split`), and the exact-decimal set (`decimal`, `dec_div`, `scale`, `decimal_prefix`, `round_sig`, `number_format`, `is_numeric`, `to_number`, `idiv`), and `group_by`, `key_by`, `sum_by`; `is_blank`, `first_present`, `get`, `get_in`, `get_or_put`, `add_keys`, `add_into`, `date_range`, `day_add`, and the markup set
 (`html_escape`, `xml_escape`, `el`, `html_raw`, `html_stringify`, `xml_stringify`). `min` and `max` take strings and pass over `nil`
 (`last = max(last, t)`), and `sort_by` takes a list as a key, compared item by item (`[-u.touches, u.userid]`).
 The statement's quoting reads backslashes, so a program written for it has none (`chr(9)`, not `"\t"`).
