@@ -1,6 +1,9 @@
 // grain standard library: document generation and compression (pdf_render, zip_create, unzip, xlsx_create)
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
@@ -842,7 +845,25 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
     if (Value* f = m->find("freeze_pane")) freeze_pane = f->to_text();
     if (Value* mg = m->find("merges")) {
       if (mg->type == Type::List) {
-        for (const auto& it : mg->list_items()) merges.push_back(it.to_text());
+        for (const auto& it : mg->list_items()) {
+          // "B3:D3", or [first_row, first_col, last_row, last_col] counted from 1: [3, 2, 3, 4]
+          if (it.type == Type::List) {
+            const auto& q = it.list_items();
+            if (q.size() != 4 || !std::all_of(q.begin(), q.end(), [](const Value& x) { return x.type == Type::Int && x.i >= 1; })) {
+              error = "xlsx_create(): a merge is \"A1:C1\" or [first_row, first_col, last_row, last_col], each from 1";
+              return Value::nil();
+            }
+            merges.push_back(excel_col_name((int)q[1].i - 1) + std::to_string(q[0].i) + ":" + excel_col_name((int)q[3].i - 1) +
+                             std::to_string(q[2].i));
+            continue;
+          }
+          const std::string ref = it.to_text();
+          if (ref.empty() || !std::all_of(ref.begin(), ref.end(), [](char c) { return std::isalnum((unsigned char)c) || c == ':'; })) {
+            error = "xlsx_create(): \"" + ref + "\" is not a cell range";
+            return Value::nil();
+          }
+          merges.push_back(ref);
+        }
       }
     }
     if (Value* cw = m->find("col_widths")) {
@@ -922,7 +943,13 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
         if (v.type == Type::Int) {
           std::snprintf(num_buf, sizeof num_buf, "%lld", (long long)v.as_int());
         } else {
-          std::snprintf(num_buf, sizeof num_buf, "%.4g", v.as_double());
+          // the shortest text that reads back as the same number: %.4g wrote 24098.0 as 2.41e+04 (24100 in Excel)
+          const double dv = v.as_double();
+          if (dv == std::floor(dv) && std::fabs(dv) < 1e15) std::snprintf(num_buf, sizeof num_buf, "%.0f", dv);   // 930, not 9.3e+02
+          else for (int prec = 1; prec <= 17; ++prec) {
+            std::snprintf(num_buf, sizeof num_buf, "%.*g", prec, dv);
+            if (std::strtod(num_buf, nullptr) == dv) break;
+          }
         }
         char_len = (int)std::strlen(num_buf);
         row_xml += "<c r=\"" + addr + "\" s=\"" + std::to_string(style_id) + "\"><v>" + num_buf + "</v></c>";

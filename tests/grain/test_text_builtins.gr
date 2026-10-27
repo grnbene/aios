@@ -1,0 +1,106 @@
+# tests/grain/test_text_builtins.gr
+# The builtins an app used to write for itself: markup nodes (el, html_raw, html_stringify, xml_stringify,
+# html_escape), date_format's unpadded fields and %P, date_range, max/min over strings and nil, is_blank,
+# first_present, get_or_put, add_keys, sort_by with list keys, env and secret. Each part is driven at top level,
+# inside a function, inside a closure and nested in control flow.
+fn check(c, msg) { assert_true(c, msg) }
+
+# ---- markup ----------------------------------------------------------------------------------------------
+let cell = el("td", {"class": ["who", nil, "big"], "data-v": "a&b\"c", "hidden": false, "open": true},
+              el("b", "Ann <x> & 'co'"), el("br"), html_raw("&middot;"), nil, false, 3, [" ", el("i", "y")])
+check(html_stringify(cell) ==
+      "<td class=\"who big\" data-v=\"a&amp;b&quot;c\" open><b>Ann &lt;x&gt; &amp; &#39;co&#39;</b><br>&middot;3 <i>y</i></td>",
+      "html: escaped text and attributes, class list, false/nil left out, true bare, void br, raw as is")
+check(xml_stringify(el("row", {"n": 1, "ok": true}, el("c"), "a<b")) == "<row n=\"1\" ok=\"true\"><c/>a&lt;b</row>",
+      "xml: empty element closed, true written out, &lt;")
+check(html_stringify(el("script", "if (a < b && c) { x = '</script>' }")) == "<script>if (a < b && c) { x = '<\\/script>' }</script>",
+      "script text is not escaped, and cannot close itself early")
+check(html_stringify(el("p", nil, "x")) == "<p>x</p>", "nil attrs")
+check(html_stringify(el("p", el("b", "x"))) == "<p><b>x</b></p>", "a node as the second argument is a child")
+let parsed = xml_parse("<a k=\"v\"><b>t &amp; u</b></a>")
+check(xml_stringify(parsed) == "<a k=\"v\"><b>t &amp; u</b></a>", "xml_parse's tree written back")
+check(html_escape(nil) == "" and html_escape(12) == "12" and html_escape("<'&\">") == "&lt;&#39;&amp;&quot;&gt;", "html_escape")
+let bad = pcall(html_stringify, el("p", {"on click": "x"}))
+check(not bad.ok and contains(bad.error, "not an attribute name"), "an attribute name with a space is refused")
+let bad2 = pcall(html_stringify, el("br", "x"))
+check(not bad2.ok and contains(bad2.error, "<br> holds nothing"), "a void element with content is refused")
+let bad3 = pcall(html_stringify, true)
+check(not bad3.ok, "true is not a node")
+
+fn rows_html(people) {
+  let rows = []
+  for p in people { push(rows, el("tr", el("td", {"data-v": lower(p)}, p))) }
+  return html_stringify(el("tbody", rows))
+}
+check(rows_html(["Ann", "B&B"]) == "<tbody><tr><td data-v=\"ann\">Ann</td></tr><tr><td data-v=\"b&amp;b\">B&amp;B</td></tr></tbody>",
+      "markup built in a function")
+let make = fn(tag) { return fn(text) { return html_stringify(el(tag, {"class": "c"}, text)) } }
+check(make("span")("<") == "<span class=\"c\">&lt;</span>", "markup built in a closure")
+
+# ---- dates -----------------------------------------------------------------------------------------------
+let t = date_parse("2026-10-07 09:05:03")
+check(date_format(t, "%b %-d, %Y", "utc") == "Oct 7, 2026", "%-d")
+check(date_format(t, "%-I:%M%P", "utc") == "9:05am", "%-I and %P")
+check(date_format(date_parse("2026-10-27 00:30"), "%-I:%M%P", "utc") == "12:30am", "midnight is 12am")
+check(date_format(date_parse("2026-10-27 13:00"), "%-H %-m %-M %-S %-j %P", "utc") == "13 10 0 0 300 pm", "the other unpadded fields")
+check(date_format(t, "%d %I %p", "utc") == "07 09 AM", "the padded fields are as before")
+check(not pcall(date_format, t, "%-Y", "utc").ok, "%-Y has no unpadded form")
+check(date_range("2026-02-27", "2026-03-02") == ["2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02"], "date_range over a month end")
+check(date_range("2024-02-28", "2024-03-01") == ["2024-02-28", "2024-02-29", "2024-03-01"], "a leap day")
+check(date_range("2026-10-27", "2026-10-27") == ["2026-10-27"] and date_range("2026-10-28", "2026-10-27") == [], "one day; backwards is none")
+check(len(date_range("2026-01-01", "2026-12-31")) == 365, "a year")
+check(not pcall(date_range, "2026-02-30", "2026-03-01").ok and not pcall(date_range, "2026-10-27 10:00", "2026-10-28").ok, "not a day")
+fn days_in(a, b) { let n = 0; for d in date_range(a, b) { if ends_with(d, "-01") { n += 1 } } return n }
+check(days_in("2026-01-15", "2026-06-15") == 5, "date_range in a function")
+
+# ---- max / min, is_blank, first_present ------------------------------------------------------------------
+check(max("2026-10-27 08:05", "2026-10-27 14:30", "2026-09-01") == "2026-10-27 14:30", "max of strings")
+check(min(["b", "a", "c"]) == "a", "min of a list of strings")
+check(max(nil, "x", nil) == "x" and max([nil, nil]) == nil and min(3, nil, 1) == 1, "nil is passed over")
+check(max(1, 2.5, 2) == 2.5 and min(4, -1) == -1, "numbers as before")
+check(not pcall(max, 1, "a").ok, "numbers and strings together")
+check(not pcall(max, []).ok, "max of nothing")
+let latest = nil
+for s in ["2026-10-01", "2026-10-03", "2026-10-02"] { latest = max(latest, s) }
+check(latest == "2026-10-03", "a running latest from nil")
+check(is_blank(nil) and is_blank("") and is_blank(" \t\n") and not is_blank("a") and not is_blank(0) and not is_blank(false) and not is_blank([]), "is_blank")
+check(first_present(nil, "  ", "", "Ann", "Bob") == "Ann" and first_present(nil, "") == nil and first_present(0, 1) == 0, "first_present")
+
+# ---- get_or_put, add_keys, sort_by -----------------------------------------------------------------------
+let users = {}
+fn count_touch(uid) {
+  let u = get_or_put(users, lower(uid), {"userid": uid, "n": 0})
+  u.n += 1
+  return u
+}
+count_touch("Ann"); count_touch("ANN"); count_touch("bob")
+check(len(users) == 2 and users.ann.n == 2 and users.ann.userid == "Ann" and users.bob.n == 1, "get_or_put keeps the first, in a function")
+let seen = {}
+add_keys(seen, ["o1", "o2"])
+add_keys(seen, ["o2", "o3"])
+check(len(seen) == 3 and seen.o3 == true, "add_keys as a set")
+check(add_keys({}, [1, 2], 0)["2"] == 0, "add_keys with a value and number keys")
+let people = [{"id": "c", "n": 5}, {"id": "a", "n": 5}, {"id": "b", "n": 9}]
+let order = map(sort_by(people, fn(p) { return [-p.n, p.id] }), fn(p) { return p.id })
+check(order == ["b", "a", "c"], "list keys: by touches, then by id")
+check(sort_by([[1, "a"], [1]], fn(x) { return x })[0] == [1], "a shorter list key that is a prefix comes first")
+let inner = fn() {
+  let groups = {}
+  for w in ["x", "y", "x"] { if true { get_or_put(groups, w, []); push(groups[w], w) } }
+  return len(groups.x)
+}
+check(inner() == 2, "get_or_put in a closure, nested in control flow")
+
+# ---- env / secret ----------------------------------------------------------------------------------------
+check(env("GRAIN_TEST_UNSET_VAR_XYZ", "d") == "d" and env("GRAIN_TEST_UNSET_VAR_XYZ") == nil, "env unset")
+check(env("PATH") != nil, "env set")
+check(secret("GRAIN_TEST_UNSET_SECRET_XYZ") == "" and secret("GRAIN_TEST_UNSET_SECRET_XYZ", "d") == "d", "secret unset")
+# the test is run with GRAIN_TEST_EMPTY set to "" and GRAIN_TEST_SECRET_FILE naming a file this writes
+if getenv("GRAIN_TEST_SECRET_FILE") != nil {
+  check(getenv("GRAIN_TEST_EMPTY") == "" and env("GRAIN_TEST_EMPTY", "d") == "d", "env: set to nothing is unset")
+  write_file(getenv("GRAIN_TEST_SECRET_FILE"), "  s3cr3t\n")
+  check(secret("GRAIN_TEST_SECRET") == "s3cr3t", "secret from NAME_FILE, trimmed")
+  delete_file(getenv("GRAIN_TEST_SECRET_FILE"))
+}
+
+print("text builtins: ok")

@@ -43,6 +43,8 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `len` | `len(val)` | Returns the length of a string, list, map, or bytes buffer. |
 | `cwd` | `cwd()` | Returns the current working directory path. |
 | `getenv` | `getenv(name, [default])` | Reads an environment variable; returns `default` or `nil` if unset. |
+| `env` | `env(name, [default])` | An app setting or environment variable; `default` (or `nil`) when it is unset **or empty**. Use it for hosts, ports and names, where `""` never means a value. |
+| `secret` | `secret(name, [default])` | `env(name)`, or else the contents of the file `NAME_FILE` names, trimmed: a password kept in a file of its own (mode 600) instead of the environment. Neither set: `default`, or `""`. |
 | `setenv` | `setenv(name, val)` | Sets or updates an environment variable for the process. |
 | `sleep` | `sleep(ms)` | Pauses the current execution thread for `ms` milliseconds. |
 | `clock` | `clock()` | High-resolution wall-clock timestamp in fractional seconds. |
@@ -75,8 +77,8 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 |---|---|---|
 | `abs` | `abs(n)` | Returns the absolute value of an integer, real, or decimal. |
 | `idiv` | `idiv(a, b)` | Whole-number integer division, truncating toward zero. |
-| `min` | `min(...nums)` | Returns the minimum of one or more numbers. |
-| `max` | `max(...nums)` | Returns the maximum of one or more numbers. |
+| `min` | `min(...vals)` / `min(list)` | The smallest of numbers, or of strings (by bytes, so `"2026-10-27 08:05"` < `"2026-10-27 14:30"`). `nil` is passed over (all `nil`: `nil`), so a running value can start as `nil`: `first = min(first, t)`. Numbers and strings together are an error. |
+| `max` | `max(...vals)` / `max(list)` | The largest; the same rules as `min`. `latest = max(latest, t)`. |
 | `floor` | `floor(n)` | Rounds down to the nearest integer. |
 | `ceil` | `ceil(n)` | Rounds up to the nearest integer. |
 | `round` | `round(n, [places])` | Rounds half away from zero (default 0 decimal places). |
@@ -158,6 +160,8 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `index_of` | `index_of(str, sub, [start])` | Returns 0-based index of `sub`, or `-1` if not found. |
 | `last_index_of` | `last_index_of(str, sub)` | Returns last index of `sub`, or `-1` if not found. |
 | `find` | `find(haystack, needle)` | Alias for `index_of`. |
+| `is_blank` | `is_blank(val)` | `true` for `nil` and for a string of only spaces, tabs and line breaks (a column that came back NULL or `''`); `false` for anything else, `0`, `false` and `[]` included. |
+| `first_present` | `first_present(a, b, ...)` | The first argument that is not blank (`is_blank`), or `nil`: `first_present(u.name, u.realname, u.userid)`. Unlike `a ?? b`, which only passes over `nil`, it passes over `""` too. |
 
 ### Manipulation & Trimming
 | Function | Signature | Description |
@@ -191,7 +195,7 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `remove_at` | `remove_at(list, index)` | Removes element at `index` in-place. |
 | `reverse` | `reverse(list)` | Returns a new list with elements in reverse order. |
 | `sort` | `sort(list)` | Returns a new list sorted in ascending order. |
-| `sort_by` | `sort_by(list, key_fn, [desc])` | Sorts list by extracted key; optional descending flag. |
+| `sort_by` | `sort_by(list, key_fn, ["asc"\|"desc"])` | Sorts by extracted key, stable. Keys are numbers, strings or booleans, or a **list** of them: compared item by item, so ties fall to the next item: `sort_by(users, fn(u) { return [-u.touches, lower(u.userid)] })`. |
 | `group_by` | `group_by(list, key_fn)` | Groups items into a map of lists keyed by `key_fn(item)`. |
 | `key_by` | `key_by(list, key_fn)` | Maps list into dictionary keyed by `key_fn(item)` (first wins). |
 | `sum_by` | `sum_by(list, key_fn, val_fn)` | Groups items and aggregates totals per key. |
@@ -227,6 +231,8 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `get` | `get(map_or_list, key_or_idx, [default])` | Safe lookup returning `default` (or `nil`) if not found. |
 | `get_in` | `get_in(container, path_list, [default])` | Deep nested traversal over maps and lists with default fallback. |
 | `merge` | `merge(...maps)` | Merges multiple maps (later keys overwrite earlier ones). |
+| `get_or_put` | `get_or_put(map, key, value)` | `map[key]` when it is there (and not `nil`); otherwise puts `value` at `key` and returns it. The record a key stands for, made the first time it is seen: `get_or_put(users, lower(uid), {"userid": uid, "n": 0}).n += 1`. `value` is worked out before the call either way. |
+| `add_keys` | `add_keys(map, list, [value])` | Sets `map[item] = value` (default `true`) for every item: a map used as a set, `len(map)` its size. Returns the map. |
 
 ---
 
@@ -261,9 +267,10 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 | `now` | `now()` | Returns fractional UNIX epoch timestamp in seconds. |
 | `iso8601` | `iso8601([timestamp])` | Formats timestamp as ISO 8601 string (e.g. `"2026-10-26T14:48:02Z"`). Default is current time. |
 | `date_parts` | `date_parts(ts, [utc])` | Returns map: `{year, month, day, hour, min, sec, wday, yday, isdst}`. |
-| `date_format` | `date_format(fmt, ts, [utc])` | Formats timestamp using `strftime`-style format patterns. |
+| `date_format` | `date_format(ts, fmt, [zone])` | Formats a timestamp (zone `"local"`, the default, or `"utc"`). `%Y %m %d %e %H %I %M %S %L %j %y %a %A %b %B %p %F %T %z %s %%`; `%P` is lowercase am/pm; `%-d %-m %-H %-I %-M %-S %-j` drop the leading zero: `date_format(date_parse("2026-10-07 09:05"), "%b %-d, %Y %-I:%M%P", "utc")` is `"Oct 7, 2026 9:05am"`. |
 | `date_parse` | `date_parse(str, [fmt])` | Parses date/time string into fractional UNIX timestamp. |
 | `date_make` | `date_make(y, m, d, [h, min, s, utc])` | Constructs UNIX timestamp from year, month, day, etc. |
+| `date_range` | `date_range(first_day, last_day)` | Every calendar day from one `YYYY-MM-DD` to another, both included, as `YYYY-MM-DD` strings; `[]` when the first is after the last. No zone, so no daylight-saving hour to skip or repeat. At most 100000 days. |
 | `every` | `every(seconds, fn)` | Recurring timer executing `fn()` every `seconds`. Returns timer ID. |
 | `after` | `after(seconds, fn)` | One-shot delayed timer executing `fn()`. Returns timer ID. |
 | `cancel` | `cancel(timer_id)` | Cancels an active timer created with `every` or `after`. |
@@ -323,6 +330,26 @@ ECMAScript-compatible regular expression operations.
 | `xml_parse` | `xml_parse(xml_str)` | Parses XML into nested map `{tag, attrs, children, text}` with entity decoding and CDATA support. |
 | `xml_escape` | `xml_escape(str)` | Escapes special XML characters (`&`, `<`, `>`, `"`, `'`). |
 | `xml_unescape` | `xml_unescape(str)` | Unescapes standard and numeric XML entities (e.g. `&amp;`, `&#x2603;`). |
+| `html_escape` | `html_escape(val)` | `val` as text safe inside an element or a quoted attribute (`&`, `<`, `>`, `"`, `'` as `&#39;`); `nil` is `""`, a number its text. |
+| `el` | `el(tag, [attrs], ...children)` | An element node `{tag, attrs, children}`. The second argument is the attrs when it is `nil` or a map that is not itself a node; otherwise it is the first child. |
+| `html_raw` | `html_raw(markup)` | Markup already written, put into a node tree as it is (`&middot;`, a fragment rendered elsewhere). |
+| `html_stringify` | `html_stringify(node)` | Writes a node tree as HTML, escaped in one place (see below). |
+| `xml_stringify` | `xml_stringify(node)` | Writes a node tree as XML; also writes back what `xml_parse` returns. |
+
+#### Building markup
+
+Build a page or document as nodes and write it out once, instead of joining strings and remembering to escape every value:
+
+```grain
+let row = el("tr", el("td", {"class": ["who", is_lead ? "lead" : nil], "data-v": lower(name)},
+                       el("b", name), el("small", userid)))
+html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><small>ann</small></td></tr>
+```
+
+- **Nodes:** a string or number is text (escaped); `nil` and `false` write nothing, so `cond ? el(...) : nil` works; a list writes each item in turn; `html_raw(s)` writes `s` as it is; a map `{tag, attrs, children}` is an element (what `el` makes and `xml_parse` returns; a parsed `text` comes before the children). `true` is an error.
+- **Attributes** are written in the order given. `nil` and `false` leave the attribute out; `true` writes it bare in HTML (`open`) and as `="true"` in XML; a list is its items joined by spaces, blanks skipped (class lists). Names with spaces, quotes or `=` are refused.
+- **HTML:** `area base br col embed hr img input link meta source track wbr` have no closing tag (content in one is an error); `<script>` and `<style>` content is written unescaped, with any `</script` inside written as `<\/script` so it cannot end the element early.
+- **XML:** an element with no content is written `<name/>`.
 | `base64_encode` | `base64_encode(str_or_bytes)` | Encodes string or bytes to standard Base64. |
 | `base64_decode` | `base64_decode(b64_str)` | Decodes Base64 string to original UTF-8 string. |
 | `hex_encode` | `hex_encode(str_or_bytes)` | Encodes input into lowercase hexadecimal string. |
@@ -352,7 +379,7 @@ ECMAScript-compatible regular expression operations.
 |---|---|---|
 | `doc.csv` / `csv_format` | `doc.csv(cols, rows)` or `doc.csv(records)` | Formats columns/rows or a list of record maps as an RFC 4180 CSV string. |
 | `doc.parse_csv` / `csv_parse` | `doc.parse_csv(text, [options])` | Parses RFC 4180 CSV into a list of maps, or `{columns, rows}` when `as_table: true`. |
-| `doc.xlsx` / `xlsx_create` | `doc.xlsx(spec)` | Generates an OpenXML `.xlsx` workbook from `{sheet, records, columns, rows, freeze_pane}`. |
+| `doc.xlsx` / `xlsx_create` | `doc.xlsx(spec)` | Generates an OpenXML `.xlsx` workbook from `{sheet, records, columns, rows, freeze_pane, merges, col_widths}`. A cell is a value or `{v, s}` (`s` a style name). Numbers are written exactly. `merges` holds `"B3:D3"` ranges or `[first_row, first_col, last_row, last_col]` lists counted from 1. |
 | `doc.pdf` / `pdf_render` | `doc.pdf(html, [css], [options])` | Compiles HTML/CSS into vector PDF 1.4 bytes (`page_width`, `page_height`, margins). |
 | `doc.zip` / `zip_create` | `doc.zip(entries, [level])` | Packages a map of `{"filename": data}` into a PKZIP archive buffer. |
 | `doc.unzip` / `unzip` | `doc.unzip(zip_data)` | Decompresses PKZIP archive bytes into a map of `{"filename": bytes}`. |
@@ -423,7 +450,8 @@ ECMAScript-compatible regular expression operations.
 | `res_json` | `res_json(val, [status, [headers]])` | Returns HTTP response map formatted as JSON. |
 | `res_text` | `res_text(text, [status, [headers]])` | Returns plain text HTTP response map. |
 | `res_html` | `res_html(html, [status, [headers]])` | Returns HTML HTTP response map. |
-| `res_error` | `res_error(message, [status])` | Returns error response map (default 400). |
+| `res_error` | `res_error(status, [message])` | Returns a JSON error response `{error, status}` (a status that is not a number is 500; the message defaults to `"Internal Error"`). |
+| `res_download` | `res_download(body, filename, [headers])` | A file to save: `Content-Disposition: attachment` with `filename` made safe (a non-ASCII name also as `filename*`), the content type from the extension (pdf, xlsx, docx, csv, json, txt, html, xml, zip, gz, png, jpg, svg; otherwise `application/octet-stream`) and no caching. `body` is a string or bytes; `headers` are added last and win. |
 | `res_redirect` | `res_redirect(location, [status])` | Returns redirect response map (default 302). |
 | `res_sse` | `res_sse(events_list, [headers])` | Returns response formatted as `text/event-stream`. |
 | `on_machine` | `on_machine(machine_id, fn)` | Dispatches route execution to a specific fleet node. |

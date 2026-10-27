@@ -730,6 +730,10 @@ const std::vector<std::string>& grain_allowed() {
       "sum_by", "idiv", "upper_rtrim",
       // patterns: the same text and pattern give the same answer anywhere
       "regex_test", "regex_match", "regex_find_all", "regex_replace", "regex_split",
+      // blanks, records made on first use, sets, calendar days and markup: functions of their arguments (get_or_put
+      // and add_keys change the map they are given, as push changes its list)
+      "is_blank", "first_present", "get", "get_in", "get_or_put", "add_keys", "date_range",
+      "html_escape", "xml_escape", "el", "html_raw", "html_stringify", "xml_stringify",
       "sat"};   // deterministic: a reaction replayed after a crash gets the same answer
   return names;
 }

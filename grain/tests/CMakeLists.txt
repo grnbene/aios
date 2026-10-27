@@ -99,6 +99,8 @@ add_test(NAME grain.lang.match_coalesce COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT
 add_test(NAME grain.lang.spread_jit COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)
 add_test(NAME grain.lang.spread_jit.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)
 add_test(NAME grain.lang.match_coalesce.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_match_coalesce.gr)
+add_test(NAME grain.lang.text_builtins COMMAND ${CMAKE_COMMAND} -E env GRAIN_TEST_EMPTY= GRAIN_TEST_SECRET_FILE=${CMAKE_CURRENT_BINARY_DIR}/text_builtins.secret $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
+add_test(NAME grain.lang.text_builtins.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 
 
 # The HTTP client against a local server (tests/net): needs Python 3 to run the

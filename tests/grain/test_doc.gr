@@ -77,6 +77,14 @@ let sheet_xml = str(unzipped["xl/worksheets/sheet1.xml"])
 check(contains(sheet_xml, "Marcus Miller"), "sheet1 contains Marcus Miller")
 check(contains(sheet_xml, "2200"), "sheet1 contains 2200")
 check(contains(sheet_xml, "freeze_pane") == false, "no raw string leak")
+
+// a real is written as the shortest text that reads back as it (it was %.4g: 24098.0 came out 2.41e+04)
+let num_sheet = str(doc.unzip(doc.xlsx({"rows": [[24098.0, 0.1, 1234567.25, 2.5e-7, 930.0, -1390.0]], "merges": ["A1:B1", [2, 1, 2, 3]]}))["xl/worksheets/sheet1.xml"])
+check(contains(num_sheet, "<v>24098</v>") and contains(num_sheet, "<v>0.1</v>") and contains(num_sheet, "<v>1234567.25</v>") and
+      contains(num_sheet, "<v>2.5e-07</v>") and contains(num_sheet, "<v>930</v>") and contains(num_sheet, "<v>-1390</v>"), "reals written exactly, whole ones plainly")
+check(contains(num_sheet, "<mergeCell ref=\"A1:B1\"/>") and contains(num_sheet, "<mergeCell ref=\"A2:C2\"/>"), "merges as A1 text and as [row, col, row, col]")
+check(!pcall(doc.xlsx, {"rows": [[1]], "merges": ["A1\"/><x"]}).ok, "a merge that is not a cell range is refused")
+check(!pcall(doc.xlsx, {"rows": [[1]], "merges": [[0, 1, 1, 1]]}).ok, "merge rows and columns count from 1")
 check(contains(sheet_xml, "pane xSplit=\"1\" ySplit=\"1\""), "freeze pane B2 parsed correctly")
 
 let styles_xml = str(unzipped["xl/styles.xml"])
