@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "aios/userland/runtime_registry.hpp"
 #include "aios/core/base64.hpp"
 #include "aios/core/json.hpp"
 #include "aios/hal/host.hpp"
@@ -23,7 +24,9 @@ constexpr uint16_t kDefaultPort = 7480;
 std::string text_of(const aios::ByteBuffer& b) { return std::string(b.begin(), b.end()); }
 aios::ByteSpan span_of(const std::string& s) { return aios::ByteSpan(reinterpret_cast<const uint8_t*>(s.data()), s.size()); }
 
-// Where this machine's host keeps its apps: GRAIN_HOME, else ~/.grain (%LOCALAPPDATA%\grain on Windows).
+// Where this machine's host keeps its apps: GRAIN_HOME, else ~/.grain (%LOCALAPPDATA%\grain on Windows) - and when
+// no host has started there, the home of an app host that is running (aios serve keeps its apps in <root>/apps;
+// grain ps lists it), so `grain app status` finds the host this machine has without being told where.
 std::string default_home(aios::hal::Host& h) {
   std::string v = h.env("GRAIN_HOME");
   if (!v.empty()) return v;
@@ -32,7 +35,11 @@ std::string default_home(aios::hal::Host& h) {
   if (!v.empty()) return v + "\\grain";
 #endif
   v = h.env("HOME");
-  return (v.empty() ? std::string(".") : v) + "/.grain";
+  const std::string home = (v.empty() ? std::string(".") : v) + "/.grain";
+  if (h.read_file(home + "/host.key").ok()) return home;
+  for (const auto& running : runtime::app_host_homes())
+    if (h.read_file(running + "/host.key").ok()) return running;
+  return home;
 }
 
 struct Target {
