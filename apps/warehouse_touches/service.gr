@@ -131,7 +131,14 @@ ui.pane({
   "css": PAGE_CSS,
   "machine": COMPUTE_ON,
   "workers": true,
-  "view": fn() { return dashboard_node(report(get_db(), {"start": state.start, "stop": state.stop, "userid": nil}), state) },
+  // a connection of the render's own, closed after: the routes run in worker VMs copied from this program's
+  // globals, and a connection kept in a global (get_db's db_conn) cannot be copied to them
+  "view": fn() {
+    let c = db_connect(DB_CFG)
+    let data = report(c, {"start": state.start, "stop": state.stop, "userid": nil})
+    db_close(c)
+    return dashboard_node(data, state)
+  },
   // Live: the engine wakes the pane when the touch_day Thing changes (WAIT THING, on a connection of its own);
   // every open page then looks again, and gets a frame when its own range's figures moved.
   "watch": {"thing": "touch_day", "db": DB_CFG},
