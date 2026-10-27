@@ -38,7 +38,9 @@ fn stamp_touch(user, first, last) {
   }
 }
 
-fn fetch_warehouse_touches(db, start_date, stop_date, userids) {
+// The report straight from the tables (~10 queries over the range). The Thing path below must give the same answer;
+// this one stays as what it is checked against (WAREHOUSE_SOURCE=sql).
+fn fetch_warehouse_touches_sql(db, start_date, stop_date, userids) {
   let start_ts = start_date + " 00:00:00"
   let stop_ts = stop_date + " 23:59:59"
 
@@ -386,6 +388,11 @@ fn fetch_warehouse_touches(db, start_date, stop_date, userids) {
     }
   }
 
+  return rollup(users, days, start_date, stop_date)
+}
+
+// users: lower(userid) -> user record; days: lower(userid) -> {day: true}. Touches, per-day rates, totals, rank.
+fn rollup(users, days, start_date, stop_date) {
   // Compute User Rollups & Metrics
   let totals = blank_user("TOTAL")
   totals.name = "All users"
@@ -490,4 +497,180 @@ fn fetch_warehouse_touches(db, start_date, stop_date, userids) {
     "users": user_list,
     "totals": totals
   }
+}
+
+// ---- From the touch_day Thing ------------------------------------------------------------------------------------
+// The engine keeps one Thing per day (things/touch_day.gr): every user's sums and distinct sets for that day. A report
+// reads the days of its range and merges them - sums added, distinct sets unioned, runs taken once - into the same
+// user records the SQL path builds, then the same rollup.
+
+fn days_between(start_date, stop_date) {
+  let is_day = fn(d) { return d != nil and regex_test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", str(d)) }
+  if not is_day(start_date) or not is_day(stop_date) { return [] }
+  let out = []
+  let t = date_parse(start_date)
+  let end = date_parse(stop_date)
+  while t <= end and len(out) < 4000 {
+    push(out, date_format(t, "%Y-%m-%d", "utc"))
+    t = t + 86400
+  }
+  return out
+}
+
+fn touch_days(db, start_date, stop_date) {
+  let ds = days_between(start_date, stop_date)
+  if len(ds) == 0 { return [] }
+  let quoted = []
+  for d in ds { push(quoted, "'" + d + "'") }
+  let r = db_query(db, "SHOW THING touch_day KEYS (" + join(quoted, ", ") + ")", [])
+  if not r.ok { error("touch_day: " + r.error) }
+  let out = []
+  for row in r.records { push(out, {"day": str(row.day), "users": json_parse(row.users)}) }
+  return out
+}
+
+fn fetch_warehouse_touches(db, start_date, stop_date, userids) {
+  let users = {}
+  let days = {}
+  let get_user = fn(key, uid) {
+    if users[key] == nil { users[key] = blank_user(uid) }
+    if days[key] == nil { days[key] = {} }   // a user's days may already be noted (the active-day pass runs first)
+    return users[key]
+  }
+  let rows = touch_days(db, start_date, stop_date)
+  let sets = {}   // key -> {items, vendors, orders, moves: {type: pairs}}
+  let set_of = fn(key) {
+    if sets[key] == nil { sets[key] = {"items": {}, "vendors": {}, "orders": {}, "moves": {}} }
+    return sets[key]
+  }
+  let add_all = fn(m, list) { for v in list { m[v] = true } }
+
+  // In the SQL path's order (receiving, picking, moves, loads, sticker), so a user's displayed id is the same one.
+  for part in ["rec", "pick", "moves", "loads", "sticker"] {
+    for dayrow in rows {
+      for key in keys(dayrow.users) {
+        let d = dayrow.users[key]
+        if part == "rec" and d.rec.scans > 0 {
+          let u = get_user(key, d.userid)
+          u.receiving.scans = u.receiving.scans + d.rec.scans
+          u.receiving.qty_in = u.receiving.qty_in + real(d.rec.qty_in)
+          u.receiving.qty_out = u.receiving.qty_out + real(d.rec.qty_out)
+          add_all(set_of(key).items, d.rec.items)
+          add_all(set_of(key).vendors, d.rec.vendors)
+        } else if part == "pick" and d.pick.lines > 0 {
+          let u = get_user(key, d.userid)
+          u.picking.lines = u.picking.lines + d.pick.lines
+          u.picking.qty = u.picking.qty + real(d.pick.qty)
+          add_all(set_of(key).orders, d.pick.orders)
+        } else if part == "moves" and len(keys(d.moves)) > 0 {
+          let u = get_user(key, d.userid)
+          let s = set_of(key)
+          for t in keys(d.moves) {
+            if u.movements.by_type[t] == nil { u.movements.by_type[t] = {"moves": 0, "qty": 0.0} }
+            u.movements.by_type[t].qty = u.movements.by_type[t].qty + real(d.moves[t].qty)
+            u.movements.qty = u.movements.qty + real(d.moves[t].qty)
+            if s.moves[t] == nil { s.moves[t] = {} }
+            add_all(s.moves[t], d.moves[t].pairs)
+          }
+        } else if part == "sticker" and (d.packed.n > 0 or d.staged.n > 0) {
+          let u = get_user(key, d.userid)
+          u.sticker.packed = u.sticker.packed + d.packed.n
+          u.sticker.packedunits = u.sticker.packedunits + real(d.packed.units)
+          u.sticker.staged = u.sticker.staged + d.staged.n
+          u.sticker.stagedunits = u.sticker.stagedunits + real(d.staged.units)
+        }
+        if part == "rec" and d.active {   // the days with a receiving, pick, move or sticker touch
+          if days[key] == nil { days[key] = {} }
+          days[key][dayrow.day] = true
+        }
+      }
+    }
+    if part == "loads" {
+      // a run over several days is one run: its rows' figures combined, then counted once per name on its dispatch
+      let runs = {}     // key -> run id -> combined run
+      let units = {}    // key -> run id -> name on the dispatch -> {units, orders}
+      for dayrow in rows {
+        for key in keys(dayrow.users) {
+          let d = dayrow.users[key]
+          for id in keys(d.runs) {
+            let r = d.runs[id]
+            if runs[key] == nil { runs[key] = {} }
+            let c = runs[key][id]
+            if c == nil {
+              runs[key][id] = {"uid": d.userid, "k": r.k, "manual": r.manual, "forced": r.forced, "assigned": r.assigned, "started": r.started, "stopped": r.stopped}
+            } else {
+              c.manual = c.manual + r.manual
+              c.forced = c.forced or r.forced
+              if r.assigned != nil and (c.assigned == nil or r.assigned < c.assigned) { c.assigned = r.assigned }
+              if r.started != nil and (c.started == nil or r.started < c.started) { c.started = r.started }
+              if r.stopped != nil and (c.stopped == nil or r.stopped > c.stopped) { c.stopped = r.stopped }
+            }
+          }
+          for id in keys(d.units) {
+            if units[key] == nil { units[key] = {"uid": d.userid, "runs": {}} }
+            if units[key].runs[id] == nil { units[key].runs[id] = d.units[id] }   // the same on every day the run is on
+          }
+        }
+      }
+      for key in keys(runs) {
+        for id in keys(runs[key]) {
+          let run = runs[key][id]
+          let u = get_user(key, run.uid)
+          u.loads.dispatches = u.loads.dispatches + run.k
+          u.loads.manual = u.loads.manual + run.manual * run.k
+          if run.forced { u.loads.forced = u.loads.forced + run.k }
+          let last_t = run.stopped != nil ? run.stopped : run.assigned
+          stamp_touch(u, run.started != nil ? run.started : run.assigned, last_t)
+          if last_t != nil and len(last_t) >= 10 {
+            if days[key] == nil { days[key] = {} }
+            days[key][slice(last_t, 0, 10)] = true
+          }
+        }
+      }
+      for key in keys(units) {
+        let by_name = {}   // name on the dispatch -> {units, orders}
+        let per_run = units[key].runs
+        for id in keys(per_run) {
+          for dv in keys(per_run[id]) {
+            if by_name[dv] == nil { by_name[dv] = {"units": 0.0, "orders": {}} }
+            by_name[dv].units = by_name[dv].units + real(per_run[id][dv].units)
+            add_all(by_name[dv].orders, per_run[id][dv].orders)
+          }
+        }
+        let u = get_user(key, units[key].uid)
+        for dv in keys(by_name) {
+          u.loads.scans = u.loads.scans + by_name[dv].units
+          u.loads.orders = u.loads.orders + len(keys(by_name[dv].orders))
+        }
+      }
+    }
+  }
+  // first and last touch of receiving, picking, moves and sticker (loads stamped above)
+  for dayrow in rows {
+    for key in keys(dayrow.users) {
+      let d = dayrow.users[key]
+      if users[key] != nil and (d.first != nil or d.last != nil) { stamp_touch(users[key], d.first, d.last) }
+    }
+  }
+  for key in keys(sets) {
+    let u = users[key]
+    let s = sets[key]
+    u.receiving.items = len(keys(s.items))
+    u.receiving.vendors = len(keys(s.vendors))
+    u.picking.orders = len(keys(s.orders))
+    for t in keys(s.moves) {
+      let n = len(keys(s.moves[t]))
+      u.movements.by_type[t].moves = u.movements.by_type[t].moves + n
+      u.movements.moves = u.movements.moves + n
+    }
+  }
+  // operator names
+  let n_res = pcall(db_query, db, "SELECT userid, realname FROM www_users")
+  if n_res.ok and n_res.value.records != nil {
+    for row in n_res.value.records {
+      let k = lower(row.userid)
+      if users[k] != nil and row.realname != nil { users[k].name = trim(row.realname) }
+    }
+  }
+  return rollup(users, days, start_date, stop_date)
 }

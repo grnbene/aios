@@ -43,6 +43,15 @@ fn get_db() {
   return c
 }
 
+// WAREHOUSE_SOURCE: "thing" (default) reads the touch_day Thing the engine keeps current; "sql" runs the report's
+// queries against the tables, as it did before the Thing - what the Thing is checked against.
+let SOURCE = env("WAREHOUSE_SOURCE", "thing")
+
+fn report(db, p) {
+  if SOURCE == "sql" { return fetch_warehouse_touches_sql(db, p.start, p.stop, p.userid) }
+  return fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+}
+
 fn parse_date_params(req) {
   let q = {}
   if req.query_params != nil and type(req.query_params) == "map" {
@@ -74,14 +83,14 @@ fn handle_health(req) {
 fn handle_quickreport(req) {
   let p = parse_date_params(req)
   let db = get_db()
-  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let data = report(db, p)
   return {"status": 200, "content_type": "application/json; charset=utf-8", "json": data}
 }
 
 fn handle_quickreportview(req) {
   let p = parse_date_params(req)
   let db = get_db()
-  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let data = report(db, p)
   let html = render_html_dashboard(data, p)
   return {"status": 200, "content_type": "text/html; charset=utf-8", "body": html}
 }
@@ -89,7 +98,7 @@ fn handle_quickreportview(req) {
 fn handle_quickreportpdf(req) {
   let p = parse_date_params(req)
   let db = get_db()
-  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let data = report(db, p)
   let pdf_bytes = render_pdf_report(data)
   let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".pdf"
 
@@ -108,7 +117,7 @@ fn handle_quickreportpdf(req) {
 fn handle_quickreportxlsx(req) {
   let p = parse_date_params(req)
   let db = get_db()
-  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let data = report(db, p)
   let xlsx_bytes = render_xlsx_report(data)
   let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".xlsx"
 
@@ -127,7 +136,7 @@ fn handle_quickreportxlsx(req) {
 fn handle_quickreportcsv(req) {
   let p = parse_date_params(req)
   let db = get_db()
-  let data = fetch_warehouse_touches(db, p.start, p.stop, p.userid)
+  let data = report(db, p)
   let csv_str = render_csv_report(data)
   let filename = "warehouse-touches-" + data.start + "-to-" + data.stop + ".csv"
 
