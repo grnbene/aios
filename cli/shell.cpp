@@ -1,4 +1,5 @@
 #include "shell.hpp"
+#include "command_docs.hpp"
 #include <algorithm>
 #include <functional>
 #include <regex>
@@ -548,41 +549,8 @@ bool shell_command(Session& sess, Out& out, Surface& me, const std::vector<std::
     };
     for (const auto& [name, page] : pages)
       if (target == name) { o << page << "\n"; return true; }
-    // A kernel command: its own line from `help`, found under the name an
-    // alias stands for.
-    static const std::pair<const char*, const char*> aliases[] = {
-#include "command_aliases.inc"
-    };
-    std::string want = target;
-    for (const auto& [alias, name] : aliases)
-      if (want == alias) { want = name; break; }
-    std::string help_text;
-    { Out h([&](const std::string& t) { help_text += t; }); print_help(h); }
-    bool found = false;
-    for (auto& line : split(help_text, '\n')) {
-      std::string t = line;
-      t.erase(0, t.find_first_not_of(' '));
-      std::string clean;
-      for (size_t i = 0; i < t.size(); ++i) {
-        if (t[i] == '\033') { while (i < t.size() && t[i] != 'm') ++i; continue; }
-        clean.push_back(t[i]);
-      }
-      // The usage column is 32 wide. " | " separates commands that share a
-      // line ("reboot | poweroff", "chain | btc ..."); a bare | separates
-      // subcommands, which are not entries of their own.
-      std::string usage = clean.substr(0, std::min<size_t>(clean.size(), 32));
-      bool hit = false;
-      for (size_t from = 0; from <= usage.size();) {
-        size_t bar = usage.find(" | ", from);
-        std::string alt = usage.substr(from, bar == std::string::npos ? std::string::npos : bar - from);
-        alt.erase(0, alt.find_first_not_of(' '));
-        if (alt.substr(0, alt.find_first_of(" |")) == want || alt.substr(0, alt.find_first_of(" |")) == target) hit = true;
-        if (bar == std::string::npos) break;
-        from = bar + 3;
-      }
-      if (hit) { o << clean << "\n"; found = true; }
-    }
-    if (found) return true;
+    // A kernel command (or one of its aliases): the command in full, as `help <cmd>` shows it.
+    if (const CommandDoc* d = find_command_doc(target)) { print_command_help(o, *d); return true; }
     fail(Status::NotFound, "no manual entry for " + target + ": `man` lists the familiar commands, `help` the kernel commands");
   }
   if (cmd == "which") {

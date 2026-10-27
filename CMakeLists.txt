@@ -270,7 +270,7 @@ if(AIOS_ENABLE_SDL2 AND SDL2_FOUND)
 endif()
 
 # The command surface. A debugging instrument for humans, not part of the kernel.
-add_executable(aios-cli cli/main.cpp cli/commands.cpp cli/embed.cpp cli/out.cpp cli/shell.cpp cli/console.cpp cli/ask.cpp cli/dream.cpp cli/organ.cpp cli/face.cpp cli/grain_cmd.cpp cli/sat_cmd.cpp cli/grain_net.cpp cli/grain_host.cpp cli/model_controller.cpp)
+add_executable(aios-cli cli/main.cpp cli/commands.cpp cli/command_docs.cpp cli/embed.cpp cli/out.cpp cli/shell.cpp cli/console.cpp cli/ask.cpp cli/dream.cpp cli/organ.cpp cli/face.cpp cli/grain_cmd.cpp cli/sat_cmd.cpp cli/grain_net.cpp cli/grain_host.cpp cli/model_controller.cpp)
 target_link_libraries(aios-cli PRIVATE aios)
 set_target_properties(aios-cli PROPERTIES OUTPUT_NAME aios)
 
