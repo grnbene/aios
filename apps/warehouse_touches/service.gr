@@ -29,7 +29,7 @@ fn get_db() {
   return c
 }
 
-fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid) }
+fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid, p.hour) }
 
 // start / stop from the query (or a range "a..b"); missing or not a date, the PHP report's defaults: the last 30
 // days, today included (report_range in lib/queries.gr).
@@ -42,7 +42,7 @@ fn parse_date_params(req) {
     if len(rparts) >= 2 { start = rparts[0]; stop = rparts[1] }
   }
   let r = report_range(start, stop)
-  return {"start": r[0], "stop": r[1], "userid": q.userid}
+  return {"start": r[0], "stop": r[1], "userid": q.userid, "hour": hour_wanted(q.hour_wanted)}
 }
 
 // ---- Route Handlers ----------------------------------------------------------
@@ -105,7 +105,7 @@ fn handle_quickreportxlsx(req) { return export(req, "xlsx", render_xlsx_report) 
 fn handle_quickreportcsv(req) { return export(req, "csv", render_csv_report) }
 
 // GET /quickreportevents?start&stop: server-sent events for an open dashboard. The engine wakes this route when the
-// touch_day Thing changes (WAIT THING - nothing here polls); when a day of the range is among the changed ones, the
+// touch_hour Thing changes (WAIT THING - nothing here polls); when an hour of the range is among the changed ones, the
 // report is read again and pushed as `report` {badge, live}, which the page swaps in. A comment goes out when a wait
 // times out with nothing new, so a closed page is noticed and the route ends.
 fn handle_events(req, writer) {
@@ -116,7 +116,7 @@ fn handle_events(req, writer) {
   writer.write_head(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
   let clock = "0"
   while not writer.is_closed() {
-    let r = db_query(w, "WAIT THING touch_day SINCE " + clock + " TIMEOUT 25", [])
+    let r = db_query(w, "WAIT THING touch_hour SINCE " + clock + " TIMEOUT 25", [])
     if not r.ok {
       writer.event("failed", r.error)
       break
@@ -130,7 +130,7 @@ fn handle_events(req, writer) {
       clock = now_clock
       let hit = first or str(row.whole) == "1"
       if not hit {
-        for d in json_parse(row.changed) { if in_range[str(d)] { hit = true } }
+        for d in json_parse(row.changed) { if in_range[slice(str(d), 0, 10)] { hit = true } }   // an hour of a day of the range
       }
       if hit {
         let data = report(get_db(), p)
@@ -151,7 +151,7 @@ let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
 
 // The viewer's own page: the range (the PHP report's default, the last 30 days) and the table's sort.
 let default_range = report_range(nil, nil)
-let state = {"start": default_range[0], "stop": default_range[1], "sorter": {"col": 2, "dir": "desc"}}
+let state = {"start": default_range[0], "stop": default_range[1], "hour": nil, "sorter": {"col": 2, "dir": "desc"}}
 
 ui.pane({
   "title": "Warehouse Activity",
@@ -163,13 +163,13 @@ ui.pane({
   // globals, and a connection kept in a global (get_db's db_conn) cannot be copied to them
   "view": fn() {
     let c = db_connect(DB_CFG)
-    let data = report(c, {"start": state.start, "stop": state.stop, "userid": nil})
+    let data = report(c, {"start": state.start, "stop": state.stop, "userid": nil, "hour": state.hour})
     db_close(c)
     return dashboard_node(data, state)
   },
-  // Live: the engine wakes the pane when the touch_day Thing changes (WAIT THING, on a connection of its own);
+  // Live: the engine wakes the pane when the touch_hour Thing changes (WAIT THING, on a connection of its own);
   // every open page then looks again, and gets a frame when its own range's figures moved.
-  "watch": {"thing": "touch_day", "db": DB_CFG},
+  "watch": {"thing": "touch_hour", "db": DB_CFG},
   "routes": {
     "/health": handle_health,
     "/quickreportauth": handle_auth,

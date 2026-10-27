@@ -51,7 +51,9 @@ fn report_columns(report) {
                ["Avg Disp. Min", false, fn(u) { return u.loads.avgloadtime }, "dec", 12.0],
                ["Skipped", false, fn(u) { return u.loads.manual }, "int", 10.0],
                ["Skipped %", false, fn(u) { return u.loads.manualpct }, "dec", 10.0],
-               ["Force Comp.", false, fn(u) { return u.loads.forced }, "int", 10.0]]],
+               ["Force Comp.", false, fn(u) { return u.loads.forced }, "int", 10.0],
+               ["Pickup Orders", false, fn(u) { return u.loads.pickuporders }, "int", 10.0],
+               ["Pickup Units", false, fn(u) { return u.loads.pickupunits }, "int", 10.0]]],
     ["Sticker Scan Out", [["Staged Units", true, fn(u) { return u.sticker.stagedunits }, "int", 11.0],
                           ["Staged Orders", false, fn(u) { return u.sticker.staged }, "int", 11.0],
                           ["Packed Orders", false, fn(u) { return u.sticker.packed }, "int", 11.0],
@@ -179,7 +181,7 @@ fn render_csv_report(report) {
             r.qty_in, r.qty_out, r.scans,
             p.qty, p.orders, p.lines,
             m.qty, m.moves, mv(u, "item move"), mv(u, "dolly move"), mv(u, "merge"),
-            l.scans, l.orders, l.dispatches, l.avgdispatchunits, l.avgloadtime, l.manual, l.manualpct, l.forced,
+            l.scans, l.orders, l.dispatches, l.avgdispatchunits, l.avgloadtime, l.manual, l.manualpct, l.forced, l.pickuporders, l.pickupunits,
             s.stagedunits, s.staged, s.packed, s.packedunits, s.binds,
             u.touches, u.active_days, u.touches_per_day, pct,
             short_time(u.first_touch), short_time(u.last_touch)]
@@ -193,7 +195,7 @@ fn render_csv_report(report) {
     "Rec Qty In", "Rec Qty Out", "Rec Scans",
     "Pick Units", "Pick Orders", "Pick Lines",
     "Move Qty", "Move Count", "Item Move Qty", "Dolly Move Qty", "Merge Qty",
-    "Load Units", "Load Orders", "Dispatches", "Avg Units/Disp", "Avg Load Min", "Skipped Scans", "Skipped Pct", "Force Comp",
+    "Load Units", "Load Orders", "Dispatches", "Avg Units/Disp", "Avg Load Min", "Skipped Scans", "Skipped Pct", "Force Comp", "Pickup Orders", "Pickup Units",
     "Staged Units", "Staged Orders", "Packed Orders", "Packed Units", "Bound Orders",
     "Total Touches", "Active Days", "Touches/Day", "Pct of Total", "First Touch", "Last Touch"
   ], rows)
@@ -203,7 +205,7 @@ fn render_csv_report(report) {
 
 // The page: the same page as apir/warehouse/touches/quickreportview in the PHP report (catalog/controller/apir/
 // warehouse/touches.php) - its markup, styles and sort - with the figures kept live: /quickreportevents pushes a new
-// <div id="live"> whenever a day of the range changes (WAIT THING on touch_day), and the page swaps it in.
+// <div id="live"> whenever an hour of the range changes (WAIT THING on touch_hour), and the page swaps it in.
 
 // The five sources that make up touches, in column order: key, label, colour variable.
 let SOURCES = [["receiving", "Receiving", "--rec"], ["picking", "Picking", "--pick"], ["movements", "Bin moves", "--move"],
@@ -231,8 +233,9 @@ fn source_cells(u) {
     "receiving": small(n0(u.receiving.scans) + " scan rows" + rec_extra),
     "picking": small(n0(u.picking.orders) + " orders" + MID + n0(u.picking.lines) + " lines"),
     "movements": small(n0(u.movements.moves) + " moves"),
-    "loads": [small(n0(l.dispatches) + " disp" + MID + "avg " + n1(l.avgloadtime) + " min" + MID + "avg " + n1(l.avgdispatchunits) + " units"),
-              small(n1(l.manualpct) + "% skipped (" + n0(l.manual) + ")" + MID + n0(l.forced) + " force completed")],
+    "loads": [l.dispatches > 0 ? small(n0(l.dispatches) + " disp" + MID + "avg " + n1(l.avgloadtime) + " min" + MID + "avg " + n1(l.avgdispatchunits) + " units") : nil,
+              l.manual > 0 or l.forced > 0 ? small(n1(l.manualpct) + "% skipped (" + n0(l.manual) + ")" + MID + n0(l.forced) + " force completed") : nil,
+              l.pickuporders > 0 or l.pickupunits > 0 ? small(n0(l.pickuporders) + " pickup orders" + MID + n0(l.pickupunits) + " pickup units (not scanned, credited to taken by)") : nil],
     "sticker": [small(n0(st.staged) + " staged orders"),
                 small("packed " + n0(st.packed) + " ord" + MID + n0(st.packedunits) + " units" + MID + n0(st.binds) + " bound")]
   }
@@ -250,12 +253,23 @@ fn sort_value(u, col) {
 }
 
 // The PHP page's live part, for the page whose script sorts it (render_live: data-col headers).
-fn render_live(report) { return html_stringify(live_node(report, nil)) }
+fn render_live(report) { return html_stringify(live_node(report, nil, hours_node(report.hour, nil))) }
+
+// The hour of the day the report is limited to (hour_wanted in the PHP report): All, then 12am to 11pm. pick: an
+// action for a button (the pane); nil: the page's script submits the form with the hour (the PHP page).
+fn hours_node(current, pick) {
+  let label = fn(h) { return str(h % 12 == 0 ? 12 : h % 12) + (h < 12 ? "am" : "pm") }
+  let button = fn(h, text) {
+    return el("button", {"type": "button", "class": ["btn", "hour", h == current ? "on" : nil], "data-hour": h ?? "",
+                         "on_click": pick == nil ? nil : fn() { pick(h) }}, text)
+  }
+  return el("div", {"class": "hours"}, button(nil, "All"), map(range(0, 24), fn(h) { return button(h, label(h)) }))
+}
 
 // What changes with the data: the cards and the "By person" panel. sorter nil: the rows in rank order
 // and headers for the page script to sort; a sorter {col, dir}: the rows sorted here (ties by user id, every time)
 // and each header an action that sorts by it (the same column again turns the order).
-fn live_node(report, sorter) {
+fn live_node(report, sorter, hours) {
   let t = report.totals
   let pt = source_parts(t)
   let lasts = report.lasts == nil ? {} : report.lasts
@@ -274,7 +288,8 @@ fn live_node(report, sorter) {
                                        n0(t.receiving.scans) + " scan rows" + MID + "under " + n0(t.receiving.vendors) + " vendors"),
     card(SOURCES[1], n0(pt.picking), n0(t.picking.orders) + " orders" + MID + n0(t.picking.lines) + " lines"),
     card(SOURCES[2], n0(pt.movements), n0(t.movements.moves) + " moves"),
-    card(SOURCES[3], n0(pt.loads), n0(t.loads.dispatches) + " dispatches" + MID + n1(t.loads.manualpct) + "% skipped (" + n0(t.loads.manual) + ")"),
+    card(SOURCES[3], n0(pt.loads), n0(t.loads.dispatches) + " dispatches" + MID + n0(t.loads.pickuporders) + " pickup orders" + MID +
+                                   n0(t.loads.pickupunits) + " pickup units" + MID + n1(t.loads.manualpct) + "% skipped (" + n0(t.loads.manual) + ")"),
     card(SOURCES[4], n0(pt.sticker), n0(t.sticker.staged) + " staged orders" + MID + n0(t.sticker.stagedunits) + " units staged"))
 
   let nil_cell = el("span", {"class": "nil"}, "\u{2013}")
@@ -326,12 +341,15 @@ fn live_node(report, sorter) {
   push(head, th(8, {}, "Days"), th(9, {}, "Per day"), th(10, {}, "First / last"))
   push(foot, el("td", n0(t.active_days)), el("td", n1(t.touches_per_day)),
        el("td", {"class": "when"}, when(t.first_touch), el("small", "to " + when(t.last_touch))))
-  let legend = map(SOURCES, fn(src) { return el("span", dot(src[2]), src[1]) })
+  let pickups = t.loads.pickuporders > 0 or t.loads.pickupunits > 0
+  let legend = map(SOURCES, fn(src) {
+    return el("span", dot(src[2]), src[1], src[0] == "loads" and pickups ? [" ", el("small", "(incl. pickup orders, credited to who took the order)")] : nil)
+  })
 
   let panel = el("div", {"class": "panel"},
     el("div", {"class": "panel-head"}, el("h2", "By person"), el("div", {"class": "legend"}, legend)),
     el("div", {"class": "scroll"}, el("table", el("thead", el("tr", head)), el("tbody", rows), el("tfoot", el("tr", foot)))))
-  return [cards, panel]
+  return [cards, hours, panel]
 }
 
 let PAGE_CSS = join([
@@ -347,6 +365,8 @@ let PAGE_CSS = join([
   "input[type=date] { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }",
   ".btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; text-decoration: none; cursor: pointer; }",
   ".btn.primary { background: var(--rec); border-color: var(--rec); color: #ffffff; }",
+  ".hours { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }",
+  ".btn.hour { padding: 4px 10px; font-size: 12px; } .btn.hour.on { background: var(--rec); border-color: var(--rec); color: #ffffff; }",
   ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }",
   ".card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }",
   ".card.total { border-width: 2px; }",
@@ -373,7 +393,7 @@ let PAGE_CSS = join([
   "td.empty { text-align: center; color: var(--muted); padding: 30px; }",
   "#live.pulse .card.total { animation: pulse 1.2s ease-out; }",
   "@keyframes pulse { from { border-color: var(--rec); } to { border-color: var(--line); } }",
-  "@media print { body { background: #ffffff; } form, .btn { display: none; } .card, .panel { break-inside: avoid; } }"
+  "@media print { body { background: #ffffff; } form, .btn, .hours { display: none; } .card, .panel { break-inside: avoid; } }"
 ], chr(10))
 
 // The PHP page's table sort, bound again after each pushed update (the sort kept), and the event stream.
@@ -427,8 +447,18 @@ let PAGE_JS = join([
   "}"
 ], chr(10))
 
+// The PHP page's hour buttons: the form again, with that hour.
+let HOURS_JS = join([
+  "document.addEventListener('click', function (e) {",
+  "  var b = e.target.closest && e.target.closest('.hour'), f = document.getElementById('report-form');",
+  "  if (!b || !f) return;",
+  "  f.elements['hour_wanted'].value = b.dataset.hour;",
+  "  f.submit();",
+  "});"
+], chr(10))
+
 fn render_html_dashboard(report, input) {
-  let q = "?start=" + report.start + "&stop=" + report.stop
+  let q = "?start=" + report.start + "&stop=" + report.stop + "&hour_wanted=" + str(report.hour ?? "")
   return "<!doctype html>" + html_stringify(el("html",
     el("head", el("meta", {"charset": "utf-8"}), el("meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}),
        el("title", "Warehouse Activity " + report.start + " to " + report.stop), el("style", PAGE_CSS)),
@@ -437,14 +467,15 @@ fn render_html_dashboard(report, input) {
         el("header",
           el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
           el("div", {"class": "clock", "aria-live": "off"}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
-          el("form", {"method": "get", "action": "/quickreportview"},
+          el("form", {"method": "get", "action": "/quickreportview", "id": "report-form"},
+            el("input", {"type": "hidden", "name": "hour_wanted", "value": str(report.hour ?? "")}),
             el("label", "From"), el("input", {"type": "date", "name": "start", "value": report.start}),
             el("label", "To"), el("input", {"type": "date", "name": "stop", "value": report.stop}),
             el("button", {"type": "submit", "class": "btn primary"}, "Run"),
             el("a", {"class": "btn", "href": "/quickreportpdf" + q}, "Export PDF"),
             el("a", {"class": "btn", "href": "/quickreportxlsx" + q}, "Export Excel"))),
         el("div", {"id": "live"}, html_raw(render_live(report)))),
-      el("script", PAGE_JS))))
+      el("script", PAGE_JS), el("script", HOURS_JS))))
 }
 
 // The clock in the header, filled in by the page (the time is the viewer's).
@@ -468,7 +499,7 @@ let EXPORT_JS = join([
   "  var p = new URLSearchParams(location.search);",
   "  if (!a || !p.get('route')) return;",
   "  e.preventDefault();",
-  "  p.set('export', a.dataset.export); p.set('start', a.dataset.start); p.set('stop', a.dataset.stop);",
+  "  p.set('export', a.dataset.export); p.set('start', a.dataset.start); p.set('stop', a.dataset.stop); p.set('hour_wanted', a.dataset.hour || '');",
   "  location.href = location.pathname + '?' + p.toString();",
   "});"
 ], chr(10))
@@ -476,7 +507,8 @@ let EXPORT_JS = join([
 // The page as a ui.pane view (service.gr): the same markup as the PHP page, its range a form whose Run is an
 // action and its sort done here (state: {start, stop, sorter}, the viewer's own).
 fn dashboard_node(report, state) {
-  let q = "?start=" + report.start + "&stop=" + report.stop
+  let hour = str(state.hour ?? "")
+  let q = "?start=" + report.start + "&stop=" + report.stop + "&hour_wanted=" + hour
   return el("div", {"class": "page"},
     el("header",
       el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
@@ -489,8 +521,8 @@ fn dashboard_node(report, state) {
           state.start = r[0]
           state.stop = r[1]
         }}, "Run"),
-        el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop}, "Export PDF"),
-        el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop}, "Export Excel"))),
-    el("div", {"id": "live"}, live_node(report, state.sorter)),
+        el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
+        el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
+    el("div", {"id": "live"}, live_node(report, state.sorter, hours_node(state.hour, fn(h) { state.hour = h }))),
     el("script", CLOCK_JS), el("script", EXPORT_JS))
 }
