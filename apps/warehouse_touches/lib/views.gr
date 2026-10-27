@@ -392,6 +392,13 @@ fn fmt_day(d) {
 // The line under the title: the range.
 fn render_badge(report) { return html_escape(fmt_day(report.start) + " – " + fmt_day(report.stop)) }
 
+// the latest of every source's last touch
+fn t_last(lasts) {
+  let best = nil
+  for k in keys(lasts) { if lasts[k] != nil and (best == nil or lasts[k] > best) { best = lasts[k] } }
+  return best
+}
+
 // the counted part of each source for a user (or the totals)
 fn source_parts(u) {
   return {"receiving": u.receiving.qty_in + u.receiving.qty_out, "picking": u.picking.qty, "movements": u.movements.qty,
@@ -418,14 +425,19 @@ fn source_cells(u) {
 fn render_live(report) {
   let t = report.totals
   let pt = source_parts(t)
+  let lasts = report.lasts == nil ? {} : report.lasts
+  let last_line = fn(src) {
+    let t = src == nil ? t_last(lasts) : lasts[src]
+    return "<div class=\"last\">" + (t == nil ? "no touches" : "last touch " + html_escape(fmt_time(t))) + "</div>"
+  }
   let card = fn(src, value, sub) {
     return "<div class=\"card\"><div class=\"label\">" + dot(src[2]) + html_escape(src[1]) + "</div><div class=\"value\">" + value +
-           "</div><div class=\"sub\">" + sub + "</div></div>"
+           "</div><div class=\"sub\">" + sub + "</div>" + last_line(src[0]) + "</div>"
   }
   let out = []
   push(out, "<div class=\"cards\">")
   push(out, "<div class=\"card total\"><div class=\"label\">Total touches</div><div class=\"value\">" + n0(t.touches) +
-            "</div><div class=\"sub\">units &middot; " + n0(len(report.users)) + " people &middot; " + n0(t.active_days) + " active days</div></div>")
+            "</div><div class=\"sub\">units &middot; " + n0(len(report.users)) + " people &middot; " + n0(t.active_days) + " active days</div>" + last_line(nil) + "</div>")
   push(out, card(SOURCES[0], n0(pt.receiving) + UNITS_TAG, n0(t.receiving.qty_in) + " in / " + n0(t.receiving.qty_out) + " out &middot; " +
                  n0(t.receiving.scans) + " scan rows &middot; under " + n0(t.receiving.vendors) + " vendors"))
   push(out, card(SOURCES[1], n0(pt.picking) + UNITS_TAG, n0(t.picking.orders) + " orders &middot; " + n0(t.picking.lines) + " lines"))
@@ -504,6 +516,8 @@ let PAGE_CSS = join([
   ".card.total { border-width: 2px; }",
   ".card .label { color: var(--muted); font-size: 13px; } .card .value { font-size: 28px; font-weight: 600; margin: 2px 0; } .card .sub { color: var(--muted); font-size: 12px; }",
   ".note { color: var(--muted); font-size: 12px; margin: 0 0 20px; }",
+  ".card .last { color: var(--muted); font-size: 11px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); }",
+  ".clock { text-align: center; font-variant-numeric: tabular-nums; } .clock .time { font-size: 22px; font-weight: 600; } .clock .day { color: var(--muted); font-size: 12px; }",
   ".dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }",
   ".panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }",
   ".panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }",
@@ -553,6 +567,12 @@ let PAGE_JS = join([
   "    if (sortCol !== null) { var th = document.querySelector('th[data-col=\"' + sortCol + '\"]'); if (th) sortBy(th, sortDir); }",
   "}",
   "bindSort();",
+  "function tick() {",
+  "    var d = new Date();",
+  "    document.getElementById('clock-time').textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });",
+  "    document.getElementById('clock-day').textContent = d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });",
+  "}",
+  "tick(); setInterval(tick, 1000);",
   "if (window.EventSource) {",
   "    var es = new EventSource('/quickreportevents' + location.search);",
   "    es.addEventListener('report', function (m) {",
@@ -574,6 +594,7 @@ fn render_html_dashboard(report, input) {
     "<title>Warehouse Activity " + html_escape(report.start) + " to " + html_escape(report.stop) + "</title><style>" + PAGE_CSS + "</style></head><body><div class=\"page\">",
     "<header>",
     "<div><h1>Warehouse Activity</h1><div class=\"range\" id=\"range\">" + render_badge(report) + "</div></div>",
+    "<div class=\"clock\" aria-live=\"off\"><div class=\"time\" id=\"clock-time\"></div><div class=\"day\" id=\"clock-day\"></div></div>",
     "<form method=\"get\" action=\"/quickreportview\">",
     "<label>From</label><input type=\"date\" name=\"start\" value=\"" + html_escape(report.start) + "\">",
     "<label>To</label><input type=\"date\" name=\"stop\" value=\"" + html_escape(report.stop) + "\">",

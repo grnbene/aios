@@ -227,11 +227,16 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
       }
     }
   }
-  // first and last touch of receiving, picking, moves and sticker (loads were stamped above)
+  // first and last touch of receiving, picking, moves and sticker (loads were stamped above); and each source's
+  // latest touch over everyone, for its stat card
+  let lasts = {}
+  let later = fn(src, t) { if t != nil and t != "" and (lasts[src] == nil or t > lasts[src]) { lasts[src] = t } }
   for dayrow in rows {
     for key in keys(dayrow.users) {
       let d = dayrow.users[key]
       if users[key] != nil and (d.first != nil or d.last != nil) { stamp_touch(users[key], d.first, d.last) }
+      if d.lasts != nil { for src in keys(d.lasts) { later(src, d.lasts[src]) } }
+      for id in keys(d.runs) { later("loads", d.runs[id].stopped != nil ? d.runs[id].stopped : d.runs[id].assigned) }
     }
   }
   for key in keys(sets) {
@@ -261,8 +266,10 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
       if users[k] != nil and row.realname != nil { users[k].name = trim(row.realname) }
     }
   }
-  return rollup(users, days, start_date, stop_date, {"items": len(keys(all_items)), "vendors": len(keys(all_vendors)),
-                "orders": len(keys(all_orders)), "secs": load_secs, "timed": load_timed})
+  let report = rollup(users, days, start_date, stop_date, {"items": len(keys(all_items)), "vendors": len(keys(all_vendors)),
+                      "orders": len(keys(all_orders)), "secs": load_secs, "timed": load_timed})
+  report.lasts = lasts
+  return report
 }
 
 // Touches, rates and totals, as the PHP report works them out. users: lower(userid) -> record; days: lower(userid) ->
