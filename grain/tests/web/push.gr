@@ -18,6 +18,8 @@ ui.pane({"title": "Push",
       el("div", {"id": "keep", "data-ui-keep": true}, "from the server"),
       el("p", {"id": "v"}, "value " + trim(read_file(path))),
       el("p", {"id": "n"}, "n=" + str(n)),
+      // rows by key, in the order the value says (value 3: b before a): a reorder moves them, it does not rewrite them
+      el("ul", {"id": "rows"}, map(trim(read_file(path)) == "3" ? ["b", "a"] : ["a", "b"], fn(k) { return el("li", {"data-key": k}, "row " + k) })),
       el("button", {"id": "add", "on_click": fn() { n += 1 }}, "Add"))
   }})
 run_panes()

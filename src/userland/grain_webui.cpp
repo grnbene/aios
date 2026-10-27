@@ -132,9 +132,9 @@ const char* kStyle = R"CSS(
   }
 }
 *{box-sizing:border-box}
-@keyframes ui-flash{from{background-color:rgba(250,204,21,.45);box-shadow:0 0 0 3px rgba(250,204,21,.45)}to{background-color:transparent;box-shadow:0 0 0 3px transparent}}
-.ui-changed{animation:ui-flash 1.8s ease-out;border-radius:3px}
-@media (prefers-reduced-motion:reduce){.ui-changed{animation:none;outline:2px solid rgba(250,204,21,.6)}}
+@keyframes ui-flash{0%{background-color:rgba(59,130,246,.28)}25%{background-color:rgba(59,130,246,.22)}100%{background-color:rgba(59,130,246,0)}}
+.ui-changed{animation:ui-flash 2.6s ease-out;border-radius:4px}
+@media (prefers-reduced-motion:reduce){.ui-changed{animation:none;background-color:rgba(59,130,246,.15)}}
 body{
   margin:0;background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(59,130,246,0.12),transparent),var(--bg);
   min-height:100vh;color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -563,7 +563,7 @@ const char* kScript = R"JS(
   function flash(el){
     if(!el||!el.classList)return;
     el.classList.remove('ui-changed');void el.offsetWidth;el.classList.add('ui-changed');
-    clearTimeout(el._uiFlash);el._uiFlash=setTimeout(function(){el.classList.remove('ui-changed')},1800);
+    clearTimeout(el._uiFlash);el._uiFlash=setTimeout(function(){el.classList.remove('ui-changed')},2700);
   }
   function morph(target,source,fromAction){
     if(target.nodeType!==source.nodeType||target.nodeName!==source.nodeName){
@@ -599,6 +599,21 @@ const char* kScript = R"JS(
       return;
     }
     var sc=Array.from(source.childNodes),tc=Array.from(target.childNodes);
+    // children with data-key (a table's rows, by who they are): matched by key, so a row that moved is moved, not
+    // rewritten in place - and only what changed in it is marked
+    var keyed=sc.length>0&&sc.every(function(n){return n.nodeType===Node.ELEMENT_NODE&&n.hasAttribute('data-key')});
+    if(keyed){
+      var have={};
+      tc.forEach(function(n){if(n.nodeType===Node.ELEMENT_NODE&&n.hasAttribute('data-key'))have[n.getAttribute('data-key')]=n;});
+      sc.forEach(function(src,i){
+        var k=src.getAttribute('data-key'),t=have[k];
+        if(t){delete have[k];morph(t,src,fromAction);}
+        else{t=src.cloneNode(true);}
+        if(target.childNodes[i]!==t)target.insertBefore(t,target.childNodes[i]||null);
+      });
+      Array.from(target.childNodes).slice(sc.length).forEach(function(n){target.removeChild(n);});
+      return;
+    }
     var max=Math.max(sc.length,tc.length);
     for(var k=0;k<max;k++){
       if(!tc[k]&&sc[k])target.appendChild(sc[k].cloneNode(true));
