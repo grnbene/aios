@@ -718,7 +718,7 @@ at start (`asql: 2 Thing kind(s), 4 things back from disk`).
 
 ### Syntax (aggregate and row Things)
 
-From `ThingEngine::parse_create` (`sql_things.cpp:873-1150`):
+From `ThingEngine::parse_create` (`sql_things.cpp`):
 
 ```
 CREATE THING <name> KEY <column>
@@ -741,7 +741,8 @@ CREATE THING <name> KEY <column>
 - `READS` defaults to every table the query names.
 - `PART` sub-queries are allowed only on row Things.
 - `WHEN ... DO ... TO` is allowed only on a row Thing, and the profile must
-  have `things_write=1`. Inside `DO`, outside quotes:
+  have `things_write=1` (not yet with `SHADOW`, below). Inside `DO`, outside
+  quotes:
   - the word `KEY` is replaced by the Thing's key. `ON DUPLICATE KEY`,
     `PRIMARY KEY` and similar are left alone.
   - `THING.<label>` is replaced by that value of the Thing that acted, as it
@@ -762,7 +763,8 @@ CREATE THING <name> KEY <column>
   in the key's history instead of running it. Nothing connects to the target,
   so the profile needs no `things_write=1` yet. `SHOW THING SHADOW <name>`
   lists every key's `would act` lines, newest first, with the statements as
-  they would have run (each key keeps its last 32 history lines).
+  they would have run. Each key keeps only its last 32 history lines, ordinary
+  changes included, so on a busy key older `would act` lines drop off.
   `SHOW THINGS` adds `(shadow)` to its act.
   - `SET THING <name> LIVE` turns the act on. The profile must then have
     `things_write=1`. It acts only for what comes true from then on: a key
@@ -773,9 +775,9 @@ CREATE THING <name> KEY <column>
 
 The parser also has `RESOURCE`, `CLAIMS` (allocation), `GRAIN` (a grain
 program), `AT '<time>' GRAIN` (an event Thing, gated by `AIOS_THING_WRITES=1`)
-and mirror kinds. Their shapes are in the error strings at
-`sql_things.cpp:2805`, `2839`, `4168` and `4802`. **None of these were driven
-here.**
+and mirror kinds. Their shapes are in the usage error strings in
+`sql_things.cpp` (each starts `CREATE THING <name> RESOURCE`, `CLAIMS`,
+`GRAIN`, `AT '` or `MIRROR`). **None of these were driven here.**
 
 The other statements:
 
@@ -783,8 +785,9 @@ The other statements:
     SHOW THINGS <name> | SHOW THING <name>       every Thing of a kind
     SHOW THING HISTORY <name> '<key>'   what changed it and why
     SHOW THING SHADOW <name>            what a Thing's act would have run (TO .. SHADOW)
-    SHOW THING <name> AS OF '<time>' [KEYS ('k', ...)]   a row Thing as it stood then (see below)
+    SHOW THING <name> AS OF '<time>' [KEYS ('k', ...)]   an aggregate or row Thing as it stood then (see below)
     SET THING <name> KEEP <n> DAYS      how far back AS OF reaches (30 by default; 0 keeps none)
+    EXPLAIN THING <name> '<key>' [LIMIT n]   the source rows that make up one Thing (see below)
     SET THING <name> SHADOW | LIVE      hold a Thing's act back, or let it write
     SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
@@ -810,10 +813,12 @@ counts (see [What's running on this machine](grain-apps.md#whats-running-on-this
 
 ### `AS OF`: a Thing as it stood at a moment
 
-A row Thing writes every change of a key (its values after it, and the cause) to a log beside its state file,
+An aggregate or row Thing (any `CREATE THING .. AS SELECT` kind, partitioned or not) writes every change of a key
+(its values after it, and the cause) to a log beside its state file,
 `<root>/sql_db/things/<name>.asof`. `SHOW THING <name> AS OF '2026-10-27 14:15:00'` reads it back: one row per key
 that existed at the end of that second, its values, `changed_at` (when that value was set) and `cause` (what set it,
-the same text as `SHOW THING HISTORY`). `'YYYY-MM-DD HH:MM'` and `'YYYY-MM-DD'` mean the end of that minute or day.
+the same text as `SHOW THING HISTORY`). Times are local. `'YYYY-MM-DD HH:MM'` and `'YYYY-MM-DD'` mean the end of
+that minute or day, and a time after now gives the current state.
 `KEYS ('123', ...)` narrows it.
 
 How much is kept: 30 days (`AIOS_THING_KEEP_DAYS`, or `SET THING <name> KEEP <n> DAYS`) and at most 256 MB per Thing
@@ -822,6 +827,15 @@ after it. A time before the cut-off is refused with the cut-off named. `KEEP 0 D
 A Thing made before this existed starts its log when the engine first loads it. The log lives on disk only. Grain
 Things, claims and resources keep their own history and have no `AS OF`. Design and costs:
 [design/thing-time-travel.md](design/thing-time-travel.md).
+
+### `EXPLAIN THING`: the rows behind a value
+
+`EXPLAIN THING orders '123'` runs the Thing's own query for that key without its `GROUP BY`: every source row that
+went into it (all of the query's columns, joins included), filtered by the Thing's `WHERE`. For each value that is a
+plain `SUM(x)`, `COUNT(*)`, `COUNT(x)`, `MIN(x)`, `MAX(x)` or `AVG(x)` (optionally times a number) a column
+`thing.<label>` shows that row's share, so a `SUM`'s shares add up to the value. A value made some other way (`CASE`,
+`DISTINCT`, two aggregates combined) gets no share column; its rows are still listed. `NULL` (unquoted) is the NULL
+key. At most 1,000 rows unless `LIMIT n` says otherwise. Grain Things are not made by a query and are refused.
 
 ### `WAIT THING`: told when a Thing changes
 

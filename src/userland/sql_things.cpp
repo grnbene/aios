@@ -748,7 +748,7 @@ ThingFleetFn& fleet_fn() { static ThingFleetFn f; return f; }
 // a JOIN's ON). Returns the statement without it.
 bool split_target(const std::string& sql, std::string* body, std::string* target) {
   std::string u = upper(trim(sql));
-  static const char* verbs[] = {"SHOW", "CALL", "PAUSE", "RESUME", "REFRESH", "FIRE", "RETRY", "SET"};
+  static const char* verbs[] = {"SHOW", "CALL", "PAUSE", "RESUME", "REFRESH", "FIRE", "RETRY", "SET", "EXPLAIN"};
   bool ok = false;
   for (const char* v : verbs) if (u.rfind(v, 0) == 0) ok = true;
   if (!ok) return false;
@@ -2486,7 +2486,7 @@ bool ThingEngine::handles(const std::string& sql) const {
   char a[8], b[8];
   if (!word(i, a, sizeof a) || !word(i, b, sizeof b)) return false;
   static const char* const verbs[] = {"CREATE", "DROP", "SHOW", "REPLAY", "CALL", "PAUSE", "RESUME",
-                                      "REFRESH", "FIRE", "RETRY", "SET", "RESOLVE", "CHECK", "WAIT"};
+                                      "REFRESH", "FIRE", "RETRY", "SET", "RESOLVE", "CHECK", "WAIT", "EXPLAIN"};
   bool verb = false;
   for (const char* v : verbs) if (std::strcmp(a, v) == 0) { verb = true; break; }
   if (!verb) return false;
@@ -3237,6 +3237,110 @@ SqlQueryResult ThingEngine::show_shadow(const std::string& name) {
   return res;
 }
 
+namespace {
+// What one source row adds to a simple aggregate: SUM(x) / MIN(x) / MAX(x) / AVG(x) -> x, COUNT(*) -> 1, COUNT(x) ->
+// 1 where x is not NULL, each optionally times a number (SUM(qty) * 2). "" for anything else (CASE, DISTINCT,
+// arithmetic over two aggregates): it is not one row's share.
+std::string row_share(const std::string& item) {
+  std::string s = trim(item);
+  std::string times;
+  {
+    // a trailing "* <number>"
+    size_t e = s.size();
+    while (e > 0 && (std::isdigit((unsigned char)s[e - 1]) || s[e - 1] == '.')) --e;
+    size_t m = e;
+    while (m > 0 && std::isspace((unsigned char)s[m - 1])) --m;
+    if (e < s.size() && m > 0 && s[m - 1] == '*') { times = s.substr(e); s = trim(s.substr(0, m - 1)); }
+  }
+  const size_t open = s.find('(');
+  if (open == std::string::npos || s.back() != ')') return "";
+  const std::string fn = upper(trim(s.substr(0, open)));
+  if (fn != "SUM" && fn != "MIN" && fn != "MAX" && fn != "AVG" && fn != "COUNT") return "";
+  // the first '(' must close at the end: SUM(a) + SUM(b) is two aggregates
+  int depth = 0;
+  char quote = 0;
+  for (size_t i = open; i < s.size(); ++i) {
+    const char c = s[i];
+    if (quote) { if (c == quote) quote = 0; continue; }
+    if (c == '\'' || c == '"' || c == '`') { quote = c; continue; }
+    if (c == '(') ++depth;
+    if (c == ')' && --depth == 0 && i + 1 != s.size()) return "";
+  }
+  const std::string arg = trim(s.substr(open + 1, s.size() - open - 2));
+  if (arg.empty() || upper(arg).rfind("DISTINCT", 0) == 0) return "";
+  std::string share = fn == "COUNT" ? (arg == "*" ? std::string("1") : "CASE WHEN (" + arg + ") IS NULL THEN 0 ELSE 1 END") : "(" + arg + ")";
+  return times.empty() ? share : share + " * " + times;
+}
+}  // namespace
+
+SqlQueryResult ThingEngine::explain(const std::string& sql) {
+  static const char* form = "EXPLAIN THING <name> '<key>' [LIMIT n]";
+  std::string t = trim(sql);
+  if (!t.empty() && t.back() == ';') t = trim(t.substr(0, t.size() - 1));
+  Scan sc(t);
+  const size_t tp = sc.find_kw("THING");
+  if (tp == std::string::npos) return error_result(form);
+  std::string rest = trim(t.substr(tp + 5));
+  size_t limit = 1000;
+  {
+    Scan rs(rest);
+    const size_t lp = rs.find_kw("LIMIT");
+    if (lp != std::string::npos) {
+      const std::string n = trim(rest.substr(lp + 5));
+      if (!all_digits(n) || n[0] == '-') return error_result(form);
+      limit = (size_t)std::strtoull(n.c_str(), nullptr, 10);
+      rest = trim(rest.substr(0, lp));
+    }
+  }
+  // the name, then the key: 'text', a number, or NULL
+  size_t sp = 0;
+  if (!rest.empty() && rest[0] == '`') { sp = rest.find('`', 1); sp = sp == std::string::npos ? rest.size() : sp + 1; }
+  else while (sp < rest.size() && !std::isspace((unsigned char)rest[sp])) ++sp;
+  const std::string name = lower(unquote_ident(rest.substr(0, sp)));
+  std::string key = trim(rest.substr(sp));
+  if (name.empty() || key.empty()) return error_result(form);
+  bool key_null = false;
+  if (upper(key) == "NULL") key_null = true;
+  else if (key.size() >= 2 && (key.front() == '\'' || key.front() == '"') && key.back() == key.front()) {
+    std::vector<std::string> one;
+    std::string err;
+    if (!parse_key_list("(" + key + ")", &one, &err) || one.size() != 1) return error_result(form);
+    key = one[0];
+  } else if (!all_digits(key)) {
+    return error_result(form);
+  }
+  // the query's parts, taken under the lock; the query runs after it is let go
+  std::string q, db;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    auto it = kinds_.find(name);
+    if (it == kinds_.end()) return error_result("no Thing kind named " + name);
+    const Kind& k = it->second;
+    if (k.type != Kind::Aggregate) return error_result("EXPLAIN THING: " + k.name + " is not made by a query (a grain Thing explains itself: SHOW THING HISTORY)");
+    // an item is kept as declared ("SUM(qty) AS qty"): the expression is what comes before its AS
+    auto expr_of = [](const std::string& text) {
+      Scan is(text);
+      const size_t p = is.find_kw("AS");
+      return p == std::string::npos ? trim(text) : trim(text.substr(0, p));
+    };
+    std::string shares;
+    for (size_t i = 1; i < k.items.size(); ++i) {
+      const std::string sh = row_share(expr_of(k.items[i].text));
+      if (!sh.empty()) shares += ", " + sh + " AS `thing." + k.items[i].label + "`";
+    }
+    const std::string kx = expr_of(k.items[0].text);
+    q = "SELECT *" + shares + " FROM " + k.source + " WHERE ";
+    if (!k.where_text.empty()) q += "(" + k.where_text + ") AND ";
+    q += "(" + kx + ")" + (key_null ? std::string(" IS NULL") : " = " + (all_digits(key) ? key : sql_lit(key)));
+    q += " LIMIT " + std::to_string(limit);
+    db = k.db;
+  }
+  SqlQueryResult r = db_.execute_local_query(q, db);
+  if (!r.success) return error_result("EXPLAIN THING " + name + ": " + r.error_message);
+  if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+  return r;
+}
+
 SqlQueryResult ThingEngine::show_history(const std::string& name, const std::string& key) {
   auto it = kinds_.find(lower(name));
   if (it == kinds_.end()) return error_result("no Thing kind named " + name);
@@ -3607,6 +3711,7 @@ SqlQueryResult ThingEngine::control(const std::string& verb, const std::string& 
 
 SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
   const std::string u = upper(trim(sql));
+  if (u.rfind("EXPLAIN", 0) == 0) return explain(sql);
   if (u.rfind("SET", 0) == 0) {
     // SET THING <name> SHADOW | LIVE
     std::string t = trim(sql);
