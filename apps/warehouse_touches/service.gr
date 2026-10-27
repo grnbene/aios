@@ -152,6 +152,45 @@ fn handle_quickreportcsv(req) {
   }
 }
 
+// GET /quickreportevents?start&stop: server-sent events for an open dashboard. The engine wakes this route when the
+// touch_day Thing changes (WAIT THING - nothing here polls); when a day of the range is among the changed ones, the
+// report is read again and pushed as `report` {badge, live}, which the page swaps in. A comment goes out when a wait
+// times out with nothing new, so a closed page is noticed and the route ends.
+fn handle_events(req, writer) {
+  let p = parse_date_params(req)
+  let in_range = {}
+  for d in days_between(p.start, p.stop) { in_range[d] = true }
+  // WAIT holds its connection while it waits, so this stream has one of its own
+  let w = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
+  writer.write_head(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+  let clock = "0"
+  while not writer.is_closed() {
+    let r = db_query(w, "WAIT THING touch_day SINCE " + clock + " TIMEOUT 25", [])
+    if not r.ok {
+      writer.event("failed", r.error)
+      break
+    }
+    let row = r.records[0]
+    let now_clock = str(row.clock)
+    if now_clock == clock {
+      if not writer.write(": nothing new" + chr(10) + chr(10)) { break }
+    } else {
+      let first = clock == "0"
+      clock = now_clock
+      let hit = first or str(row.whole) == "1"
+      if not hit {
+        for d in json_parse(row.changed) { if in_range[str(d)] { hit = true } }
+      }
+      if hit {
+        let data = report(get_db(), p)
+        if not writer.event("report", json_stringify({"badge": render_badge(data), "live": render_live(data)})) { break }
+      }
+    }
+  }
+  db_close(w)
+  return nil
+}
+
 // ---- UI Pane & HTTP Routes ---------------------------------------------------
 
 // WAREHOUSE_COMPUTE_ON: the fleet member (its id, or a prefix) whose copy of this app answers the reports - the
@@ -172,6 +211,7 @@ ui.pane({
     "/quickreportview": on_machine(COMPUTE_ON, handle_quickreportview),
     "/quickreportpdf": on_machine(COMPUTE_ON, handle_quickreportpdf),
     "/quickreportxlsx": on_machine(COMPUTE_ON, handle_quickreportxlsx),
-    "/quickreportcsv": on_machine(COMPUTE_ON, handle_quickreportcsv)
+    "/quickreportcsv": on_machine(COMPUTE_ON, handle_quickreportcsv),
+    "/quickreportevents": on_machine(COMPUTE_ON, handle_events)
   }
 })

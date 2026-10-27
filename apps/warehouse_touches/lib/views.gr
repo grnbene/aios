@@ -550,6 +550,8 @@ fn render_html_dashboard(report, input) {
     "  body.force-cards .mobile-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }",
     "  body.force-cards .table-wrap { display: none; }",
     "}",
+    "#live.pulse .card.total { animation: pulse 0.9s ease-out; }",
+    "@keyframes pulse { from { box-shadow: 0 0 0 3px var(--rec); } to { box-shadow: 0 0 0 0 transparent; } }",
     "</style></head><body>"
   ]
 
@@ -558,7 +560,7 @@ fn render_html_dashboard(report, input) {
     "<div class=\"page-header\">",
     "<div class=\"header-title\">",
     "<h1>Warehouse Touches</h1>",
-    "<div class=\"date-badge\">" + html_escape(report.start) + " to " + html_escape(report.stop) + " &middot; " + str(user_count) + " operators &middot; " + fmt_num(t.active_days, 0) + " active days</div>",
+    "<div class=\"date-badge\" id=\"badge\">" + render_badge(report) + "</div>",
     "</div>",
     "<div class=\"header-actions\">",
     "<form class=\"filter-bar\" method=\"GET\" action=\"/quickreportview\">",
@@ -578,6 +580,89 @@ fn render_html_dashboard(report, input) {
     "</div>"
   ], ""))
 
+  push(parts, "<div id=\"live\">" + render_live(report) + "</div>")
+
+  // Client-Side Table Sorter & View Switcher JavaScript
+  push(parts, join([
+    "<script>",
+    "(function(){",
+    "  window.setDashView = function(view) {",
+    "    var b = document.body;",
+    "    var btnT = document.getElementById('btn-table');",
+    "    var btnC = document.getElementById('btn-cards');",
+    "    if (view === 'table') {",
+    "      b.classList.add('force-table'); b.classList.remove('force-cards');",
+    "      if (btnT) btnT.classList.add('active'); if (btnC) btnC.classList.remove('active');",
+    "    } else {",
+    "      b.classList.add('force-cards'); b.classList.remove('force-table');",
+    "      if (btnT) btnT.classList.remove('active'); if (btnC) btnC.classList.add('active');",
+    "    }",
+    "  };",
+    "  var sortCol = null, sortDir = null;",
+    "  function sortBy(table, colIdx, dir) {",
+    "    var ths = table.querySelectorAll('thead th');",
+    "    var th = ths[colIdx]; if (!th) return;",
+    "    ths.forEach(function(h){ h.removeAttribute('data-dir'); });",
+    "    th.setAttribute('data-dir', dir);",
+    "    var isNum = th.getAttribute('data-type') === 'num';",
+    "    var tbody = table.querySelector('tbody');",
+    "    var rows = Array.from(tbody.querySelectorAll('tr'));",
+    "    rows.sort(function(a, b){",
+    "      var cA = a.children[colIdx]; var cB = b.children[colIdx];",
+    "      var vA = cA ? (cA.getAttribute('data-v') || cA.textContent.trim()) : '';",
+    "      var vB = cB ? (cB.getAttribute('data-v') || cB.textContent.trim()) : '';",
+    "      if (isNum) { var nA = parseFloat(vA) || 0; var nB = parseFloat(vB) || 0; return dir === 'asc' ? nA - nB : nB - nA; }",
+    "      return dir === 'asc' ? vA.localeCompare(vB) : vB.localeCompare(vA);",
+    "    });",
+    "    rows.forEach(function(r){ tbody.appendChild(r); });",
+    "  }",
+    "  function bindSort() {",
+    "    var table = document.getElementById('touches-table');",
+    "    if (!table) return;",
+    "    table.querySelectorAll('thead th').forEach(function(th, colIdx){",
+    "      th.addEventListener('click', function(){",
+    "        sortCol = colIdx; sortDir = th.getAttribute('data-dir') === 'desc' ? 'asc' : 'desc';",
+    "        sortBy(table, sortCol, sortDir);",
+    "      });",
+    "    });",
+    "    if (sortCol !== null) sortBy(table, sortCol, sortDir);",
+    "  }",
+    "  bindSort();",
+    "  // Pushed by the server the moment the data changes (WAIT THING on the touch_day Thing): the new figures replace",
+    "  // these in place; the view and the sort stay as they are.",
+    "  if (window.EventSource) {",
+    "    var es = new EventSource('/quickreportevents' + location.search);",
+    "    es.addEventListener('report', function(m){",
+    "      try {",
+    "        var d = JSON.parse(m.data);",
+    "        document.getElementById('live').innerHTML = d.live;",
+    "        document.getElementById('badge').innerHTML = d.badge;",
+    "        bindSort();",
+    "        var l = document.getElementById('live'); l.classList.remove('pulse'); void l.offsetWidth; l.classList.add('pulse');",
+    "      } catch (e) {}",
+    "    });",
+    "  }",
+    "})();",
+    "</script>",
+    "</body></html>"
+  ], ""))
+
+  return join(parts, "")
+}
+
+// The line under the title: the range, the people and the active days.
+fn render_badge(report) {
+  return html_escape(report.start) + " to " + html_escape(report.stop) + " &middot; " + str(len(report.users)) +
+         " operators &middot; " + fmt_num(report.totals.active_days, 0) + " active days"
+}
+
+// What changes with the data: the summary cards and the team panel (cards deck and grid). The page shows it inside
+// <div id="live">, and /quickreportevents pushes a new one whenever a day of the range changes.
+fn render_live(report) {
+  let t = report.totals
+  let pt = t.parts
+  let user_count = len(report.users)
+  let parts = []
   // 2. Summary Metric Cards
   push(parts, join([
     "<div class=\"cards\">",
@@ -720,53 +805,6 @@ fn render_html_dashboard(report, input) {
     "<td class=\"when\">" + fmt_time(t.first_touch) + "<small>to " + fmt_time(t.last_touch) + "</small></td>",
     "</tr></tfoot></table></div>",
     "</div>" // panel
-  ], ""))
-
-  // Client-Side Table Sorter & View Switcher JavaScript
-  push(parts, join([
-    "<script>",
-    "(function(){",
-    "  window.setDashView = function(view) {",
-    "    var b = document.body;",
-    "    var btnT = document.getElementById('btn-table');",
-    "    var btnC = document.getElementById('btn-cards');",
-    "    if (view === 'table') {",
-    "      b.classList.add('force-table'); b.classList.remove('force-cards');",
-    "      if (btnT) btnT.classList.add('active'); if (btnC) btnC.classList.remove('active');",
-    "    } else {",
-    "      b.classList.add('force-cards'); b.classList.remove('force-table');",
-    "      if (btnT) btnT.classList.remove('active'); if (btnC) btnC.classList.add('active');",
-    "    }",
-    "  };",
-    "  var table = document.getElementById('touches-table');",
-    "  if (table) {",
-    "    var ths = table.querySelectorAll('thead th');",
-    "    ths.forEach(function(th, colIdx){",
-    "      th.addEventListener('click', function(){",
-    "        var tbody = table.querySelector('tbody');",
-    "        var rows = Array.from(tbody.querySelectorAll('tr'));",
-    "        var currentDir = th.getAttribute('data-dir');",
-    "        var newDir = currentDir === 'desc' ? 'asc' : 'desc';",
-    "        ths.forEach(function(h){ h.removeAttribute('data-dir'); });",
-    "        th.setAttribute('data-dir', newDir);",
-    "        var isNum = th.getAttribute('data-type') === 'num';",
-    "        rows.sort(function(a, b){",
-    "          var cA = a.children[colIdx]; var cB = b.children[colIdx];",
-    "          var vA = cA ? (cA.getAttribute('data-v') || cA.textContent.trim()) : '';",
-    "          var vB = cB ? (cB.getAttribute('data-v') || cB.textContent.trim()) : '';",
-    "          if (isNum) {",
-    "            var nA = parseFloat(vA) || 0; var nB = parseFloat(vB) || 0;",
-    "            return newDir === 'asc' ? nA - nB : nB - nA;",
-    "          }",
-    "          return newDir === 'asc' ? vA.localeCompare(vB) : vB.localeCompare(vA);",
-    "        });",
-    "        rows.forEach(function(r){ tbody.appendChild(r); });",
-    "      });",
-    "    });",
-    "  }",
-    "})();",
-    "</script>",
-    "</body></html>"
   ], ""))
 
   return join(parts, "")
