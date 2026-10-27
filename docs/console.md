@@ -222,6 +222,9 @@ The Familiar Shell (mapped onto AOS; storage authority applies):
 
 `help` lists the kernel commands, grouped (system, authority, entities and
 memory, compute, channels and store, intelligence, applications and shell).
+`help <cmd>` shows one command in full: its aliases and every subcommand, with
+its usage and what it does. The text comes from `cli/command_docs.cpp`, and
+docs/reference.md is generated from the same table.
 
 The file commands act on the root's own tree (`<root>/fs`). `/host/...` is the
 substrate's filesystem as this machine sees it. Reads need storage `read`,
@@ -289,7 +292,7 @@ FAILED: invalid: grep: invalid regular expression '(unclosed': Mismatched '(' an
 ```
 
 `man <cmd>` describes a familiar command as this shell implements it, and for
-a kernel command (or any alias of one) prints its line from `help`; `which`
+a kernel command (or any alias of one) prints the same as `help <cmd>`; `which`
 says whether a word is a familiar command:
 
 ```

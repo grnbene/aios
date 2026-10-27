@@ -2,6 +2,7 @@
 #include "model_controller.h"
 #include "grain_cmd.hpp"
 #include "shell.hpp"
+#include "command_docs.hpp"
 #include "../src/node/protocol.hpp"
 #include "aios/userland/crash_log.hpp"
 #include "aios/userland/runtime_registry.hpp"
@@ -6512,115 +6513,6 @@ std::vector<std::string> tokenize(const std::string& line) {
   return out;
 }
 
-void print_help(Out& o) {
-  o << o.style(Header()) << "AIOS Command Surface — System Capabilities & Console Commands" << o.style(Reset()) << "\n\n";
-
-  o << o.style(Bold()) << "SYSTEM & ENVIRONMENT" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "info" << o.style(Reset()) << "Display OS topology, memory fabric, and entity summary\n"
-    << "  " << o.style(Cyan()) << W{32} << "sysstat" << o.style(Reset()) << "Display detailed system statistics and health dashboard\n"
-    << "  " << o.style(Cyan()) << W{32} << "devices" << o.style(Reset()) << "List compute devices (CPU, GPU, NPU, Remote)\n"
-    << "  " << o.style(Cyan()) << W{32} << "storage" << o.style(Reset()) << "List storage devices and root volume mount point\n"
-    << "  " << o.style(Cyan()) << W{32} << "network" << o.style(Reset()) << "List network interfaces, IP addresses, and link status\n"
-    << "  " << o.style(Cyan()) << W{32} << "whoami | id" << o.style(Reset()) << "Show active console entity identity\n"
-    << "  " << o.style(Cyan()) << W{32} << "identity" << o.style(Reset()) << "Display or inspect system identity object\n"
-    << "  " << o.style(Cyan()) << W{32} << "subsystems [-v]" << o.style(Reset()) << "Query hardware subsystem capabilities (-v for device names)\n"
-    << "  " << o.style(Cyan()) << W{32} << "bus list|peer <src> <dst>" << o.style(Reset()) << "List PCI devices/windows or copy data between peer devices\n"
-    << "  " << o.style(Cyan()) << W{32} << "attest status|pcrs|quote" << o.style(Reset()) << "TPM attestation: query status, PCR values, and signed quotes\n"
-    << "  " << o.style(Cyan()) << W{32} << "watchdog" << o.style(Reset()) << "System watchdog: monitor health checks, heap, and recovery status\n"
-    << "  " << o.style(Cyan()) << W{32} << "load" << o.style(Reset()) << "Measure system load and request compute quota from host\n"
-    << "  " << o.style(Cyan()) << W{32} << "reboot | poweroff" << o.style(Reset()) << "Restart or shut down the system substrate\n"
-    << "  " << o.style(Cyan()) << W{32} << "sleep <sec>" << o.style(Reset()) << "Pause execution for specified seconds\n"
-    << "  " << o.style(Cyan()) << W{32} << "quit | exit" << o.style(Reset()) << "Exit the command surface session\n\n";
-
-  o << o.style(Bold()) << "AUTHORITY & SECURITY" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "authority [view]" << o.style(Reset()) << "Show capability profile and audit log (mine, residents, log, refusals)\n"
-    << "  " << o.style(Cyan()) << W{32} << "cap grant <e> <kind> <id> <r>" << o.style(Reset()) << "Grant derived capability rights to an entity\n"
-    << "  " << o.style(Cyan()) << W{32} << "cap request <kind> <id> <r>" << o.style(Reset()) << "Request capability rights from kernel\n"
-    << "  " << o.style(Cyan()) << W{32} << "quota set|list|clear|reset" << o.style(Reset()) << "Manage execution time and compute quotas per entity\n"
-    << "  " << o.style(Cyan()) << W{32} << "gateway serve|token|mint|route" << o.style(Reset()) << "Token-gated HTTP gateway for remote compute requests\n"
-    << "  " << o.style(Cyan()) << W{32} << "cap delegate|revoke|list" << o.style(Reset()) << "Manage capabilities (delegate, revoke, or list by kind)\n\n";
-
-  o << o.style(Bold()) << "ENTITIES & MEMORY FABRIC" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "entity create|list|show" << o.style(Reset()) << "Manage persistent system entities\n"
-    << "  " << o.style(Cyan()) << W{32} << "mem alloc|read|write" << o.style(Reset()) << "Allocate, read, or write memory regions (system/shared/persistent/device)\n"
-    << "  " << o.style(Cyan()) << W{32} << "mem migrate|share|list" << o.style(Reset()) << "Migrate, share, or list allocated memory objects\n"
-    << "  " << o.style(Cyan()) << W{32} << "state create|set|get|list" << o.style(Reset()) << "Manage entity state objects\n"
-    << "  " << o.style(Cyan()) << W{32} << "kv set|get|del|list" << o.style(Reset()) << "In-memory key-value store backed by StateObjects\n\n";
-
-  o << o.style(Bold()) << "COMPUTE & GRAPH EXECUTION" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "tensor create|show" << o.style(Reset()) << "Create or inspect typed tensor views (f32, f64, i32, etc.)\n"
-    << "  " << o.style(Cyan()) << W{32} << "compute kernels|serve" << o.style(Reset()) << "List compute kernels or serve compute/SQL service over network\n"
-    << "  " << o.style(Cyan()) << W{32} << "sat solve <file>" << o.style(Reset()) << "Boolean satisfiability (SAT) solver: find model or prove UNSAT\n"
-    << "  " << o.style(Cyan()) << W{32} << "graph create|op|plan|run" << o.style(Reset()) << "Build, optimize, schedule, and execute compute graphs\n\n";
-
-  o << o.style(Bold()) << "CHANNELS & OBJECT STORE" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "channel create|pub|sub|list" << o.style(Reset()) << "Manage IPC state channels and ring buffers (pub/sub)\n"
-    << "  " << o.style(Cyan()) << W{32} << "sql query|serve|import|dump" << o.style(Reset()) << "ASQL relational database: execute queries, run MySQL server, import/dump\n"
-    << "  " << o.style(Cyan()) << W{32} << "ingress receive|verify|list" << o.style(Reset()) << "Receive, verify, and inspect incoming network payloads\n"
-    << "  " << o.style(Cyan()) << W{32} << "feed ingest <url>|list" << o.style(Reset()) << "Ingest and list RSS/Atom feeds into semantic object store\n"
-    << "  " << o.style(Cyan()) << W{32} << "store put|get|similar|list" << o.style(Reset()) << "Semantic object store: store, retrieve, search similarity, or list\n\n";
-
-  o << o.style(Bold()) << "INTELLIGENCE & DISTRIBUTED" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "ask <request>" << o.style(Reset()) << "Submit natural language task or prompt to resident AI model\n"
-    << "  " << o.style(Cyan()) << W{32} << "mind bind|cycle|unbind" << o.style(Reset()) << "Manage AI backend slot binding (echo, plugin, extern, wire, qwen, jepa)\n"
-    << "  " << o.style(Cyan()) << W{32} << "infer load|status|ask|serve" << o.style(Reset()) << "Run local Qwen2 checkpoint or serve OpenAI-compatible completions API\n"
-    << "  " << o.style(Cyan()) << W{32} << "jepa status|record|train|tick" << o.style(Reset()) << "JEPA world model: inspect latent state, record transitions, train policy\n"
-    << "  " << o.style(Cyan()) << W{32} << "fleet hub|join|members|status" << o.style(Reset()) << "Cluster fleet management: hub discovery, node membership, load balancing\n"
-    << "  " << o.style(Cyan()) << W{32} << "p2p status|peers|ping|mdns" << o.style(Reset()) << "Peer-to-peer networking: local DHT, mDNS discovery, and node ping\n"
-    << "  " << o.style(Cyan()) << W{32} << "qwen status|ask|local" << o.style(Reset()) << "Query remote LLM model server or local in-tree model\n"
-    << "  " << o.style(Cyan()) << W{32} << "lm status|ask|train|tokenize" << o.style(Reset()) << "Built-in small language model: status, generation, training, tokenizer\n"
-    << "  " << o.style(Cyan()) << W{32} << "voice say|listen|status" << o.style(Reset()) << "Text-to-speech (TTS) synthesis and speech recognition (STT)\n"
-    << "  " << o.style(Cyan()) << W{32} << "node serve|connect|memory|list" << o.style(Reset()) << "Connect and manage remote peer kernels across network fabric\n"
-    << "  " << o.style(Cyan()) << W{32} << "checkpoint <e> | restore <path>" << o.style(Reset()) << "Create or restore entity state snapshots\n\n";
-
-  o << o.style(Bold()) << "APPLICATIONS & SHELL" << o.style(Reset()) << "\n"
-    << "  " << o.style(Cyan()) << W{32} << "display show|set|status|list" << o.style(Reset()) << "Display manager: inspect framebuffer, resolution, and active views\n"
-    << "  " << o.style(Cyan()) << W{32} << "scene" << o.style(Reset()) << "Inspect and manage desktop scene graph and layout\n"
-    << "  " << o.style(Cyan()) << W{32} << "keys list|bind|unbind|reset" << o.style(Reset()) << "Manage input key bindings and shortcuts\n"
-    << "  " << o.style(Cyan()) << W{32} << "app list|install|open|stop" << o.style(Reset()) << "Manage and launch installed applications\n"
-    << "  " << o.style(Cyan()) << W{32} << "js <program>|features" << o.style(Reset()) << "Execute JavaScript code using built-in ECMAScript engine\n"
-    << "  " << o.style(Cyan()) << W{32} << "face reference|look|text|source" << o.style(Reset()) << "Face UI language: view language reference, render UI, or inspect source\n"
-    << "  " << o.style(Cyan()) << W{32} << "mail sync|list|search|read|send" << o.style(Reset()) << "Mail client: synchronize accounts, search, read, and compose email\n"
-    << "  " << o.style(Cyan()) << W{32} << "google auth|status|sync|watch|logout" << o.style(Reset()) << "Sign in to a Google account (OAuth 2.0) and keep its mail, calendar, contacts and notes in sync\n"
-    << "  " << o.style(Cyan()) << W{32} << "contacts list|search|add|show" << o.style(Reset()) << "Address book and contact management\n"
-    << "  " << o.style(Cyan()) << W{32} << "calendar agenda|add|show|list" << o.style(Reset()) << "Calendar and agenda event management\n"
-    << "  " << o.style(Cyan()) << W{32} << "task create|list|show|update" << o.style(Reset()) << "Task ledger and todo tracking\n"
-    << "  " << o.style(Cyan()) << W{32} << "chain | btc peers|headers|rpc" << o.style(Reset()) << "Bitcoin client: manage P2P peers, query headers, and execute JSON-RPC\n"
-    << "  " << o.style(Cyan()) << W{32} << "wallet info|send|history|import" << o.style(Reset()) << "Crypto wallet: view balances, sign transactions, import private keys\n"
-    << "  " << o.style(Cyan()) << W{32} << "contract create|solve|watch" << o.style(Reset()) << "Manage and solve Hash Time-Locked Contracts (HTLC)\n"
-    << "  " << o.style(Cyan()) << W{32} << "tx plan|stage|commit|abort|show" << o.style(Reset()) << "Atomic multi-file patch transactions (plan, stage, commit, abort)\n"
-    << "  " << o.style(Cyan()) << W{32} << "gui [desktop [--tui]]" << o.style(Reset()) << "AIOS desktop environment: start GUI/TUI interface or show options\n"
-    << "  " << o.style(Cyan()) << W{32} << "browser <url>|follow <n>|back" << o.style(Reset()) << "Built-in web browser: fetch, render, and navigate web pages\n"
-    << "  " << o.style(Cyan()) << W{32} << "daemon list|start|status" << o.style(Reset()) << "Manage background userland services and daemons\n"
-    << "  " << o.style(Cyan()) << W{32} << "build [test|gate|<args...>]" << o.style(Reset()) << "Compile system targets, execute test suites, or run audit gates\n"
-    << "  " << o.style(Cyan()) << W{32} << "git init|add|commit|log|status" << o.style(Reset()) << "Native Git client: repository initialization, commits, and logs\n"
-    << "  " << o.style(Cyan()) << W{32} << "git branch|switch <rev>" << o.style(Reset()) << "Manage, list, and switch repository branches\n"
-    << "  " << o.style(Cyan()) << W{32} << "git repos|use|fsck [as=$entity]" << o.style(Reset()) << "Manage registered Git repositories and check repository integrity\n"
-    << "  " << o.style(Cyan()) << W{32} << "git clone|fetch|pull|push" << o.style(Reset()) << "Synchronize Git repositories over SSH and Git protocols\n"
-    << "  " << o.style(Cyan()) << W{32} << "ssh <user@host> <cmd> | keygen" << o.style(Reset()) << "Native SSH-2 client and keypair generation utility\n"
-    << "  " << o.style(Cyan()) << W{32} << "npm install|view <package>" << o.style(Reset()) << "Install and inspect npm packages directly from npm registry\n"
-    << "  " << o.style(Cyan()) << W{32} << "pip install|view <package>" << o.style(Reset()) << "Install and inspect Python packages from PyPI with SHA-256 verification\n"
-    << "  " << o.style(Cyan()) << W{32} << "cargo vendor|view <crate>" << o.style(Reset()) << "Vendor and inspect Rust crates from crates.io with checksum checks\n"
-    << "  " << o.style(Cyan()) << W{32} << "go get|list|mod verify <module>" << o.style(Reset()) << "Download, list, and verify Go modules against checksum database\n"
-    << "  " << o.style(Cyan()) << W{32} << "elf <path>" << o.style(Reset()) << "Inspect ELF binary headers, sections, and program segments\n"
-    << "  " << o.style(Cyan()) << W{32} << "sense <url>" << o.style(Reset()) << "Fetch web page via TLS and extract content into semantic store\n"
-    << "  " << o.style(Cyan()) << W{32} << "dream <what you want>" << o.style(Reset()) << "Synthesize and render an application or UI from natural language prompt\n"
-    << "  " << o.style(Cyan()) << W{32} << "dream list|show|open|remove" << o.style(Reset()) << "Manage synthesized applications: list, inspect, open, or delete\n"
-    << "  " << o.style(Cyan()) << W{32} << "organ grow|call|list|source" << o.style(Reset()) << "Dynamically synthesize, compile, load, and execute C++ extensions\n"
-    << "  " << o.style(Cyan()) << W{32} << "grain run|eval|dis|repl" << o.style(Reset()) << "Grain language runtime: evaluate code, disassemble bytecode, or start REPL\n"
-    << "  " << o.style(Cyan()) << W{32} << "horizon scan|show|distil|brief" << o.style(Reset()) << "Scan external news and feeds, distilling briefings relevant to current tasks\n"
-    << "  " << o.style(Cyan()) << W{32} << "directive add|list|remove" << o.style(Reset()) << "Manage background directives executed during idle cycles\n"
-    << "  " << o.style(Cyan()) << W{32} << "edit <file> <old> <new>" << o.style(Reset()) << "Find and replace text within a file in place\n"
-    << "  " << o.style(Cyan()) << W{32} << "host <command...>" << o.style(Reset()) << "Execute command on the underlying host operating system\n"
-    << "  " << o.style(Cyan()) << W{32} << "install dualboot|disk|status" << o.style(Reset()) << "Bare-metal installer: manage disk partitioning and dual-boot setup\n"
-    << "  " << o.style(Cyan()) << W{32} << "set NAME" << o.style(Reset()) << "Bind last produced command output to session variable $NAME\n"
-    << "  " << o.style(Cyan()) << W{32} << "echo <text>" << o.style(Reset()) << "Print text to standard output\n"
-    << "  " << o.style(Cyan()) << W{32} << "expect <text>" << o.style(Reset()) << "Assertion test: fail unless previous output contains specified text\n"
-    << "  " << o.style(Cyan()) << W{32} << "rewind <path>" << o.style(Reset()) << "Restore a running entity to a saved checkpoint image\n"
-    << "  " << o.style(Cyan()) << W{32} << "help" << o.style(Reset()) << "Display this command reference list\n"
-    << "  " << o.style(Cyan()) << W{32} << "pwd · cd · ls · cat · grep..." << o.style(Reset()) << "POSIX compatibility shell builtins (`man` for full list)\n";
-}
-
 void cmd_miner(Ctx& c, const Args& a) {
   c.view();
   userland::BitcoinMiner miner(c.k);
@@ -10915,35 +10807,15 @@ Result<void> run_line(Session& s, const std::string& raw) {
     if (cmd == "help") {
       if (a.size() > 1) {
         const std::string& target = a[1];
-        if (target == "git") { cmd_git(c, {"git", "help"}); }
-        else if (target == "ssh") { cmd_ssh(c, {"ssh", "help"}); }
-        else if (target == "tx") { cmd_tx(c, {"tx", "help"}); }
-        else if (target == "webserver" || target == "web") {
+        if (target == "webserver" || target == "web") {
           c.o << c.o.style(Header()) << "AIOS Web Server (aios webserver)" << c.o.style(Reset()) << "\n\n"
               << "Usage:\n"
               << "  aios webserver <config-file>    Start vhost HTTP(S) server with FastCGI PHP-FPM\n"
               << "  aios webserver --help           Show vhost configuration format and examples\n";
+        } else if (const CommandDoc* d = find_command_doc(target)) {
+          print_command_help(c.o, *d);
         } else {
-          std::string help_text;
-          { Out h([&](const std::string& t) { help_text += t; }); print_help(h); }
-          bool found = false;
-          for (auto& help_line : split(help_text, '\n')) {
-            std::string clean;
-            for (size_t i = 0; i < help_line.size(); ++i) {
-              if (help_line[i] == '\033') { while (i < help_line.size() && help_line[i] != 'm') ++i; continue; }
-              clean.push_back(help_line[i]);
-            }
-            std::string t = clean;
-            t.erase(0, t.find_first_not_of(" \t"));
-            std::string cmd_name = t.substr(0, t.find_first_of(" \t|"));
-            if (cmd_name == target || t.find(target) != std::string::npos) {
-              c.o << line << "\n";
-              found = true;
-            }
-          }
-          if (!found) {
-            c.o << "No specific help for '" << target << "'. Type `help` to list all commands.\n";
-          }
+          fail(Status::NotFound, "no help for '" + target + "'; `help` lists the commands");
         }
       } else {
         print_help(c.o);

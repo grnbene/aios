@@ -29,7 +29,7 @@ objs=()
 # bare-metal link fails on a function that plainly exists in the tree. dream,
 # organ and face were added over 2026-09-09..10 and this list was not, so the
 # metal target had been unbuildable for two days while the hosted one was fine.
-CLI="$here/cli/commands.cpp $here/cli/embed.cpp $here/cli/out.cpp $here/cli/shell.cpp $here/cli/console.cpp $here/cli/ask.cpp $here/cli/dream.cpp $here/cli/organ.cpp $here/cli/face.cpp $here/cli/grain_cmd.cpp $here/cli/sat_cmd.cpp $here/cli/grain_net.cpp $here/cli/grain_host.cpp $here/cli/model_controller.cpp"
+CLI="$here/cli/commands.cpp $here/cli/command_docs.cpp $here/cli/embed.cpp $here/cli/out.cpp $here/cli/shell.cpp $here/cli/console.cpp $here/cli/ask.cpp $here/cli/dream.cpp $here/cli/organ.cpp $here/cli/face.cpp $here/cli/grain_cmd.cpp $here/cli/sat_cmd.cpp $here/cli/grain_net.cpp $here/cli/grain_host.cpp $here/cli/model_controller.cpp"
 # head closes the pipe as soon as it has its line, which makes xargs die of
 # SIGPIPE — and under `set -o pipefail` that killed the whole build before it
 # printed anything, intermittently, depending on how fast xargs got there. It is
