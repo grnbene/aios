@@ -47,6 +47,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/grain_webui.cpp
   ${AIOS_ROOT}/src/userland/grain_app.cpp
   ${AIOS_ROOT}/src/userland/grain_app_cli.cpp
+  ${AIOS_ROOT}/src/userland/runtime_registry.cpp
   ${AIOS_ROOT}/src/net/http_stream.cpp
   ${AIOS_ROOT}/src/userland/grain_std_regex.cpp
   ${AIOS_ROOT}/src/userland/grain_std_time.cpp

@@ -834,6 +834,149 @@ Value bi_add_keys(Vm&, std::vector<Value>& args, std::string& error) {
   return args[0];
 }
 
+// add_into(total, record, [fields]): adds record's numbers into total's, field by field, into nested maps too (a
+// field total lacks starts at record's value; a nested map it lacks starts empty). Text, lists and nil are left
+// alone. fields, when given, names the top-level fields to add. Returns total.
+static bool add_into_map(MapObj* total, MapObj* rec, const std::vector<std::string>* only, int depth, const std::string& at,
+                         std::string& error) {
+  if (depth > 64) { error = "add_into(): nested more than 64 deep"; return false; }
+  auto one = [&](const std::string& k, const Value& rv) -> bool {
+    if (rv.type == Type::Nil) return true;
+    Value* tv = total->find(k);
+    const std::string where = at.empty() ? k : at + "." + k;
+    const bool rnum = rv.is_number() || rv.type == Type::Decimal;
+    if (rnum) {
+      if (!tv || tv->type == Type::Nil) { total->put(k, rv); return true; }
+      if (!(tv->is_number() || tv->type == Type::Decimal)) {
+        error = "add_into(): the total's " + where + " is a " + type_name(tv->type) + ", not a number";
+        return false;
+      }
+      Value sum;
+      if (tv->type == Type::Decimal || rv.type == Type::Decimal) {
+        if (!decimal_arith('+', *tv, rv, sum, error)) { error = "add_into(): " + where + ": " + error; return false; }
+      } else if (tv->type == Type::Int && rv.type == Type::Int) {
+        int64_t r = 0;
+        sum = __builtin_add_overflow(tv->i, rv.i, &r) ? Value::real((double)tv->i + (double)rv.i) : Value::integer(r);
+      } else {
+        sum = Value::real(tv->as_double() + rv.as_double());
+      }
+      *tv = sum;
+      return true;
+    }
+    if (rv.type == Type::Map) {
+      if (!tv || tv->type == Type::Nil) {
+        total->put(k, Value::object(Type::Map, std::make_shared<MapObj>()));
+        tv = total->find(k);
+      }
+      if (tv->type != Type::Map) { error = "add_into(): the total's " + where + " is a " + type_name(tv->type) + ", not a map"; return false; }
+      return add_into_map(static_cast<MapObj*>(tv->obj.get()), static_cast<MapObj*>(rv.obj.get()), nullptr, depth + 1, where, error);
+    }
+    return true;   // text, a list, a flag: not something to add
+  };
+  if (only) {
+    for (const auto& k : *only)
+      if (Value* rv = rec->find(k)) { if (!one(k, *rv)) return false; }
+    return true;
+  }
+  const auto entries = rec->entries;   // a copy: total and record may be the same map
+  for (const auto& [k, rv] : entries)
+    if (!one(k, rv)) return false;
+  return true;
+}
+
+Value bi_add_into(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Map || args[1].type != Type::Map) {
+    error = std::string("add_into() wants two maps, got a ") + type_name(args[0].type) + " and a " + type_name(args[1].type);
+    return Value::nil();
+  }
+  std::vector<std::string> fields;
+  const bool some = args.size() > 2 && args[2].type != Type::Nil;
+  if (some) {
+    if (args[2].type != Type::List) { error = "add_into(): fields is a list of names"; return Value::nil(); }
+    for (const Value& f : args[2].list_items()) fields.push_back(f.type == Type::Str ? f.str() : f.to_text());
+  }
+  if (!add_into_map(static_cast<MapObj*>(args[0].obj.get()), static_cast<MapObj*>(args[1].obj.get()), some ? &fields : nullptr, 0, "", error))
+    return Value::nil();
+  return args[0];
+}
+
+// thing_rows(db, name, [keys]): SHOW THING name [KEYS (...)] over a db_connect connection, its rows as maps with the
+// columns that hold JSON (a grain Thing's lists and maps) read back as values. An error is raised, not returned.
+Value bi_thing_rows(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[1], error, "thing_rows")) return Value::nil();
+  const std::string& name = args[1].str();
+  if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) { return std::isalnum((unsigned char)c) || c == '_'; })) {
+    error = "thing_rows(): \"" + name + "\" is not a Thing's name";
+    return Value::nil();
+  }
+  std::string sql = "SHOW THING " + name;
+  if (args.size() > 2 && args[2].type != Type::Nil) {
+    if (args[2].type != Type::List) { error = "thing_rows(): keys is a list"; return Value::nil(); }
+    const auto& keys = args[2].list_items();
+    if (keys.empty()) return Value::list({});
+    sql += " KEYS (";
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const Value& k = keys[i];
+      if (i) sql += ", ";
+      if (k.is_number()) { sql += k.to_text(); continue; }
+      if (k.type != Type::Str) { error = std::string("thing_rows(): a key is text or a number, not a ") + type_name(k.type); return Value::nil(); }
+      sql += "'";
+      for (char c : k.str()) {
+        if (c == '\'') sql += "''";
+        else if (c == '\\') sql += "\\\\";
+        else if (c == '\0') sql += "\\0";
+        else sql += c;
+      }
+      sql += "'";
+    }
+    sql += ")";
+  }
+  Value* q = vm.find_global("db_query");
+  if (!q) { error = "thing_rows(): this program has no db_query"; return Value::nil(); }
+  Value r = vm.call(*q, {args[0], Value::string(sql)}, error);
+  if (!error.empty()) return Value::nil();
+  if (r.type != Type::Map) { error = "thing_rows(): db_query gave no result"; return Value::nil(); }
+  MapObj* rm = static_cast<MapObj*>(r.obj.get());
+  Value* ok = rm->find("ok");
+  if (!ok || !ok->truthy()) {
+    Value* e = rm->find("error");
+    error = "thing_rows(" + name + "): " + (e ? e->to_text() : std::string("the query failed"));
+    return Value::nil();
+  }
+  // grain's db_query gives records (maps); aios's gives columns and rows (lists): the same rows either way
+  std::vector<std::vector<std::pair<std::string, Value>>> rows;
+  if (Value* recs = rm->find("records"); recs && recs->type == Type::List) {
+    for (const Value& row : recs->list_items())
+      if (row.type == Type::Map) rows.push_back(static_cast<MapObj*>(row.obj.get())->entries);
+  } else if (Value* cols = rm->find("columns"), *rs = rm->find("rows"); cols && rs && cols->type == Type::List && rs->type == Type::List) {
+    const auto& names = cols->list_items();
+    for (const Value& row : rs->list_items()) {
+      if (row.type != Type::List) continue;
+      std::vector<std::pair<std::string, Value>> fields;
+      const auto& vals = row.list_items();
+      for (size_t i = 0; i < names.size() && i < vals.size(); ++i) fields.push_back({names[i].to_text(), vals[i]});
+      rows.push_back(std::move(fields));
+    }
+  }
+  std::vector<Value> out;
+  {
+    for (const auto& row : rows) {
+      auto copy = std::make_shared<MapObj>();
+      for (const auto& [k, v] : row) {
+        if (v.type == Type::Str && !v.str().empty() && (v.str()[0] == '{' || v.str()[0] == '[')) {
+          std::string jerr;
+          Value parsed = grain_json_parse(v.str(), jerr);
+          copy->put(k, jerr.empty() ? parsed : v);
+        } else {
+          copy->put(k, v);
+        }
+      }
+      out.push_back(Value::object(Type::Map, copy));
+    }
+  }
+  return Value::list(std::move(out));
+}
+
 Value bi_ltrim(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "ltrim")) return Value::nil();
   const std::string& s = args[0].str();
@@ -7047,6 +7190,8 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("chr", 1, 1, bi_chr);
   vm.define_native("trim", 1, 2, bi_trim);
   vm.define_native("is_blank", 1, 1, bi_is_blank);
+  vm.define_native("add_into", 2, 3, bi_add_into);
+  vm.define_native("thing_rows", 2, 3, bi_thing_rows);
   vm.define_native("first_present", 1, -1, bi_first_present);
   vm.define_native("get_or_put", 3, 3, bi_get_or_put);
   vm.define_native("add_keys", 2, 3, bi_add_keys);

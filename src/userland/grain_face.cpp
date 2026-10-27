@@ -459,6 +459,11 @@ class FacePane final : public PaneDriver {
   void set_machine(const std::string& m) { machine_ = m; }
   const Value& watch() const { return watch_; }
   void set_watch(const Value& w) { watch_ = w; }
+  // "watch": {"thing", "db", "timeout"}: the arguments watch_thing_native is called with
+  const std::string& watch_thing() const { return watch_thing_; }
+  const Value& watch_db() const { return watch_db_; }
+  int64_t watch_timeout() const { return watch_timeout_; }
+  void set_watch_thing(const std::string& t, const Value& db, int64_t timeout) { watch_thing_ = t; watch_db_ = db; watch_timeout_ = timeout; }
   void set_workers(bool v) { workers_ = v; }
 
   bool render_html(Vm& vm, std::string& html, std::string& error) {
@@ -1218,6 +1223,9 @@ class FacePane final : public PaneDriver {
   bool api_only_ = false;  // no page: only its routes answer (serve_routes)
   std::string machine_;    // the fleet member whose copy of the program runs this pane (its page, actions and routes)
   Value watch_;            // fn(since): returns when the pane's data may have changed (WebUi's watcher calls it)
+  std::string watch_thing_;
+  Value watch_db_;
+  int64_t watch_timeout_ = 10;
   bool workers_ = false;   // routes run in worker VMs, not one at a time in this one
 
  private:
@@ -1370,6 +1378,45 @@ class FacePane final : public PaneDriver {
   std::string pending_;
 };
 
+// The watch a pane's {"thing": name, "db": settings} makes: connect (db_connect(settings)), WAIT THING name SINCE
+// <since> TIMEOUT <timeout>, close, and give the Thing's clock (since, unchanged, when the wait timed out).
+Value watch_thing_native(Vm& v, std::vector<Value>& a, std::string& e) {
+  const std::string thing = a[1].type == Type::Str ? a[1].str() : std::string();
+  Value* connect = v.find_global("db_connect");
+  Value* query = v.find_global("db_query");
+  Value* close = v.find_global("db_close");
+  if (!connect || !query) { e = "watch " + thing + ": this program has no db_connect"; return Value::nil(); }
+  Value c = v.call(*connect, {a[2]}, e);
+  if (!e.empty()) { e = "watch " + thing + ": " + e; return Value::nil(); }
+  auto cm = as_map(c);
+  Value* ok = cm ? cm->find("ok") : nullptr;
+  if (!ok || !ok->truthy()) { Value* er = cm ? cm->find("error") : nullptr; e = "watch " + thing + ": " + (er ? er->to_text() : std::string("cannot connect")); return Value::nil(); }
+  std::string since = a[0].type == Type::Nil ? "0" : a[0].to_text();
+  if (since.empty() || !std::all_of(since.begin(), since.end(), [](char ch) { return ch >= '0' && ch <= '9'; })) since = "0";
+  Value r = v.call(*query, {c, Value::string("WAIT THING " + thing + " SINCE " + since + " TIMEOUT " + std::to_string(a[3].as_int()))}, e);
+  if (close) { std::string ce; v.call(*close, {c}, ce); }
+  if (!e.empty()) { e = "watch " + thing + ": " + e; return Value::nil(); }
+  auto rm = as_map(r);
+  Value* rok = rm ? rm->find("ok") : nullptr;
+  if (!rok || !rok->truthy()) { Value* er = rm ? rm->find("error") : nullptr; e = "watch " + thing + ": " + (er ? er->to_text() : std::string("WAIT failed")); return Value::nil(); }
+  // grain's db_query gives records (maps); aios's gives columns and rows (lists)
+  if (Value* recs = rm->find("records"); recs && recs->type == Type::List && !recs->list_items().empty()) {
+    auto row = as_map(recs->list_items()[0]);
+    Value* clock = row ? row->find("clock") : nullptr;
+    return clock ? Value::string(clock->to_text()) : a[0];
+  }
+  Value* cols = rm->find("columns");
+  Value* rows = rm->find("rows");
+  if (cols && rows && cols->type == Type::List && rows->type == Type::List && !rows->list_items().empty() &&
+      rows->list_items()[0].type == Type::List) {
+    const auto& names = cols->list_items();
+    const auto& first = rows->list_items()[0].list_items();
+    for (size_t i = 0; i < names.size() && i < first.size(); ++i)
+      if (names[i].to_text() == "clock") return Value::string(first[i].to_text());
+  }
+  return a[0];
+}
+
 // pane(options): title, width, height, view (a function returning the widgets).
 Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   auto o = as_map(args[0]);
@@ -1416,8 +1463,27 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   // the value differs from the last, every viewer's view is looked at again and pushed if it changed. It should
   // wait for the change itself (WAIT THING ... TIMEOUT s) rather than return at once; it is called at most 4 times
   // a second.
-  if (Value* wt = o->find("watch"); wt && wt->type != Type::Nil) {
-    if (!is_callable(*wt)) { error = std::string("ui.pane()'s \"watch\" is a function, got a ") + type_name(wt->type); return Value::nil(); }
+  // {"thing": name, "db": cfg, "timeout": s} is that function for a Thing: connect (db_connect(cfg)), WAIT THING
+  // name SINCE <since> TIMEOUT s (10), close, and return the Thing's clock.
+  if (Value* wv = o->find("watch"); wv && wv->type != Type::Nil) {
+    Value watch_fn = *wv;
+    Value* wt = &watch_fn;
+    if (wt->type == Type::Map) {
+      auto wm = as_map(*wt);
+      Value* th = wm->find("thing");
+      Value* db = wm->find("db");
+      Value* to = wm->find("timeout");
+      if (!th || th->type != Type::Str || th->str().empty() ||
+          !std::all_of(th->str().begin(), th->str().end(), [](char c) { return std::isalnum((unsigned char)c) || c == '_'; })) {
+        error = "ui.pane()'s \"watch\": {\"thing\": <a Thing's name>, \"db\": <db_connect settings>}";
+        return Value::nil();
+      }
+      if (!db || db->type != Type::Map) { error = "ui.pane()'s \"watch\" needs \"db\": the map db_connect takes"; return Value::nil(); }
+      const int64_t timeout = to && to->is_number() ? std::max<int64_t>(1, std::min<int64_t>(60, to->as_int())) : 10;
+      pane->set_watch_thing(th->str(), *db, timeout);
+      *wt = Value::object(Type::Native, std::make_shared<NativeObj>("watch_thing", 4, 4, watch_thing_native));
+    }
+    if (!is_callable(*wt)) { error = std::string("ui.pane()'s \"watch\" is a function or {\"thing\", \"db\"}, got a ") + type_name(wt->type); return Value::nil(); }
     pane->set_watch(*wt);
   }
   if (Value* wk = o->find("workers")) pane->set_workers(wk->truthy());   // each route request in a VM of its own, on its own thread: a slow one does not hold up the rest
@@ -1605,7 +1671,9 @@ std::string web_pane_machine(Vm& vm, uint64_t id) {
 std::unique_ptr<WorkerCall> web_pane_watch_prepare(Vm& vm, uint64_t id, const Value& since, std::string& error) {
   FacePane* f = web_face(vm, id);
   if (!f || f->watch().type == Type::Nil) return nullptr;
-  auto call = prepare_worker_call(vm, f->watch(), {since}, error);
+  std::vector<Value> args{since};
+  if (!f->watch_thing().empty()) args = {since, Value::string(f->watch_thing()), f->watch_db(), Value::integer(f->watch_timeout())};
+  auto call = prepare_worker_call(vm, f->watch(), std::move(args), error);
   if (!call && error.empty()) error = "watch(): could not be copied to a worker";
   return call;
 }

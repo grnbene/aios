@@ -21,6 +21,33 @@ grain host
 
 It runs in the foreground, stores everything under `~/.grain` (override with `$GRAIN_HOME` or `--home`), and listens on `127.0.0.1:7480`.
 
+When `~/.grain` has no host and `$GRAIN_HOME` is not set, `grain app` uses the home of an app host that is running
+on this machine (an `aios serve` keeps its apps in `<root>/apps`), as `grain ps` lists it.
+
+### What is running here: `grain ps`
+
+```text
+$ grain ps
+PID      KIND         UP    PORTS                         WHAT
+732593   app host     3h    7480 control                  aios serve  [/home/arch/.aios-apps-root/apps]
+    app   warehouse_touches     running   c4f89119  :8573   30 req, 0 failed
+3285292  asql         3d    3307 mysql, 7311 rpc          compute serve sql=1  [/opt/aios/root-v8]
+    thing touch_day             active    1105 rows   version 10689
+1976601  grain serve  4d    18200 web                     grain/examples/ops_board.gr
+
+not registered (an older binary, or started some other way):
+4052     ?            5d    -                             /opt/aos/bin/aios --root /opt/aos/fleet-root exec fleet join ...
+```
+
+Every grain runtime writes a record of itself - `grain run` / `grain serve` (and the ports its program `listen()`s
+on), an app host (`grain host`, `aios serve`: its apps, their state, port and requests), an ASQL engine
+(`aios exec "compute serve sql=1"`: its ports and its Things), `aios exec "grain ..."` - to a directory private to its
+user (`$XDG_RUNTIME_DIR/grain`, or `/tmp/grain-<uid>`, mode 0700, records 0600). An app host and an engine refresh
+theirs every few seconds. A record goes at a normal exit; one whose process is gone (killed, or its pid reused) is
+skipped and cleared by the next `grain ps`. On Linux, `grain ps` also lists this user's `grain` / `aios` processes
+that wrote no record, with the ports they listen on. `grain ps --json` gives both lists as JSON; in aios,
+`aios exec "grain ps"`. Driven by `scripts/grain-ps-check.sh <grain> <aios>`.
+
 In another terminal, check and deploy the hello-world example:
 
 ```bash

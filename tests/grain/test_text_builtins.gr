@@ -103,4 +103,31 @@ if getenv("GRAIN_TEST_SECRET_FILE") != nil {
   delete_file(getenv("GRAIN_TEST_SECRET_FILE"))
 }
 
+# ---- add_into, day_add, tolerant date_parse, date_format of a string, db_connect(map) ---------------------
+let total = {"n": 1, "q": 0.5, "name": "all", "by": {"a": {"n": 1}}}
+add_into(total, {"n": 2, "q": 1, "name": "ann", "tags": ["x"], "by": {"a": {"n": 3}, "b": {"n": 4}}, "skip": nil})
+check(total.n == 3 and total.q == 1.5 and total.name == "all" and total.by.a.n == 4 and total.by.b.n == 4 and not has(total, "tags"),
+      "add_into: numbers added, nested maps too, text and lists left alone")
+add_into(total, {"n": 10, "q": 10}, ["q"])
+check(total.n == 3 and total.q == 11.5, "add_into with fields adds only those")
+check(add_into({"d": decimal("0.10")}, {"d": decimal("0.20")}).d == decimal("0.30"), "add_into adds decimals exactly")
+check(not pcall(add_into, {"n": "x"}, {"n": 1}).ok, "a total that is not a number is an error")
+fn sum_all(rs) { let t = {} for r in rs { add_into(t, r) } return t }
+check(sum_all([{"a": 1}, {"a": 2, "b": {"c": 1}}, {"b": {"c": 2}}]) == {"a": 3, "b": {"c": 3}}, "add_into in a function, from empty")
+check(day_add("2026-10-27", -29) == "2026-09-28" and day_add("2024-02-28", 1) == "2024-02-29" and day_add("2026-12-31", 1) == "2027-01-01",
+      "day_add over months, a leap day and a year end")
+check(not pcall(day_add, "2026-10-27 08:00", 1).ok and not pcall(day_add, "2026-10-27", 1.5).ok, "day_add wants a day and whole days")
+check(date_parse("0000-00-00 00:00:00", {"or": nil}) == nil and date_parse("", {"or": 0}) == 0 and date_parse(nil, {"or": "none"}) == "none",
+      "date_parse with or: a zero date, empty text and nil give it")
+check(date_parse("2026-10-27 08:20:00", {"or": nil}) == date_parse("2026-10-27 08:20:00"), "date_parse with or: a date is a date")
+check(not pcall(date_parse, "0000-00-00").ok, "without or it is still an error")
+check(not pcall(date_parse, "2026-10-27", {"zone": "mars", "or": nil}).ok, "a bad zone stays an error")
+check(date_format("2026-10-27 08:20:11", "%b %-d %-I:%M%P") == "Oct 27 8:20am", "date_format of a string: its wall time as written")
+check(date_format("2026-10-07", "%b %-d, %Y") == "Oct 7, 2026", "a day")
+check(not pcall(date_format, "0000-00-00 00:00:00", "%Y").ok, "a string that is not a date is an error")
+let bad_cfg = pcall(db_connect, {"port": 3306})
+check(not bad_cfg.ok and contains(bad_cfg.error, "host"), "db_connect(map) wants a host")
+let refused = db_connect({"host": "127.0.0.1", "port": 1, "user": "u", "password": "p"})
+check(type(refused) == "map" and not refused.ok, "db_connect(map) connects with the map's settings (a closed port: not ok)")
+
 print("text builtins: ok")
