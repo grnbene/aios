@@ -25,18 +25,33 @@ inline std::shared_ptr<MapObj> as_map(const Value& v) {
 }
 
 // Escapes special characters for PDF text string literals
+// Text for a PDF string in the standard fonts' WinAnsiEncoding: UTF-8 decoded, Latin-1 and the Windows-1252 extras
+// (dashes, quotes, bullet, euro, ellipsis) as their single bytes, written as octal escapes; anything else '?'. A
+// non-breaking space used to come out as '?' - every byte past ASCII did.
 std::string pdf_escape_text(const std::string& t) {
   std::string o;
-  for (size_t i = 0; i < t.size(); ++i) {
+  auto byte = [&o](unsigned v) {
+    char b[8];
+    std::snprintf(b, sizeof b, "\\%03o", v & 0xFF);
+    o += b;
+  };
+  for (size_t i = 0; i < t.size();) {
     unsigned char c = (unsigned char)t[i];
-    if (c == '(' || c == ')' || c == '\\') {
-      o += '\\';
-      o += (char)c;
-    } else if (c >= 0x20 && c < 0x7F) {
-      o += (char)c;
-    } else if (c >= 0x80) {
-      if ((c & 0xC0) == 0x80) continue;  // continuation bytes of multi-byte UTF-8
-      o += '?';
+    uint32_t cp = c;
+    size_t n = 1;
+    if (c >= 0xF0 && i + 3 < t.size()) { cp = ((c & 0x07u) << 18) | ((t[i + 1] & 0x3Fu) << 12) | ((t[i + 2] & 0x3Fu) << 6) | (t[i + 3] & 0x3Fu); n = 4; }
+    else if (c >= 0xE0 && i + 2 < t.size()) { cp = ((c & 0x0Fu) << 12) | ((t[i + 1] & 0x3Fu) << 6) | (t[i + 2] & 0x3Fu); n = 3; }
+    else if (c >= 0xC0 && i + 1 < t.size()) { cp = ((c & 0x1Fu) << 6) | (t[i + 1] & 0x3Fu); n = 2; }
+    i += n;
+    if (cp == '(' || cp == ')' || cp == '\\') { o += '\\'; o += (char)cp; continue; }
+    if (cp >= 0x20 && cp < 0x7F) { o += (char)cp; continue; }
+    if (cp >= 0xA0 && cp <= 0xFF) { byte(cp); continue; }
+    switch (cp) {
+      case 0x20AC: byte(0x80); break; case 0x2026: byte(0x85); break; case 0x2018: byte(0x91); break;
+      case 0x2019: byte(0x92); break; case 0x201C: byte(0x93); break; case 0x201D: byte(0x94); break;
+      case 0x2022: byte(0x95); break; case 0x2013: byte(0x96); break; case 0x2014: byte(0x97); break;
+      case 0x2122: byte(0x99); break;
+      default: if (cp >= 0x80) o += '?'; break;
     }
   }
   return o;
@@ -163,13 +178,24 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
   if (printable_w < 100) printable_w = 100;
   if (printable_h < 100) printable_h = 100;
 
+  // A fragment (a table, a few divs) is given a document around it: the layout styles from <body> down, and with no
+  // body there was nothing for a page's or the paper's colours to apply to.
+  {
+    std::string lower_html = html.substr(0, 4096);
+    for (char& ch : lower_html) ch = (char)std::tolower((unsigned char)ch);
+    if (lower_html.find("<body") == std::string::npos && lower_html.find("<html") == std::string::npos)
+      html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" + html + "</body></html>";
+  }
   auto dom = userland::web::parse_html(ByteSpan(reinterpret_cast<const uint8_t*>(html.data()), html.size()));
   if (!dom) {
     error = "pdf_render() failed to parse HTML";
     return Value::nil();
   }
 
-  userland::web::Stylesheet sheet = userland::web::collect_author_css(*dom, "", {});
+  // Paper: black text on white unless the document says otherwise. The engine's own defaults are a screen's, and a
+  // page that set no colour came out in its pale default text.
+  userland::web::Stylesheet sheet = userland::web::parse_css("html, body { color: #000000; background-color: #ffffff; }");
+  sheet.append(userland::web::collect_author_css(*dom, "", {}));
   if (!css.empty()) sheet.append(userland::web::parse_css(css));
 
   userland::web::Document doc;
@@ -186,8 +212,37 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
 
   userland::web::layout(doc, sheet, m, printable_w, printable_h);
 
-  int num_pages = (doc.content_height + printable_h - 1) / printable_h;
+  // Content wider than the page (a wide table whose columns cannot shrink further) is laid out again at the width it
+  // needs and the whole page scaled down to fit, fonts and all - what mPDF's shrink_tables_to_fit does for the PHP
+  // reports. It used to run off the right edge. Content that fits is drawn 1:1, as before.
+  auto right_edge = [&doc]() {
+    int r = 0;
+    for (const auto& f : doc.fragments)
+      if (f.w > 0 && f.x + f.w > r) r = f.x + f.w;
+    return r;
+  };
+  double scale = 1.0;
+  int layout_w = printable_w;
+  if (int r = right_edge(); r > printable_w + 1) {
+    layout_w = r;
+    for (int pass = 0; pass < 3; ++pass) {   // a wider layout can itself want a little more
+      userland::web::layout(doc, sheet, m, layout_w, (int)((double)printable_h * layout_w / printable_w));
+      const int r2 = right_edge();
+      if (r2 <= layout_w + 1) break;
+      layout_w = r2;
+    }
+    scale = (double)printable_w / layout_w;
+  }
+  // A page holds printable_h of paper: in layout units, that divided by the scale.
+  const int page_span = std::max(1, (int)((double)printable_h / scale));
+
+  int num_pages = (doc.content_height + page_span - 1) / page_span;
   if (num_pages < 1) num_pages = 1;
+  auto num = [](double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.2f", v);
+    return std::string(b);
+  };
 
   std::vector<std::string> page_streams;
   page_streams.reserve(num_pages);
@@ -195,8 +250,8 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
   using Kind = userland::web::Fragment::Kind;
 
   for (int p = 0; p < num_pages; ++p) {
-    int y_start = p * printable_h;
-    int y_end = (p + 1) * printable_h;
+    int y_start = p * page_span;
+    int y_end = (p + 1) * page_span;
 
     std::ostringstream s;
     // Base white canvas
@@ -214,12 +269,13 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
     // Fragments for page p
     for (const auto& f : doc.fragments) {
       if (f.y < y_start || f.y >= y_end) continue;
-      int local_y = margin_top + (f.y - y_start);
-      int local_x = margin_left + f.x;
+      const double local_y = margin_top + (f.y - y_start) * scale;
+      const double local_x = margin_left + f.x * scale;
 
       if (f.kind == Kind::Text && !f.text.empty()) {
-        int px = f.font.px > 0 ? (int)f.font.px : 10;
-        int baseline = page_h - (local_y + (px * 8 + 9) / 10);
+        int lpx = f.font.px > 0 ? (int)f.font.px : 10;
+        const double px = lpx * scale;
+        const double baseline = page_h - (local_y + ((lpx * 8 + 9) / 10) * scale);
         std::string font_name = "/F1";
         if (f.font.bold && f.font.italic) font_name = "/F4";
         else if (f.font.bold) font_name = "/F2";
@@ -231,11 +287,25 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
           text_col = 0xFF111111;
         }
 
-        s << "BT\n" << font_name << " " << px << " Tf\n" << pdf_rgb(text_col) << " rg\n";
-        s << "1 0 0 1 " << local_x << " " << baseline << " Tm\n(" << pdf_escape_text(f.text) << ") Tj\nET\n";
+        s << "BT\n" << font_name << " " << num(px) << " Tf\n" << pdf_rgb(text_col) << " rg\n";
+        s << "1 0 0 1 " << num(local_x) << " " << num(baseline) << " Tm\n(" << pdf_escape_text(f.text) << ") Tj\nET\n";
       } else if ((f.kind == Kind::Rect || f.kind == Kind::Rule) && (f.color >> 24) != 0 && f.w > 0 && f.h > 0) {
-        int pdf_y = page_h - local_y - f.h;
-        s << pdf_rgb(f.color) << " rg\n" << local_x << " " << pdf_y << " " << f.w << " " << f.h << " re\nf\n";
+        const double h = f.h * scale;
+        const double pdf_y = page_h - local_y - h;
+        s << pdf_rgb(f.color) << " rg\n" << num(local_x) << " " << num(pdf_y) << " " << num(f.w * scale) << " " << num(h) << " re\nf\n";
+      } else if (f.kind == Kind::Border && (f.color >> 24) != 0 && f.w > 0 && f.h > 0 && f.text.size() >= 4) {
+        // the four widths ride in the text field (top, right, bottom, left), as the screen painter reads them
+        const double bt = (unsigned char)f.text[0] * scale, br = (unsigned char)f.text[1] * scale;
+        const double bb = (unsigned char)f.text[2] * scale, bl = (unsigned char)f.text[3] * scale;
+        const double w = f.w * scale, h = f.h * scale, top = page_h - local_y;
+        s << pdf_rgb(f.color) << " rg\n";
+        auto band = [&](double bx, double by, double bw, double bh) {
+          if (bw > 0 && bh > 0) s << num(bx) << " " << num(by) << " " << num(bw) << " " << num(bh) << " re\nf\n";
+        };
+        band(local_x, top - bt, w, bt);              // top
+        band(local_x, top - h, w, bb);               // bottom
+        band(local_x, top - h, bl, h);               // left
+        band(local_x + w - br, top - h, br, h);      // right
       }
     }
 
