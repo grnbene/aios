@@ -2,6 +2,9 @@
 
 Status: proposal, 2026-10-27. Stage 1 is in: markup views (`grain/tests/web/markup_test.py`), a whole pane given to a
 fleet member (`ui.pane` `"machine"`, `scripts/pane-machine-check.sh`), and the warehouse page as a pane view.
+Stage 2 is in as `"watch": fn(since)` (`grain/tests/web/watch_test.py`): a function rather than `{"thing": name}`, so
+the host needs no database settings of its own and any source of change can drive it; the warehouse pane watches
+`touch_day` with `WAIT THING`.
 
 An app declares what it is and what it shows once; the runtime puts it in a browser, a desktop window or a PDF. Today the same report is three programs' worth of plumbing.
 

@@ -134,6 +134,16 @@ ui.pane({
   "machine": COMPUTE_ON,
   "workers": true,
   "view": fn() { return dashboard_node(report(get_db(), {"start": state.start, "stop": state.stop, "userid": nil}), state) },
+  // Live: the engine wakes this when the touch_day Thing changes (WAIT THING, on a connection of its own); every
+  // open page then looks again, and gets a frame when its own range's figures moved.
+  "watch": fn(since) {
+    let w = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
+    if not w.ok { error("touch_day watch: " + w.error) }
+    let r = db_query(w, "WAIT THING touch_day SINCE " + (since ?? "0") + " TIMEOUT 10", [])
+    db_close(w)
+    if not r.ok { error("touch_day watch: " + r.error) }
+    return str(r.records[0].clock)
+  },
   "routes": {
     "/health": handle_health,
     "/quickreport": handle_quickreport,
