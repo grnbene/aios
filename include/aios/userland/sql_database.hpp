@@ -878,6 +878,10 @@ struct ColumnStore {
   std::vector<SegCodeHdr> seg_hdr;
   std::vector<uint32_t> seg_tab;
   bool pack_segments();                 // false: the global layout is not larger
+  // A FOR integer column re-laid per segment (SegmentFOR) when that is at most 60% of it, as optimize_encoding would
+  // choose; decided and done from the codes alone. False: kept as it is.
+  bool for_to_segments();
+  size_t for_seg_tried_rows = 0;        // the row count when maintain_storage last tried for_to_segments (not saved)
   void unpack_segments();
   uint32_t seg_read_code(size_t row) const;
   void seg_decode(size_t start, size_t end, uint32_t* out) const;

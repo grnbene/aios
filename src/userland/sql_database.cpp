@@ -14632,6 +14632,62 @@ inline uint32_t seg_extract(const uint8_t* p, size_t i, unsigned w, uint32_t mas
 // code 0 like any other row, so a segment that holds one keeps 0 in its range
 // (or its table): every row decodes to exactly the code it had. Declines
 // (false, column untouched) unless the result is at least a tenth smaller.
+// A column that was FOR when it was encoded stays FOR as rows arrive (an append widens it): a column of sequential
+// ids then pays the whole column's span on every row (st's 20M stockmovestaxes.stkmoveno at 32 bits: 77 MB), where
+// each 2048-row segment's own base and width is ~11 bits. optimize_encoding picks the segments when they are at most
+// 60% of FOR; this is the same rule and the same layout, worked out from the codes - no row turned into text and
+// parsed back - so maintenance can ask it as the column grows. The values do not change, only how they are held.
+bool ColumnStore::for_to_segments() {
+  if (encoding != ColumnEncoding::FOR || seg_packed_ || bit_width_ == 0 || bit_width_ > 32 || row_count_ < 2 * kSegRows) return false;
+  const size_t nsegs = (row_count_ + kSegRows - 1) / kSegRows;
+  std::vector<unsigned> widths(nsegs, 0);
+  for (size_t sg = 0; sg < nsegs; ++sg) {
+    bool any = false;
+    uint32_t mn = 0, mx = 0;
+    const size_t end = std::min(row_count_, (sg + 1) * kSegRows);
+    for (size_t r = sg * kSegRows; r < end; ++r) {
+      if (is_null(r)) continue;
+      const uint32_t c = read_code(r);
+      if (!any) { mn = mx = c; any = true; }
+      else { mn = std::min(mn, c); mx = std::max(mx, c); }
+    }
+    widths[sg] = any ? seg_bits_for((uint64_t)mx - mn) : 0;
+  }
+  const size_t for_total = (row_count_ * bit_width_ + 7) / 8;
+  if (seg_cost(widths) * 10 > for_total * 6) return false;
+  // The codes move aside and are read from there while the segments are written in their place.
+  std::vector<uint8_t> old_packed;
+  std::vector<uint32_t> old32;
+  old_packed.swap(packed_data);
+  old32.swap(data32);
+  const uint8_t w = bit_width_;
+  const int64_t base = base_int64;
+  auto code_at = [&](size_t r) -> uint32_t {
+    if (w == 32) return r < old32.size() ? old32[r] : 0;
+    if (w == 16) return r * 2 < old_packed.size() ? reinterpret_cast<const uint16_t*>(old_packed.data())[r] : 0;
+    if (w == 8) return r < old_packed.size() ? old_packed[r] : 0;
+    const size_t bit_pos = r * w, byte_idx = bit_pos >> 3, bit_off = bit_pos & 7;
+    if (byte_idx >= old_packed.size()) return 0;
+    uint64_t word = 0;
+    std::memcpy(&word, old_packed.data() + byte_idx, std::min(sizeof(word), old_packed.size() - byte_idx));
+    return (uint32_t)((word >> bit_off) & ((1u << w) - 1u));
+  };
+  epoch = sql_next_mutation_seq();   // new layout, new codes: caches keyed on the epoch let go
+  encoding = ColumnEncoding::SegmentFOR;
+  base_int64 = 0;
+  bit_width_ = 0;
+  seg_byte_at.assign(1, 0);
+  std::vector<int64_t> vals(kSegRows);
+  for (size_t sg = 0; sg < nsegs; ++sg) {
+    const size_t start = sg * kSegRows, n = std::min(kSegRows, row_count_ - start);
+    for (size_t i = 0; i < n; ++i) vals[i] = is_null(start + i) ? 0 : base + (int64_t)code_at(start + i);
+    segfor_put(sg, vals.data(), n);
+  }
+  packed_data.shrink_to_fit();
+  ++recodes;
+  return true;
+}
+
 bool ColumnStore::pack_segments() {
   if (seg_packed_ || encoding != ColumnEncoding::DictBitPacked || row_count_ == 0) return false;
   const size_t nseg = (row_count_ + kSegCodeRows - 1) / kSegCodeRows;
@@ -22692,6 +22748,20 @@ void SqlDatabase::maintain_storage() {
     if (kernel_.host().monotonic_ns() - narrow_t0 > kNarrowBudgetNs) break;
     for (ColumnStore& cs : kv.second.col_data) {
       if (kernel_.host().monotonic_ns() - narrow_t0 > kNarrowBudgetNs) break;
+      // The same for a FOR integer column: per segment once that is at most 60% of it (sequential ids). Only in a table
+      // this checkpoint writes anyway (it changed since it was saved): an idle checkpoint writes nothing.
+      if (cs.encoding == ColumnEncoding::FOR && cs.size() >= 4096 && [&] {
+            auto sv = saved_tables_.find(kv.first);
+            return sv == saved_tables_.end() || sv->second.seq != kv.second.mutation_seq || sv->second.rows != kv.second.row_count();
+          }() &&
+          (cs.for_seg_tried_rows == 0 || cs.size() >= cs.for_seg_tried_rows + cs.for_seg_tried_rows / 4)) {
+        cs.for_seg_tried_rows = cs.size();
+        if (cs.for_to_segments()) {
+          ++segpacked;
+          kv.second.stamp_form_change();
+        }
+        continue;
+      }
       if (cs.encoding != ColumnEncoding::DictBitPacked || cs.shared_dict || cs.size() == 0) continue;
       const uint8_t need = code_bits_for(cs.dict.size() ? cs.dict.size() - 1 : 0);
       const uint8_t w = need;
