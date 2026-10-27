@@ -4,6 +4,7 @@
 // aios (grain_aios.cpp). A failed check fills `error` with what was wanted and
 // what came; the native then returns nil and the VM raises it at the call.
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,23 @@ void install_doc_builtins(Vm& vm);
 void install_kv_builtins(Vm& vm);
 // mail_send (grain_std_mail.cpp); installed by install_http_builtins.
 void install_mail_builtins(Vm& vm);
+
+// Markup nodes (el, html_raw - grain_std_text.cpp), written by html_stringify / xml_stringify and by a ui.pane view.
+// A host that puts markup on a live surface hooks into the writer:
+//   attr(node, tag, name, value, out, err): called for each attribute before the writer's own handling;
+//     0 = not mine (write it as usual), 1 = handled (anything to write already appended to `out`, with its leading
+//     space), -1 = refused (err says why). A function-valued attribute is an error unless this handles it.
+//   widget(node, out, err): a ui.* widget ({widget: ...}) found among the children; written by the host.
+struct MarkupHooks {
+  std::function<int(const Value& node, const std::string& tag, const std::string& name, const Value& value, std::string& out,
+                    std::string& err)> attr;
+  std::function<bool(const Value& node, std::string& out, std::string& err)> widget;
+};
+// An element or html_raw node (a map with a string "tag", or only "raw"), not a ui.* widget.
+bool is_markup_node(const Value& v);
+bool markup_write(const Value& node, bool html, std::string& out, std::string& err, const MarkupHooks* hooks = nullptr);
+// The text a node shows, tags dropped (a surface that cannot draw markup shows this).
+std::string markup_text(const Value& node);
 
 // The JSON json_parse / json_stringify use (grain_builtins.cpp).
 Value grain_json_parse(const std::string& text, std::string& err);

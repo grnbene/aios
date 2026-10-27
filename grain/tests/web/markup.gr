@@ -1,0 +1,26 @@
+// A ui.pane whose view is markup (el nodes) with actions on it, and a ui.* widget inside the markup.
+// Driven by markup_test.py: sort by a header click (server side), a bound field read in an action, escaping.
+let people = [{"name": "Ann <a&b>", "n": 3}, {"name": "Bob", "n": 9}, {"name": "Cy", "n": 5}]
+let desc = true
+let start = "2026-10-01"
+let clicks = 0
+
+fn header() {
+  return el("th", {"class": "sortable", "data-dir": desc ? "desc" : "asc", "on_click": fn() { desc = not desc; clicks += 1 }}, "Touches")
+}
+
+fn view() {
+  let rows = sort_by(people, fn(p) { return p.n }, desc ? "desc" : "asc")
+  return el("div", {"class": "page"},
+    el("form", {"class": "range"},
+      el("input", {"type": "date", "bind": "start", "value": start}),
+      el("button", {"type": "button", "on_click": fn(f) { start = f.start }}, "Run")),
+    el("p", {"id": "start"}, "from " + start),
+    el("table",
+      el("thead", el("tr", el("th", "Name"), header())),
+      el("tbody", map(rows, fn(p) { return el("tr", el("td", {"class": "who"}, p.name), el("td", p.n)) }))),
+    ui.text("clicks " + str(clicks), {"bold": true}))
+}
+
+ui.pane({"title": "Markup", "css": ".sortable { cursor: pointer }", "view": view})
+run_panes()

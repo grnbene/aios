@@ -571,6 +571,13 @@ class FacePane final : public PaneDriver {
   }
 
   bool json_widget(const Value& v, std::string& out, std::string& error, int depth) {
+    if (is_markup_node(v) || v.type == Type::List || v.type == Type::Str) {
+      // a native client draws widgets; markup it is given as markup, for a web surface of its own (stage 4)
+      std::string html;
+      if (!markup_html(v, html, error, depth)) return false;
+      out += "{\"widget\":\"html\",\"html\":" + jstr(html) + "}";
+      return true;
+    }
     auto m = as_map(v);
     Value* type_v = m ? m->find("widget") : nullptr;
     if (!type_v || type_v->type != Type::Str) {
@@ -722,7 +729,47 @@ class FacePane final : public PaneDriver {
     return o;
   }
 
+  // An el() / html_raw() node in a view: written as markup, its function-valued attributes made actions (on_click,
+  // and on_change on an input or select, as the page's data-act; on_enter as data-enter) and `bind: "id"` making an
+  // input a field (data-id, its value kept as a ui.field's is). ui.* widgets inside it are written as widgets.
+  bool markup_html(const Value& v, std::string& out, std::string& error, int depth) {
+    if (depth > 200) { error = "the widgets nest more than 200 deep"; return false; }
+    MarkupHooks hooks;
+    hooks.attr = [this](const Value& node, const std::string& tag, const std::string& name, const Value& val, std::string& o,
+                        std::string& err) -> int {
+      if (is_callable(val)) {
+        std::string what = markup_text(node);
+        if (what.size() > 40) what = what.substr(0, 40);
+        const std::string who = "the <" + tag + "> \"" + what + "\"'s " + name;
+        if (name == "on_click" || name == "on_change") { o += " data-act=\"" + esc(action_for(val, who)) + "\""; return 1; }
+        if (name == "on_enter") { o += " data-enter=\"" + esc(action_for(val, who)) + "\""; return 1; }
+        err = "a function here is an action: on_click, on_change or on_enter";
+        return -1;
+      }
+      auto bound = [&]() -> std::string {
+        auto nm = as_map(node);
+        Value* a = nm ? nm->find("attrs") : nullptr;
+        Value* b = a && a->type == Type::Map ? as_map(*a)->find("bind") : nullptr;
+        return b && b->type == Type::Str ? b->str() : std::string();
+      };
+      if (name == "bind") {
+        if (val.type != Type::Str || val.str().empty()) { err = "bind names a field: a string"; return -1; }
+        o += " data-id=\"" + esc(val.str()) + "\"";
+        if (web_set_fields_.count(val.str())) o += " value=\"" + esc(web_fields_[val.str()]) + "\"";
+        return 1;
+      }
+      if (name == "value") {
+        const std::string id = bound();
+        if (!id.empty() && web_set_fields_.count(id)) return 1;   // the field's own value is written with bind
+      }
+      return 0;
+    };
+    hooks.widget = [this, depth](const Value& node, std::string& o, std::string& err) { return html_widget(node, o, err, depth + 1); };
+    return markup_write(v, true, out, error, &hooks);
+  }
+
   bool html_widget(const Value& v, std::string& out, std::string& error, int depth) {
+    if (is_markup_node(v) || v.type == Type::List || v.type == Type::Str) return markup_html(v, out, error, depth);
     auto m = as_map(v);
     Value* type_v = m ? m->find("widget") : nullptr;
     if (!type_v || type_v->type != Type::Str) {
@@ -1248,6 +1295,13 @@ class FacePane final : public PaneDriver {
   }
 
   std::shared_ptr<fc::Widget> build(const Value& v, std::string& error, int depth) {
+    if (is_markup_node(v) || v.type == Type::List || v.type == Type::Str) {
+      // a face window cannot draw markup yet: it shows the text (a web surface in the window is stage 4)
+      auto w = std::make_shared<fc::Widget>();
+      w->type = "text";
+      w->label = markup_text(v);
+      return w;
+    }
     auto m = as_map(v);
     Value* type_v = m ? m->find("widget") : nullptr;
     if (!type_v || type_v->type != Type::Str) {
