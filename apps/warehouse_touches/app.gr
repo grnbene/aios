@@ -18,5 +18,6 @@ let app = {
   "secrets": ["DB_PASSWORD"],
   "requires": ["db"],
   "health": {"path": "/health", "ok": [200]},
+  "deployed": "deployed.gr",
   "max_steps": 0
 }

@@ -1,27 +1,100 @@
-# Warehouse Touches (Grain Native Reporting)
+# Warehouse Touches Service
 
-A high-performance warehouse touches reporting service written natively in Grain for AIOS.
-Replaces the legacy PHP/mPDF touches reporting quartet (`quickreportview`, `quickreportpdf`, `quickreportxlsx`, `quickreport`) with zero-dependency native document generation and sub-millisecond execution.
+Warehouse Touches is an AIOS web service written in Grain that aggregates warehouse operations and generates multi-format reporting for ERP users.
 
-## Endpoints
+It replaces the legacy PHP endpoint (`touches.php`) while querying the primary operations tables directly from ASQL.
 
-- `GET /` or `GET /quickreportview`: Interactive operator view (summary metrics cards, touch mix visual breakdown, ranked table, date filtering).
-- `GET /quickreportpdf`: High-speed vector PDF generator rendering the 26-column touches grid in landscape letter format with highlighted contributing columns and running pagination headers/footers (`pdf_render`).
-- `GET /quickreportxlsx`: Native OpenXML Excel spreadsheet export (`.xlsx`) with frozen panes, cell formats, number styling, and column widths (`xlsx_create`).
-- `GET /quickreport`: Direct JSON rollup endpoint without PHP-FPM overhead.
-- `GET /health`: Health check endpoint.
+Related documentation:
+- [Running and managing Grain applications](../../docs/grain-apps.md)
+- [Writing Grain applications](../../docs/grain-app-writing.md)
+- [Hosting applications with AIOS](../../docs/aios-serve.md)
 
-## Native Document Engine Primitives
+---
 
-- `pdf_render(html, [css], [options])`: Headless HTML/CSS vector PDF 1.4 compiler with font support (Helvetica, Helvetica-Bold, Helvetica-Oblique, Helvetica-BoldOblique), automatic pagination, multi-page headers/footers, and exact cross-reference tables.
-- `xlsx_create(spec)`: Zero-dependency OpenXML spreadsheet generator assembling zipped XML parts (`[Content_Types].xml`, `_rels/.rels`, `xl/workbook.xml`, `xl/styles.xml`, `xl/worksheets/sheet1.xml`).
-- `zip_create(entries, [level])`: Native PKZIP archive generator using RFC 1951 DEFLATE compression.
-- `unzip(bytes)`: In-tree central directory ZIP decompressor.
+## API Endpoints
 
-## Verification
+| Endpoint | Method | Response | Description |
+|---|---|---|---|
+| `/` or `/quickreportview` | `GET` | HTML | Interactive dashboard (summary cards, touch mix bars, ranked operator table, and date filter) |
+| `/quickreport` | `GET` | JSON | Aggregated touch rollups and per-operator metrics |
+| `/quickreportpdf` | `GET` | `application/pdf` | Vector PDF report in landscape letter format |
+| `/quickreportxlsx` | `GET` | `application/vnd.openxmlformats-officedocument...` | OpenXML spreadsheet export with frozen panes and cell styling |
+| `/quickreportcsv` | `GET` | `text/csv` | Tabular CSV export covering all 31 metrics |
+| `/health` | `GET` | JSON | Health status (`{"status":"ok"}`) |
 
-Run the test suite:
+### Query Parameters
+
+All reporting endpoints accept optional date filter parameters:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `start` | `YYYY-MM-DD` | 30 days ago | Beginning of the date range |
+| `stop` | `YYYY-MM-DD` | Current date | End of the date range |
+| `range` | `START..STOP` | *(none)* | Combined date span string (e.g. `2026-09-01..2026-10-26`) |
+| `userid` | string | *(none)* | Filter activity to a single operator ID |
+
+---
+
+## Architecture and File Layout
+
+```text
+apps/warehouse_touches/
+├── app.gr                 # Application manifest (port 8573, listen interface, settings, secrets)
+├── service.gr             # HTTP routes and request handlers
+├── lib/
+│   ├── queries.gr         # ASQL touch queries (recscan, picking, bin movements, loads, stickers)
+│   └── views.gr           # Document and view renderers (HTML dashboard, PDF, XLSX, CSV)
+└── README.md              # Service documentation
+```
+
+### Warehouse Operations ("Touches")
+
+The service queries five distinct operational areas from ASQL:
+1. **Receiving (`recscan`)**: Pallet and carton receipts, quantities, scan counts, and vendor tallies.
+2. **Picking (`pickingfreeze` + `stockmaster`)**: Merchandise picks excluding non-inventory freight/fees.
+3. **Bin Movements (`binmovements_details`)**: Stock movements, merges, and dolly relocations.
+4. **Truck Loading (`loadingbays` + `dispatch`)**: Dispatches, loading scan counts, manual overrides, and driver times.
+5. **Sticker Scans (`stickerscanout` + `salesorderdetails`)**: Pack and stage unit scans and bound orders.
+
+---
+
+## Host Configuration
+
+Configuration settings are set through `app set` or environment variables:
 
 ```bash
-grain run apps/warehouse_touches/checks.gr
+app set warehouse_touches \
+    DB_HOST=127.0.0.1 \
+    DB_PORT=3307 \
+    DB_USER=root \
+    DB_NAME=versioneight
+
+# Pass MariaDB/ASQL password via stdin
+cat /opt/aios/mysql.pass | app secret warehouse_touches DB_PASSWORD
+```
+
+### Settings Reference
+
+| Setting | Default | Description |
+|---|---|---|
+| `DB_HOST` | `127.0.0.1` | ASQL / database host |
+| `DB_PORT` | `3307` | ASQL / database port |
+| `DB_USER` | `root` | Database user |
+| `DB_NAME` | `versioneight` | Database name |
+| `WAREHOUSE_COMPUTE_ON` | `""` | Optional fleet member ID to route report computation to |
+
+### Secrets Reference
+
+| Secret | Description |
+|---|---|
+| `DB_PASSWORD` | Password for the database connection |
+
+---
+
+## Running and Verification
+
+To run standalone with the Grain CLI:
+
+```bash
+grain run apps/warehouse_touches/service.gr
 ```

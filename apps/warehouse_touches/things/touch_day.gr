@@ -1,0 +1,337 @@
+// touch_day - an ASQL Thing: one warehouse day's touches, per user, kept current by the engine.
+//
+// Key: the day ("YYYY-MM-DD"). Value: `users`, a JSON map of lower(userid) to that user's raw figures for the day -
+// sums, and the distinct sets (items, vendors, orders, moves) a report over several days has to union rather than add
+// (lib/queries.gr merges them). A scan, pick, move, load or sticker row that changes names the day(s) it falls on in
+// touched(), and the engine rebuilds only those days; the report reads them with SHOW THING touch_day KEYS (...).
+//
+// It counts exactly what lib/queries.gr's SQL report counts, row for row: same tables, filters and joins.
+
+let DAY_SAFE = true   // a day's answer depends on that day's rows only, never on the clock
+
+let MERCH = " AND ((sm.categoryid = 'TIRE' OR pf.stockid = 'FET') OR (sm.categoryid IN ('O','OT')) OR " +
+            "(sm.categoryid NOT IN ('TIRE','O','F','E','X','L') AND pf.stockid NOT IN ('LAB-STORAGE','LAB-T11','LAB-T26')))"
+let PICKED = " FROM pickingfreeze pf INNER JOIN stockmaster sm ON sm.stockid = pf.stockid " +
+             "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 "
+
+fn day_of(t) {
+  if t == nil { return nil }
+  let s = str(t)
+  if len(s) < 10 or s < "1970" { return nil }
+  return slice(s, 0, 10)
+}
+fn blank(s) { return s == nil or trim(str(s)) == "" }
+fn num(v) { return v == nil ? 0.0 : real(v) }
+fn ival(v) { return v == nil or str(v) == "" ? 0 : int(v) }
+
+// Every day any of the tables has a touch on.
+fn enroll() {
+  let days = {}
+  for sql in [
+    "SELECT DISTINCT DATE(date_rec) AS d FROM recscan WHERE date_rec IS NOT NULL",
+    "SELECT DISTINCT DATE(date_pickupdate) AS d FROM pickingfreeze WHERE date_pickupdate IS NOT NULL",
+    "SELECT DISTINCT DATE(date_created) AS d FROM binmovements_details WHERE date_created IS NOT NULL",
+    "SELECT DISTINCT DATE(packedtime) AS d FROM stickerscanout WHERE packedtime IS NOT NULL",
+    "SELECT DISTINCT DATE(stagedtime) AS d FROM stickerscanout WHERE stagedtime IS NOT NULL",
+    "SELECT DISTINCT DATE(timestopped) AS d FROM loadingbays WHERE timestopped IS NOT NULL",
+    "SELECT DISTINCT DATE(timeassigned) AS d FROM loadingbays WHERE timeassigned IS NOT NULL"
+  ] {
+    for r in read_raw(sql) {
+      let d = day_of(r.d)
+      if d != nil { days[d] = true }
+    }
+  }
+  return sort(keys(days))
+}
+
+// A driver's name on a dispatch is mapped to the user whose real name it is (www_users).
+fn shared() {
+  let m = {}
+  for r in read_raw("SELECT userid, realname FROM www_users") {
+    if not blank(r.realname) { m[lower(trim(r.realname))] = r.userid }
+  }
+  return {"drivers": m}
+}
+
+fn things(ks, sh) {
+  let want = {}
+  let lo = nil
+  let hi = nil
+  for k in ks {
+    let d = str(k)
+    want[d] = true
+    if lo == nil or d < lo { lo = d }
+    if hi == nil or d > hi { hi = d }
+  }
+  if lo == nil { return {} }
+  let a = lo + " 00:00:00"
+  let b = hi + " 23:59:59"
+  let out_days = {}
+
+  // the user record of a day, made on first use; `uid` is the userid as the row has it
+  let user = fn(day, uid) {
+    if day == nil or not has(want, day) or blank(uid) { return nil }
+    if out_days[day] == nil { out_days[day] = {} }
+    let key = lower(uid)
+    let u = out_days[day][key]
+    if u == nil {
+      u = {"userid": uid, "active": false, "first": nil, "last": nil,
+           "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
+           "pick": {"lines": 0, "qty": 0.0, "orders": []},
+           "moves": {}, "runs": {}, "units": {},
+           "packed": {"n": 0, "units": 0.0}, "staged": {"n": 0, "units": 0.0}}
+      out_days[day][key] = u
+    }
+    return u
+  }
+  let stamp = fn(u, first, last) {
+    if not blank(first) and (u.first == nil or str(first) < u.first) { u.first = str(first) }
+    if not blank(last) and (u.last == nil or str(last) > u.last) { u.last = str(last) }
+  }
+
+  // 1. Receiving
+  for r in read_raw("SELECT userid, DATE(date_rec) AS day, COUNT(*) AS scans, " +
+                    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN qty ELSE 0 END) AS qty_in, " +
+                    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN 0 ELSE qty END) AS qty_out, " +
+                    "MIN(date_rec) AS first_touch, MAX(date_rec) AS last_touch FROM recscan " +
+                    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' " +
+                    "GROUP BY userid, DATE(date_rec)", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil {
+      u.active = true
+      u.rec.scans = u.rec.scans + int(r.scans)
+      u.rec.qty_in = u.rec.qty_in + num(r.qty_in)
+      u.rec.qty_out = u.rec.qty_out + num(r.qty_out)
+      stamp(u, r.first_touch, r.last_touch)
+    }
+  }
+  for r in read_raw("SELECT DISTINCT userid, DATE(date_rec) AS day, stockid FROM recscan " +
+                    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' AND stockid IS NOT NULL", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil { push(u.rec.items, str(r.stockid)) }
+  }
+  for r in read_raw("SELECT DISTINCT userid, DATE(date_rec) AS day, vendor FROM recscan " +
+                    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' AND vendor IS NOT NULL", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil { push(u.rec.vendors, str(r.vendor)) }
+  }
+
+  // 2. Picking
+  let pick_where = "WHERE pf.bin <> 'STAGING' AND pf.picked > 0 AND pf.date_pickupdate >= ? AND pf.date_pickupdate <= ? " +
+                   "AND pf.userid IS NOT NULL AND pf.userid <> '' " + MERCH
+  for r in read_raw("SELECT pf.userid, DATE(pf.date_pickupdate) AS day, COUNT(*) AS line_count, SUM(pf.picked) AS qty, " +
+                    "MIN(pf.date_pickupdate) AS first_touch, MAX(pf.date_pickupdate) AS last_touch" + PICKED + pick_where +
+                    " GROUP BY pf.userid, DATE(pf.date_pickupdate)", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil {
+      u.active = true
+      u.pick.lines = u.pick.lines + int(r.line_count)
+      u.pick.qty = u.pick.qty + num(r.qty)
+      stamp(u, r.first_touch, r.last_touch)
+    }
+  }
+  for r in read_raw("SELECT DISTINCT pf.userid, DATE(pf.date_pickupdate) AS day, pf.orderno" + PICKED + pick_where +
+                    " AND pf.orderno IS NOT NULL", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil { push(u.pick.orders, str(r.orderno)) }
+  }
+
+  // 3. Bin movements (a move is a distinct (binmoveid, stockid) of its type)
+  let move_where = "WHERE date_created >= ? AND date_created <= ? AND `from` <> `to` AND qty > 0 AND user IS NOT NULL AND user <> '' "
+  for r in read_raw("SELECT user AS userid, DATE(date_created) AS day, LOWER(TRIM(type)) AS movetype, SUM(qty) AS qty, " +
+                    "MIN(date_created) AS first_touch, MAX(date_created) AS last_touch FROM binmovements_details " + move_where +
+                    "GROUP BY user, DATE(date_created), LOWER(TRIM(type))", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil {
+      u.active = true
+      let t = blank(r.movetype) ? "other" : str(r.movetype)
+      if u.moves[t] == nil { u.moves[t] = {"pairs": [], "qty": 0.0} }
+      u.moves[t].qty = u.moves[t].qty + num(r.qty)
+      stamp(u, r.first_touch, r.last_touch)
+    }
+  }
+  for r in read_raw("SELECT DISTINCT user AS userid, DATE(date_created) AS day, LOWER(TRIM(type)) AS movetype, binmoveid, stockid " +
+                    "FROM binmovements_details " + move_where + "AND binmoveid IS NOT NULL AND stockid IS NOT NULL", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil {
+      let t = blank(r.movetype) ? "other" : str(r.movetype)
+      if u.moves[t] == nil { u.moves[t] = {"pairs": [], "qty": 0.0} }
+      push(u.moves[t].pairs, str(r.binmoveid) + "|" + str(r.stockid))
+    }
+  }
+
+  // 4. Loads: a run (dispnumber, truckid) falls on the day its row was stopped, or assigned when it was forced
+  // complete without a stop time; each of its drivers gets it.
+  let runs = {}
+  for r in read_raw("SELECT dispnumber, truckid, timeassigned, timestarted, timestopped, manual_pick, completed, force_complete, " +
+                    "(COALESCE(force_complete, 0) = 1 OR COALESCE(run_moved, 0) = 1) AS untimed FROM loadingbays " +
+                    "WHERE COALESCE(run_deleted, 0) = 0 AND dispnumber IS NOT NULL AND dispnumber <> '' " +
+                    "AND ((completed = 1 AND timestopped >= ? AND timestopped <= ?) " +
+                    "  OR (force_complete = 1 AND COALESCE(timestopped, '') = '' AND timeassigned >= ? AND timeassigned <= ?))", a, b, a, b) {
+    let stopped_in = ival(r.completed) == 1 and not blank(r.timestopped) and str(r.timestopped) >= a and str(r.timestopped) <= b
+    let day = stopped_in ? day_of(r.timestopped) : day_of(r.timeassigned)
+    if day != nil and has(want, day) {
+      let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
+      let rk = id + "@" + day
+      if runs[rk] == nil {
+        runs[rk] = {"id": id, "day": day, "disp": int(r.dispnumber), "truck": int(r.truckid),
+                    "manual": 0, "forced": false, "assigned": nil, "started": nil, "stopped": nil}
+      }
+      let run = runs[rk]
+      run.manual = run.manual + ival(r.manual_pick)
+      run.forced = run.forced or ival(r.force_complete) == 1
+      if not blank(r.timeassigned) and (run.assigned == nil or str(r.timeassigned) < run.assigned) { run.assigned = str(r.timeassigned) }
+      if not blank(r.timestarted) and (run.started == nil or str(r.timestarted) < run.started) { run.started = str(r.timestarted) }
+      if not blank(r.timestopped) and (run.stopped == nil or str(r.timestopped) > run.stopped) { run.stopped = str(r.timestopped) }
+    }
+  }
+  if len(keys(runs)) > 0 {
+    let disps = []
+    let trucks = []
+    let is_run = {}
+    for rk in keys(runs) {
+      push(disps, runs[rk].disp)
+      push(trucks, runs[rk].truck)
+      is_run[runs[rk].id] = true
+    }
+    disps = unique(disps)
+    trucks = unique(trucks)
+    let drivers = {}
+    for r in read_raw("SELECT DISTINCT d.dispnumber, d.truckid, d.driveruserid FROM dispatch d " +
+                      "WHERE d.driveruserid IS NOT NULL AND d.driveruserid <> '' AND d.dispnumber IN (?) AND d.truckid IN (?)", disps, trucks) {
+      let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
+      if drivers[id] == nil { drivers[id] = [] }
+      push(drivers[id], r.driveruserid)
+    }
+    let mapped = fn(driver) {
+      let m = sh.drivers[lower(trim(driver))]
+      return m == nil ? driver : m
+    }
+    for rk in keys(runs) {
+      let run = runs[rk]
+      let ds = drivers[run.id]
+      if ds != nil {
+        for driver in unique(ds) {
+          let u = user(run.day, mapped(driver))
+          if u != nil {
+            let mine = u.runs[run.id]
+            if mine == nil {
+              mine = {"k": 0, "manual": run.manual, "forced": run.forced, "assigned": run.assigned, "started": run.started, "stopped": run.stopped}
+              u.runs[run.id] = mine
+            }
+            mine.k = mine.k + 1   // one count per name on the dispatch, as the SQL report counts it
+          }
+        }
+      }
+    }
+    // Units loaded on each run, by the name on its dispatch row (and the orders they were for)
+    let per_run = {}
+    for r in read_raw("SELECT d.dispnumber, d.truckid, d.driveruserid AS driver, pf.orderno, SUM(pf.loaded) AS units" + PICKED +
+                      "INNER JOIN dispatch d ON d.invoice = pf.orderno " +
+                      "WHERE pf.loaded > 0 AND d.dispnumber IN (?) AND d.truckid IN (?) " + MERCH +
+                      " GROUP BY d.dispnumber, d.truckid, d.driveruserid, pf.orderno", disps, trucks) {
+      let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
+      if is_run[id] and r.driver != nil {
+        if per_run[id] == nil { per_run[id] = {} }
+        let dv = str(r.driver)
+        if per_run[id][dv] == nil { per_run[id][dv] = {"units": 0.0, "orders": []} }
+        per_run[id][dv].units = per_run[id][dv].units + num(r.units)
+        if r.orderno != nil { push(per_run[id][dv].orders, str(r.orderno)) }
+      }
+    }
+    for rk in keys(runs) {
+      let run = runs[rk]
+      let by_driver = per_run[run.id]
+      if by_driver != nil {
+        for dv in keys(by_driver) {
+          let u = user(run.day, mapped(dv))
+          if u != nil {
+            if u.units[run.id] == nil { u.units[run.id] = {} }
+            u.units[run.id][dv] = by_driver[dv]
+          }
+        }
+      }
+    }
+  }
+
+  // 5. Sticker scan out: packed and staged
+  for side in [["packed", "packeduserid", "packedtime"], ["staged", "stageduserid", "stagedtime"]] {
+    let who = side[1]
+    let at = side[2]
+    for r in read_raw("SELECT " + who + " AS userid, DATE(" + at + ") AS day, COUNT(*) AS orders, " +
+                      "SUM(CAST(quantity AS DECIMAL(12,2))) AS units, MIN(" + at + ") AS first_touch, MAX(" + at + ") AS last_touch " +
+                      "FROM stickerscanout WHERE statusid <> '99' AND " + at + " >= ? AND " + at + " <= ? " +
+                      "AND " + who + " IS NOT NULL AND " + who + " <> '' GROUP BY " + who + ", DATE(" + at + ")", a, b) {
+      let u = user(day_of(r.day), r.userid)
+      if u != nil {
+        u.active = true
+        u[side[0]].n = u[side[0]].n + int(r.orders)
+        u[side[0]].units = u[side[0]].units + num(r.units)
+        stamp(u, r.first_touch, r.last_touch)
+      }
+    }
+  }
+
+  let out = {}
+  for day in keys(out_days) {
+    out[day] = {"users": json_stringify(out_days[day]), "people": len(keys(out_days[day]))}
+  }
+  return out
+}
+
+// What a change means: the day(s) the row falls on, before and after.
+fn row_days(t, row) {
+  if row == nil { return [] }
+  match t {
+    "recscan" => { return [day_of(row.date_rec)] }
+    "binmovements_details" => { return [day_of(row.date_created)] }
+    "stickerscanout" => { return [day_of(row.packedtime), day_of(row.stagedtime)] }
+    "loadingbays" => { return [day_of(row.timestopped), day_of(row.timeassigned)] }
+  }
+  return []
+}
+
+// The days of the runs a dispatch row, or the order a picking line is on, belongs to.
+fn run_days(disp, truck) {
+  let ds = []
+  for r in read_raw("SELECT timestopped, timeassigned FROM loadingbays WHERE dispnumber = ? AND truckid = ?", disp, truck) {
+    push(ds, day_of(r.timestopped))
+    push(ds, day_of(r.timeassigned))
+  }
+  return ds
+}
+fn order_run_days(orderno) {
+  let ds = []
+  for r in read_raw("SELECT DISTINCT dispnumber, truckid FROM dispatch WHERE invoice = ?", orderno) {
+    for d in run_days(r.dispnumber, r.truckid) { push(ds, d) }
+  }
+  return ds
+}
+
+fn touched(table, op, before, after, sh) {
+  let t = lower(table)
+  let rows = compact([before, after])
+  if t == "www_users" {
+    if before != nil and after != nil and before.realname == after.realname and before.userid == after.userid { return nil }
+    return {"keys": [], "shared": true}
+  }
+  if t == "product_types" { return "all" }
+  if t == "stockmaster" {
+    // only what decides whether a pick counts (its category and its kind) matters, and rarely moves
+    if before != nil and after != nil and before.categoryid == after.categoryid and before.mbflag == after.mbflag { return nil }
+    if before == nil { return nil }   // a new item has no picks yet
+    return "all"
+  }
+  let ds = []
+  for row in rows {
+    if t == "pickingfreeze" {
+      push(ds, day_of(row.date_pickupdate))
+      if row.orderno != nil { for d in order_run_days(row.orderno) { push(ds, d) } }
+    } else if t == "dispatch" {
+      if row.dispnumber != nil and row.truckid != nil { for d in run_days(row.dispnumber, row.truckid) { push(ds, d) } }
+    } else {
+      for d in row_days(t, row) { push(ds, d) }
+    }
+  }
+  return unique(compact(ds))
+}
