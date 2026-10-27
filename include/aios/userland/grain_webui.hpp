@@ -79,6 +79,7 @@ class WebUi {
   // An open server-sent-events stream. The caller loops on next_frame() and writes each frame to the client.
   struct Stream {
     std::shared_ptr<Session> session;
+    bool done = false;   // told the page to load again: the next next_frame() ends the stream
     uint64_t seen = 0;
     bool tree = false;
   };
