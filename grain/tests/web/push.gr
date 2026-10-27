@@ -1,0 +1,23 @@
+// A pane whose view follows a file (its watch) and has an element its own script keeps (data-ui-keep), driven in
+// Chrome by push_test.py: a pushed change marks what it changed; the page's own element is left alone; a viewer's
+// own action does not flash.
+let path = getenv("WATCH_FILE")
+let n = 0
+ui.pane({"title": "Push",
+  "watch": fn(since) {
+    let t0 = time_ms()
+    while time_ms() - t0 < 2000 {
+      let now = read_file(path)
+      if since == nil or now != since { return now }
+      sleep(20)
+    }
+    return since
+  },
+  "view": fn() {
+    return el("div",
+      el("div", {"id": "keep", "data-ui-keep": true}, "from the server"),
+      el("p", {"id": "v"}, "value " + trim(read_file(path))),
+      el("p", {"id": "n"}, "n=" + str(n)),
+      el("button", {"id": "add", "on_click": fn() { n += 1 }}, "Add"))
+  }})
+run_panes()

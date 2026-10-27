@@ -196,6 +196,9 @@ if(NOT WIN32 AND Python3_Interpreter_FOUND)
     add_test(NAME grain.web.browser COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/browser_test.py $<TARGET_FILE:grain> ${GRAIN_CHROME}
              ${CMAKE_CURRENT_SOURCE_DIR}/web/counter.gr ${CMAKE_CURRENT_SOURCE_DIR}/../examples/sysmon.gr ${CMAKE_CURRENT_SOURCE_DIR}/web/live.gr)
     set_tests_properties(grain.web.browser PROPERTIES TIMEOUT 120)
+    add_test(NAME grain.web.push COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/web/push_test.py $<TARGET_FILE:grain> ${GRAIN_CHROME}
+             ${CMAKE_CURRENT_SOURCE_DIR}/web/push.gr)
+    set_tests_properties(grain.web.push PROPERTIES TIMEOUT 60)
   else()
     message(STATUS "grain: no Chrome found, so the in-browser test (grain.web.browser) is not run")
   endif()

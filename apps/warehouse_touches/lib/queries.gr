@@ -57,28 +57,68 @@ fn hour_wanted(h) {
   return n >= 0 and n <= 23 ? n : nil
 }
 
-// The hours of the range the touch_hour Thing holds - all 24 of each day, or the one hour wanted - with their JSON
+// The hours of the day a report is limited to: {from, to} (both included, from <= to), or nil for all of them. From
+// hour_wanted=10 (the PHP report's one hour) or hours=7-11 (a span, the timeline's).
+fn hour_span(hour_wanted_in, hours_in) {
+  if not is_blank(hours_in) {
+    let parts = split(trim(str(hours_in)), "-")
+    if len(parts) == 2 {
+      let a = hour_wanted(parts[0])
+      let b = hour_wanted(parts[1])
+      if a != nil and b != nil { return {"from": min(a, b), "to": max(a, b)} }
+    }
+  }
+  let h = hour_wanted(hour_wanted_in)
+  return h == nil ? nil : {"from": h, "to": h}
+}
+
+fn in_span(span, h) { return span == nil or (h >= span.from and h <= span.to) }
+
+// The hours of the range the touch_hour Thing holds - all 24 of each day, or those of the span - with their JSON
 // columns read back as values.
-fn touch_hours(db, start_date, stop_date, hour) {
+fn touch_hours(db, start_date, stop_date, span) {
   if not is_day(start_date) or not is_day(stop_date) { return [] }
   let hours = []
   for d in date_range(start_date, stop_date) {
-    if hour != nil { push(hours, d + " " + pad_left(str(hour), 2, "0")) }
-    else { for h in range(0, 24) { push(hours, d + " " + pad_left(str(h), 2, "0")) } }
+    for h in range(0, 24) { if in_span(span, h) { push(hours, d + " " + pad_left(str(h), 2, "0")) } }
   }
   return map(thing_rows(db, "touch_hour", hours),
-             fn(row) { return {"day": slice(str(row.hour), 0, 10), "hour": str(row.hour), "users": row.users, "runs": row.runs ?? []} })
+             fn(row) { return {"day": slice(str(row.hour), 0, 10), "hour": str(row.hour), "h": int(slice(str(row.hour), 11, 13)),
+                               "users": row.users, "runs": row.runs ?? []} })
 }
 
 fn r1(v) { return round(real(v), 1) }
 
-fn fetch_warehouse_touches(db, start_in, stop_in, userids, hour_in) {
+// The report for a range and a span of hours (nil: all), as the PHP report's quickReportData gives it.
+fn fetch_warehouse_touches(db, start_in, stop_in, userids, span) {
   let range = report_range(start_in, stop_in)
-  let start_date = range[0]
-  let stop_date = range[1]
-  let hour = hour_wanted(hour_in)
-  let rows = touch_hours(db, start_date, stop_date, hour)
+  let rows = touch_hours(db, range[0], range[1], span)
+  let report = merge_rows(db, rows, range[0], range[1])
+  report.hours = span
+  report.hour = span != nil and span.from == span.to ? span.from : nil   // the PHP page's one hour
+  return report
+}
 
+// The same, and the day's profile beside it: what each of the 24 hours holds over the range (the touches the report
+// would give for that hour alone, by source) - from one read of the range's hours.
+fn fetch_with_profile(db, start_in, stop_in, span) {
+  let range = report_range(start_in, stop_in)
+  let rows = touch_hours(db, range[0], range[1], nil)
+  let by_hour = group_by(rows, fn(r) { return r.h })
+  let profile = map(range(0, 24), fn(h) {
+    let t = merge_rows(nil, by_hour[str(h)] ?? [], range[0], range[1]).totals
+    return {"hour": h, "touches": t.touches, "parts": t.parts}
+  })
+  let report = merge_rows(db, filter(rows, fn(r) { return in_span(span, r.h) }), range[0], range[1])
+  report.hours = span
+  report.hour = span != nil and span.from == span.to ? span.from : nil
+  report.profile = profile
+  return report
+}
+
+// The report from rows of touch_hour (any set of hours of the range): users and totals as the PHP report works them
+// out. db: for the users' real names (nil: leave them out, as the profile does).
+fn merge_rows(db, rows, start_date, stop_date) {
   let users = {}
   let days = {}
   let get_user = fn(key, uid) {
@@ -261,7 +301,7 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids, hour_in) {
     u.loads.orders = u.loads.orders + u.loads.pickuporders
   }
   // real names (www_users holds password hashes too: only the name columns are read)
-  let n_res = pcall(db_query, db, "SELECT userid, realname FROM www_users")
+  let n_res = db == nil ? {"ok": false} : pcall(db_query, db, "SELECT userid, realname FROM www_users")
   if n_res.ok and n_res.value.records != nil {
     for row in n_res.value.records {
       let k = lower(row.userid)
@@ -271,7 +311,6 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids, hour_in) {
   let report = rollup(users, days, start_date, stop_date, {"items": len(all_items), "vendors": len(all_vendors),
                       "orders": len(all_orders), "secs": load_secs, "timed": load_timed})
   report.lasts = lasts
-  report.hour = hour   // the hour of the day it is limited to, nil for all
   return report
 }
 

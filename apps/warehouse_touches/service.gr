@@ -29,7 +29,7 @@ fn get_db() {
   return c
 }
 
-fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid, p.hour) }
+fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid, p.span) }
 
 // start / stop from the query (or a range "a..b"); missing or not a date, the PHP report's defaults: the last 30
 // days, today included (report_range in lib/queries.gr).
@@ -42,7 +42,7 @@ fn parse_date_params(req) {
     if len(rparts) >= 2 { start = rparts[0]; stop = rparts[1] }
   }
   let r = report_range(start, stop)
-  return {"start": r[0], "stop": r[1], "userid": q.userid, "hour": hour_wanted(q.hour_wanted)}
+  return {"start": r[0], "stop": r[1], "userid": q.userid, "span": hour_span(q.hour_wanted, q.hours)}
 }
 
 // ---- Route Handlers ----------------------------------------------------------
@@ -151,7 +151,7 @@ let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
 
 // The viewer's own page: the range (the PHP report's default, the last 30 days) and the table's sort.
 let default_range = report_range(nil, nil)
-let state = {"start": default_range[0], "stop": default_range[1], "hour": nil, "sorter": {"col": 2, "dir": "desc"}}
+let state = {"start": default_range[0], "stop": default_range[1], "span": nil, "sorter": {"col": 2, "dir": "desc"}}
 
 ui.pane({
   "title": "Warehouse Activity",
@@ -165,7 +165,7 @@ ui.pane({
   // made the Thing it reads, and ASQL may be restarting)
   "view": fn() {
     let c = db_connect(DB_CFG)
-    let got = c.ok ? pcall(report, c, {"start": state.start, "stop": state.stop, "userid": nil, "hour": state.hour}) : {"ok": false, "error": c.error}
+    let got = c.ok ? pcall(fetch_with_profile, c, state.start, state.stop, state.span) : {"ok": false, "error": c.error}
     if c.ok { db_close(c) }
     if not got.ok {
       return el("div", {"class": "page"}, el("h1", "Warehouse Activity"),
