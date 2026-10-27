@@ -80,7 +80,7 @@ fn things(ks, sh) {
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
-           "packed": {}, "staged": {}, "binds": [], "dname": nil}
+           "packed": {}, "staged": {}, "binds": [], "dname": nil, "lasts": {}}
       out_days[day][key] = u
     }
     return u
@@ -88,6 +88,10 @@ fn things(ks, sh) {
   let stamp = fn(u, first, last) {
     if not blank(first) and (u.first == nil or str(first) < u.first) { u.first = str(first) }
     if not blank(last) and (u.last == nil or str(last) > u.last) { u.last = str(last) }
+  }
+  // the latest touch of one source (each stat card shows its own)
+  let late = fn(u, src, t) {
+    if not blank(t) and (u.lasts[src] == nil or str(t) > u.lasts[src]) { u.lasts[src] = str(t) }
   }
 
   // 1. Receiving
@@ -104,6 +108,7 @@ fn things(ks, sh) {
       u.rec.qty_in = u.rec.qty_in + num(r.qty_in)
       u.rec.qty_out = u.rec.qty_out + num(r.qty_out)
       stamp(u, r.first_touch, r.last_touch)
+      late(u, "receiving", r.last_touch)
     }
   }
   for r in read_raw("SELECT DISTINCT userid, DATE(date_rec) AS day, stockid FROM recscan " +
@@ -129,6 +134,7 @@ fn things(ks, sh) {
       u.pick.lines = u.pick.lines + int(r.line_count)
       u.pick.qty = u.pick.qty + num(r.qty)
       stamp(u, r.first_touch, r.last_touch)
+      late(u, "picking", r.last_touch)
     }
   }
   for r in read_raw("SELECT DISTINCT pf.userid, DATE(pf.date_pickupdate) AS day, pf.orderno" + PICKED + pick_where +
@@ -149,6 +155,7 @@ fn things(ks, sh) {
       if u.moves[t] == nil { u.moves[t] = {"pairs": [], "qty": 0.0} }
       u.moves[t].qty = u.moves[t].qty + num(r.qty)
       stamp(u, r.first_touch, r.last_touch)
+      late(u, "movements", r.last_touch)
     }
   }
   for r in read_raw("SELECT DISTINCT user AS userid, DATE(date_created) AS day, LOWER(TRIM(type)) AS movetype, binmoveid, stockid " +
@@ -292,6 +299,7 @@ fn things(ks, sh) {
         let o = str(r.orderno)
         u[side[0]][o] = {"t": has(tire, o) ? tire[o] : nil, "f": num(r.fallback)}
         stamp(u, r.first_touch, r.last_touch)
+        late(u, "sticker", r.last_touch)
       }
     }
   }
