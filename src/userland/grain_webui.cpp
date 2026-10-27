@@ -621,7 +621,13 @@ const char* kScript = R"JS(
       else if(tc[k]&&sc[k])morph(tc[k],sc[k],fromAction);
     }
   }
+  // a frame from another version of the program than this page's (a deploy): load the page again
+  function stale(d){
+    if(d.reload||(d.version!==undefined&&app.dataset.version&&d.version!==app.dataset.version)){location.reload();return true}
+    return false;
+  }
   function apply(d,fromAction){
+    if(stale(d))return;
     if(d.html===undefined)return;
     seq=String(d.seq);
     var wrap=document.createElement('div');
@@ -658,6 +664,7 @@ const char* kScript = R"JS(
     es.onmessage=function(m){
       try{
         var d=JSON.parse(m.data);
+        if(stale(d))return;
         if(String(d.seq)!==seq)apply(d,false);
       }catch(x){}
     };
@@ -1208,7 +1215,11 @@ std::string base64_of(const std::string& in) {
 const char* kCanvasScript = R"JS(
 (function(){
   var img=document.getElementById('cv'),seq=img.dataset.seq;
-  function apply(d){if(d.png){seq=String(d.seq);img.src='data:image/png;base64,'+d.png}}
+  function stale(d){
+    if(d.reload||(d.version!==undefined&&img.dataset.version&&d.version!==img.dataset.version)){location.reload();return true}
+    return false;
+  }
+  function apply(d){if(stale(d))return;if(d.png){seq=String(d.seq);img.src='data:image/png;base64,'+d.png}}
   function post(p){
     fetch(location.pathname+location.search,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(p).toString(),credentials:'same-origin'})
       .then(function(r){return r.json()}).then(function(d){if(String(d.seq)!==seq)apply(d)}).catch(function(){});
@@ -1334,18 +1345,18 @@ bool WebUi::refresh_locked(Session& s) {
 // The frame for one viewer: {"seq":N,"html":"..."} or {"seq":N,"tree":{...}}.
 void WebUi::frame_locked(Session& s, bool tree, std::string& out) {
   if (s.canvas) {
-    out = "{\"seq\":" + std::to_string(s.seq) + ",\"canvas\":true,\"width\":" + std::to_string(s.info.width) + ",\"height\":" +
+    out = "{\"seq\":" + std::to_string(s.seq) + ",\"version\":" + json_string(s.version) + ",\"canvas\":true,\"width\":" + std::to_string(s.info.width) + ",\"height\":" +
           std::to_string(s.info.height) + ",\"png\":\"" + s.png_b64 + "\"}";
     return;
   }
-  if (tree) { out = "{\"seq\":" + std::to_string(s.seq) + ",\"tree\":" + s.last_tree + "}"; return; }
+  if (tree) { out = "{\"seq\":" + std::to_string(s.seq) + ",\"version\":" + json_string(s.version) + ",\"tree\":" + s.last_tree + "}"; return; }
   if (s.html_seq != s.seq || s.last_html.empty()) {
     std::string html, err;
     uint64_t v = 0;
     if (web_pane_render(*s.vm, s.pane, html, v, err)) { s.last_html = std::move(html); s.html_seq = s.seq; }
     else report(err);
   }
-  out = "{\"seq\":" + std::to_string(s.seq) + ",\"html\":" + json_string(s.last_html) + "}";
+  out = "{\"seq\":" + std::to_string(s.seq) + ",\"version\":" + json_string(s.version) + ",\"html\":" + json_string(s.last_html) + "}";
 }
 
 void WebUi::start_ticker() {
@@ -1566,10 +1577,22 @@ bool WebUi::open_stream(const Request& req, Stream& out, std::vector<std::pair<s
 
 bool WebUi::next_frame(Stream& st, int timeout_ms, std::string& frame) {
   Session& s = *st.session;
+  // the program changed under an open page (a deploy, an edited file): its page, scripts and styles are the old
+  // ones, so the page loads again rather than take the new version's markup into them
+  auto outdated = [&] {
+    std::string now, err;
+    return host_.current_version && host_.current_version(now, err) && now != s.version;
+  };
+  if (st.done) return false;
+  if (outdated()) { frame = "data: {\"reload\":true}\n\n"; st.done = true; return true; }
   {
     std::unique_lock<std::mutex> lock(s.push_mu);
     s.push_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return s.seq != st.seen; });
-    if (s.seq == st.seen) { frame.clear(); return true; }
+    if (s.seq == st.seen) {
+      if (outdated()) { frame = "data: {\"reload\":true}\n\n"; st.done = true; return true; }
+      frame.clear();
+      return true;
+    }
   }
   std::string body;
   {
@@ -1796,7 +1819,7 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
                        esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle +
                        "#cv{display:block;margin:24px auto;max-width:calc(100% - 32px);height:auto;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.35);user-select:none;-webkit-user-drag:none}</style></head><body>"
                        "<img id=\"cv\" alt=\"\" draggable=\"false\" width=\"" + std::to_string(s->info.width) + "\" height=\"" + std::to_string(s->info.height) +
-                       "\" data-seq=\"" + std::to_string(s->seq) + "\" src=\"data:image/png;base64," + s->png_b64 + "\"><script>" + kCanvasScript + "</script></body></html>";
+                       "\" data-seq=\"" + std::to_string(s->seq) + "\" data-version=\"" + esc(s->version) + "\" src=\"data:image/png;base64," + s->png_b64 + "\"><script>" + kCanvasScript + "</script></body></html>";
     res.headers = {{"Content-Type", "text/html; charset=utf-8"},
                    {"Cache-Control", "no-store"},
                    {"X-Content-Type-Options", "nosniff"},
@@ -1820,7 +1843,7 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
   std::string body_cls = s->info.theme.empty() ? "" : " class=\"theme-" + esc(s->info.theme) + "\"";
   std::string page = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
                      esc(s->info.title.empty() ? host_.origin : s->info.title) + "</title><style>" + kStyle + custom_css + "</style></head><body" + body_cls + "><div id=\"app\" style=\"--w:" +
-                     std::to_string(width) + "px\" data-seq=\"" + std::to_string(s->seq) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\"" + theme_attr + ">" + s->last_html +
+                     std::to_string(width) + "px\" data-seq=\"" + std::to_string(s->seq) + "\" data-version=\"" + esc(s->version) + "\" data-refresh=\"" + std::to_string(s->info.refresh) + "\"" + theme_attr + ">" + s->last_html +
                      "</div><script>" + kScript + "</script></body></html>";
   res.headers = {{"Content-Type", "text/html; charset=utf-8"},
                  {"Cache-Control", "no-store"},
