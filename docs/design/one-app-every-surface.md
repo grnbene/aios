@@ -1,7 +1,9 @@
 # One app, every surface — design (stage 1 in progress)
 
-Status: proposal, 2026-10-27. Stage 1 is in (`grain/tests/web/markup_test.py`; the HTTP form; the warehouse page is next). An app declares what it is and what it shows once; the runtime puts it in a browser,
-a desktop window or a PDF. Today the same report is three programs' worth of plumbing.
+Status: proposal, 2026-10-27. Stage 1 is in: markup views (`grain/tests/web/markup_test.py`), a whole pane given to a
+fleet member (`ui.pane` `"machine"`, `scripts/pane-machine-check.sh`), and the warehouse page as a pane view.
+
+An app declares what it is and what it shows once; the runtime puts it in a browser, a desktop window or a PDF. Today the same report is three programs' worth of plumbing.
 
 ## Today
 

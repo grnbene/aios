@@ -126,6 +126,8 @@ class Host {
     // A stream (server-sent events) from such a route, carried as the member's route writes it.
     std::function<bool(const std::string& app, const std::string& member, const WebUi::Request& req,
                        StreamHeaderCallback on_headers, StreamChunkCallback on_chunk)> forward_stream;
+    // Whether a member id (or prefix) is this machine (a pane given to it is answered here). Unset: none is.
+    std::function<bool(const std::string& member)> is_here;
   };
   // What a forwarded request is answered with on the member it was given to: this host's own app `app`, asked over
   // its local port as a client would ask it. The caller's link carries the request in and the answer out.

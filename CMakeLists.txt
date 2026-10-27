@@ -946,6 +946,9 @@ add_test(NAME volume.check COMMAND aios-volume-check ${CMAKE_BINARY_DIR}/volume-
 # only where they can run. The drives above are host-neutral and run anywhere.
 if(NOT APPLE)
 add_test(NAME zero-host.gate COMMAND ${CMAKE_SOURCE_DIR}/scripts/zero-host-audit.sh --gate)
+# A ui.pane given to another fleet member (ui.pane "machine"), on a private hub and two app hosts on loopback.
+add_test(NAME apps.pane.machine COMMAND ${CMAKE_SOURCE_DIR}/scripts/pane-machine-check.sh $<TARGET_FILE:aios-cli>)
+set_tests_properties(apps.pane.machine PROPERTIES TIMEOUT 180)
 set_tests_properties(zero-host.gate PROPERTIES ENVIRONMENT "BUILD=${CMAKE_BINARY_DIR}")
 endif()
 if(NOT APPLE AND AIOS_METAL_TESTS)

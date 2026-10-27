@@ -799,6 +799,8 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
 
 // True for a pane made by serve_routes: it has routes and no page.
 bool web_pane_api_only(Vm& vm, uint64_t id);
+// The fleet member a ui.pane's "machine" gives the whole pane to ("" when it runs here).
+std::string web_pane_machine(Vm& vm, uint64_t id);
 
 // A call made in a worker VM: the function and what it reaches are copied (grain_std_parallel.cpp's
 // rules), after which run() needs nothing from the VM they came from, on any thread.

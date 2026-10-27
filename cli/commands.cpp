@@ -1176,7 +1176,7 @@ ByteBuffer encode_app_request(const std::string& app, const userland::grain::Web
   ByteBuffer b;
   Writer w(b);
   w.str(app); w.str(q.method); w.str(q.path); w.str(q.query); w.str(q.cookie);
-  w.u8((uint8_t)((q.xhr ? 1 : 0) | (q.https ? 2 : 0)));
+  w.u8((uint8_t)((q.xhr ? 1 : 0) | (q.https ? 2 : 0) | (q.tree ? 4 : 0) | (q.stream ? 8 : 0)));   // an older member reads bits 1, 2
   w.str(q.body); w.str(q.remote);
   w.u32((uint32_t)q.headers.size());
   for (const auto& h : q.headers) { w.str(h.first); w.str(h.second); }
@@ -1186,7 +1186,7 @@ bool decode_app_request(ByteSpan in, std::string& app, userland::grain::WebUi::R
   Reader r(in);
   app = r.str(); q.method = r.str(); q.path = r.str(); q.query = r.str(); q.cookie = r.str();
   const uint8_t f = r.u8();
-  q.xhr = (f & 1) != 0; q.https = (f & 2) != 0;
+  q.xhr = (f & 1) != 0; q.https = (f & 2) != 0; q.tree = (f & 4) != 0; q.stream = (f & 8) != 0;
   q.body = r.str(); q.remote = r.str();
   const uint32_t n = r.u32();
   for (uint32_t i = 0; i < n && r.ok(); ++i) { std::string k = r.str(); std::string v = r.str(); q.headers.push_back({k, v}); }
@@ -1386,6 +1386,8 @@ void cmd_serve(Ctx& c, const Args& a) {
     }
     return answer(502, "on " + member + ": the answer kept outgrowing its buffer");
   };
+  // A pane given to a member (ui.pane "machine") is answered here when that member is this machine.
+  host_opt.is_here = [&c](const std::string& member) { return !member.empty() && c.k.self().str().compare(0, member.size(), member) == 0; };
   // A route's stream (server-sent events) from a member: one AppStream on a link of its own, each piece of the
   // member's route written through as it comes. The member's app answers it (the stream runner below, there).
   host_opt.forward_stream = [&c, &reach_mu](const std::string& app, const std::string& member, const userland::grain::WebUi::Request& req,

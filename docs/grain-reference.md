@@ -460,34 +460,57 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 
 ## 13. Databases & ASQL
 
-### MySQL & MariaDB Client
-| Function | Signature | Description |
-|---|---|---|
-| `db_connect` | `db_connect(host, port, user, db, [opts])` | Connects to MySQL/MariaDB or ASQL server. Returns DB handle. |
-| `db_query` | `db_query(handle, sql, [params, [opts]])` | Executes query; returns list of row maps. |
-| `db_escape` | `db_escape(str)` | Escapes special characters for SQL literals. |
-| `db_quote` | `db_quote(str)` | Wraps string in single quotes with SQL escaping. |
-| `db_close` | `db_close(handle)` | Closes database connection. |
-| `db_transaction` | `db_transaction(conn, fn)` | Executes callback within a transaction (`START TRANSACTION` / `COMMIT`). Automatically rolls back on error (`ROLLBACK`). Supports nested calls via `SAVEPOINT`. |
-| `db_ping` | `db_ping(handle)` | Pings server to verify connection vitality. |
-| `db_connected` | `db_connected(handle)` | Returns `true` if connection handle remains open. |
-| `db_select_db` | `db_select_db(handle, db_name)` | Switches default database on the connection. |
-| `db_tables` | `db_tables(handle, [db_name])` | Returns list of table names in database. |
-| `db_columns` | `db_columns(handle, table)` | Returns column metadata for table. |
-| `db_schema` | `db_schema(handle)` | Introspects full schema of the database. |
-| `db_build_update` | `db_build_update(table, data_map, key_col, key_val)` | Constructs parameterized UPDATE statement and parameter values. |
-| `live` | `live(handle, query_or_thing, [callback])` | Subscribes to real-time binlog row mutations on ASQL. |
+Grain interacts with relational data and the ASQL engine through three distinct access mechanisms:
+1. **In-Process & Fleet Mesh Engine (`sql`, `sql_on`)**: Queries executed directly against the local kernel's `SqlDatabase` instance without TCP/socket overhead, or routed across the P2P fleet mesh (`src/userland/machine_sql.cpp`).
+2. **Wire Protocol Client (`db_*`, `live`)**: Full client speaking MySQL/MariaDB wire protocol to ASQL (e.g. port 3307), MariaDB, or MySQL (`src/userland/grain_std_db.cpp`, `src/userland/grain_aios.cpp`).
+3. **Loopback One-Shot Helpers (`asql_query`, `asql_exec`)**: Ad-hoc query/execution helpers connecting to loopback ASQL on `127.0.0.1:3307` (`src/userland/grain_aios.cpp`).
 
-### Embedded ASQL Engine
+### In-Process & Fleet Mesh SQL Engine
+*Defined in [`src/userland/machine_sql.cpp`](file:///repos/aios/src/userland/machine_sql.cpp#L333-L355) (installed via `install_sql_builtins`).*
+
 | Function | Signature | Description |
 |---|---|---|
-| `asql_query` | `asql_query(sql, [params, [options]])` | Executes query directly in the in-tree ASQL engine. |
-| `asql_exec` | `asql_exec(sql, [params, [options]])` | Executes non-query DDL/DML in the in-tree ASQL engine. |
-| `thing_conflicts` | `thing_conflicts(thing_name, [options])` | Inspects conflict records for an ASQL reactive Thing. |
-| `sql_tokenize` | `sql_tokenize(sql_str)` | Tokenizes SQL statement into lexical tokens. |
-| `sql_format` | `sql_format(sql_str)` | Formats and indents SQL query string. |
-| `sql_suggest` | `sql_suggest(sql, [cursor_pos, schema])` | Auto-complete suggestions for SQL keywords, tables, and columns. |
-| `sql_generate_ddl`| `sql_generate_ddl(table, cols)` | Generates CREATE TABLE DDL from column specifications. |
+| `sql` | `sql(statement)` | Executes directly in the machine's in-process `SqlDatabase` (`machine_sql.cpp:333`). Result sets return a list of row maps with typed numbers (`Int` -> integer, `Real`/`Decimal` -> real) and `NULL` -> `nil`. Non-queries return `{"affected": n}`. Throws a Grain runtime error on failure (catch with `pcall`). |
+| `sql_on` | `sql_on(peer_prefix, statement)` | Executes statement on remote fleet node identified by peer ID prefix (`machine_sql.cpp:342`). Returns the same list of maps or `{"affected": n}`. Remote writes require `fleet_sql_writes_allowed` on the target. Throws on failure. |
+
+### MySQL, MariaDB & ASQL Wire Client
+*Defined in [`src/userland/grain_std_db.cpp`](file:///repos/aios/src/userland/grain_std_db.cpp#L351-L711) (installed via `install_db_builtins`) and [`src/userland/grain_aios.cpp`](file:///repos/aios/src/userland/grain_aios.cpp#L333-L571) (`install_aios_builtins`).*
+
+| Function | Signature | Description |
+|---|---|---|
+| `db_connect` | `db_connect(host, port, user, password, [database])` | Connects via MySQL wire protocol (`grain_std_db.cpp:351`, `grain_aios.cpp:333`). Returns `{"ok": bool, "conn": <handle>, "server_version": str, "error": str}`. Either the returned map or the inner `conn` handle can be passed to subsequent `db_*` calls. |
+| `db_query` | `db_query(conn, sql, [params], [options])` | Executes query with optional `?` parameter binding list and options map (`grain_std_db.cpp:474`). Strings are escaped, `nil` binds as `NULL`, lists expand for `IN (?)`. Options: `{rows: bool, records: bool, decimals: bool}`. Returns `{"ok": bool, "columns": [...], "rows": [[...]], "records": [{...}], "affected_rows": int, "last_insert_id": int, "error": str}`. |
+| `db_transaction` | `db_transaction(conn, fn)` | Runs callback `fn(conn)` in a transaction (`grain_std_db.cpp:517`). Manages `START TRANSACTION`/`COMMIT` (or nested `SAVEPOINT grain_sp_<depth>`). Automatically rolls back on runtime error and re-raises. Returns callback result. |
+| `db_escape` | `db_escape(str)` | Escapes special characters (`\0`, `\n`, `\r`, `\\`, `'`, `"`, `\x1a`) for MySQL string literals (`grain_std_db.cpp:463`). |
+| `db_quote` | `db_quote(val)` | Formats value as a safe SQL literal (`grain_std_db.cpp:468`): numbers, `NULL` for `nil`, `'escaped'` for strings. |
+| `db_close` | `db_close(conn)` | Closes connection socket and frees session resources (`grain_std_db.cpp:512`, `grain_aios.cpp:441`). |
+| `db_ping` | `db_ping(conn)` | Pings server to verify connection vitality (`grain_aios.cpp:433`). Returns boolean. |
+| `db_connected` | `db_connected(conn)` | Checks if connection handle remains open and active (`grain_aios.cpp:448`). Returns boolean. |
+| `db_select_db` | `db_select_db(conn, db_name)` | Switches default database on the active connection (`grain_aios.cpp:425`). Returns boolean. |
+| `db_tables` | `db_tables(conn, [db_name])` | Returns list of table name strings in database (`grain_aios.cpp:454`). |
+| `db_columns` | `db_columns(conn, table)` | Returns list of column metadata maps (`name`, `type`, `null`, `key`, `default`, `extra`) for table (`grain_aios.cpp:478`). |
+| `db_schema` | `db_schema(conn)` | Introspects full schema of the database, returning `map[table_name] -> [column_maps]` (`grain_aios.cpp:502`). |
+| `db_build_update` | `db_build_update(table, data_map, key_col, key_val)` | Constructs parameterized UPDATE statement and parameter values map `{"sql": str, "params": [...]}` (`grain_aios.cpp:538`). |
+| `live` | `live(conn, query_or_tables, [callback])` | Subscribes to real-time mutations on ASQL via `SELECT ASQL_CHANGES(...)` timer polling (`grain_std_db.cpp:640`). Triggers callback or updates reactive view only when table tokens change. |
+
+### Loopback ASQL Wire Helpers & Reactive Data
+*Defined in [`src/userland/grain_aios.cpp`](file:///repos/aios/src/userland/grain_aios.cpp#L573-L714) (`install_aios_builtins`).*
+
+| Function | Signature | Description |
+|---|---|---|
+| `asql_query` | `asql_query(sql, [port=3307], [login])` | Convenience helper connecting to loopback `127.0.0.1:port` (`grain_aios.cpp:649`). Executes query and returns list of row maps `[{"col": val, ...}, ...]`. Returns `nil` on error. Optional login map: `{"user": "...", "password": "...", "database": "..."}`. |
+| `asql_exec` | `asql_exec(sql, [port=3307], [login])` | Convenience helper connecting to loopback `127.0.0.1:port` (`grain_aios.cpp:686`). Executes DDL/DML and returns `{"ok": bool, "affected_rows": int, "last_insert_id": int, "error": str}`. |
+| `thing_conflicts` | `thing_conflicts(thing_name, [key], [port], [opts])` | Inspects conflict records for an ASQL reactive Thing (`grain_aios.cpp:573`). |
+
+### SQL Tooling & Parsing Primitives
+*Defined in [`src/userland/grain_builtins.cpp`](file:///repos/aios/src/userland/grain_builtins.cpp#L6294-L6568) (installed in `install_core_builtins`).*
+
+| Function | Signature | Description |
+|---|---|---|
+| `sql_tokenize` | `sql_tokenize(sql_str)` | Lexes SQL statement into token maps `[{"type": str, "text": str}, ...]` (`grain_builtins.cpp:6294`). |
+| `sql_format` | `sql_format(sql_str)` | Formats and indents SQL query string (`grain_builtins.cpp:6318`). |
+| `sql_suggest` | `sql_suggest(sql, [cursor_pos, tables, columns])` | Returns autocomplete suggestions for keywords, tables, and columns (`grain_builtins.cpp:6499`). |
+| `sql_generate_ddl` | `sql_generate_ddl(table, cols)` | Generates `CREATE TABLE` DDL statement from column definition maps (`grain_builtins.cpp:6348`). |
 
 ---
 
@@ -647,6 +670,8 @@ actions, the pushed re-render and its in-place update all work as for widgets.
 - **State** such as a sort or a range lives in the program (one copy per viewer unless the pane is `"shared"`), so
   a re-render keeps it; markup pushed into an open page is merged in place, and a `<script>` inside it does not run.
 - **`css`** in the pane's options is added to the page.
+- **`machine`** in the pane's options gives the whole pane - page, actions, push and routes - to that fleet member's
+  copy of the app (`docs/aios-serve.md`); `""` or this machine: here.
 - A native client (`application/x-grain-ui+json`) gets markup as `{"widget": "html", "html": ...}`; a desktop
   face window shows its text for now (`docs/design/one-app-every-surface.md`, stage 4).
 

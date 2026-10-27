@@ -939,6 +939,7 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
       auto fwd = opt_.forward;
       wh.forward = [fwd, app](const std::string& member, const WebUi::Request& req, WebUi::Response& res) { return fwd(app, member, req, res); };
     }
+    wh.is_here = opt_.is_here;
     if (opt_.forward_stream) {
       auto fs = opt_.forward_stream;
       wh.forward_stream = [fs, app](const std::string& member, const WebUi::Request& req, StreamHeaderCallback h, StreamChunkCallback c) {
@@ -1316,6 +1317,19 @@ Result<void> Host::answer_forwarded_stream(const std::string& app, const WebUi::
   if (!in || !in->ui || in->state != (int)State::Running)
     return Result<void>(Status::NotFound, "app " + app + " is not running on " + opt_.machine);
   in->requests++;
+  // A pane given to this machine (ui.pane "machine"): its page's own push, frame by frame, as a browser here gets it.
+  if (req.stream && req.method == "GET") {
+    WebUi::Stream stream;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string frame, error;
+    if (in->ui->open_stream(req, stream, headers, frame, error)) {
+      bool alive = on_headers(200, headers) && on_chunk(frame);
+      while (alive && !in->stop->load() && in->ui->next_frame(stream, 15000, frame))
+        alive = on_chunk(frame.empty() ? std::string(": keepalive\n\n") : frame);
+      in->ui->close_stream(stream);
+      return Ok();
+    }
+  }
   bool sent = false;
   auto heads = [&](int status, const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
     if (sent) return true;
