@@ -44,9 +44,14 @@ fn get_db() {
 }
 
 fn parse_date_params(req) {
-  let q = req.query != nil ? req.query : {}
-  let now_ts = time_us() / 1000000
-  let today_str = slice(str(now()), 0, 10)
+  let q = {}
+  if req.query_params != nil and type(req.query_params) == "map" {
+    q = req.query_params
+  } else if req.query != nil and type(req.query) == "map" {
+    q = req.query
+  }
+  let today_str = date_format(now(), "%Y-%m-%d")
+  let thirty_days_ago = date_format(now() - 30 * 86400, "%Y-%m-%d")
 
   if q.range != nil and contains(str(q.range), "..") {
     let rparts = split(str(q.range), "..")
@@ -56,12 +61,7 @@ fn parse_date_params(req) {
   }
 
   let stop_date = q.stop != nil and q.stop != "" ? q.stop : today_str
-  let start_date = q.start != nil and q.start != "" ? q.start : ""
-
-  if start_date == "" {
-    // Default: 30 days window
-    start_date = stop_date
-  }
+  let start_date = q.start != nil and q.start != "" ? q.start : thirty_days_ago
   return {"start": start_date, "stop": stop_date, "userid": q.userid}
 }
 
@@ -145,6 +145,11 @@ fn handle_quickreportcsv(req) {
 
 // ---- UI Pane & HTTP Routes ---------------------------------------------------
 
+// WAREHOUSE_COMPUTE_ON: the fleet member (its id, or a prefix) whose copy of this app answers the reports - the
+// request crosses the substrate to that member, its copy reads its own ASQL, and the answer comes back here.
+// Empty, or this machine: answered here, from DB_HOST.
+let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
+
 ui.pane({
   "title": "Warehouse Touches",
   "width": 1000,
@@ -152,12 +157,12 @@ ui.pane({
   "shared": true,
   "workers": true,
   "routes": {
-    "/": handle_quickreportview,
+    "/": on_machine(COMPUTE_ON, handle_quickreportview),
     "/health": handle_health,
-    "/quickreport": handle_quickreport,
-    "/quickreportview": handle_quickreportview,
-    "/quickreportpdf": handle_quickreportpdf,
-    "/quickreportxlsx": handle_quickreportxlsx,
-    "/quickreportcsv": handle_quickreportcsv
+    "/quickreport": on_machine(COMPUTE_ON, handle_quickreport),
+    "/quickreportview": on_machine(COMPUTE_ON, handle_quickreportview),
+    "/quickreportpdf": on_machine(COMPUTE_ON, handle_quickreportpdf),
+    "/quickreportxlsx": on_machine(COMPUTE_ON, handle_quickreportxlsx),
+    "/quickreportcsv": on_machine(COMPUTE_ON, handle_quickreportcsv)
   }
 })

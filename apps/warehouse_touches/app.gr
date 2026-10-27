@@ -12,11 +12,11 @@ let app = {
     "DB_HOST": "127.0.0.1",
     "DB_PORT": "3307",
     "DB_USER": "root",
-    "DB_NAME": "versioneight"
+    "DB_NAME": "versioneight",
+    "WAREHOUSE_COMPUTE_ON": ""
   },
   "secrets": ["DB_PASSWORD"],
   "requires": ["db"],
   "health": {"path": "/health", "ok": [200]},
-  "check": "checks.gr",
   "max_steps": 0
 }
