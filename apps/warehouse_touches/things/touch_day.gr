@@ -5,7 +5,8 @@
 // (lib/queries.gr merges them). A scan, pick, move, load or sticker row that changes names the day(s) it falls on in
 // touched(), and the engine rebuilds only those days; the report reads them with SHOW THING touch_day KEYS (...).
 //
-// It counts exactly what lib/queries.gr's SQL report counts, row for row: same tables, filters and joins.
+// It counts what the PHP report counts (catalog/controller/apir/warehouse/touches.php, quickReportData), row for row:
+// the same tables, filters and joins, split by day.
 
 let DAY_SAFE = true   // a day's answer depends on that day's rows only, never on the clock
 
@@ -79,7 +80,7 @@ fn things(ks, sh) {
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
-           "packed": {"n": 0, "units": 0.0}, "staged": {"n": 0, "units": 0.0}}
+           "packed": {}, "staged": {}, "binds": [], "dname": nil}
       out_days[day][key] = u
     }
     return u
@@ -175,16 +176,18 @@ fn things(ks, sh) {
       let rk = id + "@" + day
       if runs[rk] == nil {
         runs[rk] = {"id": id, "day": day, "disp": int(r.dispnumber), "truck": int(r.truckid),
-                    "manual": 0, "forced": false, "assigned": nil, "started": nil, "stopped": nil}
+                    "manual": 0, "forced": false, "untimed": false, "assigned": nil, "started": nil, "stopped": nil}
       }
       let run = runs[rk]
       run.manual = run.manual + ival(r.manual_pick)
+      run.untimed = run.untimed or ival(r.untimed) == 1
       run.forced = run.forced or ival(r.force_complete) == 1
       if not blank(r.timeassigned) and (run.assigned == nil or str(r.timeassigned) < run.assigned) { run.assigned = str(r.timeassigned) }
       if not blank(r.timestarted) and (run.started == nil or str(r.timestarted) < run.started) { run.started = str(r.timestarted) }
       if not blank(r.timestopped) and (run.stopped == nil or str(r.timestopped) > run.stopped) { run.stopped = str(r.timestopped) }
     }
   }
+  let day_runs = {}   // day -> the runs that fall on it (their trucks are the range's truck list)
   if len(keys(runs)) > 0 {
     let disps = []
     let trucks = []
@@ -205,76 +208,104 @@ fn things(ks, sh) {
     }
     let mapped = fn(driver) {
       let m = sh.drivers[lower(trim(driver))]
-      return m == nil ? driver : m
+      return m == nil ? trim(driver) : m
+    }
+    // a driver www_users does not know is shown by the name on the dispatch (as the PHP report does)
+    let driver_user = fn(day, driver) {
+      let u = user(day, mapped(driver))
+      if u != nil and sh.drivers[lower(trim(driver))] == nil { u.dname = trim(driver) }
+      return u
     }
     for rk in keys(runs) {
       let run = runs[rk]
       let ds = drivers[run.id]
       if ds != nil {
         for driver in unique(ds) {
-          let u = user(run.day, mapped(driver))
+          let u = driver_user(run.day, driver)
           if u != nil {
             let mine = u.runs[run.id]
             if mine == nil {
-              mine = {"k": 0, "manual": run.manual, "forced": run.forced, "assigned": run.assigned, "started": run.started, "stopped": run.stopped}
+              mine = {"k": 0, "manual": run.manual, "forced": run.forced, "untimed": run.untimed, "assigned": run.assigned, "started": run.started, "stopped": run.stopped}
               u.runs[run.id] = mine
             }
-            mine.k = mine.k + 1   // one count per name on the dispatch, as the SQL report counts it
+            mine.k = mine.k + 1   // one count per name on the dispatch, as the PHP report counts it
           }
         }
       }
     }
-    // Units loaded on each run, by the name on its dispatch row (and the orders they were for)
-    let per_run = {}
+    // Units loaded, by the name on the dispatch row and the orders they were for. The PHP report takes the dispatch
+    // rows whose number is a run's and whose truck is any run's in the range (two IN lists, not pairs), so a
+    // dispatch whose rows are on another truck than its loading bay row counts when that truck also ran. Every
+    // dispatch row of a run's number is kept here, by its own number and truck; the report applies the range's trucks.
+    let per_disp = {}   // dispnumber -> "disp-truck" -> name -> {units, orders}
     for r in read_raw("SELECT d.dispnumber, d.truckid, d.driveruserid AS driver, pf.orderno, SUM(pf.loaded) AS units" + PICKED +
                       "INNER JOIN dispatch d ON d.invoice = pf.orderno " +
-                      "WHERE pf.loaded > 0 AND d.dispnumber IN (?) AND d.truckid IN (?) " + MERCH +
-                      " GROUP BY d.dispnumber, d.truckid, d.driveruserid, pf.orderno", disps, trucks) {
-      let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
-      if is_run[id] and r.driver != nil {
-        if per_run[id] == nil { per_run[id] = {} }
-        let dv = str(r.driver)
-        if per_run[id][dv] == nil { per_run[id][dv] = {"units": 0.0, "orders": []} }
-        per_run[id][dv].units = per_run[id][dv].units + num(r.units)
-        if r.orderno != nil { push(per_run[id][dv].orders, str(r.orderno)) }
-      }
+                      "WHERE pf.loaded > 0 AND d.dispnumber IN (?) AND d.driveruserid IS NOT NULL AND d.driveruserid <> '' " + MERCH +
+                      " GROUP BY d.dispnumber, d.truckid, d.driveruserid, pf.orderno", disps) {
+      let dn = str(int(r.dispnumber))
+      let id = dn + "-" + str(int(r.truckid))
+      let dv = str(r.driver)
+      if per_disp[dn] == nil { per_disp[dn] = {} }
+      if per_disp[dn][id] == nil { per_disp[dn][id] = {} }
+      if per_disp[dn][id][dv] == nil { per_disp[dn][id][dv] = {"units": 0.0, "orders": []} }
+      per_disp[dn][id][dv].units = per_disp[dn][id][dv].units + num(r.units)
+      if r.orderno != nil { push(per_disp[dn][id][dv].orders, str(r.orderno)) }
     }
     for rk in keys(runs) {
       let run = runs[rk]
-      let by_driver = per_run[run.id]
-      if by_driver != nil {
-        for dv in keys(by_driver) {
-          let u = user(run.day, mapped(dv))
-          if u != nil {
-            if u.units[run.id] == nil { u.units[run.id] = {} }
-            u.units[run.id][dv] = by_driver[dv]
+      if day_runs[run.day] == nil { day_runs[run.day] = [] }
+      push(day_runs[run.day], run.id)
+      let rows_of = per_disp[str(run.disp)]
+      if rows_of != nil {
+        for id in keys(rows_of) {
+          for dv in keys(rows_of[id]) {
+            let u = driver_user(run.day, dv)
+            if u != nil {
+              if u.units[id] == nil { u.units[id] = {} }
+              u.units[id][dv] = rows_of[id][dv]
+            }
           }
         }
       }
     }
   }
 
-  // 5. Sticker scan out: packed and staged
+  // 5. Sticker scan out. One row per order and user (statusid 99 is a hidden trail); units are every tire line on the
+  // order (salesorderdetails), stickerscanout.quantity only for an order with none. A packed order with a trackinginfo
+  // bind is a bind, credited to whoever packed it. Each order is kept by number, so a range counts it once.
   for side in [["packed", "packeduserid", "packedtime"], ["staged", "stageduserid", "stagedtime"]] {
     let who = side[1]
     let at = side[2]
-    for r in read_raw("SELECT " + who + " AS userid, DATE(" + at + ") AS day, COUNT(*) AS orders, " +
-                      "SUM(CAST(quantity AS DECIMAL(12,2))) AS units, MIN(" + at + ") AS first_touch, MAX(" + at + ") AS last_touch " +
-                      "FROM stickerscanout WHERE statusid <> '99' AND " + at + " >= ? AND " + at + " <= ? " +
-                      "AND " + who + " IS NOT NULL AND " + who + " <> '' GROUP BY " + who + ", DATE(" + at + ")", a, b) {
+    let where = "statusid <> '99' AND " + at + " >= ? AND " + at + " <= ? AND " + who + " IS NOT NULL AND " + who + " <> ''"
+    let tire = {}
+    for r in read_raw("SELECT sod.orderno, SUM(sod.quantity) AS units FROM salesorderdetails sod " +
+                      "INNER JOIN stockmaster sm ON sm.stockid = sod.stkcode AND sm.categoryid = 'TIRE' " +
+                      "WHERE sod.orderno IN (SELECT orderno FROM stickerscanout WHERE " + where + ") GROUP BY sod.orderno", a, b) {
+      tire[str(r.orderno)] = num(r.units)
+    }
+    for r in read_raw("SELECT orderno, " + who + " AS userid, DATE(" + at + ") AS day, MAX(CAST(quantity AS DECIMAL(12,2))) AS fallback, " +
+                      "MIN(" + at + ") AS first_touch, MAX(" + at + ") AS last_touch FROM stickerscanout WHERE " + where +
+                      " GROUP BY orderno, " + who + ", DATE(" + at + ")", a, b) {
       let u = user(day_of(r.day), r.userid)
       if u != nil {
         u.active = true
-        u[side[0]].n = u[side[0]].n + int(r.orders)
-        u[side[0]].units = u[side[0]].units + num(r.units)
+        let o = str(r.orderno)
+        u[side[0]][o] = {"t": has(tire, o) ? tire[o] : nil, "f": num(r.fallback)}
         stamp(u, r.first_touch, r.last_touch)
       }
     }
   }
+  for r in read_raw("SELECT DISTINCT p.orderno, p.packeduserid AS userid, DATE(p.packedtime) AS day FROM stickerscanout p " +
+                    "INNER JOIN trackinginfo ti ON ti.transno = p.orderno AND ti.bind = 1 " +
+                    "WHERE p.statusid <> '99' AND p.packedtime >= ? AND p.packedtime <= ? AND p.packeduserid IS NOT NULL AND p.packeduserid <> ''", a, b) {
+    let u = user(day_of(r.day), r.userid)
+    if u != nil { push(u.binds, str(r.orderno)) }
+  }
 
   let out = {}
-  for day in keys(out_days) {
-    out[day] = {"users": json_stringify(out_days[day]), "people": len(keys(out_days[day]))}
+  for day in unique(concat(keys(out_days), keys(day_runs))) {
+    let us = out_days[day] == nil ? {} : out_days[day]
+    out[day] = {"users": json_stringify(us), "people": len(keys(us)), "runs": json_stringify(day_runs[day] == nil ? [] : day_runs[day])}
   }
   return out
 }
@@ -294,9 +325,17 @@ fn row_days(t, row) {
 // The days of the runs a dispatch row, or the order a picking line is on, belongs to.
 fn run_days(disp, truck) {
   let ds = []
-  for r in read_raw("SELECT timestopped, timeassigned FROM loadingbays WHERE dispnumber = ? AND truckid = ?", disp, truck) {
+  for r in read_raw("SELECT timestopped, timeassigned FROM loadingbays WHERE dispnumber = ?", disp) {
     push(ds, day_of(r.timestopped))
     push(ds, day_of(r.timeassigned))
+  }
+  return ds
+}
+fn sticker_days(orderno) {
+  let ds = []
+  for r in read_raw("SELECT packedtime, stagedtime FROM stickerscanout WHERE orderno = ?", orderno) {
+    push(ds, day_of(r.packedtime))
+    push(ds, day_of(r.stagedtime))
   }
   return ds
 }
@@ -327,6 +366,10 @@ fn touched(table, op, before, after, sh) {
     if t == "pickingfreeze" {
       push(ds, day_of(row.date_pickupdate))
       if row.orderno != nil { for d in order_run_days(row.orderno) { push(ds, d) } }
+    } else if t == "salesorderdetails" {
+      if row.orderno != nil { for d in sticker_days(row.orderno) { push(ds, d) } }
+    } else if t == "trackinginfo" {
+      if row.transno != nil { for d in sticker_days(row.transno) { push(ds, d) } }
     } else if t == "dispatch" {
       if row.dispnumber != nil and row.truckid != nil { for d in run_days(row.dispnumber, row.truckid) { push(ds, d) } }
     } else {
