@@ -4,6 +4,7 @@
 #include "shell.hpp"
 #include "../src/node/protocol.hpp"
 #include "aios/userland/crash_log.hpp"
+#include "aios/userland/runtime_registry.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/crypto/sha256.hpp"
 #include "aios/crypto/curve25519.hpp"
@@ -1502,6 +1503,7 @@ void cmd_serve(Ctx& c, const Args& a) {
     });
   else if (c.k.relay()) c.k.relay()->set_command_runner(runner);
   // (straight out: this command does not return, and what it says belongs in the service's log now)
+  userland::runtime::announce("app host", "aios serve", home);   // grain ps (the Host keeps its apps in the record)
   std::cout << "serve: " << store->apps().size() << " app(s) in " << home << "; control on " << (all_ips ? "all IPs" : "127.0.0.1") << " port " << bound
             << (c.k.in_fleet() ? "; fleet members reach it as `app ... on " + c.k.self().short_str() + "`" : std::string()) << "\n" << std::flush;
   g_serve_stop.store(false);
@@ -3252,6 +3254,36 @@ void cmd_compute(Ctx& c, const Args& a) {
         c.o << "compute mysql wire server: answering queries\n";
       }
       sql_db->set_startup_phase("ready");
+      // grain ps: this engine, its ports and its Things (runtime_registry.hpp)
+      userland::runtime::announce("asql", "compute serve sql=1", c.k.config().root);
+      if (mysql_wire_up) userland::runtime::add_port(mysql_port, "mysql");
+      userland::runtime::add_port(o.port, "rpc");
+      userland::SqlDatabase* things_db = sql_db.get();
+      userland::runtime::keep_current("things", [things_db] {
+        auto r = things_db->execute_gateway_query("SHOW THINGS");
+        if (!r.success) return std::string("[]");
+        auto js = [](const std::string& s) {
+          std::string q = "\"";
+          for (unsigned char ch : s) {
+            if (ch == '"' || ch == '\\') { q += '\\'; q += (char)ch; }
+            else if (ch >= 0x20) q += (char)ch;
+          }
+          return q + "\"";
+        };
+        static const char* keep[] = {"thing", "things", "version", "reactions", "full_recomputes", "state", "declared"};
+        std::string out = "[";
+        for (size_t i = 0; i < r.rows.size(); ++i) {
+          out += i ? ",{" : "{";
+          bool first = true;
+          for (size_t k = 0; k < r.columns.size() && k < r.rows[i].values.size(); ++k) {
+            if (std::find(std::begin(keep), std::end(keep), r.columns[k]) == std::end(keep)) continue;
+            out += (first ? "" : ",") + js(r.columns[k]) + ":" + js(r.rows[i].values[k]);
+            first = false;
+          }
+          out += "}";
+        }
+        return out + "]";
+      }, 5);
     }
     // The rpc "sql" op (see compute_serve's is_read_only_sql) is hardcoded
     // read-only and always will be; the mysql wire server started just above,
@@ -3279,7 +3311,9 @@ void cmd_compute(Ctx& c, const Args& a) {
     std::signal(SIGTERM, compute_stop_signal);
     std::signal(SIGINT, compute_stop_signal);
     need(channel::compute_serve(c.k, w, o, log, &g_compute_stop, sql_db.get()));
+    userland::runtime::stop_keeping("things");   // the engine is about to go
     if (sql_db && g_compute_stop.load()) {
+      userland::runtime::withdraw();   // _Exit below runs no exit handlers
       const uint64_t t0 = c.k.host().monotonic_ns();
       auto flushed = sql_db->flush_for_exit();
       c.o << "compute sql: " << (flushed.ok() ? "store written" : "store NOT written (" + flushed.error().message + ")") << " in "

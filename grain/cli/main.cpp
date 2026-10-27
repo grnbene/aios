@@ -32,6 +32,7 @@
 #endif
 
 #include "aios/userland/grain.hpp"
+#include "aios/userland/runtime_registry.hpp"
 #include "bundle.hpp"
 #include "tools.hpp"
 #include "grain_net.hpp"
@@ -73,6 +74,7 @@ void usage(std::ostream& o) {
     << "  grain eval <source...>            run one line and print its value\n"
     << "  grain repl                        read and run lines until EOF or .quit\n"
     << "  grain serve <file.gr> [--port N] [--max-body 10m]  the program's ui.pane in a browser, not a window\n"
+    << "  grain ps [--json]                 the grain programs, app hosts and ASQL engines running here\n"
     << "  grain open <url>                  a ui.pane program running on a server, in a native window (no HTML)\n"
     << "  grain check <file.gr>...          compile only and report every error\n"
     << "  grain dis <file.gr>               show the bytecode the compiler emitted\n"
@@ -342,8 +344,13 @@ int main(int argc, char** argv) {
   if (sub == "help" || sub == "-h") { usage(std::cout); return kExitOk; }
   if (sub == "version") { std::cout << "grain " GRAIN_VERSION "\n"; return kExitOk; }
   if (sub == "repl") return repl(opt);
+  if (sub == "ps") {   // grain ps [--json]: the grain runtimes on this machine (runtime_registry.hpp)
+    std::cout << aios::userland::runtime::ps_text(!rest.empty() && rest[0] == "--json");
+    return kExitOk;
+  }
   if (sub == "run") {
     if (rest.empty()) { std::cerr << "grain run <file.gr> [args...]\n"; return kExitUsage; }
+    aios::userland::runtime::announce("grain run", rest[0]);
     return run_file(opt, rest[0], std::vector<std::string>(rest.begin() + 1, rest.end()));
   }
   if (sub == "eval") {
@@ -366,6 +373,7 @@ int main(int argc, char** argv) {
   if (sub == "serve") {   // grain serve app.gr [--port N] [--host H]: the program's ui.pane in a browser
     if (rest.empty()) { std::cerr << "grain: serve wants a program\n"; return kExitUsage; }
     const std::string path = rest[0];
+    aios::userland::runtime::announce("grain serve", path);
     return serve_program(path,
         [path](std::string& source, std::string& version, std::string& error) {
           if (!read_source(path, source)) { error = "cannot read " + path; return false; }
@@ -397,7 +405,10 @@ int main(int argc, char** argv) {
     return disassemble(rest[0]);
   }
   // `grain prog.gr args...`: a file is run, the way an interpreter is used from a shebang line.
-  if (sub.size() > 3 && sub.compare(sub.size() - 3, 3, ".gr") == 0) return run_file(opt, sub, rest);
+  if (sub.size() > 3 && sub.compare(sub.size() - 3, 3, ".gr") == 0) {
+    aios::userland::runtime::announce("grain run", sub);
+    return run_file(opt, sub, rest);
+  }
   std::cerr << "grain: unknown command " << sub << "\n";
   usage(std::cerr);
   return kExitUsage;

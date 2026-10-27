@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "aios/userland/runtime_registry.hpp"
 #include "aios/core/base64.hpp"
 #include "aios/core/json.hpp"
 #include "aios/hal/host.hpp"
@@ -245,6 +246,7 @@ int host_command(const std::vector<std::string>& args) {
     return kOk;
   }
   if (!p.words.empty()) { host_usage(std::cerr); return kUsage; }
+  aios::userland::runtime::announce("app host", "grain host", p.home);
   return run_host(h, p);
 }
 
