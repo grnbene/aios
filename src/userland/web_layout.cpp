@@ -3989,13 +3989,36 @@ struct Engine {
       int v = std::atoi(c.attr("colspan").c_str());
       return v > 1 ? v : 1;
     };
+    auto cell_rows = [](const Node& c) -> int {
+      if (!c.has_attr("rowspan")) return 1;
+      int v = std::atoi(c.attr("rowspan").c_str());
+      return v > 1 ? (v > 1024 ? 1024 : v) : 1;
+    };
 
+    // Where every cell sits: a cell with rowspan holds its columns in the rows below it, so the cells of those rows
+    // start after it. Without this a two-row heading put the second row's first cell under the spanning one, and
+    // every heading after it one column to the left of its data.
+    struct Placed { Node* cell; size_t col; int span; int rows; };
+    std::vector<std::vector<Placed>> placed(rows.size());
     size_t cols = 1;
-    for (Node* r : rows) {
-      size_t n = 0;
-      for (auto& c : r->children)
-        if (c->kind == Node::Kind::Element && (c->tag == "td" || c->tag == "th")) n += cell_span(*c);
-      if (n > cols) cols = n;
+    {
+      std::vector<int> held;   // per column: rows still held by a rowspan above
+      for (size_t ri = 0; ri < rows.size(); ++ri) {
+        size_t col = 0;
+        for (auto& c : rows[ri]->children) {
+          if (c->kind != Node::Kind::Element || (c->tag != "td" && c->tag != "th")) continue;
+          while (col < held.size() && held[col] > 0) ++col;
+          const int span = cell_span(*c), down = cell_rows(*c);
+          if (col + (size_t)span > 128) break;
+          placed[ri].push_back({c.get(), col, span, down});
+          if (held.size() < col + (size_t)span) held.resize(col + (size_t)span, 0);
+          for (int k = 0; k < span; ++k) held[col + (size_t)k] = down;
+          col += (size_t)span;
+        }
+        if (held.size() > cols) cols = held.size();
+        if (col > cols) cols = col;
+        for (int& h : held) if (h > 0) --h;
+      }
     }
     if (cols > 128) cols = 128;
 
@@ -4013,14 +4036,14 @@ struct Engine {
     };
     std::vector<SpanningCell> spanning;
 
-    for (Node* r : rows) {
+    for (size_t ri = 0; ri < rows.size(); ++ri) {
+      Node* r = rows[ri];
       Style rs = compute_style(*r, style, ua, author, viewport_w);
-      size_t col = 0;
-      for (auto& c : r->children) {
-        if (c->kind != Node::Kind::Element) continue;
-        if (c->tag != "td" && c->tag != "th") continue;
+      for (const Placed& pc : placed[ri]) {
+        Node* c = pc.cell;
+        const size_t col = pc.col;
         if (col >= cols) break;
-        int span = cell_span(*c);
+        int span = pc.span;
         if (col + span > cols) span = (int)(cols - col);
         Style cellst = compute_style(*c, rs, ua, author, viewport_w);
         // What the cell's CONTENT is worth, through the same intrinsic sizing
@@ -4058,7 +4081,6 @@ struct Engine {
         } else {
           spanning.push_back({col, span, whole, longest, want_px});
         }
-        col += span;
       }
     }
 
@@ -4216,35 +4238,46 @@ struct Engine {
     for (size_t i = 0; i < cols; ++i)
       if (col_w[i] < 20) col_w[i] = 20;
 
+    // A cell spanning rows: its background and border, stretched over every row it covers once the last is laid out.
+    struct Tall { std::vector<size_t> slots; int rows_left = 0; int top = 0; };
+    std::vector<Tall> tall;
     int cursor = y;
-    for (Node* r : rows) {
+    for (size_t ri = 0; ri < rows.size(); ++ri) {
+      Node* r = rows[ri];
       Style rs = compute_style(*r, style, ua, author, viewport_w);
       if (rs.display == Display::None) continue;
-      int cell_x = x;
       int row_h = !rs.height.is_auto() ? len_px(rs.height, viewport_h, 0) : 0;
-      size_t col = 0;
       // Two passes over the row: lay the cells out to find the tallest, then
       // stretch every cell's background and border to that height so the row
       // reads as a row.
       std::vector<size_t> bg_slots;
       std::vector<size_t> border_slots;
-      for (auto& c : r->children) {
-        if (c->kind != Node::Kind::Element) continue;
-        if (c->tag != "td" && c->tag != "th") continue;
+      for (const Placed& pc : placed[ri]) {
+        Node* c = pc.cell;
+        const size_t col = pc.col;
         if (col >= cols) break;
-        int span = cell_span(*c);
+        int span = pc.span;
         if (col + span > cols) span = (int)(cols - col);
+        int cell_x = x;
+        for (size_t s = 0; s < col; ++s) cell_x += col_w[s];
         int cell_w = 0;
         for (size_t s = 0; s < (size_t)span; ++s) cell_w += col_w[col + s];
 
         Style cellst = compute_style(*c, rs, ua, author, viewport_w);
-        if (cellst.display == Display::None) {
-          cell_x += cell_w;
-          col += span;
-          continue;
-        }
+        if (cellst.display == Display::None) continue;
         size_t before = doc.fragments.size();
         int h = layout_box(*c, cellst, cell_x, cursor, cell_w, depth + 1);
+        if (pc.rows > 1) {   // its height is the rows it spans, not this one's alone
+          Tall t;
+          t.rows_left = pc.rows;
+          t.top = cursor;
+          for (size_t k = before; k < doc.fragments.size() && k < before + 2; ++k) {
+            if (doc.fragments[k].node != c) break;
+            if (doc.fragments[k].kind == Fragment::Kind::Rect || doc.fragments[k].kind == Fragment::Kind::Border) t.slots.push_back(k);
+          }
+          tall.push_back(std::move(t));
+          continue;
+        }
         // The cell's OWN background and border, to be stretched to the row. It
         // used to take "the first two fragments the cell made" on faith, and a
         // cell with no background of its own -- which is every cell in every
@@ -4256,18 +4289,24 @@ struct Engine {
         //
         // A fragment knows which element it came from, so ask.
         for (size_t k = before; k < doc.fragments.size() && k < before + 2; ++k) {
-          if (doc.fragments[k].node != c.get()) break;
+          if (doc.fragments[k].node != c) break;
           if (doc.fragments[k].kind == Fragment::Kind::Rect) bg_slots.push_back(k);
           if (doc.fragments[k].kind == Fragment::Kind::Border) border_slots.push_back(k);
         }
         if (h > row_h) row_h = h;
-        cell_x += cell_w;
-        col += span;
       }
       for (size_t k : bg_slots) doc.fragments[k].h = row_h;
       for (size_t k : border_slots) doc.fragments[k].h = row_h;
       cursor += row_h;
+      for (auto& t : tall) {
+        if (t.rows_left <= 0) continue;
+        if (--t.rows_left == 0)
+          for (size_t k : t.slots) doc.fragments[k].h = cursor - t.top;
+      }
     }
+    for (auto& t : tall)   // a rowspan past the last row ends with the table
+      if (t.rows_left > 0)
+        for (size_t k : t.slots) doc.fragments[k].h = cursor - t.top;
     return cursor - y;
   }
 };
