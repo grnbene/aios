@@ -1,47 +1,59 @@
-// touch_day - an ASQL Thing: one warehouse day's touches, per user, kept current by the engine.
+// touch_hour - an ASQL Thing: one warehouse hour's touches, per user, kept current by the engine.
 //
-// Key: the day ("YYYY-MM-DD"). Value: `users`, a JSON map of lower(userid) to that user's raw figures for the day -
-// sums, and the distinct sets (items, vendors, orders, moves) a report over several days has to union rather than add
-// (lib/queries.gr merges them). A scan, pick, move, load or sticker row that changes names the day(s) it falls on in
-// touched(), and the engine rebuilds only those days; the report reads them with SHOW THING touch_day KEYS (...).
+// Key: the hour ("YYYY-MM-DD HH", 24 to a day). Value: `users`, a JSON map of lower(userid) to that user's raw figures
+// for the hour - sums, and the distinct sets (items, vendors, orders, moves, pickup orders) a report over several
+// hours has to union rather than add (lib/queries.gr merges them). A row that changes names the hour(s) it falls on in
+// touched(), and the engine rebuilds only those; a report reads the hours of its range - every hour, or the one hour
+// the page asks for (hour_wanted) - with thing_rows(db, "touch_hour", [...]).
 //
 // It counts what the PHP report counts (catalog/controller/apir/warehouse/touches.php, quickReportData), row for row:
-// the same tables, filters and joins, split by day.
+// the same tables, filters and joins, split by the hour of each source's own time (as its hour_wanted filter is).
 
-let DAY_SAFE = true   // a day's answer depends on that day's rows only, never on the clock
+let DAY_SAFE = true   // an hour's answer depends on that hour's rows only, never on the clock
 
 let MERCH = " AND ((sm.categoryid = 'TIRE' OR pf.stockid = 'FET') OR (sm.categoryid IN ('O','OT')) OR " +
             "(sm.categoryid NOT IN ('TIRE','O','F','E','X','L') AND pf.stockid NOT IN ('LAB-STORAGE','LAB-T11','LAB-T26')))"
 let PICKED = " FROM pickingfreeze pf INNER JOIN stockmaster sm ON sm.stockid = pf.stockid " +
              "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 "
 
-fn day_of(t) {
-  if t == nil { return nil }
+// "2026-10-27 08:20:11" -> "2026-10-27 08"; a date alone is its 00 hour
+fn hour_of(t) {
+  if is_blank(t) { return nil }
   let s = str(t)
   if len(s) < 10 or s < "1970" { return nil }
-  return slice(s, 0, 10)
+  return len(s) >= 13 ? slice(s, 0, 13) : slice(s, 0, 10) + " 00"
+}
+// An invoice's hour: its trandate's day (as the PHP report dates it) and its inputdate's hour (trandate holds the
+// date only; inputdate is when it was put in).
+fn invoice_hour(trandate, inputdate) {
+  let d = hour_of(trandate)
+  let h = hour_of(inputdate)
+  if d == nil { return nil }
+  return slice(d, 0, 10) + (h == nil ? " 00" : slice(h, 10, 13))
 }
 fn num(v) { return v == nil ? 0.0 : real(v) }
 fn ival(v) { return v == nil or str(v) == "" ? 0 : int(v) }
 
-// Every day any of the tables has a touch on.
+// Every hour any of the tables has a touch in.
 fn enroll() {
-  let days = {}
+  let hours = {}
   for sql in [
-    "SELECT DISTINCT DATE(date_rec) AS d FROM recscan WHERE date_rec IS NOT NULL",
-    "SELECT DISTINCT DATE(date_pickupdate) AS d FROM pickingfreeze WHERE date_pickupdate IS NOT NULL",
-    "SELECT DISTINCT DATE(date_created) AS d FROM binmovements_details WHERE date_created IS NOT NULL",
-    "SELECT DISTINCT DATE(packedtime) AS d FROM stickerscanout WHERE packedtime IS NOT NULL",
-    "SELECT DISTINCT DATE(stagedtime) AS d FROM stickerscanout WHERE stagedtime IS NOT NULL",
-    "SELECT DISTINCT DATE(timestopped) AS d FROM loadingbays WHERE timestopped IS NOT NULL",
-    "SELECT DISTINCT DATE(timeassigned) AS d FROM loadingbays WHERE timeassigned IS NOT NULL"
+    "SELECT DISTINCT DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS d FROM recscan WHERE date_rec IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(date_pickupdate, '%Y-%m-%d %H') AS d FROM pickingfreeze WHERE date_pickupdate IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(date_created, '%Y-%m-%d %H') AS d FROM binmovements_details WHERE date_created IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(packedtime, '%Y-%m-%d %H') AS d FROM stickerscanout WHERE packedtime IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(stagedtime, '%Y-%m-%d %H') AS d FROM stickerscanout WHERE stagedtime IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(timestopped, '%Y-%m-%d %H') AS d FROM loadingbays WHERE timestopped IS NOT NULL",
+    "SELECT DISTINCT DATE_FORMAT(timeassigned, '%Y-%m-%d %H') AS d FROM loadingbays WHERE timeassigned IS NOT NULL",
+    "SELECT DISTINCT CONCAT(DATE(dt.trandate), ' ', DATE_FORMAT(dt.inputdate, '%H')) AS d FROM debtortrans dt INNER JOIN salesorders so ON so.orderno = dt.order_ " +
+      "WHERE dt.type = 10 AND so.shipvia = 2 AND dt.trandate IS NOT NULL"
   ] {
     for r in read_raw(sql) {
-      let d = day_of(r.d)
-      if d != nil { days[d] = true }
+      let h = hour_of(r.d)
+      if h != nil { hours[h] = true }
     }
   }
-  return sort(keys(days))
+  return sort(keys(hours))
 }
 
 // A driver's name on a dispatch is mapped to the user whose real name it is (www_users).
@@ -64,23 +76,23 @@ fn things(ks, sh) {
     hi = max(hi, d)
   }
   if lo == nil { return {} }
-  let a = lo + " 00:00:00"
-  let b = hi + " 23:59:59"
-  let out_days = {}
+  let a = lo + ":00:00"
+  let b = hi + ":59:59"
+  let out_hours = {}
 
-  // the user record of a day, made on first use; `uid` is the userid as the row has it
-  let user = fn(day, uid) {
-    if day == nil or not has(want, day) or is_blank(uid) { return nil }
-    let of_day = get_or_put(out_days, day, {})
+  // the user record of an hour, made on first use; `uid` is the userid as the row has it
+  let user = fn(hour, uid) {
+    if hour == nil or not has(want, hour) or is_blank(uid) { return nil }
+    let of_hour = get_or_put(out_hours, hour, {})
     let key = lower(uid)
-    let u = of_day[key]
+    let u = of_hour[key]
     if u == nil {
       u = {"userid": uid, "active": false, "first": nil, "last": nil,
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
-           "packed": {}, "staged": {}, "binds": [], "dname": nil, "lasts": {}}
-      of_day[key] = u
+           "packed": {}, "staged": {}, "binds": [], "pickups": {}, "dname": nil, "lasts": {}}
+      of_hour[key] = u
     }
     return u
   }
@@ -94,13 +106,13 @@ fn things(ks, sh) {
   }
 
   // 1. Receiving
-  for r in read_raw("SELECT userid, DATE(date_rec) AS day, COUNT(*) AS scans, " +
+  for r in read_raw("SELECT userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS day, COUNT(*) AS scans, " +
                     "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN qty ELSE 0 END) AS qty_in, " +
                     "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN 0 ELSE qty END) AS qty_out, " +
                     "MIN(date_rec) AS first_touch, MAX(date_rec) AS last_touch FROM recscan " +
                     "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' " +
-                    "GROUP BY userid, DATE(date_rec)", a, b) {
-    let u = user(day_of(r.day), r.userid)
+                    "GROUP BY userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H')", a, b) {
+    let u = user(hour_of(r.day), r.userid)
     if u != nil {
       u.active = true
       u.rec.scans = u.rec.scans + int(r.scans)
@@ -110,24 +122,24 @@ fn things(ks, sh) {
       late(u, "receiving", r.last_touch)
     }
   }
-  for r in read_raw("SELECT DISTINCT userid, DATE(date_rec) AS day, stockid FROM recscan " +
+  for r in read_raw("SELECT DISTINCT userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS day, stockid FROM recscan " +
                     "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' AND stockid IS NOT NULL", a, b) {
-    let u = user(day_of(r.day), r.userid)
+    let u = user(hour_of(r.day), r.userid)
     if u != nil { push(u.rec.items, str(r.stockid)) }
   }
-  for r in read_raw("SELECT DISTINCT userid, DATE(date_rec) AS day, vendor FROM recscan " +
+  for r in read_raw("SELECT DISTINCT userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS day, vendor FROM recscan " +
                     "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' AND vendor IS NOT NULL", a, b) {
-    let u = user(day_of(r.day), r.userid)
+    let u = user(hour_of(r.day), r.userid)
     if u != nil { push(u.rec.vendors, str(r.vendor)) }
   }
 
   // 2. Picking
   let pick_where = "WHERE pf.bin <> 'STAGING' AND pf.picked > 0 AND pf.date_pickupdate >= ? AND pf.date_pickupdate <= ? " +
                    "AND pf.userid IS NOT NULL AND pf.userid <> '' " + MERCH
-  for r in read_raw("SELECT pf.userid, DATE(pf.date_pickupdate) AS day, COUNT(*) AS line_count, SUM(pf.picked) AS qty, " +
+  for r in read_raw("SELECT pf.userid, DATE_FORMAT(pf.date_pickupdate, '%Y-%m-%d %H') AS day, COUNT(*) AS line_count, SUM(pf.picked) AS qty, " +
                     "MIN(pf.date_pickupdate) AS first_touch, MAX(pf.date_pickupdate) AS last_touch" + PICKED + pick_where +
-                    " GROUP BY pf.userid, DATE(pf.date_pickupdate)", a, b) {
-    let u = user(day_of(r.day), r.userid)
+                    " GROUP BY pf.userid, DATE_FORMAT(pf.date_pickupdate, '%Y-%m-%d %H')", a, b) {
+    let u = user(hour_of(r.day), r.userid)
     if u != nil {
       u.active = true
       u.pick.lines = u.pick.lines + int(r.line_count)
@@ -136,18 +148,18 @@ fn things(ks, sh) {
       late(u, "picking", r.last_touch)
     }
   }
-  for r in read_raw("SELECT DISTINCT pf.userid, DATE(pf.date_pickupdate) AS day, pf.orderno" + PICKED + pick_where +
+  for r in read_raw("SELECT DISTINCT pf.userid, DATE_FORMAT(pf.date_pickupdate, '%Y-%m-%d %H') AS day, pf.orderno" + PICKED + pick_where +
                     " AND pf.orderno IS NOT NULL", a, b) {
-    let u = user(day_of(r.day), r.userid)
+    let u = user(hour_of(r.day), r.userid)
     if u != nil { push(u.pick.orders, str(r.orderno)) }
   }
 
   // 3. Bin movements (a move is a distinct (binmoveid, stockid) of its type)
   let move_where = "WHERE date_created >= ? AND date_created <= ? AND `from` <> `to` AND qty > 0 AND user IS NOT NULL AND user <> '' "
-  for r in read_raw("SELECT user AS userid, DATE(date_created) AS day, LOWER(TRIM(type)) AS movetype, SUM(qty) AS qty, " +
+  for r in read_raw("SELECT user AS userid, DATE_FORMAT(date_created, '%Y-%m-%d %H') AS day, LOWER(TRIM(type)) AS movetype, SUM(qty) AS qty, " +
                     "MIN(date_created) AS first_touch, MAX(date_created) AS last_touch FROM binmovements_details " + move_where +
-                    "GROUP BY user, DATE(date_created), LOWER(TRIM(type))", a, b) {
-    let u = user(day_of(r.day), r.userid)
+                    "GROUP BY user, DATE_FORMAT(date_created, '%Y-%m-%d %H'), LOWER(TRIM(type))", a, b) {
+    let u = user(hour_of(r.day), r.userid)
     if u != nil {
       u.active = true
       let t = is_blank(r.movetype) ? "other" : str(r.movetype)
@@ -157,9 +169,9 @@ fn things(ks, sh) {
       late(u, "movements", r.last_touch)
     }
   }
-  for r in read_raw("SELECT DISTINCT user AS userid, DATE(date_created) AS day, LOWER(TRIM(type)) AS movetype, binmoveid, stockid " +
+  for r in read_raw("SELECT DISTINCT user AS userid, DATE_FORMAT(date_created, '%Y-%m-%d %H') AS day, LOWER(TRIM(type)) AS movetype, binmoveid, stockid " +
                     "FROM binmovements_details " + move_where + "AND binmoveid IS NOT NULL AND stockid IS NOT NULL", a, b) {
-    let u = user(day_of(r.day), r.userid)
+    let u = user(hour_of(r.day), r.userid)
     if u != nil {
       let t = is_blank(r.movetype) ? "other" : str(r.movetype)
       push(get_or_put(u.moves, t, {"pairs": [], "qty": 0.0}).pairs, str(r.binmoveid) + "|" + str(r.stockid))
@@ -175,11 +187,11 @@ fn things(ks, sh) {
                     "AND ((completed = 1 AND timestopped >= ? AND timestopped <= ?) " +
                     "  OR (force_complete = 1 AND COALESCE(timestopped, '') = '' AND timeassigned >= ? AND timeassigned <= ?))", a, b, a, b) {
     let stopped_in = ival(r.completed) == 1 and not is_blank(r.timestopped) and str(r.timestopped) >= a and str(r.timestopped) <= b
-    let day = stopped_in ? day_of(r.timestopped) : day_of(r.timeassigned)
-    if day != nil and has(want, day) {
+    let hour = stopped_in ? hour_of(r.timestopped) : hour_of(r.timeassigned)
+    if hour != nil and has(want, hour) {
       let id = str(int(r.dispnumber)) + "-" + str(int(r.truckid))
-      let rk = id + "@" + day
-      let run = runs[rk] ?? get_or_put(runs, rk, {"id": id, "day": day, "disp": int(r.dispnumber), "truck": int(r.truckid),
+      let rk = id + "@" + hour
+      let run = runs[rk] ?? get_or_put(runs, rk, {"id": id, "hour": hour, "disp": int(r.dispnumber), "truck": int(r.truckid),
                                                   "manual": 0, "forced": false, "untimed": false, "assigned": nil, "started": nil, "stopped": nil})
       run.manual = run.manual + ival(r.manual_pick)
       run.untimed = run.untimed or ival(r.untimed) == 1
@@ -189,7 +201,7 @@ fn things(ks, sh) {
       if not is_blank(r.timestopped) { run.stopped = max(run.stopped, str(r.timestopped)) }
     }
   }
-  let day_runs = {}   // day -> the runs that fall on it (their trucks are the range's truck list)
+  let hour_runs = {}   // hour -> the runs that fall on it (their trucks are the range's truck list)
   if len(runs) > 0 {
     let disps = []
     let trucks = []
@@ -212,8 +224,8 @@ fn things(ks, sh) {
       return m == nil ? trim(driver) : m
     }
     // a driver www_users does not know is shown by the name on the dispatch (as the PHP report does)
-    let driver_user = fn(day, driver) {
-      let u = user(day, mapped(driver))
+    let driver_user = fn(hour, driver) {
+      let u = user(hour, mapped(driver))
       if u != nil and sh.drivers[lower(trim(driver))] == nil { u.dname = trim(driver) }
       return u
     }
@@ -222,7 +234,7 @@ fn things(ks, sh) {
       let ds = drivers[run.id]
       if ds != nil {
         for driver in unique(ds) {
-          let u = driver_user(run.day, driver)
+          let u = driver_user(run.hour, driver)
           if u != nil {
             let mine = u.runs[run.id] ?? get_or_put(u.runs, run.id, {"k": 0, "manual": run.manual, "forced": run.forced, "untimed": run.untimed,
                                                                       "assigned": run.assigned, "started": run.started, "stopped": run.stopped})
@@ -249,12 +261,12 @@ fn things(ks, sh) {
     }
     for rk in keys(runs) {
       let run = runs[rk]
-      push(get_or_put(day_runs, run.day, []), run.id)
+      push(get_or_put(hour_runs, run.hour, []), run.id)
       let rows_of = per_disp[str(run.disp)]
       if rows_of != nil {
         for id in keys(rows_of) {
           for dv in keys(rows_of[id]) {
-            let u = driver_user(run.day, dv)
+            let u = driver_user(run.hour, dv)
             if u != nil {
               get_or_put(u.units, id, {})[dv] = rows_of[id][dv]
             }
@@ -277,10 +289,10 @@ fn things(ks, sh) {
                       "WHERE sod.orderno IN (SELECT orderno FROM stickerscanout WHERE " + where + ") GROUP BY sod.orderno", a, b) {
       tire[str(r.orderno)] = num(r.units)
     }
-    for r in read_raw("SELECT orderno, " + who + " AS userid, DATE(" + at + ") AS day, MAX(CAST(quantity AS DECIMAL(12,2))) AS fallback, " +
+    for r in read_raw("SELECT orderno, " + who + " AS userid, DATE_FORMAT(" + at + ", '%Y-%m-%d %H') AS day, MAX(CAST(quantity AS DECIMAL(12,2))) AS fallback, " +
                       "MIN(" + at + ") AS first_touch, MAX(" + at + ") AS last_touch FROM stickerscanout WHERE " + where +
-                      " GROUP BY orderno, " + who + ", DATE(" + at + ")", a, b) {
-      let u = user(day_of(r.day), r.userid)
+                      " GROUP BY orderno, " + who + ", DATE_FORMAT(" + at + ", '%Y-%m-%d %H')", a, b) {
+      let u = user(hour_of(r.day), r.userid)
       if u != nil {
         u.active = true
         let o = str(r.orderno)
@@ -290,49 +302,91 @@ fn things(ks, sh) {
       }
     }
   }
-  for r in read_raw("SELECT DISTINCT p.orderno, p.packeduserid AS userid, DATE(p.packedtime) AS day FROM stickerscanout p " +
+  for r in read_raw("SELECT DISTINCT p.orderno, p.packeduserid AS userid, DATE_FORMAT(p.packedtime, '%Y-%m-%d %H') AS day FROM stickerscanout p " +
                     "INNER JOIN trackinginfo ti ON ti.transno = p.orderno AND ti.bind = 1 " +
                     "WHERE p.statusid <> '99' AND p.packedtime >= ? AND p.packedtime <= ? AND p.packeduserid IS NOT NULL AND p.packeduserid <> ''", a, b) {
-    let u = user(day_of(r.day), r.userid)
+    let u = user(hour_of(r.day), r.userid)
     if u != nil { push(u.binds, str(r.orderno)) }
   }
 
+  // 6. Pickup orders (salesorders.shipvia = 2): loaded onto the customer's vehicle, never scanned out, so no driver
+  // and no loaded quantity - they count as loads for whoever took the order (takenby). An order counts on its
+  // invoice's day (debtortrans type 10, trandate, as the PHP report does) in the hour it was put in (inputdate:
+  // trandate holds the date only), its units the merchandise lines' qtyinvoiced. Kept by order number, so a range
+  // with two of its invoices counts it once.
+  let pick_orders = {}
+  let inv_key = "CONCAT(DATE(dt.trandate), ' ', DATE_FORMAT(dt.inputdate, '%H'))"
+  let inv = read_raw("SELECT so.orderno, so.takenby AS userid, " + inv_key + " AS day, " +
+                     "MIN(dt.inputdate) AS first_touch, MAX(dt.inputdate) AS last_touch FROM debtortrans dt " +
+                     "INNER JOIN salesorders so ON so.orderno = dt.order_ " +
+                     "WHERE dt.type = 10 AND dt.trandate >= ? AND dt.trandate <= ? AND so.shipvia = 2 " +
+                     "AND so.takenby IS NOT NULL AND so.takenby <> '' " +
+                     "GROUP BY so.orderno, so.takenby, " + inv_key, slice(a, 0, 10) + " 00:00:00", slice(b, 0, 10) + " 23:59:59")
+  for r in inv { pick_orders[str(r.orderno)] = true }
+  if len(pick_orders) > 0 {
+    let units = {}
+    for r in read_raw("SELECT sod.orderno, SUM(sod.qtyinvoiced) AS units FROM salesorderdetails sod " +
+                      "INNER JOIN stockmaster sm ON sm.stockid = sod.stkcode " +
+                      "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 " +
+                      "WHERE sod.orderno IN (?) AND sod.qtyinvoiced > 0" + replace(MERCH, "pf.stockid", "sod.stkcode") +
+                      " GROUP BY sod.orderno", keys(pick_orders)) {
+      units[str(r.orderno)] = num(r.units)
+    }
+    for r in inv {
+      let o = str(r.orderno)
+      if not has(units, o) { continue }   // no merchandise invoiced: not a load
+      let u = user(hour_of(r.day), r.userid)
+      if u != nil {
+        let have = u.pickups[o]
+        u.pickups[o] = {"u": units[o], "t": max(have == nil ? nil : have.t, str(r.last_touch)), "d": slice(str(r.day), 0, 10)}   // d: trandate's day
+        stamp(u, r.first_touch, r.last_touch)
+        late(u, "loads", r.last_touch)
+      }
+    }
+  }
+
   let out = {}
-  for day in unique(concat(keys(out_days), keys(day_runs))) {
-    let us = out_days[day] ?? {}
-    out[day] = {"users": json_stringify(us), "people": len(us), "runs": json_stringify(day_runs[day] ?? [])}
+  for hour in unique(concat(keys(out_hours), keys(hour_runs))) {
+    let us = out_hours[hour] ?? {}
+    out[hour] = {"users": json_stringify(us), "people": len(us), "runs": json_stringify(hour_runs[hour] ?? [])}
   }
   return out
 }
 
-// What a change means: the day(s) the row falls on, before and after.
+// What a change means: the hour(s) the row falls in, before and after.
 fn row_days(t, row) {
   if row == nil { return [] }
   match t {
-    "recscan" => { return [day_of(row.date_rec)] }
-    "binmovements_details" => { return [day_of(row.date_created)] }
-    "stickerscanout" => { return [day_of(row.packedtime), day_of(row.stagedtime)] }
-    "loadingbays" => { return [day_of(row.timestopped), day_of(row.timeassigned)] }
+    "recscan" => { return [hour_of(row.date_rec)] }
+    "binmovements_details" => { return [hour_of(row.date_created)] }
+    "stickerscanout" => { return [hour_of(row.packedtime), hour_of(row.stagedtime)] }
+    "loadingbays" => { return [hour_of(row.timestopped), hour_of(row.timeassigned)] }
+    "debtortrans" => { return str(row.type) == "10" and not is_blank(row.order_) and str(row.order_) != "0" ? [invoice_hour(row.trandate, row.inputdate)] : [] }
   }
   return []
 }
 
-// The days of the runs a dispatch row, or the order a picking line is on, belongs to.
+// The hours of the runs a dispatch row, or the order a picking line is on, belongs to; of a pickup order's invoices.
 fn run_days(disp, truck) {
   let ds = []
   for r in read_raw("SELECT timestopped, timeassigned FROM loadingbays WHERE dispnumber = ?", disp) {
-    push(ds, day_of(r.timestopped))
-    push(ds, day_of(r.timeassigned))
+    push(ds, hour_of(r.timestopped))
+    push(ds, hour_of(r.timeassigned))
   }
   return ds
 }
 fn sticker_days(orderno) {
   let ds = []
   for r in read_raw("SELECT packedtime, stagedtime FROM stickerscanout WHERE orderno = ?", orderno) {
-    push(ds, day_of(r.packedtime))
-    push(ds, day_of(r.stagedtime))
+    push(ds, hour_of(r.packedtime))
+    push(ds, hour_of(r.stagedtime))
   }
   return ds
+}
+fn pickup_hours(orderno) {
+  let so = read_raw("SELECT shipvia FROM salesorders WHERE orderno = ?", orderno)
+  if len(so) == 0 or str(so[0].shipvia) != "2" { return [] }
+  return map(read_raw("SELECT DISTINCT trandate, inputdate FROM debtortrans WHERE type = 10 AND order_ = ?", orderno), fn(r) { return invoice_hour(r.trandate, r.inputdate) })
 }
 fn order_run_days(orderno) {
   let ds = []
@@ -359,10 +413,18 @@ fn touched(table, op, before, after, sh) {
   let ds = []
   for row in rows {
     if t == "pickingfreeze" {
-      push(ds, day_of(row.date_pickupdate))
+      push(ds, hour_of(row.date_pickupdate))
       if row.orderno != nil { for d in order_run_days(row.orderno) { push(ds, d) } }
     } else if t == "salesorderdetails" {
-      if row.orderno != nil { for d in sticker_days(row.orderno) { push(ds, d) } }
+      if row.orderno != nil {
+        for d in sticker_days(row.orderno) { push(ds, d) }
+        for d in pickup_hours(row.orderno) { push(ds, d) }
+      }
+    } else if t == "salesorders" {
+      // only whether it is a pickup and who took it matter here; a new order has no invoice yet
+      if before == nil or after == nil or before.shipvia != after.shipvia or before.takenby != after.takenby {
+        for r in read_raw("SELECT DISTINCT trandate, inputdate FROM debtortrans WHERE type = 10 AND order_ = ?", row.orderno) { push(ds, invoice_hour(r.trandate, r.inputdate)) }
+      }
     } else if t == "trackinginfo" {
       if row.transno != nil { for d in sticker_days(row.transno) { push(ds, d) } }
     } else if t == "dispatch" {

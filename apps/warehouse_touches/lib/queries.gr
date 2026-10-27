@@ -1,5 +1,5 @@
 // Warehouse touches: the report the PHP touches report gives (catalog/controller/apir/warehouse/touches.php,
-// quickReportData), read from the touch_day Thing the engine keeps current (things/touch_day.gr).
+// quickReportData), read from the touch_hour Thing the engine keeps current (things/touch_hour.gr).
 //
 // The Thing holds one day per key: every user's sums and the distinct sets (items, vendors, orders, moves, sticker
 // orders, binds, load runs) a range has to union rather than add. A report reads the days of its range and merges
@@ -19,7 +19,8 @@ fn blank_user(userid) {
         "merge": {"moves": 0, "qty": 0.0}
       }
     },
-    "loads": {"scans": 0.0, "orders": 0, "dispatches": 0, "avgloadtime": 0.0, "avgdispatchunits": 0.0, "manual": 0, "manualpct": 0.0, "forced": 0},
+    "loads": {"scans": 0.0, "orders": 0, "dispatches": 0, "avgloadtime": 0.0, "avgdispatchunits": 0.0, "manual": 0, "manualpct": 0.0, "forced": 0,
+              "pickupunits": 0.0, "pickuporders": 0},
     "sticker": {"packed": 0, "packedunits": 0.0, "staged": 0, "stagedunits": 0.0, "binds": 0},
     "touches": 0.0,
     "parts": {"receiving": 0.0, "picking": 0.0, "movements": 0.0, "loads": 0.0, "sticker": 0.0},
@@ -49,20 +50,34 @@ fn report_range(start, stop) {
 // 'YYYY-MM-DD HH:MM:SS' as seconds (for a load's length), nil when it is not one
 fn secs_of(ts) { return is_blank(ts) ? nil : date_parse(str(ts), {"or": nil}) }
 
-// The days of the range the touch_day Thing holds (its JSON columns read back as values).
-fn touch_days(db, start_date, stop_date) {
+// An hour of the day 0-23 (the page's hour_wanted), or nil for all of them.
+fn hour_wanted(h) {
+  if is_blank(h) or not is_digit(trim(str(h))) { return nil }
+  let n = int(trim(str(h)))
+  return n >= 0 and n <= 23 ? n : nil
+}
+
+// The hours of the range the touch_hour Thing holds - all 24 of each day, or the one hour wanted - with their JSON
+// columns read back as values.
+fn touch_hours(db, start_date, stop_date, hour) {
   if not is_day(start_date) or not is_day(stop_date) { return [] }
-  return map(thing_rows(db, "touch_day", date_range(start_date, stop_date)),
-             fn(row) { return {"day": str(row.day), "users": row.users, "runs": row.runs ?? []} })
+  let hours = []
+  for d in date_range(start_date, stop_date) {
+    if hour != nil { push(hours, d + " " + pad_left(str(hour), 2, "0")) }
+    else { for h in range(0, 24) { push(hours, d + " " + pad_left(str(h), 2, "0")) } }
+  }
+  return map(thing_rows(db, "touch_hour", hours),
+             fn(row) { return {"day": slice(str(row.hour), 0, 10), "hour": str(row.hour), "users": row.users, "runs": row.runs ?? []} })
 }
 
 fn r1(v) { return round(real(v), 1) }
 
-fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
+fn fetch_warehouse_touches(db, start_in, stop_in, userids, hour_in) {
   let range = report_range(start_in, stop_in)
   let start_date = range[0]
   let stop_date = range[1]
-  let rows = touch_days(db, start_date, stop_date)
+  let hour = hour_wanted(hour_in)
+  let rows = touch_hours(db, start_date, stop_date, hour)
 
   let users = {}
   let days = {}
@@ -71,7 +86,7 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
     return users[key] ?? get_or_put(users, key, blank_user(uid))
   }
   let sets = {}   // key -> the distinct sets merged across the days
-  let set_of = fn(key) { return get_or_put(sets, key, {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}}) }
+  let set_of = fn(key) { return get_or_put(sets, key, {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}, "pickups": {}}) }
   let all_items = {}
   let all_vendors = {}
   let all_orders = {}
@@ -79,7 +94,8 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
   let load_timed = {}
 
   // In the PHP report's order (receiving, picking, moves, loads, sticker): a user's id is shown as the first source has it.
-  for part in ["rec", "pick", "moves", "loads", "sticker"] {
+  // pickup orders after loads, as the PHP report adds them (credited to who took the order)
+  for part in ["rec", "pick", "moves", "loads", "pickup", "sticker"] {
     if part == "loads" {
       // a run over several days is one run: its rows combined, then counted once per name on its dispatch
       let runs = {}
@@ -178,6 +194,16 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
             u.movements.qty = u.movements.qty + real(d.moves[t].qty)
             add_keys(get_or_put(s.moves, t, {}), d.moves[t].pairs)
           }
+        } else if part == "pickup" and len(d.pickups ?? {}) > 0 {
+          get_user(key, d.userid)
+          let s = set_of(key)
+          for o in keys(d.pickups) {
+            // one order once over the range: its units once, its latest invoice (t) and that invoice's day (d)
+            let mine = d.pickups[o]
+            let have = get_or_put(s.pickups, o, {"u": real(mine.u), "t": nil, "d": nil})
+            have.t = max(have.t, mine.t)
+            have.d = max(have.d, mine.d)
+          }
         } else if part == "sticker" and (len(d.packed) > 0 or len(d.staged) > 0 or len(d.binds) > 0) {
           get_user(key, d.userid)
           let s = set_of(key)
@@ -224,6 +250,15 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
       u.sticker[side + "units"] = units
     }
     u.sticker.binds = len(s.binds)
+    // pickup orders are loads: their units and orders, and the day of each one's latest invoice
+    for o in keys(s.pickups) {
+      let pk = s.pickups[o]
+      u.loads.pickuporders = u.loads.pickuporders + 1
+      u.loads.pickupunits = u.loads.pickupunits + pk.u
+      if pk.d != nil { get_or_put(days, key, {})[pk.d] = true }
+    }
+    u.loads.scans = u.loads.scans + u.loads.pickupunits
+    u.loads.orders = u.loads.orders + u.loads.pickuporders
   }
   // real names (www_users holds password hashes too: only the name columns are read)
   let n_res = pcall(db_query, db, "SELECT userid, realname FROM www_users")
@@ -236,6 +271,7 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids) {
   let report = rollup(users, days, start_date, stop_date, {"items": len(all_items), "vendors": len(all_vendors),
                       "orders": len(all_orders), "secs": load_secs, "timed": load_timed})
   report.lasts = lasts
+  report.hour = hour   // the hour of the day it is limited to, nil for all
   return report
 }
 
@@ -256,8 +292,10 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     let timed = distinct.timed[k]
     u.loads.avgloadtime = timed != nil and timed > 0 ? r1(distinct.secs[k] / timed / 60.0) : 0.0
     if timed != nil { secs_all = secs_all + distinct.secs[k]; timed_all = timed_all + timed }
-    u.loads.avgdispatchunits = u.loads.dispatches > 0 ? r1(u.loads.scans / real(u.loads.dispatches)) : 0.0
-    u.loads.manualpct = u.loads.scans > 0 ? r1(100.0 * real(u.loads.manual) / u.loads.scans) : 0.0
+    // pickup units were never scanned or dispatched: out of the dispatch average and the skipped percent
+    let scanned = u.loads.scans - u.loads.pickupunits
+    u.loads.avgdispatchunits = u.loads.dispatches > 0 ? r1(scanned / real(u.loads.dispatches)) : 0.0
+    u.loads.manualpct = scanned > 0 ? r1(100.0 * real(u.loads.manual) / scanned) : 0.0
     u.parts = {"receiving": u.receiving.qty_in + u.receiving.qty_out, "picking": u.picking.qty, "movements": u.movements.qty,
                "loads": u.loads.scans, "sticker": u.sticker.stagedunits}
     u.touches = u.parts.receiving + u.parts.picking + u.parts.movements + u.parts.loads + u.parts.sticker
@@ -270,15 +308,16 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     // the sums (items, vendors and orders are distinct across users, so not added; nor are the averages)
     add_into(totals.receiving, u.receiving, ["scans", "qty_in", "qty_out"])
     add_into(totals.picking, u.picking, ["lines", "qty"])
-    add_into(totals.loads, u.loads, ["scans", "orders", "dispatches", "manual", "forced"])
+    add_into(totals.loads, u.loads, ["scans", "orders", "dispatches", "manual", "forced", "pickupunits", "pickuporders"])
     add_into(totals.sticker, u.sticker)
     add_into(totals.parts, u.parts)
     add_into(totals.movements, u.movements, ["moves", "qty", "by_type"])
     push(user_list, u)
   }
   totals.loads.avgloadtime = timed_all > 0 ? r1(secs_all / timed_all / 60.0) : 0.0
-  totals.loads.avgdispatchunits = totals.loads.dispatches > 0 ? r1(totals.loads.scans / real(totals.loads.dispatches)) : 0.0
-  totals.loads.manualpct = totals.loads.scans > 0 ? r1(100.0 * real(totals.loads.manual) / totals.loads.scans) : 0.0
+  let scanned_all = totals.loads.scans - totals.loads.pickupunits
+  totals.loads.avgdispatchunits = totals.loads.dispatches > 0 ? r1(scanned_all / real(totals.loads.dispatches)) : 0.0
+  totals.loads.manualpct = scanned_all > 0 ? r1(100.0 * real(totals.loads.manual) / scanned_all) : 0.0
   totals.active_days = len(all_days)
   totals.touches_per_day = totals.active_days > 0 ? r1(totals.touches / real(totals.active_days)) : 0.0
   // busiest first; ties in user id order, so a pushed update does not reshuffle people with the same touches

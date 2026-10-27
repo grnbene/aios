@@ -1,26 +1,30 @@
-// Post-deploy hook: creates or replaces the touch_day Thing in this machine's ASQL (things/touch_day.gr, built beside
-// the old version and swapped in when its first pass is done). A copy whose reports run on another member
-// (WAREHOUSE_COMPUTE_ON) leaves the Thing to that member.
+// Post-deploy hook: creates or replaces the touch_hour Thing in this machine's ASQL (things/touch_hour.gr, built beside
+// the old version and swapped in when its first pass is done), and drops touch_day, the per-day Thing it replaces. A
+// copy whose reports run on another member (WAREHOUSE_COMPUTE_ON) leaves the Thing to that member.
 
 let READS = "recscan, pickingfreeze, stockmaster, product_types, binmovements_details, www_users, loadingbays, dispatch, stickerscanout, " +
-            "salesorderdetails, trackinginfo"
+            "salesorderdetails, trackinginfo, salesorders, debtortrans"
 
 fn deployed(app) {
   let elsewhere = env("WAREHOUSE_COMPUTE_ON", "")
   if elsewhere != "" {
-    print("touch_day: kept on " + elsewhere + ", where this app's reports run")
+    print("touch_hour: kept on " + elsewhere + ", where this app's reports run")
     return true
   }
   let c = db_connect({"host": env("DB_HOST", "127.0.0.1"), "port": int(env("DB_PORT", "3307")), "user": env("DB_USER", "root"),
                       "password": secret("DB_PASSWORD"), "db": env("DB_NAME", "versioneight")})
   if not c.ok { return "cannot reach ASQL: " + c.error }
   let have = db_query(c, "SHOW THINGS", [])
-  let exists = false
-  if have.ok { for r in have.records { if r.thing == "touch_day" { exists = true } } }
-  let verb = exists ? "CREATE OR REPLACE THING" : "CREATE THING"
-  let r = db_query(c, verb + " touch_day GRAIN KEY day READS " + READS + " AS ?", [app_program("things/touch_day.gr")])
+  let things = {}
+  if have.ok { for r in have.records { things[r.thing] = true } }
+  let verb = has(things, "touch_hour") ? "CREATE OR REPLACE THING" : "CREATE THING"
+  let r = db_query(c, verb + " touch_hour GRAIN KEY hour READS " + READS + " AS ?", [app_program("things/touch_hour.gr")])
+  if not r.ok { db_close(c); return "touch_hour: " + r.error }
+  print("touch_hour: " + (has(things, "touch_hour") ? "replaced in place" : "created") + ", " + str(r.affected_rows) + " hours")
+  if has(things, "touch_day") {
+    let d = db_query(c, "DROP THING touch_day", [])
+    print("touch_day: " + (d.ok ? "dropped (touch_hour replaces it)" : "not dropped: " + d.error))
+  }
   db_close(c)
-  if not r.ok { return "touch_day: " + r.error }
-  print("touch_day: " + (exists ? "replaced in place" : "created") + ", " + str(r.affected_rows) + " days")
   return true
 }
