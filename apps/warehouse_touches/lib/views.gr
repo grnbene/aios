@@ -459,6 +459,20 @@ let CLOCK_JS = join([
   "})();"
 ], chr(10))
 
+// The export links behind a proxy that picks the app by ?route= (atl's nginx: ?route=apir/warehouse/touches/
+// quickreportlive&key=..&userid=..): the same URL with export=pdf|xlsx and the range, so the key goes along. Reached
+// directly (no route), the links are the app's own paths.
+let EXPORT_JS = join([
+  "document.addEventListener('click', function (e) {",
+  "  var a = e.target.closest && e.target.closest('a[data-export]');",
+  "  var p = new URLSearchParams(location.search);",
+  "  if (!a || !p.get('route')) return;",
+  "  e.preventDefault();",
+  "  p.set('export', a.dataset.export); p.set('start', a.dataset.start); p.set('stop', a.dataset.stop);",
+  "  location.href = location.pathname + '?' + p.toString();",
+  "});"
+], chr(10))
+
 // The page as a ui.pane view (service.gr): the same markup as the PHP page, its range a form whose Run is an
 // action and its sort done here (state: {start, stop, sorter}, the viewer's own).
 fn dashboard_node(report, state) {
@@ -475,8 +489,8 @@ fn dashboard_node(report, state) {
           state.start = r[0]
           state.stop = r[1]
         }}, "Run"),
-        el("a", {"class": "btn", "href": "/quickreportpdf" + q}, "Export PDF"),
-        el("a", {"class": "btn", "href": "/quickreportxlsx" + q}, "Export Excel"))),
+        el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop}, "Export PDF"),
+        el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop}, "Export Excel"))),
     el("div", {"id": "live"}, live_node(report, state.sorter)),
-    el("script", CLOCK_JS))
+    el("script", CLOCK_JS), el("script", EXPORT_JS))
 }

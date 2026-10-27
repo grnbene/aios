@@ -540,6 +540,8 @@ body:has([data-theme="glass"]),body.theme-glass{
 )CSS";
 
 // Sends the fields with every event, swaps the widgets in, keeps the focused field and its caret.
+// The page's own URL, query and all, for its events and its stream: behind a proxy that picks the app by a query
+// parameter (?route=...&key=...), a request to the bare path would go somewhere else.
 const char* kScript = R"JS(
 (function(){
   var app=document.getElementById('app'),seq=app.dataset.seq,busy=false,again=null;
@@ -602,7 +604,7 @@ const char* kScript = R"JS(
   function send(action){
     if(busy){again=action;return}
     busy=true;var p=fields();p.append('action',action||'');
-    fetch(location.pathname,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'same-origin'})
+    fetch(location.pathname+location.search,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'same-origin'})
       .then(function(r){return r.json()}).then(function(d){
         if(d.html!==undefined){apply(d,true)}   // always: the event stream may have shown this seq already, but only an action's answer clears a field
         else if(d.error){app.insertAdjacentHTML('afterbegin','<div class="error"></div>');app.firstChild.textContent=d.error}
@@ -622,7 +624,7 @@ const char* kScript = R"JS(
   app.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.dataset&&e.target.dataset.enter){e.preventDefault();send(e.target.dataset.enter)}});
   var f=app.querySelector('input[data-focus]');if(f)f.focus();
   if(window.EventSource){
-    var es=new EventSource(location.pathname);
+    var es=new EventSource(location.pathname+location.search);
     es.onmessage=function(m){
       try{
         var d=JSON.parse(m.data);
@@ -1178,7 +1180,7 @@ const char* kCanvasScript = R"JS(
   var img=document.getElementById('cv'),seq=img.dataset.seq;
   function apply(d){if(d.png){seq=String(d.seq);img.src='data:image/png;base64,'+d.png}}
   function post(p){
-    fetch(location.pathname,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(p).toString(),credentials:'same-origin'})
+    fetch(location.pathname+location.search,{method:'POST',headers:{'X-Grain-UI':'1','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(p).toString(),credentials:'same-origin'})
       .then(function(r){return r.json()}).then(function(d){if(String(d.seq)!==seq)apply(d)}).catch(function(){});
   }
   function pos(e){var r=img.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*img.naturalWidth/r.width),y:Math.round((e.clientY-r.top)*img.naturalHeight/r.height)}}
@@ -1195,7 +1197,7 @@ const char* kCanvasScript = R"JS(
     post({type:'key',key:k,shift:e.shiftKey?'1':'',ctrl:e.ctrlKey?'1':'',alt:e.altKey?'1':'',meta:e.metaKey?'1':''});
     if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey)post({type:'text',text:e.key});
   });
-  if(window.EventSource){var es=new EventSource(location.pathname);es.onmessage=function(m){try{var d=JSON.parse(m.data);if(String(d.seq)!==seq)apply(d)}catch(x){}}}
+  if(window.EventSource){var es=new EventSource(location.pathname+location.search);es.onmessage=function(m){try{var d=JSON.parse(m.data);if(String(d.seq)!==seq)apply(d)}catch(x){}}}
 })();
 )JS";
 
