@@ -420,6 +420,12 @@ class ThingEngine {
   void act_due(Kind& k);
   bool condition_holds(const Kind& k, const Instance& in, bool* holds, std::string* err);
   bool run_act(const Kind& k, const Instance& in, std::string* err);
+  // The names a row Thing's values go by, as WHEN and DO see them: the key's first, then each output column.
+  std::vector<std::string> value_labels(const Kind& k) const;
+  // ... and one Thing's values under them (NULL as sql_null()).
+  std::vector<std::string> value_row(const Kind& k, const Instance& in) const;
+  // THING.<label> references in DO that name no value of the Thing ("" when every one does).
+  std::string unknown_do_labels(const Kind& k) const;
   SqlQueryResult replay(const std::string& name, const std::string& action, const std::string& from);
   std::string things_dir() const;
   std::string serialize(const Kind& k) const;
