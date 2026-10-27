@@ -113,7 +113,9 @@ let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
 
 // The viewer's own page: the range (the PHP report's default, the last 30 days) and the table's sort.
 let default_range = report_range(nil, nil)
-let state = {"start": default_range[0], "stop": default_range[1], "span": nil, "sorter": {"col": 2, "dir": "desc"}}
+// view: the timeline's tab (hours, days, heat); span: the hours picked; days: the run of days picked in the range
+let state = {"start": default_range[0], "stop": default_range[1], "view": "hours", "span": nil, "days": nil,
+             "sorter": {"col": 2, "dir": "desc"}}
 
 ui.pane({
   "title": "Warehouse Activity",
@@ -127,7 +129,7 @@ ui.pane({
   // made the Thing it reads, and ASQL may be restarting)
   "view": fn() {
     let c = db_connect(DB_CFG)
-    let got = c.ok ? pcall(fetch_with_profile, c, state.start, state.stop, state.span) : {"ok": false, "error": c.error}
+    let got = c.ok ? pcall(fetch_for_page, c, state.start, state.stop, state.span, state.days, state.view) : {"ok": false, "error": c.error}
     if c.ok { db_close(c) }
     if not got.ok {
       return el("div", {"class": "page"}, el("h1", "Warehouse Activity"),
@@ -145,6 +147,7 @@ ui.pane({
       let r = report_range(q.start, q.stop)
       state.start = r[0]
       state.stop = r[1]
+      state.days = nil
     }
     if has(q, "hours") or has(q, "hour_wanted") { state.span = hour_span(q.hour_wanted, q.hours) }
   },
