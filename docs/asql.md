@@ -634,6 +634,7 @@ The other statements:
     SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
     SHOW THING <name> CLOCK             the stamp a client holds after reading everything
+    WAIT THING <name> SINCE <clock> [TIMEOUT <s>]   returns when the kind's clock moves (see below)
     SHOW THING ALERTS [name]
     SHOW THING CONFLICTS <name> ['<key>']   each side of each field the sources disagree on
     RESOLVE THING <name> '<key>' <field> TAKE '<source>' | UNRESOLVE
@@ -647,6 +648,31 @@ The other statements:
 Results from Thing statements carry an extra `machine` column (this engine's
 short identity), because the same statements can be sent `ON <machine>` across
 a fleet.
+
+### `WAIT THING`: told when a Thing changes
+
+`WAIT THING <name> SINCE <clock> [TIMEOUT <seconds>]` returns as soon as the
+kind's clock differs from `<clock>`, with one row: `clock` (the new one, to
+pass as the next `SINCE`), `changed` (a JSON list of the keys whose Things
+changed since, for a grain kind) and `whole` (1 when every Thing may have
+changed: `SINCE 0`, a `CREATE OR REPLACE` that gave the kind a new clock, or a
+kind that is not grain). `SINCE 0` answers at once with the current clock. With
+nothing changed by the timeout (default 30 s, at most 3600) it returns the same
+clock and `[]`.
+
+Nothing polls. The engine wakes its waiters when it has committed a change - at
+the end of a settle or tick in which a clock moved, after a Thing statement, and
+when a replacement takes the name (`ThingEngine::wake_waiters`,
+`sql_things.cpp`). The statement runs with no statement lock (it is routed like
+`CREATE OR REPLACE THING`, `sql_database.cpp`), so a waiter never holds up a
+write or the reaction it is waiting for; it holds only its own connection.
+Inside a transaction it is refused.
+
+Driven on a local server (2026-10-27): one client ran `WAIT THING per_who SINCE
+2 TIMEOUT 20`; another inserted a scan 1.5 s later (9 ms). The waiter returned
+11 ms after the insert with `3 | ["ann"] | 0`. Twenty waiters woke on one insert
+(13 ms) with the same answer, a `TIMEOUT 1.5` returned the same clock after 1.5 s,
+and a `CREATE OR REPLACE` woke its waiter with `whole = 1`.
 
 ### Grain Things
 

@@ -25194,6 +25194,11 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
       ScopedSessionDb in_session(session_db);   // the client's database, as the statement lock's path sets it
       if (things_->try_replace_unlocked(sql_query.substr(i), &r)) return r;
     }
+    // WAIT THING: sleeps until a Thing changes - with no statement lock, or the change could never be made
+    if (sql_query.size() - i >= 4 && strncasecmp(sql_query.c_str() + i, "WAIT", 4) == 0) {
+      SqlQueryResult r;
+      if (things_->try_wait_unlocked(sql_query.substr(i), &r)) return r;
+    }
   }
   if (txn_concurrent() && g_rw_depth == 0) return execute_gateway_concurrent(sql_query, session_db, begins ? 1 : 0);
   // A transaction takes the one writer lock for its whole life. BEGIN used to
@@ -26751,6 +26756,10 @@ SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, co
         if (r.success && r.is_result_set && !sql_wire_results()) r.formatted_table = format_result_table(r.columns, r.rows);
         return r;
       }
+    }
+    if (things_ && sql_query.size() - i >= 4 && strncasecmp(sql_query.c_str() + i, "WAIT", 4) == 0) {
+      SqlQueryResult r;
+      if (things_->try_wait_unlocked(sql_query.substr(i), &r)) return r;
     }
   }
   StatementLock lock(rw_lock_, !reads);
