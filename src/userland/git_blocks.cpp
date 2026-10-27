@@ -38,9 +38,6 @@
 #include "aios/hal/host.hpp"
 #include "aios/userland/git_remote.hpp"
 #include "aios/userland/git_structural.hpp"
-#if defined(AIOS_HAVE_ZLIB)
-#include <zlib.h>
-#endif
 
 namespace aios::userland {
 
@@ -60,11 +57,6 @@ enum Kind : uint8_t { KCommit = 1, KTree = 2, KBlob = 3, KTag = 4, KBlobDelta = 
 constexpr int kMaxDeltaDepth = 10;   // reading the newest versions stays cheap: they are whole
 
 ByteBuffer compress(const uint8_t* p, size_t n) {
-#if defined(AIOS_HAVE_ZLIB)
-  uLongf cap = compressBound((uLong)n);
-  ByteBuffer out(cap);
-  if (compress2(out.data(), &cap, p, (uLong)n, Z_BEST_COMPRESSION) == Z_OK) { out.resize(cap); return out; }
-#endif
   return zlib_deflate(ByteSpan(p, n), 9);
 }
 
@@ -680,13 +672,6 @@ Result<std::shared_ptr<ByteBuffer>> GitBlockFile::frame(uint32_t f) const {
   uint32_t clen = get32(e + 8), ulen = get32(e + 12);
   if (off + clen > frames_data_len_) return R(Status::Corrupt, path_ + ": frame " + std::to_string(f) + " runs past the end");
   std::shared_ptr<ByteBuffer> buf;
-#if defined(AIOS_HAVE_ZLIB)
-  {
-    auto out = std::make_shared<ByteBuffer>(ulen);
-    uLongf got = ulen;
-    if (uncompress(out->data(), &got, frames_data_ + off, clen) == Z_OK && got == ulen) buf = out;
-  }
-#endif
   if (!buf) {
     size_t end = 0;
     auto z = zlib_inflate_at(ByteSpan(frames_data_ + off, clen), 0, &end, ulen);

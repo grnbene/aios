@@ -20,14 +20,7 @@
 #include "aios/net/tls_conn.hpp"
 #include "aios/userland/sql_database.hpp"
 
-#if defined(AIOS_HAVE_LIBDEFLATE)
-#include <libdeflate.h>
-#elif defined(AIOS_HAVE_ZLIB)
-#include <zlib.h>
-#endif
-#if defined(AIOS_HAVE_ZSTD)
-#include <zstd.h>
-#endif
+#include "aios/userland/git.hpp"   // zlib_deflate / zlib_inflate: the zlib envelope around the in-tree deflate
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -775,73 +768,19 @@ constexpr size_t kWireMinCompress = 50;    // smaller pieces go stored, as MySQL
 // `n` bytes compressed onto `out`; 0 when the algorithm could not (the piece then goes stored).
 size_t wire_compress(uint8_t algo, int level, const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
   const size_t at = out.size();
-#if defined(AIOS_HAVE_ZSTD)
-  if (algo == kWireZstd) {
-    struct C { ZSTD_CCtx* c = ZSTD_createCCtx(); ~C() { ZSTD_freeCCtx(c); } };
-    thread_local C cc;
-    out.resize(at + ZSTD_compressBound(n));
-    const size_t got = ZSTD_compressCCtx(cc.c, out.data() + at, out.size() - at, src, n, level);
-    if (ZSTD_isError(got)) { out.resize(at); return 0; }
-    out.resize(at + got);
-    return got;
-  }
-#endif
-  if (algo != kWireZlib) return 0;
-#if defined(AIOS_HAVE_LIBDEFLATE)
-  struct C {
-    int level = -1;
-    libdeflate_compressor* c = nullptr;
-    ~C() { if (c) libdeflate_free_compressor(c); }
-  };
-  thread_local C cc;
-  if (!cc.c || cc.level != level) {
-    if (cc.c) libdeflate_free_compressor(cc.c);
-    cc.c = libdeflate_alloc_compressor(std::clamp(level, 1, 12));
-    cc.level = level;
-  }
-  if (!cc.c) return 0;
-  out.resize(at + libdeflate_zlib_compress_bound(cc.c, n));
-  const size_t got = libdeflate_zlib_compress(cc.c, src, n, out.data() + at, out.size() - at);
-  out.resize(at + got);
-  return got;
-#elif defined(AIOS_HAVE_ZLIB)
-  uLongf len = compressBound((uLong)n);
-  out.resize(at + len);
-  if (compress2(out.data() + at, &len, src, (uLong)n, std::clamp(level, 1, 9)) != Z_OK) { out.resize(at); return 0; }
-  out.resize(at + len);
-  return len;
-#else
-  (void)level; (void)src; (void)n;
-  return 0;
-#endif
+  if (algo != kWireZlib) return 0;   // zstd is not offered (no in-tree zstd yet): the piece goes stored
+  const ByteBuffer z = userland::zlib_deflate(ByteSpan(src, n), std::clamp(level, 1, 9));
+  out.insert(out.end(), z.begin(), z.end());
+  return out.size() - at;
 }
 
 // A frame's payload inflated to exactly `plain` bytes into `dst`.
 bool wire_inflate(uint8_t algo, const uint8_t* src, size_t n, uint8_t* dst, size_t plain) {
-#if defined(AIOS_HAVE_ZSTD)
-  if (algo == kWireZstd) {
-    struct D { ZSTD_DCtx* d = ZSTD_createDCtx(); ~D() { ZSTD_freeDCtx(d); } };
-    thread_local D dc;
-    const size_t got = ZSTD_decompressDCtx(dc.d, dst, plain, src, n);
-    return !ZSTD_isError(got) && got == plain;
-  }
-#endif
   if (algo != kWireZlib) return false;
-#if defined(AIOS_HAVE_LIBDEFLATE)
-  struct D {
-    libdeflate_decompressor* d = libdeflate_alloc_decompressor();
-    ~D() { if (d) libdeflate_free_decompressor(d); }
-  };
-  thread_local D dc;
-  size_t got = 0;
-  return dc.d && libdeflate_zlib_decompress(dc.d, src, n, dst, plain, &got) == LIBDEFLATE_SUCCESS && got == plain;
-#elif defined(AIOS_HAVE_ZLIB)
-  uLongf got = (uLongf)plain;
-  return uncompress(dst, &got, src, (uLong)n) == Z_OK && got == plain;
-#else
-  (void)src; (void)n; (void)dst; (void)plain;
-  return false;
-#endif
+  auto r = userland::zlib_inflate_at(ByteSpan(src, n), 0, nullptr, plain);
+  if (!r.ok() || r->size() != plain) return false;
+  std::memcpy(dst, r->data(), plain);
+  return true;
 }
 
 void put_u24(uint8_t* p, size_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); }
@@ -1160,9 +1099,7 @@ Result<void> MariaWireSession::connect(const std::string& user, const std::strin
   uint8_t comp = 0;
   if (comp_want_ == kWireZstd && (negotiated_capabilities_ & kCapZstd)) comp = kWireZstd;
   else if (comp_want_ && (negotiated_capabilities_ & kCapCompress)) comp = kWireZlib;
-#if !defined(AIOS_HAVE_ZSTD)
   if (comp == kWireZstd) comp = (negotiated_capabilities_ & kCapCompress) ? kWireZlib : 0;
-#endif
   if (comp == kWireZstd) client_caps |= kCapZstd;
   else if (comp == kWireZlib) client_caps |= kCapCompress;
 
@@ -2724,12 +2661,7 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
                   CAP_SECURE_CONNECTION | CAP_MULTI_STATEMENTS | CAP_MULTI_RESULTS |
                   CAP_PLUGIN_AUTH;
   if (tls_enabled()) caps |= 0x00000800;   // CLIENT_SSL
-#if defined(AIOS_HAVE_LIBDEFLATE) || defined(AIOS_HAVE_ZLIB)
-  caps |= kCapCompress;
-#endif
-#if defined(AIOS_HAVE_ZSTD)
-  caps |= kCapZstd;
-#endif
+  caps |= kCapCompress;   // the zlib compressed protocol, with the in-tree deflate (zstd is not offered: no in-tree zstd yet)
   put_u16(&hs, caps & 0xffff);  // capability flags lower 16 bits
   // Clients that take their connection charset from the greeting (PHP's mysqlnd
   // before 7.4) follow this byte. A charset-aware server stands in for a

@@ -7,7 +7,6 @@
 
 namespace aios::net {
 
-#if !defined(AIOS_HAVE_ZLIB)   // with zlib, src/hal/gzip_zlib.cpp provides the encoder
 // The portable encoder: bare metal (no zlib there) and any host without it.
 namespace {
 
@@ -199,7 +198,6 @@ ByteBuffer GzipStreamEncoder::finish() {
   return out;
 }
 
-#endif  // AIOS_HAVE_ZLIB
 
 ByteBuffer gzip_compress_whole(ByteSpan data) {
   GzipStreamEncoder enc;

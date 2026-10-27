@@ -5,8 +5,6 @@
 #include <cstring>
 #include <vector>
 
-#if defined(AIOS_HAVE_LIBDEFLATE)
-#endif
 #include "aios/net/gzip.hpp"
 
 namespace aios::net {
@@ -353,92 +351,382 @@ size_t deflate_raw_append(ByteSpan data, int level, ByteBuffer& out) {
 
 // ---------------------------------------------------------------------------
 // inflate
+//
+// Built for speed the way libdeflate's decoder is, without it: a 64-bit bit buffer topped up eight bytes at a
+// time, two-level decode tables whose entries carry a literal or a length's base and extra-bit count (one lookup a
+// symbol), matches copied a word at a time where the distance allows, the output written through a pointer into a
+// buffer sized once when the size is known (a store chunk, a link frame) and doubled when it is not. On chi's 1.65
+// GB of ASQL table chunks the decoder this replaces ran at 403 MB/s against libdeflate's 1215.
 // ---------------------------------------------------------------------------
 namespace {
 
-// Bits come out of the stream least significant first. Up to eight bytes are held at a time, so a code is looked up
-// and dropped in a couple of operations rather than assembled a bit at a time (a pack of hundreds of megabytes is
-// inflated once to index it: bit by bit that took most of a minute).
-struct BitReader {
-  ByteSpan d;
-  size_t pos = 0;
+// Bits come out least significant first. refill() tops the buffer up to at least 56 bits while input lasts; the
+// bits above `have` are the stream's own next bits (an eight-byte load counted as fewer bytes), so OR-ing the same
+// bytes in again later changes nothing.
+struct Bits {
+  const uint8_t* d;
+  size_t n;
+  size_t pos = 0;      // bytes counted into `have`
   uint64_t buf = 0;
   int have = 0;
-  bool bad = false;
-  void fill() { while (have <= 56 && pos < d.size()) { buf |= (uint64_t)d[pos++] << have; have += 8; } }
-  // The next n bits without taking them; past the end of the data they read as zeros (the taker then finds too few).
-  uint32_t peek(int n) { if (have < n) fill(); return (uint32_t)(buf & ((1u << n) - 1)); }
-  void drop(int n) { if (n > have) { bad = true; have = 0; buf = 0; return; } buf >>= n; have -= n; }
-  int bit() {
-    if (have < 1) { fill(); if (have < 1) { bad = true; return 0; } }
-    int b = (int)(buf & 1); buf >>= 1; --have; return b;
+  void refill() {
+    if (pos + 8 <= n) {
+      uint64_t w;
+      std::memcpy(&w, d + pos, 8);
+      buf |= w << have;
+      const int take = (63 - have) >> 3;
+      pos += (size_t)take;
+      have += take * 8;
+    } else {
+      while (have <= 56 && pos < n) { buf |= (uint64_t)d[pos++] << have; have += 8; }
+    }
   }
-  uint32_t bits(int n) {
-    if (n == 0) return 0;
-    if (have < n) { fill(); if (have < n) { bad = true; have = 0; buf = 0; return 0; } }
-    uint32_t v = (uint32_t)(buf & ((1u << n) - 1)); buf >>= n; have -= n; return v;
+  uint32_t peek(int k) const { return (uint32_t)(buf & ((1ull << k) - 1)); }
+  bool take(int k, uint32_t* v) {   // false: the stream ends inside these bits
+    if (k > have) return false;
+    *v = (uint32_t)(buf & ((1ull << k) - 1));
+    buf = k == 64 ? 0 : buf >> k;
+    have -= k;
+    return true;
   }
-  // To the next byte boundary, with the whole bytes held given back: what follows is read from d at pos.
-  void align() { int r = have % 8; buf >>= r; have -= r; pos -= (size_t)(have / 8); have = 0; buf = 0; }
-  // Bytes of the stream used so far: a byte only partly read counts, bytes held and untouched do not.
-  size_t consumed() const { return pos - (size_t)(have / 8); }
+  bool drop(int k) { if (k > have) return false; buf >>= k; have -= k; return true; }
+  // To the next byte boundary, whole bytes held given back: what follows is read from d at pos.
+  void align() { const int r = have & 7; buf >>= r; have -= r; pos -= (size_t)(have >> 3); have = 0; buf = 0; }
+  size_t consumed() const { return pos - (size_t)(have >> 3); }
 };
 
-// A canonical Huffman code: counts and symbols for the bit-by-bit walk (codes longer than kFastBits), and a table
-// indexed by the next kFastBits bits of the stream for every shorter code: (symbol << 4) | length, 0 where none.
-const int kFastBits = 9;
-struct Huff { uint16_t counts[16]; std::vector<uint16_t> symbols; uint16_t fast[1 << kFastBits]; };
-
-void huff_build(Huff& h, const uint8_t* lengths, int n) {
-  for (int i = 0; i < 16; ++i) h.counts[i] = 0;
-  for (int i = 0; i < n; ++i) h.counts[lengths[i]]++;
-  h.counts[0] = 0;
-  uint16_t offs[16];
-  offs[0] = 0; offs[1] = 0;
-  for (int i = 1; i < 15; ++i) offs[i + 1] = (uint16_t)(offs[i] + h.counts[i]);
-  h.symbols.assign((size_t)n, 0);
-  for (int i = 0; i < n; ++i) if (lengths[i]) h.symbols[offs[lengths[i]]++] = (uint16_t)i;
-  // The codes themselves, in order of length then symbol; each short one fills every table slot whose low bits are
-  // the code as the stream carries it (most significant bit first, so reversed here).
-  std::memset(h.fast, 0, sizeof(h.fast));
-  uint32_t next[16];
-  uint32_t code = 0;
-  next[0] = 0;
-  for (int len = 1; len < 16; ++len) { code = (code + h.counts[len - 1]) << 1; next[len] = code; }
-  for (int i = 0; i < n; ++i) {
-    int len = lengths[i];
-    if (!len) continue;
-    uint32_t c = next[len]++;
-    if (len > kFastBits || (c >> len)) continue;   // long, or an over-subscribed set: the walk below decides
-    uint32_t r = 0;
-    for (int b = 0; b < len; ++b) r |= ((c >> b) & 1u) << (len - 1 - b);
-    for (uint32_t v = r; v < (1u << kFastBits); v += 1u << len) h.fast[v] = (uint16_t)((i << 4) | len);
-  }
-}
-
-int huff_decode(BitReader& br, const Huff& h) {
-  if (uint16_t e = h.fast[br.peek(kFastBits)]) {
-    int len = e & 15;
-    if (len <= br.have) { br.drop(len); return e >> 4; }
-    br.bad = true;   // the stream ends inside this code
-    return -1;
-  }
-  int code = 0, first = 0, index = 0;
-  for (int len = 1; len < 16; ++len) {
-    code |= br.bit();
-    int count = h.counts[len];
-    if (code - first < count) return h.symbols[(size_t)(index + (code - first))];
-    index += count;
-    first = (first + count) << 1;
-    code <<= 1;
-  }
-  return -1;
-}
+// A decode table entry (uint32): bits 0-3 the code's length in bits (0: no code here), bit 4 a pointer to a
+// subtable (bits 16-31 its first entry), bits 5-6 the kind, bits 8-11 extra bits to read, bits 16-31 the value
+// (a literal byte, or the base of a length or distance).
+enum : uint32_t { kSub = 1u << 4, kLit = 1u << 5, kBase = 2u << 5, kEob = 3u << 5, kKindMask = 3u << 5 };
+constexpr int kLitBits = 10, kDistBits = 8;   // primary table widths; longer codes go through a subtable
 
 const uint16_t kLenBase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
 const uint8_t  kLenExtra[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
 const uint16_t kDistBase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
 const uint8_t  kDistExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+
+struct Table {
+  std::vector<uint32_t> e;   // the primary table, then the subtables
+  int bits = 0;
+};
+
+// What symbol `sym` of an alphabet decodes to: for the literal/length alphabet a literal, the end of the block or a
+// length; for the distance alphabet a distance. 0 for a symbol the format does not use (286, 287, 30, 31).
+uint32_t sym_entry(bool litlen, int sym) {
+  if (litlen) {
+    if (sym < 256) return kLit | ((uint32_t)sym << 16);
+    if (sym == 256) return kEob;
+    if (sym <= 285) return kBase | ((uint32_t)kLenExtra[sym - 257] << 8) | ((uint32_t)kLenBase[sym - 257] << 16);
+    return 0;
+  }
+  if (sym < 30) return kBase | ((uint32_t)kDistExtra[sym] << 8) | ((uint32_t)kDistBase[sym] << 16);
+  return 0;
+}
+
+// A canonical Huffman code from its lengths. False for an over-subscribed set; an incomplete one is allowed (the
+// format permits it for a distance code of one symbol): its missing codes stay 0, and a stream that uses one fails.
+bool build(Table& t, const uint8_t* lengths, int n, bool litlen, int bits) {
+  int count[16] = {0};
+  for (int i = 0; i < n; ++i) count[lengths[i]]++;
+  count[0] = 0;
+  int left = 1;
+  for (int len = 1; len < 16; ++len) { left = (left << 1) - count[len]; if (left < 0) return false; }
+  uint32_t next[16];
+  uint32_t code = 0;
+  next[0] = 0;
+  for (int len = 1; len < 16; ++len) { code = (code + (uint32_t)count[len - 1]) << 1; next[len] = code; }
+  t.bits = bits;
+  t.e.assign((size_t)1 << bits, 0);
+  const int sub_bits = 15 - bits;
+  for (int sym = 0; sym < n; ++sym) {
+    const int len = lengths[sym];
+    if (!len) continue;
+    const uint32_t c = next[len]++;
+    uint32_t r = 0;   // the code as the stream carries it: most significant bit first, so reversed
+    for (int b = 0; b < len; ++b) r |= ((c >> b) & 1u) << (len - 1 - b);
+    const uint32_t v = sym_entry(litlen, sym) | (uint32_t)len;
+    if (len <= bits) {
+      for (uint32_t i = r; i < ((uint32_t)1 << bits); i += (uint32_t)1 << len) t.e[i] = v;
+      continue;
+    }
+    const uint32_t lo = r & (((uint32_t)1 << bits) - 1);
+    if (!(t.e[lo] & kSub)) {   // this prefix's subtable: 2^(15-bits) entries, indexed by the next bits
+      const size_t at = t.e.size();
+      t.e.resize(at + ((size_t)1 << sub_bits), 0);
+      t.e[lo] = kSub | ((uint32_t)at << 16);
+    }
+    const size_t base = t.e[lo] >> 16;
+    const uint32_t hi = r >> bits;
+    for (uint32_t i = hi; i < ((uint32_t)1 << sub_bits); i += (uint32_t)1 << (len - bits)) t.e[base + i] = v;
+  }
+  return true;
+}
+
+// The entry for the next code (and its length), or 0.
+inline uint32_t lookup(const Table& t, uint64_t buf) {
+  uint32_t e = t.e[buf & (((uint64_t)1 << t.bits) - 1)];
+  if (e & kSub) e = t.e[(e >> 16) + ((buf >> t.bits) & (((uint64_t)1 << (15 - t.bits)) - 1))];
+  return e;
+}
+
+const Table& fixed_litlen() {
+  static const Table t = [] {
+    uint8_t l[288];
+    for (int i = 0; i < 144; ++i) l[i] = 8;
+    for (int i = 144; i < 256; ++i) l[i] = 9;
+    for (int i = 256; i < 280; ++i) l[i] = 7;
+    for (int i = 280; i < 288; ++i) l[i] = 8;
+    Table x;
+    build(x, l, 288, true, kLitBits);
+    return x;
+  }();
+  return t;
+}
+const Table& fixed_dist() {
+  static const Table t = [] {
+    uint8_t l[30];
+    for (int i = 0; i < 30; ++i) l[i] = 5;
+    Table x;
+    build(x, l, 30, false, kDistBits);
+    return x;
+  }();
+  return t;
+}
+
+}  // namespace
+
+namespace {
+
+// Where the decoder writes: [base, end) is the room it has; `o` the next byte. A growable output (a ByteBuffer
+// whose final size is not known) moves when it grows; a fixed one (inflate_raw_exact: a store chunk, its size known)
+// is written in place, never past `end`.
+struct Out {
+  uint8_t* base;
+  uint8_t* o;
+  uint8_t* end;
+  ByteBuffer* vec = nullptr;   // growable: the buffer, its bytes from `start` on
+  size_t start = 0;
+  size_t max_out = SIZE_MAX;
+  size_t produced() const { return (size_t)(o - base); }
+  // Room for k more bytes (plus 16 of slack in a growable buffer for the word copies): false past max_out or past a
+  // fixed buffer's end.
+  bool room(size_t k) {
+    if ((size_t)(end - o) >= k) return true;
+    if (!vec) return false;
+    const size_t have = produced();
+    if (have + k > max_out) return false;
+    size_t want = std::max(have + k, (size_t)(end - base) * 2);
+    if (max_out != SIZE_MAX) want = std::min(want, max_out);
+    vec->resize(start + want + 16);
+    base = vec->data() + start;
+    o = base + have;
+    end = base + want;
+    return true;
+  }
+};
+
+const char* inflate_blocks(Bits& br, Out& out) {
+  Table dyn_lit, dyn_dist;
+  for (;;) {
+    br.refill();
+    uint32_t final_block = 0, type = 0;
+    if (!br.take(1, &final_block) || !br.take(2, &type)) return "truncated deflate stream";
+
+    if (type == 0) {   // stored
+      br.align();
+      if (br.pos + 4 > br.n) return "truncated stored block";
+      const uint32_t len = (uint32_t)br.d[br.pos] | ((uint32_t)br.d[br.pos + 1] << 8);
+      const uint32_t nlen = (uint32_t)br.d[br.pos + 2] | ((uint32_t)br.d[br.pos + 3] << 8);
+      if ((len ^ 0xFFFFu) != nlen) return "stored block length check failed";
+      br.pos += 4;
+      if (br.pos + len > br.n) return "stored block runs past end";
+      if (!out.room(len)) return "inflates past the size limit";
+      std::memcpy(out.o, br.d + br.pos, len);
+      out.o += len;
+      br.pos += len;
+      if (final_block) return nullptr;
+      continue;
+    }
+    if (type == 3) return "reserved deflate block type";
+
+    const Table* lit = &fixed_litlen();
+    const Table* dist = &fixed_dist();
+    if (type == 2) {   // dynamic: the code lengths, themselves Huffman coded
+      uint32_t hlit, hdist, hclen;
+      br.refill();
+      if (!br.take(5, &hlit) || !br.take(5, &hdist) || !br.take(4, &hclen)) return "truncated deflate stream";
+      hlit += 257; hdist += 1; hclen += 4;
+      if (hlit > 286 || hdist > 30) return "too many length or distance codes";
+      static const uint8_t order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+      uint8_t cl[19] = {0};
+      for (uint32_t i = 0; i < hclen; ++i) {
+        br.refill();
+        uint32_t v;
+        if (!br.take(3, &v)) return "truncated deflate stream";
+        cl[order[i]] = (uint8_t)v;
+      }
+      // The code-length code: symbols 0..18, at most 7 bits; a plain table of 128 with (symbol << 16) | length.
+      uint32_t clt[128] = {0};
+      {
+        int count[16] = {0};
+        for (int i = 0; i < 19; ++i) count[cl[i]]++;
+        count[0] = 0;
+        int left = 1;
+        for (int len = 1; len < 16; ++len) { left = (left << 1) - count[len]; if (left < 0) return "bad code length code"; }
+        uint32_t next[16]; uint32_t code = 0; next[0] = 0;
+        for (int len = 1; len < 16; ++len) { code = (code + (uint32_t)count[len - 1]) << 1; next[len] = code; }
+        for (int sym = 0; sym < 19; ++sym) {
+          const int len = cl[sym];
+          if (!len) continue;
+          const uint32_t c = next[len]++;
+          uint32_t r = 0;
+          for (int b = 0; b < len; ++b) r |= ((c >> b) & 1u) << (len - 1 - b);
+          for (uint32_t i = r; i < 128; i += (uint32_t)1 << len) clt[i] = ((uint32_t)sym << 16) | (uint32_t)len;
+        }
+      }
+      uint8_t lengths[286 + 30] = {0};
+      uint32_t n = 0;
+      while (n < hlit + hdist) {
+        br.refill();
+        const uint32_t e = clt[br.peek(7)];
+        const int len = (int)(e & 15);
+        if (!len || !br.drop(len)) return "bad code length symbol";
+        const uint32_t sym = e >> 16;
+        uint32_t rep = 0, val = 0;
+        if (sym < 16) { lengths[n++] = (uint8_t)sym; continue; }
+        if (sym == 16) {
+          if (n == 0) return "repeat with no previous length";
+          if (!br.take(2, &rep)) return "truncated deflate stream";
+          rep += 3; val = lengths[n - 1];
+        } else if (sym == 17) {
+          if (!br.take(3, &rep)) return "truncated deflate stream";
+          rep += 3;
+        } else {
+          if (!br.take(7, &rep)) return "truncated deflate stream";
+          rep += 11;
+        }
+        if (n + rep > hlit + hdist) return "code lengths run past their count";
+        while (rep--) lengths[n++] = (uint8_t)val;
+      }
+      if (lengths[256] == 0) return "no end-of-block code";
+      if (!build(dyn_lit, lengths, (int)hlit, true, kLitBits) || !build(dyn_dist, lengths + hlit, (int)hdist, false, kDistBits))
+        return "bad Huffman code lengths";
+      lit = &dyn_lit;
+      dist = &dyn_dist;
+    }
+
+    const uint32_t* lt = lit->e.data();
+    const uint32_t* dt = dist->e.data();
+    constexpr uint64_t kLitMask = ((uint64_t)1 << kLitBits) - 1, kLitSub = ((uint64_t)1 << (15 - kLitBits)) - 1;
+    constexpr uint64_t kDistMask = ((uint64_t)1 << kDistBits) - 1, kDistSub = ((uint64_t)1 << (15 - kDistBits)) - 1;
+    auto lit_at = [lt](uint64_t b) { uint32_t e = lt[b & kLitMask]; if (e & kSub) e = lt[(e >> 16) + ((b >> kLitBits) & kLitSub)]; return e; };
+    auto dist_at = [dt](uint64_t b) { uint32_t e = dt[b & kDistMask]; if (e & kSub) e = dt[(e >> 16) + ((b >> kDistBits) & kDistSub)]; return e; };
+    constexpr size_t kMargin = 258 + 16;   // a whole match plus a word copy's overrun
+
+    for (;;) {
+      // Fast path: eight more input bytes and a whole match's room: no bound checked per byte, the bit buffer
+      // in registers, up to three literals a refill (56 bits; a literal code is at most 15).
+      if (br.pos + 16 <= br.n && (size_t)(out.end - out.o) >= kMargin) {
+        uint64_t buf = br.buf;
+        int have = br.have;
+        uint8_t* o = out.o;
+        uint8_t* const fast_end = out.end - kMargin;
+        const uint8_t* const in_end = br.d + br.n - 16;   // room for two eight-byte loads an iteration (one before a length)
+        const char* err = nullptr;
+        bool eob = false;
+        while (o <= fast_end && br.d + br.pos <= in_end) {
+          { uint64_t w; std::memcpy(&w, br.d + br.pos, 8); buf |= w << have; const int t = (63 - have) >> 3; br.pos += (size_t)t; have += t * 8; }
+          uint32_t e = lit_at(buf);
+          int len = (int)(e & 15);
+          if (!len) { err = "bad literal/length symbol"; break; }
+          buf >>= len; have -= len;
+          if ((e & kKindMask) == kLit) {
+            *o++ = (uint8_t)(e >> 16);
+            e = lit_at(buf);
+            if ((e & kKindMask) != kLit) goto not_literal;
+            len = (int)(e & 15);
+            buf >>= len; have -= len;
+            *o++ = (uint8_t)(e >> 16);
+            e = lit_at(buf);
+            if ((e & kKindMask) != kLit) goto not_literal;
+            len = (int)(e & 15);
+            buf >>= len; have -= len;
+            *o++ = (uint8_t)(e >> 16);
+            continue;
+          not_literal:
+            len = (int)(e & 15);
+            if (!len) { err = "bad literal/length symbol"; break; }
+            if (have < 48) {   // a length and a distance may need 48 bits: refill first
+              { uint64_t w; std::memcpy(&w, br.d + br.pos, 8); buf |= w << have; const int t = (63 - have) >> 3; br.pos += (size_t)t; have += t * 8; }
+            }
+            buf >>= len; have -= len;
+          }
+          {
+            const uint32_t kind = e & kKindMask;
+            if (kind == kEob) { eob = true; break; }
+            if (kind != kBase) { err = "invalid length symbol"; break; }
+            const int xl = (int)((e >> 8) & 15);
+            const uint32_t mlen = (e >> 16) + (uint32_t)(buf & ((1u << xl) - 1));
+            buf >>= xl; have -= xl;
+            const uint32_t de = dist_at(buf);
+            const int dl = (int)(de & 15);
+            if (!dl || (de & kKindMask) != kBase) { err = "invalid distance symbol"; break; }
+            buf >>= dl; have -= dl;
+            const int xd = (int)((de >> 8) & 15);
+            const size_t d = (de >> 16) + (size_t)(buf & ((1u << xd) - 1));
+            buf >>= xd; have -= xd;
+            if (d > (size_t)(o - out.base)) { err = "distance before start of output"; break; }
+            const uint8_t* src = o - d;
+            if (d >= 8) {   // a word at a time; up to 7 bytes past the match land in the margin and are overwritten later
+              uint8_t* w = o;
+              uint8_t* const stop = o + mlen;
+              do { uint64_t v; std::memcpy(&v, src, 8); std::memcpy(w, &v, 8); src += 8; w += 8; } while (w < stop);
+            } else if (d == 1) {
+              std::memset(o, *src, mlen);
+            } else {
+              for (uint32_t i = 0; i < mlen; ++i) o[i] = src[i];   // overlapping: the copy feeds itself
+            }
+            o += mlen;
+          }
+        }
+        br.buf = buf;
+        br.have = have;
+        out.o = o;
+        if (err) return err;
+        if (eob) break;
+        continue;
+      }
+      // Careful path: the last bytes of the input or the output, every take and write checked.
+      br.refill();
+      uint32_t e = lit_at(br.buf);
+      int len = (int)(e & 15);
+      if (!len || !br.drop(len)) return "bad literal/length symbol";
+      const uint32_t kind = e & kKindMask;
+      if (kind == kLit) {
+        if (!out.room(1)) return "inflates past the size limit";
+        *out.o++ = (uint8_t)(e >> 16);
+        continue;
+      }
+      if (kind == kEob) break;
+      if (kind != kBase) return "invalid length symbol";
+      uint32_t extra = 0;
+      if (!br.take((int)((e >> 8) & 15), &extra)) return "truncated deflate stream";
+      const uint32_t mlen = (e >> 16) + extra;
+      const uint32_t de = dist_at(br.buf);
+      len = (int)(de & 15);
+      if (!len || (de & kKindMask) != kBase || !br.drop(len)) return "invalid distance symbol";
+      if (!br.take((int)((de >> 8) & 15), &extra)) return "truncated deflate stream";
+      const size_t d = (de >> 16) + extra;
+      if (d > out.produced()) return "distance before start of output";
+      if (!out.room(mlen)) return "inflates past the size limit";
+      const uint8_t* src = out.o - d;
+      for (uint32_t i = 0; i < mlen; ++i) out.o[i] = src[i];
+      out.o += mlen;
+    }
+    if (final_block) return nullptr;
+  }
+}
 
 }  // namespace
 
@@ -446,103 +734,25 @@ bool inflate_raw_tree(ByteSpan whole, size_t offset, ByteBuffer& out, size_t* en
                       size_t max_out) {
   auto fail = [&](const char* w) { if (why) *why = w; return false; };
   if (offset > whole.size()) return fail("inflate past the end of the buffer");
-  ByteSpan data = whole.subspan(offset);
-  BitReader br{data};
-  Huff fixed_lit, fixed_dist;
-  bool fixed_ready = false;
-
-  for (;;) {
-    int final_block = br.bit();
-    int type = (int)br.bits(2);
-    if (br.bad) return fail("truncated deflate stream");
-
-    if (type == 0) {
-      br.align();
-      if (br.pos + 4 > br.d.size()) return fail("truncated stored block");
-      uint32_t len = (uint32_t)br.d[br.pos] | ((uint32_t)br.d[br.pos + 1] << 8);
-      br.pos += 4;
-      if (br.pos + len > br.d.size()) return fail("stored block runs past end");
-      if (out.size() + len > max_out) return fail("inflates past the size limit");
-      out.insert(out.end(), br.d.begin() + br.pos, br.d.begin() + br.pos + len);
-      br.pos += len;
-    } else if (type == 1 || type == 2) {
-      Huff dyn_lit, dyn_dist;
-      const Huff* lit;
-      const Huff* dist;
-      if (type == 1) {
-        if (!fixed_ready) {
-          uint8_t l[288];
-          for (int i = 0; i < 144; ++i) l[i] = 8;
-          for (int i = 144; i < 256; ++i) l[i] = 9;
-          for (int i = 256; i < 280; ++i) l[i] = 7;
-          for (int i = 280; i < 288; ++i) l[i] = 8;
-          huff_build(fixed_lit, l, 288);
-          uint8_t d2[30];
-          for (int i = 0; i < 30; ++i) d2[i] = 5;
-          huff_build(fixed_dist, d2, 30);
-          fixed_ready = true;
-        }
-        lit = &fixed_lit; dist = &fixed_dist;
-      } else {
-        int hlit = (int)br.bits(5) + 257;
-        int hdist = (int)br.bits(5) + 1;
-        int hclen = (int)br.bits(4) + 4;
-        static const uint8_t order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
-        uint8_t clen[19];
-        std::memset(clen, 0, sizeof(clen));
-        for (int i = 0; i < hclen; ++i) clen[order[i]] = (uint8_t)br.bits(3);
-        Huff code_huff;
-        huff_build(code_huff, clen, 19);
-        uint8_t lengths[320];
-        std::memset(lengths, 0, sizeof(lengths));
-        int n = 0;
-        while (n < hlit + hdist) {
-          int sym = huff_decode(br, code_huff);
-          if (sym < 0 || br.bad) return fail("bad code-length symbol");
-          if (sym < 16) { lengths[n++] = (uint8_t)sym; continue; }
-          int rep = 0; uint8_t val = 0;
-          if (sym == 16) { if (n == 0) return fail("repeat with no previous length"); val = lengths[n - 1]; rep = 3 + (int)br.bits(2); }
-          else if (sym == 17) { rep = 3 + (int)br.bits(3); }
-          else { rep = 11 + (int)br.bits(7); }
-          if (n + rep > hlit + hdist) return fail("code lengths overflow");
-          while (rep--) lengths[n++] = val;
-        }
-        huff_build(dyn_lit, lengths, hlit);
-        huff_build(dyn_dist, lengths + hlit, hdist);
-        lit = &dyn_lit; dist = &dyn_dist;
-      }
-
-      for (;;) {
-        int sym = huff_decode(br, *lit);
-        if (sym < 0 || br.bad) return fail("bad literal/length symbol");
-        if (sym < 256) {
-          if (out.size() >= max_out) return fail("inflates past the size limit");
-          out.push_back((uint8_t)sym);
-          continue;
-        }
-        if (sym == 256) break;
-        sym -= 257;
-        if (sym >= 29) return fail("invalid length symbol");
-        uint32_t len = kLenBase[sym] + br.bits(kLenExtra[sym]);
-        int dsym = huff_decode(br, *dist);
-        if (dsym < 0 || dsym >= 30) return fail("invalid distance symbol");
-        uint32_t d = kDistBase[dsym] + br.bits(kDistExtra[dsym]);
-        if (d > out.size()) return fail("distance before start of output");
-        const size_t at = out.size(), from = at - d;
-        if (at + len > max_out) return fail("inflates past the size limit");
-        out.resize(at + len);
-        uint8_t* o = out.data();
-        if (d >= len) std::memcpy(o + at, o + from, len);            // the two ranges are apart
-        else for (uint32_t i = 0; i < len; ++i) o[at + i] = o[from + i];   // overlapping: the copy feeds itself
-      }
-    } else {
-      return fail("reserved deflate block type");
-    }
-    if (final_block) break;
-  }
-  if (br.bad) return fail("truncated deflate stream");
+  Bits br{whole.data() + offset, whole.size() - offset};
+  const size_t start = out.size();
+  // Room up front: the whole answer when its size is known, else a guess that doubles as it is passed.
+  size_t room = expect ? expect : std::max<size_t>(64 << 10, (whole.size() - offset) * 4);
+  if (max_out != SIZE_MAX) room = std::min(room, max_out);
+  out.resize(start + room + 16);
+  Out o{out.data() + start, out.data() + start, out.data() + start + room, &out, start, max_out};
+  const char* err = inflate_blocks(br, o);
+  out.resize(start + o.produced());
+  if (err) return fail(err);
   if (end_offset) *end_offset = offset + br.consumed();   // every byte the stream used, the last one whole
   return true;
+}
+
+// Straight into the caller's buffer (a store chunk: its size known): no copy, no growing, never a byte past it.
+static bool inflate_raw_into(ByteSpan data, uint8_t* dst, size_t expect) {
+  Bits br{data.data(), data.size()};
+  Out o{dst, dst, dst + expect};
+  return inflate_blocks(br, o) == nullptr && o.produced() == expect;
 }
 
 
@@ -614,26 +824,16 @@ bool gzip_decode(ByteSpan data, ByteBuffer& out, size_t max_out, std::string* wh
   return true;
 }
 
-bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) {
-#if defined(AIOS_HAVE_LIBDEFLATE)
-  if (host_inflate_raw_exact(data, out, expect)) return true;   // anything else: zlib or the decoder below says why, and the answer must agree
-#endif
-#if defined(AIOS_HAVE_ZLIB)
-  {
-    ByteBuffer zb;
-    size_t consumed = 0;
-    if (zlib_inflate_raw(data, &zb, &consumed, expect)) {
-      if (zb.size() != expect) return false;
-      std::memcpy(out, zb.data(), expect);
-      return true;
-    }
-  }
-#endif
-  ByteBuffer tree;
-  tree.reserve(expect);
-  if (!inflate_raw_tree(data, 0, tree, nullptr, expect, nullptr) || tree.size() != expect) return false;
-  std::memcpy(out, tree.data(), expect);
-  return true;
+bool inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect) { return inflate_raw_into(data, out, expect); }
+
+bool zlib_inflate_prefix(ByteSpan data, uint8_t* out, size_t max, size_t* got) {
+  if (data.size() < 2 || (data[0] & 0x0f) != 8 || (((uint32_t)data[0] << 8) | data[1]) % 31 != 0 || (data[1] & 0x20)) return false;
+  Bits br{data.data() + 2, data.size() - 2};
+  Out o{out, out, out + max};
+  const char* err = inflate_blocks(br, o);
+  *got = o.produced();
+  // Stopping because `out` is full is what was asked for; anything else that stops it is damage.
+  return err == nullptr || (o.produced() == max && std::strcmp(err, "inflates past the size limit") == 0);
 }
 
 Result<ByteBuffer> zlib_inflate(ByteSpan data) {
@@ -642,13 +842,6 @@ Result<ByteBuffer> zlib_inflate(ByteSpan data) {
   if ((cmf & 0x0f) != 8) return Result<ByteBuffer>(Status::Corrupt, "not a deflate stream");
   if (((uint32_t)cmf << 8 | flg) % 31 != 0) return Result<ByteBuffer>(Status::Corrupt, "bad zlib header check");
   if (flg & 0x20) return Result<ByteBuffer>(Status::Unsupported, "zlib preset dictionary");
-#if defined(AIOS_HAVE_ZLIB)
-  {
-    ByteBuffer out;
-    size_t used = 0;
-    if (zlib_inflate_z(data, &out, &used, 0)) return out;
-  }
-#endif
   ByteBuffer out;
   size_t inner_end = 0;
   std::string why;

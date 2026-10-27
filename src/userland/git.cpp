@@ -171,16 +171,6 @@ Result<ByteBuffer> zlib_inflate_at(ByteSpan whole, size_t offset, size_t* end_of
   if ((cmf & 0x0f) != 8) return Result<ByteBuffer>(Status::Corrupt, "not a deflate stream");
   if (((uint32_t)cmf << 8 | flg) % 31 != 0) return Result<ByteBuffer>(Status::Corrupt, "bad zlib header check");
   if (flg & 0x20) return Result<ByteBuffer>(Status::Unsupported, "zlib preset dictionary");
-#if defined(AIOS_HAVE_ZLIB)
-  {
-    ByteBuffer out;
-    size_t used = 0;
-    if (net::zlib_inflate_z(data, &out, &used, expect)) {
-      if (end_offset) *end_offset = offset + used;
-      return out;
-    }
-  }
-#endif
   size_t inner_end = 0;
   auto out = inflate_raw(whole, offset + 2, &inner_end, expect);
   if (!out.ok()) return out;
@@ -199,19 +189,6 @@ Result<ByteBuffer> zlib_inflate_at(ByteSpan whole, size_t offset, size_t* end_of
 Result<ByteBuffer> inflate_raw(ByteSpan whole, size_t offset, size_t* end_offset, size_t expect) {
   if (offset > whole.size()) return Result<ByteBuffer>(Status::Invalid, "inflate past the end of the buffer");
   ByteSpan data = whole.subspan(offset);
-#if defined(AIOS_HAVE_ZLIB)
-  // The system zlib where the host has one: a clone inflates every object of
-  // the pack, and the decoder below took a fifth of its time. The decoder
-  // stays for a host without zlib, and for anything zlib refuses.
-  {
-    ByteBuffer out;
-    size_t used = 0;
-    if (net::zlib_inflate_raw(data, &out, &used, expect)) {
-      if (end_offset) *end_offset = offset + used;
-      return out;
-    }
-  }
-#endif
 
   ByteBuffer out;
   std::string why;
@@ -1153,7 +1130,6 @@ bool Git::commit_meta(const std::string& oid, std::string& tree, std::vector<std
 }
 
 bool Git::packed_commit_head(const std::string& oid, GitCommit& c) const {
-#if defined(AIOS_HAVE_ZLIB)
   uint8_t want[20];
   if (!mem_.empty() || oid.size() != 40 || !hex_to_20(oid, want)) return false;
   load_pack_indexes();
@@ -1173,19 +1149,10 @@ bool Git::packed_commit_head(const std::string& oid, GitCommit& c) const {
     while ((b & 0x80) && p < pack.size()) { b = pack[p++]; size |= (uint64_t)(b & 0x7f) << shift; shift += 7; }
     uint8_t head[1024];
     size_t got = 0;
-    thread_local ByteBuffer whole;
+    // The commit's first KB only: the in-tree inflater stops there (the tree and committer lines are at the top).
     const uint8_t* text = head;
-    // libdeflate inflates the whole commit faster than zlib inflates its head; zlib stops at 1 KB
-    if (size <= (64u << 10)) {
-      whole.resize((size_t)size);
-      if (net::zlib_inflate_known(pack.subspan(p), whole.data(), (size_t)size, nullptr, &got)) text = whole.data();
-      else got = 0;
-    }
-    if (!got) {
-      const size_t want_n = (size_t)std::min<uint64_t>(size, sizeof head);
-      if (!net::zlib_inflate_prefix(pack.subspan(p), head, want_n, &got) || got == 0) return false;
-      text = head;
-    }
+    const size_t want_n = (size_t)std::min<uint64_t>(size, sizeof head);
+    if (!net::zlib_inflate_prefix(pack.subspan(p), head, want_n, &got) || got == 0) return false;
     // the committer line must be whole in what was inflated
     const std::string_view h((const char*)text, got);
     const size_t cl = h.find("\ncommitter ");
@@ -1194,9 +1161,6 @@ bool Git::packed_commit_head(const std::string& oid, GitCommit& c) const {
     scan_commit(text, got, c, true);
     return !c.tree.empty();
   }
-#else
-  (void)oid; (void)c;
-#endif
   return false;
 }
 
@@ -1616,10 +1580,6 @@ namespace {
 // The first bytes a zlib stream at `off` of `whole` inflates to (at most `max`).
 size_t inflate_head(ByteSpan whole, size_t off, uint8_t* out, size_t max) {
   if (off >= whole.size()) return 0;
-#if defined(AIOS_HAVE_ZLIB)
-  size_t got = 0;
-  if (net::zlib_inflate_prefix(whole.subspan(off), out, max, &got)) return got;
-#endif
   auto z = zlib_inflate_at(whole, off, nullptr);
   if (!z.ok()) return 0;
   const size_t n = std::min(max, z->size());

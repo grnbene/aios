@@ -76,9 +76,6 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #elif defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__) || defined(__SSE4_2__)
 #include <immintrin.h>
 #endif
-#if defined(AIOS_HAVE_LIBDEFLATE)
-#include <libdeflate.h>
-#endif
 #if defined(_WIN32)
 #include <mutex>
 #else
@@ -13640,23 +13637,16 @@ void store_pack(const uint8_t* raw, size_t n, ByteBuffer& out, bool dense) {
     uint8_t* body = head + kStoreChunkHeader;
     size_t stored = 0;
     uint8_t kind = 0;
-#if defined(AIOS_HAVE_LIBDEFLATE)
-    if (dense) {
-    struct C {
-      libdeflate_compressor* c = libdeflate_alloc_compressor(5);
-      ~C() { if (c) libdeflate_free_compressor(c); }
-    };
-    thread_local C comp;
-    if (comp.c) {
-      stored = libdeflate_deflate_compress(comp.c, plain, len, body, len);
-      if (stored > 0 && stored < len) {
+    if (dense) {   // deflate (level 5): smaller, several times the CPU of LZ4, for a table that has stopped changing
+      thread_local ByteBuffer z;
+      z.clear();
+      net::deflate_raw_append(ByteSpan(plain, len), 5, z);
+      if (!z.empty() && z.size() < len) {
+        std::memcpy(body, z.data(), z.size());
+        stored = z.size();
         kind = 2;
       }
     }
-    }
-#else
-    (void)dense;
-#endif
     if (kind == 0) {
       stored = lz4_compress_into(plain, len, body);
       kind = 1;
@@ -13715,25 +13705,7 @@ bool store_unpack(ByteSpan in, ByteBuffer& out, std::string* why, size_t* end = 
       } else if (p.kind == 1) {
         if (!lz4_decompress(base + p.in_at, p.stored, dst, p.len)) { bad = true; break; }
       } else if (p.kind == 2) {
-#if defined(AIOS_HAVE_LIBDEFLATE)
-        struct D {
-          libdeflate_decompressor* d = libdeflate_alloc_decompressor();
-          ~D() { if (d) libdeflate_free_decompressor(d); }
-        };
-        thread_local D dec;
-        if (!dec.d || libdeflate_deflate_decompress(dec.d, base + p.in_at, p.stored, dst, p.len, nullptr) != LIBDEFLATE_SUCCESS) {
-          bad = true; break;
-        }
-#elif defined(AIOS_HAVE_ZLIB)
-        size_t consumed = 0;
-        ByteBuffer zb;
-        if (!net::zlib_inflate_raw(ByteSpan(base + p.in_at, p.stored), &zb, &consumed, p.len) || zb.size() != p.len) {
-          bad = true; break;
-        }
-        std::memcpy(dst, zb.data(), p.len);
-#else
-        bad = true; break;
-#endif
+        if (!net::inflate_raw_exact(ByteSpan(base + p.in_at, p.stored), dst, p.len)) { bad = true; break; }
       }
       if (store_hash64(dst, p.len) != p.hash) { bad = true; break; }
     }

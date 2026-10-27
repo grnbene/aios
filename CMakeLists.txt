@@ -214,36 +214,9 @@ if(AIOS_HOST_COMPAT_INCLUDE)
   target_include_directories(aios PRIVATE ${AIOS_HOST_COMPAT_INCLUDE})
 endif()
 target_link_libraries(aios PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
-# HTTP gzip (src/net/gzip.cpp) uses the system zlib when the host has one:
-# dynamic Huffman, the ratio and speed nginx gets. Without it (and always on
-# bare metal, which builds src/ with metal/build.sh) the fixed-Huffman
-# encoder in that file is used instead.
-find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
-  target_compile_definitions(aios PUBLIC AIOS_HAVE_ZLIB=1)
-  target_link_libraries(aios PUBLIC ZLIB::ZLIB)
-  # libdeflate, where the host has it, inflates a stream whose size is known (every git object: its header says)
-  # in one call, two to three times faster than zlib's streaming inflate. zlib stays for everything else and for
-  # whatever libdeflate refuses. The static archive is preferred, so the binary needs nothing more at run time.
-  find_path(AIOS_LIBDEFLATE_INCLUDE libdeflate.h)
-  find_library(AIOS_LIBDEFLATE_LIB NAMES libdeflate.a deflate)
-  if(AIOS_LIBDEFLATE_INCLUDE AND AIOS_LIBDEFLATE_LIB)
-    target_compile_definitions(aios PUBLIC AIOS_HAVE_LIBDEFLATE=1)
-    target_include_directories(aios PUBLIC ${AIOS_LIBDEFLATE_INCLUDE})
-    target_link_libraries(aios PUBLIC ${AIOS_LIBDEFLATE_LIB})
-    message(STATUS "libdeflate: ${AIOS_LIBDEFLATE_LIB}")
-  endif()
-endif()
-# zstd, where the host has it: the MySQL wire's zstd compressed protocol (CLIENT_ZSTD_COMPRESSION_ALGORITHM). The
-# static archive is preferred, as for libdeflate.
-find_path(AIOS_ZSTD_INCLUDE zstd.h)
-find_library(AIOS_ZSTD_LIB NAMES libzstd.a zstd)
-if(AIOS_ZSTD_INCLUDE AND AIOS_ZSTD_LIB)
-  target_compile_definitions(aios PUBLIC AIOS_HAVE_ZSTD=1)
-  target_include_directories(aios PUBLIC ${AIOS_ZSTD_INCLUDE})
-  target_link_libraries(aios PUBLIC ${AIOS_ZSTD_LIB})
-  message(STATUS "zstd: ${AIOS_ZSTD_LIB}")
-endif()
+# Compression is all in-tree (src/net/deflate.cpp: deflate, inflate, gzip, CRC-32; src/userland/git.cpp: the zlib
+# envelope, Adler-32): no zlib, libdeflate or zstd is linked. The MySQL wire's zstd protocol is not offered until an
+# in-tree zstd exists; clients fall back to zlib.
 # shm_open/shm_unlink live in librt before glibc 2.34 (Ubuntu 20.04, Debian
 # bullseye); newer glibc folds it into libc and an empty librt still links.
 if(UNIX AND NOT APPLE)

@@ -53,21 +53,6 @@ class GzipStreamEncoder {
 // convenience wrapper over GzipStreamEncoder for the non-streaming case.
 ByteBuffer gzip_compress_whole(ByteSpan data);
 
-#if defined(AIOS_HAVE_ZLIB)
-// A raw deflate stream through the system zlib (see gzip_zlib.cpp).
-bool zlib_inflate_raw(ByteSpan data, ByteBuffer* out, size_t* consumed, size_t expect);
-bool zlib_inflate_z(ByteSpan data, ByteBuffer* out, size_t* consumed, size_t expect);
-bool zlib_inflate_prefix(ByteSpan data, uint8_t* out, size_t max, size_t* got);
-// A zlib stream that inflates to at most `expect` bytes, into `out`, in one call (libdeflate). False where the host
-// has no libdeflate or it refuses the stream: the caller then inflates with zlib.
-bool zlib_inflate_known(ByteSpan data, uint8_t* out, size_t expect, size_t* consumed, size_t* got);
-#endif
-#if defined(AIOS_HAVE_LIBDEFLATE)
-// The host's libdeflate (src/hal/gzip_zlib.cpp): a raw deflate stream that inflates to exactly `expect` bytes; and
-// `data` compressed raw at `level` into `out`, its size, or 0 when it does not fit in `cap`.
-bool host_inflate_raw_exact(ByteSpan data, uint8_t* out, size_t expect);
-size_t host_deflate_raw(ByteSpan data, uint8_t* out, size_t cap, int level);
-#endif
 
 // Picks gzip when the client's Accept-Encoding header allows it and `mime`
 // is a type worth compressing (text/html, application/json, ...); images,
