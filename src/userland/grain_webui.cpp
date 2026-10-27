@@ -132,6 +132,9 @@ const char* kStyle = R"CSS(
   }
 }
 *{box-sizing:border-box}
+@keyframes ui-flash{from{background-color:rgba(250,204,21,.45);box-shadow:0 0 0 3px rgba(250,204,21,.45)}to{background-color:transparent;box-shadow:0 0 0 3px transparent}}
+.ui-changed{animation:ui-flash 1.8s ease-out;border-radius:3px}
+@media (prefers-reduced-motion:reduce){.ui-changed{animation:none;outline:2px solid rgba(250,204,21,.6)}}
 body{
   margin:0;background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(59,130,246,0.12),transparent),var(--bg);
   min-height:100vh;color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -556,14 +559,26 @@ const char* kScript = R"JS(
     });
     return p;
   }
+  // A pushed update (not the answer to this viewer's own action) marks the text it changes, briefly: what moved.
+  function flash(el){
+    if(!el||!el.classList)return;
+    el.classList.remove('ui-changed');void el.offsetWidth;el.classList.add('ui-changed');
+    clearTimeout(el._uiFlash);el._uiFlash=setTimeout(function(){el.classList.remove('ui-changed')},1800);
+  }
   function morph(target,source,fromAction){
     if(target.nodeType!==source.nodeType||target.nodeName!==source.nodeName){
       target.replaceWith(source.cloneNode(true));return;
     }
     if(target.nodeType===Node.TEXT_NODE){
-      if(target.textContent!==source.textContent)target.textContent=source.textContent;return;
+      if(target.textContent!==source.textContent){
+        target.textContent=source.textContent;
+        if(!fromAction&&target.textContent.trim()!=='')flash(target.parentElement);
+      }
+      return;
     }
     if(target.nodeType!==Node.ELEMENT_NODE)return;
+    // data-ui-keep: the page's own (a clock its script keeps): an update leaves it as it is
+    if(target.hasAttribute('data-ui-keep'))return;
     var sa=source.attributes,ta=target.attributes;
     for(var i=0;i<sa.length;i++){
       var a=sa[i];if(target.getAttribute(a.name)!==a.value)target.setAttribute(a.name,a.value);
