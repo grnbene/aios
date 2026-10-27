@@ -441,6 +441,8 @@ class ThingEngine {
   void asof_trim(Kind& k);                      // past its days or its size: rewritten from a later cut-off
   SqlQueryResult asof_show(Kind& k, uint64_t end_ns, const std::vector<std::string>* keys);
   SqlQueryResult set_keep(const std::string& name, int days);
+  // EXPLAIN THING <name> '<key>' [LIMIT n]: the source rows that make up one Thing.
+  SqlQueryResult explain(const std::string& sql);
   SqlQueryResult show_shadow(const std::string& name);
   // The names a row Thing's values go by, as WHEN and DO see them: the key's first, then each output column.
   std::vector<std::string> value_labels(const Kind& k) const;
