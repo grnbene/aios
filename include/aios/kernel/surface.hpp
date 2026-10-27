@@ -46,6 +46,7 @@ class Surface {
 
   // Compute
   Result<GraphID> create_graph();
+  Result<void> destroy_graph(const GraphID& g);
   Result<OperationID> add_operation(const GraphID& g, Operation op);
   Result<ExecutionReport> execute(const GraphID& g, const SchedulePolicy& policy = {});
   Result<std::vector<Placement>> plan(const GraphID& g);
