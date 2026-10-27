@@ -280,9 +280,10 @@ fn span_label(span) {
 }
 
 // Through the day: what each hour of the day holds over the range, a column per hour with its touches stacked by
-// source (receiving at the foot) and scaled to the busiest hour. A click picks that hour (again: all hours); a drag
-// across the columns picks a span (TIMELINE_JS sets the bound "span" field and presses the hidden apply button).
-// Outside the span the columns dim. Each column's title gives its figures.
+// source (receiving at the foot) and scaled to the busiest hour, and under it a slider with two handles over the same
+// hours. Dragging a handle shows the span as it goes (SLIDER_JS) and picks it when let go (the handles are bound
+// fields, their change an action); a click on a column picks that hour (again: all hours). Outside the span the
+// columns dim. Each column's title gives its figures.
 fn timeline_node(report, span, pick) {
   let profile = report.profile ?? []
   let top = max(1.0, max(concat([0.0], map(profile, fn(p) { return real(p.touches) }))))
@@ -301,52 +302,57 @@ fn timeline_node(report, span, pick) {
               el("span", {"class": "tl-bar", "style": "height:" + str(round(100.0 * total / top, 2)) + "%"}, segs))
   })
   let axis = map(range(0, 24), fn(h) { return el("span", h % 3 == 0 ? hour_label(h) : "") })
+  let from = span == nil ? 0 : span.from
+  let to = span == nil ? 23 : span.to
+  // the handles let go: both values come with the action (all 24 hours is all hours)
+  let apply = fn(f) {
+    if not is_digit(str(f.tl_from ?? "")) or not is_digit(str(f.tl_to ?? "")) { return nil }
+    let a = int(f.tl_from)
+    let b = int(f.tl_to)
+    let lo = max(0, min(a, b))
+    let hi = min(23, max(a, b))
+    pick(lo == 0 and hi == 23 ? nil : {"from": lo, "to": hi})
+  }
   return el("div", {"class": "panel tl-panel"},
     el("div", {"class": "panel-head"},
       el("h2", "Through the day"),
       el("div", {"class": "tl-sel"},
         el("b", span_label(span)), el("span", n0(report.totals.touches) + " touches"),
-        span == nil ? el("span", {"class": "tl-hint"}, "click an hour, or drag across hours") :
+        span == nil ? el("span", {"class": "tl-hint"}, "drag the handles, or click an hour") :
                       el("button", {"type": "button", "class": "btn", "on_click": fn() { pick(nil) }}, "All hours"))),
     el("div", {"class": "tl"},
       el("div", {"class": "tl-cols"}, cols),
-      el("div", {"class": "tl-axis"}, axis),
-      el("input", {"type": "hidden", "bind": "span", "value": ""}),
-      el("button", {"type": "button", "class": "tl-apply", "hidden": true, "on_click": fn(f) {
-        let parts = split(str(f.span ?? ""), "-")
-        if len(parts) == 2 and is_digit(parts[0]) and is_digit(parts[1]) {
-          let a = int(parts[0])
-          let b = int(parts[1])
-          if a >= 0 and b <= 23 { pick({"from": min(a, b), "to": max(a, b)}) }
-        }
-      }}, "apply")))
+      el("div", {"class": "tl-slider"},
+        el("div", {"class": "tl-track"}, el("div", {"class": "tl-fill", "style": "left:" + str(round(100.0 * from / 23.0, 3)) + "%;width:" +
+                                                                         str(round(100.0 * (to - from) / 23.0, 3)) + "%"})),
+        el("input", {"type": "range", "class": "tl-range tl-from", "min": 0, "max": 23, "step": 1, "bind": "tl_from", "value": from,
+                     "aria-label": "From hour", "on_change": apply}),
+        el("input", {"type": "range", "class": "tl-range tl-to", "min": 0, "max": 23, "step": 1, "bind": "tl_to", "value": to,
+                     "aria-label": "To hour", "on_change": apply})),
+      el("div", {"class": "tl-axis"}, axis)))
 }
 
-// The timeline's drag: press on a column, move across others, let go - the span goes to the server as the bound
-// "span" field with the hidden apply button's action. A press and release on one column is a click (its own action).
-let TIMELINE_JS = join([
+// The slider as it is dragged: the handles never cross, and the band, the label and the dimmed hours follow the
+// handles before the page asks the server (which it does when a handle is let go - its change).
+let SLIDER_JS = join([
   "(function () {",
-  "  var start = null, cur = null;",
-  "  function col(e) { var t = document.elementFromPoint(e.clientX, e.clientY); return t && t.closest ? t.closest('.tl-col') : null; }",
-  "  function paint(a, b) {",
-  "    var lo = Math.min(a, b), hi = Math.max(a, b);",
-  "    document.querySelectorAll('.tl-col').forEach(function (c) { var h = +c.dataset.hour; c.classList.toggle('tl-drag', h >= lo && h <= hi); });",
-  "  }",
-  "  document.addEventListener('pointerdown', function (e) { var c = col(e); if (!c) return; start = cur = +c.dataset.hour; });",
-  "  document.addEventListener('pointermove', function (e) {",
-  "    if (start === null) return;",
-  "    var c = col(e); if (!c) return;",
-  "    var h = +c.dataset.hour; if (h !== cur) { cur = h; paint(start, cur); }",
-  "  });",
-  "  document.addEventListener('pointerup', function () {",
-  "    if (start === null) return;",
-  "    var a = start, b = cur; start = cur = null;",
-  "    document.querySelectorAll('.tl-drag').forEach(function (c) { c.classList.remove('tl-drag'); });",
-  "    if (a === b) return;",
-  "    var i = document.querySelector('input[data-id=\"span\"]'), go = document.querySelector('.tl-apply');",
-  "    if (!i || !go) return;",
-  "    i.value = Math.min(a, b) + '-' + Math.max(a, b);",
-  "    go.click();",
+  "  function at(h, m) { return (h % 12 === 0 ? 12 : h % 12) + ':' + m + (h < 12 ? 'am' : 'pm'); }",
+  "  document.addEventListener('input', function (e) {",
+  "    var t = e.target;",
+  "    if (!t.classList || !t.classList.contains('tl-range')) return;",
+  "    var box = t.closest('.tl-slider'), lo = box.querySelector('.tl-from'), hi = box.querySelector('.tl-to');",
+  "    var a = +lo.value, b = +hi.value;",
+  "    if (a > b) { if (t === lo) { hi.value = a; b = a; } else { lo.value = b; a = b; } }",
+  "    lo.style.zIndex = a > 11 ? 3 : 2;   // at the far end the lower handle has to be the one on top",
+  "    var fill = box.querySelector('.tl-fill');",
+  "    fill.style.left = (a / 23 * 100) + '%'; fill.style.width = ((b - a) / 23 * 100) + '%';",
+  "    var all = a === 0 && b === 23;",
+  "    document.querySelectorAll('.tl-col').forEach(function (c) {",
+  "      var h = +c.dataset.hour;",
+  "      c.classList.toggle('out', h < a || h > b); c.classList.toggle('on', !all && h >= a && h <= b);",
+  "    });",
+  "    var label = document.querySelector('.tl-sel b');",
+  "    if (label) label.textContent = all ? 'All hours' : at(a, '00') + ' \u{2013} ' + at(b, '59');",
   "  });",
   "})();"
 ], chr(10))
@@ -389,7 +395,7 @@ fn live_node(report, sorter, hours) {
     let name = first_present(u.name, u.userid)
     let title = join(map(SOURCES, fn(src) { return src[1] + " " + n0(p[src[0]]) }), " / ")
     let bar = map(SOURCES, fn(src) { return el("span", {"style": "background:var(" + src[2] + ");width:" + str(round(100.0 * real(p[src[0]]) / top, 2)) + "%"}) })
-    push(rows, el("tr",
+    push(rows, el("tr", {"data-key": lower(u.userid)},   // the row is this user's: an update moves it rather than rewriting it
       el("td", {"class": "rank", "data-v": rank}, rank),
       el("td", {"class": "who", "data-v": lower(name)}, el("b", name), el("small", u.userid)),
       el("td", {"data-v": str(u.touches)}, el("b", n0(u.touches)), el("div", {"class": "bar", "title": title}, bar)),
@@ -452,17 +458,27 @@ let PAGE_CSS = join([
   ".tl-panel { margin-bottom: 20px; }",
   ".tl-sel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; } .tl-sel b { color: var(--text); font-weight: 600; }",
   ".tl-sel .btn { padding: 4px 10px; font-size: 12px; } .tl-hint { font-size: 12px; opacity: .8; }",
-  ".tl { padding: 16px 16px 10px; user-select: none; -webkit-user-select: none; }",
-  ".tl-cols { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 4px; height: 150px; align-items: end; touch-action: none; }",
-  ".tl-col { height: 100%; display: flex; align-items: flex-end; padding: 0 2px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; transition: background .15s; }",
-  ".tl-col:hover, .tl-col.tl-drag { background: var(--head); box-shadow: inset 0 0 0 1px var(--line); }",
+  ".tl { padding: 12px 16px 8px; user-select: none; -webkit-user-select: none; }",
+  ".tl-cols { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 3px; height: 84px; align-items: end; }",
+  ".tl-col { height: 100%; display: flex; align-items: flex-end; padding: 0 1px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; transition: background .15s; }",
+  ".tl-col:hover { background: var(--head); box-shadow: inset 0 0 0 1px var(--line); }",
+  ".tl-slider { position: relative; height: 22px; margin: 8px calc(100% / 48 - 8px) 0; }",
+  ".tl-track { position: absolute; left: 0; right: 0; top: 9px; height: 4px; border-radius: 2px; background: var(--line); }",
+  ".tl-fill { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: var(--rec); transition: left .15s, width .15s; }",
+  ".tl-range { position: absolute; left: 0; top: 0; width: 100%; height: 22px; margin: 0; background: none; pointer-events: none; -webkit-appearance: none; appearance: none; z-index: 2; }",
+  ".tl-range.tl-to { z-index: 2; } .tl-range:focus { outline: none; }",
+  ".tl-range::-webkit-slider-runnable-track { height: 22px; background: none; }",
+  ".tl-range::-moz-range-track { height: 22px; background: none; }",
+  ".tl-range::-webkit-slider-thumb { -webkit-appearance: none; pointer-events: auto; width: 16px; height: 16px; margin-top: 3px; border-radius: 50%; background: var(--panel); border: 2px solid var(--rec); box-shadow: 0 1px 3px rgba(0, 0, 0, .35); cursor: grab; }",
+  ".tl-range::-moz-range-thumb { pointer-events: auto; width: 12px; height: 12px; border-radius: 50%; background: var(--panel); border: 2px solid var(--rec); box-shadow: 0 1px 3px rgba(0, 0, 0, .35); cursor: grab; }",
+  ".tl-range:active::-webkit-slider-thumb { cursor: grabbing; transform: scale(1.15); } .tl-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px rgba(47, 125, 225, .35); }",
   ".tl-col.on { background: var(--head); box-shadow: inset 0 0 0 1px var(--rec); }",
   ".tl-bar { width: 100%; min-height: 2px; display: flex; flex-direction: column-reverse; border-radius: 4px 4px 1px 1px; overflow: hidden; background: var(--line); transition: height .5s ease, opacity .2s; }",
   ".tl-bar i { display: block; width: 100%; transition: height .5s ease; }",
   ".tl-col.out .tl-bar { opacity: .28; }",
-  ".tl-axis { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 4px; margin-top: 6px; color: var(--muted); font-size: 11px; }",
+  ".tl-axis { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 3px; margin-top: 2px; color: var(--muted); font-size: 11px; }",
   ".tl-axis span { text-align: center; white-space: nowrap; overflow: visible; }",
-  "@media (max-width: 700px) { .tl-cols { gap: 2px; height: 120px; } .tl-axis { gap: 2px; font-size: 10px; } }",
+  "@media (max-width: 700px) { .tl-cols { gap: 2px; height: 64px; } .tl-axis { gap: 2px; font-size: 10px; } }",
   ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }",
   ".card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }",
   ".card.total { border-width: 2px; }",
@@ -621,5 +637,5 @@ fn dashboard_node(report, state) {
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
     el("div", {"id": "live"}, live_node(report, state.sorter, timeline_node(report, state.span, fn(sp) { state.span = sp }))),
-    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", TIMELINE_JS))
+    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS))
 }
