@@ -10,7 +10,8 @@ fn setting(name, fallback) {
   return fallback
 }
 
-let READS = "recscan, pickingfreeze, stockmaster, product_types, binmovements_details, www_users, loadingbays, dispatch, stickerscanout"
+let READS = "recscan, pickingfreeze, stockmaster, product_types, binmovements_details, www_users, loadingbays, dispatch, stickerscanout, " +
+            "salesorderdetails, trackinginfo"
 
 fn deployed(app) {
   let elsewhere = setting("WAREHOUSE_COMPUTE_ON", "")

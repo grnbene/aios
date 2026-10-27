@@ -43,35 +43,22 @@ fn get_db() {
   return c
 }
 
-// WAREHOUSE_SOURCE: "thing" (default) reads the touch_day Thing the engine keeps current; "sql" runs the report's
-// queries against the tables, as it did before the Thing - what the Thing is checked against.
-let SOURCE = env("WAREHOUSE_SOURCE", "thing")
+fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid) }
 
-fn report(db, p) {
-  if SOURCE == "sql" { return fetch_warehouse_touches_sql(db, p.start, p.stop, p.userid) }
-  return fetch_warehouse_touches(db, p.start, p.stop, p.userid)
-}
-
+// start / stop from the query (or a range "a..b"); missing or not a date, the PHP report's defaults: the last 30
+// days, today included (report_range in lib/queries.gr).
 fn parse_date_params(req) {
   let q = {}
-  if req.query_params != nil and type(req.query_params) == "map" {
-    q = req.query_params
-  } else if req.query != nil and type(req.query) == "map" {
-    q = req.query
-  }
-  let today_str = date_format(now(), "%Y-%m-%d")
-  let thirty_days_ago = date_format(now() - 30 * 86400, "%Y-%m-%d")
-
+  if req.query_params != nil and type(req.query_params) == "map" { q = req.query_params }
+  else if req.query != nil and type(req.query) == "map" { q = req.query }
+  let start = q.start
+  let stop = q.stop
   if q.range != nil and contains(str(q.range), "..") {
     let rparts = split(str(q.range), "..")
-    if len(rparts) >= 2 {
-      return {"start": rparts[0], "stop": rparts[1], "userid": q.userid}
-    }
+    if len(rparts) >= 2 { start = rparts[0]; stop = rparts[1] }
   }
-
-  let stop_date = q.stop != nil and q.stop != "" ? q.stop : today_str
-  let start_date = q.start != nil and q.start != "" ? q.start : thirty_days_ago
-  return {"start": start_date, "stop": stop_date, "userid": q.userid}
+  let r = report_range(start, stop)
+  return {"start": r[0], "stop": r[1], "userid": q.userid}
 }
 
 // ---- Route Handlers ----------------------------------------------------------
