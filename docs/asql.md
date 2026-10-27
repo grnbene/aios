@@ -727,7 +727,7 @@ CREATE THING <name> KEY <column>
   [READS <table>[, ...]]
   AS SELECT <key>, <value> [AS label], ... FROM <source> [WHERE ...] GROUP BY <key>[, ...]
   [PART <name> AS SELECT ... WHERE <col> = KEY]...
-  [WHEN <condition> DO <statement>[; ...] TO <profile>]
+  [WHEN <condition> DO <statement>[; ...] TO <profile> [SHADOW]]
 ```
 
 - The first select column must be the `KEY`, and `GROUP BY` must start with it.
@@ -757,6 +757,19 @@ CREATE THING <name> KEY <column>
   condition becomes true, including for keys already true at `CREATE`. A
   failed act is recorded in the history and is tried again at the key's next
   change.
+- `TO <profile> SHADOW` works each act out (`KEY` and `THING.<label>` filled
+  in) at the same moments a live act would run, and records it as `would act`
+  in the key's history instead of running it. Nothing connects to the target,
+  so the profile needs no `things_write=1` yet. `SHOW THING SHADOW <name>`
+  lists every key's `would act` lines, newest first, with the statements as
+  they would have run (each key keeps its last 32 history lines).
+  `SHOW THINGS` adds `(shadow)` to its act.
+  - `SET THING <name> LIVE` turns the act on. The profile must then have
+    `things_write=1`. It acts only for what comes true from then on: a key
+    that would have acted while in shadow is not acted on when it goes live,
+    only the next time its condition comes true.
+  - `SET THING <name> SHADOW` holds it back again. The mode is kept across
+    restarts.
 
 The parser also has `RESOURCE`, `CLAIMS` (allocation), `GRAIN` (a grain
 program), `AT '<time>' GRAIN` (an event Thing, gated by `AIOS_THING_WRITES=1`)
@@ -769,6 +782,8 @@ The other statements:
     SHOW THINGS                         every kind
     SHOW THINGS <name> | SHOW THING <name>       every Thing of a kind
     SHOW THING HISTORY <name> '<key>'   what changed it and why
+    SHOW THING SHADOW <name>            what a Thing's act would have run (TO .. SHADOW)
+    SET THING <name> SHADOW | LIVE      hold a Thing's act back, or let it write
     SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
     SHOW THING <name> CLOCK             the stamp a client holds after reading everything

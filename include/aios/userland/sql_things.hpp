@@ -250,6 +250,9 @@ class ThingEngine {
     // Thing does itself. Checked for every Thing that changed; runs once when the condition
     // comes to hold (one transaction on the profile, KEY filled in), again after it clears.
     std::string when_expr, do_sql, do_target;
+    // Shadow: the act is worked out (KEY and THING.<label> filled in) and recorded in the history as "would act",
+    // never run; SET THING <name> LIVE turns it on, SET THING <name> SHADOW back off.
+    bool do_shadow = false;
     uint64_t act_clock = 0;                     // the clock up to which every change was checked
     std::vector<std::string> out_labels;        // the head's output names when an item is a `*` (from the first run)
     std::string source_by;                      // SOURCE BY: the value column naming the system a row came from
@@ -420,6 +423,10 @@ class ThingEngine {
   void act_due(Kind& k);
   bool condition_holds(const Kind& k, const Instance& in, bool* holds, std::string* err);
   bool run_act(const Kind& k, const Instance& in, std::string* err);
+  // The DO statements for this Thing, KEY and THING.<label> filled in.
+  bool act_statements(const Kind& k, const Instance& in, std::vector<std::string>* stmts, std::string* err) const;
+  SqlQueryResult set_act_mode(const std::string& name, bool shadow);
+  SqlQueryResult show_shadow(const std::string& name);
   // The names a row Thing's values go by, as WHEN and DO see them: the key's first, then each output column.
   std::vector<std::string> value_labels(const Kind& k) const;
   // ... and one Thing's values under them (NULL as sql_null()).

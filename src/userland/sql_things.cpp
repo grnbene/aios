@@ -1024,7 +1024,14 @@ bool ThingEngine::parse_create(const std::string& sql, Kind* k, std::string* err
       if (top == std::string::npos) { *err = "WHEN <condition> DO <statement>[; ...] TO <connection profile>"; return false; }
       k->when_expr = trim(body.substr(wp + 4, dp - wp - 4));
       k->do_sql = trim(clause.substr(0, top));
-      k->do_target = unquote_ident(trim(clause.substr(top + 2)));
+      std::string target = trim(clause.substr(top + 2));
+      {
+        // TO <profile> SHADOW: worked out and recorded, never run
+        size_t b = target.size();
+        while (b > 0 && !std::isspace((unsigned char)target[b - 1])) --b;
+        if (b > 0 && upper(target.substr(b)) == "SHADOW") { k->do_shadow = true; target = trim(target.substr(0, b)); }
+      }
+      k->do_target = unquote_ident(target);
       if (k->when_expr.empty() || k->do_sql.empty() || k->do_target.empty()) { *err = "WHEN <condition> DO <statement>[; ...] TO <connection profile>"; return false; }
       body = trim(body.substr(0, wp));
     }
@@ -1693,13 +1700,8 @@ bool ThingEngine::condition_holds(const Kind& k, const Instance& in, bool* holds
   return true;
 }
 
-// The DO statements, KEY filled in, in one transaction on the profile.
-bool ThingEngine::run_act(const Kind& k, const Instance& in, std::string* err) {
-  DbConnectionProfile prof;
-  bool found = false;
-  for (const auto& p : db_.list_profiles()) if (p.id == k.do_target) { prof = p; found = true; }
-  if (!found) { *err = "DO .. TO " + k.do_target + ": no such connection profile"; return false; }
-  if (!prof.things_write) { *err = "DO .. TO " + k.do_target + ": the profile is not marked things_write=1"; return false; }
+// The DO statements with KEY and THING.<label> filled in.
+bool ThingEngine::act_statements(const Kind& k, const Instance& in, std::vector<std::string>* out, std::string* err) const {
   const std::string key = in.key_null ? std::string("NULL") : (all_digits(in.key) ? in.key : sql_lit(in.key));
   const std::vector<std::string> labels = value_labels(k);
   const std::vector<std::string> values = value_row(k, in);
@@ -1745,6 +1747,19 @@ bool ThingEngine::run_act(const Kind& k, const Instance& in, std::string* err) {
     if (!trim(cur).empty()) stmts.push_back(trim(cur));
   }
   if (stmts.empty()) { *err = "DO: nothing to run"; return false; }
+  *out = std::move(stmts);
+  return true;
+}
+
+// The DO statements in one transaction on the profile.
+bool ThingEngine::run_act(const Kind& k, const Instance& in, std::string* err) {
+  DbConnectionProfile prof;
+  bool found = false;
+  for (const auto& p : db_.list_profiles()) if (p.id == k.do_target) { prof = p; found = true; }
+  if (!found) { *err = "DO .. TO " + k.do_target + ": no such connection profile"; return false; }
+  if (!prof.things_write) { *err = "DO .. TO " + k.do_target + ": the profile is not marked things_write=1"; return false; }
+  std::vector<std::string> stmts;
+  if (!act_statements(k, in, &stmts, err)) return false;
   if (auto t = sql_profile_transport_ok(prof); !t.ok()) { *err = "DO .. TO " + k.do_target + ": " + t.error().message; return false; }
   MariaWireSession target(sql_profile_dial_host(prof), prof.port);
   auto c = target.connect(prof.user, prof.password, prof.database);
@@ -1775,7 +1790,16 @@ void ThingEngine::act_due(Kind& k) {
     if (!holds) { if (in.acted) { in.acted = false; dirty_ = true; } continue; }
     if (in.acted) continue;
     const uint64_t now = db_.kernel_.host().wall_ns();
-    if (run_act(k, in, &err)) {
+    std::vector<std::string> would;
+    if (k.do_shadow && act_statements(k, in, &would, &err)) {
+      // what it would have run, as it would have run it; once per time the condition comes true, as a live act
+      std::string text;
+      for (const auto& s : would) text += (text.empty() ? "" : "; ") + s;
+      in.acted = true;
+      in.history.push_back(History{now, "would act", "WHEN " + k.when_expr, text + " TO " + k.do_target});
+    } else if (k.do_shadow) {
+      in.history.push_back(History{now, "act failed", "WHEN " + k.when_expr, err});
+    } else if (run_act(k, in, &err)) {
       in.acted = true;
       in.history.push_back(History{now, "acted", "WHEN " + k.when_expr, "DO " + k.do_sql + " TO " + k.do_target});
       fprintf(stderr, "[things] %s %s: acted (%s)\n", k.name.c_str(), in.key.c_str(), k.do_sql.c_str());
@@ -2266,7 +2290,7 @@ SqlQueryResult ThingEngine::show(const std::string& name) {
         }
       }
       for (const auto& p : k.part_defs) links += std::string(links.empty() ? "" : "; ") + "part " + p.name + ": " + p.key_table + "(" + p.key_col + ")";
-      if (!k.do_sql.empty()) links += std::string(links.empty() ? "" : "; ") + "when " + k.when_expr + " do " + k.do_sql + " on " + k.do_target;
+      if (!k.do_sql.empty()) links += std::string(links.empty() ? "" : "; ") + "when " + k.when_expr + " do " + k.do_sql + " on " + k.do_target + (k.do_shadow ? " (shadow)" : "");
       res.rows.push_back(SqlRow{{k.name, std::to_string(count), std::to_string(k.version),
                                  std::to_string(k.reactions), std::to_string(k.full_recomputes),
                                  std::to_string(k.parts.size()), links, waiting_for(k), wall_text(k.created_ns),
@@ -2913,6 +2937,52 @@ SqlQueryResult ThingEngine::show_json(const Kind& k, uint64_t since, bool clock_
   return res;
 }
 
+// SET THING <name> SHADOW | LIVE. Going live writes only for what comes true from now on: a key that would
+// have acted while in shadow is not acted on again (it acts the next time its condition comes true).
+SqlQueryResult ThingEngine::set_act_mode(const std::string& name, bool shadow) {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  MuHeld held;
+  auto it = kinds_.find(lower(name));
+  if (it == kinds_.end()) return error_result("no Thing kind named " + name);
+  Kind& k = it->second;
+  if (k.do_sql.empty()) return error_result(k.name + " has no WHEN .. DO to run or hold back");
+  if (!shadow) {
+    bool found = false, may = false;
+    for (const auto& p : db_.list_profiles()) if (p.id == k.do_target) { found = true; may = p.things_write; }
+    if (!found) return error_result("DO .. TO " + k.do_target + ": no such connection profile");
+    if (!may) return error_result("DO .. TO " + k.do_target + ": the profile is not marked things_write=1 (a Thing writes only where someone said it may)");
+  }
+  const bool was = k.do_shadow;
+  k.do_shadow = shadow;
+  dirty_ = true;
+  save_locked();
+  SqlQueryResult res;
+  res.formatted_table = was == shadow ? "Thing " + k.name + " was already " + (shadow ? "in shadow." : "live.")
+                        : shadow ? "Thing " + k.name + " in shadow: it records what it would run (SHOW THING SHADOW " + k.name + ") and writes nothing."
+                                 : "Thing " + k.name + " is live: it writes to " + k.do_target + " for what comes true from now on.";
+  return res;
+}
+
+// Every key's "would act" lines, newest first: what a Thing in shadow would have run.
+SqlQueryResult ThingEngine::show_shadow(const std::string& name) {
+  auto it = kinds_.find(lower(name));
+  if (it == kinds_.end()) return error_result("no Thing kind named " + name);
+  const Kind& k = it->second;
+  if (k.do_sql.empty()) return error_result(k.name + " has no WHEN .. DO");
+  struct Line { uint64_t at; std::string key, run; };
+  std::vector<Line> lines;
+  for (const auto& kv : k.things)
+    for (const History& h : kv.second.history)
+      if (h.cause == "would act") lines.push_back(Line{h.wall_ns, kv.second.key_null ? std::string("NULL") : kv.second.key, h.after});
+  std::stable_sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) { return a.at > b.at; });
+  SqlQueryResult res;
+  res.is_result_set = true;
+  res.columns = {"at", "key", "would_run", "mode"};
+  for (const Line& l : lines) res.rows.push_back(SqlRow{{wall_text(l.at), l.key, l.run, k.do_shadow ? "shadow" : "live"}});
+  if (!sql_wire_results()) res.formatted_table = db_.format_result_table(res.columns, res.rows);
+  return res;
+}
+
 SqlQueryResult ThingEngine::show_history(const std::string& name, const std::string& key) {
   auto it = kinds_.find(lower(name));
   if (it == kinds_.end()) return error_result("no Thing kind named " + name);
@@ -3283,7 +3353,23 @@ SqlQueryResult ThingEngine::control(const std::string& verb, const std::string& 
 
 SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
   const std::string u = upper(trim(sql));
-  if (u.rfind("SET", 0) == 0) return set_alerts(sql);
+  if (u.rfind("SET", 0) == 0) {
+    // SET THING <name> SHADOW | LIVE
+    std::string t = trim(sql);
+    if (!t.empty() && t.back() == ';') t = trim(t.substr(0, t.size() - 1));
+    const std::string tu = upper(t);
+    for (const char* mode : {" SHADOW", " LIVE"}) {
+      const size_t ml = std::strlen(mode);
+      if (tu.size() > ml && tu.compare(tu.size() - ml, ml, mode) == 0 && tu.find("ALERTS") == std::string::npos) {
+        Scan sc(t);
+        const size_t tp = sc.find_kw("THING");
+        if (tp == std::string::npos) break;
+        const std::string name = unquote_ident(trim(t.substr(tp + 5, t.size() - ml - tp - 5)));
+        return set_act_mode(name, mode[1] == 'S');
+      }
+    }
+    return set_alerts(sql);
+  }
   for (const char* v : {"PAUSE", "RESUME", "REFRESH", "FIRE", "RETRY"}) {
     if (u.rfind(v, 0) != 0) continue;
     Scan sc(sql);
@@ -3458,7 +3544,7 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
       bool found = false, may = false;
       for (const auto& p : db_.list_profiles()) if (p.id == k.do_target) { found = true; may = p.things_write; }
       if (!found) return error_result("DO .. TO " + k.do_target + ": no such connection profile");
-      if (!may) return error_result("DO .. TO " + k.do_target + ": the profile is not marked things_write=1 (a Thing writes only where someone said it may)");
+      if (!may && !k.do_shadow) return error_result("DO .. TO " + k.do_target + ": the profile is not marked things_write=1 (a Thing writes only where someone said it may; TO " + k.do_target + " SHADOW records what it would do without writing)");
     }
     auto it = kinds_.emplace(k.name, std::move(k)).first;
     if (!run_full(it->second, "created", &err)) {
@@ -3591,6 +3677,12 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     auto it = kinds_.find(lower(name));
     if (it == kinds_.end() || it->second.type != Kind::Claims) return error_result("no claims Thing named " + name);
     return show_lines(it->second);
+  }
+  size_t shp = sc.find_kw("SHADOW");
+  if (shp != std::string::npos) {
+    std::string name = unquote_ident(trim(sql.substr(shp + 6)));
+    if (!name.empty() && name.back() == ';') name = unquote_ident(trim(name.substr(0, name.size() - 1)));
+    return show_shadow(name);
   }
   size_t hp = sc.find_kw("HISTORY");
   if (hp != std::string::npos) {
@@ -4786,7 +4878,7 @@ std::string ThingEngine::serialize(const Kind& k) const {
     o += "\n";
   }
   for (const auto& d : k.departed) o += "gone\t" + esc(d.first) + "\t" + std::to_string(d.second) + "\n";
-  if (!k.do_sql.empty()) o += "act_clock\t" + std::to_string(k.act_clock) + "\n";
+  if (!k.do_sql.empty()) o += "act_clock\t" + std::to_string(k.act_clock) + "\n" + "act_shadow\t" + (k.do_shadow ? "1" : "0") + "\n";
   if (k.type == Kind::Resource) {
     if (!k.claimed_by.empty()) o += "claimed_by\t" + esc(k.claimed_by) + "\n";
     for (const auto& kv : k.res) {
@@ -4955,6 +5047,8 @@ bool ThingEngine::deserialize(const std::string& text, Kind* k, std::string* err
       k->departed[unesc(f[1])] = std::strtoull(f[2].c_str(), nullptr, 10);
     } else if (f[0] == "act_clock" && f.size() >= 2) {
       k->act_clock = std::strtoull(f[1].c_str(), nullptr, 10);
+    } else if (f[0] == "act_shadow" && f.size() >= 2) {
+      k->do_shadow = f[1] == "1";   // SET THING .. LIVE|SHADOW since its CREATE
     }
   }
   (void)cur_part;
