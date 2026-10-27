@@ -111,6 +111,8 @@ class WebUi {
   bool member_known_ = false;           // given_member(): learnt for member_version_ of the program
   std::string member_version_, member_;
   aios::hal::Thread ticker_;
+  aios::hal::Thread watcher_;           // the pane's watch (start_watcher)
+  void start_watcher();
   bool stop_ = false;
   std::condition_variable stop_cv_;
 

@@ -1,0 +1,17 @@
+// A ui.pane whose "watch" follows a file: when the file changes, open pages get the new view with no action.
+// Driven by watch_test.py, which names the file in WATCH_FILE.
+let path = getenv("WATCH_FILE")
+let renders = 0
+ui.pane({"title": "Watch",
+  "watch": fn(since) {
+    // wait for a change, a little at a time (as WAIT THING ... TIMEOUT would), and say what the data is now
+    let t0 = time_ms()
+    while time_ms() - t0 < 2000 {
+      let now = read_file(path)
+      if since == nil or now != since { return now }
+      sleep(20)
+    }
+    return since
+  },
+  "view": fn() { renders += 1; return el("p", {"id": "v"}, "value " + trim(read_file(path))) }})
+run_panes()

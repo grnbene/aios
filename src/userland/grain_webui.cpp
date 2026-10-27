@@ -1221,6 +1221,7 @@ struct WebUi::Session {
   std::mutex push_mu;
   std::condition_variable push_cv;
   std::atomic<int> streams{0};   // open event streams: a session with a viewer is not idle (changed under `mu`, read by the reaper)
+  std::atomic<bool> stale{false};   // the pane's watch saw its data move: look again (the ticker, for a watched session)
 
   // A pane drawn by hand: its last frame, and which mouse buttons went down on it (for click).
   bool canvas = false;
@@ -1239,6 +1240,7 @@ WebUi::~WebUi() {
   }
   stop_cv_.notify_all();
   if (ticker_.joinable()) ticker_.join();
+  if (watcher_.joinable()) watcher_.join();   // waits for a watch call in progress (its own TIMEOUT)
 }
 
 size_t WebUi::sessions() const { std::lock_guard<std::mutex> lock(mu_); return sessions_.size() + (shared_ ? 1 : 0); }
@@ -1331,16 +1333,68 @@ void WebUi::start_ticker() {
         if (!turn.owns_lock()) continue;   // an event is running; the next tick
         const bool clocked = s->info.refresh > 0;   // a view that reads the clock: look again every `refresh` seconds
         const bool drawn = s->canvas && s->streams > 0;   // a drawn pane may move by itself: looked at 10 times a second while watched
-        if (s->vm->timers.empty() && !clocked && !drawn) continue;
+        // the data moved (the pane's watch): a session someone has open looks again now; one nobody does when asked
+        const bool stale = s->stale.load() && s->streams > 0;
+        if (s->vm->timers.empty() && !clocked && !drawn && !stale) continue;
         s->vm->steps = 0;
         std::string err;
         bool look = run_timers(*s->vm, err);
         if (clocked && Clock::now() - s->last_look >= std::chrono::seconds(s->info.refresh)) { look = true; s->last_look = Clock::now(); }
         if (drawn && Clock::now() - s->last_draw >= std::chrono::milliseconds(100)) look = true;
+        if (stale) { s->stale = false; look = true; }
         if (look) refresh_locked(*s);
         if (!err.empty()) report(err);
       }
       lock.lock();
+    }
+  });
+}
+
+// The pane's watch (ui.pane "watch"): called on this thread, in a worker VM copied from a session's program, again
+// each time it returns, with what it returned last time. When that moves, every session is stale. Runs while the
+// program has sessions; ends when it has no watch.
+void WebUi::start_watcher() {
+  if (watcher_.joinable()) return;
+  watcher_ = aios::hal::Thread([this]() {
+    std::string since;
+    bool have = false;
+    std::unique_lock<std::mutex> lock(mu_);
+    while (!stop_) {
+      std::shared_ptr<Session> s = shared_;
+      if (!s && !sessions_.empty()) s = sessions_.begin()->second;
+      if (!s) { stop_cv_.wait_for(lock, std::chrono::seconds(1)); continue; }
+      lock.unlock();
+      std::unique_ptr<WorkerCall> call;
+      std::string err;
+      {
+        std::lock_guard<std::mutex> turn(s->mu);
+        if (!s->canvas) call = web_pane_watch_prepare(*s->vm, s->pane, have ? Value::string(since) : Value::nil(), err);
+      }
+      s.reset();
+      if (!call) {
+        lock.lock();
+        if (err.empty()) break;   // no watch: nothing to do
+        report(err);
+        stop_cv_.wait_for(lock, std::chrono::seconds(5));
+        continue;
+      }
+      const auto began = Clock::now();
+      call->run();
+      lock.lock();
+      if (!call->error.empty()) {
+        report("watch(): " + call->error);
+        stop_cv_.wait_for(lock, std::chrono::seconds(5));   // a failing watch (its database away) is not called in a loop
+        continue;
+      }
+      const std::string now = call->result.type == Type::Nil ? since : call->result.to_text();
+      if (have && now != since) {
+        for (auto& kv : sessions_) kv.second->stale = true;
+        if (shared_) shared_->stale = true;
+      }
+      since = now;
+      have = true;
+      const auto took = Clock::now() - began;
+      if (took < std::chrono::milliseconds(250)) stop_cv_.wait_for(lock, std::chrono::milliseconds(250) - took);
     }
   });
 }
@@ -1408,12 +1462,14 @@ std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::stri
   if (s->info.shared) {
     if (!shared_) shared_ = s;     // the first to finish starting is the copy everyone shares
     start_ticker();
+    start_watcher();
     return shared_;
   }
   reap_locked();
   new_id = random_hex(16);
   sessions_[new_id] = s;
   start_ticker();
+  start_watcher();
   return s;
 }
 
