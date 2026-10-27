@@ -939,6 +939,12 @@ Result<void> Host::launch_locked(const std::string& app, const std::string& vers
       auto fwd = opt_.forward;
       wh.forward = [fwd, app](const std::string& member, const WebUi::Request& req, WebUi::Response& res) { return fwd(app, member, req, res); };
     }
+    if (opt_.forward_stream) {
+      auto fs = opt_.forward_stream;
+      wh.forward_stream = [fs, app](const std::string& member, const WebUi::Request& req, StreamHeaderCallback h, StreamChunkCallback c) {
+        return fs(app, member, req, std::move(h), std::move(c));
+      };
+    }
     in->ui = std::make_shared<WebUi>(std::move(wh));
     in->ui->log = [this, app](const std::string& msg) { log(app, "[web] " + msg); };
     const int want = port_override >= 0 ? port_override : in->m.port;
@@ -1297,6 +1303,36 @@ Result<WebUi::Response> Host::answer_forwarded(const std::string& app, const Web
   WebUi::Response res = in->ui->handle(req);   // no streaming over the link: a route that streams is buffered whole
   if (res.status >= 500) in->failures++;
   return res;
+}
+
+Result<void> Host::answer_forwarded_stream(const std::string& app, const WebUi::Request& req, StreamHeaderCallback on_headers,
+                                           StreamChunkCallback on_chunk) {
+  std::shared_ptr<Instance> in;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = running_.find(app);
+    if (it != running_.end()) in = it->second;
+  }
+  if (!in || !in->ui || in->state != (int)State::Running)
+    return Result<void>(Status::NotFound, "app " + app + " is not running on " + opt_.machine);
+  in->requests++;
+  bool sent = false;
+  auto heads = [&](int status, const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
+    if (sent) return true;
+    sent = true;
+    return on_headers(status, headers);
+  };
+  auto chunks = [&](const std::string& chunk) -> bool {
+    if (!sent && !heads(200, {{"Content-Type", "text/event-stream; charset=utf-8"}, {"Cache-Control", "no-cache"}})) return false;
+    return on_chunk(chunk);
+  };
+  WebUi::Response res = in->ui->handle(req, heads, chunks);
+  if (!sent) {   // the route answered whole after all: that answer, as one head and one chunk
+    if (res.status >= 500) in->failures++;
+    if (!on_headers(res.status, res.headers)) return Ok();
+    if (!res.body.empty()) on_chunk(res.body);
+  }
+  return Ok();
 }
 
 std::vector<AppStatus> Host::status() {

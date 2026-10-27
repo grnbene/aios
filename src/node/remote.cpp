@@ -34,6 +34,24 @@ Result<ByteBuffer> RemoteNode::call(uint8_t type, ByteSpan payload, int timeout_
   return reply;
 }
 
+Result<void> RemoteNode::stream(uint8_t type, ByteSpan payload, const std::function<bool(ByteSpan frame)>& on_frame, int idle_ms) {
+  hal::LockGuard g(mu_);
+  calls_++;
+  if (!link_) return Result<void>(Status::Invalid, "node link not established");
+  if (!link_->send(type, payload)) return Result<void>(Status::IoError, "node " + address_ + " closed the link");
+  for (;;) {
+    uint8_t t; ByteBuffer frame;
+    if (!link_->recv(t, frame, idle_ms)) return Result<void>(Status::IoError, "the stream from node " + address_ + " went quiet or closed");
+    if (t == nodeproto::Error) { Reader r(frame); Status st = (Status)r.u8(); std::string msg = r.str(); return Result<void>(st, "node " + address_ + ": " + msg); }
+    if (t != type) return Result<void>(Status::Corrupt, "node replied with the wrong frame");
+    if (!frame.empty() && frame[0] == 3) return Ok();
+    if (!on_frame(ByteSpan(frame.data(), frame.size()))) {
+      if (c_) c_->close();   // the reader is gone: the peer's next send fails and its route ends
+      return Ok();
+    }
+  }
+}
+
 void RemoteNode::close() {
   hal::LockGuard g(mu_);
   if (c_) c_->close();

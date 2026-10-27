@@ -56,6 +56,10 @@ class NodeService {
   // the format). Unset, the node refuses SQL.
   using SqlRunner = std::function<Result<ByteBuffer>(const std::string& sql)>;
   void set_sql_runner(SqlRunner r) { sql_runner_ = std::move(r); }
+  // What a peer's AppStream request runs: the request (the embedder's encoding) and `emit`, which sends one frame
+  // back on the link and is false once the link is gone. Unset, the node refuses streams.
+  using StreamRunner = std::function<Result<void>(ByteSpan request, const std::function<bool(ByteSpan frame)>& emit)>;
+  void set_stream_runner(StreamRunner r) { stream_runner_ = std::move(r); }
   std::vector<PeerInfo> peers() const;
   uint16_t port() const { return port_; }
  private:
@@ -70,6 +74,7 @@ class NodeService {
   bool polled_mode_ = false;
   CommandRunner runner_;
   SqlRunner sql_runner_;
+  StreamRunner stream_runner_;
   Kernel& k_;
   std::vector<std::string> tokens_;
   EntityID admission_;   // any one admits a peer; guarded by mu_
@@ -104,6 +109,11 @@ class RemoteNode {
   // query legitimately takes a while) is not appropriate for a quick status
   // ping - telemetry() passes its own, much shorter, bound instead.
   Result<ByteBuffer> call(uint8_t type, ByteSpan payload, int timeout_ms = 120000);
+  // One request whose answer comes as many frames of `type`: each goes to on_frame as it arrives, until a frame
+  // whose first byte is 3 (the end), an Error, or on_frame returning false - then the link is closed (the peer's
+  // next send fails, and it stops). idle_ms: the longest wait for a frame. Holds the link for the whole stream, so a
+  // caller gives it a link of its own (open_sibling).
+  Result<void> stream(uint8_t type, ByteSpan payload, const std::function<bool(ByteSpan frame)>& on_frame, int idle_ms);
   // Ask this peer for its live load, or hand it a recovery point to hold.
   Result<NodeTelemetry> telemetry();
   Result<void> replicate(const EntityID& entity, uint64_t generation, ByteSpan image);

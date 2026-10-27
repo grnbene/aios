@@ -834,6 +834,9 @@ bool web_pane_route_prepare(Vm& vm, uint64_t id, const std::string& method, cons
 bool web_pane_route_finish(RouteJob& job, int& status, std::string& res_body, std::string& content_type, std::string& error);
 // The fleet member a route was given to (`on_machine(member, handler)`), "" for a route of this machine's own or none.
 std::string web_pane_route_machine(Vm& vm, uint64_t id, const std::string& method, const std::string& path);
+// True when one of the pane's routes answers this method and path (an event-stream request to it is the route's,
+// not the pane's own stream of changes).
+bool web_pane_has_route(Vm& vm, uint64_t id, const std::string& method, const std::string& path);
 
 }  // namespace aios::userland::grain
 

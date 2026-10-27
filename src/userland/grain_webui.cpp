@@ -1427,6 +1427,8 @@ bool WebUi::open_stream(const Request& req, Stream& out, std::vector<std::pair<s
     // for one of its own routes (res_sse), so leave it to them.
     std::lock_guard<std::mutex> turn(s->mu);
     if (web_pane_api_only(*s->vm, s->pane)) return false;
+    // nor is one for a route of the pane (a page's own EventSource to /events, say): the route answers it
+    if (req.path != "/" && web_pane_has_route(*s->vm, s->pane, req.method, req.path)) return false;
   }
   headers = {{"Content-Type", "text/event-stream"}, {"Cache-Control", "no-store"}, {"X-Content-Type-Options", "nosniff"}, {"X-Accel-Buffering", "no"}};
   if (!new_id.empty()) headers.push_back({"Set-Cookie", host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "")});
@@ -1504,6 +1506,12 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
     {
       std::lock_guard<std::mutex> turn(s->mu);
       member = web_pane_route_machine(*s->vm, s->pane, req.method, req.path);
+    }
+    if (!member.empty() && host_.forward_stream && on_chunk) {
+      bool wants_stream = false;
+      for (const auto& h : req.headers)
+        if ((h.first == "accept" || h.first == "Accept") && h.second.find("text/event-stream") != std::string::npos) wants_stream = true;
+      if (wants_stream && host_.forward_stream(member, req, on_headers, on_chunk)) return Response{};
     }
     if (!member.empty()) {
       Response fwd;

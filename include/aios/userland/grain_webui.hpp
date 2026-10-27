@@ -46,6 +46,9 @@ class WebUi {
     // A route given to another machine (on_machine): the request, answered there. Returns false when `member` is this
     // machine (the route's own handler answers here). Unset: every route answers here.
     std::function<bool(const std::string& member, const Request& req, Response& res)> forward;
+    // The same for a request whose answer is a stream (Accept: text/event-stream): the member's route writes, and
+    // each piece comes through on_headers / on_chunk as it is written. false: not carried (answered as above).
+    std::function<bool(const std::string& member, const Request& req, StreamHeaderCallback on_headers, StreamChunkCallback on_chunk)> forward_stream;
   };
 
   struct Request {

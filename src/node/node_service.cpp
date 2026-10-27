@@ -252,6 +252,7 @@ std::string NodeService::role_refusal(const Session& sess, uint8_t t, const Byte
     }
     case nodeproto::Command: { Reader r(p); return need(command_role(r.str())); }
     case nodeproto::Sql: return need("sql");
+    case nodeproto::AppStream: return need("app-route");
     default: return need("compute");
   }
 }
@@ -444,6 +445,14 @@ bool NodeService::step(Session& sess, int timeout_ms) {
         std::string output;
         int code = runner_ ? runner_(line, output) : fleet_shell_command(line, output);
         w.u32(static_cast<uint32_t>(code)); w.str(output);
+        break;
+      }
+      case nodeproto::AppStream: {
+        if (!stream_runner_) { st = Result<void>(Status::Unsupported, "this node runs no app streams"); break; }
+        auto emit = [&link](ByteSpan frame) { return link.send(nodeproto::AppStream, frame); };
+        auto rr = stream_runner_(ByteSpan(p.data(), p.size()), emit);
+        if (!rr.ok()) { st = rr.error(); break; }
+        w.u8(3);   // the end
         break;
       }
       case nodeproto::Sql: {
