@@ -387,7 +387,7 @@ fn live_node(report, sorter, hours) {
       el("td", {"class": "rank", "data-v": rank}, rank),
       el("td", {"class": "who", "data-v": lower(name)}, el("b", name), el("small", u.userid)),
       el("td", {"data-v": str(u.touches)}, el("b", n0(u.touches)), el("div", {"class": "bar", "title": title}, bar)),
-      map(SOURCES, fn(src) { let v = p[src[0]]; return el("td", {"data-v": str(v)}, v > 0 ? [main_num(v), sub[src[0]]] : nil_cell) }),
+      map(SOURCES, fn(src) { let v = p[src[0]]; return el("td", {"class": "src", "data-v": str(v)}, v > 0 ? [main_num(v), sub[src[0]]] : nil_cell) }),
       el("td", {"data-v": str(u.active_days)}, n0(u.active_days)),
       el("td", {"data-v": str(u.touches_per_day)}, n1(u.touches_per_day)),
       el("td", {"class": "when", "data-v": u.first_touch}, when(u.first_touch), el("small", "to " + when(u.last_touch)))))
@@ -412,7 +412,7 @@ fn live_node(report, sorter, hours) {
   for pair in enumerate(SOURCES) {
     let src = pair[1]
     push(head, th(pair[0] + 3, {"class": "contrib", "style": "--c:var(" + src[2] + ")"}, src[1]))
-    push(foot, el("td", main_num(pt[src[0]]), tsub[src[0]]))
+    push(foot, el("td", {"class": "src"}, main_num(pt[src[0]]), tsub[src[0]]))
   }
   push(head, th(8, {}, "Days"), th(9, {}, "Per day"), th(10, {}, "First / last"))
   push(foot, el("td", n0(t.active_days)), el("td", n1(t.touches_per_day)),
@@ -479,14 +479,15 @@ let PAGE_CSS = join([
   ".panel-head h2 { margin: 0; font-size: 15px; }",
   ".legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; }",
   ".scroll { overflow-x: auto; }",
-  "table { width: 100%; border-collapse: collapse; min-width: 1150px; }",
-  "th { background: var(--head); color: var(--muted); font-size: 12px; font-weight: 600; text-align: right; padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; white-space: nowrap; }",
-  "th.contrib { color: var(--text); border-top: 3px solid var(--c); }",
+  "table { width: 100%; border-collapse: collapse; min-width: 880px; }",
+  "th { background: var(--head); color: var(--muted); font-size: 12px; font-weight: 600; text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; white-space: nowrap; }",
+  "th.contrib { color: var(--text); border-top: 3px solid var(--c); white-space: normal; }",
   "th.l, td.who, td.rank { text-align: left; } th[data-dir=asc]::after { content: \" \\25B2\"; } th[data-dir=desc]::after { content: \" \\25BC\"; }",
-  "td { text-align: right; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }",
+  "td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }",
+  "td.src { white-space: normal; min-width: 110px; max-width: 170px; } td.src small { line-height: 1.35; margin-top: 1px; }",
   "td small { display: block; color: var(--muted); font-size: 11px; }",
   "td.rank { color: var(--muted); width: 36px; } td.when { font-size: 12px; }",
-  ".bar { display: flex; height: 6px; margin-top: 5px; border-radius: 3px; overflow: hidden; background: var(--line); min-width: 140px; }",
+  ".bar { display: flex; height: 6px; margin-top: 5px; border-radius: 3px; overflow: hidden; background: var(--line); min-width: 100px; }",
   ".bar span { display: block; height: 100%; }",
   "tfoot td { font-weight: 600; background: var(--head); border-bottom: 0; }",
   ".nil { color: var(--muted); }",
