@@ -86,12 +86,11 @@ fn handle_quickreport(req) {
   return {"status": 200, "content_type": "application/json; charset=utf-8", "json": data}
 }
 
+// GET /quickreportview: the PHP report's address. The page is the pane's now ("/"): there, with the link's range and
+// hours (the pane's on_open reads them), so a bookmark opens on the same dates.
 fn handle_quickreportview(req) {
-  let p = parse_date_params(req)
-  let db = get_db()
-  let data = report(db, p)
-  let html = render_html_dashboard(data, p)
-  return {"status": 200, "content_type": "text/html; charset=utf-8", "body": html}
+  let q = str(req.query ?? "")
+  return res_redirect(q == "" ? "/" : "/?" + q)
 }
 
 // The exports: the report as a file to save, named for its range.
@@ -104,43 +103,6 @@ fn handle_quickreportpdf(req) { return export(req, "pdf", render_pdf_report) }
 fn handle_quickreportxlsx(req) { return export(req, "xlsx", render_xlsx_report) }
 fn handle_quickreportcsv(req) { return export(req, "csv", render_csv_report) }
 
-// GET /quickreportevents?start&stop: server-sent events for an open dashboard. The engine wakes this route when the
-// touch_hour Thing changes (WAIT THING - nothing here polls); when an hour of the range is among the changed ones, the
-// report is read again and pushed as `report` {badge, live}, which the page swaps in. A comment goes out when a wait
-// times out with nothing new, so a closed page is noticed and the route ends.
-fn handle_events(req, writer) {
-  let p = parse_date_params(req)
-  let in_range = add_keys({}, date_range(p.start, p.stop))
-  // WAIT holds its connection while it waits, so this stream has one of its own
-  let w = db_connect(DB_CFG)
-  writer.write_head(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  let clock = "0"
-  while not writer.is_closed() {
-    let r = db_query(w, "WAIT THING touch_hour SINCE " + clock + " TIMEOUT 25", [])
-    if not r.ok {
-      writer.event("failed", r.error)
-      break
-    }
-    let row = r.records[0]
-    let now_clock = str(row.clock)
-    if now_clock == clock {
-      if not writer.write(": nothing new" + chr(10) + chr(10)) { break }
-    } else {
-      let first = clock == "0"
-      clock = now_clock
-      let hit = first or str(row.whole) == "1"
-      if not hit {
-        for d in json_parse(row.changed) { if in_range[slice(str(d), 0, 10)] { hit = true } }   // an hour of a day of the range
-      }
-      if hit {
-        let data = report(get_db(), p)
-        if not writer.event("report", json_stringify({"badge": render_badge(data), "live": render_live(data)})) { break }
-      }
-    }
-  }
-  db_close(w)
-  return nil
-}
 
 // ---- The pane --------------------------------------------------------------------------------------------
 
@@ -176,14 +138,23 @@ ui.pane({
   // Live: the engine wakes the pane when the touch_hour Thing changes (WAIT THING, on a connection of its own);
   // every open page then looks again, and gets a frame when its own range's figures moved.
   "watch": {"thing": "touch_hour", "db": DB_CFG},
+  // a link opens the page on its range and hours (start, stop; hours=7-11 or the PHP report's hour_wanted=10); what
+  // it does not say is left as the viewer had it
+  "on_open": fn(q) {
+    if has(q, "start") or has(q, "stop") {
+      let r = report_range(q.start, q.stop)
+      state.start = r[0]
+      state.stop = r[1]
+    }
+    if has(q, "hours") or has(q, "hour_wanted") { state.span = hour_span(q.hour_wanted, q.hours) }
+  },
   "routes": {
     "/health": handle_health,
     "/quickreportauth": handle_auth,
     "/quickreport": handle_quickreport,
-    "/quickreportview": handle_quickreportview,     // the PHP page as it was (its own script sorts and follows the events)
+    "/quickreportview": handle_quickreportview,     // the PHP report's address: to the page, with its range
     "/quickreportpdf": handle_quickreportpdf,
     "/quickreportxlsx": handle_quickreportxlsx,
-    "/quickreportcsv": handle_quickreportcsv,
-    "/quickreportevents": handle_events
+    "/quickreportcsv": handle_quickreportcsv
   }
 })

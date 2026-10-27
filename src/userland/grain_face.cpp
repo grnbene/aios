@@ -459,6 +459,8 @@ class FacePane final : public PaneDriver {
   void set_machine(const std::string& m) { machine_ = m; }
   const Value& watch() const { return watch_; }
   void set_watch(const Value& w) { watch_ = w; }
+  const Value& on_open() const { return on_open_; }
+  void set_on_open(const Value& f) { on_open_ = f; }
   // "watch": {"thing", "db", "timeout"}: the arguments watch_thing_native is called with
   const std::string& watch_thing() const { return watch_thing_; }
   const Value& watch_db() const { return watch_db_; }
@@ -1223,6 +1225,7 @@ class FacePane final : public PaneDriver {
   bool api_only_ = false;  // no page: only its routes answer (serve_routes)
   std::string machine_;    // the fleet member whose copy of the program runs this pane (its page, actions and routes)
   Value watch_;            // fn(since): returns when the pane's data may have changed (WebUi's watcher calls it)
+  Value on_open_;          // fn(query): the page was opened with this URL query (a link's range, say)
   std::string watch_thing_;
   Value watch_db_;
   int64_t watch_timeout_ = 10;
@@ -1485,6 +1488,13 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
     }
     if (!is_callable(*wt)) { error = std::string("ui.pane()'s \"watch\" is a function or {\"thing\", \"db\"}, got a ") + type_name(wt->type); return Value::nil(); }
     pane->set_watch(*wt);
+  }
+  // "on_open": fn(query) - called when the page itself is opened (a GET of it, in a browser or by a link), with its
+  // URL's query as a map, before it is drawn: a link can carry the state the page opens on (?start=..&stop=..).
+  // Not for the page's own events or its stream of updates.
+  if (Value* oo = o->find("on_open"); oo && oo->type != Type::Nil) {
+    if (!is_callable(*oo)) { error = std::string("ui.pane()'s \"on_open\" is a function, got a ") + type_name(oo->type); return Value::nil(); }
+    pane->set_on_open(*oo);
   }
   if (Value* wk = o->find("workers")) pane->set_workers(wk->truthy());   // each route request in a VM of its own, on its own thread: a slow one does not hold up the rest
   return register_driven_pane(vm, title, w, h, pane);
@@ -2040,6 +2050,14 @@ const Value* route_match(FacePane* f, const std::string& method, const std::stri
   return nullptr;
 }
 }  // namespace
+
+bool web_pane_on_open(Vm& vm, uint64_t id, const std::string& query, std::string& error) {
+  FacePane* f = web_face(vm, id);
+  if (!f || f->on_open().type == Type::Nil) return true;
+  vm.call(f->on_open(), {Value::object(Type::Map, parse_query_params(query))}, error);
+  if (!error.empty()) { error = "on_open(): " + error; return false; }
+  return true;
+}
 
 struct RouteWriterState {
   std::mutex mu;

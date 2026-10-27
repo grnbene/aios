@@ -203,9 +203,9 @@ fn render_csv_report(report) {
 
 // ---- The page -----------------------------------------------------------------------------------------------
 
-// The page: the same page as apir/warehouse/touches/quickreportview in the PHP report (catalog/controller/apir/
-// warehouse/touches.php) - its markup, styles and sort - with the figures kept live: /quickreportevents pushes a new
-// <div id="live"> whenever an hour of the range changes (WAIT THING on touch_hour), and the page swaps it in.
+// The page: apir/warehouse/touches/quickreportview of the PHP report (catalog/controller/apir/warehouse/touches.php) -
+// its markup and styles - as the pane's view (dashboard_node): its range, sort and hours the viewer's own, kept live by
+// the pane's watch on touch_hour.
 
 // The five sources that make up touches, in column order: key, label, colour variable.
 let SOURCES = [["receiving", "Receiving", "--rec"], ["picking", "Picking", "--pick"], ["movements", "Bin moves", "--move"],
@@ -252,19 +252,7 @@ fn sort_value(u, col) {
   return real(u.touches)   // 0 (rank) and 2: the busiest first
 }
 
-// The PHP page's live part, for the page whose script sorts it (render_live: data-col headers).
-fn render_live(report) { return html_stringify(live_node(report, nil, hours_node(report.hour, nil))) }
 
-// The hour of the day the report is limited to (hour_wanted in the PHP report): All, then 12am to 11pm. pick: an
-// action for a button (the pane); nil: the page's script submits the form with the hour (the PHP page).
-fn hours_node(current, pick) {
-  let label = fn(h) { return str(h % 12 == 0 ? 12 : h % 12) + (h < 12 ? "am" : "pm") }
-  let button = fn(h, text) {
-    return el("button", {"type": "button", "class": ["btn", "hour", h == current ? "on" : nil], "data-hour": h ?? "",
-                         "on_click": pick == nil ? nil : fn() { pick(h) }}, text)
-  }
-  return el("div", {"class": "hours"}, button(nil, "All"), map(range(0, 24), fn(h) { return button(h, label(h)) }))
-}
 
 // What changes with the data: the cards and the "By person" panel. sorter nil: the rows in rank order
 // and headers for the page script to sort; a sorter {col, dir}: the rows sorted here (ties by user id, every time)
@@ -508,87 +496,10 @@ let PAGE_CSS = join([
   "@media print { body { background: #ffffff; } form, .btn, .hours, .tl-hint { display: none; } .card, .panel { break-inside: avoid; } }"
 ], chr(10))
 
-// The PHP page's table sort, bound again after each pushed update (the sort kept), and the event stream.
-let PAGE_JS = join([
-  "var sortCol = null, sortDir = null;",
-  "function sortBy(th, dir) {",
-  "    var col = +th.dataset.col;",
-  "    document.querySelectorAll('th[data-col]').forEach(function (h) { h.removeAttribute('data-dir'); });",
-  "    th.dataset.dir = dir;",
-  "    var body = th.closest('table').tBodies[0], rows = Array.prototype.slice.call(body.rows);",
-  "    rows.sort(function (a, b) {",
-  "        var x = a.cells[col].dataset.v || '', y = b.cells[col].dataset.v || '';",
-  "        // a number only when the whole value is one: parseFloat('2026-09-28 08:20') is 2026 for every row",
-  "        var nx = x.trim() === '' ? NaN : Number(x), ny = y.trim() === '' ? NaN : Number(y);",
-  "        var c = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : x.localeCompare(y);",
-  "        if (c === 0) c = (a.cells[1].dataset.v || '').localeCompare(b.cells[1].dataset.v || '');   // ties: by name, every time",
-  "        return dir === 'asc' ? c : -c;",
-  "    });",
-  "    rows.forEach(function (r) { body.appendChild(r); });",
-  "}",
-  "function bindSort() {",
-  "    document.querySelectorAll('th[data-col]').forEach(function (th) {",
-  "        th.addEventListener('click', function () {",
-  "            sortCol = th.dataset.col; sortDir = th.dataset.dir === 'desc' ? 'asc' : 'desc';",
-  "            sortBy(th, sortDir);",
-  "        });",
-  "    });",
-  "    if (sortCol !== null) { var th = document.querySelector('th[data-col=\"' + sortCol + '\"]'); if (th) sortBy(th, sortDir); }",
-  "}",
-  "bindSort();",
-  "function tick() {",
-  "    var d = new Date();",
-  "    document.getElementById('clock-time').textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });",
-  "    document.getElementById('clock-day').textContent = d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });",
-  "}",
-  "tick(); setInterval(tick, 1000);",
-  "if (window.EventSource) {",
-  "    var es = new EventSource('/quickreportevents' + location.search);",
-  "    es.addEventListener('report', function (m) {",
-  "        try {",
-  "            var d = JSON.parse(m.data), live = document.getElementById('live');",
-  "            var sc = live.querySelector('.scroll'), left = sc ? sc.scrollLeft : 0, top = window.scrollY;",
-  "            live.innerHTML = d.live;",
-  "            sc = live.querySelector('.scroll'); if (sc) sc.scrollLeft = left;",
-  "            window.scrollTo(window.scrollX, top);",
-  "            document.getElementById('range').innerHTML = d.badge;",
-  "            bindSort();",
-  "            live.classList.remove('pulse'); void live.offsetWidth; live.classList.add('pulse');",
-  "        } catch (e) {}",
-  "    });",
-  "}"
-], chr(10))
 
-// The PHP page's hour buttons: the form again, with that hour.
-let HOURS_JS = join([
-  "document.addEventListener('click', function (e) {",
-  "  var b = e.target.closest && e.target.closest('.hour'), f = document.getElementById('report-form');",
-  "  if (!b || !f) return;",
-  "  f.elements['hour_wanted'].value = b.dataset.hour;",
-  "  f.submit();",
-  "});"
-], chr(10))
 
-fn render_html_dashboard(report, input) {
-  let q = "?start=" + report.start + "&stop=" + report.stop + "&hour_wanted=" + str(report.hour ?? "")
-  return "<!doctype html>" + html_stringify(el("html",
-    el("head", el("meta", {"charset": "utf-8"}), el("meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}),
-       el("title", "Warehouse Activity " + report.start + " to " + report.stop), el("style", PAGE_CSS)),
-    el("body",
-      el("div", {"class": "page"},
-        el("header",
-          el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
-          el("div", {"class": "clock", "aria-live": "off"}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
-          el("form", {"method": "get", "action": "/quickreportview", "id": "report-form"},
-            el("input", {"type": "hidden", "name": "hour_wanted", "value": str(report.hour ?? "")}),
-            el("label", "From"), el("input", {"type": "date", "name": "start", "value": report.start}),
-            el("label", "To"), el("input", {"type": "date", "name": "stop", "value": report.stop}),
-            el("button", {"type": "submit", "class": "btn primary"}, "Run"),
-            el("a", {"class": "btn", "href": "/quickreportpdf" + q}, "Export PDF"),
-            el("a", {"class": "btn", "href": "/quickreportxlsx" + q}, "Export Excel"))),
-        el("div", {"id": "live"}, html_raw(render_live(report)))),
-      el("script", PAGE_JS), el("script", HOURS_JS))))
-}
+
+
 
 // The clock in the header, filled in by the page (the time is the viewer's).
 let CLOCK_JS = join([

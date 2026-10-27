@@ -59,6 +59,13 @@ try:
     check("the action got the field's value", True, '<p id="start">from 2026-09-15</p>' in h)
     check("the input shows the new value", True, 'data-id="start" value="2026-09-15"' in h)
 
+    _, _, h = request("GET", "/?start=2026-08-01", None, {"Cookie": cookie})
+    check("on_open: a link's query opens the page on it", True, '<p id="start">from 2026-08-01</p>' in h)
+    _, _, h = request("GET", "/", None, {"Cookie": cookie})
+    check("a reload without it keeps what the viewer had", True, '<p id="start">from 2026-08-01</p>' in h)
+    h = event("")
+    check("an action does not open the page again", True, '<p id="start">from 2026-08-01</p>' in h)
+
     _, th, tree = request("GET", "/", None, {"Accept": "application/x-grain-ui+json", "Cookie": cookie})
     t = json.loads(tree)["tree"]
     check("a native client gets the markup as markup", ("html", True), (t["widget"], t["html"].startswith('<div class="page">')))

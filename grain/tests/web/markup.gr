@@ -22,5 +22,6 @@ fn view() {
     ui.text("clicks " + str(clicks), {"bold": true}))
 }
 
-ui.pane({"title": "Markup", "css": ".sortable { cursor: pointer }", "view": view})
+ui.pane({"title": "Markup", "css": ".sortable { cursor: pointer }", "view": view,
+         "on_open": fn(q) { if has(q, "start") { start = q.start } }})
 run_panes()
