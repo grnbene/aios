@@ -1241,13 +1241,20 @@ void cmd_serve(Ctx& c, const Args& a) {
   std::mutex slots_mu;
   std::condition_variable slots_cv;
   int slots_used = 0;
+  // The first answer buffer a slot takes (AIOS_APP_ROUTE_MB, default 1); it grows to the largest answer it has had.
   const uint64_t route_room = [] {
     const char* e = std::getenv("AIOS_APP_ROUTE_MB");
-    const uint64_t mb = e && *e ? std::strtoull(e, nullptr, 10) : 64;
+    const uint64_t mb = e && *e ? std::strtoull(e, nullptr, 10) : 1;
     return std::max<uint64_t>(1, mb) << 20;
   }();
+  // Each of the route_max slots keeps its request and answer buffers from one request to the next. Fresh ones a
+  // request were two MemAllocs (one of a 64 MB answer buffer the member zero-filled), two MemReleases and the job
+  // lane's uploads - five round trips through the hub (~50 ms each, Cleve -> chi -> atl) for an answer that took
+  // the member a millisecond. Kept, the buffers stay staged on the member and a request is one ExecBatch.
+  struct RouteBufs { Tensor tin{}, tout{}; uint64_t in_cap = 0, out_cap = 0; bool busy = false; };
+  std::vector<RouteBufs> route_bufs((size_t)route_max);
   ga::Host::Options host_opt{[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str(), nullptr};
-  host_opt.forward = [&c, &route_worker, &reach_mu, route_room, route_max, &slots_mu, &slots_cv, &slots_used](const std::string& app, const std::string& member,
+  host_opt.forward = [&c, &route_worker, &reach_mu, route_room, route_max, &slots_mu, &slots_cv, &slots_used, &route_bufs](const std::string& app, const std::string& member,
                                                                   const userland::grain::WebUi::Request& req,
                                                                   userland::grain::WebUi::Response& res) -> bool {
     auto answer = [&res](int status, const std::string& why) {
@@ -1272,44 +1279,61 @@ void cmd_serve(Ctx& c, const Args& a) {
         return answer(503, "too many requests on their way to " + member + " (" + std::to_string(route_max) + " at once); try again");
       ++slots_used;
     }
+    // A slot of its own: its buffers, kept from the last request through it.
+    RouteBufs* rb = nullptr;
+    {
+      std::lock_guard<std::mutex> g(slots_mu);
+      for (auto& b : route_bufs) if (!b.busy) { b.busy = true; rb = &b; break; }
+    }
     struct Slot {
-      std::mutex& m; std::condition_variable& cv; int& used;
-      ~Slot() { { std::lock_guard<std::mutex> g(m); --used; } cv.notify_one(); }
-    } slot{slots_mu, slots_cv, slots_used};
+      std::mutex& m; std::condition_variable& cv; int& used; RouteBufs* rb;
+      ~Slot() { { std::lock_guard<std::mutex> g(m); --used; if (rb) rb->busy = false; } cv.notify_one(); }
+    } slot{slots_mu, slots_cv, slots_used, rb};
+    if (!rb) return answer(503, "no free route slot");
+    // A buffer that cannot be used as it is goes, and the next request through the slot makes a new one.
+    auto drop = [&](Tensor& t, uint64_t& cap) { if (cap) { (void)route_worker.release(t.memory); cap = 0; } };
+    auto ensure = [&](Tensor& t, uint64_t& cap, uint64_t need) -> bool {
+      if (cap >= need) return true;
+      drop(t, cap);
+      auto nt = route_worker.tensor(DType::U8, {need});
+      if (!nt.ok()) return false;
+      t = *nt;
+      cap = need;
+      return true;
+    };
     const ByteBuffer in = encode_app_request(app, req);
-    uint64_t room = route_room;
+    // The request buffer: room for this request (a longer one grows it); what is past it the decoder never reads.
+    if (!ensure(rb->tin, rb->in_cap, std::max<uint64_t>(in.size(), 4096))) return answer(503, "request buffer");
     for (int attempt = 0; attempt < 2; ++attempt) {
-      auto tin = route_worker.tensor(DType::U8, {(uint64_t)in.size()});
-      if (!tin.ok()) return answer(503, "request buffer: " + tin.error().message);
-      auto tout = route_worker.tensor(DType::U8, {room});
-      if (!tout.ok()) { (void)route_worker.release(tin->memory); return answer(503, "answer buffer: " + tout.error().message); }
-      auto release = [&] { (void)route_worker.release(tin->memory); (void)route_worker.release(tout->memory); };
-      auto wr = route_worker.write(tin->memory, tin->offset, ByteSpan(in.data(), in.size()));
+      if (!ensure(rb->tout, rb->out_cap, std::max<uint64_t>(rb->out_cap, route_room))) return answer(503, "answer buffer");
+      auto wr = route_worker.write(rb->tin.memory, rb->tin.offset, ByteSpan(in.data(), in.size()));
       auto g = route_worker.create_graph();
-      if (!wr.ok() || !g.ok()) { release(); return answer(503, "graph: " + (wr.ok() ? g.error().message : wr.error().message)); }
+      if (!wr.ok() || !g.ok()) return answer(503, "graph: " + (wr.ok() ? g.error().message : wr.error().message));
       Operation op;
       op.code = OpCode::Custom;
       op.custom_kernel = fnv1a(std::string(kAppRouteKernel));
       op.requirement.device_selector = "remote:relay:" + hits[0].short_str();
-      op.inputs.push_back(*tin);
-      op.outputs.push_back(*tout);
+      Tensor tin = rb->tin;
+      tin.shape = {(uint64_t)in.size()};   // the request's own bytes, not the buffer's room
+      op.inputs.push_back(tin);
+      op.outputs.push_back(rb->tout);
       auto added = route_worker.add_operation(*g, op);
       auto rep = added.ok() ? route_worker.execute(*g) : Result<ExecutionReport>(added.error());
-      (void)c.k.graphs().destroy(*g);
+      (void)route_worker.destroy_graph(*g);
       if (!rep.ok() || !rep->failure.empty()) {
-        release();
+        drop(rb->tout, rb->out_cap);   // a failed job may have left the member's copy of it half written
         return answer(502, "on " + member + ": " + (rep.ok() ? rep->failure : rep.error().message));
       }
-      auto head = route_worker.read(tout->memory, tout->offset, 4);
-      if (!head.ok() || head->size() < 4) { release(); return answer(502, "on " + member + ": no answer came back"); }
+      auto head = route_worker.read(rb->tout.memory, rb->tout.offset, 4);
+      if (!head.ok() || head->size() < 4) return answer(502, "on " + member + ": no answer came back");
       const uint64_t len = (uint64_t)(*head)[0] | ((uint64_t)(*head)[1] << 8) | ((uint64_t)(*head)[2] << 16) | ((uint64_t)(*head)[3] << 24);
-      if (len + 4 > room) {   // it did not fit: ask once more with room for it
-        release();
-        room = len + 4;
+      if (len + 4 > rb->out_cap) {   // it did not fit: room for it (and a quarter more), asked once more
+        const uint64_t want = len + 4 + (len + 4) / 4;
+        drop(rb->tout, rb->out_cap);
+        if (!ensure(rb->tout, rb->out_cap, want)) return answer(503, "answer buffer");
         continue;
       }
-      auto body = route_worker.read(tout->memory, tout->offset, len + 4);
-      release();
+      auto body = route_worker.read(rb->tout.memory, rb->tout.offset, len + 4);
       if (!body.ok() || !decode_app_response(ByteSpan(body->data(), body->size()), res))
         return answer(502, "on " + member + ": the answer could not be read");
       return true;
@@ -1337,6 +1361,9 @@ void cmd_serve(Ctx& c, const Args& a) {
         return Ok();
       }
       std::memcpy(dst, out.data(), out.size());
+      // The caller keeps this buffer for its next request: what an earlier, longer answer left past this one is
+      // zeroed, so the read back (which leaves trailing zeros off) carries this answer only.
+      std::memset(dst + out.size(), 0, room - out.size());
       return Ok();
     }));
   }
