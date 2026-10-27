@@ -338,6 +338,137 @@ $ aios-asql-top --no-conf -P 13410 -u x -1
 
 ---
 
+## Connecting and querying from Grain
+
+Grain programs interact with ASQL through three distinct access mechanisms, depending on whether code runs in-process inside the kernel, connects over the network via wire protocol, or executes ad-hoc loopback queries:
+
+```
++-------------------------------------------------------------------------------+
+|                             Grain Applications                                |
++-------------------------------------------------------------------------------+
+         |                                |                            |
+         | 1. In-Process (Kernel/Mesh)    | 2. Wire Protocol (TCP)     | 3. Loopback
+         v                                v                            v
+  sql() / sql_on()               db_connect() / db_query()    asql_query() / asql_exec()
+  [src/userland/machine_sql.cpp] [src/userland/grain_std_db.cpp] [src/userland/grain_aios.cpp]
+         |                                |                            |
+         | Direct C++ Pointer             | MySQL Wire (e.g. :3307)    | Loopback TCP
+         v                                v                            v
+  +-----------------------------------------------------------------------------+
+  |                          ASQL Engine (SqlDatabase)                          |
+  +-----------------------------------------------------------------------------+
+```
+
+### 1. In-process engine: `sql()` and `sql_on()`
+*Source: [`src/userland/machine_sql.cpp:333-355`](file:///repos/aios/src/userland/machine_sql.cpp#L333-L355)*
+
+When Grain runs inside the AIOS kernel (`aios grain ...`, bare metal, or system services), `install_sql_builtins` binds `sql()` directly to the process's `SqlDatabase` instance. This completely bypasses TCP sockets, auth handshakes, and wire serialization.
+
+- **Result set queries** (`SELECT`, `SHOW`, `EXPLAIN`): Returns a list of maps, one per row.
+  - Number types are mapped to native Grain numbers: `SqlDataType::Int` becomes integer, `Real` / `Decimal` become real numbers.
+  - `NULL` becomes `nil`. Text and dates become strings.
+- **Non-query statements** (`INSERT`, `UPDATE`, `DELETE`, DDL): Returns a map `{"affected": <integer>}`.
+- **Errors**: Failures throw a Grain runtime error (not a map with `ok=false` to overlook). Catch errors with `pcall()`.
+
+```grain
+// In-process query: zero socket overhead, sub-microsecond execution
+let rows = sql("SELECT stockid, description, standardcost FROM stockmaster WHERE discontinued = 0 LIMIT 10")
+for row in rows {
+  print(row.stockid + ": " + str(row.standardcost))
+}
+
+// Data modification: returns affected row count
+let res = sql("UPDATE pickingfreeze SET status = 'DONE' WHERE id = 1042")
+print("Updated " + str(res.affected) + " rows")
+
+// Fleet mesh query across peer nodes:
+let peer_rows = sql_on("remote-node", "SELECT COUNT(*) AS total FROM recscan")
+```
+
+### 2. Wire client protocol: `db_connect()`, `db_query()`, `db_transaction()`
+*Source: [`src/userland/grain_std_db.cpp:351-570`](file:///repos/aios/src/userland/grain_std_db.cpp#L351-L570)*
+
+For standalone Grain programs (`grain run ...`, `grain serve ...`), background workers, or connecting across network boundaries, Grain provides a zero-dependency MySQL 5.7 wire client. It connects to ASQL's native wire port (default 3307) or external MariaDB/MySQL instances.
+
+#### Connecting (`db_connect`)
+```grain
+// Signature: db_connect(host, port, user, password, [database])
+let res = db_connect("127.0.0.1", 3307, "root", getenv("DB_PASS"), "versioneight")
+if !res.ok {
+  print("Connection failed: " + res.error)
+  return nil
+}
+let db = res.conn   // or pass `res` directly to db_* functions
+```
+The result map contains `{"ok": true, "conn": <handle>, "server_version": "5.7.44-aios-asql", "error": ""}`. Either the returned map or the inner `conn` handle can be passed as the connection argument to all subsequent `db_*` builtins (`grain_std_db.cpp:322`).
+
+> [!IMPORTANT]
+> **Thread & Connection Rules** ([`docs/grain-app-writing.md:224`](file:///repos/aios/docs/grain-app-writing.md#L224)): Sockets and database connections cannot cross thread boundaries. In multi-worker `ui.pane` web services, open the database connection inside request handlers or worker tasks, never in global module scope. Always call `db_close(db)` when finished.
+
+#### Safe Parameter Binding (`db_query`)
+Queries use `?` placeholders with safe parameter list binding (`grain_std_db.cpp:474-505`). Values are escaped automatically; `nil` binds as `NULL`, booleans as `1`/`0`, and nested lists automatically expand into comma-separated runs for SQL `IN (?)`:
+
+```grain
+// Parameterized query with ? placeholders
+let items = db_query(db, "SELECT * FROM stockmaster WHERE category = ? AND standardcost > ?", ["TIRES", 50.0])
+
+// Lists expand automatically for IN (?) clauses
+let ids = ["T100", "T200", "T300"]
+let matches = db_query(db, "SELECT stockid, description FROM stockmaster WHERE stockid IN (?)", [ids])
+
+// Memory optimization: omit `rows` when only `records` are needed
+let fast = db_query(db, "SELECT stockid FROM stockmaster", {"rows": false})
+```
+
+`db_query` returns:
+- `ok`: boolean success flag.
+- `error`: error string (empty if ok).
+- `columns`: list of column name strings `["col1", "col2", ...]`.
+- `rows`: list of lists in column order `[[val1, val2], ...]`.
+- `records`: list of row maps `[{"col1": val1, "col2": val2}, ...]`.
+- `affected_rows`: integer count of modified rows.
+- `last_insert_id`: integer ID for `AUTO_INCREMENT` inserts.
+
+#### Transactions with Nested Savepoints (`db_transaction`)
+`db_transaction(conn, fn)` wraps operations in an ACID transaction (`grain_std_db.cpp:517`):
+- Top-level call begins with `START TRANSACTION` and commits with `COMMIT`.
+- Nested calls within the closure automatically use `SAVEPOINT grain_sp_<depth>`.
+- If an unhandled error or exception occurs in the callback, it automatically issues `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) and rethrows the error.
+
+```grain
+let result = db_transaction(db, fn(tx) {
+  let ins = db_query(tx, "INSERT INTO recscan (scan_date, user, qty) VALUES (NOW(), ?, ?)", ["JACK", 10.0])
+  if !ins.ok { error("Failed insert: " + ins.error) }
+  return ins.last_insert_id
+})
+```
+
+### 3. Loopback one-shot helpers: `asql_query()` and `asql_exec()`
+*Source: [`src/userland/grain_aios.cpp:649-714`](file:///repos/aios/src/userland/grain_aios.cpp#L649-L714)*
+
+For administrative scripts or quick CLI pipelines running on the same host as ASQL, `asql_query` and `asql_exec` manage connection lifecycle automatically:
+
+```grain
+// asql_query(sql, [port=3307], [login]) -> returns list of row maps directly
+let users = asql_query("SELECT userid, realname FROM www_users")
+for u in users {
+  print(u.userid + ": " + u.realname)
+}
+
+// asql_exec(sql, [port=3307], [login]) -> returns {ok, affected_rows, last_insert_id, error}
+let res = asql_exec("DELETE FROM pickingfreeze WHERE status = 'CANCELLED'")
+if res.ok {
+  print("Removed " + str(res.affected_rows) + " rows")
+}
+```
+
+### 4. Reactive polling: `live()`
+*Source: [`src/userland/grain_std_db.cpp:640-699`](file:///repos/aios/src/userland/grain_std_db.cpp#L640-L699)*
+
+Instead of repeatedly querying heavy tables, Grain's `live()` primitive polls ASQL's mutation tracker via `SELECT ASQL_CHANGES('table1', 'table2')`. The underlying query is only re-evaluated when a table token actually moves, driving reactive dashboards with negligible CPU overhead.
+
+---
+
 ## Connection profiles: `connections.ini`
 
 A profile names another MySQL-protocol server the engine may connect to. Three
