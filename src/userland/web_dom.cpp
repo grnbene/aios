@@ -524,4 +524,130 @@ NodePtr parse_html(ByteSpan markup) {
   return doc;
 }
 
+namespace {
+
+std::string url_trimmed(const std::string& s) {
+  size_t a = 0, b = s.size();
+  while (a < b && is_space(s[a])) ++a;
+  while (b > a && is_space(s[b - 1])) --b;
+  return s.substr(a, b - a);
+}
+
+std::string url_lowered(const std::string& s) {
+  std::string o = s;
+  for (char& c : o) c = lower(c);
+  return o;
+}
+
+bool url_has_scheme(const std::string& s) {
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (c == ':') return i > 0;
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '-' ||
+              c == '.';
+    if (!ok) return false;
+  }
+  return false;
+}
+
+std::string normalise_path(const std::string& path) {
+  std::vector<std::string> parts;
+  size_t i = 0;
+  bool absolute = !path.empty() && path[0] == '/';
+  while (i < path.size()) {
+    size_t slash = path.find('/', i);
+    if (slash == std::string::npos) slash = path.size();
+    std::string seg = path.substr(i, slash - i);
+    i = slash + 1;
+    if (seg.empty() || seg == ".") continue;
+    if (seg == "..") {
+      if (!parts.empty()) parts.pop_back();
+    } else {
+      parts.push_back(seg);
+    }
+  }
+  std::string out = absolute ? "/" : "";
+  for (size_t k = 0; k < parts.size(); ++k) {
+    if (k > 0 || !absolute) out += parts[k];
+    else out += parts[k];
+    if (k + 1 < parts.size()) out += '/';
+  }
+  if (!parts.empty() && path.back() == '/' && out.back() != '/') out += '/';
+  return out.empty() ? (absolute ? "/" : ".") : out;
+}
+
+}  // namespace
+
+std::string resolve_url(const std::string& base, const std::string& href_raw) {
+  std::string href = url_trimmed(href_raw);
+  if (href.empty()) return {};
+  std::string low = url_lowered(href);
+  if (low.compare(0, 7, "mailto:") == 0 || low.compare(0, 11, "javascript:") == 0 ||
+      low.compare(0, 4, "tel:") == 0 || low.compare(0, 5, "data:") == 0)
+    return href;
+  if (url_has_scheme(href)) return href;
+
+  size_t scheme_end = base.find("://");
+  if (scheme_end == std::string::npos) return href;
+  std::string scheme = base.substr(0, scheme_end);
+  size_t host_start = scheme_end + 3;
+  size_t host_end = base.find('/', host_start);
+  std::string authority = base.substr(host_start, (host_end == std::string::npos ? base.size() : host_end) - host_start);
+  std::string base_path = host_end == std::string::npos ? "/" : base.substr(host_end);
+  size_t cut = base_path.find_first_of("?#");
+  if (cut != std::string::npos) base_path = base_path.substr(0, cut);
+
+  if (href.compare(0, 2, "//") == 0) return scheme + ":" + href;
+  if (href[0] == '#') return base + (base.find('#') == std::string::npos ? href : std::string());
+  if (href[0] == '?') return scheme + "://" + authority + base_path + href;
+  if (href[0] == '/') return scheme + "://" + authority + normalise_path(href);
+
+  size_t last_slash = base_path.rfind('/');
+  std::string dir = last_slash == std::string::npos ? "/" : base_path.substr(0, last_slash + 1);
+  return scheme + "://" + authority + normalise_path(dir + href);
+}
+
+Stylesheet collect_author_css(Node& doc, const std::string& base, const Fetch& fetch) {
+  Stylesheet sheet;
+  std::vector<Node*> stack;
+  stack.push_back(&doc);
+  std::vector<Node*> flat;
+  while (!stack.empty()) {
+    Node* n = stack.back();
+    stack.pop_back();
+    flat.push_back(n);
+    for (size_t i = n->children.size(); i > 0; --i) stack.push_back(n->children[i - 1].get());
+  }
+
+  size_t fetched = 0;
+  for (Node* n : flat) {
+    if (n->kind != Node::Kind::Element) continue;
+    if (n->tag == "style") {
+      std::string media = n->attr("media");
+      Stylesheet inner = parse_css(n->inner_text());
+      if (!media.empty())
+        for (auto& r : inner.rules)
+          if (r.media.empty()) r.media = media;
+      sheet.append(inner);
+      continue;
+    }
+    if (n->tag != "link") continue;
+    std::string rel = url_lowered(n->attr("rel"));
+    if (rel.find("stylesheet") == std::string::npos) continue;
+    std::string href = resolve_url(base, n->attr("href"));
+    if (href.empty() || !fetch) continue;
+    if (++fetched > 6) break;
+    auto res = fetch(href, FetchOptions{});
+    if (res.ok() && !res->body.empty()) {
+      Stylesheet linked = parse_css(res->body);
+      std::string media = n->attr("media");
+      if (!media.empty())
+        for (auto& r : linked.rules)
+          if (r.media.empty()) r.media = media;
+      sheet.append(linked);
+    }
+  }
+  return sheet;
+}
+
 }  // namespace aios::userland::web

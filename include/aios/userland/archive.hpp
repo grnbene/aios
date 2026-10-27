@@ -23,6 +23,9 @@ struct ArchiveEntry {
 // not extracted. Stored and deflated entries; every one's CRC-32 is checked.
 Result<std::vector<ArchiveEntry>> unzip(ByteSpan zip);
 
+// Creates a standard PKZIP archive (deflated with net::deflate_raw or stored).
+ByteBuffer zip_create(const std::vector<ArchiveEntry>& entries, int compression_level = 6);
+
 uint32_t crc32(ByteSpan data);
 
 }  // namespace aios::userland

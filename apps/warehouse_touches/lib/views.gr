@@ -1,0 +1,773 @@
+// Warehouse Touches Views: Production PDF, XLSX, CSV, and Responsive Dashboard
+//
+// Matches and exceeds catalog/controller/apir/warehouse/touches.php in fidelity,
+// typography, responsive layout, and document generation.
+
+fn html_escape(s) {
+  if s == nil { return "" }
+  let str_val = str(s)
+  let out = ""
+  for i in range(0, len(str_val)) {
+    let c = str_val[i]
+    if c == "&" { out = out + "&amp;" }
+    else if c == "<" { out = out + "&lt;" }
+    else if c == ">" { out = out + "&gt;" }
+    else if c == "\"" { out = out + "&quot;" }
+    else if c == "'" { out = out + "&#39;" }
+    else { out = out + c }
+  }
+  return out
+}
+
+fn fmt_num(n, decimals) {
+  if n == nil { return "0" }
+  let r = real(n)
+  if decimals == 0 {
+    let int_part = int(r)
+    let s = str(int_part)
+    let neg = false
+    if len(s) > 0 and s[0] == "-" {
+      neg = true
+      s = slice(s, 1, len(s))
+    }
+    let res = ""
+    let cnt = 0
+    let idx = len(s) - 1
+    while idx >= 0 {
+      if cnt > 0 and cnt % 3 == 0 { res = "," + res }
+      res = s[idx] + res
+      cnt += 1
+      idx -= 1
+    }
+    return neg ? "-" + res : res
+  }
+  let s = str(round(r, decimals))
+  let dot = -1
+  for i in range(0, len(s)) {
+    if s[i] == "." { dot = i }
+  }
+  if dot == -1 {
+    return fmt_num(int(r), 0) + ".0"
+  }
+  let int_str = fmt_num(int(slice(s, 0, dot)), 0)
+  let dec_str = slice(s, dot + 1, len(s))
+  while len(dec_str) < decimals { dec_str = dec_str + "0" }
+  if len(dec_str) > decimals { dec_str = slice(dec_str, 0, decimals) }
+  return int_str + "." + dec_str
+}
+
+fn fmt_pct(val) {
+  if val == nil { return "0.0%" }
+  return fmt_num(val, 1) + "%"
+}
+
+fn fmt_time(ts) {
+  if ts == nil or ts == "" { return "" }
+  let s = str(ts)
+  if len(s) < 16 { return s }
+  let m_str = slice(s, 5, 7)
+  let d_str = slice(s, 8, 10)
+  let hr_str = slice(s, 11, 13)
+  let min_str = slice(s, 14, 16)
+  let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  let m_idx = int(m_str) - 1
+  let m_name = (m_idx >= 0 and m_idx < 12) ? months[m_idx] : m_str
+  let d_num = int(d_str)
+  let hr = int(hr_str)
+  let ampm = hr >= 12 ? "pm" : "am"
+  let hr12 = hr % 12
+  if hr12 == 0 { hr12 = 12 }
+  return m_name + " " + str(d_num) + " " + str(hr12) + ":" + min_str + ampm
+}
+
+fn fmt_short_date(ts) {
+  if ts == nil or ts == "" { return "" }
+  let s = str(ts)
+  if len(s) < 16 { return s }
+  return slice(s, 5, 16)
+}
+
+// ---- Native 31-Column PDF Report --------------------------------------------
+
+fn render_pdf_report(report) {
+  let css = join([
+    "body { color: #111111; font-family: Helvetica, Arial, sans-serif; margin: 0; padding: 0; }",
+    "div.header { font-size: 10pt; font-weight: bold; margin-bottom: 2mm; color: #111111; }",
+    "div.key { font-size: 7pt; margin-bottom: 2.5mm; color: #444444; }",
+    "span.swatch { display: inline-block; width: 12px; height: 8px; background-color: #ffd966; border: 0.2mm solid #888888; vertical-align: middle; margin-right: 3px; }",
+    "table.touches { border-collapse: collapse; width: 100%; font-size: 5pt; }",
+    "table.touches th { background-color: #e5e7eb; border: 0.2mm solid #9ca3af; padding: 0.6mm 0.3mm; text-align: center; color: #111827; font-weight: bold; }",
+    "table.touches th.contrib { background-color: #ffd966; color: #78350f; }",
+    "table.touches td { border: 0.2mm solid #d1d5db; padding: 0.5mm 0.3mm; text-align: right; color: #1f2937; }",
+    "table.touches td.l { text-align: left; font-weight: 500; }",
+    "table.touches td.t { white-space: nowrap; font-size: 4.5pt; color: #4b5563; }",
+    "table.touches td.contrib { background-color: #fff2cc; font-weight: 600; }",
+    "table.touches tr:nth-child(even) td { background-color: #f9fafb; }",
+    "table.touches tr:nth-child(even) td.contrib { background-color: #fef9c3; }",
+    "table.touches tr.total td { background-color: #e5e7eb; font-weight: bold; border-top: 0.4mm solid #4b5563; }",
+    "table.touches tr.total td.contrib { background-color: #fde68a; font-weight: bold; }",
+    "div.footer { font-size: 6.5pt; text-align: right; color: #6b7280; margin-top: 2mm; }"
+  ], " ")
+
+  let grand = report.totals.touches > 0 ? report.totals.touches : 1.0
+
+  let parts = [
+    "<div class=\"header\">Warehouse Touches " + html_escape(report.start) + " to " + html_escape(report.stop) + "</div>",
+    "<div class=\"key\"><span class=\"swatch\"></span> Highlighted columns count toward total touches (units)</div>",
+    "<table class=\"touches\"><thead><tr><th rowspan=\"2\">User</th>",
+    "<th colspan=\"3\">Receiving</th>",
+    "<th colspan=\"3\">Picking</th>",
+    "<th colspan=\"5\">Bin Movements</th>",
+    "<th colspan=\"8\">Loads</th>",
+    "<th colspan=\"5\">Sticker Scan Out</th>",
+    "<th colspan=\"6\">Overall</th></tr><tr>",
+    "<th class=\"contrib\">Qty In</th><th class=\"contrib\">Qty Out</th><th>Scans</th>",
+    "<th class=\"contrib\">Units</th><th>Orders</th><th>Lines</th>",
+    "<th class=\"contrib\">Qty</th><th>Moves</th><th>Item Qty</th><th>Dolly Qty</th><th>Merge Qty</th>",
+    "<th class=\"contrib\">Units</th><th>Orders</th><th>Disp.</th><th>Avg Disp. Units</th><th>Avg Disp. Min</th><th>Skipped</th><th>Skipped %</th><th>Force Comp.</th>",
+    "<th class=\"contrib\">Staged Units</th><th>Staged Orders</th><th>Packed Orders</th><th>Packed Units</th><th>Bound Orders</th>",
+    "<th>Touches</th><th>Days</th><th>Per Day</th><th>%</th><th>First</th><th>Last</th>",
+    "</tr></thead><tbody>"
+  ]
+
+  for u in report.users {
+    let r = u.receiving
+    let p = u.picking
+    let m = u.movements
+    let l = u.loads
+    let s = u.sticker
+    let mi = m.by_type["item move"] != nil ? m.by_type["item move"].qty : 0
+    let md = m.by_type["dolly move"] != nil ? m.by_type["dolly move"].qty : 0
+    let mm = m.by_type["merge"] != nil ? m.by_type["merge"].qty : 0
+    let u_pct = fmt_num((100.0 * real(u.touches)) / real(grand), 1)
+
+    push(parts, join([
+      "<tr>",
+      "<td class=\"l\">" + html_escape(u.userid) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(r.qty_in, 0) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(r.qty_out, 0) + "</td>",
+      "<td>" + fmt_num(r.scans, 0) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(p.qty, 0) + "</td>",
+      "<td>" + fmt_num(p.orders, 0) + "</td>",
+      "<td>" + fmt_num(p.lines, 0) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(m.qty, 0) + "</td>",
+      "<td>" + fmt_num(m.moves, 0) + "</td>",
+      "<td>" + fmt_num(mi, 0) + "</td>",
+      "<td>" + fmt_num(md, 0) + "</td>",
+      "<td>" + fmt_num(mm, 0) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(l.scans, 0) + "</td>",
+      "<td>" + fmt_num(l.orders, 0) + "</td>",
+      "<td>" + fmt_num(l.dispatches, 0) + "</td>",
+      "<td>" + fmt_num(l.avgdispatchunits, 1) + "</td>",
+      "<td>" + fmt_num(l.avgloadtime, 1) + "</td>",
+      "<td>" + fmt_num(l.manual, 0) + "</td>",
+      "<td>" + fmt_num(l.manualpct, 1) + "%</td>",
+      "<td>" + fmt_num(l.forced, 0) + "</td>",
+      "<td class=\"contrib\">" + fmt_num(s.stagedunits, 0) + "</td>",
+      "<td>" + fmt_num(s.staged, 0) + "</td>",
+      "<td>" + fmt_num(s.packed, 0) + "</td>",
+      "<td>" + fmt_num(s.packedunits, 0) + "</td>",
+      "<td>" + fmt_num(s.binds, 0) + "</td>",
+      "<td><b>" + fmt_num(u.touches, 0) + "</b></td>",
+      "<td>" + fmt_num(u.active_days, 0) + "</td>",
+      "<td>" + fmt_num(u.touches_per_day, 1) + "</td>",
+      "<td>" + u_pct + "%</td>",
+      "<td class=\"t\">" + fmt_short_date(u.first_touch) + "</td>",
+      "<td class=\"t\">" + fmt_short_date(u.last_touch) + "</td>",
+      "</tr>"
+    ], ""))
+  }
+
+  // Grand Totals Row
+  let t = report.totals
+  let tr = t.receiving
+  let tp = t.picking
+  let tm = t.movements
+  let tl = t.loads
+  let ts = t.sticker
+  let tmi = tm.by_type["item move"] != nil ? tm.by_type["item move"].qty : 0
+  let tmd = tm.by_type["dolly move"] != nil ? tm.by_type["dolly move"].qty : 0
+  let tmm = tm.by_type["merge"] != nil ? tm.by_type["merge"].qty : 0
+
+  push(parts, join([
+    "<tr class=\"total\">",
+    "<td class=\"l\">All users</td>",
+    "<td class=\"contrib\">" + fmt_num(tr.qty_in, 0) + "</td>",
+    "<td class=\"contrib\">" + fmt_num(tr.qty_out, 0) + "</td>",
+    "<td>" + fmt_num(tr.scans, 0) + "</td>",
+    "<td class=\"contrib\">" + fmt_num(tp.qty, 0) + "</td>",
+    "<td>" + fmt_num(tp.orders, 0) + "</td>",
+    "<td>" + fmt_num(tp.lines, 0) + "</td>",
+    "<td class=\"contrib\">" + fmt_num(tm.qty, 0) + "</td>",
+    "<td>" + fmt_num(tm.moves, 0) + "</td>",
+    "<td>" + fmt_num(tmi, 0) + "</td>",
+    "<td>" + fmt_num(tmd, 0) + "</td>",
+    "<td>" + fmt_num(tmm, 0) + "</td>",
+    "<td class=\"contrib\">" + fmt_num(tl.scans, 0) + "</td>",
+    "<td>" + fmt_num(tl.orders, 0) + "</td>",
+    "<td>" + fmt_num(tl.dispatches, 0) + "</td>",
+    "<td>" + fmt_num(tl.avgdispatchunits, 1) + "</td>",
+    "<td>" + fmt_num(tl.avgloadtime, 1) + "</td>",
+    "<td>" + fmt_num(tl.manual, 0) + "</td>",
+    "<td>" + fmt_num(tl.manualpct, 1) + "%</td>",
+    "<td>" + fmt_num(tl.forced, 0) + "</td>",
+    "<td class=\"contrib\">" + fmt_num(ts.stagedunits, 0) + "</td>",
+    "<td>" + fmt_num(ts.staged, 0) + "</td>",
+    "<td>" + fmt_num(ts.packed, 0) + "</td>",
+    "<td>" + fmt_num(ts.packedunits, 0) + "</td>",
+    "<td>" + fmt_num(ts.binds, 0) + "</td>",
+    "<td><b>" + fmt_num(t.touches, 0) + "</b></td>",
+    "<td>" + fmt_num(t.active_days, 0) + "</td>",
+    "<td>" + fmt_num(t.touches_per_day, 1) + "</td>",
+    "<td>100.0%</td>",
+    "<td class=\"t\">" + fmt_short_date(t.first_touch) + "</td>",
+    "<td class=\"t\">" + fmt_short_date(t.last_touch) + "</td>",
+    "</tr>"
+  ], ""))
+
+  push(parts, "</tbody></table>")
+  let html = join(parts, "")
+
+  let options = {
+    "page_size": "letter",
+    "orientation": "landscape",
+    "margin": 18,
+    "header": "Warehouse Touches " + report.start + " to " + report.stop,
+    "footer": "Printed " + report.stop + "   Page {PAGENO} of {nbpg}"
+  }
+
+  return doc.pdf(html, css, options)
+}
+
+// ---- Native 31-Column OpenXML XLSX Package ----------------------------------
+
+fn render_xlsx_report(report) {
+  let rows = []
+  let grand = report.totals.touches > 0 ? report.totals.touches : 1.0
+
+  // Row 1: Title Banner
+  push(rows, [
+    {"v": "Warehouse Touches " + report.start + " to " + report.stop + " (highlighted columns count toward total touches)", "s": "title"}
+  ])
+  // Row 2: Spacer
+  push(rows, [])
+
+  // Row 3: Section Headers
+  push(rows, [
+    {"v": "User", "s": "section"},
+    {"v": "Receiving", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"},
+    {"v": "Picking", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"},
+    {"v": "Bin Movements", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"},
+    {"v": "Loads", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"},
+    {"v": "Sticker Scan Out", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"},
+    {"v": "Overall", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}, {"v": "", "s": "section"}
+  ])
+
+  // Row 4: Column Subheaders
+  push(rows, [
+    {"v": "User", "s": "header"},
+    {"v": "Qty In", "s": "contrib_header"}, {"v": "Qty Out", "s": "contrib_header"}, {"v": "Scan Rows", "s": "header"},
+    {"v": "Units", "s": "contrib_header"}, {"v": "Orders", "s": "header"}, {"v": "Lines", "s": "header"},
+    {"v": "Qty", "s": "contrib_header"}, {"v": "Moves", "s": "header"}, {"v": "Item Qty", "s": "header"}, {"v": "Dolly Qty", "s": "header"}, {"v": "Merge Qty", "s": "header"},
+    {"v": "Units", "s": "contrib_header"}, {"v": "Orders", "s": "header"}, {"v": "Dispatches", "s": "header"}, {"v": "Avg Disp. Units", "s": "header"}, {"v": "Avg Disp. Min", "s": "header"}, {"v": "Skipped", "s": "header"}, {"v": "Skipped %", "s": "header"}, {"v": "Force Comp.", "s": "header"},
+    {"v": "Staged Units", "s": "contrib_header"}, {"v": "Staged Orders", "s": "header"}, {"v": "Packed Orders", "s": "header"}, {"v": "Packed Units", "s": "header"}, {"v": "Bound Orders", "s": "header"},
+    {"v": "Touches", "s": "header"}, {"v": "Days", "s": "header"}, {"v": "Per Day", "s": "header"}, {"v": "%", "s": "header"}, {"v": "First", "s": "header"}, {"v": "Last", "s": "header"}
+  ])
+
+  // Data rows
+  for u in report.users {
+    let r = u.receiving
+    let p = u.picking
+    let m = u.movements
+    let l = u.loads
+    let s = u.sticker
+    let mi = m.by_type["item move"] != nil ? m.by_type["item move"].qty : 0
+    let md = m.by_type["dolly move"] != nil ? m.by_type["dolly move"].qty : 0
+    let mm = m.by_type["merge"] != nil ? m.by_type["merge"].qty : 0
+    let u_pct = round((100.0 * real(u.touches)) / real(grand), 1)
+
+    push(rows, [
+      {"v": u.userid, "s": "plain"},
+      {"v": r.qty_in, "s": "contrib_int"}, {"v": r.qty_out, "s": "contrib_int"}, {"v": r.scans, "s": "int"},
+      {"v": p.qty, "s": "contrib_int"}, {"v": p.orders, "s": "int"}, {"v": p.lines, "s": "int"},
+      {"v": m.qty, "s": "contrib_int"}, {"v": m.moves, "s": "int"}, {"v": mi, "s": "int"}, {"v": md, "s": "int"}, {"v": mm, "s": "int"},
+      {"v": l.scans, "s": "contrib_int"}, {"v": l.orders, "s": "int"}, {"v": l.dispatches, "s": "int"}, {"v": l.avgdispatchunits, "s": "dec"}, {"v": l.avgloadtime, "s": "dec"}, {"v": l.manual, "s": "int"}, {"v": l.manualpct, "s": "dec"}, {"v": l.forced, "s": "int"},
+      {"v": s.stagedunits, "s": "contrib_int"}, {"v": s.staged, "s": "int"}, {"v": s.packed, "s": "int"}, {"v": s.packedunits, "s": "int"}, {"v": s.binds, "s": "int"},
+      {"v": u.touches, "s": "int"}, {"v": u.active_days, "s": "int"}, {"v": u.touches_per_day, "s": "dec"},
+      {"v": u_pct, "s": "dec"},
+      {"v": fmt_short_date(u.first_touch), "s": "plain"},
+      {"v": fmt_short_date(u.last_touch), "s": "plain"}
+    ])
+  }
+
+  // Totals Row
+  let t = report.totals
+  let tr = t.receiving
+  let tp = t.picking
+  let tm = t.movements
+  let tl = t.loads
+  let ts = t.sticker
+  let tmi = tm.by_type["item move"] != nil ? tm.by_type["item move"].qty : 0
+  let tmd = tm.by_type["dolly move"] != nil ? tm.by_type["dolly move"].qty : 0
+  let tmm = tm.by_type["merge"] != nil ? tm.by_type["merge"].qty : 0
+
+  push(rows, [
+    {"v": "All users", "s": "total_text"},
+    {"v": tr.qty_in, "s": "total_contrib_int"}, {"v": tr.qty_out, "s": "total_contrib_int"}, {"v": tr.scans, "s": "total_int"},
+    {"v": tp.qty, "s": "total_contrib_int"}, {"v": tp.orders, "s": "total_int"}, {"v": tp.lines, "s": "total_int"},
+    {"v": tm.qty, "s": "total_contrib_int"}, {"v": tm.moves, "s": "total_int"}, {"v": tmi, "s": "total_int"}, {"v": tmd, "s": "total_int"}, {"v": tmm, "s": "total_int"},
+    {"v": tl.scans, "s": "total_contrib_int"}, {"v": tl.orders, "s": "total_int"}, {"v": tl.dispatches, "s": "total_int"}, {"v": tl.avgdispatchunits, "s": "total_dec"}, {"v": tl.avgloadtime, "s": "total_dec"}, {"v": tl.manual, "s": "total_int"}, {"v": tl.manualpct, "s": "total_dec"}, {"v": tl.forced, "s": "total_int"},
+    {"v": ts.stagedunits, "s": "total_contrib_int"}, {"v": ts.staged, "s": "total_int"}, {"v": ts.packed, "s": "total_int"}, {"v": ts.packedunits, "s": "total_int"}, {"v": ts.binds, "s": "total_int"},
+    {"v": t.touches, "s": "total_int"}, {"v": t.active_days, "s": "total_int"}, {"v": t.touches_per_day, "s": "total_dec"},
+    {"v": 100.0, "s": "total_dec"},
+    {"v": fmt_short_date(t.first_touch), "s": "total_text"},
+    {"v": fmt_short_date(t.last_touch), "s": "total_text"}
+  ])
+
+  let spec = {
+    "sheet": "Touches",
+    "freeze_pane": "B5",
+    "merges": [
+      "A1:AE1",
+      "A3:A4",
+      "B3:D3",
+      "E3:G3",
+      "H3:L3",
+      "M3:T3",
+      "U3:Y3",
+      "Z3:AE3"
+    ],
+    "col_widths": [
+      16.0,
+      10.0, 10.0, 10.0,
+      10.0, 10.0, 10.0,
+      10.0, 10.0, 10.0, 10.0, 10.0,
+      10.0, 10.0, 10.0, 12.0, 12.0, 10.0, 10.0, 10.0,
+      11.0, 11.0, 11.0, 11.0, 11.0,
+      11.0, 9.0, 10.0, 8.0, 12.0, 12.0
+    ],
+    "rows": rows
+  }
+
+  return doc.xlsx(spec)
+}
+
+// ---- Native 31-Column CSV Export --------------------------------------------
+
+fn render_csv_report(report) {
+  let cols = [
+    "User", "Name",
+    "Rec Qty In", "Rec Qty Out", "Rec Scans",
+    "Pick Units", "Pick Orders", "Pick Lines",
+    "Move Qty", "Move Count", "Item Move Qty", "Dolly Move Qty", "Merge Qty",
+    "Load Units", "Load Orders", "Dispatches", "Avg Units/Disp", "Avg Load Min", "Skipped Scans", "Skipped Pct", "Force Comp",
+    "Staged Units", "Staged Orders", "Packed Orders", "Packed Units", "Bound Orders",
+    "Total Touches", "Active Days", "Touches/Day", "Pct of Total", "First Touch", "Last Touch"
+  ]
+
+  let grand = report.totals.touches > 0 ? report.totals.touches : 1.0
+  let rows = []
+
+  for u in report.users {
+    let r = u.receiving
+    let p = u.picking
+    let m = u.movements
+    let l = u.loads
+    let s = u.sticker
+    let mi = m.by_type["item move"] != nil ? m.by_type["item move"].qty : 0
+    let md = m.by_type["dolly move"] != nil ? m.by_type["dolly move"].qty : 0
+    let mm = m.by_type["merge"] != nil ? m.by_type["merge"].qty : 0
+    let u_pct = round((100.0 * real(u.touches)) / real(grand), 1)
+
+    let u_name = u.name != nil and u.name != "" ? u.name : (u.realname != nil and u.realname != "" ? u.realname : u.userid)
+
+    push(rows, [
+      u.userid, u_name,
+      r.qty_in, r.qty_out, r.scans,
+      p.qty, p.orders, p.lines,
+      m.qty, m.moves, mi, md, mm,
+      l.scans, l.orders, l.dispatches, l.avgdispatchunits, l.avgloadtime, l.manual, l.manualpct, l.forced,
+      s.stagedunits, s.staged, s.packed, s.packedunits, s.binds,
+      u.touches, u.active_days, u.touches_per_day, u_pct,
+      fmt_short_date(u.first_touch), fmt_short_date(u.last_touch)
+    ])
+  }
+
+  let t = report.totals
+  let tr = t.receiving
+  let tp = t.picking
+  let tm = t.movements
+  let tl = t.loads
+  let ts = t.sticker
+  let tmi = tm.by_type["item move"] != nil ? tm.by_type["item move"].qty : 0
+  let tmd = tm.by_type["dolly move"] != nil ? tm.by_type["dolly move"].qty : 0
+  let tmm = tm.by_type["merge"] != nil ? tm.by_type["merge"].qty : 0
+
+  push(rows, [
+    "ALL USERS", "All Warehouse Operators",
+    tr.qty_in, tr.qty_out, tr.scans,
+    tp.qty, tp.orders, tp.lines,
+    tm.qty, tm.moves, tmi, tmd, tmm,
+    tl.scans, tl.orders, tl.dispatches, tl.avgdispatchunits, tl.avgloadtime, tl.manual, tl.manualpct, tl.forced,
+    ts.stagedunits, ts.staged, ts.packed, ts.packedunits, ts.binds,
+    t.touches, t.active_days, t.touches_per_day, 100.0,
+    fmt_short_date(t.first_touch), fmt_short_date(t.last_touch)
+  ])
+
+  return doc.csv(cols, rows)
+}
+
+// ---- Responsive Operator Dashboard View --------------------------------------
+
+fn render_html_dashboard(report, input) {
+  let t = report.totals
+  let pt = t.parts
+  let user_count = len(report.users)
+  let grand = t.touches > 0 ? t.touches : 1.0
+
+  let parts = [
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, viewport-fit=cover\">",
+    "<title>Warehouse Touches - " + html_escape(report.start) + " to " + html_escape(report.stop) + "</title>",
+    "<style>",
+    ":root {",
+    "  --bg: #0b1120; --panel: #151f32; --panel-alt: #1a263d; --line: #223049; --text: #f8fafc; --muted: #94a3b8;",
+    "  --rec: #38bdf8; --pick: #f59e0b; --move: #10b981; --load: #818cf8; --stick: #ec4899; --head: #111a2d;",
+    "}",
+    "@media (prefers-color-scheme: light) {",
+    "  :root {",
+    "    --bg: #f8fafc; --panel: #ffffff; --panel-alt: #f1f5f9; --line: #e2e8f0; --text: #0f172a; --muted: #64748b;",
+    "    --rec: #0284c7; --pick: #d97706; --move: #059669; --load: #6366f1; --stick: #db2777; --head: #f8fafc;",
+    "  }",
+    "}",
+    "* { box-sizing: border-box; margin: 0; padding: 0; }",
+    ":focus-visible { outline: 2px solid var(--rec); outline-offset: 2px; }",
+    "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); padding: 20px 24px 40px; min-height: 100vh; -webkit-font-smoothing: antialiased; }",
+    "@media (max-width: 768px) { body { padding: 12px 12px 32px; } }",
+    
+    // Header & Filter Bar
+    ".page-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 20px; flex-wrap: wrap; gap: 14px; }",
+    ".header-title { display: flex; flex-direction: column; gap: 4px; }",
+    "h1 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; }",
+    ".date-badge { color: var(--muted); font-size: 13px; font-weight: 500; }",
+    ".header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }",
+    ".filter-bar { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--line); padding: 5px 8px; border-radius: 8px; font-size: 13px; }",
+    ".filter-bar input[type=date] { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: 12px; font-family: inherit; }",
+    ".filter-bar input[type=date]:focus { outline: none; border-color: var(--rec); }",
+    ".btn { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 5px; transition: 0.15s; }",
+    ".btn:hover { background: var(--panel-alt); border-color: var(--muted); }",
+    ".btn-primary { background: var(--rec); border-color: var(--rec); color: #041226; font-weight: 700; }",
+    ".btn-primary:hover { opacity: 0.9; }",
+    ".export-group { display: flex; gap: 6px; }",
+    "@media (max-width: 768px) {",
+    "  .page-header { flex-direction: column; align-items: stretch; gap: 12px; }",
+    "  .header-actions { flex-direction: column; align-items: stretch; gap: 8px; }",
+    "  .filter-bar { flex-wrap: wrap; justify-content: space-between; }",
+    "  .export-group { display: grid; grid-template-columns: repeat(4, 1fr); width: 100%; gap: 4px; }",
+    "  .export-group .btn { padding: 7px 2px; justify-content: center; font-size: 11px; }",
+    "}",
+
+    // Summary Cards
+    ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }",
+    ".card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }",
+    ".card.total { border-width: 2px; border-color: var(--rec); background: linear-gradient(180deg, rgba(56,189,248,0.06) 0%, var(--panel) 100%); }",
+    ".card .label { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; text-transform: uppercase; letter-spacing: 0.04em; }",
+    ".card .value { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 2px; }",
+    ".card .sub { font-size: 11.5px; color: var(--muted); line-height: 1.35; }",
+    ".dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; flex: none; }",
+    "@media (max-width: 640px) {",
+    "  .cards { grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 14px; }",
+    "  .card { padding: 12px; }",
+    "  .card .value { font-size: 20px; }",
+    "  .card .sub { font-size: 10.5px; }",
+    "}",
+
+    // Panel & Table
+    ".panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 24px; }",
+    ".panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; gap: 8px; }",
+    ".panel-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }",
+    ".legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11.5px; color: var(--muted); font-weight: 500; }",
+    ".legend-item { display: inline-flex; align-items: center; gap: 4px; }",
+    ".view-toggle { display: inline-flex; background: rgba(0,0,0,0.25); border: 1px solid var(--line); border-radius: 6px; padding: 2px; gap: 2px; }",
+    ".view-btn { background: transparent; border: 0; color: var(--muted); font-family: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 4px; cursor: pointer; transition: 0.15s; }",
+    ".view-btn.active { background: var(--rec); color: #041226; font-weight: 700; }",
+    
+    ".table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; width: 100%; }",
+    "table.touches-grid { width: 100%; border-collapse: collapse; min-width: 1080px; font-size: 13px; }",
+    "th { background: var(--head); color: var(--muted); font-size: 11.5px; font-weight: 700; text-align: right; padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; white-space: nowrap; transition: color 0.12s; }",
+    "th:hover { color: var(--text); }",
+    "th.l, td.who, td.rank { text-align: left; }",
+    "th.contrib { color: var(--text); border-top: 3px solid var(--c); }",
+    "th[data-dir=asc]::after { content: ' \\25B2'; color: var(--rec); }",
+    "th[data-dir=desc]::after { content: ' \\25BC'; color: var(--rec); }",
+    "td { text-align: right; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }",
+    "td b.c { display: block; font-size: 14px; font-weight: 750; color: var(--c); line-height: 1.2; margin-bottom: 2px; }",
+    "td small { display: block; font-size: 11px; color: var(--muted); font-weight: 400; line-height: 1.3; }",
+    "td .nil { color: var(--muted); opacity: 0.5; }",
+    "td.who b { font-size: 14px; font-weight: 700; color: var(--text); display: block; }",
+    "td.who small { font-size: 11px; color: var(--muted); }",
+    "td.when { font-size: 12px; color: var(--text); }",
+    "td.when small { font-size: 10.5px; color: var(--muted); }",
+    "tfoot td { background: var(--panel-alt); font-weight: bold; border-top: 2px solid var(--line); border-bottom: none; }",
+    "tr:hover td { background: rgba(255,255,255,0.02); }",
+    
+    // Touch Mix Bar
+    ".mix-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: rgba(128,128,128,0.2); width: 100%; min-width: 100px; max-width: 160px; margin-top: 4px; }",
+    ".mix-bar span { height: 100%; }",
+
+    // Sticky rank and operator on mobile table scroll
+    "@media (max-width: 768px) {",
+    "  th.sticky-rank, td.sticky-rank { position: sticky; left: 0; z-index: 3; background: var(--panel); }",
+    "  th.sticky-op, td.sticky-op { position: sticky; left: 34px; z-index: 3; background: var(--panel); border-right: 1px solid var(--line); box-shadow: 3px 0 6px rgba(0,0,0,0.2); }",
+    "  th.sticky-rank, th.sticky-op { background: var(--head); z-index: 4; }",
+    "}",
+
+    // Mobile Cards View
+    ".mobile-cards { display: none; flex-direction: column; gap: 10px; padding: 12px; }",
+    ".op-card { background: var(--panel-alt); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }",
+    ".op-top { display: flex; justify-content: space-between; align-items: flex-start; }",
+    ".op-title { display: flex; align-items: center; gap: 8px; }",
+    ".op-rank { width: 24px; height: 24px; border-radius: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; color: var(--muted); flex: none; }",
+    ".op-touches { text-align: right; }",
+    ".op-touches-val { font-size: 20px; font-weight: 800; color: var(--rec); line-height: 1.1; }",
+    ".op-touches-rate { font-size: 11px; color: var(--muted); }",
+    ".op-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 6px; margin-top: 4px; }",
+    ".op-grid-cell { display: flex; flex-direction: column; gap: 1px; }",
+    ".op-grid-label { font-size: 9.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; }",
+    ".op-grid-val { font-size: 13px; font-weight: 750; }",
+    ".op-grid-sub { font-size: 10px; color: var(--muted); line-height: 1.2; }",
+    
+    // View Switcher Rules
+    "@media (max-width: 768px) {",
+    "  body:not(.force-table) .mobile-cards { display: flex; }",
+    "  body:not(.force-table) .table-wrap { display: none; }",
+    "  body.force-table .mobile-cards { display: none; }",
+    "  body.force-table .table-wrap { display: block; }",
+    "}",
+    "@media (min-width: 769px) {",
+    "  body:not(.force-cards) .mobile-cards { display: none; }",
+    "  body:not(.force-cards) .table-wrap { display: block; }",
+    "  body.force-cards .mobile-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }",
+    "  body.force-cards .table-wrap { display: none; }",
+    "}",
+    "</style></head><body>"
+  ]
+
+  // 1. Header
+  push(parts, join([
+    "<div class=\"page-header\">",
+    "<div class=\"header-title\">",
+    "<h1>Warehouse Touches</h1>",
+    "<div class=\"date-badge\">" + html_escape(report.start) + " to " + html_escape(report.stop) + " &middot; " + str(user_count) + " operators &middot; " + fmt_num(t.active_days, 0) + " active days</div>",
+    "</div>",
+    "<div class=\"header-actions\">",
+    "<form class=\"filter-bar\" method=\"GET\" action=\"/quickreportview\">",
+    "<label style=\"color:var(--muted);font-size:11.5px;font-weight:600\">From</label>",
+    "<input type=\"date\" name=\"start\" value=\"" + html_escape(report.start) + "\">",
+    "<label style=\"color:var(--muted);font-size:11.5px;font-weight:600\">To</label>",
+    "<input type=\"date\" name=\"stop\" value=\"" + html_escape(report.stop) + "\">",
+    "<button type=\"submit\" class=\"btn btn-primary\">Filter</button>",
+    "</form>",
+    "<div class=\"export-group\">",
+    "<a href=\"/quickreportpdf?start=" + html_escape(report.start) + "&stop=" + html_escape(report.stop) + "\" class=\"btn\" target=\"_blank\" aria-label=\"Download PDF Report\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" y1=\"15\" x2=\"12\" y2=\"3\"/></svg> PDF</a>",
+    "<a href=\"/quickreportxlsx?start=" + html_escape(report.start) + "&stop=" + html_escape(report.stop) + "\" class=\"btn\" aria-label=\"Download Excel Spreadsheet\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M8 12h8\"/><path d=\"M12 8v8\"/></svg> Excel</a>",
+    "<a href=\"/quickreportcsv?start=" + html_escape(report.start) + "&stop=" + html_escape(report.stop) + "\" class=\"btn\" aria-label=\"Download CSV Table\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/></svg> CSV</a>",
+    "<a href=\"/quickreport?start=" + html_escape(report.start) + "&stop=" + html_escape(report.stop) + "\" class=\"btn\" target=\"_blank\" aria-label=\"View JSON Data\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><polyline points=\"16 18 22 12 16 6\"/><polyline points=\"8 6 2 12 8 18\"/></svg> JSON</a>",
+    "</div>",
+    "</div>",
+    "</div>"
+  ], ""))
+
+  // 2. Summary Metric Cards
+  push(parts, join([
+    "<div class=\"cards\">",
+    "<div class=\"card total\"><div class=\"label\">Total Touches</div><div class=\"value\">" + fmt_num(t.touches, 0) + "</div><div class=\"sub\">units &middot; " + str(user_count) + " people &middot; " + fmt_num(t.active_days, 0) + " active days</div></div>",
+    "<div class=\"card\"><div class=\"label\"><i class=\"dot\" style=\"background:var(--rec)\"></i> Receiving</div><div class=\"value\">" + fmt_num(pt.receiving, 0) + "</div><div class=\"sub\">" + fmt_num(t.receiving.qty_in, 0) + " in / " + fmt_num(t.receiving.qty_out, 0) + " out &middot; " + fmt_num(t.receiving.scans, 0) + " scans &middot; under " + fmt_num(t.receiving.vendors, 0) + " vendors</div></div>",
+    "<div class=\"card\"><div class=\"label\"><i class=\"dot\" style=\"background:var(--pick)\"></i> Picking</div><div class=\"value\">" + fmt_num(pt.picking, 0) + "</div><div class=\"sub\">" + fmt_num(t.picking.orders, 0) + " orders &middot; " + fmt_num(t.picking.lines, 0) + " lines</div></div>",
+    "<div class=\"card\"><div class=\"label\"><i class=\"dot\" style=\"background:var(--move)\"></i> Bin Moves</div><div class=\"value\">" + fmt_num(pt.movements, 0) + "</div><div class=\"sub\">" + fmt_num(t.movements.moves, 0) + " moves</div></div>",
+    "<div class=\"card\"><div class=\"label\"><i class=\"dot\" style=\"background:var(--load)\"></i> Loads</div><div class=\"value\">" + fmt_num(pt.loads, 0) + "</div><div class=\"sub\">" + fmt_num(t.loads.dispatches, 0) + " dispatches &middot; " + fmt_num(t.loads.manualpct, 1) + "% skipped (" + fmt_num(t.loads.manual, 0) + ")</div></div>",
+    "<div class=\"card\"><div class=\"label\"><i class=\"dot\" style=\"background:var(--stick)\"></i> Sticker Scan</div><div class=\"value\">" + fmt_num(pt.sticker, 0) + "</div><div class=\"sub\">" + fmt_num(t.sticker.staged, 0) + " staged orders &middot; " + fmt_num(t.sticker.stagedunits, 0) + " units staged</div></div>",
+    "</div>"
+  ], ""))
+
+  // 3. Panel Header with Legend & View Switcher
+  push(parts, join([
+    "<div class=\"panel\">",
+    "<div class=\"panel-head\">",
+    "<div class=\"panel-title\">Team Activity</div>",
+    "<div class=\"legend\">",
+    "<span class=\"legend-item\"><i class=\"dot\" style=\"background:var(--rec)\"></i> Receiving</span>",
+    "<span class=\"legend-item\"><i class=\"dot\" style=\"background:var(--pick)\"></i> Picking</span>",
+    "<span class=\"legend-item\"><i class=\"dot\" style=\"background:var(--move)\"></i> Bin Moves</span>",
+    "<span class=\"legend-item\"><i class=\"dot\" style=\"background:var(--load)\"></i> Loads</span>",
+    "<span class=\"legend-item\"><i class=\"dot\" style=\"background:var(--stick)\"></i> Sticker</span>",
+    "</div>",
+    "<div class=\"view-toggle\">",
+    "<button type=\"button\" class=\"view-btn\" id=\"btn-table\" onclick=\"setDashView('table')\">Grid</button>",
+    "<button type=\"button\" class=\"view-btn active\" id=\"btn-cards\" onclick=\"setDashView('cards')\">Cards</button>",
+    "</div>",
+    "</div>"
+  ], ""))
+
+  // 4. Responsive Mobile Cards Deck
+  push(parts, "<div class=\"mobile-cards\">")
+  let rank = 1
+  for u in report.users {
+    let p = u.parts
+    let r_w = round((100.0 * real(p.receiving)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let pk_w = round((100.0 * real(p.picking)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let m_w = round((100.0 * real(p.movements)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let l_w = round((100.0 * real(p.loads)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let s_w = round((100.0 * real(p.sticker)) / real(u.touches > 0 ? u.touches : 1), 1)
+
+    let u_name = u.name != nil and u.name != "" ? u.name : (u.realname != nil and u.realname != "" ? u.realname : u.userid)
+
+    push(parts, join([
+      "<div class=\"op-card\">",
+      "<div class=\"op-top\">",
+      "<div class=\"op-title\">",
+      "<div class=\"op-rank\">#" + str(rank) + "</div>",
+      "<div><b style=\"font-size:14px\">" + html_escape(u_name) + "</b><div style=\"font-size:11px;color:var(--muted)\">" + html_escape(u.userid) + " &middot; " + fmt_num(u.active_days, 0) + " days</div></div>",
+      "</div>",
+      "<div class=\"op-touches\">",
+      "<div class=\"op-touches-val\">" + fmt_num(u.touches, 0) + "</div>",
+      "<div class=\"op-touches-rate\">" + fmt_num(u.touches_per_day, 1) + " / day</div>",
+      "</div>",
+      "</div>",
+
+      "<div class=\"mix-bar\" style=\"max-width:100%\">",
+      "<span style=\"background:var(--rec);width:" + str(r_w) + "%\"></span>",
+      "<span style=\"background:var(--pick);width:" + str(pk_w) + "%\"></span>",
+      "<span style=\"background:var(--move);width:" + str(m_w) + "%\"></span>",
+      "<span style=\"background:var(--load);width:" + str(l_w) + "%\"></span>",
+      "<span style=\"background:var(--stick);width:" + str(s_w) + "%\"></span>",
+      "</div>",
+
+      "<div class=\"op-grid\">",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\"><i class=\"dot\" style=\"background:var(--rec)\"></i> REC</span><span class=\"op-grid-val\" style=\"color:var(--rec)\">" + fmt_num(p.receiving, 0) + "</span><span class=\"op-grid-sub\">" + fmt_num(u.receiving.scans, 0) + " scans</span></div>",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\"><i class=\"dot\" style=\"background:var(--pick)\"></i> PICK</span><span class=\"op-grid-val\" style=\"color:var(--pick)\">" + fmt_num(p.picking, 0) + "</span><span class=\"op-grid-sub\">" + fmt_num(u.picking.orders, 0) + " ord &middot; " + fmt_num(u.picking.lines, 0) + " lin</span></div>",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\"><i class=\"dot\" style=\"background:var(--move)\"></i> MOVE</span><span class=\"op-grid-val\" style=\"color:var(--move)\">" + fmt_num(p.movements, 0) + "</span><span class=\"op-grid-sub\">" + fmt_num(u.movements.moves, 0) + " moves</span></div>",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\"><i class=\"dot\" style=\"background:var(--load)\"></i> LOAD</span><span class=\"op-grid-val\" style=\"color:var(--load)\">" + fmt_num(p.loads, 0) + "</span><span class=\"op-grid-sub\">" + fmt_num(u.loads.dispatches, 0) + " disp</span></div>",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\"><i class=\"dot\" style=\"background:var(--stick)\"></i> STICK</span><span class=\"op-grid-val\" style=\"color:var(--stick)\">" + fmt_num(p.sticker, 0) + "</span><span class=\"op-grid-sub\">" + fmt_num(u.sticker.staged, 0) + " staged</span></div>",
+      "<div class=\"op-grid-cell\"><span class=\"op-grid-label\">WHEN</span><span class=\"op-grid-sub\" style=\"margin-top:2px\">" + fmt_time(u.first_touch) + "<br>to " + fmt_time(u.last_touch) + "</span></div>",
+      "</div>",
+
+      "</div>"
+    ], ""))
+    rank += 1
+  }
+  push(parts, "</div>")
+
+  // 5. Full Interactive Data Table Grid
+  push(parts, join([
+    "<div class=\"table-wrap\"><table class=\"touches-grid\" id=\"touches-table\"><thead><tr>",
+    "<th class=\"l sticky-rank\" data-col=\"0\" data-type=\"num\">#</th>",
+    "<th class=\"l sticky-op\" data-col=\"1\" data-type=\"text\">Person</th>",
+    "<th data-col=\"2\" data-type=\"num\" data-dir=\"desc\">Touches</th>",
+    "<th class=\"contrib\" style=\"--c:var(--rec)\" data-col=\"3\" data-type=\"num\">Receiving</th>",
+    "<th class=\"contrib\" style=\"--c:var(--pick)\" data-col=\"4\" data-type=\"num\">Picking</th>",
+    "<th class=\"contrib\" style=\"--c:var(--move)\" data-col=\"5\" data-type=\"num\">Bin Moves</th>",
+    "<th class=\"contrib\" style=\"--c:var(--load)\" data-col=\"6\" data-type=\"num\">Loads</th>",
+    "<th class=\"contrib\" style=\"--c:var(--stick)\" data-col=\"7\" data-type=\"num\">Sticker</th>",
+    "<th data-col=\"8\" data-type=\"num\">Days</th>",
+    "<th data-col=\"9\" data-type=\"num\">Per Day</th>",
+    "<th class=\"l\" data-col=\"10\" data-type=\"text\">First / Last</th>",
+    "</tr></thead><tbody>"
+  ], ""))
+
+  rank = 1
+  for u in report.users {
+    let p = u.parts
+    let r_w = round((100.0 * real(p.receiving)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let pk_w = round((100.0 * real(p.picking)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let m_w = round((100.0 * real(p.movements)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let l_w = round((100.0 * real(p.loads)) / real(u.touches > 0 ? u.touches : 1), 1)
+    let s_w = round((100.0 * real(p.sticker)) / real(u.touches > 0 ? u.touches : 1), 1)
+
+    let u_name = u.name != nil and u.name != "" ? u.name : (u.realname != nil and u.realname != "" ? u.realname : u.userid)
+
+    push(parts, join([
+      "<tr>",
+      "<td class=\"rank sticky-rank\" data-v=\"" + str(rank) + "\">" + str(rank) + "</td>",
+      "<td class=\"who sticky-op\" data-v=\"" + html_escape(u_name) + "\"><b>" + html_escape(u_name) + "</b><small>" + html_escape(u.userid) + "</small></td>",
+      "<td data-v=\"" + str(u.touches) + "\"><b>" + fmt_num(u.touches, 0) + "</b><div class=\"mix-bar\"><span style=\"background:var(--rec);width:" + str(r_w) + "%\"></span><span style=\"background:var(--pick);width:" + str(pk_w) + "%\"></span><span style=\"background:var(--move);width:" + str(m_w) + "%\"></span><span style=\"background:var(--load);width:" + str(l_w) + "%\"></span><span style=\"background:var(--stick);width:" + str(s_w) + "%\"></span></div></td>",
+      "<td data-v=\"" + str(p.receiving) + "\"><b class=\"c\" style=\"--c:var(--rec)\">" + fmt_num(p.receiving, 0) + "</b><small>" + fmt_num(u.receiving.scans, 0) + " scans &middot; " + fmt_num(u.receiving.qty_in, 0) + " in / " + fmt_num(u.receiving.qty_out, 0) + " out</small></td>",
+      "<td data-v=\"" + str(p.picking) + "\"><b class=\"c\" style=\"--c:var(--pick)\">" + fmt_num(p.picking, 0) + "</b><small>" + fmt_num(u.picking.orders, 0) + " orders &middot; " + fmt_num(u.picking.lines, 0) + " lines</small></td>",
+      "<td data-v=\"" + str(p.movements) + "\"><b class=\"c\" style=\"--c:var(--move)\">" + fmt_num(p.movements, 0) + "</b><small>" + fmt_num(u.movements.moves, 0) + " moves</small></td>",
+      "<td data-v=\"" + str(p.loads) + "\"><b class=\"c\" style=\"--c:var(--load)\">" + fmt_num(p.loads, 0) + "</b><small>" + fmt_num(u.loads.dispatches, 0) + " disp &middot; avg " + fmt_num(u.loads.avgloadtime, 1) + " min</small><small>" + fmt_num(u.loads.manualpct, 1) + "% skipped (" + fmt_num(u.loads.manual, 0) + ")</small></td>",
+      "<td data-v=\"" + str(p.sticker) + "\"><b class=\"c\" style=\"--c:var(--stick)\">" + fmt_num(p.sticker, 0) + "</b><small>" + fmt_num(u.sticker.staged, 0) + " staged orders</small><small>packed " + fmt_num(u.sticker.packed, 0) + " ord &middot; " + fmt_num(u.sticker.packedunits, 0) + " units</small></td>",
+      "<td data-v=\"" + str(u.active_days) + "\">" + fmt_num(u.active_days, 0) + "</td>",
+      "<td data-v=\"" + str(u.touches_per_day) + "\">" + fmt_num(u.touches_per_day, 1) + "</td>",
+      "<td class=\"when\" data-v=\"" + html_escape(u.first_touch) + "\">" + fmt_time(u.first_touch) + "<small>to " + fmt_time(u.last_touch) + "</small></td>",
+      "</tr>"
+    ], ""))
+    rank += 1
+  }
+
+  // Table Footers with Grand Totals
+  push(parts, join([
+    "</tbody><tfoot><tr>",
+    "<td></td>",
+    "<td class=\"who\">All users</td>",
+    "<td><b>" + fmt_num(t.touches, 0) + "</b></td>",
+    "<td><b class=\"c\" style=\"--c:var(--rec)\">" + fmt_num(pt.receiving, 0) + "</b><small>" + fmt_num(t.receiving.scans, 0) + " scans &middot; " + fmt_num(t.receiving.qty_in, 0) + " in / " + fmt_num(t.receiving.qty_out, 0) + " out</small></td>",
+    "<td><b class=\"c\" style=\"--c:var(--pick)\">" + fmt_num(pt.picking, 0) + "</b><small>" + fmt_num(t.picking.orders, 0) + " orders &middot; " + fmt_num(t.picking.lines, 0) + " lines</small></td>",
+    "<td><b class=\"c\" style=\"--c:var(--move)\">" + fmt_num(pt.movements, 0) + "</b><small>" + fmt_num(t.movements.moves, 0) + " moves</small></td>",
+    "<td><b class=\"c\" style=\"--c:var(--load)\">" + fmt_num(pt.loads, 0) + "</b><small>" + fmt_num(t.loads.dispatches, 0) + " disp &middot; avg " + fmt_num(t.loads.avgloadtime, 1) + " min</small><small>" + fmt_num(t.loads.manualpct, 1) + "% skipped (" + fmt_num(t.loads.manual, 0) + ")</small></td>",
+    "<td><b class=\"c\" style=\"--c:var(--stick)\">" + fmt_num(pt.sticker, 0) + "</b><small>" + fmt_num(t.sticker.staged, 0) + " staged orders</small><small>packed " + fmt_num(t.sticker.packed, 0) + " ord &middot; " + fmt_num(t.sticker.packedunits, 0) + " units</small></td>",
+    "<td>" + fmt_num(t.active_days, 0) + "</td>",
+    "<td>" + fmt_num(t.touches_per_day, 1) + "</td>",
+    "<td class=\"when\">" + fmt_time(t.first_touch) + "<small>to " + fmt_time(t.last_touch) + "</small></td>",
+    "</tr></tfoot></table></div>",
+    "</div>" // panel
+  ], ""))
+
+  // Client-Side Table Sorter & View Switcher JavaScript
+  push(parts, join([
+    "<script>",
+    "(function(){",
+    "  window.setDashView = function(view) {",
+    "    var b = document.body;",
+    "    var btnT = document.getElementById('btn-table');",
+    "    var btnC = document.getElementById('btn-cards');",
+    "    if (view === 'table') {",
+    "      b.classList.add('force-table'); b.classList.remove('force-cards');",
+    "      if (btnT) btnT.classList.add('active'); if (btnC) btnC.classList.remove('active');",
+    "    } else {",
+    "      b.classList.add('force-cards'); b.classList.remove('force-table');",
+    "      if (btnT) btnT.classList.remove('active'); if (btnC) btnC.classList.add('active');",
+    "    }",
+    "  };",
+    "  var table = document.getElementById('touches-table');",
+    "  if (table) {",
+    "    var ths = table.querySelectorAll('thead th');",
+    "    ths.forEach(function(th, colIdx){",
+    "      th.addEventListener('click', function(){",
+    "        var tbody = table.querySelector('tbody');",
+    "        var rows = Array.from(tbody.querySelectorAll('tr'));",
+    "        var currentDir = th.getAttribute('data-dir');",
+    "        var newDir = currentDir === 'desc' ? 'asc' : 'desc';",
+    "        ths.forEach(function(h){ h.removeAttribute('data-dir'); });",
+    "        th.setAttribute('data-dir', newDir);",
+    "        var isNum = th.getAttribute('data-type') === 'num';",
+    "        rows.sort(function(a, b){",
+    "          var cA = a.children[colIdx]; var cB = b.children[colIdx];",
+    "          var vA = cA ? (cA.getAttribute('data-v') || cA.textContent.trim()) : '';",
+    "          var vB = cB ? (cB.getAttribute('data-v') || cB.textContent.trim()) : '';",
+    "          if (isNum) {",
+    "            var nA = parseFloat(vA) || 0; var nB = parseFloat(vB) || 0;",
+    "            return newDir === 'asc' ? nA - nB : nB - nA;",
+    "          }",
+    "          return newDir === 'asc' ? vA.localeCompare(vB) : vB.localeCompare(vA);",
+    "        });",
+    "        rows.forEach(function(r){ tbody.appendChild(r); });",
+    "      });",
+    "    });",
+    "  }",
+    "})();",
+    "</script>",
+    "</body></html>"
+  ], ""))
+
+  return join(parts, "")
+}

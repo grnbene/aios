@@ -80,24 +80,6 @@ std::string lowered(const std::string& s) {
   return o;
 }
 
-std::string trimmed(const std::string& s) {
-  size_t a = 0, b = s.size();
-  while (a < b && is_space(s[a])) ++a;
-  while (b > a && is_space(s[b - 1])) --b;
-  return s.substr(a, b - a);
-}
-
-bool has_scheme(const std::string& s) {
-  for (size_t i = 0; i < s.size(); ++i) {
-    char c = s[i];
-    if (c == ':') return i > 0;
-    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '-' ||
-              c == '.';
-    if (!ok) return false;
-  }
-  return false;
-}
-
 std::string dec(uint64_t v) {
   if (!v) return "0";
   std::string s;
@@ -106,34 +88,6 @@ std::string dec(uint64_t v) {
     v /= 10;
   }
   return s;
-}
-
-// Collapse `a/b/../c` to `a/c` and `a/./b` to `a/b`. A server will accept the
-// unnormalised form, but the cache key and the `<base>` resolution both want
-// one canonical spelling of the same page.
-std::string normalise_path(const std::string& path) {
-  std::vector<std::string> parts;
-  size_t i = 0;
-  bool absolute = !path.empty() && path[0] == '/';
-  while (i < path.size()) {
-    size_t slash = path.find('/', i);
-    std::string seg = path.substr(i, (slash == std::string::npos ? path.size() : slash) - i);
-    i = slash == std::string::npos ? path.size() : slash + 1;
-    if (seg == "." || seg.empty()) continue;
-    if (seg == "..") {
-      if (!parts.empty()) parts.pop_back();
-      continue;
-    }
-    parts.push_back(seg);
-  }
-  std::string out = absolute ? "/" : "";
-  for (size_t k = 0; k < parts.size(); ++k) {
-    out += parts[k];
-    if (k + 1 < parts.size()) out += "/";
-  }
-  if (!path.empty() && path.back() == '/' && (out.empty() || out.back() != '/')) out += "/";
-  if (out.empty()) out = "/";
-  return out;
 }
 
 // A picture that is SVG markup rather than a raster: an <img src="x.svg"> or
@@ -192,40 +146,6 @@ bool decode_svg_image(const std::string& body, Bitmap& out, int& nat_w, int& nat
 }
 
 }  // namespace
-
-std::string resolve_url(const std::string& base, const std::string& href_raw) {
-  std::string href = trimmed(href_raw);
-  if (href.empty()) return {};
-  // A url the engine will not follow is still returned whole, so the caller
-  // can say why rather than showing a broken link.
-  std::string low = lowered(href);
-  if (low.compare(0, 7, "mailto:") == 0 || low.compare(0, 11, "javascript:") == 0 ||
-      low.compare(0, 4, "tel:") == 0 || low.compare(0, 5, "data:") == 0)
-    return href;
-  if (has_scheme(href)) return href;
-
-  size_t scheme_end = base.find("://");
-  if (scheme_end == std::string::npos) return href;
-  std::string scheme = base.substr(0, scheme_end);
-  size_t host_start = scheme_end + 3;
-  size_t host_end = base.find('/', host_start);
-  std::string authority = base.substr(host_start, (host_end == std::string::npos ? base.size() : host_end) - host_start);
-  std::string base_path = host_end == std::string::npos ? "/" : base.substr(host_end);
-  // The query and the fragment of the base are not part of the directory a
-  // relative url resolves against.
-  size_t cut = base_path.find_first_of("?#");
-  if (cut != std::string::npos) base_path = base_path.substr(0, cut);
-
-  if (href.compare(0, 2, "//") == 0) return scheme + ":" + href;
-  if (href[0] == '#') return base + (base.find('#') == std::string::npos ? href : std::string());
-  if (href[0] == '?') return scheme + "://" + authority + base_path + href;
-  if (href[0] == '/') return scheme + "://" + authority + normalise_path(href);
-
-  // Relative to the base's directory.
-  size_t last_slash = base_path.rfind('/');
-  std::string dir = last_slash == std::string::npos ? "/" : base_path.substr(0, last_slash + 1);
-  return scheme + "://" + authority + normalise_path(dir + href);
-}
 
 // Fetch several addresses at once, on a few threads of their own. A page's stylesheets, scripts and pictures are
 // independent of each other and each costs a whole connection (and, over https, a handshake) on this machine's stack;
@@ -307,54 +227,6 @@ std::vector<std::string> prefetch_urls(Node& doc, const std::string& base, bool 
     if (std::find(urls.begin(), urls.end(), href) == urls.end()) urls.push_back(href);
   }
   return urls;
-}
-
-Stylesheet collect_author_css(Node& doc, const std::string& base, const Fetch& fetch) {
-  Stylesheet sheet;
-  // Walk in document order: a later sheet must win over an earlier one, and
-  // the cascade breaks ties by order, so the order they are appended in IS the
-  // author's intent.
-  std::vector<Node*> stack;
-  stack.push_back(&doc);
-  std::vector<Node*> flat;
-  while (!stack.empty()) {
-    Node* n = stack.back();
-    stack.pop_back();
-    flat.push_back(n);
-    for (size_t i = n->children.size(); i > 0; --i) stack.push_back(n->children[i - 1].get());
-  }
-
-  size_t fetched = 0;
-  for (Node* n : flat) {
-    if (n->kind != Node::Kind::Element) continue;
-    if (n->tag == "style") {
-      std::string media = n->attr("media");
-      Stylesheet inner = parse_css(n->inner_text());
-      if (!media.empty())
-        for (auto& r : inner.rules)
-          if (r.media.empty()) r.media = media;
-      sheet.append(inner);
-      continue;
-    }
-    if (n->tag != "link") continue;
-    std::string rel = lowered(n->attr("rel"));
-    if (rel.find("stylesheet") == std::string::npos) continue;
-    std::string href = resolve_url(base, n->attr("href"));
-    if (href.empty() || !fetch) continue;
-    // A page with forty stylesheets is a page that will not finish loading in
-    // ring 0. Six is what a real document uses.
-    if (fetched >= 6) continue;
-    ++fetched;
-    auto r = fetch(href, {});
-    if (!r.ok()) continue;
-    Stylesheet inner = parse_css(r->body);
-    std::string media = n->attr("media");
-    if (!media.empty())
-      for (auto& rule : inner.rules)
-        if (rule.media.empty()) rule.media = media;
-    sheet.append(inner);
-  }
-  return sheet;
 }
 
 // -------------------------------------------------------------- the browser --

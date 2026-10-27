@@ -93,6 +93,10 @@ Value bi_type(Vm& vm, std::vector<Value>& args, std::string&) {
 // that form made three copies of every key it was asked about.
 Value bi_str(Vm&, std::vector<Value>& args, std::string&) {
   if (args[0].type == Type::Str && args[0].obj) return args[0];
+  if (args[0].type == Type::Bytes) {
+    const auto& b = args[0].bytes_data();
+    return Value::string(std::string(b.begin(), b.end()));
+  }
   return Value::string(args[0].to_text());
 }
 
@@ -6268,26 +6272,48 @@ Value bi_data_to_csv(Vm&, std::vector<Value>& args, std::string& error) {
   const auto& cols = args[0].list_items();
   const auto& rows = args[1].list_items();
 
+  auto format_cell = [](std::string& out, const Value& v) {
+    if (v.type == Type::Nil) return;
+    if (v.type == Type::Int) { out += std::to_string(v.as_int()); return; }
+    if (v.type == Type::Real) {
+      char b[64];
+      std::snprintf(b, sizeof b, "%.10g", v.as_double());
+      out += b;
+      return;
+    }
+    if (v.type == Type::Bool) { out += v.b ? "true" : "false"; return; }
+    std::string s = v.type == Type::Str ? v.str() : v.to_text();
+    bool needs = false;
+    for (char c : s) {
+      if (c == ',' || c == '"' || c == '\n' || c == '\r') { needs = true; break; }
+    }
+    if (!needs) {
+      out += s;
+    } else {
+      out += '"';
+      for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else out += c;
+      }
+      out += '"';
+    }
+  };
+
   std::string csv;
   for (size_t c = 0; c < cols.size(); ++c) {
     if (c > 0) csv += ",";
-    csv += "\"" + cols[c].to_text() + "\"";
+    format_cell(csv, cols[c]);
   }
-  csv += "\n";
+  csv += "\r\n";
 
   for (size_t r = 0; r < rows.size(); ++r) {
     if (rows[r].type != Type::List) continue;
     const auto& cells = rows[r].list_items();
     for (size_t c = 0; c < cells.size(); ++c) {
       if (c > 0) csv += ",";
-      if (cells[c].type == Type::Nil) {
-        csv += "";
-      } else {
-        std::string s = cells[c].to_text();
-        csv += "\"" + s + "\"";
-      }
+      format_cell(csv, cells[c]);
     }
-    csv += "\n";
+    csv += "\r\n";
   }
   return Value::string(csv);
 }
@@ -6607,7 +6633,15 @@ Value write_or_append(Vm& vm, std::vector<Value>& args, std::string& error, bool
   if (!want_str(args[0], error, who)) return Value::nil();
   Files* f = files_of(vm, error, who);
   if (!f) return Value::nil();
-  const std::string data = args[1].type == Type::Str ? args[1].str() : args[1].to_text();
+  std::string data;
+  if (args[1].type == Type::Str) {
+    data = args[1].str();
+  } else if (args[1].type == Type::Bytes) {
+    const auto& b = args[1].bytes_data();
+    data.assign(reinterpret_cast<const char*>(b.data()), b.size());
+  } else {
+    data = args[1].to_text();
+  }
   std::string why;
   if (!f->write(args[0].str(), data, append, why)) { error = file_error(who, args[0].str(), why); return Value::nil(); }
   return Value::integer(static_cast<int64_t>(data.size()));
@@ -6795,6 +6829,7 @@ void install_core_builtins(Vm& vm) {
   install_path_builtins(vm);
   install_parallel_builtins(vm);
   install_decimal_builtins(vm);
+  install_doc_builtins(vm);
 
   vm.define_native("print", 0, -1, bi_print);
   vm.define_native("eprint", 0, -1, bi_eprint);

@@ -198,6 +198,26 @@ Value bi_sidecar_pdf_len(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::integer((int64_t)out_len);
 }
 
+Value bi_sidecar_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "sidecar_pdf_render")) return Value::nil();
+  std::string css = args.size() > 1 && args[1].type == Type::Str ? args[1].str() : "";
+  int vp_w = 800;
+  if (args.size() > 2 && args[2].is_number()) vp_w = (int)args[2].as_int();
+  std::vector<uint8_t> pdf_buf(2 * 1024 * 1024);
+  size_t out_len = pdf_buf.size();
+  int rc = aios_pdf_render_html(args[0].str().c_str(), css.c_str(), vp_w, pdf_buf.data(), &out_len);
+  if (rc == AIOS_ERR_BUFFER_TOO_SMALL) {
+    pdf_buf.resize(out_len);
+    rc = aios_pdf_render_html(args[0].str().c_str(), css.c_str(), vp_w, pdf_buf.data(), &out_len);
+  }
+  if (rc != AIOS_OK) {
+    error = "sidecar_pdf_render failed to render PDF";
+    return Value::nil();
+  }
+  pdf_buf.resize(out_len);
+  return Value::object(Type::Bytes, std::make_shared<BytesObj>(std::move(pdf_buf)));
+}
+
 Value bi_sidecar_cap_mint(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "sidecar_cap_mint") ||
       !want_str(args[1], error, "sidecar_cap_mint") ||
@@ -709,6 +729,7 @@ void install_aios_builtins(Vm& vm) {
   vm.define_native("sidecar_parse_feed", 1, 1, bi_sidecar_parse_feed);
   vm.define_native("sidecar_svg_png_len", 1, 3, bi_sidecar_svg_png_len);
   vm.define_native("sidecar_pdf_len", 1, 2, bi_sidecar_pdf_len);
+  vm.define_native("sidecar_pdf_render", 1, 3, bi_sidecar_pdf_render);
   vm.define_native("sidecar_cap_mint", 4, 4, bi_sidecar_cap_mint);
   vm.define_native("sidecar_cap_attenuate", 2, 2, bi_sidecar_cap_attenuate);
   vm.define_native("sidecar_patch_check", 1, 1, bi_sidecar_patch_check);

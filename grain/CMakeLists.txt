@@ -97,6 +97,9 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/web_dom.cpp
   ${AIOS_ROOT}/src/userland/web_css.cpp
   ${AIOS_ROOT}/src/userland/web_svg.cpp
+  ${AIOS_ROOT}/src/userland/web_layout.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_doc.cpp
+  ${AIOS_ROOT}/src/userland/archive.cpp
   ${AIOS_ROOT}/src/net/deflate.cpp)
 
 # The host: the machine (files, clocks, randomness - what TLS asks of it), threads
