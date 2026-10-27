@@ -1417,8 +1417,39 @@ std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::stri
   return s;
 }
 
+// The member this program's pane is given to (ui.pane "machine"), or "" when it is answered here: none named, no
+// fleet link to carry it, or the member is this machine. Learnt from one session per version of the program and
+// kept, so a forwarded request starts no session here (the session is the member's, its cookie the member's).
+std::string WebUi::given_member(const Request& req) {
+  std::string version, err;
+  if (!host_.forward || !host_.current_version || !host_.current_version(version, err)) return "";
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (member_known_ && member_version_ == version) return member_;
+  }
+  std::string new_id;
+  std::shared_ptr<Session> s = session_for(req, new_id, err);
+  if (!s) return "";
+  std::string m;
+  {
+    std::lock_guard<std::mutex> turn(s->mu);
+    if (!s->canvas) m = web_pane_machine(*s->vm, s->pane);
+  }
+  if (!m.empty() && host_.is_here && host_.is_here(m)) m.clear();
+  std::lock_guard<std::mutex> lock(mu_);
+  member_known_ = true;
+  member_version_ = version;
+  member_ = m;
+  if (!m.empty()) {   // the probe: this machine keeps no copy of a pane another member runs
+    if (!new_id.empty()) sessions_.erase(new_id);
+    if (shared_ == s) shared_.reset();
+  }
+  return m;
+}
+
 bool WebUi::open_stream(const Request& req, Stream& out, std::vector<std::pair<std::string, std::string>>& headers,
                         std::string& first, std::string& error) {
+  if (!given_member(req).empty()) return false;   // a pane given to another member: its push comes from there (handle())
   std::string new_id;
   std::shared_ptr<Session> s = session_for(req, new_id, error);
   if (!s) { report(error); return false; }
@@ -1488,6 +1519,18 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
     return res;
   }
 
+  // A pane given to another member (ui.pane "machine"): every request of it - the page, its actions, its push and
+  // its routes - is answered by that member's copy, and its answer comes back as it came.
+  if (const std::string member = given_member(req); !member.empty()) {
+    if (req.stream && host_.forward_stream && on_chunk && host_.forward_stream(member, req, on_headers, on_chunk)) return Response{};
+    Response fwd;
+    if (host_.forward(member, req, fwd)) {
+      if (fwd.status == 502 || fwd.status == 503) report(req.path + " given to " + member + ": " + fwd.body);
+      return fwd;
+    }
+    return fail(502, "the pane is given to " + member + ", which could not be asked");
+  }
+
   std::string new_id, error;
   std::shared_ptr<Session> s = session_for(req, new_id, error);
   if (!s) return fail(500, error);
@@ -1505,7 +1548,7 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
     std::string member;
     {
       std::lock_guard<std::mutex> turn(s->mu);
-      member = web_pane_route_machine(*s->vm, s->pane, req.method, req.path);
+      if (!s->canvas) member = web_pane_route_machine(*s->vm, s->pane, req.method, req.path);
     }
     if (!member.empty() && host_.forward_stream && on_chunk) {
       bool wants_stream = false;

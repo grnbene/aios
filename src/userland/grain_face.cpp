@@ -455,6 +455,8 @@ class FacePane final : public PaneDriver {
   bool workers() const { return workers_; }
   bool api_only() const { return api_only_; }
   void set_api_only(bool v) { api_only_ = v; }
+  const std::string& machine() const { return machine_; }
+  void set_machine(const std::string& m) { machine_ = m; }
   void set_workers(bool v) { workers_ = v; }
 
   bool render_html(Vm& vm, std::string& html, std::string& error) {
@@ -1212,6 +1214,7 @@ class FacePane final : public PaneDriver {
   Value routes_ = Value::nil();
   Value middleware_ = Value::nil();
   bool api_only_ = false;  // no page: only its routes answer (serve_routes)
+  std::string machine_;    // the fleet member whose copy of the program runs this pane (its page, actions and routes)
   bool workers_ = false;   // routes run in worker VMs, not one at a time in this one
 
  private:
@@ -1399,6 +1402,12 @@ Value bi_ui_pane(Vm& vm, std::vector<Value>& args, std::string& error) {
   else if (Value* a = o->find("api")) pane->set_routes(*a);
   if (Value* mw = o->find("middleware")) pane->set_middleware(*mw);
   pane->set_api_only(api_only);
+  // "machine": every request of the pane - the page, its actions and its push, and the routes - answered by this
+  // program's copy on that fleet member (as on_machine does for one route); "" or nil: here.
+  if (Value* mc = o->find("machine"); mc && mc->type != Type::Nil) {
+    if (mc->type != Type::Str) { error = std::string("ui.pane()'s \"machine\" is a member id, got a ") + type_name(mc->type); return Value::nil(); }
+    pane->set_machine(mc->str());
+  }
   if (Value* wk = o->find("workers")) pane->set_workers(wk->truthy());   // each route request in a VM of its own, on its own thread: a slow one does not hold up the rest
   return register_driven_pane(vm, title, w, h, pane);
 }
@@ -1574,6 +1583,11 @@ bool web_pane_first(const Vm& vm, WebPaneInfo& out) {
 bool web_pane_api_only(Vm& vm, uint64_t id) {
   FacePane* f = web_face(vm, id);
   return f && f->api_only();
+}
+
+std::string web_pane_machine(Vm& vm, uint64_t id) {
+  FacePane* f = web_face(vm, id);
+  return f ? f->machine() : std::string();
 }
 
 bool web_pane_render(Vm& vm, uint64_t id, std::string& html, uint64_t& version, std::string& error) {

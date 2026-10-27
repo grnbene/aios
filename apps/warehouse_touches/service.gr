@@ -116,27 +116,31 @@ fn handle_events(req, writer) {
   return nil
 }
 
-// ---- UI Pane & HTTP Routes ---------------------------------------------------
+// ---- The pane --------------------------------------------------------------------------------------------
 
-// WAREHOUSE_COMPUTE_ON: the fleet member (its id, or a prefix) whose copy of this app answers the reports - the
-// request crosses the substrate to that member, its copy reads its own ASQL, and the answer comes back here.
-// Empty, or this machine: answered here, from DB_HOST.
+// WAREHOUSE_COMPUTE_ON: the fleet member (its id, or a prefix) whose copy of this app answers - the page, its
+// actions and the exports cross the substrate to that member, its copy reads its own ASQL, and the answers come
+// back here. Empty, or this machine: answered here, from DB_HOST.
 let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
 
+// The viewer's own page: the range (the PHP report's default, the last 30 days) and the table's sort.
+let default_range = report_range(nil, nil)
+let state = {"start": default_range[0], "stop": default_range[1], "sorter": {"col": 2, "dir": "desc"}}
+
 ui.pane({
-  "title": "Warehouse Touches",
-  "width": 1000,
-  "height": 700,
-  "shared": true,
+  "title": "Warehouse Activity",
+  "width": 1400,
+  "css": PAGE_CSS,
+  "machine": COMPUTE_ON,
   "workers": true,
+  "view": fn() { return dashboard_node(report(get_db(), {"start": state.start, "stop": state.stop, "userid": nil}), state) },
   "routes": {
-    "/": on_machine(COMPUTE_ON, handle_quickreportview),
     "/health": handle_health,
-    "/quickreport": on_machine(COMPUTE_ON, handle_quickreport),
-    "/quickreportview": on_machine(COMPUTE_ON, handle_quickreportview),
-    "/quickreportpdf": on_machine(COMPUTE_ON, handle_quickreportpdf),
-    "/quickreportxlsx": on_machine(COMPUTE_ON, handle_quickreportxlsx),
-    "/quickreportcsv": on_machine(COMPUTE_ON, handle_quickreportcsv),
-    "/quickreportevents": on_machine(COMPUTE_ON, handle_events)
+    "/quickreport": handle_quickreport,
+    "/quickreportview": handle_quickreportview,     // the PHP page as it was (its own script sorts and follows the events)
+    "/quickreportpdf": handle_quickreportpdf,
+    "/quickreportxlsx": handle_quickreportxlsx,
+    "/quickreportcsv": handle_quickreportcsv,
+    "/quickreportevents": handle_events
   }
 })

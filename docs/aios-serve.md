@@ -150,6 +150,13 @@ Driven on a private local fleet (hub and two app hosts, 2026-10-27): a route on 
 500 ms, asked through member B, delivered them 0.50 s apart, each from A; a client that left after 1.2 s ended A's
 route ("reader gone"); a plain route on A came back whole through B.
 
+A whole pane can be given to a member the same way: `ui.pane({..., "machine": member})`. Every request of the pane -
+the page, its actions (`/_ui/event`), its push (the page's own event stream) and its routes - is answered by that
+member's copy of the app, whose session it is (the cookie comes from there); this machine starts no copy of the
+program for it. On that member itself, or with `""`, the pane is answered here. When the member cannot be reached
+the answer is a 502/503 after the same retries a route gets. Driven by `scripts/pane-machine-check.sh` (a hub and
+two app hosts on loopback).
+
 `apps/warehouse_touches` puts the two together: its `/quickreportevents` route waits on the `touch_day` Thing with
 `WAIT THING` (see `docs/asql.md`) and pushes the new figures when a day of the page's range changes.
 

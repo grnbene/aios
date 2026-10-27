@@ -49,6 +49,9 @@ class WebUi {
     // The same for a request whose answer is a stream (Accept: text/event-stream): the member's route writes, and
     // each piece comes through on_headers / on_chunk as it is written. false: not carried (answered as above).
     std::function<bool(const std::string& member, const Request& req, StreamHeaderCallback on_headers, StreamChunkCallback on_chunk)> forward_stream;
+    // Whether `member` (an id or a prefix) is this machine. A pane given to it (ui.pane "machine") is answered here.
+    // Unset: no member is.
+    std::function<bool(const std::string& member)> is_here;
   };
 
   struct Request {
@@ -105,6 +108,8 @@ class WebUi {
   mutable std::mutex mu_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
   std::shared_ptr<Session> shared_;     // the one copy, for a pane with "shared": true
+  bool member_known_ = false;           // given_member(): learnt for member_version_ of the program
+  std::string member_version_, member_;
   aios::hal::Thread ticker_;
   bool stop_ = false;
   std::condition_variable stop_cv_;
@@ -115,6 +120,7 @@ class WebUi {
   void report(const std::string& msg) const;
   void start_ticker();
   void tick();
+  std::string given_member(const Request& req);   // the member a ui.pane "machine" gives the pane to, "" for here
   bool refresh_locked(Session& s);           // re-render; true (and a new seq) when what is on screen changed
   void frame_locked(Session& s, bool tree, std::string& out);
 };

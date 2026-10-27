@@ -243,8 +243,24 @@ fn source_cells(u) {
   }
 }
 
-// What changes with the data: the cards, the note and the "By person" panel.
-fn render_live(report) {
+// The table's columns, for a server-side sort (the pane): what each one sorts by.
+fn sort_value(u, col) {
+  let p = source_parts(u)
+  if col == 1 { return lower(first_present(u.name, u.userid)) }
+  if col >= 3 and col <= 7 { return real(p[SOURCES[col - 3][0]]) }
+  if col == 8 { return u.active_days }
+  if col == 9 { return real(u.touches_per_day) }
+  if col == 10 { return str(u.first_touch ?? "") }
+  return real(u.touches)   // 0 (rank) and 2: the busiest first
+}
+
+// The PHP page's live part, for the page whose script sorts it (render_live: data-col headers).
+fn render_live(report) { return html_stringify(live_node(report, nil)) }
+
+// What changes with the data: the cards, the note and the "By person" panel. sorter nil: the rows in rank order
+// and headers for the page script to sort; a sorter {col, dir}: the rows sorted here (ties by user id, every time)
+// and each header an action that sorts by it (the same column again turns the order).
+fn live_node(report, sorter) {
   let t = report.totals
   let pt = source_parts(t)
   let lasts = report.lasts == nil ? {} : report.lasts
@@ -270,8 +286,12 @@ fn render_live(report) {
 
   let nil_cell = el("span", {"class": "nil"}, "\u{2013}")
   let top = max(1.0, max(concat([0.0], map(report.users, fn(u) { return real(u.touches) }))))
+  let ranked = enumerate(report.users)
+  if sorter != nil {
+    ranked = sort_by(sort_by(ranked, fn(pr) { return lower(pr[1].userid) }), fn(pr) { return sort_value(pr[1], sorter.col) }, sorter.dir)
+  }
   let rows = []
-  for pair in enumerate(report.users) {
+  for pair in ranked {
     let rank = pair[0] + 1
     let u = pair[1]
     let p = source_parts(u)
@@ -291,15 +311,26 @@ fn render_live(report) {
   if len(rows) == 0 { push(rows, el("tr", el("td", {"colspan": 11, "class": "empty"}, "No warehouse activity in this range."))) }
 
   let tsub = source_cells(t)
-  let head = [el("th", {"class": "l", "data-col": 0}, "#"), el("th", {"class": "l", "data-col": 1}, "Person"),
-              el("th", {"data-col": 2, "data-dir": "desc"}, "Touches")]
+  let th = fn(col, attrs, label) {
+    if sorter == nil {
+      attrs["data-col"] = col
+      if col == 2 { attrs["data-dir"] = "desc" }
+    } else {
+      if sorter.col == col { attrs["data-dir"] = sorter.dir }
+      attrs["on_click"] = fn() {
+        if sorter.col == col { sorter.dir = sorter.dir == "desc" ? "asc" : "desc" } else { sorter.col = col; sorter.dir = "desc" }
+      }
+    }
+    return el("th", attrs, label)
+  }
+  let head = [th(0, {"class": "l"}, "#"), th(1, {"class": "l"}, "Person"), th(2, {}, "Touches")]
   let foot = [el("td"), el("td", {"class": "who"}, "All users"), el("td", n0(t.touches))]
   for pair in enumerate(SOURCES) {
     let src = pair[1]
-    push(head, el("th", {"class": "contrib", "style": "--c:var(" + src[2] + ")", "data-col": pair[0] + 3, "title": "Counts toward touches"}, src[1]))
+    push(head, th(pair[0] + 3, {"class": "contrib", "style": "--c:var(" + src[2] + ")", "title": "Counts toward touches"}, src[1]))
     push(foot, el("td", main_num(src[2], pt[src[0]]), tsub[src[0]]))
   }
-  push(head, el("th", {"data-col": 8}, "Days"), el("th", {"data-col": 9}, "Per day"), el("th", {"data-col": 10}, "First / last"))
+  push(head, th(8, {}, "Days"), th(9, {}, "Per day"), th(10, {}, "First / last"))
   push(foot, el("td", n0(t.active_days)), el("td", n1(t.touches_per_day)),
        el("td", {"class": "when"}, when(t.first_touch), el("small", "to " + when(t.last_touch))))
   let legend = map(SOURCES, fn(src) { return el("span", dot(src[2]), src[1]) })
@@ -307,7 +338,7 @@ fn render_live(report) {
   let panel = el("div", {"class": "panel"},
     el("div", {"class": "panel-head"}, el("h2", "By person"), el("div", {"class": "legend"}, legend)),
     el("div", {"class": "scroll"}, el("table", el("thead", el("tr", head)), el("tbody", rows), el("tfoot", el("tr", foot)))))
-  return html_stringify([cards, note, panel])
+  return [cards, note, panel]
 }
 
 let PAGE_CSS = join([
@@ -423,4 +454,38 @@ fn render_html_dashboard(report, input) {
             el("a", {"class": "btn", "href": "/quickreportxlsx" + q}, "Export Excel"))),
         el("div", {"id": "live"}, html_raw(render_live(report)))),
       el("script", PAGE_JS))))
+}
+
+// The clock in the header, filled in by the page (the time is the viewer's).
+let CLOCK_JS = join([
+  "(function () {",
+  "  function tick() {",
+  "    var d = new Date(), t = document.getElementById('clock-time'), y = document.getElementById('clock-day');",
+  "    if (t) t.textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });",
+  "    if (y) y.textContent = d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });",
+  "  }",
+  "  tick(); setInterval(tick, 1000);",
+  "})();"
+], chr(10))
+
+// The page as a ui.pane view (service.gr): the same markup as the PHP page, its range a form whose Run is an
+// action and its sort done here (state: {start, stop, sorter}, the viewer's own).
+fn dashboard_node(report, state) {
+  let q = "?start=" + report.start + "&stop=" + report.stop
+  return el("div", {"class": "page"},
+    el("header",
+      el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
+      el("div", {"class": "clock", "aria-live": "off"}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
+      el("form", {"onsubmit": "return false"},
+        el("label", "From"), el("input", {"type": "date", "bind": "start", "value": report.start}),
+        el("label", "To"), el("input", {"type": "date", "bind": "stop", "value": report.stop}),
+        el("button", {"type": "button", "class": "btn primary", "on_click": fn(f) {
+          let r = report_range(f.start, f.stop)
+          state.start = r[0]
+          state.stop = r[1]
+        }}, "Run"),
+        el("a", {"class": "btn", "href": "/quickreportpdf" + q}, "Export PDF"),
+        el("a", {"class": "btn", "href": "/quickreportxlsx" + q}, "Export Excel"))),
+    el("div", {"id": "live"}, live_node(report, state.sorter)),
+    el("script", CLOCK_JS))
 }
