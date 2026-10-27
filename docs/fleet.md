@@ -44,7 +44,8 @@ over the same encrypted link (`src/node/secure.cpp`).
   and reach each other **by kernel identity**. The hub switches byte circuits
   between them and only sees ciphertext (`include/aios/fleet/relay.hpp`). A
   member needs no inbound port, and a peer reached this way shows up as
-  `relay:<id>`.
+  `relay:<id>`. A member can also be reached straight, skipping the hub, with
+  `AIOS_FLEET_DIRECT` (see [A member reached straight](#a-member-reached-straight-aios_fleet_listen--aios_fleet_direct)).
 
 Most fleet features work over either kind of link, because both end up in the
 kernel's node list (`node list`). These features are **relay only**: the
@@ -903,6 +904,36 @@ M> fleet join 127.0.0.1 13635 … ; fleet members
 
 Before, the join failed silently and was never retried. The key is also in the
 environment, so it is readable through `/proc/<pid>/environ` by the same user.
+
+### A member reached straight: `AIOS_FLEET_LISTEN` / `AIOS_FLEET_DIRECT`
+
+By default a member reaches another member through the hub, so every byte
+of work between them crosses the hub's machine. For a pair that should talk
+straight to each other (an app host forwarding requests to the machine that
+answers them), give the answering member a port and the asking member its
+address:
+
+- `AIOS_FLEET_LISTEN=<port>` on the answering member: after the boot join it
+  runs `node serve <port> <cluster key> bind=0.0.0.0` (`cli/main.cpp`).
+  Firewall that port to the members that use it.
+- `AIOS_FLEET_DIRECT=<member>=<host>:<port>[,...]` on the asking member:
+  `Kernel::reach` opens a direct link to that member first, with the same
+  cluster-key handshake (`Kernel::open_member`, `src/kernel/kernel.cpp`).
+
+On a direct link, work and memory cross the substrate exactly as they do
+over a hub circuit. The peer at that address must prove it is that member,
+or the link is refused. If the direct link cannot be made, the hub carries
+the link and the failure is logged (`fleet: direct link to … failed`). The
+link keeps the member's name (`relay:<id>`) either way, so device names and
+selectors do not change. `Kernel::find_member` resolves a member from the
+roster, from a link already made, or from its direct route, so a member
+reached directly is still served while the hub is down. To go back to the
+hub alone, remove `AIOS_FLEET_DIRECT` and restart.
+
+In production (2026-10-27): atl-ga-1's app host listens on 7421, and
+cleve-ny-1's app host reaches it with
+`AIOS_FLEET_DIRECT=1127294d54b8=206.217.132.218:7421`. The hub runs on
+atl-ga-1.
 
 ### `deploy/aos-fleet/`: a persistent member
 
