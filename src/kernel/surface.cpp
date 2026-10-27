@@ -167,6 +167,13 @@ Result<GraphID> Surface::create_graph() {
   AIOS_TRY(need_entity());
   return k_.graphs_->create(who_, k_.now());
 }
+Result<void> Surface::destroy_graph(const GraphID& g) {
+  AIOS_TRY(need_entity());
+  const ComputeGraph* gr = k_.graphs_->get(g);
+  if (!gr) return Result<void>(Status::NotFound, "graph " + g.short_str());
+  if (gr->owner != who_) return Result<void>(Status::Denied, "graph belongs to another entity");
+  return k_.graphs_->destroy(g);
+}
 Result<OperationID> Surface::add_operation(const GraphID& g, Operation op) {
   const ComputeGraph* gr = k_.graphs_->get(g);
   if (!gr) return Result<OperationID>(Status::NotFound, "graph " + g.short_str());
