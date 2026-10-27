@@ -51,6 +51,34 @@ fn handle_health(req) {
   return {"status": 200, "content_type": "application/json", "body": "{\"status\":\"ok\"}"}
 }
 
+// GET /quickreportauth: the check atl's nginx asks before every request of the live page (auth_request), on the
+// PHP API's terms (catalog/controller/startup/validate.php, the ?key= path): the key one of apikeys' active ones,
+// for this app's database, and a userid that is not empty and not admin. nginx hands the original URI in
+// X-Original-URI; 204 lets it through, 401 (the PHP API's answer) does not.
+fn query_of(uri) {
+  let at = index_of(uri, "?")
+  let q = {}
+  if at < 0 { return q }
+  for pair in split(slice(uri, at + 1), "&") {
+    let eq = index_of(pair, "=")
+    if eq > 0 { q[url_decode(replace(slice(pair, 0, eq), "+", " "))] = url_decode(replace(slice(pair, eq + 1), "+", " ")) }
+  }
+  return q
+}
+
+fn handle_auth(req) {
+  let denied = {"status": 401, "content_type": "application/json", "body": "{\"success\":false,\"message\":\"Unauthorized\"}"}
+  let q = query_of(req.headers["x-original-uri"] ?? "")
+  let userid = trim(q.userid ?? "")
+  if is_blank(q.key) or userid == "" or lower(userid) == "admin" { return denied }
+  let c = db_connect(DB_CFG)
+  if not c.ok { return {"status": 503, "content_type": "text/plain", "body": "no database"} }
+  let r = db_query(c, "SELECT keycode FROM apikeys WHERE active = '1' AND keycode = ? AND `database` = ?", [q.key, DB_CFG.db])
+  db_close(c)
+  if not r.ok or len(r.records) == 0 { return denied }
+  return {"status": 204, "body": ""}
+}
+
 fn handle_quickreport(req) {
   let p = parse_date_params(req)
   let db = get_db()
@@ -144,6 +172,7 @@ ui.pane({
   "watch": {"thing": "touch_day", "db": DB_CFG},
   "routes": {
     "/health": handle_health,
+    "/quickreportauth": handle_auth,
     "/quickreport": handle_quickreport,
     "/quickreportview": handle_quickreportview,     // the PHP page as it was (its own script sorts and follows the events)
     "/quickreportpdf": handle_quickreportpdf,
