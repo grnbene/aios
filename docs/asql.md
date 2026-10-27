@@ -741,11 +741,18 @@ CREATE THING <name> KEY <column>
 - `READS` defaults to every table the query names.
 - `PART` sub-queries are allowed only on row Things.
 - `WHEN ... DO ... TO` is allowed only on a row Thing, and the profile must
-  have `things_write=1`. Inside `DO`, the word `KEY` outside quotes is replaced
-  by the Thing's key. `ON DUPLICATE KEY`, `PRIMARY KEY` and similar are left
-  alone. **Only the key** is substituted. A value label in the statement is
-  sent as-is: `VALUES (KEY, line_count)` failed on the target with
-  `no such column: line_count`. The act runs in one transaction on the
+  have `things_write=1`. Inside `DO`, outside quotes:
+  - the word `KEY` is replaced by the Thing's key. `ON DUPLICATE KEY`,
+    `PRIMARY KEY` and similar are left alone.
+  - `THING.<label>` is replaced by that value of the Thing that acted, as it
+    is when it acts: a number as itself, text quoted, NULL as `NULL`. Write
+    `` THING.`a label` `` for a label with a space in it. `THING` is the same
+    name the condition sees its values under (`WHEN thing.picked >= thing.qty`).
+    A label the Thing does not have is refused at `CREATE`, with the labels it
+    does have. A bare label (`VALUES (KEY, line_count)`) is sent as it is
+    and means a column on the target.
+
+  The act runs in one transaction on the
   profile, inside the statement that caused it. It fires once each time the
   condition becomes true, including for keys already true at `CREATE`. A
   failed act is recorded in the history and is tried again at the key's next

@@ -1594,16 +1594,91 @@ bool ThingEngine::run_part(Kind& k, Kind::PartDef& p, const std::vector<std::str
 // Does WHEN hold for this Thing: the engine's own SQL over the row's columns, a derived
 // table of its values (the key and every output column; a later duplicate name wins, as a
 // row read by name would).
-bool ThingEngine::condition_holds(const Kind& k, const Instance& in, bool* holds, std::string* err) {
+std::vector<std::string> ThingEngine::value_labels(const Kind& k) const {
   std::vector<std::string> labels;
+  if (!k.items.empty()) labels.push_back(k.items[0].label);
+  if (k.row_mode && !k.out_labels.empty()) labels.insert(labels.end(), k.out_labels.begin(), k.out_labels.end());
+  else for (size_t i = 1; i < k.items.size(); ++i) labels.push_back(k.items[i].label);
+  return labels;
+}
+
+std::vector<std::string> ThingEngine::value_row(const Kind& k, const Instance& in) const {
   std::vector<std::string> values;
-  labels.push_back(k.items[0].label);
   values.push_back(in.key_null ? sql_null() : in.key);
   if (k.row_mode && !k.out_labels.empty()) {
-    for (size_t v = 0; v < k.out_labels.size(); ++v) { labels.push_back(k.out_labels[v]); values.push_back(v < in.row.size() ? in.row[v] : sql_null()); }
+    for (size_t v = 0; v < k.out_labels.size(); ++v) values.push_back(v < in.row.size() ? in.row[v] : sql_null());
   } else {
-    for (size_t i = 1; i < k.items.size(); ++i) { labels.push_back(k.items[i].label); values.push_back(value_text(k, in, i)); }
+    for (size_t i = 1; i < k.items.size(); ++i) values.push_back(value_text(k, in, i));
   }
+  return values;
+}
+
+namespace {
+// At q[i], outside quotes: THING.<label> or THING.`<label>` (THING in any case, not part of a longer name or of
+// a qualified one). Sets *end past it and *label; false when there is none here.
+bool thing_ref_at(const std::string& q, size_t i, size_t* end, std::string* label) {
+  if (i + 6 > q.size() || q[i + 5] != '.') return false;
+  for (size_t j = 0; j < 5; ++j) if (std::toupper((unsigned char)q[i + j]) != "THING"[j]) return false;
+  if (i > 0 && (std::isalnum((unsigned char)q[i - 1]) || q[i - 1] == '_' || q[i - 1] == '.' || q[i - 1] == '`')) return false;
+  size_t j = i + 6;
+  if (j < q.size() && q[j] == '`') {
+    const size_t close = q.find('`', j + 1);
+    if (close == std::string::npos || close == j + 1) return false;
+    *label = q.substr(j + 1, close - j - 1);
+    *end = close + 1;
+    return true;
+  }
+  size_t e = j;
+  while (e < q.size() && (std::isalnum((unsigned char)q[e]) || q[e] == '_')) ++e;
+  if (e == j) return false;
+  *label = q.substr(j, e - j);
+  *end = e;
+  return true;
+}
+// The value under `label` (case-insensitive; a later duplicate wins, as WHEN reads it), or false.
+bool value_of(const std::vector<std::string>& labels, const std::vector<std::string>& values, const std::string& label, std::string* out) {
+  for (size_t i = labels.size(); i-- > 0;) {
+    if (lower(labels[i]) != lower(label)) continue;
+    if (out) *out = i < values.size() ? values[i] : sql_null();
+    return true;
+  }
+  return false;
+}
+// A value as a literal in a statement: a plain number as itself, NULL as NULL, anything else quoted.
+std::string value_literal(const std::string& v) {
+  if (sql_is_null(v)) return "NULL";
+  size_t i = (!v.empty() && v[0] == '-') ? 1 : 0, digits = 0, dots = 0;
+  for (; i < v.size(); ++i) {
+    if (std::isdigit((unsigned char)v[i])) ++digits;
+    else if (v[i] == '.' && dots == 0) ++dots;
+    else return sql_lit(v);
+  }
+  return digits > 0 && v.back() != '.' && v[v[0] == '-' ? 1 : 0] != '.' ? v : sql_lit(v);
+}
+}  // namespace
+
+std::string ThingEngine::unknown_do_labels(const Kind& k) const {
+  const std::vector<std::string> labels = value_labels(k);
+  std::string missing;
+  char quote = 0;
+  const std::string& q = k.do_sql;
+  for (size_t i = 0; i < q.size(); ++i) {
+    const char c = q[i];
+    if (quote) { if (c == quote) quote = 0; continue; }
+    if (c == '\'' || c == '"' || c == '`') { quote = c; continue; }
+    size_t end = 0;
+    std::string label;
+    if (thing_ref_at(q, i, &end, &label)) {
+      if (!value_of(labels, {}, label, nullptr)) missing += (missing.empty() ? "" : ", ") + std::string("THING.") + label;
+      i = end - 1;
+    }
+  }
+  return missing;
+}
+
+bool ThingEngine::condition_holds(const Kind& k, const Instance& in, bool* holds, std::string* err) {
+  const std::vector<std::string> labels = value_labels(k);
+  const std::vector<std::string> values = value_row(k, in);
   std::string cols;
   for (size_t i = 0; i < labels.size(); ++i) {
     bool later = false;
@@ -1626,8 +1701,11 @@ bool ThingEngine::run_act(const Kind& k, const Instance& in, std::string* err) {
   if (!found) { *err = "DO .. TO " + k.do_target + ": no such connection profile"; return false; }
   if (!prof.things_write) { *err = "DO .. TO " + k.do_target + ": the profile is not marked things_write=1"; return false; }
   const std::string key = in.key_null ? std::string("NULL") : (all_digits(in.key) ? in.key : sql_lit(in.key));
+  const std::vector<std::string> labels = value_labels(k);
+  const std::vector<std::string> values = value_row(k, in);
   // KEY as a word outside quotes -> the key, unless it is SQL's own KEY (ON DUPLICATE KEY
-  // UPDATE, PRIMARY KEY ..); ';' outside quotes splits the statements
+  // UPDATE, PRIMARY KEY ..); THING.<label> outside quotes -> that value of this Thing;
+  // ';' outside quotes splits the statements
   std::vector<std::string> stmts;
   {
     std::string cur;
@@ -1645,6 +1723,16 @@ bool ThingEngine::run_act(const Kind& k, const Instance& in, std::string* err) {
       if (quote) { cur += c; if (c == quote) quote = 0; continue; }
       if (c == '\'' || c == '"' || c == '`') { quote = c; cur += c; continue; }
       if (c == ';') { if (!trim(cur).empty()) stmts.push_back(trim(cur)); cur.clear(); continue; }
+      {
+        size_t end = 0;
+        std::string label, v;
+        if (thing_ref_at(q, i, &end, &label)) {
+          if (!value_of(labels, values, label, &v)) { *err = "DO: THING." + label + " is not a value of " + k.name; return false; }
+          cur += value_literal(v);
+          i = end - 1;
+          continue;
+        }
+      }
       if ((c == 'K' || c == 'k') && i + 3 <= q.size() && std::toupper((unsigned char)q[i + 1]) == 'E' && std::toupper((unsigned char)q[i + 2]) == 'Y' &&
           (i == 0 || !(std::isalnum((unsigned char)q[i - 1]) || q[i - 1] == '_' || q[i - 1] == '.')) &&
           (i + 3 == q.size() || !(std::isalnum((unsigned char)q[i + 3]) || q[i + 3] == '_'))) {
@@ -3376,6 +3464,15 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     if (!run_full(it->second, "created", &err)) {
       kinds_.erase(it);
       return error_result(err);
+    }
+    // Its value names are known once it is built (a `*` learns them there): a DO naming one it does not have
+    // is refused now, not at its first act.
+    if (const std::string missing = unknown_do_labels(it->second); !missing.empty()) {
+      std::string have;
+      for (const auto& l : value_labels(it->second)) have += (have.empty() ? "" : ", ") + l;
+      const std::string name = it->second.name;
+      kinds_.erase(it);
+      return error_result("DO: " + missing + " is not a value of " + name + " (its values: " + have + ")");
     }
     act_due(it->second);
     // On disk before the statement returns: a declared Thing is not
