@@ -11,8 +11,8 @@ fn deployed(app) {
     print("touch_day: kept on " + elsewhere + ", where this app's reports run")
     return true
   }
-  let c = db_connect(env("DB_HOST", "127.0.0.1"), int(env("DB_PORT", "3307")), env("DB_USER", "root"),
-                     secret("DB_PASSWORD"), env("DB_NAME", "versioneight"))
+  let c = db_connect({"host": env("DB_HOST", "127.0.0.1"), "port": int(env("DB_PORT", "3307")), "user": env("DB_USER", "root"),
+                      "password": secret("DB_PASSWORD"), "db": env("DB_NAME", "versioneight")})
   if not c.ok { return "cannot reach ASQL: " + c.error }
   let have = db_query(c, "SHOW THINGS", [])
   let exists = false

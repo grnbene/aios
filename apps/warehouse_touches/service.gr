@@ -24,7 +24,7 @@ let db_conn = nil
 
 fn get_db() {
   if db_conn != nil { return db_conn }
-  let c = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
+  let c = db_connect(DB_CFG)
   db_conn = c
   return c
 }
@@ -34,9 +34,7 @@ fn report(db, p) { return fetch_warehouse_touches(db, p.start, p.stop, p.userid)
 // start / stop from the query (or a range "a..b"); missing or not a date, the PHP report's defaults: the last 30
 // days, today included (report_range in lib/queries.gr).
 fn parse_date_params(req) {
-  let q = {}
-  if req.query_params != nil and type(req.query_params) == "map" { q = req.query_params }
-  else if req.query != nil and type(req.query) == "map" { q = req.query }
+  let q = req.query_params ?? {}
   let start = q.start
   let stop = q.stop
   if q.range != nil and contains(str(q.range), "..") {
@@ -86,7 +84,7 @@ fn handle_events(req, writer) {
   let p = parse_date_params(req)
   let in_range = add_keys({}, date_range(p.start, p.stop))
   // WAIT holds its connection while it waits, so this stream has one of its own
-  let w = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
+  let w = db_connect(DB_CFG)
   writer.write_head(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
   let clock = "0"
   while not writer.is_closed() {
@@ -134,16 +132,9 @@ ui.pane({
   "machine": COMPUTE_ON,
   "workers": true,
   "view": fn() { return dashboard_node(report(get_db(), {"start": state.start, "stop": state.stop, "userid": nil}), state) },
-  // Live: the engine wakes this when the touch_day Thing changes (WAIT THING, on a connection of its own); every
-  // open page then looks again, and gets a frame when its own range's figures moved.
-  "watch": fn(since) {
-    let w = db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db)
-    if not w.ok { error("touch_day watch: " + w.error) }
-    let r = db_query(w, "WAIT THING touch_day SINCE " + (since ?? "0") + " TIMEOUT 10", [])
-    db_close(w)
-    if not r.ok { error("touch_day watch: " + r.error) }
-    return str(r.records[0].clock)
-  },
+  // Live: the engine wakes the pane when the touch_day Thing changes (WAIT THING, on a connection of its own);
+  // every open page then looks again, and gets a frame when its own range's figures moved.
+  "watch": {"thing": "touch_day", "db": DB_CFG},
   "routes": {
     "/health": handle_health,
     "/quickreport": handle_quickreport,

@@ -42,29 +42,18 @@ fn is_day(d) { return not is_blank(d) and pcall(date_range, str(d), str(d)).ok }
 fn report_range(start, stop) {
   let today = date_format(now(), "%Y-%m-%d")
   let b = is_day(stop) ? str(stop) : today
-  let a = is_day(start) ? str(start) : date_format(date_parse(b) - 29 * 86400, "%Y-%m-%d", "utc")
+  let a = is_day(start) ? str(start) : day_add(b, -29)
   return [a, b]
 }
 
 // 'YYYY-MM-DD HH:MM:SS' as seconds (for a load's length), nil when it is not one
-fn secs_of(ts) {
-  if is_blank(ts) { return nil }
-  let s = str(ts)
-  if len(s) < 19 or s < "1971" { return nil }
-  return date_parse(slice(s, 0, 19))
-}
+fn secs_of(ts) { return is_blank(ts) ? nil : date_parse(str(ts), {"or": nil}) }
 
+// The days of the range the touch_day Thing holds (its JSON columns read back as values).
 fn touch_days(db, start_date, stop_date) {
   if not is_day(start_date) or not is_day(stop_date) { return [] }
-  let ds = date_range(start_date, stop_date)
-  if len(ds) == 0 { return [] }
-  let quoted = []
-  for d in ds { push(quoted, "'" + d + "'") }
-  let r = db_query(db, "SHOW THING touch_day KEYS (" + join(quoted, ", ") + ")", [])
-  if not r.ok { error("touch_day: " + r.error) }
-  let out = []
-  for row in r.records { push(out, {"day": str(row.day), "users": json_parse(row.users), "runs": row.runs == nil ? [] : json_parse(row.runs)}) }
-  return out
+  return map(thing_rows(db, "touch_day", date_range(start_date, stop_date)),
+             fn(row) { return {"day": str(row.day), "users": row.users, "runs": row.runs ?? []} })
 }
 
 fn r1(v) { return round(real(v), 1) }
@@ -278,18 +267,13 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     for d in u_days { all_days[d] = true }
     stamp_touch(totals, u.first_touch, u.last_touch)
     totals.touches = totals.touches + u.touches
-    for f in ["scans", "qty_in", "qty_out"] { totals.receiving[f] = totals.receiving[f] + u.receiving[f] }
-    for f in ["lines", "qty"] { totals.picking[f] = totals.picking[f] + u.picking[f] }
-    for f in ["scans", "orders", "dispatches", "manual", "forced"] { totals.loads[f] = totals.loads[f] + u.loads[f] }
-    for f in ["packed", "packedunits", "staged", "stagedunits", "binds"] { totals.sticker[f] = totals.sticker[f] + u.sticker[f] }
-    for p in keys(u.parts) { totals.parts[p] = totals.parts[p] + u.parts[p] }
-    for f in ["moves", "qty"] {
-      totals.movements[f] = totals.movements[f] + u.movements[f]
-      for t in keys(u.movements.by_type) {
-        let bt = get_or_put(totals.movements.by_type, t, {"moves": 0, "qty": 0.0})
-        bt[f] = bt[f] + u.movements.by_type[t][f]
-      }
-    }
+    // the sums (items, vendors and orders are distinct across users, so not added; nor are the averages)
+    add_into(totals.receiving, u.receiving, ["scans", "qty_in", "qty_out"])
+    add_into(totals.picking, u.picking, ["lines", "qty"])
+    add_into(totals.loads, u.loads, ["scans", "orders", "dispatches", "manual", "forced"])
+    add_into(totals.sticker, u.sticker)
+    add_into(totals.parts, u.parts)
+    add_into(totals.movements, u.movements, ["moves", "qty", "by_type"])
     push(user_list, u)
   }
   totals.loads.avgloadtime = timed_all > 0 ? r1(secs_all / timed_all / 60.0) : 0.0
