@@ -161,11 +161,17 @@ ui.pane({
   "workers": true,
   // a connection of the render's own, closed after: the routes run in worker VMs copied from this program's
   // globals, and a connection kept in a global (get_db's db_conn) cannot be copied to them
+  // (a page that cannot read its data says so rather than failing: a new version starts before its deploy hook has
+  // made the Thing it reads, and ASQL may be restarting)
   "view": fn() {
     let c = db_connect(DB_CFG)
-    let data = report(c, {"start": state.start, "stop": state.stop, "userid": nil, "hour": state.hour})
-    db_close(c)
-    return dashboard_node(data, state)
+    let got = c.ok ? pcall(report, c, {"start": state.start, "stop": state.stop, "userid": nil, "hour": state.hour}) : {"ok": false, "error": c.error}
+    if c.ok { db_close(c) }
+    if not got.ok {
+      return el("div", {"class": "page"}, el("h1", "Warehouse Activity"),
+                el("p", {"class": "note"}, "The report is not available yet (" + str(got.error) + "). This page shows it when it is."))
+    }
+    return dashboard_node(got.value, state)
   },
   // Live: the engine wakes the pane when the touch_hour Thing changes (WAIT THING, on a connection of its own);
   // every open page then looks again, and gets a frame when its own range's figures moved.
