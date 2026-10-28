@@ -1,0 +1,16 @@
+// import from many VMs at once (here spawned tasks; on a server, page sessions starting together): each VM runs
+// its own copy of the file, so each sees only its own globals. Sharing one compiled copy across threads let a VM
+// read another's `mark` and corrupted the heap (an app host on atl-ga-1 aborted, 2026-10-28).
+let tasks = []
+for i in range(0, 16) {
+  push(tasks, spawn(fn(i) {
+    import("mods/mark.gr")
+    set_mark(i)
+    let wrong = 0
+    for n in range(0, 50000) { if get_mark() != i { wrong = wrong + 1 } }
+    return wrong
+  }, i))
+}
+let wrong = 0
+for t in tasks { wrong = wrong + await(t) }
+print("reads of another VM's global:", wrong)
