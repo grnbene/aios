@@ -1,0 +1,42 @@
+{
+  "name": "grain",
+  "displayName": "Grain Language",
+  "description": "Syntax highlighting, language configuration, and snippets for Grain (.gr) substrate programs",
+  "version": "1.0.0",
+  "publisher": "aios",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "grain",
+        "aliases": [
+          "Grain",
+          "grain"
+        ],
+        "extensions": [
+          ".gr"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "grain",
+        "scopeName": "source.grain",
+        "path": "./syntaxes/grain.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "grain",
+        "path": "./snippets/grain.json"
+      }
+    ]
+  }
+}
