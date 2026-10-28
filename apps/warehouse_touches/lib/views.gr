@@ -69,6 +69,7 @@ fn card_lines(rep) {
     {"key": "movements", "label": "Bin Moves", "touches": pt.movements, "detail": n0(t.movements.moves) + " moves", "last": last("movements")},
     {"key": "loads", "label": "Loads", "touches": pt.loads,
      "detail": n0(l.dispatches) + " dispatches" + MID + n0(l.pickuporders) + " pickups (" + n0(l.pickupunits) + " units)" + MID +
+               (l.clearedorders > 0 ? n0(l.clearedorders) + " cleared from run (" + n0(l.clearedunits) + " units)" + MID : "") +
                n1(l.manualpct) + "% skipped", "last": last("loads")},
     {"key": "sticker", "label": "Sticker Scan Out", "touches": pt.sticker, "detail": n0(t.sticker.staged) + " orders staged", "last": last("sticker")}
   ]
@@ -109,6 +110,8 @@ fn detail_cols() {
     ["Loads", "Force Completed", fn(u) { return u.loads.forced }, "int", false],
     ["Loads", "Pickup Orders", fn(u) { return u.loads.pickuporders }, "int", false],
     ["Loads", "Pickup Units", fn(u) { return u.loads.pickupunits }, "int", false],
+    ["Loads", "Cleared Orders", fn(u) { return u.loads.clearedorders }, "int", false],
+    ["Loads", "Cleared Units", fn(u) { return u.loads.clearedunits }, "int", false],
     ["Sticker Scan Out", "Touches", part("sticker"), "int", true],
     ["Sticker Scan Out", "Orders Staged", fn(u) { return u.sticker.staged }, "int", false],
     ["Sticker Scan Out", "Orders Packed", fn(u) { return u.sticker.packed }, "int", false],
