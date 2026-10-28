@@ -127,8 +127,9 @@ let COMPUTE_ON = env("WAREHOUSE_COMPUTE_ON", "")
 
 // The viewer's own page: the range (the PHP report's default, the last 30 days) and the table's sort.
 let default_range = report_range(nil, nil)
-// view: the timeline's tab (hours, days, heat); span: the hours picked; days: the run of days picked in the range
-let state = {"start": default_range[0], "stop": default_range[1], "view": "hours", "span": nil, "days": nil,
+// view: the timeline's tab (hours, days, heat); table: the panel's, by person or by month; span: the hours picked; days: the run of days picked in the range
+// paused / held: whether the page is paused, and the figures it holds while it is (the "view" below)
+let state = {"start": default_range[0], "stop": default_range[1], "view": "hours", "span": nil, "days": nil, "table": "person", "paused": false, "held": nil,
              "sorter": {"col": 2, "dir": "desc"}}
 
 ui.pane({
@@ -141,14 +142,21 @@ ui.pane({
   // globals, and a connection kept in a global (get_db's db_conn) cannot be copied to them
   // (a page that cannot read its data says so rather than failing: a new version starts before its deploy hook has
   // made the Thing it reads, and ASQL may be restarting)
+  // Paused: a page narrowed to hours or days, or on a range that ended before today, keeps the figures it read
+  // (state.held) while the Thing changes - they move only when the viewer changes the range, the hours, the days or
+  // the tab, or presses Refresh (which drops state.held). A range that runs to today with nothing picked stays live.
   "view": fn() {
+    state.paused = state.span != nil or state.days != nil or state.stop < date_format(now(), "%Y-%m-%d")
+    let key = json_stringify([state.start, state.stop, state.span, state.days, state.view, state.table])
+    if state.paused and state.held != nil and state.held.key == key { return dashboard_node(state.held.report, state) }
     let c = db_connect(DB_CFG)
-    let got = c.ok ? pcall(fetch_for_page, c, state.start, state.stop, state.span, state.days, state.view) : {"ok": false, "error": c.error}
+    let got = c.ok ? pcall(fetch_for_page, c, state.start, state.stop, state.span, state.days, state.view, state.table) : {"ok": false, "error": c.error}
     if c.ok { db_close(c) }
     if not got.ok {
       return el("div", {"class": "page"}, el("h1", "Warehouse Activity"),
                 el("p", {"class": "note"}, "The report is not available yet (" + str(got.error) + "). This page shows it when it is."))
     }
+    state.held = state.paused ? {"key": key, "report": got.value} : nil
     return dashboard_node(got.value, state)
   },
   // Live: the engine wakes the pane when the touch_hour Thing changes (WAIT THING, on a connection of its own);

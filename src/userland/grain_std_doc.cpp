@@ -91,10 +91,27 @@ std::string xml_escape(const std::string& s) {
   return o;
 }
 
+// The cell styles (styles.xml's cellXfs): 20 kinds, then each again with a left edge (a section's first column),
+// "<kind>_edge" - ids 20 to 39.
+constexpr int kXlsxKinds = 20;
+
 int resolve_style_id(const Value& s_val) {
-  if (s_val.type == Type::Int) return (int)s_val.as_int();
+  if (s_val.type == Type::Int) {
+    const long long id = s_val.as_int();
+    return id >= 0 && id < 2 * kXlsxKinds ? (int)id : 0;
+  }
   if (s_val.type == Type::Str) {
     const std::string& s = s_val.str();
+    const std::string edge = "_edge";
+    if (s.size() > edge.size() && s.compare(s.size() - edge.size(), edge.size(), edge) == 0) {
+      return kXlsxKinds + resolve_style_id(Value::string(s.substr(0, s.size() - edge.size())));
+    }
+    if (s == "count") return 16;          // a whole number, a zero shown as a dash
+    if (s == "total_count") return 17;
+    if (s == "contrib_count") return 18;
+    if (s == "total_contrib_count") return 19;
+    if (s == "note") return 14;
+    if (s == "bold" || s == "label") return 15;
     if (s == "plain" || s == "normal") return 0;
     if (s == "section" || s == "section_header") return 1;
     if (s == "header" || s == "col_header") return 2;
@@ -239,8 +256,38 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
   // A page holds printable_h of paper: in layout units, that divided by the scale.
   const int page_span = std::max(1, (int)((double)printable_h / scale));
 
-  int num_pages = (doc.content_height + page_span - 1) / page_span;
-  if (num_pages < 1) num_pages = 1;
+  using Kind = userland::web::Fragment::Kind;
+
+  // Page breaks: a page holds up to page_span of the layout and ends above any line of text or small box (a table
+  // row's background, a cell's border) that would cross its bottom, so a row goes whole to the next page instead of
+  // being drawn into the footer. Boxes taller than a quarter page (a whole table's) may still cross.
+  std::vector<int> breaks{0};
+  const int small = std::max(1, page_span / 4);
+  while (breaks.back() < doc.content_height) {
+    const int start = breaks.back();
+    int end = start + page_span;
+    for (bool moved = true; moved;) {
+      moved = false;
+      for (const auto& f : doc.fragments) {
+        const int fh = f.h > 0 ? f.h : (f.kind == Kind::Text ? m.line_height(f.font) : 0);
+        if (fh <= 0 || fh > small) continue;
+        if (f.y > start && f.y < end && f.y + fh > end) { end = f.y; moved = true; }
+      }
+    }
+    breaks.push_back(end);
+  }
+  // A last page holding only the layout's trailing space (a body's padding, a margin) is not a page: drop it.
+  auto has_ink = [&doc](int from, int to) {
+    for (const auto& f : doc.fragments) {
+      if (f.y < from || f.y >= to) continue;
+      if (f.kind == Kind::Text && !f.text.empty()) return true;
+      if ((f.kind == Kind::Rect || f.kind == Kind::Rule || f.kind == Kind::Border) && (f.color >> 24) != 0 && (f.color & 0xFFFFFF) != 0xFFFFFF)
+        return true;
+    }
+    return false;
+  };
+  while (breaks.size() > 2 && !has_ink(breaks[breaks.size() - 2], breaks.back())) breaks.pop_back();
+  int num_pages = std::max(1, (int)breaks.size() - 1);
   auto num = [](double v) {
     char b[32];
     std::snprintf(b, sizeof b, "%.2f", v);
@@ -250,11 +297,9 @@ Value bi_pdf_render(Vm&, std::vector<Value>& args, std::string& error) {
   std::vector<std::string> page_streams;
   page_streams.reserve(num_pages);
 
-  using Kind = userland::web::Fragment::Kind;
-
   for (int p = 0; p < num_pages; ++p) {
-    int y_start = p * page_span;
-    int y_end = (p + 1) * page_span;
+    int y_start = p < (int)breaks.size() ? breaks[p] : 0;
+    int y_end = p + 1 < (int)breaks.size() ? breaks[p + 1] : page_span;
 
     std::ostringstream s;
     // Base white canvas
@@ -806,21 +851,25 @@ Value bi_doc_parse_csv(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 // ---- Native: xlsx_create(spec) ----------------------------------------------
-Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
-  if (args.empty()) {
-    error = "xlsx_create() requires 1 argument (spec map or rows list)";
-    return Value::nil();
-  }
 
-  std::string sheet_name = "Sheet1";
+// One worksheet of a workbook: its tab name and its sheetN.xml.
+struct XlsxSheet {
+  std::string name;
+  std::string xml;
+};
+
+// A sheet from its spec: a list of rows (or of records), or a map {sheet, rows | records, columns, freeze_pane,
+// merges, col_widths}. false (and error set) when the spec is not one.
+bool xlsx_sheet(const Value& spec, const std::string& fallback_name, XlsxSheet& out, std::string& error) {
+  std::string sheet_name = fallback_name;
   std::string freeze_pane = "";
   std::vector<std::string> merges;
   std::vector<double> col_widths;
   std::vector<Value> rows;
   std::vector<std::string> cols;
 
-  if (args[0].type == Type::List) {
-    const auto& list = args[0].list_items();
+  if (spec.type == Type::List) {
+    const auto& list = spec.list_items();
     if (!list.empty() && list[0].type == Type::Map) {
       auto first_m = as_map(list[0]);
       for (const auto& kv : first_m->entries) cols.push_back(kv.first);
@@ -837,8 +886,8 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
     } else {
       rows = list;
     }
-  } else if (args[0].type == Type::Map) {
-    auto m = as_map(args[0]);
+  } else if (spec.type == Type::Map) {
+    auto m = as_map(spec);
     if (Value* s = m->find("sheet")) sheet_name = s->to_text();
     else if (Value* t = m->find("title")) sheet_name = t->to_text();
     else if (Value* n = m->find("name")) sheet_name = n->to_text();
@@ -851,7 +900,7 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
             const auto& q = it.list_items();
             if (q.size() != 4 || !std::all_of(q.begin(), q.end(), [](const Value& x) { return x.type == Type::Int && x.i >= 1; })) {
               error = "xlsx_create(): a merge is \"A1:C1\" or [first_row, first_col, last_row, last_col], each from 1";
-              return Value::nil();
+              return false;
             }
             merges.push_back(excel_col_name((int)q[1].i - 1) + std::to_string(q[0].i) + ":" + excel_col_name((int)q[3].i - 1) +
                              std::to_string(q[2].i));
@@ -860,7 +909,7 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
           const std::string ref = it.to_text();
           if (ref.empty() || !std::all_of(ref.begin(), ref.end(), [](char c) { return std::isalnum((unsigned char)c) || c == ':'; })) {
             error = "xlsx_create(): \"" + ref + "\" is not a cell range";
-            return Value::nil();
+            return false;
           }
           merges.push_back(ref);
         }
@@ -894,9 +943,16 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
       }
     }
   } else {
-    error = "xlsx_create() argument must be a map or a list of rows";
-    return Value::nil();
+    error = "xlsx_create(): a sheet is a map or a list of rows";
+    return false;
   }
+
+  // Excel's rule for a tab name: 1 to 31 characters, none of : \ / ? * [ ]
+  if (sheet_name.empty() || sheet_name.size() > 31 || sheet_name.find_first_of(":\\/?*[]") != std::string::npos) {
+    error = "xlsx_create(): \"" + sheet_name + "\" is not a sheet name (1 to 31 characters, none of : \\ / ? * [ ])";
+    return false;
+  }
+  out.name = sheet_name;
 
   // Prepend styled header row if columns specified
   if (!cols.empty()) {
@@ -1025,23 +1081,66 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
     merges_xml += "</mergeCells>";
   }
 
-  std::string sheet1_xml =
+  out.xml =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
       "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
       "<sheetPr><pageSetUpPr fitToPage=\"1\"/></sheetPr>" +
       views_xml + cols_xml + "<sheetData>" + sheet_data + "</sheetData>" + merges_xml +
       "<pageSetup orientation=\"landscape\" fitToWidth=\"1\" fitToHeight=\"0\"/></worksheet>";
+  return true;
+}
 
-  // OpenXML Stylesheet
-  const char* kStylesXml =
+// styles.xml: the 20 kinds of cell resolve_style_id names, then each with a section's left edge.
+std::string xlsx_styles_xml() {
+  // numFmt, font, fill, border (0 none, 1 top: a totals row), alignment
+  struct Kind { int fmt, font, fill, border; const char* align; };
+  static const Kind kinds[kXlsxKinds] = {
+      {0, 0, 0, 0, nullptr},                                          // 0 plain
+      {0, 2, 2, 0, "<alignment horizontal=\"center\" vertical=\"center\"/>"},  // 1 section
+      {0, 1, 5, 0, "<alignment horizontal=\"center\" wrapText=\"1\"/>"},       // 2 header
+      {0, 1, 3, 0, "<alignment horizontal=\"center\" wrapText=\"1\"/>"},       // 3 contrib_header
+      {3, 0, 0, 0, nullptr},                                          // 4 int
+      {164, 0, 0, 0, nullptr},                                        // 5 dec
+      {3, 0, 4, 0, nullptr},                                          // 6 contrib_int
+      {164, 0, 4, 0, nullptr},                                        // 7 contrib_dec
+      {0, 1, 5, 1, nullptr},                                          // 8 total text
+      {3, 1, 5, 1, nullptr},                                          // 9 total int
+      {164, 1, 5, 1, nullptr},                                        // 10 total dec
+      {3, 1, 6, 1, nullptr},                                          // 11 total contrib int
+      {164, 1, 6, 1, nullptr},                                        // 12 total contrib dec
+      {0, 3, 0, 0, nullptr},                                          // 13 title
+      {0, 4, 0, 0, nullptr},                                          // 14 note
+      {0, 1, 0, 0, nullptr},                                          // 15 bold
+      {165, 0, 0, 0, nullptr},                                        // 16 count
+      {165, 1, 5, 1, nullptr},                                        // 17 total count
+      {165, 0, 4, 0, nullptr},                                        // 18 contrib count
+      {165, 1, 6, 1, nullptr},                                        // 19 total contrib count
+  };
+  std::string xfs;
+  for (int edge = 0; edge < 2; ++edge) {
+    for (const Kind& k : kinds) {
+      // borders 2 and 3: the left edge, without and with the totals' top line
+      const int border = edge ? (k.border == 1 ? 3 : 2) : k.border;
+      xfs += "    <xf numFmtId=\"" + std::to_string(k.fmt) + "\" fontId=\"" + std::to_string(k.font) + "\" fillId=\"" +
+             std::to_string(k.fill) + "\" borderId=\"" + std::to_string(border) + "\"";
+      if (k.fmt) xfs += " applyNumberFormat=\"1\"";
+      if (k.font) xfs += " applyFont=\"1\"";
+      if (k.fill) xfs += " applyFill=\"1\"";
+      if (border) xfs += " applyBorder=\"1\"";
+      xfs += k.align ? std::string(" applyAlignment=\"1\">") + k.align + "</xf>\n" : std::string("/>\n");
+    }
+  }
+  return std::string(
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
       "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n"
-      "  <numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.0\"/></numFmts>\n"
-      "  <fonts count=\"4\">\n"
+      "  <numFmts count=\"2\"><numFmt numFmtId=\"164\" formatCode=\"#,##0.0\"/>"
+      "<numFmt numFmtId=\"165\" formatCode=\"#,##0;-#,##0;&quot;\u2013&quot;\"/></numFmts>\n"
+      "  <fonts count=\"5\">\n"
       "    <font><sz val=\"10\"/><name val=\"Arial\"/></font>\n"
       "    <font><b/><sz val=\"10\"/><name val=\"Arial\"/></font>\n"
       "    <font><b/><sz val=\"10\"/><color rgb=\"FFFFFFFF\"/><name val=\"Arial\"/></font>\n"
       "    <font><b/><sz val=\"13\"/><name val=\"Arial\"/></font>\n"
+      "    <font><i/><sz val=\"9\"/><color rgb=\"FF6B7480\"/><name val=\"Arial\"/></font>\n"
       "  </fonts>\n"
       "  <fills count=\"7\">\n"
       "    <fill><patternFill patternType=\"none\"/></fill>\n"
@@ -1052,37 +1151,73 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
       "    <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFEEEEEE\"/><bgColor indexed=\"64\"/></patternFill></fill>\n"
       "    <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFFFE699\"/><bgColor indexed=\"64\"/></patternFill></fill>\n"
       "  </fills>\n"
-      "  <borders count=\"2\">\n"
+      "  <borders count=\"4\">\n"
       "    <border><left/><right/><top/><bottom/><diagonal/></border>\n"
       "    <border><left/><right/><top style=\"thin\"><color rgb=\"FF888888\"/></top><bottom/><diagonal/></border>\n"
+      "    <border><left style=\"medium\"><color rgb=\"FF2B323A\"/></left><right/><top/><bottom/><diagonal/></border>\n"
+      "    <border><left style=\"medium\"><color rgb=\"FF2B323A\"/></left><right/><top style=\"thin\"><color rgb=\"FF888888\"/></top><bottom/><diagonal/></border>\n"
       "  </borders>\n"
       "  <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\n"
-      "  <cellXfs count=\"14\">\n"
-      "    <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/>\n"                                                // 0 plain
-      "    <xf numFmtId=\"0\" fontId=\"2\" fillId=\"2\" borderId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\" vertical=\"center\"/></xf>\n" // 1 section
-      "    <xf numFmtId=\"0\" fontId=\"1\" fillId=\"5\" borderId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\"/></xf>\n"                   // 2 header
-      "    <xf numFmtId=\"0\" fontId=\"1\" fillId=\"3\" borderId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\"/></xf>\n"                   // 3 contrib_header
-      "    <xf numFmtId=\"3\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>\n"                          // 4 int
-      "    <xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>\n"                        // 5 dec
-      "    <xf numFmtId=\"3\" fontId=\"0\" fillId=\"4\" borderId=\"0\" applyNumberFormat=\"1\" applyFill=\"1\"/>\n"          // 6 contrib_int
-      "    <xf numFmtId=\"164\" fontId=\"0\" fillId=\"4\" borderId=\"0\" applyNumberFormat=\"1\" applyFill=\"1\"/>\n"        // 7 contrib_dec
-      "    <xf numFmtId=\"0\" fontId=\"1\" fillId=\"5\" borderId=\"1\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\n" // 8 total text
-      "    <xf numFmtId=\"3\" fontId=\"1\" fillId=\"5\" borderId=\"1\" applyNumberFormat=\"1\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\n" // 9 total int
-      "    <xf numFmtId=\"164\" fontId=\"1\" fillId=\"5\" borderId=\"1\" applyNumberFormat=\"1\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\n" // 10 total dec
-      "    <xf numFmtId=\"3\" fontId=\"1\" fillId=\"6\" borderId=\"1\" applyNumberFormat=\"1\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\n" // 11 total contrib int
-      "    <xf numFmtId=\"164\" fontId=\"1\" fillId=\"6\" borderId=\"1\" applyNumberFormat=\"1\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\n" // 12 total contrib dec
-      "    <xf numFmtId=\"0\" fontId=\"3\" fillId=\"0\" borderId=\"0\" applyFont=\"1\"/>\n"                                // 13 title
+      "  <cellXfs count=\"") + std::to_string(2 * kXlsxKinds) + "\">\n" + xfs +
       "  </cellXfs>\n"
       "  <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\n"
       "</styleSheet>";
+}
 
-  const char* kContentTypes =
+// xlsx_create(spec): one sheet (a list of rows or records, or a map {sheet, rows, ...}), or a workbook of several -
+// {"sheets": [sheet spec, ...]}, in tab order.
+Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args.empty()) {
+    error = "xlsx_create() requires 1 argument (spec map or rows list)";
+    return Value::nil();
+  }
+  std::vector<XlsxSheet> sheets;
+  Value* many = args[0].type == Type::Map ? as_map(args[0])->find("sheets") : nullptr;
+  if (many != nullptr) {
+    if (many->type != Type::List || many->list_items().empty()) {
+      error = "xlsx_create(): sheets is a list of one or more sheets";
+      return Value::nil();
+    }
+    for (const auto& one : many->list_items()) {
+      XlsxSheet sh;
+      if (!xlsx_sheet(one, "Sheet" + std::to_string(sheets.size() + 1), sh, error)) return Value::nil();
+      for (const auto& had : sheets) {
+        auto lower = [](std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; };
+        if (lower(had.name) == lower(sh.name)) {
+          error = "xlsx_create(): two sheets are named \"" + sh.name + "\"";
+          return Value::nil();
+        }
+      }
+      sheets.push_back(std::move(sh));
+    }
+  } else {
+    if (args[0].type != Type::Map && args[0].type != Type::List) {
+      error = "xlsx_create() argument must be a map or a list of rows";
+      return Value::nil();
+    }
+    XlsxSheet sh;
+    if (!xlsx_sheet(args[0], "Sheet1", sh, error)) return Value::nil();
+    sheets.push_back(std::move(sh));
+  }
+
+  std::string types_sheets, book_sheets, book_rels;
+  for (size_t i = 0; i < sheets.size(); ++i) {
+    const std::string n = std::to_string(i + 1);
+    types_sheets += "  <Override PartName=\"/xl/worksheets/sheet" + n +
+                    ".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n";
+    book_sheets += "<sheet name=\"" + xml_escape(sheets[i].name) + "\" sheetId=\"" + n + "\" r:id=\"rId" + n + "\"/>";
+    book_rels += "  <Relationship Id=\"rId" + n +
+                 "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet" + n + ".xml\"/>\n";
+  }
+  const std::string styles_rel = "rId" + std::to_string(sheets.size() + 1);
+
+  const std::string content_types =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
       "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n"
       "  <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n"
       "  <Default Extension=\"xml\" ContentType=\"application/xml\"/>\n"
-      "  <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n"
-      "  <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n"
+      "  <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n" +
+      types_sheets +
       "  <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\n"
       "</Types>";
 
@@ -1092,17 +1227,16 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
       "  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\n"
       "</Relationships>";
 
-  std::string workbook_xml =
+  const std::string workbook_xml =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
       "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n"
-      "  <sheets><sheet name=\"" + xml_escape(sheet_name) + "\" sheetId=\"1\" r:id=\"rId1\"/></sheets>\n"
+      "  <sheets>" + book_sheets + "</sheets>\n"
       "</workbook>";
 
-  const char* kWorkbookRels =
+  const std::string workbook_rels =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n"
-      "  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>\n"
-      "  <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\n"
+      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n" + book_rels +
+      "  <Relationship Id=\"" + styles_rel + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\n"
       "</Relationships>";
 
   auto str_to_buf = [](const std::string& str) {
@@ -1110,13 +1244,15 @@ Value bi_xlsx_create(Vm&, std::vector<Value>& args, std::string& error) {
   };
 
   std::vector<ArchiveEntry> entries = {
-      {"[Content_Types].xml", str_to_buf(kContentTypes), 0644, false},
+      {"[Content_Types].xml", str_to_buf(content_types), 0644, false},
       {"_rels/.rels", str_to_buf(kRels), 0644, false},
       {"xl/workbook.xml", str_to_buf(workbook_xml), 0644, false},
-      {"xl/_rels/workbook.xml.rels", str_to_buf(kWorkbookRels), 0644, false},
-      {"xl/worksheets/sheet1.xml", str_to_buf(sheet1_xml), 0644, false},
-      {"xl/styles.xml", str_to_buf(kStylesXml), 0644, false},
+      {"xl/_rels/workbook.xml.rels", str_to_buf(workbook_rels), 0644, false},
   };
+  for (size_t i = 0; i < sheets.size(); ++i) {
+    entries.push_back({"xl/worksheets/sheet" + std::to_string(i + 1) + ".xml", str_to_buf(sheets[i].xml), 0644, false});
+  }
+  entries.push_back({"xl/styles.xml", str_to_buf(xlsx_styles_xml()), 0644, false});
 
   ByteBuffer zip = zip_create(entries, 6);
   std::vector<uint8_t> out(zip.begin(), zip.end());

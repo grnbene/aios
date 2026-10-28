@@ -96,7 +96,29 @@ fn fetch_warehouse_touches(db, start_in, stop_in, userids, span) {
   let report = merge_rows(db, rows, dates[0], dates[1])
   report.hours = span
   report.hour = span != nil and span.from == span.to ? span.from : nil   // the PHP page's one hour
+  report.months = month_reports(rows, dates[0], dates[1])
+  report.as_of = date_format(now(), "%Y-%m-%d %H:%M:%S")
   return report
+}
+
+// The calendar months a range covers, each cut to the range: [{month "2026-01", from, to}].
+fn range_months(start_date, stop_date) {
+  let out = []
+  for d in date_range(start_date, stop_date) {
+    let m = slice(d, 0, 7)
+    if len(out) == 0 or out[len(out) - 1].month != m { push(out, {"month": m, "from": d, "to": d}) } else { out[len(out) - 1].to = d }
+  }
+  return out
+}
+
+// The range month by month: each month's own report from its hours (merge_rows), so what is counted once - an
+// order, a vendor, a person, a day - is counted once within that month. Names are left out (the range's report has
+// them).
+fn month_reports(rows, start_date, stop_date) {
+  let by_month = group_by(rows, fn(r) { return slice(r.day, 0, 7) })
+  return map(range_months(start_date, stop_date), fn(m) {
+    return merge(m, merge_rows(nil, by_month[m.month] ?? [], m.from, m.to))
+  })
 }
 
 fn in_days(sel, day) { return sel == nil or (day >= sel.from and day <= sel.to) }
@@ -107,7 +129,7 @@ fn in_days(sel, day) { return sel == nil or (day >= sel.from and day <= sel.to) 
 //   "days":  days, each day of the range over the hours picked
 //   "heat":  heat, each hour of each day of the range
 // All from one read of the range's hours; only the view asked for is worked out.
-fn fetch_for_page(db, start_in, stop_in, span, sel_days, view) {
+fn fetch_for_page(db, start_in, stop_in, span, sel_days, view, table) {
   let dates = report_range(start_in, stop_in)
   let rows = touch_hours(db, dates[0], dates[1], nil)
   let sel = sel_days != nil and sel_days.from >= dates[0] and sel_days.to <= dates[1] ? sel_days : nil
@@ -130,11 +152,19 @@ fn fetch_for_page(db, start_in, stop_in, span, sel_days, view) {
     let by_hour = group_by(filter(rows, fn(r) { return in_days(sel, r.day) }), fn(r) { return r.h })
     report.profile = map(range(0, 24), fn(h) { return merge({"hour": h}, figures(by_hour[str(h)] ?? [])) })
   }
+  if table == "month" {
+    // the By Month table: each month of the range over the hours picked: its touches, by source, and how many people and days
+    report.months = map(month_reports(filter(rows, fn(r) { return in_span(span, r.h) }), dates[0], dates[1]), fn(m) {
+      return {"month": m.month, "from": m.from, "to": m.to, "touches": m.totals.touches, "parts": m.totals.parts,
+              "people": len(m.users), "active_days": m.totals.active_days, "touches_per_day": m.totals.touches_per_day}
+    })
+  }
   report.hours = span
   report.hour = span != nil and span.from == span.to ? span.from : nil
   report.sel_days = sel
   report.range_start = dates[0]
   report.range_stop = dates[1]
+  report.as_of = date_format(now(), "%Y-%m-%d %H:%M:%S")
   return report
 }
 

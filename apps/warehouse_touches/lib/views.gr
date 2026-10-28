@@ -21,184 +21,279 @@ fn day_text(d) {
   return date_parse(s, {"or": nil}) == nil ? s : date_format(s, "%b %-d, %Y")
 }
 
-// '2026-10-27 08:20:11' as '10-27 08:20', the exports' first / last columns
-fn short_time(ts) { return is_blank(ts) ? "" : slice(str(ts), 5, 16) }
 
-// ---- The report's columns: the PDF and the XLSX -------------------------------------------------------------
+// ---- The exports: the PDF, the Excel and the CSV --------------------------------------------------------------
+//
+// One page: Summary (the page's cards), By Month and By Person - every figure a touch count, each row's areas adding
+// up to its Total and each Total row the cards' figures. The Excel adds Person by Month and Detail by Person.
 
-// The PHP report's sections (quickReportColumns): the first column of each section counts toward touches.
-// Each column: [header, counts toward touches, value of a user (or the totals), format "int" | "dec" | "text", width
-// in the XLSX].
-fn report_columns(report) {
-  let grand = report.totals.touches > 0 ? real(report.totals.touches) : 1.0
-  let mv = fn(u, t) { return get_in(u.movements.by_type, [t, "qty"], 0) }
+// The five areas a touch comes from, in column order: [source key, name].
+let AREAS = [["receiving", "Receiving"], ["picking", "Picking"], ["movements", "Bin Moves"], ["loads", "Loads"], ["sticker", "Sticker Scan Out"]]
+
+// "Sep 29 – Oct 28, 2026 · All hours" / "· 7:00am – 11:59am"
+fn filter_text(report) {
+  let a = report.start
+  let b = report.stop
+  let days = a == b ? date_format(a, "%b %-d, %Y")
+                    : date_format(a, slice(a, 0, 4) == slice(b, 0, 4) ? "%b %-d" : "%b %-d, %Y") + " \u{2013} " + date_format(b, "%b %-d, %Y")
+  return days + MID + (report.hours == nil ? "All hours" : span_label(report.hours))
+}
+fn as_of_text(report) { return "As of " + date_format(report.as_of, "%b %-d, %Y %-I:%M %p") }
+
+// "Oct 2026", or "Sep 2026 (29–30)" for a month the range covers only part of.
+fn month_text(m) {
+  let first = slice(m.from, 0, 8) + "01"
+  let whole = m.from == first and day_add(m.to, 1) == date_format(day_add(first, 32), "%Y-%m") + "-01"
+  let name = date_format(m.from, "%b %Y")
+  return whole ? name : name + " (" + date_format(m.from, "%-d") + "\u{2013}" + date_format(m.to, "%-d") + ")"
+}
+
+// The cards (the page's and the Summary's): area, touches, detail, last touch. rep: a report.
+fn card_lines(rep) {
+  let t = rep.totals
+  let pt = source_parts(t)
+  let lasts = rep.lasts ?? {}
+  let last = fn(src) {
+    let at = src != nil ? lasts[src] : (len(lasts) == 0 ? nil : max(values(lasts)))
+    return at == nil ? "" : when(at)
+  }
+  let l = t.loads
   return [
-    ["Receiving", [["Qty In", true, fn(u) { return u.receiving.qty_in }, "int", 10.0],
-                   ["Qty Out", true, fn(u) { return u.receiving.qty_out }, "int", 10.0],
-                   ["Scan Rows", false, fn(u) { return u.receiving.scans }, "int", 10.0]]],
-    ["Picking", [["Units", true, fn(u) { return u.picking.qty }, "int", 10.0],
-                 ["Orders", false, fn(u) { return u.picking.orders }, "int", 10.0],
-                 ["Lines", false, fn(u) { return u.picking.lines }, "int", 10.0]]],
-    ["Bin Movements", [["Qty", true, fn(u) { return u.movements.qty }, "int", 10.0],
-                       ["Moves", false, fn(u) { return u.movements.moves }, "int", 10.0],
-                       ["Item Qty", false, fn(u) { return mv(u, "item move") }, "int", 10.0],
-                       ["Dolly Qty", false, fn(u) { return mv(u, "dolly move") }, "int", 10.0],
-                       ["Merge Qty", false, fn(u) { return mv(u, "merge") }, "int", 10.0]]],
-    ["Loads", [["Units", true, fn(u) { return u.loads.scans }, "int", 10.0],
-               ["Orders", false, fn(u) { return u.loads.orders }, "int", 10.0],
-               ["Dispatches", false, fn(u) { return u.loads.dispatches }, "int", 10.0],
-               ["Avg Disp. Units", false, fn(u) { return u.loads.avgdispatchunits }, "dec", 12.0],
-               ["Avg Disp. Min", false, fn(u) { return u.loads.avgloadtime }, "dec", 12.0],
-               ["Skipped", false, fn(u) { return u.loads.manual }, "int", 10.0],
-               ["Skipped %", false, fn(u) { return u.loads.manualpct }, "dec", 10.0],
-               ["Force Comp.", false, fn(u) { return u.loads.forced }, "int", 10.0],
-               ["Pickup Orders", false, fn(u) { return u.loads.pickuporders }, "int", 10.0],
-               ["Pickup Units", false, fn(u) { return u.loads.pickupunits }, "int", 10.0]]],
-    ["Sticker Scan Out", [["Staged Units", true, fn(u) { return u.sticker.stagedunits }, "int", 11.0],
-                          ["Staged Orders", false, fn(u) { return u.sticker.staged }, "int", 11.0],
-                          ["Packed Orders", false, fn(u) { return u.sticker.packed }, "int", 11.0],
-                          ["Packed Units", false, fn(u) { return u.sticker.packedunits }, "int", 11.0],
-                          ["Bound Orders", false, fn(u) { return u.sticker.binds }, "int", 11.0]]],
-    ["Overall", [["Touches", false, fn(u) { return u.touches }, "int", 11.0],
-                 ["Days", false, fn(u) { return u.active_days }, "int", 9.0],
-                 ["Per Day", false, fn(u) { return u.touches_per_day }, "dec", 10.0],
-                 ["%", false, fn(u) { return 100.0 * real(u.touches) / grand }, "dec", 8.0],
-                 ["First", false, fn(u) { return short_time(u.first_touch) }, "text", 12.0],
-                 ["Last", false, fn(u) { return short_time(u.last_touch) }, "text", 12.0]]]
+    {"key": nil, "label": "Total", "touches": t.touches,
+     "detail": n0(len(rep.users)) + " people" + MID + n0(t.active_days) + " active days", "last": last(nil)},
+    {"key": "receiving", "label": "Receiving", "touches": pt.receiving,
+     "detail": n0(t.receiving.qty_in) + " in / " + n0(t.receiving.qty_out) + " out" + MID + n0(t.receiving.scans) + " scans" + MID +
+               n0(t.receiving.vendors) + " vendors", "last": last("receiving")},
+    {"key": "picking", "label": "Picking", "touches": pt.picking,
+     "detail": n0(t.picking.orders) + " orders" + MID + n0(t.picking.lines) + " lines", "last": last("picking")},
+    {"key": "movements", "label": "Bin Moves", "touches": pt.movements, "detail": n0(t.movements.moves) + " moves", "last": last("movements")},
+    {"key": "loads", "label": "Loads", "touches": pt.loads,
+     "detail": n0(l.dispatches) + " dispatches" + MID + n0(l.pickuporders) + " pickups (" + n0(l.pickupunits) + " units)" + MID +
+               n1(l.manualpct) + "% skipped", "last": last("loads")},
+    {"key": "sticker", "label": "Sticker Scan Out", "touches": pt.sticker, "detail": n0(t.sticker.staged) + " orders staged", "last": last("sticker")}
   ]
 }
 
-// A value as the PHP report prints it: whole numbers with thousands, one decimal (blank when zero), or text.
-fn column_text(value, format) {
-  if format == "text" { return value }
-  if format == "dec" { return value == nil or real(value) == 0.0 ? "" : n1(value) }
-  return n0(value)
+// A row's figures, as the By Month and By Person tables show them: Total, each area, Days, Per Day.
+fn touch_figures(rec) {
+  let p = source_parts(rec)
+  return concat([rec.touches], map(AREAS, fn(a) { return p[a[0]] }), [rec.active_days, rec.touches_per_day])
+}
+let FIGURE_HEADS = concat(["Total"], map(AREAS, fn(a) { return a[1] }), ["Days", "Per Day"])
+
+// "–" for nothing, as the PDF prints a count
+fn count_text(v) { return v == nil or real(v) == 0.0 ? "\u{2013}" : n0(v) }
+
+// The Detail by Person columns, by area: [area, header, value of a user (or the totals), format, counts toward Total
+// Touches]. Each area's Touches column is what it adds to Total Touches; the columns after it are the work behind it.
+fn detail_cols() {
+  let part = fn(k) { return fn(u) { return source_parts(u)[k] } }
+  return [
+    ["Total", "Total Touches", fn(u) { return u.touches }, "int", true],
+    ["Receiving", "Touches", part("receiving"), "int", true],
+    ["Receiving", "In", fn(u) { return u.receiving.qty_in }, "int", false],
+    ["Receiving", "Out", fn(u) { return u.receiving.qty_out }, "int", false],
+    ["Receiving", "Scans", fn(u) { return u.receiving.scans }, "int", false],
+    ["Receiving", "Vendors", fn(u) { return u.receiving.vendors }, "int", false],
+    ["Picking", "Touches", part("picking"), "int", true],
+    ["Picking", "Orders", fn(u) { return u.picking.orders }, "int", false],
+    ["Picking", "Lines", fn(u) { return u.picking.lines }, "int", false],
+    ["Bin Moves", "Touches", part("movements"), "int", true],
+    ["Bin Moves", "Moves", fn(u) { return u.movements.moves }, "int", false],
+    ["Loads", "Touches", part("loads"), "int", true],
+    ["Loads", "Dispatches", fn(u) { return u.loads.dispatches }, "int", false],
+    ["Loads", "Units per Dispatch", fn(u) { return u.loads.avgdispatchunits }, "dec", false],
+    ["Loads", "Minutes per Dispatch", fn(u) { return u.loads.avgloadtime }, "dec", false],
+    ["Loads", "Skipped Scans", fn(u) { return u.loads.manual }, "int", false],
+    ["Loads", "Skipped %", fn(u) { return u.loads.manualpct }, "dec", false],
+    ["Loads", "Force Completed", fn(u) { return u.loads.forced }, "int", false],
+    ["Loads", "Pickup Orders", fn(u) { return u.loads.pickuporders }, "int", false],
+    ["Loads", "Pickup Units", fn(u) { return u.loads.pickupunits }, "int", false],
+    ["Sticker Scan Out", "Touches", part("sticker"), "int", true],
+    ["Sticker Scan Out", "Orders Staged", fn(u) { return u.sticker.staged }, "int", false],
+    ["Sticker Scan Out", "Orders Packed", fn(u) { return u.sticker.packed }, "int", false],
+    ["Sticker Scan Out", "Units Packed", fn(u) { return u.sticker.packedunits }, "int", false],
+    ["Sticker Scan Out", "Bound Orders", fn(u) { return u.sticker.binds }, "int", false],
+    ["Time", "First Touch", fn(u) { return when(u.first_touch) }, "text", false],
+    ["Time", "Last Touch", fn(u) { return when(u.last_touch) }, "text", false]
+  ]
 }
 
-// The PDF: the PHP report's quickReportHtml table and quickReportCss, Letter landscape, title in the page header.
+fn person_name(u) { return first_present(u.name, u.userid) }
+
+// ---- PDF ----------------------------------------------------------------------------------------------------
+
 fn render_pdf_report(report) {
   let css = join([
-    "table.touches { border-collapse: collapse; width: 100%; font-size: 6.5pt; }",
-    "table.touches th { background-color: #dddddd; border: 0.2mm solid #888888; padding: 0.8mm; text-align: center; }",
-    "table.touches th.contrib { background-color: #ffd966; }",
-    "table.touches td { border: 0.2mm solid #888888; padding: 0.8mm; text-align: right; }",
-    "table.touches td.l { text-align: left; }",
-    "table.touches td.t { white-space: nowrap; font-size: 6pt; }",
-    "table.touches td.contrib { background-color: #fff2cc; }",
-    "table.touches tr.total td { background-color: #eeeeee; font-weight: bold; }",
-    "table.touches tr.total td.contrib { background-color: #ffe699; }",
-    "div.key { font-size: 8pt; margin-bottom: 2mm; }",
-    "span.swatch { display: inline-block; width: 4mm; height: 2.5mm; vertical-align: middle; background-color: #ffd966; border: 0.2mm solid #888888; }"
+    "body { font-family: Helvetica; color: #1d2228; }",
+    "h1 { font-size: 17pt; margin: 0 0 1mm 0; }",
+    "div.range { font-size: 10pt; color: #1d2228; margin-bottom: 0.5mm; }",
+    "div.asof { font-size: 8pt; color: #6b7480; margin-bottom: 3mm; }",
+    "h2 { font-size: 9pt; text-transform: uppercase; letter-spacing: 0.6pt; color: #1e3a5f; margin: 5mm 0 1.5mm 0; padding-bottom: 0.8mm; border-bottom: 0.4mm solid #1e3a5f; }",
+    "table { border-collapse: collapse; width: 100%; font-size: 8pt; }",
+    "th { background-color: #eef1f5; color: #1d2228; font-weight: bold; padding: 1.4mm 2mm; text-align: right; border-bottom: 0.3mm solid #1e3a5f; }",
+    "td { padding: 1.1mm 2mm; text-align: right; border-bottom: 0.15mm solid #dde1e7; }",
+    "th.l, td.l { text-align: left; }",
+    "td.rank { color: #6b7480; width: 6mm; }",
+    "td.muted { color: #6b7480; }",
+    "tr.alt td { background-color: #f7f8fa; }",
+    "tr.total td { font-weight: bold; background-color: #eef1f5; border-top: 0.3mm solid #1e3a5f; border-bottom: 0.3mm solid #1e3a5f; }"
   ], " ")
-  let sections = report_columns(report)
-  let row = fn(u, cls, name) {
-    let cells = [el("td", {"class": "l"}, name)]
-    for sec in sections {
-      for col in sec[1] {
-        push(cells, el("td", {"class": [col[3] == "text" ? "t" : nil, col[1] ? "contrib" : nil]}, column_text(col[2](u), col[3])))
-      }
-    }
-    return el("tr", {"class": cls}, cells)
+  let head = fn(cells) { return el("tr", map(cells, fn(c) { return el("th", {"class": c[1] ? "l" : nil}, c[0]) })) }
+  let figure_cells = fn(rec) {
+    let f = touch_figures(rec)
+    return map(enumerate(f), fn(pair) { return el("td", pair[0] == len(f) - 1 ? n1(pair[1]) : count_text(pair[1])) })
   }
-  let body = map(report.users, fn(u) { return row(u, nil, u.userid) })
-  push(body, row(report.totals, "total", "All users"))
-  let page = [
-    el("div", {"class": "key"}, el("span", {"class": "swatch"}, NBSP + NBSP + NBSP), " Highlighted columns count toward total touches (units)"),
-    el("table", {"class": "touches"},
-       el("thead",
-          el("tr", el("th", {"rowspan": 2}, "User"),
-             map(sections, fn(sec) { return el("th", {"colspan": len(sec[1])}, sec[0]) })),
-          el("tr", map(flatten(map(sections, fn(sec) { return sec[1] })),
-                       fn(col) { return el("th", {"class": col[1] ? "contrib" : nil}, col[0]) }))),
-       el("tbody", body))
-  ]
-  // mPDF('', 'Letter-L', 0, '', 8, 8, 18, 12, 6, 6): margins in mm, as points
+  let alt = fn(i) { return i % 2 == 1 ? "alt" : nil }
+  let lines = card_lines(report)
+  let summary = el("table",
+    head([["Area", true], ["Touches", false], ["Detail", true], ["Last Touch", true]]),
+    map(enumerate(filter(lines, fn(x) { return x.key != nil })), fn(pair) {
+      let line = pair[1]
+      return el("tr", {"class": alt(pair[0])}, el("td", {"class": "l"}, line.label), el("td", n0(line.touches)),
+                el("td", {"class": "l"}, line.detail), el("td", {"class": "l muted"}, line.last))
+    }),
+    map(filter(lines, fn(x) { return x.key == nil }), fn(line) {
+      return el("tr", {"class": "total"}, el("td", {"class": "l"}, "Total"), el("td", n0(line.touches)),
+                el("td", {"class": "l"}, line.detail), el("td", {"class": "l"}, line.last))
+    }))
+  let months = el("table",
+    head(concat([["Month", true]], map(FIGURE_HEADS, fn(h) { return [h, false] }))),
+    map(enumerate(report.months), fn(pair) { return el("tr", {"class": alt(pair[0])}, el("td", {"class": "l"}, month_text(pair[1])), figure_cells(pair[1].totals)) }),
+    el("tr", {"class": "total"}, el("td", {"class": "l"}, "Total"), figure_cells(report.totals)))
+  let people = el("table",
+    head(concat([["#", true], ["Name", true]], map(FIGURE_HEADS, fn(h) { return [h, false] }))),
+    map(enumerate(report.users), fn(pair) {
+      let u = pair[1]
+      return el("tr", {"class": alt(pair[0])}, el("td", {"class": "l rank"}, str(u.rank)), el("td", {"class": "l"}, person_name(u)), figure_cells(u))
+    }),
+    el("tr", {"class": "total"}, el("td"), el("td", {"class": "l"}, "Total"), figure_cells(report.totals)))
+  let page = [el("h1", "Warehouse Touches"), el("div", {"class": "range"}, filter_text(report)), el("div", {"class": "asof"}, as_of_text(report)),
+              el("h2", "Summary"), summary, el("h2", "By Month"), months, el("h2", "By Person"), people]
+  // Letter landscape, margins in mm, as points
   let mm = fn(v) { return int(v * 72.0 / 25.4 + 0.5) }
   return doc.pdf(html_stringify(page), css, {
     "page_size": "letter", "orientation": "landscape",
-    "margin_left": mm(8), "margin_right": mm(8), "margin_top": mm(18), "margin_bottom": mm(12),
-    "header": "Warehouse Touches " + report.start + " to " + report.stop,
-    "footer": "Printed " + date_format(now(), "%Y-%m-%d %H:%M") + "   {PAGENO} / {nbpg}"
+    "margin_left": mm(12), "margin_right": mm(12), "margin_top": mm(16), "margin_bottom": mm(18),
+    "header": "Warehouse Touches" + MID + filter_text(report),
+    "footer": "Printed " + date_format(now(), "%b %-d, %Y %-I:%M %p") + "   Page {PAGENO} of {nbpg}"
   })
 }
 
-// The XLSX: the same columns, a title row, the sections over their columns, the user rows and the totals.
-fn render_xlsx_report(report) {
-  let sections = report_columns(report)
-  let cols = flatten(map(sections, fn(sec) { return sec[1] }))
-  let ncol = len(cols) + 1
-  let section_row = [{"v": "User", "s": "section"}]
-  let merges = [[1, 1, 1, ncol], [3, 1, 4, 1]]
-  let at = 2
-  for sec in sections {
-    push(section_row, {"v": sec[0], "s": "section"})
-    for i in range(1, len(sec[1])) { push(section_row, {"v": "", "s": "section"}) }
-    push(merges, [3, at, 3, at + len(sec[1]) - 1])
-    at += len(sec[1])
+// ---- XLSX ---------------------------------------------------------------------------------------------------
+
+// A whole-number cell ("–" for zero, still a number), a decimal or text; bold on a Total row.
+fn xcount(v, total) { return {"v": v ?? 0, "s": total ? "total_count" : "count"} }
+fn xdec(v, total) { return {"v": round(real(v ?? 0), 1), "s": total ? "total_dec" : "dec"} }
+fn xtext(v, total) { return {"v": v ?? "", "s": total ? "total_text" : "plain"} }
+fn xhead(v) { return {"v": v, "s": "header"} }
+
+// Report: the PDF's page - Summary, By Month, By Person - in columns A (#), B (name), C (Total), D-H (areas),
+// I (Days), J (Per Day).
+fn xlsx_report(report) {
+  let rows = [[{"v": "Warehouse Touches", "s": "title"}], [{"v": filter_text(report), "s": "bold"}], [{"v": as_of_text(report), "s": "note"}], []]
+  let merges = []
+  let figures = fn(rec, total) {
+    let f = touch_figures(rec)
+    return map(enumerate(f), fn(pair) { return pair[0] == len(f) - 1 ? xdec(pair[1], total) : xcount(pair[1], total) })
   }
-  let style = fn(col, total) {
-    let base = col[3] == "text" ? "text" : (col[3] == "dec" ? "dec" : (col[1] ? "contrib_int" : "int"))
-    if total { return "total_" + base }
-    return base == "text" ? "plain" : base
+  let heads = map(FIGURE_HEADS, fn(h) { return xhead(h) })
+
+  push(rows, [{"v": "Summary", "s": "bold"}])
+  push(rows, [xhead(""), xhead("Area"), xhead("Touches"), xhead("Detail"), xhead(""), xhead(""), xhead(""), xhead(""), xhead("Last Touch"), xhead("")])
+  push(merges, [len(rows), 4, len(rows), 8])
+  push(merges, [len(rows), 9, len(rows), 10])
+  for line in card_lines(report) {
+    let total = line.key == nil
+    push(rows, [xtext("", total), xtext(line.label, total), xcount(line.touches, total), xtext(line.detail, total), xtext("", total), xtext("", total),
+                xtext("", total), xtext("", total), xtext(line.last, total), xtext("", total)])
+    push(merges, [len(rows), 4, len(rows), 8])
+    push(merges, [len(rows), 9, len(rows), 10])
   }
-  let row = fn(u, name, total) {
-    let cells = [{"v": name, "s": total ? "total_text" : "plain"}]
-    for col in cols {
-      let v = col[2](u)
-      push(cells, {"v": col[3] == "dec" and v != nil ? round(real(v), 1) : v, "s": style(col, total)})   // decimals to one place
+  push(rows, [])
+
+  push(rows, [{"v": "By Month", "s": "bold"}])
+  push(rows, concat([xhead(""), xhead("Month")], heads))
+  for m in report.months { push(rows, concat([xtext("", false), xtext(month_text(m), false)], figures(m.totals, false))) }
+  push(rows, concat([xtext("", true), xtext("Total", true)], figures(report.totals, true)))
+  push(rows, [])
+
+  push(rows, [{"v": "By Person", "s": "bold"}])
+  push(rows, concat([xhead("#"), xhead("Name")], heads))
+  for u in report.users { push(rows, concat([xcount(u.rank, false), xtext(person_name(u), false)], figures(u, false))) }
+  push(rows, concat([xtext("", true), xtext("Total", true)], figures(report.totals, true)))
+  return {"sheet": "Report", "rows": rows, "merges": merges,
+          "col_widths": [5.0, 24.0, 11.0, 11.0, 11.0, 11.0, 11.0, 15.0, 11.0, 11.0]}
+}
+
+// Person by Month: each person's touches in each month, and over the range.
+fn xlsx_person_by_month(report) {
+  let rows = [[{"v": "Warehouse Touches \u{2013} Person by Month", "s": "title"}], [{"v": filter_text(report), "s": "bold"}],
+              [{"v": as_of_text(report), "s": "note"}], []]
+  let by_month = map(report.months, fn(m) {
+    let of = {}
+    for u in m.users { of[lower(u.userid)] = u.touches }
+    return of
+  })
+  push(rows, concat([xhead("#"), xhead("Name")], map(report.months, fn(m) { return xhead(month_text(m)) }), [xhead("Total")]))
+  for u in report.users {
+    push(rows, concat([xcount(u.rank, false), xtext(person_name(u), false)],
+                      map(by_month, fn(of) { return xcount(of[lower(u.userid)] ?? 0, false) }), [xcount(u.touches, false)]))
+  }
+  push(rows, concat([xtext("", true), xtext("Total", true)], map(report.months, fn(m) { return xcount(m.totals.touches, true) }),
+                    [xcount(report.totals.touches, true)]))
+  return {"sheet": "Person by Month", "rows": rows, "freeze_pane": "C6",
+          "col_widths": concat([5.0, 24.0], map(range(0, len(report.months) + 1), fn(i) { return 16.0 }))}
+}
+
+// Detail by Person: the activity behind each person's touches, grouped by area.
+fn xlsx_detail(report) {
+  let cols = detail_cols()
+  let rows = [[{"v": "Warehouse Touches \u{2013} Detail by Person", "s": "title"}], [{"v": filter_text(report), "s": "bold"}],
+              [{"v": as_of_text(report), "s": "note"}], [{"v": "Highlighted columns count toward Total Touches.", "s": "note"}], []]
+  let band_at = len(rows) + 1
+  let band = [{"v": "", "s": "section"}]
+  let heads = [xhead("Name")]
+  let merges = []
+  for pair in enumerate(cols) {
+    let c = pair[1]
+    let starts = pair[0] == 0 or c[0] != cols[pair[0] - 1][0]
+    push(band, {"v": starts ? c[0] : "", "s": starts ? "section_edge" : "section"})
+    push(heads, {"v": c[1], "s": (c[4] ? "contrib_header" : "header") + (starts ? "_edge" : "")})
+    let n = len(filter(cols, fn(x) { return x[0] == c[0] }))
+    if starts and n > 1 { push(merges, [band_at, pair[0] + 2, band_at, pair[0] + 1 + n]) }
+  }
+  push(rows, band)
+  push(rows, heads)
+  let line = fn(u, name, total) {
+    let cells = [xtext(name, total)]
+    for pair in enumerate(cols) {
+      let c = pair[1]
+      let starts = pair[0] == 0 or c[0] != cols[pair[0] - 1][0]
+      let cell = c[4] ? {"v": c[2](u) ?? 0, "s": total ? "total_contrib_count" : "contrib_count"}
+                      : (c[3] == "int" ? xcount(c[2](u), total) : (c[3] == "dec" ? xdec(c[2](u), total) : xtext(c[2](u), total)))
+      if starts { cell.s = cell.s + "_edge" }
+      push(cells, cell)
     }
     return cells
   }
-  let rows = [
-    [{"v": "Warehouse Touches " + report.start + " to " + report.stop + " (highlighted columns count toward total touches)", "s": "title"}],
-    [],
-    section_row,
-    concat([{"v": "User", "s": "header"}], map(cols, fn(col) { return {"v": col[0], "s": col[1] ? "contrib_header" : "header"} }))
-  ]
-  for u in report.users { push(rows, row(u, u.userid, false)) }
-  push(rows, row(report.totals, "All users", true))
-  return doc.xlsx({
-    "sheet": "Touches",
-    "freeze_pane": "B5",
-    "merges": merges,
-    "col_widths": concat([16.0], map(cols, fn(col) { return col[4] })),
-    "rows": rows
-  })
+  for u in report.users { push(rows, line(u, person_name(u), false)) }
+  push(rows, line(report.totals, "Total", true))
+  return {"sheet": "Detail by Person", "rows": rows, "merges": merges, "freeze_pane": "B" + str(band_at + 2),
+          "col_widths": concat([24.0], map(cols, fn(c) { return c[3] == "text" ? 16.0 : 11.0 }))}
+}
+
+fn render_xlsx_report(report) {
+  return doc.xlsx({"sheets": [xlsx_report(report), xlsx_person_by_month(report), xlsx_detail(report)]})
 }
 
 // ---- CSV ----------------------------------------------------------------------------------------------------
 
+// By Person, as the Report sheet has it.
 fn render_csv_report(report) {
-  let grand = report.totals.touches > 0 ? report.totals.touches : 1.0
-  let mv = fn(u, t) { return get_in(u.movements.by_type, [t, "qty"], 0) }
-  let line = fn(u, id, name, pct) {
-    let r = u.receiving
-    let p = u.picking
-    let m = u.movements
-    let l = u.loads
-    let s = u.sticker
-    return [id, name,
-            r.qty_in, r.qty_out, r.scans,
-            p.qty, p.orders, p.lines,
-            m.qty, m.moves, mv(u, "item move"), mv(u, "dolly move"), mv(u, "merge"),
-            l.scans, l.orders, l.dispatches, l.avgdispatchunits, l.avgloadtime, l.manual, l.manualpct, l.forced, l.pickuporders, l.pickupunits,
-            s.stagedunits, s.staged, s.packed, s.packedunits, s.binds,
-            u.touches, u.active_days, u.touches_per_day, pct,
-            short_time(u.first_touch), short_time(u.last_touch)]
-  }
-  let rows = map(report.users, fn(u) {
-    return line(u, u.userid, first_present(u.name, u.realname, u.userid), round((100.0 * real(u.touches)) / real(grand), 1))
-  })
-  push(rows, line(report.totals, "ALL USERS", "All Warehouse Operators", 100.0))
-  return doc.csv([
-    "User", "Name",
-    "Rec Qty In", "Rec Qty Out", "Rec Scans",
-    "Pick Units", "Pick Orders", "Pick Lines",
-    "Move Qty", "Move Count", "Item Move Qty", "Dolly Move Qty", "Merge Qty",
-    "Load Units", "Load Orders", "Dispatches", "Avg Units/Disp", "Avg Load Min", "Skipped Scans", "Skipped Pct", "Force Comp", "Pickup Orders", "Pickup Units",
-    "Staged Units", "Staged Orders", "Packed Orders", "Packed Units", "Bound Orders",
-    "Total Touches", "Active Days", "Touches/Day", "Pct of Total", "First Touch", "Last Touch"
-  ], rows)
+  let rows = map(report.users, fn(u) { return concat([u.rank, person_name(u), u.userid], touch_figures(u)) })
+  push(rows, concat(["", "Total", ""], touch_figures(report.totals)))
+  return doc.csv(concat(["#", "Name", "User ID"], FIGURE_HEADS), rows)
 }
 
 // ---- The page -----------------------------------------------------------------------------------------------
@@ -212,8 +307,6 @@ let SOURCES = [["receiving", "Receiving", "--rec"], ["picking", "Picking", "--pi
                ["loads", "Loads", "--load"], ["sticker", "Sticker scan out", "--stick"]]
 
 fn dot(var) { return el("i", {"class": "dot", "style": "background:var(" + var + ")"}) }
-fn main_num(value) { return el("b", n0(value)) }
-fn small(text) { return el("small", text) }
 
 // The line under the title: the range.
 fn render_badge(report) { return html_escape(day_text(report.start) + " \u{2013} " + day_text(report.stop)) }
@@ -224,22 +317,6 @@ fn source_parts(u) {
           "loads": u.loads.scans, "sticker": u.sticker.stagedunits}
 }
 
-// the context lines under each counted number, for a user row and for the totals row
-fn source_cells(u) {
-  let l = u.loads
-  let st = u.sticker
-  let rec_extra = u.receiving.qty_out > 0 ? MID + n0(u.receiving.qty_in) + " in / " + n0(u.receiving.qty_out) + " out" : ""
-  return {
-    "receiving": small(n0(u.receiving.scans) + " scans" + rec_extra),
-    "picking": small(n0(u.picking.orders) + " orders" + MID + n0(u.picking.lines) + " lines"),
-    "movements": small(n0(u.movements.moves) + " moves"),
-    "loads": [l.dispatches > 0 ? small(n0(l.dispatches) + " disp" + MID + n1(l.avgloadtime) + " min" + MID + n1(l.avgdispatchunits) + "/disp") : nil,
-              l.manual > 0 or l.forced > 0 ? small(n1(l.manualpct) + "% skipped" + (l.forced > 0 ? MID + n0(l.forced) + " forced" : "")) : nil,
-              l.pickuporders > 0 or l.pickupunits > 0 ? small(n0(l.pickuporders) + " pickups" + MID + n0(l.pickupunits) + " units") : nil],
-    "sticker": [small(n0(st.staged) + " staged"),
-                small(n0(st.packed) + " packed" + MID + n0(st.binds) + " bound")]
-  }
-}
 
 // The table's columns, for a server-side sort (the pane): what each one sorts by.
 fn sort_value(u, col) {
@@ -408,28 +485,49 @@ let SLIDER_JS = join([
   "})();"
 ], chr(10))
 
-fn live_node(report, sorter, hours) {
+// By Month (the panel's other table): the Excel's By Month - a row per month of the range over the hours picked, a
+// Total row of the months added up (the cards' figures when no days are picked); a month's button narrows the report
+// to its days.
+fn months_node(report, state) {
+  let sel = report.sel_days
+  let months = report.months ?? []
+  let top = max(1.0, max(concat([0.0], map(months, fn(m) { return real(m.touches) }))))
+  let cells = fn(touches, parts, days, per_day) {
+    return concat([el("td", el("b", count_text(touches)))], map(AREAS, fn(a) { return el("td", count_text(parts[a[0]])) }),
+                  [el("td", n0(days)), el("td", n1(per_day))])
+  }
+  let rows = map(months, fn(m) {
+    let picked = sel != nil and sel.from == m.from and sel.to == m.to
+    return el("tr", {"class": picked ? "on" : nil}, el("td", {"class": "who"}, el("b", month_text(m))),
+      cells(m.touches, m.parts, m.active_days, m.touches_per_day),
+      el("td", el("button", {"type": "button", "class": "btn", "on_click": fn() { state.days = picked ? nil : {"from": m.from, "to": m.to} }},
+                  picked ? "All days" : "Show month")))
+  })
+  let sum_of = fn(f) { let t = 0.0 for m in months { t = t + real(f(m)) } return t }
+  let parts = {}
+  for a in AREAS { parts[a[0]] = sum_of(fn(m) { return m.parts[a[0]] }) }
+  let touches = sum_of(fn(m) { return m.touches })
+  let days = sum_of(fn(m) { return m.active_days })
+  return el("div", {"class": "scroll"}, el("table", {"class": "months"},
+    el("thead", el("tr", el("th", {"class": "l"}, "Month"), map(FIGURE_HEADS, fn(h) { return el("th", h) }), el("th", ""))),
+    el("tbody", rows),
+    el("tfoot", el("tr", el("td", {"class": "who"}, "Total"), cells(touches, parts, days, days > 0 ? touches / days : 0.0), el("td")))))
+}
+
+fn live_node(report, state, hours) {
+  let sorter = state.sorter
   let t = report.totals
   let pt = source_parts(t)
-  let lasts = report.lasts == nil ? {} : report.lasts
-  let last_line = fn(src) {
-    let at = src != nil ? lasts[src] : (len(lasts) == 0 ? nil : max(values(lasts)))
-    return el("div", {"class": "last"}, at == nil ? "no touches" : "last touch " + when(at))
-  }
-  let card = fn(src, value, sub) {
-    return el("div", {"class": "card"}, el("div", {"class": "label"}, dot(src[2]), src[1]), el("div", {"class": "value"}, value),
-              el("div", {"class": "sub"}, sub), last_line(src[0]))
-  }
-  let cards = el("div", {"class": "cards"},
-    el("div", {"class": "card total"}, el("div", {"class": "label"}, "Total touches"), el("div", {"class": "value"}, n0(t.touches)),
-       el("div", {"class": "sub"}, n0(len(report.users)) + " people" + MID + n0(t.active_days) + " active days"), last_line(nil)),
-    card(SOURCES[0], n0(pt.receiving), n0(t.receiving.qty_in) + " in / " + n0(t.receiving.qty_out) + " out" + MID +
-                                       n0(t.receiving.scans) + " scans" + MID + n0(t.receiving.vendors) + " vendors"),
-    card(SOURCES[1], n0(pt.picking), n0(t.picking.orders) + " orders" + MID + n0(t.picking.lines) + " lines"),
-    card(SOURCES[2], n0(pt.movements), n0(t.movements.moves) + " moves"),
-    card(SOURCES[3], n0(pt.loads), n0(t.loads.dispatches) + " dispatches" + MID + n0(t.loads.pickuporders) + " pickups (" +
-                                   n0(t.loads.pickupunits) + " units)" + MID + n1(t.loads.manualpct) + "% skipped"),
-    card(SOURCES[4], n0(pt.sticker), n0(t.sticker.staged) + " orders staged"))
+  let src_of = {}
+  for src in SOURCES { src_of[src[0]] = src }
+  // the cards: card_lines, as the Excel's Summary says them
+  let cards = el("div", {"class": "cards"}, map(card_lines(report), fn(line) {
+    let src = line.key == nil ? nil : src_of[line.key]
+    return el("div", {"class": ["card", src == nil ? "total" : nil]},
+              el("div", {"class": "label"}, src == nil ? nil : dot(src[2]), line.label == "Total" ? "Total touches" : line.label),
+              el("div", {"class": "value"}, n0(line.touches)),
+              el("div", {"class": "sub"}, line.detail), el("div", {"class": "last"}, line.last == "" ? "no touches" : "last touch " + line.last))
+  }))
 
   let nil_cell = el("span", {"class": "nil"}, "\u{2013}")
   let top = max(1.0, max(concat([0.0], map(report.users, fn(u) { return real(u.touches) }))))
@@ -442,22 +540,19 @@ fn live_node(report, sorter, hours) {
     let rank = pair[0] + 1
     let u = pair[1]
     let p = source_parts(u)
-    let sub = source_cells(u)
     let name = first_present(u.name, u.userid)
     let title = join(map(SOURCES, fn(src) { return src[1] + " " + n0(p[src[0]]) }), " / ")
     let bar = map(SOURCES, fn(src) { return el("span", {"style": "background:var(" + src[2] + ");width:" + str(round(100.0 * real(p[src[0]]) / top, 2)) + "%"}) })
     push(rows, el("tr", {"data-key": lower(u.userid)},   // the row is this user's: an update moves it rather than rewriting it
       el("td", {"class": "rank", "data-v": rank}, rank),
-      el("td", {"class": "who", "data-v": lower(name)}, el("b", name), el("small", u.userid)),
+      el("td", {"class": "who", "data-v": lower(name)}, el("b", name)),
       el("td", {"data-v": str(u.touches)}, el("b", n0(u.touches)), el("div", {"class": "bar", "title": title}, bar)),
-      map(SOURCES, fn(src) { let v = p[src[0]]; return el("td", {"class": "src", "data-v": str(v)}, v > 0 ? [main_num(v), sub[src[0]]] : nil_cell) }),
+      map(SOURCES, fn(src) { let v = p[src[0]]; return el("td", {"data-v": str(v)}, v > 0 ? n0(v) : nil_cell) }),
       el("td", {"data-v": str(u.active_days)}, n0(u.active_days)),
-      el("td", {"data-v": str(u.touches_per_day)}, n1(u.touches_per_day)),
-      el("td", {"class": "when", "data-v": u.first_touch}, when(u.first_touch), el("small", "to " + when(u.last_touch)))))
+      el("td", {"data-v": str(u.touches_per_day)}, n1(u.touches_per_day))))
   }
-  if len(rows) == 0 { push(rows, el("tr", el("td", {"colspan": 11, "class": "empty"}, "No warehouse activity in this range."))) }
+  if len(rows) == 0 { push(rows, el("tr", el("td", {"colspan": 10, "class": "empty"}, "No warehouse activity in this range."))) }
 
-  let tsub = source_cells(t)
   let th = fn(col, attrs, label) {
     if sorter == nil {
       attrs["data-col"] = col
@@ -470,24 +565,29 @@ fn live_node(report, sorter, hours) {
     }
     return el("th", attrs, label)
   }
-  let head = [th(0, {"class": "l"}, "#"), th(1, {"class": "l"}, "Person"), th(2, {}, "Touches")]
-  let foot = [el("td"), el("td", {"class": "who"}, "All users"), el("td", n0(t.touches))]
+  let head = [th(0, {"class": "l"}, "#"), th(1, {"class": "l"}, "Name"), th(2, {}, "Total")]
+  let foot = [el("td"), el("td", {"class": "who"}, "Total"), el("td", n0(t.touches))]
   for pair in enumerate(SOURCES) {
     let src = pair[1]
-    push(head, th(pair[0] + 3, {"class": "contrib", "style": "--c:var(" + src[2] + ")"}, src[1]))
-    push(foot, el("td", {"class": "src"}, main_num(pt[src[0]]), tsub[src[0]]))
+    push(head, th(pair[0] + 3, {"class": "contrib", "style": "--c:var(" + src[2] + ")"}, AREAS[pair[0]][1]))
+    push(foot, el("td", count_text(pt[src[0]])))
   }
-  push(head, th(8, {}, "Days"), th(9, {}, "Per day"), th(10, {}, "First / last"))
-  push(foot, el("td", n0(t.active_days)), el("td", n1(t.touches_per_day)),
-       el("td", {"class": "when"}, when(t.first_touch), el("small", "to " + when(t.last_touch))))
+  push(head, th(8, {}, "Days"), th(9, {}, "Per Day"))
+  push(foot, el("td", n0(t.active_days)), el("td", n1(t.touches_per_day)))
   let pickups = t.loads.pickuporders > 0 or t.loads.pickupunits > 0
   let legend = map(SOURCES, fn(src) {
     return el("span", dot(src[2]), src[1], src[0] == "loads" and pickups ? [" ", el("small", "(incl. pickups)")] : nil)
   })
 
+  let by_month = state.table == "month"
+  let pick = fn(id, text) {
+    return el("button", {"type": "button", "class": ["pill", (state.table ?? "person") == id ? "on" : nil], "on_click": fn() { state.table = id }}, text)
+  }
   let panel = el("div", {"class": "panel"},
-    el("div", {"class": "panel-head"}, el("h2", "By person"), el("div", {"class": "legend"}, legend)),
-    el("div", {"class": "scroll"}, el("table", el("thead", el("tr", head)), el("tbody", rows), el("tfoot", el("tr", foot)))))
+    el("div", {"class": "panel-head"}, el("div", {"class": "pills"}, pick("person", "By Person"), pick("month", "By Month")),
+       el("div", {"class": "legend"}, legend)),
+    by_month ? months_node(report, state)
+             : el("div", {"class": "scroll"}, el("table", el("thead", el("tr", head)), el("tbody", rows), el("tfoot", el("tr", foot)))))
   return [cards, hours, panel]
 }
 
@@ -543,6 +643,13 @@ let PAGE_CSS = join([
   ".tl-axis { display: grid; gap: 3px; margin-top: 2px; color: var(--muted); font-size: 11px; }",
   ".tl-axis span { text-align: center; white-space: nowrap; overflow: visible; }",
   "@media (max-width: 700px) { .tl-cols { gap: 2px; height: 64px; } .tl-axis { gap: 2px; font-size: 10px; } }",
+  ".status { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: -6px 0 16px; padding: 10px 14px; border-radius: 8px; font-size: 14px; border: 1px solid; }",
+  ".status b { letter-spacing: .06em; } .status .btn { padding: 4px 12px; font-size: 13px; }",
+  ".status.live { background: rgba(58, 167, 118, .12); border-color: var(--move); }",
+  ".status.paused { background: rgba(232, 145, 45, .16); border-color: var(--pick); } .status.paused .btn:first-of-type { margin-left: auto; }",
+  ".pulse-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--move); animation: live 1.6s ease-in-out infinite; }",
+  "@keyframes live { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }",
+  "table.months tr.on td { background: var(--head); } table.months td.who small { display: block; }",
   ".cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }",
   ".card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }",
   ".card.total { border-width: 2px; }",
@@ -604,6 +711,25 @@ let EXPORT_JS = join([
   "});"
 ], chr(10))
 
+// Live or paused (service.gr's view): live, the page follows the Thing; paused - hours or days picked, or a range
+// that ended before today - it keeps the figures it read until the viewer changes what is picked or presses Refresh.
+fn status_node(report, state) {
+  if not state.paused {
+    return el("div", {"class": "status live"}, el("i", {"class": "pulse-dot"}), el("b", "LIVE"), "Updating as the warehouse works")
+  }
+  return el("div", {"class": "status paused"}, el("b", "PAUSED"), "Showing figures as of " + when(report.as_of),
+    el("button", {"type": "button", "class": "btn", "on_click": fn() { state.held = nil }}, "Refresh"),
+    el("button", {"type": "button", "class": "btn primary", "on_click": fn() {
+      // the last 30 days to today, every hour and day: live again
+      let r = report_range(nil, nil)
+      state.start = r[0]
+      state.stop = r[1]
+      state.span = nil
+      state.days = nil
+      state.held = nil
+    }}, "Back to live"))
+}
+
 // The page as a ui.pane view (service.gr): the same markup as the PHP page, its range a form whose Run is an
 // action, its sort done here and its hours picked on the timeline (state: {start, stop, span, sorter}, the viewer's
 // own).
@@ -622,9 +748,11 @@ fn dashboard_node(report, state) {
           state.start = r[0]
           state.stop = r[1]
           state.days = nil   // a new range: all of its days
+          state.held = nil   // and read again, even when it is the same range
         }}, "Run"),
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
-    el("div", {"id": "live"}, live_node(report, state.sorter, timeline_node(report, state))),
+    status_node(report, state),
+    el("div", {"id": "live"}, live_node(report, state, timeline_node(report, state))),
     el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS))
 }
