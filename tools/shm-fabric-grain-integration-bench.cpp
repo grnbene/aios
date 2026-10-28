@@ -11,6 +11,9 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/channel/state_channel.hpp"
@@ -95,7 +98,19 @@ static void test_compute_serve_shm_dispatch() {
 
   std::string ring_name = "aios_bench_compute_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
   ComputeServeOptions opt;
-  opt.port = 17311;
+  // A port nothing else holds: a fixed one (it was 17311) failed whenever another engine on the machine had it.
+  opt.port = [] {
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof a;
+    uint16_t port = 17311;
+    if (s >= 0 && ::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0 && ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) == 0)
+      port = ntohs(a.sin_port);
+    if (s >= 0) ::close(s);
+    return port;
+  }();
   opt.loopback_only = true;
   opt.shm_ring_name = ring_name;
 

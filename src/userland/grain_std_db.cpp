@@ -427,7 +427,10 @@ bool sql_literal(const Value& v, std::string& out, std::string& error, int depth
   }
 }
 
+}  // namespace
+
 // Replaces each ? with the next parameter, quoted. A ? inside a string, a quoted name or a comment is left alone.
+// (Outside the file's own namespace: aios's db_query binds with it too.)
 bool bind_params(const std::string& sql, const std::vector<Value>& params, std::string& out, std::string& error) {
   size_t next = 0;
   out.reserve(sql.size() + 16 * params.size());
@@ -458,6 +461,8 @@ bool bind_params(const std::string& sql, const std::vector<Value>& params, std::
   if (next != params.size()) { error = "the query has " + std::to_string(next) + " ? but " + std::to_string(params.size()) + " parameter(s) were given"; return false; }
   return true;
 }
+
+namespace {
 
 // db_escape(text) -> text safe between single quotes (what mysqli::real_escape_string gives)
 Value bi_db_escape(Vm&, std::vector<Value>& args, std::string& error) {

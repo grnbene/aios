@@ -786,7 +786,7 @@ Result<std::shared_ptr<RemoteNode>> Kernel::open_member(const Id128& kernel_id) 
     return n;
   }
   if (!direct_err.empty())
-    std::fprintf(stderr, "fleet: direct link to %s failed (%s); through the hub\n", kernel_id.short_str().c_str(), direct_err.c_str());
+    host_->log_error("fleet: direct link to " + kernel_id.short_str() + " failed (" + direct_err + "); through the hub");
   if (!relay_ || !relay_->attached())
     return R(Status::Busy, "not attached to a fleet hub" + (direct_err.empty() ? std::string() : "; direct link: " + direct_err));
   auto conn = relay_->open(kernel_id);
