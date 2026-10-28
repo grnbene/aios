@@ -7,6 +7,7 @@
 // comma-joined), so those are put in ssh's terms before comparing; nothing else
 // is adjusted. `--real` does the same for every Host alias in the person's own
 // ~/.ssh/config, reading it only.
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -57,6 +58,20 @@ struct Ctx {
   std::string local_host;
 };
 
+// The installed ssh's major version (`ssh -V`: "OpenSSH_9.6p1 ..."), 0 when it cannot be read.
+int ssh_major() {
+  static const int v = [] {
+    FILE* p = ::popen("ssh -V 2>&1", "r");
+    if (!p) return 0;
+    char buf[128] = {0};
+    const bool got = std::fgets(buf, sizeof buf, p) != nullptr;
+    ::pclose(p);
+    const char* at = got ? std::strstr(buf, "OpenSSH_") : nullptr;
+    return at ? std::atoi(at + 8) : 0;
+  }();
+  return v;
+}
+
 // IdentityFile as ssh would open it: ~ and the tokens a fixture uses.
 std::string expand_like_ssh(const std::string& raw, const Ctx& c, const net::SshResolved& r) {
   std::string v = raw;
@@ -86,10 +101,16 @@ void expect(const std::string& tag, const std::string& key, const std::string& o
 
 void compare(const std::string& tag, const net::SshResolved& r, const GOut& g, const Ctx& c) {
   expect(tag, "hostname", r.hostname, first(g, "hostname"));
-  expect(tag, "user", r.user, first(g, "user"));
+  // OpenSSH 10 expands %-tokens in User (ssh_resolve does); an older ssh leaves them as written
+  if (!(ssh_major() < 10 && first(g, "user").find('%') != std::string::npos)) expect(tag, "user", r.user, first(g, "user"));
   expect(tag, "port", std::to_string(r.port), first(g, "port"));
   std::vector<std::string> ids;
-  for (auto& raw : g.count("identityfile") ? g.at("identityfile") : std::vector<std::string>()) ids.push_back(expand_like_ssh(raw, c, r));
+  for (auto& raw : g.count("identityfile") ? g.at("identityfile") : std::vector<std::string>()) {
+    // OpenSSH before 10 still lists ~/.ssh/id_dsa among its default identities; ssh_resolve follows OpenSSH 10's
+    // list (DSA is gone, and this client has no DSA keys), so that one default is not counted against it.
+    if (ssh_major() < 10 && (raw == "~/.ssh/id_dsa" || expand_like_ssh(raw, c, r) == c.account.home + "/.ssh/id_dsa")) continue;
+    ids.push_back(expand_like_ssh(raw, c, r));
+  }
   expect(tag, "identityfile", joined(r.identity_files, " "), joined(ids, " "));
   std::vector<std::string> certs;
   for (auto& raw : g.count("certificatefile") ? g.at("certificatefile") : std::vector<std::string>()) certs.push_back(expand_like_ssh(raw, c, r));
@@ -239,12 +260,12 @@ int main(int argc, char** argv) {
 
   for (auto& cs : cases) {
     std::string fixture = root + "/" + cs.fixture;
-    std::vector<std::string> argv = {ssh, "-G", "-F", fixture};
-    if (!cs.user.empty()) { argv.push_back("-l"); argv.push_back(cs.user); }
-    if (!cs.port.empty()) { argv.push_back("-p"); argv.push_back(cs.port); }
-    argv.push_back(cs.host);
+    std::vector<std::string> cmd = {ssh, "-G", "-F", fixture};
+    if (!cs.user.empty()) { cmd.push_back("-l"); cmd.push_back(cs.user); }
+    if (!cs.port.empty()) { cmd.push_back("-p"); cmd.push_back(cs.port); }
+    cmd.push_back(cs.host);
     int rc;
-    std::string out = run_ssh_g(argv, rc);
+    std::string out = run_ssh_g(cmd, rc);
     net::SshConfigFiles files;
     files.user_file = fixture;
     files.read_system = false;

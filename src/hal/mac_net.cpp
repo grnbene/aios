@@ -148,6 +148,16 @@ Result<std::unique_ptr<Listener>> net_listen(uint16_t port, bool loopback_only) 
   return std::unique_ptr<Listener>(new TcpListener(fd, ntohs(a.sin_port)));
 }
 
+Result<uint32_t> resolve_ipv4(const std::string& host, int timeout_ms) {
+  (void)timeout_ms;
+  addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+  addrinfo* res = nullptr;
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return Result<uint32_t>(Status::NotFound, "cannot resolve " + host);
+  const uint32_t a = (uint32_t)((sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+  ::freeaddrinfo(res);
+  return a;
+}
+
 Result<std::unique_ptr<Connection>> net_connect(const std::string& host, uint16_t port, int timeout_ms) {
   addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;

@@ -251,10 +251,10 @@ int main(int argc, char** argv) {
           if (comma == std::string::npos) comma = all.size();
           const std::string one = all.substr(at, comma - at);
           at = comma + 1;
-          const size_t eq = one.find('='), colon = one.rfind(':');
+          const size_t eq = one.find('='), port_at = one.rfind(':');
           if (one.empty()) continue;
-          if (eq == std::string::npos || colon == std::string::npos || colon < eq) { std::cerr << "fleet: AIOS_FLEET_DIRECT entry '" << one << "' is not <member>=<host>:<port>\n"; continue; }
-          s.kernel->add_direct_route(one.substr(0, eq), one.substr(eq + 1, colon - eq - 1), (uint16_t)std::strtoul(one.c_str() + colon + 1, nullptr, 10));
+          if (eq == std::string::npos || port_at == std::string::npos || port_at < eq) { std::cerr << "fleet: AIOS_FLEET_DIRECT entry '" << one << "' is not <member>=<host>:<port>\n"; continue; }
+          s.kernel->add_direct_route(one.substr(0, eq), one.substr(eq + 1, port_at - eq - 1), (uint16_t)std::strtoul(one.c_str() + port_at + 1, nullptr, 10));
         }
       }
     }

@@ -1256,7 +1256,7 @@ void cmd_serve(Ctx& c, const Args& a) {
   // the member a millisecond. Kept, the buffers stay staged on the member and a request is one ExecBatch.
   struct RouteBufs { Tensor tin{}, tout{}; uint64_t in_cap = 0, out_cap = 0; bool busy = false; };
   std::vector<RouteBufs> route_bufs((size_t)route_max);
-  ga::Host::Options host_opt{[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str(), nullptr};
+  ga::Host::Options host_opt{[&c](userland::grain::Vm& vm) { setup_app_vm(c.k, vm); }, aios_app_caps(), c.k.self().short_str(), nullptr, nullptr, nullptr};
   host_opt.forward = [&c, &route_worker, &reach_mu, route_room, route_max, &slots_mu, &slots_cv, &slots_used, &route_bufs](const std::string& app, const std::string& member,
                                                                   const userland::grain::WebUi::Request& req,
                                                                   userland::grain::WebUi::Response& res) -> bool {

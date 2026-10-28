@@ -250,6 +250,16 @@ Result<std::unique_ptr<Connection>> net_connect_pipe(const std::string& name, in
   return std::unique_ptr<Connection>(new PipeConnection(h, name));
 }
 
+Result<uint32_t> resolve_ipv4(const std::string& host, int timeout_ms) {
+  (void)timeout_ms;
+  addrinfo hints{}; hints.ai_family = AF_INET;
+  addrinfo* res = nullptr;
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return Result<uint32_t>(Status::NotFound, "cannot resolve " + host);
+  const uint32_t a = (uint32_t)reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
+  ::freeaddrinfo(res);
+  return a;
+}
+
 Result<std::unique_ptr<Connection>> net_connect(const std::string& host, uint16_t port, int timeout_ms) {
   ensure_winsock();
   addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;

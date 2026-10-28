@@ -100,9 +100,9 @@ int main() {
   const uint64_t d_before = status(db, "Asql_row_index_rows_indexed");
   bool d_ok = true;
   for (size_t n = 0; n < 20; ++n) {
-    const std::string k = std::to_string(50000 + n * 3);
-    d_ok &= run(db, "DELETE FROM d1 WHERE id = " + k);
-    d_ok &= run(db, "INSERT INTO d1 VALUES (" + k + ",'again')");
+    const std::string id_text = std::to_string(50000 + n * 3);
+    d_ok &= run(db, "DELETE FROM d1 WHERE id = " + id_text);
+    d_ok &= run(db, "INSERT INTO d1 VALUES (" + id_text + ",'again')");
     d_ok &= run(db, "UPDATE d1 SET v = 'upd' WHERE id = " + std::to_string(60000 + n));
     d_ok &= run(db, "INSERT INTO d1 VALUES (" + std::to_string(120001 + n) + ",'new')");
   }

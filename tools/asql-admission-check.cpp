@@ -9,6 +9,7 @@
 //    waiting statement; a statement bigger than the whole budget still runs.
 //  - SET GLOBAL / SET SESSION and @@ of both variables.
 #undef NDEBUG
+#include <filesystem>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -68,7 +69,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 int main() {
   std::printf("=== ASQL admission check (max_connections, query memory) ===\n");
   const std::string root = "/tmp/aios-asql-admission";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

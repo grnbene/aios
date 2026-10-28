@@ -6,6 +6,7 @@
 // back named `SUM()`, so two such columns collided in an associative fetch;
 // MySQL names an unaliased column by its expression text as written.
 #undef NDEBUG
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -173,7 +174,7 @@ void check_names(SqlDatabase& db) {
 int main() {
   std::printf("=== ASQL grouped expression aggregate check ===\n");
   const std::string root = "/tmp/aios-asql-grouped-expr";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

@@ -8733,7 +8733,7 @@ bool mysql_str_to_date(const std::string& s, const std::string& fmt, std::string
     if (pm && hh < 12) hh += 12;
     else if (!pm && hh == 12) hh = 0;
   }
-  char buf[64];
+  char buf[80];   // six ints at their widest (the ranges are checked below; the compiler cannot see it)
   if (!have_date) {   // a time alone: STR_TO_DATE('5:04 PM', '%l:%i %p') is 17:04:00
     if (!have_time || hh > 23 || mi > 59 || ss > 59) return false;
     std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mi, ss);
@@ -13139,7 +13139,7 @@ std::string canonical_temporal(const SqlColumn& c, const std::string& v) {
   }
   if (g.empty()) return std::string();
   auto two = [](long long y) { return y < 70 ? y + 2000 : (y < 100 ? y + 1900 : y); };
-  char out[64];
+  char out[128];   // six 64-bit fields at their widest: the checks above bound them, the compiler cannot see it
   if (c.temporal == 3) {
     long long hh = 0, mm = 0, ss = 0;
     if (g.size() == 1) {   // HHMMSS, HMMSS, MMSS, SS
@@ -20573,8 +20573,8 @@ Result<void> SqlDatabase::test_profile_connection(const DbConnectionProfile& pro
   server_addr.sin_port = htons(prof.port);
 
   if (inet_pton(AF_INET, prof.host.c_str(), &server_addr.sin_addr) <= 0) {
-    struct hostent* he = gethostbyname(prof.host.c_str());
-    if (!he) {
+    auto addr = hal::resolve_ipv4(prof.host);
+    if (!addr.ok()) {
 #if defined(_WIN32)
       ::closesocket(sock);
 #else
@@ -20582,7 +20582,7 @@ Result<void> SqlDatabase::test_profile_connection(const DbConnectionProfile& pro
 #endif
       return Result<void>(Status::IoError, "cannot resolve host: " + prof.host);
     }
-    std::memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+    std::memcpy(&server_addr.sin_addr, &*addr, sizeof(uint32_t));
   }
 
   int res = ::connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
@@ -25135,7 +25135,6 @@ namespace { constexpr uint64_t kQmemMaxWaitMs = 30000; }
 
 bool SqlDatabase::qmem_reserve(uint64_t order, size_t* held, size_t bytes, bool may_wait) {
   std::unique_lock<aios::hal::Mutex> lk(qmem_mu_);
-  const size_t budget = qmem_budget_.load(std::memory_order_relaxed);
   const uint64_t t0 = kernel_.host().monotonic_ns();
   bool waiting = false;
   for (;;) {
@@ -37548,7 +37547,8 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
         const FastKey& fk = fast_keys[i];
         if (fk.kind == FastKey::AggNum) {
           for (size_t gi = 0; gi < G; ++gi) {
-            const Val& v = values[gi][fk.col];
+            const AggValues::Row row = values[gi];   // a view: the Val is in values' own storage
+            const Val& v = row[fk.col];
             if (v.null) { (*kn)[gi * nk + i] = 1; continue; }
             // Whole numbers a double holds exactly order as their text does.
             if (!v.numeric || v.num != std::floor(v.num) || std::fabs(v.num) > 9.0e15) return false;
@@ -52283,7 +52283,7 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
                           row_index_.ai_column == ai_idx;
   // Rows vanished or were rewritten under us: start over.
   if (!same_table || row_index_.rows_indexed > t.row_count()) {
-    row_index_ = RowIndex{};
+    row_index_ = RowIndex();
     row_index_.table = t.name;
     row_index_.pk_columns = pk_cols;
     row_index_.ai_column = ai_idx;

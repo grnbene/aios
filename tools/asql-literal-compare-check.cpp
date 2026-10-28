@@ -6,6 +6,7 @@
 // other case and trailing spaces. `id > '5'` on a small INT table matched no
 // row at all on the live mirror (the fast path had only = and <> for text).
 #undef NDEBUG
+#include <filesystem>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -144,7 +145,7 @@ void fill(SqlDatabase& db, const std::string& table, size_t rows) {
 int main() {
   std::printf("=== ASQL column-vs-literal comparison check ===\n");
   const std::string root = "/tmp/aios-asql-literal-compare";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

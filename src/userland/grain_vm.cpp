@@ -731,7 +731,7 @@ std::vector<std::pair<std::string, Value>> Vm::current_locals() const {
 std::vector<std::string> Vm::global_names() const {
   std::vector<std::string> names;
   names.reserve(st_->globals.size());
-  for (const auto& kv : st_->globals) names.push_back(kv.first);
+  for (const auto& g : st_->globals) names.push_back(g.first);
   std::sort(names.begin(), names.end());
   return names;
 }

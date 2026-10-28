@@ -95,9 +95,12 @@ bool has_frame(const Child& c) {
 #endif
 }
 
-[[gnu::noinline]] int recurse(volatile int depth) {
+// Runs the stack out: 4 KB a frame, never returning before the stack is gone (the depth check is never reached,
+// and keeps the recursion from being one the compiler can see is endless).
+[[gnu::noinline]] int recurse(int depth) {
   volatile char pad[4096];
   pad[0] = (char)depth;
+  if (depth == 1 << 30) return 0;
   return recurse(depth + 1) + pad[0];
 }
 

@@ -44,20 +44,6 @@ void note_dispatch(const std::string& cmd) {
   std::lock_guard<std::mutex> g(ran_lock);
   dispatched.push_back(cmd);
 }
-void clear_dispatch() {
-  std::lock_guard<std::mutex> g(ran_lock);
-  dispatched.clear();
-}
-std::string wait_dispatch() {
-  for (int i = 0; i < 200; ++i) {
-    {
-      std::lock_guard<std::mutex> g(ran_lock);
-      if (!dispatched.empty()) return dispatched.back();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  }
-  return std::string();
-}
 
 void check(bool ok, const std::string& what, const std::string& detail = std::string()) {
   std::printf("        %s %s%s\n", ok ? "OK  " : "FAIL", what.c_str(),

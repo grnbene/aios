@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
     json::Value q2 = obj(); q2.set("value", S("+1 555 0199")); q2.set("type", S("work")); ph.push(q2); p1.set("phoneNumbers", ph); }
   { json::Value o = json::Value::array(); json::Value x = obj(); x.set("name", S("Analytical Engines")); x.set("title", S("Programmer")); o.push(x); p1.set("organizations", o); }
   { json::Value ad = json::Value::array(); json::Value x = obj(); x.set("streetAddress", S("12 Byron Rd")); x.set("city", S("London")); x.set("postalCode", S("W1")); x.set("country", S("UK")); ad.push(x); p1.set("addresses", ad); }
-  { json::Value b = json::Value::array(); json::Value x = obj(); json::Value d = obj(); d.set("year", json::Value::integer(1815)); d.set("month", json::Value::integer(12)); d.set("day", json::Value::integer(10)); x.set("date", d); b.push(x); p1.set("birthdays", b); }
+  { json::Value births = json::Value::array(); json::Value x = obj(); json::Value d = obj(); d.set("year", json::Value::integer(1815)); d.set("month", json::Value::integer(12)); d.set("day", json::Value::integer(10)); x.set("date", d); births.push(x); p1.set("birthdays", births); }
   { json::Value ph = json::Value::array(); json::Value x = obj(); x.set("url", S("https://photos.example/ada.jpg")); ph.push(x); p1.set("photos", ph); }   // not a field AIOS holds
   json::Value p2 = obj(); p2.set("resourceName", S("people/c2"));
   { json::Value n = json::Value::array(); json::Value x = obj(); x.set("givenName", S("Grace")); x.set("familyName", S("Hopper")); n.push(x); p2.set("names", n); }

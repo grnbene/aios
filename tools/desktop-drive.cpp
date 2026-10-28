@@ -134,10 +134,10 @@ int main(int argc, char** argv) {
     std::atomic<bool> asked_to_stop{false};
     std::atomic<bool> finished{false};
     desk.set_interrupt([&] { asked_to_stop = true; });
-    desk.set_dispatcher([&](const std::string&, userland::OutputCallback out) {
-      out("thinking...");
+    desk.set_dispatcher([&](const std::string&, userland::OutputCallback say) {
+      say("thinking...");
       for (int i = 0; i < 400 && !asked_to_stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      out(asked_to_stop ? "stopped" : "ran to completion");
+      say(asked_to_stop ? "stopped" : "ran to completion");
       finished = true;
     });
     // Dismiss the menu step 7 left open, or it owns the next click — which is

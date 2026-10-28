@@ -485,7 +485,7 @@ Value array_sort(Context& ctx, CallArgs& a) {
   uint64_t len;
   JS_TRY(this_array_like(ctx, a.this_value, &o, &len));
   std::vector<Value> sorted;
-  uint64_t holes;
+  uint64_t holes = 0;
   JS_TRY(sort_indexed(ctx, o, len, a[0], &sorted, &holes));
   uint64_t k = 0;
   for (; k < sorted.size(); ++k) JS_TRY(set_idx(ctx, o, k, sorted[k]));

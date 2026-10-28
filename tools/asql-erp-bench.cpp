@@ -18,6 +18,7 @@
 //
 // Build target: aios-asql-erp-bench  (added to CMakeLists.txt)
 
+#include "aios/hal/net.hpp"
 #include <arpa/inet.h>
 #include <cassert>
 #include <chrono>
@@ -103,16 +104,15 @@ struct AsqlConn {
 
     bool connect(const std::string& h, int p) {
         host = h; port = p;
-        addrinfo hints{}, *res;
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(h.c_str(), std::to_string(p).c_str(), &hints, &res) != 0) return false;
-        fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (fd < 0) { freeaddrinfo(res); return false; }
-        if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-            close(fd); fd = -1; freeaddrinfo(res); return false;
-        }
-        freeaddrinfo(res);
+        auto addr = aios::hal::resolve_ipv4(h);   // the engine's resolver: a static build has no NSS
+        if (!addr.ok()) return false;
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons((uint16_t)p);
+        to.sin_addr.s_addr = *addr;
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&to), sizeof to) != 0) { close(fd); fd = -1; return false; }
         return true;
     }
 

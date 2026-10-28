@@ -106,6 +106,10 @@ int main() {
       case ColumnEncoding::RLE: enc_name = "RLE (Run-Length Encoded)"; break;
       case ColumnEncoding::DecimalScaled: enc_name = "DecimalScaled (Fixed-Pt FOR)"; break;
       case ColumnEncoding::FSST: enc_name = "FSST Symbol Table (256-dict)"; break;
+      case ColumnEncoding::SegmentFOR: enc_name = "SegmentFOR (per-segment FOR)"; break;
+      case ColumnEncoding::ALP: enc_name = "ALP (decimal doubles)"; break;
+      case ColumnEncoding::TemporalDays: enc_name = "TemporalDays (dates)"; break;
+      case ColumnEncoding::TemporalSeconds: enc_name = "TemporalSeconds (datetimes)"; break;
     }
     std::printf("  Col %2zu: %-16s | Encoding: %-28s | Width: %2u-bit | Mem: %5zu KB\n",
                 c, tbl->columns[c].name.c_str(), enc_name, (unsigned)cs.bit_width_, col_mem / 1024);

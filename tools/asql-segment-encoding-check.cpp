@@ -4,6 +4,7 @@
 // boundaries, written out and read back - and after every step each cell,
 // each aggregate and each filtered count must be what the model says.
 #undef NDEBUG
+#include <filesystem>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "aios/userland/portable_int128.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
 
@@ -95,7 +97,7 @@ void verify(SqlDatabase& db, const std::vector<Row>& model, const char* step) {
     }
   }
   // Aggregates and filters through the query engine.
-  __int128 ts_sum = 0, seq_sum = 0;
+  AIOS_INT128 ts_sum = 0, seq_sum = 0;
   int64_t ts_min = INT64_MAX, ts_max = INT64_MIN, seq_max = INT64_MIN;
   size_t ts_n = 0, amt_n = 0, ts_gt = 0, seq_le = 0;
   double amt_min = 1e300, amt_max = -1e300;
@@ -106,8 +108,8 @@ void verify(SqlDatabase& db, const std::vector<Row>& model, const char* step) {
     if (m.seq) { seq_sum += *m.seq; seq_max = std::max(seq_max, *m.seq); seq_le += *m.seq <= seq_pivot; }
     if (m.amt) { amt_n++; double d = std::strtod(m.amt->c_str(), nullptr); amt_min = std::min(amt_min, d); amt_max = std::max(amt_max, d); }
   }
-  auto i128 = [](__int128 v) {
-    bool neg = v < 0; unsigned __int128 u = neg ? -(unsigned __int128)v : v; std::string s;
+  auto i128 = [](AIOS_INT128 v) {
+    bool neg = v < 0; AIOS_UINT128 u = neg ? -(AIOS_UINT128)v : v; std::string s;
     do { s.insert(s.begin(), char('0' + (int)(u % 10))); u /= 10; } while (u);
     return neg ? "-" + s : s;
   };
@@ -127,7 +129,7 @@ void verify(SqlDatabase& db, const std::vector<Row>& model, const char* step) {
           "%s: ts > pivot %s want %zu", step, q1(db, "SELECT COUNT(*) FROM segcheck WHERE ts > " + std::to_string(ts_pivot)).c_str(), ts_gt);
   }
   {
-    __int128 small = 0;
+    AIOS_INT128 small = 0;
     for (const Row& m : model) if (m.seq && *m.seq < 1000000) small += *m.seq;
     const std::string got = q1(db, "SELECT SUM(seq) FROM segcheck WHERE seq < 1000000");
     CHECK(got == i128(small), "%s: SUM(seq) of the small ones %s want %s", step, got.c_str(), i128(small).c_str());
@@ -160,7 +162,7 @@ void verify(SqlDatabase& db, const std::vector<Row>& model, const char* step) {
 int main() {
   std::printf("=== ASQL per-segment encoding check (SegmentFOR, ALP) ===\n");
   const std::string root = "/tmp/aios-asql-segcheck";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);
