@@ -98,7 +98,6 @@ allocated CPU slots.
 | [docs/console.md](docs/console.md) | the `aios` console, roots, the resident machine, the familiar shell, entities and capabilities, the optional mind |
 | [docs/asql.md](docs/asql.md) | running ASQL, the MySQL wire server, replicating MariaDB, write modes, Things and Cells, running it as a service |
 | [docs/things.md](docs/things.md) | Things, the practical guide: one worked example from a first Thing to acting on it safely (shadow, then live), looking back (`AS OF`, `EXPLAIN`), previewing a write (`WHAT IF`) and building one Thing on another (`INTO`) |
-| [docs/things.md](docs/things.md) | practical guide to Things: live queries, shadow actions, time travel, lineage, and what-if previews |
 | [docs/network.md](docs/network.md) | the web server, TLS, SSH, linking two machines, moving a running workload, the fleet relay and gateway, the native TCP/IP stack |
 | [docs/fleet.md](docs/fleet.md) | several machines as one: membership and keys, discovery, remote devices and memory, moving running work, fleet-wide SQL, the orchestrator, running a fleet |
 | [docs/resources.md](docs/resources.md) | devices, memory types and migration, tensors, quotas, the object store and AQL, checkpoints, the sidecars and their C ABI |
