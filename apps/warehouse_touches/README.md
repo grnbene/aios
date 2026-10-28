@@ -4,7 +4,7 @@ A report of who touched what in the warehouse, and how much: receiving, picking,
 scans and customer pickups, per person, over a range of days. It replaces the PHP report `touches.php` and gives the
 same numbers.
 
-Related: [Running Grain apps](../../docs/grain-apps.md) · [Writing Grain apps](../../docs/grain-app-writing.md) ·
+Working on it: [DEVELOPING.md](DEVELOPING.md) · Related: [Running Grain apps](../../docs/grain-apps.md) · [Writing Grain apps](../../docs/grain-app-writing.md) ·
 [Things](../../docs/things.md)
 
 ---
