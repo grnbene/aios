@@ -9,7 +9,7 @@
 
 	<detectors>
 		<extension priority="1.0">gr</extension>
-		<match-content lines="1" priority="1.0">^#!\s*.*grain</match-content>
+		<match-content lines="1" priority="1.0">^\#!\s*.*grain</match-content>
 	</detectors>
 
 	<indentation>
@@ -66,7 +66,7 @@
 				<capture number="1" name="grain.comment.content" />
 			</scope>
 			<scope name="grain.comment.line.hash" spell-check="true">
-				<expression>#(.*)$</expression>
+				<expression>\#(.*)$</expression>
 				<capture number="1" name="grain.comment.content" />
 			</scope>
 		</collection>
