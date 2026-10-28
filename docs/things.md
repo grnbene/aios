@@ -1,8 +1,26 @@
 # Things: A Practical Guide
 
-A **Thing** is a query whose result ASQL maintains incrementally. You declare the query once; whenever underlying table data changes, the engine identifies the affected keys and updates only those records. Applications read the live results using `SHOW THING`, ensuring fresh data without repeated aggregate queries or external cache invalidation.
+A **Thing** is a piece of business state - an order, a stock position, a warehouse's load - that the database
+keeps current for you. At its core it is an **incrementally maintained materialized view** (IVM): you declare a
+query once, and whenever a write changes the tables under it, ASQL recomputes only the keys that write touched.
+Applications read the live result with `SHOW THING`: no repeated aggregate queries, no cache to invalidate. (One
+exception to "only the keys touched": a change to a table the Thing joins without its partition column recomputes
+the whole Thing - see "When to Avoid".)
 
-In database terms, a Thing is an **incrementally maintained materialized view** (IVM). Unlike materialized views that are refreshed whole on demand, ASQL hooks table mutations and recomputes only the partitions a write touched. (One exception: a change to a table the Thing joins without its partition column recomputes the whole Thing - see "When to Avoid".)
+Around that core, a Thing does what usually takes several other systems:
+
+| A Thing can | Usually done by |
+|---|---|
+| keep a query's answer current, per key | an incrementally maintained materialized view |
+| act when a value *becomes* true (`WHEN ... DO`, shadow then live) | a trigger, or a rules engine |
+| tell readers the moment it changes (`WAIT THING`, a grain pane's `watch`) | change notification, pub/sub |
+| remember what it was, when and why (`HISTORY`, `AS OF`) | a temporal table, an audit log |
+| show which rows make up a value (`EXPLAIN THING`) | a data-lineage tool |
+| preview what a write would do to it (`WHAT IF`) | a staging copy, or a transaction rolled back by hand |
+| be a table other queries and Things build on (`INTO`) | a summary table kept by triggers or a batch job |
+
+This guide covers the query-built Things above. Other kinds of Thing - computed by a program, reconciling several
+source systems, allocating stock, running once at a time, following another machine - are listed at the end.
 
 For complete grammar specifications and engine internals, see [asql.md](asql.md#things).
 
@@ -190,6 +208,27 @@ Managed table characteristics:
 - **Managed integrity**: Direct client writes to managed tables (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`, `DROP`, `RENAME`, `LOAD DATA`) are rejected, naming the Thing. Dropping the parent Thing (`DROP THING orders`) drops the associated managed table. The table must not exist before `CREATE`.
 - **Data types**: Values are stored as text (matching `SHOW THING` formatting); downstream numeric aggregations should use explicit `CAST` expressions.
 - **Cycle prevention**: Recursive and circular dependencies between chained Things are validated and rejected at `CREATE` time.
+
+---
+
+## Other Kinds of Thing
+
+The Things in this guide are made by a query. The same engine has other kinds, for other jobs:
+
+- **Grain Things** (`CREATE THING ... GRAIN KEY ... AS '<program>'`): values computed by a Grain program instead of a
+  query - for state a `GROUP BY` cannot express (the warehouse app's `touch_hour` is one). See
+  [asql.md - Grain Things](asql.md#grain-things).
+- **Conflicts across sources** (`SOURCE BY`, `RESOLVE THING`, `CHECK THING`): one Thing fed by several systems,
+  keeping each side's values, settling the fields they disagree on, and checking the picks are consistent. See
+  [asql.md - Conflicts](asql.md#conflicts-source-by-keeps-both-sides) and
+  [Settling conflicts together](asql.md#settling-conflicts-together-and-checking-the-picks).
+- **Resources and claims** (`RESOURCE`, `CLAIMS`): stock that orders claim, with the shares allocated again as
+  either side changes (`SHOW THING ALLOCATION`). Only named in [asql.md](asql.md#things) so far; the syntax is in the
+  error messages of `sql_things.cpp`.
+- **Event Things** (`CREATE THING <name> AT '<time>' GRAIN ...`): a program that runs once at its time, writes what
+  it was given leave to (`AIOS_THING_WRITES=1`), and leaves a receipt. Also only named in asql.md so far.
+- **Mirrors** (`CREATE THING <name> MIRROR <kind> ON <machine>`): another machine's Things, followed over the fleet,
+  with history and alerts of their own here. See [fleet.md - Mirrors](fleet.md#mirrors-things-about-another-machine).
 
 ---
 
