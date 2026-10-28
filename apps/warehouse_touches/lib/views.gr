@@ -682,6 +682,8 @@ let PAGE_CSS = join([
   ".status { display: inline-flex; align-items: center; gap: 10px; margin: -6px 0 16px; padding: 5px 12px; border-radius: 999px; font-size: 13px; border: 1px solid; }",
   ".status b { letter-spacing: .06em; } .status .btn { padding: 4px 12px; font-size: 13px; }",
   ".status.live { background: rgba(58, 167, 118, .12); border-color: var(--move); }",
+  "header .status { margin: 0; } button.status { font: inherit; font-size: 13px; color: inherit; cursor: pointer; }",
+  "button.status small { opacity: .65; } button.status:hover { background: rgba(58, 167, 118, .22); }",
   ".status.paused { background: rgba(232, 145, 45, .16); border-color: var(--pick); } .status.paused { padding-right: 6px; }",
   ".pulse-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--move); animation: live 1.6s ease-in-out infinite; }",
   "@keyframes live { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }",
@@ -776,11 +778,18 @@ fn theme_toggle_node() {
     html_raw(sun), html_raw(moon), el("span", {"class": "theme-svg sun"}, "Light"), el("span", {"class": "theme-svg moon"}, "Dark"))
 }
 
-// Live or paused (service.gr's view): live, the page follows the Thing; paused - hours or days picked, or a range
-// that ended before today - it keeps the figures it read until the viewer changes what is picked or presses Refresh.
+// Live or paused (service.gr's view): live, the page follows the Thing, and clicking LIVE pauses it; paused - by the
+// viewer, hours or days picked, or a range that ended before today - it keeps the figures it read until the viewer
+// resumes, changes what is picked or presses Refresh.
 fn status_node(report, state) {
   if not state.paused {
-    return el("div", {"class": "status live"}, el("i", {"class": "pulse-dot"}), el("b", "LIVE"))
+    return el("button", {"type": "button", "class": "status live", "title": "Pause: keep these figures still",
+                         "on_click": fn() { state.hold = true; state.held = nil }},
+              el("i", {"class": "pulse-dot"}), el("b", "LIVE"), el("small", "Pause"))
+  }
+  if state.hold {
+    return el("div", {"class": "status paused"}, el("b", "PAUSED"), "As of " + when(report.as_of),
+      el("button", {"type": "button", "class": "btn primary", "on_click": fn() { state.hold = false; state.held = nil }}, "Resume"))
   }
   return el("div", {"class": "status paused"}, el("b", "PAUSED"), "Showing figures as of " + when(report.as_of),
     el("button", {"type": "button", "class": "btn", "on_click": fn() { state.held = nil }}, "Refresh"),
@@ -791,6 +800,7 @@ fn status_node(report, state) {
       state.stop = r[1]
       state.span = nil
       state.days = nil
+      state.hold = false
       state.held = nil
     }}, "Back to live"))
 }
@@ -804,6 +814,7 @@ fn dashboard_node(report, state) {
   return el("div", {"class": "page"},
     el("header",
       el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
+      status_node(report, state),
       el("div", {"class": "clock", "aria-live": "off", "data-ui-keep": true}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
       el("form", {"onsubmit": "return false"},
         theme_toggle_node(),
@@ -818,7 +829,6 @@ fn dashboard_node(report, state) {
         }}, "Run"),
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
-    status_node(report, state),
     el("div", {"id": "live"}, live_node(report, state, timeline_node(report, state))),
     el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS))
 }
