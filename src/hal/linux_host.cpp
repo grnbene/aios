@@ -793,6 +793,7 @@ namespace {
 // glibc program cannot load a host library safely - the library brings a second libc (the OpenCL loader crashed
 // in clGetPlatformIDs at start), and what it needs from libc or libm is not exported to it (a mind plugin:
 // "undefined symbol: log2") - so such a build loads none.
+#if !defined(AIOS_STATIC_LINK)
 bool statically_linked() {
   static const bool s = [] {
     bool interp = false;
@@ -805,10 +806,16 @@ bool statically_linked() {
   }();
   return s;
 }
+#endif
 thread_local std::string tls_library_error;
 }  // namespace
 
 void* load_library(const std::string& name) {
+#if defined(AIOS_STATIC_LINK)
+  tls_library_error = name + ": this aios is statically linked, and a static program cannot load host libraries "
+                      "(accelerators, mind plugins); a dynamically linked build can";
+  return nullptr;
+#else
   if (statically_linked()) {
     tls_library_error = name + ": this aios is statically linked, and a static program cannot load host libraries "
                         "(accelerators, mind plugins); a dynamically linked build can";
@@ -818,6 +825,7 @@ void* load_library(const std::string& name) {
   void* h = dlopen(name.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) { const char* e = dlerror(); tls_library_error = e ? e : name + ": not loaded"; }
   return h;
+#endif
 }
 void* library_symbol(void* handle, const std::string& symbol) { return handle ? dlsym(handle, symbol.c_str()) : nullptr; }
 void unload_library(void* handle) { if (handle) dlclose(handle); }

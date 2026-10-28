@@ -195,7 +195,7 @@ int run_app_command(hal::Host& h, const std::vector<std::string>& args, const Ap
     auto b = pack_dir(h, dir);
     if (!b.ok()) { errs << "grain app: " << b.error().message << "\n"; return kFailed; }
     auto store = make_dir_store(h, dir + "/.grain");
-    Host apps(h, *store, {env.setup_vm, env.capabilities, "local"});
+    Host apps(h, *store, {env.setup_vm, env.capabilities, "local", nullptr, nullptr, nullptr});
     std::vector<std::string> report;
     auto r = apps.deploy(*b, report);
     for (const auto& l : report) out << l << "\n";

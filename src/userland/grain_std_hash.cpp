@@ -280,9 +280,9 @@ Value bi_jwt_verify(Vm&, std::vector<Value>& args, std::string& error) {
 
   // exp / nbf (RFC 7519 NumericDate): a number of seconds; anything else is a malformed token, not "no limit".
   const double now_sec = static_cast<double>(std::time(nullptr));
-  auto seconds = [](const Value* v, double& out) {
-    if (v->type == Type::Int) { out = static_cast<double>(v->i); return true; }
-    if (v->type == Type::Real) { out = v->d; return true; }
+  auto seconds = [](const Value* v, double& secs) {
+    if (v->type == Type::Int) { secs = static_cast<double>(v->i); return true; }
+    if (v->type == Type::Real) { secs = v->d; return true; }
     return false;
   };
   double t = 0;

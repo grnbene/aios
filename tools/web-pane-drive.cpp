@@ -400,36 +400,36 @@ int main(int argc, char** argv) {
           desk.input_text(t);
           for (int i = 0; i < 4; ++i) { desk.render_desktop(kernel); hal::sleep_ms(90); }
         } else if (!one.empty()) {
-          int k = 0;
-          if (one == "Enter") k = hal::KeyEnter;
-          else if (one == "Backspace") k = hal::KeyBackspace;
-          else if (one == "Escape") k = hal::KeyEscape;
-          else if (one == "Tab") k = hal::KeyTab;
-          else if (one == "CtrlA") k = hal::KeyCtrlA;
-          else if (one == "CtrlC") k = hal::KeyCtrlC;
-          else if (one == "CtrlV") k = hal::KeyCtrlV;
-          else if (one == "CtrlX") k = hal::KeyCtrlX;
-          else if (one == "CtrlL") k = hal::KeyCtrlL;
-          else if (one == "CtrlR") k = hal::KeyCtrlR;
-          else if (one == "F5") k = hal::KeyF5;
-          else if (one == "PageDown") k = hal::KeyPageDown;
-          else if (one == "PageUp") k = hal::KeyPageUp;
-          else if (one == "CtrlF") k = hal::KeyCtrlF;
+          int key = 0;
+          if (one == "Enter") key = hal::KeyEnter;
+          else if (one == "Backspace") key = hal::KeyBackspace;
+          else if (one == "Escape") key = hal::KeyEscape;
+          else if (one == "Tab") key = hal::KeyTab;
+          else if (one == "CtrlA") key = hal::KeyCtrlA;
+          else if (one == "CtrlC") key = hal::KeyCtrlC;
+          else if (one == "CtrlV") key = hal::KeyCtrlV;
+          else if (one == "CtrlX") key = hal::KeyCtrlX;
+          else if (one == "CtrlL") key = hal::KeyCtrlL;
+          else if (one == "CtrlR") key = hal::KeyCtrlR;
+          else if (one == "F5") key = hal::KeyF5;
+          else if (one == "PageDown") key = hal::KeyPageDown;
+          else if (one == "PageUp") key = hal::KeyPageUp;
+          else if (one == "CtrlF") key = hal::KeyCtrlF;
           else if (one == "ShiftEnter" || one == "AltLeft" || one == "AltRight") {
             // A modifier is held for exactly this key, the way the window system reports it.
             userland::web_pane_set_modifiers(one == "ShiftEnter", one != "ShiftEnter");
-            k = one == "ShiftEnter" ? hal::KeyEnter : one == "AltLeft" ? hal::KeyLeft : hal::KeyRight;
-            desk.input_key(k);
+            key = one == "ShiftEnter" ? hal::KeyEnter : one == "AltLeft" ? hal::KeyLeft : hal::KeyRight;
+            desk.input_key(key);
             userland::web_pane_set_modifiers(false, false);
             for (int i = 0; i < 10; ++i) { desk.render_desktop(kernel); hal::sleep_ms(120); }
-            k = 0;
+            key = 0;
           }
-          else if (one == "ZoomIn") k = userland::kWebKeyZoomIn;
-          else if (one == "ZoomOut") k = userland::kWebKeyZoomOut;
-          else if (one == "ZoomReset") k = userland::kWebKeyZoomReset;
-          if (k) {
+          else if (one == "ZoomIn") key = userland::kWebKeyZoomIn;
+          else if (one == "ZoomOut") key = userland::kWebKeyZoomOut;
+          else if (one == "ZoomReset") key = userland::kWebKeyZoomReset;
+          if (key) {
             std::printf("        key      : %s\n", one.c_str());
-            desk.input_key(k);
+            desk.input_key(key);
             for (int i = 0; i < 10; ++i) { desk.render_desktop(kernel); hal::sleep_ms(120); }
           }
         }

@@ -25,6 +25,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+# A fully static link (-static, as build-static is configured): static glibc cannot load host libraries or use the
+# host's NSS (dlopen, getaddrinfo, getpwuid_r warn at link time and misbehave on a host with another glibc). The
+# HAL then loads no libraries and resolves names and accounts itself.
+if(CMAKE_EXE_LINKER_FLAGS MATCHES "(^| )-static( |$)")
+  add_compile_definitions(AIOS_STATIC_LINK=1)
+endif()
 if(MSVC)
   # sql_database.cpp alone is 28k+ lines of template-heavy SQL evaluation
   # code: its object file's section count overflows the COFF 32-bit limit

@@ -70,7 +70,6 @@ Result<FetchResult> decode_data_url(const std::string& url) {
   return Result<FetchResult>(std::move(fr));
 }
 
-bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
 
 std::string lowered(const std::string& s) {

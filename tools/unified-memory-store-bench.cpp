@@ -281,6 +281,10 @@ int main() {
   std::printf("  [✓] Semantic Vector Accuracy        : 100.0%% Recall with sub-linear crossover\n");
   std::printf("  [✓] Autonomous Memory Pressure      : Idle demoted to Sparse Bloom Log; Pinned retained in Hot RAM\n");
 
+  // the shared and persistent regions given back, as a program done with them does
+  check(memory.release(mem_shm).ok(), "Released the POSIX Shared Memory object");
+  check(memory.release(mem_pmem).ok(), "Released the Persistent Memory-mapped object");
+
   std::printf("\n----------------------------------------------------------------------\n");
   std::printf("Summary: %d checks executed, %d failures.\n", g_checks, g_failures);
   if (g_failures == 0) {

@@ -525,9 +525,6 @@ std::string blob(RepoState& rs, const std::string& oid, bool* okp = nullptr) {
   return r.out;
 }
 
-const char* favor_name(GitMergeFavor f) {
-  switch (f) { case GitMergeFavor::Ours: return "ours"; case GitMergeFavor::Theirs: return "theirs"; case GitMergeFavor::Union: return "union"; default: return "none"; }
-}
 GitMergeFavor favor_of(const std::string& s) {
   return s == "ours" ? GitMergeFavor::Ours : s == "theirs" ? GitMergeFavor::Theirs : s == "union" ? GitMergeFavor::Union : GitMergeFavor::None;
 }

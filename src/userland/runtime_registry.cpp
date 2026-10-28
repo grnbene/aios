@@ -347,7 +347,7 @@ std::string ps_text(bool json) {
     FILE* f = std::fopen(t, "r");
     if (!f) continue;
     char line[512];
-    std::fgets(line, sizeof line, f);
+    if (!std::fgets(line, sizeof line, f)) { std::fclose(f); continue; }   // the header line
     while (std::fgets(line, sizeof line, f)) {
       char local[128], rem[128], st[8];
       unsigned long inode = 0;

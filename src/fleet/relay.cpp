@@ -352,9 +352,9 @@ Result<uint16_t> RelayHub::start(uint16_t port, bool loopback_only) {
         // The quote follows the id: attested, signature, signer, then the PCRs it covers.
         capability::TPMQuote q;
         if (ar.remaining() == 0) { refuse("this hub requires a TPM quote (join with attest=1)"); continue; }
-        ByteSpan att = ar.bytes(), sig = ar.bytes(), pub = ar.bytes();
+        ByteSpan att = ar.bytes(), quote_sig = ar.bytes(), pub = ar.bytes();
         uint32_t npcr = ar.u32();
-        q.attested.assign(att.begin(), att.end()); q.signature.assign(sig.begin(), sig.end()); q.signer_public.assign(pub.begin(), pub.end());
+        q.attested.assign(att.begin(), att.end()); q.signature.assign(quote_sig.begin(), quote_sig.end()); q.signer_public.assign(pub.begin(), pub.end());
         for (uint32_t i = 0; i < npcr && ar.ok() && i < 24; ++i) {
           capability::PcrValue v; v.index = ar.u32(); ByteSpan d = ar.raw(32);
           if (d.size() == 32) std::memcpy(v.digest.data(), d.data(), 32);

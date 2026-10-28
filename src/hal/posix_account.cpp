@@ -7,11 +7,37 @@
 #include <pwd.h>
 #include <unistd.h>
 #include <vector>
+#include <cstdio>
+#include <string>
 
 namespace aios::hal {
 
 Result<LocalAccount> local_account() {
   const uid_t uid = ::getuid();
+#if defined(AIOS_STATIC_LINK)
+  // A static glibc's getpwuid_r loads the host's NSS libraries at run time: /etc/passwd is read here instead
+  // (name:password:uid:gid:gecos:home:shell).
+  {
+    FILE* f = std::fopen("/etc/passwd", "re");
+    if (!f) return Result<LocalAccount>(Status::NotFound, "uid " + std::to_string(uid) + ": /etc/passwd cannot be read");
+    char line[4096];
+    while (std::fgets(line, sizeof line, f)) {
+      std::vector<std::string> fld;
+      std::string cur;
+      for (const char* p = line; *p && *p != '\n'; ++p) { if (*p == ':') { fld.push_back(cur); cur.clear(); } else cur += *p; }
+      fld.push_back(cur);
+      if (fld.size() < 7 || fld[2] != std::to_string(uid)) continue;
+      std::fclose(f);
+      LocalAccount a;
+      a.name = fld[0];
+      a.home = fld[5];
+      a.uid = (uint32_t)uid;
+      return a;
+    }
+    std::fclose(f);
+    return Result<LocalAccount>(Status::NotFound, "uid " + std::to_string(uid) + " has no entry in /etc/passwd");
+  }
+#else
   long size = ::sysconf(_SC_GETPW_R_SIZE_MAX);
   std::vector<char> buf(size > 0 ? (size_t)size : 16384);
   for (;;) {
@@ -27,6 +53,7 @@ Result<LocalAccount> local_account() {
     a.uid = (uint32_t)uid;
     return a;
   }
+#endif
 }
 
 std::string local_hostname() {

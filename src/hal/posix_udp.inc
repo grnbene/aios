@@ -6,12 +6,9 @@ inline bool resolve_v4(const std::string& host, in_addr& out) {
   if (host.empty() || host == "0.0.0.0") { out.s_addr = htonl(INADDR_ANY); return true; }
   if (host == "255.255.255.255") { out.s_addr = htonl(INADDR_BROADCAST); return true; }
   if (::inet_pton(AF_INET, host.c_str(), &out) == 1) return true;
-  addrinfo hints{};
-  hints.ai_family = AF_INET;
-  addrinfo* res = nullptr;
-  if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
-  out = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
-  ::freeaddrinfo(res);
+  auto a = resolve_ipv4(host);   // the HAL's resolver (its own in a static build)
+  if (!a.ok()) return false;
+  out.s_addr = *a;
   return true;
 }
 

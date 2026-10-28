@@ -5,6 +5,7 @@
 //   roles=app-admin,sql: `app ...` command lines and SQL run; other command lines (shell) are refused;
 //   no roles listed: today's access;
 //   a peer not in the roster (roles offered for it but no key): not limited by them.
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -31,7 +32,7 @@ static bool refused_for_role(const std::string& msg) { return msg.find(" role he
 
 int main() {
   const std::string root = "/tmp/aios-fleet-roles-check";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);
@@ -154,7 +155,7 @@ int main() {
 
   set_link_identity(nullptr);
   (*k).reset();
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   std::printf(failures ? "fleet roles check: %d failure(s)\n" : "fleet roles check: all passed\n", failures);
   return failures ? 1 : 0;
 }

@@ -76,6 +76,10 @@ const char* net_backend();
 // bind_host "" or "0.0.0.0" = every interface.
 Result<std::unique_ptr<UdpSocket>> udp_open(const std::string& bind_host, uint16_t port);
 Result<std::unique_ptr<Connection>> net_connect(const std::string& host, uint16_t port, int timeout_ms);
+// A host name (or IPv4 literal) to an IPv4 address, in network byte order. The host's resolver in a dynamically
+// linked build; in a statically linked one (AIOS_STATIC_LINK) the engine's own - the literal, /etc/hosts, then DNS
+// to the servers /etc/resolv.conf names - since static glibc's resolver loads the host's NSS libraries at run time.
+Result<uint32_t> resolve_ipv4(const std::string& host, int timeout_ms = 5000);
 
 // The client side of a named pipe: the Windows OpenSSH agent answers at
 // \\.\pipe\openssh-ssh-agent, and nothing else this machine talks to lives

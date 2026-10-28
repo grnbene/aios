@@ -404,8 +404,9 @@ void Kernel::load_or_create_node_key() {
     std::memcpy(node_seed_.data(), d->data() + 4, node_seed_.size());
   } else {
     host_->random(MutableByteSpan(node_seed_.data(), node_seed_.size()));
-    ByteBuffer b; Writer w(b); w.u32(kNodeIdentityMagic);
-    b.insert(b.end(), node_seed_.begin(), node_seed_.end());
+    ByteBuffer b(4 + node_seed_.size());   // the magic, then the seed: written into place
+    for (int i = 0; i < 4; ++i) b[(size_t)i] = (uint8_t)(kNodeIdentityMagic >> (8 * i));
+    std::memcpy(b.data() + 4, node_seed_.data(), node_seed_.size());
     auto wr = host_->create_exclusive_private(path, b);
     std::fill(b.begin(), b.end(), 0);
     if (!wr.ok()) { node_seed_.fill(0); node_key_problem_ = path + ": " + wr.error().message; return; }

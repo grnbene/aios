@@ -4,6 +4,7 @@
 //   another key, and one replaying an earlier signature are refused;
 //   listed with a member key only, or a hub without a members file: as before, whether or not the member signs;
 //   a signing member taken off the members file is dropped within seconds.
+#include <filesystem>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +49,7 @@ static std::string attach(uint16_t port, const std::string& cluster, const Id128
 
 int main() {
   const std::string dir = "/tmp/aios-fleet-signed-attach-check";
-  std::system(("rm -rf " + dir + " && mkdir -p " + dir).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(dir, fs_err); std::filesystem::create_directories(dir, fs_err); }
   const std::string members = dir + "/members";
   const std::string cluster = "cluster-key-for-the-check";
   Key a(1), b(2), stranger(3);
@@ -118,7 +119,7 @@ int main() {
   CHECK(r != "ok", "no members file, the wrong cluster key: refused, signature or not");
   open_hub.stop();
 
-  std::system(("rm -rf " + dir).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(dir, fs_err); }
   std::printf(failures ? "fleet signed attach check: %d failure(s)\n" : "fleet signed attach check: all passed\n", failures);
   return failures ? 1 : 0;
 }

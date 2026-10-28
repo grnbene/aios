@@ -242,9 +242,9 @@ int main(int argc, char** argv) {
     OAuth other_process(*host, root);
     auto pend = other_process.take_pending("mock");
     check(pend.ok() && pend->state == s->pending.state && pend->verifier == s->pending.verifier, "another process picks it up");
-    auto red = OAuth::parse_redirect(loc);
-    check(red.ok() && !red->code.empty(), "the pasted address parses");
-    auto tk = other_process.finish(*cfg, *pend, *red);
+    auto pasted = OAuth::parse_redirect(loc);
+    check(pasted.ok() && !pasted->code.empty(), "the pasted address parses");
+    auto tk = other_process.finish(*cfg, *pend, *pasted);
     check(tk.ok() && tk->account == "sean@example.com", "and finishes the sign-in");
     check(!other_process.take_pending("mock").ok(), "a pending sign-in is single use");
     check(!OAuth::parse_redirect("hello").ok(), "pasting something that is not an address is refused with a clear message");
@@ -252,11 +252,11 @@ int main(int argc, char** argv) {
 
   // --- revoke ---
   {
-    OAuthToken t = *oauth.load_token("mock", "sean@example.com");
+    OAuthToken held = *oauth.load_token("mock", "sean@example.com");
     auto before = counter(base, "revoked");
     auto rv = oauth.revoke("mock", "sean@example.com");
     check(rv.ok() && counter(base, "revoked") == before + 1 && !oauth.load_token("mock", "sean@example.com").ok(), "revoke() tells the provider and forgets the token");
-    (void)t;
+    (void)held;
   }
 
   std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);

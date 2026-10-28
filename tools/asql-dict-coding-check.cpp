@@ -6,6 +6,7 @@
 // LIKE, GROUP BY and ORDER BY must answer as a model of the table says -
 // after more writes, a dictionary compaction, and a restart from the store.
 #undef NDEBUG
+#include <filesystem>
 #include <cstdio>
 #include <cctype>
 #include <cstdlib>
@@ -203,7 +204,7 @@ int main() {
   setenv("AIOS_STORE_MAINTAIN_MS", "2000", 1);
   setenv("AIOS_ZONE_VERIFY", "1", 1);   // every incremental zone-map update checked against a rescan
   const std::string root = "/tmp/aios-asql-dictcheck";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

@@ -212,13 +212,17 @@ void civil_from_days(int64_t days_since_0001, int* y, unsigned* m, unsigned* d) 
 std::string date_text(int64_t days_since_0001) {
   int y; unsigned m, d;
   civil_from_days(days_since_0001, &y, &m, &d);
-  char b[16];
+  char b[40];   // a year at its widest (a damaged value), not only four digits
   std::snprintf(b, sizeof b, "%04d-%02u-%02u", y, m, d);
   return b;
 }
 
 // Seconds-and-fraction since midnight, `scale` digits of fraction.
 std::string time_text(uint64_t units, int scale) {
+  // TDS's TIME scale is 0..7 and it comes off the wire as a byte: anything else is clamped, not trusted (a scale
+  // of 255 overflowed the divisor and the buffer)
+  if (scale < 0) scale = 0;
+  if (scale > 7) scale = 7;
   uint64_t div = 1;
   for (int i = 0; i < scale; ++i) div *= 10;
   const uint64_t secs = units / div, frac = units % div;

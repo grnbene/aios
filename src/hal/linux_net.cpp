@@ -16,6 +16,9 @@
 #include <atomic>
 #include <algorithm>
 #include <mutex>
+#include <vector>
+#include <string>
+#include <cctype>
 #if __has_include(<linux/io_uring.h>)
 #include <linux/io_uring.h>
 #include <sys/mman.h>
@@ -364,23 +367,185 @@ Result<std::unique_ptr<Listener>> net_listen(uint16_t port, bool loopback_only) 
   return std::unique_ptr<Listener>(new TcpListener(fd, ntohs(a.sin_port)));
 }
 
-Result<std::unique_ptr<Connection>> net_connect(const std::string& host, uint16_t port, int timeout_ms) {
+#if defined(AIOS_STATIC_LINK)
+namespace {
+// The engine's own resolver, for a statically linked build (see resolve_ipv4 in net.hpp).
+std::string read_small_file(const char* path) {
+  std::string out;
+  int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return out;
+  char buf[4096];
+  for (ssize_t n; (n = ::read(fd, buf, sizeof buf)) > 0 && out.size() < (1u << 20);) out.append(buf, (size_t)n);
+  ::close(fd);
+  return out;
+}
+std::vector<std::string> fields_of(const std::string& line) {
+  std::vector<std::string> f;
+  size_t i = 0;
+  while (i < line.size()) {
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+    if (i >= line.size() || line[i] == '#' || line[i] == ';') break;
+    size_t j = i;
+    while (j < line.size() && line[j] != ' ' && line[j] != '\t' && line[j] != '#') ++j;
+    f.push_back(line.substr(i, j - i));
+    i = j;
+  }
+  return f;
+}
+bool same_name(std::string a, std::string b) {
+  if (!a.empty() && a.back() == '.') a.pop_back();
+  if (!b.empty() && b.back() == '.') b.pop_back();
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+  return true;
+}
+// One A-record query to one server over UDP: the first address in the answer (a CNAME chain in the same answer
+// is followed by taking its A record).
+bool dns_a(uint32_t server, const std::string& name, int timeout_ms, uint32_t* out) {
+  int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return false;
+  std::vector<uint8_t> q;
+  // an unpredictable query id, so an answer cannot be guessed
+  uint16_t id = 0;
+  {
+    const int rnd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    const bool got = rnd >= 0 && ::read(rnd, &id, sizeof id) == (ssize_t)sizeof id;
+    if (rnd >= 0) ::close(rnd);
+    if (!got) id = (uint16_t)(::getpid() ^ (uint16_t)std::chrono::steady_clock::now().time_since_epoch().count());
+  }
+  q.push_back((uint8_t)(id >> 8)); q.push_back((uint8_t)id);
+  q.push_back(0x01); q.push_back(0x00);           // recursion desired
+  q.push_back(0); q.push_back(1);                 // one question
+  for (int i = 0; i < 6; ++i) q.push_back(0);
+  size_t s = 0;
+  while (s <= name.size()) {
+    size_t e = name.find('.', s);
+    if (e == std::string::npos) e = name.size();
+    if (e > s) {
+      if (e - s > 63) { ::close(fd); return false; }
+      q.push_back((uint8_t)(e - s));
+      q.insert(q.end(), name.begin() + (long)s, name.begin() + (long)e);
+    }
+    s = e + 1;
+  }
+  q.push_back(0);
+  q.push_back(0); q.push_back(1);                 // QTYPE A
+  q.push_back(0); q.push_back(1);                 // QCLASS IN
+  sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(53); a.sin_addr.s_addr = server;
+  if (::sendto(fd, q.data(), q.size(), 0, (sockaddr*)&a, sizeof a) != (ssize_t)q.size()) { ::close(fd); return false; }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  uint8_t r[1500];
+  for (;;) {
+    const int left = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) break;
+    pollfd pf{fd, POLLIN, 0};
+    if (::poll(&pf, 1, left) <= 0) break;
+    sockaddr_in from{}; socklen_t fl = sizeof from;
+    const ssize_t n = ::recvfrom(fd, r, sizeof r, 0, (sockaddr*)&from, &fl);
+    if (n < 12 || from.sin_addr.s_addr != server || ((r[0] << 8) | r[1]) != id) continue;   // not the answer to this
+    if ((r[3] & 0x0f) != 0) break;                                                           // NXDOMAIN, SERVFAIL ...
+    const size_t qd = (size_t)((r[4] << 8) | r[5]), an = (size_t)((r[6] << 8) | r[7]);
+    size_t i = 12;
+    auto skip_name = [&]() -> bool {
+      while (i < (size_t)n) {
+        const uint8_t l = r[i];
+        if ((l & 0xc0) == 0xc0) { i += 2; return i <= (size_t)n; }
+        if (l == 0) { ++i; return true; }
+        i += 1 + l;
+      }
+      return false;
+    };
+    bool bad = false;
+    for (size_t k = 0; k < qd && !bad; ++k) { if (!skip_name() || i + 4 > (size_t)n) bad = true; else i += 4; }
+    for (size_t k = 0; k < an && !bad; ++k) {
+      if (!skip_name() || i + 10 > (size_t)n) { bad = true; break; }
+      const uint16_t type = (uint16_t)((r[i] << 8) | r[i + 1]), rdlen = (uint16_t)((r[i + 8] << 8) | r[i + 9]);
+      i += 10;
+      if (i + rdlen > (size_t)n) { bad = true; break; }
+      if (type == 1 && rdlen == 4) { std::memcpy(out, r + i, 4); ::close(fd); return true; }
+      i += rdlen;
+    }
+    break;
+  }
+  ::close(fd);
+  return false;
+}
+}  // namespace
+
+Result<uint32_t> resolve_ipv4(const std::string& host, int timeout_ms) {
+  in_addr lit{};
+  if (::inet_pton(AF_INET, host.c_str(), &lit) == 1) return (uint32_t)lit.s_addr;
+  if (host.empty()) return Result<uint32_t>(Status::Invalid, "no host name");
+  // /etc/hosts first, as the host's own resolver would
+  {
+    const std::string hosts = read_small_file("/etc/hosts");
+    size_t a = 0;
+    while (a < hosts.size()) {
+      size_t e = hosts.find('\n', a);
+      if (e == std::string::npos) e = hosts.size();
+      const auto f = fields_of(hosts.substr(a, e - a));
+      a = e + 1;
+      if (f.size() < 2 || ::inet_pton(AF_INET, f[0].c_str(), &lit) != 1) continue;
+      for (size_t k = 1; k < f.size(); ++k) if (same_name(f[k], host)) return (uint32_t)lit.s_addr;
+    }
+  }
+  if (same_name(host, "localhost")) return (uint32_t)htonl(INADDR_LOOPBACK);
+  // then DNS: the servers and search domains /etc/resolv.conf names (127.0.0.1 when it names none)
+  std::vector<uint32_t> servers;
+  std::vector<std::string> search;
+  {
+    const std::string rc = read_small_file("/etc/resolv.conf");
+    size_t a = 0;
+    while (a < rc.size()) {
+      size_t e = rc.find('\n', a);
+      if (e == std::string::npos) e = rc.size();
+      const auto f = fields_of(rc.substr(a, e - a));
+      a = e + 1;
+      if (f.size() >= 2 && f[0] == "nameserver" && ::inet_pton(AF_INET, f[1].c_str(), &lit) == 1) servers.push_back((uint32_t)lit.s_addr);
+      else if (f.size() >= 2 && (f[0] == "search" || f[0] == "domain")) search.assign(f.begin() + 1, f.end());
+    }
+  }
+  if (servers.empty()) servers.push_back((uint32_t)htonl(INADDR_LOOPBACK));
+  std::vector<std::string> names;
+  const bool dotted = host.find('.') != std::string::npos;
+  if (dotted) names.push_back(host);
+  for (const auto& d : search) names.push_back(host + "." + d);
+  if (!dotted) names.push_back(host);
+  const int per = std::max(500, timeout_ms / (int)std::max<size_t>(1, servers.size() * names.size()));
+  for (const auto& n : names)
+    for (uint32_t s : servers) {
+      uint32_t out = 0;
+      if (dns_a(s, n, per, &out)) return out;
+    }
+  return Result<uint32_t>(Status::NotFound, "cannot resolve " + host);
+}
+#else
+Result<uint32_t> resolve_ipv4(const std::string& host, int timeout_ms) {
+  (void)timeout_ms;
   addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
-  if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) return Result<std::unique_ptr<Connection>>(Status::NotFound, "cannot resolve " + host);
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return Result<uint32_t>(Status::NotFound, "cannot resolve " + host);
+  const uint32_t a = (uint32_t)((sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+  ::freeaddrinfo(res);
+  return a;
+}
+#endif
+
+Result<std::unique_ptr<Connection>> net_connect(const std::string& host, uint16_t port, int timeout_ms) {
+  auto addr = resolve_ipv4(host, timeout_ms);
+  if (!addr.ok()) return Result<std::unique_ptr<Connection>>(Status::NotFound, "cannot resolve " + host);
+  sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(port); to.sin_addr.s_addr = *addr;
   int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-  if (fd < 0) { ::freeaddrinfo(res); return Result<std::unique_ptr<Connection>>(Status::IoError, strerror(errno)); }
-  int rc = ::connect(fd, res->ai_addr, res->ai_addrlen);
+  if (fd < 0) return Result<std::unique_ptr<Connection>>(Status::IoError, strerror(errno));
+  int rc = ::connect(fd, (sockaddr*)&to, sizeof to);
   if (rc != 0 && errno == EINPROGRESS) {
     pollfd pf{fd, POLLOUT, 0};
-    if (::poll(&pf, 1, timeout_ms) <= 0) { ::close(fd); ::freeaddrinfo(res); return Result<std::unique_ptr<Connection>>(Status::Busy, "connect timed out"); }
+    if (::poll(&pf, 1, timeout_ms) <= 0) { ::close(fd); return Result<std::unique_ptr<Connection>>(Status::Busy, "connect timed out"); }
     int err = 0; socklen_t el = sizeof err; ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err) { ::close(fd); ::freeaddrinfo(res); return Result<std::unique_ptr<Connection>>(Status::IoError, strerror(err)); }
-  } else if (rc != 0) { std::string e = strerror(errno); ::close(fd); ::freeaddrinfo(res); return Result<std::unique_ptr<Connection>>(Status::IoError, e); }
+    if (err) { ::close(fd); return Result<std::unique_ptr<Connection>>(Status::IoError, strerror(err)); }
+  } else if (rc != 0) { std::string e = strerror(errno); ::close(fd); return Result<std::unique_ptr<Connection>>(Status::IoError, e); }
   int fl = ::fcntl(fd, F_GETFL); ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-  std::string peer = addr_str(*(sockaddr_in*)res->ai_addr);
-  ::freeaddrinfo(res);
-  return std::unique_ptr<Connection>(new TcpConnection(fd, peer));
+  return std::unique_ptr<Connection>(new TcpConnection(fd, addr_str(to)));
 }
 Result<std::unique_ptr<Connection>> net_connect_unix(const std::string& path, int timeout_ms) {
   sockaddr_un a{};

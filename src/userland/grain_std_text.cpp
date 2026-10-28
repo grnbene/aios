@@ -503,13 +503,13 @@ class XmlParser {
         pos = end + 2;
       } else if (starts_with("<!DOCTYPE", 9) || starts_with("<!doctype", 9)) {
         pos += 9;
-        int depth = 1;
-        while (pos < s.size() && depth > 0) {
-          if (s[pos] == '<') depth++;
-          else if (s[pos] == '>') depth--;
+        int open = 1;   // the DOCTYPE's own <...> nesting, not the parser's element depth
+        while (pos < s.size() && open > 0) {
+          if (s[pos] == '<') open++;
+          else if (s[pos] == '>') open--;
           pos++;
         }
-        if (depth > 0) {
+        if (open > 0) {
           err = "xml_parse: unclosed DOCTYPE declaration";
           return;
         }

@@ -436,12 +436,13 @@ Result<void> OAuth::write_vault(const json::Value& v) {
   const size_t magic = sizeof kVaultMagic;
   ByteBuffer ct = crypto::aead_encrypt(key, nonce, ByteSpan(reinterpret_cast<const uint8_t*>(kVaultMagic), magic - 1),
                                        ByteSpan(reinterpret_cast<const uint8_t*>(plain.data()), plain.size()));
-  ByteBuffer out(kVaultMagic, kVaultMagic + magic);
-  out.insert(out.end(), nonce.begin(), nonce.end());
-  uint32_t len = static_cast<uint32_t>(ct.size());
-  const uint8_t* lp = reinterpret_cast<const uint8_t*>(&len);
-  out.insert(out.end(), lp, lp + 4);
-  out.insert(out.end(), ct.begin(), ct.end());
+  // magic, nonce, the length (4 bytes, little-endian), the ciphertext: written into place at their final size
+  ByteBuffer out(magic + nonce.size() + 4 + ct.size());
+  std::memcpy(out.data(), kVaultMagic, magic);
+  std::memcpy(out.data() + magic, nonce.data(), nonce.size());
+  const uint32_t len = static_cast<uint32_t>(ct.size());
+  for (int i = 0; i < 4; ++i) out[magic + nonce.size() + (size_t)i] = (uint8_t)(len >> (8 * i));
+  std::memcpy(out.data() + magic + nonce.size() + 4, ct.data(), ct.size());
   const std::string tmp = vpath + ".tmp";
   if (auto w = host_.write_file(tmp, ByteSpan(out.data(), out.size())); !w.ok()) return w;
 #if !defined(AIOS_METAL) && !defined(_WIN32)

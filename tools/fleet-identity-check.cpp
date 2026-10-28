@@ -1,6 +1,7 @@
 // Stage 1 of docs/design/fleet-identity-keys.md: each kernel root gets its own Ed25519 key in <root>/node.identity.
 // Checks: made at first boot, mode 600, the same key after a restart, signatures verify (and a changed message does
 // not), and a damaged file is left alone (no silent new identity) with the kernel still booting.
+#include <filesystem>
 #include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +25,7 @@ static std::string read_all(const std::string& p) {
 
 int main() {
   const std::string root = "/tmp/aios-fleet-identity-check";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   const std::string path = root + "/node.identity";
   KernelConfig cfg;
   cfg.root = root;
@@ -84,7 +85,7 @@ int main() {
     }
     CHECK(read_all(path) == "garbage", "the damaged file is left as it was");
   }
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   std::printf(failures ? "fleet identity check: %d failure(s)\n" : "fleet identity check: all passed\n", failures);
   return failures ? 1 : 0;
 }

@@ -7,6 +7,7 @@
 //   neither side listed: still rekeyed from X25519 (recorded traffic stays closed).
 // The signed roster through a real hub: a member that pinned the hub key gets each peer's key and roles; a wrong
 // pinned key or none gets no keys; a key changed in the members file reaches members within seconds.
+#include <filesystem>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -171,7 +172,7 @@ int main() {
   std::printf("signed roster through the hub\n");
   {
     const std::string dir = "/tmp/aios-fleet-link-v2-check";
-    std::system(("rm -rf " + dir + " && mkdir -p " + dir).c_str());
+    { std::error_code fs_err; std::filesystem::remove_all(dir, fs_err); std::filesystem::create_directories(dir, fs_err); }
     const std::string members = dir + "/members";
     const Key hubk(9), kc(4);
     const Id128 ma = id_of(11), mb = id_of(12);
@@ -219,7 +220,7 @@ int main() {
     CHECK(changed, "a key changed in the members file reaches members within 8 s");
     a2.stop(); b.stop();
     hub.stop();
-    std::system(("rm -rf " + dir).c_str());
+    { std::error_code fs_err; std::filesystem::remove_all(dir, fs_err); }
   }
   std::printf(failures ? "fleet link v2 check: %d failure(s)\n" : "fleet link v2 check: all passed\n", failures);
   return failures ? 1 : 0;

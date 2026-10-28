@@ -804,7 +804,8 @@ Result<SshResolved> ssh_resolve(hal::Host& host, const std::string& name, const 
   if (o.proxy_jump) out.proxy_jump = *o.proxy_jump;
   out.proxy_command = o.proxy_command.value_or("");
   out.connect_timeout_s = (int)o.connect_timeout.value_or(0);
-  out.server_alive_interval_s = (int)o.alive_interval.value_or(0);
+  // readconf.c: unset, ServerAliveInterval is 300 seconds in batch mode and 0 (off) otherwise
+  out.server_alive_interval_s = (int)o.alive_interval.value_or(o.batch_mode.value_or(false) ? 300 : 0);
   out.server_alive_count_max = (int)o.alive_count.value_or(3);
   out.connection_attempts = (int)o.attempts.value_or(1);
   out.batch_mode = o.batch_mode.value_or(false);

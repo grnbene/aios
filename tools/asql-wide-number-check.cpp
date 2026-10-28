@@ -7,6 +7,7 @@
 // number; MariaDB compares them exactly, and so must we. The expected answers
 // are worked out here with 128-bit integers.
 #undef NDEBUG
+#include <filesystem>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "aios/userland/portable_int128.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
 
@@ -22,7 +24,7 @@ using namespace aios::userland;
 
 namespace {
 
-using i128 = __int128;
+using i128 = AIOS_INT128;
 
 int failures = 0;
 int checks = 0;
@@ -330,7 +332,7 @@ void verify(SqlDatabase& db, const std::string& T, const std::vector<Col>& cols,
 int main() {
   std::printf("=== ASQL wide number check (past 2^53, near 2^63, 18-digit decimals) ===\n");
   const std::string root = "/tmp/aios-asql-widecheck";
-  std::system(("rm -rf " + root).c_str());
+  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);
