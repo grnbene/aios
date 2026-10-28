@@ -17,6 +17,8 @@
 
 #include "aios/userland/grain.hpp"
 
+namespace aios::userland::grain { void install_mail_builtins(Vm& vm); }   // unavailable.cpp
+
 namespace {
 
 using namespace aios::userland::grain;
@@ -139,6 +141,10 @@ EMSCRIPTEN_KEEPALIVE char* grain_run(const char* source, const char* origin, dou
   }
   Vm vm;
   install_core_builtins(vm);
+  install_http_builtins(vm);     // over the page's own transport (http_browser.cpp)
+  install_socket_builtins(vm);   // the ones a page cannot have: each says so
+  install_db_builtins(vm);
+  install_mail_builtins(vm);
   vm.sink = &printed;
   vm.files = &g_files;
   vm.step_limit = step_limit > 0 ? (uint64_t)step_limit : 0;

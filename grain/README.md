@@ -387,8 +387,9 @@ site cannot add, so a link elsewhere cannot press your buttons.
 
 ## In a browser (WebAssembly)
 
-The same VM, built with Emscripten, runs in a page or in Node. Status: the language and its portable standard
-library run and give what `grain` gives; the network and the databases are not in yet.
+The same VM, built with Emscripten, runs in a page or in Node. The language, its portable standard library and
+`http_*` run and give what `grain` gives; the databases and `ui.pane` are not in yet. Size, optimized: 1.29 MB, 0.51 MB
+gzipped, 0.40 MB with brotli.
 
 ```
 emcmake cmake -S grain -B build-grain-wasm -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-Oz -DNDEBUG"
@@ -400,8 +401,17 @@ node grain/wasm/run.mjs  build-grain-wasm/grain_wasm.js prog.gr  # a program
 One function, `grain_run(source, origin, step_limit)`, answers JSON: what the program printed and its value, or its
 compile or run error with the line (`grain/wasm/grain_wasm.cpp`). Files are the page's in-memory file system. The
 sources are `grain`'s own (`GRAIN_LANG_SOURCES`) without the JIT's code generation, processes, sockets, TLS, mail and
-the database drivers; `process_run` is there and says it is not available in a browser. The host layer for a page is
-`src/hal/wasm_host.cpp`. Still to come: `http_*` over `fetch`, a database over HTTP, and `ui.pane` drawn into a page.
+the database drivers. The host layer for a page is `src/hal/wasm_host.cpp`.
+
+- **`http_get` / `http_post` / `http_request`** are the same builtins over the page's transport: the page gives the
+  module `grainHttp`, a synchronous function (`grain/wasm/http-sync.mjs`: a synchronous XMLHttpRequest in a Web
+  Worker, a helper thread in Node). The browser follows redirects and undoes gzip itself, so `follow_redirects: false`
+  cannot be honoured, and the server must allow the page's origin (CORS). Without `grainHttp` the call says the page
+  gave the VM no network.
+- **What a page cannot do** is an error where a program asks for it, naming the call: `process_run`, `udp_*`, `tcp_*`,
+  `db_*` (an HTTP gateway for the database is not built yet), `live`, `mail_send`, `events`.
+- **Text is not painted.** The glyph tables (3.9 MB) are left out (`grain/wasm/no_fonts.cpp`: every face with its real
+  size and one blank glyph). A page draws its own text; a program that paints text into pixels gets none.
 
 ## Going low-level
 

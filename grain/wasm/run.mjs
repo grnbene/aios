@@ -6,6 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
+import { nodeTransport } from './http-sync.mjs';
 
 const [, , module_path, program, limit] = process.argv;
 if (!module_path || !program) {
@@ -13,7 +14,7 @@ if (!module_path || !program) {
   process.exit(2);
 }
 const { default: createGrain } = await import(pathToFileURL(resolve(module_path)).href);
-const grain = await createGrain();
+const grain = await createGrain({ grainHttp: await nodeTransport() });
 const run = grain.cwrap('grain_run', 'number', ['string', 'string', 'number']);
 const free = grain.cwrap('grain_free', null, ['number']);
 
