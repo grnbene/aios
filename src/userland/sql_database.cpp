@@ -24438,7 +24438,9 @@ void SqlDatabase::record_query_stat(const std::string& sql, uint64_t duration_us
     // only real-world statement that still gets cut, which is the case
     // nobody reads character-by-character anyway.
     static constexpr size_t kRecentQuerySqlCap = 8000;
-    entry.sql = sql.length() > kRecentQuerySqlCap ? (sql.substr(0, kRecentQuerySqlCap - 3) + "...") : sql;
+    // CREATE SECRET carries a value that must not be readable here.
+    const std::string logged = SecretStore::redact(sql);
+    entry.sql = logged.length() > kRecentQuerySqlCap ? (logged.substr(0, kRecentQuerySqlCap - 3) + "...") : logged;
     entry.duration_us = duration_us;
     entry.rows_affected = rows;
     entry.success = success;

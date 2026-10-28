@@ -21,7 +21,9 @@ Sources: `src/userland/sql_database.cpp`, `include/aios/userland/sql_database.hp
 `src/userland/mysql_wire.cpp`, `src/userland/mysql_binlog.cpp`,
 `include/aios/userland/mysql_binlog.hpp`, `src/userland/sql_things.cpp`,
 `include/aios/userland/sql_things.hpp`, `src/userland/sql_cells.cpp`,
-`include/aios/userland/sql_cells.hpp`, `src/channel/compute_serve.cpp`,
+`include/aios/userland/sql_cells.hpp`, `src/userland/sql_secrets.cpp`,
+`include/aios/userland/sql_secrets.hpp`, `src/userland/sql_mail.cpp`,
+`include/aios/userland/sql_mail.hpp`, `src/net/mail_message.cpp`, `src/channel/compute_serve.cpp`,
 `cli/commands.cpp` (`cmd_sql`, `compute serve`), `tools/aios-engine.cpp`,
 `tools/aios-server.cpp`, `tools/asql-console.cpp`, `tools/asql-top.cpp`,
 `packaging/`.
@@ -1290,7 +1292,10 @@ CREATE CELLS <name> ON [db.]<table> KEY <column> (
 )
 [ACT EXISTING]
 [ON RISE|FALL <bit> DO <statement>[; ...] TO <profile>]...
-[ON RISE|FALL <bit> NOTIFY '<http(s) url>' | 'local:<handler>']...
+[ON RISE|FALL <bit> NOTIFY '<http(s) url>' [HEADER '<Name: value>']... [BODY '<template>']
+                         | 'local:<handler>']...
+[ON RISE|FALL <bit> MAIL <mailer> TO '<address>[, ...]' [CC '...'] [REPLY_TO '...']
+                         SUBJECT '<template>' BODY '<template>' [HTML '<template>']]...
 
 SHOW CELLS                        every set: keys, bits on, bytes, changes, acts
 SHOW CELLS <name>                 values per key
@@ -1311,7 +1316,12 @@ DROP CELLS <name>
   with `KEY` replaced as for Things. The profile must exist and have
   `things_write=1` when you run `CREATE`.
 - `NOTIFY` POSTs JSON of the edge and the key's current values. A non-2xx
-  answer counts as a failure.
+  answer counts as a failure. `https://` goes through the engine's own TLS
+  client and checks the server's certificate.
+- `MAIL` sends an email through a mailer: see [Mailers](#mailers).
+- `HEADER` and `BODY` say what to send, for an API that is not ours
+  (Telegram, a chat webhook): see [NOTIFY templates](#notify-templates) and
+  [Secrets](#secrets). `BODY` and `HEADER` are refused with `local:`.
 - `NOTIFY 'local:<handler>'` hands the same JSON to a handler registered in
   the same process (`CellEngine::register_local`), on the set's worker
   thread, with no network. A program that runs ASQL in process (converge's
@@ -1323,6 +1333,128 @@ DROP CELLS <name>
 - Queued acts are journaled with the set and run again after a crash. An act
   can therefore repeat: make `DO` statements idempotent, and drop repeated
   `id`s in a `NOTIFY` receiver.
+
+### NOTIFY templates
+
+`NOTIFY '<url>' [HEADER '<Name: value>']... [BODY '<template>']` sends what
+the template says instead of the default JSON. A `{{name}}` in the URL, a
+header or the body is filled in at the moment of sending:
+
+| Placeholder | Filled with |
+|---|---|
+| `{{secret:<name>}}` | the opened value of `CREATE SECRET <name>` (see [Secrets](#secrets)) |
+| `{{set}}`, `{{key}}`, `{{edge}}`, `{{bit}}`, `{{id}}` | the cell set, the key, `rise` or `fall`, the bit, the act's id |
+| `{{<cell>}}` | that cell's value for the key as it stands now |
+
+- In the URL a value is percent-encoded. A secret is not, because a bot token
+  has a `:` in it. In the body every value, secrets included, is JSON-escaped,
+  so a quote or a newline in a row cannot break the document.
+- A `HEADER` value with a line break after filling is refused. A header named
+  `Content-Type` replaces the default `application/json`.
+- `CREATE CELLS` checks every placeholder: a secret that does not exist, or a
+  name that is neither one of the values above nor a cell of the set, is an
+  error then, not at the first edge.
+- The declaration is stored and shown (`SHOW CELLS`) with the placeholders, so
+  a token never appears in it. An error from the receiver or the network goes
+  through the same scrub: the act log shows `.../bot{{secret:tg_token}}/sendMessage: HTTP 401`,
+  not the token.
+- A string a bit cannot hold (a name, a subject) rides along as `MIN(<column>)`
+  of a key with one row. For a key with several rows `MIN` is the smallest, not
+  "the row that raised the bit".
+- In a quoted string, `''` or `\'` is the quote itself, as elsewhere in ASQL.
+  A `\n` stays `\n`, which JSON reads as a newline.
+
+### Secrets
+
+A secret is a named value (a bot token, an API key) kept sealed, so it is in
+no declaration, no `SHOW`, no query log and no backup of the data in plain text.
+
+```
+CREATE SECRET <name> AS '<value>'      seal a value; one of that name is replaced
+DROP SECRET <name>
+SHOW SECRETS                           names and when they were set, never a value
+```
+
+- A name is letters, digits and `_`, up to 64.
+- Each value is AES-256-GCM sealed under a random 96-bit nonce, with its name
+  as the associated data, so a sealed value moved under another name does not
+  open. Files are `<store>/secrets/secrets.db` (sealed values) and
+  `<store>/secrets/master.key` (32 random bytes, created readable by this
+  account only on first use).
+- `AIOS_SECRET_KEY_FILE=<path>` names another key file (32 raw bytes or 64 hex
+  characters), so the key can live off the data volume. It must exist.
+- Whoever can read both files can read the secrets. Keep `master.key` out of
+  backups that carry the data, or use `AIOS_SECRET_KEY_FILE`.
+- The query log keeps `CREATE SECRET <name> AS '***'`. Cells statements are not
+  put in the query log at all, and the value is in no file under the store.
+- A secret is opened only to send. If its seal does not verify (a different
+  key, an altered file) the act fails with that reason and is tried again at
+  the key's next change.
+
+Sources: `include/aios/userland/sql_secrets.hpp`, `src/userland/sql_secrets.cpp`.
+
+### Mailers
+
+A mailer is a named way to send email, so a Cells act can mail someone when a
+row arrives. AIOS sends it with its own SMTP client (kernel sockets and TLS,
+STARTTLS or implicit TLS, AUTH PLAIN/LOGIN/XOAUTH2); nothing is shelled out.
+
+```
+CREATE MAILER <name> OAUTH '<provider>' ACCOUNT '<email>' [HOST '<smtp host>'] [PORT <n>]
+                     [SECURITY 'starttls'|'tls'|'none'] [FROM '<address>'] [FROM_NAME '<name>']
+CREATE MAILER <name> USER '<user>' PASSWORD SECRET <secret> HOST '<smtp host>' [PORT <n>]
+                     [SECURITY ...] FROM '<address>' [FROM_NAME '<name>']
+CREATE MAILER <name> HOST '127.0.0.1' [PORT <n>] FROM '<address>'     a relay on this machine, no sign-in
+DROP MAILER <name>
+SHOW MAILERS                    name, server, how it signs in, from: never a password or token
+```
+
+- `OAUTH` uses a sign-in the machine already has: `aios --root <root> exec 'google auth <email>'`
+  (see [google-mail.md](google-mail.md)) keeps the tokens in `<root>/oauth`. Each send asks for a live access
+  token (refreshing it when it is near expiry) and signs in with SASL XOAUTH2. For `'google'` the server
+  defaults to `smtp.gmail.com:587` and `FROM` to the account. If the sign-in has lapsed or was revoked, the
+  act fails with `run aios google auth <email> on this machine` and is tried again at the key's next change.
+- `PASSWORD SECRET <secret>` names a `CREATE SECRET` value ([Secrets](#secrets)); a password is never written
+  in the statement, and it is opened only to send.
+- A password or token is never sent without TLS to another machine: `SECURITY 'none'` is accepted only for
+  `127.0.0.1`. A mailer with no sign-in sends only through this machine.
+- Declarations are kept in `<store>/mailers/<name>.mailer`; they name a secret, never hold one. A mailer that a
+  Cells set still mails through is not dropped.
+- The message is plain text, an HTML alternative, or both, with UTF-8 subjects and names encoded (RFC 2047).
+  Nothing a row holds can add a header: every recipient must be a plain address after filling, a line break
+  in the subject becomes a space, and a bad recipient fails the act and sends nothing.
+
+`MAIL <mailer> TO '...' SUBJECT '...' BODY '...' [HTML '...']` in a Cells act takes the same `{{values}}` as
+[NOTIFY templates](#notify-templates): `{{key}}`, `{{edge}}`, `{{<cell>}}` and so on, so `TO '{{mail}}'` writes
+back to whoever the row names. In `HTML` a value is HTML-escaped; in the subject and plain text it goes in as
+it is. `{{secret:...}}` is refused in a MAIL. `CREATE CELLS` checks the mailer exists and every placeholder.
+
+Every mail is one act per edge: a bit that rises sends once, and a failed send is tried again at the key's next
+change. Mail a rule you did not mean to loop (a bit that a mailed update can flip) will send as often as it
+flips.
+
+Sources: `include/aios/userland/sql_mail.hpp`, `src/userland/sql_mail.cpp`, `include/aios/net/mail_message.hpp`,
+`src/net/mail_message.cpp` (the MIME builder, shared with Grain's `mail_send`).
+
+```
+$ mysql ... -e "CREATE MAILER qbc OAUTH 'google' ACCOUNT 'support@qbc.com' FROM_NAME 'QBC Systems';
+CREATE CELLS ack ON qbc.leads KEY id (fresh BIT ALL status = 'new', who MIN(name), mail MIN(email), msg MIN(message))
+  ON RISE fresh MAIL qbc TO '{{mail}}' CC 'staff@qbc.com' SUBJECT 'We got your message, {{who}}'
+  BODY 'Hi {{who}},\n\nThanks for writing. You said:\n{{msg}}\n\n- QBC'
+  HTML '<p>Hi {{who}},</p><blockquote>{{msg}}</blockquote>'"
+$ mysql ... -e "SHOW MAILERS"
++------+------------------------+-----------------------------+-----------------+---------------------+
+| name | server                 | sign_in                     | from            | created             |
++------+------------------------+-----------------------------+-----------------+---------------------+
+| qbc  | smtp.gmail.com:587 starttls | oauth google support@qbc.com | support@qbc.com | 2026-10-28 12:00:00 |
++------+------------------------+-----------------------------+-----------------+---------------------+
+```
+
+The checks behind this ran against the mock Google and mock SMTP in `scripts/` (the SMTP mock rejects a bare
+LF and bad credentials): sign-in through the real `aios google auth`, XOAUTH2 and password delivery, To/Cc
+envelope, UTF-8 subject, HTML escaping, a recipient with a line break refused, a rejected password failing with
+no secret in the error, and `google logout` making the act fail with the sign-in message. It has not been run
+against Google itself.
 
 ### Worked example: picking progress per order, with NOTIFY
 
@@ -1381,6 +1513,42 @@ What the listener received:
 /edge {"cells":"picking","key":"100","bit":"ready","edge":"rise","id":1,"values":{"n":"2","done":"2","value":"6.00","biggest":"2","ready":"1","started":"1"}}
 /edge {"cells":"picking","key":"100","bit":"ready","edge":"fall","id":2,"values":{"n":"3","done":"2","value":"7.00","biggest":"4","ready":"0","started":"1"}}
 ```
+
+### Worked example: a support request reaches Telegram
+
+A row inserted into `support_requests` sends a message through a Telegram
+bot. It was run on chi-il-1 (AlmaLinux 9) and on a throwaway root; the token
+below is a stand-in.
+
+```
+$ mysql ... qbc -e "
+CREATE SECRET tg_token AS '123456:ABC-stand-in';
+CREATE SECRET tg_chat  AS '-1001234567890';
+CREATE TABLE support_requests (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(120),
+  email VARCHAR(190), subject VARCHAR(250), message TEXT,
+  status VARCHAR(20) NOT NULL DEFAULT 'new', created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE CELLS support_alert ON qbc.support_requests KEY id (
+  fresh BIT ALL status = 'new', who MIN(name), mail MIN(email), subj MIN(subject)
+) ON RISE fresh NOTIFY 'https://api.telegram.org/bot{{secret:tg_token}}/sendMessage'
+  BODY '{\"chat_id\":\"{{secret:tg_chat}}\",\"text\":\"New QBC support request #{{key}}\\nFrom: {{who}} <{{mail}}>\\nSubject: {{subj}}\"}'"
+
+$ mysql ... qbc -e "INSERT INTO support_requests (name,email,subject,message)
+    VALUES ('Dana','dana@example.com','Printer offline','...'); SELECT SLEEP(4);
+    SHOW CELLS support_alert ACTS"
++---------------------+------+------------+--------+
+| at                  | key  | act        | result |
++---------------------+------+------------+--------+
+| 2026-10-28 11:15:57 | 1    | RISE fresh | ok     |
++---------------------+------+------------+--------+
+```
+
+The bit `fresh` rises when a key's only row has `status = 'new'`, so one message
+goes out per request. Setting `status` to another value drops the bit; a later
+`'new'` rises it again. A bad token shows as the error with the placeholder:
+`NOTIFY https://api.telegram.org/bot{{secret:fk}}/sendMessage: HTTP 401`.
+Send plain text: Telegram's `parse_mode` is off, so a `_` or `*` in a subject
+cannot break the message.
+
 
 ### Worked example: DO ... TO a profile
 

@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 
-#include "aios/core/base64.hpp"
 #include "aios/hal/host.hpp"
 #include "aios/net/line_stream.hpp"
+#include "aios/net/mail_message.hpp"
 #include "aios/net/smtp.hpp"
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
@@ -22,51 +22,8 @@ namespace aios::userland::grain {
 
 namespace {
 
-bool is_ascii(const std::string& s) {
-  for (unsigned char c : s) if (c >= 0x80) return false;
-  return true;
-}
-bool has_break(const std::string& s) { return s.find_first_of("\r\n") != std::string::npos; }
-
-std::string b64(const std::string& s) { return base64_encode(ByteSpan(reinterpret_cast<const uint8_t*>(s.data()), s.size())); }
-std::string b64_lines(const std::string& s) {
-  const std::string e = b64(s);
-  std::string out;
-  for (size_t i = 0; i < e.size(); i += 76) out += e.substr(i, 76) + "\r\n";
-  return out;
-}
-
-// A header value: as it is when ASCII, else RFC 2047 encoded words of at most 45 bytes (split on UTF-8 boundaries).
-std::string header_text(const std::string& s) {
-  if (is_ascii(s)) return s;
-  std::string out;
-  size_t i = 0;
-  while (i < s.size()) {
-    size_t j = std::min(s.size(), i + 45);
-    while (j < s.size() && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80) --j;
-    if (!out.empty()) out += "\r\n ";
-    out += "=?UTF-8?B?" + b64(s.substr(i, j - i)) + "?=";
-    i = j;
-  }
-  return out;
-}
-
-// `"Name" <addr>` (the name quoted or encoded), or the bare address.
-std::string mailbox(const std::string& name, const std::string& addr) {
-  if (name.empty()) return addr;
-  if (!is_ascii(name)) return header_text(name) + " <" + addr + ">";
-  std::string q = "\"";
-  for (char c : name) { if (c == '"' || c == '\\') q += '\\'; q += c; }
-  return q + "\" <" + addr + ">";
-}
-
-// A bare address: one @, something on both sides, no spaces, brackets or line breaks.
-bool plain_address(const std::string& a) {
-  const size_t at = a.find('@');
-  if (at == std::string::npos || at == 0 || at + 1 >= a.size() || a.find('@', at + 1) != std::string::npos) return false;
-  for (unsigned char c : a) if (c <= ' ' || c == '<' || c == '>' || c == ',' || c == ';' || c == '"' || c == 0x7F) return false;
-  return true;
-}
+bool has_break(const std::string& s) { return net::mail_has_break(s); }
+bool plain_address(const std::string& a) { return net::mail_plain_address(a); }
 
 // to / cc / bcc: a string or a list of strings, each a bare address.
 bool addresses(MapObj& m, const char* key, std::vector<std::string>& out, std::string& error) {
@@ -94,58 +51,6 @@ bool text_field(MapObj& m, const char* key, std::string& out, std::string& error
   out = v->str();
   return true;
 }
-
-std::string rfc5322_date(std::time_t t) {
-  static const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-  static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  std::tm g{};
-#if defined(_WIN32)
-  gmtime_s(&g, &t);
-#else
-  gmtime_r(&t, &g);
-#endif
-  char buf[64];
-  std::snprintf(buf, sizeof buf, "%s, %02d %s %04d %02d:%02d:%02d +0000", days[g.tm_wday], g.tm_mday, months[g.tm_mon], g.tm_year + 1900,
-                g.tm_hour, g.tm_min, g.tm_sec);
-  return buf;
-}
-
-std::string random_hex(size_t bytes) {
-  std::vector<uint8_t> r(bytes);
-  hal::process_host().random(MutableByteSpan(r.data(), r.size()));
-  static const char* digits = "0123456789abcdef";
-  std::string out;
-  for (uint8_t b : r) { out += digits[b >> 4]; out += digits[b & 15]; }
-  return out;
-}
-
-// A text part: 7bit when ASCII with SMTP-safe lines, else base64.
-std::string text_part(const std::string& type, const std::string& body) {
-  bool seven = is_ascii(body);
-  size_t line = 0;
-  for (char c : body) { line = (c == '\n') ? 0 : line + 1; if (line > 900) { seven = false; break; } }
-  std::string out = "Content-Type: " + type + "; charset=utf-8\r\n";
-  if (seven) return out + "Content-Transfer-Encoding: 7bit\r\n\r\n" + body + "\r\n";
-  return out + "Content-Transfer-Encoding: base64\r\n\r\n" + b64_lines(body);
-}
-
-// RFC 2231 for a non-ASCII filename (filename*=UTF-8''...), a quoted one otherwise.
-std::string filename_param(const std::string& name) {
-  if (is_ascii(name)) {
-    std::string q;
-    for (char c : name) { if (c == '"' || c == '\\') q += '\\'; q += c; }
-    return "filename=\"" + q + "\"";
-  }
-  std::string out = "filename*=UTF-8''";
-  static const char* hexd = "0123456789ABCDEF";
-  for (unsigned char c : name) {
-    if (std::isalnum(c) || c == '.' || c == '-' || c == '_') out += static_cast<char>(c);
-    else { out += '%'; out += hexd[c >> 4]; out += hexd[c & 15]; }
-  }
-  return out;
-}
-
-struct Attachment { std::string filename, type, data; };
 
 // mail_send({host, port, security, user, password, from, from_name, to, cc, bcc, reply_to, subject, text, html,
 //            attachments: [{filename, data, type}], timeout_ms})
@@ -191,13 +96,13 @@ Value bi_mail_send(Vm&, std::vector<Value>& args, std::string& error) {
     timeout_ms = static_cast<int>(std::min<int64_t>(v->as_int(), 600000));
   }
 
-  std::vector<Attachment> files;
+  std::vector<net::MailAttachment> files;
   if (Value* v = m.find("attachments"); v && v->type != Type::Nil) {
     if (v->type != Type::List) { error = "mail_send(): attachments is a list of {filename, data, type}"; return Value::nil(); }
     for (const Value& it : v->list_items()) {
       if (it.type != Type::Map) { error = "mail_send(): each attachment is a map {filename, data, type}"; return Value::nil(); }
       MapObj& a = *static_cast<MapObj*>(it.obj.get());
-      Attachment f;
+      net::MailAttachment f;
       if (!text_field(a, "filename", f.filename, error, true) || !text_field(a, "type", f.type, error, true)) return Value::nil();
       Value* d = a.find("data");
       if (!d) { error = "mail_send(): attachment " + f.filename + " has no data"; return Value::nil(); }
@@ -212,46 +117,21 @@ Value bi_mail_send(Vm&, std::vector<Value>& args, std::string& error) {
 
   // The message.
   const std::string domain = from.substr(from.find('@') + 1);
-  const std::string message_id = "<" + random_hex(16) + "@" + domain + ">";
-  auto join = [](const std::vector<std::string>& v) { std::string o; for (const auto& x : v) { if (!o.empty()) o += ", "; o += x; } return o; };
-  std::string msg;
-  msg += "From: " + mailbox(from_name, from) + "\r\n";
-  if (!to.empty()) msg += "To: " + join(to) + "\r\n";
-  if (!cc.empty()) msg += "Cc: " + join(cc) + "\r\n";
-  if (!reply_to.empty()) msg += "Reply-To: " + reply_to + "\r\n";
-  msg += "Subject: " + header_text(subject) + "\r\n";
-  msg += "Date: " + rfc5322_date(std::time(nullptr)) + "\r\n";
-  msg += "Message-ID: " + message_id + "\r\n";
-  msg += "MIME-Version: 1.0\r\n";
-  // The readable part: text, html, or both as alternatives (text first: the last is the preferred).
-  std::string body_part;
-  if (!text.empty() && !html.empty()) {
-    const std::string b = "alt-" + random_hex(12);
-    body_part = "Content-Type: multipart/alternative; boundary=\"" + b + "\"\r\n\r\n";
-    body_part += "--" + b + "\r\n" + text_part("text/plain", text);
-    body_part += "--" + b + "\r\n" + text_part("text/html", html);
-    body_part += "--" + b + "--\r\n";
-  } else {
-    body_part = html.empty() ? text_part("text/plain", text) : text_part("text/html", html);
-  }
-  if (files.empty()) {
-    msg += body_part;
-  } else {
-    const std::string b = "mix-" + random_hex(12);
-    msg += "Content-Type: multipart/mixed; boundary=\"" + b + "\"\r\n\r\n";
-    msg += "--" + b + "\r\n" + body_part;
-    for (const auto& f : files) {
-      msg += "--" + b + "\r\n";
-      msg += "Content-Type: " + f.type + "\r\n";
-      msg += "Content-Disposition: attachment; " + filename_param(f.filename) + "\r\n";
-      msg += "Content-Transfer-Encoding: base64\r\n\r\n" + b64_lines(f.data);
-    }
-    msg += "--" + b + "--\r\n";
-  }
-
-  std::vector<std::string> rcpts = to;
-  rcpts.insert(rcpts.end(), cc.begin(), cc.end());
-  rcpts.insert(rcpts.end(), bcc.begin(), bcc.end());   // delivered to, never named in a header
+  net::MailParts parts;
+  parts.from = from;
+  parts.from_name = from_name;
+  parts.reply_to = reply_to;
+  parts.subject = subject;
+  parts.text = text;
+  parts.html = html;
+  parts.to = to;
+  parts.cc = cc;
+  parts.bcc = bcc;
+  parts.attachments = std::move(files);
+  std::string message_id, build_err;
+  const std::string msg = net::mail_build_message(parts, &message_id, &build_err);
+  if (msg.empty()) { error = "mail_send(): " + build_err; return Value::nil(); }
+  const std::vector<std::string> rcpts = net::mail_recipients(parts);   // bcc delivered to, never named in a header
 
   net::SmtpClient smtp(hal::process_host(), http_trust_root(), timeout_ms);
   auto fail = [&](const char* step, const Error& e) {

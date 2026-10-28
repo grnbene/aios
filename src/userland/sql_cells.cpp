@@ -66,6 +66,103 @@ bool all_digits(const std::string& s) {
   return true;
 }
 
+// A quoted string at s[i] (single or double quotes; the quote doubled, or \<quote>, is the quote itself).
+bool take_quoted(const std::string& s, size_t& i, std::string* out) {
+  while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+  if (i >= s.size() || (s[i] != '\'' && s[i] != '"')) return false;
+  const char q = s[i++];
+  out->clear();
+  for (; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '\\' && i + 1 < s.size()) {
+      if (s[i + 1] == q || s[i + 1] == '\\') { *out += s[++i]; continue; }
+      *out += c;
+      continue;
+    }
+    if (c == q) {
+      if (i + 1 < s.size() && s[i + 1] == q) { *out += q; ++i; continue; }
+      ++i;
+      return true;
+    }
+    *out += c;
+  }
+  return false;
+}
+
+// The {{name}} placeholders of a NOTIFY template, in order.
+bool placeholders(const std::string& t, std::vector<std::string>* names, std::string* err) {
+  for (size_t p = t.find("{{"); p != std::string::npos; p = t.find("{{", p)) {
+    const size_t e = t.find("}}", p + 2);
+    if (e == std::string::npos) { *err = "'{{' without '}}' in '" + t + "'"; return false; }
+    names->push_back(trim(t.substr(p + 2, e - p - 2)));
+    p = e + 2;
+  }
+  return true;
+}
+
+enum class Fill { Url, Json, Raw, Html };
+
+std::string percent_encode(const std::string& v) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string o;
+  for (unsigned char c : v) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+    else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+  }
+  return o;
+}
+
+std::string json_escape(const std::string& v) {
+  std::string o;
+  for (unsigned char c : v) {
+    if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+    else if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+    else o += (char)c;
+  }
+  return o;
+}
+
+std::string html_escape(const std::string& v) {
+  std::string o;
+  for (char c : v) {
+    switch (c) {
+      case '&': o += "&amp;"; break;
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '"': o += "&quot;"; break;
+      case '\'': o += "&#39;"; break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+// `t` with each {{name}} replaced: {{secret:x}} by `secret(x)`, anything else by `var(name)`. A variable is
+// percent-encoded in a URL and JSON-escaped in a body; a secret goes into a URL as it is (a bot token has a ':'),
+// and JSON-escaped in a body.
+template <class SecretFn, class VarFn>
+bool render_template(const std::string& t, Fill mode, SecretFn secret, VarFn var, std::string* out, std::string* err) {
+  out->clear();
+  size_t at = 0;
+  for (size_t p = t.find("{{"); p != std::string::npos; p = t.find("{{", at)) {
+    const size_t e = t.find("}}", p + 2);
+    if (e == std::string::npos) { *err = "'{{' without '}}'"; return false; }
+    *out += t.substr(at, p - at);
+    const std::string name = trim(t.substr(p + 2, e - p - 2));
+    std::string v;
+    const bool is_secret = name.rfind("secret:", 0) == 0;
+    if (is_secret) { if (!secret(trim(name.substr(7)), &v, err)) return false; }
+    else if (!var(name, &v, err)) return false;
+    if (mode == Fill::Url) *out += is_secret ? v : percent_encode(v);
+    else if (mode == Fill::Json) *out += json_escape(v);
+    else if (mode == Fill::Html) *out += html_escape(v);
+    else *out += v;
+    at = e + 2;
+  }
+  *out += t.substr(at);
+  return true;
+}
+
 // Top-level (outside quotes and parentheses) helpers over a statement's text.
 struct Scan {
   const std::string& s;
@@ -215,6 +312,8 @@ std::string dec_text(AIOS_INT128 v, int scale) {
 }  // namespace
 
 CellEngine::CellEngine(SqlDatabase& db) : db_(db) {
+  secrets_ = std::make_unique<SecretStore>(db_.kernel_.host(), db_.root_path_ + "/secrets");
+  mailers_ = std::make_unique<MailerStore>(db_.kernel_.host(), db_.kernel_.config().root, db_.root_path_ + "/mailers", *secrets_);
 #if !defined(AIOS_INLINE_THREADS)
   worker_ = aios::hal::Thread([this] { worker_loop(); });
 #endif
@@ -247,7 +346,8 @@ bool CellEngine::has_pending() const {
 
 bool CellEngine::handles(const std::string& sql) const {
   const std::string h = head_words(sql, 2);
-  return h == "CREATE CELLS" || h == "DROP CELLS" || h == "SHOW CELLS";
+  return h == "CREATE CELLS" || h == "DROP CELLS" || h == "SHOW CELLS" ||
+         h == "CREATE SECRET" || h == "DROP SECRET" || h == "SHOW SECRETS" || MailerStore::handles(h);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,16 +472,67 @@ bool CellEngine::parse_create(const std::string& sql, Set* s, std::string* err) 
         found = true;
       }
     if (!found) { *err = "ON RISE|FALL " + bit + ": no such bit"; return false; }
+    {
+      size_t mk = k;
+      while (mk < clause.size() && std::isspace((unsigned char)clause[mk])) ++mk;
+      if (cs.word_at(mk, "MAIL")) {
+        const char* usage = "ON ... MAIL <mailer> TO '<address>[, ...]' [CC '<address>'] [REPLY_TO '<address>'] SUBJECT '<template>' BODY '<template>' [HTML '<template>']";
+        size_t p = mk + 4;
+        while (p < clause.size() && std::isspace((unsigned char)clause[p])) ++p;
+        size_t w = p;
+        while (w < clause.size() && (std::isalnum((unsigned char)clause[w]) || clause[w] == '_')) ++w;
+        act.mail.mailer = clause.substr(p, w - p);
+        if (!is_ident(act.mail.mailer)) { *err = usage; return false; }
+        p = w;
+        for (;;) {
+          while (p < clause.size() && std::isspace((unsigned char)clause[p])) ++p;
+          if (p >= clause.size()) break;
+          w = p;
+          while (w < clause.size() && (std::isalpha((unsigned char)clause[w]) || clause[w] == '_')) ++w;
+          const std::string word = upper(clause.substr(p, w - p));
+          p = w;
+          std::string v;
+          if (word.empty() || !take_quoted(clause, p, &v) || v.empty()) { *err = std::string(usage) + " (each part is a keyword and a quoted, non-empty string)"; return false; }
+          std::string* dst = word == "TO" ? &act.mail.to : word == "CC" ? &act.mail.cc : word == "REPLY_TO" ? &act.mail.reply_to
+                           : word == "SUBJECT" ? &act.mail.subject : word == "BODY" ? &act.mail.text : word == "HTML" ? &act.mail.html : nullptr;
+          if (!dst) { *err = "MAIL has no '" + word + "'; " + usage; return false; }
+          if (!dst->empty()) { *err = "MAIL has two " + word + " clauses"; return false; }
+          *dst = v;
+        }
+        if (act.mail.to.empty() || act.mail.subject.empty() || (act.mail.text.empty() && act.mail.html.empty())) { *err = usage; return false; }
+        s->acts.push_back(act);
+        continue;
+      }
+    }
     const size_t nt = cs.find_word("NOTIFY", k);
     if (nt != std::string::npos) {
-      std::string url = trim(clause.substr(nt + 6));
-      if (url.size() < 2 || (url.front() != '\'' && url.front() != '"') || url.back() != url.front()) {
-        *err = "ON ... " + bit + " NOTIFY '<http url>'";
-        return false;
-      }
-      act.notify = url.substr(1, url.size() - 2);
+      const char* usage = "ON ... NOTIFY '<url>' [HEADER '<Name: value>']... [BODY '<template>']";
+      size_t p = nt + 6;
+      if (!take_quoted(clause, p, &act.notify)) { *err = usage; return false; }
       if (act.notify.rfind("http://", 0) != 0 && act.notify.rfind("https://", 0) != 0 && act.notify.rfind("local:", 0) != 0) {
         *err = "NOTIFY takes an http:// or https:// url, or local:<handler>";
+        return false;
+      }
+      for (;;) {
+        while (p < clause.size() && std::isspace((unsigned char)clause[p])) ++p;
+        if (p >= clause.size()) break;
+        size_t w = p;
+        while (w < clause.size() && std::isalpha((unsigned char)clause[w])) ++w;
+        const std::string word = upper(clause.substr(p, w - p));
+        if (word != "BODY" && word != "HEADER") { *err = std::string(usage) + ", not '" + clause.substr(p) + "'"; return false; }
+        p = w;
+        std::string v;
+        if (!take_quoted(clause, p, &v) || v.empty()) { *err = word + " takes a quoted, non-empty string"; return false; }
+        if (word == "BODY") {
+          if (!act.notify_body.empty()) { *err = "NOTIFY has two BODY clauses"; return false; }
+          act.notify_body = v;
+        } else {
+          if (v.find(':') == std::string::npos) { *err = "HEADER '<Name: value>': no colon in '" + v + "'"; return false; }
+          act.notify_headers.push_back(v);
+        }
+      }
+      if (act.notify.rfind("local:", 0) == 0 && (!act.notify_body.empty() || !act.notify_headers.empty())) {
+        *err = "BODY and HEADER go with an http(s) url, not local:<handler>";
         return false;
       }
       s->acts.push_back(act);
@@ -626,6 +777,9 @@ void CellEngine::queue_job(Set& s, const std::string& key, size_t i, bool rise, 
     j.sql = a.sql;
     j.target = a.target;
     j.notify = a.notify;
+    j.notify_body = a.notify_body;
+    j.notify_headers = a.notify_headers;
+    j.mail = a.mail;
     {
       std::lock_guard<aios::hal::Mutex> jl(jobs_mu_);
       jobs_.push_back(std::move(j));
@@ -717,11 +871,13 @@ bool CellEngine::run_job(const Job& j, std::string* err) {
   static thread_local std::map<std::string, std::unique_ptr<MariaWireSession>> sessions;
   DbConnectionProfile prof;
   bool found = false;
-  if (j.notify.empty())
+  if (j.notify.empty() && !j.mail.active())
     for (const auto& p : db_.list_profiles()) if (p.id == j.target) { prof = p; found = true; }
   bool ok = false;
   if (!j.notify.empty()) {
     ok = post_edge(j, err);
+  } else if (j.mail.active()) {
+    ok = send_mail(j, err);
   } else if (!found) *err = "TO " + j.target + ": no such connection profile";
   else if (!prof.things_write) *err = "TO " + j.target + ": the profile is not marked things_write=1";
   else {
@@ -826,7 +982,7 @@ void CellEngine::unregister_local(const std::string& name) {
   local_handlers().erase(name);
 }
 
-bool CellEngine::post_edge(const Job& j, std::string* err) {
+void CellEngine::edge_values(const Job& j, std::string* body_out, std::map<std::string, std::string>* vars_out) {
   auto js = [](const std::string& v) {
     std::string o = "\"";
     for (unsigned char c : v) {
@@ -837,6 +993,7 @@ bool CellEngine::post_edge(const Job& j, std::string* err) {
     return o + "\"";
   };
   std::string body;
+  std::map<std::string, std::string>& vars = *vars_out;
   {
     std::lock_guard<aios::hal::Mutex> lk(mu_);
     auto it = sets_.find(lower(j.set));
@@ -854,13 +1011,26 @@ bool CellEngine::post_edge(const Job& j, std::string* err) {
           else if (c.kind == Cell::Sum) v = dec_text(k->second.sum[(size_t)s.slot[ci]].v, k->second.sum[(size_t)s.slot[ci]].scale);
           else v = k->second.ext[(size_t)s.slot[ci]];
           values += (values.empty() ? "" : ",") + js(c.name) + ":" + js(v);
+          vars[lower(c.name)] = v;
         }
       }
     }
     const size_t sp = j.what.find(' ');
+    vars["set"] = j.set;
+    vars["key"] = j.key;
+    vars["edge"] = j.rise ? "rise" : "fall";
+    vars["bit"] = sp == std::string::npos ? j.what : j.what.substr(sp + 1);
+    vars["id"] = std::to_string(j.id);
     body = "{\"cells\":" + js(j.set) + ",\"key\":" + js(j.key) + ",\"bit\":" + js(sp == std::string::npos ? j.what : j.what.substr(sp + 1)) +
            ",\"edge\":" + js(j.rise ? "rise" : "fall") + ",\"id\":" + std::to_string(j.id) + ",\"values\":{" + values + "}}";
   }
+  *body_out = body;
+}
+
+bool CellEngine::post_edge(const Job& j, std::string* err) {
+  std::string body;
+  std::map<std::string, std::string> vars;
+  edge_values(j, &body, &vars);
   if (j.notify.rfind("local:", 0) == 0) {
     LocalHandler h;
     {
@@ -873,18 +1043,44 @@ bool CellEngine::post_edge(const Job& j, std::string* err) {
     if (!h(body, &why)) { *err = "NOTIFY " + j.notify + ": " + (why.empty() ? "refused" : why); return false; }
     return true;
   }
-  auto ep = channel::parse_endpoint(j.notify);
-  if (!ep.ok()) { *err = "NOTIFY " + j.notify + ": " + ep.error().message; return false; }
+  // Every error leaves through here with any secret's value taken out of it.
+  auto fail = [&](const std::string& m) {
+    *err = secrets_->scrub("NOTIFY " + j.notify + ": " + m);
+    return false;
+  };
+  auto secret = [&](const std::string& name, std::string* v, std::string* e) { return secrets_->get(name, v, e); };
+  auto var = [&](const std::string& name, std::string* v, std::string* e) {
+    auto f = vars.find(lower(name));
+    if (f == vars.end()) { *e = "no such value {{" + name + "}}"; return false; }
+    *v = f->second;
+    return true;
+  };
+  std::string url, why;
+  if (!render_template(j.notify, Fill::Url, secret, var, &url, &why)) return fail(why);
+  auto ep = channel::parse_endpoint(url);
+  if (!ep.ok()) return fail(ep.error().message);
+  if (!j.notify_body.empty() && !render_template(j.notify_body, Fill::Json, secret, var, &body, &why)) return fail(why);
   channel::HttpRequest req;
   req.method = "POST";
   req.endpoint = *ep;
   req.headers = {{"Content-Type", "application/json"}};
+  for (const std::string& h : j.notify_headers) {
+    std::string line;
+    if (!render_template(h, Fill::Raw, secret, var, &line, &why)) return fail(why);
+    if (line.find_first_of("\r\n") != std::string::npos) return fail("a HEADER value has a line break");
+    const size_t colon = line.find(':');
+    const std::string name = trim(line.substr(0, colon)), value = trim(line.substr(colon + 1));
+    if (name.empty()) return fail("a HEADER has no name");
+    bool replaced = false;
+    for (auto& have : req.headers) if (lower(have.first) == lower(name)) { have.second = value; replaced = true; }
+    if (!replaced) req.headers.emplace_back(name, value);
+  }
   req.body.assign(body.begin(), body.end());
   req.timeout_ms = 5000;
   if (ep->secure) { req.host = &db_.kernel_.host(); req.kernel_root = db_.root_path_; }
   auto r = channel::http_send(req);
-  if (!r.ok()) { *err = "NOTIFY " + j.notify + ": " + r.error().message; return false; }
-  if (r->status < 200 || r->status >= 300) { *err = "NOTIFY " + j.notify + ": HTTP " + std::to_string(r->status); return false; }
+  if (!r.ok()) return fail(r.error().message);
+  if (r->status < 200 || r->status >= 300) return fail("HTTP " + std::to_string(r->status));
   return true;
 }
 
@@ -943,6 +1139,7 @@ void CellEngine::save() {
 }
 
 void CellEngine::load() {
+  mailers_->load();
   std::lock_guard<aios::hal::Mutex> lk(mu_);
   auto& host = db_.kernel_.host();
   if (!host.exists(cells_dir())) return;
@@ -1009,8 +1206,155 @@ void CellEngine::load() {
 }
 
 // ---------------------------------------------------------------------------
+// Every {{...}} in a set's NOTIFY and MAIL acts names one of the edge's own values or a cell of the set; a NOTIFY
+// may also name a secret that exists, a MAIL never (a secret does not go into an email).
+bool CellEngine::check_templates(const Set& s, std::string* err) {
+  for (const Act& a : s.acts) {
+    if (a.notify.empty() && !a.mail.active()) continue;
+    std::vector<std::string> names;
+    if (a.mail.active()) {
+      if (!mailers_->has(a.mail.mailer)) { *err = "MAIL " + a.mail.mailer + ": no such mailer (CREATE MAILER " + a.mail.mailer + " ... first)"; return false; }
+      for (const std::string* f : {&a.mail.to, &a.mail.cc, &a.mail.reply_to, &a.mail.subject, &a.mail.text, &a.mail.html})
+        if (!placeholders(*f, &names, err)) return false;
+    } else {
+      if (!placeholders(a.notify, &names, err) || !placeholders(a.notify_body, &names, err)) return false;
+      for (const std::string& h : a.notify_headers) if (!placeholders(h, &names, err)) return false;
+    }
+    for (const std::string& n : names) {
+      if (n.rfind("secret:", 0) == 0) {
+        if (a.mail.active()) { *err = "{{" + n + "}}: a secret is not available in a MAIL"; return false; }
+        const std::string sn = trim(n.substr(7));
+        if (!secrets_->has(sn)) { *err = "{{" + n + "}}: no such secret (CREATE SECRET " + sn + " AS '...' first)"; return false; }
+        continue;
+      }
+      const std::string ln = lower(n);
+      bool known = ln == "set" || ln == "key" || ln == "edge" || ln == "bit" || ln == "id";
+      for (const Cell& c : s.cells) if (lower(c.name) == ln) known = true;
+      if (!known) { *err = "{{" + n + "}}: not set, key, edge, bit, id or a cell of " + s.name; return false; }
+    }
+  }
+  return true;
+}
+
+// MAIL: the fields filled from the edge, then sent through the mailer. A recipient that is not a plain address
+// after filling (a value with a comma or a line break in it) fails the act rather than reaching a header.
+bool CellEngine::send_mail(const Job& j, std::string* err) {
+  std::string body;
+  std::map<std::string, std::string> vars;
+  edge_values(j, &body, &vars);
+  auto fail = [&](const std::string& m) {
+    *err = secrets_->scrub("MAIL " + j.mail.mailer + ": " + m);
+    return false;
+  };
+  auto no_secret = [](const std::string&, std::string*, std::string* e) { *e = "a secret is not available in a MAIL"; return false; };
+  auto var = [&](const std::string& name, std::string* v, std::string* e) {
+    auto f = vars.find(lower(name));
+    if (f == vars.end()) { *e = "no such value {{" + name + "}}"; return false; }
+    *v = f->second;
+    return true;
+  };
+  std::string why, to, cc, reply_to;
+  net::MailParts parts;
+  if (!render_template(j.mail.to, Fill::Raw, no_secret, var, &to, &why) || !render_template(j.mail.cc, Fill::Raw, no_secret, var, &cc, &why) ||
+      !render_template(j.mail.reply_to, Fill::Raw, no_secret, var, &reply_to, &why) ||
+      !render_template(j.mail.subject, Fill::Raw, no_secret, var, &parts.subject, &why) ||
+      !render_template(j.mail.text, Fill::Raw, no_secret, var, &parts.text, &why) ||
+      !render_template(j.mail.html, Fill::Html, no_secret, var, &parts.html, &why))
+    return fail(why);
+  auto split = [](const std::string& list, std::vector<std::string>* out) {
+    size_t at = 0;
+    while (at <= list.size()) {
+      size_t c = list.find(',', at);
+      const std::string one = trim(list.substr(at, c == std::string::npos ? std::string::npos : c - at));
+      if (!one.empty()) out->push_back(one);
+      if (c == std::string::npos) break;
+      at = c + 1;
+    }
+  };
+  split(to, &parts.to);
+  split(cc, &parts.cc);
+  parts.reply_to = trim(reply_to);
+  // a line break in the subject is a header injection, not a subject
+  for (char& c : parts.subject) if (c == '\r' || c == '\n') c = ' ';
+  std::string message_id;
+  if (!mailers_->send(j.mail.mailer, std::move(parts), &message_id, &why)) return fail(why);
+  return true;
+}
+
+SqlQueryResult CellEngine::mailer_statement(const std::string& sql) {
+  std::string q = trim(sql);
+  while (!q.empty() && q.back() == ';') q = trim(q.substr(0, q.size() - 1));
+  const std::string h = head_words(q, 2);
+  std::string err;
+  if (h == "SHOW MAILERS") {
+    SqlQueryResult r;
+    r.success = true;
+    r.is_result_set = true;
+    r.columns = {"name", "server", "sign_in", "from", "created"};
+    for (const auto& m : mailers_->list())
+      r.rows.push_back(SqlRow{{m.name, m.host + ":" + std::to_string(m.port) + " " + m.security, m.auth_text(), m.from, m.created}});
+    if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+    return r;
+  }
+  if (h == "DROP MAILER") {
+    const std::string n = unquote_ident(trim(q.substr(q.find("MAILER") != std::string::npos ? q.find("MAILER") + 6 : q.size())));
+    {
+      // a mailer a set still mails through is not dropped from under it
+      std::lock_guard<aios::hal::Mutex> lk(mu_);
+      for (const auto& kv : sets_)
+        for (const Act& a : kv.second->acts)
+          if (a.mail.mailer == n) return error_result("mailer " + n + " is used by cells " + kv.second->name + " (DROP CELLS " + kv.second->name + " first)");
+    }
+    if (!mailers_->drop(n, &err)) return error_result(err);
+    return ok_result("mailer " + n + " dropped");
+  }
+  if (!mailers_->create(q, &err)) return error_result(err);
+  return ok_result("mailer created");
+}
+
+// CREATE SECRET name AS 'value' | DROP SECRET name | SHOW SECRETS
+SqlQueryResult CellEngine::secret_statement(const std::string& sql) {
+  std::string q = trim(sql);
+  while (!q.empty() && q.back() == ';') q = trim(q.substr(0, q.size() - 1));
+  const std::string h = head_words(q, 2);
+  std::string err;
+  if (h == "SHOW SECRETS") {
+    SqlQueryResult r;
+    r.success = true;
+    r.is_result_set = true;
+    r.columns = {"name", "set_at"};
+    for (const auto& e : secrets_->list()) r.rows.push_back(SqlRow{{e.name, e.set_at}});
+    if (!sql_wire_results()) r.formatted_table = db_.format_result_table(r.columns, r.rows);
+    return r;
+  }
+  // the name is the third word
+  size_t i = 0;
+  auto word = [&]() {
+    while (i < q.size() && std::isspace((unsigned char)q[i])) ++i;
+    const size_t b = i;
+    while (i < q.size() && !std::isspace((unsigned char)q[i])) ++i;
+    return q.substr(b, i - b);
+  };
+  word(); word();
+  const std::string name = unquote_ident(word());
+  if (h == "DROP SECRET") {
+    if (!trim(q.substr(i)).empty()) return error_result("DROP SECRET <name>");
+    if (!secrets_->drop(name, &err)) return error_result(err);
+    return ok_result("secret " + name + " dropped");
+  }
+  // CREATE SECRET: nothing of the value goes into a message
+  if (upper(word()) != "AS") return error_result("CREATE SECRET <name> AS '<value>'");
+  std::string value;
+  size_t p = i;
+  if (!take_quoted(q, p, &value) || !trim(q.substr(p)).empty()) return error_result("CREATE SECRET <name> AS '<value>'");
+  if (!secrets_->set(name, value, &err)) return error_result(err);
+  return ok_result("secret " + name + " sealed");
+}
+
 SqlQueryResult CellEngine::execute(const std::string& sql) {
   const std::string h = head_words(sql, 2);
+  if (h == "CREATE SECRET" || h == "DROP SECRET" || h == "SHOW SECRETS") return secret_statement(sql);
+  if (MailerStore::handles(h)) return mailer_statement(sql);
   if (h == "SHOW CELLS") return show(sql);
   if (h == "DROP CELLS") {
     std::string name = lower(unquote_ident(trim(trim(sql).substr(10))));
@@ -1031,8 +1375,9 @@ SqlQueryResult CellEngine::execute(const std::string& sql) {
   std::lock_guard<aios::hal::Mutex> lk(mu_);
   if (sets_.count(lower(s->name))) return error_result("cells " + s->name + " already exist (DROP CELLS first)");
   if (!compile(*s, &err)) return error_result(err);
+  if (!check_templates(*s, &err)) return error_result(err);
   for (const Act& a : s->acts) {
-    if (!a.notify.empty()) continue;
+    if (!a.notify.empty() || a.mail.active()) continue;
     bool found = false, writable = false;
     for (const auto& p : db_.list_profiles()) if (p.id == a.target) { found = true; writable = p.things_write; }
     if (!found) return error_result("TO " + a.target + ": no such connection profile");
