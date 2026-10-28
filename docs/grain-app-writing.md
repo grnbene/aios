@@ -424,7 +424,7 @@ After the new version passes checks and takes over the live port, the host runs 
 ```grain
 fn deployed(app) {
   print("Running migrations for version", app.version)
-  let db = db_connect("127.0.0.1", 3307, "erp", getenv("DB_PASS"), "versioneight")
+  let db = db_connect("127.0.0.1", 3307, "app", getenv("DB_PASS"), "appdb")
   db_query(db, "ALTER TABLE items ADD COLUMN IF NOT EXISTS audited DATETIME")
   return true
 }

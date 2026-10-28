@@ -1,8 +1,8 @@
-// Views and nested sub-queries answer what MariaDB answers (found against chi's versioneight, 2026-10-26):
+// Views and nested sub-queries answer what MariaDB answers (differential comparison, 2026-10-26):
 // - COUNT(*) over a view that aggregates with no GROUP BY is one row, not the rows the view read
 //   (moving_avg_supplier answered 52303 where MariaDB answers 1);
 // - col IN (SELECT ...) on a reopened table reads each row's dictionary code where the segment holds it
-//   (remotestocknewitems: x IN (SELECT ... WHERE loccode IN (SELECT ...)) lost about half its matches).
+//   (subquery items: x IN (SELECT ... WHERE loc IN (SELECT ...)) lost about half its matches).
 #undef NDEBUG
 #include <cstdio>
 #include <string>

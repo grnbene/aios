@@ -34,7 +34,7 @@ Sources: `src/userland/sql_database.cpp`, `include/aios/userland/sql_database.hp
 |---|---|---|---|---|---|
 | `aios exec "sql serve ..."` | `<root>/sql_db` | none (loopback only) | no | no | a quick local server |
 | `aios exec "compute serve sql=1 ..."` | `<root>/<sql_db=>` (default `sql_db`) | one (`mysql_user=`) | `mysql_socket=` | `cdc_host=` with seeding | **the production path**. The packaged service runs this. |
-| `build/aios-engine` | `<root>/<--upstream-db>` (default `versioneight`) | one (`--sql-user=`) | `--socket=` | `--upstream=` with seeding (`--tables=`) | standalone engine |
+| `build/aios-engine` | `<root>/<--upstream-db>` (default `appdb`) | one (`--sql-user=`) | `--socket=` | `--upstream=` with seeding (`--tables=`) | standalone engine |
 | `build/aios-server` | `<root>/<--db>` (default `aios_gateway`; an existing `sql_db` when only that is there) | none (loopback only) | no | no | a gateway with write-through or write-behind to a downstream |
 
 They share one engine (`SqlDatabase`) and one wire server (`MysqlWireServer`).
@@ -175,7 +175,7 @@ Usage: build/aios-engine [options]
   --upstream-user=<user>    Upstream replication username (default: root)
   --upstream-pass=<pass>    Upstream replication password
   --upstream-pass-file=<f>  Upstream replication password, first line of a file
-  --upstream-db=<db>        Upstream database name (default: versioneight)
+  --upstream-db=<db>        Upstream database name (required with --upstream)
   --server-id=<n>           Replica server id (default: derived from this root's identity)
   --tables=<t1,t2,...>      Comma-separated whitelist of tables to mirror; a listed table
                             not in the store yet is copied from the upstream first
@@ -237,8 +237,7 @@ On SIGTERM it stops the CDC stream and the wire, then checkpoints:
 
 Things to know about `aios-engine`:
 
-- The store goes in `<root>/<--upstream-db>`, which is `<root>/versioneight` by
-  default. Even so, a client still lands in database `aios_db`.
+- The store goes in `<root>/<--upstream-db>`, which defaults to the upstream database name. Even so, a client still lands in database `aios_db`.
 - `--socket=PATH` opens a unix socket beside the TCP port
   (`✓ MySQL Native Wire Gateway listening on unix socket PATH`); `mysql -S PATH`
   reaches the same engine. With no `--socket` there is none.
@@ -372,17 +371,17 @@ When Grain runs inside the AIOS kernel (`aios grain ...`, bare metal, or system 
 
 ```grain
 // In-process query: zero socket overhead, sub-microsecond execution
-let rows = sql("SELECT stockid, description, standardcost FROM stockmaster WHERE discontinued = 0 LIMIT 10")
+let rows = sql("SELECT id, name, price FROM products WHERE active = 1 LIMIT 10")
 for row in rows {
-  print(row.stockid + ": " + str(row.standardcost))
+  print(row.id + ": " + str(row.price))
 }
 
 // Data modification: returns affected row count
-let res = sql("UPDATE pickingfreeze SET status = 'DONE' WHERE id = 1042")
+let res = sql("UPDATE orders SET status = 'processed' WHERE id = 1042")
 print("Updated " + str(res.affected) + " rows")
 
 // Fleet mesh query across peer nodes:
-let peer_rows = sql_on("remote-node", "SELECT COUNT(*) AS total FROM recscan")
+let peer_rows = sql_on("remote-node", "SELECT COUNT(*) AS total FROM audit_log")
 ```
 
 ### 2. Wire client protocol: `db_connect()`, `db_query()`, `db_transaction()`
@@ -393,7 +392,7 @@ For standalone Grain programs (`grain run ...`, `grain serve ...`), background w
 #### Connecting (`db_connect`)
 ```grain
 // Signature: db_connect(host, port, user, password, [database])
-let res = db_connect("127.0.0.1", 3307, "root", getenv("DB_PASS"), "versioneight")
+let res = db_connect("127.0.0.1", 3307, "root", getenv("DB_PASS"), "appdb")
 if !res.ok {
   print("Connection failed: " + res.error)
   return nil
@@ -410,14 +409,14 @@ Queries use `?` placeholders with safe parameter list binding (`grain_std_db.cpp
 
 ```grain
 // Parameterized query with ? placeholders
-let items = db_query(db, "SELECT * FROM stockmaster WHERE category = ? AND standardcost > ?", ["TIRES", 50.0])
+let items = db_query(db, "SELECT * FROM products WHERE category = ? AND price > ?", ["HARDWARE", 50.0])
 
 // Lists expand automatically for IN (?) clauses
-let ids = ["T100", "T200", "T300"]
-let matches = db_query(db, "SELECT stockid, description FROM stockmaster WHERE stockid IN (?)", [ids])
+let ids = ["SKU1", "SKU2", "SKU3"]
+let matches = db_query(db, "SELECT id, name FROM products WHERE id IN (?)", [ids])
 
 // Memory optimization: omit `rows` when only `records` are needed
-let fast = db_query(db, "SELECT stockid FROM stockmaster", {"rows": false})
+let fast = db_query(db, "SELECT id FROM products", {"rows": false})
 ```
 
 `db_query` returns:
@@ -450,13 +449,13 @@ For administrative scripts or quick CLI pipelines running on the same host as AS
 
 ```grain
 // asql_query(sql, [port=3307], [login]) -> returns list of row maps directly
-let users = asql_query("SELECT userid, realname FROM www_users")
+let users = asql_query("SELECT id, username FROM users")
 for u in users {
-  print(u.userid + ": " + u.realname)
+  print(u.id + ": " + u.username)
 }
 
 // asql_exec(sql, [port=3307], [login]) -> returns {ok, affected_rows, last_insert_id, error}
-let res = asql_exec("DELETE FROM pickingfreeze WHERE status = 'CANCELLED'")
+let res = asql_exec("DELETE FROM orders WHERE status = 'cancelled'")
 if res.ok {
   print("Removed " + str(res.affected_rows) + " rows")
 }
@@ -921,10 +920,10 @@ Two Things that work as a pair. A **resource** is something with a quantity - st
 resource out among the claims, again whenever either side changes.
 
 ```sql
-CREATE THING stock RESOURCE KEY stockid, loc CAPACITY qty FROM locstock;
+CREATE THING inventory RESOURCE KEY item_id, loc CAPACITY qty FROM stock;
 
-CREATE THING alloc CLAIMS stock KEY orderno PRIORITY created [ALLOCATE FIFO | ALLOCATE READY] READS lines
-  AS SELECT orderno, line, stockid, loc, qty FROM lines [WHERE ...];
+CREATE THING alloc CLAIMS inventory KEY order_id PRIORITY created [ALLOCATE FIFO | ALLOCATE READY] READS lines
+  AS SELECT order_id, line_id, item_id, loc, qty FROM lines [WHERE ...];
 ```
 
 - **The resource** has one Thing per `KEY` (here an item at a location), its capacity the `SUM` of `CAPACITY` over
@@ -944,19 +943,19 @@ CREATE THING alloc CLAIMS stock KEY orderno PRIORITY created [ALLOCATE FIFO | AL
 What they show (from a run of the example above, 5 of T1 and 2 of T2 in stock):
 
 ```
-SHOW THING stock
-stockid  loc  on_hand  demand  promised  free  short  claims  ...
+SHOW THING inventory
+item_id  loc  on_hand  demand  promised  free  short  claims  ...
 T1       01   5        6       5         0     1      2
 T2       01   2        3       2         0     1      2
 
 SHOW THING alloc
-orderno  status   lines  short_lines  ...  waiting_for
+order_id status   lines  short_lines  ...  waiting_for
 100      Ready    1      0                 a change to its lines or to the stock it holds
 200      Waiting  2      1                 01 at T1: short 1 (2 of 2 in line)
 300      Waiting  1      1                 01 at T2: short 1 (2 of 2 in line)
 
 SHOW THING LINES alloc          -- each line: need, allocated, its place in the queue for that item
-orderno  line  stockid  loc  need  allocated  position  queue
+order_id line  item_id  loc  need  allocated  position  queue
 100      1     T1       01   3     3          1         2
 200      1     T1       01   3     2          2         2
 ...
@@ -964,10 +963,10 @@ orderno  line  stockid  loc  need  allocated  position  queue
 
 `SHOW THING ALLOCATION alloc` sums up an `ALLOCATE READY` plan: claimants, how many are whole, how many FIFO would
 have made whole (`whole_if_fifo`), the contested groups, and how many of their plans were proven optimal. After
-`UPDATE locstock SET qty = 6 WHERE stockid = 'T1'`, order 200 turns Ready, and both Things' `SHOW THING HISTORY`
-(`SHOW THING HISTORY stock 'T1,01'` for a resource - its key values joined by commas) says what changed it.
+`UPDATE stock SET qty = 6 WHERE item_id = 'T1'`, order 200 turns Ready, and both Things' `SHOW THING HISTORY`
+(`SHOW THING HISTORY inventory 'T1,01'` for a resource - its key values joined by commas) says what changed it.
 
-A resource can have one claims Thing. `DROP THING` a resource is refused while its claims exist (`stock is claimed
+A resource can have one claims Thing. `DROP THING` a resource is refused while its claims exist (`inventory is claimed
 by alloc: drop that first`). A grain Thing can read a claims Thing's queues through `LINKS` (see "Grain Things").
 
 ### Event Things: a program that runs once, at a set time
@@ -1433,10 +1432,10 @@ its answer made. Definitions are saved under `<root>/active` and built again at 
 replays, every object is rebuilt from the tables as they stand.
 
 ```sql
-CREATE ACTIVE FILTER open_orders ON salesorders WHERE orderstatusid = 20 AND hold = 0;
-CREATE ACTIVE CACHE today AS SELECT COUNT(*) AS n, SUM(total) AS revenue FROM salesorders WHERE trandate = '2026-10-20';
-CREATE ACTIVE LINK lines_order ON salesorderdetails(orderno) REFERENCES salesorders(orderno);
-CREATE ACTIVE VIEW by_rep AS SELECT salesman, COUNT(*) AS orders, SUM(total) AS revenue FROM salesorders GROUP BY salesman;
+CREATE ACTIVE FILTER open_orders ON orders WHERE status = 'open' AND hold = 0;
+CREATE ACTIVE CACHE today AS SELECT COUNT(*) AS n, SUM(total) AS revenue FROM orders WHERE order_date = '2026-10-20';
+CREATE ACTIVE LINK items_order ON order_items(order_id) REFERENCES orders(id);
+CREATE ACTIVE VIEW by_rep AS SELECT rep_id, COUNT(*) AS orders, SUM(total) AS revenue FROM orders GROUP BY rep_id;
 SHOW ACTIVE FILTERS | CACHES | LINKS | VIEWS | STATUS | TIERING;
 DROP ACTIVE FILTER|CACHE|LINK|VIEW [IF EXISTS] name;
 ```
@@ -1868,8 +1867,8 @@ These worked over the wire:
     the engine picks its own plan
   - nested groups, `a JOIN (b JOIN c ON x) ON y`; a `LEFT`/`RIGHT` join to a group
     runs the group as a derived table, so its rows are NULL-padded together
-  - a view of several tables joined after other tables (`productlinepoints p JOIN
-    stocktrans s ON p.lineid = s.lineid`): the view's tables join first
+  - a view of several tables joined after other tables (`order_items p JOIN
+    inventory_ledger s ON p.line_id = s.line_id`): the view's tables join first
 - multi-table writes: `UPDATE a JOIN b ... SET`, `UPDATE a, b SET ... WHERE`,
   `DELETE t1[, t2] FROM <tables> [WHERE]` (a target named by alias), and
   `DELETE FROM t1 USING <tables> [WHERE]`; each target needs a primary key

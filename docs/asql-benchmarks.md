@@ -124,7 +124,7 @@ the commit's fsync):
 
 | | ASQL before | ASQL now | MariaDB |
 |---|---|---|---|
-| erp.stocktrans, 1.5M rows | 33,081 / 23,985 us | 414 / 431 us | 16,074 / 7,725 us |
+| appdb.inventory_ledger, 1.5M rows | 33,081 / 23,985 us | 414 / 431 us | 16,074 / 7,725 us |
 | sbtest1, 100k rows | 581 / 454 us | 275 / 292 us | 345 / 335 us |
 
 What changed:
@@ -204,8 +204,8 @@ master). Checked with the MariaDB client (`--compress`), the MySQL 8.0.46
 client (`--compression-algorithms=zlib|zstd`, zstd levels 1-19), sysbench's
 prepared statements and aios-mysql-check.
 
-Four whole ERP tables (salesorders, salesorderdetails, stockmaster,
-debtorsmaster: 68.6 MB of rows) to the mysql client; bytes counted by a TCP
+Four whole enterprise benchmark tables (orders, order_items, products,
+customers: 68.6 MB of rows) to the mysql client; bytes counted by a TCP
 proxy in front of each server, time best of 5 without it:
 
 | | bytes to the client | ratio | time |
@@ -217,7 +217,7 @@ proxy in front of each server, time best of 5 without it:
 | ASQL zlib (level 6, as MariaDB) | 23,733,346 | 2.89x | 2.16 s |
 | ASQL zstd (the client's level, 3) | 24,097,974 | 2.85x | 2.12 s |
 
-The same rows (sorted, the outputs are identical; salesorderdetails comes in
+The same rows (sorted, the outputs are identical; order_items comes in
 insertion order from ASQL until an OPTIMIZE clusters it by its key, as
 InnoDB keeps it).
 
@@ -407,10 +407,10 @@ changed how reads run, not what they return.
 | top customers 90d (join) | 964 | 34 | 28x (was 4.9x) |
 | monthly totals (GROUP BY YEAR, MONTH) | 528 | 19 | 27x (was 12x) |
 | line sales by location (join) | 286 | 10.5 | 27x (was 5.8x) |
-| locstock top items (GROUP BY .. LIMIT) | 412 | 18 | 22x (was 7.5x) |
-| orders w/o dispatch (NOT EXISTS) | 144 | 6.6 | 22x (was 3.1x) |
-| stocktrans 30d / 7d line sales (IN subquery) | 199 / 63 | 10.9 / 10.5 | 18x / 6x |
-| pickingfreeze by document | 358 | 22.5 | 16x (was 3.9x) |
+| inventory top items (GROUP BY .. LIMIT) | 412 | 18 | 22x (was 7.5x) |
+| orders w/o shipment (NOT EXISTS) | 144 | 6.6 | 22x (was 3.1x) |
+| inventory ledger 30d / 7d line sales (IN subquery) | 199 / 63 | 10.9 / 10.5 | 18x / 6x |
+| order holds by document | 358 | 22.5 | 16x (was 3.9x) |
 | busy items (HAVING) | 185 | 17.9 | 10x |
 | category stock (LEFT JOIN) | 60 | 8.7 | 7x |
 | point lookups (order by pk, item history) | 0.3-0.4 | 0.3-0.4 | 1.0-1.1x cold, 1.6-2.2x steady (79 vs 124 us, 70 vs 153 us) |
@@ -481,23 +481,23 @@ interleaved run by run (this box drifts by up to 20% over an hour; the ratios
 below are from back-to-back runs). ASQL with AIOS_TXN_CONCURRENT=1, as shipped
 (result cache on) unless noted.
 
-## ERP-shaped queries (the "22x" class)
+## Enterprise workload queries (the "22x" class)
 
-1.5M stocktrans, 400k salesorders / 1.2M salesorderdetails, 300k locstock,
-250k dispatch and pickingfreeze, 30k stockmaster, 20k debtorsmaster; the
-asql-erp-bench suite's shapes plus joins, NOT EXISTS, LEFT JOIN, HAVING.
+1.5M inventory ledger, 400k orders / 1.2M order_items, 300k inventory,
+250k shipments and order holds, 30k products, 20k customers; the
+benchmark suite's shapes plus joins, NOT EXISTS, LEFT JOIN, HAVING.
 Median of 5, `SQL_NO_CACHE` on ASQL, every result diffed against MariaDB's
 (0 mismatches):
 
 | query | MariaDB ms | ASQL ms | |
 |---|---|---|---|
-| stocktrans 30d line sales (IN subquery) | 419 | 16 | 26x |
+| inventory ledger 30d line sales (IN subquery) | 419 | 16 | 26x |
 | line sales by location (join) | 3,357 | 51 | 66x |
 | distinct customers 365d | 403 | 8.8 | 46x |
 | top customers 90d (join) | 3,384 | 184 | 18x |
 | open orders 3-way join | 1,563 | 157 | 10x |
 | monthly totals (GROUP BY YEAR, MONTH) | 389 | 37 | 10x (was 1.5x) |
-| orders without dispatch (NOT EXISTS) | 89 | 39 | 2.3x (was 0.8x) |
+| orders without shipment (NOT EXISTS) | 89 | 39 | 2.3x (was 0.8x) |
 | category stock (LEFT JOIN ... ON ... AND) | 39 | 15 | 2.6x (was 0.3x) |
 | item history / order by key | 0.4-0.6 | 0.2-0.5 | 1.3-1.7x |
 
