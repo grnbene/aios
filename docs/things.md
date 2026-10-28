@@ -1,68 +1,78 @@
-# Things: a practical guide
+# Things: A Practical Guide
 
-A **Thing** is a query whose answer ASQL keeps up to date for you. You write the query once; every time a row it reads changes, the engine works out which keys that touches and recomputes just those. You read the answer with `SHOW THING`, and it is never stale.
+A **Thing** is a query whose result ASQL maintains incrementally. You declare the query once; whenever underlying table data changes, the engine identifies the affected keys and updates only those records. Applications read the live results using `SHOW THING`, ensuring fresh data without repeated aggregate queries or external cache invalidation.
 
-This guide walks through one example from start to finish - open orders in a warehouse - and shows how to use each feature along the way. The full syntax and every option is in [asql.md](asql.md#things); this page is the "how do I use it" version.
+In database terms, a Thing is an **incrementally maintained materialized view** (IVM). Unlike standard materialized views that require costly full-table refreshes, ASQL hooks table mutations and updates only the touched partitions.
 
-## If you know other systems
+For complete grammar specifications and engine internals, see [asql.md](asql.md#things).
 
-A Thing is an **incrementally maintained materialized view**: a stored query result that stays correct as the
-data under it changes, without being recomputed from scratch. The idea shows up in many places under other names:
+---
 
-| Where you may have met it | What it is called there | How a Thing compares |
-|---|---|---|
-| PostgreSQL | `MATERIALIZED VIEW` | Postgres recomputes the whole view when you run `REFRESH MATERIALIZED VIEW`. A Thing is never refreshed by hand, and recomputes only the keys a write touched. |
-| Oracle | materialized view with `REFRESH FAST ON COMMIT` | The closest match: kept current at commit from change logs. A Thing also acts on its values, keeps their history and explains them (below). |
-| SQL Server | indexed view | Maintained inside every write, but with strict limits on the query (no outer joins, no `MAX`/`MIN`, and more). A Thing's query can be any `SELECT ... GROUP BY` over the key. |
-| MySQL / MariaDB | no built-in equivalent; usually a summary table kept by triggers or a cron job | A Thing replaces that hand-written trigger or batch job, and cannot drift from the query it stands for. |
-| Streaming systems (Materialize, ksqlDB, Flink SQL) | a materialized view or table over a stream | Same idea, but they run as a separate service fed by a change stream. A Thing lives in the database the data is already in. |
-| Spreadsheets | a formula cell | The analogy most people already have: change an input cell and every total that depends on it updates. A Thing is that, for SQL. |
-| UI frameworks (MobX, Vue, Svelte) | computed / derived values | Same contract: declare how a value is derived, and it is kept current when its inputs change. |
+## Example Schema
 
-The extra features map to familiar ideas too:
-
-| Thing feature | Known elsewhere as |
-|---|---|
-| `WHEN ... DO` | a trigger, or a rule in a rules engine, but on a computed value (fires when an order *becomes* fully picked, not on each row written) |
-| `SHADOW` then `LIVE` | a dry-run or "shadow mode" rollout: run the new logic beside the old, compare, then switch |
-| `AS OF` | temporal tables (SQL:2011 system versioning; SQL Server's `FOR SYSTEM_TIME AS OF`; Oracle Flashback Query), for the Thing's values |
-| `EXPLAIN THING` | data lineage or provenance: which inputs produced this number |
-| `WHAT IF` | running a change in a transaction and rolling it back, with the downstream effects reported for you |
-| `INTO` | a table kept equal to a view, so other views (and ordinary SQL) can build on it |
-
-## The example
+This guide follows a warehouse order fulfillment example:
 
 ```sql
-CREATE TABLE lines (id INT PRIMARY KEY, orderno INT, wh VARCHAR(4), qty INT, picked INT, price DECIMAL(10,2));
+CREATE TABLE lines (
+    id INT PRIMARY KEY,
+    orderno INT,
+    wh VARCHAR(4),
+    qty INT,
+    picked INT,
+    price DECIMAL(10,2)
+);
 ```
 
-Each row is one line of an order: how many items were ordered, how many have been picked so far, and the price.
+Each row represents an order line item: item quantity ordered, quantity picked so far, and unit price.
 
-## 1. Make a Thing
+---
+
+## 1. Creating and Querying a Thing
+
+Define a Thing to track live order summaries across lines:
 
 ```sql
 CREATE THING orders KEY orderno PARTITION BY orderno READS lines
   AS SELECT orderno, COUNT(*) AS line_count, SUM(qty) AS qty, SUM(picked) AS picked, SUM(qty * price) AS total
      FROM lines GROUP BY orderno;
+```
 
+Key clauses:
+- **`KEY orderno`**: Defines the unique identifier for each Thing instance.
+- **`PARTITION BY orderno`**: Specifies the partition boundary for change tracking. When `KEY` and `PARTITION BY` match, it functions as a row Thing (allowing expressions like `COUNT`, `SUM`, `AVG`, `MAX`, `CASE`).
+- **`READS lines`**: Declares source dependencies (defaults to all tables referenced in the query).
+
+### Querying Current State
+
+```sql
 SHOW THING orders;
 ```
 
-This maintains one live row per order. An `UPDATE lines SET picked = ...` updates the order it belongs to before the statement returns.
+When an `UPDATE lines SET picked = ...` commits, the corresponding order summary is updated before the write returns.
 
-To inspect recent changes and what triggered them:
+### Inspecting Change History
+
+To view recent mutations and their causes:
 
 ```sql
 SHOW THING HISTORY orders '200';
 ```
 
-## 2. Let it act - carefully
+Returns the last 32 state transitions for key `200`, including timestamps, before/after values, and the triggering statement cause.
 
-A Thing can trigger an action when a condition becomes true. For example: when an order is fully picked, mark it ready in the ERP. The current values of the Thing are available to the action as `THING.<label>`, and `KEY` is the order number.
+---
 
-### Start in shadow mode
+## 2. Automated Actions and Shadow Mode (WHEN ... DO)
 
-In shadow mode, the action is evaluated and recorded exactly as it would run, but it is not sent to the target database:
+Things can trigger automated writes when a condition becomes true (e.g. marking an order ready in an ERP system when picking completes).
+
+Actions support variable substitution:
+- `KEY`: Evaluates to the key value (e.g. order number).
+- `THING.<label>` (or `` THING.`<label>` ``): Evaluates to the value of that label at trigger time (numbers remain unquoted, text strings are quoted, `NULL` becomes `NULL`).
+
+### Testing Safely with Shadow Mode
+
+To test actions against production writes without executing updates on external systems, suffix the action with `SHADOW`:
 
 ```sql
 CREATE THING ready KEY orderno PARTITION BY orderno READS lines
@@ -72,83 +82,100 @@ CREATE THING ready KEY orderno PARTITION BY orderno READS lines
   TO erp SHADOW;
 ```
 
-`erp` is a connection profile in `connections.ini`. Watch the actions it would take:
+`erp` references a database profile defined in `connections.ini`. In shadow mode, the engine evaluates the condition and logs the formatted SQL statements without sending them to the target.
+
+Inspect recorded candidate actions:
 
 ```sql
 SHOW THING SHADOW ready;
 ```
 
-Every line is a statement it would have run, with the real numbers filled in.
+Each entry displays the exact SQL statement that would execute, with real values substituted.
 
-### Promote to live
+### Promoting to Live Execution
 
-When you are satisfied with the previewed actions:
+Once verified, promote the Thing to live execution:
 
 ```sql
 SET THING ready LIVE;
 ```
 
-The profile needs `things_write=1` before this is allowed—a Thing writes only where explicitly permitted. Going live acts only on orders that become ready from that point forward; it does not replay what it would have done in shadow mode.
+Requirements and behavior:
+- The target connection profile must have `things_write=1` enabled in `connections.ini`.
+- Going live does not replay historical shadow entries; it acts only on orders transitioning to ready from that point forward.
+- **Edge-triggered semantics**: Actions execute once per transition from false to true. Subsequent updates while the condition remains true do not re-fire.
+- **Transaction isolation**: Actions evaluate only committed data. Changes rolled back in an open transaction never trigger an action.
 
-You can hold back actions again at any time with `SET THING ready SHADOW`. Both settings survive engine restarts.
+To revert to shadow mode:
 
-### Rules for actions
+```sql
+SET THING ready SHADOW;
+```
 
-- **Edge-triggered**: An action fires once each time its condition becomes true, not on every subsequent update while it stays true.
-- **Transaction isolation**: A Thing reacts only to committed data. If someone updates `lines` inside a transaction and rolls it back, the Thing never sees the change, and no action is fired.
+Mode configuration persists across server restarts.
 
-## 3. "Why does it say that?"
+---
 
-Two diagnostic questions come up constantly:
+## 3. Auditing and Diagnostics
 
-### What was the state at a given moment? (Time travel)
+### Point-in-Time Reconstruction (Time Travel with AS OF)
 
-Every change to a Thing is kept on disk for 30 days by default:
+Every Thing change is appended to an on-disk history log (`<root>/sql_db/things/<name>.asof`), allowing state reconstruction at any prior timestamp:
 
 ```sql
 SHOW THING orders AS OF '2026-10-27 14:15:00';
 SHOW THING orders AS OF '2026-10-27 14:15:00' KEYS ('123');
 ```
 
-Each row shows the values as they stood at that moment, when they were set (`changed_at`), and what caused the change (`cause`).
+Output includes the values as they stood at that timestamp, the recorded `changed_at` time, and the mutation `cause`.
 
-- Adjust retention: `SET THING orders KEEP 90 DAYS` (or `KEEP 0 DAYS` to disable).
-- Storage: History is kept in append logs on disk (capped at 256 MB per Thing), keeping memory footprint minimal.
+- **Retention settings**: Configured via `SET THING orders KEEP <n> DAYS` (default is 30 days, capped at 256 MB per Thing; set `KEEP 0 DAYS` to disable).
+- **Environment defaults**: Configurable system-wide with `AIOS_THING_KEEP_DAYS` and `AIOS_THING_KEEP_MB`.
 
-### Which rows make up this value? (Lineage)
+### Source-Row Attribution (Lineage with EXPLAIN THING)
+
+To identify which underlying source rows produced an aggregate calculation:
 
 ```sql
 EXPLAIN THING orders '123';
 ```
 
-This returns all source rows behind order 123, plus a `thing.<label>` column showing each individual row's contribution to aggregates (`SUM`, `COUNT`, `MIN`, `MAX`, `AVG`). The individual shares add up directly to what the Thing shows.
+The engine unrolls the aggregate query for key `123`, returning the contributing source rows from `lines` alongside a `thing.<label>` column showing each individual row's share of `SUM`, `COUNT`, `AVG`, `MIN`, or `MAX`. The sum of individual contributions matches the aggregate value shown in `SHOW THING`.
 
-## 4. Try a change before you make it (What-If previews)
+---
 
-Before running a bulk update or migration, preview what it would do to your Things:
+## 4. Write Previews and Impact Analysis (WHAT IF)
+
+Before running migrations or bulk updates, preview their downstream effects across all Things without altering state:
 
 ```sql
 WHAT IF UPDATE lines SET picked = qty WHERE wh = 'a';
 ```
 
-The output lists every order that would change, its values before and after, and any action it would fire. Nothing is written—not to the source tables, not to the Things, and not to any action target.
+Output displays:
+1. Every Thing key affected, with `old` and `new` column values.
+2. Every downstream `WHEN ... DO` trigger that would fire (`would act: ...`).
+3. No modifications are committed to source tables, Things, or external action profiles.
 
-Several statements can be previewed in a single batch:
+### Multi-Statement Previews
+
+Preview multiple related operations as a single batch:
 
 ```sql
 WHAT IF 'UPDATE lines SET qty = 4 WHERE id = 1; DELETE FROM lines WHERE orderno = 300';
 ```
 
 > [!TIP]
-> Use the quoted form when using the `mysql` command-line client. That client splits input on semicolons before sending it to the server, so without quotes it would preview the first statement and **execute the second statement for real**.
+> Always quote multi-statement batches when using the standard `mysql` CLI. Unquoted semicolons cause the command-line client to split the input into separate queries, previewing the first and executing subsequent statements against live tables.
 
-## 5. Build Things on other Things
+---
 
-Often one Thing serves as the input to another: for example, overall warehouse load is an aggregate over open orders. Rather than duplicating order logic across queries, give the first Thing a managed table:
+## 5. Chaining Things with Managed Tables (INTO)
+
+When multi-tier analytics or reports share intermediate calculations, persist a Thing's output into a managed table using `INTO <db>.<table>`:
 
 ```sql
--- Drop the earlier standalone Thing if replacing it with a managed-table Thing
-DROP THING orders;
+DROP THING IF EXISTS orders;
 
 CREATE THING orders KEY orderno PARTITION BY orderno READS lines INTO shop.orders_t
   AS SELECT orderno, SUM(qty) AS qty, MAX(wh) AS wh FROM lines GROUP BY orderno;
@@ -157,56 +184,47 @@ CREATE THING load KEY wh PARTITION BY wh READS orders_t
   AS SELECT wh, SUM(CAST(qty AS SIGNED)) AS units, COUNT(*) AS orders FROM orders_t GROUP BY wh;
 ```
 
-`shop.orders_t` is a real database table that ASQL keeps in sync with `orders`:
-- A write to `lines` flows through `orders`, into `orders_t`, and into `load` before the write statement returns.
-- Standard SQL queries, BI tools, and reports can read and join `orders_t` like any other table.
-- The table is managed by the Thing: client writes (`INSERT`, `UPDATE`, `DELETE`) are rejected, and `DROP THING orders` drops the table automatically.
-- Values are stored as text (matching `SHOW THING` output), so cast them when comparing numerically.
-- Circular dependencies between Things are detected and prevented at `CREATE` time.
+Managed table characteristics:
+- **Cascading updates**: Mutations to `lines` propagate through `orders`, update `orders_t`, and trigger updates in `load` within the same transaction commit cycle.
+- **SQL compatibility**: `shop.orders_t` is a standard table accessible to `SELECT` queries, BI tools, and joins.
+- **Managed integrity**: Direct client writes (`INSERT`, `UPDATE`, `DELETE`) to managed tables are rejected. Dropping the parent Thing (`DROP THING orders`) drops the associated managed table.
+- **Data types**: Values are stored as text (matching `SHOW THING` formatting); downstream numeric aggregations should use explicit `CAST` expressions.
+- **Cycle prevention**: Recursive and circular dependencies between chained Things are validated and rejected at `CREATE` time.
 
-## When a Thing is the right tool
+---
 
-Reach for a Thing when **the same question is asked over and over, and the answer must be current**:
+## When to Use Things
 
-- **Status per business object.** Per order: lines picked of lines ordered. Per customer: open balance. Per item: on
-  hand and on order. Per warehouse: units still to pick today. These are read on every page load, and recomputing
-  them from the raw tables each time is what makes pages slow.
-- **Dashboards and boards that refresh constantly.** A board polled every few seconds reads the Thing, which is
-  already computed, instead of running the aggregate again. `WAIT THING` lets a page wait for a change rather than
-  poll at all.
-- **Acting on a condition.** "When an order is fully picked, mark it ready." "When stock falls under its reorder
-  point, raise a purchase line." Without a Thing this is a polling job that rescans everything, or a trigger that
-  has to recompute the same aggregate itself.
-- **Explaining numbers to people.** When "the dashboard is wrong" tickets are common, `AS OF` and `EXPLAIN THING`
-  answer them from the database instead of from guesswork.
-- **Logic that several reports share.** Define "an open order" once as a Thing with `INTO`, and build the
-  warehouse, customer and driver views on it.
+### Recommended Use Cases
 
-## When it is not
+- **High-traffic entity metrics**: Order fulfillment progress, inventory availability, customer balances, and facility throughput queries executed frequently across user sessions.
+- **Zero-polling reactive interfaces**: Dashboards and monitoring screens using `WAIT THING <name>` or Grain UI `"watch"` bindings (`"watch": {"thing": "orders"}`) to stream incremental updates without periodic polling.
+- **Automated workflow handoffs**: Triggering downstream state changes across ERP/database boundaries with verifiable shadow mode testing.
+- **Multi-layer analytical rollups**: Building consistent intermediate tables with `INTO` that serve multiple reports and downstream models.
+- **Auditable business state**: Applications requiring historical point-in-time auditing (`AS OF`) or granular aggregate verification (`EXPLAIN THING`).
 
-- **One-off and ad-hoc queries.** If a question is asked once, just run the query: a Thing pays to keep the answer
-  current on every write, which only pays off when the answer is read often.
-- **Questions shaped by each request.** "Sales between these two dates someone picked on a form" changes with every
-  request. Keep a Thing per day or per hour (as `touch_hour` does) and add up the days the request asks for, rather
-  than one Thing per possible range.
-- **Values that change on nearly every write anyway.** If almost every write touches almost every key, there is
-  little left to save, and the Thing adds work to each write.
-- **Tables a Thing would read whole.** A Thing reacts by key when the table carries its partition column. A table
-  it joins without that column (a price list, say) makes every change to it recompute the whole Thing. That is fine
-  for small lookup tables, and expensive for big, busy ones.
-- **Exact, transactional reads of your own uncommitted writes.** A Thing shows committed data only; inside an open
-  transaction, query the tables directly.
+### When to Avoid
 
-## Operational considerations
+- **Ad-hoc and exploratory queries**: One-off queries incur continuous maintenance overhead on writes without recurring read benefits.
+- **Arbitrary dynamic filtering**: Queries filtering across dynamic combinations of non-partitioned columns.
+- **Global write patterns without partition locality**: Workloads where individual writes modify nearly every key across the table.
+- **Unpartitioned joins on large, volatile tables**: Joining large, frequently-written tables lacking partition alignment forces full Thing recalculation on every write.
+- **Transaction-local uncommitted reads**: Things only reflect committed state; to inspect pending modifications within an open transaction, query base tables directly.
 
-- **Targeted updates**: When source data changes, ASQL recomputes only the specific keys affected by that write rather than re-evaluating the full query.
-- **Append-only history**: Time travel logs (`AS OF`) use compact on-disk appends per changed key.
-- **Managed tables**: `INTO` updates only modified keys in the target table once changes settle.
-- **Lightweight previews**: `WHAT IF` evaluates changes in a temporary transaction that rolls back immediately.
+---
 
-## Where to read more
+## Architecture and Performance Invariants
 
-- Reference syntax and all options: [asql.md - Things](asql.md#things)
-- Time travel storage and pruning internals: [design/thing-time-travel.md](design/thing-time-travel.md)
-- What-If preview transaction mechanics: [design/thing-what-if.md](design/thing-what-if.md)
-- Cascading updates and cycle detection: [design/thing-into.md](design/thing-into.md)
+- **Targeted Recomputation**: ASQL's mutation hooks identify changed partition keys and update only those specific partitions, avoiding full-table scans.
+- **Non-blocking Append History**: Time travel logs (`.asof`) use sequential disk appends per modified key, pruned according to retention policies (`AIOS_THING_KEEP_DAYS`).
+- **Deferred Settle**: Chained managed tables settle updates after the primary lock is released, minimizing write lock contention.
+- **Isolated Rollback Previews**: `WHAT IF` operations execute in an isolated sandbox transaction that is rolled back prior to completion.
+
+---
+
+## References
+
+- [asql.md - Things Reference](asql.md#things)
+- [design/thing-time-travel.md](design/thing-time-travel.md)
+- [design/thing-what-if.md](design/thing-what-if.md)
+- [design/thing-into.md](design/thing-into.md)
