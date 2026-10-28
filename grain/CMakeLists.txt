@@ -103,6 +103,12 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/archive.cpp
   ${AIOS_ROOT}/src/net/deflate.cpp)
 
+# A browser (Emscripten): the same language, its own host - see wasm/wasm.cmake.
+if(EMSCRIPTEN)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/wasm/wasm.cmake)
+  return()
+endif()
+
 # The host: the machine (files, clocks, randomness - what TLS asks of it), threads
 # and sleeping, processes, sockets - one file of each per OS.
 if(WIN32)
