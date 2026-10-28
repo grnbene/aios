@@ -1206,7 +1206,12 @@ class PkMap {
     ++it;
     return it;
   }
-  uint32_t& operator[](const std::string& key) { if (runs_) to_slots(); return emplace(key, 0).first->second; }
+  // Out of runs mode first, so the entry is a slot: the reference is into slots_, never into an iterator's copy.
+  uint32_t& operator[](const std::string& key) {
+    if (runs_) to_slots();
+    const size_t i = emplace(key, 0).first.i;
+    return slots_[i].second;
+  }
   std::pair<iterator, bool> emplace(const std::string& key, size_t v) {
     uint64_t ik = 0;
     const bool is_int = int_key(key, &ik, true);
@@ -3392,6 +3397,8 @@ class SqlDatabase {
   SqlQueryResult execute_explain(const std::string& sql);
   SqlQueryResult execute_transaction(const std::string& verb);
   SqlQueryResult execute_what_if(const std::string& sql, const std::string& session_db);
+  // A client statement writing a table a Thing keeps (INTO): the refusal, or "".
+  std::string kept_table_refusal(const std::string& sql, const std::string& session_db);
   // CALL of a stored procedure this engine implements natively (the ERP's
   // getNextTransNo); and `SET @name = expr` for the connection's variables.
   SqlQueryResult execute_call(const std::string& sql);

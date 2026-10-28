@@ -949,6 +949,26 @@ bool ThingEngine::parse_create(const std::string& sql, Kind* k, std::string* err
   size_t p_part = sc.find_kw("PARTITION BY");
   size_t p_reads = sc.find_kw("READS");
   size_t p_as = sc.find_kw("AS", p_reads != std::string::npos ? p_reads : p_part != std::string::npos ? p_part : p_key);
+  // INTO <db>.<table>, anywhere between KEY and AS (not the INSERT INTO of a DO, which is past AS): taken out the
+  // same way as SOURCE BY
+  {
+    const size_t p_into = sc.find_kw("INTO");
+    if (p_into != std::string::npos && p_key != std::string::npos && p_as != std::string::npos && p_key < p_into && p_into < p_as) {
+      size_t end = p_as;
+      for (size_t q : {p_part, p_reads, sc.find_kw("SOURCE BY")}) if (q != std::string::npos && q > p_into && q < end) end = q;
+      std::string target = trim(sql.substr(p_into + 4, end - p_into - 4));
+      std::string db, table;
+      const size_t dot = target.find('.');
+      if (dot == std::string::npos) table = unquote_ident(target);
+      else { db = unquote_ident(trim(target.substr(0, dot))); table = unquote_ident(trim(target.substr(dot + 1))); }
+      if (table.empty()) { *err = "INTO <database>.<table>"; return false; }
+      std::string rest = sql.substr(0, p_into) + std::string(end - p_into, ' ') + sql.substr(end);
+      const bool ok = parse_create(rest, k, err);
+      if (ok) { k->into_db = lower(db); k->into_table = lower(table); k->declaration = trim(sql); }
+      if (ok && k->type != Kind::Aggregate) { *err = "INTO: a Thing made by a query only"; return false; }
+      return ok;
+    }
+  }
   // SOURCE BY <column>, anywhere between KEY and AS: taken out here so the clauses around it parse as before
   {
     const size_t p_src = sc.find_kw("SOURCE BY");
@@ -1510,6 +1530,78 @@ static bool parse_key_list(std::string list, std::vector<std::string>* keys, std
   return true;
 }
 
+// ---- INTO: a table kept equal to a Thing (docs/design/thing-into.md) ---------------------------------------------
+void ThingEngine::keep_table(const std::string& db, const std::string& table, const std::string& by) {
+  std::lock_guard<aios::hal::Mutex> lk(kept_mu_);
+  const std::string key = lower(db) + "." + lower(table);
+  if (by.empty()) kept_.erase(key); else kept_[key] = by;
+  kept_count_.store(kept_.size(), std::memory_order_relaxed);
+}
+
+std::string ThingEngine::kept_by(const std::string& db, const std::string& table) const {
+  std::lock_guard<aios::hal::Mutex> lk(kept_mu_);
+  auto it = kept_.find(lower(db) + "." + lower(table));
+  return it == kept_.end() ? std::string() : it->second;
+}
+
+bool ThingEngine::into_pending() const {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  if (!into_drops_.empty()) return true;
+  for (const auto& kv : kinds_) if (!kv.second.into_table.empty() && (kv.second.into_resync || !kv.second.into_dirty.empty())) return true;
+  return false;
+}
+
+std::vector<std::pair<std::string, std::string>> ThingEngine::into_statements() {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  MuHeld held;
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& d : into_drops_) out.push_back({d.first, "DROP TABLE IF EXISTS " + ident(d.second)});
+  into_drops_.clear();
+  for (auto& kv : kinds_) {
+    Kind& k = kv.second;
+    if (k.into_table.empty() || (!k.into_resync && k.into_dirty.empty())) continue;
+    const std::vector<std::string> labels = value_labels(k);
+    const std::string db = k.into_db.empty() ? k.db : k.into_db;
+    const std::string tbl = ident(k.into_table);
+    std::string cols;
+    for (const auto& l : labels) cols += (cols.empty() ? "" : ", ") + ident(l);
+    auto row_lit = [&](const Instance& in) {
+      const std::vector<std::string> vals = value_row(k, in);
+      std::string o;
+      for (size_t i = 0; i < labels.size(); ++i) o += (i ? ", " : "") + (i < vals.size() ? sql_lit(vals[i]) : std::string("NULL"));
+      return "(" + o + ")";
+    };
+    std::vector<std::string> put, del;   // VALUES tuples, and keys to delete (as literals)
+    if (k.into_resync) {
+      // the table as the Thing is: made if it is not there, emptied, written whole
+      std::string defs;
+      for (size_t i = 0; i < labels.size(); ++i) defs += (i ? ", " : "") + ident(labels[i]) + (i == 0 ? " VARCHAR(255) NOT NULL PRIMARY KEY" : " TEXT");
+      out.push_back({db, "CREATE TABLE IF NOT EXISTS " + tbl + " (" + defs + ")"});
+      out.push_back({db, "DELETE FROM " + tbl});
+      for (const auto& tk : k.things) if (!tk.second.key_null) put.push_back(row_lit(tk.second));
+    } else {
+      for (const auto& key : k.into_dirty) {
+        auto it = k.things.find(key);
+        if (it != k.things.end()) { if (!it->second.key_null) put.push_back(row_lit(it->second)); }
+        else if (key != kNullKey) del.push_back(sql_lit(key));
+      }
+    }
+    for (size_t i = 0; i < del.size(); i += 500) {
+      std::string list;
+      for (size_t j = i; j < del.size() && j < i + 500; ++j) list += (j > i ? ", " : "") + del[j];
+      out.push_back({db, "DELETE FROM " + tbl + " WHERE " + ident(labels[0]) + " IN (" + list + ")"});
+    }
+    for (size_t i = 0; i < put.size(); i += 500) {
+      std::string vals;
+      for (size_t j = i; j < put.size() && j < i + 500; ++j) vals += (j > i ? ", " : "") + put[j];
+      out.push_back({db, "REPLACE INTO " + tbl + " (" + cols + ") VALUES " + vals});
+    }
+    k.into_dirty.clear();
+    k.into_resync = false;
+  }
+  return out;
+}
+
 // ---- Time travel: the change log beside a row Thing (docs/design/thing-time-travel.md) ----------------------------
 namespace {
 int keep_days_default() {
@@ -1746,6 +1838,13 @@ void ThingEngine::finish_changes(Kind& k, const std::map<std::string, std::strin
       for (const auto& v : vals) log += "\t" + val_field(v);
       log += "\n";
     }
+  }
+  if (!k.into_table.empty()) {
+    for (const auto& kv : before_display) {
+      auto it = k.things.find(kv.first);
+      if (it != k.things.end() && display(k, it->second) != kv.second) k.into_dirty.insert(kv.first);
+    }
+    for (const std::string& ik : k.asof_gone) k.into_dirty.insert(ik);
   }
   if (asof_on(k))
     for (const std::string& ik : k.asof_gone)
@@ -4097,6 +4196,51 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
       kinds_.erase(it);
       return error_result(err);
     }
+    // INTO: the table must be free, the value names distinct (they are its columns), and no chain of INTO tables
+    // may lead back to this one
+    if (!it->second.into_table.empty()) {
+      Kind& nk = it->second;
+      if (nk.into_db.empty()) nk.into_db = lower(nk.db);
+      std::string why;
+      const std::vector<std::string> labels = value_labels(nk);
+      for (size_t i = 0; i < labels.size() && why.empty(); ++i)
+        for (size_t j = i + 1; j < labels.size(); ++j)
+          if (lower(labels[i]) == lower(labels[j])) { why = "two values are named " + labels[i] + " (they are the table's columns)"; break; }
+      if (why.empty() && db_.resolve_table(nk.into_table, nk.into_db))
+        why = nk.into_db + "." + nk.into_table + " exists: INTO makes a table of its own";
+      if (why.empty()) {
+        for (const auto& kv : kinds_)
+          if (kv.first != nk.name && kv.second.into_db == nk.into_db && kv.second.into_table == nk.into_table) why = "Thing " + kv.first + " keeps that table";
+      }
+      if (why.empty()) {
+        // does what this Thing reads reach its own table through other Things' INTO tables?
+        std::function<bool(const Kind&, std::vector<std::string>&)> reaches = [&](const Kind& from, std::vector<std::string>& chain) {
+          for (const auto& r : from.reads) {
+            std::string rdb = lower(from.db), rt = lower(r);
+            const size_t dot = rt.find('.');
+            if (dot != std::string::npos) { rdb = rt.substr(0, dot); rt = rt.substr(dot + 1); }
+            if (rdb == nk.into_db && rt == nk.into_table) return true;
+            for (const auto& kv : kinds_) {
+              if (kv.first == nk.name || kv.second.into_table.empty() || kv.second.into_db != rdb || kv.second.into_table != rt) continue;
+              if (std::find(chain.begin(), chain.end(), kv.first) != chain.end()) continue;
+              chain.push_back(kv.first);
+              if (reaches(kv.second, chain)) return true;
+              chain.pop_back();
+            }
+          }
+          return false;
+        };
+        std::vector<std::string> chain;
+        if (reaches(nk, chain)) {
+          std::string path = nk.name;
+          for (const auto& c : chain) path += " reads " + c + ", which";
+          why = "a cycle: " + path + " reads " + nk.into_db + "." + nk.into_table + ", which " + nk.name + " keeps";
+        }
+      }
+      if (!why.empty()) { kinds_.erase(it); return error_result("INTO: " + why); }
+      nk.into_resync = true;   // made and filled by the settle at this statement's end
+      keep_table(nk.into_db, nk.into_table, nk.name);
+    }
     // Its value names are known once it is built (a `*` learns them there): a DO naming one it does not have
     // is refused now, not at its first act.
     if (const std::string missing = unknown_do_labels(it->second); !missing.empty()) {
@@ -4129,6 +4273,10 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
     if (dit->second.type == Kind::Claims) {
       auto rit = kinds_.find(dit->second.resource);
       if (rit != kinds_.end()) { rit->second.claimed_by.clear(); rit->second.res.clear(); }
+    }
+    if (!dit->second.into_table.empty()) {
+      into_drops_.push_back({dit->second.into_db, dit->second.into_table});
+      keep_table(dit->second.into_db, dit->second.into_table, "");
     }
     kinds_.erase(dit);
     rebuild_watched();
@@ -5714,6 +5862,13 @@ void ThingEngine::load() {
       k.pending_full = true;
       k.full_cause = "parts unresolved at load";
     }
+  }
+  for (auto& kv : kinds_) {
+    Kind& k = kv.second;
+    if (k.into_table.empty()) continue;
+    if (k.into_db.empty()) k.into_db = lower(k.db);
+    keep_table(k.into_db, k.into_table, k.name);
+    k.into_resync = true;   // a crash between the Thing's file and its table: made equal again at the first settle
   }
   for (auto& kv : kinds_) {
     Kind& k = kv.second;
