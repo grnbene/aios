@@ -1,0 +1,217 @@
+{
+  "fileTypes": [
+    "gr"
+  ],
+  "name": "Grain",
+  "scopeName": "source.grain",
+  "uuid": "7BD4B2F7-E1F9-4B52-9A8C-328AE5E95E10",
+  "patterns": [
+    {
+      "match": "(//|#).*$",
+      "name": "comment.line.grain"
+    },
+    {
+      "begin": "\\b[fF]\"",
+      "beginCaptures": {
+        "0": {
+          "name": "string.interpolated.grain"
+        }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": {
+          "name": "string.interpolated.grain"
+        }
+      },
+      "name": "string.interpolated.grain",
+      "patterns": [
+        {
+          "match": "\\\\(\\\\{|\\\\}|[\"\\\\/bfnrt]|u[0-9a-fA-F]{4})",
+          "name": "constant.character.escape.grain"
+        },
+        {
+          "begin": "\\{",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.begin.grain"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.end.grain"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "begin": "\"",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.grain"
+        }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.grain"
+        }
+      },
+      "name": "string.quoted.double.grain",
+      "patterns": [
+        {
+          "match": "\\\\([\\\\\"0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})",
+          "name": "constant.character.escape.grain"
+        }
+      ]
+    },
+    {
+      "begin": "'",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.grain"
+        }
+      },
+      "end": "'",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.grain"
+        }
+      },
+      "name": "string.quoted.single.grain",
+      "patterns": [
+        {
+          "match": "\\\\([\\\\'0abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})",
+          "name": "constant.character.escape.grain"
+        }
+      ]
+    },
+    {
+      "match": "\\b0x[0-9a-fA-F_]+\\b",
+      "name": "constant.numeric.hex.grain"
+    },
+    {
+      "match": "\\b0b[01_]+\\b",
+      "name": "constant.numeric.binary.grain"
+    },
+    {
+      "match": "\\b[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?\\b",
+      "name": "constant.numeric.decimal.grain"
+    },
+    {
+      "match": "\\b(true|false|nil)\\b",
+      "name": "constant.language.grain"
+    },
+    {
+      "match": "\\b(this)\\b",
+      "name": "variable.language.this.grain"
+    },
+    {
+      "match": "\\b(E|PI|all_rights|current_generation|grant|never|persistent|ram|read_only|read_write|shared_mem|write_only)\\b",
+      "name": "support.constant.substrate.grain"
+    },
+    {
+      "match": "\\b(entity)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.entity.grain"
+        },
+        "2": {
+          "name": "entity.name.type.entity.grain"
+        }
+      }
+    },
+    {
+      "match": "\\b(on)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.handler.grain"
+        },
+        "2": {
+          "name": "entity.name.function.handler.grain"
+        }
+      }
+    },
+    {
+      "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.function.grain"
+        },
+        "2": {
+          "name": "entity.name.function.grain"
+        }
+      }
+    },
+    {
+      "match": "\\b(break|continue|else|entity|fn|for|if|import|in|let|match|on|return|while)\\b",
+      "name": "keyword.control.grain"
+    },
+    {
+      "match": "\\b(and|or|not)\\b",
+      "name": "keyword.operator.logical.grain"
+    },
+    {
+      "match": "\\b(Capability|Entity|Id128|MemoryObject|StateChannel|StateFrame)\\b",
+      "name": "support.type.substrate.grain"
+    },
+    {
+      "match": "\\b(Capability|MemoryObject|StateChannel|StateFrame|__entity_assemble|cap_mint|capability|channel_create|id128|memory_allocate|state_frame)\\b",
+      "name": "support.function.substrate.grain"
+    },
+    {
+      "match": "\\b(ui|doc)\\b(?=\\.)",
+      "name": "support.class.module.grain"
+    },
+    {
+      "match": "\\b(__grain_defer|__grain_run_deferred|__route_invoke|abs|abspath|accept|acos|add_into|add_keys|aes_cbc_decrypt|after|all|any|app_program|append_file|asin|asql_exec|asql_query|assert|assert_eq|assert_false|assert_ne|assert_true|atan|atan2|await|base64_decode|base64_encode|basename|bcrypt_hash|bcrypt_verify|bytes|bytes_concat|bytes_copy|bytes_fill|bytes_find|bytes_from_hex|bytes_get|bytes_hex|bytes_set|bytes_str|cancel|canvas_arc|canvas_begin_path|canvas_bezier_curve_to|canvas_blit|canvas_blur|canvas_clear|canvas_clear_rect|canvas_close_path|canvas_create|canvas_create_linear_gradient|canvas_create_radial_gradient|canvas_draw_glass|canvas_draw_glow|canvas_draw_image|canvas_draw_line|canvas_draw_shadow|canvas_draw_text|canvas_fill|canvas_fill_circle|canvas_fill_ellipse|canvas_fill_gradient_h|canvas_fill_gradient_v|canvas_fill_linear_gradient|canvas_fill_polygon|canvas_fill_rect|canvas_fill_round_rect|canvas_fill_text|canvas_get_height|canvas_get_pixel|canvas_get_pixels|canvas_get_width|canvas_gradient_add_color_stop|canvas_height|canvas_line|canvas_line_to|canvas_measure_text|canvas_move_to|canvas_new|canvas_present|canvas_quadratic_curve_to|canvas_register_pane|canvas_restore|canvas_rotate|canvas_save|canvas_save_ppm|canvas_scale|canvas_set_fill_color|canvas_set_fill_style|canvas_set_font|canvas_set_global_alpha|canvas_set_line_width|canvas_set_pixel|canvas_set_pixels|canvas_set_stroke_color|canvas_set_stroke_style|canvas_stroke|canvas_stroke_circle|canvas_stroke_ellipse|canvas_stroke_polygon|canvas_stroke_rect|canvas_stroke_round_rect|canvas_stroke_text|canvas_to_bytes|canvas_to_ppm|canvas_translate|canvas_width|ceil|char_at|chars|chr|claims|clamp|clock|close|color_blend|color_contrast|color_darken|color_hex|color_hsl|color_hsla|color_invert|color_lighten|color_luminance|color_parse|color_rgb|color_rgba|color_to_hex|color_to_hsl|compact|concat|contains|cos|count|create_pane|csv_format|csv_parse|cv_begin_path|cv_close_path|cv_create|cv_draw_line|cv_draw_text|cv_fill|cv_fill_circle|cv_fill_rect|cv_line_to|cv_move_to|cv_stroke|cv_stroke_circle|cv_stroke_rect|cv_to_ppm|cwd|data_to_csv|data_to_json|data_to_sql_insert|date_format|date_make|date_parse|date_parts|date_range|day_add|db_build_update|db_close|db_columns|db_connect|db_connected|db_escape|db_ping|db_query|db_quote|db_schema|db_select_db|db_tables|db_transaction|debugger|dec_div|decimal|decimal_prefix|dedup|deg|del|delete_file|dirname|draw_autocomplete_popup|draw_badge|draw_bar_chart|draw_button|draw_card|draw_conflict|draw_connection_dialog|draw_data_grid|draw_donut_chart|draw_icon|draw_menu_bar|draw_metric_tile|draw_nav_tree|draw_progress_bar|draw_query_plan|draw_sparkline|draw_sql_editor|draw_status_bar|draw_tab_bar|draw_table_designer|draw_toolbar|draw_window_frame|drop|e|each|ease_in|ease_in_out|ease_out|el|ends_with|entries|enumerate|env|eprint|error|events|events_close|every|exp|extname|file_exists|filter|find|find_if|first_present|flatten|floor|for_each|format|from_entries|gc|get|get_in|get_or_put|getenv|gradient_add_stop|group_by|gunzip|gzip|has|hash_equals|haversine|hex_decode|hex_encode|hmac_sha256|html_escape|html_raw|html_stringify|http_get|http_parse_multipart|http_post|http_request|hypot|idiv|image_decode|index_of|insert|int|is_alnum|is_alpha|is_blank|is_digit|is_dir|is_err|is_numeric|is_ok|is_space|is_stopping|iso8601|join|json_parse|json_stringify|jwt_sign|jwt_verify|keccak256|key_by|keys|kv_del|kv_expire|kv_get|kv_incr|kv_keys|kv_mget|kv_set|kv_ttl|last_index_of|len|lerp|list_dir|list_panes|listen|live|log|log10|log2|log_debug|log_error|log_get_format|log_get_level|log_info|log_set_format|log_set_level|log_warn|lower|ltrim|mail_send|map|max|md5|merge|min|mkdir|net_connect|now|number_format|on_machine|ord|pack|pack_size|pad_left|pad_right|palette_analogous|palette_monochromatic|palette_triadic|pane_dispatch_event|pane_draw|pane_emit_event|pane_get|pane_get_canvas|pane_list|pane_on_event|pane_register|pane_render|pane_resize|pane_set_bounds|pane_trigger_event|pane_unregister|panic|parallel_map|params|path_basename|path_dirname|path_ext|path_join|path_normalize|pcall|pdf_render|peer|pi|pop|port|pow|print|process_run|push|rad|rand|random|random_bytes|range|read|read_bytes|read_file|read_raw|read_raw_with|read_target|read_until|read_with|real|reduce|regex_find_all|regex_match|regex_replace|regex_split|regex_test|register_pane|register_window|remove_at|repeat|replace|repr|res_download|res_error|res_html|res_json|res_redirect|res_sse|res_text|reverse|rgb|rgba|rmdir|round|round_sig|rtrim|run_panes|sat|scale|secret|seed|serve_routes|setenv|sha1|sha256|sha384|sha512|should_stop|sidecar_btc_addr|sidecar_cap_attenuate|sidecar_cap_mint|sidecar_eth_addr|sidecar_haversine|sidecar_keccak256|sidecar_parse_eml|sidecar_parse_feed|sidecar_parse_ical|sidecar_parse_vcard|sidecar_patch_check|sidecar_pdf_len|sidecar_pdf_render|sidecar_sha256|sidecar_svg_png_len|sidecar_tsp|sign|sin|sleep|slice|smoothstep|sort|sort_by|spawn|split|spring|sql|sql_format|sql_generate_ddl|sql_on|sql_suggest|sql_tokenize|sqrt|starts_with|str|sum_by|sys|sys_exec|take|tan|task_done|tcp_close|tcp_connect|tcp_recv|tcp_send|thing_conflicts|thing_rows|time|time_ms|time_us|to_number|trim|trunc|try_call|type|udp_bind|udp_close|udp_port|udp_recv|udp_recv_from|udp_send|udp_send_to|udp_socket|unique|unpack|unregister_pane|unzip|upper|upper_rtrim|url_decode|url_encode|utf8_valid|uuid|uuid_v4|values|wait|window_close|window_dispatch_event|window_get|window_get_canvas|window_list|window_register|window_render|window_set_bounds|window_unregister|write|write_bytes|write_file|xlsx_create|xml_escape|xml_parse|xml_stringify|xml_unescape|zip|zip_create)\\b",
+      "name": "support.function.builtin.grain"
+    },
+    {
+      "match": "\\.(attenuate|can|close|consume|dispatch|has_expired|listen|migrate|publish|read|recv|send|stats|write)\\b",
+      "captures": {
+        "1": {
+          "name": "support.function.member.grain"
+        }
+      }
+    },
+    {
+      "match": "\\.([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "variable.other.member.grain"
+        }
+      }
+    },
+    {
+      "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*(::[a-zA-Z_][a-zA-Z0-9_]*)+\\b",
+      "name": "entity.name.namespace.grain"
+    },
+    {
+      "match": "\\b[A-Z][a-zA-Z0-9_]*\\b",
+      "name": "entity.name.type.grain"
+    },
+    {
+      "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": {
+          "name": "entity.name.function.call.grain"
+        }
+      }
+    },
+    {
+      "match": "(==|!=|<=|>=|<<=|>>=|\\+=|-=|\\*=|/=|%=|\\^=|&=|\\|=|::|->|=>|\\?\\?|\\?\\.|\\?|<<|>>|<|>|=|\\+|-|\\*|/|%|\\^|&|\\||~|!)",
+      "name": "keyword.operator.grain"
+    },
+    {
+      "match": "(\\(|\\)|\\{|\\}|\\[|\\]|,|;|:|\\.)",
+      "name": "punctuation.separator.grain"
+    }
+  ]
+}
