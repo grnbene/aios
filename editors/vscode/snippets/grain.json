@@ -1,0 +1,83 @@
+{
+  "entity": {
+    "prefix": "entity",
+    "body": [
+      "entity ${1:SystemMonitor} {",
+      "\tidentity: id128(),",
+      "\tchannel: StateChannel(provider = shared_mem),",
+      "",
+      "\tcapability: Capability {",
+      "\t\tresource: ${2:hardware::uart0},",
+      "\t\trights: ${3:read_write},",
+      "\t\texpires: never",
+      "\t},",
+      "",
+      "\ton ${4:frame_received}(${5:frame}) {",
+      "\t\tif (${5:frame}.generation == current_generation) {",
+      "\t\t\tthis.channel.publish(${5:frame}.payload)",
+      "\t\t}",
+      "\t}",
+      "}"
+    ],
+    "description": "Substrate Entity declaration"
+  },
+  "on": {
+    "prefix": "on",
+    "body": [
+      "on ${1:event_name}(${2:frame}) {",
+      "\t${0}",
+      "}"
+    ],
+    "description": "Substrate event handler"
+  },
+  "fn": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:args}) {",
+      "\t${0}",
+      "}"
+    ],
+    "description": "Function definition"
+  },
+  "let": {
+    "prefix": "let",
+    "body": [
+      "let ${1:name} = ${2:value}"
+    ],
+    "description": "Variable binding"
+  },
+  "StateFrame": {
+    "prefix": "StateFrame",
+    "body": [
+      "let ${1:frame} = StateFrame(\"${2:tag}\", ${3:payload})"
+    ],
+    "description": "StateFrame constructor"
+  },
+  "Capability": {
+    "prefix": "Capability",
+    "body": [
+      "Capability {",
+      "\tresource: ${1:resource},",
+      "\trights: ${2:read_write},",
+      "\texpires: ${3:never}",
+      "}"
+    ],
+    "description": "Capability declaration"
+  },
+  "StateChannel": {
+    "prefix": "StateChannel",
+    "body": [
+      "StateChannel(provider = ${1:shared_mem})"
+    ],
+    "description": "StateChannel constructor"
+  },
+  "test": {
+    "prefix": "test",
+    "body": [
+      "test(\"${1:test description}\", fn() {",
+      "\t${0}",
+      "})"
+    ],
+    "description": "Grain test case"
+  }
+}

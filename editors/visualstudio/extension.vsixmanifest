@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
+  <Metadata>
+    <Identity Id="aios.grain.visualstudio" Version="1.0.0" Language="en-US" Publisher="AIOS" />
+    <DisplayName>Grain Language Support</DisplayName>
+    <Description xml:space="preserve">Syntax highlighting, language configuration, and TextMate grammar for Grain (.gr) substrate programs in Visual Studio.</Description>
+    <MoreInfo>https://github.com/QBCSystems/aios</MoreInfo>
+    <License>LICENSE</License>
+    <Icon>icon.png</Icon>
+    <Tags>grain, aios, substrate, language, textmate</Tags>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Community" Version="[15.0, 18.0)">
+      <ProductArchitecture>all</ProductArchitecture>
+    </InstallationTarget>
+  </Installation>
+  <Dependencies>
+    <Dependency Id="Microsoft.Framework.NDP" DisplayName="Microsoft .NET Framework" Version="[4.5,)" />
+  </Dependencies>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.VsPackage" d:Source="File" Path="Grain.pkgdef" />
+    <Asset Type="Microsoft.VisualStudio.TextmateGrammar" d:Source="File" Path="Syntaxes" />
+  </Assets>
+</PackageManifest>

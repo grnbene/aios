@@ -1,0 +1,16 @@
+[$RootKey$\TextMate\Repositories]
+"Grain"="$PackageFolder$\Syntaxes"
+
+[$RootKey$\TextMate\LanguageConfiguration\GrammarMapping]
+"source.grain"="$PackageFolder$\language-configuration.json"
+
+[$RootKey$\TextMate\LanguageConfiguration\ContentTypeMapping]
+"grain"="$PackageFolder$\language-configuration.json"
+
+[$RootKey$\Languages\FileExtensions\.gr]
+@="{7BD4B2F7-E1F9-4B52-9A8C-328AE5E95E10}"
+"ContentType"="grain"
+
+[$RootKey$\Languages\Language Services\Grain]
+@="{7BD4B2F7-E1F9-4B52-9A8C-328AE5E95E10}"
+"Package"="{7BD4B2F7-E1F9-4B52-9A8C-328AE5E95E10}"
