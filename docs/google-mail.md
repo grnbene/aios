@@ -28,6 +28,35 @@ address there; the page it ends on will not load, so copy that page's whole addr
 (Google refuses sign-in from embedded or unfamiliar browsers, so the sign-in itself always happens in a real
 browser; `aios` never sees your password.)
 
+## Signing in on a server (sending mail from ASQL)
+
+A mailer (`CREATE MAILER ... OAUTH 'google' ACCOUNT '<email>'`, see [asql.md - Mailers](asql.md#mailers)) sends with
+the tokens that `google auth` keeps under the root of the machine that runs ASQL. On a server this has four
+differences from the desktop sign-in:
+
+- **Run it as the user the service runs as**, with the full path and `--root`. As root it would leave a vault the
+  service cannot read:
+
+      runuser -u aios -- /opt/aios/bin/aios --root /opt/aios/root-v8-full exec 'google auth support@qbc.com'
+
+  The `<root>/oauth` directory must be owned by that user (`chown aios:aios`, mode 0700), and so must
+  `google.json` (mode 0600).
+- **Ask for the mail scope only.** Without a `scopes` list the client asks for mail, Calendar and Contacts. A
+  mailer needs just `https://mail.google.com/`, so give the client file
+  `"scopes": ["https://mail.google.com/", "openid", "email"]` inside its `installed` block before signing in.
+  `google status` then lists only those scopes.
+- **The browser is on another machine.** The consent page redirects to `http://127.0.0.1:<port>/` on the server,
+  which a laptop cannot load; that failed page is expected. Copy its whole address from the address bar. While the
+  `google auth` process is still waiting (up to 10 minutes) you can hand it to the listener from the server:
+  `curl 'http://127.0.0.1:<port>/?state=...&code=...'`; otherwise run `google auth finish '<address>'` as the
+  same user. The code works once.
+- **Workspace accounts:** create the client as a **Desktop app** and set the consent screen to **Internal**, so the
+  refresh token does not expire after 7 days. A Web-application client does not work: it needs registered
+  redirect addresses and this flow uses a loopback port chosen at run time.
+
+If the sign-in later lapses or is revoked, a mailer's act fails with `run aios google auth <email> on this machine`
+in `SHOW CELLS <name> ACTS`, and tries again at the key's next change.
+
 ## Using it
 
     google sync                      mail, calendar, contacts and notes
