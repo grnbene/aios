@@ -1,99 +1,143 @@
-# Warehouse Touches Service
+# Warehouse Touches
 
-Warehouse Touches is an AIOS web service written in Grain that aggregates warehouse operations and generates multi-format reporting for ERP users.
+A report of who touched what in the warehouse, and how much: receiving, picking, bin moves, truck loading, sticker
+scans and customer pickups, per person, over a range of days. It replaces the PHP report `touches.php` and gives the
+same numbers.
 
-It replaces the legacy PHP endpoint (`touches.php`) while querying the primary operations tables directly from ASQL.
-
-Related documentation:
-- [Running and managing Grain applications](../../docs/grain-apps.md)
-- [Writing Grain applications](../../docs/grain-app-writing.md)
-- [Hosting applications with AIOS](../../docs/aios-serve.md)
+Related: [Running Grain apps](../../docs/grain-apps.md) · [Writing Grain apps](../../docs/grain-app-writing.md) ·
+[Things](../../docs/things.md)
 
 ---
 
-## API Endpoints
+## How it works
 
-| Endpoint | Method | Response | Description |
-|---|---|---|---|
-| `/` or `/quickreportview` | `GET` | HTML | Interactive dashboard (summary cards, touch mix bars, ranked operator table, and date filter) |
-| `/quickreport` | `GET` | JSON | Aggregated touch rollups and per-operator metrics |
-| `/quickreportpdf` | `GET` | `application/pdf` | Vector PDF report in landscape letter format |
-| `/quickreportxlsx` | `GET` | `application/vnd.openxmlformats-officedocument...` | OpenXML spreadsheet export with frozen panes and cell styling |
-| `/quickreportcsv` | `GET` | `text/csv` | Tabular CSV export covering all 31 metrics |
-| `/health` | `GET` | JSON | Health status (`{"status":"ok"}`) |
+The heavy work is done once, by ASQL, not on every page view.
 
-### Query Parameters
+1. **ASQL keeps a Thing called `touch_hour`.** It has one row per warehouse hour (`"2026-10-27 08"`), holding
+   each person's figures for that hour. ASQL builds it from the warehouse tables and, when a row in one of those
+   tables changes, it recomputes only the hour that row falls in. The program for it is `things/touch_hour.gr`.
+2. **The app reads that Thing.** A report for a range reads the hours in the range and adds them up per person
+   (`lib/queries.gr`). It does not query the warehouse tables itself.
+3. **Deploying the app creates the Thing.** After a deploy, `deployed.gr` creates `touch_hour` in the ASQL the app
+   points at, or replaces it with the new program if it already exists. While the new version is being built, the
+   old one keeps answering.
 
-All reporting endpoints accept optional date filter parameters:
+The tables `touch_hour` reads: `recscan`, `pickingfreeze`, `stockmaster`, `product_types`, `binmovements_details`,
+`www_users`, `loadingbays`, `dispatch`, `stickerscanout`, `salesorderdetails`, `trackinginfo`, `salesorders`,
+`debtortrans`.
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `start` | `YYYY-MM-DD` | 30 days ago | Beginning of the date range |
-| `stop` | `YYYY-MM-DD` | Current date | End of the date range |
-| `range` | `START..STOP` | *(none)* | Combined date span string (e.g. `2026-09-01..2026-10-26`) |
-| `userid` | string | *(none)* | Filter activity to a single operator ID |
+## Where it runs
+
+| Machine | What it does |
+|---|---|
+| **atl-ga-1** | Does the work. Its ASQL keeps `touch_hour`, and its copy of the app answers every request. The public page goes through atl's nginx. |
+| **Other machines** (e.g. a workstation) | Can run a copy that forwards everything to atl. With `WAREHOUSE_COMPUTE_ON` set to atl's app host id, the page and every report and export are answered by atl and sent back. Nothing is computed locally, and the deploy there does not create a Thing. |
+
+`WAREHOUSE_COMPUTE_ON` empty (the default) means "answer here, from this machine's ASQL".
+
+## The page
+
+`/` is the report page. It shows summary cards, the mix of touch types, a table of operators you can sort, and a
+timeline of the day (Hours, Days, Heatmap tabs). Pick dates at the top; click an hour or drag across hours to narrow
+the report to them.
+
+The page updates by itself: when ASQL changes `touch_hour`, every open page checks whether its own range changed and
+redraws if it did.
+
+## Addresses
+
+| Address | Gives |
+|---|---|
+| `/` | The report page |
+| `/quickreportview` | The old PHP address. Sends you to `/` with the same dates and hours, so old links keep working |
+| `/quickreport` | The report as JSON |
+| `/quickreportpdf` | The report as a PDF (landscape letter) |
+| `/quickreportxlsx` | The report as an Excel file |
+| `/quickreportcsv` | The report as CSV |
+| `/quickreportauth` | Used by atl's nginx to check the API key before letting a request to the public page through |
+| `/health` | `{"status":"ok"}` |
+
+### Choosing dates and hours
+
+All addresses above take the same options in the link:
+
+| Option | Example | Meaning |
+|---|---|---|
+| `start` | `2026-10-01` | First day. Default: 29 days before `stop` (30 days in all) |
+| `stop` | `2026-10-27` | Last day. Default: today |
+| `range` | `2026-10-01..2026-10-27` | Both days at once |
+| `hours` | `7-11` | Only these hours of each day (7 through 11) |
+| `hour_wanted` | `10` | One hour of each day, as the PHP report took it |
+
+A date that isn't a real date is ignored and the default is used.
+
+`userid` is **not** a filter. Reports always cover everyone. On the public page, `userid` is only part of the login
+check (see below).
+
+## The public page
+
+atl serves the page to outside users at:
+
+```
+https://atl-ga-1.tireserv.com/?route=apir/warehouse/touches/quickreportlive&key=<api key>&userid=<user>
+```
+
+Add `&export=pdf`, `&export=xlsx` or `&export=csv` for a file. Before each request nginx asks the app
+(`/quickreportauth`) whether to allow it, using the same rule as the PHP API: the key must be an active key in
+`apikeys` for this database, and `userid` must be set and not `admin`. Otherwise the answer is 401.
 
 ---
 
-## Architecture and File Layout
+## Files
 
 ```text
 apps/warehouse_touches/
-├── app.gr                 # Application manifest (port 8573, listen interface, settings, secrets)
-├── service.gr             # HTTP routes and request handlers
+├── app.gr               # name, port (8573), settings and secrets
+├── service.gr           # the page, the addresses, the login check
+├── deployed.gr          # runs after a deploy: creates or replaces the touch_hour Thing
+├── things/
+│   └── touch_hour.gr    # the Thing: one row per hour, each person's figures
 ├── lib/
-│   ├── queries.gr         # ASQL touch queries (recscan, picking, bin movements, loads, stickers)
-│   └── views.gr           # Document and view renderers (HTML dashboard, PDF, XLSX, CSV)
-└── README.md              # Service documentation
+│   ├── queries.gr       # reads touch_hour for a range and adds it up per person
+│   └── views.gr         # the page, PDF, Excel and CSV
+└── README.md
 ```
 
-### Warehouse Operations ("Touches")
+## Settings
 
-The service queries five distinct operational areas from ASQL:
-1. **Receiving (`recscan`)**: Pallet and carton receipts, quantities, scan counts, and vendor tallies.
-2. **Picking (`pickingfreeze` + `stockmaster`)**: Merchandise picks excluding non-inventory freight/fees.
-3. **Bin Movements (`binmovements_details`)**: Stock movements, merges, and dolly relocations.
-4. **Truck Loading (`loadingbays` + `dispatch`)**: Dispatches, loading scan counts, manual overrides, and driver times.
-5. **Sticker Scans (`stickerscanout` + `salesorderdetails`)**: Pack and stage unit scans and bound orders.
+| Setting | Default | Meaning |
+|---|---|---|
+| `DB_HOST` | `127.0.0.1` | ASQL address |
+| `DB_PORT` | `3307` | ASQL port |
+| `DB_USER` | `root` | Database user (atl uses `erp`) |
+| `DB_NAME` | `versioneight` | Database |
+| `WAREHOUSE_COMPUTE_ON` | empty | Fleet member that answers instead of this machine (see "Where it runs") |
 
----
-
-## Host Configuration
-
-Configuration settings are set through `app set` or environment variables:
+The password is either the secret `DB_PASSWORD` or a file named by the setting `DB_PASSWORD_FILE` (atl uses
+`/opt/aios/mysql.pass`).
 
 ```bash
-app set warehouse_touches \
-    DB_HOST=127.0.0.1 \
-    DB_PORT=3307 \
-    DB_USER=root \
-    DB_NAME=versioneight
+grain app set warehouse_touches DB_USER=erp DB_PASSWORD_FILE=/opt/aios/mysql.pass
+# or keep the password as a sealed secret (read from stdin, never typed on the command line):
+grain app secret warehouse_touches DB_PASSWORD < /path/to/password-file
 
-# Pass MariaDB/ASQL password via stdin
-cat /opt/aios/mysql.pass | app secret warehouse_touches DB_PASSWORD
+# a copy on another machine that sends everything to atl:
+grain app set warehouse_touches WAREHOUSE_COMPUTE_ON=<atl app host id>
 ```
 
-### Settings Reference
+Add `at <host>` to any of these to change another machine's settings.
 
-| Setting | Default | Description |
-|---|---|---|
-| `DB_HOST` | `127.0.0.1` | ASQL / database host |
-| `DB_PORT` | `3307` | ASQL / database port |
-| `DB_USER` | `root` | Database user |
-| `DB_NAME` | `versioneight` | Database name |
-| `WAREHOUSE_COMPUTE_ON` | `""` | Optional fleet member ID to route report computation to |
+## Running it
 
-### Secrets Reference
+Deploy it to an app host (this also creates the Thing):
 
-| Secret | Description |
-|---|---|
-| `DB_PASSWORD` | Password for the database connection |
+```bash
+grain app deploy apps/warehouse_touches at <host>
+grain app status warehouse_touches at <host>
+grain app logs warehouse_touches at <host>
+```
 
----
-
-## Running and Verification
-
-To run standalone with the Grain CLI:
+On its own, for trying it out against an ASQL that already has `touch_hour`:
 
 ```bash
 grain run apps/warehouse_touches/service.gr
