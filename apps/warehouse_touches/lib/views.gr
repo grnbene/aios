@@ -592,18 +592,49 @@ fn live_node(report, state, hours) {
 }
 
 let PAGE_CSS = join([
-  ":root { --bg: #f5f6f8; --panel: #ffffff; --line: #e3e6ea; --text: #1d2228; --muted: #6b7480; --rec: #2f7de1; --pick: #e8912d; --move: #3aa776; --load: #8a63d2; --stick: #d6477f; --head: #fafbfc; }",
-  "@media (prefers-color-scheme: dark) { :root { --bg: #111418; --panel: #1a1f25; --line: #2b323a; --text: #e8ebee; --muted: #98a2ad; --head: #20262d; } }",
+  ":root, [data-theme=\"light\"] {",
+  "  --bg: #f4f6f8; --panel: #ffffff; --line: #dfe3e8; --line-strong: #c4cdd5; --text: #161c24; --text-strong: #090c0f;",
+  "  --muted: #5c6877; --rec: #1e6ac7; --pick: #c76a14; --move: #238555; --load: #6b44a8; --stick: #b3295c;",
+  "  --head: #eff2f6; --hover: #f1f4f8; --shadow-sm: 0 1px 3px rgba(0, 0, 0, .06), 0 1px 2px rgba(0, 0, 0, .04);",
+  "  color-scheme: light;",
+  "}",
+  "[data-theme=\"dark\"] {",
+  "  --bg: #111418; --panel: #1a1f25; --line: #2b323a; --line-strong: #3d4652; --text: #e8ebee; --text-strong: #ffffff;",
+  "  --muted: #98a2ad; --rec: #2f7de1; --pick: #e8912d; --move: #3aa776; --load: #8a63d2; --stick: #d6477f;",
+  "  --head: #20262d; --hover: #232a32; --shadow-sm: 0 1px 3px rgba(0, 0, 0, .35);",
+  "  color-scheme: dark;",
+  "}",
+  "@media (prefers-color-scheme: dark) {",
+  "  :root:not([data-theme=\"light\"]) {",
+  "    --bg: #111418; --panel: #1a1f25; --line: #2b323a; --line-strong: #3d4652; --text: #e8ebee; --text-strong: #ffffff;",
+  "    --muted: #98a2ad; --rec: #2f7de1; --pick: #e8912d; --move: #3aa776; --load: #8a63d2; --stick: #d6477f;",
+  "    --head: #20262d; --hover: #232a32; --shadow-sm: 0 1px 3px rgba(0, 0, 0, .35);",
+  "    color-scheme: dark;",
+  "  }",
+  "}",
   "* { box-sizing: border-box; }",
-  "body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Arial, sans-serif; }",
+  "body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Arial, sans-serif; transition: background .15s, color .15s; }",
   ".page { max-width: 1400px; margin: 0 auto; padding: 24px 16px 40px; }",
   "header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; }",
-  "h1 { margin: 0; font-size: 22px; } .range { color: var(--muted); margin-top: 4px; }",
+  "h1 { margin: 0; font-size: 22px; color: var(--text-strong); } .range { color: var(--muted); margin-top: 4px; }",
   "form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }",
-  "form label { color: var(--muted); font-size: 12px; }",
+  "form label { color: var(--muted); font-size: 12px; font-weight: 500; }",
   "input[type=date] { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }",
-  ".btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; text-decoration: none; cursor: pointer; }",
-  ".btn.primary { background: var(--rec); border-color: var(--rec); color: #ffffff; }",
+  "input[type=date]:focus { outline: none; border-color: var(--rec); box-shadow: 0 0 0 2px rgba(47, 125, 225, .25); }",
+  ".btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; text-decoration: none; cursor: pointer; transition: background .15s, border-color .15s; box-shadow: var(--shadow-sm); }",
+  ".btn:hover { background: var(--head); border-color: var(--line-strong); }",
+  ".btn.primary { background: var(--rec); border-color: var(--rec); color: #ffffff; box-shadow: 0 1px 2px rgba(0,0,0,.15); }",
+  ".btn.primary:hover { filter: brightness(1.08); }",
+  ".theme-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; padding: 6px 11px; margin-right: 4px; cursor: pointer; user-select: none; }",
+  ".theme-svg { display: none; }",
+  ":root .theme-svg.moon, [data-theme=\"light\"] .theme-svg.moon { display: inline-block; }",
+  ":root .theme-svg.sun, [data-theme=\"light\"] .theme-svg.sun { display: none; }",
+  "[data-theme=\"dark\"] .theme-svg.sun { display: inline-block; }",
+  "[data-theme=\"dark\"] .theme-svg.moon { display: none; }",
+  "@media (prefers-color-scheme: dark) {",
+  "  :root:not([data-theme=\"light\"]) .theme-svg.sun { display: inline-block; }",
+  "  :root:not([data-theme=\"light\"]) .theme-svg.moon { display: none; }",
+  "}",
   ".hours { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }",
   ".btn.hour { padding: 4px 10px; font-size: 12px; } .btn.hour.on { background: var(--rec); border-color: var(--rec); color: #ffffff; }",
   ".tl-panel { margin-bottom: 20px; }",
@@ -711,11 +742,37 @@ let EXPORT_JS = join([
   "});"
 ], chr(10))
 
+// Theme switcher: Light or Dark, kept in localStorage; until one is picked, the system's. It only sets data-theme on
+// <html>, which pushed updates never touch; the icon and the label follow it in CSS, so nothing here has to run again
+// when the page changes.
+let THEME_JS = join([
+  "(function () {",
+  "  var KEY = 'warehouse_touches_theme';",
+  "  function saved() { try { var s = localStorage.getItem(KEY); return s === 'light' || s === 'dark' ? s : null; } catch (e) { return null; } }",
+  "  function system() { return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }",
+  "  var root = document.documentElement;",
+  "  root.setAttribute('data-theme', saved() || system());",
+  "  document.addEventListener('click', function (e) {",
+  "    if (!e.target.closest || !e.target.closest('#theme-toggle')) return;",
+  "    var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';",
+  "    try { localStorage.setItem(KEY, next); } catch (err) {}",
+  "    root.setAttribute('data-theme', next);",
+  "  });",
+  "})();"
+], chr(10))
+
+fn theme_toggle_node() {
+  let sun = "<svg class=\"theme-svg sun\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"5\"/><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"/><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"/><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"/><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"/><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"/><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"/><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"/></svg>"
+  let moon = "<svg class=\"theme-svg moon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"/></svg>"
+  return el("button", {"type": "button", "class": "btn theme-toggle", "id": "theme-toggle", "title": "Switch between light and dark", "aria-label": "Switch between light and dark"},
+    html_raw(sun), html_raw(moon), el("span", {"class": "theme-svg sun"}, "Light"), el("span", {"class": "theme-svg moon"}, "Dark"))
+}
+
 // Live or paused (service.gr's view): live, the page follows the Thing; paused - hours or days picked, or a range
 // that ended before today - it keeps the figures it read until the viewer changes what is picked or presses Refresh.
 fn status_node(report, state) {
   if not state.paused {
-    return el("div", {"class": "status live"}, el("i", {"class": "pulse-dot"}), el("b", "LIVE"), "Updating as the warehouse works")
+    return el("div", {"class": "status live"}, el("i", {"class": "pulse-dot"}), el("b", "LIVE"))
   }
   return el("div", {"class": "status paused"}, el("b", "PAUSED"), "Showing figures as of " + when(report.as_of),
     el("button", {"type": "button", "class": "btn", "on_click": fn() { state.held = nil }}, "Refresh"),
@@ -741,6 +798,7 @@ fn dashboard_node(report, state) {
       el("div", el("h1", "Warehouse Activity"), el("div", {"class": "range", "id": "range"}, html_raw(render_badge(report)))),
       el("div", {"class": "clock", "aria-live": "off", "data-ui-keep": true}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
       el("form", {"onsubmit": "return false"},
+        theme_toggle_node(),
         el("label", "From"), el("input", {"type": "date", "bind": "start", "value": report.range_start ?? report.start}),
         el("label", "To"), el("input", {"type": "date", "bind": "stop", "value": report.range_stop ?? report.stop}),
         el("button", {"type": "button", "class": "btn primary", "on_click": fn(f) {
@@ -754,5 +812,5 @@ fn dashboard_node(report, state) {
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
     status_node(report, state),
     el("div", {"id": "live"}, live_node(report, state, timeline_node(report, state))),
-    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS))
+    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS))
 }
