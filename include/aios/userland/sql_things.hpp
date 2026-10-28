@@ -1,4 +1,6 @@
 #pragma once
+
+#include <atomic>
 #include "aios/userland/portable_int128.hpp"  // MSVC has no __int128
 // Things: live objects kept inside the SQL engine.
 //
@@ -151,6 +153,14 @@ class ThingEngine {
   // transaction, would do to each Thing - nothing is changed. Called by SqlDatabase::execute_what_if, which rolls
   // the transaction back afterwards.
   struct Notice { const SqlTable* table; const SqlRow* before; const SqlRow* after; };
+  // INTO: the statements that bring every INTO table up to its Thing (and drop the tables of Things dropped), as
+  // {database, statement}, oldest first - run by SqlDatabase with this engine's lock let go. into_pending: any due.
+  std::vector<std::pair<std::string, std::string>> into_statements();
+  bool into_pending() const;
+  // The Thing that keeps <db>.<table> (INTO), or "" - a client may not write it. Its own lock, not mu_.
+  std::string kept_by(const std::string& db, const std::string& table) const;
+  // Whether any table is kept at all: the one check every statement pays.
+  bool keeps_any() const { return kept_count_.load(std::memory_order_relaxed) != 0; }
   SqlQueryResult what_if(const std::vector<Notice>& notices, const std::vector<const SqlTable*>& resets);
 
   // Run the reactions pending notices call for. The caller holds the
@@ -267,6 +277,11 @@ class ThingEngine {
     uint64_t asof_bytes = 0;                    // the log's size, as appended (not saved: read from the file at load)
     uint64_t asof_trim_at = 0;                  // the size the next size cut waits for (when a base alone is large)
     std::vector<std::string> asof_gone;         // row keys that left in the change being finished
+    // INTO <db>.<table> (docs/design/thing-into.md): a table the engine keeps equal to the Thing, one row per key.
+    // Written after a settle, with this engine's lock let go (SqlDatabase::things_settle, into_statements).
+    std::string into_db, into_table;
+    std::set<std::string> into_dirty;           // keys whose row is to be written (or deleted)
+    bool into_resync = false;                   // the whole table to be made equal (at CREATE, and at load)
     std::vector<std::string> out_labels;        // the head's output names when an item is a `*` (from the first run)
     std::string source_by;                      // SOURCE BY: the value column naming the system a row came from
     // RESOLVE THING .. PREFER: field label (or "*") -> the sources in the order preferred
@@ -561,6 +576,13 @@ class ThingEngine {
 
   SqlDatabase& db_;
   mutable aios::hal::Mutex mu_;
+  // INTO: "db.table" (lower case) -> the Thing keeping it, under its own lock (a client write asks it, and may be
+  // running with mu_ held by this engine's own queries); and the tables of Things dropped, to be dropped.
+  mutable aios::hal::Mutex kept_mu_;
+  std::map<std::string, std::string> kept_;
+  std::atomic<size_t> kept_count_{0};
+  std::vector<std::pair<std::string, std::string>> into_drops_;   // {db, table}
+  void keep_table(const std::string& db, const std::string& table, const std::string& by);
   // WAIT THING: waiters sleep on wait_cv_ until wait_epoch_ moves; wake_waiters() moves it whenever the engine has
   // committed changes (the end of a settle, a statement, a replacement taking its name).
   std::mutex wait_mu_;

@@ -991,6 +991,8 @@ struct SessionTxn {
   std::set<std::string> held_reset;   // tables to re-read whole at COMMIT (reset in the transaction, or too many rows)
 };
 thread_local SessionTxn tls_txn;
+// Set while the engine writes a Thing's INTO table: those writes are the one kind a kept table takes.
+thread_local bool g_thing_into_writing = false;
 // Write-behind statements of this session's open transaction, held until its
 // COMMIT reaches the WAL (a ROLLBACK drops them): {database, statement}.
 thread_local std::vector<std::pair<std::string, std::string>> tls_wb_txn;
@@ -23854,7 +23856,10 @@ void SqlDatabase::things_settle() {
   const bool things_due = things_ && things_->has_pending();
   const bool cells_due = cells_ && cells_->has_pending();
   const bool active_due = active_data_ && active_data_->has_pending();
-  if (!things_due && !cells_due && !active_due) return;
+  // INTO tables are written only where no transaction is open: written inside a client's, its ROLLBACK would take
+  // the Thing's rows back with it. They wait for the next settle without one (the tick's, if no other).
+  const bool into_due = things_ && !tls_txn.open && things_->into_pending();
+  if (!things_due && !cells_due && !active_due && !into_due) return;
   // Statement lock first, then the engine's own: the order every write path
   // takes them in (a write holds the lock when it delivers its notice).
   StatementLock lock(rw_lock_, true);
@@ -23862,7 +23867,69 @@ void SqlDatabase::things_settle() {
   if (things_due) things_->settle();
   if (cells_due) cells_->settle();
   if (active_due) active_data_->settle();
+  // INTO (docs/design/thing-into.md): each kept table brought up to its Thing, with the Things' lock let go (the
+  // writes notify the Things, which take it). The Things those writes reach - a Thing built on another's table -
+  // settle in a further pass; passes repeat while there is anything to write, at most 8 (CREATE refuses a cycle).
+  if (things_ && !tls_txn.open) {
+    for (int pass = 0; pass < 8; ++pass) {
+      const auto writes = things_->into_statements();
+      if (writes.empty()) break;
+      {
+        struct Mark { bool prev; Mark() : prev(g_thing_into_writing) { g_thing_into_writing = true; } ~Mark() { g_thing_into_writing = prev; } } mark;
+        for (const auto& w : writes) {
+          SqlQueryResult r = execute_query(w.second, w.first);
+          if (!r.success) fprintf(stderr, "[things] INTO: %s: %s\n", w.second.substr(0, 120).c_str(), r.error_message.c_str());
+        }
+      }
+      if (things_->has_pending()) things_->settle();
+    }
+  }
   g_in_settle = false;
+}
+
+// A client statement whose target is a table a Thing keeps (INTO): refused, naming the Thing. Read from the
+// statement's first words: INSERT / REPLACE [INTO], UPDATE, DELETE FROM, TRUNCATE [TABLE], DROP / ALTER TABLE,
+// RENAME TABLE, LOAD DATA .. INTO TABLE. "" when it may go ahead.
+std::string SqlDatabase::kept_table_refusal(const std::string& sql, const std::string& session_db) {
+  if (!things_ || g_thing_into_writing || !things_->keeps_any()) return "";
+  std::vector<std::string> w;   // the first words, upper case, with the name after them kept as written
+  std::vector<std::string> raw;
+  {
+    size_t i = 0;
+    while (i < sql.size() && w.size() < 12) {
+      while (i < sql.size() && std::isspace((unsigned char)sql[i])) ++i;
+      if (i >= sql.size()) break;
+      size_t j = i;
+      if (sql[i] == '`') { j = sql.find('`', i + 1); j = j == std::string::npos ? sql.size() : j + 1; while (j < sql.size() && sql[j] == '.') { ++j; if (j < sql.size() && sql[j] == '`') { j = sql.find('`', j + 1); j = j == std::string::npos ? sql.size() : j + 1; } else while (j < sql.size() && (std::isalnum((unsigned char)sql[j]) || sql[j] == '_')) ++j; } }
+      else while (j < sql.size() && !std::isspace((unsigned char)sql[j]) && sql[j] != '(' && sql[j] != ',' && sql[j] != ';') ++j;
+      if (j == i) break;
+      raw.push_back(sql.substr(i, j - i));
+      w.push_back(upper_of(raw.back()));
+      i = j;
+    }
+  }
+  if (w.empty()) return "";
+  static const std::set<std::string> skip = {"LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "QUICK", "INTO", "FROM", "TABLE", "IF", "EXISTS", "ONLINE", "OFFLINE", "TEMPORARY"};
+  size_t at = 1;
+  const std::string& v = w[0];
+  if (v == "LOAD") {   // LOAD DATA [..] INFILE 'x' [..] INTO TABLE t
+    at = w.size();
+    for (size_t i = 0; i + 2 < w.size(); ++i) if (w[i] == "INTO" && w[i + 1] == "TABLE") { at = i + 2; break; }
+  } else if (v == "DROP" || v == "ALTER" || v == "RENAME" || v == "TRUNCATE") {
+    if (v != "TRUNCATE" && (w.size() < 2 || (w[1] != "TABLE" && w[1] != "ONLINE" && w[1] != "OFFLINE" && w[1] != "IGNORE"))) return "";
+  } else if (v != "INSERT" && v != "REPLACE" && v != "UPDATE" && v != "DELETE") {
+    return "";
+  }
+  while (at < w.size() && skip.count(w[at])) ++at;
+  if (at >= w.size()) return "";
+  std::string name = raw[at];
+  std::string db = session_db, table = name;
+  const size_t dot = name.find('.');
+  if (dot != std::string::npos) { db = name.substr(0, dot); table = name.substr(dot + 1); }
+  auto unq = [](std::string s) { if (s.size() >= 2 && s.front() == '`' && s.back() == '`') s = s.substr(1, s.size() - 2); return s; };
+  const std::string by = things_->kept_by(unq(db), unq(table));
+  if (by.empty()) return "";
+  return "table " + unq(db) + "." + unq(table) + " is kept by Thing " + by + " (INTO): the Thing writes it, a client reads it";
 }
 
 // Tables nothing has written for a while: the scan is a read, the folding and re-encoding a write.
@@ -25979,6 +26046,9 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
     const bool plain = first == "SELECT"sv || first == "INSERT"sv || first == "UPDATE"sv || first == "DELETE"sv ||
                        first == "REPLACE"sv || first == "BEGIN"sv || first == "COMMIT"sv || first == "ROLLBACK"sv ||
                        first == "WITH"sv;
+    // a table a Thing keeps (INTO) is the Thing's to write
+    if (things_ && things_->keeps_any() && first != "SELECT"sv && first != "WITH"sv)
+      if (const std::string why = kept_table_refusal(q, session_db.empty() ? effective_database() : session_db); !why.empty()) return make_error(why);
     if (active_data_) {
       SqlQueryResult ac_res;
       if (active_data_->try_eval_cache(q, &ac_res)) return ac_res;
@@ -26124,7 +26194,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
       const auto t0 = std::chrono::steady_clock::now();
       SqlQueryResult res = execute_transaction(std::string(verb));
       if (g_things_defer == 0 && !g_cdc_thread &&
-          ((things_ && things_->has_pending()) || (cells_ && cells_->has_pending()) ||
+          ((things_ && (things_->has_pending() || things_->into_pending())) || (cells_ && cells_->has_pending()) ||
            (active_data_ && active_data_->has_pending()))) things_settle();
       const auto elapsed_us =
           (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -26837,7 +26907,7 @@ SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, co
   // inside the gateway's own statement lock). The binlog consumer reacts at
   // commit, and a caller that deferred reactions settles them itself.
   if (!reads && g_things_defer == 0 && !g_cdc_thread &&
-      ((things_ && things_->has_pending()) || (cells_ && cells_->has_pending()) ||
+      ((things_ && (things_->has_pending() || things_->into_pending())) || (cells_ && cells_->has_pending()) ||
        (active_data_ && active_data_->has_pending()))) {
     // Under the shared lock (a table-scoped write) the Things run once the
     // statement's locks are gone, under the exclusive lock of their own.
@@ -26877,6 +26947,8 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
     if (things_ && things_->handles(q)) return things_->execute(q);
     // WHAT IF <statements>: what they would do to the Things, the statements rolled back
     if (starts_what_if(q)) return execute_what_if(q, session_db);
+    // a table a Thing keeps (INTO) is the Thing's to write
+    if (const std::string why = kept_table_refusal(q, session_db); !why.empty()) return make_error(why);
     // CREATE / DROP / SHOW CELLS: per-key bits and counts (sql_cells.hpp).
     if (cells_ && cells_->handles(q)) return cells_->execute(q);
     // CALL SAT: the solver, its answer verified before it is returned
@@ -43644,7 +43716,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                 const ColumnStore& jcs = js.table->col_data[jcol];
                 if (vx::dict_coded(bcs) && vx::dict_coded(jcs)) {
                   StarKey pk, ck;
-                  if (star_key_of(bt, dc_base_col, &pk) && star_key_of(*js.table, jcol, &ck)) {
+                  // Both keys compared alike (text with text, numbers with numbers), as star_join requires: an INT
+                  // column's codes mapped to a text column's met nothing, though MariaDB joins 100 to '100' by value
+                  // (the probe below does).
+                  if (star_key_of(bt, dc_base_col, &pk) && star_key_of(*js.table, jcol, &ck) && pk.text == ck.text) {
                     dc_code_map = star_code_map(pk, ck);
                     if (dc_code_map && dc_code_map->ok) {
                       direct_code_join = true;

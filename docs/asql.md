@@ -730,6 +730,8 @@ CREATE THING <name> KEY <column>
   [WHEN <condition> DO <statement>[; ...] TO <profile> [SHADOW]]
 ```
 
+`INTO <database>.<table>`, anywhere between `KEY` and `AS`, keeps a table equal to the Thing (see "`INTO`" below).
+
 - The first select column must be the `KEY`, and `GROUP BY` must start with it.
 - `HAVING`, `ORDER BY`, `LIMIT`, `UNION` and `WITH ROLLUP` are refused:
   `a Thing's query cannot use HAVING: partitions could not add up to it`.
@@ -849,6 +851,24 @@ plain `SUM(x)`, `COUNT(*)`, `COUNT(x)`, `MIN(x)`, `MAX(x)` or `AVG(x)` (optional
 `thing.<label>` shows that row's share, so a `SUM`'s shares add up to the value. A value made some other way (`CASE`,
 `DISTINCT`, two aggregates combined) gets no share column; its rows are still listed. `NULL` (unquoted) is the NULL
 key. At most 1,000 rows unless `LIMIT n` says otherwise. Grain Things are not made by a query and are refused.
+
+### `INTO`: a Thing as a table, and Things built on Things
+
+`CREATE THING orders KEY orderno PARTITION BY orderno READS lines INTO shop.orders_t AS SELECT ...` keeps the table
+`shop.orders_t` equal to the Thing: one row per key, the key column (`VARCHAR(255)`, the primary key) and one `TEXT`
+column per value, named by the Thing's labels. It is there when `CREATE` returns. Because it is a real table:
+
+- another Thing can read it - `CREATE THING by_wh ... READS orders_t AS SELECT wh, SUM(CAST(qty AS SIGNED)) ...
+  FROM orders_t GROUP BY wh` is a Thing built on `orders`, with the order logic written once;
+- SQL and reports can read and join it, which `SHOW THING` cannot (`JOIN orders_t o ON o.orderno = l.orderno`).
+
+A change to the source reaches the table and every Thing built on it before the statement returns. The table is
+the Thing's: a client's `INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER` or `DROP` of it is refused,
+naming the Thing. `DROP THING` drops the table too. The table must not exist before `CREATE`, and a Thing whose
+reads lead back to its own table through other Things' tables is refused, naming the chain. Like the Thing itself
+it follows only committed changes. After a restart each table is compared with its Thing and made equal, so a crash
+between the two leaves nothing behind. A NULL key has no row (a primary key cannot be NULL). Values are text, as
+`SHOW THING` gives them: cast to compare as numbers. Design: [design/thing-into.md](design/thing-into.md).
 
 ### `WHAT IF`: a write's effect on the Things, before it is made
 
