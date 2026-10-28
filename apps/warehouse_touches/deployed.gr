@@ -2,7 +2,7 @@
 // the old version and swapped in when its first pass is done), and drops touch_day, the per-day Thing it replaces. A
 // copy whose reports run on another member (WAREHOUSE_COMPUTE_ON) leaves the Thing to that member.
 
-let READS = "recscan, pickingfreeze, stockmaster, product_types, binmovements_details, www_users, loadingbays, dispatch, stickerscanout, " +
+let READS = "recscan, stockmoves, pickingfreeze, stockmaster, product_types, binmovements_details, www_users, loadingbays, dispatch, stickerscanout, " +
             "salesorderdetails, trackinginfo, salesorders, debtortrans"
 
 fn deployed(app) {
