@@ -1,67 +1,42 @@
-# AIOS: the All-In-One System
+# AIOS: All-In-One System
 
-A complete computing stack in one C++20 tree: kernel, storage, network and
-crypto, database, web server, display and window system, languages and tools.
-It runs from its own hardware layers on bare-metal x86-64 and the Raspberry Pi 3,
-and as a hosted program on Linux and macOS, all built from the same kernel
-sources.
+AIOS is a unified C++20 systems architecture and runtime designed for high-performance state, reactive data, and sandboxed application execution. Built with zero external runtime dependencies, it runs hosted on Linux and macOS or directly on bare-metal hardware (x86-64 and ARM64 / Raspberry Pi 3) from the same kernel codebase.
 
-A language model can be bound to one slot (the Intelligence ABI); `ask` and
-`dream` use it. Everything else runs without one. The model can run in-tree:
-`infer` loads a Qwen2 checkpoint with an optional LoRA adapter and serves it as
-an OpenAI-compatible chat endpoint (`infer serve`), or a mind is bound to it
-directly (`mind bind <e> local`).
+---
 
-Built in-tree:
+## Core Architecture
 
-- **ASQL**: an in-memory relational engine that speaks the MySQL wire protocol,
-  replicates a live MariaDB over its binlog, and keeps live objects (Things,
-  Cells) up to date from the rows. Includes concurrent transaction execution
-  (`AIOS_TXN_CONCURRENT=1`), a 16-way sharded query cache, columnar dictionary
-  and delta bit-packing, zero-copy wire streaming with zlib/zstd protocol
-  compression, and real-time performance inspection (`asql-top`, `asql-console`).
-  It is what runs against real ERP databases today.
-- **TLS** (client and server; TLS 1.3 and 1.2, AES-GCM, ChaCha20-Poly1305,
-  X25519, P-256, RSA, X.509), **SSH** (client and server with ssh-agent and
-  key-based auth), HTTP/HTTPS, FastCGI, and a **TCP/IP stack** of its own for bare metal.
-- A **web server** (`aios-webserver`): HTTP/HTTPS for static files and PHP over
-  FastCGI.
-- **aios-git**: Git-compatible VCS with a working-copy commit layer (`@`),
-  evolutionary log (`git change evolog`), stacked changes, AST-aware structural
-  diffs and merges (13 grammars), and an in-tree fsmonitor daemon.
-- **aios-sh**: Native Bourne/POSIX shell with streaming built-ins (awk, sed, grep, hash).
-- Mail, contacts and calendar, an editor with LSP, and clients for the
-  npm, PyPI, Cargo (crates.io), and Go module registries.
-- A **SAT solver** that proves both answers: a model for SAT, a proof for UNSAT,
-  each checked, and splittable across a fleet.
-- **grain**, the machine's own scripting language, with an AArch64 JIT.
-- A **compute fabric**: graphs placed across CPU lanes and OpenCL, Vulkan, CUDA
-  or Metal devices, on this machine or another one, with budgets, mid-graph
-  checkpoints, and model training (`lm`) that runs on the same graphs.
-- **Language-model inference** (`infer`): Qwen2 checkpoints from safetensors,
-  LoRA adapters, the model's own BPE tokenizer and chat template, AVX2+FMA
-  kernels, and an OpenAI-compatible endpoint. Its logits agree with Hugging
-  Face transformers to four decimals.
-- **Fleets**: machines join a hub (or link directly) over encrypted links that
-  share one fleet key, then use each other's devices and memory; a compute graph
-  or a training run is pinned to another member with `dev=remote:…`; a running
-  entity moves to another machine and carries on; an orchestrator moves work off
-  an overloaded member and restores replicated work on a standby when its source
-  dies; SQL reaches other members (`sql_on()`, `SHOW … ON ALL`, mirrored Things);
-  SAT problems split across members with their proofs checked elsewhere.
-- **Resources as objects**: memory that migrates between RAM, shared, persistent,
-  device and remote memory keeping its identity; an object store with similarity,
-  relation and history queries; capability-scoped quotas; and sidecars (a
-  shared-memory fabric, an event fabric, telemetry, a module vault) other
-  programs can use through a C ABI.
-- **Chain and feeds**: Bitcoin and Ethereum clients on its own secp256k1 and
-  Keccak, feed and sensing services, and voice.
-- A **window system and desktop** that runs on a host or straight onto a
-  bare-metal framebuffer, a web engine for its browse pane, and the face
-  language for small applications.
-- **Installers** for every way onto a machine: a bootable ISO, a dual-boot
-  install beside Linux, a deployable disk image, SD card or network boot for the
-  Pi, and a packaged ASQL server.
+### 1. High-Performance Relational State (ASQL & Things)
+* **In-Memory Relational Engine**: Speaks the MySQL wire protocol with concurrent transaction execution (`AIOS_TXN_CONCURRENT=1`), a 16-way sharded query cache, columnar dictionary and delta bit-packing, and zero-copy wire streaming with zlib/zstd protocol compression.
+* **Real-Time CDC Replication**: Ingests live MariaDB/MySQL binary replication streams (binlog) into memory with sub-millisecond propagation.
+* **Reactive Materialized Views (Things)**: Incremental view maintenance (IVM) engine that updates derived state, triggers reactive side effects (`WHEN ... DO ... SHADOW`), and supports historical queries (`AS OF`), predictive previews (`WHAT IF`), and chained materialized pipelines (`INTO`).
+* **Operational Tooling**: Live performance inspection via `asql-top` and `asql-console`.
+
+### 2. Application Runtime & Scripting (Grain)
+* **Sandboxed Scripting Language**: Built-in language designed for high-throughput operational scripts, web APIs, and application logic.
+* **JIT Compilation**: Native code generation (including AArch64 JIT) for tight compute loops.
+* **App Lifecycle Management**: Integrated manifest-based packaging, hot deployment, route handling, workers, and atomic rollbacks.
+* **Extensive Builtin Library**: 540+ builtins spanning I/O, networking, data structures, and UI layout.
+
+### 3. Capability Kernel & Security Model
+* **Pure Capability Security**: No ambient root privileges. All operations are mediated by 128-bit entity identities and attenuable, revocable capability tokens.
+* **State & Memory Migration**: Objects and memory regions migrate transparently across RAM, shared memory, persistent NVRAM, accelerator devices, or remote nodes while preserving identity.
+* **Process & Entity Checkpoints**: Full checkpoint and restore of running entities across process restarts or machine migrations.
+
+---
+
+## Integrated Subsystems & Tooling
+
+* **Networking & Cryptography**: Native TLS 1.3/1.2 client and server, SSH client/server with agent forwarding, HTTP/HTTPS web server (`aios-webserver`), FastCGI, and an independent bare-metal TCP/IP stack. Cryptographic primitives implemented in-tree: AES-GCM, ChaCha20-Poly1305, X25519, P-256, RSA, SHA-2/3, Keccak, and secp256k1.
+* **Developer Environment**:
+  * `aios-git`: Git-compatible version control featuring working-copy commits (`@`), stacked change management, evolutionary logs (`git change evolog`), and AST-aware structural diffing/merging across 13 language grammars.
+  * `aios-sh`: Native POSIX/Bourne shell implementation with streaming built-ins (awk, sed, grep).
+* **Distributed Compute & Fleet Fabric**:
+  * Fleet clustering over authenticated, encrypted links with automatic node discovery, remote memory access, and cross-machine SQL (`sql_on()`).
+  * Heterogeneous compute graph scheduler targeting multi-lane CPU, OpenCL, Vulkan, CUDA, and Metal devices.
+  * In-tree SAT solver verifying both satisfiable models and unsat certificates, splittable across fleet nodes.
+* **Intelligence ABI Slot**: Optional extension interface for language model inference (`infer`), supporting local GGUF/safetensors checkpoints (such as Qwen2) with LoRA adapters, AVX2+FMA acceleration, and an OpenAI-compatible HTTP endpoint.
+* **Bare Metal & Boot**: Self-contained OS layers with bootable ISOs, UEFI/BIOS bootloaders, virtio drivers, and SD/network boot support for embedded boards (Raspberry Pi 3).
 
 ## Get started
 

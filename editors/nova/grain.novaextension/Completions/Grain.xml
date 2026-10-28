@@ -160,27 +160,1307 @@
 
 	<!-- Standard Built-in Functions -->
 	<set name="grain.builtins" symbol="function">
-		<completion string="print">
+		<completion string="__grain_defer">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="len">
+		<completion string="__grain_run_deferred">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="type">
+		<completion string="__route_invoke">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="repr">
+		<completion string="abs">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="str">
+		<completion string="abspath">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="accept">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="acos">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="add_into">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="add_keys">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="aes_cbc_decrypt">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="after">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="all">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="any">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="app_program">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="append_file">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="asin">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="asql_exec">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="asql_query">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="assert">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="assert_eq">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="assert_false">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="assert_ne">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="assert_true">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="atan">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="atan2">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="await">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="base64_decode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="base64_encode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="basename">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bcrypt_hash">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bcrypt_verify">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_concat">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_copy">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_fill">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_find">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_from_hex">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_hex">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_set">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="bytes_str">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cancel">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_arc">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_begin_path">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_bezier_curve_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_blit">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_blur">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_clear">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_clear_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_close_path">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_create">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_create_linear_gradient">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_create_radial_gradient">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_glass">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_glow">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_image">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_line">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_shadow">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_draw_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_circle">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_ellipse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_gradient_h">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_gradient_v">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_linear_gradient">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_polygon">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_round_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_fill_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_get_height">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_get_pixel">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_get_pixels">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_get_width">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_gradient_add_color_stop">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_height">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_line">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_line_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_measure_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_move_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_new">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_present">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_quadratic_curve_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_register_pane">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_restore">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_rotate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_save">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_save_ppm">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_scale">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_fill_color">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_fill_style">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_font">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_global_alpha">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_line_width">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_pixel">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_pixels">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_stroke_color">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_set_stroke_style">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_circle">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_ellipse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_polygon">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_round_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_stroke_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_to_bytes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_to_ppm">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_translate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="canvas_width">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ceil">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="char_at">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="chars">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="chr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="claims">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="clamp">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="clock">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_blend">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_contrast">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_darken">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_hex">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_hsl">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_hsla">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_invert">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_lighten">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_luminance">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_parse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_rgb">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_rgba">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_to_hex">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="color_to_hsl">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="compact">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="concat">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="contains">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cos">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="count">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="create_pane">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="csv_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="csv_parse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_begin_path">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_close_path">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_create">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_draw_line">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_draw_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_fill">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_fill_circle">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_fill_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_line_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_move_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_stroke">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_stroke_circle">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_stroke_rect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cv_to_ppm">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="cwd">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="data_to_csv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="data_to_json">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="data_to_sql_insert">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="date_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="date_make">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="date_parse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="date_parts">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="date_range">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="day_add">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_build_update">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_columns">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_connect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_connected">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_escape">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_ping">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_query">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_quote">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_schema">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_select_db">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_tables">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="db_transaction">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="debugger">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="dec_div">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="decimal">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="decimal_prefix">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="dedup">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="deg">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="del">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="delete_file">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="dirname">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_autocomplete_popup">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_badge">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_bar_chart">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_button">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_card">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_conflict">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_connection_dialog">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_data_grid">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_donut_chart">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_icon">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_menu_bar">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_metric_tile">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_nav_tree">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_progress_bar">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_query_plan">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_sparkline">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_sql_editor">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_status_bar">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_tab_bar">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_table_designer">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_toolbar">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="draw_window_frame">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="drop">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="e">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="each">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ease_in">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ease_in_out">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ease_out">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="el">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ends_with">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="entries">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="enumerate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="env">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="eprint">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="error">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="events">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="events_close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="every">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="exp">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="extname">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="file_exists">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="filter">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="find">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="find_if">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="first_present">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="flatten">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="floor">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="for_each">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="from_entries">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="gc">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="get_in">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="get_or_put">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="getenv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="gradient_add_stop">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="group_by">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="gunzip">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="gzip">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="has">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="hash_equals">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="haversine">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="hex_decode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="hex_encode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="hmac_sha256">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="html_escape">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="html_raw">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="html_stringify">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="http_get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="http_parse_multipart">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="http_post">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="http_request">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="hypot">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="idiv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="image_decode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="index_of">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="insert">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
@@ -190,12 +1470,92 @@
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="real">
+		<completion string="is_alnum">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="bool">
+		<completion string="is_alpha">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_blank">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_digit">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_dir">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_err">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_numeric">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_ok">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_space">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="is_stopping">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="iso8601">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="join">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="json_parse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="json_stringify">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="jwt_sign">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="jwt_verify">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="keccak256">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="key_by">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
@@ -205,12 +1565,362 @@
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="values">
+		<completion string="kv_del">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="push">
+		<completion string="kv_expire">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_incr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_keys">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_mget">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_set">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="kv_ttl">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="last_index_of">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="len">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="lerp">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="list_dir">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="list_panes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="listen">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="live">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log10">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log2">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_debug">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_error">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_get_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_get_level">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_info">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_set_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_set_level">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="log_warn">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="lower">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ltrim">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="mail_send">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="map">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="max">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="md5">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="merge">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="min">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="mkdir">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="net_connect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="now">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="number_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="on_machine">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="ord">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pack">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pack_size">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pad_left">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pad_right">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="palette_analogous">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="palette_monochromatic">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="palette_triadic">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_dispatch_event">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_draw">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_emit_event">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_get_canvas">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_list">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_on_event">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_register">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_render">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_resize">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_set_bounds">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_trigger_event">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pane_unregister">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="panic">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="parallel_map">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="params">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="path_basename">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="path_dirname">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="path_ext">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="path_join">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="path_normalize">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pcall">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pdf_render">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="peer">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pi">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
@@ -220,12 +1930,762 @@
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
-		<completion string="sort">
+		<completion string="port">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="pow">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="print">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="process_run">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="push">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rad">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rand">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="random">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="random_bytes">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
 		</completion>
 		<completion string="range">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_bytes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_file">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_raw">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_raw_with">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_target">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_until">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="read_with">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="real">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="reduce">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="regex_find_all">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="regex_match">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="regex_replace">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="regex_split">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="regex_test">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="register_pane">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="register_window">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="remove_at">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="repeat">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="replace">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="repr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_download">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_error">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_html">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_json">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_redirect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_sse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="res_text">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="reverse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rgb">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rgba">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rmdir">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="round">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="round_sig">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="rtrim">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="run_panes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sat">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="scale">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="secret">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="seed">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="serve_routes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="setenv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sha1">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sha256">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sha384">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sha512">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="should_stop">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_btc_addr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_cap_attenuate">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_cap_mint">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_eth_addr">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_haversine">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_keccak256">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_parse_eml">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_parse_feed">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_parse_ical">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_parse_vcard">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_patch_check">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_pdf_len">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_pdf_render">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_sha256">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_svg_png_len">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sidecar_tsp">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sign">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sin">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sleep">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="slice">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="smoothstep">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sort">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sort_by">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="spawn">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="split">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="spring">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql_format">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql_generate_ddl">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql_on">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql_suggest">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sql_tokenize">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sqrt">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="starts_with">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="str">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sum_by">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sys">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="sys_exec">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="take">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="tan">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="task_done">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="tcp_close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="tcp_connect">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="tcp_recv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="tcp_send">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="thing_conflicts">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="thing_rows">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="time">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="time_ms">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="time_us">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="to_number">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="trim">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="trunc">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="try_call">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="type">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_bind">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_port">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_recv">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_recv_from">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_send">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_send_to">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="udp_socket">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="unique">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="unpack">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="unregister_pane">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="unzip">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="upper">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="upper_rtrim">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="url_decode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="url_encode">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="utf8_valid">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="uuid">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="uuid_v4">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="values">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="wait">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_close">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_dispatch_event">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_get">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_get_canvas">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_list">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_register">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_render">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_set_bounds">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="window_unregister">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="write">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="write_bytes">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="write_file">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="xlsx_create">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="xml_escape">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="xml_parse">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="xml_stringify">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="xml_unescape">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="zip">
+			<behavior>
+				<arguments prefix="(" suffix=")" separator=", " />
+			</behavior>
+		</completion>
+		<completion string="zip_create">
 			<behavior>
 				<arguments prefix="(" suffix=")" separator=", " />
 			</behavior>
