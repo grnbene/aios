@@ -261,7 +261,8 @@ fn merge_rows(db, rows, start_date, stop_date) {
       for key in keys(dayrow.users) {
         let d = dayrow.users[key]
         if part == "rec" {
-          if d.rec.scans > 0 {
+          // a receipt can be someone's who scanned nothing that hour (touch_hour: receive_hour)
+          if d.rec.scans > 0 or real(d.rec.qty_in) != 0.0 or real(d.rec.qty_out) != 0.0 {
             let u = get_user(key, d.userid)
             u.receiving.scans = u.receiving.scans + d.rec.scans
             u.receiving.qty_in = u.receiving.qty_in + real(d.rec.qty_in)

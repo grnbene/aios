@@ -38,11 +38,48 @@ fn invoice_hour(trandate, inputdate) {
 fn num(v) { return v == nil ? 0.0 : real(v) }
 fn ival(v) { return v == nil or str(v) == "" ? 0 : int(v) }
 
+// The receiving scans of days lo..hi (YYYY-MM-DD), for receive_hour: user|day|stockid|side and user|day -> the
+// first hour scanned, and day|stockid|side -> the first hour anyone scanned it. side: "in", or "out" (in_out 1).
+fn receive_scans(lo, hi) {
+  let m = {}
+  let first = fn(k, h) { if m[k] == nil or h < m[k] { m[k] = h } }
+  for r in read_raw("SELECT userid, stockid, COALESCE(in_out, 0) AS io, MIN(date_rec) AS t FROM recscan " +
+                    "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' " +
+                    "GROUP BY userid, stockid, COALESCE(in_out, 0), DATE(date_rec)", lo + " 00:00:00", hi + " 23:59:59") {
+    let h = hour_of(r.t)
+    if h != nil {
+      let day = slice(h, 0, 10)
+      let side = str(r.io) == "1" ? "out" : "in"
+      first(lower(str(r.userid)) + "|" + day + "|" + str(r.stockid) + "|" + side, h)
+      first(lower(str(r.userid)) + "|" + day, h)
+      first(day + "|" + str(r.stockid) + "|" + side, h)
+    }
+  }
+  return m
+}
+// The hour a stock move counts in: its receiver's scan of the item that day, else their first receiving scan that
+// day, else anyone's scan of the item that day, else the day's 00 hour.
+fn receive_hour(scans, userid, day, stockid, out) {
+  let side = out ? "out" : "in"
+  let u = lower(str(userid))
+  return scans[u + "|" + day + "|" + str(stockid) + "|" + side] ?? scans[u + "|" + day] ?? scans[day + "|" + str(stockid) + "|" + side] ?? day + " 00"
+}
+
+// The hours a day's receiving can fall in: every hour with a receiving scan that day, and its 00 hour.
+fn receive_day_hours(day) {
+  if is_blank(day) or len(day) < 10 { return [] }
+  let hs = [day + " 00"]
+  for r in read_raw("SELECT DISTINCT DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS h FROM recscan WHERE date_rec >= ? AND date_rec <= ?",
+                    day + " 00:00:00", day + " 23:59:59") { push(hs, str(r.h)) }
+  return hs
+}
+
 // Every hour any of the tables has a touch in.
 fn enroll() {
   let hours = {}
   for sql in [
     "SELECT DISTINCT DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS d FROM recscan WHERE date_rec IS NOT NULL",
+    "SELECT DISTINCT CONCAT(trandate, ' 00') AS d FROM stockmoves WHERE type IN (25, 85) AND trandate IS NOT NULL",
     "SELECT DISTINCT DATE_FORMAT(date_pickupdate, '%Y-%m-%d %H') AS d FROM pickingfreeze WHERE date_pickupdate IS NOT NULL",
     "SELECT DISTINCT DATE_FORMAT(date_created, '%Y-%m-%d %H') AS d FROM binmovements_details WHERE date_created IS NOT NULL",
     "SELECT DISTINCT DATE_FORMAT(packedtime, '%Y-%m-%d %H') AS d FROM stickerscanout WHERE packedtime IS NOT NULL",
@@ -109,10 +146,12 @@ fn things(ks, sh) {
     if not is_blank(t) { u.lasts[src] = max(u.lasts[src], str(t)) }
   }
 
-  // 1. Receiving
+  // 1. Receiving. Who scanned what, and when, is recscan's; how many is not: the receiving screen adds each new
+  // quantity to every row of the item, vendor and bin, closed ones too, so an old row holds the item's running total
+  // (GYR-183934470: received 2 to 10 at a time, 17 rows of 2025 each saying 148). The quantities are the stock moves
+  // instead - received (type 25, Purchase Order Delivery) and returned to the vendor (type 85, Vendor RGA) - each
+  // placed by receive_hour (below) in the hour its receiver scanned it.
   for r in read_raw("SELECT userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS day, COUNT(*) AS scans, " +
-                    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN qty ELSE 0 END) AS qty_in, " +
-                    "SUM(CASE WHEN COALESCE(in_out, 0) = 0 THEN 0 ELSE qty END) AS qty_out, " +
                     "MIN(date_rec) AS first_touch, MAX(date_rec) AS last_touch FROM recscan " +
                     "WHERE date_rec >= ? AND date_rec <= ? AND userid IS NOT NULL AND userid <> '' " +
                     "GROUP BY userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H')", a, b) {
@@ -120,10 +159,21 @@ fn things(ks, sh) {
     if u != nil {
       u.active = true
       u.rec.scans = u.rec.scans + int(r.scans)
-      u.rec.qty_in = u.rec.qty_in + num(r.qty_in)
-      u.rec.qty_out = u.rec.qty_out + num(r.qty_out)
       stamp(u, r.first_touch, r.last_touch)
       late(u, "receiving", r.last_touch)
+    }
+  }
+  let d_lo = slice(a, 0, 10)
+  let d_hi = slice(b, 0, 10)
+  let scans_of = receive_scans(d_lo, d_hi)
+  for r in read_raw("SELECT userid, trandate, stockid, type, SUM(qty) AS qty FROM stockmoves " +
+                    "WHERE type IN (25, 85) AND trandate >= ? AND trandate <= ? AND userid IS NOT NULL AND userid <> '' " +
+                    "GROUP BY userid, trandate, stockid, type", d_lo, d_hi) {
+    let out = str(r.type) == "85"
+    let u = user(receive_hour(scans_of, r.userid, slice(str(r.trandate), 0, 10), r.stockid, out), r.userid)
+    if u != nil {
+      u.active = true
+      if out { u.rec.qty_out = u.rec.qty_out - num(r.qty) } else { u.rec.qty_in = u.rec.qty_in + num(r.qty) }
     }
   }
   for r in read_raw("SELECT DISTINCT userid, DATE_FORMAT(date_rec, '%Y-%m-%d %H') AS day, stockid FROM recscan " +
@@ -451,6 +501,23 @@ fn touched(table, op, before, after, sh) {
     if before != nil and after != nil and before.categoryid == after.categoryid and before.mbflag == after.mbflag { return nil }
     if before == nil { return nil }   // a new item has no picks yet
     return "all"
+  }
+  if t == "stockmoves" {
+    // only receipts and vendor returns are read here (every sale is a stock move too)
+    let ours = filter(rows, fn(r) { return str(r.type) == "25" or str(r.type) == "85" })
+    if len(ours) == 0 { return nil }
+    let hs = []
+    for r in ours { for h in receive_day_hours(slice(str(r.trandate), 0, 10)) { push(hs, h) } }
+    return unique(compact(hs))
+  }
+  if t == "recscan" {
+    // the receiving screen rewrites old rows' qty all day; only who, what and when are read from recscan now
+    if before != nil and after != nil and before.date_rec == after.date_rec and before.userid == after.userid and
+       before.stockid == after.stockid and before.in_out == after.in_out and before.vendor == after.vendor { return nil }
+    // a scan can move the day's receipts to its hour (receive_hour), so the day's receiving hours are read again
+    let hs = []
+    for r in rows { if not is_blank(r.date_rec) { for h in receive_day_hours(slice(str(r.date_rec), 0, 10)) { push(hs, h) } } }
+    return unique(compact(hs))
   }
   let ds = []
   for row in rows {
