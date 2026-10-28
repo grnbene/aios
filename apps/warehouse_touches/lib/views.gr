@@ -682,6 +682,9 @@ let PAGE_CSS = join([
   ".status { display: inline-flex; align-items: center; gap: 10px; margin: -6px 0 16px; padding: 5px 12px; border-radius: 999px; font-size: 13px; border: 1px solid; }",
   ".status b { letter-spacing: .06em; } .status .btn { padding: 4px 12px; font-size: 13px; }",
   ".status.live { background: rgba(58, 167, 118, .12); border-color: var(--move); }",
+  ".tl-tip { position: fixed; z-index: 50; display: none; pointer-events: none; min-width: 170px; padding: 8px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 6px 20px rgba(0,0,0,.18); font-size: 12px; }",
+  ".tl-tip .tip-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 4px; } .tl-tip .tip-head span { opacity: .75; }",
+  ".tl-tip .tip-row { display: flex; align-items: center; gap: 6px; } .tl-tip .tip-row b { margin-left: auto; font-variant-numeric: tabular-nums; }",
   "header .status { margin: 0; } button.status { font: inherit; font-size: 13px; color: inherit; cursor: pointer; }",
   "button.status small { opacity: .65; } button.status:hover { background: rgba(58, 167, 118, .22); }",
   ".status.paused { background: rgba(232, 145, 45, .16); border-color: var(--pick); } .status.paused { padding-right: 6px; }",
@@ -727,6 +730,44 @@ let PAGE_CSS = join([
 
 
 // The clock in the header, filled in by the page (the time is the viewer's).
+// Hover on a timeline column or a heatmap cell: its figures at once, in a box over it (the browser's own title
+// tooltip comes late and plain). The figures are the element's title - "label: N touches · Source n · ..." -
+// moved to data-tip so the browser does not show it as well; a source at 0 is left out.
+let TIP_JS = join([
+  "(function () {",
+  "  if (window.__wtTip) return; window.__wtTip = 1;",
+  "  var colors = {" + join(map(SOURCES, fn(src) { return "'" + src[1] + "': 'var(" + src[2] + ")'" }), ", ") + "};",
+  "  var tip = document.createElement('div'); tip.className = 'tl-tip'; document.body.appendChild(tip);",
+  "  function hide() { tip.style.display = 'none'; }",
+  "  function add(parent, tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; parent.appendChild(e); return e; }",
+  "  document.addEventListener('mouseover', function (e) {",
+  "    var b = e.target.closest ? e.target.closest('.tl-col, .hm-cell') : null;",
+  "    if (!b) { hide(); return; }",
+  "    if (b.hasAttribute('title')) { b.dataset.tip = b.getAttribute('title'); b.removeAttribute('title'); }",
+  "    var t = b.dataset.tip; if (!t) { hide(); return; }",
+  "    var parts = t.split(" + json_stringify(MID) + "), head = parts[0], at = head.lastIndexOf(': ');",
+  "    tip.textContent = '';",
+  "    var h = add(tip, 'div', 'tip-head');",
+  "    add(h, 'b', null, at > 0 ? head.slice(0, at) : head);",
+  "    if (at > 0) add(h, 'span', null, head.slice(at + 2));",
+  "    for (var i = 1; i < parts.length; i++) {",
+  "      var sp = parts[i].lastIndexOf(' '), name = parts[i].slice(0, sp), val = parts[i].slice(sp + 1);",
+  "      if (val === '0') continue;",
+  "      var row = add(tip, 'div', 'tip-row'), d = add(row, 'i', 'dot');",
+  "      d.style.background = colors[name] || 'var(--muted)';",
+  "      add(row, 'span', null, name); add(row, 'b', null, val);",
+  "    }",
+  "    tip.style.display = 'block';",
+  "    var r = b.getBoundingClientRect(), w = tip.offsetWidth, ht = tip.offsetHeight;",
+  "    var x = Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2));",
+  "    var y = r.top - ht - 8; if (y < 8) y = r.bottom + 8;",
+  "    tip.style.left = x + 'px'; tip.style.top = y + 'px';",
+  "  });",
+  "  document.addEventListener('scroll', hide, true);",
+  "  document.addEventListener('mouseleave', hide);",
+  "})();"
+], chr(10))
+
 let CLOCK_JS = join([
   "(function () {",
   "  function tick() {",
@@ -830,5 +871,5 @@ fn dashboard_node(report, state) {
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
     el("div", {"id": "live"}, live_node(report, state, timeline_node(report, state))),
-    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS))
+    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS), el("script", TIP_JS))
 }
