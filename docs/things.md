@@ -93,14 +93,14 @@ Actions support variable substitution:
 To test actions against production writes without executing updates on external systems, suffix the action with `SHADOW`:
 
 ```sql
-CREATE THING ready KEY orderno PARTITION BY orderno READS lines
-  AS SELECT orderno, COUNT(*) AS line_count, SUM(qty) AS qty, SUM(picked) AS picked FROM lines GROUP BY orderno
+CREATE THING ready KEY order_id PARTITION BY order_id READS lines
+  AS SELECT order_id, COUNT(*) AS line_count, SUM(qty) AS qty, SUM(picked) AS picked FROM lines GROUP BY order_id
   WHEN picked >= qty
-  DO UPDATE salesorders SET orderstatusid = 21, lines = THING.line_count WHERE orderno = KEY
-  TO erp SHADOW;
+  DO UPDATE orders SET status = 'ready', line_count = THING.line_count WHERE id = KEY
+  TO upstream SHADOW;
 ```
 
-`erp` references a database profile defined in `connections.ini`. In shadow mode, the engine evaluates the condition and records the formatted SQL statements in the key's history without connecting to the target - so the profile does not need `things_write=1` yet.
+`upstream` references a database profile defined in `connections.ini`. In shadow mode, the engine evaluates the condition and records the formatted SQL statements in the key's history without connecting to the target - so the profile does not need `things_write=1` yet.
 
 Inspect recorded candidate actions:
 

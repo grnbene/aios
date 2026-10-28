@@ -66,7 +66,7 @@ CDC_LOG_FILE=
 CDC_LOG_POS=
 
 # Table whitelist — only these are ingested, which is what keeps RAM bounded.
-CDC_TABLES=stocktrans,banktrans,clubs_joined,companies,currencies,custbranch,debtorsmaster,debtortrans,debtortranstaxes,debtortype,dispatch,dispatch_status,grns,holdreasons,locationusers,locstock,manufacturer,oms_snoozed,order_cancellations,order_status,paymentterms,periods,pickingfreeze,product_to_manufacturer,productlines,purchdata,purchorderdetails,purchorders,salesman,salesorderdetails,salesorderpaymentmethod,salesorders,salestypes,shippers,stockcategory,stockmaster,stockmoves,stockmovestaxes,suppallocs,suppcredittogrn,suppinvstogrn,suppliers,suppliertype,supptrans,supptranstaxes,systypenames,systypes,taxauthorities,taxauthrates,taxgroups,taxgrouptaxes,territory,trackinginfo,www_users,chartdetails,chartmaster,credit_cards,credit_cards_net,creditorders,custallocns,custcontacts,gltrans,prices,product_description,product_to_image,product_types,quote_details,quotes,reserveinvoice,salesordertopurchaseorder,statements,apikeys
+CDC_TABLES=orders,order_items,products,categories,inventory,inventory_moves,customers,customer_branches,shippers,suppliers,purchase_orders,purchase_order_details,invoices,payments,users,audit_log
 
 # Fleet membership (optional). With all three set, asql-serve joins this hub
 # before serving, and fleet members can query this engine with sql_on() /

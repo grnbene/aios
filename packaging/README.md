@@ -77,7 +77,7 @@ A conf that pins `AIOS_BIN` to some other binary (a hand deploy's
 
     /opt/aios/bin/asql-check            every whitelisted table against the master (minutes)
     /opt/aios/bin/asql-check --quick    service, wire, binlog position, Things (seconds)
-    /opt/aios/bin/asql-check salesorders
+    /opt/aios/bin/asql-check orders
 
 The acceptance test after an install or upgrade, exit 0 only when: the unit is
 running (by start timestamp and pid), the unix socket answers, the binlog is

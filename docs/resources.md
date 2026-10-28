@@ -931,7 +931,7 @@ Its flags, all `--name=value`:
 | `--bind=` / `--port=` | `0.0.0.0` / `3307` | MySQL-wire listener |
 | `--sql-user=`, `--sql-pass=`, `--sql-pass-file=` | none | an account on the wire server (not in `--help`) |
 | `--trust-loopback` | off | let loopback clients in without an account (not in `--help`) |
-| `--upstream=`, `--upstream-user=`, `--upstream-pass=`, `--upstream-db=`, `--tables=` | none, `root`, none, `versioneight`, all | CDC from a MariaDB/MySQL binlog |
+| `--upstream=`, `--upstream-user=`, `--upstream-pass=`, `--upstream-db=`, `--tables=` | none, `root`, none, `appdb`, all | CDC from a MariaDB/MySQL binlog |
 | `--mode=` | `local` | `write_behind` or `write_through` sync to upstream |
 | `--shm-ring=` | `aios_ring` | name of the 4 MB shm ring it creates (nothing in the engine writes to it) |
 | `--telemetry-slots=` | 131072 | size of the telemetry ring |
@@ -1174,7 +1174,7 @@ $ build/aios-sidecars-check
   [PASS] Capability read-only enforcement: read allowed, write denied
   [PASS] Capability revocation: admin token invalid after revoke
 [Step 7] Testing Transparent In-Memory CDC Multi-Tenant ASQL Engine...
-  [PASS] ASQL tenant isolation (hairlines): session sees row 101 only
+  [PASS] ASQL tenant isolation (tenant_a): session sees row 101 only
   ALL 10026/10026 SIDECAR CHECKS PASSED
 
 $ build/aios-unified-memory-store-bench
