@@ -72,6 +72,7 @@ grain_cli_case(cli.pkg.ok ${CLI_CASES}/pkg_ok 0 /dev/null pkg@@check)
 grain_cli_case(cli.pkg.missing_import ${CLI_CASES}/pkg_bad 2 /dev/null pkg@@check)
 grain_case(cli.db_quote ${CLI_CASES} 0 run db_quote.gr)
 grain_case(cli.modules ${CLI_CASES} 0 run modules.gr)                    # import
+grain_case(cli.modules_threads ${CLI_CASES} 0 run modules_threads.gr)    # import from many VMs at once
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.lex_error ${CLI_CASES} 1 run lex_error.gr)             # the caret sits under the character the lexer refused
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)

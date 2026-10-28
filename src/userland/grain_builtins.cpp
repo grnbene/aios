@@ -465,6 +465,27 @@ std::string import_normalize(const std::string& path) {
   return out;
 }
 
+// A compiled function and every function inside it, copied: the same code and constants, with empty inline caches
+// and no native code yet. Constants other than functions are literals nothing changes, so they are shared.
+std::shared_ptr<FnObj> clone_fn_tree(const std::shared_ptr<FnObj>& src) {
+  if (!src) return nullptr;
+  auto dst = std::make_shared<FnObj>();
+  dst->name = src->name;
+  dst->arity = src->arity;
+  dst->local_slots = src->local_slots;
+  dst->debug_locals = src->debug_locals;
+  dst->upvalue_from_local = src->upvalue_from_local;
+  dst->upvalue_index = src->upvalue_index;
+  dst->chunk.code = src->chunk.code;
+  dst->chunk.lines = src->chunk.lines;
+  dst->chunk.columns = src->chunk.columns;
+  dst->chunk.constants = src->chunk.constants;
+  for (Value& c : dst->chunk.constants)
+    if (c.type == Type::Fn && c.obj && !c.obj->is_closure)
+      c.obj = clone_fn_tree(std::static_pointer_cast<FnObj>(c.obj));
+  return dst;
+}
+
 // import "lib.gr": runs another file in this program, once, so its functions and values are defined here.
 // The path is relative to the file that imports it. Everything it defines at its top level is global, as if it
 // had been written in place; a name it shares with the program is the later definition's. An error inside it
@@ -551,10 +572,12 @@ Value bi_import(Vm& vm, std::vector<Value>& args, std::string& error) {
     return Value::nil();
   }
 
+  // The cache holds the compile; each import runs its own copy of it. A function's chunk keeps per-VM state (the
+  // global slot cache, native code), and the renaming and rewriting below change it, so VMs on other threads must
+  // never share one: two page sessions importing the same file at once corrupted the heap, and read each other's
+  // globals. The same rule as a worker's functions (grain_std_parallel.cpp, Copier::function).
   CompileResult compiled = raw_compiled;
-  if (!as_name.empty() || !symbols_filter.empty()) {
-    compiled.script = std::make_shared<FnObj>(*raw_compiled.script);
-  }
+  compiled.script = clone_fn_tree(raw_compiled.script);
 
   std::string mod_prefix;
   if (!as_name.empty()) {

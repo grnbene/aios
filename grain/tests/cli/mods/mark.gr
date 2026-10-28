@@ -1,0 +1,4 @@
+// One global per VM that imports this file (modules_threads.gr).
+let mark = -1
+fn set_mark(v) { mark = v }
+fn get_mark() { return mark }
