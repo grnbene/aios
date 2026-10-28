@@ -97,6 +97,8 @@ allocated CPU slots.
 |---|---|
 | [docs/console.md](docs/console.md) | the `aios` console, roots, the resident machine, the familiar shell, entities and capabilities, the optional mind |
 | [docs/asql.md](docs/asql.md) | running ASQL, the MySQL wire server, replicating MariaDB, write modes, Things and Cells, running it as a service |
+| [docs/things.md](docs/things.md) | Things, the practical guide: one worked example from a first Thing to acting on it safely (shadow, then live), looking back (`AS OF`, `EXPLAIN`), previewing a write (`WHAT IF`) and building one Thing on another (`INTO`) |
+| [docs/things.md](docs/things.md) | practical guide to Things: live queries, shadow actions, time travel, lineage, and what-if previews |
 | [docs/network.md](docs/network.md) | the web server, TLS, SSH, linking two machines, moving a running workload, the fleet relay and gateway, the native TCP/IP stack |
 | [docs/fleet.md](docs/fleet.md) | several machines as one: membership and keys, discovery, remote devices and memory, moving running work, fleet-wide SQL, the orchestrator, running a fleet |
 | [docs/resources.md](docs/resources.md) | devices, memory types and migration, tensors, quotas, the object store and AQL, checkpoints, the sidecars and their C ABI |
@@ -109,7 +111,7 @@ allocated CPU slots.
 | [docs/asql-benchmarks.md](docs/asql-benchmarks.md) | ASQL sysbench and ERP workload benchmarks against MariaDB |
 | [README-ASQL.md](README-ASQL.md) | ASQL's internals and its feature list |
 | [grain/README.md](grain/README.md) | `grain`: the language, syntax, JIT compiler, and core runtime |
-| [docs/grain-reference.md](docs/grain-reference.md) | Grain standard library reference: all 440+ builtins across 18 domains |
+| [docs/grain-reference.md](docs/grain-reference.md) | Grain standard library reference: 540+ builtins (and the `ui.*` and `doc.*` modules) across 18 domains |
 | [docs/grain-apps.md](docs/grain-apps.md) | running and managing Grain applications, deployments, and rollbacks |
 | [docs/grain-app-writing.md](docs/grain-app-writing.md) | writing Grain applications: manifests, routes, workers, and hooks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | the object model and the invariants each layer keeps |

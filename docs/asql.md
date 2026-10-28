@@ -710,6 +710,9 @@ the master and a start, that row arrived too.
 
 ## Things
 
+New to Things? [things.md](things.md) walks through one example from start to finish; this section is the
+full reference.
+
 A Thing kind is a grouped query that the engine keeps current. Each distinct
 `KEY` value is one Thing. When a row changes in a table the query reads, the
 engine re-reads only the partitions that row touched and replaces their
@@ -775,11 +778,11 @@ CREATE THING <name> KEY <column>
   - `SET THING <name> SHADOW` holds it back again. The mode is kept across
     restarts.
 
-The parser also has `RESOURCE`, `CLAIMS` (allocation), `GRAIN` (a grain
-program), `AT '<time>' GRAIN` (an event Thing, gated by `AIOS_THING_WRITES=1`)
-and mirror kinds. Their shapes are in the usage error strings in
-`sql_things.cpp` (each starts `CREATE THING <name> RESOURCE`, `CLAIMS`,
-`GRAIN`, `AT '` or `MIRROR`). **None of these were driven here.**
+The parser also includes specialized kinds: `RESOURCE`, `CLAIMS` (allocation),
+`GRAIN` (a grain program), `AT '<time>' GRAIN` (an event Thing, gated by
+`AIOS_THING_WRITES=1`), and mirror kinds across fleet machines. Their syntax
+is defined in `sql_things.cpp`. Application queries typically use standard
+aggregate and row Things.
 
 The other statements:
 
@@ -823,8 +826,7 @@ line, no act, nothing in the `AS OF` log. `ROLLBACK TO SAVEPOINT` and a statemen
 transaction are folded in the same way: what reaches the Thing is what was committed. A transaction is held as its
 changed rows until it commits; past 100,000 rows (`AIOS_THING_HOLD_ROWS`) only the tables it touched are kept, and
 their Things are read again whole at `COMMIT`. Autocommit writes, and rows arriving by replication outside a
-transaction, reach the Things at once, as before. (Before this, an open transaction's rows showed in every
-session's Things, and an act could run for a change that was then rolled back.)
+transaction, reach the Things immediately.
 
 ### `AS OF`: a Thing as it stood at a moment
 
