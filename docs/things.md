@@ -2,7 +2,7 @@
 
 A **Thing** is a query whose result ASQL maintains incrementally. You declare the query once; whenever underlying table data changes, the engine identifies the affected keys and updates only those records. Applications read the live results using `SHOW THING`, ensuring fresh data without repeated aggregate queries or external cache invalidation.
 
-In database terms, a Thing is an **incrementally maintained materialized view** (IVM). Unlike standard materialized views that require costly full-table refreshes, ASQL hooks table mutations and updates only the touched partitions.
+In database terms, a Thing is an **incrementally maintained materialized view** (IVM). Unlike materialized views that are refreshed whole on demand, ASQL hooks table mutations and recomputes only the partitions a write touched. (One exception: a change to a table the Thing joins without its partition column recomputes the whole Thing - see "When to Avoid".)
 
 For complete grammar specifications and engine internals, see [asql.md](asql.md#things).
 
@@ -39,7 +39,7 @@ CREATE THING orders KEY orderno PARTITION BY orderno READS lines
 
 Key clauses:
 - **`KEY orderno`**: Defines the unique identifier for each Thing instance.
-- **`PARTITION BY orderno`**: Specifies the partition boundary for change tracking. When `KEY` and `PARTITION BY` match, it functions as a row Thing (allowing expressions like `COUNT`, `SUM`, `AVG`, `MAX`, `CASE`).
+- **`PARTITION BY orderno`**: Specifies the partition boundary for change tracking (defaults to the key). When `KEY` and `PARTITION BY` match, it is a row Thing and its values can be any expression (`COUNT`, `SUM`, `AVG`, `MAX`, `CASE`, ...). When they differ, every value must be a `SUM` or `COUNT` (optionally times a number), so that partitions add up exactly.
 - **`READS lines`**: Declares source dependencies (defaults to all tables referenced in the query).
 
 ### Querying Current State
@@ -48,7 +48,7 @@ Key clauses:
 SHOW THING orders;
 ```
 
-When an `UPDATE lines SET picked = ...` commits, the corresponding order summary is updated before the write returns.
+When an `UPDATE lines SET picked = ...` commits, the corresponding order summary is updated before the write returns (inside an explicit transaction: at its `COMMIT`).
 
 ### Inspecting Change History
 
@@ -58,7 +58,7 @@ To view recent mutations and their causes:
 SHOW THING HISTORY orders '200';
 ```
 
-Returns the last 32 state transitions for key `200`, including timestamps, before/after values, and the triggering statement cause.
+Returns the most recent 32 history entries for key `200`: when, the cause (a description such as `lines update orderno 200`, not the SQL statement), and the values before and after. Actions taken (or, in shadow mode, worked out) appear here too.
 
 ---
 
@@ -82,7 +82,7 @@ CREATE THING ready KEY orderno PARTITION BY orderno READS lines
   TO erp SHADOW;
 ```
 
-`erp` references a database profile defined in `connections.ini`. In shadow mode, the engine evaluates the condition and logs the formatted SQL statements without sending them to the target.
+`erp` references a database profile defined in `connections.ini`. In shadow mode, the engine evaluates the condition and records the formatted SQL statements in the key's history without connecting to the target - so the profile does not need `things_write=1` yet.
 
 Inspect recorded candidate actions:
 
@@ -120,7 +120,7 @@ Mode configuration persists across server restarts.
 
 ### Point-in-Time Reconstruction (Time Travel with AS OF)
 
-Every Thing change is appended to an on-disk history log (`<root>/sql_db/things/<name>.asof`), allowing state reconstruction at any prior timestamp:
+Every Thing change is appended to an on-disk history log (`<root>/sql_db/things/<name>.asof`), allowing the Thing to be reconstructed at any moment within its retention (and since the log began - for a Thing created before this feature, since the engine first loaded it):
 
 ```sql
 SHOW THING orders AS OF '2026-10-27 14:15:00';
@@ -129,7 +129,7 @@ SHOW THING orders AS OF '2026-10-27 14:15:00' KEYS ('123');
 
 Output includes the values as they stood at that timestamp, the recorded `changed_at` time, and the mutation `cause`.
 
-- **Retention settings**: Configured via `SET THING orders KEEP <n> DAYS` (default is 30 days, capped at 256 MB per Thing; set `KEEP 0 DAYS` to disable).
+- **Retention settings**: Configured via `SET THING orders KEEP <n> DAYS` (default is 30 days, capped at 256 MB per Thing - past the cap, the oldest changes are folded away; set `KEEP 0 DAYS` to disable). A time before the kept history is refused, naming the earliest time it can answer.
 - **Environment defaults**: Configurable system-wide with `AIOS_THING_KEEP_DAYS` and `AIOS_THING_KEEP_MB`.
 
 ### Source-Row Attribution (Lineage with EXPLAIN THING)
@@ -140,7 +140,7 @@ To identify which underlying source rows produced an aggregate calculation:
 EXPLAIN THING orders '123';
 ```
 
-The engine unrolls the aggregate query for key `123`, returning the contributing source rows from `lines` alongside a `thing.<label>` column showing each individual row's share of `SUM`, `COUNT`, `AVG`, `MIN`, or `MAX`. The sum of individual contributions matches the aggregate value shown in `SHOW THING`.
+The engine runs the Thing's own query for key `123` without its `GROUP BY`, returning the contributing source rows (its `WHERE` and joins applied) alongside a `thing.<label>` column per simple aggregate: each row's share of a `SUM` or `COUNT` - which add up to the value `SHOW THING` shows - and each row's value for a `MIN`, `MAX` or `AVG`. Values computed some other way (`CASE`, `DISTINCT`, two aggregates combined) get no such column. At most 1,000 rows unless `LIMIT n` says otherwise.
 
 ---
 
@@ -152,10 +152,10 @@ Before running migrations or bulk updates, preview their downstream effects acro
 WHAT IF UPDATE lines SET picked = qty WHERE wh = 'a';
 ```
 
-Output displays:
-1. Every Thing key affected, with `old` and `new` column values.
-2. Every downstream `WHEN ... DO` trigger that would fire (`would act: ...`).
-3. No modifications are committed to source tables, Things, or external action profiles.
+Output is one row per Thing key that would change, with the columns `thing`, `key`, `change` (`new`, `changed` or `gone`), `before` and `after` (only the values that change), and `act`:
+1. `would act: <statements> TO <profile>` for a `WHEN ... DO` that would fire, or `would re-arm` where its condition would stop holding.
+2. A grain Thing that reads a written table is listed as `would re-run` (its values come from its program and are not previewed).
+3. Nothing is written to source tables, Things, their history, or any action's target. `WHAT IF` is refused inside an open transaction.
 
 ### Multi-Statement Previews
 
@@ -175,7 +175,7 @@ WHAT IF 'UPDATE lines SET qty = 4 WHERE id = 1; DELETE FROM lines WHERE orderno 
 When multi-tier analytics or reports share intermediate calculations, persist a Thing's output into a managed table using `INTO <db>.<table>`:
 
 ```sql
-DROP THING IF EXISTS orders;
+DROP THING orders;   -- replacing the earlier Thing (DROP THING has no IF EXISTS)
 
 CREATE THING orders KEY orderno PARTITION BY orderno READS lines INTO shop.orders_t
   AS SELECT orderno, SUM(qty) AS qty, MAX(wh) AS wh FROM lines GROUP BY orderno;
@@ -185,9 +185,9 @@ CREATE THING load KEY wh PARTITION BY wh READS orders_t
 ```
 
 Managed table characteristics:
-- **Cascading updates**: Mutations to `lines` propagate through `orders`, update `orders_t`, and trigger updates in `load` within the same transaction commit cycle.
+- **Cascading updates**: A committed change to `lines` propagates through `orders`, into `orders_t`, and on into `load` before the statement returns. The writes to `orders_t` are the engine's own, made after the change commits - never inside a client's open transaction.
 - **SQL compatibility**: `shop.orders_t` is a standard table accessible to `SELECT` queries, BI tools, and joins.
-- **Managed integrity**: Direct client writes (`INSERT`, `UPDATE`, `DELETE`) to managed tables are rejected. Dropping the parent Thing (`DROP THING orders`) drops the associated managed table.
+- **Managed integrity**: Direct client writes to managed tables (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`, `DROP`, `RENAME`, `LOAD DATA`) are rejected, naming the Thing. Dropping the parent Thing (`DROP THING orders`) drops the associated managed table. The table must not exist before `CREATE`.
 - **Data types**: Values are stored as text (matching `SHOW THING` formatting); downstream numeric aggregations should use explicit `CAST` expressions.
 - **Cycle prevention**: Recursive and circular dependencies between chained Things are validated and rejected at `CREATE` time.
 
@@ -215,10 +215,10 @@ Managed table characteristics:
 
 ## Architecture and Performance Invariants
 
-- **Targeted Recomputation**: ASQL's mutation hooks identify changed partition keys and update only those specific partitions, avoiding full-table scans.
-- **Non-blocking Append History**: Time travel logs (`.asof`) use sequential disk appends per modified key, pruned according to retention policies (`AIOS_THING_KEEP_DAYS`).
-- **Deferred Settle**: Chained managed tables settle updates after the primary lock is released, minimizing write lock contention.
-- **Isolated Rollback Previews**: `WHAT IF` operations execute in an isolated sandbox transaction that is rolled back prior to completion.
+- **Targeted Recomputation**: ASQL's mutation hooks identify the partitions a write changed and re-run the Thing's query for just those partitions, not the whole query (a table read whole is the exception above).
+- **Append-only History**: Time travel logs (`.asof`) get one appended line per changed key (written while the Thing's lock is held), rewritten from a later cut-off when they pass their days or size (`AIOS_THING_KEEP_DAYS`, `AIOS_THING_KEEP_MB`). Nothing is kept in memory per change.
+- **Deferred Settle**: Managed tables are written after the Things settle, with the Things' own lock let go - a write notifies the Things, which take that lock, so writing while holding it would deadlock. Chained Things settle in further passes (at most 8).
+- **Rolled-back Previews**: `WHAT IF` runs the statements in an ordinary transaction of its own, which is always rolled back. While it runs it holds what any transaction holds (in the default mode, the writer lock, so other writers wait), so keep previewed statements modest.
 
 ---
 
