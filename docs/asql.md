@@ -778,11 +778,10 @@ CREATE THING <name> KEY <column>
   - `SET THING <name> SHADOW` holds it back again. The mode is kept across
     restarts.
 
-The parser also includes specialized kinds: `RESOURCE`, `CLAIMS` (allocation),
-`GRAIN` (a grain program), `AT '<time>' GRAIN` (an event Thing, gated by
-`AIOS_THING_WRITES=1`), and mirror kinds across fleet machines. Their syntax
-is defined in `sql_things.cpp`. Application queries typically use standard
-aggregate and row Things.
+Besides these, there are Things that allocate stock to orders (`RESOURCE` and `CLAIMS`), Things computed by a
+grain program (`GRAIN`), Things that act once at a set time (`AT '<time>' GRAIN`), and mirrors of another machine's
+Things. Each has a section below ("Resources and claims", "Event Things", "Grain Things"; mirrors are in
+[fleet.md](fleet.md#mirrors-things-about-another-machine)).
 
 The other statements:
 
@@ -914,6 +913,106 @@ Driven on a local server (2026-10-27): one client ran `WAIT THING per_who SINCE
 11 ms after the insert with `3 | ["ann"] | 0`. Twenty waiters woke on one insert
 (13 ms) with the same answer, a `TIMEOUT 1.5` returned the same clock after 1.5 s,
 and a `CREATE OR REPLACE` woke its waiter with `whole = 1`.
+
+### Resources and claims: allocating stock to orders
+
+Two Things that work as a pair. A **resource** is something with a quantity - stock of an item at a location. A
+**claims** Thing is the demand on it - orders whose lines each want some of a resource - and the engine shares the
+resource out among the claims, again whenever either side changes.
+
+```sql
+CREATE THING stock RESOURCE KEY stockid, loc CAPACITY qty FROM locstock;
+
+CREATE THING alloc CLAIMS stock KEY orderno PRIORITY created [ALLOCATE FIFO | ALLOCATE READY] READS lines
+  AS SELECT orderno, line, stockid, loc, qty FROM lines [WHERE ...];
+```
+
+- **The resource** has one Thing per `KEY` (here an item at a location), its capacity the `SUM` of `CAPACITY` over
+  that key's rows of the `FROM` table. Only keys some claim names are kept. `READS` defaults to the `FROM` table.
+- **The claims** query returns one row per line: the claimant's key (here the order), a line id, the resource's key
+  columns in its `KEY` order, and the quantity the line needs. No `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` or
+  `UNION`: the order lines are served in is `PRIORITY` - one or more expressions, ascending, NULL first (numbers as
+  numbers, text as text), like an `ORDER BY`. Item keys compare as MariaDB's collation does (`'ABC'` = `'abc'`).
+- **`ALLOCATE FIFO`** (the default) serves lines strictly in priority order: each takes what it needs, or what is
+  left.
+- **`ALLOCATE READY`** shares a contested resource so that the most claimants are complete - an exact plan, solved
+  as a SAT problem per group of claimants competing for the same stock - and the rest are still served in priority
+  order. The difference shows when an early claimant cannot be completed anyway: with 3 of item A and none of B,
+  order 1 (first, wanting 3 A and 1 B) and order 2 (wanting 3 A) - FIFO gives order 1 the three A and neither order
+  is complete; READY gives them to order 2, which ships.
+
+What they show (from a run of the example above, 5 of T1 and 2 of T2 in stock):
+
+```
+SHOW THING stock
+stockid  loc  on_hand  demand  promised  free  short  claims  ...
+T1       01   5        6       5         0     1      2
+T2       01   2        3       2         0     1      2
+
+SHOW THING alloc
+orderno  status   lines  short_lines  ...  waiting_for
+100      Ready    1      0                 a change to its lines or to the stock it holds
+200      Waiting  2      1                 01 at T1: short 1 (2 of 2 in line)
+300      Waiting  1      1                 01 at T2: short 1 (2 of 2 in line)
+
+SHOW THING LINES alloc          -- each line: need, allocated, its place in the queue for that item
+orderno  line  stockid  loc  need  allocated  position  queue
+100      1     T1       01   3     3          1         2
+200      1     T1       01   3     2          2         2
+...
+```
+
+`SHOW THING ALLOCATION alloc` sums up an `ALLOCATE READY` plan: claimants, how many are whole, how many FIFO would
+have made whole (`whole_if_fifo`), the contested groups, and how many of their plans were proven optimal. After
+`UPDATE locstock SET qty = 6 WHERE stockid = 'T1'`, order 200 turns Ready, and both Things' `SHOW THING HISTORY`
+(`SHOW THING HISTORY stock 'T1,01'` for a resource - its key values joined by commas) says what changed it.
+
+A resource can have one claims Thing. `DROP THING` a resource is refused while its claims exist (`stock is claimed
+by alloc: drop that first`). A grain Thing can read a claims Thing's queues through `LINKS` (see "Grain Things").
+
+### Event Things: a program that runs once, at a set time
+
+An **event Thing** is a planned piece of work - a price change posted at midnight, a month-end close - written as a
+grain program that runs once at its time, writes what it was given leave to write, and leaves a receipt.
+
+```sql
+CREATE THING raise AT '2030-01-01 00:00:00' GRAIN
+  READS prices, price_log WRITES prices, price_log PARAMS '{"pct": 10}'
+  AS 'fn preview(input) { return read("SELECT sku, price FROM prices") }
+      fn fire(ctx) {
+        let n = 0
+        for r in read("SELECT sku, price FROM prices") {
+          let np = round(to_number(r.price) * (100 + params.pct)) / 100
+          write("INSERT INTO price_log VALUES (?, ?, ?)", r.sku, r.price, np)
+          n += write("UPDATE prices SET price = ? WHERE sku = ?", np, r.sku)
+        }
+        return {"updated": n}
+      }
+      fn verify(ctx, fired) { return len(read("SELECT * FROM price_log")) == fired.updated }'
+```
+
+- **It only runs where writes were allowed.** An event Thing writes, so `CREATE` is refused unless the engine was
+  started with `AIOS_THING_WRITES=1`, and one that comes due in a process started without it is marked `failed`
+  with that reason (and an alert) instead of firing.
+- **The program** must define `fire(ctx)`; `ctx` has `at` (its time), `now` and `today`, and `params` is the
+  `PARAMS` JSON. `read(sql, ...)` reads (the `WRITES` tables count as read too); `write(sql, ...)` - only while it
+  fires - runs an `INSERT`, `UPDATE`, `DELETE`, `REPLACE` or `DROP TABLE` on a `WRITES` table and returns the rows
+  affected. Optional: `preview(input)`, `verify(ctx, fired)` (false fails the event), `cleanup(ctx, fired)`.
+- **Before its time** it is a plan anyone can look at: `SHOW THING raise` (its time, `armed`, what it reads and
+  writes, its params) and `CALL THING raise.preview()`.
+- **At its time** (checked on the engine's clock; a time already past fires at once, or at the next start) it is
+  marked `firing` on disk before the first write, then `fire`, `verify`, `cleanup` run, a receipt is kept, and the
+  Thing removes itself. `SHOW THING RECEIPTS` lists them: when it was due, when it fired, how long, how many writes,
+  and what fire, verify and cleanup returned.
+- **A crash while firing** leaves it `firing`, and the next start fires it again - write `fire()` so that a second
+  run does no harm (mark what is done, as the ERP's `posted_at` does).
+- **Failure.** An error in the program, or `verify()` returning false, leaves it `failed` with the reason in `SHOW
+  THING` and an alert in `SHOW THING ALERTS`. `RETRY THING raise` arms it again for its time (fix what it reads
+  first: the program itself is as created; `DROP` and `CREATE` to change it).
+- **`FIRE THING raise NOW`** fires it at once instead of at its time. `PAUSE THING` holds it back.
+- **`WRITES ... TO <profile>`** makes the tables a real database's, reached through a connection profile: `fire()`
+  is then one transaction on it (an error rolls it all back), and `read_target(sql, ...)` reads that database.
+  (Described from the code; the examples above ran against ASQL's own tables.)
 
 ### Grain Things
 
