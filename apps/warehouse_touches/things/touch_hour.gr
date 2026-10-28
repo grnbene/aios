@@ -11,6 +11,10 @@
 
 let DAY_SAFE = true   // an hour's answer depends on that hour's rows only, never on the clock
 
+// the line deliveries cleared from their run are counted on (section 7): no driver is known for them
+let CLEARED = "CLEARED"
+let CLEARED_NAME = "Cleared from run (no driver)"
+
 let MERCH = " AND ((sm.categoryid = 'TIRE' OR pf.stockid = 'FET') OR (sm.categoryid IN ('O','OT')) OR " +
             "(sm.categoryid NOT IN ('TIRE','O','F','E','X','L') AND pf.stockid NOT IN ('LAB-STORAGE','LAB-T11','LAB-T26')))"
 let PICKED = " FROM pickingfreeze pf INNER JOIN stockmaster sm ON sm.stockid = pf.stockid " +
@@ -46,7 +50,7 @@ fn enroll() {
     "SELECT DISTINCT DATE_FORMAT(timestopped, '%Y-%m-%d %H') AS d FROM loadingbays WHERE timestopped IS NOT NULL",
     "SELECT DISTINCT DATE_FORMAT(timeassigned, '%Y-%m-%d %H') AS d FROM loadingbays WHERE timeassigned IS NOT NULL",
     "SELECT DISTINCT CONCAT(DATE(dt.trandate), ' ', DATE_FORMAT(dt.inputdate, '%H')) AS d FROM debtortrans dt INNER JOIN salesorders so ON so.orderno = dt.order_ " +
-      "WHERE dt.type = 10 AND so.shipvia = 2 AND dt.trandate IS NOT NULL"
+      "WHERE dt.type = 10 AND so.shipvia IN (1, 2) AND dt.trandate IS NOT NULL"
   ] {
     for r in read_raw(sql) {
       let h = hour_of(r.d)
@@ -91,7 +95,7 @@ fn things(ks, sh) {
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
-           "packed": {}, "staged": {}, "binds": [], "pickups": {}, "dname": nil, "lasts": {}}
+           "packed": {}, "staged": {}, "binds": [], "pickups": {}, "cleared": {}, "dname": nil, "lasts": {}}
       of_hour[key] = u
     }
     return u
@@ -345,6 +349,38 @@ fn things(ks, sh) {
     }
   }
 
+  // 7. Deliveries cleared from their run to be invoiced later (salesorders.shipvia = 1): loaded onto a truck
+  // (pickingfreeze.loaded), but the order's dispatch row - the run and the driver - is gone, so section 4 cannot see
+  // them. They count as loads on their invoice's hour, on one line of their own (CLEARED), with no driver or run.
+  // An order with any dispatch row left counts there instead, never here. Kept by order number, as pickups are.
+  let del = read_raw("SELECT so.orderno, " + inv_key + " AS day FROM debtortrans dt " +
+                     "INNER JOIN salesorders so ON so.orderno = dt.order_ " +
+                     "WHERE dt.type = 10 AND dt.trandate >= ? AND dt.trandate <= ? AND so.shipvia = 1 " +
+                     "GROUP BY so.orderno, " + inv_key, slice(a, 0, 10) + " 00:00:00", slice(b, 0, 10) + " 23:59:59")
+  if len(del) > 0 {
+    let on_run = {}
+    let orders = unique(map(del, fn(r) { return str(r.orderno) }))
+    for r in read_raw("SELECT DISTINCT invoice FROM dispatch WHERE invoice IN (?)", orders) { on_run[str(r.invoice)] = true }
+    let off = []
+    for o in orders { if not has(on_run, o) { push(off, o) } }
+    let units = {}
+    if len(off) > 0 {
+      for r in read_raw("SELECT pf.orderno, SUM(pf.loaded) AS units" + PICKED + "WHERE pf.loaded > 0 AND pf.orderno IN (?)" + MERCH +
+                        " GROUP BY pf.orderno", off) {
+        units[str(r.orderno)] = num(r.units)
+      }
+    }
+    for r in del {
+      let o = str(r.orderno)
+      if not has(units, o) { continue }   // nothing loaded: not a load
+      let u = user(hour_of(r.day), CLEARED)
+      if u != nil {
+        u.dname = CLEARED_NAME
+        u.cleared[o] = {"u": units[o], "d": slice(str(r.day), 0, 10)}
+      }
+    }
+  }
+
   let out = {}
   for hour in unique(concat(keys(out_hours), keys(hour_runs))) {
     let us = out_hours[hour] ?? {}
@@ -388,6 +424,12 @@ fn pickup_hours(orderno) {
   if len(so) == 0 or str(so[0].shipvia) != "2" { return [] }
   return map(read_raw("SELECT DISTINCT trandate, inputdate FROM debtortrans WHERE type = 10 AND order_ = ?", orderno), fn(r) { return invoice_hour(r.trandate, r.inputdate) })
 }
+// A delivery order's invoice hours: where it counts once it is cleared from its run (section 7).
+fn delivery_hours(orderno) {
+  let so = read_raw("SELECT shipvia FROM salesorders WHERE orderno = ?", orderno)
+  if len(so) == 0 or str(so[0].shipvia) != "1" { return [] }
+  return map(read_raw("SELECT DISTINCT trandate, inputdate FROM debtortrans WHERE type = 10 AND order_ = ?", orderno), fn(r) { return invoice_hour(r.trandate, r.inputdate) })
+}
 fn order_run_days(orderno) {
   let ds = []
   for r in read_raw("SELECT DISTINCT dispnumber, truckid FROM dispatch WHERE invoice = ?", orderno) {
@@ -414,7 +456,10 @@ fn touched(table, op, before, after, sh) {
   for row in rows {
     if t == "pickingfreeze" {
       push(ds, hour_of(row.date_pickupdate))
-      if row.orderno != nil { for d in order_run_days(row.orderno) { push(ds, d) } }
+      if row.orderno != nil {
+        for d in order_run_days(row.orderno) { push(ds, d) }
+        for d in delivery_hours(row.orderno) { push(ds, d) }
+      }
     } else if t == "salesorderdetails" {
       if row.orderno != nil {
         for d in sticker_days(row.orderno) { push(ds, d) }
@@ -429,6 +474,8 @@ fn touched(table, op, before, after, sh) {
       if row.transno != nil { for d in sticker_days(row.transno) { push(ds, d) } }
     } else if t == "dispatch" {
       if row.dispnumber != nil and row.truckid != nil { for d in run_days(row.dispnumber, row.truckid) { push(ds, d) } }
+      // a row gone (cleared from the run) or come back moves the order between its run and section 7
+      if row.invoice != nil { for d in delivery_hours(row.invoice) { push(ds, d) } }
     } else {
       for d in row_days(t, row) { push(ds, d) }
     }
