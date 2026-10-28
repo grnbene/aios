@@ -811,6 +811,18 @@ To see a running engine's Things from a shell without connecting to it, use
 `grain ps`: it lists each engine on the machine with its Things and their row
 counts (see [What's running on this machine](grain-apps.md#whats-running-on-this-machine-grain-ps)).
 
+### Things and transactions
+
+A Thing reacts only to what was committed. While a transaction is open, the rows it wrote are in no Thing: not for
+other sessions, and not for its own (a session that wants to read its own change through a Thing commits first).
+`COMMIT` brings them in, and a Thing's `WHEN .. DO` acts then; `ROLLBACK` leaves no trace - no value, no history
+line, no act, nothing in the `AS OF` log. `ROLLBACK TO SAVEPOINT` and a statement that fails inside the
+transaction are folded in the same way: what reaches the Thing is what was committed. A transaction is held as its
+changed rows until it commits; past 100,000 rows (`AIOS_THING_HOLD_ROWS`) only the tables it touched are kept, and
+their Things are read again whole at `COMMIT`. Autocommit writes, and rows arriving by replication outside a
+transaction, reach the Things at once, as before. (Before this, an open transaction's rows showed in every
+session's Things, and an act could run for a change that was then rolled back.)
+
 ### `AS OF`: a Thing as it stood at a moment
 
 An aggregate or row Thing (any `CREATE THING .. AS SELECT` kind, partitioned or not) writes every change of a key
