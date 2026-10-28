@@ -87,12 +87,66 @@ check(!pcall(doc.xlsx, {"rows": [[1]], "merges": ["A1\"/><x"]}).ok, "a merge tha
 check(!pcall(doc.xlsx, {"rows": [[1]], "merges": [[0, 1, 1, 1]]}).ok, "merge rows and columns count from 1")
 check(contains(sheet_xml, "pane xSplit=\"1\" ySplit=\"1\""), "freeze pane B2 parsed correctly")
 
+// a workbook of several sheets, in tab order, each its own part; a "<kind>_edge" style is that kind with a left edge
+let book = doc.unzip(doc.xlsx({"sheets": [
+  {"sheet": "Summary", "rows": [[{"v": "Total", "s": "bold"}, {"v": 91843, "s": "contrib_int_edge"}]]},
+  {"sheet": "By Month", "rows": [[{"v": "January", "s": "note"}, {"v": 7, "s": "total_int_edge"}]], "freeze_pane": "B2"},
+  [[1, 2]]
+]}))
+let book_xml = str(book["xl/workbook.xml"])
+check(contains(book_xml, "<sheet name=\"Summary\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"By Month\" sheetId=\"2\" r:id=\"rId2\"/><sheet name=\"Sheet3\" sheetId=\"3\" r:id=\"rId3\"/>"),
+      "sheets named in tab order, a list of rows named Sheet3")
+check(contains(str(book["xl/_rels/workbook.xml.rels"]), "Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\""),
+      "styles after the sheets' relationships")
+let types = str(book["[Content_Types].xml"])
+check(contains(types, "/xl/worksheets/sheet1.xml") and contains(types, "/xl/worksheets/sheet2.xml") and contains(types, "/xl/worksheets/sheet3.xml"), "every sheet's part typed")
+let s1 = str(book["xl/worksheets/sheet1.xml"])
+let s2 = str(book["xl/worksheets/sheet2.xml"])
+check(contains(s1, "<c r=\"A1\" t=\"inlineStr\" s=\"15\">") and contains(s1, "<c r=\"B1\" s=\"26\"><v>91843</v>"), "bold is 15, contrib_int_edge is 6 + 20")
+check(contains(s2, "<c r=\"A1\" t=\"inlineStr\" s=\"14\">") and contains(s2, "<c r=\"B1\" s=\"29\"><v>7</v>") and contains(s2, "ySplit=\"1\""),
+      "note is 14, total_int_edge is 9 + 20, each sheet its own pane")
+check(contains(str(book["xl/worksheets/sheet3.xml"]), "<v>2</v>"), "a sheet given as rows")
+let dash = str(doc.unzip(doc.xlsx({"rows": [[{"v": 0, "s": "count"}, {"v": 5, "s": "total_count"}, {"v": 0, "s": "contrib_count"}, {"v": 9, "s": "total_contrib_count"}]]}))["xl/worksheets/sheet1.xml"])
+check(contains(dash, "<c r=\"A1\" s=\"16\"><v>0</v>") and contains(dash, "<c r=\"B1\" s=\"17\"><v>5</v>") and
+      contains(dash, "<c r=\"C1\" s=\"18\"><v>0</v>") and contains(dash, "<c r=\"D1\" s=\"19\"><v>9</v>"),
+      "count 16, total_count 17, contrib_count 18, total_contrib_count 19: a zero stays a number")
+let book_styles = str(book["xl/styles.xml"])
+check(contains(book_styles, "<cellXfs count=\"40\">") and contains(book_styles, "<borders count=\"4\">") and contains(book_styles, "<left style=\"medium\">"),
+      "40 cell styles, the edge a medium left border")
+check(!pcall(doc.xlsx, {"sheets": [{"sheet": "A", "rows": []}, {"sheet": "a", "rows": []}]}).ok, "two sheets of one name (any case) are refused")
+check(!pcall(doc.xlsx, {"sheets": [{"sheet": "Jan/Feb", "rows": []}]}).ok, "a sheet name Excel refuses is refused")
+check(!pcall(doc.xlsx, {"sheets": []}).ok, "a workbook of no sheets is refused")
+
 let styles_xml = str(unzipped["xl/styles.xml"])
 check(contains(styles_xml, "<styleSheet"), "styles.xml has styleSheet root")
 check(contains(styles_xml, "<fonts"), "styles.xml has fonts collection")
 check(contains(styles_xml, "<fills"), "styles.xml has fills collection")
 
 // --- Vector PDF (doc.pdf) ---
+// every page has something on it besides the footer: no blank page at the end
+for n in [20, 33, 47, 60, 75, 90, 120] {
+  let rows = join(map(range(0, n), fn(i) { return "<tr><td>row " + str(i) + "</td><td>" + str(i * 7) + "</td></tr>" }), "")
+  let pdf = str(doc.pdf("<h1>Title</h1><table>" + rows + "</table>", "td { padding: 3px; } body { padding-bottom: 20px; }",
+                        {"margin_top": 40, "margin_bottom": 60, "footer": "page {PAGENO}"}))
+  let pages = filter(split(pdf, "stream"), fn(s) { return contains(s, " Tm") })
+  let empty = filter(pages, fn(pg) {
+    let body = filter(split(pg, chr(10)), fn(l) { return contains(l, " Tm") and contains(l, "1 0 0 1 ") and real(split(trim(l), " ")[5]) != 30.0 })
+    return len(body) == 0
+  })
+  check(len(empty) == 0, str(n) + " rows: " + str(len(empty)) + " blank page(s) of " + str(len(pages)))
+}
+// a long table across pages: no row is drawn into the bottom margin (the footer's), each goes whole to the next page
+let long_rows = join(map(range(0, 150), fn(i) { return "<tr><td>row " + str(i) + "</td><td>" + str(i * 7) + "</td></tr>" }), "")
+let long_pdf = str(doc.pdf("<table>" + long_rows + "</table>", "td { padding: 3px; }",
+                           {"margin_top": 40, "margin_bottom": 60, "footer": "page {PAGENO}"}))
+let low = filter(split(long_pdf, chr(10)), fn(l) {
+  if not contains(l, " Tm") or not contains(l, "1 0 0 1 ") { return false }
+  let p = split(trim(l), " ")
+  let y = real(p[5])
+  return y != 30.0 and y < 60.0   // 30: the footer's own line (margin_bottom / 2)
+})
+check(len(low) == 0, "no body text in the bottom margin (" + str(len(low)) + " lines were)")
+
 let html = "<div style=\"padding:20px;\"><h1 style=\"color:#0284c7;\">Warehouse Touches Report</h1><table border=\"1\"><tr><th>Operator</th><th>Touches</th></tr><tr><td>Jack</td><td>2040</td></tr></table></div>"
 let pdf = doc.pdf(html, "body { font-family: Helvetica; }", {
   "page_width": 792.0,

@@ -37,12 +37,18 @@ The tables `touch_hour` reads: `recscan`, `pickingfreeze`, `stockmaster`, `produ
 
 ## The page
 
-`/` is the report page. It shows summary cards, the mix of touch types, a table of operators you can sort, and a
-timeline of the day (Hours, Days, Heatmap tabs). Pick dates at the top; click an hour or drag across hours to narrow
-the report to them.
+`/` is the report page: the summary cards, a timeline of the day (Hours, Days, Heatmap tabs), and a table you can
+switch between By Person and By Month. Every figure is a touch count; each row's areas add up to its Total, and the
+Total rows equal the cards. Pick dates at the top; click an hour or drag across hours to narrow the report to them;
+"Show month" in By Month narrows it to that month.
 
-The page updates by itself: when ASQL changes `touch_hour`, every open page checks whether its own range changed and
-redraws if it did.
+The page updates by itself while it shows a range that runs to today with no hours or days picked ("Live"). With
+hours or days picked, or a range in the past, it is paused: it keeps the figures it read, shows when it read them,
+and reads again only when you change the range or press Refresh.
+
+The exports carry the same tables. PDF: Summary, By Month and By Person on one page. Excel: a Report sheet (the
+same), Person by Month, and Detail by Person (in/out, scans, orders, lines, moves, dispatches and the rest). CSV: By
+Person.
 
 ## Addresses
 
