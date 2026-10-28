@@ -34,12 +34,25 @@
 // (a socket server can hand that straight to the browsers). By default a
 // bit already on at CREATE counts as acted on; ACT EXISTING acts on those too.
 //
+// NOTIFY can say what to send and how, so it can reach an API that is not ours (Telegram, a chat webhook):
+//   NOTIFY 'https://api.telegram.org/bot{{secret:tg_token}}/sendMessage'
+//     BODY '{"chat_id":"{{secret:tg_chat}}","text":"New request {{key}}: {{subject}}"}'
+//     [HEADER 'Name: value' ...]
+// Or mail someone: ON RISE <bit> MAIL <mailer> TO '<address>[, ...]' [CC '...'] [REPLY_TO '...'] SUBJECT '<template>'
+// BODY '<template>' [HTML '<template>'] with a mailer from CREATE MAILER (sql_mail.hpp). The same {{values}}
+// fill the fields (HTML-escaped in HTML); a secret is not available to a mail.
+// {{secret:name}} is opened from CREATE SECRET at the moment of sending (sql_secrets.hpp) and never stored in the
+// declaration; {{set}} {{key}} {{edge}} {{bit}} {{id}} and {{<cell name>}} fill in the edge. In the URL a value is
+// percent-encoded, in the body it is JSON-escaped. Without BODY the edge goes as the JSON above.
+//
 //   SHOW CELLS                        every set: keys, bits on, bytes, acts
 //   SHOW CELLS name [WHERE bit]       the values per key (only keys with bit on)
 //   SHOW CELLS name KEY 'k'           one key
 //   SHOW CELLS name ACTS              the last acts: when, key, ok / error
 //   DROP CELLS name
 #include "aios/hal/sync.hpp"
+#include "aios/userland/sql_mail.hpp"
+#include "aios/userland/sql_secrets.hpp"
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -95,12 +108,19 @@ class CellEngine {
     std::unique_ptr<SqlRowExpr> expr, when;
     bool is_bit() const { return kind == BitAll || kind == BitAny || kind == BitNone; }
   };
+  struct MailAct {           // MAIL <mailer> TO ... SUBJECT ... BODY|HTML ...: templates, filled at the send
+    std::string mailer, to, cc, reply_to, subject, text, html;
+    bool active() const { return !mailer.empty(); }
+  };
   struct Act {
     size_t bit = 0;          // index into cells
     bool rise = true;
     std::string sql;         // statements, ';'-separated, KEY outside quotes = the key
     std::string target;      // connection profile
     std::string notify;      // NOTIFY '<url>' instead: the edge POSTed there as JSON
+    std::string notify_body;                   // BODY '<template>': sent instead of that JSON
+    std::vector<std::string> notify_headers;   // HEADER '<Name: value>' templates
+    MailAct mail;                              // MAIL <mailer> ... instead
   };
   struct KeyState {
     int64_t rows = 0;
@@ -134,7 +154,9 @@ class CellEngine {
     std::map<uint64_t, std::pair<std::string, std::pair<size_t, bool>>> inflight;   // id -> key, (bit, rise)
   };
   struct Job {
-    std::string set, key, what, sql, target, notify;
+    std::string set, key, what, sql, target, notify, notify_body;
+    std::vector<std::string> notify_headers;
+    MailAct mail;
     size_t bit = 0;
     bool rise = true;
     uint64_t id = 0;   // its inflight entry
@@ -150,6 +172,11 @@ class CellEngine {
   void queue_edges(Set& s, const std::string& key, KeyState& k);
   bool run_job(const Job& j, std::string* err);
   bool post_edge(const Job& j, std::string* err);
+  bool check_templates(const Set& s, std::string* err);
+  bool send_mail(const Job& j, std::string* err);
+  void edge_values(const Job& j, std::string* body, std::map<std::string, std::string>* vars);
+  SqlQueryResult secret_statement(const std::string& sql);
+  SqlQueryResult mailer_statement(const std::string& sql);
   void worker_loop();
   size_t bytes_of(const Set& s) const;
   std::string cells_dir() const;
@@ -157,6 +184,8 @@ class CellEngine {
   SqlQueryResult show(const std::string& sql);
 
   SqlDatabase& db_;
+  std::unique_ptr<SecretStore> secrets_;
+  std::unique_ptr<MailerStore> mailers_;
   mutable aios::hal::Mutex mu_;
   std::map<std::string, std::unique_ptr<Set>> sets_;
   std::unordered_set<std::string> watched_;   // "db.table" lower case

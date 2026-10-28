@@ -427,6 +427,8 @@ When `CDC_HOST`, `CDC_DB`, and `CDC_TABLES` are configured, ASQL automatically c
 - `CREATE PROCEDURE`, `CREATE FUNCTION`, `CREATE TRIGGER` (`BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE`), `CREATE EVENT`.
 - Control flow: `IF`, `CASE`, `WHILE`, `REPEAT`, `LOOP`, `LEAVE`, `ITERATE`, `DECLARE CURSOR`, `DECLARE HANDLER`, `SIGNAL SQLSTATE`.
 - Routines persist across restarts in `<root>/programs.db`.
+- `CREATE SECRET name AS '...'` seals a value (AES-256-GCM); a Cells `NOTIFY 'https://...' HEADER ... BODY '...{{secret:name}}...'` uses it at send time, for example to post a Telegram message when a row arrives. See [docs/asql.md](docs/asql.md#secrets).
+- `CREATE MAILER name OAUTH 'google' ACCOUNT '...'` and a Cells `ON RISE bit MAIL name TO '...' SUBJECT '...' BODY '...'` send email through AIOS's own SMTP client, signed in with the machine's Google OAuth sign-in. See [docs/asql.md](docs/asql.md#mailers).
 
 ---
 
