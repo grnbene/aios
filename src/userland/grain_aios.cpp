@@ -375,7 +375,28 @@ Value bi_db_query(Vm&, std::vector<Value>& args, std::string& error) {
     return Value::nil();
   }
 
+  // db_query(db, sql, params?, options?), as grain's own (grain_std_db.cpp): `?` bound from a list, and
+  // {rows: false} / {records: false} to build only one shape
+  const Value* params = args.size() > 2 ? &args[2] : nullptr;
+  const Value* options = args.size() > 3 ? &args[3] : nullptr;
+  if (params && params->type == Type::Map && !options) { options = params; params = nullptr; }
+  if (params && params->type == Type::Nil) params = nullptr;
+  if (params && params->type != Type::List) { error = std::string("db_query() wants its parameters as a list, got a ") + type_name(params->type); return Value::nil(); }
+  bool want_rows = true, want_records = true;
+  if (options && options->type != Type::Nil) {
+    if (options->type != Type::Map) { error = std::string("db_query() wants its options as a map, got a ") + type_name(options->type); return Value::nil(); }
+    for (const auto& kv : static_cast<MapObj*>(options->obj.get())->entries) {
+      if (kv.first == "rows") want_rows = kv.second.truthy();
+      else if (kv.first == "records") want_records = kv.second.truthy();
+      else { error = "db_query(): unknown option \"" + kv.first + "\" (rows, records)"; return Value::nil(); }
+    }
+  }
   std::string sql = args[1].to_text();
+  if (params) {
+    std::string bound;
+    if (!bind_params(sql, params->list_items(), bound, error)) { error = "db_query(): " + error; return Value::nil(); }
+    sql = std::move(bound);
+  }
   auto q_res = session->query(sql);
 
   auto out = std::make_shared<MapObj>();
@@ -385,6 +406,7 @@ Value bi_db_query(Vm&, std::vector<Value>& args, std::string& error) {
     out->put("columns", Value::list({}));
     out->put("column_types", Value::list({}));
     out->put("rows", Value::list({}));
+    out->put("records", Value::list({}));
     out->put("affected_rows", Value::integer(0));
     out->put("last_insert_id", Value::integer(0));
     out->put("message", Value::string(""));
@@ -407,19 +429,20 @@ Value bi_db_query(Vm&, std::vector<Value>& args, std::string& error) {
   out->put("columns", Value::list(cols));
   out->put("column_types", Value::list(col_types));
 
-  std::vector<Value> rows;
+  std::vector<Value> rows, records;
   for (const auto& r : mres.rows) {
     std::vector<Value> row_cells;
-    for (const auto& cell : r) {
-      if (cell.is_null) {
-        row_cells.push_back(Value::nil());
-      } else {
-        row_cells.push_back(Value::string(cell.bytes));
-      }
+    auto rec = want_records ? std::make_shared<MapObj>() : nullptr;
+    for (size_t c = 0; c < r.size(); ++c) {
+      const Value v = r[c].is_null ? Value::nil() : Value::string(r[c].bytes);
+      if (want_rows) row_cells.push_back(v);
+      if (rec && c < mres.columns.size()) rec->put(mres.columns[c].name, v);
     }
-    rows.push_back(Value::list(row_cells));
+    if (want_rows) rows.push_back(Value::list(row_cells));
+    if (rec) records.push_back(Value::object(Type::Map, rec));
   }
   out->put("rows", Value::list(rows));
+  out->put("records", Value::list(records));
   return Value::object(Type::Map, out);
 }
 
@@ -735,7 +758,7 @@ void install_aios_builtins(Vm& vm) {
   vm.define_native("sidecar_cap_attenuate", 2, 2, bi_sidecar_cap_attenuate);
   vm.define_native("sidecar_patch_check", 1, 1, bi_sidecar_patch_check);
   vm.define_native("db_connect", 1, 5, bi_db_connect);
-  vm.define_native("db_query", 2, 2, bi_db_query);
+  vm.define_native("db_query", 2, 4, bi_db_query);
   vm.define_native("db_select_db", 2, 2, bi_db_select_db);
   vm.define_native("db_ping", 1, 1, bi_db_ping);
   vm.define_native("db_close", 1, 1, bi_db_close);

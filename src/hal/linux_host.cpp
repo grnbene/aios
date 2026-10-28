@@ -35,6 +35,7 @@
 #include <dirent.h>
 #include <algorithm>
 #include <dlfcn.h>
+#include <link.h>
 #include <time.h>
 #include <cerrno>
 #include <cstring>
@@ -787,10 +788,40 @@ std::unique_ptr<Host> make_host() { return std::make_unique<LinuxHost>(); }
 void host_note(const std::string& text) { std::fputs(text.c_str(), stderr); std::fflush(stderr); }
 double parse_double(const char* s, char** end) { return std::strtod(s, end); }
 
-void* load_library(const std::string& name) { return dlopen(name.c_str(), RTLD_NOW | RTLD_LOCAL); }
+namespace {
+// Whether this program is statically linked: its own program headers name no dynamic loader (PT_INTERP). A static
+// glibc program cannot load a host library safely - the library brings a second libc (the OpenCL loader crashed
+// in clGetPlatformIDs at start), and what it needs from libc or libm is not exported to it (a mind plugin:
+// "undefined symbol: log2") - so such a build loads none.
+bool statically_linked() {
+  static const bool s = [] {
+    bool interp = false;
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) {
+      for (int i = 0; i < info->dlpi_phnum; ++i)
+        if (info->dlpi_phdr[i].p_type == PT_INTERP) *static_cast<bool*>(data) = true;
+      return 1;   // the first object is the program itself
+    }, &interp);
+    return !interp;
+  }();
+  return s;
+}
+thread_local std::string tls_library_error;
+}  // namespace
+
+void* load_library(const std::string& name) {
+  if (statically_linked()) {
+    tls_library_error = name + ": this aios is statically linked, and a static program cannot load host libraries "
+                        "(accelerators, mind plugins); a dynamically linked build can";
+    return nullptr;
+  }
+  tls_library_error.clear();
+  void* h = dlopen(name.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (!h) { const char* e = dlerror(); tls_library_error = e ? e : name + ": not loaded"; }
+  return h;
+}
 void* library_symbol(void* handle, const std::string& symbol) { return handle ? dlsym(handle, symbol.c_str()) : nullptr; }
 void unload_library(void* handle) { if (handle) dlclose(handle); }
-std::string library_error() { const char* e = dlerror(); return e ? e : ""; }
+std::string library_error() { return tls_library_error; }
 
 namespace {
 // The hosted build's instruments. Same contract as the bare-metal provider in

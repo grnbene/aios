@@ -359,11 +359,15 @@ std::string dev_str(cl_device_id d, cl_device_info what) {
 
 AcceleratorReport register_opencl_devices(DeviceFabric& devices, MemoryFabric& memory, hal::Host& host, IdGenerator& ids) {
   AcceleratorReport rep;
-  // A statically linked build cannot safely dlopen (static glibc); AIOS_NO_ACCEL
-  // lets such a build skip accelerator discovery entirely.
+  // AIOS_NO_ACCEL skips accelerator discovery entirely. A statically linked build skips it by itself: it cannot
+  // load the host's OpenCL runtime (hal::load_library says why).
   if (const char* e = getenv("AIOS_NO_ACCEL"); e && e[0] && e[0] != '0') { rep.note = "accelerators disabled (AIOS_NO_ACCEL)"; return rep; }
   if (const char* e = getenv("AIOS_NO_OPENCL"); e && e[0] && e[0] != '0') { rep.note = "OpenCL disabled (AIOS_NO_OPENCL)"; return rep; }
-  if (!cl().load()) { rep.note = "no OpenCL runtime on this host"; return rep; }
+  if (!cl().load()) {
+    const std::string why = hal::library_error();
+    rep.note = why.find("statically linked") != std::string::npos ? "OpenCL not loaded: " + why : "no OpenCL runtime on this host";
+    return rep;
+  }
   cl_uint np = 0;
   if (cl().GetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) { rep.note = "OpenCL runtime present, no platforms"; return rep; }
   std::vector<cl_platform_id> plats(np);

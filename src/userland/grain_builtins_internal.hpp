@@ -80,6 +80,9 @@ struct MarkupHooks {
 // db_connect(cfg): one map {host, port, user, password, db (or database)} in place of the five arguments - rewrites
 // `args` to them (both db_connect builtins call it first). false, with error, when the map is not one.
 bool db_connect_args(std::vector<Value>& args, std::string& error);
+// db_query's `?` binding: each ? outside quotes and comments replaced by the next parameter as a SQL literal
+// (grain_std_db.cpp; aios's db_query uses it too, so both bind alike).
+bool bind_params(const std::string& sql, const std::vector<Value>& params, std::string& out, std::string& error);
 
 // An element or html_raw node (a map with a string "tag", or only "raw"), not a ui.* widget.
 bool is_markup_node(const Value& v);
