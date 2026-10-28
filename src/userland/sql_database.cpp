@@ -982,6 +982,13 @@ struct SessionTxn {
     size_t undo_size = 0;   // where this frame's row changes start in `undo`
   };
   std::vector<Frame> frames;
+  // Change notices for the Things (and cells, active data) written in this transaction, held until COMMIT and
+  // dropped at ROLLBACK: a Thing reacts only to what was committed. Before this a Thing showed a transaction's
+  // rows to every session while it was open, and a WHEN .. DO acted on a change that was then rolled back.
+  // Past AIOS_THING_HOLD_ROWS (100,000) rows the rows are let go and each touched table is re-read whole at COMMIT.
+  struct HeldNotice { std::string key; bool has_before = false, has_after = false; SqlRow before, after; size_t row = 0; };
+  std::vector<HeldNotice> held;
+  std::set<std::string> held_reset;   // tables to re-read whole at COMMIT (reset in the transaction, or too many rows)
 };
 thread_local SessionTxn tls_txn;
 // Write-behind statements of this session's open transaction, held until its
@@ -23789,15 +23796,57 @@ bool SqlDatabase::things_watch(const SqlTable& t) const {
 }
 
 void SqlDatabase::notify_row_change(const SqlTable& t, const SqlRow* before, const SqlRow* after, size_t row) {
+  if (tls_txn.open) {   // held for COMMIT (see SessionTxn::held)
+    const std::string key = make_table_key(t.database, t.name);
+    if (tls_txn.held_reset.count(key)) return;   // re-read whole at COMMIT anyway
+    static const size_t cap = [] {
+      const char* e = std::getenv("AIOS_THING_HOLD_ROWS");
+      return e && *e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)100000;
+    }();
+    if (tls_txn.held.size() >= cap) {
+      for (const auto& h : tls_txn.held) tls_txn.held_reset.insert(h.key);
+      tls_txn.held.clear();
+      tls_txn.held.shrink_to_fit();
+      tls_txn.held_reset.insert(key);
+      return;
+    }
+    SessionTxn::HeldNotice h;
+    h.key = key;
+    h.row = row;
+    if (before) { h.has_before = true; h.before = *before; }
+    if (after) { h.has_after = true; h.after = *after; }
+    tls_txn.held.push_back(std::move(h));
+    return;
+  }
   if (things_) things_->on_row_change(t, before, after);
   if (cells_) cells_->on_row_change(t, before, after);
   if (active_data_) active_data_->on_row_change(t, before, after, row);
 }
 
 void SqlDatabase::notify_table_reset(const SqlTable& t) {
+  if (tls_txn.open) { tls_txn.held_reset.insert(make_table_key(t.database, t.name)); return; }
   if (things_) things_->on_table_reset(t);
   if (cells_) cells_->on_table_reset(t);
   if (active_data_) active_data_->on_table_reset(t);
+}
+
+// COMMIT: the transaction's held notices, delivered in the order they were written (the transaction is closed
+// first, so they go through rather than being held again). A table dropped since has nothing to tell.
+void SqlDatabase::deliver_held_notices() {
+  auto held = std::move(tls_txn.held);
+  auto reset = std::move(tls_txn.held_reset);
+  tls_txn.held.clear();
+  tls_txn.held_reset.clear();
+  for (const auto& h : held) {
+    if (reset.count(h.key)) continue;
+    auto it = tables_.find(h.key);
+    if (it == tables_.end()) continue;
+    notify_row_change(it->second, h.has_before ? &h.before : nullptr, h.has_after ? &h.after : nullptr, h.row);
+  }
+  for (const auto& key : reset) {
+    auto it = tables_.find(key);
+    if (it != tables_.end()) notify_table_reset(it->second);
+  }
 }
 
 void SqlDatabase::things_settle() {
@@ -28064,6 +28113,8 @@ SqlQueryResult SqlDatabase::execute_transaction(const std::string& verb) {
     tls_txn.appended.clear();
     tls_txn.redo.clear();
     tls_txn.undo.clear();
+    tls_txn.held.clear();
+    tls_txn.held_reset.clear();
     g_undo_db = this;
     tls_txn.open = true;
     tls_txn.read_only = g_begin_read_only;
@@ -28074,6 +28125,8 @@ SqlQueryResult SqlDatabase::execute_transaction(const std::string& verb) {
 
   auto release = [&]() {
     tls_txn.open = false;
+    tls_txn.held.clear();          // a ROLLBACK's: never told
+    tls_txn.held_reset.clear();
     tls_txn.frames.clear();
     tls_txn.snapshot.clear();
     tls_txn.appended.clear();
@@ -28103,6 +28156,7 @@ SqlQueryResult SqlDatabase::execute_transaction(const std::string& verb) {
     auto buffered = tls_txn.redo;
     tls_txn.open = false;
     append_redo_batch(buffered);
+    deliver_held_notices();   // the Things learn of it now that it is committed
     release();
     checkpoint();
     res.formatted_table = "Committed.";

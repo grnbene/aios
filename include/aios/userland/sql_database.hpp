@@ -2349,6 +2349,8 @@ class SqlDatabase {
   void notify_row_change(const SqlTable& t, const SqlRow* before, const SqlRow* after, size_t row = (size_t)-1);
   void active_data_tick();
   void notify_table_reset(const SqlTable& t);
+  // COMMIT: the change notices this session's transaction held back (SessionTxn::held), delivered.
+  void deliver_held_notices();
   void things_settle();
   void things_tick();
   bool things_watch(const SqlTable& t) const;
