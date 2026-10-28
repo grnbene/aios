@@ -430,14 +430,22 @@ grain::Value gb_claims(grain::Vm&, std::vector<grain::Value>& args, std::string&
 
 // The shortest text that reads back as the same double (what ASQL and PHP's
 // json_encode both print).
+// The shortest text that reads back as the same double, in plain notation where a person would write it so: 10
+// is "10", not "1e+01" (the shortest %g for it), and 0.25 is "0.25". Exponents only past 1e15 or under 1e-5.
 std::string real_text(double d) {
   if (std::isnan(d)) return "NaN";
   if (std::isinf(d)) return d > 0 ? "INF" : "-INF";
-  char b[40];
+  char b[64];
+  const double a = std::fabs(d);
+  const bool plain = a == 0 || (a < 1e15 && a >= 1e-5);
+  if (plain && d == std::trunc(d)) { std::snprintf(b, sizeof b, "%.0f", d); return b; }
   for (int p = 1; p <= 17; ++p) {
     std::snprintf(b, sizeof b, "%.*g", p, d);
-    if (std::strtod(b, nullptr) == d) return b;
+    if (std::strtod(b, nullptr) != d) continue;
+    if (plain && std::strchr(b, 'e') != nullptr) continue;   // the same digits, but a person would not write it so
+    return b;
   }
+  std::snprintf(b, sizeof b, "%.17g", d);
   return b;
 }
 
@@ -2656,6 +2664,20 @@ SqlQueryResult ThingEngine::show(const std::string& name) {
     if (k.type == Kind::Resource) return show_resource(k);
     if (k.type == Kind::Claims) return show_claims(k);
     if (k.type == Kind::Grain || k.type == Kind::Mirror) return show_grain(k);
+    if (k.type == Kind::Event) {
+      // A Thing that acts once is one row: when, where it stands, what it may touch. (It had no branch here and fell
+      // into the query kinds' rows, reading an item it does not have: SHOW THING of an event crashed the engine.)
+      std::string reads, writes;
+      for (const auto& r : k.reads) reads += (reads.empty() ? "" : ", ") + r;
+      for (const auto& w : k.writes) writes += (writes.empty() ? "" : ", ") + w;
+      res.columns = {"thing", "at", "state", "error", "reads", "writes", "target", "params", "declared"};
+      res.rows.push_back(SqlRow{{k.name, k.at, k.paused ? std::string("paused (") + k.state + ")" : k.state,
+                                 k.fire_error.empty() ? sql_null() : k.fire_error, reads, writes,
+                                 k.write_target.empty() ? std::string("ASQL") : k.write_target,
+                                 k.params_json.empty() ? sql_null() : k.params_json, wall_text(k.created_ns)}});
+      if (!sql_wire_results()) res.formatted_table = db_.format_result_table(res.columns, res.rows);
+      return res;
+    }
     res.columns.push_back(k.items[0].label);
     const bool labelled = k.row_mode && !k.out_labels.empty();
     if (labelled) for (const auto& l : k.out_labels) res.columns.push_back(l);

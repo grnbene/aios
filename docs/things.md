@@ -222,11 +222,12 @@ The Things in this guide are made by a query. The same engine has other kinds, f
   keeping each side's values, settling the fields they disagree on, and checking the picks are consistent. See
   [asql.md - Conflicts](asql.md#conflicts-source-by-keeps-both-sides) and
   [Settling conflicts together](asql.md#settling-conflicts-together-and-checking-the-picks).
-- **Resources and claims** (`RESOURCE`, `CLAIMS`): stock that orders claim, with the shares allocated again as
-  either side changes (`SHOW THING ALLOCATION`). Only named in [asql.md](asql.md#things) so far; the syntax is in the
-  error messages of `sql_things.cpp`.
-- **Event Things** (`CREATE THING <name> AT '<time>' GRAIN ...`): a program that runs once at its time, writes what
-  it was given leave to (`AIOS_THING_WRITES=1`), and leaves a receipt. Also only named in asql.md so far.
+- **Resources and claims** (`RESOURCE`, `CLAIMS`): stock that orders claim, shared out again as either side
+  changes - first come first served, or so that the most orders are complete (`ALLOCATE READY`). See
+  [asql.md - Resources and claims](asql.md#resources-and-claims-allocating-stock-to-orders).
+- **Event Things** (`CREATE THING <name> AT '<time>' GRAIN ...`): a planned piece of work - a midnight price change -
+  that runs once at its time, writes only what it was given leave to (`AIOS_THING_WRITES=1`), and leaves a receipt.
+  See [asql.md - Event Things](asql.md#event-things-a-program-that-runs-once-at-a-set-time).
 - **Mirrors** (`CREATE THING <name> MIRROR <kind> ON <machine>`): another machine's Things, followed over the fleet,
   with history and alerts of their own here. See [fleet.md - Mirrors](fleet.md#mirrors-things-about-another-machine).
 
