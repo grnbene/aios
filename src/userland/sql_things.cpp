@@ -3341,6 +3341,180 @@ SqlQueryResult ThingEngine::explain(const std::string& sql) {
   return r;
 }
 
+SqlQueryResult ThingEngine::what_if(const std::vector<Notice>& notices, const std::vector<const SqlTable*>& resets) {
+  // What one Thing of a kind the writes reach needs for the comparison, copied under the lock: the queries are run
+  // after it is let go (they read the transaction's uncommitted rows, and must not wait on a writer holding it).
+  struct Was { std::vector<std::string> vals; bool acted = false; };
+  struct Plan {
+    Kind q;                                   // the kind's query, labels and act - no Things
+    bool full = false;                        // a table it reads whole was written: every key
+    std::set<std::string> parts;              // the partitions written
+    std::map<std::string, Was> was;           // the keys at stake, as they are (or every key, when full)
+  };
+  std::map<std::string, Plan> plans;
+  std::set<std::string> grain_hit;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    MuHeld held;
+    auto reach = [&](Kind& k, const SqlTable& t, const SqlRow* before, const SqlRow* after, bool reset) {
+      const std::string key = table_key(t);
+      if (k.type == Kind::Grain) {
+        if (std::find(k.reads.begin(), k.reads.end(), lower(t.name)) != k.reads.end() && lower(t.database) == lower(k.db)) grain_hit.insert(k.name);
+        return;
+      }
+      if (k.type != Kind::Aggregate || k.building) return;
+      const bool by_part = k.deps_partition.count(key) != 0, whole = k.deps_full.count(key) != 0;
+      if (!by_part && !whole) return;
+      Plan& p = plans[k.name];
+      if (whole || reset) { p.full = true; return; }
+      const int c = t.get_column_index(k.part_col);
+      if (c < 0) { p.full = true; return; }
+      for (const SqlRow* r : {before, after})
+        if (r && (size_t)c < r->values.size() && !sql_is_null(r->values[(size_t)c])) p.parts.insert(canon(r->values[(size_t)c]));
+    };
+    for (auto& kv : kinds_) {
+      for (const auto& n : notices) reach(kv.second, *n.table, n.before, n.after, false);
+      for (const SqlTable* t : resets) reach(kv.second, *t, nullptr, nullptr, true);
+    }
+    for (auto& pv : plans) {
+      const Kind& k = kinds_.at(pv.first);
+      Plan& p = pv.second;
+      p.q.name = k.name; p.q.db = k.db; p.q.type = k.type; p.q.row_mode = k.row_mode; p.q.items = k.items;
+      p.q.out_labels = k.out_labels; p.q.source = k.source; p.q.where_text = k.where_text; p.q.group_text = k.group_text;
+      p.q.part_expr = k.part_expr; p.q.part_col = k.part_col; p.q.when_expr = k.when_expr; p.q.do_sql = k.do_sql;
+      p.q.do_target = k.do_target; p.q.do_shadow = k.do_shadow;
+      auto keep = [&](const std::string& ik) {
+        auto it = k.things.find(ik);
+        if (it == k.things.end() || p.was.count(ik)) return;
+        p.was[ik] = Was{value_row(k, it->second), it->second.acted};
+      };
+      if (p.full) for (const auto& tk : k.things) keep(tk.first);
+      else
+        for (const auto& part : p.parts) {
+          auto pit = k.parts.find(part);
+          if (pit == k.parts.end()) continue;
+          for (const Partial& pr : pit->second) keep(pr.key_null ? std::string(kNullKey) : pr.key);
+        }
+    }
+  }
+  auto lit = [](const std::string& v) { return all_digits(v) ? v : sql_lit(v); };
+  // the same value: the same text, or the same exact decimal written differently (15.25 and 15.250)
+  auto same = [](const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    ThingDec x, y;
+    if (sql_is_null(a) || sql_is_null(b) || !parse_dec(a, &x) || !parse_dec(b, &y)) return false;
+    const int s = std::max(x.scale, y.scale);
+    return dec_text(x, s) == dec_text(y, s);
+  };
+  SqlQueryResult res;
+  res.is_result_set = true;
+  res.columns = {"thing", "key", "change", "before", "after", "act"};
+  for (auto& pv : plans) {
+    Plan& p = pv.second;
+    const Kind& k = p.q;
+    // the keys the write would bring into the partitions written (found inside the transaction)
+    std::set<std::string> keys;
+    for (const auto& w : p.was) keys.insert(w.first);
+    if (!p.full && !p.parts.empty()) {
+      SqlQueryResult r = db_.execute_local_query(partition_sql(k, std::vector<std::string>(p.parts.begin(), p.parts.end())), k.db);
+      if (!r.success) return error_result("WHAT IF: " + k.name + ": " + r.error_message);
+      for (const SqlRow& row : r.rows) if (row.values.size() > 1) keys.insert(sql_is_null(row.values[1]) ? std::string(kNullKey) : row.values[1]);
+    }
+    if (!p.full && keys.empty()) continue;
+    // a key the write reaches can be a Thing already through other partitions (a warehouse's other orders): its
+    // values now, from the Thing
+    {
+      std::lock_guard<aios::hal::Mutex> lk(mu_);
+      MuHeld held;
+      auto kit = kinds_.find(pv.first);
+      if (kit != kinds_.end())
+        for (const auto& key : keys) {
+          if (p.was.count(key)) continue;
+          auto it = kit->second.things.find(key);
+          if (it != kit->second.things.end()) p.was[key] = Was{value_row(kit->second, it->second), it->second.acted};
+        }
+    }
+    // each key's values with the write applied: the Thing's own query, for those keys
+    std::string items;
+    for (size_t i = 0; i < k.items.size(); ++i) items += (i ? ", " : "") + k.items[i].text;
+    std::string sql = "SELECT " + items + " FROM " + k.source;
+    std::string cond = k.where_text.empty() ? std::string() : "(" + k.where_text + ")";
+    if (!p.full) {
+      std::string in_list;
+      bool null_key = false;
+      for (const auto& key : keys) {
+        if (key == kNullKey) { null_key = true; continue; }
+        in_list += (in_list.empty() ? "" : ", ") + lit(key);
+      }
+      Scan is(k.items[0].text);
+      const size_t ap = is.find_kw("AS");
+      const std::string kx = ap == std::string::npos ? trim(k.items[0].text) : trim(k.items[0].text.substr(0, ap));
+      std::string kc;
+      if (!in_list.empty()) kc = "(" + kx + ") IN (" + in_list + ")";
+      if (null_key) kc += std::string(kc.empty() ? "" : " OR ") + "(" + kx + ") IS NULL";
+      cond += std::string(cond.empty() ? "" : " AND ") + "(" + kc + ")";
+    }
+    if (!cond.empty()) sql += " WHERE " + cond;
+    sql += " GROUP BY " + k.group_text;
+    SqlQueryResult r = db_.execute_local_query(sql, k.db);
+    if (!r.success) return error_result("WHAT IF: " + k.name + ": " + r.error_message);
+    const std::vector<std::string> labels = value_labels(k);
+    std::map<std::string, std::vector<std::string>> now;
+    for (const SqlRow& row : r.rows) {
+      if (row.values.empty()) continue;
+      now[sql_is_null(row.values[0]) ? std::string(kNullKey) : row.values[0]] = row.values;
+    }
+    std::set<std::string> all = keys;
+    for (const auto& n : now) all.insert(n.first);
+    std::vector<std::string> order(all.begin(), all.end());
+    std::stable_sort(order.begin(), order.end(), key_before);
+    for (const std::string& key : order) {
+      auto w = p.was.find(key);
+      auto n = now.find(key);
+      const bool had = w != p.was.end(), has = n != now.end();
+      if (!had && !has) continue;
+      std::string before, after;
+      auto field = [&](size_t i, const std::vector<std::string>& v) {
+        return (i < labels.size() ? labels[i] : std::to_string(i)) + "=" + (i < v.size() ? (sql_is_null(v[i]) ? std::string("NULL") : v[i]) : std::string("NULL"));
+      };
+      for (size_t i = 1; i < labels.size(); ++i) {
+        const std::string b = had && i < w->second.vals.size() ? w->second.vals[i] : sql_null();
+        const std::string a = has && i < n->second.size() ? n->second[i] : sql_null();
+        if (had && has && same(a, b)) continue;
+        if (had) before += (before.empty() ? "" : " | ") + field(i, w->second.vals);
+        if (has) after += (after.empty() ? "" : " | ") + field(i, n->second);
+      }
+      if (had && has && before.empty() && after.empty()) continue;
+      std::string act;
+      if (!k.do_sql.empty() && has) {
+        Instance in;
+        in.key_null = key == kNullKey;
+        in.key = in.key_null ? std::string() : key;
+        in.row.assign(n->second.begin() + 1, n->second.end());
+        bool holds = false;
+        std::string err;
+        if (!condition_holds(k, in, &holds, &err)) act = "WHEN cannot be read: " + err;
+        else if (holds && !(had && w->second.acted)) {
+          std::vector<std::string> stmts;
+          if (!act_statements(k, in, &stmts, &err)) act = "would act, but: " + err;
+          else {
+            std::string text;
+            for (const auto& s : stmts) text += (text.empty() ? "" : "; ") + s;
+            act = "would act: " + text + " TO " + k.do_target + (k.do_shadow ? " (shadow: recorded only)" : "");
+          }
+        } else if (!holds && had && w->second.acted) {
+          act = "would re-arm";
+        }
+      }
+      res.rows.push_back(SqlRow{{k.name, key == kNullKey ? sql_null() : key, !had ? "new" : !has ? "gone" : "changed", before, after, act}});
+    }
+  }
+  for (const auto& g : grain_hit)
+    res.rows.push_back(SqlRow{{g, "", "would re-run", "", "", "(a grain Thing: its values come from its program, not previewed)"}});
+  if (!sql_wire_results()) res.formatted_table = db_.format_result_table(res.columns, res.rows);
+  return res;
+}
+
 SqlQueryResult ThingEngine::show_history(const std::string& name, const std::string& key) {
   auto it = kinds_.find(lower(name));
   if (it == kinds_.end()) return error_result("no Thing kind named " + name);

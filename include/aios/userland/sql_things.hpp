@@ -147,6 +147,12 @@ class ThingEngine {
   // A watched table emptied or replaced wholesale.
   void on_table_reset(const SqlTable& t);
 
+  // WHAT IF (docs/design/thing-what-if.md): what these row changes, still uncommitted in the caller's open
+  // transaction, would do to each Thing - nothing is changed. Called by SqlDatabase::execute_what_if, which rolls
+  // the transaction back afterwards.
+  struct Notice { const SqlTable* table; const SqlRow* before; const SqlRow* after; };
+  SqlQueryResult what_if(const std::vector<Notice>& notices, const std::vector<const SqlTable*>& resets);
+
   // Run the reactions pending notices call for. The caller holds the
   // statement lock exclusively (SqlDatabase::things_settle).
   void settle();
