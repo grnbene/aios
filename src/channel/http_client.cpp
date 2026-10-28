@@ -191,6 +191,9 @@ Result<HttpEndpoint> parse_endpoint(const std::string& url) {
 
 Result<HttpResponse> http_send(const HttpRequest& request) { return http_send_noted(request, nullptr); }
 
+// The transport over hal::net and TLS. A browser build has neither: its transport is the page's own
+// (grain/wasm/http_browser.cpp), which defines this function there.
+#if !defined(__EMSCRIPTEN__)
 Result<HttpResponse> http_send_noted(const HttpRequest& request, HttpTransportNote* note) {
   const auto& ep = request.endpoint;
   std::unique_ptr<hal::Connection> conn_holder;
@@ -328,6 +331,7 @@ Result<HttpResponse> http_send_noted(const HttpRequest& request, HttpTransportNo
   if (conn_holder) conn_holder->close();
   return response;
 }
+#endif  // !__EMSCRIPTEN__
 
 Result<HttpResponse> http_get(const std::string& url, int timeout_ms) {
   auto ep = parse_endpoint(url);
