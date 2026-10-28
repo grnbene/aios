@@ -21,7 +21,12 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
+#if !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
+namespace { inline int native_stack(void** pc, int n) { return backtrace(pc, n); } }
+#else
+namespace { inline int native_stack(void**, int) { return 0; } }   // no machine stack to walk in WebAssembly
+#endif
 #include <map>
 #include <sys/time.h>
 #include <cmath>
@@ -826,7 +831,7 @@ void prof_tick(int) {
     const size_t at = ip > 0 ? ip - 1 : 0;
     ProfSample& ps = g_prof_buf[n];
     ps.line = at < c->lines.size() ? c->lines[at] : 0;
-    ps.depth = g_prof_native ? backtrace(ps.pc, 14) : 0;
+    ps.depth = g_prof_native ? native_stack(ps.pc, 14) : 0;
     g_prof_n = n + 1;
   }
 }

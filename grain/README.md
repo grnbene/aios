@@ -385,6 +385,24 @@ library. The cookie is `HttpOnly` and `SameSite=Strict`, text from the program
 is escaped, and an event must carry `X-Grain-UI: 1`, which a page on another
 site cannot add, so a link elsewhere cannot press your buttons.
 
+## In a browser (WebAssembly)
+
+The same VM, built with Emscripten, runs in a page or in Node. Status: the language and its portable standard
+library run and give what `grain` gives; the network and the databases are not in yet.
+
+```
+emcmake cmake -S grain -B build-grain-wasm -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-Oz -DNDEBUG"
+cmake --build build-grain-wasm --parallel
+node grain/wasm/test.mjs build-grain-wasm/grain_wasm.js          # the build, checked
+node grain/wasm/run.mjs  build-grain-wasm/grain_wasm.js prog.gr  # a program
+```
+
+One function, `grain_run(source, origin, step_limit)`, answers JSON: what the program printed and its value, or its
+compile or run error with the line (`grain/wasm/grain_wasm.cpp`). Files are the page's in-memory file system. The
+sources are `grain`'s own (`GRAIN_LANG_SOURCES`) without the JIT's code generation, processes, sockets, TLS, mail and
+the database drivers; `process_run` is there and says it is not available in a browser. The host layer for a page is
+`src/hal/wasm_host.cpp`. Still to come: `http_*` over `fetch`, a database over HTTP, and `ui.pane` drawn into a page.
+
 ## Going low-level
 
 Four layers, from the safest up. The standard library has the first; the
