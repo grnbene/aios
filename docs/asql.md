@@ -1550,6 +1550,40 @@ Send plain text: Telegram's `parse_mode` is off, so a `_` or `*` in a subject
 cannot break the message.
 
 
+### Production example: lead alerts on chi-il-1 (2026-10-28)
+
+The qbc.com site (`qbc.service`, `/var/www/qbc`) and its ASQL (`aios-compute.service`, `127.0.0.1:3307`, database
+`qbc`, root `/opt/aios/root-v8-full`, user `aios`) run on chi-il-1. The contact form inserts into `qbc.leads`; the
+site sends nothing itself. Two Cells rules on `leads` send the alerts:
+
+```
+CREATE SECRET tg_token AS '<bot token>';   CREATE SECRET tg_chat AS '<chat id>';
+CREATE MAILER qbcmail OAUTH 'google' ACCOUNT 'support@qbc.com' FROM_NAME 'QBC Systems';
+
+CREATE CELLS lead_alert ON qbc.leads KEY id (fresh BIT ALL status = 'new', who MIN(name), co MIN(company),
+  mail MIN(email), ph MIN(phone), prod MIN(product), msg MIN(message))
+  ON RISE fresh NOTIFY 'https://api.telegram.org/bot{{secret:tg_token}}/sendMessage'
+  BODY '{"chat_id":"{{secret:tg_chat}}","text":"New QBC Systems lead #{{key}}\nName: {{who}}\nCompany: {{co}}\n..."}';
+
+CREATE CELLS lead_mail ON qbc.leads KEY id (fresh BIT ALL status = 'new', who MIN(name), co MIN(company),
+  mail MIN(email), ph MIN(phone), prod MIN(product), msg MIN(message), at MIN(created_at))
+  ON RISE fresh MAIL qbcmail TO 'patrick@qbc.com' SUBJECT 'New QBC Systems lead #{{key}}: {{who}}'
+  BODY '...' HTML '...';
+```
+
+A real form submission fired both rules once each (`SHOW CELLS lead_alert ACTS` and `SHOW CELLS lead_mail ACTS`
+both `ok`). Operating notes:
+
+- Cells rules are not edited in place: to change a recipient, `DROP CELLS lead_mail` and create it again.
+- A bit that is on when the rule is created counts as acted on, so existing leads are not re-sent.
+- When ASQL is down, a submitted lead is kept by the site in memory and no alert is sent.
+- Upgrading the engine on chi-il-1: build on the host (`cmake --build ... --target aios-cli`, flags in
+  `packaging/build-portable.sh`, `nice` and `-j4` on a busy machine), run the new binary on a spare port and root
+  with a smoke test, keep the old binary as `/opt/aios/bin/aios.bak-<date>-<tag>`, swap with `mv`, and
+  `systemctl restart aios-compute`. ASQL answers again after about 20 seconds (2020 tables); secrets, mailers,
+  Cells and the CDC position (`sql_db/cdc_position`) come back as they were.
+- The Google sign-in for the mailer is described in [google-mail.md](google-mail.md#signing-in-on-a-server-sending-mail-from-asql).
+
 ### Worked example: DO ... TO a profile
 
 ```
