@@ -788,6 +788,7 @@ The other statements:
     SHOW THING <name> AS OF '<time>' [KEYS ('k', ...)]   an aggregate or row Thing as it stood then (see below)
     SET THING <name> KEEP <n> DAYS      how far back AS OF reaches (30 by default; 0 keeps none)
     EXPLAIN THING <name> '<key>' [LIMIT n]   the source rows that make up one Thing (see below)
+    WHAT IF <statement>                 what a write would do to the Things, without doing it (see below)
     SET THING <name> SHADOW | LIVE      hold a Thing's act back, or let it write
     SHOW THING <name> KEYS ('k', ...)   only those Things of a grain kind, in the order asked (collation match)
     SHOW THING <name> JSON [SINCE n]    one JSON document per Thing; SINCE = only newer stamps (+ keys that left)
@@ -848,6 +849,24 @@ plain `SUM(x)`, `COUNT(*)`, `COUNT(x)`, `MIN(x)`, `MAX(x)` or `AVG(x)` (optional
 `thing.<label>` shows that row's share, so a `SUM`'s shares add up to the value. A value made some other way (`CASE`,
 `DISTINCT`, two aggregates combined) gets no share column; its rows are still listed. `NULL` (unquoted) is the NULL
 key. At most 1,000 rows unless `LIMIT n` says otherwise. Grain Things are not made by a query and are refused.
+
+### `WHAT IF`: a write's effect on the Things, before it is made
+
+`WHAT IF UPDATE prices SET price = price * 1.05 WHERE brand = 'acme'` runs the statement in a transaction of its own,
+works out what it would do to every Thing, and rolls the transaction back. Nothing is written: not the tables, not
+any Thing, its history or its `AS OF` log, not any act's target. One row per key that would change: the Thing, the
+key, `new` / `changed` / `gone`, the values before and after (only those that change), and for a Thing with
+`WHEN .. DO` either `would act: <the statements, values filled in> TO <profile>` or `would re-arm`. A grain Thing that
+reads a written table is listed as `would re-run`: its values come from its program and are not previewed.
+
+Several statements go in one string: `WHAT IF 'UPDATE ...; INSERT ...'` (a `'` inside is written `''`). Write them
+that way in the mysql command-line client in particular: it splits what you type on `;` before sending it, so in
+`WHAT IF UPDATE a ...; UPDATE b ...` it previews the first and **runs the second**. A program that sends the whole
+text as one query can use the bare form; the engine keeps everything after `WHAT IF` inside the preview.
+
+`WHAT IF` is refused inside an open transaction, and a statement in it that fails stops it with that error (the
+rest is rolled back too). `PART` sub-queries are not compared. A write to a table a Thing reads whole, not by its
+partition column, previews every key of that Thing. Design: [design/thing-what-if.md](design/thing-what-if.md).
 
 ### `WAIT THING`: told when a Thing changes
 

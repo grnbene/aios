@@ -432,6 +432,9 @@ std::vector<std::string> split_statements(const std::string& q) {
       if (head.size() < 8) {
         head.push_back(w);
         if (head[0] == "CREATE" && (w == "PROCEDURE" || w == "FUNCTION" || w == "TRIGGER" || w == "EVENT")) compound = true;
+        // WHAT IF <statement>; <statement> ...: the rest of the text is what it previews. Split here, a statement
+        // after the first would run for real.
+        if (head.size() == 2 && head[0] == "WHAT" && head[1] == "IF") { out.push_back(q.substr(start)); return out; }
       }
       if (compound) {
         size_t k = e;

@@ -24695,6 +24695,16 @@ static bool starts_user_var_set(const std::string& q) {
 }
 
 // BEGIN / START TRANSACTION, after any leading whitespace and comments.
+// WHAT IF <statements>: it opens a transaction of its own (and always rolls it back).
+static bool starts_what_if(const std::string& sql) {
+  size_t i = 0;
+  while (i < sql.size() && std::isspace((unsigned char)sql[i])) ++i;
+  if (sql.size() - i < 7 || strncasecmp(sql.c_str() + i, "WHAT", 4) != 0 || !std::isspace((unsigned char)sql[i + 4])) return false;
+  i += 4;
+  while (i < sql.size() && std::isspace((unsigned char)sql[i])) ++i;
+  return sql.size() - i >= 2 && strncasecmp(sql.c_str() + i, "IF", 2) == 0 && (sql.size() - i == 2 || std::isspace((unsigned char)sql[i + 2]));
+}
+
 static bool starts_transaction(const std::string& sql) {
   size_t i = 0;
   const size_t n = sql.size();
@@ -25262,7 +25272,8 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
       if (db && tls_txn.begin_prelocked) { tls_txn.begin_prelocked = false; db->writer_mu_.unlock(); }
     }
   } prelock;
-  if (begins && !tls_txn.open && !tls_txn.begin_prelocked) {
+  // WHAT IF's own transaction takes the writer lock the same way, before the statement lock
+  if ((begins || (g_rw_depth == 0 && starts_what_if(sql_query))) && !tls_txn.open && !tls_txn.begin_prelocked) {
     writer_mu_.lock();
     tls_txn.begin_prelocked = true;
     prelock.db = this;
@@ -25975,6 +25986,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
     if (!plain) {
       if (active_data_ && active_data_->handles(q)) return execute_local_query(q, session_db);
       if (things_ && things_->handles(q)) return execute_local_query(q, session_db);
+      if (starts_what_if(q)) return execute_local_query(q, session_db);   // WHAT IF: the Things, its writes rolled back
       if (cells_ && cells_->handles(q)) return execute_local_query(q, session_db);
       if (sql_is_sat(q)) return execute_local_query(q, session_db);
       if (sql_is_result_view(q)) return sql_run_result_view(*this, q, session_db);
@@ -26784,7 +26796,7 @@ SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, co
       if (db && tls_txn.begin_prelocked) { tls_txn.begin_prelocked = false; db->writer_mu_.unlock(); }
     }
   } prelock;
-  if (g_rw_depth == 0 && !tls_txn.open && !tls_txn.begin_prelocked && !txn_concurrent() && starts_transaction(sql_query)) {
+  if (g_rw_depth == 0 && !tls_txn.open && !tls_txn.begin_prelocked && !txn_concurrent() && (starts_transaction(sql_query) || starts_what_if(sql_query))) {
     writer_mu_.lock();
     tls_txn.begin_prelocked = true;
     prelock.db = this;
@@ -26863,6 +26875,8 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
     if (active_data_ && active_data_->handles(q)) return active_data_->execute(q);
     // CREATE / DROP / SHOW THING(S), REPLAY THING: the Things, never a table.
     if (things_ && things_->handles(q)) return things_->execute(q);
+    // WHAT IF <statements>: what they would do to the Things, the statements rolled back
+    if (starts_what_if(q)) return execute_what_if(q, session_db);
     // CREATE / DROP / SHOW CELLS: per-key bits and counts (sql_cells.hpp).
     if (cells_ && cells_->handles(q)) return cells_->execute(q);
     // CALL SAT: the solver, its answer verified before it is returned
@@ -28090,6 +28104,73 @@ SqlDatabase::StatementUndo::~StatementUndo() {
   if (at_ >= tls_txn.frames.size()) return;
   if (!done_) db_.frames_roll_back(at_);
   db_.frames_release(at_);
+}
+
+// WHAT IF <statement>[; ...] (docs/design/thing-what-if.md): the statements in a transaction of this one's own,
+// the Things' answer to them worked out from the transaction's held notices, and the transaction rolled back -
+// always, whatever happened. The Things never hear of it: their notices were held for a COMMIT that never comes.
+SqlQueryResult SqlDatabase::execute_what_if(const std::string& sql, const std::string& session_db) {
+  if (tls_txn.open)
+    return make_error("WHAT IF runs the statements in a transaction of its own and rolls it back: COMMIT or ROLLBACK the open one first");
+  if (!things_) return make_error("WHAT IF: this engine keeps no Things");
+  std::string body = trim(sql);
+  body = trim(body.substr(4));   // WHAT
+  body = trim(body.substr(2));   // IF
+  while (!body.empty() && body.back() == ';') body = trim(body.substr(0, body.size() - 1));
+  // WHAT IF '<statement>; <statement>': several statements in one string, for a client (the mysql command line)
+  // that splits a query on its ';'s before sending it - split there, the statements after the first would run
+  if (body.size() >= 2 && (body.front() == '\'' || body.front() == '"') && body.back() == body.front()) {
+    const char qc = body.front();
+    std::string inner;
+    for (size_t i = 1; i + 1 < body.size(); ++i) {
+      if (body[i] == qc && i + 2 < body.size() && body[i + 1] == qc) { inner += qc; ++i; continue; }   // '' -> '
+      if (body[i] == '\\' && i + 2 < body.size()) { inner += body[i]; inner += body[++i]; continue; }
+      inner += body[i];
+    }
+    body = inner;
+  }
+  // the statements: ';' outside quotes and comments ends one
+  std::vector<std::string> stmts;
+  {
+    std::string cur;
+    char quote = 0;
+    for (size_t i = 0; i < body.size(); ++i) {
+      const char c = body[i];
+      if (quote) { cur += c; if (c == '\\' && quote != '`' && i + 1 < body.size()) cur += body[++i]; else if (c == quote) quote = 0; continue; }
+      if (c == '\'' || c == '"' || c == '`') { quote = c; cur += c; continue; }
+      if (c == ';') { if (!trim(cur).empty()) stmts.push_back(trim(cur)); cur.clear(); continue; }
+      cur += c;
+    }
+    if (!trim(cur).empty()) stmts.push_back(trim(cur));
+  }
+  if (stmts.empty()) return make_error("WHAT IF <statement>[; <statement> ...]");
+  for (const auto& s : stmts)
+    if (starts_transaction(s) || commits_transaction(s) || starts_what_if(s) || upper_of(trim(s)).rfind("ROLLBACK", 0) == 0)
+      return make_error("WHAT IF: " + s + ": the statements run in its own transaction, which it rolls back; leave out BEGIN, COMMIT and ROLLBACK");
+  SqlQueryResult begun = execute_transaction("BEGIN");
+  if (!begun.success) return begun;
+  struct RollBack {
+    SqlDatabase* db;
+    ~RollBack() { if (tls_txn.open) (void)db->execute_transaction("ROLLBACK"); }
+  } roll_back{this};
+  for (const auto& s : stmts) {
+    SqlQueryResult r = execute_query(s, session_db);
+    if (!r.success) return make_error("WHAT IF: " + s + ": " + r.error_message + " (nothing was kept)");
+  }
+  // what the transaction would tell the Things at COMMIT
+  std::vector<ThingEngine::Notice> notices;
+  std::vector<const SqlTable*> resets;
+  for (const auto& h : tls_txn.held) {
+    auto it = tables_.find(h.key);
+    if (it == tables_.end()) continue;
+    notices.push_back(ThingEngine::Notice{&it->second, h.has_before ? &h.before : nullptr, h.has_after ? &h.after : nullptr});
+  }
+  for (const auto& key : tls_txn.held_reset) {
+    auto it = tables_.find(key);
+    if (it != tables_.end()) resets.push_back(&it->second);
+  }
+  SqlQueryResult res = things_->what_if(notices, resets);
+  return res;   // ~RollBack: the statements are taken back
 }
 
 SqlQueryResult SqlDatabase::execute_transaction(const std::string& verb) {

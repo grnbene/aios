@@ -3391,6 +3391,7 @@ class SqlDatabase {
   SqlQueryResult execute_describe(const std::string& sql);
   SqlQueryResult execute_explain(const std::string& sql);
   SqlQueryResult execute_transaction(const std::string& verb);
+  SqlQueryResult execute_what_if(const std::string& sql, const std::string& session_db);
   // CALL of a stored procedure this engine implements natively (the ERP's
   // getNextTransNo); and `SET @name = expr` for the connection's variables.
   SqlQueryResult execute_call(const std::string& sql);
