@@ -270,7 +270,14 @@ std::vector<std::string> imports_of(const std::string& src) {
   std::vector<std::string> out;
   size_t at = 0;
   while ((at = src.find("import", at)) != std::string::npos) {
-    const bool at_start = at == 0 || src[at - 1] == '\n' || src[at - 1] == ' ' || src[at - 1] == '\t' || src[at - 1] == ';';
+    bool at_start = at == 0 || src[at - 1] == '\n' || src[at - 1] == ' ' || src[at - 1] == '\t' || src[at - 1] == ';';
+    // Not inside a comment: the line's first non-blank characters are not `//` or `#`.
+    if (at_start) {
+      size_t ls = src.rfind('\n', at);
+      ls = ls == std::string::npos ? 0 : ls + 1;
+      while (ls < at && (src[ls] == ' ' || src[ls] == '\t')) ++ls;
+      if (src[ls] == '#' || (ls + 1 < src.size() && src[ls] == '/' && src[ls + 1] == '/')) at_start = false;
+    }
     size_t p = at + 6;
     while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) ++p;
     if (at_start && p < src.size() && src[p] == '"') {
