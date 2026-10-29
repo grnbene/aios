@@ -289,6 +289,13 @@ The table files become AQT8 at the first checkpoint, which the old binary refuse
 The stall fixes (commit 4589495) ride along: the hang-up watcher, the 10-minute read deadline
 (`AIOS_SQL_MAX_READ_MS` in the unit's environment to change it), lock-free `SHOW PROCESSLIST` and `SELECT 1`.
 
+**Where the key maps stand (measured 02:35, fresh load, after the warm-up)**: 289 MB for 8.8M keys, and they
+survive checkpoints. Of that, the 34 text-keyed tables (3.0M keys, slots at ~45 B) are about half, and integer
+tables whose ids have gaps from old deletes are a 16-byte run per key for the rest; consecutive ids and the
+re-packed pairs cost almost nothing. The old binary held 340 MB at this point and went to ~23 B a key for
+everything under a day of writes; this one stays as loaded. The next cut is the text keys - a sorted key arena
+with a prefix index (~20 B a key) - which trades a hash probe for a bisection on those tables.
+
 ## What this does not do
 
 - It does not cap or trim the key maps (the earlier plan's phase 1). The engine rewrites `rowindexes.list` on every
