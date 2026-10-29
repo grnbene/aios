@@ -10,6 +10,7 @@
 // to eat the rest of the document).
 #include <cstring>
 
+#include "aios/core/html_entities.hpp"
 #include "aios/userland/web.hpp"
 
 namespace aios::userland::web {
@@ -85,30 +86,10 @@ void append_utf8(std::string& out, uint32_t cp) {
   }
 }
 
-struct NamedEntity {
-  const char* name;
-  uint32_t cp;
-};
-
 // The named references a page's prose actually uses. Anything outside this set
 // is left as the author wrote it, so `&foo;` shows up as `&foo;` instead of
 // silently vanishing.
-constexpr NamedEntity kEntities[] = {
-    {"amp", '&'},      {"lt", '<'},        {"gt", '>'},        {"quot", '"'},     {"apos", '\''},
-    {"nbsp", 0x00A0},  {"copy", 0x00A9},   {"reg", 0x00AE},    {"trade", 0x2122}, {"deg", 0x00B0},
-    {"plusmn", 0x00B1},{"sup2", 0x00B2},   {"sup3", 0x00B3},   {"micro", 0x00B5}, {"middot", 0x00B7},
-    {"frac14", 0x00BC},{"frac12", 0x00BD}, {"frac34", 0x00BE}, {"times", 0x00D7}, {"divide", 0x00F7},
-    {"ndash", 0x2013}, {"mdash", 0x2014},  {"lsquo", 0x2018},  {"rsquo", 0x2019}, {"sbquo", 0x201A},
-    {"ldquo", 0x201C}, {"rdquo", 0x201D},  {"bdquo", 0x201E},  {"dagger", 0x2020},{"Dagger", 0x2021},
-    {"bull", 0x2022},  {"hellip", 0x2026}, {"prime", 0x2032},  {"Prime", 0x2033}, {"lsaquo", 0x2039},
-    {"rsaquo", 0x203A},{"euro", 0x20AC},   {"pound", 0x00A3},  {"yen", 0x00A5},   {"cent", 0x00A2},
-    {"larr", 0x2190},  {"uarr", 0x2191},   {"rarr", 0x2192},   {"darr", 0x2193},  {"harr", 0x2194},
-    {"laquo", 0x00AB}, {"raquo", 0x00BB},  {"shy", 0x00AD},    {"ensp", 0x2002},  {"emsp", 0x2003},
-    {"thinsp", 0x2009},{"minus", 0x2212},  {"le", 0x2264},     {"ge", 0x2265},    {"ne", 0x2260},
-    {"alpha", 0x03B1}, {"beta", 0x03B2},   {"gamma", 0x03B3},  {"delta", 0x03B4}, {"pi", 0x03C0},
-    {"mu", 0x03BC},    {"sigma", 0x03C3},  {"omega", 0x03C9},  {"lambda", 0x03BB},{"infin", 0x221E},
-    {"check", 0x2713}, {"cross", 0x2717},  {"star", 0x2605},   {"hearts", 0x2665},{"spades", 0x2660},
-};
+// The names themselves are in src/core/html_entities.cpp, shared with the mail reader.
 
 bool hex_digit(char c, uint32_t& v) {
   if (c >= '0' && c <= '9') { v = (uint32_t)(c - '0'); return true; }
@@ -156,15 +137,12 @@ bool decode_entity(const std::string& s, size_t& i, std::string& out) {
          ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= '0' && s[j] <= '9')))
     name += s[j++];
   if (name.empty()) return false;
-  for (const auto& e : kEntities) {
-    if (name == e.name) {
-      if (j < s.size() && s[j] == ';') ++j;
-      append_utf8(out, e.cp);
-      i = j;
-      return true;
-    }
-  }
-  return false;
+  uint32_t cp = 0;
+  if (!html_named_entity(name, cp)) return false;
+  if (j < s.size() && s[j] == ';') ++j;
+  append_utf8(out, cp);
+  i = j;
+  return true;
 }
 
 std::string decode_entities(const std::string& s) {

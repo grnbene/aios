@@ -267,7 +267,13 @@ def main():
         want, got = reference(raw), mine[name]
         diffs = []
         for f in FIELDS:
-            if want[f] != got[f]: diffs.append((f, want[f], got[f]))
+            if want[f] == got[f]: continue
+            # The text of an HTML message: the old worker stripped tags and kept the markup's own line
+            # structure; aios breaks a line at a block element and a cell. Same words in the same order
+            # is the parity that matters there, so a body that came from html is compared with runs of
+            # whitespace made one space.
+            if f == "body" and want["html"] and " ".join(want[f].split()) == " ".join(got[f].split()): continue
+            diffs.append((f, want[f], got[f]))
         # email's get_payload(decode=True) is None for a message/rfc822 part, so the reference has no size for
         # a forwarded message attached as a file; aios reports the enclosed message's bytes. Compared where Python has one.
         wa = [(a["filename"], a["size_bytes"], a["mime_type"], a["content_id"]) for a in want["attachments"]]
