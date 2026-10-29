@@ -171,6 +171,17 @@ int main() {
     c.run("SHOW GLOBAL STATUS LIKE 'Asql_hangup_kills'", &st);
     const std::string hangup_kills = st.empty() ? "?" : st[0][1];
     check(deadline_kills == "2" && hangup_kills == "1", "SHOW STATUS counts them: Asql_read_deadline_kills " + deadline_kills + " (two reads above), Asql_hangup_kills " + hangup_kills + " (one)");
+    // A session's own limit: SET max_statement_time (seconds; 0 for no limit) overrides the engine's for that session.
+    check(c.run("SET max_statement_time = 0.4") == "ok", "SET max_statement_time = 0.4");
+    const auto t2 = std::chrono::steady_clock::now();
+    const std::string r3 = c.run(kLongRead + " AND 5 > 1");
+    const double took3 = ms_since(t2);
+    check(r3.find("interrupted") != std::string::npos && took3 < 1200, "the session's read ended after " + std::to_string((int)took3) + " ms (its own limit, under the engine's 1500)");
+    check(c.run("SET SESSION max_statement_time = 0") == "ok", "SET max_statement_time = 0");
+    const auto t3 = std::chrono::steady_clock::now();
+    const std::string r4 = c.run(kLongRead + " AND 6 > 1");
+    check(r4 == "ok" && ms_since(t3) > 2500, "with no limit the read runs to its end (" + std::to_string((int)ms_since(t3)) + " ms): " + r4);
+    check(c.run("SET max_statement_time = DEFAULT") == "ok", "SET max_statement_time = DEFAULT");
   }
 
   // 4. SHOW GLOBAL STATUS while the statement lock is held by someone else (here: taken outright for 3 s, as a

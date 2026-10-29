@@ -2048,7 +2048,9 @@ stays open), and its redo record is never written.
   answers are in.
 - A read cannot hold the engine indefinitely. A top-level read past
   `AIOS_SQL_MAX_READ_MS` (default 600000, ten minutes; `0` for no limit) ends
-  as a `KILL QUERY` does, with "Query execution was interrupted"; a wire
+  as a `KILL QUERY` does, with "Query execution was interrupted"; a session
+  sets its own limit with `SET max_statement_time = <seconds>` (MariaDB's
+  name; `0` for none, `DEFAULT` for the engine's); a wire
   client that hangs up while its statement runs has the statement ended the
   same way within about 100 ms (a read stops at its next check, a write runs
   to its end). `SHOW PROCESSLIST` and `SELECT <number>` take no statement
