@@ -76,7 +76,7 @@ To view recent mutations and their causes:
 SHOW THING HISTORY orders '200';
 ```
 
-Returns the most recent 32 history entries for key `200`: when, the cause (a description such as `lines update orderno 200`, not the SQL statement), and the values before and after. Actions taken (or, in shadow mode, worked out) appear here too.
+Returns the history kept for key `200`: when, the cause (a description such as `lines update orderno 200`, not the SQL statement), and the values before and after. Actions taken (or, in shadow mode, worked out) appear here too. The engine keeps the last two entries a Thing (every entry is a before/after copy of its values: 32 of them for 59,504 Things were 60 MB of files and as much memory); `AIOS_THINGS_HISTORY=<n>` in the engine's environment keeps more, and a store saved under a larger limit is cut to the running one when it is loaded. The whole history of a kind with `ASOF` on is in its as-of file.
 
 ---
 
@@ -258,6 +258,12 @@ The Things in this guide are made by a query. The same engine has other kinds, f
 - **Targeted Recomputation**: ASQL's mutation hooks identify the partitions a write changed and re-run the Thing's query for just those partitions, not the whole query (a table read whole is the exception above).
 - **Append-only History**: Time travel logs (`.asof`) get one appended line per changed key (written while the Thing's lock is held), rewritten from a later cut-off when they pass their days or size (`AIOS_THING_KEEP_DAYS`, `AIOS_THING_KEEP_MB`). Nothing is kept in memory per change.
 - **Deferred Settle**: Managed tables are written after the Things settle, with the Things' own lock let go - a write notifies the Things, which take that lock, so writing while holding it would deadlock. Chained Things settle in further passes (at most 8).
+- **A Thing's program is a function of its arguments**: its grain runs in a VM that keeps only the pure builtins
+  (`include/aios/userland/thing_builtins.hpp`: lists, text, numbers, decimals, patterns, markup), the engine's
+  `read` / `read_raw` / `write` family, and what the program and the modules it imports define. No clock, no files,
+  no network: a reaction replayed after a crash must give the same answer. `grain app check` applies the same list
+  to `things/*.gr` on the developer's machine and refuses a program that names anything else, with the line
+  (`things/x.gr:10: 'now' is not available in a Thing`), so this is caught before deploy rather than by `deployed.gr`.
 - **Rolled-back Previews**: `WHAT IF` runs the statements in an ordinary transaction of its own, which is always rolled back. While it runs it holds what any transaction holds (in the default mode, the writer lock, so other writers wait), so keep previewed statements modest.
 
 ---

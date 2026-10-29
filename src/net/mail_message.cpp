@@ -25,9 +25,40 @@ std::string b64_lines(const std::string& s) {
   return out;
 }
 
-// A header value: as it is when ASCII, else RFC 2047 encoded words of at most 45 bytes (split on UTF-8 boundaries).
-std::string header_text(const std::string& s) {
-  if (is_ascii(s)) return s;
+// RFC 5322 §2.1.1: a line of at most 78 characters where it can be had, never more than 998.
+constexpr size_t kSoftLine = 78;
+constexpr size_t kHardLine = 998;
+
+// `s` folded at spaces so that no line, the first of them `prefix` characters longer, exceeds 78 where a
+// space allows it; a run with no space in it goes on a line of its own. Empty when some run would still
+// exceed the hard limit (the caller then encodes instead).
+std::string fold_at_spaces(const std::string& s, size_t prefix) {
+  std::string out;
+  size_t line = prefix, at = 0;
+  while (at < s.size()) {
+    size_t sp = s.find(' ', at);
+    if (sp == std::string::npos) sp = s.size();
+    const size_t len = sp - at;
+    if (len + 1 > kHardLine) return {};
+    if (!out.empty()) {
+      if (line + 1 + len > kSoftLine) { out += "\r\n "; line = 1; }
+      else { out += ' '; ++line; }
+    }
+    out.append(s, at, len);
+    line += len;
+    at = sp + 1;
+  }
+  return out;
+}
+
+// A header value: as it is when ASCII and short, folded at spaces when ASCII and long, else RFC 2047
+// encoded words of at most 45 bytes (split on UTF-8 boundaries). `prefix` is the length of "Name: ".
+std::string header_text(const std::string& s, size_t prefix = 0) {
+  if (is_ascii(s)) {
+    if (prefix + s.size() <= kSoftLine) return s;
+    std::string folded = fold_at_spaces(s, prefix);
+    if (!folded.empty()) return folded;
+  }
   std::string out;
   size_t i = 0;
   while (i < s.size()) {
@@ -129,13 +160,27 @@ std::string mail_build_message(const MailParts& m, std::string* message_id, std:
 
   const std::string domain = m.from.substr(m.from.find('@') + 1);
   *message_id = "<" + random_hex(16) + "@" + domain + ">";
-  auto join = [](const std::vector<std::string>& v) { std::string o; for (const auto& x : v) { if (!o.empty()) o += ", "; o += x; } return o; };
+  // An address list is folded after a comma: each line under 78 where the addresses allow it.
+  auto list_header = [](const char* name, const std::vector<std::string>& v) {
+    std::string o = std::string(name) + ": ";
+    size_t line = o.size();
+    for (size_t i = 0; i < v.size(); ++i) {
+      const std::string item = v[i] + (i + 1 < v.size() ? "," : "");
+      if (i > 0) {
+        if (line + 1 + item.size() > kSoftLine) { o += "\r\n "; line = 1; }
+        else { o += ' '; ++line; }
+      }
+      o += item;
+      line += item.size();
+    }
+    return o + "\r\n";
+  };
   std::string msg;
   msg += "From: " + mailbox(m.from_name, m.from) + "\r\n";
-  if (!m.to.empty()) msg += "To: " + join(m.to) + "\r\n";
-  if (!m.cc.empty()) msg += "Cc: " + join(m.cc) + "\r\n";
+  if (!m.to.empty()) msg += list_header("To", m.to);
+  if (!m.cc.empty()) msg += list_header("Cc", m.cc);
   if (!m.reply_to.empty()) msg += "Reply-To: " + m.reply_to + "\r\n";
-  msg += "Subject: " + header_text(m.subject) + "\r\n";
+  msg += "Subject: " + header_text(m.subject, 9) + "\r\n";
   msg += "Date: " + rfc5322_date(std::time(nullptr)) + "\r\n";
   msg += "Message-ID: " + *message_id + "\r\n";
   msg += "MIME-Version: 1.0\r\n";

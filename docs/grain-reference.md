@@ -40,7 +40,7 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `repr` | `repr(val)` | Converts a value to its debug string representation (quoting strings). |
 | `int` | `int(val)` | Converts a string, real, or decimal to an integer (truncating toward zero). |
 | `real` | `real(val)` | Converts an integer, string, or decimal to a 64-bit IEEE 754 floating-point number. |
-| `len` | `len(val)` | Returns the length of a string, list, map, or bytes buffer. |
+| `len` | `len(val)` | Returns the length of a string (in bytes; `chars` counts characters), list, map, or bytes buffer. |
 | `cwd` | `cwd()` | Returns the current working directory path. |
 | `getenv` | `getenv(name, [default])` | Reads an environment variable; returns `default` or `nil` if unset. |
 | `env` | `env(name, [default])` | An app setting or environment variable; `default` (or `nil`) when it is unset **or empty**. Use it for hosts, ports and names, where `""` never means a value. |
@@ -145,10 +145,10 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 ### Inspection & Predicates
 | Function | Signature | Description |
 |---|---|---|
-| `char_at` | `char_at(str, index)` | Returns 1-character string at 0-based `index`. |
-| `chars` | `chars(str)` | Splits string into a list of 1-character substrings. |
-| `ord` | `ord(char_str)` | Unicode code point for the first character. |
-| `chr` | `chr(code_point)` | Converts Unicode code point integer into a UTF-8 character string. |
+| `char_at` | `char_at(str, index)` | Returns the character (one UTF-8 character, not a byte) at 0-based `index`; negative counts from the end; `""` past the end. |
+| `chars` | `chars(str)` | Splits string into a list of its characters (UTF-8 sequences; a byte that is not UTF-8 is one entry). |
+| `ord` | `ord(char_str)` | Unicode code point for the first character (`ord("é")` is 233; a byte that is not UTF-8 gives the byte). |
+| `chr` | `chr(code_point)` | Converts Unicode code point integer (0..1114111, not a surrogate) into a UTF-8 character string. |
 | `utf8_valid` | `utf8_valid(str_or_bytes)` | Returns `true` if the input is valid UTF-8. |
 | `is_digit` | `is_digit(str)` | `true` if string is non-empty and contains only digits (`0-9`). |
 | `is_alpha` | `is_alpha(str)` | `true` if string contains only ASCII letters (`a-z`, `A-Z`). |
@@ -166,14 +166,14 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 ### Manipulation & Trimming
 | Function | Signature | Description |
 |---|---|---|
-| `upper` | `upper(str)` | Converts string to uppercase. |
-| `lower` | `lower(str)` | Converts string to lowercase. |
+| `upper` | `upper(str)` | Converts string to uppercase: ASCII, the Latin-1 Supplement and Latin Extended-A (é, ñ, ł); other scripts are left as they are. |
+| `lower` | `lower(str)` | Converts string to lowercase, over the same letters as `upper`. |
 | `trim` | `trim(str, [chars])` | Strips leading and trailing whitespace (or specific characters). |
 | `ltrim` | `ltrim(str, [chars])` | Strips leading whitespace or characters. |
 | `rtrim` | `rtrim(str, [chars])` | Strips trailing whitespace or characters. |
 | `upper_rtrim` | `upper_rtrim(str)` | Uppercases string and trims trailing whitespace. |
-| `pad_left` | `pad_left(str, len, [pad])` | Pads string on the left to `len` characters (default space). |
-| `pad_right` | `pad_right(str, len, [pad])`| Pads string on the right to `len` characters. |
+| `pad_left` | `pad_left(str, len, [pad])` | Pads string on the left to `len` characters (counted as characters, not bytes; default space). |
+| `pad_right` | `pad_right(str, len, [pad])`| Pads string on the right to `len` characters (counted as characters, not bytes). |
 | `repeat` | `repeat(str, count)` | Repeats string `count` times. |
 | `replace` | `replace(str, old, new)` | Replaces all occurrences of `old` with `new`. |
 | `slice` | `slice(str_or_list, start, [end])` | Slices substring or sublist from `start` up to `end`. |
@@ -199,6 +199,14 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `group_by` | `group_by(list, key_fn)` | Groups items into a map of lists keyed by `key_fn(item)`. |
 | `key_by` | `key_by(list, key_fn)` | Maps list into dictionary keyed by `key_fn(item)` (first wins). |
 | `sum_by` | `sum_by(list, key_fn, val_fn)` | Groups items and aggregates totals per key. |
+| `sum` | `sum(list)` | The items added as `sum_by` adds them: integers stay integers, decimals exact, otherwise a real; `nil` items count nothing; `0` for an empty list. |
+| `chunk` | `chunk(list, n)` | The list in pieces of `n` (the last one shorter): `chunk([1,2,3,4,5], 2)` is `[[1,2],[3,4],[5]]`. |
+| `partition` | `partition(list, fn)` | `[items fn is true for, the rest]`, each in order. |
+| `take_while` | `take_while(list, fn)` | The leading items `fn` is true for. |
+| `drop_while` | `drop_while(list, fn)` | Everything after the leading items `fn` is true for. |
+| `min_by` / `max_by` | `min_by(list, fn)` | The item whose `fn(item)` is least / greatest (keys ordered as `sort_by` orders them); the first of equals; `nil` for an empty list. |
+| `find_index` | `find_index(list, fn)` | The index of the first item `fn` is true for, `-1` when none. |
+| `zip_with` | `zip_with(a, b, fn)` | `fn(a[i], b[i])` for each pair, as long as the shorter list. |
 | `unique` / `dedup` | `unique(list)` | Returns a list with consecutive or duplicate items removed. |
 | `flatten` | `flatten(list, [depth])` | Flattens nested lists up to `depth` levels (default 1). |
 | `concat` | `concat(...lists)` | Concatenates multiple lists into a single list. |
@@ -212,6 +220,7 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | Function | Signature | Description |
 |---|---|---|
 | `map` | `map(list, fn)` | Transforms each element: `[fn(x) for x in list]`. |
+| `flat_map` | `flat_map(list, fn)` | `map` with the results joined into one list: a list result contributes its items, `nil` nothing, any other value itself (one level, as JavaScript's `flatMap`). `flat_map(orders, fn (o) { return o.lines })`. Allowed in Things. |
 | `filter` | `filter(list, fn)` | Keeps elements where `fn(x)` is truthy. |
 | `reduce` | `reduce(list, fn, [init])` | Folds list with accumulator: `fn(acc, item)`. |
 | `each` / `for_each` | `each(list, fn)` | Invokes `fn(item)` on each element for side effects. |
@@ -327,8 +336,8 @@ ECMAScript-compatible regular expression operations.
 
 | Function | Signature | Description |
 |---|---|---|
-| `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. |
-| `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. |
+| `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. An integer that fits 64 bits is an int; a longer one is a real of that size. |
+| `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. A real is written with the fewest digits that read back as the same value (`0.1`, not 17 digits). |
 | `xml_parse` | `xml_parse(xml_str)` | Parses XML into nested map `{tag, attrs, children, text}` with entity decoding and CDATA support. |
 | `xml_escape` | `xml_escape(str)` | Escapes special XML characters (`&`, `<`, `>`, `"`, `'`). |
 | `xml_unescape` | `xml_unescape(str)` | Unescapes standard and numeric XML entities (e.g. `&amp;`, `&#x2603;`). |

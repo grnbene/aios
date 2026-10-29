@@ -1,0 +1,18 @@
+// chunk, partition, take_while, drop_while, sum, min_by, max_by, find_index, zip_with
+print(chunk([1, 2, 3, 4, 5], 2))
+print(chunk([], 3))
+print(partition([1, 2, 3, 4, 5, 6], fn (x) { return x % 2 == 0 }))
+print(take_while([2, 4, 6, 7, 8], fn (x) { return x % 2 == 0 }))
+print(drop_while([2, 4, 6, 7, 8], fn (x) { return x % 2 == 0 }))
+print(sum([1, 2, 3]))
+print(sum([1, 2.5]))
+print(sum([decimal("1.10"), decimal("2.20")]))
+print(sum([1, nil, 2]))
+print(sum([]))
+let people = [{"n": "b", "a": 30}, {"n": "a", "a": 25}, {"n": "c", "a": 30}]
+print(min_by(people, fn (p) { return p.a }).n)
+print(max_by(people, fn (p) { return p.a }).n)
+print(min_by([], fn (p) { return p }))
+print(find_index([5, 7, 9], fn (x) { return x > 6 }))
+print(find_index([5, 7, 9], fn (x) { return x > 60 }))
+print(zip_with([1, 2, 3], [10, 20], fn (a, b) { return a + b }))

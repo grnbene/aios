@@ -66,6 +66,7 @@ class TcpConnection final : public Connection {
   }
   std::string peer() const override { return peer_; }
   bool alive() const override { return fd_ >= 0 && !dead_; }
+  int poll_fd() const override { return fd_; }
   void close() override { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } dead_ = true; }
  private:
   int fd_;

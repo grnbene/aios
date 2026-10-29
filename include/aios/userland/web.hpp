@@ -815,6 +815,10 @@ class Browser {
   const Document& document() const { return doc_; }
   const std::string& url() const { return doc_.url; }
   const std::string& status() const { return status_; }
+  // The URL's fragment (`#section`): the element the page should be scrolled to and that `:target` matches. Set by a
+  // visit of a URL with one and by a same-page anchor link; the pane takes the pending scroll once a frame.
+  const std::string& target() const { return target_; }
+  bool take_target_scroll() { const bool p = target_pending_; target_pending_ = false; return p; }
   // What script did on this page, so the pane can say so instead of leaving a
   // person to wonder whether anything ran.
   const ::aios::userland::ScriptRun& script() const { return script_; }
@@ -864,7 +868,24 @@ Result<void> visit(const std::string& url, const Metrics& m, int viewport_w, boo
   Stylesheet author_;
   std::vector<std::string> history_;
   int history_index_ = -1;
+  // Every URL this browser has been to (the back/forward list is cut on a new visit; this is not): what `:visited`
+  // means. visited_gen_ moves when a URL is added, so the pane re-marks the links only then.
+  std::vector<std::string> visited_;
+  uint64_t visited_gen_ = 0;
+  void note_visited(const std::string& url) {
+    for (const auto& u : visited_) if (u == url) return;
+    visited_.push_back(url);
+    ++visited_gen_;
+  }
+
+ public:
+  bool visited(const std::string& url) const { for (const auto& u : visited_) if (u == url) return true; return false; }
+  uint64_t visited_gen() const { return visited_gen_; }
+
+ private:
   std::string status_;
+  std::string target_;          // the current document's fragment, "" for none
+  bool target_pending_ = false; // the pane has yet to scroll to it
   std::string transport_;
   bool secure_ = false;
   std::vector<std::pair<std::string, Bitmap>> images_;

@@ -24,7 +24,16 @@ The heavy work is done once, by ASQL, not on every page view.
 
 The tables `touch_hour` reads: `recscan`, `pickingfreeze`, `stockmaster`, `product_types`, `binmovements_details`,
 `www_users`, `loadingbays`, `dispatch`, `stickerscanout`, `salesorderdetails`, `trackinginfo`, `salesorders`,
-`debtortrans`.
+`debtortrans`, `stockmoves`.
+
+Two places where the app counts differently from `touches.php`, on purpose:
+
+- **Receiving quantities** come from the stock moves (received: type 25; returned to the vendor: type 85), not from
+  `recscan.qty`. The receiving screen adds each new quantity to every old row of the same item, vendor and bin, so
+  `recscan.qty` holds a running total and old months grow with every delivery. The scans themselves (who, what,
+  when) are still `recscan`'s, and each move is placed in the hour its receiver scanned that item.
+- **Deliveries cleared from their run** (status "needs invoiced") count as loads, on a "Cleared from run (no
+  driver)" line: their dispatch row is gone, but the loaded quantity is still in `pickingfreeze`.
 
 ## Where it runs
 

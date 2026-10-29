@@ -1,0 +1,16 @@
+# page target.html  viewport=420
+# title An anchor within the page
+# content 420x3425  background=ffffffff  links=1
+text      20    20   182    19  #ff0b57a4  14px             u link=0  "Jump to the second section"
+rect      20    51   380  1600  #fff4f4f4
+text      20    51   140    19  #ff1a1a1a  14px              "a tall first section"
+rect      20  1671   380    53  #ffe8e8e8
+text      30  1681   234    33  #ff1a1a1a  24px,bold         "The second section"
+text      20  1736   371    19  #ff1a1a1a  14px              "It sits well below the first screen, so following the"
+text      20  1755   329    19  #ff1a1a1a  14px              "link scrolls the page and the heading takes its"
+text      20  1774   105    19  #ff1a1a1a  14px              ":target colour."
+rect      20  1805   380  1600  #fff4f4f4
+text      20  1805    91    19  #ff1a1a1a  14px              "more below it"
+link     20    20   182    19  file:///#second  "Jump to the second section"
+# glyph-gaps (none)
+

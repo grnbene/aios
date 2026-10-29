@@ -16,6 +16,7 @@
 #include <shared_mutex>
 #include <functional>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #if defined(__linux__)
 #include <linux/futex.h>
@@ -474,6 +475,7 @@ struct SqlWorkerContext {
   std::shared_ptr<const void> user_vars;
   // The statement's KILL flag (sql_interrupted), when it may be cut short.
   const void* kill = nullptr;
+  uint64_t read_deadline_ns = 0;   // the top-level read's deadline (steady ns), carried to its workers; 0 = none
 };
 
 // True once the running statement's session was KILLed (KILL QUERY or
@@ -694,9 +696,24 @@ class DictArena {
   void clear() {
     bytes_.clear(); offs_.assign(1, 0);
     pfirst_ = 0; cbytes_.clear(); coffs_.clear(); coder_.reset();
+    blocked_ = false; per_block_ = 0; blocks_.clear();
     bucket_offs_.clear(); entry_count_ = 0; front_coded_ = false; sorted_ = false;
     gen_ = next_gen();
   }
+  // Blocked: entries [0, coded_count()) held as compressed blocks of per_block() entries each (deflate or LZ4; the
+  // payload a varint length per entry, then its bytes). For dictionaries of long entries - JSON options, notes,
+  // request bodies - 4-7x smaller than the text where symbol codes gave 2.7x; a point read decodes one block, and
+  // the block stays decoded for the reads after it. Exclusive with symbol codes and front coding.
+  struct Block { uint32_t count = 0; uint32_t raw_size = 0; uint8_t codec = 1; std::vector<uint8_t> bytes; };
+  static constexpr uint8_t kBlockLz4 = 0, kBlockDeflate = 1;
+  bool blocked() const { return blocked_; }
+  // Plain entries from coded_count() on into blocks of `per_block` (fixed by the first call), whole blocks only:
+  // what does not fill a block stays plain for a later call.
+  void block_upto(size_t upto, uint8_t codec, uint32_t per_block);
+  const std::vector<Block>& blocks() const { return blocks_; }
+  uint32_t per_block() const { return per_block_; }
+  // On load, into an empty arena: the blocks as stored; false when they do not add up.
+  bool set_blocked(uint32_t per_block, std::vector<Block> blocks);
   // A copy for the store: an arena only grows between clears (a compaction
   // builds a new one), so a copy that shares this arena's generation and
   // is a prefix of it takes the appended tail only - a checkpoint's
@@ -720,20 +737,26 @@ class DictArena {
   void shrink_to_fit() { bytes_.shrink_to_fit(); offs_.shrink_to_fit(); cbytes_.shrink_to_fit(); coffs_.shrink_to_fit(); bucket_offs_.shrink_to_fit(); }
   std::string_view view(size_t k) const {
     if (front_coded_) return view_front_coded(k);
-    if (k < pfirst_) return coded_view(k);
+    if (k < pfirst_) return blocked_ ? blocked_view(k) : coded_view(k);
     k -= pfirst_;
     return std::string_view(bytes_.data() + offs_[k], offs_[k + 1] - offs_[k]);
   }
   const std::string& operator[](size_t k) const;
   size_t memory_bytes() const {
-    return bytes_.capacity() + offs_.capacity() * sizeof(uint32_t) + cbytes_.capacity() + coffs_.capacity() * sizeof(uint32_t) +
-           bucket_offs_.capacity() * sizeof(uint32_t) + (coder_ ? coder_->memory_bytes() : 0);
+    size_t b = bytes_.capacity() + offs_.capacity() * sizeof(uint32_t) + cbytes_.capacity() + coffs_.capacity() * sizeof(uint32_t) +
+               bucket_offs_.capacity() * sizeof(uint32_t) + (coder_ ? coder_->memory_bytes() : 0) + blocks_.capacity() * sizeof(Block);
+    for (const Block& bl : blocks_) b += bl.bytes.capacity();
+    return b;
   }
-  size_t byte_size() const { return bytes_.size() + cbytes_.size(); }   // the entries as held
+  size_t byte_size() const {   // the entries as held
+    size_t b = bytes_.size() + cbytes_.size();
+    for (const Block& bl : blocks_) b += bl.bytes.size();
+    return b;
+  }
   size_t plain_bytes() const { return bytes_.size(); }
-  // Entries [0, coded_count()) are coded; data() / offsets() describe the
-  // plain ones only, so a reader of the raw buffer checks coded() first.
-  bool coded() const { return pfirst_ > 0; }
+  // Entries [0, coded_count()) are coded (symbol codes, or blocks when blocked()); data() / offsets() describe the
+  // plain ones only, so a reader of the raw buffer checks coded_count() first.
+  bool coded() const { return pfirst_ > 0; }   // (true for blocks as well: a reader of the raw buffer must decode)
   size_t coded_count() const { return pfirst_; }
   const std::shared_ptr<const SymbolCoder>& coder() const { return coder_; }
   // Entries [coded_count(), upto) coded with c (the arena's coder once it has one).
@@ -765,6 +788,10 @@ class DictArena {
   std::vector<uint8_t> cbytes_;
   std::vector<uint32_t> coffs_;   // pfirst_ + 1 of them when coded
   std::shared_ptr<const SymbolCoder> coder_;
+  bool blocked_ = false;           // entries [0, pfirst_) are in blocks_ (then coder_ is null)
+  uint32_t per_block_ = 0;
+  std::vector<Block> blocks_;
+  std::string_view blocked_view(size_t k) const;
   static constexpr size_t kBucketSize = 16;
   static constexpr size_t kBucketShift = 4;
   void un_front_code();
@@ -1089,6 +1116,10 @@ struct ColumnStore {
   void reserve(size_t sz);
   void resize(size_t sz, const std::string& val);
   void materialize_to_dict_packed();
+  // The column as a dictionary at the width its entries need (materialize_to_dict_packed leaves it at 32 bits a
+  // code): what a write the current encoding cannot take in place turns the column into.
+  void to_dict_narrow();
+  void widen_for(uint32_t id);   // the codes a bit wider when `id` does not fit (never 32 at once)
 
   // Bit-packing & integer code helpers
   uint32_t read_code(size_t row) const;
@@ -1164,19 +1195,21 @@ class PkMap {
     bool operator!=(const iterator& o) const { return i != o.i; }
     void skip() { while (i < m->slots_.size() && m->slots_[i].state != 1) ++i; }
   };
-  iterator begin() { if (runs_) to_slots(); iterator it{this, 0}; it.skip(); return it; }
-  iterator end() { return iterator{this, runs_ ? 0 : slots_.size()}; }
+  iterator begin() { if (runs_) to_slots("a walk"); if (sorted_) sorted_to_slots(); iterator it{this, 0}; it.skip(); return it; }
+  iterator end() { return iterator{this, (runs_ || sorted_) ? 0 : slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
   // `hash` is for the tests: a degenerate one makes every key collide, and the map must still be exact.
   explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash), runs_(runs_enabled()) {}
   void clear() {
     slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false;
-    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); shape_ = 0;
+    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); late_.clear(); shape_ = 0; pair_swap_ = false;
+    sorted_ = false; skeys_.clear(); soff_.clear(); sval_.clear(); sidx_.clear(); sgone_.clear(); slate_.clear();
   }
-  void reserve(size_t n) { if (runs_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
+  void reserve(size_t n) { if (runs_ || sorted_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
     if (runs_) return run_find(key);
+    if (sorted_) return sorted_find(key);
     if (slots_.empty()) return end();
     uint64_t ik = 0;
     if (!text_ && !int_key(key, &ik)) return end();   // not this map's integer shape: not one of its keys
@@ -1191,10 +1224,14 @@ class PkMap {
   iterator erase(iterator it) {
     if (runs_) {
       if (it.i == 0) return it;
-      const uint64_t k = it.run_hit.key;
-      gone_.insert(std::lower_bound(gone_.begin(), gone_.end(), k, int_less), k);
-      --count_;
-      if (gone_.size() * 4 > count_ + 256) to_slots();   // more erased than the runs save
+      run_erase(it.run_hit.key);
+      maybe_fold();
+      return end();
+    }
+    if (sorted_) {
+      if (it.i == 0) return it;
+      sorted_erase_hit(it.run_hit.key);
+      maybe_sfold();
       return end();
     }
     slots_[it.i].state = 2;
@@ -1206,9 +1243,28 @@ class PkMap {
     ++it;
     return it;
   }
-  // Out of runs mode first, so the entry is a slot: the reference is into slots_, never into an iterator's copy.
+  // The reference is into slots_, or in runs mode into a run of the overlay holding this key alone - never into an
+  // iterator's copy. It is good until the next change to the map (its callers write through it at once).
   uint32_t& operator[](const std::string& key) {
-    if (runs_) to_slots();
+    if (runs_) {
+      uint64_t ik = 0;
+      if (int_key(key, &ik, true)) {
+        uint32_t v = 0;
+        auto have = run_find(key);
+        if (have != end()) { v = have->second; run_erase(ik); }
+        return late_[late_insert(ik, v, false)].val;
+      }
+      to_slots("a write through a key that is not this map's integer shape");
+    }
+    if (sorted_) {
+      // A live key's id is written where it is; a new key goes to the overlay (no fold here: the reference
+      // handed out must outlive this call, and a fold would move it).
+      uint32_t* ref = sorted_ref(key);
+      if (ref) return *ref;
+      ++count_;
+      auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+      return slate_.insert(at, SlateEntry{key, 0})->val;
+    }
     const size_t i = emplace(key, 0).first.i;
     return slots_[i].second;
   }
@@ -1220,8 +1276,25 @@ class PkMap {
         if (run_append(ik, v)) return {run_iter(ik, (uint32_t)v), true};
         auto have = run_find(key);
         if (have != end()) return {have, false};
+        if (v <= UINT32_MAX) {   // a key before the last (a line added to an old order): into the overlay
+          late_insert(ik, (uint32_t)v, true);
+          maybe_fold();
+          return {run_iter(ik, (uint32_t)v), true};
+        }
       }
-      to_slots();   // a text key, or one not after the last: slots from here on
+      to_slots(is_int ? "an id past 32 bits" : "a key that is not this map's integer shape");   // slots from here on
+    }
+    if (sorted_) {
+      auto have = sorted_find(key);
+      if (have != end()) return {have, false};
+      if (v > UINT32_MAX) sorted_to_slots();   // an id past 32 bits: as slots, below
+      else {
+        ++count_;
+        auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+        const size_t s = (size_t)(slate_.insert(at, SlateEntry{key, (uint32_t)v}) - slate_.begin());
+        if (slate_.size() + sgone_.size() > 4096 + count_ / 64) { sfold(); return {sorted_find(key), true}; }
+        return {run_iter(kSlateBit | (uint64_t)s, (uint32_t)v), true};
+      }
     }
     if (!text_ && !is_int) to_text();
     if (text_) ik = hash_text(key);
@@ -1237,12 +1310,22 @@ class PkMap {
     return {iterator{this, i}, true};
   }
   size_t memory_bytes() const {
+    size_t slate = slate_.capacity() * sizeof(SlateEntry);
+    for (const SlateEntry& e : slate_) if (e.key.capacity() > sizeof(std::string)) slate += e.key.capacity();
     return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity() +
-           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t);
+           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t) + late_.capacity() * sizeof(Run) +
+           skeys_.capacity() + (soff_.capacity() + sval_.capacity() + sgone_.capacity()) * sizeof(uint32_t) +
+           sidx_.capacity() * sizeof(uint64_t) + slate;
   }
   // Every entry's row id through `fn` (a monotonic renumbering: the row index folding its gaps). In runs mode the
   // runs are rebuilt from the new ids; slots are rewritten in place.
   template <class F> void remap_values(F fn) {
+    if (runs_) fold();   // the overlay into the runs first: one list to renumber
+    if (sorted_) {
+      sfold();
+      for (uint32_t& v : sval_) v = (uint32_t)fn(v);
+      return;
+    }
     if (!runs_) {
       for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
       return;
@@ -1264,18 +1347,125 @@ class PkMap {
       if (!ok) break;
     }
     if (!ok) {
-      to_slots();
+      to_slots("an id past 32 bits at a renumbering");
       for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
       return;
     }
     runs_v_.swap(fresh);
     gone_.clear();
     count_ = n;
-    if (runs_v_.size() * 2 > count_ + 64) to_slots();
+  }
+  // Every entry's id through `fn`, and every entry `fn` answers kDrop for goes (the row index folding its gaps
+  // after deletes: the erased rows' entries out, the ids above them down). Runs stay runs - a walk with begin() did
+  // this before and turned every map with a deleted row into slots at the next checkpoint. Returns how many went.
+  static constexpr size_t kDrop = (size_t)-1;
+  template <class F> size_t remap_or_erase(F fn) {
+    if (runs_) fold();
+    size_t gone = 0;
+    if (sorted_) {
+      sfold();   // the overlay in, the erased out: one sorted list to renumber
+      for (uint32_t p = 0; p < sval_.size(); ++p) {
+        const size_t nv = fn(sval_[p]);
+        if (nv == kDrop) { sgone_.push_back(p); ++gone; --count_; }   // in position order: sgone_ stays sorted
+        else sval_[p] = (uint32_t)nv;
+      }
+      maybe_sfold();
+      return gone;
+    }
+    if (runs_) {
+      std::vector<Run> fresh;
+      fresh.reserve(runs_v_.size());
+      size_t n = 0;
+      bool ok = true;
+      for (const Run& r : runs_v_) {
+        for (uint32_t j = 0; j < r.n && ok; ++j) {
+          const size_t nv = fn((size_t)r.val + j);
+          if (nv == kDrop) { ++gone; continue; }
+          ok = append_run(fresh, r.key + j, nv);
+          ++n;
+        }
+        if (!ok) break;
+      }
+      if (ok) {
+        fresh.shrink_to_fit();
+        runs_v_.swap(fresh);
+        count_ = n;
+        return gone;
+      }
+      to_slots("an id past 32 bits at a gap fold");   // as slots, below (nothing was dropped yet)
+      gone = 0;
+    }
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      Slot& sl = slots_[i];
+      if (sl.state != 1) continue;
+      const size_t nv = fn(sl.second);
+      if (nv == kDrop) {
+        sl.state = 2;
+        if (text_) dead_ += entry_bytes(i);
+        --count_;
+        ++gone;
+      } else {
+        sl.second = (uint32_t)nv;
+      }
+    }
+    if (text_ && dead_ > (1u << 20) && dead_ * 2 > arena_.size()) compact();
+    return gone;
   }
   bool runs_mode() const { return runs_; }
   // How many maps have turned from runs back into slots (SHOW STATUS Asql_pk_runs_to_slots).
   static std::atomic<uint64_t>& runs_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
+  // Text keys as a sorted arena (below): what a checkpoint asks of a map of text keys held as slots. True when the
+  // map changed form; a small map (under kSortedMin keys) or one not of text keys is left as it is.
+  bool sort_text_keys() {
+    if (sorted_ || runs_ || !text_ || count_ < kSortedMin || !sorted_enabled()) return false;
+    // Each live key's bytes located once (the varint decoded), then sorted by memcmp alone: 3M keys in ~1 s.
+    struct Ref { const char* p; uint32_t len; uint32_t val; };
+    std::vector<Ref> order;
+    order.reserve(count_);
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      if (slots_[i].state != 1) continue;
+      size_t len;
+      const char* p = text_of(i, &len);
+      order.push_back(Ref{p, (uint32_t)len, slots_[i].second});
+    }
+    std::sort(order.begin(), order.end(), [](const Ref& a, const Ref& b) {
+      const int c = std::memcmp(a.p, b.p, std::min(a.len, b.len));
+      return c < 0 || (c == 0 && a.len < b.len);
+    });
+    std::vector<char> keys;
+    keys.reserve(arena_.size() - dead_);
+    std::vector<uint32_t> off, val;
+    off.reserve(order.size());
+    val.reserve(order.size());
+    for (const Ref& r : order) {
+      if (keys.size() + r.len + 5 > UINT32_MAX) return false;   // offsets are 32-bit: a map this big stays slots
+      off.push_back((uint32_t)keys.size());
+      put_skey(keys, r.p, r.len);
+      val.push_back(r.val);
+    }
+    std::vector<Slot>().swap(slots_);
+    std::vector<uint32_t>().swap(koff_);
+    std::vector<char>().swap(arena_);
+    dead_ = 0;
+    used_ = count_;
+    keys.shrink_to_fit();
+    skeys_.swap(keys);
+    soff_.swap(off);
+    sval_.swap(val);
+    build_sidx();
+    sorted_ = true;
+    sorted_count().fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  bool sorted_mode() const { return sorted_; }
+  // Text keys held as slots: what sort_text_keys would take (an integer map that fell back to slots is not one).
+  bool text_slots() const { return text_ && !sorted_ && !runs_; }
+  // The table's name for the store trace; the pointer must outlive the map (the row index's own string).
+  void trace_name(const char* n) { trace_name_ = n; }
+  // How many maps have been sorted, and how many sorted maps turned back into slots (SHOW STATUS).
+  static std::atomic<uint64_t>& sorted_count() { static std::atomic<uint64_t> n{0}; return n; }
+  static std::atomic<uint64_t>& sorted_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
+  static constexpr size_t kSortedMin = 4096;
 
  private:
   static constexpr size_t npos = (size_t)-1;
@@ -1314,16 +1504,133 @@ class PkMap {
     it.run_hit.state = 1;
     return it;
   }
+  // The overlay on the runs. late_: keys that arrived before the last one (a line added to an old order), and keys
+  // re-pointed at another row - runs of their own, sorted, never overlapping a live key of runs_v_ (such a key is in
+  // gone_ as well, and late_ answers first). gone_: erased keys of runs_v_. Both are folded into runs_v_ in one pass
+  // once they have grown (maybe_fold). Before this, any of these turned the map into slots for good: after a day of
+  // replication every map on atl was slots, 340 MB for keys that are ~2 MB as runs.
+  std::vector<Run> late_;
+  // The run of `rv` that holds key k, or nullptr.
+  static const Run* run_at(const std::vector<Run>& rv, uint64_t k) {
+    auto r = std::upper_bound(rv.begin(), rv.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    if (r == rv.begin()) return nullptr;
+    --r;
+    return (k - r->key) < r->n ? &*r : nullptr;
+  }
   iterator run_find(const std::string& key) {
     uint64_t ik = 0;
-    if (runs_v_.empty() || !int_key(key, &ik)) return end();
-    auto r = std::upper_bound(runs_v_.begin(), runs_v_.end(), ik, [](uint64_t k, const Run& x) { return int_less(k, x.key); });
-    if (r == runs_v_.begin()) return end();
-    --r;
-    const uint64_t off = ik - r->key;
-    if (off >= r->n) return end();
+    if ((runs_v_.empty() && late_.empty()) || !int_key(key, &ik)) return end();
+    if (const Run* l = run_at(late_, ik)) return run_iter(ik, (uint32_t)(l->val + (ik - l->key)));
+    const Run* r = run_at(runs_v_, ik);
+    if (!r) return end();
     if (!gone_.empty() && std::binary_search(gone_.begin(), gone_.end(), ik, int_less)) return end();
-    return run_iter(ik, (uint32_t)(r->val + off));
+    return run_iter(ik, (uint32_t)(r->val + (ik - r->key)));
+  }
+  // Key k -> id v into the overlay (k is not a live key). With `merge` it joins a neighbouring run it continues;
+  // without, it is a run of its own (operator[] hands out a reference to that run's id). Returns the run's index.
+  size_t late_insert(uint64_t k, uint32_t v, bool merge) {
+    auto r = std::upper_bound(late_.begin(), late_.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    const size_t at = (size_t)(r - late_.begin());   // the first run after k
+    ++count_;
+    if (merge) {
+      if (at > 0) {
+        Run& p = late_[at - 1];
+        if (p.key + p.n == k && (uint64_t)p.val + p.n == v && p.n < UINT32_MAX) { ++p.n; return at - 1; }
+      }
+      if (at < late_.size()) {
+        Run& s = late_[at];
+        if (k + 1 == s.key && v + 1 == s.val && s.n < UINT32_MAX) { s.key = k; s.val = v; ++s.n; return at; }
+      }
+    }
+    late_.insert(late_.begin() + (long)at, Run{k, v, 1});
+    return at;
+  }
+  // Key k, a live key, out of the map: out of the overlay if it is there, else marked gone in the runs.
+  void run_erase(uint64_t k) {
+    --count_;
+    auto r = std::upper_bound(late_.begin(), late_.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    if (r != late_.begin() && (k - (r - 1)->key) < (r - 1)->n) {
+      --r;
+      const uint64_t off = k - r->key;
+      if (r->n == 1) late_.erase(r);
+      else if (off == 0) { ++r->key; ++r->val; --r->n; }
+      else if (off == r->n - 1) --r->n;
+      else {
+        const Run tail{k + 1, (uint32_t)(r->val + off + 1), (uint32_t)(r->n - off - 1)};
+        r->n = (uint32_t)off;
+        late_.insert(r + 1, tail);
+      }
+      return;
+    }
+    gone_.insert(std::lower_bound(gone_.begin(), gone_.end(), k, int_less), k);
+  }
+  // The overlay into the runs, once it holds a few thousand entries or a 64th of the map (a pass over the runs).
+  void maybe_fold() {
+    if (late_.size() + gone_.size() > 4096 + count_ / 64) fold();
+  }
+  void fold() {
+    if (!runs_ || (late_.empty() && gone_.empty())) return;
+    std::vector<Run> fresh;
+    fresh.reserve(runs_v_.size() + late_.size() + gone_.size());
+    size_t g = 0, li = 0, n = 0;
+    uint32_t lj = 0;
+    bool ok = true;
+    auto take = [&](uint64_t k, uint32_t v) { ok = ok && append_run(fresh, k, v); ++n; };
+    // The overlay's entries before key k (all of them when `all`); true when the next one is k itself.
+    auto late_upto = [&](uint64_t k, bool all) {
+      while (li < late_.size() && ok) {
+        const uint64_t lk = late_[li].key + lj;
+        if (!all) {
+          if (lk == k) return true;
+          if (!int_less(lk, k)) return false;
+        }
+        take(lk, late_[li].val + lj);
+        if (++lj == late_[li].n) { ++li; lj = 0; }
+      }
+      return false;
+    };
+    for (const Run& r : runs_v_) {
+      for (uint32_t j = 0; j < r.n && ok; ++j) {
+        const uint64_t k = r.key + j;
+        if (late_upto(k, false)) {   // re-pointed: the overlay's id, not this run's
+          take(k, late_[li].val + lj);
+          if (++lj == late_[li].n) { ++li; lj = 0; }
+          continue;
+        }
+        while (g < gone_.size() && int_less(gone_[g], k)) ++g;
+        if (g < gone_.size() && gone_[g] == k) continue;
+        take(k, r.val + j);
+      }
+      if (!ok) break;
+    }
+    late_upto(0, true);
+    std::vector<Run>().swap(late_);
+    std::vector<uint64_t>().swap(gone_);
+    // Nearly a run a key, and the keys are pairs: the other packing may make runs of them (see pair_swap_).
+    if (ok && shape_ == 2 && !pair_swap_ && fresh.size() * 2 > n + 64) {
+      std::vector<std::pair<uint64_t, uint32_t>> all;   // (swapped key, id)
+      all.reserve(n);
+      bool fits = true;
+      for (const Run& r : fresh) {
+        for (uint32_t j = 0; j < r.n && fits; ++j) {
+          const uint64_t k = r.key + j, a = k >> kPairLowBits, b = k & ((1ull << kPairLowBits) - 1);
+          if (a >= (1ull << kPairLowBits)) { fits = false; break; }
+          all.push_back({(b << kPairLowBits) | a, r.val + j});
+        }
+        if (!fits) break;
+      }
+      if (fits) {
+        std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return int_less(x.first, y.first); });
+        std::vector<Run> swapped;
+        bool ok2 = true;
+        for (const auto& [k, v] : all) if (!(ok2 = append_run(swapped, k, v))) break;
+        if (ok2 && swapped.size() * 2 <= fresh.size()) { pair_swap_ = true; swapped.shrink_to_fit(); fresh.swap(swapped); }
+      }
+    }
+    fresh.shrink_to_fit();
+    runs_v_.swap(fresh);
+    count_ = n;
+    if (!ok) to_slots("an id past 32 bits at a fold");
   }
   // Key `k` -> id `v` after the last entry of `rv`, when `k` is after every key there; false otherwise (unchanged).
   static bool append_run(std::vector<Run>& rv, uint64_t k, size_t v) {
@@ -1340,13 +1647,20 @@ class PkMap {
   bool run_append(uint64_t k, size_t v) {
     if (!append_run(runs_v_, k, v)) return false;
     ++count_;
-    if (runs_v_.size() * 2 > count_ + 64) to_slots();   // keys too scattered for runs to save anything
+    // (A run per key, keys with gaps, still costs less than a slot a key: 16 B against ~23, so nothing here turns
+    // scattered keys into slots.)
     return true;
   }
-  // Runs into slots, for good.
-  void to_slots() {
+  // Runs into slots, for good. `why` names the cause in the store trace (AIOS_STORE_TRACE), with the table.
+  void to_slots(const char* why = "") {
     if (!runs_) return;
-    runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+    // An empty map taking its first text key is not a fallback (every text-keyed table starts this way, and it
+    // made Asql_pk_runs_to_slots climb by one per text table built): counted and traced only when keys are lost to it.
+    if (count_ > 0) {
+      runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+      static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+      if (trace) std::fprintf(stderr, "[store] %s: key map of %zu keys turns from runs into slots (%s)\n", trace_name_ ? trace_name_ : "?", count_, why);
+    }
     std::vector<Run> rv;
     rv.swap(runs_v_);
     std::vector<uint64_t> gone;
@@ -1367,6 +1681,14 @@ class PkMap {
         ++count_; ++used_;
       }
     }
+    for (const Run& r : late_) {
+      for (uint32_t j = 0; j < r.n; ++j) {
+        const size_t at = place(r.key + j);
+        slots_[at] = Slot{r.key + j, r.val + j, 1};
+        ++count_; ++used_;
+      }
+    }
+    late_.clear();
   }
   uint64_t hash_text(const std::string& key) const { return hash_fn_ ? hash_fn_(key) : (uint64_t)std::hash<std::string>{}(key); }
   // The keys of one map are one shape (one table's primary key): shape_ 1, a single integer; 2, two integers packed
@@ -1378,15 +1700,23 @@ class PkMap {
   bool int_key(const std::string& key, uint64_t* v, bool adopt = false) {
     int shape = 0;
     if (as_int(key, v)) shape = 1;
-    else if (as_pair(key, v)) shape = 2;
+    else if (as_pair(key, v, pair_swap_)) shape = 2;
     else return false;
     if (shape_ == 0 && adopt && !text_) shape_ = shape;
     return shape == shape_;
   }
   std::string int_text(uint64_t k) const {
-    if (shape_ == 2) return std::to_string(k >> kPairLowBits) + '\x1f' + std::to_string(k & ((1ull << kPairLowBits) - 1)) + '\x1f';
+    if (shape_ == 2) {
+      const uint64_t hi = k >> kPairLowBits, lo = k & ((1ull << kPairLowBits) - 1);
+      return pair_swap_ ? std::to_string(lo) + '\x1f' + std::to_string(hi) + '\x1f' : std::to_string(hi) + '\x1f' + std::to_string(lo) + '\x1f';
+    }
     return std::to_string((int64_t)k) + '\x1f';
   }
+  // A two-column key packed with its second column first: an order's lines (orderlineno, orderno) arrive line by
+  // line within the order, so packed (line << 24 | order) every key was a run of its own; packed (order << 24 |
+  // line) an order's lines are one run. Chosen at a fold when it halves the runs (every key re-packed, the second
+  // column must fit 24 bits); a lookup packs the same way from then on.
+  bool pair_swap_ = false;
   // A canonical integer's digits [p, p+n): no sign handling (the pair's parts are non-negative), no leading zero.
   static bool canon_uint(const char* p, size_t n, uint64_t* v) {
     if (n == 0 || n > 19 || (p[0] == '0' && n > 1)) return false;
@@ -1396,13 +1726,14 @@ class PkMap {
     return true;
   }
   // "<a>\x1f<b>\x1f": a two-column integer key, packed (a << 24 | b) when both fit; the packing keeps the key order.
-  static bool as_pair(const std::string& key, uint64_t* v) {
+  static bool as_pair(const std::string& key, uint64_t* v, bool swap = false) {
     const size_t n = key.size();
     if (n < 4 || key[n - 1] != '\x1f') return false;
     const size_t mid = key.find('\x1f');
     if (mid == std::string::npos || mid + 1 >= n - 1) return false;
     uint64_t a = 0, b = 0;
     if (!canon_uint(key.data(), mid, &a) || !canon_uint(key.data() + mid + 1, n - 1 - (mid + 1), &b)) return false;
+    if (swap) std::swap(a, b);
     if (a >= (1ull << (63 - kPairLowBits)) || b >= (1ull << kPairLowBits)) return false;
     *v = (a << kPairLowBits) | b;
     return true;
@@ -1558,6 +1889,198 @@ class PkMap {
       ++count_; ++used_;
     }
   }
+
+  // Sorted mode: the text keys of a big map (a checkpoint sorts one of kSortedMin+ keys) as one arena in key
+  // order - a varint length and the bytes, nothing between - with a 32-bit offset and a 32-bit row id a key
+  // (skeys_, soff_, sval_): ~9 B a key over the text, where a slot and its koff_ cost ~29 B at 70% load.
+  // A lookup bisects: sidx_ (the first 8 bytes of every 64th key) narrows it to a window of a few groups, then
+  // the window by full compare. Writes go to an overlay as runs mode's do: slate_, new keys sorted (a key that
+  // is in the arena and live is never there: a re-point writes sval_ in place); sgone_, erased arena positions,
+  // sorted. Both fold into the arena in one merge (sfold) once they have grown. An id past 32 bits, or a walk
+  // with begin(), turns the map back into slots (sorted_to_slots), to be sorted again at a checkpoint.
+  // AIOS_SQL_PK_SORTED=0 leaves every map as slots.
+  struct SlateEntry { std::string key; uint32_t val; };
+  bool sorted_ = false;
+  const char* trace_name_ = nullptr;
+  std::vector<char> skeys_;
+  std::vector<uint32_t> soff_, sval_;
+  std::vector<uint64_t> sidx_;
+  std::vector<uint32_t> sgone_;
+  std::vector<SlateEntry> slate_;
+  static constexpr uint32_t kSidxGroup = 64;
+  static constexpr uint64_t kSlateBit = 1ull << 63;   // an iterator's run_hit.key: kSlateBit | overlay index, else the arena position
+  static bool sorted_enabled() {
+    static const bool on = [] { const char* e = std::getenv("AIOS_SQL_PK_SORTED"); return !(e && e[0] == '0'); }();
+    return on;
+  }
+  static void put_skey(std::vector<char>& keys, const char* p, size_t n) {
+    size_t len = n;
+    do { keys.push_back((char)((len & 0x7f) | (len > 0x7f ? 0x80 : 0))); len >>= 7; } while (len);
+    keys.insert(keys.end(), p, p + n);
+  }
+  // The key at arena position `pos`: where its bytes start and how long they are.
+  const char* skey_at(size_t pos, size_t* len) const {
+    const char* p = skeys_.data() + soff_[pos];
+    size_t n = 0;
+    int shift = 0;
+    for (;; ++p, shift += 7) {
+      n |= (size_t)((unsigned char)*p & 0x7f) << shift;
+      if (!((unsigned char)*p & 0x80)) { ++p; break; }
+    }
+    *len = n;
+    return p;
+  }
+  // <0, 0, >0 as the key at `pos` compares with `key` (bytes, then length: std::string's order).
+  int skey_cmp(size_t pos, const std::string& key) const {
+    size_t len;
+    const char* p = skey_at(pos, &len);
+    const int c = std::memcmp(p, key.data(), std::min(len, key.size()));
+    return c != 0 ? c : (len < key.size() ? -1 : len > key.size() ? 1 : 0);
+  }
+  static uint64_t key_prefix(const char* p, size_t n) {
+    uint64_t u = 0;
+    for (size_t i = 0; i < 8; ++i) u = (u << 8) | (i < n ? (unsigned char)p[i] : 0);
+    return u;
+  }
+  void build_sidx() {
+    sidx_.clear();
+    sidx_.reserve(soff_.size() / kSidxGroup + 1);
+    for (size_t g = 0; g < soff_.size(); g += kSidxGroup) {
+      size_t len;
+      const char* p = skey_at(g, &len);
+      sidx_.push_back(key_prefix(p, len));
+    }
+    sidx_.shrink_to_fit();
+  }
+  // The arena position of `key`, live or erased, or npos.
+  size_t sorted_pos(const std::string& key) const {
+    if (soff_.empty()) return npos;
+    const uint64_t u = key_prefix(key.data(), key.size());
+    // Groups whose first key's prefix is below u may hold the key (it sorts after their first key); groups whose
+    // first key's prefix is above u cannot: the window is from the last group starting at or below u (or the one
+    // before the first starting above it) to the first group starting above u.
+    const size_t g_hi = (size_t)(std::upper_bound(sidx_.begin(), sidx_.end(), u) - sidx_.begin());
+    const size_t g_lo = (size_t)(std::lower_bound(sidx_.begin(), sidx_.end(), u) - sidx_.begin());
+    size_t lo = (g_lo > 0 ? g_lo - 1 : 0) * kSidxGroup;
+    size_t hi = std::min(soff_.size(), g_hi * kSidxGroup);
+    while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      const int c = skey_cmp(mid, key);
+      if (c == 0) return mid;
+      if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return npos;
+  }
+  size_t slate_pos(const std::string& key) const {
+    auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+    return (at != slate_.end() && at->key == key) ? (size_t)(at - slate_.begin()) : npos;
+  }
+  bool sgone_has(uint32_t pos) const { return !sgone_.empty() && std::binary_search(sgone_.begin(), sgone_.end(), pos); }
+  iterator sorted_find(const std::string& key) {
+    const size_t s = slate_pos(key);
+    if (s != npos) return run_iter(kSlateBit | (uint64_t)s, slate_[s].val);
+    const size_t p = sorted_pos(key);
+    if (p == npos || sgone_has((uint32_t)p)) return end();
+    return run_iter((uint64_t)p, sval_[p]);
+  }
+  // The id of a live key, to write in place, or nullptr.
+  uint32_t* sorted_ref(const std::string& key) {
+    const size_t s = slate_pos(key);
+    if (s != npos) return &slate_[s].val;
+    const size_t p = sorted_pos(key);
+    if (p == npos || sgone_has((uint32_t)p)) return nullptr;
+    return &sval_[p];
+  }
+  // A hit of sorted_find out of the map: the overlay entry (the hit is its index, good until the next change,
+  // and erase follows find at once), or the arena position marked erased.
+  void sorted_erase_hit(uint64_t hit) {
+    --count_;
+    if (hit & kSlateBit) {
+      const size_t s = (size_t)(hit & ~kSlateBit);
+      if (s < slate_.size()) slate_.erase(slate_.begin() + (long)s);
+      return;
+    }
+    sgone_.insert(std::lower_bound(sgone_.begin(), sgone_.end(), (uint32_t)hit), (uint32_t)hit);
+  }
+  void maybe_sfold() {
+    if (slate_.size() + sgone_.size() > 4096 + count_ / 64) sfold();
+  }
+  // The overlay and the erasures into the arena: one merge, in key order.
+  void sfold() {
+    if (!sorted_ || (slate_.empty() && sgone_.empty())) return;
+    std::vector<char> keys;
+    keys.reserve(skeys_.size() + slate_.size() * 24);
+    std::vector<uint32_t> off, val;
+    off.reserve(count_);
+    val.reserve(count_);
+    size_t g = 0, li = 0;
+    bool overflow = false;
+    auto take = [&](const char* p, size_t n, uint32_t v) {
+      if (keys.size() + n + 5 > UINT32_MAX) { overflow = true; return; }
+      off.push_back((uint32_t)keys.size());
+      put_skey(keys, p, n);
+      val.push_back(v);
+    };
+    for (size_t p = 0; p < soff_.size() && !overflow; ++p) {
+      if (g < sgone_.size() && sgone_[g] == p) { ++g; continue; }
+      size_t len;
+      const char* kp = skey_at(p, &len);
+      // the overlay's keys before this one
+      while (li < slate_.size() && !overflow) {
+        const std::string& lk = slate_[li].key;
+        const int c = std::memcmp(kp, lk.data(), std::min(len, lk.size()));
+        const bool arena_first = c < 0 || (c == 0 && len < lk.size());
+        if (arena_first) break;
+        take(lk.data(), lk.size(), slate_[li].val);
+        ++li;
+      }
+      take(kp, len, sval_[p]);
+    }
+    for (; li < slate_.size() && !overflow; ++li) take(slate_[li].key.data(), slate_[li].key.size(), slate_[li].val);
+    if (overflow) { sorted_to_slots(); return; }
+    keys.shrink_to_fit();
+    skeys_.swap(keys);
+    soff_.swap(off);
+    sval_.swap(val);
+    std::vector<uint32_t>().swap(sgone_);
+    std::vector<SlateEntry>().swap(slate_);
+    build_sidx();
+    count_ = used_ = sval_.size();
+  }
+  // The sorted arena back into slots (text), for good until a checkpoint sorts it again.
+  void sorted_to_slots() {
+    if (!sorted_) return;
+    sorted_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+    std::vector<char> keys;
+    keys.swap(skeys_);
+    std::vector<uint32_t> off, val, gone;
+    off.swap(soff_);
+    val.swap(sval_);
+    gone.swap(sgone_);
+    std::vector<SlateEntry> late;
+    late.swap(slate_);
+    std::vector<uint64_t>().swap(sidx_);
+    sorted_ = false;
+    text_ = true;
+    count_ = used_ = 0;
+    slots_.clear();
+    rehash(val.size() + late.size());
+    size_t g = 0;
+    std::string k;
+    for (size_t p = 0; p < off.size(); ++p) {
+      if (g < gone.size() && gone[g] == p) { ++g; continue; }
+      const char* q = keys.data() + off[p];
+      size_t n = 0;
+      int shift = 0;
+      for (;; ++q, shift += 7) {
+        n |= (size_t)((unsigned char)*q & 0x7f) << shift;
+        if (!((unsigned char)*q & 0x80)) { ++q; break; }
+      }
+      k.assign(q, n);
+      emplace(k, val[p]);
+    }
+    for (const SlateEntry& e : late) emplace(e.key, e.val);
+  }
 };
 
 // The statement lock and each table's lock. Holds are short (a single-row
@@ -1597,6 +2120,14 @@ class SqlRwLock {
       rsleep_.fetch_sub(1, std::memory_order_seq_cst);
       if (got) return;
     }
+  }
+  // The shared lock if it is free right now (no holder writing, no writer waiting); false without waiting.
+  bool try_lock_shared() {
+    int32_t s = state_.load(std::memory_order_acquire);
+    while (s >= 0 && waiting_writers_.load(std::memory_order_acquire) == 0) {
+      if (state_.compare_exchange_weak(s, s + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) return true;
+    }
+    return false;
   }
   void unlock_shared() {
     if (state_.fetch_sub(1, std::memory_order_seq_cst) != 1) return;
@@ -2988,6 +3519,8 @@ class SqlDatabase {
   // session. False: no such session.
   static void set_session_closer(uint64_t id, std::function<void()> closer);
   static bool kill_session(uint64_t id, bool query_only);
+  // The wire's hang-up watcher stopped a statement (SHOW STATUS Asql_hangup_kills).
+  static void note_hangup_kill();
   static std::vector<SessionInfo> active_sessions();
   static void set_current_session_id(uint64_t id);
   static uint64_t current_session_id();
@@ -3086,11 +3619,13 @@ class SqlDatabase {
   // SHOW ENGINE ASQL STATUS -- both of which monitors poll every second.
   struct MemoryFootprint {
     size_t rows = 0, delta_rows = 0;
-    size_t est_mem = 0, probe_mem = 0, row_index_mem = 0;
+    size_t est_mem = 0, probe_mem = 0, row_index_mem = 0, things_mem = 0;
     uint64_t bytes_age_ms = 0;
     std::unordered_map<std::string, size_t> table_bytes;   // "db.table" -> estimate
   };
-  MemoryFootprint memory_footprint() const;
+  // `cached_only`: the last snapshot, however old, without walking the tables (SHOW STATUS while the statement
+  // lock is held by someone else: the walk takes per-table locks that need it).
+  MemoryFootprint memory_footprint(bool cached_only = false) const;
   // The probe-index cache is bounded by TOTAL BYTES across every table, not by
   // a count per table: counts cannot distinguish one index over four million
   // rows from eight over a lookup table.

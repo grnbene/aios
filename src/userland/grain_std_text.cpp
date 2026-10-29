@@ -258,6 +258,105 @@ Value bi_group_by(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, groups);
 }
 
+// chunk(list, n): the list in pieces of n (the last one shorter).
+Value bi_chunk(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "chunk")) return Value::nil();
+  if (args[1].type != Type::Int || args[1].i < 1) { error = "chunk() wants a piece size of 1 or more"; return Value::nil(); }
+  const std::vector<Value>& items = args[0].list_items();
+  const size_t n = (size_t)args[1].i;
+  std::vector<Value> out;
+  for (size_t at = 0; at < items.size(); at += n)
+    out.push_back(Value::list(std::vector<Value>(items.begin() + (long)at, items.begin() + (long)std::min(at + n, items.size()))));
+  return Value::list(std::move(out));
+}
+// partition(list, fn): [the items fn is true for, the rest], each in order.
+Value bi_partition(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "partition")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  std::vector<Value> yes, no;
+  for (const auto& item : items) {
+    Value v = vm.call(args[1], {item}, error);
+    if (!error.empty()) return Value::nil();
+    (v.truthy() ? yes : no).push_back(item);
+  }
+  return Value::list({Value::list(std::move(yes)), Value::list(std::move(no))});
+}
+// take_while(list, fn) / drop_while(list, fn): the leading items fn is true for, or everything after them.
+static Value take_or_drop_while(Vm& vm, std::vector<Value>& args, std::string& error, bool take) {
+  if (!want_list(args[0], error, take ? "take_while" : "drop_while")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  size_t n = 0;
+  for (; n < items.size(); ++n) {
+    Value v = vm.call(args[1], {items[n]}, error);
+    if (!error.empty()) return Value::nil();
+    if (!v.truthy()) break;
+  }
+  if (take) return Value::list(std::vector<Value>(items.begin(), items.begin() + (long)n));
+  return Value::list(std::vector<Value>(items.begin() + (long)n, items.end()));
+}
+Value bi_take_while(Vm& vm, std::vector<Value>& args, std::string& error) { return take_or_drop_while(vm, args, error, true); }
+Value bi_drop_while(Vm& vm, std::vector<Value>& args, std::string& error) { return take_or_drop_while(vm, args, error, false); }
+// sum(list): the items added as sum_by adds them (integers stay integers, decimals exact, anything else a real);
+// nil items count nothing; an empty list is 0.
+Value bi_sum(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "sum")) return Value::nil();
+  Value sum = Value::integer(0);
+  for (const auto& v : args[0].list_items()) {
+    if (v.type == Type::Nil) continue;
+    if (sum.type == Type::Int && v.type == Type::Int) sum = Value::integer(sum.i + v.i);
+    else if (sum.type == Type::Decimal || v.type == Type::Decimal) {
+      Value r;
+      if (!decimal_arith('+', sum, v, r, error)) { error = "sum(): " + error; return Value::nil(); }
+      sum = r;
+    } else sum = Value::real(sum.as_double() + v.as_double());
+  }
+  return sum;
+}
+// min_by(list, fn) / max_by(list, fn): the item whose fn(item) is least / greatest (as sort_by orders keys); the
+// first of equals; nil for an empty list.
+static Value min_or_max_by(Vm& vm, std::vector<Value>& args, std::string& error, bool want_max) {
+  if (!want_list(args[0], error, want_max ? "max_by" : "min_by")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  Value best, best_key;
+  bool have = false;
+  for (const auto& item : items) {
+    Value key = vm.call(args[1], {item}, error);
+    if (!error.empty()) return Value::nil();
+    if (!have) { best = item; best_key = key; have = true; continue; }
+    int r = 0;
+    if (!compare_keys(key, best_key, r, error)) return Value::nil();
+    if (want_max ? r > 0 : r < 0) { best = item; best_key = key; }
+  }
+  return have ? best : Value::nil();
+}
+Value bi_min_by(Vm& vm, std::vector<Value>& args, std::string& error) { return min_or_max_by(vm, args, error, false); }
+Value bi_max_by(Vm& vm, std::vector<Value>& args, std::string& error) { return min_or_max_by(vm, args, error, true); }
+// find_index(list, fn): the index of the first item fn is true for, -1 when none.
+Value bi_find_index(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "find_index")) return Value::nil();
+  const std::vector<Value> items = args[0].list_items();
+  for (size_t i = 0; i < items.size(); ++i) {
+    Value v = vm.call(args[1], {items[i]}, error);
+    if (!error.empty()) return Value::nil();
+    if (v.truthy()) return Value::integer((int64_t)i);
+  }
+  return Value::integer(-1);
+}
+// zip_with(a, b, fn): fn(a[i], b[i]) for each pair, as long as the shorter list.
+Value bi_zip_with(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_list(args[0], error, "zip_with") || !want_list(args[1], error, "zip_with")) return Value::nil();
+  const std::vector<Value> a = args[0].list_items(), b = args[1].list_items();
+  std::vector<Value> out;
+  const size_t n = std::min(a.size(), b.size());
+  out.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    Value v = vm.call(args[2], {a[i], b[i]}, error);
+    if (!error.empty()) return Value::nil();
+    out.push_back(std::move(v));
+  }
+  return Value::list(std::move(out));
+}
+
 // key_by(list, key_fn): a map from each key (as text) to the FIRST item with it, keys in the order first met.
 Value bi_key_by(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "key_by")) return Value::nil();
@@ -977,6 +1076,15 @@ void install_text_builtins(Vm& vm) {
   vm.define_native("group_by", 2, 2, bi_group_by);
   vm.define_native("key_by", 2, 2, bi_key_by);
   vm.define_native("sum_by", 3, 3, bi_sum_by);
+  vm.define_native("chunk", 2, 2, bi_chunk);
+  vm.define_native("partition", 2, 2, bi_partition);
+  vm.define_native("take_while", 2, 2, bi_take_while);
+  vm.define_native("drop_while", 2, 2, bi_drop_while);
+  vm.define_native("sum", 1, 1, bi_sum);
+  vm.define_native("min_by", 2, 2, bi_min_by);
+  vm.define_native("max_by", 2, 2, bi_max_by);
+  vm.define_native("find_index", 2, 2, bi_find_index);
+  vm.define_native("zip_with", 3, 3, bi_zip_with);
   vm.define_native("uuid", 0, 0, bi_uuid);
   vm.define_native("xml_parse", 1, 1, bi_xml_parse);
   vm.define_native("xml_escape", 1, 1, bi_xml_escape);

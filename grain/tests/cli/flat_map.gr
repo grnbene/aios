@@ -1,0 +1,7 @@
+// flat_map: fn's results joined into one list - a list contributes its items, nil nothing, any other value itself.
+let orders = [{"no": 1, "lines": ["a", "b"]}, {"no": 2, "lines": []}, {"no": 3, "lines": ["c"]}]
+print(flat_map(orders, fn (o) { return o.lines }))
+print(flat_map([1, 2, 3], fn (x) { return [x, x * 10] }))
+print(flat_map([1, 2, 3], fn (x) { if x == 2 { return nil } return x }))
+print(flat_map({"a": [1, 2], "b": [3]}, fn (k, v) { return v }))
+print(len(flat_map([], fn (x) { return [x] })))

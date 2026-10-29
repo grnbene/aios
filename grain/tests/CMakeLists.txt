@@ -67,12 +67,17 @@ function(grain_cli_case name workdir status input)
             -DSTATUS=${status} -P ${RUNNER})
 endfunction()
 grain_cli_case(cli.debug ${CLI_CASES} 0 ${CLI_CASES}/dbg_loop.in debug@@dbg_loop.gr)
+grain_case(cli.dis_closures ${CLI_CASES} 0 dis dis_closures.gr)   # the listing steps by instruction_length: captures after CLOSURE, jump targets
 # grain pkg check follows imports: one that names no file fails the check
 grain_cli_case(cli.pkg.ok ${CLI_CASES}/pkg_ok 0 /dev/null pkg@@check)
 grain_cli_case(cli.pkg.missing_import ${CLI_CASES}/pkg_bad 2 /dev/null pkg@@check)
 grain_case(cli.db_quote ${CLI_CASES} 0 run db_quote.gr)
 grain_case(cli.modules ${CLI_CASES} 0 run modules.gr)                    # import
 grain_case(cli.modules_threads ${CLI_CASES} 0 run modules_threads.gr)    # import from many VMs at once
+grain_case(cli.escapes ${CLI_CASES} 0 run escapes.gr)    # \uXXXX, \u{...}, surrogate pairs, \xHH
+grain_case(cli.flat_map ${CLI_CASES} 0 run flat_map.gr)    # flat_map over lists and maps
+grain_case(cli.listops ${CLI_CASES} 0 run listops.gr)    # chunk, partition, take_while, drop_while, sum, min_by, max_by, find_index, zip_with
+grain_case(app.things_check ${CMAKE_CURRENT_SOURCE_DIR}/app_things 1 app check .)    # a Thing naming what a Thing may not is refused with the lines
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.lex_error ${CLI_CASES} 1 run lex_error.gr)             # the caret sits under the character the lexer refused
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
@@ -95,6 +100,12 @@ add_test(NAME grain.lang.adv_features COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/
 add_test(NAME grain.lang.spread COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread.gr)
 add_test(NAME grain.lang.number_format COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_number_format.gr)
 add_test(NAME grain.lang.php_style_builtins COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_php_style_builtins.gr)
+add_test(NAME grain.lang.unicode_text COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_unicode_text.gr)
+add_test(NAME grain.lang.unicode_text.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_unicode_text.gr)
+add_test(NAME grain.lang.call_depth COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_call_depth.gr)
+add_test(NAME grain.lang.call_depth.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_call_depth.gr)
+add_test(NAME grain.lang.json_numbers COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_json_numbers.gr)
+add_test(NAME grain.lang.json_numbers.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_json_numbers.gr)
 add_test(NAME grain.lang.on_machine COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_on_machine.gr)
 add_test(NAME grain.lang.match_coalesce COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_match_coalesce.gr)
 add_test(NAME grain.lang.spread_jit COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)

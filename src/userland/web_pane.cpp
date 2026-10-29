@@ -23,6 +23,10 @@
 #include "aios/userland/git.hpp"
 
 extern bool g_css_has_hover;   // web_css.cpp
+extern bool g_css_has_active;  // web_css.cpp: a :active rule exists, so a press marks the pressed element
+extern bool g_css_has_focus;   // web_css.cpp: a :focus / :focus-within rule exists, so the focused field is marked
+extern bool g_css_has_target;  // web_css.cpp: a :target rule exists, so the element the fragment names is marked
+extern bool g_css_has_visited; // web_css.cpp: a :visited rule exists, so links to visited addresses are marked
 namespace aios::userland {
 namespace {
 
@@ -407,15 +411,20 @@ static const void* s_hover_dom = nullptr;
 static uint64_t s_hover_gen = 0, s_hover_ms = 0;
 static bool s_hover_dirty = false;
 static const void* s_hover_off_dom = nullptr;   // a page whose re-cascade is too slow to do per pointer move
-static void set_hover_chain(web::Node* n, bool on) {
+static void set_mark_chain(web::Node* n, const char* attr, bool on) {
   for (; n; n = n->parent) {
     if (n->kind != web::Node::Kind::Element) continue;
     auto& a = n->attrs;
     for (size_t i = 0; i < a.size(); ++i)
-      if (a[i].name == "data-aios-hover") { a.erase(a.begin() + (long)i); break; }
-    if (on) a.push_back({"data-aios-hover", "1"});
+      if (a[i].name == attr) { a.erase(a.begin() + (long)i); break; }
+    if (on) a.push_back({attr, "1"});
   }
 }
+static void set_hover_chain(web::Node* n, bool on) { set_mark_chain(n, "data-aios-hover", on); }
+// `:active`: the pressed element (and its ancestors) carry data-aios-active from the button going down until it
+// comes up, the way the hover chain carries data-aios-hover; `:active` never matched before.
+static web::Node* s_active_node = nullptr;
+static const void* s_active_dom = nullptr;
 // Layout of a big page takes hundreds of milliseconds and rewrites the tree the frame reads, so the frame never does
 // it: it asks here, and a worker job (see dispatch_reflow) lays the page out holding the page lock. The frame meanwhile
 // try-locks and, finding the worker in there, leaves the pixels of the last frame on screen.
@@ -423,6 +432,120 @@ static bool s_reflow_req = false;
 static bool s_reflow_hover = false;               // the request came from :hover, whose cost decides whether to stop doing it
 static std::atomic<bool> s_reflow_inflight{false};
 static uint64_t s_live_cost_ms = 0;               // what the last in-frame layout of a loading page cost
+// The pressed element: marked on the button going down, cleared when it comes up.
+static void set_active(WebPane& pane, web::Node* n) {
+  web::Node* dom = pane.browser ? pane.browser->document().dom.get() : nullptr;
+  if (s_active_dom != dom) { s_active_node = nullptr; s_active_dom = dom; }
+  if (n == s_active_node) return;
+  set_mark_chain(s_active_node, "data-aios-active", false);
+  set_mark_chain(n, "data-aios-active", true);
+  s_active_node = n;
+  s_reflow_req = true;
+}
+static void clear_active() {
+  if (!s_active_node) return;
+  set_mark_chain(s_active_node, "data-aios-active", false);
+  s_active_node = nullptr;
+  s_reflow_req = true;
+}
+// `:focus` / `:focus-within`: the field that has the keyboard (pane.field, set by clicks, Tab and autofocus in
+// several places) is reconciled here once a frame: the element carries data-aios-focus, it and its ancestors
+// data-aios-focus-within. Neither matched before.
+static web::Node* s_focus_node = nullptr;
+static const void* s_focus_dom = nullptr;
+static void set_focus_marks(web::Node* n, bool on) {
+  if (!n) return;
+  if (n->kind == web::Node::Kind::Element) {
+    auto& a = n->attrs;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i].name == "data-aios-focus") { a.erase(a.begin() + (long)i); break; }
+    if (on) a.push_back({"data-aios-focus", "1"});
+  }
+  set_mark_chain(n, "data-aios-focus-within", on);
+}
+// `#section` in the URL, or a same-page anchor link: once the page is laid out, scroll to the element with that id
+// and mark it with data-aios-target so `:target` matches (the previous one unmarked); the browser says when a new
+// fragment is pending (take_target_scroll).
+static web::Node* s_target_node = nullptr;
+static web::Node* node_with_id(web::Node* n, const std::string& id) {
+  if (!n) return nullptr;
+  if (n->kind == web::Node::Kind::Element && n->attr("id") == id) return n;
+  for (auto& ch : n->children)
+    if (web::Node* hit = node_with_id(ch.get(), id)) return hit;
+  return nullptr;
+}
+static void update_target(WebPane& pane, int view_h) {
+  if (!pane.browser) return;
+  const web::Document& doc = pane.browser->document();
+  if (!doc.dom || doc.fragments.empty()) return;   // not laid out yet: the scroll stays pending for the next frame
+  if (!pane.browser->take_target_scroll()) return;
+  const std::string& id = pane.browser->target();
+  web::Node* now = id.empty() ? nullptr : node_with_id(doc.dom.get(), id);
+  if (now != s_target_node) {
+    if (s_target_node) {
+      auto& a = s_target_node->attrs;
+      for (size_t i = 0; i < a.size(); ++i) if (a[i].name == "data-aios-target") { a.erase(a.begin() + (long)i); break; }
+    }
+    if (now) now->attrs.push_back({"data-aios-target", "1"});
+    s_target_node = now;
+    if (::g_css_has_target) s_reflow_req = true;
+  }
+  // The element's first box, as the page is laid out now; the top of the page for an empty fragment.
+  int y = 0;
+  if (now) {
+    bool found = false;
+    for (const auto& f : doc.fragments) {
+      for (const web::Node* n = f.node; n; n = n->parent)
+        if (n == now) { y = f.y; found = true; break; }
+      if (found) break;
+    }
+    if (!found) return;
+  }
+  const int max_scroll = std::max(0, doc.content_height - view_h);
+  pane.scroll = std::max(0, std::min(y, max_scroll));
+}
+// `:visited`: every `<a href>` whose address (resolved against the page's) this browser has been to carries
+// data-aios-visited. Marked when the document changes and when the set of visited addresses grows (a link just
+// followed to another page is visited on the way back; a same-page anchor at once).
+static const void* s_visited_dom = nullptr;
+static uint64_t s_visited_gen = 0;
+static bool mark_visited_links(WebPane& pane, web::Node* n, const std::string& base) {
+  bool changed = false;
+  if (!n) return false;
+  if (n->kind == web::Node::Kind::Element && n->tag == "a") {
+    const std::string href = n->attr("href");
+    const bool want = !href.empty() && pane.browser->visited(web::resolve_url(base, href));
+    auto& a = n->attrs;
+    size_t at = a.size();
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].name == "data-aios-visited") { at = i; break; }
+    if (want && at == a.size()) { a.push_back({"data-aios-visited", "1"}); changed = true; }
+    else if (!want && at < a.size()) { a.erase(a.begin() + (long)at); changed = true; }
+  }
+  for (auto& ch : n->children) changed = mark_visited_links(pane, ch.get(), base) || changed;
+  return changed;
+}
+static void update_visited(WebPane& pane) {
+  if (!::g_css_has_visited || !pane.browser) return;
+  const web::Document& doc = pane.browser->document();
+  web::Node* dom = doc.dom.get();
+  if (!dom) return;
+  const uint64_t gen = pane.browser->visited_gen();
+  if (dom == s_visited_dom && gen == s_visited_gen) return;
+  s_visited_dom = dom;
+  s_visited_gen = gen;
+  if (mark_visited_links(pane, dom, doc.url)) s_reflow_req = true;
+}
+static void update_focus(WebPane& pane) {
+  if (!::g_css_has_focus) return;
+  web::Node* dom = pane.browser ? pane.browser->document().dom.get() : nullptr;
+  if (s_focus_dom != dom) { s_focus_node = nullptr; s_focus_dom = dom; }
+  web::Node* now = pane.field;
+  if (now == s_focus_node) return;
+  set_focus_marks(s_focus_node, false);
+  set_focus_marks(now, true);
+  s_focus_node = now;
+  s_reflow_req = true;
+}
 // Called in the frame with the guard held.
 static void update_hover(WebPane& pane, int view_w, uint64_t now_ms) {
   if (!s_hover_dirty || !::g_css_has_hover || !pane.working.empty()) return;
@@ -1572,6 +1695,9 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   }
   pane.last_viewport_w = view_w;
   update_hover(pane, view_w, k.host().monotonic_ns() / 1000000ULL);
+  update_focus(pane);
+  update_target(pane, view_h);
+  update_visited(pane);
   pane.browser->set_view_height(view_h);
 
   // The page's own time. A frame handler, a due timer, an animation frame: each
@@ -2478,7 +2604,7 @@ void web_pane_motion(WindowSurface& win, int rel_x, int rel_y) {
   }
 }
 
-void web_pane_release() { s_sel_drag = false; }
+void web_pane_release() { s_sel_drag = false; clear_active(); }
 
 void web_pane_wheel(WindowSurface& win, int notches) {
   if (win.web && win.web->face) return;   // a face has no scroll
@@ -2649,6 +2775,7 @@ void web_pane_click(HardwareCompositor& c, WindowSurface& win, Kernel& k, int re
   // every click in the page area -- clicking away from a field ends its turn
   // with the keyboard, which is what a person expects.
   web::Node* clicked = pane.browser->node_at(rel_x, page_y);
+  if (::g_css_has_active) set_active(pane, clicked);
   pane.field = field_ancestor(clicked);
   if (pane.field) pane.message = "typing into <" + pane.field->tag + ">";
   sel_clear();

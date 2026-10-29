@@ -20,6 +20,7 @@ page for each item below.
 | SVG | `<use>` (of an element, or a `<symbol>` with its viewBox), nested `<svg>`, `transform` (translate, scale, rotate, skew, matrix), linear and radial gradients (units, `gradientTransform`, `href` chains, `stop-opacity`), `fill-opacity` / `stroke-opacity` / `opacity`, `style="fill: ..."`, every CSS colour form, `fill-rule="evenodd"`, `preserveAspectRatio` (align, meet, slice, none). | `web_svg.cpp` |
 | CSS transforms | `scale`, `rotate`, `skew`, `matrix`, `matrix3d` (its 2D part), `rotateX/Y` (flattened as Chrome does without perspective), the standalone `rotate` and `scale` properties, `transform-origin`, nesting. The box keeps its place in the flow; its fragments are painted offscreen and composited through the matrix, and links inside it are hit where they are drawn. | `web_css.cpp`, `web_layout.cpp` `add_transform`, `web_pane.cpp` `render_group` |
 | Repaint after a change | A relayout that kept every fragment's count and size (a ticked checkbox, a swapped class) left the old picture on screen; the frame cache now follows a layout generation. Inline pictures are no longer appended again on every relayout. Text is one fragment per element, so a click on a `<label>` or a `<span>` with a handler reaches that element. | `web_pane.cpp`, `web_layout.cpp` |
+| `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:target`, `:visited` | Each matches from a marker attribute the pane reconciles once a frame (`data-aios-active` on press, cleared on release; the focused field and its ancestors; the element a same-page anchor or URL fragment scrolled to; a link whose address this browser has been to in this session - no history across runs). Checked by `scripts/drive-active.sh`, `drive-focus.sh`, `drive-target.sh`, `drive-visited.sh`. | `web_css.cpp`, `web_pane.cpp`, `web_browser.cpp` |
 
 ## Left
 
@@ -41,8 +42,9 @@ page for each item below.
    - Transitions and `@keyframes` animations are not implemented at all, for transforms or anything else.
 5. **SVG** does not draw clip paths, masks, patterns, filters, markers, `<text>`, a radial gradient's focal point, or
    the `reflect` / `repeat` spread methods.
-6. **States.** `:active` never matches, so a pressed button has no pressed look. `:hover` applies on the frame after
-   the pointer moves.
+6. **States.** `:hover` (and the states in the Closed table) apply on the frame after the pointer moves or the
+   focus changes, not within the same event. `:current`, `:past`, `:future`, `:playing`, `:paused`,
+   `:user-invalid` and `:user-valid` never match.
 7. **Missing images** show their alt text in a box; Chrome shows a broken-image icon beside the alt text.
 8. **A page that sets no background** is drawn on the engine's dark ground (the machine's own look), where Chrome uses
    white. A deliberate difference, not a gap.

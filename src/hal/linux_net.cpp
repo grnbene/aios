@@ -194,6 +194,7 @@ class TcpConnection final : public Connection {
   // recv/send has actually seen EOF or an error. Callers poll on a short timeout
   // and use this to tell "nothing yet" from "the peer is gone".
   bool alive() const override { return fd_ >= 0 && !dead_; }
+  int poll_fd() const override { return fd_; }
   // shutdown, not close: it wakes a thread blocked in send/recv/poll on this
   // socket (a bare ::close does not), and the descriptor stays ours until the
   // destructor, so a call still running cannot land on a reused number.

@@ -45,13 +45,13 @@ For the complete function-by-function reference of all 440+ builtins with parame
 | Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
 | Processes | `sys_exec(command)` through the system shell, `exec([program, args...])` without one: `{ok, code, output}` |
 | Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); TCP/UDP sockets; a small server (`listen`, `accept`, `read_until`, `write`) |
-| Strings | escapes `\n \t \r \0 \a \b \f \v \e`, `\xHH` (one byte), `\u{1F600}` (a code point, as UTF-8); `utf8_valid(text or bytes)` |
+| Strings | escapes `\n \t \r \0 \a \b \f \v \e`, `\xHH` (one byte), `\u{1F600}` (a code point, as UTF-8); `utf8_valid(text or bytes)`; `len`, `s[i]`, `slice` and `index_of` are byte offsets, while `chars`, `char_at`, `ord`, `chr`, `pad_left`, `pad_right`, `upper` and `lower` work in characters (UTF-8) |
 | Text | `format("{:>8.2f}", x)`, `regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split` (ECMAScript patterns), `upper`, `lower`, `trim`, `split`, `join`, `replace`, `pad_left`, ... |
 | Data | `json_parse`, `json_stringify(v, {indent, ascii, escape_slashes})` (ascii: `\uXXXX` past ASCII; escape_slashes: `\/`; both is PHP's `json_encode`), `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `key_by(list, fn)` (first item per key), `sum_by(list, key_fn, value_fn)`, `compact(list)` (without its nils), `unique(list)` (first seen kept), `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
 | Numbers in text | `is_numeric(v)` (a number, or a string that is one and nothing more), `to_number(v, [default])` (a string by the number it starts with: `to_number("12.50abc")` is `12.50`) |
 | Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
 | Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_cbc_decrypt(key, iv, data)` (PKCS#7, what `openssl_decrypt` reads; nil when the padding is wrong) and `hash_equals(a, b)` (in constant time, for secrets) |
-| Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
+| Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}`; a call chain deeper than 1,000 frames stops with "call depth exceeded" (a runaway recursion never takes the process down) |
 | Every core | `parallel_map(list, fn)`, `spawn(fn, args...)` -> task, `await(task)`, `task_done(task)` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
@@ -279,6 +279,10 @@ let name = "Grain"
 let balance = decimal("1234.56")
 print($"Hello {name}, balance: {balance:,.2f}")   # Hello Grain, balance: 1,234.56
 print($"[{7:>5}] {{braces}}")                      # [    7] {braces}
+
+# String escapes: \n \t \r \0 \v \e \\ \" \' ; \xHH one byte; · four hex digits (as JSON and JavaScript
+# write it, a surrogate pair 😀 is one code point); \u{1F600} any code point in braces
+print("café \u{2014} 😀")           # café — 😀
 
 # Spread (...): a list's items as a call's arguments, or inside a list literal
 let params = ["A1", 3]

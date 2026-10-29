@@ -30,6 +30,7 @@ static inline struct tm* localtime_r(const std::time_t* t, struct tm* buf) {
 #include "aios/hal/net.hpp"
 #include "aios/userland/grain.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "aios/userland/thing_builtins.hpp"
 #include "aios/userland/mysql_wire.hpp"
 #include "aios/userland/sat_solver.hpp"
 #include "aios/userland/sql_sat.hpp"
@@ -41,7 +42,18 @@ namespace aios::userland {
 
 namespace {
 
-constexpr size_t kHistoryKeep = 32;
+// How many history entries a Thing keeps in memory (and in its file): the last two by default - enough for "what
+// changed it and why" - since every entry is a before/after copy of the Thing's values, and 32 of them for 59,504
+// Things were 60 of atl's 98 MB of Thing files (and as much RSS). AIOS_THINGS_HISTORY=<n> keeps more (1..100000);
+// the as-of file (ASOF) holds the whole history for a kind that has it on.
+size_t history_keep() {
+  static const size_t v = [] {
+    const char* e = std::getenv("AIOS_THINGS_HISTORY");
+    const long long n = e && *e ? std::strtoll(e, nullptr, 10) : 2;
+    return (size_t)std::min<long long>(std::max<long long>(n, 1), 100000);
+  }();
+  return v;
+}
 constexpr size_t kPartitionChunk = 1000;
 const char* const kNullKey = "\x01NULL";
 
@@ -723,28 +735,9 @@ bool gcall(ThingGrain& g, const char* name, const std::vector<grain::Value>& arg
 }
 
 // What a Thing's program may name: pure functions of their arguments.
-const std::vector<std::string>& grain_allowed() {
-  static const std::vector<std::string> names = {
-      "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "sort", "reverse", "map",
-      "filter", "reduce", "each", "for_each", "any", "all", "find_if", "flatten", "concat", "insert", "remove_at",
-      "zip", "enumerate", "take", "drop", "count", "unique", "dedup", "compact", "keys", "values", "has", "del", "merge",
-      "entries", "from_entries", "split", "join", "upper", "lower", "find", "replace", "slice", "ord", "chr", "trim",
-      "ltrim", "rtrim", "starts_with", "ends_with", "contains", "index_of", "last_index_of", "pad_left", "pad_right",
-      "repeat", "char_at", "chars", "is_digit", "is_alpha", "is_alnum", "is_space", "abs", "min", "max", "floor",
-      "ceil", "sqrt", "pow", "round", "trunc", "sign", "clamp", "log", "log2", "log10", "exp", "assert", "try_call",
-      "pcall", "error", "panic", "is_err", "is_ok", "json_parse", "json_stringify",
-      // exact decimals and text layout: pure functions of their arguments
-      "decimal", "dec_div", "scale", "decimal_prefix", "round_sig", "number_format", "is_numeric", "to_number", "format", "sort_by", "group_by", "key_by",
-      "sum_by", "idiv", "upper_rtrim",
-      // patterns: the same text and pattern give the same answer anywhere
-      "regex_test", "regex_match", "regex_find_all", "regex_replace", "regex_split",
-      // blanks, records made on first use, sets, calendar days and markup: functions of their arguments (get_or_put
-      // and add_keys change the map they are given, as push changes its list)
-      "is_blank", "first_present", "get", "get_in", "get_or_put", "add_keys", "add_into", "date_range", "day_add",
-      "html_escape", "xml_escape", "el", "html_raw", "html_stringify", "xml_stringify",
-      "sat"};   // deterministic: a reaction replayed after a crash gets the same answer
-  return names;
-}
+// The list lives in include/aios/userland/thing_builtins.hpp, shared with `grain app check`, which refuses a Thing
+// that names anything else before it is deployed.
+const std::vector<std::string>& grain_allowed() { return thing_allowed_builtins(); }
 
 }  // namespace
 
@@ -1835,7 +1828,7 @@ void ThingEngine::finish_changes(Kind& k, const std::map<std::string, std::strin
     in.version++;
     in.updated_ns = now;
     in.history.push_back(History{now, cause, kv.second, after});
-    if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+    if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
     k.version++;
     in.stamp = k.version;
     dirty_ = true;
@@ -1952,7 +1945,7 @@ bool ThingEngine::run_part(Kind& k, Kind::PartDef& p, const std::vector<std::str
       in.part_rows[p.name] = std::move(rows);
       in.history.push_back(History{db_.kernel_.host().wall_ns(), cause, before,
                                    "part " + p.name + ": " + std::to_string(in.part_rows[p.name].size()) + " rows"});
-      if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+      if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
       stamp_instance(k, in);
     }
   }
@@ -2168,7 +2161,7 @@ void ThingEngine::act_due(Kind& k) {
       in.history.push_back(History{now, "act failed", "WHEN " + k.when_expr, err});
       fprintf(stderr, "[things] %s %s: act failed: %s\n", k.name.c_str(), in.key.c_str(), err.c_str());
     }
-    if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+    if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
     k.version++;
     in.stamp = k.version;
     dirty_ = true;
@@ -5219,7 +5212,7 @@ void ThingEngine::reallocate(Kind& c, Kind& r, const std::string& cause, bool qu
       it->second.version++;
       it->second.updated_ns = now;
       it->second.history.push_back(History{now, cause, kv.second, after});
-      if (it->second.history.size() > kHistoryKeep) it->second.history.erase(it->second.history.begin());
+      if (it->second.history.size() > history_keep()) it->second.history.erase(it->second.history.begin());
       c.version++;
     }
   }
@@ -5232,7 +5225,7 @@ void ThingEngine::reallocate(Kind& c, Kind& r, const std::string& cause, bool qu
       it->second.version++;
       it->second.updated_ns = now;
       it->second.history.push_back(History{now, cause, kv.second, after});
-      if (it->second.history.size() > kHistoryKeep) it->second.history.erase(it->second.history.begin());
+      if (it->second.history.size() > history_keep()) it->second.history.erase(it->second.history.begin());
       r.version++;
     }
   }
@@ -5827,6 +5820,38 @@ void ThingEngine::save() {
   save_locked();
 }
 
+size_t ThingEngine::memory_bytes() {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  auto str = [](const std::string& s) { return sizeof(s) + (s.capacity() > 15 ? s.capacity() + 1 : 0); };
+  auto strs = [&](const std::vector<std::string>& v) { size_t b = sizeof(v) + (v.capacity() - v.size()) * sizeof(std::string); for (const auto& s : v) b += str(s); return b; };
+  auto hist = [&](const std::vector<History>& h) { size_t b = sizeof(h) + h.capacity() * sizeof(History); for (const auto& e : h) b += str(e.cause) + str(e.before) + str(e.after) - 3 * sizeof(std::string); return b; };
+  constexpr size_t kNode = 48;   // a std::map node's own bytes beside its value
+  size_t total = 0;
+  for (const auto& kv : kinds_) {
+    const Kind& k = kv.second;
+    total += sizeof(Kind) + kNode + str(k.name) + str(k.declaration) + str(k.grain_src);
+    for (const auto& t : k.things) {
+      const Instance& in = t.second;
+      total += kNode + sizeof(Instance) + str(t.first) + str(in.key) + in.sums.capacity() * sizeof(ThingDec) +
+               in.nonnull.capacity() * sizeof(int64_t) + in.scale.capacity() * sizeof(int) + hist(in.history) + strs(in.row) +
+               strs(in.conflicts) + str(in.json_doc) - 2 * sizeof(std::string);
+      for (const auto& s : in.sides) total += str(s.first) + strs(s.second);
+      for (const auto& pr : in.part_rows) { total += kNode + str(pr.first); for (const auto& row : pr.second) total += strs(row); }
+    }
+    for (const auto& g : k.gthings) {
+      const Kind::GInst& gi = g.second;
+      total += kNode + sizeof(Kind::GInst) + str(g.first) + str(gi.key) + hist(gi.history) + gi.vals.capacity() * sizeof(gi.vals[0]);
+      for (const auto& v : gi.vals) total += str(v.first) + str(v.second) - 2 * sizeof(std::string);
+    }
+    for (const auto& p : k.parts) {
+      total += kNode + str(p.first) + p.second.capacity() * sizeof(Partial);
+      for (const auto& pa : p.second) total += str(pa.key) + strs(pa.vals) - 2 * sizeof(std::string);
+    }
+    if (k.shown_rows) for (const auto& r : *k.shown_rows) total += sizeof(r) + strs(r.values);
+  }
+  return total;
+}
+
 void ThingEngine::save_locked() {
   if (!dirty_) return;
   auto& host = db_.kernel_.host();
@@ -5859,6 +5884,17 @@ void ThingEngine::load() {
     }
     const std::string name = k.name;
     kinds_.emplace(name, std::move(k));
+  }
+  // Histories saved under a larger limit are cut to this run's at the load, so the next save writes the smaller files.
+  {
+    const size_t keep = history_keep();
+    auto cut = [keep](std::vector<History>& h) { if (h.size() > keep) h.erase(h.begin(), h.begin() + (long)(h.size() - keep)); };
+    for (auto& kv : kinds_) {
+      for (auto& t : kv.second.things) cut(t.second.history);
+      for (auto& g : kv.second.gthings) cut(g.second.history);
+      for (auto& r : kv.second.res) cut(r.second.history);
+      for (auto& o : kv.second.orders) cut(o.second.history);
+    }
   }
   // Claims and resources back together: the shares are derived, so they are
   // worked out again from the saved claims and capacities (no history).
@@ -6122,7 +6158,7 @@ bool ThingEngine::put_ginst(Kind& k, const std::string& ck, Kind::GInst fresh, c
   gi.version++;
   gi.updated_ns = now;
   gi.history.push_back(History{now, cause, before.empty() ? std::string("(not a Thing)") : before, after});
-  if (gi.history.size() > kHistoryKeep) gi.history.erase(gi.history.begin());
+  if (gi.history.size() > history_keep()) gi.history.erase(gi.history.begin());
   k.version++;
   gi.stamp = k.version;
   dirty_ = true;

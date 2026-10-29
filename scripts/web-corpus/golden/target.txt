@@ -1,0 +1,2 @@
+CLICKED rect      20  1669  1361    49  #ffffe08a
+SCROLL 1669  TARGET second

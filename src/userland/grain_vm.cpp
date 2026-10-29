@@ -414,48 +414,49 @@ size_t print_one(std::ostringstream& out, const FnObj& fn, size_t at, int& last_
 
   const Op op = (Op)c.code[at];
   out << op_name(op);
+  // How far to step is instruction_length's to say (the one operand table, shared with the app
+  // check's bytecode walk); this only prints what the operands mean.
+  const size_t next = at + instruction_length(fn, at);
   switch (op) {
     case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
     case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet: {
       const int k = (c.code[at + 1] << 8) | c.code[at + 2];
       out << " " << k << "  ; " << c.constants[k].repr() << "\n";
-      return at + 3;
+      break;
     }
     case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
       out << " " << ((c.code[at + 1] << 8) | c.code[at + 2]) << "\n";
-      return at + 3;
+      break;
     case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:
     case Op::Call: case Op::IterNext:
       out << " " << (int)c.code[at + 1] << "\n";
-      return at + 2;
+      break;
     case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: {
       const int d = (c.code[at + 1] << 8) | c.code[at + 2];
-      out << " -> " << (at + 3 + (size_t)d) << "\n";
-      return at + 3;
+      out << " -> " << (next + (size_t)d) << "\n";
+      break;
     }
     case Op::Loop: {
       const int d = (c.code[at + 1] << 8) | c.code[at + 2];
-      out << " -> " << (at + 3 - (size_t)d) << "\n";
-      return at + 3;
+      out << " -> " << (next - (size_t)d) << "\n";
+      break;
     }
     case Op::Closure: {
       const int k = (c.code[at + 1] << 8) | c.code[at + 2];
       auto sub = std::static_pointer_cast<FnObj>(c.constants[k].obj);
       out << " " << k << "  ; fn " << (sub ? sub->name : "?") << "\n";
-      size_t next = at + 3;
-      const size_t n = sub ? sub->upvalue_index.size() : 0;
-      for (size_t u = 0; u < n; ++u) {
-        std::snprintf(buf, sizeof buf, "%04zu ", next);
-        out << buf << "   |   capture " << (c.code[next] ? "local" : "upvalue")
-            << " " << (int)c.code[next + 1] << "\n";
-        next += 2;
+      for (size_t cap = at + 3; cap < next; cap += 2) {
+        std::snprintf(buf, sizeof buf, "%04zu ", cap);
+        out << buf << "   |   capture " << (c.code[cap] ? "local" : "upvalue")
+            << " " << (int)c.code[cap + 1] << "\n";
       }
-      return next;
+      break;
     }
     default:
       out << "\n";
-      return at + 1;
+      break;
   }
+  return next;
 }
 
 void disassemble_into(std::ostringstream& out, const FnObj& fn) {
@@ -473,6 +474,29 @@ void disassemble_into(std::ostringstream& out, const FnObj& fn) {
 }
 
 }  // namespace
+
+// Operand sizes, the one table: the disassembler steps by it and so does the app check's bytecode walk.
+size_t instruction_length(const FnObj& fn, size_t at) {
+  const Chunk& c = fn.chunk;
+  if (at >= c.code.size()) return 1;
+  switch ((Op)c.code[at]) {
+    case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet:
+    case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
+    case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
+      return 3;
+    case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:
+    case Op::Call: case Op::IterNext:
+      return 2;
+    case Op::Closure: {
+      const int k = (c.code[at + 1] << 8) | c.code[at + 2];
+      auto sub = (size_t)k < c.constants.size() ? std::static_pointer_cast<FnObj>(c.constants[(size_t)k].obj) : nullptr;
+      return 3 + 2 * (sub ? sub->upvalue_index.size() : 0);
+    }
+    default:
+      return 1;
+  }
+}
 
 std::string disassemble(const FnObj& fn) {
   std::ostringstream out;
@@ -543,7 +567,7 @@ struct Vm::State {
   int error_column = 0;
 };
 
-Vm::Vm() : st_(std::make_unique<State>()) { st_->stack.reserve(1024); st_->frames.reserve(256); }
+Vm::Vm() : st_(std::make_unique<State>()) { st_->stack.reserve(1024); st_->frames.reserve(jit::kMaxFrames + 24); }   // never reallocated under native frames: the JIT writes Frames in place
 Vm::~Vm() {
   if (st_) {
     timers.clear();

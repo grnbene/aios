@@ -260,14 +260,36 @@ Token Lexer::string_token(bool is_fstr) {
         break;
       }
       case 'u': {
-        if (peek() != '{') return Token{Tok::Error, "\\u wants a code point in braces: \\u{1F600}", 0, 0, start_line, start_col};
-        advance();
         uint32_t cp = 0;
-        int n = 0;
-        while (hex_digit(peek()) >= 0 && n < 8) { cp = cp * 16 + (uint32_t)hex_digit(peek()); advance(); ++n; }
-        if (peek() != '}' || n == 0) return Token{Tok::Error, "\\u{...} wants 1 to 6 hex digits and a closing brace", 0, 0, start_line, start_col};
-        advance();
-        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return Token{Tok::Error, "\\u{...} is not a Unicode scalar value", 0, 0, start_line, start_col};
+        if (peek() == '{') {
+          advance();
+          int n = 0;
+          while (hex_digit(peek()) >= 0 && n < 8) { cp = cp * 16 + (uint32_t)hex_digit(peek()); advance(); ++n; }
+          if (peek() != '}' || n == 0) return Token{Tok::Error, "\\u{...} wants 1 to 6 hex digits and a closing brace", 0, 0, start_line, start_col};
+          advance();
+        } else {
+          // \uXXXX, four hex digits, as JSON and JavaScript write it (a string pasted from either compiled nowhere
+          // before); a surrogate pair 😀 is one code point.
+          auto four = [&](uint32_t* v) {
+            *v = 0;
+            for (int k = 0; k < 4; ++k) {
+              const int h = hex_digit(peek());
+              if (h < 0) return false;
+              *v = *v * 16 + (uint32_t)h;
+              advance();
+            }
+            return true;
+          };
+          if (!four(&cp)) return Token{Tok::Error, "\\u wants four hex digits (\\u00B7) or a code point in braces (\\u{1F600})", 0, 0, start_line, start_col};
+          if (cp >= 0xD800 && cp <= 0xDBFF) {
+            uint32_t lo = 0;
+            if (peek() != '\\' || peek(1) != 'u') return Token{Tok::Error, "\\uD800-\\uDBFF is half a surrogate pair: the low half must follow", 0, 0, start_line, start_col};
+            advance(); advance();
+            if (!four(&lo) || lo < 0xDC00 || lo > 0xDFFF) return Token{Tok::Error, "\\uD800-\\uDBFF must be followed by \\uDC00-\\uDFFF", 0, 0, start_line, start_col};
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          }
+        }
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return Token{Tok::Error, "\\u escape is not a Unicode scalar value", 0, 0, start_line, start_col};
         if (cp < 0x80) out.push_back((char)cp);
         else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
         else if (cp < 0x10000) { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }

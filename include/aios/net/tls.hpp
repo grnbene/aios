@@ -89,6 +89,8 @@ class TlsServer {
   void close();
   const TlsInfo& info() const { return info_; }
   bool closed() const { return closed_; }
+  // The connection under the TLS record layer (for its poll_fd), null before accept.
+  const hal::Connection* transport() const;
 
  private:
   struct Impl;

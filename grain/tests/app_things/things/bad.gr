@@ -1,0 +1,12 @@
+// A Thing that reaches outside itself: a file and the clock are not functions of its arguments, and `tally` is
+// nobody's. `grain app check` refuses it with the lines.
+fn enroll() {
+  let names = read_file("hours.txt")
+  return split(names, "\n")
+}
+
+fn things(keys, sh) {
+  let out = {}
+  for k in keys { out[k] = {"at": now(), "n": tally(k)} }
+  return out
+}

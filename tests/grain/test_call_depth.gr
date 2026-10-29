@@ -1,0 +1,27 @@
+# tests/grain/test_call_depth.gr
+# How deep a call chain may go: 900 frames of plain recursion run (a tree walk or a recursive-descent
+# parser of ordinary size never hits the limit), recursion through a native callback (map calling the
+# function that calls map) runs as deep, and a runaway chain stops with the depth error, never the process.
+# Driven at top level, inside a function, inside a closure and nested in control flow.
+fn check(c, msg) { assert_true(c, msg) }
+
+fn count_down(n) { return n == 0 ? 0 : 1 + count_down(n - 1) }
+fn via_map(n) { return n == 0 ? 0 : map([n - 1], via_map)[0] + 1 }
+fn forever(n) { return forever(n + 1) }
+
+fn run(where) {
+  check(count_down(900) == 900, where + ": 900 frames of recursion")
+  check(via_map(400) == 400, where + ": 400 frames through a native callback")
+  let r = pcall(fn () { return forever(0) })
+  check(not r.ok, where + ": a runaway chain stops")
+  check(contains(r.error, "call depth exceeded"), where + ": with the depth error: " + r.error)
+  check(count_down(50) == 50, where + ": and the machine runs on afterwards")
+}
+
+run("top level")
+fn in_fn() { run("in a function") }
+in_fn()
+let clos = fn () { run("in a closure") }
+clos()
+for i in [1] { if i == 1 { run("nested in control flow") } }
+print("call depth: ok")

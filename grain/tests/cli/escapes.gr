@@ -1,0 +1,8 @@
+// String escapes: \uXXXX as JSON and JavaScript write it (a middle dot pasted from either), the brace form \u{...},
+// a surrogate pair as one code point, and \xHH as one byte.
+print("·")
+print("·" == "\u{B7}")
+print("😀")
+print("😀" == "\u{1F600}")
+print("aAb\x41")
+print("café — €")

@@ -384,6 +384,13 @@ let thing_code = app_program("things/stock_item.gr")
 
 `app_program()` reads the file, recursively inlines every `import` into one self-contained string, and returns it.
 
+A Thing's program runs inside ASQL with only the pure builtins (lists, text, numbers, decimals, patterns, markup),
+the engine's `read` / `read_raw` / `write` family, and what it and its modules define - no clock, no files, no
+network. `grain app check` applies that rule to every file under `things/` (and the modules they import) and
+refuses the app with the line and the name: `things/x.gr:10: 'now' is not available in a Thing (pure builtins
+only: docs/things.md)`. A deploy applies it the same way, so a Thing that would fail in `deployed.gr` never leaves
+your machine.
+
 ---
 
 ## Pre-cutover checks (`check.gr`)

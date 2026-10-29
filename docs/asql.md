@@ -2046,6 +2046,32 @@ stays open), and its redo record is never written.
   half the engine's speed (78k a second against 151k with the cache off),
   waiting on each other's stores; sharded, 140k cold and 254k once the
   answers are in.
+- A read cannot hold the engine indefinitely. A top-level read past
+  `AIOS_SQL_MAX_READ_MS` (default 600000, ten minutes; `0` for no limit) ends
+  as a `KILL QUERY` does, with "Query execution was interrupted"; a session
+  sets its own limit with `SET max_statement_time = <seconds>` (MariaDB's
+  name; `0` for none, `DEFAULT` for the engine's); a wire
+  client that hangs up while its statement runs has the statement ended the
+  same way within about 100 ms (a read stops at its next check, a write runs
+  to its end). `SHOW PROCESSLIST` and `SELECT <number>` take no statement
+  lock, so an operator can see what to kill, and a health check answers,
+  while a writer waits behind a long read; `SHOW [GLOBAL] STATUS` takes it
+  only when it is free, and otherwise answers from its counters and the last
+  memory snapshot (`Asql_memory_bytes_age_ms` says how old it is). It counts both
+  protections: `Asql_read_deadline_kills`, `Asql_hangup_kills`.
+- A table's primary-key map (key -> row) takes the form its keys allow. Integer
+  keys that arrive in order are runs of consecutive keys (16 bytes a run, so an
+  auto-increment table's map is a few KB; lines added to old orders, deletes and
+  re-pointed keys go to an overlay that folds in). Text keys (a code, a name, a
+  composite with a text column) start as a hash table, ~45 bytes a key over the
+  text, and a checkpoint sorts a map of 4,096+ keys into one arena in key order
+  with a 32-bit offset and row id a key: ~25 bytes a key, a lookup a bisection
+  (0.7 µs on 3M keys against 0.1 µs for the hash probe) narrowed by an index of
+  every 64th key's first bytes; writes go to an overlay that folds in. Half a
+  million keys are sorted a checkpoint (~0.3 s under the lock). An id past 32
+  bits or a walk turns a map back into slots, to be sorted again. Counters:
+  `Asql_pk_runs_to_slots`, `Asql_pk_text_sorted`, `Asql_pk_sorted_to_slots`;
+  `AIOS_SQL_PK_RUNS=0` / `AIOS_SQL_PK_SORTED=0` keep every map as a hash table.
 
 ## What SQL works, and its gaps
 

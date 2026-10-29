@@ -156,6 +156,9 @@ class ThingEngine {
   // INTO: the statements that bring every INTO table up to its Thing (and drop the tables of Things dropped), as
   // {database, statement}, oldest first - run by SqlDatabase with this engine's lock let go. into_pending: any due.
   std::vector<std::pair<std::string, std::string>> into_statements();
+  // What the Things hold in memory (an estimate from the containers' capacities: the kinds, every Thing's values
+  // and history, the cached rows), for the engine's footprint (Asql_memory_bytes, Asql_things_mem_bytes).
+  size_t memory_bytes();
   bool into_pending() const;
   // The Thing that keeps <db>.<table> (INTO), or "" - a client may not write it. Its own lock, not mu_.
   std::string kept_by(const std::string& db, const std::string& table) const;
