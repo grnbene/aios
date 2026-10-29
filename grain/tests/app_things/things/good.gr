@@ -1,0 +1,20 @@
+// A Thing that names only what a Thing may: pure builtins, the engine's reads, and its own functions.
+let BY_HOUR = "by_hour"
+
+fn hour_of(row) { return slice(row.at, 0, 13) }
+
+fn enroll() {
+  return map(read_raw("SELECT at FROM scans"), fn (r) { return hour_of(r) })
+}
+
+fn things(keys, sh) {
+  let out = {}
+  for k in keys {
+    let rows = read_raw("SELECT who, qty FROM scans WHERE at LIKE ?", k + "%")
+    let by = group_by(rows, fn (r) { return r.who })
+    out[k] = map(entries(by), fn (e) { return {"who": e[0], "qty": sum(map(e[1], fn (r) { return r.qty }))} })
+  }
+  return out
+}
+
+fn touched(table, op, before, after, sh) { return [hour_of(after ?? before)] }

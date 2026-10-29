@@ -469,6 +469,29 @@ void disassemble_into(std::ostringstream& out, const FnObj& fn) {
 
 }  // namespace
 
+// (The operand sizes print_one above knows, without the printing: kept in step with it.)
+size_t instruction_length(const FnObj& fn, size_t at) {
+  const Chunk& c = fn.chunk;
+  if (at >= c.code.size()) return 1;
+  switch ((Op)c.code[at]) {
+    case Op::Constant: case Op::GetGlobal: case Op::SetGlobal: case Op::DefineGlobal:
+    case Op::FieldGet: case Op::OptFieldGet: case Op::FieldSet:
+    case Op::BuildList: case Op::BuildMap: case Op::ListConcat:
+    case Op::Jump: case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::Loop:
+      return 3;
+    case Op::GetLocal: case Op::SetLocal: case Op::GetUpvalue: case Op::SetUpvalue:
+    case Op::Call: case Op::IterNext:
+      return 2;
+    case Op::Closure: {
+      const int k = (c.code[at + 1] << 8) | c.code[at + 2];
+      auto sub = (size_t)k < c.constants.size() ? std::static_pointer_cast<FnObj>(c.constants[(size_t)k].obj) : nullptr;
+      return 3 + 2 * (sub ? sub->upvalue_index.size() : 0);
+    }
+    default:
+      return 1;
+  }
+}
+
 std::string disassemble(const FnObj& fn) {
   std::ostringstream out;
   disassemble_into(out, fn);

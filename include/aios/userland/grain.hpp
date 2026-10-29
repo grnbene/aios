@@ -448,6 +448,8 @@ CompileResult compile_source(const std::string& source, const std::string& origi
 // The disassembler is part of the language, not a debug afterthought: it is how
 // anyone checks that the compiler emitted what the source said.
 std::string disassemble(const FnObj& fn);
+// The length in bytes of the instruction at `at` of fn's chunk (a Closure's captures included): a walk over the code.
+size_t instruction_length(const FnObj& fn, size_t at);
 
 // ---------------------------------------------------------------------------
 // Virtual machine
