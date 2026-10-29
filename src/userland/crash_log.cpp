@@ -22,19 +22,34 @@ thread_local char tls_statement[kStatementMax];
 thread_local size_t tls_statement_len = 0;
 
 // One alternate stack per thread, made the first time the thread records a statement (or installs the handler), so a
-// thread that overflows its stack still has somewhere to run the handler.
-thread_local bool tls_altstack_done = false;
+// thread that overflows its stack still has somewhere to run the handler. It lives as long as the thread and no
+// longer: switched off and freed when the thread ends. The wire runs a thread per connection, and a stack left behind
+// by each was 64 KB a connection for good - 1.5 GB an hour on st under a monitor connecting 6.5 times a second.
+struct AltStack {
+  void* mem = nullptr;
+  bool done = false;
+  ~AltStack() {
+    if (!mem) return;
+    stack_t off{};
+    off.ss_flags = SS_DISABLE;
+    sigaltstack(&off, nullptr);   // never left pointing at memory that is about to be freed
+    ::operator delete(mem);
+  }
+};
+thread_local AltStack tls_altstack;
 void ensure_altstack() {
-  if (tls_altstack_done) return;
-  tls_altstack_done = true;
+  AltStack& a = tls_altstack;
+  if (a.done) return;
+  a.done = true;
   // MINSIGSTKSZ is a sysconf() call on glibc 2.34+, not a constant: checked here.
   if (kAltStackSize < (size_t)MINSIGSTKSZ) return;
-  void* mem = ::operator new(kAltStackSize, std::nothrow);   // kept for the life of the thread
+  void* mem = ::operator new(kAltStackSize, std::nothrow);
   if (!mem) return;
   stack_t ss{};
   ss.ss_sp = mem;
   ss.ss_size = kAltStackSize;
-  if (sigaltstack(&ss, nullptr) != 0) ::operator delete(mem);
+  if (sigaltstack(&ss, nullptr) != 0) { ::operator delete(mem); return; }
+  a.mem = mem;
 }
 
 void put(const char* s, size_t n) {
