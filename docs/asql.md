@@ -2072,6 +2072,17 @@ stays open), and its redo record is never written.
   bits or a walk turns a map back into slots, to be sorted again. Counters:
   `Asql_pk_runs_to_slots`, `Asql_pk_text_sorted`, `Asql_pk_sorted_to_slots`;
   `AIOS_SQL_PK_RUNS=0` / `AIOS_SQL_PK_SORTED=0` keep every map as a hash table.
+- After a restart the engine warms the indexes it had: the column and join
+  indexes in `indexes.list` / `probes.list`, then the primary-key maps in
+  `rowindexes.list` (written most recently used first), in that order only up
+  to the row-index budget (`AIOS_SQL_ROWINDEX_MB`, default 1024); a table past it
+  gets its map from the first write that needs one. Each index is built under a
+  short shared lock of its own, so the engine answers, replication starts and
+  writes go through while the warm-up runs, and a map built by the warm-up is
+  not counted as used (the budget can take it back). The log line says what was
+  warmed and what was left: `asql: warmed 17 column, 62 join and 9 primary-key
+  indexes in ... (14 primary-key maps left for their first write: over the
+  1024 MB budget; row maps ... MB)`. Check: `scripts/asql-warm-check.sh`.
 
 ## What SQL works, and its gaps
 

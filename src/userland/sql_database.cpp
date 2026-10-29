@@ -24471,24 +24471,21 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   if (!want.empty() || !want_probes.empty() || !want_rows.empty()) {
     index_warm_ = aios::hal::Thread([this, want, want_probes, want_rows]() {
       const uint64_t t0 = kernel_.host().monotonic_ns();
-      StatementLock lock(rw_lock_, false);
-      // One entry per pool lane at a time, not one after another: built in
-      // turn, 17 column and 22 join indexes were still going 200 s after a
-      // restart, and the first queries paid for them in CPU.
-      // (0 a column index, 1 a join index, 2 a table's primary-key row map)
-      std::vector<std::pair<int, std::pair<std::string, std::string>>> all;
-      for (const auto& w : want) all.push_back({0, w});
-      for (const auto& w : want_probes) all.push_back({1, w});
-      for (const auto& w : want_rows) all.push_back({2, {w, std::string()}});
+      // Each index is built under a shared statement lock of its own, never one held across the whole warm-up: that
+      // one kept every writer - the replication applier, CHANGE REPLICATION SOURCE and START REPLICA at start-up, so
+      // the wire's "answering" too - waiting until the last index was built (st: 62 join and 23 primary-key maps,
+      // 34 s unanswering on every restart). A writer now gets in between two builds.
+      //
+      // Column and join indexes: one entry per pool lane at a time, not one after another (built in turn, 17
+      // column and 22 join indexes were still going 200 s after a restart, and the first queries paid in CPU).
+      std::vector<std::pair<bool, std::pair<std::string, std::string>>> all;   // (true: a join index)
+      for (const auto& w : want) all.push_back({false, w});
+      for (const auto& w : want_probes) all.push_back({true, w});
       SqlThreadPool::instance().parallel_for_static(all.size(), 1, [&](size_t b0, size_t b1, size_t) {
         for (size_t i = b0; i < b1; ++i) {
-          const bool probe = all[i].first == 1;
+          StatementLock lock(rw_lock_, false);
+          const bool probe = all[i].first;
           const auto& w = all[i].second;
-          if (all[i].first == 2) {   // (the row maps are known by the table's own name)
-            for (const auto& kv : tables_)
-              if (lower_of(kv.second.name) == w.first) { grow_row_index(kv.second); break; }
-            continue;
-          }
           auto it = tables_.find(w.first);
           if (it == tables_.end()) continue;
           int c = it->second.get_column_index(w.second);
@@ -24497,8 +24494,36 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
           else if (it->second.col_data[(size_t)c].size() == it->second.row_count()) warm_column_index(it->second, (size_t)c);
         }
       });
-      fprintf(stderr, "asql: warmed %zu column, %zu join and %zu primary-key indexes in %.1f s\n", want.size(), want_probes.size(), want_rows.size(),
-              (double)(kernel_.host().monotonic_ns() - t0) / 1e9);
+      // Primary-key row maps (what a keyed write - the applier's UPDATE or DELETE - finds its row with): the list is
+      // most recently used first, and they are built in that order until the row-index budget (AIOS_SQL_ROWINDEX_MB)
+      // is reached. Built all at once they were 2 GB of a 1 GB budget on st, every one "just used" and so never
+      // evictable. One built here is not a use: it is marked idle, so the budget can take it back if nothing needs it,
+      // and a table past the budget has its map built by the first write that wants it, as before a warm-up.
+      size_t rows_warmed = 0, rows_skipped = 0;
+      const size_t budget = row_index_budget_bytes();
+      for (const auto& name : want_rows) {
+        {
+          std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+          if (row_indices_memory_bytes_locked() >= budget) { ++rows_skipped; continue; }
+        }
+        StatementLock lock(rw_lock_, false);
+        for (const auto& kv : tables_) {
+          if (lower_of(kv.second.name) != name) continue;
+          grow_row_index(kv.second);
+          std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+          auto it = table_row_indices_.find(name);
+          if (it != table_row_indices_.end() && it->second) { it->second->last_access_ns = 0; ++rows_warmed; }
+          break;
+        }
+      }
+      size_t row_mb = 0;
+      {
+        std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+        row_mb = row_indices_memory_bytes_locked() >> 20;
+      }
+      fprintf(stderr, "asql: warmed %zu column, %zu join and %zu primary-key indexes in %.1f s (%zu primary-key maps left for "
+              "their first write: over the %zu MB budget; row maps %zu MB)\n", want.size(), want_probes.size(), rows_warmed,
+              (double)(kernel_.host().monotonic_ns() - t0) / 1e9, rows_skipped, budget >> 20, row_mb);
       fflush(stderr);
       // The builds' scratch (candidate lists, sort buffers) came from every
       // pool lane's own arena; hand it back before the first query arrives.
@@ -55685,11 +55710,15 @@ void SqlDatabase::save_index_list() {
   }
   // And the primary-key row maps: the first keyed write to a table after a restart built its map (a scan of the
   // table, on the writer's time - the replication applier's, or the statement's that came first).
+  // Most recently used first: a restart warms them in this order, as far as the row-index budget goes.
   std::string rlist;
   {
     std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+    std::vector<std::pair<uint64_t, std::string>> by_use;
     for (const auto& kv : table_row_indices_)
-      if (kv.second && kv.second->rows_indexed > 0) rlist += kv.first + "\n";
+      if (kv.second && kv.second->rows_indexed > 0) by_use.push_back({kv.second->last_access_ns, kv.first});
+    std::sort(by_use.begin(), by_use.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+    for (const auto& u : by_use) rlist += u.second + "\n";
   }
   if (!rlist.empty() && rlist != last_rowindex_list_ &&
       kernel_.host().write_file(root_path_ + "/rowindexes.list", ByteSpan((const uint8_t*)rlist.data(), rlist.size())).ok())
