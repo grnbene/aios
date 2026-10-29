@@ -963,7 +963,7 @@ void HardwareCompositor::draw_text_to(std::vector<uint32_t>& buf, int buf_w, int
     const fonts::Glyph* gp = nullptr;
     // Where this glyph's coverage rows live. The face's own blob for anything
     // baked into the atlas; a runtime glyph carries its own.
-    const uint8_t* cov_base = face.cov;
+    const uint8_t* cov_base = face.cov();
     if ((c & 0x80) != 0) {
       uint32_t cp = 0;
       int extra = 0;

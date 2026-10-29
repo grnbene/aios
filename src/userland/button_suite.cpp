@@ -56,7 +56,7 @@ void draw_text_simple(std::vector<uint32_t>& buf, int buf_w, int buf_h,
       for (int gy = 0; gy < static_cast<int>(g.h); ++gy) {
         int py = line_top + g.by + gy;
         if (py < 0 || py >= buf_h) continue;
-        const uint8_t* cov_row = face.cov + g.off + static_cast<size_t>(gy) * g.w;
+        const uint8_t* cov_row = face.cov() + g.off + static_cast<size_t>(gy) * g.w;
         for (int gx = 0; gx < static_cast<int>(g.w); ++gx) {
           int px = glyph_x + gx;
           if (px < 0 || px >= buf_w) continue;
