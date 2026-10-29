@@ -1,0 +1,62 @@
+== fn dis_closures.gr (0 param(s), 92 bytes, 9 constant(s)) ==
+0000    1 CONST 0  ; 1
+0003    | CONST 1  ; 2
+0006    | CONST 2  ; 3
+0009    | LIST 3
+0012    | DEFGLOBAL 3  ; "xs"
+0015    2 CLOSURE 4  ; fn adder
+0018    | DEFGLOBAL 5  ; "adder"
+0021    6 CONST 6  ; 0
+0024    | DEFGLOBAL 7  ; "total"
+0027    7 GETGLOBAL 3  ; "xs"
+0030    | ITERPREP
+0031    | CONST 6  ; 0
+0034    | ITERNEXT 1
+0036    | JUMPF -> 78
+0039    | POP
+0040    | GETLOCAL 3
+0042    | CONST 0  ; 1
+0045    | GT
+0046    | JUMPF -> 73
+0049    | POP
+0050    | GETGLOBAL 7  ; "total"
+0053    | GETGLOBAL 5  ; "adder"
+0056    | GETLOCAL 3
+0058    | CALL 1
+0060    | CONST 0  ; 1
+0063    | CALL 1
+0065    | ADD
+0066    | SETGLOBAL 7  ; "total"
+0069    | POP
+0070    | JUMP -> 74
+0073    | POP
+0074    | POP
+0075    | LOOP -> 34
+0078    | POP
+0079    | POP
+0080    | POP
+0081    8 GETGLOBAL 8  ; "print"
+0084    | GETGLOBAL 7  ; "total"
+0087    | CALL 1
+0089    | POP
+0090    0 NIL
+0091    | RET
+
+== fn adder (1 param(s), 12 bytes, 1 constant(s)) ==
+0000    3 GETLOCAL 1
+0002    4 CLOSURE 0  ; fn <fn>
+0005    |   capture local 2
+0007    |   capture local 1
+0009    | RET
+0010    2 NIL
+0011    | RET
+
+== fn <fn> (1 param(s), 11 bytes, 0 constant(s)) ==
+0000    4 GETLOCAL 1
+0002    | GETUPVAL 0
+0004    | ADD
+0005    | GETUPVAL 1
+0007    | ADD
+0008    | RET
+0009    | NIL
+0010    | RET

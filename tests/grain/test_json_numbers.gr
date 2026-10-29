@@ -1,0 +1,41 @@
+# tests/grain/test_json_numbers.gr
+# Numbers through json_parse and json_stringify: an integer past 64 bits is read as a real (not pinned to
+# the largest integer), a real is written with the fewest digits that read back as the same value (0.1 is
+# "0.1", not "0.10000000000000001"), and what is written reads back equal. Driven at top level, inside a
+# function, inside a closure and nested in control flow.
+fn check(c, msg) { assert_true(c, msg) }
+
+fn run(where) {
+  # integers that fit stay integers, to the edges
+  check(json_parse("9223372036854775807") == 9223372036854775807, where + ": max int64")
+  check(json_parse("-9223372036854775808") == -9223372036854775808, where + ": min int64")
+  check(json_parse("[0, -0, 42]") == [0, 0, 42], where + ": small ints")
+  # past 64 bits: a real of that size, never the saturated integer
+  let big = json_parse("12345678901234567890")
+  check(big == 12345678901234567890.0, where + ": a big integer reads as the real of that size: " + str(big))
+  check(json_parse("-12345678901234567890") == -12345678901234567890.0, where + ": a big negative integer too")
+  check(json_parse("99999999999999999999999") > 9.9e22, where + ": 23 digits")
+  # reals written short
+  check(json_stringify(0.1) == "0.1", where + ": 0.1 writes as 0.1, got " + json_stringify(0.1))
+  check(json_stringify(1.5) == "1.5", where + ": 1.5")
+  check(json_stringify(0.1 + 0.2) == "0.30000000000000004", where + ": 0.1 + 0.2 keeps the digit that tells it apart")
+  check(json_stringify(123456789.125) == "123456789.125", where + ": 123456789.125")
+  check(json_stringify(1e21) == "1e+21", where + ": 1e21")
+  check(json_stringify(-2.5) == "-2.5", where + ": -2.5")
+  check(json_stringify([1.0, 100.0]) == "[1,100]", where + ": whole reals write without a fraction, as before")
+  check(json_stringify(json_parse("1e400")) == "null", where + ": an overflowing real is null, as before")
+  # round trip: every real written reads back as the same value
+  for x in [0.1, 0.2, 1 / 3, 2.5e-7, 6.02214076e23, 1.7976931348623157e308, 5e-324, -0.000001] {
+    check(json_parse(json_stringify(x)) == x, where + ": round trip of " + str(x) + " via " + json_stringify(x))
+  }
+  # a big integer written by stringify, read back, is the same real
+  check(json_parse(json_stringify(big)) == big, where + ": the big one round-trips")
+}
+
+run("top level")
+fn in_fn() { run("in a function") }
+in_fn()
+let clos = fn () { run("in a closure") }
+clos()
+for i in [1] { if i == 1 { run("nested in control flow") } }
+print("json numbers: ok")

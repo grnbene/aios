@@ -124,7 +124,9 @@ You should see `touch_hour` listed with existing rows. Note that local snapshot 
 The typical development loop is: **edit → check → deploy → verify**.
 
 ```bash
-# Check syntax and compilation across all files in the app
+# Check syntax and compilation across all files in the app. A Thing (things/*.gr) may name only the pure builtins,
+# the engine's read/read_raw/write family and what it defines itself; the check refuses anything else with the
+# line (e.g. "things/touch_hour.gr:40: 'now' is not available in a Thing"), before it reaches a deploy.
 grain app check apps/warehouse_touches
 
 # Deploy the updated version locally

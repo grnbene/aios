@@ -1,0 +1,8 @@
+// A fixture for `grain app check`: a Thing that names what a Thing may, and one that does not.
+let app = {
+  "name": "app_things",
+  "description": "things checked before deploy",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8599
+}

@@ -1,0 +1,2 @@
+CLICKED text      20    20   142    17  #ff681da8  "A link into this page"
+CLICKED text     197    20   147    17  #ff1a0dab  "one to another page"

@@ -1,0 +1,1 @@
+grain app: things/bad.gr:10: 'now' is not available in a Thing (pure builtins only: docs/things.md); things/bad.gr:4: 'read_file' is not available in a Thing (pure builtins only: docs/things.md); things/bad.gr:10: 'tally' is not defined

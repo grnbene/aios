@@ -233,6 +233,15 @@ std::vector<std::string> prefetch_urls(Node& doc, const std::string& base, bool 
 Result<void> Browser::visit(const std::string& url, const Metrics& m, int viewport_w, bool record,
                             const FetchOptions& opt) {
   if (!fetch_) return Result<void>(Status::Unsupported, "this browser has nothing to fetch with");
+  // A URL with a fragment: the page without it is fetched, and the fragment names the element to scroll to.
+  if (const size_t hash = url.find('#'); hash != std::string::npos) {
+    const std::string frag = url.substr(hash + 1);
+    Result<void> r = visit(url.substr(0, hash), m, viewport_w, record, opt);
+    if (r.ok()) { target_ = frag; target_pending_ = !frag.empty(); }
+    return r;
+  }
+  target_.clear();
+  target_pending_ = false;
   std::string low = lowered(url);
   if (low.compare(0, 7, "mailto:") == 0)
     return Result<void>(Status::Unsupported, "that is an email address, not a page: " + url.substr(7));
@@ -316,6 +325,7 @@ Result<void> Browser::visit(const std::string& url, const Metrics& m, int viewpo
       history_.push_back(doc_.url);
       history_index_ = (int)history_.size() - 1;
     }
+    note_visited(doc_.url);
   }
 
   status_ = doc_.title + " · " + dec(doc_.fragments.size()) + " box(es), " + dec(doc_.links.size()) + " link(s)";
@@ -431,10 +441,13 @@ Result<void> Browser::follow(size_t link_index, const Metrics& m, int viewport_w
   if (hash != std::string::npos) {
     std::string without = href.substr(0, hash);
     if (without.empty() || without == doc_.url) {
-      status_ = "that link points into this page";
+      // The page is already here: the pane scrolls to the element the fragment names, and `:target` moves to it.
+      target_ = href.substr(hash + 1);
+      target_pending_ = true;
+      status_ = target_.empty() ? "top of the page" : "#" + target_;
+      note_visited(doc_.url + "#" + target_);   // the anchor counts as visited, as Chrome has it
       return Ok();
     }
-    href = without;
   }
   return visit(href, m, viewport_w, true);
 }

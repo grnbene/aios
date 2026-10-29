@@ -20,7 +20,7 @@ fn blank_user(userid) {
       }
     },
     "loads": {"scans": 0.0, "orders": 0, "dispatches": 0, "avgloadtime": 0.0, "avgdispatchunits": 0.0, "manual": 0, "manualpct": 0.0, "forced": 0,
-              "pickupunits": 0.0, "pickuporders": 0},
+              "pickupunits": 0.0, "pickuporders": 0, "clearedunits": 0.0, "clearedorders": 0},
     "sticker": {"packed": 0, "packedunits": 0.0, "staged": 0, "stagedunits": 0.0, "binds": 0},
     "touches": 0.0,
     "parts": {"receiving": 0.0, "picking": 0.0, "movements": 0.0, "loads": 0.0, "sticker": 0.0},
@@ -178,7 +178,7 @@ fn merge_rows(db, rows, start_date, stop_date) {
     return users[key] ?? get_or_put(users, key, blank_user(uid))
   }
   let sets = {}   // key -> the distinct sets merged across the days
-  let set_of = fn(key) { return get_or_put(sets, key, {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}, "pickups": {}}) }
+  let set_of = fn(key) { return get_or_put(sets, key, {"items": {}, "vendors": {}, "orders": {}, "moves": {}, "packed": {}, "staged": {}, "binds": {}, "pickups": {}, "cleared": {}}) }
   let all_items = {}
   let all_vendors = {}
   let all_orders = {}
@@ -187,7 +187,8 @@ fn merge_rows(db, rows, start_date, stop_date) {
 
   // In the PHP report's order (receiving, picking, moves, loads, sticker): a user's id is shown as the first source has it.
   // pickup orders after loads, as the PHP report adds them (credited to who took the order)
-  for part in ["rec", "pick", "moves", "loads", "pickup", "sticker"] {
+  // deliveries cleared from their run (touch_hour section 7) after the pickups: loads with no run or driver
+  for part in ["rec", "pick", "moves", "loads", "pickup", "cleared", "sticker"] {
     if part == "loads" {
       // a run over several days is one run: its rows combined, then counted once per name on its dispatch
       let runs = {}
@@ -260,7 +261,8 @@ fn merge_rows(db, rows, start_date, stop_date) {
       for key in keys(dayrow.users) {
         let d = dayrow.users[key]
         if part == "rec" {
-          if d.rec.scans > 0 {
+          // a receipt can be someone's who scanned nothing that hour (touch_hour: receive_hour)
+          if d.rec.scans > 0 or real(d.rec.qty_in) != 0.0 or real(d.rec.qty_out) != 0.0 {
             let u = get_user(key, d.userid)
             u.receiving.scans = u.receiving.scans + d.rec.scans
             u.receiving.qty_in = u.receiving.qty_in + real(d.rec.qty_in)
@@ -295,6 +297,15 @@ fn merge_rows(db, rows, start_date, stop_date) {
             let have = get_or_put(s.pickups, o, {"u": real(mine.u), "t": nil, "d": nil})
             have.t = max(have.t, mine.t)
             have.d = max(have.d, mine.d)
+          }
+        } else if part == "cleared" and len(d.cleared ?? {}) > 0 {
+          let u = get_user(key, d.userid)
+          u.name = first_present(u.name, d.dname) ?? u.name
+          let s = set_of(key)
+          for o in keys(d.cleared) {
+            // one order once over the range, as a pickup
+            let have = get_or_put(s.cleared, o, {"u": real(d.cleared[o].u), "d": nil})
+            have.d = max(have.d, d.cleared[o].d)
           }
         } else if part == "sticker" and (len(d.packed) > 0 or len(d.staged) > 0 or len(d.binds) > 0) {
           get_user(key, d.userid)
@@ -349,8 +360,13 @@ fn merge_rows(db, rows, start_date, stop_date) {
       u.loads.pickupunits = u.loads.pickupunits + pk.u
       if pk.d != nil { get_or_put(days, key, {})[pk.d] = true }
     }
-    u.loads.scans = u.loads.scans + u.loads.pickupunits
-    u.loads.orders = u.loads.orders + u.loads.pickuporders
+    for o in keys(s.cleared) {
+      u.loads.clearedorders = u.loads.clearedorders + 1
+      u.loads.clearedunits = u.loads.clearedunits + s.cleared[o].u
+      if s.cleared[o].d != nil { get_or_put(days, key, {})[s.cleared[o].d] = true }
+    }
+    u.loads.scans = u.loads.scans + u.loads.pickupunits + u.loads.clearedunits
+    u.loads.orders = u.loads.orders + u.loads.pickuporders + u.loads.clearedorders
   }
   // real names (www_users holds password hashes too: only the name columns are read)
   let n_res = db == nil ? {"ok": false} : pcall(db_query, db, "SELECT userid, realname FROM www_users")
@@ -383,8 +399,9 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     let timed = distinct.timed[k]
     u.loads.avgloadtime = timed != nil and timed > 0 ? r1(distinct.secs[k] / timed / 60.0) : 0.0
     if timed != nil { secs_all = secs_all + distinct.secs[k]; timed_all = timed_all + timed }
-    // pickup units were never scanned or dispatched: out of the dispatch average and the skipped percent
-    let scanned = u.loads.scans - u.loads.pickupunits
+    // pickup units were never scanned or dispatched, and cleared ones have no run left: out of the dispatch average
+    // and the skipped percent
+    let scanned = u.loads.scans - u.loads.pickupunits - u.loads.clearedunits
     u.loads.avgdispatchunits = u.loads.dispatches > 0 ? r1(scanned / real(u.loads.dispatches)) : 0.0
     u.loads.manualpct = scanned > 0 ? r1(100.0 * real(u.loads.manual) / scanned) : 0.0
     u.parts = {"receiving": u.receiving.qty_in + u.receiving.qty_out, "picking": u.picking.qty, "movements": u.movements.qty,
@@ -399,14 +416,14 @@ fn rollup(users, days, start_date, stop_date, distinct) {
     // the sums (items, vendors and orders are distinct across users, so not added; nor are the averages)
     add_into(totals.receiving, u.receiving, ["scans", "qty_in", "qty_out"])
     add_into(totals.picking, u.picking, ["lines", "qty"])
-    add_into(totals.loads, u.loads, ["scans", "orders", "dispatches", "manual", "forced", "pickupunits", "pickuporders"])
+    add_into(totals.loads, u.loads, ["scans", "orders", "dispatches", "manual", "forced", "pickupunits", "pickuporders", "clearedunits", "clearedorders"])
     add_into(totals.sticker, u.sticker)
     add_into(totals.parts, u.parts)
     add_into(totals.movements, u.movements, ["moves", "qty", "by_type"])
     push(user_list, u)
   }
   totals.loads.avgloadtime = timed_all > 0 ? r1(secs_all / timed_all / 60.0) : 0.0
-  let scanned_all = totals.loads.scans - totals.loads.pickupunits
+  let scanned_all = totals.loads.scans - totals.loads.pickupunits - totals.loads.clearedunits
   totals.loads.avgdispatchunits = totals.loads.dispatches > 0 ? r1(scanned_all / real(totals.loads.dispatches)) : 0.0
   totals.loads.manualpct = scanned_all > 0 ? r1(100.0 * real(totals.loads.manual) / scanned_all) : 0.0
   totals.active_days = len(all_days)

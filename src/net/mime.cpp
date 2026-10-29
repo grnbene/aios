@@ -7,6 +7,7 @@
 #include <map>
 
 #include "aios/core/base64.hpp"
+#include "aios/core/html_entities.hpp"
 #include "aios/core/bytes.hpp"
 
 namespace aios::net::mime {
@@ -401,6 +402,19 @@ std::string decode_words(std::string_view value) {
   size_t i = 0;
   bool last_was_word = false;
   std::string pending_ws;   // whitespace seen since the last encoded word
+  // Adjacent encoded words of one charset are one byte stream (RFC 2047 §6.2 lets a sender cut a
+  // multi-byte character between two words, and Java mailers do); their bytes are collected and
+  // converted together, so a UTF-8 sequence split across words comes out as the character, not
+  // as two replacement marks.
+  std::string run;
+  std::string run_cs;
+  bool have_run = false;
+  auto flush_run = [&] {
+    if (!have_run) return;
+    out += to_utf8(run, run_cs);
+    run.clear();
+    have_run = false;
+  };
   while (i < value.size()) {
     if (value[i] == '=' && i + 1 < value.size() && value[i + 1] == '?') {
       // =?charset?enc?text?=
@@ -420,7 +434,9 @@ std::string decode_words(std::string_view value) {
         if (ok) {
           if (!last_was_word) out += pending_ws;   // whitespace between two encoded words is dropped
           pending_ws.clear();
-          out += to_utf8(raw, cs);
+          const std::string ncs = normalize_charset(cs);
+          if (!have_run || ncs != run_cs) { flush_run(); run_cs = ncs; have_run = true; }
+          run += raw;
           last_was_word = true;
           i = end + 2;
           continue;
@@ -433,12 +449,14 @@ std::string decode_words(std::string_view value) {
       ++i;
       continue;
     }
+    flush_run();
     out += pending_ws;
     pending_ws.clear();
     out += c;
     last_was_word = false;
     ++i;
   }
+  flush_run();
   out += pending_ws;
   // collapse whitespace runs, trim
   std::string collapsed;
@@ -603,8 +621,19 @@ std::string format_date(int64_t epoch, int offset_minutes) {
   return buf;
 }
 
+// A tag whose element starts on a line of its own in the text: what a message written as a table of
+// rows and cells, a list, or a run of <div>s reads like once the tags are gone.
+bool html_block_tag(std::string_view name) {
+  static constexpr std::string_view kBlocks[] = {
+      "p", "div", "tr", "li", "ul", "ol", "table", "tbody", "thead", "tfoot", "blockquote", "pre",
+      "h1", "h2", "h3", "h4", "h5", "h6", "hr", "section", "article", "header", "footer", "dt", "dd"};
+  for (std::string_view b : kBlocks) if (ieq(name, b)) return true;
+  return false;
+}
+
 std::string html_to_text(std::string_view html) {
-  // <style>..</style> and <script>..</script> go whole.
+  // <style>..</style>, <script>..</script> and <!-- comments --> go whole; a block element's tags
+  // become a line break, a cell's a space, <br> a line break; every other tag is dropped.
   std::string s;
   s.reserve(html.size());
   size_t i = 0;
@@ -613,19 +642,30 @@ std::string html_to_text(std::string_view html) {
       auto starts = [&](std::string_view tag) {
         return i + tag.size() <= html.size() && ieq(html.substr(i, tag.size()), tag);
       };
+      if (starts("<!--")) {
+        size_t close = html.find("-->", i + 4);
+        i = close == std::string_view::npos ? html.size() : close + 3;
+        continue;
+      }
       if (starts("<style") || starts("<script")) {
         bool style = starts("<style");
         size_t close = find_i(html, style ? "</style>" : "</script>", i);
         if (close != std::string_view::npos) { i = close + (style ? 8 : 9); continue; }
       }
-      if (starts("<br")) {
-        size_t gt = html.find('>', i);
-        if (gt != std::string_view::npos) { s += '\n'; i = gt + 1; continue; }
-      }
-      if (starts("</p>")) { s += "\n\n"; i += 4; continue; }
       size_t gt = html.find('>', i);
       if (gt == std::string_view::npos) { s += html[i]; ++i; continue; }
-      i = gt + 1;   // any other tag: dropped
+      // the element's name: after '<' and an optional '/', up to a space, '/' or '>'
+      size_t n0 = i + 1;
+      const bool closing = n0 < gt && html[n0] == '/';
+      if (closing) ++n0;
+      size_t n1 = n0;
+      while (n1 < gt && html[n1] != ' ' && html[n1] != '/' && html[n1] != '\t' && html[n1] != '\r' && html[n1] != '\n') ++n1;
+      std::string_view name = html.substr(n0, n1 - n0);
+      if (ieq(name, "br")) s += '\n';
+      else if (closing && ieq(name, "p")) s += "\n\n";
+      else if (ieq(name, "td") || ieq(name, "th")) s += ' ';
+      else if (html_block_tag(name)) s += '\n';
+      i = gt + 1;
       continue;
     }
     s += html[i];
@@ -639,12 +679,9 @@ std::string html_to_text(std::string_view html) {
     size_t semi = s.find(';', k);
     if (semi == std::string::npos || semi - k > 10) { out += s[k]; continue; }
     std::string_view ent = std::string_view(s).substr(k + 1, semi - k - 1);
+    uint32_t named = 0;
     if (ent == "nbsp") out += ' ';
-    else if (ent == "amp") out += '&';
-    else if (ent == "lt") out += '<';
-    else if (ent == "gt") out += '>';
-    else if (ent == "quot") out += '"';
-    else if (ent == "apos") out += '\'';
+    else if (html_named_entity(ent, named)) put_utf8(out, named);
     else if (!ent.empty() && ent[0] == '#') {
       uint32_t cp = 0;
       bool ok = ent.size() > 1;
@@ -666,7 +703,21 @@ std::string html_to_text(std::string_view html) {
     }
     k = semi;
   }
-  return std::string(trim(out));
+  // Tidy: a run of spaces is one space, none beside a line break, at most one blank line in a row.
+  std::string tidy;
+  tidy.reserve(out.size());
+  int newlines = 0;
+  bool space = false;
+  for (char c : out) {
+    if (c == '\r') continue;
+    if (c == '\n') { space = false; if (++newlines <= 2) tidy += '\n'; continue; }
+    if (c == ' ' || c == '\t') { space = true; continue; }
+    if (space && !tidy.empty() && tidy.back() != '\n') tidy += ' ';
+    space = false;
+    newlines = 0;
+    tidy += c;
+  }
+  return std::string(trim(tidy));
 }
 
 TypedValue parse_typed_value(std::string_view v) {
@@ -855,17 +906,28 @@ void walk_part(Walk& w, std::string_view raw, int depth) {
     std::string boundary = ct.param("boundary");
     if (!boundary.empty()) { walk_multipart(w, body, boundary, depth); return; }
   }
-  if (ct.value == "message/rfc822") {
-    walk_part(w, body, depth + 1);
-    return;
-  }
-
   std::string cte = find_header(hdrs, "Content-Transfer-Encoding");
   TypedValue cd = parse_typed_value(find_header(hdrs, "Content-Disposition"));
   std::string filename = cd.param("filename");
   if (filename.empty()) filename = ct.param("name");
   filename = decode_words(filename);
   std::string cid = strip_angle(find_header(hdrs, "Content-ID"));
+
+  if (ct.value == "message/rfc822") {
+    // A message forwarded as a file is an attachment the reader can open or save (its size is the
+    // enclosed message's bytes); its parts are still walked, as the first text found anywhere is
+    // the body when the outer message carries none.
+    if (!filename.empty()) {
+      AttachmentInfo a;
+      a.filename = filename;
+      a.mime_type = ct.value;
+      a.content_id = cid;
+      a.size_bytes = body.size();
+      w.out.attachments.push_back(std::move(a));
+    }
+    walk_part(w, body, depth + 1);
+    return;
+  }
 
   const bool is_text = major == "text";
   std::string payload;

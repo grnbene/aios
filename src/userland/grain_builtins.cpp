@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -294,26 +295,95 @@ Value bi_join(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::string(out);
 }
 
+// --- characters in UTF-8 text ----------------------------------------------------------------------
+// Strings are bytes; len, s[i], slice and index_of count bytes. The builtins that speak in characters
+// (chars, char_at, ord, chr, pad_left, pad_right, upper, lower) step through the text one UTF-8 sequence
+// at a time with these. A byte that is not well-formed UTF-8 is one character of its own, kept as it is.
+
+// How many bytes the character starting at s[at] takes (1 for an invalid lead or a cut-off sequence).
+size_t utf8_char_len(const std::string& s, size_t at) {
+  const unsigned char b = (unsigned char)s[at];
+  size_t n = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 1;
+  if (at + n > s.size()) return 1;
+  for (size_t k = 1; k < n; ++k) if (((unsigned char)s[at + k] & 0xC0) != 0x80) return 1;
+  return n;
+}
+
+// The code point of the character at s[at] (the byte itself when it is not well-formed UTF-8).
+uint32_t utf8_code_point(const std::string& s, size_t at, size_t n) {
+  const unsigned char b = (unsigned char)s[at];
+  if (n == 1) return b;
+  uint32_t cp = n == 2 ? (b & 0x1F) : n == 3 ? (b & 0x0F) : (b & 0x07);
+  for (size_t k = 1; k < n; ++k) cp = (cp << 6) | ((unsigned char)s[at + k] & 0x3F);
+  return cp;
+}
+
+void utf8_append(std::string& out, uint32_t cp) {
+  if (cp < 0x80) out += (char)cp;
+  else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+  else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+  else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+}
+
+size_t utf8_count(const std::string& s) {
+  size_t n = 0;
+  for (size_t at = 0; at < s.size(); at += utf8_char_len(s, at)) ++n;
+  return n;
+}
+
+// Case for ASCII, the Latin-1 Supplement and Latin Extended-A: the letters of the Western European
+// languages (names, addresses, product text). Other scripts are returned as they are. ß has no
+// single-character upper case and stays ß; ÿ's upper case Ÿ is in Extended-A.
+uint32_t to_upper_cp(uint32_t c) {
+  if (c >= 'a' && c <= 'z') return c - 32;
+  if (c < 0xE0) return c;
+  if (c <= 0xFE && c != 0xF7) return c - 32;                                  // à..þ -> À..Þ (÷ is not a letter)
+  if (c == 0xFF) return 0x178;                                                // ÿ -> Ÿ
+  if (c == 0x131) return 'I';                                                 // dotless ı
+  if (c >= 0x100 && c <= 0x137) return (c & 1) ? c - 1 : c;                   // pairs: even upper, odd lower
+  if (c >= 0x139 && c <= 0x148) return (c & 1) ? c : c - 1;                   // pairs: odd upper, even lower
+  if (c >= 0x14A && c <= 0x177) return (c & 1) ? c - 1 : c;
+  if (c >= 0x179 && c <= 0x17E) return (c & 1) ? c : c - 1;
+  if (c == 0x17F) return 'S';                                                 // long s
+  return c;
+}
+
+uint32_t to_lower_cp(uint32_t c) {
+  if (c >= 'A' && c <= 'Z') return c + 32;
+  if (c < 0xC0) return c;
+  if (c <= 0xDE && c != 0xD7) return c + 32;                                  // À..Þ -> à..þ (× is not a letter)
+  if (c == 0x178) return 0xFF;                                                // Ÿ -> ÿ
+  if (c == 0x130) return 'i';                                                 // İ (dotted I)
+  if (c >= 0x100 && c <= 0x137) return (c & 1) ? c : c + 1;
+  if (c >= 0x139 && c <= 0x148) return (c & 1) ? c + 1 : c;
+  if (c >= 0x14A && c <= 0x177) return (c & 1) ? c : c + 1;
+  if (c >= 0x179 && c <= 0x17E) return (c & 1) ? c + 1 : c;
+  return c;
+}
+
+Value recase(const Value& in_v, uint32_t (*map)(uint32_t)) {
+  const std::string& in = in_v.str();
+  std::string out;
+  bool changed = false;
+  for (size_t at = 0; at < in.size();) {
+    const size_t n = utf8_char_len(in, at);
+    const uint32_t cp = utf8_code_point(in, at, n);
+    const uint32_t mapped = (n == 1 && cp >= 0x80) ? cp : map(cp);   // a stray byte is not a letter
+    if (mapped == cp) { out.append(in, at, n); }
+    else { utf8_append(out, mapped); changed = true; }
+    at += n;
+  }
+  return changed ? Value::string(std::move(out)) : in_v;
+}
+
 Value bi_upper(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "upper")) return Value::nil();
-  const std::string& in = args[0].str();
-  size_t at = 0;
-  while (at < in.size() && !(in[at] >= 'a' && in[at] <= 'z')) ++at;
-  if (at == in.size()) return args[0];
-  std::string s = in;
-  for (size_t i = at; i < s.size(); ++i) if (s[i] >= 'a' && s[i] <= 'z') s[i] = (char)(s[i] - 32);
-  return Value::string(std::move(s));
+  return recase(args[0], to_upper_cp);
 }
 
 Value bi_lower(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "lower")) return Value::nil();
-  const std::string& in = args[0].str();
-  size_t at = 0;
-  while (at < in.size() && !(in[at] >= 'A' && in[at] <= 'Z')) ++at;
-  if (at == in.size()) return args[0];
-  std::string s = in;
-  for (size_t i = at; i < s.size(); ++i) if (s[i] >= 'A' && s[i] <= 'Z') s[i] = (char)(s[i] + 32);
-  return Value::string(std::move(s));
+  return recase(args[0], to_lower_cp);
 }
 
 // -1 for "not here", so a caller can test it without a second call.
@@ -370,14 +440,17 @@ Value bi_slice(Vm&, std::vector<Value>& args, std::string& error) {
 Value bi_ord(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "ord")) return Value::nil();
   if (args[0].str().empty()) { error = "ord() of an empty string"; return Value::nil(); }
-  return Value::integer((int64_t)(unsigned char)args[0].str()[0]);
+  const std::string& s = args[0].str();
+  return Value::integer((int64_t)utf8_code_point(s, 0, utf8_char_len(s, 0)));
 }
 
 Value bi_chr(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[0], error, "chr")) return Value::nil();
   const int64_t c = args[0].as_int();
-  if (c < 0 || c > 255) { error = "chr() takes 0..255"; return Value::nil(); }
-  return Value::string(std::string(1, (char)c));
+  if (c < 0 || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) { error = "chr() takes a code point, 0..1114111 and not a surrogate"; return Value::nil(); }
+  std::string out;
+  utf8_append(out, (uint32_t)c);
+  return Value::string(std::move(out));
 }
 
 // --- arithmetic ------------------------------------------------------------
@@ -1133,13 +1206,15 @@ Value bi_pad_left(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "pad_left") || !want_number(args[1], error, "pad_left")) return Value::nil();
   const std::string& s = args[0].str();
   int64_t target_len = args[1].as_int();
-  if (target_len <= (int64_t)s.size()) return args[0];
-  char pad_char = ' ';
+  const int64_t have = (int64_t)utf8_count(s);   // characters, so padded columns line up
+  if (target_len <= have) return args[0];
+  std::string pad_char = " ";
   if (args.size() > 2 && args[2].type == Type::Str && !args[2].str().empty()) {
-    pad_char = args[2].str()[0];
+    pad_char = args[2].str().substr(0, utf8_char_len(args[2].str(), 0));
   }
   if (target_len > 1000000) { error = "pad_left() target length is too large"; return Value::nil(); }
-  std::string out(target_len - s.size(), pad_char);
+  std::string out;
+  for (int64_t i = have; i < target_len; ++i) out += pad_char;
   out += s;
   return Value::string(out);
 }
@@ -1148,14 +1223,15 @@ Value bi_pad_right(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "pad_right") || !want_number(args[1], error, "pad_right")) return Value::nil();
   const std::string& s = args[0].str();
   int64_t target_len = args[1].as_int();
-  if (target_len <= (int64_t)s.size()) return args[0];
-  char pad_char = ' ';
+  const int64_t have = (int64_t)utf8_count(s);
+  if (target_len <= have) return args[0];
+  std::string pad_char = " ";
   if (args.size() > 2 && args[2].type == Type::Str && !args[2].str().empty()) {
-    pad_char = args[2].str()[0];
+    pad_char = args[2].str().substr(0, utf8_char_len(args[2].str(), 0));
   }
   if (target_len > 1000000) { error = "pad_right() target length is too large"; return Value::nil(); }
   std::string out = s;
-  out.append(target_len - s.size(), pad_char);
+  for (int64_t i = have; i < target_len; ++i) out += pad_char;
   return Value::string(out);
 }
 
@@ -1175,9 +1251,15 @@ Value bi_char_at(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "char_at") || !want_number(args[1], error, "char_at")) return Value::nil();
   const std::string& s = args[0].str();
   int64_t idx = args[1].as_int();
-  if (idx < 0) idx += (int64_t)s.size();
-  if (idx < 0 || idx >= (int64_t)s.size()) return Value::string("");
-  return Value::string(std::string(1, s[(size_t)idx]));
+  if (idx < 0) idx += (int64_t)utf8_count(s);   // a character index, from the end when negative
+  if (idx < 0) return Value::string("");
+  size_t at = 0;
+  for (int64_t i = 0; at < s.size(); ++i) {
+    const size_t n = utf8_char_len(s, at);
+    if (i == idx) return Value::string(s.substr(at, n));
+    at += n;
+  }
+  return Value::string("");
 }
 
 Value bi_chars(Vm&, std::vector<Value>& args, std::string& error) {
@@ -1185,7 +1267,11 @@ Value bi_chars(Vm&, std::vector<Value>& args, std::string& error) {
   const std::string& s = args[0].str();
   std::vector<Value> out;
   out.reserve(s.size());
-  for (char c : s) out.push_back(Value::string(std::string(1, c)));
+  for (size_t at = 0; at < s.size();) {
+    const size_t n = utf8_char_len(s, at);
+    out.push_back(Value::string(s.substr(at, n)));
+    at += n;
+  }
   return Value::list(std::move(out));
 }
 
@@ -1249,6 +1335,39 @@ Value bi_map(Vm& vm, std::vector<Value>& args, std::string& error) {
     return Value::list(std::move(out));
   }
   error = std::string("map() wants a list or map, got a ") + type_name(col.type);
+  return Value::nil();
+}
+
+// flat_map(list, fn): fn's results joined into one list - a list result contributes its items, nil nothing, any
+// other value itself. One level, as JavaScript's flatMap: `flat_map(orders, fn (o) { return o.lines })`.
+Value bi_flat_map(Vm& vm, std::vector<Value>& args, std::string& error) {
+  const Value& col = args[0];
+  const Value& fn = args[1];
+  std::vector<Value> out;
+  auto take = [&](Value res) {
+    if (res.type == Type::List) { const auto& items = res.list_items(); out.insert(out.end(), items.begin(), items.end()); }
+    else if (res.type != Type::Nil) out.push_back(std::move(res));
+  };
+  if (col.type == Type::List) {
+    const auto& items = col.list_items();
+    out.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+      Value res = vm.call(fn, {items[i]}, error);
+      if (!error.empty()) return Value::nil();
+      take(std::move(res));
+    }
+    return Value::list(std::move(out));
+  }
+  if (col.type == Type::Map) {
+    auto* m = static_cast<MapObj*>(col.obj.get());
+    for (const auto& [k, v] : m->entries) {
+      Value res = vm.call(fn, {Value::string(k), v}, error);
+      if (!error.empty()) return Value::nil();
+      take(std::move(res));
+    }
+    return Value::list(std::move(out));
+  }
+  error = std::string("flat_map() wants a list or map, got a ") + type_name(col.type);
   return Value::nil();
 }
 
@@ -2298,10 +2417,14 @@ class JsonParser {
       while (peek() >= '0' && peek() <= '9') get();
     }
     std::string num_str = s.substr(start, pos - start);
-    if (is_float) {
-      return Value::real(std::strtod(num_str.c_str(), nullptr));
+    if (!is_float) {
+      // An integer that fits is an integer; one past 64 bits is a real of that size (as a source
+      // literal is), never the largest integer standing in for it.
+      int64_t n = 0;
+      const auto r = std::from_chars(num_str.data(), num_str.data() + num_str.size(), n, 10);
+      if (r.ec == std::errc() && r.ptr == num_str.data() + num_str.size()) return Value::integer(n);
     }
-    return Value::integer((int64_t)std::strtoll(num_str.c_str(), nullptr, 10));
+    return Value::real(std::strtod(num_str.c_str(), nullptr));
   }
 
   Value parse_string(std::string& err) {
@@ -2449,8 +2572,10 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       if (std::isnan(v.d) || std::isinf(v.d)) {
         out += "null";
       } else {
-        std::snprintf(buf, sizeof(buf), "%.17g", v.d);
-        out += buf;
+        // The fewest digits that read back as the same value: 0.1 is "0.1", 0.1 + 0.2 is
+        // "0.30000000000000004" (what JavaScript and Python write), not 17 digits for every real.
+        const auto r = std::to_chars(buf, buf + sizeof(buf), v.d);
+        out.append(buf, r.ptr);
       }
       break;
     }
@@ -7171,6 +7296,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("sort", 1, 1, bi_sort);
   vm.define_native("reverse", 1, 1, bi_reverse);
   vm.define_native("map", 2, 2, bi_map);
+  vm.define_native("flat_map", 2, 2, bi_flat_map);
   vm.define_native("filter", 2, 2, bi_filter);
   vm.define_native("reduce", 2, 3, bi_reduce);
   vm.define_native("each", 2, 2, bi_each);

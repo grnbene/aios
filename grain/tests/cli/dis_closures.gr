@@ -1,0 +1,8 @@
+let xs = [1, 2, 3]
+fn adder(n) {
+  let k = n
+  return fn(x) { return x + k + n }
+}
+let total = 0
+for x in xs { if x > 1 { total = total + adder(x)(1) } }
+print(total)

@@ -1032,6 +1032,50 @@ Result<void> BinlogConsumer::discover_master_pos(std::string* out_file) {
   return Ok();
 }
 
+bool BinlogConsumer::resume_after_impossible_position(const std::vector<std::pair<std::string, uint64_t>>& logs, const std::string& file,
+                                                      uint64_t pos, std::string* next_file, uint64_t* next_pos, std::string* why) {
+  // Binlog names sort by their numeric suffix as text (mariadb-bin.000027 < mariadb-bin.000028, same width).
+  size_t at = logs.size();
+  for (size_t i = 0; i < logs.size(); ++i) if (logs[i].first == file) { at = i; break; }
+  if (at < logs.size()) {
+    if (logs[at].second >= pos) return false;   // the position is within the file: not this failure
+    if (at + 1 >= logs.size()) return false;    // the current log, shorter than asked: nothing after it yet
+    *next_file = logs[at + 1].first;
+    *next_pos = 4;
+    *why = file + " ends at " + std::to_string(logs[at].second) + ", " + std::to_string(pos - logs[at].second) +
+           " bytes before the saved position (a crash truncated it: those changes are in the master's tables but not in its log, and the mirror will not have them until the tables they touched are reseeded)";
+    return true;
+  }
+  for (const auto& l : logs) {
+    if (l.first > file) { *next_file = l.first; *next_pos = 4; *why = file + " is no longer among the master's logs"; return true; }
+  }
+  return false;
+}
+
+Result<void> BinlogConsumer::recover_impossible_position(const std::string& err) {
+  MariaWireSession sess(config_.host, config_.port);
+  auto cr = sess.connect(config_.user, config_.password, config_.database);
+  if (!cr.ok()) return cr.status();
+  auto blr = sess.query("SHOW BINARY LOGS;");
+  if (!blr.ok() || !blr->ok) return Error(Status::IoError, "SHOW BINARY LOGS failed while recovering the position");
+  std::vector<std::pair<std::string, uint64_t>> logs;
+  for (const auto& row : blr->rows) {
+    if (row.size() < 2) continue;
+    logs.emplace_back(row[0].bytes, std::strtoull(row[1].bytes.c_str(), nullptr, 10));
+  }
+  std::string next_file, why;
+  uint64_t next_pos = 0;
+  if (!resume_after_impossible_position(logs, active_binlog_file_, active_binlog_pos_, &next_file, &next_pos, &why))
+    return Error(Status::Invalid, "no log after " + active_binlog_file_ + " to resume from");
+  fprintf(stderr, "[cdc] %s; the master refused %s/%llu (%s). Resuming from %s/%llu.\n", why.c_str(), active_binlog_file_.c_str(),
+          (unsigned long long)active_binlog_pos_, err.c_str(), next_file.c_str(), (unsigned long long)next_pos);
+  fflush(stderr);
+  active_binlog_file_ = next_file;
+  active_binlog_pos_ = (uint32_t)next_pos;
+  db_.save_cdc_position();   // so a restart does not come back to the refused position
+  return connect_and_dump();
+}
+
 Result<void> BinlogConsumer::send_register_slave() {
   std::vector<uint8_t> payload;
   payload.push_back(0x15); // COM_REGISTER_SLAVE
@@ -1240,6 +1284,14 @@ Result<size_t> BinlogConsumer::step(int timeout_ms) {
     std::string err = (pkt.size() > 9) ? std::string((const char*)pkt.data() + 9, pkt.size() - 9) : "Binlog stream error";
     last_error_ = err;
     connected_ = false;
+    // "Client requested master to start replication from impossible position": the saved position is past the end
+    // of a log a crash truncated (atl, 2026-10-28: 15 KB short, retried every second for twelve hours while the
+    // mirror stood still). Resume from the next log and say so, rather than retry what can never succeed.
+    if (err.find("impossible position") != std::string::npos) {
+      auto rr = recover_impossible_position(err);
+      if (rr.ok()) return 0;
+      return Error(Status::Invalid, err + " (" + rr.error().message + ")");
+    }
     return Error(Status::Invalid, err);
   } else if (packet_kind_ == PacketKind::Eof) {
     // End of binlog stream or rotate

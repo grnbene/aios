@@ -1,0 +1,3 @@
+CLICKED rect      20    61   320    76  #fffff5e0
+CLICKED border    20    61   320    33  #ffff3300
+CLICKED border    20   104   320    33  #ffc0c0c0

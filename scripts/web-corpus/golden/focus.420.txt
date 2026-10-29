@@ -1,0 +1,13 @@
+# page focus.html  viewport=420
+# title A focused field
+# content 420x182  background=ffffffff  links=0
+text      20    32   378    19  #ff1a1a1a  14px              "Click the name field: its border turns orange, and the"
+text      20    51   287    19  #ff1a1a1a  14px              "form behind it goes cream (focus-within)."
+rect      20    82   320    35  #ffffffff  r=2
+border    20    82   320    35  #ffc0c0c0  r=2
+text      28    90   304    19  #ff000000  14px              "Ada"
+rect      20   127   320    35  #ffffffff  r=2
+border    20   127   320    35  #ffc0c0c0  r=2
+text      28   135   304    19  #ff000000  14px              "a note"
+# glyph-gaps (none)
+

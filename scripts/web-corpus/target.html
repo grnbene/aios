@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><title>An anchor within the page</title>
+<style>
+body { margin: 20px; font: 14px sans-serif; background: #ffffff; }
+p { margin: 0 0 12px; }
+.filler { height: 1600px; background: #f4f4f4; }
+#second { padding: 10px; background: #e8e8e8; }
+#second:target { background: #ffe08a; }
+</style></head>
+<body>
+<p><a id="go" href="#second">Jump to the second section</a></p>
+<div class="filler">a tall first section</div>
+<h2 id="second">The second section</h2>
+<p>It sits well below the first screen, so following the link scrolls the page and the heading takes its :target colour.</p>
+<div class="filler">more below it</div>
+</body></html>

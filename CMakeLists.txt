@@ -485,6 +485,18 @@ add_test(NAME asql.cdc_stall.check COMMAND aios-asql-cdc-stall-check)
 add_executable(aios-asql-row-index-churn-check tools/asql-row-index-churn-check.cpp)
 target_link_libraries(aios-asql-row-index-churn-check PRIVATE aios)
 add_test(NAME asql.row_index_churn.check COMMAND aios-asql-row-index-churn-check)
+add_executable(aios-asql-dict-width-check tools/asql-dict-width-check.cpp)
+target_link_libraries(aios-asql-dict-width-check PRIVATE aios)
+add_test(NAME asql.dict_width.check COMMAND aios-asql-dict-width-check)
+add_executable(aios-asql-temporal-choice-check tools/asql-temporal-choice-check.cpp)
+target_link_libraries(aios-asql-temporal-choice-check PRIVATE aios)
+add_test(NAME asql.temporal_choice.check COMMAND aios-asql-temporal-choice-check)
+add_executable(aios-asql-dict-blocks-check tools/asql-dict-blocks-check.cpp)
+target_link_libraries(aios-asql-dict-blocks-check PRIVATE aios)
+add_test(NAME asql.dict_blocks.check COMMAND aios-asql-dict-blocks-check)
+add_executable(aios-asql-stall-check tools/asql-stall-check.cpp)
+target_link_libraries(aios-asql-stall-check PRIVATE aios)
+add_test(NAME asql.stall.check COMMAND aios-asql-stall-check)
 
 add_executable(aios-asql-delete-matching-check tools/asql-delete-matching-check.cpp)
 target_link_libraries(aios-asql-delete-matching-check PRIVATE aios)
@@ -775,6 +787,12 @@ if(AIOS_BUILD_SH)
 endif()
 add_executable(aios-mime-check tools/mime-check.cpp)
 target_link_libraries(aios-mime-check PRIVATE aios)
+add_test(NAME mime.words.check COMMAND aios-mime-words-check)
+add_executable(aios-mime-words-check tools/mime-words-check.cpp)
+target_link_libraries(aios-mime-words-check PRIVATE aios)
+add_executable(aios-mail-html-text-check tools/mail-html-text-check.cpp)
+target_link_libraries(aios-mail-html-text-check PRIVATE aios)
+add_test(NAME mail.html_text.check COMMAND aios-mail-html-text-check)
 add_executable(aios-js-parse tools/js-parse-check.cpp)
 target_link_libraries(aios-js-parse PRIVATE aios)
 add_executable(aios-json-check tools/json-check.cpp)
@@ -787,6 +805,9 @@ add_executable(aios-imap-check tools/imap-check.cpp)
 target_link_libraries(aios-imap-check PRIVATE aios)
 add_executable(aios-smtp-check tools/smtp-check.cpp)
 target_link_libraries(aios-smtp-check PRIVATE aios)
+add_executable(aios-mail-message-check tools/mail-message-check.cpp)
+target_link_libraries(aios-mail-message-check PRIVATE aios)
+add_test(NAME mail.message.check COMMAND aios-mail-message-check)
 
 add_executable(aios-sidecars-check tools/sidecars-check.cpp)
 target_link_libraries(aios-sidecars-check PRIVATE aios)
@@ -886,6 +907,14 @@ add_test(NAME drive.web COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-web.sh ${CMAKE
 # deleting the element it was called on would have been caught here on the first
 # run; instead it survived long enough to look like a layout bug.
 add_test(NAME drive.dom COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-dom.sh ${CMAKE_BINARY_DIR})
+# `:active`: a button pressed and held takes its :active style and loses it on release (web-corpus/active.html).
+add_test(NAME drive.active COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-active.sh ${CMAKE_BINARY_DIR})
+# `:focus` / `:focus-within`: a clicked field shows its :focus border and the form its :focus-within background.
+add_test(NAME drive.focus COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-focus.sh ${CMAKE_BINARY_DIR})
+# A same-page anchor link scrolls to its element and `:target` matches it (web-corpus/target.html).
+add_test(NAME drive.target COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-target.sh ${CMAKE_BINARY_DIR})
+# A link whose address has been visited takes its :visited colour (web-corpus/visited.html).
+add_test(NAME drive.visited COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-visited.sh ${CMAKE_BINARY_DIR})
 
 add_test(NAME drive.image COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-image.sh ${CMAKE_BINARY_DIR})
 

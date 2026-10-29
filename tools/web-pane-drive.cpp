@@ -301,6 +301,49 @@ int main(int argc, char** argv) {
       }
     }
   }
+  // AIOS_PRESS_ID=<id> presses the middle of the element with that id and holds it: the frames and fragments after
+  // this show the page with the button down (`:active`), which no click can show since it releases at once.
+  if (const char* want = std::getenv("AIOS_PRESS_ID"); want && *want) {
+    userland::WindowSurface* w = pane_now();
+    int cx = -1, cy = -1;
+    if (w && w->web && w->web->browser) {
+      for (const auto& f : w->web->browser->document().fragments) {
+        for (const userland::web::Node* n = f.node; n; n = n->parent) {
+          if (n->kind == userland::web::Node::Kind::Element && n->attr("id") == want) {
+            cx = pane.x + f.x + f.w / 2;
+            cy = pane.y + 34 + f.y + f.h / 2;
+            break;
+          }
+        }
+        if (cx >= 0) break;
+      }
+    }
+    if (cx < 0) {
+      std::printf("step 4b: #%s has no painted box to press\n", want);
+    } else {
+      std::printf("step 4b: press #%s at screen (%d,%d) and hold\n", want, cx, cy);
+      desk.input_mouse_motion(cx, cy);
+      desk.input_mouse_button(cx, cy, true, hal::MouseLeft);
+      for (int i = 0; i < 6; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
+      frame(desk, kernel, W, H, out + "/6-pressed.ppm");
+      if (w && w->web && w->web->browser) {
+        for (const auto& f : w->web->browser->document().fragments) {
+          if (f.kind != userland::web::Fragment::Kind::Rect && f.kind != userland::web::Fragment::Kind::Text) continue;
+          std::printf("PRESSED %-5s %5d %5d %5d %5d  #%08x", f.kind == userland::web::Fragment::Kind::Rect ? "rect" : "text", f.x, f.y, f.w, f.h, f.color);
+          if (f.kind == userland::web::Fragment::Kind::Text) std::printf("  \"%s\"", f.text.c_str());
+          std::printf("\n");
+        }
+      }
+      desk.input_mouse_button(cx, cy, false, hal::MouseLeft);
+      for (int i = 0; i < 4; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
+      if (w && w->web && w->web->browser) {
+        for (const auto& f : w->web->browser->document().fragments) {
+          if (f.kind != userland::web::Fragment::Kind::Rect) continue;
+          std::printf("RELEASED rect %5d %5d %5d %5d  #%08x\n", f.x, f.y, f.w, f.h, f.color);
+        }
+      }
+    }
+  }
   // AIOS_CLICK_ID=<id> clicks the middle of the element with that id. A
   // coordinate is only right for the window size it was read at; an id is the
   // thing the page itself names, so a menu check survives a reflow.
@@ -326,8 +369,17 @@ int main(int argc, char** argv) {
       desk.input_mouse_motion(cx, cy);
       desk.input_mouse_button(cx, cy, true, hal::MouseLeft);
       desk.input_mouse_button(cx, cy, false, hal::MouseLeft);
-      for (int i = 0; i < 4; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
+      for (int i = 0; i < 6; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
       frame(desk, kernel, W, H, out + "/7-clicked.ppm");
+      // The boxes after the click (`:focus` on the field it focused), by colour.
+      if (w && w->web && w->web->browser) {
+        for (const auto& f : w->web->browser->document().fragments) {
+          if (f.kind == userland::web::Fragment::Kind::Text) { std::printf("CLICKED text   %5d %5d %5d %5d  #%08x  \"%s\"\n", f.x, f.y, f.w, f.h, f.color, f.text.c_str()); continue; }
+          if (f.kind != userland::web::Fragment::Kind::Rect && f.kind != userland::web::Fragment::Kind::Border) continue;
+          std::printf("CLICKED %-6s %5d %5d %5d %5d  #%08x\n", f.kind == userland::web::Fragment::Kind::Rect ? "rect" : "border", f.x, f.y, f.w, f.h, f.color);
+        }
+        std::printf("SCROLL %d  TARGET %s\n", w->web->scroll, w->web->browser->target().c_str());   // where the page sits after the click, and the fragment
+      }
     }
   } else
   // AIOS_PANE_CLICK=x,y clicks a point instead of the first link, so an

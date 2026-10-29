@@ -76,6 +76,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/rsa.cpp
   ${AIOS_ROOT}/src/crypto/x509.cpp
   ${AIOS_ROOT}/src/core/base64.cpp
+  ${AIOS_ROOT}/src/core/html_entities.cpp
   ${AIOS_ROOT}/src/core/result.cpp
   ${AIOS_ROOT}/src/core/json.cpp
   ${AIOS_ROOT}/src/core/ids.cpp
