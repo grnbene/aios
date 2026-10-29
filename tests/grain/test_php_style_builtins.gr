@@ -19,26 +19,18 @@ check(not bad.ok, "an unknown option is refused")
 fn php_json_old(v) {
   let s = replace(json_stringify(v), "/", "\\/")
   if not regex_test("[^\\x00-\\x7F]", s) { return s }
-  let bs = chars(s)
+  # chars() is one entry per character and ord() its code point, so the walk is per character
   let out = []
-  let i = 0
-  while i < len(bs) {
-    let b = ord(bs[i])
-    if b < 128 {
-      push(out, bs[i])
-      i = i + 1
-      continue
-    }
-    let n = b >= 240 ? 4 : (b >= 224 ? 3 : 2)
-    let cp = b >= 240 ? b & 7 : (b >= 224 ? b & 15 : b & 31)
-    for k in 1..n { cp = (cp << 6) | (ord(bs[i + k]) & 63) }
-    if cp >= 65536 {
+  for c in chars(s) {
+    let cp = ord(c)
+    if cp < 128 {
+      push(out, c)
+    } else if cp >= 65536 {
       push(out, "\\u" + format("{:04x}", 55296 + ((cp - 65536) >> 10)))
       push(out, "\\u" + format("{:04x}", 56320 + ((cp - 65536) & 1023)))
     } else {
       push(out, "\\u" + format("{:04x}", cp))
     }
-    i = i + n
   }
   return join(out, "")
 }

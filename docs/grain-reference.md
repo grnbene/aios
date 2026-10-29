@@ -40,7 +40,7 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `repr` | `repr(val)` | Converts a value to its debug string representation (quoting strings). |
 | `int` | `int(val)` | Converts a string, real, or decimal to an integer (truncating toward zero). |
 | `real` | `real(val)` | Converts an integer, string, or decimal to a 64-bit IEEE 754 floating-point number. |
-| `len` | `len(val)` | Returns the length of a string, list, map, or bytes buffer. |
+| `len` | `len(val)` | Returns the length of a string (in bytes; `chars` counts characters), list, map, or bytes buffer. |
 | `cwd` | `cwd()` | Returns the current working directory path. |
 | `getenv` | `getenv(name, [default])` | Reads an environment variable; returns `default` or `nil` if unset. |
 | `env` | `env(name, [default])` | An app setting or environment variable; `default` (or `nil`) when it is unset **or empty**. Use it for hosts, ports and names, where `""` never means a value. |
@@ -145,10 +145,10 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 ### Inspection & Predicates
 | Function | Signature | Description |
 |---|---|---|
-| `char_at` | `char_at(str, index)` | Returns 1-character string at 0-based `index`. |
-| `chars` | `chars(str)` | Splits string into a list of 1-character substrings. |
-| `ord` | `ord(char_str)` | Unicode code point for the first character. |
-| `chr` | `chr(code_point)` | Converts Unicode code point integer into a UTF-8 character string. |
+| `char_at` | `char_at(str, index)` | Returns the character (one UTF-8 character, not a byte) at 0-based `index`; negative counts from the end; `""` past the end. |
+| `chars` | `chars(str)` | Splits string into a list of its characters (UTF-8 sequences; a byte that is not UTF-8 is one entry). |
+| `ord` | `ord(char_str)` | Unicode code point for the first character (`ord("é")` is 233; a byte that is not UTF-8 gives the byte). |
+| `chr` | `chr(code_point)` | Converts Unicode code point integer (0..1114111, not a surrogate) into a UTF-8 character string. |
 | `utf8_valid` | `utf8_valid(str_or_bytes)` | Returns `true` if the input is valid UTF-8. |
 | `is_digit` | `is_digit(str)` | `true` if string is non-empty and contains only digits (`0-9`). |
 | `is_alpha` | `is_alpha(str)` | `true` if string contains only ASCII letters (`a-z`, `A-Z`). |
@@ -166,14 +166,14 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 ### Manipulation & Trimming
 | Function | Signature | Description |
 |---|---|---|
-| `upper` | `upper(str)` | Converts string to uppercase. |
-| `lower` | `lower(str)` | Converts string to lowercase. |
+| `upper` | `upper(str)` | Converts string to uppercase: ASCII, the Latin-1 Supplement and Latin Extended-A (é, ñ, ł); other scripts are left as they are. |
+| `lower` | `lower(str)` | Converts string to lowercase, over the same letters as `upper`. |
 | `trim` | `trim(str, [chars])` | Strips leading and trailing whitespace (or specific characters). |
 | `ltrim` | `ltrim(str, [chars])` | Strips leading whitespace or characters. |
 | `rtrim` | `rtrim(str, [chars])` | Strips trailing whitespace or characters. |
 | `upper_rtrim` | `upper_rtrim(str)` | Uppercases string and trims trailing whitespace. |
-| `pad_left` | `pad_left(str, len, [pad])` | Pads string on the left to `len` characters (default space). |
-| `pad_right` | `pad_right(str, len, [pad])`| Pads string on the right to `len` characters. |
+| `pad_left` | `pad_left(str, len, [pad])` | Pads string on the left to `len` characters (counted as characters, not bytes; default space). |
+| `pad_right` | `pad_right(str, len, [pad])`| Pads string on the right to `len` characters (counted as characters, not bytes). |
 | `repeat` | `repeat(str, count)` | Repeats string `count` times. |
 | `replace` | `replace(str, old, new)` | Replaces all occurrences of `old` with `new`. |
 | `slice` | `slice(str_or_list, start, [end])` | Slices substring or sublist from `start` up to `end`. |

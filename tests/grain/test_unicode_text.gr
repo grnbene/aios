@@ -1,0 +1,59 @@
+# tests/grain/test_unicode_text.gr
+# Text builtins that speak in characters, on text that is not ASCII: chars, char_at, ord, chr, pad_left,
+# pad_right, upper and lower. (len, s[i], slice and index_of are byte offsets, as documented, and stay so.)
+# Each part is driven at top level, inside a function, inside a closure and nested in control flow.
+fn check(c, msg) { assert_true(c, msg) }
+
+fn run(where) {
+  let s = "héllo✓"
+  # chars: one entry per character, not per byte
+  check(chars(s) == ["h", "é", "l", "l", "o", "✓"], where + ": chars splits characters")
+  check(len(chars(s)) == 6, where + ": six characters")
+  check(len(s) == 9, where + ": nine bytes (len is bytes)")
+  check(chars("") == [], where + ": chars of empty")
+  check(chars("日本") == ["日", "本"], where + ": chars of CJK")
+  check(chars("😀a") == ["😀", "a"], where + ": chars of a 4-byte character")
+  # char_at: a character index, negative from the end
+  check(char_at(s, 1) == "é", where + ": char_at 1")
+  check(char_at(s, 5) == "✓", where + ": char_at 5")
+  check(char_at(s, -1) == "✓", where + ": char_at -1")
+  check(char_at(s, 6) == "", where + ": char_at past the end")
+  # ord and chr: code points, round trip
+  check(ord("é") == 233, where + ": ord é")
+  check(ord("✓") == 10003, where + ": ord ✓")
+  check(ord("😀") == 128512, where + ": ord 😀")
+  check(ord("a") == 97, where + ": ord a")
+  check(chr(233) == "é", where + ": chr 233")
+  check(chr(10003) == "✓", where + ": chr 10003")
+  check(chr(128512) == "😀", where + ": chr 128512")
+  check(chr(65) == "A", where + ": chr 65")
+  for c in chars(s) { check(chr(ord(c)) == c, where + ": chr(ord()) of " + c) }
+  check(not pcall(fn () { return chr(1114112) }).ok, where + ": chr past U+10FFFF is refused")
+  check(not pcall(fn () { return chr(55296) }).ok, where + ": chr of a surrogate is refused")
+  # pad: characters wide, so columns line up
+  check(pad_left("é", 3, ".") == "..é", where + ": pad_left counts characters")
+  check(pad_right("日本", 4) == "日本  ", where + ": pad_right counts characters")
+  check(pad_left("abc", 2) == "abc", where + ": pad_left of a wider string")
+  # upper and lower: Latin letters with accents too
+  check(upper("héllo") == "HÉLLO", where + ": upper é")
+  check(lower("ÉCOLE Ñ") == "école ñ", where + ": lower É Ñ")
+  check(upper("straße") == "STRASSE" or upper("straße") == "STRAßE", where + ": upper ß is ß or SS")
+  check(upper("łódź") == "ŁÓDŹ", where + ": upper Latin Extended-A")
+  check(lower("ŁÓDŹ") == "łódź", where + ": lower Latin Extended-A")
+  check(upper("ÿ") == "Ÿ" and lower("Ÿ") == "ÿ", where + ": ÿ pairs across blocks")
+  check(upper("a×b÷c") == "A×B÷C", where + ": × and ÷ are not letters")
+  check(upper("日本 ✓") == "日本 ✓", where + ": upper leaves what has no case")
+  check(upper("already") == "ALREADY" and lower("MiXeD") == "mixed", where + ": ASCII as before")
+  # an invalid byte is one entry, kept as it is
+  let bad = "a\xffb"
+  check(len(chars(bad)) == 3, where + ": an invalid byte is one entry")
+  check(ord("\xff") == 255, where + ": ord of an invalid byte is the byte")
+}
+
+run("top level")
+fn in_fn() { run("in a function") }
+in_fn()
+let clos = fn () { run("in a closure") }
+clos()
+for i in [1] { if i == 1 { run("nested in control flow") } }
+print("unicode text: ok")
