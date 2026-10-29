@@ -11983,6 +11983,9 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
           return bt->lookup(k);
         }
       }
+      // A correlated subquery runs once per outer row, and that loop checked for KILL nowhere: the read that stalled
+      // atl was this shape, and a KILL QUERY (or the read deadline) could not reach it.
+      if (sql_interrupted()) { ctx_fail(ctx, "Query execution was interrupted"); return val_null(); }
       std::string outer_key;
       {
         if (e->sub_mu) {
@@ -12048,6 +12051,9 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
     }
 
     case ExprOp::Exists: {
+      // A correlated subquery runs once per outer row, and that loop checked for KILL nowhere: the read that stalled
+      // atl was this shape, and a KILL QUERY (or the read deadline) could not reach it.
+      if (sql_interrupted()) { ctx_fail(ctx, "Query execution was interrupted"); return val_null(); }
       std::string outer_key;
       {
         if (e->sub_mu) {
@@ -21256,6 +21262,20 @@ struct StatementLock {
 // The running statement's KILL flag when it may stop part way (see
 // sql_interrupted); handed to the pool's workers with the rest of the context.
 thread_local std::atomic<uint8_t>* tls_kill = nullptr;
+// When the running top-level read must have finished (steady clock, ns); 0 = no limit. A read past it ends as a
+// KILLed one does: it was a read that held the shared lock for eight minutes, with replication's writer and every
+// reader behind it, that stalled atl - and nothing but a restart ended it. AIOS_SQL_MAX_READ_MS (default 600000).
+thread_local uint64_t tls_read_deadline_ns = 0;
+static uint64_t max_read_ns() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("AIOS_SQL_MAX_READ_MS");
+    return (uint64_t)(e && *e ? std::strtoull(e, nullptr, 10) : 600000ull) * 1000000ull;
+  }();
+  return v;
+}
+static uint64_t steady_now_ns() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 SqlWorkerContext sql_capture_worker_context() {
   SqlWorkerContext c;
@@ -21268,6 +21288,7 @@ SqlWorkerContext sql_capture_worker_context() {
   c.unresolved_sink = g_unresolved_sink;
   c.outer_ref_log = g_outer_ref_log;
   c.kill = tls_kill;
+  c.read_deadline_ns = tls_read_deadline_ns;
   // What a worker running this statement's subqueries can see: the scopes this
   // thread inherited, then its own.
   for (const auto* p : tls_cte_parents) c.cte_parents.push_back(p);
@@ -21293,6 +21314,7 @@ void sql_install_worker_context(const SqlWorkerContext& in, SqlWorkerContext* sa
   g_unresolved_sink = in.unresolved_sink;
   g_outer_ref_log = static_cast<OuterRefLog*>(in.outer_ref_log);
   tls_kill = static_cast<std::atomic<uint8_t>*>(const_cast<void*>(in.kill));
+  tls_read_deadline_ns = in.read_deadline_ns;
 }
 
 std::string SqlDatabase::effective_database() const {
@@ -24568,7 +24590,16 @@ bool SqlDatabase::kill_session(uint64_t id, bool query_only) {
   return true;
 }
 
-bool sql_interrupted() { return tls_kill && tls_kill->load(std::memory_order_relaxed) != 0; }
+bool sql_interrupted() {
+  if (!tls_kill) return false;
+  if (tls_kill->load(std::memory_order_relaxed) != 0) return true;
+  if (tls_read_deadline_ns && steady_now_ns() > tls_read_deadline_ns) {
+    uint8_t none = 0;
+    tls_kill->compare_exchange_strong(none, 1);   // as KILL QUERY: the gateway reports "interrupted" and clears it
+    return true;
+  }
+  return false;
+}
 
 void SqlDatabase::update_active_session(uint64_t id, const std::string& command, const std::string& state,
                                        const std::string& info, const std::string& db) {
@@ -25303,6 +25334,38 @@ SqlQueryResult SqlDatabase::execute_gateway_query_once(const std::string& sql_qu
       ok.success = true;
       return ok;
     }
+    // SHOW PROCESSLIST neither: it reads the session registry under its own lock, and an operator looking for the
+    // statement to kill was queued behind the writer that statement had queued (4.6 s behind a 5 s read locally;
+    // the whole stall on atl).
+    // Nor `SELECT 1` (a health check, what the watch and every connection pool send): it reads no table, and queued
+    // behind a waiting writer it reported the engine down while the engine was only busy.
+    at = 0;
+    if (first_word_upper(sql_query, &at, b, sizeof b, false) == "SELECT"sv) {
+      size_t p = at;
+      while (p < sql_query.size() && ascii_space(sql_query[p])) ++p;
+      const size_t d0 = p;
+      while (p < sql_query.size() && sql_query[p] >= '0' && sql_query[p] <= '9') ++p;
+      const size_t d1 = p;
+      while (p < sql_query.size() && (ascii_space(sql_query[p]) || sql_query[p] == ';')) ++p;
+      if (d1 > d0 && d1 - d0 <= 18 && p == sql_query.size()) {
+        SqlQueryResult r;
+        r.success = true;
+        r.is_result_set = true;
+        r.columns = {sql_query.substr(d0, d1 - d0)};
+        r.rows.push_back(SqlRow{{sql_query.substr(d0, d1 - d0)}});
+        return r;
+      }
+    }
+    at = 0;
+    if (first_word_upper(sql_query, &at, b, sizeof b, false) == "SHOW"sv) {
+      const std::string rest = sql_query.substr(at);
+      std::string up;
+      for (char c : rest) up += (char)::toupper((unsigned char)c);
+      size_t p = up.find_first_not_of(" \t\r\n");
+      if (p != std::string::npos && up.compare(p, 5, "FULL ") == 0) p = up.find_first_not_of(" \t", p + 5);
+      if (p != std::string::npos && up.compare(p, 11, "PROCESSLIST") == 0 && up.find_first_not_of(" \t;\r\n", p + 11) == std::string::npos)
+        return execute_show(sql_query);
+    }
   }
   // A top-level read may be stopped part way by KILL; a write runs to its end
   // (a statement cut short would be half applied).
@@ -25312,14 +25375,18 @@ SqlQueryResult SqlDatabase::execute_gateway_query_once(const std::string& sql_qu
   static thread_local int kill_depth = 0;
   struct KillScope {
     bool top = false;
-    ~KillScope() { if (top) tls_kill = nullptr; --kill_depth; }
+    ~KillScope() { if (top) { tls_kill = nullptr; tls_read_deadline_ns = 0; } --kill_depth; }
   } kill_scope;
   std::shared_ptr<SessionSlot> kslot = kill_depth == 0 ? tls_session_slot : nullptr;
   ++kill_depth;
   if (kslot && g_rw_depth == 0 && !tls_txn.open) {
     uint8_t one = 1;
     kslot->kill.compare_exchange_strong(one, 0);   // a KILL QUERY of the statement before
-    if (statement_only_reads(sql_query)) { tls_kill = &kslot->kill; kill_scope.top = true; }
+    if (statement_only_reads(sql_query)) {
+      tls_kill = &kslot->kill;
+      kill_scope.top = true;
+      tls_read_deadline_ns = max_read_ns() ? steady_now_ns() + max_read_ns() : 0;
+    }
   }
   SqlQueryResult kres = execute_gateway_query_inner(sql_query, session_db);
   if (kill_scope.top && kslot->kill.load() != 0) {
