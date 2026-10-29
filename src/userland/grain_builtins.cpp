@@ -3711,7 +3711,7 @@ void draw_text_aa(GrainCanvas& cv, const std::string& text, double start_x, doub
       continue;
     }
     const fonts::Glyph* gp = nullptr;
-    const uint8_t* cov_base = face.cov;
+    const uint8_t* cov_base = face.cov();
     if ((c & 0x80) != 0) {
       uint32_t cp = 0;
       int extra = 0;

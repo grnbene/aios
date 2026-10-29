@@ -200,12 +200,12 @@ struct Drawn {
 };
 
 Drawn glyph_for(const fonts::Face& face, uint32_t cp) {
-  if (const fonts::Glyph* g = face.find(cp)) return {g, face.cov};
+  if (const fonts::Glyph* g = face.find(cp)) return {g, face.cov()};
   // A page is written in whatever alphabet its author writes in. The atlas
   // carries Latin; the outline engine cuts the rest on demand, so a Greek or
   // Cyrillic or Han page renders as itself instead of as a row of '?'.
   if (const glyphs::Rasterized* r = glyphs::rasterize(face, cp)) return {&r->g, r->cov};
-  return {&face.at(ascii_for_cp(cp)), face.cov};
+  return {&face.at(ascii_for_cp(cp)), face.cov()};
 }
 
 // Coverage at a fractional source position, bilinear. Sampling outside the

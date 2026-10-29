@@ -7,7 +7,10 @@
 //
 // The data lives in src/userland/font_atlas.cpp. It is a megabyte, and a
 // megabyte of constexpr in a header is a megabyte every translation unit that
-// includes it has to re-parse.
+// includes it has to re-parse. Each face's coverage is kept deflated there
+// (3.4 MB of mostly 0 and 255 is 0.8 MB deflated) and inflated the first time
+// the face is drawn with (cov(), src/userland/font_cov.cpp): a binary that
+// never draws text - a server - never pays for it in memory either.
 #pragma once
 #include <cstdint>
 
@@ -29,13 +32,19 @@ struct CpGlyph {
 
 struct Face {
   const Glyph* glyphs;
-  const uint8_t* cov;
+  const uint8_t* covz;   // the coverage blob, raw deflate
   uint8_t ascent;   // line top to baseline
   uint8_t line_h;   // ascent + descent: one row of text
   uint8_t first, count;
   const CpGlyph* extra;
   uint16_t extra_n;
   uint8_t px;       // the size this face was cut at
+  uint32_t covz_n;  // deflated bytes
+  uint32_t cov_n;   // the blob's bytes, inflated
+  const uint8_t** slot;   // the inflated blob, once a glyph of the face has been drawn
+  // The coverage blob a Glyph's `off` indexes: inflated on the first call (once, whichever thread gets there)
+  // and kept for the life of the program.
+  const uint8_t* cov() const;
   const Glyph& at(char c) const {
     unsigned char u = static_cast<unsigned char>(c);
     if (u < first || u >= first + count) u = ' ';
@@ -163,5 +172,13 @@ extern const Face MONO_13;
 extern const Face MONO_14;
 // MONO_15: DejaVuSansMono.ttf at 15px, ascent 14, line 18, 308 glyphs past ASCII
 extern const Face MONO_15;
+
+// Every face, by name: for a check that walks them all (tools/font-atlas-check.cpp).
+struct NamedFace {
+  const char* name;
+  const Face* face;
+};
+extern const NamedFace kFaces[];
+extern const uint32_t kFaceCount;
 
 }  // namespace aios::userland::fonts
