@@ -221,6 +221,29 @@ int main() {
        "and %zu bytes for %zu keys (%.1f a key; loaded %.1f; slots ~24, and 53 before this)", m.memory_bytes(), ref.size(), (double)m.memory_bytes() / ref.size(), (double)loaded / (row - 50000));
   }
 
+  // ---- folding the gaps after deletes: entries out, ids above them down, still runs ----
+  {
+    PkMap m;
+    for (long long k = 1; k <= 300000; ++k) m.emplace(ik(k), (size_t)(k - 1));
+    // rows 100, 101 and 250000 deleted: their entries go, every id above moves down by the rows gone beneath it
+    std::vector<size_t> erased{100, 101, 250000};
+    const size_t gone = m.remap_or_erase([&](size_t v) -> size_t {
+      auto lb = std::lower_bound(erased.begin(), erased.end(), v);
+      if (lb != erased.end() && *lb == v) return PkMap::kDrop;
+      return v - (size_t)(lb - erased.begin());
+    });
+    OK(gone == 3 && m.runs_mode() && m.size() == 299997, "3 rows folded out of 300k keys: still runs, %zu keys", m.size());
+    OK(m.find(ik(101)) == m.end() && m.find(ik(102)) == m.end() && m.find(ik(250001)) == m.end(), "the deleted rows' keys are gone");
+    OK(m.find(ik(100))->second == 99 && m.find(ik(103))->second == 100 && m.find(ik(250002))->second == 249998 && m.find(ik(300000))->second == 299996,
+       "the ids above them moved down (103 -> 100, 300000 -> 299996)");
+    OK(m.memory_bytes() < 4096, "and %zu bytes of map", m.memory_bytes());
+    // (A walk with begin() is what did this before, and it is one-way.)
+    PkMap w;
+    for (long long k = 1; k <= 1000; ++k) w.emplace(ik(k), (size_t)(k - 1));
+    for (auto e = w.begin(); e != w.end(); ++e) {}
+    OK(!w.runs_mode(), "a walk with begin() still turns a map into slots (which is why the fold no longer walks)");
+  }
+
   std::printf(failures ? "pkmap runs check: %d failure(s)\n" : "pkmap runs check: all passed\n", failures);
   return failures ? 1 : 0;
 }

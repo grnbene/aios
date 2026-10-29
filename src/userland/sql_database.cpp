@@ -24453,7 +24453,14 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       // The builds' scratch (candidate lists, sort buffers) came from every
       // pool lane's own arena; hand it back before the first query arrives.
       trim_process_memory();
+      // A checkpoint as soon as the first write is done, not after the first 20,000 statements: a store loads at
+      // what its files hold (660 MB of columns for atl's) and the first checkpoint's upkeep - dictionary compaction,
+      // code narrowing, the forms added since the files were written - takes it to 400 MB. A restarted atl sat at
+      // the fat size for as long as replication took to reach the count.
+      checkpoint_due_.store(true, std::memory_order_release);
     });
+  } else {
+    checkpoint_due_.store(true, std::memory_order_release);
   }
   // Write-behind is OPT-IN. Booting a database is not a request for it, so
   // init() no longer arms the WAL — that used to mean every plain asql
@@ -25290,8 +25297,14 @@ void SqlDatabase::after_statement_unlocked() {
   // open anywhere); otherwise the hint stays for a later statement.
   if (checkpoint_due_.load(std::memory_order_acquire) && open_txns_.load() == 0 && !tls_txn.open && !bulk_load_ &&
       !redo_replaying_ && checkpoint_due_.exchange(false, std::memory_order_acq_rel)) {
+    // The flag is the decision (made by checkpoint() under a shared lock, or by the boot-time warm-up): run the
+    // checkpoint here rather than ask checkpoint() again, whose "enough statements since the last" test the
+    // warm-up's request would fail. A snapshot being copied keeps the request for later.
     StatementLock lock(rw_lock_, true);
-    checkpoint();
+    if (snapshot_pins_.load(std::memory_order_acquire) > 0 || checkpoint_writing_.load(std::memory_order_acquire))
+      checkpoint_due_.store(true, std::memory_order_release);
+    else
+      flush_impl(true);
   }
   if (settle_due_.exchange(false, std::memory_order_acq_rel)) things_settle();
 }
@@ -52095,13 +52108,13 @@ void SqlDatabase::row_index_after_erase(const SqlTable& t, std::vector<size_t> e
     table_row_indices_.erase(it);
     return;
   }
-  for (auto e = ri.pk_to_row.begin(); e != ri.pk_to_row.end();) {
-    const size_t v = e->second;
+  // (remap_or_erase, not a walk with begin(): the walk turned the map into slots for good, so every table with a
+  // deleted row had a 23-B-a-key map after its next checkpoint - 289 MB on a fresh load of atl's store.)
+  ri.pk_to_row.remap_or_erase([&](size_t v) -> size_t {
     auto lb = std::lower_bound(erased.begin(), erased.end(), v);
-    if (lb != erased.end() && *lb == v) { e = ri.pk_to_row.erase(e); continue; }
-    e->second = v - (size_t)(lb - erased.begin());
-    ++e;
-  }
+    if (lb != erased.end() && *lb == v) return PkMap::kDrop;
+    return v - (size_t)(lb - erased.begin());
+  });
   // The mark moves down by the rows erased beneath it (a complete map stays
   // complete: old_count - erased = the count now).
   ri.rows_indexed -= (size_t)(std::lower_bound(erased.begin(), erased.end(), ri.rows_indexed) - erased.begin());
