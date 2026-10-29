@@ -1316,6 +1316,52 @@ class PkMap {
     gone_.clear();
     count_ = n;
   }
+  // Every entry's id through `fn`, and every entry `fn` answers kDrop for goes (the row index folding its gaps
+  // after deletes: the erased rows' entries out, the ids above them down). Runs stay runs - a walk with begin() did
+  // this before and turned every map with a deleted row into slots at the next checkpoint. Returns how many went.
+  static constexpr size_t kDrop = (size_t)-1;
+  template <class F> size_t remap_or_erase(F fn) {
+    if (runs_) fold();
+    size_t gone = 0;
+    if (runs_) {
+      std::vector<Run> fresh;
+      fresh.reserve(runs_v_.size());
+      size_t n = 0;
+      bool ok = true;
+      for (const Run& r : runs_v_) {
+        for (uint32_t j = 0; j < r.n && ok; ++j) {
+          const size_t nv = fn((size_t)r.val + j);
+          if (nv == kDrop) { ++gone; continue; }
+          ok = append_run(fresh, r.key + j, nv);
+          ++n;
+        }
+        if (!ok) break;
+      }
+      if (ok) {
+        fresh.shrink_to_fit();
+        runs_v_.swap(fresh);
+        count_ = n;
+        return gone;
+      }
+      to_slots();   // an id past 32 bits: as slots, below (nothing was dropped yet)
+      gone = 0;
+    }
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      Slot& sl = slots_[i];
+      if (sl.state != 1) continue;
+      const size_t nv = fn(sl.second);
+      if (nv == kDrop) {
+        sl.state = 2;
+        if (text_) dead_ += entry_bytes(i);
+        --count_;
+        ++gone;
+      } else {
+        sl.second = (uint32_t)nv;
+      }
+    }
+    if (text_ && dead_ > (1u << 20) && dead_ * 2 > arena_.size()) compact();
+    return gone;
+  }
   bool runs_mode() const { return runs_; }
   // How many maps have turned from runs back into slots (SHOW STATUS Asql_pk_runs_to_slots).
   static std::atomic<uint64_t>& runs_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
