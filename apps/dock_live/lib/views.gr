@@ -51,7 +51,7 @@ let BOARD_CSS = join([
   // load spots (HOST_JS): plain text on a shared board; inside the loading screen, the old badge's look - tap to load
   "html[data-host='1'] .loadable { cursor: pointer; border-radius: 6px; user-select: none; }",
   "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: 2px 8px; }",
-  "html[data-host='1'] .item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
+  "html[data-host='1'] .item.loadable, html[data-host='1'] .next-item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
   "html[data-host='1'] .loadable.busy { opacity: .45; pointer-events: none; }",
   ".order.active { box-shadow: inset 4px 0 0 var(--claimed); }",
   "#dock-note { position: fixed; left: 50%; bottom: 56px; transform: translateX(-50%); padding: 10px 18px; border-radius: 8px; font-size: 17px; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
@@ -186,8 +186,9 @@ fn load_attrs(cls, bay, o, l, delta) {
           "data-stock": l.stockid}
 }
 
-// active: the bay when this is its order to load now (the one the loading screen takes scans for), else ""
-fn order_node(o, active) {
+// active: the bay when this is its order to load now (the one the loading screen takes scans for), else "".
+// shown: the line already up big in Next to load ("" for none) - not listed a second time under it.
+fn order_node(o, active, shown) {
   let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
   let rows = []
   if o.credit {
@@ -195,6 +196,7 @@ fn order_node(o, active) {
                   el("span", {"class": "tag credit"}, "CREDIT")))
   }
   for l in sort_by(o.lines ?? [], fn (l) { return [line_rank(l), l.line] }) {
+    if active != "" and l.line == shown { continue }
     let st = line_state(l)
     let qty = el("span", {"class": "qty"}, qty_text(l.qty) + "x")
     let item = el("span", {"class": "item"}, l.stockid, el("span", {"class": "bin"}, l.bin))
@@ -207,6 +209,8 @@ fn order_node(o, active) {
     push(rows, el("div", {"class": "ln"}, qty, item,
                   el("span", {"class": "state"}, el("span", {"class": "tag " + st.cls}, st.text), line_clock(l, st.cls))))
   }
+  // its only line is the one up in Next to load, which names the order and customer too
+  if len(rows) == 0 { return "" }
   return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order")},
             el("div", {"class": "order-head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
             ...rows)
@@ -249,7 +253,8 @@ fn next_node(b) {
   return el("div", {"class": "next"},
             el("div", {"class": "next-top"}, el("span", {"class": "lbl"}, "Next to load"),
                el("span", load_attrs("next-count", b.bay, n.order, l, "1"), qty_text(l.loaded) + "/" + qty_text(l.qty))),
-            el("div", {"class": "next-item"}, l.stockid),
+            // tap the tire to take one back off (HOST_JS), once any of it is on the truck
+            el("div", real(l.loaded) > 0 ? load_attrs("next-item", b.bay, n.order, l, "-1") : {"class": "next-item"}, l.stockid),
             el("div", {"class": "next-desc"}, l.description),
             el("div", {"class": "next-meta"},
                el("span", "#" + n.order.orderno + " · " + n.order.customer),
@@ -286,6 +291,7 @@ fn bay_node(b) {
   }
   let nx = next_to_load(b)
   let active_no = nx == nil ? "" : nx.order.orderno
+  let shown_line = nx == nil ? "" : nx.line.line
   let loading = el("span", {"class": "clock none"}, "not started")
   if not is_blank(b.timestarted) { loading = clock_node(b.timestarted, 20, 30, "hms") }
   // orders still to load first; loaded ones sink, keeping run order within each group
@@ -317,7 +323,7 @@ fn bay_node(b) {
                   bar_node("Loaded", "loaded", b.loaded, b.units, "to load")),
                alert,
                next_node(b)),
-            el("div", {"class": "orders"}, ...map(orders, fn (o) { return order_node(o, o.orderno == active_no ? b.bay : "") })))
+            el("div", {"class": "orders"}, ...map(orders, fn (o) { return o.orderno == active_no ? order_node(o, b.bay, shown_line) : order_node(o, "", "") })))
 }
 
 // Light or dark: ?theme=light|dark on the link (a TV has no mouse), else what this screen last picked, else light -
