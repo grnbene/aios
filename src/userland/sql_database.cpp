@@ -21271,6 +21271,9 @@ thread_local std::atomic<uint8_t>* tls_kill = nullptr;
 // KILLed one does: it was a read that held the shared lock for eight minutes, with replication's writer and every
 // reader behind it, that stalled atl - and nothing but a restart ended it. AIOS_SQL_MAX_READ_MS (default 600000).
 thread_local uint64_t tls_read_deadline_ns = 0;
+// A session's own limit, set with `SET max_statement_time = <seconds>` as MariaDB has it (0: no limit); -1 means
+// the engine's default. A report that legitimately runs past ten minutes raises it for its session.
+thread_local int64_t tls_max_read_override_ns = -1;
 static uint64_t max_read_ns() {
   static const uint64_t v = [] {
     const char* e = std::getenv("AIOS_SQL_MAX_READ_MS");
@@ -25065,7 +25068,7 @@ static bool starts_user_var_set(const std::string& q) {
   // The server settings kept per session go the same way: foreign_key_checks, autocommit, sql_mode, the
   // isolation level, the lock wait (the rest were accepted and ignored).
   for (const char* v : {"foreign_key_checks", "autocommit", "sql_mode", "tx_isolation", "transaction_isolation",
-                        "lock_wait_timeout", "time_zone"})
+                        "lock_wait_timeout", "time_zone", "max_statement_time"})
     if (strcase_contains_sv(q, v) && !strcase_contains_sv(q, "transaction isolation")) return true;
   return false;
 }
@@ -25426,7 +25429,8 @@ SqlQueryResult SqlDatabase::execute_gateway_query_once(const std::string& sql_qu
     if (statement_only_reads(sql_query)) {
       tls_kill = &kslot->kill;
       kill_scope.top = true;
-      tls_read_deadline_ns = max_read_ns() ? steady_now_ns() + max_read_ns() : 0;
+      const uint64_t limit = tls_max_read_override_ns >= 0 ? (uint64_t)tls_max_read_override_ns : max_read_ns();
+      tls_read_deadline_ns = limit ? steady_now_ns() + limit : 0;
     }
   }
   SqlQueryResult kres = execute_gateway_query_inner(sql_query, session_db);
@@ -28740,6 +28744,9 @@ SqlQueryResult SqlDatabase::execute_set_user_vars(const std::string& sql) {
       // is still refused rather than silently dropped.
       std::string sys = name;
       if (sys.rfind("@@", 0) == 0) sys = sys.substr(2);
+      // `SET SESSION x = ...` / `SET GLOBAL x = ...` / `SET LOCAL x = ...`: the scope word before the name
+      for (const char* scope : {"session ", "global ", "local "})
+        if (lower_of(sys).rfind(scope, 0) == 0) { sys = trim(sys.substr(std::strlen(scope))); break; }
       const size_t dot = sys.rfind('.');
       if (dot != std::string::npos) {
         const std::string scope = lower_of(sys.substr(0, dot));
@@ -28748,7 +28755,19 @@ SqlQueryResult SqlDatabase::execute_set_user_vars(const std::string& sql) {
       if (sys.empty() || !std::all_of(sys.begin(), sys.end(),
               [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
         return make_error("unsupported SET: " + p);
-      // The one setting kept: foreign key checks, per session (dumps turn
+      // max_statement_time, as MariaDB has it: seconds (a fraction allowed), 0 for no limit, this session only. The
+      // read deadline (AIOS_SQL_MAX_READ_MS) is what it overrides; a write is never cut short.
+      if (lower_of(sys) == "max_statement_time") {
+        std::string v = trim(p.substr(eq + eqlen));
+        if (v.size() >= 2 && (v.front() == '\'' || v.front() == '"') && v.back() == v.front()) v = v.substr(1, v.size() - 2);
+        if (lower_of(v) == "default") { tls_max_read_override_ns = -1; continue; }
+        char* end = nullptr;
+        const double secs = std::strtod(v.c_str(), &end);
+        if (v.empty() || !end || *end != '\0' || !(secs >= 0)) return make_error("Variable 'max_statement_time' can't be set to the value of '" + v + "'");
+        tls_max_read_override_ns = (int64_t)(secs * 1e9);
+        continue;
+      }
+      // The one other setting kept: foreign key checks, per session (dumps turn
       // them off for their load and back on at the end).
       if (lower_of(sys) == "foreign_key_checks") {
         std::string v = lower_of(trim(p.substr(eq + eqlen)));
