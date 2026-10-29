@@ -18,6 +18,9 @@ class Connection {
   virtual std::string peer() const = 0;
   virtual void close() = 0;
   virtual bool alive() const { return true; }   // false once the peer is known to be gone
+  // A descriptor poll() can watch for the peer hanging up (POLLRDHUP) while this side is busy and not reading;
+  // -1 when there is none (a relayed or in-process connection).
+  virtual int poll_fd() const { return -1; }
   virtual size_t pending() const { return SIZE_MAX; }   // bytes readable without waiting (unknown = SIZE_MAX)
   // Whatever has arrived, up to data.size(): bytes read, 0 = nothing within
   // timeout_ms (check alive() to tell that from the peer having closed),

@@ -494,6 +494,9 @@ add_test(NAME asql.temporal_choice.check COMMAND aios-asql-temporal-choice-check
 add_executable(aios-asql-dict-blocks-check tools/asql-dict-blocks-check.cpp)
 target_link_libraries(aios-asql-dict-blocks-check PRIVATE aios)
 add_test(NAME asql.dict_blocks.check COMMAND aios-asql-dict-blocks-check)
+add_executable(aios-asql-stall-check tools/asql-stall-check.cpp)
+target_link_libraries(aios-asql-stall-check PRIVATE aios)
+add_test(NAME asql.stall.check COMMAND aios-asql-stall-check)
 
 add_executable(aios-asql-delete-matching-check tools/asql-delete-matching-check.cpp)
 target_link_libraries(aios-asql-delete-matching-check PRIVATE aios)

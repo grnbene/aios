@@ -22,7 +22,10 @@
 
 #include "aios/userland/git.hpp"   // zlib_deflate / zlib_inflate: the zlib envelope around the in-tree deflate
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
+#include <mutex>
+#include <thread>
 
 #include <algorithm>
 #include <array>
@@ -2611,9 +2614,61 @@ class BorrowedConnection : public hal::Connection {
   std::string peer() const override { return c_.peer(); }
   void close() override { c_.close(); }
   bool alive() const override { return c_.alive(); }
+  int poll_fd() const override { return c_.poll_fd(); }
   size_t pending() const override { return c_.pending(); }
  private:
   hal::Connection& c_;
+};
+
+// A client that hangs up while its statement runs. The session's thread is inside the engine and not reading the
+// socket, so it learned of the hang-up only when the statement ended - a report whose browser tab was closed ran
+// to its end, holding the shared lock with replication's writer and every reader queued behind it (atl, 2026-10-28,
+// eight minutes). One thread here polls the busy sessions' sockets for the peer going away (POLLRDHUP) and gives the
+// statement the KILL QUERY an operator would have: a read stops at its next check, a write runs to its end.
+class HangupWatcher {
+ public:
+  static HangupWatcher& instance() { static HangupWatcher w; return w; }
+  void watch(uint64_t conn_id, int fd) {
+    if (fd < 0) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    busy_.push_back({conn_id, fd});
+    if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+  }
+  void unwatch(uint64_t conn_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (size_t i = 0; i < busy_.size(); ++i)
+      if (busy_[i].conn_id == conn_id) { busy_[i] = busy_.back(); busy_.pop_back(); break; }
+  }
+ private:
+  struct Busy { uint64_t conn_id; int fd; };
+  std::mutex mu_;
+  std::vector<Busy> busy_;
+  std::thread thread_;
+  ~HangupWatcher() { if (thread_.joinable()) thread_.detach(); }
+  void run() {
+    std::vector<pollfd> fds;
+    std::vector<uint64_t> ids;
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        fds.clear(); ids.clear();
+        for (const Busy& b : busy_) { fds.push_back(pollfd{b.fd, POLLRDHUP, 0}); ids.push_back(b.conn_id); }
+      }
+      if (fds.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
+      const int n = ::poll(fds.data(), fds.size(), 100);
+      if (n <= 0) continue;
+      for (size_t i = 0; i < fds.size(); ++i) {
+        if (!(fds[i].revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL))) continue;
+        SqlDatabase::kill_session(ids[i], true);
+        unwatch(ids[i]);   // once: the statement ends on its own from here
+      }
+    }
+  }
+};
+struct HangupWatch {   // the statement's time on the watcher's list
+  uint64_t id;
+  HangupWatch(uint64_t conn_id, const hal::Connection& c) : id(conn_id) { HangupWatcher::instance().watch(conn_id, c.poll_fd()); }
+  ~HangupWatch() { HangupWatcher::instance().unwatch(id); }
 };
 }  // namespace
 
@@ -3999,7 +4054,11 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
                            },
                            [&]() { return wire_flush(client_conn); });
       sql_set_row_sink(cap_session ? nullptr : &row_sink);
-      std::shared_ptr<const SqlQueryResult> res_shared = db_.execute_gateway_query_shared(bound_sql, session_database);
+      std::shared_ptr<const SqlQueryResult> res_shared;
+      {
+        HangupWatch hw(conn_id, client_conn);
+        res_shared = db_.execute_gateway_query_shared(bound_sql, session_database);
+      }
       sql_set_row_sink(nullptr);
       sql_set_wire_results(false);
       const SqlQueryResult& res = *res_shared;
@@ -4231,7 +4290,11 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
                              },
                              [&]() { return wire_flush(client_conn); });
         sql_set_row_sink(cap_session ? nullptr : &row_sink);
-        std::shared_ptr<const SqlQueryResult> res_shared = db_.execute_gateway_query_shared(stmt_text, session_database);
+        std::shared_ptr<const SqlQueryResult> res_shared;
+        {
+          HangupWatch hw(conn_id, client_conn);
+          res_shared = db_.execute_gateway_query_shared(stmt_text, session_database);
+        }
         sql_set_row_sink(nullptr);
         sql_set_wire_results(false);
         const auto wt1 = wire_trace ? std::chrono::steady_clock::now() : wt0;

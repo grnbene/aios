@@ -474,6 +474,7 @@ struct SqlWorkerContext {
   std::shared_ptr<const void> user_vars;
   // The statement's KILL flag (sql_interrupted), when it may be cut short.
   const void* kill = nullptr;
+  uint64_t read_deadline_ns = 0;   // the top-level read's deadline (steady ns), carried to its workers; 0 = none
 };
 
 // True once the running statement's session was KILLed (KILL QUERY or
