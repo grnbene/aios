@@ -14,113 +14,107 @@ let THEME_DARK = "--bg: #0e1116; --panel: #171c23; --line: #2a313b; --text: #e9e
                  "--claimed: #f2c230; --claimed-ink: #1b1600; --picked: #3d8ef0; --picked-ink: #ffffff; --loaded: #2fa86a; --loaded-soft: rgba(47, 168, 106, .14); " +
                  "--warn: #f2a93b; --crit: #ff5a5f; color-scheme: dark;"
 
+// Every size on the board in one unit, --u: 1 px on a 1920-wide screen (the wall TVs), in step with the screen's
+// width above and below it - a 4K TV (or a TV left at 4K) gets the same board, bigger, not more empty space; a laptop,
+// the loading screen's frame or a phone stops at about the sizes the board had before it was tuned for a TV.
+fn u(n) { return "calc(" + str(n) + " * var(--u))" }
+
 let BOARD_CSS = join([
   ":root, [data-theme=\"light\"] { " + THEME_LIGHT + " }",
   "[data-theme=\"dark\"] { " + THEME_DARK + " }",
+  ":root { --u: clamp(0.76px, 0.0521vw, 2px); --ease: cubic-bezier(.2, .7, .2, 1); }",
   "* { box-sizing: border-box; }",
-  "body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.3 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Arial, sans-serif; }",
-  ".board { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 14px; padding: 14px; min-height: 100vh; }",
-  ".bay { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; min-width: 0; overflow: hidden; max-height: calc(100vh - 70px); }",
+  "body { margin: 0; background: var(--bg); color: var(--text); font: " + u(20) + "/1.3 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Arial, sans-serif; }",
+  // the columns are the server's (board_columns): a door that gets a truck widens, one that is emptied narrows
+  ".board { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: " + u(14) + "; padding: " + u(14) + "; min-height: 100vh; transition: grid-template-columns .7s var(--ease); }",
+  ".bay { background: var(--panel); border: 1px solid var(--line); border-radius: " + u(10) + "; display: flex; flex-direction: column; min-width: 0; overflow: hidden; max-height: calc(100vh - " + u(70) + "); transition: opacity .5s; }",
   ".bay.wide { grid-column: 1 / -1; } .bay.tall { max-height: none; } .bay.tall .orders { overflow: visible; }",
-  ".bay-tools { display: inline-flex; gap: 4px; margin-left: auto; }",
-  ".bay-tools button { font: inherit; font-size: 15px; line-height: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }",
+  ".bay-tools { display: inline-flex; gap: " + u(4) + "; margin-left: auto; opacity: .6; } .bay-tools:hover { opacity: 1; }",
+  ".bay-tools button { font: inherit; font-size: " + u(14) + "; line-height: 1; padding: " + u(4) + " " + u(7) + "; border-radius: " + u(6) + "; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }",
   ".bay-tools button[aria-pressed=\"true\"] { background: var(--picked); border-color: var(--picked); color: #fff; }",
   ".bay.free { opacity: .55; }",
-  ".bay-head { padding: 12px 14px; border-bottom: 1px solid var(--line); }",
-  ".bay-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }",
-  ".bay-name { font-size: 30px; font-weight: 800; color: var(--strong); letter-spacing: .5px; }",
-  ".bay-truck { font-size: 20px; color: var(--strong); text-align: right; }",
-  ".bay-sub { color: var(--muted); font-size: 15px; margin-top: 2px; display: flex; justify-content: space-between; gap: 8px; }",
-  ".bay-clocks { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; }",
-  ".bc { display: inline-flex; align-items: baseline; gap: 6px; } .bc .clock { font-size: 22px; }",
-  ".lbl { color: var(--muted); font-size: 13px; font-weight: 500; }",
-  ".clock { font-weight: 800; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }",
-  ".clock.none { color: var(--muted); font-weight: 500; font-size: 14px; }",
+  ".bay-head { padding: " + u(12) + " " + u(14) + "; border-bottom: 1px solid var(--line); }",
+  ".bay-title { display: flex; justify-content: space-between; align-items: baseline; gap: " + u(8) + "; }",
+  ".bay-name { font-size: " + u(36) + "; font-weight: 800; color: var(--strong); letter-spacing: .5px; white-space: nowrap; }",
+  ".bay-truck { font-size: " + u(26) + "; font-weight: 700; color: var(--strong); text-align: right; }",
+  ".bay-driver { font-size: " + u(21) + "; font-weight: 600; color: var(--text); margin-top: " + u(2) + "; }",
+  ".bay-sub { color: var(--muted); font-size: " + u(18) + "; margin-top: " + u(2) + "; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 " + u(8) + "; }",
+  ".bay-clocks { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 " + u(10) + "; margin-top: " + u(8) + "; }",
+  ".bc { display: inline-flex; align-items: baseline; gap: " + u(6) + "; } .bc .clock { font-size: " + u(28) + "; }",
+  ".lbl { color: var(--muted); font-size: " + u(16) + "; font-weight: 500; }",
+  ".clock { font-weight: 800; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; transition: color .6s; }",
+  ".clock.none { color: var(--muted); font-weight: 500; font-size: " + u(17) + "; }",
   ".clock.warn { color: var(--warn); } .clock.crit { color: var(--crit); }",
-  ".done-at { color: var(--muted); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }",
-  ".state { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }",
-  ".state .clock { font-size: 15px; } .times { display: inline-flex; align-items: baseline; gap: 5px; }",
-  ".alert .clock { margin-left: 4px; }",
-  ".need { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 15px; font-weight: 600; color: var(--text); }",
-  ".need-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .need .bin { margin-left: 8px; color: var(--muted); font-weight: 500; }",
+  ".done-at { color: var(--muted); font-size: " + u(16) + "; white-space: nowrap; font-variant-numeric: tabular-nums; }",
+  ".state { display: inline-flex; align-items: center; gap: " + u(8) + "; justify-content: flex-end; }",
+  ".state .clock { font-size: " + u(19) + "; } .times { display: inline-flex; align-items: baseline; gap: " + u(5) + "; }",
+  ".alert .clock { margin-left: " + u(4) + "; }",
+  ".need { display: flex; justify-content: space-between; align-items: baseline; gap: " + u(8) + "; margin-top: " + u(4) + "; font-size: " + u(19) + "; font-weight: 600; color: var(--text); }",
+  ".need-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .need .bin { margin-left: " + u(8) + "; color: var(--muted); font-weight: 600; }",
   ".need.more { color: var(--muted); font-weight: 500; }",
-  ".bars { margin-top: 10px; display: grid; gap: 6px; }",
-  ".next { margin-top: 10px; padding: 10px 12px; border-radius: 8px; border: 2px solid var(--line); border-left: 8px solid var(--picked); background: var(--bg); }",
+  ".bars { margin-top: " + u(10) + "; display: grid; gap: " + u(6) + "; }",
+  ".next { margin-top: " + u(10) + "; padding: " + u(10) + " " + u(12) + "; border-radius: " + u(8) + "; border: 2px solid var(--line); border-left: " + u(8) + " solid var(--picked); background: var(--bg); }",
   ".next-top { display: flex; justify-content: space-between; align-items: baseline; }",
-  ".next-count { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--strong); }",
+  ".next-count { font-size: " + u(28) + "; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--strong); }",
   // load spots (HOST_JS): plain text on a shared board; inside the loading screen, the old badge's look - tap to load
-  "html[data-host='1'] .loadable { cursor: pointer; border-radius: 6px; user-select: none; }",
-  "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: 2px 8px; }",
+  "html[data-host='1'] .loadable { cursor: pointer; border-radius: " + u(6) + "; user-select: none; }",
+  "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: " + u(2) + " " + u(8) + "; }",
   "html[data-host='1'] .item.loadable, html[data-host='1'] .next-item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
   "html[data-host='1'] .loadable.busy { opacity: .45; pointer-events: none; }",
-  ".order.active { box-shadow: inset 4px 0 0 var(--claimed); }",
-  "#dock-note { position: fixed; left: 50%; bottom: 56px; transform: translateX(-50%); padding: 10px 18px; border-radius: 8px; font-size: 17px; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
+  ".order.active { box-shadow: inset " + u(4) + " 0 0 var(--claimed); }",
+  "#dock-note { position: fixed; left: 50%; bottom: " + u(56) + "; transform: translateX(-50%); padding: " + u(10) + " " + u(18) + "; border-radius: " + u(8) + "; font-size: " + u(18) + "; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
   "#dock-note.show { opacity: 1; } #dock-note.ok { background: var(--loaded); } #dock-note.err { background: var(--open); }",
-  ".next-item { font-size: 34px; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
-  ".next-desc { font-size: 17px; color: var(--text); margin-top: 2px; }",
-  ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 10px; margin-top: 6px; font-size: 14px; color: var(--muted); }",
-  ".next-meta .bin { color: var(--text); font-weight: 700; margin-right: 6px; }",
-  ".bar { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }",
-  ".track { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; }",
-  ".fill { height: 100%; border-radius: 5px; }",
+  ".next-item { font-size: " + u(40) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
+  ".next-desc { font-size: " + u(20) + "; color: var(--text); margin-top: " + u(2) + "; }",
+  ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(6) + "; font-size: " + u(17) + "; color: var(--muted); }",
+  ".next-meta .bin { color: var(--text); font-weight: 700; margin-right: " + u(6) + "; }",
+  ".bar { display: grid; grid-template-columns: " + u(70) + " minmax(0, 1fr) auto; align-items: center; gap: " + u(8) + "; font-size: " + u(17) + "; color: var(--muted); }",
+  ".track { height: " + u(14) + "; background: var(--track); border-radius: " + u(7) + "; overflow: hidden; }",
+  // a bar grows to its new count; yellow turns blue or green as it fills
+  ".fill { height: 100%; border-radius: " + u(7) + "; transition: width .8s var(--ease), background-color .6s; }",
   ".fill.picked { background: var(--picked); } .fill.loaded { background: var(--loaded); } .fill.partial { background: var(--claimed); }",
-  ".bar .left { color: var(--muted); font-size: 13px; }",
+  ".bar .left { color: var(--muted); font-size: " + u(16) + "; }",
   ".bar .num { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }",
-  ".alert { margin-top: 10px; padding: 6px 10px; border-radius: 6px; background: var(--open-soft); color: var(--open-text); font-weight: 700; font-size: 16px; }",
+  ".alert { margin-top: " + u(10) + "; padding: " + u(6) + " " + u(10) + "; border-radius: " + u(6) + "; background: var(--open-soft); color: var(--open-text); font-weight: 700; font-size: " + u(20) + "; transition: background-color .6s, color .6s; }",
   ".alert.ok { background: var(--loaded-soft); color: var(--loaded); }",
-  ".orders { overflow-y: auto; flex: 1 1 auto; min-height: 0; padding: 6px 10px 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; align-content: start; }",
-  ".order { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }",
+  ".orders { overflow-y: auto; flex: 1 1 auto; min-height: 0; padding: " + u(6) + " " + u(10) + " " + u(10) + "; display: grid; grid-template-columns: minmax(0, 1fr); gap: " + u(6) + "; align-content: start; }",
+  ".order { border: 1px solid var(--line); border-radius: " + u(8) + "; padding: " + u(8) + " " + u(10) + "; min-width: 0; transition: opacity .6s; }",
   ".order-head > * { min-width: 0; } .ln > * { min-width: 0; }",
   ".order.done { opacity: .7; }",
-  ".order-head { display: flex; justify-content: space-between; gap: 8px; font-size: 15px; }",
+  ".order-head { display: flex; justify-content: space-between; gap: " + u(8) + "; font-size: " + u(18) + "; }",
   ".order-no { font-weight: 700; color: var(--strong); } .order-cust { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
-  ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; font-size: 16px; }",
-  ".ln .qty { flex: 0 0 44px; } .ln .item { flex: 1 1 140px; } .ln .state { margin-left: auto; }",
-  // a narrow screen (a phone, a small monitor, the board framed beside something): the doors stack instead of
-  // squeezing three columns until the lines run into each other
-  "@media (max-width: 1100px) { .board { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)) !important; } }",
-  ".ln .qty { font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
-  ".ln .item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .bin { color: var(--muted); font-size: 14px; margin-left: 6px; }",
-  ".tag { padding: 2px 8px; border-radius: 5px; font-size: 14px; font-weight: 700; white-space: nowrap; }",
+  ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(21) + "; }",
+  ".ln .qty { flex: 0 0 " + u(56) + "; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
+  ".ln .item { flex: 1 1 " + u(180) + "; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .state { margin-left: auto; }",
+  ".ln .bin { color: var(--muted); font-size: " + u(17) + "; font-weight: 500; margin-left: " + u(6) + "; }",
+  // a line keeps its tag as it moves along (NO CLAIM, a picker, PICKED, LOADED): the colour fades to the next one
+  ".tag { padding: " + u(3) + " " + u(10) + "; border-radius: " + u(5) + "; font-size: " + u(17) + "; font-weight: 700; white-space: nowrap; transition: background-color .6s, color .6s; }",
   ".tag.open { background: var(--open); color: var(--open-ink); }",
   ".tag.claimed { background: var(--claimed); color: var(--claimed-ink); }",
   ".tag.picked { background: var(--picked); color: var(--picked-ink); }",
   ".tag.loaded { background: var(--loaded); color: #ffffff; }",
-  ".legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 14px 0; font-size: 15px; color: var(--muted); }",
-  ".legend .key { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; }",
-  ".legend .sw { width: 22px; height: 14px; border-radius: 4px; display: inline-block; }",
-  ".sw.open { background: var(--open); } .sw.claimed { background: var(--claimed); } .sw.picked { background: var(--picked); } .sw.loaded { background: var(--loaded); }",
-  ".bay-driver { font-size: 18px; font-weight: 600; color: var(--text); margin-top: 2px; }",
   ".tag.credit { background: transparent; color: var(--muted); border: 1px solid var(--line); }",
-  ".empty { color: var(--muted); padding: 30px 14px; font-size: 20px; text-align: center; }",
-  ".foot { position: fixed; right: 14px; bottom: 8px; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; }",
-  ".theme-toggle { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; " +
+  ".legend { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(8) + " " + u(18) + "; padding: " + u(10) + " " + u(14) + " 0; font-size: " + u(18) + "; color: var(--muted); }",
+  ".legend .key { display: inline-flex; align-items: center; gap: " + u(8) + "; color: var(--text); font-weight: 600; }",
+  ".legend .sw { width: " + u(26) + "; height: " + u(16) + "; border-radius: " + u(4) + "; display: inline-block; }",
+  ".sw.open { background: var(--open); } .sw.claimed { background: var(--claimed); } .sw.picked { background: var(--picked); } .sw.loaded { background: var(--loaded); }",
+  ".empty { color: var(--muted); padding: " + u(30) + " " + u(14) + "; font-size: " + u(24) + "; text-align: center; }",
+  ".foot { position: fixed; right: " + u(14) + "; bottom: " + u(8) + "; color: var(--muted); font-size: " + u(14) + "; display: flex; align-items: center; gap: " + u(10) + "; }",
+  ".theme-toggle { display: inline-flex; align-items: center; gap: " + u(6) + "; font: inherit; font-size: " + u(14) + "; padding: " + u(4) + " " + u(10) + "; border-radius: " + u(6) + "; " +
     "border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }",
-  ".theme-svg { display: none; }",
+  ".theme-svg { display: none; } .theme-toggle svg { width: " + u(14) + "; height: " + u(14) + "; }",
   ":root .theme-svg.moon, [data-theme=\"light\"] .theme-svg.moon { display: inline-block; }",
   ":root .theme-svg.sun, [data-theme=\"light\"] .theme-svg.sun { display: none; }",
   "[data-theme=\"dark\"] .theme-svg.sun { display: inline-block; } [data-theme=\"dark\"] .theme-svg.moon { display: none; }",
   ".fs-svg, .fs-on { display: none; } .fs-off { display: inline; } .fs-svg.off { display: inline-block; }",
   "[data-fs=\"1\"] .fs-off, [data-fs=\"1\"] .fs-svg.off { display: none; } [data-fs=\"1\"] .fs-on { display: inline; } [data-fs=\"1\"] .fs-svg.on { display: inline-block; }",
-  ".note { color: var(--muted); padding: 40px; font-size: 20px; }",
-  // A wall TV (1600 px and wider): read from across the dock. Not one zoom - what is read from afar (each line, its
-  // state and clock, the bin, the alerts) grows most; what is already big (the bay, the next tire) a little; the bay's
-  // layout buttons, which nobody presses on a TV, step back.
-  "@media (min-width: 1600px) {",
-  "  body { font-size: 20px; }",
-  "  .legend { font-size: 18px; } .legend .sw { width: 26px; height: 16px; }",
-  "  .bay-name { font-size: 36px; } .bay-truck { font-size: 26px; font-weight: 700; } .bay-driver { font-size: 21px; }",
-  "  .bay-sub { font-size: 18px; } .lbl { font-size: 16px; } .bc .clock { font-size: 28px; } .clock.none { font-size: 17px; }",
-  "  .bar { font-size: 17px; grid-template-columns: 70px minmax(0, 1fr) auto; } .bar .left { font-size: 16px; } .track { height: 14px; border-radius: 7px; }",
-  "  .alert { font-size: 20px; } .need { font-size: 19px; } .need .bin { font-weight: 600; }",
-  "  .next-item { font-size: 40px; } .next-desc { font-size: 20px; } .next-meta { font-size: 17px; } .next-count { font-size: 28px; }",
-  "  .order { padding: 8px 10px; } .order-head { font-size: 18px; }",
-  "  .ln { font-size: 21px; gap: 4px 10px; } .ln .qty { flex-basis: 56px; } .ln .item { font-weight: 600; flex-basis: 180px; }",
-  "  .ln .bin { font-size: 17px; font-weight: 500; }",
-  "  .tag { font-size: 17px; padding: 3px 10px; } .state .clock { font-size: 19px; } .done-at { font-size: 16px; }",
-  "  .bay-tools button { font-size: 13px; padding: 3px 6px; opacity: .5; }",
-  "  .empty { font-size: 24px; } .foot { font-size: 14px; }",
-  "}"
+  ".note { color: var(--muted); padding: " + u(40) + "; font-size: " + u(20) + "; }",
+  // a new bay, order or line comes in (ENTER_JS); what changes in place fades or grows (the transitions above)
+  "@media (prefers-reduced-motion: reduce) { .board, .fill, .tag, .clock, .alert, .order, .bay { transition: none; } }",
+  // a narrow screen (a phone, a small monitor, the board framed beside something): the doors stack instead of
+  // squeezing three columns until the lines run into each other, each as tall as it needs
+  "@media (max-width: 1100px) { .board { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)) !important; min-height: 0; } " +
+    ".bay { max-height: none; } .bay .orders { overflow: visible; } .bay.free { min-height: 0; } .foot { position: static; justify-content: flex-end; padding: 0 " + u(14) + " " + u(10) + "; } }"
 ], "\n")
 
 fn qty_text(v) {
@@ -210,7 +204,7 @@ fn order_node(o, active, shown) {
   let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
   let rows = []
   if o.credit {
-    push(rows, el("div", {"class": "ln"}, el("span", {"class": "qty"}, ""), el("span", {"class": "item"}, "Credit pickup"),
+    push(rows, el("div", {"class": "ln", "data-key": "credit"}, el("span", {"class": "qty"}, ""), el("span", {"class": "item"}, "Credit pickup"),
                   el("span", {"class": "tag credit"}, "CREDIT")))
   }
   for l in sort_by(o.lines ?? [], fn (l) { return [line_rank(l), l.line] }) {
@@ -224,13 +218,15 @@ fn order_node(o, active, shown) {
       qty = el("span", left ? load_attrs("qty", active, o, l, "1") : {"class": "qty"}, qty_text(l.loaded) + "/" + qty_text(l.qty))
       if real(l.loaded) > 0 { item = el("span", load_attrs("item", active, o, l, "-1"), l.stockid, el("span", {"class": "bin"}, l.bin)) }
     }
-    push(rows, el("div", {"class": "ln"}, qty, item,
+    push(rows, el("div", {"class": "ln", "data-key": "line-" + str(l.line)}, qty, item,
                   el("span", {"class": "state"}, el("span", {"class": "tag " + st.cls}, st.text), line_clock(l, st.cls))))
   }
   // its only line is the one up in Next to load, which names the order and customer too
   if len(rows) == 0 { return "" }
-  return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order")},
-            el("div", {"class": "order-head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
+  // keyed by order (and its head and lines by what they are): an order that moves up the list is moved, a new one
+  // comes in, and a line that changes state keeps its element so its tag fades to the new colour
+  return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order"), "data-key": "order-" + o.orderno},
+            el("div", {"class": "order-head", "data-key": "head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
             ...rows)
 }
 
@@ -282,7 +278,7 @@ fn next_node(b) {
 
 fn bay_node(b) {
   if b.dispnumber == "" {
-    return el("div", {"class": "bay free"},
+    return el("div", {"class": "bay free", "data-key": "bay-" + b.bay},
               el("div", {"class": "bay-head"}, el("div", {"class": "bay-title"}, el("span", {"class": "bay-name"}, "BAY " + b.bay))),
               el("div", {"class": "empty"}, "No truck"))
   }
@@ -319,7 +315,8 @@ fn bay_node(b) {
     let needs = len(filter(o.lines ?? [], fn (l) { return line_state(l).cls == "open" })) > 0
     return [done ? 2 : (needs ? 0 : 1), -real(o.sort)]
   })
-  return el("div", {"class": "bay", "data-bay": b.bay},
+  // keyed by the door and the run on it: a new truck is a new bay (it comes in); the same one is updated in place
+  return el("div", {"class": "bay", "data-bay": b.bay, "data-key": "bay-" + b.bay + "-" + b.dispnumber},
             el("div", {"class": "bay-head"},
                el("div", {"class": "bay-title"},
                   el("span", {"class": "bay-name"}, "BAY " + b.bay),
@@ -341,7 +338,8 @@ fn bay_node(b) {
                   bar_node("Loaded", "loaded", b.loaded, b.units, "to load")),
                alert,
                next_node(b)),
-            el("div", {"class": "orders"}, ...map(orders, fn (o) { return o.orderno == active_no ? order_node(o, b.bay, shown_line) : order_node(o, "", "") })))
+            el("div", {"class": "orders"}, ...filter(map(orders, fn (o) { return o.orderno == active_no ? order_node(o, b.bay, shown_line) : order_node(o, "", "") }),
+                                                     fn (n) { return n != "" })))
 }
 
 // Light or dark: ?theme=light|dark on the link (a TV has no mouse), else what this screen last picked, else light -
@@ -442,6 +440,36 @@ let LAYOUT_JS = join([
 ], chr(10))
 
 
+// What arrives while the board is open comes in rather than appears: a truck put on a door (its bay is keyed by the
+// run, so it is a new element), an order put on a truck, a line added to an order. A push only adds an element that is
+// new; one that moved (the orders re-sort as lines are claimed) is the same element put elsewhere, and is left alone -
+// which a CSS animation cannot tell apart, as moving an element restarts it. What the page loaded with is already
+// there. A new bay brings its orders with it rather than each coming in on its own.
+let ENTER_JS = join([
+  "(function () {",
+  "  if (!window.WeakSet || !Element.prototype.animate) return;",
+  "  var calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;",
+  "  var SEL = '.bay, .order, .ln', seen = new WeakSet();",
+  "  function all(node) { var l = node.matches(SEL) ? [node] : []; node.querySelectorAll(SEL).forEach(function (e) { l.push(e); }); return l; }",
+  "  all(document.body).forEach(function (e) { seen.add(e); });",
+  "  function arrived(node) {",
+  "    if (node.nodeType !== 1) return;",
+  "    var list = all(node);",
+  "    list.forEach(function (e) {",
+  "      if (seen.has(e)) return;",
+  "      seen.add(e);",
+  "      var up = e.parentElement && e.parentElement.closest(SEL);",
+  "      if (calm || (up && list.indexOf(up) >= 0)) return;",
+  "      var bay = e.classList.contains('bay');",
+  "      e.animate([{opacity: 0, transform: bay ? 'translateY(18px)' : 'translateY(10px) scale(.985)'}, {opacity: 1, transform: 'none'}],",
+  "                {duration: bay ? 600 : 450, easing: 'cubic-bezier(.2, .7, .2, 1)'});",
+  "    });",
+  "  }",
+  "  new MutationObserver(function (ms) { ms.forEach(function (m) { m.addedNodes.forEach(arrived); }); })",
+  "    .observe(document.body, {childList: true, subtree: true});",
+  "})();"
+], chr(10))
+
 // Full screen for a wall TV: the board alone, edge to edge. A small control beside Light/Dark; its icon and label
 // follow data-fs on <html>, which pushes never touch. Inside the loading screen's frame it needs the frame's
 // allow="fullscreen", which that screen gives.
@@ -499,7 +527,7 @@ let HOST_JS = join([
 // page when it differs from the one the page loaded with, because the page's stylesheet and scripts are only read on
 // load - a deploy's new design otherwise arrived as unstyled markup on every screen already open (a wall TV that
 // nobody reloads). Data changes leave it alone.
-let DESIGN = slice(sha256(BOARD_CSS + THEME_JS + CLOCK_JS + LAYOUT_JS + FULLSCREEN_JS + HOST_JS), 0, 12)
+let DESIGN = slice(sha256(BOARD_CSS + THEME_JS + CLOCK_JS + LAYOUT_JS + FULLSCREEN_JS + HOST_JS + ENTER_JS), 0, 12)
 
 // One column per door; a door with no truck says so in a narrow strip, so the doors that are working get the width
 // (an empty third of a TV left the busy doors' lines cut off). All empty: equal, as before.
@@ -512,5 +540,6 @@ fn board_node(bays, read_at) {
   return el("div", {"data-design": DESIGN}, legend_node(),
             el("div", {"class": "board", "style": "grid-template-columns: " + board_columns(bays)}, ...map(bays, bay_node)),
             el("div", {"class": "foot"}, el("span", "Dock Live · read " + read_at), fullscreen_node(), theme_toggle_node()),
-            el("script", THEME_JS), el("script", CLOCK_JS), el("script", LAYOUT_JS), el("script", FULLSCREEN_JS), el("script", HOST_JS))
+            el("script", THEME_JS), el("script", CLOCK_JS), el("script", LAYOUT_JS), el("script", FULLSCREEN_JS), el("script", HOST_JS),
+            el("script", ENTER_JS))
 }
