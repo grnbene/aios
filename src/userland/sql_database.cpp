@@ -32511,11 +32511,11 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       if (!lit.empty()) {
         if (!d.coded() && !d.is_front_coded()) {
           contains_in_dict(d, lit, yes, no, ps, &p.code_truth);
-        } else if (d.blocked()) {
-          // Block by block, each decoded once into a plain arena of its own entries: a plain copy of the whole
-          // dictionary per statement (70 MB for po_options) was the cost before, and the scan is the same.
+        } else {
+          // A coded, blocked or front-coded dictionary: a slice at a time (a block, or 4096 entries), each decoded
+          // into a plain arena of its own entries and scanned there. A plain copy of the whole dictionary per
+          // statement (70 MB for po_options, 14 MB for gltrans.narrative) was the cost before; the scan is the same.
           p.code_truth.assign(nd, no);
-          const size_t per = d.per_block();
           DictArena part;
           std::vector<uint8_t> part_truth;
           auto scan = [&](size_t first, size_t count) {
@@ -32524,14 +32524,13 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
             contains_in_dict(part, lit, yes, no, ps, &part_truth);
             std::copy(part_truth.begin(), part_truth.begin() + (long)std::min(count, part_truth.size()), p.code_truth.begin() + (long)first);
           };
-          for (size_t b = 0; b < d.blocks().size(); ++b) scan(b * per, d.blocks()[b].count);
-          if (d.coded_count() < nd) scan(d.coded_count(), nd - d.coded_count());
-        } else {
-          // A coded or front-coded dictionary is decoded into a plain one first: the scan
-          // runs over one contiguous buffer.
-          DictArena plain;
-          d.decode_into(plain);
-          contains_in_dict(plain, lit, yes, no, ps, &p.code_truth);
+          if (d.blocked()) {
+            const size_t per = d.per_block();
+            for (size_t b = 0; b < d.blocks().size(); ++b) scan(b * per, d.blocks()[b].count);
+            if (d.coded_count() < nd) scan(d.coded_count(), nd - d.coded_count());
+          } else {
+            for (size_t at = 0; at < nd; at += 4096) scan(at, std::min<size_t>(4096, nd - at));
+          }
         }
         return p;
       }
