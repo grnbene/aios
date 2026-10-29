@@ -5809,6 +5809,38 @@ void ThingEngine::save() {
   save_locked();
 }
 
+size_t ThingEngine::memory_bytes() {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  auto str = [](const std::string& s) { return sizeof(s) + (s.capacity() > 15 ? s.capacity() + 1 : 0); };
+  auto strs = [&](const std::vector<std::string>& v) { size_t b = sizeof(v) + (v.capacity() - v.size()) * sizeof(std::string); for (const auto& s : v) b += str(s); return b; };
+  auto hist = [&](const std::vector<History>& h) { size_t b = sizeof(h) + h.capacity() * sizeof(History); for (const auto& e : h) b += str(e.cause) + str(e.before) + str(e.after) - 3 * sizeof(std::string); return b; };
+  constexpr size_t kNode = 48;   // a std::map node's own bytes beside its value
+  size_t total = 0;
+  for (const auto& kv : kinds_) {
+    const Kind& k = kv.second;
+    total += sizeof(Kind) + kNode + str(k.name) + str(k.declaration) + str(k.grain_src);
+    for (const auto& t : k.things) {
+      const Instance& in = t.second;
+      total += kNode + sizeof(Instance) + str(t.first) + str(in.key) + in.sums.capacity() * sizeof(ThingDec) +
+               in.nonnull.capacity() * sizeof(int64_t) + in.scale.capacity() * sizeof(int) + hist(in.history) + strs(in.row) +
+               strs(in.conflicts) + str(in.json_doc) - 2 * sizeof(std::string);
+      for (const auto& s : in.sides) total += str(s.first) + strs(s.second);
+      for (const auto& pr : in.part_rows) { total += kNode + str(pr.first); for (const auto& row : pr.second) total += strs(row); }
+    }
+    for (const auto& g : k.gthings) {
+      const Kind::GInst& gi = g.second;
+      total += kNode + sizeof(Kind::GInst) + str(g.first) + str(gi.key) + hist(gi.history) + gi.vals.capacity() * sizeof(gi.vals[0]);
+      for (const auto& v : gi.vals) total += str(v.first) + str(v.second) - 2 * sizeof(std::string);
+    }
+    for (const auto& p : k.parts) {
+      total += kNode + str(p.first) + p.second.capacity() * sizeof(Partial);
+      for (const auto& pa : p.second) total += str(pa.key) + strs(pa.vals) - 2 * sizeof(std::string);
+    }
+    if (k.shown_rows) for (const auto& r : *k.shown_rows) total += sizeof(r) + strs(r.values);
+  }
+  return total;
+}
+
 void ThingEngine::save_locked() {
   if (!dirty_) return;
   auto& host = db_.kernel_.host();
