@@ -25379,6 +25379,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_once(const std::string& sql_qu
         r.success = true;
         r.is_result_set = true;
         r.columns = {sql_query.substr(d0, d1 - d0)};
+        r.column_types = {SqlDataType::Int};   // typed as MariaDB types it (a client comparing `=== 1` sees an integer)
         r.rows.push_back(SqlRow{{sql_query.substr(d0, d1 - d0)}});
         return r;
       }
