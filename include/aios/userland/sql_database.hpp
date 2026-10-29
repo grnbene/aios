@@ -1792,6 +1792,14 @@ class SqlRwLock {
       if (got) return;
     }
   }
+  // The shared lock if it is free right now (no holder writing, no writer waiting); false without waiting.
+  bool try_lock_shared() {
+    int32_t s = state_.load(std::memory_order_acquire);
+    while (s >= 0 && waiting_writers_.load(std::memory_order_acquire) == 0) {
+      if (state_.compare_exchange_weak(s, s + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) return true;
+    }
+    return false;
+  }
   void unlock_shared() {
     if (state_.fetch_sub(1, std::memory_order_seq_cst) != 1) return;
     if (wsleep_.load(std::memory_order_seq_cst) > 0) {
@@ -3286,7 +3294,9 @@ class SqlDatabase {
     uint64_t bytes_age_ms = 0;
     std::unordered_map<std::string, size_t> table_bytes;   // "db.table" -> estimate
   };
-  MemoryFootprint memory_footprint() const;
+  // `cached_only`: the last snapshot, however old, without walking the tables (SHOW STATUS while the statement
+  // lock is held by someone else: the walk takes per-table locks that need it).
+  MemoryFootprint memory_footprint(bool cached_only = false) const;
   // The probe-index cache is bounded by TOTAL BYTES across every table, not by
   // a count per table: counts cannot distinguish one index over four million
   // rows from eight over a lookup table.

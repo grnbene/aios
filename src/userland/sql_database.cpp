@@ -24599,6 +24599,9 @@ bool SqlDatabase::kill_session(uint64_t id, bool query_only) {
 
 // Counted for SHOW STATUS: reads ended by the deadline, statements ended because their client hung up.
 static std::atomic<uint64_t> g_read_deadline_kills{0}, g_hangup_kills{0};
+// SHOW STATUS running without the statement lock (it was held by a long read with a writer waiting): the footprint
+// is the last snapshot and the table count comes from it, nothing walks the tables.
+static thread_local bool tls_status_cached_only = false;
 void SqlDatabase::note_hangup_kill() { g_hangup_kills.fetch_add(1, std::memory_order_relaxed); }
 
 bool sql_interrupted() {
@@ -24778,7 +24781,7 @@ std::vector<SqlDatabase::RecentQueryLog> SqlDatabase::recent_queries() const {
   return out;
 }
 
-SqlDatabase::MemoryFootprint SqlDatabase::memory_footprint() const {
+SqlDatabase::MemoryFootprint SqlDatabase::memory_footprint(bool cached_only) const {
   static constexpr uint64_t kFootprintTtlNs = 10ull * 1000000000ull;
   MemoryFootprint fp;
   for (const auto& kv : tables_) {
@@ -24788,7 +24791,7 @@ SqlDatabase::MemoryFootprint SqlDatabase::memory_footprint() const {
   }
   const uint64_t now = kernel_.host().monotonic_ns();
   std::lock_guard<aios::hal::Mutex> lk(footprint_mu_);
-  if (footprint_at_ns_ == 0 || now - footprint_at_ns_ >= kFootprintTtlNs) {
+  if ((footprint_at_ns_ == 0 || now - footprint_at_ns_ >= kFootprintTtlNs) && !(cached_only && footprint_at_ns_ != 0)) {
     MemoryFootprint b;
     for (const auto& kv : tables_) {
       table_lock_shared(&kv.second);   // a table-scoped writer may be writing it
@@ -25383,6 +25386,19 @@ SqlQueryResult SqlDatabase::execute_gateway_query_once(const std::string& sql_qu
       if (p != std::string::npos && up.compare(p, 5, "FULL ") == 0) p = up.find_first_not_of(" \t", p + 5);
       if (p != std::string::npos && up.compare(p, 11, "PROCESSLIST") == 0 && up.find_first_not_of(" \t;\r\n", p + 11) == std::string::npos)
         return execute_show(sql_query);
+      // SHOW [GLOBAL|SESSION] STATUS [LIKE ...]: what the watch and every monitor send. If the statement lock is
+      // free it runs as any statement; if not (a long read holds it, a writer waits), it answers now from counters
+      // and the last footprint snapshot rather than report the engine down while it is only busy.
+      size_t q = p;
+      if (q != std::string::npos && (up.compare(q, 7, "GLOBAL ") == 0 || up.compare(q, 8, "SESSION ") == 0)) q = up.find_first_not_of(" \t", up.find(' ', q));
+      if (q != std::string::npos && up.compare(q, 6, "STATUS") == 0 && !rw_lock_.try_lock_shared()) {
+        tls_status_cached_only = true;
+        SqlQueryResult r = execute_show(sql_query);
+        tls_status_cached_only = false;
+        return r;
+      } else if (q != std::string::npos && up.compare(q, 6, "STATUS") == 0) {
+        rw_lock_.unlock_shared();   // was free: the ordinary path takes it again below
+      }
     }
   }
   // A top-level read may be stopped part way by KILL; a write runs to its end
@@ -49082,7 +49098,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
     char hit_buf[32];
     std::snprintf(hit_buf, sizeof(hit_buf), "%.1f%%", hit_rate);
 
-    const MemoryFootprint fp = memory_footprint();
+    const MemoryFootprint fp = memory_footprint(tls_status_cached_only);
+    const size_t ntables = tls_status_cached_only ? fp.table_bytes.size() : tables_.size();
     size_t total_tbl_rows = fp.rows;
     size_t total_est_mem = fp.est_mem;
     size_t total_probe_mem = fp.probe_mem;
@@ -49136,6 +49153,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_errors", std::to_string(metrics_.total_errors.load(std::memory_order_relaxed))},
       {"Asql_last_latency_us", std::to_string(metrics_.last_query_time_us.load(std::memory_order_relaxed))},
       {"Asql_memory_bytes", std::to_string(total_est_mem)},
+      {"Asql_memory_bytes_age_ms", std::to_string(fp.bytes_age_ms)},   // how old that snapshot is (10 s at most; older only when answered without the lock)
       {"Asql_parallel_scans", std::to_string(SqlThreadPool::instance().dispatches())},
       {"Asql_probe_index_mem_bytes", std::to_string(total_probe_mem)},
       {"Asql_colidx_bytes", std::to_string(colidx_total_bytes())},
@@ -49170,7 +49188,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_radix_joins", std::to_string(metrics_.radix_joins.load(std::memory_order_relaxed))},
       {"Asql_slow_queries", std::to_string(metrics_.total_slow_queries.load(std::memory_order_relaxed))},
       {"Asql_total_rows", std::to_string(total_tbl_rows)},
-      {"Asql_total_tables", std::to_string(tables_.size())},
+      {"Asql_total_tables", std::to_string(ntables)},
       {"Asql_zone_map_pruned", std::to_string(metrics_.zone_map_pruned_blocks.load(std::memory_order_relaxed) + vx_zone_pruned_blocks())},
       {"Bytes_received", std::to_string(bytes_in)},
       {"Bytes_sent", std::to_string(bytes_out)},
@@ -49188,7 +49206,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Created_tmp_disk_tables", "0"},
       {"Created_tmp_tables", "0"},
       {"Max_used_connections", std::to_string(max_conns)},
-      {"Open_tables", std::to_string(tables_.size())},
+      {"Open_tables", std::to_string(ntables)},
       {"Queries", std::to_string(q)},
       {"Questions", std::to_string(q)},
       {"Slow_queries", std::to_string(metrics_.total_slow_queries.load(std::memory_order_relaxed))},
