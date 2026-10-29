@@ -311,8 +311,18 @@ checkpoints (19 maps, two small ones left for the next), counted memory 691 -> 5
 113 -> 43 MB in 408 ms, `stockmoves` 574k in 226 ms, everything else under 100 ms. Micro-benchmark on 3M keys:
 239 MB -> 73 MB, lookup 0.11 -> 0.71 µs (overlay of 50k: 0.89 µs); the query bench is unchanged (point reads
 0.1 ms). Differential soak: 300 sorted sequences, 3.2M steps, every answer the model's. `AIOS_SQL_PK_SORTED=0`
-keeps every map as slots. RSS follows the counted memory only once the allocator gives the slot pages back (see
-the replica notes: all three allocator settings showed a 170-190 MB gap after the morning's 58k-insert burst).
+keeps every map as slots.
+
+**The RSS gap, settled (07:20)**: RSS stood 160-190 MB above `Asql_memory_bytes` on every replica whatever the
+allocator setting, and on a fresh load. glibc's own figures (`Asql_malloc_live_bytes`, `_mmap_bytes`,
+`_free_bytes`, from `mallinfo2`) show live bytes equal to RSS and only 15-50 MB free: not fragmentation, data the
+estimate never counted. A per-step memory lap at the start (`AIOS_STORE_TRACE=1`) puts 129 MB of it at "things and
+cells loaded": 59,504 Things of two kinds (`sticker_item` 49,800 and `touch_hour` 9,704; 98 MB in their files, of
+which 60 MB is history - up to 32 entries a Thing, each a before/after copy of its values). The footprint now
+includes `ThingEngine::memory_bytes()` (`Asql_things_mem_bytes`, 126 MB here); the remaining gap on the atl store
+copy is 52 MB. The next cut, a design question for the Things rather than the store: the history need not live in
+memory (the as-of journal already writes it to disk) - keeping the last one or two entries and reading older ones
+from the file would give back ~70 MB on atl.
 
 ## What this does not do
 
