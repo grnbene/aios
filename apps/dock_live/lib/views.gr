@@ -47,15 +47,27 @@ let BOARD_CSS = join([
   ".clock.warn { color: var(--warn); } .clock.crit { color: var(--crit); }",
   ".done-at { color: var(--muted); font-size: " + u(16) + "; white-space: nowrap; font-variant-numeric: tabular-nums; }",
   ".state { display: inline-flex; align-items: center; gap: " + u(8) + "; justify-content: flex-end; }",
-  ".state .clock { font-size: " + u(19) + "; } .times { display: inline-flex; align-items: baseline; gap: " + u(5) + "; }",
+  ".state .clock { font-size: " + u(22) + "; } .times { display: inline-flex; align-items: baseline; gap: " + u(5) + "; }",
   ".alert .clock { margin-left: " + u(4) + "; }",
-  ".need { display: flex; justify-content: space-between; align-items: baseline; gap: " + u(8) + "; margin-top: " + u(4) + "; font-size: " + u(19) + "; font-weight: 600; color: var(--text); }",
-  ".need-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .need .bin { margin-left: " + u(8) + "; color: var(--muted); font-weight: 600; }",
-  ".need.more { color: var(--muted); font-weight: 500; }",
+  // NEEDS A PICKER: read from 10-15 ft (55" TV) - the tire at 40, its bin at 30, both bold
+  ".alert.pick { padding: " + u(10) + " " + u(14) + " " + u(12) + "; border-left: " + u(8) + " solid var(--open); }",
+  ".pick-head { display: flex; justify-content: space-between; align-items: center; font-size: " + u(24) + "; font-weight: 800; letter-spacing: .5px; }",
+  ".pick-n { background: var(--open); color: var(--open-ink); border-radius: " + u(20) + "; padding: 0 " + u(14) + "; font-size: " + u(26) + "; min-width: " + u(40) + "; text-align: center; }",
+  ".needs { display: grid; gap: " + u(10) + "; margin-top: " + u(8) + "; }",
+  ".need { color: var(--strong); min-width: 0; }",
+  ".need + .need { border-top: 1px solid var(--open-soft); padding-top: " + u(8) + "; }",
+  ".need-top { display: flex; align-items: baseline; gap: " + u(12) + "; min-width: 0; line-height: 1.1; }",
+  ".need-qty { font-size: " + u(34) + "; font-weight: 800; color: var(--open-text); flex: none; font-variant-numeric: tabular-nums; }",
+  ".need-item { font-size: " + u(40) + "; font-weight: 800; letter-spacing: .3px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".need-sub { display: flex; align-items: baseline; gap: " + u(14) + "; margin-top: " + u(2) + "; }",
+  ".need-bin { font-size: " + u(30) + "; font-weight: 800; color: var(--text); }",
+  ".need-order { font-size: " + u(20) + "; font-weight: 600; color: var(--muted); }",
+  ".need-sub .clock { font-size: " + u(28) + "; margin-left: auto; }",
+  ".need-more { font-size: " + u(22) + "; font-weight: 700; color: var(--open-text); }",
   ".bars { margin-top: " + u(10) + "; display: grid; gap: " + u(6) + "; }",
-  ".next { margin-top: " + u(10) + "; padding: " + u(10) + " " + u(12) + "; border-radius: " + u(8) + "; border: 2px solid var(--line); border-left: " + u(8) + " solid var(--picked); background: var(--bg); }",
+  ".next { margin-top: " + u(10) + "; padding: " + u(6) + " " + u(12) + "; border-radius: " + u(8) + "; border: 2px solid var(--line); border-left: " + u(8) + " solid var(--picked); background: var(--bg); }",
   ".next-top { display: flex; justify-content: space-between; align-items: baseline; }",
-  ".next-count { font-size: " + u(28) + "; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--strong); }",
+  ".next-count { font-size: " + u(24) + "; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--strong); }",
   // load spots (HOST_JS): plain text on a shared board; inside the loading screen, the old badge's look - tap to load
   "html[data-host='1'] .loadable { cursor: pointer; border-radius: " + u(6) + "; user-select: none; }",
   "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: " + u(2) + " " + u(8) + "; }",
@@ -64,9 +76,9 @@ let BOARD_CSS = join([
   ".order.active { box-shadow: inset " + u(4) + " 0 0 var(--claimed); }",
   "#dock-note { position: fixed; left: 50%; bottom: " + u(56) + "; transform: translateX(-50%); padding: " + u(10) + " " + u(18) + "; border-radius: " + u(8) + "; font-size: " + u(18) + "; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
   "#dock-note.show { opacity: 1; } #dock-note.ok { background: var(--loaded); } #dock-note.err { background: var(--open); }",
-  ".next-item { font-size: " + u(40) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
-  ".next-desc { font-size: " + u(20) + "; color: var(--text); margin-top: " + u(2) + "; }",
-  ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(6) + "; font-size: " + u(17) + "; color: var(--muted); }",
+  ".next-item { font-size: " + u(28) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
+  ".next-desc { font-size: " + u(17) + "; color: var(--text); margin-top: " + u(2) + "; }",
+  ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(16) + "; color: var(--muted); }",
   ".next-meta .bin { color: var(--text); font-weight: 700; margin-right: " + u(6) + "; }",
   ".bar { display: grid; grid-template-columns: " + u(70) + " minmax(0, 1fr) auto; align-items: center; gap: " + u(8) + "; font-size: " + u(17) + "; color: var(--muted); }",
   ".track { height: " + u(14) + "; background: var(--track); border-radius: " + u(7) + "; overflow: hidden; }",
@@ -83,12 +95,12 @@ let BOARD_CSS = join([
   ".order.done { opacity: .7; }",
   ".order-head { display: flex; justify-content: space-between; gap: " + u(8) + "; font-size: " + u(18) + "; }",
   ".order-no { font-weight: 700; color: var(--strong); } .order-cust { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
-  ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(21) + "; }",
-  ".ln .qty { flex: 0 0 " + u(56) + "; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
+  ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(25) + "; }",
+  ".ln .qty { flex: 0 0 " + u(62) + "; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
   ".ln .item { flex: 1 1 " + u(180) + "; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .state { margin-left: auto; }",
-  ".ln .bin { color: var(--muted); font-size: " + u(17) + "; font-weight: 500; margin-left: " + u(6) + "; }",
+  ".ln .bin { color: var(--muted); font-size: " + u(20) + "; font-weight: 500; margin-left: " + u(6) + "; }",
   // a line keeps its tag as it moves along (NO CLAIM, a picker, PICKED, LOADED): the colour fades to the next one
-  ".tag { padding: " + u(3) + " " + u(10) + "; border-radius: " + u(5) + "; font-size: " + u(17) + "; font-weight: 700; white-space: nowrap; transition: background-color .6s, color .6s; }",
+  ".tag { padding: " + u(3) + " " + u(10) + "; border-radius: " + u(5) + "; font-size: " + u(20) + "; font-weight: 700; white-space: nowrap; transition: background-color .6s, color .6s; }",
   ".tag.open { background: var(--open); color: var(--open-ink); }",
   ".tag.claimed { background: var(--claimed); color: var(--claimed-ink); }",
   ".tag.picked { background: var(--picked); color: var(--picked-ink); }",
@@ -283,23 +295,27 @@ fn bay_node(b) {
               el("div", {"class": "empty"}, "No truck"))
   }
   let alert = el("div", {"class": "alert ok"}, "All picked")
-  if b.lines_unclaimed > 0 {
-    // the lines themselves, longest-waiting first, so nobody has to scroll the bay to find them
-    let waiting = []
-    for o in b.orders ?? [] {
-      for l in o.lines ?? [] { if line_state(l).cls == "open" { push(waiting, {"order": o, "line": l}) } }
-    }
-    waiting = sort_by(waiting, fn (w) { return w.line.released_at == "" ? "9999" : w.line.released_at })
-    let rows = map(take(waiting, 4), fn (w) {
-      return el("div", {"class": "need"},
-                el("span", {"class": "need-what"}, "#" + w.order.orderno + "  " + qty_text(w.line.qty) + "x " + w.line.stockid,
-                   w.line.bin == "" ? "" : el("span", {"class": "bin"}, w.line.bin)),
-                clock_node(w.line.released_at, 15, 30, "m"))
+  // The lines nobody has taken, longest-waiting first: what someone with a free minute can go and pick ahead. The
+  // biggest thing on the bay, read from 10-15 ft on the dock's 55" TV - the tire and how many on one line, the bin
+  // and how long it has waited under it. Counted from what is listed (a partly picked line with no claim is being
+  // picked, as its row says, though the Thing counts it as unclaimed).
+  let waiting = []
+  for o in b.orders ?? [] {
+    for l in o.lines ?? [] { if line_state(l).cls == "open" { push(waiting, {"order": o, "line": l}) } }
+  }
+  waiting = sort_by(waiting, fn (w) { return w.line.released_at == "" ? "9999" : w.line.released_at })
+  if len(waiting) > 0 {
+    let rows = map(take(waiting, 3), fn (w) {
+      return el("div", {"class": "need", "data-key": "need-" + w.order.orderno + "-" + str(w.line.line)},
+                el("div", {"class": "need-top"}, el("span", {"class": "need-qty"}, qty_text(w.line.qty) + "×"),
+                   el("span", {"class": "need-item"}, w.line.stockid)),
+                el("div", {"class": "need-sub"}, el("span", {"class": "need-bin"}, w.line.bin == "" ? "no bin" : w.line.bin),
+                   el("span", {"class": "need-order"}, "#" + w.order.orderno), clock_node(w.line.released_at, 15, 30, "m")))
     })
-    let more = len(waiting) > 4 ? el("div", {"class": "need more"}, "+ " + str(len(waiting) - 4) + " more below") : ""
-    alert = el("div", {"class": "alert"},
-               el("div", str(b.lines_unclaimed) + (b.lines_unclaimed == 1 ? " line needs a picker" : " lines need a picker")),
-               ...rows, more)
+    if len(waiting) > 3 { push(rows, el("div", {"class": "need-more", "data-key": "more"}, "+ " + str(len(waiting) - 3) + " more below")) }
+    alert = el("div", {"class": "alert pick"},
+               el("div", {"class": "pick-head"}, "NEEDS A PICKER", el("span", {"class": "pick-n"}, str(len(waiting)))),
+               el("div", {"class": "needs"}, ...rows))
   } else if b.lines_open > 0 {
     alert = el("div", {"class": "alert ok"}, "Every open line is claimed")
   }
@@ -449,7 +465,7 @@ let ENTER_JS = join([
   "(function () {",
   "  if (!window.WeakSet || !Element.prototype.animate) return;",
   "  var calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;",
-  "  var SEL = '.bay, .order, .ln', seen = new WeakSet();",
+  "  var SEL = '.bay, .order, .ln, .need', seen = new WeakSet();",
   "  function all(node) { var l = node.matches(SEL) ? [node] : []; node.querySelectorAll(SEL).forEach(function (e) { l.push(e); }); return l; }",
   "  all(document.body).forEach(function (e) { seen.add(e); });",
   "  function arrived(node) {",
