@@ -736,6 +736,7 @@ const std::vector<std::string>& grain_allowed() {
       // exact decimals and text layout: pure functions of their arguments
       "decimal", "dec_div", "scale", "decimal_prefix", "round_sig", "number_format", "is_numeric", "to_number", "format", "sort_by", "group_by", "key_by",
       "sum_by", "idiv", "upper_rtrim",
+      "chunk", "partition", "take_while", "drop_while", "sum", "min_by", "max_by", "find_index", "zip_with",
       // patterns: the same text and pattern give the same answer anywhere
       "regex_test", "regex_match", "regex_find_all", "regex_replace", "regex_split",
       // blanks, records made on first use, sets, calendar days and markup: functions of their arguments (get_or_put
