@@ -898,6 +898,8 @@ add_test(NAME drive.web COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-web.sh ${CMAKE
 # deleting the element it was called on would have been caught here on the first
 # run; instead it survived long enough to look like a layout bug.
 add_test(NAME drive.dom COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-dom.sh ${CMAKE_BINARY_DIR})
+# `:active`: a button pressed and held takes its :active style and loses it on release (web-corpus/active.html).
+add_test(NAME drive.active COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-active.sh ${CMAKE_BINARY_DIR})
 
 add_test(NAME drive.image COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-image.sh ${CMAKE_BINARY_DIR})
 

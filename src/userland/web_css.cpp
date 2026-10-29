@@ -36,6 +36,7 @@
 #include <cstdio>
 
 bool g_css_has_hover = false;   // some stylesheet had a :hover rule (read by web_pane.cpp)
+bool g_css_has_active = false;  // ... a :active rule: the pane marks the pressed element while the button is down
 
 namespace aios::userland::web {
 namespace {
@@ -1005,7 +1006,16 @@ SimpleSelector parse_simple(const std::string& text) {
         s.attrs.push_back(std::move(t));
         saw_pseudo = false;
         g_css_has_hover = true;
-      } else if (name == "active" || name == "focus" || name == "focus-visible" ||
+      } else if (name == "active") {
+        // Decidable while a button is down: the pane marks the pressed element and its ancestors with this
+        // attribute on press, re-cascades, and clears it on release (web_pane_click / web_pane_release).
+        SimpleSelector::AttrTest t;
+        t.name = "data-aios-active";
+        t.op = SimpleSelector::AttrTest::Op::Present;
+        s.attrs.push_back(std::move(t));
+        saw_pseudo = false;
+        g_css_has_active = true;
+      } else if (name == "focus" || name == "focus-visible" ||
           name == "focus-within" || name == "target" || name == "visited" || name == "current" ||
           name == "past" || name == "future" || name == "playing" || name == "paused" ||
           name == "user-invalid" || name == "user-valid") {
