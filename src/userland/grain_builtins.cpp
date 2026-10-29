@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2416,10 +2417,14 @@ class JsonParser {
       while (peek() >= '0' && peek() <= '9') get();
     }
     std::string num_str = s.substr(start, pos - start);
-    if (is_float) {
-      return Value::real(std::strtod(num_str.c_str(), nullptr));
+    if (!is_float) {
+      // An integer that fits is an integer; one past 64 bits is a real of that size (as a source
+      // literal is), never the largest integer standing in for it.
+      int64_t n = 0;
+      const auto r = std::from_chars(num_str.data(), num_str.data() + num_str.size(), n, 10);
+      if (r.ec == std::errc() && r.ptr == num_str.data() + num_str.size()) return Value::integer(n);
     }
-    return Value::integer((int64_t)std::strtoll(num_str.c_str(), nullptr, 10));
+    return Value::real(std::strtod(num_str.c_str(), nullptr));
   }
 
   Value parse_string(std::string& err) {
@@ -2567,8 +2572,10 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       if (std::isnan(v.d) || std::isinf(v.d)) {
         out += "null";
       } else {
-        std::snprintf(buf, sizeof(buf), "%.17g", v.d);
-        out += buf;
+        // The fewest digits that read back as the same value: 0.1 is "0.1", 0.1 + 0.2 is
+        // "0.30000000000000004" (what JavaScript and Python write), not 17 digits for every real.
+        const auto r = std::to_chars(buf, buf + sizeof(buf), v.d);
+        out.append(buf, r.ptr);
       }
       break;
     }

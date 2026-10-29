@@ -336,8 +336,8 @@ ECMAScript-compatible regular expression operations.
 
 | Function | Signature | Description |
 |---|---|---|
-| `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. |
-| `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. |
+| `json_parse` | `json_parse(json_str)` | Parses JSON string into Grain maps, lists, and primitives. An integer that fits 64 bits is an int; a longer one is a real of that size. |
+| `json_stringify`| `json_stringify(val, [options])` | Serializes value to JSON. Options: `{"indent": 2, "ascii": true, "escape_slashes": true}`. A real is written with the fewest digits that read back as the same value (`0.1`, not 17 digits). |
 | `xml_parse` | `xml_parse(xml_str)` | Parses XML into nested map `{tag, attrs, children, text}` with entity decoding and CDATA support. |
 | `xml_escape` | `xml_escape(str)` | Escapes special XML characters (`&`, `<`, `>`, `"`, `'`). |
 | `xml_unescape` | `xml_unescape(str)` | Unescapes standard and numeric XML entities (e.g. `&amp;`, `&#x2603;`). |
