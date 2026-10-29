@@ -250,6 +250,20 @@ What is still open: the allocator gap itself. The replica measurement says it fo
 which steps 1 and 2 remove, but that is a prediction until the new binary runs under replication (the next thing to
 do on the local replica, then atl).
 
+**Later the same night (commits 5768d8a, 4f9e993, 4056d10 and the stall series)**
+
+- A checkpoint right after boot: a store loads at what its files hold (660 MB of columns) and the first
+  checkpoint's upkeep takes it to 400 MB; it used to come after 20,000 statements. The warm-up asks for one.
+- Folding deleted rows out of a key map used `begin()`, which turned the map into slots for good: every table with
+  a deleted row had a fat map after its next checkpoint (289 MB on a fresh load). `PkMap::remap_or_erase`.
+- Date predicates prune by the segments' date bounds; a symbol-coded dictionary with no plain tail reaches the
+  block step; decoding one before blocking no longer holds 3x its text.
+- Measured on the same store and protocol, final: columns 412 -> 376 MB, resident 715 -> 690 MB (the rest of the
+  night's numbers are in the commits).
+- Under replication the gap still follows writes with the maps staying runs: three local replicas of atl ran
+  overnight on the new engine - default malloc, `MALLOC_ARENA_MAX=2`, and that plus `MALLOC_MMAP_THRESHOLD_=1048576`
+  - sampled in `samples.txt` beside each store; the unit's `Environment=` on atl follows from them.
+
 ## Deploying to atl
 
 The table files become AQT8 at the first checkpoint, which the old binary refuses. So, in this order:
