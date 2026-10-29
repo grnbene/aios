@@ -109,6 +109,9 @@ class WebUi {
   mutable std::mutex mu_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
   std::shared_ptr<Session> shared_;     // the one copy, for a pane with "shared": true
+  // Routes asked with no session (nginx's auth check, another site's fetch or EventSource): they would never send a
+  // new session's cookie back, so they share this one instead of each starting a copy of the program.
+  std::shared_ptr<Session> routes_;
   bool member_known_ = false;           // given_member(): learnt for member_version_ of the program
   std::string member_version_, member_;
   aios::hal::Thread ticker_;
@@ -117,7 +120,7 @@ class WebUi {
   bool stop_ = false;
   std::condition_variable stop_cv_;
 
-  std::shared_ptr<Session> session_for(const Request& req, std::string& new_id, std::string& error);
+  std::shared_ptr<Session> session_for(const Request& req, std::string& new_id, std::string& error, bool route = false);
   std::shared_ptr<Session> make_session(std::string& error);
   void reap_locked();
   void report(const std::string& msg) const;

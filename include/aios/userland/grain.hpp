@@ -737,6 +737,8 @@ bool pane_closed(Vm& vm, uint64_t id, std::string& error);
 // Unregisters every pane of `vm`, with no callbacks: for an embedder that is
 // done with the VM (its program ended, or its app was closed).
 void drop_panes(const Vm& vm);
+// How many panes every VM in this process has registered and not yet dropped.
+size_t pane_count();
 
 // A ui.pane shown in a browser instead of a window (grain_face.cpp renders it, grain_webui.cpp
 // serves it). The program is the same one a desktop window runs: its `view` is called, its
@@ -801,6 +803,8 @@ bool web_pane_handle_route(Vm& vm, uint64_t id, const std::string& method, const
 
 // True for a pane made by serve_routes: it has routes and no page.
 bool web_pane_api_only(Vm& vm, uint64_t id);
+// Whether the pane runs each route in a worker VM of its own (its "workers" option), outside the session's lock.
+bool web_pane_workers(Vm& vm, uint64_t id);
 // The fleet member a ui.pane's "machine" gives the whole pane to ("" when it runs here).
 std::string web_pane_machine(Vm& vm, uint64_t id);
 // The pane's "on_open" with the page request's URL query (true when it has none, or it ran).
