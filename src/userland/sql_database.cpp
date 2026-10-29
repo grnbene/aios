@@ -22974,6 +22974,30 @@ void SqlDatabase::maintain_storage() {
       }
     }
   }
+  // A primary-key map of text keys held as slots (a code, a name, a composite with a text column: atl's 34 such
+  // tables were half of its 289 MB of key maps at ~45 B a key) becomes a sorted arena, ~25 B a key. A map that
+  // turned back into slots since (an id past 32 bits, a walk) is sorted again here.
+  // Half a million keys a checkpoint (~0.3 s under the lock: 3M keys sort in 1.6 s): the rest wait for the next one.
+  {
+    std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+    size_t sort_budget = 500000, left = 0, left_keys = 0;
+    for (auto& kv : table_row_indices_) {
+      if (!kv.second) continue;
+      PkMap& pk = kv.second->pk_to_row;
+      if (pk.sorted_mode() || pk.runs_mode() || pk.size() < PkMap::kSortedMin) continue;
+      if (sort_budget == 0) { ++left; left_keys += pk.size(); continue; }
+      const uint64_t t0 = kernel_.host().monotonic_ns();
+      const size_t before = pk.memory_bytes();
+      sort_budget -= std::min(sort_budget, pk.size());
+      if (pk.sort_text_keys()) {
+        static const bool store_trace_k = std::getenv("AIOS_STORE_TRACE") != nullptr;
+        if (store_trace_k) fprintf(stderr, "[store] %s: %zu text keys sorted at checkpoint (%.1f MB -> %.1f MB, %.1f ms)\n", kv.second->table.c_str(), kv.second->pk_to_row.size(), before / 1048576.0, kv.second->pk_to_row.memory_bytes() / 1048576.0, (kernel_.host().monotonic_ns() - t0) / 1e6);
+        trimmed_tables = true;   // the slots' pages go back after this statement
+      }
+    }
+    static const bool store_trace_k2 = std::getenv("AIOS_STORE_TRACE") != nullptr;
+    if (store_trace_k2 && left) fprintf(stderr, "[store] key maps: %zu of text keys (%zu keys) left for the next checkpoint\n", left, left_keys);
+  }
   if (trimmed_tables) g_trim_after_statement.store(true, std::memory_order_relaxed);   // the freed pages go back after this statement
   if (refreshed && std::getenv("AIOS_STORE_TRACE"))
     fprintf(stderr, "[store] %zu zone-map segment(s) refreshed in %.1f ms\n", refreshed, (kernel_.host().monotonic_ns() - refresh_t0) / 1e6);
@@ -49222,6 +49246,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_query_memory_waits", std::to_string(metrics_.query_memory_waits.load(std::memory_order_relaxed))},
       {"Asql_row_index_mem_bytes", std::to_string(total_row_index_mem)},
       {"Asql_pk_runs_to_slots", std::to_string(PkMap::runs_to_slots_count().load(std::memory_order_relaxed))},
+      {"Asql_pk_text_sorted", std::to_string(PkMap::sorted_count().load(std::memory_order_relaxed))},
+      {"Asql_pk_sorted_to_slots", std::to_string(PkMap::sorted_to_slots_count().load(std::memory_order_relaxed))},
       {"Asql_row_index_evictions", std::to_string(metrics_.row_index_evictions.load(std::memory_order_relaxed))},
       {"Asql_read_deadline_kills", std::to_string(g_read_deadline_kills.load(std::memory_order_relaxed))},
       {"Asql_hangup_kills", std::to_string(g_hangup_kills.load(std::memory_order_relaxed))},

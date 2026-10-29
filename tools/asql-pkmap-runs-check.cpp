@@ -265,6 +265,119 @@ int main() {
     OK(!w.runs_mode(), "a walk with begin() still turns a map into slots (which is why the fold no longer walks)");
   }
 
+  // ---- sorted mode: a map of text keys (a code, a name, a composite with a text column) as a sorted arena ----
+  // What it answers must be exactly what the slots answer; only the memory differs.
+  {
+    unsetenv("AIOS_SQL_PK_SORTED");
+    auto tk = [](uint64_t n) {   // "sku-<n>\x1fwh<n%7>\x1f": text, two columns, ~14 B
+      return "sku-" + std::to_string(n) + '\x1f' + "wh" + std::to_string(n % 7) + '\x1f';
+    };
+    // differential: sorted once, then random ops against a std::map, through folds and back to slots
+    std::mt19937_64 srng(777);
+    long schecks = 0;
+    int sorted_rounds = 0;
+    const int srounds = std::getenv("PKMAP_ROUNDS") ? std::max(20, std::atoi(std::getenv("PKMAP_ROUNDS")) / 20) : 20;
+    for (int round = 0; round < srounds && failures < 20; ++round) {
+      PkMap m;
+      std::map<std::string, uint32_t> ref;
+      const uint64_t n0 = PkMap::kSortedMin + (srng() % 20000);
+      uint32_t next_val = 0;
+      while (m.size() < n0) {   // scattered keys, some repeats, until the map is big enough to be sorted
+        const std::string k = tk(srng() % (n0 * 2));
+        if (m.emplace(k, next_val).second) { ref[k] = next_val; ++next_val; }
+      }
+      const bool sorted = m.sort_text_keys();
+      CHECK(sorted, "round %d: %zu text keys sorted", round, m.size());
+      if (sorted) ++sorted_rounds;
+      const int ops = 500 + (int)(srng() % 20000);   // past 4096 + n/64: folds happen
+      for (int op = 0; op < ops; ++op) {
+        const int r = (int)(srng() % 100);
+        if (r < 35) {   // a new key, or one that is there
+          const std::string k = tk(srng() % (n0 * 3));
+          auto res = m.emplace(k, next_val);
+          const bool fresh = ref.emplace(k, next_val).second;
+          CHECK(res.second == fresh, "sorted round %d op %d: emplace new=%d, model %d", round, op, res.second, fresh);
+          CHECK(res.first->second == ref[k], "sorted round %d op %d: emplace value %u, model %u", round, op, res.first->second, ref[k]);
+          if (fresh) ++next_val;
+        } else if (r < 65) {   // lookup
+          const std::string k = (srng() % 10 == 0) ? "zz" + std::to_string(srng() % 100) + '\x1f' : tk(srng() % (n0 * 3));
+          auto it = m.find(k);
+          auto rf = ref.find(k);
+          CHECK((it != m.end()) == (rf != ref.end()), "sorted round %d op %d: find found=%d, model %d", round, op, it != m.end(), rf != ref.end());
+          if (it != m.end() && rf != ref.end()) CHECK(it->second == rf->second, "sorted round %d op %d: find value %u, model %u", round, op, it->second, rf->second);
+        } else if (r < 80) {   // erase by key, or through the iterator of a find
+          const std::string k = tk(srng() % (n0 * 3));
+          if (srng() % 2) { m.erase(k); }
+          else { auto it = m.find(k); if (it != m.end()) m.erase(it); }
+          ref.erase(k);
+        } else if (r < 92) {   // a write through operator[]: a re-point, or a new key
+          const std::string k = tk(srng() % (n0 * 3));
+          const uint32_t v = (uint32_t)(srng() % 1000000);
+          m[k] = v;
+          ref[k] = v;
+        } else if (r < 96) {   // renumber every id
+          const uint32_t cut = next_val / 2;
+          auto f = [cut](size_t v) { return v > cut ? v - 1 : v; };
+          m.remap_values(f);
+          for (auto& e : ref) e.second = (uint32_t)f(e.second);
+        } else {   // fold the gaps: ids drop out and the rest move down
+          std::vector<size_t> erased;
+          for (int i = 0; i < 3; ++i) erased.push_back(srng() % std::max<uint32_t>(1, next_val));
+          std::sort(erased.begin(), erased.end());
+          erased.erase(std::unique(erased.begin(), erased.end()), erased.end());
+          auto f = [&](size_t v) -> size_t {
+            auto lb = std::lower_bound(erased.begin(), erased.end(), v);
+            if (lb != erased.end() && *lb == v) return PkMap::kDrop;
+            return v - (size_t)(lb - erased.begin());
+          };
+          const size_t gone = m.remap_or_erase(f);
+          size_t model_gone = 0;
+          for (auto it = ref.begin(); it != ref.end();) {
+            const size_t nv = f(it->second);
+            if (nv == PkMap::kDrop) { it = ref.erase(it); ++model_gone; } else { it->second = (uint32_t)nv; ++it; }
+          }
+          CHECK(gone == model_gone, "sorted round %d op %d: remap_or_erase dropped %zu, model %zu", round, op, gone, model_gone);
+        }
+        CHECK(m.size() == ref.size(), "sorted round %d op %d: size %zu, model %zu", round, op, m.size(), ref.size());
+        ++schecks;
+      }
+      for (const auto& e : ref) {
+        auto it = m.find(e.first);
+        CHECK(it != m.end() && it->second == e.second, "sorted round %d: final find of a model key", round);
+      }
+      CHECK(m.sorted_mode(), "sorted round %d: still sorted at the end", round);
+      // and back to slots (a walk), still exact
+      size_t walked = 0;
+      for (auto it = m.begin(); it != m.end(); ++it) ++walked;
+      CHECK(!m.sorted_mode() && walked == ref.size(), "sorted round %d: a walk turns it into slots with every key (%zu of %zu)", round, walked, ref.size());
+      for (const auto& e : ref) {
+        auto it = m.find(e.first);
+        CHECK(it != m.end() && it->second == e.second, "sorted round %d: every key found as slots", round);
+      }
+      CHECK(m.sort_text_keys() && m.sorted_mode(), "sorted round %d: and sorted again", round);
+    }
+    OK(failures == 0, "sorted: %d random sequences, %ld steps, every answer the model's (%d sorted)", srounds, schecks, sorted_rounds);
+    // memory: 1M text keys
+    PkMap big;
+    for (uint64_t i = 0; i < 1000000; ++i) big.emplace(tk(i * 7 + 3), (size_t)i);
+    const size_t as_slots = big.memory_bytes();
+    OK(big.sort_text_keys(), "1M text keys sorted");
+    const size_t as_sorted = big.memory_bytes();
+    OK(as_sorted * 2 < as_slots, "and %zu bytes for 1M keys (%.1f a key; slots were %.1f a key)", as_sorted, as_sorted / 1e6, as_slots / 1e6);
+    size_t bad = 0;
+    for (uint64_t i = 0; i < 1000000; i += 97) { auto it = big.find(tk(i * 7 + 3)); if (it == big.end() || it->second != i) ++bad; }
+    size_t ghosts = 0;
+    for (uint64_t i = 0; i < 1000; ++i) if (big.find(tk(i * 7 + 4)) != big.end()) ++ghosts;
+    OK(bad == 0 && ghosts == 0, "every key found with its row, absent ones not");
+    // too small to be worth it: left as slots; AIOS_SQL_PK_SORTED=0: left as slots
+    PkMap small;
+    for (uint64_t i = 0; i < 100; ++i) small.emplace(tk(i), (size_t)i);
+    OK(!small.sort_text_keys() && !small.sorted_mode(), "a map of 100 keys stays slots");
+    PkMap ints;
+    for (long long k = 1; k <= 10000; ++k) ints.emplace(ik(k), (size_t)k);
+    OK(!ints.sort_text_keys() && ints.runs_mode(), "a map of integer keys is not sorted (it is runs)");
+  }
+
   std::printf(failures ? "pkmap runs check: %d failure(s)\n" : "pkmap runs check: all passed\n", failures);
   return failures ? 1 : 0;
 }

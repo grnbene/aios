@@ -1194,8 +1194,8 @@ class PkMap {
     bool operator!=(const iterator& o) const { return i != o.i; }
     void skip() { while (i < m->slots_.size() && m->slots_[i].state != 1) ++i; }
   };
-  iterator begin() { if (runs_) to_slots(); iterator it{this, 0}; it.skip(); return it; }
-  iterator end() { return iterator{this, runs_ ? 0 : slots_.size()}; }
+  iterator begin() { if (runs_) to_slots(); if (sorted_) sorted_to_slots(); iterator it{this, 0}; it.skip(); return it; }
+  iterator end() { return iterator{this, (runs_ || sorted_) ? 0 : slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
   // `hash` is for the tests: a degenerate one makes every key collide, and the map must still be exact.
@@ -1203,10 +1203,12 @@ class PkMap {
   void clear() {
     slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false;
     runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); late_.clear(); shape_ = 0; pair_swap_ = false;
+    sorted_ = false; skeys_.clear(); soff_.clear(); sval_.clear(); sidx_.clear(); sgone_.clear(); slate_.clear();
   }
-  void reserve(size_t n) { if (runs_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
+  void reserve(size_t n) { if (runs_ || sorted_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
     if (runs_) return run_find(key);
+    if (sorted_) return sorted_find(key);
     if (slots_.empty()) return end();
     uint64_t ik = 0;
     if (!text_ && !int_key(key, &ik)) return end();   // not this map's integer shape: not one of its keys
@@ -1223,6 +1225,12 @@ class PkMap {
       if (it.i == 0) return it;
       run_erase(it.run_hit.key);
       maybe_fold();
+      return end();
+    }
+    if (sorted_) {
+      if (it.i == 0) return it;
+      sorted_erase_hit(it.run_hit.key);
+      maybe_sfold();
       return end();
     }
     slots_[it.i].state = 2;
@@ -1247,6 +1255,15 @@ class PkMap {
       }
       to_slots();
     }
+    if (sorted_) {
+      // A live key's id is written where it is; a new key goes to the overlay (no fold here: the reference
+      // handed out must outlive this call, and a fold would move it).
+      uint32_t* ref = sorted_ref(key);
+      if (ref) return *ref;
+      ++count_;
+      auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+      return slate_.insert(at, SlateEntry{key, 0})->val;
+    }
     const size_t i = emplace(key, 0).first.i;
     return slots_[i].second;
   }
@@ -1266,6 +1283,18 @@ class PkMap {
       }
       to_slots();   // a text key: slots from here on
     }
+    if (sorted_) {
+      auto have = sorted_find(key);
+      if (have != end()) return {have, false};
+      if (v > UINT32_MAX) sorted_to_slots();   // an id past 32 bits: as slots, below
+      else {
+        ++count_;
+        auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+        const size_t s = (size_t)(slate_.insert(at, SlateEntry{key, (uint32_t)v}) - slate_.begin());
+        if (slate_.size() + sgone_.size() > 4096 + count_ / 64) { sfold(); return {sorted_find(key), true}; }
+        return {run_iter(kSlateBit | (uint64_t)s, (uint32_t)v), true};
+      }
+    }
     if (!text_ && !is_int) to_text();
     if (text_) ik = hash_text(key);
     if ((used_ + 1) * 10 > slots_.size() * 7 || slots_.empty()) rehash(count_ + 1);
@@ -1280,13 +1309,22 @@ class PkMap {
     return {iterator{this, i}, true};
   }
   size_t memory_bytes() const {
+    size_t slate = slate_.capacity() * sizeof(SlateEntry);
+    for (const SlateEntry& e : slate_) if (e.key.capacity() > sizeof(std::string)) slate += e.key.capacity();
     return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity() +
-           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t) + late_.capacity() * sizeof(Run);
+           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t) + late_.capacity() * sizeof(Run) +
+           skeys_.capacity() + (soff_.capacity() + sval_.capacity() + sgone_.capacity()) * sizeof(uint32_t) +
+           sidx_.capacity() * sizeof(uint64_t) + slate;
   }
   // Every entry's row id through `fn` (a monotonic renumbering: the row index folding its gaps). In runs mode the
   // runs are rebuilt from the new ids; slots are rewritten in place.
   template <class F> void remap_values(F fn) {
     if (runs_) fold();   // the overlay into the runs first: one list to renumber
+    if (sorted_) {
+      sfold();
+      for (uint32_t& v : sval_) v = (uint32_t)fn(v);
+      return;
+    }
     if (!runs_) {
       for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
       return;
@@ -1323,6 +1361,16 @@ class PkMap {
   template <class F> size_t remap_or_erase(F fn) {
     if (runs_) fold();
     size_t gone = 0;
+    if (sorted_) {
+      sfold();   // the overlay in, the erased out: one sorted list to renumber
+      for (uint32_t p = 0; p < sval_.size(); ++p) {
+        const size_t nv = fn(sval_[p]);
+        if (nv == kDrop) { sgone_.push_back(p); ++gone; --count_; }   // in position order: sgone_ stays sorted
+        else sval_[p] = (uint32_t)nv;
+      }
+      maybe_sfold();
+      return gone;
+    }
     if (runs_) {
       std::vector<Run> fresh;
       fresh.reserve(runs_v_.size());
@@ -1365,6 +1413,54 @@ class PkMap {
   bool runs_mode() const { return runs_; }
   // How many maps have turned from runs back into slots (SHOW STATUS Asql_pk_runs_to_slots).
   static std::atomic<uint64_t>& runs_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
+  // Text keys as a sorted arena (below): what a checkpoint asks of a map of text keys held as slots. True when the
+  // map changed form; a small map (under kSortedMin keys) or one not of text keys is left as it is.
+  bool sort_text_keys() {
+    if (sorted_ || runs_ || !text_ || count_ < kSortedMin || !sorted_enabled()) return false;
+    // Each live key's bytes located once (the varint decoded), then sorted by memcmp alone: 3M keys in ~1 s.
+    struct Ref { const char* p; uint32_t len; uint32_t val; };
+    std::vector<Ref> order;
+    order.reserve(count_);
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      if (slots_[i].state != 1) continue;
+      size_t len;
+      const char* p = text_of(i, &len);
+      order.push_back(Ref{p, (uint32_t)len, slots_[i].second});
+    }
+    std::sort(order.begin(), order.end(), [](const Ref& a, const Ref& b) {
+      const int c = std::memcmp(a.p, b.p, std::min(a.len, b.len));
+      return c < 0 || (c == 0 && a.len < b.len);
+    });
+    std::vector<char> keys;
+    keys.reserve(arena_.size() - dead_);
+    std::vector<uint32_t> off, val;
+    off.reserve(order.size());
+    val.reserve(order.size());
+    for (const Ref& r : order) {
+      if (keys.size() + r.len + 5 > UINT32_MAX) return false;   // offsets are 32-bit: a map this big stays slots
+      off.push_back((uint32_t)keys.size());
+      put_skey(keys, r.p, r.len);
+      val.push_back(r.val);
+    }
+    std::vector<Slot>().swap(slots_);
+    std::vector<uint32_t>().swap(koff_);
+    std::vector<char>().swap(arena_);
+    dead_ = 0;
+    used_ = count_;
+    keys.shrink_to_fit();
+    skeys_.swap(keys);
+    soff_.swap(off);
+    sval_.swap(val);
+    build_sidx();
+    sorted_ = true;
+    sorted_count().fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  bool sorted_mode() const { return sorted_; }
+  // How many maps have been sorted, and how many sorted maps turned back into slots (SHOW STATUS).
+  static std::atomic<uint64_t>& sorted_count() { static std::atomic<uint64_t> n{0}; return n; }
+  static std::atomic<uint64_t>& sorted_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
+  static constexpr size_t kSortedMin = 4096;
 
  private:
   static constexpr size_t npos = (size_t)-1;
@@ -1781,6 +1877,197 @@ class PkMap {
       koff_[j] = put_text(k);
       ++count_; ++used_;
     }
+  }
+
+  // Sorted mode: the text keys of a big map (a checkpoint sorts one of kSortedMin+ keys) as one arena in key
+  // order - a varint length and the bytes, nothing between - with a 32-bit offset and a 32-bit row id a key
+  // (skeys_, soff_, sval_): ~9 B a key over the text, where a slot and its koff_ cost ~29 B at 70% load.
+  // A lookup bisects: sidx_ (the first 8 bytes of every 64th key) narrows it to a window of a few groups, then
+  // the window by full compare. Writes go to an overlay as runs mode's do: slate_, new keys sorted (a key that
+  // is in the arena and live is never there: a re-point writes sval_ in place); sgone_, erased arena positions,
+  // sorted. Both fold into the arena in one merge (sfold) once they have grown. An id past 32 bits, or a walk
+  // with begin(), turns the map back into slots (sorted_to_slots), to be sorted again at a checkpoint.
+  // AIOS_SQL_PK_SORTED=0 leaves every map as slots.
+  struct SlateEntry { std::string key; uint32_t val; };
+  bool sorted_ = false;
+  std::vector<char> skeys_;
+  std::vector<uint32_t> soff_, sval_;
+  std::vector<uint64_t> sidx_;
+  std::vector<uint32_t> sgone_;
+  std::vector<SlateEntry> slate_;
+  static constexpr uint32_t kSidxGroup = 64;
+  static constexpr uint64_t kSlateBit = 1ull << 63;   // an iterator's run_hit.key: kSlateBit | overlay index, else the arena position
+  static bool sorted_enabled() {
+    static const bool on = [] { const char* e = std::getenv("AIOS_SQL_PK_SORTED"); return !(e && e[0] == '0'); }();
+    return on;
+  }
+  static void put_skey(std::vector<char>& keys, const char* p, size_t n) {
+    size_t len = n;
+    do { keys.push_back((char)((len & 0x7f) | (len > 0x7f ? 0x80 : 0))); len >>= 7; } while (len);
+    keys.insert(keys.end(), p, p + n);
+  }
+  // The key at arena position `pos`: where its bytes start and how long they are.
+  const char* skey_at(size_t pos, size_t* len) const {
+    const char* p = skeys_.data() + soff_[pos];
+    size_t n = 0;
+    int shift = 0;
+    for (;; ++p, shift += 7) {
+      n |= (size_t)((unsigned char)*p & 0x7f) << shift;
+      if (!((unsigned char)*p & 0x80)) { ++p; break; }
+    }
+    *len = n;
+    return p;
+  }
+  // <0, 0, >0 as the key at `pos` compares with `key` (bytes, then length: std::string's order).
+  int skey_cmp(size_t pos, const std::string& key) const {
+    size_t len;
+    const char* p = skey_at(pos, &len);
+    const int c = std::memcmp(p, key.data(), std::min(len, key.size()));
+    return c != 0 ? c : (len < key.size() ? -1 : len > key.size() ? 1 : 0);
+  }
+  static uint64_t key_prefix(const char* p, size_t n) {
+    uint64_t u = 0;
+    for (size_t i = 0; i < 8; ++i) u = (u << 8) | (i < n ? (unsigned char)p[i] : 0);
+    return u;
+  }
+  void build_sidx() {
+    sidx_.clear();
+    sidx_.reserve(soff_.size() / kSidxGroup + 1);
+    for (size_t g = 0; g < soff_.size(); g += kSidxGroup) {
+      size_t len;
+      const char* p = skey_at(g, &len);
+      sidx_.push_back(key_prefix(p, len));
+    }
+    sidx_.shrink_to_fit();
+  }
+  // The arena position of `key`, live or erased, or npos.
+  size_t sorted_pos(const std::string& key) const {
+    if (soff_.empty()) return npos;
+    const uint64_t u = key_prefix(key.data(), key.size());
+    // Groups whose first key's prefix is below u may hold the key (it sorts after their first key); groups whose
+    // first key's prefix is above u cannot: the window is from the last group starting at or below u (or the one
+    // before the first starting above it) to the first group starting above u.
+    const size_t g_hi = (size_t)(std::upper_bound(sidx_.begin(), sidx_.end(), u) - sidx_.begin());
+    const size_t g_lo = (size_t)(std::lower_bound(sidx_.begin(), sidx_.end(), u) - sidx_.begin());
+    size_t lo = (g_lo > 0 ? g_lo - 1 : 0) * kSidxGroup;
+    size_t hi = std::min(soff_.size(), g_hi * kSidxGroup);
+    while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      const int c = skey_cmp(mid, key);
+      if (c == 0) return mid;
+      if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return npos;
+  }
+  size_t slate_pos(const std::string& key) const {
+    auto at = std::lower_bound(slate_.begin(), slate_.end(), key, [](const SlateEntry& e, const std::string& k) { return e.key < k; });
+    return (at != slate_.end() && at->key == key) ? (size_t)(at - slate_.begin()) : npos;
+  }
+  bool sgone_has(uint32_t pos) const { return !sgone_.empty() && std::binary_search(sgone_.begin(), sgone_.end(), pos); }
+  iterator sorted_find(const std::string& key) {
+    const size_t s = slate_pos(key);
+    if (s != npos) return run_iter(kSlateBit | (uint64_t)s, slate_[s].val);
+    const size_t p = sorted_pos(key);
+    if (p == npos || sgone_has((uint32_t)p)) return end();
+    return run_iter((uint64_t)p, sval_[p]);
+  }
+  // The id of a live key, to write in place, or nullptr.
+  uint32_t* sorted_ref(const std::string& key) {
+    const size_t s = slate_pos(key);
+    if (s != npos) return &slate_[s].val;
+    const size_t p = sorted_pos(key);
+    if (p == npos || sgone_has((uint32_t)p)) return nullptr;
+    return &sval_[p];
+  }
+  // A hit of sorted_find out of the map: the overlay entry (the hit is its index, good until the next change,
+  // and erase follows find at once), or the arena position marked erased.
+  void sorted_erase_hit(uint64_t hit) {
+    --count_;
+    if (hit & kSlateBit) {
+      const size_t s = (size_t)(hit & ~kSlateBit);
+      if (s < slate_.size()) slate_.erase(slate_.begin() + (long)s);
+      return;
+    }
+    sgone_.insert(std::lower_bound(sgone_.begin(), sgone_.end(), (uint32_t)hit), (uint32_t)hit);
+  }
+  void maybe_sfold() {
+    if (slate_.size() + sgone_.size() > 4096 + count_ / 64) sfold();
+  }
+  // The overlay and the erasures into the arena: one merge, in key order.
+  void sfold() {
+    if (!sorted_ || (slate_.empty() && sgone_.empty())) return;
+    std::vector<char> keys;
+    keys.reserve(skeys_.size() + slate_.size() * 24);
+    std::vector<uint32_t> off, val;
+    off.reserve(count_);
+    val.reserve(count_);
+    size_t g = 0, li = 0;
+    bool overflow = false;
+    auto take = [&](const char* p, size_t n, uint32_t v) {
+      if (keys.size() + n + 5 > UINT32_MAX) { overflow = true; return; }
+      off.push_back((uint32_t)keys.size());
+      put_skey(keys, p, n);
+      val.push_back(v);
+    };
+    for (size_t p = 0; p < soff_.size() && !overflow; ++p) {
+      if (g < sgone_.size() && sgone_[g] == p) { ++g; continue; }
+      size_t len;
+      const char* kp = skey_at(p, &len);
+      // the overlay's keys before this one
+      while (li < slate_.size() && !overflow) {
+        const std::string& lk = slate_[li].key;
+        const int c = std::memcmp(kp, lk.data(), std::min(len, lk.size()));
+        const bool arena_first = c < 0 || (c == 0 && len < lk.size());
+        if (arena_first) break;
+        take(lk.data(), lk.size(), slate_[li].val);
+        ++li;
+      }
+      take(kp, len, sval_[p]);
+    }
+    for (; li < slate_.size() && !overflow; ++li) take(slate_[li].key.data(), slate_[li].key.size(), slate_[li].val);
+    if (overflow) { sorted_to_slots(); return; }
+    keys.shrink_to_fit();
+    skeys_.swap(keys);
+    soff_.swap(off);
+    sval_.swap(val);
+    std::vector<uint32_t>().swap(sgone_);
+    std::vector<SlateEntry>().swap(slate_);
+    build_sidx();
+    count_ = used_ = sval_.size();
+  }
+  // The sorted arena back into slots (text), for good until a checkpoint sorts it again.
+  void sorted_to_slots() {
+    if (!sorted_) return;
+    sorted_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+    std::vector<char> keys;
+    keys.swap(skeys_);
+    std::vector<uint32_t> off, val, gone;
+    off.swap(soff_);
+    val.swap(sval_);
+    gone.swap(sgone_);
+    std::vector<SlateEntry> late;
+    late.swap(slate_);
+    std::vector<uint64_t>().swap(sidx_);
+    sorted_ = false;
+    text_ = true;
+    count_ = used_ = 0;
+    slots_.clear();
+    rehash(val.size() + late.size());
+    size_t g = 0;
+    std::string k;
+    for (size_t p = 0; p < off.size(); ++p) {
+      if (g < gone.size() && gone[g] == p) { ++g; continue; }
+      const char* q = keys.data() + off[p];
+      size_t n = 0;
+      int shift = 0;
+      for (;; ++q, shift += 7) {
+        n |= (size_t)((unsigned char)*q & 0x7f) << shift;
+        if (!((unsigned char)*q & 0x80)) { ++q; break; }
+      }
+      k.assign(q, n);
+      emplace(k, val[p]);
+    }
+    for (const SlateEntry& e : late) emplace(e.key, e.val);
   }
 };
 
