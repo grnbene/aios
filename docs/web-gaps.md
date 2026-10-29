@@ -45,7 +45,9 @@ page for each item below.
    since 2026-10-28: the pane marks the pressed element with `data-aios-active` on press and clears it on release,
    as `:hover` is done; `scripts/drive-active.sh` holds a button down and reads the fragments. `:focus`,
    `:focus-visible` and `:focus-within` match the field that has the keyboard since 2026-10-29, reconciled once a
-   frame from the pane's own focus; `scripts/drive-focus.sh`.) `:target`, `:visited` and the rest still never match.
+   frame from the pane's own focus; `scripts/drive-focus.sh`. A same-page anchor link, or a URL with a fragment,
+   scrolls to the element and `:target` matches it since 2026-10-29 - before, following `#section` did nothing;
+   `scripts/drive-target.sh`.) `:visited` and the rest still never match.
 7. **Missing images** show their alt text in a box; Chrome shows a broken-image icon beside the alt text.
 8. **A page that sets no background** is drawn on the engine's dark ground (the machine's own look), where Chrome uses
    white. A deliberate difference, not a gap.
