@@ -192,6 +192,27 @@ int main() {
   BinlogConsumer consumer(kernel, db, bcfg);
   std::cout << "  [PASS] Consumer configured with table whitelist: [orders, users]\n\n";
 
+  // A refused position ("impossible position"): where to resume. atl 2026-10-28: a crash left mariadb-bin.000026
+  // at 1008388891 bytes with the saved position 1008404944; the consumer retried it every second for twelve hours.
+  {
+    using L = std::vector<std::pair<std::string, uint64_t>>;
+    const L logs = {{"mariadb-bin.000025", 1073742008}, {"mariadb-bin.000026", 1008388891}, {"mariadb-bin.000027", 1073742603}, {"mariadb-bin.000028", 786773918}};
+    std::string f, why; uint64_t p = 0;
+    assert(BinlogConsumer::resume_after_impossible_position(logs, "mariadb-bin.000026", 1008404944, &f, &p, &why));
+    assert(f == "mariadb-bin.000027" && p == 4);
+    assert(why.find("16053 bytes") != std::string::npos);
+    // the position is within the file: not this failure, nothing to resume
+    assert(!BinlogConsumer::resume_after_impossible_position(logs, "mariadb-bin.000027", 500, &f, &p, &why));
+    // the current (last) log, shorter than asked: nothing after it yet
+    assert(!BinlogConsumer::resume_after_impossible_position(logs, "mariadb-bin.000028", 900000000, &f, &p, &why));
+    // the file is gone (purged): the first log after it
+    assert(BinlogConsumer::resume_after_impossible_position(logs, "mariadb-bin.000020", 4, &f, &p, &why));
+    assert(f == "mariadb-bin.000025" && p == 4);
+    // nothing listed after a gone file
+    assert(!BinlogConsumer::resume_after_impossible_position(logs, "mariadb-bin.000099", 4, &f, &p, &why));
+    std::cout << "  [PASS] a refused position resumes from the next log (and only when one exists)\n\n";
+  }
+
   // 3. Test Ingress Filtering & Zero RAM Overhead for Unwhitelisted Tables
   std::cout << "[Step 3] Testing Ingress Filtering (0 RAM spent on non-whitelisted tables)...\n";
   // Table ID 100 = unwhitelisted "audit_huge_blobs"

@@ -334,7 +334,20 @@ class BinlogConsumer {
   Result<void> send_checksum_config();
   Result<void> send_binlog_dump();
   Result<void> discover_master_pos(std::string* out_file = nullptr);
+  // The master refused the saved position ("impossible position": the file is shorter than it, a crash having
+  // truncated the log, or the file is gone). Decides where to resume from SHOW BINARY LOGS and reconnects there.
+  Result<void> recover_impossible_position(const std::string& err);
   Result<void> introspect_table_columns(BinlogTableMap& map);
+
+ public:
+  // The decision recover_impossible_position makes, on its own for the tests: `logs` is SHOW BINARY LOGS (name,
+  // size) in order; `file`/`pos` the refused position. True with the file and position to resume from - the next
+  // log's head when `file` is listed but shorter than `pos` (its tail was lost: `why` says how many bytes), or the
+  // first log after `file` when `file` is no longer listed - false when nothing after it exists yet.
+  static bool resume_after_impossible_position(const std::vector<std::pair<std::string, uint64_t>>& logs, const std::string& file,
+                                               uint64_t pos, std::string* next_file, uint64_t* next_pos, std::string* why);
+
+ private:
   // Each mirrored table's column charsets, read from the master's
   // information_schema once per table ("db.table" -> latin1 by ordinal) and
   // dropped when DDL arrives. Only successful reads are kept.
