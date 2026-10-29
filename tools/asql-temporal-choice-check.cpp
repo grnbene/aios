@@ -113,6 +113,18 @@ int main() {
   OK(c_ge == (long long)m_ge && c_day == (long long)m_day && c_between == (long long)m_between && c_eq == (long long)m_eq && c_lt_frac == (long long)m_lt_frac,
      ">=, >= a bare date, BETWEEN, =, < a fraction: %lld %lld %lld %lld %lld (model %zu %zu %zu %zu %zu)",
      c_ge, c_day, c_between, c_eq, c_lt_frac, m_ge, m_day, m_between, m_eq, m_lt_frac);
+  // The rows are in time order, so a narrow range skips most segments by their zone maps (the date bounds parsed as
+  // seconds): the pruned-blocks counter moves, and the count is still the model's.
+  auto pruned = [&]() -> long long {
+    auto r = db.execute_local_query("SHOW GLOBAL STATUS LIKE 'Asql_zone_map_pruned'");
+    return r.success && !r.rows.empty() && r.rows[0].values.size() > 1 ? std::stoll(r.rows[0].values[1]) : -1;
+  };
+  const long long p0 = pruned();
+  const long long c_narrow = count("date_created BETWEEN '" + model[N / 2] + "' AND '" + model[N / 2 + 100] + "'");
+  const long long p1 = pruned();
+  size_t m_narrow = 0;
+  for (size_t i = 0; i < N; ++i) if (model[i] >= model[N / 2] && model[i] <= model[N / 2 + 100]) ++m_narrow;
+  OK(c_narrow == (long long)m_narrow && p1 > p0, "a narrow range: %lld rows (model %zu), %lld segments skipped by their date bounds", c_narrow, m_narrow, p1 - p0);
   db.execute_local_query("DROP TABLE o");
   std::printf("%s\n", failures ? "FAILED" : "PASSED");
   return failures ? 1 : 0;
