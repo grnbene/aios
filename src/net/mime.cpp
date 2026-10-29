@@ -401,6 +401,19 @@ std::string decode_words(std::string_view value) {
   size_t i = 0;
   bool last_was_word = false;
   std::string pending_ws;   // whitespace seen since the last encoded word
+  // Adjacent encoded words of one charset are one byte stream (RFC 2047 §6.2 lets a sender cut a
+  // multi-byte character between two words, and Java mailers do); their bytes are collected and
+  // converted together, so a UTF-8 sequence split across words comes out as the character, not
+  // as two replacement marks.
+  std::string run;
+  std::string run_cs;
+  bool have_run = false;
+  auto flush_run = [&] {
+    if (!have_run) return;
+    out += to_utf8(run, run_cs);
+    run.clear();
+    have_run = false;
+  };
   while (i < value.size()) {
     if (value[i] == '=' && i + 1 < value.size() && value[i + 1] == '?') {
       // =?charset?enc?text?=
@@ -420,7 +433,9 @@ std::string decode_words(std::string_view value) {
         if (ok) {
           if (!last_was_word) out += pending_ws;   // whitespace between two encoded words is dropped
           pending_ws.clear();
-          out += to_utf8(raw, cs);
+          const std::string ncs = normalize_charset(cs);
+          if (!have_run || ncs != run_cs) { flush_run(); run_cs = ncs; have_run = true; }
+          run += raw;
           last_was_word = true;
           i = end + 2;
           continue;
@@ -433,12 +448,14 @@ std::string decode_words(std::string_view value) {
       ++i;
       continue;
     }
+    flush_run();
     out += pending_ws;
     pending_ws.clear();
     out += c;
     last_was_word = false;
     ++i;
   }
+  flush_run();
   out += pending_ws;
   // collapse whitespace runs, trim
   std::string collapsed;
