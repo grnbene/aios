@@ -173,6 +173,24 @@ int main() {
     check(deadline_kills == "2" && hangup_kills == "1", "SHOW STATUS counts them: Asql_read_deadline_kills " + deadline_kills + " (two reads above), Asql_hangup_kills " + hangup_kills + " (one)");
   }
 
+  // 4. SHOW GLOBAL STATUS while the statement lock is held by someone else (here: taken outright for 3 s, as a
+  // long read with a writer waiting holds it): it answers from its counters and the last footprint snapshot.
+  {
+    Client monitor, reader;
+    std::thread holder([&db] { db.rw_lock().lock(); std::this_thread::sleep_for(3s); db.rw_lock().unlock(); });
+    std::this_thread::sleep_for(200ms);
+    auto pr = std::make_shared<std::promise<double>>();
+    auto read_took = pr->get_future();
+    std::thread([&reader, pr] { const auto t0 = std::chrono::steady_clock::now(); reader.run("SELECT COUNT(*) FROM stall"); pr->set_value(ms_since(t0)); }).detach();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::vector<std::string>> rows;
+    const std::string r = monitor.run("SHOW GLOBAL STATUS LIKE 'Asql_total_tables'", &rows);
+    const double took = ms_since(t0);
+    check(r == "ok" && took < 500 && !rows.empty() && rows[0][1] != "0", "SHOW GLOBAL STATUS answered in " + std::to_string((int)took) + " ms with the statement lock held (" + (rows.empty() ? "?" : rows[0][0] + "=" + rows[0][1]) + ")");
+    holder.join();
+    check(read_took.get() > 2000, "while a read beside it waited for the lock");
+  }
+
   server.stop_background();
   server.stop();
   db.execute_local_query("DROP TABLE stall");

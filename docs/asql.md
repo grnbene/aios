@@ -2053,8 +2053,10 @@ stays open), and its redo record is never written.
   same way within about 100 ms (a read stops at its next check, a write runs
   to its end). `SHOW PROCESSLIST` and `SELECT <number>` take no statement
   lock, so an operator can see what to kill, and a health check answers,
-  while a writer waits behind a long read. `SHOW STATUS` counts both:
-  `Asql_read_deadline_kills`, `Asql_hangup_kills`.
+  while a writer waits behind a long read; `SHOW [GLOBAL] STATUS` takes it
+  only when it is free, and otherwise answers from its counters and the last
+  memory snapshot (`Asql_memory_bytes_age_ms` says how old it is). It counts both
+  protections: `Asql_read_deadline_kills`, `Asql_hangup_kills`.
 
 ## What SQL works, and its gaps
 
