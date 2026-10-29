@@ -212,6 +212,7 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | Function | Signature | Description |
 |---|---|---|
 | `map` | `map(list, fn)` | Transforms each element: `[fn(x) for x in list]`. |
+| `flat_map` | `flat_map(list, fn)` | `map` with the results joined into one list: a list result contributes its items, `nil` nothing, any other value itself (one level, as JavaScript's `flatMap`). `flat_map(orders, fn (o) { return o.lines })`. Allowed in Things. |
 | `filter` | `filter(list, fn)` | Keeps elements where `fn(x)` is truthy. |
 | `reduce` | `reduce(list, fn, [init])` | Folds list with accumulator: `fn(acc, item)`. |
 | `each` / `for_each` | `each(list, fn)` | Invokes `fn(item)` on each element for side effects. |

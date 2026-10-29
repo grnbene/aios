@@ -725,7 +725,7 @@ bool gcall(ThingGrain& g, const char* name, const std::vector<grain::Value>& arg
 // What a Thing's program may name: pure functions of their arguments.
 const std::vector<std::string>& grain_allowed() {
   static const std::vector<std::string> names = {
-      "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "sort", "reverse", "map",
+      "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "sort", "reverse", "map", "flat_map",
       "filter", "reduce", "each", "for_each", "any", "all", "find_if", "flatten", "concat", "insert", "remove_at",
       "zip", "enumerate", "take", "drop", "count", "unique", "dedup", "compact", "keys", "values", "has", "del", "merge",
       "entries", "from_entries", "split", "join", "upper", "lower", "find", "replace", "slice", "ord", "chr", "trim",
