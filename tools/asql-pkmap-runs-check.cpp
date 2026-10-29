@@ -121,7 +121,8 @@ int main() {
     // Keys with gaps (MariaDB's ids after old deletes): one run per gap.
     PkMap g;
     for (long long k = 1; k <= 100000; ++k) g.emplace(ik(k * 3), (size_t)k);
-    OK(!g.runs_mode(), "every third key, each its own id: too scattered for runs, slots");
+    OK(g.runs_mode() && g.memory_bytes() <= 100000 * 16 * 3 / 2 && g.find(ik(300))->second == 100 && g.find(ik(301)) == g.end(),
+       "every third key, each its own id: a run a key, still runs (%zu bytes for 100k keys; slots ~2.4 MB)", g.memory_bytes());
   }
 
   // ---- two-integer keys (an order's lines): packed, and runs when they arrive in order ----
@@ -164,10 +165,11 @@ int main() {
     OK(!a.runs_mode() && a.find(ik(10))->second == 10 && a.find("abc\x1f")->second == 5000, "a text key: slots, everything still found");
     PkMap b; for (int k = 0; k < 1000; ++k) b.emplace(ik(k), (size_t)k);
     b.emplace(ik(-5), 7000);
-    OK(!b.runs_mode() && b.find(ik(-5))->second == 7000 && b.find(ik(999))->second == 999, "a key before the last: slots");
+    OK(b.runs_mode() && b.find(ik(-5))->second == 7000 && b.find(ik(999))->second == 999, "a key before the last: kept aside, still runs");
     PkMap c; for (int k = 0; k < 1000; ++k) c.emplace(ik(k), (size_t)k);
     c[ik(5)] = 99;
-    OK(!c.runs_mode() && c.find(ik(5))->second == 99, "a write through operator[]: slots, the write kept");
+    OK(c.runs_mode() && c.find(ik(5))->second == 99 && c.find(ik(4))->second == 4 && c.find(ik(6))->second == 6 && c.size() == 1000,
+       "a write through operator[]: the write kept, its neighbours unmoved, still runs");
     PkMap d; for (int k = 0; k < 1000; ++k) d.emplace(ik(k), (size_t)k);
     size_t walked = 0;
     for (auto e = d.begin(); e != d.end(); ++e) ++walked;
@@ -175,6 +177,48 @@ int main() {
     PkMap e; for (int k = 0; k < 1000; ++k) e.emplace(ik(k), (size_t)k);
     auto again = e.emplace(ik(500), 1);
     OK(e.runs_mode() && !again.second && again.first->second == 500, "emplacing a key already there: unchanged, still runs");
+  }
+
+  // ---- a day of replication: lines added to old orders, keys deleted, keys re-pointed - the map stays runs ----
+  // (atl's maps had all turned into slots this way: 340 MB for 8.8M keys that cost ~2 MB as runs.)
+  {
+    auto pk2 = [](long long a, long long b) { return std::to_string(a) + '\x1f' + std::to_string(b) + '\x1f'; };
+    PkMap m;
+    std::map<std::string, uint32_t> ref;
+    uint32_t row = 0;
+    for (long long order = 1; order <= 200000; ++order)
+      for (long long line = 1; line <= 1 + order % 3; ++line) { m.emplace(pk2(order, line), row); ref[pk2(order, line)] = row; ++row; }
+    const size_t loaded = m.memory_bytes();
+    std::mt19937_64 rng(99);
+    // 50k lines added to orders already there: every one of them a key before the last.
+    for (int i = 0; i < 50000; ++i) {
+      const long long order = 1 + (long long)(rng() % 200000);
+      const long long line = 10 + (long long)(rng() % 5);
+      if (m.emplace(pk2(order, line), row).second) { ref[pk2(order, line)] = row; ++row; }
+    }
+    OK(m.runs_mode() && m.size() == ref.size(), "50k lines added to old orders: still runs, %zu keys", m.size());
+    // 30% of the keys deleted (more than the quarter that used to turn the map into slots).
+    size_t deleted = 0;
+    for (auto it = ref.begin(); it != ref.end();) {
+      if (rng() % 10 < 3) { m.erase(it->first); it = ref.erase(it); ++deleted; } else ++it;
+    }
+    OK(m.runs_mode() && m.size() == ref.size(), "%zu keys deleted: still runs", deleted);
+    // Keys re-pointed at other rows (an UPDATE that moves a row).
+    for (int i = 0; i < 20000; ++i) {
+      auto it = ref.begin();
+      std::advance(it, (long)(rng() % ref.size()));
+      m[it->first] = it->second + 1000000u;
+      it->second += 1000000u;
+    }
+    OK(m.runs_mode(), "20k keys re-pointed through operator[]: still runs");
+    size_t bad = 0;
+    for (const auto& e : ref) { auto it = m.find(e.first); if (it == m.end() || it->second != e.second) ++bad; }
+    size_t ghosts = 0;
+    for (long long order = 1; order <= 2000; ++order) for (long long line = 1; line <= 14; ++line)
+      if (!ref.count(pk2(order, line)) && m.find(pk2(order, line)) != m.end()) ++ghosts;
+    OK(bad == 0 && ghosts == 0, "every key answers the model's row (%zu checked), no deleted key answers", ref.size());
+    OK(m.memory_bytes() < ref.size() * 16,
+       "and %zu bytes for %zu keys (%.1f a key; loaded %.1f; slots ~24, and 53 before this)", m.memory_bytes(), ref.size(), (double)m.memory_bytes() / ref.size(), (double)loaded / (row - 50000));
   }
 
   std::printf(failures ? "pkmap runs check: %d failure(s)\n" : "pkmap runs check: all passed\n", failures);

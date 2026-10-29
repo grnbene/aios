@@ -38,12 +38,14 @@ uint64_t status(SqlDatabase& db, const char* name) {
   const size_t bar = r.formatted_table.find('|', p);
   return bar == std::string::npos ? UINT64_MAX : std::strtoull(r.formatted_table.c_str() + bar + 1, nullptr, 10);
 }
-bool fill(SqlDatabase& db, const std::string& table, size_t rows) {
+// `step` 2: ids with a gap between them, so the key map is a run a key (16 B each, ~1.6 MB a table). Consecutive
+// ids are one run - 16 B for the whole table - and three such tables could never be over any budget.
+bool fill(SqlDatabase& db, const std::string& table, size_t rows, size_t step = 1) {
   if (!run(db, "CREATE TABLE " + table + " (id INT NOT NULL PRIMARY KEY, v VARCHAR(24))")) return false;
   for (size_t from = 0; from < rows; from += 2000) {
     std::string sql = "INSERT INTO " + table + " VALUES ";
     for (size_t i = from; i < from + 2000 && i < rows; ++i)
-      sql += (i == from ? "(" : ",(") + std::to_string(i) + ",'row" + std::to_string(i) + "')";
+      sql += (i == from ? "(" : ",(") + std::to_string(i * step) + ",'row" + std::to_string(i) + "')";
     if (!run(db, sql)) return false;
   }
   return true;
@@ -66,12 +68,12 @@ int main() {
 
   const size_t kRows = 100000;
   for (const char* t : {"t1", "t2", "t3"})
-    if (!fill(db, t, kRows)) return 1;
+    if (!fill(db, t, kRows, 2)) return 1;
 
   auto order = [&](size_t n) {
     bool ok = true;
     for (const char* t : {"t1", "t2", "t3"})
-      ok &= run(db, std::string("INSERT INTO ") + t + " VALUES (" + std::to_string(kRows + n) + ",'new')");
+      ok &= run(db, std::string("INSERT INTO ") + t + " VALUES (" + std::to_string(2 * kRows + n) + ",'new')");   // past the even ids
     return ok;
   };
 
@@ -90,7 +92,7 @@ int main() {
   check(evicted == 0, "no index in use by the stream is evicted");
 
   // Correctness: the index the stream kept still answers for the key.
-  SqlQueryResult dup = db.execute_local_query("INSERT INTO t2 VALUES (7,'again')");
+  SqlQueryResult dup = db.execute_local_query("INSERT INTO t2 VALUES (8,'again')");   // (ids are even: 8 is one of them)
   check(!dup.success && dup.error_message.find("uplicate") != std::string::npos, "a duplicate primary key is still refused");
 
   // What a replicated order does to a big table that stays hot: rows deleted by key and put back, rows updated.
@@ -141,8 +143,8 @@ int main() {
   // The budget still holds: after the hot window, a new table's index makes room by dropping the cold ones.
   std::this_thread::sleep_for(std::chrono::milliseconds(2200));
   const uint64_t evict_mid = status(db, "Asql_row_index_evictions");
-  if (!fill(db, "t4", kRows)) return 1;
-  if (!run(db, "INSERT INTO t4 VALUES (" + std::to_string(kRows + 1) + ",'new')")) return 1;
+  if (!fill(db, "t4", kRows, 2)) return 1;
+  if (!run(db, "INSERT INTO t4 VALUES (" + std::to_string(2 * kRows + 1) + ",'new')")) return 1;
   const uint64_t evicted_cold = status(db, "Asql_row_index_evictions") - evict_mid;
   std::printf("cold tables: %llu evictions\n", (unsigned long long)evicted_cold);
   check(evicted_cold >= 1, "an index nobody touched for longer than the hot window is evicted to make room");
