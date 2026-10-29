@@ -52754,6 +52754,7 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
     idx->pk_columns = pk_cols;
     idx->ai_column = ai_idx;
     idx->pk_to_row.reserve(t.row_count());
+    idx->pk_to_row.trace_name(idx->table.c_str());
     table_row_indices_[tkey] = idx;
     it = table_row_indices_.find(tkey);
   }
@@ -52769,6 +52770,7 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
     row_index_.pk_columns = pk_cols;
     row_index_.ai_column = ai_idx;
     row_index_.pk_to_row.reserve(t.row_count());
+    row_index_.pk_to_row.trace_name(row_index_.table.c_str());
   }
   // Index whatever arrived since last time — usually nothing, which is what
   // makes a bulk import linear. Only the key and auto-increment columns are
