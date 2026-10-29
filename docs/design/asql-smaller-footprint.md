@@ -274,6 +274,10 @@ do on the local replica, then atl).
 
 ## Deploying to atl
 
+Checked end to end at 03:00: the warehouse app deployed to a local grain host against this engine on a fresh
+store (`touch_hour` rebuilt, 10,912 hours, 9.6 s), and its report for October 1-27 gave the known figures (292
+cleared orders / 1,043 units, receiving 14,165, picking 1,807 lines).
+
 The table files become AQT8 at the first checkpoint, which the old binary refuses. So, in this order:
 
 1. `scripts/asql-export.sh` on atl (or `cp -a` of `/opt/aios/root-v8/sql_db` with the service stopped) kept beside
