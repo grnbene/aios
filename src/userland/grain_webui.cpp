@@ -227,6 +227,10 @@ const char* kCanvasScript = R"JS(
 }  // namespace
 
 struct WebUi::Session {
+  // The program's ui.pane is registered process-wide and holds its closures: left there, it keeps this session's
+  // whole VM alive after the session is reaped, evicted or its app stopped (~4 MB a session for the dock board).
+  ~Session() { if (vm) drop_panes(*vm); }
+
   std::mutex mu;                 // one event, timer or render at a time; the VM is not thread safe
   std::unique_ptr<Vm> vm;
   std::shared_ptr<void> keep;    // what the host's setup made (its files)
@@ -234,6 +238,7 @@ struct WebUi::Session {
   std::string version;           // the program's version this session runs
   uint64_t pane = 0;
   WebPaneInfo info;
+  bool workers = false;          // the pane runs each route in a VM of its own, outside `mu` (its "workers" option)
   // Touched by requests under `mu` and read by the reaper under the server's lock: atomic, so neither waits on the other.
   std::atomic<Clock::time_point> last{Clock::now()};
   Clock::time_point last_look = Clock::now();
@@ -268,7 +273,7 @@ WebUi::~WebUi() {
   if (watcher_.joinable()) watcher_.join();   // waits for a watch call in progress (its own TIMEOUT)
 }
 
-size_t WebUi::sessions() const { std::lock_guard<std::mutex> lock(mu_); return sessions_.size() + (shared_ ? 1 : 0); }
+size_t WebUi::sessions() const { std::lock_guard<std::mutex> lock(mu_); return sessions_.size() + (shared_ ? 1 : 0) + (routes_ ? 1 : 0); }
 
 void WebUi::report(const std::string& msg) const {
   if (log) log(msg);
@@ -458,6 +463,7 @@ std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
     return s;
   }
   s->pane = s->info.id;
+  s->workers = web_pane_workers(*s->vm, s->pane);
   s->vm->steps = 0;
   std::string tree, err;
   uint64_t v = 0;
@@ -466,7 +472,7 @@ std::shared_ptr<WebUi::Session> WebUi::make_session(std::string& error) {
   return s;
 }
 
-std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::string& new_id, std::string& error) {
+std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::string& new_id, std::string& error, bool route) {
   std::string version;
   if (!host_.current_version(version, error)) return nullptr;
   const std::string id = cookie_value(req.cookie, host_.cookie_name);
@@ -480,6 +486,8 @@ std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::stri
       return it->second;
     }
     if (it != sessions_.end()) sessions_.erase(it);
+    if (route && routes_ && routes_->version == version) { routes_->last = Clock::now(); return routes_; }
+    if (route) routes_.reset();     // the program changed: the routes' copy starts over
   }
   auto s = make_session(error);   // outside the lock: it runs the program
   if (!s) return nullptr;
@@ -489,6 +497,12 @@ std::shared_ptr<WebUi::Session> WebUi::session_for(const Request& req, std::stri
     start_ticker();
     start_watcher();
     return shared_;
+  }
+  // Only a pane whose routes run in workers: one whose routes hold the session's lock (a stream for minutes) would
+  // make every caller without a session wait on the others. Those keep a session each, dropped as any other.
+  if (route && s->workers) {
+    if (!routes_ || routes_->version != version) routes_ = s;   // two at once: the first to finish is kept
+    return routes_;
   }
   reap_locked();
   new_id = random_hex(16);
@@ -625,7 +639,9 @@ WebUi::Response WebUi::handle(const Request& req, StreamHeaderCallback on_header
   }
 
   std::string new_id, error;
-  std::shared_ptr<Session> s = session_for(req, new_id, error);
+  // A route (not the page, not one of its events) asked with no session of its own shares the routes' copy.
+  const bool route = req.path != "/" && req.path != "/_ui/event" && !(req.method == "POST" && req.xhr);
+  std::shared_ptr<Session> s = session_for(req, new_id, error, route);
   if (!s) return fail(500, error);
   std::string cookie_header;
   if (!new_id.empty()) cookie_header = host_.cookie_name + "=" + new_id + "; Path=/; HttpOnly; SameSite=Strict" + (req.https ? "; Secure" : "");

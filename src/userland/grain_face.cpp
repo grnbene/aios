@@ -1673,6 +1673,11 @@ bool web_pane_api_only(Vm& vm, uint64_t id) {
   return f && f->api_only();
 }
 
+bool web_pane_workers(Vm& vm, uint64_t id) {
+  FacePane* f = web_face(vm, id);
+  return f && f->workers();
+}
+
 std::string web_pane_machine(Vm& vm, uint64_t id) {
   FacePane* f = web_face(vm, id);
   return f ? f->machine() : std::string();

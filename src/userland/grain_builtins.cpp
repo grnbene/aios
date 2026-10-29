@@ -7710,6 +7710,11 @@ void drop_panes(const Vm& vm) {
                       g_grain_panes.end());
 }
 
+size_t pane_count() {
+  std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
+  return g_grain_panes.size();
+}
+
 static bool remove_pane(const std::shared_ptr<GrainPane>& pane) {
   std::lock_guard<aios::hal::Mutex> lk(g_grain_panes_mu);
   const auto before = g_grain_panes.size();
