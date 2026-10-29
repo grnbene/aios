@@ -1982,6 +1982,8 @@ struct TlsServer::Impl {
                                        int timeout_ms);
 };
 
+const hal::Connection* TlsServer::transport() const { return impl_ ? impl_->conn.get() : nullptr; }
+
 namespace {
 Result<HandshakeFailure> fail(uint8_t alert, std::string why) { return HandshakeFailure{alert, std::move(why)}; }
 Result<HandshakeFailure> done() { return HandshakeFailure{0, {}}; }
