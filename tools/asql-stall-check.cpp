@@ -164,6 +164,13 @@ int main() {
     const double took2 = ms_since(t1);
     check(r2.find("interrupted") != std::string::npos && took2 < 2500, "a correlated-subquery read over the deadline ended after " + std::to_string((int)took2) + " ms: " + r2);
     check(c.run("SELECT 1", &rows) == "ok" && !rows.empty() && rows[0][0] == "1", "SELECT 1 answers (without the statement lock)");
+    // Both protections are counted, so an operator can see them act (SHOW STATUS).
+    std::vector<std::vector<std::string>> st;
+    c.run("SHOW GLOBAL STATUS LIKE 'Asql_read_deadline_kills'", &st);
+    const std::string deadline_kills = st.empty() ? "?" : st[0][1];
+    c.run("SHOW GLOBAL STATUS LIKE 'Asql_hangup_kills'", &st);
+    const std::string hangup_kills = st.empty() ? "?" : st[0][1];
+    check(deadline_kills == "2" && hangup_kills == "1", "SHOW STATUS counts them: Asql_read_deadline_kills " + deadline_kills + " (two reads above), Asql_hangup_kills " + hangup_kills + " (one)");
   }
 
   server.stop_background();

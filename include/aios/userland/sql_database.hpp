@@ -3182,6 +3182,8 @@ class SqlDatabase {
   // session. False: no such session.
   static void set_session_closer(uint64_t id, std::function<void()> closer);
   static bool kill_session(uint64_t id, bool query_only);
+  // The wire's hang-up watcher stopped a statement (SHOW STATUS Asql_hangup_kills).
+  static void note_hangup_kill();
   static std::vector<SessionInfo> active_sessions();
   static void set_current_session_id(uint64_t id);
   static uint64_t current_session_id();

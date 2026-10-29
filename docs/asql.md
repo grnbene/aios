@@ -2046,6 +2046,15 @@ stays open), and its redo record is never written.
   half the engine's speed (78k a second against 151k with the cache off),
   waiting on each other's stores; sharded, 140k cold and 254k once the
   answers are in.
+- A read cannot hold the engine indefinitely. A top-level read past
+  `AIOS_SQL_MAX_READ_MS` (default 600000, ten minutes; `0` for no limit) ends
+  as a `KILL QUERY` does, with "Query execution was interrupted"; a wire
+  client that hangs up while its statement runs has the statement ended the
+  same way within about 100 ms (a read stops at its next check, a write runs
+  to its end). `SHOW PROCESSLIST` and `SELECT <number>` take no statement
+  lock, so an operator can see what to kill, and a health check answers,
+  while a writer waits behind a long read. `SHOW STATUS` counts both:
+  `Asql_read_deadline_kills`, `Asql_hangup_kills`.
 
 ## What SQL works, and its gaps
 
