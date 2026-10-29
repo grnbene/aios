@@ -1,0 +1,9 @@
+# page active.html  viewport=420
+# title A pressed button
+# content 420x137  background=ffffffff  links=0
+text      20    32   378    19  #ff1a1a1a  14px              "Press and hold the button: it darkens while the button"
+text      20    51   287    19  #ff1a1a1a  14px              "is down, and goes back when it is let go."
+rect      20    82    52    35  #ff0f6ab0  r=3
+text      39    90    14    19  #ffffffff  14px              "Go"
+# glyph-gaps (none)
+

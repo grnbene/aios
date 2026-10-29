@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><title>A pressed button</title>
+<style>
+body { margin: 20px; font: 14px sans-serif; background: #ffffff; }
+#go { padding: 8px 14px; background: #0f6ab0; color: #ffffff; border: 0; }
+#go:hover { background: #1b7fcc; }
+#go:active { background: #083d66; }   /* after :hover, as the LVHA order has it: both match while pressed */
+</style></head>
+<body>
+<p>Press and hold the button: it darkens while the button is down, and goes back when it is let go.</p>
+<button id="go">Go</button>
+</body></html>

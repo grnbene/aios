@@ -41,8 +41,9 @@ page for each item below.
    - Transitions and `@keyframes` animations are not implemented at all, for transforms or anything else.
 5. **SVG** does not draw clip paths, masks, patterns, filters, markers, `<text>`, a radial gradient's focal point, or
    the `reflect` / `repeat` spread methods.
-6. **States.** `:active` never matches, so a pressed button has no pressed look. `:hover` applies on the frame after
-   the pointer moves.
+6. **States.** `:hover` applies on the frame after the pointer moves. (`:active` matches while the button is down
+   since 2026-10-28: the pane marks the pressed element with `data-aios-active` on press and clears it on release,
+   as `:hover` is done; `scripts/drive-active.sh` holds a button down and reads the fragments.)
 7. **Missing images** show their alt text in a box; Chrome shows a broken-image icon beside the alt text.
 8. **A page that sets no background** is drawn on the engine's dark ground (the machine's own look), where Chrome uses
    white. A deliberate difference, not a gap.

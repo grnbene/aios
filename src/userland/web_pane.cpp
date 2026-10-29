@@ -23,6 +23,7 @@
 #include "aios/userland/git.hpp"
 
 extern bool g_css_has_hover;   // web_css.cpp
+extern bool g_css_has_active;  // web_css.cpp: a :active rule exists, so a press marks the pressed element
 namespace aios::userland {
 namespace {
 
@@ -407,15 +408,20 @@ static const void* s_hover_dom = nullptr;
 static uint64_t s_hover_gen = 0, s_hover_ms = 0;
 static bool s_hover_dirty = false;
 static const void* s_hover_off_dom = nullptr;   // a page whose re-cascade is too slow to do per pointer move
-static void set_hover_chain(web::Node* n, bool on) {
+static void set_mark_chain(web::Node* n, const char* attr, bool on) {
   for (; n; n = n->parent) {
     if (n->kind != web::Node::Kind::Element) continue;
     auto& a = n->attrs;
     for (size_t i = 0; i < a.size(); ++i)
-      if (a[i].name == "data-aios-hover") { a.erase(a.begin() + (long)i); break; }
-    if (on) a.push_back({"data-aios-hover", "1"});
+      if (a[i].name == attr) { a.erase(a.begin() + (long)i); break; }
+    if (on) a.push_back({attr, "1"});
   }
 }
+static void set_hover_chain(web::Node* n, bool on) { set_mark_chain(n, "data-aios-hover", on); }
+// `:active`: the pressed element (and its ancestors) carry data-aios-active from the button going down until it
+// comes up, the way the hover chain carries data-aios-hover; `:active` never matched before.
+static web::Node* s_active_node = nullptr;
+static const void* s_active_dom = nullptr;
 // Layout of a big page takes hundreds of milliseconds and rewrites the tree the frame reads, so the frame never does
 // it: it asks here, and a worker job (see dispatch_reflow) lays the page out holding the page lock. The frame meanwhile
 // try-locks and, finding the worker in there, leaves the pixels of the last frame on screen.
@@ -423,6 +429,22 @@ static bool s_reflow_req = false;
 static bool s_reflow_hover = false;               // the request came from :hover, whose cost decides whether to stop doing it
 static std::atomic<bool> s_reflow_inflight{false};
 static uint64_t s_live_cost_ms = 0;               // what the last in-frame layout of a loading page cost
+// The pressed element: marked on the button going down, cleared when it comes up.
+static void set_active(WebPane& pane, web::Node* n) {
+  web::Node* dom = pane.browser ? pane.browser->document().dom.get() : nullptr;
+  if (s_active_dom != dom) { s_active_node = nullptr; s_active_dom = dom; }
+  if (n == s_active_node) return;
+  set_mark_chain(s_active_node, "data-aios-active", false);
+  set_mark_chain(n, "data-aios-active", true);
+  s_active_node = n;
+  s_reflow_req = true;
+}
+static void clear_active() {
+  if (!s_active_node) return;
+  set_mark_chain(s_active_node, "data-aios-active", false);
+  s_active_node = nullptr;
+  s_reflow_req = true;
+}
 // Called in the frame with the guard held.
 static void update_hover(WebPane& pane, int view_w, uint64_t now_ms) {
   if (!s_hover_dirty || !::g_css_has_hover || !pane.working.empty()) return;
@@ -2478,7 +2500,7 @@ void web_pane_motion(WindowSurface& win, int rel_x, int rel_y) {
   }
 }
 
-void web_pane_release() { s_sel_drag = false; }
+void web_pane_release() { s_sel_drag = false; clear_active(); }
 
 void web_pane_wheel(WindowSurface& win, int notches) {
   if (win.web && win.web->face) return;   // a face has no scroll
@@ -2649,6 +2671,7 @@ void web_pane_click(HardwareCompositor& c, WindowSurface& win, Kernel& k, int re
   // every click in the page area -- clicking away from a field ends its turn
   // with the keyboard, which is what a person expects.
   web::Node* clicked = pane.browser->node_at(rel_x, page_y);
+  if (::g_css_has_active) set_active(pane, clicked);
   pane.field = field_ancestor(clicked);
   if (pane.field) pane.message = "typing into <" + pane.field->tag + ">";
   sel_clear();
