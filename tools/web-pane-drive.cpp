@@ -374,6 +374,7 @@ int main(int argc, char** argv) {
       // The boxes after the click (`:focus` on the field it focused), by colour.
       if (w && w->web && w->web->browser) {
         for (const auto& f : w->web->browser->document().fragments) {
+          if (f.kind == userland::web::Fragment::Kind::Text) { std::printf("CLICKED text   %5d %5d %5d %5d  #%08x  \"%s\"\n", f.x, f.y, f.w, f.h, f.color, f.text.c_str()); continue; }
           if (f.kind != userland::web::Fragment::Kind::Rect && f.kind != userland::web::Fragment::Kind::Border) continue;
           std::printf("CLICKED %-6s %5d %5d %5d %5d  #%08x\n", f.kind == userland::web::Fragment::Kind::Rect ? "rect" : "border", f.x, f.y, f.w, f.h, f.color);
         }

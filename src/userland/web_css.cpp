@@ -39,6 +39,7 @@ bool g_css_has_hover = false;   // some stylesheet had a :hover rule (read by we
 bool g_css_has_active = false;  // ... a :active rule: the pane marks the pressed element while the button is down
 bool g_css_has_focus = false;   // ... a :focus / :focus-within rule: the pane marks the field that has the keyboard
 bool g_css_has_target = false;  // ... a :target rule: the pane marks the element the URL's fragment names
+bool g_css_has_visited = false; // ... a :visited rule: the pane marks the links whose address has been visited
 
 namespace aios::userland::web {
 namespace {
@@ -1035,7 +1036,16 @@ SimpleSelector parse_simple(const std::string& text) {
         s.attrs.push_back(std::move(t));
         saw_pseudo = false;
         g_css_has_target = true;
-      } else if (name == "visited" || name == "current" ||
+      } else if (name == "visited") {
+        // Decidable: the pane marks the links whose address this browser has been to with this attribute
+        // (web_pane.cpp update_visited) and re-cascades when the set of visited addresses grows.
+        SimpleSelector::AttrTest t;
+        t.name = "data-aios-visited";
+        t.op = SimpleSelector::AttrTest::Op::Present;
+        s.attrs.push_back(std::move(t));
+        saw_pseudo = false;
+        g_css_has_visited = true;
+      } else if (name == "current" ||
           name == "past" || name == "future" || name == "playing" || name == "paused" ||
           name == "user-invalid" || name == "user-valid") {
         s.never = true;
