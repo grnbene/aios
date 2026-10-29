@@ -262,7 +262,7 @@ const std::vector<CommandDoc>& command_docs() {
   }},
   {"node", "INTELLIGENCE & DISTRIBUTED", "node serve|connect|list|peers|memory|migrate", "Direct links between kernels", {
     {"serve", "node serve <port> <token|@FILE|env:NAME> [bind=127.0.0.1|0.0.0.0]", "accept links"},
-    {"connect", "node connect <host> <port> <token>", "link to another kernel and use its devices"},
+    {"connect", "node connect <host> <port> <token|@FILE|env:NAME>", "link to another kernel and use its devices"},
     {"list", "node list", "links this machine made"},
     {"peers", "node peers", "links made to this machine"},
     {"memory", "node memory [<node-index>]", "which linked node new remote memory goes to"},

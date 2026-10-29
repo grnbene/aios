@@ -1354,7 +1354,15 @@ void cmd_serve(Ctx& c, const Args& a) {
       Operation op;
       op.code = OpCode::Custom;
       op.custom_kernel = fnv1a(std::string(kAppRouteKernel));
-      op.requirement.device_selector = "remote:relay:" + target.short_str();   // the member's link, direct or through the hub
+      // The device of the link reach() gave: "relay:<id>" for a member (direct or through the hub), the address for a
+      // machine linked with `node connect` that is in no fleet. Naming it "remote:relay:<id>" always left such a
+      // machine's routes with "no device answering" though the link was up.
+      std::string link_name;
+      {
+        std::lock_guard<std::mutex> g(reach_mu);
+        link_name = node_at < c.k.nodes().size() ? c.k.nodes()[node_at]->address() : "relay:" + target.short_str();
+      }
+      op.requirement.device_selector = "remote:" + link_name;
       Tensor tin = rb->tin;
       tin.shape = {(uint64_t)in.size()};   // the request's own bytes, not the buffer's room
       op.inputs.push_back(tin);
@@ -5699,7 +5707,8 @@ void cmd_node(Ctx& c, const Args& a) {
     c.o << "serving this kernel on " << (loopback ? "127.0.0.1:" : "0.0.0.0:") << p << " (peers act here as guest entities; link authenticated and encrypted with the token)\n";
   } else if (sub == "connect") {
     if (a.size() < 5) fail(Status::Invalid, "node connect <host> <port> <token>");
-    auto at = need(c.me.connect(c.r.expand(a[2]), (uint16_t)to_u64(c.r.expand(a[3])), c.r.expand(a[4])));
+    // The token as `node serve` takes it: as written, @FILE (its first line) or env:NAME - kept out of `ps`.
+    auto at = need(c.me.connect(c.r.expand(a[2]), (uint16_t)to_u64(c.r.expand(a[3])), fleet_key_arg(c.r.expand(a[4]))));
     c.o << "attached node " << at.address << ": " << at.devices.size() << " device(s)";
     for (auto& d : at.devices) c.o << " [" << d << "]";
     c.o << (at.provides_memory ? ", provides remote memory" : "") << ", transport " << at.transport << "\n";

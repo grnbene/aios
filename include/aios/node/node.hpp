@@ -137,6 +137,7 @@ class RemoteNode {
   // peer; a long job runs on a sibling, and the shared link stays free.
   using Opener = std::function<Result<std::shared_ptr<RemoteNode>>()>;
   void set_opener(Opener o) { opener_ = std::move(o); }
+  const Opener& opener() const { return opener_; }
   bool can_open_sibling() const { return (bool)opener_; }
   // What the peer said it speaks (nodeproto::kFeat*); 0 from an older peer.
   uint32_t features() const { return features_; }

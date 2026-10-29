@@ -1,0 +1,485 @@
+// The wall board: one column per dock door, the truck on it, and every line it is waiting on - who has it claimed,
+// who picked it, whether it is on the truck. Read across a warehouse: big type, one colour per state, and the
+// lines nobody has claimed first in each order so they are what the eye lands on.
+
+// Light and dark, as warehouse_touches does it: the system's until someone picks (the toggle, or ?theme= on the link
+// for a TV with no mouse), then that, kept in the screen's localStorage. The state colours keep their meaning in both;
+// only their text and wash change so a yellow "NO CLAIM" stays readable on white.
+let THEME_LIGHT = "--bg: #f4f6f8; --panel: #ffffff; --line: #dfe3e8; --text: #161c24; --muted: #5c6877; --strong: #090c0f; --track: #e6eaee; " +
+                  "--open: #c4262e; --open-ink: #ffffff; --open-text: #a51d25; --open-soft: rgba(196, 38, 46, .12); " +
+                  "--claimed: #f2c230; --claimed-ink: #1b1600; --picked: #1e6ac7; --picked-ink: #ffffff; --loaded: #1f8a50; --loaded-soft: rgba(31, 138, 80, .12); " +
+                  "--warn: #b26a00; --crit: #c4262e; color-scheme: light;"
+let THEME_DARK = "--bg: #0e1116; --panel: #171c23; --line: #2a313b; --text: #e9edf1; --muted: #8c97a3; --strong: #ffffff; --track: #0b0e12; " +
+                 "--open: #e5484d; --open-ink: #ffffff; --open-text: #ff6b6f; --open-soft: rgba(229, 72, 77, .16); " +
+                 "--claimed: #f2c230; --claimed-ink: #1b1600; --picked: #3d8ef0; --picked-ink: #ffffff; --loaded: #2fa86a; --loaded-soft: rgba(47, 168, 106, .14); " +
+                 "--warn: #f2a93b; --crit: #ff5a5f; color-scheme: dark;"
+
+let BOARD_CSS = join([
+  ":root, [data-theme=\"light\"] { " + THEME_LIGHT + " }",
+  "[data-theme=\"dark\"] { " + THEME_DARK + " }",
+  "* { box-sizing: border-box; }",
+  "body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.3 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Arial, sans-serif; }",
+  ".board { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 14px; padding: 14px; min-height: 100vh; }",
+  ".bay { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; min-width: 0; overflow: hidden; max-height: calc(100vh - 70px); }",
+  ".bay.wide { grid-column: 1 / -1; } .bay.tall { max-height: none; } .bay.tall .orders { overflow: visible; }",
+  ".bay-tools { display: inline-flex; gap: 4px; margin-left: auto; }",
+  ".bay-tools button { font: inherit; font-size: 15px; line-height: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }",
+  ".bay-tools button[aria-pressed=\"true\"] { background: var(--picked); border-color: var(--picked); color: #fff; }",
+  ".bay.free { opacity: .55; }",
+  ".bay-head { padding: 12px 14px; border-bottom: 1px solid var(--line); }",
+  ".bay-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }",
+  ".bay-name { font-size: 30px; font-weight: 800; color: var(--strong); letter-spacing: .5px; }",
+  ".bay-truck { font-size: 20px; color: var(--strong); text-align: right; }",
+  ".bay-sub { color: var(--muted); font-size: 15px; margin-top: 2px; display: flex; justify-content: space-between; gap: 8px; }",
+  ".bay-clocks { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; }",
+  ".bc { display: inline-flex; align-items: baseline; gap: 6px; } .bc .clock { font-size: 22px; }",
+  ".lbl { color: var(--muted); font-size: 13px; font-weight: 500; }",
+  ".clock { font-weight: 800; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }",
+  ".clock.none { color: var(--muted); font-weight: 500; font-size: 14px; }",
+  ".clock.warn { color: var(--warn); } .clock.crit { color: var(--crit); }",
+  ".done-at { color: var(--muted); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }",
+  ".state { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }",
+  ".state .clock { font-size: 15px; } .times { display: inline-flex; align-items: baseline; gap: 5px; }",
+  ".alert .clock { margin-left: 4px; }",
+  ".need { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 15px; font-weight: 600; color: var(--text); }",
+  ".need-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .need .bin { margin-left: 8px; color: var(--muted); font-weight: 500; }",
+  ".need.more { color: var(--muted); font-weight: 500; }",
+  ".bars { margin-top: 10px; display: grid; gap: 6px; }",
+  ".next { margin-top: 10px; padding: 10px 12px; border-radius: 8px; border: 2px solid var(--line); border-left: 8px solid var(--picked); background: var(--bg); }",
+  ".next-top { display: flex; justify-content: space-between; align-items: baseline; }",
+  ".next-count { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--strong); }",
+  // load spots (HOST_JS): plain text on a shared board; inside the loading screen, the old badge's look - tap to load
+  "html[data-host='1'] .loadable { cursor: pointer; border-radius: 6px; user-select: none; }",
+  "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: 2px 8px; }",
+  "html[data-host='1'] .item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
+  "html[data-host='1'] .loadable.busy { opacity: .45; pointer-events: none; }",
+  ".order.active { box-shadow: inset 4px 0 0 var(--claimed); }",
+  "#dock-note { position: fixed; left: 50%; bottom: 56px; transform: translateX(-50%); padding: 10px 18px; border-radius: 8px; font-size: 17px; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
+  "#dock-note.show { opacity: 1; } #dock-note.ok { background: var(--loaded); } #dock-note.err { background: var(--open); }",
+  ".next-item { font-size: 34px; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
+  ".next-desc { font-size: 17px; color: var(--text); margin-top: 2px; }",
+  ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 10px; margin-top: 6px; font-size: 14px; color: var(--muted); }",
+  ".next-meta .bin { color: var(--text); font-weight: 700; margin-right: 6px; }",
+  ".bar { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }",
+  ".track { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; }",
+  ".fill { height: 100%; border-radius: 5px; }",
+  ".fill.picked { background: var(--picked); } .fill.loaded { background: var(--loaded); } .fill.partial { background: var(--claimed); }",
+  ".bar .left { color: var(--muted); font-size: 13px; }",
+  ".bar .num { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }",
+  ".alert { margin-top: 10px; padding: 6px 10px; border-radius: 6px; background: var(--open-soft); color: var(--open-text); font-weight: 700; font-size: 16px; }",
+  ".alert.ok { background: var(--loaded-soft); color: var(--loaded); }",
+  ".orders { overflow-y: auto; flex: 1 1 auto; min-height: 0; padding: 6px 10px 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; align-content: start; }",
+  ".order { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }",
+  ".order-head > * { min-width: 0; } .ln > * { min-width: 0; }",
+  ".order.done { opacity: .45; }",
+  ".order-head { display: flex; justify-content: space-between; gap: 8px; font-size: 15px; }",
+  ".order-no { font-weight: 700; color: var(--strong); } .order-cust { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; font-size: 16px; }",
+  ".ln .qty { flex: 0 0 44px; } .ln .item { flex: 1 1 140px; } .ln .state { margin-left: auto; }",
+  // a narrow screen (a phone, a small monitor, the board framed beside something): the doors stack instead of
+  // squeezing three columns until the lines run into each other
+  "@media (max-width: 1100px) { .board { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)) !important; } }",
+  ".ln .qty { font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
+  ".ln .item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .bin { color: var(--muted); font-size: 14px; margin-left: 6px; }",
+  ".tag { padding: 2px 8px; border-radius: 5px; font-size: 14px; font-weight: 700; white-space: nowrap; }",
+  ".tag.open { background: var(--open); color: var(--open-ink); }",
+  ".tag.claimed { background: var(--claimed); color: var(--claimed-ink); }",
+  ".tag.picked { background: var(--picked); color: var(--picked-ink); }",
+  ".tag.loaded { background: var(--loaded); color: #ffffff; }",
+  ".legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 14px 0; font-size: 15px; color: var(--muted); }",
+  ".legend .key { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; }",
+  ".legend .sw { width: 22px; height: 14px; border-radius: 4px; display: inline-block; }",
+  ".sw.open { background: var(--open); } .sw.claimed { background: var(--claimed); } .sw.picked { background: var(--picked); } .sw.loaded { background: var(--loaded); }",
+  ".bay-driver { font-size: 18px; font-weight: 600; color: var(--text); margin-top: 2px; }",
+  ".tag.credit { background: transparent; color: var(--muted); border: 1px solid var(--line); }",
+  ".empty { color: var(--muted); padding: 30px 14px; font-size: 20px; text-align: center; }",
+  ".foot { position: fixed; right: 14px; bottom: 8px; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; }",
+  ".theme-toggle { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; " +
+    "border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }",
+  ".theme-svg { display: none; }",
+  ":root .theme-svg.moon, [data-theme=\"light\"] .theme-svg.moon { display: inline-block; }",
+  ":root .theme-svg.sun, [data-theme=\"light\"] .theme-svg.sun { display: none; }",
+  "[data-theme=\"dark\"] .theme-svg.sun { display: inline-block; } [data-theme=\"dark\"] .theme-svg.moon { display: none; }",
+  ".fs-svg, .fs-on { display: none; } .fs-off { display: inline; } .fs-svg.off { display: inline-block; }",
+  "[data-fs=\"1\"] .fs-off, [data-fs=\"1\"] .fs-svg.off { display: none; } [data-fs=\"1\"] .fs-on { display: inline; } [data-fs=\"1\"] .fs-svg.on { display: inline-block; }",
+  ".note { color: var(--muted); padding: 40px; font-size: 20px; }"
+], "\n")
+
+fn qty_text(v) {
+  let f = real(v ?? 0)
+  return f == floor(f) ? str(int(f)) : str(f)
+}
+
+fn pct(a, b) {
+  if real(b ?? 0) <= 0 { return 0 }
+  return min(100, int(real(a) * 100 / real(b)))
+}
+
+// A line's state, in the order it moves through the floor: nobody on it, claimed, picked (on the dock), loaded.
+fn line_state(l) {
+  if real(l.loaded) >= real(l.qty) and real(l.qty) > 0 { return {"cls": "loaded", "text": "LOADED"} }
+  if real(l.picked) >= real(l.qty) and real(l.qty) > 0 { return {"cls": "picked", "text": "PICKED " + (l.picker == "" ? "" : l.picker)} }
+  let part = real(l.picked) > 0 ? " " + qty_text(l.picked) + "/" + qty_text(l.qty) : ""
+  if l.claimed_by != "" { return {"cls": "claimed", "text": l.claimed_by + part} }
+  // partly picked with no claim: someone is on it, so it is being picked - named by who picked so far
+  if real(l.picked) > 0 { return {"cls": "claimed", "text": (l.picker == "" ? "PICKING" : l.picker) + part} }
+  return {"cls": "open", "text": "NO CLAIM"}
+}
+
+fn line_rank(l) {
+  let c = line_state(l).cls
+  return c == "open" ? 0 : (c == "claimed" ? 1 : (c == "picked" ? 2 : 3))
+}
+
+// A running clock: how long since `since` (Cleve's local time), counted in the browser every second (CLOCK_JS), so it
+// moves between pushes. It turns amber at `warn` minutes and red at `crit` (0: never). "hms" reads 1:04:09, as the
+// loading TV's bay timer does; "m" reads 25m / 1h 04m for a line.
+fn two(n) { return n < 10 ? "0" + str(n) : str(n) }
+fn hms_text(sec) { return str(idiv(sec, 3600)) + ":" + two(idiv(sec % 3600, 60)) + ":" + two(sec % 60) }
+fn mins_text(sec) {
+  let m = idiv(sec, 60)
+  if m < 1 { return "<1m" }
+  if m < 60 { return str(m) + "m" }
+  return str(idiv(m, 60)) + "h " + two(m % 60) + "m"
+}
+// seconds from one local time to another (or to now), nil when either is not a time
+fn secs_between(from, to) {
+  let a = date_parse(from, {"zone": "local", "or": nil})
+  let b = to == nil ? now() : date_parse(to, {"zone": "local", "or": nil})
+  if a == nil or b == nil { return nil }
+  return max(0, int(b - a))
+}
+
+// The text and colour are also worked out here, so the page is right before its script runs and a pushed update
+// never shows an empty clock for the second until the next tick.
+fn clock_node(since, warn, crit, fmt) {
+  let sec = is_blank(since) ? nil : secs_between(since, nil)
+  if sec == nil { return el("span", {"class": "clock none"}, "") }
+  let m = sec / 60
+  let tone = (crit > 0 and m >= crit) ? " crit" : ((warn > 0 and m >= warn) ? " warn" : "")
+  return el("span", {"class": "clock" + tone, "data-since": since, "data-warn": str(warn), "data-crit": str(crit), "data-fmt": fmt},
+            fmt == "hms" ? hms_text(sec) : mins_text(sec))
+}
+
+// When a line was finished: its pick scan, as a time of day ("done 10:12am"). Empty for a line picked other than
+// by scan, which has no time.
+fn done_node(at) {
+  let t = is_blank(at) ? nil : date_parse(at, {"zone": "local", "or": nil})
+  if t == nil { return el("span", {"class": "done-at none"}, "") }
+  return el("span", {"class": "done-at"}, "done " + date_format(t, "%-I:%M%P"))
+}
+
+// The line's clock, for the state it is in: one running timer while it waits for a picker (since it was released) or
+// is being picked (since it was claimed); once picked, the time it was done. When a line went on the truck is not
+// recorded per line - the bay's loading clock is that.
+fn line_clock(l, cls) {
+  if cls == "open" { return clock_node(l.released_at, 15, 30, "m") }
+  if cls == "claimed" { return clock_node(l.claimed_at, 10, 20, "m") }
+  if cls == "picked" { return done_node(l.picked_at) }
+  return done_node(l.picked_at)
+}
+
+// A spot the loader can tap when the loading screen hosts this board (HOST_JS): delta 1 loads one, -1 takes one off.
+// The screen checks it against its own active order and makes the same load call a tap on its qty badge makes.
+fn load_attrs(cls, bay, o, l, delta) {
+  return {"class": cls + " loadable", "data-load": delta, "data-bay": bay, "data-order": o.orderno, "data-line": l.line,
+          "data-stock": l.stockid}
+}
+
+// active: the bay when this is its order to load now (the one the loading screen takes scans for), else ""
+fn order_node(o, active) {
+  let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
+  let rows = []
+  if o.credit {
+    push(rows, el("div", {"class": "ln"}, el("span", {"class": "qty"}, ""), el("span", {"class": "item"}, "Credit pickup"),
+                  el("span", {"class": "tag credit"}, "CREDIT")))
+  }
+  for l in sort_by(o.lines ?? [], fn (l) { return [line_rank(l), l.line] }) {
+    let st = line_state(l)
+    let qty = el("span", {"class": "qty"}, qty_text(l.qty) + "x")
+    let item = el("span", {"class": "item"}, l.stockid, el("span", {"class": "bin"}, l.bin))
+    if active != "" {
+      // loaded so far, as the loading screen's badge shows it
+      let left = real(l.loaded) < real(l.qty)
+      qty = el("span", left ? load_attrs("qty", active, o, l, "1") : {"class": "qty"}, qty_text(l.loaded) + "/" + qty_text(l.qty))
+      if real(l.loaded) > 0 { item = el("span", load_attrs("item", active, o, l, "-1"), l.stockid, el("span", {"class": "bin"}, l.bin)) }
+    }
+    push(rows, el("div", {"class": "ln"}, qty, item,
+                  el("span", {"class": "state"}, el("span", {"class": "tag " + st.cls}, st.text), line_clock(l, st.cls))))
+  }
+  return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order")},
+            el("div", {"class": "order-head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
+            ...rows)
+}
+
+fn hhmm(t) {
+  let s = str(t ?? "")
+  return len(s) >= 16 ? slice(s, 11, 16) : ""
+}
+
+// A truck's progress bar, in the legend's colours: its own colour (blue picked, green loaded) only once all of it is
+// done; yellow - in progress - until then, with what is left beside the count. A green bar at 20/22 read as loaded.
+fn bar_node(label, cls, done, total, left_word) {
+  let full = real(total) > 0 and real(done) >= real(total)
+  let left = real(total) - real(done)
+  return el("div", {"class": "bar"}, el("span", label),
+            el("div", {"class": "track"}, el("div", {"class": "fill " + (full ? cls : "partial"), "style": "width:" + str(pct(done, total)) + "%"})),
+            el("span", {"class": "num"}, qty_text(done) + "/" + qty_text(total),
+               (full or real(total) <= 0) ? "" : el("span", {"class": "left"}, " · " + qty_text(left) + " " + left_word)))
+}
+
+// The next tire to go on the truck, big, as the loading TV shows it: the first stop in load order (the orders come
+// load-first, highest sort on top) that is not all on the truck, and its first line not loaded yet. Credits ride
+// along without a scan, so they are passed over.
+fn next_to_load(b) {
+  for o in b.orders ?? [] {
+    if o.credit { continue }
+    for l in o.lines ?? [] {
+      if real(l.loaded) < real(l.qty) { return {"order": o, "line": l} }
+    }
+  }
+  return nil
+}
+
+fn next_node(b) {
+  let n = next_to_load(b)
+  if n == nil { return "" }
+  let l = n.line
+  let st = line_state(l)
+  return el("div", {"class": "next"},
+            el("div", {"class": "next-top"}, el("span", {"class": "lbl"}, "Next to load"),
+               el("span", load_attrs("next-count", b.bay, n.order, l, "1"), qty_text(l.loaded) + "/" + qty_text(l.qty))),
+            el("div", {"class": "next-item"}, l.stockid),
+            el("div", {"class": "next-desc"}, l.description),
+            el("div", {"class": "next-meta"},
+               el("span", "#" + n.order.orderno + " · " + n.order.customer),
+               el("span", {"class": "state"}, l.bin == "" ? "" : el("span", {"class": "bin"}, l.bin),
+                  el("span", {"class": "tag " + st.cls}, st.text))))
+}
+
+fn bay_node(b) {
+  if b.dispnumber == "" {
+    return el("div", {"class": "bay free"},
+              el("div", {"class": "bay-head"}, el("div", {"class": "bay-title"}, el("span", {"class": "bay-name"}, "BAY " + b.bay))),
+              el("div", {"class": "empty"}, "No truck"))
+  }
+  let alert = el("div", {"class": "alert ok"}, "All picked")
+  if b.lines_unclaimed > 0 {
+    // the lines themselves, longest-waiting first, so nobody has to scroll the bay to find them
+    let waiting = []
+    for o in b.orders ?? [] {
+      for l in o.lines ?? [] { if line_state(l).cls == "open" { push(waiting, {"order": o, "line": l}) } }
+    }
+    waiting = sort_by(waiting, fn (w) { return w.line.released_at == "" ? "9999" : w.line.released_at })
+    let rows = map(take(waiting, 4), fn (w) {
+      return el("div", {"class": "need"},
+                el("span", {"class": "need-what"}, "#" + w.order.orderno + "  " + qty_text(w.line.qty) + "x " + w.line.stockid,
+                   w.line.bin == "" ? "" : el("span", {"class": "bin"}, w.line.bin)),
+                clock_node(w.line.released_at, 15, 30, "m"))
+    })
+    let more = len(waiting) > 4 ? el("div", {"class": "need more"}, "+ " + str(len(waiting) - 4) + " more below") : ""
+    alert = el("div", {"class": "alert"},
+               el("div", str(b.lines_unclaimed) + (b.lines_unclaimed == 1 ? " line needs a picker" : " lines need a picker")),
+               ...rows, more)
+  } else if b.lines_open > 0 {
+    alert = el("div", {"class": "alert ok"}, "Every open line is claimed")
+  }
+  let nx = next_to_load(b)
+  let active_no = nx == nil ? "" : nx.order.orderno
+  let loading = el("span", {"class": "clock none"}, "not started")
+  if not is_blank(b.timestarted) { loading = clock_node(b.timestarted, 20, 30, "hms") }
+  // orders still to load first; loaded ones sink, keeping run order within each group
+  // orders with a line nobody has taken first, then the rest still to load, loaded ones last; run order within each
+  let orders = sort_by(b.orders ?? [], fn (o) {
+    let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
+    let needs = len(filter(o.lines ?? [], fn (l) { return line_state(l).cls == "open" })) > 0
+    return [done ? 2 : (needs ? 0 : 1), -real(o.sort)]
+  })
+  return el("div", {"class": "bay", "data-bay": b.bay},
+            el("div", {"class": "bay-head"},
+               el("div", {"class": "bay-title"},
+                  el("span", {"class": "bay-name"}, "BAY " + b.bay),
+                  el("span", {"class": "bay-truck"}, b.truck),
+                  // this screen's layout for the bay (LAYOUT_JS): across the whole board, and every order shown
+                  el("span", {"class": "bay-tools"},
+                     el("button", {"type": "button", "data-act": "wide", "aria-pressed": "false", "title": "Full width"}, "⇔"),
+                     el("button", {"type": "button", "data-act": "tall", "aria-pressed": "false", "title": "Show every order"}, "⇕"))),
+               b.driver == "" ? "" : el("div", {"class": "bay-driver"}, "Driver: " + b.driver),
+               el("div", {"class": "bay-sub"},
+                  el("span", "Run " + b.dispnumber + " · " + str(b.orders_done) + "/" + str(len(b.orders ?? [])) + " orders"),
+                  el("span", "Assigned " + hhmm(b.timeassigned))),
+               // the truck's clocks: on the door since it was assigned; loading since its first load scan (the TV's
+               // timer and its 20 / 30 minute marks)
+               el("div", {"class": "bay-clocks"},
+                  el("span", {"class": "bc"}, el("span", {"class": "lbl"}, "On bay"), clock_node(b.timeassigned, 0, 0, "hms")),
+                  el("span", {"class": "bc"}, el("span", {"class": "lbl"}, "Loading"), loading)),
+               el("div", {"class": "bars"}, bar_node("Picked", "picked", b.picked, b.units, "to pick"),
+                  bar_node("Loaded", "loaded", b.loaded, b.units, "to load")),
+               alert,
+               next_node(b)),
+            el("div", {"class": "orders"}, ...map(orders, fn (o) { return order_node(o, o.orderno == active_no ? b.bay : "") })))
+}
+
+// Light or dark: ?theme=light|dark on the link (a TV has no mouse), else what this screen last picked, else light -
+// the floor's choice, whatever the screen's system is set to. It only sets data-theme on <html>, which pushed updates never touch; the button's icon and label follow
+// it in CSS, so nothing here has to run again when the board changes.
+let THEME_JS = join([
+  "(function () {",
+  "  var KEY = 'dock_live_theme';",
+  "  function ok(s) { return s === 'light' || s === 'dark' ? s : null; }",
+  "  function saved() { try { return ok(localStorage.getItem(KEY)); } catch (e) { return null; } }",
+  "  function keep(s) { try { localStorage.setItem(KEY, s); } catch (e) {} }",
+  "  var asked = ok(new URLSearchParams(location.search).get('theme'));",
+  "  if (asked) { keep(asked); }",
+  "  var root = document.documentElement;",
+  "  root.setAttribute('data-theme', asked || saved() || 'light');",
+  "  document.addEventListener('click', function (e) {",
+  "    if (!e.target.closest || !e.target.closest('#theme-toggle')) return;",
+  "    var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';",
+  "    keep(next);",
+  "    root.setAttribute('data-theme', next);",
+  "  });",
+  "})();"
+], chr(10))
+
+fn theme_toggle_node() {
+  let sun = "<svg class=\"theme-svg sun\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"5\"/><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"/><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"/><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"/><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"/><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"/><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"/><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"/></svg>"
+  let moon = "<svg class=\"theme-svg moon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"/></svg>"
+  return el("button", {"type": "button", "class": "theme-toggle", "id": "theme-toggle", "title": "Switch between light and dark", "aria-label": "Switch between light and dark"},
+    html_raw(sun), html_raw(moon), el("span", {"class": "theme-svg sun"}, "Light"), el("span", {"class": "theme-svg moon"}, "Dark"))
+}
+
+// Every clock on the page, every second: the time since its data-since (Cleve's local time, as the browser on the
+// floor keeps it), amber past data-warn minutes, red past data-crit. A push replaces the markup with fresh times and
+// the next tick picks the new elements up. A "done" time is fixed, so the server writes it (done_node).
+let CLOCK_JS = join([
+  "(function () {",
+  "  function at(s) { var d = new Date(String(s).replace(' ', 'T')); return isNaN(d) ? null : d; }",
+  "  function two(n) { return (n < 10 ? '0' : '') + n; }",
+  "  function hms(sec) { var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60; return h + ':' + two(m) + ':' + two(s); }",
+  "  function mins(sec) { var m = Math.floor(sec / 60); if (m < 1) return '<1m'; if (m < 60) return m + 'm'; return Math.floor(m / 60) + 'h ' + two(m % 60) + 'm'; }",
+  "  var root = document.querySelector('[data-design]');",
+  "  var design = root ? root.getAttribute('data-design') : null;",
+  "  function tick() {",
+  "    var now = Date.now();",
+  "    var cur = document.querySelector('[data-design]');",
+  "    if (design && cur && cur.getAttribute('data-design') !== design) { location.reload(); return; }",
+  "    document.querySelectorAll('.clock[data-since]').forEach(function (el) {",
+  "      var t = at(el.getAttribute('data-since')); if (!t) return;",
+  "      var sec = Math.max(0, Math.floor((now - t.getTime()) / 1000));",
+  "      var text = el.getAttribute('data-fmt') === 'hms' ? hms(sec) : mins(sec);",
+  "      if (el.textContent !== text) el.textContent = text;",
+  "      var w = +el.getAttribute('data-warn') || 0, c = +el.getAttribute('data-crit') || 0, m = sec / 60;",
+  "      el.classList.toggle('crit', c > 0 && m >= c);",
+  "      el.classList.toggle('warn', w > 0 && m >= w && !(c > 0 && m >= c));",
+  "    });",
+  "  }",
+  "  tick();",
+  "  setInterval(tick, 1000);",
+  "})();"
+], chr(10))
+
+// What the colours mean, across the top, for someone new on the floor.
+fn legend_node() {
+  let key = fn (cls, text) { return el("span", {"class": "key"}, el("span", {"class": "sw " + cls}), text) }
+  return el("div", {"class": "legend"}, key("open", "Needs a picker"), key("claimed", "Being picked"),
+            key("picked", "Picked"), key("loaded", "Loaded"))
+}
+
+// Each bay's layout on this screen - wide (the whole width) and tall (every order, not just a screenful) - from the
+// bay's buttons, kept in localStorage. A push replaces the markup, so it is put back on every change before the
+// browser paints (a MutationObserver), and a bay keeps its size through live updates.
+let LAYOUT_JS = join([
+  "(function () {",
+  "  var KEY = 'dock_live_layout';",
+  "  function load() { try { return JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { return {}; } }",
+  "  function save(v) { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} }",
+  "  var layout = load();",
+  "  function apply() {",
+  "    document.querySelectorAll('.bay[data-bay]').forEach(function (bay) {",
+  "      var l = layout[bay.getAttribute('data-bay')] || {};",
+  "      ['wide', 'tall'].forEach(function (k) {",
+  "        if (bay.classList.contains(k) !== !!l[k]) bay.classList.toggle(k, !!l[k]);",
+  "        var b = bay.querySelector('[data-act=' + k + ']');",
+  "        if (b && b.getAttribute('aria-pressed') !== String(!!l[k])) b.setAttribute('aria-pressed', String(!!l[k]));",
+  "      });",
+  "    });",
+  "  }",
+  "  document.addEventListener('click', function (e) {",
+  "    var b = e.target.closest && e.target.closest('.bay [data-act]'); if (!b) return;",
+  "    var id = b.closest('.bay').getAttribute('data-bay'), k = b.getAttribute('data-act');",
+  "    var l = layout[id] || {}; l[k] = !l[k]; layout[id] = l; save(layout); apply();",
+  "  });",
+  "  apply();",
+  // the board's own re-render puts a bay's class and buttons back as the server wrote them, as attribute changes
+  // rather than new nodes - watch both; apply() changes nothing when it already matches, so it cannot loop
+  "  new MutationObserver(apply).observe(document.body, {childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'aria-pressed']});",
+  "})();"
+], chr(10))
+
+
+// Full screen for a wall TV: the board alone, edge to edge. A small control beside Light/Dark; its icon and label
+// follow data-fs on <html>, which pushes never touch. Inside the loading screen's frame it needs the frame's
+// allow="fullscreen", which that screen gives.
+let FULLSCREEN_JS = join([
+  "(function () {",
+  "  var root = document.documentElement;",
+  "  function mark() { root.setAttribute('data-fs', document.fullscreenElement ? '1' : '0'); }",
+  "  document.addEventListener('fullscreenchange', mark);",
+  "  document.addEventListener('click', function (e) {",
+  "    if (!e.target.closest || !e.target.closest('#fs-toggle')) return;",
+  "    if (document.fullscreenElement) { document.exitFullscreen(); } else if (root.requestFullscreen) { root.requestFullscreen(); }",
+  "  });",
+  "  mark();",
+  "})();"
+], chr(10))
+
+fn fullscreen_node() {
+  let enter = "<svg class=\"fs-svg off\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3\"/></svg>"
+  let leave = "<svg class=\"fs-svg on\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3\"/></svg>"
+  return el("button", {"type": "button", "class": "theme-toggle", "id": "fs-toggle", "title": "Full screen", "aria-label": "Full screen"},
+    html_raw(enter), html_raw(leave), el("span", {"class": "fs-off"}, "Full screen"), el("span", {"class": "fs-on"}, "Exit"))
+}
+
+// Load by tap, only inside the v8 loading screen: it posts {kind: "dock-host"} into this frame, and from then on a tap
+// on a load spot goes up to it as {kind: "dock-load", ...} and its answer comes back as a short note. A board opened
+// on its own (a shared link) never hears from a host, so it stays a board to look at.
+let HOST_JS = join([
+  "(function () {",
+  "  var root = document.documentElement, host = null;",
+  "  function note(ok, text) {",
+  "    var n = document.getElementById('dock-note');",
+  "    if (!n) { n = document.createElement('div'); n.id = 'dock-note'; document.body.appendChild(n); }",
+  "    n.className = ok ? 'show ok' : 'show err'; n.textContent = text;",
+  "    clearTimeout(n._t); n._t = setTimeout(function () { n.className = ''; }, 3000);",
+  "  }",
+  "  window.addEventListener('message', function (e) {",
+  "    var d = e.data || {};",
+  "    if (d.kind === 'dock-host' && e.source === window.parent) { host = e.origin; root.setAttribute('data-host', '1'); }",
+  "    if (d.kind === 'dock-load-result' && host && e.origin === host) {",
+  "      var b = document.querySelectorAll('.loadable.busy'); for (var i = 0; i < b.length; i++) { b[i].classList.remove('busy'); }",
+  "      note(!!d.ok, d.text || (d.ok ? 'Done' : 'Not loaded'));",
+  "    }",
+  "  });",
+  "  document.addEventListener('click', function (e) {",
+  "    if (!host || !e.target.closest) return;",
+  "    var t = e.target.closest('.loadable'); if (!t) return;",
+  "    e.preventDefault(); t.classList.add('busy');",
+  "    window.parent.postMessage({ kind: 'dock-load', delta: Number(t.getAttribute('data-load')), bay: t.getAttribute('data-bay'),",
+  "      orderno: t.getAttribute('data-order'), line: t.getAttribute('data-line'), stockid: t.getAttribute('data-stock') }, host);",
+  "  });",
+  "})();"
+], chr(10))
+
+// The board's look, as a fingerprint of its stylesheet and scripts. A pushed update carries it; CLOCK_JS reloads the
+// page when it differs from the one the page loaded with, because the page's stylesheet and scripts are only read on
+// load - a deploy's new design otherwise arrived as unstyled markup on every screen already open (a wall TV that
+// nobody reloads). Data changes leave it alone.
+let DESIGN = slice(sha256(BOARD_CSS + THEME_JS + CLOCK_JS + LAYOUT_JS + FULLSCREEN_JS + HOST_JS), 0, 12)
+
+fn board_node(bays, read_at) {
+  return el("div", {"data-design": DESIGN}, legend_node(),
+            el("div", {"class": "board", "style": "--cols:" + str(max(1, len(bays)))}, ...map(bays, bay_node)),
+            el("div", {"class": "foot"}, el("span", "Dock Live · read " + read_at), fullscreen_node(), theme_toggle_node()),
+            el("script", THEME_JS), el("script", CLOCK_JS), el("script", LAYOUT_JS), el("script", FULLSCREEN_JS), el("script", HOST_JS))
+}

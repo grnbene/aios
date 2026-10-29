@@ -106,7 +106,42 @@ fn shared() {
   return {"drivers": m}
 }
 
+// The hours to build, a batch of them, in runs that lie close together: each run is read on its own range.
+// One range from the batch's first hour to its last read every table across everything between: one change to an old
+// order (a pick, a dispatch row, a receipt; touched() below) and one from today made a single rebuild of two hours
+// scan three and a half years of recscan, stockmoves and debtortrans, several times a minute on atl-ga-1 (2026-10-29),
+// ASQL at a full core. An hour's answer is its own rows' only (DAY_SAFE), so the runs' answers together are the batch's.
+let RUN_GAP_DAYS = 2   // hours more than this many days apart are read separately
+
+fn hour_runs_of(ks) {
+  let hs = sort(unique(map(ks, fn(k) { return str(k) })))
+  let runs = []
+  let cur = []
+  let last_day = nil
+  for h in hs {
+    let day = slice(h, 0, 10)
+    if last_day != nil and day > day_add(last_day, RUN_GAP_DAYS) {
+      push(runs, cur)
+      cur = []
+    }
+    push(cur, h)
+    last_day = day
+  }
+  if len(cur) > 0 { push(runs, cur) }
+  return runs
+}
+
 fn things(ks, sh) {
+  let out = {}
+  for run in hour_runs_of(ks) {
+    let part = things_span(run, sh)
+    for h in keys(part) { out[h] = part[h] }
+  }
+  return out
+}
+
+// The hours of one run (close together), read on the run's own range.
+fn things_span(ks, sh) {
   let want = {}
   let lo = nil
   let hi = nil

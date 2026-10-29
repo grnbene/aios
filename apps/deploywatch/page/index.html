@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deploy Machines</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6;
+  --cache: #d9d8d1; --kernel: #a9a79f;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --sel: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9;
+    --cache: #383835; --kernel: #5c5b56; --sel: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9;
+  --cache: #383835; --kernel: #5c5b56; --sel: #3987e5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 18px 24px 8px; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; }
+h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+.sub { color: var(--ink-2); font-size: 13px; }
+.muted { color: var(--muted); }
+main { padding: 8px 24px 40px; max-width: 1400px; margin: 0 auto; }
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: none; color: var(--ink-2); padding: 6px 12px; font: inherit; cursor: pointer; }
+.seg button.on { background: var(--sel); color: #fff; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; cursor: pointer; text-align: left; font: inherit; color: inherit; }
+.card.on { outline: 2px solid var(--sel); outline-offset: -1px; }
+.card .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.card .name { font-weight: 650; font-size: 15px; }
+.card .nums { display: flex; gap: 18px; margin: 8px 0 6px; }
+.card .big { font-size: 22px; font-weight: 600; }
+.card .lbl { font-size: 12px; color: var(--muted); }
+.status { font-size: 12px; display: inline-flex; align-items: center; gap: 5px; color: var(--ink-2); white-space: nowrap; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; min-width: 0; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 14px; margin-bottom: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 10px 14px; }
+.tile .v { font-size: 20px; font-weight: 600; }
+.tile .k { font-size: 12px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--ink-2); margin: 8px 0 0; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.12); min-width: 170px; display: none; z-index: 5; }
+.tip .row { display: flex; justify-content: space-between; gap: 12px; }
+.bar { display: flex; height: 26px; border-radius: 6px; overflow: hidden; gap: 2px; background: var(--surface); margin: 10px 0 6px; }
+.bar div { height: 100%; min-width: 2px; }
+.bar div:first-child { border-radius: 4px 0 0 4px; } .bar div:last-child { border-radius: 0 4px 4px 0; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--grid); }
+td { padding: 5px 6px; border-bottom: 1px solid var(--grid); }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.events { list-style: none; margin: 8px 0 0; padding: 0; max-height: 360px; overflow: auto; }
+.events li { padding: 8px 0; border-bottom: 1px solid var(--grid); display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; align-items: start; }
+.events .ico { font-size: 13px; line-height: 20px; text-align: center; border-radius: 50%; width: 20px; height: 20px; color: #fff; }
+.events .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.events .what { font-size: 13px; }
+.events .why { font-size: 12px; color: var(--ink-2); }
+.hbar { height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+.hbar div { height: 100%; background: var(--s1); border-radius: 4px; }
+.err { color: var(--critical); font-size: 13px; }
+.note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.scroll { overflow-x: auto; }
+@media (max-width: 640px) { header, main { padding-left: 16px; padding-right: 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Deploy machines</h1>
+    <div class="sub" id="updated">Connecting…</div>
+  </div>
+  <div class="seg" id="range">
+    <button data-m="15">15 min</button><button data-m="60" class="on">1 hour</button><button data-m="360">6 hours</button><button data-m="1440">24 hours</button>
+  </div>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div id="detail"></div>
+</main>
+<div class="tip" id="tip"></div>
+<script>
+"use strict";
+const GROUPS = ["ASQL", "aios apps", "aios services", "MariaDB", "Node", "PHP & web", "Other"];
+const GCOLOR = {"ASQL": "var(--s1)", "aios apps": "var(--s2)", "aios services": "var(--s3)", "MariaDB": "var(--s4)",
+                "Node": "var(--s5)", "PHP & web": "var(--s6)", "Other": "var(--s7)"};
+const state = { machines: [], sel: null, minutes: 60, now: {}, hist: {}, events: {}, tables: {}, disk: {}, errs: {} };
+try { const m = localStorage.getItem("dw.minutes"); if (m) state.minutes = +m; } catch (e) {}
+try { state.sel = localStorage.getItem("dw.sel"); } catch (e) {}
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+function bytes(n) {
+  if (n == null || isNaN(n)) return "–";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; let v = Math.abs(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (n < 0 ? "-" : "") + (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+}
+const pct = (v) => (v == null ? "–" : (Math.round(v * 10) / 10) + "%");
+function ago(t) {
+  const s = Date.now() / 1000 - t;
+  if (s < 90) return Math.round(s) + " s ago";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  if (s < 172800) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+const stamp = (t) => new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"});
+function dur(s) { s = Math.round(s); if (s < 60) return s + " s"; if (s < 3600) return Math.round(s / 60) + " min"; return (s / 3600).toFixed(1) + " h"; }
+
+async function get(path) {
+  const r = await fetch(path, {headers: {"Accept": "application/json"}});
+  const text = await r.text();
+  let body; try { body = JSON.parse(text); } catch (e) { body = null; }
+  if (!r.ok) throw new Error((body && (body.error || body.message)) || text.trim() || ("HTTP " + r.status));
+  return body;
+}
+
+// How a machine is: the worst thing true of it now, with its reason.
+function health(n) {
+  if (!n) return {c: "var(--muted)", t: "No reading", lvl: 0};
+  const s = n.sample, m = s.mem, avail = m.avail / m.total;
+  if (n.age_s > 120) return {c: "var(--critical)", t: "Stale: last reading " + ago(s.t), lvl: 3};
+  if (s.asql && s.asql.error) return {c: "var(--critical)", t: "ASQL not answering", lvl: 3};
+  if (avail < 0.10) return {c: "var(--critical)", t: "Memory low", lvl: 3};
+  if (s.cpu >= 85) return {c: "var(--serious)", t: "CPU busy", lvl: 2};
+  if (avail < 0.20) return {c: "var(--warning)", t: "Memory tight", lvl: 1};
+  if (s.mem.swap_used > 512 * 1048576) return {c: "var(--warning)", t: "Using swap", lvl: 1};
+  return {c: "var(--good)", t: "Healthy", lvl: 0};
+}
+const ICON = {3: "✕", 2: "!", 1: "!", 0: "✓"};
+
+function spark(samples, w, h) {
+  if (!samples || samples.length < 2) return "";
+  const t0 = samples[0].t, t1 = samples[samples.length - 1].t || t0 + 1;
+  const pts = samples.map(s => [((s.t - t0) / (t1 - t0 || 1)) * w, h - (s.cpu / 100) * h]);
+  const d = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none" aria-hidden="true"><path d="${d}L${w},${h}L0,${h}Z" fill="var(--s1)" opacity=".14"/><path d="${d}" fill="none" stroke="var(--s1)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function renderCards() {
+  $("#cards").innerHTML = state.machines.map(name => {
+    const n = state.now[name], e = state.errs[name];
+    const hl = e && !n ? {c: "var(--critical)", t: "Unreachable", lvl: 3} : health(n);
+    const s = n && n.sample;
+    const spikes = (state.events[name] || []).filter(ev => ev.start > Date.now() / 1000 - 86400).length;
+    const asqlRss = s && s.asql && !s.asql.error ? bytes(s.asql.Asql_resident_bytes) : (s && s.asql ? "down" : "none");
+    return `<button class="card ${state.sel === name ? "on" : ""}" data-name="${esc(name)}">
+      <div class="top"><span class="name">${esc(name)}</span>
+        <span class="status"><span class="dot" style="background:${hl.c}"></span>${esc(hl.t)}</span></div>
+      ${s ? `<div class="nums">
+        <div><div class="big">${pct(s.cpu)}</div><div class="lbl">CPU of ${s.ncpu} cores</div></div>
+        <div><div class="big">${bytes(s.mem.used)}</div><div class="lbl">of ${bytes(s.mem.total)} used</div></div>
+        <div><div class="big" style="font-size:16px;padding-top:5px">${asqlRss}</div><div class="lbl">ASQL</div></div>
+      </div>
+      ${spark(state.hist[name], 240, 34)}
+      <div class="lbl">${spikes ? spikes + " spike" + (spikes > 1 ? "s" : "") + " in 24 h" : "No spikes in 24 h"}</div>`
+      : e ? `<div style="margin-top:8px">Can't reach this machine right now.</div><div class="note">${esc(e)}</div>`
+          : `<div class="muted" style="margin-top:8px">Waiting for the first reading…</div>`}
+    </button>`;
+  }).join("");
+  document.querySelectorAll(".card").forEach(b => b.onclick = () => { state.sel = b.dataset.name; try { localStorage.setItem("dw.sel", state.sel); } catch (e) {} render(); loadDetail(); });
+}
+
+// A stacked area over time. series: [{key, label, color}], value(sample, key) in the y unit; ymax; fmt for values.
+function stacked(samples, series, value, ymax, fmt, height, yfmt) {
+  const W = 640, H = height, L = 46, R = 8, T = 8, B = 22;
+  if (!samples || samples.length < 2) return `<div class="muted" style="padding:30px 0">Not enough samples yet.</div>`;
+  const t0 = samples[0].t, t1 = samples[samples.length - 1].t;
+  const x = t => L + ((t - t0) / (t1 - t0 || 1)) * (W - L - R);
+  const y = v => T + (1 - Math.min(v, ymax) / ymax) * (H - T - B);
+  let base = samples.map(() => 0), paths = "";
+  for (const s of series) {
+    const top = samples.map((sm, i) => base[i] + Math.max(0, value(sm, s.key)));
+    let d = samples.map((sm, i) => (i ? "L" : "M") + x(sm.t).toFixed(1) + "," + y(top[i]).toFixed(1)).join("");
+    for (let i = samples.length - 1; i >= 0; i--) d += "L" + x(samples[i].t).toFixed(1) + "," + y(base[i]).toFixed(1);
+    paths += `<path d="${d}Z" fill="${s.color}" stroke="var(--surface)" stroke-width="1"/>`;
+    base = top;
+  }
+  let grid = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = ymax * k / 4, yy = y(v);
+    grid += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="${k ? "var(--grid)" : "var(--axis)"}" stroke-width="1"/>`;
+    grid += `<text x="${L - 6}" y="${yy + 4}" text-anchor="end" font-size="11" fill="var(--muted)">${esc(yfmt(v))}</text>`;
+  }
+  const ticks = 5;
+  for (let k = 0; k <= ticks; k++) {
+    const t = t0 + (t1 - t0) * k / ticks;
+    grid += `<text x="${x(t)}" y="${H - 6}" text-anchor="${k === 0 ? "start" : k === ticks ? "end" : "middle"}" font-size="11" fill="var(--muted)">${clock(t)}</text>`;
+  }
+  const id = "c" + Math.random().toString(36).slice(2);
+  chartData[id] = {samples, series, value, fmt, x, L, R, W, T, B, H};
+  return `<div class="chart" data-id="${id}"><svg viewBox="0 0 ${W} ${H}" role="img">${grid}${paths}
+    <line class="xh" x1="0" x2="0" y1="${T}" y2="${H - B}" stroke="var(--ink-2)" stroke-width="1" style="display:none"/></svg></div>
+    <div class="legend">${series.slice().reverse().map(s => `<span><i class="sw" style="background:${s.color}"></i>${esc(s.label)}</span>`).join("")}</div>`;
+}
+const chartData = {};
+function wireCharts() {
+  const tip = $("#tip");
+  document.querySelectorAll(".chart").forEach(el => {
+    const c = chartData[el.dataset.id]; if (!c) return;
+    const svg = el.querySelector("svg"), xh = svg.querySelector(".xh");
+    svg.onmousemove = (ev) => {
+      const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * c.W;
+      let best = 0, bd = 1e18;
+      c.samples.forEach((s, i) => { const d = Math.abs(c.x(s.t) - px); if (d < bd) { bd = d; best = i; } });
+      const s = c.samples[best];
+      xh.setAttribute("x1", c.x(s.t)); xh.setAttribute("x2", c.x(s.t)); xh.style.display = "";
+      const rows = c.series.slice().reverse().map(se => `<div class="row"><span><i class="sw" style="background:${se.color}"></i> ${esc(se.label)}</span><b>${esc(c.fmt(c.value(s, se.key)))}</b></div>`).join("");
+      tip.innerHTML = `<div class="muted" style="margin-bottom:4px">${stamp(s.t)}</div>${rows}`;
+      tip.style.display = "block";
+      const tw = tip.offsetWidth, left = ev.pageX + 14 + tw > window.scrollX + innerWidth ? ev.pageX - tw - 14 : ev.pageX + 14;
+      tip.style.left = left + "px"; tip.style.top = (ev.pageY + 12) + "px";
+    };
+    svg.onmouseleave = () => { tip.style.display = "none"; xh.style.display = "none"; };
+  });
+}
+
+function memSeries() {
+  return GROUPS.map(g => ({key: g, label: g, color: GCOLOR[g]}))
+    .concat([{key: "_kernel", label: "Kernel & not in a process", color: "var(--kernel)"}, {key: "_cache", label: "File cache (reclaimable)", color: "var(--cache)"}]);
+}
+function memValue(s, k) {
+  if (k === "_cache") return s.mem.cache;
+  if (k === "_kernel") return Math.max(0, s.mem.used - GROUPS.reduce((a, g) => a + (s.g[g] ? s.g[g].rss : 0), 0));
+  return s.g[k] ? s.g[k].rss : 0;
+}
+
+function memBar(s) {
+  const segs = memSeries().map(se => ({...se, v: memValue(s, se.key)}));
+  const free = Math.max(0, s.mem.total - segs.reduce((a, x) => a + x.v, 0));
+  const all = segs.concat([{key: "_free", label: "Free", color: "transparent", v: free}]);
+  const tot = all.reduce((a, x) => a + x.v, 0) || 1;
+  return `<div class="bar" role="img" aria-label="Memory by service">${all.filter(x => x.v > 0).map(x =>
+      `<div title="${esc(x.label)}: ${bytes(x.v)}" style="flex:${x.v / tot};background:${x.color};${x.key === "_free" ? "outline:1px dashed var(--axis);outline-offset:-1px" : ""}"></div>`).join("")}</div>
+    <table><thead><tr><th>Where it goes</th><th class="n">Resident</th><th class="n">Share</th><th class="n">Processes</th></tr></thead><tbody>
+    ${all.filter(x => x.v > 0).sort((a, b) => b.v - a.v).map(x => `<tr><td><i class="sw" style="background:${x.color};${x.key === "_free" ? "outline:1px dashed var(--axis)" : ""}"></i> ${esc(x.label)}</td>
+      <td class="n">${bytes(x.v)}</td><td class="n">${pct(100 * x.v / s.mem.total)}</td><td class="n">${s.g[x.key] ? s.g[x.key].n : ""}</td></tr>`).join("")}
+    </tbody></table>
+    <div class="note">Resident sizes count shared pages in every process that maps them. MariaDB's buffer pool and ASQL's columns sit in their own process.</div>`;
+}
+
+function asqlPanel(name, s) {
+  const a = s.asql;
+  if (!a) return `<div class="panel"><h2>Inside ASQL</h2><div class="muted" style="margin-top:8px">No ASQL engine on this machine.</div></div>`;
+  if (a.error) return `<div class="panel"><h2>Inside ASQL</h2><div class="err" style="margin-top:8px">${esc(a.error)}</div></div>`;
+  const rows = a.Asql_row_index_mem_bytes || 0, things = a.Asql_things_mem_bytes || 0, colidx = a.Asql_colidx_bytes || 0;
+  const tables = Math.max(0, (a.Asql_memory_bytes || 0) - rows - things - colidx);
+  const cache = a.Asql_cache_bytes || 0, work = a.Asql_query_memory_reserved || 0;
+  const res = a.Asql_resident_bytes || 0;
+  const parts = [
+    {l: "Table columns & probe indexes", v: tables, c: "var(--s1)"},
+    {l: "Row indexes", v: rows, c: "var(--s2)"},
+    {l: "Things", v: things, c: "var(--s3)"},
+    {l: "Column lookup indexes", v: colidx, c: "var(--s4)"},
+    {l: "Query result cache", v: cache, c: "var(--s5)"},
+    {l: "Queries running now", v: work, c: "var(--s6)"},
+  ];
+  const counted = parts.reduce((x, p) => x + p.v, 0);
+  parts.push({l: "Not attributed (allocator held, buffers)", v: Math.max(0, res - counted), c: "var(--kernel)"});
+  const tot = Math.max(res, counted) || 1;
+  const t = state.tables[name];
+  return `<div class="panel"><h2>Inside ASQL</h2>
+    <div class="sub">${bytes(res)} resident · ${(a.Asql_total_tables || 0).toLocaleString()} tables · ${(a.Asql_total_rows || 0).toLocaleString()} rows · up ${dur(a.Uptime || 0)}</div>
+    <div class="bar" role="img" aria-label="ASQL memory">${parts.filter(p => p.v > 0).map(p => `<div title="${esc(p.l)}: ${bytes(p.v)}" style="flex:${p.v / tot};background:${p.c}"></div>`).join("")}</div>
+    <table><tbody>${parts.filter(p => p.v > 0).map(p => `<tr><td><i class="sw" style="background:${p.c}"></i> ${esc(p.l)}</td><td class="n">${bytes(p.v)}</td><td class="n">${pct(100 * p.v / tot)}</td></tr>`).join("")}</tbody></table>
+    <div class="note">Allocator: ${bytes(a.Asql_malloc_live_bytes)} live, ${bytes(a.Asql_malloc_free_bytes)} free but kept. Query workspace peak ${bytes(a.Asql_query_memory_peak)} of ${bytes(a.Asql_query_memory_budget)}. ${a.Asql_slow_queries || 0} slow queries since start.</div>
+    <h2 style="margin-top:16px">Biggest tables</h2>
+    ${!t ? `<div class="muted">Loading…</div>` : t.ok === false ? `<div class="err">${esc(t.error)}</div>` : `
+      <div class="scroll"><table><thead><tr><th>Table</th><th class="n">Rows</th><th class="n">Columns</th><th class="n">Indexes</th><th class="n">Total</th></tr></thead><tbody>
+      ${t.tables.slice(0, 15).map(r => `<tr><td>${esc(r.db)}.<b>${esc(r.table)}</b></td><td class="n">${(r.rows || 0).toLocaleString()}</td><td class="n">${bytes(r.data)}</td><td class="n">${bytes(r.index)}</td><td class="n">${bytes(r.bytes)}</td></tr>`).join("")}
+      </tbody></table></div><div class="note">Read ${ago(t.t)}; ${t.count.toLocaleString()} tables, ${bytes(t.bytes)} in all.</div>`}
+  </div>`;
+}
+
+const EVKIND = {cpu: {c: "var(--serious)", i: "!"}, mem: {c: "var(--critical)", i: "✕"}, asql: {c: "var(--critical)", i: "✕"},
+                grew: {c: "var(--warning)", i: "↑"}, swap: {c: "var(--warning)", i: "↓"}, restart: {c: "var(--s1)", i: "↻"}};
+function eventLine(ev) {
+  const k = EVKIND[ev.kind] || {c: "var(--muted)", i: "•"};
+  let why = "";
+  if (ev.kind === "cpu") why = `Peak ${pct(ev.peak)}` + (ev.top && ev.top.length ? " · busiest: " + ev.top.map(p => `${esc(p.name)} ${pct(p.cpu)}`).join(", ") : "");
+  else if (ev.kind === "mem") why = `${bytes(ev.avail)} available at worst` + (ev.top ? " · biggest: " + ev.top.map(p => `${esc(p.name)} ${bytes(p.rss)}`).join(", ") : "");
+  else if (ev.kind === "grew" || ev.kind === "swap") why = `${bytes(ev.from)} → ${bytes(ev.to)} in ${dur(ev.end - ev.start)}`;
+  else if (ev.kind === "restart") why = ev.pid ? `now pid ${ev.pid}` : "";
+  else if (ev.kind === "asql") why = esc(ev.error || "");
+  const lasted = ev.open ? `<b style="color:var(--critical)">still going</b> · ${dur(Date.now() / 1000 - ev.start)}` : (ev.secs ? "lasted " + dur(ev.secs) : "");
+  return `<li><span class="ico" style="background:${k.c}" aria-hidden="true">${k.i}</span>
+    <div><div class="what">${esc(ev.title)}${lasted ? " · " + lasted : ""}</div><div class="why">${why}${ev.note ? `<br>${esc(ev.note)}` : ""}</div></div>
+    <span class="when" title="${stamp(ev.start)}">${ago(ev.start)}</span></li>`;
+}
+
+function diskPanel(d) {
+  if (!d) return `<div class="muted">Loading…</div>`;
+  if (d.error && !(d.folders || []).length) return `<div class="muted">${esc(d.error)}</div>`;
+  return d.folders.map(f => {
+    if (!f.ok) return `<div style="margin:10px 0"><b>${esc(f.path)}</b> <span class="err">${esc(f.error)}</span></div>`;
+    const max = Math.max(1, ...f.children.map(k => k.bytes));
+    return `<div style="margin:12px 0 4px"><b>${esc(f.path)}</b> <span class="muted">${bytes(f.bytes)}${f.partial ? " (walk stopped at its limit; at least this much)" : ""}${f.unreadable ? ` · ${f.unreadable} folder${f.unreadable > 1 ? "s" : ""} not readable by the app` : ""}</span></div>
+      <table><tbody>${f.children.filter(k => k.bytes > 0).map(k => `<tr><td style="width:45%">${esc(k.name)}${k.dir ? "/" : ""}</td><td><div class="hbar"><div style="width:${100 * k.bytes / max}%"></div></div></td><td class="n" style="width:90px">${bytes(k.bytes)}</td></tr>`).join("")}</tbody></table>
+      ${f.others ? `<div class="note">and ${f.others} smaller</div>` : ""}`;
+  }).join("") + `<div class="note">Walked ${ago(d.t)}.</div>`;
+}
+
+function render() {
+  renderCards();
+  const name = state.sel, n = state.now[name];
+  if (!name) { $("#detail").innerHTML = ""; return; }
+  if (!n) { $("#detail").innerHTML = `<div class="panel"><h2>${esc(name)}</h2><div class="err" style="margin-top:6px">${esc(state.errs[name] || "Waiting for the first reading…")}</div></div>`; return; }
+  const s = n.sample, h = state.hist[name] || [];
+  for (const k in chartData) delete chartData[k];
+  const cpuSeries = GROUPS.map(g => ({key: g, label: g, color: GCOLOR[g]}));
+  const cores = (v) => (v / 100).toFixed(v >= 1000 ? 0 : 1) + " cores";
+  const procs = (s.top || []).slice().sort((a, b) => b.cpu - a.cpu || b.rss - a.rss);
+  $("#detail").innerHTML = `
+    <div class="tiles">
+      <div class="tile"><div class="v">${pct(s.cpu)}</div><div class="k">CPU now (${s.ncpu} cores)</div></div>
+      <div class="tile"><div class="v">${s.load.map(v => v.toFixed(2)).join(" · ")}</div><div class="k">Load 1 · 5 · 15 min</div></div>
+      <div class="tile"><div class="v">${bytes(s.mem.used)}</div><div class="k">Memory used of ${bytes(s.mem.total)}</div></div>
+      <div class="tile"><div class="v">${bytes(s.mem.avail)}</div><div class="k">Available</div></div>
+      <div class="tile"><div class="v">${bytes(s.mem.swap_used)}</div><div class="k">Swap used of ${bytes(s.mem.swap_total)}</div></div>
+      <div class="tile"><div class="v">${s.asql && !s.asql.error ? bytes(s.asql.Asql_resident_bytes) : "–"}</div><div class="k">ASQL resident</div></div>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h2>CPU by service</h2><div class="sub">Cores in use, the whole machine is ${s.ncpu}</div>
+        ${stacked(h, cpuSeries, (sm, k) => sm.g[k] ? sm.g[k].cpu : 0, s.ncpu * 100, cores, 230, v => (v / 100).toFixed(0))}</div>
+      <div class="panel"><h2>Memory by service</h2><div class="sub">Resident memory, up to the machine's ${bytes(s.mem.total)}</div>
+        ${stacked(h, memSeries(), memValue, s.mem.total, bytes, 230, v => bytes(v).replace(".0 ", " "))}</div>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h2>Where memory goes now</h2><div class="sub">Reading from ${ago(s.t)}</div>${memBar(s)}</div>
+      ${asqlPanel(name, s)}
+    </div>
+    <div class="grid2">
+      <div class="panel"><h2>Spikes</h2><div class="sub">CPU over 85% for 20 s, memory under 10% free, +512 MB in 5 min, restarts. Kept on the machine, so they are here even when this page was closed.</div>
+        ${(state.events[name] || []).length ? `<ul class="events">${state.events[name].map(eventLine).join("")}</ul>` : `<div class="muted" style="margin-top:10px">No spikes recorded.</div>`}</div>
+      <div class="panel"><h2>Busiest processes</h2><div class="sub">Top by CPU, then the biggest by memory</div>
+        <div class="scroll"><table><thead><tr><th>Process</th><th>Service</th><th class="n">CPU</th><th class="n">Memory</th></tr></thead><tbody>
+        ${procs.map(p => `<tr><td title="pid ${p.pid}">${esc(p.name)}</td><td><i class="sw" style="background:${GCOLOR[p.group]}"></i> ${esc(p.group)}</td><td class="n">${pct(p.cpu)}</td><td class="n">${bytes(p.rss)}</td></tr>`).join("")}
+        </tbody></table></div><div class="note">CPU is percent of one core (400% is four cores busy).</div></div>
+    </div>
+    <div class="panel"><h2>Disk</h2><div class="sub">The watched folders and what in them takes the room</div>${diskPanel(state.disk[name])}</div>`;
+  wireCharts();
+}
+
+async function loadNow(name) {
+  try {
+    state.now[name] = await get(`/m/${encodeURIComponent(name)}/now`); delete state.errs[name];
+  } catch (e) { state.errs[name] = e.message; }
+}
+async function loadHist(name) {
+  try { state.hist[name] = (await get(`/m/${encodeURIComponent(name)}/history?minutes=${state.minutes}&points=300`)).samples; } catch (e) {}
+}
+async function loadEvents(name) {
+  try { state.events[name] = (await get(`/m/${encodeURIComponent(name)}/events?limit=200`)).events; } catch (e) {}
+}
+async function loadDetail() {
+  const name = state.sel; if (!name) return;
+  await Promise.all([
+    get(`/m/${encodeURIComponent(name)}/tables`).then(t => state.tables[name] = t, e => state.tables[name] = {ok: false, error: e.message}),
+    get(`/m/${encodeURIComponent(name)}/disk`).then(d => state.disk[name] = d, e => state.disk[name] = {error: e.message, folders: []}),
+  ]);
+  render();
+}
+
+// Each machine is drawn as its answers come: one that cannot be reached (the app host waits ~15 s for it) holds up
+// nothing else, and is not asked again until its last round is over.
+let tick = 0;
+const busy = {};
+async function refreshOne(m, t) {
+  if (busy[m]) return;
+  busy[m] = true;
+  try {
+    await loadNow(m);
+    render();
+    if (state.errs[m]) return;
+    if (t % 3 === 0 || m === state.sel) await loadHist(m);
+    if (t % 6 === 0 || !state.events[m]) await loadEvents(m);
+    if (m === state.sel && (t % 30 === 0 || !state.tables[m])) await loadDetail();
+    render();
+  } finally { busy[m] = false; }
+}
+function refresh() {
+  const t = tick++;
+  state.machines.forEach(m => refreshOne(m, t));
+  $("#updated").textContent = "Updated " + new Date().toLocaleTimeString() + " · every 10 s";
+}
+
+document.querySelectorAll("#range button").forEach(b => {
+  b.classList.toggle("on", +b.dataset.m === state.minutes);
+  b.onclick = async () => {
+    state.minutes = +b.dataset.m; try { localStorage.setItem("dw.minutes", state.minutes); } catch (e) {}
+    document.querySelectorAll("#range button").forEach(x => x.classList.toggle("on", x === b));
+    await Promise.all(state.machines.map(loadHist)); render();
+  };
+});
+
+(async function start() {
+  try { state.machines = (await get("/machines")).machines; } catch (e) { $("#updated").textContent = "Cannot list machines: " + e.message; return; }
+  if (!state.machines.length) { $("#updated").textContent = "No machines set to watch (the WATCH setting)."; return; }
+  if (!state.machines.includes(state.sel)) state.sel = state.machines[0];
+  render();
+  refresh();
+  setInterval(refresh, 10000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+// What the ASQL engine on this machine says about itself, over its own MySQL wire on loopback.
+
+let ASQL_KEYS = [
+  "Asql_memory_bytes", "Asql_row_index_mem_bytes", "Asql_things_mem_bytes", "Asql_colidx_bytes",
+  "Asql_probe_index_mem_bytes", "Asql_cache_bytes", "Asql_query_memory_reserved", "Asql_query_memory_peak",
+  "Asql_query_memory_budget", "Asql_resident_bytes", "Asql_malloc_live_bytes", "Asql_malloc_free_bytes",
+  "Asql_total_rows", "Asql_total_tables", "Asql_slow_queries", "Asql_errors", "Asql_delta_buffer_rows",
+  "Asql_process_cpu_pct", "Queries", "Threads_connected", "Uptime"
+]
+
+fn asql_cfg() {
+  return {
+    "host": setting("ASQL_HOST", "127.0.0.1"),
+    "port": int(setting("ASQL_PORT", "3307")),
+    "user": setting("ASQL_USER", "erp"),
+    "password": secret_value("ASQL_PASSWORD")
+  }
+}
+
+// The positional form: db_connect(map) is newer than st's and cleve-ny-1's aios.
+fn asql_connect() {
+  let c = asql_cfg()
+  return db_connect(c.host, c.port, c.user, c.password)
+}
+
+// Whether to ask at all: a machine with no engine configured (no password) has none to ask.
+fn asql_configured() { return secret_value("ASQL_PASSWORD") != "" }
+
+fn num(v) {
+  let t = type(v)
+  if t == "int" or t == "real" { return v }
+  if v == nil or v == "" { return 0 }
+  let r = pcall(real, str(v))
+  if not r.ok { return 0 }
+  return r.value == floor(r.value) ? int(r.value) : r.value
+}
+
+// {ok, status: {key: number}} or {ok: false, error}. A connection of its own, closed after.
+fn asql_status() {
+  let c = asql_connect()
+  if not c.ok { return {"ok": false, "error": str(c.error)} }
+  let r = db_query(c, "SHOW GLOBAL STATUS")
+  db_close(c)
+  if not r.ok { return {"ok": false, "error": str(r.error)} }
+  let all = {}
+  for row in r.records {
+    let ks = keys(row)
+    let k = row.Variable_name ?? row[ks[0]]
+    all[k] = row.Value ?? row[ks[1]]
+  }
+  let out = {}
+  for k in ASQL_KEYS { if has(all, k) { out[k] = num(all[k]) } }
+  return {"ok": true, "status": out}
+}
+
+let SYSTEM_DBS = {"information_schema": true, "mysql": true, "performance_schema": true, "sys": true}
+
+// The tables holding the most memory: the engine's own Data_length (encoded columns) and Index_length (its indexes)
+// from SHOW TABLE STATUS, every database it holds.
+fn asql_tables(limit) {
+  let c = asql_connect()
+  if not c.ok { return {"ok": false, "error": str(c.error)} }
+  defer db_close(c)
+  let dbs = db_query(c, "SHOW DATABASES")
+  if not dbs.ok { return {"ok": false, "error": str(dbs.error)} }
+  let rows = []
+  for d in dbs.records {
+    let name = values(d)[0]
+    if has(SYSTEM_DBS, lower(name)) { continue }
+    let r = db_query(c, "SHOW TABLE STATUS FROM `" + replace(name, "`", "``") + "`")
+    if not r.ok { continue }
+    for t in r.records {
+      if t.Comment == "VIEW" { continue }
+      let data = num(t.Data_length)
+      let index = num(t.Index_length)
+      push(rows, {"db": name, "table": t.Name, "rows": num(t.Rows), "data": data, "index": index, "bytes": data + index})
+    }
+  }
+  let top = take(sort_by(rows, fn (t) { return t.bytes }, "desc"), limit)
+  return {"ok": true, "t": time(), "tables": top, "count": len(rows), "bytes": total_of(rows, fn (t) { return t.bytes })}
+}

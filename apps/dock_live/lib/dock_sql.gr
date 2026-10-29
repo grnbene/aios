@@ -1,0 +1,163 @@
+// What the loading dock is doing, read inside the engine: which truck is on which bay, which orders that truck
+// carries, and each order line's pick - for things/dock_bay.gr, counting what the v8 PHP serves the dock screens
+// (catalog/controller/apir/oms/dispatching.php getassignedpicks / getbayorders, model oms/orders.php).
+//
+// Only the engine's read/read_raw and pure builtins: this file runs inside a Thing.
+
+// A bay is a dock door (loadingbays.bay_id 1-3 on the loading TV, 4-5 on the parcel screen). Rows on bay 0 are
+// leftovers from before bays had numbers and are never on a screen.
+let MIN_BAY = 1
+
+fn s(v) { return v == nil ? "" : str(v) }
+fn n(v) { return v == nil or str(v) == "" ? 0.0 : real(v) }
+
+// The truck on each bay now: the loading the screens show (completed = 0, active = 1), and of two on one bay the
+// one the TV shows - model weberp/dispatching getBayStatus: lowest priority first, then the first row.
+// -> bay -> {bay, id, dispnumber, truckid, timeassigned, timestarted}
+fn active_loadings() {
+  let out = {}
+  for r in read("SELECT id, bay_id, dispnumber, truckid, timeassigned, timestarted FROM loadingbays " +
+                "WHERE completed = 0 AND active = 1 AND bay_id >= ? ORDER BY bay_id, priority, id", MIN_BAY) {
+    if has(out, s(r.bay_id)) { continue }
+    out[s(r.bay_id)] = {"bay": s(r.bay_id), "id": r.id, "dispnumber": s(r.dispnumber), "truckid": s(r.truckid),
+                        "timeassigned": s(r.timeassigned), "timestarted": s(r.timestarted)}
+  }
+  return out
+}
+
+// truckid -> bay, from active_loadings()
+fn bay_by_truck(loadings) {
+  let m = {}
+  for b in keys(loadings) { m[loadings[b].truckid] = b }
+  return m
+}
+
+// The orders a truck carries, as dispatch lists them for the loading screens (invoice set, not cleared from the
+// run, stops and checkpoints - type 0 - left out), in run order.
+fn truck_orders(truckids) {
+  if len(truckids) == 0 { return [] }
+  return read("SELECT invoice, truckid, type, sort, customerno, branchcode, driveruserid FROM dispatch " +
+              "WHERE truckid IN (?) AND invoice <> '' AND COALESCE(cleared, 0) <> 1 AND type <> 0 ORDER BY sort", truckids)
+}
+
+// The bays an order is on now (zero or one), through its dispatch row.
+fn bays_of_orders(ordernos) {
+  let want = compact(ordernos)
+  if len(want) == 0 { return [] }
+  let loadings = active_loadings()
+  let by_truck = bay_by_truck(loadings)
+  if len(by_truck) == 0 { return [] }
+  let out = []
+  for d in read("SELECT DISTINCT truckid FROM dispatch WHERE invoice IN (?) AND COALESCE(cleared, 0) <> 1", map(want, s)) {
+    let b = by_truck[s(d.truckid)]
+    if b != nil { push(out, b) }
+  }
+  return unique(out)
+}
+
+// Order lines as the dock sees them: one per item (a line entered twice is one), open lines first - an order whose
+// lines are all completed shows them all - fees (tagalong) left out. Items whose product type needs no pick count
+// as picked and loaded, as the TV forces them loaded.
+// -> orderno -> [{line, stockid, description, qty, pickable}]
+fn order_lines(ordernos) {
+  let out = {}
+  if len(ordernos) == 0 { return out }
+  let fees = {}
+  for f in read_raw("SELECT stockid FROM tagalong") { fees[f.stockid] = true }
+  let pickable = {}
+  for t in read_raw("SELECT label FROM product_types WHERE requirespick = 1") { pickable[t.label] = true }
+  let rows = read("SELECT d.orderno, d.orderlineno, d.stkcode, d.quantity, COALESCE(d.completed, 0) AS completed, " +
+                  "sm.description, sm.mbflag FROM salesorderdetails d LEFT JOIN stockmaster sm ON sm.stockid = d.stkcode " +
+                  "WHERE d.orderno IN (?) ORDER BY d.orderno, d.orderlineno", ordernos)
+  let open_of = {}
+  for r in rows { if r.completed != 1 { open_of[s(r.orderno)] = true } }
+  for r in rows {
+    let o = s(r.orderno)
+    if has(fees, s(r.stkcode)) { continue }
+    if has(open_of, o) and r.completed == 1 { continue }
+    let lines = get_or_put(out, o, [])
+    let same = nil
+    for l in lines { if l.stockid == s(r.stkcode) { same = l } }
+    if same != nil {
+      same.qty = same.qty + n(r.quantity)
+    } else {
+      push(lines, {"line": s(r.orderlineno), "stockid": s(r.stkcode), "description": s(r.description),
+                   "qty": n(r.quantity), "pickable": r.mbflag == nil or has(pickable, s(r.mbflag))})
+    }
+  }
+  return out
+}
+
+// The pick rows of some orders: orderno|line -> [rows] in pick_id order (a line picked from two bins has a row
+// per bin).
+fn pick_rows(ordernos) {
+  let out = {}
+  if len(ordernos) == 0 { return out }
+  for r in read("SELECT pick_id, orderno, linenumber, stockid, bin, pick, picked, loaded, claimed, claimed_user, " +
+                "claimed_date, date_created, date_pickupdate, userid, pickstatus FROM pickingfreeze WHERE orderno IN (?) ORDER BY pick_id", ordernos) {
+    push(get_or_put(out, s(r.orderno) + "|" + s(r.linenumber), []), r)
+  }
+  return out
+}
+
+// The columns a Thing here shows or is placed by, per table. A change that leaves all of them alone (the stock
+// figures pickingfreeze rewrites as stock moves - qoh, avail; a dispatch row's position, ETA and status) changes
+// nothing on a screen, so touched() lets it pass instead of recomputing under the engine's lock, which every other
+// Thing's readers - the touches report, the sticker feed - are waiting on meanwhile.
+let USED = {
+  "pickingfreeze": ["pick_id", "orderno", "linenumber", "stockid", "bin", "pick", "picked", "loaded", "claimed", "claimed_user",
+                    "claimed_date", "date_created", "date_pickupdate", "userid", "pickstatus", "completed", "invoiced", "cleared"],
+  "dispatch": ["invoice", "truckid", "type", "sort", "cleared", "customerno", "branchcode", "driveruserid"],
+  "salesorderdetails": ["orderno", "orderlineno", "stkcode", "quantity", "completed"],
+  "trucks": ["truck_id", "truck_name", "truck_driver", "truck_phone"],
+  "custbranch": ["debtorno", "branchcode", "brname"]
+}
+
+// True when an update changed none of the columns a screen uses (an insert or delete always matters).
+fn unchanged(table, before, after) {
+  let cols = USED[table]
+  if cols == nil or before == nil or after == nil { return false }
+  for c in cols { if s(before[c]) != s(after[c]) { return false } }
+  return true
+}
+
+// A time as the screens use it: "YYYY-MM-DD HH:MM:SS" (Cleve's local time), or "" for a time never set - MariaDB's
+// zero date, which pickingfreeze uses for "not picked by scan yet".
+fn when(v) {
+  let t = s(v)
+  if len(t) < 19 or slice(t, 0, 4) == "0000" { return "" }
+  return slice(t, 0, 19)
+}
+
+// A line's pick from its rows: quantities summed across bins (getPickingFreezeLoaded), the bin and picker of its
+// first row, and who holds a claim on any of them - a claim is per row, so the first row alone can miss it.
+// Its clocks, from the rows' own times:
+//   released_at  the earliest row frozen for picking (date_created): how long it has waited for a picker
+//   claim_at     when someone claimed it (claimed_date, only when a claimer is named - the column defaults to the
+//                row's creation, so on an unclaimed row it means nothing)
+//   picked_at    the last pick scan (date_pickupdate; empty for a line picked other than by scan)
+// Nothing records when a line went on the truck; the bay's loading clock (timestarted) covers loading.
+fn line_pick(rows) {
+  let p = {"pick": 0.0, "picked": 0.0, "loaded": 0.0, "bin": "", "picker": "", "claimed_by": "", "claimed_at": "",
+           "claim_at": "", "released_at": "", "picked_at": "", "frozen": rows != nil and len(rows) > 0}
+  if not p.frozen { return p }
+  p.bin = s(rows[0].bin)
+  p.picker = s(rows[0].userid)
+  for r in rows {
+    p.pick = p.pick + n(r.pick)
+    p.picked = p.picked + n(r.picked)
+    p.loaded = p.loaded + n(r.loaded)
+    let made = when(r.date_created)
+    if made != "" and (p.released_at == "" or made < p.released_at) { p.released_at = made }
+    p.picked_at = max(p.picked_at, when(r.date_pickupdate))
+    if not is_blank(r.claimed_user) {
+      let at = when(r.claimed_date)
+      if at != "" and (p.claim_at == "" or at < p.claim_at) { p.claim_at = at }
+      if p.claimed_by == "" and s(r.claimed) == "1" {
+        p.claimed_by = s(r.claimed_user)
+        p.claimed_at = at
+      }
+    }
+  }
+  return p
+}

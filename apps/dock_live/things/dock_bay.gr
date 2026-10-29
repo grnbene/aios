@@ -1,0 +1,153 @@
+// dock_bay - an ASQL Thing: a loading-dock door and the truck on it, kept current by the engine.
+//
+// Key: the bay ("1".."5", loadingbays.bay_id). Values: the loading on it now (dispnumber, truck, driver, when it was
+// assigned), the orders that truck carries in run order with each line's pick - quantity, picked, loaded, bin, who
+// picked it and who holds a claim on it - and the bay's totals. A bay with no truck on it keeps its row with
+// `dispnumber` empty, so a screen can tell "free" from "gone".
+//
+// A claim, a scan or a load on any device writes pickingfreeze in Cleve's MariaDB; the row reaches this engine by
+// CDC and touched() names the one bay whose truck carries that order, so only that bay is rebuilt and only it wakes
+// the screens watching (WAIT THING dock_bay). Assigning or completing a truck rebuilds the bay(s) it moved on.
+
+import "../lib/dock_sql.gr"
+
+let DAY_SAFE = true   // nothing here depends on the clock
+
+fn enroll() {
+  let out = []
+  for r in read("SELECT DISTINCT bay_id FROM loadingbays WHERE bay_id >= ?", MIN_BAY) { push(out, s(r.bay_id)) }
+  return out
+}
+
+fn shared() { return {} }
+
+fn things(ks, sh) {
+  let want = {}
+  for k in ks { want[s(k)] = true }
+  let loadings = active_loadings()
+  let by_truck = bay_by_truck(loadings)
+  let trucks_wanted = []
+  for b in keys(want) { if loadings[b] != nil { push(trucks_wanted, loadings[b].truckid) } }
+
+  let truck_info = {}
+  if len(trucks_wanted) > 0 {
+    for t in read("SELECT truck_id, truck_name, truck_driver, truck_phone FROM trucks WHERE truck_id IN (?)", trucks_wanted) {
+      truck_info[s(t.truck_id)] = t
+    }
+  }
+
+  let stops = truck_orders(trucks_wanted)
+  let ordernos = map(stops, fn (d) { return s(d.invoice) })
+  let names = {}
+  if len(stops) > 0 {
+    for c in read("SELECT d.invoice, cb.brname FROM dispatch d JOIN custbranch cb ON cb.debtorno = d.customerno AND cb.branchcode = d.branchcode " +
+                  "WHERE d.invoice IN (?) AND COALESCE(d.cleared, 0) <> 1", ordernos) {
+      names[s(c.invoice)] = s(c.brname)
+    }
+  }
+  let lines_of = order_lines(ordernos)
+  let picks_of = pick_rows(ordernos)
+
+  let out = {}
+  for b in keys(want) {
+    let l = loadings[b]
+    let bay = {"bay": b, "dispnumber": "", "loading_id": "", "truckid": "", "truck": "", "driver": "", "phone": "",
+               "timeassigned": "", "timestarted": "", "unclaimed_since": "", "orders": [],
+               "units": 0.0, "picked": 0.0, "loaded": 0.0, "lines": 0, "lines_open": 0, "lines_unclaimed": 0, "orders_done": 0}
+    if l != nil {
+      let t = truck_info[l.truckid] ?? {}
+      bay.dispnumber = l.dispnumber
+      bay.loading_id = s(l.id)
+      bay.truckid = l.truckid
+      bay.truck = s(t.truck_name)
+      // The driver is on the run's dispatch rows (driveruserid, the name the dispatcher picked), not on the truck -
+      // trucks.truck_driver is empty at Cleve. The name most of its rows carry; the truck's own as a fallback.
+      let seen = {}
+      for d in stops {
+        if s(d.truckid) != l.truckid { continue }
+        let who = trim(s(d.driveruserid))
+        if who != "" { seen[who] = (seen[who] ?? 0) + 1 }
+      }
+      let best = ""
+      for who in keys(seen) { if best == "" or seen[who] > seen[best] { best = who } }
+      bay.driver = best != "" ? best : s(t.truck_driver)
+      bay.phone = s(t.truck_phone)
+      bay.timeassigned = when(l.timeassigned)
+      bay.timestarted = when(l.timestarted)
+      for d in stops {
+        if s(d.truckid) != l.truckid { continue }
+        let o = s(d.invoice)
+        let credit = s(d.type) == "11"
+        let order = {"orderno": o, "customer": names[o] ?? "", "sort": n(d.sort), "credit": credit, "lines": [],
+                     "units": 0.0, "picked": 0.0, "loaded": 0.0}
+        if not credit {
+          for ln in lines_of[o] ?? [] {
+            let p = line_pick(picks_of[o + "|" + ln.line])
+            let qty = ln.qty
+            // no pick needed (a fee-like item, or an item never frozen for picking): picked and loaded as the TV
+            // counts it
+            let forced = not ln.pickable
+            let picked = forced ? qty : p.picked
+            let loaded = forced ? qty : p.loaded
+            let line = {"line": ln.line, "stockid": ln.stockid, "description": ln.description, "qty": qty,
+                        "pick": p.frozen ? p.pick : qty, "picked": picked, "loaded": loaded, "bin": p.bin,
+                        "picker": p.picker, "claimed_by": p.claimed_by, "claimed_at": p.claimed_at, "pickable": ln.pickable,
+                        "released_at": p.released_at, "claim_at": p.claim_at, "picked_at": p.picked_at}
+            push(order.lines, line)
+            order.units = order.units + qty
+            order.picked = order.picked + min(picked, qty)
+            order.loaded = order.loaded + min(loaded, qty)
+            bay.lines = bay.lines + 1
+            if picked < qty {
+              bay.lines_open = bay.lines_open + 1
+              if line.claimed_by == "" {
+                bay.lines_unclaimed = bay.lines_unclaimed + 1
+                // the longest a line on this truck has waited for anyone to take it
+                if p.released_at != "" and (bay.unclaimed_since == "" or p.released_at < bay.unclaimed_since) {
+                  bay.unclaimed_since = p.released_at
+                }
+              }
+            }
+          }
+        }
+        if credit or (order.units > 0 and order.loaded >= order.units) { bay.orders_done = bay.orders_done + 1 }
+        bay.units = bay.units + order.units
+        bay.picked = bay.picked + order.picked
+        bay.loaded = bay.loaded + order.loaded
+        push(bay.orders, order)
+      }
+      // the screens load the last stop first: highest sort on top, as getassignedpicks hands them over
+      bay.orders = sort_by(bay.orders, fn (o) { return -o.sort })
+    }
+    // a list is kept as JSON text, which thing_rows reads back as the list
+    bay.orders = json_stringify(bay.orders)
+    out[b] = bay
+  }
+  return out
+}
+
+// Which bays a change moves. A row is placed by the bay its order's truck is on, before and after the change (an
+// order moved between trucks leaves one bay and joins another).
+fn touched(table, op, before, after, sh) {
+  let t = lower(table)
+  if unchanged(t, before, after) { return [] }
+  let rows = compact([before, after])
+  if t == "loadingbays" {
+    return unique(compact(map(rows, fn (r) { return n(r.bay_id) >= MIN_BAY ? s(r.bay_id) : nil })))
+  }
+  if t == "trucks" {
+    let by_truck = bay_by_truck(active_loadings())
+    return unique(compact(map(rows, fn (r) { return by_truck[s(r.truck_id)] })))
+  }
+  if t == "dispatch" {
+    let by_truck = bay_by_truck(active_loadings())
+    return unique(compact(map(rows, fn (r) { return by_truck[s(r.truckid)] })))
+  }
+  if t == "pickingfreeze" or t == "salesorderdetails" {
+    return bays_of_orders(map(rows, fn (r) { return s(r.orderno) }))
+  }
+  if t == "custbranch" or t == "tagalong" or t == "product_types" { return "all" }
+  // stockmaster: a description edit waits for the bay's next change rather than rebuilding every bay on every
+  // cost update
+  return nil
+}

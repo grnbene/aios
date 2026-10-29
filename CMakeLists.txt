@@ -68,6 +68,10 @@ file(GLOB_RECURSE AIOS_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 # The host boundary is picked here and nowhere else: exactly one platform's
 # implementation of hal::Host / hal::net / hal::block is compiled in. Every
 # line above hal/ is the same source on every host.
+# src/hal/wasm_host.cpp is the page's host: only grain/wasm/wasm.cmake builds it
+# (it names it), never a native binary - it uses Linux spellings (st_mtim) that
+# macOS does not have.
+list(FILTER AIOS_SOURCES EXCLUDE REGEX "/src/hal/wasm_")
 if(APPLE)
   list(FILTER AIOS_SOURCES EXCLUDE REGEX "/src/hal/(linux_|win_)")
   set(AIOS_HOST_BOUNDARY "macOS (src/hal/mac_*.cpp)")

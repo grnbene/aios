@@ -1,0 +1,24 @@
+// Dock Live application manifest.
+// The loading dock as it is now, for the wall TV and the pick/load screens: /bays and /picks (JSON), /stream
+// (server-sent events, pushed when the dock_bay / dock_pick Things change) and the wall board at /.
+// Reads ASQL only; every write (claim, pick, load) stays with the v8 PHP API.
+let app = {
+  "name": "dock_live",
+  "description": "loading dock live: bays, picks and claims pushed to the dock screens",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8577,
+  "listen": "local",
+  "settings": {
+    "DB_HOST": "127.0.0.1",
+    "DB_PORT": "3307",
+    "DB_USER": "root",
+    "DB_NAME": "versioneight"
+  },
+  "secrets": ["DB_PASSWORD"],
+  "requires": ["db"],
+  "health": {"path": "/health", "ok": [200]},
+  "check": "checks.gr",
+  "deployed": "deployed.gr",
+  "max_steps": 0
+}

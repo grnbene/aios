@@ -1,0 +1,50 @@
+// Where the disk goes: each watched folder's size and its biggest children, by walking it (list_dir gives each
+// entry's size). The app runs as its own user, so a folder that user cannot read is reported as such, not as empty.
+
+// Size of one tree, counting at most `budget.left` entries. list_dir follows a symbolic link, so depth is capped too.
+fn tree_size(path, budget, depth) {
+  if budget.left <= 0 { budget.partial = true; return 0 }
+  let got = pcall(list_dir, path)
+  if not got.ok { budget.unreadable = budget.unreadable + 1; return 0 }
+  let total = 0
+  for e in got.value {
+    budget.left = budget.left - 1
+    if budget.left <= 0 { budget.partial = true; break }
+    if e.dir {
+      if depth < 24 { total = total + tree_size(path + "/" + e.name, budget, depth + 1) }
+    } else {
+      total = total + e.size
+    }
+  }
+  return total
+}
+
+// One watched folder: its total and its children, biggest first.
+fn folder_report(root, max_entries) {
+  let budget = {"left": max_entries, "partial": false, "unreadable": 0}
+  let started = time()
+  let top = pcall(list_dir, root)
+  if not top.ok { return {"path": root, "ok": false, "error": str(top.error)} }
+  let kids = []
+  for e in top.value {
+    let p = root + "/" + e.name
+    let size = e.dir ? tree_size(p, budget, 1) : e.size
+    push(kids, {"name": e.name, "dir": e.dir, "bytes": size})
+  }
+  kids = sort_by(kids, fn (k) { return k.bytes }, "desc")
+  return {
+    "path": root, "ok": true,
+    "bytes": total_of(kids, fn (k) { return k.bytes }),
+    "children": take(kids, 12),
+    "others": max(0, len(kids) - 12),
+    "partial": budget.partial,
+    "unreadable": budget.unreadable,
+    "took_s": round(time() - started, 1)
+  }
+}
+
+fn disk_report(paths, max_entries) {
+  let out = []
+  for p in paths { if file_exists(p) { push(out, folder_report(p, max_entries)) } }
+  return {"t": time(), "folders": out}
+}

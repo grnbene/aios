@@ -154,6 +154,11 @@ Driven on a private local fleet (hub and two app hosts, 2026-10-27): a route on 
 500 ms, asked through member B, delivered them 0.50 s apart, each from A; a client that left after 1.2 s ended A's
 route ("reader gone"); a plain route on A came back whole through B.
 
+The member may also be a machine in no fleet, linked to this one with `node connect <host> <port> @<token file>`
+(it runs `node serve <port> @<token file>` beside its app host): `on_machine` takes its kernel id or a prefix, found
+among the links this machine made, and the request goes to that link's device. Such a link is not re-dialed when it
+drops; restart the app host that made it. `apps/deploywatch` reaches st this way, which is kept out of the fleet.
+
 A whole pane can be given to a member the same way: `ui.pane({..., "machine": member})`. Every request of the pane -
 the page, its actions (`/_ui/event`), its push (the page's own event stream) and its routes - is answered by that
 member's copy of the app, whose session it is (the cookie comes from there); this machine starts no copy of the

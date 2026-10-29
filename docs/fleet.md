@@ -129,10 +129,10 @@ own attach key, and can require a TPM quote when it joins.
 
 ### Keeping the key off the command line
 
-`fleet join`, `fleet observe`, `fleet hub` and `node serve` accept `@FILE`,
-which reads the key from the first line of a file, and `env:NAME`, which reads
-it from that environment variable (`fleet_key_arg`). Either keeps it out of
-`ps`. `node connect` still takes the token only as an argument.
+`fleet join`, `fleet observe`, `fleet hub`, `node serve` and `node connect`
+accept `@FILE`, which reads the key from the first line of a file, and
+`env:NAME`, which reads it from that environment variable (`fleet_key_arg`).
+Either keeps it out of `ps`.
 
 ### Binding
 
