@@ -24597,12 +24597,17 @@ bool SqlDatabase::kill_session(uint64_t id, bool query_only) {
   return true;
 }
 
+// Counted for SHOW STATUS: reads ended by the deadline, statements ended because their client hung up.
+static std::atomic<uint64_t> g_read_deadline_kills{0}, g_hangup_kills{0};
+void SqlDatabase::note_hangup_kill() { g_hangup_kills.fetch_add(1, std::memory_order_relaxed); }
+
 bool sql_interrupted() {
   if (!tls_kill) return false;
   if (tls_kill->load(std::memory_order_relaxed) != 0) return true;
   if (tls_read_deadline_ns && steady_now_ns() > tls_read_deadline_ns) {
     uint8_t none = 0;
-    tls_kill->compare_exchange_strong(none, 1);   // as KILL QUERY: the gateway reports "interrupted" and clears it
+    // as KILL QUERY: the gateway reports "interrupted" and clears it (counted once, by whichever thread got there)
+    if (tls_kill->compare_exchange_strong(none, 1)) g_read_deadline_kills.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   return false;
@@ -49144,6 +49149,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_row_index_mem_bytes", std::to_string(total_row_index_mem)},
       {"Asql_pk_runs_to_slots", std::to_string(PkMap::runs_to_slots_count().load(std::memory_order_relaxed))},
       {"Asql_row_index_evictions", std::to_string(metrics_.row_index_evictions.load(std::memory_order_relaxed))},
+      {"Asql_read_deadline_kills", std::to_string(g_read_deadline_kills.load(std::memory_order_relaxed))},
+      {"Asql_hangup_kills", std::to_string(g_hangup_kills.load(std::memory_order_relaxed))},
       {"Asql_row_index_rows_indexed", std::to_string(metrics_.row_index_rows_indexed.load(std::memory_order_relaxed))},
       {"Asql_rss_bytes", std::to_string(rss_bytes)},   // the footprint: on macOS resident + compressed + swapped
       {"Asql_resident_bytes", std::to_string(get_process_rss_bytes())},

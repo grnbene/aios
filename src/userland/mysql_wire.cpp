@@ -2659,7 +2659,18 @@ class HangupWatcher {
       if (n <= 0) continue;
       for (size_t i = 0; i < fds.size(); ++i) {
         if (!(fds[i].revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL))) continue;
-        SqlDatabase::kill_session(ids[i], true);
+        // Still mid-statement? The list was copied before the poll, and a client that got its answer and closed
+        // during those 100 ms is not a hang-up (it was counted as one).
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          bool busy = false;
+          for (const Busy& b : busy_) if (b.conn_id == ids[i] && b.fd == fds[i].fd) { busy = true; break; }
+          if (!busy) continue;
+        }
+        const bool killed = SqlDatabase::kill_session(ids[i], true);
+        if (killed) SqlDatabase::note_hangup_kill();
+        static const bool trace = std::getenv("AIOS_HANGUP_TRACE") != nullptr;
+        if (trace) std::fprintf(stderr, "[hangup] connection %llu fd %d revents 0x%x: %s\n", (unsigned long long)ids[i], fds[i].fd, (unsigned)fds[i].revents, killed ? "statement killed" : "no session");
         unwatch(ids[i]);   // once: the statement ends on its own from here
       }
     }
