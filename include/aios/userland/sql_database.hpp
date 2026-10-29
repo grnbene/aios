@@ -1202,7 +1202,7 @@ class PkMap {
   explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash), runs_(runs_enabled()) {}
   void clear() {
     slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false;
-    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); late_.clear(); shape_ = 0;
+    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); late_.clear(); shape_ = 0; pair_swap_ = false;
   }
   void reserve(size_t n) { if (runs_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
@@ -1505,6 +1505,27 @@ class PkMap {
     late_upto(0, true);
     std::vector<Run>().swap(late_);
     std::vector<uint64_t>().swap(gone_);
+    // Nearly a run a key, and the keys are pairs: the other packing may make runs of them (see pair_swap_).
+    if (ok && shape_ == 2 && !pair_swap_ && fresh.size() * 2 > n + 64) {
+      std::vector<std::pair<uint64_t, uint32_t>> all;   // (swapped key, id)
+      all.reserve(n);
+      bool fits = true;
+      for (const Run& r : fresh) {
+        for (uint32_t j = 0; j < r.n && fits; ++j) {
+          const uint64_t k = r.key + j, a = k >> kPairLowBits, b = k & ((1ull << kPairLowBits) - 1);
+          if (a >= (1ull << kPairLowBits)) { fits = false; break; }
+          all.push_back({(b << kPairLowBits) | a, r.val + j});
+        }
+        if (!fits) break;
+      }
+      if (fits) {
+        std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return int_less(x.first, y.first); });
+        std::vector<Run> swapped;
+        bool ok2 = true;
+        for (const auto& [k, v] : all) if (!(ok2 = append_run(swapped, k, v))) break;
+        if (ok2 && swapped.size() * 2 <= fresh.size()) { pair_swap_ = true; swapped.shrink_to_fit(); fresh.swap(swapped); }
+      }
+    }
     fresh.shrink_to_fit();
     runs_v_.swap(fresh);
     count_ = n;
@@ -1572,15 +1593,23 @@ class PkMap {
   bool int_key(const std::string& key, uint64_t* v, bool adopt = false) {
     int shape = 0;
     if (as_int(key, v)) shape = 1;
-    else if (as_pair(key, v)) shape = 2;
+    else if (as_pair(key, v, pair_swap_)) shape = 2;
     else return false;
     if (shape_ == 0 && adopt && !text_) shape_ = shape;
     return shape == shape_;
   }
   std::string int_text(uint64_t k) const {
-    if (shape_ == 2) return std::to_string(k >> kPairLowBits) + '\x1f' + std::to_string(k & ((1ull << kPairLowBits) - 1)) + '\x1f';
+    if (shape_ == 2) {
+      const uint64_t hi = k >> kPairLowBits, lo = k & ((1ull << kPairLowBits) - 1);
+      return pair_swap_ ? std::to_string(lo) + '\x1f' + std::to_string(hi) + '\x1f' : std::to_string(hi) + '\x1f' + std::to_string(lo) + '\x1f';
+    }
     return std::to_string((int64_t)k) + '\x1f';
   }
+  // A two-column key packed with its second column first: an order's lines (orderlineno, orderno) arrive line by
+  // line within the order, so packed (line << 24 | order) every key was a run of its own; packed (order << 24 |
+  // line) an order's lines are one run. Chosen at a fold when it halves the runs (every key re-packed, the second
+  // column must fit 24 bits); a lookup packs the same way from then on.
+  bool pair_swap_ = false;
   // A canonical integer's digits [p, p+n): no sign handling (the pair's parts are non-negative), no leading zero.
   static bool canon_uint(const char* p, size_t n, uint64_t* v) {
     if (n == 0 || n > 19 || (p[0] == '0' && n > 1)) return false;
@@ -1590,13 +1619,14 @@ class PkMap {
     return true;
   }
   // "<a>\x1f<b>\x1f": a two-column integer key, packed (a << 24 | b) when both fit; the packing keeps the key order.
-  static bool as_pair(const std::string& key, uint64_t* v) {
+  static bool as_pair(const std::string& key, uint64_t* v, bool swap = false) {
     const size_t n = key.size();
     if (n < 4 || key[n - 1] != '\x1f') return false;
     const size_t mid = key.find('\x1f');
     if (mid == std::string::npos || mid + 1 >= n - 1) return false;
     uint64_t a = 0, b = 0;
     if (!canon_uint(key.data(), mid, &a) || !canon_uint(key.data() + mid + 1, n - 1 - (mid + 1), &b)) return false;
+    if (swap) std::swap(a, b);
     if (a >= (1ull << (63 - kPairLowBits)) || b >= (1ull << kPairLowBits)) return false;
     *v = (a << kPairLowBits) | b;
     return true;

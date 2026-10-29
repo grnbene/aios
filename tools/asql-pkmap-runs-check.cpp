@@ -221,6 +221,26 @@ int main() {
        "and %zu bytes for %zu keys (%.1f a key; loaded %.1f; slots ~24, and 53 before this)", m.memory_bytes(), ref.size(), (double)m.memory_bytes() / ref.size(), (double)loaded / (row - 50000));
   }
 
+  // ---- a two-column key that arrives with its second column the slow one: salesorderdetails (orderlineno, orderno)
+  // comes line by line within the order, so packed first-column-first every key was a run of its own; the other
+  // packing makes an order's lines one run, and the map adopts it at a fold when that halves the runs ----
+  {
+    auto pk2 = [](long long a, long long b) { return std::to_string(a) + '\x1f' + std::to_string(b) + '\x1f'; };
+    PkMap m;
+    std::map<std::string, uint32_t> ref;
+    uint32_t row = 0;
+    for (long long order = 1; order <= 100000; ++order)
+      for (long long line = 1; line <= 3; ++line) { m.emplace(pk2(line, order), row); ref[pk2(line, order)] = row; ++row; }
+    OK(m.runs_mode() && m.size() == 300000, "300k (line, order) keys, line the fast column: still runs");
+    OK(m.memory_bytes() < 100000 * 16 * 3 / 2 + 65536, "and %zu bytes: a run an order, not a run a key (%.1f a key)", m.memory_bytes(), (double)m.memory_bytes() / 300000);
+    size_t bad = 0;
+    for (const auto& e : ref) { auto it = m.find(e.first); if (it == m.end() || it->second != e.second) ++bad; }
+    OK(bad == 0 && m.find(pk2(4, 50)) == m.end() && m.find(pk2(1, 100001)) == m.end(), "every key found with its row after the re-packing, absent ones not");
+    m.erase(pk2(2, 777));
+    m[pk2(3, 777)] = 5;
+    OK(m.find(pk2(2, 777)) == m.end() && m.find(pk2(3, 777))->second == 5 && m.find(pk2(1, 777))->second == ref[pk2(1, 777)], "erase and re-point still work on the re-packed map");
+  }
+
   // ---- folding the gaps after deletes: entries out, ids above them down, still runs ----
   {
     PkMap m;
