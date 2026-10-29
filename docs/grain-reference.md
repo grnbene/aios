@@ -199,6 +199,14 @@ Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, 
 | `group_by` | `group_by(list, key_fn)` | Groups items into a map of lists keyed by `key_fn(item)`. |
 | `key_by` | `key_by(list, key_fn)` | Maps list into dictionary keyed by `key_fn(item)` (first wins). |
 | `sum_by` | `sum_by(list, key_fn, val_fn)` | Groups items and aggregates totals per key. |
+| `sum` | `sum(list)` | The items added as `sum_by` adds them: integers stay integers, decimals exact, otherwise a real; `nil` items count nothing; `0` for an empty list. |
+| `chunk` | `chunk(list, n)` | The list in pieces of `n` (the last one shorter): `chunk([1,2,3,4,5], 2)` is `[[1,2],[3,4],[5]]`. |
+| `partition` | `partition(list, fn)` | `[items fn is true for, the rest]`, each in order. |
+| `take_while` | `take_while(list, fn)` | The leading items `fn` is true for. |
+| `drop_while` | `drop_while(list, fn)` | Everything after the leading items `fn` is true for. |
+| `min_by` / `max_by` | `min_by(list, fn)` | The item whose `fn(item)` is least / greatest (keys ordered as `sort_by` orders them); the first of equals; `nil` for an empty list. |
+| `find_index` | `find_index(list, fn)` | The index of the first item `fn` is true for, `-1` when none. |
+| `zip_with` | `zip_with(a, b, fn)` | `fn(a[i], b[i])` for each pair, as long as the shorter list. |
 | `unique` / `dedup` | `unique(list)` | Returns a list with consecutive or duplicate items removed. |
 | `flatten` | `flatten(list, [depth])` | Flattens nested lists up to `depth` levels (default 1). |
 | `concat` | `concat(...lists)` | Concatenates multiple lists into a single list. |
