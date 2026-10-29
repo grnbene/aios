@@ -5,11 +5,11 @@
 // Light and dark, as warehouse_touches does it: the system's until someone picks (the toggle, or ?theme= on the link
 // for a TV with no mouse), then that, kept in the screen's localStorage. The state colours keep their meaning in both;
 // only their text and wash change so a yellow "NO CLAIM" stays readable on white.
-let THEME_LIGHT = "--bg: #f4f6f8; --panel: #ffffff; --line: #dfe3e8; --text: #161c24; --muted: #5c6877; --strong: #090c0f; --track: #e6eaee; " +
+let THEME_LIGHT = "--bg: #f4f6f8; --panel: #ffffff; --line: #dfe3e8; --text: #161c24; --muted: #434d59; --strong: #090c0f; --track: #e6eaee; " +
                   "--open: #c4262e; --open-ink: #ffffff; --open-text: #a51d25; --open-soft: rgba(196, 38, 46, .12); " +
                   "--claimed: #f2c230; --claimed-ink: #1b1600; --picked: #1e6ac7; --picked-ink: #ffffff; --loaded: #1f8a50; --loaded-soft: rgba(31, 138, 80, .12); " +
                   "--warn: #b26a00; --crit: #c4262e; color-scheme: light;"
-let THEME_DARK = "--bg: #0e1116; --panel: #171c23; --line: #2a313b; --text: #e9edf1; --muted: #8c97a3; --strong: #ffffff; --track: #0b0e12; " +
+let THEME_DARK = "--bg: #0e1116; --panel: #171c23; --line: #2a313b; --text: #e9edf1; --muted: #a9b3bf; --strong: #ffffff; --track: #0b0e12; " +
                  "--open: #e5484d; --open-ink: #ffffff; --open-text: #ff6b6f; --open-soft: rgba(229, 72, 77, .16); " +
                  "--claimed: #f2c230; --claimed-ink: #1b1600; --picked: #3d8ef0; --picked-ink: #ffffff; --loaded: #2fa86a; --loaded-soft: rgba(47, 168, 106, .14); " +
                  "--warn: #f2a93b; --crit: #ff5a5f; color-scheme: dark;"
@@ -71,7 +71,7 @@ let BOARD_CSS = join([
   ".orders { overflow-y: auto; flex: 1 1 auto; min-height: 0; padding: 6px 10px 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; align-content: start; }",
   ".order { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }",
   ".order-head > * { min-width: 0; } .ln > * { min-width: 0; }",
-  ".order.done { opacity: .45; }",
+  ".order.done { opacity: .7; }",
   ".order-head { display: flex; justify-content: space-between; gap: 8px; font-size: 15px; }",
   ".order-no { font-weight: 700; color: var(--strong); } .order-cust { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
   ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; font-size: 16px; }",
@@ -102,7 +102,25 @@ let BOARD_CSS = join([
   "[data-theme=\"dark\"] .theme-svg.sun { display: inline-block; } [data-theme=\"dark\"] .theme-svg.moon { display: none; }",
   ".fs-svg, .fs-on { display: none; } .fs-off { display: inline; } .fs-svg.off { display: inline-block; }",
   "[data-fs=\"1\"] .fs-off, [data-fs=\"1\"] .fs-svg.off { display: none; } [data-fs=\"1\"] .fs-on { display: inline; } [data-fs=\"1\"] .fs-svg.on { display: inline-block; }",
-  ".note { color: var(--muted); padding: 40px; font-size: 20px; }"
+  ".note { color: var(--muted); padding: 40px; font-size: 20px; }",
+  // A wall TV (1600 px and wider): read from across the dock. Not one zoom - what is read from afar (each line, its
+  // state and clock, the bin, the alerts) grows most; what is already big (the bay, the next tire) a little; the bay's
+  // layout buttons, which nobody presses on a TV, step back.
+  "@media (min-width: 1600px) {",
+  "  body { font-size: 20px; }",
+  "  .legend { font-size: 18px; } .legend .sw { width: 26px; height: 16px; }",
+  "  .bay-name { font-size: 36px; } .bay-truck { font-size: 26px; font-weight: 700; } .bay-driver { font-size: 21px; }",
+  "  .bay-sub { font-size: 18px; } .lbl { font-size: 16px; } .bc .clock { font-size: 28px; } .clock.none { font-size: 17px; }",
+  "  .bar { font-size: 17px; grid-template-columns: 70px minmax(0, 1fr) auto; } .bar .left { font-size: 16px; } .track { height: 14px; border-radius: 7px; }",
+  "  .alert { font-size: 20px; } .need { font-size: 19px; } .need .bin { font-weight: 600; }",
+  "  .next-item { font-size: 40px; } .next-desc { font-size: 20px; } .next-meta { font-size: 17px; } .next-count { font-size: 28px; }",
+  "  .order { padding: 8px 10px; } .order-head { font-size: 18px; }",
+  "  .ln { font-size: 21px; gap: 4px 10px; } .ln .qty { flex-basis: 56px; } .ln .item { font-weight: 600; flex-basis: 180px; }",
+  "  .ln .bin { font-size: 17px; font-weight: 500; }",
+  "  .tag { font-size: 17px; padding: 3px 10px; } .state .clock { font-size: 19px; } .done-at { font-size: 16px; }",
+  "  .bay-tools button { font-size: 13px; padding: 3px 6px; opacity: .5; }",
+  "  .empty { font-size: 24px; } .foot { font-size: 14px; }",
+  "}"
 ], "\n")
 
 fn qty_text(v) {
@@ -483,9 +501,16 @@ let HOST_JS = join([
 // nobody reloads). Data changes leave it alone.
 let DESIGN = slice(sha256(BOARD_CSS + THEME_JS + CLOCK_JS + LAYOUT_JS + FULLSCREEN_JS + HOST_JS), 0, 12)
 
+// One column per door; a door with no truck says so in a narrow strip, so the doors that are working get the width
+// (an empty third of a TV left the busy doors' lines cut off). All empty: equal, as before.
+fn board_columns(bays) {
+  if len(bays) == 0 { return "minmax(0, 1fr)" }
+  return join(map(bays, fn (b) { return b.dispnumber == "" ? "minmax(0, .4fr)" : "minmax(0, 1fr)" }), " ")
+}
+
 fn board_node(bays, read_at) {
   return el("div", {"data-design": DESIGN}, legend_node(),
-            el("div", {"class": "board", "style": "--cols:" + str(max(1, len(bays)))}, ...map(bays, bay_node)),
+            el("div", {"class": "board", "style": "grid-template-columns: " + board_columns(bays)}, ...map(bays, bay_node)),
             el("div", {"class": "foot"}, el("span", "Dock Live · read " + read_at), fullscreen_node(), theme_toggle_node()),
             el("script", THEME_JS), el("script", CLOCK_JS), el("script", LAYOUT_JS), el("script", FULLSCREEN_JS), el("script", HOST_JS))
 }
