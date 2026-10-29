@@ -1,0 +1,40 @@
+// Grain in a page. This program runs in a WebAssembly VM in a Web Worker; its pane is drawn into the page's own DOM; its
+// data comes from http_get (a synchronous request in the worker); its state is its variables.
+let cfg = json_parse(read_file("/app/config.json"))
+let rows = []
+let load_error = ""
+let query = ""
+let desc = true
+let clicks = 0
+
+fn load() {
+  let r = pcall(http_get, cfg.data_url)
+  if not r.ok { load_error = r.error; return nil }
+  if not r.value.ok { load_error = "HTTP " + str(r.value.status); return nil }
+  rows = json_parse(r.value.body)
+}
+load()
+
+fn header() {
+  return el("th", {"class": "sortable", "data-dir": desc ? "desc" : "asc", "on_click": fn() { desc = not desc }}, "Touches")
+}
+
+fn view() {
+  let shown = filter(rows, fn(p) { return contains(lower(p.name), lower(query)) })
+  shown = sort_by(shown, fn(p) { return p.touches }, desc ? "desc" : "asc")
+  return el("div", {"class": "demo"},
+    el("h1", "Grain in a page"),
+    load_error != "" ? el("p", {"class": "err"}, "Could not load the data: " + load_error) : nil,
+    el("p", {"class": "clicks"}, "Clicked " + str(clicks) + " times"),
+    el("form", {"class": "controls"},
+      el("input", {"type": "text", "bind": "query", "value": query, "placeholder": "filter by name"}),
+      el("button", {"type": "button", "class": "filter", "on_click": fn(f) { query = f.query }}, "Filter"),
+      el("button", {"type": "button", "class": "count", "on_click": fn(f) { clicks += 1 }}, "Add one")),
+    el("table",
+      el("thead", el("tr", el("th", "Name"), header())),
+      el("tbody", map(shown, fn(p) { return el("tr", {"data-key": p.name}, el("td", {"class": "who"}, p.name), el("td", p.touches)) }))))
+}
+
+ui.pane({"title": "Grain in a page", "css": ".demo { padding: 16px } .sortable { cursor: pointer } .err { color: #f87171 } .controls { display: flex; gap: 8px; margin: 12px 0 }",
+         "view": view})
+run_panes()

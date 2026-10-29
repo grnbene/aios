@@ -387,9 +387,9 @@ site cannot add, so a link elsewhere cannot press your buttons.
 
 ## In a browser (WebAssembly)
 
-The same VM, built with Emscripten, runs in a page or in Node. The language, its portable standard library and
-`http_*` run and give what `grain` gives; the databases and `ui.pane` are not in yet. Size, optimized: 1.29 MB, 0.51 MB
-gzipped, 0.40 MB with brotli.
+The same VM, built with Emscripten, runs in a page or in Node. The language, its portable standard library, `http_*`
+and `ui.pane` run and give what `grain` gives; the databases are not in yet. Size, optimized: 1.29 MB, 0.51 MB gzipped,
+0.40 MB with brotli.
 
 ```
 emcmake cmake -S grain -B build-grain-wasm -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-Oz -DNDEBUG"
@@ -403,6 +403,24 @@ compile or run error with the line (`grain/wasm/grain_wasm.cpp`). Files are the 
 sources are `grain`'s own (`GRAIN_LANG_SOURCES`) without the JIT's code generation, processes, sockets, TLS, mail and
 the database drivers. The host layer for a page is `src/hal/wasm_host.cpp`.
 
+- **A `ui.pane` in a page, without an iframe.** `grain_pane_open / _event / _tick / _close` (`grain/wasm/pane.cpp`) are
+  the calls `grain serve` makes (`web_pane_*`), without the HTTP: the program's `view` becomes the HTML fragment, an
+  action is the page script's own urlencoded body, and the VM keeps the program's variables between actions. The build
+  also writes `grain-pane.js` and `grain-pane.css` out of `src/userland/grain_webui_assets.inc` - the text the server's
+  page is made of - so a pane in a page runs the same client, not a copy. `pane-host.mjs` mounts a pane into an element:
+  the program runs in a Web Worker (`pane-worker.mjs`), the DOM stays on the page.
+
+  ```js
+  import { mountPane } from './pane-host.mjs';   // and <link rel="stylesheet" href="grain-pane.css">
+  const pane = await mountPane(document.querySelector('#mount'), {
+    files: { '/app/main.gr': source },            // the program and what it imports, by path
+    main: '/app/main.gr', query: location.search.slice(1) });
+  ```
+
+  `grain/wasm/demo/` is a page that does it (a table fetched with `http_get`, sorted and filtered by clicks).
+  `node grain/wasm/pane-test.mjs` checks the protocol on the server's own test apps; `grain/tests/web/wasm_pane_test.py`
+  drives the demo in headless Chrome. Not done: the pane's CSS is global, as on the server's page (no scoping yet), and
+  there is no `watch` (it needs the database).
 - **`http_get` / `http_post` / `http_request`** are the same builtins over the page's transport: the page gives the
   module `grainHttp`, a synchronous function (`grain/wasm/http-sync.mjs`: a synchronous XMLHttpRequest in a Web
   Worker, a helper thread in Node). The browser follows redirects and undoes gzip itself, so `follow_redirects: false`

@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Grain in a page</title>
+<link rel="stylesheet" href="grain-pane.css">
+<div id="mount"></div>
+<script type="module">
+  import { mountPane } from './pane-host.mjs';
+  const text = (url) => fetch(url).then((r) => r.text());
+  const files = {
+    '/app/main.gr': await text('app/main.gr'),
+    '/app/config.json': JSON.stringify({ data_url: new URL('data.json', location.href).href }),
+  };
+  try {
+    window.pane = await mountPane(document.getElementById('mount'), { files, main: '/app/main.gr', query: location.search.slice(1) });
+  } catch (e) {
+    document.getElementById('mount').textContent = 'The pane did not start: ' + e.message;
+    window.paneError = e.message;
+  }
+  window.paneReady = true;
+</script>
