@@ -902,6 +902,8 @@ add_test(NAME drive.dom COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-dom.sh ${CMAKE
 add_test(NAME drive.active COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-active.sh ${CMAKE_BINARY_DIR})
 # `:focus` / `:focus-within`: a clicked field shows its :focus border and the form its :focus-within background.
 add_test(NAME drive.focus COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-focus.sh ${CMAKE_BINARY_DIR})
+# A same-page anchor link scrolls to its element and `:target` matches it (web-corpus/target.html).
+add_test(NAME drive.target COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-target.sh ${CMAKE_BINARY_DIR})
 
 add_test(NAME drive.image COMMAND ${CMAKE_SOURCE_DIR}/scripts/drive-image.sh ${CMAKE_BINARY_DIR})
 

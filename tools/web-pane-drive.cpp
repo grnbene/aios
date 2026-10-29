@@ -377,6 +377,7 @@ int main(int argc, char** argv) {
           if (f.kind != userland::web::Fragment::Kind::Rect && f.kind != userland::web::Fragment::Kind::Border) continue;
           std::printf("CLICKED %-6s %5d %5d %5d %5d  #%08x\n", f.kind == userland::web::Fragment::Kind::Rect ? "rect" : "border", f.x, f.y, f.w, f.h, f.color);
         }
+        std::printf("SCROLL %d  TARGET %s\n", w->web->scroll, w->web->browser->target().c_str());   // where the page sits after the click, and the fragment
       }
     }
   } else

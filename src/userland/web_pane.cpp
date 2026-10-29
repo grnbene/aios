@@ -25,6 +25,7 @@
 extern bool g_css_has_hover;   // web_css.cpp
 extern bool g_css_has_active;  // web_css.cpp: a :active rule exists, so a press marks the pressed element
 extern bool g_css_has_focus;   // web_css.cpp: a :focus / :focus-within rule exists, so the focused field is marked
+extern bool g_css_has_target;  // web_css.cpp: a :target rule exists, so the element the fragment names is marked
 namespace aios::userland {
 namespace {
 
@@ -460,6 +461,47 @@ static void set_focus_marks(web::Node* n, bool on) {
     if (on) a.push_back({"data-aios-focus", "1"});
   }
   set_mark_chain(n, "data-aios-focus-within", on);
+}
+// `#section` in the URL, or a same-page anchor link: once the page is laid out, scroll to the element with that id
+// and mark it with data-aios-target so `:target` matches (the previous one unmarked); the browser says when a new
+// fragment is pending (take_target_scroll).
+static web::Node* s_target_node = nullptr;
+static web::Node* node_with_id(web::Node* n, const std::string& id) {
+  if (!n) return nullptr;
+  if (n->kind == web::Node::Kind::Element && n->attr("id") == id) return n;
+  for (auto& ch : n->children)
+    if (web::Node* hit = node_with_id(ch.get(), id)) return hit;
+  return nullptr;
+}
+static void update_target(WebPane& pane, int view_h) {
+  if (!pane.browser) return;
+  const web::Document& doc = pane.browser->document();
+  if (!doc.dom || doc.fragments.empty()) return;   // not laid out yet: the scroll stays pending for the next frame
+  if (!pane.browser->take_target_scroll()) return;
+  const std::string& id = pane.browser->target();
+  web::Node* now = id.empty() ? nullptr : node_with_id(doc.dom.get(), id);
+  if (now != s_target_node) {
+    if (s_target_node) {
+      auto& a = s_target_node->attrs;
+      for (size_t i = 0; i < a.size(); ++i) if (a[i].name == "data-aios-target") { a.erase(a.begin() + (long)i); break; }
+    }
+    if (now) now->attrs.push_back({"data-aios-target", "1"});
+    s_target_node = now;
+    if (::g_css_has_target) s_reflow_req = true;
+  }
+  // The element's first box, as the page is laid out now; the top of the page for an empty fragment.
+  int y = 0;
+  if (now) {
+    bool found = false;
+    for (const auto& f : doc.fragments) {
+      for (const web::Node* n = f.node; n; n = n->parent)
+        if (n == now) { y = f.y; found = true; break; }
+      if (found) break;
+    }
+    if (!found) return;
+  }
+  const int max_scroll = std::max(0, doc.content_height - view_h);
+  pane.scroll = std::max(0, std::min(y, max_scroll));
 }
 static void update_focus(WebPane& pane) {
   if (!::g_css_has_focus) return;
@@ -1622,6 +1664,7 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   pane.last_viewport_w = view_w;
   update_hover(pane, view_w, k.host().monotonic_ns() / 1000000ULL);
   update_focus(pane);
+  update_target(pane, view_h);
   pane.browser->set_view_height(view_h);
 
   // The page's own time. A frame handler, a due timer, an animation frame: each

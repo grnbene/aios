@@ -815,6 +815,10 @@ class Browser {
   const Document& document() const { return doc_; }
   const std::string& url() const { return doc_.url; }
   const std::string& status() const { return status_; }
+  // The URL's fragment (`#section`): the element the page should be scrolled to and that `:target` matches. Set by a
+  // visit of a URL with one and by a same-page anchor link; the pane takes the pending scroll once a frame.
+  const std::string& target() const { return target_; }
+  bool take_target_scroll() { const bool p = target_pending_; target_pending_ = false; return p; }
   // What script did on this page, so the pane can say so instead of leaving a
   // person to wonder whether anything ran.
   const ::aios::userland::ScriptRun& script() const { return script_; }
@@ -865,6 +869,8 @@ Result<void> visit(const std::string& url, const Metrics& m, int viewport_w, boo
   std::vector<std::string> history_;
   int history_index_ = -1;
   std::string status_;
+  std::string target_;          // the current document's fragment, "" for none
+  bool target_pending_ = false; // the pane has yet to scroll to it
   std::string transport_;
   bool secure_ = false;
   std::vector<std::pair<std::string, Bitmap>> images_;
