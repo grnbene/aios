@@ -51,7 +51,7 @@ For the complete function-by-function reference of all 440+ builtins with parame
 | Numbers in text | `is_numeric(v)` (a number, or a string that is one and nothing more), `to_number(v, [default])` (a string by the number it starts with: `to_number("12.50abc")` is `12.50`) |
 | Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
 | Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_cbc_decrypt(key, iv, data)` (PKCS#7, what `openssl_decrypt` reads; nil when the padding is wrong) and `hash_equals(a, b)` (in constant time, for secrets) |
-| Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}` |
+| Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}`; a call chain deeper than 1,000 frames stops with "call depth exceeded" (a runaway recursion never takes the process down) |
 | Every core | `parallel_map(list, fn)`, `spawn(fn, args...)` -> task, `await(task)`, `task_done(task)` |
 | Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |

@@ -26,7 +26,7 @@ struct Ctx {
 constexpr uint32_t kFrameClosure = 0, kFrameIp = 8, kFrameBase = 16,
                    kFrameOwnedPtr = 24, kFrameOwnedCtrl = 32, kFrameChunk = 40, kFrameSize = 48;
 // The deepest call chain the VM allows (Vm::invoke's limit).
-constexpr uint32_t kMaxFrames = 200;
+constexpr uint32_t kMaxFrames = 1000;
 
 // Native entry: runs the function whose frame is on top of the VM's frame
 // stack (frame base `base` = stack index of the callee slot) through to its
