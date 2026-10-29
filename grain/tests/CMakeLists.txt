@@ -104,6 +104,8 @@ add_test(NAME grain.lang.unicode_text COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/
 add_test(NAME grain.lang.unicode_text.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_unicode_text.gr)
 add_test(NAME grain.lang.call_depth COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_call_depth.gr)
 add_test(NAME grain.lang.call_depth.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_call_depth.gr)
+add_test(NAME grain.lang.json_numbers COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_json_numbers.gr)
+add_test(NAME grain.lang.json_numbers.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_json_numbers.gr)
 add_test(NAME grain.lang.on_machine COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_on_machine.gr)
 add_test(NAME grain.lang.match_coalesce COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_match_coalesce.gr)
 add_test(NAME grain.lang.spread_jit COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_spread_jit.gr)
