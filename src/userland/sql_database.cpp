@@ -32511,6 +32511,21 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       if (!lit.empty()) {
         if (!d.coded() && !d.is_front_coded()) {
           contains_in_dict(d, lit, yes, no, ps, &p.code_truth);
+        } else if (d.blocked()) {
+          // Block by block, each decoded once into a plain arena of its own entries: a plain copy of the whole
+          // dictionary per statement (70 MB for po_options) was the cost before, and the scan is the same.
+          p.code_truth.assign(nd, no);
+          const size_t per = d.per_block();
+          DictArena part;
+          std::vector<uint8_t> part_truth;
+          auto scan = [&](size_t first, size_t count) {
+            part.clear();
+            for (size_t i = 0; i < count; ++i) part.push_back(d.view(first + i));
+            contains_in_dict(part, lit, yes, no, ps, &part_truth);
+            std::copy(part_truth.begin(), part_truth.begin() + (long)std::min(count, part_truth.size()), p.code_truth.begin() + (long)first);
+          };
+          for (size_t b = 0; b < d.blocks().size(); ++b) scan(b * per, d.blocks()[b].count);
+          if (d.coded_count() < nd) scan(d.coded_count(), nd - d.coded_count());
         } else {
           // A coded or front-coded dictionary is decoded into a plain one first: the scan
           // runs over one contiguous buffer.
