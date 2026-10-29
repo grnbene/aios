@@ -67,6 +67,7 @@ function(grain_cli_case name workdir status input)
             -DSTATUS=${status} -P ${RUNNER})
 endfunction()
 grain_cli_case(cli.debug ${CLI_CASES} 0 ${CLI_CASES}/dbg_loop.in debug@@dbg_loop.gr)
+grain_case(cli.dis_closures ${CLI_CASES} 0 dis dis_closures.gr)   # the listing steps by instruction_length: captures after CLOSURE, jump targets
 # grain pkg check follows imports: one that names no file fails the check
 grain_cli_case(cli.pkg.ok ${CLI_CASES}/pkg_ok 0 /dev/null pkg@@check)
 grain_cli_case(cli.pkg.missing_import ${CLI_CASES}/pkg_bad 2 /dev/null pkg@@check)
