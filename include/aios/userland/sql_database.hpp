@@ -1654,9 +1654,13 @@ class PkMap {
   // Runs into slots, for good. `why` names the cause in the store trace (AIOS_STORE_TRACE), with the table.
   void to_slots(const char* why = "") {
     if (!runs_) return;
-    runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
-    static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
-    if (trace) std::fprintf(stderr, "[store] %s: key map of %zu keys turns from runs into slots (%s)\n", trace_name_ ? trace_name_ : "?", count_, why);
+    // An empty map taking its first text key is not a fallback (every text-keyed table starts this way, and it
+    // made Asql_pk_runs_to_slots climb by one per text table built): counted and traced only when keys are lost to it.
+    if (count_ > 0) {
+      runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+      static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+      if (trace) std::fprintf(stderr, "[store] %s: key map of %zu keys turns from runs into slots (%s)\n", trace_name_ ? trace_name_ : "?", count_, why);
+    }
     std::vector<Run> rv;
     rv.swap(runs_v_);
     std::vector<uint64_t> gone;
