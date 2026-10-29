@@ -15014,7 +15014,7 @@ std::string_view DictArena::view_front_coded(size_t k) const {
 }
 
 void DictArena::front_code(std::vector<uint32_t>* remap_out, size_t /*bucket_size*/) {
-  if (front_coded_ || pfirst_ > 0) return;   // already coded, or holding SymbolCoder entries (the two do not mix)
+  if (front_coded_ || pfirst_ > 0) return;   // already coded, or holding SymbolCoder entries or blocks (these do not mix)
   size_t N = size();
   if (N <= 1) return;
 
@@ -15135,8 +15135,170 @@ std::string_view DictArena::coded_view(size_t k) const {
   return s;
 }
 
+// A block's text and the (offset, length) of each entry in it; false on a damaged block.
+static bool dict_block_decode(const DictArena::Block& blk, std::vector<char>& raw, std::vector<uint32_t>& offs) {
+  raw.resize(blk.raw_size);
+  uint8_t* dst = reinterpret_cast<uint8_t*>(raw.data());
+  bool ok = blk.raw_size == 0 ||
+            (blk.codec == DictArena::kBlockDeflate ? net::inflate_raw_exact(ByteSpan(blk.bytes.data(), blk.bytes.size()), dst, blk.raw_size)
+                                                   : lz4_decompress(blk.bytes.data(), blk.bytes.size(), dst, blk.raw_size));
+  offs.clear();
+  const char* p = raw.data();
+  const char* end = p + raw.size();
+  for (uint32_t e = 0; e < blk.count && ok; ++e) {
+    const uint32_t len = dict_read_varint(p, end);
+    if ((size_t)(end - p) < len) { ok = false; break; }
+    offs.push_back((uint32_t)(p - raw.data()));
+    offs.push_back(len);
+    p += len;
+  }
+  if (!ok) offs.clear();
+  return ok;
+}
+
+// Decoded blocks per thread, least recently used out first, keyed by the arena's generation (unique to the arena's
+// content: a new generation after every change) and the block. A view stays good while the thread reads other
+// blocks, as long as fewer than this many: a binary search over the sorted codes of a 4,400-block dictionary holds
+// its needle through 13 probes. (Two slots evicted in turn lost the needle: `doc > probe` miscounted.)
+namespace {
+struct DictBlockCache {
+  uint64_t gen = 0;
+  size_t blk = (size_t)-1;
+  uint64_t used = 0;
+  std::vector<char> raw;
+  std::vector<uint32_t> offs;   // offset, length per entry
+};
+constexpr size_t kDictBlockSlots = 24;
+thread_local DictBlockCache g_dict_blocks[kDictBlockSlots];
+thread_local uint64_t g_dict_blocks_tick = 0;
+}   // namespace
+
+std::string_view DictArena::blocked_view(size_t k) const {
+  if (per_block_ == 0) return std::string_view(sql_null());
+  const size_t b = k / per_block_, i = k % per_block_;
+  if (b >= blocks_.size()) return std::string_view(sql_null());
+  DictBlockCache* c = nullptr;
+  DictBlockCache* lru = &g_dict_blocks[0];
+  for (DictBlockCache& s : g_dict_blocks) {
+    if (s.gen == gen_ && s.blk == b) { c = &s; break; }
+    if (s.used < lru->used) lru = &s;
+  }
+  if (!c) {
+    c = lru;
+    c->gen = 0;
+    if (!dict_block_decode(blocks_[b], c->raw, c->offs)) return std::string_view(sql_null());   // damaged: NULL entries, never garbage
+    c->gen = gen_;
+    c->blk = b;
+  }
+  c->used = ++g_dict_blocks_tick;
+  if (i * 2 + 1 >= c->offs.size()) return std::string_view(sql_null());
+  return std::string_view(c->raw.data() + c->offs[i * 2], c->offs[i * 2 + 1]);
+}
+
+void DictArena::block_upto(size_t upto, uint8_t codec, uint32_t per_block) {
+  if (front_coded_) un_front_code();
+  if (coder_ || pfirst_ > size()) return;   // symbol-coded entries do not mix with blocks
+  upto = std::min(upto, size());
+  if (upto <= pfirst_) return;
+  if (!blocked_) { blocked_ = true; per_block_ = std::max<uint32_t>(1, per_block); }
+  // Whole blocks, except that everything asked for is taken (the last block then runs short). A short last block is
+  // reopened here: its entries go first, ahead of the plain ones.
+  std::vector<std::string> head;
+  if (!blocks_.empty() && blocks_.back().count < per_block_) {
+    std::vector<char> raw;
+    std::vector<uint32_t> offs;
+    if (dict_block_decode(blocks_.back(), raw, offs)) {
+      for (size_t e = 0; e * 2 + 1 < offs.size(); ++e) head.emplace_back(raw.data() + offs[e * 2], offs[e * 2 + 1]);
+      pfirst_ -= blocks_.back().count;
+      blocks_.pop_back();
+    }
+  }
+  const size_t plain_wanted = upto - pfirst_;                      // plain entries asked for
+  const size_t all = head.size() + plain_wanted;
+  const size_t sealed = upto == size() ? all : (all / per_block_) * per_block_;
+  if (sealed <= head.size()) {   // not even a block's worth with the reopened ones: put them back as they were
+    if (!head.empty()) {
+      std::vector<char> raw;
+      for (const std::string& s : head) { dict_write_varint(raw, (uint32_t)s.size()); raw.insert(raw.end(), s.begin(), s.end()); }
+      Block b;
+      b.count = (uint32_t)head.size();
+      b.raw_size = (uint32_t)raw.size();
+      b.codec = codec == kBlockDeflate ? kBlockDeflate : kBlockLz4;
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(raw.data());
+      if (b.codec == kBlockDeflate) { ByteBuffer out; net::deflate_raw_append(ByteSpan(src, raw.size()), 6, out); out.shrink_to_fit(); b.bytes = std::move(out); }
+      else { b.bytes = lz4_compress(src, raw.size()); b.bytes.shrink_to_fit(); }
+      blocks_.push_back(std::move(b));
+      pfirst_ += head.size();
+    }
+    return;
+  }
+  const size_t take = sealed - head.size();   // the first `take` plain entries
+  auto entry = [&](size_t i, const char** p, uint32_t* len) {   // entry i of head ++ plain
+    if (i < head.size()) { *p = head[i].data(); *len = (uint32_t)head[i].size(); return; }
+    i -= head.size();
+    *p = bytes_.data() + offs_[i];
+    *len = offs_[i + 1] - offs_[i];
+  };
+  std::vector<char> raw;
+  for (size_t at = 0; at < sealed; at += per_block_) {
+    const size_t n = std::min<size_t>(per_block_, sealed - at);
+    raw.clear();
+    for (size_t i = at; i < at + n; ++i) {
+      const char* p = nullptr;
+      uint32_t len = 0;
+      entry(i, &p, &len);
+      dict_write_varint(raw, len);
+      raw.insert(raw.end(), p, p + len);
+    }
+    Block b;
+    b.count = (uint32_t)n;
+    b.raw_size = (uint32_t)raw.size();
+    b.codec = codec;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(raw.data());
+    if (codec == kBlockDeflate) {
+      ByteBuffer out;
+      out.reserve(raw.size() / 3 + 64);
+      net::deflate_raw_append(ByteSpan(src, raw.size()), 6, out);
+      out.shrink_to_fit();
+      b.bytes = std::move(out);
+    } else {
+      b.codec = kBlockLz4;
+      b.bytes = lz4_compress(src, raw.size());
+      b.bytes.shrink_to_fit();   // lz4_compress sizes its buffer at the bound (more than the text): the block holds what it used
+    }
+    blocks_.push_back(std::move(b));
+  }
+  // The plain entries left move to the front of their buffer (as code_upto does).
+  const uint32_t cut = offs_[take];
+  bytes_.erase(bytes_.begin(), bytes_.begin() + cut);
+  offs_.erase(offs_.begin(), offs_.begin() + (long)take);
+  for (auto& o : offs_) o -= cut;
+  bytes_.shrink_to_fit();
+  offs_.shrink_to_fit();
+  pfirst_ += sealed;
+  gen_ = next_gen();
+}
+
+bool DictArena::set_blocked(uint32_t per_block, std::vector<Block> blocks) {
+  if (size() != 0 || per_block == 0 || blocks.empty()) return false;
+  size_t n = 0;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    const Block& b = blocks[i];
+    if (b.count == 0 || b.count > per_block || (i + 1 < blocks.size() && b.count != per_block)) return false;
+    if ((b.codec != kBlockLz4 && b.codec != kBlockDeflate) || (b.raw_size == 0) != b.bytes.empty()) return false;
+    n += b.count;
+  }
+  blocked_ = true;
+  per_block_ = per_block;
+  blocks_ = std::move(blocks);
+  pfirst_ = n;
+  gen_ = next_gen();
+  return true;
+}
+
 void DictArena::code_upto(const std::shared_ptr<const SymbolCoder>& c, size_t upto) {
   if (front_coded_) un_front_code();
+  if (blocked_) return;   // blocks and symbol codes do not mix
   upto = std::min(upto, size());
   if (upto <= pfirst_ || (!coder_ && !c)) return;
   if (!coder_) { coder_ = c; coffs_.assign(1, 0); }
@@ -15195,6 +15357,13 @@ void DictArena::decode_into(DictArena& out) const {
     for (size_t k = 0; k < entry_count_; ++k) out.push_back(view(k));
     return;
   }
+  if (blocked_) {   // block by block, in order: each is decoded once; the buffer sized once from the blocks' raw sizes
+    size_t raw = bytes_.size();
+    for (const Block& b : blocks_) raw += b.raw_size;
+    out.reserve(size(), raw);
+    for (size_t k = 0; k < size(); ++k) out.push_back(view(k));
+    return;
+  }
   size_t bytes = bytes_.size();
   for (size_t k = 0; k < pfirst_; ++k) bytes += (size_t)(coffs_[k + 1] - coffs_[k]) * 8;
   out.bytes_.resize(bytes + 8);
@@ -15211,7 +15380,7 @@ void DictArena::decode_into(DictArena& out) const {
 }
 
 void DictArena::push_from(const DictArena& src, size_t k) {
-  if (front_coded_ || src.front_coded_) { push_back(src.view(k)); return; }
+  if (front_coded_ || src.front_coded_ || src.blocked_ || blocked_) { push_back(src.view(k)); return; }
   if (k < src.pfirst_ && offs_.size() == 1 && (coder_ == src.coder_ || (!coder_ && pfirst_ == 0))) {
     if (!coder_) { coder_ = src.coder_; coffs_.assign(1, 0); }
     cbytes_.insert(cbytes_.end(), src.cbytes_.begin() + src.coffs_[k], src.cbytes_.begin() + src.coffs_[k + 1]);
@@ -16008,11 +16177,14 @@ void ColumnStore::set(size_t row, const std::string& val) {
     bool is_val_null = sql_is_null(val);
     set_null(row, is_val_null);
     if (!is_val_null) {
-      if (encoding != ColumnEncoding::DictBitPacked || bit_width_ != 32) {
-        materialize_to_dict_packed();
+      // set_encoded took the cell if this was a dictionary of its own (widening a bit when the code asked for it):
+      // here the column is something else, or shares its dictionary, and becomes a dictionary at the width it needs.
+      if (encoding != ColumnEncoding::DictBitPacked || shared_dict) {
+        to_dict_narrow();
         if (++write_recodes < 2) reencode_pending = true;
       }
       uint32_t id = intern(val);
+      widen_for(id);
       write_code(row, id);
     }
   }
@@ -16044,12 +16216,15 @@ void ColumnStore::push_back(const std::string& val) {
     null_bitmap[byte_idx] &= ~(1 << (r & 7));
   }
 
-  if (encoding != ColumnEncoding::DictBitPacked || bit_width_ != 32) {
-    materialize_to_dict_packed();
+  // append_encoded took the row if this was a dictionary of its own (widening a bit when the code asked for it) or a
+  // run-length column: here the column is something else, or shares its dictionary, and becomes a dictionary at
+  // the width it needs - not 32 bits a code for every row it already holds.
+  if (encoding != ColumnEncoding::DictBitPacked || shared_dict) {
+    to_dict_narrow();
   }
   uint32_t id = intern(val);
-  if (r >= data32.size()) { grow_column_vec(data32, r + 1); data32.resize(r + 1, 0); }
-  data32[r] = id;
+  widen_for(id);
+  write_code(r, id);
   refresh_zone_maps(r, r);
   if ((r + 1) % kSegRows == 0) seal_segment(*this);
 }
@@ -16350,6 +16525,21 @@ static void repack_codes(ColumnStore& cs, uint8_t w) {
   pack_column_codes(cs, [&](size_t r) { return codes[r]; });
 }
 
+// A write the current encoding cannot hold (a cell of a run-length column rewritten, a row deleted from an integer
+// column) used to turn the whole column into 32-bit dictionary codes, to be narrowed at some later checkpoint if its
+// 40 ms reached the table: stockmoves on atl held eleven columns of a few values at 4 B a row, and every cycle of
+// widening and narrowing allocated and freed the column again. Here the column goes straight to the width its
+// dictionary needs.
+void ColumnStore::to_dict_narrow() {
+  materialize_to_dict_packed();
+  repack_codes(*this, code_bits_for(dict.size() ? dict.size() - 1 : 0));
+}
+
+// Room for code `id`: a bit more when it does not fit (as set_encoded widens a dictionary column), never 32 at once.
+void ColumnStore::widen_for(uint32_t id) {
+  if (bit_width_ < 32 && (bit_width_ == 0 || ((uint64_t)id >> bit_width_))) repack_codes(*this, code_bits_for(id));
+}
+
 // The dictionary of a column whose cells are rewritten holds every value
 // ever written: an UPDATE interns the new value and the old entry stays. A
 // column updated 250k times held 350k entries for 100k rows - 2 KB a row,
@@ -16358,6 +16548,8 @@ static void repack_codes(ColumnStore& cs, uint8_t w) {
 // their order, the codes are rewritten. Returns whether it compacted.
 bool ColumnStore::compact_dictionary() {
   if (encoding != ColumnEncoding::DictBitPacked || shared_dict || row_count_ == 0) return false;
+  const bool was_blocked = dict.blocked();   // the survivors go back into blocks below (push_from copies them plain)
+  const uint32_t block_per = dict.per_block();
   const size_t nd = dict.size();
   if (nd <= row_count_ + row_count_ / 2 + 1024) return false;
   std::vector<uint32_t> codes(row_count_);   // read_code decodes a per-segment layout as it is
@@ -16390,6 +16582,7 @@ bool ColumnStore::compact_dictionary() {
     }
   }
   dict = std::move(compacted);
+  if (was_blocked) dict.block_upto(dict.size(), DictArena::kBlockLz4, block_per);
   id_index.clear();
     id_tag.clear();
   id_index_count = 0;
@@ -16419,6 +16612,37 @@ bool ColumnStore::code_dictionary(size_t budget) {
   constexpr size_t kMinBytes = (size_t)1 << 20;   // a dictionary of 1 MB before a table is worth training
   constexpr size_t kMinTail = (size_t)256 << 10;  // then its new entries once they add up to this
   constexpr size_t kMinAvg = 32;                    // bytes an entry, on average
+  // Long entries (128 B and up on average: JSON options, notes, request bodies) go into compressed blocks, not
+  // symbol codes: 4-7x smaller where the codes gave 2.7x (atl's salesorderdetails.po_options, 27 MB -> 4 MB), a
+  // block decode per point read, and the block stays decoded for the reads after it. Whole blocks only: a tail
+  // shorter than a block stays plain until it has grown.
+  constexpr size_t kBlockMinAvg = 128;
+  // A dictionary already in symbol codes whose entries are long (~64 B coded is ~170 B of text) is decoded and
+  // blocked whole, once: atl's po_options, request and narrative columns were coded before blocks existed.
+  if (dict.coded() && !dict.blocked() && dict.size() > 64 && dict.byte_size() >= kMinBytes && dict.byte_size() >= dict.size() * 40) {
+    DictArena plain;
+    dict.decode_into(plain);
+    dict = std::move(plain);
+    budget = (size_t)-1;
+  }
+  if (dict.blocked() || (!dict.coded() && dict.plain_bytes() >= kMinBytes &&
+                         dict.plain_bytes() >= (dict.size() - dict.coded_count()) * kBlockMinAvg)) {
+    const size_t plain_entries = dict.size() - dict.coded_count();
+    if (plain_entries == 0) return false;
+    if (dict.blocked() && dict.plain_bytes() < kMinTail) return false;
+    uint32_t per = dict.blocked() ? dict.per_block() : 16;
+    if (!dict.blocked()) {
+      const size_t avg = dict.plain_bytes() / plain_entries + 1;
+      while ((size_t)per * avg < ((size_t)16 << 10) && per < 4096) per *= 2;   // ~16 KB of text a block: a decode on a miss is ~20 us
+    }
+    size_t upto = dict.coded_count(), bytes = 0;
+    while (upto < dict.size() && bytes < budget) bytes += dict.view(upto++).size();
+    const size_t was = dict.coded_count();
+    // LZ4, not deflate: a LIKE over the column decodes every block per statement, and inflating 29 MB of
+    // payment_details took the statement from 33 to 63 ms; LZ4 holds 3/4 of deflate's saving at a fifth of the cost.
+    dict.block_upto(upto, DictArena::kBlockLz4, per);
+    return dict.coded_count() > was;
+  }
   std::shared_ptr<const SymbolCoder> coder = dict.coder();
   if (!dict.coded()) {
     if (dict.plain_bytes() < kMinBytes) return false;
@@ -16546,7 +16770,7 @@ bool ColumnStore::append_encoded(const std::string& val) {
       if (shared_dict) return false;
       unpack_segments();
       uint32_t id = null ? 0 : intern(val);
-      if (bit_width_ < 32 && (bit_width_ == 0 || ((uint64_t)id >> bit_width_))) repack_codes(*this, code_bits_for(id));
+      widen_for(id);
       row_count_++;
       mark();
       write_code(r, id);
@@ -16789,7 +17013,7 @@ bool ColumnStore::set_encoded(size_t row, const std::string& val) {
       if (shared_dict) return false;
       unpack_segments();
       uint32_t id = intern(val);
-      if (bit_width_ < 32 && (bit_width_ == 0 || ((uint64_t)id >> bit_width_))) repack_codes(*this, code_bits_for(id));
+      widen_for(id);
       write_code(row, id);
       break;
     }
@@ -17605,8 +17829,16 @@ void ColumnStore::erase(size_t row) {
   unpack_segments();
   epoch = sql_next_mutation_seq();
   if (encoding != ColumnEncoding::DictBitPacked || bit_width_ != 32) reencode_pending = true;
-  materialize_to_dict_packed();
-  if (row < data32.size()) data32.erase(data32.begin() + row);
+  // A dictionary at a byte-rounded width (8, 16 or 32 bits: one erase of the codes array, as erase_rows does), not
+  // the whole column at 32 bits a code for one row gone.
+  if (encoding != ColumnEncoding::DictBitPacked || shared_dict) to_dict_narrow();
+  if (bit_width_ != 8 && bit_width_ != 16 && bit_width_ != 32) repack_codes(*this, bit_width_ > 16 ? 32 : (bit_width_ > 8 ? 16 : 8));
+  if (bit_width_ == 32) {
+    if (row < data32.size()) data32.erase(data32.begin() + row);
+  } else {
+    const size_t w = bit_width_ / 8;
+    if ((row + 1) * w <= packed_data.size()) packed_data.erase(packed_data.begin() + (long)(row * w), packed_data.begin() + (long)((row + 1) * w));
+  }
   // The NULL flags move up with the values. Only the tail used to be cut, so
   // every row below a deleted one took the NULL-ness of the row after it: a
   // replicated DELETE turned a neighbour's NULL amount into 0 and a real note
@@ -17935,12 +18167,18 @@ static bool temporal_scan_dict(const ColumnStore& cs, bool* with_time, int64_t* 
 static constexpr size_t kTemporalMinDistinct = 256;
 
 bool ColumnStore::dict_temporal_fits() const {
-  if (encoding != ColumnEncoding::DictBitPacked || shared_dict || row_count_ == 0 || dict.size() <= kTemporalMinDistinct) return false;
+  // A run-length column of date strings too (its runs carry the same dictionary codes): atl's
+  // salesorders.date_created and debtortrans.inputdate, encoded before the temporal rule, were RLE and never looked at.
+  if ((encoding != ColumnEncoding::DictBitPacked && encoding != ColumnEncoding::RLE) || shared_dict || row_count_ == 0 ||
+      dict.size() <= kTemporalMinDistinct)
+    return false;
   bool with_time = false;
   int64_t lo, hi;
   if (!temporal_scan_dict(*this, &with_time, &lo, &hi, nullptr)) return false;
   const size_t packed = (row_count_ * temporal_code_bits((uint64_t)(hi - lo)) + 7) / 8;
-  const size_t coded = dict.memory_bytes() + (row_count_ * bit_width_ + 7) / 8;
+  const size_t coded = dict.memory_bytes() + (encoding == ColumnEncoding::RLE
+                                                  ? rle_codes_data.size() + rle_run_lengths.size() * sizeof(uint16_t)
+                                                  : (row_count_ * bit_width_ + 7) / 8);
   return packed < coded;
 }
 
@@ -17964,6 +18202,10 @@ void ColumnStore::dict_to_temporal() {
     write_code(r, (uint32_t)(vals[codes[r]] - lo));
   }
   if (bit_width_ == 32) packed_data.clear();
+  // (the runs of a run-length column, if it was one)
+  rle_num_runs = 0; rle_code_bits = 0;
+  std::vector<uint8_t>().swap(rle_codes_data); std::vector<uint16_t>().swap(rle_run_lengths);
+  std::vector<uint32_t>().swap(rle_escape_runs); std::vector<uint32_t>().swap(rle_escape_lengths); std::vector<uint32_t>().swap(rle_seg_base_rows);
   dict.clear(); drop_dict_derived(); dict.shrink_to_fit();
   id_index.clear();
   id_index_count = 0;
@@ -22554,6 +22796,7 @@ void SqlDatabase::maintain_storage() {
   size_t refreshed = 0;
   bool trimmed_tables = false;
   size_t recode_budget = (size_t)256 << 20;   // bytes of block columns transcoded to their TEXT_CODEC this checkpoint
+  size_t dict_budget = (size_t)32 << 20;      // bytes of dictionary text put into blocks or symbol codes this checkpoint
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
     bool changed = false;
@@ -22570,6 +22813,17 @@ void SqlDatabase::maintain_storage() {
         // The numeric readings of the entries are rebuilt on demand
         // (ensure_dict_doubles / ensure_dict_ints), not here under the lock.
         changed = true;
+      }
+      // A dictionary of long entries into compressed blocks, one of 32+ B entries into symbol codes, within a budget
+      // per checkpoint: until now this happened only when a column was encoded, so a column encoded before either
+      // existed (atl's salesorderdetails.po_options, 27 MB) kept its plain entries for good.
+      if (dict_budget > 0 && (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) && !cs.shared_dict &&
+          cs.dict.plain_bytes() >= ((size_t)1 << 20)) {
+        const size_t before = cs.dict.plain_bytes();
+        if (cs.code_dictionary(dict_budget)) {
+          dict_budget -= std::min(dict_budget, before - std::min(before, cs.dict.plain_bytes()));
+          changed = true;
+        }
       }
       // A DOUBLE column the same way, when every value it holds is a
       // decimal of at most four places that reads back as written (the
@@ -22588,7 +22842,8 @@ void SqlDatabase::maintain_storage() {
       // entries (not the rows) say whether every value is canonical text, and
       // it becomes days / seconds in FOR integers (dict_to_temporal). A column
       // still too small for the encoding is looked at again at the next checkpoint.
-      if (t.columns[c].temporal && !cs.reencode_pending && !cs.typed_tried && cs.encoding == ColumnEncoding::DictBitPacked &&
+      if (t.columns[c].temporal && !cs.reencode_pending && !cs.typed_tried &&
+          (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) &&
           !cs.shared_dict && cs.dict.size() > kTemporalMinDistinct) {
         cs.typed_tried = true;
         if (cs.dict_temporal_fits()) {
@@ -29980,6 +30235,14 @@ void typed_values(const ColumnStore& cs, size_t start, size_t end, double* out) 
     case ColumnEncoding::ALP:
       cs.alp_doubles(start, end, out);
       return;
+    case ColumnEncoding::TemporalDays:
+    case ColumnEncoding::TemporalSeconds: {   // days / seconds since 1970, as the sort key and the date predicate read them
+      static thread_local std::vector<uint32_t> codes;
+      if (codes.size() < n) codes.resize(n);
+      decode_codes(cs, start, end, codes.data());
+      for (size_t i = 0; i < n; ++i) out[i] = (double)(cs.base_int64 + (int64_t)codes[i]);
+      return;
+    }
     default:
       std::fill(out, out + n, 0.0);
   }
@@ -30098,6 +30361,7 @@ double typed_value(const ColumnStore& cs, size_t r) {
     case ColumnEncoding::DecimalScaled: return scaled_decimal_double(cs.base_int64 + (int64_t)cs.read_code(r), cs.scale_factor);
     case ColumnEncoding::SegmentFOR: return (double)cs.segfor_value(r);
     case ColumnEncoding::ALP: return cs.alp_value(r);
+    case ColumnEncoding::TemporalDays: case ColumnEncoding::TemporalSeconds: return (double)(cs.base_int64 + (int64_t)cs.read_code(r));
     default: return 0;
   }
 }
@@ -32301,11 +32565,28 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         return p;
       }
     }
-    if (numeric_col && e->args.size() >= 2 && e->args[0]->op == ExprOp::Column &&
+    // A date column held as days / seconds the same way: the constant as the column's integer (typed_values reads the
+    // rows as those), where the text compare below formatted every row (a month's count: 3.8 ms against 0.9).
+    const bool temporal_enc = cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds;
+    if ((numeric_col || temporal_enc) && e->args.size() >= 2 && e->args[0]->op == ExprOp::Column &&
         (e->op == ExprOp::Eq || e->op == ExprOp::Ne || e->op == ExprOp::Lt || e->op == ExprOp::Le ||
          e->op == ExprOp::Gt || e->op == ExprOp::Ge || e->op == ExprOp::Between)) {
-      auto as_number = [](const Val& v, double* d) {
+      auto as_number = [&](const Val& v, double* d) {
         if (v.null) return false;
+        if (temporal_enc) {
+          // 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' against seconds (a bare date is its midnight, as MariaDB reads it);
+          // 'YYYY-MM-DD' against days. Any other constant takes the text compare below.
+          if (v.numeric) return false;
+          const std::string s = v.str();
+          int64_t tv = 0;
+          if (cs.encoding == ColumnEncoding::TemporalSeconds) {
+            if (s.size() == 19 && temporal_parse(s, true, &tv)) { *d = (double)tv; return true; }
+            if (s.size() == 10 && temporal_parse(s, false, &tv)) { *d = (double)tv * 86400.0; return true; }
+            return false;
+          }
+          if (s.size() == 10 && temporal_parse(s, false, &tv)) { *d = (double)tv; return true; }
+          return false;
+        }
         // compare_vals: a number against text compares the text's numeric prefix.
         *d = v.numeric ? v.num : numeric_prefix_of(v.str());
         return true;
@@ -32315,7 +32596,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
       if (ok && e->op == ExprOp::Between)
         ok = e->args.size() == 3 && constant_value(e->args[2].get(), local, base, &b) && as_number(b, &p.hi);
       const Val* bp = e->op == ExprOp::Between ? &b : nullptr;
-      if (ok && needs_int_mode(cs, a, bp)) {
+      if (ok && !temporal_enc && needs_int_mode(cs, a, bp)) {
         p.op = e->op;
         p.negated = e->negated;
         ok = set_int_mode(p, cs, a, bp);
@@ -32328,6 +32609,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
         p.negated = e->negated;
         p.null_truth = kN;
         p.nulls = has_nulls(cs);
+        p.temporal = temporal_enc;   // (its zone maps hold text bounds, not these numbers: no pruning by them)
         return p;
       }
       // A NULL constant: every row compares to NULL.
@@ -32417,6 +32699,7 @@ bool segment_may_match(const Pred& p, const ColumnStore& cs, size_t seg) {
   if (p.kind == Pred::PerCode && p.nulls && p.null_truth == kT) return true;   // NULL rows pass: the map cannot say
   if (zm.all_null) return false;              // a comparison with NULL is never true
   if (p.negated) return true;                 // NOT BETWEEN: not worth the cases
+  if (p.kind == Pred::NumCmp && p.temporal) return true;   // a date column's numeric bounds are its leading years: not these numbers
   if (p.kind == Pred::NumCmp || (p.kind == Pred::TextCmp && p.num_lit)) {
     if (p.kind == Pred::TextCmp && !p.numeric_col) return true; // numeric prefixes of text: not in the map
     if (zm.min_double > zm.max_double) return true;
@@ -37071,6 +37354,13 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
           if (numeric && typed_numeric(cs)) {
             sk.kind = SortKey::Num;
             sk.ints = exact_int_scale(cs) >= 0 && wide_numbers(cs);   // 9007199254740993 sorts after ...992
+          }
+          else if (cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds) {
+            // Dates held as days / seconds: their order is the integers' (typed_ints reads them). Left to the
+            // generic key they were formatted and compared as text per row: ORDER BY date_created took 200 ms
+            // against 114 as a run-length dictionary.
+            sk.kind = SortKey::Num;
+            sk.ints = true;
           }
           else if (dict_coded(cs) && worth_per_code(cs)) {
             Source s = make_source(sk.expr, t, local, base);
@@ -54031,6 +54321,7 @@ constexpr uint32_t kStoreMagicV3 = 0x51534C33;  // "QSL3"
 // by the next save.
 // ---------------------------------------------------------------------------
 namespace {
+constexpr uint32_t kColStoreMagicV8 = 0x41515438; // "AQT8": a dictionary may be held in compressed blocks (DictArena::blocked)
 constexpr uint32_t kColStoreMagicV7 = 0x41515437; // "AQT7": a codec byte per compressed block (LZ4 or deflate); a block column may carry an open tail
 constexpr uint32_t kColStoreMagicV6 = 0x41515436; // "AQT6": compressed blocks keep lengths in the payload, compact FSST boundaries
 constexpr uint32_t kColStoreMagicV5 = 0x41515435; // "AQT5": compact RLE runs
@@ -54038,7 +54329,7 @@ constexpr uint32_t kColStoreMagicV4 = 0x41515434; // "AQT4": AQT3 and each colum
 constexpr uint32_t kColStoreMagicV3 = 0x41515433; // "AQT3": zone maps keyed by general_ci weight
 constexpr uint32_t kColStoreMagicV2 = 0x41515432; // "AQT2": keyed lower-cased, PAD SPACE
 constexpr uint32_t kColStoreMagicV1 = 0x41515431; // "AQT1": keyed on lowered text
-constexpr uint32_t kColStoreMagic = kColStoreMagicV7;
+constexpr uint32_t kColStoreMagic = kColStoreMagicV8;
 constexpr uint32_t kManifestMagic = 0x41514D31;   // "AQM1"
 // After the columns: the table's secondary indices (UNIQUE ones enforced) and
 // foreign keys. They were never written: a table kept them only while its
@@ -54144,7 +54435,22 @@ bool get_str_vec(Reader& r, DictArena& v) {
 // marker count, its symbol table, the coded entries as stored, then its
 // plain entries.
 constexpr uint64_t kCodedDictMarker = ~0ull;
+// AQT8: a blocked dictionary is this marker, the entries a block, the block count, each block (entries, raw bytes,
+// codec, payload), then its plain entries.
+constexpr uint64_t kBlockedDictMarker = ~0ull - 1;
 void put_dict(Writer& w, const DictArena& d) {
+  if (d.blocked()) {
+    w.u64(kBlockedDictMarker);
+    w.u32(d.per_block());
+    w.u32((uint32_t)d.blocks().size());
+    for (const DictArena::Block& b : d.blocks()) { w.u32(b.count); w.u32(b.raw_size); w.u8(b.codec); put_pod_vec(w, b.bytes); }
+    w.u64(d.size() - d.coded_count());
+    for (size_t k = d.coded_count(); k < d.size(); ++k) {
+      const std::string_view v = d.view(k);
+      w.bytes(ByteSpan(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+    }
+    return;
+  }
   if (!d.coded()) { put_str_vec(w, d); return; }
   w.u64(kCodedDictMarker);
   const SymbolCoder& c = *d.coder();
@@ -54163,7 +54469,20 @@ bool get_dict(Reader& r, DictArena& v, bool aqt4) {
   uint64_t n = r.u64();
   if (!r.ok()) return false;
   v.clear();
-  if (n == kCodedDictMarker) {
+  if (n == kBlockedDictMarker) {
+    const uint32_t per = r.u32();
+    const uint32_t nb = r.u32();
+    if (!r.ok() || per == 0 || nb > r.remaining()) return false;
+    std::vector<DictArena::Block> blocks(nb);
+    for (uint32_t i = 0; i < nb; ++i) {
+      blocks[i].count = r.u32();
+      blocks[i].raw_size = r.u32();
+      blocks[i].codec = r.u8();
+      if (!r.ok() || !get_pod_vec(r, blocks[i].bytes)) return false;
+    }
+    if (!v.set_blocked(per, std::move(blocks))) return false;
+    n = r.u64();
+  } else if (n == kCodedDictMarker) {
     const uint32_t nsym = r.u32();
     if (!r.ok() || nsym > 255) return false;
     auto c = std::make_shared<SymbolCoder>();
@@ -55239,7 +55558,7 @@ bool SqlDatabase::load_tables_v4() {
     const uint64_t valid_end = valid_lengths[ei] ? std::min<uint64_t>(valid_lengths[ei], file_bytes_kept ? file_bytes_kept->size() : image_end) : (file_bytes_kept ? file_bytes_kept->size() : image_end);
     Reader r(body);
     const uint32_t magic = r.u32();
-    if (magic != kColStoreMagic && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3 && magic != kColStoreMagicV2 && magic != kColStoreMagicV1) {
+    if (magic != kColStoreMagic && magic != kColStoreMagicV7 && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3 && magic != kColStoreMagicV2 && magic != kColStoreMagicV1) {
       slot.damaged.push_back({file, "not a table file this version reads"});
       return;
     }
@@ -55388,7 +55707,7 @@ bool SqlDatabase::load_tables_v4() {
     // SPACE, or lower-cased ASCII only): pruning on them could skip a segment
     // that matches. Rebuild them from the data; the table is rewritten at the
     // next checkpoint.
-    if (magic != kColStoreMagic && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3)
+    if (magic != kColStoreMagic && magic != kColStoreMagicV7 && magic != kColStoreMagicV6 && magic != kColStoreMagicV5 && magic != kColStoreMagicV4 && magic != kColStoreMagicV3)
       for (auto& cd : t.col_data) cd.build_zone_maps();
     t.ensure_columns();
     const size_t base_rows = t.row_count();

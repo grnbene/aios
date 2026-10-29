@@ -694,9 +694,24 @@ class DictArena {
   void clear() {
     bytes_.clear(); offs_.assign(1, 0);
     pfirst_ = 0; cbytes_.clear(); coffs_.clear(); coder_.reset();
+    blocked_ = false; per_block_ = 0; blocks_.clear();
     bucket_offs_.clear(); entry_count_ = 0; front_coded_ = false; sorted_ = false;
     gen_ = next_gen();
   }
+  // Blocked: entries [0, coded_count()) held as compressed blocks of per_block() entries each (deflate or LZ4; the
+  // payload a varint length per entry, then its bytes). For dictionaries of long entries - JSON options, notes,
+  // request bodies - 4-7x smaller than the text where symbol codes gave 2.7x; a point read decodes one block, and
+  // the block stays decoded for the reads after it. Exclusive with symbol codes and front coding.
+  struct Block { uint32_t count = 0; uint32_t raw_size = 0; uint8_t codec = 1; std::vector<uint8_t> bytes; };
+  static constexpr uint8_t kBlockLz4 = 0, kBlockDeflate = 1;
+  bool blocked() const { return blocked_; }
+  // Plain entries from coded_count() on into blocks of `per_block` (fixed by the first call), whole blocks only:
+  // what does not fill a block stays plain for a later call.
+  void block_upto(size_t upto, uint8_t codec, uint32_t per_block);
+  const std::vector<Block>& blocks() const { return blocks_; }
+  uint32_t per_block() const { return per_block_; }
+  // On load, into an empty arena: the blocks as stored; false when they do not add up.
+  bool set_blocked(uint32_t per_block, std::vector<Block> blocks);
   // A copy for the store: an arena only grows between clears (a compaction
   // builds a new one), so a copy that shares this arena's generation and
   // is a prefix of it takes the appended tail only - a checkpoint's
@@ -720,20 +735,26 @@ class DictArena {
   void shrink_to_fit() { bytes_.shrink_to_fit(); offs_.shrink_to_fit(); cbytes_.shrink_to_fit(); coffs_.shrink_to_fit(); bucket_offs_.shrink_to_fit(); }
   std::string_view view(size_t k) const {
     if (front_coded_) return view_front_coded(k);
-    if (k < pfirst_) return coded_view(k);
+    if (k < pfirst_) return blocked_ ? blocked_view(k) : coded_view(k);
     k -= pfirst_;
     return std::string_view(bytes_.data() + offs_[k], offs_[k + 1] - offs_[k]);
   }
   const std::string& operator[](size_t k) const;
   size_t memory_bytes() const {
-    return bytes_.capacity() + offs_.capacity() * sizeof(uint32_t) + cbytes_.capacity() + coffs_.capacity() * sizeof(uint32_t) +
-           bucket_offs_.capacity() * sizeof(uint32_t) + (coder_ ? coder_->memory_bytes() : 0);
+    size_t b = bytes_.capacity() + offs_.capacity() * sizeof(uint32_t) + cbytes_.capacity() + coffs_.capacity() * sizeof(uint32_t) +
+               bucket_offs_.capacity() * sizeof(uint32_t) + (coder_ ? coder_->memory_bytes() : 0) + blocks_.capacity() * sizeof(Block);
+    for (const Block& bl : blocks_) b += bl.bytes.capacity();
+    return b;
   }
-  size_t byte_size() const { return bytes_.size() + cbytes_.size(); }   // the entries as held
+  size_t byte_size() const {   // the entries as held
+    size_t b = bytes_.size() + cbytes_.size();
+    for (const Block& bl : blocks_) b += bl.bytes.size();
+    return b;
+  }
   size_t plain_bytes() const { return bytes_.size(); }
-  // Entries [0, coded_count()) are coded; data() / offsets() describe the
-  // plain ones only, so a reader of the raw buffer checks coded() first.
-  bool coded() const { return pfirst_ > 0; }
+  // Entries [0, coded_count()) are coded (symbol codes, or blocks when blocked()); data() / offsets() describe the
+  // plain ones only, so a reader of the raw buffer checks coded_count() first.
+  bool coded() const { return pfirst_ > 0; }   // (true for blocks as well: a reader of the raw buffer must decode)
   size_t coded_count() const { return pfirst_; }
   const std::shared_ptr<const SymbolCoder>& coder() const { return coder_; }
   // Entries [coded_count(), upto) coded with c (the arena's coder once it has one).
@@ -765,6 +786,10 @@ class DictArena {
   std::vector<uint8_t> cbytes_;
   std::vector<uint32_t> coffs_;   // pfirst_ + 1 of them when coded
   std::shared_ptr<const SymbolCoder> coder_;
+  bool blocked_ = false;           // entries [0, pfirst_) are in blocks_ (then coder_ is null)
+  uint32_t per_block_ = 0;
+  std::vector<Block> blocks_;
+  std::string_view blocked_view(size_t k) const;
   static constexpr size_t kBucketSize = 16;
   static constexpr size_t kBucketShift = 4;
   void un_front_code();
@@ -1089,6 +1114,10 @@ struct ColumnStore {
   void reserve(size_t sz);
   void resize(size_t sz, const std::string& val);
   void materialize_to_dict_packed();
+  // The column as a dictionary at the width its entries need (materialize_to_dict_packed leaves it at 32 bits a
+  // code): what a write the current encoding cannot take in place turns the column into.
+  void to_dict_narrow();
+  void widen_for(uint32_t id);   // the codes a bit wider when `id` does not fit (never 32 at once)
 
   // Bit-packing & integer code helpers
   uint32_t read_code(size_t row) const;
@@ -1172,7 +1201,7 @@ class PkMap {
   explicit PkMap(uint64_t (*hash)(const std::string&) = nullptr) : hash_fn_(hash), runs_(runs_enabled()) {}
   void clear() {
     slots_.clear(); koff_.clear(); arena_.clear(); dead_ = 0; count_ = used_ = 0; text_ = false;
-    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); shape_ = 0;
+    runs_ = runs_enabled(); runs_v_.clear(); gone_.clear(); late_.clear(); shape_ = 0;
   }
   void reserve(size_t n) { if (runs_) return; if (n * 3 + 4 > slots_.size() * 2) rehash(n); }
   iterator find(const std::string& key) {
@@ -1191,10 +1220,8 @@ class PkMap {
   iterator erase(iterator it) {
     if (runs_) {
       if (it.i == 0) return it;
-      const uint64_t k = it.run_hit.key;
-      gone_.insert(std::lower_bound(gone_.begin(), gone_.end(), k, int_less), k);
-      --count_;
-      if (gone_.size() * 4 > count_ + 256) to_slots();   // more erased than the runs save
+      run_erase(it.run_hit.key);
+      maybe_fold();
       return end();
     }
     slots_[it.i].state = 2;
@@ -1206,9 +1233,19 @@ class PkMap {
     ++it;
     return it;
   }
-  // Out of runs mode first, so the entry is a slot: the reference is into slots_, never into an iterator's copy.
+  // The reference is into slots_, or in runs mode into a run of the overlay holding this key alone - never into an
+  // iterator's copy. It is good until the next change to the map (its callers write through it at once).
   uint32_t& operator[](const std::string& key) {
-    if (runs_) to_slots();
+    if (runs_) {
+      uint64_t ik = 0;
+      if (int_key(key, &ik, true)) {
+        uint32_t v = 0;
+        auto have = run_find(key);
+        if (have != end()) { v = have->second; run_erase(ik); }
+        return late_[late_insert(ik, v, false)].val;
+      }
+      to_slots();
+    }
     const size_t i = emplace(key, 0).first.i;
     return slots_[i].second;
   }
@@ -1220,8 +1257,13 @@ class PkMap {
         if (run_append(ik, v)) return {run_iter(ik, (uint32_t)v), true};
         auto have = run_find(key);
         if (have != end()) return {have, false};
+        if (v <= UINT32_MAX) {   // a key before the last (a line added to an old order): into the overlay
+          late_insert(ik, (uint32_t)v, true);
+          maybe_fold();
+          return {run_iter(ik, (uint32_t)v), true};
+        }
       }
-      to_slots();   // a text key, or one not after the last: slots from here on
+      to_slots();   // a text key: slots from here on
     }
     if (!text_ && !is_int) to_text();
     if (text_) ik = hash_text(key);
@@ -1238,11 +1280,12 @@ class PkMap {
   }
   size_t memory_bytes() const {
     return slots_.capacity() * sizeof(Slot) + koff_.capacity() * sizeof(uint32_t) + arena_.capacity() +
-           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t);
+           runs_v_.capacity() * sizeof(Run) + gone_.capacity() * sizeof(uint64_t) + late_.capacity() * sizeof(Run);
   }
   // Every entry's row id through `fn` (a monotonic renumbering: the row index folding its gaps). In runs mode the
   // runs are rebuilt from the new ids; slots are rewritten in place.
   template <class F> void remap_values(F fn) {
+    if (runs_) fold();   // the overlay into the runs first: one list to renumber
     if (!runs_) {
       for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
       return;
@@ -1271,7 +1314,6 @@ class PkMap {
     runs_v_.swap(fresh);
     gone_.clear();
     count_ = n;
-    if (runs_v_.size() * 2 > count_ + 64) to_slots();
   }
   bool runs_mode() const { return runs_; }
   // How many maps have turned from runs back into slots (SHOW STATUS Asql_pk_runs_to_slots).
@@ -1314,16 +1356,112 @@ class PkMap {
     it.run_hit.state = 1;
     return it;
   }
+  // The overlay on the runs. late_: keys that arrived before the last one (a line added to an old order), and keys
+  // re-pointed at another row - runs of their own, sorted, never overlapping a live key of runs_v_ (such a key is in
+  // gone_ as well, and late_ answers first). gone_: erased keys of runs_v_. Both are folded into runs_v_ in one pass
+  // once they have grown (maybe_fold). Before this, any of these turned the map into slots for good: after a day of
+  // replication every map on atl was slots, 340 MB for keys that are ~2 MB as runs.
+  std::vector<Run> late_;
+  // The run of `rv` that holds key k, or nullptr.
+  static const Run* run_at(const std::vector<Run>& rv, uint64_t k) {
+    auto r = std::upper_bound(rv.begin(), rv.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    if (r == rv.begin()) return nullptr;
+    --r;
+    return (k - r->key) < r->n ? &*r : nullptr;
+  }
   iterator run_find(const std::string& key) {
     uint64_t ik = 0;
-    if (runs_v_.empty() || !int_key(key, &ik)) return end();
-    auto r = std::upper_bound(runs_v_.begin(), runs_v_.end(), ik, [](uint64_t k, const Run& x) { return int_less(k, x.key); });
-    if (r == runs_v_.begin()) return end();
-    --r;
-    const uint64_t off = ik - r->key;
-    if (off >= r->n) return end();
+    if ((runs_v_.empty() && late_.empty()) || !int_key(key, &ik)) return end();
+    if (const Run* l = run_at(late_, ik)) return run_iter(ik, (uint32_t)(l->val + (ik - l->key)));
+    const Run* r = run_at(runs_v_, ik);
+    if (!r) return end();
     if (!gone_.empty() && std::binary_search(gone_.begin(), gone_.end(), ik, int_less)) return end();
-    return run_iter(ik, (uint32_t)(r->val + off));
+    return run_iter(ik, (uint32_t)(r->val + (ik - r->key)));
+  }
+  // Key k -> id v into the overlay (k is not a live key). With `merge` it joins a neighbouring run it continues;
+  // without, it is a run of its own (operator[] hands out a reference to that run's id). Returns the run's index.
+  size_t late_insert(uint64_t k, uint32_t v, bool merge) {
+    auto r = std::upper_bound(late_.begin(), late_.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    const size_t at = (size_t)(r - late_.begin());   // the first run after k
+    ++count_;
+    if (merge) {
+      if (at > 0) {
+        Run& p = late_[at - 1];
+        if (p.key + p.n == k && (uint64_t)p.val + p.n == v && p.n < UINT32_MAX) { ++p.n; return at - 1; }
+      }
+      if (at < late_.size()) {
+        Run& s = late_[at];
+        if (k + 1 == s.key && v + 1 == s.val && s.n < UINT32_MAX) { s.key = k; s.val = v; ++s.n; return at; }
+      }
+    }
+    late_.insert(late_.begin() + (long)at, Run{k, v, 1});
+    return at;
+  }
+  // Key k, a live key, out of the map: out of the overlay if it is there, else marked gone in the runs.
+  void run_erase(uint64_t k) {
+    --count_;
+    auto r = std::upper_bound(late_.begin(), late_.end(), k, [](uint64_t a, const Run& x) { return int_less(a, x.key); });
+    if (r != late_.begin() && (k - (r - 1)->key) < (r - 1)->n) {
+      --r;
+      const uint64_t off = k - r->key;
+      if (r->n == 1) late_.erase(r);
+      else if (off == 0) { ++r->key; ++r->val; --r->n; }
+      else if (off == r->n - 1) --r->n;
+      else {
+        const Run tail{k + 1, (uint32_t)(r->val + off + 1), (uint32_t)(r->n - off - 1)};
+        r->n = (uint32_t)off;
+        late_.insert(r + 1, tail);
+      }
+      return;
+    }
+    gone_.insert(std::lower_bound(gone_.begin(), gone_.end(), k, int_less), k);
+  }
+  // The overlay into the runs, once it holds a few thousand entries or a 64th of the map (a pass over the runs).
+  void maybe_fold() {
+    if (late_.size() + gone_.size() > 4096 + count_ / 64) fold();
+  }
+  void fold() {
+    if (!runs_ || (late_.empty() && gone_.empty())) return;
+    std::vector<Run> fresh;
+    fresh.reserve(runs_v_.size() + late_.size() + gone_.size());
+    size_t g = 0, li = 0, n = 0;
+    uint32_t lj = 0;
+    bool ok = true;
+    auto take = [&](uint64_t k, uint32_t v) { ok = ok && append_run(fresh, k, v); ++n; };
+    // The overlay's entries before key k (all of them when `all`); true when the next one is k itself.
+    auto late_upto = [&](uint64_t k, bool all) {
+      while (li < late_.size() && ok) {
+        const uint64_t lk = late_[li].key + lj;
+        if (!all) {
+          if (lk == k) return true;
+          if (!int_less(lk, k)) return false;
+        }
+        take(lk, late_[li].val + lj);
+        if (++lj == late_[li].n) { ++li; lj = 0; }
+      }
+      return false;
+    };
+    for (const Run& r : runs_v_) {
+      for (uint32_t j = 0; j < r.n && ok; ++j) {
+        const uint64_t k = r.key + j;
+        if (late_upto(k, false)) {   // re-pointed: the overlay's id, not this run's
+          take(k, late_[li].val + lj);
+          if (++lj == late_[li].n) { ++li; lj = 0; }
+          continue;
+        }
+        while (g < gone_.size() && int_less(gone_[g], k)) ++g;
+        if (g < gone_.size() && gone_[g] == k) continue;
+        take(k, r.val + j);
+      }
+      if (!ok) break;
+    }
+    late_upto(0, true);
+    std::vector<Run>().swap(late_);
+    std::vector<uint64_t>().swap(gone_);
+    fresh.shrink_to_fit();
+    runs_v_.swap(fresh);
+    count_ = n;
+    if (!ok) to_slots();
   }
   // Key `k` -> id `v` after the last entry of `rv`, when `k` is after every key there; false otherwise (unchanged).
   static bool append_run(std::vector<Run>& rv, uint64_t k, size_t v) {
@@ -1340,7 +1478,8 @@ class PkMap {
   bool run_append(uint64_t k, size_t v) {
     if (!append_run(runs_v_, k, v)) return false;
     ++count_;
-    if (runs_v_.size() * 2 > count_ + 64) to_slots();   // keys too scattered for runs to save anything
+    // (A run per key, keys with gaps, still costs less than a slot a key: 16 B against ~23, so nothing here turns
+    // scattered keys into slots.)
     return true;
   }
   // Runs into slots, for good.
@@ -1367,6 +1506,14 @@ class PkMap {
         ++count_; ++used_;
       }
     }
+    for (const Run& r : late_) {
+      for (uint32_t j = 0; j < r.n; ++j) {
+        const size_t at = place(r.key + j);
+        slots_[at] = Slot{r.key + j, r.val + j, 1};
+        ++count_; ++used_;
+      }
+    }
+    late_.clear();
   }
   uint64_t hash_text(const std::string& key) const { return hash_fn_ ? hash_fn_(key) : (uint64_t)std::hash<std::string>{}(key); }
   // The keys of one map are one shape (one table's primary key): shape_ 1, a single integer; 2, two integers packed
