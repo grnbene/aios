@@ -47,7 +47,9 @@ page for each item below.
    `:focus-visible` and `:focus-within` match the field that has the keyboard since 2026-10-29, reconciled once a
    frame from the pane's own focus; `scripts/drive-focus.sh`. A same-page anchor link, or a URL with a fragment,
    scrolls to the element and `:target` matches it since 2026-10-29 - before, following `#section` did nothing;
-   `scripts/drive-target.sh`.) `:visited` and the rest still never match.
+   `scripts/drive-target.sh`. `:visited` matches a link whose address this browser has been to in this session
+   since 2026-10-29 - no history is kept across runs; `scripts/drive-visited.sh`.) `:current`, `:past`,
+   `:future`, `:playing`, `:paused`, `:user-invalid` and `:user-valid` still never match.
 7. **Missing images** show their alt text in a box; Chrome shows a broken-image icon beside the alt text.
 8. **A page that sets no background** is drawn on the engine's dark ground (the machine's own look), where Chrome uses
    white. A deliberate difference, not a gap.

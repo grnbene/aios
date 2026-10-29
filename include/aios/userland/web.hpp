@@ -868,6 +868,21 @@ Result<void> visit(const std::string& url, const Metrics& m, int viewport_w, boo
   Stylesheet author_;
   std::vector<std::string> history_;
   int history_index_ = -1;
+  // Every URL this browser has been to (the back/forward list is cut on a new visit; this is not): what `:visited`
+  // means. visited_gen_ moves when a URL is added, so the pane re-marks the links only then.
+  std::vector<std::string> visited_;
+  uint64_t visited_gen_ = 0;
+  void note_visited(const std::string& url) {
+    for (const auto& u : visited_) if (u == url) return;
+    visited_.push_back(url);
+    ++visited_gen_;
+  }
+
+ public:
+  bool visited(const std::string& url) const { for (const auto& u : visited_) if (u == url) return true; return false; }
+  uint64_t visited_gen() const { return visited_gen_; }
+
+ private:
   std::string status_;
   std::string target_;          // the current document's fragment, "" for none
   bool target_pending_ = false; // the pane has yet to scroll to it

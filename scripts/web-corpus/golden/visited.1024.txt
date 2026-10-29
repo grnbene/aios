@@ -1,0 +1,13 @@
+# page visited.html  viewport=1024
+# title A visited link
+# content 1024x122  background=ffffffff  links=2
+text      20    20   147    19  #ff1a0dab  14px             u link=0  "A link into this page"
+text     167    20    35    19  #ff1a1a1a  14px              " and "
+text     202    20   133    19  #ff1a0dab  14px             u link=1  "one to another page"
+text     335    20     7    19  #ff1a1a1a  14px              "."
+rect      20    51   984    39  #ffeeeeee
+text      30    61   742    19  #ff1a1a1a  14px              "Following the first link makes it a visited one: it takes the :visited colour. The second stays unvisited."
+link     20    20   147    19  file:///#here  "A link into this page"
+link    202    20   133    19  file:///elsewhere.html  "one to another page"
+# glyph-gaps (none)
+

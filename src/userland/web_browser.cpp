@@ -325,6 +325,7 @@ Result<void> Browser::visit(const std::string& url, const Metrics& m, int viewpo
       history_.push_back(doc_.url);
       history_index_ = (int)history_.size() - 1;
     }
+    note_visited(doc_.url);
   }
 
   status_ = doc_.title + " · " + dec(doc_.fragments.size()) + " box(es), " + dec(doc_.links.size()) + " link(s)";
@@ -444,6 +445,7 @@ Result<void> Browser::follow(size_t link_index, const Metrics& m, int viewport_w
       target_ = href.substr(hash + 1);
       target_pending_ = true;
       status_ = target_.empty() ? "top of the page" : "#" + target_;
+      note_visited(doc_.url + "#" + target_);   // the anchor counts as visited, as Chrome has it
       return Ok();
     }
   }

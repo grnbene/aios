@@ -26,6 +26,7 @@ extern bool g_css_has_hover;   // web_css.cpp
 extern bool g_css_has_active;  // web_css.cpp: a :active rule exists, so a press marks the pressed element
 extern bool g_css_has_focus;   // web_css.cpp: a :focus / :focus-within rule exists, so the focused field is marked
 extern bool g_css_has_target;  // web_css.cpp: a :target rule exists, so the element the fragment names is marked
+extern bool g_css_has_visited; // web_css.cpp: a :visited rule exists, so links to visited addresses are marked
 namespace aios::userland {
 namespace {
 
@@ -502,6 +503,37 @@ static void update_target(WebPane& pane, int view_h) {
   }
   const int max_scroll = std::max(0, doc.content_height - view_h);
   pane.scroll = std::max(0, std::min(y, max_scroll));
+}
+// `:visited`: every `<a href>` whose address (resolved against the page's) this browser has been to carries
+// data-aios-visited. Marked when the document changes and when the set of visited addresses grows (a link just
+// followed to another page is visited on the way back; a same-page anchor at once).
+static const void* s_visited_dom = nullptr;
+static uint64_t s_visited_gen = 0;
+static bool mark_visited_links(WebPane& pane, web::Node* n, const std::string& base) {
+  bool changed = false;
+  if (!n) return false;
+  if (n->kind == web::Node::Kind::Element && n->tag == "a") {
+    const std::string href = n->attr("href");
+    const bool want = !href.empty() && pane.browser->visited(web::resolve_url(base, href));
+    auto& a = n->attrs;
+    size_t at = a.size();
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].name == "data-aios-visited") { at = i; break; }
+    if (want && at == a.size()) { a.push_back({"data-aios-visited", "1"}); changed = true; }
+    else if (!want && at < a.size()) { a.erase(a.begin() + (long)at); changed = true; }
+  }
+  for (auto& ch : n->children) changed = mark_visited_links(pane, ch.get(), base) || changed;
+  return changed;
+}
+static void update_visited(WebPane& pane) {
+  if (!::g_css_has_visited || !pane.browser) return;
+  const web::Document& doc = pane.browser->document();
+  web::Node* dom = doc.dom.get();
+  if (!dom) return;
+  const uint64_t gen = pane.browser->visited_gen();
+  if (dom == s_visited_dom && gen == s_visited_gen) return;
+  s_visited_dom = dom;
+  s_visited_gen = gen;
+  if (mark_visited_links(pane, dom, doc.url)) s_reflow_req = true;
 }
 static void update_focus(WebPane& pane) {
   if (!::g_css_has_focus) return;
@@ -1665,6 +1697,7 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   update_hover(pane, view_w, k.host().monotonic_ns() / 1000000ULL);
   update_focus(pane);
   update_target(pane, view_h);
+  update_visited(pane);
   pane.browser->set_view_height(view_h);
 
   // The page's own time. A frame handler, a due timer, an animation frame: each
