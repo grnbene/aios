@@ -1,4 +1,5 @@
 // A Thing that names only what a Thing may: pure builtins, the engine's reads, and its own functions.
+// (An import mentioned in a comment is not an import: import "../lib/nothing.gr" is not looked for.)
 let BY_HOUR = "by_hour"
 
 fn hour_of(row) { return slice(row.at, 0, 13) }
