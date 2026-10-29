@@ -2,6 +2,9 @@
 // and the control link. Everything goes through the host layer (hal::Host for files, time and randomness;
 // hal::net for sockets; hal::Thread), so it runs wherever grain does.
 #include "aios/userland/grain_app.hpp"
+#include "aios/userland/thing_builtins.hpp"
+#include <map>
+#include <set>
 
 #include <algorithm>
 #include <cctype>
@@ -217,12 +220,136 @@ Result<Manifest> read_manifest(const Bundle& b) {
   return m;
 }
 
+namespace {
+// The global names a compiled program reads and the ones it defines, by walking its code and its nested functions.
+void global_uses(const FnObj& fn, std::map<std::string, int>* reads, std::set<std::string>* defines) {
+  const Chunk& c = fn.chunk;
+  for (size_t at = 0; at < c.code.size(); at += instruction_length(fn, at)) {
+    const Op op = (Op)c.code[at];
+    if (op != Op::GetGlobal && op != Op::DefineGlobal && op != Op::SetGlobal) continue;
+    const size_t k = (size_t)((c.code[at + 1] << 8) | c.code[at + 2]);
+    if (k >= c.constants.size()) continue;
+    const std::string name = c.constants[k].str();
+    if (op == Op::GetGlobal) { if (!reads->count(name)) (*reads)[name] = at < c.lines.size() ? c.lines[at] : 0; }
+    else defines->insert(name);
+  }
+  for (const Value& k : c.constants)
+    if (k.type == Type::Fn && k.obj)
+      if (auto* sub = dynamic_cast<FnObj*>(k.obj.get())) global_uses(*sub, reads, defines);
+}
+}  // namespace
+
+// A Thing's program (things/*.gr) may name only the pure builtins the engine keeps for it, what the engine
+// defines for a Thing, and what it defines itself; anything else is refused here, on the developer's machine, with
+// the line - not at deploy, by deployed.gr. Shared list: include/aios/userland/thing_builtins.hpp.
+namespace {
+// "<dir>/../lib/feed.gr" as the bundle spells it: the importer's directory joined with the import's path, `.` and
+// `..` folded.
+std::string bundle_path(const std::string& importer, const std::string& rel) {
+  std::vector<std::string> parts;
+  auto take = [&](const std::string& s) {
+    size_t at = 0;
+    while (at <= s.size()) {
+      const size_t sl = s.find('/', at);
+      const std::string seg = s.substr(at, sl == std::string::npos ? std::string::npos : sl - at);
+      if (seg == "..") { if (!parts.empty()) parts.pop_back(); }
+      else if (!seg.empty() && seg != ".") parts.push_back(seg);
+      if (sl == std::string::npos) break;
+      at = sl + 1;
+    }
+  };
+  const size_t dir = importer.rfind('/');
+  if (dir != std::string::npos) take(importer.substr(0, dir));
+  take(rel);
+  std::string out;
+  for (const auto& p : parts) out += (out.empty() ? "" : "/") + p;
+  return out;
+}
+// The paths a source imports: `import "path"` statements.
+std::vector<std::string> imports_of(const std::string& src) {
+  std::vector<std::string> out;
+  size_t at = 0;
+  while ((at = src.find("import", at)) != std::string::npos) {
+    const bool at_start = at == 0 || src[at - 1] == '\n' || src[at - 1] == ' ' || src[at - 1] == '\t' || src[at - 1] == ';';
+    size_t p = at + 6;
+    while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) ++p;
+    if (at_start && p < src.size() && src[p] == '"') {
+      const size_t e = src.find('"', p + 1);
+      if (e != std::string::npos) out.push_back(src.substr(p + 1, e - p - 1));
+    }
+    at = p;
+  }
+  return out;
+}
+const std::string* bundle_file(const Bundle& b, const std::string& path) {
+  for (const auto& [p, src] : b.files) if (p == path) return &src;
+  return nullptr;
+}
+}  // namespace
+
+// A Thing's program (things/*.gr) and the modules it imports run in a VM that has only the pure builtins the engine
+// keeps for it, what the engine defines for a Thing, and what the program and its modules define. Anything else is
+// refused here, on the developer's machine, with the line - not at deploy, by deployed.gr. Shared list:
+// include/aios/userland/thing_builtins.hpp.
+static std::string thing_lint(const Bundle& b, const std::string& path, const FnObj& script) {
+  static const std::set<std::string> allowed = [] {
+    std::set<std::string> s(thing_allowed_builtins().begin(), thing_allowed_builtins().end());
+    s.insert(thing_native_names().begin(), thing_native_names().end());
+    s.insert("import");
+    return s;
+  }();
+  static const std::set<std::string> builtins = [] {
+    Vm vm;
+    install_core_builtins(vm);   // every core builtin a program could name, for the wording
+    const auto names = vm.global_names();
+    return std::set<std::string>(names.begin(), names.end());
+  }();
+  // The program and the modules it imports (and theirs), each compiled once; what any of them defines is in
+  // scope for all, as it is in the one VM they run in.
+  struct Unit { std::string path; std::map<std::string, int> reads; };
+  std::vector<Unit> units;
+  std::set<std::string> defines, seen{path};
+  std::vector<std::shared_ptr<FnObj>> keep;
+  std::vector<std::pair<std::string, const FnObj*>> todo{{path, &script}};
+  std::string out;
+  while (!todo.empty()) {
+    auto [p, fn] = todo.back();
+    todo.pop_back();
+    Unit u{p, {}};
+    global_uses(*fn, &u.reads, &defines);
+    units.push_back(std::move(u));
+    const std::string* src = bundle_file(b, p);
+    if (!src) continue;
+    for (const std::string& rel : imports_of(*src)) {
+      const std::string mp = bundle_path(p, rel);
+      if (!seen.insert(mp).second) continue;
+      const std::string* msrc = bundle_file(b, mp);
+      if (!msrc) { out += (out.empty() ? "" : "; ") + p + ": imports " + rel + ", which is not in the app"; continue; }
+      auto c = compile_source(*msrc, mp);
+      if (!c.ok()) continue;   // compile_all reports it in its own turn
+      keep.push_back(c.script);
+      todo.push_back({mp, c.script.get()});
+    }
+  }
+  for (const Unit& u : units)
+    for (const auto& [name, line] : u.reads) {
+      if (allowed.count(name) || defines.count(name)) continue;
+      out += (out.empty() ? "" : "; ") + u.path + ":" + std::to_string(line) + ": '" + name +
+             (builtins.count(name) ? "' is not available in a Thing (pure builtins only: docs/things.md)" : "' is not defined");
+    }
+  return out;
+}
+
 Result<void> compile_all(const Bundle& b) {
   std::string errs;
   for (const auto& [p, src] : b.files) {
     if (p.size() < 3 || p.compare(p.size() - 3, 3, ".gr") != 0) continue;
     auto c = compile_source(src, p);
     if (!c.ok()) for (const auto& d : c.errors) errs += (errs.empty() ? "" : "; ") + p + ":" + std::to_string(d.line) + ": " + d.message;
+    else if (p.rfind("things/", 0) == 0) {
+      const std::string lint = thing_lint(b, p, *c.script);
+      if (!lint.empty()) errs += (errs.empty() ? "" : "; ") + lint;
+    }
   }
   if (!errs.empty()) return Result<void>(Status::Invalid, errs);
   return Ok();

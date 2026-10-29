@@ -76,6 +76,7 @@ grain_case(cli.modules_threads ${CLI_CASES} 0 run modules_threads.gr)    # impor
 grain_case(cli.escapes ${CLI_CASES} 0 run escapes.gr)    # \uXXXX, \u{...}, surrogate pairs, \xHH
 grain_case(cli.flat_map ${CLI_CASES} 0 run flat_map.gr)    # flat_map over lists and maps
 grain_case(cli.listops ${CLI_CASES} 0 run listops.gr)    # chunk, partition, take_while, drop_while, sum, min_by, max_by, find_index, zip_with
+grain_case(app.things_check ${CMAKE_CURRENT_SOURCE_DIR}/app_things 1 app check .)    # a Thing naming what a Thing may not is refused with the lines
 grain_case(cli.compile_error ${CLI_CASES} 1 run compile_error.gr)
 grain_case(cli.lex_error ${CLI_CASES} 1 run lex_error.gr)             # the caret sits under the character the lexer refused
 grain_case(cli.runtime_error ${CLI_CASES} 2 run runtime_error.gr)
