@@ -16,6 +16,7 @@
 #include <shared_mutex>
 #include <functional>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #if defined(__linux__)
 #include <linux/futex.h>
@@ -1194,7 +1195,7 @@ class PkMap {
     bool operator!=(const iterator& o) const { return i != o.i; }
     void skip() { while (i < m->slots_.size() && m->slots_[i].state != 1) ++i; }
   };
-  iterator begin() { if (runs_) to_slots(); if (sorted_) sorted_to_slots(); iterator it{this, 0}; it.skip(); return it; }
+  iterator begin() { if (runs_) to_slots("a walk"); if (sorted_) sorted_to_slots(); iterator it{this, 0}; it.skip(); return it; }
   iterator end() { return iterator{this, (runs_ || sorted_) ? 0 : slots_.size()}; }
   size_t size() const { return count_; }
   bool empty() const { return count_ == 0; }
@@ -1253,7 +1254,7 @@ class PkMap {
         if (have != end()) { v = have->second; run_erase(ik); }
         return late_[late_insert(ik, v, false)].val;
       }
-      to_slots();
+      to_slots("a write through a key that is not this map's integer shape");
     }
     if (sorted_) {
       // A live key's id is written where it is; a new key goes to the overlay (no fold here: the reference
@@ -1281,7 +1282,7 @@ class PkMap {
           return {run_iter(ik, (uint32_t)v), true};
         }
       }
-      to_slots();   // a text key: slots from here on
+      to_slots(is_int ? "an id past 32 bits" : "a key that is not this map's integer shape");   // slots from here on
     }
     if (sorted_) {
       auto have = sorted_find(key);
@@ -1346,7 +1347,7 @@ class PkMap {
       if (!ok) break;
     }
     if (!ok) {
-      to_slots();
+      to_slots("an id past 32 bits at a renumbering");
       for (Slot& sl : slots_) if (sl.state == 1) sl.second = (uint32_t)fn(sl.second);
       return;
     }
@@ -1391,7 +1392,7 @@ class PkMap {
         count_ = n;
         return gone;
       }
-      to_slots();   // an id past 32 bits: as slots, below (nothing was dropped yet)
+      to_slots("an id past 32 bits at a gap fold");   // as slots, below (nothing was dropped yet)
       gone = 0;
     }
     for (size_t i = 0; i < slots_.size(); ++i) {
@@ -1459,6 +1460,8 @@ class PkMap {
   bool sorted_mode() const { return sorted_; }
   // Text keys held as slots: what sort_text_keys would take (an integer map that fell back to slots is not one).
   bool text_slots() const { return text_ && !sorted_ && !runs_; }
+  // The table's name for the store trace; the pointer must outlive the map (the row index's own string).
+  void trace_name(const char* n) { trace_name_ = n; }
   // How many maps have been sorted, and how many sorted maps turned back into slots (SHOW STATUS).
   static std::atomic<uint64_t>& sorted_count() { static std::atomic<uint64_t> n{0}; return n; }
   static std::atomic<uint64_t>& sorted_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }
@@ -1627,7 +1630,7 @@ class PkMap {
     fresh.shrink_to_fit();
     runs_v_.swap(fresh);
     count_ = n;
-    if (!ok) to_slots();
+    if (!ok) to_slots("an id past 32 bits at a fold");
   }
   // Key `k` -> id `v` after the last entry of `rv`, when `k` is after every key there; false otherwise (unchanged).
   static bool append_run(std::vector<Run>& rv, uint64_t k, size_t v) {
@@ -1648,10 +1651,12 @@ class PkMap {
     // scattered keys into slots.)
     return true;
   }
-  // Runs into slots, for good.
-  void to_slots() {
+  // Runs into slots, for good. `why` names the cause in the store trace (AIOS_STORE_TRACE), with the table.
+  void to_slots(const char* why = "") {
     if (!runs_) return;
     runs_to_slots_count().fetch_add(1, std::memory_order_relaxed);
+    static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+    if (trace) std::fprintf(stderr, "[store] %s: key map of %zu keys turns from runs into slots (%s)\n", trace_name_ ? trace_name_ : "?", count_, why);
     std::vector<Run> rv;
     rv.swap(runs_v_);
     std::vector<uint64_t> gone;
@@ -1892,6 +1897,7 @@ class PkMap {
   // AIOS_SQL_PK_SORTED=0 leaves every map as slots.
   struct SlateEntry { std::string key; uint32_t val; };
   bool sorted_ = false;
+  const char* trace_name_ = nullptr;
   std::vector<char> skeys_;
   std::vector<uint32_t> soff_, sval_;
   std::vector<uint64_t> sidx_;
