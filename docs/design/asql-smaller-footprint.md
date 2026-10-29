@@ -250,6 +250,23 @@ What is still open: the allocator gap itself. The replica measurement says it fo
 which steps 1 and 2 remove, but that is a prediction until the new binary runs under replication (the next thing to
 do on the local replica, then atl).
 
+## Deploying to atl
+
+The table files become AQT8 at the first checkpoint, which the old binary refuses. So, in this order:
+
+1. `scripts/asql-export.sh` on atl (or `cp -a` of `/opt/aios/root-v8/sql_db` with the service stopped) kept beside
+   the old binary `/opt/aios/bin/aios-829500b6` as the rollback pair; the export alone is not enough once the new
+   binary has checkpointed.
+2. Upload the new binary, verify the md5, point `AIOS_BIN` at it, restart `aios-compute`. `SHOW ASQL STORAGE` and
+   `SHOW GLOBAL STATUS` (`Asql_memory_bytes`, `Asql_rss_bytes`, `Asql_pk_runs_to_slots`) at +1 min, +1 h, +1 day.
+   Expected on atl after a day: `Asql_pk_runs_to_slots` in the tens, not the hundreds; resident well under the old
+   2.1 GB.
+3. Rollback = stop, put the pre-deploy store copy back, start the old binary. Replication resumes from the copy's
+   `cdc_position` (keep it: `--keep-replication-state`).
+
+The stall fixes (commit 4589495) ride along: the hang-up watcher, the 10-minute read deadline
+(`AIOS_SQL_MAX_READ_MS` in the unit's environment to change it), lock-free `SHOW PROCESSLIST` and `SELECT 1`.
+
 ## What this does not do
 
 - It does not cap or trim the key maps (the earlier plan's phase 1). The engine rewrites `rowindexes.list` on every
