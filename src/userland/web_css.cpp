@@ -37,6 +37,7 @@
 
 bool g_css_has_hover = false;   // some stylesheet had a :hover rule (read by web_pane.cpp)
 bool g_css_has_active = false;  // ... a :active rule: the pane marks the pressed element while the button is down
+bool g_css_has_focus = false;   // ... a :focus / :focus-within rule: the pane marks the field that has the keyboard
 
 namespace aios::userland::web {
 namespace {
@@ -1015,8 +1016,16 @@ SimpleSelector parse_simple(const std::string& text) {
         s.attrs.push_back(std::move(t));
         saw_pseudo = false;
         g_css_has_active = true;
-      } else if (name == "focus" || name == "focus-visible" ||
-          name == "focus-within" || name == "target" || name == "visited" || name == "current" ||
+      } else if (name == "focus" || name == "focus-visible" || name == "focus-within") {
+        // Decidable: the pane marks the field that has the keyboard with data-aios-focus (and it and its ancestors
+        // with data-aios-focus-within) each frame the focus changes, and re-cascades (web_pane.cpp update_focus).
+        SimpleSelector::AttrTest t;
+        t.name = name == "focus-within" ? "data-aios-focus-within" : "data-aios-focus";
+        t.op = SimpleSelector::AttrTest::Op::Present;
+        s.attrs.push_back(std::move(t));
+        saw_pseudo = false;
+        g_css_has_focus = true;
+      } else if (name == "target" || name == "visited" || name == "current" ||
           name == "past" || name == "future" || name == "playing" || name == "paused" ||
           name == "user-invalid" || name == "user-valid") {
         s.never = true;

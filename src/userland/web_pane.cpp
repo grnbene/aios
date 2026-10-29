@@ -24,6 +24,7 @@
 
 extern bool g_css_has_hover;   // web_css.cpp
 extern bool g_css_has_active;  // web_css.cpp: a :active rule exists, so a press marks the pressed element
+extern bool g_css_has_focus;   // web_css.cpp: a :focus / :focus-within rule exists, so the focused field is marked
 namespace aios::userland {
 namespace {
 
@@ -443,6 +444,32 @@ static void clear_active() {
   if (!s_active_node) return;
   set_mark_chain(s_active_node, "data-aios-active", false);
   s_active_node = nullptr;
+  s_reflow_req = true;
+}
+// `:focus` / `:focus-within`: the field that has the keyboard (pane.field, set by clicks, Tab and autofocus in
+// several places) is reconciled here once a frame: the element carries data-aios-focus, it and its ancestors
+// data-aios-focus-within. Neither matched before.
+static web::Node* s_focus_node = nullptr;
+static const void* s_focus_dom = nullptr;
+static void set_focus_marks(web::Node* n, bool on) {
+  if (!n) return;
+  if (n->kind == web::Node::Kind::Element) {
+    auto& a = n->attrs;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i].name == "data-aios-focus") { a.erase(a.begin() + (long)i); break; }
+    if (on) a.push_back({"data-aios-focus", "1"});
+  }
+  set_mark_chain(n, "data-aios-focus-within", on);
+}
+static void update_focus(WebPane& pane) {
+  if (!::g_css_has_focus) return;
+  web::Node* dom = pane.browser ? pane.browser->document().dom.get() : nullptr;
+  if (s_focus_dom != dom) { s_focus_node = nullptr; s_focus_dom = dom; }
+  web::Node* now = pane.field;
+  if (now == s_focus_node) return;
+  set_focus_marks(s_focus_node, false);
+  set_focus_marks(now, true);
+  s_focus_node = now;
   s_reflow_req = true;
 }
 // Called in the frame with the guard held.
@@ -1594,6 +1621,7 @@ void render_web_pane_frame(HardwareCompositor& c, WindowSurface& win, Kernel& k)
   }
   pane.last_viewport_w = view_w;
   update_hover(pane, view_w, k.host().monotonic_ns() / 1000000ULL);
+  update_focus(pane);
   pane.browser->set_view_height(view_h);
 
   // The page's own time. A frame handler, a due timer, an animation frame: each
