@@ -304,8 +304,11 @@ text-keyed map of 4,096+ keys into one arena in key order (varint length + bytes
 key, and an index of every 64th key's first 8 bytes that narrows the bisection to a few groups. Writes go to an
 overlay (`slate_`: new keys sorted; `sgone_`: erased positions) folded in at the runs-mode threshold; a re-point
 writes the id in place; an id past 32 bits or a walk turns the map back to slots (`Asql_pk_sorted_to_slots`), to be
-sorted again. `maintain_storage` sorts up to 500k keys a checkpoint, text-keyed slot maps only (integer maps that
-fell back to slots - 31 on this store - are not candidates: counting them ate the budget). Measured on the atl
+sorted again. `maintain_storage` sorts up to 500k keys a checkpoint, text-keyed slot maps only (an integer map that fell
+back to slots is not a candidate; counting them ate the budget). The "31 maps turned to slots" this store
+reported were not fallbacks: `Asql_pk_runs_to_slots` counted every empty map taking its first text key (fixed in
+18530d9; the to_slots trace names the table and the cause); on replica C with the trace, no map with keys has
+fallen back. Measured on the atl
 store copy with the full warm-up list: key maps 289 -> 133 MB after the boot checkpoint and six maintaining
 checkpoints (19 maps, two small ones left for the next), counted memory 691 -> 577 MB; `prices` 879k keys
 113 -> 43 MB in 408 ms, `stockmoves` 574k in 226 ms, everything else under 100 ms. Micro-benchmark on 3M keys:
