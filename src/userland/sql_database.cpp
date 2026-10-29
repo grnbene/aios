@@ -24502,13 +24502,20 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       size_t rows_warmed = 0, rows_skipped = 0;
       const size_t budget = row_index_budget_bytes();
       for (const auto& name : want_rows) {
-        {
-          std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
-          if (row_indices_memory_bytes_locked() >= budget) { ++rows_skipped; continue; }
-        }
         StatementLock lock(rw_lock_, false);
         for (const auto& kv : tables_) {
           if (lower_of(kv.second.name) != name) continue;
+          // What the map will take, before it is built (st's stockmovestaxes, 20M rows, is about a gigabyte on its
+          // own: checked after the build, the last map took the total to twice the budget). A key is ~24 bytes in a
+          // map, a text key about twice that.
+          bool text_key = false;
+          for (const auto& col : kv.second.columns)
+            if (col.is_primary_key && col.type == SqlDataType::Text) text_key = true;
+          const size_t expect = kv.second.row_count() * (text_key ? 48 : 24);
+          {
+            std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+            if (row_indices_memory_bytes_locked() + expect > budget) { ++rows_skipped; break; }
+          }
           grow_row_index(kv.second);
           std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
           auto it = table_row_indices_.find(name);
