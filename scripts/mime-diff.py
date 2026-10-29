@@ -221,7 +221,28 @@ Content-Type: text/html
 --O--
 """)
 cases["utf8-8bit"] = crlf("From: a@x\nSubject: u\nDate: Tue, 1 Jul 2003 10:52:37 +0000\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n") + "日本語のテキスト ✓ é\r\n".encode()
-cases["bad-utf8-label"] = crlf("From: a@x\nSubject: u\nDate: Tue, 1 Jul 2003 10:52:37 +0000\nContent-Type: text/plain; charset=utf-8\n\n") + b"ok \xe9 bad byte\r\n"
+cases["no-charset-utf8"] = crlf("From: a@x\nSubject: u\nDate: Tue, 1 Jul 2003 10:52:37 +0000\nContent-Type: text/plain\n\n") + "sans étiquette ✓\r\n".encode()
+cases["rfc822-attachment"] = crlf("""From: a@x
+Subject: fwd as file
+Date: Fri, 4 Oct 2002 08:00:00 +0000
+Content-Type: multipart/mixed; boundary="M"
+
+--M
+Content-Type: text/plain
+
+see attached
+--M
+Content-Type: message/rfc822; name="original.eml"
+Content-Disposition: attachment; filename="original.eml"
+
+From: b@y
+Subject: the original
+Content-Type: text/plain
+
+inner text that is not the body
+--M--
+""")
+cases["bad-utf8-label"] =crlf("From: a@x\nSubject: u\nDate: Tue, 1 Jul 2003 10:52:37 +0000\nContent-Type: text/plain; charset=utf-8\n\n") + b"ok \xe9 bad byte\r\n"
 
 def reference(raw):
     msg = email.message_from_bytes(raw)
@@ -247,8 +268,11 @@ def main():
         diffs = []
         for f in FIELDS:
             if want[f] != got[f]: diffs.append((f, want[f], got[f]))
+        # email's get_payload(decode=True) is None for a message/rfc822 part, so the reference has no size for
+        # a forwarded message attached as a file; aios reports the enclosed message's bytes. Compared where Python has one.
         wa = [(a["filename"], a["size_bytes"], a["mime_type"], a["content_id"]) for a in want["attachments"]]
-        ga = [(a["filename"], a["size_bytes"], a["mime_type"], a["content_id"]) for a in got["attachments"]]
+        ga = [(a["filename"], a["size_bytes"] if not (a["mime_type"] == "message/rfc822" and w["size_bytes"] == 0) else 0,
+               a["mime_type"], a["content_id"]) for a, w in zip(got["attachments"], want["attachments"] + [{"size_bytes": -1}] * len(got["attachments"]))]
         if wa != ga: diffs.append(("attachments", wa, ga))
         if diffs:
             bad += 1

@@ -872,17 +872,28 @@ void walk_part(Walk& w, std::string_view raw, int depth) {
     std::string boundary = ct.param("boundary");
     if (!boundary.empty()) { walk_multipart(w, body, boundary, depth); return; }
   }
-  if (ct.value == "message/rfc822") {
-    walk_part(w, body, depth + 1);
-    return;
-  }
-
   std::string cte = find_header(hdrs, "Content-Transfer-Encoding");
   TypedValue cd = parse_typed_value(find_header(hdrs, "Content-Disposition"));
   std::string filename = cd.param("filename");
   if (filename.empty()) filename = ct.param("name");
   filename = decode_words(filename);
   std::string cid = strip_angle(find_header(hdrs, "Content-ID"));
+
+  if (ct.value == "message/rfc822") {
+    // A message forwarded as a file is an attachment the reader can open or save (its size is the
+    // enclosed message's bytes); its parts are still walked, as the first text found anywhere is
+    // the body when the outer message carries none.
+    if (!filename.empty()) {
+      AttachmentInfo a;
+      a.filename = filename;
+      a.mime_type = ct.value;
+      a.content_id = cid;
+      a.size_bytes = body.size();
+      w.out.attachments.push_back(std::move(a));
+    }
+    walk_part(w, body, depth + 1);
+    return;
+  }
 
   const bool is_text = major == "text";
   std::string payload;
