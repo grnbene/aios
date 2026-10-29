@@ -33,7 +33,8 @@ int main() {
   std::mt19937_64 rng(12345);
   long checks = 0;
   int ended_in_runs = 0;
-  for (int round = 0; round < 400 && failures < 20; ++round) {
+  const int rounds = std::getenv("PKMAP_ROUNDS") ? std::atoi(std::getenv("PKMAP_ROUNDS")) : 400;   // more rounds for a soak
+  for (int round = 0; round < rounds && failures < 20; ++round) {
     g_pairs = round % 3 == 1;
     PkMap m;
     std::map<std::string, uint32_t> ref;
@@ -100,7 +101,7 @@ int main() {
     if (m.runs_mode()) ++ended_in_runs;
   }
   g_pairs = false;
-  OK(failures == 0, "400 random sequences, %ld steps, every answer the model's (%d ended still in runs)", checks, ended_in_runs);
+  OK(failures == 0, "%d random sequences, %ld steps, every answer the model's (%d ended still in runs)", rounds, checks, ended_in_runs);
   OK(ended_in_runs > 100, "the tame sequences stayed in runs: %d", ended_in_runs);
 
   // ---- an auto-increment table ----
