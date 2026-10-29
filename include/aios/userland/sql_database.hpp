@@ -3619,7 +3619,7 @@ class SqlDatabase {
   // SHOW ENGINE ASQL STATUS -- both of which monitors poll every second.
   struct MemoryFootprint {
     size_t rows = 0, delta_rows = 0;
-    size_t est_mem = 0, probe_mem = 0, row_index_mem = 0;
+    size_t est_mem = 0, probe_mem = 0, row_index_mem = 0, things_mem = 0;
     uint64_t bytes_age_ms = 0;
     std::unordered_map<std::string, size_t> table_bytes;   // "db.table" -> estimate
   };

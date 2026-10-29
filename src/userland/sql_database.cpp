@@ -103,6 +103,15 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #if defined(__GLIBC__) || defined(__linux__)
 #include <malloc.h>
 #endif
+#if defined(__GLIBC__)
+namespace {
+// glibc's view of the heap: bytes handed out and still held (arena blocks in use plus mmapped blocks), and bytes
+// free but kept (what RSS carries beyond the live data).
+size_t malloc_live_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.uordblks + mi.hblkhd; }
+size_t malloc_mmap_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.hblkhd; }   // blocks past the mmap threshold: the big arrays
+size_t malloc_free_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.fordblks; }
+}  // namespace
+#endif
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 #include <sys/sysctl.h>
@@ -24367,6 +24376,12 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   auto init_lap = [&](const char* what) {
     const auto now = std::chrono::steady_clock::now();
     std::fprintf(stderr, "asql: %s (%.2f s into the start)\n", what, std::chrono::duration<double>(now - init_t0).count());
+#if defined(__GLIBC__)
+    // Under the store trace, where the process's memory stands at each step of the start: what a step adds
+    // beyond the tables' own estimate is what Asql_memory_bytes will not count.
+    if (std::getenv("AIOS_STORE_TRACE"))
+      std::fprintf(stderr, "[store] memory at '%s': allocator live %.1f MB (%.1f past the mmap threshold)\n", what, malloc_live_bytes() / 1048576.0, malloc_mmap_bytes() / 1048576.0);
+#endif
   };
   load_profiles();
   load_tables();
@@ -24837,6 +24852,9 @@ SqlDatabase::MemoryFootprint SqlDatabase::memory_footprint(bool cached_only) con
     }
     b.row_index_mem = row_indices_memory_bytes();
     b.est_mem += b.row_index_mem;
+    // The Things: 59,504 of them on atl (two kinds, 98 MB in their files) were 129 MB the footprint never counted.
+    b.things_mem = things_ ? things_->memory_bytes() : 0;
+    b.est_mem += b.things_mem;
     b.est_mem += colidx_total_bytes();   // the per-column lookup indexes (vx::g_colidx) held by no table
     footprint_bytes_ = b;
     footprint_at_ns_ = now;
@@ -24844,6 +24862,7 @@ SqlDatabase::MemoryFootprint SqlDatabase::memory_footprint(bool cached_only) con
   fp.est_mem = footprint_bytes_.est_mem;
   fp.probe_mem = footprint_bytes_.probe_mem;
   fp.row_index_mem = footprint_bytes_.row_index_mem;
+  fp.things_mem = footprint_bytes_.things_mem;
   fp.table_bytes = footprint_bytes_.table_bytes;
   fp.bytes_age_ms = (now - footprint_at_ns_) / 1000000ull;
   return fp;
@@ -49247,6 +49266,7 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_query_memory_waiting", std::to_string(query_memory_waiting())},
       {"Asql_query_memory_waits", std::to_string(metrics_.query_memory_waits.load(std::memory_order_relaxed))},
       {"Asql_row_index_mem_bytes", std::to_string(total_row_index_mem)},
+      {"Asql_things_mem_bytes", std::to_string(fp.things_mem)},
       {"Asql_pk_runs_to_slots", std::to_string(PkMap::runs_to_slots_count().load(std::memory_order_relaxed))},
       {"Asql_pk_text_sorted", std::to_string(PkMap::sorted_count().load(std::memory_order_relaxed))},
       {"Asql_pk_sorted_to_slots", std::to_string(PkMap::sorted_to_slots_count().load(std::memory_order_relaxed))},
@@ -49255,6 +49275,13 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_hangup_kills", std::to_string(g_hangup_kills.load(std::memory_order_relaxed))},
       {"Asql_row_index_rows_indexed", std::to_string(metrics_.row_index_rows_indexed.load(std::memory_order_relaxed))},
       {"Asql_rss_bytes", std::to_string(rss_bytes)},   // the footprint: on macOS resident + compressed + swapped
+#if defined(__GLIBC__)
+      // What the allocator holds for the process (live) and keeps free: RSS minus the live bytes is retained free
+      // memory, live minus Asql_memory_bytes is what the footprint estimate does not count.
+      {"Asql_malloc_live_bytes", std::to_string(malloc_live_bytes())},
+      {"Asql_malloc_mmap_bytes", std::to_string(malloc_mmap_bytes())},
+      {"Asql_malloc_free_bytes", std::to_string(malloc_free_bytes())},
+#endif
       {"Asql_resident_bytes", std::to_string(get_process_rss_bytes())},
       // A client on another machine cannot read this box's /proc, so the engine
       // reports the host totals itself. Without them "327 MB" answers neither
@@ -56016,6 +56043,17 @@ bool SqlDatabase::load_tables_v4() {
   store_generation_ = gen;
   std::fprintf(stderr, "asql: %zu table(s) loaded in %.2f s (thread time: read %.2f, unpack %.2f, decode %.2f, parts %.2f)\n", tables_.size(),
                std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count(), t_read, t_unpack, t_decode, t_parts);
+#if defined(__GLIBC__)
+  // Where the process's memory stands against the tables' own estimate right after the load: what the estimate
+  // misses shows here, before indexes and queries add theirs.
+  if (std::getenv("AIOS_STORE_TRACE")) {
+    size_t est = 0;
+    for (const auto& kv : tables_) est += kv.second.estimated_memory_bytes();
+    std::fprintf(stderr, "[store] memory after the load: allocator live %.1f MB (%.1f in blocks past the mmap threshold), tables' estimate %.1f MB, %zu columns\n",
+                 malloc_live_bytes() / 1048576.0, malloc_mmap_bytes() / 1048576.0, est / 1048576.0,
+                 [&] { size_t n = 0; for (const auto& kv : tables_) n += kv.second.col_data.size(); return n; }());
+  }
+#endif
   return true;
 }
 
