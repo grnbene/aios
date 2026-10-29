@@ -2138,6 +2138,10 @@ Value Vm::call(const Value& callee, const std::vector<Value>& args, std::string&
   else ok = execute_loop(target_depth);
   if (!ok || !S.error.empty()) {
     error = S.error;
+    // The unwound frames' upvalues are closed as a return would close them. Left open, they pointed past the stack:
+    // the next closure made at one of those slots shared one (and so another call's variable), and the next close
+    // read beyond the stack's end - a double free that took down an app host whose loop caught an error with pcall.
+    close_upvalues_from(base);
     while (S.frames.size() > target_depth) S.frames.pop_back();
     S.stack.resize(base);
     S.error = prev_error;

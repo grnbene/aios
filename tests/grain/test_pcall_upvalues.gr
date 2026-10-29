@@ -1,0 +1,78 @@
+# tests/grain/test_pcall_upvalues.gr
+# A function that made closures and then raised, its error caught by pcall: the closures keep the values they
+# captured, and the machine runs on. Vm::call's error path once dropped the frames without closing their upvalues,
+# so an escaped closure read whatever later took its stack slot, and the next closure return closed upvalues past
+# the stack's end - a double free that took down deploywatch's app host (and every app on it) on the second failed
+# reading. Driven at top level, inside a function, inside a closure and nested in control flow.
+fn check(c, msg) { assert_true(c, msg) }
+
+# captures x, hands the closure out, then fails
+fn capture_then_fail(box, v) {
+  let x = v
+  let twice = v * 2
+  box.f = fn () { return x }
+  box.g = fn () { return twice + x }
+  error("boom " + str(v))
+}
+
+# the shape that crashed: closures over a loop variable, then an undefined name, called again and again
+fn filter_then_fail(rows, groups) {
+  for g in groups {
+    let mine = filter(rows, fn (p) { return p.group == g })
+    let main = len(mine) > 0 ? no_such_function_anywhere(mine) : nil
+  }
+  return "unreachable"
+}
+
+# the same layout as capture_then_fail, returning normally: its x takes the slot the failed call's x had
+fn capture_then_return(box, v) {
+  let x = v
+  let twice = v * 2
+  box.f = fn () { return x }
+  box.g = fn () { return twice + x }
+  return v
+}
+
+fn churn(n) {
+  let box = {"n": n}
+  let k = map([1, 2, 3], fn (v) { return v + box.n })
+  return k[2]
+}
+
+fn run(where) {
+  let box = {}
+  let r = pcall(capture_then_fail, box, 41)
+  check(not r.ok and contains(r.error, "boom 41"), where + ": the error comes back: " + str(r.error))
+  # the stack slots the failed call used are taken again, by other values
+  let a = churn(100)
+  let b = [7, 8, 9]
+  check(box.f() == 41, where + ": an escaped closure keeps what it captured, got " + str(box.f()))
+  check(box.g() == 123, where + ": and so does its sibling, got " + str(box.g()))
+  check(a == 103, where + ": the next call runs as it should")
+
+  # one call fails and the next, from the same place, succeeds: its closures must not take over the failed ones'
+  # (a left-open upvalue is found by slot and shared, and then closed with the second call's values)
+  let boxes = [{}, {}]
+  let vals = [41, 99]
+  let fns = [capture_then_fail, capture_then_return]
+  for i in 0..2 { pcall(fns[i], boxes[i], vals[i]) }
+  check(boxes[0].f() == 41, where + ": the failed call's closure still sees 41, got " + str(boxes[0].f()))
+  check(boxes[1].f() == 99, where + ": the second call's closure sees 99, got " + str(boxes[1].f()))
+  check(boxes[0].g() == 123, where + ": the failed call's sibling sees 82 + 41, got " + str(boxes[0].g()))
+
+  let rows = []
+  for i in 0..300 { push(rows, {"pid": i, "group": ["a", "b", "c"][i % 3], "rss": i}) }
+  for i in 0..50 {
+    let f = pcall(filter_then_fail, rows, ["a", "b", "c"])
+    check(not f.ok and contains(f.error, "no_such_function_anywhere"), where + ": failure " + str(i) + " is caught")
+    check(churn(i) == i + 3, where + ": closures run after failure " + str(i))
+  }
+}
+
+run("top level")
+fn in_fn() { run("in a function") }
+in_fn()
+let clos = fn () { run("in a closure") }
+clos()
+for i in [1] { if i == 1 { run("nested in control flow") } }
+print("pcall upvalues: ok")

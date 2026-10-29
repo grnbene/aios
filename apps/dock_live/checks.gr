@@ -1,0 +1,11 @@
+// Pre-cutover checks: the new copy answers its health check and the board, and refuses the key check without a
+// key (nginx lets nothing through that /dockauth does not pass).
+fn check(app) {
+  let h = http_get(app.url + "/health")
+  if h.status != 200 { return "GET /health answered " + str(h.status) }
+  let page = http_get(app.url + "/")
+  if page.status != 200 { return "GET / answered " + str(page.status) }
+  let a = http_get(app.url + "/dockauth")
+  if a.status != 401 { return "GET /dockauth without a key answered " + str(a.status) + ", not 401" }
+  return true
+}

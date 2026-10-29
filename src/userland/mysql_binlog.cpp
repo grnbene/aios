@@ -1243,7 +1243,10 @@ Result<size_t> BinlogConsumer::step(int timeout_ms) {
     }
   }
 
-  {
+  // The packet counters, under AIOS_CDC_TRACE=1 like the row trace below. Printed (and flushed) for every 20
+  // packets whatever the setting, they were most of a mirror's journal: ~150,000 lines in 11 minutes on atl-ga-1.
+  static const bool diag = [] { const char* e = getenv("AIOS_CDC_TRACE"); return e && e[0] == '1'; }();
+  if (diag) {
     static uint64_t diag_read = 0, diag_00 = 0, diag_ff = 0, diag_fe = 0, diag_other = 0, diag_other_sample = 0;
     ++diag_read;
     if (packet_kind_ == PacketKind::Err) ++diag_ff;
@@ -1688,10 +1691,14 @@ Result<void> BinlogConsumer::handle_table_map(const uint8_t* p, size_t len, uint
     introspect_table_columns(tmap);
   }
 
-  fprintf(stderr, "[cdc-diag] TABLE_MAP id=%llu schema=%s table=%s cols=%zu whitelisted=%d\n",
-          (unsigned long long)table_id, tmap.schema_name.c_str(), tmap.table_name.c_str(),
-          tmap.columns.size(), (int)tmap.whitelisted);
-  fflush(stderr);
+  // One line per TABLE_MAP - before every row event - so only under AIOS_CDC_TRACE=1.
+  static const bool diag = [] { const char* e = getenv("AIOS_CDC_TRACE"); return e && e[0] == '1'; }();
+  if (diag) {
+    fprintf(stderr, "[cdc-diag] TABLE_MAP id=%llu schema=%s table=%s cols=%zu whitelisted=%d\n",
+            (unsigned long long)table_id, tmap.schema_name.c_str(), tmap.table_name.c_str(),
+            tmap.columns.size(), (int)tmap.whitelisted);
+    fflush(stderr);
+  }
 
   table_maps_[table_id] = std::move(tmap);
   total_events_applied_++;

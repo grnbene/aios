@@ -827,10 +827,23 @@ Result<size_t> Kernel::reach(const Id128& kernel_id) {
     if (nodes_[i]->alive()) return i;   // live link — reuse it
     stale = (long)i; break;             // dead link (hub restart / blip) — replace in place below
   }
-  auto opened = open_member(kernel_id);
-  if (!opened.ok()) return opened.error();
-  auto node = *opened;
-  node->set_opener([this, kernel_id]() { return open_member(kernel_id); });
+  // A dead link is opened again the way it was made: a member's through open_member (the opener reach gave it), a
+  // machine linked with `node connect` - in no fleet - by dialing it with its token again (Kernel::connect's opener).
+  // Only open_member before, which a machine outside the fleet never answers: its link stayed dead until restart.
+  std::shared_ptr<RemoteNode> node;
+  if (stale >= 0 && nodes_[(size_t)stale]->can_open_sibling()) {
+    auto old = nodes_[(size_t)stale];
+    auto again = old->open_sibling();
+    if (!again.ok()) return again.error();
+    if ((*again)->kernel() != kernel_id) { (*again)->close(); return Result<size_t>(Status::Conflict, "a different kernel (" + (*again)->kernel().short_str() + ") answered at " + old->address()); }
+    node = *again;
+    node->set_opener(old->opener());
+  } else {
+    auto opened = open_member(kernel_id);
+    if (!opened.ok()) return opened.error();
+    node = *opened;
+    node->set_opener([this, kernel_id]() { return open_member(kernel_id); });
+  }
   auto at = attach_remote_node(*this, node);
   if (!at.ok()) return at.error();
   if (stale >= 0) { nodes_[(size_t)stale] = node; return (size_t)stale; }   // swap the dead node out, keep index stable

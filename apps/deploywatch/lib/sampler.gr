@@ -1,0 +1,172 @@
+// The sampler: every SAMPLE_S seconds it reads the machine, keeps the sample, and notes a spike when one starts and
+// when it ends. CPU percentages are worked out between two readings, so the first reading only primes them.
+
+import "proc.gr"
+import "asql.gr"
+import "store.gr"
+
+let CPU_HIGH = 85          // whole machine busy, percent: a spike when it holds for two samples running
+let CPU_CALM = 70          // ...and over when it falls under this
+let MEM_LOW = 0.10         // available memory under this share of the total
+let MEM_OK = 0.15
+let GROW_BYTES = 512 * 1024 * 1024   // a group growing this much within GROW_WINDOW_S
+let GROW_WINDOW_S = 300
+let SWAP_GROW = 256 * 1024 * 1024
+let WATCHED = ["ASQL", "aios apps", "MariaDB"]   // a restart of these is an event
+
+fn new_state() {
+  return {
+    "page": page_size(), "ncpu": cpu_count(),
+    "cpu": nil, "procs": {}, "t": nil,
+    "recent": [],                     // the last GROW_WINDOW_S of samples, for growth
+    "mains": {},                      // group -> the main process's "pid/start"
+    "open": {},                       // kind -> the open event
+    "high_runs": 0,
+    "grew_at": {},                    // group -> when its last growth event was
+    "asql_ok": nil
+  }
+}
+
+fn top_of(list, key, n) { return take(sort_by(list, fn (p) { return p[key] }, "desc"), n) }
+
+// One reading. Returns the sample (nil for the priming reading) and updates st.
+fn take_sample(st) {
+  let t = time()
+  let cpu = cpu_totals()
+  let procs = processes(st.page)
+  let mem = memory()
+  let dt = st.t == nil ? 0 : t - st.t
+  let busy = 0
+  if st.cpu != nil and cpu.total > st.cpu.total {
+    let dtot = cpu.total - st.cpu.total
+    busy = round(100 * (dtot - (cpu.idle - st.cpu.idle)) / dtot, 1)
+  }
+  let groups = {}
+  for g in GROUPS { groups[g] = {"rss": 0, "cpu": 0, "n": 0} }
+  let now_procs = {}
+  let rows = []
+  for p in procs {
+    let key = str(p.pid) + "/" + str(p.start)
+    now_procs[key] = p.ticks
+    let before = st.procs[key]
+    let pct = (before != nil and dt > 0) ? round(100 * (p.ticks - before) / USER_HZ / dt, 1) : 0
+    let g = group_of(p)
+    let gs = groups[g]
+    gs.rss = gs.rss + p.rss
+    gs.cpu = gs.cpu + pct
+    gs.n = gs.n + 1
+    push(rows, {"pid": p.pid, "start": p.start, "name": short_name(p), "group": g, "rss": p.rss, "cpu": pct})
+  }
+  let primed = st.cpu != nil
+  st.cpu = cpu
+  st.procs = now_procs
+  st.t = t
+  if not primed { return nil }
+
+  let top = top_of(rows, "cpu", 8)
+  let seen = {}
+  for p in top { seen[str(p.pid)] = true }
+  for p in top_of(rows, "rss", 10) { if not has(seen, str(p.pid)) { push(top, p) } }
+
+  let s = {
+    "t": round(t, 1), "dt": round(dt, 1), "ncpu": st.ncpu, "cpu": busy, "load": load_avg(), "mem": mem,
+    "g": {}, "top": map(top, fn (p) { return {"pid": p.pid, "name": p.name, "group": p.group, "rss": p.rss, "cpu": p.cpu} })
+  }
+  for g in GROUPS { s.g[g] = {"rss": groups[g].rss, "cpu": round(groups[g].cpu, 1), "n": groups[g].n} }
+  if asql_configured() {
+    let a = asql_status()
+    s.asql = a.ok ? a.status : {"error": a.error}
+  }
+  spikes(st, s, rows)
+  return s
+}
+
+fn open_event(st, kind, ev) {
+  ev.id = kind + "-" + str(int(ev.start))
+  ev.kind = kind
+  ev.open = true
+  st.open[kind] = ev
+  record_event(ev)
+}
+
+fn close_event(st, kind, t) {
+  let ev = st.open[kind]
+  if ev == nil { return }
+  ev.open = false
+  ev.end = t
+  ev.secs = round(t - ev.start)
+  record_event(ev)
+  del(st.open, kind)
+}
+
+fn culprits(rows) { return map(top_of(rows, "cpu", 3), fn (p) { return {"name": p.name, "group": p.group, "cpu": p.cpu} }) }
+
+fn spikes(st, s, rows) {
+  // CPU: two samples running at or over CPU_HIGH opens it; the peak and who was busy at the peak go with it
+  if s.cpu >= CPU_HIGH { st.high_runs = st.high_runs + 1 } else { st.high_runs = 0 }
+  let cev = st.open.cpu
+  if cev == nil and st.high_runs >= 2 {
+    open_event(st, "cpu", {"start": s.t - s.dt, "peak": s.cpu, "top": culprits(rows), "title": "CPU busy"})
+  } else if cev != nil {
+    if s.cpu > cev.peak { cev.peak = s.cpu; cev.top = culprits(rows) }
+    if s.cpu < CPU_CALM { close_event(st, "cpu", s.t) }
+  }
+
+  // memory running out
+  let share = s.mem.avail / s.mem.total
+  let mev = st.open.mem
+  if mev == nil and share < MEM_LOW {
+    open_event(st, "mem", {"start": s.t, "peak": s.mem.used, "avail": s.mem.avail, "title": "Memory low",
+                           "top": map(top_of(rows, "rss", 3), fn (p) { return {"name": p.name, "group": p.group, "rss": p.rss} })})
+  } else if mev != nil {
+    if s.mem.avail < mev.avail { mev.avail = s.mem.avail; mev.peak = s.mem.used }
+    if share > MEM_OK { close_event(st, "mem", s.t) }
+  }
+
+  // growth: a group (or swap) holding much more than it did GROW_WINDOW_S ago
+  push(st.recent, {"t": s.t, "g": s.g, "swap": s.mem.swap_used})
+  st.recent = filter(st.recent, fn (r) { return r.t >= s.t - GROW_WINDOW_S })
+  let first = st.recent[0]
+  if s.t - first.t >= GROW_WINDOW_S * 0.8 {
+    for g in GROUPS {
+      let grew = s.g[g].rss - first.g[g].rss
+      let last = st.grew_at[g] ?? 0
+      if grew >= GROW_BYTES and s.t - last >= 600 {
+        st.grew_at[g] = s.t
+        record_event({"id": "grew-" + g + "-" + str(int(s.t)), "kind": "grew", "group": g, "start": first.t, "end": s.t,
+                      "from": first.g[g].rss, "to": s.g[g].rss, "title": g + " grew", "open": false})
+      }
+    }
+    let sw = s.mem.swap_used - first.swap
+    if sw >= SWAP_GROW and s.t - (st.grew_at.swap ?? 0) >= 600 {
+      st.grew_at.swap = s.t
+      record_event({"id": "swap-" + str(int(s.t)), "kind": "swap", "start": first.t, "end": s.t, "from": first.swap,
+                    "to": s.mem.swap_used, "title": "Swapping", "open": false})
+    }
+  }
+
+  // restarts: the biggest process of a watched group is a different process than last time, or none at all
+  for g in WATCHED {
+    let mine = filter(rows, fn (p) { return p.group == g })
+    let main = biggest(mine, fn (p) { return p.rss })
+    let id = main == nil ? "" : str(main.pid) + "/" + str(main.start)
+    let was = st.mains[g]
+    if was != nil and was != id {
+      let title = id == "" ? g + " stopped" : (was == "" ? g + " started" : g + " restarted")
+      record_event({"id": "restart-" + g + "-" + str(int(s.t)), "kind": "restart", "group": g, "start": s.t, "end": s.t,
+                    "title": title, "pid": main?.pid, "open": false})
+    }
+    st.mains[g] = id
+  }
+
+  // the engine stopped answering, or answers again
+  if s.asql != nil {
+    let ok = not has(s.asql, "error")
+    if st.asql_ok == true and not ok {
+      open_event(st, "asql", {"start": s.t, "title": "ASQL not answering", "error": s.asql.error})
+    } else if ok and st.open.asql != nil {
+      close_event(st, "asql", s.t)
+    }
+    st.asql_ok = ok
+  }
+}

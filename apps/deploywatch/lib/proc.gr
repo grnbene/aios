@@ -1,0 +1,158 @@
+// This machine's own counters, read from /proc as the kernel keeps them.
+
+let NUL = chr(0)
+// /proc/<pid>/stat counts CPU time in USER_HZ ticks, which Linux fixes at 100 for user space on every architecture
+// (it is part of the kernel's ABI; the scheduler's own HZ is not what these files report).
+let USER_HZ = 100
+
+// The fields of a /proc line: split() cuts at every single space, and these files pad with runs of them.
+fn words(s) { return filter(split(replace(trim(s), "\t", " "), " "), fn (w) { return w != "" }) }
+
+// env, secret, sum and max_by are newer than the aios some deploy machines run (st's and cleve-ny-1's lack env and
+// secret), so these are spelled out.
+fn setting(name, fallback) {
+  let v = getenv(name)
+  return (v == nil or v == "") ? fallback : v
+}
+// NAME, or else the first line of the file NAME_FILE names (a password kept in a file of its own); "" when neither.
+fn secret_value(name) {
+  let v = getenv(name)
+  if v != nil and v != "" { return v }
+  let f = getenv(name + "_FILE")
+  if f == nil or f == "" { return "" }
+  let got = pcall(read_file, f)
+  return got.ok ? trim(split(got.value, "\n")[0]) : ""
+}
+fn total_of(list, f) {
+  let t = 0
+  for x in list { t = t + f(x) }
+  return t
+}
+fn biggest(list, f) {
+  let best = nil
+  let bv = nil
+  for x in list {
+    let v = f(x)
+    if best == nil or v > bv { best = x; bv = v }
+  }
+  return best
+}
+
+// The page size the kernel counts resident pages in, from its own report of this process's first mapping.
+fn page_size() {
+  for line in split(read_file("/proc/self/smaps"), "\n") {
+    if starts_with(line, "KernelPageSize:") { return int(words(slice(line, 15))[0]) * 1024 }
+  }
+  error("no KernelPageSize in /proc/self/smaps")
+}
+
+fn is_linux() { return file_exists("/proc/stat") and file_exists("/proc/meminfo") }
+
+// The whole machine's CPU time: total and idle (idle + iowait) jiffies since boot, from the first line of /proc/stat
+// (cpu user nice system idle iowait irq softirq steal; guest time is already inside user).
+fn cpu_totals() {
+  let f = words(split(read_file("/proc/stat"), "\n")[0])
+  let total = 0
+  for i in 1..min(len(f), 9) { total = total + int(f[i]) }
+  return {"total": total, "idle": int(f[4]) + int(f[5])}
+}
+
+fn load_avg() {
+  let f = words(read_file("/proc/loadavg"))
+  return [real(f[0]), real(f[1]), real(f[2])]
+}
+
+fn cpu_count() {
+  let n = 0
+  for line in split(read_file("/proc/stat"), "\n") {
+    if starts_with(line, "cpu") and len(line) > 3 and is_digit(slice(line, 3, 4)) { n = n + 1 }
+  }
+  return n
+}
+
+// /proc/meminfo in bytes, and what `free` calls used: what is neither free nor a cache the kernel can drop.
+fn memory() {
+  let m = {}
+  for line in split(read_file("/proc/meminfo"), "\n") {
+    let at = index_of(line, ":")
+    if at < 0 { continue }
+    let f = words(slice(line, at + 1))
+    if len(f) == 0 { continue }
+    m[slice(line, 0, at)] = int(f[0]) * (len(f) > 1 and f[1] == "kB" ? 1024 : 1)
+  }
+  let cache = (m.Buffers ?? 0) + (m.Cached ?? 0) + (m.SReclaimable ?? 0)
+  return {
+    "total": m.MemTotal,
+    "avail": m.MemAvailable,
+    "free": m.MemFree,
+    "cache": cache,
+    "used": m.MemTotal - m.MemFree - cache,
+    "shmem": m.Shmem ?? 0,
+    "swap_total": m.SwapTotal ?? 0,
+    "swap_used": (m.SwapTotal ?? 0) - (m.SwapFree ?? 0)
+  }
+}
+
+// One process: its command line (or [comm] for a kernel thread), CPU ticks so far, start time and resident bytes.
+// The fields after the ")" that ends comm: state is field 3, utime 14, stime 15, starttime 22, rss 24.
+fn read_proc(pid, page) {
+  let s = read_file("/proc/" + pid + "/stat")
+  let close = last_index_of(s, ")")
+  let comm = slice(s, index_of(s, "(") + 1, close)
+  let f = words(slice(s, close + 1))
+  let cl = pcall(read_file, "/proc/" + pid + "/cmdline")
+  let cmd = cl.ok ? trim(replace(cl.value, NUL, " ")) : ""
+  return {
+    "pid": int(pid),
+    "comm": comm,
+    "cmd": cmd == "" ? "[" + comm + "]" : cmd,
+    "ticks": int(f[11]) + int(f[12]),
+    "start": int(f[19]),
+    "rss": int(f[21]) * page
+  }
+}
+
+// Every process now. One that exits between the listing and the read is simply not there.
+fn processes(page) {
+  let out = []
+  for e in list_dir("/proc") {
+    if not e.dir or not is_digit(e.name) { continue }
+    let got = pcall(read_proc, e.name, page)
+    if got.ok { push(out, got.value) }
+  }
+  return out
+}
+
+// What a process is, for the page: the deploy machines' own services by name, the rest by kind.
+let GROUPS = ["ASQL", "aios apps", "aios services", "MariaDB", "Node", "PHP & web", "Other"]
+
+fn group_of(p) {
+  let c = lower(p.cmd)
+  if contains(c, "compute serve") or contains(c, "asql-serve") { return "ASQL" }
+  if (contains(c, "aios") and contains(c, "serve port=")) or contains(c, "apps-root") { return "aios apps" }
+  if contains(c, "/opt/aios") or contains(c, "/opt/aos") or starts_with(p.comm, "aios") { return "aios services" }
+  if p.comm == "mariadbd" or p.comm == "mysqld" or p.comm == "mysqld_safe" { return "MariaDB" }
+  if starts_with(p.comm, "node") { return "Node" }
+  if starts_with(p.comm, "php") or p.comm == "nginx" or p.comm == "httpd" or starts_with(c, "/usr/sbin/httpd") { return "PHP & web" }
+  return "Other"
+}
+
+// A short name for a process: the program's base name, and for aios what it was told to run.
+fn short_name(p) {
+  if starts_with(p.cmd, "[") { return p.cmd }
+  let ws = words(p.cmd)
+  let base = path_basename(ws[0])
+  // a program that renames itself (php-fpm: pool www, postgres: writer): its own words
+  if ends_with(base, ":") { return join(take(ws, min(len(ws), 3)), " ") }
+  let c = p.cmd
+  let at = index_of(c, "exec ")
+  if starts_with(base, "aios") and at >= 0 {
+    let what = trim(replace(slice(c, at + 5), "\"", ""))
+    let told = words(what)
+    return base + " " + join(take(told, min(len(told), 3)), " ")
+  }
+  if (base == "node" or base == "node20" or starts_with(base, "python")) and len(ws) > 1 {
+    return base + " " + path_basename(ws[len(ws) > 2 and starts_with(ws[1], "-") ? 2 : 1])
+  }
+  return base
+}

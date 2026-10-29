@@ -1,0 +1,75 @@
+// Where the samples and spikes are kept: the app's own data directory, one file of samples per hour (one JSON line
+// each), so dropping old history is deleting old files, and a page of the last hour reads one or two of them.
+
+fn hour_file(t) { return "samples-" + date_format(t, "%Y%m%d-%H", "utc") + ".jsonl" }
+
+fn record_sample(s) { append_file(hour_file(s.t), json_stringify(s) + "\n") }
+
+// Hour files older than keep_hours go.
+fn prune(keep_hours) {
+  let oldest = hour_file(time() - keep_hours * 3600)
+  for e in list_dir(".") {
+    if starts_with(e.name, "samples-") and ends_with(e.name, ".jsonl") and e.name < oldest { delete_file(e.name) }
+  }
+}
+
+fn read_lines(name) {
+  if not file_exists(name) { return [] }
+  let out = []
+  for line in split(read_file(name), "\n") {
+    if line == "" { continue }
+    let p = pcall(json_parse, line)
+    if p.ok { push(out, p.value) }
+  }
+  return out
+}
+
+// The samples since `since` (epoch seconds), oldest first, thinned to at most `points` by keeping the busiest
+// sample of each run (so a spike shorter than a run still shows at its height).
+fn history(since, points) {
+  let out = []
+  let t = since - since % 3600
+  while t <= time() {
+    for s in read_lines(hour_file(t)) { if s.t >= since { push(out, s) } }
+    t = t + 3600
+  }
+  if len(out) <= points { return out }
+  let per = int(ceil(len(out) / points))
+  let thin = []
+  let at = 0
+  while at < len(out) {
+    push(thin, biggest(slice(out, at, at + per), fn (s) { return s.cpu + s.mem.used / s.mem.total }))
+    at = at + per
+  }
+  return thin
+}
+
+// Spikes: one JSON line each, appended as they open and close.
+fn record_event(ev) { append_file("events.jsonl", json_stringify(ev) + "\n") }
+
+// The newest events, newest first: an event that opened and later closed is shown once, as it closed.
+fn events(limit) {
+  let all = read_lines("events.jsonl")
+  let seen = {}
+  let out = []
+  for ev in reverse(all) {
+    if has(seen, ev.id) { continue }
+    seen[ev.id] = true
+    push(out, ev)
+    if len(out) >= limit { break }
+  }
+  return out
+}
+
+// Keep the events file to its newest lines.
+fn trim_events(keep) {
+  let lines = filter(split(file_exists("events.jsonl") ? read_file("events.jsonl") : "", "\n"), fn (l) { return l != "" })
+  if len(lines) > keep * 2 { write_file("events.jsonl", join(drop(lines, len(lines) - keep), "\n") + "\n") }
+}
+
+fn save_json(name, v) { write_file(name, json_stringify(v)) }
+fn load_json(name) {
+  if not file_exists(name) { return nil }
+  let p = pcall(json_parse, read_file(name))
+  return p.ok ? p.value : nil
+}

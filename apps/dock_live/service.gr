@@ -1,0 +1,239 @@
+// Dock Live service
+//
+// The loading dock as the engine keeps it (things/dock_bay.gr), for the wall TV and the v8 pick and load screens.
+// Read-only: claims, picks and loads are still written by the v8 PHP API to Cleve's MariaDB,
+// reach this ASQL by CDC, and come back out of here to every screen at once.
+//
+// Endpoints:
+//   GET /            the wall board (live: the page is pushed when a bay changes)
+//   GET /bays        {success, clock, bays: [...]}                       ?bays=1,2,3 for some of them
+//   GET /stream      server-sent events: "snapshot" once, then "change" {clock, rows, gone} whenever the Thing
+//                    changes, "ping" while it does not.  ?kind=bays
+//   GET /dockauth    the key check atl's nginx asks before every request (204 / 401)
+//   GET /health
+
+import "lib/views.gr"
+
+fn env(name, fallback) {
+  let v = getenv(name)
+  if v == nil or v == "" { return fallback }
+  return v
+}
+
+fn secret(name) {
+  let v = getenv(name)
+  if v != nil and v != "" { return v }
+  let f = getenv(name + "_FILE")
+  if f != nil and f != "" { return trim(read_file(f)) }
+  return ""
+}
+
+let DB_CFG = {
+  "host": env("DB_HOST", "127.0.0.1"),
+  "port": int(env("DB_PORT", "3307")),
+  "user": env("DB_USER", "root"),
+  "password": secret("DB_PASSWORD"),
+  "db": env("DB_NAME", "versioneight")
+}
+
+// Positional db_connect: older hosts (chi) don't take the config map, every host takes this.
+fn db_open() { return db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.password, DB_CFG.db) }
+
+// One Thing. A per-pick-row Thing (dock_pick) was tried and dropped: it reacted to every pick-row change in the
+// warehouse, ~450 a minute, and each reaction holds the engine's one Things lock (~300 ms a reaction on atl), so
+// every other Thing's readers - this board, the touches report - stalled 4-16 s at a time. The bays change a few
+// times a minute.
+let KINDS = {"bays": "dock_bay"}
+
+// The screens are served from Cleve's own hosts and read this one. The host already puts
+// Access-Control-Allow-Origin on a JSON answer and Cache-Control on a stream; adding either again sends it twice,
+// and a browser refuses "*, *". So each says only what the host leaves out.
+let JSON_HEADERS = {"Cache-Control": "no-store"}
+let STREAM_HEADERS = {"Access-Control-Allow-Origin": "*"}
+
+// How long one WAIT THING may sit before the stream says it is still there. Under nginx's proxy_read_timeout and
+// short enough that a dead client is noticed (the next write to it fails).
+let PING_SECONDS = 20
+
+// The bookkeeping columns SHOW THING adds; a screen has no use for them.
+let META = ["version", "updated_at", "last_change", "machine"]
+
+// SHOW THING hands plain columns back as text (only the JSON ones come back as values): these are numbers.
+let NUMERIC = ["units", "picked", "loaded", "lines", "lines_open", "lines_unclaimed", "orders_done", "pick"]
+let FLAGS = ["claimed", "completed"]
+
+fn strip(row) {
+  for m in META { if has(row, m) { del(row, m) } }
+  for f in NUMERIC { if has(row, f) and row[f] != nil and is_numeric(str(row[f])) { row[f] = to_number(str(row[f])) } }
+  for f in FLAGS { if has(row, f) { row[f] = str(row[f]) == "1" or str(row[f]) == "true" } }
+  // a bay's orders are JSON text in the Thing; thing_rows reads them back as a list, an older version left text
+  if has(row, "orders") and type(row.orders) == "string" { row.orders = json_parse(row.orders) ?? [] }
+  return row
+}
+
+fn json_res(status, body) {
+  return {"status": status, "content_type": "application/json; charset=utf-8", "headers": JSON_HEADERS, "json": body}
+}
+
+fn csv_list(v) {
+  if is_blank(v) { return [] }
+  return compact(map(split(str(v), ","), fn (x) { let t = trim(x); return t == "" ? nil : t }))
+}
+
+fn clock_of(c, thing) {
+  let r = db_query(c, "WAIT THING " + thing + " SINCE 0", [])
+  if not r.ok or len(r.records) == 0 { return nil }
+  return int(r.records[0].clock)
+}
+
+// Rows of a Thing: all of them, or those keys. Read inside one connection with the clock taken first, so a change
+// landing between the two is announced again rather than lost.
+fn read_rows(c, thing, ks) {
+  let rows = ks == nil ? thing_rows(c, thing) : thing_rows(c, thing, ks)
+  return map(rows, strip)
+}
+
+fn bay_sort(rows) { return sort_by(rows, fn (b) { return int(b.bay) }) }
+
+// ---- Routes -----------------------------------------------------------------------------------------------------
+
+fn handle_health(req) {
+  return {"status": 200, "content_type": "application/json", "body": "{\"status\":\"ok\"}"}
+}
+
+// The PHP API's rule (catalog/controller/startup/validate.php, the ?key= path), as warehouse_touches applies it:
+// one of apikeys' active keys for this database, and a userid that is not empty and not admin. nginx hands the
+// original URI in X-Original-URI.
+fn query_of(uri) {
+  let at = index_of(uri, "?")
+  let q = {}
+  if at < 0 { return q }
+  for pair in split(slice(uri, at + 1), "&") {
+    let eq = index_of(pair, "=")
+    if eq > 0 { q[url_decode(replace(slice(pair, 0, eq), "+", " "))] = url_decode(replace(slice(pair, eq + 1), "+", " ")) }
+  }
+  return q
+}
+
+fn handle_auth(req) {
+  let denied = {"status": 401, "content_type": "application/json", "body": "{\"success\":false,\"message\":\"Unauthorized\"}"}
+  let q = query_of(req.headers["x-original-uri"] ?? "")
+  let userid = trim(q.userid ?? "")
+  if is_blank(q.key) or userid == "" or lower(userid) == "admin" { return denied }
+  let c = db_open()
+  if not c.ok { return {"status": 503, "content_type": "text/plain", "body": "no database"} }
+  let r = db_query(c, "SELECT keycode FROM apikeys WHERE active = '1' AND keycode = ? AND `database` = ?", [q.key, DB_CFG.db])
+  db_close(c)
+  if not r.ok or len(r.records) == 0 { return denied }
+  return {"status": 204, "body": ""}
+}
+
+fn handle_bays(req) {
+  let q = req.query_params ?? {}
+  let want = csv_list(q.bays)
+  let c = db_open()
+  if not c.ok { return json_res(503, {"success": false, "message": "no database: " + c.error}) }
+  let clock = clock_of(c, "dock_bay")
+  let got = pcall(read_rows, c, "dock_bay", len(want) > 0 ? want : nil)
+  db_close(c)
+  if not got.ok { return json_res(503, {"success": false, "message": str(got.error)}) }
+  return json_res(200, {"success": true, "clock": clock, "bays": bay_sort(got.value)})
+}
+
+// GET /stream: the Thing's rows once, then each change as it lands. The engine wakes the WAIT THING when it commits
+// a change (no polling here or in the browser); `changed` names the keys, which are read and sent - a key that is
+// no longer a Thing (a pick invoiced, a bay emptied of its row) is sent in `gone`. EventSource reconnects on its
+// own after a drop and gets a fresh snapshot, so nothing missed while away stays missed.
+fn handle_stream(req, writer) {
+  let q = req.query_params ?? {}
+  let kind = str(q.kind ?? "bays")
+  let thing = KINDS[kind]
+  for k in keys(STREAM_HEADERS) { writer.header(k, STREAM_HEADERS[k]) }
+  writer.header("X-Accel-Buffering", "no")
+  if thing == nil {
+    writer.status(400)
+    writer.write_sse({"event": "error", "data": {"message": "kind is bays"}})
+    return nil
+  }
+  let c = db_open()
+  if not c.ok {
+    writer.write_sse({"event": "error", "data": {"message": "no database: " + c.error}})
+    return nil
+  }
+  let clock = clock_of(c, thing)
+  let first = pcall(read_rows, c, thing, nil)
+  if not first.ok {
+    writer.write_sse({"event": "error", "data": {"message": str(first.error)}})
+    db_close(c)
+    return nil
+  }
+  writer.write_sse({"event": "snapshot", "retry": 3000, "data": {"kind": kind, "clock": clock, "rows": first.value}})
+  while not writer.is_closed() {
+    let w = db_query(c, "WAIT THING " + thing + " SINCE " + str(clock) + " TIMEOUT " + str(PING_SECONDS), [])
+    if not w.ok or len(w.records) == 0 {
+      writer.write_sse({"event": "error", "data": {"message": w.ok ? "no answer" : w.error}})
+      break
+    }
+    let r = w.records[0]
+    let next = int(r.clock)
+    if next == clock {
+      writer.write_sse({"event": "ping", "data": {"clock": clock}})
+      continue
+    }
+    clock = next
+    if str(r.whole) == "1" {
+      let all = pcall(read_rows, c, thing, nil)
+      if not all.ok { break }
+      writer.write_sse({"event": "snapshot", "data": {"kind": kind, "clock": clock, "rows": all.value}})
+      continue
+    }
+    let changed = json_parse(str(r.changed ?? "[]")) ?? []
+    if len(changed) == 0 { continue }
+    let got = pcall(read_rows, c, thing, changed)
+    if not got.ok { break }
+    let present = {}
+    let id = kind == "bays" ? "bay" : "pick_id"
+    for row in got.value { present[str(row[id])] = true }
+    let gone = filter(map(changed, str), fn (k) { return not has(present, k) })
+    writer.write_sse({"event": "change", "data": {"kind": kind, "clock": clock, "rows": got.value, "gone": gone}})
+  }
+  db_close(c)
+  return nil
+}
+
+// ---- The wall board ---------------------------------------------------------------------------------------------
+
+// The bays this page shows: ?bays=1,2,3 on the link (the loading TV's three doors by default).
+let state = {"bays": ["1", "2", "3"]}
+
+ui.pane({
+  "title": "Dock Live",
+  "width": 1920,
+  "css": BOARD_CSS,
+  "workers": true,
+  // its own connection per render: a connection cannot be copied into the worker VMs the routes run in. A page that
+  // cannot read says so - a new version can start before its deploy hook has made the Things.
+  "view": fn() {
+    let c = db_open()
+    let got = c.ok ? pcall(read_rows, c, "dock_bay", state.bays) : {"ok": false, "error": c.error}
+    if c.ok { db_close(c) }
+    if not got.ok {
+      return el("div", {"class": "note"}, "The dock is not available yet (" + str(got.error) + "). This page shows it when it is.")
+    }
+    let page = pcall(board_node, bay_sort(got.value), date_format(now(), "%H:%M:%S"))
+    if not page.ok { return el("div", {"class": "note"}, "The dock board could not be drawn (" + str(page.error) + ").") }
+    return page.value
+  },
+  // Live: the engine wakes this when a bay changes, and every open board is looked at again and pushed.
+  "watch": {"thing": "dock_bay", "db": DB_CFG},
+  "on_open": fn(q) {
+    let want = csv_list(q.bays)
+    if len(want) > 0 { state.bays = want }
+  },
+  "routes": {
+    "/health": handle_health,
+    "/dockauth": handle_auth,
+    "/bays": handle_bays,
+    "/stream": handle_stream
+  }
+})

@@ -1,0 +1,174 @@
+// deploywatch service.
+//
+// On a Linux machine:
+//   a sampler (every SAMPLE_S s): /proc and ASQL's status into samples-*.jsonl, spikes into events.jsonl
+//   a slower task: ASQL's biggest tables (every 5 min) and the watched folders' sizes (every DISK_EVERY_MIN)
+//   GET /now                      the newest sample
+//   GET /history?minutes=60       samples since then, thinned to ?points (default 360)
+//   GET /events?limit=100         spikes, newest first
+//   GET /tables                   ASQL's biggest tables by memory
+//   GET /disk                     the watched folders
+// On the workstation (WATCH set: name=member,...), the same routes of each machine's copy under /m/<name>/..., and
+// the page at /.
+
+import "lib/proc.gr"
+import "lib/asql.gr"
+import "lib/store.gr"
+import "lib/disk.gr"
+import "lib/sampler.gr"
+
+let SAMPLE_S = int(setting("SAMPLE_S", "10"))
+let KEEP_HOURS = int(setting("KEEP_HOURS", "48"))
+let DISK_PATHS = filter(map(split(setting("DISK_PATHS", ""), ","), trim), fn (p) { return p != "" })
+let DISK_EVERY_S = int(setting("DISK_EVERY_MIN", "30")) * 60
+let DISK_MAX = int(setting("DISK_MAX_ENTRIES", "300000"))
+let TABLES_EVERY_S = 300
+let LINUX = is_linux()
+
+// An event left open by a copy that stopped (a deploy, a restart) is closed as of now, saying so.
+fn close_stale_events() {
+  for ev in events(200) {
+    if ev.open {
+      ev.open = false
+      ev.end = time()
+      ev.secs = round(ev.end - ev.start)
+      ev.note = "deploywatch restarted while this was open; it ended at or before this time"
+      record_event(ev)
+    }
+  }
+}
+
+// Each reading runs in a VM of its own (spawn, then await), and only await is under pcall. A grain error caught by
+// pcall in a function that made closures leaves the VM's open upvalues pointing past its stack (Vm::call's error
+// path, src/userland/grain_vm.cpp), and the next closure return in that VM frees garbage: a failed reading in this
+// long-lived loop took the whole app host down (double free) on the aios the deploy machines run. A reading's VM
+// ends with the reading, so a failure there cannot reach this loop.
+fn sample_once(st) {
+  if st == nil { st = new_state() }
+  let s = take_sample(st)
+  return {"st": st, "sample": s}
+}
+
+fn isolated(f, arg) { return pcall(await, spawn(f, arg)) }
+
+fn sampler_loop() {
+  let st = nil
+  let n = 0
+  while not is_stopping() {
+    let started = time()
+    let got = isolated(sample_once, st)
+    if not got.ok {
+      print("deploywatch: sample failed: " + str(got.error))
+    } else {
+      st = got.value.st
+      if got.value.sample != nil {
+        save_json("now.json", got.value.sample)
+        record_sample(got.value.sample)
+      }
+    }
+    n = n + 1
+    if n % 360 == 1 {
+      prune(KEEP_HOURS)
+      trim_events(1000)
+    }
+    sleep(max(1000, int((SAMPLE_S - (time() - started)) * 1000)))
+  }
+}
+
+fn disk_job(paths) { return disk_report(paths, DISK_MAX) }
+
+fn slow_loop() {
+  let next_tables = 0
+  let next_disk = time() + 60       // after the first samples, not with them
+  while not is_stopping() {
+    if asql_configured() and time() >= next_tables {
+      let r = isolated(asql_tables, 25)
+      save_json("tables.json", r.ok ? r.value : {"ok": false, "error": str(r.error), "t": time()})
+      next_tables = time() + TABLES_EVERY_S
+    }
+    if len(DISK_PATHS) > 0 and time() >= next_disk {
+      let r = isolated(disk_job, DISK_PATHS)
+      save_json("disk.json", r.ok ? r.value : {"error": str(r.error), "t": time()})
+      next_disk = time() + DISK_EVERY_S
+    }
+    sleep(5000)
+  }
+}
+
+if LINUX {
+  close_stale_events()
+  spawn(sampler_loop)
+  spawn(slow_loop)
+}
+
+fn q_int(req, name, fallback, lo, hi) {
+  let v = get(req.query_params ?? {}, name)
+  if v == nil or not is_digit(str(v)) { return fallback }
+  return clamp(int(v), lo, hi)
+}
+
+fn about() {
+  return {"host": sys.host, "cpus": sys.cpus, "linux": LINUX, "sample_s": SAMPLE_S, "keep_hours": KEEP_HOURS}
+}
+
+fn not_measured() { return res_error(404, "this machine is not measured here (no /proc)") }
+
+fn handle_now(req) {
+  if not LINUX { return not_measured() }
+  let s = load_json("now.json")
+  if s == nil { return res_error(503, "no sample yet: the first one comes " + str(SAMPLE_S * 2) + " s after start") }
+  return {"about": about(), "sample": s, "age_s": round(time() - s.t, 1)}
+}
+
+fn handle_history(req) {
+  if not LINUX { return not_measured() }
+  let minutes = q_int(req, "minutes", 60, 1, KEEP_HOURS * 60)
+  let points = q_int(req, "points", 360, 10, 2000)
+  let rows = history(time() - minutes * 60, points)
+  // the page draws lines from these; each process list stays only on the newest
+  let slim = map(rows, fn (s) { return {"t": s.t, "cpu": s.cpu, "load": s.load, "mem": s.mem, "g": s.g, "asql": s.asql} })
+  return {"about": about(), "minutes": minutes, "samples": slim}
+}
+
+fn handle_events(req) {
+  if not LINUX { return not_measured() }
+  return {"events": events(q_int(req, "limit", 100, 1, 1000))}
+}
+
+fn handle_tables(req) {
+  if not LINUX { return not_measured() }
+  return load_json("tables.json") ?? {"ok": false, "error": "not read yet: the first read comes within a minute of start"}
+}
+
+fn handle_disk(req) {
+  if not LINUX { return not_measured() }
+  return load_json("disk.json") ?? {"error": "not walked yet: the first walk starts a minute after start", "folders": []}
+}
+
+let routes = {
+  "GET /health": fn (req) { return {"ok": true, "linux": LINUX} },
+  "GET /now": handle_now,
+  "GET /history": handle_history,
+  "GET /events": handle_events,
+  "GET /tables": handle_tables,
+  "GET /disk": handle_disk
+}
+
+// The workstation: each watched machine's routes under /m/<name>/, answered by that machine's copy.
+let WATCH = []
+for item in split(setting("WATCH", ""), ",") {
+  let eq = index_of(item, "=")
+  if eq <= 0 { continue }
+  push(WATCH, {"name": trim(slice(item, 0, eq)), "member": trim(slice(item, eq + 1))})
+}
+for w in WATCH {
+  routes["GET /m/" + w.name + "/now"] = on_machine(w.member, handle_now)
+  routes["GET /m/" + w.name + "/history"] = on_machine(w.member, handle_history)
+  routes["GET /m/" + w.name + "/events"] = on_machine(w.member, handle_events)
+  routes["GET /m/" + w.name + "/tables"] = on_machine(w.member, handle_tables)
+  routes["GET /m/" + w.name + "/disk"] = on_machine(w.member, handle_disk)
+}
+routes["GET /machines"] = fn (req) { return {"machines": map(WATCH, fn (w) { return w.name })} }
+routes["GET /"] = fn (req) { return res_html(read_file("page/index.html")) }
+
+serve_routes(routes)

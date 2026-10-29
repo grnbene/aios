@@ -23,6 +23,7 @@
 #include "aios/userland/git.hpp"   // zlib_deflate / zlib_inflate: the zlib envelope around the in-tree deflate
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <mutex>
 #include <thread>
@@ -2625,6 +2626,13 @@ class BorrowedConnection : public hal::Connection {
 // to its end, holding the shared lock with replication's writer and every reader queued behind it (atl, 2026-10-28,
 // eight minutes). One thread here polls the busy sessions' sockets for the peer going away (POLLRDHUP) and gives the
 // statement the KILL QUERY an operator would have: a read stops at its next check, a write runs to its end.
+// macOS has no POLLRDHUP: there a peer's close shows as readable with nothing to read, so the watcher asks for POLLIN
+// and peeks - 0 bytes is the hang-up, bytes are only the client talking (which is then left a poll's length).
+#if defined(POLLRDHUP)
+constexpr short kPeerClosed = POLLRDHUP;
+#else
+constexpr short kPeerClosed = POLLIN;
+#endif
 class HangupWatcher {
  public:
   static HangupWatcher& instance() { static HangupWatcher w; return w; }
@@ -2652,13 +2660,20 @@ class HangupWatcher {
       {
         std::lock_guard<std::mutex> lk(mu_);
         fds.clear(); ids.clear();
-        for (const Busy& b : busy_) { fds.push_back(pollfd{b.fd, POLLRDHUP, 0}); ids.push_back(b.conn_id); }
+        for (const Busy& b : busy_) { fds.push_back(pollfd{b.fd, kPeerClosed, 0}); ids.push_back(b.conn_id); }
       }
       if (fds.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
       const int n = ::poll(fds.data(), fds.size(), 100);
       if (n <= 0) continue;
+      bool talking = false;
       for (size_t i = 0; i < fds.size(); ++i) {
-        if (!(fds[i].revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL))) continue;
+        if (!(fds[i].revents & (kPeerClosed | POLLHUP | POLLERR | POLLNVAL))) continue;
+#if !defined(POLLRDHUP)
+        if (!(fds[i].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+          char c;
+          if (::recv(fds[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) != 0) { talking = true; continue; }
+        }
+#endif
         // Still mid-statement? The list was copied before the poll, and a client that got its answer and closed
         // during those 100 ms is not a hang-up (it was counted as one).
         {
@@ -2673,6 +2688,9 @@ class HangupWatcher {
         if (trace) std::fprintf(stderr, "[hangup] connection %llu fd %d revents 0x%x: %s\n", (unsigned long long)ids[i], fds[i].fd, (unsigned)fds[i].revents, killed ? "statement killed" : "no session");
         unwatch(ids[i]);   // once: the statement ends on its own from here
       }
+      // a socket that is only readable stays readable until its statement ends: without this the poll above would
+      // answer at once, every time, and the thread would spin
+      if (talking) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 };

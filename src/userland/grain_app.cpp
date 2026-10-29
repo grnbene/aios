@@ -984,15 +984,23 @@ void Host::shutdown() {
 }
 
 void Host::start_accepting(const std::shared_ptr<Instance>& in) {
-  Instance* raw = in.get();
+  Instance* raw = in.get();   // the accept loop's: it is joined before the instance can go
+  std::weak_ptr<Instance> weak = in;
   std::shared_ptr<WebUi> ui = in->ui;
   const size_t max_body = in->m.max_body;
-  in->accept = hal::Thread([raw, ui, max_body] {
+  in->accept = hal::Thread([raw, weak, ui, max_body] {
     while (!raw->stop->load() && !raw->accept_stop.load()) {
       auto c = raw->listener->accept(100);   // (short: a hand-over waits for this loop to notice)
       if (!c.ok()) continue;
       std::shared_ptr<hal::Connection> conn(std::move(*c));
-      hal::Thread t([conn, ui, raw, max_body] { answer(conn, ui, raw, max_body); });
+      // A connection is detached and can outlive its version: a page's live stream, an SSE route, is still open
+      // when a deploy swaps versions and drops the old instance. It held the raw pointer and read the freed
+      // instance (inst->stop) on its next frame - the host segfaulted on every deploy with a page open. It holds
+      // the instance while it answers; the stream still ends at once, since halt() sets stop, which it checks.
+      hal::Thread t([conn, ui, weak, max_body] {
+        std::shared_ptr<Instance> inst = weak.lock();
+        answer(conn, ui, inst.get(), max_body);
+      });
       if (t.joinable()) t.detach(); else conn->close();
     }
   });

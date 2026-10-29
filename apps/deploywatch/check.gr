@@ -1,0 +1,16 @@
+// Before cutover: the new copy answers, reads /proc where there is one, and serves the page.
+fn check(app) {
+  let h = http_get(app.url + "/health")
+  if h.status != 200 { return "GET /health returned " + str(h.status) }
+  let health = json_parse(h.body)
+  let page = http_get(app.url + "/")
+  if page.status != 200 or not contains(page.body, "Deploy machines") { return "GET / did not serve the page (" + str(page.status) + ")" }
+  let m = http_get(app.url + "/machines")
+  if m.status != 200 { return "GET /machines returned " + str(m.status) }
+  if health.linux {
+    // the first sample needs two readings; the staging copy is checked right away, so only its errors count here
+    let d = http_get(app.url + "/disk")
+    if d.status != 200 { return "GET /disk returned " + str(d.status) }
+  }
+  return true
+}
