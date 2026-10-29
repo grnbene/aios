@@ -323,9 +323,12 @@ estimate never counted. A per-step memory lap at the start (`AIOS_STORE_TRACE=1`
 cells loaded": 59,504 Things of two kinds (`sticker_item` 49,800 and `touch_hour` 9,704; 98 MB in their files, of
 which 60 MB is history - up to 32 entries a Thing, each a before/after copy of its values). The footprint now
 includes `ThingEngine::memory_bytes()` (`Asql_things_mem_bytes`, 126 MB here); the remaining gap on the atl store
-copy is 52 MB. The next cut, a design question for the Things rather than the store: the history need not live in
-memory (the as-of journal already writes it to disk) - keeping the last one or two entries and reading older ones
-from the file would give back ~70 MB on atl.
+copy is 52 MB. The history limit is now two entries a Thing (`AIOS_THINGS_HISTORY=<n>` for more, b5ac4e2), but
+on atl it gives back little: the Things there already held about two entries each (sticker_item 1.98, touch_hour
+1.00), so the 60 MB of history is two before/after copies of large values, not depth (117 MB of Things counted
+after the cut, against 126). What would cut it: not storing `before` (it is the previous entry's `after`), or a
+limit of one; each is worth ~25 MB on atl. touch_hour's own values are 2 KB a Thing (19 MB for 9,704 hours that
+never change again); rolling closed hours off is the app's decision.
 
 ## What this does not do
 
