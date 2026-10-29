@@ -369,8 +369,15 @@ int main(int argc, char** argv) {
       desk.input_mouse_motion(cx, cy);
       desk.input_mouse_button(cx, cy, true, hal::MouseLeft);
       desk.input_mouse_button(cx, cy, false, hal::MouseLeft);
-      for (int i = 0; i < 4; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
+      for (int i = 0; i < 6; ++i) { desk.render_desktop(kernel); hal::sleep_ms(60); }
       frame(desk, kernel, W, H, out + "/7-clicked.ppm");
+      // The boxes after the click (`:focus` on the field it focused), by colour.
+      if (w && w->web && w->web->browser) {
+        for (const auto& f : w->web->browser->document().fragments) {
+          if (f.kind != userland::web::Fragment::Kind::Rect && f.kind != userland::web::Fragment::Kind::Border) continue;
+          std::printf("CLICKED %-6s %5d %5d %5d %5d  #%08x\n", f.kind == userland::web::Fragment::Kind::Rect ? "rect" : "border", f.x, f.y, f.w, f.h, f.color);
+        }
+      }
     }
   } else
   // AIOS_PANE_CLICK=x,y clicks a point instead of the first link, so an

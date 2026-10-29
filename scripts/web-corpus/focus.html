@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><title>A focused field</title>
+<style>
+body { margin: 20px; font: 14px sans-serif; background: #ffffff; }
+form { display: flex; flex-direction: column; gap: 10px; max-width: 320px; }
+input[type="text"] { padding: 6px; border: 2px solid #c0c0c0; }
+input[type="text"]:focus { border-color: #ff3300; }
+form:focus-within { background: #fff5e0; }
+</style></head>
+<body>
+<p>Click the name field: its border turns orange, and the form behind it goes cream (focus-within).</p>
+<form>
+  <input type="text" id="who" name="who" value="Ada">
+  <input type="text" id="note" name="note" value="a note">
+</form>
+</body></html>
