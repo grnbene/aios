@@ -7,5 +7,5 @@ fn down(n) { return down(n + 1) }
   from down (line 1:21)
   from down (line 1:21)
   from down (line 1:21)
-  from ... 193 more frame(s)
+  from ... 993 more frame(s)
   from e3.gr (line 2:1)

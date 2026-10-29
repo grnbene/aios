@@ -562,7 +562,7 @@ struct Vm::State {
   int error_column = 0;
 };
 
-Vm::Vm() : st_(std::make_unique<State>()) { st_->stack.reserve(1024); st_->frames.reserve(256); }
+Vm::Vm() : st_(std::make_unique<State>()) { st_->stack.reserve(1024); st_->frames.reserve(jit::kMaxFrames + 24); }   // never reallocated under native frames: the JIT writes Frames in place
 Vm::~Vm() {
   if (st_) {
     timers.clear();
