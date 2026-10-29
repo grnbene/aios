@@ -280,6 +280,10 @@ let balance = decimal("1234.56")
 print($"Hello {name}, balance: {balance:,.2f}")   # Hello Grain, balance: 1,234.56
 print($"[{7:>5}] {{braces}}")                      # [    7] {braces}
 
+# String escapes: \n \t \r \0 \v \e \\ \" \' ; \xHH one byte; · four hex digits (as JSON and JavaScript
+# write it, a surrogate pair 😀 is one code point); \u{1F600} any code point in braces
+print("café \u{2014} 😀")           # café — 😀
+
 # Spread (...): a list's items as a call's arguments, or inside a list literal
 let params = ["A1", 3]
 let rows = read_raw(sql, ...params)               # read_raw(sql, "A1", 3)
