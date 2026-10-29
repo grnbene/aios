@@ -24,6 +24,8 @@ class TlsServerConnection : public hal::Connection {
   std::string peer() const override { return peer_; }
   void close() override;
   bool alive() const override { return !closed_; }
+  // The socket under the TLS layer, so the wire's hang-up watcher sees a TLS client go away mid-statement too.
+  int poll_fd() const override { const hal::Connection* t = server_ ? server_->transport() : nullptr; return t ? t->poll_fd() : -1; }
 
  private:
   std::unique_ptr<TlsServer> server_;
