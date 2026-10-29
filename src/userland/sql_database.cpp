@@ -15383,6 +15383,7 @@ void DictArena::decode_into(DictArena& out) const {
   std::memcpy(o, bytes_.data(), bytes_.size());
   for (size_t k = 1; k < offs_.size(); ++k) out.offs_.push_back(base + offs_[k]);
   out.bytes_.resize(base + bytes_.size());
+  out.bytes_.shrink_to_fit();   // sized at 8x the coded bytes (the decoder's bound): 208 MB held for 70 MB of po_options text
 }
 
 void DictArena::push_from(const DictArena& src, size_t k) {
@@ -16646,7 +16647,11 @@ bool ColumnStore::code_dictionary(size_t budget) {
     const size_t was = dict.coded_count();
     // LZ4, not deflate: a LIKE over the column decodes every block per statement, and inflating 29 MB of
     // payment_details took the statement from 33 to 63 ms; LZ4 holds 3/4 of deflate's saving at a fifth of the cost.
+    const size_t before = dict.memory_bytes();
     dict.block_upto(upto, DictArena::kBlockLz4, per);
+    static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+    if (trace && dict.coded_count() > was)
+      fprintf(stderr, "[store] dictionary: entries %zu-%zu into blocks of %u (%.1f MB -> %.1f MB)\n", was, dict.coded_count(), per, before / 1048576.0, dict.memory_bytes() / 1048576.0);
     return dict.coded_count() > was;
   }
   std::shared_ptr<const SymbolCoder> coder = dict.coder();
@@ -22840,7 +22845,8 @@ void SqlDatabase::maintain_storage() {
       // per checkpoint: until now this happened only when a column was encoded, so a column encoded before either
       // existed (atl's salesorderdetails.po_options, 27 MB) kept its plain entries for good.
       if (dict_budget > 0 && (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) && !cs.shared_dict &&
-          cs.dict.plain_bytes() >= ((size_t)1 << 20)) {
+          (cs.dict.plain_bytes() >= ((size_t)1 << 20) ||
+           (cs.dict.coded() && !cs.dict.blocked() && cs.dict.byte_size() >= ((size_t)1 << 20)))) {   // or symbol-coded, long entries: blocks are smaller
         const size_t before = cs.dict.plain_bytes();
         if (cs.code_dictionary(dict_budget)) {
           dict_budget -= std::min(dict_budget, before - std::min(before, cs.dict.plain_bytes()));
@@ -32800,7 +32806,23 @@ bool segment_may_match(const Pred& p, const ColumnStore& cs, size_t seg) {
   if (p.kind == Pred::PerCode && p.nulls && p.null_truth == kT) return true;   // NULL rows pass: the map cannot say
   if (zm.all_null) return false;              // a comparison with NULL is never true
   if (p.negated) return true;                 // NOT BETWEEN: not worth the cases
-  if (p.kind == Pred::NumCmp && p.temporal) return true;   // a date column's numeric bounds are its leading years: not these numbers
+  if (p.kind == Pred::NumCmp && p.temporal) {
+    // A date column's numeric bounds are its leading years, not these numbers; its text bounds are the dates. Whole
+    // ones only (a bound cut short by str_cut does not parse): then the segment is read.
+    int64_t mn = 0, mx = 0;
+    const bool seconds = zm.min_str.size() == 19;
+    if (p.negated || zm.min_str.size() != zm.max_str.size() || !temporal_parse(zm.min_str, seconds, &mn) || !temporal_parse(zm.max_str, seconds, &mx)) return true;
+    const double lo_b = (double)mn, hi_b = (double)mx;
+    switch (p.op) {
+      case ExprOp::Eq: return p.lo >= lo_b && p.lo <= hi_b;
+      case ExprOp::Lt: return lo_b < p.lo;
+      case ExprOp::Le: return lo_b <= p.lo;
+      case ExprOp::Gt: return hi_b > p.lo;
+      case ExprOp::Ge: return hi_b >= p.lo;
+      case ExprOp::Between: return hi_b >= p.lo && lo_b <= p.hi;
+      default: return true;
+    }
+  }
   if (p.kind == Pred::NumCmp || (p.kind == Pred::TextCmp && p.num_lit)) {
     if (p.kind == Pred::TextCmp && !p.numeric_col) return true; // numeric prefixes of text: not in the map
     if (zm.min_double > zm.max_double) return true;
