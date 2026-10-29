@@ -1252,6 +1252,39 @@ Value bi_map(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::nil();
 }
 
+// flat_map(list, fn): fn's results joined into one list - a list result contributes its items, nil nothing, any
+// other value itself. One level, as JavaScript's flatMap: `flat_map(orders, fn (o) { return o.lines })`.
+Value bi_flat_map(Vm& vm, std::vector<Value>& args, std::string& error) {
+  const Value& col = args[0];
+  const Value& fn = args[1];
+  std::vector<Value> out;
+  auto take = [&](Value res) {
+    if (res.type == Type::List) { const auto& items = res.list_items(); out.insert(out.end(), items.begin(), items.end()); }
+    else if (res.type != Type::Nil) out.push_back(std::move(res));
+  };
+  if (col.type == Type::List) {
+    const auto& items = col.list_items();
+    out.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+      Value res = vm.call(fn, {items[i]}, error);
+      if (!error.empty()) return Value::nil();
+      take(std::move(res));
+    }
+    return Value::list(std::move(out));
+  }
+  if (col.type == Type::Map) {
+    auto* m = static_cast<MapObj*>(col.obj.get());
+    for (const auto& [k, v] : m->entries) {
+      Value res = vm.call(fn, {Value::string(k), v}, error);
+      if (!error.empty()) return Value::nil();
+      take(std::move(res));
+    }
+    return Value::list(std::move(out));
+  }
+  error = std::string("flat_map() wants a list or map, got a ") + type_name(col.type);
+  return Value::nil();
+}
+
 Value bi_filter(Vm& vm, std::vector<Value>& args, std::string& error) {
   const Value& col = args[0];
   const Value& fn = args[1];
@@ -7171,6 +7204,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("sort", 1, 1, bi_sort);
   vm.define_native("reverse", 1, 1, bi_reverse);
   vm.define_native("map", 2, 2, bi_map);
+  vm.define_native("flat_map", 2, 2, bi_flat_map);
   vm.define_native("filter", 2, 2, bi_filter);
   vm.define_native("reduce", 2, 3, bi_reduce);
   vm.define_native("each", 2, 2, bi_each);
