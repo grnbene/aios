@@ -22984,7 +22984,9 @@ void SqlDatabase::maintain_storage() {
     for (auto& kv : table_row_indices_) {
       if (!kv.second) continue;
       PkMap& pk = kv.second->pk_to_row;
-      if (pk.sorted_mode() || pk.runs_mode() || pk.size() < PkMap::kSortedMin) continue;
+      // (Only text keys as slots count against the budget: an integer map that fell back to slots - 31 of atl's -
+      // is not sortable, and counting it ate the budget at every checkpoint before anything was sorted.)
+      if (!pk.text_slots() || pk.size() < PkMap::kSortedMin) continue;
       if (sort_budget == 0) { ++left; left_keys += pk.size(); continue; }
       const uint64_t t0 = kernel_.host().monotonic_ns();
       const size_t before = pk.memory_bytes();

@@ -1457,6 +1457,8 @@ class PkMap {
     return true;
   }
   bool sorted_mode() const { return sorted_; }
+  // Text keys held as slots: what sort_text_keys would take (an integer map that fell back to slots is not one).
+  bool text_slots() const { return text_ && !sorted_ && !runs_; }
   // How many maps have been sorted, and how many sorted maps turned back into slots (SHOW STATUS).
   static std::atomic<uint64_t>& sorted_count() { static std::atomic<uint64_t> n{0}; return n; }
   static std::atomic<uint64_t>& sorted_to_slots_count() { static std::atomic<uint64_t> n{0}; return n; }

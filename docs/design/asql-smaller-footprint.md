@@ -297,8 +297,22 @@ The stall fixes (commit 4589495) ride along: the hang-up watcher, the 10-minute 
 survive checkpoints. Of that, the 34 text-keyed tables (3.0M keys, slots at ~45 B) are about half, and integer
 tables whose ids have gaps from old deletes are a 16-byte run per key for the rest; consecutive ids and the
 re-packed pairs cost almost nothing. The old binary held 340 MB at this point and went to ~23 B a key for
-everything under a day of writes; this one stays as loaded. The next cut is the text keys - a sorted key arena
-with a prefix index (~20 B a key) - which trades a hash probe for a bisection on those tables.
+everything under a day of writes; this one stays as loaded.
+
+**Text keys as a sorted arena (done 2026-10-29 06:00, commit after 81e96a7)**: `PkMap::sort_text_keys` turns a
+text-keyed map of 4,096+ keys into one arena in key order (varint length + bytes), a 32-bit offset and row id a
+key, and an index of every 64th key's first 8 bytes that narrows the bisection to a few groups. Writes go to an
+overlay (`slate_`: new keys sorted; `sgone_`: erased positions) folded in at the runs-mode threshold; a re-point
+writes the id in place; an id past 32 bits or a walk turns the map back to slots (`Asql_pk_sorted_to_slots`), to be
+sorted again. `maintain_storage` sorts up to 500k keys a checkpoint, text-keyed slot maps only (integer maps that
+fell back to slots - 31 on this store - are not candidates: counting them ate the budget). Measured on the atl
+store copy with the full warm-up list: key maps 289 -> 133 MB after the boot checkpoint and six maintaining
+checkpoints (19 maps, two small ones left for the next), counted memory 691 -> 577 MB; `prices` 879k keys
+113 -> 43 MB in 408 ms, `stockmoves` 574k in 226 ms, everything else under 100 ms. Micro-benchmark on 3M keys:
+239 MB -> 73 MB, lookup 0.11 -> 0.71 µs (overlay of 50k: 0.89 µs); the query bench is unchanged (point reads
+0.1 ms). Differential soak: 300 sorted sequences, 3.2M steps, every answer the model's. `AIOS_SQL_PK_SORTED=0`
+keeps every map as slots. RSS follows the counted memory only once the allocator gives the slot pages back (see
+the replica notes: all three allocator settings showed a 170-190 MB gap after the morning's 58k-insert burst).
 
 ## What this does not do
 
