@@ -189,24 +189,24 @@ int main() {
     for (long long order = 1; order <= 200000; ++order)
       for (long long line = 1; line <= 1 + order % 3; ++line) { m.emplace(pk2(order, line), row); ref[pk2(order, line)] = row; ++row; }
     const size_t loaded = m.memory_bytes();
-    std::mt19937_64 rng(99);
+    std::mt19937_64 churn(99);
     // 50k lines added to orders already there: every one of them a key before the last.
     for (int i = 0; i < 50000; ++i) {
-      const long long order = 1 + (long long)(rng() % 200000);
-      const long long line = 10 + (long long)(rng() % 5);
+      const long long order = 1 + (long long)(churn() % 200000);
+      const long long line = 10 + (long long)(churn() % 5);
       if (m.emplace(pk2(order, line), row).second) { ref[pk2(order, line)] = row; ++row; }
     }
     OK(m.runs_mode() && m.size() == ref.size(), "50k lines added to old orders: still runs, %zu keys", m.size());
     // 30% of the keys deleted (more than the quarter that used to turn the map into slots).
     size_t deleted = 0;
     for (auto it = ref.begin(); it != ref.end();) {
-      if (rng() % 10 < 3) { m.erase(it->first); it = ref.erase(it); ++deleted; } else ++it;
+      if (churn() % 10 < 3) { m.erase(it->first); it = ref.erase(it); ++deleted; } else ++it;
     }
     OK(m.runs_mode() && m.size() == ref.size(), "%zu keys deleted: still runs", deleted);
     // Keys re-pointed at other rows (an UPDATE that moves a row).
     for (int i = 0; i < 20000; ++i) {
       auto it = ref.begin();
-      std::advance(it, (long)(rng() % ref.size()));
+      std::advance(it, (long)(churn() % ref.size()));
       m[it->first] = it->second + 1000000u;
       it->second += 1000000u;
     }
