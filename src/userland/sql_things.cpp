@@ -42,7 +42,18 @@ namespace aios::userland {
 
 namespace {
 
-constexpr size_t kHistoryKeep = 32;
+// How many history entries a Thing keeps in memory (and in its file): the last two by default - enough for "what
+// changed it and why" - since every entry is a before/after copy of the Thing's values, and 32 of them for 59,504
+// Things were 60 of atl's 98 MB of Thing files (and as much RSS). AIOS_THINGS_HISTORY=<n> keeps more (1..100000);
+// the as-of file (ASOF) holds the whole history for a kind that has it on.
+size_t history_keep() {
+  static const size_t v = [] {
+    const char* e = std::getenv("AIOS_THINGS_HISTORY");
+    const long long n = e && *e ? std::strtoll(e, nullptr, 10) : 2;
+    return (size_t)std::min<long long>(std::max<long long>(n, 1), 100000);
+  }();
+  return v;
+}
 constexpr size_t kPartitionChunk = 1000;
 const char* const kNullKey = "\x01NULL";
 
@@ -1817,7 +1828,7 @@ void ThingEngine::finish_changes(Kind& k, const std::map<std::string, std::strin
     in.version++;
     in.updated_ns = now;
     in.history.push_back(History{now, cause, kv.second, after});
-    if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+    if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
     k.version++;
     in.stamp = k.version;
     dirty_ = true;
@@ -1934,7 +1945,7 @@ bool ThingEngine::run_part(Kind& k, Kind::PartDef& p, const std::vector<std::str
       in.part_rows[p.name] = std::move(rows);
       in.history.push_back(History{db_.kernel_.host().wall_ns(), cause, before,
                                    "part " + p.name + ": " + std::to_string(in.part_rows[p.name].size()) + " rows"});
-      if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+      if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
       stamp_instance(k, in);
     }
   }
@@ -2150,7 +2161,7 @@ void ThingEngine::act_due(Kind& k) {
       in.history.push_back(History{now, "act failed", "WHEN " + k.when_expr, err});
       fprintf(stderr, "[things] %s %s: act failed: %s\n", k.name.c_str(), in.key.c_str(), err.c_str());
     }
-    if (in.history.size() > kHistoryKeep) in.history.erase(in.history.begin());
+    if (in.history.size() > history_keep()) in.history.erase(in.history.begin());
     k.version++;
     in.stamp = k.version;
     dirty_ = true;
@@ -5201,7 +5212,7 @@ void ThingEngine::reallocate(Kind& c, Kind& r, const std::string& cause, bool qu
       it->second.version++;
       it->second.updated_ns = now;
       it->second.history.push_back(History{now, cause, kv.second, after});
-      if (it->second.history.size() > kHistoryKeep) it->second.history.erase(it->second.history.begin());
+      if (it->second.history.size() > history_keep()) it->second.history.erase(it->second.history.begin());
       c.version++;
     }
   }
@@ -5214,7 +5225,7 @@ void ThingEngine::reallocate(Kind& c, Kind& r, const std::string& cause, bool qu
       it->second.version++;
       it->second.updated_ns = now;
       it->second.history.push_back(History{now, cause, kv.second, after});
-      if (it->second.history.size() > kHistoryKeep) it->second.history.erase(it->second.history.begin());
+      if (it->second.history.size() > history_keep()) it->second.history.erase(it->second.history.begin());
       r.version++;
     }
   }
@@ -5874,6 +5885,17 @@ void ThingEngine::load() {
     const std::string name = k.name;
     kinds_.emplace(name, std::move(k));
   }
+  // Histories saved under a larger limit are cut to this run's at the load, so the next save writes the smaller files.
+  {
+    const size_t keep = history_keep();
+    auto cut = [keep](std::vector<History>& h) { if (h.size() > keep) h.erase(h.begin(), h.begin() + (long)(h.size() - keep)); };
+    for (auto& kv : kinds_) {
+      for (auto& t : kv.second.things) cut(t.second.history);
+      for (auto& g : kv.second.gthings) cut(g.second.history);
+      for (auto& r : kv.second.res) cut(r.second.history);
+      for (auto& o : kv.second.orders) cut(o.second.history);
+    }
+  }
   // Claims and resources back together: the shares are derived, so they are
   // worked out again from the saved claims and capacities (no history).
   for (auto& kv : kinds_) {
@@ -6136,7 +6158,7 @@ bool ThingEngine::put_ginst(Kind& k, const std::string& ck, Kind::GInst fresh, c
   gi.version++;
   gi.updated_ns = now;
   gi.history.push_back(History{now, cause, before.empty() ? std::string("(not a Thing)") : before, after});
-  if (gi.history.size() > kHistoryKeep) gi.history.erase(gi.history.begin());
+  if (gi.history.size() > history_keep()) gi.history.erase(gi.history.begin());
   k.version++;
   gi.stamp = k.version;
   dirty_ = true;

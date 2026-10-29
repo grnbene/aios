@@ -76,7 +76,7 @@ To view recent mutations and their causes:
 SHOW THING HISTORY orders '200';
 ```
 
-Returns the most recent 32 history entries for key `200`: when, the cause (a description such as `lines update orderno 200`, not the SQL statement), and the values before and after. Actions taken (or, in shadow mode, worked out) appear here too.
+Returns the history kept for key `200`: when, the cause (a description such as `lines update orderno 200`, not the SQL statement), and the values before and after. Actions taken (or, in shadow mode, worked out) appear here too. The engine keeps the last two entries a Thing (every entry is a before/after copy of its values: 32 of them for 59,504 Things were 60 MB of files and as much memory); `AIOS_THINGS_HISTORY=<n>` in the engine's environment keeps more, and a store saved under a larger limit is cut to the running one when it is loaded. The whole history of a kind with `ASOF` on is in its as-of file.
 
 ---
 
