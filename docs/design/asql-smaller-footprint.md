@@ -258,8 +258,16 @@ do on the local replica, then atl).
   a deleted row had a fat map after its next checkpoint (289 MB on a fresh load). `PkMap::remap_or_erase`.
 - Date predicates prune by the segments' date bounds; a symbol-coded dictionary with no plain tail reaches the
   block step; decoding one before blocking no longer holds 3x its text.
-- Measured on the same store and protocol, final: columns 412 -> 376 MB, resident 715 -> 690 MB (the rest of the
-  night's numbers are in the commits).
+- Measured on the same store and protocol with the night's last engine (01fb45ce): columns 412 -> 375 MB, counted
+  467 -> 429 MB, resident 715 -> 688 MB. Queries, unmodified HEAD -> this: `po_options LIKE` 164 -> 63 ms,
+  `gltrans narrative LIKE` 46 -> 26, `payment_details LIKE` 33 -> 21 (every LIKE over a coded or blocked
+  dictionary now scans it a slice at a time instead of decoding it whole), `ORDER BY date_created LIMIT` 118 -> 5.5,
+  a month's date-range count 0.94 -> 0.20, point lookups by key 0.1-0.16 ms both, joins and group-bys within noise.
+- A session can raise or drop its read deadline with `SET max_statement_time`; `SHOW STATUS` answers without the
+  statement lock and counts the deadline and hang-up kills.
+- Under replication the growth is transient: three local replicas of atl ran the night on the new engine through a
+  burst of 900k replicated updates; resident rose to ~1.2 GB during it and fell back to counted + ~60 MB once it
+  ended (A 741, B 699, C 522 MB at 02:21), with 10 / 41 / 41 maps in slot form against hundreds before.
 - Under replication the gap still follows writes with the maps staying runs: three local replicas of atl ran
   overnight on the new engine - default malloc, `MALLOC_ARENA_MAX=2`, and that plus `MALLOC_MMAP_THRESHOLD_=1048576`
   - sampled in `samples.txt` beside each store; the unit's `Environment=` on atl follows from them.
