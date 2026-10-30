@@ -244,21 +244,28 @@ namespace {
 
 // Integers print without a decimal point; reals always print with one, so a
 // program never has to wonder which kind it is holding.
-// std::to_chars, not snprintf: the same text (C++17 defines %.12g's output for it), without printf's machinery.
+// std::to_chars, not snprintf: an int's digits, a real's shortest round-trip text.
 std::string number_text(const Value& v) {
   char buf[48];
   if (v.type == Type::Int) {
     auto r = std::to_chars(buf, buf + sizeof buf, v.i);
     return std::string(buf, r.ptr);
   }
-  if (v.d == (double)(int64_t)v.d && std::fabs(v.d) < 1e15) {   // a whole number: "3.0"
-    auto r = std::to_chars(buf, buf + sizeof buf, (int64_t)v.d);
-    std::string out(buf, r.ptr);
-    if (out == "0" && std::signbit(v.d)) out = "-0";
-    return out + ".0";
-  }
-  auto r = std::to_chars(buf, buf + sizeof buf, v.d, std::chars_format::general, 12);
-  return std::string(buf, r.ptr);
+  // A real: the shortest text that reads back as the same real (0.30000000000000004, 123456789.123456), never
+  // rounded to look tidier, and with a point or an exponent so it never reads as an int (3.0, 1e+16).
+  if (std::isnan(v.d)) return "nan";
+  if (std::isinf(v.d)) return v.d < 0 ? "-inf" : "inf";
+  // Shortest digits; written out in full while the exponent is -4..15, with an exponent past that (Python's rule:
+  // 1234567.891, 0.0001, 6.666666666666666e+19, 1e-05).
+  auto r = std::to_chars(buf, buf + sizeof buf, v.d, std::chars_format::scientific);
+  std::string sci(buf, r.ptr);
+  const size_t e = sci.find('e');
+  const int exp10 = e == std::string::npos ? 0 : std::atoi(sci.c_str() + e + 1);
+  if (exp10 < -4 || exp10 >= 16) return sci;
+  r = std::to_chars(buf, buf + sizeof buf, v.d, std::chars_format::fixed);
+  std::string out(buf, r.ptr);
+  if (out.find('.') == std::string::npos) out += ".0";
+  return out;
 }
 
 std::string quote(const std::string& s) {

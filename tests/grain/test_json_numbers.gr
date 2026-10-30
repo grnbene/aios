@@ -22,7 +22,7 @@ fn run(where) {
   check(json_stringify(123456789.125) == "123456789.125", where + ": 123456789.125")
   check(json_stringify(1e21) == "1e+21", where + ": 1e21")
   check(json_stringify(-2.5) == "-2.5", where + ": -2.5")
-  check(json_stringify([1.0, 100.0]) == "[1,100]", where + ": whole reals write without a fraction, as before")
+  check(json_stringify([1e0, 100e0]) == "[1.0,100.0]", where + ": a whole real keeps its point, as str() writes it, so it reads back as a real")
   check(json_stringify(json_parse("1e400")) == "null", where + ": an overflowing real is null, as before")
   # round trip: every real written reads back as the same value
   for x in [0.1, 0.2, 1 / 3, 2.5e-7, 6.02214076e23, 1.7976931348623157e308, 5e-324, -0.000001] {

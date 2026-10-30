@@ -2612,10 +2612,10 @@ void json_stringify_helper(const Value& v, std::string& out, int indent_level, i
       if (std::isnan(v.d) || std::isinf(v.d)) {
         out += "null";
       } else {
-        // The fewest digits that read back as the same value: 0.1 is "0.1", 0.1 + 0.2 is
-        // "0.30000000000000004" (what JavaScript and Python write), not 17 digits for every real.
-        const auto r = std::to_chars(buf, buf + sizeof(buf), v.d);
-        out.append(buf, r.ptr);
+        // As str() writes it: the fewest digits that read back as the same value (0.30000000000000004), a point or
+        // an exponent so it stays a real (3.0) - one text for a real wherever grain writes one.
+        (void)buf;
+        out += v.to_text();
       }
       break;
     }
