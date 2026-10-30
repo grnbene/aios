@@ -14,7 +14,7 @@ aios --root R grain run --steps 0 apps/sqldoom/load.gr doom1.wad E1M1
 procedures (`sql/loader_procs.sql`) and the static catalogs (`sql/game_data.sql`, `sql/menu_data.sql`), decodes the
 WAD's palettes, COLORMAP, wall textures, flats, status-bar patches and sprites, loads each map asked for (all of them
 when none is named), and builds the derived tables (`sql/derived.sql`). E1M1 from the shareware `doom1.wad` loads in
-about 90 s.
+about 45 s.
 
 ## Rendering a frame
 
