@@ -17147,6 +17147,20 @@ class GrainDesktopFiles final : public grain::Files {
     out = at(path);
     return true;
   }
+  bool stat(const std::string& path, grain::FileStat& out, std::string&) override {
+    auto st = h_.stat(at(path));
+    if (!st.ok()) return false;
+    out.size = st->is_dir ? 0 : static_cast<int64_t>(st->size);
+    out.dir = st->is_dir;
+    out.modified_ms = static_cast<int64_t>(st->mtime_ns / 1000000);
+    out.mode = st->mode & 07777;
+    return true;
+  }
+  bool rename(const std::string& from, const std::string& to, std::string& error) override {
+    auto r = h_.rename_file(at(from), at(to));
+    if (!r.ok()) { error = r.error().message; return false; }
+    return true;
+  }
 
  private:
   std::string at(const std::string& p) const { return p.empty() ? base_ : p[0] == '/' ? p : base_ + "/" + p; }

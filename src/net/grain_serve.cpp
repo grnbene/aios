@@ -124,6 +124,23 @@ class RootedFiles final : public g::Files {
     auto st = host_.stat(full);
     return st.ok() && st->is_dir;
   }
+  bool stat(const std::string& path, g::FileStat& out, std::string& error) override {
+    std::string full;
+    if (!resolve(path, full, error)) return false;
+    auto st = host_.stat(full);
+    if (!st.ok()) return false;
+    out.size = st->is_dir ? 0 : (int64_t)st->size;
+    out.dir = st->is_dir;
+    out.modified_ms = (int64_t)(st->mtime_ns / 1000000);
+    out.mode = st->mode & 07777;
+    return true;
+  }
+  bool rename(const std::string& from, const std::string& to, std::string& error) override {
+    std::string a, b;
+    if (!resolve(from, a, error) || !resolve(to, b, error)) return false;
+    if (!host_.rename_file(a, b).ok()) { error = "cannot rename " + from; return false; }
+    return true;
+  }
 
  private:
   hal::Host& host_;

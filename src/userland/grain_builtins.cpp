@@ -7129,6 +7129,157 @@ Value bi_file_exists(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::boolean(f->exists(args[0].str()));
 }
 
+// file_stat(path): {size, dir, modified, mode} - modified in milliseconds since 1970 - or nil when nothing is there.
+Value bi_file_stat(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "file_stat")) return Value::nil();
+  Files* f = files_of(vm, error, "file_stat");
+  if (!f) return Value::nil();
+  FileStat st;
+  std::string why;
+  if (!f->stat(args[0].str(), st, why)) {
+    if (!why.empty()) error = file_error("file_stat", args[0].str(), why);
+    return Value::nil();
+  }
+  auto m = std::make_shared<MapObj>();
+  m->put("size", Value::integer(st.size));
+  m->put("dir", Value::boolean(st.dir));
+  m->put("modified", Value::integer(st.modified_ms));
+  m->put("mode", Value::integer(st.mode));
+  return Value::object(Type::Map, m);
+}
+
+// rename_file(from, to): `from` takes the name `to`, replacing what was there (in one step where the storage can).
+Value bi_rename_file(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "rename_file") || !want_str(args[1], error, "rename_file")) return Value::nil();
+  Files* f = files_of(vm, error, "rename_file");
+  if (!f) return Value::nil();
+  std::string why;
+  if (!f->rename(args[0].str(), args[1].str(), why)) { error = file_error("rename_file", args[0].str(), why); return Value::nil(); }
+  return Value::boolean(true);
+}
+
+// copy_file(from, to): a file's bytes under a second name, replacing what was there.
+Value bi_copy_file(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "copy_file") || !want_str(args[1], error, "copy_file")) return Value::nil();
+  Files* f = files_of(vm, error, "copy_file");
+  if (!f) return Value::nil();
+  if (f->is_dir(args[0].str())) { error = file_error("copy_file", args[0].str(), "is a directory"); return Value::nil(); }
+  std::string data, why;
+  if (!f->read(args[0].str(), data, why)) { error = file_error("copy_file", args[0].str(), why); return Value::nil(); }
+  if (!f->write(args[1].str(), data, false, why)) { error = file_error("copy_file", args[1].str(), why); return Value::nil(); }
+  return Value::boolean(true);
+}
+
+// One path segment against one glob segment: * (any run), ? (one character), [abc] [a-z] [!abc]. A name that
+// starts with '.' is matched only by a pattern that starts with one, as a shell does.
+bool glob_segment(const std::string& pat, const std::string& name) {
+  if (!name.empty() && name[0] == '.' && (pat.empty() || pat[0] != '.')) return false;
+  size_t p = 0, n = 0, star_p = std::string::npos, star_n = 0;
+  while (n < name.size()) {
+    if (p < pat.size() && pat[p] == '*') { star_p = p++; star_n = n; continue; }
+    if (p < pat.size() && pat[p] == '[') {
+      size_t q = p + 1;
+      const bool negate = q < pat.size() && (pat[q] == '!' || pat[q] == '^');
+      if (negate) ++q;
+      bool hit = false, closed = false;
+      for (bool first = true; q < pat.size(); first = false) {
+        if (pat[q] == ']' && !first) { closed = true; break; }
+        if (q + 2 < pat.size() && pat[q + 1] == '-' && pat[q + 2] != ']') {
+          if ((unsigned char)name[n] >= (unsigned char)pat[q] && (unsigned char)name[n] <= (unsigned char)pat[q + 2]) hit = true;
+          q += 3;
+        } else {
+          if (pat[q] == name[n]) hit = true;
+          ++q;
+        }
+      }
+      if (closed && hit != negate) { p = q + 1; ++n; continue; }
+      if (!closed && pat[p] == name[n]) { ++p; ++n; continue; }   // an unclosed [ is itself
+    } else if (p < pat.size() && (pat[p] == '?' || pat[p] == name[n])) {
+      ++p; ++n;
+      continue;
+    }
+    if (star_p == std::string::npos) return false;
+    p = star_p + 1;
+    n = ++star_n;
+  }
+  while (p < pat.size() && pat[p] == '*') ++p;
+  return p == pat.size();
+}
+
+bool glob_walk(Files* f, const std::string& dir, const std::vector<std::string>& segs, size_t i,
+               std::vector<std::string>& out, size_t& budget, std::string& error) {
+  auto under = [&](const std::string& name) { return dir.empty() ? name : (dir == "/" ? "/" + name : dir + "/" + name); };
+  if (i == segs.size()) return true;
+  const std::string& seg = segs[i];
+  const bool last = i + 1 == segs.size();
+  if (seg == "**") {   // zero or more directories
+    if (last) {        // a trailing ** is everything below
+      std::vector<FileEntry> entries;
+      std::string why;
+      if (!f->list(dir, entries, why)) return true;
+      for (const auto& e : entries) {
+        if (!e.name.empty() && e.name[0] == '.') continue;
+        if (budget == 0) { error = "glob(): more than 100000 entries looked at"; return false; }
+        --budget;
+        out.push_back(under(e.name));
+        if (e.dir && !glob_walk(f, under(e.name), segs, i, out, budget, error)) return false;
+      }
+      return true;
+    }
+    if (!glob_walk(f, dir, segs, i + 1, out, budget, error)) return false;
+    std::vector<FileEntry> entries;
+    std::string why;
+    if (!f->list(dir, entries, why)) return true;
+    for (const auto& e : entries) {
+      if (!e.dir || (!e.name.empty() && e.name[0] == '.')) continue;
+      if (budget == 0) { error = "glob(): more than 100000 entries looked at"; return false; }
+      --budget;
+      if (!glob_walk(f, under(e.name), segs, i, out, budget, error)) return false;
+    }
+    return true;
+  }
+  if (seg.find_first_of("*?[") == std::string::npos) {   // a plain name: no listing needed
+    const std::string p = under(seg);
+    if (last) { if (f->exists(p) || f->is_dir(p)) out.push_back(p); return true; }
+    return f->is_dir(p) ? glob_walk(f, p, segs, i + 1, out, budget, error) : true;
+  }
+  std::vector<FileEntry> entries;
+  std::string why;
+  if (!f->list(dir, entries, why)) return true;   // not a directory, or not readable: no matches here
+  for (const auto& e : entries) {
+    if (budget == 0) { error = "glob(): more than 100000 entries looked at"; return false; }
+    --budget;
+    if (!glob_segment(seg, e.name)) continue;
+    if (last) out.push_back(under(e.name));
+    else if (e.dir && !glob_walk(f, under(e.name), segs, i + 1, out, budget, error)) return false;
+  }
+  return true;
+}
+
+// glob(pattern): the paths that match, sorted - "*.csv", "logs/2026-10-*/*.jsonl", "**/*.gr" (** is any depth).
+Value bi_glob(Vm& vm, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "glob")) return Value::nil();
+  Files* f = files_of(vm, error, "glob");
+  if (!f) return Value::nil();
+  const std::string& pat = args[0].str();
+  std::vector<std::string> segs;
+  for (size_t i = 0; i <= pat.size();) {
+    size_t j = pat.find('/', i);
+    if (j == std::string::npos) j = pat.size();
+    if (j > i) segs.push_back(pat.substr(i, j - i));
+    i = j + 1;
+  }
+  std::vector<std::string> out;
+  size_t budget = 100000;
+  if (!segs.empty() && !glob_walk(f, !pat.empty() && pat[0] == '/' ? "/" : "", segs, 0, out, budget, error)) return Value::nil();
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  std::vector<Value> vals;
+  vals.reserve(out.size());
+  for (auto& p : out) vals.push_back(Value::string(std::move(p)));
+  return Value::list(std::move(vals));
+}
+
 Value bi_entity_assemble(Vm&, std::vector<Value>& args, std::string& error) {
   if (args.size() < 3 || args[0].type != Type::Str || args[1].type != Type::Map || args[2].type != Type::Map) {
     error = "__entity_assemble expects (name, fields, handlers)";
@@ -7634,6 +7785,10 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("append_file", 2, 2, bi_append_file);
   vm.define_native("list_dir", 0, 1, bi_list_dir);
   vm.define_native("delete_file", 1, 1, bi_delete_file);
+  vm.define_native("file_stat", 1, 1, bi_file_stat);
+  vm.define_native("rename_file", 2, 2, bi_rename_file);
+  vm.define_native("copy_file", 2, 2, bi_copy_file);
+  vm.define_native("glob", 1, 1, bi_glob);
   vm.define_native("file_exists", 1, 1, bi_file_exists);
 
   // AIOS Substrate Primitives

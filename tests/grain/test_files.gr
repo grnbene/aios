@@ -1,0 +1,50 @@
+// file_stat, rename_file, copy_file, glob: in a directory of its own, removed at the end.
+fn check(c, msg) { assert_true(c, msg) }
+
+let d = "grain-files-test-" + str(time_ms())
+mkdir(d + "/logs/2026-10-29", true)
+mkdir(d + "/logs/2026-10-30", true)
+write_file(d + "/a.csv", "1,2,3\n")
+write_file(d + "/b.csv", "4\n")
+write_file(d + "/c.txt", "x")
+write_file(d + "/.hidden.csv", "h")
+write_file(d + "/logs/2026-10-29/x.jsonl", "{}")
+write_file(d + "/logs/2026-10-30/y.jsonl", "{}")
+write_file(d + "/logs/2026-10-30/z.log", "z")
+
+// file_stat
+let s = file_stat(d + "/a.csv")
+check(s.size == 6 and s.dir == false, "a file's size: " + str(s))
+check(abs(s.modified - time_ms()) < 60000, "modified is milliseconds since 1970, near now: " + str(s.modified))
+check(file_stat(d + "/logs").dir == true, "a directory")
+check(file_stat(d + "/nope") == nil, "nothing there: nil")
+
+// rename_file replaces what was at the new name
+write_file(d + "/old.txt", "new content")
+write_file(d + "/target.txt", "was here")
+check(rename_file(d + "/old.txt", d + "/target.txt") == true, "rename returns true")
+check(!file_exists(d + "/old.txt") and read_file(d + "/target.txt") == "new content", "renamed over the old file")
+check(!try_call(rename_file, d + "/missing", d + "/x").ok, "renaming nothing is an error")
+
+// copy_file
+check(copy_file(d + "/a.csv", d + "/a2.csv") and read_file(d + "/a2.csv") == "1,2,3\n", "copied")
+check(read_file(d + "/a.csv") == "1,2,3\n", "the original stays")
+check(!try_call(copy_file, d + "/logs", d + "/l2").ok, "a directory is not copied")
+delete_file(d + "/a2.csv")
+
+// glob
+check(glob(d + "/*.csv") == [d + "/a.csv", d + "/b.csv"], "*.csv, hidden files left out: " + str(glob(d + "/*.csv")))
+check(glob(d + "/.*.csv") == [d + "/.hidden.csv"], "a pattern starting with . finds hidden files")
+check(glob(d + "/[ab].*") == [d + "/a.csv", d + "/b.csv"], "a [set]")
+check(glob(d + "/[!a]?csv") == [d + "/b.csv"], "a negated set and ?")
+check(glob(d + "/logs/2026-10-*/*.jsonl") == [d + "/logs/2026-10-29/x.jsonl", d + "/logs/2026-10-30/y.jsonl"], "wildcards in the middle")
+check(glob(d + "/**/*.jsonl") == [d + "/logs/2026-10-29/x.jsonl", d + "/logs/2026-10-30/y.jsonl"], "** at any depth")
+check(len(glob(d + "/logs/**")) == 5, "a trailing ** is everything below: " + str(glob(d + "/logs/**")))
+check(glob(d + "/*.none") == [], "no match: an empty list")
+
+// clean up
+for p in reverse(glob(d + "/**")) { if file_stat(p).dir { rmdir(p) } else { delete_file(p) } }
+delete_file(d + "/.hidden.csv")
+rmdir(d)
+check(!is_dir(d), "cleaned up")
+print("PASS: test_files")
