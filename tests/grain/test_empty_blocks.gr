@@ -1,0 +1,20 @@
+// An empty block after a name in a header (if x { }, while x { }, for i in 0..n { }) was read as the brace-call
+// `x { }` - a call of x with an empty map - and then the block was missing. At top level and in a function.
+let ready = true
+let n = 3
+let go = false
+if ready { }
+while go { }
+for i in 0..n { }
+for x in [1, 2] { }
+fn inside() {
+  let m = 2
+  if m { } else if ready { }
+  for i in 0..m { }
+  while go { }
+  return "ran"
+}
+assert_true(inside() == "ran", "empty blocks inside a function")
+fn Point(p) { return p.x }
+assert_true(Point { x: 7 } == 7, "the brace-call itself still works outside a header")
+print("PASS: test_empty_blocks")

@@ -13,6 +13,7 @@ class Parser {
   Parser(std::vector<Token> tokens, std::vector<Diagnostic>* errors);
   std::vector<StmtP> parse_program();
   ExprP expression();
+  ExprP header_expression();   // before a block: no `x {` brace-call
   // Nothing but newlines left - how an f-string's {expression} is checked
   // for trailing junk.
   bool finished();
@@ -36,7 +37,7 @@ class Parser {
   bool match_spread();
   // `match x { ... }`, as a value or (as_statement) a statement whose arms may be blocks
   ExprP match_expr(bool as_statement);
-  bool no_brace_call_ = false;   // while a match subject is read: `x {` is not a call of x with a map
+  bool no_brace_call_ = false;   // while a match subject or a block header is read: `x {` is not a call of x with a map
   ExprP map_literal();
   ExprP lambda();
 
