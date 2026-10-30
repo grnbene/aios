@@ -274,6 +274,13 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 
 A `zone` is `"local"` (the machine's own), `"utc"`, a fixed offset (`"+05:30"`, `"-0800"`) or a name from the machine's tz database (`"America/New_York"`, `"Europe/London"`, read from `/usr/share/zoneinfo` or `$TZDIR`, daylight saving included, past and future).
 
+```grain
+date_format(now(), "%F %H:%M %z", "America/New_York")    # "2026-10-30 11:05 -0400"
+date_make(2026, 12, 24, 18, 0, 0, "Europe/Berlin")      # 6 pm in Berlin, as a moment
+date_parts(now(), "Asia/Kolkata").hour
+date_parse("2026-07-04 09:00", "America/Chicago")       # read in Chicago time
+```
+
 | Function | Signature | Description |
 |---|---|---|
 | `now` | `now()` | Returns fractional UNIX epoch timestamp in seconds. |
@@ -311,6 +318,13 @@ A `zone` is `"local"` (the machine's own), `"utc"`, a fixed offset (`"+05:30"`, 
 | `mkdir` | `mkdir(path, [parents])` | Creates directory; creates parent directories if `parents` is true. |
 | `rmdir` | `rmdir(path)` | Removes an empty directory. |
 | `is_dir` | `is_dir(path)` | Returns `true` if path exists and is a directory. |
+
+```grain
+for p in glob("logs/2026-10-*/*.jsonl") {
+  let st = file_stat(p)
+  if now() * 1000 - st.modified > 7 * 86400000 { rename_file(p, "archive/" + basename(p)) }
+}
+```
 
 ### Path Manipulation
 | Function | Signature | Description |
@@ -394,6 +408,15 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 | `jwt_sign` | `jwt_sign(payload_map, secret, [expires_in_seconds])` | Creates an RFC 7519 JSON Web Token (HS256) signed with HMAC-SHA256. With `expires_in_seconds`, sets `iat` and `exp` (the caller's map is not changed). An empty secret is an error. |
 | `jwt_verify` | `jwt_verify(token, secret)` | Verifies a JWT token signature, expiration (`exp`), and not-before (`nbf`), returning `{"ok": bool, "payload": map, "error": str}`. |
 
+Keys, IVs and results are raw bytes held in strings, not hex. A key kept as hex goes through `hex_decode` first, and a
+result that has to travel as text goes through `base64_encode`:
+
+```grain
+let key = hex_decode(secret("BOX_KEY"))            # 64 hex digits -> 32 bytes
+let sealed = base64_encode(aes_gcm_encrypt(key, json_stringify(order)))
+let order2 = json_parse(aes_gcm_decrypt(key, base64_decode(sealed)))   # nil if it was changed
+```
+
 ### Document Generation & Archives (`doc.*`)
 | Function | Signature | Description |
 |---|---|---|
@@ -459,7 +482,7 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 The command-line `grain` and `aios grain` also have a small server toolkit for text protocols: `listen(port, [loopback=true])`, `accept(listener, [timeout_ms=1000])`, `read_until(conn, marker, [limit], [timeout_ms])`, `read(conn, n, [timeout_ms])`, `write(conn, data)`, `peer(conn)`, `port(listener)`, `close(handle)`.
 
 ### WebSockets
-Granted with HTTP (`install_http_builtins`): the command-line `grain`, `aios grain` and apps have them. `ws_accept` serves a WebSocket from an app's route; `ws_upgrade` makes one from a socket `tcp_accept` gave, so it is where sockets are.
+Available in apps and in scripts run with `grain` or `aios grain`. To serve WebSockets from an app, call `ws_accept(req)` in a route (see [Writing Grain applications](grain-app-writing.md#websockets)). `ws_upgrade` is for a server you write yourself on `tcp_listen`.
 
 | Function | Signature | Description |
 |---|---|---|
@@ -467,7 +490,7 @@ Granted with HTTP (`install_http_builtins`): the command-line `grain`, `aios gra
 | `ws_accept` | `ws_accept(req, [{protocol, headers}])` | Inside an app's route: answers that route's own request as a WebSocket and returns it. The connection is the route's until the handler returns. An error when the request is not a WebSocket upgrade. |
 | `ws_upgrade` | `ws_upgrade(sock, [{protocol, headers}])` | The server side: answers the WebSocket request on a socket `tcp_accept` gave and returns a websocket; an error (and a 400 to the client) when it is not one. |
 | `ws_send` | `ws_send(ws, data, [binary])` | Sends a text message, or binary when `binary` is true or `data` is `bytes`. At most 16 MB. |
-| `ws_recv` | `ws_recv(ws, [timeout_ms])` | The next message, `{type: "text" | "binary", data}`; `{type: "close", code, reason}` once the other end closes; `nil` when nothing came in time (default 5000). Pings are answered and fragments joined on the way. |
+| `ws_recv` | `ws_recv(ws, [timeout_ms])` | The next message, `{type, data}` (`type` is `"text"` or `"binary"`); `{type: "close", code, reason}` once the other end closes; `nil` when nothing came in time (default 5000). Pings are answered and fragments joined on the way. |
 | `ws_close` | `ws_close(ws, [code], [reason])` | Starts the closing handshake (code 1000 by default); `ws_recv` then gives the other end's close. |
 | `ws_info` | `ws_info(ws)` | `{path, headers}`: the request a server answered (headers lowercased), or the response headers a client got. |
 
@@ -572,10 +595,19 @@ Grain includes a full software 2D rendering canvas for generating images, charti
 | `canvas_to_ppm` / `cv_to_ppm` | `canvas_to_ppm(cv)` | Encodes canvas to PPM image format bytes. |
 | `canvas_save_ppm` | `canvas_save_ppm(cv, path)` | Writes canvas to disk as a PPM image. |
 | `canvas_to_png` | `canvas_to_png(cv)` | The canvas as a PNG file's bytes (RGBA, transparency kept). Also `canvas_to_bytes(cv, "png")`. |
-| `canvas_save_png` | `canvas_save_png(cv, path)` | Writes the canvas as a PNG through the program's files (like `write_file`). Returns `true`. |
-| `canvas_to_jpeg` | `canvas_to_jpeg(cv, [quality])` | The canvas as a baseline JPEG's bytes, quality 1-100 (default 85; colour at half resolution below 90, full from 90). JPEG has no transparency: transparent parts are laid over white. Also `canvas_to_bytes(cv, "jpeg")`. |
-| `canvas_save_jpeg` | `canvas_save_jpeg(cv, path, [quality])` | Writes the canvas as a JPEG through the program's files. Returns `true`. |
+| `canvas_save_png` | `canvas_save_png(cv, path)` | Saves the canvas as a PNG file, the way `write_file` saves (so an app writes in its data directory). Returns `true`. |
+| `canvas_to_jpeg` | `canvas_to_jpeg(cv, [quality])` | The canvas as a baseline JPEG's bytes, quality 1-100 (default 85; colour at half resolution below 90, full from 90). JPEG has no transparency, so transparent areas come out white. Also `canvas_to_bytes(cv, "jpeg")`. |
+| `canvas_save_jpeg` | `canvas_save_jpeg(cv, path, [quality])` | Saves the canvas as a JPEG file, the way `write_file` saves (so an app writes in its data directory). Returns `true`. |
 | `image_decode` | `image_decode(bytes_buf)` | Decodes PNG/JPEG bytes into a canvas instance. |
+
+```grain
+let cv = canvas_create(400, 200)
+canvas_set_fill_color(cv, "#1e6ac7")
+canvas_fill_rect(cv, 0, 0, 400, 200)
+canvas_save_png(cv, "chart.png")                 # exact pixels, transparency kept
+canvas_save_jpeg(cv, "chart.jpg", 80)            # smaller, for photos and big images
+return res_download(canvas_to_png(cv), "chart.png")   # in a route: straight to the browser
+```
 
 ### Path Building & Shapes
 | Function | Signature | Description |
