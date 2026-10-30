@@ -26,6 +26,7 @@
 #include "grain_native.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <csetjmp>
 #include <cstdint>
@@ -33,6 +34,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -745,6 +747,7 @@ class Asm {
   }
 
   void mov_ri(int r, uint64_t v) { rex(true, 0, r); u8(0xB8 + (r & 7)); u64(v); }
+  void mov_fs(int r, int32_t disp) { u8(0x64); rex(true, r, 0); u8(0x8B); u8(0x04 | ((r & 7) << 3)); u8(0x25); u32((uint32_t)disp); }   // r = fs:[disp]
   void mov_rr(int dst, int src) { rex(true, src, dst); u8(0x89); modrm_reg(src, dst); }
   void mov_rm(int dst, int base, int32_t d) { rex(true, dst, base); u8(0x8B); modrm_mem(dst, base, d); }
   void mov_mr(int base, int32_t d, int src) { rex(true, src, base); u8(0x89); modrm_mem(src, base, d); }
@@ -830,13 +833,41 @@ class Asm {
 
 enum Trap { kTrapIndex = 1, kTrapDivide = 2, kTrapStack = 3, kTrapByte = 4 };
 
-uint64_t g_stack_limit = 0;       // generated code compares rsp with this on entry
-std::jmp_buf* g_jmp = nullptr;
-int g_trap = 0;
+// Generated code compares rsp with the calling thread's stack limit on entry. Where a thread_local sits at the
+// same distance from the thread pointer in every thread (Linux x86-64, the program's own TLS), the code reads it
+// through fs and native calls run on many threads at once. Elsewhere it reads one global, and calls take turns.
+uint64_t g_stack_limit = 0;
+thread_local uint64_t t_stack_limit = 0;
+thread_local std::jmp_buf* t_jmp = nullptr;
+thread_local int t_trap = 0;
 
 extern "C" void grain_native_trap(int code) {
-  g_trap = code;
-  std::longjmp(*g_jmp, 1);
+  t_trap = code;
+  std::longjmp(*t_jmp, 1);
+}
+
+#if defined(__linux__)
+int64_t fs_offset_of_limit() {
+  uintptr_t tp;
+  __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+  return (int64_t)((uintptr_t)&t_stack_limit - tp);
+}
+#endif
+
+// The fs displacement of t_stack_limit, or 0 when it is not the same in every thread (then: the global, a lock).
+int64_t tls_limit_offset() {
+  static const int64_t off = [] {
+#if defined(__linux__)
+    const int64_t here = fs_offset_of_limit();
+    int64_t there = 0;
+    std::thread([&] { there = fs_offset_of_limit(); }).join();
+    if (here != there || here == 0 || here < INT32_MIN || here > INT32_MAX) return (int64_t)0;
+    return here;
+#else
+    return (int64_t)0;
+#endif
+  }();
+  return off;
 }
 
 void* make_executable(const std::vector<uint8_t>& code, std::string& error) {
@@ -898,8 +929,12 @@ class Gen {
     a_.mov_rr(RBP, RSP);
     const int frame = ((f_.nslots * 8) + 15) & ~15;
     if (frame) a_.sub_rsp(frame);
-    a_.mov_ri(RAX, (uint64_t)(uintptr_t)&g_stack_limit);
-    a_.mov_rm(RAX, RAX, 0);
+    if (const int64_t tls = tls_limit_offset()) {
+      a_.mov_fs(RAX, (int32_t)tls);   // this thread's limit
+    } else {
+      a_.mov_ri(RAX, (uint64_t)(uintptr_t)&g_stack_limit);
+      a_.mov_rm(RAX, RAX, 0);
+    }
     a_.cmp(RSP, RAX);
     trap_if(CC_B, kTrapStack);
     int ii = 0, fi = 0, si = 0;
@@ -1273,8 +1308,8 @@ std::vector<std::shared_ptr<Fn>>& registry() {
   return r;
 }
 
-// The stack limit and the trap target are per call but kept in globals the generated code can reach,
-// so native calls take turns: a web server running requests on many threads stays correct.
+// The registry's lock, and - where the stack limit is one global (tls_limit_offset() == 0) - the lock native
+// calls take turns on, so a web server running requests on many threads stays correct.
 std::mutex& native_mutex() {
   static std::mutex m;
   return m;
@@ -1290,14 +1325,15 @@ struct Regs {
 // noinline: it owns the setjmp, and nothing with a destructor may be live across it.
 __attribute__((noinline)) int guarded_call(void* code, const Regs& r, bool fp, uint64_t* iret, double* dret) {
   std::jmp_buf jb;
-  std::jmp_buf* prev = g_jmp;
-  const uint64_t prev_limit = g_stack_limit;
-  g_jmp = &jb;
-  g_stack_limit = (uint64_t)(uintptr_t)__builtin_frame_address(0) - 256 * 1024;   // native recursion gets 256 KB
+  uint64_t& limit = tls_limit_offset() ? t_stack_limit : g_stack_limit;
+  std::jmp_buf* prev = t_jmp;
+  const uint64_t prev_limit = limit;
+  t_jmp = &jb;
+  limit = (uint64_t)(uintptr_t)__builtin_frame_address(0) - 256 * 1024;   // native recursion gets 256 KB
   if (setjmp(jb)) {
-    g_jmp = prev;
-    g_stack_limit = prev_limit;
-    return g_trap;
+    t_jmp = prev;
+    limit = prev_limit;
+    return t_trap;
   }
   if (fp) *dret = reinterpret_cast<FpShim>(code)(r.i[0], r.i[1], r.i[2], r.i[3], r.i[4], r.i[5],
                                                   r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6], r.d[7],
@@ -1305,8 +1341,8 @@ __attribute__((noinline)) int guarded_call(void* code, const Regs& r, bool fp, u
   else *iret = reinterpret_cast<IntShim>(code)(r.i[0], r.i[1], r.i[2], r.i[3], r.i[4], r.i[5],
                                                 r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6], r.d[7],
                                                 r.s[0], r.s[1], r.s[2], r.s[3], r.s[4], r.s[5], r.s[6], r.s[7]);
-  g_jmp = prev;
-  g_stack_limit = prev_limit;
+  t_jmp = prev;
+  limit = prev_limit;
   return 0;
 }
 
@@ -1361,7 +1397,9 @@ Value method_native_call(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std:
   uint64_t iret = 0;
   double dret = 0;
   int trap;
-  {
+  if (tls_limit_offset()) {
+    trap = guarded_call(f.code, regs, f.ret == Ty::F64, &iret, &dret);   // this thread's own limit and trap
+  } else {
     std::lock_guard<std::mutex> lock(native_mutex());
     trap = guarded_call(f.code, regs, f.ret == Ty::F64, &iret, &dret);
   }
