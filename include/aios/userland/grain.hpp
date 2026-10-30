@@ -821,6 +821,9 @@ enum class RoundMode { HalfUp, HalfEven, HalfDown, Up, Down, Floor, Ceil };
 // `mode`, as a decimal with exactly max(places, 0) places (grain_std_decimal.cpp).
 bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::string& error);
 bool round_mode_named(const std::string& name, RoundMode& mode);
+// a op b (+ - * / %) as the language does it - ints exact, past 64 bits the exact decimal, a real makes a real.
+bool number_arith(char op, const Value& a, const Value& b, Value& out, std::string& error);
+bool number_pow(const Value& x, const Value& n, Value& out, std::string& error);   // exact for a whole exponent
 bool number_exact(const Value& v, Value& out, std::string& error);   // int / decimal / real -> the exact decimal (a real as it prints)   // "half_up", "half_even", ... -> false if not one
 double decimal_to_double(const Value& d);
 bool decimal_to_int(const Value& d, int64_t& out);   // truncated toward zero; false if it does not fit

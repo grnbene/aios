@@ -89,7 +89,7 @@ integer division
   ok    idiv truncates toward zero
   ok    idiv negative divisor
   ok    idiv matches %
-  ok    idiv min / -1 wraps
+  ok    idiv min / -1 is 2^63, exactly
   ok    idiv by zero
   ok    idiv wants integers
 stdlib: 87 checks, all agreed

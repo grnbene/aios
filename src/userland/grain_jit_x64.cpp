@@ -543,6 +543,7 @@ class Compiler {
       if (op == Op::Add) a_.add(R10, R11);
       else if (op == Op::Subtract) a_.sub(R10, R11);
       else a_.imul(R10, R11);
+      slow.push_back(a_.jcc(O));   // past 64 bits: the interpreter makes it an exact decimal (the stack is untouched)
       a_.store(R14, -64 + kPayOff, R10);
       a_.sub_imm(R14, 32);
     });
@@ -855,6 +856,7 @@ class Compiler {
       slow.push_back(a_.jcc(NE));
       a_.load(R10, R14, -32 + kPayOff);
       a_.neg(R10);
+      slow.push_back(a_.jcc(O));   // -INT64_MIN: a decimal, by the interpreter
       a_.store(R14, -32 + kPayOff, R10);
     });
   }

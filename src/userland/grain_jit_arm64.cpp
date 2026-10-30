@@ -149,7 +149,7 @@ extern "C" int grain_jit_get_global(Ctx* c, uint32_t ip) { return c->vm->jit_get
 // ---- encoder ----------------------------------------------------------------
 enum Reg : uint32_t { X0 = 0, X1, X2, X9 = 9, X10, X11, X12, X13, X14, X15, X16, X17,
                       X19 = 19, X20, X21, X22, X23, X24, X29 = 29, X30, XZR = 31, SP = 31 };
-enum Cond : uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13 };
+enum Cond : uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, VS = 6, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13 };
 
 struct Asm {
   std::vector<uint32_t> buf;
@@ -179,6 +179,11 @@ struct Asm {
   void add_lsl(Reg d, Reg n, Reg m, unsigned sh) { w(0x8B000000u | (m << 16) | (sh << 10) | (n << 5) | d); }
   void sub(Reg d, Reg n, Reg m) { w(0xCB000000u | (m << 16) | (n << 5) | d); }
   void mul(Reg d, Reg n, Reg m) { w(0x9B007C00u | (m << 16) | (n << 5) | d); }
+  void adds(Reg d, Reg n, Reg m) { w(0xAB000000u | (m << 16) | (n << 5) | d); }
+  void subs(Reg d, Reg n, Reg m) { w(0xEB000000u | (m << 16) | (n << 5) | d); }
+  void negs(Reg d, Reg m) { w(0xEB0003E0u | (m << 16) | d); }
+  void smulh(Reg d, Reg n, Reg m) { w(0x9B407C00u | (m << 16) | (n << 5) | d); }
+  void cmp_asr63(Reg n, Reg m) { w(0xEB800000u | (m << 16) | (63u << 10) | (n << 5) | 31u); }   // cmp n, m, asr #63
   void sdiv(Reg d, Reg n, Reg m) { w(0x9AC00C00u | (m << 16) | (n << 5) | d); }
   void msub(Reg d, Reg n, Reg m, Reg a) { w(0x9B008000u | (m << 16) | (a << 10) | (n << 5) | d); }   // d = a - n*m
   void neg(Reg d, Reg m) { w(0xCB0003E0u | (m << 16) | d); }
@@ -564,9 +569,15 @@ class Compiler {
   void emit_arith(size_t ip, Op op) {
     fast_or_step(ip, [&](std::vector<size_t>& slow) {
       both_int(slow);
-      if (op == Op::Add) a_.add(X11, X11, X12);
-      else if (op == Op::Subtract) a_.sub(X11, X11, X12);
-      else a_.mul(X11, X11, X12);
+      // Past 64 bits goes to the interpreter, which makes it an exact decimal (the stack is untouched until stur).
+      if (op == Op::Add) { a_.adds(X11, X11, X12); slow.push_back(a_.bcond(VS)); }
+      else if (op == Op::Subtract) { a_.subs(X11, X11, X12); slow.push_back(a_.bcond(VS)); }
+      else {
+        a_.smulh(X13, X11, X12);   // the high half: only the low half's sign when the product fits
+        a_.mul(X11, X11, X12);
+        a_.cmp_asr63(X13, X11);
+        slow.push_back(a_.bcond(NE));
+      }
       a_.stur(X11, X22, -64 + kPayOff);
       a_.sub_imm(X22, X22, 32);
     });
@@ -837,7 +848,8 @@ class Compiler {
       a_.cmp_imm_w(X9, static_cast<uint32_t>(Type::Int));
       slow.push_back(a_.bcond(NE));
       a_.ldur(X11, X22, -32 + kPayOff);
-      a_.neg(X11, X11);
+      a_.negs(X11, X11);
+      slow.push_back(a_.bcond(VS));   // -INT64_MIN: a decimal, by the interpreter
       a_.stur(X11, X22, -32 + kPayOff);
     });
   }

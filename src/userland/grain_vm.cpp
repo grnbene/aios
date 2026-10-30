@@ -1386,11 +1386,20 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         {
           Value& x = S.stack[S.stack.size() - 2];
           const Value& y = S.stack.back();
-          if (both_int(x, y)) { x.i += y.i; S.stack.pop_back(); break; }
+          int64_t r;
+          if (both_int(x, y) && !__builtin_add_overflow(x.i, y.i, &r)) { x.i = r; S.stack.pop_back(); break; }   // past 64 bits: below, exact
           if (x.type == Type::Real && y.type == Type::Real) { x.d += y.d; S.stack.pop_back(); break; }
         }
         Value b = pop(), a = pop();
-        if (both_int(a, b)) { S.stack.push_back(Value::integer(a.i + b.i)); break; }
+        if (both_int(a, b)) {
+          int64_t r;
+          if (!__builtin_add_overflow(a.i, b.i, &r)) { S.stack.push_back(Value::integer(r)); break; }
+          Value d;   // past 64 bits: the exact decimal, never a wrapped int
+          std::string why;
+          if (!decimal_arith('+', a, b, d, why)) { fail(line, "number too large: " + why); break; }
+          S.stack.push_back(std::move(d));
+          break;
+        }
         if (numeric_pair(a, b)) { S.stack.push_back(Value::real(a.as_double() + b.as_double())); break; }
         if (a.type == Type::Decimal || b.type == Type::Decimal) {
           Value r;
@@ -1426,7 +1435,12 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         {
           Value& x = S.stack[S.stack.size() - 2];
           const Value& y = S.stack.back();
-          if (both_int(x, y)) { x.i = op == Op::Subtract ? x.i - y.i : x.i * y.i; S.stack.pop_back(); break; }
+          int64_t r;
+          if (both_int(x, y) && !(op == Op::Subtract ? __builtin_sub_overflow(x.i, y.i, &r) : __builtin_mul_overflow(x.i, y.i, &r))) {
+            x.i = r;
+            S.stack.pop_back();
+            break;
+          }
           if (x.type == Type::Real && y.type == Type::Real) { x.d = op == Op::Subtract ? x.d - y.d : x.d * y.d; S.stack.pop_back(); break; }
         }
         Value b = pop(), a = pop();
@@ -1443,7 +1457,15 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           break;
         }
         if (both_int(a, b)) {
-          S.stack.push_back(Value::integer(op == Op::Subtract ? a.i - b.i : a.i * b.i));
+          int64_t r;
+          if (!(op == Op::Subtract ? __builtin_sub_overflow(a.i, b.i, &r) : __builtin_mul_overflow(a.i, b.i, &r))) {
+            S.stack.push_back(Value::integer(r));
+          } else {
+            Value d;   // past 64 bits: the exact decimal
+            std::string why;
+            if (!decimal_arith(op == Op::Subtract ? '-' : '*', a, b, d, why)) { fail(line, "number too large: " + why); break; }
+            S.stack.push_back(std::move(d));
+          }
         } else {
           const double x = a.as_double(), y = b.as_double();
           S.stack.push_back(Value::real(op == Op::Subtract ? x - y : x * y));
@@ -1527,7 +1549,8 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
       }
       case Op::Negate: {
         Value a = pop();
-        if (a.type == Type::Int) S.stack.push_back(Value::integer(-a.i));
+        if (a.type == Type::Int && a.i != INT64_MIN) S.stack.push_back(Value::integer(-a.i));
+        else if (a.type == Type::Int) { Value r; std::string why; decimal_negate(decimal_from_int(a.i), r, why); S.stack.push_back(std::move(r)); }
         else if (a.type == Type::Real) S.stack.push_back(Value::real(-a.d));
         else if (a.type == Type::Decimal) { Value r; std::string why; decimal_negate(a, r, why); S.stack.push_back(std::move(r)); }
         else { fail(line, std::string("cannot negate a ") + type_name(a.type)); }

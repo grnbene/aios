@@ -1,0 +1,31 @@
+// Integer arithmetic never wraps: past 64 bits a result is the exact decimal (Python's ints agree, digit for digit),
+// past 38 digits it is an error. In a function (the JIT's fast path, then its overflow branch), at top level, and in
+// the builtins that add or multiply.
+fn check(c, msg) { assert_true(c, msg) }
+let big = 9223372036854775807
+let small = -9223372036854775807 - 1
+fn ops(b, s) {
+  return [b + 1, b + b, s - 1, b * 2, b * b, -s, s * -1, 3037000500 * 3037000500, 3037000499 * 3037000499, b - s]
+}
+let want = ["9223372036854775808", "18446744073709551614", "-9223372036854775809", "18446744073709551614",
+            "85070591730234615847396907784232501249", "9223372036854775808", "9223372036854775808",
+            "9223372037000250000", "9223372030926249001", "18446744073709551615"]
+let got = ops(big, small)
+for i in 0..len(want) { check(str(got[i]) == want[i], "in a function, case " + str(i) + ": " + str(got[i])) }
+check(type(got[8]) == "int" and type(got[0]) == "decimal", "an int while it fits, a decimal past")
+check(str(big + 1) == "9223372036854775808" and str(-small) == "9223372036854775808", "at top level")
+let acc = big
+acc += 1
+check(str(acc) == "9223372036854775808", "+= too")
+check((big + 1) - 1 == big, "and back")
+fn grow() { let x = 1; for i in 0..70 { x = x * 2 }; return x }
+check(str(grow()) == "1180591620717411303424", "a loop the JIT compiles, past 64 bits on its way")
+check(str(abs(small)) == "9223372036854775808" and str(idiv(small, -1)) == "9223372036854775808", "abs, idiv")
+check(str(sum([big, big, 2])) == "18446744073709551616" and str(sum([big, 0.5e0])) == "9.223372036854776e+18", "sum: exact, a real with a real")
+check(str(pow(2, 64)) == "18446744073709551616" and str(pow(3, 50)) == "717897987691852588770249" and pow(2, 62) == 4611686018427387904, "pow is exact")
+check(str(pow(2, -2)) == "0.25" and type(pow(2, 0.5e0)) == "real", "pow: negative and fractional exponents")
+let t = {"n": big}
+add_into(t, {"n": 1})
+check(str(t.n) == "9223372036854775808", "add_into: exact, where it gave a real")
+check(!try_call(pow, 2, 200).ok and !try_call(fn () { return pow(10, 37) * 100 }).ok, "past 38 digits: an error, not a wrong answer")
+print("PASS: test_int_overflow")
