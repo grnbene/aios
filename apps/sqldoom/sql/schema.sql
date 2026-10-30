@@ -251,13 +251,15 @@ CREATE TABLE IF NOT EXISTS walltex_meta (
   name   TEXT PRIMARY KEY,
   width  INT NOT NULL,
   height INT NOT NULL,
-  palette_indices LONGBLOB NOT NULL
+  palette_indices LONGBLOB NOT NULL,
+  tex_id INT NOT NULL   -- this port's: the texture's part of walltex_texels.k
 );
 
 -- Flats are always packed 64x64 row-major palette-index bitmaps.
 CREATE TABLE IF NOT EXISTS flat_textures (
   name TEXT PRIMARY KEY,
-  palette_indices LONGBLOB NOT NULL
+  palette_indices LONGBLOB NOT NULL,
+  flat_id INT NOT NULL   -- this port's: the flat's part of flat_texels.k
 );
 
 CREATE TABLE IF NOT EXISTS sprite_frames (
@@ -276,34 +278,39 @@ CREATE TABLE IF NOT EXISTS sprite_frames (
 CREATE TABLE IF NOT EXISTS sprite_lumps (
   lump_name VARCHAR(8) PRIMARY KEY,
   pixels    LONGBLOB NOT NULL,
-  mask      LONGBLOB NOT NULL
+  mask      LONGBLOB NOT NULL,
+  lump_id   INT NOT NULL   -- this port's: the lump's part of sprite_texels.k
 );
 
--- The texels of the three tables above as rows, which is how the ASQL renderer reads them: a join on (name, u, v)
--- per pixel, where SQLDoom's GET_BYTE reads the BYTEA (ASQL would copy the whole blob into every pixel's row).
--- Wall textures and flats have every texel; a sprite only its opaque ones (its mask is which rows there are).
+-- The texels of the three tables above as rows, which is how the ASQL renderer reads them, where SQLDoom's GET_BYTE
+-- reads the BYTEA (ASQL would copy the whole blob into every pixel's row). Wall textures and flats have every texel;
+-- a sprite only its opaque ones (its mask is which rows there are).
+--
+-- k packs (id, v, u) as id * 2^20 + v * 2^10 + u: the renderer's per-pixel join is on that one integer. ASQL indexes
+-- a join key column by column, so a join on (name, u, v) found the rows of one of them and checked the other two on
+-- each - thousands of candidates per pixel; on one key it is one probe.
 CREATE TABLE IF NOT EXISTS walltex_texels (
+  k             BIGINT NOT NULL PRIMARY KEY,
   name          VARCHAR(8) NOT NULL,
   u             SMALLINT NOT NULL,
   v             SMALLINT NOT NULL,
-  palette_index SMALLINT NOT NULL,
-  PRIMARY KEY (name, u, v)
+  palette_index SMALLINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS flat_texels (
+  k             BIGINT NOT NULL PRIMARY KEY,
   name          VARCHAR(8) NOT NULL,
   u             SMALLINT NOT NULL,
   v             SMALLINT NOT NULL,
-  palette_index SMALLINT NOT NULL,
-  PRIMARY KEY (name, u, v)
+  palette_index SMALLINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sprite_texels (
+  k             BIGINT NOT NULL PRIMARY KEY,
   lump_name     VARCHAR(8) NOT NULL,
   u             SMALLINT NOT NULL,
   v             SMALLINT NOT NULL,
-  palette_index SMALLINT NOT NULL,
-  PRIMARY KEY (lump_name, u, v)
+  palette_index SMALLINT NOT NULL
 );
 
 -- The status-bar patches (STBAR background, STTNUM digit font, STFST

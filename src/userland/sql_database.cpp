@@ -27990,12 +27990,25 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
     // values could contain "NEAR", "AS OF", etc. and cause a false match).
     if (!prechecked && (verb == "SELECT" || verb == "AQL" || verb == "WITH" ||
         (toks[0].kind == Tok::Punct && toks[0].text == "("))) {
-      if (upper_q.find("FROM OBJECTS") != std::string::npos ||
-          upper_q.find("NEAR ") != std::string::npos ||
-          upper_q.find("AS OF ") != std::string::npos ||
-          upper_q.find("RELATED TO ") != std::string::npos ||
-          upper_q.find("HISTORY OF ") != std::string::npos ||
-          upper_q.rfind("AQL", 0) == 0) {
+      // AQL's clauses as keywords, read from the tokens: NEAR followed by its text, embedding_of(..) or a vector,
+      // AS OF, RELATED TO, HISTORY OF. Matched as text, `near` anywhere - a column (SQLDoom's render_settings.near),
+      // a comment, a string - sent an SQL statement to the object store.
+      auto aql_clause = [&]() {
+        auto word = [&](size_t i, std::string_view w) {
+          return i < toks.size() && toks[i].kind == Tok::Ident && !toks[i].quoted && toks[i].up == w;
+        };
+        for (size_t i = 0; i + 1 < toks.size(); ++i) {
+          if (i > 0 && toks[i - 1].kind == Tok::Punct && toks[i - 1].text == ".") continue;   // t.near: a column
+          if (word(i, "NEAR") && (toks[i + 1].kind == Tok::Str || word(i + 1, "EMBEDDING_OF") ||
+                                  (toks[i + 1].kind == Tok::Punct && toks[i + 1].text == "[")))
+            return true;
+          if ((word(i, "AS") && word(i + 1, "OF")) || (word(i, "RELATED") && word(i + 1, "TO")) ||
+              (word(i, "HISTORY") && word(i + 1, "OF")))
+            return true;
+        }
+        return false;
+      };
+      if (upper_q.find("FROM OBJECTS") != std::string::npos || upper_q.rfind("AQL", 0) == 0 || aql_clause()) {
         // Work out the select list FIRST. AQL itself only knows how to hand
         // back objects, so when the operator asked for COUNT(*) or a single
         // column we must still ask it for the objects -- with `*` -- and do

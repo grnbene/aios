@@ -155,6 +155,14 @@ int main() {
   expect_error(db, "too many column names", "SELECT * FROM (SELECT 1 AS a) AS t(x, y)", "names for");
   expect_error(db, "LATERAL on a table", "SELECT * FROM a, LATERAL w", "LATERAL takes");
 
+  // SQLDoom's render_settings has a column `near`; AQL's NEAR clause was found by the text "NEAR " anywhere in a
+  // SELECT or WITH, so these went to the object store.
+  std::cout << "\n[4] near is a name, not AQL's NEAR\n";
+  expect(db, "a column named near", "SELECT near + 1 FROM (SELECT 1 AS near) t", "2");
+  expect(db, "qualified, in a WITH", "WITH s AS (SELECT 2 AS near) SELECT s.near * 2 FROM s", "4");
+  expect(db, "in a comment", "WITH s AS (SELECT 3 AS x) -- the near clip plane\nSELECT x FROM s", "3");
+  expect(db, "in a string", "SELECT 'near the end'", "near the end");
+
   std::cout << "\n=== " << (g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES: " + std::to_string(g_failures)) << " ===\n";
   return g_failures == 0 ? 0 : 1;
 }

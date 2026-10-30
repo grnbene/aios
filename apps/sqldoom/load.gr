@@ -6,6 +6,7 @@
 #
 # Not ported yet: sound effects and music (sound_assets, music_assets, map_music stay empty).
 import "lib/wad.gr" as wad
+import { run_sql_file } from "lib/sqlfile.gr"
 
 let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))   # where sql/ is: run from the repo root, or set SQLDOOM_DIR
 let started = clock()
@@ -31,56 +32,6 @@ fn insert_rows(table, cols, rows, per) {
     sql("INSERT INTO " + table + " (" + cols + ") VALUES " + join(parts, ","))
     i = i + per
   }
-}
-
-# Whether only spaces, then a line break, a -- comment or the end, follow position i.
-fn ends_line(text, i) {
-  while i < len(text) and (slice(text, i, i + 1) == " " or slice(text, i, i + 1) == "\t") { i = i + 1 }
-  return i >= len(text) or slice(text, i, i + 1) == "\n" or slice(text, i, i + 2) == "--"
-}
-
-# A file of statements, split at `sep` (";" or ";;") where it ends a line outside quotes and comments.
-fn run_sql_file(path, sep) {
-  let text = read_file(path)
-  let stmts = []
-  let cur = ""
-  let quote = ""
-  let i = 0
-  let n = len(text)
-  while i < n {
-    let c = slice(text, i, i + 1)
-    if quote != "" {
-      cur = cur + c
-      if c == quote {
-        if slice(text, i + 1, i + 2) == quote { cur = cur + quote
-                                                 i = i + 1 }
-        else { quote = "" }
-      }
-      i = i + 1
-      continue
-    }
-    if c == "-" and slice(text, i, i + 2) == "--" {
-      let e = index_of(text, "\n", i)
-      if e < 0 { e = n }
-      i = e
-      continue
-    }
-    if c == "'" or c == "\"" or c == "`" { quote = c }
-    if slice(text, i, i + len(sep)) == sep and ends_line(text, i + len(sep)) {
-      if trim(cur) != "" { push(stmts, trim(cur)) }
-      cur = ""
-      i = i + len(sep)
-      continue
-    }
-    cur = cur + c
-    i = i + 1
-  }
-  if trim(cur) != "" { push(stmts, trim(cur)) }
-  for s in stmts {
-    let r = pcall(sql, s)
-    if not r.ok { error(basename(path) + ": " + str(r.error) + "\n  in: " + slice(s, 0, 200)) }
-  }
-  return len(stmts)
 }
 
 # ---- textures, colormap, flats ----------------------------------------------------------------------------------
@@ -160,20 +111,23 @@ fn load_wall_textures(w, lumps, by) {
         }
       }
     }
-    push(rows, [t.name, t.w, t.h, tex])
+    push(rows, [t.name, t.w, t.h, tex, len(rows)])
   }
-  insert_rows("walltex_meta", "name, width, height, palette_indices", rows, 50)
-  for r in rows { insert_rows("walltex_texels", "name, u, v, palette_index", texels_of(r[0], r[1], r[2], r[3], nil), 4000) }
+  insert_rows("walltex_meta", "name, width, height, palette_indices, tex_id", rows, 50)
+  for r in rows { insert_rows("walltex_texels", "k, name, u, v, palette_index", texels_of(r[4], r[0], r[1], r[2], r[3], nil), 4000) }
   return len(rows)
 }
 
-# A w x h row-major texel buffer as (name, u, v, index) rows; with a mask, only the texels it marks.
-fn texels_of(name, w, h, pixels, mask) {
+# A texel's key in the *_texels tables: the picture's id, then v, then u (schema.sql).
+fn texel_key(id, u, v) { return id * 1048576 + v * 1024 + u }
+
+# A w x h row-major texel buffer as (k, name, u, v, index) rows; with a mask, only the texels it marks.
+fn texels_of(id, name, w, h, pixels, mask) {
   let out = []
   for v in range(0, h) {
     for u in range(0, w) {
       let o = v * w + u
-      if mask == nil or bytes_get(mask, o, "u8") != 0 { push(out, [name, u, v, bytes_get(pixels, o, "u8")]) }
+      if mask == nil or bytes_get(mask, o, "u8") != 0 { push(out, [texel_key(id, u, v), name, u, v, bytes_get(pixels, o, "u8")]) }
     }
   }
   return out
@@ -182,10 +136,10 @@ fn texels_of(name, w, h, pixels, mask) {
 fn load_flats(w, lumps) {
   let rows = []
   for l in wad.between(lumps, "F_START", "F_END") {
-    if l.size == 4096 { push(rows, [l.name, wad.lump_bytes(w, l)]) }
+    if l.size == 4096 { push(rows, [l.name, wad.lump_bytes(w, l), len(rows)]) }
   }
-  insert_rows("flat_textures", "name, palette_indices", rows, 50)
-  for r in rows { insert_rows("flat_texels", "name, u, v, palette_index", texels_of(r[0], 64, 64, r[1], nil), 4096) }
+  insert_rows("flat_textures", "name, palette_indices, flat_id", rows, 50)
+  for r in rows { insert_rows("flat_texels", "k, name, u, v, palette_index", texels_of(r[2], r[0], 64, 64, r[1], nil), 4096) }
   return len(rows)
 }
 
@@ -250,11 +204,12 @@ fn load_sprites(w, lumps) {
       frames[sprite + m[3] + m[4]] = [sprite, m[3], int(m[4]), l.name, true, p.w, p.h, p.left, p.top]
     }
     let texels = []
-    let px = wad.patch_pixels(data, p, fn (u, v, idx) { push(texels, [l.name, u, v, idx]) })
-    push(lump_rows, [l.name, px.pixels, px.mask])
-    insert_rows("sprite_texels", "lump_name, u, v, palette_index", texels, 4000)
+    let id = len(lump_rows)
+    let px = wad.patch_pixels(data, p, fn (u, v, idx) { push(texels, [texel_key(id, u, v), l.name, u, v, idx]) })
+    push(lump_rows, [l.name, px.pixels, px.mask, id])
+    insert_rows("sprite_texels", "k, lump_name, u, v, palette_index", texels, 4000)
   }
-  insert_rows("sprite_lumps", "lump_name, pixels, mask", lump_rows, 50)
+  insert_rows("sprite_lumps", "lump_name, pixels, mask, lump_id", lump_rows, 50)
   insert_rows("sprite_frames", "sprite, frame, rotation, lump_name, flipped, width, height, left_offset, top_offset", values(frames), 2000)
   return len(lump_rows)
 }
@@ -384,6 +339,7 @@ sql("USE doom")
 progress("Applying the schema...")
 run_sql_file(path_join(here, "sql/schema.sql"), ";")
 run_sql_file(path_join(here, "sql/loader_procs.sql"), ";;")
+run_sql_file(path_join(here, "sql/render_light.sql"), ";;")
 progress("Loading the game catalogs...")
 for t in ["thing_combat_defs", "thing_ai_frames", "pickup_defs", "weapon_frames", "weapon_defs", "thing_sprite_defs", "projectile_defs",
           "colormap_rgb", "walltex_meta", "flat_textures", "ui_patches", "ui_patch_pixels", "sprite_frames", "sprite_lumps",

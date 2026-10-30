@@ -1,0 +1,43 @@
+# One frame from the SQL renderer, saved as a PNG: the camera at player 1's start unless a pose is given.
+#
+#   aios --root R grain run --steps 0 apps/sqldoom/render.gr out.png [MAP [x y z angle]]
+let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
+
+if len(args) < 1 { error("usage: render.gr <out.png> [MAP [x y z angle]]") }
+let out = args[0]
+let map_name = len(args) > 1 ? upper(args[1]) : "E1M1"
+
+sql("USE doom")
+let m = sql("SELECT map_id FROM maps WHERE name = '" + map_name + "'")
+if len(m) == 0 { error("map " + map_name + " is not loaded") }
+let map_id = m[0].map_id
+let pose = nil
+if len(args) >= 6 {
+  pose = {"x": to_number(args[2]), "y": to_number(args[3]), "z": to_number(args[4]), "angle": to_number(args[5])}
+} else {
+  let start = sql("SELECT id, x, y, angle FROM things WHERE map_id = " + str(map_id) + " AND type = 1")[0]
+  pose = {"x": start.x, "y": start.y, "z": 41, "angle": start.angle, "id": start.id}
+}
+let player = sql("SELECT id FROM things WHERE map_id = " + str(map_id) + " AND type = 1")[0].id
+# The status bar and the frame's palette read the player's state. The game tic (not ported yet) makes it when it
+# spawns the player; until then a player at the start with the schema's defaults stands in.
+sql("INSERT IGNORE INTO player_state (map_id, player_thing_id) VALUES (" + str(map_id) + ", " + str(player) + ")")
+
+sql("SET @map_id = " + str(map_id) + ", @player_thing_id = " + str(player) + ", @skill = 2, @x = " + str(pose.x) +
+    "e0, @y = " + str(pose.y) + "e0, @z = " + str(pose.z) + "e0, @angle = " + str(pose.angle) + "e0")
+let t0 = clock()
+let frame = sql(read_file(path_join(here, "sql/renderer.sql")))[0].frame_rgb
+let ms = clock() - t0
+if frame == nil { error("the renderer returned no frame") }
+print("frame: " + str(len(frame)) + " bytes in " + format("{:.0f}", ms) + " ms")
+
+let rgb = bytes(frame)
+let px = []
+let n = idiv(len(rgb), 3)
+for i in range(0, n) {
+  push(px, 0xFF000000 | (bytes_get(rgb, i * 3, "u8") << 16) | (bytes_get(rgb, i * 3 + 1, "u8") << 8) | bytes_get(rgb, i * 3 + 2, "u8"))
+}
+let cv = canvas_create(320, 200)
+canvas_set_pixels(cv, px)
+canvas_save_png(cv, out)
+print("wrote " + out)
