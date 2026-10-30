@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include "aios/net/deflate.hpp"
 #include "aios/userland/web.hpp"
@@ -1462,6 +1463,226 @@ ByteBuffer encode_png(const uint32_t* argb, int w, int h) {
   png_chunk(out, "IDAT", z);
 
   png_chunk(out, "IEND", ByteBuffer());
+  return out;
+}
+
+// ---- JPEG out: baseline, Huffman tables of Annex K -----------------------------------------------
+
+namespace {
+
+const uint8_t kJpegZigzag[64] = {0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,  12, 19, 26, 33, 40, 48,
+                                 41, 34, 27, 20, 13, 6,  7,  14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23,
+                                 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
+const uint8_t kJpegLumQ[64] = {16, 11, 10, 16, 24,  40,  51,  61,  12, 12, 14, 19, 26,  58,  60,  55,
+                               14, 13, 16, 24, 40,  57,  69,  56,  14, 17, 22, 29, 51,  87,  80,  62,
+                               18, 22, 37, 56, 68,  109, 103, 77,  24, 35, 55, 64, 81,  104, 113, 92,
+                               49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99};
+const uint8_t kJpegChrQ[64] = {17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99,
+                               99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+                               99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
+const uint8_t kDcLumBits[16] = {0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0};
+const uint8_t kDcChrBits[16] = {0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0};
+const uint8_t kDcVals[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+const uint8_t kAcLumBits[16] = {0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d};
+const uint8_t kAcLumVals[162] = {
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81,
+    0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
+    0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+    0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5,
+    0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
+const uint8_t kAcChrBits[16] = {0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77};
+const uint8_t kAcChrVals[162] = {
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08,
+    0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25,
+    0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74,
+    0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba,
+    0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4,
+    0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
+
+struct JpegEncHuff {
+  uint16_t code[256] = {};
+  uint8_t len[256] = {};
+  JpegEncHuff(const uint8_t bits[16], const uint8_t* vals) {
+    int k = 0;
+    uint16_t c = 0;
+    for (int l = 1; l <= 16; ++l) {
+      for (int i = 0; i < bits[l - 1]; ++i, ++k) { code[vals[k]] = c++; len[vals[k]] = (uint8_t)l; }
+      c <<= 1;
+    }
+  }
+};
+
+struct JpegBitWriter {
+  ByteBuffer& out;
+  uint32_t acc = 0;
+  int n = 0;
+  void put(uint32_t bits, int count) {
+    for (int i = count - 1; i >= 0; --i) {
+      acc = (acc << 1) | ((bits >> i) & 1);
+      if (++n == 8) {
+        out.push_back((uint8_t)acc);
+        if ((uint8_t)acc == 0xFF) out.push_back(0);   // a data 0xFF is stuffed so it cannot read as a marker
+        acc = 0;
+        n = 0;
+      }
+    }
+  }
+  void flush() { while (n) put(1, 1); }   // padded with ones
+};
+
+void jpeg_marker(ByteBuffer& out, uint8_t m, const ByteBuffer& body) {
+  out.push_back(0xFF);
+  out.push_back(m);
+  const size_t len = body.size() + 2;
+  out.push_back((uint8_t)(len >> 8));
+  out.push_back((uint8_t)len);
+  out.insert(out.end(), body.begin(), body.end());
+}
+
+void jpeg_dht(ByteBuffer& body, uint8_t cls_id, const uint8_t bits[16], const uint8_t* vals, size_t nvals) {
+  body.push_back(cls_id);
+  body.insert(body.end(), bits, bits + 16);
+  body.insert(body.end(), vals, vals + nvals);
+}
+
+int jpeg_category(int v) {
+  v = v < 0 ? -v : v;
+  int c = 0;
+  while (v) { ++c; v >>= 1; }
+  return c;
+}
+
+// One 8x8 block of samples (level-shifted) through the DCT, quantized, entropy-coded.
+void jpeg_block(const float in[64], const uint8_t q[64], int& prev_dc, const JpegEncHuff& dc, const JpegEncHuff& ac, JpegBitWriter& w) {
+  static float cosv[8][8];
+  static bool init = false;
+  if (!init) {
+    for (int u = 0; u < 8; ++u)
+      for (int x = 0; x < 8; ++x)
+        cosv[u][x] = (float)((u == 0 ? std::sqrt(0.125) : 0.5) * std::cos((2 * x + 1) * u * M_PI / 16.0));
+    init = true;
+  }
+  float tmp[64], coef[64];
+  for (int y = 0; y < 8; ++y)
+    for (int u = 0; u < 8; ++u) {
+      float s = 0;
+      for (int x = 0; x < 8; ++x) s += cosv[u][x] * in[y * 8 + x];
+      tmp[y * 8 + u] = s;
+    }
+  for (int u = 0; u < 8; ++u)
+    for (int v = 0; v < 8; ++v) {
+      float s = 0;
+      for (int y = 0; y < 8; ++y) s += cosv[v][y] * tmp[y * 8 + u];
+      coef[v * 8 + u] = s;
+    }
+  int zz[64];
+  for (int k = 0; k < 64; ++k) {
+    const int i = kJpegZigzag[k];
+    zz[k] = (int)std::lround(coef[i] / q[i]);
+  }
+  const int diff = zz[0] - prev_dc;
+  prev_dc = zz[0];
+  int cat = jpeg_category(diff);
+  w.put(dc.code[cat], dc.len[cat]);
+  if (cat) w.put((uint32_t)(diff < 0 ? diff + (1 << cat) - 1 : diff), cat);
+  int run = 0;
+  for (int k = 1; k < 64; ++k) {
+    if (zz[k] == 0) { ++run; continue; }
+    while (run >= 16) { w.put(ac.code[0xF0], ac.len[0xF0]); run -= 16; }
+    cat = jpeg_category(zz[k]);
+    const int sym = (run << 4) | cat;
+    w.put(ac.code[sym], ac.len[sym]);
+    w.put((uint32_t)(zz[k] < 0 ? zz[k] + (1 << cat) - 1 : zz[k]), cat);
+    run = 0;
+  }
+  if (run) w.put(ac.code[0x00], ac.len[0x00]);   // end of block
+}
+
+}  // namespace
+
+ByteBuffer encode_jpeg(const uint32_t* argb, int w, int h, int quality) {
+  ByteBuffer out;
+  if (!argb || w <= 0 || h <= 0 || w > 65535 || h > 65535) return out;
+  quality = std::clamp(quality, 1, 100);
+  const int scale = quality < 50 ? 5000 / quality : 200 - quality * 2;
+  uint8_t ql[64], qc[64];
+  for (int i = 0; i < 64; ++i) {
+    ql[i] = (uint8_t)std::clamp((kJpegLumQ[i] * scale + 50) / 100, 1, 255);
+    qc[i] = (uint8_t)std::clamp((kJpegChrQ[i] * scale + 50) / 100, 1, 255);
+  }
+  const bool sub = quality < 90;   // 4:2:0: colour at half resolution, as cameras do
+
+  // The planes, over white where transparent.
+  const size_t n = (size_t)w * (size_t)h;
+  std::vector<float> Y(n), Cb(n), Cr(n);
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t p = argb[i];
+    const float a = (float)(p >> 24) / 255.0f;
+    const float r = ((p >> 16) & 0xFF) * a + 255.0f * (1 - a), g = ((p >> 8) & 0xFF) * a + 255.0f * (1 - a), b = (p & 0xFF) * a + 255.0f * (1 - a);
+    Y[i] = 0.299f * r + 0.587f * g + 0.114f * b - 128.0f;
+    Cb[i] = -0.168736f * r - 0.331264f * g + 0.5f * b;
+    Cr[i] = 0.5f * r - 0.418688f * g - 0.081312f * b;
+  }
+  auto at = [&](const std::vector<float>& pl, int x, int y) { return pl[(size_t)std::min(y, h - 1) * (size_t)w + (size_t)std::min(x, w - 1)]; };
+
+  out.push_back(0xFF); out.push_back(0xD8);   // SOI
+  {
+    const uint8_t app0[] = {'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0};
+    jpeg_marker(out, 0xE0, ByteBuffer(app0, app0 + sizeof app0));
+  }
+  ByteBuffer dqt;
+  dqt.push_back(0x00);
+  for (int k = 0; k < 64; ++k) dqt.push_back(ql[kJpegZigzag[k]]);
+  dqt.push_back(0x01);
+  for (int k = 0; k < 64; ++k) dqt.push_back(qc[kJpegZigzag[k]]);
+  jpeg_marker(out, 0xDB, dqt);
+  {
+    const uint8_t sof[] = {8, (uint8_t)(h >> 8), (uint8_t)h, (uint8_t)(w >> 8), (uint8_t)w, 3,
+                           1, (uint8_t)(sub ? 0x22 : 0x11), 0, 2, 0x11, 1, 3, 0x11, 1};
+    jpeg_marker(out, 0xC0, ByteBuffer(sof, sof + sizeof sof));
+  }
+  ByteBuffer dht;
+  jpeg_dht(dht, 0x00, kDcLumBits, kDcVals, 12);
+  jpeg_dht(dht, 0x10, kAcLumBits, kAcLumVals, 162);
+  jpeg_dht(dht, 0x01, kDcChrBits, kDcVals, 12);
+  jpeg_dht(dht, 0x11, kAcChrBits, kAcChrVals, 162);
+  jpeg_marker(out, 0xC4, dht);
+  {
+    const uint8_t sos[] = {3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0};
+    jpeg_marker(out, 0xDA, ByteBuffer(sos, sos + sizeof sos));
+  }
+
+  static const JpegEncHuff dc_l(kDcLumBits, kDcVals), ac_l(kAcLumBits, kAcLumVals), dc_c(kDcChrBits, kDcVals), ac_c(kAcChrBits, kAcChrVals);
+  JpegBitWriter bw{out};
+  int pdy = 0, pdb = 0, pdr = 0;
+  float blk[64];
+  const int mcu = sub ? 16 : 8;
+  for (int my = 0; my < h; my += mcu)
+    for (int mx = 0; mx < w; mx += mcu) {
+      for (int by = 0; by < mcu; by += 8)
+        for (int bx = 0; bx < mcu; bx += 8) {
+          for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) blk[y * 8 + x] = at(Y, mx + bx + x, my + by + y);
+          jpeg_block(blk, ql, pdy, dc_l, ac_l, bw);
+        }
+      for (int c = 0; c < 2; ++c) {
+        const std::vector<float>& pl = c == 0 ? Cb : Cr;
+        for (int y = 0; y < 8; ++y)
+          for (int x = 0; x < 8; ++x) {
+            if (!sub) { blk[y * 8 + x] = at(pl, mx + x, my + y); continue; }
+            const int sx = mx + 2 * x, sy = my + 2 * y;
+            blk[y * 8 + x] = (at(pl, sx, sy) + at(pl, sx + 1, sy) + at(pl, sx, sy + 1) + at(pl, sx + 1, sy + 1)) * 0.25f;
+          }
+        jpeg_block(blk, qc, c == 0 ? pdb : pdr, dc_c, ac_c, bw);
+      }
+    }
+  bw.flush();
+  out.push_back(0xFF); out.push_back(0xD9);   // EOI
   return out;
 }
 
