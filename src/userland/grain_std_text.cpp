@@ -87,26 +87,40 @@ bool render(const Value& v, const Spec& sp, std::string& out, std::string& error
   } else {
     if (!v.is_number() && v.type != Type::Decimal) { error = std::string("format(): {:") + t + "} wants a number, got a " + type_name(v.type); return false; }
     const double d = v.type == Type::Decimal ? decimal_to_double(v) : v.as_double();
-    const bool neg = v.type == Type::Decimal ? decimal_compare(v, Value::integer(0)) < 0
-                   : v.type == Type::Int ? v.i < 0 : std::signbit(d);
-    if (v.type == Type::Decimal && (t == 'f' || (!t && sp.precision >= 0))) {
-      // exact: {:.2f} of a decimal rounds half away from zero on its digits, not on a real's
-      Value r = v;
-      if (sp.precision >= 0 && !decimal_round(v, sp.precision, r, error)) return false;
+    bool neg = v.type == Type::Decimal ? decimal_compare(v, Value::integer(0)) < 0
+             : v.type == Type::Int ? v.i < 0 : std::signbit(d);
+    if ((t == 'f' || t == '%' || (!t && sp.precision >= 0 && v.type != Type::Int)) &&
+        !(v.type == Type::Real && !std::isfinite(v.d))) {
+      // As round() rounds (number_round, half away from zero) - an int and a decimal exactly, a real as the decimal
+      // it prints as - so {:.2f} of 2.675 is 2.68 like round(2.675, 2), never the 2.67 of its binary expansion.
+      // {:%} is the number times 100, exactly.
+      Value x;
+      if (!number_exact(v, x, error)) { error = "format(): " + error; return false; }
+      if (t == '%') {
+        Value hundred;
+        if (!decimal_arith('*', x, Value::integer(100), hundred, error)) { error = "format(): " + error; return false; }
+        x = hundred;
+      }
+      Value r = x;
+      const int prec = sp.precision >= 0 ? sp.precision : (t == 'f' || t == '%' ? 6 : -1);
+      if (prec >= 0 && !number_round(x, prec, RoundMode::HalfUp, r, error)) { error = "format(): " + error; return false; }
       body = decimal_text(r);
+      neg = decimal_compare(r, Value::integer(0)) < 0;   // what it rounded to: -0.004 at 2 places is 0.00, not -0.00
       if (!body.empty() && body[0] == '-') body.erase(0, 1);
-      if (sp.precision >= 0) {
+      if (sp.precision >= 0 || t == 'f' || t == '%') {
+        const int want = sp.precision >= 0 ? sp.precision : 6;
         const size_t dot = body.find('.');
         const size_t have = dot == std::string::npos ? 0 : body.size() - dot - 1;
-        if (have < (size_t)sp.precision) {
-          if (dot == std::string::npos && sp.precision > 0) body += ".";
-          body.append((size_t)sp.precision - have, '0');
+        if (have < (size_t)want) {
+          if (dot == std::string::npos && want > 0) body += ".";
+          body.append((size_t)want - have, '0');
         }
       }
       if (sp.group) {
         const size_t dot = body.find('.');
         body = group_thousands(body.substr(0, dot)) + (dot == std::string::npos ? "" : body.substr(dot));
       }
+      if (t == '%') body += "%";
     } else if (t == 'd' || t == 'x' || t == 'X' || t == 'o' || t == 'b') {
       if (v.type != Type::Int && d != std::floor(d)) { error = std::string("format(): {:") + t + "} wants a whole number, got " + v.to_text(); return false; }
       const int64_t n = v.type == Type::Int ? v.i : static_cast<int64_t>(d);

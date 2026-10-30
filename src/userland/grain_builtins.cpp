@@ -1743,30 +1743,34 @@ Value bi_from_entries(Vm&, std::vector<Value>& args, std::string& error) {
 
 // --- advanced math ---------------------------------------------------------
 
+// round(x, [places], [mode]): the one rounding (number_round): an int, a decimal or a real - a real as the decimal it
+// prints as, so round(2.675e0, 2) is 2.68 - by mode "half_up" (half away from zero, the default), "half_even",
+// "half_down", "up", "down", "floor" or "ceil". Without places: an int. With places: a decimal with exactly that many
+// places (round(2.5, 2) is 2.50); places below 0 round to tens, hundreds, ... and give an int.
 Value bi_round(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_numeric(args[0], error, "round")) return Value::nil();
-  if (args[0].type == Type::Decimal) {
-    // exact, half away from zero: round(2.675d, 2) is 2.68, which no real can say
-    int places = 0;
-    if (args.size() > 1) {
-      if (!want_number(args[1], error, "round")) return Value::nil();
-      places = (int)args[1].as_int();
-    }
-    Value r;
-    if (!decimal_round(args[0], places, r, error)) return Value::nil();
-    if (args.size() > 1) return r;
-    int64_t n = 0;
-    if (!decimal_to_int(r, n)) { error = "round(): the decimal does not fit in 64 bits"; return Value::nil(); }
-    return Value::integer(n);
-  }
-  double d = args[0].as_double();
-  if (args.size() > 1) {
+  int places = 0;
+  bool to_int = true;
+  size_t at = 1;
+  if (args.size() > 1 && args[1].type != Type::Str) {
     if (!want_number(args[1], error, "round")) return Value::nil();
-    int64_t decimals = args[1].as_int();
-    double factor = std::pow(10.0, (double)decimals);
-    return Value::real(std::round(d * factor) / factor);
+    places = (int)args[1].as_int();
+    to_int = places < 0;
+    at = 2;
   }
-  return Value::integer((int64_t)std::round(d));
+  RoundMode mode = RoundMode::HalfUp;
+  if (args.size() > at) {
+    if (args[at].type != Type::Str || !round_mode_named(args[at].str(), mode)) {
+      error = "round(): the mode is \"half_up\", \"half_even\", \"half_down\", \"up\", \"down\", \"floor\" or \"ceil\"";
+      return Value::nil();
+    }
+  }
+  Value r;
+  if (!number_round(args[0], places, mode, r, error)) { error = "round(): " + error; return Value::nil(); }
+  if (!to_int) return r;
+  int64_t n = 0;
+  if (!decimal_to_int(r, n)) { error = "round(): " + r.to_text() + " does not fit in 64 bits"; return Value::nil(); }
+  return Value::integer(n);
 }
 
 Value bi_trunc(Vm&, std::vector<Value>& args, std::string& error) {
@@ -7636,7 +7640,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("ceil", 1, 1, bi_ceil);
   vm.define_native("sqrt", 1, 1, bi_sqrt);
   vm.define_native("pow", 2, 2, bi_pow);
-  vm.define_native("round", 1, 2, bi_round);
+  vm.define_native("round", 1, 3, bi_round);
   vm.define_native("trunc", 1, 1, bi_trunc);
   vm.define_native("sign", 1, 1, bi_sign);
   vm.define_native("clamp", 3, 3, bi_clamp);
