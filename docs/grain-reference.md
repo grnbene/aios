@@ -383,6 +383,9 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 | `hmac_sha256` | `hmac_sha256(key, data)` | Computes HMAC-SHA256 signature as hex string. |
 | `random_bytes` | `random_bytes(count)` | Cryptographically secure random bytes buffer. |
 | `aes_cbc_decrypt` | `aes_cbc_decrypt(key, iv, data)` | AES-CBC decryption with PKCS#7 unpadding (returns `nil` on bad padding). |
+| `aes_cbc_encrypt` | `aes_cbc_encrypt(key, iv, data)` | AES-CBC with PKCS#7 padding (a 16, 24 or 32 byte key, a 16 byte IV): what PHP's `openssl_encrypt(..., OPENSSL_RAW_DATA, $iv)` writes. For talking to programs that use it; seal new data with `aes_gcm_encrypt`. |
+| `aes_gcm_encrypt` | `aes_gcm_encrypt(key, plaintext, [aad])` | AES-GCM (a 16 or 32 byte key) under a fresh random nonce. Returns `nonce (12) + ciphertext + tag (16)` as one string. `aad` is data the tag covers without hiding it. |
+| `aes_gcm_decrypt` | `aes_gcm_decrypt(key, sealed, [aad])` | The plaintext `aes_gcm_encrypt` sealed, or `nil` when the key, the `aad` or any byte is not what was sealed. Opens any AES-GCM message laid out as nonce + ciphertext + tag. |
 | `hash_equals` | `hash_equals(a, b)` | Timing-safe string comparison to protect against side-channel leaks. |
 | `bcrypt_hash` | `bcrypt_hash(pass, [cost=10])` | Computes a standard `$2b$` OpenBSD bcrypt password hash with random salt. |
 | `bcrypt_verify` | `bcrypt_verify(pass, hash)` | Verifies a password against a `$2a$`, `$2b$` or `$2y$` (PHP `password_hash`) bcrypt hash in constant time. |
