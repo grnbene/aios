@@ -248,7 +248,13 @@ class TcpConnection final : public Connection {
         if (n > 0) { rlen_ = (size_t)n; return 1; }
         if (n == 0) { dead_ = true; last_eof_ = true; return -1; }
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { dead_ = true; return -1; }
-        for (int i = 0; i < 32; ++i) __builtin_ia32_pause();
+        for (int i = 0; i < 32; ++i) {   // a spin hint: pause on x86, yield on arm64 (the Pi), nothing elsewhere
+#if defined(__x86_64__) || defined(__i386__)
+          __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+          __asm__ __volatile__("yield");
+#endif
+        }
       } while (std::chrono::steady_clock::now() < until);
     }
     if (timeout_ms != rcv_timeout_ms_) {
