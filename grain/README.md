@@ -212,7 +212,7 @@ sqrt(2)                          # 1.4142135623730951, a real
   prints the shortest text that reads back as it (`0.30000000000000004`), always with a point or an
   exponent.
 - **Rounding.** One rule for `round`, `number_format` and `format`: half away from zero by default,
-  exact for decimals; a real rounds the number it prints as, so `round(2.675e0, 2)` is `2.68` too.
+  exact for decimals; a real rounds from its value to 15 significant digits, which sheds the binary noise arithmetic leaves, so `round(2.675e0, 2)` is `2.68` and `round(1.55e0 * 0.3e0, 2)` is `0.47`, as PHP and a sum by hand give.
 - **Errors, not wrong answers.** Past 38 digits, and division by zero, are errors.
 - **Data.** `json_parse` reads `19.99` as a decimal and `1e3` as a real; `to_number("19.99")` is a
   decimal; `db_query(..., {"decimals": true})` returns DECIMAL columns exactly.

@@ -83,7 +83,7 @@ Numbers are exact unless a real is asked for ([the rules](design/grain-numbers.m
 | `max` | `max(...vals)` / `max(list)` | The largest; the same rules as `min`. `latest = max(latest, t)`. |
 | `floor` | `floor(n)` | Rounds down to the nearest integer. |
 | `ceil` | `ceil(n)` | Rounds up to the nearest integer. |
-| `round` | `round(n, [places], [mode])` | The one rounding (shared by `number_format` and `format`): `mode` is `"half_up"` (half away from zero, the default), `"half_even"`, `"half_down"`, `"up"`, `"down"`, `"floor"` or `"ceil"`. Without places: an int (`round(2.5)` is 3); with places: a decimal with exactly that many (`round(2.5, 2)` is `2.50`); places below 0 round to tens, hundreds. Exact for ints and decimals; a real rounds the number it prints as, so `round(2.675e0, 2)` is `2.68`. A rounded zero has no sign. |
+| `round` | `round(n, [places], [mode])` | The one rounding (shared by `number_format` and `format`): `mode` is `"half_up"` (half away from zero, the default), `"half_even"`, `"half_down"`, `"up"`, `"down"`, `"floor"` or `"ceil"`. Without places: an int (`round(2.5)` is 3); with places: a decimal with exactly that many (`round(2.5, 2)` is `2.50`); places below 0 round to tens, hundreds. Exact for ints and decimals; a real rounds from its value to 15 significant digits, then half away from zero (the binary noise of arithmetic sheds there): `round(2.675e0, 2)` is `2.68`, `round(1.55e0 * 0.3e0, 2)` is `0.47`, as PHP rounds. A rounded zero has no sign. |
 | `trunc` | `trunc(n)` | Truncates decimal digits toward zero. |
 | `sign` | `sign(n)` | Returns `1` if positive, `-1` if negative, `0` if zero. |
 | `clamp` | `clamp(val, min, max)` | Constrains `val` within the inclusive range `[min, max]`. |

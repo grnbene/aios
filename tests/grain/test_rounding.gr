@@ -1166,4 +1166,13 @@ check(str(round(5e-324, 2, "up")) == "0.01" and str(round(-5e-324, 2, "floor")) 
 check(!try_call(round, 1e300).ok, "a real past 64 bits does not round to an int")
 check(!try_call(round, 2.5, 2, "nearest").ok, "an unknown mode is an error")
 check(format("{:.2f}", 1e300 * 1e300) == "inf", "inf formats as inf")
+// a real computed by arithmetic rounds from its 15 significant digits: the binary noise past them does not decide it
+let noisy = 1.55e0 * 0.3e0   // 0.46499999999999997
+check(str(round(noisy, 2)) == "0.47" and format("{:.2f}", noisy) == "0.47" and number_format(noisy, 2) == "0.47", "1.55 x 0.3 rounds to 0.47 (shortest digits said 0.46)")
+check(str(decimal(noisy)) == "0.46499999999999997", "decimal() still converts what the real is")
+check(format("{:.1%}", 0.1234e0) == "12.3%", "{:%} of a real")
+// aa's invoices 130442126 and 130442531, line by line as the ERP's PHP computes them, in reals
+fn line(price, disc, qty) { return round(round(round(price, 2) - round(round(price, 2) * round(disc, 4), 2), 2) * qty, 2) }
+check(line(6.5e0, 0.25e0, -1) + line(9.09e0, 0.25e0, -1) == -11.69, "invoice 130442126: 11.69")
+check(line(35.79e0, 0.1e0, -1) + line(28.25e0, 0.1e0, 1) == -6.79, "invoice 130442531: 6.79")
 print("PASS: test_rounding")
