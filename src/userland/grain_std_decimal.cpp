@@ -49,17 +49,24 @@ I round_div(I n, I d) {
 
 struct Dec { I m = 0; int s = 0; };
 
+Value make(I m, int s) { return Value::object(Type::Decimal, std::make_shared<DecimalObj>(m, s)); }
+Value frac_at30(const DecimalObj* o);
+
 bool get(const Value& v, Dec& d) {
   if (v.type == Type::Int) { d.m = v.i; d.s = 0; return true; }
   if (v.type == Type::Decimal) {
     auto* o = static_cast<const DecimalObj*>(v.obj.get());
+    if (o->den != 0) {   // a fraction: as its 30 places, for what wants a decimal that ends (printing, scale)
+      const Value r = frac_at30(o);
+      auto* ro = static_cast<const DecimalObj*>(r.obj.get());
+      d.m = ro->mant; d.s = ro->scale;
+      return true;
+    }
     d.m = o->mant; d.s = o->scale;
     return true;
   }
   return false;
 }
-
-Value make(I m, int s) { return Value::object(Type::Decimal, std::make_shared<DecimalObj>(m, s)); }
 
 bool mul_checked(I a, I b, I& out) { return !__builtin_mul_overflow(a, b, &out); }
 
@@ -121,7 +128,138 @@ bool real_digits(double x, I& m, int& s, std::string& error) {
   return true;
 }
 
-// An int, decimal or real as an exact decimal.
+// ---- fractions: a quotient that does not end, kept exact -------------------------------------------------------
+//
+// 1 / 3 is the fraction 1/3, not 0.333333333333: (1 / 3) * 3 is 1 and 2 / 3 * 3 is 2, where a quotient cut to 12
+// places gives 2.000000000001. A fraction is held reduced, its denominator up to 10^36 and never only 2s and 5s
+// (that would be a decimal that ends, and is made one). It prints to 12 places - or as many as the decimals it came
+// from had - and rounds exactly. Arithmetic that would pass 128 bits rounds the answer to 30 places instead.
+
+struct Frac { I n = 0; I d = 1; };
+
+I gcd128(I a, I b) {
+  a = iabs(a);
+  b = iabs(b);
+  while (b != 0) { const I t = a % b; a = b; b = t; }
+  return a;
+}
+
+const I kMaxDen = pow10(36);
+
+const DecimalObj* dec_obj(const Value& v) {
+  return v.type == Type::Decimal && v.obj ? static_cast<const DecimalObj*>(v.obj.get()) : nullptr;
+}
+bool is_frac(const Value& v) { const DecimalObj* o = dec_obj(v); return o && o->den != 0; }
+
+bool frac_of(const Value& v, Frac& f) {
+  if (v.type == Type::Int) { f = {v.i, 1}; return true; }
+  const DecimalObj* o = dec_obj(v);
+  if (!o) return false;
+  if (o->den != 0) { f = {o->mant, o->den}; return true; }
+  f = {o->mant, pow10(o->scale)};
+  return true;
+}
+
+int print_places(const Value& v) {   // how many places a decimal or fraction prints with
+  const DecimalObj* o = dec_obj(v);
+  return o ? o->scale : 0;
+}
+
+// round(n / d) to `places` places (0..30) by `mode`, exactly, as the mantissa at that scale. d > 0, d <= 10^37.
+bool frac_round(I n, I d, int places, RoundMode mode, I& out) {
+  const bool neg = n < 0;
+  const I a = iabs(n);
+  const I whole = a / d;
+  I r = a % d;
+  I q;
+  if (!mul_checked(whole, pow10(places), q)) return false;
+  I digits = 0;
+  for (int k = 0; k < places; ++k) {   // r < d <= 10^37, so r * 10 fits
+    r *= 10;
+    digits = digits * 10 + r / d;
+    r %= d;
+  }
+  if (__builtin_add_overflow(q, digits, &q)) return false;
+  if (r != 0) {
+    const int half = r * 2 > d ? 1 : (r * 2 == d ? 0 : -1);
+    bool up = false;   // away from zero, in magnitude
+    switch (mode) {
+      case RoundMode::Down: up = false; break;
+      case RoundMode::Up: up = true; break;
+      case RoundMode::Floor: up = neg; break;
+      case RoundMode::Ceil: up = !neg; break;
+      case RoundMode::HalfUp: up = half >= 0; break;
+      case RoundMode::HalfDown: up = half > 0; break;
+      case RoundMode::HalfEven: up = half > 0 || (half == 0 && q % 2 != 0); break;
+    }
+    if (up) ++q;
+  }
+  out = neg ? -q : q;
+  return true;
+}
+
+// n / d at 30 places (half away from zero, trailing zeros dropped): what a fraction is when something wants a decimal
+// that ends. d may be any size here: past 10^37 both sides shed digits first (an error far below the 30th place).
+Value frac_rounded(I n, I d) {
+  if (d < 0) { n = -n; d = -d; }
+  while (d > pow10(37)) { n /= 10; d /= 10; }
+  I q = 0;
+  frac_round(n, d, kMaxScale, RoundMode::HalfUp, q);
+  int sc = kMaxScale;
+  while (sc > 0 && q % 10 == 0) { q /= 10; --sc; }
+  return make(q, sc);
+}
+
+// The value of n / d: reduced; an int's worth or a decimal that ends when it is one (whole: scale 0); a fraction
+// printing with `places` places otherwise; rounded to 30 places when the denominator would pass 10^36.
+Value from_frac(I n, I d, int places) {
+  if (d < 0) { n = -n; d = -d; }
+  const I g = gcd128(n, d);
+  if (g > 1) { n /= g; d /= g; }
+  I t = d;
+  int twos = 0, fives = 0;
+  while (t % 2 == 0) { t /= 2; ++twos; }
+  while (t % 5 == 0) { t /= 5; ++fives; }
+  if (t == 1) {   // it ends
+    const int k = std::max(twos, fives);
+    I m;
+    if (k <= kMaxScale && mul_checked(n, pow10(k) / d, m)) return make(m, k);
+    return frac_rounded(n, d);
+  }
+  if (d > kMaxDen) return frac_rounded(n, d);
+  return Value::object(Type::Decimal, std::make_shared<DecimalObj>(n, std::max(places, kMinDivScale), d));
+}
+
+Value frac_at30(const DecimalObj* o) { return frac_rounded(o->mant, o->den); }
+
+// a op b with a fraction on either side (or a plain quotient that does not end): exactly, or - past 128 bits - each
+// side at 30 places and the decimal answer.
+bool frac_arith(char op, const Value& a, const Value& b, Value& out, std::string& error);
+
+// Compare two fractions exactly (no overflow: continued-fraction steps when cross products would not fit).
+int frac_compare(Frac x, Frac y) {
+  const int sx = x.n < 0 ? -1 : (x.n > 0 ? 1 : 0), sy = y.n < 0 ? -1 : (y.n > 0 ? 1 : 0);
+  if (sx != sy) return sx < sy ? -1 : 1;
+  if (sx == 0) return 0;
+  I a = iabs(x.n), b = x.d, c = iabs(y.n), d = y.d;
+  int flip = sx;   // comparing magnitudes; negatives reverse the answer
+  for (;;) {
+    I l, r;
+    if (mul_checked(a, d, l) && mul_checked(c, b, r)) return l < r ? -flip : (l > r ? flip : 0);
+    const I qa = a / b, qc = c / d;
+    if (qa != qc) return qa < qc ? -flip : flip;
+    const I ra = a % b, rc = c % d;
+    if (ra == 0 || rc == 0) return ra == rc ? 0 : (ra == 0 ? -flip : flip);
+    // a/b vs c/d with equal whole parts: compare the remainders, which is the reciprocals the other way round
+    a = b; b = ra;
+    const I c2 = d;
+    d = rc;
+    c = c2;
+    flip = -flip;
+  }
+}
+
+// An int, decimal or real as an exact decimal (a fraction as its 30 places).
 bool exact_of(const Value& v, Dec& d, std::string& error) {
   if (get(v, d)) return true;
   if (v.type == Type::Real) return real_digits(v.d, d.m, d.s, error);
@@ -135,7 +273,14 @@ Value decimal_from_int(int64_t v) { return make(v, 0); }
 
 std::string decimal_text(const Value& v) {
   Dec d;
-  if (!get(v, d)) return "?";
+  if (const DecimalObj* o = dec_obj(v); o && o->den != 0) {   // a fraction: to its places, half away from zero
+    I q = 0;
+    frac_round(o->mant, o->den, o->scale, RoundMode::HalfUp, q);
+    d.m = q;
+    d.s = o->scale;
+  } else if (!get(v, d)) {
+    return "?";
+  }
   const bool neg = d.m < 0;
   I a = iabs(d.m);
   std::string digits;
@@ -194,6 +339,10 @@ bool decimal_parse(const std::string& text, Value& out, std::string& error) {
 }
 
 bool decimal_negate(const Value& a, Value& out, std::string&) {
+  if (const DecimalObj* o = dec_obj(a); o && o->den != 0) {
+    out = Value::object(Type::Decimal, std::make_shared<DecimalObj>(-o->mant, o->scale, o->den));
+    return true;
+  }
   Dec x;
   get(a, x);
   out = make(-x.m, x.s);
@@ -201,6 +350,12 @@ bool decimal_negate(const Value& a, Value& out, std::string&) {
 }
 
 int decimal_compare(const Value& a, const Value& b) {
+  if (is_frac(a) || is_frac(b)) {   // exactly, as fractions
+    Frac x, y;
+    frac_of(a, x);
+    frac_of(b, y);
+    return frac_compare(x, y);
+  }
   Dec x, y;
   get(a, x);
   get(b, y);
@@ -228,6 +383,7 @@ bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::str
       case '%': if (y == 0) { error = "modulo by zero"; return false; } out = Value::real(std::fmod(x, y)); return true;
     }
   }
+  if (is_frac(a) || is_frac(b)) return frac_arith(op, a, b, out, error);
   Dec x, y;
   if (!get(a, x) || !get(b, y)) {
     error = std::string("cannot mix a decimal with a ") + type_name(a.type == Type::Decimal ? b.type : a.type) +
@@ -257,17 +413,18 @@ bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::str
       // (x.m / 10^x.s) / (y.m / 10^y.s) at scale s = x.m * 10^(s - x.s + y.s) / y.m
       I num;
       const int up = s - x.s + y.s;
-      if (up > 38 || !mul_checked(x.m, pow10(up), num)) return overflow(error);
+      if (up > 38 || !mul_checked(x.m, pow10(up), num)) return frac_arith('/', a, b, out, error);   // big: exactly
       // An exact quotient keeps no more places than it needs (10 / 4 is 2.5, 10.00 / 4 is 2.50); one that does not
-      // end keeps them all, rounded.
-      I q = round_div(num, y.m);
-      int qs = s;
+      // end is the exact fraction (1 / 3 is 1/3, printing 0.333333333333).
+      I q = num / y.m;
       if (q * y.m == num) {
+        int qs = s;
         const int keep = std::max(x.s, y.s);
         while (qs > keep && q % 10 == 0) { q /= 10; --qs; }
+        out = make(q, qs);
+        return true;
       }
-      out = make(q, qs);
-      return true;
+      return frac_arith('/', a, b, out, error);
     }
     case '%': {
       if (y.m == 0) { error = "modulo by zero"; return false; }
@@ -281,6 +438,56 @@ bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::str
   error = "unknown decimal operator";
   return false;
 }
+
+namespace {
+bool frac_arith(char op, const Value& a, const Value& b, Value& out, std::string& error) {
+  Frac x, y;
+  if (!frac_of(a, x) || !frac_of(b, y)) { error = "cannot mix a decimal with that"; return false; }
+  const int places = std::max(print_places(a), print_places(b));
+  I n = 0, d = 1;
+  bool fits = true;
+  switch (op) {
+    case '+': case '-': {
+      const I g = gcd128(x.d, y.d);
+      I l, r, dd;
+      fits = mul_checked(x.n, y.d / g, l) && mul_checked(y.n, x.d / g, r) && mul_checked(x.d / g, y.d, dd) &&
+             !(op == '+' ? __builtin_add_overflow(l, r, &n) : __builtin_sub_overflow(l, r, &n));
+      d = dd;
+      break;
+    }
+    case '*': {
+      const I g1 = gcd128(x.n, y.d), g2 = gcd128(y.n, x.d);
+      fits = mul_checked(g1 ? x.n / g1 : 0, g2 ? y.n / g2 : 0, n) && mul_checked(x.d / (g2 ? g2 : 1), y.d / (g1 ? g1 : 1), d);
+      break;
+    }
+    case '/': {
+      if (y.n == 0) { error = "division by zero"; return false; }
+      const I g1 = gcd128(x.n, y.n), g2 = gcd128(x.d, y.d);
+      fits = mul_checked(g1 ? x.n / g1 : 0, y.d / g2, n) && mul_checked(x.d / g2, g1 ? y.n / g1 : 1, d);
+      break;
+    }
+    case '%': {   // x - trunc(x / y) * y
+      if (y.n == 0) { error = "modulo by zero"; return false; }
+      Value q;
+      if (!frac_arith('/', a, b, q, error)) return false;
+      I whole = 0;
+      if (const DecimalObj* o = dec_obj(q); o && o->den != 0) whole = o->mant / o->den;
+      else if (q.type == Type::Int) whole = q.i;
+      else { Dec qd; get(q, qd); whole = qd.m / pow10(qd.s); }
+      Value prod, r;
+      if (!frac_arith('*', make(whole, 0), b, prod, error) || !frac_arith('-', a, prod, r, error)) return false;
+      out = r;
+      return true;
+    }
+    default: error = "unknown decimal operator"; return false;
+  }
+  if (fits) { out = from_frac(n, d, places); return true; }
+  // past 128 bits: each side at 30 places, then the decimal answer (which may round in its turn). A quotient is the
+  // first side times the second's reciprocal, both at 30 places, so it never comes back here.
+  if (op == '/') return decimal_arith('*', frac_rounded(x.n, x.d), frac_rounded(y.d, y.n), out, error);
+  return decimal_arith(op, frac_rounded(x.n, x.d), frac_rounded(y.n, y.d), out, error);
+}
+}  // namespace
 
 bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
   Dec d;
@@ -301,6 +508,21 @@ bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
 bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::string& error) {
   if (places > kMaxScale) { error = "rounds to at most 30 places"; return false; }
   if (places < -38) { error = "rounds to at most 38 places left of the point"; return false; }
+  if (const DecimalObj* o = dec_obj(v); o && o->den != 0) {   // a fraction: exactly, digit by digit
+    I q = 0;
+    if (places >= 0) {
+      if (!frac_round(o->mant, o->den, places, mode, q)) return overflow(error);
+      out = make(q, places);
+      return true;
+    }
+    I d10;
+    if (!mul_checked(o->den, pow10(-places), d10) || d10 > pow10(37)) { out = make(0, 0); return true; }
+    if (!frac_round(o->mant, d10, 0, mode, q)) return overflow(error);
+    I m;
+    if (!mul_checked(q, pow10(-places), m)) return overflow(error);
+    out = make(m, 0);
+    return true;
+  }
   Dec d;
   if (!exact_of(v, d, error)) return false;
   const int target = places < 0 ? 0 : places;
@@ -397,6 +619,10 @@ bool round_mode_named(const std::string& name, RoundMode& mode) {
 
 double Value::decimal_as_double() const { return decimal_to_double(*this); }
 int64_t Value::decimal_as_int() const {
+  if (const DecimalObj* o = dec_obj(*this); o && o->den != 0) {
+    const I whole = o->mant / o->den;
+    return whole > (I)INT64_MAX ? INT64_MAX : whole < (I)INT64_MIN ? INT64_MIN : (int64_t)whole;
+  }
   Dec d;
   if (!get(*this, d)) return 0;
   const I whole = d.m / pow10(d.s);
@@ -404,12 +630,19 @@ int64_t Value::decimal_as_int() const {
 }
 
 double decimal_to_double(const Value& v) {
+  if (const DecimalObj* o = dec_obj(v); o && o->den != 0) return std::strtod(decimal_text(frac_rounded(o->mant, o->den)).c_str(), nullptr);
   Dec d;
   if (!get(v, d)) return 0.0;
   return std::strtod(decimal_text(v).c_str(), nullptr);
 }
 
 bool decimal_to_int(const Value& v, int64_t& out) {
+  if (const DecimalObj* o = dec_obj(v); o && o->den != 0) {
+    const I whole = o->mant / o->den;
+    if (whole > (I)INT64_MAX || whole < (I)INT64_MIN) return false;
+    out = (int64_t)whole;
+    return true;
+  }
   Dec d;
   if (!get(v, d)) return false;
   const I whole = d.m / pow10(d.s);
@@ -436,6 +669,11 @@ Value bi_decimal(Vm&, std::vector<Value>& args, std::string& error) {
   }
   if (args.size() > 1) {
     if (!want_number(args[1], error, "decimal")) return Value::nil();
+    if (is_frac(out)) {
+      Value r;
+      if (!number_round(out, (int)args[1].as_int(), RoundMode::HalfUp, r, error)) { error = "decimal(): " + error; return Value::nil(); }
+      return r;
+    }
     // an explicit scale pads (2 -> 2.00) as well as rounds
     Dec d;
     get(out, d);
@@ -454,24 +692,21 @@ Value bi_dec_div(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[2], error, "dec_div")) return Value::nil();
   const int places = (int)args[2].as_int();
   if (places < 0 || places > kMaxScale) { error = "dec_div(): places from 0 to 30"; return Value::nil(); }
-  Dec x, y;
-  get(args[0], x);
-  get(args[1], y);
-  if (y.m == 0) { error = "dec_div(): division by zero"; return Value::nil(); }
-  I num;
-  const int up = places - x.s + y.s;
-  if (up >= 0) {
-    if (up > 38 || !mul_checked(x.m, pow10(up), num)) { overflow(error); error = "dec_div(): " + error; return Value::nil(); }
-    return make(round_div(num, y.m), places);
+  {   // the exact quotient (fractions included), rounded once, half away from zero
+    Value q;
+    if (!decimal_arith('/', args[0].type == Type::Int ? make(args[0].i, 0) : args[0], args[1], q, error)) {
+      error = "dec_div(): " + error;
+      return Value::nil();
+    }
+    Value r;
+    if (!number_round(q, places, RoundMode::HalfUp, r, error)) { error = "dec_div(): " + error; return Value::nil(); }
+    return r;
   }
-  // fewer places than the operands carry: divide the divisor up instead
-  I den;
-  if (-up > 38 || !mul_checked(y.m, pow10(-up), den)) { overflow(error); error = "dec_div(): " + error; return Value::nil(); }
-  return make(round_div(x.m, den), places);
 }
 
 // scale(d): digits after the point, as it prints.
 Value bi_scale(Vm&, std::vector<Value>& args, std::string& error) {
+  if (is_frac(args[0])) return Value::integer(print_places(args[0]));   // a fraction: the places it prints with
   Dec d;
   if (!get(args[0], d)) { error = std::string("scale() wants a decimal, got a ") + type_name(args[0].type); return Value::nil(); }
   return Value::integer(d.s);

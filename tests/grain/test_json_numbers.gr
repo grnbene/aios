@@ -25,7 +25,7 @@ fn run(where) {
   check(json_stringify([1e0, 100e0]) == "[1.0,100.0]", where + ": a whole real keeps its point, as str() writes it, so it reads back as a real")
   check(json_stringify(json_parse("1e400")) == "null", where + ": an overflowing real is null, as before")
   # round trip: every real written reads back as the same value
-  for x in [0.1, 0.2, 1 / 3, 2.5e-7, 6.02214076e23, 1.7976931348623157e308, 5e-324, -0.000001] {
+  for x in [0.1, 0.2, 1e0 / 3, 2.5e-7, 6.02214076e23, 1.7976931348623157e308, 5e-324, -0.000001] {
     check(json_parse(json_stringify(x)) == x, where + ": round trip of " + str(x) + " via " + json_stringify(x))
   }
   # a big integer written by stringify, read back, is the same real
