@@ -202,7 +202,7 @@ Token Lexer::string_token(bool is_fstr) {
     // brace_depth == 0 (string literal text):
     // ${expr} interpolates; a ${ that no expression can follow ("${:.2f}": a price's dollar sign before a format()
     // placeholder, "${}") is text, as written.
-    if (c == '$' && peek(1) == '{' && peek(2) != ':' && peek(2) != '}') {
+    if (c == '$' && peek(1) == '{' && peek(2) != ':' && peek(2) != '}' && peek(2) != quote && peek(2) != '\0') {
       advance(); // '$'
       advance(); // '{'
       out += "${";
@@ -231,6 +231,16 @@ Token Lexer::string_token(bool is_fstr) {
       } else {
         out.push_back('}');
       }
+      continue;
+    }
+
+    // In a plain string only ${expr} interpolates: every other brace is text, written doubled so that if the string
+    // turns out to interpolate ("${x} costs ${:.2f}") the f-string reader takes it as text; if it does not, the
+    // doubling is undone below and the text is exactly as written.
+    if (!is_fstr && (c == '{' || c == '}')) {
+      advance();
+      out.push_back(c);
+      out.push_back(c);
       continue;
     }
 
@@ -311,12 +321,21 @@ Token Lexer::string_token(bool is_fstr) {
         return Token{Tok::Error, std::string("unknown escape \\") + e, 0, 0, start_line, start_col};
     }
   }
+  if (!is_fstr && !has_interp) {   // no ${expr}: every brace was doubled above; as written again
+    std::string plain;
+    plain.reserve(out.size());
+    for (size_t k = 0; k < out.size(); ++k) {
+      plain.push_back(out[k]);
+      if ((out[k] == '{' || out[k] == '}') && k + 1 < out.size() && out[k + 1] == out[k]) ++k;
+    }
+    out = std::move(plain);
+  }
   return Token{has_interp ? Tok::FStr : Tok::Str, out, 0, 0, start_line, start_col};
 }
 
-// Integer unless something in it forces a double: a decimal point or an
-// exponent. `1e3` is a real, `1000` is an integer, and they are not the same
-// value even though they print the same.
+// An integer, unless it has a point or an exponent. With a point and no exponent (19.99) it is an exact decimal, as
+// written; with an exponent (1e3, 6.02e23) a real - scientific notation is for scientific numbers. An integer too big
+// for 64 bits is an exact decimal too. (Both come out as Tok::Real with `exact` set and the digits in `text`.)
 Token Lexer::number_token() {
   const int start_line = line_;
   const size_t start = pos_;
@@ -346,7 +365,7 @@ Token Lexer::number_token() {
     t.integer = (int64_t)std::strtoull(digits.c_str(), nullptr, hex ? 16 : 2);
     return t;
   }
-  bool real = false;
+  bool real = false, exponent = false;
   while (is_digit(peek())) advance();
   if (peek() == '.' && is_digit(peek(1))) {
     real = true;
@@ -358,6 +377,7 @@ Token Lexer::number_token() {
     const size_t digit_at = (sign == '+' || sign == '-') ? 2 : 1;
     if (is_digit(peek(digit_at))) {
       real = true;
+      exponent = true;
       advance();
       if (sign == '+' || sign == '-') advance();
       while (is_digit(peek())) advance();
@@ -371,13 +391,13 @@ Token Lexer::number_token() {
   if (real) {
     t.kind = Tok::Real;
     t.real = std::strtod(text.c_str(), nullptr);
+    t.exact = !exponent;
   } else {
     t.kind = Tok::Int;
     errno = 0;
     t.integer = (int64_t)std::strtoll(text.c_str(), nullptr, 10);
-    // A literal too large for the integer it was written as becomes a real
-    // rather than a silently wrapped negative.
-    if (errno == ERANGE) { t.kind = Tok::Real; t.real = std::strtod(text.c_str(), nullptr); }
+    // Too large for 64 bits: the exact decimal (never a silently wrapped negative, nor a rounded real).
+    if (errno == ERANGE) { t.kind = Tok::Real; t.real = std::strtod(text.c_str(), nullptr); t.exact = true; }
   }
   return t;
 }

@@ -20,7 +20,7 @@ using ExprP = std::unique_ptr<Expr>;
 using StmtP = std::unique_ptr<Stmt>;
 
 enum class ExprKind : uint8_t {
-  IntLit, RealLit, StrLit, BoolLit, NilLit,
+  IntLit, RealLit, DecLit, StrLit, BoolLit, NilLit,   // DecLit: an exact decimal, its digits in text
   Name,        // a
   Unary,       // -a, not a, ~a
   Binary,      // a + b

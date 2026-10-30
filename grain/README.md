@@ -39,7 +39,7 @@ For the complete function-by-function reference of all 440+ builtins with parame
 | Area | Functions |
 |---|---|
 | The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv` (the shell's environment; an app sees only its own settings), `cwd`, `sleep(ms)` (milliseconds), `clock`, `time_us` |
-| Numbers | `a..b` is `range(a, b)`; `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
+| Numbers | exact by default (see [Numbers](#numbers)): `19.99` is an exact decimal, `1e9` a real; `/` is exact (`7 / 2` is `3.5`, `(1 / 3) * 3` is `1`); ints never wrap; `round(x, places, mode)`; `a..b` is `range(a, b)`; `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`) |
 | Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`, `decimal_prefix(s)` (the number a string starts with: `{d, whole}` or nil), `round_sig(d, n)`, `number_format(v, places, point, sep)` (PHP's: `number_format(1234.5678, 2)` is `"1,234.57"`); `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
 | Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists`, `file_stat` (size, modified time, mode), `rename_file`, `copy_file`, `glob("logs/**/*.jsonl")` (relative to the working directory) |
 | Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
@@ -185,28 +185,39 @@ and JOINs, or given as `live(db, sql, {"tables": [...]})`); the query runs only
 when one of them was written. Against another server it runs every tick
 (`every`, default 1 second). `live.runs` counts how often the query itself ran.
 
-## Exact decimals
+## Numbers
 
-Money is not a real: `0.1 + 0.2 == 0.3` is false for reals in every language, and a
-price rounded as a real rounds the wrong way half the time. A decimal is exact.
+grain's numbers are exact unless you ask for a real. The full rules are in
+[docs/design/grain-numbers.md](../docs/design/grain-numbers.md).
 
 ```grain
-let price = decimal("19.99")
-let total = price * 3 + decimal("0.05")     # 60.02
-round(total / 7, 2)                         # 8.57 - half away from zero, as PHP's round() does
-decimal("2.50") == decimal("2.5")           # true: the scale only decides how it prints
-format("{:,.2f}", decimal("1234567.891"))   # 1,234,567.89
+0.1 + 0.2 == 0.3                 # true: 0.1 is exactly 0.1
+let total = 19.99 * 3 + 0.05     # 60.02, exactly
+4.35 * 100                       # 435.00 (int() of it is 435, not 434)
+7 / 2                            # 3.5          10 / 2 is the int 5
+(1 / 3) * 3                      # 1            1 / 3 is the exact fraction, printing 0.333333333333
+9223372036854775807 + 1          # 9223372036854775808 - ints never wrap
+round(2.675, 2)                  # 2.68         round(2.5) is 3, round(-2.5) is -3
+round(2.5, 0, "half_even")       # 2            also half_down, up, down, floor, ceil
+format("{:,.2f}", 1234567.891)   # 1,234,567.89 - format, number_format and round agree
+sqrt(2)                          # 1.4142135623730951, a real
+1.5e3                            # 1500.0, a real: an exponent means a real
 ```
 
-A decimal is an integer mantissa (128 bits, 38 digits) and a scale of up to 30. An
-int mixes freely; a real does not, because 0.1 as a real is not 0.1 - say
-`decimal(x)` if you mean it (a real becomes the shortest decimal that reads back as
-it). `+ - %` take the larger scale, `*` adds the scales (rounding past 30), and `/`
-keeps at least 12 places; `dec_div(a, b, places)` picks them. `round(d, places)`
-rounds half away from zero. Overflow and division by zero stop the program with an
-error rather than answering wrongly. They cross into workers, `json_stringify` and
-`db_query(..., {"decimals": true})` with every digit. There is no decimal literal
-yet: write `decimal("0.5")`. See [**`examples/grain/decimals.gr`**](../examples/grain/decimals.gr) for exact invoicing, tax calculation, and formatting examples.
+- **Three kinds.** An int (64-bit), a decimal (exact: 38 digits, up to 30 places, or an exact fraction
+  from a division that does not end) and a real (binary floating point, inexact: what `sqrt`, `sin`,
+  `log` and an exponent literal give).
+- **Mixing.** Ints and decimals mix exactly; anything with a real is a real.
+- **Printing.** A decimal prints its digits (`1.50` keeps its places, a fraction shows 12); a real
+  prints the shortest text that reads back as it (`0.30000000000000004`), always with a point or an
+  exponent.
+- **Rounding.** One rule for `round`, `number_format` and `format`: half away from zero by default,
+  exact for decimals; a real rounds the number it prints as, so `round(2.675e0, 2)` is `2.68` too.
+- **Errors, not wrong answers.** Past 38 digits, and division by zero, are errors.
+- **Data.** `json_parse` reads `19.99` as a decimal and `1e3` as a real; `to_number("19.99")` is a
+  decimal; `db_query(..., {"decimals": true})` returns DECIMAL columns exactly.
+
+See [**`examples/grain/decimals.gr`**](../examples/grain/decimals.gr) for invoicing, tax and formatting.
 
 ## Programs in several files
 

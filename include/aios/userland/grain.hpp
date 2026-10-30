@@ -85,7 +85,10 @@ struct Value {
   static Value id128(const aios::Id128& id);
   static Value id128(const std::string& hex);
 
-  bool is_number() const { return type == Type::Int || type == Type::Real; }
+  // Any number: an int, a real or an exact decimal (19.99 is a decimal). is_binary_number: an int or a real only, for
+  // the VM's fast paths and what must not see a decimal as a double.
+  bool is_number() const { return type == Type::Int || type == Type::Real || type == Type::Decimal; }
+  bool is_binary_number() const { return type == Type::Int || type == Type::Real; }
   bool is_id128() const { return type == Type::Id128; }
   // Only nil and false are false. An empty string and 0 are values, and a
   // language that calls them false makes `if count` mean two different things

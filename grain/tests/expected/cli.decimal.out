@@ -2,6 +2,7 @@ decimal
   ok    0.1 + 0.2
   ok    0.1 + 0.2 == 0.3
   ok    reals still disagree
+  ok    but the literals are exact
   ok    keeps its scale
   ok    1.50 == 1.5
   ok    equals an int
@@ -91,4 +92,4 @@ utf8
   ok    surrogate
   ok    truncated
   ok    bytes
-decimal: 87 checks, all agreed
+decimal: 88 checks, all agreed

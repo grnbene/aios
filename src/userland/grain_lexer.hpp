@@ -34,6 +34,9 @@ struct Token {
   double real = 0;
   int line = 1;
   int column = 1;
+  // Last, after the fields Token{...} lists by position: a Real written with a point and no exponent, or an int past
+  // 64 bits - an exact decimal in grain (its digits are `text`); a native fn reads `real`.
+  bool exact = false;
 };
 
 class Lexer {

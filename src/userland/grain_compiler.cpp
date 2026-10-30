@@ -365,6 +365,18 @@ class Compiler {
     switch (e.kind) {
       case ExprKind::IntLit: emit_constant(Value::integer(e.integer), e.line, e.column); return;
       case ExprKind::RealLit: emit_constant(Value::real(e.real), e.line, e.column); return;
+      case ExprKind::DecLit: {   // 19.99: exactly that (grain_std_decimal.cpp)
+        Value d;
+        std::string why;
+        if (!decimal_parse(e.text, d, why)) {
+          error(e.line, e.column, e.text + " is too large for an exact number (38 digits); write it with an exponent (" +
+                e.text.substr(0, 1) + "e" + std::to_string(e.text.find('.') == std::string::npos ? e.text.size() - 1 : e.text.find('.') - 1) +
+                ") for a real");
+          return;
+        }
+        emit_constant(d, e.line, e.column);
+        return;
+      }
       case ExprKind::StrLit: emit_constant(Value::string(e.text), e.line, e.column); return;
       case ExprKind::BoolLit: emit(e.integer ? Op::True : Op::False, e.line, e.column); return;
       case ExprKind::NilLit: emit(Op::Nil, e.line, e.column); return;

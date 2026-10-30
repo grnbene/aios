@@ -792,15 +792,21 @@ Value bi_to_number(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!error.empty()) { error = "to_number(): " + error.substr(error.find("decimal_prefix(): ") == 0 ? 18 : 0); return Value::nil(); }
   if (p.type == Type::Nil) return fallback;
   Value* d = std::static_pointer_cast<MapObj>(p.obj)->find("d");
-  return d ? *d : fallback;
+  if (!d) return fallback;
+  // a whole number written without a point ("12") is an int, as the literal 12 is; "12.50" stays the decimal 12.50
+  Dec dd;
+  if (d->type == Type::Decimal && get(*d, dd) && dd.s == 0 && dd.m <= (I)INT64_MAX && dd.m >= (I)INT64_MIN &&
+      v.str().find_first_of(".eE") == std::string::npos)
+    return Value::integer((int64_t)dd.m);
+  return *d;
 }
 
 // number_format(v [, places [, dec_point [, thousands_sep]]]): v printed with `places` digits after the point
 // (default 0), groups of three split by thousands_sep (default ",") and the point written dec_point (default ".") -
 // PHP's number_format(). As PHP 7.4 reads v: nil and false are 0, true 1, a string by the number it starts with
 // (one that starts with none gives nil, where PHP warns and gives NULL), a real as the shortest decimal that reads
-// back as it. The value is rounded to 15 significant digits first (PHP's pre-rounding: 1.005 gives 1.01), then
-// half away from zero to the places; a zero prints with no sign; places below 0 count as 0.
+// back as it (1.005 gives 1.01, as PHP's pre-rounding does). Rounded as round() rounds: half away from zero to the
+// places; a zero prints with no sign; places below 0 count as 0.
 Value bi_number_format(Vm& vm, std::vector<Value>& args, std::string& error) {
   const Value& v = args[0];
   Value dv;

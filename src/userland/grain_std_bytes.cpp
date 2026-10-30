@@ -95,7 +95,7 @@ Value read_number(const uint8_t* p, const NumType& t) {
 // The value must fit the field: a script that writes 300 into a byte is wrong.
 bool write_number(uint8_t* p, const NumType& t, const Value& v, std::string& error, const char* who) {
   if (t.is_float) {
-    if (!v.is_number()) { error = std::string(who) + "() wants a number to store, got a " + type_name(v.type); return false; }
+    if (!v.is_number() && v.type != Type::Decimal) { error = std::string(who) + "() wants a number to store, got a " + type_name(v.type); return false; }
     if (t.size == 4) { const float f = (float)v.as_double(); uint32_t u; std::memcpy(&u, &f, 4); store(p, 4, t.big, u); }
     else { const double d = v.as_double(); uint64_t u; std::memcpy(&u, &d, 8); store(p, 8, t.big, u); }
     return true;

@@ -76,8 +76,8 @@ ExprP parse_fstring(const Token& t, std::vector<Diagnostic>* errors) {
       fail("a lone '}' in a formatted string (write }} for a brace)");
       return result ? std::move(result) : std::make_unique<Expr>();
     }
-    if (c == '$' && i + 1 < raw.size() && raw[i + 1] == '{') {
-      ++i;
+    if (c == '$' && i + 1 < raw.size() && raw[i + 1] == '{' && !(i + 2 < raw.size() && raw[i + 2] == '{')) {
+      ++i;   // ${expr}; a $ before {{ (a text brace) is a dollar sign
     } else if (c != '{') {
       lit.push_back(c);
       ++i;
@@ -268,7 +268,8 @@ ExprP Parser::primary() {
     }
     case Tok::Real: {
       advance();
-      auto e = std::make_unique<Expr>(); e->kind = ExprKind::RealLit; e->real = t.real; e->line = t.line; e->column = t.column;
+      auto e = std::make_unique<Expr>(); e->kind = t.exact ? ExprKind::DecLit : ExprKind::RealLit; e->real = t.real; e->line = t.line; e->column = t.column;
+      if (t.exact) e->text = t.text;
       return e;
     }
     case Tok::Str: {

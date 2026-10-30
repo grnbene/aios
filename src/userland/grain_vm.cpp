@@ -368,13 +368,10 @@ std::string Value::repr() const {
 bool Value::equals(const Value& o) const {
   // 2 and 2.0 are the same number written two ways. Everything else has to
   // match kind as well as content.
-  if (is_number() && o.is_number()) {
-    if (type == Type::Int && o.type == Type::Int) return i == o.i;
-    return as_double() == o.as_double();
-  }
-  // A decimal equals an int or decimal of the same value (2.50 == 2.5); against a real both are compared as reals.
+  if (type == Type::Int && o.type == Type::Int) return i == o.i;
+  // A decimal equals an int or decimal of the same value (2.50 == 2.5), exactly; with a real, both are compared as reals.
   if (is_exact_number(*this) && is_exact_number(o)) return decimal_compare(*this, o) == 0;
-  if ((type == Type::Decimal && o.type == Type::Real) || (type == Type::Real && o.type == Type::Decimal)) return as_double() == o.as_double();
+  if (is_number() && o.is_number()) return as_double() == o.as_double();
   if (type != o.type) return false;
   switch (type) {
     case Type::Nil: return true;
@@ -811,7 +808,7 @@ void Vm::emit(const std::string& line) {
 
 namespace {
 
-bool numeric_pair(const Value& a, const Value& b) { return a.is_number() && b.is_number(); }
+bool numeric_pair(const Value& a, const Value& b) { return a.is_binary_number() && b.is_binary_number(); }   // decimals go their own way
 // A decimal on either side with an int or decimal on the other.
 bool decimal_pair(const Value& a, const Value& b) {
   return (a.type == Type::Decimal || b.type == Type::Decimal) && is_exact_number(a) && is_exact_number(b);
