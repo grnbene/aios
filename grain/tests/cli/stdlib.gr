@@ -119,7 +119,7 @@ check("idiv exact", idiv(8, 2), 4)
 check("idiv truncates toward zero", idiv(-7, 2), -3)
 check("idiv negative divisor", idiv(7, -2), -3)
 check("idiv matches %", idiv(-7, 2) * 2 + -7 % 2, -7)
-check("idiv min / -1 wraps", idiv(-9223372036854775807 - 1, -1), -9223372036854775807 - 1)
+check("idiv min / -1 is 2^63, exactly", str(idiv(-9223372036854775807 - 1, -1)), "9223372036854775808")
 check("idiv by zero", fails(fn () { return idiv(1, 0) }), true)
 check("idiv wants integers", fails(fn () { return idiv(7.5, 2) }), true)
 

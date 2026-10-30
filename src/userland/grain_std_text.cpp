@@ -317,12 +317,9 @@ Value bi_sum(Vm&, std::vector<Value>& args, std::string& error) {
   Value sum = Value::integer(0);
   for (const auto& v : args[0].list_items()) {
     if (v.type == Type::Nil) continue;
-    if (sum.type == Type::Int && v.type == Type::Int) sum = Value::integer(sum.i + v.i);
-    else if (sum.type == Type::Decimal || v.type == Type::Decimal) {
-      Value r;
-      if (!decimal_arith('+', sum, v, r, error)) { error = "sum(): " + error; return Value::nil(); }
-      sum = r;
-    } else sum = Value::real(sum.as_double() + v.as_double());
+    Value r;   // as + adds: exact, past 64 bits the exact decimal (it wrapped), a real only with a real
+    if (!number_arith('+', sum, v, r, error)) { error = "sum(): " + error; return Value::nil(); }
+    sum = std::move(r);
   }
   return sum;
 }
@@ -404,11 +401,8 @@ Value bi_sum_by(Vm& vm, std::vector<Value>& args, std::string& error) {
     const std::string k = key.to_text();
     Value* cur = out->find(k);
     if (!cur) { out->put(k, v); continue; }
-    Value sum;
-    if (cur->type == Type::Int && v.type == Type::Int) sum = Value::integer(cur->i + v.i);
-    else if (cur->type == Type::Decimal || v.type == Type::Decimal) {
-      if (!decimal_arith('+', *cur, v, sum, error)) { error = "sum_by(): " + error; return Value::nil(); }
-    } else sum = Value::real(cur->as_double() + v.as_double());
+    Value sum;   // as + adds
+    if (!number_arith('+', *cur, v, sum, error)) { error = "sum_by(): " + error; return Value::nil(); }
     *cur = sum;
   }
   return Value::object(Type::Map, out);

@@ -318,6 +318,59 @@ bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::s
   return true;
 }
 
+// a op b for two numbers, as the language does it: ints exactly (past 64 bits the exact decimal), an int or decimal
+// with a decimal exactly, anything with a real as a real. For builtins that add, multiply, ... (sum, add_into, pow).
+bool number_arith(char op, const Value& a, const Value& b, Value& out, std::string& error) {
+  const bool an = a.type == Type::Int || a.type == Type::Real || a.type == Type::Decimal;
+  const bool bn = b.type == Type::Int || b.type == Type::Real || b.type == Type::Decimal;
+  if (!an || !bn) { error = std::string("wants numbers, got a ") + type_name(an ? b.type : a.type); return false; }
+  if (a.type == Type::Int && b.type == Type::Int && op != '/') {
+    int64_t r = 0;
+    bool over = false;
+    switch (op) {
+      case '+': over = __builtin_add_overflow(a.i, b.i, &r); break;
+      case '-': over = __builtin_sub_overflow(a.i, b.i, &r); break;
+      case '*': over = __builtin_mul_overflow(a.i, b.i, &r); break;
+      case '%':
+        if (b.i == 0) { error = "modulo by zero"; return false; }
+        r = b.i == -1 ? 0 : a.i % b.i;
+        break;
+      default: error = "unknown operator"; return false;
+    }
+    if (!over) { out = Value::integer(r); return true; }
+  }
+  if (a.type == Type::Real && b.type == Type::Real) {
+    switch (op) {
+      case '+': out = Value::real(a.d + b.d); return true;
+      case '-': out = Value::real(a.d - b.d); return true;
+      case '*': out = Value::real(a.d * b.d); return true;
+      case '/': if (b.d == 0) { error = "division by zero"; return false; } out = Value::real(a.d / b.d); return true;
+      case '%': if (b.d == 0) { error = "modulo by zero"; return false; } out = Value::real(std::fmod(a.d, b.d)); return true;
+    }
+  }
+  return decimal_arith(op, a, b, out, error);   // exact; with a real on one side, a real
+}
+
+// pow(x, n): exact for an int or decimal raised to a whole n (2^64 is 18446744073709551616, 1.1^2 is 1.21; a negative
+// n divides, as / does); a real or a fractional exponent gives a real.
+bool number_pow(const Value& x, const Value& n, Value& out, std::string& error) {
+  const bool exact_base = x.type == Type::Int || x.type == Type::Decimal;
+  if (exact_base && n.type == Type::Int && n.i >= -1000 && n.i <= 1000) {
+    Value acc = Value::integer(1), base = x;
+    int64_t e = n.i < 0 ? -n.i : n.i;
+    while (e > 0) {   // by squaring, each step exact (past 38 digits: an error, never a wrong answer)
+      if (e & 1) { Value t; if (!number_arith('*', acc, base, t, error)) return false; acc = t; }
+      e >>= 1;
+      if (e) { Value t; if (!number_arith('*', base, base, t, error)) return false; base = t; }
+    }
+    if (n.i < 0) return number_arith('/', Value::integer(1), acc, out, error);
+    out = acc;
+    return true;
+  }
+  out = Value::real(std::pow(x.as_double(), n.as_double()));
+  return true;
+}
+
 // An int, decimal or real as an exact decimal: a real as the decimal it prints as (rounded at 30 places past that).
 bool number_exact(const Value& v, Value& out, std::string& error) {
   if (v.type == Type::Decimal) { out = v; return true; }

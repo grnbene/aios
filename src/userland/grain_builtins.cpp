@@ -498,6 +498,11 @@ Value bi_abs(Vm&, std::vector<Value>& args, std::string& error) {
     if (decimal_compare(r, Value::integer(0)) < 0) decimal_negate(args[0], r, error);
     return r;
   }
+  if (args[0].type == Type::Int && args[0].i == INT64_MIN) {   // 2^63: the exact decimal, not INT64_MIN again
+    Value r;
+    if (!number_arith('-', Value::integer(0), args[0], r, error)) return Value::nil();
+    return r;
+  }
   if (args[0].type == Type::Int) return Value::integer(args[0].i < 0 ? -args[0].i : args[0].i);
   return Value::real(std::fabs(args[0].d));
 }
@@ -544,8 +549,12 @@ Value bi_idiv(Vm&, std::vector<Value>& args, std::string& error) {
     return Value::nil();
   }
   if (args[1].i == 0) { error = "idiv(): division by zero"; return Value::nil(); }
-  // INT64_MIN / -1 traps on x86 (SIGFPE); arithmetic wraps, so it stays INT64_MIN.
-  if (args[1].i == -1) return Value::integer((int64_t)(0 - (uint64_t)args[0].i));
+  // INT64_MIN / -1 is 2^63: the exact decimal, as an overflowing - is (and the division would trap on x86).
+  if (args[1].i == -1) {
+    Value r;
+    if (!number_arith('-', Value::integer(0), args[0], r, error)) return Value::nil();
+    return r;
+  }
   return Value::integer(args[0].i / args[1].i);
 }
 
@@ -895,7 +904,9 @@ Value bi_sqrt(Vm&, std::vector<Value>& args, std::string& error) {
 
 Value bi_pow(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[0], error, "pow") || !want_number(args[1], error, "pow")) return Value::nil();
-  return Value::real(std::pow(args[0].as_double(), args[1].as_double()));
+  Value r;
+  if (!number_pow(args[0], args[1], r, error)) { error = "pow(): " + error; return Value::nil(); }
+  return r;
 }
 
 // --- the rest --------------------------------------------------------------
@@ -983,15 +994,8 @@ static bool add_into_map(MapObj* total, MapObj* rec, const std::vector<std::stri
         error = "add_into(): the total's " + where + " is a " + type_name(tv->type) + ", not a number";
         return false;
       }
-      Value sum;
-      if (tv->type == Type::Decimal || rv.type == Type::Decimal) {
-        if (!decimal_arith('+', *tv, rv, sum, error)) { error = "add_into(): " + where + ": " + error; return false; }
-      } else if (tv->type == Type::Int && rv.type == Type::Int) {
-        int64_t r = 0;
-        sum = __builtin_add_overflow(tv->i, rv.i, &r) ? Value::real((double)tv->i + (double)rv.i) : Value::integer(r);
-      } else {
-        sum = Value::real(tv->as_double() + rv.as_double());
-      }
+      Value sum;   // as + adds: exact, past 64 bits the exact decimal (it was a real), a real only with a real
+      if (!number_arith('+', *tv, rv, sum, error)) { error = "add_into(): " + where + ": " + error; return false; }
       *tv = sum;
       return true;
     }
