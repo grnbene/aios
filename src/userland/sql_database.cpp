@@ -44,6 +44,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #include "aios/crypto/sha512.hpp"
 #include "aios/userland/sql_functions.hpp"
 #include <algorithm>
+#include <charconv>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -1277,10 +1278,12 @@ std::string sql_format_double(double v, int sig) {
   char buf[64];
   if (sig > 0) snprintf(buf, sizeof(buf), "%.*e", sig - 1, v);
   else {
-    for (int p = 1; p <= 17; ++p) {
-      snprintf(buf, sizeof(buf), "%.*e", p - 1, v);
-      if (std::strtod(buf, nullptr) == v) break;
-    }
+    // The shortest digits that read back as v, correctly rounded: what trying %.1e .. %.17e until strtod gave v
+    // back found (the same digits for each of 4,000,000 doubles compared), without up to 17 printf/strtod
+    // pairs. It was most of a statement that writes doubles into a CTE: SQLDoom's renderer spent ~60% of a
+    // frame here.
+    auto r = std::to_chars(buf, buf + sizeof(buf) - 1, v, std::chars_format::scientific);
+    *r.ptr = '\0';
   }
   // buf: [-]d.ddddde[+-]XX
   std::string m(buf);
@@ -25746,6 +25749,9 @@ std::string SqlDatabase::engine_status_report() const {
 
 namespace {
 thread_local bool g_wire_results = false;
+// Set while a statement's rows only go on to be a CTE, a derived table or a LATERAL's: no one reads its printed
+// table, which for SQLDoom's renderer was tens of thousands of rows formatted per CTE, per frame.
+thread_local int g_rows_only = 0;
 thread_local SqlRowSink* g_row_sink = nullptr;        // set by the wire server for the statement about to run
 thread_local SqlRowSink* g_vx_sink = nullptr;         // handed to the one top-level single-table select of that statement
 thread_local SqlRowSink* g_join_sink = nullptr;       // ... or join, taken by the first select to start (the top one)
@@ -25755,6 +25761,10 @@ thread_local SqlRowSink* g_join_sink = nullptr;       // ... or join, taken by t
 thread_local std::shared_ptr<const SqlQueryResult>* g_shared_sink = nullptr;
 }  // namespace
 void sql_set_wire_results(bool on) { g_wire_results = on; }
+struct RowsOnly {
+  RowsOnly() { ++g_rows_only; }
+  ~RowsOnly() { --g_rows_only; }
+};
 void sql_set_row_sink(SqlRowSink* sink) { g_row_sink = sink; }
 SqlRowSink* sql_row_sink() { return g_row_sink; }
 uint64_t sql_last_insert_id() { return tls_last_insert_id; }
@@ -25769,7 +25779,7 @@ bool sql_wire_results() { return g_wire_results; }
 
 std::string SqlDatabase::format_result_table(const std::vector<std::string>& cols,
                                              const std::vector<SqlRow>& rows) const {
-  if (g_wire_results) return std::string();
+  if (g_wire_results || g_rows_only) return std::string();
   if (cols.empty()) return "Empty set";
   std::vector<size_t> widths(cols.size(), 0);
   for (size_t i = 0; i < cols.size(); ++i) widths[i] = std::max(widths[i], cols[i].size());
@@ -42926,6 +42936,7 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
     SqlQueryResult br;
     {
       OuterScope scope(&oc);
+      RowsOnly rows_only;
       br = execute_parsed_select(db, body);
     }
     if (!br.success) { *err = br.error_message; return false; }
@@ -43794,7 +43805,11 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           continue;
         }
         const std::string pushed = expanded_branch.sources.size() == 1 ? derived_pushdown_sql(expanded_branch, s) : std::string();
-        SqlQueryResult dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
+        SqlQueryResult dres;
+        {
+          RowsOnly rows_only;
+          dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
+        }
         if (!dres.success) return dres;
         if (s.column_names.size() > dres.columns.size())
           return make_error("the column list of " + s.alias + " has " + std::to_string(s.column_names.size()) + " names for " +
@@ -47786,7 +47801,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       size_t e_pos = toks[cte_body_end_tok - 1].end_pos;
       std::string cte_sql = sql.substr(s_pos, e_pos - s_pos);
 
-      SqlQueryResult res = execute_local_query(cte_sql);
+      SqlQueryResult res;
+      {
+        RowsOnly rows_only;
+        res = execute_local_query(cte_sql);
+      }
       if (!res.success) return res;
 
       SqlTable tbl;
@@ -47813,7 +47832,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       size_t rec_end = toks[cte_body_end_tok - 1].end_pos;
       std::string rec_sql = sql.substr(rec_start, rec_end - rec_start);
 
-      SqlQueryResult anchor_res = execute_local_query(anchor_sql);
+      SqlQueryResult anchor_res;
+      {
+        RowsOnly rows_only;
+        anchor_res = execute_local_query(anchor_sql);
+      }
       if (!anchor_res.success) return anchor_res;
 
       SqlTable accum_tbl;
@@ -47845,7 +47868,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         if (working_tbl.row_count() == 0) break;
         current_scope[cte_name] = std::make_shared<SqlTable>(working_tbl);
 
-        SqlQueryResult rec_res = execute_local_query(rec_sql);
+        SqlQueryResult rec_res;
+        {
+          RowsOnly rows_only;
+          rec_res = execute_local_query(rec_sql);
+        }
         if (!rec_res.success) return rec_res;
         if (rec_res.rows.empty()) break;
 

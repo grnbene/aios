@@ -28,8 +28,9 @@ pose the camera is at player 1's start:
 
 ![E1M1 from player 1's start, rendered by ASQL](e1m1-start.png)
 
-It takes about 15 s a frame (SQLDoom on CedarDB: about 13 ms). Most of that is ASQL evaluating the per-pixel
-CTEs (the floor and ceiling ones run over some 56,000 rows each, a second or two apiece).
+It takes about 6 s a frame (SQLDoom on CedarDB: about 13 ms). ASQL materializes each of the renderer's CTEs as rows
+of text before the next reads it, and the floor and ceiling chain alone is eight CTEs of some 56,000 rows; real time
+needs CTEs kept as typed columns, a change to the engine of its own.
 
 ## What differs from SQLDoom
 
