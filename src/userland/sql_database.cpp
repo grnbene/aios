@@ -4802,19 +4802,22 @@ class SqlParser {
     }
     if (depth != 0 || j >= t_.size() || t_[j].kind == Tok::End) return false;
 
-    // j is the matching `)` for the innermost `(` before SELECT.
+    // j is the matching `)` for the innermost `(` before SELECT. The `)`s right
+    // after it close the parens around that one, innermost first: when they
+    // close every `(` up to ours, the query only sits in redundant parentheses
+    // (`((SELECT ...))`). When they stop short, the paren left open holds more
+    // than the query - a join group, `(((SELECT ...)) i JOIN (...) j)` as
+    // MariaDB writes a view - unless what follows continues the query.
+    const size_t wrappers = (k - 1) - p_;   // the parens around the innermost one
+    size_t closed = 0;
+    while (j + 1 < t_.size() && t_[j + 1].kind == Tok::Punct && t_[j + 1].text == ")" && closed < wrappers) { ++j; ++closed; }
+    if (closed == wrappers && closed > 0) return true;
     if (j + 1 >= t_.size()) return false;
     const Token& next_tok = t_[j + 1];
 
     // If followed by UNION, this branch is part of a compound query, so the outer
     // `(` encloses the whole subquery.
     if (next_tok.kind == Tok::Ident && !next_tok.quoted && next_tok.up == "UNION"sv) {
-      return true;
-    }
-
-    // If followed by `)`, the inner query is enclosed in redundant parentheses
-    // (e.g. `((SELECT ...))` or `((SELECT ... UNION ...))`).
-    if (next_tok.kind == Tok::Punct && next_tok.text == ")") {
       return true;
     }
 
@@ -46956,6 +46959,23 @@ static std::string take_paren_text(SqlParser& p, const std::vector<Token>& toks,
   return b > a ? trim(sql.substr(a, b - a)) : std::string();
 }
 
+// `[GENERATED ALWAYS] AS (expr) [VIRTUAL | STORED | PERSISTENT]` at the parser's
+// position, as a column definition carries it in CREATE TABLE and in ALTER TABLE
+// ADD / MODIFY / CHANGE: consumed into col and true; false with nothing consumed
+// when not at one, and with *err set when it starts one that is malformed.
+static bool take_generated_clause(SqlParser& p, const std::vector<Token>& toks, const std::string& sql, SqlColumn& col,
+                                  std::string* err) {
+  if (!p.is_word("GENERATED") && !(p.is_word("AS") && p.is_punct("(", 1))) return false;
+  if (p.take_word("GENERATED")) p.take_word("ALWAYS");
+  if (!p.take_word("AS")) { *err = "expected AS after GENERATED ALWAYS"; return false; }
+  col.generated = take_paren_text(p, toks, sql);
+  if (col.generated.empty()) { *err = "GENERATED ALWAYS AS needs a parenthesised expression"; return false; }
+  col.generated_virtual = true;
+  if (p.take_word("STORED") || p.take_word("PERSISTENT")) col.generated_virtual = false;
+  else p.take_word("VIRTUAL");
+  return true;
+}
+
 // The hidden name a session's TEMPORARY table is stored under (see tls_temp_tables).
 static std::string temp_table_hidden_name(const std::string& visible) {
   return std::string("\x01tmp") + std::to_string((unsigned long long)SqlDatabase::current_session_id()) + "\x01" + visible;
@@ -47355,15 +47375,10 @@ SqlQueryResult SqlDatabase::execute_create_table(const std::string& sql) {
             table.checks.push_back(std::move(ck));
             continue;
           }
-          if (p.is_word("GENERATED") || (p.is_word("AS") && p.is_punct("(", 1))) {
-            if (p.take_word("GENERATED")) p.take_word("ALWAYS");
-            if (!p.take_word("AS")) return make_error("expected AS after GENERATED ALWAYS");
-            col.generated = take_paren_text(p, toks, sql);
-            if (col.generated.empty()) return make_error("GENERATED ALWAYS AS needs a parenthesised expression");
-            col.generated_virtual = true;
-            if (p.take_word("STORED") || p.take_word("PERSISTENT")) col.generated_virtual = false;
-            else p.take_word("VIRTUAL");
-            continue;
+          {
+            std::string gerr;
+            if (take_generated_clause(p, toks, sql, col, &gerr)) continue;
+            if (!gerr.empty()) return make_error(gerr);
           }
           if (p.take_word("DEFAULT")) {
             std::string derr;
@@ -48264,6 +48279,11 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
     bool at_first = false;
     std::string after_col;
     while (!p.at_end() && !p.is_punct(",") && !p.is_punct(";")) {
+      {
+        std::string gerr;
+        if (take_generated_clause(p, toks, sql, col, &gerr)) continue;
+        if (!gerr.empty()) return make_error(gerr);
+      }
       if (p.take_word("NOT")) { p.take_word("NULL"); col.not_null = true; continue; }
       if (p.take_word("NULL")) { col.not_null = false; continue; }
       if (p.take_word("AUTO_INCREMENT") || p.take_word("AUTOINCREMENT")) { col.auto_increment = true; continue; }
@@ -48324,6 +48344,21 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
     t->mutation_seq = sql_next_mutation_seq();
     t->layout_seq = t->mutation_seq;
     invalidate_table_index(t->name, t->database);
+    // A generated column is worked out for every row already there, as MariaDB
+    // fills it; one that cannot be leaves the table as it was.
+    if (!col.generated.empty()) {
+      for (size_t r = 0; r < rows; ++r) {
+        std::string rerr;
+        if (apply_row_rules(t, nullptr, r, &rerr)) continue;
+        colidx_forget(*t);
+        t->col_data.erase(t->col_data.begin() + (long)at);
+        t->columns.erase(t->columns.begin() + (long)at);
+        t->mutation_seq = sql_next_mutation_seq();
+        t->layout_seq = t->mutation_seq;
+        invalidate_table_index(t->name, t->database);
+        return make_error(rerr);
+      }
+    }
     checkpoint();
     SqlQueryResult res;
     res.formatted_table = "Column '" + col.name + "' added to '" + t->name + "'.";
@@ -48364,6 +48399,7 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
       p.take_punct(")");
     }
     SqlColumn& col = t->columns[(size_t)ci];
+    const SqlColumn col_before = col;
     col.name = new_name;
     apply_column_type(type, targs, col);
     note_enum_and_sign(p, type, tstrs, col, targs.empty());
@@ -48378,9 +48414,16 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
     col.auto_increment = false;
     col.default_value.clear();
     col.comment.clear();
+    col.generated.clear();
+    col.generated_virtual = false;
     bool m_first = false;
     std::string m_after;
     while (!p.at_end() && !p.is_punct(",") && !p.is_punct(";")) {
+      {
+        std::string gerr;
+        if (take_generated_clause(p, toks, sql, col, &gerr)) continue;
+        if (!gerr.empty()) { col = col_before; return make_error(gerr); }
+      }
       if (p.take_word("NOT")) { p.take_word("NULL"); col.not_null = true; continue; }
       if (p.take_word("NULL")) { col.not_null = false; continue; }
       if (p.take_word("AUTO_INCREMENT") || p.take_word("AUTOINCREMENT")) { col.auto_increment = true; continue; }
@@ -48398,6 +48441,25 @@ SqlQueryResult SqlDatabase::execute_alter(const std::string& sql) {
       if (p.take_word("FIRST")) { m_first = true; continue; }
       if (p.take_word("AFTER")) { if (!p.parse_name(&m_after)) return make_error(p.error()); continue; }
       p.next();
+    }
+    // Made generated, or given a new expression: every row's value worked out
+    // again. One that cannot be puts the column and its values back.
+    if (!col.generated.empty() && col.generated != col_before.generated) {
+      t->compact_delta_buffer();
+      t->ensure_columns();
+      const size_t rows = t->row_count();
+      std::vector<std::string> kept;
+      kept.reserve(rows);
+      for (size_t r = 0; r < rows; ++r) kept.push_back(t->cell(r, (size_t)ci));
+      for (size_t r = 0; r < rows; ++r) {
+        std::string rerr;
+        if (apply_row_rules(t, nullptr, r, &rerr)) continue;
+        t->columns[(size_t)ci] = col_before;
+        for (size_t k = 0; k < r; ++k) if (t->cell(k, (size_t)ci) != kept[k]) t->set_cell(k, (size_t)ci, kept[k]);
+        return make_error(rerr);
+      }
+      t->mutation_seq = sql_next_mutation_seq();
+      invalidate_table_index(t->name, t->database);
     }
     // FIRST / AFTER x: the column (its values with it) moves to that place.
     if (m_first || !m_after.empty()) {

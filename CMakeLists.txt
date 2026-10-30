@@ -543,6 +543,9 @@ target_link_libraries(aios-asql-lock-kill-check PRIVATE aios)
 add_executable(aios-asql-inline-unique-check tools/asql-inline-unique-check.cpp)
 target_link_libraries(aios-asql-inline-unique-check PRIVATE aios)
 
+add_executable(aios-asql-generated-alter-check tools/asql-generated-alter-check.cpp)
+target_link_libraries(aios-asql-generated-alter-check PRIVATE aios)
+
 # reads /proc and glibc's mallinfo2 / malloc_trim: Linux only
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(aios-asql-memory-drive tools/asql-memory-drive.cpp)
