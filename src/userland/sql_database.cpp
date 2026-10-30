@@ -7982,7 +7982,18 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
       // MariaDB prints the double's shortest digits and pads them to scale + 4 places: 285776080076.39276000,
       // not the binary expansion's ...39276123.
       std::string txt = sql_format_double(r, 0);
-      if (txt.find_first_of("eE") != std::string::npos) { char eb[96]; std::snprintf(eb, sizeof eb, "%.*f", scale + 4, r); txt = eb; }
+      if (const size_t ep = txt.find_first_of("eE"); ep != std::string::npos && std::atoi(txt.c_str() + ep + 1) > 0) {
+        // a big one in full, its shortest digits then zeros: 1024819108047807500.0000, as MariaDB writes it - not the
+        // binary expansion's ...807488
+        const bool neg = txt[0] == '-';
+        std::string digits;
+        for (size_t i = neg ? 1 : 0; i < ep; ++i) if (txt[i] != '.') digits += txt[i];
+        const int whole = std::atoi(txt.c_str() + ep + 1) + 1;   // digits before the point
+        if ((int)digits.size() < whole) digits.append((size_t)(whole - (int)digits.size()), '0');
+        txt = (neg ? "-" : "") + digits.substr(0, (size_t)whole) + ((int)digits.size() > whole ? "." + digits.substr((size_t)whole) : "");
+      } else if (ep != std::string::npos) {
+        char eb[96]; std::snprintf(eb, sizeof eb, "%.*f", scale + 4, r); txt = eb;
+      }
       size_t dot = txt.find('.');
       if (dot == std::string::npos) { txt += '.'; dot = txt.size() - 1; }
       const size_t places = txt.size() - dot - 1;
@@ -12261,9 +12272,11 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
           const AIOS_INT128 i64max = (AIOS_INT128)INT64_MAX, i64min = (AIOS_INT128)INT64_MIN;
           const AIOS_INT128 u64max = ((AIOS_INT128)1 << 64) - 1;
           const bool uns = a > i64max || b > i64max;
+          // An operand past UNSIGNED BIGINT's range is no BIGINT: a literal or DECIMAL that wide is a DECIMAL to
+          // MariaDB, and its sum or product is exact (99999999999999999999 + 0), never error 1690.
+          const bool wide = a > u64max || a < i64min || b > u64max || b < i64min;
           AIOS_INT128 res = e->op == ExprOp::Add ? a + b : e->op == ExprOp::Sub ? a - b : a * b;
-          const bool big = a > u64max || a < i64min || b > u64max || b < i64min ||   // past 128-bit arithmetic's safe range
-                           (uns ? (res > u64max || res < 0) : (res > i64max || res < i64min));
+          const bool big = !wide && (uns ? (res > u64max || res < 0) : (res > i64max || res < i64min));
           if (big) {
             ctx_fail(ctx, "BIGINT value is out of range in '" + (e->source_text.empty() ? std::string("expression") : e->source_text) + "'");
             return val_null();
@@ -46156,6 +46169,12 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
     SqlQueryResult next_res = execute_parsed_select_single(db, stmt.branches[u + 1]);
     if (!next_res.success) return next_res;
     const uint8_t kind = u < stmt.union_kind.size() ? stmt.union_kind[u] : 0;
+    // A column that is a DOUBLE in any branch is a DOUBLE: MariaDB's type for DECIMAL beside DOUBLE (and INT beside
+    // DOUBLE). Marked here, its values written as doubles after the rows are in (below).
+    for (size_t ci = 0; ci < res.column_types.size() && ci < next_res.column_types.size(); ++ci)
+      if (next_res.column_types[ci] == SqlDataType::Real &&
+          (res.column_types[ci] == SqlDataType::Decimal || res.column_types[ci] == SqlDataType::Int))
+        res.column_types[ci] = SqlDataType::Real;
 
     if (kind != 0) {
       // INTERSECT / EXCEPT: the left rows that have (or have no) match on the
@@ -46203,10 +46222,32 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
       // x incoming) nested scan. A view with two ~100k-300k row branches (the
       // mixedinventory shape) made the old nested loop take tens of billions
       // of string comparisons and never finish.
-      auto row_key = [](const SqlRow& row) {
+      // A number column keys by the number, not its text: -2.50 and -2.5000 are one row, as MariaDB has them (both
+      // are the column's DECIMAL(..,4) by then).
+      std::vector<bool> numeric_col(res.columns.size(), false);
+      for (size_t ci = 0; ci < numeric_col.size() && ci < res.column_types.size(); ++ci) {
+        const SqlDataType t = res.column_types[ci];
+        const SqlDataType nt = ci < next_res.column_types.size() ? next_res.column_types[ci] : t;
+        numeric_col[ci] = (t == SqlDataType::Decimal || t == SqlDataType::Int || t == SqlDataType::Real) &&
+                          (nt == SqlDataType::Decimal || nt == SqlDataType::Int || nt == SqlDataType::Real);
+      }
+      auto row_key = [&numeric_col](const SqlRow& row) {
         std::string key;
-        for (const auto& v : row.values) {
-          append_collate_key(key, sql_display(v));
+        for (size_t ci = 0; ci < row.values.size(); ++ci) {
+          const std::string& v = row.values[ci];
+          double d = 0;
+          if (ci < numeric_col.size() && numeric_col[ci] && !sql_is_null(v) && v.find_first_of("eE") == std::string::npos &&
+              parse_number(v, &d)) {
+            std::string n = v;   // canonical: no trailing zeros after the point, no point left bare, no -0
+            if (n.find('.') != std::string::npos) {
+              while (!n.empty() && n.back() == '0') n.pop_back();
+              if (!n.empty() && n.back() == '.') n.pop_back();
+            }
+            if (n == "-0") n = "0";
+            key += n;
+          } else {
+            append_collate_key(key, sql_display(v));
+          }
           key += '\x01';
         }
         return key;
@@ -46233,6 +46274,19 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
         if (seen.insert(row_key(r)).second) {
           res.rows.push_back(std::move(r));
         }
+      }
+    }
+  }
+
+  // A DOUBLE column of a union writes every value as a double, a DECIMAL branch's too: 2.67 and 1, not 2.6700000
+  // and 1.0000000.
+  if (stmt.branches.size() > 1) {
+    for (size_t ci = 0; ci < res.columns.size() && ci < res.column_types.size(); ++ci) {
+      if (res.column_types[ci] != SqlDataType::Real) continue;
+      for (auto& r : res.rows) {
+        if (ci >= r.values.size() || sql_is_null(r.values[ci])) continue;
+        double d = 0;
+        if (parse_number(r.values[ci], &d)) r.values[ci] = sql_format_double(d, 0);
       }
     }
   }
