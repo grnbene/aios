@@ -131,6 +131,8 @@ add_test(NAME grain.lang.jpeg.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=
 add_test(NAME grain.lang.for_range COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_for_range.gr)
 add_test(NAME grain.lang.for_range.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_for_range.gr)
 add_test(NAME grain.lang.empty_blocks COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_empty_blocks.gr)
+add_test(NAME grain.lang.mod_const COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_mod_const.gr)
+add_test(NAME grain.lang.mod_const.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_mod_const.gr)
 add_test(NAME grain.lang.text_builtins COMMAND ${CMAKE_COMMAND} -E env GRAIN_TEST_EMPTY= GRAIN_TEST_SECRET_FILE=${CMAKE_CURRENT_BINARY_DIR}/text_builtins.secret $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 add_test(NAME grain.lang.text_builtins.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 

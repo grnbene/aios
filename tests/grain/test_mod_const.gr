@@ -1,0 +1,20 @@
+// x % k with k written as a constant: the JIT works it out by multiplying when the divisor is k. Each line
+// checks that against the same divisor held in a variable (always idiv), for n from the int64 limits to small.
+fn check(c, msg) { assert_true(c, msg) }
+let ns = [0, 1, -1, 2, -2, 6, 7, 8, -7, -8, 13, 99, 100, 101, -101, 12345, -12345, 2147483647, -2147483648, 4294967296,
+          9223372036854775807, -9223372036854775807 - 1, 9223372036854775806, -9223372036854775807, 1000000007 * 3 + 5, -(1000000007 * 3 + 5)]
+fn by_const(n) {
+  return [n % 2, n % 3, n % 5, n % 7, n % 9, n % 10, n % 13, n % 50, n % 100, n % 1000, n % 1024, n % 65536, n % 2147483648, n % 4294967295, n % 1000000007, n % 4611686018427387904, n % 9223372036854775807]
+}
+fn by_var(n, ds) { let out = []; for d in ds { push(out, n % d) }; return out }
+let ds = [2, 3, 5, 7, 9, 10, 13, 50, 100, 1000, 1024, 65536, 2147483648, 4294967295, 1000000007, 4611686018427387904, 9223372036854775807]
+for n in ns { check(by_const(n) == by_var(n, ds), "n = " + str(n) + ": " + str(by_const(n)) + " vs " + str(by_var(n, ds))) }
+let x = 0
+for i in -500..500 { check(i % 7 == by_var(i, [7])[0] and i % 10 == by_var(i, [10])[0] and i % 1024 == by_var(i, [1024])[0], "i = " + str(i)) }
+// a jump that lands on % with a divisor that is not the constant written just before it
+fn pick(n, c) { return n % (c ? 3 : 5) }
+check(pick(17, true) == 2 and pick(17, false) == 2 and pick(19, false) == 4 and pick(19, true) == 1, "a % after a choice of divisors")
+// what the fast path never takes: 1, 0, -1 and negatives still go the old way
+check(17 % 1 == 0 and 17 % -5 == 2 and -17 % -5 == -2, "1 and negative divisors")
+check(!try_call(fn () { return 5 % 0 }).ok, "division by zero is still an error")
+print("PASS: test_mod_const")
