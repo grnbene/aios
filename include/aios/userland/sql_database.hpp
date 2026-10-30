@@ -3775,7 +3775,6 @@ class SqlDatabase {
 
   // Dynamic virtual table builder for MySQL information_schema compatibility (Navicat, DBeaver, Workbench)
   SqlTable build_info_schema_table(const std::string& table_name) const;
-  mutable std::unordered_map<std::string, SqlTable> info_schema_cache_;
   // information_schema.columns, built once per schema shape: rebuilding it
   // on every reference (every column of every table - 17 ms on the ST mirror)
   // was the ERP's "does this column exist" check, once per getOpenCredits.

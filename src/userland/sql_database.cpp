@@ -167,6 +167,17 @@ struct LockWait {
 };
 thread_local LockWait tls_lock_wait;
 
+// information_schema / mysql.user tables are rebuilt on every reference. They used to go into one
+// shared map (info_schema_cache_) that every connection thread overwrote unguarded: two connections
+// reading information_schema.tables at once freed each other's copy (SIGABRT, "pointer being freed
+// was not allocated" in ~ColumnStore). Each thread now keeps its own copy, keyed by database.
+static SqlTable* tls_info_schema_slot(const void* db, const std::string& key, SqlTable&& built) {
+  static thread_local std::unordered_map<std::string, SqlTable> cache;
+  SqlTable& slot = cache[std::to_string(reinterpret_cast<uintptr_t>(db)) + "|" + key];
+  slot = std::move(built);
+  return &slot;
+}
+
 // A stored program as the catalog holds it (sql_programs.inc parses and runs it).
 struct SqlDatabase::StoredProgram {
   char kind = 'P';                   // P procedure, F function, T trigger, E event
@@ -15331,9 +15342,13 @@ void DictArena::block_upto(size_t upto, uint8_t codec, uint32_t per_block) {
       blocks_.pop_back();
     }
   }
-  const size_t plain_wanted = upto - pfirst_;                      // plain entries asked for
+  // The reopened entries sit between the blocks (pfirst_ now ends there) and the plain ones: the plain entries
+  // start head.size() further on. Counted from pfirst_ alone, the reopened ones were counted twice, and the
+  // blocking asked for more plain entries than there were, reading past offs_.
+  const size_t plain_first = pfirst_ + head.size();
+  const size_t plain_wanted = upto - plain_first;                  // plain entries asked for
   const size_t all = head.size() + plain_wanted;
-  const size_t sealed = upto == size() ? all : (all / per_block_) * per_block_;
+  const size_t sealed = upto == size() + head.size() ? all : (all / per_block_) * per_block_;
   if (sealed <= head.size()) {   // not even a block's worth with the reopened ones: put them back as they were
     if (!head.empty()) {
       std::vector<char> raw;
@@ -21992,12 +22007,10 @@ SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::string&
 
   if (want_db == "information_schema") {
     if (want_tbl == "columns") return const_cast<SqlTable*>(info_schema_columns());
-    info_schema_cache_[want_tbl] = build_info_schema_table(want_tbl);
-    return &info_schema_cache_[want_tbl];
+    return tls_info_schema_slot(this, want_tbl, build_info_schema_table(want_tbl));
   }
   if (want_db == "mysql" && want_tbl == "user" && !tables_.count(make_table_key(target_db, target_table))) {
-    info_schema_cache_["mysql.user"] = build_mysql_user_table();
-    return &info_schema_cache_["mysql.user"];
+    return tls_info_schema_slot(this, "mysql.user", build_mysql_user_table());
   }
 
   // Tenant isolation: an unqualified FROM <table> (either target_db came out
@@ -22152,12 +22165,10 @@ const SqlTable* SqlDatabase::resolve_table(const std::string& name, const std::s
 
   if (want_db == "information_schema") {
     if (want_tbl == "columns") return const_cast<SqlTable*>(info_schema_columns());
-    info_schema_cache_[want_tbl] = build_info_schema_table(want_tbl);
-    return &info_schema_cache_[want_tbl];
+    return tls_info_schema_slot(this, want_tbl, build_info_schema_table(want_tbl));
   }
   if (want_db == "mysql" && want_tbl == "user" && !tables_.count(make_table_key(target_db, target_table))) {
-    info_schema_cache_["mysql.user"] = build_mysql_user_table();
-    return &info_schema_cache_["mysql.user"];
+    return tls_info_schema_slot(this, "mysql.user", build_mysql_user_table());
   }
 
   std::string key = make_table_key(target_db, target_table);
@@ -28430,6 +28441,12 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       SqlQueryResult r;
       r.formatted_table = std::to_string(pairs.size()) + " table(s) renamed.";
       return r;
+    }
+    if (verb == "DO" && toks.size() > 1) {
+      // DO expr[, expr]: evaluated for its effect (RELEASE_LOCK, GET_LOCK, SLEEP), result discarded.
+      SqlQueryResult r = execute_select("SELECT " + q.substr(toks[1].start_pos));
+      if (!r.success) return r;
+      return SqlQueryResult();
     }
     return make_error("unsupported statement: " + toks[0].text);
   };

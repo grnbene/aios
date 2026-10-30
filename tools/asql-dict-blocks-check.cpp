@@ -39,7 +39,36 @@ static std::string payload(std::mt19937_64& rng, size_t k) {
   return s;
 }
 
+// A blocked dictionary blocked again after values were added, as a replica's checkpoints do: the short last block
+// is reopened and its entries go first. They were counted twice, so the blocking asked for more plain entries than
+// there were and read past the offsets (the cleve hub's SIGBUS in block_upto, 2026-10-30). Rounds of appends and
+// blockings at random points, every entry read back after each.
+static void reblocking_rounds() {
+  std::mt19937_64 rng(11);
+  size_t bad_rounds = 0, rounds = 0;
+  for (int trial = 0; trial < 200; ++trial) {
+    DictArena d;
+    std::vector<std::string> model;
+    const uint32_t per_block = 1 + (uint32_t)(rng() % 70);
+    const uint8_t codec = rng() % 2 ? DictArena::kBlockLz4 : DictArena::kBlockDeflate;
+    for (int round = 0; round < 12; ++round, ++rounds) {
+      const size_t add = rng() % 3 == 0 ? rng() % 4 : rng() % 200;
+      for (size_t i = 0; i < add; ++i) {
+        model.push_back("v" + std::to_string(model.size()) + std::string(rng() % 40, 'x'));
+        d.push_back(model.back());
+      }
+      const size_t upto = rng() % 2 ? model.size() : (model.empty() ? 0 : rng() % (model.size() + 1));
+      d.block_upto(upto, codec, per_block);
+      bool ok = d.size() == model.size();
+      for (size_t k = 0; ok && k < model.size(); ++k) ok = d.view(k) == model[k];
+      if (!ok) ++bad_rounds;
+    }
+  }
+  OK(bad_rounds == 0, "a blocked dictionary blocked again after appends: %zu rounds, %zu with an entry not as written", rounds, bad_rounds);
+}
+
 int main() {
+  reblocking_rounds();
   KernelConfig cfg;
   cfg.root = "/tmp/aios-asql-dict-blocks-test";
   auto k = Kernel::boot(cfg);
