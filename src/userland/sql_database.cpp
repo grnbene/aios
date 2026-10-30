@@ -3352,6 +3352,14 @@ struct ParsedSelectBranch {
     // ephemeral table, the same way a non-mergeable view is.
     std::string subquery_sql;
     bool is_derived() const { return !subquery_sql.empty(); }
+    // LATERAL (SELECT ...) t: the derived table reads the sources before it (materialize_lateral). A
+    // generate_series(...) in FROM can too, as in PostgreSQL, LATERAL written or not.
+    bool lateral = false;
+    // generate_series(start, stop [, step]) in FROM: the arguments' text. Made natively (materialize_series);
+    // subquery_sql holds `SELECT * FROM generate_series(...)` for whatever reads a derived table as text.
+    std::string series_args;
+    // `(...) AS t(a, b)`, `generate_series(...) AS g(n)`: its columns' names, in order.
+    std::vector<std::string> column_names;
     // `JOIN t USING (a, b)` / `NATURAL JOIN t`: the join's columns, turned into
     // its ON once each source's columns are known (resolve_using_joins).
     std::vector<std::string> using_cols;
@@ -3380,6 +3388,9 @@ struct ParsedSelectStatement {
   // `(SELECT ..) UNION (SELECT ..) ORDER BY .. LIMIT ..`: the ORDER BY / LIMIT
   // after a parenthesised last branch belongs to the whole union, not to it.
   std::string union_tail;
+  // A statement that opens with WITH: the whole text, run as one (execute_with makes its CTEs, then the SELECT
+  // after them, which is what `branches` describe - their sources name those CTEs, not stored tables).
+  std::string with_sql;
   std::string error;
   bool ok = false;
 };
@@ -3389,6 +3400,7 @@ struct ParsedSelectStatement {
 struct OuterMemoRef { size_t depth, src, col; };
 
 struct RowInSet;   // a row-value IN's subquery rows (below)
+struct LateralKeys;   // a LATERAL table's outer values (below)
 struct SqlExpr {
   ExprOp op = ExprOp::Literal;
   Val literal;                 // for Literal
@@ -3428,6 +3440,8 @@ struct SqlExpr {
   mutable std::shared_ptr<ParsedSelectStatement> parsed_subquery;
   // (a, b) IN (SELECT x, y ...): the subquery's rows, kept once it is known to read nothing from outside.
   mutable std::shared_ptr<const RowInSet> row_in_set;
+  // __LATKEY(...): the outer values a LATERAL table was made for, each to the key its rows carry.
+  std::shared_ptr<const LateralKeys> lateral_keys;
 
   // A subquery that reads nothing from the query it sits inside has the same
   // answer for every row, so it is run once and kept. `IN (SELECT invoice FROM
@@ -4835,7 +4849,8 @@ class SqlParser {
 
   bool at_subquery() const {
     if (!is_punct("(")) return false;
-    if (is_word("SELECT", 1) || (is_word("VALUES", 1) && is_punct("(", 2))) return true;
+    // (WITH [RECURSIVE] c AS (...) SELECT ...): a subquery that opens with its own CTEs.
+    if (is_word("SELECT", 1) || is_word("WITH", 1) || (is_word("VALUES", 1) && is_punct("(", 2))) return true;
     if (!is_punct("(", 1)) return false;
 
     // We have at least two opening parens: `((...`
@@ -4844,11 +4859,11 @@ class SqlParser {
     while (k < t_.size() && t_[k].kind == Tok::Punct && t_[k].text == "(") {
       k++;
     }
-    if (k >= t_.size() || t_[k].kind != Tok::Ident || t_[k].quoted || t_[k].up != "SELECT"sv) {
+    if (k >= t_.size() || t_[k].kind != Tok::Ident || t_[k].quoted || (t_[k].up != "SELECT"sv && t_[k].up != "WITH"sv)) {
       return false;
     }
 
-    // k is at SELECT. The `(` immediately before this SELECT is at k - 1.
+    // k is at SELECT (or WITH). The `(` immediately before this SELECT is at k - 1.
     // Scan to find where the `(` at k - 1 closes.
     int depth = 1;
     size_t j = k;
@@ -4938,7 +4953,20 @@ class SqlParser {
   // A FROM/JOIN operand: a named table or a parenthesised SELECT, each
   // optionally aliased. A derived table's alias is how its columns are named,
   // so there it is required rather than optional.
+  // `AS t(a, b)`'s names, at an open '('.
+  bool parse_column_names(std::vector<std::string>* out) {
+    if (!take_punct("(")) return true;
+    do {
+      std::string c;
+      if (!parse_name(&c)) return false;
+      out->push_back(c);
+    } while (take_punct(","));
+    if (!take_punct(")")) { fail("expected ) after the column names"); return false; }
+    return true;
+  }
+
   bool parse_source_spec(ParsedSelectBranch::SourceSpec* src) {
+    src->lateral = take_word("LATERAL");
     if (at_subquery()) {
       if (!take_subquery_text(&src->subquery_sql)) {
         fail("could not read the derived table");
@@ -4951,8 +4979,26 @@ class SqlParser {
       }
       if (!parse_name(&src->alias)) return false;
       src->table_name = src->alias;
-      return true;
+      return parse_column_names(&src->column_names);
     }
+    // generate_series(start, stop [, step]) [[AS] g [(n)]]: a table function, PostgreSQL's. Its one column is
+    // named by the column list, else the alias, else generate_series.
+    if (peek().kind == Tok::Ident && !peek().quoted && peek().up == "GENERATE_SERIES"sv && is_punct("(", 1)) {
+      next();
+      if (!take_paren_text(&src->series_args)) return false;
+      src->subquery_sql = "SELECT * FROM generate_series(" + src->series_args + ")";
+      src->alias = "generate_series";
+      const bool as = take_word("AS");
+      if (peek().kind == Tok::Ident && !at_source_terminator()) {
+        if (!parse_name(&src->alias)) return false;
+      } else if (as) {
+        fail("expected a name after AS");
+        return false;
+      }
+      src->table_name = src->alias;
+      return parse_column_names(&src->column_names);
+    }
+    if (src->lateral) { fail("LATERAL takes a subquery or generate_series(...)"); return false; }
     if (!parse_name(&src->table_name)) return false;
     src->alias = src->table_name;
     if (take_word("AS")) { if (!parse_name(&src->alias)) return false; }
@@ -5663,6 +5709,39 @@ static bool merge_plain_derived(const std::string& sql, std::string* out) {
   return true;
 }
 
+// Where the statement after WITH [RECURSIVE] name [(cols)] AS (...), ... starts: the token index, or npos when the
+// CTE list is not well formed.
+static size_t with_main_select(const std::vector<Token>& toks) {
+  size_t i = 0;
+  auto word = [&](std::string_view w) { return i < toks.size() && toks[i].kind == Tok::Ident && !toks[i].quoted && toks[i].up == w; };
+  auto punct = [&](const char* c) { return i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == c; };
+  if (!word("WITH"sv)) return std::string::npos;
+  ++i;
+  if (word("RECURSIVE"sv)) ++i;
+  for (;;) {
+    if (i >= toks.size() || toks[i].kind != Tok::Ident) return std::string::npos;
+    ++i;   // the CTE's name
+    if (punct("(")) {   // its column names
+      while (i < toks.size() && !punct(")")) ++i;
+      if (!punct(")")) return std::string::npos;
+      ++i;
+    }
+    if (!word("AS"sv)) return std::string::npos;
+    ++i;
+    if (!punct("(")) return std::string::npos;
+    int depth = 0;
+    for (; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+      if (punct("(")) ++depth;
+      else if (punct(")") && --depth == 0) break;
+    }
+    if (depth != 0 || i >= toks.size()) return std::string::npos;
+    ++i;   // past its ')'
+    if (punct(",")) { ++i; continue; }
+    break;
+  }
+  return i < toks.size() && toks[i].kind != Tok::End ? i : std::string::npos;
+}
+
 ParsedSelectStatement parse_select_sql(const std::string& sql) {
   ParsedSelectStatement stmt;
   std::string clean_sql = trim(sql);
@@ -5678,6 +5757,19 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
     }
     if (balanced) clean_sql = trim(clean_sql.substr(1, clean_sql.size() - 2));
     else break;
+  }
+
+  // WITH ... SELECT (a subquery or derived table with CTEs of its own): the SELECT after the CTEs is parsed for
+  // what it is, and the whole text kept to be run.
+  if (clean_sql.size() > 5 && strncasecmp(clean_sql.c_str(), "WITH", 4) == 0 && ascii_space(clean_sql[4])) {
+    std::vector<Token> wt;
+    std::string werr;
+    if (!tokenize_sql(clean_sql, &wt, &werr)) { stmt.error = werr; return stmt; }
+    const size_t main_at = with_main_select(wt);
+    if (main_at == std::string::npos) { stmt.error = "expected the SELECT after the CTEs"; return stmt; }
+    stmt = parse_select_sql(clean_sql.substr(wt[main_at].start_pos));
+    stmt.with_sql = clean_sql;
+    return stmt;
   }
 
   {   // a filter-only derived table merged into its statement (merge_plain_derived), a few levels deep
@@ -7145,7 +7237,7 @@ using BatchPageKeys = std::function<bool(const SqlExpr* outer, std::vector<Val>*
 static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, const EvalCtx& ctx, const BatchPageKeys* page = nullptr) {
   if (!ctx.db || e->op != ExprOp::Subquery || e->subquery_sql.empty()) return nullptr;
   ParsedSelectStatement st = parse_select_sql(e->subquery_sql);
-  if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty()) return nullptr;
+  if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty() || !st.with_sql.empty()) return nullptr;
   const ParsedSelectBranch& b = st.branches[0];
   if (b.sources.size() != 1 || b.sources[0].is_derived() || !b.sources[0].using_cols.empty() || b.sources[0].natural ||
       !b.group_by.empty() || b.having || b.limit == 0 || b.offset != 0 || !b.windows.empty() || !b.where ||
@@ -7485,7 +7577,7 @@ bool fill_subquery(const SqlExpr* e, const EvalCtx& ctx, NestedResult* out) {
   // of the page's 250 ms statement.
   if (parsed->branches.size() == 1) {
     const ParsedSelectBranch& b = parsed->branches[0];
-    bool empty_base = b.sources.size() == 1 && !b.sources[0].is_derived() && b.group_by.empty() && !b.having &&
+    bool empty_base = parsed->with_sql.empty() && b.sources.size() == 1 && !b.sources[0].is_derived() && b.group_by.empty() && !b.having &&
                       b.join_conditions.empty() && !find_cte_table(b.sources[0].table_name);
     if (empty_base) {
       const SqlTable* t = ctx.db->find_table(b.sources[0].table_name);
@@ -12020,6 +12112,34 @@ struct RowInSet {
   }
 };
 
+// The outer values a LATERAL derived table was made for (materialize_lateral), each tuple to the key its rows carry
+// in the table's hidden column. __LATKEY(a.x, b.y) is that key for the row in hand - NULL when none was made for its
+// values - so the table joins back on one plain equality, which the join can hash. A tuple is read the same way on
+// both sides: NULL, a number by its canonical digits where the column is a number, else the text.
+struct LateralKeys {
+  std::vector<bool> numeric;   // per position: compared as a number
+  std::unordered_map<std::string, int64_t> ids;
+  void encode(const Val& v, size_t i, std::string* out) const {
+    if (v.null) { out->append("\x00", 1); return; }
+    out->push_back('\x01');
+    std::string t = v.str();
+    if (i < numeric.size() && numeric[i]) {
+      std::string c = canonical_decimal(t);
+      if (!c.empty()) t = std::move(c);
+    }
+    out->append(t);
+    out->push_back('\x1f');
+  }
+};
+
+Val eval_lateral_key(const SqlExpr* e, const EvalCtx& ctx) {
+  if (!e->lateral_keys) return val_null();
+  std::string key;
+  for (size_t i = 0; i < e->args.size(); ++i) e->lateral_keys->encode(eval_expr(e->args[i].get(), ctx), i, &key);
+  auto it = e->lateral_keys->ids.find(key);
+  return it == e->lateral_keys->ids.end() ? val_null() : val_num((double)it->second);
+}
+
 Val eval_row_in(const SqlExpr* e, const EvalCtx& ctx) {
   const SqlExpr* row = e->args[0].get();
   std::vector<Val> l;
@@ -12221,6 +12341,7 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
     case ExprOp::Func: {
       const std::string& up = func_upper(e);
       if (up == "__ROW_IN"sv) return eval_row_in(e, ctx);
+      if (up == "__LATKEY"sv) return eval_lateral_key(e, ctx);
       if (is_aggregate_name(up)) return eval_aggregate(e, ctx);
       Val v = eval_scalar_func(e, ctx);
       if (!v.null && v.numeric && !v.approx &&
@@ -32133,7 +32254,7 @@ bool constant_subqueries_ok(SqlDatabase* db, const SqlExpr* e, std::vector<SubTa
       std::shared_ptr<ParsedSelectStatement> sp = cached_parse(parsed, e->subquery_sql);
       st = sp.get();
     }
-    if (!st || !st->ok || st->branches.size() != 1 || !st->union_tail.empty()) return false;
+    if (!st || !st->ok || st->branches.size() != 1 || !st->union_tail.empty() || !st->with_sql.empty()) return false;
     const ParsedSelectBranch& b = st->branches[0];
     if (b.sources.empty() || !b.windows.empty() || b.items.size() != 1 || b.items[0].star || !b.items[0].expr)
       return false;
@@ -40626,7 +40747,7 @@ static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const
   const std::string& sub = ex.subquery_sql;
   if (sub.empty() || sub.find('`') != std::string::npos) return false;
   ParsedSelectStatement st = parse_select_sql(sub);
-  if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty()) return false;
+  if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty() || !st.with_sql.empty()) return false;
   const ParsedSelectBranch& b = st.branches[0];
   if (b.sources.size() != 1 || b.sources[0].is_derived() || !b.sources[0].using_cols.empty() || b.sources[0].natural ||
       !b.group_by.empty() || b.having || b.limit == 0 || b.offset != 0 || !b.windows.empty() || !b.where)
@@ -40831,6 +40952,7 @@ bool fast_in_subquery_scan(const EvalCtx& ctx, const ParsedSelectStatement& st,
 }
 
 bool fast_in_subquery(const EvalCtx& ctx, const ParsedSelectStatement& st, NestedResult* out) {
+  if (!st.with_sql.empty()) return false;   // its sources are its own CTEs
   NestedResult res;
   res.ok = true;
   if (!fast_in_subquery_scan(ctx, st, [&](size_t n) { res.first_column.reserve(n); },
@@ -42330,6 +42452,293 @@ void own_branch_exprs(ParsedSelectBranch& b) {
   for (auto& o : b.order_by) o.expr = clone_expr(o.expr);
 }
 
+// generate_series(start, stop [, step]) as a table: its arguments worked out in the scope it sits in (a LATERAL
+// one's outer row is there), its numbers in one column. A NULL argument makes no rows, as in PostgreSQL; a step of 0
+// is refused. Whole arguments give integers; with a fraction among them the numbers are decimals at the largest scale
+// written (0, 1, 0.25 gives 0.00 ... 1.00), worked out exactly as integers of that scale.
+static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const ParsedSelectBranch::SourceSpec& src, std::string* err) {
+  SqlQueryResult a = db->execute_local_query("SELECT " + src.series_args);
+  if (!a.success) { *err = a.error_message; return nullptr; }
+  if (a.columns.size() < 2 || a.columns.size() > 3 || a.rows.size() != 1) {
+    *err = "generate_series takes (start, stop [, step])";
+    return nullptr;
+  }
+  if (src.column_names.size() > 1) {
+    *err = "generate_series makes one column; " + std::to_string(src.column_names.size()) + " names given";
+    return nullptr;
+  }
+  auto t = std::make_shared<SqlTable>();
+  t->name = src.alias;
+  SqlColumn col;
+  col.name = !src.column_names.empty() ? src.column_names[0] : src.alias;
+  const std::vector<std::string>& v = a.rows[0].values;
+  bool any_null = false;
+  int scale = 0;
+  std::vector<std::string> digits;
+  for (const std::string& x : v) {
+    if (sql_is_null(x)) { any_null = true; continue; }
+    std::string c = canonical_decimal(x);
+    if (c.empty()) { *err = "generate_series takes numbers, not '" + x + "'"; return nullptr; }
+    const size_t dot = c.find('.');
+    if (dot != std::string::npos) scale = std::max(scale, (int)(c.size() - dot - 1));
+    digits.push_back(std::move(c));
+  }
+  col.type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
+  col.scale = scale;
+  t->columns.push_back(col);
+  t->ensure_columns();
+  t->inferred_types = true;
+  if (any_null) return t;
+  // Each argument as an integer count of 10^-scale.
+  auto scaled = [&](const std::string& c, long long* out) {
+    std::string w = c;
+    size_t dot = w.find('.');
+    int have = 0;
+    if (dot != std::string::npos) { have = (int)(w.size() - dot - 1); w.erase(dot, 1); }
+    w.append((size_t)(scale - have), '0');
+    errno = 0;
+    char* end = nullptr;
+    *out = std::strtoll(w.c_str(), &end, 10);
+    return errno != ERANGE && end && *end == '\0';
+  };
+  long long start = 0, stop = 0, step = 1;
+  for (int k = 0; k < scale; ++k) step *= 10;
+  if (!scaled(digits[0], &start) || !scaled(digits[1], &stop) || (digits.size() == 3 && !scaled(digits[2], &step))) {
+    *err = "generate_series: a bound past the 64-bit range";
+    return nullptr;
+  }
+  if (step == 0) { *err = "generate_series: the step cannot be 0"; return nullptr; }
+  if ((step > 0 && start > stop) || (step < 0 && start < stop)) return t;
+  const unsigned long long span = step > 0 ? (unsigned long long)(stop - start) : (unsigned long long)(start - stop);
+  const unsigned long long n = span / (unsigned long long)(step > 0 ? step : -step) + 1;
+  if (n > 100000000ull) { *err = "generate_series would make " + std::to_string(n) + " rows (100,000,000 at most)"; return nullptr; }
+  t->reserve((size_t)n);
+  auto text_of = [&](long long x) {
+    if (scale == 0) return std::to_string(x);
+    const bool neg = x < 0;
+    std::string d = std::to_string(neg ? -(x + 1) + 1ull : (unsigned long long)x);
+    if (d.size() <= (size_t)scale) d.insert(0, (size_t)scale + 1 - d.size(), '0');
+    d.insert(d.size() - (size_t)scale, ".");
+    return neg ? "-" + d : d;
+  };
+  long long x = start;
+  for (unsigned long long i = 0; i < n; ++i, x += step) t->append_row(SqlRow{{text_of(x)}});
+  return t;
+}
+
+// LATERAL (SELECT ...) t / generate_series(<reads an earlier source>): a derived table that reads the sources before
+// it. Made once for each distinct value of the earlier columns its text names - `alias.col` of an earlier source, or a
+// bare name an earlier source has as a column (a superset of what it reads: never too few) - with those values as
+// the outer row its run sees. Its rows go into one table with a hidden key column, and the join it sits in gets
+// `t.__lateral_key = __LATKEY(those columns)`: one equality, hashed like any other, that pairs each earlier row with
+// the rows made for its values (none: CROSS drops the row, LEFT pads it). Null when it names no earlier column - an
+// ordinary derived table then.
+static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSelectBranch& b, size_t idx, std::string* err) {
+  ParsedSelectBranch::SourceSpec& src = b.sources[idx];
+  std::vector<const SqlTable*> before(idx, nullptr);
+  auto alias_of = [&](size_t k) {
+    const auto& o = b.sources[k];
+    return last_name_part(o.alias.empty() ? o.table_name : o.alias);
+  };
+  for (size_t k = 0; k < idx; ++k) {
+    before[k] = SelectEngine::resolve_table(db, b.sources[k].table_name);
+    if (!before[k]) { *err = "table not found: " + b.sources[k].table_name; return nullptr; }
+  }
+  struct Ref { size_t src; std::string col; };
+  std::vector<Ref> refs;
+  auto add = [&](size_t k, const std::string& name) {
+    const int ci = before[k]->get_column_index(name);
+    if (ci < 0 || (size_t)ci >= before[k]->columns.size() - before[k]->hidden_columns) return;
+    const std::string& col = before[k]->columns[(size_t)ci].name;
+    for (const Ref& r : refs) if (r.src == k && lower_of(r.col) == lower_of(col)) return;
+    refs.push_back({k, col});
+  };
+  {
+    const std::string& text = src.series_args.empty() ? src.subquery_sql : src.series_args;
+    std::vector<Token> toks;
+    std::string terr;
+    if (!tokenize_sql(text, &toks, &terr)) { *err = terr; return nullptr; }
+    auto punct = [&](size_t i, const char* c) { return i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == c; };
+    for (size_t i = 0; i < toks.size(); ++i) {
+      if (toks[i].kind != Tok::Ident) continue;
+      if (punct(i + 1, ".") && i + 2 < toks.size() && toks[i + 2].kind == Tok::Ident) {
+        for (size_t k = 0; k < idx; ++k) if (lower_of(alias_of(k)) == lower_of(toks[i].text)) add(k, toks[i + 2].text);
+        i += 2;
+        continue;
+      }
+      if ((i > 0 && punct(i - 1, ".")) || punct(i + 1, "(")) continue;   // a qualified name's tail, a function
+      for (size_t k = 0; k < idx; ++k) add(k, toks[i].text);
+    }
+  }
+  if (refs.empty()) return nullptr;
+
+  // The distinct values of those columns over the earlier sources (their joins; the WHERE comes later).
+  ParsedSelectBranch kb;
+  kb.sources.assign(b.sources.begin(), b.sources.begin() + (long)idx);
+  for (size_t k = 0; k + 1 < idx; ++k) {
+    kb.join_conditions.push_back(k < b.join_conditions.size() ? b.join_conditions[k] : nullptr);
+    kb.join_is_left.push_back(k < b.join_is_left.size() && b.join_is_left[k]);
+    kb.join_is_right.push_back(k < b.join_is_right.size() && b.join_is_right[k]);
+  }
+  auto column_expr = [&](size_t k, const std::string& col) {
+    auto c = std::make_shared<SqlExpr>();
+    c->op = ExprOp::Column;
+    c->qualifier = alias_of(k);
+    c->name = col;
+    c->source_text = c->qualifier + "." + col;
+    return c;
+  };
+  for (size_t j = 0; j < refs.size(); ++j) {
+    SelectItem it;
+    it.expr = column_expr(refs[j].src, refs[j].col);
+    it.label = "k" + std::to_string(j);
+    kb.items.push_back(std::move(it));
+  }
+  kb.distinct = true;
+  SqlQueryResult kr = execute_parsed_select_single(db, kb);
+  if (!kr.success) { *err = kr.error_message; return nullptr; }
+
+  auto keys = std::make_shared<LateralKeys>();
+  for (size_t j = 0; j < refs.size(); ++j)
+    keys->numeric.push_back(j < kr.column_types.size() && sql_type_numeric(kr.column_types[j]));
+
+  // The outer row each run sees: one table per earlier source it reads, holding the values of the key in hand.
+  std::vector<std::shared_ptr<SqlTable>> fakes;
+  std::vector<QuerySource> fsrc;
+  std::vector<std::pair<size_t, size_t>> at(refs.size());   // ref j -> (fake table, its column)
+  for (size_t j = 0; j < refs.size(); ++j) {
+    size_t f = 0;
+    for (; f < fsrc.size(); ++f) if (lower_of(fsrc[f].alias) == lower_of(alias_of(refs[j].src))) break;
+    if (f == fsrc.size()) {
+      auto t = std::make_shared<SqlTable>();
+      t->name = alias_of(refs[j].src);
+      t->inferred_types = true;
+      fakes.push_back(t);
+      QuerySource qs;
+      qs.alias = t->name;
+      fsrc.push_back(qs);
+    }
+    SqlColumn c;
+    const int ci = before[refs[j].src]->get_column_index(refs[j].col);
+    c = before[refs[j].src]->columns[(size_t)ci];
+    c.is_primary_key = false;
+    c.auto_increment = false;
+    at[j] = {f, fakes[f]->columns.size()};
+    fakes[f]->columns.push_back(c);
+  }
+  for (size_t f = 0; f < fakes.size(); ++f) {
+    fakes[f]->ensure_columns();
+    fsrc[f].table = fakes[f].get();
+  }
+  JoinedRow jr;
+  jr.parts.assign(fsrc.size(), 0);
+  EvalCtx oc;
+  oc.db = db;
+  oc.sources = &fsrc;
+  oc.row = &jr;
+
+  const ParsedSelectStatement body = parse_select_sql(src.subquery_sql);
+  if (!body.ok) { *err = body.error.empty() ? std::string("could not read the LATERAL subquery") : body.error; return nullptr; }
+  std::vector<std::string> names;
+  std::vector<SqlDataType> types;
+  std::vector<uint8_t> is_string;
+  std::vector<SqlRow> rows;
+  bool have_columns = false;
+  auto run_for = [&](const std::vector<std::string>* key_vals, int64_t id) -> bool {
+    for (size_t f = 0; f < fakes.size(); ++f) {
+      fakes[f]->clear_rows();
+      fakes[f]->ensure_columns();
+      SqlRow r;
+      r.values.assign(fakes[f]->columns.size(), std::string());
+      fakes[f]->append_row(r);
+    }
+    for (size_t j = 0; j < refs.size(); ++j)
+      fakes[at[j].first]->set_cell(0, at[j].second, key_vals ? (*key_vals)[j] : sql_null());
+    SqlQueryResult br;
+    {
+      OuterScope scope(&oc);
+      br = execute_parsed_select(db, body);
+    }
+    if (!br.success) { *err = br.error_message; return false; }
+    if (!have_columns) {
+      names = br.columns;
+      types = br.column_types;
+      is_string = br.column_is_string;
+      have_columns = true;
+    }
+    if (!key_vals) return true;
+    for (SqlRow& r : br.rows) {
+      r.values.resize(names.size());
+      r.values.push_back(std::to_string(id));
+      rows.push_back(std::move(r));
+    }
+    return true;
+  };
+  for (size_t r = 0; r < kr.rows.size(); ++r) {
+    const std::vector<std::string>& kv = kr.rows[r].values;
+    std::string key;
+    for (size_t j = 0; j < refs.size(); ++j) {
+      const std::string& cell = j < kv.size() ? kv[j] : sql_null();
+      keys->encode(sql_is_null(cell) ? val_null() : (keys->numeric[j] ? val_cell(cell) : val_text(cell)), j, &key);
+    }
+    if (!keys->ids.emplace(key, (int64_t)r).second) continue;   // the same values again (1 and 1.0): made once
+    if (!run_for(&kv, (int64_t)r)) return nullptr;
+  }
+  if (!have_columns && !run_for(nullptr, 0)) return nullptr;   // no earlier rows: its columns, from a run on NULLs
+
+  if (src.column_names.size() > names.size()) {
+    *err = "the column list of " + src.alias + " has " + std::to_string(src.column_names.size()) + " names for " +
+           std::to_string(names.size()) + " columns";
+    return nullptr;
+  }
+  auto t = std::make_shared<SqlTable>();
+  t->name = src.alias;
+  for (size_t c = 0; c < names.size(); ++c) {
+    SqlColumn col;
+    col.name = c < src.column_names.size() ? src.column_names[c] : names[c];
+    col.type = c < types.size() ? types[c] : SqlDataType::Text;
+    col.declared_text = c < is_string.size() && is_string[c];
+    t->columns.push_back(col);
+  }
+  fit_decimal_scales(t->columns, rows);
+  SqlColumn key_col;
+  key_col.name = "__lateral_key";
+  key_col.type = SqlDataType::Int;
+  t->columns.push_back(key_col);
+  t->hidden_columns = 1;
+  t->ensure_columns();
+  t->reserve(rows.size());
+  for (const SqlRow& r : rows) t->append_row(r);
+  t->inferred_types = true;
+
+  // ON ... AND t.__lateral_key = __LATKEY(<the earlier columns>)
+  auto keycol = std::make_shared<SqlExpr>();
+  keycol->op = ExprOp::Column;
+  keycol->qualifier = src.alias;
+  keycol->name = "__lateral_key";
+  keycol->source_text = src.alias + ".__lateral_key";
+  auto fn = std::make_shared<SqlExpr>();
+  fn->op = ExprOp::Func;
+  fn->name = "__LATKEY";
+  for (const Ref& r : refs) fn->args.push_back(column_expr(r.src, r.col));
+  fn->lateral_keys = keys;
+  fn->source_text = "__LATKEY(...)";
+  auto eq = std::make_shared<SqlExpr>();
+  eq->op = ExprOp::Eq;
+  eq->args = {keycol, fn};
+  if (b.join_conditions.size() < idx) b.join_conditions.resize(idx);
+  ExprPtr& on = b.join_conditions[idx - 1];
+  if (on) {
+    auto both = std::make_shared<SqlExpr>();
+    both->op = ExprOp::And;
+    both->args = {on, eq};
+    on = both;
+  } else {
+    on = eq;
+  }
+  return t;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -43087,11 +43496,39 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         branch_ptr = &expanded_branch;
         branched = true;
       }
-      for (auto& s : expanded_branch.sources) {
+      for (size_t si = 0; si < expanded_branch.sources.size(); ++si) {
+        auto& s = expanded_branch.sources[si];
         if (!s.is_derived()) continue;
+        // LATERAL, or a generate_series that reads an earlier source: made per earlier value (materialize_lateral).
+        std::shared_ptr<SqlTable> made;
+        if (si > 0 && (s.lateral || !s.series_args.empty())) {
+          std::string lerr;
+          made = materialize_lateral(db, expanded_branch, si, &lerr);
+          if (!lerr.empty()) return make_error(lerr);
+        }
+        if (!made && !s.series_args.empty()) {
+          std::string serr;
+          made = materialize_series(db, s, &serr);
+          if (!made) return make_error(serr);
+        }
+        if (made) {
+          SelectEngine::push_cte_scope(db);
+          SelectEngine::add_cte_table(db, made->name, made);
+          ephem_guard.frames++;
+          s.table_name = s.alias;
+          s.subquery_sql.clear();
+          s.series_args.clear();
+          s.lateral = false;
+          ephem_tables.push_back(std::move(made));
+          continue;
+        }
         const std::string pushed = expanded_branch.sources.size() == 1 ? derived_pushdown_sql(expanded_branch, s) : std::string();
         SqlQueryResult dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
         if (!dres.success) return dres;
+        if (s.column_names.size() > dres.columns.size())
+          return make_error("the column list of " + s.alias + " has " + std::to_string(s.column_names.size()) + " names for " +
+                            std::to_string(dres.columns.size()) + " columns");
+        for (size_t ci = 0; ci < s.column_names.size(); ++ci) dres.columns[ci] = s.column_names[ci];   // AS t(a, b)
 
         auto ephem = std::make_unique<SqlTable>();
         ephem->name = s.alias;
@@ -43115,6 +43552,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         ephem_guard.frames++;
         s.table_name = s.alias;
         s.subquery_sql.clear();
+        s.lateral = false;
         ephem_tables.push_back(std::move(shared_ephem));
       }
     }
@@ -45197,7 +45635,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         continue;
       }
       const size_t first = expanded.size();
-      for (size_t ci = 0; ci < s.table->columns.size(); ++ci) {
+      const size_t shown = s.table->columns.size() - std::min(s.table->hidden_columns, s.table->columns.size());
+      for (size_t ci = 0; ci < shown; ++ci) {
         const SqlColumn& c = s.table->columns[ci];
         SelectItem col;
         auto e = std::make_shared<SqlExpr>();
@@ -46488,6 +46927,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
 SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatement& stmt) {
   if (!stmt.ok) return make_error(stmt.error.empty() ? "invalid select" : stmt.error);
+  // Its own CTEs first: the whole statement through execute_with, in the scope this one runs in (a correlated
+  // subquery's outer row is still there for the CTEs and the SELECT to read).
+  if (!stmt.with_sql.empty()) return db->execute_local_query(stmt.with_sql);
   if (stmt.branches.empty()) return make_error("expected SELECT");
   if (stmt.branches.size() == 1) {
     return execute_parsed_select_single(db, stmt.branches[0]);

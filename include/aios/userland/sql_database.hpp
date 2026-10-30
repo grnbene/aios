@@ -2422,6 +2422,8 @@ struct SqlTable {
   // column types were inferred, not declared, so a "text" column may really
   // hold numbers and keeps the look-at-the-value reading.
   bool inferred_types = false;
+  // Trailing columns `*` leaves out: a LATERAL derived table's join key, which the engine adds and no query names.
+  size_t hidden_columns = 0;
   std::string database = "aios_db";
   std::vector<SqlColumn> columns;
   mutable std::vector<ColumnStore> col_data;
