@@ -13,6 +13,8 @@
 // thread, like tcp_recv: ws_recv waits at most its timeout. Messages are capped at 16 MB.
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -275,6 +277,85 @@ Value bi_ws_upgrade(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Extern, std::make_shared<ExternObj>(kWs, h));
 }
 
+// ---- a route's own request as a websocket (ws_accept) ------------------------------------------------
+
+// The server's connection, lent for as long as the route runs.
+struct Lent {
+  std::mutex mu;
+  std::shared_ptr<hal::Connection> conn;   // null once withdrawn
+  bool taken = false;
+};
+std::mutex g_lent_mu;
+std::map<std::string, std::shared_ptr<Lent>> g_lent;
+
+// What a websocket made by ws_accept reads and writes through: the lent connection while it is lent.
+class LentConn final : public hal::Connection {
+ public:
+  explicit LentConn(std::shared_ptr<Lent> l) : l_(std::move(l)) {}
+  bool send_all(ByteSpan data) override { std::lock_guard<std::mutex> lk(l_->mu); return l_->conn && l_->conn->send_all(data); }
+  bool recv_all(MutableByteSpan data, int timeout_ms) override { std::lock_guard<std::mutex> lk(l_->mu); return l_->conn && l_->conn->recv_all(data, timeout_ms); }
+  long recv_some(MutableByteSpan data, int timeout_ms) override { std::lock_guard<std::mutex> lk(l_->mu); return l_->conn ? l_->conn->recv_some(data, timeout_ms) : -1; }
+  std::string peer() const override { std::lock_guard<std::mutex> lk(l_->mu); return l_->conn ? l_->conn->peer() : ""; }
+  bool alive() const override { std::lock_guard<std::mutex> lk(l_->mu); return l_->conn && l_->conn->alive(); }
+  void close() override {}   // the server closes it when the route is done
+ private:
+  std::shared_ptr<Lent> l_;
+};
+
+std::string header_of(MapObj* req, const char* name) {
+  Value* hs = req->find("headers");
+  if (!hs || hs->type != Type::Map) return "";
+  Value* v = static_cast<MapObj*>(hs->obj.get())->find(name);
+  return v && v->type == Type::Str ? v->str() : "";
+}
+
+// ws_accept(req, [{protocol, headers}]) -> websocket: inside an app's route, answers the request as a websocket
+// upgrade. An error when it is not one, or the server serving it cannot lend its connection.
+Value bi_ws_accept(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Map) { error = "ws_accept() wants the route's request"; return Value::nil(); }
+  auto* req = static_cast<MapObj*>(args[0].obj.get());
+  const std::string key = header_of(req, "sec-websocket-key"), token = header_of(req, "x-grain-upgrade");
+  if (lower(header_of(req, "upgrade")) != "websocket" || key.empty()) { error = "ws_accept(): the request is not a websocket upgrade"; return Value::nil(); }
+  std::shared_ptr<Lent> l;
+  {
+    std::lock_guard<std::mutex> lk(g_lent_mu);
+    auto it = g_lent.find(token);
+    if (token.empty() || it == g_lent.end()) { error = "ws_accept(): this server does not hand its connections to routes"; return Value::nil(); }
+    l = it->second;
+  }
+  {
+    std::lock_guard<std::mutex> lk(l->mu);
+    if (l->taken || !l->conn) { error = "ws_accept(): the request was already answered"; return Value::nil(); }
+    l->taken = true;
+  }
+  std::string extra;
+  if (args.size() > 1 && args[1].type == Type::Map) {
+    auto* o = static_cast<MapObj*>(args[1].obj.get());
+    if (const Value* p = o->find("protocol"); p && p->type == Type::Str) extra += "Sec-WebSocket-Protocol: " + p->str() + "\r\n";
+    if (const Value* more = o->find("headers"); more && more->type == Type::Map)
+      for (const auto& [k, v] : static_cast<MapObj*>(more->obj.get())->entries) {
+        const std::string val = v.type == Type::Str ? v.str() : v.to_text();
+        if (k.find_first_of("\r\n:") != std::string::npos || val.find_first_of("\r\n") != std::string::npos) {
+          error = "ws_accept(): a header name or value holds a line break";
+          return Value::nil();
+        }
+        extra += k + ": " + val + "\r\n";
+      }
+  }
+  auto h = std::make_shared<WsHandle>();
+  h->conn = std::make_unique<LentConn>(l);
+  h->client = false;
+  const std::string yes = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+                          accept_key(key) + "\r\n" + extra + "\r\n";
+  if (!h->conn->send_all(ByteSpan(reinterpret_cast<const uint8_t*>(yes.data()), yes.size()))) { error = "ws_accept(): the connection failed"; return Value::nil(); }
+  if (Value* p = req->find("path"); p && p->type == Type::Str) h->path = p->str();
+  h->headers = std::make_shared<MapObj>();
+  if (Value* hs = req->find("headers"); hs && hs->type == Type::Map)
+    for (const auto& [k, v] : static_cast<MapObj*>(hs->obj.get())->entries)
+      if (k != "x-grain-upgrade") h->headers->put(k, v);
+  return Value::object(Type::Extern, std::make_shared<ExternObj>(kWs, h));
+}
+
 // ws_info(ws) -> {path, headers}: the request a server answered, or the response headers a client got
 Value bi_ws_info(Vm&, std::vector<Value>& args, std::string& error) {
   auto* h = ws_of(args[0], error, "ws_info");
@@ -394,7 +475,35 @@ Value bi_ws_close(Vm&, std::vector<Value>& args, std::string& error) {
 
 }  // namespace
 
+std::string offer_connection(std::shared_ptr<hal::Connection> conn) {
+  uint8_t raw[16];
+  hal::process_host().random(MutableByteSpan(raw, sizeof raw));
+  static const char* const hex = "0123456789abcdef";
+  std::string token;
+  for (uint8_t b : raw) { token.push_back(hex[b >> 4]); token.push_back(hex[b & 15]); }
+  auto l = std::make_shared<Lent>();
+  l->conn = std::move(conn);
+  std::lock_guard<std::mutex> lk(g_lent_mu);
+  g_lent[token] = l;
+  return token;
+}
+
+bool withdraw_connection(const std::string& token) {
+  std::shared_ptr<Lent> l;
+  {
+    std::lock_guard<std::mutex> lk(g_lent_mu);
+    auto it = g_lent.find(token);
+    if (it == g_lent.end()) return false;
+    l = it->second;
+    g_lent.erase(it);
+  }
+  std::lock_guard<std::mutex> lk(l->mu);
+  l->conn.reset();
+  return l->taken;
+}
+
 void install_ws_builtins(Vm& vm) {
+  vm.define_native("ws_accept", 1, 2, bi_ws_accept);
   vm.define_native("ws_connect", 1, 2, bi_ws_connect);
   vm.define_native("ws_upgrade", 1, 2, bi_ws_upgrade);
   vm.define_native("ws_info", 1, 1, bi_ws_info);
