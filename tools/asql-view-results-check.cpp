@@ -9,6 +9,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -41,8 +42,8 @@ std::string pn_of(int i) {
 }  // namespace
 
 int main() {
-  const std::string root = "/tmp/aios-view-results-check";
-  if (std::system(("rm -rf " + root).c_str()) != 0) std::printf("could not remove %s\n", root.c_str());
+  const CheckRoot check_root("/tmp/aios-view-results-check");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   cfg.residency = test_config;

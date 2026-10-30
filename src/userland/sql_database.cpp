@@ -887,6 +887,45 @@ thread_local bool g_stmt_logging = false;          // an autocommit write logs i
 thread_local bool g_defer_stmt_redo = false;       // ... and writes its redo only once it has gone through
 thread_local bool g_no_open_txns = false;          // this statement began with no transaction open anywhere
 thread_local bool tls_fk_checks = true;            // the session's FOREIGN_KEY_CHECKS (see "foreign keys")
+// The warnings and notes the session's last statement raised: SHOW WARNINGS lists them, @@warning_count counts them,
+// and the wire's OK / EOF packet carries the count. Each statement starts the list again, except the ones that read
+// it (SHOW WARNINGS / ERRORS / COUNT(*), a SELECT of @@warning_count or @@error_count). As MariaDB's
+// max_error_count (64) only the first 64 are kept; the count is of all of them.
+struct SqlCondition {
+  const char* level;   // "Note", "Warning" or "Error"
+  uint16_t code;
+  std::string message;
+};
+thread_local std::vector<SqlCondition> tls_conditions;
+thread_local uint64_t tls_warning_count = 0;
+// max_recursive_iterations, as MariaDB has it: how many times a recursive CTE's recursive part may run. Past it the
+// CTE stops with warning 1931 (error 1931 where a warning is an error, below). The session's value is
+// kMaxRecursiveUnset until a SET gives it one; till then it is the server's (SET GLOBAL, default 1000).
+constexpr uint64_t kMaxRecursiveUnset = ~0ull;
+constexpr uint64_t kMaxRecursiveIterationsMax = 4294967295ull;
+std::atomic<uint64_t> g_max_recursive_iterations{1000};
+thread_local uint64_t tls_max_recursive_iterations = kMaxRecursiveUnset;
+uint64_t max_recursive_iterations() {
+  return tls_max_recursive_iterations != kMaxRecursiveUnset ? tls_max_recursive_iterations
+                                                            : g_max_recursive_iterations.load(std::memory_order_relaxed);
+}
+// Under a strict sql_mode MariaDB turns a warning into an error (its abort_on_warning) in an INSERT, REPLACE, UPDATE
+// or CREATE TABLE ... SELECT, and in a stored function or trigger: the statement fails and writes nothing. A DELETE,
+// a SELECT and a CALL keep it a warning. tls_stmt_changes_data is the statement's (a procedure's statement sets it
+// for itself); tls_in_function counts the functions and triggers running.
+thread_local bool tls_stmt_changes_data = false;
+thread_local int tls_in_function = 0;
+// A recursive CTE ran in this statement: what it returned depends on the session's max_recursive_iterations, which
+// the answer cache does not key on, so the answer is not cached.
+thread_local bool tls_stmt_ran_recursive = false;
+// A view built in this statement that ran a recursive CTE, by its table key, with the write generation it was built
+// at: read again in the same statement (the planner and the executor both resolve it) it is the same rows and the one
+// warning, as MariaDB materializes it once. Dropped when the statement ends, or a write makes it stale.
+struct StmtView {
+  uint64_t gen;
+  std::shared_ptr<SqlTable> table;
+};
+thread_local std::unordered_map<std::string, StmtView> tls_stmt_views;
 // The session's sql_mode has NO_AUTO_VALUE_ON_ZERO (a dump sets it so its rows keep id 0): an AUTO_INCREMENT
 // column given 0 then stores 0. Otherwise 0, as NULL, takes the next value - as on MariaDB.
 thread_local bool tls_no_auto_value_on_zero = false;
@@ -3349,6 +3388,7 @@ struct ParsedSelectStatement {
 // scope the subquery sits in, and which source / column of that scope.
 struct OuterMemoRef { size_t depth, src, col; };
 
+struct RowInSet;   // a row-value IN's subquery rows (below)
 struct SqlExpr {
   ExprOp op = ExprOp::Literal;
   Val literal;                 // for Literal
@@ -3386,6 +3426,8 @@ struct SqlExpr {
   // subqueries -- rather than a reduced copy of it.
   std::string subquery_sql;
   mutable std::shared_ptr<ParsedSelectStatement> parsed_subquery;
+  // (a, b) IN (SELECT x, y ...): the subquery's rows, kept once it is known to read nothing from outside.
+  mutable std::shared_ptr<const RowInSet> row_in_set;
 
   // A subquery that reads nothing from the query it sits inside has the same
   // answer for every row, so it is run once and kept. `IN (SELECT invoice FROM
@@ -3864,6 +3906,16 @@ class SqlParser {
     if (take_word("IN")) {
       // IN (SELECT ...) keeps the statement rather than a list of values; the
       // check has to come before the '(' is eaten as the start of a list.
+      if (at_subquery() && is_row(left)) {
+        // (a, b) IN (SELECT x, y ...): its own node, so nothing made for a one-column IN (the lookup sets, the
+        // semi-join rewrites) ever sees a row.
+        auto e = make_op_call("__ROW_IN", {left});
+        e->negated = neg;
+        if (!take_subquery_text(&e->subquery_sql)) return left;
+        give_subquery_locks(e.get());
+        e->source_text = left->source_text + (neg ? " NOT IN (" : " IN (") + e->subquery_sql + ")";
+        return e;
+      }
       if (at_subquery()) {
         auto e = make(ExprOp::In);
         e->negated = neg;
@@ -4623,20 +4675,15 @@ class SqlParser {
               e->group_order_by.push_back(k);
             } while (take_punct(",") && !is_word("SEPARATOR"));
           }
+          // SEPARATOR takes a string literal ('', "", X'..', 0x..), as on MariaDB, where anything else is a syntax
+          // error: an expression here used to be dropped and the values joined with ',' all the same.
           if (take_word("SEPARATOR")) {
-            if (peek().kind == Tok::Str) {
-              e->separator = peek().text;
-              p_++;
-            } else if (peek().kind == Tok::Ident || peek().kind == Tok::Num) {
-              e->separator = peek().text;
-              p_++;
-            } else {
-              ExprPtr sep_expr = parse_expr();
-              if (failed() || !sep_expr) return e;
-              if (sep_expr->op == ExprOp::Literal) {
-                e->separator = sep_expr->literal.str();
-              }
+            if (peek().kind != Tok::Str) {
+              fail("SEPARATOR takes a string literal, near '" + peek().text + "'");
+              return e;
             }
+            e->separator = peek().text;
+            p_++;
           }
         } else {
           if (!is_punct(")")) {
@@ -6848,6 +6895,8 @@ struct NestedResult {
   std::string error;
   std::vector<Val> first_column;  // the subquery's first column, row by row
   size_t row_count = 0;
+  size_t column_count = 0;
+  std::vector<std::vector<Val>> rows;   // every column of every row: only for a row-value IN, which compares them all
 };
 // Runs a nested SELECT with `outer` pushed as the scope its own columns fall
 // back to. Only the first column is handed back: that is all any of the three
@@ -6855,7 +6904,7 @@ struct NestedResult {
 // of it, EXISTS only counts.
 inline NestedResult run_nested_parsed_select(SqlDatabase* db,
                                              const ParsedSelectStatement& stmt,
-                                             const EvalCtx& outer) {
+                                             const EvalCtx& outer, bool all_columns = false) {
   NestedResult out;
   if (!db) {
     out.error = "no database for subquery";
@@ -6872,6 +6921,21 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
   }
   out.ok = true;
   out.row_count = r.rows.size();
+  out.column_count = r.columns.size();
+  if (all_columns) {
+    out.rows.reserve(r.rows.size());
+    for (SqlRow& row : r.rows) {
+      std::vector<Val> vals;
+      vals.reserve(r.columns.size());
+      for (size_t c = 0; c < r.columns.size(); ++c) {
+        const bool text_col = c < r.column_types.size() && r.column_types[c] == SqlDataType::Text;
+        if (c >= row.values.size() || sql_is_null(row.values[c])) vals.push_back(val_null());
+        else vals.push_back(text_col ? val_text(row.values[c]) : val_cell(std::move(row.values[c])));
+      }
+      out.rows.push_back(std::move(vals));
+    }
+    return out;
+  }
   if (!r.columns.empty()) {
     out.first_column.reserve(r.rows.size());
     // A string column stays strings: supplierid IN (SELECT supplierno ...)
@@ -7463,7 +7527,7 @@ bool fill_subquery(const SqlExpr* e, const EvalCtx& ctx, NestedResult* out) {
   OuterRefLog ref_log;
   OuterRefLog* const outer_log = g_outer_ref_log;
   g_outer_ref_log = &ref_log;
-  *out = run_nested_parsed_select(ctx.db, *parsed, ctx);
+  *out = run_nested_parsed_select(ctx.db, *parsed, ctx, e->op == ExprOp::Func /* __ROW_IN: every column */);
   g_outer_ref_log = outer_log;
   // What this run read from further out is also read, as far as the subquery
   // around it is concerned.
@@ -8344,7 +8408,7 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
     }
 
     std::string out;
-    const std::string& sep = e->separator.empty() ? "," : e->separator;
+    const std::string& sep = e->separator;   // ',' unless SEPARATOR gave another ('' included)
     for (size_t i = 0; i < items.size(); ++i) {
       if (i > 0) out += sep;
       out += items[i].val;
@@ -11898,6 +11962,124 @@ static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v) {
   return v;
 }
 
+// The rows of a row-value IN's subquery: (a, b) IN (SELECT x, y ...). A row matches when every column compares
+// equal (compare_vals: the same equality a one-column IN and `=` use); the IN is true when one does, NULL when none
+// does but one could not be told (a NULL in a column no other column contradicts), else false - MariaDB's answer,
+// NOT IN its opposite. When the first column holds only numbers its rows are bucketed by that number, so a probe
+// reads the rows with an equal first value (and the ones with a NULL there) instead of all of them.
+struct RowInSet {
+  size_t ncols = 0;
+  std::vector<std::vector<Val>> rows;
+  bool by_number = false;
+  std::unordered_map<double, std::vector<uint32_t>> by_first;
+  std::vector<uint32_t> null_first;
+
+  void build(std::vector<std::vector<Val>> r, size_t n) {
+    ncols = n;
+    rows = std::move(r);
+    by_number = true;
+    for (const auto& row : rows)
+      if (!row[0].null && (!row[0].numeric || InLookupSet::is_wide(row[0]))) { by_number = false; break; }
+    if (!by_number) return;
+    for (uint32_t i = 0; i < rows.size(); ++i) {
+      if (rows[i][0].null) null_first.push_back(i);
+      else by_first[rows[i][0].num].push_back(i);
+    }
+  }
+  // 1 true, 0 false, -1 NULL.
+  int match(const std::vector<Val>& l) const {
+    bool unknown = false;
+    auto test = [&](const std::vector<Val>& r) {
+      bool u = false;
+      for (size_t i = 0; i < ncols; ++i) {
+        const int c = compare_vals(l[i], r[i]);
+        if (c == -2) u = true;
+        else if (c != 0) return 0;
+      }
+      return u ? -1 : 1;
+    };
+    auto over = [&](const std::vector<uint32_t>& idx) {
+      for (uint32_t i : idx) {
+        const int t = test(rows[i]);
+        if (t == 1) return true;
+        if (t < 0) unknown = true;
+      }
+      return false;
+    };
+    if (by_number && !l[0].null && l[0].numeric && !InLookupSet::is_wide(l[0])) {
+      auto it = by_first.find(l[0].num);
+      if ((it != by_first.end() && over(it->second)) || over(null_first)) return 1;
+      return unknown ? -1 : 0;
+    }
+    for (const auto& r : rows) {
+      const int t = test(r);
+      if (t == 1) return 1;
+      if (t < 0) unknown = true;
+    }
+    return unknown ? -1 : 0;
+  }
+};
+
+Val eval_row_in(const SqlExpr* e, const EvalCtx& ctx) {
+  const SqlExpr* row = e->args[0].get();
+  std::vector<Val> l;
+  l.reserve(row->args.size());
+  for (const auto& a : row->args) l.push_back(eval_expr(a.get(), ctx));
+  auto cached = [&]() -> std::shared_ptr<const RowInSet> {
+    if (e->sub_mu) {
+      std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
+      return e->sub_evaluated && !e->sub_correlated ? e->row_in_set : nullptr;
+    }
+    return e->sub_evaluated && !e->sub_correlated ? e->row_in_set : nullptr;
+  };
+  std::shared_ptr<const RowInSet> set = cached();
+  if (!set) {
+    // One thread fills an uncorrelated one while the others wait for it (as IN does); a correlated one runs per row.
+    bool correlated = false;
+    if (e->sub_mu) {
+      std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
+      correlated = e->sub_evaluated && e->sub_correlated;
+    }
+    std::unique_lock<aios::hal::Mutex> single_flight;
+    if (!correlated && e->fill_mu) single_flight = std::unique_lock<aios::hal::Mutex>(*e->fill_mu);
+    set = cached();
+    if (!set) {
+      NestedResult r;
+      if (!fill_subquery(e, ctx, &r)) {
+        if (ctx.err && !ctx.err->empty()) return val_null();   // its error
+        // Marked as run and uncorrelated by an earlier run that kept no rows (a speculative one): run it here.
+        std::shared_ptr<ParsedSelectStatement> parsed;
+        if (e->sub_mu) {
+          std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
+          parsed = e->parsed_subquery;
+        } else {
+          parsed = e->parsed_subquery;
+        }
+        if (!parsed) parsed = std::make_shared<ParsedSelectStatement>(parse_select_sql(e->subquery_sql));
+        if (!parsed->ok) { ctx_fail(ctx, parsed->error); return val_null(); }
+        r = run_nested_parsed_select(ctx.db, *parsed, ctx, true);
+        if (!r.ok) { ctx_fail(ctx, r.error); return val_null(); }
+      }
+      if (r.column_count != 0 && r.column_count != l.size()) {
+        ctx_fail(ctx, "Operand should contain " + std::to_string(l.size()) + " column(s)");
+        return val_null();
+      }
+      auto built = std::make_shared<RowInSet>();
+      built->build(std::move(r.rows), l.size());
+      set = built;
+      if (e->sub_mu) {
+        std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
+        if (e->sub_evaluated && !e->sub_correlated) e->row_in_set = built;
+      } else if (e->sub_evaluated && !e->sub_correlated) {
+        e->row_in_set = built;
+      }
+    }
+  }
+  const int m = set->match(l);
+  if (m < 0) return val_null();
+  return val_num(e->negated ? m == 0 : m == 1);
+}
+
 Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
   if (!e) return val_null();
   switch (e->op) {
@@ -11913,8 +12095,17 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
         std::string var = e->name;
         if (var.rfind("@@", 0) == 0) var = var.substr(2);
         std::string vlow = lower_of(var);
+        bool global_scope = !e->qualifier.empty() && lower_of(e->qualifier) == "@@global";
         if (vlow.rfind("session.", 0) == 0) vlow = vlow.substr(8);
-        else if (vlow.rfind("global.", 0) == 0) vlow = vlow.substr(7);
+        else if (vlow.rfind("global.", 0) == 0) { vlow = vlow.substr(7); global_scope = true; }
+        if (vlow == "max_recursive_iterations")
+          return val_num((double)(global_scope ? g_max_recursive_iterations.load(std::memory_order_relaxed) : max_recursive_iterations()));
+        if (vlow == "warning_count") return val_num((double)tls_warning_count);
+        if (vlow == "error_count") {
+          uint64_t n = 0;
+          for (const SqlCondition& c : tls_conditions) n += std::strcmp(c.level, "Error") == 0;
+          return val_num((double)n);
+        }
 
         if (vlow == "version") return val_text("5.7.44-aios-asql");
         if (vlow == "version_comment") return val_text("AIOS ASQL / MySQL Native Wire Server");
@@ -12029,6 +12220,7 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
     }
     case ExprOp::Func: {
       const std::string& up = func_upper(e);
+      if (up == "__ROW_IN"sv) return eval_row_in(e, ctx);
       if (is_aggregate_name(up)) return eval_aggregate(e, ctx);
       Val v = eval_scalar_func(e, ctx);
       if (!v.null && v.numeric && !v.approx &&
@@ -13062,6 +13254,20 @@ thread_local bool tls_sql_mode_set = false;
 thread_local bool tls_sql_mode_strict = false;
 thread_local std::string tls_sql_mode;
 bool sql_strict() { return tls_sql_mode_set ? tls_sql_mode_strict : sql_strict_default(); }
+
+void sql_note_condition(const char* level, uint16_t code, std::string message) {
+  ++tls_warning_count;
+  if (tls_conditions.size() < 64) tls_conditions.push_back(SqlCondition{level, code, std::move(message)});
+}
+
+bool sql_warning_is_error() { return sql_strict() && (tls_stmt_changes_data || tls_in_function > 0); }
+
+uint64_t sql_statement_warning_count() { return tls_warning_count; }
+
+void sql_clear_statement_conditions() {
+  tls_conditions.clear();
+  tls_warning_count = 0;
+}
 std::string sql_mode_text() {
   if (tls_sql_mode_set) return tls_sql_mode;
   return sql_strict_default() ? "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
@@ -21201,6 +21407,33 @@ static std::string_view first_word_upper(const std::string& sql, size_t* from, c
   *from = j;
   return k > cap ? std::string_view() : std::string_view(buf, k);
 }
+// Whether a statement is one that changes rows in the sense of sql_warning_is_error: INSERT, REPLACE, UPDATE, or a
+// CREATE (CREATE TABLE ... SELECT is the one that runs a query). Its first word, past spaces, comments and '('.
+bool sql_statement_changes_data(const std::string& sql) {
+  size_t i = 0;
+  char buf[8];
+  const std::string_view w = first_word_upper(sql, &i, buf, sizeof buf, true);
+  return w == "INSERT"sv || w == "REPLACE"sv || w == "UPDATE"sv || w == "CREATE"sv;
+}
+
+// A top-level statement begins: its own conditions, unless it is one that reads them.
+void sql_begin_statement(const std::string& sql) {
+  tls_stmt_changes_data = sql_statement_changes_data(sql);
+  tls_stmt_ran_recursive = false;
+  tls_stmt_views.clear();
+  size_t i = 0;
+  char buf[8];
+  const std::string_view w = first_word_upper(sql, &i, buf, sizeof buf, false);
+  if (w == "SHOW"sv) {
+    size_t j = i;
+    char b2[8];
+    const std::string_view w2 = first_word_upper(sql, &j, b2, sizeof b2, false);
+    if (w2 == "WARNINGS"sv || w2 == "ERRORS"sv || w2 == "COUNT"sv) return;
+  }
+  if (w == "SELECT"sv && (strcase_contains_sv(sql, "warning_count") || strcase_contains_sv(sql, "error_count"))) return;
+  sql_clear_statement_conditions();
+}
+
 // SET autocommit = 1 | ON | TRUE (any scope), which commits an open transaction.
 static bool sets_autocommit_on(const std::string& sql) {
   const std::string low = lower_of(sql);
@@ -22675,6 +22908,10 @@ std::shared_ptr<SqlTable> SqlDatabase::matview_refresh(const std::string& key, c
 std::shared_ptr<SqlTable> SqlDatabase::get_or_build_materialized_view(const SqlView* v) {
   if (!v) return nullptr;
   std::string key = make_table_key(v->database, v->name);
+  if (auto sv = tls_stmt_views.find(key); sv != tls_stmt_views.end()) {
+    if (sv->second.gen == query_cache_gen_.load(std::memory_order_acquire)) return sv->second.table;
+    tls_stmt_views.erase(sv);
+  }
   // The cached table if it is right, refreshed first if only some groups
   // changed (that refresh runs outside the lock); null: build it.
   auto lookup = [&]() -> std::shared_ptr<SqlTable> {
@@ -22720,7 +22957,14 @@ std::shared_ptr<SqlTable> SqlDatabase::get_or_build_materialized_view(const SqlV
   if (auto cur = lookup()) return cur;
 
   if (!view_within_build_budget(v, nullptr)) return nullptr;
+  // A view whose query runs a recursive CTE has the rows the session's max_recursive_iterations let it have (and
+  // warns when that cut it short): built for this statement, never kept for another (tls_stmt_ran_recursive).
+  const bool ran_recursive_before = tls_stmt_ran_recursive;
+  tls_stmt_ran_recursive = false;
+  const uint64_t built_gen = query_cache_gen_.load(std::memory_order_acquire);
   SqlQueryResult vres = execute_local_query(v->query_sql, v->database.empty() ? effective_database() : v->database);
+  const bool keep = !tls_stmt_ran_recursive;
+  tls_stmt_ran_recursive = tls_stmt_ran_recursive || ran_recursive_before;
   if (!vres.success) return nullptr;
 
   auto ephem = std::make_shared<SqlTable>();
@@ -22748,6 +22992,10 @@ std::shared_ptr<SqlTable> SqlDatabase::get_or_build_materialized_view(const SqlV
     ephem->append_row(r);
   }
   ephem->inferred_types = true;
+  if (!keep) {
+    tls_stmt_views[key] = StmtView{built_gen, ephem};
+    return ephem;
+  }
 
   // What the cached table depends on, and whether it can be refreshed a group
   // at a time. Its source tables are read here, under the statement's locks,
@@ -24645,7 +24893,7 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
             std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
             if (row_indices_memory_bytes_locked() + expect > budget) { ++rows_skipped; break; }
           }
-          grow_row_index(kv.second);
+          warm_row_index(kv.second);
           std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
           auto it = table_row_indices_.find(name);
           if (it != table_row_indices_.end() && it->second) { it->second->last_access_ns = 0; ++rows_warmed; }
@@ -25274,7 +25522,7 @@ static bool starts_user_var_set(const std::string& q) {
   // The server settings kept per session go the same way: foreign_key_checks, autocommit, sql_mode, the
   // isolation level, the lock wait (the rest were accepted and ignored).
   for (const char* v : {"foreign_key_checks", "autocommit", "sql_mode", "tx_isolation", "transaction_isolation",
-                        "lock_wait_timeout", "time_zone", "max_statement_time"})
+                        "lock_wait_timeout", "time_zone", "max_statement_time", "max_recursive_iterations"})
     if (strcase_contains_sv(q, v) && !strcase_contains_sv(q, "transaction isolation")) return true;
   return false;
 }
@@ -25979,6 +26227,12 @@ std::string SqlDatabase::cant_repeat_reason(const std::string& sql, const std::s
 }
 
 SqlQueryResult SqlDatabase::execute_gateway_query(const std::string& sql_query, const std::string& session_db) {
+  const bool top = g_rw_depth == 0;
+  if (top) sql_begin_statement(sql_query);
+  struct EndStatement {
+    bool top;
+    ~EndStatement() { if (top) tls_stmt_views.clear(); }
+  } end_statement{top};
   // GET_LOCK waits here, between runs, with no lock held (see LockWait). Only
   // a top-level read outside a transaction: anywhere else it waits as before.
   LockWait& w = tls_lock_wait;
@@ -26202,6 +26456,9 @@ void SqlDatabase::abandon_open_transaction() {
   tls_autocommit = true;
   tls_tx_isolation.clear();
   tls_lock_wait_timeout = 50;
+  tls_max_recursive_iterations = kMaxRecursiveUnset;
+  tls_conditions.clear();
+  tls_warning_count = 0;
   session_time_zone_set("SYSTEM");
 }
 
@@ -26902,7 +27159,9 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
     if (res.success) {
       // The rows themselves become the cache's entry; a caller that takes
       // the answer shared gets that entry, one that wants its own copies it.
-      if (res.rows.size() <= kMaxQueryCacheRows) {
+      // Not an answer a recursive CTE gave (it depends on the session's max_recursive_iterations) or one that
+      // raised a warning (a hit would answer without it).
+      if (res.rows.size() <= kMaxQueryCacheRows && !tls_stmt_ran_recursive && tls_conditions.empty()) {
         auto shared = std::make_shared<const SqlQueryResult>(std::move(res));
         query_cache_store(cache_key, shared, std::move(deps), reads_view, gen_before);
         if (vx_trace_on()) {
@@ -27042,6 +27301,12 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
 }
 
 SqlQueryResult SqlDatabase::execute_query(const std::string& sql_query, const std::string& session_db) {
+  const bool top = g_rw_depth == 0;
+  if (top) sql_begin_statement(sql_query);
+  struct EndStatement {
+    bool top;
+    ~EndStatement() { if (top) tls_stmt_views.clear(); }
+  } end_statement{top};
   ScopedSessionDb guard(session_db);
   std::string q = trim(sql_query);
   if (q.empty()) {
@@ -28977,6 +29242,40 @@ SqlQueryResult SqlDatabase::execute_set_user_vars(const std::string& sql) {
         const double secs = std::strtod(v.c_str(), &end);
         if (v.empty() || !end || *end != '\0' || !(secs >= 0)) return make_error("Variable 'max_statement_time' can't be set to the value of '" + v + "'");
         tls_max_read_override_ns = (int64_t)(secs * 1e9);
+        continue;
+      }
+      // max_recursive_iterations: a whole number, as MariaDB takes it ('7' and 1.5 are refused); past the range it is
+      // cut to 0 or 4294967295 with warning 1292. DEFAULT is the server's value; SET GLOBAL changes that, for the
+      // sessions that have not set their own.
+      if (lower_of(sys) == "max_recursive_iterations") {
+        const std::string v = trim(p.substr(eq + eqlen));
+        const bool global = lower_of(name).rfind("global", 0) == 0 || lower_of(name).rfind("@@global", 0) == 0;
+        uint64_t n = 0;
+        if (lower_of(v) == "default") {
+          n = global ? 1000 : g_max_recursive_iterations.load(std::memory_order_relaxed);
+        } else {
+          Val val;
+          if (v.rfind("@", 0) == 0) val = user_var_get(v);
+          else {
+            char* end = nullptr;
+            const bool neg = !v.empty() && v[0] == '-';
+            if (v.empty() || v.find_first_not_of("0123456789", neg ? 1 : 0) != std::string::npos || v.size() == (neg ? 1u : 0u))
+              return make_error("Incorrect argument type to variable 'max_recursive_iterations'");
+            errno = 0;
+            const long long x = std::strtoll(v.c_str(), &end, 10);
+            val = val_num(errno == ERANGE ? (neg ? -1e300 : 1e300) : (double)x);
+          }
+          if (val.null || !val.numeric || val.num != std::floor(val.num))
+            return make_error("Incorrect argument type to variable 'max_recursive_iterations'");
+          if (val.num < 0 || val.num > (double)kMaxRecursiveIterationsMax) {
+            n = val.num < 0 ? 0 : kMaxRecursiveIterationsMax;
+            sql_note_condition("Warning", 1292, "Truncated incorrect max_recursive_iterations value: '" + v + "'");
+          } else {
+            n = (uint64_t)val.num;
+          }
+        }
+        if (global) g_max_recursive_iterations.store(n, std::memory_order_relaxed);
+        else tls_max_recursive_iterations = n;
         continue;
       }
       // The one other setting kept: foreign key checks, per session (dumps turn
@@ -31908,13 +32207,18 @@ bool constant_value(const SqlExpr* e, const EvalCtx& local, const EvalCtx& base,
       return true;
     }
     std::vector<SubTabDep> deps;
-    const bool cacheable = constant_subqueries_ok(base.db, e, &deps);
+    bool cacheable = constant_subqueries_ok(base.db, e, &deps);
     EvalCtx c = base;
     c.row = nullptr;
     c.group = nullptr;
     std::string err;
     c.err = &err;
+    // Kept for later statements only when no recursive CTE gave it (see tls_stmt_ran_recursive).
+    const bool ran_recursive_before = tls_stmt_ran_recursive;
+    tls_stmt_ran_recursive = false;
     *out = eval_expr(e, c);
+    if (tls_stmt_ran_recursive) cacheable = false;
+    tls_stmt_ran_recursive = tls_stmt_ran_recursive || ran_recursive_before;
     if (!err.empty()) return false;
     if (cacheable && !deps.empty()) {
       if (sub_cache.size() > 256) sub_cache.clear();
@@ -46809,10 +47113,22 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         accum_tbl.append_row(r);
       }
 
+      // The recursive part runs at most max_recursive_iterations times. Due to run once more - its last run still
+      // made rows, or the limit is 0 - the CTE stops there with what it has and warning 1931, as MariaDB does; or,
+      // where a warning is an error, the statement fails. It stopped at a fixed 10000 without a word: a short
+      // answer that looked whole.
+      tls_stmt_ran_recursive = true;
+      const uint64_t limit = max_recursive_iterations();
       SqlTable working_tbl = accum_tbl;
-      int max_recursion = 10000;
-
-      while (working_tbl.row_count() > 0 && max_recursion-- > 0) {
+      for (uint64_t level = 0;; ++level) {
+        if (level == limit) {
+          std::string msg = "Query execution was interrupted. The query exceeded max_recursive_iterations = " +
+                            std::to_string(limit) + ". The query result may be incomplete";
+          if (sql_warning_is_error()) return make_error(msg);
+          sql_note_condition("Warning", 1931, std::move(msg));
+          break;
+        }
+        if (working_tbl.row_count() == 0) break;
         current_scope[cte_name] = std::make_shared<SqlTable>(working_tbl);
 
         SqlQueryResult rec_res = execute_local_query(rec_sql);
@@ -49692,10 +50008,46 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
     if (std::string werr; !show_where_filter(this, p, sql, &res, &werr)) return make_error(werr);
     return res;
   }
+  // SHOW COUNT(*) WARNINGS / ERRORS: @@warning_count / @@error_count, under MariaDB's column names.
+  if (p.is_word("COUNT") && p.is_punct("(", 1) && p.is_punct("*", 2) && p.is_punct(")", 3)) {
+    for (int k = 0; k < 4; ++k) p.next();
+    const bool errors = p.take_word("ERRORS");
+    if (!errors && !p.take_word("WARNINGS")) return make_error("expected WARNINGS or ERRORS after SHOW COUNT(*)");
+    uint64_t n = tls_warning_count;
+    if (errors) {
+      n = 0;
+      for (const SqlCondition& c : tls_conditions) n += std::strcmp(c.level, "Error") == 0;
+    }
+    SqlQueryResult res;
+    res.is_result_set = true;
+    res.columns = {errors ? "@@session.error_count" : "@@session.warning_count"};
+    res.rows.push_back(SqlRow{{std::to_string(n)}});
+    res.formatted_table = format_result_table(res.columns, res.rows);
+    return res;
+  }
+  // SHOW WARNINGS / ERRORS [LIMIT [offset,] count]: the conditions the last statement raised (ERRORS: its errors).
+  const bool show_errors = !p.is_word("WARNINGS") && p.is_word("ERRORS");
   if (p.take_word("WARNINGS") || p.take_word("ERRORS")) {
+    uint64_t offset = 0, limit = ~0ull;
+    if (p.take_word("LIMIT")) {
+      auto number = [&](uint64_t* out) {
+        if (p.peek().kind != Tok::Num) return false;
+        *out = std::strtoull(p.next().text.c_str(), nullptr, 10);
+        return true;
+      };
+      if (!number(&limit)) return make_error("expected a number after LIMIT");
+      if (p.take_punct(",")) { offset = limit; if (!number(&limit)) return make_error("expected a number after LIMIT n,"); }
+    }
     SqlQueryResult res;
     res.is_result_set = true;
     res.columns = {"Level", "Code", "Message"};
+    uint64_t at = 0;
+    for (const SqlCondition& c : tls_conditions) {
+      if (show_errors && std::strcmp(c.level, "Error") != 0) continue;
+      if (at++ < offset) continue;
+      if (res.rows.size() >= limit) break;
+      res.rows.push_back(SqlRow{{c.level, std::to_string(c.code), c.message}});
+    }
     res.rows_affected = 0;
     res.formatted_table = format_result_table(res.columns, res.rows);
     return res;
@@ -52948,6 +53300,26 @@ void SqlDatabase::grow_row_index(const SqlTable& t) {
   if (!pk_cols.empty() || ai_idx >= 0) {
     if (t.row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(t, pk_cols, ai_idx);
     else sync_row_index(t, pk_cols, ai_idx, 16384);
+  }
+}
+
+// The warm-up's build of a table's whole map, a chunk at a time with row_index_mu_ let go between chunks. Every
+// INSERT takes that mutex for its own table's map, so one 2M-row map built under it at once (half a second to a
+// second and a half) held up a write to any other table - a two-row one - for all of it; now for one chunk at most.
+void SqlDatabase::warm_row_index(const SqlTable& t) {
+  std::vector<int> pk_cols;
+  int ai_idx = -1;
+  for (size_t i = 0; i < t.columns.size(); ++i) {
+    if (t.columns[i].is_primary_key) pk_cols.push_back((int)i);
+    if (t.columns[i].auto_increment) ai_idx = (int)i;
+  }
+  if (pk_cols.empty() && ai_idx < 0) return;
+  constexpr size_t kWarmChunkRows = 16384;
+  for (;;) {
+    std::shared_ptr<RowIndex> idx = sync_row_index(t, pk_cols, ai_idx, kWarmChunkRows);
+    if (!idx) return;
+    std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+    if (idx->rows_indexed >= t.row_count()) return;
   }
 }
 

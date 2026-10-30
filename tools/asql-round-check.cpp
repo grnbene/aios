@@ -11,6 +11,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -39,8 +40,8 @@ void expect(SqlDatabase& db, const std::string& expr, const std::string& want, c
 
 int main() {
   std::printf("=== ASQL rounding of DOUBLEs and DECIMALs ===\n");
-  const std::string root = "/tmp/aios-asql-round-check";
-  { std::error_code e; std::filesystem::remove_all(root, e); }
+  const CheckRoot check_root("/tmp/aios-asql-round-check");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);
@@ -92,6 +93,5 @@ int main() {
   expect(db, "COUNT(*) FROM (SELECT d2 FROM v UNION SELECT d4 FROM v) u", "4", "UNION: -2.50 and -2.5000 are one row");
   expect(db, "MIN(d2) FROM (SELECT d2 FROM v UNION ALL SELECT x FROM v) u", "-2.5", "DECIMAL beside DOUBLE is a DOUBLE");
   std::printf("%d of %d checks %s\n", checks - failures, checks, failures ? "passed - FAILED" : "passed");
-  { std::error_code e; std::filesystem::remove_all(root, e); }
   return failures ? 1 : 0;
 }

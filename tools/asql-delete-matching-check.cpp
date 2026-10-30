@@ -12,6 +12,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -38,8 +39,8 @@ std::string at_of(int i) {
 }  // namespace
 
 int main() {
-  const std::string root = "/tmp/aios-delete-matching-check";
-  if (std::system(("rm -rf " + root).c_str()) != 0) std::printf("could not remove %s\n", root.c_str());
+  const CheckRoot check_root("/tmp/aios-delete-matching-check");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   cfg.residency = test_config;
@@ -113,7 +114,6 @@ int main() {
             std::to_string([&] { size_t n = 0; for (size_t i = 0; i < model.size(); ++i) if (!drop[i] && model[i].at[0] == '0') ++n; return n; }() -
                            [&] { size_t n = 0; for (int i = 0; i < 50; ++i) if (model[(size_t)i * 1999].at[0] == '0' && !drop[(size_t)i * 1999]) ++n; return n; }()),
         "zero-date rows: the named ones gone (" + one(db, "SELECT COUNT(*) FROM log WHERE at = '0000-00-00 00:00:00'") + " left)");
-  if (std::system(("rm -rf " + root).c_str()) != 0) std::printf("could not remove %s\n", root.c_str());
   if (failures) { std::printf("=== %d FAILURE(S) ===\n", failures); return 1; }
   std::printf("=== DELETE MATCHING CHECKS PASSED ===\n");
   return 0;

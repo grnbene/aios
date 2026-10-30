@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"

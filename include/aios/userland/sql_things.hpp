@@ -142,6 +142,7 @@ class ThingEngine {
   friend struct ThingGrainAccess;   // the grain natives that read other kinds (sql_things.cpp)
  public:
   explicit ThingEngine(SqlDatabase& db);
+  ~ThingEngine();   // stops the grain kinds' worker threads
 
   // True when some kind reads this table (checked before building row images).
   bool watches(const SqlTable& t) const;
@@ -312,6 +313,11 @@ class ThingEngine {
     // (stock at a location), or claimants (orders whose lines claim it).
     enum Type { Aggregate = 0, Resource = 1, Claims = 2, Grain = 3, Event = 4, Mirror = 5 } type = Aggregate;
     bool paused = false;               // PAUSE THING: notices wait, nothing reacts or fires
+    // A grain kind reacts on a thread of its own (grain_worker): running while that thread is alive (busy or lingering
+    // for more work), dropping once DROP / a replacement let the kind go while it ran - the node is kept in retired_
+    // and the worker destroys it when it is through with its chunk. Both set and read under mu_ only.
+    bool running = false;
+    bool dropping = false;
     bool building = false;             // CREATE OR REPLACE THING's new version, before it takes the name: not saved or dropped
     // EVENT (CREATE THING name AT '<when>' GRAIN ... WRITES ... AS '<grain>'): a
     // Thing that acts once. At its time the program's fire(ctx) runs with
@@ -360,6 +366,7 @@ class ThingEngine {
     bool pending_shared = false;
     std::string grain_error;                    // the last run that failed, shown by SHOW THINGS
     std::string shared_json;                    // shared() as saved, until the VM takes it back
+    std::string shared_text;                    // shared() as JSON, kept with every change for the save (the VM is the worker's)
     double last_full_ms = 0;
     // A full pass under way (a sweep): enroll()'s keys, then the ones that left, recomputed a slice at a time - each
     // slice a settle of its own, the engine's lock (and the statement lock) let go between them, so one big kind's
@@ -369,7 +376,7 @@ class ThingEngine {
     size_t sweep_at = 0;
     std::string sweep_cause;
     uint64_t sweep_t0 = 0;
-    double sweep_ms_per_key = 0;      // measured as it goes: sizes the next slice to the budget
+    size_t sweep_n = 8;               // keys a slice: grown and shrunk to a call of about a second (grain_run_chunk)
     // RESOURCE: one Thing per key, capacity = SUM(cap_col) of cap_table rows.
     // Only keys something claims are held (the rest cannot change anything).
     std::vector<std::string> key_cols;
@@ -512,14 +519,17 @@ class ThingEngine {
   bool parse_grain(const std::string& sql, Kind* k, std::string* err) const;
   bool grain_boot(Kind& k, std::string* err);
   void grain_notice(Kind& k, const SqlTable& t, const char* op, const SqlRow* before, const SqlRow* after);
-  void settle_grain(Kind& k);
+  void settle_grain(Kind& k);   // mu_ held: hands the kind's work to its worker thread (starts one if none)
+  // The worker thread of one grain kind: runs the program - touched(), shared(), enroll(), things() - with neither
+  // mu_ nor the statement lock held (each read() takes the shared lock for itself), mu_ taken only to pick up work
+  // and to put results in. Lingers a while for more work, then ends; settle_grain starts a new one when needed.
+  void grain_worker(Kind* kp);
+  bool grain_has_work(const Kind& k) const;   // mu_ held
+  bool grain_run_chunk(Kind& k, std::unique_lock<aios::hal::Mutex>& lk);   // mu_ held in and out; true when it did something
+  void erase_kind(std::map<std::string, Kind>::iterator it);   // mu_ held: gone now, or retired until its worker is through
+  void reap_workers_locked();
   // keep_notices: what arrived meanwhile stays to be seen (a replacement built while writes go on)
   bool grain_full(Kind& k, const std::string& cause, std::string* err, bool keep_notices = false);
-  // The full pass in slices (settle's way of running one; grain_full stays for CREATE, load and a replacement's build,
-  // which run with the lock let go or before anything reads): start reads shared() and enroll() and queues the keys;
-  // step recomputes them until the deadline and says whether the pass is done.
-  bool grain_sweep_start(Kind& k, const std::string& cause, std::string* err);
-  bool grain_sweep_step(Kind& k, std::chrono::steady_clock::time_point deadline, bool* done, std::string* err);
   SqlQueryResult replace_grain(Kind&& k, std::unique_lock<aios::hal::Mutex>& lk);
  public:
   // CREATE OR REPLACE THING of a grain Thing that exists, run by the caller outside any statement lock (so the old
@@ -527,7 +537,10 @@ class ThingEngine {
   // the ordinary path takes it.
   bool try_replace_unlocked(const std::string& sql, SqlQueryResult* out);
  private:
-  bool grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err);
+  // things(keys): with lk given, the call runs with mu_ let go and the results go in with it taken back (the worker's
+  // way); without, the caller owns the kind (CREATE, load, a replacement's build) and nothing is locked here.
+  bool grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err,
+                  std::unique_lock<aios::hal::Mutex>* lk = nullptr);
   // every Thing of a grain kind, or (keys given) those Things only, in the order asked, by collation key
   SqlQueryResult show_grain(const Kind& k, const std::vector<std::string>* keys = nullptr);
   // The rows of SHOW THING <name> for a grain kind, built once per version of the kind; under mu_.
@@ -610,6 +623,13 @@ class ThingEngine {
   uint64_t wait_epoch_ = 0;
   void wake_waiters();
   std::map<std::string, Kind> kinds_;
+  // the grain kinds' worker threads, by kind (map nodes stay put); the ones through, to be joined; the kinds dropped
+  // while their worker ran, kept alive until it is through; the workers wait on worker_cv_ (with mu_) for more
+  aios::hal::CondVar worker_cv_;
+  bool stopping_ = false;
+  std::map<const Kind*, aios::hal::Thread> workers_;
+  std::vector<aios::hal::Thread> done_workers_;
+  std::vector<std::map<std::string, Kind>::node_type> retired_;
   std::unordered_set<std::string> watched_;   // "db.table" of every kind's links
   std::set<std::string> firing_now_;           // events firing in this process (never two firings of one)
   bool dirty_ = false;

@@ -588,6 +588,11 @@ struct Run {
   bool exec(const std::string& sql, SqlQueryResult* res, Condition* cond) {
     std::string bound;
     if (!bind(sql, &bound)) { cond->kind = Condition::Exception; cond->message = error; error.clear(); return false; }
+    struct ChangesData {   // the statement's own, for its run; the caller's after
+      bool was = tls_stmt_changes_data;
+      ~ChangesData() { tls_stmt_changes_data = was; }
+    } changes_data;
+    tls_stmt_changes_data = sql_statement_changes_data(bound);
     *res = db.execute_local_query_unguarded(bound, session_db);
     if (!res->success) { cond->kind = Condition::Exception; cond->message = res->error_message; return false; }
     last_row_count = res->is_result_set ? -1 : (long long)res->rows_affected;
@@ -1336,6 +1341,12 @@ struct DepthGuard {
   DepthGuard() : ok(++tls_program_depth <= 32), append_only(tls_txn_append_only) { tls_txn_append_only = false; }
   ~DepthGuard() { --tls_program_depth; tls_txn_append_only = append_only; }
 };
+// A stored function or trigger is running: under a strict sql_mode a warning in it is an error (see
+// sql_warning_is_error). A procedure is not one: its statements decide for themselves (psm::Run::exec).
+struct InFunction {
+  InFunction() { ++tls_in_function; }
+  ~InFunction() { --tls_in_function; }
+};
 
 bool sql_table_in_use_by_trigger(const SqlTable* t) {
   for (const SqlTable* u : tls_tables_in_use) if (u == t) return true;
@@ -1424,6 +1435,7 @@ Val as_returns_type(const Val& v, const std::string& returns) {
 Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<Val>& args,
                      const std::string& session_db, std::string* err) {
   DepthGuard dg;
+  InFunction in_function;
   if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return val_null(); }
   if (args.size() != f.params.size()) {
     *err = "Incorrect number of arguments for FUNCTION " + f.db + "." + f.name + "; expected " +
@@ -1442,6 +1454,7 @@ Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const
 Val sql_run_aggregate(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<std::vector<Val>>& rows,
                       const std::string& session_db, std::string* err) {
   DepthGuard dg;
+  InFunction in_function;
   if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return val_null(); }
   if (!rows.empty() && rows[0].size() != f.params.size()) {
     *err = "Incorrect number of arguments for FUNCTION " + f.db + "." + f.name + "; expected " +
@@ -1463,6 +1476,7 @@ Val sql_run_aggregate(SqlDatabase& db, const SqlDatabase::StoredProgram& f, cons
 bool sql_fire_trigger(SqlDatabase& db, const SqlDatabase::StoredProgram& t, const SqlTable& table, const SqlRow* old_row,
                       SqlRow* new_row, std::string* err) {
   DepthGuard dg;
+  InFunction in_function;
   if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return false; }
   // An INSERT the trigger runs leaves the caller's ids as they were, as on
   // MariaDB: an audit trigger's history row is not the id the client asked for.

@@ -8,6 +8,7 @@
 #include <vector>
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 using namespace aios;
 using namespace aios::userland;
 namespace {
@@ -18,8 +19,8 @@ std::string one(SqlDatabase& db, const std::string& q) {
 }
 }  // namespace
 int main() {
-  const std::string root = "/tmp/aios-datetime-literal-check";
-  if (std::system(("rm -rf " + root).c_str()) != 0) return 1;
+  const CheckRoot check_root("/tmp/aios-datetime-literal-check");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg; cfg.root = root; cfg.residency = test_config;
   auto k = Kernel::boot(cfg);
   if (!k.ok()) { std::printf("boot failed\n"); return 1; }
@@ -84,7 +85,6 @@ int main() {
     std::printf("  [%s] %s day >= 20260501: %s, as day >= '2026-05-01': %s\n", dn == dw ? "ok" : "FAIL", pass ? "reopened" : "written", dn.c_str(), dw.c_str());
     if (pass == 0) db.flush_now();
   }
-  if (std::system(("rm -rf " + root).c_str()) != 0) std::printf("could not remove %s\n", root.c_str());
   if (failures) { std::printf("=== %d FAILURE(S) ===\n", failures); return 1; }
   std::printf("=== DATETIME LITERAL CHECKS PASSED ===\n");
   return 0;

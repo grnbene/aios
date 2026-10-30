@@ -17,6 +17,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -144,8 +145,8 @@ void fill(SqlDatabase& db, const std::string& table, size_t rows) {
 
 int main() {
   std::printf("=== ASQL column-vs-literal comparison check ===\n");
-  const std::string root = "/tmp/aios-asql-literal-compare";
-  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
+  const CheckRoot check_root("/tmp/aios-asql-literal-compare");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

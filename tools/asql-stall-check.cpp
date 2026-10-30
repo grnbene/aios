@@ -8,11 +8,14 @@
 // Before the fixes: PROCESSLIST waited the read out, the statement ran to its end after the hang-up, and a read had
 // no limit.
 #include <chrono>
+#include <cmath>
+#include <filesystem>
 #include <cstdlib>
 #include <future>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/mysql_wire.hpp"
@@ -31,13 +34,14 @@ void check(bool ok, const std::string& label) {
 double ms_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
-// A read that takes seconds and no index can shorten: every row against every other row (2200 x 2200 pairs, a
+// A read that takes seconds and no index can shorten: every row against every other row (n x n pairs, a
 // predicate on both sides).
 const std::string kLongRead = "SELECT COUNT(*) FROM stall a, stall b WHERE (a.id * 31 + b.id) % 7919 = 3";
-const uint16_t kPort = 23397;
+// The port the wire server got (it binds port 0, so two runs at once never share one).
+uint16_t g_port = 0;
 
 struct Client {
-  MariaWireSession s{"127.0.0.1", kPort};
+  MariaWireSession s{"127.0.0.1", g_port};
   bool open = false;
   Client() { open = s.connect("erp", "stall-check", "aios_db").ok(); }
   // The statement's outcome: ok, or the error text.
@@ -61,7 +65,10 @@ struct Client {
 int main() {
   setenv("AIOS_SQL_MAX_READ_MS", "1500", 1);   // read once, at the first statement
   KernelConfig cfg;
-  cfg.root = "/tmp/aios-asql-stall-test";
+  // Its own root, so two runs at once never share one.
+  char root_dir[] = "/tmp/aios-asql-stall-XXXXXX";
+  if (!mkdtemp(root_dir)) { std::perror("mkdtemp"); return 1; }
+  cfg.root = root_dir;
   auto k = Kernel::boot(cfg);
   if (!k.ok()) { std::printf("kernel boot failed\n"); return 1; }
   SqlDatabase db(**k);
@@ -77,10 +84,31 @@ int main() {
     }
     if (!sql.empty()) db.execute_local_query(sql);
   }
-  MysqlWireServer server(**k, db, kPort, "127.0.0.1");
+  // The read must take seconds here to show anything (the deadline below is 1.5 s). 2200 rows took 2.5 s on one
+  // machine and 1.6 s on a faster one: the table grows until the read takes over 3.5 s on this one. Its cost goes
+  // with the square of the rows.
+  int table_rows = 2200;
+  for (int round = 0; round < 4; ++round) {
+    const auto t0 = std::chrono::steady_clock::now();
+    db.execute_local_query(kLongRead + " AND " + std::to_string(100 + round) + " > 1");
+    const double ms = ms_since(t0);
+    if (ms > 3500) break;
+    const int want = (int)(table_rows * std::sqrt(4500.0 / std::max(ms, 50.0))) + 1;
+    std::string sql;
+    for (int i = table_rows; i < want; ++i) {
+      sql += sql.empty() ? "INSERT INTO stall VALUES " : ",";
+      sql += "(" + std::to_string(i) + ",'w" + std::to_string((i * 7919) % 100000) + "')";
+      if ((i + 1) % 1000 == 0) { db.execute_local_query(sql); sql.clear(); }
+    }
+    if (!sql.empty()) db.execute_local_query(sql);
+    std::cout << "the long read took " << (int)ms << " ms over " << table_rows << " rows: " << want << " rows now\n";
+    table_rows = want;
+  }
+  MysqlWireServer server(**k, db, 0, "127.0.0.1");
   server.add_account("erp", "stall-check");
   auto sr = server.start();
-  check(sr.ok(), "wire server listening on " + std::to_string(kPort));
+  g_port = server.port();
+  check(sr.ok(), "wire server listening on " + std::to_string(g_port));
   server.start_background();
 
   // How long the read takes alone, with no deadline (it is a nested statement here, not a top-level read).
@@ -156,7 +184,7 @@ int main() {
     const double took = ms_since(t0);
     check(r.find("interrupted") != std::string::npos && took < 2500, "a read over the deadline ended after " + std::to_string((int)took) + " ms: " + r);
     std::vector<std::vector<std::string>> rows;
-    check(c.run("SELECT COUNT(*) FROM stall", &rows) == "ok" && !rows.empty() && rows[0][0] == "2200", "the session is fine after it");
+    check(c.run("SELECT COUNT(*) FROM stall", &rows) == "ok" && !rows.empty() && rows[0][0] == std::to_string(table_rows), "the session is fine after it");
     // The shape that stalled atl: a correlated subquery per outer row (its loop had no check for KILL at all, so
     // the deadline, like KILL QUERY, could not reach it: 7 s against a 1.5 s deadline on the served engine).
     const auto t1 = std::chrono::steady_clock::now();
@@ -205,6 +233,8 @@ int main() {
   server.stop_background();
   server.stop();
   db.execute_local_query("DROP TABLE stall");
+  std::error_code ec;
+  std::filesystem::remove_all(root_dir, ec);
   std::cout << (g_failures ? "FAILED\n" : "PASSED\n");
   return g_failures ? 1 : 0;
 }

@@ -296,7 +296,7 @@ class MysqlWireServer {
                              const std::function<void()>& on_idle = nullptr);
   Result<void> send_ok(hal::Connection& conn, uint8_t seq, uint64_t affected_rows = 0,
                        uint64_t last_insert_id = 0, uint16_t status = 0x0002,
-                       const std::string& msg = "");
+                       const std::string& msg = "", uint16_t warnings = 0);
   Result<void> send_err(hal::Connection& conn, uint8_t seq, uint16_t err_code,
                         const std::string& sqlstate, const std::string& msg);
 };

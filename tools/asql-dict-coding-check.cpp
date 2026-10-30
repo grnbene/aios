@@ -17,6 +17,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -203,8 +204,8 @@ int main() {
   std::printf("=== ASQL dictionary maintenance check (narrowed codes, coded dictionaries) ===\n");
   setenv("AIOS_STORE_MAINTAIN_MS", "2000", 1);
   setenv("AIOS_ZONE_VERIFY", "1", 1);   // every incremental zone-map update checked against a rescan
-  const std::string root = "/tmp/aios-asql-dictcheck";
-  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
+  const CheckRoot check_root("/tmp/aios-asql-dictcheck");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

@@ -2169,8 +2169,19 @@ These worked over the wire:
   `DELETE t1[, t2] FROM <tables> [WHERE]` (a target named by alias), and
   `DELETE FROM t1 USING <tables> [WHERE]`; each target needs a primary key
 - correlated scalar subqueries
-- `WITH` and `WITH RECURSIVE`
-- `GROUP_CONCAT(... ORDER BY ... SEPARATOR ...)`; `JSON_ARRAYAGG([DISTINCT] x
+- `WITH` and `WITH RECURSIVE` (at the start of a statement or a view; not
+  yet inside a subquery). A recursive CTE's recursive part runs at most
+  `max_recursive_iterations` times (MariaDB's: default 1000, up to 4294967295,
+  `SET [SESSION | GLOBAL] max_recursive_iterations = n`); one still making
+  rows at the limit stops there with warning 1931. Under a strict `sql_mode`
+  that is error 1931 instead, writing nothing, in an `INSERT`, `REPLACE`,
+  `UPDATE` or `CREATE TABLE ... SELECT` and in a stored function or trigger.
+  An answer a recursive CTE gave is not cached.
+- `SHOW WARNINGS` / `SHOW ERRORS [LIMIT [offset,] n]`, `SHOW COUNT(*)
+  WARNINGS | ERRORS`, `@@warning_count`, `@@error_count`: the last
+  statement's warnings (the wire's OK / EOF packets carry the count)
+- `GROUP_CONCAT(... ORDER BY ... SEPARATOR '...')` (a string literal; `''`
+  joins with nothing); `JSON_ARRAYAGG([DISTINCT] x
   [ORDER BY ...])` and `JSON_OBJECTAGG(k, v)`
 - `information_schema.VIEWS` (definition, definer, security, algorithm)
 - `JSON_EXTRACT`, `DATE_FORMAT`, `DATEDIFF`, `REGEXP`, `CAST(... AS DECIMAL(p,s))`

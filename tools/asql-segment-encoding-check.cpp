@@ -16,6 +16,7 @@
 #include "aios/userland/portable_int128.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -161,8 +162,8 @@ void verify(SqlDatabase& db, const std::vector<Row>& model, const char* step) {
 
 int main() {
   std::printf("=== ASQL per-segment encoding check (SegmentFOR, ALP) ===\n");
-  const std::string root = "/tmp/aios-asql-segcheck";
-  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
+  const CheckRoot check_root("/tmp/aios-asql-segcheck");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

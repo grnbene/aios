@@ -2646,6 +2646,10 @@ bool sql_wire_results();
 // statement just run (0 when it generated none) and clears it for the next.
 uint64_t sql_last_insert_id();
 uint64_t sql_take_statement_insert_id();
+// The warnings the session's last statement raised (what SHOW WARNINGS lists), for the wire's OK / EOF packet.
+// A statement answered from the wire's cached packets clears them, as a statement run does at its start.
+uint64_t sql_statement_warning_count();
+void sql_clear_statement_conditions();
 // While set on this thread, every table a SELECT's plan reads is added to
 // *sink (a Thing's links are the tables its query actually touches).
 void sql_set_read_capture(std::unordered_set<const struct SqlTable*>* sink);
@@ -3740,6 +3744,7 @@ class SqlDatabase {
   // Returns the index only if one already exists for this table -- the read
   // path must never be what creates it.
   void grow_row_index(const SqlTable& t);
+  void warm_row_index(const SqlTable& t);
   std::shared_ptr<RowIndex> find_row_index(const SqlTable& t);
   void invalidate_row_index() {
     {
