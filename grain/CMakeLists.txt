@@ -90,6 +90,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/crypto/bcrypt.cpp
   ${AIOS_ROOT}/src/userland/glyph_engine.cpp
   ${AIOS_ROOT}/src/userland/font_atlas.cpp
+  ${AIOS_ROOT}/src/userland/font_cov.cpp
   ${AIOS_ROOT}/src/userland/font_kerning.cpp
   # face widgets (ui.*): face's layout and painting, its type and pixels, PNG for its images
   ${AIOS_ROOT}/src/userland/grain_face.cpp
