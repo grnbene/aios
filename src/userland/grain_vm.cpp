@@ -1489,6 +1489,16 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
           break;
         }
         if (b.as_double() == 0.0) { fail(line, "division by zero"); break; }
+        if (both_int(a, b)) {
+          // Exact: an int when it divides evenly (10 / 2 is 5), else the decimal quotient (7 / 2 is 3.5; 1 / 3 is
+          // 0.333333333333, 12 places for one that does not end) - never the binary 3.5000000000000004 kind.
+          if (a.i % b.i == 0 && !(a.i == INT64_MIN && b.i == -1)) { S.stack.push_back(Value::integer(a.i / b.i)); break; }
+          Value r;
+          std::string why;
+          if (!decimal_arith('/', a, b, r, why)) { fail(line, why); break; }
+          S.stack.push_back(std::move(r));
+          break;
+        }
         S.stack.push_back(Value::real(a.as_double() / b.as_double()));
         break;
       }

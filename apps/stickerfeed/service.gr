@@ -37,7 +37,7 @@ fn secret(name) {
 fn loose_empty_string(v) {
   if v == nil or v == false or v == "" { return true }
   let t = type(v)
-  if t == "int" or t == "real" { return v == 0 }
+  if t == "int" or t == "real" or t == "decimal" { return v == 0 }   // 0.0 is a decimal now
   return false
 }
 

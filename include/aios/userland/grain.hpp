@@ -144,14 +144,16 @@ class BytesObj final : public Obj {
   std::vector<uint8_t> data;
 };
 
-// An exact decimal number: mantissa / 10^scale, held as a 128-bit integer (38 digits) and a scale from 0 to 30.
+// An exact decimal number: mantissa / 10^scale, held as a 128-bit integer (38 digits) and a scale from 0 to 30 - or,
+// with den set, the exact fraction mant / den (a quotient that does not end, 1 / 3), printing with `scale` places.
 // Immutable, so it is shared between VMs like a string. 1.50 and 1.5 are the same number and compare equal; the
 // scale only decides how it prints. See grain_std_decimal.cpp for the arithmetic and its rules.
 class DecimalObj final : public Obj {
  public:
-  DecimalObj(AIOS_INT128 m, int s) : Obj(Type::Decimal), mant(m), scale(s) {}
+  DecimalObj(AIOS_INT128 m, int s, AIOS_INT128 d = 0) : Obj(Type::Decimal), mant(m), scale(s), den(d) {}
   AIOS_INT128 mant;
   int scale;
+  AIOS_INT128 den;   // 0: a decimal that ends; else the fraction's denominator (reduced, up to 10^36)
 };
 
 class ListObj final : public Obj {
