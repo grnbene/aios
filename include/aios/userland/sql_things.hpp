@@ -97,6 +97,7 @@
 // replayed after a crash computes exactly what it computed the first time.
 // LINKS lets it read another Thing - claims(kind, keys) gives a claims kind's
 // queues - and hear whenever those queues are shared out again.
+#include <chrono>
 #include <cstdint>
 #include "aios/hal/sync.hpp"
 #include <functional>
@@ -360,6 +361,15 @@ class ThingEngine {
     std::string grain_error;                    // the last run that failed, shown by SHOW THINGS
     std::string shared_json;                    // shared() as saved, until the VM takes it back
     double last_full_ms = 0;
+    // A full pass under way (a sweep): enroll()'s keys, then the ones that left, recomputed a slice at a time - each
+    // slice a settle of its own, the engine's lock (and the statement lock) let go between them, so one big kind's
+    // pass no longer holds every reader and every other kind for its whole length. Not saved: a restart runs the
+    // pass again from the start.
+    std::vector<std::string> sweep;
+    size_t sweep_at = 0;
+    std::string sweep_cause;
+    uint64_t sweep_t0 = 0;
+    double sweep_ms_per_key = 0;      // measured as it goes: sizes the next slice to the budget
     // RESOURCE: one Thing per key, capacity = SUM(cap_col) of cap_table rows.
     // Only keys something claims are held (the rest cannot change anything).
     std::vector<std::string> key_cols;
@@ -505,6 +515,11 @@ class ThingEngine {
   void settle_grain(Kind& k);
   // keep_notices: what arrived meanwhile stays to be seen (a replacement built while writes go on)
   bool grain_full(Kind& k, const std::string& cause, std::string* err, bool keep_notices = false);
+  // The full pass in slices (settle's way of running one; grain_full stays for CREATE, load and a replacement's build,
+  // which run with the lock let go or before anything reads): start reads shared() and enroll() and queues the keys;
+  // step recomputes them until the deadline and says whether the pass is done.
+  bool grain_sweep_start(Kind& k, const std::string& cause, std::string* err);
+  bool grain_sweep_step(Kind& k, std::chrono::steady_clock::time_point deadline, bool* done, std::string* err);
   SqlQueryResult replace_grain(Kind&& k, std::unique_lock<aios::hal::Mutex>& lk);
  public:
   // CREATE OR REPLACE THING of a grain Thing that exists, run by the caller outside any statement lock (so the old
@@ -568,6 +583,8 @@ class ThingEngine {
   // An engine clock: true when some Thing is due (an event's time, or a new
   // day for the ones that wait on the date). Cheap; no queries.
   bool due_now();
+  // Settle work left over by a slice (a sweep, or reactions past the budget): the clock comes back for it at once.
+  bool work_left() const;
   // Pull the mirrors whose time has come. No lock held: a peer that is slow
   // or gone costs the pull its own time, never a statement's.
   void pull_mirrors();
