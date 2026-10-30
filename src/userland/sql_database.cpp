@@ -42631,7 +42631,7 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
     fsrc[f].table = fakes[f].get();
   }
   JoinedRow jr;
-  jr.parts.assign(fsrc.size(), 0);
+  for (size_t f = 0; f < fsrc.size(); ++f) jr.parts.push_back(0);
   EvalCtx oc;
   oc.db = db;
   oc.sources = &fsrc;
@@ -42695,7 +42695,8 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
   t->name = src.alias;
   for (size_t c = 0; c < names.size(); ++c) {
     SqlColumn col;
-    col.name = c < src.column_names.size() ? src.column_names[c] : names[c];
+    // A generate_series' one column, unlisted, is named by its alias (as materialize_series names it).
+    col.name = c < src.column_names.size() ? src.column_names[c] : !src.series_args.empty() ? src.alias : names[c];
     col.type = c < types.size() ? types[c] : SqlDataType::Text;
     col.declared_text = c < is_string.size() && is_string[c];
     t->columns.push_back(col);
