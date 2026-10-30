@@ -73,7 +73,6 @@ let BOARD_CSS = join([
   "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: " + u(2) + " " + u(8) + "; }",
   "html[data-host='1'] .item.loadable, html[data-host='1'] .next-item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
   "html[data-host='1'] .loadable.busy { opacity: .45; pointer-events: none; }",
-  ".order.active { box-shadow: inset " + u(4) + " 0 0 var(--claimed); }",
   "#dock-note { position: fixed; left: 50%; bottom: " + u(56) + "; transform: translateX(-50%); padding: " + u(10) + " " + u(18) + "; border-radius: " + u(8) + "; font-size: " + u(18) + "; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
   "#dock-note.show { opacity: 1; } #dock-note.ok { background: var(--loaded); } #dock-note.err { background: var(--open); }",
   ".next-item { font-size: " + u(28) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
@@ -237,7 +236,7 @@ fn order_node(o, active, shown) {
   if len(rows) == 0 { return "" }
   // keyed by order (and its head and lines by what they are): an order that moves up the list is moved, a new one
   // comes in, and a line that changes state keeps its element so its tag fades to the new colour
-  return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order"), "data-key": "order-" + o.orderno},
+  return el("div", {"class": done ? "order done" : "order", "data-key": "order-" + o.orderno},
             el("div", {"class": "order-head", "data-key": "head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
             ...rows)
 }
@@ -324,12 +323,11 @@ fn bay_node(b) {
   let shown_line = nx == nil ? "" : nx.line.line
   let loading = el("span", {"class": "clock none"}, "not started")
   if not is_blank(b.timestarted) { loading = clock_node(b.timestarted, 20, 30, "hms") }
-  // orders still to load first; loaded ones sink, keeping run order within each group
-  // orders with a line nobody has taken first, then the rest still to load, loaded ones last; run order within each
+  // the truck in load order (last stop first), as the loaders put it on - orders still to load, then the loaded ones,
+  // each in that order. Lines nobody has taken are in the red banner above, not pulled out of order here.
   let orders = sort_by(b.orders ?? [], fn (o) {
     let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
-    let needs = len(filter(o.lines ?? [], fn (l) { return line_state(l).cls == "open" })) > 0
-    return [done ? 2 : (needs ? 0 : 1), -real(o.sort)]
+    return [done ? 1 : 0, -real(o.sort)]
   })
   // keyed by the door and the run on it: a new truck is a new bay (it comes in); the same one is updated in place
   return el("div", {"class": "bay", "data-bay": b.bay, "data-key": "bay-" + b.bay + "-" + b.dispnumber},
