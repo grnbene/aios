@@ -49,21 +49,21 @@ let BOARD_CSS = join([
   ".state { display: inline-flex; align-items: center; gap: " + u(8) + "; justify-content: flex-end; }",
   ".state .clock { font-size: " + u(22) + "; } .times { display: inline-flex; align-items: baseline; gap: " + u(5) + "; }",
   ".alert .clock { margin-left: " + u(4) + "; }",
-  // NEEDS A PICKER: read from 10-15 ft (55" TV) - the tire at 40, its bin at 30, both bold
-  ".alert.pick { padding: " + u(10) + " " + u(14) + " " + u(12) + "; border-left: " + u(8) + " solid var(--open); }",
-  ".pick-head { display: flex; justify-content: space-between; align-items: center; font-size: " + u(24) + "; font-weight: 800; letter-spacing: .5px; }",
-  ".pick-n { background: var(--open); color: var(--open-ink); border-radius: " + u(20) + "; padding: 0 " + u(14) + "; font-size: " + u(26) + "; min-width: " + u(40) + "; text-align: center; }",
-  ".needs { display: grid; gap: " + u(10) + "; margin-top: " + u(8) + "; }",
+  // NEEDS A PICKER: read from 10-15 ft (55" TV) - the tire at 33, its bin at 25, both bold (about a fifth under the first cut)
+  ".alert.pick { padding: " + u(8) + " " + u(11) + " " + u(10) + "; border-left: " + u(7) + " solid var(--open); }",
+  ".pick-head { display: flex; justify-content: space-between; align-items: center; font-size: " + u(20) + "; font-weight: 800; letter-spacing: .5px; }",
+  ".pick-n { background: var(--open); color: var(--open-ink); border-radius: " + u(16) + "; padding: 0 " + u(11) + "; font-size: " + u(21) + "; min-width: " + u(33) + "; text-align: center; }",
+  ".needs { display: grid; gap: " + u(8) + "; margin-top: " + u(7) + "; }",
   ".need { color: var(--strong); min-width: 0; }",
-  ".need + .need { border-top: 1px solid var(--open-soft); padding-top: " + u(8) + "; }",
-  ".need-top { display: flex; align-items: baseline; gap: " + u(12) + "; min-width: 0; line-height: 1.1; }",
-  ".need-qty { font-size: " + u(34) + "; font-weight: 800; color: var(--open-text); flex: none; font-variant-numeric: tabular-nums; }",
-  ".need-item { font-size: " + u(40) + "; font-weight: 800; letter-spacing: .3px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
-  ".need-sub { display: flex; align-items: baseline; gap: " + u(14) + "; margin-top: " + u(2) + "; }",
-  ".need-bin { font-size: " + u(30) + "; font-weight: 800; color: var(--text); }",
-  ".need-order { font-size: " + u(20) + "; font-weight: 600; color: var(--muted); }",
-  ".need-sub .clock { font-size: " + u(28) + "; margin-left: auto; }",
-  ".need-more { font-size: " + u(22) + "; font-weight: 700; color: var(--open-text); }",
+  ".need + .need { border-top: 1px solid var(--open-soft); padding-top: " + u(7) + "; }",
+  ".need-top { display: flex; align-items: baseline; gap: " + u(10) + "; min-width: 0; line-height: 1.1; }",
+  ".need-qty { font-size: " + u(28) + "; font-weight: 800; color: var(--open-text); flex: none; font-variant-numeric: tabular-nums; }",
+  ".need-item { font-size: " + u(33) + "; font-weight: 800; letter-spacing: .3px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".need-sub { display: flex; align-items: baseline; gap: " + u(11) + "; margin-top: " + u(2) + "; }",
+  ".need-bin { font-size: " + u(25) + "; font-weight: 800; color: var(--text); }",
+  ".need-order { font-size: " + u(16) + "; font-weight: 600; color: var(--muted); }",
+  ".need-sub .clock { font-size: " + u(23) + "; margin-left: auto; }",
+  ".need-more { font-size: " + u(18) + "; font-weight: 700; color: var(--open-text); }",
   ".bars { margin-top: " + u(10) + "; display: grid; gap: " + u(6) + "; }",
   ".next { margin-top: " + u(10) + "; padding: " + u(6) + " " + u(12) + "; border-radius: " + u(8) + "; border: 2px solid var(--line); border-left: " + u(8) + " solid var(--picked); background: var(--bg); }",
   ".next-top { display: flex; justify-content: space-between; align-items: baseline; }",
@@ -73,10 +73,9 @@ let BOARD_CSS = join([
   "html[data-host='1'] .qty.loadable, html[data-host='1'] .next-count.loadable { background: var(--open); color: #fff; padding: " + u(2) + " " + u(8) + "; }",
   "html[data-host='1'] .item.loadable, html[data-host='1'] .next-item.loadable { text-decoration: underline dotted; text-underline-offset: 3px; }",
   "html[data-host='1'] .loadable.busy { opacity: .45; pointer-events: none; }",
-  ".order.active { box-shadow: inset " + u(4) + " 0 0 var(--claimed); }",
   "#dock-note { position: fixed; left: 50%; bottom: " + u(56) + "; transform: translateX(-50%); padding: " + u(10) + " " + u(18) + "; border-radius: " + u(8) + "; font-size: " + u(18) + "; font-weight: 700; color: #fff; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 9; }",
   "#dock-note.show { opacity: 1; } #dock-note.ok { background: var(--loaded); } #dock-note.err { background: var(--open); }",
-  ".next-item { font-size: " + u(28) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
+  ".next-item { font-size: " + u(34) + "; font-weight: 800; color: var(--strong); letter-spacing: .3px; line-height: 1.15; word-break: break-all; }",
   ".next-desc { font-size: " + u(17) + "; color: var(--text); margin-top: " + u(2) + "; }",
   ".next-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(16) + "; color: var(--muted); }",
   ".next-meta .bin { color: var(--text); font-weight: 700; margin-right: " + u(6) + "; }",
@@ -97,11 +96,12 @@ let BOARD_CSS = join([
   ".order-no { font-weight: 700; color: var(--strong); } .order-cust { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
   ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(25) + "; }",
   ".ln .qty { flex: 0 0 " + u(62) + "; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
-  ".ln .item { flex: 1 1 " + u(180) + "; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .state { margin-left: auto; }",
+  ".ln .item { flex: 1 1 " + u(180) + "; font-size: " + u(30) + "; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .state { margin-left: auto; }",
   ".ln .bin { color: var(--muted); font-size: " + u(20) + "; font-weight: 500; margin-left: " + u(6) + "; }",
   // a line keeps its tag as it moves along (NO CLAIM, a picker, PICKED, LOADED): the colour fades to the next one
   ".tag { padding: " + u(3) + " " + u(10) + "; border-radius: " + u(5) + "; font-size: " + u(20) + "; font-weight: 700; white-space: nowrap; transition: background-color .6s, color .6s; }",
   ".tag.open { background: var(--open); color: var(--open-ink); }",
+  ".by { font-size: " + u(18) + "; font-weight: 600; color: var(--muted); white-space: nowrap; }",
   ".tag.claimed { background: var(--claimed); color: var(--claimed-ink); }",
   ".tag.picked { background: var(--picked); color: var(--picked-ink); }",
   ".tag.loaded { background: var(--loaded); color: #ffffff; }",
@@ -148,6 +148,28 @@ fn line_state(l) {
   // partly picked with no claim: someone is on it, so it is being picked - named by who picked so far
   if real(l.picked) > 0 { return {"cls": "claimed", "text": (l.picker == "" ? "PICKING" : l.picker) + part} }
   return {"cls": "open", "text": "NO CLAIM"}
+}
+
+// Who picked what is on the dock - small and grey to the left of the tag (so the tags stay in line), for when it can't be found and someone has to ask.
+fn by_node(l, st) {
+  if st.cls != "picked" and not contains(st.text, "ON DOCK") and not contains(st.text, "STAGING") { return "" }
+  return l.picker == "" ? "" : el("span", {"class": "by"}, l.picker)
+}
+
+// The loader's view of a line: on the truck, on the dock (picked and waiting to go on), or still in its bin needing a picker.
+fn load_state(l) {
+  let qty = real(l.qty)
+  let loaded = real(l.loaded)
+  if qty > 0 and loaded >= qty { return {"cls": "loaded", "text": "LOADED"} }
+  let left = qty - loaded
+  let dock = max(0, min(left, real(l.picked) - loaded))
+  let fetch = left - dock
+  let bin = l.bin == "" ? "" : " · " + l.bin
+  // picked out of STAGING it is still in staging, not on the dock - the loaders were searching the dock for it
+  let where = upper(trim(l.bin)) == "STAGING" ? "STAGING" : "ON DOCK"
+  if fetch <= 0 { return {"cls": "picked", "text": where} }
+  if dock <= 0 { return {"cls": "open", "text": "NEEDS PICKER" + bin} }
+  return {"cls": "open", "text": qty_text(dock) + " " + where + " · " + qty_text(fetch) + " NEEDS PICKER" + bin}
 }
 
 fn line_rank(l) {
@@ -213,15 +235,29 @@ fn load_attrs(cls, bay, o, l, delta) {
 // active: the bay when this is its order to load now (the one the loading screen takes scans for), else "".
 // shown: the line already up big in Next to load ("" for none) - not listed a second time under it.
 fn order_node(o, active, shown) {
-  let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
+  // loaded and through; a credit stays a stop on the route (it is never "loaded")
+  let done = not o.credit and real(o.units) > 0 and real(o.loaded) >= real(o.units)
   let rows = []
+  // a credit is a stop where the driver collects returns: what comes back on the truck, nothing to load or tap
   if o.credit {
-    push(rows, el("div", {"class": "ln", "data-key": "credit"}, el("span", {"class": "qty"}, ""), el("span", {"class": "item"}, "Credit pickup"),
-                  el("span", {"class": "tag credit"}, "CREDIT")))
+    let ps = o.pickups ?? []
+    if len(ps) == 0 {
+      push(rows, el("div", {"class": "ln", "data-key": "credit"}, el("span", {"class": "qty"}, ""), el("span", {"class": "item"}, "Credit pickup"),
+                    el("span", {"class": "state"}, el("span", {"class": "tag credit"}, "PICK UP"))))
+    }
+    for p in ps {
+      push(rows, el("div", {"class": "ln", "data-key": "pickup-" + p.stockid}, el("span", {"class": "qty"}, qty_text(p.qty) + "x"),
+                    el("span", {"class": "item"}, p.stockid), el("span", {"class": "state"}, el("span", {"class": "tag credit"}, "PICK UP"))))
+    }
   }
-  for l in sort_by(o.lines ?? [], fn (l) { return [line_rank(l), l.line] }) {
+  if done {
+    return el("div", {"class": "order done", "data-key": "order-" + o.orderno},
+              el("div", {"class": "order-head", "data-key": "head"}, el("span", {"class": "order-no"}, "✓ #" + o.orderno),
+                 el("span", {"class": "order-cust"}, o.customer)))
+  }
+  for l in sort_by(o.lines ?? [], fn (l) { return l.line }) {
     if active != "" and l.line == shown { continue }
-    let st = line_state(l)
+    let st = load_state(l)
     let qty = el("span", {"class": "qty"}, qty_text(l.qty) + "x")
     let item = el("span", {"class": "item"}, l.stockid, el("span", {"class": "bin"}, l.bin))
     if active != "" {
@@ -231,13 +267,13 @@ fn order_node(o, active, shown) {
       if real(l.loaded) > 0 { item = el("span", load_attrs("item", active, o, l, "-1"), l.stockid, el("span", {"class": "bin"}, l.bin)) }
     }
     push(rows, el("div", {"class": "ln", "data-key": "line-" + str(l.line)}, qty, item,
-                  el("span", {"class": "state"}, el("span", {"class": "tag " + st.cls}, st.text), line_clock(l, st.cls))))
+                  el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))))
   }
   // its only line is the one up in Next to load, which names the order and customer too
   if len(rows) == 0 { return "" }
   // keyed by order (and its head and lines by what they are): an order that moves up the list is moved, a new one
   // comes in, and a line that changes state keeps its element so its tag fades to the new colour
-  return el("div", {"class": done ? "order done" : (active != "" ? "order active" : "order"), "data-key": "order-" + o.orderno},
+  return el("div", {"class": done ? "order done" : "order", "data-key": "order-" + o.orderno},
             el("div", {"class": "order-head", "data-key": "head"}, el("span", {"class": "order-no"}, "#" + o.orderno), el("span", {"class": "order-cust"}, o.customer)),
             ...rows)
 }
@@ -275,7 +311,7 @@ fn next_node(b) {
   let n = next_to_load(b)
   if n == nil { return "" }
   let l = n.line
-  let st = line_state(l)
+  let st = load_state(l)
   return el("div", {"class": "next"},
             el("div", {"class": "next-top"}, el("span", {"class": "lbl"}, "Next to load"),
                el("span", load_attrs("next-count", b.bay, n.order, l, "1"), qty_text(l.loaded) + "/" + qty_text(l.qty))),
@@ -284,8 +320,7 @@ fn next_node(b) {
             el("div", {"class": "next-desc"}, l.description),
             el("div", {"class": "next-meta"},
                el("span", "#" + n.order.orderno + " · " + n.order.customer),
-               el("span", {"class": "state"}, l.bin == "" ? "" : el("span", {"class": "bin"}, l.bin),
-                  el("span", {"class": "tag " + st.cls}, st.text))))
+               el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))))
 }
 
 fn bay_node(b) {
@@ -294,42 +329,35 @@ fn bay_node(b) {
               el("div", {"class": "bay-head"}, el("div", {"class": "bay-title"}, el("span", {"class": "bay-name"}, "BAY " + b.bay))),
               el("div", {"class": "empty"}, "No truck"))
   }
-  let alert = el("div", {"class": "alert ok"}, "All picked")
-  // The lines nobody has taken, longest-waiting first: what someone with a free minute can go and pick ahead. The
-  // biggest thing on the bay, read from 10-15 ft on the dock's 55" TV - the tire and how many on one line, the bin
-  // and how long it has waited under it. Counted from what is listed (a partly picked line with no claim is being
-  // picked, as its row says, though the Thing counts it as unclaimed).
-  let waiting = []
+  // A loading board: what is on the dock and what still needs a picker, over every line not on the truck yet.
+  let on_dock = 0.0
+  let staged = 0.0
+  let to_get = 0.0
   for o in b.orders ?? [] {
-    for l in o.lines ?? [] { if line_state(l).cls == "open" { push(waiting, {"order": o, "line": l}) } }
+    if o.credit { continue }
+    for l in o.lines ?? [] {
+      let left = real(l.qty) - real(l.loaded)
+      if left > 0 {
+        let dock = max(0, min(left, real(l.picked) - real(l.loaded)))
+        if upper(trim(l.bin)) == "STAGING" { staged = staged + dock } else { on_dock = on_dock + dock }
+        to_get = to_get + (left - dock)
+      }
+    }
   }
-  waiting = sort_by(waiting, fn (w) { return w.line.released_at == "" ? "9999" : w.line.released_at })
-  if len(waiting) > 0 {
-    let rows = map(take(waiting, 3), fn (w) {
-      return el("div", {"class": "need", "data-key": "need-" + w.order.orderno + "-" + str(w.line.line)},
-                el("div", {"class": "need-top"}, el("span", {"class": "need-qty"}, qty_text(w.line.qty) + "×"),
-                   el("span", {"class": "need-item"}, w.line.stockid)),
-                el("div", {"class": "need-sub"}, el("span", {"class": "need-bin"}, w.line.bin == "" ? "no bin" : w.line.bin),
-                   el("span", {"class": "need-order"}, "#" + w.order.orderno), clock_node(w.line.released_at, 15, 30, "m")))
-    })
-    if len(waiting) > 3 { push(rows, el("div", {"class": "need-more", "data-key": "more"}, "+ " + str(len(waiting) - 3) + " more below")) }
-    alert = el("div", {"class": "alert pick"},
-               el("div", {"class": "pick-head"}, "NEEDS A PICKER", el("span", {"class": "pick-n"}, str(len(waiting)))),
-               el("div", {"class": "needs"}, ...rows))
-  } else if b.lines_open > 0 {
-    alert = el("div", {"class": "alert ok"}, "Every open line is claimed")
-  }
+  let summary = el("div", {"class": to_get > 0 ? "alert" : "alert ok"},
+                   qty_text(on_dock) + " on the dock · " + (staged > 0 ? qty_text(staged) + " in staging · " : "") +
+                   qty_text(to_get) + " need a picker")
   let nx = next_to_load(b)
   let active_no = nx == nil ? "" : nx.order.orderno
   let shown_line = nx == nil ? "" : nx.line.line
   let loading = el("span", {"class": "clock none"}, "not started")
   if not is_blank(b.timestarted) { loading = clock_node(b.timestarted, 20, 30, "hms") }
-  // orders still to load first; loaded ones sink, keeping run order within each group
-  // orders with a line nobody has taken first, then the rest still to load, loaded ones last; run order within each
+  // the truck in load order (last stop first), as the loaders put it on - orders still to load, then the loaded ones,
+  // each in that order.
+  // credits keep their stop: a pickup sits where the driver makes it, not after everything loaded
   let orders = sort_by(b.orders ?? [], fn (o) {
-    let done = o.credit or (real(o.units) > 0 and real(o.loaded) >= real(o.units))
-    let needs = len(filter(o.lines ?? [], fn (l) { return line_state(l).cls == "open" })) > 0
-    return [done ? 2 : (needs ? 0 : 1), -real(o.sort)]
+    let done = not o.credit and real(o.units) > 0 and real(o.loaded) >= real(o.units)
+    return [done ? 1 : 0, -real(o.sort)]
   })
   // keyed by the door and the run on it: a new truck is a new bay (it comes in); the same one is updated in place
   return el("div", {"class": "bay", "data-bay": b.bay, "data-key": "bay-" + b.bay + "-" + b.dispnumber},
@@ -350,9 +378,8 @@ fn bay_node(b) {
                el("div", {"class": "bay-clocks"},
                   el("span", {"class": "bc"}, el("span", {"class": "lbl"}, "On bay"), clock_node(b.timeassigned, 0, 0, "hms")),
                   el("span", {"class": "bc"}, el("span", {"class": "lbl"}, "Loading"), loading)),
-               el("div", {"class": "bars"}, bar_node("Picked", "picked", b.picked, b.units, "to pick"),
-                  bar_node("Loaded", "loaded", b.loaded, b.units, "to load")),
-               alert,
+               el("div", {"class": "bars"}, bar_node("Loaded", "loaded", b.loaded, b.units, "to load")),
+               summary,
                next_node(b)),
             el("div", {"class": "orders"}, ...filter(map(orders, fn (o) { return o.orderno == active_no ? order_node(o, b.bay, shown_line) : order_node(o, "", "") }),
                                                      fn (n) { return n != "" })))

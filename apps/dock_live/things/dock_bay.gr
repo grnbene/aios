@@ -46,6 +46,7 @@ fn things(ks, sh) {
     }
   }
   let lines_of = order_lines(ordernos)
+  let pickups_of = credit_pickups(map(filter(stops, fn (d) { return s(d.type) == "11" }), fn (d) { return s(d.invoice) }))
   let picks_of = pick_rows(ordernos)
 
   let out = {}
@@ -79,7 +80,7 @@ fn things(ks, sh) {
         let o = s(d.invoice)
         let credit = s(d.type) == "11"
         let order = {"orderno": o, "customer": names[o] ?? "", "sort": n(d.sort), "credit": credit, "lines": [],
-                     "units": 0.0, "picked": 0.0, "loaded": 0.0}
+                     "pickups": credit ? (pickups_of[o] ?? []) : [], "units": 0.0, "picked": 0.0, "loaded": 0.0}
         if not credit {
           for ln in lines_of[o] ?? [] {
             let p = line_pick(picks_of[o + "|" + ln.line])
@@ -143,7 +144,7 @@ fn touched(table, op, before, after, sh) {
     let by_truck = bay_by_truck(active_loadings())
     return unique(compact(map(rows, fn (r) { return by_truck[s(r.truckid)] })))
   }
-  if t == "pickingfreeze" or t == "salesorderdetails" {
+  if t == "pickingfreeze" or t == "salesorderdetails" or t == "creditorderdetails" {
     return bays_of_orders(map(rows, fn (r) { return s(r.orderno) }))
   }
   if t == "custbranch" or t == "tagalong" or t == "product_types" { return "all" }
