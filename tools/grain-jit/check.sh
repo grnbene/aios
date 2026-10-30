@@ -11,6 +11,7 @@
 #
 #   tools/grain-jit/check.sh            build + compare
 #   tools/grain-jit/check.sh --no-build compare with the last build
+#   tools/grain-jit/check.sh --arm64 <aarch64 grain build dir>   AArch64's, against the whole cross-built library
 #   tools/grain-jit/check.sh --x86 <grain build dir>   the x86-64 compiler (grain_jit_x64.cpp), natively: the
 #                                       runner linked against that build's libgrain_lang.a (cmake -S grain -B <dir>)
 # Needs: aarch64-linux-gnu-g++, qemu-user-static (not for --x86).
@@ -24,11 +25,17 @@ lib=
 if [ "${1:-}" = "--x86" ]; then
   CXX=g++; RUN=; out="$out-x86"; lib="${2:?--x86 wants the grain build directory}/libgrain_lang.a"; shift 2
   [ -f "$lib" ] || { echo "no $lib (cmake --build the grain directory first)"; exit 1; }
+elif [ "${1:-}" = "--arm64" ]; then
+  # The whole library cross-built (cmake -S grain -B <dir> -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64
+  # -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++; cmake --build <dir>
+  # --target grain_lang), linked statically and run under qemu: the hand-kept source list below fell behind.
+  lib="${2:?--arm64 wants the aarch64 grain build directory}/libgrain_lang.a"; shift 2
+  [ -f "$lib" ] || { echo "no $lib (cross-build grain_lang first)"; exit 1; }
 fi
 mkdir -p "$out"
 FLAGS=(-std=c++20 -O2 -I"$S/include" -I"$S/src/userland" -I"$S/src")
 if [ -n "$lib" ]; then
-  $CXX "${FLAGS[@]}" -c "$here/runner.cpp" -o "$out/runner.o" && $CXX -o "$out/gr" "$out/runner.o" "$lib" -ldl -lpthread -lrt ||
+  $CXX "${FLAGS[@]}" -c "$here/runner.cpp" -o "$out/runner.o" && $CXX $([ -n "$RUN" ] && echo -static) -o "$out/gr" "$out/runner.o" "$lib" -ldl -lpthread -lrt ||
     { echo "link failed"; exit 1; }
 elif [ "${1:-}" != "--no-build" ]; then
   # The portable standard library only (install_core_builtins): nothing here
@@ -36,7 +43,7 @@ elif [ "${1:-}" != "--no-build" ]; then
   srcs=(src/userland/grain_lexer src/userland/grain_parser src/userland/grain_compiler src/userland/grain_vm
         src/userland/grain_jit_arm64 src/userland/grain_jit_x64 src/userland/grain_builtins src/userland/grain_std_hash
         src/userland/grain_std_decimal src/core/ids
-        src/userland/font_atlas src/userland/glyph_engine src/hal/posix_sync
+        src/userland/font_atlas src/userland/font_cov src/userland/glyph_engine src/hal/posix_sync src/crypto/aes_gcm src/core/base64 src/crypto/bcrypt
         src/crypto/sha256 src/crypto/sha1 src/crypto/sha512 src/crypto/md5 src/crypto/keccak256 src/crypto/hmac_sha256)
   for f in "${srcs[@]}"; do $CXX "${FLAGS[@]}" -c "$S/$f.cpp" -o "$out/$(basename $f).o" & done
   $CXX "${FLAGS[@]}" -c "$here/runner.cpp" -o "$out/runner.o" &
