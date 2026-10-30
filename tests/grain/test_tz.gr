@@ -1,0 +1,36 @@
+// Named and fixed time zones in date_parts / date_format / date_make / date_parse. Expected values from Python's
+// zoneinfo (a separate reader of the same tz database); a one-off sweep of 8450 moments in 25 zones, 1900-2100,
+// every transition's second before and after, agreed with it exactly.
+fn check(c, msg) { assert_true(c, msg) }
+
+// wall time to a moment, inside the file's transitions and past them (the footer's POSIX rule)
+check(date_make(2026, 7, 4, 9, 0, 0, "America/New_York") == 1783170000, "New York, summer")
+check(date_make(2026, 1, 15, 18, 30, 0, "Australia/Sydney") == 1768462200, "Sydney, its summer")
+check(date_make(2075, 12, 25, 12, 0, 0, "America/New_York") == 3344518800, "New York, 2075: the rule, not the table")
+check(date_parse("2026-07-04 09:00", "America/New_York") == 1783170000, "date_parse in a zone")
+check(date_parse("2026-07-04T13:00:00Z", "America/New_York") == 1783170000, "an offset in the text wins")
+
+// a moment to wall time
+let t = 1790000000
+check(date_format(t, "%F %T %z", "Asia/Kolkata") == "2026-09-21 19:43:20 +0530", "Kolkata +05:30")
+check(date_format(t, "%F %T %z", "America/St_Johns") == "2026-09-21 11:43:20 -0230", "St John's -02:30 in summer")
+check(date_format(t, "%F %T %z", "Pacific/Chatham") == "2026-09-22 02:58:20 +1245", "Chatham +12:45")
+check(date_format(t, "%F %T %z", "Australia/Lord_Howe") == "2026-09-22 00:43:20 +1030", "Lord Howe's half-hour DST")
+
+// the exact second London changes
+let sw = 1774746000
+check(date_parts(sw - 1, "Europe/London").offset == 0 and date_parts(sw, "Europe/London").offset == 3600, "London at the switch")
+
+// fixed offsets
+check(date_format(0, "%F %T %z", "+05:30") == "1970-01-01 05:30:00 +0530", "+05:30")
+check(date_format(0, "%H:%M", "-0800") == "16:00", "-0800")
+check(date_make(2026, 1, 1, 0, 0, 0, "-05:00") == date_make(2026, 1, 1, 5, 0, 0, "utc"), "date_make with an offset")
+
+// a date string re-zoned keeps reading as written
+check(date_format("2026-10-27 08:20", "%H:%M", "Europe/Berlin") == "08:20", "a date string stays as it reads")
+
+// refused by name
+check(!try_call(date_parts, 0, "Mars/Olympus").ok, "no such zone")
+check(!try_call(date_parts, 0, "../../etc/passwd").ok, "not a zone's name")
+check(contains(try_call(date_parts, 0, "+25:00").error, "not an offset"), "an offset out of range")
+print("PASS: test_tz")

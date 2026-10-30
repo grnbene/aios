@@ -17,7 +17,8 @@
 //   date_parse(text, {zone, or})            -> `or` for a text that is not a date
 //   date_format("2026-10-27 08:20", fmt)    -> a date string written as it reads (read and written in one zone)
 //
-// zone is "utc" or "local" (the machine's own zone); date_parts, date_format
+// zone is "utc", "local" (the machine's own zone), a fixed offset ("+05:30", "-0800") or a name from the tz
+// database ("America/New_York", "Europe/London"; grain_tz.cpp); date_parts, date_format
 // and date_make default to local, date_parse to UTC unless the text carries
 // its own offset (Z, +05:30). month is 1-12, weekday 0 (Sunday) to 6,
 // yearday 1-366, offset the zone's distance from UTC in seconds.
@@ -27,11 +28,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "aios/userland/grain.hpp"
 #include "grain_builtins_internal.hpp"
+#include "grain_tz.hpp"
 
 namespace aios::userland::grain {
 
@@ -83,6 +86,24 @@ int64_t local_offset(int64_t t) {
 #endif
 }
 
+// The zone a date is read or written in: UTC, the machine's own, a fixed offset ("+05:30") or a named one from the
+// tz database ("America/New_York"). `name` is how the program wrote it.
+struct Zone {
+  enum Kind { Utc, Local, Fixed, Named } kind = Local;
+  int64_t fixed = 0;
+  std::shared_ptr<const tz::Zone> tz;
+  std::string name = "local";
+  int64_t offset(int64_t t) const {
+    switch (kind) {
+      case Utc: return 0;
+      case Local: return local_offset(t);
+      case Fixed: return fixed;
+      case Named: return tz->offset_at(t);
+    }
+    return 0;
+  }
+};
+
 struct Parts {
   int64_t year = 1970;
   unsigned month = 1, day = 1;
@@ -90,13 +111,13 @@ struct Parts {
   int64_t offset = 0;
 };
 
-Parts parts_of(double t, bool local) {
+Parts parts_of(double t, const Zone& zone) {
   const double whole = std::floor(t);
   int64_t secs = static_cast<int64_t>(whole);
   Parts p;
   p.millisecond = static_cast<int>(std::lround((t - whole) * 1000.0));
   if (p.millisecond >= 1000) { p.millisecond -= 1000; ++secs; }
-  p.offset = local ? local_offset(secs) : 0;
+  p.offset = zone.offset(secs);
   const int64_t wall = secs + p.offset;
   int64_t days = wall / 86400, rem = wall % 86400;
   if (rem < 0) { rem += 86400; --days; }
@@ -109,26 +130,44 @@ Parts parts_of(double t, bool local) {
   return p;
 }
 
-// Wall-clock fields in a zone to a moment. For local time the zone's offset at
-// that wall time is found by asking twice (the offset at the UTC reading, then
-// at the corrected one), which settles across a DST change.
-double moment_of(int64_t y, unsigned mo, unsigned d, int h, int mi, double s, bool local) {
+// Wall-clock fields in a zone to a moment. The zone's offset at that wall time is found by asking twice (the
+// offset at the UTC reading, then at the corrected one), which settles across a DST change.
+double moment_of(int64_t y, unsigned mo, unsigned d, int h, int mi, double s, const Zone& zone) {
   const double wall = static_cast<double>(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60) + s;
-  if (!local) return wall;
+  if (zone.kind == Zone::Utc) return wall;
   const int64_t guess = static_cast<int64_t>(std::floor(wall));
-  int64_t off = local_offset(guess);
-  off = local_offset(guess - off);
+  int64_t off = zone.offset(guess);
+  off = zone.offset(guess - off);
   return wall - static_cast<double>(off);
 }
 
-bool zone_arg(std::vector<Value>& args, size_t at, bool dflt_local, const char* who, std::string& error, bool& local) {
-  local = dflt_local;
+const Zone kUtc{Zone::Utc, 0, nullptr, "utc"};
+
+// "utc", "local", "+05:30" / "-0800", or a tz database name ("Europe/London").
+bool zone_arg(std::vector<Value>& args, size_t at, bool dflt_local, const char* who, std::string& error, Zone& zone) {
+  zone = dflt_local ? Zone{} : kUtc;
   if (args.size() <= at) return true;
   if (!want_str(args[at], error, who)) return false;
   const std::string& z = args[at].str();
-  if (z == "utc" || z == "UTC") local = false;
-  else if (z == "local") local = true;
-  else { error = std::string(who) + "(): the zone is \"utc\" or \"local\", not \"" + z + "\""; return false; }
+  zone.name = z;
+  if (z == "utc" || z == "UTC" || z == "Z") { zone.kind = Zone::Utc; return true; }
+  if (z == "local") { zone.kind = Zone::Local; return true; }
+  if (!z.empty() && (z[0] == '+' || z[0] == '-')) {
+    const int sign = z[0] == '-' ? -1 : 1;
+    std::string digits;
+    for (size_t i = 1; i < z.size(); ++i)
+      if (z[i] != ':') digits.push_back(z[i]);
+    bool ok = (digits.size() == 2 || digits.size() == 4) && digits.find_first_not_of("0123456789") == std::string::npos;
+    const int64_t hh = ok ? std::stoll(digits.substr(0, 2)) : 0, mm = ok && digits.size() == 4 ? std::stoll(digits.substr(2)) : 0;
+    if (!ok || hh > 23 || mm > 59) { error = std::string(who) + "(): \"" + z + "\" is not an offset (+HH:MM)"; return false; }
+    zone.kind = Zone::Fixed;
+    zone.fixed = sign * (hh * 3600 + mm * 60);
+    return true;
+  }
+  std::string why;
+  zone.tz = tz::load(z, why);
+  if (!zone.tz) { error = std::string(who) + "(): " + why + " (a zone is \"utc\", \"local\", \"+HH:MM\" or a name like \"America/New_York\")"; return false; }
+  zone.kind = Zone::Named;
   return true;
 }
 
@@ -149,9 +188,9 @@ Value bi_now(Vm&, std::vector<Value>&, std::string&) {
 
 Value bi_date_parts(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_number(args[0], error, "date_parts")) return Value::nil();
-  bool local = true;
-  if (!zone_arg(args, 1, true, "date_parts", error, local)) return Value::nil();
-  const Parts p = parts_of(args[0].as_double(), local);
+  Zone zone;
+  if (!zone_arg(args, 1, true, "date_parts", error, zone)) return Value::nil();
+  const Parts p = parts_of(args[0].as_double(), zone);
   auto m = std::make_shared<MapObj>();
   m->put("year", Value::integer(p.year));
   m->put("month", Value::integer(p.month));
@@ -172,19 +211,19 @@ Value bi_date_format(Vm& vm, std::vector<Value>& args, std::string& error) {
   // A date string ("2026-10-27 08:20", as a database gives it) is written as it reads: read and written in the same
   // zone ("utc" unless one is given), so its wall time does not move.
   if (args[0].type == Type::Str) {
-    bool local = false;
-    if (!zone_arg(args, 2, false, "date_format", error, local)) return Value::nil();
-    std::vector<Value> pa{args[0], Value::string(local ? "local" : "utc")};
+    Zone zone;
+    if (!zone_arg(args, 2, false, "date_format", error, zone)) return Value::nil();
+    std::vector<Value> pa{args[0], Value::string(zone.name)};
     Value t = date_parse_core(vm, pa, error);
     if (!error.empty()) { error = "date_format(): " + error.substr(error.find("date_parse(): ") == 0 ? 14 : 0); return Value::nil(); }
-    std::vector<Value> fa{t, args[1], Value::string(local ? "local" : "utc")};
+    std::vector<Value> fa{t, args[1], Value::string(zone.name)};
     return bi_date_format(vm, fa, error);
   }
   if (!want_number(args[0], error, "date_format") || !want_str(args[1], error, "date_format")) return Value::nil();
-  bool local = true;
-  if (!zone_arg(args, 2, true, "date_format", error, local)) return Value::nil();
+  Zone zone;
+  if (!zone_arg(args, 2, true, "date_format", error, zone)) return Value::nil();
   const double t = args[0].as_double();
-  const Parts p = parts_of(t, local);
+  const Parts p = parts_of(t, zone);
   const std::string& f = args[1].str();
   std::string out;
   for (size_t i = 0; i < f.size(); ++i) {
@@ -252,8 +291,8 @@ Value bi_date_format(Vm& vm, std::vector<Value>& args, std::string& error) {
 // is an error - a date that is guessed at is worse than none.
 Value date_parse_core(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "date_parse")) return Value::nil();
-  bool local = false;
-  if (!zone_arg(args, 1, false, "date_parse", error, local)) return Value::nil();
+  Zone zone;
+  if (!zone_arg(args, 1, false, "date_parse", error, zone)) return Value::nil();
   const std::string& s = args[0].str();
   size_t i = 0;
   auto bad = [&]() { error = "date_parse(): \"" + s + "\" is not an ISO 8601 date (YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|+HH:MM])"; return Value::nil(); };
@@ -309,16 +348,16 @@ Value date_parse_core(Vm&, std::vector<Value>& args, std::string& error) {
     if (i != s.size()) return bad();
   }
   const double secs = static_cast<double>(sec) + frac;
-  if (has_offset) return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), secs, false) - static_cast<double>(offset));
-  return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), secs, local));
+  if (has_offset) return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), secs, kUtc) - static_cast<double>(offset));
+  return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), secs, zone));
 }
 
 // date_make(year, month, day [, hour, minute, second] [, zone])
 Value bi_date_make(Vm&, std::vector<Value>& args, std::string& error) {
   size_t nums = args.size();
-  bool local = true;
+  Zone zone;
   if (nums > 3 && args[nums - 1].type == Type::Str) {
-    if (!zone_arg(args, nums - 1, true, "date_make", error, local)) return Value::nil();
+    if (!zone_arg(args, nums - 1, true, "date_make", error, zone)) return Value::nil();
     --nums;
   }
   if (nums != 3 && nums != 6) { error = "date_make(): wants year, month, day [, hour, minute, second] [, zone]"; return Value::nil(); }
@@ -333,7 +372,7 @@ Value bi_date_make(Vm&, std::vector<Value>& args, std::string& error) {
             std::to_string(mi) + " is not a date and time";
     return Value::nil();
   }
-  return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), sec, local));
+  return Value::real(moment_of(y, static_cast<unsigned>(mo), static_cast<unsigned>(d), static_cast<int>(h), static_cast<int>(mi), sec, zone));
 }
 
 // date_parse(text, [zone | {zone, or}]): with "or" in the options, a text that is not a date (a database's
