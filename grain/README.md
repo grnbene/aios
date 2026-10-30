@@ -38,22 +38,22 @@ For the complete function-by-function reference of all 440+ builtins with parame
 
 | Area | Functions |
 |---|---|
-| The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv`, `cwd`, `sleep(ms)` (milliseconds), `clock`, `time_us` |
+| The machine | `sys` (`os`, `arch`, `cpus`, `memory`, `host`, `version`), `args`, `getenv`, `setenv` (the shell's environment; an app sees only its own settings), `cwd`, `sleep(ms)` (milliseconds), `clock`, `time_us` |
 | Numbers | `a..b` is `range(a, b)`; `/` always gives a real (`7 / 2` is `3.5`); `idiv(a, b)` is whole-number division, truncating toward zero like `%` (`idiv(-7, 2)` is `-3`); integers only, and zero is an error |
 | Decimals | `decimal("19.99")`, `decimal(x, places)`, `dec_div(a, b, places)`, `scale(d)`, `decimal_prefix(s)` (the number a string starts with: `{d, whole}` or nil), `round_sig(d, n)`, `number_format(v, places, point, sep)` (PHP's: `number_format(1234.5678, 2)` is `"1,234.57"`); `+ - * / %`, comparisons, `round`, `floor`, `ceil`, `abs`, `min`, `max`, `format("{:.2f}", d)` all take them; exact, half-up, 38 digits |
-| Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists` (relative to the working directory) |
+| Files | `read_file`, `write_file`, `append_file`, `list_dir`, `delete_file`, `file_exists`, `file_stat` (size, modified time, mode), `rename_file`, `copy_file`, `glob("logs/**/*.jsonl")` (relative to the working directory) |
 | Paths and directories | `path_join`, `basename`, `dirname`, `extname`, `path_normalize`, `abspath`, `mkdir`, `rmdir`, `is_dir` |
 | Processes | `sys_exec(command)` through the system shell, `exec([program, args...])` without one: `{ok, code, output}` |
-| Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); TCP/UDP sockets; a small server (`listen`, `accept`, `read_until`, `write`) |
+| Network | `http_get`, `http_post`, `http_request` (HTTP and HTTPS with certificate verification, redirects); WebSockets (`ws_connect` to `ws://` / `wss://`, `ws_accept(req)` in an app's route); TCP client and server (`tcp_connect`, `tcp_listen`, `tcp_accept`); UDP; a small text-protocol server (`listen`, `accept`, `read_until`, `write`) |
 | Strings | escapes `\n \t \r \0 \a \b \f \v \e`, `\xHH` (one byte), `\u{1F600}` (a code point, as UTF-8); `utf8_valid(text or bytes)`; `len`, `s[i]`, `slice` and `index_of` are byte offsets, while `chars`, `char_at`, `ord`, `chr`, `pad_left`, `pad_right`, `upper` and `lower` work in characters (UTF-8) |
 | Text | `format("{:>8.2f}", x)`, `regex_test`, `regex_match`, `regex_find_all`, `regex_replace`, `regex_split` (ECMAScript patterns), `upper`, `lower`, `trim`, `split`, `join`, `replace`, `pad_left`, ... |
 | Data | `json_parse`, `json_stringify(v, {indent, ascii, escape_slashes})` (ascii: `\uXXXX` past ASCII; escape_slashes: `\/`; both is PHP's `json_encode`), `base64_*`, `hex_*`, `url_*`, `sort_by`, `group_by`, `key_by(list, fn)` (first item per key), `sum_by(list, key_fn, value_fn)`, `compact(list)` (without its nils), `unique(list)` (first seen kept), `map`, `filter`, `reduce`, `zip`, `enumerate`, ... |
 | Numbers in text | `is_numeric(v)` (a number, or a string that is one and nothing more), `to_number(v, [default])` (a string by the number it starts with: `to_number("12.50abc")` is `12.50`) |
-| Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS |
-| Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_cbc_decrypt(key, iv, data)` (PKCS#7, what `openssl_decrypt` reads; nil when the padding is wrong) and `hash_equals(a, b)` (in constant time, for secrets) |
+| Time | `now`, `date_format`, `date_parse` (ISO 8601), `date_parts`, `date_make` - computed by grain, so a date prints the same on every OS; in `"local"`, `"utc"`, an offset (`"+05:30"`) or any named zone (`"America/New_York"`, from the machine's tz database) |
+| Digests and ids | `sha256`, `sha1`, `sha512`, `sha384`, `md5`, `keccak256`, `hmac_sha256`, `uuid`; `aes_gcm_encrypt` / `aes_gcm_decrypt` (to seal data: nil when anything was changed), `aes_cbc_encrypt` / `aes_cbc_decrypt` (PKCS#7, what PHP's `openssl_encrypt` / `openssl_decrypt` use), keys and results as raw bytes; `hash_equals(a, b)` (in constant time, for secrets) |
 | Errors | `error(message)`, `pcall(fn, args...)` -> `{ok, value, error}`; a call chain deeper than 1,000 frames stops with "call depth exceeded" (a runaway recursion never takes the process down) |
 | Every core | `parallel_map(list, fn)`, `spawn(fn, args...)` -> task, `await(task)`, `task_done(task)` |
-| Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PPM or bytes |
+| Graphics | a 2D canvas: shapes, gradients, text, images, effects, widgets; saved as PNG (`canvas_save_png`), JPEG (`canvas_save_jpeg(cv, path, quality)`), PPM or raw bytes |
 | Windows | `create_pane({title, width, height, on_draw, on_event, on_click, on_key})`, then `run_panes()` |
 | Widgets | `ui.column`, `ui.row`, `ui.text`, `ui.button`, `ui.field`, `ui.table`, `ui.tile` in a `ui.pane` |
 
