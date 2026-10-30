@@ -1,0 +1,25 @@
+// tcp_listen / tcp_accept / tcp_port / tcp_peer: a server and its client in one program, over loopback.
+fn check(c, msg) { assert_true(c, msg) }
+
+let l = tcp_listen(0)
+let port = tcp_port(l)
+check(port > 0, "port 0 picks a free port: " + str(port))
+check(tcp_accept(l, 50) == nil, "nobody connecting: nil after the timeout")
+
+let c = tcp_connect("127.0.0.1", port)
+let s = tcp_accept(l, 2000)
+check(s != nil, "a connection accepted")
+check(starts_with(tcp_peer(s), "127.0.0.1:"), "its peer: " + tcp_peer(s))
+
+tcp_send(c, "ping\n")
+check(tcp_recv(s, 100, 2000) == "ping\n", "client to server")
+tcp_send(s, "pong")
+check(tcp_recv(c, 100, 2000) == "pong", "server to client")
+
+tcp_close(c)
+check(tcp_recv(s, 100, 2000) == "", "the client closed: \"\"")
+tcp_close(s)
+tcp_close(l)
+check(!try_call(tcp_accept, l, 10).ok, "a closed listener is an error")
+check(!try_call(tcp_listen, 80, "everywhere").ok, "where is local or all")
+print("PASS: test_tcp_server")

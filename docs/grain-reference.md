@@ -448,7 +448,13 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 | `tcp_connect` | `tcp_connect(host, port, [timeout_ms])` | Opens TCP connection. Returns TCP socket handle. |
 | `tcp_send` | `tcp_send(handle, data_str_or_bytes)` | Transmits data over socket. |
 | `tcp_recv` | `tcp_recv(handle, [max_bytes, [timeout_ms]])` | Reads incoming data from socket. |
-| `tcp_close` | `tcp_close(handle)` | Closes TCP connection. |
+| `tcp_close` | `tcp_close(handle)` | Closes a TCP connection or a listener. |
+| `tcp_listen` | `tcp_listen(port, [where])` | Listens for TCP connections: `where` is `"local"` (this machine only, the default) or `"all"`; port `0` picks a free one. Returns a listener. |
+| `tcp_accept` | `tcp_accept(listener, [timeout_ms])` | The next connection (a socket for `tcp_send` / `tcp_recv` / `tcp_close`), or `nil` when none came within the timeout (default 5000). |
+| `tcp_port` | `tcp_port(listener)` | The port a listener is on. |
+| `tcp_peer` | `tcp_peer(handle)` | The other end of a connection, `"host:port"`. |
+
+The command-line `grain` and `aios grain` also have a small server toolkit for text protocols: `listen(port, [loopback=true])`, `accept(listener, [timeout_ms=1000])`, `read_until(conn, marker, [limit], [timeout_ms])`, `read(conn, n, [timeout_ms])`, `write(conn, data)`, `peer(conn)`, `port(listener)`, `close(handle)`.
 
 ### Raw UDP Sockets
 | Function | Signature | Description |
