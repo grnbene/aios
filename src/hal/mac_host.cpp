@@ -180,6 +180,16 @@ class MacHost final : public Host {
     return Ok();
   }
 
+  Result<void> sync_dir(const std::string& dir) override {
+    int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return Result<void>(Status::IoError, dir + ": " + strerror(errno));
+    const int rc = ::fsync(fd);
+    const int e = errno;
+    ::close(fd);
+    if (rc != 0) return Result<void>(Status::IoError, dir + ": " + strerror(e));
+    return Ok();
+  }
+
   Result<void> write_file(const std::string& path, ByteSpan data) override {
     std::string tmp = path + ".tmp";
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);

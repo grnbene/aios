@@ -9393,6 +9393,72 @@ void cmd_sql(Ctx& c, const Args& a) {
     } else {
       c.o << c.o.style(Green()) << "[IMPORT SUCCESS]" << c.o.style(Reset()) << "\n" << res.formatted_table;
     }
+  } else if (sub == "copy") {
+    // A one-off copy of a MariaDB/MySQL database over the wire: the mirror's
+    // seeding copy (one consistent snapshot, rows streamed straight into the
+    // store), without a binlog on the source and without a stream after it.
+    // Needs only SELECT there.
+    const std::string host = kv(a, "host");
+    const std::string user = kv(a, "user");
+    const std::string database = kv(a, "db");
+    if (host.empty() || user.empty() || database.empty())
+      fail(Status::Invalid, "sql copy host=<host|/socket> [port=3306] user=<user> pass_file=<file> | pass=<pass> db=<database> "
+                            "[tables=t1,t2 | tables=@file] [no_data=t1,t2] [replace=1] [compress=0]");
+    const uint16_t port = has_kv(a, "port") ? (uint16_t)to_u64(kv(a, "port")) : 3306;
+    // A password on the command line shows in `ps` and the shell history; a file does not.
+    std::string pass = kv(a, "pass");
+    if (has_kv(a, "pass_file") && !read_first_line(kv(a, "pass_file"), pass))
+      fail(Status::NotFound, "sql copy: cannot read " + kv(a, "pass_file"));
+    // tables= names a list (t1,t2) or, with a leading @, a file of one name per
+    // line with # comments; without it the whole database is copied.
+    std::vector<std::string> tables;
+    auto add_table = [&](std::string t) {
+      while (!t.empty() && (t.back() == '\r' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
+      const size_t from = t.find_first_not_of(" \t");
+      if (from == std::string::npos || t[from] == '#') return;
+      tables.push_back(t.substr(from));
+    };
+    const std::string wl = kv(a, "tables");
+    if (!wl.empty() && wl[0] == '@') {
+      std::vector<std::string> lines;
+      if (!read_file_lines(wl.substr(1), lines)) fail(Status::NotFound, "sql copy: cannot read the tables file " + wl.substr(1));
+      for (const auto& l : lines) add_table(l);
+      if (tables.empty()) fail(Status::Invalid, "sql copy: " + wl.substr(1) + " names no tables");
+    } else {
+      for (size_t from = 0; from < wl.size();) {
+        const size_t comma = wl.find(',', from);
+        add_table(wl.substr(from, comma == std::string::npos ? std::string::npos : comma - from));
+        if (comma == std::string::npos) break;
+        from = comma + 1;
+      }
+    }
+    userland::SqlDatabase::SeedOptions opts;
+    opts.require_binlog = false;
+    opts.recopy = kv(a, "replace") == "1";
+    size_t failed = 0;
+    opts.failed = &failed;
+    // Compressed on the wire unless compress=0: zstd where the source has it, else zlib.
+    opts.compression = kv(a, "compress") == "0" ? 0 : 2;
+    // no_data=t1,t2: those tables are created empty (their rows are not wanted here).
+    const std::string nd = kv(a, "no_data");
+    for (size_t from = 0; from < nd.size();) {
+      const size_t comma = nd.find(',', from);
+      std::string t = nd.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
+      for (auto& ch : t) ch = (char)std::tolower((unsigned char)ch);
+      if (!t.empty()) opts.no_data.insert(t);
+      if (comma == std::string::npos) break;
+      from = comma + 1;
+    }
+    c.o << c.o.style(Header()) << "Copying " << database << " from " << host << (host[0] == '/' ? std::string() : ":" + std::to_string(port))
+        << (tables.empty() ? std::string(" (every table)") : " (" + std::to_string(tables.size()) + " table(s))") << c.o.style(Reset()) << "\n";
+    c.o.flush();
+    db.set_seed_progress([&c](const std::string& line) { c.o << "  " << line << "\n"; c.o.flush(); });
+    auto copied = db.seed_from_source(host, port, user, pass, database, tables, nullptr, opts);
+    db.set_seed_progress(nullptr);
+    if (!copied.ok()) fail(copied.error().status, copied.error().message);
+    if (failed) fail(Status::IoError, "sql copy: " + std::to_string(failed) + " table(s) not copied (see above), " + std::to_string(*copied) + " copied");
+    c.o << c.o.style(Green()) << "[COPY DONE]" << c.o.style(Reset()) << " " << *copied << " table(s) copied into " << database
+        << (*copied == 0 && !opts.recopy ? " (all already here; replace=1 copies them again)" : "") << "\n";
   } else if (sub == "push" || sub == "dump" || sub == "export") {
     std::string cid = kv(a, "customer", "");
     std::string tbl = kv(a, "table", "tasks");
@@ -9510,7 +9576,7 @@ void cmd_sql(Ctx& c, const Args& a) {
     }
     return;
   } else {
-    fail(Status::Invalid, "sql query \"<sql>\" | sql console | sql serve [port=3307] | sql pull customer=<cid> sql=\"<sql>\" | sql push customer=<cid> [table=tasks] | sql sync [customer=<cid>] | sql tables");
+    fail(Status::Invalid, "sql query \"<sql>\" | sql console | sql serve [port=3307] | sql copy host= user= pass_file= db= | sql pull customer=<cid> sql=\"<sql>\" | sql push customer=<cid> [table=tasks] | sql sync [customer=<cid>] | sql tables");
   }
 }
 

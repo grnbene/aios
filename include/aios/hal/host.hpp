@@ -150,6 +150,10 @@ class Host {
   virtual Result<void> create_exclusive_unsynced(const std::string& path, ByteSpan data) { return create_exclusive(path, data); }
   // Everything written under `path` is on disk when this returns (nothing to do for a host whose writes are durable).
   virtual void sync_tree(const std::string& path) { (void)path; }
+  // The directory's own entries on disk: a file renamed into it (write_file's tmp -> name) survives a power cut only
+  // once its directory is flushed (XFS, and ext4 without auto_da_alloc). Nothing to do for a host whose writes are
+  // durable.
+  virtual Result<void> sync_dir(const std::string& dir) { (void)dir; return Ok(); }
   virtual Result<void> append_file(const std::string& path, ByteSpan data) = 0;
   virtual Result<ByteBuffer> read_file(const std::string& path) = 0;
   virtual Result<std::shared_ptr<const FileView>> view_file(const std::string& path) {

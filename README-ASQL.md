@@ -378,6 +378,18 @@ aios --root /opt/aios/root exec "sql import file=/path/to/backup.sql"
 aios --root /opt/aios/root exec 'sql import sql="CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT); INSERT INTO t1 VALUES (1, '\''hello'\'');"'
 ```
 
+### Copy a Live MariaDB/MySQL Database (no binlog needed)
+
+```bash
+# Every table and view of shopdb, over the wire, in one consistent snapshot
+aios --root /opt/aios/root exec "sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shopdb"
+
+# Only some tables, copying them again if already present
+aios --root /opt/aios/root exec "sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shopdb tables=orders,stock replace=1"
+```
+
+Needs only `SELECT` on the source. See `docs/asql.md` ("Copying a live database").
+
 ### Initial CDC Seeding from Upstream MariaDB/MySQL
 
 When `CDC_HOST`, `CDC_DB`, and `CDC_TABLES` are configured, ASQL automatically copies missing tables from upstream during startup. To seed manually from a consistent snapshot:
