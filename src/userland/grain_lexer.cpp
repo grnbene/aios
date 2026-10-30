@@ -200,7 +200,9 @@ Token Lexer::string_token(bool is_fstr) {
     }
 
     // brace_depth == 0 (string literal text):
-    if (c == '$' && peek(1) == '{') {
+    // ${expr} interpolates; a ${ that no expression can follow ("${:.2f}": a price's dollar sign before a format()
+    // placeholder, "${}") is text, as written.
+    if (c == '$' && peek(1) == '{' && peek(2) != ':' && peek(2) != '}') {
       advance(); // '$'
       advance(); // '{'
       out += "${";

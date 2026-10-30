@@ -224,7 +224,8 @@ bool Parser::match(Tok k) {
 void Parser::error_at(const Token& t, const std::string& message) {
   if (panicked_) return;   // one complaint per bad construct, not one per token
   panicked_ = true;
-  if (errors_->size() < 12) errors_->push_back(Diagnostic{t.line, t.column, message});
+  // a trial parse (an f-string's {x:spec} tried whole first) has no list: it only needs to know it failed
+  if (errors_ && errors_->size() < 12) errors_->push_back(Diagnostic{t.line, t.column, message});
 }
 
 bool Parser::expect(Tok k, const char* what) {

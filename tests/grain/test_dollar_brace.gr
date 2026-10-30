@@ -1,0 +1,9 @@
+// "${:.2f}" in a plain string - a dollar sign before a format() placeholder - crashed the parser (a trial parse of
+// the {..} had no error list); a ${ that no expression can follow is text, and ${expr} still interpolates.
+let x = 5
+assert_true(format("${:.2f}", 19.5) == "$19.50", "a price format: " + format("${:.2f}", 19.5))
+assert_true("cost ${}" == "cost " + "$" + "{}", "${} is text")
+assert_true("${x}" == "5" and "n=${x + 1}" == "n=6", "an expression in dollar-braces interpolates")
+fn inside() { return format("total ${:,.2f}", 1234.5) }
+assert_true(inside() == "total $1,234.50", "in a function: " + inside())
+print("PASS: test_dollar_brace")
