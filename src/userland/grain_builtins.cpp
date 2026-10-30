@@ -276,12 +276,33 @@ Value bi_del(Vm&, std::vector<Value>& args, std::string& error) {
 Value bi_split(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "split")) return Value::nil();
   const std::string& s = args[0].str();
-  const std::string sep = args.size() > 1 ? args[1].str() : " ";
+  static const std::string space = " ";
+  const std::string& sep = args.size() > 1 ? args[1].str() : space;
   std::vector<Value> out;
   if (sep.empty()) {
+    out.reserve(s.size());
     for (char c : s) out.push_back(Value::string(std::string(1, c)));
     return Value::list(std::move(out));
   }
+  // Counted first, so the list is allocated once; a one-byte separator is found with memchr.
+  const char* p = s.data();
+  const char* const end = p + s.size();
+  if (sep.size() == 1) {
+    const char c = sep[0];
+    size_t n = 1;
+    for (const char* q = p; (q = static_cast<const char*>(std::memchr(q, c, (size_t)(end - q)))); ++q) ++n;
+    out.reserve(n);
+    for (;;) {
+      const char* q = static_cast<const char*>(std::memchr(p, c, (size_t)(end - p)));
+      if (!q) { out.push_back(Value::string(std::string(p, end))); break; }
+      out.push_back(Value::string(std::string(p, q)));
+      p = q + 1;
+    }
+    return Value::list(std::move(out));
+  }
+  size_t n = 1;
+  for (size_t at = s.find(sep); at != std::string::npos; at = s.find(sep, at + sep.size())) ++n;
+  out.reserve(n);
   size_t at = 0;
   for (;;) {
     const size_t found = s.find(sep, at);
@@ -294,11 +315,20 @@ Value bi_split(Vm&, std::vector<Value>& args, std::string& error) {
 
 Value bi_join(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_list(args[0], error, "join")) return Value::nil();
-  const std::string sep = args.size() > 1 ? args[1].str() : "";
-  std::string out;
+  static const std::string none;
+  const std::string& sep = args.size() > 1 ? args[1].str() : none;
   const auto& items = args[0].list_items();
-  for (size_t i = 0; i < items.size(); ++i) { if (i) out += sep; out += items[i].to_text(); }
-  return Value::string(out);
+  // Strings (the usual list) are measured and copied straight in; anything else goes through to_text.
+  size_t total = items.empty() ? 0 : sep.size() * (items.size() - 1);
+  for (const Value& v : items) if (v.type == Type::Str && v.obj) total += v.str().size();
+  std::string out;
+  out.reserve(total);
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i) out += sep;
+    if (items[i].type == Type::Str && items[i].obj) out += items[i].str();
+    else out += items[i].to_text();
+  }
+  return Value::string(std::move(out));
 }
 
 // --- characters in UTF-8 text ----------------------------------------------------------------------
