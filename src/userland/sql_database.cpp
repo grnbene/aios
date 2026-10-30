@@ -55112,19 +55112,29 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     return (uint64_t)(e && *e ? std::max(0, std::atoi(e)) : 120) * 1000000000ull;
   }();
   size_t dense_budget = (size_t)256 << 20;   // bytes of table files deflated per checkpoint
+  // Tables whose form changed and nothing else, rewritten whole under the lock this checkpoint, at most this many
+  // bytes (AIOS_STORE_FORM_MB, 16 by default); the rest keep their file and wait for a later one.
+  static const size_t form_budget_total = [] {
+    const char* e = std::getenv("AIOS_STORE_FORM_MB");
+    return (size_t)(e && *e ? std::max(0, std::atoi(e)) : 16) << 20;
+  }();
+  size_t form_budget = form_budget_total;
   static const bool snap_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+  uint64_t snap_small_ns = 0;   // tables under 5 ms each, added up (AIOS_STORE_TRACE)
+  const uint64_t snap_loop_t0 = snap_trace ? kernel_.host().monotonic_ns() : 0;
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
     // AIOS_STORE_TRACE: a table that held the lock 5 ms or more here, and how much of it was folding its delta in -
     // whichever way below it leaves by (unchanged, a part, appended rows, whole).
     struct SnapTime {
-      hal::Host& h; const std::string& name; uint64_t t0, fold = 0;
+      hal::Host& h; const std::string& name; uint64_t t0; uint64_t& small; uint64_t fold = 0;
       ~SnapTime() {
         if (!snap_trace) return;
-        const double ms = (double)(h.monotonic_ns() - t0) / 1e6;
-        if (ms >= 5) fprintf(stderr, "[store] snapshot %s: %.1f ms under the lock (delta fold %.1f)\n", name.c_str(), ms, fold / 1e6);
+        const uint64_t ns = h.monotonic_ns() - t0;
+        if (ns >= 5000000ull) fprintf(stderr, "[store] snapshot %s: %.1f ms under the lock (delta fold %.1f)\n", name.c_str(), ns / 1e6, fold / 1e6);
+        else small += ns;
       }
-    } snap_time{kernel_.host(), kv.first, snap_trace ? kernel_.host().monotonic_ns() : 0};
+    } snap_time{kernel_.host(), kv.first, snap_trace ? kernel_.host().monotonic_ns() : 0, snap_small_ns};
     t.compact_delta_buffer();
     if (snap_trace) snap_time.fold = kernel_.host().monotonic_ns() - snap_time.t0;
     t.ensure_columns();
@@ -55135,7 +55145,36 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.still_ns = now_ns;
     auto prev = saved_tables_.find(kv.first);
     bool dense = false;
-    if (prev != saved_tables_.end() && prev->second.seq == state.seq && prev->second.rows == state.rows &&
+    // Form only: the counter moved and nothing in the table changed - a column re-encoded, a dictionary compacted,
+    // segments packed (stamp_form_change), the journal running on from the file without a write in it. The file still
+    // holds exactly these rows in this order, so it can stand; the new form is only smaller or faster to load. Written
+    // whole under the lock it was every such table at once: 433 files and 2-11 s of every read waiting on a copy of
+    // the Cleve mirror after a restart. Now within a budget a checkpoint; the rest keep their file, form pending.
+    bool force_whole = false;
+    if (prev != saved_tables_.end() && prev->second.shape == state.shape && prev->second.rows == state.rows &&
+        !unpacked_tables_.count(kv.first)) {
+      bool form_only = prev->second.seq == state.seq && prev->second.form_pending;
+      if (prev->second.seq != state.seq) {
+        std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+        const SqlTable::ChangeJournal& j = t.journal;
+        form_only = j.on && !j.broken && j.start_seq == prev->second.seq && j.last_seq == t.mutation_seq && j.ops.empty();
+      }
+      if (form_only) {
+        const size_t cost = std::max<size_t>(prev->second.bytes, 1);
+        if (exit_flush_ || form_budget >= cost) {
+          form_budget -= std::min(form_budget, cost);
+          force_whole = true;
+        } else {
+          entries.emplace_back(kv.first, prev->second.file);
+          SavedTableFile kept = prev->second;
+          kept.seq = state.seq;   // the file is the table as it stands; its journal goes on from here
+          kept.form_pending = true;
+          saved_now[kv.first] = kept;
+          continue;
+        }
+      }
+    }
+    if (!force_whole && prev != saved_tables_.end() && prev->second.seq == state.seq && prev->second.rows == state.rows &&
         prev->second.shape == state.shape && kernel_.host().exists(dir + "/" + prev->second.file) &&
         !(prev->second.op_parts && !ops_parts_enabled())) {   // parts of writes, with them turned off: written whole
       // Unchanged. Written in the fast form while it was changing; once it
@@ -55153,13 +55192,33 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       dense = true;
       state.still_ns = still;
       dense_budget -= std::min(dense_budget, std::max<size_t>(prev->second.bytes, 1));
+      // Nothing has changed since its file was written, so the file is the table: deflated from it by the writer
+      // thread, off the lock. Its columns were copied under the lock to be serialized again (atl's mirror: 3 s of
+      // every read waiting at one checkpoint, a still table at a time, 15-60 ms each). A file with parts on its end
+      // is rewritten from the columns below, the parts folding into it.
+      if (prev->second.parts == 0 && !unpacked_tables_.count(kv.first)) {
+        const std::string file = hex_of(kv.first) + ".g" + std::to_string(gen) + ".tbl";
+        CheckpointImage::TableImage ti;
+        ti.key = kv.first;
+        ti.file = file;
+        ti.dense = true;
+        ti.repack_from = prev->second.file;
+        img.tables.push_back(std::move(ti));
+        entries.emplace_back(kv.first, file);
+        SavedTableFile kept = prev->second;
+        kept.file = file;
+        kept.dense = true;
+        kept.still_ns = still;
+        saved_now[kv.first] = kept;
+        continue;
+      }
     }
     state.layout = t.layout_seq;
     // Rows erased or cells set since the file was written, every one of them in the table's journal: the writes go
     // to the file as a part, in their order, instead of the table whole. A 30M-row audit log with a few thousand
     // rows deleted was copied whole under the lock at every checkpoint (1.5 s of every read waiting, and the copy
     // tripled the process's memory). The same bounds as appended rows; past them it is written whole again.
-    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
+    if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
         prev->second.seq != state.seq && prev->second.shape == state.shape && prev->second.file_bytes > 0 &&
         prev->second.parts < kPartMaxCount) {
       std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
@@ -55246,7 +55305,7 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       for (const auto& op : j.ops) if (op.kind != 'A') return false;
       return true;
     };
-    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
+    if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
         prev->second.seq != state.seq && state.rows > prev->second.rows && prev->second.shape == state.shape &&
         (prev->second.layout == t.layout_seq || only_appended()) &&
         prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount &&
@@ -55285,6 +55344,18 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.dense = dense;
     state.base_rows = state.rows;
     ++rewritten;
+    if (snap_trace && prev != saved_tables_.end()) {
+      // AIOS_STORE_TRACE: why a table that had a file is copied whole under the lock, not added to as a part
+      std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+      const SqlTable::ChangeJournal& j = t.journal;
+      fprintf(stderr, "[store] %s: whole (rows %zu; dense %d unpacked %d parts %u/%u shape %s seq %s; journal on %d broken %d "
+                      "from %s to %s, %zu ops, %zu cells; part rows %zu + cells %zu of bound %zu)\n",
+              t.name.c_str(), state.rows, (int)dense, (int)unpacked_tables_.count(kv.first), prev->second.parts, kPartMaxCount,
+              prev->second.shape == state.shape ? "same" : "changed", prev->second.seq == state.seq ? "same" : "moved",
+              (int)j.on, (int)j.broken, j.start_seq == prev->second.seq ? "file" : "elsewhere",
+              j.last_seq == t.mutation_seq ? "now" : "behind", j.ops.size(), j.cells, prev->second.part_rows,
+              prev->second.op_cells, std::max(kPartMaxRowsFloor, prev->second.base_rows / 4));
+    }
     unpacked_tables_.erase(kv.first);   // written packed now
     CheckpointImage::TableImage ti;
     ti.key = kv.first;
@@ -55370,8 +55441,12 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.file = file;
     saved_now[kv.first] = state;
   }
+  const uint64_t snap_loop_ns = snap_trace ? kernel_.host().monotonic_ns() - snap_loop_t0 : 0;
   // Every table as this snapshot holds it is what the next one starts from: its journal records from here.
   for (auto& kv : tables_) kv.second.journal_begin();
+  if (snap_trace)
+    fprintf(stderr, "[store] snapshot of %zu tables: loop %.1f ms (tables under 5 ms each: %.1f), journals begun %.1f ms\n", tables_.size(),
+            snap_loop_ns / 1e6, snap_small_ns / 1e6, (kernel_.host().monotonic_ns() - snap_loop_t0 - snap_loop_ns) / 1e6);
   // The manifest is finished by write_checkpoint (manifest_bytes), once every
   // file's valid length is known; the databases it names are taken here, under the lock.
   img.databases.assign(databases_.begin(), databases_.end());
@@ -55631,6 +55706,25 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   } shed_wbuf{checkpoint_wbuf_};
   for (auto& ti : img.tables) {
     auto sv = img.saved.find(ti.key);
+    if (!ti.repack_from.empty()) {
+      // A still table, deflated from its own file. A file that does not unpack goes under the new name as it is -
+      // the table all the same, deflated another time.
+      auto rd = h.read_file(dir + "/" + ti.repack_from);
+      if (!rd.ok()) return Result<void>(Status::IoError, ti.repack_from + ": " + rd.error().message);
+      ByteBuffer plain;
+      std::string why;
+      const bool unpacked = store_unpack(ByteSpan(rd->data(), rd->size()), plain, &why);
+      if (unpacked) store_pack(plain.data(), plain.size(), packed, true);
+      const ByteSpan bytes = unpacked ? ByteSpan(packed.data(), packed.size()) : ByteSpan(rd->data(), rd->size());
+      auto wr = h.write_file(dir + "/" + ti.file, bytes);
+      if (!wr.ok()) return wr;
+      if (sv != img.saved.end()) {
+        sv->second.file_bytes = bytes.size();
+        if (unpacked) sv->second.bytes = plain.size();
+        else sv->second.dense = false;
+      }
+      continue;
+    }
     if (ti.ops) {
       // The writes since the file was written, as one part on its end.
       const std::vector<uint8_t> part = store_ops_part_bytes(img.gen, ti.rows_from, ti.rows_to, ti.ncols, ti.ops_plain, ti.dense);
