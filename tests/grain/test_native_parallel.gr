@@ -1,0 +1,38 @@
+// Native functions on two threads at once: one waits for a flag the other sets. While native calls took turns
+// (one process-wide lock), the waiter held the lock for its whole wait and never saw the flag.
+// Also: a trap on one thread (recursion too deep) is that call's error, not another's.
+fn check(c, msg) { assert_true(c, msg) }
+
+native fn wait_flag(p: ptr, spins: i64) -> bool {
+  let i = 0
+  while i < spins {
+    if rd64(p, 0) != 0 { return true }
+    i += 1
+  }
+  return false
+}
+native fn set_flag(p: ptr) -> i64 {
+  wr64(p, 0, 1)
+  return 1
+}
+native fn deep(n: i64) -> i64 {
+  if n == 0 { return 0 }
+  return deep(n - 1) + 1
+}
+
+let flag = bytes(8)
+let p = bytes_ptr(flag)
+let r = parallel_map([0, 1], fn (i) {
+  if i == 0 { return wait_flag(p, 3000000000) }
+  sleep(50)
+  return set_flag(p)
+})
+check(r[0] == true, "the waiter saw the flag the other thread set: " + str(r))
+
+let traps = parallel_map([0, 1, 2, 3], fn (i) {
+  if i % 2 == 0 { return try_call(deep, 10000000).error }
+  return deep(1000)
+})
+check(contains(traps[0], "recursion too deep") and contains(traps[2], "recursion too deep"), "each deep call traps: " + str(traps))
+check(traps[1] == 1000 and traps[3] == 1000, "and the others are not disturbed")
+print("PASS: test_native_parallel")

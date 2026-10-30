@@ -270,8 +270,9 @@ returns something that is not a response, or runs past `grain_steps` gets a
 With `grain_native safe`, `native fn` in the script compiles to machine code and
 a handler can do its hot work at native speed (`native fn fib` is about 20x
 the VM) on `bytes` and numbers only: no `ptr`, `extern fn`, FFI or plugins.
-Native code is not counted by `grain_steps`, and native calls take turns, so
-keep native functions short. Each recompile of an edited script keeps its
+Native code is not counted by `grain_steps`, so keep native functions short. On
+Linux, requests on different threads run their native calls at the same time;
+elsewhere (macOS) native calls take turns. Each recompile of an edited script keeps its
 native code in memory until the server restarts.
 
 A body larger than `grain_max_body`, or sent chunked, is not read up front:
