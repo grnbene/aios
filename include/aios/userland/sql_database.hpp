@@ -3139,6 +3139,13 @@ class SqlDatabase {
   void load_programs();
   void save_programs();
   void refresh_program_flags();
+  // CREATE TYPE name AS ENUM (...) (PostgreSQL's): database.name (lower case) -> its labels, kept in types.db.
+  // A CREATE / ALTER TABLE column of the type is an ENUM of the labels (with_enum_types).
+  std::map<std::string, std::vector<std::string>> enum_types_;
+  SqlQueryResult execute_type_ddl(const std::string& sql);
+  std::string with_enum_types(const std::string& sql) const;
+  void load_enum_types();
+  void save_enum_types();
   void run_due_events();
   mutable std::unordered_map<std::string, SqlTable> view_table_cache_;
   mutable std::unordered_map<std::string, std::shared_ptr<SqlTable>> materialized_view_cache_;

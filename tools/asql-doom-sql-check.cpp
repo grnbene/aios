@@ -163,6 +163,116 @@ int main() {
   expect(db, "in a comment", "WITH s AS (SELECT 3 AS x) -- the near clip plane\nSELECT x FROM s", "3");
   expect(db, "in a string", "SELECT 'near the end'", "near the end");
 
+  // The PostgreSQL SQLDoom's game tic is written in, where MySQL has no spelling of it (each value is what
+  // PostgreSQL 16 answers, written as MySQL writes it: true as 1).
+  std::cout << "\n[5] PostgreSQL's spellings\n";
+  expect(db, "x::type",
+         "SELECT 2.5e0::int, 3.5e0::int, (-2.5e0)::int, 2.5::int, '42'::int + 1, 1::boolean, 'yes'::bool, 'f'::boolean, "
+         "12.345::numeric, 12.345::numeric(5,1), 42::text, 'abc'::varchar(2), (3 + 4)::text, -x::bigint "
+         "FROM a WHERE s = 'r'",
+         "2|4|-2|3|43|1|1|0|12.345|12.3|42|ab|7|-2");
+  expect(db, "::float8 divides as a float", "SELECT 7::float8 / 2 = 3.5", "1");
+  expect(db, "::an enum type is the label", "SELECT 'stand'::actor_state", "stand");
+  expect(db, "::type nested", "SELECT (SELECT MAX(y)::text FROM a) AS m", "2");
+  run_ok(db, "CREATE FUNCTION pgc(v DOUBLE) RETURNS INT RETURN v::int");
+  expect(db, "::type in a function body", "SELECT pgc(2.5), pgc(3.5)", "2|4");
+
+  expect(db, "IS [NOT] DISTINCT FROM",
+         "SELECT s, x IS DISTINCT FROM 1, x IS NOT DISTINCT FROM NULL FROM a ORDER BY s", "p|0|0;q|0|0;r|1|0;s|1|0;t|1|1");
+  expect(db, "IS DISTINCT FROM a subquery", "SELECT COUNT(*) FROM a WHERE x IS DISTINCT FROM (SELECT 2)", "4");
+
+  expect(db, "BOOL_AND / BOOL_OR / EVERY", "SELECT BOOL_AND(x > 0), BOOL_OR(x > 2), BOOL_AND(x > 1), EVERY(y = 1) FROM a",
+         "1|1|0|0");
+  expect(db, "BOOL_OR grouped, NULL for only NULLs",
+         "SELECT x, BOOL_OR(y = 2) FROM a WHERE x IS NOT NULL GROUP BY x ORDER BY x", "1|1;2|0;3|NULL");
+  expect(db, "BOOL_OR as a window",
+         "SELECT s, BOOL_OR(y = 2) OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM a ORDER BY s",
+         "p|0;q|1;r|1;s|1;t|1");
+  expect(db, "ARG_MAX / ARG_MIN", "SELECT ARG_MAX(s, x * 10 + y), ARG_MIN(s, x + y), MAX_BY(s, x) FROM a", "r|p|s");
+  expect(db, "ARG_MAX grouped", "SELECT x, ARG_MAX(s, y) FROM a WHERE x IS NOT NULL GROUP BY x ORDER BY x", "1|q;2|r;3|NULL");
+  expect(db, "string_agg", "SELECT string_agg(s, '-' ORDER BY s DESC), string_agg(CASE WHEN x > 1 THEN s END, '+' ORDER BY s) FROM a",
+         "t-s-r-q-p|r+s");
+  expect(db, "string_agg of bytes, ''::bytea", "SELECT HEX(string_agg(UNHEX(LPAD(HEX(x), 2, '0')), ''::bytea ORDER BY s)) FROM a",
+         "01010203");
+  expect(db, "FILTER (WHERE ..)",
+         "SELECT COUNT(*) FILTER (WHERE x = 1), SUM(y) FILTER (WHERE x IS NOT NULL), "
+         "string_agg(s, '' ORDER BY s) FILTER (WHERE y = 1) FROM a",
+         "2|4|prt");
+  expect(db, "FILTER grouped", "SELECT y, COUNT(*) FILTER (WHERE x > 1) FROM a GROUP BY y ORDER BY y", "NULL|1;1|1;2|0");
+  run_ok(db, "CREATE FUNCTION nbig() RETURNS INT RETURN (SELECT COUNT(*) FILTER (WHERE x > 1) FROM a)");
+  expect(db, "FILTER in a function body", "SELECT nbig()", "2");
+
+  run_ok(db, "CREATE TABLE kv (k INT PRIMARY KEY, v INT, n INT)");
+  run_ok(db, "INSERT INTO kv VALUES (1,10,0),(2,20,0)");
+  run_ok(db, "INSERT INTO kv VALUES (1,99,0),(3,30,0) ON CONFLICT (k) DO NOTHING");
+  run_ok(db, "INSERT INTO kv VALUES (2,25,0) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v + kv.v, n = kv.n + 1");
+  // every SET reads the row as it was: v and n swap
+  run_ok(db, "INSERT INTO kv VALUES (3,0,0) ON CONFLICT (k) DO UPDATE SET v = kv.n, n = kv.v");
+  run_ok(db, "INSERT INTO kv VALUES (1,5,0),(2,5,0) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v WHERE kv.v > 20");
+  expect(db, "ON CONFLICT", "SELECT GROUP_CONCAT(CONCAT(k,':',v,':',n) ORDER BY k) FROM kv", "1:10:0,2:5:1,3:0:30");
+  run_ok(db, "INSERT INTO kv SELECT k + 2, 1, 1 FROM kv ON CONFLICT DO NOTHING");
+  expect(db, "INSERT .. SELECT .. ON CONFLICT DO NOTHING", "SELECT COUNT(*), SUM(k) FROM kv", "5|15");
+  run_ok(db, "CREATE PROCEDURE upk(IN kk INT) BEGIN INSERT INTO kv VALUES (kk, 1, 0) ON CONFLICT (k) DO UPDATE SET n = kv.n + 1; END");
+  run_ok(db, "CALL upk(1)");
+  run_ok(db, "CALL upk(1)");
+  expect(db, "ON CONFLICT in a procedure", "SELECT n FROM kv WHERE k = 1", "2");
+
+  run_ok(db, "CREATE TABLE pts (id INT PRIMARY KEY, x INT, tot INT)");
+  run_ok(db, "INSERT INTO pts VALUES (1,1,0),(2,2,0),(3,9,0)");
+  run_ok(db, "UPDATE pts p SET tot = q.n, x = p.x * 10 FROM (SELECT x, COUNT(*) AS n FROM a GROUP BY x) q WHERE q.x = p.x");
+  expect(db, "UPDATE .. FROM", "SELECT id, x, tot FROM pts ORDER BY id", "1|10|2;2|20|1;3|9|0");
+  run_ok(db, "UPDATE pts SET tot = tot + w.r FROM w WHERE w.c = pts.id AND w.solid = 1");
+  expect(db, "UPDATE .. FROM, no alias", "SELECT id, x, tot FROM pts ORDER BY id", "1|10|3;2|20|2;3|9|0");
+  run_ok(db, "CREATE PROCEDURE bump() BEGIN UPDATE pts p SET tot = p.tot + w.c FROM w WHERE w.c = p.id; END");
+  run_ok(db, "CALL bump()");
+  expect(db, "UPDATE .. FROM in a procedure", "SELECT id, tot FROM pts ORDER BY id", "1|4;2|4;3|0");
+
+  run_ok(db, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
+  run_ok(db, "CREATE TABLE person (name VARCHAR(10), m mood)");
+  run_ok(db, "INSERT INTO person VALUES ('a', 'ok')");
+  run_ok(db, "ALTER TABLE person ADD COLUMN m2 mood");
+  expect(db, "CREATE TYPE .. AS ENUM", "SELECT m, m2, 'happy'::mood FROM person", "ok|NULL|happy");
+  {
+    SqlQueryResult r = q(db, "SHOW CREATE TABLE person");
+    const std::string ddl = r.success && !r.rows.empty() && r.rows[0].values.size() > 1 ? r.rows[0].values[1] : std::string();
+    if (ddl.find("enum('sad','ok','happy')") == std::string::npos) fail("the column is the enum", ddl);
+    else std::cout << "  [ok] the column is the enum\n";
+  }
+  expect_error(db, "CREATE TYPE twice", "CREATE TYPE mood AS ENUM ('x')", "already exists");
+  run_ok(db, "DROP TYPE mood");
+  run_ok(db, "DROP TYPE IF EXISTS mood");
+  expect_error(db, "DROP TYPE of none", "DROP TYPE mood", "does not exist");
+
+  expect(db, "|| is OR", "SELECT 'a' || 'b', 0 || 1", "0|1");
+  run_ok(db, "SET sql_mode = 'PIPES_AS_CONCAT'");
+  expect(db, "|| under PIPES_AS_CONCAT", "SELECT 'a' || 'b', 0 || 1", "ab|01");
+  expect(db, "|| with NULL, and nested", "SELECT NULL || 'x', (SELECT s || '!' FROM a WHERE s = 'p')", "NULL|p!");
+  run_ok(db, "CREATE FUNCTION cat2(a1 TEXT, b1 TEXT) RETURNS TEXT RETURN a1 || b1");
+  run_ok(db, "SET sql_mode = DEFAULT");
+  expect(db, "|| is OR again (the same text)", "SELECT 'a' || 'b', 0 || 1", "0|1");
+  run_ok(db, "CREATE FUNCTION or2(a1 INT, b1 INT) RETURNS INT RETURN a1 || b1");
+  expect(db, "a function keeps the sql_mode it was made under", "SELECT cat2('x', 'y'), or2(0, 1)", "xy|1");
+
+  expect(db, "TRUNC, CHR, GET_BYTE", "SELECT TRUNC(2.7), TRUNC(-2.7), TRUNC(1.2345, 2), CHR(65), GET_BYTE(X'0a0bff', 2)", "2|-2|1.23|A|255");
+  expect_error(db, "GET_BYTE past the end", "SELECT GET_BYTE(X'0a', 1)", "out of valid range");
+  // A routine's variable holds what its declared type holds (MySQL converts a value assigned to one).
+  run_ok(db, "CREATE FUNCTION third(p DOUBLE) RETURNS DOUBLE BEGIN DECLARE x DOUBLE DEFAULT p; DECLARE n INT DEFAULT 2.6; "
+             "SET x = x / 3; SET n = n + 0.4; RETURN x * 3 + n; END");
+  expect(db, "a DOUBLE variable divides as a double, an INT one rounds", "SELECT third(2) = 5", "1");
+
+  // sql_mode PG_DIVISION (ASQL's): PostgreSQL's `/`.
+  expect(db, "/ is MySQL's", "SELECT 7 / 2, -7 / 2", "3.5000|-3.5000");
+  run_ok(db, "SET sql_mode = 'PG_DIVISION'");
+  expect(db, "PG_DIVISION: integers truncate", "SELECT 7 / 2, -7 / 2, 7.0 / 2 = 3.5, 1 / 3.0 > 0.33333333, 7e0 / 2", "3|-3|1|1|3.5");
+  expect(db, "PG_DIVISION over rows", "SELECT s, x / 2 FROM a ORDER BY s", "p|0;q|0;r|1;s|1;t|NULL");
+  expect(db, "PG_DIVISION in a CTE and SUM", "WITH c AS (SELECT x / 2 AS h FROM a) SELECT GROUP_CONCAT(h ORDER BY h), SUM(h), "
+                                             "(SELECT SUM(x / 2) FROM a) FROM c",
+         "0,0,1,1|2|2");
+  expect_error(db, "PG_DIVISION: by zero is an error", "SELECT 1 / 0", "division by zero");
+  run_ok(db, "CREATE FUNCTION half(n INT) RETURNS INT RETURN n / 2 * 2");
+  run_ok(db, "SET sql_mode = DEFAULT");
+  expect(db, "a function keeps PG_DIVISION", "SELECT half(7), 7 / 2", "6|3.5000");
+
   std::cout << "\n=== " << (g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES: " + std::to_string(g_failures)) << " ===\n";
   return g_failures == 0 ? 0 : 1;
 }

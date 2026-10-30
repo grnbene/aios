@@ -446,6 +446,7 @@ struct Condition {
 
 
 namespace {
+namespace psm { Val as_returns_type(const Val& v, const std::string& returns); }
 namespace psm {
 const Nodes& body_of(const SqlDatabase::StoredProgram& p) {
   static const Nodes none;
@@ -456,6 +457,9 @@ std::string literal_of(const Val& v) {
   if (v.null) return "NULL";
   if (v.numeric) {
     std::string s = v.str();
+    // A double as a double literal: 2.5 written as 2.5 reads back as the exact decimal, which rounds and divides as
+    // one (a DOUBLE variable's 2.5::int was 3, not 2).
+    if (v.approx && !s.empty() && s.find_first_of("eE") == std::string::npos && std::isfinite(v.num)) s += "e0";
     if (!s.empty()) return s;
   }
   std::string out = "'";
@@ -510,6 +514,9 @@ struct Run {
   size_t exit_scope = 0;
 
   explicit Run(SqlDatabase& d, std::string sdb) : db(d), session_db(std::move(sdb)) { scopes.emplace_back(); cursors.emplace_back(); }
+  // A declared variable's type (lower-case name -> type): what it holds is what the type holds, as MySQL converts
+  // a value assigned to one. Without it a DOUBLE given 2 held the exact 2, and x / 3 came out as 0.6667.
+  std::map<std::string, std::string> var_types;
 
   Val* find_var(const std::string& name) {
     const std::string k = lower_of(name);
@@ -594,7 +601,14 @@ struct Run {
     } changes_data;
     tls_stmt_changes_data = sql_statement_changes_data(bound);
     *res = db.execute_local_query_unguarded(bound, session_db);
-    if (!res->success) { cond->kind = Condition::Exception; cond->message = res->error_message; return false; }
+    if (!res->success) {
+      // AIOS_ROUTINE_TRACE=1: the statement a routine failed on, as it ran (its variables bound), to stderr.
+      static const bool trace = std::getenv("AIOS_ROUTINE_TRACE") != nullptr;
+      if (trace) std::fprintf(stderr, "[routine] %s\n  in: %.2000s\n", res->error_message.c_str(), bound.c_str());
+      cond->kind = Condition::Exception;
+      cond->message = res->error_message;
+      return false;
+    }
     last_row_count = res->is_result_set ? -1 : (long long)res->rows_affected;
     return true;
   }
@@ -628,7 +642,11 @@ struct Run {
       new_row->values[(size_t)ci] = v.null ? sql_null() : sql_normalize_value(col.type, col.scale, val_store_text(v, col.type));
       return true;
     }
-    if (Val* var = find_var(target)) { *var = v; return true; }
+    if (Val* var = find_var(target)) {
+      auto ty = var_types.find(lower_of(target));
+      *var = ty == var_types.end() ? v : as_returns_type(v, ty->second);
+      return true;
+    }
     cond->kind = Condition::Exception;
     cond->message = "Unknown system variable '" + target + "'";
     return false;
@@ -712,7 +730,11 @@ struct Run {
       case Node::DeclareVar: {
         Val v = val_null();
         if (!n.deflt.empty() && !eval(n.deflt, &v, &c)) { raise(c); return; }
-        for (const std::string& name : n.names) scopes[scope][name] = v;
+        v = as_returns_type(v, n.type);
+        for (const std::string& name : n.names) {
+          scopes[scope][name] = v;
+          var_types[lower_of(name)] = n.type;
+        }
         return;
       }
       case Node::DeclareCursor:
@@ -933,6 +955,8 @@ Result<std::shared_ptr<SqlDatabase::StoredProgram>> parse_program(SqlDatabase& d
   std::string terr;
   if (!tokenize_sql(sql, &toks, &terr)) return R(Status::Invalid, terr);
   auto p = std::make_shared<SqlDatabase::StoredProgram>();
+  p->pipes_as_concat = tls_pipes_as_concat;
+  p->pg_division = tls_pg_division;
   p->create_text = trim(sql);
   while (!p->create_text.empty() && p->create_text.back() == ';') p->create_text = trim(p->create_text.substr(0, p->create_text.size() - 1));
   size_t i = 0;
@@ -1149,7 +1173,7 @@ std::vector<std::shared_ptr<const SqlDatabase::StoredProgram>> SqlDatabase::tabl
 void SqlDatabase::save_programs() {
   if (root_path_.empty()) return;
   Writer w;
-  w.u32(0x41515047);   // "AQPG"
+  w.u32(0x41515032);   // "AQP2": "AQPG" and each program's PIPES_AS_CONCAT
   {
     hal::LockGuard g(programs_mu_);
     w.u32((uint32_t)programs_.size());
@@ -1158,6 +1182,7 @@ void SqlDatabase::save_programs() {
       w.str(kv.second->create_text);
       w.u64(kv.second->created_ns);
       w.u64(kv.second->modified_ns);
+      w.u8((kv.second->pipes_as_concat ? 1 : 0) | (kv.second->pg_division ? 2 : 0));
     }
   }
   kernel_.host().write_file(root_path_ + "/programs.db", ByteSpan(w.buf().data(), w.buf().size()));
@@ -1168,14 +1193,21 @@ void SqlDatabase::load_programs() {
   auto raw = kernel_.host().read_file(root_path_ + "/programs.db");
   if (!raw.ok() || raw->empty()) return;
   Reader r(ByteSpan(raw->data(), raw->size()));
-  if (r.u32() != 0x41515047) return;
+  const uint32_t magic = r.u32();
+  if (magic != 0x41515047 && magic != 0x41515032) return;
   const uint32_t n = r.u32();
   for (uint32_t k = 0; k < n && r.ok(); ++k) {
     const std::string pdb = r.str(), text = r.str();
     const uint64_t created = r.u64(), modified = r.u64();
+    const uint8_t modes = magic == 0x41515032 ? r.u8() : 0;
     if (!r.ok()) break;
     bool orr = false, ine = false;
+    const bool caller_pipes = tls_pipes_as_concat, caller_div = tls_pg_division;
+    tls_pipes_as_concat = (modes & 1) != 0;   // read as it was made
+    tls_pg_division = (modes & 2) != 0;
     auto p = parse_program(*this, text, pdb, &orr, &ine);
+    tls_pipes_as_concat = caller_pipes;
+    tls_pg_division = caller_div;
     if (!p.ok()) {
       fprintf(stderr, "[asql] a stored program did not load: %s\n", p.error().message.c_str());
       continue;
@@ -1294,7 +1326,12 @@ SqlQueryResult SqlDatabase::execute_program_ddl(const std::string& sql) {
     auto np = std::make_shared<StoredProgram>();
     const StoredProgram& old = *it->second;
     bool orr = false, ine = false;
+    const bool caller_pipes = tls_pipes_as_concat, caller_div = tls_pg_division;
+    tls_pipes_as_concat = old.pipes_as_concat;
+    tls_pg_division = old.pg_division;
     auto re = parse_program(*this, old.create_text, old.db, &orr, &ine);
+    tls_pipes_as_concat = caller_pipes;
+    tls_pg_division = caller_div;
     if (!re.ok()) return make_error(re.error().message);
     np = *re;
     np->created_ns = old.created_ns;
@@ -1389,12 +1426,28 @@ void psm::Run::call(const std::string& text, Condition* c) {
   }
 }
 
+// A routine runs under the PIPES_AS_CONCAT and PG_DIVISION it was made under; the caller's come back after.
+struct RoutineMode {
+  bool saved_pipes = tls_pipes_as_concat, saved_div = tls_pg_division;
+  explicit RoutineMode(const SqlDatabase::StoredProgram& p) {
+    tls_pipes_as_concat = p.pipes_as_concat;
+    tls_pg_division = p.pg_division;
+  }
+  ~RoutineMode() {
+    tls_pipes_as_concat = saved_pipes;
+    tls_pg_division = saved_div;
+  }
+};
+
 std::vector<SqlQueryResult> sql_run_procedure(SqlDatabase& db, const SqlDatabase::StoredProgram& p, const std::vector<Val>& in,
                                               std::vector<Val>* out, const std::string& session_db, std::string* err) {
   DepthGuard dg;
   if (!dg.ok) { *err = "Recursive limit 32 (as max_sp_recursion_depth variable) was exceeded for routine " + p.name; return {}; }
+  RoutineMode mode(p);
   psm::Run run(db, p.db.empty() ? session_db : p.db);
-  for (size_t k = 0; k < p.params.size(); ++k) run.scopes[0][lower_of(p.params[k].name)] = k < in.size() ? in[k] : val_null();
+  // an IN / INOUT argument as the parameter's type holds it (an OUT one starts NULL either way)
+  for (size_t k = 0; k < p.params.size(); ++k)
+    run.scopes[0][lower_of(p.params[k].name)] = k < in.size() ? psm::as_returns_type(in[k], p.params[k].type) : val_null();
   run.run_list(psm::body_of(p), false);
   if (!run.error.empty()) { *err = run.error; return {}; }
   if (out) {
@@ -1428,12 +1481,19 @@ Val as_returns_type(const Val& v, const std::string& returns) {
   }
   if (kind == "char" || kind == "varchar" || kind == "text" || kind == "tinytext" || kind == "mediumtext" || kind == "longtext")
     return val_text(v.str());
+  // A DOUBLE holds a double: 2.5 passed to one is the binary 2.5, which rounds as a float does.
+  if (kind == "double" || kind == "float" || kind == "real") {
+    double n = v.numeric ? val_as_number(v) : 0;
+    if (!v.numeric && !parse_number(v.str(), &n)) n = 0;
+    return val_approx(n);
+  }
   return v;
 }
 }  // namespace psm
 
 Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<Val>& args,
                      const std::string& session_db, std::string* err) {
+  RoutineMode mode(f);
   DepthGuard dg;
   InFunction in_function;
   if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return val_null(); }
@@ -1444,7 +1504,7 @@ Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const
   }
   psm::Run run(db, f.db.empty() ? session_db : f.db);
   run.allow_results = false;
-  for (size_t k = 0; k < f.params.size(); ++k) run.scopes[0][lower_of(f.params[k].name)] = args[k];
+  for (size_t k = 0; k < f.params.size(); ++k) run.scopes[0][lower_of(f.params[k].name)] = psm::as_returns_type(args[k], f.params[k].type);
   run.run_list(psm::body_of(f), false);
   if (!run.error.empty()) { *err = run.error; return val_null(); }
   if (!run.returned) { *err = "No RETURN found in FUNCTION " + f.db + "." + f.name; return val_null(); }
@@ -1461,6 +1521,7 @@ Val sql_run_aggregate(SqlDatabase& db, const SqlDatabase::StoredProgram& f, cons
            std::to_string(f.params.size()) + ", got " + std::to_string(rows[0].size());
     return val_null();
   }
+  RoutineMode mode(f);
   psm::Run run(db, f.db.empty() ? session_db : f.db);
   run.allow_results = false;
   for (size_t k = 0; k < f.params.size(); ++k) run.scopes[0][lower_of(f.params[k].name)] = val_null();
@@ -1484,6 +1545,7 @@ bool sql_fire_trigger(SqlDatabase& db, const SqlDatabase::StoredProgram& t, cons
     uint64_t last = tls_last_insert_id, stmt = tls_statement_insert_id;
     ~KeepIds() { tls_last_insert_id = last; tls_statement_insert_id = stmt; }
   } keep_ids;
+  RoutineMode mode(t);
   psm::Run run(db, t.db);
   run.allow_results = false;
   run.trig_table = &table;
@@ -1613,4 +1675,128 @@ std::vector<std::shared_ptr<const SqlDatabase::StoredProgram>> SqlDatabase::list
   hal::LockGuard g(programs_mu_);
   for (const auto& kv : programs_) if (kv.second->kind == kind) out.push_back(kv.second);
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// CREATE TYPE name AS ENUM ('a', 'b', ...) / DROP TYPE [IF EXISTS] name, PostgreSQL's. The type is its labels: a
+// column declared with it is ENUM('a', 'b', ...), and x::name is the label as text (parse_pg_cast).
+// ---------------------------------------------------------------------------
+SqlQueryResult SqlDatabase::execute_type_ddl(const std::string& sql) {
+  std::vector<Token> toks;
+  std::string terr;
+  if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
+  SqlParser p(toks);
+  const bool create = p.is_word("CREATE");
+  p.next();
+  p.next();   // TYPE
+  bool if_exists = false;
+  if (!create && p.is_word("IF") && p.is_word("EXISTS", 1)) { p.next(); p.next(); if_exists = true; }
+  std::string name;
+  if (!p.parse_name(&name)) return make_error(p.error());
+  std::string db = effective_database();
+  const size_t dot = name.rfind('.');
+  if (dot != std::string::npos) { db = name.substr(0, dot); name = name.substr(dot + 1); }
+  const std::string key = lower_of(db) + "." + lower_of(name);
+  SqlQueryResult r;
+  if (!create) {
+    {
+      hal::LockGuard g(programs_mu_);
+      if (!enum_types_.erase(key) && !if_exists) return make_error("type \"" + name + "\" does not exist");
+    }
+    save_enum_types();
+    r.formatted_table = "Type dropped.";
+    return r;
+  }
+  if (!p.take_word("AS") || !p.take_word("ENUM") || !p.take_punct("("))
+    return make_error("CREATE TYPE takes AS ENUM ('label', ...) here");
+  std::vector<std::string> labels;
+  if (!p.is_punct(")")) {
+    do {
+      if (p.peek().kind != Tok::Str) return make_error("an enum label is a string literal, near '" + p.peek().text + "'");
+      for (const auto& l : labels)
+        if (l == p.peek().text) return make_error("enum label \"" + l + "\" is there twice");
+      labels.push_back(p.next().text);
+    } while (p.take_punct(","));
+  }
+  if (!p.take_punct(")")) return make_error("expected ) after the enum labels");
+  p.take_punct(";");
+  if (!p.at_end()) return make_error("unexpected trailing input near '" + p.peek().text + "'");
+  {
+    hal::LockGuard g(programs_mu_);
+    if (enum_types_.count(key)) return make_error("type \"" + name + "\" already exists");
+    enum_types_[key] = labels;
+  }
+  save_enum_types();
+  r.formatted_table = "Type created.";
+  return r;
+}
+
+// A CREATE / ALTER TABLE with each column type that is an enum type of the current database written as its ENUM.
+// A type is a word right after a column's name, which follows `(`, `,`, ADD [COLUMN], MODIFY [COLUMN] or
+// CHANGE [COLUMN] old.
+std::string SqlDatabase::with_enum_types(const std::string& sql) const {
+  std::vector<Token> toks;
+  std::string terr;
+  if (!tokenize_sql(sql, &toks, &terr)) return sql;
+  bool table = false;
+  for (size_t i = 1; i < toks.size() && i < 6; ++i) if (toks[i].up == "TABLE"sv) table = true;
+  if (!table) return sql;
+  const std::string prefix = lower_of(effective_database()) + ".";
+  std::string out;
+  size_t copied = 0;
+  hal::LockGuard g(programs_mu_);
+  for (size_t i = 2; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+    if (toks[i].kind != Tok::Ident || toks[i].quoted || toks[i - 1].kind != Tok::Ident) continue;
+    const Token& before = toks[i - 2];
+    const bool col_start = (before.kind == Tok::Punct && (before.text == "(" || before.text == ",")) ||
+                           before.up == "ADD"sv || before.up == "MODIFY"sv || before.up == "COLUMN"sv ||
+                           (i >= 3 && (toks[i - 3].up == "CHANGE"sv || (toks[i - 3].up == "COLUMN"sv && i >= 4 && toks[i - 4].up == "CHANGE"sv)));
+    if (!col_start) continue;
+    auto it = enum_types_.find(prefix + lower_of(toks[i].text));
+    if (it == enum_types_.end()) continue;
+    std::string en = "ENUM(";
+    for (size_t k = 0; k < it->second.size(); ++k) {
+      std::string lab;
+      for (char c : it->second[k]) { if (c == '\'') lab += "''"; else if (c == '\\') lab += "\\\\"; else lab += c; }
+      en += (k ? ", '" : "'") + lab + "'";
+    }
+    en += ")";
+    out += sql.substr(copied, toks[i].start_pos - copied) + en;
+    copied = toks[i].end_pos;
+  }
+  if (copied == 0) return sql;
+  return out + sql.substr(copied);
+}
+
+void SqlDatabase::save_enum_types() {
+  if (root_path_.empty()) return;
+  Writer w;
+  w.u32(0x41515459);   // "AQTY"
+  {
+    hal::LockGuard g(programs_mu_);
+    w.u32((uint32_t)enum_types_.size());
+    for (const auto& kv : enum_types_) {
+      w.str(kv.first);
+      w.u32((uint32_t)kv.second.size());
+      for (const auto& l : kv.second) w.str(l);
+    }
+  }
+  kernel_.host().write_file(root_path_ + "/types.db", ByteSpan(w.buf().data(), w.buf().size()));
+}
+
+void SqlDatabase::load_enum_types() {
+  if (root_path_.empty()) return;
+  auto raw = kernel_.host().read_file(root_path_ + "/types.db");
+  if (!raw.ok() || raw->empty()) return;
+  Reader r(ByteSpan(raw->data(), raw->size()));
+  if (r.u32() != 0x41515459) return;
+  const uint32_t n = r.u32();
+  hal::LockGuard g(programs_mu_);
+  for (uint32_t k = 0; k < n && r.ok(); ++k) {
+    std::string key = r.str();
+    const uint32_t m = r.u32();
+    std::vector<std::string> labels;
+    for (uint32_t j = 0; j < m && r.ok(); ++j) labels.push_back(r.str());
+    if (r.ok()) enum_types_[key] = std::move(labels);
+  }
 }

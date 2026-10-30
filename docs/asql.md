@@ -2169,8 +2169,8 @@ These worked over the wire:
   `DELETE t1[, t2] FROM <tables> [WHERE]` (a target named by alias), and
   `DELETE FROM t1 USING <tables> [WHERE]`; each target needs a primary key
 - correlated scalar subqueries
-- `WITH` and `WITH RECURSIVE` (at the start of a statement or a view; not
-  yet inside a subquery). A recursive CTE's recursive part runs at most
+- `WITH` and `WITH RECURSIVE` (at the start of a statement or a view, and inside a
+  subquery, a derived table or a function body). A recursive CTE's recursive part runs at most
   `max_recursive_iterations` times (MariaDB's: default 1000, up to 4294967295,
   `SET [SESSION | GLOBAL] max_recursive_iterations = n`); one still making
   rows at the limit stops there with warning 1931. Under a strict `sql_mode`
@@ -2256,6 +2256,30 @@ These worked over the wire:
   fractional seconds). Omitted time components default to zero (`17:00` parses
   as `17:00:00`), properly matching datetime and date values rather than
   degrading to text-as-number comparisons (`tools/asql-datetime-literal-check.cpp`).
+
+### PostgreSQL's spellings
+
+Code written for PostgreSQL (SQLDoom's game tic, `apps/sqldoom`) runs as written where MySQL has no spelling of
+its own for the same thing; `tools/asql-doom-sql-check.cpp` holds each, at the top level, nested and in routines:
+
+- `x::type` - `int`/`bigint`/`smallint`, `float8`/`real`/`double precision`, `numeric[(p,s)]`, `text`/`varchar(n)`,
+  `boolean`, `bytea`, `date`, `timestamp`, or an enum type (its label). As PostgreSQL casts: a float to an integer
+  rounds half to even (`2.5e0::int` is 2), a bare `numeric` keeps every digit, `'yes'::boolean` is 1
+- `a IS [NOT] DISTINCT FROM b` (`NOT (a <=> b)`)
+- `LATERAL (SELECT ...)` and `generate_series(start, stop [, step])` in `FROM`, with `AS t(a, b)` column lists
+- `BOOL_AND`, `BOOL_OR`, `EVERY`; `ARG_MAX(v, k)` / `ARG_MIN(v, k)` (also `MAX_BY` / `MIN_BY`);
+  `string_agg(x, sep [ORDER BY ..])`; `agg(..) FILTER (WHERE ..)`, windows included
+- `INSERT .. ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET c = EXCLUDED.c .. [WHERE ..]`: every `SET` and the
+  `WHERE` read the row as it was (MySQL's `ON DUPLICATE KEY UPDATE` sees each assignment before it); any unique
+  key's collision is the conflict
+- `UPDATE t [AS] a SET c = .. FROM <tables> [WHERE ..]`, after a `WITH` too
+- `CREATE TYPE name AS ENUM ('a', ..)` / `DROP TYPE [IF EXISTS] name`: a column of the type is that `ENUM`
+- `TRUNC(x [, places])`, `CHR(n)`, `GET_BYTE(bytes, offset)`
+- `sql_mode` `PIPES_AS_CONCAT` (MySQL's, also in `ANSI`): `a || b` is `CONCAT(a, b)`. `PG_DIVISION` (ASQL's own):
+  `/` divides as PostgreSQL's - an integer by an integer truncates toward zero, other exact operands divide in double
+  precision, dividing by zero is an error. A stored routine runs under the `sql_mode` it was made under, as in MySQL.
+
+Not there: arrays, `RETURNING`, data-modifying CTEs, `$n` placeholders, PL/pgSQL.
 
 ### Window functions
 

@@ -198,6 +198,10 @@ struct SqlDatabase::StoredProgram {
   bool preserve = false, enabled = true;
   mutable std::atomic<int64_t> last_run{0};
   uint64_t created_ns = 0, modified_ns = 0;
+  // Made under sql_mode PIPES_AS_CONCAT / PG_DIVISION: it runs under them, whoever calls it (MySQL keeps a
+  // routine's sql_mode).
+  bool pipes_as_concat = false;
+  bool pg_division = false;
 };
 
 // macOS had no branch here, so every "give it back" call site was a no-op on a
@@ -2511,6 +2515,17 @@ struct Token {
 bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std::string* err);
 bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* err, bool remember);
 
+// The session's sql_mode has PIPES_AS_CONCAT (or ANSI, which includes it): `a || b` is CONCAT(a, b), not OR. The
+// tokenizer says which by the token it makes - "||+" for the concatenation, text no statement can hold (it reads as
+// || then +) - so whatever is kept by a statement's tokens (the shape cache) keeps the two apart.
+thread_local bool tls_pipes_as_concat = false;
+thread_local bool tl_last_pipes = false;
+// sql_mode PG_DIVISION, ASQL's own: `/` divides as PostgreSQL's does - an integer by an integer truncates toward
+// zero (7 / 2 is 3), other exact operands divide in double precision (MySQL keeps 4 more places: 1 / 3.0 is
+// 0.33333), and dividing by zero is an error. Decided when the division is worked out, so no parse or plan
+// depends on it. For code written for PostgreSQL, such as SQLDoom's game tic.
+thread_local bool tls_pg_division = false;
+
 // One statement is tokenized by the gateway, again by the local executor and
 // again by the SELECT parser - the same text three times, a quarter of the
 // ERP's uncached tax join on st. The last text a thread tokenized is kept,
@@ -2535,9 +2550,9 @@ bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* 
     return true;
   }
   const bool keep = out->empty() && sql.size() >= 64 && sql.size() <= (64u << 10);
-  if (keep && !tl_last_sql.empty() && sql == tl_last_sql) { *out = tl_last_toks; return true; }
+  if (keep && !tl_last_sql.empty() && sql == tl_last_sql && tl_last_pipes == tls_pipes_as_concat) { *out = tl_last_toks; return true; }
   if (!tokenize_sql_uncached(sql, out, err)) return false;
-  if (keep && remember) { tl_last_sql = sql; tl_last_toks = *out; }
+  if (keep && remember) { tl_last_sql = sql; tl_last_toks = *out; tl_last_pipes = tls_pipes_as_concat; }
   return true;
 }
 bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* err) { return tokenize_sql(sql, out, err, true); }
@@ -2828,14 +2843,14 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
       i += 3;
       continue;
     }
-    static const char* const two[] = {"<=", ">=", "<>", "!=", "||", "&&", ":=", "<<", ">>", "->"};
+    static const char* const two[] = {"<=", ">=", "<>", "!=", "||", "&&", "::", ":=", "<<", ">>", "->"};
     bool matched = false;
     for (const char* op : two) {
       if (sql.compare(i, 2, op) == 0) {
         Token t;
         t.kind = Tok::Punct;
-        t.text = op;
-        t.up = op;
+        t.text = tls_pipes_as_concat && op[0] == '|' && op[1] == '|' ? "||+" : op;
+        t.up = t.text;
         t.start_pos = i;
         t.end_pos = i + 2;
         out->push_back(std::move(t));
@@ -3580,7 +3595,8 @@ bool is_aggregate_name(const std::string& up) {
          up == "ANY_VALUE"sv || up == "FIRST"sv || up == "FIRST_VALUE"sv ||
          up == "BIT_AND"sv || up == "BIT_OR"sv || up == "BIT_XOR"sv ||
          up == "ARBITRARY"sv || up == "STD"sv || up == "STDDEV"sv || up == "STDDEV_POP"sv ||
-         up == "STDDEV_SAMP"sv || up == "VARIANCE"sv || up == "VAR_POP"sv || up == "VAR_SAMP"sv;
+         up == "STDDEV_SAMP"sv || up == "VARIANCE"sv || up == "VAR_POP"sv || up == "VAR_SAMP"sv ||
+         up == "ARG_MAX"sv || up == "ARG_MIN"sv || up == "MAX_BY"sv || up == "MIN_BY"sv;
 }
 
 bool expr_has_aggregate(const ExprPtr& e) {
@@ -3871,6 +3887,19 @@ class SqlParser {
         e->negated = neg;
         return e;
       }
+      // a IS [NOT] DISTINCT FROM b (SQL's, PostgreSQL's): NOT (a <=> b), and a <=> b.
+      if (take_word("DISTINCT")) {
+        if (!take_word("FROM")) { fail("expected FROM after IS DISTINCT"); return left; }
+        ExprPtr right = parse_bitor();
+        if (failed() || !right) return left;
+        auto same = make_op_call("__NULLSAFE_EQ", {left, right});
+        same->source_text = left->source_text + " <=> " + right->source_text;
+        if (neg) return same;
+        auto e = make(ExprOp::Not);
+        e->args = {same};
+        e->source_text = left->source_text + " IS DISTINCT FROM " + right->source_text;
+        return e;
+      }
       if (!take_word("NULL")) { fail("expected NULL after IS"); return left; }
       auto e = make(ExprOp::IsNull);
       e->negated = neg;
@@ -4140,10 +4169,27 @@ class SqlParser {
   }
 
   ExprPtr parse_bitxor() {
-    ExprPtr left = parse_unary();
+    ExprPtr left = parse_concat();
     while (!failed() && is_punct("^")) {
       p_++;
-      left = make_op_call("__BITXOR", {left, parse_unary()});
+      left = make_op_call("__BITXOR", {left, parse_concat()});
+    }
+    return left;
+  }
+
+  // a || b under PIPES_AS_CONCAT (the tokenizer's "||+"): CONCAT(a, b), between ^ and the unary operators as MySQL
+  // places it.
+  ExprPtr parse_concat() {
+    ExprPtr left = parse_unary();
+    while (!failed() && left && is_punct("||+")) {
+      p_++;
+      ExprPtr right = parse_unary();
+      if (failed() || !right) return left;
+      auto e = make(ExprOp::Func);
+      e->name = "CONCAT";
+      e->args = {left, right};
+      e->source_text = left->source_text + " || " + right->source_text;
+      left = e;
     }
     return left;
   }
@@ -4175,8 +4221,61 @@ class SqlParser {
     return e;
   }
 
+  // PostgreSQL's `x::type`, as the CAST it is: the target in MySQL's words, and a third argument "PG" (or "PGBOOL")
+  // for where PostgreSQL's cast differs - a float to an integer rounds half to even, a bare numeric keeps every
+  // digit, text to boolean reads t/true/yes/on/1. A name that is no type here is an enum's (CREATE TYPE .. AS ENUM):
+  // its label, as text.
+  ExprPtr parse_pg_cast(ExprPtr inner) {
+    if (peek().kind != Tok::Ident) { fail("expected a type after ::"); return nullptr; }
+    std::string ty = next().up;
+    if ((ty == "DOUBLE" && is_word("PRECISION")) || (ty == "CHARACTER" && is_word("VARYING"))) ty += " " + next().up;
+    std::string args_text;
+    if (take_punct("(")) {
+      args_text = "(";
+      while (!at_end() && !is_punct(")")) args_text += next().text;
+      if (!expect_punct(")")) return nullptr;
+      args_text += ")";
+    }
+    if (ty == "TIMESTAMP" || ty == "TIME") {
+      if (take_word("WITH") || take_word("WITHOUT")) {
+        if (!take_word("TIME") || !take_word("ZONE")) { fail("expected TIME ZONE"); return nullptr; }
+      }
+    }
+    if (is_punct("[")) { fail("array types are not supported"); return nullptr; }
+    std::string target, flag;
+    if (ty == "INT" || ty == "INTEGER" || ty == "INT2" || ty == "INT4" || ty == "INT8" || ty == "SMALLINT" ||
+        ty == "BIGINT") { target = "SIGNED"; flag = "PG"; }
+    else if (ty == "FLOAT" || ty == "FLOAT4" || ty == "FLOAT8" || ty == "REAL" || ty == "DOUBLE PRECISION" ||
+             ty == "DOUBLE") target = "DOUBLE";
+    else if (ty == "NUMERIC" || ty == "DECIMAL") { target = "DECIMAL" + args_text; if (args_text.empty()) flag = "PG"; }
+    else if (ty == "TEXT" || ty == "VARCHAR" || ty == "CHARACTER VARYING" || ty == "CHAR" || ty == "CHARACTER" ||
+             ty == "BPCHAR" || ty == "NAME" || ty == "JSON" || ty == "JSONB") target = "CHAR" + args_text;
+    else if (ty == "BOOLEAN" || ty == "BOOL") { target = "SIGNED"; flag = "PGBOOL"; }
+    else if (ty == "BYTEA") target = "BINARY";
+    else if (ty == "DATE") target = "DATE";
+    else if (ty == "TIMESTAMP" || ty == "TIMESTAMPTZ") target = "DATETIME";
+    else if (ty == "TIME") target = "TIME";
+    else target = "CHAR";   // an enum type's label
+    auto e = make(ExprOp::Func);
+    e->name = "CAST";
+    auto t_expr = make(ExprOp::Literal);
+    t_expr->literal = val_text(target);
+    e->args = {inner, t_expr};
+    if (!flag.empty()) {
+      auto f_expr = make(ExprOp::Literal);
+      f_expr->literal = val_text(flag);
+      e->args.push_back(f_expr);
+    }
+    e->source_text = inner->source_text + "::" + lower_of(ty) + args_text;
+    return e;
+  }
+
   ExprPtr parse_postfix() {
     ExprPtr left = parse_primary();
+    while (!failed() && left && is_punct("::")) {
+      p_++;
+      left = parse_pg_cast(left);
+    }
     while (!failed() && left && (is_punct("->") || is_punct("->>"))) {
       bool unquote = is_punct("->>");
       p_++;
@@ -4662,7 +4761,28 @@ class SqlParser {
         }
         // JSON_ARRAYAGG(x ORDER BY ...) reads like GROUP_CONCAT (MariaDB allows
         // the ORDER BY there; the ERP's manufacturer_purchasing_priorities uses it).
-        if (t.up == "GROUP_CONCAT"sv || t.up == "JSON_ARRAYAGG"sv || t.up == "JSON_OBJECTAGG"sv) {
+        // string_agg(x, separator [ORDER BY ..]) (PostgreSQL's) is GROUP_CONCAT(x [ORDER BY ..] SEPARATOR separator).
+        if (t.up == "STRING_AGG"sv) {
+          ExprPtr arg = parse_expr();
+          if (failed() || !arg) return e;
+          e->args.push_back(arg);
+          if (!expect_punct(",")) return e;
+          if (peek().kind != Tok::Str) { fail("string_agg takes a string literal separator, near '" + peek().text + "'"); return e; }
+          e->separator = next().text;
+          if (take_punct("::")) next();   // ''::bytea, ', '::text: the literal is the separator either way
+          if (take_word("ORDER")) {
+            if (!take_word("BY")) { fail("expected BY after ORDER in string_agg"); return e; }
+            do {
+              OrderKey k;
+              k.expr = parse_expr();
+              if (failed() || !k.expr) return e;
+              if (take_word("DESC")) k.descending = true;
+              else take_word("ASC");
+              e->group_order_by.push_back(k);
+            } while (take_punct(","));
+          }
+          e->name = "GROUP_CONCAT";
+        } else if (t.up == "GROUP_CONCAT"sv || t.up == "JSON_ARRAYAGG"sv || t.up == "JSON_OBJECTAGG"sv) {
           if (!is_punct(")") && !is_word("ORDER") && !is_word("SEPARATOR")) {
             do {
               ExprPtr arg = parse_expr();
@@ -4711,6 +4831,39 @@ class SqlParser {
         for (size_t i = 0; i < e->args.size(); ++i)
           e->source_text += (i ? "," : "") + e->args[i]->source_text;
         e->source_text += ")";
+        // BOOL_AND / EVERY / BOOL_OR (PostgreSQL's): MIN / MAX of the argument as a truth value.
+        if ((t.up == "BOOL_AND"sv || t.up == "EVERY"sv || t.up == "BOOL_OR"sv) && e->args.size() == 1) {
+          e->name = t.up == "BOOL_OR"sv ? "MAX" : "MIN";
+          e->args[0] = make_op_call("__TRUTH", {e->args[0]});
+        }
+        // agg(..) FILTER (WHERE c): the aggregate over the rows c holds for - each argument is NULL on the others,
+        // which every aggregate passes over (COUNT(*) counts IF(c, 1, NULL)).
+        if (is_word("FILTER") && is_punct("(", 1)) {
+          p_ += 2;
+          if (!take_word("WHERE")) { fail("expected WHERE in FILTER (...)"); return e; }
+          ExprPtr cond = parse_expr();
+          if (failed() || !cond) return e;
+          if (!expect_punct(")")) return e;
+          auto only_when = [&](ExprPtr v) {
+            auto null_lit = make(ExprOp::Literal);
+            null_lit->literal = val_null();
+            null_lit->source_text = "NULL";
+            auto f = make(ExprOp::Func);
+            f->name = "IF";
+            f->args = {cond, std::move(v), null_lit};
+            f->source_text = "IF(" + cond->source_text + ", .., NULL)";
+            return f;
+          };
+          if (!e->args.empty() && e->args[0]->op == ExprOp::Star) {
+            auto one = make(ExprOp::Literal);
+            one->literal = val_num(1);
+            one->source_text = "1";
+            e->args[0] = only_when(one);
+          } else {
+            for (auto& a : e->args) a = only_when(a);
+          }
+          e->source_text += " FILTER (WHERE " + cond->source_text + ")";
+        }
         if (is_word("OVER")) {
           const size_t over_at = p_;
           p_++;
@@ -8411,6 +8564,30 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
     }
     return val_num_with_text((double)acc, std::to_string(acc));
   }
+  // ARG_MAX(v, k) / ARG_MIN(v, k) (DuckDB's, CedarDB's; MAX_BY / MIN_BY as other engines name them): v from the
+  // row whose k is largest / smallest, the first such row on a tie. Rows whose k is NULL are passed over.
+  if (up == "ARG_MAX"sv || up == "ARG_MIN"sv || up == "MAX_BY"sv || up == "MIN_BY"sv) {
+    if (e->args.size() != 2) { ctx_fail(ctx, up + "() takes a value and the key to order by"); return val_null(); }
+    const bool want_max = up == "ARG_MAX"sv || up == "MAX_BY"sv;
+    Val best, best_key;
+    bool has_val = false;
+    EvalCtx inner = ctx;
+    inner.group = nullptr;
+    for (size_t gi = 0; gi < ctx.group->size(); ++gi) {
+      inner.row = &(*ctx.group)[gi];
+      Val k = eval_expr(e->args[1].get(), inner);
+      if (ctx.err && !ctx.err->empty()) return val_null();
+      if (k.null) continue;
+      const int c = has_val ? compare_vals(k, best_key) : 0;
+      if (!has_val || (c != -2 && (want_max ? c > 0 : c < 0))) {
+        best = eval_expr(e->args[0].get(), inner);
+        best_key = std::move(k);
+        has_val = true;
+      }
+    }
+    return has_val ? best : val_null();
+  }
+
   if (up == "MIN"sv || up == "MAX"sv) {
     Val best;
     bool has_val = false;
@@ -9856,6 +10033,24 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     if (arg_count == 0 || a_ptr[0].null) return arg_count == 0 ? val_null() : a_ptr[0];
     std::string target = arg_count > 1 ? upper_of(a_ptr[1].str()) : std::string();
     if (target.empty() || target.rfind("USING", 0) == 0) return a_ptr[0];
+    // x::type (parse_pg_cast): PostgreSQL's cast where it differs from MySQL's.
+    const std::string_view pg = arg_count > 2 ? a_ptr[2].sv() : std::string_view();
+    if (pg == "PGBOOL"sv) {
+      if (a_ptr[0].numeric) return val_num(val_as_number(a_ptr[0]) != 0 ? 1 : 0);
+      const std::string t = lower_of(trim(a_ptr[0].str()));
+      if (t == "t" || t == "true" || t == "y" || t == "yes" || t == "on" || t == "1") return val_num(1);
+      if (t == "f" || t == "false" || t == "n" || t == "no" || t == "off" || t == "0") return val_num(0);
+      return val_null();
+    }
+    if (pg == "PG"sv && target == "DECIMAL") {   // numeric with no precision: the number, every digit kept
+      if (a_ptr[0].numeric) return a_ptr[0];
+      double d = 0;
+      const std::string t = trim(a_ptr[0].str());
+      return parse_number(t, &d) ? val_num_with_text(d, canonical_decimal(t).empty() ? t : canonical_decimal(t)) : val_null();
+    }
+    if (pg == "PG"sv && target == "SIGNED" && a_ptr[0].numeric && a_ptr[0].approx) {   // float to integer: half to even
+      return val_num(std::nearbyint(val_as_number(a_ptr[0])));
+    }
     if (target.rfind("DECIMAL", 0) == 0 || target.rfind("NUMERIC", 0) == 0) {
       int places = 0;
       size_t comma = target.find(',');
@@ -10958,6 +11153,36 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
     return round_value(a_ptr[0], (long long)val_as_number(a_ptr[1]), true);
   }
+  // PostgreSQL's: TRUNC(x [, places]) is TRUNCATE(x, places), 0 places unless given; CHR(n) the character with that
+  // code (UTF-8 past 127); GET_BYTE(bytes, offset) the byte at a 0-based offset, an error past the end.
+  if (up == "TRUNC"sv) {
+    if (arg_count < 1 || a_ptr[0].null || (arg_count > 1 && a_ptr[1].null)) return val_null();
+    return round_value(a_ptr[0], arg_count > 1 ? (long long)val_as_number(a_ptr[1]) : 0, true);
+  }
+  if (up == "CHR"sv) {
+    if (arg_count != 1) { ctx_fail(ctx, "chr() takes one argument"); return val_null(); }
+    if (a_ptr[0].null) return val_null();
+    const long long n = (long long)val_as_number(a_ptr[0]);
+    if (n <= 0 || n > 0x10FFFF) { ctx_fail(ctx, "requested character too large for encoding: " + std::to_string(n)); return val_null(); }
+    std::string out;
+    const uint32_t c = (uint32_t)n;
+    if (c < 0x80) out += (char)c;
+    else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+    else { out += (char)(0xF0 | (c >> 18)); out += (char)(0x80 | ((c >> 12) & 0x3F)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+    return val_text(out);
+  }
+  if (up == "GET_BYTE"sv) {
+    if (arg_count != 2) { ctx_fail(ctx, "get_byte() takes bytes and an offset"); return val_null(); }
+    if (a_ptr[0].null || a_ptr[1].null) return val_null();
+    const std::string_view b = a_ptr[0].sv();
+    const long long at = (long long)val_as_number(a_ptr[1]);
+    if (at < 0 || (size_t)at >= b.size()) {
+      ctx_fail(ctx, "index " + std::to_string(at) + " out of valid range, 0.." + std::to_string((long long)b.size() - 1));
+      return val_null();
+    }
+    return val_num((unsigned char)b[(size_t)at]);
+  }
   if (up == "GREATEST"sv || up == "LEAST"sv) {
     if (arg_count == 0) return val_null();
     Val best = a_ptr[0];
@@ -11388,6 +11613,8 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     return val_u64(up == "__SHL"sv ? l << r : l >> r);
   }
   if (up == "__BITNOT"sv) return a_ptr[0].null ? val_null() : val_u64(~as_u64(a_ptr[0]));
+  // x as a truth value: NULL, 1 or 0 (BOOL_AND / BOOL_OR / EVERY are MIN / MAX of it).
+  if (up == "__TRUTH"sv) return a_ptr[0].null ? val_null() : val_num(val_as_number(a_ptr[0]) != 0 ? 1 : 0);
   if (up == "BIT_COUNT"sv) {
     if (arg_count != 1) { ctx_fail(ctx, "Incorrect parameter count in the call to native function 'BIT_COUNT'"); return val_null(); }
     if (a_ptr[0].null) return val_null();
@@ -11964,6 +12191,7 @@ static NumType nt_of(const SqlExpr* e, const EvalCtx& ctx, int depth = 0) {
       if (a.k == 0 || b.k == 0 || a.k == 5 || b.k == 5) return {};
       if (a.k == 4 || b.k == 4 || a.k == 3 || b.k == 3) return {3, 0};
       const int as = a.k == 2 ? a.s : 0, bs = b.k == 2 ? b.s : 0;
+      if (e->op == ExprOp::Div && tls_pg_division) return as == 0 && bs == 0 ? NumType{1, 0} : NumType{3, 0};
       int sc = e->op == ExprOp::Div ? as + 4 : e->op == ExprOp::Mul ? as + bs : std::max(as, bs);
       sc = std::min(sc, 38);
       return sc > 0 ? NumType{2, (int8_t)sc} : NumType{1, 0};
@@ -12608,6 +12836,15 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
             ctx_fail(ctx, "BIGINT value is out of range in '" + (e->source_text.empty() ? std::string("expression") : e->source_text) + "'");
             return val_null();
           }
+        }
+      }
+      if (e->op == ExprOp::Div && tls_pg_division && l.numeric && r.numeric && !l.approx && !r.approx) {
+        AIOS_INT128 a = 0, b = 0;
+        int sa = 0, da = 0, sb = 0, db_ = 0;
+        if (exact_internal_of(l, &a, &sa, &da) && exact_internal_of(r, &b, &sb, &db_)) {
+          if (b == 0) { ctx_fail(ctx, "division by zero"); return val_null(); }
+          if (sa == 0 && sb == 0) return val_exact(a / b, 0);   // C++'s / truncates toward zero, as PostgreSQL's
+          return val_approx(val_as_number(l) / val_as_number(r));
         }
       }
       Val exact;
@@ -13397,9 +13634,12 @@ std::string sql_mode_text() {
 void sql_set_session_mode(const std::string& mode) {
   std::string m = upper_of(mode);
   m.erase(std::remove(m.begin(), m.end(), ' '), m.end());
-  if (m == "DEFAULT") { tls_sql_mode_set = false; return; }
+  if (m == "DEFAULT") { tls_sql_mode_set = false; tls_pipes_as_concat = false; tls_pg_division = false; return; }
   tls_sql_mode_set = true;
   tls_sql_mode = m;
+  tls_pg_division = m.find("PG_DIVISION") != std::string::npos;
+  tls_pipes_as_concat = m.find("PIPES_AS_CONCAT") != std::string::npos || m == "ANSI" || m.rfind("ANSI,", 0) == 0 ||
+                        m.find(",ANSI,") != std::string::npos || (m.size() > 5 && m.compare(m.size() - 5, 5, ",ANSI") == 0);
   tls_sql_mode_strict = m.find("STRICT_TRANS_TABLES") != std::string::npos || m.find("STRICT_ALL_TABLES") != std::string::npos ||
                         m.find("TRADITIONAL") != std::string::npos;
 }
@@ -24879,6 +25119,7 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   load_tables();
   init_lap("tables and views loaded");
   load_programs();
+  load_enum_types();
   // Every table file was read whole and decoded; the file buffers are freed
   // but their pages are still ours until asked for. (The legacy v3 loader
   // already did this; the v4 path never did.)
@@ -26886,7 +27127,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
   // token against the uncacheable-function list - 40 us for the ERP's
   // three-table tax join, against 6 for a one-table lookup.
   // Built once: it is the whole statement text, hashed on every probe.
-  const std::string cache_key = cache_on ? session_db + "::" + q : std::string();
+  const std::string cache_key = cache_on ? (tls_pipes_as_concat ? "||+" : "") + session_db + "::" + q : std::string();
   if (cache_on && !locking) {
     std::shared_ptr<const SqlQueryResult> hit;
     {
@@ -27922,6 +28163,18 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
     std::vector<Token> toks;
     std::string terr;
     if (!tokenize_sql(q, &toks, &terr)) return make_error(terr);
+    // CREATE TYPE .. AS ENUM / DROP TYPE; a table's column of such a type is the ENUM it names, written out before
+    // the statement is recorded (a replay needs no type).
+    if (toks.size() > 2 && (toks[0].up == "CREATE"sv || toks[0].up == "DROP"sv) && toks[1].up == "TYPE"sv)
+      return execute_type_ddl(q);
+    if (!enum_types_.empty() && toks.size() > 2 && (toks[0].up == "CREATE"sv || toks[0].up == "ALTER"sv)) {
+      std::string rq = with_enum_types(q);
+      if (rq != q) {
+        q = rq;
+        toks.clear();
+        if (!tokenize_sql(q, &toks, &terr)) return make_error(terr);
+      }
+    }
     if (toks.empty() || toks[0].kind == Tok::End) {
       SqlQueryResult r;
       r.formatted_table = "Empty query";
@@ -51302,7 +51555,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
         if (toks[e].kind == Tok::Punct && toks[e].text == "(") depth++;
         else if (toks[e].kind == Tok::Punct && toks[e].text == ")") depth--;
         else if (depth == 0 && toks[e].kind == Tok::Punct && toks[e].text == ",") break;
-        else if (depth == 0 && toks[e].up == "ON" && e + 1 < toks.size() && toks[e + 1].up == "DUPLICATE") break;
+        else if (depth == 0 && toks[e].up == "ON" && e + 1 < toks.size() && (toks[e + 1].up == "DUPLICATE" || toks[e + 1].up == "CONFLICT")) break;
       }
       if (e == e0 || toks[e0].kind == Tok::End) return make_error("expected a value after '='");
       const size_t a = toks[e0].start_pos;
@@ -51347,7 +51600,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     for (size_t i = from; i < toks.size(); ++i) {
       if (toks[i].kind == Tok::Punct && toks[i].text == "(") depth++;
       else if (toks[i].kind == Tok::Punct && toks[i].text == ")") depth--;
-      else if (depth == 0 && toks[i].up == "ON" && i + 1 < toks.size() && toks[i + 1].up == "DUPLICATE") { end_tok = i; break; }
+      else if (depth == 0 && toks[i].up == "ON" && i + 1 < toks.size() && (toks[i + 1].up == "DUPLICATE" || toks[i + 1].up == "CONFLICT")) { end_tok = i; break; }
       if (toks[i].kind == Tok::End) { end_tok = i; break; }
     }
     size_t a = toks[from].start_pos;
@@ -51427,7 +51680,64 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   struct DupSet { size_t col; ExprPtr value; };
   std::vector<DupSet> dup_sets;
   bool dup_literal_only = true;
-  if (p.take_word("ON")) {
+  // PostgreSQL's ON CONFLICT: DO NOTHING passes over a row whose key is there (INSERT IGNORE, for keys alone);
+  // DO UPDATE SET .. [WHERE ..] is the ON DUPLICATE KEY UPDATE below with EXCLUDED.col for the new row's value,
+  // every SET and the WHERE read off the row as it was (MySQL's assignments each see the ones before), and a
+  // WHERE that does not hold leaving the row as it is. Any unique key's collision is the conflict, the target
+  // named or not, as MySQL's is.
+  bool conflict_nothing = false;
+  bool pg_upsert = false;
+  ExprPtr pg_where;
+  if (p.is_word("ON") && p.is_word("CONFLICT", 1)) {
+    p.next();
+    p.next();
+    if (p.take_punct("(")) {
+      for (int depth = 1; depth > 0 && !p.at_end(); p.next()) {
+        if (p.is_punct("(")) depth++;
+        else if (p.is_punct(")") && --depth == 0) break;
+      }
+      if (!p.take_punct(")")) return make_error("expected ')' after the ON CONFLICT columns");
+    } else if (p.take_word("ON")) {
+      std::string cn;
+      if (!p.take_word("CONSTRAINT") || !p.parse_name(&cn)) return make_error("expected ON CONSTRAINT name");
+    }
+    if (!p.take_word("DO")) return make_error("expected DO after ON CONFLICT");
+    if (p.take_word("NOTHING")) {
+      conflict_nothing = true;
+    } else {
+      if (!p.take_word("UPDATE") || !p.take_word("SET")) return make_error("expected DO NOTHING or DO UPDATE SET");
+      on_duplicate = true;
+      pg_upsert = true;
+      dup_literal_only = false;
+      // EXCLUDED.col: the new row's column, as VALUES(col) is below; t.col the row there, as a bare name is.
+      std::function<void(const ExprPtr&)> rewrite_excluded = [&](const ExprPtr& e) {
+        if (!e) return;
+        if (e->op == ExprOp::Column && upper_of(e->qualifier) == "EXCLUDED") {
+          e->name = std::string("\x01") + e->name;
+          e->qualifier.clear();
+          return;
+        }
+        for (const auto& a : e->args) rewrite_excluded(a);
+      };
+      do {
+        std::string cn;
+        if (!p.parse_name(&cn)) return make_error(p.error());
+        int ci = t->get_column_index(cn);
+        if (ci < 0) return make_error("no such column: " + cn);
+        if (!p.take_punct("=")) return make_error("expected '=' in ON CONFLICT DO UPDATE SET");
+        ExprPtr v = p.parse_expr();
+        if (p.failed()) return make_error(p.error());
+        rewrite_excluded(v);
+        dup_sets.push_back({(size_t)ci, v});
+      } while (p.take_punct(","));
+      if (p.take_word("WHERE")) {
+        pg_where = p.parse_expr();
+        if (p.failed()) return make_error(p.error());
+        rewrite_excluded(pg_where);
+      }
+    }
+    p.take_punct(";");
+  } else if (p.take_word("ON")) {
     if (!p.take_word("DUPLICATE") || !p.take_word("KEY") || !p.take_word("UPDATE"))
       return make_error("expected ON DUPLICATE KEY UPDATE");
     on_duplicate = true;
@@ -51758,6 +52068,12 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     ctx.row = &jr;
     ctx.err = err;
     ctx.db = this;
+    if (pg_where) {   // ON CONFLICT .. WHERE: the row stays as it is unless it holds
+      Val w = eval_expr(pg_where.get(), ctx);
+      if (!err->empty()) return false;
+      if (w.null || val_as_number(w) == 0) { *out = cur; return true; }
+    }
+    std::vector<std::pair<size_t, std::string>> pg_sets;   // ON CONFLICT: set once every value is worked out
     for (const auto& d : dup_sets) {
       Val v = eval_expr(d.value.get(), ctx);
       if (!err->empty()) return false;
@@ -51767,8 +52083,10 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (sql_strict() && !g_cdc_thread && !redo_replaying_) {
         if (std::string se = strict_cell_error(c, v.null ? sql_null() : sql_normalize_value(c.type, c.scale, text)); !se.empty()) { *err = se; return false; }
       } else if (!g_cdc_thread && !redo_replaying_) text = lenient_cell_value(c, text);
-      dup_cur->set_cell(0, d.col, text);
+      if (pg_upsert) pg_sets.emplace_back(d.col, std::move(text));
+      else dup_cur->set_cell(0, d.col, text);
     }
+    for (auto& [col, text] : pg_sets) dup_cur->set_cell(0, col, text);
     *out = dup_cur->get_row(0);
     if (t->has_rules() && !apply_row_rules(t, out, SIZE_MAX, err)) return false;
     bump_on_update(cur, out);
@@ -51924,7 +52242,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (ucoll < 0) { ucoll = r; ucoll_key = u; }
       if (std::find(ucoll_rows.begin(), ucoll_rows.end(), (size_t)r) == ucoll_rows.end()) ucoll_rows.push_back((size_t)r);
     }
-    if (ucoll >= 0 && insert_ignore && !replace) {
+    if (ucoll >= 0 && (insert_ignore || conflict_nothing) && !replace) {
       if (tuples.size() > 1 && generated && (long long)generated == row_index_p->auto_max) {
         row_index_p->auto_max--;
         if (t->auto_increment_next == (long long)generated + 1) t->auto_increment_next = (long long)generated;
@@ -51983,7 +52301,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       else hit = row_index_p->pk_to_row.find(pk_key);
       const bool found = !via_map ? big_hit >= 0 : (hit != row_index_p->pk_to_row.end() && row_index_p->row_of(hit->second) < t->row_count());
       const size_t found_row = !via_map ? (size_t)(big_hit < 0 ? 0 : big_hit) : (found ? row_index_p->row_of(hit->second) : 0);
-      if (found && insert_ignore && !replace) {
+      if (found && (insert_ignore || conflict_nothing) && !replace) {
         if (tuples.size() > 1 && generated && (long long)generated == row_index_p->auto_max) {
           row_index_p->auto_max--;
           if (t->auto_increment_next == (long long)generated + 1) t->auto_increment_next = (long long)generated;
@@ -52992,7 +53310,7 @@ std::shared_ptr<const std::string> SqlDatabase::cached_wire_packets(const std::s
   // session used to build one (three string copies) and probe a shard.
   if (query_cache_entries_.load(std::memory_order_acquire) == 0 || !statement_only_reads(sql_query)) return nullptr;
   if (locking_read(sql_query)) return nullptr;
-  const std::string key = session_db + "::" + trim(unwrap_versioned_comments(sql_query));
+  const std::string key = (tls_pipes_as_concat ? "||+" : "") + session_db + "::" + trim(unwrap_versioned_comments(sql_query));
   QueryCacheShard& sh = query_cache_shard(key);
   std::shared_lock<SqlRwLock> lock(sh.mu);
   if (sh.lookup.empty()) return nullptr;
@@ -53013,7 +53331,7 @@ void SqlDatabase::attach_cached_wire_packets(const std::string& sql_query, const
   if (query_cache_budget_bytes() == 0 || packets.size() > query_cache_budget_bytes() / 16) return;
   if (query_cache_entries_.load(std::memory_order_acquire) == 0 || !statement_only_reads(sql_query)) return;
   if (locking_read(sql_query)) return;
-  const std::string key = session_db + "::" + trim(unwrap_versioned_comments(sql_query));
+  const std::string key = (tls_pipes_as_concat ? "||+" : "") + session_db + "::" + trim(unwrap_versioned_comments(sql_query));
   // Most statements have no entry (their answer was not admitted): found out
   // under the shared lock, so they never take the cache from its readers.
   QueryCacheShard& sh = query_cache_shard(key);
@@ -54059,6 +54377,45 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
   if (!t) return make_error("table not found: " + name);
   if (sql_table_in_use_by_trigger(t))
     return make_error("Can't update table '" + t->name + "' in stored function/trigger because it is already used by statement which invoked this stored function/trigger");
+  // PostgreSQL's UPDATE t [AS] a SET c = .. FROM <tables> [WHERE ..]: MySQL's multi-table UPDATE t a, <tables>
+  // SET a.c = .. [WHERE ..], which works every new value out before it writes any (as PostgreSQL does).
+  {
+    const size_t after_name = p.pos();
+    size_t set_at = 0, from_at = 0, where_at = 0;
+    int depth = 0;
+    for (size_t i = after_name; i < toks.size() && toks[i].kind != Tok::End; ++i) {
+      if (toks[i].kind == Tok::Punct && toks[i].text == "(") { depth++; continue; }
+      if (toks[i].kind == Tok::Punct && toks[i].text == ")") { depth--; continue; }
+      if (depth != 0 || toks[i].kind != Tok::Ident || toks[i].quoted) continue;
+      if (!set_at && toks[i].up == "SET") set_at = i;
+      else if (set_at && !from_at && toks[i].up == "FROM") from_at = i;
+      else if (from_at && !where_at && toks[i].up == "WHERE") where_at = i;
+    }
+    if (set_at && from_at) {
+      std::string alias = last_name_part(name);
+      size_t a = after_name;
+      if (a < set_at && toks[a].up == "AS") ++a;
+      if (a < set_at && toks[a].kind == Tok::Ident) alias = toks[a].text;
+      std::string rq = "UPDATE " + sql.substr(toks[1].start_pos, toks[set_at].start_pos - toks[1].start_pos) + ", " +
+                       sql.substr(toks[from_at + 1].start_pos,
+                                  (where_at ? toks[where_at].start_pos : sql.size()) - toks[from_at + 1].start_pos) +
+                       " SET ";
+      // each assignment's column, which PostgreSQL leaves bare, named as the target's
+      size_t from = set_at + 1;
+      depth = 0;
+      for (size_t i = set_at + 1; i <= from_at; ++i) {
+        if (toks[i].kind == Tok::Punct && toks[i].text == "(") depth++;
+        else if (toks[i].kind == Tok::Punct && toks[i].text == ")") depth--;
+        if (i == from_at || (depth == 0 && toks[i].kind == Tok::Punct && toks[i].text == ",")) {
+          if (from > set_at + 1) rq += ", ";
+          rq += "`" + alias + "`." + sql.substr(toks[from].start_pos, toks[i].start_pos - toks[from].start_pos);
+          from = i + 1;
+        }
+      }
+      if (where_at) rq += " " + sql.substr(toks[where_at].start_pos);
+      return execute_update_join(rq, name);
+    }
+  }
   // UPDATE t x JOIN u y ON ... SET x.col = ...: the multi-table form.
   if (!p.is_word("SET")) return execute_update_join(sql, name);
   if (!p.take_word("SET")) return make_error("expected SET");
