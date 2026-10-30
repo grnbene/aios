@@ -340,6 +340,12 @@ progress("Applying the schema...")
 run_sql_file(path_join(here, "sql/schema.sql"), ";")
 run_sql_file(path_join(here, "sql/loader_procs.sql"), ";;")
 run_sql_file(path_join(here, "sql/render_light.sql"), ";;")
+# The game tic's functions are SQLDoom's PostgreSQL inside: || concatenates and / divides as there. Each function
+# keeps the sql_mode it was made under.
+progress("Installing the game tic...")
+sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+run_sql_file(path_join(here, "sql/gametic.sql"), ";;")
+sql("SET sql_mode = DEFAULT")
 progress("Loading the game catalogs...")
 for t in ["thing_combat_defs", "thing_ai_frames", "pickup_defs", "weapon_frames", "weapon_defs", "thing_sprite_defs", "projectile_defs",
           "colormap_rgb", "walltex_meta", "flat_textures", "ui_patches", "ui_patch_pixels", "sprite_frames", "sprite_lumps",

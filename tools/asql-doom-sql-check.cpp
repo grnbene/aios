@@ -123,6 +123,9 @@ int main() {
   run_ok(db, "CREATE FUNCTION tri(n INT) RETURNS INT RETURN "
              "(WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < n) SELECT SUM(i) FROM r)");
   expect(db, "in a function body", "SELECT tri(4), tri(1)", "10|1");
+  run_ok(db, "CREATE VIEW cv AS WITH d1 AS (SELECT s, x * 2 AS w FROM a), d2 AS (SELECT s, w + 1 AS w FROM d1) SELECT s, w FROM d2");
+  expect(db, "a view that opens with WITH", "SELECT GROUP_CONCAT(w ORDER BY s) FROM cv", "3,3,5,7");
+  expect(db, "joined", "SELECT a.s, cv.w FROM a JOIN cv ON cv.s = a.s WHERE a.x = 1 ORDER BY a.s", "p|3;q|3");
 
   std::cout << "\n[3] LATERAL and generate_series\n";
   expect(db, "generate_series", "SELECT GROUP_CONCAT(n ORDER BY n) FROM generate_series(1, 5) AS g(n)", "1,2,3,4,5");
@@ -149,6 +152,10 @@ int main() {
   expect(db, "nested in a scalar subquery",
          "SELECT (SELECT COUNT(*) FROM a CROSS JOIN LATERAL (SELECT w.r FROM w WHERE w.c = a.x) t)", "5");
   expect(db, "a derived table's column list", "SELECT p + q FROM (SELECT 1, 2) AS t(p, q)", "3");
+  expect(db, "a LATERAL inside a LATERAL reads both outer rows",
+         "SELECT a.s, t.m FROM a CROSS JOIN LATERAL (SELECT MAX(q.v) AS m FROM w CROSS JOIN LATERAL "
+         "(SELECT w.r + a.x AS v) q WHERE w.c = a.x) t WHERE a.x IS NOT NULL ORDER BY a.s",
+         "p|3;q|3;r|3;s|NULL");
   run_ok(db, "CREATE FUNCTION tris(p INT) RETURNS INT RETURN (SELECT SUM(g.n) FROM a CROSS JOIN LATERAL generate_series(1, a.x + p) g(n))");
   expect(db, "in a function body", "SELECT tris(0), tris(1)", "11|22");
   expect_error(db, "step 0", "SELECT * FROM generate_series(1, 5, 0) AS g", "cannot be 0");
@@ -216,6 +223,10 @@ int main() {
   run_ok(db, "CALL upk(1)");
   run_ok(db, "CALL upk(1)");
   expect(db, "ON CONFLICT in a procedure", "SELECT n FROM kv WHERE k = 1", "2");
+  // WITH .. INSERT INTO t in a routine: t is the table written, not a SELECT .. INTO variable
+  run_ok(db, "CREATE PROCEDURE wins() BEGIN WITH s AS (SELECT 40 AS k) INSERT INTO kv (k, v, n) SELECT k, 4, 4 FROM s; END");
+  run_ok(db, "CALL wins()");
+  expect(db, "WITH .. INSERT INTO in a procedure", "SELECT v FROM kv WHERE k = 40", "4");
 
   run_ok(db, "CREATE TABLE pts (id INT PRIMARY KEY, x INT, tot INT)");
   run_ok(db, "INSERT INTO pts VALUES (1,1,0),(2,2,0),(3,9,0)");

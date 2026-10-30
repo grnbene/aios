@@ -324,6 +324,8 @@ class Parser {
         if (punct("(", k)) { ++depth; continue; }
         if (punct(")", k)) { --depth; continue; }
         if (depth || !word("INTO", k) || word("OUTFILE", k + 1) || word("DUMPFILE", k + 1)) continue;
+        // WITH .. INSERT [IGNORE] INTO t / REPLACE INTO t: the statement's table, not variables
+        if (k > i_ && (word("INSERT", k - 1) || word("REPLACE", k - 1) || word("IGNORE", k - 1))) break;
         size_t v = k + 1, ve = v;
         while (ve < e && (t_[ve].kind == Tok::Ident || punct(",", ve)) && !word("FROM", ve) && !word("WHERE", ve) &&
                !word("GROUP", ve) && !word("ORDER", ve) && !word("LIMIT", ve) && !word("HAVING", ve) &&

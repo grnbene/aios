@@ -22479,7 +22479,7 @@ SqlTable SqlDatabase::build_info_schema_table(const std::string& table_name) con
       std::string updatable = "YES";
       {
         ParsedSelectStatement vst = parse_select_sql(v->query_sql);
-        if (!vst.ok || vst.branches.size() != 1) updatable = "NO";
+        if (!vst.ok || vst.branches.size() != 1 || !vst.with_sql.empty()) updatable = "NO";
         else {
           const ParsedSelectBranch& vb = vst.branches[0];
           if (vb.distinct || !vb.group_by.empty() || vb.having || vb.limit >= 0 || vb.sources.empty()) updatable = "NO";
@@ -22959,7 +22959,7 @@ bool matview_walk(const SqlExpr* e, const EvalCtx& ctx, std::vector<std::vector<
 // not allow it (then it is rebuilt whole when a table it reads changes).
 std::shared_ptr<MatViewPlan> build_matview_plan(SqlDatabase* db, const SqlView* v, size_t out_cols) {
   ParsedSelectStatement st = parse_select_sql(v->query_sql);
-  if (!st.ok || st.branches.size() != 1) return nullptr;
+  if (!st.ok || st.branches.size() != 1 || !st.with_sql.empty()) return nullptr;
   auto plan = std::make_shared<MatViewPlan>();
   plan->branch = st.branches[0];
   const ParsedSelectBranch& b = plan->branch;
@@ -42539,7 +42539,7 @@ static std::string derived_pushdown_sql(const ParsedSelectBranch& outer, const P
   if (!outer.group_by.empty() || outer.having || !outer.join_conditions.empty() || !outer.windows.empty()) return "";
   if (!outer.where && outer.limit < 0) return "";
   const ParsedSelectStatement inner_st = parse_select_sql(src.subquery_sql);
-  if (!inner_st.ok || inner_st.branches.size() != 1 || !inner_st.union_tail.empty()) return "";
+  if (!inner_st.ok || inner_st.branches.size() != 1 || !inner_st.union_tail.empty() || !inner_st.with_sql.empty()) return "";
   const ParsedSelectBranch& in = inner_st.branches[0];
   // `SELECT <row-wise items> FROM (inner) x LIMIT n [OFFSET m]` and nothing
   // else outside: the derived table is the inner's first n+m rows in the
@@ -42902,6 +42902,9 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
   oc.db = db;
   oc.sources = &fsrc;
   oc.row = &jr;
+  // A LATERAL inside another's subquery reads that one's outer row as well (p.px two levels out): the scope this
+  // statement runs in stays reachable past the earlier sources' row.
+  oc.outer = current_outer_scope();
 
   const ParsedSelectStatement body = parse_select_sql(src.subquery_sql);
   if (!body.ok) { *err = body.error.empty() ? std::string("could not read the LATERAL subquery") : body.error; return nullptr; }
@@ -43233,7 +43236,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         const bool foreign_db = !v->database.empty() && lower_of(v->database) != lower_of(db->effective_database());
         ParsedSelectStatement v_stmt = parse_select_sql(foreign_db ? qualify_view_tables(db, v->query_sql, v->database)
                                                                    : v->query_sql);   // a fresh parse: ours to rewrite
-        bool mergeable = (v_stmt.ok && v_stmt.branches.size() == 1 &&
+        // (A view that opens with WITH is not merged: its sources are its own CTEs, which only running it makes.)
+        bool mergeable = (v_stmt.ok && v_stmt.branches.size() == 1 && v_stmt.with_sql.empty() &&
                           !v_stmt.branches[0].distinct &&
                           v_stmt.branches[0].group_by.empty() &&
                           !v_stmt.branches[0].having &&
@@ -47634,6 +47638,7 @@ SqlQueryResult run_subselect(SqlDatabase& db, const std::string& sql) {
 SqlQueryResult SqlDatabase::execute_select_single(const std::string& sql) {
   ParsedSelectStatement stmt = parse_select_sql(sql);
   if (!stmt.ok) return make_error(stmt.error.empty() ? "invalid select" : stmt.error);
+  if (!stmt.with_sql.empty()) return execute_parsed_select(this, stmt);   // its CTEs first
   if (stmt.branches.empty()) return make_error("expected SELECT");
   return execute_parsed_select_single(this, stmt.branches[0]);
 }
@@ -51338,6 +51343,7 @@ inline void row_key_into(const SqlRow& r, const std::vector<int>& pk_cols, std::
 static thread_local int tls_view_dml_depth = 0;
 static bool rewrite_view_dml(SqlDatabase* db, const std::string& sql, const SqlView& v, char kind, std::string* out, std::string* why) {
   const ParsedSelectStatement st = parse_select_sql(v.query_sql);
+  if (!st.with_sql.empty()) { *why = "it opens with WITH"; return false; }
   if (!st.ok || st.branches.size() != 1) { *why = "it is a UNION"; return false; }
   const ParsedSelectBranch& b = st.branches[0];
   // A view over a join: an UPDATE goes to the join itself (the engine's
