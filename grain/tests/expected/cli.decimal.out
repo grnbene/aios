@@ -5,7 +5,8 @@ decimal
   ok    keeps its scale
   ok    1.50 == 1.5
   ok    equals an int
-  ok    never equals a real
+  ok    equals a real of the same value, compared as reals
+  ok    but not a real that only nearly is
   ok    scale
   ok    multiply adds scales
   ok    multiply two
@@ -20,7 +21,7 @@ decimal
   ok    round half away from zero
   ok    round to an int
   ok    round to an int, negative
-  ok    round keeps a coarser scale
+  ok    round to more places writes them all
   ok    floor
   ok    ceil
   ok    trunc
@@ -42,7 +43,9 @@ decimal
   ok    format groups
   ok    format negative
   ok    37 digits fit
-  ok    mixing with a real fails
+  ok    mixing with a real gives a real
+  ok    and its value
+  ok    a real compares with a decimal
   ok    overflow fails
   ok    division by zero fails
   ok    junk fails
@@ -88,4 +91,4 @@ utf8
   ok    surrogate
   ok    truncated
   ok    bytes
-decimal: 84 checks, all agreed
+decimal: 87 checks, all agreed

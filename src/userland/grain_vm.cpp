@@ -365,8 +365,9 @@ bool Value::equals(const Value& o) const {
     if (type == Type::Int && o.type == Type::Int) return i == o.i;
     return as_double() == o.as_double();
   }
-  // A decimal equals an int or decimal of the same value (2.50 == 2.5 == ... 2.5); never a real, which is only approximately anything.
+  // A decimal equals an int or decimal of the same value (2.50 == 2.5); against a real both are compared as reals.
   if (is_exact_number(*this) && is_exact_number(o)) return decimal_compare(*this, o) == 0;
+  if ((type == Type::Decimal && o.type == Type::Real) || (type == Type::Real && o.type == Type::Decimal)) return as_double() == o.as_double();
   if (type != o.type) return false;
   switch (type) {
     case Type::Nil: return true;
@@ -1348,6 +1349,9 @@ bool Vm::execute_loop(size_t target_frame_depth, bool single_step) {
         int cmp = 0;
         if (decimal_pair(a, b)) {
           cmp = decimal_compare(a, b);
+        } else if ((a.type == Type::Decimal && b.is_number()) || (b.type == Type::Decimal && a.is_number())) {
+          const double x = a.as_double(), y = b.as_double();   // a decimal against a real: as reals
+          cmp = x < y ? -1 : (x > y ? 1 : 0);
         } else if (numeric_pair(a, b)) {
           if (both_int(a, b)) cmp = a.i < b.i ? -1 : (a.i > b.i ? 1 : 0);
           else { const double x = a.as_double(), y = b.as_double(); cmp = x < y ? -1 : (x > y ? 1 : 0); }
