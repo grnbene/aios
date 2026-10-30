@@ -83,6 +83,14 @@ int main() {
   expect(db, "ROUND(-2.5)", "-3", "");
   expect(db, "MOD(2.6750, 2)", "0.6750", "MOD of a DECIMAL: exact (it was 0.6749999999999998)");
   expect(db, "MOD(1.00, 0.3)", "0.10", "");
+  // the rest of the local MariaDB sweep's differences, each now as MariaDB answers
+  expect(db, "99999999999999999999 + 0", "99999999999999999999", "an integer past UNSIGNED BIGINT is a DECIMAL: exact, no error 1690");
+  expect(db, "999999999999999999999999999999 * 1", "999999999999999999999999999999", "");
+  exec(db, "CREATE TABLE v (g INT, i BIGINT, d2 DECIMAL(12,2), d4 DECIMAL(18,4), x DOUBLE)");
+  exec(db, "INSERT INTO v VALUES (1, 2147483647, -2.50, -2.5000, 2.675), (1, -2147483648, 1.00, 1.0050, 1.005), (1, 3, 4.35, 4.3500, 0.1)");
+  expect(db, "VARIANCE(i) FROM v", "3074457344186603000.0000", "a big DOUBLE in full from its shortest digits (not ...3333.3333 of the binary)");
+  expect(db, "COUNT(*) FROM (SELECT d2 FROM v UNION SELECT d4 FROM v) u", "4", "UNION: -2.50 and -2.5000 are one row");
+  expect(db, "MIN(d2) FROM (SELECT d2 FROM v UNION ALL SELECT x FROM v) u", "-2.5", "DECIMAL beside DOUBLE is a DOUBLE");
   std::printf("%d of %d checks %s\n", checks - failures, checks, failures ? "passed - FAILED" : "passed");
   { std::error_code e; std::filesystem::remove_all(root, e); }
   return failures ? 1 : 0;

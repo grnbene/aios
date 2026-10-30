@@ -532,7 +532,7 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   else if (has("division by zero") || has("Division by 0")) { *code = 1365; *sqlstate = "22012"; }
   else if (starts("CONSTRAINT `") && has("` failed for `")) { *code = 4025; *sqlstate = "23000"; }
   else if (starts("Unknown prepared statement handler")) { *code = 1243; *sqlstate = "HY000"; }
-  else if (starts("BIGINT value is out of range")) { *code = 1690; *sqlstate = "22003"; }
+  else if (starts("BIGINT value is out of range") || starts("DOUBLE value is out of range") || starts("DECIMAL value is out of range")) { *code = 1690; *sqlstate = "22003"; }
   else if (starts("Cannot execute statement in a READ ONLY transaction")) { *code = 1792; *sqlstate = "25006"; }
   else if (starts("Result consisted of more than one row")) { *code = 1172; *sqlstate = "42000"; }
   else if (starts("The value specified for generated column")) { *code = 1906; *sqlstate = "HY000"; }
