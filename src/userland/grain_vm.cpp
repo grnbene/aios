@@ -29,6 +29,7 @@ namespace { inline int native_stack(void**, int) { return 0; } }   // no machine
 #endif
 #include <map>
 #include <sys/time.h>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -243,15 +244,21 @@ namespace {
 
 // Integers print without a decimal point; reals always print with one, so a
 // program never has to wonder which kind it is holding.
+// std::to_chars, not snprintf: the same text (C++17 defines %.12g's output for it), without printf's machinery.
 std::string number_text(const Value& v) {
-  char buf[40];
-  if (v.type == Type::Int) { std::snprintf(buf, sizeof buf, "%lld", (long long)v.i); return buf; }
-  if (v.d == (double)(int64_t)v.d && std::fabs(v.d) < 1e15) {
-    std::snprintf(buf, sizeof buf, "%.1f", v.d);
-  } else {
-    std::snprintf(buf, sizeof buf, "%.12g", v.d);
+  char buf[48];
+  if (v.type == Type::Int) {
+    auto r = std::to_chars(buf, buf + sizeof buf, v.i);
+    return std::string(buf, r.ptr);
   }
-  return buf;
+  if (v.d == (double)(int64_t)v.d && std::fabs(v.d) < 1e15) {   // a whole number: "3.0"
+    auto r = std::to_chars(buf, buf + sizeof buf, (int64_t)v.d);
+    std::string out(buf, r.ptr);
+    if (out == "0" && std::signbit(v.d)) out = "-0";
+    return out + ".0";
+  }
+  auto r = std::to_chars(buf, buf + sizeof buf, v.d, std::chars_format::general, 12);
+  return std::string(buf, r.ptr);
 }
 
 std::string quote(const std::string& s) {
