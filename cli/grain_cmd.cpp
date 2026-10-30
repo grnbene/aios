@@ -105,6 +105,24 @@ struct HostFiles final : grain::Files {
     out = p.generic_string();
     return true;
   }
+  bool stat(const std::string& path, grain::FileStat& out, std::string&) override {
+    std::error_code ec;
+    const auto s = std::filesystem::status(path, ec);
+    if (ec || !std::filesystem::exists(s)) return false;
+    out.dir = std::filesystem::is_directory(s);
+    out.size = out.dir ? 0 : static_cast<int64_t>(std::filesystem::file_size(path, ec));
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (!ec) out.modified_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::file_clock::to_sys(t).time_since_epoch()).count();
+    out.mode = static_cast<uint32_t>(s.permissions()) & 07777;
+    return true;
+  }
+  bool rename(const std::string& from, const std::string& to, std::string& error) override {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) { error = ec.message(); return false; }
+    return true;
+  }
 };
 
 HostFiles g_host_files;

@@ -572,6 +572,24 @@ class AppFiles final : public Files {
   bool remove_dir(const std::string& path, std::string& error) override { return remove(path, error); }
   bool is_dir(const std::string& path) override { auto st = h_.stat(where(path)); return st.ok() && st->is_dir; }
   bool absolute(const std::string& path, std::string& out, std::string&) override { out = where(path); return true; }
+  bool stat(const std::string& path, FileStat& out, std::string&) override {
+    auto f = b_.files.find(path);
+    if (f != b_.files.end()) { out = FileStat{}; out.size = (int64_t)f->second.size(); return true; }   // one of the app's own files
+    auto st = h_.stat(where(path));
+    if (!st.ok()) return false;
+    out.size = st->is_dir ? 0 : (int64_t)st->size;
+    out.dir = st->is_dir;
+    out.modified_ms = (int64_t)(st->mtime_ns / 1000000);
+    out.mode = st->mode & 07777;
+    return true;
+  }
+  bool rename(const std::string& from, const std::string& to, std::string& error) override {
+    auto absolute_path = [](const std::string& p) { return !p.empty() && p[0] == '/'; };
+    if (data_.empty() && !(absolute_path(from) && absolute_path(to))) { error = "this app has no data directory"; return false; }
+    auto r = h_.rename_file(where(from), where(to));
+    if (!r.ok()) { error = r.error().message; return false; }
+    return true;
+  }
 
  private:
   hal::Host& h_;

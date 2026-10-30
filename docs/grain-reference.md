@@ -302,6 +302,10 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 | `file_exists` | `file_exists(path)` | Returns `true` if file or directory exists. |
 | `delete_file` | `delete_file(path)` | Deletes a file. |
 | `list_dir` | `list_dir([path])` | Returns a list of filenames in the directory (default `.`). |
+| `file_stat` | `file_stat(path)` | `{size, dir, modified, mode}` for what is at `path` (`modified` in milliseconds since 1970, UTC; `mode` the permission bits), or `nil` when nothing is there. |
+| `rename_file` | `rename_file(from, to)` | `from` takes the name `to`, replacing what was there (in one step where the storage can). Returns `true`. |
+| `copy_file` | `copy_file(from, to)` | A second copy of a file's bytes under `to`, replacing what was there. Returns `true`. |
+| `glob` | `glob(pattern)` | The paths that match, sorted: `*` and `?` within a name, `[abc]` / `[a-z]` / `[!abc]`, `**` for any depth (`glob("logs/**/*.jsonl")`). Names starting with `.` match only a pattern that starts with one. |
 | `mkdir` | `mkdir(path, [parents])` | Creates directory; creates parent directories if `parents` is true. |
 | `rmdir` | `rmdir(path)` | Removes an empty directory. |
 | `is_dir` | `is_dir(path)` | Returns `true` if path exists and is a directory. |

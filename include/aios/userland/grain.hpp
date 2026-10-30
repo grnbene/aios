@@ -464,8 +464,26 @@ struct FileEntry {
   int64_t size = 0;
   bool dir = false;
 };
+struct FileStat {
+  int64_t size = 0;
+  bool dir = false;
+  int64_t modified_ms = 0;   // milliseconds since 1970 (UTC); 0 where the storage does not know
+  uint32_t mode = 0;         // permission bits; 0 where the storage has none
+};
 struct Files {
   virtual ~Files() = default;
+  // What is at `path`: false with `error` empty when nothing is there, with `error` set when it cannot be asked.
+  virtual bool stat(const std::string& path, FileStat& out, std::string& error) {
+    (void)path; (void)out;
+    error = "this machine's storage cannot describe a file";
+    return false;
+  }
+  // `from` takes the name `to`, replacing what was there.
+  virtual bool rename(const std::string& from, const std::string& to, std::string& error) {
+    (void)from; (void)to;
+    error = "this machine's storage cannot rename";
+    return false;
+  }
   virtual bool read(const std::string& path, std::string& out, std::string& error) = 0;
   virtual bool write(const std::string& path, const std::string& data, bool append, std::string& error) = 0;
   virtual bool list(const std::string& path, std::vector<FileEntry>& out, std::string& error) = 0;
