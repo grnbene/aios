@@ -721,6 +721,9 @@ Result<Bitmap> decode_image(ByteSpan bytes);
 // And out again, as a PNG: what the machine hands to anything that reads
 // pictures — including a mind being asked to look at what it drew.
 ByteBuffer encode_png(const uint32_t* argb, int w, int h);
+// As a baseline JPEG (JFIF, quality 1-100; 4:2:0 below 90, 4:4:4 from 90). JPEG has no alpha: a
+// transparent pixel is laid over white.
+ByteBuffer encode_jpeg(const uint32_t* argb, int w, int h, int quality);
 
 // An inline <svg> subtree, drawn into a bitmap of this size. `current` is the
 // element's computed colour: every icon set of the shape the web actually uses

@@ -572,6 +572,8 @@ Grain includes a full software 2D rendering canvas for generating images, charti
 | `canvas_save_ppm` | `canvas_save_ppm(cv, path)` | Writes canvas to disk as a PPM image. |
 | `canvas_to_png` | `canvas_to_png(cv)` | The canvas as a PNG file's bytes (RGBA, transparency kept). Also `canvas_to_bytes(cv, "png")`. |
 | `canvas_save_png` | `canvas_save_png(cv, path)` | Writes the canvas as a PNG through the program's files (like `write_file`). Returns `true`. |
+| `canvas_to_jpeg` | `canvas_to_jpeg(cv, [quality])` | The canvas as a baseline JPEG's bytes, quality 1-100 (default 85; colour at half resolution below 90, full from 90). JPEG has no transparency: transparent parts are laid over white. Also `canvas_to_bytes(cv, "jpeg")`. |
+| `canvas_save_jpeg` | `canvas_save_jpeg(cv, path, [quality])` | Writes the canvas as a JPEG through the program's files. Returns `true`. |
 | `image_decode` | `image_decode(bytes_buf)` | Decodes PNG/JPEG bytes into a canvas instance. |
 
 ### Path Building & Shapes

@@ -126,6 +126,8 @@ add_test(NAME grain.lang.tz COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grai
 add_test(NAME grain.lang.tz.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_tz.gr)
 add_test(NAME grain.lang.native_parallel COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_native_parallel.gr)
 set_tests_properties(grain.lang.native_parallel PROPERTIES TIMEOUT 60)
+add_test(NAME grain.lang.jpeg COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_jpeg.gr)
+add_test(NAME grain.lang.jpeg.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_jpeg.gr)
 add_test(NAME grain.lang.text_builtins COMMAND ${CMAKE_COMMAND} -E env GRAIN_TEST_EMPTY= GRAIN_TEST_SECRET_FILE=${CMAKE_CURRENT_BINARY_DIR}/text_builtins.secret $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 add_test(NAME grain.lang.text_builtins.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 

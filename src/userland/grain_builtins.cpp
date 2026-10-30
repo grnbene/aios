@@ -4637,10 +4637,50 @@ Value bi_canvas_save_png(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::boolean(true);
 }
 
+bool jpeg_quality(const std::vector<Value>& args, size_t at, const char* who, int& q, std::string& error) {
+  q = 85;
+  if (args.size() <= at) return true;
+  if (!args[at].is_number() || args[at].as_int() < 1 || args[at].as_int() > 100) { error = std::string(who) + "(): quality is a number from 1 to 100"; return false; }
+  q = (int)args[at].as_int();
+  return true;
+}
+
+// canvas_to_jpeg(cv, [quality=85]): the canvas as a JPEG file's bytes; transparent parts over white.
+Value bi_canvas_to_jpeg(Vm&, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_to_jpeg");
+  if (!cv) return Value::nil();
+  int q;
+  if (!jpeg_quality(args, 1, "canvas_to_jpeg", q, error)) return Value::nil();
+  ByteBuffer j = web::encode_jpeg(cv->pixels.data(), (int)cv->width, (int)cv->height, q);
+  return Value::string(std::string(reinterpret_cast<const char*>(j.data()), j.size()));
+}
+
+// canvas_save_jpeg(cv, path, [quality=85]): written through the program's own files, like write_file.
+Value bi_canvas_save_jpeg(Vm& vm, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_save_jpeg");
+  if (!cv) return Value::nil();
+  if (!want_str(args[1], error, "canvas_save_jpeg")) return Value::nil();
+  int q;
+  if (!jpeg_quality(args, 2, "canvas_save_jpeg", q, error)) return Value::nil();
+  Files* f = files_of(vm, error, "canvas_save_jpeg");
+  if (!f) return Value::nil();
+  ByteBuffer j = web::encode_jpeg(cv->pixels.data(), (int)cv->width, (int)cv->height, q);
+  std::string why;
+  if (!f->write(args[1].str(), std::string(reinterpret_cast<const char*>(j.data()), j.size()), false, why)) {
+    error = file_error("canvas_save_jpeg", args[1].str(), why);
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
 Value bi_canvas_to_bytes(Vm&, std::vector<Value>& args, std::string& error) {
   auto cv = get_canvas(args[0], error, "canvas_to_bytes");
   if (!cv) return Value::nil();
   std::string fmt = args.size() > 1 ? args[1].str() : "ppm";
+  if (fmt == "jpeg" || fmt == "jpg") {
+    ByteBuffer j = web::encode_jpeg(cv->pixels.data(), (int)cv->width, (int)cv->height, 85);
+    return Value::string(std::string(reinterpret_cast<const char*>(j.data()), j.size()));
+  }
   if (fmt == "png") {
     ByteBuffer png = web::encode_png(cv->pixels.data(), (int)cv->width, (int)cv->height);
     return Value::string(std::string(reinterpret_cast<const char*>(png.data()), png.size()));
@@ -7737,6 +7777,8 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("canvas_to_bytes", 1, 2, bi_canvas_to_bytes);
   vm.define_native("canvas_to_png", 1, 1, bi_canvas_to_png);
   vm.define_native("canvas_save_png", 2, 2, bi_canvas_save_png);
+  vm.define_native("canvas_to_jpeg", 1, 2, bi_canvas_to_jpeg);
+  vm.define_native("canvas_save_jpeg", 2, 3, bi_canvas_save_jpeg);
   vm.define_native("canvas_blit", 3, 9, bi_canvas_blit);
   vm.define_native("canvas_draw_image", 3, 9, bi_canvas_blit);
   vm.define_native("canvas_present", 1, 2, bi_canvas_present);

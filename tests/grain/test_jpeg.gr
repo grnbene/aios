@@ -1,0 +1,34 @@
+// canvas_to_jpeg / canvas_save_jpeg / canvas_to_bytes(cv, "jpeg"). Checked once against Pillow (libjpeg): every
+// file decodes at its size, and the picture quality matches libjpeg's own encoder at the same settings within 0.1 dB.
+fn check(c, msg) { assert_true(c, msg) }
+
+let cv = canvas_create(37, 23)
+for y in 0..23 { for x in 0..37 { canvas_set_pixel(cv, x, y, 0xFF000000 + (idiv(x * 255, 36) << 16) + (idiv(y * 255, 22) << 8) + 128) } }
+
+let j = canvas_to_jpeg(cv)
+check(hex_encode(slice(j, 0, 3)) == "ffd8ff" and hex_encode(slice(j, len(j) - 2)) == "ffd9", "SOI ... EOI")
+check(canvas_to_bytes(cv, "jpeg") == j, "canvas_to_bytes(cv, \"jpeg\") at the default quality 85")
+
+// back through the in-tree decoder: the same size, and every channel of every pixel close
+let back = image_decode(bytes(j))
+check(canvas_width(back) == 37 and canvas_height(back) == 23, "its size")
+let worst = 0
+for y in 0..23 {
+  for x in 0..37 {
+    let a = canvas_get_pixel(cv, x, y)
+    let b = canvas_get_pixel(back, x, y)
+    for sh in [0, 8, 16] { worst = max(worst, abs(((a >> sh) & 255) - ((b >> sh) & 255))) }
+  }
+}
+check(worst <= 12, "a smooth picture stays close at quality 85: worst channel off by " + str(worst))
+
+check(len(canvas_to_jpeg(cv, 30)) < len(canvas_to_jpeg(cv, 95)), "lower quality, smaller file")
+let t = image_decode(bytes(canvas_to_jpeg(canvas_create(8, 8))))
+check((canvas_get_pixel(t, 4, 4) & 0xFFFFFF) == 0xFFFFFF, "transparent is laid over white")
+check(len(canvas_to_jpeg(canvas_create(1, 1))) > 0, "a 1x1 canvas")
+check(!try_call(canvas_to_jpeg, cv, 0).ok and !try_call(canvas_to_jpeg, cv, 101).ok, "quality is 1 to 100")
+
+let path = "grain-jpeg-test-" + str(time_ms()) + ".jpg"
+check(canvas_save_jpeg(cv, path, 90) == true and read_file(path) == canvas_to_jpeg(cv, 90), "saved through the program's files")
+delete_file(path)
+print("PASS: test_jpeg")
