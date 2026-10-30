@@ -870,6 +870,16 @@ ExprP Parser::binary(int min_power) {
 // Assignment is an expression so `a = b = 0` works, but its left side has to be
 // something that can be assigned TO. That is checked here, where the shape is
 // known, rather than in the compiler where it would be a confusing error.
+// The expression before a block (if, while, for ... in): `x {` there opens the block, never a call of x with a map,
+// so `if ready { }` and `for i in 0..n { }` read as written.
+ExprP Parser::header_expression() {
+  const bool saved = no_brace_call_;
+  no_brace_call_ = true;
+  ExprP e = expression();
+  no_brace_call_ = saved;
+  return e;
+}
+
 ExprP Parser::expression() {
   ExprP left = binary(1);
 
@@ -894,6 +904,7 @@ ExprP Parser::expression() {
     call->line = line;
     call->column = col;
     call->a = std::move(callee);
+    call->text = "..";   // written as a..b: `for x in a..b` counts instead of building the list (grain_compiler.cpp)
     call->items.push_back(std::move(left));
     call->items.push_back(std::move(hi));
     left = std::move(call);
@@ -1138,7 +1149,7 @@ StmtP Parser::statement() {
     s->kind = StmtKind::If;
     s->line = t.line;
     s->column = t.column;
-    s->expr = expression();
+    s->expr = header_expression();
     skip_newlines();
     expect(Tok::LBrace, "'{' after the condition");
     s->body = block_body();
@@ -1166,7 +1177,7 @@ StmtP Parser::statement() {
     s->kind = StmtKind::While;
     s->line = t.line;
     s->column = t.column;
-    s->expr = expression();
+    s->expr = header_expression();
     skip_newlines();
     expect(Tok::LBrace, "'{' after the condition");
     s->body = block_body();
@@ -1182,7 +1193,7 @@ StmtP Parser::statement() {
     if (check(Tok::Ident)) { s->name = peek().text; advance(); }
     else error_at(peek(), "expected a name after for");
     expect(Tok::In, "'in'");
-    s->iterable = expression();
+    s->iterable = header_expression();
     skip_newlines();
     expect(Tok::LBrace, "'{' after the sequence");
     s->body = block_body();
