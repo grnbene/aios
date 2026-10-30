@@ -822,19 +822,30 @@ Value bi_xml_unescape(Vm&, std::vector<Value>& args, std::string& error) {
 // (class lists). HTML knows its empty elements (<br>, <input>, <meta> ...) and leaves <script> and <style>
 // unescaped; XML writes an element with no content as <name/>.
 
+// Appends `in` to `out`, escaped: the runs between the five special characters are copied whole.
+void escape_markup_into(std::string& out, const std::string& in, bool html) {
+  size_t from = 0;
+  for (size_t i = 0; i < in.size(); ++i) {
+    const char* rep;
+    switch (in[i]) {
+      case '&': rep = "&amp;"; break;
+      case '<': rep = "&lt;"; break;
+      case '>': rep = "&gt;"; break;
+      case '"': rep = "&quot;"; break;
+      case '\'': rep = html ? "&#39;" : "&apos;"; break;
+      default: continue;
+    }
+    out.append(in, from, i - from);
+    out.append(rep);
+    from = i + 1;
+  }
+  out.append(in, from, std::string::npos);
+}
+
 std::string escape_html(const std::string& in) {
   std::string out;
   out.reserve(in.size() + 16);
-  for (char c : in) {
-    switch (c) {
-      case '&': out.append("&amp;"); break;
-      case '<': out.append("&lt;"); break;
-      case '>': out.append("&gt;"); break;
-      case '"': out.append("&quot;"); break;
-      case '\'': out.append("&#39;"); break;
-      default: out.push_back(c); break;
-    }
-  }
+  escape_markup_into(out, in, true);
   return out;
 }
 
@@ -861,7 +872,7 @@ struct MarkupWriter {
   std::string error;
   const MarkupHooks* hooks = nullptr;
 
-  std::string esc(const std::string& s) const { return html ? escape_html(s) : escape_xml(s); }
+  void esc_into(const std::string& s) { escape_markup_into(out, s, html); }
 
   bool attr_text(const Value& v, std::string& text) {
     if (v.type == Type::Str) { text = v.str(); return true; }
@@ -893,7 +904,7 @@ struct MarkupWriter {
         if (!v.b) return true;
         error = "true is not a node (a condition that wanted ? node : nil?)";
         return false;
-      case Type::Str: out += raw_text ? v.str() : esc(v.str()); return true;
+      case Type::Str: if (raw_text) out += v.str(); else esc_into(v.str()); return true;
       case Type::Int: case Type::Real: case Type::Decimal: out += v.to_text(); return true;
       case Type::List:
         for (const Value& c : v.list_items())
@@ -941,9 +952,17 @@ struct MarkupWriter {
           if (!html) out += "=\"true\"";
           continue;
         }
+        if (val.type == Type::Str) {   // the usual case: no copy
+          out += "=\"";
+          esc_into(val.str());
+          out += '"';
+          continue;
+        }
         std::string text;
         if (!attr_text(val, text)) { error = "<" + name + " " + k + ">: " + error; return false; }
-        out += "=\"" + esc(text) + "\"";
+        out += "=\"";
+        esc_into(text);
+        out += '"';
       }
     }
     Value* text = m->find("text");
@@ -959,14 +978,16 @@ struct MarkupWriter {
     out += '>';
     const bool raw_inside = html && (name == "script" || name == "style");
     const size_t body = out.size();
-    if (has_text) out += raw_inside ? text->str() : esc(text->str());
+    if (has_text) { if (raw_inside) out += text->str(); else esc_into(text->str()); }
     if (has_kids && !write(*kids, depth + 1, raw_inside)) return false;
     if (raw_inside) {
       // the one thing that ends a script early: written as <\/script, which the script reads the same
       const std::string close = "</" + name;
       for (size_t at = out.find(close, body); at != std::string::npos; at = out.find(close, at + 2)) out.insert(at + 1, "\\");
     }
-    out += "</" + name + ">";
+    out += "</";
+    out += name;
+    out += '>';
     return true;
   }
 };
@@ -1013,10 +1034,12 @@ Value bi_el(Vm&, std::vector<Value>& args, std::string& error) {
       if (!am->find("tag") && !am->find("raw")) { attrs = a; first_child = 2; }
     }
   }
-  std::vector<Value> kids(args.begin() + static_cast<std::ptrdiff_t>(std::min(first_child, args.size())), args.end());
+  std::vector<Value> kids(std::make_move_iterator(args.begin() + static_cast<std::ptrdiff_t>(std::min(first_child, args.size()))),
+                          std::make_move_iterator(args.end()));
   auto m = std::make_shared<MapObj>();
-  m->put("tag", args[0]);
-  m->put("attrs", attrs.type == Type::Nil ? Value::object(Type::Map, std::make_shared<MapObj>()) : attrs);
+  m->entries.reserve(3);   // one allocation for the three fields, not three as the vector grows
+  m->put("tag", std::move(args[0]));
+  m->put("attrs", attrs.type == Type::Nil ? Value::object(Type::Map, std::make_shared<MapObj>()) : std::move(attrs));
   m->put("children", Value::list(std::move(kids)));
   return Value::object(Type::Map, m);
 }
