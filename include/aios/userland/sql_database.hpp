@@ -3038,9 +3038,25 @@ class SqlDatabase {
   // Told of each seed line as it happens - including a row count every few seconds while a big table streams -
   // so a long seed shows it is alive instead of printing its whole log at the end.
   void set_seed_progress(std::function<void(const std::string&)> f) { seed_progress_ = std::move(f); }
+  // How a copy from a source behaves. The mirror's seed takes the defaults; `sql copy` (a one-off copy, no
+  // stream after it) passes require_binlog = false and, to refresh, recopy = true.
+  struct SeedOptions {
+    bool require_binlog = true;   // refuse a source with binary logging off (a stream needs the snapshot's position)
+    bool recopy = false;          // copy a table again even when a finished copy is here
+    size_t* failed = nullptr;     // set to how many tables this pass tried and did not copy (the log says why)
+    std::set<std::string> no_data;   // lower-case names copied as their definition only, without rows
+    uint8_t compression = 0;      // the wire's compressed protocol: 0 off, 1 zlib, 2 zstd (else zlib, else none)
+  };
+  // tables empty: every table and view of `database` on the source.
   Result<size_t> seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                   const std::string& password, const std::string& database,
-                                  const std::vector<std::string>& tables, std::vector<std::string>* log);
+                                  const std::vector<std::string>& tables, std::vector<std::string>* log,
+                                  const SeedOptions& opts);
+  Result<size_t> seed_from_source(const std::string& host, uint16_t port, const std::string& user,
+                                  const std::string& password, const std::string& database,
+                                  const std::vector<std::string>& tables, std::vector<std::string>* log) {
+    return seed_from_source(host, port, user, password, database, tables, log, SeedOptions());
+  }
   // Where a starting engine is: what the wire server tells a client that connects before it answers queries.
   // init() reports "loading tables", seed_from_source() "seeding tables", each with its count; the server that
   // owns the engine sets the rest (its own steps, and ready once they are done).
