@@ -224,6 +224,7 @@ Value bi_sort(Vm&, std::vector<Value>& args, std::string& error) {
     if (!v.is_number() && v.type != Type::Str && v.type != Type::Id128) comparable = false;
   if (!comparable) { error = "sort() needs a list of numbers, strings, or id128 values"; return Value::nil(); }
   std::stable_sort(items.begin(), items.end(), [](const Value& a, const Value& b) {
+    if (is_exact_number(a) && is_exact_number(b)) return decimal_compare(a, b) < 0;   // ints and decimals: exactly
     if (a.is_number() && b.is_number()) return a.as_double() < b.as_double();
     if (a.type == Type::Str && b.type == Type::Str) return a.str() < b.str();
     if (a.type == Type::Id128 && b.type == Type::Id128) return a.as_id128() < b.as_id128();
@@ -2450,7 +2451,7 @@ class JsonParser {
       err = "json_parse: invalid number";
       return Value::nil();
     }
-    bool is_float = false;
+    bool is_float = false, exponent = false;
     if (peek() == '.') {
       is_float = true;
       get();
@@ -2459,18 +2460,25 @@ class JsonParser {
     }
     if (peek() == 'e' || peek() == 'E') {
       is_float = true;
+      exponent = true;
       get();
       if (peek() == '+' || peek() == '-') get();
       if (peek() < '0' || peek() > '9') { err = "json_parse: invalid exponent in number"; return Value::nil(); }
       while (peek() >= '0' && peek() <= '9') get();
     }
     std::string num_str = s.substr(start, pos - start);
+    // As grain reads its own literals: an integer that fits is an int; one with a point and no exponent (19.99), or
+    // an integer past 64 bits, is the exact decimal - a price from an API stays its cents; one with an exponent is a
+    // real. A decimal past 38 digits is the real of that size rather than an error.
     if (!is_float) {
-      // An integer that fits is an integer; one past 64 bits is a real of that size (as a source
-      // literal is), never the largest integer standing in for it.
       int64_t n = 0;
       const auto r = std::from_chars(num_str.data(), num_str.data() + num_str.size(), n, 10);
       if (r.ec == std::errc() && r.ptr == num_str.data() + num_str.size()) return Value::integer(n);
+    }
+    if (!exponent) {
+      Value d;
+      std::string why;
+      if (decimal_parse(num_str, d, why)) return d;
     }
     return Value::real(std::strtod(num_str.c_str(), nullptr));
   }

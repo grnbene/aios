@@ -150,13 +150,13 @@ bool marshal(Frame& f, Ty t, const g::Value& v, std::deque<std::string>& temps, 
   };
   switch (t) {
     case Ty::F32: {
-      if (!v.is_number()) return bad("a number");
+      if (!v.is_number() && v.type != g::Type::Decimal) return bad("a number");   // a decimal: its nearest real
       const float x = (float)v.as_double();
       uint32_t u; std::memcpy(&u, &x, 4);
       return push_fp(f, u, error);
     }
     case Ty::F64: {
-      if (!v.is_number()) return bad("a number");
+      if (!v.is_number() && v.type != g::Type::Decimal) return bad("a number");   // a decimal: its nearest real
       const double x = v.as_double();
       uint64_t u; std::memcpy(&u, &x, 8);
       return push_fp(f, u, error);
@@ -245,7 +245,7 @@ g::Value method_call(g::Vm&, g::BoundMethodObj& bm, std::vector<g::Value>& args,
     if (k < sig.args.size()) t = sig.args[k];
     else {   // a variadic argument is typed by its value
       const g::Value& v = args[k];
-      t = v.type == g::Type::Real ? Ty::F64 : v.type == g::Type::Str ? Ty::CStr : v.type == g::Type::Bytes || v.type == g::Type::Nil ? Ty::Ptr : Ty::I64;
+      t = v.type == g::Type::Real || v.type == g::Type::Decimal ? Ty::F64 : v.type == g::Type::Str ? Ty::CStr : v.type == g::Type::Bytes || v.type == g::Type::Nil ? Ty::Ptr : Ty::I64;
     }
     if (!marshal(f, t, args[k], temps, error, k, name.c_str())) return g::Value::nil();
   }

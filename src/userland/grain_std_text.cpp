@@ -208,6 +208,7 @@ Value bi_format(Vm&, std::vector<Value>& args, std::string& error) {
 bool compare_keys(const Value& a, const Value& b, int& r, std::string& error) {
   if (a.is_number() && b.is_number()) {
     if (a.type == Type::Int && b.type == Type::Int) r = a.i < b.i ? -1 : a.i > b.i ? 1 : 0;
+    else if (is_exact_number(a) && is_exact_number(b)) r = decimal_compare(a, b);   // decimals: exactly
     else { const double x = a.as_double(), y = b.as_double(); r = x < y ? -1 : x > y ? 1 : 0; }
     return true;
   }

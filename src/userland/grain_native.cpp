@@ -1374,7 +1374,7 @@ Value method_native_call(Vm&, BoundMethodObj& bm, std::vector<Value>& args, std:
         if (!push_word(regs, false, (uint64_t)v.i, error)) return Value::nil();
         break;
       case Ty::F64:
-        if (!v.is_number()) return wrong("a number");
+        if (!v.is_number() && v.type != Type::Decimal) return wrong("a number");   // a decimal: its nearest real
         { double d = v.as_double(); uint64_t bits; std::memcpy(&bits, &d, 8); if (!push_word(regs, true, bits, error)) return Value::nil(); }
         break;
       case Ty::Bool:

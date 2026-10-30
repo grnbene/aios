@@ -38,8 +38,8 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `type` | `type(val)` | Returns the type name as a string: `"nil"`, `"bool"`, `"int"`, `"real"`, `"decimal"`, `"str"`, `"list"`, `"map"`, `"fn"`, `"bytes"`, `"handle"`. |
 | `str` | `str(val)` | Converts a value to its human-readable string representation. |
 | `repr` | `repr(val)` | Converts a value to its debug string representation (quoting strings). |
-| `int` | `int(val)` | Converts a string, real, or decimal to an integer (truncating toward zero). |
-| `real` | `real(val)` | Converts an integer, string, or decimal to a 64-bit IEEE 754 floating-point number. |
+| `int` | `int(val)` | Converts a string, real, or decimal (a fraction too) to an integer, truncating toward zero: `int(4.35 * 100)` is 435. |
+| `real` | `real(val)` | Converts an integer, string, or decimal to the nearest 64-bit IEEE 754 floating-point number (inexact by nature). |
 | `len` | `len(val)` | Returns the length of a string (in bytes; `chars` counts characters), list, map, or bytes buffer. |
 | `cwd` | `cwd()` | Returns the current working directory path. |
 | `getenv` | `getenv(name, [default])` | An app's setting or secret, or the shell's environment variable for a script run from the command line (`grain`, `aios grain`); returns `default` or `nil` if unset. Apps, web pages, Things and the sidecar never see the machine's environment, and `setenv` there changes only the program's own settings. |
@@ -72,6 +72,8 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 
 ## 2. Numbers, Math & Animation
 
+Numbers are exact unless a real is asked for ([the rules](design/grain-numbers.md)): `12` is an int, `19.99` an exact decimal, `1e9` a real. `+ - *` of ints never wrap (past 64 bits the exact decimal); `/` gives an int when it divides evenly, a decimal when the quotient ends (`7 / 2` is `3.5`) and otherwise the exact fraction (`(1 / 3) * 3` is `1`, `1 / 3` prints `0.333333333333`). A decimal with a real gives a real. Past 38 digits, and division by zero, are errors.
+
 ### Arithmetic & Standard Math
 | Function | Signature | Description |
 |---|---|---|
@@ -81,12 +83,12 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `max` | `max(...vals)` / `max(list)` | The largest; the same rules as `min`. `latest = max(latest, t)`. |
 | `floor` | `floor(n)` | Rounds down to the nearest integer. |
 | `ceil` | `ceil(n)` | Rounds up to the nearest integer. |
-| `round` | `round(n, [places])` | Rounds half away from zero (default 0 decimal places). |
+| `round` | `round(n, [places], [mode])` | The one rounding (shared by `number_format` and `format`): `mode` is `"half_up"` (half away from zero, the default), `"half_even"`, `"half_down"`, `"up"`, `"down"`, `"floor"` or `"ceil"`. Without places: an int (`round(2.5)` is 3); with places: a decimal with exactly that many (`round(2.5, 2)` is `2.50`); places below 0 round to tens, hundreds. Exact for ints and decimals; a real rounds the number it prints as, so `round(2.675e0, 2)` is `2.68`. A rounded zero has no sign. |
 | `trunc` | `trunc(n)` | Truncates decimal digits toward zero. |
 | `sign` | `sign(n)` | Returns `1` if positive, `-1` if negative, `0` if zero. |
 | `clamp` | `clamp(val, min, max)` | Constrains `val` within the inclusive range `[min, max]`. |
 | `sqrt` | `sqrt(n)` | Square root. |
-| `pow` | `pow(base, exp)` | Raises `base` to `exp`. |
+| `pow` | `pow(base, exp)` | Raises `base` to `exp`: exact for an int or decimal to a whole power (`pow(2, 64)` is `18446744073709551616`, `pow(2, -2)` is `0.25`); a real for a real base or a fractional exponent. |
 | `hypot` | `hypot(x, y)` | Euclidean distance $\sqrt{x^2 + y^2}$. |
 | `exp` | `exp(n)` | Natural exponential $e^n$. |
 | `log` | `log(n)` | Natural logarithm $\ln(n)$. |
@@ -125,18 +127,18 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 
 ## 3. Exact Decimals (`decimal`)
 
-Decimals use a 128-bit integer mantissa with an explicit scale up to 30 digits, preventing IEEE floating-point rounding errors for currency and tax arithmetic.
+A decimal is what `19.99` is: an exact number, a 128-bit integer mantissa with a scale up to 30 places (38 digits), or the exact fraction a division that does not end gives (reduced, its denominator up to 10^36; printed to 12 places; past that it rounds to 30). `decimal(...)` makes one from a string or a real (a real becomes the decimal it prints as).
 
 | Function | Signature | Description |
 |---|---|---|
 | `decimal` | `decimal(str_or_num, [scale])` | Constructs an exact decimal (e.g. `decimal("19.99")`). |
-| `dec_div` | `dec_div(a, b, places)` | Exact decimal division rounded to the specified decimal places. |
+| `dec_div` | `dec_div(a, b, places)` | The exact quotient rounded once, half away from zero, to `places`. |
 | `scale` | `scale(dec)` | Returns the decimal's current fractional scale (places past the decimal point). |
 | `decimal_prefix`| `decimal_prefix(str)` | Parses leading number characters from a string into `{decimal, whole}` or `nil`. |
 | `round_sig` | `round_sig(dec, n)` | Rounds decimal to `n` significant figures. |
-| `number_format` | `number_format(val, [places, pt, sep])` | Formats number with thousands separator and decimal point (PHP style). |
+| `number_format` | `number_format(val, [places, pt, sep])` | Formats a number with a thousands separator and decimal point (PHP style), rounded as `round` rounds: `number_format(1.005, 2)` is `"1.01"`. |
 | `is_numeric` | `is_numeric(val)` | Returns `true` if `val` is a number or numeric string. |
-| `to_number` | `to_number(val, [default])` | Extracts leading numeric value from string (e.g. `"12.50abc"` $\to 12.50$). |
+| `to_number` | `to_number(val, [default])` | The number a string starts with: `"12.50abc"` is the decimal `12.50`, `"12"` the int 12. |
 
 ---
 

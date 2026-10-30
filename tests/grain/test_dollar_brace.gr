@@ -1,9 +1,17 @@
 // "${:.2f}" in a plain string - a dollar sign before a format() placeholder - crashed the parser (a trial parse of
-// the {..} had no error list); a ${ that no expression can follow is text, and ${expr} still interpolates.
+// the {..} had no error list). In a plain string only ${expr} interpolates; every other brace, and a ${ no expression
+// can follow, is text - also in a string that does interpolate. f"..." strings keep {expr} and {{ }}.
 let x = 5
 assert_true(format("${:.2f}", 19.5) == "$19.50", "a price format: " + format("${:.2f}", 19.5))
 assert_true("cost ${}" == "cost " + "$" + "{}", "${} is text")
 assert_true("${x}" == "5" and "n=${x + 1}" == "n=6", "an expression in dollar-braces interpolates")
 fn inside() { return format("total ${:,.2f}", 1234.5) }
 assert_true(inside() == "total $1,234.50", "in a function: " + inside())
+let name = "Bo"
+assert_true("${x} costs ${:.2f} {not code} }{" == "5 costs " + "$" + "{:.2f} " + "{" + "not code} }{", "braces beside an interpolation are text")
+assert_true(format("${x} ${:.2f}", 3) == "5 $3.00", "an interpolation and a placeholder in one format string")
+assert_true("${name}: {\"k\": ${x}}" == "Bo: {\"k\": 5}", "JSON around an interpolation")
+assert_true("plain {a} {{b}} }" == "plain " + "{" + "a} " + "{{" + "b}} }", "a plain string's braces as written")
+assert_true(f"f {x} {{lit}}" == "f 5 {lit}", "an f-string as before")
+assert_true(len("${") == 2 and len("x${") == 3 and "a ${x}{}" == "a 5" + "{}", "a dollar-brace at the very end is text")
 print("PASS: test_dollar_brace")

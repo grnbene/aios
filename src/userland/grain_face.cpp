@@ -368,7 +368,8 @@ bool attr_text(const std::string& key, const Value& v, std::string& out, std::st
   switch (v.type) {
     case Type::Str: out = v.str(); return true;
     case Type::Int:
-    case Type::Real: out = v.to_text(); return true;
+    case Type::Real:
+    case Type::Decimal: out = v.to_text(); return true;   // a decimal as its digits (max: 0.75)
     case Type::Bool: out = v.b ? "true" : "false"; return true;
     default:
       error = "the option \"" + key + "\" wants a string, a number or true/false, got a " + type_name(v.type);
