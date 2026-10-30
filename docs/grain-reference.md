@@ -42,7 +42,7 @@ All builtins are implemented in C++20 across `src/userland/grain_*.cpp` and avai
 | `real` | `real(val)` | Converts an integer, string, or decimal to a 64-bit IEEE 754 floating-point number. |
 | `len` | `len(val)` | Returns the length of a string (in bytes; `chars` counts characters), list, map, or bytes buffer. |
 | `cwd` | `cwd()` | Returns the current working directory path. |
-| `getenv` | `getenv(name, [default])` | Reads an environment variable; returns `default` or `nil` if unset. |
+| `getenv` | `getenv(name, [default])` | An app's setting or secret, or the shell's environment variable for a script run from the command line (`grain`, `aios grain`); returns `default` or `nil` if unset. Apps, web pages, Things and the sidecar never see the machine's environment, and `setenv` there changes only the program's own settings. |
 | `env` | `env(name, [default])` | An app setting or environment variable; `default` (or `nil`) when it is unset **or empty**. Use it for hosts, ports and names, where `""` never means a value. |
 | `secret` | `secret(name, [default])` | `env(name)`, or else the contents of the file `NAME_FILE` names, trimmed: a password kept in a file of its own (mode 600) instead of the environment. Neither set: `default`, or `""`. |
 | `setenv` | `setenv(name, val)` | Sets or updates an environment variable for the process. |

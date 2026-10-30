@@ -323,6 +323,7 @@ std::unique_ptr<Vm> make_worker(Vm& parent, std::vector<std::string>* sink) {
   w->settings = parent.settings;
   w->kv = parent.kv;   // the same kv_* store as the program that spawned it
   w->allow_process = parent.allow_process;
+  w->allow_env = parent.allow_env;
   w->on_print = parent.on_print;
   w->stop_flag = parent.stop_flag;
   w->sink = sink;

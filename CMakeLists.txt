@@ -801,6 +801,10 @@ add_executable(aios-crash-log-altstack-check tools/crash-log-altstack-check.cpp)
 target_link_libraries(aios-crash-log-altstack-check PRIVATE aios)
 add_test(NAME crash_log.altstack.check COMMAND aios-crash-log-altstack-check)
 
+add_executable(aios-grain-sandbox-check tools/grain-sandbox-check.cpp)
+target_link_libraries(aios-grain-sandbox-check PRIVATE aios)
+add_test(NAME grain.sandbox.check COMMAND aios-grain-sandbox-check)
+
 add_executable(aios-font-atlas-check tools/font-atlas-check.cpp)
 target_link_libraries(aios-font-atlas-check PRIVATE aios)
 add_test(NAME font.atlas.check COMMAND aios-font-atlas-check ${CMAKE_SOURCE_DIR}/metal/font_atlas.json)

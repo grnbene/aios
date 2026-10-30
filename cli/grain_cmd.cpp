@@ -153,6 +153,7 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif
+  vm.allow_env = true;       // and read the machine's environment (getenv)
   // A program at a console must not be able to hang the console. Ten million
   // instructions is far past any sensible script and reached in well under a
   // second, so a runaway says so instead of needing a kill.
@@ -272,6 +273,7 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
 #else
   grain::install_socket_builtins(vm);   // x86 metal: sockets through its own hal::net
 #endif
+  vm.allow_env = true;       // and read the machine's environment (getenv)
     vm.step_limit = 10000000;
     std::string line;
     while (std::getline(std::cin, line)) {

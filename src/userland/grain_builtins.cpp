@@ -1916,14 +1916,18 @@ Value bi_getenv(Vm& vm, std::vector<Value>& args, std::string& error) {
     auto it = vm.settings->values.find(args[0].str());
     if (it != vm.settings->values.end()) return Value::string(it->second);
   }
-  const char* val = std::getenv(args[0].str().c_str());
-  if (val) return Value::string(val);
+  // The process's own variables only when the host allows it (Vm::allow_env): an app host's hold the fleet keys.
+  if (vm.allow_env)
+    if (const char* val = std::getenv(args[0].str().c_str())) return Value::string(val);
   return args.size() > 1 ? args[1] : Value::nil();
 }
 
 Value bi_setenv(Vm& vm, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "setenv") || !want_str(args[1], error, "setenv")) return Value::nil();
-  if (vm.settings) {   // a hosted app changes its own settings, not the process every app shares
+  // A hosted app, or any VM not allowed the process's environment, changes its own settings, not the process
+  // every app shares.
+  if (vm.settings || !vm.allow_env) {
+    if (!vm.settings) vm.settings = std::make_shared<VmSettings>();
     std::lock_guard<std::mutex> lk(vm.settings->mu);
     vm.settings->values[args[0].str()] = args[1].str();
     return Value::boolean(true);
