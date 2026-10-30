@@ -2131,6 +2131,9 @@ These worked over the wire:
 - `CREATE VIEW`
 - `INSERT ... VALUES (...), (...)`, `INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)`
 - `UPDATE`, `DELETE`
+- `INSERT` / `UPDATE` / `DELETE` through a view whose rows map to base-table
+  rows; `UPDATE` through a view of joined tables writes the base table the set
+  column comes from
 - `BEGIN` / `UPDATE` / `ROLLBACK` (the change was undone)
 - `SELECT` with `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT n OFFSET m`
 - joins: `[INNER] JOIN`, `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`, `CROSS JOIN`, and
@@ -2142,6 +2145,8 @@ These worked over the wire:
   - `STRAIGHT_JOIN` (as the join keyword and as a query modifier) and index hints
     `USE`/`FORCE`/`IGNORE {INDEX|KEY} [FOR ...] (...)`, accepted and ignored:
     the engine picks its own plan
+  - `USING` / `NATURAL` over a derived table or view written as `SELECT *`
+    (`(SELECT * FROM a) d NATURAL JOIN b`)
   - nested groups, `a JOIN (b JOIN c ON x) ON y`; a `LEFT`/`RIGHT` join to a group
     runs the group as a derived table, so its rows are NULL-padded together
   - a view of several tables joined after other tables (`order_items p JOIN
@@ -2195,6 +2200,16 @@ These worked over the wire:
 - `ROW_COUNT()`: what the connection's previous statement changed (-1 after a SELECT)
 - window functions (below)
 - `CREATE [UNIQUE] INDEX name ON t (cols)` (as `ALTER TABLE t ADD INDEX`)
+- generated columns, `[GENERATED ALWAYS] AS (expr) [VIRTUAL | STORED | PERSISTENT]`,
+  in `CREATE TABLE` and in `ALTER TABLE ... ADD COLUMN / MODIFY / CHANGE`: the
+  rows already there are worked out when the column is added or made generated
+  (an expression that fails on any row refuses the ALTER and leaves the table
+  as it was), and INSERT and UPDATE keep it current. Both kinds
+  are held as values, so a filter on one costs what a plain column's does: on
+  200,000 JSON documents, `WHERE jc = ?` over
+  `jc AS (JSON_VALUE(doc, '$.cust')) STORED` took 4 ms against 38 ms for
+  `WHERE JSON_VALUE(doc, '$.cust') = ?`; the ALTER that added it took 0.6 s.
+  `tools/asql-generated-alter-check.cpp` holds it.
 - `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT` (what came after the
   savepoint is undone, row by row)
 - `UNION` / `UNION ALL` / mixed, deduplicating as MariaDB does
@@ -2284,8 +2299,8 @@ Refused or wrong:
 | Statement | Result |
 |---|---|
 | a multi-table `DELETE` with `ORDER BY` or `LIMIT` | refused, as in MySQL |
-| a USING / NATURAL join over a derived table or view written as `SELECT *` | refused: its columns cannot be told from its text |
-| `INSERT` / `UPDATE` / `DELETE` through a view | refused (`The target table v of the UPDATE is not updatable`); write the base table |
+| `UPDATE` / `DELETE` through a view with an aggregate, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT` or `UNION` | refused (`The target table vg of the UPDATE is not updatable (it has DISTINCT, GROUP BY, HAVING or LIMIT)`), as in MySQL |
+| `INSERT` through a view of several joined tables | refused (`... is not insertable-into (it joins several tables)`), as in MySQL |
 | `SHOW REPLICA STATUS` with no replication configured | empty, as MariaDB answers |
 | a window function inside another, or `COUNT(DISTINCT x) OVER (...)` | refused, as in MariaDB |
 
