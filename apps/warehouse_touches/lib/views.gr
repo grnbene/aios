@@ -632,6 +632,8 @@ let PAGE_CSS = join([
   ".btn.primary:hover { filter: brightness(1.08); }",
   ".theme-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; padding: 6px 11px; margin-right: 4px; cursor: pointer; user-select: none; }",
   ".theme-svg { display: none; }",
+  ".fs-svg, .fs-on { display: none; } .fs-off { display: inline; } .fs-svg.off { display: inline-block; }",
+  "[data-fs=\"1\"] .fs-svg.off, [data-fs=\"1\"] .fs-off { display: none; } [data-fs=\"1\"] .fs-svg.on { display: inline-block; } [data-fs=\"1\"] .fs-on { display: inline; }",
   ":root .theme-svg.moon, [data-theme=\"light\"] .theme-svg.moon { display: inline-block; }",
   ":root .theme-svg.sun, [data-theme=\"light\"] .theme-svg.sun { display: none; }",
   "[data-theme=\"dark\"] .theme-svg.sun { display: inline-block; }",
@@ -793,16 +795,16 @@ let EXPORT_JS = join([
   "});"
 ], chr(10))
 
-// Theme switcher: Light or Dark, kept in localStorage; until one is picked, the system's. It only sets data-theme on
+// Theme switcher: Light or Dark, kept in localStorage; until one is picked, light - the warehouse's choice, whatever
+// the screen's system is set to. It only sets data-theme on
 // <html>, which pushed updates never touch; the icon and the label follow it in CSS, so nothing here has to run again
 // when the page changes.
 let THEME_JS = join([
   "(function () {",
   "  var KEY = 'warehouse_touches_theme';",
   "  function saved() { try { var s = localStorage.getItem(KEY); return s === 'light' || s === 'dark' ? s : null; } catch (e) { return null; } }",
-  "  function system() { return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }",
   "  var root = document.documentElement;",
-  "  root.setAttribute('data-theme', saved() || system());",
+  "  root.setAttribute('data-theme', saved() || 'light');",
   "  document.addEventListener('click', function (e) {",
   "    if (!e.target.closest || !e.target.closest('#theme-toggle')) return;",
   "    var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';",
@@ -811,6 +813,28 @@ let THEME_JS = join([
   "  });",
   "})();"
 ], chr(10))
+
+// Full screen, beside Light / Dark (as on the dock board): the page fills the screen, or the frame it sits in on the
+// v8 warehouse dashboard. data-fs on <html> picks the icon and the label.
+let FULLSCREEN_JS = join([
+  "(function () {",
+  "  var root = document.documentElement;",
+  "  function mark() { root.setAttribute('data-fs', document.fullscreenElement ? '1' : '0'); }",
+  "  document.addEventListener('fullscreenchange', mark);",
+  "  document.addEventListener('click', function (e) {",
+  "    if (!e.target.closest || !e.target.closest('#fs-toggle')) return;",
+  "    if (document.fullscreenElement) { document.exitFullscreen(); } else if (root.requestFullscreen) { root.requestFullscreen(); }",
+  "  });",
+  "  mark();",
+  "})();"
+], chr(10))
+
+fn fullscreen_node() {
+  let enter = "<svg class=\"fs-svg off\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3\"/></svg>"
+  let leave = "<svg class=\"fs-svg on\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3\"/></svg>"
+  return el("button", {"type": "button", "class": "btn theme-toggle", "id": "fs-toggle", "title": "Full screen", "aria-label": "Full screen"},
+    html_raw(enter), html_raw(leave), el("span", {"class": "fs-off"}, "Full screen"), el("span", {"class": "fs-on"}, "Exit"))
+}
 
 fn theme_toggle_node() {
   let sun = "<svg class=\"theme-svg sun\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"5\"/><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"/><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"/><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"/><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"/><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"/><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"/><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"/></svg>"
@@ -859,6 +883,7 @@ fn dashboard_node(report, state) {
       el("div", {"class": "clock", "aria-live": "off", "data-ui-keep": true}, el("div", {"class": "time", "id": "clock-time"}), el("div", {"class": "day", "id": "clock-day"})),
       el("form", {"onsubmit": "return false"},
         theme_toggle_node(),
+        fullscreen_node(),
         el("label", "From"), el("input", {"type": "date", "bind": "start", "value": report.range_start ?? report.start}),
         el("label", "To"), el("input", {"type": "date", "bind": "stop", "value": report.range_stop ?? report.stop}),
         el("button", {"type": "button", "class": "btn primary", "on_click": fn(f) {
@@ -871,5 +896,5 @@ fn dashboard_node(report, state) {
         el("a", {"class": "btn", "href": "/quickreportpdf" + q, "data-export": "pdf", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export PDF"),
         el("a", {"class": "btn", "href": "/quickreportxlsx" + q, "data-export": "xlsx", "data-start": report.start, "data-stop": report.stop, "data-hour": hour}, "Export Excel"))),
     el("div", {"id": "live"}, live_node(report, state, timeline_node(report, state))),
-    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS), el("script", TIP_JS))
+    el("script", CLOCK_JS), el("script", EXPORT_JS), el("script", SLIDER_JS), el("script", THEME_JS), el("script", FULLSCREEN_JS), el("script", TIP_JS))
 }
