@@ -701,6 +701,46 @@ class Compiler {
       // that no name can reach, so the loop cannot be broken by a body that
       // reassigns the thing it is walking.
       case StmtKind::ForIn: {
+        // `for x in a..b` counts from a to b in two hidden locals: no list of b - a numbers is built, kept and freed.
+        // __range_bound gives each bound range()'s checks (a number, truncated). The counter starts one short and
+        // steps at the top, so `continue` (which jumps there) steps it too.
+        if (s.iterable->kind == ExprKind::Call && s.iterable->text == ".." && s.iterable->items.size() == 2) {
+          const Expr& r = *s.iterable;
+          begin_block();
+          emit_op_wide(Op::GetGlobal, name_constant("__range_bound", s.line, s.column), s.line, s.column);
+          expression(*r.items[0]);
+          emit_op_arg(Op::Call, 1, s.line, s.column);
+          emit_constant(Value::integer(1), s.line, s.column);
+          emit(Op::Subtract, s.line, s.column);
+          const int at = add_local("  at", s.line);
+          emit_op_wide(Op::GetGlobal, name_constant("__range_bound", s.line, s.column), s.line, s.column);
+          expression(*r.items[1]);
+          emit_op_arg(Op::Call, 1, s.line, s.column);
+          const int end = add_local("  end", s.line);
+
+          const size_t top = chunk().code.size();
+          scope_->loops_.push_back(Scope::Loop{top, {}, scope_->depth_});
+          emit_op_arg(Op::GetLocal, (uint8_t)at, s.line, s.column);
+          emit_constant(Value::integer(1), s.line, s.column);
+          emit(Op::Add, s.line, s.column);
+          emit_op_arg(Op::SetLocal, (uint8_t)at, s.line, s.column);
+          emit_op_arg(Op::GetLocal, (uint8_t)end, s.line, s.column);
+          emit(Op::Less, s.line, s.column);
+          const size_t exit = emit_jump(Op::JumpIfFalse, s.line, s.column);
+          emit(Op::Pop, s.line, s.column);
+          begin_block();
+          emit_op_arg(Op::GetLocal, (uint8_t)at, s.line, s.column);
+          add_local(s.name, s.line);   // a fresh binding each time round, as for any list
+          for (const auto& b : s.body) statement(*b);
+          end_block(s.line);
+          emit_loop(top, s.line, s.column);
+          patch_jump(exit);
+          emit(Op::Pop, s.line, s.column);
+          for (size_t j : scope_->loops_.back().breaks) patch_jump(j);
+          scope_->loops_.pop_back();
+          end_block(s.line);
+          return;
+        }
         begin_block();
         expression(*s.iterable);
         emit(Op::IterPrep, s.line, s.column);

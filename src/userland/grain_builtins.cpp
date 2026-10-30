@@ -184,6 +184,12 @@ Value bi_pop(Vm&, std::vector<Value>& args, std::string& error) {
   return out;
 }
 
+// A bound of `for x in a..b`, checked as range() checks it.
+Value bi_range_bound(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_number(args[0], error, "range")) return Value::nil();
+  return Value::integer(args[0].as_int());
+}
+
 Value bi_range(Vm&, std::vector<Value>& args, std::string& error) {
   int64_t from = 0, to = 0, step = 1;
   if (args.size() == 1) { if (!want_number(args[0], error, "range")) return Value::nil(); to = args[0].as_int(); }
@@ -7518,6 +7524,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("push", 1, -1, bi_push);
   vm.define_native("compact", 1, 1, bi_compact);
   vm.define_native("pop", 1, 1, bi_pop);
+  vm.define_native("__range_bound", 1, 1, bi_range_bound);
   vm.define_native("range", 1, 3, bi_range);
   vm.define_native("sort", 1, 1, bi_sort);
   vm.define_native("reverse", 1, 1, bi_reverse);

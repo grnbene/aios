@@ -1,0 +1,49 @@
+// `for x in a..b` counts without building a list; it must mean exactly what iterating range(a, b) means.
+fn check(c, msg) { assert_true(c, msg) }
+fn walk(a, b) { let out = []; for x in a..b { push(out, x) }; return out }
+
+// the same values as the list, in every shape of bounds
+for pair in [[0, 5], [3, 3], [5, 2], [-3, 2], [0, 5.9], [0.9, 3], [-2.5, 1], [0, 1]] {
+  check(walk(pair[0], pair[1]) == range(pair[0], pair[1]), "a..b as range(a, b) for " + str(pair))
+}
+check(!try_call(walk, "a", 3).ok and contains(try_call(walk, "a", 3).error, "range"), "a bound that is not a number: the same error as range()")
+
+// top level
+let top = []
+for i in 1..4 { push(top, i * 10) }
+check(top == [10, 20, 30], "at top level")
+
+// each pass its own binding: closures keep their own value
+let fs = []
+for i in 0..3 { push(fs, fn () { return i }) }
+check(fs[0]() == 0 and fs[1]() == 1 and fs[2]() == 2, "closures capture each value")
+
+// continue, break, and a body that changes the variable
+let seen = []
+for i in 0..10 {
+  if i % 2 == 0 { continue }
+  if i > 7 { break }
+  i = i * 100   // only this pass's copy
+  push(seen, i)
+}
+check(seen == [100, 300, 500, 700], "continue steps, break leaves, assigning the variable does not move the loop: " + str(seen))
+
+// bounds are worked out once
+let calls = 0
+fn n() { calls += 1; return 4 }
+let c = 0
+for i in 0..n() { c += 1 }
+check(c == 4 and calls == 1, "the bound is evaluated once")
+
+// nested, inside a closure, with a return from the middle
+let first_pair = fn (target) {
+  for a in 0..10 { for b in a..10 { if a * b == target { return [a, b] } } }
+  return nil
+}
+check(first_pair(12) == [2, 6], "nested loops and an early return in a closure")
+
+// a sum the JIT compiles, and a count range() refuses
+fn total(m) { let s = 0; for i in 0..m { s += i }; return s }
+check(total(1000) == 499500, "a sum")
+check(total(20000000) == 199999990000000, "20 million: counted, where range() refuses a list that long")
+print("PASS: test_for_range")
