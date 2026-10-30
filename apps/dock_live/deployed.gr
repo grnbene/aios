@@ -12,7 +12,7 @@ fn setting(name, fallback) {
 
 let THINGS = [
   {"name": "dock_bay", "key": "bay",
-   "reads": "loadingbays, trucks, dispatch, custbranch, salesorderdetails, stockmaster, pickingfreeze, tagalong, product_types"}
+   "reads": "loadingbays, trucks, dispatch, custbranch, salesorderdetails, creditorderdetails, stockmaster, pickingfreeze, tagalong, product_types"}
 ]
 
 fn deployed(app) {

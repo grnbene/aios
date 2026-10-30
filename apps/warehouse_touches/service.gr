@@ -131,7 +131,7 @@ let default_range = report_range(nil, nil)
 // paused / held: whether the page is paused, and the figures it holds while it is (the "view" below); hold: the viewer
 // paused it (the LIVE button in the header) and it stays paused until they resume
 let state = {"start": default_range[0], "stop": default_range[1], "view": "hours", "span": nil, "days": nil, "table": "person", "paused": false, "held": nil,
-             "hold": false,
+             "hold": false, "today": nil,
              "sorter": {"col": 2, "dir": "desc"}}
 
 ui.pane({
@@ -149,7 +149,17 @@ ui.pane({
   // the tab, or presses Refresh (which drops state.held). A range that runs to today with nothing picked stays live,
   // unless the viewer paused it (state.hold).
   "view": fn() {
-    state.paused = state.hold or state.span != nil or state.days != nil or state.stop < date_format(now(), "%Y-%m-%d")
+    // Live past midnight: a range that ran to today keeps running to today - To moves to the new day, From stays,
+    // unless the range was that one day (From = To), which moves with it. A range the viewer ended before today, one
+    // narrowed to hours or days, or one they paused stays where it is.
+    let today = date_format(now(), "%Y-%m-%d")
+    if state.today != nil and state.today != today and state.stop == state.today and not state.hold and state.span == nil and state.days == nil {
+      if state.start == state.stop { state.start = today }
+      state.stop = today
+      state.held = nil
+    }
+    state.today = today
+    state.paused = state.hold or state.span != nil or state.days != nil or state.stop < today
     let key = json_stringify([state.start, state.stop, state.span, state.days, state.view, state.table])
     if state.paused and state.held != nil and state.held.key == key { return dashboard_node(state.held.report, state) }
     let c = db_connect(DB_CFG)
