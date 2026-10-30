@@ -165,6 +165,8 @@ struct Asm {
   void imul(Reg d, Reg s) { rex(true, d, s); b(0x0F); b(0xAF); rr(d, s); }
   void cqo() { b(0x48); b(0x99); }
   void idiv(Reg s) { rex(true, 0, s); b(0xF7); rr(7, s); }
+  void imul1(Reg s) { rex(true, 0, s); b(0xF7); rr(5, s); }   // rdx:rax = rax * s, signed
+  void sar_imm(Reg d, uint8_t n) { rex(true, 0, d); b(0xC1); rr(7, d); b(n); }
   void neg(Reg d) { rex(true, 0, d); b(0xF7); rr(3, d); }
   void not_(Reg d) { rex(true, 0, d); b(0xF7); rr(2, d); }
   void shl_cl(Reg d) { rex(true, 0, d); b(0xD3); rr(4, d); }
@@ -548,9 +550,54 @@ class Compiler {
 
   // Int % Int, C++ semantics (idiv truncates; the remainder is in rdx). A zero divisor, -1 (INT64_MIN % -1
   // faults on this machine) and every other type: the interpreter.
+  // Signed division by a constant d >= 2 as a multiply and shifts (Hacker's Delight 10-1): q = n / d truncated.
+  struct Magic { int64_t m; int shift; };
+  static Magic magic_for(int64_t d) {
+    const uint64_t two63 = 1ULL << 63, ad = (uint64_t)d;
+    const uint64_t anc = two63 - 1 - two63 % ad;
+    int p = 63;
+    uint64_t q1 = two63 / anc, r1 = two63 - q1 * anc, q2 = two63 / ad, r2 = two63 - q2 * ad, delta;
+    do {
+      ++p;
+      q1 *= 2; r1 *= 2;
+      if (r1 >= anc) { ++q1; r1 -= anc; }
+      q2 *= 2; r2 *= 2;
+      if (r2 >= ad) { ++q2; r2 -= ad; }
+      delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    return Magic{(int64_t)(q2 + 1), p - 64};
+  }
+
   void emit_modulo(size_t ip) {
+    // `x % k` with k a constant just before: when the divisor really is k (checked, so a jump that lands here
+    // with another divisor still divides), the remainder comes from a multiply - a few cycles, where idiv is 40+.
+    int64_t k = 0;
+    if (ip >= 3 && static_cast<Op>(code_[ip - 3]) == Op::Constant) {
+      const Value& c = fn_.chunk.constants[rd16(ip - 2)];
+      if (c.type == Type::Int && !c.obj && c.i >= 2) k = c.i;
+    }
     fast_or_step(ip, [&](std::vector<size_t>& slow) {
       both_int(slow);
+      size_t general = 0, done = 0;
+      if (k) {
+        const Magic mg = magic_for(k);
+        a_.mov_imm64(RCX, (uint64_t)k);
+        a_.cmp(R11, RCX);
+        general = a_.jcc(NE);
+        a_.mov_imm64(RAX, (uint64_t)mg.m);
+        a_.imul1(R10);                    // rdx = high half of m * n
+        if (mg.m < 0) a_.add(RDX, R10);
+        if (mg.shift) a_.sar_imm(RDX, (uint8_t)mg.shift);
+        a_.mov(RAX, R10);
+        a_.shr_imm(RAX, 63);
+        a_.add(RDX, RAX);                 // + 1 for a negative n: truncation toward zero
+        a_.imul(RDX, RCX);                // q * k
+        a_.mov(RAX, R10);
+        a_.sub(RAX, RDX);                 // n - q * k
+        a_.mov(RDX, RAX);
+        done = a_.jmp();
+        a_.patch(general, a_.here());
+      }
       a_.test(R11, R11);
       slow.push_back(a_.jcc(E));
       a_.cmp_imm(R11, -1);
@@ -558,6 +605,7 @@ class Compiler {
       a_.mov(RAX, R10);
       a_.cqo();
       a_.idiv(R11);
+      if (k) a_.patch(done, a_.here());
       a_.store(R14, -64 + kPayOff, RDX);
       a_.sub_imm(R14, 32);
     });
