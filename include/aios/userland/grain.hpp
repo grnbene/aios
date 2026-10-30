@@ -91,8 +91,12 @@ struct Value {
   // language that calls them false makes `if count` mean two different things
   // depending on whether count is a number or a list.
   bool truthy() const { return !(type == Type::Nil || (type == Type::Bool && !b)); }
-  double as_double() const { return type == Type::Int ? (double)i : type == Type::Real ? d : 0.0; }
-  int64_t as_int() const { return type == Type::Int ? i : type == Type::Real ? (int64_t)d : 0; }
+  // A decimal reads as its nearest real / its whole part (toward zero, held to the int64 range): every builtin
+  // that wants a number takes any of the three kinds.
+  double as_double() const { return type == Type::Int ? (double)i : type == Type::Real ? d : type == Type::Decimal ? decimal_as_double() : 0.0; }
+  int64_t as_int() const { return type == Type::Int ? i : type == Type::Real ? (int64_t)d : type == Type::Decimal ? decimal_as_int() : 0; }
+  double decimal_as_double() const;
+  int64_t decimal_as_int() const;
 
   const aios::Id128& as_id128() const;
   const std::string& str() const;

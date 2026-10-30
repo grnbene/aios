@@ -27,7 +27,7 @@ inline bool want_str(const Value& v, std::string& error, const char* who) {
 }
 
 inline bool want_number(const Value& v, std::string& error, const char* who) {
-  if (v.is_number()) return true;
+  if (v.is_number() || v.type == Type::Decimal) return true;   // as_double / as_int read a decimal too
   error = std::string(who) + "() wants a number, got a " + type_name(v.type);
   return false;
 }

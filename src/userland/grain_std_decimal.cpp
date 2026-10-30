@@ -158,6 +158,19 @@ int decimal_compare(const Value& a, const Value& b) {
 }
 
 bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::string& error) {
+  // With a real on either side the answer is a real: the decimal (or int) as its nearest real, then binary
+  // arithmetic. A real is inexact; the result being one says so.
+  if ((a.type == Type::Real && (b.type == Type::Decimal || b.type == Type::Int || b.type == Type::Real)) ||
+      (b.type == Type::Real && (a.type == Type::Decimal || a.type == Type::Int))) {
+    const double x = a.as_double(), y = b.as_double();
+    switch (op) {
+      case '+': out = Value::real(x + y); return true;
+      case '-': out = Value::real(x - y); return true;
+      case '*': out = Value::real(x * y); return true;
+      case '/': if (y == 0) { error = "division by zero"; return false; } out = Value::real(x / y); return true;
+      case '%': if (y == 0) { error = "modulo by zero"; return false; } out = Value::real(std::fmod(x, y)); return true;
+    }
+  }
   Dec x, y;
   if (!get(a, x) || !get(b, y)) {
     error = std::string("cannot mix a decimal with a ") + type_name(a.type == Type::Decimal ? b.type : a.type) +
@@ -188,7 +201,15 @@ bool decimal_arith(char op, const Value& a, const Value& b, Value& out, std::str
       I num;
       const int up = s - x.s + y.s;
       if (up > 38 || !mul_checked(x.m, pow10(up), num)) return overflow(error);
-      out = make(round_div(num, y.m), s);
+      // An exact quotient keeps no more places than it needs (10 / 4 is 2.5, 10.00 / 4 is 2.50); one that does not
+      // end keeps them all, rounded.
+      I q = round_div(num, y.m);
+      int qs = s;
+      if (q * y.m == num) {
+        const int keep = std::max(x.s, y.s);
+        while (qs > keep && q % 10 == 0) { q /= 10; --qs; }
+      }
+      out = make(q, qs);
       return true;
     }
     case '%': {
@@ -208,9 +229,22 @@ bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
   Dec d;
   if (!get(v, d)) { error = "round() wants a decimal"; return false; }
   if (places < 0 || places > kMaxScale) { error = "a decimal rounds to 0..30 places"; return false; }
-  if (places >= d.s) { out = make(d.m, d.s); return true; }   // already that exact: keep its own scale
+  if (places >= d.s) {   // already that exact: written with exactly `places` places (round(2.5, 2) is 2.50)
+    I m;
+    if (!rescale(d.m, d.s, places, m)) return overflow(error);
+    out = make(m, places);
+    return true;
+  }
   out = make(round_div(d.m, pow10(d.s - places)), places);
   return true;
+}
+
+double Value::decimal_as_double() const { return decimal_to_double(*this); }
+int64_t Value::decimal_as_int() const {
+  Dec d;
+  if (!get(*this, d)) return 0;
+  const I whole = d.m / pow10(d.s);
+  return whole > (I)INT64_MAX ? INT64_MAX : whole < (I)INT64_MIN ? INT64_MIN : (int64_t)whole;
 }
 
 double decimal_to_double(const Value& v) {
