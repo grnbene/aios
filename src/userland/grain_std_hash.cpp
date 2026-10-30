@@ -93,6 +93,81 @@ Value bi_aes_cbc_decrypt(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::string(std::move(out));
 }
 
+// aes_cbc_encrypt(key, iv, data): AES-CBC with PKCS#7 padding, what openssl_encrypt(..., 'AES-*-CBC', $key,
+// OPENSSL_RAW_DATA, $iv) writes and aes_cbc_decrypt reads. For talking to programs that use it; new data is
+// better sealed with aes_gcm_encrypt, which also tells a changed message from the real one.
+Value bi_aes_cbc_encrypt(Vm&, std::vector<Value>& args, std::string& error) {
+  for (auto& a : args)
+    if (!want_str(a, error, "aes_cbc_encrypt")) return Value::nil();
+  const std::string &key = args[0].str(), &iv = args[1].str(), &data = args[2].str();
+  if (key.size() != 16 && key.size() != 24 && key.size() != 32) { error = "aes_cbc_encrypt: the key is 16, 24 or 32 bytes"; return Value::nil(); }
+  if (iv.size() != 16) { error = "aes_cbc_encrypt: the IV is 16 bytes"; return Value::nil(); }
+  std::string padded = data;
+  padded.append(16 - data.size() % 16, (char)(16 - data.size() % 16));
+  std::string out(padded.size(), '\0');
+  if (!crypto::aes_cbc_encrypt(bytes_of(key), bytes_of(iv), bytes_of(padded),
+                               MutableByteSpan(reinterpret_cast<uint8_t*>(out.data()), out.size()))) {
+    error = "aes_cbc_encrypt: failed";
+    return Value::nil();
+  }
+  return Value::string(std::move(out));
+}
+
+static void fill_random(uint8_t* out, size_t n);
+
+// aes_gcm_encrypt(key, plaintext, [aad]): AES-GCM (a 16 or 32 byte key) under a fresh random 12-byte nonce.
+// Returns nonce || ciphertext || 16-byte tag, the one string aes_gcm_decrypt takes back. `aad` is data the tag
+// covers without hiding it (a record's id, say). Arguments are raw bytes.
+Value bi_aes_gcm_encrypt(Vm&, std::vector<Value>& args, std::string& error) {
+  for (auto& a : args)
+    if (!want_str(a, error, "aes_gcm_encrypt")) return Value::nil();
+  const std::string& key = args[0].str();
+  const std::string aad = args.size() > 2 ? args[2].str() : std::string();
+  if (key.size() != 16 && key.size() != 32) { error = "aes_gcm_encrypt: the key is 16 or 32 bytes"; return Value::nil(); }
+  crypto::GcmNonce nonce;
+  fill_random(nonce.data(), nonce.size());
+  ByteBuffer sealed;
+  if (key.size() == 16) {
+    crypto::Aes128Key k;
+    std::memcpy(k.data(), key.data(), 16);
+    sealed = crypto::aes128_gcm_seal(k, nonce, bytes_of(aad), bytes_of(args[1].str()));
+  } else {
+    crypto::Aes256Key k;
+    std::memcpy(k.data(), key.data(), 32);
+    sealed = crypto::aes256_gcm_seal(k, nonce, bytes_of(aad), bytes_of(args[1].str()));
+  }
+  std::string out(reinterpret_cast<const char*>(nonce.data()), nonce.size());
+  out.append(reinterpret_cast<const char*>(sealed.data()), sealed.size());
+  return Value::string(std::move(out));
+}
+
+// aes_gcm_decrypt(key, sealed, [aad]): what aes_gcm_encrypt sealed (nonce || ciphertext || tag), or nil when the
+// key, the aad or any byte of it is not what was sealed.
+Value bi_aes_gcm_decrypt(Vm&, std::vector<Value>& args, std::string& error) {
+  for (auto& a : args)
+    if (!want_str(a, error, "aes_gcm_decrypt")) return Value::nil();
+  const std::string &key = args[0].str(), &sealed = args[1].str();
+  const std::string aad = args.size() > 2 ? args[2].str() : std::string();
+  if (key.size() != 16 && key.size() != 32) { error = "aes_gcm_decrypt: the key is 16 or 32 bytes"; return Value::nil(); }
+  if (sealed.size() < 12 + 16) return Value::nil();
+  crypto::GcmNonce nonce;
+  std::memcpy(nonce.data(), sealed.data(), 12);
+  const ByteSpan body(reinterpret_cast<const uint8_t*>(sealed.data()) + 12, sealed.size() - 12);
+  ByteBuffer out;
+  bool ok;
+  if (key.size() == 16) {
+    crypto::Aes128Key k;
+    std::memcpy(k.data(), key.data(), 16);
+    ok = crypto::aes128_gcm_open(k, nonce, bytes_of(aad), body, out);
+  } else {
+    crypto::Aes256Key k;
+    std::memcpy(k.data(), key.data(), 32);
+    ok = crypto::aes256_gcm_open(k, nonce, bytes_of(aad), body, out);
+  }
+  if (!ok) return Value::nil();
+  return Value::string(std::string(reinterpret_cast<const char*>(out.data()), out.size()));
+}
+
 // hash_equals(a, b): compares two strings in time that depends on their lengths only, for secrets.
 Value bi_hash_equals(Vm&, std::vector<Value>& args, std::string& error) {
   if (!want_str(args[0], error, "hash_equals") || !want_str(args[1], error, "hash_equals")) return Value::nil();
@@ -304,6 +379,9 @@ Value bi_jwt_verify(Vm&, std::vector<Value>& args, std::string& error) {
 
 void install_hash_builtins(Vm& vm) {
   vm.define_native("aes_cbc_decrypt", 3, 3, bi_aes_cbc_decrypt);
+  vm.define_native("aes_cbc_encrypt", 3, 3, bi_aes_cbc_encrypt);
+  vm.define_native("aes_gcm_encrypt", 2, 3, bi_aes_gcm_encrypt);
+  vm.define_native("aes_gcm_decrypt", 2, 3, bi_aes_gcm_decrypt);
   vm.define_native("hash_equals", 2, 2, bi_hash_equals);
   vm.define_native("random_bytes", 1, 1, bi_random_bytes);
   vm.define_native("sha256", 1, 1, bi_sha256);

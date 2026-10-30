@@ -117,6 +117,8 @@ add_test(NAME grain.lang.defer COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/g
 add_test(NAME grain.lang.defer.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_defer.gr)
 add_test(NAME grain.lang.files COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_files.gr)
 add_test(NAME grain.lang.files.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_files.gr)
+add_test(NAME grain.lang.aes COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_aes.gr)
+add_test(NAME grain.lang.aes.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_aes.gr)
 add_test(NAME grain.lang.text_builtins COMMAND ${CMAKE_COMMAND} -E env GRAIN_TEST_EMPTY= GRAIN_TEST_SECRET_FILE=${CMAKE_CURRENT_BINARY_DIR}/text_builtins.secret $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 add_test(NAME grain.lang.text_builtins.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_text_builtins.gr)
 

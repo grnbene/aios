@@ -1,0 +1,39 @@
+// aes_cbc_encrypt, aes_gcm_encrypt, aes_gcm_decrypt. The expected bytes come from another implementation (Python's
+// cryptography package, made once and written here), so these check grain against the standard, not against itself.
+fn check(c, msg) { assert_true(c, msg) }
+fn seq(a, n) { let s = ""; for i in a..(a + n) { s = s + chr(i) }; return s }
+
+let k16 = hex_decode("000102030405060708090a0b0c0d0e0f")
+let k32 = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+let iv = hex_decode("6465666768696a6b6c6d6e6f70717273")
+let msg = "Attack at dawn - 29 bytes ok."
+
+// CBC: the same bytes openssl writes, and back
+check(hex_encode(aes_cbc_encrypt(k16, iv, msg)) == "9a6eee9168ebf7039d96331770f2435a6466d78d184a04087960bdd5af06c8c2", "AES-128-CBC matches")
+check(hex_encode(aes_cbc_encrypt(k32, iv, msg)) == "9197f1adf32a4835ae923ba5daa3d26b0a0838ba8a1a26d9d204f81712bd3cd6", "AES-256-CBC matches")
+check(aes_cbc_decrypt(k32, iv, aes_cbc_encrypt(k32, iv, msg)) == msg, "CBC round trip")
+check(len(aes_cbc_encrypt(k16, iv, seq(65, 16))) == 32, "a whole block of input gets a whole block of padding")
+check(aes_cbc_decrypt(k16, iv, aes_cbc_encrypt(k16, iv, "")) == "", "empty in, empty out")
+check(!try_call(aes_cbc_encrypt, "short", iv, msg).ok, "a bad key size is an error")
+
+// GCM: decrypts what another implementation sealed (nonce || ciphertext || tag, with aad)
+let other16 = hex_decode("c8c9cacbcccdcecfd0d1d2d3775ce0df6d580b48aab7cc23b60f438b5022c429b3566976a79728a3386e8e8f90573de1683d4e523c403e6ff3")
+let other32 = hex_decode("c8c9cacbcccdcecfd0d1d2d3500c15bae5a7db41001c7bdf6968cb39c0b5d5886612dc419e89548af4c1534c7499f72b2310e927566bfd9a3e")
+check(aes_gcm_decrypt(k16, other16, "order-42") == msg, "AES-128-GCM opens another implementation's message")
+check(aes_gcm_decrypt(k32, other32, "order-42") == msg, "AES-256-GCM opens another implementation's message")
+check(aes_gcm_decrypt(k32, other32, "order-43") == nil, "a different aad: nil")
+check(aes_gcm_decrypt(k32, other32) == nil, "a missing aad: nil")
+check(aes_gcm_decrypt(k16, other32, "order-42") == nil, "the wrong key: nil")
+
+// GCM: round trip, a fresh nonce each time, any changed byte refused
+let a = aes_gcm_encrypt(k32, msg)
+let b = aes_gcm_encrypt(k32, msg)
+check(len(a) == 12 + len(msg) + 16, "nonce + ciphertext + tag")
+check(a != b, "a fresh nonce each time")
+check(aes_gcm_decrypt(k32, a) == msg and aes_gcm_decrypt(k32, b) == msg, "round trip")
+let flipped = slice(a, 0, 20) + chr((ord(a[20]) + 1) % 256) + slice(a, 21)
+check(aes_gcm_decrypt(k32, flipped) == nil, "one changed byte: nil")
+check(aes_gcm_decrypt(k32, "too short") == nil, "too short: nil")
+check(aes_gcm_decrypt(k16, aes_gcm_encrypt(k16, "", "x"), "x") == "", "empty plaintext with aad")
+check(!try_call(aes_gcm_encrypt, k32 + "x", msg).ok, "a bad key size is an error")
+print("PASS: test_aes")
