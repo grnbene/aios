@@ -1,0 +1,52 @@
+// The same nine workloads as workloads.php: what the apps do (calls, loops, strings, records, sorting, JSON, regex,
+// text, markup). One line each: name, milliseconds, a result both must agree on. Run by tools/grain-vs-php/run.sh.
+fn t(name, f) {
+  let a = time_us()
+  let r = f()
+  print(name + "\t" + str(round((time_us() - a) / 1000)) + "\t" + str(r))
+}
+fn fib(n) { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }
+t("fib27", fn () { return fib(27) })
+t("loop10M", fn () { let s = 0; let i = 0; while i < 10000000 { s += i % 7; i += 1 }; return s })
+t("concat1M", fn () { let parts = []; for i in 0..1000000 { push(parts, "x" + str(i)) }; return len(join(parts, ",")) })
+t("records200k", fn () {
+  let rows = []
+  for i in 0..200000 { push(rows, {"id": i, "store": "S" + str(i % 50), "qty": i % 13}) }
+  let tot = {}
+  for r in rows { tot[r.store] = (tot[r.store] ?? 0) + r.qty }
+  return len(keys(tot))
+})
+t("sort200k", fn () {
+  let xs = []
+  let x = 12345
+  for i in 0..200000 { x = (x * 1103515245 + 12345) % 2147483648; push(xs, x) }
+  let s = sort(xs)
+  return s[0]
+})
+t("json50k", fn () {
+  let rows = []
+  for i in 0..50000 { push(rows, {"id": i, "name": "item " + str(i), "price": 1.5 * i, "tags": ["a", "b"]}) }
+  let txt = json_stringify(rows)
+  let back = json_parse(txt)
+  return len(back)
+})
+t("regex100k", fn () {
+  let lines = []
+  for i in 0..100000 { push(lines, "order-" + str(i) + " qty=" + str(i % 9) + " ok") }
+  let n = 0
+  for l in lines { n += len(regex_replace("qty=([0-9]+)", l, "Q$1")) }
+  return n
+})
+t("split5MB", fn () {
+  let lines = []
+  for i in 0..100000 { push(lines, " " + str(i) + ", Store " + str(i % 50) + " , 12.50 , yes ") }
+  let text = join(lines, "\n")
+  let n = 0
+  for l in split(text, "\n") { let f = split(l, ","); n += len(trim(f[1])) }
+  return n
+})
+t("html20k", fn () {
+  let rows = []
+  for i in 0..20000 { push(rows, el("tr", el("td", str(i)), el("td", "Bay <" + str(i % 9) + ">"), el("td", "ok"))) }
+  return len(html_stringify(el("table", rows)))
+})
