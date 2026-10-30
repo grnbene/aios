@@ -23188,6 +23188,12 @@ Result<void> SqlDatabase::flush_impl(bool async, bool maintain) {
   if (things_) things_->save();
   if (cells_) cells_->save();
   save_index_list();
+  // The position this snapshot is at (the lock is held: nothing commits until it is let go), for the manifest to
+  // carry - on either path below.
+  if (binlog_consumer_) {
+    std::string file; uint64_t pos = 0;
+    if (binlog_consumer_->committed_position(&file, &pos)) img->cdc_text = file + "\n" + std::to_string(pos) + "\n";
+  }
   if (!rotate_redo(*img)) {
     // The log could not be rotated (a host without rename): the old way,
     // files under the lock and the log emptied after them.
@@ -54614,6 +54620,11 @@ constexpr uint32_t kColumnSpansFooterMagic = 0x41515453;
 // never named (a crash before its manifest), and is not read. A loader from
 // before parts stops at the entries and reads only whole images.
 constexpr uint32_t kManifestLengthsMagic = 0x41514d4c;    // "AQML"
+// After the lengths, a replica's binlog position as of this generation (the cdc_position text). Carried in the
+// manifest so the two cannot disagree: written as a file after it, a crash between the two left the new generation
+// with the old position, startup dropped the logs that would have moved it on, and replication applied again what
+// the store already held - doubling rows in a table without a key. A manifest without it is read as before.
+constexpr uint32_t kManifestCdcMagic = 0x41514d43;        // "AQMC"
 // A part appended to a table file by a checkpoint whose only change to the
 // table was appended rows (snapshot_tables_v4): the rows [from, to) as
 // text, one length-prefixed cell after another, row-major, store_pack'ed.
@@ -55101,9 +55112,21 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     return (uint64_t)(e && *e ? std::max(0, std::atoi(e)) : 120) * 1000000000ull;
   }();
   size_t dense_budget = (size_t)256 << 20;   // bytes of table files deflated per checkpoint
+  static const bool snap_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
+    // AIOS_STORE_TRACE: a table that held the lock 5 ms or more here, and how much of it was folding its delta in -
+    // whichever way below it leaves by (unchanged, a part, appended rows, whole).
+    struct SnapTime {
+      hal::Host& h; const std::string& name; uint64_t t0, fold = 0;
+      ~SnapTime() {
+        if (!snap_trace) return;
+        const double ms = (double)(h.monotonic_ns() - t0) / 1e6;
+        if (ms >= 5) fprintf(stderr, "[store] snapshot %s: %.1f ms under the lock (delta fold %.1f)\n", name.c_str(), ms, fold / 1e6);
+      }
+    } snap_time{kernel_.host(), kv.first, snap_trace ? kernel_.host().monotonic_ns() : 0};
     t.compact_delta_buffer();
+    if (snap_trace) snap_time.fold = kernel_.host().monotonic_ns() - snap_time.t0;
     t.ensure_columns();
     // Unchanged since the file already on disk: the new manifest names that
     // file again. A checkpoint used to rewrite all 8 GB of st's store every
@@ -55368,6 +55391,10 @@ std::vector<uint8_t> SqlDatabase::manifest_bytes(const CheckpointImage& img) con
   for (const auto& e : img.entries) {
     auto sv = img.saved.find(e.first);
     m.u64(sv == img.saved.end() ? 0 : sv->second.file_bytes);   // 0: the whole file (none of it is a part)
+  }
+  if (!img.cdc_text.empty()) {
+    m.u32(kManifestCdcMagic);
+    m.str(img.cdc_text);
   }
   return m.take();
 }
@@ -55659,6 +55686,9 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   img.manifest = manifest_bytes(img);
   auto mw = h.write_file(dir + "/MANIFEST", ByteSpan(img.manifest.data(), img.manifest.size()));
   if (!mw.ok()) return mw;
+  // The renames into tables/ (each file's tmp -> name, MANIFEST last) on disk: until the directory is flushed a
+  // power cut can bring back the previous MANIFEST beside files it does not name, or lose a renamed table file.
+  if (auto ds = h.sync_dir(dir); !ds.ok()) return ds;
   const uint64_t w2 = h.monotonic_ns();
   store_generation_ = img.gen;
   saved_tables_ = std::move(img.saved);
@@ -55676,8 +55706,11 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   const std::string legacy = root_path_ + "/schema_tables.db";
   if (h.exists(legacy)) h.remove(legacy);
   const uint64_t w3 = h.monotonic_ns();
-  if (!img.cdc_text.empty())
+  // Also in the manifest now (kManifestCdcMagic); kept as a file for the tools that read it.
+  if (!img.cdc_text.empty()) {
     h.write_file(root_path_ + "/cdc_position", ByteSpan((const uint8_t*)img.cdc_text.data(), img.cdc_text.size()));
+    h.sync_dir(root_path_);
+  }
   // The rotated logs this generation covers (its own, and any an earlier
   // write left behind) are redundant now that the manifest names it.
   if (auto ls = h.list_dir(root_path_); ls.ok())
@@ -55766,6 +55799,20 @@ bool SqlDatabase::load_tables_v4() {
   std::vector<uint64_t> valid_lengths(manifest_entries.size(), 0);
   if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
     for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
+  // The position this generation was taken at is where the stream resumes from - before the redo logs after it are
+  // replayed, which move it on with every commit mark they hold. The separate file may be older (written after the
+  // manifest, a crash between left it behind) and is brought up to the manifest's.
+  if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestCdcMagic) {
+    const std::string cdc = m.str();
+    if (m.ok() && !cdc.empty()) {
+      auto cur = kernel_.host().read_file(root_path_ + "/cdc_position");
+      const bool same = cur.ok() && std::string((const char*)cur->data(), cur->size()) == cdc;
+      if (!same) {
+        kernel_.host().write_file(root_path_ + "/cdc_position", ByteSpan((const uint8_t*)cdc.data(), cdc.size()));
+        kernel_.host().sync_dir(root_path_);
+      }
+    }
+  }
   set_startup_phase("loading tables", 0, manifest_entries.size());
   const auto load_t0 = std::chrono::steady_clock::now();
   // The tables are independent: each is read, unpacked and decoded on whichever thread takes it, biggest first,
