@@ -256,3 +256,7 @@ add_custom_target(grain-update-expected ${GRAIN_UPDATE_COMMANDS} DEPENDS grain $
 add_executable(grain-pane-isolation pane_isolation.cpp)
 target_link_libraries(grain-pane-isolation PRIVATE grain_lang)
 add_test(NAME grain.pane_isolation COMMAND grain-pane-isolation)
+
+add_executable(grain-ws-check ws_check.cpp)
+target_link_libraries(grain-ws-check PRIVATE grain_lang)
+add_test(NAME grain.ws.check COMMAND grain-ws-check)

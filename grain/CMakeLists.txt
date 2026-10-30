@@ -66,6 +66,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/net/line_stream.cpp
   ${AIOS_ROOT}/src/userland/grain_std_db.cpp
   ${AIOS_ROOT}/src/userland/grain_std_events.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_ws.cpp
   ${AIOS_ROOT}/src/channel/http_client.cpp
   ${AIOS_ROOT}/src/net/tls.cpp
   ${AIOS_ROOT}/src/net/tls_conn.cpp

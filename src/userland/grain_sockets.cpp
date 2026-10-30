@@ -256,6 +256,15 @@ Value bi_tcp_peer(Vm&, std::vector<Value>& args, std::string& error) {
 
 }  // namespace
 
+// The connection under a tcp socket, taken out of it (the socket is then closed to grain): how ws_upgrade turns a
+// socket tcp_accept gave into a websocket (grain_std_ws.cpp).
+std::unique_ptr<hal::Connection> take_tcp_connection(const Value& v, std::string& error, const char* who) {
+  auto* h = handle<TcpHandle>(v, kTcp, error, who);
+  if (!h) return nullptr;
+  if (!h->conn) { error = std::string(who) + "(): the socket is closed"; return nullptr; }
+  return std::move(h->conn);
+}
+
 void install_socket_builtins(Vm& vm) {
   vm.define_native("udp_socket", 0, 0, bi_udp_socket);
   vm.define_native("udp_bind", 2, 3, bi_udp_bind);
