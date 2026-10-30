@@ -2810,6 +2810,7 @@ class SqlDatabase {
     std::string file; uint64_t seq = 0; size_t rows = 0; uint64_t shape = 0; size_t bytes = 0; bool dense = false; uint64_t still_ns = 0;
     uint64_t layout = 0; size_t base_rows = 0; size_t part_rows = 0; uint64_t file_bytes = 0; uint32_t parts = 0;
     uint32_t op_parts = 0;   // of the parts, those with erased rows or set cells (kOpsPartMagic)
+    bool form_pending = false;   // a new form (re-encoded, compacted) not written yet: the file holds the same rows
     size_t op_cells = 0;     // rows erased + cells set, over those parts
   };
   Result<void> save_tables_v4();
@@ -2848,6 +2849,9 @@ class SqlDatabase {
       // A change the table's journal holds: its writes in order (kOpsPartMagic), already serialized; appended
       // to the file as a part the same way.
       bool ops = false; std::vector<uint8_t> ops_plain;
+      // A still table deflated: its own file (repack_from), unchanged since it was written, unpacked and packed
+      // again dense by the writer thread - nothing of it copied under the lock.
+      std::string repack_from;
     };
     std::vector<TableImage> tables;
     std::vector<uint8_t> manifest;
