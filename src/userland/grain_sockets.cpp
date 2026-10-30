@@ -26,6 +26,10 @@ struct UdpHandle {
 struct TcpHandle {
   std::unique_ptr<hal::Connection> conn;
 };
+const char* const kTcpListener = "tcp_listener";
+struct TcpListenHandle {
+  std::unique_ptr<hal::Listener> listener;
+};
 
 template <class T>
 T* handle(const Value& v, const char* kind, std::string& error, const char* who) {
@@ -185,12 +189,69 @@ Value bi_tcp_recv(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::string(std::move(buf));
 }
 
+// tcp_close(sock_or_listener) -> true
 Value bi_tcp_close(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type == Type::Extern && args[0].obj && static_cast<ExternObj*>(args[0].obj.get())->kind_name == kTcpListener) {
+    auto* l = handle<TcpListenHandle>(args[0], kTcpListener, error, "tcp_close");
+    if (l->listener) l->listener->close();
+    l->listener.reset();
+    return Value::boolean(true);
+  }
   auto* h = handle<TcpHandle>(args[0], kTcp, error, "tcp_close");
   if (!h) return Value::nil();
   if (h->conn) h->conn->close();
   h->conn.reset();
   return Value::boolean(true);
+}
+
+// tcp_listen(port, [where="local"]) -> listener. "local" takes connections from this machine only, "all" from
+// anywhere; port 0 picks a free one (tcp_port says which).
+Value bi_tcp_listen(Vm&, std::vector<Value>& args, std::string& error) {
+  uint16_t port = 0;
+  if (!want_port(args[0], error, "tcp_listen", port, true)) return Value::nil();
+  std::string where = "local";
+  if (args.size() > 1) {
+    if (!want_text(args[1], error, "tcp_listen")) return Value::nil();
+    where = args[1].str();
+    if (where != "local" && where != "all") { error = "tcp_listen(): where is \"local\" or \"all\", not \"" + where + "\""; return Value::nil(); }
+  }
+  auto r = hal::net_listen(port, where == "local");
+  if (!r.ok()) { error = "tcp_listen(" + std::to_string(port) + "): " + r.error().message; return Value::nil(); }
+  auto h = std::make_shared<TcpListenHandle>();
+  h->listener = std::move(r.value());
+  return Value::object(Type::Extern, std::make_shared<ExternObj>(kTcpListener, h));
+}
+
+// tcp_accept(listener, [timeout_ms=5000]) -> socket (tcp_send/tcp_recv/tcp_close), or nil when none came in time
+Value bi_tcp_accept(Vm&, std::vector<Value>& args, std::string& error) {
+  auto* l = handle<TcpListenHandle>(args[0], kTcpListener, error, "tcp_accept");
+  if (!l) return Value::nil();
+  if (!l->listener) { error = "tcp_accept(): the listener is closed"; return Value::nil(); }
+  auto r = l->listener->accept(timeout_arg(args, 1, 5000));
+  if (!r.ok()) {
+    if (r.error().status == Status::Busy) return Value::nil();
+    error = "tcp_accept(): " + r.error().message;
+    return Value::nil();
+  }
+  auto h = std::make_shared<TcpHandle>();
+  h->conn = std::move(r.value());
+  return Value::object(Type::Extern, std::make_shared<ExternObj>(kTcp, h));
+}
+
+// tcp_port(listener) -> the port it listens on
+Value bi_tcp_port(Vm&, std::vector<Value>& args, std::string& error) {
+  auto* l = handle<TcpListenHandle>(args[0], kTcpListener, error, "tcp_port");
+  if (!l) return Value::nil();
+  if (!l->listener) { error = "tcp_port(): the listener is closed"; return Value::nil(); }
+  return Value::integer(l->listener->port());
+}
+
+// tcp_peer(sock) -> "host:port" of the other end
+Value bi_tcp_peer(Vm&, std::vector<Value>& args, std::string& error) {
+  auto* h = handle<TcpHandle>(args[0], kTcp, error, "tcp_peer");
+  if (!h) return Value::nil();
+  if (!h->conn) { error = "tcp_peer(): the socket is closed"; return Value::nil(); }
+  return Value::string(h->conn->peer());
 }
 
 }  // namespace
@@ -209,6 +270,10 @@ void install_socket_builtins(Vm& vm) {
   vm.define_native("tcp_send", 2, 2, bi_tcp_send);
   vm.define_native("tcp_recv", 1, 3, bi_tcp_recv);
   vm.define_native("tcp_close", 1, 1, bi_tcp_close);
+  vm.define_native("tcp_listen", 1, 2, bi_tcp_listen);
+  vm.define_native("tcp_accept", 1, 2, bi_tcp_accept);
+  vm.define_native("tcp_port", 1, 1, bi_tcp_port);
+  vm.define_native("tcp_peer", 1, 1, bi_tcp_peer);
 }
 
 }  // namespace aios::userland::grain
