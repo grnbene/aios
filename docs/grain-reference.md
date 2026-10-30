@@ -593,7 +593,7 @@ Grain includes a full software 2D rendering canvas for generating images, charti
 | `canvas_get_pixel` | `canvas_get_pixel(cv, x, y)` | Reads 32-bit ARGB pixel value at coordinate. |
 | `canvas_set_pixel` | `canvas_set_pixel(cv, x, y, color)` | Writes 32-bit ARGB pixel at coordinate. |
 | `canvas_get_pixels` | `canvas_get_pixels(cv)` | Returns raw pixel buffer as a `bytes` buffer. |
-| `canvas_set_pixels` | `canvas_set_pixels(cv, bytes_buf)` | Copies pixel buffer directly into canvas. |
+| `canvas_set_pixels` | `canvas_set_pixels(cv, pixels)` | Sets every pixel: a list of ARGB numbers (or colours), or raw bytes - a `bytes` buffer or a string holding them - 4 a pixel (R, G, B, A) or 3 (R, G, B, opaque), row by row, exactly width x height of them. |
 | `canvas_to_ppm` / `cv_to_ppm` | `canvas_to_ppm(cv)` | Encodes canvas to PPM image format bytes. |
 | `canvas_save_ppm` | `canvas_save_ppm(cv, path)` | Writes canvas to disk as a PPM image. |
 | `canvas_to_png` | `canvas_to_png(cv)` | The canvas as a PNG file's bytes (RGBA, transparency kept). Also `canvas_to_bytes(cv, "png")`. |

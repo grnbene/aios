@@ -4034,6 +4034,25 @@ Value bi_canvas_get_pixels(Vm&, std::vector<Value>& args, std::string& error) {
 Value bi_canvas_set_pixels(Vm&, std::vector<Value>& args, std::string& error) {
   auto cv = get_canvas(args[0], error, "canvas_set_pixels");
   if (!cv) return Value::nil();
+  // Raw bytes (a bytes buffer, or a string holding them): 4 a pixel as R, G, B, A, or 3 as R, G, B (opaque), row by
+  // row - a frame a renderer hands back whole, copied in one pass instead of through a list of numbers.
+  if (args[1].type == Type::Bytes || args[1].type == Type::Str) {
+    const uint8_t* d = args[1].type == Type::Bytes ? args[1].bytes_data().data() : reinterpret_cast<const uint8_t*>(args[1].str().data());
+    const size_t n = args[1].type == Type::Bytes ? args[1].bytes_data().size() : args[1].str().size();
+    const size_t px = cv->pixels.size();
+    if (n != px * 4 && n != px * 3) {
+      error = "canvas_set_pixels() wants " + std::to_string(px * 4) + " bytes (RGBA) or " + std::to_string(px * 3) +
+              " (RGB) for this canvas, got " + std::to_string(n);
+      return Value::nil();
+    }
+    const size_t step = n / px;
+    for (size_t i = 0; i < px; ++i) {
+      const uint8_t* q = d + i * step;
+      const uint32_t a = step == 4 ? q[3] : 0xFFu;
+      cv->pixels[i] = (a << 24) | (uint32_t(q[0]) << 16) | (uint32_t(q[1]) << 8) | uint32_t(q[2]);
+    }
+    return args[0];
+  }
   if (!want_list(args[1], error, "canvas_set_pixels")) return Value::nil();
   const auto& items = args[1].list_items();
   size_t n = std::min(items.size(), cv->pixels.size());

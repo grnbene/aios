@@ -1,0 +1,144 @@
+# Play SQLDoom on ASQL: a window (or, with `aios grain serve`, a browser page) whose every frame is the SQL renderer's
+# and whose every tic is the SQL game tic. A port of SQLDoom's doom_client.py (github.com/cedardb/sqldoom, GPL-2.0)
+# for single player: input, timing and display, nothing else - the game is in the database.
+#
+#   aios --root R grain serve apps/sqldoom/play.gr [MAP] [skill 0..4]     (the pane in a browser)
+#
+# Keys: arrows or W/S to move, A/D to strafe, left/right arrows to turn, Ctrl or F to fire, Space or E to use, Shift
+# to run, 1-7 for a weapon, Escape to quit.
+#
+# SQLDOOM_FRAMES=n draws n frames with no display and saves the last to SQLDOOM_SHOT (default frame.png); the keys
+# held meanwhile are SQLDOOM_KEYS (e.g. "up,ctrl").
+let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
+let map_name = len(args) > 0 ? upper(args[0]) : "E1M1"
+let skill = len(args) > 1 ? int(args[1]) : 2
+
+sql("USE doom")
+# The client's statements and the renderer are SQLDoom's PostgreSQL, as the game tic's are.
+sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+let m = sql("SELECT map_id FROM maps WHERE name = '" + map_name + "'")
+if len(m) == 0 { error("map " + map_name + " is not loaded (apps/sqldoom/load.gr)") }
+let map_id = m[0].map_id
+let player = sql("SELECT id FROM things WHERE map_id = " + str(map_id) + " AND type = 1")[0].id
+
+# A prepared statement of SQLDoom's client: $1, $2, .. filled in as SQL literals (the highest first, so $1 does not
+# eat $10's digits).
+fn bind(text, params) {
+  let out = text
+  let i = len(params)
+  while i > 0 {
+    let v = params[i - 1]
+    let lit = v == nil ? "NULL" : (type(v) == "bool" ? (v ? "TRUE" : "FALSE") : (type(v) == "str" ? "'" + replace(v, "'", "''") + "'" : str(v)))
+    out = replace(out, "$" + str(i), lit)
+    i = i - 1
+  }
+  return out
+}
+let camera_sql = read_file(path_join(here, "sql/client/camera_pose.sql"))
+let snapshot_sql = read_file(path_join(here, "sql/client/game_tick_finish.sql"))
+let renderer_sql = read_file(path_join(here, "sql/renderer.sql"))
+
+sql("SELECT doom_reset_stage(" + str(map_id) + ", " + str(skill) + ")")
+sql("SELECT doom_spawn_player(" + str(map_id) + ", " + str(player) + ")")
+
+let held = {}
+let pending_weapon = nil
+let pending_use = false
+let tics = 0
+let last_tic_ms = clock()
+let last_frame_tic = -1
+let status = "E1M1"
+let level_over = false
+let frame = canvas_create(320, 200)
+
+fn down(k) { return get(held, k, false) }
+fn axis(plus, minus) { return (plus ? 1 : 0) - (minus ? 1 : 0) }
+
+fn run_tic() {
+  let fwd = axis(down("up") or down("w"), down("down") or down("s"))
+  let strafe = axis(down("d"), down("a"))
+  let turn = axis(down("right"), down("left")) * 3.2   # TURN_DEGREES_PER_TIC
+  let fire = down("ctrl") or down("f")
+  let run = down("shift")
+  let q = "SELECT doom_run_game_tic(" + join([str(map_id), str(player), str(skill), str(fwd) + "e0", str(strafe) + "e0",
+            run ? "TRUE" : "FALSE", str(turn) + "e0", fire ? "TRUE" : "FALSE", pending_weapon == nil ? "NULL" : str(pending_weapon),
+            pending_use ? "TRUE" : "FALSE"], ", ") + ")"
+  pending_weapon = nil
+  pending_use = false
+  let t0 = clock()
+  sql(q)
+  tics = tics + 1
+  let snap = sql(bind(snapshot_sql, [map_id, player]))
+  if len(snap) > 0 {
+    let s = snap[0]
+    if s.use_exit == 1 or s.cross_exit == 1 or s.use_secret_exit == 1 or s.cross_secret_exit == 1 or s.sector_exit == 1 or s.boss_exit == 1 {
+      level_over = true
+      status = map_name + " done"
+    } else if s.alive == 0 {
+      status = "dead"
+    }
+  }
+  status = format("{} tic {} ({:.0f} ms)", level_over ? map_name + " done" : map_name, tics, clock() - t0)
+  last_tic_ms = clock()
+}
+
+fn render_frame() {
+  # how far the clock is into the next tic: the camera between the last two
+  let alpha = min(1, max(0, (clock() - last_tic_ms) / (1000 / 35)))
+  let pose = sql(bind(camera_sql, [map_id, player, alpha]))
+  if len(pose) == 0 { return }
+  let p = pose[0]
+  sql("SET @map_id = " + str(map_id) + ", @player_thing_id = " + str(player) + ", @skill = " + str(skill) +
+      ", @x = " + str(p.x) + "e0, @y = " + str(p.y) + "e0, @z = " + str(p.z) + "e0, @angle = " + str(p.angle) + "e0")
+  let rgb = sql(renderer_sql)[0].frame_rgb
+  if rgb != nil { canvas_set_pixels(frame, rgb) }
+  last_frame_tic = tics
+}
+
+let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right", "control": "ctrl",
+              "lctrl": "ctrl", "rctrl": "ctrl", "lshift": "shift", "rshift": "shift", " ": "space"}
+fn key_name(e) { return get(keymap, lower(e.key), lower(e.key)) }
+
+# 35 tics a second, as Doom's clock runs. A tic that is slow makes the next late; none are made up.
+every(1 / 35, fn () { if not level_over { run_tic() } })
+
+let pane = create_pane({"title": "SQLDoom on ASQL", "width": 320, "height": 218,
+  "on_draw": fn (cv) {
+    if tics != last_frame_tic { render_frame() }
+    canvas_clear(cv, "#000000")
+    canvas_draw_image(cv, frame, 0, 0)
+    canvas_fill_text(cv, status, 6, 214, "#9aa4b2")
+  },
+  # every event: a key held from its key event to its key_up
+  "on_event": fn (p, e) {
+    if e.type != "key" and e.type != "key_up" { return nil }
+    let k = key_name(e)
+    if e.type == "key_up" {
+      held[k] = false
+      return nil
+    }
+    if k == "escape" {
+      unregister_pane(p.id)
+      return nil
+    }
+    held[k] = true
+    if k == "space" or k == "e" { pending_use = true }
+    if regex_test("^[1-7]$", k) { pending_weapon = int(k) }
+    return nil
+  }
+})
+
+let frames = int(env("SQLDOOM_FRAMES", "0"))
+if frames > 0 {
+  # no display: a tic and a frame at a time, the keys held throughout
+  for k in split(env("SQLDOOM_KEYS", ""), ",") { if k != "" { held[k] = true } }
+  for i in range(0, frames) {
+    run_tic()
+    let t0 = clock()
+    render_frame()
+    print(status + format(", frame {:.0f} ms", clock() - t0))
+  }
+  canvas_save_png(frame, env("SQLDOOM_SHOT", "frame.png"))
+} else {
+  run_panes()
+}
