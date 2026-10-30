@@ -221,6 +221,16 @@ class LinuxHost final : public Host {
   Result<void> write_file(const std::string& path, ByteSpan data) override { return write_file_impl(path, data, true); }
   Result<void> write_file_unsynced(const std::string& path, ByteSpan data) override { return write_file_impl(path, data, false); }
   // One flush of the filesystem the tree is on, for what write_file_unsynced left in the page cache.
+  Result<void> sync_dir(const std::string& dir) override {
+    int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return Result<void>(Status::IoError, dir + ": " + strerror(errno));
+    const int rc = ::fsync(fd);
+    const int e = errno;
+    ::close(fd);
+    if (rc != 0) return Result<void>(Status::IoError, dir + ": " + strerror(e));
+    return Ok();
+  }
+
   void sync_tree(const std::string& path) override {
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) { ::sync(); return; }

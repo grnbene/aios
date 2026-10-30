@@ -691,6 +691,8 @@ target_link_libraries(aios-sql-comparison-bench PRIVATE aios)
 
 add_executable(aios-asql-stmt-bench tools/asql-stmt-bench.cpp)
 target_link_libraries(aios-asql-stmt-bench PRIVATE aios)
+add_executable(aios-asql-write-bench tools/asql-write-bench.cpp)
+target_link_libraries(aios-asql-write-bench PRIVATE aios)
 
 add_executable(aios-git-merge-check tools/git-merge-check.cpp)
 target_link_libraries(aios-git-merge-check PRIVATE aios)
