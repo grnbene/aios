@@ -17,6 +17,7 @@
 #include "grain_jit.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@
 
 #if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace aios::userland::grain::jit {
@@ -883,6 +885,18 @@ Entry compile(const FnObj& fn) {
   if (!mem) return nullptr;
   *reinterpret_cast<size_t*>(mem) = code.size() + 16;
   std::memcpy(mem + 16, code.data(), code.size());
+  // GRAIN_JIT_DUMP=<dir>: each function's code to <dir>/<name>-<address>.bin (objdump -D -b binary -mi386:x86-64
+  // --adjust-vma=<address>), and a line in /tmp/perf-<pid>.map so perf names it. For looking at the JIT, never on.
+  if (const char* dir = std::getenv("GRAIN_JIT_DUMP"); dir && *dir) {
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/%s-%p.bin", dir, fn.name.empty() ? "fn" : fn.name.c_str(), static_cast<void*>(mem + 16));
+    if (FILE* f = std::fopen(path, "wb")) { std::fwrite(code.data(), 1, code.size(), f); std::fclose(f); }
+    std::snprintf(path, sizeof path, "/tmp/perf-%d.map", (int)getpid());
+    if (FILE* f = std::fopen(path, "a")) {
+      std::fprintf(f, "%lx %zx grain:%s\n", (unsigned long)(uintptr_t)(mem + 16), code.size(), fn.name.c_str());
+      std::fclose(f);
+    }
+  }
   return reinterpret_cast<Entry>(mem + 16);
 }
 
