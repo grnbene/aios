@@ -55,6 +55,18 @@ size_t history_keep() {
   return v;
 }
 constexpr size_t kPartitionChunk = 1000;
+// How long one kind's settle may hold the engine's lock (and the statement lock with it) before it lets go and leaves
+// the rest for the next settle: a grain kind's full pass and its reactions run in slices of about this much. One big
+// kind's pass (10,938 hours of warehouse touches, minutes of work) used to hold every reader - another kind's screen,
+// any statement on the mirror - for its whole length. AIOS_THING_SLICE_MS overrides it.
+int settle_slice_ms() {
+  static const int ms = [] {
+    const char* e = std::getenv("AIOS_THING_SLICE_MS");
+    const int v = e ? std::atoi(e) : 100;
+    return v > 0 ? v : 100;
+  }();
+  return ms;
+}
 const char* const kNullKey = "\x01NULL";
 
 std::string lower(std::string s) {
@@ -833,8 +845,18 @@ bool ThingEngine::has_pending() const {
     if (kv.second.pending_full || !kv.second.pending.empty() || !kv.second.pending_res.empty() ||
         !kv.second.pending_part_keys.empty() || !kv.second.pending_part_full.empty() ||
         !kv.second.dirty_queues.empty() || kv.second.pending_shared ||
-        (kv.second.grain && !kv.second.grain->notices.empty()))
+        (kv.second.grain && !kv.second.grain->notices.empty()) || (!kv.second.paused && !kv.second.sweep.empty()))
       return true;
+  return false;
+}
+
+bool ThingEngine::work_left() const {
+  std::lock_guard<aios::hal::Mutex> lk(mu_);
+  for (const auto& kv : kinds_) {
+    const Kind& k = kv.second;
+    if (k.paused || k.type != Kind::Grain) continue;
+    if (!k.sweep.empty() || !k.pending.empty() || k.pending_full || (k.grain && !k.grain->notices.empty())) return true;
+  }
   return false;
 }
 
@@ -6401,10 +6423,82 @@ bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err
   return true;
 }
 
+// A full pass begun: shared() and enroll() read now, the keys queued - enroll()'s and those of the Things that are no
+// longer enrolled (each recomputed, it answers nothing and goes). What was pending is in the pass; a change from here
+// on is noted as usual and goes after it.
+bool ThingEngine::grain_sweep_start(Kind& k, const std::string& cause, std::string* err) {
+  if (!k.grain) { *err = "the program is not loaded"; return false; }
+  ThingGrain& g = *k.grain;
+  k.day = current_day();
+  GrainScope scope(db_, this, k.db, &k.reads, &k.links);
+  if (!g.shared_fresh) {
+    grain::Value sh;
+    if (!gcall(g, "shared", {}, &sh, err)) return false;
+    g.shared = sh;
+  }
+  g.shared_fresh = false;
+  g.have_shared = true;
+  grain::Value en;
+  if (!gcall(g, "enroll", {}, &en, err)) return false;
+  if (en.type != grain::Type::List) { *err = "enroll() must return a list of keys"; return false; }
+  std::vector<std::string> keys;
+  std::set<std::string> enrolled;
+  for (const auto& v : en.list_items()) {
+    keys.push_back(gval_text(v));
+    enrolled.insert(sql_collate_key(keys.back()));
+  }
+  for (const auto& e : k.gthings)
+    if (!enrolled.count(e.first)) keys.push_back(e.second.key);
+  k.sweep = std::move(keys);
+  k.sweep_at = 0;
+  k.sweep_cause = cause;
+  k.sweep_t0 = db_.kernel_.host().wall_ns();
+  k.pending.clear();
+  return true;
+}
+
+// The pass's next keys, until the deadline: a slice sized from what a key has cost so far (8 keys while that is not
+// known yet), never past the deadline by more than one slice. *done once every key is through.
+bool ThingEngine::grain_sweep_step(Kind& k, std::chrono::steady_clock::time_point deadline, bool* done, std::string* err) {
+  *done = false;
+  while (k.sweep_at < k.sweep.size()) {
+    size_t n = 8;
+    if (k.sweep_ms_per_key > 0) {
+      const double left = std::chrono::duration<double, std::milli>(deadline - std::chrono::steady_clock::now()).count();
+      n = left <= 0 ? 1 : (size_t)std::max(1.0, std::min((double)kPartitionChunk, left / k.sweep_ms_per_key));
+    }
+    const size_t end = std::min(k.sweep.size(), k.sweep_at + n);
+    std::vector<std::string> keys(k.sweep.begin() + (std::ptrdiff_t)k.sweep_at, k.sweep.begin() + (std::ptrdiff_t)end);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!grain_keys(k, keys, k.sweep_cause, err)) {
+      std::vector<std::string>().swap(k.sweep);
+      k.sweep_at = 0;
+      return false;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double per = ms / (double)(end - k.sweep_at);
+    k.sweep_ms_per_key = k.sweep_ms_per_key > 0 ? (k.sweep_ms_per_key + per) / 2 : per;
+    k.sweep_at = end;
+    if (std::chrono::steady_clock::now() >= deadline) break;
+  }
+  if (k.sweep_at < k.sweep.size()) return true;
+  std::vector<std::string>().swap(k.sweep);
+  k.sweep_at = 0;
+  k.full_recomputes++;
+  if (!k.grain_error.empty()) alert(k.name, "", "recovered", "a full pass ran clean");
+  k.grain_error.clear();
+  k.last_full_ms = (double)(db_.kernel_.host().wall_ns() - k.sweep_t0) / 1e6;
+  dirty_ = true;
+  *done = true;
+  return true;
+}
+
 void ThingEngine::settle_grain(Kind& k) {
   if (!k.grain) return;
   ThingGrain& g = *k.grain;
   std::string err;
+  // this kind's share of the lock: what is not done by then waits for the next settle (work_left brings it soon)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settle_slice_ms());
   // Things whose moment has come are read again.
   if (!k.wakes.empty()) {
     const std::string now = [] { std::time_t t = std::time(nullptr); std::tm tm_buf{}; localtime_r(&t, &tm_buf); char b[32];
@@ -6481,18 +6575,34 @@ void ThingEngine::settle_grain(Kind& k) {
     const std::string cause = k.full_cause.empty() ? std::string("full recompute") : k.full_cause;
     k.pending_full = false;
     k.full_cause.clear();
-    if (!grain_full(k, cause, &err)) {
+    if (!grain_sweep_start(k, cause, &err)) {
       k.grain_error = err;
       alert(k.name, "", "error", err);
       fprintf(stderr, "[things] %s: full pass failed: %s\n", k.name.c_str(), err.c_str());
+      return;
     }
-    return;
+  }
+  // a full pass under way goes first, a slice per settle; reactions wait until it is through
+  if (!k.sweep.empty()) {
+    bool done = false;
+    if (!grain_sweep_step(k, deadline, &done, &err)) {
+      k.grain_error = err;
+      alert(k.name, "", "error", err);
+      fprintf(stderr, "[things] %s: full pass failed: %s\n", k.name.c_str(), err.c_str());
+      return;
+    }
+    if (!done || std::chrono::steady_clock::now() >= deadline) return;
   }
   if (k.pending.empty()) return;
   std::vector<std::pair<std::string, std::string>> todo(k.pending.begin(), k.pending.end());
   k.pending.clear();
   std::sort(todo.begin(), todo.end());
   for (size_t at = 0; at < todo.size(); at += kPartitionChunk) {
+    // past this kind's share: the rest waits for the next settle, as it was noted
+    if (at > 0 && std::chrono::steady_clock::now() >= deadline) {
+      for (size_t i = at; i < todo.size(); ++i) k.pending.emplace(todo[i].first, todo[i].second);
+      return;
+    }
     const size_t end = std::min(todo.size(), at + kPartitionChunk);
     std::vector<std::string> keys;
     for (size_t i = at; i < end; ++i) keys.push_back(todo[i].first);
@@ -6903,6 +7013,8 @@ bool ThingEngine::due_now() {
     if (k.paused) continue;
     if (k.type == Kind::Event && k.state != "failed" && k.at <= now && !firing_now_.count(k.name)) return true;
     if (k.type == Kind::Grain && !k.wakes.empty() && k.wakes.begin()->first <= now) return true;
+    // a full pass or reactions a slice left over: settled again now, not at the next write
+    if (k.type == Kind::Grain && (!k.sweep.empty() || !k.pending.empty() || k.pending_full)) return true;
     if (k.type == Kind::Mirror && k.next_pull_ns <= db_.kernel_.host().wall_ns()) return true;
     // the ones that wait on the date: a new day is theirs to see even when
     // nothing is written (a quiet mirror, a scratch copy with no binlog)

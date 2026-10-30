@@ -59,6 +59,24 @@ fn bays_of_orders(ordernos) {
 // lines are all completed shows them all - fees (tagalong) left out. Items whose product type needs no pick count
 // as picked and loaded, as the TV forces them loaded.
 // -> orderno -> [{line, stockid, description, qty, pickable}]
+// What the driver collects at a credit's stop: its open lines (a credit is a return - the tires come back on the
+// truck; the loading API counts them loaded as they are, nothing is put on at the dock). Same tire on two lines, one
+// line. Only credit order numbers are asked for: a credit and a sales order may share a number.
+fn credit_pickups(ordernos) {
+  let out = {}
+  if len(ordernos) == 0 { return out }
+  for r in read("SELECT d.orderno, d.stkcode, d.quantity, sm.description FROM creditorderdetails d " +
+                "LEFT JOIN stockmaster sm ON sm.stockid = d.stkcode " +
+                "WHERE d.orderno IN (?) AND COALESCE(d.completed, 0) <> 1 ORDER BY d.orderno, d.orderlineno", ordernos) {
+    let lines = get_or_put(out, s(r.orderno), [])
+    let same = nil
+    for l in lines { if l.stockid == s(r.stkcode) { same = l } }
+    if same != nil { same.qty = same.qty + n(r.quantity) }
+    else { push(lines, {"stockid": s(r.stkcode), "description": s(r.description), "qty": n(r.quantity)}) }
+  }
+  return out
+}
+
 fn order_lines(ordernos) {
   let out = {}
   if len(ordernos) == 0 { return out }
