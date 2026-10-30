@@ -272,6 +272,8 @@ The `bytes` type provides bounds-checked mutable byte buffers for binary protoco
 
 ## 7. Date, Time & Timers
 
+A `zone` is `"local"` (the machine's own), `"utc"`, a fixed offset (`"+05:30"`, `"-0800"`) or a name from the machine's tz database (`"America/New_York"`, `"Europe/London"`, read from `/usr/share/zoneinfo` or `$TZDIR`, daylight saving included, past and future).
+
 | Function | Signature | Description |
 |---|---|---|
 | `now` | `now()` | Returns fractional UNIX epoch timestamp in seconds. |
