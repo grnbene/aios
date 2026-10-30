@@ -630,13 +630,13 @@ Dispatched at `cli/commands.cpp:10919` → `cmd_app` (`cli/commands.cpp:1528`).
 
 ## `grain`
 
-Dispatched at `cli/commands.cpp:10956` → `run_grain_command` (`cli/grain_cmd.cpp:229`).
+Dispatched at `cli/commands.cpp:10956` → `run_grain_command` (`cli/grain_cmd.cpp:239`).
 
 **grain run|eval|repl|dis|serve|ps** - The grain language *(Applications & Shell)*
 
 | subcommand | usage | what it does |
 |---|---|---|
-| `run` | `grain run <file.gr> [args...]` | run a program |
+| `run` | `grain run [--steps N] <file.gr> [args...]` | run a program (`args` holds what follows it; at most N instructions, 10M unless given, 0 for none) |
 | `eval` | `grain eval <source>` | run one line and print its value |
 | `repl` | `grain repl` | an interactive prompt |
 | `dis` | `grain dis <file.gr>` | the bytecode the compiler made |

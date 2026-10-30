@@ -313,7 +313,7 @@ const std::vector<CommandDoc>& command_docs() {
     {"help", "app help", "the grain app commands in full"},
   }},
   {"grain", "APPLICATIONS & SHELL", "grain run|eval|repl|dis|serve|ps", "The grain language", {
-    {"run", "grain run <file.gr> [args...]", "run a program"},
+    {"run", "grain run [--steps N] <file.gr> [args...]", "run a program (`args` holds what follows it; at most N instructions, 10M unless given, 0 for none)"},
     {"eval", "grain eval <source>", "run one line and print its value"},
     {"repl", "grain repl", "an interactive prompt"},
     {"dis", "grain dis <file.gr>", "the bytecode the compiler made"},

@@ -1,0 +1,425 @@
+# Load a Doom WAD into ASQL: SQLDoom's schema, its static game catalogs, the WAD's textures, sprites and status-bar
+# art, and the chosen maps' geometry, then the tables derived from them. A port of SQLDoom's wad_loader.py and
+# wad_sql.py (github.com/cedardb/sqldoom, GPL-2.0) to grain, run inside aios so sql() reaches the engine directly:
+#
+#   aios --root R grain run apps/sqldoom/load.gr doom1.wad [E1M1 ...]
+#
+# Not ported yet: sound effects and music (sound_assets, music_assets, map_music stay empty).
+import "lib/wad.gr" as wad
+
+let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))   # where sql/ is: run from the repo root, or set SQLDOOM_DIR
+let started = clock()
+
+fn progress(msg) { print("[wad-loader] " + msg) }
+
+# A value as an SQL literal: NULL, a number, TRUE/FALSE, 'text' with quotes doubled, or X'..' for bytes.
+fn lit(v) {
+  let t = type(v)
+  if v == nil { return "NULL" }
+  if t == "bool" { return v ? "TRUE" : "FALSE" }
+  if t == "int" or t == "real" or t == "decimal" { return str(v) }
+  if t == "bytes" { return "X'" + bytes_hex(v) + "'" }
+  return "'" + replace(replace(str(v), "\\", "\\\\"), "'", "''") + "'"
+}
+
+# Rows (lists of values) into a table, `per` rows to a statement.
+fn insert_rows(table, cols, rows, per) {
+  let i = 0
+  while i < len(rows) {
+    let parts = []
+    for r in slice(rows, i, min(i + per, len(rows))) { push(parts, "(" + join(map(r, lit), ",") + ")") }
+    sql("INSERT INTO " + table + " (" + cols + ") VALUES " + join(parts, ","))
+    i = i + per
+  }
+}
+
+# Whether only spaces, then a line break, a -- comment or the end, follow position i.
+fn ends_line(text, i) {
+  while i < len(text) and (slice(text, i, i + 1) == " " or slice(text, i, i + 1) == "\t") { i = i + 1 }
+  return i >= len(text) or slice(text, i, i + 1) == "\n" or slice(text, i, i + 2) == "--"
+}
+
+# A file of statements, split at `sep` (";" or ";;") where it ends a line outside quotes and comments.
+fn run_sql_file(path, sep) {
+  let text = read_file(path)
+  let stmts = []
+  let cur = ""
+  let quote = ""
+  let i = 0
+  let n = len(text)
+  while i < n {
+    let c = slice(text, i, i + 1)
+    if quote != "" {
+      cur = cur + c
+      if c == quote {
+        if slice(text, i + 1, i + 2) == quote { cur = cur + quote
+                                                 i = i + 1 }
+        else { quote = "" }
+      }
+      i = i + 1
+      continue
+    }
+    if c == "-" and slice(text, i, i + 2) == "--" {
+      let e = index_of(text, "\n", i)
+      if e < 0 { e = n }
+      i = e
+      continue
+    }
+    if c == "'" or c == "\"" or c == "`" { quote = c }
+    if slice(text, i, i + len(sep)) == sep and ends_line(text, i + len(sep)) {
+      if trim(cur) != "" { push(stmts, trim(cur)) }
+      cur = ""
+      i = i + len(sep)
+      continue
+    }
+    cur = cur + c
+    i = i + 1
+  }
+  if trim(cur) != "" { push(stmts, trim(cur)) }
+  for s in stmts {
+    let r = pcall(sql, s)
+    if not r.ok { error(basename(path) + ": " + str(r.error) + "\n  in: " + slice(s, 0, 200)) }
+  }
+  return len(stmts)
+}
+
+# ---- textures, colormap, flats ----------------------------------------------------------------------------------
+
+fn load_colormap(w, by) {
+  let pal = wad.lump_bytes(w, by["PLAYPAL"])
+  let cm = wad.lump_bytes(w, by["COLORMAP"])
+  let palettes = max(1, idiv(len(pal), 768))
+  let levels = min(34, idiv(len(cm), 256))
+  let rows = []
+  for p in range(0, palettes) {
+    for level in range(0, levels) {
+      for source in range(0, 256) {
+        let mapped = bytes_get(cm, level * 256 + source, "u8")
+        let o = p * 768 + mapped * 3
+        let rgb = bytes(3)
+        bytes_copy(rgb, 0, pal, o, 3)
+        push(rows, [p, level, source, mapped, bytes_get(pal, o, "u8"), bytes_get(pal, o + 1, "u8"), bytes_get(pal, o + 2, "u8"), rgb])
+      }
+    }
+  }
+  insert_rows("colormap_rgb", "pal, level, palette_index, mapped_index, r, g, b, rgb", rows, 2000)
+  return len(rows)
+}
+
+fn texture_defs(w, by, name) {
+  if not has(by, name) { return [] }
+  let d = wad.lump_bytes(w, by[name])
+  let n = bytes_get(d, 0, "i32le")
+  let out = []
+  for i in range(0, n) {
+    let o = bytes_get(d, 4 + 4 * i, "i32le")
+    let patches = []
+    let count = bytes_get(d, o + 20, "i16le")
+    for k in range(0, count) {
+      let po = o + 22 + k * 10
+      push(patches, {"ox": bytes_get(d, po, "i16le"), "oy": bytes_get(d, po + 2, "i16le"), "patch": bytes_get(d, po + 4, "i16le")})
+    }
+    push(out, {"name": wad.name8(d, o), "w": bytes_get(d, o + 12, "i16le"), "h": bytes_get(d, o + 14, "i16le"), "patches": patches})
+  }
+  return out
+}
+
+fn load_wall_textures(w, lumps, by) {
+  let pn = wad.lump_bytes(w, by["PNAMES"])
+  let pnames = []
+  for i in range(0, bytes_get(pn, 0, "i32le")) { push(pnames, wad.name8(pn, 4 + i * 8)) }
+  let patch_lumps = {}
+  for l in wad.between(lumps, "P_START", "P_END") {
+    if l.size > 0 { patch_lumps[l.name] = l }
+  }
+  let cache = {}
+  let defs = concat(texture_defs(w, by, "TEXTURE1"), texture_defs(w, by, "TEXTURE2"))
+  let rows = []
+  for t in defs {
+    if t.w <= 0 or t.h <= 0 { continue }
+    let tex = bytes(t.w * t.h)   # an uncovered texel stays index 0, as in SQLDoom
+    for pp in t.patches {
+      if pp.patch < 0 or pp.patch >= len(pnames) { continue }
+      let pname = pnames[pp.patch]
+      if not has(patch_lumps, pname) { continue }
+      if not has(cache, pname) {
+        let data = wad.lump_bytes(w, patch_lumps[pname])
+        let r = pcall(wad.decode_patch, data)
+        cache[pname] = r.ok ? {"data": data, "p": r.value} : nil
+      }
+      let c = cache[pname]
+      if c == nil { continue }
+      for x in range(0, c.p.w) {
+        let tx = pp.ox + x
+        if tx < 0 or tx >= t.w { continue }
+        for post in c.p.cols[x] {
+          for row in range(0, post.len) {
+            let ty = pp.oy + post.top + row
+            if ty >= 0 and ty < t.h { bytes_set(tex, ty * t.w + tx, "u8", bytes_get(c.data, post.ofs + row, "u8")) }
+          }
+        }
+      }
+    }
+    push(rows, [t.name, t.w, t.h, tex])
+  }
+  insert_rows("walltex_meta", "name, width, height, palette_indices", rows, 50)
+  for r in rows { insert_rows("walltex_texels", "name, u, v, palette_index", texels_of(r[0], r[1], r[2], r[3], nil), 4000) }
+  return len(rows)
+}
+
+# A w x h row-major texel buffer as (name, u, v, index) rows; with a mask, only the texels it marks.
+fn texels_of(name, w, h, pixels, mask) {
+  let out = []
+  for v in range(0, h) {
+    for u in range(0, w) {
+      let o = v * w + u
+      if mask == nil or bytes_get(mask, o, "u8") != 0 { push(out, [name, u, v, bytes_get(pixels, o, "u8")]) }
+    }
+  }
+  return out
+}
+
+fn load_flats(w, lumps) {
+  let rows = []
+  for l in wad.between(lumps, "F_START", "F_END") {
+    if l.size == 4096 { push(rows, [l.name, wad.lump_bytes(w, l)]) }
+  }
+  insert_rows("flat_textures", "name, palette_indices", rows, 50)
+  for r in rows { insert_rows("flat_texels", "name, u, v, palette_index", texels_of(r[0], 64, 64, r[1], nil), 4096) }
+  return len(rows)
+}
+
+# ---- status bar, sprites ----------------------------------------------------------------------------------------
+
+fn ui_patch_names() {
+  let names = ["STBAR", "STTMINUS", "STTPRCNT", "STFGOD0", "STFDEAD0", "STARMS", "TITLEPIC", "CREDIT", "HELP1", "M_DOOM",
+    "M_NGAME", "M_OPTION", "M_LOADG", "M_SAVEG", "M_QUITG", "M_RDTHIS", "M_NEWG", "M_EPISOD", "M_EPI1", "M_EPI2",
+    "M_EPI3", "M_EPI4", "M_SKILL", "M_JKILL", "M_ROUGH", "M_HURT", "M_ULTRA", "M_NMARE", "M_SKULL1", "M_SKULL2",
+    "M_PAUSE", "M_LSLEFT", "M_LSCNTR", "M_LSRGHT", "M_LGTTL", "M_SGTTL", "WIMAP0", "WIMAP1", "WIMAP2", "INTERPIC",
+    "VICTORY2", "ENDPIC", "PFUB1", "PFUB2", "WIF", "WIENTER", "WIOSTK", "WIOSTI", "WISCRT2", "WITIME", "WIPAR",
+    "WIPCNT", "WICOLON", "WIMINUS", "WISUCKS", "WIURH0", "WIURH1", "WISPLAT"]
+  for d in range(0, 10) { push(names, "STTNUM" + str(d), "STYSNUM" + str(d), "WINUM" + str(d)) }
+  for e in range(0, 7) { push(names, "END" + str(e)) }
+  for f in range(0, 5) {
+    for k in range(0, 3) { push(names, "STFST" + str(f) + str(k)) }
+    push(names, "STFTL" + str(f) + "0", "STFTR" + str(f) + "0", "STFOUCH" + str(f), "STFEVL" + str(f))
+  }
+  for g in range(2, 8) { push(names, "STGNUM" + str(g)) }
+  for k in range(0, 6) { push(names, "STKEYS" + str(k)) }
+  for e in range(0, 4) {
+    for m in range(0, 9) { push(names, "WILV" + str(e) + str(m)) }
+  }
+  for code in concat(range(33, 96), [121]) { push(names, "STCFN" + pad_left(str(code), 3, "0")) }
+  return names
+}
+
+fn load_ui_patches(w, by) {
+  let rows = []
+  let texels = []
+  let skipped = []
+  for name in ui_patch_names() {
+    if not has(by, name) or by[name].size <= 0 { push(skipped, name)
+                                                continue }
+    let data = wad.lump_bytes(w, by[name])
+    let r = pcall(wad.decode_patch, data)
+    if not r.ok { push(skipped, name)
+                  continue }
+    let p = r.value
+    let px = wad.patch_pixels(data, p, fn (u, v, idx) { push(texels, [name, u, v, idx]) })
+    push(rows, [name, p.w, p.h, p.left, p.top, px.pixels, px.mask])
+  }
+  insert_rows("ui_patches", "name, width, height, left_offset, top_offset, pixels, mask", rows, 20)
+  insert_rows("ui_patch_pixels", "name, dx, dy, palette_index", texels, 5000)
+  return {"patches": len(rows), "skipped": skipped}
+}
+
+fn load_sprites(w, lumps) {
+  let frames = {}
+  let lump_rows = []
+  for l in wad.between(lumps, "S_START", "S_END") {
+    let mm = regex_match("^([A-Z0-9]{4})([A-Z])([0-8])(?:([A-Z])([0-8]))?$", l.name)
+    if mm == nil or l.size < 12 { continue }
+    let m = mm.groups
+    let data = wad.lump_bytes(w, l)
+    let r = pcall(wad.decode_patch, data)
+    if not r.ok { continue }
+    let p = r.value
+    let sprite = m[0]
+    frames[sprite + m[1] + m[2]] = [sprite, m[1], int(m[2]), l.name, false, p.w, p.h, p.left, p.top]
+    if m[3] != nil {
+      frames[sprite + m[3] + m[4]] = [sprite, m[3], int(m[4]), l.name, true, p.w, p.h, p.left, p.top]
+    }
+    let texels = []
+    let px = wad.patch_pixels(data, p, fn (u, v, idx) { push(texels, [l.name, u, v, idx]) })
+    push(lump_rows, [l.name, px.pixels, px.mask])
+    insert_rows("sprite_texels", "lump_name, u, v, palette_index", texels, 4000)
+  }
+  insert_rows("sprite_lumps", "lump_name, pixels, mask", lump_rows, 50)
+  insert_rows("sprite_frames", "sprite, frame, rotation, lump_name, flipped, width, height, left_offset, top_offset", values(frames), 2000)
+  return len(lump_rows)
+}
+
+# ---- maps -------------------------------------------------------------------------------------------------------
+
+fn sky_for(name) {
+  let m = regex_match("^E([1-4])M[1-9]$", name)
+  if m != nil { return "SKY" + m.groups[0] }
+  let d = regex_match("^MAP([0-9][0-9])$", name)
+  if d != nil {
+    let n = int(d.groups[0])
+    return n < 12 ? "SKY1" : (n < 21 ? "SKY2" : "SKY3")
+  }
+  return nil
+}
+
+let MAP_TABLES = ["render_things", "render_segs", "sector_sound_origins", "node_children", "nodes", "ssectors", "segs",
+                  "things", "linedefs", "sidedefs", "sectors", "vertexes", "reject_lumps", "blockmaps", "map_music"]
+
+fn insert_map(wad_id, name) {
+  let existing = sql("SELECT map_id FROM maps WHERE name = " + lit(name) + " ORDER BY map_id")
+  let map_id = nil
+  if len(existing) > 0 {
+    map_id = existing[0].map_id
+    for t in MAP_TABLES { sql("DELETE FROM " + t + " WHERE map_id = " + str(map_id)) }
+    sql("UPDATE maps SET wad_id = " + str(wad_id) + ", sky_texture = " + lit(sky_for(name)) + " WHERE map_id = " + str(map_id))
+  } else {
+    sql("INSERT INTO maps (wad_id, name, sky_texture) VALUES (" + str(wad_id) + ", " + lit(name) + ", " + lit(sky_for(name)) + ")")
+    map_id = sql("SELECT MAX(map_id) AS id FROM maps WHERE name = " + lit(name))[0].id
+  }
+  return map_id
+}
+
+# Fixed-size records of a lump, each read by `row(buf, offset, index)`.
+fn records(w, lump, size, row) {
+  let d = wad.lump_bytes(w, lump)
+  let out = []
+  for i in range(0, idiv(len(d), size)) { push(out, row(d, i * size, i)) }
+  return out
+}
+
+fn load_map(w, map_id, by) {
+  let m = map_id
+  insert_rows("vertexes", "id, map_id, x, y", records(w, by["VERTEXES"], 4, fn (d, o, i) {
+    return [i, m, bytes_get(d, o, "i16le"), bytes_get(d, o + 2, "i16le")]
+  }), 1000)
+  insert_rows("sectors", "id, map_id, floor_height, ceil_height, spawn_floor_height, spawn_ceil_height, spawn_floor_tex, floor_tex, ceil_tex, light_level, spawn_light_level, special, tag",
+    records(w, by["SECTORS"], 26, fn (d, o, i) {
+      let fh = bytes_get(d, o, "i16le")
+      let ch = bytes_get(d, o + 2, "i16le")
+      let ft = wad.tex8(d, o + 4)
+      let light = bytes_get(d, o + 20, "i16le")
+      return [i, m, fh, ch, fh, ch, ft, ft, wad.tex8(d, o + 12), light, light, bytes_get(d, o + 22, "i16le"), bytes_get(d, o + 24, "i16le")]
+    }), 1000)
+  insert_rows("sidedefs", "id, map_id, x_offset, y_offset, upper_tex, lower_tex, mid_tex, sector_id", records(w, by["SIDEDEFS"], 30, fn (d, o, i) {
+    return [i, m, bytes_get(d, o, "i16le"), bytes_get(d, o + 2, "i16le"), wad.tex8(d, o + 4), wad.tex8(d, o + 12), wad.tex8(d, o + 20), bytes_get(d, o + 28, "i16le")]
+  }), 1000)
+  insert_rows("linedefs", "id, map_id, v1_id, v2_id, flags, special, tag, right_sd_id, left_sd_id", records(w, by["LINEDEFS"], 14, fn (d, o, i) {
+    let r = bytes_get(d, o + 10, "u16le")
+    let l = bytes_get(d, o + 12, "u16le")
+    return [i, m, bytes_get(d, o, "u16le"), bytes_get(d, o + 2, "u16le"), bytes_get(d, o + 4, "u16le"), bytes_get(d, o + 6, "u16le"),
+            bytes_get(d, o + 8, "u16le"), r == 65535 ? -1 : r, l == 65535 ? -1 : l]
+  }), 1000)
+  insert_rows("things", "id, map_id, x, y, angle, type, flags, spawn_x, spawn_y, spawn_angle", records(w, by["THINGS"], 10, fn (d, o, i) {
+    let x = bytes_get(d, o, "i16le")
+    let y = bytes_get(d, o + 2, "i16le")
+    let a = bytes_get(d, o + 4, "i16le")
+    return [i, m, x, y, a, bytes_get(d, o + 6, "i16le"), bytes_get(d, o + 8, "u16le"), x, y, a]
+  }), 1000)
+  insert_rows("segs", "id, map_id, v1_id, v2_id, angle, linedef_id, direction, offs", records(w, by["SEGS"], 12, fn (d, o, i) {
+    return [i, m, bytes_get(d, o, "u16le"), bytes_get(d, o + 2, "u16le"), bytes_get(d, o + 4, "i16le"), bytes_get(d, o + 6, "u16le"),
+            bytes_get(d, o + 8, "i16le"), bytes_get(d, o + 10, "i16le")]
+  }), 1000)
+  insert_rows("ssectors", "id, map_id, seg_count, first_seg_id", records(w, by["SSECTORS"], 4, fn (d, o, i) {
+    return [i, m, bytes_get(d, o, "u16le"), bytes_get(d, o + 2, "u16le")]
+  }), 1000)
+
+  let nd = wad.lump_bytes(w, by["NODES"])
+  let nodes = []
+  let children = []
+  for i in range(0, idiv(len(nd), 28)) {
+    let o = i * 28
+    push(nodes, [i, m, bytes_get(nd, o, "i16le"), bytes_get(nd, o + 2, "i16le"), bytes_get(nd, o + 4, "i16le"), bytes_get(nd, o + 6, "i16le")])
+    for side in [["R", 8, 24], ["L", 16, 26]] {
+      let c = bytes_get(nd, o + side[2], "u16le")
+      let b = o + side[1]
+      let ssec = (c & 32768) != 0
+      # bbox order in the lump: top, bottom, left, right
+      push(children, [m, i, side[0], ssec ? "SSECTOR" : "NODE", ssec ? nil : c, ssec ? (c & 32767) : nil,
+                      bytes_get(nd, b, "i16le"), bytes_get(nd, b + 2, "i16le"), bytes_get(nd, b + 4, "i16le"), bytes_get(nd, b + 6, "i16le")])
+    }
+  }
+  insert_rows("nodes", "id, map_id, x, y, dx, dy", nodes, 1000)
+  insert_rows("node_children", "map_id, node_id, side, child_kind, child_node_id, child_ssector_id, bbox_top, bbox_bottom, bbox_left, bbox_right", children, 1000)
+
+  if has(by, "REJECT") { insert_rows("reject_lumps", "map_id, data", [[m, wad.lump_bytes(w, by["REJECT"])]], 1) }
+  if has(by, "BLOCKMAP") {
+    let bm = wad.lump_bytes(w, by["BLOCKMAP"])
+    let h = len(bm) >= 8 ? [bytes_get(bm, 0, "i16le"), bytes_get(bm, 2, "i16le"), bytes_get(bm, 4, "i16le"), bytes_get(bm, 6, "i16le")] : [0, 0, 0, 0]
+    insert_rows("blockmaps", "map_id, origin_x, origin_y, cols, `rows`, payload", [[m, h[0], h[1], h[2], h[3], bm]], 1)
+  }
+  sql("CALL doom_materialize_render_segs(" + str(m) + ")")
+  sql("CALL doom_materialize_render_things(" + str(m) + ")")
+}
+
+# ---- main -------------------------------------------------------------------------------------------------------
+
+if len(args) < 1 { error("usage: load.gr <wad> [MAP ...]") }
+let wad_path = abspath(args[0])
+let wanted = map(slice(args, 1), upper)
+
+progress("Reading " + wad_path + "...")
+let w = read_bytes(wad_path)
+let parsed = wad.parse(w)
+let lumps = parsed.lumps
+let by = wad.first_by_name(lumps)
+let maps = []
+for i in range(0, len(lumps)) {
+  let name = lumps[i].name
+  if wad.is_map_marker(name) and (len(wanted) == 0 or index_of(join(wanted, ","), name) >= 0) { push(maps, i) }
+}
+progress("Found " + parsed.type + " with " + str(len(lumps)) + " lumps; loading " + str(len(maps)) + " maps.")
+
+sql("CREATE DATABASE IF NOT EXISTS doom")
+sql("USE doom")
+progress("Applying the schema...")
+run_sql_file(path_join(here, "sql/schema.sql"), ";")
+run_sql_file(path_join(here, "sql/loader_procs.sql"), ";;")
+progress("Loading the game catalogs...")
+for t in ["thing_combat_defs", "thing_ai_frames", "pickup_defs", "weapon_frames", "weapon_defs", "thing_sprite_defs", "projectile_defs",
+          "colormap_rgb", "walltex_meta", "flat_textures", "ui_patches", "ui_patch_pixels", "sprite_frames", "sprite_lumps",
+          "walltex_texels", "flat_texels", "sprite_texels",
+          "menu_items", "menu_decor"] { sql("DELETE FROM " + t) }
+run_sql_file(path_join(here, "sql/game_data.sql"), ";")
+run_sql_file(path_join(here, "sql/menu_data.sql"), ";")
+
+sql("INSERT INTO wads (wad_type, wad_path) VALUES (" + lit(parsed.type) + ", " + lit(wad_path) + ")")
+let wad_id = sql("SELECT MAX(wad_id) AS id FROM wads")[0].id
+
+progress("COLORMAP: " + str(load_colormap(w, by)) + " entries")
+progress("Wall textures: " + str(load_wall_textures(w, lumps, by)))
+progress("Flats: " + str(load_flats(w, lumps)))
+let ui = load_ui_patches(w, by)
+progress("Status-bar patches: " + str(ui.patches) + (len(ui.skipped) > 0 ? " (not in this WAD: " + join(ui.skipped, " ") + ")" : ""))
+progress("Sprites: " + str(load_sprites(w, lumps)))
+
+for i in maps {
+  let name = lumps[i].name
+  let t0 = clock()
+  let own = {}
+  let j = i + 1
+  while j < len(lumps) and not wad.is_map_marker(lumps[j].name) {
+    own[lumps[j].name] = lumps[j]
+    j = j + 1
+  }
+  let map_id = insert_map(wad_id, name)
+  load_map(w, map_id, own)
+  progress(name + " loaded as map_id " + str(map_id) + " in " + format("{:.1f}", (clock() - t0) / 1000) + "s")
+}
+
+progress("Stamping line special flags...")
+sql("UPDATE linedefs ld JOIN line_special_defs d ON d.special = ld.special " +
+    "SET ld.cross_activated = d.cross_activated, ld.cross_once = d.cross_once, " +
+    "ld.monster_crossable = d.monster_crossable, ld.scrolls = d.scrolls")
+progress("Building derived tables...")
+run_sql_file(path_join(here, "sql/derived.sql"), ";")
+progress("Import complete in " + format("{:.1f}", (clock() - started) / 1000) + "s.")

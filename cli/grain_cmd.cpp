@@ -155,7 +155,8 @@ void report_errors(Out& o, const std::string& origin, const std::vector<grain::D
 // One path for "compile this text and run it", because the file, the one-liner
 // and the REPL line must not be able to disagree about what the language does.
 bool compile_and_run(Kernel& k, Out& o, const std::string& source,
-                     const std::string& origin, bool show_value, bool serving = false) {
+                     const std::string& origin, bool show_value, bool serving = false,
+                     const std::vector<std::string>& script_args = {}, uint64_t steps = 10000000) {
   auto compiled = grain::compile_source(source, origin, show_value);
   if (!compiled.ok()) { report_errors(o, origin, compiled.errors, source); return false; }
 
@@ -179,8 +180,17 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
   // A SERVER is the one program whose whole job is to never finish, so `serve`
   // lifts the limit -- and is also the only mode that hands out sockets, so
   // `grain run` cannot quietly open a port.
-  vm.step_limit = serving ? 0 : 10000000;
+  vm.step_limit = serving ? 0 : steps;
   if (serving) install_grain_net(vm);
+  // As the standalone grain has them: `args` is what followed the file on the command line, and a relative import
+  // starts at the program's own directory, not wherever aios was started.
+  std::vector<grain::Value> arg_values;
+  for (const auto& a : script_args) arg_values.push_back(grain::Value::string(a));
+  vm.define_global("args", grain::Value::list(std::move(arg_values)));
+  if (!origin.empty() && origin[0] != '<') {
+    const size_t slash = origin.find_last_of('/');
+    if (slash != std::string::npos) vm.base_dir = origin.substr(0, slash);
+  }
 
   // A finite program's output is collected and handed over at the end, so a
   // caller that is not a terminal gets the text. A SERVER never reaches the
@@ -249,19 +259,30 @@ Result<void> run_grain_command(Kernel& k, Out& o, const std::vector<std::string>
     return Ok();
   }
   if (sub == "run" || sub == "dis" || sub == "serve") {
-    if (a.size() < 3) return Result<void>(Status::Invalid, "grain " + sub + " <file>");
+    // grain run [--steps N] <file> [args...]: N instructions at most (0: no limit), ten million unless given.
+    size_t at = 2;
+    uint64_t steps = 10000000;
+    if (sub == "run" && a.size() > 3 && a[2] == "--steps") {
+      char* end = nullptr;
+      steps = std::strtoull(a[3].c_str(), &end, 10);
+      if (!end || *end || a[3].empty()) return Result<void>(Status::Invalid, "grain run --steps wants a number");
+      at = 4;
+    }
+    if (a.size() <= at) return Result<void>(Status::Invalid, "grain " + sub + " <file>");
+    const std::string file = a[at];
+    const std::vector<std::string> script_args(a.begin() + static_cast<long>(at) + 1, a.end());
     bool ok = false;
-    const std::string source = read_file(a[2], ok);
-    if (!ok) return Result<void>(Status::NotFound, "cannot read " + a[2]);
+    const std::string source = read_file(file, ok);
+    if (!ok) return Result<void>(Status::NotFound, "cannot read " + file);
     if (sub == "dis") {
-      auto compiled = grain::compile_source(source, a[2]);
-      if (!compiled.ok()) { report_errors(o, a[2], compiled.errors); return Result<void>(Status::Invalid, "did not compile"); }
+      auto compiled = grain::compile_source(source, file);
+      if (!compiled.ok()) { report_errors(o, file, compiled.errors); return Result<void>(Status::Invalid, "did not compile"); }
       o << grain::disassemble(*compiled.script);
       return Ok();
     }
-    userland::runtime::announce("aios grain " + sub, a[2], k.config().root);
-    if (!compile_and_run(k, o, source, a[2], false, sub == "serve"))
-      return Result<void>(Status::Invalid, a[2] + " did not run to completion");
+    userland::runtime::announce("aios grain " + sub, file, k.config().root);
+    if (!compile_and_run(k, o, source, file, false, sub == "serve", script_args, steps))
+      return Result<void>(Status::Invalid, file + " did not run to completion");
     return Ok();
   }
 

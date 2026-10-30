@@ -1,0 +1,114 @@
+# Reading a Doom WAD: the lump directory, and the picture ("patch") format walls, sprites and the status bar share.
+# A port of SQLDoom's wad_loader.py (github.com/cedardb/sqldoom, GPL-2.0).
+
+# An 8-byte lump or texture name: NULs dropped (not only trailing ones), trimmed, upper case.
+fn name8(buf, off) {
+  let s = ""
+  for i in range(0, 8) {
+    let c = bytes_get(buf, off + i, "u8")
+    if c != 0 and c < 128 { s = s + chr(c) }
+  }
+  return upper(trim(s))
+}
+
+# A texture name, nil where the WAD has none ("-" stays "-", as Doom means no texture by it).
+fn tex8(buf, off) {
+  let s = name8(buf, off)
+  if s == "" { return nil }
+  return s
+}
+
+fn is_map_marker(name) {
+  return regex_test("^E[1-4]M[1-9]$", name) or regex_test("^MAP[0-9][0-9]$", name)
+}
+
+# {type, lumps: [{name, ofs, size}]} for the WAD's bytes.
+fn parse(wad) {
+  let ident = bytes_str(wad, 0, 4)
+  if ident != "IWAD" and ident != "PWAD" { error("not a WAD (ident " + ident + ")") }
+  let n = bytes_get(wad, 4, "i32le")
+  let dir = bytes_get(wad, 8, "i32le")
+  let lumps = []
+  for i in range(0, n) {
+    let e = dir + i * 16
+    push(lumps, {"name": name8(wad, e + 8), "ofs": bytes_get(wad, e, "i32le"), "size": bytes_get(wad, e + 4, "i32le")})
+  }
+  return {"type": ident, "lumps": lumps}
+}
+
+# A lump's bytes, copied out.
+fn lump_bytes(wad, lump) {
+  let b = bytes(lump.size)
+  if lump.size > 0 { bytes_copy(b, 0, wad, lump.ofs, lump.size) }
+  return b
+}
+
+# name -> lump, the first of a name winning (as SQLDoom's _lump_map).
+fn first_by_name(lumps) {
+  let m = {}
+  for l in lumps {
+    if not has(m, l.name) { m[l.name] = l }
+  }
+  return m
+}
+
+fn index_of_name(lumps, name) {
+  for i in range(0, len(lumps)) {
+    if lumps[i].name == name { return i }
+  }
+  return -1
+}
+
+# The lumps between two markers (P_START/P_END, S_START/S_END, F_START/F_END), or [] when either is missing.
+fn between(lumps, start, stop) {
+  let i = index_of_name(lumps, start)
+  let j = index_of_name(lumps, stop)
+  if i < 0 or j < 0 { return [] }
+  return slice(lumps, i + 1, j)
+}
+
+# A picture lump: {w, h, left, top, cols}, cols[x] a list of posts {top, ofs, len} into the lump's bytes. Errors on
+# a lump that is not one.
+fn decode_patch(data) {
+  let size = len(data)
+  if size < 8 { error("not a patch") }
+  let w = bytes_get(data, 0, "i16le")
+  let h = bytes_get(data, 2, "i16le")
+  if w <= 0 or h <= 0 or 8 + 4 * w > size { error("invalid Doom patch dimensions") }
+  let cols = []
+  for x in range(0, w) {
+    let o = bytes_get(data, 8 + 4 * x, "i32le")
+    let posts = []
+    while o >= 0 and o < size {
+      let td = bytes_get(data, o, "u8")
+      if td == 255 { break }
+      let n = bytes_get(data, o + 1, "u8")
+      if o + 3 + n > size { error("a post past the end of the patch") }
+      push(posts, {"top": td, "ofs": o + 3, "len": n})
+      o = o + 4 + n
+    }
+    push(cols, posts)
+  }
+  return {"w": w, "h": h, "left": bytes_get(data, 4, "i16le"), "top": bytes_get(data, 6, "i16le"), "cols": cols}
+}
+
+# A decoded patch drawn into w*h palette-index and opacity buffers; on_texel(u, v, index) is called per opaque texel.
+fn patch_pixels(data, p, on_texel) {
+  let n = p.w * p.h
+  let pixels = bytes(n)
+  let mask = bytes(n)
+  for u in range(0, p.w) {
+    for post in p.cols[u] {
+      for row in range(0, post.len) {
+        let v = post.top + row
+        if v >= 0 and v < p.h {
+          let idx = bytes_get(data, post.ofs + row, "u8")
+          bytes_set(pixels, v * p.w + u, "u8", idx)
+          bytes_set(mask, v * p.w + u, "u8", 1)
+          if on_texel != nil { on_texel(u, v, idx) }
+        }
+      }
+    }
+  }
+  return {"pixels": pixels, "mask": mask}
+}
