@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <charconv>
 #include <cstdlib>
 #include <string>
 
@@ -71,6 +72,62 @@ bool rescale(I m, int from, int to, I& out) {
 }
 
 bool overflow(std::string& error) { error = "decimal overflow (more than 38 digits)"; return false; }
+
+// n / d rounded by `mode`. `over` says d is larger than any n here (a divisor past 10^38), so the quotient is 0
+// with all of n left over.
+I round_div_mode(I n, I d, RoundMode mode, bool over = false) {
+  const I q = over ? 0 : n / d;
+  const I r = over ? n : n % d;
+  if (r == 0) return q;
+  const I away = ((n < 0) != (d < 0)) ? -1 : 1;   // the direction away from zero
+  int half = -1;                                   // the remainder against half the divisor: below, at, above
+  if (!over) {
+    const I r2 = iabs(r), dd = iabs(d);
+    half = r2 > dd - r2 ? 1 : (r2 == dd - r2 ? 0 : -1);
+  }
+  switch (mode) {
+    case RoundMode::Down: return q;
+    case RoundMode::Up: return q + away;
+    case RoundMode::Floor: return away < 0 ? q - 1 : q;
+    case RoundMode::Ceil: return away > 0 ? q + 1 : q;
+    case RoundMode::HalfUp: return half >= 0 ? q + away : q;
+    case RoundMode::HalfDown: return half > 0 ? q + away : q;
+    case RoundMode::HalfEven: return half > 0 || (half == 0 && q % 2 != 0) ? q + away : q;
+  }
+  return q;
+}
+
+// A real as the decimal it prints as: its shortest digits (to_chars), so 2.675 is 2.675 and not the
+// 2.67499999999999982236431605997495353221893310546875 its bits hold. The scale may pass 38 for a tiny real (5e-324
+// is 5 at scale 324): the mantissa is at most 17 digits, and number_round divides such a scale away exactly.
+bool real_digits(double x, I& m, int& s, std::string& error) {
+  if (std::isnan(x) || std::isinf(x)) { error = "a real that is not a finite number"; return false; }
+  char buf[64];
+  auto r = std::to_chars(buf, buf + sizeof buf, x, std::chars_format::scientific);
+  const std::string t(buf, r.ptr);
+  const size_t e = t.find('e');
+  const int exp10 = std::atoi(t.c_str() + e + 1);
+  const bool neg = t[0] == '-';
+  I v = 0;
+  int ndigits = 0;
+  for (size_t i = neg ? 1 : 0; i < e; ++i) if (t[i] != '.') { v = v * 10 + (t[i] - '0'); ++ndigits; }
+  int scale = ndigits - 1 - exp10;   // value = v * 10^-scale
+  if (scale < 0) {
+    if (-scale > 38 || !mul_checked(v, pow10(-scale), v)) { error = "too large for a decimal (38 digits)"; return false; }
+    scale = 0;
+  }
+  m = neg ? -v : v;
+  s = scale;
+  return true;
+}
+
+// An int, decimal or real as an exact decimal.
+bool exact_of(const Value& v, Dec& d, std::string& error) {
+  if (get(v, d)) return true;
+  if (v.type == Type::Real) return real_digits(v.d, d.m, d.s, error);
+  error = std::string("wants a number, got a ") + type_name(v.type);
+  return false;
+}
 
 }  // namespace
 
@@ -239,6 +296,52 @@ bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
   return true;
 }
 
+// The one rounding there is: v (int, decimal or real - a real as the decimal it prints as) to `places` places by
+// `mode`, as a decimal with exactly that many places. places < 0 rounds to tens, hundreds, ... (scale 0).
+bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::string& error) {
+  if (places > kMaxScale) { error = "rounds to at most 30 places"; return false; }
+  if (places < -38) { error = "rounds to at most 38 places left of the point"; return false; }
+  Dec d;
+  if (!exact_of(v, d, error)) return false;
+  const int target = places < 0 ? 0 : places;
+  I m;
+  if (places >= d.s) {
+    if (!rescale(d.m, d.s, target, m)) return overflow(error);
+  } else {
+    const int drop = d.s - places;   // digits to take off, >= 1
+    // past 10^38 the divisor is larger than any mantissa: the quotient is 0, the remainder all of it, under half
+    const I q = drop > 38 ? round_div_mode(d.m, 1, mode, true) : round_div_mode(d.m, pow10(drop), mode);
+    m = q;
+    if (places < 0 && !mul_checked(q, pow10(-places), m)) return overflow(error);
+  }
+  out = make(m, target);
+  return true;
+}
+
+// An int, decimal or real as an exact decimal: a real as the decimal it prints as (rounded at 30 places past that).
+bool number_exact(const Value& v, Value& out, std::string& error) {
+  if (v.type == Type::Decimal) { out = v; return true; }
+  if (v.type == Type::Int) { out = make(v.i, 0); return true; }
+  Dec d;
+  if (!exact_of(v, d, error)) return false;
+  if (d.s <= kMaxScale) { out = make(d.m, d.s); return true; }
+  Value r;
+  if (!number_round(v, kMaxScale, RoundMode::HalfUp, r, error)) return false;
+  Dec rd;
+  get(r, rd);
+  while (rd.s > 0 && rd.m % 10 == 0) { rd.m /= 10; --rd.s; }
+  out = make(rd.m, rd.s);
+  return true;
+}
+
+bool round_mode_named(const std::string& name, RoundMode& mode) {
+  static const std::pair<const char*, RoundMode> names[] = {
+      {"half_up", RoundMode::HalfUp}, {"half_even", RoundMode::HalfEven}, {"half_down", RoundMode::HalfDown},
+      {"up", RoundMode::Up}, {"down", RoundMode::Down}, {"floor", RoundMode::Floor}, {"ceil", RoundMode::Ceil}};
+  for (const auto& [n, m] : names) if (name == n) { mode = m; return true; }
+  return false;
+}
+
 double Value::decimal_as_double() const { return decimal_to_double(*this); }
 int64_t Value::decimal_as_int() const {
   Dec d;
@@ -272,13 +375,8 @@ Value bi_decimal(Vm&, std::vector<Value>& args, std::string& error) {
   if (v.type == Type::Decimal || v.type == Type::Int) out = v.type == Type::Int ? decimal_from_int(v.i) : v;
   else if (v.type == Type::Str) { if (!decimal_parse(v.str(), out, error)) { error = "decimal(): " + error; return Value::nil(); } }
   else if (v.type == Type::Real) {
-    if (std::isnan(v.d) || std::isinf(v.d)) { error = "decimal(): a real that is not a finite number"; return Value::nil(); }
-    char buf[64];
-    for (int digits = 15; digits <= 17; ++digits) {
-      std::snprintf(buf, sizeof buf, "%.*g", digits, v.d);
-      if (std::strtod(buf, nullptr) == v.d) break;
-    }
-    if (!decimal_parse(buf, out, error)) { error = "decimal(): " + error; return Value::nil(); }
+    // the decimal it prints as (decimal(0.1e0) is 0.1); past 30 places, rounded there
+    if (!number_exact(v, out, error)) { error = "decimal(): " + error; return Value::nil(); }
   } else {
     error = std::string("decimal() cannot convert a ") + type_name(v.type);
     return Value::nil();
@@ -429,9 +527,7 @@ Value bi_number_format(Vm& vm, std::vector<Value>& args, std::string& error) {
     if (!d) return Value::nil();
     dv = *d;
   } else if (v.type == Type::Int || v.type == Type::Decimal || v.type == Type::Real) {
-    std::vector<Value> one{v};
-    dv = bi_decimal(vm, one, error);
-    if (!error.empty()) { error = "number_format(): " + error; return Value::nil(); }
+    dv = v;
   } else {
     error = std::string("number_format() cannot format a ") + type_name(v.type);
     return Value::nil();
@@ -448,14 +544,12 @@ Value bi_number_format(Vm& vm, std::vector<Value>& args, std::string& error) {
     error = "number_format(): the point and the separator are strings";
     return Value::nil();
   }
-  std::vector<Value> rs{dv, Value::integer(15)};
-  Value r = bi_round_sig(vm, rs, error);
-  if (!error.empty()) return Value::nil();
+  Value r;   // as round() rounds: half away from zero, a real as the decimal it prints as
+  if (!number_round(dv, (int)places, RoundMode::HalfUp, r, error)) { error = "number_format(): " + error; return Value::nil(); }
   Dec d;
   get(r, d);
-  I m;
-  if (!rescale(d.m, d.s, (int)places, m)) { overflow(error); error = "number_format(): " + error; return Value::nil(); }
-  const std::string text = decimal_text(make(m, (int)places));   // "-1234.50"
+  const I m = d.m;
+  const std::string text = decimal_text(r);   // "-1234.50"
   const bool neg = m != 0 && !text.empty() && text[0] == '-';
   const std::string body = text[0] == '-' ? text.substr(1) : text;
   const size_t dot = body.find('.');

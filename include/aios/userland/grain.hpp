@@ -815,6 +815,13 @@ bool decimal_parse(const std::string& text, Value& out, std::string& error);
 Value decimal_from_int(int64_t v);
 // Rounded half away from zero (PHP's round(), and money's) to `places` decimals, 0..30.
 bool decimal_round(const Value& d, int places, Value& out, std::string& error);
+// How a number rounds (round(), number_format, format's {:.Nf}): half_up is half away from zero.
+enum class RoundMode { HalfUp, HalfEven, HalfDown, Up, Down, Floor, Ceil };
+// The one rounding: an int, decimal or real (a real as the decimal it prints as) to `places` places (-38..30) by
+// `mode`, as a decimal with exactly max(places, 0) places (grain_std_decimal.cpp).
+bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::string& error);
+bool round_mode_named(const std::string& name, RoundMode& mode);
+bool number_exact(const Value& v, Value& out, std::string& error);   // int / decimal / real -> the exact decimal (a real as it prints)   // "half_up", "half_even", ... -> false if not one
 double decimal_to_double(const Value& d);
 bool decimal_to_int(const Value& d, int64_t& out);   // truncated toward zero; false if it does not fit
 inline bool is_decimal(const Value& v) { return v.type == Type::Decimal; }
