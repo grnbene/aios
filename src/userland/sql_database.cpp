@@ -24428,7 +24428,13 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   things_clock_ = aios::hal::Thread([this]() {
     std::unique_lock<aios::hal::Mutex> lk(things_clock_mu_);
     while (!things_clock_stop_) {
-      things_clock_cv_.wait_for_ms(lk, 1000);
+      // a settle that ran out of its slice (a big kind's full pass, a burst of reactions) left the rest: back for it
+      // in 20 ms, the locks let go in between, rather than in a second
+      lk.unlock();
+      const bool more = things_ && things_->work_left();
+      lk.lock();
+      if (things_clock_stop_) break;
+      things_clock_cv_.wait_for_ms(lk, more ? 20 : 1000);
       if (things_clock_stop_) break;
       lk.unlock();
       if (things_ && things_->due_now()) things_tick();
