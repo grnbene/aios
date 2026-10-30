@@ -563,7 +563,15 @@ struct Vm::State {
   std::unordered_map<std::string, Value> globals;
   uint64_t serial = next_serial();
   jit::Ctx jit_ctx{};
-  std::deque<std::vector<Value>> native_args;    // see call_value: one per native nesting depth (deque: growing it must not move the ones in use)
+  // A native call's arguments and error, one per nesting depth (a native may call back into grain, which calls
+  // natives): kept in a deque so growing it never moves the ones in use, reached through plain pointers so a
+  // call does not pay a deque's index arithmetic.
+  struct NativeCall {
+    std::vector<Value> args;
+    std::string err;
+  };
+  std::deque<NativeCall> native_calls;
+  std::vector<NativeCall*> native_pool;
   size_t native_depth = 0;
   std::vector<std::weak_ptr<Obj>> tracked_containers;
   size_t gc_prune_at = 4096;
@@ -1071,17 +1079,24 @@ bool Vm::invoke(const Value& callee, uint8_t argc, int line, int column) {
     // Argument vectors come from a per-depth pool instead of a fresh heap
     // allocation per native call; depth-indexed because a native (map,
     // filter, each...) can call back into grain, which calls natives.
-    if (S.native_depth >= S.native_args.size()) S.native_args.emplace_back();
-    std::vector<Value>& args = S.native_args[S.native_depth];
-    args.assign(std::make_move_iterator(S.stack.end() - argc), std::make_move_iterator(S.stack.end()));
-    std::string err;
+    if (S.native_depth == S.native_pool.size()) S.native_pool.push_back(&S.native_calls.emplace_back());
+    State::NativeCall& call = *S.native_pool[S.native_depth];
+    std::vector<Value>& args = call.args;
+    const size_t base = S.stack.size() - argc - 1;   // the callee's slot; the result goes there
+    args.assign(std::make_move_iterator(S.stack.begin() + (std::ptrdiff_t)base + 1), std::make_move_iterator(S.stack.end()));
     ++S.native_depth;
-    Value out = nat->fn(*this, args, err);
+    Value out = nat->fn(*this, args, call.err);
     --S.native_depth;
     args.clear();
-    S.stack.resize(S.stack.size() - argc - 1);
-    if (!err.empty()) { fail(line, err); return false; }
-    S.stack.push_back(std::move(out));
+    for (uint8_t k = 0; k < argc; ++k) S.stack.pop_back();   // moved from: nothing left to release
+    if (!call.err.empty()) {
+      std::string err = std::move(call.err);
+      call.err.clear();
+      S.stack.pop_back();
+      fail(line, err);
+      return false;
+    }
+    S.stack[base] = std::move(out);   // over the callee, which this releases
     return true;
   }
   if (callee.type == Type::Fn && callee.obj) {
