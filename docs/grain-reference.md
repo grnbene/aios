@@ -456,6 +456,18 @@ html_stringify(row)   // <tr><td class="who" data-v="ann"><b>Ann &amp; co</b><sm
 
 The command-line `grain` and `aios grain` also have a small server toolkit for text protocols: `listen(port, [loopback=true])`, `accept(listener, [timeout_ms=1000])`, `read_until(conn, marker, [limit], [timeout_ms])`, `read(conn, n, [timeout_ms])`, `write(conn, data)`, `peer(conn)`, `port(listener)`, `close(handle)`.
 
+### WebSockets
+Granted with HTTP (`install_http_builtins`): the command-line `grain`, `aios grain` and apps have them. `ws_upgrade` needs a socket from `tcp_accept`, so it is where sockets are.
+
+| Function | Signature | Description |
+|---|---|---|
+| `ws_connect` | `ws_connect(url, [{headers, protocols, timeout_ms}])` | Opens a `ws://` or `wss://` WebSocket (TLS verified like `http_get`). Returns a websocket. |
+| `ws_upgrade` | `ws_upgrade(sock, [{protocol, headers}])` | The server side: answers the WebSocket request on a socket `tcp_accept` gave and returns a websocket; an error (and a 400 to the client) when it is not one. |
+| `ws_send` | `ws_send(ws, data, [binary])` | Sends a text message, or binary when `binary` is true or `data` is `bytes`. At most 16 MB. |
+| `ws_recv` | `ws_recv(ws, [timeout_ms])` | The next message, `{type: "text" | "binary", data}`; `{type: "close", code, reason}` once the other end closes; `nil` when nothing came in time (default 5000). Pings are answered and fragments joined on the way. |
+| `ws_close` | `ws_close(ws, [code], [reason])` | Starts the closing handshake (code 1000 by default); `ws_recv` then gives the other end's close. |
+| `ws_info` | `ws_info(ws)` | `{path, headers}`: the request a server answered (headers lowercased), or the response headers a client got. |
+
 ### Raw UDP Sockets
 | Function | Signature | Description |
 |---|---|---|

@@ -433,6 +433,7 @@ MultipartResult parse_multipart_data(const std::string& body, const std::string&
 
 std::string grain_http_trust_root() { return trust_root(); }
 void install_events_builtins(Vm& vm);   // grain_std_events.cpp
+void install_ws_builtins(Vm& vm);       // grain_std_ws.cpp
 
 std::string http_trust_root() { return trust_root(); }
 
@@ -447,7 +448,8 @@ void install_http_builtins(Vm& vm) {
   vm.define_native("http_post", 2, 3, bi_http_post);
   vm.define_native("http_request", 1, 1, bi_http_request);
   vm.define_native("http_parse_multipart", 2, 2, bi_http_parse_multipart);
-  install_events_builtins(vm);   // server-sent events: the same capability, a stream instead of one answer
+  install_events_builtins(vm);
+  install_ws_builtins(vm);       // websockets: the same capability, both ways at once   // server-sent events: the same capability, a stream instead of one answer
 }
 
 }  // namespace aios::userland::grain
