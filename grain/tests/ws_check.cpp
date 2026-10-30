@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 
+#include "aios/hal/net.hpp"
 #include "aios/userland/grain.hpp"
 
 namespace g = aios::userland::grain;
@@ -82,6 +83,56 @@ int main() {
   check("text and binary echoed, 70 KB intact, close answered", cs == "text:hello,binary:0001ff,true,close:1000");
   check("the server got the path, a header, every message and the close",
         ss == "/feed?x=1|grain|text 5,binary 3,text 70000,close 1000");
+
+  // A route's own request as a websocket: the server lends its connection (offer_connection), the route takes it
+  // (ws_accept), the server withdraws it after the route.
+  {
+    auto lis = aios::hal::net_listen(0, true);
+    if (!lis.ok()) { std::printf("net_listen failed\n"); return 1; }
+    const std::string lp = std::to_string((*lis)->port());
+    g::Vm app, cl;
+    setup(app);
+    setup(cl);
+    std::string seen;
+    bool taken = false, after = false, untaken = true;
+    std::thread srv([&] {
+      auto c = (*lis)->accept(5000);
+      if (!c.ok()) return;
+      std::shared_ptr<aios::hal::Connection> conn(std::move(*c));
+      std::string head;   // the request head, as the server reads it
+      uint8_t ch;
+      while (head.find("\r\n\r\n") == std::string::npos && conn->recv_all(aios::MutableByteSpan(&ch, 1), 5000)) head.push_back((char)ch);
+      const size_t k = head.find("Sec-WebSocket-Key: ") + 19;
+      const std::string key = head.substr(k, head.find("\r\n", k) - k);
+      const std::string token = g::offer_connection(conn);
+      auto r = run(app,
+          "let req = {\"path\": \"/live\", \"headers\": {\"upgrade\": \"websocket\", \"sec-websocket-key\": \"" + key +
+          "\", \"x-grain-upgrade\": \"" + token + "\"}}\n"
+          "let ws = ws_accept(req)\n"
+          "let m = ws_recv(ws, 5000)\n"
+          "ws_send(ws, \"route got \" + m.data)\n"
+          "let bye = ws_recv(ws, 5000)\n"
+          "m.data + \"|\" + bye.type");
+      seen = r.ok ? r.value.to_text() : "error: " + r.error;
+      taken = g::withdraw_connection(token);
+      after = !run(app, "ws_send(ws, \"too late\")").ok;   // the route is over: its websocket fails
+      untaken = g::withdraw_connection(g::offer_connection(conn));
+    });
+    auto c = run(cl,
+        "let ws = ws_connect(\"ws://127.0.0.1:" + lp + "/live\")\n"
+        "ws_send(ws, \"ping\")\n"
+        "let a = ws_recv(ws, 5000)\n"
+        "ws_close(ws)\n"
+        "a.data");
+    srv.join();
+    std::printf("  route saw: %s\n  client saw: %s\n", seen.c_str(), c.ok ? c.value.to_text().c_str() : c.error.c_str());
+    check("a route answers its own request as a websocket", seen == "ping|close" && c.ok && c.value.to_text() == "route got ping");
+    check("the server learns the route took the connection", taken);
+    check("a websocket kept past its route fails", after);
+    check("an offer the route did not take stays the server's", !untaken);
+    auto bogus = run(cl, "ws_accept({\"headers\": {\"upgrade\": \"websocket\", \"sec-websocket-key\": \"x\", \"x-grain-upgrade\": \"forged\"}})");
+    check("a token the server did not offer is refused", !bogus.ok);
+  }
 
   g::Vm bad;
   setup(bad);

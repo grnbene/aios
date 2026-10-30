@@ -844,8 +844,18 @@ void answer(std::shared_ptr<hal::Connection> conn, std::shared_ptr<WebUi> ui, Ho
       req.tree = value.find("application/x-grain-ui") != std::string::npos;
       req.stream = value.find("text/event-stream") != std::string::npos;
     }
+    if (name == "x-grain-upgrade") continue;   // the server's own, below; never the client's
     req.headers.push_back({name, value});
   }
+  // A websocket upgrade: the connection is lent to the route (ws_accept) for as long as it runs.
+  std::string lent;
+  if (req.method == "GET")
+    for (const auto& h : req.headers)
+      if (h.first == "upgrade") {
+        std::string v = h.second;
+        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        if (v == "websocket") { lent = offer_connection(conn); req.headers.push_back({"x-grain-upgrade", lent}); }
+      }
   if (head->content_length > 0 || head->chunked) {
     net::RequestBodyReader body(reader, *head);
     while (!body.done()) {
@@ -898,6 +908,10 @@ void answer(std::shared_ptr<hal::Connection> conn, std::shared_ptr<WebUi> ui, Ho
   WebUi::Response res;
   if (req.path == "/favicon.ico") res.status = 204;
   else res = ui->handle(req, on_headers, on_chunk);
+  if (!lent.empty() && withdraw_connection(lent)) {   // the route made it a websocket and is done with it
+    conn->close();
+    return;
+  }
 
   if (headers_sent) {
     conn->close();

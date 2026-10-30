@@ -216,6 +216,29 @@ The writer object supports:
 
 A streamed response has no length, so the connection closes when the handler returns. If the handler fails after it has started writing, the client sees the stream end and the error is in the server's log; the status line cannot be taken back.
 
+### WebSockets
+
+A route can answer its own request as a WebSocket with `ws_accept(req)`, then talk both ways with `ws_send` /
+`ws_recv` (see the reference). The connection is the route's until the handler returns; then it is closed.
+
+```grain
+serve_routes({
+  "GET /live": fn (req) {
+    let ws = ws_accept(req)
+    while true {
+      let m = ws_recv(ws, 15000)               # nil when nothing came in 15 s
+      if m == nil { ws_send(ws, "still here"); continue }
+      if m.type == "close" { break }
+      ws_send(ws, "you said " + m.data)
+    }
+  }
+})
+```
+
+`ws_accept` refuses a request that is not a WebSocket upgrade, so one route can answer both. The app host (`grain
+host`, `aios serve`) lends routes their connection; a proxy in front (nginx) has to pass `Upgrade` and `Connection`
+through for it to reach the app.
+
 ### How requests run across workers
 
 Each incoming request runs in a worker VM on its own thread:

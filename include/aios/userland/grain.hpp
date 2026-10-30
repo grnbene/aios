@@ -36,6 +36,8 @@
 
 namespace aios::hal { class Host; }
 
+namespace aios::hal { class Connection; }
+
 namespace aios::userland::grain {
 
 // kv_* (grain_std_kv.cpp): a hosted app's key-value store, in memory and journaled at `journal_path`. One store per
@@ -714,6 +716,12 @@ void install_socket_builtins(Vm& vm);
 // verifies against <root>/ssl/ca-certificates.crt when present, else the
 // system's store; the root is process-wide and set once by the embedder.
 void install_http_builtins(Vm& vm);
+// An HTTP server lends a request's connection to its route for ws_accept (grain_std_ws.cpp): offer_connection
+// before the route runs (its token goes in the request's x-grain-upgrade header, which the server strips from
+// what the client sent), withdraw_connection after. Withdraw says whether the route took it: then the server writes
+// nothing more and closes it. A websocket kept past its route fails from then on rather than reach a closed socket.
+std::string offer_connection(std::shared_ptr<hal::Connection> conn);
+bool withdraw_connection(const std::string& token);
 // db_connect, db_query, db_close and live(): the MySQL/MariaDB/ASQL wire protocol, and query results that stay
 // current (grain_std_db.cpp). Like http, the network is a capability the embedder grants.
 void install_db_builtins(Vm& vm);
