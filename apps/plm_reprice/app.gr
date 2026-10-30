@@ -1,0 +1,25 @@
+// PLM reprice application manifest.
+// Reprices a tire when what its price is computed from changes, instead of every tire every few hours. The plm_input
+// Thing (things/plm_input.gr) notices; service.gr asks v8 to reprice those tires; v8's PHP does the pricing.
+// MODE "dry" logs only. The nightly auto.php plm_reprice cron stays as the fallback.
+let app = {
+  "name": "plm_reprice",
+  "description": "reprice tires when their PLM inputs change",
+  "main": "service.gr",
+  "kind": "worker",
+  "restart": "always",
+  "settings": {
+    "DB_HOST": "127.0.0.1",
+    "DB_PORT": "3307",
+    "DB_USER": "root",
+    "DB_NAME": "versioneight",
+    "MODE": "dry",
+    "BATCH_SECONDS": "30",
+    "V8_URL": "",
+    "LOG_FILE": ""
+  },
+  "secrets": ["DB_PASSWORD", "V8_TOKEN"],
+  "requires": ["db"],
+  "deployed": "deployed.gr",
+  "max_steps": 0
+}

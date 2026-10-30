@@ -1,0 +1,207 @@
+// plm_input - an ASQL Thing: what each active tire's PLM price is computed from, one row per tire.
+//
+// Key: stockid (stockmaster.categoryid = 'TIRE', discontinued = 0). Values are the inputs v8's
+// model_weberp_batchupload::reprice() reads, written as text so two equal inputs are equal strings:
+//   cost   lineid, materialcost, in stock (SUM(locstock.quantity) > 0), the newest receipt (type 25) price, a forced
+//          cost, the purchdata rows in preferred_sort order, and the remote warehouses holding stock (getItemCost,
+//          getNextCost)
+//   rules  the sales types (pricebook, fallback), the remote API suppliers' warehouses, and the line's prodlineprice
+//          rows (getPLMPriceInternal, getNextCost)
+//   book   the price rows reprice() reads: the one active today per level, every pricebook row, and a basis level's
+//          start row; level, debtorno, dates, and the price only where it is an input (pricebook, basis start)
+//   wake_at  the next day a price row starts or ends, so a window opening or closing re-reads `book`
+//
+// Nothing here computes a price: PHP stays the one pricing engine. The engine wakes WAIT THING plm_input only for
+// keys whose values changed, and apps/plm_reprice/service.gr reprices exactly those. `prices` is read for `book`,
+// but touched() ignores a price row whose only change is its price on a non-pricebook row, which is all reprice()
+// writes, so repricing never feeds back into this Thing.
+
+let DAY_SAFE = true   // the date matters only through `book`, and wake_at says when that changes
+
+let BIG_BATCH = 4000
+
+fn ck(s) {
+  if s == nil { return "" }
+  return upper_rtrim(s)
+}
+
+fn txt(v) { return v == nil ? "" : str(v) }
+
+// Wire-format rows as positional lists: every value the text MariaDB would send, so fingerprints do not drift
+fn rows(sql, params) {
+  let out = []
+  for r in read_raw_with(sql, params) { push(out, values(r)) }
+  return out
+}
+
+fn in_ids(col, ids) { return ids == nil ? "" : " AND " + col + " IN (?)" }
+fn with_ids(params, ids) {
+  if ids != nil { push(params, ids) }
+  return params
+}
+
+fn today() { return read_raw_with("SELECT CURDATE() AS d", nil)[0].d }
+
+fn enroll() {
+  let out = []
+  for r in read_with("SELECT stockid FROM stockmaster WHERE categoryid = 'TIRE'", nil) { push(out, r.stockid) }
+  return out
+}
+
+// Sales types and remote API suppliers' warehouses: every item's price depends on both
+fn shared() {
+  let st = []
+  for r in rows("SELECT typeabbrev, ispricebook, fallback FROM salestypes", nil) { push(st, ck(r[0]) + ":" + txt(r[1]) + ":" + ck(r[2])) }
+  let wh = {}
+  let sup = []
+  for r in rows("SELECT remoteapi.supplierno, remotemapping.warehouse FROM remoteapi INNER JOIN remotemapping ON remoteapi.api_id = remotemapping.api_id", nil) {
+    wh[ck(r[1])] = true
+    push(sup, ck(r[0]) + ">" + ck(r[1]))
+  }
+  return {"global": join(sort(st), ",") + "|" + join(sort(unique(sup)), ","), "remote_wh": wh}
+}
+
+fn things(ks, sh) {
+  let ids = len(ks) > BIG_BATCH ? nil : ks
+  let d = today()
+
+  let sm = rows("SELECT stockid, lineid, materialcost FROM stockmaster WHERE categoryid = 'TIRE' AND discontinued = 0" + in_ids("stockid", ids), with_ids([], ids))
+  let out = {}
+  if len(sm) == 0 { return out }
+
+  let lines = unique(map(sm, fn (r) { return txt(r[1]) }))
+  let plp = {}
+  for r in rows("SELECT line_field, typeabbrev, pricebasis, operator, amount FROM prodlineprice WHERE line_field IN (?)", [lines]) {
+    let k = ck(r[0])
+    if plp[k] == nil { plp[k] = [] }
+    push(plp[k], ck(r[1]) + ":" + txt(r[2]) + ":" + txt(r[3]) + ":" + txt(r[4]))
+  }
+
+  let qoh = {}
+  for r in rows("SELECT stockid, SUM(quantity) FROM locstock WHERE 1 = 1" + in_ids("stockid", ids) + " GROUP BY stockid", with_ids([], ids)) {
+    qoh[ck(r[0])] = to_number(txt(r[1]), 0) > 0
+  }
+
+  let last25 = {}
+  for r in rows("SELECT m.stockid, m.price FROM stockmoves m WHERE m.type = 25" + in_ids("m.stockid", ids) +
+                " AND m.stkmoveno = (SELECT MAX(x.stkmoveno) FROM stockmoves x WHERE x.type = 25 AND x.stockid = m.stockid)", with_ids([], ids)) {
+    last25[ck(r[0])] = txt(r[1])
+  }
+
+  let forced = {}
+  for r in rows("SELECT stockid, cost FROM forcedcostoverride WHERE 1 = 1" + in_ids("stockid", ids), with_ids([], ids)) { forced[ck(r[0])] = txt(r[1]) }
+
+  // purchdata in getNextCost's order: preferred_sort, then supplier so ties read the same every time
+  let pd = {}
+  for r in rows("SELECT stockid, supplierno, price, preferred_sort FROM purchdata WHERE 1 = 1" + in_ids("stockid", ids), with_ids([], ids)) {
+    let k = ck(r[0])
+    if pd[k] == nil { pd[k] = [] }
+    push(pd[k], r)
+  }
+
+  let remote = {}
+  for r in rows("SELECT stockid, loccode FROM remotestock WHERE qty > 0" + in_ids("stockid", ids), with_ids([], ids)) {
+    if not has(sh.remote_wh, ck(r[1])) { continue }
+    let k = ck(r[0])
+    if remote[k] == nil { remote[k] = [] }
+    push(remote[k], ck(r[1]))
+  }
+
+  // The price rows reprice() reads: the row active today per level (any debtorno: its dates are where it writes),
+  // every pricebook row (getPLMPriceInternal reads one with no date or debtorno test), and a basis level's row that
+  // getPLMPriceInternal takes as its start (debtorno '' and startdate >= today and enddate <= today). A price is an
+  // input only on the last two; on an active row it is reprice()'s own answer.
+  let book = {}
+  for r in rows("SELECT stockid, typeabbrev, debtorno, startdate, enddate, pricebook, price FROM prices WHERE ((startdate <= ? AND enddate >= ?) OR pricebook = 1 OR (debtorno = '' AND startdate >= ? AND enddate <= ?))" + in_ids("stockid", ids), with_ids([d, d, d, d], ids)) {
+    let k = ck(r[0])
+    if book[k] == nil { book[k] = [] }
+    let pb = txt(r[5]) == "1"
+    let basis = ck(r[2]) == "" and txt(r[3]) >= d and txt(r[4]) <= d
+    push(book[k], ck(r[1]) + ":" + ck(r[2]) + ":" + txt(r[3]) + ":" + txt(r[4]) + ":" + (pb ? "pb=" + txt(r[6]) : "") + (basis ? "b=" + txt(r[6]) : ""))
+  }
+
+  let wake = {}
+  let note = fn (k, day) {
+    if day == nil or txt(day) <= d { return nil }
+    if wake[k] == nil or txt(day) < wake[k] { wake[k] = txt(day) }
+    return nil
+  }
+  for r in rows("SELECT stockid, startdate, DATE_ADD(enddate, INTERVAL 1 DAY) FROM prices WHERE (startdate > ? OR (enddate >= ? AND enddate < '9999-01-01'))" + in_ids("stockid", ids), with_ids([d, d], ids)) {
+    note(ck(r[0]), r[1])
+    note(ck(r[0]), r[2])
+  }
+
+  for r in sm {
+    let k = ck(r[0])
+    let sup = map(sort_by(pd[k] ?? [], fn (p) { return [p[3] == nil ? -1000000 : int(to_number(txt(p[3]), 0)), ck(p[1])] }),
+                  fn (p) { return ck(p[1]) + ":" + txt(p[2]) + ":" + txt(p[3]) })
+    let cost = join([
+      "line=" + ck(r[1]), "mc=" + txt(r[2]), "stock=" + ((qoh[k] ?? false) ? "1" : "0"), "rcv=" + (last25[k] ?? ""),
+      "forced=" + (forced[k] ?? ""), "pd=" + join(sup, ","), "remote=" + join(sort(remote[k] ?? []), ",")
+    ], ";")
+    let vals = {
+      "cost": cost,
+      "rules": sh.global + "|" + join(sort(plp[ck(r[1])] ?? []), ","),
+      "book": join(sort(book[k] ?? []), ",")
+    }
+    if wake[k] != nil { vals["wake_at"] = wake[k] + " 00:00:00" }
+    out[r[0]] = vals
+  }
+  return out
+}
+
+// ---- What a change means ------------------------------------------------------------------------------------------
+
+let CANON = {}
+fn canon(v) {
+  if v == nil { return nil }
+  let s = str(v)
+  if has(CANON, s) { return CANON[s] }
+  let r = read_with("SELECT stockid FROM stockmaster WHERE stockid = ?", [s])
+  let c = len(r) > 0 ? r[0].stockid : nil
+  CANON[s] = c
+  return c
+}
+
+// True when an insert or delete, or when any of these columns moved
+fn moved(before, after, cols) {
+  if before == nil or after == nil { return true }
+  for c in cols { if txt(before[c]) != txt(after[c]) { return true } }
+  return false
+}
+
+fn items_of(rows_of, col) { return unique(compact(map(rows_of, fn (r) { return canon(r[col]) }))) }
+
+// A remote stock row counts only as "this supplier warehouse has some": the feeds rewrite qty and cost all day
+fn remote_has(r, sh) { return r != nil and has(sh.remote_wh, ck(r.loccode)) and to_number(txt(r.qty), 0) > 0 }
+
+fn touched(table, op, before, after, sh) {
+  let t = lower(table)
+  let rows_of = compact([before, after])
+  if t == "salestypes" { return "all" }
+  if t == "remoteapi" or t == "remotemapping" { return {"shared": true} }
+  if t == "stockmaster" { return moved(before, after, ["stockid", "lineid", "materialcost", "categoryid", "discontinued"]) ? items_of(rows_of, "stockid") : [] }
+  if t == "locstock" { return moved(before, after, ["stockid", "quantity"]) ? items_of(rows_of, "stockid") : [] }
+  if t == "stockmoves" {
+    if not moved(before, after, ["stockid", "type", "price"]) { return [] }
+    return items_of(filter(rows_of, fn (r) { return txt(r.type) == "25" }), "stockid")
+  }
+  if t == "purchdata" { return moved(before, after, ["stockid", "supplierno", "price", "preferred_sort"]) ? items_of(rows_of, "stockid") : [] }
+  if t == "remotestock" {
+    if before != nil and after != nil and ck(before.stockid) == ck(after.stockid) and remote_has(before, sh) == remote_has(after, sh) { return [] }
+    return items_of(filter(rows_of, fn (r) { return has(sh.remote_wh, ck(r.loccode)) }), "stockid")
+  }
+  if t == "forcedcostoverride" { return items_of(rows_of, "stockid") }
+  if t == "prices" {
+    // reprice() rewrites price and priceupdated only; that is the answer, not an input. A price is an input on a
+    // pricebook row, and on a row a basis level may start from (startdate >= enddate: see things())
+    let price_in = len(filter(rows_of, fn (r) { return txt(r.pricebook) == "1" or txt(r.startdate) >= txt(r.enddate) })) > 0
+    if not moved(before, after, ["stockid", "typeabbrev", "debtorno", "startdate", "enddate", "pricebook"]) and not (price_in and moved(before, after, ["price"])) { return [] }
+    return items_of(rows_of, "stockid")
+  }
+  if t == "prodlineprice" {
+    let lines = unique(map(rows_of, fn (r) { return txt(r.line_field) }))
+    return map(read_with("SELECT stockid FROM stockmaster WHERE categoryid = 'TIRE' AND lineid IN (?)", [lines]), fn (r) { return r.stockid })
+  }
+  return nil
+}
