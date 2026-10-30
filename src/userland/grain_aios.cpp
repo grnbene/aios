@@ -757,6 +757,9 @@ void install_aios_builtins(Vm& vm) {
   vm.define_native("sidecar_cap_mint", 4, 4, bi_sidecar_cap_mint);
   vm.define_native("sidecar_cap_attenuate", 2, 2, bi_sidecar_cap_attenuate);
   vm.define_native("sidecar_patch_check", 1, 1, bi_sidecar_patch_check);
+}
+
+void install_aios_db_builtins(Vm& vm) {
   vm.define_native("db_connect", 1, 5, bi_db_connect);
   vm.define_native("db_query", 2, 4, bi_db_query);
   vm.define_native("db_select_db", 2, 2, bi_db_select_db);
@@ -775,6 +778,7 @@ void install_aios_builtins(Vm& vm) {
 void install_builtins(Vm& vm) {
   install_core_builtins(vm);
   install_aios_builtins(vm);
+  install_aios_db_builtins(vm);
 }
 
 }  // namespace aios::userland::grain

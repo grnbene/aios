@@ -586,6 +586,10 @@ class Vm {
   // process_run may start other programs (grain_std_process.cpp). False unless the host says: a command-line
   // script's host does; an app host only for apps its operator named (AIOS_APP_PROCESS_RUN); web pages never.
   bool allow_process = false;
+  // getenv/env/secret may read the process's environment, and setenv change it (grain_builtins.cpp). False unless
+  // the host says: a command-line script's host does; an app, a web page, a Thing or the sidecar never - on the fleet
+  // the app host's environment holds the fleet keys. Without it a VM reads its settings, and setenv writes there.
+  bool allow_env = false;
   // spawn()'s tasks this VM started and has not awaited; dropping it (with the VM) waits for them,
   // so no task is still running grain when the program that started it is gone.
   std::shared_ptr<void> tasks;
@@ -671,11 +675,14 @@ void install_parallel_builtins(Vm& vm);
 void install_decimal_builtins(Vm& vm);   // decimal(), dec_div(), scale() (grain_std_decimal.cpp)
 
 // The bridges that make this a language ON aios rather than beside it: the
-// sidecar's C ABI, the SAT solver, the MariaDB wire client and ASQL
+// sidecar's C ABI and the SAT solver - nothing that reaches the network
 // (grain_aios.cpp).
 void install_aios_builtins(Vm& vm);
+// aios's MariaDB wire client and ASQL (db_connect, db_query, asql_query, ...):
+// the network, so the sidecar's sandboxed aios_grain_run does not get them.
+void install_aios_db_builtins(Vm& vm);
 
-// Both: what every VM inside aios gets.
+// All three: what every VM inside aios gets.
 void install_builtins(Vm& vm);
 
 // udp_* / tcp_* over hal::net (grain_sockets.cpp). Separate from

@@ -775,7 +775,8 @@ int aios_grain_run(const char* source_code, uint64_t step_limit,
     return AIOS_ERR_EXECUTION;
   }
   grain::Vm vm;
-  grain::install_builtins(vm);
+  grain::install_core_builtins(vm);   // sandboxed: no network (no db_*/asql_*), no files, no process environment
+  grain::install_aios_builtins(vm);
   std::vector<std::string> output;
   vm.sink = &output;
   vm.step_limit = step_limit;
