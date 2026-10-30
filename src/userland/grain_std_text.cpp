@@ -94,8 +94,13 @@ bool render(const Value& v, const Spec& sp, std::string& out, std::string& error
       // As round() rounds (number_round, half away from zero) - an int and a decimal exactly, a real as the decimal
       // it prints as - so {:.2f} of 2.675 is 2.68 like round(2.675, 2), never the 2.67 of its binary expansion.
       // {:%} is the number times 100, exactly.
-      Value x;
-      if (!number_exact(v, x, error)) { error = "format(): " + error; return false; }
+      Value x = v;   // a real goes to number_round as it is (it rounds a real from its 15 significant digits)
+      if (v.type != Type::Real && !number_exact(v, x, error)) { error = "format(): " + error; return false; }
+      if (t == '%' && v.type == Type::Real) {   // times 100 from the real's 15 significant digits, then exactly
+        Value r15;
+        if (!number_round(v, 30, RoundMode::HalfUp, r15, error)) { error = "format(): " + error; return false; }
+        x = r15;
+      }
       if (t == '%') {
         Value hundred;
         if (!decimal_arith('*', x, Value::integer(100), hundred, error)) { error = "format(): " + error; return false; }

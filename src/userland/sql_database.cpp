@@ -3151,6 +3151,52 @@ bool exact_arith_display(ExprOp op, const Val& l, const Val& r, Val* out) {
 // rounds in decimal, half away from zero, to min(its scale, d) places. An
 // approximate x goes through MariaDB's my_double_round: rint() of x * 10^d,
 // which rounds a binary tie to even -- ROUND(10.75e0 * 0.3e0, 2) is 3.22.
+// ROUND of a DOUBLE, as PHP and grain round it - not as MariaDB does. MariaDB scales by 10^d and calls rint: the binary
+// value, half to even, so ROUND(1.625e0, 2) is 1.62 and ROUND(1.55e0 * 0.3, 2) (0.46499999999999997) is 0.46, where the
+// invoice that PHP wrote says 1.63 and 0.47 (aa: 26 of 9245 invoices a cent off through a view of such ROUNDs; the rule
+// below, 0 of 9245). Here: the double's shortest digits, rounded to 15 significant digits - what absorbs the binary
+// noise a product or sum leaves - then to d places half away from zero, exactly. A rounded zero has no sign. False
+// for what this does not cover (not finite; past 38 digits), which the binary path then rounds.
+bool round_double_as_written(double value, long long d, Val* out) {
+  if (!std::isfinite(value) || d > 30 || d < -38) return false;
+  char buf[64];
+  const auto tc = std::to_chars(buf, buf + sizeof buf, value, std::chars_format::scientific);
+  const std::string t(buf, tc.ptr);
+  const size_t e = t.find('e');
+  const int exp10 = std::atoi(t.c_str() + e + 1);
+  AIOS_INT128 m = 0;
+  int ndig = 0;
+  for (size_t i = t[0] == '-' ? 1 : 0; i < e; ++i)
+    if (t[i] != '.') { m = m * 10 + (t[i] - '0'); ++ndig; }
+  if (t[0] == '-') m = -m;
+  int sc = ndig - 1 - exp10;   // value = m * 10^-sc
+  if (ndig > 15) { m = scale_down_half_up(m, ndig - 15); sc -= ndig - 15; }   // 15 significant digits
+  if (sc < 0) {   // a whole number past its digits (1e20): as an integer, if it fits
+    if (!scale_up_exact(&m, -sc)) return false;
+    sc = 0;
+  }
+  const int target = d > 0 ? (int)d : 0;
+  AIOS_INT128 q = m;
+  if (d >= sc) {
+    if (!scale_up_exact(&q, target - sc)) return false;
+  } else {
+    const int drop = sc - (int)d;   // >= 1; past 38 the divisor exceeds any 15-digit mantissa: under half, 0
+    q = drop > 38 ? 0 : scale_down_half_up(m, drop);
+    if (d < 0 && !scale_up_exact(&q, (int)-d)) return false;
+  }
+  const std::string text = scaled_to_decimal(q, target);   // no "-0.00": a rounded zero has no sign
+  double dv = 0;
+  parse_number(text, &dv);
+  if (d > 0) {
+    Val r = val_num_with_text(dv, text);
+    r.approx = true;
+    *out = r;
+  } else {
+    *out = val_approx(dv);
+  }
+  return true;
+}
+
 Val round_value(const Val& x, long long d, bool truncate) {
   if (x.null) return val_null();
   AIOS_INT128 v = 0;
@@ -3182,6 +3228,10 @@ Val round_value(const Val& x, long long d, bool truncate) {
     return val_exact(q, 0);
   }
   const double value = x.numeric ? x.num : numeric_prefix_of(x.str());
+  if (!truncate) {
+    Val r;
+    if (round_double_as_written(value, d, &r)) return r;
+  }
   const bool neg = d < 0;
   const unsigned long long ad = neg ? (unsigned long long)(-d) : (unsigned long long)d;
   const double tmp = std::pow(10.0, (double)ad);
@@ -9643,6 +9693,10 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
         int sc = 0, dsc = 0;
         if (exact_internal_of(in, &v, &sc, &dsc) && sc > dsc) digits = scaled_to_decimal(v, sc);
       }
+      if (in.numeric && in.approx && places >= 0 && places <= 30) {   // a DOUBLE: as ROUND rounds it (as written)
+        Val r;
+        if (round_double_as_written(in.num, places, &r)) digits = r.str();
+      }
       double probe = 0;
       double tnum = 0;
       if (!in.numeric && in.temporal && temporal_number(digits, &tnum)) {
@@ -9690,9 +9744,11 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       long long v = 0;
       double tnum = 0;
       if (a_ptr[0].numeric) {
-        // a DOUBLE rounds by rint (2.5e0 is 2), an exact number half away from zero (2.5 is 3)
+        // a DOUBLE as ROUND rounds it (as written, half away from zero: 2.5e0 is 3, as 2.5 is; MariaDB's rint says 2)
         const double x = val_as_number(a_ptr[0]);
-        v = a_ptr[0].approx ? (long long)std::nearbyint(x) : (long long)std::llround(x);
+        Val r;
+        v = a_ptr[0].approx && round_double_as_written(x, 0, &r) ? (long long)std::llround(r.num)
+          : a_ptr[0].approx ? (long long)std::nearbyint(x) : (long long)std::llround(x);
       } else if (a_ptr[0].temporal && temporal_number(a_ptr[0].str(), &tnum)) {
         v = (long long)tnum;   // a DATE as YYYYMMDD, a DATETIME as YYYYMMDDHHMMSS
       } else {
@@ -10599,7 +10655,36 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   if (up == "FORMAT"sv) {
     if (arg_count == 0 || a_ptr[0].null) return val_null();
     int places = (arg_count > 1 && !a_ptr[1].null) ? (int)val_as_number(a_ptr[1]) : 0;
-    std::string out = format_grouped(val_as_number(a_ptr[0]), places);
+    places = std::clamp(places, 0, 30);
+    // Rounded as ROUND rounds - a DECIMAL exactly (FORMAT(1.0050, 2) is 1.01, a 20-digit DECIMAL keeps its digits), a
+    // DOUBLE as written (round_double_as_written) - then grouped. The double path stays for a text that is no number.
+    std::string out;
+    {
+      Val r = round_value(a_ptr[0], places, false);
+      std::string txt = r.null ? std::string() : r.str();
+      const bool number_text = !txt.empty() && txt.find_first_not_of("-0123456789.") == std::string::npos;
+      AIOS_INT128 xv = 0;
+      int xs = 0, xd = 0;
+      if (number_text && (a_ptr[0].numeric || exact_internal_of(a_ptr[0], &xv, &xs, &xd))) {
+        const bool neg = txt[0] == '-';
+        if (neg) txt.erase(txt.begin());
+        size_t dot = txt.find('.');
+        std::string ip = dot == std::string::npos ? txt : txt.substr(0, dot);
+        std::string fp = dot == std::string::npos ? std::string() : txt.substr(dot + 1);
+        if ((int)fp.size() < places) fp.append((size_t)places - fp.size(), '0');
+        std::string grouped;
+        int cnt = 0;
+        for (size_t i = ip.size(); i > 0; --i) {
+          grouped += ip[i - 1];
+          if (++cnt % 3 == 0 && i > 1) grouped += ',';
+        }
+        std::reverse(grouped.begin(), grouped.end());
+        const bool zero = txt.find_first_not_of("0.") == std::string::npos;
+        out = (neg && !zero ? "-" : "") + grouped + (places > 0 ? "." + fp.substr(0, (size_t)places) : "");
+      } else {
+        out = format_grouped(val_as_number(a_ptr[0]), places);
+      }
+    }
     if (arg_count > 2 && !a_ptr[2].null) {
       // The locale's separators (MariaDB's lc_messages table): de 1.234.567,89; fr 1 234 567,89; de_CH 1'234'567.89.
       const std::string loc = lower_of(a_ptr[2].str().substr(0, 5));
@@ -10676,8 +10761,10 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
     return val_num(std::atan2(val_as_number(a_ptr[0]), val_as_number(a_ptr[1])));
   }
-  if (up == "MOD"sv) {
+  if (up == "MOD"sv) {   // MOD(a, b) is a % b: exact for exact operands (MOD(2.6750, 2) is 0.6750, not 0.674999...)
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
+    Val exact;
+    if (exact_arith(ExprOp::Mod, a_ptr[0], a_ptr[1], &exact)) return exact;
     double divisor = val_as_number(a_ptr[1]);
     if (divisor == 0) return val_null();
     return val_num(std::fmod(val_as_number(a_ptr[0]), divisor));

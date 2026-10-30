@@ -339,6 +339,20 @@ $ aios-asql-top --no-conf -P 13410 -u x -1
 
 ---
 
+## Rounding: where ASQL answers differently from MariaDB, on purpose
+
+ASQL answers as MariaDB does, with one deliberate exception: rounding a DOUBLE. MariaDB's `ROUND` of a DOUBLE rounds the
+binary value half to even (`ROUND(1.625e0, 2)` is 1.62; `ROUND(1.55e0 * 0.3e0, 2)`, whose product is
+0.46499999999999997, is 0.46), so a report built from `ROUND`s over DOUBLE columns misses by a cent against the ERP's
+own PHP. ASQL rounds a DOUBLE as PHP and grain do: from its value to 15 significant digits, then half away from zero
+(1.63, 0.47), and a rounded zero has no sign. The same in `FORMAT`, `CAST(x AS DECIMAL(p,s))` and `CAST(x AS SIGNED)`.
+
+Measured on aa: through a view of `ROUND(ROUND(price,2) * ROUND(discountpercent,4),2)`-style columns over DOUBLE
+prices, 26 of 9,245 invoices (21 days) were a cent or more off the totals the ERP stored, and none with this rule;
+on 762,816 price x discount x quantity lines, MariaDB's rounding disagrees with PHP on 10,274 and ASQL's on none.
+DECIMALs round exactly, half away from zero, as in MariaDB; `MOD` and `FORMAT` of a DECIMAL are exact.
+`tools/asql-round-check.cpp` (ctest `asql.round.check`) holds the cases.
+
 ## Connecting and querying from Grain
 
 Grain programs interact with ASQL through three distinct access mechanisms, depending on whether code runs in-process inside the kernel, connects over the network via wire protocol, or executes ad-hoc loopback queries:

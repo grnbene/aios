@@ -503,7 +503,7 @@ bool decimal_round(const Value& v, int places, Value& out, std::string& error) {
   return true;
 }
 
-// The one rounding there is: v (int, decimal or real - a real as the decimal it prints as) to `places` places by
+// The one rounding there is: v (int, decimal or real - a real from its 15 significant digits) to `places` places by
 // `mode`, as a decimal with exactly that many places. places < 0 rounds to tens, hundreds, ... (scale 0).
 bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::string& error) {
   if (places > kMaxScale) { error = "rounds to at most 30 places"; return false; }
@@ -525,6 +525,18 @@ bool number_round(const Value& v, int places, RoundMode mode, Value& out, std::s
   }
   Dec d;
   if (!exact_of(v, d, error)) return false;
+  // A real computed by arithmetic carries binary noise past its 15th digit: 1.55e0 * 0.3e0 is 0.46499999999999997,
+  // which its shortest digits would round to 0.46 where the sum done by hand, PHP and the ERP's invoices say 0.47.
+  // So a real rounds from its value to 15 significant digits (half away from zero), then to the places.
+  if (v.type == Type::Real) {
+    int n = 0;
+    for (I a = iabs(d.m); a > 0; a /= 10) ++n;
+    if (n > 15) {
+      d.m = round_div_mode(d.m, pow10(n - 15), RoundMode::HalfUp);
+      d.s -= n - 15;
+      if (d.s < 0) { I up; if (!mul_checked(d.m, pow10(-d.s), up)) return overflow(error); d.m = up; d.s = 0; }
+    }
+  }
   const int target = places < 0 ? 0 : places;
   I m;
   if (places >= d.s) {
@@ -838,7 +850,7 @@ Value bi_number_format(Vm& vm, std::vector<Value>& args, std::string& error) {
     error = "number_format(): the point and the separator are strings";
     return Value::nil();
   }
-  Value r;   // as round() rounds: half away from zero, a real as the decimal it prints as
+  Value r;   // as round() rounds: half away from zero, a real from its 15 significant digits
   if (!number_round(dv, (int)places, RoundMode::HalfUp, r, error)) { error = "number_format(): " + error; return Value::nil(); }
   Dec d;
   get(r, d);
