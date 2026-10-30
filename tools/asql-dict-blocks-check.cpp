@@ -14,6 +14,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -69,8 +70,9 @@ static void reblocking_rounds() {
 
 int main() {
   reblocking_rounds();
+  const CheckRoot check_root("/tmp/aios-asql-dict-blocks-test");   // this run's own (see check-root.hpp)
   KernelConfig cfg;
-  cfg.root = "/tmp/aios-asql-dict-blocks-test";
+  cfg.root = check_root.path;
   auto k = Kernel::boot(cfg);
   if (!k.ok()) { std::printf("kernel boot failed\n"); return 1; }
   std::mt19937_64 rng(7);

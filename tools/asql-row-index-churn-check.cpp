@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"

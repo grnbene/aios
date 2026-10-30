@@ -10,6 +10,9 @@
 // the same tables, filters and joins, split by the hour of each source's own time (as its hour_wanted filter is).
 
 let DAY_SAFE = true   // an hour's answer depends on that hour's rows only, never on the clock
+// What shared() holds (the drivers' names) moves only the hours of the runs those drivers are named on, and touched()
+// names them: a user renamed is no reason to read every hour again.
+let SHARED_KEYS = true
 
 // the line deliveries cleared from their run are counted on (section 7): no driver is known for them
 let CLEARED = "CLEARED"
@@ -515,6 +518,18 @@ fn delivery_hours(orderno) {
   if len(so) == 0 or str(so[0].shipvia) != "1" { return [] }
   return map(read_raw("SELECT DISTINCT trandate, inputdate FROM debtortrans WHERE type = 10 AND order_ = ?", orderno), fn(r) { return invoice_hour(r.trandate, r.inputdate) })
 }
+// The hours of the runs a user (by the real name a dispatch names its driver with, as shared() maps it) drove on: what
+// a change to that user's name or id moves.
+fn driver_hours(users) {
+  let names = []
+  for u in users { if not is_blank(u.realname) { push(names, lower(trim(str(u.realname)))) } }
+  if len(names) == 0 { return [] }
+  let ds = []
+  for r in read_raw("SELECT DISTINCT dispnumber, truckid FROM dispatch WHERE LOWER(TRIM(driveruserid)) IN (?)", unique(names)) {
+    for d in run_days(r.dispnumber, r.truckid) { push(ds, d) }
+  }
+  return ds
+}
 fn order_run_days(orderno) {
   let ds = []
   for r in read_raw("SELECT DISTINCT dispnumber, truckid FROM dispatch WHERE invoice = ?", orderno) {
@@ -528,7 +543,7 @@ fn touched(table, op, before, after, sh) {
   let rows = compact([before, after])
   if t == "www_users" {
     if before != nil and after != nil and before.realname == after.realname and before.userid == after.userid { return nil }
-    return {"keys": [], "shared": true}
+    return {"keys": unique(compact(driver_hours(rows))), "shared": true}
   }
   if t == "product_types" { return "all" }
   if t == "stockmaster" {

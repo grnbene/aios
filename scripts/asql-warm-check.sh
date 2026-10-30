@@ -9,7 +9,12 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=$(realpath "${1:-$here/build/aios}")
 work=$(mktemp -d /tmp/asql-warm-check.XXXXXX)
-port=$((20000 + RANDOM % 20000))
+# Two ports the system has free (the wire's and the compute service's), not a random pair: runs side by side - two
+# sessions, ctest -j - drew the same one now and then, and one engine answered the other's queries or never started.
+read -r port cport < <(python3 -c 'import socket
+a, b = socket.socket(), socket.socket()
+a.bind(("127.0.0.1", 0)); b.bind(("127.0.0.1", 0))
+print(a.getsockname()[1], b.getsockname()[1])')
 pid=""
 cleanup() { [ -n "$pid" ] && kill "$pid" 2>/dev/null; wait 2>/dev/null; [ "${fail:-0}" = 0 ] || tail -5 "$work/engine.log" 2>/dev/null; rm -rf "$work"; }
 trap cleanup EXIT
@@ -20,7 +25,7 @@ printf '[client]\nuser=erp\npassword=%s\nhost=127.0.0.1\nport=%s\n' "$(cat "$wor
 q() { mysql --defaults-extra-file="$work/my.cnf" -N -e "$1"; }
 start() {   # start [env...]
   (cd "$work" && exec env AIOS_NO_ACCEL=1 AIOS_CHECKPOINT_SECS=3 "$@" "$bin" --root "$work/root" exec \
-     "compute serve port=$((port + 1)) lanes=4 sql=1 mysql_port=$port mysql_bind=127.0.0.1 mysql_user=erp mysql_pass_file=$work/pw" \
+     "compute serve port=$cport lanes=4 sql=1 mysql_port=$port mysql_bind=127.0.0.1 mysql_user=erp mysql_pass_file=$work/pw" \
      > "$work/engine.log" 2>&1) &
   pid=$!
 }

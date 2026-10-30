@@ -11,6 +11,7 @@
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -40,8 +41,9 @@ static bool rows_match(const SqlTable& t, size_t c, const std::vector<std::strin
 }
 
 int main() {
+  const CheckRoot check_root("/tmp/aios-asql-dict-width-test");   // this run's own (see check-root.hpp)
   KernelConfig cfg;
-  cfg.root = "/tmp/aios-asql-dict-width-test";
+  cfg.root = check_root.path;
   auto k = Kernel::boot(cfg);
   if (!k.ok()) { std::printf("kernel boot failed\n"); return 1; }
   SqlDatabase db(**k);

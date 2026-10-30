@@ -42,6 +42,12 @@ namespace aios::userland {
 
 namespace {
 
+const char* const kNullKey = "\x01NULL";
+
+std::string lower(std::string s) {
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
 // How many history entries a Thing keeps in memory (and in its file): the last two by default - enough for "what
 // changed it and why" - since every entry is a before/after copy of the Thing's values, and 32 of them for 59,504
 // Things were 60 of atl's 98 MB of Thing files (and as much RSS). AIOS_THINGS_HISTORY=<n> keeps more (1..100000);
@@ -55,24 +61,6 @@ size_t history_keep() {
   return v;
 }
 constexpr size_t kPartitionChunk = 1000;
-// How long one kind's settle may hold the engine's lock (and the statement lock with it) before it lets go and leaves
-// the rest for the next settle: a grain kind's full pass and its reactions run in slices of about this much. One big
-// kind's pass (10,938 hours of warehouse touches, minutes of work) used to hold every reader - another kind's screen,
-// any statement on the mirror - for its whole length. AIOS_THING_SLICE_MS overrides it.
-int settle_slice_ms() {
-  static const int ms = [] {
-    const char* e = std::getenv("AIOS_THING_SLICE_MS");
-    const int v = e ? std::atoi(e) : 100;
-    return v > 0 ? v : 100;
-  }();
-  return ms;
-}
-const char* const kNullKey = "\x01NULL";
-
-std::string lower(std::string s) {
-  for (char& c : s) c = (char)std::tolower((unsigned char)c);
-  return s;
-}
 std::string upper(std::string s) {
   for (char& c : s) c = (char)std::toupper((unsigned char)c);
   return s;
@@ -404,6 +392,9 @@ struct ThingGrain {
   bool shared_fresh = false;   // shared was just recomputed: a full pass may take it as is
   bool has_touched = false;
   bool day_safe = false;   // the program says when its Things next change with the date (wake_at): the day turning is no reason to read them all again
+  // SHARED_KEYS = true: touched() names every key a change to shared() moves (along with "shared": true), so a new
+  // shared() is taken as it is and those keys read again - no full pass for it.
+  bool shared_keys = false;
   std::vector<std::string> printed;
   struct Notice {
     std::string table, op;
@@ -811,6 +802,23 @@ void set_things_fleet(ThingFleetFn fn) { fleet_fn() = std::move(fn); }
 
 ThingEngine::ThingEngine(SqlDatabase& db) : db_(db) {}
 
+// The grain kinds' workers end with the engine: told to stop, woken, joined. A chunk under way finishes first (its
+// reads take the statement lock as any client's do).
+ThingEngine::~ThingEngine() {
+  std::vector<aios::hal::Thread> ts;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu_);
+    stopping_ = true;
+    for (auto& w : workers_) ts.push_back(std::move(w.second));
+    workers_.clear();
+    for (auto& t : done_workers_) ts.push_back(std::move(t));
+    done_workers_.clear();
+  }
+  worker_cv_.notify_all();
+  for (auto& t : ts)
+    if (t.joinable()) t.join();
+}
+
 std::string ThingEngine::machine_id() const { return db_.kernel_.self().short_str(); }
 
 namespace {
@@ -845,7 +853,8 @@ bool ThingEngine::has_pending() const {
     if (kv.second.pending_full || !kv.second.pending.empty() || !kv.second.pending_res.empty() ||
         !kv.second.pending_part_keys.empty() || !kv.second.pending_part_full.empty() ||
         !kv.second.dirty_queues.empty() || kv.second.pending_shared ||
-        (kv.second.grain && !kv.second.grain->notices.empty()) || (!kv.second.paused && !kv.second.sweep.empty()))
+        (kv.second.grain && !kv.second.grain->notices.empty()) || (!kv.second.paused && !kv.second.sweep.empty()) ||
+        kv.second.running)
       return true;
   return false;
 }
@@ -854,7 +863,9 @@ bool ThingEngine::work_left() const {
   std::lock_guard<aios::hal::Mutex> lk(mu_);
   for (const auto& kv : kinds_) {
     const Kind& k = kv.second;
-    if (k.paused || k.type != Kind::Grain) continue;
+    if (k.type != Kind::Grain) continue;
+    if (k.running) return true;   // its worker is at it: the INTO writes its results call for follow at once
+    if (k.paused) continue;
     if (!k.sweep.empty() || !k.pending.empty() || k.pending_full || (k.grain && !k.grain->notices.empty())) return true;
   }
   return false;
@@ -4315,7 +4326,7 @@ SqlQueryResult ThingEngine::execute_local(const std::string& sql) {
       into_drops_.push_back({dit->second.into_db, dit->second.into_table});
       keep_table(dit->second.into_db, dit->second.into_table, "");
     }
-    kinds_.erase(dit);
+    erase_kind(dit);
     rebuild_watched();
     // Nothing is left to be alarmed about.
     for (const auto& al : std::map<std::string, std::pair<std::string, std::string>>(alert_last_)) {
@@ -5568,6 +5579,11 @@ std::string ThingEngine::serialize(const Kind& k) const {
   o += "version\t" + std::to_string(k.version) + "\n";
   o += "reactions\t" + std::to_string(k.reactions) + "\n";
   o += "full\t" + std::to_string(k.full_recomputes) + "\n";
+  if (k.last_full_ms > 0) {   // how long the last full pass took, shown by SHOW THINGS across a restart
+    char ms[32];
+    std::snprintf(ms, sizeof ms, "%.0f", k.last_full_ms);
+    o += "fullms\t" + std::string(ms) + "\n";
+  }
   o += "day\t" + esc(k.day) + "\n";
   if (k.paused) o += "paused\t1\n";
   for (const auto& r : k.prefer) {
@@ -5685,6 +5701,7 @@ bool ThingEngine::deserialize(const std::string& text, Kind* k, std::string* err
     else if (f[0] == "version" && f.size() >= 2) k->version = std::strtoull(f[1].c_str(), nullptr, 10);
     else if (f[0] == "reactions" && f.size() >= 2) k->reactions = std::strtoull(f[1].c_str(), nullptr, 10);
     else if (f[0] == "full" && f.size() >= 2) k->full_recomputes = std::strtoull(f[1].c_str(), nullptr, 10);
+    else if (f[0] == "fullms" && f.size() >= 2) k->last_full_ms = std::strtod(f[1].c_str(), nullptr);
     else if (f[0] == "day" && f.size() >= 2) k->day = unesc(f[1]);
     else if (f[0] == "paused" && f.size() >= 2) k->paused = f[1] == "1";
     else if (f[0] == "prefer" && f.size() >= 3) {
@@ -6099,6 +6116,7 @@ bool ThingEngine::grain_boot(Kind& k, std::string* err) {
   }
   g->has_touched = g->vm.find_global("touched") != nullptr;
   if (grain::Value* ds = g->vm.find_global("DAY_SAFE")) g->day_safe = ds->truthy();
+  if (grain::Value* sk = g->vm.find_global("SHARED_KEYS")) g->shared_keys = sk->truthy();
   k.time_dependent = !g->day_safe;   // a program may read CURDATE(); unless it names its own wakes, a new day is a full pass
   k.grain = g;
   return true;
@@ -6200,7 +6218,8 @@ void ThingEngine::drop_ginst(Kind& k, const std::string& ck, const std::string& 
 // AIOS_THINGS_TRACE_TIME=1: each things() and touched() call's time, to stderr
 static bool things_trace_time() { static const bool on = [] { const char* e = getenv("AIOS_THINGS_TRACE_TIME"); return e && e[0] == '1'; }(); return on; }
 
-bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err) {
+bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, const std::string& cause, std::string* err,
+                             std::unique_lock<aios::hal::Mutex>* lk) {
   ThingGrain& g = *k.grain;
   GrainScope scope(db_, this, k.db, &k.reads, &k.links);
   std::vector<grain::Value> kl;
@@ -6208,10 +6227,15 @@ bool ThingEngine::grain_keys(Kind& k, const std::vector<std::string>& keys, cons
   for (const auto& key : keys) kl.push_back(grain::Value::string(key));
   grain::Value out;
   const auto t0 = std::chrono::steady_clock::now();
-  if (!gcall(g, "things", {grain::Value::list(std::move(kl)), g.shared}, &out, err)) return false;
+  // the program runs with the engine's lock let go: its reads take the statement lock each for itself, and writes,
+  // other kinds and SHOW THING go on meanwhile
+  if (lk) lk->unlock();
+  const bool ok = gcall(g, "things", {grain::Value::list(std::move(kl)), g.shared}, &out, err);
   if (things_trace_time())
     fprintf(stderr, "[things-time] %s: things(%zu key(s)) %.3f ms (%s)\n", k.name.c_str(), keys.size(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), cause.c_str());
+  if (lk) lk->lock();
+  if (!ok) return false;
   if (out.type != grain::Type::Map) { *err = "things() must return a map of key -> values"; return false; }
   auto* m = static_cast<grain::MapObj*>(out.obj.get());
   const uint64_t now = db_.kernel_.host().wall_ns();
@@ -6366,7 +6390,7 @@ SqlQueryResult ThingEngine::replace_grain(Kind&& k, std::unique_lock<aios::hal::
     nkind.reactions += old->second.reactions;
     nkind.full_recomputes += old->second.full_recomputes;
     nkind.created_ns = old->second.created_ns;
-    kinds_.erase(old);
+    erase_kind(old);
   }
   node.key() = name;
   auto placed = kinds_.insert(std::move(node));
@@ -6383,6 +6407,17 @@ SqlQueryResult ThingEngine::replace_grain(Kind&& k, std::unique_lock<aios::hal::
   return res;
 }
 
+namespace {
+// shared() as JSON text (what the save keeps and json_parse takes back): computed by whoever holds the VM.
+std::string grain_shared_text(ThingGrain& g) {
+  grain::Value* js = g.vm.find_global("json_stringify");
+  if (!js) return std::string();
+  std::string e;
+  grain::Value txt = g.vm.call(*js, {g.shared}, e);
+  return e.empty() && txt.type == grain::Type::Str ? txt.str() : std::string();
+}
+}  // namespace
+
 bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err, bool keep_notices) {
   if (!k.grain) { *err = "the program is not loaded"; return false; }
   ThingGrain& g = *k.grain;
@@ -6396,6 +6431,7 @@ bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err
   }
   g.shared_fresh = false;
   g.have_shared = true;
+  k.shared_text = grain_shared_text(g);
   grain::Value en;
   if (!gcall(g, "enroll", {}, &en, err)) return false;
   if (en.type != grain::Type::List) { *err = "enroll() must return a list of keys"; return false; }
@@ -6423,82 +6459,12 @@ bool ThingEngine::grain_full(Kind& k, const std::string& cause, std::string* err
   return true;
 }
 
-// A full pass begun: shared() and enroll() read now, the keys queued - enroll()'s and those of the Things that are no
-// longer enrolled (each recomputed, it answers nothing and goes). What was pending is in the pass; a change from here
-// on is noted as usual and goes after it.
-bool ThingEngine::grain_sweep_start(Kind& k, const std::string& cause, std::string* err) {
-  if (!k.grain) { *err = "the program is not loaded"; return false; }
-  ThingGrain& g = *k.grain;
-  k.day = current_day();
-  GrainScope scope(db_, this, k.db, &k.reads, &k.links);
-  if (!g.shared_fresh) {
-    grain::Value sh;
-    if (!gcall(g, "shared", {}, &sh, err)) return false;
-    g.shared = sh;
-  }
-  g.shared_fresh = false;
-  g.have_shared = true;
-  grain::Value en;
-  if (!gcall(g, "enroll", {}, &en, err)) return false;
-  if (en.type != grain::Type::List) { *err = "enroll() must return a list of keys"; return false; }
-  std::vector<std::string> keys;
-  std::set<std::string> enrolled;
-  for (const auto& v : en.list_items()) {
-    keys.push_back(gval_text(v));
-    enrolled.insert(sql_collate_key(keys.back()));
-  }
-  for (const auto& e : k.gthings)
-    if (!enrolled.count(e.first)) keys.push_back(e.second.key);
-  k.sweep = std::move(keys);
-  k.sweep_at = 0;
-  k.sweep_cause = cause;
-  k.sweep_t0 = db_.kernel_.host().wall_ns();
-  k.pending.clear();
-  return true;
-}
-
-// The pass's next keys, until the deadline: a slice sized from what a key has cost so far (8 keys while that is not
-// known yet), never past the deadline by more than one slice. *done once every key is through.
-bool ThingEngine::grain_sweep_step(Kind& k, std::chrono::steady_clock::time_point deadline, bool* done, std::string* err) {
-  *done = false;
-  while (k.sweep_at < k.sweep.size()) {
-    size_t n = 8;
-    if (k.sweep_ms_per_key > 0) {
-      const double left = std::chrono::duration<double, std::milli>(deadline - std::chrono::steady_clock::now()).count();
-      n = left <= 0 ? 1 : (size_t)std::max(1.0, std::min((double)kPartitionChunk, left / k.sweep_ms_per_key));
-    }
-    const size_t end = std::min(k.sweep.size(), k.sweep_at + n);
-    std::vector<std::string> keys(k.sweep.begin() + (std::ptrdiff_t)k.sweep_at, k.sweep.begin() + (std::ptrdiff_t)end);
-    const auto t0 = std::chrono::steady_clock::now();
-    if (!grain_keys(k, keys, k.sweep_cause, err)) {
-      std::vector<std::string>().swap(k.sweep);
-      k.sweep_at = 0;
-      return false;
-    }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    const double per = ms / (double)(end - k.sweep_at);
-    k.sweep_ms_per_key = k.sweep_ms_per_key > 0 ? (k.sweep_ms_per_key + per) / 2 : per;
-    k.sweep_at = end;
-    if (std::chrono::steady_clock::now() >= deadline) break;
-  }
-  if (k.sweep_at < k.sweep.size()) return true;
-  std::vector<std::string>().swap(k.sweep);
-  k.sweep_at = 0;
-  k.full_recomputes++;
-  if (!k.grain_error.empty()) alert(k.name, "", "recovered", "a full pass ran clean");
-  k.grain_error.clear();
-  k.last_full_ms = (double)(db_.kernel_.host().wall_ns() - k.sweep_t0) / 1e6;
-  dirty_ = true;
-  *done = true;
-  return true;
-}
-
+// The kind's pass and reactions run on its worker thread (grain_worker): settle, with mu_ held, only notes the
+// Things whose moment has come and the day's turn, and sees that a worker is at it. Nothing of the program runs
+// under the engine's lock, nor under the statement lock the caller (a settle, the binlog applier) holds: a kind's
+// pass costs the writer and the other kinds nothing but the shared lock its reads take one at a time.
 void ThingEngine::settle_grain(Kind& k) {
-  if (!k.grain) return;
-  ThingGrain& g = *k.grain;
-  std::string err;
-  // this kind's share of the lock: what is not done by then waits for the next settle (work_left brings it soon)
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settle_slice_ms());
+  if (!k.grain || k.dropping) return;
   // Things whose moment has come are read again.
   if (!k.wakes.empty()) {
     const std::string now = [] { std::time_t t = std::time(nullptr); std::tm tm_buf{}; localtime_r(&t, &tm_buf); char b[32];
@@ -6516,16 +6482,84 @@ void ThingEngine::settle_grain(Kind& k) {
   if (!k.pending_full) {
     const std::string day = current_day();
     if (!day.empty() && day != k.day) {
-      if (g.day_safe) k.day = day;
+      if (k.grain->day_safe) k.day = day;
       else { k.pending_full = true; k.full_cause = "the day turned: " + day; }
     }
   }
+  if (!grain_has_work(k)) return;
+  reap_workers_locked();
+  if (k.running) { worker_cv_.notify_all(); return; }
+  k.running = true;
+  Kind* kp = &k;   // map nodes stay put; a running kind that is dropped is retired, not freed, until its worker is through
+  workers_[kp] = aios::hal::Thread([this, kp] { grain_worker(kp); });
+}
+
+bool ThingEngine::grain_has_work(const Kind& k) const {
+  if (k.paused || !k.grain) return false;
+  return !k.grain->notices.empty() || k.pending_shared || k.pending_full || !k.sweep.empty() || !k.pending.empty();
+}
+
+// Workers that ended are joined here (under mu_: they are past their last use of it, or about to be).
+void ThingEngine::reap_workers_locked() {
+  for (auto& t : done_workers_)
+    if (t.joinable()) t.join();
+  done_workers_.clear();
+}
+
+// A kind let go: gone now, or - its worker running - retired, paused, kept alive for the worker to find it dropping
+// and free it when its chunk is through. Nothing waits for the worker: the caller may hold the statement lock the
+// worker's reads need.
+void ThingEngine::erase_kind(std::map<std::string, Kind>::iterator it) {
+  if (!it->second.running) { kinds_.erase(it); return; }
+  it->second.dropping = true;
+  it->second.paused = true;
+  retired_.push_back(kinds_.extract(it));
+  worker_cv_.notify_all();
+}
+
+void ThingEngine::grain_worker(Kind* kp) {
+  Kind& k = *kp;
+  std::unique_lock<aios::hal::Mutex> lk(mu_);
+  for (;;) {
+    if (stopping_ || k.dropping) break;
+    if (grain_has_work(k)) {
+      const uint64_t before = k.version;
+      grain_run_chunk(k, lk);
+      if (k.version != before) wake_waiters();
+      continue;
+    }
+    // nothing now: a while for more (a reaction every 100 ms costs no thread each), then the thread goes
+    if (!worker_cv_.wait_for_ms(lk, 2000, [&] { return stopping_ || k.dropping || grain_has_work(k); })) break;
+  }
+  k.running = false;
+  if (auto w = workers_.find(kp); w != workers_.end()) {
+    done_workers_.push_back(std::move(w->second));
+    workers_.erase(w);
+  }
+  if (k.dropping)   // the last to touch it: freed here (k is dangling past this)
+    for (size_t i = 0; i < retired_.size(); ++i)
+      if (&retired_[i].mapped() == kp) { retired_.erase(retired_.begin() + (std::ptrdiff_t)i); break; }
+  worker_cv_.notify_all();
+}
+
+// One step of a kind's work, mu_ held in and out and let go for every call into the program: touched() over the
+// notices so far, then shared() if asked for, then a full pass begun (shared() and enroll()) or its next slice,
+// then a chunk of the keys pending. A full pass under way goes before reactions. A key that changes while it is
+// being read comes back as a notice and is read again: nothing is lost to the run. True when something was done.
+bool ThingEngine::grain_run_chunk(Kind& k, std::unique_lock<aios::hal::Mutex>& lk) {
+  ThingGrain& g = *k.grain;
+  std::string err;
+  GrainScope scope(db_, this, k.db, &k.reads, &k.links);
   // touched() hears every change, also once a full pass is coming: a program that keeps what it read (an
   // item's inputs, a table it reads whole) learns from it what to read again, in that pass too.
   if (!g.notices.empty()) {
     std::vector<ThingGrain::Notice> ns;
     ns.swap(g.notices);
-    GrainScope scope(db_, this, k.db, &k.reads, &k.links);
+    bool full = k.pending_full;
+    std::string full_cause;
+    bool want_shared = false;
+    std::vector<std::pair<std::string, std::string>> keys;
+    lk.unlock();
     for (const auto& n : ns) {
       grain::Value r;
       const std::string cause = n.table + " " + n.op;
@@ -6534,89 +6568,171 @@ void ThingEngine::settle_grain(Kind& k) {
       if (things_trace_time())
         fprintf(stderr, "[things-time] %s: touched(%s) %.3f ms\n", k.name.c_str(), cause.c_str(),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-      if (!ok) {
-        k.pending_full = true;
-        k.full_cause = "after touched() failed: " + err;
-        break;
-      }
-      if (k.pending_full || r.type == grain::Type::Nil) continue;
-      if (r.type == grain::Type::Str && r.str() == "all") { k.pending_full = true; k.full_cause = cause; continue; }
-      grain::Value keys = r;
+      if (!ok) { full = true; full_cause = "after touched() failed: " + err; break; }
+      if (full || r.type == grain::Type::Nil) continue;
+      if (r.type == grain::Type::Str && r.str() == "all") { full = true; full_cause = cause; continue; }
+      grain::Value ks = r;
       if (r.type == grain::Type::Map) {
         auto* m = static_cast<grain::MapObj*>(r.obj.get());
         grain::Value* sh = m->find("shared");
-        if (sh && sh->truthy()) k.pending_shared = true;
+        if (sh && sh->truthy()) want_shared = true;
         grain::Value* kv = m->find("keys");
-        keys = kv ? *kv : grain::Value::nil();
+        ks = kv ? *kv : grain::Value::nil();
       }
-      if (keys.type == grain::Type::List) {
-        for (const auto& v : keys.list_items()) k.pending[gval_text(v)] = cause;
-      } else if (keys.type != grain::Type::Nil) {
-        k.pending_full = true;
-        k.full_cause = "touched() answered neither nil, keys, {keys, shared} nor \"all\"";
+      if (ks.type == grain::Type::List) {
+        for (const auto& v : ks.list_items()) keys.emplace_back(gval_text(v), cause);
+      } else if (ks.type != grain::Type::Nil) {
+        full = true;
+        full_cause = "touched() answered neither nil, keys, {keys, shared} nor \"all\"";
       }
     }
+    lk.lock();
+    if (full && !k.pending_full) { k.pending_full = true; k.full_cause = full_cause; }
+    if (!k.pending_full)
+      for (auto& kv : keys) k.pending[kv.first] = kv.second;
+    if (want_shared) k.pending_shared = true;
+    return true;
   }
   if (!k.pending_full && k.pending_shared) {
     k.pending_shared = false;
-    GrainScope scope(db_, this, k.db, &k.reads, &k.links);
+    lk.unlock();
     grain::Value sh;
-    if (!gcall(g, "shared", {}, &sh, &err)) {
-      k.pending_full = true;
-      k.full_cause = "after shared() failed: " + err;
-    } else if (!g.have_shared || !sh.equals(g.shared)) {
+    const bool ok = gcall(g, "shared", {}, &sh, &err);
+    const bool moved = ok && (!g.have_shared || !sh.equals(g.shared));
+    std::string text;
+    if (moved) {
       g.shared = sh;
       g.shared_fresh = true;
+      text = grain_shared_text(g);
+    }
+    lk.lock();
+    if (!ok) {
+      k.pending_full = true;
+      k.full_cause = "after shared() failed: " + err;
+    } else if (moved && g.shared_keys) {
+      // the program named the keys this moves (touched() queued them): the new value is taken, those are read again
+      g.shared_fresh = false;
+      k.shared_text = text;
+      dirty_ = true;
+    } else if (moved) {
+      k.shared_text = text;
       k.pending_full = true;
       k.full_cause = "what every item shares moved";
     }
+    return true;
   }
+  // A full pass begun: shared() and enroll() read now, the keys queued - enroll()'s and those of the Things that are
+  // no longer enrolled (each recomputed, it answers nothing and goes). What was pending is in the pass; a change
+  // from here on is noted as usual and goes after it.
   if (k.pending_full) {
     const std::string cause = k.full_cause.empty() ? std::string("full recompute") : k.full_cause;
     k.pending_full = false;
     k.full_cause.clear();
-    if (!grain_sweep_start(k, cause, &err)) {
+    lk.unlock();
+    // (nothing that takes the statement lock - current_day() is a query - runs with mu_ held: the writer holding
+    // that lock may be waiting for mu_ itself)
+    const std::string day = current_day();
+    bool ok = true;
+    grain::Value en;
+    std::string text;
+    if (!g.shared_fresh) {
+      grain::Value sh;
+      ok = gcall(g, "shared", {}, &sh, &err);
+      if (ok) g.shared = sh;
+    }
+    g.shared_fresh = false;
+    if (ok) {
+      g.have_shared = true;
+      text = grain_shared_text(g);
+      ok = gcall(g, "enroll", {}, &en, &err);
+    }
+    if (ok && en.type != grain::Type::List) { err = "enroll() must return a list of keys"; ok = false; }
+    lk.lock();
+    k.day = day;
+    if (!text.empty()) k.shared_text = text;
+    if (!ok) {
       k.grain_error = err;
       alert(k.name, "", "error", err);
       fprintf(stderr, "[things] %s: full pass failed: %s\n", k.name.c_str(), err.c_str());
-      return;
+      return true;
     }
-  }
-  // a full pass under way goes first, a slice per settle; reactions wait until it is through
-  if (!k.sweep.empty()) {
-    bool done = false;
-    if (!grain_sweep_step(k, deadline, &done, &err)) {
-      k.grain_error = err;
-      alert(k.name, "", "error", err);
-      fprintf(stderr, "[things] %s: full pass failed: %s\n", k.name.c_str(), err.c_str());
-      return;
-    }
-    if (!done || std::chrono::steady_clock::now() >= deadline) return;
-  }
-  if (k.pending.empty()) return;
-  std::vector<std::pair<std::string, std::string>> todo(k.pending.begin(), k.pending.end());
-  k.pending.clear();
-  std::sort(todo.begin(), todo.end());
-  for (size_t at = 0; at < todo.size(); at += kPartitionChunk) {
-    // past this kind's share: the rest waits for the next settle, as it was noted
-    if (at > 0 && std::chrono::steady_clock::now() >= deadline) {
-      for (size_t i = at; i < todo.size(); ++i) k.pending.emplace(todo[i].first, todo[i].second);
-      return;
-    }
-    const size_t end = std::min(todo.size(), at + kPartitionChunk);
     std::vector<std::string> keys;
-    for (size_t i = at; i < end; ++i) keys.push_back(todo[i].first);
-    const std::string cause = end - at == 1 ? todo[at].second
-                                            : todo[at].second + " (+" + std::to_string(end - at - 1) + " more)";
-    if (!grain_keys(k, keys, cause, &err)) {
+    std::set<std::string> enrolled;
+    for (const auto& v : en.list_items()) {
+      keys.push_back(gval_text(v));
+      enrolled.insert(sql_collate_key(keys.back()));
+    }
+    for (const auto& e : k.gthings)
+      if (!enrolled.count(e.first)) keys.push_back(e.second.key);
+    k.sweep = std::move(keys);
+    k.sweep_at = 0;
+    k.sweep_cause = cause;
+    k.sweep_t0 = db_.kernel_.host().wall_ns();
+    k.pending.clear();
+    return true;
+  }
+  // a full pass under way goes first, a slice at a time, PAUSE, DROP and the engine's end seen between slices. A slice
+  // is about kSliceMs of keys: the count doubles while a call takes under half that and halves while one takes over
+  // twice it. (Sizing it from the cost of a key - a call's time over its keys - stuck at one key a call wherever the
+  // first calls were slow: a call that reads ranges costs nearly the same for one key as for a hundred, so one key
+  // looked as dear as a whole call, and touch_hour's pass on atl-ga-1 ran 12,802 one-hour calls in 12 minutes, 2026-10-30.)
+  // A second, not less: a call's fixed cost (its program's whole-table reads) was 110 ms on a slower machine, and a
+  // quarter-second slice there stayed at two keys a call. The slice runs on the kind's own thread, holding no lock
+  // between its reads; its length only sets how soon a PAUSE or DROP of this kind is seen.
+  if (!k.sweep.empty()) {
+    constexpr double kSliceMs = 1000;
+    const size_t n = std::max<size_t>(1, std::min(k.sweep_n, kPartitionChunk));
+    const size_t at = std::min(k.sweep_at, k.sweep.size());
+    const size_t end = std::min(k.sweep.size(), at + n);
+    std::vector<std::string> keys(k.sweep.begin() + (std::ptrdiff_t)at, k.sweep.begin() + (std::ptrdiff_t)end);
+    const std::string cause = k.sweep_cause;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!grain_keys(k, keys, cause, &err, &lk)) {
+      std::vector<std::string>().swap(k.sweep);
+      k.sweep_at = 0;
       k.grain_error = err;
       alert(k.name, "", "error", err);
-      fprintf(stderr, "[things] %s: reaction failed (%s); a full pass next\n", k.name.c_str(), err.c_str());
-      k.pending_full = true;
-      k.full_cause = "after a failed reaction";
-      return;
+      fprintf(stderr, "[things] %s: full pass failed: %s\n", k.name.c_str(), err.c_str());
+      return true;
     }
+    if (end - at == n) {   // (a short last slice says nothing about the size)
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (ms < kSliceMs / 2) k.sweep_n = std::min(n * 2, kPartitionChunk);
+      else if (ms > kSliceMs * 2) k.sweep_n = std::max<size_t>(1, n / 2);
+    }
+    k.sweep_at = std::min(end, k.sweep.size());
+    if (k.sweep_at >= k.sweep.size()) {
+      std::vector<std::string>().swap(k.sweep);
+      k.sweep_at = 0;
+      k.full_recomputes++;
+      if (!k.grain_error.empty()) alert(k.name, "", "recovered", "a full pass ran clean");
+      k.grain_error.clear();
+      k.last_full_ms = (double)(db_.kernel_.host().wall_ns() - k.sweep_t0) / 1e6;
+      dirty_ = true;
+    }
+    return true;
   }
+  if (k.pending.empty()) return false;
+  // the keys pending, a chunk at a time, taken off the queue before the call: one that changes meanwhile is queued
+  // again by its notice and read once more
+  std::vector<std::pair<std::string, std::string>> todo(k.pending.begin(), k.pending.end());
+  std::sort(todo.begin(), todo.end());
+  const size_t take = std::min(todo.size(), kPartitionChunk);
+  std::vector<std::string> keys;
+  keys.reserve(take);
+  for (size_t i = 0; i < take; ++i) {
+    keys.push_back(todo[i].first);
+    k.pending.erase(todo[i].first);
+  }
+  const std::string cause = take == 1 ? todo[0].second : todo[0].second + " (+" + std::to_string(take - 1) + " more)";
+  if (!grain_keys(k, keys, cause, &err, &lk)) {
+    k.grain_error = err;
+    alert(k.name, "", "error", err);
+    fprintf(stderr, "[things] %s: reaction failed (%s); a full pass next\n", k.name.c_str(), err.c_str());
+    k.pending_full = true;
+    k.full_cause = "after a failed reaction";
+  }
+  return true;
 }
 
 // SHOW THING's columns for a grain kind: its key, every field seen, then the bookkeeping.
@@ -6688,12 +6804,8 @@ SqlQueryResult ThingEngine::show_grain(const Kind& k, const std::vector<std::str
 
 std::string ThingEngine::grain_serialize(const Kind& k) const {
   std::string o;
-  if (k.grain && k.grain->have_shared) {
-    grain::Value* js = k.grain->vm.find_global("json_stringify");
-    std::string e;
-    grain::Value txt = js ? k.grain->vm.call(*js, {k.grain->shared}, e) : grain::Value::nil();
-    if (e.empty() && txt.type == grain::Type::Str) o += "gshared\t" + esc(txt.str()) + "\n";
-  }
+  // shared() as text, kept by whoever last set it (the kind's worker owns the VM: not called here)
+  if (k.grain && !k.shared_text.empty()) o += "gshared\t" + esc(k.shared_text) + "\n";
   o += "gcols";
   for (const auto& c : k.gcols) o += "\t" + esc(c);
   o += "\n";
@@ -6718,7 +6830,7 @@ void ThingEngine::grain_restore(Kind& k) {
   std::string e;
   if (!k.shared_json.empty() && jp) {
     grain::Value v = g.vm.call(*jp, {grain::Value::string(k.shared_json)}, e);
-    if (e.empty()) { g.shared = v; g.have_shared = true; }
+    if (e.empty()) { g.shared = v; g.have_shared = true; k.shared_text = k.shared_json; }
   }
   k.shared_json.clear();
   if (!g.have_shared) { k.pending_full = true; k.full_cause = "loaded without its shared state"; }

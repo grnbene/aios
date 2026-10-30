@@ -522,6 +522,7 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   else if (starts("Cannot add or update a child row")) { *code = 1452; *sqlstate = "23000"; }
   else if (starts("Cannot delete or update a parent row")) { *code = 1451; *sqlstate = "23000"; }
   else if (starts("Cannot truncate a table referenced in a foreign key constraint")) { *code = 1701; *sqlstate = "42000"; }
+  else if (starts("Query execution was interrupted. The query exceeded max_recursive_iterations")) { *code = 1931; *sqlstate = "HY000"; }
   else if (starts("Query execution was interrupted")) { *code = 1317; *sqlstate = "70100"; }
   else if (starts("Unknown thread id: ")) { *code = 1094; *sqlstate = "HY000"; }
   else if (has("already exists")) { *code = 1050; *sqlstate = "42S01"; }
@@ -2008,7 +2009,9 @@ bool stream_result_set(const SqlQueryResult& res, bool binary, bool cs_out_latin
   };
   auto put_eof = [&]() {
     const size_t h = open_packet();
-    const uint8_t eof[] = {0xfe, 0x00, 0x00, (uint8_t)(status & 0xff), (uint8_t)(status >> 8)};
+    // The statement's warning count, then the status. An answer stored with the cache never has a warning.
+    const uint16_t warnings = (uint16_t)std::min<uint64_t>(sql_statement_warning_count(), 0xffff);
+    const uint8_t eof[] = {0xfe, (uint8_t)(warnings & 0xff), (uint8_t)(warnings >> 8), (uint8_t)(status & 0xff), (uint8_t)(status >> 8)};
     stream_buf.insert(stream_buf.end(), eof, eof + sizeof(eof));
     close_stream_packet(stream_buf, h, seq);
   };
@@ -2154,7 +2157,8 @@ class WireRowSink final : public SqlRowSink {
   bool end() override {
     if (!ok_) return false;
     const size_t h = open();
-    const uint8_t eof[] = {0xfe, 0x00, 0x00, (uint8_t)(status_ & 0xff), (uint8_t)(status_ >> 8)};
+    const uint16_t warnings = (uint16_t)std::min<uint64_t>(sql_statement_warning_count(), 0xffff);
+    const uint8_t eof[] = {0xfe, (uint8_t)(warnings & 0xff), (uint8_t)(warnings >> 8), (uint8_t)(status_ & 0xff), (uint8_t)(status_ >> 8)};
     buf_->insert(buf_->end(), eof, eof + sizeof(eof));
     close_stream_packet(*buf_, h, seq_);
     flush();
@@ -2470,13 +2474,13 @@ Result<size_t> MysqlWireServer::recv_packet(hal::Connection& conn, std::vector<u
 
 Result<void> MysqlWireServer::send_ok(hal::Connection& conn, uint8_t seq, uint64_t affected_rows,
                                       uint64_t last_insert_id, uint16_t status,
-                                      const std::string& msg) {
+                                      const std::string& msg, uint16_t warnings) {
   std::vector<uint8_t> pkt;
   pkt.push_back(0x00);  // OK header
   put_lenenc_u64(&pkt, affected_rows);
   put_lenenc_u64(&pkt, last_insert_id);
   put_u16(&pkt, status);    // server status: 0x0002 = AUTOCOMMIT
-  put_u16(&pkt, 0);         // warning count: 0
+  put_u16(&pkt, warnings);  // the statement's warning count (SHOW WARNINGS)
   if (!msg.empty()) {
     put_lenenc_str(&pkt, msg);
   }
@@ -4110,7 +4114,8 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       }
       if (!res.is_result_set) {
         send_ok(client_conn, 1, (client_flags & CAP_FOUND_ROWS) && res.rows_matched >= 0 ? (uint64_t)res.rows_matched : res.rows_affected,
-                sql_take_statement_insert_id(), SERVER_STATUS_AUTOCOMMIT, res.ok_info);
+                sql_take_statement_insert_id(), SERVER_STATUS_AUTOCOMMIT, res.ok_info,
+                (uint16_t)std::min<uint64_t>(sql_statement_warning_count(), 0xffff));
         res_shared.reset();
         SqlDatabase::update_active_session(conn_id, "Sleep", "idle", "", session_database);
         continue;
@@ -4299,6 +4304,7 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
           std::shared_ptr<const std::string> packets;
           packets = db_.cached_wire_packets(stmt_text, session_database, wire_db, false, cs_out_latin1);
           if (packets) {
+            sql_clear_statement_conditions();   // a statement answered: the last one's warnings are gone
             db_.metrics().bytes_sent.fetch_add(packets->size(), std::memory_order_relaxed);
             wire_queue(client_conn, ByteSpan(reinterpret_cast<const uint8_t*>(packets->data()), packets->size()));
             break;
@@ -4362,7 +4368,8 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
           // UPDATE: the rows changed, or - a client that asked for found rows (JDBC, CLIENT_FOUND_ROWS) - matched.
           send_ok(client_conn, curr_seq++,
                   (client_flags & CAP_FOUND_ROWS) && res.rows_matched >= 0 ? (uint64_t)res.rows_matched : res.rows_affected,
-                  sql_take_statement_insert_id(), status, res.ok_info);
+                  sql_take_statement_insert_id(), status, res.ok_info,
+                  (uint16_t)std::min<uint64_t>(sql_statement_warning_count(), 0xffff));
           res_shared.reset();
           SqlDatabase::update_active_session(conn_id, "Sleep", "idle", "", session_database);
           wire_flush(client_conn);

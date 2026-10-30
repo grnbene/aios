@@ -18,6 +18,7 @@
 #include "aios/userland/portable_int128.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "check-root.hpp"
 
 using namespace aios;
 using namespace aios::userland;
@@ -331,8 +332,8 @@ void verify(SqlDatabase& db, const std::string& T, const std::vector<Col>& cols,
 
 int main() {
   std::printf("=== ASQL wide number check (past 2^53, near 2^63, 18-digit decimals) ===\n");
-  const std::string root = "/tmp/aios-asql-widecheck";
-  { std::error_code fs_err; std::filesystem::remove_all(root, fs_err); }
+  const CheckRoot check_root("/tmp/aios-asql-widecheck");   // this run's own (see check-root.hpp)
+  const std::string& root = check_root.path;
   KernelConfig cfg;
   cfg.root = root;
   auto k = Kernel::boot(cfg);

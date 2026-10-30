@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
 #include "aios/storage/object_store.hpp"

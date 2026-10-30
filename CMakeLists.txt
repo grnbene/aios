@@ -531,6 +531,14 @@ target_link_libraries(aios-asql-temporal-check PRIVATE aios)
 add_executable(aios-asql-sqlfeatures-check tools/asql-sqlfeatures-check.cpp)
 target_link_libraries(aios-asql-sqlfeatures-check PRIVATE aios)
 
+add_executable(aios-asql-recursive-cte-check tools/asql-recursive-cte-check.cpp)
+target_link_libraries(aios-asql-recursive-cte-check PRIVATE aios)
+add_test(NAME asql.recursive_cte.check COMMAND aios-asql-recursive-cte-check)
+
+add_executable(aios-asql-doom-sql-check tools/asql-doom-sql-check.cpp)
+target_link_libraries(aios-asql-doom-sql-check PRIVATE aios)
+add_test(NAME asql.doom_sql.check COMMAND aios-asql-doom-sql-check)
+
 add_executable(aios-asql-lock-id-check tools/asql-lock-id-check.cpp)
 target_link_libraries(aios-asql-lock-id-check PRIVATE aios)
 
