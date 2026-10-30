@@ -1,0 +1,12 @@
+// Single operations a million times each, against ops.php: where per-operation cost goes.
+fn t(name, f) { let a = time_us(); f(); print(name + "\t" + str(round((time_us() - a) / 1000)) + "\t-") }
+let N = 1000000
+t("empty loop", fn () { for i in 0..N { let z = 0 } })
+t("str(i)", fn () { for i in 0..N { let s = str(i) } })
+t("len(x) native call", fn () { let x = "abc"; for i in 0..N { let n = len(x) } })
+t("\"x\" + s", fn () { let s = "123456"; for i in 0..N { let y = "x" + s } })
+t("push(list, 1)", fn () { let l = []; for i in 0..N { push(l, 1) } })
+t("push(list, str)", fn () { let l = []; let s = "abc"; for i in 0..N { push(l, s) } })
+let parts = []
+for i in 0..N { push(parts, "x" + str(i)) }
+t("join 1M", fn () { let j = join(parts, ",") })
