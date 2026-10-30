@@ -1,0 +1,25 @@
+// canvas_to_png / canvas_save_png / canvas_to_bytes(cv, "png"): a PNG that decodes back to the same pixels,
+// transparency kept. (Checked once against an independent decoder too: Python's zlib, by hand.)
+fn check(c, msg) { assert_true(c, msg) }
+
+let cv = canvas_create(40, 20)
+canvas_set_fill_color(cv, "#ff0000")
+canvas_fill_rect(cv, 0, 0, 20, 20)
+canvas_set_fill_color(cv, "rgba(0, 0, 255, 0.5)")
+canvas_fill_rect(cv, 30, 5, 5, 5)
+
+let p = canvas_to_png(cv)
+check(hex_encode(slice(p, 0, 8)) == "89504e470d0a1a0a", "a PNG signature")
+check(canvas_to_bytes(cv, "png") == p, "canvas_to_bytes(cv, \"png\") is the same file")
+
+let back = image_decode(bytes(p))
+check(canvas_width(back) == 40 and canvas_height(back) == 20, "its size")
+let same = true
+for y in 0..20 { for x in 0..40 { if canvas_get_pixel(back, x, y) != canvas_get_pixel(cv, x, y) { same = false } } }
+check(same, "every pixel the same, alpha included")
+check(canvas_get_pixel(back, 25, 2) == 0, "unpainted stays transparent")
+
+let path = "grain-png-test-" + str(time_ms()) + ".png"
+check(canvas_save_png(cv, path) == true and read_file(path) == p, "saved through the program's files")
+delete_file(path)
+print("PASS: test_png")

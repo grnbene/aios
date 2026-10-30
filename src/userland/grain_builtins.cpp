@@ -4610,10 +4610,41 @@ Value bi_canvas_save_ppm(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::boolean(ok);
 }
 
+// canvas_to_png(cv): the canvas as a PNG file's bytes, transparency kept.
+Value bi_canvas_to_png(Vm&, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_to_png");
+  if (!cv) return Value::nil();
+  ByteBuffer png = web::encode_png(cv->pixels.data(), (int)cv->width, (int)cv->height);
+  return Value::string(std::string(reinterpret_cast<const char*>(png.data()), png.size()));
+}
+
+Files* files_of(Vm& vm, std::string& error, const char* who);
+std::string file_error(const char* who, const std::string& path, const std::string& why);
+
+// canvas_save_png(cv, path): written through the program's own files (Vm::files), like write_file.
+Value bi_canvas_save_png(Vm& vm, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_save_png");
+  if (!cv) return Value::nil();
+  if (!want_str(args[1], error, "canvas_save_png")) return Value::nil();
+  Files* f = files_of(vm, error, "canvas_save_png");
+  if (!f) return Value::nil();
+  ByteBuffer png = web::encode_png(cv->pixels.data(), (int)cv->width, (int)cv->height);
+  std::string why;
+  if (!f->write(args[1].str(), std::string(reinterpret_cast<const char*>(png.data()), png.size()), false, why)) {
+    error = file_error("canvas_save_png", args[1].str(), why);
+    return Value::nil();
+  }
+  return Value::boolean(true);
+}
+
 Value bi_canvas_to_bytes(Vm&, std::vector<Value>& args, std::string& error) {
   auto cv = get_canvas(args[0], error, "canvas_to_bytes");
   if (!cv) return Value::nil();
   std::string fmt = args.size() > 1 ? args[1].str() : "ppm";
+  if (fmt == "png") {
+    ByteBuffer png = web::encode_png(cv->pixels.data(), (int)cv->width, (int)cv->height);
+    return Value::string(std::string(reinterpret_cast<const char*>(png.data()), png.size()));
+  }
   if (fmt == "raw" || fmt == "argb") {
     std::string raw((const char*)cv->pixels.data(), cv->pixels.size() * sizeof(uint32_t));
     return Value::string(std::move(raw));
@@ -7704,6 +7735,8 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("cv_to_ppm", 1, 1, bi_canvas_to_ppm);
   vm.define_native("canvas_save_ppm", 2, 2, bi_canvas_save_ppm);
   vm.define_native("canvas_to_bytes", 1, 2, bi_canvas_to_bytes);
+  vm.define_native("canvas_to_png", 1, 1, bi_canvas_to_png);
+  vm.define_native("canvas_save_png", 2, 2, bi_canvas_save_png);
   vm.define_native("canvas_blit", 3, 9, bi_canvas_blit);
   vm.define_native("canvas_draw_image", 3, 9, bi_canvas_blit);
   vm.define_native("canvas_present", 1, 2, bi_canvas_present);
