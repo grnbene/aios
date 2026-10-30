@@ -9,7 +9,7 @@ namespace aios::userland {
 // Builtins a Thing may call: pure functions of their arguments (the engine retains these globals and no others).
 inline const std::vector<std::string>& thing_allowed_builtins() {
   static const std::vector<std::string> names = {
-      "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "sort", "reverse", "map", "flat_map",
+      "print", "len", "type", "str", "repr", "int", "real", "push", "pop", "range", "__range_bound", "sort", "reverse", "map", "flat_map",
       "filter", "reduce", "each", "for_each", "any", "all", "find_if", "flatten", "concat", "insert", "remove_at",
       "zip", "enumerate", "take", "drop", "count", "unique", "dedup", "compact", "keys", "values", "has", "del", "merge",
       "entries", "from_entries", "split", "join", "upper", "lower", "find", "replace", "slice", "ord", "chr", "trim",
