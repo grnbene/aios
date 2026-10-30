@@ -303,10 +303,48 @@ The `sql` group (`cli/commands.cpp:7928`; aliases `asql`, `mariadb`, `db`):
     sql query "<sql>"           one statement (also: sql exec)
     sql import file=<dump.sql>  a mysqldump file (also: sql pull)
     sql import sql="<stmts>"
+    sql copy host= user= pass_file= db=   a live MariaDB/MySQL database, over the wire
     sql tables                  tables of the default database
     sql console [db=<name>]     an in-process REPL
     sql serve [port=3307] [bind=0.0.0.0]
     sql push / sql sync         task-ledger export and sync
+
+### Copying a live database (`sql copy`)
+
+`sql copy` copies a MariaDB/MySQL database into the store over the wire. It
+uses the mirror's seeding copy: one consistent snapshot
+(`START TRANSACTION WITH CONSISTENT SNAPSHOT`), each table's rows streamed
+straight into the store. The source needs no binlog, and only `SELECT` is
+needed there. No stream starts after it.
+
+```
+aios --root R exec "sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shopdb"
+aios --root R exec "sql copy host=/run/mysqld/mysqld.sock user=reader pass_file=/root/src.pass db=shopdb tables=orders,stock replace=1"
+```
+
+- No `tables=`: every table and view in `db` on the source. `tables=t1,t2`,
+  or `tables=@file` (one name per line, `#` comments), copies only those.
+- `no_data=t1,t2` creates those tables with their definition only, no rows
+  (a table of documents nobody needs here).
+- Views are created over the copied tables, after them.
+- A table already here is skipped unless `replace=1` (that drops and copies
+  it again). A copy that was interrupted is copied again either way.
+- The wire is compressed (zstd where the source has it, else zlib).
+  `compress=0` turns that off. Over a WAN, compression is most of the speed:
+  100k rows of km's log table took 4.2 s compressed and 22.1 s plain.
+- `port=` defaults to 3306. A host that is a path is a unix socket. `pass=`
+  works too, but it shows in `ps`.
+- A table with a single-column primary key continues from its last key when
+  the connection breaks.
+- Any table that does not copy is named with the reason, and the command
+  exits non-zero.
+- `seed_positions` records each table. The position is `none 0` when the
+  source has no binlog. Without a binlog nothing can stream from that point,
+  so a later `compute serve cdc_host=` mirror should re-seed rather than
+  stream onto these tables.
+
+Measured against a MariaDB 10.9 with `log_bin` off, through an SSH tunnel:
+300,000 rows (DECIMAL, DOUBLE, DATE, DATETIME, TEXT, NULLs) streamed in 3.2 s.
 
 ### The operator tools
 

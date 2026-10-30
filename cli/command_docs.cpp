@@ -160,9 +160,10 @@ const std::vector<CommandDoc>& command_docs() {
     {"consume", "channel consume <e> <ch>", "take the next item"},
     {"list", "channel list", "every channel"},
   }},
-  {"sql", "CHANNELS & OBJECT STORE", "sql query|console|serve|import|push|sync|tables", "The machine's SQL engine", {
+  {"sql", "CHANNELS & OBJECT STORE", "sql query|console|serve|import|copy|push|sync|tables", "The machine's SQL engine", {
     {"query|exec", "sql query \"<sql>\"", "run a statement"},
     {"pull|import", "sql import <file.sql> | file=<path> | sql=\"<statements>\" [customer=<cid>]", "run statements from a file or the line"},
+    {"copy", "sql copy host=<host|/socket> [port=3306] user=<u> pass_file=<f> db=<db> [tables=t1,t2|@file] [no_data=t1,t2] [replace=1] [compress=0]", "copy a live MariaDB/MySQL database over the wire (no binlog needed)"},
     {"push|dump|export", "sql dump [customer=<cid>] [table=tasks]", "a table as SQL statements"},
     {"sync", "sql sync [customer=<cid>]", "sync the task ledger with its SQL tables"},
     {"tables|list", "sql tables", "every table"},

@@ -18982,7 +18982,9 @@ void ColumnStore::optimize_encoding(SqlDataType type, int dec_scale, uint8_t tem
     const double dict_row = (entry + 4.0) * ndv_ratio + code_bits_for((uint32_t)std::min<size_t>(ndv, 0xFFFFFFFFu)) / 8.0;
     if (dict_row < block_row) {
       encode_dict();
-      while (code_dictionary((size_t)16 << 20)) {}
+      // Whole, not 16 MB at a time: each call cuts what it blocked off the front of the plain buffer, a copy of
+      // all that is left, so a 2 GB column of log text (km's tpl3pl_logs) copied its rest again every 16 MB.
+      while (code_dictionary((size_t)-1)) {}
       return;
     }
   }
@@ -20052,7 +20054,8 @@ void SqlTable::encode_columns(std::vector<ColumnStore>& cols, const std::vector<
           cols[c].packed_data.shrink_to_fit();
         }
       }
-      while (cols[c].code_dictionary((size_t)16 << 20)) {}
+      // Whole, not in 16 MB slices: see optimize_encoding (each slice copies the rest of the plain buffer).
+      while (cols[c].code_dictionary((size_t)-1)) {}
     }
   };
   const size_t optimizable = std::min(defs.size(), cols.size());
@@ -23288,6 +23291,12 @@ Result<void> SqlDatabase::flush_impl(bool async, bool maintain) {
   if (things_) things_->save();
   if (cells_) cells_->save();
   save_index_list();
+  // The position this snapshot is at (the lock is held: nothing commits until it is let go), for the manifest to
+  // carry - on either path below.
+  if (binlog_consumer_) {
+    std::string file; uint64_t pos = 0;
+    if (binlog_consumer_->committed_position(&file, &pos)) img->cdc_text = file + "\n" + std::to_string(pos) + "\n";
+  }
   if (!rotate_redo(*img)) {
     // The log could not be rotated (a host without rename): the old way,
     // files under the lock and the log emptied after them.
@@ -54755,6 +54764,11 @@ constexpr uint32_t kColumnSpansFooterMagic = 0x41515453;
 // never named (a crash before its manifest), and is not read. A loader from
 // before parts stops at the entries and reads only whole images.
 constexpr uint32_t kManifestLengthsMagic = 0x41514d4c;    // "AQML"
+// After the lengths, a replica's binlog position as of this generation (the cdc_position text). Carried in the
+// manifest so the two cannot disagree: written as a file after it, a crash between the two left the new generation
+// with the old position, startup dropped the logs that would have moved it on, and replication applied again what
+// the store already held - doubling rows in a table without a key. A manifest without it is read as before.
+constexpr uint32_t kManifestCdcMagic = 0x41514d43;        // "AQMC"
 // A part appended to a table file by a checkpoint whose only change to the
 // table was appended rows (snapshot_tables_v4): the rows [from, to) as
 // text, one length-prefixed cell after another, row-major, store_pack'ed.
@@ -55242,9 +55256,31 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     return (uint64_t)(e && *e ? std::max(0, std::atoi(e)) : 120) * 1000000000ull;
   }();
   size_t dense_budget = (size_t)256 << 20;   // bytes of table files deflated per checkpoint
+  // Tables whose form changed and nothing else, rewritten whole under the lock this checkpoint, at most this many
+  // bytes (AIOS_STORE_FORM_MB, 16 by default); the rest keep their file and wait for a later one.
+  static const size_t form_budget_total = [] {
+    const char* e = std::getenv("AIOS_STORE_FORM_MB");
+    return (size_t)(e && *e ? std::max(0, std::atoi(e)) : 16) << 20;
+  }();
+  size_t form_budget = form_budget_total;
+  static const bool snap_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+  uint64_t snap_small_ns = 0;   // tables under 5 ms each, added up (AIOS_STORE_TRACE)
+  const uint64_t snap_loop_t0 = snap_trace ? kernel_.host().monotonic_ns() : 0;
   for (auto& kv : tables_) {
     SqlTable& t = kv.second;
+    // AIOS_STORE_TRACE: a table that held the lock 5 ms or more here, and how much of it was folding its delta in -
+    // whichever way below it leaves by (unchanged, a part, appended rows, whole).
+    struct SnapTime {
+      hal::Host& h; const std::string& name; uint64_t t0; uint64_t& small; uint64_t fold = 0;
+      ~SnapTime() {
+        if (!snap_trace) return;
+        const uint64_t ns = h.monotonic_ns() - t0;
+        if (ns >= 5000000ull) fprintf(stderr, "[store] snapshot %s: %.1f ms under the lock (delta fold %.1f)\n", name.c_str(), ns / 1e6, fold / 1e6);
+        else small += ns;
+      }
+    } snap_time{kernel_.host(), kv.first, snap_trace ? kernel_.host().monotonic_ns() : 0, snap_small_ns};
     t.compact_delta_buffer();
+    if (snap_trace) snap_time.fold = kernel_.host().monotonic_ns() - snap_time.t0;
     t.ensure_columns();
     // Unchanged since the file already on disk: the new manifest names that
     // file again. A checkpoint used to rewrite all 8 GB of st's store every
@@ -55253,7 +55289,36 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.still_ns = now_ns;
     auto prev = saved_tables_.find(kv.first);
     bool dense = false;
-    if (prev != saved_tables_.end() && prev->second.seq == state.seq && prev->second.rows == state.rows &&
+    // Form only: the counter moved and nothing in the table changed - a column re-encoded, a dictionary compacted,
+    // segments packed (stamp_form_change), the journal running on from the file without a write in it. The file still
+    // holds exactly these rows in this order, so it can stand; the new form is only smaller or faster to load. Written
+    // whole under the lock it was every such table at once: 433 files and 2-11 s of every read waiting on a copy of
+    // the Cleve mirror after a restart. Now within a budget a checkpoint; the rest keep their file, form pending.
+    bool force_whole = false;
+    if (prev != saved_tables_.end() && prev->second.shape == state.shape && prev->second.rows == state.rows &&
+        !unpacked_tables_.count(kv.first)) {
+      bool form_only = prev->second.seq == state.seq && prev->second.form_pending;
+      if (prev->second.seq != state.seq) {
+        std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+        const SqlTable::ChangeJournal& j = t.journal;
+        form_only = j.on && !j.broken && j.start_seq == prev->second.seq && j.last_seq == t.mutation_seq && j.ops.empty();
+      }
+      if (form_only) {
+        const size_t cost = std::max<size_t>(prev->second.bytes, 1);
+        if (exit_flush_ || form_budget >= cost) {
+          form_budget -= std::min(form_budget, cost);
+          force_whole = true;
+        } else {
+          entries.emplace_back(kv.first, prev->second.file);
+          SavedTableFile kept = prev->second;
+          kept.seq = state.seq;   // the file is the table as it stands; its journal goes on from here
+          kept.form_pending = true;
+          saved_now[kv.first] = kept;
+          continue;
+        }
+      }
+    }
+    if (!force_whole && prev != saved_tables_.end() && prev->second.seq == state.seq && prev->second.rows == state.rows &&
         prev->second.shape == state.shape && kernel_.host().exists(dir + "/" + prev->second.file) &&
         !(prev->second.op_parts && !ops_parts_enabled())) {   // parts of writes, with them turned off: written whole
       // Unchanged. Written in the fast form while it was changing; once it
@@ -55271,13 +55336,33 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       dense = true;
       state.still_ns = still;
       dense_budget -= std::min(dense_budget, std::max<size_t>(prev->second.bytes, 1));
+      // Nothing has changed since its file was written, so the file is the table: deflated from it by the writer
+      // thread, off the lock. Its columns were copied under the lock to be serialized again (atl's mirror: 3 s of
+      // every read waiting at one checkpoint, a still table at a time, 15-60 ms each). A file with parts on its end
+      // is rewritten from the columns below, the parts folding into it.
+      if (prev->second.parts == 0 && !unpacked_tables_.count(kv.first)) {
+        const std::string file = hex_of(kv.first) + ".g" + std::to_string(gen) + ".tbl";
+        CheckpointImage::TableImage ti;
+        ti.key = kv.first;
+        ti.file = file;
+        ti.dense = true;
+        ti.repack_from = prev->second.file;
+        img.tables.push_back(std::move(ti));
+        entries.emplace_back(kv.first, file);
+        SavedTableFile kept = prev->second;
+        kept.file = file;
+        kept.dense = true;
+        kept.still_ns = still;
+        saved_now[kv.first] = kept;
+        continue;
+      }
     }
     state.layout = t.layout_seq;
     // Rows erased or cells set since the file was written, every one of them in the table's journal: the writes go
     // to the file as a part, in their order, instead of the table whole. A 30M-row audit log with a few thousand
     // rows deleted was copied whole under the lock at every checkpoint (1.5 s of every read waiting, and the copy
     // tripled the process's memory). The same bounds as appended rows; past them it is written whole again.
-    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
+    if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
         prev->second.seq != state.seq && prev->second.shape == state.shape && prev->second.file_bytes > 0 &&
         prev->second.parts < kPartMaxCount) {
       std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
@@ -55364,7 +55449,7 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
       for (const auto& op : j.ops) if (op.kind != 'A') return false;
       return true;
     };
-    if (prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
+    if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
         prev->second.seq != state.seq && state.rows > prev->second.rows && prev->second.shape == state.shape &&
         (prev->second.layout == t.layout_seq || only_appended()) &&
         prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount &&
@@ -55403,6 +55488,18 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.dense = dense;
     state.base_rows = state.rows;
     ++rewritten;
+    if (snap_trace && prev != saved_tables_.end()) {
+      // AIOS_STORE_TRACE: why a table that had a file is copied whole under the lock, not added to as a part
+      std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
+      const SqlTable::ChangeJournal& j = t.journal;
+      fprintf(stderr, "[store] %s: whole (rows %zu; dense %d unpacked %d parts %u/%u shape %s seq %s; journal on %d broken %d "
+                      "from %s to %s, %zu ops, %zu cells; part rows %zu + cells %zu of bound %zu)\n",
+              t.name.c_str(), state.rows, (int)dense, (int)unpacked_tables_.count(kv.first), prev->second.parts, kPartMaxCount,
+              prev->second.shape == state.shape ? "same" : "changed", prev->second.seq == state.seq ? "same" : "moved",
+              (int)j.on, (int)j.broken, j.start_seq == prev->second.seq ? "file" : "elsewhere",
+              j.last_seq == t.mutation_seq ? "now" : "behind", j.ops.size(), j.cells, prev->second.part_rows,
+              prev->second.op_cells, std::max(kPartMaxRowsFloor, prev->second.base_rows / 4));
+    }
     unpacked_tables_.erase(kv.first);   // written packed now
     CheckpointImage::TableImage ti;
     ti.key = kv.first;
@@ -55488,8 +55585,12 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     state.file = file;
     saved_now[kv.first] = state;
   }
+  const uint64_t snap_loop_ns = snap_trace ? kernel_.host().monotonic_ns() - snap_loop_t0 : 0;
   // Every table as this snapshot holds it is what the next one starts from: its journal records from here.
   for (auto& kv : tables_) kv.second.journal_begin();
+  if (snap_trace)
+    fprintf(stderr, "[store] snapshot of %zu tables: loop %.1f ms (tables under 5 ms each: %.1f), journals begun %.1f ms\n", tables_.size(),
+            snap_loop_ns / 1e6, snap_small_ns / 1e6, (kernel_.host().monotonic_ns() - snap_loop_t0 - snap_loop_ns) / 1e6);
   // The manifest is finished by write_checkpoint (manifest_bytes), once every
   // file's valid length is known; the databases it names are taken here, under the lock.
   img.databases.assign(databases_.begin(), databases_.end());
@@ -55509,6 +55610,10 @@ std::vector<uint8_t> SqlDatabase::manifest_bytes(const CheckpointImage& img) con
   for (const auto& e : img.entries) {
     auto sv = img.saved.find(e.first);
     m.u64(sv == img.saved.end() ? 0 : sv->second.file_bytes);   // 0: the whole file (none of it is a part)
+  }
+  if (!img.cdc_text.empty()) {
+    m.u32(kManifestCdcMagic);
+    m.str(img.cdc_text);
   }
   return m.take();
 }
@@ -55745,6 +55850,25 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   } shed_wbuf{checkpoint_wbuf_};
   for (auto& ti : img.tables) {
     auto sv = img.saved.find(ti.key);
+    if (!ti.repack_from.empty()) {
+      // A still table, deflated from its own file. A file that does not unpack goes under the new name as it is -
+      // the table all the same, deflated another time.
+      auto rd = h.read_file(dir + "/" + ti.repack_from);
+      if (!rd.ok()) return Result<void>(Status::IoError, ti.repack_from + ": " + rd.error().message);
+      ByteBuffer plain;
+      std::string why;
+      const bool unpacked = store_unpack(ByteSpan(rd->data(), rd->size()), plain, &why);
+      if (unpacked) store_pack(plain.data(), plain.size(), packed, true);
+      const ByteSpan bytes = unpacked ? ByteSpan(packed.data(), packed.size()) : ByteSpan(rd->data(), rd->size());
+      auto wr = h.write_file(dir + "/" + ti.file, bytes);
+      if (!wr.ok()) return wr;
+      if (sv != img.saved.end()) {
+        sv->second.file_bytes = bytes.size();
+        if (unpacked) sv->second.bytes = plain.size();
+        else sv->second.dense = false;
+      }
+      continue;
+    }
     if (ti.ops) {
       // The writes since the file was written, as one part on its end.
       const std::vector<uint8_t> part = store_ops_part_bytes(img.gen, ti.rows_from, ti.rows_to, ti.ncols, ti.ops_plain, ti.dense);
@@ -55800,6 +55924,9 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   img.manifest = manifest_bytes(img);
   auto mw = h.write_file(dir + "/MANIFEST", ByteSpan(img.manifest.data(), img.manifest.size()));
   if (!mw.ok()) return mw;
+  // The renames into tables/ (each file's tmp -> name, MANIFEST last) on disk: until the directory is flushed a
+  // power cut can bring back the previous MANIFEST beside files it does not name, or lose a renamed table file.
+  if (auto ds = h.sync_dir(dir); !ds.ok()) return ds;
   const uint64_t w2 = h.monotonic_ns();
   store_generation_ = img.gen;
   saved_tables_ = std::move(img.saved);
@@ -55817,8 +55944,11 @@ Result<void> SqlDatabase::write_checkpoint(CheckpointImage& img) {
   const std::string legacy = root_path_ + "/schema_tables.db";
   if (h.exists(legacy)) h.remove(legacy);
   const uint64_t w3 = h.monotonic_ns();
-  if (!img.cdc_text.empty())
+  // Also in the manifest now (kManifestCdcMagic); kept as a file for the tools that read it.
+  if (!img.cdc_text.empty()) {
     h.write_file(root_path_ + "/cdc_position", ByteSpan((const uint8_t*)img.cdc_text.data(), img.cdc_text.size()));
+    h.sync_dir(root_path_);
+  }
   // The rotated logs this generation covers (its own, and any an earlier
   // write left behind) are redundant now that the manifest names it.
   if (auto ls = h.list_dir(root_path_); ls.ok())
@@ -55907,6 +56037,20 @@ bool SqlDatabase::load_tables_v4() {
   std::vector<uint64_t> valid_lengths(manifest_entries.size(), 0);
   if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestLengthsMagic)
     for (size_t i = 0; i < manifest_entries.size() && m.ok(); ++i) { const uint64_t n = m.u64(); if (m.ok()) valid_lengths[i] = n; }
+  // The position this generation was taken at is where the stream resumes from - before the redo logs after it are
+  // replayed, which move it on with every commit mark they hold. The separate file may be older (written after the
+  // manifest, a crash between left it behind) and is brought up to the manifest's.
+  if (m.ok() && m.remaining() >= 4 && m.u32() == kManifestCdcMagic) {
+    const std::string cdc = m.str();
+    if (m.ok() && !cdc.empty()) {
+      auto cur = kernel_.host().read_file(root_path_ + "/cdc_position");
+      const bool same = cur.ok() && std::string((const char*)cur->data(), cur->size()) == cdc;
+      if (!same) {
+        kernel_.host().write_file(root_path_ + "/cdc_position", ByteSpan((const uint8_t*)cdc.data(), cdc.size()));
+        kernel_.host().sync_dir(root_path_);
+      }
+    }
+  }
   set_startup_phase("loading tables", 0, manifest_entries.size());
   const auto load_t0 = std::chrono::steady_clock::now();
   // The tables are independent: each is read, unpacked and decoded on whichever thread takes it, biggest first,
@@ -56470,6 +56614,8 @@ bool SqlDatabase::load_cdc_position(std::string* out_file, uint64_t* out_pos) co
 // sql_db/seed_positions holds one line per seeded table: "table\tfile\tpos".
 // A line with file "-" marks a copy that started and never finished - the
 // table is dropped and copied again on the next start rather than trusted.
+// File "none" (position 0) is a finished copy from a source without a binlog
+// (`sql copy`): there is no point in it for a stream to start from.
 // ---------------------------------------------------------------------------
 namespace {
 std::map<std::string, std::pair<std::string, uint64_t>> read_seed_positions(Kernel& k, const std::string& path) {
@@ -56647,7 +56793,8 @@ std::string SqlDatabase::startup_status() const {
 
 Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t port, const std::string& user,
                                              const std::string& password, const std::string& database,
-                                             const std::vector<std::string>& tables, std::vector<std::string>* log) {
+                                             const std::vector<std::string>& tables, std::vector<std::string>* log,
+                                             const SeedOptions& opts) {
   // A table half-way through its bulk load is not read by anyone.
   StatementLock lock(rw_lock_, true);
   const std::string seed_path = root_path_ + "/seed_positions";
@@ -56657,13 +56804,49 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
     if (seed_progress_) seed_progress_(s);
   };
 
+  MariaWireSession src(host, port);
+  src.set_read_timeout_ms(120000);   // a big table streamed over a WAN stalls between packets
+  // Text over a WAN: km's tpl3pl_logs came 5x faster compressed. Kept by every reconnect below.
+  if (opts.compression) src.set_compression(opts.compression);
+  // Connected only once there is something to copy: a mirror whose tables are
+  // all here starts without its master being up.
+  bool connected = false;
+  auto open_session = [&]() -> Result<void> {
+    if (connected) return Result<void>();
+    auto cr = src.connect(user, password, database);
+    if (!cr.ok()) return Result<void>(Status::IoError, "seed: cannot connect to " + host + ":" + std::to_string(port) + ": " + cr.error().message);
+    connected = true;
+    if (opts.compression) say(std::string("wire compression: ") + (*src.compression() ? src.compression() : "none (the source offers none)"));
+    return Result<void>();
+  };
+  auto must = [&src](const std::string& q) -> Result<MariaResult> {
+    auto r = src.query(q);
+    if (!r.ok()) return r.error();
+    if (!r->ok) return Result<MariaResult>(Status::Invalid, r->error_message);
+    return r;
+  };
+  std::string db_lit = "'";
+  for (char ch : database) { if (ch == '\'' || ch == '\\') db_lit += '\\'; db_lit += ch; }
+  db_lit += "'";
+
+  // No names given: the whole database, as the source lists it.
+  std::vector<std::string> wanted = tables;
+  if (wanted.empty()) {
+    if (auto r = open_session(); !r.ok()) return Result<size_t>(r.error().status, r.error().message);
+    auto lt = must("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = " + db_lit + " ORDER BY TABLE_NAME");
+    if (!lt.ok()) return Result<size_t>(lt.error().status, "seed: cannot list the tables of " + database + ": " + lt.error().message);
+    for (const auto& row : lt->rows) if (!row.empty() && !row[0].is_null) wanted.push_back(row[0].bytes);
+    if (wanted.empty()) return Result<size_t>(Status::NotFound, "seed: " + database + " has no tables on " + host + " (or this user cannot see them)");
+  }
+
   // Which tables need a copy: not in the store at all, or a copy that was
-  // interrupted (marked "-").
+  // interrupted (marked "-"); every one of them when asked to copy again.
   // Each table lives in the source's own database here (summitholding.x,
   // not a shared default), so two tenants' tables of the same name stay two
   // tables. Seed points are recorded as "db.table".
   std::vector<std::string> todo;
-  for (const auto& t : tables) {
+  for (const auto& t : wanted) {
+    if (opts.recopy) { todo.push_back(t); continue; }
     auto it = seeds.find(lower_ascii(database + "." + t));
     const bool interrupted = it != seeds.end() && it->second.first == "-";
     // find_view first: resolve_table on a view BUILDS it, and on st that was
@@ -56671,18 +56854,9 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
     const bool present = find_view(t, database) != nullptr || resolve_table(t, database) != nullptr;
     if (interrupted || !present) todo.push_back(t);
   }
+  if (opts.failed) *opts.failed = 0;
   if (todo.empty()) return (size_t)0;
-
-  MariaWireSession src(host, port);
-  src.set_read_timeout_ms(120000);   // a big table streamed over a WAN stalls between packets
-  auto cr = src.connect(user, password, database);
-  if (!cr.ok()) return Result<size_t>(Status::IoError, "seed: cannot connect to " + host + ":" + std::to_string(port) + ": " + cr.error().message);
-  auto must = [&src](const std::string& q) -> Result<MariaResult> {
-    auto r = src.query(q);
-    if (!r.ok()) return r.error();
-    if (!r->ok) return Result<MariaResult>(Status::Invalid, r->error_message);
-    return r;
-  };
+  if (auto r = open_session(); !r.ok()) return Result<size_t>(r.error().status, r.error().message);
   // Which of the wanted names are views there, so each is seeded as a live
   // view over the mirrored base tables rather than a frozen copy of rows it
   // had at seed time - a view's whole point is to read what its tables hold
@@ -56690,14 +56864,13 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
   // answers (MariaDB is happy to be asked), so nothing here would have said
   // "no such table" - it would have silently copied a snapshot instead.
   std::set<std::string> source_views;
-  std::string db_lit = "'";
-  for (char ch : database) { if (ch == '\'' || ch == '\\') db_lit += '\\'; db_lit += ch; }
-  db_lit += "'";
   if (auto vt = must("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = " + db_lit +
                      " AND TABLE_TYPE = 'VIEW'");
       vt.ok()) {
     for (const auto& row : vt->rows) if (!row.empty()) source_views.insert(lower_ascii(row[0].bytes));
   }
+  // Tables before views: a view is created over tables this pass may still be copying.
+  std::stable_partition(todo.begin(), todo.end(), [&](const std::string& t) { return source_views.count(lower_ascii(t)) == 0; });
   // One snapshot for every table in this pass, and the binlog position it
   // corresponds to: MariaDB reports it without taking a global lock.
   // A streamed table waits on us between packets; the default 60 s write
@@ -56718,8 +56891,12 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
       if (lower_ascii(row[0].bytes) == "binlog_snapshot_file") snap_file = row[1].bytes;
       if (lower_ascii(row[0].bytes) == "binlog_snapshot_position") snap_pos = std::strtoull(row[1].bytes.c_str(), nullptr, 10);
     }
-    if (snap_file.empty() || snap_pos == 0)
-      return Result<void>(Status::Unsupported, "seed: the source reports no binlog snapshot position (binary logging off?)");
+    if (snap_file.empty() || snap_pos == 0) {
+      if (opts.require_binlog)
+        return Result<void>(Status::Unsupported, "seed: the source reports no binlog snapshot position (binary logging off?)");
+      // A plain copy: still one consistent snapshot, recorded as having no position to stream from.
+      snap_file = "none"; snap_pos = 0;
+    }
     return Result<void>();
   };
   auto reconnect = [&]() -> bool {
@@ -56857,7 +57034,10 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
       return true;
     };
     std::string select = "SELECT * FROM " + quote_ident(t);
-    if (pk_col >= 0) {
+    const bool definition_only = opts.no_data.count(lower_ascii(t)) != 0;
+    if (definition_only) {
+      select += " WHERE 1 = 0";   // the same path, zero rows: created, packed and recorded like any copy
+    } else if (pk_col >= 0) {
       if (resumed && !last_pk.empty()) {
         bool digits = !last_pk.empty();
         for (char ch : last_pk) if (!std::isdigit((unsigned char)ch) && ch != '-') digits = false;
@@ -56912,15 +57092,20 @@ Result<size_t> SqlDatabase::seed_from_source(const std::string& host, uint16_t p
     seeds[key] = {table_snap_file, table_snap_pos};
     write_seed_positions(kernel_, seed_path, seeds);
     ++seeded;
-    say(t + ": " + std::to_string(rows_copied) + " rows from " + table_snap_file + ":" + std::to_string(table_snap_pos) + (attempt ? " (" + std::to_string(attempt) + " resume(s))" : ""));
+    say(t + ": " + (definition_only ? std::string("definition only, no rows") : std::to_string(rows_copied) + " rows") +
+        (table_snap_pos ? " from " + table_snap_file + ":" + std::to_string(table_snap_pos) : std::string(" (no binlog position)")) +
+        (attempt ? " (" + std::to_string(attempt) + " resume(s))" : ""));
   }
   src.query("COMMIT");
+  // Every name in todo either counted as seeded or said why it did not.
+  if (opts.failed) *opts.failed = todo.size() - seeded;
 
   // A store that has never streamed starts the stream at the snapshot: every
   // table it holds was either just seeded at that point or imported earlier
   // (whose position, if any, the saved file already carries).
+  // A copy from a source without a binlog has no point to start one from.
   std::string have_file; uint64_t have_pos = 0;
-  if (!load_cdc_position(&have_file, &have_pos)) {
+  if (snap_pos > 0 && !load_cdc_position(&have_file, &have_pos)) {
     std::string text = snap_file + "\n" + std::to_string(snap_pos) + "\n";
     kernel_.host().write_file(root_path_ + "/cdc_position", ByteSpan((const uint8_t*)text.data(), text.size()));
   }
