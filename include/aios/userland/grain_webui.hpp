@@ -112,6 +112,9 @@ class WebUi {
   // Routes asked with no session (nginx's auth check, another site's fetch or EventSource): they would never send a
   // new session's cookie back, so they share this one instead of each starting a copy of the program.
   std::shared_ptr<Session> routes_;
+  // Sessions taken off the books (reaped, evicted): torn down by the ticker with mu_ not held, so no request waits
+  // on a program's teardown, and the memory they held handed back to the system after.
+  std::vector<std::shared_ptr<Session>> dropped_;
   bool member_known_ = false;           // given_member(): learnt for member_version_ of the program
   std::string member_version_, member_;
   aios::hal::Thread ticker_;
@@ -122,7 +125,9 @@ class WebUi {
 
   std::shared_ptr<Session> session_for(const Request& req, std::string& new_id, std::string& error, bool route = false);
   std::shared_ptr<Session> make_session(std::string& error);
-  void reap_locked();
+  // Drops sessions nobody is watching and nobody has touched for idle_seconds - or, when the process is close to its
+  // memory limit (`tight`), for a minute - and, past max_sessions, the least recently used. Into dropped_.
+  void reap_locked(bool tight = false);
   void report(const std::string& msg) const;
   void start_ticker();
   void tick();

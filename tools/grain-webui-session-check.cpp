@@ -10,7 +10,9 @@
 
 #include <cstdio>
 #include <memory>
+#include <chrono>
 #include <string>
+#include <thread>
 
 using namespace aios::userland::grain;
 
@@ -53,6 +55,8 @@ int main() {
     check(ok_routes == 20 && ok_pages == 20, "40 cookieless requests answered (" + std::to_string(ok_routes) + " routes, " +
                                                  std::to_string(ok_pages) + " pages)");
     check(ui.sessions() <= kMax, "sessions held to the cap: " + std::to_string(ui.sessions()));
+    // the dropped ones are torn down by the ticker, off the request path, on its next 50 ms tick
+    for (int i = 0; i < 40 && pane_count() - before > kMax; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const size_t live = pane_count() - before;
     check(live <= kMax, "panes left registered while running: " + std::to_string(live) + " (at most " + std::to_string(kMax) +
                             ", one per session kept)");

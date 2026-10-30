@@ -17,7 +17,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace aios::userland::grain {
 
@@ -280,16 +284,73 @@ void WebUi::report(const std::string& msg) const {
   else std::fprintf(stderr, "grain-ui: %s\n", msg.c_str());
 }
 
-void WebUi::reap_locked() {
+namespace {
+// Whether this process's cgroup (a systemd unit's MemoryMax) is over three quarters full. Each viewer of a page holds
+// a copy of its program (5-17 MB for the touches report or the dock board); a host with a 2 GB cap and a burst of
+// viewers whose browsers keep no cookie (an embedded frame, a kiosk that restarts) could reach it within the
+// 30-minute idle window. Linux only; anywhere else, or with no limit, never tight.
+bool memory_tight() {
+#if defined(__linux__)
+  static const std::string dir = [] {
+    std::ifstream cg("/proc/self/cgroup");
+    std::string line, v1;
+    while (std::getline(cg, line)) {
+      if (line.rfind("0::", 0) == 0) return "/sys/fs/cgroup" + line.substr(3);              // cgroup v2
+      const size_t a = line.find(":memory:");
+      if (a != std::string::npos) v1 = "/sys/fs/cgroup/memory" + line.substr(a + 8);        // cgroup v1
+    }
+    return v1;
+  }();
+  if (dir.empty()) return false;
+  auto read_num = [](const std::string& path, unsigned long long& v) {
+    std::ifstream f(path);
+    std::string t;
+    if (!(f >> t) || t == "max") return false;
+    v = std::strtoull(t.c_str(), nullptr, 10);
+    return true;
+  };
+  unsigned long long used = 0, limit = 0;
+  if (read_num(dir + "/memory.max", limit)) {
+    if (!read_num(dir + "/memory.current", used)) return false;
+  } else if (read_num(dir + "/memory.limit_in_bytes", limit)) {
+    if (!read_num(dir + "/memory.usage_in_bytes", used)) return false;
+  } else {
+    return false;
+  }
+  if (limit == 0 || limit >= (1ull << 60)) return false;   // v1's "no limit" is a huge number
+  return used > limit / 4 * 3;
+#else
+  return false;
+#endif
+}
+
+// Freed pages back to the system: what the dropped sessions held stays with the allocator otherwise, and the process
+// looks as big as its busiest half hour for the rest of its life.
+void return_free_memory() {
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
+}  // namespace
+
+void WebUi::reap_locked(bool tight) {
   const auto now = Clock::now();
+  // A session nobody is watching (no open tab: its page closed, or a client that kept no cookie) and untouched this
+  // long. One with a tab open is never reaped here, tight or not.
+  const long idle = tight ? std::min(60, host_.idle_seconds) : host_.idle_seconds;
   for (auto it = sessions_.begin(); it != sessions_.end();) {
     const bool watched = it->second->streams > 0;
-    if (!watched && std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last.load()).count() > host_.idle_seconds) it = sessions_.erase(it);
-    else ++it;
+    if (!watched && std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last.load()).count() > idle) {
+      dropped_.push_back(std::move(it->second));
+      it = sessions_.erase(it);
+    } else {
+      ++it;
+    }
   }
   while (sessions_.size() >= host_.max_sessions && !sessions_.empty()) {   // the least recently used goes
     auto oldest = sessions_.begin();
     for (auto it = sessions_.begin(); it != sessions_.end(); ++it) if (it->second->last.load() < oldest->second->last.load()) oldest = it;
+    dropped_.push_back(std::move(oldest->second));
     sessions_.erase(oldest);
   }
 }
@@ -350,8 +411,37 @@ void WebUi::start_ticker() {
   if (ticker_.joinable()) return;
   ticker_ = aios::hal::Thread([this]() {
     std::unique_lock<std::mutex> lock(mu_);
+    auto last_reap = Clock::now();
+    auto last_trim = Clock::time_point{};
+    bool trim_owed = false;
     while (!stop_) {
       stop_cv_.wait_for(lock, std::chrono::milliseconds(50));
+      if (stop_) break;
+      // Every 30 s idle sessions go even when no new visitor comes to trigger it (a new visitor's reap drops them
+      // too). What was dropped is torn down on the next tick with the lock let go - a page request never waits on a
+      // program's teardown - and the memory it held is returned to the system, at most every 5 s.
+      if (Clock::now() - last_reap >= std::chrono::seconds(30)) {
+        last_reap = Clock::now();
+        lock.unlock();
+        const bool tight = memory_tight();
+        lock.lock();
+        reap_locked(tight);
+      }
+      if (!dropped_.empty()) {
+        std::vector<std::shared_ptr<Session>> gone;
+        gone.swap(dropped_);
+        lock.unlock();
+        gone.clear();   // a session still in a request's hands lives until that request lets go of it
+        lock.lock();
+        trim_owed = true;
+      }
+      if (trim_owed && Clock::now() - last_trim >= std::chrono::seconds(5)) {
+        trim_owed = false;
+        last_trim = Clock::now();
+        lock.unlock();
+        return_free_memory();
+        lock.lock();
+      }
       if (stop_) break;
       std::vector<std::shared_ptr<Session>> all;
       for (auto& kv : sessions_) all.push_back(kv.second);
