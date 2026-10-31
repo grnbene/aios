@@ -221,3 +221,19 @@ inline void colbatch_narrow_int(ColBatch::Col& c, size_t n) {
   c.nul.swap(nul);
   std::vector<std::string>().swap(c.s);
 }
+
+// The batch's rows in another order: row r becomes the row perm[r] was (an ORDER BY's, or a GROUP BY's implicit one,
+// worked out on indexes with the row path's own comparator).
+inline void colbatch_permute(ColBatch& B, const std::vector<uint32_t>& perm) {
+  const size_t n = perm.size();
+  for (ColBatch::Col& c : B.cols) {
+    switch (c.kind) {
+      case ColBatch::Text: { std::vector<std::string> o(n); for (size_t r = 0; r < n; ++r) o[r] = std::move(c.s[perm[r]]); c.s.swap(o); break; }
+      case ColBatch::I64: { std::vector<int64_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.i[perm[r]]; c.i.swap(o); break; }
+      case ColBatch::F64: { std::vector<double> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.f[perm[r]]; c.f.swap(o); break; }
+      case ColBatch::Codes: { std::vector<uint32_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.codes[perm[r]]; c.codes.swap(o); break; }
+    }
+    if (c.kind != ColBatch::Text) { std::vector<uint8_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.nul[perm[r]]; c.nul.swap(o); }
+  }
+  B.rows = n;
+}

@@ -77,9 +77,17 @@ A result table's typed columns are read as numbers where the row path's dictiona
 
 ## Next stages
 
-- **3c: grouped emits and derived tables.** A GROUP BY's answer and a derived table or LATERAL (`FROM (SELECT ..)
-  q`) still hand over rows. Same producer shape: aggregates per group are already Vals, group keys gather from the
-  group's first row.
+- **3c: grouped emits and derived tables (done, LATERAL still rows).** A GROUP BY's answer - from the join path's
+  grouped emit or the single-table engine's - fills a batch: stored columns gathered from each group's first row,
+  every other item made per group with its aggregates' values. A GROUP BY carries an implicit ORDER BY of its keys,
+  so each group's sort keys are made as the emit makes them and the group indexes stable-sorted with the engine's
+  own comparator (or the single-table engine's picked order taken as it is) - the same order a stable sort of the
+  rows gives. A derived table (`FROM (SELECT ..) q`) asks for a batch as a CTE does. HAVING, DISTINCT, a LIMIT, a
+  pivot and GROUP_CONCAT's ordered path still give rows. `execute_with` takes a request on entry and hands it only
+  to the statement after its CTEs: a recursive CTE's anchor, run first, took a derived table's request and answered
+  into it (caught by `asql.doom_sql.check`, "recursive, in a derived table"). Measured against the previous commit,
+  alternating, median of nine steady frames: 953 -> 839 and 1,004 -> 897 ms; with the path off, unchanged
+  (1,425 / 1,351 before, 1,330 / 1,438 after).
 - **3d: the last copy.** The batch is still copied into column stores; a table could adopt its lanes directly
   (an I64 column's vector becomes `int64_data`).
 - **4: batched joins (first step done).** Where every key of a join step is a number the base row already holds

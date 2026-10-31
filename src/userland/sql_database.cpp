@@ -39644,6 +39644,68 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
       having_done = !having;
       if (want != SIZE_MAX && !having && !distinct && pick.size() > want) pick.resize(want);
     }
+    // The groups' answer as a typed batch, for a consumer that takes one: a stored column read from each group's
+    // first row (as project reads it), every other item made per group with its aggregates' values - and no group
+    // projected below (first_row cleared). Not with a sort, DISTINCT, HAVING or a limit.
+    if (vx_col_out && vx_trace_on())
+      vx_trace(std::string("colbatch: vx grouped, picked=") + (picked ? "1" : "0") + " sink=" + (sink ? "1" : "0") + " limit=" +
+               std::to_string(limit) + " offset=" + std::to_string(offset) + " distinct=" + (distinct ? "1" : "0") + " order=" +
+               std::to_string(order_by.size()) + " having=" + (having ? "1" : "0"));
+    if (vx_col_out && !sink && limit < 0 && offset <= 0 && !distinct && !having) {
+      ColBatch& B = *vx_col_out;
+      const size_t G = first_row.size();
+      // the order: the groups the fast sort above picked, else each group's sort keys made as project makes them
+      // (a GROUP BY's implicit ORDER BY among them) and sorted below with `less`
+      std::vector<OutRow> keyrows(!order_by.empty() && !picked ? G : 0);
+      const bool no_row = selection.count == 0 && group_by.empty();   // an aggregate over no rows: no row to read
+      B.cols.assign(expanded.size(), ColBatch::Col());
+      B.rows = G;
+      if (G && !fast_resolved) { resolve_fast(rd.ev.at(first_row[0])); if (!err.empty()) { *out = make_error(err); return true; } }
+      std::vector<size_t> interp;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+        if (G && fast_col[i] >= 0 && (size_t)fast_col[i] < t.col_data.size()) {
+          colbatch_gather(t, (size_t)fast_col[i], dest, 0, [&](size_t r) -> size_t { return no_row ? kNullRow : (size_t)first_row[r]; }, G, &B.cols[i]);
+          continue;
+        }
+        interp.push_back(i);
+        B.cols[i].kind = ColBatch::Text;
+        B.cols[i].s.resize(G);
+      }
+      for (size_t gi = 0; gi < G && (!interp.empty() || !keyrows.empty()); ++gi) {
+        for (size_t d = 0; d < agg_dups.size(); ++d) agg_vals[aggs.size() + d] = {agg_dups[d].first, values[gi][agg_dups[d].second]};
+        for (size_t a = 0; a < aggs.size(); ++a) { agg_vals[a].first = aggs[a].node; agg_vals[a].second = std::move(values[gi][a]); }
+        EvalCtx gctx = base;
+        JoinedRow jr;
+        jr.parts.push_back(first_row[gi]);
+        gctx.row = no_row ? nullptr : &jr;
+        gctx.agg_values = &agg_vals;
+        for (size_t i : interp) {
+          Val v = eval_expr(expanded[i].expr.get(), gctx);
+          if (!err.empty()) { *out = make_error(err); return true; }
+          B.cols[i].s[gi] = v.null ? sql_null() : v.str();
+        }
+        if (!keyrows.empty())
+          for (const OrderKey& k : order_by) {
+            const SqlExpr* ke = k.ordinal > 0 && (size_t)k.ordinal <= expanded.size() ? expanded[(size_t)k.ordinal - 1].expr.get() : k.expr.get();
+            keyrows[gi].keys.push_back(eval_expr(ke, gctx));
+            if (!err.empty()) { *out = make_error(err); return true; }
+          }
+      }
+      for (size_t i = 0; i < expanded.size(); ++i)
+        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], G);
+      if (picked) {
+        colbatch_permute(B, pick);
+      } else if (!keyrows.empty()) {
+        std::vector<uint32_t> perm(G);
+        for (size_t r = 0; r < G; ++r) perm[r] = (uint32_t)r;
+        std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return less(keyrows[a], keyrows[b]); });
+        colbatch_permute(B, perm);
+      }
+      B.filled = true;
+      first_row.clear();   // nothing left to project below
+      pick.clear();
+    }
     const size_t ngroups_out = picked ? pick.size() : first_row.size();
     for (size_t pi = 0; pi < ngroups_out; ++pi) {
       const size_t gi = picked ? pick[pi] : pi;
@@ -44363,11 +44425,15 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         }
         const std::string pushed = expanded_branch.sources.size() == 1 ? derived_pushdown_sql(expanded_branch, s) : std::string();
         SqlQueryResult dres;
+        ColBatch dbatch;
         {
           RowsOnly rows_only;
+          ColOutRequest want_columns(&dbatch);   // its rows as typed columns, where the select can give them so
           dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
         }
         if (!dres.success) return dres;
+        const bool d_in_batch = dres.rows_in_batch && dbatch.filled;
+        if (vx_trace_on()) vx_trace("derived " + s.alias + ": " + std::to_string(d_in_batch ? dbatch.rows : dres.rows.size()) + (d_in_batch ? " rows as columns" : " rows"));
         if (s.column_names.size() > dres.columns.size())
           return make_error("the column list of " + s.alias + " has " + std::to_string(s.column_names.size()) + " names for " +
                             std::to_string(dres.columns.size()) + " columns");
@@ -44382,11 +44448,17 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           col.declared_text = ci < dres.column_is_string.size() && dres.column_is_string[ci];
           ephem->columns.push_back(col);
         }
-        fit_decimal_scales(ephem->columns, dres.rows);
+        if (d_in_batch) fit_decimal_scales_with(ephem->columns, [&](size_t c, auto&& fn) { colbatch_each_value(dbatch, c, fn); });
+        else fit_decimal_scales(ephem->columns, dres.rows);
         ephem->ensure_columns();
-        ephem->reserve(dres.rows.size());
-        ephem->reserve(dres.rows.size());
-        append_result_rows(ephem.get(), dres.rows);
+        ephem->reserve(d_in_batch ? dbatch.rows : dres.rows.size());
+        if (d_in_batch && !colbatch_fill_table(ephem.get(), dbatch)) {   // a table not to fill so: the rows it stands for
+          dbatch.to_rows(&dres.rows);
+          dres.rows_in_batch = false;
+          append_result_rows(ephem.get(), dres.rows);
+        } else if (!d_in_batch) {
+          append_result_rows(ephem.get(), dres.rows);
+        }
         { std::vector<SqlRow> gone; gone.swap(dres.rows); }   // the table holds them now
         ephem->inferred_types = true;
 
@@ -48148,6 +48220,85 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       const size_t pr = !g.empty() && gdirect[i].src < g[0].parts.size() ? g[0].parts[gdirect[i].src] : kNullRow;
       o.row.values.push_back(pr == kNullRow ? sql_null() : sources[gdirect[i].src].table->cell(pr, gdirect[i].col));
     };
+    // The groups' answer as a typed batch, for a consumer that takes one (a CTE's or a derived table's table):
+    // a stored column gathered from each group's first row (as push_group_cell reads it), every other item made per
+    // group with the context the emit below gives it (the aggregates' values made ahead, a program's text) - and
+    // no group emitted below (groups cleared). Not with a sort, DISTINCT, HAVING, a limit or a pivot.
+    if (col_out && vx_trace_on())
+      vx_trace(std::string("colbatch: grouped emit, sink=") + (join_sink ? "1" : "0") + " order=" + std::to_string(order_by.size()) +
+               " distinct=" + (distinct ? "1" : "0") + " having=" + (having ? "1" : "0") + " limit=" + std::to_string(limit) +
+               " keep_items=" + (keep_items ? "1" : "0") + " bounded=" + (bounded ? "1" : "0") + " pivot=" + (pivot.buckets.empty() ? "0" : "1"));
+    if (col_out && !join_sink && !distinct && !having && limit < 0 && offset <= 0 && !keep_items &&
+        !bounded && pivot.buckets.empty()) {
+      ColBatch& B = *col_out;
+      const size_t n = groups.size();
+      // the groups' sort keys, made as the emit makes them (a GROUP BY's implicit ORDER BY among them)
+      std::vector<OutRow> keyrows(order_by.empty() ? 0 : n);
+      B.cols.assign(expanded.size(), ColBatch::Col());
+      B.rows = n;
+      std::vector<size_t> interp;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+        if (gdirect[i].ok) {
+          const size_t ds = gdirect[i].src;
+          colbatch_gather(*sources[ds].table, gdirect[i].col, dest, 0, [&](size_t r) -> size_t {
+            const JoinedRows& g = groups[r];
+            return !g.empty() && ds < g[0].parts.size() ? g[0].parts[ds] : kNullRow;
+          }, n, &B.cols[i]);
+          continue;
+        }
+        interp.push_back(i);
+        B.cols[i].kind = ColBatch::Text;
+        B.cols[i].s.resize(n);
+      }
+      auto run = [&](size_t b0, size_t b1, std::string* e) {
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.err = e;
+        for (size_t gi = b0; gi < b1 && e->empty(); ++gi) {
+          JoinedRows& g = groups[gi];
+          ctx.row = g.empty() ? nullptr : &g[0];
+          ctx.group = aggregated ? &g : nullptr;
+          ctx.agg_values = nullptr;
+          if (star_grouped) { ctx.group = nullptr; ctx.agg_values = &star_vals[gi]; }
+          else if (!vp_aggs.empty()) ctx.agg_values = &vp_aggs[gi];
+          for (size_t i : interp) {
+            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { B.cols[i].s[gi] = std::move(vp_gtext[i][gi]); continue; }
+            Val v = eval_expr(expanded[i].expr.get(), ctx);
+            if (!e->empty()) return;
+            B.cols[i].s[gi] = v.null ? sql_null() : v.str();
+          }
+          if (!keyrows.empty())
+            for (const OrderKey& k : order_by) {
+              keyrows[gi].sort_keys.push_back(eval_expr(k.expr.get(), ctx));
+              if (!e->empty()) return;
+            }
+        }
+      };
+      if (!interp.empty() || !keyrows.empty()) {
+        if (n >= 64 && !SqlThreadPool::is_in_worker_thread()) {
+          const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
+          std::vector<std::string> errs(lanes);
+          SqlThreadPool::instance().parallel_for(n, 32, [&](size_t b0, size_t b1, size_t tid) {
+            if (tid >= lanes) tid = 0;
+            run(b0, b1, &errs[tid]);
+          });
+          for (const auto& e : errs) if (!e.empty()) return make_error(e);
+        } else {
+          std::string e;
+          run(0, n, &e);
+          if (!e.empty()) return make_error(e);
+        }
+      }
+      for (size_t i = 0; i < expanded.size(); ++i)
+        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+      if (!keyrows.empty()) {   // the order the rows would be sorted into below (a stable sort of them in group order)
+        std::vector<uint32_t> perm(n);
+        for (size_t r = 0; r < n; ++r) perm[r] = (uint32_t)r;
+        std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return row_less(keyrows[a], keyrows[b]); });
+        colbatch_permute(B, perm);
+      }
+      B.filled = true;
+      groups.clear();   // nothing left for the emit below
+    }
     size_t biggest = 0, grouped_rows = 0;
     for (const auto& g : groups) { biggest = std::max(biggest, g.size()); grouped_rows += g.size(); }
     const size_t agg_lanes = SqlThreadPool::instance().num_workers() + 1;
@@ -49044,6 +49195,10 @@ static void cte_columns_from_batch(const SqlQueryResult& res, const ColBatch& B,
 }
 
 SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
+  // A consumer's request for the answer as a typed batch (sql_colbatch.inc) is for the statement after the CTEs:
+  // taken here, so no statement run to make a CTE (a recursive one's anchor and steps among them) takes it, and
+  // handed back for the final statement alone (below).
+  ColBatch* const with_out = take_col_out();
   std::vector<Token> toks;
   std::string terr;
   if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
@@ -49318,6 +49473,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
   size_t main_start = toks[p.pos()].start_pos;
   std::string main_sql = sql.substr(main_start);
 
+  ColOutRequest main_columns(with_out);
   if (trace_merge) {
     const uint64_t t0 = hal_now_ns();
     SqlQueryResult r = execute_local_query(main_sql);
