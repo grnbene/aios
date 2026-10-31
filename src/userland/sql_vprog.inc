@@ -13,11 +13,14 @@
 // by construction (a DOUBLE column, an approximate literal, a function of one). AIOS_SQL_VPROG=0 turns it off.
 namespace vp {
 
-enum class Ty : uint8_t { I64, F64 };
+// Str: a text lane. Its int64 holds a reference - a dictionary code of one of the program's text columns (the
+// column's slot + 1 in the high 32 bits, the code below) or a literal (slot 0, the literal's index) - and the
+// text is read through it only when compared or printed.
+enum class Ty : uint8_t { I64, F64, Str };
 
 struct Ins {
   enum Op : uint8_t {
-    Konst, ColI, ColF, CodeI, CodeF, ColNull, StrIn,
+    Konst, ColI, ColF, CodeI, CodeF, ColNull, StrIn, ColS,
     Neg, Add, Sub, Mul, Div, Mod, IDiv,
     Eq, Ne, Lt, Le, Gt, Ge, And, Or, Not, IsNull, NotNull,
     Case, Coalesce, NullIf, Greatest, Least, Abs, Floor, Ceil, Sqrt, Pow, Sin, Cos, Tan, Atan, Atan2, Radians,
@@ -27,6 +30,8 @@ struct Ins {
   Ty ty = Ty::I64;
   bool approx = false;    // the interpreter's Val here would be approximate (a DOUBLE)
   bool dec = false;       // an exact decimal literal with a fraction (0.5): a double lane, exact to the interpreter
+  bool dyadic = false;    // dec: a value a double holds exactly (1.0, 0.5, 2.25 - a finite binary fraction)
+  bool exact_dyadic = false;   // Add/Sub/Mul of such exact values: the result must stay exactly representable
   // The interpreter's value here may be an exact decimal at some rows and a double at others (GREATEST(0.0, d)):
   // the number is the lane's, the text may not be - so a tainted value is read only by what erases text (a CAST
   // to SIGNED, a comparison, a truth test), never printed.
@@ -36,6 +41,7 @@ struct Ins {
   double kf = 0;
   int64_t ki = 0;
   uint32_t src = 0;       // a column's source
+  uint32_t slot = 0;      // ColS: the column's index in Prog::text_cols
   const ColumnStore* cs = nullptr;
   std::vector<uint32_t> args;
   std::vector<int64_t> code_i;      // CodeI: per dictionary code
@@ -45,6 +51,13 @@ struct Ins {
 
 struct Prog {
   std::vector<Ins> ins;   // operands before the operators that read them; the last is the result
+  std::vector<const ColumnStore*> text_cols;   // the text columns Str lanes refer to, by slot
+  std::vector<std::string> lits;               // the text literals, by index
+  std::string_view text_of(int64_t ref) const {
+    const uint32_t slot = (uint32_t)((uint64_t)ref >> 32), idx = (uint32_t)ref;
+    if (slot == 0) return idx < lits.size() ? std::string_view(lits[idx]) : std::string_view();
+    return slot - 1 < text_cols.size() ? vx::dict_view(*text_cols[slot - 1], idx) : std::string_view();
+  }
   // The literals the program was compiled with, and the division rule: a cached statement shape rebinds its
   // literals in place (shape_bind), and the program on the expression is then stale - program_for checks.
   std::string lit_sig;
@@ -173,8 +186,26 @@ struct Compiler {
       if (vx::typed_numeric(cs)) in.op = Ins::ColF;
       else if (vx::dict_coded(cs) && codes_of(cs, false, &in)) in.op = Ins::CodeF;
       else return fail("DOUBLE column not typed or dictionary-coded");
+    } else if (col.type == SqlDataType::Text) {
+      // a dictionary-coded text column: the lane holds codes, the text is read when compared or printed
+      if (cs.shared_dict || !vx::dict_coded(cs)) return fail("text column " + t->name + "." + col.name + " not dictionary-coded");
+      if (t->inferred_types) {   // a result table's "text" may hold numbers, which the interpreter reads as numbers
+        const size_t nd = vx::dict_size(cs);
+        if (nd > (1u << 20)) return fail("dictionary too large");
+        for (size_t k = 0; k < nd; ++k) {
+          const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+          double x = 0;
+          if (!sql_is_null(d) && parse_number(d, &x)) return fail("result column " + t->name + "." + col.name + " with numbers as text");
+        }
+      }
+      in.ty = Ty::Str;
+      in.op = Ins::ColS;
+      uint32_t slot = (uint32_t)P.text_cols.size();
+      for (uint32_t k = 0; k < P.text_cols.size(); ++k) if (P.text_cols[k] == &cs) { slot = k; break; }
+      if (slot == P.text_cols.size()) P.text_cols.push_back(&cs);
+      in.slot = slot;
     } else {
-      return fail(std::string(col.type == SqlDataType::Decimal ? "DECIMAL" : "text") + " column " + t->name + "." + col.name);
+      return fail("DECIMAL column " + t->name + "." + col.name);
     }
     return emit(std::move(in));
   }
@@ -183,7 +214,13 @@ struct Compiler {
     Ins in;
     in.op = Ins::Konst;
     if (v.null) { in.knull = true; in.ty = Ty::F64; in.approx = true; return emit(std::move(in)); }
-    if (!v.numeric) return fail("text literal");
+    if (!v.numeric) {
+      if (v.temporal) return fail("temporal literal");
+      in.ty = Ty::Str;
+      in.ki = (int64_t)P.lits.size();
+      P.lits.push_back(v.str());
+      return emit(std::move(in));
+    }
     if (v.approx) { in.ty = Ty::F64; in.approx = true; in.kf = v.num; return emit(std::move(in)); }
     const std::string& t = v.str();
     if (t.find_first_of(".eE") == std::string::npos && t.size() <= 18) {
@@ -199,6 +236,12 @@ struct Compiler {
     in.ty = Ty::F64;
     in.dec = true;
     in.kf = v.num;
+    {
+      double f = std::fabs(v.num);
+      int k = 0;
+      while (f != std::floor(f) && k < 60) { f *= 2; ++k; }
+      in.dyadic = f == std::floor(f) && std::fabs(v.num) < 9e15;
+    }
     return emit(std::move(in));
   }
 
@@ -245,12 +288,15 @@ struct Compiler {
     return emit(std::move(in));
   }
   static bool decimalish(const Ins& x) { return x.dec || x.taint; }
+  static bool is_text(const Ins& x) { return x.ty == Ty::Str; }
+  // an exact value a double holds exactly: a dyadic literal, or + - * and unary minus of such
+  static bool exact_dyadic(const Ins& x) { return (x.dec && x.dyadic) || x.exact_dyadic; }
 
   // Both operands' numbers as one lane type: doubles if either is one.
   bool numeric_pair(uint32_t a, uint32_t b, Ty* ty, bool* approx) {
     const Ins& x = at(a);
     const Ins& y = at(b);
-    if (x.uns || y.uns) return false;
+    if (x.uns || y.uns || x.ty == Ty::Str || y.ty == Ty::Str) return false;
     *ty = (x.ty == Ty::F64 || y.ty == Ty::F64) ? Ty::F64 : Ty::I64;
     *approx = x.approx || y.approx;
     // An exact decimal (or a value that may be one) beside an exact number: DECIMAL arithmetic, whose digits are
@@ -259,7 +305,9 @@ struct Compiler {
     // (a tainted double - one that could be a decimal at some rows - beside an exact integer is the double's
     // arithmetic at the rows that matter; at a row where the decimal won, an exact result the double also
     // holds, as 0.0 * 4096 and 131071.0 * 4096 are)
-    auto exact_decimal = [](const Ins& v) { return v.dec || (v.taint && !v.approx); };
+    // A decimal literal a double holds exactly (1.0) beside an integer: screen_h - 1.0 is the decimal 167.0 to the
+    // interpreter and exactly 167 in the lane - the same number, so a tainted exact double (its text is not).
+    auto exact_decimal = [](const Ins& v) { return (v.dec && !v.dyadic) || (v.taint && !v.approx && !exact_dyadic(v)); };
     if ((exact_decimal(x) && !y.approx && !y.knull) || (exact_decimal(y) && !x.approx && !x.knull)) return false;
     return true;
   }
@@ -279,8 +327,12 @@ struct Compiler {
         if (e->args.size() != 1) return fail();
         const uint32_t a = compile(e->args[0].get());
         if (!ok) return 0;
-        if (at(a).uns) return fail();
-        return unary(Ins::Neg, a, at(a).ty, at(a).approx, decimalish(at(a)));
+        if (at(a).uns || is_text(at(a))) return fail("text operand");
+        {
+          const uint32_t r = unary(Ins::Neg, a, at(a).ty, at(a).approx, decimalish(at(a)));
+          if (exact_dyadic(at(a))) P.ins[r].exact_dyadic = true;
+          return r;
+        }
       }
       case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div: case ExprOp::Mod: {
         if (e->args.size() != 2) return fail();
@@ -294,6 +346,13 @@ struct Compiler {
           return binary(Ins::Div, a, b, Ty::F64, true, tainted(a, b));
         }
         if (e->op == ExprOp::Mod && ty == Ty::F64 && !approx) return fail("decimal MOD");   // exact decimals' MOD
+        if (ty == Ty::F64 && !approx && (e->op == ExprOp::Add || e->op == ExprOp::Sub || e->op == ExprOp::Mul)) {
+          // an exact result the lane holds exactly while it stays a whole number of halves, quarters.. below 2^53:
+          // the operands are, and a sum or product of two such is one; past 2^53 the double rounds - refused
+          Ins::Op op = e->op == ExprOp::Add ? Ins::Add : e->op == ExprOp::Sub ? Ins::Sub : Ins::Mul;
+          Ins in; in.op = op; in.ty = Ty::F64; in.approx = false; in.taint = true; in.exact_dyadic = true; in.args = {a, b};
+          return emit(std::move(in));
+        }
         const Ins::Op op = e->op == ExprOp::Add ? Ins::Add : e->op == ExprOp::Sub ? Ins::Sub : e->op == ExprOp::Mul ? Ins::Mul : Ins::Mod;
         return binary(op, a, b, ty, approx, tainted(a, b));
       }
@@ -318,7 +377,12 @@ struct Compiler {
         const uint32_t a = compile(l);
         const uint32_t b = compile(r);
         if (!ok) return 0;
-        if (at(a).uns || at(b).uns) return fail();
+        if (at(a).uns || at(b).uns) return fail("unsigned compared");
+        if (is_text(at(a)) || is_text(at(b))) {
+          // two texts compare as texts (= and <> alone: their order is the collation's)
+          if (!is_text(at(a)) || !is_text(at(b))) return fail("text compared with a number");
+          if (e->op != ExprOp::Eq && e->op != ExprOp::Ne) return fail("text order");
+        }
         const Ins::Op op = e->op == ExprOp::Eq ? Ins::Eq : e->op == ExprOp::Ne ? Ins::Ne : e->op == ExprOp::Lt ? Ins::Lt
                          : e->op == ExprOp::Le ? Ins::Le : e->op == ExprOp::Gt ? Ins::Gt : Ins::Ge;
         return binary(op, a, b, Ty::I64, false);
@@ -328,12 +392,14 @@ struct Compiler {
         const uint32_t a = compile(e->args[0].get());
         const uint32_t b = compile(e->args[1].get());
         if (!ok) return 0;
+        if (is_text(at(a)) || is_text(at(b))) return fail("truth of a text");
         return binary(e->op == ExprOp::And ? Ins::And : Ins::Or, a, b, Ty::I64, false);
       }
       case ExprOp::Not: {
         if (e->args.size() != 1) return fail();
         const uint32_t a = compile(e->args[0].get());
         if (!ok) return 0;
+        if (is_text(at(a))) return fail("truth of a text");
         return unary(Ins::Not, a, Ty::I64, false);
       }
       case ExprOp::IsNull: {
@@ -389,7 +455,7 @@ struct Compiler {
             if (!ok) return 0;
             in.args.push_back(a);
             const bool is_value = (i % 2 == 1) || (i + 1 == e->args.size() && e->args.size() % 2 == 1);
-            if (!is_value) continue;
+            if (!is_value) { if (is_text(at(a))) return fail("truth of a text"); continue; }
             if (!same_kind(in, at(a), &first)) return fail("CASE branches of mixed kinds");
           }
           if (first) return fail("CASE of no values");
@@ -413,6 +479,7 @@ struct Compiler {
           if (!ok) return 0;
           if (at(ox).uns) return fail("unsigned CASE operand");
         }
+        const bool ox_text = !text_case && is_text(at(ox));
         for (size_t i = 1; i + 1 < e->args.size(); i += 2) {
           uint32_t cond;
           if (text_case) {
@@ -421,6 +488,7 @@ struct Compiler {
             const uint32_t v = compile(e->args[i].get());
             if (!ok) return 0;
             if (at(v).uns) return fail("unsigned CASE value");
+            if (is_text(at(v)) != ox_text) return fail("text compared with a number");
             cond = binary(Ins::Eq, ox, v, Ty::I64, false);
           }
           if (!ok) return 0;
@@ -448,14 +516,14 @@ struct Compiler {
           if (n != 1) return fail();
           const uint32_t a = compile(e->args[0].get());
           if (!ok) return 0;
-          if (at(a).uns) return fail();
+          if (at(a).uns || is_text(at(a))) return fail("text operand");
           return unary(op, a, ty, approx);
         };
         if (up == "ABS"sv || up == "FLOOR"sv || up == "CEIL"sv || up == "CEILING"sv) {
           if (n != 1) return fail();
           const uint32_t a = compile(e->args[0].get());
           if (!ok) return 0;
-          if (at(a).uns) return fail();
+          if (at(a).uns || is_text(at(a))) return fail("text operand");
           // FLOOR of an exact decimal is an exact integer, of a double a double: the same number, so tainted
           return unary(up == "ABS"sv ? Ins::Abs : up == "FLOOR"sv ? Ins::Floor : Ins::Ceil, a, at(a).ty, at(a).approx, decimalish(at(a)));
         }
@@ -471,7 +539,7 @@ struct Compiler {
           const uint32_t a = compile(e->args[0].get());
           const uint32_t b = compile(e->args[1].get());
           if (!ok) return 0;
-          if (at(a).uns || at(b).uns) return fail();
+          if (at(a).uns || at(b).uns || is_text(at(a)) || is_text(at(b))) return fail("text operand");
           return binary(up == "ATAN2"sv ? Ins::Atan2 : Ins::Pow, a, b, Ty::F64, true);   // a DOUBLE: no taint
         }
         if (up == "__INTDIV"sv) {
@@ -479,7 +547,7 @@ struct Compiler {
           const uint32_t a = compile(e->args[0].get());
           const uint32_t b = compile(e->args[1].get());
           if (!ok) return 0;
-          if (at(a).ty != Ty::I64 || at(b).ty != Ty::I64 || at(a).uns || at(b).uns) return fail();
+          if (at(a).ty != Ty::I64 || at(b).ty != Ty::I64 || at(a).uns || at(b).uns) return fail("DIV operands");
           return binary(Ins::IDiv, a, b, Ty::I64, false);
         }
         if (up == "MOD"sv) {
@@ -496,7 +564,7 @@ struct Compiler {
           const uint32_t a = compile(e->args[0].get());
           const uint32_t b = compile(e->args[1].get());
           if (!ok) return 0;
-          if (at(a).dec || at(b).dec) return fail();
+          if (at(a).dec || at(b).dec || is_text(at(a)) || is_text(at(b))) return fail("bit operand");
           Ins in;
           in.op = up == "__BITAND"sv ? Ins::BitAnd : up == "__BITOR"sv ? Ins::BitOr : up == "__BITXOR"sv ? Ins::BitXor
                 : up == "__SHL"sv ? Ins::Shl : Ins::Shr;
@@ -507,7 +575,7 @@ struct Compiler {
           if (n != 1) return fail();
           const uint32_t a = compile(e->args[0].get());
           if (!ok) return 0;
-          if (at(a).dec) return fail();
+          if (at(a).dec || is_text(at(a))) return fail("bit operand");
           Ins in; in.op = Ins::BitNot; in.ty = Ty::I64; in.uns = true; in.args = {a};
           return emit(std::move(in));
         }
@@ -515,10 +583,10 @@ struct Compiler {
           if (n < 2 || !e->args[1] || e->args[1]->op != ExprOp::Literal) return fail();
           const std::string target = upper_of(e->args[1]->literal.str());
           const std::string_view pg = n > 2 && e->args[2] ? e->args[2]->literal.sv() : std::string_view();
-          if (!pg.empty()) return fail();   // x::type's own roundings
+          if (!pg.empty()) return fail("x::type cast");   // x::type's own roundings
           const uint32_t a = compile(e->args[0].get());
           if (!ok) return 0;
-          if (at(a).uns) return fail();
+          if (is_text(at(a))) return fail("CAST of a text");
           // CAST(x AS SIGNED) rounds half away from zero, an exact decimal on its digits and a double on its 15
           // significant digits as written (round_double_as_written): the same integer for either reading of
           // the lane's number. CAST AS DOUBLE is a DOUBLE of either. Both erase the text, and the taint.
@@ -549,9 +617,14 @@ struct Compiler {
             const uint32_t a = compile(e->args[i].get());
             if (!ok) return 0;
             in.args.push_back(a);
-            // NULLIF(x, y) is x or NULL: y only decides, and may be of any numeric kind
-            if (up == "NULLIF"sv && i == 1) { if (at(a).uns) return fail(); continue; }
-            if (!same_kind(in, at(a), &first)) return fail();
+            // NULLIF(x, y) is x or NULL: y only decides, and may be of any numeric kind (or a text beside a text)
+            if (up == "NULLIF"sv && i == 1) {
+              if (at(a).uns) return fail("unsigned NULLIF");
+              if (is_text(at(a)) != is_text(at(in.args[0]))) return fail("text compared with a number");
+              continue;
+            }
+            if ((up == "GREATEST"sv || up == "LEAST"sv) && is_text(at(a))) return fail("text order");
+            if (!same_kind(in, at(a), &first)) return fail("branches of mixed kinds");
           }
           if (first) return fail();
           return emit(std::move(in));
@@ -581,6 +654,7 @@ struct Compiler {
       while (i < k.size() && std::isalpha((unsigned char)k[i])) ++i;
       k = k.substr(0, i);
       *known = true;
+      if (is_text(at(a))) return fail("text into a routine parameter");
       if (k == "int" || k == "integer" || k == "bigint" || k == "smallint" || k == "tinyint" || k == "mediumint") {
         if (at(a).uns) return fail("unsigned into INT");
         if (at(a).ty == Ty::I64) return a;
@@ -638,6 +712,10 @@ struct Compiler {
   bool same_kind(Ins& in, const Ins& v, bool* first) {
     if (v.uns) return false;
     if (v.knull) return true;
+    if (v.ty == Ty::Str || (!*first && in.ty == Ty::Str)) {
+      if (*first) { in.ty = Ty::Str; *first = false; return true; }
+      return in.ty == Ty::Str && v.ty == Ty::Str;
+    }
     if (*first) { in.ty = v.ty; in.approx = v.approx; in.taint = decimalish(v); *first = false; return true; }
     if (in.ty == Ty::I64 && v.ty == Ty::I64) return true;
     if (in.ty == Ty::I64) { in.ty = Ty::F64; in.taint = true; }   // the integers so far were exact: now a mix
@@ -685,7 +763,7 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
     std::vector<double>& vf = L.f[x];
     std::vector<uint8_t>& nl = L.n[x];
     nl.assign(n, 0);
-    if (in.ty == Ty::I64) vi.assign(n, 0); else vf.assign(n, 0);
+    if (in.ty != Ty::F64) vi.assign(n, 0); else vf.assign(n, 0);
     auto A = [&](size_t k) -> const std::vector<int64_t>& { return L.i[in.args[k]]; };
     auto F = [&](size_t k) -> const std::vector<double>& { return L.f[in.args[k]]; };
     auto N = [&](size_t k) -> const std::vector<uint8_t>& { return L.n[in.args[k]]; };
@@ -696,9 +774,19 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
     switch (in.op) {
       case Ins::Konst:
         if (in.knull) std::fill(nl.begin(), nl.end(), 1);
-        else if (in.ty == Ty::I64) std::fill(vi.begin(), vi.end(), in.ki);
+        else if (in.ty != Ty::F64) std::fill(vi.begin(), vi.end(), in.ki);   // an integer, or a text literal's reference
         else std::fill(vf.begin(), vf.end(), in.kf);
         break;
+      case Ins::ColS: {
+        const ColumnStore& cs = *in.cs;
+        const int64_t hi = (int64_t)((uint64_t)(in.slot + 1) << 32);
+        for (size_t j = 0; j < n; ++j) {
+          const size_t r = row_of(j);
+          if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
+          vi[j] = hi | (int64_t)vx::code_at(cs, r);
+        }
+        break;
+      }
       case Ins::ColI: case Ins::ColF: {
         const ColumnStore& cs = *in.cs;
         const bool nulls = vx::has_nulls(cs);
@@ -761,6 +849,12 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
             const double a = fd(0, j), b = fd(1, j);
             const double r = in.op == Ins::Add ? a + b : in.op == Ins::Sub ? a - b : a * b;
             if (!std::isfinite(r)) { *err = "DOUBLE value is out of range in 'expression'"; return false; }
+            if (in.exact_dyadic) {
+              // the interpreter's exact decimal: the lane must hold it exactly (a sum of halves below 2^52 does;
+              // a product of two 30-bit values may not) - else the interpreter's path
+              if (std::fabs(r) >= 4503599627370496.0 || (in.op == Ins::Mul && std::fabs(a) >= 1073741824.0 && std::fabs(b) >= 1073741824.0) ||
+                  (in.op == Ins::Mul && std::fma(a, b, -r) != 0)) { *err = "exact decimal past a double"; return false; }
+            }
             vf[j] = r;
           }
         }
@@ -800,10 +894,12 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
         break;
       case Ins::Eq: case Ins::Ne: case Ins::Lt: case Ins::Le: case Ins::Gt: case Ins::Ge: {
         const bool both_int = ty(0) == Ty::I64 && ty(1) == Ty::I64;
+        const bool texts = ty(0) == Ty::Str;   // then both are (the compiler saw to it)
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j] || N(1)[j]) { nl[j] = 1; continue; }
           int c;
-          if (both_int) { const int64_t a = A(0)[j], b = A(1)[j]; c = a < b ? -1 : a > b ? 1 : 0; }
+          if (texts) c = pad_compare_ci(P.text_of(A(0)[j]), P.text_of(A(1)[j]));
+          else if (both_int) { const int64_t a = A(0)[j], b = A(1)[j]; c = a < b ? -1 : a > b ? 1 : 0; }
           else { const double a = fd(0, j), b = fd(1, j); c = a < b ? -1 : a > b ? 1 : 0; }
           vi[j] = in.op == Ins::Eq ? c == 0 : in.op == Ins::Ne ? c != 0 : in.op == Ins::Lt ? c < 0
                 : in.op == Ins::Le ? c <= 0 : in.op == Ins::Gt ? c > 0 : c >= 0;
@@ -853,7 +949,7 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
           }
           if (hit < 0 && has_else) hit = (int)(na - 1);
           if (hit < 0 || N((size_t)hit)[j]) { nl[j] = 1; continue; }
-          if (in.ty == Ty::I64) vi[j] = L.i[in.args[(size_t)hit]][j]; else vf[j] = fd((size_t)hit, j);
+          if (in.ty != Ty::F64) vi[j] = L.i[in.args[(size_t)hit]][j]; else vf[j] = fd((size_t)hit, j);
         }
         break;
       }
@@ -862,17 +958,18 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
           size_t k = 0;
           while (k < in.args.size() && N(k)[j]) ++k;
           if (k == in.args.size()) { nl[j] = 1; continue; }
-          if (in.ty == Ty::I64) vi[j] = L.i[in.args[k]][j]; else vf[j] = fd(k, j);
+          if (in.ty != Ty::F64) vi[j] = L.i[in.args[k]][j]; else vf[j] = fd(k, j);
         }
         break;
       case Ins::NullIf:
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
           if (!N(1)[j]) {
-            const bool same = (ty(0) == Ty::I64 && ty(1) == Ty::I64) ? A(0)[j] == A(1)[j] : fd(0, j) == fd(1, j);
+            const bool same = ty(0) == Ty::Str ? pad_compare_ci(P.text_of(A(0)[j]), P.text_of(A(1)[j])) == 0
+                            : (ty(0) == Ty::I64 && ty(1) == Ty::I64) ? A(0)[j] == A(1)[j] : fd(0, j) == fd(1, j);
             if (same) { nl[j] = 1; continue; }
           }
-          if (in.ty == Ty::I64) vi[j] = A(0)[j]; else vf[j] = F(0)[j];
+          if (in.ty != Ty::F64) vi[j] = A(0)[j]; else vf[j] = F(0)[j];
         }
         break;
       case Ins::Greatest: case Ins::Least:
@@ -931,6 +1028,13 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       case Ins::CastI:
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
+          if (ty(0) == Ty::I64 && P.ins[in.args[0]].uns) {
+            // the interpreter reads an unsigned bit result through its double (val_u64), and rounds that
+            const double a = (double)(uint64_t)A(0)[j];
+            if (!(a < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
+            vi[j] = (int64_t)std::llround(a);
+            continue;
+          }
           if (ty(0) == Ty::I64) { vi[j] = A(0)[j]; continue; }
           const double a = F(0)[j];
           if (!(std::fabs(a) < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
@@ -944,7 +1048,7 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       case Ins::CastF:
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
-          vf[j] = fd(0, j);
+          vf[j] = P.ins[in.args[0]].uns ? (double)(uint64_t)A(0)[j] : fd(0, j);
         }
         break;
       case Ins::RoundI:
@@ -995,6 +1099,7 @@ inline Val value_at(const Prog& P, const Lanes& L, size_t j) {
   const size_t K = P.ins.size() - 1;
   if (L.n[K][j]) return val_null();
   if (o.ty == Ty::F64) return o.approx ? val_approx(L.f[K][j]) : val_num(L.f[K][j]);
+  if (o.ty == Ty::Str) return val_text(std::string(P.text_of(L.i[K][j])));
   const int64_t v = L.i[K][j];
   if (o.uns) { const uint64_t u = (uint64_t)v; return val_num_with_text((double)u, std::to_string(u)); }
   return val_exact((AIOS_INT128)v, 0);
@@ -1011,6 +1116,7 @@ inline std::string text_at(const Prog& P, const Lanes& L, size_t j) {
     if (d == std::floor(d) && std::fabs(d) < 1e15) return std::to_string((long long)d);
     return sql_format_double(d, 0);
   }
+  if (o.ty == Ty::Str) return std::string(P.text_of(L.i[K][j]));
   if (o.uns) return std::to_string((uint64_t)L.i[K][j]);
   return std::to_string((long long)L.i[K][j]);
 }
@@ -1023,16 +1129,19 @@ struct Column {
   std::vector<int64_t> i;
   std::vector<double> f;
   std::vector<uint8_t> n;
+  std::vector<std::string> s;   // Str: the text per row
   size_t size() const { return n.size(); }
   bool is_null(size_t j) const { return n[j] != 0; }
   Val at(size_t j) const {
     if (n[j]) return val_null();
+    if (ty == Ty::Str) return val_text(s[j]);
     if (ty == Ty::F64) return approx ? val_approx(f[j]) : val_num(f[j]);
     if (uns) { const uint64_t u = (uint64_t)i[j]; return val_num_with_text((double)u, std::to_string(u)); }
     return val_exact((AIOS_INT128)i[j], 0);
   }
   std::string text(size_t j) const {
     if (n[j]) return sql_null();
+    if (ty == Ty::Str) return s[j];
     if (ty == Ty::F64) {
       const double d = f[j];
       if (d == 0 && approx && std::signbit(d)) return "-0";
@@ -1050,7 +1159,8 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
   out->n.assign(total, 0);
-  if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
+  if (o.ty == Ty::Str) out->s.assign(total, std::string());
+  else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
   const size_t chunk = 4096;
   const size_t K = P.ins.size() - 1;
@@ -1062,7 +1172,8 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
     };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
-    if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
     else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
   }
   return true;
@@ -1074,7 +1185,8 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
   out->n.assign(total, 0);
-  if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
+  if (o.ty == Ty::Str) out->s.assign(total, std::string());
+  else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
   const size_t chunk = 4096;
   const size_t K = P.ins.size() - 1;
@@ -1083,7 +1195,8 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
     auto rowid = [&](size_t j, uint32_t src) -> size_t { return src == 0 ? (size_t)ids(at + j) : kNullRow; };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
-    if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
     else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
   }
   return true;

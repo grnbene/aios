@@ -2091,19 +2091,24 @@ stays open), and its redo record is never written.
 - Expressions are compiled into vectorized programs (`src/userland/sql_vprog.inc`)
   where the program is certain to give the interpreter's answer: integer and
   DOUBLE columns, literals, arithmetic, comparisons, AND/OR/NOT, IS NULL,
-  CASE/IF/COALESCE/NULLIF/GREATEST/LEAST over one type, ABS/FLOOR/CEIL, SQRT,
-  POWER and the trigonometry, CAST to SIGNED or DOUBLE, DIV, MOD, the bit
-  operators, and `text_col = 'lit'` / `IN ('a', 'b')` over a dictionary-coded
-  column. A program runs over a whole set of rows in lanes of int64 / double
-  with a null byte per row - an aggregate's argument over its group (or over
-  every group's rows at once, when the groups are many and small), a GROUP BY
+  CASE (both forms) / IF / COALESCE / NULLIF / GREATEST / LEAST over one type,
+  BETWEEN, ABS/FLOOR/CEIL, SQRT, POWER and the trigonometry, CAST to SIGNED or
+  DOUBLE, DIV, MOD, the bit operators, dictionary-coded text columns and text
+  literals through CASE / COALESCE / NULLIF, `=`, `<>` and `IN`, and a call of
+  a stored function whose body is `RETURN <expression>` (inlined, the
+  arguments coerced as a call coerces them). A program runs over a whole set of
+  rows in lanes of int64 / double (a text lane holds dictionary codes) with a
+  null byte per row - an aggregate's argument over its group (or over every
+  group's rows at once, when the groups are many and small), a GROUP BY
   expression, a join's expression key over the probe rows, a select item over
   the output rows, and the single-table path's expression sources. Anything
-  else - a subquery, a string function, DECIMAL arithmetic (whose digits the
-  interpreter carries), a text-valued CASE - stays with the interpreter, as
-  does a value that might be an exact decimal at some rows and a DOUBLE at
-  others (`GREATEST(0.0, d)` printed, though not `CAST(GREATEST(0.0, d) AS
-  SIGNED)`, whose rounding is the same either way). `AIOS_SQL_VPROG=0` turns
+  else - a subquery, a string function, DECIMAL columns and arithmetic (whose
+  digits the interpreter carries), the order of texts - stays with the
+  interpreter. A value that might be an exact decimal or an exact integer at
+  some rows and a DOUBLE at others (`GREATEST(0.0, d)`, `GREATEST(0, FLOOR(d)
+  + n)`) is carried as a tainted double: the number is right, the text may not
+  be, so only a CAST, a comparison or a truth test may read it, never a
+  printed result. `AIOS_SQL_VPROG=0` turns
   it off; `AIOS_VX_TRACE=1` prints `vp: compiled` / `vp: interpreted (why)` per
   expression. SQRT, EXP, LOG, the trigonometry, POWER and CAST AS DOUBLE give a
   DOUBLE of any argument, as MySQL's do: `SQRT(4) / 8` is 0.25, not the
