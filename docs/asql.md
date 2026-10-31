@@ -2108,9 +2108,17 @@ stays open), and its redo record is never written.
   some rows and a DOUBLE at others (`GREATEST(0.0, d)`, `GREATEST(0, FLOOR(d)
   + n)`) is carried as a tainted double: the number is right, the text may not
   be, so only a CAST, a comparison or a truth test may read it, never a
-  printed result. `AIOS_SQL_VPROG=0` turns
+  printed result. A program decodes each column it reads in blocks once per
+  evaluation and gathers by row id, and a dictionary's entries are parsed to
+  numbers once per column on each thread; `CAST(d AS SIGNED)` rounds with
+  `std::round` except within the rendering's resolution of a half, where the
+  interpreter's as-written rounding decides. `AIOS_SQL_VPROG=0` turns
   it off; `AIOS_VX_TRACE=1` prints `vp: compiled` / `vp: interpreted (why)` per
-  expression. SQRT, EXP, LOG, the trigonometry, POWER and CAST AS DOUBLE give a
+  expression. (`AIOS_SQL_PRETYPE=1` gives a result table's INT and DOUBLE
+  columns typed encodings as it is filled instead of dictionaries: off by
+  default while results flow as text between a CTE and its readers, since a
+  typed cell is formatted on every copy out where a dictionary hands over its
+  string, and a SQLDoom frame measured slower with it on.) SQRT, EXP, LOG, the trigonometry, POWER and CAST AS DOUBLE give a
   DOUBLE of any argument, as MySQL's do: `SQRT(4) / 8` is 0.25, not the
   DECIMAL 0.2500 an exact 2 would divide to.
 - Join steps, where the programs reach them: a WHERE conjunct pushed down to a

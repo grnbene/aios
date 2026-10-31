@@ -46,9 +46,15 @@ struct Ins {
   const ColumnStore* cs = nullptr;
   std::vector<uint32_t> args;
   std::shared_ptr<const RowInSet> set;   // TupleIn: the subquery's rows
-  std::vector<int64_t> code_i;      // CodeI: per dictionary code
-  std::vector<double> code_f;       // CodeF
-  std::vector<uint8_t> code_null;   // CodeI / CodeF: 1 where the code is NULL; StrIn: 1 where the code matches
+  // CodeI / CodeF: the dictionary's entries as numbers, one per code, shared across the programs that read the
+  // column (CodeTable); StrIn: 1 per code where the entry matches.
+  struct CodeTable { std::vector<int64_t> i; std::vector<double> f; std::vector<uint8_t> null; };
+  std::shared_ptr<const CodeTable> codes;
+  std::vector<uint8_t> code_null;
+  const std::vector<int64_t>& code_i() const { return codes->i; }
+  const std::vector<double>& code_f() const { return codes->f; }
+  size_t code_count() const { return codes ? codes->null.size() : code_null.size(); }
+  bool code_is_null(uint32_t k) const { return codes ? codes->null[k] != 0 : code_null[k] != 0; }
 };
 
 struct Prog {
@@ -141,29 +147,49 @@ struct Compiler {
     return true;
   }
 
-  // A dictionary's codes as numbers, once.
+  // A dictionary's entries as numbers, one per code: worked out once per column and dictionary size and kept on
+  // this thread (CodeCache), since every program over the column asks for the same table and a result table's
+  // 50,000-entry dictionary took milliseconds to parse per statement.
+  struct CodeCache {
+    struct Entry { uint64_t uid; size_t n; bool as_int; std::shared_ptr<const Ins::CodeTable> table; bool bad; };
+    std::vector<Entry> entries;   // a few dozen live at once; cleared when many have gone stale
+  };
+  static CodeCache& code_cache() { thread_local CodeCache c; return c; }
   bool codes_of(const ColumnStore& cs, bool as_int, Ins* in) {
     if (cs.shared_dict) return false;
     const size_t n = vx::dict_size(cs);
     if (n == 0 || n > (1u << 20)) return false;
-    in->code_null.assign(n, 0);
-    if (as_int) in->code_i.assign(n, 0); else in->code_f.assign(n, 0);
-    for (size_t k = 0; k < n; ++k) {
+    CodeCache& cc = code_cache();
+    for (const auto& e : cc.entries)
+      if (e.uid == cs.uid.v && e.n == n && e.as_int == as_int) {
+        if (e.bad) return false;
+        in->codes = e.table;
+        return true;
+      }
+    auto t = std::make_shared<Ins::CodeTable>();
+    t->null.assign(n, 0);
+    if (as_int) t->i.assign(n, 0); else t->f.assign(n, 0);
+    bool ok = true;
+    for (size_t k = 0; ok && k < n; ++k) {
       const std::string& s = vx::dict_entry(cs, (uint32_t)k);
-      if (sql_is_null(s)) { in->code_null[k] = 1; continue; }
+      if (sql_is_null(s)) { t->null[k] = 1; continue; }
       double d = 0;
-      if (!parse_number(s, &d)) return false;
+      if (!parse_number(s, &d)) { ok = false; break; }
       if (as_int) {
-        if (d != std::floor(d) || std::fabs(d) >= 9.2e18) return false;
+        if (d != std::floor(d) || std::fabs(d) >= 9.2e18) { ok = false; break; }
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(s.c_str(), &end, 10);
-        if (errno == ERANGE || !end || *end != '\0') return false;
-        in->code_i[k] = v;
+        if (errno == ERANGE || !end || *end != '\0') { ok = false; break; }
+        t->i[k] = v;
       } else {
-        in->code_f[k] = d;
+        t->f[k] = d;
       }
     }
+    if (cc.entries.size() >= 512) cc.entries.clear();
+    cc.entries.push_back({cs.uid.v, n, as_int, ok ? t : nullptr, !ok});
+    if (!ok) return false;
+    in->codes = t;
     return true;
   }
 
@@ -783,6 +809,35 @@ struct Lanes {
   std::vector<std::vector<int64_t>> i;
   std::vector<std::vector<double>> f;
   std::vector<std::vector<uint8_t>> n;   // 1: NULL
+  // A column read by the program, decoded whole once (the kernels' block decoders) and gathered by row id, where
+  // the column is not much larger than the row set: a per-row accessor (a switch on the encoding, a bit unpack)
+  // was 20-40 ns a cell, most of a 55-op program's time.
+  size_t total_rows = 0;
+  struct Cached { std::vector<int64_t> i; std::vector<double> f; std::vector<uint32_t> c; bool ints = false, dbls = false, codes = false; };
+  std::unordered_map<const ColumnStore*, Cached> cols;
+  Cached* cached(const ColumnStore& cs) {
+    const size_t sz = cs.size();
+    if (sz > std::max<size_t>(65536, total_rows * 4)) return nullptr;
+    return &cols[&cs];
+  }
+  const int64_t* ints(const ColumnStore& cs) {
+    Cached* cc = cached(cs);
+    if (!cc) return nullptr;
+    if (!cc->ints) { cc->i.resize(cs.size()); if (cs.size()) vx::typed_ints(cs, 0, cs.size(), cc->i.data()); cc->ints = true; }
+    return cc->i.data();
+  }
+  const double* dbls(const ColumnStore& cs) {
+    Cached* cc = cached(cs);
+    if (!cc) return nullptr;
+    if (!cc->dbls) { cc->f.resize(cs.size()); if (cs.size()) vx::typed_values(cs, 0, cs.size(), cc->f.data()); cc->dbls = true; }
+    return cc->f.data();
+  }
+  const uint32_t* codes(const ColumnStore& cs) {
+    Cached* cc = cached(cs);
+    if (!cc) return nullptr;
+    if (!cc->codes) { cc->c.resize(cs.size()); if (cs.size()) vx::decode_codes(cs, 0, cs.size(), cc->c.data()); cc->codes = true; }
+    return cc->c.data();
+  }
 };
 
 // Evaluates P over n rows, rowid(j, src) being row j's row in source src (or kNullRow). False with *err set when
@@ -815,10 +870,11 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       case Ins::ColS: {
         const ColumnStore& cs = *in.cs;
         const int64_t hi = (int64_t)((uint64_t)(in.slot + 1) << 32);
+        const uint32_t* cc = L.codes(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          vi[j] = hi | (int64_t)vx::code_at(cs, r);
+          vi[j] = hi | (int64_t)(cc ? cc[r] : vx::code_at(cs, r));
         }
         break;
       }
@@ -826,22 +882,26 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
         const ColumnStore& cs = *in.cs;
         const bool nulls = vx::has_nulls(cs);
         const bool as_int = vx::typed_integer(cs);
+        const int64_t* ci = (in.op == Ins::ColI || as_int) ? L.ints(cs) : nullptr;
+        const double* cf = (in.op == Ins::ColF && !as_int) ? L.dbls(cs) : nullptr;
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { nl[j] = 1; continue; }
-          if (in.op == Ins::ColI) vi[j] = vx::typed_int(cs, r);
-          else vf[j] = as_int ? (double)vx::typed_int(cs, r) : vx::typed_value(cs, r);
+          if (in.op == Ins::ColI) vi[j] = ci ? ci[r] : vx::typed_int(cs, r);
+          else if (as_int) vf[j] = (double)(ci ? ci[r] : vx::typed_int(cs, r));
+          else vf[j] = cf ? cf[r] : vx::typed_value(cs, r);
         }
         break;
       }
       case Ins::CodeI: case Ins::CodeF: {
         const ColumnStore& cs = *in.cs;
+        const uint32_t* cc = L.codes(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          const uint32_t k = vx::code_at(cs, r);
-          if (k >= in.code_null.size() || in.code_null[k]) { nl[j] = 1; continue; }
-          if (in.op == Ins::CodeI) vi[j] = in.code_i[k]; else vf[j] = in.code_f[k];
+          const uint32_t k = cc ? cc[r] : vx::code_at(cs, r);
+          if (k >= in.code_count() || in.code_is_null(k)) { nl[j] = 1; continue; }
+          if (in.op == Ins::CodeI) vi[j] = in.code_i()[k]; else vf[j] = in.code_f()[k];
         }
         break;
       }
@@ -855,10 +915,11 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       }
       case Ins::StrIn: {
         const ColumnStore& cs = *in.cs;
+        const uint32_t* cc = L.codes(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          const uint32_t k = vx::code_at(cs, r);
+          const uint32_t k = cc ? cc[r] : vx::code_at(cs, r);
           vi[j] = k < in.code_null.size() && in.code_null[k] ? 1 : 0;
         }
         break;
@@ -1061,23 +1122,35 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
         }
         break;
       case Ins::CastI:
+        // The interpreter's CAST(x AS SIGNED) is val_num((double)v): past 1e15 it prints as a double (1e15) and
+        // past 2^53 loses digits - such a value takes the interpreter's path, so the text is its own.
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
           if (ty(0) == Ty::I64 && P.ins[in.args[0]].uns) {
             // the interpreter reads an unsigned bit result through its double (val_u64), and rounds that
             const double a = (double)(uint64_t)A(0)[j];
-            if (!(a < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
+            if (!(a < 1e15)) { *err = "CAST past 1e15: the interpreter's text"; return false; }
             vi[j] = (int64_t)std::llround(a);
             continue;
           }
-          if (ty(0) == Ty::I64) { vi[j] = A(0)[j]; continue; }
+          if (ty(0) == Ty::I64) {
+            if (A(0)[j] >= 1000000000000000LL || A(0)[j] <= -1000000000000000LL) { *err = "CAST past 1e15: the interpreter's text"; return false; }
+            vi[j] = A(0)[j];
+            continue;
+          }
           const double a = F(0)[j];
-          if (!(std::fabs(a) < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
+          if (!(std::fabs(a) < 1e15)) { *err = "CAST past 1e15: the interpreter's text"; return false; }
           // a DOUBLE as ROUND rounds it: half away from zero on its 15 significant digits, as written; an exact
-          // decimal (a literal's lane) on its value
-          Val r;
-          if (!P.ins[in.args[0]].approx) vi[j] = (int64_t)std::llround(a);
-          else vi[j] = round_double_as_written(a, 0, &r) ? (int64_t)std::llround(r.num) : (int64_t)std::nearbyint(a);
+          // decimal (a literal's lane) on its value. Writing the double out and reading it back is ~300 ns a
+          // row, so it is done only where it can differ from std::round: a fraction within the rendering's
+          // resolution of a half (2.4999999999999996 is written 2.5).
+          if (!P.ins[in.args[0]].approx) { vi[j] = (int64_t)std::llround(a); continue; }
+          const double fl = std::floor(a);
+          const double frac = a - fl;
+          const double tol = std::fabs(a) * 1e-13 + 1e-13;
+          if (frac == 0) vi[j] = (int64_t)a;
+          else if (std::fabs(frac - 0.5) > tol) vi[j] = (int64_t)std::round(a);
+          else { Val r; vi[j] = round_double_as_written(a, 0, &r) ? (int64_t)std::llround(r.num) : (int64_t)std::nearbyint(a); }
         }
         break;
       case Ins::CastF:
@@ -1111,9 +1184,14 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       case Ins::RoundI:
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
-          if (ty(0) == Ty::I64) { vi[j] = A(0)[j]; continue; }
+          // (a routine's INT coercion is val_num(std::round(n)) too: past 1e15 it prints as a double)
+          if (ty(0) == Ty::I64) {
+            if (A(0)[j] >= 1000000000000000LL || A(0)[j] <= -1000000000000000LL) { *err = "INT past 1e15: the interpreter's text"; return false; }
+            vi[j] = A(0)[j];
+            continue;
+          }
           const double a = std::round(F(0)[j]);
-          if (!(std::fabs(a) < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
+          if (!(std::fabs(a) < 1e15)) { *err = "INT past 1e15: the interpreter's text"; return false; }
           vi[j] = (int64_t)a;
         }
         break;
@@ -1219,6 +1297,7 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
   if (o.ty == Ty::Str) out->s.assign(total, std::string());
   else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
+  L.total_rows = total;
   const size_t chunk = 4096;
   const size_t K = P.ins.size() - 1;
   for (size_t at = 0; at < total; at += chunk) {
@@ -1245,6 +1324,7 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
   if (o.ty == Ty::Str) out->s.assign(total, std::string());
   else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
+  L.total_rows = total;
   const size_t chunk = 4096;
   const size_t K = P.ins.size() - 1;
   for (size_t at = 0; at < total; at += chunk) {
@@ -1273,7 +1353,7 @@ inline bool valid(const Prog& P, const EvalCtx& ctx) {
       if (&cs == in.cs) { found = true; break; }
     if (!found || in.cs->size() != t->row_count()) return false;
     // a dictionary that has grown since: codes the tables do not know
-    if ((in.op == Ins::CodeI || in.op == Ins::CodeF || in.op == Ins::StrIn) && vx::dict_size(*in.cs) != in.code_null.size()) return false;
+    if ((in.op == Ins::CodeI || in.op == Ins::CodeF || in.op == Ins::StrIn) && vx::dict_size(*in.cs) != in.code_count()) return false;
   }
   return true;
 }
