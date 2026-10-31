@@ -82,8 +82,18 @@ A result table's typed columns are read as numbers where the row path's dictiona
   group's first row.
 - **3d: the last copy.** The batch is still copied into column stores; a table could adopt its lanes directly
   (an I64 column's vector becomes `int64_data`).
-- **4: batched joins.** The join still probes one base row at a time; keys are already in lanes, so the probe
-  can run over a batch of them and gather candidates in a tight loop. The next largest cost after the handoff.
+- **4: batched joins (first step done).** Where every key of a join step is a number the base row already holds
+  (a program's lanes, or a typed column of an earlier table) and the joined side's other keys are typed, a base
+  row's matches are read straight off the index's number map and checked as numbers - no Val, context or
+  candidate list per row (`batch_probe`). Several keys go through a step-local hash of the joined rows by all of
+  them, built by walking the probing key's index lists in their own order, so each list holds exactly the
+  candidates and order the old per-row check kept. It makes the same rows in the same order: same candidates (0
+  still finds the rows with no digits), same ON, prefilter, WHERE, padding. Not for a key a double may not carry,
+  a dictionary-code or parent/child link, or a key held as text. `AIOS_SQL_BATCH_JOIN=0` turns it off.
+  Measured: the probes it covers run 1.3-5x faster (`m` 66 -> 13 ms, `p` 59 -> 17 ms over three frames); the
+  frame's median over nine steady frames fell ~75 ms (1,115 -> 1,039 and 1,016 -> 942 ms in two alternating
+  rounds). Not yet covered: LATERAL keys (`__LATKEY`), text keys; next, the index's own number map (an
+  `unordered_map<double, vector>`, a hash and two cache misses a probe) as a flat open-addressed table.
 
 Trade-offs taken: the path is opt-out, not opt-in, because every consumer that declines gets exactly the old rows;
 code size is 223 lines in one new file (`sql_colbatch.inc`) and about 440 lines of hooks and typed appends in

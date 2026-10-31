@@ -46056,15 +46056,17 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         };
         // Which keys' columns hold typed numbers, read as numbers below.
         std::vector<char> key_typed(prep_jkeys.size(), 0);
-        if (!js.table->inferred_types) {
-          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-            const int c = prep_jkeys[ki].column;
-            if (c < 0 || (size_t)c >= js.table->col_data.size()) continue;
-            const ColumnStore& kcs = js.table->col_data[c];
-            if (kcs.size() != js.table->row_count()) continue;
+        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+          const int c = prep_jkeys[ki].column;
+          if (c < 0 || (size_t)c >= js.table->col_data.size()) continue;
+          const ColumnStore& kcs = js.table->col_data[c];
+          if (kcs.size() != js.table->row_count()) continue;
+          if (!js.table->inferred_types)
             key_typed[ki] = vx::typed_integer(kcs) || kcs.encoding == ColumnEncoding::TypedDouble ||
                             kcs.encoding == ColumnEncoding::DecimalScaled;
-          }
+          else   // a result table's typed column (sql_colbatch.inc): canonical values, whose text reads back as the number
+            key_typed[ki] = kcs.encoding == ColumnEncoding::TypedInt64 || kcs.encoding == ColumnEncoding::TypedInt32 ||
+                            kcs.encoding == ColumnEncoding::TypedDouble;
         }
         // Direct-Code Equi-Join: when both sides of best_ki are dictionary-coded columns,
         // map base dictionary codes to joined dictionary codes via star_code_map.
@@ -46388,6 +46390,152 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               if (col.is_null(r) || (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0)) base_refused[r] = 1;
           }
         }
+        // The batched probe: where every key of the step is a number this row already holds - the probing key in a
+        // program's lanes or a typed column of an earlier table, each other key likewise and a typed column on the
+        // joined side - a base row's matches are read straight off the index's number map and checked against the
+        // other keys as numbers, with no Val, context or candidate list per row. It makes exactly the rows
+        // process_probe makes, in the same order: the same candidates (the index's list for the number; for 0,
+        // the digitless rows too, through probe_gather_matches), the same ON, prefilter, WHERE and padding.
+        // Not for a key whose numbers a double may not carry (best_wide), a dictionary-code or parent/child link,
+        // or a key held as text. AIOS_SQL_BATCH_JOIN=0 turns it off.
+        struct NumKey { const vp::Column* lane = nullptr; const ColumnStore* cs = nullptr; size_t src = 0; bool ints = false; };
+        std::vector<NumKey> numkeys(prep_jkeys.size());
+        static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
+        bool batch_ok = batch_join_on && best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx && !link_to_parent && !link_to_kids &&
+                        !direct_code_join && !best_wide && !xk_join;
+        for (size_t ki = 0; batch_ok && ki < prep_jkeys.size(); ++ki) {
+          NumKey& nk = numkeys[ki];
+          if (ki < vp_key_ok.size() && vp_key_ok[ki] && vp_keys[ki].ty != vp::Ty::Str && !vp_keys[ki].uns) {
+            nk.lane = &vp_keys[ki];
+          } else {
+            const SqlExpr* kv = prep_jkeys[ki].value;
+            size_t ks = 0, kc = 0;
+            if (!kv || kv->op != ExprOp::Column || lookup_column_here(basectx, *kv, &ks, &kc) != ColumnLookup::Found ||
+                ks >= baseonly.size() || !baseonly[ks].table || kc >= baseonly[ks].table->col_data.size()) { batch_ok = false; break; }
+            const SqlTable& bt = *baseonly[ks].table;
+            const ColumnStore& bcs = bt.col_data[kc];
+            const bool typed_int = bcs.encoding == ColumnEncoding::TypedInt64 || bcs.encoding == ColumnEncoding::TypedInt32;
+            const bool typed_dbl = bcs.encoding == ColumnEncoding::TypedDouble;
+            // a number the interpreter reads as exactly this value: a declared table's typed integer or double, or a
+            // result table's (its values are canonical)
+            const bool numeric_type = kc < bt.columns.size() && !bt.columns[kc].temporal &&
+                                      (bt.columns[kc].type == SqlDataType::Int || (typed_dbl && bt.columns[kc].type == SqlDataType::Real && bt.columns[kc].scale == 0));
+            if (!numeric_type || bcs.size() != bt.row_count() ||
+                !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) { batch_ok = false; break; }
+            nk.cs = &bcs;
+            nk.src = ks;
+            nk.ints = !typed_dbl;
+          }
+          if ((int)ki != best_ki && !key_typed[ki]) batch_ok = false;
+        }
+        auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
+          if (k.lane) {
+            if (k.lane->is_null(bi)) return false;
+            *out = k.lane->ty == vp::Ty::I64 ? (double)k.lane->i[bi] : k.lane->f[bi];
+            return true;
+          }
+          const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
+          if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
+          *out = k.ints ? (double)vx::typed_int(*k.cs, r) : vx::typed_value(*k.cs, r);
+          return true;
+        };
+        // Several keys: the joined rows by all of them at once, built for this step by walking the probing key's
+        // index lists in their own order - so each composite list holds exactly the candidates the old check kept,
+        // in the order it kept them, and a probe is one lookup instead of a walk of the probing key's list
+        // checking the others (34 levels x 256 palette entries: 34 candidates read per pixel). Only where the
+        // joined table is not much larger than the probe side; NULLs never match, a 0 and a -0 are one key.
+        struct CompKey {
+          double v[4] = {0, 0, 0, 0};
+          bool operator==(const CompKey& o) const { return v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3]; }
+        };
+        struct CompHash {
+          size_t operator()(const CompKey& k) const {
+            uint64_t h = 1469598103934665603ULL;
+            for (double d : k.v) { uint64_t b; std::memcpy(&b, &d, 8); h = (h ^ b) * 1099511628211ULL; h ^= h >> 29; }
+            return (size_t)h;
+          }
+        };
+        std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
+        bool comp_ok = false;
+        if (batch_ok && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
+          const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
+          if (bidx->no_numeric_prefix.empty()) {
+            comp.reserve(bidx->by_number.size() * 2);
+            for (const auto& kv : bidx->by_number) {
+              for (uint32_t mr : kv.second) {
+                if (mr >= js.table->row_count()) continue;
+                CompKey ck;
+                bool null = false;
+                for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
+                  if ((int)ki == best_ki) { ck.v[ki] = kv.first == 0 ? 0.0 : kv.first; continue; }
+                  const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+                  if (kcs.is_null(mr)) { null = true; break; }
+                  const double d = vx::typed_value(kcs, mr);
+                  ck.v[ki] = d == 0 ? 0.0 : d;
+                }
+                if (!null) comp[ck].push_back(mr);
+              }
+            }
+            comp_ok = true;
+          }
+        }
+        auto batch_probe = [&](size_t bi, EvalCtx& ctx, JoinedRows& l_next) {
+          const JoinedRow& base = rows[bi];
+          auto pad = [&]() {
+            if (!join_is_left[j]) return;
+            JoinedRow padded = base;
+            padded.parts.push_back(kNullRow);
+            ctx.row = &padded;
+            for (const SqlExpr* p : pushable) if (!predicate_true(p, ctx)) return;
+            l_next.push_back(std::move(padded));
+          };
+          if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { pad(); return; }
+          bool matched = false;
+          double key = 0;
+          if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
+            const auto* idx = prep_jkeys[(size_t)best_ki].idx.get();
+            auto take = [&](size_t mr) {
+              if (mr >= js.table->row_count()) return;
+              for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+                if ((int)ki == best_ki) continue;
+                double w = 0;
+                if (!numkey(numkeys[ki], bi, base, &w)) return;
+                const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+                if (kcs.is_null(mr) || vx::typed_value(kcs, mr) != w) return;
+              }
+              JoinedRow cand = base;
+              cand.parts.push_back(mr);
+              ctx.row = &cand;
+              if (has_extra_join && !on_true(ctx)) return;
+              matched = true;
+              if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
+              if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) return;
+              for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) return;
+              l_next.push_back(std::move(cand));
+            };
+            if (comp_ok) {
+              CompKey ck;
+              bool null = false;
+              for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
+                double w = key;
+                if ((int)ki != best_ki && !numkey(numkeys[ki], bi, base, &w)) null = true;
+                ck.v[ki] = w == 0 ? 0.0 : w;
+              }
+              if (!null) {
+                auto it = comp.find(ck);
+                if (it != comp.end()) for (uint32_t mr : it->second) take(mr);
+              }
+            } else if (key == 0 && !idx->no_numeric_prefix.empty()) {
+              std::vector<size_t> zero;   // 0 also finds the rows with no digits, merged in row order
+              probe_gather_matches(idx, val_num(0.0), zero);
+              for (size_t mr : zero) take(mr);
+            } else {
+              auto it = idx->by_number.find(key);
+              if (it != idx->by_number.end()) for (uint32_t mr : it->second) take(mr);
+            }
+          }
+          if (!matched) pad();
+        };
         auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, JoinedRows& l_next,
                                  JoinMemo* memo) {
           JoinedRow probe_row = base;
@@ -46499,7 +46647,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
             auto& l_next = local_next[bstart / kJoinChunk];
             for (size_t bi = bstart; bi < bend; ++bi) {
-              process_probe(rows[bi], vctx, ctx, l_next, memo_ok ? &memos[tid] : nullptr);
+              if (batch_ok) batch_probe(bi, ctx, l_next);
+              else process_probe(rows[bi], vctx, ctx, l_next, memo_ok ? &memos[tid] : nullptr);
             }
           });
 
@@ -46533,7 +46682,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           JoinMemo memo;
           for (const JoinedRow& base : rows) {
             if (sql_interrupted()) break;
-            process_probe(base, vctx, ctx, next, memo_ok ? &memo : nullptr);
+            if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, next);
+            else process_probe(base, vctx, ctx, next, memo_ok ? &memo : nullptr);
           }
         }
         if (vx_trace_on())
@@ -46541,6 +46691,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                    ", indexes " + std::to_string((jt_b - jt_a) / 1000) + ", expression hash " + std::to_string((jt_c - jt_b) / 1000) + ", hash tables and lanes " +
                    std::to_string((jt_d - jt_c) / 1000) + ", rest " + std::to_string((jt_probe0 - jt_d) / 1000) + "), probed " + std::to_string(rows.size()) +
                    " rows in " + std::to_string((hal_now_ns() - jt_probe0) / 1000) + " us" + (best_ki >= 0 ? " (index)" : xk_join ? " (expression hash)" : single_int_hash ? " (int hash)" : " (text hash)") +
+                   (batch_ok ? " (batched)" : "") +
                    (step_timing ? " [gather " + std::to_string(t_gather.load() / 1000) + " us, " + std::to_string(n_cands.load()) + " candidates, ON checks " +
                                   std::to_string(t_on.load() / 1000) + " us, " + std::to_string(n_skipped.load()) + " base rows refused by their own ON conjuncts]" : ""));
         hash_join_done = true;
