@@ -4699,8 +4699,8 @@ BEGIN
     -- The 3x3 block of cells around the candidate: the largest radius sum in
     -- play is well under a cell, so a neighbour cell is as far as an overlap
     -- can reach.
-    CROSS JOIN (SELECT generate_series(-1,1) AS d) gx
-    CROSS JOIN (SELECT generate_series(-1,1) AS d) gy
+    CROSS JOIN generate_series(-1,1) AS gx(d)   -- PostgreSQL's SELECT generate_series(..) (a set-returning function in a SELECT list), in FROM
+    CROSS JOIN generate_series(-1,1) AS gy(d)
     JOIN solid_things st
       ON st.cellx = FLOOR(c.cx / v_blockmap_cell)::int + gx.d
      AND st.celly = FLOOR(c.cy / v_blockmap_cell)::int + gy.d
@@ -4728,7 +4728,8 @@ BEGIN
       )) AS t
     ) lt
     CROSS JOIN LATERAL (
-      SELECT sqrt((c.cx - (b.x1 + lt.t * (b.x2 - b.x1)))^2 + (c.cy - (b.y1 + lt.t * (b.y2 - b.y1)))^2) AS dist
+      -- PostgreSQL's ^ is a power; MySQL's is xor
+      SELECT sqrt(POWER(c.cx - (b.x1 + lt.t * (b.x2 - b.x1)), 2) + POWER(c.cy - (b.y1 + lt.t * (b.y2 - b.y1)), 2)) AS dist
     ) dd
     CROSS JOIN LATERAL (
       SELECT

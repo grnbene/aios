@@ -237,6 +237,11 @@ int main() {
   run_ok(db, "CREATE PROCEDURE bump() BEGIN UPDATE pts p SET tot = p.tot + w.c FROM w WHERE w.c = p.id; END");
   run_ok(db, "CALL bump()");
   expect(db, "UPDATE .. FROM in a procedure", "SELECT id, tot FROM pts ORDER BY id", "1|4;2|4;3|0");
+  run_ok(db, "DELETE FROM pts p WHERE p.id = 3");
+  run_ok(db, "DELETE FROM pts AS p WHERE p.tot = 4 AND p.id = 2");
+  expect(db, "DELETE FROM t alias", "SELECT GROUP_CONCAT(id) FROM pts", "1");
+  run_ok(db, "DELETE FROM kv k USING w WHERE w.c = k.k AND w.solid = 1");
+  expect(db, "DELETE FROM t alias USING ..", "SELECT GROUP_CONCAT(k ORDER BY k) FROM kv", "3,4,5,40");
 
   run_ok(db, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
   run_ok(db, "CREATE TABLE person (name VARCHAR(10), m mood)");

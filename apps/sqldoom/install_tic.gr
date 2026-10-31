@@ -1,0 +1,8 @@
+# Reinstall the game tic's functions (sql/gametic.sql) into a loaded database, without loading the WAD again.
+#
+#   aios --root R grain run --steps 0 apps/sqldoom/install_tic.gr
+import { run_sql_file } from "lib/sqlfile.gr"
+let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
+sql("USE doom")
+sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+print(str(run_sql_file(path_join(here, "sql/gametic.sql"), ";;")) + " statements")

@@ -55514,6 +55514,22 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   if (!p.take_word("FROM")) return make_error("expected FROM");
   std::string name;
   if (!p.parse_name(&name)) return make_error(p.error());
+  // DELETE FROM t [AS] a WHERE ..: the table under an alias (MySQL 8.0.16's, PostgreSQL's), as the multi-table
+  // DELETE a FROM t a WHERE .. it is.
+  {
+    const size_t name_end = p.pos();
+    const bool as = p.take_word("AS");
+    const Token& at = p.peek();
+    if (at.kind == Tok::Ident && (as || !(p.is_word("WHERE") || p.is_word("ORDER") || p.is_word("LIMIT") ||
+                                          p.is_word("MATCHING") || p.is_word("PARTITION") || p.is_word("RETURNING")))) {
+      const std::string alias = at.text;
+      std::string rest = sql.substr(at.end_pos);
+      // .. USING <tables> (PostgreSQL's): the other tables of the join
+      if (p.is_word("USING", 1)) rest = ", " + sql.substr(p.peek(1).end_pos);
+      return execute_delete("DELETE `" + alias + "` FROM " + name + " `" + alias + "`" + rest);
+    }
+    p.seek(name_end);
+  }
   if (const SqlView* vw = find_view(name)) {
     std::string rq, why;
     if (tls_view_dml_depth < 8 && rewrite_view_dml(this, sql, *vw, 'D', &rq, &why)) {

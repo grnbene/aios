@@ -606,7 +606,7 @@ struct Run {
     if (!res->success) {
       // AIOS_ROUTINE_TRACE=1: the statement a routine failed on, as it ran (its variables bound), to stderr.
       static const bool trace = std::getenv("AIOS_ROUTINE_TRACE") != nullptr;
-      if (trace) std::fprintf(stderr, "[routine] %s\n  in: %.2000s\n", res->error_message.c_str(), bound.c_str());
+      if (trace) std::fprintf(stderr, "[routine] %s\n  in: %.30000s\n", res->error_message.c_str(), bound.c_str());
       cond->kind = Condition::Exception;
       cond->message = res->error_message;
       return false;
