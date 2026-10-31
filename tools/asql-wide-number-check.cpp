@@ -395,6 +395,36 @@ int main() {
       verify(db, T, cols, n, "re-encoded");
       made.push_back({T, cols, n});
     }
+    // CAST to SIGNED / UNSIGNED keeps every digit: it went through a double, so a BIGINT past 2^53 lost its low
+    // digits (and % of it was wrong) and a whole number from 1e15 up printed as 2.1e17. Expected values are made
+    // here from the generated data, never read from the engine. wbig's columns are typed (the compiled path);
+    // wsmall's are dictionaries and the literals go through the interpreter.
+    {
+      const std::string big = i128_text(MAX - 12);   // 9223372036854775795
+      CHECK(q1(db, "SELECT CAST(" + big + " AS SIGNED)") == big, "CAST of a literal past 2^53: %s", q1(db, "SELECT CAST(" + big + " AS SIGNED)").c_str());
+      CHECK(q1(db, "SELECT CAST(" + big + " AS SIGNED) % 1000003") == i128_text((MAX - 12) % 1000003), "CAST literal %% 1000003");
+      CHECK(q1(db, "SELECT CAST(1e15 AS SIGNED)") == "1000000000000000", "CAST(1e15 AS SIGNED) prints digits: %s", q1(db, "SELECT CAST(1e15 AS SIGNED)").c_str());
+      CHECK(q1(db, "SELECT CAST(12.5 AS SIGNED)") == "13" && q1(db, "SELECT CAST(-12.5 AS SIGNED)") == "-13", "CAST rounds half away from zero");
+      CHECK(q1(db, "SELECT CAST(18446744073709551615 AS SIGNED)") == "-1", "an unsigned value past INT64_MAX wraps into SIGNED");
+      CHECK(q1(db, "SELECT CAST(~5 AS SIGNED)") == "-6", "CAST(~5 AS SIGNED) is -6: %s", q1(db, "SELECT CAST(~5 AS SIGNED)").c_str());
+      CHECK(q1(db, "SELECT CAST(99999999999999999999999 AS SIGNED)") == "9223372036854775807", "a value past 64 bits saturates");
+      CHECK(q1(db, "SELECT CAST(-1 AS UNSIGNED)") == "18446744073709551615", "CAST(-1 AS UNSIGNED) wraps");
+      for (const Made& m : made) {
+        const Col& kk = m.cols[1];
+        const Col& ss = m.cols[3];
+        i128 sum_mod = 0, sum_wrap = 0;
+        for (size_t i = 0; i < m.n; ++i) { sum_mod += kk.v[i] % 1000003; sum_wrap += -ss.v[i] - 1; }
+        // every k by its digits, through CAST, then %: the sum of exact remainders
+        CHECK(q1(db, "SELECT SUM(CAST(k AS SIGNED) % 1000003) FROM " + m.table) == i128_text(sum_mod),
+              "%s: SUM(CAST(k AS SIGNED) %% 1000003) = %s, want %s", m.table.c_str(), q1(db, "SELECT SUM(CAST(k AS SIGNED) % 1000003) FROM " + m.table).c_str(), i128_text(sum_mod).c_str());
+        CHECK(q1(db, "SELECT MAX(CAST(k AS SIGNED)) FROM " + m.table) == i128_text(MAX), "%s: MAX(CAST(k AS SIGNED)) prints the digits", m.table.c_str());
+        CHECK(q1(db, "SELECT MIN(CAST(s AS SIGNED)) FROM " + m.table) == i128_text(-MAX - 1), "%s: MIN(CAST(s AS SIGNED)) is INT64_MIN", m.table.c_str());
+        // ~s is the unsigned complement; CAST .. AS SIGNED wraps it back to -s-1, for every row
+        CHECK(q1(db, "SELECT SUM(CAST(~s AS SIGNED)) FROM " + m.table) == i128_text(sum_wrap), "%s: SUM(CAST(~s AS SIGNED)) = %s, want %s", m.table.c_str(),
+              q1(db, "SELECT SUM(CAST(~s AS SIGNED)) FROM " + m.table).c_str(), i128_text(sum_wrap).c_str());
+        CHECK(q1(db, "SELECT COUNT(*) FROM " + m.table + " WHERE CAST(k AS SIGNED) <> k") == "0", "%s: CAST(k AS SIGNED) = k on every row", m.table.c_str());
+      }
+    }
     auto f = db.flush_now();
     CHECK(f.ok(), "checkpoint failed");
   }
