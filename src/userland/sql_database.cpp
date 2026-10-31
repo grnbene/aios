@@ -65,6 +65,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #if defined(__linux__)
@@ -1263,7 +1264,15 @@ bool parse_number(const std::string& s, double* out) {
     return false;
   }
   if (!digits) return false;
-  (void)start;
+  // A plain integer of up to 15 digits is below 2^53: built digit by digit it is exactly the double strtod gives
+  // (-0 included), without strtod's ~1,300 instructions - two of them in every one-row UPDATE.
+  if (!dot && !expo && i - start <= 15) {
+    int64_t v = 0;
+    for (size_t k = start; k < i; ++k) v = v * 10 + (s[k] - '0');
+    const double d = (double)v;
+    *out = s[0] == '-' ? -d : d;
+    return true;
+  }
   *out = std::strtod(s.c_str(), nullptr);
   return true;
 }
@@ -2839,8 +2848,11 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
     // Two-character operators before the one-character ones, so that <= does
     // not tokenise as < followed by =.
     // <=> and ->> are the three-character operators: before <= and -> take their first two.
-    if (sql.compare(i, 3, "<=>") == 0 || sql.compare(i, 3, "->>") == 0) {
-      const char* op = sql.compare(i, 3, "<=>") == 0 ? "<=>" : "->>";
+    // Matched on the characters themselves: thirteen string compares (each with its strlen) for every '=' or '+'
+    // were a third of tokenizing a one-row UPDATE.
+    const char c1 = i + 1 < sql.size() ? sql[i + 1] : '\0', c2 = i + 2 < sql.size() ? sql[i + 2] : '\0';
+    if ((c == '<' && c1 == '=' && c2 == '>') || (c == '-' && c1 == '>' && c2 == '>')) {
+      const char* op = c == '<' ? "<=>" : "->>";
       Token t;
       t.kind = Tok::Punct;
       t.text = op;
@@ -2854,7 +2866,7 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
     static const char* const two[] = {"<=", ">=", "<>", "!=", "||", "&&", "::", ":=", "<<", ">>", "->"};
     bool matched = false;
     for (const char* op : two) {
-      if (sql.compare(i, 2, op) == 0) {
+      if (op[0] == c && op[1] == c1) {
         Token t;
         t.kind = Tok::Punct;
         t.text = tls_pipes_as_concat && op[0] == '|' && op[1] == '|' ? "||+" : op;
@@ -3666,20 +3678,26 @@ class SqlParser {
   size_t pos() const { return p_; }
   void seek(size_t p) { p_ = p; }
 
-  bool is_word(const char* w, size_t ahead = 0) const {
+  // string_view: a literal's length is known where it is written, so a test is a length check and (rarely) a
+  // memcmp - not a strlen and a compare at each of the expression grammar's fifteen levels.
+  [[gnu::always_inline]] bool is_word(std::string_view w, size_t ahead = 0) const {
     const Token& t = peek(ahead);
-    return t.kind == Tok::Ident && !t.quoted && t.up == w;
+    return t.kind == Tok::Ident && !t.quoted && same_text(t.up, w);
   }
-  bool is_punct(const char* s, size_t ahead = 0) const {
+  [[gnu::always_inline]] bool is_punct(std::string_view s, size_t ahead = 0) const {
     const Token& t = peek(ahead);
-    return t.kind == Tok::Punct && t.text == s;
+    return t.kind == Tok::Punct && same_text(t.text, s);
   }
-  bool take_word(const char* w) {
+  // Length and first character first: nearly every test fails on one of those.
+  [[gnu::always_inline]] static bool same_text(const std::string& a, std::string_view b) {
+    return a.size() == b.size() && !b.empty() && a[0] == b[0] && std::memcmp(a.data() + 1, b.data() + 1, b.size() - 1) == 0;
+  }
+  bool take_word(std::string_view w) {
     if (!is_word(w)) return false;
     p_++;
     return true;
   }
-  bool take_punct(const char* s) {
+  bool take_punct(std::string_view s) {
     if (!is_punct(s)) return false;
     p_++;
     return true;
@@ -25079,24 +25097,41 @@ bool SqlDatabase::redo_write_direct() {
     auto r = h.read_range(redo_path_, block_start, head);
     if (!r.ok() || r->size() != head) { redo_direct_ok_ = false; return false; }
     redo_tail_.assign(reinterpret_cast<const char*>(r->data()), head);
+    redo_dbuf_tail_ = false;
   }
   const size_t total = head + redo_buf_spare_.size();
   const size_t padded = (total + kBlock - 1) & ~(kBlock - 1);
   if (redo_dbuf_.size() < padded + kBlock) redo_dbuf_.resize(padded + kBlock);
   uint8_t* buf = redo_dbuf_.data();
   buf += (kBlock - (reinterpret_cast<uintptr_t>(buf) & (kBlock - 1))) & (kBlock - 1);
-  std::memcpy(buf, redo_tail_.data(), head);
+  if (buf != redo_dbuf_at_) {   // a new or moved buffer: zeroed once, from where its blocks start
+    redo_dbuf_at_ = buf;
+    std::memset(buf, 0, redo_dbuf_.size() - (size_t)(buf - redo_dbuf_.data()));
+    redo_dbuf_dirty_ = 0;
+    redo_dbuf_tail_ = false;
+  }
+  // A statement's record is a few hundred bytes, so the block's earlier bytes are usually where the last write
+  // left them and the padding after them still zero: copying ~2 KB in and zeroing ~3.5 KB on every write was
+  // ~4% of a one-row UPDATE.
+  if (!redo_dbuf_tail_) std::memcpy(buf, redo_tail_.data(), head);
   std::memcpy(buf + head, redo_buf_spare_.data(), redo_buf_spare_.size());
-  std::memset(buf + total, 0, padded - total);
+  if (redo_dbuf_dirty_ > total) std::memset(buf + total, 0, std::min(padded, redo_dbuf_dirty_) - total);
   auto w = h.write_at_direct(redo_path_, block_start, ByteSpan(buf, padded));
   if (!w.ok()) {
     redo_direct_ok_ = false;   // Unsupported or a failed write: the cached path writes these same bytes
     redo_tail_.clear();
+    redo_dbuf_tail_ = false;
     return false;
   }
   redo_write_off_ += redo_buf_spare_.size();
+  // [total, padded) is zero now. Bytes past padded from an earlier, longer write are cleared here, once, so the
+  // mark stays at this write's end (left as a high-water mark it made every later write zero its block again).
+  if (redo_dbuf_dirty_ > padded) std::memset(buf + padded, 0, redo_dbuf_dirty_ - padded);
+  redo_dbuf_dirty_ = total;
   const size_t keep = total & (kBlock - 1);
   redo_tail_.assign(reinterpret_cast<const char*>(buf + (total - keep)), keep);
+  // Still in the buffer's first block, the tail is already where the next write wants it.
+  redo_dbuf_tail_ = total - keep == 0;
   return true;
 }
 
@@ -25106,6 +25141,7 @@ void SqlDatabase::redo_prepare_file() {
   auto& h = kernel_.host();
   redo_write_off_ = 0;
   redo_tail_.clear();
+  redo_dbuf_tail_ = false;
   if (redo_path_.empty()) return;
   // A spare log the background wrote out as zeros (prepare_redo_spare):
   // renamed into place, its blocks already written.

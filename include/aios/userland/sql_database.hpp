@@ -3300,6 +3300,12 @@ class SqlDatabase {
   bool redo_direct_ok_ = true;
   std::string redo_tail_;         // the log's bytes from its last block's start to its end
   std::vector<uint8_t> redo_dbuf_;
+  // What redo_write_direct's aligned buffer still holds from its last write, so a write does not redo it: bytes
+  // past redo_dbuf_dirty_ are zero, and with redo_dbuf_tail_ its first redo_tail_.size() bytes are redo_tail_.
+  // Both describe the buffer at redo_dbuf_at_; a buffer that moved is assumed to hold anything.
+  const uint8_t* redo_dbuf_at_ = nullptr;
+  size_t redo_dbuf_dirty_ = 0;
+  bool redo_dbuf_tail_ = false;
   void redo_prepare_file();   // a fresh, preallocated log at offset 0 (the spare, when one is ready)
   std::string redo_spare_path() const;
   void prepare_redo_spare();
