@@ -6752,6 +6752,56 @@ inline void probe_gather_range(const SqlTable& t, const SqlDatabase::ProbeIndex*
 
 // Whether an item computes an exact number (MySQL: an integer or DECIMAL
 // result) rather than a DOUBLE -- decided from the operands, as MySQL does.
+// Whether an item is an integer by construction: integer columns and literals under + - * % and unary minus,
+// DIV, the bit operators, CAST to SIGNED / UNSIGNED, COUNT, FLOOR / CEIL of an exact number, ABS of an integer,
+// and IF / CASE / COALESCE / GREATEST / LEAST whose every value is one (MySQL types each of these BIGINT).
+bool infer_item_exact(const SqlExpr* e, const std::vector<QuerySource>& sources);
+bool infer_item_int(const SqlExpr* e, const std::vector<QuerySource>& sources, int depth = 0) {
+  if (!e || depth > 64) return false;
+  switch (e->op) {
+    case ExprOp::Column: {
+      if (e->bound_depth != 0 || e->bound_src < 0 || e->bound_col < 0) return false;
+      if ((size_t)e->bound_src >= sources.size()) return false;
+      const SqlTable* t = sources[(size_t)e->bound_src].table;
+      if (!t || (size_t)e->bound_col >= t->columns.size()) return false;
+      return t->columns[(size_t)e->bound_col].type == SqlDataType::Int && !t->columns[(size_t)e->bound_col].temporal;
+    }
+    case ExprOp::Literal:
+      return e->literal.numeric && !e->literal.approx && e->literal.str().find_first_of(".eE") == std::string::npos;
+    case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Mod: case ExprOp::Neg:
+      for (const auto& a : e->args)
+        if (!infer_item_int(a.get(), sources, depth + 1)) return false;
+      return !e->args.empty();
+    case ExprOp::Case: {
+      const size_t first = e->negated ? 1 : 0;
+      bool any = false;
+      for (size_t i = first; i + 1 < e->args.size(); i += 2) { if (!infer_item_int(e->args[i + 1].get(), sources, depth + 1)) return false; any = true; }
+      if ((e->args.size() - first) % 2 == 1) { if (!infer_item_int(e->args.back().get(), sources, depth + 1)) return false; any = true; }
+      return any;
+    }
+    case ExprOp::Func: {
+      const std::string up = upper_of(e->name);
+      if (up == "COUNT"sv || up == "__INTDIV"sv || up == "__BITAND"sv || up == "__BITOR"sv || up == "__BITXOR"sv ||
+          up == "__SHL"sv || up == "__SHR"sv || up == "__BITNOT"sv)
+        return true;
+      if ((up == "CAST"sv || up == "CONVERT"sv) && e->args.size() >= 2 && e->args[1] && e->args[1]->op == ExprOp::Literal) {
+        const std::string target = upper_of(e->args[1]->literal.str());
+        return target.rfind("SIGNED", 0) == 0 || target.rfind("UNSIGNED", 0) == 0 || target.rfind("INT", 0) == 0;
+      }
+      if (up == "FLOOR"sv || up == "CEIL"sv || up == "CEILING"sv) return e->args.size() == 1 && infer_item_exact(e->args[0].get(), sources);
+      if (up == "ABS"sv) return e->args.size() == 1 && infer_item_int(e->args[0].get(), sources, depth + 1);
+      if (up == "IF"sv) return e->args.size() == 3 && infer_item_int(e->args[1].get(), sources, depth + 1) && infer_item_int(e->args[2].get(), sources, depth + 1);
+      if (up == "IFNULL"sv || up == "COALESCE"sv || up == "GREATEST"sv || up == "LEAST"sv) {
+        for (const auto& a : e->args) if (!infer_item_int(a.get(), sources, depth + 1)) return false;
+        return !e->args.empty();
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
 bool infer_item_exact(const SqlExpr* e, const std::vector<QuerySource>& sources) {
   if (!e) return false;
   switch (e->op) {
@@ -6993,6 +7043,9 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
       return SqlDataType::Decimal;
     case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div: case ExprOp::Mod:
     case ExprOp::Neg:
+      // y * 320 + x of integers is an integer (BIGINT, as MySQL types it), not a DECIMAL: a CTE or derived
+      // table built from it then holds a typed integer column, which the kernels read as one
+      if (e->op != ExprOp::Div && infer_item_int(e, sources)) return SqlDataType::Int;
       return infer_item_exact(e, sources) ? SqlDataType::Decimal : SqlDataType::Real;
     // A truth value is an integer (1, 0, NULL): the client right-aligns it and binds it as a number.
     case ExprOp::Eq: case ExprOp::Ne: case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt: case ExprOp::Ge:
@@ -8136,6 +8189,15 @@ void find_probe_candidates(const SqlExpr* where, const EvalCtx& local, const Eva
 // error rather than a zero.
 // An expression every row of a group can evaluate at the same time: no
 // subquery, no side effect, nothing whose answer depends on evaluation order.
+// A stored function whose whole body is RETURN <expression> over its parameters (sql_programs.inc): the expression
+// parsed once, each parameter node reached by its path of argument indices. The vectorized programs inline one
+// at a call site; the interpreter binds the arguments as literals into a clone (sql_run_function).
+struct FastReturn {
+  ExprPtr tmpl;
+  std::vector<std::pair<std::vector<size_t>, size_t>> params;   // a path of argument indices to a parameter node, and its index
+};
+static std::shared_ptr<const FastReturn> fast_return_of(const SqlDatabase::StoredProgram& f);
+
 #include "sql_vprog.inc"
 
 bool parallel_safe_expr(const SqlExpr* e) {

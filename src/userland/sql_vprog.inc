@@ -21,7 +21,8 @@ struct Ins {
     Neg, Add, Sub, Mul, Div, Mod, IDiv,
     Eq, Ne, Lt, Le, Gt, Ge, And, Or, Not, IsNull, NotNull,
     Case, Coalesce, NullIf, Greatest, Least, Abs, Floor, Ceil, Sqrt, Pow, Sin, Cos, Tan, Atan, Atan2, Radians,
-    Degrees, CastI, CastF, BitAnd, BitOr, BitXor, Shl, Shr, BitNot
+    Degrees, CastI, CastF, BitAnd, BitOr, BitXor, Shl, Shr, BitNot,
+    RoundI   // a stored routine's INT parameter or result: the double rounded half away from zero (std::round)
   } op = Konst;
   Ty ty = Ty::I64;
   bool approx = false;    // the interpreter's Val here would be approximate (a DOUBLE)
@@ -48,6 +49,9 @@ struct Prog {
   // literals in place (shape_bind), and the program on the expression is then stale - program_for checks.
   std::string lit_sig;
   bool pg_division = false;
+  // A stored function inlined: the programs generation it was compiled under (a CREATE OR REPLACE moves it).
+  bool has_fn = false;
+  uint64_t fn_gen = 0;
   const Ins& out() const { return ins.back(); }
 };
 
@@ -68,15 +72,41 @@ inline bool enabled() {
   return on;
 }
 
+// An expression as text for the trace: its source text where the parser kept it, else its shape.
+inline std::string expr_text(const SqlExpr* e, int depth = 0) {
+  if (!e) return "?";
+  // the tree itself, not source_text: a merged view's text is stitched from pieces and may name an alias
+  if (depth > 12) return e->source_text.empty() ? ".." : e->source_text;
+  if (e->op == ExprOp::Column) return e->name.empty() ? "<col?>" : e->qualifier.empty() ? e->name : e->qualifier + "." + e->name;
+  if (e->op == ExprOp::Literal) {
+    if (e->literal.null) return "NULL";
+    const std::string& t = e->literal.str();
+    return e->literal.numeric ? (t.empty() ? "<num " + std::to_string(e->literal.num) + ">" : t) : "'" + t + "'";
+  }
+  std::string s = e->op == ExprOp::Func ? e->name : "op" + std::to_string((int)e->op);
+  s += "(";
+  for (size_t i = 0; i < e->args.size(); ++i) { if (i) s += ","; s += expr_text(e->args[i].get(), depth + 1); }
+  return s + ")";
+}
+
 struct Compiler {
   const EvalCtx& ctx;
   Prog& P;
   bool ok = true;
   int depth = 0;
   std::string why;   // the first reason the expression did not compile (for the trace)
+  bool pg_div = tls_pg_division;   // the division rule in force: the statement's, or an inlined routine's own
+  int inlined = 0;                 // stored functions being inlined, one inside another
+  // An inlined function's parameter nodes (in its RETURN template) and the lanes its arguments compiled to.
+  std::vector<std::pair<const SqlExpr*, uint32_t>> bound;
 
   uint32_t emit(Ins in) { P.ins.push_back(std::move(in)); return (uint32_t)P.ins.size() - 1; }
-  uint32_t fail(const char* reason = "") { if (ok) why = reason; ok = false; return 0; }
+  const SqlExpr* cur = nullptr;    // the node being compiled, named by a reason-less fail
+  uint32_t fail(const std::string& reason = std::string()) {
+    if (ok) why = !reason.empty() ? reason : "at " + expr_text(cur);
+    ok = false;
+    return 0;
+  }
   const Ins& at(uint32_t i) const { return P.ins[i]; }
 
   // The source and column a column expression names in this scope (not an outer one).
@@ -144,8 +174,7 @@ struct Compiler {
       else if (vx::dict_coded(cs) && codes_of(cs, false, &in)) in.op = Ins::CodeF;
       else return fail("DOUBLE column not typed or dictionary-coded");
     } else {
-      if (ok) why = std::string(col.type == SqlDataType::Decimal ? "DECIMAL" : "text") + " column " + t->name + "." + col.name;
-      return fail();
+      return fail(std::string(col.type == SqlDataType::Decimal ? "DECIMAL" : "text") + " column " + t->name + "." + col.name);
     }
     return emit(std::move(in));
   }
@@ -180,10 +209,18 @@ struct Compiler {
     const SqlTable* t = (*ctx.sources)[s].table;
     const SqlColumn& sc = t->columns[c];
     const ColumnStore& cs = t->col_data[c];
-    // (a result table's "text" column may hold numbers, which = reads as numbers: not here)
-    if (sc.type != SqlDataType::Text || sc.temporal || t->inferred_types || cs.shared_dict || !vx::dict_coded(cs)) return fail();
+    if (sc.type != SqlDataType::Text || sc.temporal || cs.shared_dict || !vx::dict_coded(cs)) return fail("text column not dictionary-coded");
     const size_t n = vx::dict_size(cs);
-    if (n == 0 || n > (1u << 20)) return fail();
+    if (n == 0 || n > (1u << 20)) return fail("dictionary too large");
+    // a result table's "text" column may hold numbers, which = reads as numbers (12 = '12.0'): only one with none
+    if (t->inferred_types) {
+      for (size_t k = 0; k < n; ++k) {
+        const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+        double x = 0;
+        if (!sql_is_null(d) && parse_number(d, &x)) return fail("result column with numbers as text");
+      }
+      for (const SqlExpr* l : lits) { double x = 0; if (parse_number(l->literal.str(), &x)) return fail("numeric text literal"); }
+    }
     Ins in;
     in.op = Ins::StrIn;
     in.ty = Ty::I64;
@@ -230,11 +267,14 @@ struct Compiler {
 
   uint32_t compile(const SqlExpr* e) {
     if (!ok) return 0;
-    if (!e || ++depth > 64) return fail();
-    struct Depth { int& d; ~Depth() { --d; } } dd{depth};
+    if (!e || ++depth > 64) return fail("too deep");
+    struct Depth { int& d; const SqlExpr*& c; const SqlExpr* prev; ~Depth() { --d; c = prev; } } dd{depth, cur, cur};
+    cur = e;
     switch (e->op) {
       case ExprOp::Literal: return literal(e->literal);
-      case ExprOp::Column: return column(e);
+      case ExprOp::Column:
+        for (const auto& b : bound) if (b.first == e) return b.second;
+        return column(e);
       case ExprOp::Neg: {
         if (e->args.size() != 1) return fail();
         const uint32_t a = compile(e->args[0].get());
@@ -250,7 +290,7 @@ struct Compiler {
         Ty ty; bool approx;
         if (!numeric_pair(a, b, &ty, &approx)) return fail("decimal arithmetic");
         if (e->op == ExprOp::Div) {
-          if (tls_pg_division || !approx) return fail("exact division");   // two exact operands divide as decimals
+          if (pg_div || !approx) return fail(pg_div ? "PG division" : "exact division");   // two exact operands divide as decimals
           return binary(Ins::Div, a, b, Ty::F64, true, tainted(a, b));
         }
         if (e->op == ExprOp::Mod && ty == Ty::F64 && !approx) return fail("decimal MOD");   // exact decimals' MOD
@@ -310,6 +350,19 @@ struct Compiler {
         if (!ok) return 0;
         return unary(e->negated ? Ins::NotNull : Ins::IsNull, x, Ty::I64, false);
       }
+      case ExprOp::Between: {
+        // x BETWEEN lo AND hi: lo <= x AND x <= hi, as the interpreter reads it (NOT BETWEEN negated)
+        if (e->args.size() != 3) return fail("BETWEEN arity");
+        const uint32_t x = compile(e->args[0].get());
+        const uint32_t lo = compile(e->args[1].get());
+        const uint32_t hi = compile(e->args[2].get());
+        if (!ok) return 0;
+        if (at(x).uns || at(lo).uns || at(hi).uns) return fail("unsigned BETWEEN");
+        const uint32_t a = binary(Ins::Ge, x, lo, Ty::I64, false);
+        const uint32_t b = binary(Ins::Le, x, hi, Ty::I64, false);
+        const uint32_t both = binary(Ins::And, a, b, Ty::I64, false);
+        return e->negated ? unary(Ins::Not, both, Ty::I64, false) : both;
+      }
       case ExprOp::In: {
         // text_col IN ('a', 'b'): literals only, the column dictionary-coded
         if (e->args.size() < 2) return fail();
@@ -326,17 +379,62 @@ struct Compiler {
         return e->negated ? unary(Ins::Not, m, Ty::I64, false) : m;
       }
       case ExprOp::Case: {
-        if (e->negated || e->args.size() < 2) return fail();   // the simple CASE x WHEN v: not here
+        if (e->args.size() < 2) return fail("CASE of no values");
         Ins in;
         in.op = Ins::Case;
         bool first = true;
-        for (size_t i = 0; i < e->args.size(); ++i) {
-          const uint32_t a = compile(e->args[i].get());
+        if (!e->negated) {
+          for (size_t i = 0; i < e->args.size(); ++i) {
+            const uint32_t a = compile(e->args[i].get());
+            if (!ok) return 0;
+            in.args.push_back(a);
+            const bool is_value = (i % 2 == 1) || (i + 1 == e->args.size() && e->args.size() % 2 == 1);
+            if (!is_value) continue;
+            if (!same_kind(in, at(a), &first)) return fail("CASE branches of mixed kinds");
+          }
+          if (first) return fail("CASE of no values");
+          return emit(std::move(in));
+        }
+        // CASE x WHEN v THEN r ...: each WHEN is x = v (a NULL never equal, as compare_vals has it) - of a text
+        // column against text literals through the dictionary, of numbers as numbers
+        const SqlExpr* x = e->args[0].get();
+        bool text_case = x && x->op == ExprOp::Column;
+        for (size_t i = 1; text_case && i + 1 < e->args.size(); i += 2) {
+          const SqlExpr* v = e->args[i].get();
+          if (!v || v->op != ExprOp::Literal || v->literal.numeric || v->literal.null) text_case = false;
+        }
+        if (text_case) {
+          size_t cs = 0, cc = 0;
+          text_case = place(x, &cs, &cc) && (*ctx.sources)[cs].table->columns[cc].type == SqlDataType::Text;
+        }
+        uint32_t ox = 0;
+        if (!text_case) {
+          ox = compile(x);
           if (!ok) return 0;
-          in.args.push_back(a);
-          const bool is_value = (i % 2 == 1) || (i + 1 == e->args.size() && e->args.size() % 2 == 1);
-          if (!is_value) continue;
-          if (!same_kind(in, at(a), &first)) return fail("CASE branches of mixed kinds");
+          if (at(ox).uns) return fail("unsigned CASE operand");
+        }
+        for (size_t i = 1; i + 1 < e->args.size(); i += 2) {
+          uint32_t cond;
+          if (text_case) {
+            cond = str_in(x, {e->args[i].get()});
+          } else {
+            const uint32_t v = compile(e->args[i].get());
+            if (!ok) return 0;
+            if (at(v).uns) return fail("unsigned CASE value");
+            cond = binary(Ins::Eq, ox, v, Ty::I64, false);
+          }
+          if (!ok) return 0;
+          const uint32_t r = compile(e->args[i + 1].get());
+          if (!ok) return 0;
+          in.args.push_back(cond);
+          in.args.push_back(r);
+          if (!same_kind(in, at(r), &first)) return fail("CASE branches of mixed kinds");
+        }
+        if ((e->args.size() - 1) % 2 == 1) {
+          const uint32_t d = compile(e->args.back().get());
+          if (!ok) return 0;
+          in.args.push_back(d);
+          if (!same_kind(in, at(d), &first)) return fail("CASE branches of mixed kinds");
         }
         if (first) return fail("CASE of no values");
         return emit(std::move(in));
@@ -458,41 +556,98 @@ struct Compiler {
           if (first) return fail();
           return emit(std::move(in));
         }
-        if (ok) why = "function " + up;
-        return fail();
+        if (uint32_t r = stored_function(e, up); ok) return r;
+        return 0;
       }
       default:
-        if (ok) why = "operator " + std::to_string((int)e->op);
-        return fail();
+        return fail("operator " + std::to_string((int)e->op));
     }
+  }
+
+  // A call of a stored function whose body is RETURN <expression> over its parameters: the arguments compile to
+  // lanes, coerced to the parameters' declared types as a call coerces them (psm::as_returns_type: an INT rounds
+  // half away from zero, a DOUBLE is a double), the template compiles with its parameter nodes bound to those
+  // lanes under the routine's own division rule, and the result is coerced to the RETURNS type the same way.
+  uint32_t stored_function(const SqlExpr* e, const std::string& up) {
+    if (!ctx.db || inlined >= 8) return fail("function " + up);
+    std::shared_ptr<const SqlDatabase::StoredProgram> fn = ctx.db->find_program('F', e->name);
+    if (!fn || fn->aggregate || fn->params.size() != e->args.size()) return fail("function " + up);
+    std::shared_ptr<const FastReturn> fr = fast_return_of(*fn);
+    if (!fr || !fr->tmpl) return fail("stored function " + up + " is not a RETURN expression");
+    // the declared type's coercion of a lane, or none for a type the call leaves alone
+    auto coerce = [&](uint32_t a, const std::string& type, bool* known) -> uint32_t {
+      std::string k = lower_of(type);
+      size_t i = 0;
+      while (i < k.size() && std::isalpha((unsigned char)k[i])) ++i;
+      k = k.substr(0, i);
+      *known = true;
+      if (k == "int" || k == "integer" || k == "bigint" || k == "smallint" || k == "tinyint" || k == "mediumint") {
+        if (at(a).uns) return fail("unsigned into INT");
+        if (at(a).ty == Ty::I64) return a;
+        return unary(Ins::RoundI, a, Ty::I64, false);
+      }
+      if (k == "double" || k == "float" || k == "real") {
+        if (at(a).uns) return fail("unsigned into DOUBLE");
+        return unary(Ins::CastF, a, Ty::F64, true);
+      }
+      if (k == "decimal" || k == "numeric" || k == "dec" || k == "char" || k == "varchar" || k == "text" ||
+          k == "tinytext" || k == "mediumtext" || k == "longtext")
+        return fail("stored function " + up + ": " + k + " parameter or result");
+      *known = false;   // left as it is
+      return a;
+    };
+    std::vector<uint32_t> args;
+    for (size_t i = 0; i < e->args.size(); ++i) {
+      const uint32_t a = compile(e->args[i].get());
+      if (!ok) return 0;
+      bool known = false;
+      const uint32_t c = coerce(a, fn->params[i].type, &known);
+      if (!ok) return 0;
+      args.push_back(c);
+    }
+    // the parameter nodes, by their paths in the template
+    const size_t bound_before = bound.size();
+    for (const auto& [path, k] : fr->params) {
+      const SqlExpr* n = fr->tmpl.get();
+      for (size_t i : path) n = i < n->args.size() ? n->args[i].get() : nullptr;
+      if (!n || k >= args.size()) return fail("stored function " + up + ": parameter path");
+      bound.emplace_back(n, args[k]);
+    }
+    const bool saved_div = pg_div;
+    pg_div = fn->pg_division;
+    ++inlined;
+    const uint32_t body = compile(fr->tmpl.get());
+    --inlined;
+    pg_div = saved_div;
+    bound.resize(bound_before);
+    if (!ok) return 0;
+    bool known = false;
+    const uint32_t r = coerce(body, fn->returns, &known);
+    if (!ok) return 0;
+    P.has_fn = true;
+    P.fn_gen = ctx.db->programs_generation();
+    return r;
   }
 
   // The values a CASE / COALESCE / GREATEST may give are of one kind: all integers (exact) or all doubles
   // (approximate); a NULL fits either. Mixed, the interpreter's answer type would change row by row.
   // An exact decimal among doubles (GREATEST(0.0, d), LEAST(d, 131071.0)) is allowed: the number is right at every
   // row, the text may not be, so the result is tainted and only erased by a CAST, a comparison or a truth test.
+  // An exact integer beside a double (GREATEST(0, FLOOR(d) + n)) is the same: the result is a double lane that is
+  // tainted, since the interpreter's answer is the exact integer at the rows where it won.
   bool same_kind(Ins& in, const Ins& v, bool* first) {
     if (v.uns) return false;
     if (v.knull) return true;
-    const bool vf = v.ty == Ty::F64;   // a double or a decimal
     if (*first) { in.ty = v.ty; in.approx = v.approx; in.taint = decimalish(v); *first = false; return true; }
-    if (in.ty == Ty::I64) return v.ty == Ty::I64 && !decimalish(v);
-    if (!vf) return false;
+    if (in.ty == Ty::I64 && v.ty == Ty::I64) return true;
+    if (in.ty == Ty::I64) { in.ty = Ty::F64; in.taint = true; }   // the integers so far were exact: now a mix
+    if (v.ty == Ty::I64) in.taint = true;
     in.approx = in.approx || v.approx;
     in.taint = in.taint || decimalish(v);
     return true;
   }
 };
 
-// An expression as text for the trace: its source text where the parser kept it, else its shape.
-inline std::string expr_text(const SqlExpr* e, int depth = 0) {
-  if (!e) return "?";
-  if (!e->source_text.empty() || depth > 6) return e->source_text;
-  std::string s = e->op == ExprOp::Func ? e->name : e->op == ExprOp::Column ? e->name : e->op == ExprOp::Literal ? e->literal.str() : "op" + std::to_string((int)e->op);
-  s += "(";
-  for (size_t i = 0; i < e->args.size(); ++i) { if (i) s += ","; s += expr_text(e->args[i].get(), depth + 1); }
-  return s + ")";
-}
 
 // The program for e over ctx's sources, or null.
 inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::string* why = nullptr) {
@@ -792,6 +947,15 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
           vf[j] = fd(0, j);
         }
         break;
+      case Ins::RoundI:
+        for (size_t j = 0; j < n; ++j) {
+          if (N(0)[j]) { nl[j] = 1; continue; }
+          if (ty(0) == Ty::I64) { vi[j] = A(0)[j]; continue; }
+          const double a = std::round(F(0)[j]);
+          if (!(std::fabs(a) < 9.2e18)) { *err = "BIGINT value is out of range in 'expression'"; return false; }
+          vi[j] = (int64_t)a;
+        }
+        break;
       case Ins::BitAnd: case Ins::BitOr: case Ins::BitXor: case Ins::Shl: case Ins::Shr: case Ins::BitNot: {
         // as the interpreter reads an operand: a whole number's bits; a fraction rounded first
         auto u = [&](size_t k, size_t j) -> uint64_t {
@@ -952,7 +1116,8 @@ inline const Prog* program_for(const SqlExpr* e, const EvalCtx& ctx) {
   if (!enabled() || !e || !ctx.sources) return nullptr;
   if (e->vprog_scope == (const void*)ctx.sources) {
     const Prog* P = static_cast<const Prog*>(e->vprog.get());
-    if (P && P->pg_division == tls_pg_division && valid(*P, ctx)) {
+    if (P && P->pg_division == tls_pg_division && valid(*P, ctx) &&
+        (!P->has_fn || (ctx.db && P->fn_gen == ctx.db->programs_generation()))) {
       std::string sig;
       literal_sig(e, &sig);
       if (sig == P->lit_sig) return P;

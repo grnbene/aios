@@ -1501,10 +1501,7 @@ Val as_returns_type(const Val& v, const std::string& returns) {
 // evaluates - no statement built, tokenized and run per call, which was most of a SQLDoom frame (two light
 // functions per pixel). A body with anything else - a subquery, a user variable, a window, an aggregate, a name
 // that is no parameter - takes the interpreter as before.
-struct FastReturn {
-  ExprPtr tmpl;
-  std::vector<std::pair<std::vector<size_t>, size_t>> params;   // a path of argument indices to a parameter node, and its index
-};
+// (struct FastReturn is defined with the vectorized programs, which inline such a function at a call)
 static bool fast_return_ok(const SqlExpr* e, const std::vector<SqlDatabase::StoredProgram::Param>& params,
                            std::vector<size_t>* path, FastReturn* out) {
   if (!e) return false;
