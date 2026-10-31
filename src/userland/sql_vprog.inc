@@ -38,6 +38,11 @@ struct Ins {
   // to SIGNED, a comparison, a truth test), never printed.
   bool taint = false;
   bool uns = false;       // the bit operators' unsigned 64-bit result, printed as such
+  // CASE whose branches mix unsigned values with signed ones: the interpreter hands back each row's branch as it
+  // is, so the lane is signed and a row whose unsigned branch holds a value past INT64_MAX (where the two would
+  // print and compare differently) fails the program - the interpreter takes those rows.
+  bool uns_check = false;
+  bool has_uns = false, has_signed = false;   // compiling a CASE: the kinds of its value branches so far
   bool knull = false;
   double kf = 0;
   int64_t ki = 0;
@@ -204,11 +209,17 @@ struct Compiler {
     Ins in;
     in.src = (uint32_t)s;
     in.cs = &cs;
-    if (col.type == SqlDataType::Int) {
+    // A DECIMAL of scale 0 holding integers reads as the INT's exact integers (val_cell of "5" either way):
+    // SQLDoom's node_path_steps.depth is DECIMAL(65,0), made by CREATE TABLE .. AS from depth + 1. Only where the
+    // store itself proves every value an integer of 64 bits: a typed integer encoding, or a dictionary whose every
+    // entry is one (codes_of); past that, no program.
+    const bool whole_decimal = col.type == SqlDataType::Decimal && col.scale == 0;
+    if (col.type == SqlDataType::Int || whole_decimal) {
       in.ty = Ty::I64;
       if (vx::typed_integer(cs)) in.op = Ins::ColI;
       else if (vx::dict_coded(cs) && codes_of(cs, true, &in)) in.op = Ins::CodeI;
-      else return fail("INT column not typed or dictionary-coded");
+      else return fail(whole_decimal ? "DECIMAL column " + t->name + "." + col.name + " not held as integers"
+                                     : "INT column not typed or dictionary-coded");
     } else if (col.type == SqlDataType::Real) {
       in.ty = Ty::F64;
       in.approx = true;
@@ -488,6 +499,7 @@ struct Compiler {
             if (!same_kind(in, at(a), &first)) return fail("CASE branches of mixed kinds");
           }
           if (first) return fail("CASE of no values");
+          if (!uns_kinds(in)) return fail("unsigned CASE branch mixed with a non-integer");
           return emit(std::move(in));
         }
         // CASE x WHEN v THEN r ...: each WHEN is x = v (a NULL never equal, as compare_vals has it) - of a text
@@ -534,6 +546,7 @@ struct Compiler {
           if (!same_kind(in, at(d), &first)) return fail("CASE branches of mixed kinds");
         }
         if (first) return fail("CASE of no values");
+        if (!uns_kinds(in)) return fail("unsigned CASE branch mixed with a non-integer");
         return emit(std::move(in));
       }
       case ExprOp::Func: {
@@ -635,6 +648,7 @@ struct Compiler {
             in.args.push_back(a);
             if (i > 0 && !same_kind(in, at(a), &first)) return fail();
           }
+          if (!uns_kinds(in)) return fail("unsigned IF branch mixed with a non-integer");
           return emit(std::move(in));
         }
         if (up == "COALESCE"sv || up == "IFNULL"sv || up == "GREATEST"sv || up == "LEAST"sv || up == "NULLIF"sv) {
@@ -656,6 +670,7 @@ struct Compiler {
             if (!same_kind(in, at(a), &first)) return fail("branches of mixed kinds");
           }
           if (first) return fail();
+          if (in.has_uns) return fail("unsigned argument");   // these run without CASE's check: as before
           return emit(std::move(in));
         }
         if (up == "__ROW_IN"sv) return tuple_in(e);
@@ -769,9 +784,18 @@ struct Compiler {
   // row, the text may not be, so the result is tainted and only erased by a CAST, a comparison or a truth test.
   // An exact integer beside a double (GREATEST(0, FLOOR(d) + n)) is the same: the result is a double lane that is
   // tainted, since the interpreter's answer is the exact integer at the rows where it won.
+  // Once a CASE's branches are all seen: all unsigned, an unsigned lane; unsigned mixed with signed integers, a
+  // signed lane checked as it runs (uns_check); unsigned with a double or text, no program.
+  bool uns_kinds(Ins& in) {
+    if (!in.has_uns) return true;
+    if (in.ty != Ty::I64) return false;
+    if (in.has_signed) in.uns_check = true; else in.uns = true;
+    return true;
+  }
   bool same_kind(Ins& in, const Ins& v, bool* first) {
-    if (v.uns) return false;
     if (v.knull) return true;
+    if (v.uns) { if (v.ty != Ty::I64) return false; in.has_uns = true; }   // settled once every branch is seen (uns_kinds)
+    else in.has_signed = true;
     if (v.ty == Ty::Str || (!*first && in.ty == Ty::Str)) {
       if (*first) { in.ty = Ty::Str; *first = false; return true; }
       return in.ty == Ty::Str && v.ty == Ty::Str;
@@ -1045,6 +1069,10 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
           }
           if (hit < 0 && has_else) hit = (int)(na - 1);
           if (hit < 0 || N((size_t)hit)[j]) { nl[j] = 1; continue; }
+          if (in.uns_check && P.ins[in.args[(size_t)hit]].uns && L.i[in.args[(size_t)hit]][j] < 0) {
+            *err = "an unsigned CASE branch past BIGINT";
+            return false;
+          }
           if (in.ty != Ty::F64) vi[j] = L.i[in.args[(size_t)hit]][j]; else vf[j] = fd((size_t)hit, j);
         }
         break;
