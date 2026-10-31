@@ -203,6 +203,10 @@ struct SqlDatabase::StoredProgram {
   // routine's sql_mode).
   bool pipes_as_concat = false;
   bool pg_division = false;
+  // A function whose whole body is RETURN <expression> over its parameters: the expression parsed once, and each
+  // call evaluates it with the arguments bound as values (sql_run_function). 0 not looked at, 1 yes, 2 no.
+  mutable std::atomic<int> fast_state{0};
+  mutable std::shared_ptr<const void> fast_return;
 };
 
 // macOS had no branch here, so every "give it back" call site was a no-op on a
@@ -12053,9 +12057,23 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     if (dp.failed() || !de) { ctx_fail(ctx, dp.error()); return val_null(); }
     return eval_expr(de.get(), ctx);
   }
-  // A stored function (CREATE FUNCTION), run by the program interpreter.
+  // A stored function (CREATE FUNCTION), run by the program interpreter. Looked up once per expression node and
+  // program generation on this thread: find_program takes the programs lock, and a function in a SELECT list is
+  // called once per row (SQLDoom's light functions, 56,000 pixels a frame).
   if (ctx.db && ctx.db->has_stored_functions()) {
-    if (auto fn = ctx.db->find_program('F', e->name)) {
+    struct FnCache { uint64_t gen; const SqlDatabase* db; std::shared_ptr<const SqlDatabase::StoredProgram> fn; };
+    thread_local std::unordered_map<const SqlExpr*, FnCache> fn_cache;
+    const uint64_t gen = ctx.db->programs_generation();
+    std::shared_ptr<const SqlDatabase::StoredProgram> fn;
+    auto it = fn_cache.find(e);
+    if (it != fn_cache.end() && it->second.gen == gen && it->second.db == ctx.db) {
+      fn = it->second.fn;
+    } else {
+      fn = ctx.db->find_program('F', e->name);
+      if (fn_cache.size() > 4096) fn_cache.clear();
+      fn_cache[e] = {gen, ctx.db, fn};
+    }
+    if (fn) {
       std::vector<Val> args;
       for (size_t i = 0; i < arg_count; ++i) args.push_back(a_ptr[i]);
       std::string ferr;
@@ -22837,7 +22855,25 @@ const SqlTable* SqlDatabase::find_table(const std::string& name, const std::stri
   return const_cast<SqlDatabase*>(this)->find_table(name, db);
 }
 
+// CTEs a WITH on this thread merges into the query that reads them, as views are, instead of materializing: one
+// scope per WITH, innermost last (execute_with).
+thread_local std::vector<std::unordered_map<std::string, SqlView>> g_cte_views;
+bool sql_cte_views_active() { return !g_cte_views.empty(); }
+bool sql_is_cte_view(const SqlView* v) {
+  for (const auto& scope : g_cte_views)
+    for (const auto& kv : scope)
+      if (&kv.second == v) return true;
+  return false;
+}
+
 const SqlView* SqlDatabase::find_view(const std::string& name, const std::string& db) const {
+  if (!g_cte_views.empty() && name.find('.') == std::string::npos) {
+    const std::string k = lower_of(name);
+    for (size_t i = g_cte_views.size(); i-- > 0;) {
+      auto it = g_cte_views[i].find(k);
+      if (it != g_cte_views[i].end()) return &it->second;
+    }
+  }
   std::string target_db, target_view;
   split_qualified_name(name, db.empty() ? effective_database() : db, &target_db, &target_view);
   std::string key = make_table_key(target_db, target_view);
@@ -41030,13 +41066,18 @@ static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const
     return false;
   for (const auto& it : b.items) if (it.expr && (expr_has_aggregate(it.expr) || expr_has_subquery(it.expr))) return false;
   if (expr_has_subquery(b.where)) return false;
-  const SqlTable* t = db->resolve_table(b.sources[0].table_name);
-  if (!t || !db->is_stored_table(t)) return false;
+  // The inner table: a stored one, or a CTE's (a WITH's step, the renderer's final_pixels) - its columns typed by
+  // what made it.
+  const SqlTable* t = find_cte_table(b.sources[0].table_name);
+  if (!t) {
+    t = db->resolve_table(b.sources[0].table_name);
+    if (!t || !db->is_stored_table(t)) return false;
+  }
   const std::string iname = last_name_part(b.sources[0].table_name);
   const std::string ialias = b.sources[0].alias.empty() ? iname : lower_of(b.sources[0].alias);
   // (an aliased table answers to its alias only: its bare name there is an outer table's)
   auto inner_q = [&](const std::string& q) { return q.empty() || last_name_part(q) == ialias; };
-  // every column of the inner WHERE: the inner table's, or the one outer reference
+  // every column of the inner WHERE: the inner table's, or an outer reference
   std::vector<const SqlExpr*> outer_refs;
   bool bad = false;
   std::function<void(const SqlExpr*)> walk = [&](const SqlExpr* e) {
@@ -41050,34 +41091,54 @@ static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const
     for (const auto& a : e->args) walk(a.get());
   };
   walk(b.where.get());
-  if (bad || outer_refs.size() != 1) return false;
-  const SqlExpr* B = outer_refs[0];
-  const SqlExpr* A = nullptr;
+  if (bad || outer_refs.empty() || outer_refs.size() > 8) return false;
+  // Each outer reference in a top-level `inner = outer` conjunct of its own: the pairs (A_i, B_i). One of them on
+  // a shared column (`(sx.x, sy.y)` of two LATERAL series) is what the renderer's view_holes writes; a reference
+  // in anything but such an equality is left to the evaluator.
   std::vector<const SqlExpr*> conj;
   collect_conjuncts(b.where.get(), &conj);
-  for (const SqlExpr* c : conj) {
-    if (c->op != ExprOp::Eq || c->args.size() != 2 || c->negated) continue;
-    const SqlExpr* l = c->args[0].get();
-    const SqlExpr* r = c->args[1].get();
-    if (r == B && l && l->op == ExprOp::Column && inner_q(l->qualifier)) A = l;
-    else if (l == B && r && r->op == ExprOp::Column && inner_q(r->qualifier)) A = r;
+  std::vector<std::pair<const SqlExpr*, const SqlExpr*>> pairs;   // (A inner, B outer)
+  for (const SqlExpr* B : outer_refs) {
+    const SqlExpr* A = nullptr;
+    for (const SqlExpr* c : conj) {
+      if (c->op != ExprOp::Eq || c->args.size() != 2 || c->negated) continue;
+      const SqlExpr* l = c->args[0].get();
+      const SqlExpr* r = c->args[1].get();
+      if (r == B && l && l->op == ExprOp::Column && inner_q(l->qualifier)) A = l;
+      else if (l == B && r && r->op == ExprOp::Column && inner_q(r->qualifier)) A = r;
+    }
+    if (!A || B->qualifier.empty() || t->get_column_index(A->name) < 0) return false;
+    for (const auto& pr : pairs)   // the same outer column twice: not this shape
+      if (lower_of(pr.second->qualifier) == lower_of(B->qualifier) && lower_of(pr.second->name) == lower_of(B->name)) return false;
+    pairs.push_back({A, B});
   }
-  if (!A || B->qualifier.empty()) return false;
-  const int ac = t->get_column_index(A->name);
-  if (ac < 0) return false;
-  // the outer column's own table, to compare declared types
-  const SqlTable* ot = nullptr;
-  for (const auto& os : outer.sources) {
-    if (os.is_derived()) continue;
-    const std::string on = last_name_part(os.table_name);
-    const std::string oa = os.alias.empty() ? on : lower_of(os.alias);
-    if (last_name_part(B->qualifier) == oa) { ot = db->resolve_table(os.table_name); break; }
+  // The outer column's own table, to compare types: a stored table, a CTE's, or none that can be found (a
+  // LATERAL's, a derived table's). Columns of one declared type match as before; otherwise both must be numbers
+  // (IN compares them as = does), the outer one taken to be nullable.
+  auto numeric_type = [](SqlDataType ty) { return ty == SqlDataType::Int || ty == SqlDataType::Real || ty == SqlDataType::Decimal; };
+  std::vector<bool> nullable;
+  for (const auto& [A, B] : pairs) {
+    const SqlTable* ot = nullptr;
+    for (const auto& os : outer.sources) {
+      if (os.is_derived()) continue;
+      const std::string on = last_name_part(os.table_name);
+      const std::string oa = os.alias.empty() ? on : lower_of(os.alias);
+      if (last_name_part(B->qualifier) != oa) continue;
+      ot = find_cte_table(os.table_name);
+      if (!ot) ot = db->resolve_table(os.table_name);
+      break;
+    }
+    const SqlColumn& acol = t->columns[(size_t)t->get_column_index(A->name)];
+    const int bc = ot ? ot->get_column_index(B->name) : -1;
+    if (ot && bc < 0) return false;
+    if (ot && !ot->inferred_types && !t->inferred_types) {
+      if (ot->columns[(size_t)bc].type != acol.type || ot->columns[(size_t)bc].temporal != acol.temporal) return false;
+    } else {
+      if (!numeric_type(acol.type) || acol.temporal) return false;
+      if (ot && (!numeric_type(ot->columns[(size_t)bc].type) || ot->columns[(size_t)bc].temporal)) return false;
+    }
+    nullable.push_back(!ot || !(ot->columns[(size_t)bc].not_null || ot->columns[(size_t)bc].is_primary_key));
   }
-  if (!ot || ot->inferred_types || t->inferred_types) return false;
-  const int bc = ot->get_column_index(B->name);
-  if (bc < 0 || ot->columns[(size_t)bc].type != t->columns[(size_t)ac].type ||
-      ot->columns[(size_t)bc].temporal != t->columns[(size_t)ac].temporal)
-    return false;
   // the subquery's FROM and WHERE text, by its tokens
   std::vector<Token> toks;
   std::string terr;
@@ -41090,7 +41151,6 @@ static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const
     if (k.kind == Tok::Punct && k.text == "(") { ++depth; continue; }
     if (k.kind == Tok::Punct && k.text == ")") { --depth; continue; }
     if (depth != 0 || k.quoted) continue;
-    if (k.kind == Tok::Punct && k.text == ";") { where_end = std::min(where_end, i); break; }
     if (k.kind != Tok::Ident) continue;
     if (k.up == "FROM" && !from_at) from_at = i;
     else if (k.up == "WHERE" && from_at && !where_at) where_at = i;
@@ -41101,33 +41161,54 @@ static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const
   const size_t from_b = toks[from_at + 1].start_pos, from_e = toks[where_at].start_pos;
   const size_t where_b = toks[where_at + 1].start_pos;
   const size_t where_e = where_end < toks.size() && toks[where_end].kind != Tok::End ? toks[where_end].start_pos : sub.size();
-  // the one place the outer column is written: qualifier . name
-  size_t hit_b = 0, hit_e = 0, hits = 0;
-  for (size_t i = where_at + 1; i + 2 < where_end; ++i) {
-    if (toks[i].kind == Tok::Ident && toks[i + 1].kind == Tok::Punct && toks[i + 1].text == "." && toks[i + 2].kind == Tok::Ident &&
-        lower_of(toks[i].text) == lower_of(B->qualifier) && lower_of(toks[i + 2].text) == lower_of(B->name)) {
-      ++hits;
-      hit_b = toks[i].start_pos;
-      hit_e = toks[i + 2].end_pos;
-    }
-  }
-  if (hits != 1 || hit_b < where_b || hit_e > where_e) return false;
   auto quoted = [](const std::string& n) { return "`" + n + "`"; };
-  const std::string a_text = (A->qualifier.empty() ? std::string() : quoted(A->qualifier) + ".") + quoted(A->name);
-  const std::string b_text = quoted(B->qualifier) + "." + quoted(B->name);
-  // The correlating equality alone: the inner rows whose key is not NULL
-  // (`d.orderno = d.orderno` said the same, read per row by the evaluator).
-  const std::string inner =
-      conj.size() == 1
-          ? "SELECT " + a_text + " FROM " + sub.substr(from_b, from_e - from_b) + " WHERE " + a_text + " IS NOT NULL"
-          : "SELECT " + a_text + " FROM " + sub.substr(from_b, from_e - from_b) + " WHERE " +
-                sub.substr(where_b, hit_b - where_b) + a_text + sub.substr(hit_e, where_e - hit_e);
-  // An outer column that cannot be NULL needs no IS NULL arm (the arm kept
-  // the NOT IN from being read as a vectorized anti-join).
-  const SqlColumn& bcol = ot->columns[(size_t)bc];
-  const bool b_nullable = !(bcol.not_null || bcol.is_primary_key);
-  *out = neg ? (b_nullable ? "(" + b_text + " IS NULL OR " + b_text + " NOT IN (" + inner + "))" : b_text + " NOT IN (" + inner + ")")
-             : b_text + " IN (" + inner + ")";
+  // where each outer column is written (qualifier . name), once each, and the inner column that takes its place
+  struct Hit { size_t b, e; std::string text; };
+  std::vector<Hit> hits;
+  for (const auto& [A, B] : pairs) {
+    size_t hit_b = 0, hit_e = 0, n = 0;
+    for (size_t i = where_at + 1; i + 2 < where_end; ++i) {
+      if (toks[i].kind == Tok::Ident && toks[i + 1].kind == Tok::Punct && toks[i + 1].text == "." && toks[i + 2].kind == Tok::Ident &&
+          lower_of(toks[i].text) == lower_of(B->qualifier) && lower_of(toks[i + 2].text) == lower_of(B->name)) {
+        ++n;
+        hit_b = toks[i].start_pos;
+        hit_e = toks[i + 2].end_pos;
+      }
+    }
+    if (n != 1 || hit_b < where_b || hit_e > where_e) return false;
+    hits.push_back({hit_b, hit_e, (A->qualifier.empty() ? std::string() : quoted(A->qualifier) + ".") + quoted(A->name)});
+  }
+  std::sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) { return x.b < y.b; });
+  std::string a_list, b_list, not_null;
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    const std::string a_text = (pairs[i].first->qualifier.empty() ? std::string() : quoted(pairs[i].first->qualifier) + ".") + quoted(pairs[i].first->name);
+    a_list += (i ? ", " : "") + a_text;
+    b_list += (i ? ", " : "") + quoted(pairs[i].second->qualifier) + "." + quoted(pairs[i].second->name);
+    not_null += (i ? " AND " : "") + a_text + " IS NOT NULL";
+  }
+  const bool row = pairs.size() > 1;
+  if (row) { a_list = "(" + a_list + ")"; b_list = "(" + b_list + ")"; }
+  // The correlating equalities alone: the inner rows whose keys are not NULL (`d.orderno = d.orderno` said the
+  // same, read per row by the evaluator). With more in the WHERE, that text with each outer column replaced by
+  // its inner one.
+  std::string inner;
+  if (conj.size() == pairs.size()) {
+    inner = "SELECT " + (row ? a_list.substr(1, a_list.size() - 2) : a_list) + " FROM " + sub.substr(from_b, from_e - from_b) + " WHERE " + not_null;
+  } else {
+    std::string w;
+    size_t at = where_b;
+    for (const Hit& h : hits) { w += sub.substr(at, h.b - at) + h.text; at = h.e; }
+    w += sub.substr(at, where_e - at);
+    inner = "SELECT " + (row ? a_list.substr(1, a_list.size() - 2) : a_list) + " FROM " + sub.substr(from_b, from_e - from_b) + " WHERE " + w;
+  }
+  // An outer column that can be NULL never matched the correlated =, so NOT EXISTS held: an IS NULL arm says so
+  // (NOT IN alone is NULL there). One that cannot be NULL needs none (the arm kept the NOT IN from being read as
+  // a vectorized anti-join).
+  if (!neg) { *out = b_list + " IN (" + inner + ")"; return true; }
+  std::string arms;
+  for (size_t i = 0; i < pairs.size(); ++i)
+    if (nullable[i]) arms += quoted(pairs[i].second->qualifier) + "." + quoted(pairs[i].second->name) + " IS NULL OR ";
+  *out = arms.empty() ? b_list + " NOT IN (" + inner + ")" : "(" + arms + b_list + " NOT IN (" + inner + "))";
   return true;
 }
 // An IN subquery's values without running it as a statement: `SELECT c
@@ -43207,15 +43288,44 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
   std::vector<std::shared_ptr<SqlTable>> ephem_tables;
 
+  // Every expression under e that a merged view's columns can appear in: its arguments, an aggregate's ORDER BY
+  // (GROUP_CONCAT(h ORDER BY h)) and its window's PARTITION BY / ORDER BY (the window copied first: clone_expr
+  // shares it).
+  auto merge_children = [](ExprPtr& e, const std::function<void(ExprPtr&)>& f) {
+    for (auto& a : e->args) f(a);
+    for (auto& k : e->group_order_by) if (k.expr) f(k.expr);
+    if (e->window) {
+      e->window = std::make_shared<WindowSpec>(*e->window);
+      for (auto& pe : e->window->partition_by) f(pe);
+      for (auto& k : e->window->order_by) if (k.expr) f(k.expr);
+    }
+  };
+  // The column names of a source a merged view reads: a stored table, a CTE's table, or a view (a WITH's merged
+  // CTE among them) by its SELECT. False when they are not known.
+  auto source_columns = [&](const ParsedSelectBranch::SourceSpec& ss, std::vector<std::string>* out) {
+    if (ss.is_derived()) return false;
+    if (const SqlView* sv = db->find_view(ss.table_name)) return select_column_names(db, sv->query_sql, out);
+    const SqlTable* t = find_cte_table(ss.table_name);
+    if (!t) t = db->find_table(ss.table_name);
+    if (!t) return false;
+    for (const auto& c : t->columns) out->push_back(c.name);
+    return true;
+  };
+  auto has_name = [](const std::vector<std::string>& cols, const std::string& n) {
+    for (const auto& c : cols) if (c.size() == n.size() && strcasecmp(c.c_str(), n.c_str()) == 0) return true;
+    return false;
+  };
+
   bool exprs_owned = false;
   if (db && db->has_views()) {
     int expand_loops = 0;
-    while (expand_loops++ < 10) {
+    // A chain of merged CTEs (execute_with) is one level a pass.
+    while (expand_loops++ < (sql_cte_views_active() ? 64 : 10)) {
       bool expanded_any = false;
       const auto& current_sources = branch_ptr->sources;
       for (size_t si = 0; si < current_sources.size(); ) {
         const auto& src_spec = current_sources[si];
-        const SqlView* v = db->find_view(src_spec.table_name);
+        const SqlView* v = src_spec.is_derived() ? nullptr : db->find_view(src_spec.table_name);
         if (!v) {
           si++;
           continue;
@@ -43262,9 +43372,36 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (mergeable && branch_has_window(v_stmt.branches[0])) mergeable = false;
         }
 
+        // A LATERAL subquery or generate_series beside the view is text the merge cannot rewrite, and it may name
+        // the view's alias (o.screen_x1): the view is not merged there.
+        if (mergeable)
+          for (const auto& bs : branch.sources)
+            if (bs.lateral || !bs.series_args.empty()) { mergeable = false; break; }
+        // The view as the NULL-padded side of a LEFT JOIN: its WHERE must hold before the padding, so it goes into
+        // that join's ON, not the statement's WHERE (which dropped every row the view had no match for - a
+        // LEFT JOIN scrolling_segs sc lost every wall that does not scroll). A view of several tables there would
+        // need a nested join; a RIGHT JOIN anywhere pads earlier sources: neither is merged.
+        const bool padded_right = si > 0 && si - 1 < branch.join_is_left.size() && branch.join_is_left[si - 1];
+        if (mergeable && padded_right && v_stmt.branches[0].sources.size() > 1) mergeable = false;
+        if (mergeable)
+          for (size_t k = 0; k < branch.join_is_right.size(); ++k)
+            if (branch.join_is_right[k]) { mergeable = false; break; }
         // The view's own ORDER BY stands when the query reads the view alone and orders nothing itself (MariaDB keeps it).
         if (mergeable && branch.order_by.empty() && branch.sources.size() == 1 && !v_stmt.branches[0].order_by.empty() && branch.limit < 0 && !branch.distinct && branch.group_by.empty())
           branch.order_by = v_stmt.branches[0].order_by;
+        // A CTE the WITH meant to merge that cannot be after all: a derived table of this statement, not the
+        // materialized-view cache (which would keep this frame's rows for the next).
+        if (!mergeable && sql_is_cte_view(v)) {
+          ParsedSelectBranch::SourceSpec ds;
+          ds.subquery_sql = v->query_sql;
+          ds.alias = src_spec.alias.empty() ? src_spec.table_name : src_spec.alias;
+          ds.table_name = ds.alias;
+          ds.column_names = v->column_aliases;
+          branch.sources[si] = ds;
+          expanded_any = true;
+          si++;
+          continue;
+        }
         if (!mergeable && db) {
           std::shared_ptr<SqlTable> cached = db->get_or_build_materialized_view(v);
           if (cached) {
@@ -43332,7 +43469,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                   auto it = rename.find(lower_of(q));
                   if (it != rename.end()) e->qualifier = it->second;
                 }
-                for (auto& a : e->args) ren(a);
+                merge_children(e, ren);
               };
               for (auto& it : vb.items) ren(it.expr);
               ren(vb.where);
@@ -43352,12 +43489,12 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               size_t d = s.rfind('.');
               return d == std::string::npos ? s : s.substr(d + 1);
             };
-            std::vector<std::pair<std::string, const SqlTable*>> vsrc;
+            std::vector<std::pair<std::string, std::vector<std::string>>> vsrc;
             bool all_tables = true;
             for (const auto& vs : vb.sources) {
-              const SqlTable* t = (vs.is_derived() || db->find_view(vs.table_name)) ? nullptr : db->find_table(vs.table_name);
-              if (!t) { all_tables = false; break; }
-              vsrc.push_back({last_seg(vs.alias.empty() ? vs.table_name : vs.alias), t});
+              std::vector<std::string> cols;
+              if (!source_columns(vs, &cols)) { all_tables = false; break; }
+              vsrc.push_back({last_seg(vs.alias.empty() ? vs.table_name : vs.alias), std::move(cols)});
             }
             if (all_tables && !vsrc.empty()) {
               std::function<void(ExprPtr&)> qual = [&](ExprPtr& e) {
@@ -43366,10 +43503,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                   const std::string* owner = nullptr;
                   int hits = 0;
                   for (const auto& p : vsrc)
-                    if (p.second->get_column_index(e->name) >= 0) { owner = &p.first; ++hits; }
+                    if (has_name(p.second, e->name)) { owner = &p.first; ++hits; }
                   if (hits == 1) e->qualifier = *owner;
                 }
-                for (auto& a : e->args) qual(a);
+                merge_children(e, qual);
               };
               for (auto& it : vb.items) qual(it.expr);
               qual(vb.where);
@@ -43432,8 +43569,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           auto someone_else_has = [&](const std::string& name) {
             for (size_t k = 0; k < branch.sources.size(); ++k) {
               if (k == si) continue;
-              const SqlTable* ot = db->find_table(branch.sources[k].table_name);
-              if (ot && ot->get_column_index(name) >= 0) return true;
+              std::vector<std::string> cols;
+              if (source_columns(branch.sources[k], &cols) && has_name(cols, name)) return true;
             }
             return false;
           };
@@ -43447,8 +43584,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             for (size_t k = 0; k < branch.sources.size(); ++k) {
               if (k == si) continue;
               const auto& os = branch.sources[k];
-              const SqlTable* ot = db->find_table(os.table_name);
-              if (!ot || ot->get_column_index(name) < 0) continue;
+              std::vector<std::string> cols;
+              if (!source_columns(os, &cols) || !has_name(cols, name)) continue;
               ++hits;
               owner = os.alias.empty() ? os.table_name : os.alias;
             }
@@ -43482,7 +43619,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                   unknown_col = e->name;
               }
             }
-            for (auto& a : e->args) rewrite_in(a, check);
+            merge_children(e, [&](ExprPtr& a) { rewrite_in(a, check); });
           };
           std::function<void(ExprPtr&)> rewrite = [&](ExprPtr& e) { rewrite_in(e, false); };
 
@@ -43550,7 +43687,19 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           branch.items = std::move(new_items);
 
           // Merge WHERE clause
-          if (vb.where) {
+          if (vb.where && padded_right) {
+            ExprPtr cloned_vw = clone_expr(vb.where);
+            if (branch.join_conditions.size() < si) branch.join_conditions.resize(si);
+            ExprPtr& on = branch.join_conditions[si - 1];
+            if (on) {
+              auto and_e = std::make_shared<SqlExpr>();
+              and_e->op = ExprOp::And;
+              and_e->args = {on, cloned_vw};
+              on = and_e;
+            } else {
+              on = cloned_vw;
+            }
+          } else if (vb.where) {
             ExprPtr cloned_vw = clone_expr(vb.where);
             if (branch.where) {
               auto and_e = std::make_shared<SqlExpr>();
@@ -47728,6 +47877,40 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
 
   auto& current_scope = cte_stack().back();
 
+  // A CTE read once by the rest of the statement, whose SELECT is the kind a view is merged as (one SELECT over
+  // named tables: no grouping, aggregate, window, DISTINCT, LIMIT, ORDER BY or derived table), is not materialized:
+  // it becomes a view for the statement, and the query that reads it takes its tables and expressions - as MySQL
+  // merges a derived table or CTE. A chain of them (SQLDoom's renderer runs eight over 56,000 rows) was eight
+  // rounds of rows written out and read back. AIOS_CTE_MERGE=0 materializes every one.
+  static const bool merge_ctes = [] { const char* e = std::getenv("AIOS_CTE_MERGE"); return !e || std::string(e) != "0"; }();
+  struct CteViewScope {
+    CteViewScope() { g_cte_views.emplace_back(); }
+    ~CteViewScope() { g_cte_views.pop_back(); }
+  } cte_views;
+  // AIOS_CTE_MERGE_SKIP=a,b: CTEs of these names are materialized whatever their shape (to find the one a merge
+  // changes the answer of); AIOS_CTE_MERGE_TRACE=1 names each merged one on stderr.
+  static const std::string skip_list = [] { const char* e = std::getenv("AIOS_CTE_MERGE_SKIP"); return std::string(e ? e : ""); }();
+  static const bool trace_merge = std::getenv("AIOS_CTE_MERGE_TRACE") != nullptr;
+  auto merge_as_view = [&](const std::string& name, const std::string& body, size_t after_tok) {
+    if (!merge_ctes) return false;
+    if (!skip_list.empty() && ("," + skip_list + ",").find("," + lower_of(name) + ",") != std::string::npos) return false;
+    const std::string up = upper_of(name);
+    int refs = 0;
+    for (size_t i = after_tok; i < toks.size() && toks[i].kind != Tok::End; ++i)
+      if (toks[i].kind == Tok::Ident && toks[i].up == up) ++refs;
+    if (refs != 1) return false;
+    const ParsedSelectStatement st = parse_select_sql(body);
+    if (!st.ok || st.branches.size() != 1 || !st.with_sql.empty() || !st.union_tail.empty()) return false;
+    const ParsedSelectBranch& b = st.branches[0];
+    if (b.distinct || !b.group_by.empty() || b.having || b.limit >= 0 || b.offset > 0 || !b.order_by.empty() ||
+        b.sources.empty() || branch_has_window(b))
+      return false;
+    for (const auto& it : b.items) if (it.star || expr_has_aggregate(it.expr)) return false;
+    for (const auto& src : b.sources)
+      if (src.is_derived() || src.lateral || !src.series_args.empty() || !src.using_cols.empty() || src.natural) return false;
+    return true;
+  };
+
   while (true) {
     std::string cte_name;
     if (!p.parse_name(&cte_name)) return make_error(p.error());
@@ -47800,13 +47983,29 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       size_t s_pos = toks[cte_body_start_tok].start_pos;
       size_t e_pos = toks[cte_body_end_tok - 1].end_pos;
       std::string cte_sql = sql.substr(s_pos, e_pos - s_pos);
+      if (!is_recursive || union_tok_idx == std::string::npos) {
+        if (merge_as_view(cte_name, cte_sql, cte_body_end_tok + 1)) {
+          SqlView v;
+          v.name = cte_name;
+          v.database = effective_database();
+          v.query_sql = cte_sql;
+          v.column_aliases = cte_cols;
+          g_cte_views.back()[lower_of(cte_name)] = std::move(v);
+          if (trace_merge) std::fprintf(stderr, "[cte] merged %s\n", cte_name.c_str());
+          if (!p.take_punct(",")) break;
+          continue;
+        }
+      }
 
       SqlQueryResult res;
+      const uint64_t t0 = trace_merge ? hal_now_ns() : 0;
       {
         RowsOnly rows_only;
         res = execute_local_query(cte_sql);
       }
       if (!res.success) return res;
+      if (trace_merge)
+        std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows\n", cte_name.c_str(), (hal_now_ns() - t0) / 1e6, res.rows.size());
 
       SqlTable tbl;
       tbl.name = cte_name;
@@ -47919,6 +48118,12 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
   size_t main_start = toks[p.pos()].start_pos;
   std::string main_sql = sql.substr(main_start);
 
+  if (trace_merge) {
+    const uint64_t t0 = hal_now_ns();
+    SqlQueryResult r = execute_local_query(main_sql);
+    std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows\n", "(main)", (hal_now_ns() - t0) / 1e6, r.rows.size());
+    return r;
+  }
   return execute_local_query(main_sql);
 }
 

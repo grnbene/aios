@@ -2578,6 +2578,9 @@ struct SqlTable {
   }
 };
 
+// Whether a WITH running on this thread has CTEs it merges as views (execute_with).
+bool sql_cte_views_active();
+
 struct SqlView {
   std::string name;
   std::string database = "aios_db";
@@ -2774,7 +2777,7 @@ class SqlDatabase {
 
   std::vector<std::string> list_tables(const std::string& db = "") const;
   std::vector<std::string> list_views(const std::string& db = "") const;
-  bool has_views() const { return !views_.empty(); }
+  bool has_views() const { return !views_.empty() || sql_cte_views_active(); }
   // What a table IS — its columns, their types, its rows — so a browser can
   // show a table's shape without selecting every row out of it first.
   SqlTable* find_table(const std::string& name, const std::string& db = "");
@@ -3119,6 +3122,7 @@ class SqlDatabase {
  public:
   struct StoredProgram;
   std::shared_ptr<const StoredProgram> find_program(char kind, const std::string& name) const;
+  uint64_t programs_generation() const { return programs_gen_.load(std::memory_order_acquire); }
   bool has_stored_functions() const { return has_functions_.load(std::memory_order_acquire); }
 
   // Whether a capability may run this statement, decided from its text before
@@ -3130,6 +3134,8 @@ class SqlDatabase {
  private:
   mutable aios::hal::Mutex programs_mu_;
   std::map<std::string, std::shared_ptr<const StoredProgram>> programs_;
+  // Bumped whenever programs_ changes: what a cached find_program answer is good for.
+  std::atomic<uint64_t> programs_gen_{1};
   std::atomic<bool> has_functions_{false}, has_triggers_{false}, has_events_{false};
   std::atomic<bool> event_scheduler_{false};   // SET GLOBAL event_scheduler; off, as MariaDB ships
   SqlQueryResult execute_program_ddl(const std::string& sql);

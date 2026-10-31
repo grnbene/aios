@@ -126,6 +126,27 @@ int main() {
   run_ok(db, "CREATE VIEW cv AS WITH d1 AS (SELECT s, x * 2 AS w FROM a), d2 AS (SELECT s, w + 1 AS w FROM d1) SELECT s, w FROM d2");
   expect(db, "a view that opens with WITH", "SELECT GROUP_CONCAT(w ORDER BY s) FROM cv", "3,3,5,7");
   expect(db, "joined", "SELECT a.s, cv.w FROM a JOIN cv ON cv.s = a.s WHERE a.x = 1 ORDER BY a.s", "p|3;q|3");
+  // A view (or a CTE the engine merges as one) with a WHERE on the padded side of a LEFT JOIN keeps the rows it has
+  // no match for: its WHERE belongs to the join, not the statement.
+  run_ok(db, "CREATE VIEW solid_w AS SELECT c, r FROM w WHERE solid = 1");
+  expect(db, "LEFT JOIN a filtered view", "SELECT a.s, sw.r FROM a LEFT JOIN solid_w sw ON sw.c = a.x AND sw.r = a.y ORDER BY a.s",
+         "p|1;q|NULL;r|1;s|NULL;t|NULL");
+  expect(db, "LEFT JOIN a filtered CTE",
+         "WITH sw AS (SELECT c, r FROM w WHERE solid = 1) SELECT a.s, sw.r FROM a LEFT JOIN sw ON sw.c = a.x AND sw.r = a.y ORDER BY a.s",
+         "p|1;q|NULL;r|1;s|NULL;t|NULL");
+  // [NOT] EXISTS correlated on two columns, against a CTE's table and LATERAL series (the renderer's view_holes):
+  // run as a row-value [NOT] IN, hashed once. Each value is what the correlated form gives.
+  expect(db, "NOT EXISTS on two columns over a CTE and series",
+         "WITH fp AS (SELECT c AS x, r AS y FROM w WHERE solid = 1) "
+         "SELECT COUNT(*), MIN(sx.x * 10 + sy.y) FROM generate_series(1, 3) AS sx(x) CROSS JOIN generate_series(1, 2) AS sy(y) "
+         "WHERE NOT EXISTS (SELECT 1 FROM fp f WHERE f.x = sx.x AND f.y = sy.y)",
+         "4|12");
+  expect(db, "EXISTS on two columns, the outer nullable",
+         "SELECT GROUP_CONCAT(a.s ORDER BY a.s) FROM a WHERE EXISTS (SELECT 1 FROM w WHERE w.c = a.x AND w.r = a.y AND w.solid = 1)", "p,r");
+  expect(db, "NOT EXISTS on two columns, the outer nullable (NULLs are kept)",
+         "SELECT GROUP_CONCAT(a.s ORDER BY a.s) FROM a WHERE NOT EXISTS (SELECT 1 FROM w WHERE w.c = a.x AND w.r = a.y AND w.solid = 1)", "q,s,t");
+  expect(db, "a CTE read twice is one table",
+         "WITH sw AS (SELECT c, r FROM w WHERE solid = 1) SELECT (SELECT COUNT(*) FROM sw) + (SELECT SUM(r) FROM sw)", "20");
 
   std::cout << "\n[3] LATERAL and generate_series\n";
   expect(db, "generate_series", "SELECT GROUP_CONCAT(n ORDER BY n) FROM generate_series(1, 5) AS g(n)", "1,2,3,4,5");

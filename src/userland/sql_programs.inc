@@ -1219,6 +1219,7 @@ void SqlDatabase::load_programs() {
     if ((*p)->kind == 'E') (*p)->last_run.store(0);
     hal::LockGuard g(programs_mu_);
     programs_[program_key((*p)->kind, (*p)->db, (*p)->name)] = *p;
+    programs_gen_.fetch_add(1, std::memory_order_acq_rel);
   }
   refresh_program_flags();
 }
@@ -1287,6 +1288,7 @@ SqlQueryResult SqlDatabase::execute_program_ddl(const std::string& sql) {
             return make_error("Trigger " + np.name + " already exists");
       }
       programs_[key] = *p;
+      programs_gen_.fetch_add(1, std::memory_order_acq_rel);
     }
     refresh_program_flags();
     save_programs();
@@ -1305,6 +1307,7 @@ SqlQueryResult SqlDatabase::execute_program_ddl(const std::string& sql) {
     {
       hal::LockGuard g(programs_mu_);
       gone = programs_.erase(program_key(kind, pdb, pname)) > 0;
+      programs_gen_.fetch_add(1, std::memory_order_acq_rel);
     }
     if (!gone && !if_exists && !(bulk_load_ || seeding_ || redo_replaying_ || g_cdc_thread))
       return make_error(std::string(kind_word(kind)) + " " + pdb + "." + pname + " does not exist");
@@ -1493,9 +1496,88 @@ Val as_returns_type(const Val& v, const std::string& returns) {
 }
 }  // namespace psm
 
+// RETURN <expression> as the whole body, the expression over the parameters alone: parsed once per program (under
+// the sql_mode it was made under), and a call clones the tree, puts each argument in for its parameter and
+// evaluates - no statement built, tokenized and run per call, which was most of a SQLDoom frame (two light
+// functions per pixel). A body with anything else - a subquery, a user variable, a window, an aggregate, a name
+// that is no parameter - takes the interpreter as before.
+struct FastReturn {
+  ExprPtr tmpl;
+  std::vector<std::pair<std::vector<size_t>, size_t>> params;   // a path of argument indices to a parameter node, and its index
+};
+static bool fast_return_ok(const SqlExpr* e, const std::vector<SqlDatabase::StoredProgram::Param>& params,
+                           std::vector<size_t>* path, FastReturn* out) {
+  if (!e) return false;
+  if (e->op == ExprOp::Subquery || e->op == ExprOp::Exists || e->op == ExprOp::Star || !e->subquery_sql.empty() || e->window)
+    return false;
+  if (e->op == ExprOp::Func && is_aggregate_name(upper_of(e->name))) return false;
+  if (e->op == ExprOp::Column) {
+    if (!e->qualifier.empty() || is_user_var_name(e->name) || e->name.rfind("@@", 0) == 0) return false;
+    for (size_t k = 0; k < params.size(); ++k)
+      if (strcasecmp(params[k].name.c_str(), e->name.c_str()) == 0) { out->params.push_back({*path, k}); return true; }
+    return false;
+  }
+  for (size_t i = 0; i < e->args.size(); ++i) {
+    path->push_back(i);
+    if (!fast_return_ok(e->args[i].get(), params, path, out)) return false;
+    path->pop_back();
+  }
+  return true;
+}
+static std::shared_ptr<const FastReturn> fast_return_of(const SqlDatabase::StoredProgram& f) {
+  int st = f.fast_state.load(std::memory_order_acquire);
+  if (st == 2) return nullptr;
+  if (st == 1) return std::static_pointer_cast<const FastReturn>(f.fast_return);
+  static hal::Mutex build_mu;
+  hal::LockGuard g(build_mu);
+  st = f.fast_state.load(std::memory_order_acquire);
+  if (st == 2) return nullptr;
+  if (st == 1) return std::static_pointer_cast<const FastReturn>(f.fast_return);
+  auto fail = [&]() { f.fast_state.store(2, std::memory_order_release); return std::shared_ptr<const FastReturn>(); };
+  const psm::Nodes& body = psm::body_of(f);
+  if (f.aggregate || body.size() != 1 || body[0].kind != psm::Node::Return || trim(body[0].text).empty()) return fail();
+  for (const auto& prm : f.params) if (prm.mode != 0) return fail();
+  std::vector<Token> toks;
+  std::string terr;
+  if (!tokenize_sql(body[0].text, &toks, &terr)) return fail();
+  SqlParser p(toks);
+  p.set_source(&body[0].text);
+  ExprPtr e = p.parse_expr();
+  if (p.failed() || !e || !p.at_end()) return fail();
+  auto fr = std::make_shared<FastReturn>();
+  fr->tmpl = e;
+  std::vector<size_t> path;
+  if (!fast_return_ok(e.get(), f.params, &path, fr.get())) return fail();
+  f.fast_return = fr;
+  f.fast_state.store(1, std::memory_order_release);
+  return fr;
+}
+
 Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<Val>& args,
                      const std::string& session_db, std::string* err) {
   RoutineMode mode(f);
+  if (args.size() == f.params.size()) {
+    if (auto fr = fast_return_of(f)) {
+      DepthGuard dg;
+      InFunction in_function;
+      if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return val_null(); }
+      ExprPtr e = clone_expr(fr->tmpl);
+      for (const auto& [path, k] : fr->params) {
+        SqlExpr* n = e.get();
+        for (size_t i : path) n = n->args[i].get();
+        n->op = ExprOp::Literal;
+        n->literal = psm::as_returns_type(args[k], f.params[k].type);
+        n->name.clear();
+      }
+      std::string ferr;
+      EvalCtx ctx;
+      ctx.db = &db;
+      ctx.err = &ferr;
+      Val r = eval_expr(e.get(), ctx);
+      if (!ferr.empty()) { *err = ferr; return val_null(); }
+      return psm::as_returns_type(r, f.returns);
+    }
+  }
   DepthGuard dg;
   InFunction in_function;
   if (!dg.ok) { *err = "Recursive stored functions and triggers are not allowed"; return val_null(); }
@@ -1614,6 +1696,7 @@ void SqlDatabase::run_due_events() {
     {
       hal::LockGuard g(programs_mu_);
       for (const auto& k : finished) programs_.erase(k);
+      programs_gen_.fetch_add(1, std::memory_order_acq_rel);
     }
     refresh_program_flags();
     save_programs();

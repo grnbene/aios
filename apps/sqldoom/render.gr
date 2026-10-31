@@ -32,6 +32,7 @@ if frame == nil { error("the renderer returned no frame") }
 print("frame: " + str(len(frame)) + " bytes in " + format("{:.0f}", ms) + " ms")
 
 let rgb = bytes(frame)
+if env("SQLDOOM_RAW", "") != "" { write_bytes(env("SQLDOOM_RAW"), rgb) }   # the frame's bytes as they came, for a diff
 let px = []
 let n = idiv(len(rgb), 3)
 for i in range(0, n) {
