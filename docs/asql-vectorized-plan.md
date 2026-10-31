@@ -97,6 +97,15 @@ the file split's steps are, including the object-code and timing comparison.
 
 **2c. The driver.** What is left of `execute_parsed_select_single` walks the plan.
 
+## Stage 3: compiled pipelines over the plan (decided: both)
+
+Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
+filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
+(reusing the Grain JITs' emitters: x86-64 and AArch64) and run in place of the operators, with the same answers or
+a fall-back to them. Compilation is adaptive, never for a statement that runs once in microseconds. The design,
+staging and measurements (against DuckDB on identical data: today 2.7x behind on grouping, 1.3-1.5x on an anti-join)
+come when stage 2 is done; stage 2 is its prerequisite, since a compiler needs a plan to compile from.
+
 ## Order
 
 1a, 1b, then 2a (the plan makes 1c-1e and every later change easier to place and to check), 2b/2c phase by phase,
