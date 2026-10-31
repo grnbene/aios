@@ -7204,6 +7204,17 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
 // Evaluates a subquery once and, when it turned out to read nothing from the
 // query around it, keeps the answer for every row that follows.
 SqlTable* find_cte_table(const std::string& name);   // below: a CTE / ephemeral table in scope
+// A result's rows into a table made for them, the columns encoded in parallel (append_rows_bulk) and the rows
+// consumed: a CTE, a derived table or a LATERAL's rows went in one at a time, each cell normalised and encoded in
+// turn, which was most of a statement that only hands rows on.
+static void append_result_rows(SqlTable* tbl, std::vector<SqlRow>& rows) {
+  std::vector<std::vector<std::string>> bulk;
+  bulk.reserve(rows.size());
+  for (SqlRow& r : rows) bulk.push_back(std::move(r.values));
+  { std::vector<SqlRow> gone; gone.swap(rows); }
+  tbl->append_rows_bulk(bulk);
+}
+
 std::string undo_literal(const std::string& v);      // below: a cell as an SQL literal
 
 bool fast_in_subquery(const EvalCtx& ctx, const ParsedSelectStatement& st, NestedResult* out);
@@ -43070,7 +43081,7 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
   t->hidden_columns = 1;
   t->ensure_columns();
   t->reserve(rows.size());
-  for (const SqlRow& r : rows) t->append_row(r);
+  append_result_rows(t.get(), rows);
   t->inferred_types = true;
 
   // ON ... AND t.__lateral_key = __LATKEY(<the earlier columns>)
@@ -43977,7 +43988,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         fit_decimal_scales(ephem->columns, dres.rows);
         ephem->ensure_columns();
         ephem->reserve(dres.rows.size());
-        for (const auto& r : dres.rows) ephem->append_row(r);
+        ephem->reserve(dres.rows.size());
+        append_result_rows(ephem.get(), dres.rows);
         { std::vector<SqlRow> gone; gone.swap(dres.rows); }   // the table holds them now
         ephem->inferred_types = true;
 
@@ -48015,10 +48027,8 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       }
       cte_columns_from(res, cte_cols, &tbl);
       tbl.ensure_columns();
-      for (const auto& r : res.rows) {
-        tbl.append_row(r);
-      }
-      { std::vector<SqlRow> gone; gone.swap(res.rows); }   // the table holds them now
+      tbl.reserve(res.rows.size());
+      append_result_rows(&tbl, res.rows);   // the table holds them now
       current_scope[cte_name] = std::make_shared<SqlTable>(std::move(tbl));
     } else {
       // Recursive CTE
