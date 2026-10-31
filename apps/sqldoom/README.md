@@ -30,7 +30,7 @@ aios --root R grain serve apps/sqldoom/play.gr [MAP] [skill]
 run` has no display); `SQLDOOM_FRAMES=n` runs n tics and frames with no display and saves the last.
 
 It is not playable at speed: a tic takes 25-45 ms with the monsters asleep and over 100 ms once they chase (Doom's
-budget is 28.6 ms), a frame about 2 s.
+budget is 28.6 ms), a frame about 1.4 s.
 
 ## Rendering a frame
 
@@ -45,14 +45,16 @@ pose the camera is at player 1's start:
 ![E1M1 from player 1's start, rendered by ASQL](e1m1-start.png)
 
 The game tic, renderer and client run E1M1: a scripted 400-tic run walks, turns, fires and uses with no error,
-monsters wake, chase and shoot, a door moves. It takes about 2 s a frame after the first (SQLDoom on CedarDB: about
-13 ms). The engine work the renderer drove so far, all of it general: CTEs read once are merged into their reader
-as views and the rest have their rows appended in bulk; a multi-column `EXISTS` is decorrelated into a row-value
-`IN`; expressions over integer and DOUBLE columns compile into vectorized programs run over whole row sets
-(aggregate arguments, GROUP BY keys, join keys, select items); doubles print through `std::to_chars`. What is left
-is the floor of materializing each CTE as rows of text before the next reads it - `fragment_union` alone is 78,000
-rows - and the floor and ceiling chain of eight CTEs over some 56,000 rows; real time needs CTEs kept as typed
-columns end to end, a change to the engine of its own. `AIOS_CTE_MERGE_TRACE=1` prints each CTE's time.
+monsters wake, chase and shoot, a door moves. It takes about 1.4 s a frame after the first (SQLDoom on CedarDB:
+about 13 ms). The engine work the renderer drove so far, all of it general: CTEs read once are merged into their
+reader as views and the rest have their rows appended in bulk; a multi-column `EXISTS` is decorrelated into a
+row-value `IN`, hashed as whole tuples; expressions over integer, DOUBLE and dictionary-coded text columns compile
+into vectorized programs run over whole row sets (aggregate arguments, GROUP BY keys, join keys, select items,
+pushed-down WHERE and ON conjuncts, the light functions inlined); join steps pick the key that selects and hash
+expression keys in lanes; doubles print through `std::to_chars`. What is left is the floor of materializing each
+CTE as rows of text before the next reads it - `fragment_union` alone is 78,000 rows - and the texel joins of the
+floor and ceiling chain over some 56,000 rows; real time needs CTEs kept as typed columns end to end, a change to
+the engine of its own. `AIOS_CTE_MERGE_TRACE=1` prints each CTE's time, `AIOS_VX_TRACE=1` each join step's.
 
 ## What differs from SQLDoom
 

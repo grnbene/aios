@@ -8197,6 +8197,10 @@ struct FastReturn {
   std::vector<std::pair<std::vector<size_t>, size_t>> params;   // a path of argument indices to a parameter node, and its index
 };
 static std::shared_ptr<const FastReturn> fast_return_of(const SqlDatabase::StoredProgram& f);
+// A row-value IN's set (RowInSet, below), as the programs read it: whether every tuple is numbers hashed whole,
+// its width, and whether a tuple of doubles is in it.
+static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols);
+static bool row_in_set_has(const RowInSet& set, const double* key, size_t n);
 
 #include "sql_vprog.inc"
 
@@ -12415,6 +12419,15 @@ struct RowInSet {
   bool by_number = false;
   std::unordered_map<double, std::vector<uint32_t>> by_first;
   std::vector<uint32_t> null_first;
+  // Every value of every row a number a double carries, none NULL: the whole tuple hashed by its doubles' bytes,
+  // and a probe of such numbers is one lookup. By the first column alone, (x, y) NOT IN (53,760 pixels) walked
+  // the ~170 rows sharing an x and compared each - 2 us a probe where this is 50 ns.
+  bool by_tuple = false;
+  std::unordered_set<std::string> tuples;
+  static void tuple_key(const std::vector<Val>& r, size_t n, std::string* k) {
+    k->clear();
+    for (size_t i = 0; i < n; ++i) { const double d = r[i].num == 0 ? 0.0 : r[i].num; k->append(reinterpret_cast<const char*>(&d), sizeof d); }
+  }
 
   void build(std::vector<std::vector<Val>> r, size_t n) {
     ncols = n;
@@ -12422,6 +12435,17 @@ struct RowInSet {
     by_number = true;
     for (const auto& row : rows)
       if (!row[0].null && (!row[0].numeric || InLookupSet::is_wide(row[0]))) { by_number = false; break; }
+    by_tuple = ncols >= 1 && ncols <= 8 && !rows.empty();
+    for (const auto& row : rows) {
+      if (!by_tuple) break;
+      for (size_t i = 0; i < ncols; ++i)
+        if (row[i].null || !row[i].numeric || InLookupSet::is_wide(row[i])) { by_tuple = false; break; }
+    }
+    if (by_tuple) {
+      tuples.reserve(rows.size());
+      std::string k;
+      for (const auto& row : rows) { tuple_key(row, ncols, &k); tuples.insert(k); }
+    }
     if (!by_number) return;
     for (uint32_t i = 0; i < rows.size(); ++i) {
       if (rows[i][0].null) null_first.push_back(i);
@@ -12430,6 +12454,16 @@ struct RowInSet {
   }
   // 1 true, 0 false, -1 NULL.
   int match(const std::vector<Val>& l) const {
+    if (by_tuple) {
+      bool plain = l.size() >= ncols;
+      for (size_t i = 0; plain && i < ncols; ++i)
+        if (l[i].null || !l[i].numeric || InLookupSet::is_wide(l[i])) plain = false;
+      if (plain) {
+        std::string k;
+        tuple_key(l, ncols, &k);
+        return tuples.count(k) ? 1 : 0;   // no row of the set holds a NULL: a miss is false, not unknown
+      }
+    }
     bool unknown = false;
     auto test = [&](const std::vector<Val>& r) {
       bool u = false;
@@ -12461,6 +12495,16 @@ struct RowInSet {
     return unknown ? -1 : 0;
   }
 };
+
+static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols) {
+  *ncols = set.ncols;
+  return set.by_tuple;
+}
+static bool row_in_set_has(const RowInSet& set, const double* key, size_t n) {
+  std::string k;
+  for (size_t i = 0; i < n; ++i) { const double d = key[i] == 0 ? 0.0 : key[i]; k.append(reinterpret_cast<const char*>(&d), sizeof d); }
+  return set.tuples.count(k) != 0;
+}
 
 // The outer values a LATERAL derived table was made for (materialize_lateral), each tuple to the key its rows carry
 // in the table's hidden column. __LATKEY(a.x, b.y) is that key for the row in hand - NULL when none was made for its
@@ -45254,7 +45298,16 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       const SqlExpr* xk_base = nullptr;
       bool var_key = false;
       for (const ProbeKey& k : jkeys) if (expr_reads_local(k.value, basectx)) var_key = true;
-      if (!var_key && join_conditions[j] && rows.size() >= 64 && js.table && js.table->row_count() >= 64) {
+      // Column keys that hold one or two values (`s.map_id = p.map_id`, one map loaded) find every row: an
+      // expression key beside them (`s.seg_id + 0 = p.seg_id`) is the one that selects, so it is hashed instead.
+      bool keys_flat = !jkeys.empty() && js.table;
+      for (const ProbeKey& k : jkeys) {
+        if (!keys_flat) break;
+        if (k.column < 0 || (size_t)k.column >= js.table->col_data.size()) { keys_flat = false; break; }
+        const ColumnStore& kcs = js.table->col_data[(size_t)k.column];
+        if (!(kcs.encoding == ColumnEncoding::Constant || (vx::dict_coded(kcs) && vx::dict_size(kcs) <= 2))) keys_flat = false;
+      }
+      if ((!var_key || keys_flat) && join_conditions[j] && rows.size() >= 64 && js.table && js.table->row_count() >= 64) {
         auto only_in = [&](const SqlExpr* e, const EvalCtx& in, const EvalCtx& notin) {
           bool ok = true, any = false;
           auto walk = [&](const SqlExpr* x, auto& self) -> void {
@@ -45284,11 +45337,13 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           for (int side = 0; side < 2 && !xk_join; ++side) {
             const SqlExpr* a = pc->args[side].get();
             const SqlExpr* b = pc->args[1 - side].get();
+            // over one-valued column keys, the expression that selects is wanted, not another such column
+            if (keys_flat && var_key && a->op == ExprOp::Column) continue;
             if (only_in(a, newctx, basectx) && only_in(b, basectx, newctx)) { xk_join = a; xk_base = b; }
           }
           if (xk_join) break;
         }
-        if (vx_trace_on() && xk_join) vx_trace("join: +" + js.alias + " expression key hashed");
+        if (vx_trace_on() && xk_join) vx_trace("join: +" + js.alias + " expression key hashed" + (keys_flat && var_key ? " (over one-valued column keys)" : ""));
       }
       // A key compared with a constant (`AND sm.discontinued = 0`) is a
       // condition on the joined table, not a way to find a row's partners:
@@ -45338,6 +45393,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       bool js_prefilter_where = false;              // WHERE conditions are among what js_pass checked
       std::vector<uint32_t> js_rows;                // the rows js_pass admits, ascending
       std::vector<const SqlExpr*> pushable_rest = pushable;   // what a candidate still has to pass
+      std::vector<const SqlExpr*> vp_deferred;                // WHERE conjuncts applied to the step's rows at once (below)
       // The ON clause's conditions on the joined table alone (`LEFT JOIN
       // locstock ls ON ls.stockid = sm.stockid AND ls.loccode = 'L001'`) select
       // its rows the same way, for any join kind: a row failing them never
@@ -45553,18 +45609,88 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
       // High-Performance Multi-Key Parallel Indexed Probe / Hash Join
       bool hash_join_done = false;
-      if (!prep_jkeys.empty() || xk_join) {
+      // An inner join of a table of few rows (a settings row) with no key to probe: each base row gets each of
+      // them, no per-row context. Its ON (an inner join's is a filter on the pairs, as a WHERE is) and the WHERE
+      // conjuncts pushed to this step apply after it, at once, where they compile; the rest are checked here.
+      if (jkeys.empty() && !xk_join && !join_is_left[j] && !join_is_right[j] && js.table && !right_seen &&
+          js.table->row_count() <= 64 && !rows.empty()) {
+        const size_t nj = js.table->row_count();
+        std::vector<const SqlExpr*> conds = pushable;
+        if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &conds);
+        std::vector<const SqlExpr*> plain;
+        if (rows.size() >= 256 && vp::enabled()) {
+          EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+          for (const SqlExpr* p : conds) {
+            bool retry = false;
+            const vp::Prog* P = vp::program_for(p, pctx, &retry);
+            if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
+          }
+        } else {
+          plain = conds;
+        }
+        if (!reserve_rows(rows.size() * nj, sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+        next.reserve(rows.size() * nj);
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+        for (JoinedRow& base : rows) {
+          for (size_t ri = 0; ri < nj; ++ri) {
+            JoinedRow cand = ri + 1 == nj ? std::move(base) : base;
+            cand.parts.push_back(ri);
+            if (!plain.empty()) {
+              ctx.row = &cand;
+              bool keep = true;
+              for (const SqlExpr* p : plain) if (!predicate_true(p, ctx)) { keep = false; break; }
+              if (!err.empty()) return make_error(err);
+              if (!keep) continue;
+            }
+            next.push_back(std::move(cand));
+          }
+        }
+        hash_join_done = true;
+      }
+      if (!hash_join_done && (!prep_jkeys.empty() || xk_join)) {
         bool has_extra_join = false;
         std::vector<const SqlExpr*> jparts;
         collect_conjuncts(join_conditions[j].get(), &jparts);
         if (jparts.size() != prep_jkeys.size() || xk_join) has_extra_join = true;
+        // The ON conjuncts a candidate is checked against: every one, less those an inner join leaves to the
+        // vectorized pass after the step (on_deferred) - a conjunct that compiles as a program and is no key
+        // equality the probe already answers. A LEFT or RIGHT join's ON decides its padding, so it keeps all.
+        std::vector<const SqlExpr*> on_check = jparts;
+        std::vector<const SqlExpr*> on_deferred;
+        if (has_extra_join && !join_is_left[j] && !join_is_right[j] && rows.size() >= 256 && vp::enabled()) {
+          EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+          for (const SqlExpr* pc : jparts) {
+            bool is_key = false;
+            for (const PreparedJoinKey& k : prep_jkeys)
+              if (pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == k.value || pc->args[1].get() == k.value)) is_key = true;
+            if (xk_join && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == xk_join || pc->args[1].get() == xk_join)) is_key = true;
+            if (is_key) continue;
+            const vp::Prog* P = vp::program_for(pc, pctx);
+            if (!P || P->out().ty == vp::Ty::Str) continue;
+            on_deferred.push_back(pc);
+          }
+          on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_deferred.begin(), on_deferred.end(), pc) != on_deferred.end(); }), on_check.end());
+          for (const SqlExpr* pc : on_deferred) vp_deferred.push_back(pc);
+        }
+        auto on_true = [&](EvalCtx& ctx) {
+          for (const SqlExpr* pc : on_check) if (!predicate_true(pc, ctx)) return false;
+          return true;
+        };
 
-        // Check if any prepared key has an index
+        // The indexed key whose column tells rows apart best: a typed integer column, else the dictionary with
+        // the most entries. The first indexed key took `ON s.map_id = p.map_id AND s.seg_id = p.seg_id` by
+        // map_id - one value, every row a candidate, each then checked on seg_id.
         int best_ki = -1;
-        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-          if (prep_jkeys[ki].idx) {
-            best_ki = (int)ki;
-            break;
+        {
+          size_t best_ndv = 0;
+          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+            if (!prep_jkeys[ki].idx) continue;
+            size_t ndv = 1;
+            if (prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
+              const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+              ndv = vx::typed_numeric(kcs) ? SIZE_MAX : vx::dict_coded(kcs) ? vx::dict_size(kcs) : (size_t)1 << 20;
+            }
+            if (best_ki < 0 || ndv > best_ndv) { best_ki = (int)ki; best_ndv = ndv; }
           }
         }
 
@@ -45582,7 +45708,27 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           xr.parts.push_back(0);
           xc.row = &xr;
           hash_tbl.reserve(std::min(js.table->row_count(), (size_t)1 << 20));
-          for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
+          // the expression over every row of the joined table at once, where it compiles (vp): its numbers go
+          // straight into the hash; a text-valued key, or one that does not compile, is interpreted per row
+          bool vp_built = false;
+          if (const vp::Prog* P = vp::program_for(xk_copy.get(), xc)) {
+            if (P->out().ty != vp::Ty::Str) {
+              vp::Column col;
+              std::string verr;
+              const size_t nrows = js.table->row_count();
+              if (vp::eval_column_ids(*P, [](size_t r) { return r; }, nrows, &col, &verr)) {
+                for (size_t ri = 0; ri < nrows; ++ri) {
+                  if (col.is_null(ri)) continue;
+                  const double d = col.ty == vp::Ty::I64 ? (col.uns ? (double)(uint64_t)col.i[ri] : (double)col.i[ri]) : col.f[ri];
+                  xk_num[d == 0 ? 0.0 : d].push_back((uint32_t)ri);
+                }
+                vp_built = true;
+              }
+            }
+          }
+          if (vx_trace_on()) vx_trace("join: +" + js.alias + " expression key hash of " + std::to_string(js.table->row_count()) + " rows built in " +
+                                      std::to_string((hal_now_ns() - jt0) / 1000) + " us" + (vp_built ? " (vectorized)" : ""));
+          for (size_t ri = 0; !vp_built && ri < js.table->row_count(); ++ri) {
             xr.parts.set_inline(0, ri);
             Val v = eval_expr(xk_copy.get(), xc);
             if (!err.empty()) return make_error(err);
@@ -45760,8 +45906,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
 
         // Numbers a double cannot carry on either side of the main key: matches are confirmed by their digits.
         bool best_wide = false;
+        bool js_key_wide = false;
         if (best_ki >= 0 && prep_jkeys[best_ki].column >= 0 && (size_t)prep_jkeys[best_ki].column < js.table->col_data.size()) {
-          best_wide = vx::wide_numbers(js.table->col_data[(size_t)prep_jkeys[best_ki].column]);
+          best_wide = js_key_wide = vx::wide_numbers(js.table->col_data[(size_t)prep_jkeys[best_ki].column]);
           const SqlExpr* bval = prep_jkeys[best_ki].value;
           size_t bs = 0, bc = 0;
           if (!best_wide && bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &bs, &bc) == ColumnLookup::Found &&
@@ -45783,6 +45930,15 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
           }
         }
+        // An expression key whose values are all known now, and all within a double's 53 bits: the probe's double
+        // finds exactly its matches, so no candidate has to be confirmed by its digits.
+        if (best_wide && !js_key_wide && best_ki >= 0 && vp_key_ok[(size_t)best_ki]) {
+          const vp::Column& kc = vp_keys[(size_t)best_ki];
+          bool narrow = kc.ty == vp::Ty::I64 && !kc.uns;
+          for (size_t r = 0; narrow && r < kc.size(); ++r)
+            if (!kc.is_null(r) && (kc.i[r] > 9007199254740992LL || kc.i[r] < -9007199254740992LL)) narrow = false;
+          if (narrow) best_wide = false;
+        }
         auto key_val = [&](size_t ki, const JoinedRow& base, EvalCtx& vctx) -> Val {
           if (vp_key_ok[ki]) {
             const size_t ri = (size_t)(&base - rows.data());
@@ -45790,6 +45946,29 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           }
           return eval_expr(prep_jkeys[ki].value, vctx);
         };
+        // A pushed-down WHERE conjunct that compiles as a program over this step's sources is left out of the
+        // per-candidate checks and applied to the step's rows all at once, after it (vp_deferred below). Not when
+        // a LIMIT ends the step early: the count it stops at would be of unfiltered rows.
+        const bool step_limited = limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j];
+        if (!step_limited && !pushable.empty() && rows.size() >= 256 && vp::enabled()) {
+          EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+          for (const SqlExpr* p : pushable) {
+            bool retry = false;
+            const vp::Prog* P = vp::program_for(p, pctx, &retry);
+            // one waiting on a subquery's set ((x, y) NOT IN (SELECT ..)): the interpreter runs it on the step's
+            // first row, which fills the set, and the program compiles then
+            if (!P && !retry) continue;
+            if (P && P->out().ty == vp::Ty::Str) continue;
+            vp_deferred.push_back(p);
+          }
+          if (!vp_deferred.empty()) {
+            auto drop = [&](std::vector<const SqlExpr*>& v) {
+              v.erase(std::remove_if(v.begin(), v.end(), [&](const SqlExpr* p) { return std::find(vp_deferred.begin(), vp_deferred.end(), p) != vp_deferred.end(); }), v.end());
+            };
+            drop(pushable);
+            drop(pushable_rest);
+          }
+        }
         // The joined rows whose keys equal this base row's.
         auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
           out.clear();
@@ -45939,11 +46118,14 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           }
         };
 
+        uint64_t t_gather = 0, t_on = 0, t_rest = 0, n_cands = 0;   // step diagnostics (serial path), in the trace
+        const bool step_timing = vx_trace_on() && rows.size() < 256;
         auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, JoinedRows& l_next,
                                  JoinMemo* memo) {
           JoinedRow probe_row = base;
           vctx.row = &probe_row;
           bool matched = false;
+          const uint64_t pt0 = step_timing ? hal_now_ns() : 0;
 
           // Locals, not thread_local scratch: a pushed-down condition can run
           // a correlated subquery whose own join probes on this thread.
@@ -45961,12 +46143,17 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           } else {
             gather_matches(base, vctx, fresh);
           }
+          const uint64_t pt1 = step_timing ? hal_now_ns() : 0;
+          if (step_timing) { t_gather += pt1 - pt0; n_cands += matches->size(); }
 
           for (size_t match_ri : *matches) {
             JoinedRow cand = base;
             cand.parts.push_back(match_ri);
             ctx.row = &cand;
-            if (has_extra_join && join_conditions[j] && !predicate_true(join_conditions[j].get(), ctx)) {
+            const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
+            const bool on_ok = !has_extra_join || on_true(ctx);
+            if (step_timing) t_on += hal_now_ns() - ot0;
+            if (!on_ok) {
               continue;
             }
             // The ON clause matched: this left row is not NULL-padded,
@@ -45996,6 +46183,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           }
         };
 
+        const uint64_t jt_probe0 = vx_trace_on() ? hal_now_ns() : 0;
         if (rows.size() >= 256) {
           size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
           if (total_threads == 0) total_threads = 1;
@@ -46062,6 +46250,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             process_probe(base, vctx, ctx, next, memo_ok ? &memo : nullptr);
           }
         }
+        if (vx_trace_on())
+          vx_trace("join: +" + js.alias + " prepared in " + std::to_string((jt_probe0 - jt0) / 1000) + " us, probed " + std::to_string(rows.size()) +
+                   " rows in " + std::to_string((hal_now_ns() - jt_probe0) / 1000) + " us" + (best_ki >= 0 ? " (index)" : xk_join ? " (expression hash)" : single_int_hash ? " (int hash)" : " (text hash)") +
+                   (step_timing ? " [gather " + std::to_string(t_gather / 1000) + " us, " + std::to_string(n_cands) + " candidates, ON checks " + std::to_string(t_on / 1000) + " us]" : ""));
         hash_join_done = true;
       }
 
@@ -46121,9 +46313,49 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         }
         if (vx_trace_on()) vx_trace("join: +" + js.alias + " (right): " + std::to_string(padded) + " unmatched rows kept");
       }
+      if (!vp_deferred.empty() && !next.empty()) {
+        // the WHERE conjuncts left to this point, over every row of the step at once: a row stays while each is
+        // true (a NULL is not, as predicate_true has it)
+        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+        std::vector<uint8_t> keep(next.size(), 1);
+        for (const SqlExpr* p : vp_deferred) {
+          const vp::Prog* P = vp::program_for(p, pctx);
+          if (!P) {
+            // its subquery's set is filled by one interpreted evaluation; then it may compile
+            EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+            ctx.row = &next[0];
+            (void)predicate_true(p, ctx);
+            if (!err.empty()) return make_error(err);
+            P = vp::program_for(p, pctx);
+          }
+          vp::Column col;
+          std::string verr;
+          if (!P || !vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return next[r]; }, next.size(), &col, &verr)) {
+            // the program failed on these rows (a value out of range): the interpreter decides, row by row
+            EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+            for (size_t r = 0; r < next.size(); ++r) {
+              if (!keep[r]) continue;
+              ctx.row = &next[r];
+              if (!predicate_true(p, ctx)) keep[r] = 0;
+              if (!err.empty()) return make_error(err);
+            }
+            continue;
+          }
+          for (size_t r = 0; r < next.size(); ++r) {
+            if (!keep[r] || col.is_null(r)) { keep[r] = 0; continue; }
+            if (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0) keep[r] = 0;
+          }
+        }
+        size_t w = 0;
+        for (size_t r = 0; r < next.size(); ++r) if (keep[r]) { if (w != r) next[w] = std::move(next[r]); ++w; }
+        next.resize(w);
+      }
       if (vx_trace_on())
         vx_trace("join: +" + js.alias + (join_is_left[j] ? " (left)" : "") + " -> " + std::to_string(next.size()) +
-                 " rows, " + std::to_string((hal_now_ns() - jt0) / 1000) + " us");
+                 " rows, " + std::to_string((hal_now_ns() - jt0) / 1000) + " us" +
+                 (hash_join_done ? "" : " (scanned" + (join_conditions[j] ? ", on: " + join_conditions[j]->source_text.substr(0, 80) : std::string(", no ON")) +
+                                        ", " + std::to_string(pushable.size()) + " pushed conjuncts, " + std::to_string(js.table ? js.table->row_count() : 0) + " joined rows)") +
+                 (vp_deferred.empty() ? "" : " (" + std::to_string(vp_deferred.size()) + " conjuncts vectorized)"));
       if (next.size() >= 1000000) g_trim_after_statement.store(true, std::memory_order_relaxed);
       rows.swap(next);
     }

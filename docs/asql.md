@@ -2113,6 +2113,23 @@ stays open), and its redo record is never written.
   expression. SQRT, EXP, LOG, the trigonometry, POWER and CAST AS DOUBLE give a
   DOUBLE of any argument, as MySQL's do: `SQRT(4) / 8` is 0.25, not the
   DECIMAL 0.2500 an exact 2 would divide to.
+- Join steps, where the programs reach them: a WHERE conjunct pushed down to a
+  step that compiles is applied to the step's rows all at once after it, not
+  checked per candidate (so is an inner join's ON conjunct that is no key
+  equality, and one waiting on a subquery's set - `(x, y) NOT IN (SELECT ..)`
+  - is run once by the interpreter to fill the set, then compiled); an
+  expression key (`ON s.seg_id + 0 = p.seg_id`) is hashed over the joined
+  table in lanes, and is taken over column keys that hold one or two values
+  (`AND s.map_id = p.map_id` with one map loaded, which found every row);
+  of several indexed keys the one whose column tells rows apart best probes
+  (a typed integer, else the widest dictionary); an inner join of a table
+  of at most 64 rows with no key writes each pair straight out, its ON
+  applied after; a row-value IN whose set is all numbers hashes the whole
+  tuple (`(x, y) NOT IN (53,760 pixels)` was a walk of the ~170 rows sharing
+  an x per probe). `AIOS_VX_TRACE=1` prints each step's strategy and time:
+  `join: +alias prepared in .. us, probed N rows in .. us (index | expression
+  hash | int hash | text hash)`, `(scanned, on: .., N pushed conjuncts, M
+  joined rows)` for one that fell to the scan, `(N conjuncts vectorized)`.
 - A WITH's CTE named once in the rest of the statement, whose body is one
   plain SELECT (no `*`, aggregate, DISTINCT, GROUP BY, HAVING, ORDER BY,
   LIMIT, UNION or nested WITH, over tables and other CTEs - no derived table,

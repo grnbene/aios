@@ -25,7 +25,8 @@ struct Ins {
     Eq, Ne, Lt, Le, Gt, Ge, And, Or, Not, IsNull, NotNull,
     Case, Coalesce, NullIf, Greatest, Least, Abs, Floor, Ceil, Sqrt, Pow, Sin, Cos, Tan, Atan, Atan2, Radians,
     Degrees, CastI, CastF, BitAnd, BitOr, BitXor, Shl, Shr, BitNot,
-    RoundI   // a stored routine's INT parameter or result: the double rounded half away from zero (std::round)
+    RoundI,  // a stored routine's INT parameter or result: the double rounded half away from zero (std::round)
+    TupleIn  // (a, b) IN (SELECT ..): the tuple of numbers looked up in the subquery's rows, hashed whole
   } op = Konst;
   Ty ty = Ty::I64;
   bool approx = false;    // the interpreter's Val here would be approximate (a DOUBLE)
@@ -44,6 +45,7 @@ struct Ins {
   uint32_t slot = 0;      // ColS: the column's index in Prog::text_cols
   const ColumnStore* cs = nullptr;
   std::vector<uint32_t> args;
+  std::shared_ptr<const RowInSet> set;   // TupleIn: the subquery's rows
   std::vector<int64_t> code_i;      // CodeI: per dictionary code
   std::vector<double> code_f;       // CodeF
   std::vector<uint8_t> code_null;   // CodeI / CodeF: 1 where the code is NULL; StrIn: 1 where the code matches
@@ -108,6 +110,7 @@ struct Compiler {
   bool ok = true;
   int depth = 0;
   std::string why;   // the first reason the expression did not compile (for the trace)
+  bool retry = false;   // it did not compile this time for a reason that may pass next time (a set not yet run)
   bool pg_div = tls_pg_division;   // the division rule in force: the statement's, or an inlined routine's own
   int inlined = 0;                 // stored functions being inlined, one inside another
   // An inlined function's parameter nodes (in its RETURN template) and the lanes its arguments compiled to.
@@ -629,12 +632,43 @@ struct Compiler {
           if (first) return fail();
           return emit(std::move(in));
         }
+        if (up == "__ROW_IN"sv) return tuple_in(e);
         if (uint32_t r = stored_function(e, up); ok) return r;
         return 0;
       }
       default:
         return fail("operator " + std::to_string((int)e->op));
     }
+  }
+
+  // (a, b) [NOT] IN (SELECT x, y ..) whose subquery has run and read nothing from outside, and whose rows are all
+  // numbers (RowInSet::by_tuple): each row's tuple is one lookup. A set not run yet is left to the interpreter
+  // this time, and tried again on the next statement (retry).
+  uint32_t tuple_in(const SqlExpr* e) {
+    if (e->args.size() != 1 || !e->args[0] || e->subquery_sql.empty()) return fail("row-value IN form");
+    std::shared_ptr<const RowInSet> set;
+    {
+      std::unique_lock<aios::hal::Mutex> lock;
+      if (e->sub_mu) lock = std::unique_lock<aios::hal::Mutex>(*e->sub_mu);
+      if (e->sub_evaluated && !e->sub_correlated) set = e->row_in_set;
+    }
+    if (!set) { retry = true; return fail("row-value IN set not run yet"); }
+    size_t ncols = 0;
+    if (!row_in_set_by_tuple(*set, &ncols)) return fail("row-value IN set not all numbers");
+    const SqlExpr* row = e->args[0].get();
+    if (row->args.size() != ncols || ncols == 0 || ncols > 8) return fail("row-value IN width");
+    Ins in;
+    in.op = Ins::TupleIn;
+    in.ty = Ty::I64;
+    in.set = set;
+    for (const auto& a : row->args) {
+      const uint32_t x = compile(a.get());
+      if (!ok) return 0;
+      if (is_text(at(x)) || at(x).uns) return fail("row-value IN of a text");
+      in.args.push_back(x);
+    }
+    const uint32_t m = emit(std::move(in));
+    return e->negated ? unary(Ins::Not, m, Ty::I64, false) : m;
   }
 
   // A call of a stored function whose body is RETURN <expression> over its parameters: the arguments compile to
@@ -728,7 +762,7 @@ struct Compiler {
 
 
 // The program for e over ctx's sources, or null.
-inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::string* why = nullptr) {
+inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::string* why = nullptr, bool* retry = nullptr) {
   if (!enabled() || !e || !ctx.sources) return nullptr;
   if (e->op == ExprOp::Literal || e->op == ExprOp::Column) return nullptr;   // nothing to gain
   auto P = std::make_shared<Prog>();
@@ -738,6 +772,7 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
   c.compile(e);
   if (!c.ok || P->ins.empty() || P->ins.size() > 256 || P->out().taint || P->out().dec) {
     if (why) *why = !c.ok ? c.why : (P->ins.size() > 256 ? "too long" : "result may be an exact decimal");
+    if (retry) *retry = c.retry;
     return nullptr;
   }
   return P;
@@ -1051,6 +1086,28 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
           vf[j] = P.ins[in.args[0]].uns ? (double)(uint64_t)A(0)[j] : fd(0, j);
         }
         break;
+      case Ins::TupleIn: {
+        // a NULL in the tuple is unknown (the set holds no NULL row to equal it); a value past a double's 53 bits
+        // the interpreter compares by its digits - the interpreter's path, then
+        double key[8];
+        const size_t w = in.args.size();
+        for (size_t j = 0; j < n; ++j) {
+          bool any_null = false;
+          for (size_t k = 0; k < w; ++k) {
+            if (N(k)[j]) { any_null = true; break; }
+            if (ty(k) == Ty::I64) {
+              const int64_t v = L.i[in.args[k]][j];
+              if (v > 9007199254740992LL || v < -9007199254740992LL) { *err = "row-value IN past a double"; return false; }
+              key[k] = (double)v;
+            } else {
+              key[k] = L.f[in.args[k]][j];
+            }
+          }
+          if (any_null) { nl[j] = 1; continue; }
+          vi[j] = row_in_set_has(*in.set, key, w) ? 1 : 0;
+        }
+        break;
+      }
       case Ins::RoundI:
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
@@ -1225,7 +1282,8 @@ inline bool valid(const Prog& P, const EvalCtx& ctx) {
 // null when it does not compile. A program over a column store that has since changed is compiled afresh. Only
 // the statement's own thread compiles (and writes the cache); a worker thread reads what it finds, so the
 // aggregates a parallel emit evaluates are compiled before it starts (vp::warm).
-inline const Prog* program_for(const SqlExpr* e, const EvalCtx& ctx) {
+inline const Prog* program_for(const SqlExpr* e, const EvalCtx& ctx, bool* retry_out = nullptr) {
+  if (retry_out) *retry_out = false;
   if (!enabled() || !e || !ctx.sources) return nullptr;
   if (e->vprog_scope == (const void*)ctx.sources) {
     const Prog* P = static_cast<const Prog*>(e->vprog.get());
@@ -1243,11 +1301,13 @@ inline const Prog* program_for(const SqlExpr* e, const EvalCtx& ctx) {
   }
   if (SqlThreadPool::is_in_worker_thread()) return nullptr;
   std::string why;
-  std::shared_ptr<Prog> P = compile(e, ctx, &why);
+  bool retry = false;
+  std::shared_ptr<Prog> P = compile(e, ctx, &why, &retry);
+  if (retry_out) *retry_out = retry;
   if (vx_trace_on() && e->op != ExprOp::Literal && e->op != ExprOp::Column)
     vx_trace((P ? "vp: compiled (" + std::to_string(P->ins.size()) + " ops) " : "vp: interpreted (" + why + ") ") + expr_text(e));
   e->vprog_scope = ctx.sources;
-  e->vprog_none = !P;
+  e->vprog_none = !P && !retry;
   if (!P) { e->vprog_none_sig.clear(); literal_sig(e, &e->vprog_none_sig); }
   e->vprog = P;
   return P.get();
