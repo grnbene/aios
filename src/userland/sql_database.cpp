@@ -7226,6 +7226,8 @@ struct ParsedSelectStatement;
 SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatement& stmt);
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& branch);
 
+#include "sql_colbatch_types.inc"
+
 // Runs a nested SELECT with `outer` as the scope its unresolved columns are
 // looked up in. Defined below, once SqlDatabase's own members exist; declared
 // here because expression evaluation is what reaches for it.
@@ -7236,6 +7238,10 @@ struct NestedResult {
   size_t row_count = 0;
   size_t column_count = 0;
   std::vector<std::vector<Val>> rows;   // every column of every row: only for a row-value IN, which compares them all
+  // A row-value IN's rows as the select's typed columns, every one integer lanes (rows then empty): the set is
+  // built from the lanes. text_cols: the columns of type TEXT (their cells are read as text, not numbers).
+  std::shared_ptr<struct ColBatch> batch;
+  std::vector<bool> text_cols;
 };
 // Runs a nested SELECT with `outer` pushed as the scope its own columns fall
 // back to. Only the first column is handed back: that is all any of the three
@@ -7250,8 +7256,13 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
     return out;
   }
   SqlQueryResult r;
+  // A row-value IN asks for the rows as typed columns: (x, y) NOT IN (53,760 pixels) printed every integer and
+  // parsed it back (strtod, the wide-number and decimal checks) - two thirds of building the set.
+  std::shared_ptr<ColBatch> batch = all_columns ? std::make_shared<ColBatch>() : nullptr;
   {
     OuterScope scope(&outer);
+    std::optional<ColOutRequest> want_columns;
+    if (batch) want_columns.emplace(batch.get());
     r = execute_parsed_select(db, stmt);
   }
   if (!r.success) {
@@ -7261,6 +7272,18 @@ inline NestedResult run_nested_parsed_select(SqlDatabase* db,
   out.ok = true;
   out.row_count = r.rows.size();
   out.column_count = r.columns.size();
+  if (batch && r.rows_in_batch && batch->filled) {
+    bool lanes = batch->cols.size() == r.columns.size();
+    for (const ColBatch::Col& c : batch->cols) lanes = lanes && c.kind == ColBatch::I64;
+    out.row_count = batch->rows;
+    if (lanes) {
+      out.batch = batch;
+      out.text_cols.resize(r.columns.size());
+      for (size_t c = 0; c < r.columns.size(); ++c) out.text_cols[c] = c < r.column_types.size() && r.column_types[c] == SqlDataType::Text;
+      return out;
+    }
+    batch->to_rows(&r.rows);   // anything else: the rows, and on as before
+  }
   if (all_columns) {
     out.rows.reserve(r.rows.size());
     for (SqlRow& row : r.rows) {
@@ -12475,18 +12498,97 @@ static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v) {
 // reads the rows with an equal first value (and the ones with a NULL there) instead of all of them.
 struct RowInSet {
   size_t ncols = 0;
-  std::vector<std::vector<Val>> rows;
   bool by_number = false;
-  std::unordered_map<double, std::vector<uint32_t>> by_first;
-  std::vector<uint32_t> null_first;
-  // Every value of every row a number a double carries, none NULL: the whole tuple hashed by its doubles' bytes,
-  // and a probe of such numbers is one lookup. By the first column alone, (x, y) NOT IN (53,760 pixels) walked
-  // the ~170 rows sharing an x and compared each - 2 us a probe where this is 50 ns.
+  // Every value of every row a number a double carries, none NULL: the whole tuple, its doubles (-0 as 0) compared
+  // bit for bit, in a flat open-addressed table - a probe of such numbers is one hash and a compare or two. By the
+  // first column alone, (x, y) NOT IN (53,760 pixels) walked the ~170 rows sharing an x (2 us a probe); as a set of
+  // 16-byte strings it was a heap node a tuple and most of building the set.
   bool by_tuple = false;
-  std::unordered_set<std::string> tuples;
-  static void tuple_key(const std::vector<Val>& r, size_t n, std::string* k) {
-    k->clear();
-    for (size_t i = 0; i < n; ++i) { const double d = r[i].num == 0 ? 0.0 : r[i].num; k->append(reinterpret_cast<const char*>(&d), sizeof d); }
+  std::vector<double> keys;      // ncols doubles a row, row-major
+  std::vector<uint32_t> slots;   // 1 + the row whose key sits there; 0 empty
+  size_t mask = 0;
+
+  static double norm(double d) { return d == 0 ? 0.0 : d; }
+  // Each double's bits through a full 64-bit mix: a small integer's double has all its bits in the top half, and
+  // a multiply-and-shift that left the slot bits (the low ones) the same for every key put 53,760 pixels in a
+  // handful of runs (~1,400 instructions an insert).
+  static uint64_t mix(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27; x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+  static uint64_t hash_key(const double* k, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    for (size_t i = 0; i < n; ++i) {
+      uint64_t b;
+      std::memcpy(&b, &k[i], 8);
+      h = mix(h ^ b);
+    }
+    return h;
+  }
+  bool same(const double* a, const double* b) const {   // bit for bit, as the keys were hashed
+    for (size_t i = 0; i < ncols; ++i) {
+      uint64_t x, y;
+      std::memcpy(&x, &a[i], 8);
+      std::memcpy(&y, &b[i], 8);
+      if (x != y) return false;
+    }
+    return true;
+  }
+  // The tuples (normalised) into the table; a duplicate is kept once.
+  void index_keys(size_t nrows) {
+    size_t cap = 16;
+    while (cap < nrows * 2) cap <<= 1;
+    slots.assign(cap, 0);
+    mask = cap - 1;
+    for (size_t r = 0; r < nrows; ++r) {
+      const double* k = &keys[r * ncols];
+      for (size_t at = hash_key(k, ncols) & mask;; at = (at + 1) & mask) {
+        if (!slots[at]) { slots[at] = (uint32_t)r + 1; break; }
+        if (same(&keys[(slots[at] - 1) * ncols], k)) break;
+      }
+    }
+  }
+  bool has_key(const double* raw) const {
+    double k[8];
+    for (size_t i = 0; i < ncols; ++i) k[i] = norm(raw[i]);
+    for (size_t at = hash_key(k, ncols) & mask;; at = (at + 1) & mask) {
+      const uint32_t s = slots[at];
+      if (!s) return false;
+      if (same(&keys[(s - 1) * ncols], k)) return true;
+    }
+  }
+
+  // The rows as values, for a probe the tuple table cannot answer (a NULL, text, or a number past a double in it).
+  // A set built from typed columns makes them only when such a probe comes, from each cell's own text through
+  // val_cell - the values the row path would have made.
+  mutable std::vector<std::vector<Val>> rows;
+  mutable std::unordered_map<double, std::vector<uint32_t>> by_first;
+  mutable std::vector<uint32_t> null_first;
+  std::shared_ptr<const ColBatch> batch;
+  std::vector<bool> text_col;
+  mutable std::once_flag rows_once;
+
+  void index_first() const {
+    if (!by_number) return;
+    for (uint32_t i = 0; i < rows.size(); ++i) {
+      if (rows[i][0].null) null_first.push_back(i);
+      else by_first[rows[i][0].num].push_back(i);
+    }
+  }
+  const std::vector<std::vector<Val>>& all_rows() const {
+    if (batch) std::call_once(rows_once, [&] {
+      rows.resize(batch->rows);
+      for (size_t r = 0; r < batch->rows; ++r) {
+        rows[r].reserve(ncols);
+        for (size_t c = 0; c < ncols; ++c) {
+          const std::string cell = batch->cols[c].text(r);
+          rows[r].push_back(sql_is_null(cell) ? val_null() : (c < text_col.size() && text_col[c]) ? val_text(cell) : val_cell(cell));
+        }
+      }
+      index_first();
+    });
+    return rows;
   }
 
   void build(std::vector<std::vector<Val>> r, size_t n) {
@@ -12502,16 +12604,41 @@ struct RowInSet {
         if (row[i].null || !row[i].numeric || InLookupSet::is_wide(row[i])) { by_tuple = false; break; }
     }
     if (by_tuple) {
-      tuples.reserve(rows.size());
-      std::string k;
-      for (const auto& row : rows) { tuple_key(row, ncols, &k); tuples.insert(k); }
+      keys.resize(rows.size() * ncols);
+      for (size_t i = 0; i < rows.size(); ++i)
+        for (size_t c = 0; c < ncols; ++c) keys[i * ncols + c] = norm(rows[i][c].num);
+      index_keys(rows.size());
     }
-    if (!by_number) return;
-    for (uint32_t i = 0; i < rows.size(); ++i) {
-      if (rows[i][0].null) null_first.push_back(i);
-      else by_first[rows[i][0].num].push_back(i);
-    }
+    index_first();
   }
+  // From a subquery's typed columns: only when every column is integer lanes with no NULL and no value past what a
+  // double carries exactly - then every row is in the tuple table and none is NULL, as build() would find; the rows
+  // as values wait for a probe that needs them. False: the caller builds from rows.
+  bool build_from_batch(std::shared_ptr<const ColBatch> b, size_t n, std::vector<bool> text_cols) {
+    if (!b || n < 1 || n > 8 || b->cols.size() != n || b->rows == 0 || b->rows >= UINT32_MAX) return false;
+    for (const ColBatch::Col& c : b->cols) {
+      if (c.kind != ColBatch::I64) return false;
+      for (size_t r = 0; r < b->rows; ++r) {
+        if (c.nul[r]) return false;
+        const int64_t v = c.i[r];
+        // fewer than 16 digits is never wide (text_is_wide_number); past that ask it, of the cell's own text
+        if ((v >= 1000000000000000LL || v <= -1000000000000000LL) && text_is_wide_number(std::to_string((long long)v))) return false;
+      }
+    }
+    ncols = n;
+    by_number = true;   // the first column is all numbers, none wide
+    by_tuple = true;
+    keys.resize(b->rows * n);
+    for (size_t c = 0; c < n; ++c) {
+      const std::vector<int64_t>& lane = b->cols[c].i;
+      for (size_t r = 0; r < b->rows; ++r) keys[r * n + c] = norm((double)lane[r]);
+    }
+    index_keys(b->rows);
+    text_col = std::move(text_cols);
+    batch = std::move(b);
+    return true;
+  }
+
   // 1 true, 0 false, -1 NULL.
   int match(const std::vector<Val>& l) const {
     if (by_tuple) {
@@ -12519,11 +12646,12 @@ struct RowInSet {
       for (size_t i = 0; plain && i < ncols; ++i)
         if (l[i].null || !l[i].numeric || InLookupSet::is_wide(l[i])) plain = false;
       if (plain) {
-        std::string k;
-        tuple_key(l, ncols, &k);
-        return tuples.count(k) ? 1 : 0;   // no row of the set holds a NULL: a miss is false, not unknown
+        double k[8];
+        for (size_t i = 0; i < ncols; ++i) k[i] = l[i].num;
+        return has_key(k) ? 1 : 0;   // no row of the set holds a NULL: a miss is false, not unknown
       }
     }
+    const std::vector<std::vector<Val>>& all = all_rows();
     bool unknown = false;
     auto test = [&](const std::vector<Val>& r) {
       bool u = false;
@@ -12536,7 +12664,7 @@ struct RowInSet {
     };
     auto over = [&](const std::vector<uint32_t>& idx) {
       for (uint32_t i : idx) {
-        const int t = test(rows[i]);
+        const int t = test(all[i]);
         if (t == 1) return true;
         if (t < 0) unknown = true;
       }
@@ -12547,7 +12675,7 @@ struct RowInSet {
       if ((it != by_first.end() && over(it->second)) || over(null_first)) return 1;
       return unknown ? -1 : 0;
     }
-    for (const auto& r : rows) {
+    for (const auto& r : all) {
       const int t = test(r);
       if (t == 1) return 1;
       if (t < 0) unknown = true;
@@ -12561,10 +12689,7 @@ static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols) {
   return set.by_tuple;
 }
 static bool row_in_set_has(const RowInSet& set, const double* key, size_t n) {
-  thread_local std::string k;   // kept: a 16-byte key allocated per row was most of a lookup
-  k.clear();
-  for (size_t i = 0; i < n; ++i) { const double d = key[i] == 0 ? 0.0 : key[i]; k.append(reinterpret_cast<const char*>(&d), sizeof d); }
-  return set.tuples.count(k) != 0;
+  return n == set.ncols && set.has_key(key);
 }
 
 // The outer values a LATERAL derived table was made for (materialize_lateral), each tuple to the key its rows carry
@@ -12640,7 +12765,22 @@ Val eval_row_in(const SqlExpr* e, const EvalCtx& ctx) {
         return val_null();
       }
       auto built = std::make_shared<RowInSet>();
-      built->build(std::move(r.rows), l.size());
+      if (r.batch && !built->build_from_batch(r.batch, l.size(), r.text_cols)) {
+        // lanes the tuple table cannot take (a NULL, a number past a double): the rows, as the row path makes them
+        built = std::make_shared<RowInSet>();
+        std::vector<SqlRow> text_rows;
+        r.batch->to_rows(&text_rows);
+        r.rows.clear();
+        for (SqlRow& row : text_rows) {
+          std::vector<Val> vals;
+          for (size_t c = 0; c < row.values.size(); ++c)
+            vals.push_back(sql_is_null(row.values[c]) ? val_null()
+                           : (c < r.text_cols.size() && r.text_cols[c]) ? val_text(row.values[c]) : val_cell(std::move(row.values[c])));
+          r.rows.push_back(std::move(vals));
+        }
+        r.batch.reset();
+      }
+      if (!r.batch) built->build(std::move(r.rows), l.size());
       set = built;
       if (e->sub_mu) {
         std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
