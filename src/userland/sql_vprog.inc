@@ -1150,24 +1150,13 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
         }
         break;
       case Ins::CastI:
-        // The interpreter's CAST(x AS SIGNED) is val_num((double)v): past 1e15 it prints as a double (1e15) and
-        // past 2^53 loses digits - such a value takes the interpreter's path, so the text is its own.
+        // The interpreter's CAST(x AS SIGNED) of an exact integer is that integer by its digits; of an unsigned
+        // value past INT64_MAX it is the wrap into SIGNED (as MariaDB's) - the lane's own bits either way.
         for (size_t j = 0; j < n; ++j) {
           if (N(0)[j]) { nl[j] = 1; continue; }
-          if (ty(0) == Ty::I64 && P.ins[in.args[0]].uns) {
-            // the interpreter reads an unsigned bit result through its double (val_u64), and rounds that
-            const double a = (double)(uint64_t)A(0)[j];
-            if (!(a < 1e15)) { *err = "CAST past 1e15: the interpreter's text"; return false; }
-            vi[j] = (int64_t)std::llround(a);
-            continue;
-          }
-          if (ty(0) == Ty::I64) {
-            if (A(0)[j] >= 1000000000000000LL || A(0)[j] <= -1000000000000000LL) { *err = "CAST past 1e15: the interpreter's text"; return false; }
-            vi[j] = A(0)[j];
-            continue;
-          }
+          if (ty(0) == Ty::I64) { vi[j] = A(0)[j]; continue; }
           const double a = F(0)[j];
-          if (!(std::fabs(a) < 1e15)) { *err = "CAST past 1e15: the interpreter's text"; return false; }
+          if (!(std::fabs(a) < 9.2e18)) { *err = "CAST past BIGINT: the interpreter's text"; return false; }
           // a DOUBLE as ROUND rounds it: half away from zero on its 15 significant digits, as written; an exact
           // decimal (a literal's lane) on its value. Writing the double out and reading it back is ~300 ns a
           // row, so it is done only where it can differ from std::round: a fraction within the rendering's

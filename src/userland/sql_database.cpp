@@ -10312,7 +10312,20 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
       // whole number.
       long long v = 0;
       double tnum = 0;
-      if (a_ptr[0].numeric) {
+      AIOS_INT128 ex = 0;
+      int exs = 0, exd = 0;
+      if (a_ptr[0].numeric && !a_ptr[0].approx && exact_internal_of(a_ptr[0], &ex, &exs, &exd)) {
+        // An exact number by its digits, never through a double: CAST(211104251548982408 AS SIGNED) kept every
+        // digit in MariaDB and lost its low ones here (and printed as 2.11e17). A fraction rounds half away from
+        // zero (CAST(12.9 AS SIGNED) is 13); past 64 bits an unsigned value wraps into SIGNED as MariaDB's does
+        // (CAST(18446744073709551615 AS SIGNED) is -1), anything wider saturates, as MariaDB saturates.
+        if (exs > 0) ex = scale_down_half_up(ex, exs);
+        constexpr AIOS_INT128 kI64Max = (AIOS_INT128)INT64_MAX, kI64Min = -(AIOS_INT128)INT64_MAX - 1;
+        constexpr AIOS_INT128 kU64Max = ((AIOS_INT128)1 << 64) - 1;
+        v = ex >= kI64Min && ex <= kI64Max ? (long long)ex
+          : ex > kI64Max && ex <= kU64Max ? (long long)(unsigned long long)(AIOS_UINT128)ex
+          : ex > 0 ? INT64_MAX : INT64_MIN;
+      } else if (a_ptr[0].numeric) {
         // a DOUBLE as ROUND rounds it (as written, half away from zero: 2.5e0 is 3, as 2.5 is; MariaDB's rint says 2)
         const double x = val_as_number(a_ptr[0]);
         Val r;
@@ -10336,7 +10349,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
         const unsigned long long u = (unsigned long long)v;
         return val_num_with_text((double)u, std::to_string(u));
       }
-      return val_num((double)v);
+      return val_exact((AIOS_INT128)v, 0);   // the integer by its digits (val_num's double printed 1e15 and up as a double)
     }
     if (target.rfind("DOUBLE", 0) == 0 || target.rfind("FLOAT", 0) == 0 ||
         target.rfind("REAL", 0) == 0)
