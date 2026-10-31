@@ -126,8 +126,13 @@ against the build before, the suites, the frame's bytes and alternating frame ti
   grouping, HAVING, the groups' ORDER BY .. LIMIT short cuts, the grouped emit); returns an error to hand back or
   nothing to go on to the emit. The select function 173,659 -> 137,276 bytes, `group_result` 44,327; 4,934 of 5,045
   functions the same size; frames 497/491/517 -> 490/517/493 ms.
-- next: **join step** (`JoinStepPlan`: the joined source, kind, keys, method, pushed conjuncts), then **base** and
-  **sources**; the function left is the driver that walks the plan.
+- **join** (done): `JoinPlan` + `join_steps` - the 1,375-line loop over the join steps (each step's own conditions,
+  key and method choice, probe, outer-join padding, conjuncts in lanes after the step). The select function
+  137,276 -> 89,801 bytes, `join_steps` 53,923; 4,933 of 5,046 functions the same size; frames 522/517/510 ->
+  521/510/503 ms. One step is still one iteration of that loop; splitting the step into its own operator with a
+  `JoinStepPlan` node comes with the compiler's needs.
+- next: **base** (the base source's selection and rows) and **sources** (resolving and materializing them), the
+  ungrouped projection; the function left is the driver that walks the plan.
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 
