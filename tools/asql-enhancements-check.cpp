@@ -299,8 +299,17 @@ int main() {
       stop = true;
       for (auto& th : readers) th.join();
       assert(bad == 0);
-      show = db.execute_gateway_query("SHOW THING gt");
-      for (const auto& row : show.rows) by_key[row.values[col(show, "stockid")]] = row.values;
+      // The reaction to the last of the 40 writes may still be running: wait for the kind's clock to move until
+      // the Thing shows it (bounded; each wait returns at the next reaction), as a client would - reading straight
+      // away saw an earlier sum about one run in twelve under load.
+      std::string c40 = clock_of(db.execute_gateway_query("WAIT THING gt SINCE 0"));
+      for (int tries = 0; tries < 200; ++tries) {
+        show = db.execute_gateway_query("SHOW THING gt");
+        by_key.clear();
+        for (const auto& row : show.rows) by_key[row.values[col(show, "stockid")]] = row.values;
+        if (by_key.count("B") && by_key["B"][col(show, "sum")] == "39.3000") break;
+        c40 = clock_of(db.execute_gateway_query("WAIT THING gt SINCE " + c40 + " TIMEOUT 10"));
+      }
       assert(by_key["B"][col(show, "sum")] == "39.3000");   // 0.2 + 39 + 0.1: the last write, not a kept older read
     }
     std::cout << "  -> A grain Thing added decimals exactly, kept the wire's text, and a write moved only its own key.\n";
