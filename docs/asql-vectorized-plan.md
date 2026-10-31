@@ -110,6 +110,22 @@ at hand - and prints one line a step with rows and time; the table of invented t
 Known gaps, for 2b: a subquery that fills an IN / EXISTS set appears as its own flat steps, not nested; the
 single-table engine is one step with no inner detail; a window statement's inner plan follows the `window` step.
 
+### Stage 2b, in progress: operators out of the select function
+
+Each phase's code moves verbatim into a static operator function taking its inputs as a plan struct, in
+`sql_database.cpp` for now: the operators use its file-local types (`Val`, `SqlExpr`, `EvalCtx`, `JoinedRow`), and
+moving those into engine-internal headers is the file split's own later step (docs/asql-source-layout.md, 5-6).
+Each move is checked as the file split's steps are: a sorted-line diff shows only glue, per-function object code
+against the build before, the suites, the frame's bytes and alternating frame times.
+
+- **emit** (done): `EmitPlan` + `emit_result` - DISTINCT, the sort, the projection header, the output form.
+  `execute_parsed_select_single` 177,561 -> 173,659 bytes of code, `emit_result` 7,298; 5,025 of 5,099 functions
+  the same size (the 74 changed are the sort template instances renamed with `OutRow`, and EXPLAIN); frames
+  520/523/506 -> 518/533/516 ms.
+- next: **group** (`GroupPlan`: keys, aggregates, HAVING, the grouping method), then **join step** (`JoinStepPlan`:
+  the joined source, kind, keys, method, pushed conjuncts), then **base** and **sources**; the function left is the
+  driver that walks the plan.
+
 ## Stage 3: compiled pipelines over the plan (decided: both)
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,

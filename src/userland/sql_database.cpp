@@ -12785,11 +12785,11 @@ Val eval_row_in(const SqlExpr* e, const EvalCtx& ctx) {
         std::vector<SqlRow> text_rows;
         r.batch->to_rows(&text_rows);
         r.rows.clear();
-        for (SqlRow& row : text_rows) {
+        for (SqlRow& trow : text_rows) {
           std::vector<Val> vals;
-          for (size_t c = 0; c < row.values.size(); ++c)
-            vals.push_back(sql_is_null(row.values[c]) ? val_null()
-                           : (c < r.text_cols.size() && r.text_cols[c]) ? val_text(row.values[c]) : val_cell(std::move(row.values[c])));
+          for (size_t c = 0; c < trow.values.size(); ++c)
+            vals.push_back(sql_is_null(trow.values[c]) ? val_null()
+                           : (c < r.text_cols.size() && r.text_cols[c]) ? val_text(trow.values[c]) : val_cell(std::move(trow.values[c])));
           r.rows.push_back(std::move(vals));
         }
         r.batch.reset();
@@ -44089,6 +44089,200 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   return true;
 }
 
+// The select engine's phase clock (AIOS_VX_TRACE: "phases: setup=..us rows=..us ... total=..us").
+struct PhaseClock {
+  bool on; uint64_t t0, last; std::string log;
+  explicit PhaseClock(bool o) : on(o), t0(o ? hal_now_ns() : 0), last(t0) {}
+  void mark(const char* what) {
+    if (!on) return;
+    uint64_t now = hal_now_ns();
+    log += std::string(" ") + what + "=" + std::to_string((now - last) / 1000) + "us";
+    last = now;
+  }
+  ~PhaseClock() { if (on) vx_trace("phases:" + log + " total=" + std::to_string((hal_now_ns() - t0) / 1000) + "us"); }
+};
+
+// The select engine's output rows: a row's cells with its sort keys.
+struct OutRow {
+  SqlRow row;
+  std::vector<Val> sort_keys;
+};
+
+// The emit operator (docs/asql-vectorized-plan.md, stage 2b): what shapes the answer once the rows are made -
+// DISTINCT, the sort, the projection header, and the form the rows leave in (the caller's typed batch, the client
+// sink, or rows). The pointers refer into execute_parsed_select_single's state for the statement's duration.
+struct EmitPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* expanded;
+  const std::vector<ExprPtr>* group_by;
+  const std::vector<OrderKey>* order_by;
+  const std::vector<SqlDataType>* order_types;
+  bool distinct, aggregated;
+  long long limit, offset;
+  const EvalCtx* outer_scope;
+  ColBatch* col_out;
+  SqlRowSink* join_sink;
+};
+static SqlQueryResult emit_result(const EmitPlan& p, std::vector<OutRow>& out_rows, PhaseClock& phases) {
+  SqlDatabase* const db = p.db;
+  const std::vector<QuerySource>& sources = *p.sources;
+  const std::vector<SelectItem>& expanded = *p.expanded;
+  const std::vector<ExprPtr>& group_by = *p.group_by;
+  const std::vector<OrderKey>& order_by = *p.order_by;
+  const std::vector<SqlDataType>& order_types = *p.order_types;
+  const bool distinct = p.distinct, aggregated = p.aggregated;
+  const long long limit = p.limit, offset = p.offset;
+  const EvalCtx* const outer_scope = p.outer_scope;
+  ColBatch* const col_out = p.col_out;
+  SqlRowSink* const join_sink = p.join_sink;
+  auto row_less = [&order_by, &order_types](const OutRow& a, const OutRow& b) {
+    for (size_t i = 0; i < order_by.size(); ++i) {
+      if (i >= a.sort_keys.size() || i >= b.sort_keys.size()) break;
+      const Val& x = a.sort_keys[i];
+      const Val& y = b.sort_keys[i];
+      if (x.null && y.null) continue;
+      if (x.null) return !order_by[i].descending;
+      if (y.null) return order_by[i].descending;
+      int c = compare_vals_as(order_types[i], x, y);
+      if (c == 0) continue;
+      return order_by[i].descending ? c > 0 : c < 0;
+    }
+    return false;
+  };
+  phases.mark("emit");
+  bool distinct_redundant = false;
+  if (distinct && aggregated && !group_by.empty() && out_rows.size() * expanded.size() >= 4096) {
+    EvalCtx dctx; dctx.sources = &sources;
+    auto col_of = [&](const SqlExpr* e, size_t* s, size_t* c) {
+      return e && e->op == ExprOp::Column && lookup_column_here(dctx, *e, s, c) == ColumnLookup::Found;
+    };
+    distinct_redundant = true;
+    for (const auto& g : group_by) {
+      size_t gs = 0, gc = 0;
+      if (!col_of(g.get(), &gs, &gc)) { distinct_redundant = false; break; }
+      bool shown = false;
+      for (const SelectItem& it : expanded) {
+        size_t is = 0, ic = 0;
+        if (col_of(it.expr.get(), &is, &ic) && is == gs && ic == gc) { shown = true; break; }
+      }
+      if (!shown) { distinct_redundant = false; break; }
+    }
+  }
+  if (distinct && !distinct_redundant) {
+    plan_add(plan_step("distinct", {}, "collation keys", out_rows.size()));
+    std::vector<OutRow> unique;
+    std::unordered_set<std::string> seen;
+    // A key (every cell's collation key) per row, and the kept rows' slots,
+    // until the duplicates are gone.
+    QueryMemHold distinct_hold;
+    if (!distinct_hold.reserve(out_rows.size() * (sizeof(OutRow) + 48 + expanded.size() * kQmemCellBytes)))
+      return make_error("Query execution was interrupted");
+    unique.reserve(out_rows.size());
+    seen.reserve(out_rows.size());
+    for (auto& o : out_rows) {
+      std::string k;
+      for (const auto& v : o.row.values) {
+        append_collate_key(k, sql_display(v));
+        k.push_back('\x00');
+      }
+      if (seen.insert(std::move(k)).second) {
+        unique.push_back(std::move(o));
+      }
+    }
+    out_rows.swap(unique);
+  }
+
+  if (!order_by.empty()) {
+    plan_add(plan_step("sort", {}, limit >= 0 && (size_t)(offset + limit) < out_rows.size() ? "partial sort to the limit" : "stable sort",
+                       out_rows.size()));
+    auto cmp = row_less;
+    if (limit >= 0 && (size_t)(offset + limit) < out_rows.size()) {
+      std::partial_sort(out_rows.begin(), out_rows.begin() + (size_t)(offset + limit), out_rows.end(), cmp);
+    } else {
+      // stable_sort's buffer: up to a copy of every row's slot, while it sorts.
+      QueryMemHold sort_hold;
+      if (!sort_hold.reserve(out_rows.size() * sizeof(OutRow))) return make_error("Query execution was interrupted");
+      std::stable_sort(out_rows.begin(), out_rows.end(), cmp);
+    }
+  }
+
+  phases.mark("project");
+  SqlQueryResult res;
+  res.is_result_set = true;
+  for (const SelectItem& it : expanded) {
+    res.columns.push_back(it.label);
+    res.column_types.push_back(infer_item_type(it.expr.get(), sources));
+    res.column_is_string.push_back(item_is_string(it.expr.get(), sources) ? 1 : 0);
+    res.column_origins.push_back(item_origin(it.expr.get(), sources));
+  }
+  phases.mark("columns");
+  if (plan_on()) {
+    PlanStep em = plan_step("emit", {}, col_out && col_out->filled ? "typed columns" : join_sink && !outer_scope ? "client sink" : "rows",
+                            col_out && col_out->filled ? col_out->rows : out_rows.size());
+    if (limit >= 0) em.detail = "limit " + std::to_string(limit) + (offset > 0 ? " offset " + std::to_string(offset) : "");
+    plan_add(std::move(em));
+  }
+  if (col_out && col_out->filled) {
+    res.rows_in_batch = true;   // the rows are in the caller's batch
+    return res;
+  }
+  if (join_sink && !outer_scope) {
+    if (sql_interrupted()) return make_error("Query execution was interrupted");
+    bool ok = join_sink->begin(res);
+    const size_t nc = res.columns.size();
+    std::vector<std::string_view> cells(nc);
+    std::vector<uint8_t> nulls(nc);
+    long long taken = 0;
+    for (size_t i = 0; ok && i < out_rows.size(); ++i) {
+      if ((long long)i < offset) continue;
+      if (limit >= 0 && taken >= limit) break;
+      const auto& rvals = out_rows[i].row.values;
+      for (size_t c = 0; c < nc; ++c) {
+        if (c < rvals.size() && !sql_is_null(rvals[c])) {
+          nulls[c] = 0;
+          cells[c] = rvals[c];
+        } else {
+          nulls[c] = 1;
+          cells[c] = std::string_view();
+        }
+      }
+      ok = join_sink->row(cells.data(), nulls.data(), nc);
+      taken++;
+    }
+    ok = join_sink->end() && ok;
+    res.streamed = true;
+    res.rows_affected = taken;
+    phases.mark("out");
+    if (!ok) {
+      SqlQueryResult gone = make_error("the client went away while the rows were being sent");
+      gone.streamed = true;
+      return gone;
+    }
+    return res;
+  }
+  {
+    const size_t from = std::min(out_rows.size(), (size_t)std::max(0LL, offset));
+    size_t n = out_rows.size() - from;
+    if (limit >= 0) n = std::min(n, (size_t)limit);
+    if (!reserve_rows(n, sizeof(SqlRow))) return make_error("Query execution was interrupted");   // the cells move
+    res.rows.reserve(n);
+  }
+  long long taken = 0;
+  for (size_t i = 0; i < out_rows.size(); ++i) {
+    if ((long long)i < offset) continue;
+    if (limit >= 0 && taken >= limit) break;
+    res.rows.push_back(std::move(out_rows[i].row));
+    taken++;
+  }
+  res.rows_affected = res.rows.size();
+  if (!outer_scope && !sql_wire_results()) {
+    res.formatted_table = SelectEngine::format_result_table(db, res.columns, res.rows);
+  }
+  phases.mark("out");
+  return res;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -44188,17 +44382,6 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
   }
   // Phase clock for AIOS_VX_TRACE (top-level statements only).
-  struct PhaseClock {
-    bool on; uint64_t t0, last; std::string log;
-    explicit PhaseClock(bool o) : on(o), t0(o ? hal_now_ns() : 0), last(t0) {}
-    void mark(const char* what) {
-      if (!on) return;
-      uint64_t now = hal_now_ns();
-      log += std::string(" ") + what + "=" + std::to_string((now - last) / 1000) + "us";
-      last = now;
-    }
-    ~PhaseClock() { if (on) vx_trace("phases:" + log + " total=" + std::to_string((hal_now_ns() - t0) / 1000) + "us"); }
-  };
   // Fixes the instant NOW() reports for this statement and every subquery under
   // it; nested calls read the outermost one's clock rather than restarting it.
   StatementClock stmt_clock;
@@ -47673,11 +47856,6 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     having = nullptr;
   }
 
-  // Project each group into an output row, carrying its sort keys along.
-  struct OutRow {
-    SqlRow row;
-    std::vector<Val> sort_keys;
-  };
   std::vector<OutRow> out_rows;
 
   // ORDER BY has to look at every row, but it does not have to KEEP every row.
@@ -49056,137 +49234,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   // so their rows differ in that output column. The ERP's open-orders query
   // is SELECT DISTINCT ... GROUP BY orderno, debtorno over 198 columns, and
   // keying 3,660 rows on all of them was a third of its projection.
-  phases.mark("emit");
-  bool distinct_redundant = false;
-  if (distinct && aggregated && !group_by.empty() && out_rows.size() * expanded.size() >= 4096) {
-    EvalCtx dctx; dctx.sources = &sources;
-    auto col_of = [&](const SqlExpr* e, size_t* s, size_t* c) {
-      return e && e->op == ExprOp::Column && lookup_column_here(dctx, *e, s, c) == ColumnLookup::Found;
-    };
-    distinct_redundant = true;
-    for (const auto& g : group_by) {
-      size_t gs = 0, gc = 0;
-      if (!col_of(g.get(), &gs, &gc)) { distinct_redundant = false; break; }
-      bool shown = false;
-      for (const SelectItem& it : expanded) {
-        size_t is = 0, ic = 0;
-        if (col_of(it.expr.get(), &is, &ic) && is == gs && ic == gc) { shown = true; break; }
-      }
-      if (!shown) { distinct_redundant = false; break; }
-    }
-  }
-  if (distinct && !distinct_redundant) {
-    plan_add(plan_step("distinct", {}, "collation keys", out_rows.size()));
-    std::vector<OutRow> unique;
-    std::unordered_set<std::string> seen;
-    // A key (every cell's collation key) per row, and the kept rows' slots,
-    // until the duplicates are gone.
-    QueryMemHold distinct_hold;
-    if (!distinct_hold.reserve(out_rows.size() * (sizeof(OutRow) + 48 + expanded.size() * kQmemCellBytes)))
-      return make_error("Query execution was interrupted");
-    unique.reserve(out_rows.size());
-    seen.reserve(out_rows.size());
-    for (auto& o : out_rows) {
-      std::string k;
-      for (const auto& v : o.row.values) {
-        append_collate_key(k, sql_display(v));
-        k.push_back('\x00');
-      }
-      if (seen.insert(std::move(k)).second) {
-        unique.push_back(std::move(o));
-      }
-    }
-    out_rows.swap(unique);
-  }
-
-  if (!order_by.empty()) {
-    plan_add(plan_step("sort", {}, limit >= 0 && (size_t)(offset + limit) < out_rows.size() ? "partial sort to the limit" : "stable sort",
-                       out_rows.size()));
-    auto cmp = row_less;
-    if (limit >= 0 && (size_t)(offset + limit) < out_rows.size()) {
-      std::partial_sort(out_rows.begin(), out_rows.begin() + (size_t)(offset + limit), out_rows.end(), cmp);
-    } else {
-      // stable_sort's buffer: up to a copy of every row's slot, while it sorts.
-      QueryMemHold sort_hold;
-      if (!sort_hold.reserve(out_rows.size() * sizeof(OutRow))) return make_error("Query execution was interrupted");
-      std::stable_sort(out_rows.begin(), out_rows.end(), cmp);
-    }
-  }
-
-  phases.mark("project");
-  SqlQueryResult res;
-  res.is_result_set = true;
-  for (const SelectItem& it : expanded) {
-    res.columns.push_back(it.label);
-    res.column_types.push_back(infer_item_type(it.expr.get(), sources));
-    res.column_is_string.push_back(item_is_string(it.expr.get(), sources) ? 1 : 0);
-    res.column_origins.push_back(item_origin(it.expr.get(), sources));
-  }
-  phases.mark("columns");
-  if (plan_on()) {
-    PlanStep em = plan_step("emit", {}, col_out && col_out->filled ? "typed columns" : join_sink && !outer_scope ? "client sink" : "rows",
-                            col_out && col_out->filled ? col_out->rows : out_rows.size());
-    if (limit >= 0) em.detail = "limit " + std::to_string(limit) + (offset > 0 ? " offset " + std::to_string(offset) : "");
-    plan_add(std::move(em));
-  }
-  if (col_out && col_out->filled) {
-    res.rows_in_batch = true;   // the rows are in the caller's batch
-    return res;
-  }
-  if (join_sink && !outer_scope) {
-    if (sql_interrupted()) return make_error("Query execution was interrupted");
-    bool ok = join_sink->begin(res);
-    const size_t nc = res.columns.size();
-    std::vector<std::string_view> cells(nc);
-    std::vector<uint8_t> nulls(nc);
-    long long taken = 0;
-    for (size_t i = 0; ok && i < out_rows.size(); ++i) {
-      if ((long long)i < offset) continue;
-      if (limit >= 0 && taken >= limit) break;
-      const auto& rvals = out_rows[i].row.values;
-      for (size_t c = 0; c < nc; ++c) {
-        if (c < rvals.size() && !sql_is_null(rvals[c])) {
-          nulls[c] = 0;
-          cells[c] = rvals[c];
-        } else {
-          nulls[c] = 1;
-          cells[c] = std::string_view();
-        }
-      }
-      ok = join_sink->row(cells.data(), nulls.data(), nc);
-      taken++;
-    }
-    ok = join_sink->end() && ok;
-    res.streamed = true;
-    res.rows_affected = taken;
-    phases.mark("out");
-    if (!ok) {
-      SqlQueryResult gone = make_error("the client went away while the rows were being sent");
-      gone.streamed = true;
-      return gone;
-    }
-    return res;
-  }
-  {
-    const size_t from = std::min(out_rows.size(), (size_t)std::max(0LL, offset));
-    size_t n = out_rows.size() - from;
-    if (limit >= 0) n = std::min(n, (size_t)limit);
-    if (!reserve_rows(n, sizeof(SqlRow))) return make_error("Query execution was interrupted");   // the cells move
-    res.rows.reserve(n);
-  }
-  long long taken = 0;
-  for (size_t i = 0; i < out_rows.size(); ++i) {
-    if ((long long)i < offset) continue;
-    if (limit >= 0 && taken >= limit) break;
-    res.rows.push_back(std::move(out_rows[i].row));
-    taken++;
-  }
-  res.rows_affected = res.rows.size();
-  if (!outer_scope && !sql_wire_results()) {
-    res.formatted_table = SelectEngine::format_result_table(db, res.columns, res.rows);
-  }
-  phases.mark("out");
-  return res;
+  EmitPlan ep{db, &sources, &expanded, &group_by, &order_by, &order_types, distinct, aggregated, limit, offset, outer_scope, col_out, join_sink};
+  return emit_result(ep, out_rows, phases);
 }
 
 SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatement& stmt) {
@@ -53277,7 +53326,7 @@ SqlQueryResult SqlDatabase::execute_explain(const std::string& sql) {
     SqlQueryResult run_res = execute_gateway_query(target_sql, effective_database());
     if (!run_res.success) return make_error("EXPLAIN ANALYZE failed: " + run_res.error_message);
     char buf[96];
-    std::snprintf(buf, sizeof buf, "-> %s  rows=%lld  %.2f ms", next_word.c_str(), run_res.rows_affected, (hal_now_ns() - t0) / 1e6);
+    std::snprintf(buf, sizeof buf, "-> %s  rows=%llu  %.2f ms", next_word.c_str(), (unsigned long long)run_res.rows_affected, (hal_now_ns() - t0) / 1e6);
     lines.push_back(buf);
   } else {
     lines.push_back("-> " + next_word + " (not run; EXPLAIN ANALYZE runs it)");
