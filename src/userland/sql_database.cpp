@@ -3453,6 +3453,12 @@ struct SqlExpr {
   // so on. Cached with bound_src/bound_col because a given expression always
   // resolves to the same place, however many rows flow past it.
   mutable int bound_depth = 0;
+  // The expression compiled as a vectorized program (vp::Prog) over one statement's sources, or vprog_none when
+  // it does not compile; vprog_scope is the source list it was compiled against (vp::program_for).
+  mutable std::shared_ptr<void> vprog;
+  mutable const void* vprog_scope = nullptr;
+  mutable bool vprog_none = false;
+  mutable std::string vprog_none_sig;   // the literals it failed to compile with
 
   // For Subquery/Exists, and for the In whose right side is a SELECT: the text
   // of the nested statement, exactly as written. It is executed, not inlined,
@@ -7245,6 +7251,11 @@ size_t dict_size(const ColumnStore& cs);
 uint32_t code_at(const ColumnStore& cs, size_t r);
 const std::string& dict_entry(const ColumnStore& cs, uint32_t k);
 std::string_view dict_view(const ColumnStore& cs, uint32_t k);
+bool has_nulls(const ColumnStore& cs);
+bool typed_numeric(const ColumnStore& cs);
+bool typed_integer(const ColumnStore& cs);
+double typed_value(const ColumnStore& cs, size_t r);
+int64_t typed_int(const ColumnStore& cs, size_t r);
 }
 
 // The groups straight from the column kernels (defined with them): each key's
@@ -8125,6 +8136,8 @@ void find_probe_candidates(const SqlExpr* where, const EvalCtx& local, const Eva
 // error rather than a zero.
 // An expression every row of a group can evaluate at the same time: no
 // subquery, no side effect, nothing whose answer depends on evaluation order.
+#include "sql_vprog.inc"
+
 bool parallel_safe_expr(const SqlExpr* e) {
   if (!e) return true;
   switch (e->op) {
@@ -8156,6 +8169,19 @@ bool parallel_safe_expr(const SqlExpr* e) {
 // serially (small group, or an argument that must not run concurrently).
 bool group_values(const SqlExpr* arg, const EvalCtx& ctx, std::vector<Val>* out) {
   const JoinedRows& g = *ctx.group;
+  // The argument as a vectorized program over the group's rows: a lane operation a row where the interpreter
+  // made a Val per node (the renderer's MIN(winner_key) over 64k pixel groups).
+  if (g.size() >= 64) {
+    if (const vp::Prog* P = vp::program_for(arg, ctx)) {
+      vp::Column col;
+      std::string verr;
+      if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return g[j]; }, g.size(), &col, &verr)) {
+        out->resize(g.size());
+        for (size_t j = 0; j < g.size(); ++j) (*out)[j] = col.at(j);
+        return true;
+      }
+    }
+  }
   if (g.size() < 2048 || SqlThreadPool::is_in_worker_thread() || !parallel_safe_expr(arg)) return false;
   out->assign(g.size(), Val());
   const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
@@ -10165,7 +10191,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     }
     if (target.rfind("DOUBLE", 0) == 0 || target.rfind("FLOAT", 0) == 0 ||
         target.rfind("REAL", 0) == 0)
-      return val_num(val_as_number(a_ptr[0]));
+      return val_approx(val_as_number(a_ptr[0]));   // a DOUBLE: CAST(5 AS DOUBLE) / 8 is 0.625, not 0.6250
     // A number names a date by its digits: 20240305 is 2024-03-05, 20240305123000 that day at 12:30.
     auto numeric_date_text = [](const Val& v, std::string* out) {
       if (!v.numeric || v.num < 0 || v.num != std::floor(v.num)) return false;
@@ -11127,33 +11153,35 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
     const bool apx = a_ptr[0].numeric ? a_ptr[0].approx : true;
     if (up == "FLOOR"sv) return apx ? val_approx(std::floor(x)) : val_num(std::floor(x));
     if (up == "CEIL"sv || up == "CEILING"sv) return apx ? val_approx(std::ceil(x)) : val_num(std::ceil(x));
-    if (up == "SQRT"sv) return x < 0 ? val_null() : val_num(std::sqrt(x));
+    // Of any argument, a DOUBLE (MySQL's type for them): SQRT(4) / 8 is 0.25, not the DECIMAL 0.2500 an exact 2
+    // would divide to, and SQRT(4) still prints 2.
+    if (up == "SQRT"sv) return x < 0 ? val_null() : val_approx(std::sqrt(x));
     if (up == "SIGN"sv) return val_num(x > 0 ? 1 : (x < 0 ? -1 : 0));
-    if (up == "EXP"sv) return val_num(std::exp(x));
-    if (up == "LN"sv) return x <= 0 ? val_null() : val_num(std::log(x));
-    if (up == "LOG2"sv) return x <= 0 ? val_null() : val_num(std::log2(x));
-    if (up == "LOG10"sv) return x <= 0 ? val_null() : val_num(std::log10(x));
-    if (up == "DEGREES"sv) return val_num(x * 180.0 / 3.14159265358979323846);
-    if (up == "RADIANS"sv) return val_num(x * 3.14159265358979323846 / 180.0);
-    if (up == "SIN"sv) return val_num(std::sin(x));
-    if (up == "COS"sv) return val_num(std::cos(x));
-    if (up == "TAN"sv) return val_num(std::tan(x));
-    if (up == "ASIN"sv) return val_num(std::asin(x));
-    if (up == "ACOS"sv) return val_num(std::acos(x));
-    return val_num(std::atan(x));
+    if (up == "EXP"sv) return val_approx(std::exp(x));
+    if (up == "LN"sv) return x <= 0 ? val_null() : val_approx(std::log(x));
+    if (up == "LOG2"sv) return x <= 0 ? val_null() : val_approx(std::log2(x));
+    if (up == "LOG10"sv) return x <= 0 ? val_null() : val_approx(std::log10(x));
+    if (up == "DEGREES"sv) return val_approx(x * 180.0 / 3.14159265358979323846);
+    if (up == "RADIANS"sv) return val_approx(x * 3.14159265358979323846 / 180.0);
+    if (up == "SIN"sv) return val_approx(std::sin(x));
+    if (up == "COS"sv) return val_approx(std::cos(x));
+    if (up == "TAN"sv) return val_approx(std::tan(x));
+    if (up == "ASIN"sv) return val_approx(std::asin(x));
+    if (up == "ACOS"sv) return val_approx(std::acos(x));
+    return val_approx(std::atan(x));
   }
   if (up == "LOG"sv) {
     if (arg_count == 0 || a_ptr[0].null) return val_null();
     double x = val_as_number(a_ptr[0]);
-    if (arg_count == 1) return x <= 0 ? val_null() : val_num(std::log(x));
+    if (arg_count == 1) return x <= 0 ? val_null() : val_approx(std::log(x));
     if (a_ptr[1].null) return val_null();
     double v = val_as_number(a_ptr[1]);
     if (x <= 0 || x == 1 || v <= 0) return val_null();
-    return val_num(std::log(v) / std::log(x));
+    return val_approx(std::log(v) / std::log(x));
   }
   if (up == "ATAN2"sv) {
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
-    return val_num(std::atan2(val_as_number(a_ptr[0]), val_as_number(a_ptr[1])));
+    return val_approx(std::atan2(val_as_number(a_ptr[0]), val_as_number(a_ptr[1])));
   }
   if (up == "MOD"sv) {   // MOD(a, b) is a % b: exact for exact operands (MOD(2.6750, 2) is 0.6750, not 0.674999...)
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
@@ -11165,7 +11193,7 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   }
   if (up == "POW"sv || up == "POWER"sv) {
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
-    return val_num(std::pow(val_as_number(a_ptr[0]), val_as_number(a_ptr[1])));
+    return val_approx(std::pow(val_as_number(a_ptr[0]), val_as_number(a_ptr[1])));
   }
   if (up == "TRUNCATE"sv) {
     if (arg_count < 2 || a_ptr[0].null || a_ptr[1].null) return val_null();
@@ -35685,6 +35713,10 @@ struct Source {
   size_t col = 0;
   const SqlExpr* expr = nullptr;
   bool bare_column = false;          // the argument IS the column
+  // RowExpr: the expression as a vectorized program (vp) where it compiles, and its value for every row of the
+  // table once worked out (vprog_fill) - read by row id instead of interpreted per row.
+  std::shared_ptr<const vp::Prog> vprog;
+  std::shared_ptr<const vp::Column> vcol;
   std::string expr_key;              // CodeCol of an expression: its structure, when its values can be kept
   SharedVals code_val;               // CodeCol: the value per dictionary code
   Val null_val;                      // CodeCol: on a NULL row
@@ -35738,6 +35770,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     s.bare_column = true;
     s.col = sh.cols[0];
   }
+  if (!s.bare_column && !sh.aggregate && !sh.window && vp::enabled()) s.vprog = vp::compile(e, local);
   if (!sh.pure || sh.aggregate || sh.window || sh.cols.size() != 1) return s;
   const size_t col = sh.cols[0];
   const ColumnStore& cs = t.col_data[col];
@@ -36278,10 +36311,23 @@ struct RowReader {
         return k < s.code_val.size() ? s.code_val[k] : val_null();
       }
       default:
+        if (s.vcol && r < s.vcol->size()) return s.vcol->at(r);
         return eval_expr(s.expr, ev.at(r));
     }
   }
 };
+
+// A RowExpr source's program evaluated over every row of the table, when the statement reads most of them (a
+// point lookup's one row is not worth the table's lane pass). The rows that matter are then read by row id.
+void vprog_fill(Source& s, const SqlTable& t, size_t sel_rows) {
+  if (!s.vprog || s.vcol || s.kind != Source::RowExpr) return;
+  const size_t n = t.row_count();
+  if (n == 0 || (sel_rows * 4 < n && n > 65536)) return;
+  for (const auto& cs : t.col_data) if (cs.size() != n) return;
+  auto col = std::make_shared<vp::Column>();
+  std::string err;
+  if (vp::eval_column_ids(*s.vprog, [](size_t j) { return j; }, n, col.get(), &err)) s.vcol = col;
+}
 
 // ---- vectorized aggregation ---------------------------------------------------
 //
@@ -36692,7 +36738,7 @@ Val finish_arrays(const Agg& a, const AggPlan& p, AggArrays& A, size_t g, RowRea
     case Agg::Min:
     case Agg::Max:
       if (!A.has[g]) return val_null();
-      if (A.row[g] >= 0) return eval_expr(a.src.expr, rd.ev.at((size_t)A.row[g]));
+      if (A.row[g] >= 0) return rd.val(a.src, (size_t)A.row[g]);
       return A.best[g];
     case Agg::Sum:
     case Agg::Avg: {
@@ -38349,6 +38395,8 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
   struct OutRow { SqlRow row; std::vector<Val> keys; };
   std::vector<OutRow> rows_out;
   RowReader rd(t, base);
+  const size_t vp_sel_rows = selection.all ? selection.total : selection.count;
+  for (Agg& a : aggs) vprog_fill(a.src, t, vp_sel_rows);
 
   // A bare column of the scanned table needs no expression evaluation: the
   // output text is the cell. Going through eval_expr built a Val per cell (name
@@ -38373,10 +38421,29 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
       if (c < t.columns.size()) fast_col[i] = (int)c;
     }
   };
+  // A select item that is an expression compiled as a program (vp): its text for every row of the page at once,
+  // read back by the row's position (vp_pos) instead of interpreting the item per row.
+  std::vector<std::vector<std::string>> vp_items(expanded.size());
+  size_t vp_pos = SIZE_MAX;
+  auto vp_project_page = [&](const std::vector<uint32_t>& page) {
+    if (need_keys || page.size() < 256 || !vp::enabled()) return;
+    if (!fast_resolved) { resolve_fast(rd.ev.at(page[0])); if (!err.empty()) return; }
+    for (size_t i = 0; i < expanded.size(); ++i) {
+      if (fast_col[i] >= 0) continue;
+      const vp::Prog* P = vp::program_for(expanded[i].expr.get(), rd.ev.at(page[0]));
+      if (!P) continue;
+      vp::Column col;
+      std::string verr;
+      if (!vp::eval_column_ids(*P, [&](size_t j) { return page[j]; }, page.size(), &col, &verr)) continue;
+      vp_items[i].resize(page.size());
+      for (size_t j = 0; j < page.size(); ++j) vp_items[i][j] = col.text(j);
+    }
+  };
   auto project = [&](const EvalCtx& ctx, OutRow* o, const uint32_t* row_idx = nullptr) -> bool {
     if (row_idx && !need_keys) {
       if (!fast_resolved) { resolve_fast(ctx); if (!err.empty()) return false; }
       for (size_t i = 0; i < expanded.size(); ++i) {
+        if (vp_pos < vp_items[i].size()) { o->row.values.push_back(std::move(vp_items[i][vp_pos])); continue; }
         if (fast_col[i] >= 0) {
           // One copy, from the column's own bytes into the row: the getter's
           // scratch string was a second copy of every cell shipped.
@@ -38889,17 +38956,23 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
       }
     }
     rows_out.reserve(page.size());
-    for (uint32_t r : page) {
+    vp_project_page(page);
+    if (!err.empty()) { *out = make_error(err); return true; }
+    for (size_t pi = 0; pi < page.size(); ++pi) {
+      const uint32_t r = page[pi];
+      vp_pos = pi;
       OutRow o;
       o.row.values.reserve(expanded.size());
       if (!project(rd.ev.at(r), &o, &r)) { *out = make_error(err); return true; }
       rows_out.push_back(std::move(o));
     }
+    vp_pos = SIZE_MAX;
     if (sort_evaluated) std::stable_sort(rows_out.begin(), rows_out.end(), less);
   } else {
     // Group keys.
     std::vector<Source> key_src;
     for (const auto& g : group_by) key_src.push_back(make_source(g.get(), t, local, base));
+    for (Source& ks : key_src) vprog_fill(ks, t, vp_sel_rows);
     std::vector<std::vector<uint32_t>> key_canon(key_src.size());
     for (size_t i = 0; i < key_src.size(); ++i) {
       if (key_src[i].kind != Source::CodeCol) continue;
@@ -45635,6 +45708,26 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           else if (!best_wide && bval && bval->op != ExprOp::Column && bval->op != ExprOp::Literal)
             best_wide = true;   // an expression: its values are not known ahead
         }
+        // A key that is an expression of the base row (sy * 320 + sx = pix) is evaluated over every base row
+        // at once where it compiles (vp); key_val reads this row's value back, or interprets the key.
+        std::vector<vp::Column> vp_keys(prep_jkeys.size());
+        std::vector<char> vp_key_ok(prep_jkeys.size(), 0);
+        if (rows.size() >= 256) {
+          EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope; kctx.sources = &baseonly;
+          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+            const vp::Prog* P = vp::program_for(prep_jkeys[ki].value, kctx);
+            if (!P) continue;
+            std::string verr;
+            vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
+          }
+        }
+        auto key_val = [&](size_t ki, const JoinedRow& base, EvalCtx& vctx) -> Val {
+          if (vp_key_ok[ki]) {
+            const size_t ri = (size_t)(&base - rows.data());
+            if (ri < vp_keys[ki].size()) return vp_keys[ki].at(ri);
+          }
+          return eval_expr(prep_jkeys[ki].value, vctx);
+        };
         // The joined rows whose keys equal this base row's.
         auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
           out.clear();
@@ -45673,7 +45766,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               probe_gather_matches(prep_jkeys[best_ki].idx.get(), val_num(num), match_cands);
               if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
             } else {
-              Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
+              Val want = key_val((size_t)best_ki, base, vctx);
               if (want.null) return;
               probe_gather_matches(prep_jkeys[best_ki].idx.get(), want, match_cands);
             }
@@ -45681,7 +45774,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             // UNSIGNED near 2^64 to its neighbours. Where either side holds such numbers, each candidate's key is
             // checked against this row's by its digits.
             if (best_wide && !link_to_parent && !link_to_kids && !direct_code_join && !match_cands.empty()) {
-              const Val want = eval_expr(prep_jkeys[best_ki].value, vctx);
+              const Val want = key_val((size_t)best_ki, base, vctx);
               const ColumnStore& jcs = js.table->col_data[(size_t)prep_jkeys[best_ki].column];
               size_t w = 0;
               for (size_t mi = 0; mi < match_cands.size(); ++mi) {
@@ -45700,7 +45793,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
               if (match_ri >= js.table->row_count()) continue;
               if (!other_ready) {
                 for (size_t ki = 0; ki < prep_jkeys.size(); ++ki)
-                  if ((int)ki != best_ki) other[ki] = eval_expr(prep_jkeys[ki].value, vctx);
+                  if ((int)ki != best_ki) other[ki] = key_val(ki, base, vctx);
                 other_ready = true;
               }
               bool all_keys_match = true;
@@ -45774,7 +45867,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           } else {
             std::string probe_key;
             for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-              Val want = eval_expr(prep_jkeys[ki].value, vctx);
+              Val want = key_val(ki, base, vctx);
               if (want.null) return;
               if (ki > 0) probe_key.push_back('\x1f');
               probe_key += collate_key(want.str());
@@ -46495,10 +46588,29 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         rows.swap(kept);
       }
     }
+    // A select item that compiles to a vectorized program (vp) is evaluated over every projected row at once,
+    // its text per row kept here; project_row prints the text instead of interpreting the item per row.
+    const size_t vp_proj_count = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
+                                     ? std::min(rows.size(), (size_t)offset + (size_t)limit) : rows.size();
+    std::vector<std::vector<std::string>> vp_text(expanded.size());
+    if (!ordinal_keys && !having && vp_proj_count >= 256) {
+      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        if (direct[i].ok && !ordinal_needed[i]) continue;
+        const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
+        if (!P) continue;
+        vp::Column col;
+        std::string verr;
+        if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, vp_proj_count, &col, &verr)) continue;
+        vp_text[i].resize(vp_proj_count);
+        for (size_t j = 0; j < vp_proj_count; ++j) vp_text[i][j] = col.text(j);
+      }
+    }
     auto project_row = [&](const JoinedRow& r, EvalCtx& ctx, OutRow& o) {
       o.row.values.reserve(expanded.size());
       std::vector<Val> evaled_items;
       if (ordinal_keys) evaled_items.reserve(expanded.size());
+      const size_t ri = (size_t)(&r - rows.data());
       for (size_t i = 0; i < expanded.size(); ++i) {
         if (direct[i].ok && !ordinal_needed[i]) {
           const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
@@ -46506,6 +46618,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (ordinal_keys) evaled_items.push_back(val_null());   // keeps evaled_items[i] aligned; never read
           continue;
         }
+        if (ri < vp_text[i].size()) { o.row.values.push_back(std::move(vp_text[i][ri])); continue; }
         Val v = eval_expr(expanded[i].expr.get(), ctx);
         if (ctx.err && !ctx.err->empty()) return;
         o.row.values.push_back(v.null ? sql_null() : v.str());
@@ -46758,6 +46871,19 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       }
       std::unordered_map<std::string, size_t> key_to_group;
       if (!coded) key_to_group.reserve(std::min(rows.size(), (size_t)65536));
+      // GROUP BY an expression (sy * 320 + sx): each one that compiles is evaluated over every row at once, the
+      // key built from its text per row.
+      std::vector<vp::Column> vp_gkey(group_by.size());
+      std::vector<char> vp_gkey_ok(group_by.size(), 0);
+      if (!coded && !all_cols_resolved && rows.size() >= 256) {
+        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+        for (size_t k = 0; k < group_by.size(); ++k) {
+          const vp::Prog* P = vp::program_for(group_by[k].get(), vctx);
+          if (!P) continue;
+          std::string verr;
+          vp_gkey_ok[k] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_gkey[k], &verr) ? 1 : 0;
+        }
+      }
       if (!coded) for (JoinedRow& r : rows) {
         std::string key;
         if (all_cols_resolved) {
@@ -46780,8 +46906,15 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           ctx.sources = &sources;
           ctx.row = &r;
           ctx.err = &err;
-          for (const auto& g : group_by) {
-            Val v = eval_expr(g.get(), ctx);
+          const size_t ri = (size_t)(&r - rows.data());
+          for (size_t k = 0; k < group_by.size(); ++k) {
+            if (vp_gkey_ok[k] && ri < vp_gkey[k].size()) {
+              if (vp_gkey[k].is_null(ri)) key += "\x01NULL";
+              else append_collate_key(key, vp_gkey[k].text(ri));
+              key += "\x02";
+              continue;
+            }
+            Val v = eval_expr(group_by[k].get(), ctx);
             if (v.null) {
               key += "\x01NULL";
             } else {
@@ -47105,6 +47238,101 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         gdirect[i] = {true, (size_t)ie->bound_src, (size_t)ie->bound_col};
       }
     }
+    // Each select item's aggregate arguments compiled now, on this thread, for the groups' workers (vp::warm);
+    // an item over the group's own row (pix DIV 320 of a GROUP BY pix) evaluated over every group at once.
+    std::vector<std::vector<std::string>> vp_gtext(expanded.size());
+    if (!star_grouped) {
+      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+      for (size_t i = 0; i < expanded.size(); ++i) vp::warm(expanded[i].expr.get(), vctx);
+      if (having) vp::warm(having.get(), vctx);
+      for (const OrderKey& k : order_by) vp::warm(k.expr.get(), vctx);
+      if (!keep_items && groups.size() >= 256) {
+        bool all_rows = true;
+        for (const auto& g : groups) if (g.empty()) { all_rows = false; break; }
+        for (size_t i = 0; i < expanded.size() && all_rows; ++i) {
+          if (gdirect[i].ok || expr_has_aggregate(expanded[i].expr)) continue;
+          const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
+          if (!P) continue;
+          vp::Column col;
+          std::string verr;
+          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return groups[j][0]; }, groups.size(), &col, &verr)) continue;
+          vp_gtext[i].resize(groups.size());
+          for (size_t j = 0; j < groups.size(); ++j) vp_gtext[i][j] = col.text(j);
+        }
+      }
+    }
+    // Many small groups (a screen pixel's fragments): a MIN / MAX / SUM / AVG / COUNT whose argument compiles
+    // is evaluated over every group's rows at once and folded per group here, on this thread; the groups'
+    // workers read the answers (ctx.agg_values), as they read star_vals. The groups' own rows stay where they
+    // are: flat points at them in group order. Arguments the interpreter has its own column paths for (a
+    // column, -column, column * n) are left to it.
+    std::vector<std::vector<std::pair<const SqlExpr*, Val>>> vp_aggs;
+    if (!star_grouped && pivot.buckets.empty() && aggregated && groups.size() >= 256 && vp::enabled()) {
+      std::vector<const SqlExpr*> aggs;
+      std::function<void(const SqlExpr*, int)> collect = [&](const SqlExpr* e, int depth) {
+        if (!e || depth > 64) return;
+        if (e->op == ExprOp::Func && !e->window && !e->negated && e->args.size() == 1 && e->args[0] &&
+            e->args[0]->op != ExprOp::Star && e->args[0]->op != ExprOp::Column && e->args[0]->op != ExprOp::Literal) {
+          const std::string& up = func_upper(e);
+          const SqlExpr* a = e->args[0].get();
+          const bool own_path = (a->op == ExprOp::Neg || a->op == ExprOp::Sub) && a->args.size() == 1 && a->args[0] && a->args[0]->op == ExprOp::Column;
+          const bool scaled = a->op == ExprOp::Mul && a->args.size() == 2 && a->args[0] && a->args[1] &&
+                              ((a->args[0]->op == ExprOp::Column && a->args[1]->op == ExprOp::Literal) ||
+                               (a->args[1]->op == ExprOp::Column && a->args[0]->op == ExprOp::Literal));
+          if (up == "MIN"sv || up == "MAX"sv || up == "COUNT"sv || ((up == "SUM"sv || up == "AVG"sv) && !own_path && !scaled)) {
+            if (std::find(aggs.begin(), aggs.end(), e) == aggs.end()) aggs.push_back(e);
+            return;
+          }
+        }
+        for (const auto& a : e->args) collect(a.get(), depth + 1);
+      };
+      for (const auto& it : expanded) collect(it.expr.get(), 0);
+      if (having) collect(having.get(), 0);
+      for (const OrderKey& k : order_by) collect(k.expr.get(), 0);
+      if (!aggs.empty()) {
+        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+        std::vector<const JoinedRow*> flat;
+        size_t total = 0;
+        for (const auto& g : groups) total += g.size();
+        flat.reserve(total);
+        for (const auto& g : groups) for (const JoinedRow& r : g) flat.push_back(&r);
+        for (const SqlExpr* agg : aggs) {
+          const vp::Prog* P = vp::program_for(agg->args[0].get(), vctx);
+          if (!P) continue;
+          vp::Column col;
+          std::string verr;
+          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return *flat[j]; }, total, &col, &verr)) continue;
+          if (vp_aggs.empty()) vp_aggs.resize(groups.size());
+          const std::string& up = func_upper(agg);
+          size_t at = 0;
+          for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const size_t n = groups[gi].size();
+            Val r;
+            if (up == "COUNT"sv) {
+              size_t cnt = 0;
+              for (size_t j = 0; j < n; ++j) if (!col.is_null(at + j)) ++cnt;
+              r = val_num((double)cnt);
+            } else if (up == "MIN"sv || up == "MAX"sv) {
+              bool has = false;
+              for (size_t j = 0; j < n; ++j) {
+                if (col.is_null(at + j)) continue;
+                Val v = col.at(at + j);
+                if (!has) { r = std::move(v); has = true; continue; }
+                const int c = compare_vals(v, r);
+                if (c != -2 && ((up == "MIN"sv && c < 0) || (up == "MAX"sv && c > 0))) r = std::move(v);
+              }
+              if (!has) r = val_null();
+            } else {
+              SumAcc acc;
+              for (size_t j = 0; j < n; ++j) acc.add(col.at(at + j));
+              r = up == "SUM"sv ? nt_adjust(agg, vctx, acc.finish(false)) : acc.finish(true);
+            }
+            vp_aggs[gi].emplace_back(agg, std::move(r));
+            at += n;
+          }
+        }
+      }
+    }
     if (!keep_items && groups.size() * expanded.size() >= 4096) {
       EvalCtx dctx; dctx.sources = &sources;
       for (size_t i = 0; i < expanded.size(); ++i) {
@@ -47152,6 +47380,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             pivot_vals.clear();
             if (!pivot_group(pivot, ctx, &pivot_vals)) break;
             ctx.agg_values = &pivot_vals;
+          } else if (!vp_aggs.empty()) {
+            ctx.agg_values = &vp_aggs[gi];
           }
 
           if (having && !predicate_true(having.get(), ctx)) {
@@ -47166,6 +47396,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (keep_items) evaled_items.reserve(expanded.size());
           for (size_t i = 0; i < expanded.size(); ++i) {
             if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); continue; }
+            if (gi < vp_gtext[i].size()) { o.row.values.push_back(std::move(vp_gtext[i][gi])); continue; }
             Val v = eval_expr(expanded[i].expr.get(), ctx);
             if (!local_errs[tid].empty()) break;
             push_out_value(o, std::move(v), evaled_items);
@@ -47209,6 +47440,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         } else if (aggregated && !pivot.buckets.empty()) {
           if (!pivot_group(pivot, ctx, &pivot_vals)) return make_error(err);
           ctx.agg_values = &pivot_vals;
+        } else if (!vp_aggs.empty()) {
+          ctx.agg_values = &vp_aggs[(size_t)(&g - groups.data())];
         }
 
         if (having && !predicate_true(having.get(), ctx)) {
@@ -47226,6 +47459,11 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         for (size_t i = 0; i < expanded.size(); ++i) {
           const uint64_t e0 = tr ? hal_now_ns() : 0;
           if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); if (tr) cell_ns += hal_now_ns() - e0; continue; }
+          if (!keep_items && (size_t)(&g - groups.data()) < vp_gtext[i].size()) {
+            o.row.values.push_back(std::move(vp_gtext[i][(size_t)(&g - groups.data())]));
+            if (tr) ev_ns += hal_now_ns() - e0;
+            continue;
+          }
           Val v = eval_expr(expanded[i].expr.get(), ctx);
           if (!err.empty()) return make_error(err);
           push_out_value(o, std::move(v), evaled_items);

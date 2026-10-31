@@ -2088,6 +2088,35 @@ stays open), and its redo record is never written.
   held verbatim, literals inside), an ORDER BY ordinal, a CAST width or a
   result column headed by its literal (`SELECT 1` is headed "1") parse every
   time. `AIOS_SQL_SHAPES=0` turns the cache off.
+- Expressions are compiled into vectorized programs (`src/userland/sql_vprog.inc`)
+  where the program is certain to give the interpreter's answer: integer and
+  DOUBLE columns, literals, arithmetic, comparisons, AND/OR/NOT, IS NULL,
+  CASE/IF/COALESCE/NULLIF/GREATEST/LEAST over one type, ABS/FLOOR/CEIL, SQRT,
+  POWER and the trigonometry, CAST to SIGNED or DOUBLE, DIV, MOD, the bit
+  operators, and `text_col = 'lit'` / `IN ('a', 'b')` over a dictionary-coded
+  column. A program runs over a whole set of rows in lanes of int64 / double
+  with a null byte per row - an aggregate's argument over its group (or over
+  every group's rows at once, when the groups are many and small), a GROUP BY
+  expression, a join's expression key over the probe rows, a select item over
+  the output rows, and the single-table path's expression sources. Anything
+  else - a subquery, a string function, DECIMAL arithmetic (whose digits the
+  interpreter carries), a text-valued CASE - stays with the interpreter, as
+  does a value that might be an exact decimal at some rows and a DOUBLE at
+  others (`GREATEST(0.0, d)` printed, though not `CAST(GREATEST(0.0, d) AS
+  SIGNED)`, whose rounding is the same either way). `AIOS_SQL_VPROG=0` turns
+  it off; `AIOS_VX_TRACE=1` prints `vp: compiled` / `vp: interpreted (why)` per
+  expression. SQRT, EXP, LOG, the trigonometry, POWER and CAST AS DOUBLE give a
+  DOUBLE of any argument, as MySQL's do: `SQRT(4) / 8` is 0.25, not the
+  DECIMAL 0.2500 an exact 2 would divide to.
+- A WITH's CTE named once in the rest of the statement, whose body is one
+  plain SELECT (no `*`, aggregate, DISTINCT, GROUP BY, HAVING, ORDER BY,
+  LIMIT, UNION or nested WITH, over tables and other CTEs - no derived table,
+  LATERAL or series) is merged into its reader as a view instead of being
+  materialized; the rest are materialized
+  with their rows appended in bulk, the columns in parallel. `AIOS_CTE_MERGE=0`
+  materializes every CTE, `AIOS_CTE_MERGE_SKIP=name,name` just the named ones,
+  and `AIOS_CTE_MERGE_TRACE=1` prints each CTE's time and rows (`[cte] name ms rows`,
+  `merged name` for one merged away).
 - The result cache answers a statement's exact text from the second time it
   is seen; `AIOS_SQL_CACHE_MB` is its budget (default 1024 MB) and `0` turns
   it off - what a benchmark of the engine itself, against a MariaDB with no
