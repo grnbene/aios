@@ -55721,6 +55721,14 @@ std::shared_ptr<SqlDatabase::ProbeIndex> SqlDatabase::get_or_build_probe_index(c
         idx.by_number[cstore->double_data[r]].push_back((uint32_t)r);
       }
     }
+  } else if (cstore && !idx.text_column && cstore->size() == t.row_count() &&
+             (cstore->encoding == ColumnEncoding::FOR || cstore->encoding == ColumnEncoding::SegmentFOR)) {
+    // Frame-of-reference integers: a cell prints as its integer, which val_cell reads back as exactly this double.
+    // Printed and parsed back a row at a time, they were a third of building a SQLDoom frame's join indexes.
+    for (size_t r = idx.rows_indexed; r < end; ++r) {
+      if (cstore->is_null(r)) continue;
+      idx.by_number[(double)vx::typed_int(*cstore, r)].push_back((uint32_t)r);
+    }
   } else {
     for (size_t r = idx.rows_indexed; r < end; ++r) {
       if ((size_t)column >= t.columns.size()) continue;
