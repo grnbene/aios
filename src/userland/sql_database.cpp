@@ -46694,6 +46694,445 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
   return std::nullopt;
 }
 
+// The projection operator for an ungrouped statement (docs/asql-vectorized-plan.md, stage 2b): each joined row
+// into an output row with its sort keys - stored columns copied straight from their cells, items over every row as
+// a program's lanes, the rest through the interpreter, in parallel chunks when there are rows enough - into the
+// bounded emit, or into the caller's typed batch or the client sink without a row built. The pointers refer into
+// execute_parsed_select_single's state; what it changes (the rows it consumes, the output rows, the error) is not
+// const.
+struct ProjectPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* expanded;
+  const ExprPtr* having;
+  const std::vector<OrderKey>* order_by;
+  const std::vector<SqlDataType>* order_types;
+  const std::vector<bool>* ordinal_needed;
+  long long limit, offset;
+  bool distinct, bounded;
+  size_t keep_bound;
+  const EvalCtx* outer_scope;
+  ColBatch* col_out;
+  SqlRowSink* join_sink;
+  JoinedRows* rows;
+  std::string* err;
+  std::vector<OutRow>* out_rows;
+  const std::function<void(std::vector<OutRow>&, OutRow&&)>* emit_row;
+};
+// Empty: the rows are projected into out_rows (or already in the batch / sink), on to the emit; a result: to return.
+static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, PhaseClock& phases) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<SelectItem>& expanded = *plan.expanded;
+  const ExprPtr& having = *plan.having;
+  const std::vector<OrderKey>& order_by = *plan.order_by;
+  const std::vector<SqlDataType>& order_types = *plan.order_types;
+  const std::vector<bool>& ordinal_needed = *plan.ordinal_needed;
+  const long long limit = plan.limit, offset = plan.offset;
+  const bool distinct = plan.distinct, bounded = plan.bounded;
+  const bool aggregated = false;   // this operator is the ungrouped statement's
+  const size_t keep_bound = plan.keep_bound;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  ColBatch* const col_out = plan.col_out;
+  SqlRowSink* const join_sink = plan.join_sink;
+  JoinedRows& rows = *plan.rows;
+  std::string& err = *plan.err;
+  std::vector<OutRow>& out_rows = *plan.out_rows;
+  const std::function<void(std::vector<OutRow>&, OutRow&&)>& emit_row = *plan.emit_row;
+  (void)aggregated; (void)having; (void)order_types; (void)ordinal_needed; (void)distinct; (void)bounded; (void)keep_bound; (void)join_sink; (void)phases;
+  // A select-list item that is a stored column of this query prints as the
+  // cell itself (every reading of a cell by eval_expr prints back the same
+  // text): copied, not turned into a Val and back, per cell.
+  struct DirectCol { bool ok = false; size_t src = 0, col = 0; };
+  std::vector<DirectCol> direct(expanded.size());
+  {
+    EvalCtx dctx; dctx.sources = &sources;
+    for (size_t i = 0; i < expanded.size(); ++i) {
+      const SqlExpr* ie = expanded[i].expr.get();
+      if (!ie || ie->op != ExprOp::Column) continue;
+      // A column bound in this scope (every `*` column is, on expansion) is
+      // that binding: resolving each of a wide row's 100 names again was
+      // 14 us of a 90 us lookup.
+      if (ie->bound_depth == 0 && ie->bound_src >= 0 && ie->bound_col >= 0 && (size_t)ie->bound_src < sources.size() &&
+          sources[(size_t)ie->bound_src].table && (size_t)ie->bound_col < sources[(size_t)ie->bound_src].table->columns.size()) {
+        direct[i] = {true, (size_t)ie->bound_src, (size_t)ie->bound_col};
+        continue;
+      }
+      size_t ds = 0, dc = 0;
+      if (lookup_column_here(dctx, *ie, &ds, &dc) != ColumnLookup::Found) continue;
+      if (ds >= sources.size() || !sources[ds].table || dc >= sources[ds].table->columns.size()) continue;
+      direct[i] = {true, ds, dc};
+    }
+  }
+  phases.mark("direct");
+  // Straight to the client: every item a stored column, no sort, DISTINCT
+  // or HAVING still to come - each cell from its column's bytes into the
+  // packet, no row built (400k joined rows were 42 ms of projection, then
+  // copied again into packets).
+  if (join_sink && !distinct && order_by.empty() && !having && !outer_scope && !expanded.empty()) {
+    bool all_direct = true;
+    for (size_t i = 0; i < expanded.size(); ++i) if (!direct[i].ok) all_direct = false;
+    if (all_direct) {
+      SqlQueryResult hdr;
+      hdr.is_result_set = true;
+      hdr.success = true;
+      for (const SelectItem& it : expanded) {
+        hdr.columns.push_back(it.label);
+        hdr.column_types.push_back(infer_item_type(it.expr.get(), sources));
+        hdr.column_is_string.push_back(item_is_string(it.expr.get(), sources) ? 1 : 0);
+        hdr.column_origins.push_back(item_origin(it.expr.get(), sources));
+      }
+      const size_t nc = expanded.size();
+      std::vector<std::string_view> cells(nc);
+      std::vector<uint8_t> nulls(nc);
+      const size_t from = offset > 0 ? std::min(rows.size(), (size_t)offset) : 0;
+      const size_t to = limit >= 0 ? std::min(rows.size(), from + (size_t)limit) : rows.size();
+      if (sql_interrupted()) return make_error("Query execution was interrupted");
+      bool ok = join_sink->begin(hdr);
+      size_t sent = 0;
+      for (size_t ri = from; ok && ri < to; ++ri) {
+        const JoinedRow& r = rows[ri];
+        for (size_t i = 0; i < nc; ++i) {
+          const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
+          const SqlTable& dt = *sources[direct[i].src].table;
+          if (pr == kNullRow) { nulls[i] = 1; cells[i] = std::string_view(); continue; }
+          const ColumnStore& cs = dt.col_data[direct[i].col];
+          if (pr >= cs.size()) {   // a row still in the delta buffer
+            const std::string& cv = dt.cell(pr, direct[i].col);
+            nulls[i] = sql_is_null(cv) ? 1 : 0;
+            cells[i] = nulls[i] ? std::string_view() : std::string_view(cv);
+            continue;
+          }
+          if (cs.is_null(pr)) { nulls[i] = 1; cells[i] = std::string_view(); continue; }
+          nulls[i] = 0;
+          cells[i] = cs.get_view(pr);
+        }
+        ok = join_sink->row(cells.data(), nulls.data(), nc);
+        ++sent;
+      }
+      ok = join_sink->end() && ok;
+      hdr.streamed = true;
+      hdr.rows_affected = sent;
+      if (!ok) {
+        SqlQueryResult gone = make_error("the client went away while the rows were being sent");
+        gone.streamed = true;
+        return gone;
+      }
+      return hdr;
+    }
+  }
+  // ORDER BY stored columns .. LIMIT n over many joined rows: each row's
+  // keys read as numbers (a typed number, a dictionary column's collation
+  // rank, a date's place in time), the first n rows kept - ties in row order,
+  // as the sort below keeps them - and only those projected. 40k orders of a
+  // status each projected (a customer name copied, two Vals made) to keep 20.
+  if (bounded && !having && !distinct && !order_by.empty() && order_by.size() <= 4 && rows.size() > keep_bound * 2 + 64 &&
+      keep_bound <= ((size_t)1 << 16)) {
+    struct RK { int kind = 0; size_t src = 0, col = 0; std::vector<int> rank; };   // 1 number, 2 rank
+    std::vector<RK> rk(order_by.size());
+    EvalCtx sctx; sctx.sources = &sources;
+    bool ok = true;
+    for (size_t i = 0; ok && i < order_by.size(); ++i) {
+      const SqlExpr* ke = order_by[i].ordinal > 0 && (size_t)order_by[i].ordinal <= expanded.size()
+                              ? expanded[(size_t)order_by[i].ordinal - 1].expr.get() : order_by[i].expr.get();
+      size_t ks = 0, kc = 0;
+      if (!ke || ke->op != ExprOp::Column || lookup_column_here(sctx, *ke, &ks, &kc) != ColumnLookup::Found || ks >= sources.size() ||
+          !sources[ks].table || sources[ks].table->inferred_types) { ok = false; break; }
+      const SqlTable& kt = *sources[ks].table;
+      if (kc >= kt.col_data.size() || kt.col_data[kc].size() != kt.row_count()) { ok = false; break; }
+      const ColumnStore& kcs = kt.col_data[kc];
+      rk[i].src = ks;
+      rk[i].col = kc;
+      if (vx::typed_numeric(kcs) && sql_type_numeric(kt.columns[kc].type) && sql_type_numeric(order_types[i])) { rk[i].kind = 1; continue; }
+      if (!vx::dict_coded(kcs) || sql_type_numeric(kt.columns[kc].type) || vx::dict_size(kcs) > ((size_t)1 << 22)) { ok = false; break; }
+      const size_t nd = vx::dict_size(kcs);
+      if (order_types[i] == SqlDataType::Text && !kt.columns[kc].temporal) {
+        std::vector<QuerySource> only(sources.begin() + (long)ks, sources.begin() + (long)ks + 1);
+        EvalCtx lctx; lctx.sources = &only;
+        EvalCtx bctx; bctx.db = db; bctx.sources = &only;
+        // A copy: resolving binds a column to the scope it is read in, and the
+          // statement's own key is read later in the joined one.
+          const ExprPtr kcopy = clone_expr(ke);
+          vx::Source vs = vx::make_source(kcopy.get(), kt, lctx, bctx);
+        if (vs.kind != vx::Source::CodeCol || !vs.bare_column) { ok = false; break; }
+        rk[i].rank = vx::dict_rank_of(kt, vs);
+        rk[i].kind = 2;
+        continue;
+      }
+      if (kt.columns[kc].temporal) {
+        // Every entry a point in time: ranked by it (equal times share a rank).
+        std::vector<std::pair<int64_t, uint32_t>> tk;
+        tk.reserve(nd);
+        for (size_t c = 0; ok && c < nd; ++c) {
+          int64_t k = 0;
+          const std::string& ent = vx::dict_entry(kcs, (uint32_t)c);
+          if (sql_is_null(ent)) continue;   // the NULL marker: its rows read as NULL
+          if (!temporal_key(ent, &k)) ok = false;
+          tk.push_back({k, (uint32_t)c});
+        }
+        if (!ok) break;
+        std::sort(tk.begin(), tk.end());
+        rk[i].rank.assign(nd, -1);
+        int r = -1;
+        for (size_t j = 0; j < tk.size(); ++j) {
+          if (j == 0 || tk[j].first != tk[j - 1].first) ++r;
+          rk[i].rank[tk[j].second] = r;
+        }
+        rk[i].kind = 2;
+        continue;
+      }
+      ok = false;
+    }
+    if (!ok && vx_trace_on()) {
+      std::string m = "join: ORDER BY keys not all readable as numbers:";
+      for (size_t i = 0; i < rk.size(); ++i) m += " " + std::to_string(rk[i].kind) + "/" + std::to_string((int)order_types[i]);
+      vx_trace(m);
+    }
+    if (ok) {
+      const size_t R = rows.size(), nk = order_by.size();
+      std::vector<double> kv(R * nk, 0);
+      std::vector<uint8_t> kn(R * nk, 0);
+      for (size_t i = 0; i < nk; ++i) {
+        const RK& f = rk[i];
+        const ColumnStore& kcs = sources[f.src].table->col_data[f.col];
+        for (size_t ri = 0; ri < R; ++ri) {
+          const JoinedRow& r = rows[ri];
+          const size_t pr = f.src < r.parts.size() ? r.parts[f.src] : kNullRow;
+          if (pr == kNullRow || kcs.is_null(pr)) { kn[ri * nk + i] = 1; continue; }
+          if (f.kind == 1) { kv[ri * nk + i] = vx::typed_value(kcs, pr); continue; }
+          const uint32_t code = vx::code_at(kcs, pr);
+          const int rnk = code < f.rank.size() ? f.rank[code] : -1;
+          if (rnk < 0) kn[ri * nk + i] = 1; else kv[ri * nk + i] = rnk;
+        }
+      }
+      std::vector<uint32_t> idx(R);
+      for (size_t ri = 0; ri < R; ++ri) idx[ri] = (uint32_t)ri;
+      auto nless = [&](uint32_t a, uint32_t b) {
+        for (size_t i = 0; i < nk; ++i) {
+          const bool xa = kn[a * nk + i], xb = kn[b * nk + i];
+          if (xa && xb) continue;
+          if (xa) return !order_by[i].descending;
+          if (xb) return order_by[i].descending;
+          const double x = kv[a * nk + i], y = kv[b * nk + i];
+          if (x == y) continue;
+          return order_by[i].descending ? x > y : x < y;
+        }
+        return a < b;
+      };
+      const size_t n = std::min(keep_bound, R);
+      std::partial_sort(idx.begin(), idx.begin() + (long)n, idx.end(), nless);
+      // Back in row order: the sort below decides ties by it.
+      std::sort(idx.begin(), idx.begin() + (long)n);
+      JoinedRows kept;
+      kept.reserve(n);
+      for (size_t i = 0; i < n; ++i) kept.push_back(std::move(rows[idx[i]]));
+      rows.swap(kept);
+      if (vx_trace_on()) vx_trace("join: ORDER BY keys as numbers, " + std::to_string(n) + " of " + std::to_string(R) + " rows kept");
+    }
+  }
+  bool ordinal_keys = false;
+  for (const OrderKey& k : order_by) if (k.ordinal > 0) ordinal_keys = true;
+  // SELECT DISTINCT of stored dictionary columns: two rows whose cells are
+  // the same codes print the same text, so they are one output row - dropped
+  // here on the codes, before anything is projected. The text dedupe below
+  // still runs over what is left (two codes can collate equal). `SELECT
+  // DISTINCT supplierid, suppname FROM suppliers JOIN purchdata` projected
+  // 18,167 rows to keep 90: 14 of its 16 ms.
+  if (distinct && !having && order_by.empty() && rows.size() >= 256 && !expanded.empty()) {
+    bool on_codes = true;
+    for (size_t i = 0; i < expanded.size() && on_codes; ++i) {
+      if (!direct[i].ok) { on_codes = false; break; }
+      const SqlTable& dt = *sources[direct[i].src].table;
+      on_codes = direct[i].col < dt.col_data.size() && vx::dict_coded(dt.col_data[direct[i].col]);
+    }
+    if (on_codes) {
+      std::unordered_set<std::string> seen;
+      JoinedRows kept;
+      std::string key;
+      for (JoinedRow& r : rows) {
+        key.clear();
+        for (size_t i = 0; i < expanded.size(); ++i) {
+          const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
+          uint64_t code = ~0ull;                       // the padded side of a LEFT JOIN
+          if (pr != kNullRow) {
+            const ColumnStore& cs = sources[direct[i].src].table->col_data[direct[i].col];
+            code = cs.is_null(pr) ? ~0ull - 1 : (uint64_t)vx::code_at(cs, pr);
+          }
+          key.append(reinterpret_cast<const char*>(&code), sizeof code);
+        }
+        if (seen.insert(key).second) kept.push_back(std::move(r));
+      }
+      rows.swap(kept);
+    }
+  }
+  // The answer as a typed batch, for a consumer that takes one (a CTE's table): each item made over every row
+  // at once - a stored column gathered by row id, a program's lanes, the interpreter's text otherwise - and no
+  // row projected below (rows cleared). Not with a sort, DISTINCT, HAVING or a limit: those work on the rows.
+  if (col_out && !join_sink && order_by.empty() && !distinct && !having && limit < 0 && offset <= 0 && !ordinal_keys && !bounded) {
+    ColBatch& B = *col_out;
+    const size_t n = rows.size();
+    B.cols.assign(expanded.size(), ColBatch::Col());
+    B.rows = n;
+    EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+    std::vector<size_t> interp;
+    for (size_t i = 0; i < expanded.size(); ++i) {
+      const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+      if (direct[i].ok) {
+        const size_t ds = direct[i].src;
+        colbatch_gather(*sources[ds].table, direct[i].col, dest, 0,
+                        [&](size_t r) -> size_t { const JoinedRow& jr = rows[r]; return ds < jr.parts.size() ? jr.parts[ds] : kNullRow; }, n, &B.cols[i]);
+        continue;
+      }
+      if (n >= 64) {
+        if (const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx)) {
+          vp::Column col;
+          std::string verr;
+          if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) {
+            colbatch_from_vp(std::move(col), dest, 0, &B.cols[i]);
+            continue;
+          }
+        }
+      }
+      interp.push_back(i);
+    }
+    if (!interp.empty()) {
+      // the rest through the interpreter, the rows in chunks across the pool as project_row's are
+      for (size_t i : interp) { B.cols[i].kind = ColBatch::Text; B.cols[i].s.resize(n); }
+      auto run = [&](size_t b0, size_t b1, std::string* e) {
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.group = nullptr; ctx.err = e;
+        for (size_t r = b0; r < b1 && e->empty(); ++r) {
+          ctx.row = &rows[r];
+          for (size_t i : interp) {
+            Val v = eval_expr(expanded[i].expr.get(), ctx);
+            if (!e->empty()) return;
+            B.cols[i].s[r] = v.null ? sql_null() : v.str();
+          }
+        }
+      };
+      if (n >= 4096 && !SqlThreadPool::is_in_worker_thread()) {
+        const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
+        std::vector<std::string> errs(lanes);
+        SqlThreadPool::instance().for_chunks(n, 1024, n * 4, false, [&](size_t b0, size_t b1, size_t tid) {
+          if (tid >= lanes) tid = 0;
+          run(b0, b1, &errs[tid]);
+        });
+        for (const auto& e : errs) if (!e.empty()) return make_error(e);
+      } else {
+        std::string e;
+        run(0, n, &e);
+        if (!e.empty()) return make_error(e);
+      }
+    }
+    for (size_t i = 0; i < expanded.size(); ++i)
+      if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+    B.filled = true;
+    rows.clear();   // nothing left for the projection below
+  }
+  // A select item that compiles to a vectorized program (vp) is evaluated over every projected row at once,
+  // its text per row kept here; project_row prints the text instead of interpreting the item per row.
+  const size_t vp_proj_count = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
+                                   ? std::min(rows.size(), (size_t)offset + (size_t)limit) : rows.size();
+  std::vector<std::vector<std::string>> vp_text;   // sized only when the rows are many
+  if (!ordinal_keys && !having && vp_proj_count >= 256) {
+    vp_text.resize(expanded.size());
+    EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+    for (size_t i = 0; i < expanded.size(); ++i) {
+      if (direct[i].ok && !ordinal_needed[i]) continue;
+      const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
+      if (!P) continue;
+      vp::Column col;
+      std::string verr;
+      if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, vp_proj_count, &col, &verr)) continue;
+      vp_text[i].resize(vp_proj_count);
+      for (size_t j = 0; j < vp_proj_count; ++j) vp_text[i][j] = col.text(j);
+    }
+  }
+  auto project_row = [&](const JoinedRow& r, EvalCtx& ctx, OutRow& o) {
+    o.row.values.reserve(expanded.size());
+    std::vector<Val> evaled_items;
+    if (ordinal_keys) evaled_items.reserve(expanded.size());
+    const size_t ri = (size_t)(&r - rows.data());
+    for (size_t i = 0; i < expanded.size(); ++i) {
+      if (direct[i].ok && !ordinal_needed[i]) {
+        const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
+        o.row.values.push_back(pr == kNullRow ? sql_null() : sources[direct[i].src].table->cell(pr, direct[i].col));
+        if (ordinal_keys) evaled_items.push_back(val_null());   // keeps evaled_items[i] aligned; never read
+        continue;
+      }
+      if (i < vp_text.size() && ri < vp_text[i].size()) { o.row.values.push_back(std::move(vp_text[i][ri])); continue; }
+      Val v = eval_expr(expanded[i].expr.get(), ctx);
+      if (ctx.err && !ctx.err->empty()) return;
+      o.row.values.push_back(v.null ? sql_null() : v.str());
+      if (ordinal_keys) evaled_items.push_back(v);
+    }
+    for (const OrderKey& k : order_by) {
+      if (k.ordinal > 0) {
+        size_t idx = (size_t)k.ordinal - 1;
+        o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
+      } else {
+        o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
+      }
+      if (ctx.err && !ctx.err->empty()) return;
+    }
+  };
+  // The projected rows, each with its cells.
+  const size_t max_needed = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
+                                ? (size_t)offset + (size_t)limit
+                                : SIZE_MAX;
+  const size_t proj_count = (max_needed != SIZE_MAX) ? std::min(rows.size(), max_needed) : rows.size();
+  if (!bounded && !reserve_rows(proj_count, sizeof(OutRow) + expanded.size() * kQmemCellBytes))
+    return make_error("Query execution was interrupted");
+  // Many rows, nothing bounding what is kept: projected in parallel, in
+  // chunks joined back in row order.
+  if (!bounded && !having && proj_count >= 4096 && !SqlThreadPool::is_in_worker_thread()) {
+    constexpr size_t kProjChunk = 1024;
+    const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
+    std::vector<std::vector<OutRow>> chunks((proj_count + kProjChunk - 1) / kProjChunk);
+    std::vector<std::string> errs(lanes);
+    // Projecting a row evaluates every select item: weighed as a few scanned rows.
+    SqlThreadPool::instance().for_chunks(proj_count, kProjChunk, proj_count * 4, false, [&](size_t b0, size_t b1, size_t tid) {
+      if (tid >= lanes) tid = 0;
+      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+      ctx.sources = &sources;
+      ctx.group = nullptr;
+      ctx.err = &errs[tid];
+      auto& out = chunks[b0 / kProjChunk];
+      out.reserve(b1 - b0);
+      for (size_t ri = b0; ri < b1 && errs[tid].empty(); ++ri) {
+        ctx.row = &rows[ri];
+        OutRow o;
+        project_row(rows[ri], ctx, o);
+        out.push_back(std::move(o));
+      }
+    });
+    for (const auto& e : errs) if (!e.empty()) return make_error(e);
+    out_rows.reserve(proj_count);
+    for (auto& c : chunks) for (auto& o : c) out_rows.push_back(std::move(o));
+  } else {
+  if (!bounded) out_rows.reserve(proj_count);
+  EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+  ctx.sources = &sources;
+  ctx.group = nullptr;
+  ctx.err = &err;
+  for (size_t ri = 0; ri < proj_count; ++ri) {
+    JoinedRow& r = rows[ri];
+    ctx.row = &r;
+    if (having && !predicate_true(having.get(), ctx)) {
+      if (!err.empty()) return make_error(err);
+      continue;
+    }
+    if (!err.empty()) return make_error(err);
+
+    OutRow o;
+    project_row(r, ctx, o);
+    if (!err.empty()) return make_error(err);
+    emit_row(out_rows, std::move(o));
+    if (max_needed != SIZE_MAX && out_rows.size() >= max_needed) break;
+  }
+  }
+  return std::nullopt;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -48954,396 +49393,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   const bool bounded = keep_bound != SIZE_MAX;
 
   if (!aggregated) {
-    // A select-list item that is a stored column of this query prints as the
-    // cell itself (every reading of a cell by eval_expr prints back the same
-    // text): copied, not turned into a Val and back, per cell.
-    struct DirectCol { bool ok = false; size_t src = 0, col = 0; };
-    std::vector<DirectCol> direct(expanded.size());
-    {
-      EvalCtx dctx; dctx.sources = &sources;
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        const SqlExpr* ie = expanded[i].expr.get();
-        if (!ie || ie->op != ExprOp::Column) continue;
-        // A column bound in this scope (every `*` column is, on expansion) is
-        // that binding: resolving each of a wide row's 100 names again was
-        // 14 us of a 90 us lookup.
-        if (ie->bound_depth == 0 && ie->bound_src >= 0 && ie->bound_col >= 0 && (size_t)ie->bound_src < sources.size() &&
-            sources[(size_t)ie->bound_src].table && (size_t)ie->bound_col < sources[(size_t)ie->bound_src].table->columns.size()) {
-          direct[i] = {true, (size_t)ie->bound_src, (size_t)ie->bound_col};
-          continue;
-        }
-        size_t ds = 0, dc = 0;
-        if (lookup_column_here(dctx, *ie, &ds, &dc) != ColumnLookup::Found) continue;
-        if (ds >= sources.size() || !sources[ds].table || dc >= sources[ds].table->columns.size()) continue;
-        direct[i] = {true, ds, dc};
-      }
-    }
-    phases.mark("direct");
-    // Straight to the client: every item a stored column, no sort, DISTINCT
-    // or HAVING still to come - each cell from its column's bytes into the
-    // packet, no row built (400k joined rows were 42 ms of projection, then
-    // copied again into packets).
-    if (join_sink && !distinct && order_by.empty() && !having && !outer_scope && !expanded.empty()) {
-      bool all_direct = true;
-      for (size_t i = 0; i < expanded.size(); ++i) if (!direct[i].ok) all_direct = false;
-      if (all_direct) {
-        SqlQueryResult hdr;
-        hdr.is_result_set = true;
-        hdr.success = true;
-        for (const SelectItem& it : expanded) {
-          hdr.columns.push_back(it.label);
-          hdr.column_types.push_back(infer_item_type(it.expr.get(), sources));
-          hdr.column_is_string.push_back(item_is_string(it.expr.get(), sources) ? 1 : 0);
-          hdr.column_origins.push_back(item_origin(it.expr.get(), sources));
-        }
-        const size_t nc = expanded.size();
-        std::vector<std::string_view> cells(nc);
-        std::vector<uint8_t> nulls(nc);
-        const size_t from = offset > 0 ? std::min(rows.size(), (size_t)offset) : 0;
-        const size_t to = limit >= 0 ? std::min(rows.size(), from + (size_t)limit) : rows.size();
-        if (sql_interrupted()) return make_error("Query execution was interrupted");
-        bool ok = join_sink->begin(hdr);
-        size_t sent = 0;
-        for (size_t ri = from; ok && ri < to; ++ri) {
-          const JoinedRow& r = rows[ri];
-          for (size_t i = 0; i < nc; ++i) {
-            const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
-            const SqlTable& dt = *sources[direct[i].src].table;
-            if (pr == kNullRow) { nulls[i] = 1; cells[i] = std::string_view(); continue; }
-            const ColumnStore& cs = dt.col_data[direct[i].col];
-            if (pr >= cs.size()) {   // a row still in the delta buffer
-              const std::string& cv = dt.cell(pr, direct[i].col);
-              nulls[i] = sql_is_null(cv) ? 1 : 0;
-              cells[i] = nulls[i] ? std::string_view() : std::string_view(cv);
-              continue;
-            }
-            if (cs.is_null(pr)) { nulls[i] = 1; cells[i] = std::string_view(); continue; }
-            nulls[i] = 0;
-            cells[i] = cs.get_view(pr);
-          }
-          ok = join_sink->row(cells.data(), nulls.data(), nc);
-          ++sent;
-        }
-        ok = join_sink->end() && ok;
-        hdr.streamed = true;
-        hdr.rows_affected = sent;
-        if (!ok) {
-          SqlQueryResult gone = make_error("the client went away while the rows were being sent");
-          gone.streamed = true;
-          return gone;
-        }
-        return hdr;
-      }
-    }
-    // ORDER BY stored columns .. LIMIT n over many joined rows: each row's
-    // keys read as numbers (a typed number, a dictionary column's collation
-    // rank, a date's place in time), the first n rows kept - ties in row order,
-    // as the sort below keeps them - and only those projected. 40k orders of a
-    // status each projected (a customer name copied, two Vals made) to keep 20.
-    if (bounded && !having && !distinct && !order_by.empty() && order_by.size() <= 4 && rows.size() > keep_bound * 2 + 64 &&
-        keep_bound <= ((size_t)1 << 16)) {
-      struct RK { int kind = 0; size_t src = 0, col = 0; std::vector<int> rank; };   // 1 number, 2 rank
-      std::vector<RK> rk(order_by.size());
-      EvalCtx sctx; sctx.sources = &sources;
-      bool ok = true;
-      for (size_t i = 0; ok && i < order_by.size(); ++i) {
-        const SqlExpr* ke = order_by[i].ordinal > 0 && (size_t)order_by[i].ordinal <= expanded.size()
-                                ? expanded[(size_t)order_by[i].ordinal - 1].expr.get() : order_by[i].expr.get();
-        size_t ks = 0, kc = 0;
-        if (!ke || ke->op != ExprOp::Column || lookup_column_here(sctx, *ke, &ks, &kc) != ColumnLookup::Found || ks >= sources.size() ||
-            !sources[ks].table || sources[ks].table->inferred_types) { ok = false; break; }
-        const SqlTable& kt = *sources[ks].table;
-        if (kc >= kt.col_data.size() || kt.col_data[kc].size() != kt.row_count()) { ok = false; break; }
-        const ColumnStore& kcs = kt.col_data[kc];
-        rk[i].src = ks;
-        rk[i].col = kc;
-        if (vx::typed_numeric(kcs) && sql_type_numeric(kt.columns[kc].type) && sql_type_numeric(order_types[i])) { rk[i].kind = 1; continue; }
-        if (!vx::dict_coded(kcs) || sql_type_numeric(kt.columns[kc].type) || vx::dict_size(kcs) > ((size_t)1 << 22)) { ok = false; break; }
-        const size_t nd = vx::dict_size(kcs);
-        if (order_types[i] == SqlDataType::Text && !kt.columns[kc].temporal) {
-          std::vector<QuerySource> only(sources.begin() + (long)ks, sources.begin() + (long)ks + 1);
-          EvalCtx lctx; lctx.sources = &only;
-          EvalCtx bctx; bctx.db = db; bctx.sources = &only;
-          // A copy: resolving binds a column to the scope it is read in, and the
-            // statement's own key is read later in the joined one.
-            const ExprPtr kcopy = clone_expr(ke);
-            vx::Source vs = vx::make_source(kcopy.get(), kt, lctx, bctx);
-          if (vs.kind != vx::Source::CodeCol || !vs.bare_column) { ok = false; break; }
-          rk[i].rank = vx::dict_rank_of(kt, vs);
-          rk[i].kind = 2;
-          continue;
-        }
-        if (kt.columns[kc].temporal) {
-          // Every entry a point in time: ranked by it (equal times share a rank).
-          std::vector<std::pair<int64_t, uint32_t>> tk;
-          tk.reserve(nd);
-          for (size_t c = 0; ok && c < nd; ++c) {
-            int64_t k = 0;
-            const std::string& ent = vx::dict_entry(kcs, (uint32_t)c);
-            if (sql_is_null(ent)) continue;   // the NULL marker: its rows read as NULL
-            if (!temporal_key(ent, &k)) ok = false;
-            tk.push_back({k, (uint32_t)c});
-          }
-          if (!ok) break;
-          std::sort(tk.begin(), tk.end());
-          rk[i].rank.assign(nd, -1);
-          int r = -1;
-          for (size_t j = 0; j < tk.size(); ++j) {
-            if (j == 0 || tk[j].first != tk[j - 1].first) ++r;
-            rk[i].rank[tk[j].second] = r;
-          }
-          rk[i].kind = 2;
-          continue;
-        }
-        ok = false;
-      }
-      if (!ok && vx_trace_on()) {
-        std::string m = "join: ORDER BY keys not all readable as numbers:";
-        for (size_t i = 0; i < rk.size(); ++i) m += " " + std::to_string(rk[i].kind) + "/" + std::to_string((int)order_types[i]);
-        vx_trace(m);
-      }
-      if (ok) {
-        const size_t R = rows.size(), nk = order_by.size();
-        std::vector<double> kv(R * nk, 0);
-        std::vector<uint8_t> kn(R * nk, 0);
-        for (size_t i = 0; i < nk; ++i) {
-          const RK& f = rk[i];
-          const ColumnStore& kcs = sources[f.src].table->col_data[f.col];
-          for (size_t ri = 0; ri < R; ++ri) {
-            const JoinedRow& r = rows[ri];
-            const size_t pr = f.src < r.parts.size() ? r.parts[f.src] : kNullRow;
-            if (pr == kNullRow || kcs.is_null(pr)) { kn[ri * nk + i] = 1; continue; }
-            if (f.kind == 1) { kv[ri * nk + i] = vx::typed_value(kcs, pr); continue; }
-            const uint32_t code = vx::code_at(kcs, pr);
-            const int rnk = code < f.rank.size() ? f.rank[code] : -1;
-            if (rnk < 0) kn[ri * nk + i] = 1; else kv[ri * nk + i] = rnk;
-          }
-        }
-        std::vector<uint32_t> idx(R);
-        for (size_t ri = 0; ri < R; ++ri) idx[ri] = (uint32_t)ri;
-        auto nless = [&](uint32_t a, uint32_t b) {
-          for (size_t i = 0; i < nk; ++i) {
-            const bool xa = kn[a * nk + i], xb = kn[b * nk + i];
-            if (xa && xb) continue;
-            if (xa) return !order_by[i].descending;
-            if (xb) return order_by[i].descending;
-            const double x = kv[a * nk + i], y = kv[b * nk + i];
-            if (x == y) continue;
-            return order_by[i].descending ? x > y : x < y;
-          }
-          return a < b;
-        };
-        const size_t n = std::min(keep_bound, R);
-        std::partial_sort(idx.begin(), idx.begin() + (long)n, idx.end(), nless);
-        // Back in row order: the sort below decides ties by it.
-        std::sort(idx.begin(), idx.begin() + (long)n);
-        JoinedRows kept;
-        kept.reserve(n);
-        for (size_t i = 0; i < n; ++i) kept.push_back(std::move(rows[idx[i]]));
-        rows.swap(kept);
-        if (vx_trace_on()) vx_trace("join: ORDER BY keys as numbers, " + std::to_string(n) + " of " + std::to_string(R) + " rows kept");
-      }
-    }
-    bool ordinal_keys = false;
-    for (const OrderKey& k : order_by) if (k.ordinal > 0) ordinal_keys = true;
-    // SELECT DISTINCT of stored dictionary columns: two rows whose cells are
-    // the same codes print the same text, so they are one output row - dropped
-    // here on the codes, before anything is projected. The text dedupe below
-    // still runs over what is left (two codes can collate equal). `SELECT
-    // DISTINCT supplierid, suppname FROM suppliers JOIN purchdata` projected
-    // 18,167 rows to keep 90: 14 of its 16 ms.
-    if (distinct && !having && order_by.empty() && rows.size() >= 256 && !expanded.empty()) {
-      bool on_codes = true;
-      for (size_t i = 0; i < expanded.size() && on_codes; ++i) {
-        if (!direct[i].ok) { on_codes = false; break; }
-        const SqlTable& dt = *sources[direct[i].src].table;
-        on_codes = direct[i].col < dt.col_data.size() && vx::dict_coded(dt.col_data[direct[i].col]);
-      }
-      if (on_codes) {
-        std::unordered_set<std::string> seen;
-        JoinedRows kept;
-        std::string key;
-        for (JoinedRow& r : rows) {
-          key.clear();
-          for (size_t i = 0; i < expanded.size(); ++i) {
-            const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
-            uint64_t code = ~0ull;                       // the padded side of a LEFT JOIN
-            if (pr != kNullRow) {
-              const ColumnStore& cs = sources[direct[i].src].table->col_data[direct[i].col];
-              code = cs.is_null(pr) ? ~0ull - 1 : (uint64_t)vx::code_at(cs, pr);
-            }
-            key.append(reinterpret_cast<const char*>(&code), sizeof code);
-          }
-          if (seen.insert(key).second) kept.push_back(std::move(r));
-        }
-        rows.swap(kept);
-      }
-    }
-    // The answer as a typed batch, for a consumer that takes one (a CTE's table): each item made over every row
-    // at once - a stored column gathered by row id, a program's lanes, the interpreter's text otherwise - and no
-    // row projected below (rows cleared). Not with a sort, DISTINCT, HAVING or a limit: those work on the rows.
-    if (col_out && !join_sink && order_by.empty() && !distinct && !having && limit < 0 && offset <= 0 && !ordinal_keys && !bounded) {
-      ColBatch& B = *col_out;
-      const size_t n = rows.size();
-      B.cols.assign(expanded.size(), ColBatch::Col());
-      B.rows = n;
-      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
-      std::vector<size_t> interp;
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
-        if (direct[i].ok) {
-          const size_t ds = direct[i].src;
-          colbatch_gather(*sources[ds].table, direct[i].col, dest, 0,
-                          [&](size_t r) -> size_t { const JoinedRow& jr = rows[r]; return ds < jr.parts.size() ? jr.parts[ds] : kNullRow; }, n, &B.cols[i]);
-          continue;
-        }
-        if (n >= 64) {
-          if (const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx)) {
-            vp::Column col;
-            std::string verr;
-            if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) {
-              colbatch_from_vp(std::move(col), dest, 0, &B.cols[i]);
-              continue;
-            }
-          }
-        }
-        interp.push_back(i);
-      }
-      if (!interp.empty()) {
-        // the rest through the interpreter, the rows in chunks across the pool as project_row's are
-        for (size_t i : interp) { B.cols[i].kind = ColBatch::Text; B.cols[i].s.resize(n); }
-        auto run = [&](size_t b0, size_t b1, std::string* e) {
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.group = nullptr; ctx.err = e;
-          for (size_t r = b0; r < b1 && e->empty(); ++r) {
-            ctx.row = &rows[r];
-            for (size_t i : interp) {
-              Val v = eval_expr(expanded[i].expr.get(), ctx);
-              if (!e->empty()) return;
-              B.cols[i].s[r] = v.null ? sql_null() : v.str();
-            }
-          }
-        };
-        if (n >= 4096 && !SqlThreadPool::is_in_worker_thread()) {
-          const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
-          std::vector<std::string> errs(lanes);
-          SqlThreadPool::instance().for_chunks(n, 1024, n * 4, false, [&](size_t b0, size_t b1, size_t tid) {
-            if (tid >= lanes) tid = 0;
-            run(b0, b1, &errs[tid]);
-          });
-          for (const auto& e : errs) if (!e.empty()) return make_error(e);
-        } else {
-          std::string e;
-          run(0, n, &e);
-          if (!e.empty()) return make_error(e);
-        }
-      }
-      for (size_t i = 0; i < expanded.size(); ++i)
-        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
-      B.filled = true;
-      rows.clear();   // nothing left for the projection below
-    }
-    // A select item that compiles to a vectorized program (vp) is evaluated over every projected row at once,
-    // its text per row kept here; project_row prints the text instead of interpreting the item per row.
-    const size_t vp_proj_count = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
-                                     ? std::min(rows.size(), (size_t)offset + (size_t)limit) : rows.size();
-    std::vector<std::vector<std::string>> vp_text;   // sized only when the rows are many
-    if (!ordinal_keys && !having && vp_proj_count >= 256) {
-      vp_text.resize(expanded.size());
-      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        if (direct[i].ok && !ordinal_needed[i]) continue;
-        const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
-        if (!P) continue;
-        vp::Column col;
-        std::string verr;
-        if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, vp_proj_count, &col, &verr)) continue;
-        vp_text[i].resize(vp_proj_count);
-        for (size_t j = 0; j < vp_proj_count; ++j) vp_text[i][j] = col.text(j);
-      }
-    }
-    auto project_row = [&](const JoinedRow& r, EvalCtx& ctx, OutRow& o) {
-      o.row.values.reserve(expanded.size());
-      std::vector<Val> evaled_items;
-      if (ordinal_keys) evaled_items.reserve(expanded.size());
-      const size_t ri = (size_t)(&r - rows.data());
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        if (direct[i].ok && !ordinal_needed[i]) {
-          const size_t pr = direct[i].src < r.parts.size() ? r.parts[direct[i].src] : kNullRow;
-          o.row.values.push_back(pr == kNullRow ? sql_null() : sources[direct[i].src].table->cell(pr, direct[i].col));
-          if (ordinal_keys) evaled_items.push_back(val_null());   // keeps evaled_items[i] aligned; never read
-          continue;
-        }
-        if (i < vp_text.size() && ri < vp_text[i].size()) { o.row.values.push_back(std::move(vp_text[i][ri])); continue; }
-        Val v = eval_expr(expanded[i].expr.get(), ctx);
-        if (ctx.err && !ctx.err->empty()) return;
-        o.row.values.push_back(v.null ? sql_null() : v.str());
-        if (ordinal_keys) evaled_items.push_back(v);
-      }
-      for (const OrderKey& k : order_by) {
-        if (k.ordinal > 0) {
-          size_t idx = (size_t)k.ordinal - 1;
-          o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
-        } else {
-          o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
-        }
-        if (ctx.err && !ctx.err->empty()) return;
-      }
-    };
-    // The projected rows, each with its cells.
-    const size_t max_needed = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
-                                  ? (size_t)offset + (size_t)limit
-                                  : SIZE_MAX;
-    const size_t proj_count = (max_needed != SIZE_MAX) ? std::min(rows.size(), max_needed) : rows.size();
-    if (!bounded && !reserve_rows(proj_count, sizeof(OutRow) + expanded.size() * kQmemCellBytes))
-      return make_error("Query execution was interrupted");
-    // Many rows, nothing bounding what is kept: projected in parallel, in
-    // chunks joined back in row order.
-    if (!bounded && !having && proj_count >= 4096 && !SqlThreadPool::is_in_worker_thread()) {
-      constexpr size_t kProjChunk = 1024;
-      const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
-      std::vector<std::vector<OutRow>> chunks((proj_count + kProjChunk - 1) / kProjChunk);
-      std::vector<std::string> errs(lanes);
-      // Projecting a row evaluates every select item: weighed as a few scanned rows.
-      SqlThreadPool::instance().for_chunks(proj_count, kProjChunk, proj_count * 4, false, [&](size_t b0, size_t b1, size_t tid) {
-        if (tid >= lanes) tid = 0;
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.group = nullptr;
-        ctx.err = &errs[tid];
-        auto& out = chunks[b0 / kProjChunk];
-        out.reserve(b1 - b0);
-        for (size_t ri = b0; ri < b1 && errs[tid].empty(); ++ri) {
-          ctx.row = &rows[ri];
-          OutRow o;
-          project_row(rows[ri], ctx, o);
-          out.push_back(std::move(o));
-        }
-      });
-      for (const auto& e : errs) if (!e.empty()) return make_error(e);
-      out_rows.reserve(proj_count);
-      for (auto& c : chunks) for (auto& o : c) out_rows.push_back(std::move(o));
-    } else {
-    if (!bounded) out_rows.reserve(proj_count);
-    EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-    ctx.sources = &sources;
-    ctx.group = nullptr;
-    ctx.err = &err;
-    for (size_t ri = 0; ri < proj_count; ++ri) {
-      JoinedRow& r = rows[ri];
-      ctx.row = &r;
-      if (having && !predicate_true(having.get(), ctx)) {
-        if (!err.empty()) return make_error(err);
-        continue;
-      }
-      if (!err.empty()) return make_error(err);
-
-      OutRow o;
-      project_row(r, ctx, o);
-      if (!err.empty()) return make_error(err);
-      emit_row(out_rows, std::move(o));
-      if (max_needed != SIZE_MAX && out_rows.size() >= max_needed) break;
-    }
-    }
+    const std::function<void(std::vector<OutRow>&, OutRow&&)> emit_row_fn = emit_row;
+    ProjectPlan pp{db, &sources, &expanded, &having, &order_by, &order_types, &ordinal_needed, limit, offset, distinct, bounded, keep_bound,
+                   outer_scope, col_out, join_sink, &rows, &err, &out_rows, &emit_row_fn};
+    if (std::optional<SqlQueryResult> r = project_rows(pp, phases)) return std::move(*r);
   } else {
     const std::function<void(std::vector<OutRow>&, OutRow&&)> emit_row_fn = emit_row;
     const std::function<bool(const OutRow&, const OutRow&)> row_less_fn = row_less;

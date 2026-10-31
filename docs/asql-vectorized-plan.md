@@ -131,8 +131,12 @@ against the build before, the suites, the frame's bytes and alternating frame ti
   137,276 -> 89,801 bytes, `join_steps` 53,923; 4,933 of 5,046 functions the same size; frames 522/517/510 ->
   521/510/503 ms. One step is still one iteration of that loop; splitting the step into its own operator with a
   `JoinStepPlan` node comes with the compiler's needs.
-- next: **base** (the base source's selection and rows) and **sources** (resolving and materializing them), the
-  ungrouped projection; the function left is the driver that walks the plan.
+- **project** (done): `ProjectPlan` + `project_rows` - the ungrouped statement's 391-line projection (stored
+  columns from their cells, items as lanes, the interpreter for the rest, parallel chunks, the bounded emit, the
+  batch and sink forms). The select function 89,801 -> 78,167 bytes, `project_rows` 22,425; 4,969 of 5,060
+  functions the same size; frames 499/520/522 -> 532/502/521 ms.
+- next: **base** (the base source's selection and rows) and **sources** (resolving and materializing them); the
+  function left is the driver that walks the plan.
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 
