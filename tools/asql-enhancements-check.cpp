@@ -237,7 +237,16 @@ int main() {
     assert(by_key["B"][col(show, "fmt")] == "0.60");
     assert(by_key["A"][col(show, "re")] == "true" && by_key["C"][col(show, "re")] == "false");   // regex_* are pure: a Thing may use them
     const std::string vB = by_key["B"][col(show, "version")];
+    // A write's reaction runs on the Things engine's own thread, in slices, after the write returns: wait for
+    // the kind's clock to move (WAIT THING, the API a client uses) before reading the Thing back. Asserting
+    // straight after the UPDATE raced the reaction and read the old row.
+    auto clock0 = db.execute_gateway_query("WAIT THING gt SINCE 0");
+    assert(clock0.success && clock0.rows.size() == 1);
+    const std::string since = clock0.rows[0].values[col(clock0, "clock")];
     assert(db.execute_gateway_query("UPDATE gt_items SET price = 0.3 WHERE stockid = 'A'").success);
+    auto woke = db.execute_gateway_query("WAIT THING gt SINCE " + since + " TIMEOUT 10");
+    assert(woke.success && woke.rows.size() == 1);
+    assert(woke.rows[0].values[col(woke, "clock")] != since);   // it moved: the reaction ran
     show = db.execute_gateway_query("SHOW THING gt");
     assert(show.success && show.rows.size() == 3);
     for (const auto& row : show.rows) by_key[row.values[col(show, "stockid")]] = row.values;
@@ -461,7 +470,12 @@ int main() {
     if (!rep.success) std::cerr << rep.error_message << "\n";
     assert(rep.success);
     assert(v_of("a") == "100" && v_of("b") == "200");        // the new program's values
+    auto clock0 = db.execute_gateway_query("WAIT THING rp SINCE 0");
+    assert(clock0.success && clock0.rows.size() == 1);
+    std::string since;
+    for (size_t i = 0; i < clock0.columns.size(); ++i) if (clock0.columns[i] == "clock") since = clock0.rows[0].values[i];
     assert(db.execute_gateway_query("UPDATE rp_items SET n = 3 WHERE id = 'a'").success);
+    assert(db.execute_gateway_query("WAIT THING rp SINCE " + since + " TIMEOUT 10").success);   // the reaction ran on its own thread
     assert(v_of("a") == "300");                              // and it follows writes as the Thing
     auto things = db.execute_gateway_query("SHOW THINGS");
     for (const auto& row : things.rows) assert(row.values[0] != "rp~next");   // the builder is gone

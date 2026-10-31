@@ -38561,11 +38561,12 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
   };
   // A select item that is an expression compiled as a program (vp): its text for every row of the page at once,
   // read back by the row's position (vp_pos) instead of interpreting the item per row.
-  std::vector<std::vector<std::string>> vp_items(expanded.size());
+  std::vector<std::vector<std::string>> vp_items;   // sized only for a page worth it: a point lookup pays nothing
   size_t vp_pos = SIZE_MAX;
   auto vp_project_page = [&](const std::vector<uint32_t>& page) {
     if (need_keys || page.size() < 256 || !vp::enabled()) return;
     if (!fast_resolved) { resolve_fast(rd.ev.at(page[0])); if (!err.empty()) return; }
+    vp_items.resize(expanded.size());
     for (size_t i = 0; i < expanded.size(); ++i) {
       if (fast_col[i] >= 0) continue;
       const vp::Prog* P = vp::program_for(expanded[i].expr.get(), rd.ev.at(page[0]));
@@ -38581,7 +38582,7 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
     if (row_idx && !need_keys) {
       if (!fast_resolved) { resolve_fast(ctx); if (!err.empty()) return false; }
       for (size_t i = 0; i < expanded.size(); ++i) {
-        if (vp_pos < vp_items[i].size()) { o->row.values.push_back(std::move(vp_items[i][vp_pos])); continue; }
+        if (i < vp_items.size() && vp_pos < vp_items[i].size()) { o->row.values.push_back(std::move(vp_items[i][vp_pos])); continue; }
         if (fast_col[i] >= 0) {
           // One copy, from the column's own bytes into the row: the getter's
           // scratch string was a second copy of every cell shipped.
@@ -45969,9 +45970,11 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         }
         // A key that is an expression of the base row (sy * 320 + sx = pix) is evaluated over every base row
         // at once where it compiles (vp); key_val reads this row's value back, or interprets the key.
-        std::vector<vp::Column> vp_keys(prep_jkeys.size());
-        std::vector<char> vp_key_ok(prep_jkeys.size(), 0);
+        std::vector<vp::Column> vp_keys;
+        std::vector<char> vp_key_ok;
         if (rows.size() >= 256) {
+          vp_keys.resize(prep_jkeys.size());
+          vp_key_ok.assign(prep_jkeys.size(), 0);
           EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope; kctx.sources = &baseonly;
           for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
             const uint64_t kt0 = vx_trace_on() ? hal_now_ns() : 0;
@@ -45986,7 +45989,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         }
         // An expression key whose values are all known now, and all within a double's 53 bits: the probe's double
         // finds exactly its matches, so no candidate has to be confirmed by its digits.
-        if (best_wide && !js_key_wide && best_ki >= 0 && vp_key_ok[(size_t)best_ki]) {
+        if (best_wide && !js_key_wide && best_ki >= 0 && (size_t)best_ki < vp_key_ok.size() && vp_key_ok[(size_t)best_ki]) {
           const vp::Column& kc = vp_keys[(size_t)best_ki];
           bool narrow = kc.ty == vp::Ty::I64 && !kc.uns;
           for (size_t r = 0; narrow && r < kc.size(); ++r)
@@ -45995,7 +45998,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         }
         const uint64_t jt_d = vx_trace_on() ? hal_now_ns() : 0;   // hash tables, memo keys, vectorized keys ready
         auto key_val = [&](size_t ki, const JoinedRow& base, EvalCtx& vctx) -> Val {
-          if (vp_key_ok[ki]) {
+          if (ki < vp_key_ok.size() && vp_key_ok[ki]) {
             const size_t ri = (size_t)(&base - rows.data());
             if (ri < vp_keys[ki].size()) return vp_keys[ki].at(ri);
           }
@@ -46983,8 +46986,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     // its text per row kept here; project_row prints the text instead of interpreting the item per row.
     const size_t vp_proj_count = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
                                      ? std::min(rows.size(), (size_t)offset + (size_t)limit) : rows.size();
-    std::vector<std::vector<std::string>> vp_text(expanded.size());
+    std::vector<std::vector<std::string>> vp_text;   // sized only when the rows are many
     if (!ordinal_keys && !having && vp_proj_count >= 256) {
+      vp_text.resize(expanded.size());
       EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
       for (size_t i = 0; i < expanded.size(); ++i) {
         if (direct[i].ok && !ordinal_needed[i]) continue;
@@ -47009,7 +47013,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (ordinal_keys) evaled_items.push_back(val_null());   // keeps evaled_items[i] aligned; never read
           continue;
         }
-        if (ri < vp_text[i].size()) { o.row.values.push_back(std::move(vp_text[i][ri])); continue; }
+        if (i < vp_text.size() && ri < vp_text[i].size()) { o.row.values.push_back(std::move(vp_text[i][ri])); continue; }
         Val v = eval_expr(expanded[i].expr.get(), ctx);
         if (ctx.err && !ctx.err->empty()) return;
         o.row.values.push_back(v.null ? sql_null() : v.str());
@@ -47631,13 +47635,14 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
     // Each select item's aggregate arguments compiled now, on this thread, for the groups' workers (vp::warm);
     // an item over the group's own row (pix DIV 320 of a GROUP BY pix) evaluated over every group at once.
-    std::vector<std::vector<std::string>> vp_gtext(expanded.size());
+    std::vector<std::vector<std::string>> vp_gtext;   // sized only when the groups are many
     if (!star_grouped) {
       EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
       for (size_t i = 0; i < expanded.size(); ++i) vp::warm(expanded[i].expr.get(), vctx);
       if (having) vp::warm(having.get(), vctx);
       for (const OrderKey& k : order_by) vp::warm(k.expr.get(), vctx);
       if (!keep_items && groups.size() >= 256) {
+        vp_gtext.resize(expanded.size());
         bool all_rows = true;
         for (const auto& g : groups) if (g.empty()) { all_rows = false; break; }
         for (size_t i = 0; i < expanded.size() && all_rows; ++i) {
@@ -47787,7 +47792,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
           if (keep_items) evaled_items.reserve(expanded.size());
           for (size_t i = 0; i < expanded.size(); ++i) {
             if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); continue; }
-            if (gi < vp_gtext[i].size()) { o.row.values.push_back(std::move(vp_gtext[i][gi])); continue; }
+            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { o.row.values.push_back(std::move(vp_gtext[i][gi])); continue; }
             Val v = eval_expr(expanded[i].expr.get(), ctx);
             if (!local_errs[tid].empty()) break;
             push_out_value(o, std::move(v), evaled_items);
@@ -47850,7 +47855,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         for (size_t i = 0; i < expanded.size(); ++i) {
           const uint64_t e0 = tr ? hal_now_ns() : 0;
           if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); if (tr) cell_ns += hal_now_ns() - e0; continue; }
-          if (!keep_items && (size_t)(&g - groups.data()) < vp_gtext[i].size()) {
+          if (!keep_items && i < vp_gtext.size() && (size_t)(&g - groups.data()) < vp_gtext[i].size()) {
             o.row.values.push_back(std::move(vp_gtext[i][(size_t)(&g - groups.data())]));
             if (tr) ev_ns += hal_now_ns() - e0;
             continue;
