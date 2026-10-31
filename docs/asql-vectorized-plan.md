@@ -122,9 +122,12 @@ against the build before, the suites, the frame's bytes and alternating frame ti
   `execute_parsed_select_single` 177,561 -> 173,659 bytes of code, `emit_result` 7,298; 5,025 of 5,099 functions
   the same size (the 74 changed are the sort template instances renamed with `OutRow`, and EXPLAIN); frames
   520/523/506 -> 518/533/516 ms.
-- next: **group** (`GroupPlan`: keys, aggregates, HAVING, the grouping method), then **join step** (`JoinStepPlan`:
-  the joined source, kind, keys, method, pushed conjuncts), then **base** and **sources**; the function left is the
-  driver that walks the plan.
+- **group** (done): `GroupPlan` + `group_result` - the 921-line grouped branch (lane, star columnar and general
+  grouping, HAVING, the groups' ORDER BY .. LIMIT short cuts, the grouped emit); returns an error to hand back or
+  nothing to go on to the emit. The select function 173,659 -> 137,276 bytes, `group_result` 44,327; 4,934 of 5,045
+  functions the same size; frames 497/491/517 -> 490/517/493 ms.
+- next: **join step** (`JoinStepPlan`: the joined source, kind, keys, method, pushed conjuncts), then **base** and
+  **sources**; the function left is the driver that walks the plan.
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 

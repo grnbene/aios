@@ -44283,6 +44283,990 @@ static SqlQueryResult emit_result(const EmitPlan& p, std::vector<OutRow>& out_ro
   return res;
 }
 
+// The group operator (docs/asql-vectorized-plan.md, stage 2b): the joined rows into groups and each group into an
+// output row - over integer lanes, star columnar, or the general hash of key text - with HAVING, the groups'
+// ORDER BY .. LIMIT short cuts and the grouped emit. The pointers refer into execute_parsed_select_single's state
+// for the statement's duration; the ones it changes (the rows it consumes, the star arrays, HAVING once applied,
+// ORDER BY once the groups are in order, the output rows, the error) are not const.
+struct GroupPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* items;
+  const std::vector<SelectItem>* expanded;
+  const std::vector<ExprPtr>* group_by;
+  ExprPtr* having;
+  const ExprPtr* where;
+  std::vector<OrderKey>* order_by;
+  const std::vector<SqlDataType>* order_types;
+  const std::vector<bool>* join_is_left;
+  const std::vector<bool>* ordinal_needed;
+  long long limit, offset;
+  bool distinct, aggregated, bounded;
+  size_t keep_bound;
+  const EvalCtx* outer_scope;
+  ColBatch* col_out;
+  SqlRowSink* join_sink;
+  JoinedRows* rows;
+  std::vector<std::vector<uint32_t>>* star_cols;
+  StarShape* star_shape;
+  bool* star_columnar;
+  std::string* err;
+  std::vector<OutRow>* out_rows;
+  const std::function<void(std::vector<OutRow>&, OutRow&&)>* emit_row;
+  const std::function<bool(const OutRow&, const OutRow&)>* row_less;
+};
+// Empty: the groups are in out_rows, on to the emit; a result: an error to return.
+static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseClock& phases) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<SelectItem>& items = *plan.items;
+  const std::vector<SelectItem>& expanded = *plan.expanded;
+  const std::vector<ExprPtr>& group_by = *plan.group_by;
+  ExprPtr& having = *plan.having;
+  const ExprPtr& where = *plan.where;
+  std::vector<OrderKey>& order_by = *plan.order_by;
+  const std::vector<SqlDataType>& order_types = *plan.order_types;
+  const std::vector<bool>& join_is_left = *plan.join_is_left;
+  const std::vector<bool>& ordinal_needed = *plan.ordinal_needed;
+  const long long limit = plan.limit, offset = plan.offset;
+  const bool distinct = plan.distinct, aggregated = plan.aggregated, bounded = plan.bounded;
+  const size_t keep_bound = plan.keep_bound;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  ColBatch* const col_out = plan.col_out;
+  SqlRowSink* const join_sink = plan.join_sink;
+  JoinedRows& rows = *plan.rows;
+  std::vector<std::vector<uint32_t>>& star_cols = *plan.star_cols;
+  StarShape& star_shape = *plan.star_shape;
+  bool& star_columnar = *plan.star_columnar;
+  std::string& err = *plan.err;
+  std::vector<OutRow>& out_rows = *plan.out_rows;
+  const std::function<void(std::vector<OutRow>&, OutRow&&)>& emit_row = *plan.emit_row;
+  const std::function<bool(const OutRow&, const OutRow&)>& row_less = *plan.row_less;
+  (void)items; (void)where; (void)join_is_left; (void)ordinal_needed; (void)bounded; (void)keep_bound; (void)join_sink; (void)row_less; (void)star_shape;
+    // GROUP BY over integer lanes where the statement is that shape (lane_group_by): the groups below otherwise.
+    bool lane_done = false;
+    if (vx_trace_on() && (star_columnar || distinct || order_by.size() != group_by.size()))
+      vx_trace(std::string("group: not over lanes:") + (star_columnar ? " star-columnar" : "") + (distinct ? " DISTINCT" : "") +
+               (order_by.size() != group_by.size() ? " its own ORDER BY" : ""));
+    // Under an outer scope too (a CTE, a derived table, a subquery): the lanes are compiled with none, so a column
+    // from further out does not compile and the statement declines; a local column means the same in both.
+    if (!star_columnar && !distinct && !group_by.empty() && order_by.size() == group_by.size()) {
+      bool implicit_order = true;   // GROUP BY's own ORDER BY of its keys, as made above
+      for (size_t i = 0; i < order_by.size(); ++i)
+        if (order_by[i].expr != group_by[i] || order_by[i].ordinal > 0 || order_by[i].descending) implicit_order = false;
+      std::vector<vp::Column> lcols;
+      std::vector<std::vector<std::string>> ltext;
+      size_t G = 0;
+      if (implicit_order && lane_group_by(db, sources, outer_scope, rows, group_by, expanded, having, &lcols, &ltext, &G)) {
+        lane_done = true;
+        if (vx_trace_on())
+          vx_trace("group: " + std::to_string(G) + " groups over integer lanes (" + std::to_string(rows.size()) + " rows" +
+                   (lcols.empty() ? ", " + std::to_string(ltext.size()) + " kept, items interpreted)" : ")"));
+        plan_add(plan_step("group by", {}, lcols.empty() ? "integer lanes, items interpreted" : "integer lanes", lcols.empty() ? ltext.size() : G));
+        if (lcols.empty()) {
+          out_rows.reserve(ltext.size());
+          for (auto& cells : ltext) {
+            OutRow o;
+            o.row.values = std::move(cells);
+            out_rows.push_back(std::move(o));
+          }
+        } else if (col_out && limit < 0 && offset <= 0) {
+          col_out->cols.assign(lcols.size(), ColBatch::Col());
+          for (size_t i = 0; i < lcols.size(); ++i) colbatch_from_vp(std::move(lcols[i]), SqlDataType::Int, 0, &col_out->cols[i]);
+          col_out->rows = G;
+          col_out->filled = true;
+        } else {
+          out_rows.reserve(G);
+          for (size_t g = 0; g < G; ++g) {
+            OutRow o;
+            o.row.values.reserve(lcols.size());
+            for (const vp::Column& c : lcols) o.row.values.push_back(c.text(g));
+            out_rows.push_back(std::move(o));
+          }
+        }
+        order_by.clear();   // in key order already
+      }
+    }
+    if (!lane_done) {
+    std::vector<JoinedRows> groups;
+    std::vector<std::vector<std::pair<const SqlExpr*, Val>>> star_vals;
+    bool star_grouped = false;
+    if (star_columnar) {
+      std::vector<const SqlExpr*> roots;
+      for (const auto& it : expanded) roots.push_back(it.expr.get());
+      if (having) roots.push_back(having.get());
+      for (const OrderKey& k : order_by) if (k.expr) roots.push_back(k.expr.get());
+      star_grouped = star_aggregate(db, sources, outer_scope, star_cols, star_shape, group_by, roots, &groups, &star_vals, &err);
+      if (!err.empty()) return make_error(err);
+      if (!star_grouped) {
+        groups.clear();
+        star_vals.clear();
+        rows = star_materialize(star_cols);
+      }
+      star_columnar = false;
+      std::vector<std::vector<uint32_t>>().swap(star_cols);
+    }
+    bool singleton_group = false;
+    if (!star_grouped) {
+
+    // A GROUP BY whose every column is already pinned to one value by a
+    // top-level WHERE equality (`WHERE linenumber = X AND orderno = Y GROUP
+    // BY linenumber, stockid, orderno`) can only ever produce a single group
+    // -- every surviving row shares the same key by construction. That is
+    // exactly the shape a correlated subquery takes when it aggregates a
+    // sibling table per outer row (a `fillable` or `daystilldue`-style
+    // correlated SUM), and building a hash map, hashing every group-by
+    // column of every row into a string key, and bucketing into
+    // vector<vector<JoinedRow>> just to discover there was only ever one
+    // bucket is pure overhead paid on every one of those calls. Skip it and
+    // treat the whole (already WHERE-filtered) row set as that one group --
+    // same as the group_by.empty() case just below, and just as correct: an
+    // empty `rows` still falls through to the general path so a real GROUP
+    // BY with zero matching rows still yields zero groups, not a spurious
+    // NULL-aggregate row.
+    //
+    // A row count of exactly 1 is the same guarantee by simpler means: one
+    // row can only ever group with itself, whatever the GROUP BY columns
+    // are, so there is nothing to prove about WHERE at all. This is the
+    // common case for a correlated per-outer-row subquery once WHERE has
+    // narrowed the sibling table down to the one row that actually belongs
+    // to this outer row -- pinning-by-WHERE can't see that (the pinned
+    // columns don't cover the whole GROUP BY list), but the row count alone
+    // already settles it.
+    singleton_group = !group_by.empty() && rows.size() == 1;
+    bool try_pinning = !group_by.empty() && rows.size() > 1 && where;
+    if (try_pinning) {
+      singleton_group = true;
+      std::vector<const SqlExpr*> wparts;
+      collect_conjuncts(where.get(), &wparts);
+      EvalCtx local_ctx; local_ctx.sources = &sources;
+      for (const auto& g : group_by) {
+        if (!g || g->op != ExprOp::Column) { singleton_group = false; break; }
+        size_t gs = 0, gc = 0;
+        if (lookup_column_here(local_ctx, *g, &gs, &gc) != ColumnLookup::Found) {
+          singleton_group = false;
+          break;
+        }
+        bool pinned = false;
+        for (const SqlExpr* p : wparts) {
+          if (pinned || !p || p->op != ExprOp::Eq || p->args.size() != 2) continue;
+          for (int side = 0; side < 2 && !pinned; ++side) {
+            const SqlExpr* col = p->args[side].get();
+            const SqlExpr* val = p->args[1 - side].get();
+            if (!col || col->op != ExprOp::Column) continue;
+            size_t ps = 0, pc = 0;
+            if (lookup_column_here(local_ctx, *col, &ps, &pc) != ColumnLookup::Found) continue;
+            if (ps != gs || pc != gc) continue;
+            if (expr_reads_local(val, local_ctx)) continue;  // must be row-invariant
+            pinned = true;
+          }
+        }
+        if (!pinned) { singleton_group = false; break; }
+      }
+    }
+
+    if (group_by.empty() || singleton_group) {
+      groups.push_back(std::move(rows));
+    } else {
+      struct ResolvedGroupCol {
+        size_t src;
+        size_t col_idx;
+      };
+      std::vector<ResolvedGroupCol> res_gcols;
+      bool all_cols_resolved = true;
+      for (const auto& g : group_by) {
+        if (!g || g->op != ExprOp::Column) { all_cols_resolved = false; break; }
+        size_t s = 0, c = 0;
+        EvalCtx init_ctx; init_ctx.sources = &sources;
+        const EvalCtx* owner = nullptr;
+        if (resolve_column(init_ctx, *g, &s, &c, &owner) && (owner == nullptr || owner == &init_ctx)) {
+          res_gcols.push_back({s, c});
+        } else {
+          all_cols_resolved = false;
+          break;
+        }
+      }
+
+      // Stored dictionary-coded or integer columns: each code is mapped once
+      // to a canonical id (by the same collation key the text path uses, so
+      // collation-equal spellings still share a group), and rows are
+      // grouped by those ids - no cell text, collation key or string hash per
+      // row. Groups keep first-seen order and are filled at their final size:
+      // 1.17M rows moved one by one into growing vectors was the whole of a
+      // GROUP BY salesperson's grouping time.
+      // The groups hold a copy of every row (and a group id per row) beside
+      // the rows themselves.
+      if (!reserve_rows(rows.size(), sizeof(JoinedRow) + 16)) return make_error("Query execution was interrupted");
+      bool coded = all_cols_resolved && !res_gcols.empty();
+      for (const auto& rgc : res_gcols) {
+        if (!coded) break;
+        const SqlTable* gt = rgc.src < sources.size() ? sources[rgc.src].table : nullptr;
+        if (!gt || rgc.col_idx >= gt->col_data.size() || gt->col_data[rgc.col_idx].size() != gt->row_count()) { coded = false; break; }
+        const ColumnStore& gcs = gt->col_data[rgc.col_idx];
+        // a result table's (a CTE's) column only when it holds typed integers: its text may hold numbers otherwise
+        if (gt->inferred_types && !vx::typed_integer(gcs)) { coded = false; break; }
+        if (!vx::dict_coded(gcs) && !vx::typed_integer(gcs)) { coded = false; break; }
+        if (vx::dict_coded(gcs) && vx::dict_size(gcs) > rows.size() * 2 && rows.size() < 4096) { coded = false; break; }
+      }
+      if (coded) {
+        const size_t ng = res_gcols.size();
+        // Per column: dictionary code -> canonical id (collation key's first code).
+        std::vector<std::vector<uint32_t>> canon(ng);
+        for (size_t k = 0; k < ng; ++k) {
+          const ColumnStore& gcs = sources[res_gcols[k].src].table->col_data[res_gcols[k].col_idx];
+          if (!vx::dict_coded(gcs)) continue;
+          const size_t nd = vx::dict_size(gcs);
+          canon[k].resize(nd);
+          std::unordered_map<std::string, uint32_t> first;
+          first.reserve(nd);
+          for (size_t c = 0; c < nd; ++c)
+            canon[k][c] = first.emplace(collate_key(vx::dict_view(gcs, (uint32_t)c)), (uint32_t)c).first->second;
+        }
+        std::vector<uint32_t> gid(rows.size());
+        std::unordered_map<std::string, uint32_t> tuple_to_group;
+        std::unordered_map<uint64_t, uint32_t> id_to_group;
+        int64_t null_group = -1;                  // ng == 1: the NULL key's group
+        std::vector<uint64_t> ids(ng);
+        std::vector<char> nulls(ng);              // NULL is its own key, not an id value
+        std::string tkey;
+        uint32_t ngroups = 0;
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+          const JoinedRow& r = rows[ri];
+          for (size_t k = 0; k < ng; ++k) {
+            const auto& rgc = res_gcols[k];
+            const size_t pr = rgc.src < r.parts.size() ? r.parts[rgc.src] : kNullRow;
+            const ColumnStore& gcs = sources[rgc.src].table->col_data[rgc.col_idx];
+            nulls[k] = 0;
+            if (pr == kNullRow || gcs.is_null(pr)) { ids[k] = 0; nulls[k] = 1; continue; }
+            if (!canon[k].empty()) {
+              uint32_t code = 0;
+              vx::decode_codes(gcs, pr, pr + 1, &code);
+              ids[k] = code < canon[k].size() ? canon[k][code] : code;
+            } else {
+              ids[k] = (uint64_t)vx::typed_int(gcs, pr);
+            }
+          }
+          uint32_t g;
+          if (ng == 1) {
+            if (nulls[0]) {
+              if (null_group < 0) null_group = ngroups;
+              g = (uint32_t)null_group;
+            } else {
+              g = id_to_group.emplace(ids[0], ngroups).first->second;
+            }
+          } else {
+            tkey.assign(reinterpret_cast<const char*>(ids.data()), ng * sizeof(uint64_t));
+            tkey.append(nulls.data(), ng);
+            g = tuple_to_group.emplace(tkey, ngroups).first->second;
+          }
+          if (g == ngroups) ++ngroups;
+          gid[ri] = g;
+        }
+        std::vector<size_t> sizes(ngroups, 0);
+        for (uint32_t g : gid) sizes[g]++;
+        groups.resize(ngroups);
+        for (uint32_t g = 0; g < ngroups; ++g) groups[g].reserve(sizes[g]);
+        for (size_t ri = 0; ri < rows.size(); ++ri) groups[gid[ri]].push_back(std::move(rows[ri]));
+      }
+      std::unordered_map<std::string, size_t> key_to_group;
+      if (!coded) key_to_group.reserve(std::min(rows.size(), (size_t)65536));
+      // GROUP BY an expression (sy * 320 + sx): each one that compiles is evaluated over every row at once, the
+      // key built from its text per row.
+      std::vector<vp::Column> vp_gkey(group_by.size());
+      std::vector<char> vp_gkey_ok(group_by.size(), 0);
+      if (!coded && !all_cols_resolved && rows.size() >= 256) {
+        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+        for (size_t k = 0; k < group_by.size(); ++k) {
+          const vp::Prog* P = vp::program_for(group_by[k].get(), vctx);
+          if (!P) continue;
+          std::string verr;
+          vp_gkey_ok[k] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_gkey[k], &verr) ? 1 : 0;
+        }
+      }
+      if (!coded) for (JoinedRow& r : rows) {
+        std::string key;
+        if (all_cols_resolved) {
+          for (const auto& rgc : res_gcols) {
+            if (rgc.src < r.parts.size() && r.parts[rgc.src] != kNullRow &&
+                rgc.src < sources.size() && sources[rgc.src].table) {
+              const std::string& val_str = sources[rgc.src].table->cell(r.parts[rgc.src], rgc.col_idx);
+              if (sql_is_null(val_str)) {
+                key += "\x01NULL";
+              } else {
+                append_collate_key(key, val_str);
+              }
+            } else {
+              key += "\x01NULL";
+            }
+            key += "\x02";
+          }
+        } else {
+          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+          ctx.sources = &sources;
+          ctx.row = &r;
+          ctx.err = &err;
+          const size_t ri = (size_t)(&r - rows.data());
+          for (size_t k = 0; k < group_by.size(); ++k) {
+            if (vp_gkey_ok[k] && ri < vp_gkey[k].size()) {
+              if (vp_gkey[k].is_null(ri)) key += "\x01NULL";
+              else append_collate_key(key, vp_gkey[k].text(ri));
+              key += "\x02";
+              continue;
+            }
+            Val v = eval_expr(group_by[k].get(), ctx);
+            if (v.null) {
+              key += "\x01NULL";
+            } else {
+              append_collate_key(key, v.str());
+            }
+            key += "\x02";
+          }
+          if (!err.empty()) return make_error(err);
+        }
+
+        auto it = key_to_group.find(key);
+        if (it == key_to_group.end()) {
+          size_t gidx = groups.size();
+          key_to_group.emplace(std::move(key), gidx);
+          groups.push_back({std::move(r)});
+        } else {
+          groups[it->second].push_back(std::move(r));
+        }
+      }
+    }
+    }   // !star_grouped
+
+    PivotPlan pivot;
+    if (aggregated) {
+      std::vector<const SqlExpr*> roots;
+      for (const auto& it : expanded) roots.push_back(it.expr.get());
+      if (having) roots.push_back(having.get());
+      for (const OrderKey& k : order_by) roots.push_back(k.expr.get());
+      pivot = pivot_plan(roots);
+      if (vx_trace_on() && !pivot.buckets.empty()) {
+        size_t na = 0;
+        for (const auto& b : pivot.buckets) na += b.aggs.size();
+        vx_trace("pivot: " + std::to_string(na) + " aggregates in " + std::to_string(pivot.buckets.size()) + " one-pass bucket(s)");
+      }
+    }
+
+    // ORDER BY .. LIMIT n over the groups of a join aggregate: their values
+    // are known already, so the sort keys alone are worked out for every
+    // group (and HAVING), the first n kept - ties in group order - and only
+    // those are projected. 20k customers printed to keep 20 was half of a
+    // `top customers` report.
+    // Every key a whole-number aggregate or a group column read as its
+    // dictionary rank: the keys as numbers in one array, no Val per group -
+    // 16k stock codes of a `top items` join each evaluated two keys.
+    bool star_fast_done = false;
+    if (star_grouped && !distinct && !having && keep_bound != SIZE_MAX && groups.size() > keep_bound * 2 + 64 &&
+        !order_by.empty() && order_by.size() <= 4) {
+      struct FK { int kind = 0; size_t pos = 0; size_t src = 0, col = 0; std::vector<int> rank; const SqlExpr* node = nullptr; };
+      std::vector<FK> fk(order_by.size());
+      bool ok = true;
+      for (size_t i = 0; ok && i < order_by.size(); ++i) {
+        const SqlExpr* ke = order_by[i].ordinal > 0 && (size_t)order_by[i].ordinal <= expanded.size()
+                                ? expanded[(size_t)order_by[i].ordinal - 1].expr.get() : order_by[i].expr.get();
+        if (!ke) { ok = false; break; }
+        fk[i].node = ke;
+        const auto& v0 = star_vals[0];
+        for (size_t k = 0; k < v0.size(); ++k) if (v0[k].first == ke) { fk[i].kind = 1; fk[i].pos = k; break; }
+        if (fk[i].kind == 1) continue;
+        size_t ks = 0, kc = 0;
+        EvalCtx sctx; sctx.sources = &sources;
+        if (ke->op == ExprOp::Column && lookup_column_here(sctx, *ke, &ks, &kc) == ColumnLookup::Found && ks < sources.size() &&
+            sources[ks].table && !sources[ks].table->inferred_types && order_types[i] == SqlDataType::Text) {
+          const SqlTable& kt = *sources[ks].table;
+          // A GROUP BY column, so one value (up to collation) per group.
+          bool grouped = false;
+          for (const auto& g : group_by) {
+            size_t gs = 0, gc = 0;
+            if (g && g->op == ExprOp::Column && lookup_column_here(sctx, *g, &gs, &gc) == ColumnLookup::Found && gs == ks && gc == kc) grouped = true;
+          }
+          if (grouped && kc < kt.col_data.size() && vx::dict_coded(kt.col_data[kc]) && !sql_type_numeric(kt.columns[kc].type) &&
+              kt.col_data[kc].size() == kt.row_count()) {
+            std::vector<QuerySource> only(sources.begin() + (long)ks, sources.begin() + (long)ks + 1);
+            EvalCtx lctx; lctx.sources = &only;
+            EvalCtx bctx; bctx.db = db; bctx.sources = &only;
+            // A copy: resolving binds a column to the scope it is read in, and the
+            // statement's own key is read later in the joined one.
+            const ExprPtr kcopy = clone_expr(ke);
+            vx::Source vs = vx::make_source(kcopy.get(), kt, lctx, bctx);
+            if (vs.kind == vx::Source::CodeCol && vs.bare_column) {
+              fk[i].kind = 2;
+              fk[i].src = ks;
+              fk[i].col = kc;
+              fk[i].rank = vx::dict_rank_of(kt, vs);
+              continue;
+            }
+          }
+        }
+        ok = false;
+      }
+      const size_t G = groups.size(), nk = order_by.size();
+      std::vector<double> kv(ok ? G * nk : 0);
+      std::vector<uint8_t> kn(ok ? G * nk : 0);
+      for (size_t gi = 0; ok && gi < G; ++gi) {
+        for (size_t i = 0; ok && i < nk; ++i) {
+          const FK& f = fk[i];
+          if (f.kind == 1) {
+            const auto& vs = star_vals[gi];
+            if (f.pos >= vs.size() || vs[f.pos].first != f.node) { ok = false; break; }
+            const Val& v = vs[f.pos].second;
+            if (v.null) { kn[gi * nk + i] = 1; continue; }
+            if (!v.numeric || v.num != std::floor(v.num) || std::fabs(v.num) > 9.0e15) { ok = false; break; }
+            kv[gi * nk + i] = v.num;
+          } else {
+            if (groups[gi].empty()) { ok = false; break; }
+            const JoinedRow& r0 = groups[gi][0];
+            const size_t pr = f.src < r0.parts.size() ? r0.parts[f.src] : kNullRow;
+            const ColumnStore& kcs = sources[f.src].table->col_data[f.col];
+            if (pr == kNullRow || kcs.is_null(pr)) { kn[gi * nk + i] = 1; continue; }
+            const uint32_t code = vx::code_at(kcs, pr);
+            const int rk = code < f.rank.size() ? f.rank[code] : -1;
+            if (rk < 0) kn[gi * nk + i] = 1;
+            else kv[gi * nk + i] = rk;
+          }
+        }
+      }
+      if (ok) {
+        std::vector<uint32_t> idx(G);
+        for (size_t gi = 0; gi < G; ++gi) idx[gi] = (uint32_t)gi;
+        auto nless = [&](uint32_t a, uint32_t b) {
+          for (size_t i = 0; i < nk; ++i) {
+            const bool xa = kn[a * nk + i], xb = kn[b * nk + i];
+            if (xa && xb) continue;
+            if (xa) return !order_by[i].descending;
+            if (xb) return order_by[i].descending;
+            const double x = kv[a * nk + i], y = kv[b * nk + i];
+            if (x == y) continue;
+            return order_by[i].descending ? x > y : x < y;
+          }
+          return a < b;
+        };
+        const size_t n = std::min(keep_bound, G);
+        std::partial_sort(idx.begin(), idx.begin() + (long)n, idx.end(), nless);
+        std::vector<JoinedRows> kept_groups(n);
+        std::vector<std::vector<std::pair<const SqlExpr*, Val>>> kept_vals(n);
+        for (size_t i = 0; i < n; ++i) {
+          kept_groups[i] = std::move(groups[idx[i]]);
+          kept_vals[i] = std::move(star_vals[idx[i]]);
+        }
+        groups.swap(kept_groups);
+        star_vals.swap(kept_vals);
+        star_fast_done = true;
+      }
+    }
+    if (!star_fast_done && !distinct && keep_bound != SIZE_MAX && groups.size() > keep_bound * 2 + 64 && !order_by.empty()) {
+      struct GK { std::vector<Val> keys; uint32_t gi; };
+      std::vector<GK> gk;
+      gk.reserve(groups.size());
+      EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope;
+      kctx.sources = &sources;
+      kctx.err = &err;
+      std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
+      for (size_t gi = 0; gi < groups.size(); ++gi) {
+        kctx.row = groups[gi].empty() ? nullptr : &groups[gi][0];
+        kctx.group = star_grouped ? nullptr : (aggregated ? &groups[gi] : nullptr);
+        if (star_grouped) {
+          kctx.agg_values = &star_vals[gi];
+        } else if (aggregated && !pivot.buckets.empty()) {
+          pivot_vals.clear();
+          if (pivot_group(pivot, kctx, &pivot_vals)) {
+            kctx.agg_values = &pivot_vals;
+          } else {
+            kctx.agg_values = nullptr;
+          }
+        } else {
+          kctx.agg_values = nullptr;
+        }
+        if (having) {
+          const bool keep = predicate_true(having.get(), kctx);
+          if (!err.empty()) return make_error(err);
+          if (!keep) continue;
+        }
+        GK k;
+        k.gi = (uint32_t)gi;
+        k.keys.reserve(order_by.size());
+        for (const OrderKey& ok : order_by) {
+          const SqlExpr* ke = ok.ordinal > 0 && (size_t)ok.ordinal <= expanded.size() ? expanded[(size_t)ok.ordinal - 1].expr.get()
+                                                                                      : ok.expr.get();
+          k.keys.push_back(eval_expr(ke, kctx));
+          if (!err.empty()) return make_error(err);
+        }
+        gk.push_back(std::move(k));
+      }
+      auto kless = [&](const GK& a, const GK& b) {
+        for (size_t i = 0; i < order_by.size(); ++i) {
+          const Val& x = a.keys[i];
+          const Val& y = b.keys[i];
+          if (x.null && y.null) continue;
+          if (x.null) return !order_by[i].descending;
+          if (y.null) return order_by[i].descending;
+          const int c = compare_vals_as(order_types[i], x, y);
+          if (c == 0) continue;
+          return order_by[i].descending ? c > 0 : c < 0;
+        }
+        return a.gi < b.gi;
+      };
+      const size_t n = std::min(keep_bound, gk.size());
+      std::partial_sort(gk.begin(), gk.begin() + (long)n, gk.end(), kless);
+      std::vector<JoinedRows> kept_groups(n);
+      std::vector<std::vector<std::pair<const SqlExpr*, Val>>> kept_vals(star_grouped ? n : 0);
+      for (size_t i = 0; i < n; ++i) {
+        kept_groups[i] = std::move(groups[gk[i].gi]);
+        if (star_grouped) kept_vals[i] = std::move(star_vals[gk[i].gi]);
+      }
+      groups.swap(kept_groups);
+      if (star_grouped) star_vals.swap(kept_vals);
+      having = nullptr;   // applied above
+    }
+
+    if (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0) {
+      const size_t needed = (size_t)offset + (size_t)limit;
+      if (groups.size() > needed) {
+        groups.resize(needed);
+        if (star_grouped && star_vals.size() > needed) star_vals.resize(needed);
+      }
+    }
+
+    // Parallel across groups, unless one group is a big share of the rows (a
+    // GROUP BY salesperson where one rep has most of the year): then that
+    // group's lane decides the time, and it is faster to take the groups in
+    // turn and evaluate each one's rows in parallel (group_values).
+    // Which row of a group supplies a bare column - one that is neither a group
+    // key nor inside an aggregate - is not settled by SQL: MariaDB gives the row
+    // its join met first, and it joins the smallest table first (primarymixedinventory
+    // groups `remotestock JOIN remotemapping` by stockid and sort_value and reads
+    // the quantity of the group's first row; MariaDB drives from the 13-row
+    // remotemapping, so the warehouse listed first there wins). ASQL joins in FROM
+    // order and met the rows in the big table's own order, so the same view named
+    // a different warehouse for some stock ids. Where the answer depends on it -
+    // inner joins only (an outer join fixes the order), plain-column group keys, a
+    // bare column in play - each group's rows are put in the order a smallest-table-first
+    // join would have produced them.
+    if (!group_by.empty() && !singleton_group && sources.size() > 1) {
+      bool inner_only = true;
+      for (bool l : join_is_left) if (l) inner_only = false;
+      std::vector<std::pair<size_t, size_t>> gkeys;
+      bool plain_keys = true;
+      EvalCtx lc;
+      lc.sources = &sources;
+      for (const auto& g : group_by) {
+        size_t gs = 0, gc = 0;
+        if (!g || g->op != ExprOp::Column || lookup_column_here(lc, *g, &gs, &gc) != ColumnLookup::Found) { plain_keys = false; break; }
+        gkeys.push_back({gs, gc});
+      }
+      if (inner_only && plain_keys) {
+        std::function<bool(const SqlExpr*, bool)> bare = [&](const SqlExpr* e, bool in_agg) -> bool {
+          if (!e) return false;
+          if (e->op == ExprOp::Func && is_aggregate_name(upper_of(e->name))) in_agg = true;
+          if (e->op == ExprOp::Column && !in_agg) {
+            size_t cs = 0, cc = 0;
+            if (lookup_column_here(lc, *e, &cs, &cc) != ColumnLookup::Found) return false;   // an outer reference
+            for (const auto& k : gkeys) if (k.first == cs && k.second == cc) return false;
+            return true;
+          }
+          for (const auto& a : e->args) if (bare(a.get(), in_agg)) return true;
+          return false;
+        };
+        bool has_bare = false;
+        for (const auto& it : expanded) if (!has_bare && bare(it.expr.get(), false)) has_bare = true;
+        if (!has_bare && having) has_bare = bare(having.get(), false);
+        for (const OrderKey& k : order_by) if (!has_bare && k.expr && bare(k.expr.get(), false)) has_bare = true;
+        if (has_bare) {
+          std::vector<size_t> order(sources.size());
+          for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+          std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            const size_t na = sources[a].table ? sources[a].table->row_count() : (size_t)-1;
+            const size_t nb = sources[b].table ? sources[b].table->row_count() : (size_t)-1;
+            return na < nb;
+          });
+          auto met_first = [&](const JoinedRow& a, const JoinedRow& b) {
+            for (size_t src : order) {
+              const size_t x = src < a.parts.size() ? a.parts[src] : kNullRow;
+              const size_t y = src < b.parts.size() ? b.parts[src] : kNullRow;
+              if (x != y) return x < y;
+            }
+            return false;
+          };
+          for (auto& g : groups) {
+            if (g.size() < 2 || std::is_sorted(g.begin(), g.end(), met_first)) continue;
+            std::stable_sort(g.begin(), g.end(), met_first);
+          }
+        }
+      }
+    }
+    phases.mark("group");
+    // Each output cell used to be copied out of its Val into the row and then
+    // the whole Val copied again into evaled_items, which only an ORDER BY by
+    // column number reads: three strings per cell where one will do. On the
+    // open-orders page that is 3,660 groups x 198 columns.
+    bool keep_items = false;
+    for (const OrderKey& k : order_by) if (k.ordinal > 0) keep_items = true;
+    auto push_out_value = [keep_items](OutRow& o, Val&& v, std::vector<Val>& kept) {
+      if (v.null) {
+        o.row.values.push_back(sql_null());
+      } else if (keep_items) {
+        o.row.values.push_back(v.str());
+      } else {
+        (void)v.str();
+        o.row.values.push_back(std::move(v.text));
+      }
+      if (keep_items) kept.push_back(std::move(v));
+    };
+    // A select item that is a stored column prints as that cell of the
+    // group's row -- eval_expr reads it from g[0] too -- so it is copied
+    // straight out, as the ungrouped path does, rather than made into a Val.
+    struct GroupDirectCol { bool ok = false; size_t src = 0, col = 0; };
+    std::vector<GroupDirectCol> gdirect(expanded.size());
+    // Resolving every select item is itself a cost (a SELECT * over ten joins
+    // is hundreds): only worth it when there are cells enough to save on.
+    // A select item bound to a stored column (every `*` column) prints as
+    // that cell of the group's row whatever the result's size: the gate below
+    // was for the cost of resolving each item by name, which a binding has
+    // already paid. One order's `SELECT *, SUM(..) GROUP BY` ran 42 columns
+    // through the interpreter per group - 230 us of a 440 us statement.
+    {
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        if (ordinal_needed[i]) continue;
+        const SqlExpr* ie = expanded[i].expr.get();
+        if (!ie || ie->op != ExprOp::Column || ie->bound_depth != 0 || ie->bound_src < 0 || ie->bound_col < 0) continue;
+        if ((size_t)ie->bound_src >= sources.size() || !sources[(size_t)ie->bound_src].table ||
+            (size_t)ie->bound_col >= sources[(size_t)ie->bound_src].table->columns.size()) continue;
+        gdirect[i] = {true, (size_t)ie->bound_src, (size_t)ie->bound_col};
+      }
+    }
+    // Each select item's aggregate arguments compiled now, on this thread, for the groups' workers (vp::warm);
+    // an item over the group's own row (pix DIV 320 of a GROUP BY pix) evaluated over every group at once.
+    std::vector<std::vector<std::string>> vp_gtext;   // sized only when the groups are many
+    if (!star_grouped) {
+      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+      for (size_t i = 0; i < expanded.size(); ++i) vp::warm(expanded[i].expr.get(), vctx);
+      if (having) vp::warm(having.get(), vctx);
+      for (const OrderKey& k : order_by) vp::warm(k.expr.get(), vctx);
+      if (!keep_items && groups.size() >= 256) {
+        vp_gtext.resize(expanded.size());
+        bool all_rows = true;
+        for (const auto& g : groups) if (g.empty()) { all_rows = false; break; }
+        for (size_t i = 0; i < expanded.size() && all_rows; ++i) {
+          if (gdirect[i].ok || expr_has_aggregate(expanded[i].expr)) continue;
+          const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
+          if (!P) continue;
+          vp::Column col;
+          std::string verr;
+          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return groups[j][0]; }, groups.size(), &col, &verr)) continue;
+          vp_gtext[i].resize(groups.size());
+          for (size_t j = 0; j < groups.size(); ++j) vp_gtext[i][j] = col.text(j);
+        }
+      }
+    }
+    // Many small groups (a screen pixel's fragments): a MIN / MAX / SUM / AVG / COUNT whose argument compiles
+    // is evaluated over every group's rows at once and folded per group here, on this thread; the groups'
+    // workers read the answers (ctx.agg_values), as they read star_vals. The groups' own rows stay where they
+    // are: flat points at them in group order. Arguments the interpreter has its own column paths for (a
+    // column, -column, column * n) are left to it.
+    std::vector<std::vector<std::pair<const SqlExpr*, Val>>> vp_aggs;
+    if (!star_grouped && pivot.buckets.empty() && aggregated && groups.size() >= 256 && vp::enabled()) {
+      std::vector<const SqlExpr*> aggs;
+      std::function<void(const SqlExpr*, int)> collect = [&](const SqlExpr* e, int depth) {
+        if (!e || depth > 64) return;
+        if (e->op == ExprOp::Func && !e->window && !e->negated && e->args.size() == 1 && e->args[0] &&
+            e->args[0]->op != ExprOp::Star && e->args[0]->op != ExprOp::Column && e->args[0]->op != ExprOp::Literal) {
+          const std::string& up = func_upper(e);
+          const SqlExpr* a = e->args[0].get();
+          const bool own_path = (a->op == ExprOp::Neg || a->op == ExprOp::Sub) && a->args.size() == 1 && a->args[0] && a->args[0]->op == ExprOp::Column;
+          const bool scaled = a->op == ExprOp::Mul && a->args.size() == 2 && a->args[0] && a->args[1] &&
+                              ((a->args[0]->op == ExprOp::Column && a->args[1]->op == ExprOp::Literal) ||
+                               (a->args[1]->op == ExprOp::Column && a->args[0]->op == ExprOp::Literal));
+          if (up == "MIN"sv || up == "MAX"sv || up == "COUNT"sv || ((up == "SUM"sv || up == "AVG"sv) && !own_path && !scaled)) {
+            if (std::find(aggs.begin(), aggs.end(), e) == aggs.end()) aggs.push_back(e);
+            return;
+          }
+        }
+        for (const auto& a : e->args) collect(a.get(), depth + 1);
+      };
+      for (const auto& it : expanded) collect(it.expr.get(), 0);
+      if (having) collect(having.get(), 0);
+      for (const OrderKey& k : order_by) collect(k.expr.get(), 0);
+      if (!aggs.empty()) {
+        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+        std::vector<const JoinedRow*> flat;
+        size_t total = 0;
+        for (const auto& g : groups) total += g.size();
+        flat.reserve(total);
+        for (const auto& g : groups) for (const JoinedRow& r : g) flat.push_back(&r);
+        for (const SqlExpr* agg : aggs) {
+          const vp::Prog* P = vp::program_for(agg->args[0].get(), vctx);
+          if (!P) continue;
+          vp::Column col;
+          std::string verr;
+          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return *flat[j]; }, total, &col, &verr)) continue;
+          if (vp_aggs.empty()) vp_aggs.resize(groups.size());
+          const std::string& up = func_upper(agg);
+          size_t at = 0;
+          for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const size_t n = groups[gi].size();
+            Val r;
+            if (up == "COUNT"sv) {
+              size_t cnt = 0;
+              for (size_t j = 0; j < n; ++j) if (!col.is_null(at + j)) ++cnt;
+              r = val_num((double)cnt);
+            } else if (up == "MIN"sv || up == "MAX"sv) {
+              bool has = false;
+              for (size_t j = 0; j < n; ++j) {
+                if (col.is_null(at + j)) continue;
+                Val v = col.at(at + j);
+                if (!has) { r = std::move(v); has = true; continue; }
+                const int c = compare_vals(v, r);
+                if (c != -2 && ((up == "MIN"sv && c < 0) || (up == "MAX"sv && c > 0))) r = std::move(v);
+              }
+              if (!has) r = val_null();
+            } else {
+              SumAcc acc;
+              for (size_t j = 0; j < n; ++j) acc.add(col.at(at + j));
+              r = up == "SUM"sv ? nt_adjust(agg, vctx, acc.finish(false)) : acc.finish(true);
+            }
+            vp_aggs[gi].emplace_back(agg, std::move(r));
+            at += n;
+          }
+        }
+      }
+    }
+    if (!keep_items && groups.size() * expanded.size() >= 4096) {
+      EvalCtx dctx; dctx.sources = &sources;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        const SqlExpr* ie = expanded[i].expr.get();
+        if (!ie || ie->op != ExprOp::Column) continue;
+        size_t ds = 0, dc = 0;
+        if (lookup_column_here(dctx, *ie, &ds, &dc) != ColumnLookup::Found) continue;
+        if (ds >= sources.size() || !sources[ds].table || dc >= sources[ds].table->columns.size()) continue;
+        gdirect[i] = {true, ds, dc};
+      }
+    }
+    auto push_group_cell = [&](OutRow& o, const JoinedRows& g, size_t i) {
+      const size_t pr = !g.empty() && gdirect[i].src < g[0].parts.size() ? g[0].parts[gdirect[i].src] : kNullRow;
+      o.row.values.push_back(pr == kNullRow ? sql_null() : sources[gdirect[i].src].table->cell(pr, gdirect[i].col));
+    };
+    // The groups' answer as a typed batch, for a consumer that takes one (a CTE's or a derived table's table):
+    // a stored column gathered from each group's first row (as push_group_cell reads it), every other item made per
+    // group with the context the emit below gives it (the aggregates' values made ahead, a program's text) - and
+    // no group emitted below (groups cleared). Not with a sort, DISTINCT, HAVING, a limit or a pivot.
+    if (col_out && vx_trace_on())
+      vx_trace(std::string("colbatch: grouped emit, sink=") + (join_sink ? "1" : "0") + " order=" + std::to_string(order_by.size()) +
+               " distinct=" + (distinct ? "1" : "0") + " having=" + (having ? "1" : "0") + " limit=" + std::to_string(limit) +
+               " keep_items=" + (keep_items ? "1" : "0") + " bounded=" + (bounded ? "1" : "0") + " pivot=" + (pivot.buckets.empty() ? "0" : "1"));
+    if (col_out && !join_sink && !distinct && !having && limit < 0 && offset <= 0 && !keep_items &&
+        !bounded && pivot.buckets.empty()) {
+      ColBatch& B = *col_out;
+      const size_t n = groups.size();
+      // the groups' sort keys, made as the emit makes them (a GROUP BY's implicit ORDER BY among them)
+      std::vector<OutRow> keyrows(order_by.empty() ? 0 : n);
+      B.cols.assign(expanded.size(), ColBatch::Col());
+      B.rows = n;
+      std::vector<size_t> interp;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+        if (gdirect[i].ok) {
+          const size_t ds = gdirect[i].src;
+          colbatch_gather(*sources[ds].table, gdirect[i].col, dest, 0, [&](size_t r) -> size_t {
+            const JoinedRows& g = groups[r];
+            return !g.empty() && ds < g[0].parts.size() ? g[0].parts[ds] : kNullRow;
+          }, n, &B.cols[i]);
+          continue;
+        }
+        interp.push_back(i);
+        B.cols[i].kind = ColBatch::Text;
+        B.cols[i].s.resize(n);
+      }
+      auto run = [&](size_t b0, size_t b1, std::string* e) {
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.err = e;
+        for (size_t gi = b0; gi < b1 && e->empty(); ++gi) {
+          JoinedRows& g = groups[gi];
+          ctx.row = g.empty() ? nullptr : &g[0];
+          ctx.group = aggregated ? &g : nullptr;
+          ctx.agg_values = nullptr;
+          if (star_grouped) { ctx.group = nullptr; ctx.agg_values = &star_vals[gi]; }
+          else if (!vp_aggs.empty()) ctx.agg_values = &vp_aggs[gi];
+          for (size_t i : interp) {
+            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { B.cols[i].s[gi] = std::move(vp_gtext[i][gi]); continue; }
+            Val v = eval_expr(expanded[i].expr.get(), ctx);
+            if (!e->empty()) return;
+            B.cols[i].s[gi] = v.null ? sql_null() : v.str();
+          }
+          if (!keyrows.empty())
+            for (const OrderKey& k : order_by) {
+              keyrows[gi].sort_keys.push_back(eval_expr(k.expr.get(), ctx));
+              if (!e->empty()) return;
+            }
+        }
+      };
+      if (!interp.empty() || !keyrows.empty()) {
+        if (n >= 64 && !SqlThreadPool::is_in_worker_thread()) {
+          const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
+          std::vector<std::string> errs(lanes);
+          SqlThreadPool::instance().parallel_for(n, 32, [&](size_t b0, size_t b1, size_t tid) {
+            if (tid >= lanes) tid = 0;
+            run(b0, b1, &errs[tid]);
+          });
+          for (const auto& e : errs) if (!e.empty()) return make_error(e);
+        } else {
+          std::string e;
+          run(0, n, &e);
+          if (!e.empty()) return make_error(e);
+        }
+      }
+      for (size_t i = 0; i < expanded.size(); ++i)
+        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+      if (!keyrows.empty()) {   // the order the rows would be sorted into below (a stable sort of them in group order)
+        std::vector<uint32_t> perm(n);
+        for (size_t r = 0; r < n; ++r) perm[r] = (uint32_t)r;
+        std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return row_less(keyrows[a], keyrows[b]); });
+        colbatch_permute(B, perm);
+      }
+      B.filled = true;
+      groups.clear();   // nothing left for the emit below
+    }
+    size_t biggest = 0, grouped_rows = 0;
+    for (const auto& g : groups) { biggest = std::max(biggest, g.size()); grouped_rows += g.size(); }
+    const size_t agg_lanes = SqlThreadPool::instance().num_workers() + 1;
+    const bool skewed = biggest >= 2048 && biggest * agg_lanes > grouped_rows;
+    if (groups.size() >= 64 && !skewed) {
+      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+      if (total_threads == 0) total_threads = 1;
+      // Output lists by chunk of groups, not by thread, so the rows come back
+      // in group order whichever thread finished first.
+      std::vector<std::vector<OutRow>> local_out((groups.size() + 31) / 32);
+      std::vector<std::string> local_errs(total_threads);
+
+      SqlThreadPool::instance().parallel_for(groups.size(), 32, [&](size_t bstart, size_t bend, size_t tid) {
+        if (tid >= total_threads) tid = 0;
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+        ctx.sources = &sources;
+        ctx.err = &local_errs[tid];
+        auto& l_out = local_out[bstart / 32];
+
+        std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
+        for (size_t gi = bstart; gi < bend; ++gi) {
+          auto& g = groups[gi];
+          ctx.row = g.empty() ? nullptr : &g[0];
+          ctx.group = aggregated ? &g : nullptr;
+          ctx.agg_values = nullptr;
+          if (star_grouped) {
+            ctx.group = nullptr;              // every aggregate is answered from star_vals
+            ctx.agg_values = &star_vals[gi];
+          } else if (aggregated && !pivot.buckets.empty()) {
+            pivot_vals.clear();
+            if (!pivot_group(pivot, ctx, &pivot_vals)) break;
+            ctx.agg_values = &pivot_vals;
+          } else if (!vp_aggs.empty()) {
+            ctx.agg_values = &vp_aggs[gi];
+          }
+
+          if (having && !predicate_true(having.get(), ctx)) {
+            if (!local_errs[tid].empty()) break;
+            continue;
+          }
+          if (!local_errs[tid].empty()) break;
+
+          OutRow o;
+          o.row.values.reserve(expanded.size());
+          std::vector<Val> evaled_items;
+          if (keep_items) evaled_items.reserve(expanded.size());
+          for (size_t i = 0; i < expanded.size(); ++i) {
+            if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); continue; }
+            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { o.row.values.push_back(std::move(vp_gtext[i][gi])); continue; }
+            Val v = eval_expr(expanded[i].expr.get(), ctx);
+            if (!local_errs[tid].empty()) break;
+            push_out_value(o, std::move(v), evaled_items);
+          }
+          for (const OrderKey& k : order_by) {
+            if (k.ordinal > 0) {
+              size_t idx = (size_t)k.ordinal - 1;
+              o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
+            } else {
+              o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
+            }
+            if (!local_errs[tid].empty()) break;
+          }
+          l_out.push_back(std::move(o));
+        }
+      });
+
+      for (const auto& l_err : local_errs) {
+        if (!l_err.empty()) return make_error(l_err);
+      }
+      phases.mark("groupeval");
+      plan_add(plan_step("group by", {}, star_grouped ? "star columnar" : pivot.buckets.empty() ? "hash of key text" : "hash of key text, pivot", groups.size()));
+      size_t total_out = 0;
+      for (const auto& lo : local_out) total_out += lo.size();
+      if (!bounded && !reserve_rows(total_out, sizeof(OutRow) + expanded.size() * kQmemCellBytes))
+        return make_error("Query execution was interrupted");
+      if (!bounded) out_rows.reserve(total_out);
+      for (auto& lo : local_out) {
+        for (auto& o : lo) emit_row(out_rows, std::move(o));
+      }
+    } else {
+      for (auto& g : groups) {
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+        ctx.sources = &sources;
+        ctx.row = g.empty() ? nullptr : &g[0];
+        ctx.group = aggregated ? &g : nullptr;
+        ctx.err = &err;
+        std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
+        if (star_grouped) {
+          ctx.group = nullptr;
+          ctx.agg_values = &star_vals[(size_t)(&g - groups.data())];
+        } else if (aggregated && !pivot.buckets.empty()) {
+          if (!pivot_group(pivot, ctx, &pivot_vals)) return make_error(err);
+          ctx.agg_values = &pivot_vals;
+        } else if (!vp_aggs.empty()) {
+          ctx.agg_values = &vp_aggs[(size_t)(&g - groups.data())];
+        }
+
+        if (having && !predicate_true(having.get(), ctx)) {
+          if (!err.empty()) return make_error(err);
+          continue;
+        }
+        if (!err.empty()) return make_error(err);
+
+        OutRow o;
+        o.row.values.reserve(expanded.size());
+        std::vector<Val> evaled_items;
+        if (keep_items) evaled_items.reserve(expanded.size());
+        uint64_t ev_ns = 0, cell_ns = 0;
+        const bool tr = vx_trace_on();
+        for (size_t i = 0; i < expanded.size(); ++i) {
+          const uint64_t e0 = tr ? hal_now_ns() : 0;
+          if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); if (tr) cell_ns += hal_now_ns() - e0; continue; }
+          if (!keep_items && i < vp_gtext.size() && (size_t)(&g - groups.data()) < vp_gtext[i].size()) {
+            o.row.values.push_back(std::move(vp_gtext[i][(size_t)(&g - groups.data())]));
+            if (tr) ev_ns += hal_now_ns() - e0;
+            continue;
+          }
+          Val v = eval_expr(expanded[i].expr.get(), ctx);
+          if (!err.empty()) return make_error(err);
+          push_out_value(o, std::move(v), evaled_items);
+          if (tr) ev_ns += hal_now_ns() - e0;
+        }
+        if (tr) vx_trace("group emit: cells=" + std::to_string(cell_ns / 1000) + "us interp=" + std::to_string(ev_ns / 1000) + "us (" +
+                         std::to_string(g.size()) + " rows)");
+        for (const OrderKey& k : order_by) {
+          if (k.ordinal > 0) {
+            size_t idx = (size_t)k.ordinal - 1;
+            o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
+          } else {
+            o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
+          }
+          if (!err.empty()) return make_error(err);
+        }
+        emit_row(out_rows, std::move(o));
+      }
+    }
+    }   // !lane_done
+  return std::nullopt;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -48306,927 +49290,12 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
     }
   } else {
-    // GROUP BY over integer lanes where the statement is that shape (lane_group_by): the groups below otherwise.
-    bool lane_done = false;
-    if (vx_trace_on() && (star_columnar || distinct || order_by.size() != group_by.size()))
-      vx_trace(std::string("group: not over lanes:") + (star_columnar ? " star-columnar" : "") + (distinct ? " DISTINCT" : "") +
-               (order_by.size() != group_by.size() ? " its own ORDER BY" : ""));
-    // Under an outer scope too (a CTE, a derived table, a subquery): the lanes are compiled with none, so a column
-    // from further out does not compile and the statement declines; a local column means the same in both.
-    if (!star_columnar && !distinct && !group_by.empty() && order_by.size() == group_by.size()) {
-      bool implicit_order = true;   // GROUP BY's own ORDER BY of its keys, as made above
-      for (size_t i = 0; i < order_by.size(); ++i)
-        if (order_by[i].expr != group_by[i] || order_by[i].ordinal > 0 || order_by[i].descending) implicit_order = false;
-      std::vector<vp::Column> lcols;
-      std::vector<std::vector<std::string>> ltext;
-      size_t G = 0;
-      if (implicit_order && lane_group_by(db, sources, outer_scope, rows, group_by, expanded, having, &lcols, &ltext, &G)) {
-        lane_done = true;
-        if (vx_trace_on())
-          vx_trace("group: " + std::to_string(G) + " groups over integer lanes (" + std::to_string(rows.size()) + " rows" +
-                   (lcols.empty() ? ", " + std::to_string(ltext.size()) + " kept, items interpreted)" : ")"));
-        plan_add(plan_step("group by", {}, lcols.empty() ? "integer lanes, items interpreted" : "integer lanes", lcols.empty() ? ltext.size() : G));
-        if (lcols.empty()) {
-          out_rows.reserve(ltext.size());
-          for (auto& cells : ltext) {
-            OutRow o;
-            o.row.values = std::move(cells);
-            out_rows.push_back(std::move(o));
-          }
-        } else if (col_out && limit < 0 && offset <= 0) {
-          col_out->cols.assign(lcols.size(), ColBatch::Col());
-          for (size_t i = 0; i < lcols.size(); ++i) colbatch_from_vp(std::move(lcols[i]), SqlDataType::Int, 0, &col_out->cols[i]);
-          col_out->rows = G;
-          col_out->filled = true;
-        } else {
-          out_rows.reserve(G);
-          for (size_t g = 0; g < G; ++g) {
-            OutRow o;
-            o.row.values.reserve(lcols.size());
-            for (const vp::Column& c : lcols) o.row.values.push_back(c.text(g));
-            out_rows.push_back(std::move(o));
-          }
-        }
-        order_by.clear();   // in key order already
-      }
-    }
-    if (!lane_done) {
-    std::vector<JoinedRows> groups;
-    std::vector<std::vector<std::pair<const SqlExpr*, Val>>> star_vals;
-    bool star_grouped = false;
-    if (star_columnar) {
-      std::vector<const SqlExpr*> roots;
-      for (const auto& it : expanded) roots.push_back(it.expr.get());
-      if (having) roots.push_back(having.get());
-      for (const OrderKey& k : order_by) if (k.expr) roots.push_back(k.expr.get());
-      star_grouped = star_aggregate(db, sources, outer_scope, star_cols, star_shape, group_by, roots, &groups, &star_vals, &err);
-      if (!err.empty()) return make_error(err);
-      if (!star_grouped) {
-        groups.clear();
-        star_vals.clear();
-        rows = star_materialize(star_cols);
-      }
-      star_columnar = false;
-      std::vector<std::vector<uint32_t>>().swap(star_cols);
-    }
-    bool singleton_group = false;
-    if (!star_grouped) {
-
-    // A GROUP BY whose every column is already pinned to one value by a
-    // top-level WHERE equality (`WHERE linenumber = X AND orderno = Y GROUP
-    // BY linenumber, stockid, orderno`) can only ever produce a single group
-    // -- every surviving row shares the same key by construction. That is
-    // exactly the shape a correlated subquery takes when it aggregates a
-    // sibling table per outer row (a `fillable` or `daystilldue`-style
-    // correlated SUM), and building a hash map, hashing every group-by
-    // column of every row into a string key, and bucketing into
-    // vector<vector<JoinedRow>> just to discover there was only ever one
-    // bucket is pure overhead paid on every one of those calls. Skip it and
-    // treat the whole (already WHERE-filtered) row set as that one group --
-    // same as the group_by.empty() case just below, and just as correct: an
-    // empty `rows` still falls through to the general path so a real GROUP
-    // BY with zero matching rows still yields zero groups, not a spurious
-    // NULL-aggregate row.
-    //
-    // A row count of exactly 1 is the same guarantee by simpler means: one
-    // row can only ever group with itself, whatever the GROUP BY columns
-    // are, so there is nothing to prove about WHERE at all. This is the
-    // common case for a correlated per-outer-row subquery once WHERE has
-    // narrowed the sibling table down to the one row that actually belongs
-    // to this outer row -- pinning-by-WHERE can't see that (the pinned
-    // columns don't cover the whole GROUP BY list), but the row count alone
-    // already settles it.
-    singleton_group = !group_by.empty() && rows.size() == 1;
-    bool try_pinning = !group_by.empty() && rows.size() > 1 && where;
-    if (try_pinning) {
-      singleton_group = true;
-      std::vector<const SqlExpr*> wparts;
-      collect_conjuncts(where.get(), &wparts);
-      EvalCtx local_ctx; local_ctx.sources = &sources;
-      for (const auto& g : group_by) {
-        if (!g || g->op != ExprOp::Column) { singleton_group = false; break; }
-        size_t gs = 0, gc = 0;
-        if (lookup_column_here(local_ctx, *g, &gs, &gc) != ColumnLookup::Found) {
-          singleton_group = false;
-          break;
-        }
-        bool pinned = false;
-        for (const SqlExpr* p : wparts) {
-          if (pinned || !p || p->op != ExprOp::Eq || p->args.size() != 2) continue;
-          for (int side = 0; side < 2 && !pinned; ++side) {
-            const SqlExpr* col = p->args[side].get();
-            const SqlExpr* val = p->args[1 - side].get();
-            if (!col || col->op != ExprOp::Column) continue;
-            size_t ps = 0, pc = 0;
-            if (lookup_column_here(local_ctx, *col, &ps, &pc) != ColumnLookup::Found) continue;
-            if (ps != gs || pc != gc) continue;
-            if (expr_reads_local(val, local_ctx)) continue;  // must be row-invariant
-            pinned = true;
-          }
-        }
-        if (!pinned) { singleton_group = false; break; }
-      }
-    }
-
-    if (group_by.empty() || singleton_group) {
-      groups.push_back(std::move(rows));
-    } else {
-      struct ResolvedGroupCol {
-        size_t src;
-        size_t col_idx;
-      };
-      std::vector<ResolvedGroupCol> res_gcols;
-      bool all_cols_resolved = true;
-      for (const auto& g : group_by) {
-        if (!g || g->op != ExprOp::Column) { all_cols_resolved = false; break; }
-        size_t s = 0, c = 0;
-        EvalCtx init_ctx; init_ctx.sources = &sources;
-        const EvalCtx* owner = nullptr;
-        if (resolve_column(init_ctx, *g, &s, &c, &owner) && (owner == nullptr || owner == &init_ctx)) {
-          res_gcols.push_back({s, c});
-        } else {
-          all_cols_resolved = false;
-          break;
-        }
-      }
-
-      // Stored dictionary-coded or integer columns: each code is mapped once
-      // to a canonical id (by the same collation key the text path uses, so
-      // collation-equal spellings still share a group), and rows are
-      // grouped by those ids - no cell text, collation key or string hash per
-      // row. Groups keep first-seen order and are filled at their final size:
-      // 1.17M rows moved one by one into growing vectors was the whole of a
-      // GROUP BY salesperson's grouping time.
-      // The groups hold a copy of every row (and a group id per row) beside
-      // the rows themselves.
-      if (!reserve_rows(rows.size(), sizeof(JoinedRow) + 16)) return make_error("Query execution was interrupted");
-      bool coded = all_cols_resolved && !res_gcols.empty();
-      for (const auto& rgc : res_gcols) {
-        if (!coded) break;
-        const SqlTable* gt = rgc.src < sources.size() ? sources[rgc.src].table : nullptr;
-        if (!gt || rgc.col_idx >= gt->col_data.size() || gt->col_data[rgc.col_idx].size() != gt->row_count()) { coded = false; break; }
-        const ColumnStore& gcs = gt->col_data[rgc.col_idx];
-        // a result table's (a CTE's) column only when it holds typed integers: its text may hold numbers otherwise
-        if (gt->inferred_types && !vx::typed_integer(gcs)) { coded = false; break; }
-        if (!vx::dict_coded(gcs) && !vx::typed_integer(gcs)) { coded = false; break; }
-        if (vx::dict_coded(gcs) && vx::dict_size(gcs) > rows.size() * 2 && rows.size() < 4096) { coded = false; break; }
-      }
-      if (coded) {
-        const size_t ng = res_gcols.size();
-        // Per column: dictionary code -> canonical id (collation key's first code).
-        std::vector<std::vector<uint32_t>> canon(ng);
-        for (size_t k = 0; k < ng; ++k) {
-          const ColumnStore& gcs = sources[res_gcols[k].src].table->col_data[res_gcols[k].col_idx];
-          if (!vx::dict_coded(gcs)) continue;
-          const size_t nd = vx::dict_size(gcs);
-          canon[k].resize(nd);
-          std::unordered_map<std::string, uint32_t> first;
-          first.reserve(nd);
-          for (size_t c = 0; c < nd; ++c)
-            canon[k][c] = first.emplace(collate_key(vx::dict_view(gcs, (uint32_t)c)), (uint32_t)c).first->second;
-        }
-        std::vector<uint32_t> gid(rows.size());
-        std::unordered_map<std::string, uint32_t> tuple_to_group;
-        std::unordered_map<uint64_t, uint32_t> id_to_group;
-        int64_t null_group = -1;                  // ng == 1: the NULL key's group
-        std::vector<uint64_t> ids(ng);
-        std::vector<char> nulls(ng);              // NULL is its own key, not an id value
-        std::string tkey;
-        uint32_t ngroups = 0;
-        for (size_t ri = 0; ri < rows.size(); ++ri) {
-          const JoinedRow& r = rows[ri];
-          for (size_t k = 0; k < ng; ++k) {
-            const auto& rgc = res_gcols[k];
-            const size_t pr = rgc.src < r.parts.size() ? r.parts[rgc.src] : kNullRow;
-            const ColumnStore& gcs = sources[rgc.src].table->col_data[rgc.col_idx];
-            nulls[k] = 0;
-            if (pr == kNullRow || gcs.is_null(pr)) { ids[k] = 0; nulls[k] = 1; continue; }
-            if (!canon[k].empty()) {
-              uint32_t code = 0;
-              vx::decode_codes(gcs, pr, pr + 1, &code);
-              ids[k] = code < canon[k].size() ? canon[k][code] : code;
-            } else {
-              ids[k] = (uint64_t)vx::typed_int(gcs, pr);
-            }
-          }
-          uint32_t g;
-          if (ng == 1) {
-            if (nulls[0]) {
-              if (null_group < 0) null_group = ngroups;
-              g = (uint32_t)null_group;
-            } else {
-              g = id_to_group.emplace(ids[0], ngroups).first->second;
-            }
-          } else {
-            tkey.assign(reinterpret_cast<const char*>(ids.data()), ng * sizeof(uint64_t));
-            tkey.append(nulls.data(), ng);
-            g = tuple_to_group.emplace(tkey, ngroups).first->second;
-          }
-          if (g == ngroups) ++ngroups;
-          gid[ri] = g;
-        }
-        std::vector<size_t> sizes(ngroups, 0);
-        for (uint32_t g : gid) sizes[g]++;
-        groups.resize(ngroups);
-        for (uint32_t g = 0; g < ngroups; ++g) groups[g].reserve(sizes[g]);
-        for (size_t ri = 0; ri < rows.size(); ++ri) groups[gid[ri]].push_back(std::move(rows[ri]));
-      }
-      std::unordered_map<std::string, size_t> key_to_group;
-      if (!coded) key_to_group.reserve(std::min(rows.size(), (size_t)65536));
-      // GROUP BY an expression (sy * 320 + sx): each one that compiles is evaluated over every row at once, the
-      // key built from its text per row.
-      std::vector<vp::Column> vp_gkey(group_by.size());
-      std::vector<char> vp_gkey_ok(group_by.size(), 0);
-      if (!coded && !all_cols_resolved && rows.size() >= 256) {
-        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
-        for (size_t k = 0; k < group_by.size(); ++k) {
-          const vp::Prog* P = vp::program_for(group_by[k].get(), vctx);
-          if (!P) continue;
-          std::string verr;
-          vp_gkey_ok[k] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_gkey[k], &verr) ? 1 : 0;
-        }
-      }
-      if (!coded) for (JoinedRow& r : rows) {
-        std::string key;
-        if (all_cols_resolved) {
-          for (const auto& rgc : res_gcols) {
-            if (rgc.src < r.parts.size() && r.parts[rgc.src] != kNullRow &&
-                rgc.src < sources.size() && sources[rgc.src].table) {
-              const std::string& val_str = sources[rgc.src].table->cell(r.parts[rgc.src], rgc.col_idx);
-              if (sql_is_null(val_str)) {
-                key += "\x01NULL";
-              } else {
-                append_collate_key(key, val_str);
-              }
-            } else {
-              key += "\x01NULL";
-            }
-            key += "\x02";
-          }
-        } else {
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-          ctx.sources = &sources;
-          ctx.row = &r;
-          ctx.err = &err;
-          const size_t ri = (size_t)(&r - rows.data());
-          for (size_t k = 0; k < group_by.size(); ++k) {
-            if (vp_gkey_ok[k] && ri < vp_gkey[k].size()) {
-              if (vp_gkey[k].is_null(ri)) key += "\x01NULL";
-              else append_collate_key(key, vp_gkey[k].text(ri));
-              key += "\x02";
-              continue;
-            }
-            Val v = eval_expr(group_by[k].get(), ctx);
-            if (v.null) {
-              key += "\x01NULL";
-            } else {
-              append_collate_key(key, v.str());
-            }
-            key += "\x02";
-          }
-          if (!err.empty()) return make_error(err);
-        }
-
-        auto it = key_to_group.find(key);
-        if (it == key_to_group.end()) {
-          size_t gidx = groups.size();
-          key_to_group.emplace(std::move(key), gidx);
-          groups.push_back({std::move(r)});
-        } else {
-          groups[it->second].push_back(std::move(r));
-        }
-      }
-    }
-    }   // !star_grouped
-
-    PivotPlan pivot;
-    if (aggregated) {
-      std::vector<const SqlExpr*> roots;
-      for (const auto& it : expanded) roots.push_back(it.expr.get());
-      if (having) roots.push_back(having.get());
-      for (const OrderKey& k : order_by) roots.push_back(k.expr.get());
-      pivot = pivot_plan(roots);
-      if (vx_trace_on() && !pivot.buckets.empty()) {
-        size_t na = 0;
-        for (const auto& b : pivot.buckets) na += b.aggs.size();
-        vx_trace("pivot: " + std::to_string(na) + " aggregates in " + std::to_string(pivot.buckets.size()) + " one-pass bucket(s)");
-      }
-    }
-
-    // ORDER BY .. LIMIT n over the groups of a join aggregate: their values
-    // are known already, so the sort keys alone are worked out for every
-    // group (and HAVING), the first n kept - ties in group order - and only
-    // those are projected. 20k customers printed to keep 20 was half of a
-    // `top customers` report.
-    // Every key a whole-number aggregate or a group column read as its
-    // dictionary rank: the keys as numbers in one array, no Val per group -
-    // 16k stock codes of a `top items` join each evaluated two keys.
-    bool star_fast_done = false;
-    if (star_grouped && !distinct && !having && keep_bound != SIZE_MAX && groups.size() > keep_bound * 2 + 64 &&
-        !order_by.empty() && order_by.size() <= 4) {
-      struct FK { int kind = 0; size_t pos = 0; size_t src = 0, col = 0; std::vector<int> rank; const SqlExpr* node = nullptr; };
-      std::vector<FK> fk(order_by.size());
-      bool ok = true;
-      for (size_t i = 0; ok && i < order_by.size(); ++i) {
-        const SqlExpr* ke = order_by[i].ordinal > 0 && (size_t)order_by[i].ordinal <= expanded.size()
-                                ? expanded[(size_t)order_by[i].ordinal - 1].expr.get() : order_by[i].expr.get();
-        if (!ke) { ok = false; break; }
-        fk[i].node = ke;
-        const auto& v0 = star_vals[0];
-        for (size_t k = 0; k < v0.size(); ++k) if (v0[k].first == ke) { fk[i].kind = 1; fk[i].pos = k; break; }
-        if (fk[i].kind == 1) continue;
-        size_t ks = 0, kc = 0;
-        EvalCtx sctx; sctx.sources = &sources;
-        if (ke->op == ExprOp::Column && lookup_column_here(sctx, *ke, &ks, &kc) == ColumnLookup::Found && ks < sources.size() &&
-            sources[ks].table && !sources[ks].table->inferred_types && order_types[i] == SqlDataType::Text) {
-          const SqlTable& kt = *sources[ks].table;
-          // A GROUP BY column, so one value (up to collation) per group.
-          bool grouped = false;
-          for (const auto& g : group_by) {
-            size_t gs = 0, gc = 0;
-            if (g && g->op == ExprOp::Column && lookup_column_here(sctx, *g, &gs, &gc) == ColumnLookup::Found && gs == ks && gc == kc) grouped = true;
-          }
-          if (grouped && kc < kt.col_data.size() && vx::dict_coded(kt.col_data[kc]) && !sql_type_numeric(kt.columns[kc].type) &&
-              kt.col_data[kc].size() == kt.row_count()) {
-            std::vector<QuerySource> only(sources.begin() + (long)ks, sources.begin() + (long)ks + 1);
-            EvalCtx lctx; lctx.sources = &only;
-            EvalCtx bctx; bctx.db = db; bctx.sources = &only;
-            // A copy: resolving binds a column to the scope it is read in, and the
-            // statement's own key is read later in the joined one.
-            const ExprPtr kcopy = clone_expr(ke);
-            vx::Source vs = vx::make_source(kcopy.get(), kt, lctx, bctx);
-            if (vs.kind == vx::Source::CodeCol && vs.bare_column) {
-              fk[i].kind = 2;
-              fk[i].src = ks;
-              fk[i].col = kc;
-              fk[i].rank = vx::dict_rank_of(kt, vs);
-              continue;
-            }
-          }
-        }
-        ok = false;
-      }
-      const size_t G = groups.size(), nk = order_by.size();
-      std::vector<double> kv(ok ? G * nk : 0);
-      std::vector<uint8_t> kn(ok ? G * nk : 0);
-      for (size_t gi = 0; ok && gi < G; ++gi) {
-        for (size_t i = 0; ok && i < nk; ++i) {
-          const FK& f = fk[i];
-          if (f.kind == 1) {
-            const auto& vs = star_vals[gi];
-            if (f.pos >= vs.size() || vs[f.pos].first != f.node) { ok = false; break; }
-            const Val& v = vs[f.pos].second;
-            if (v.null) { kn[gi * nk + i] = 1; continue; }
-            if (!v.numeric || v.num != std::floor(v.num) || std::fabs(v.num) > 9.0e15) { ok = false; break; }
-            kv[gi * nk + i] = v.num;
-          } else {
-            if (groups[gi].empty()) { ok = false; break; }
-            const JoinedRow& r0 = groups[gi][0];
-            const size_t pr = f.src < r0.parts.size() ? r0.parts[f.src] : kNullRow;
-            const ColumnStore& kcs = sources[f.src].table->col_data[f.col];
-            if (pr == kNullRow || kcs.is_null(pr)) { kn[gi * nk + i] = 1; continue; }
-            const uint32_t code = vx::code_at(kcs, pr);
-            const int rk = code < f.rank.size() ? f.rank[code] : -1;
-            if (rk < 0) kn[gi * nk + i] = 1;
-            else kv[gi * nk + i] = rk;
-          }
-        }
-      }
-      if (ok) {
-        std::vector<uint32_t> idx(G);
-        for (size_t gi = 0; gi < G; ++gi) idx[gi] = (uint32_t)gi;
-        auto nless = [&](uint32_t a, uint32_t b) {
-          for (size_t i = 0; i < nk; ++i) {
-            const bool xa = kn[a * nk + i], xb = kn[b * nk + i];
-            if (xa && xb) continue;
-            if (xa) return !order_by[i].descending;
-            if (xb) return order_by[i].descending;
-            const double x = kv[a * nk + i], y = kv[b * nk + i];
-            if (x == y) continue;
-            return order_by[i].descending ? x > y : x < y;
-          }
-          return a < b;
-        };
-        const size_t n = std::min(keep_bound, G);
-        std::partial_sort(idx.begin(), idx.begin() + (long)n, idx.end(), nless);
-        std::vector<JoinedRows> kept_groups(n);
-        std::vector<std::vector<std::pair<const SqlExpr*, Val>>> kept_vals(n);
-        for (size_t i = 0; i < n; ++i) {
-          kept_groups[i] = std::move(groups[idx[i]]);
-          kept_vals[i] = std::move(star_vals[idx[i]]);
-        }
-        groups.swap(kept_groups);
-        star_vals.swap(kept_vals);
-        star_fast_done = true;
-      }
-    }
-    if (!star_fast_done && !distinct && keep_bound != SIZE_MAX && groups.size() > keep_bound * 2 + 64 && !order_by.empty()) {
-      struct GK { std::vector<Val> keys; uint32_t gi; };
-      std::vector<GK> gk;
-      gk.reserve(groups.size());
-      EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope;
-      kctx.sources = &sources;
-      kctx.err = &err;
-      std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
-      for (size_t gi = 0; gi < groups.size(); ++gi) {
-        kctx.row = groups[gi].empty() ? nullptr : &groups[gi][0];
-        kctx.group = star_grouped ? nullptr : (aggregated ? &groups[gi] : nullptr);
-        if (star_grouped) {
-          kctx.agg_values = &star_vals[gi];
-        } else if (aggregated && !pivot.buckets.empty()) {
-          pivot_vals.clear();
-          if (pivot_group(pivot, kctx, &pivot_vals)) {
-            kctx.agg_values = &pivot_vals;
-          } else {
-            kctx.agg_values = nullptr;
-          }
-        } else {
-          kctx.agg_values = nullptr;
-        }
-        if (having) {
-          const bool keep = predicate_true(having.get(), kctx);
-          if (!err.empty()) return make_error(err);
-          if (!keep) continue;
-        }
-        GK k;
-        k.gi = (uint32_t)gi;
-        k.keys.reserve(order_by.size());
-        for (const OrderKey& ok : order_by) {
-          const SqlExpr* ke = ok.ordinal > 0 && (size_t)ok.ordinal <= expanded.size() ? expanded[(size_t)ok.ordinal - 1].expr.get()
-                                                                                      : ok.expr.get();
-          k.keys.push_back(eval_expr(ke, kctx));
-          if (!err.empty()) return make_error(err);
-        }
-        gk.push_back(std::move(k));
-      }
-      auto kless = [&](const GK& a, const GK& b) {
-        for (size_t i = 0; i < order_by.size(); ++i) {
-          const Val& x = a.keys[i];
-          const Val& y = b.keys[i];
-          if (x.null && y.null) continue;
-          if (x.null) return !order_by[i].descending;
-          if (y.null) return order_by[i].descending;
-          const int c = compare_vals_as(order_types[i], x, y);
-          if (c == 0) continue;
-          return order_by[i].descending ? c > 0 : c < 0;
-        }
-        return a.gi < b.gi;
-      };
-      const size_t n = std::min(keep_bound, gk.size());
-      std::partial_sort(gk.begin(), gk.begin() + (long)n, gk.end(), kless);
-      std::vector<JoinedRows> kept_groups(n);
-      std::vector<std::vector<std::pair<const SqlExpr*, Val>>> kept_vals(star_grouped ? n : 0);
-      for (size_t i = 0; i < n; ++i) {
-        kept_groups[i] = std::move(groups[gk[i].gi]);
-        if (star_grouped) kept_vals[i] = std::move(star_vals[gk[i].gi]);
-      }
-      groups.swap(kept_groups);
-      if (star_grouped) star_vals.swap(kept_vals);
-      having = nullptr;   // applied above
-    }
-
-    if (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0) {
-      const size_t needed = (size_t)offset + (size_t)limit;
-      if (groups.size() > needed) {
-        groups.resize(needed);
-        if (star_grouped && star_vals.size() > needed) star_vals.resize(needed);
-      }
-    }
-
-    // Parallel across groups, unless one group is a big share of the rows (a
-    // GROUP BY salesperson where one rep has most of the year): then that
-    // group's lane decides the time, and it is faster to take the groups in
-    // turn and evaluate each one's rows in parallel (group_values).
-    // Which row of a group supplies a bare column - one that is neither a group
-    // key nor inside an aggregate - is not settled by SQL: MariaDB gives the row
-    // its join met first, and it joins the smallest table first (primarymixedinventory
-    // groups `remotestock JOIN remotemapping` by stockid and sort_value and reads
-    // the quantity of the group's first row; MariaDB drives from the 13-row
-    // remotemapping, so the warehouse listed first there wins). ASQL joins in FROM
-    // order and met the rows in the big table's own order, so the same view named
-    // a different warehouse for some stock ids. Where the answer depends on it -
-    // inner joins only (an outer join fixes the order), plain-column group keys, a
-    // bare column in play - each group's rows are put in the order a smallest-table-first
-    // join would have produced them.
-    if (!group_by.empty() && !singleton_group && sources.size() > 1) {
-      bool inner_only = true;
-      for (bool l : join_is_left) if (l) inner_only = false;
-      std::vector<std::pair<size_t, size_t>> gkeys;
-      bool plain_keys = true;
-      EvalCtx lc;
-      lc.sources = &sources;
-      for (const auto& g : group_by) {
-        size_t gs = 0, gc = 0;
-        if (!g || g->op != ExprOp::Column || lookup_column_here(lc, *g, &gs, &gc) != ColumnLookup::Found) { plain_keys = false; break; }
-        gkeys.push_back({gs, gc});
-      }
-      if (inner_only && plain_keys) {
-        std::function<bool(const SqlExpr*, bool)> bare = [&](const SqlExpr* e, bool in_agg) -> bool {
-          if (!e) return false;
-          if (e->op == ExprOp::Func && is_aggregate_name(upper_of(e->name))) in_agg = true;
-          if (e->op == ExprOp::Column && !in_agg) {
-            size_t cs = 0, cc = 0;
-            if (lookup_column_here(lc, *e, &cs, &cc) != ColumnLookup::Found) return false;   // an outer reference
-            for (const auto& k : gkeys) if (k.first == cs && k.second == cc) return false;
-            return true;
-          }
-          for (const auto& a : e->args) if (bare(a.get(), in_agg)) return true;
-          return false;
-        };
-        bool has_bare = false;
-        for (const auto& it : expanded) if (!has_bare && bare(it.expr.get(), false)) has_bare = true;
-        if (!has_bare && having) has_bare = bare(having.get(), false);
-        for (const OrderKey& k : order_by) if (!has_bare && k.expr && bare(k.expr.get(), false)) has_bare = true;
-        if (has_bare) {
-          std::vector<size_t> order(sources.size());
-          for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-          std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            const size_t na = sources[a].table ? sources[a].table->row_count() : (size_t)-1;
-            const size_t nb = sources[b].table ? sources[b].table->row_count() : (size_t)-1;
-            return na < nb;
-          });
-          auto met_first = [&](const JoinedRow& a, const JoinedRow& b) {
-            for (size_t src : order) {
-              const size_t x = src < a.parts.size() ? a.parts[src] : kNullRow;
-              const size_t y = src < b.parts.size() ? b.parts[src] : kNullRow;
-              if (x != y) return x < y;
-            }
-            return false;
-          };
-          for (auto& g : groups) {
-            if (g.size() < 2 || std::is_sorted(g.begin(), g.end(), met_first)) continue;
-            std::stable_sort(g.begin(), g.end(), met_first);
-          }
-        }
-      }
-    }
-    phases.mark("group");
-    // Each output cell used to be copied out of its Val into the row and then
-    // the whole Val copied again into evaled_items, which only an ORDER BY by
-    // column number reads: three strings per cell where one will do. On the
-    // open-orders page that is 3,660 groups x 198 columns.
-    bool keep_items = false;
-    for (const OrderKey& k : order_by) if (k.ordinal > 0) keep_items = true;
-    auto push_out_value = [keep_items](OutRow& o, Val&& v, std::vector<Val>& kept) {
-      if (v.null) {
-        o.row.values.push_back(sql_null());
-      } else if (keep_items) {
-        o.row.values.push_back(v.str());
-      } else {
-        (void)v.str();
-        o.row.values.push_back(std::move(v.text));
-      }
-      if (keep_items) kept.push_back(std::move(v));
-    };
-    // A select item that is a stored column prints as that cell of the
-    // group's row -- eval_expr reads it from g[0] too -- so it is copied
-    // straight out, as the ungrouped path does, rather than made into a Val.
-    struct GroupDirectCol { bool ok = false; size_t src = 0, col = 0; };
-    std::vector<GroupDirectCol> gdirect(expanded.size());
-    // Resolving every select item is itself a cost (a SELECT * over ten joins
-    // is hundreds): only worth it when there are cells enough to save on.
-    // A select item bound to a stored column (every `*` column) prints as
-    // that cell of the group's row whatever the result's size: the gate below
-    // was for the cost of resolving each item by name, which a binding has
-    // already paid. One order's `SELECT *, SUM(..) GROUP BY` ran 42 columns
-    // through the interpreter per group - 230 us of a 440 us statement.
-    {
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        if (ordinal_needed[i]) continue;
-        const SqlExpr* ie = expanded[i].expr.get();
-        if (!ie || ie->op != ExprOp::Column || ie->bound_depth != 0 || ie->bound_src < 0 || ie->bound_col < 0) continue;
-        if ((size_t)ie->bound_src >= sources.size() || !sources[(size_t)ie->bound_src].table ||
-            (size_t)ie->bound_col >= sources[(size_t)ie->bound_src].table->columns.size()) continue;
-        gdirect[i] = {true, (size_t)ie->bound_src, (size_t)ie->bound_col};
-      }
-    }
-    // Each select item's aggregate arguments compiled now, on this thread, for the groups' workers (vp::warm);
-    // an item over the group's own row (pix DIV 320 of a GROUP BY pix) evaluated over every group at once.
-    std::vector<std::vector<std::string>> vp_gtext;   // sized only when the groups are many
-    if (!star_grouped) {
-      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
-      for (size_t i = 0; i < expanded.size(); ++i) vp::warm(expanded[i].expr.get(), vctx);
-      if (having) vp::warm(having.get(), vctx);
-      for (const OrderKey& k : order_by) vp::warm(k.expr.get(), vctx);
-      if (!keep_items && groups.size() >= 256) {
-        vp_gtext.resize(expanded.size());
-        bool all_rows = true;
-        for (const auto& g : groups) if (g.empty()) { all_rows = false; break; }
-        for (size_t i = 0; i < expanded.size() && all_rows; ++i) {
-          if (gdirect[i].ok || expr_has_aggregate(expanded[i].expr)) continue;
-          const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
-          if (!P) continue;
-          vp::Column col;
-          std::string verr;
-          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return groups[j][0]; }, groups.size(), &col, &verr)) continue;
-          vp_gtext[i].resize(groups.size());
-          for (size_t j = 0; j < groups.size(); ++j) vp_gtext[i][j] = col.text(j);
-        }
-      }
-    }
-    // Many small groups (a screen pixel's fragments): a MIN / MAX / SUM / AVG / COUNT whose argument compiles
-    // is evaluated over every group's rows at once and folded per group here, on this thread; the groups'
-    // workers read the answers (ctx.agg_values), as they read star_vals. The groups' own rows stay where they
-    // are: flat points at them in group order. Arguments the interpreter has its own column paths for (a
-    // column, -column, column * n) are left to it.
-    std::vector<std::vector<std::pair<const SqlExpr*, Val>>> vp_aggs;
-    if (!star_grouped && pivot.buckets.empty() && aggregated && groups.size() >= 256 && vp::enabled()) {
-      std::vector<const SqlExpr*> aggs;
-      std::function<void(const SqlExpr*, int)> collect = [&](const SqlExpr* e, int depth) {
-        if (!e || depth > 64) return;
-        if (e->op == ExprOp::Func && !e->window && !e->negated && e->args.size() == 1 && e->args[0] &&
-            e->args[0]->op != ExprOp::Star && e->args[0]->op != ExprOp::Column && e->args[0]->op != ExprOp::Literal) {
-          const std::string& up = func_upper(e);
-          const SqlExpr* a = e->args[0].get();
-          const bool own_path = (a->op == ExprOp::Neg || a->op == ExprOp::Sub) && a->args.size() == 1 && a->args[0] && a->args[0]->op == ExprOp::Column;
-          const bool scaled = a->op == ExprOp::Mul && a->args.size() == 2 && a->args[0] && a->args[1] &&
-                              ((a->args[0]->op == ExprOp::Column && a->args[1]->op == ExprOp::Literal) ||
-                               (a->args[1]->op == ExprOp::Column && a->args[0]->op == ExprOp::Literal));
-          if (up == "MIN"sv || up == "MAX"sv || up == "COUNT"sv || ((up == "SUM"sv || up == "AVG"sv) && !own_path && !scaled)) {
-            if (std::find(aggs.begin(), aggs.end(), e) == aggs.end()) aggs.push_back(e);
-            return;
-          }
-        }
-        for (const auto& a : e->args) collect(a.get(), depth + 1);
-      };
-      for (const auto& it : expanded) collect(it.expr.get(), 0);
-      if (having) collect(having.get(), 0);
-      for (const OrderKey& k : order_by) collect(k.expr.get(), 0);
-      if (!aggs.empty()) {
-        EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
-        std::vector<const JoinedRow*> flat;
-        size_t total = 0;
-        for (const auto& g : groups) total += g.size();
-        flat.reserve(total);
-        for (const auto& g : groups) for (const JoinedRow& r : g) flat.push_back(&r);
-        for (const SqlExpr* agg : aggs) {
-          const vp::Prog* P = vp::program_for(agg->args[0].get(), vctx);
-          if (!P) continue;
-          vp::Column col;
-          std::string verr;
-          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return *flat[j]; }, total, &col, &verr)) continue;
-          if (vp_aggs.empty()) vp_aggs.resize(groups.size());
-          const std::string& up = func_upper(agg);
-          size_t at = 0;
-          for (size_t gi = 0; gi < groups.size(); ++gi) {
-            const size_t n = groups[gi].size();
-            Val r;
-            if (up == "COUNT"sv) {
-              size_t cnt = 0;
-              for (size_t j = 0; j < n; ++j) if (!col.is_null(at + j)) ++cnt;
-              r = val_num((double)cnt);
-            } else if (up == "MIN"sv || up == "MAX"sv) {
-              bool has = false;
-              for (size_t j = 0; j < n; ++j) {
-                if (col.is_null(at + j)) continue;
-                Val v = col.at(at + j);
-                if (!has) { r = std::move(v); has = true; continue; }
-                const int c = compare_vals(v, r);
-                if (c != -2 && ((up == "MIN"sv && c < 0) || (up == "MAX"sv && c > 0))) r = std::move(v);
-              }
-              if (!has) r = val_null();
-            } else {
-              SumAcc acc;
-              for (size_t j = 0; j < n; ++j) acc.add(col.at(at + j));
-              r = up == "SUM"sv ? nt_adjust(agg, vctx, acc.finish(false)) : acc.finish(true);
-            }
-            vp_aggs[gi].emplace_back(agg, std::move(r));
-            at += n;
-          }
-        }
-      }
-    }
-    if (!keep_items && groups.size() * expanded.size() >= 4096) {
-      EvalCtx dctx; dctx.sources = &sources;
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        const SqlExpr* ie = expanded[i].expr.get();
-        if (!ie || ie->op != ExprOp::Column) continue;
-        size_t ds = 0, dc = 0;
-        if (lookup_column_here(dctx, *ie, &ds, &dc) != ColumnLookup::Found) continue;
-        if (ds >= sources.size() || !sources[ds].table || dc >= sources[ds].table->columns.size()) continue;
-        gdirect[i] = {true, ds, dc};
-      }
-    }
-    auto push_group_cell = [&](OutRow& o, const JoinedRows& g, size_t i) {
-      const size_t pr = !g.empty() && gdirect[i].src < g[0].parts.size() ? g[0].parts[gdirect[i].src] : kNullRow;
-      o.row.values.push_back(pr == kNullRow ? sql_null() : sources[gdirect[i].src].table->cell(pr, gdirect[i].col));
-    };
-    // The groups' answer as a typed batch, for a consumer that takes one (a CTE's or a derived table's table):
-    // a stored column gathered from each group's first row (as push_group_cell reads it), every other item made per
-    // group with the context the emit below gives it (the aggregates' values made ahead, a program's text) - and
-    // no group emitted below (groups cleared). Not with a sort, DISTINCT, HAVING, a limit or a pivot.
-    if (col_out && vx_trace_on())
-      vx_trace(std::string("colbatch: grouped emit, sink=") + (join_sink ? "1" : "0") + " order=" + std::to_string(order_by.size()) +
-               " distinct=" + (distinct ? "1" : "0") + " having=" + (having ? "1" : "0") + " limit=" + std::to_string(limit) +
-               " keep_items=" + (keep_items ? "1" : "0") + " bounded=" + (bounded ? "1" : "0") + " pivot=" + (pivot.buckets.empty() ? "0" : "1"));
-    if (col_out && !join_sink && !distinct && !having && limit < 0 && offset <= 0 && !keep_items &&
-        !bounded && pivot.buckets.empty()) {
-      ColBatch& B = *col_out;
-      const size_t n = groups.size();
-      // the groups' sort keys, made as the emit makes them (a GROUP BY's implicit ORDER BY among them)
-      std::vector<OutRow> keyrows(order_by.empty() ? 0 : n);
-      B.cols.assign(expanded.size(), ColBatch::Col());
-      B.rows = n;
-      std::vector<size_t> interp;
-      for (size_t i = 0; i < expanded.size(); ++i) {
-        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
-        if (gdirect[i].ok) {
-          const size_t ds = gdirect[i].src;
-          colbatch_gather(*sources[ds].table, gdirect[i].col, dest, 0, [&](size_t r) -> size_t {
-            const JoinedRows& g = groups[r];
-            return !g.empty() && ds < g[0].parts.size() ? g[0].parts[ds] : kNullRow;
-          }, n, &B.cols[i]);
-          continue;
-        }
-        interp.push_back(i);
-        B.cols[i].kind = ColBatch::Text;
-        B.cols[i].s.resize(n);
-      }
-      auto run = [&](size_t b0, size_t b1, std::string* e) {
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.err = e;
-        for (size_t gi = b0; gi < b1 && e->empty(); ++gi) {
-          JoinedRows& g = groups[gi];
-          ctx.row = g.empty() ? nullptr : &g[0];
-          ctx.group = aggregated ? &g : nullptr;
-          ctx.agg_values = nullptr;
-          if (star_grouped) { ctx.group = nullptr; ctx.agg_values = &star_vals[gi]; }
-          else if (!vp_aggs.empty()) ctx.agg_values = &vp_aggs[gi];
-          for (size_t i : interp) {
-            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { B.cols[i].s[gi] = std::move(vp_gtext[i][gi]); continue; }
-            Val v = eval_expr(expanded[i].expr.get(), ctx);
-            if (!e->empty()) return;
-            B.cols[i].s[gi] = v.null ? sql_null() : v.str();
-          }
-          if (!keyrows.empty())
-            for (const OrderKey& k : order_by) {
-              keyrows[gi].sort_keys.push_back(eval_expr(k.expr.get(), ctx));
-              if (!e->empty()) return;
-            }
-        }
-      };
-      if (!interp.empty() || !keyrows.empty()) {
-        if (n >= 64 && !SqlThreadPool::is_in_worker_thread()) {
-          const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
-          std::vector<std::string> errs(lanes);
-          SqlThreadPool::instance().parallel_for(n, 32, [&](size_t b0, size_t b1, size_t tid) {
-            if (tid >= lanes) tid = 0;
-            run(b0, b1, &errs[tid]);
-          });
-          for (const auto& e : errs) if (!e.empty()) return make_error(e);
-        } else {
-          std::string e;
-          run(0, n, &e);
-          if (!e.empty()) return make_error(e);
-        }
-      }
-      for (size_t i = 0; i < expanded.size(); ++i)
-        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
-      if (!keyrows.empty()) {   // the order the rows would be sorted into below (a stable sort of them in group order)
-        std::vector<uint32_t> perm(n);
-        for (size_t r = 0; r < n; ++r) perm[r] = (uint32_t)r;
-        std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return row_less(keyrows[a], keyrows[b]); });
-        colbatch_permute(B, perm);
-      }
-      B.filled = true;
-      groups.clear();   // nothing left for the emit below
-    }
-    size_t biggest = 0, grouped_rows = 0;
-    for (const auto& g : groups) { biggest = std::max(biggest, g.size()); grouped_rows += g.size(); }
-    const size_t agg_lanes = SqlThreadPool::instance().num_workers() + 1;
-    const bool skewed = biggest >= 2048 && biggest * agg_lanes > grouped_rows;
-    if (groups.size() >= 64 && !skewed) {
-      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-      if (total_threads == 0) total_threads = 1;
-      // Output lists by chunk of groups, not by thread, so the rows come back
-      // in group order whichever thread finished first.
-      std::vector<std::vector<OutRow>> local_out((groups.size() + 31) / 32);
-      std::vector<std::string> local_errs(total_threads);
-
-      SqlThreadPool::instance().parallel_for(groups.size(), 32, [&](size_t bstart, size_t bend, size_t tid) {
-        if (tid >= total_threads) tid = 0;
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.err = &local_errs[tid];
-        auto& l_out = local_out[bstart / 32];
-
-        std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
-        for (size_t gi = bstart; gi < bend; ++gi) {
-          auto& g = groups[gi];
-          ctx.row = g.empty() ? nullptr : &g[0];
-          ctx.group = aggregated ? &g : nullptr;
-          ctx.agg_values = nullptr;
-          if (star_grouped) {
-            ctx.group = nullptr;              // every aggregate is answered from star_vals
-            ctx.agg_values = &star_vals[gi];
-          } else if (aggregated && !pivot.buckets.empty()) {
-            pivot_vals.clear();
-            if (!pivot_group(pivot, ctx, &pivot_vals)) break;
-            ctx.agg_values = &pivot_vals;
-          } else if (!vp_aggs.empty()) {
-            ctx.agg_values = &vp_aggs[gi];
-          }
-
-          if (having && !predicate_true(having.get(), ctx)) {
-            if (!local_errs[tid].empty()) break;
-            continue;
-          }
-          if (!local_errs[tid].empty()) break;
-
-          OutRow o;
-          o.row.values.reserve(expanded.size());
-          std::vector<Val> evaled_items;
-          if (keep_items) evaled_items.reserve(expanded.size());
-          for (size_t i = 0; i < expanded.size(); ++i) {
-            if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); continue; }
-            if (i < vp_gtext.size() && gi < vp_gtext[i].size()) { o.row.values.push_back(std::move(vp_gtext[i][gi])); continue; }
-            Val v = eval_expr(expanded[i].expr.get(), ctx);
-            if (!local_errs[tid].empty()) break;
-            push_out_value(o, std::move(v), evaled_items);
-          }
-          for (const OrderKey& k : order_by) {
-            if (k.ordinal > 0) {
-              size_t idx = (size_t)k.ordinal - 1;
-              o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
-            } else {
-              o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
-            }
-            if (!local_errs[tid].empty()) break;
-          }
-          l_out.push_back(std::move(o));
-        }
-      });
-
-      for (const auto& l_err : local_errs) {
-        if (!l_err.empty()) return make_error(l_err);
-      }
-      phases.mark("groupeval");
-      plan_add(plan_step("group by", {}, star_grouped ? "star columnar" : pivot.buckets.empty() ? "hash of key text" : "hash of key text, pivot", groups.size()));
-      size_t total_out = 0;
-      for (const auto& lo : local_out) total_out += lo.size();
-      if (!bounded && !reserve_rows(total_out, sizeof(OutRow) + expanded.size() * kQmemCellBytes))
-        return make_error("Query execution was interrupted");
-      if (!bounded) out_rows.reserve(total_out);
-      for (auto& lo : local_out) {
-        for (auto& o : lo) emit_row(out_rows, std::move(o));
-      }
-    } else {
-      for (auto& g : groups) {
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.row = g.empty() ? nullptr : &g[0];
-        ctx.group = aggregated ? &g : nullptr;
-        ctx.err = &err;
-        std::vector<std::pair<const SqlExpr*, Val>> pivot_vals;
-        if (star_grouped) {
-          ctx.group = nullptr;
-          ctx.agg_values = &star_vals[(size_t)(&g - groups.data())];
-        } else if (aggregated && !pivot.buckets.empty()) {
-          if (!pivot_group(pivot, ctx, &pivot_vals)) return make_error(err);
-          ctx.agg_values = &pivot_vals;
-        } else if (!vp_aggs.empty()) {
-          ctx.agg_values = &vp_aggs[(size_t)(&g - groups.data())];
-        }
-
-        if (having && !predicate_true(having.get(), ctx)) {
-          if (!err.empty()) return make_error(err);
-          continue;
-        }
-        if (!err.empty()) return make_error(err);
-
-        OutRow o;
-        o.row.values.reserve(expanded.size());
-        std::vector<Val> evaled_items;
-        if (keep_items) evaled_items.reserve(expanded.size());
-        uint64_t ev_ns = 0, cell_ns = 0;
-        const bool tr = vx_trace_on();
-        for (size_t i = 0; i < expanded.size(); ++i) {
-          const uint64_t e0 = tr ? hal_now_ns() : 0;
-          if (gdirect[i].ok) { push_group_cell(o, g, i); if (keep_items) evaled_items.push_back(val_null()); if (tr) cell_ns += hal_now_ns() - e0; continue; }
-          if (!keep_items && i < vp_gtext.size() && (size_t)(&g - groups.data()) < vp_gtext[i].size()) {
-            o.row.values.push_back(std::move(vp_gtext[i][(size_t)(&g - groups.data())]));
-            if (tr) ev_ns += hal_now_ns() - e0;
-            continue;
-          }
-          Val v = eval_expr(expanded[i].expr.get(), ctx);
-          if (!err.empty()) return make_error(err);
-          push_out_value(o, std::move(v), evaled_items);
-          if (tr) ev_ns += hal_now_ns() - e0;
-        }
-        if (tr) vx_trace("group emit: cells=" + std::to_string(cell_ns / 1000) + "us interp=" + std::to_string(ev_ns / 1000) + "us (" +
-                         std::to_string(g.size()) + " rows)");
-        for (const OrderKey& k : order_by) {
-          if (k.ordinal > 0) {
-            size_t idx = (size_t)k.ordinal - 1;
-            o.sort_keys.push_back(idx < evaled_items.size() ? evaled_items[idx] : val_null());
-          } else {
-            o.sort_keys.push_back(eval_expr(k.expr.get(), ctx));
-          }
-          if (!err.empty()) return make_error(err);
-        }
-        emit_row(out_rows, std::move(o));
-      }
-    }
-    }   // !lane_done
+    const std::function<void(std::vector<OutRow>&, OutRow&&)> emit_row_fn = emit_row;
+    const std::function<bool(const OutRow&, const OutRow&)> row_less_fn = row_less;
+    GroupPlan gp{db, &sources, &items, &expanded, &group_by, &having, &where, &order_by, &order_types, &join_is_left, &ordinal_needed,
+                 limit, offset, distinct, aggregated, bounded, keep_bound, outer_scope, col_out, join_sink,
+                 &rows, &star_cols, &star_shape, &star_columnar, &err, &out_rows, &emit_row_fn, &row_less_fn};
+    if (std::optional<SqlQueryResult> r = group_result(gp, phases)) return std::move(*r);
   }
 
   // DISTINCT over grouped rows whose select list carries every GROUP BY key
