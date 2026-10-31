@@ -1074,6 +1074,12 @@ struct ColumnStore {
   bool append_int(int64_t v, bool null);
   bool append_double(double d, bool null);
   bool append_dict_code(uint32_t id, bool null);
+  // A whole column at once, into an empty one: a TypedInt64 / TypedDouble column (begin_typed) takes the lane
+  // itself, a dictionary column of its own takes a code per row (each from intern()); the null bitmap and the zone
+  // maps are made once. What the append_* calls would have left row by row; false (nothing changed) otherwise.
+  bool adopt_ints(std::vector<int64_t>&& v, const std::vector<uint8_t>& nul);
+  bool adopt_doubles(std::vector<double>&& v, const std::vector<uint8_t>& nul);
+  bool adopt_codes(const std::vector<uint32_t>& ids, const std::vector<uint8_t>& nul);
   bool set_encoded(size_t row, const std::string& val);
   // Zone maps for the segments covering rows [from, to], after a write there.
   void refresh_zone_maps(size_t from, size_t to);

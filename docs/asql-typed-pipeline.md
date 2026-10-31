@@ -88,8 +88,17 @@ A result table's typed columns are read as numbers where the row path's dictiona
   into it (caught by `asql.doom_sql.check`, "recursive, in a derived table"). Measured against the previous commit,
   alternating, median of nine steady frames: 953 -> 839 and 1,004 -> 897 ms; with the path off, unchanged
   (1,425 / 1,351 before, 1,330 / 1,438 after).
-- **3d: the last copy.** The batch is still copied into column stores; a table could adopt its lanes directly
-  (an I64 column's vector becomes `int64_data`).
+- **3d: the last copy (done).** A result table adopts a batch column whole (`ColumnStore::adopt_ints`,
+  `adopt_doubles`, `adopt_codes`): the lane becomes `int64_data` / `double_data`, a dictionary column takes its codes
+  at once, the null bitmap is made once. Adopted typed columns get no zone maps - every reader takes a missing one as
+  "may match", and a later append leaves it to maintenance. `build_zone_maps` prints every typed value to text for
+  its text bounds and bloom bits (~400 ns a DOUBLE), which was most of filling a result table (`plane_tex`'s four
+  DOUBLE columns: 20-30 ms each); losing numeric pruning on a statement's own short-lived tables cost nothing
+  measurable. Filling result tables: 169 -> 43 ms a frame; against the previous commit, median of nine steady
+  frames, alternating: 925 -> 776 and 941 -> 824 ms.
+  Follow-up, engine-wide: the same text work makes `build_zone_maps` slow for any large typed numeric column (a
+  checkpoint's re-encode, a declared table's load); its numeric bounds need no text, and its text bounds for a
+  number column could be made without per-row formatting.
 - **4: batched joins (first step done).** Where every key of a join step is a number the base row already holds
   (a program's lanes, or a typed column of an earlier table) and the joined side's other keys are typed, a base
   row's matches are read straight off the index's number map and checked as numbers - no Val, context or

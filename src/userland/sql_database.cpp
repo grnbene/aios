@@ -17990,6 +17990,56 @@ bool ColumnStore::append_dict_code(uint32_t id, bool null) {
   return true;
 }
 
+// The null bitmap of a column filled at once: bytes as far as the last NULL, as the appends leave it.
+static void adopt_nulls(ColumnStore& cs, const std::vector<uint8_t>& nul, size_t n) {
+  size_t last = SIZE_MAX;
+  for (size_t r = 0; r < n; ++r) if (nul[r]) last = r;
+  cs.null_bitmap.clear();
+  if (last == SIZE_MAX) { cs.nulls_known = 0; return; }
+  cs.null_bitmap.assign((last >> 3) + 1, 0);
+  for (size_t r = 0; r <= last; ++r) if (nul[r]) cs.null_bitmap[r >> 3] |= (uint8_t)(1 << (r & 7));
+  cs.nulls_known = 1;
+}
+
+bool ColumnStore::adopt_ints(std::vector<int64_t>&& v, const std::vector<uint8_t>& nul) {
+  if (encoding != ColumnEncoding::TypedInt64 || row_count_ != 0 || !int64_data.empty() || nul.size() != v.size()) return false;
+  const size_t n = v.size();
+  for (size_t r = 0; r < n; ++r) if (nul[r]) v[r] = 0;   // a NULL row's slot holds 0, as append_int writes it
+  int64_data = std::move(v);
+  row_count_ = n;
+  adopt_nulls(*this, nul, n);
+  // No zone maps: every reader takes a missing one as "may match", and a later append leaves it to maintenance.
+  // build_zone_maps prints every typed value to text for its text bounds and bloom bits - for a DOUBLE ~400 ns a
+  // value, which was most of filling a 56,000-row result table; the tables adopted into are a statement's own.
+  zone_maps.clear();
+  return true;
+}
+
+bool ColumnStore::adopt_doubles(std::vector<double>&& v, const std::vector<uint8_t>& nul) {
+  if (encoding != ColumnEncoding::TypedDouble || row_count_ != 0 || !double_data.empty() || nul.size() != v.size()) return false;
+  const size_t n = v.size();
+  for (size_t r = 0; r < n; ++r) if (nul[r]) v[r] = 0.0;
+  double_data = std::move(v);
+  row_count_ = n;
+  adopt_nulls(*this, nul, n);
+  zone_maps.clear();   // as adopt_ints
+  return true;
+}
+
+bool ColumnStore::adopt_codes(const std::vector<uint32_t>& ids, const std::vector<uint8_t>& nul) {
+  if (encoding != ColumnEncoding::DictBitPacked || shared_dict || row_count_ != 0 || seg_packed_ || bit_width_ != 32 ||
+      nul.size() != ids.size())
+    return false;
+  const size_t n = ids.size();
+  row_count_ = n;
+  adopt_nulls(*this, nul, n);
+  data32.assign(n, 0);
+  for (size_t r = 0; r < n; ++r) if (!nul[r]) data32[r] = ids[r];
+  packed_data.clear();
+  if (n >= kSegRows) build_zone_maps();
+  return true;
+}
+
 bool ColumnStore::set_encoded(size_t row, const std::string& val) {
   if (row >= row_count_) return false;
   if (sql_is_null(val)) {
@@ -20642,17 +20692,25 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
   t->compact_delta_buffer();
   t->mutation_seq = sql_next_mutation_seq();
   const size_t n = B.rows;
+  const bool tr = vx_trace_on();
+  std::vector<uint64_t> col_ns(tr ? B.cols.size() : 0);
+  std::vector<int> col_kind(tr ? B.cols.size() : 0);
   for_each_parallel(B.cols.size(), [&](size_t c) {
+    const uint64_t c0 = tr ? hal_now_ns() : 0;
+    struct Timed { bool on; uint64_t c0; uint64_t* out; ~Timed() { if (on) *out = hal_now_ns() - c0; } } timed{tr, c0, tr ? &col_ns[c] : nullptr};
+    if (tr) col_kind[c] = (int)B.cols[c].kind;
     ColumnStore& cs = t->col_data[c];
     ColBatch::Col& col = B.cols[c];
     const SqlColumn& sc = t->columns[c];
     const bool normalise = sc.type != SqlDataType::Text;
     auto put_text = [&](const std::string& v) { cs.push_back(normalise ? sql_normalize_value(sc.type, sc.scale, v) : v); };
     if (col.kind == ColBatch::I64 && sc.type == SqlDataType::Int && !sc.temporal && cs.begin_typed(ColumnEncoding::TypedInt64)) {
+      if (cs.adopt_ints(std::move(col.i), col.nul)) return;
       for (size_t r = 0; r < n; ++r) cs.append_int(col.i[r], col.nul[r] != 0);
       return;
     }
     if (col.kind == ColBatch::F64 && sc.type == SqlDataType::Real && sc.scale == 0 && !sc.temporal && cs.begin_typed(ColumnEncoding::TypedDouble)) {
+      if (cs.adopt_doubles(std::move(col.f), col.nul)) return;
       for (size_t r = 0; r < n; ++r) cs.append_double(col.f[r], col.nul[r] != 0);
       return;
     }
@@ -20664,14 +20722,24 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
         if (sql_is_null(v)) { id_null[k] = 1; continue; }
         ids[k] = cs.intern(v);
       }
+      std::vector<uint32_t> row_ids(n, 0);
+      std::vector<uint8_t> row_nul(n, 0);
       for (size_t r = 0; r < n; ++r) {
-        const bool nul = col.nul[r] || id_null[col.codes[r]];
-        cs.append_dict_code(nul ? 0 : ids[col.codes[r]], nul);
+        row_nul[r] = col.nul[r] || id_null[col.codes[r]];
+        if (!row_nul[r]) row_ids[r] = ids[col.codes[r]];
       }
+      if (cs.adopt_codes(row_ids, row_nul)) return;
+      for (size_t r = 0; r < n; ++r) cs.append_dict_code(row_ids[r], row_nul[r] != 0);
       return;
     }
     for (size_t r = 0; r < n; ++r) put_text(col.kind == ColBatch::Text ? col.s[r] : col.text(r));
   });
+  if (tr) {
+    std::string m = "colbatch fill " + t->name + " (" + std::to_string(n) + " rows):";
+    for (size_t c = 0; c < col_ns.size(); ++c)
+      m += " " + t->columns[c].name + "=" + "TIFC"[col_kind[c]] + "/" + std::to_string((int)t->columns[c].type) + ":" + std::to_string(col_ns[c] / 1000) + "us";
+    vx_trace(m);
+  }
   return true;
 }
 
