@@ -11,10 +11,26 @@ aios --root R grain run --steps 0 apps/sqldoom/load.gr doom1.wad E1M1
 ```
 
 `load.gr` (SQLDoom's `wad_loader.py` and `wad_sql.py`) makes database `doom`, applies `sql/schema.sql`, the import
-procedures (`sql/loader_procs.sql`) and the static catalogs (`sql/game_data.sql`, `sql/menu_data.sql`), decodes the
-WAD's palettes, COLORMAP, wall textures, flats, status-bar patches and sprites, loads each map asked for (all of them
-when none is named), and builds the derived tables (`sql/derived.sql`). E1M1 from the shareware `doom1.wad` loads in
-about 45 s.
+procedures (`sql/loader_procs.sql`), the light functions (`sql/render_light.sql`), the game tic (`sql/gametic.sql`)
+and the static catalogs (`sql/game_data.sql`, `sql/menu_data.sql`), decodes the WAD's palettes, COLORMAP, wall
+textures, flats, status-bar patches, sprites, sound effects (as WAV) and music (MUS, and MIDI made from it), loads
+each map asked for (all of them when none is named), and builds the derived tables (`sql/derived.sql`). E1M1 from the
+shareware `doom1.wad` loads in about 40 s. `install_tic.gr` reinstalls just the game tic.
+
+## Playing
+
+```bash
+aios --root R grain serve apps/sqldoom/play.gr [MAP] [skill]
+```
+
+`play.gr` (SQLDoom's `doom_client.py`, one player) starts the map as SQLDoom's client does (`doom_reset_stage`,
+`doom_spawn_player`), runs `doom_run_game_tic` 35 times a second from the keys held, reads SQLDoom's per-tic snapshot
+(`sql/client/game_tick_finish.sql`) for exits and death, and draws each frame with the renderer at the camera
+`sql/client/camera_pose.sql` interpolates between tics. `aios grain serve` shows the pane in a browser (`aios grain
+run` has no display); `SQLDOOM_FRAMES=n` runs n tics and frames with no display and saves the last.
+
+It is not playable at speed: a tic takes 25-45 ms with the monsters asleep and over 100 ms once they chase (Doom's
+budget is 28.6 ms), a frame about 6 s.
 
 ## Rendering a frame
 
@@ -28,7 +44,8 @@ pose the camera is at player 1's start:
 
 ![E1M1 from player 1's start, rendered by ASQL](e1m1-start.png)
 
-It takes about 6 s a frame (SQLDoom on CedarDB: about 13 ms). ASQL materializes each of the renderer's CTEs as rows
+The game tic, renderer and client run E1M1: a scripted 400-tic run walks, turns, fires and uses with no error,
+monsters wake, chase and shoot, a door moves. It takes about 6 s a frame (SQLDoom on CedarDB: about 13 ms). ASQL materializes each of the renderer's CTEs as rows
 of text before the next reads it, and the floor and ceiling chain alone is eight CTEs of some 56,000 rows; real time
 needs CTEs kept as typed columns, a change to the engine of its own.
 
@@ -46,9 +63,20 @@ needs CTEs kept as typed columns, a change to the engine of its own.
   of `GET_BYTE`; the top-1 `LEFT JOIN LATERAL`s as window functions; `BOOL_AND`, `ARG_MAX`, `string_agg`, `||`,
   `IS DISTINCT FROM` and `FULL JOIN` in their MySQL forms; parameters as session variables. The light functions
   (`sql/render_light.sql`) are stored functions.
+- **The game tic** (`sql/gametic.sql`) is SQLDoom's CedarScript as ASQL stored functions, its SQL left as PostgreSQL
+  wrote it: ASQL reads `::`, `ON CONFLICT`, `UPDATE .. FROM`, `DELETE .. USING`, `BOOL_OR`, `ARG_MAX`,
+  `string_agg`, `FILTER`, `LATERAL` and `generate_series` (docs/asql.md, "PostgreSQL's spellings"), and the functions
+  are made under `sql_mode` `PIPES_AS_CONCAT,PG_DIVISION` so `||` and `/` mean what they do there.
+  `tools/cs2my.py` converted the procedural layer (`let`, `if {}`, `SELECT .. {block}` to `DECLARE`, `IF`, a cursor
+  loop); by hand: `doom_prandom` (PostgreSQL's `#` xor), a `^` power, the stairs builder's visited-sector array, the
+  hitscan's `INSERT .. RETURNING` inside a `WITH`, and a `SELECT generate_series(..)` in a select list.
 
 ## Not ported yet
 
-- Sound effects and music (`sound_assets`, `music_assets`, `map_music` stay empty).
-- The game tic (SQLDoom's CedarScript `sql/runtime/functions`) and the client. Until the tic spawns the player,
-  `render.gr` puts a `player_state` row with the schema's defaults there (hence the 0 ammo above).
+- Speed: CTEs as typed columns, and the tic's per-statement cost, in the engine (see above).
+- The client's other screens - title, menus, intermission, finale, automap (`sql/client/render_screen.sql`,
+  `render_automap.sql`) - and sound playback; music is not rendered to audio (SQLDoom uses an external synthesizer).
+- Deathmatch (`39_mp.sql`, `42_api.sql`): the functions are installed but not run; they use `session_user`, roles,
+  `interval` and `EXTRACT(EPOCH ..)`.
+- `render.gr` still puts a `player_state` row with the schema's defaults there when the tic has not spawned the
+  player (hence the 0 ammo in the picture above).

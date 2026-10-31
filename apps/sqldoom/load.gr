@@ -4,9 +4,11 @@
 #
 #   aios --root R grain run apps/sqldoom/load.gr doom1.wad [E1M1 ...]
 #
-# Not ported yet: sound effects and music (sound_assets, music_assets, map_music stay empty).
+# Music is kept as MUS and as MIDI; SQLDoom's optional rendering of it to audio (an external synthesizer) is not
+# done here, so music_assets.audio_data stays NULL.
 import "lib/wad.gr" as wad
 import { run_sql_file } from "lib/sqlfile.gr"
+import "lib/sound.gr" as sound
 
 let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))   # where sql/ is: run from the repo root, or set SQLDOOM_DIR
 let started = clock()
@@ -214,6 +216,34 @@ fn load_sprites(w, lumps) {
   return len(lump_rows)
 }
 
+# ---- sound and music ------------------------------------------------------------------------------------------
+
+# Every DS* lump as a WAV, the last of a name winning (as Doom looks a lump up).
+fn load_sounds(w, lumps) {
+  let rows = {}
+  for l in lumps {
+    if not starts_with(l.name, "DS") or l.size < 8 { continue }
+    let wav = sound.dmx_to_wav(wad.lump_bytes(w, l))
+    if wav != nil { rows[l.name] = [l.name, wav] }
+  }
+  insert_rows("sound_assets", "name, wav_data", values(rows), 20)
+  return len(rows)
+}
+
+fn load_music(w, lumps) {
+  let n = 0
+  for l in lumps {
+    if not starts_with(l.name, "D_") or l.size < 16 { continue }
+    let mus = wad.lump_bytes(w, l)
+    let midi = sound.mus_to_midi(mus)
+    if midi == nil { continue }
+    sql("DELETE FROM music_assets WHERE name = " + lit(l.name))
+    insert_rows("music_assets", "name, mus_data, midi_data", [[l.name, mus, midi]], 1)
+    n = n + 1
+  }
+  return n
+}
+
 # ---- maps -------------------------------------------------------------------------------------------------------
 
 fn sky_for(name) {
@@ -252,7 +282,7 @@ fn records(w, lump, size, row) {
   return out
 }
 
-fn load_map(w, map_id, by) {
+fn load_map(w, map_id, by, name_of_map) {
   let m = map_id
   insert_rows("vertexes", "id, map_id, x, y", records(w, by["VERTEXES"], 4, fn (d, o, i) {
     return [i, m, bytes_get(d, o, "i16le"), bytes_get(d, o + 2, "i16le")]
@@ -312,6 +342,11 @@ fn load_map(w, map_id, by) {
     let h = len(bm) >= 8 ? [bytes_get(bm, 0, "i16le"), bytes_get(bm, 2, "i16le"), bytes_get(bm, 4, "i16le"), bytes_get(bm, 6, "i16le")] : [0, 0, 0, 0]
     insert_rows("blockmaps", "map_id, origin_x, origin_y, cols, `rows`, payload", [[m, h[0], h[1], h[2], h[3], bm]], 1)
   }
+  let song = sound.music_for(name_of_map)
+  if song != nil {
+    sql("INSERT INTO map_music (map_id, music_name) SELECT " + str(m) + ", name FROM music_assets WHERE name = " + lit(song) +
+        " ON DUPLICATE KEY UPDATE music_name = VALUES(music_name)")
+  }
   sql("CALL doom_materialize_render_segs(" + str(m) + ")")
   sql("CALL doom_materialize_render_things(" + str(m) + ")")
 }
@@ -363,6 +398,9 @@ progress("Flats: " + str(load_flats(w, lumps)))
 let ui = load_ui_patches(w, by)
 progress("Status-bar patches: " + str(ui.patches) + (len(ui.skipped) > 0 ? " (not in this WAD: " + join(ui.skipped, " ") + ")" : ""))
 progress("Sprites: " + str(load_sprites(w, lumps)))
+sql("DELETE FROM sound_assets")
+progress("Sound effects: " + str(load_sounds(w, lumps)))
+progress("Music: " + str(load_music(w, lumps)))
 
 for i in maps {
   let name = lumps[i].name
@@ -374,7 +412,7 @@ for i in maps {
     j = j + 1
   }
   let map_id = insert_map(wad_id, name)
-  load_map(w, map_id, own)
+  load_map(w, map_id, own, name)
   progress(name + " loaded as map_id " + str(map_id) + " in " + format("{:.1f}", (clock() - t0) / 1000) + "s")
 }
 
