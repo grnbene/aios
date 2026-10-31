@@ -2264,7 +2264,11 @@ These worked over the wire:
   MySQL without zone tables), `NAME_CONST`, `DEFAULT(col)`, `SLEEP` (really
   waits), `BENCHMARK`, `FOUND_ROWS()` (with `SQL_CALC_FOUND_ROWS`: the count
   without the `LIMIT`), `CONNECTION_ID()` and `USER()` from the connection
-- `EXPLAIN` (with an ASQL route column)
+- `EXPLAIN <select>`: the plan the statement ran with, one line a step - sources, the base rows, each join step
+  and how it probed, how the groups were made, the sort, how the answer left - with rows and time, a CTE's or
+  derived table's steps indented under it. The plan is decided from the data at hand, so EXPLAIN runs the
+  statement and discards the answer; `EXPLAIN ANALYZE` is the same for a SELECT and runs an INSERT / UPDATE /
+  DELETE (a plain EXPLAIN of those does not).
 - `SHOW CREATE TABLE` (with secondary `KEY`s), `DESCRIBE`, `SHOW TABLES`, `SHOW STATUS`, `SHOW ENGINE ASQL STATUS`
 - `information_schema.tables` and `SHOW TABLE STATUS`, with `CREATE_TIME` the
   moment `CREATE TABLE` ran, in the same clock and zone as `NOW()`, kept in the

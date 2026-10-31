@@ -7227,6 +7227,7 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& branch);
 
 #include "sql_colbatch_types.inc"
+#include "sql_plan.inc"
 
 // Runs a nested SELECT with `outer` as the scope its unresolved columns are
 // looked up in. Defined below, once SqlDatabase's own members exist; declared
@@ -44109,7 +44110,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
     ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
   } serial_scope(assigns);
-  if (branch_has_window(raw_branch)) return execute_windowed(db, raw_branch);
+  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch); }
   // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
   // table whose rows are in key order: the answer is a run of rows at one end
   // of the table. The statement is run with a key range that holds just that
@@ -44922,15 +44923,28 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         if (!s.is_derived()) continue;
         // LATERAL, or a generate_series that reads an earlier source: made per earlier value (materialize_lateral).
         std::shared_ptr<SqlTable> made;
-        if (si > 0 && (s.lateral || !s.series_args.empty())) {
-          std::string lerr;
-          made = materialize_lateral(db, expanded_branch, si, &lerr);
-          if (!lerr.empty()) return make_error(lerr);
+        PhysicalPlan lplan;
+        const uint64_t lt0 = plan_on() ? hal_now_ns() : 0;
+        const char* lkind = nullptr;
+        {
+          PlanScope lscope(plan_on() ? &lplan : nullptr);
+          if (si > 0 && (s.lateral || !s.series_args.empty())) {
+            std::string lerr;
+            made = materialize_lateral(db, expanded_branch, si, &lerr);
+            if (!lerr.empty()) return make_error(lerr);
+            if (made) lkind = "lateral";
+          }
+          if (!made && !s.series_args.empty()) {
+            std::string serr;
+            made = materialize_series(db, s, &serr);
+            if (!made) return make_error(serr);
+            lkind = "series";
+          }
         }
-        if (!made && !s.series_args.empty()) {
-          std::string serr;
-          made = materialize_series(db, s, &serr);
-          if (!made) return make_error(serr);
+        if (made && plan_on()) {
+          PlanStep ls = plan_step(lkind ? lkind : "lateral", s.alias, "materialized per outer value", made->row_count(), hal_now_ns() - lt0);
+          ls.sub = std::move(lplan.steps);
+          plan_add(std::move(ls));
         }
         if (made) {
           SelectEngine::push_cte_scope(db);
@@ -44949,7 +44963,18 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         {
           RowsOnly rows_only;
           ColOutRequest want_columns(&dbatch);   // its rows as typed columns, where the select can give them so
-          dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
+          PhysicalPlan dplan;
+          const uint64_t dt0 = plan_on() ? hal_now_ns() : 0;
+          {
+            PlanScope dscope(plan_on() ? &dplan : nullptr);
+            dres = db->execute_local_query(pushed.empty() ? s.subquery_sql : pushed);
+          }
+          if (plan_on()) {
+            PlanStep ds = plan_step("derived", s.alias, dres.rows_in_batch && dbatch.filled ? "columns" : "rows",
+                                    dres.rows_in_batch && dbatch.filled ? dbatch.rows : dres.rows.size(), hal_now_ns() - dt0);
+            ds.sub = std::move(dplan.steps);
+            plan_add(std::move(ds));
+          }
         }
         if (!dres.success) return dres;
         const bool d_in_batch = dres.rows_in_batch && dbatch.filled;
@@ -45059,6 +45084,11 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   }
 
   phases.mark("setup");
+  if (plan_on())
+    for (const QuerySource& src : sources)
+      plan_add(plan_step("source", src.alias,
+                         !src.table ? "none" : find_cte_table(src.alias) == src.table ? "cte" : src.table->inferred_types ? "result table" : "table",
+                         src.table ? src.table->row_count() : SIZE_MAX));
   const std::vector<SelectItem>& items = branch.items;
   const std::vector<ExprPtr>& join_conditions = branch.join_conditions;
   // `A RIGHT JOIN B ON c` is `B LEFT JOIN A ON c`, which is how MariaDB runs
@@ -45199,6 +45229,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       if (!is_cs) { all_count_star = false; break; }
     }
     if (all_count_star && (limit < 0 || limit >= 1) && offset <= 0) {
+      plan_add(plan_step("count(*)", sources[0].alias, "the table's row count", 1));
       SqlQueryResult res;
       res.is_result_set = true;
       res.success = true;
@@ -45236,14 +45267,22 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                                               outer_scope, &vx_res);
     g_vx_col_out = nullptr;
     take_sink();
-    if (answered) return vx_res;
+    if (answered) {
+      plan_add(plan_step("single-table", sources[0].alias, vx_res.execution_route.empty() ? "vectorized" : vx_res.execution_route,
+                         vx_res.rows_in_batch && col_out && col_out->filled ? col_out->rows
+                         : vx_res.rows.empty() ? (size_t)vx_res.rows_affected : vx_res.rows.size()));
+      return vx_res;
+    }
   }
   if (sources.size() == 1 && join_conditions.empty() && group_by.size() == 1 && !distinct && having == nullptr) {
     SqlQueryResult fast_res;
     lend_sink();
     const bool answered = try_fast_streaming_groupby(db, *sources[0].table, sources[0].alias, items, where, group_by, order_by, limit, offset, outer_scope, &fast_res);
     take_sink();
-    if (answered) return fast_res;
+    if (answered) {
+      plan_add(plan_step("single-table", sources[0].alias, "streaming group by", fast_res.rows.size()));
+      return fast_res;
+    }
   }
 
   phases.mark("fastpaths");
@@ -45972,6 +46011,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       vx_trace("join: " + sources[0].alias + " base " + std::to_string(rows.size() + base_ids.size()) + " rows (of " +
                std::to_string(sources[0].table ? sources[0].table->row_count() : 0) + ")");
     phases.mark("base");
+    plan_add(plan_step("base", sources.empty() ? std::string() : sources[0].alias, base_ids_only ? "row ids" : "rows", rows.size() + base_ids.size()));
     bool star_done = false;
     if (!any_right && !fast_pk_done) {
       std::unordered_set<const SqlExpr*> star_pushed;
@@ -46028,7 +46068,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       const QuerySource& js = sources[j + 1];
       JoinedRows next;
       std::vector<QuerySource> partial(sources.begin(), sources.begin() + (j + 2));
-      const uint64_t jt0 = vx_trace_on() ? hal_now_ns() : 0;
+      const uint64_t jt0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
+      const char* join_method = "scan";
       // Nothing left to join (inner or left, every later join keeps it empty):
       // no index and no key-column read on the joined table. A RIGHT JOIN
       // still to come keeps its own rows whatever came before.
@@ -46460,6 +46501,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             next.push_back(std::move(cand));
           }
         }
+        join_method = "small table";
         hash_join_done = true;
       }
       if (!hash_join_done && (!prep_jkeys.empty() || xk_join)) {
@@ -47286,6 +47328,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                    (batch_ok ? " (batched)" : "") +
                    (step_timing ? " [gather " + std::to_string(t_gather.load() / 1000) + " us, " + std::to_string(n_cands.load()) + " candidates, ON checks " +
                                   std::to_string(t_on.load() / 1000) + " us, " + std::to_string(n_skipped.load()) + " base rows refused by their own ON conjuncts]" : ""));
+        join_method = best_ki >= 0 ? (batch_ok ? "index probe, batched" : "index probe") : xk_join ? "expression hash" : single_int_hash ? "int hash" : "text hash";
         hash_join_done = true;
       }
 
@@ -47388,6 +47431,11 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
                  (hash_join_done ? "" : " (scanned" + (join_conditions[j] ? ", on: " + join_conditions[j]->source_text.substr(0, 80) : std::string(", no ON")) +
                                         ", " + std::to_string(pushable.size()) + " pushed conjuncts, " + std::to_string(js.table ? js.table->row_count() : 0) + " joined rows)") +
                  (vp_deferred.empty() ? "" : " (" + std::to_string(vp_deferred.size()) + " conjuncts vectorized)"));
+      if (plan_on()) {
+        PlanStep st = plan_step(join_is_left[j] ? "left join" : join_is_right[j] ? "right join" : "join", js.alias, join_method, next.size(), jt0 ? hal_now_ns() - jt0 : 0);
+        if (join_conditions[j] && !join_conditions[j]->source_text.empty()) st.detail = "on " + join_conditions[j]->source_text.substr(0, 60);
+        plan_add(std::move(st));
+      }
       if (next.size() >= 1000000) g_trim_after_statement.store(true, std::memory_order_relaxed);
       rows.swap(next);
     }
@@ -48099,6 +48147,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         if (vx_trace_on())
           vx_trace("group: " + std::to_string(G) + " groups over integer lanes (" + std::to_string(rows.size()) + " rows" +
                    (lcols.empty() ? ", " + std::to_string(ltext.size()) + " kept, items interpreted)" : ")"));
+        plan_add(plan_step("group by", {}, lcols.empty() ? "integer lanes, items interpreted" : "integer lanes", lcols.empty() ? ltext.size() : G));
         if (lcols.empty()) {
           out_rows.reserve(ltext.size());
           for (auto& cells : ltext) {
@@ -48933,6 +48982,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         if (!l_err.empty()) return make_error(l_err);
       }
       phases.mark("groupeval");
+      plan_add(plan_step("group by", {}, star_grouped ? "star columnar" : pivot.buckets.empty() ? "hash of key text" : "hash of key text, pivot", groups.size()));
       size_t total_out = 0;
       for (const auto& lo : local_out) total_out += lo.size();
       if (!bounded && !reserve_rows(total_out, sizeof(OutRow) + expanded.size() * kQmemCellBytes))
@@ -49026,6 +49076,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
   }
   if (distinct && !distinct_redundant) {
+    plan_add(plan_step("distinct", {}, "collation keys", out_rows.size()));
     std::vector<OutRow> unique;
     std::unordered_set<std::string> seen;
     // A key (every cell's collation key) per row, and the kept rows' slots,
@@ -49049,6 +49100,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   }
 
   if (!order_by.empty()) {
+    plan_add(plan_step("sort", {}, limit >= 0 && (size_t)(offset + limit) < out_rows.size() ? "partial sort to the limit" : "stable sort",
+                       out_rows.size()));
     auto cmp = row_less;
     if (limit >= 0 && (size_t)(offset + limit) < out_rows.size()) {
       std::partial_sort(out_rows.begin(), out_rows.begin() + (size_t)(offset + limit), out_rows.end(), cmp);
@@ -49070,6 +49123,12 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     res.column_origins.push_back(item_origin(it.expr.get(), sources));
   }
   phases.mark("columns");
+  if (plan_on()) {
+    PlanStep em = plan_step("emit", {}, col_out && col_out->filled ? "typed columns" : join_sink && !outer_scope ? "client sink" : "rows",
+                            col_out && col_out->filled ? col_out->rows : out_rows.size());
+    if (limit >= 0) em.detail = "limit " + std::to_string(limit) + (offset > 0 ? " offset " + std::to_string(offset) : "");
+    plan_add(std::move(em));
+  }
   if (col_out && col_out->filled) {
     res.rows_in_batch = true;   // the rows are in the caller's batch
     return res;
@@ -49905,6 +49964,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
           v.query_sql = cte_sql;
           v.column_aliases = cte_cols;
           g_cte_views.back()[lower_of(cte_name)] = std::move(v);
+          plan_add(plan_step("cte", cte_name, "merged as a view"));
           if (trace_merge) std::fprintf(stderr, "[cte] merged %s\n", cte_name.c_str());
           if (!p.take_punct(",")) break;
           continue;
@@ -49913,10 +49973,12 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
 
       SqlQueryResult res;
       ColBatch batch;
-      const uint64_t t0 = trace_merge ? hal_now_ns() : 0;
+      const uint64_t t0 = trace_merge || plan_on() ? hal_now_ns() : 0;
+      PhysicalPlan cplan;
       {
         RowsOnly rows_only;
         ColOutRequest want_columns(&batch);   // its rows as typed columns, where the select can give them so
+        PlanScope cscope(plan_on() ? &cplan : nullptr);
         res = execute_local_query(cte_sql);
       }
       if (!res.success) return res;
@@ -49944,6 +50006,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         append_result_rows(&tbl, res.rows);   // the table holds them now
       }
       if (trace_merge) std::fprintf(stderr, "[cte-append] %-21s %8.1f ms\n", cte_name.c_str(), (hal_now_ns() - ta0) / 1e6);
+      if (plan_on()) {
+        PlanStep cs = plan_step("cte", cte_name, in_batch ? "columns" : "rows", tbl.row_count(), hal_now_ns() - t0);
+        cs.sub = std::move(cplan.steps);
+        plan_add(std::move(cs));
+      }
       current_scope[cte_name] = std::make_shared<SqlTable>(std::move(tbl));
     } else {
       // Recursive CTE
@@ -53181,89 +53248,41 @@ SqlQueryResult SqlDatabase::execute_explain(const std::string& sql) {
       target_sql.pop_back();
     }
   }
-  uint64_t actual_duration_us = 0;
-  uint64_t actual_rows = 0;
-  std::string route_str = "ASQL_NATIVE_SIMD";
-  uint32_t zone_pruned = 0;
-  uint32_t bloom_pruned = 0;
-
-  if (is_analyze) {
-    auto t0 = std::chrono::steady_clock::now();
-    SqlQueryResult run_res = execute_gateway_query(target_sql, effective_database());
-    auto t1 = std::chrono::steady_clock::now();
-    actual_duration_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    if (!run_res.success) {
-      return make_error("EXPLAIN ANALYZE failed: " + run_res.error_message);
-    }
-    actual_rows = run_res.rows_affected;
-    if (!run_res.execution_route.empty()) route_str = run_res.execution_route;
-    zone_pruned = run_res.zone_pruned;
-    bloom_pruned = run_res.bloom_pruned;
-  }
-
-  std::vector<Token> target_toks;
-  tokenize_sql(target_sql, &target_toks, &terr);
-
-  std::string primary_table = "unknown";
-  size_t est_rows = 0;
-  bool is_parallel = false;
-  bool has_where = false;
-  bool has_groupby = false;
-  bool has_join = false;
-
-  for (size_t i = 0; i < target_toks.size(); ++i) {
-    if (target_toks[i].up == "FROM"sv && i + 1 < target_toks.size()) {
-      primary_table = target_toks[i + 1].text;
-      const SqlTable* t = resolve_table(primary_table);
-      if (t) {
-        est_rows = t->row_count();
-        if (est_rows > 1024) is_parallel = true;
-      }
-    }
-    if (target_toks[i].up == "WHERE"sv) has_where = true;
-    if (target_toks[i].up == "GROUP"sv) has_groupby = true;
-    if (target_toks[i].up == "JOIN"sv) has_join = true;
-  }
-
+  // The plan a statement runs with is decided from the data at hand (which index exists, how many rows a step
+  // keeps), so EXPLAIN of a SELECT runs it, with the answer discarded, and prints the steps it took with their
+  // rows and times - one line a step, a CTE's or derived table's own steps indented under it (sql_plan.inc).
+  // EXPLAIN ANALYZE is the same for a SELECT; for INSERT / UPDATE / DELETE it runs the statement, a plain EXPLAIN
+  // does not. The table of guesses this printed before (a "Radix Hash Join" for every join) is gone.
   SqlQueryResult res;
   res.is_result_set = true;
-  res.columns = {"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"};
-
-  std::ostringstream extra_oss;
-  if (is_parallel) {
-    extra_oss << "Using MorselParallelScan (" << std::max<unsigned int>(1, aios::hal::hardware_threads()) << " threads); ";
-  }
-  if (has_where) {
-    extra_oss << "Using ZoneMap Pruning; ";
-  }
-  if (has_groupby) {
-    extra_oss << "Using DictBitPacked GroupBy; Direct Typed Register Accumulation; ";
-  }
-  if (has_join) {
-    extra_oss << "Using Radix Hash Join (L1 cache-partitioned); ";
-  }
-  if (is_analyze) {
-    extra_oss << "Actual Time=" << (actual_duration_us / 1000.0) << "ms Rows=" << actual_rows << " Route=" << route_str
-              << " ZonePruned=" << zone_pruned << " BloomPruned=" << bloom_pruned;
+  res.columns = {"EXPLAIN"};
+  std::vector<std::string> lines;
+  if (next_word == "SELECT" || next_word == "WITH") {
+    PhysicalPlan plan;
+    const uint64_t t0 = hal_now_ns();
+    SqlQueryResult run_res;
+    {
+      PlanScope scope(&plan);
+      run_res = execute_local_query(target_sql);
+    }
+    if (!run_res.success) return make_error("EXPLAIN: " + run_res.error_message);
+    if (plan.steps.empty()) lines.push_back("-> answered from the result cache");
+    plan_print(plan.steps, &lines);
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%zu row(s) in %.2f ms", run_res.rows_in_batch ? (size_t)run_res.rows_affected : run_res.rows.size(),
+                  (hal_now_ns() - t0) / 1e6);
+    lines.push_back(buf);
+  } else if (is_analyze) {
+    const uint64_t t0 = hal_now_ns();
+    SqlQueryResult run_res = execute_gateway_query(target_sql, effective_database());
+    if (!run_res.success) return make_error("EXPLAIN ANALYZE failed: " + run_res.error_message);
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "-> %s  rows=%lld  %.2f ms", next_word.c_str(), run_res.rows_affected, (hal_now_ns() - t0) / 1e6);
+    lines.push_back(buf);
   } else {
-    extra_oss << "Estimated Engine Route=" << (is_parallel ? "PARALLEL_MORSEL_SCAN" : "POINT_LOOKUP");
+    lines.push_back("-> " + next_word + " (not run; EXPLAIN ANALYZE runs it)");
   }
-
-  res.rows.push_back(SqlRow{{
-    "1",
-    "SIMPLE",
-    primary_table,
-    sql_null(),
-    is_parallel ? "ALL (SIMD Vectorized)" : "const",
-    "PRIMARY, ZoneMap",
-    has_where ? "PRIMARY" : sql_null(),
-    "4",
-    sql_null(),
-    std::to_string(is_analyze ? actual_rows : est_rows),
-    "100.00",
-    extra_oss.str()
-  }});
-
+  for (const std::string& l : lines) res.rows.push_back(SqlRow{{l}});
   res.rows_affected = res.rows.size();
   res.formatted_table = format_result_table(res.columns, res.rows);
   return res;

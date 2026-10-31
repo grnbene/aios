@@ -97,6 +97,19 @@ the file split's steps are, including the object-code and timing comparison.
 
 **2c. The driver.** What is left of `execute_parsed_select_single` walks the plan.
 
+### Stage 2a, done: the plan as recorded
+
+`sql_plan.inc`: `PlanStep` / `PhysicalPlan`, a thread-local sink (`PlanScope`) and `plan_add` at each decision point
+of `execute_parsed_select_single` and `execute_with` - sources (table / cte / result table), the single-table
+engine, the base rows, every join step with its method (index probe, batched, expression hash, int hash, text hash,
+small table, scan) and ON text, the grouping method (integer lanes, star columnar, hash of key text), DISTINCT, the
+sort, the emit form (typed columns / client sink / rows, with the limit), and each CTE, derived table, LATERAL and
+series as a step with its own nested plan. Recording is off (a null check) unless EXPLAIN asked, measured identical
+on every suite. `EXPLAIN <select>` runs the statement with the answer discarded - the plan is decided from the data
+at hand - and prints one line a step with rows and time; the table of invented text it printed before is gone.
+Known gaps, for 2b: a subquery that fills an IN / EXISTS set appears as its own flat steps, not nested; the
+single-table engine is one step with no inner detail; a window statement's inner plan follows the `window` step.
+
 ## Stage 3: compiled pipelines over the plan (decided: both)
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
