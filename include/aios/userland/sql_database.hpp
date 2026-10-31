@@ -261,6 +261,9 @@ struct SqlQueryResult {
   std::vector<uint8_t> column_is_string;
   std::vector<SqlColumnOrigin> column_origins;   // parallel to `columns` when the engine knows; else empty
   std::vector<SqlRow> rows;
+  // The rows are in the typed batch the caller asked for (sql_colbatch.inc), not in `rows`: only a caller that made
+  // the request sees one, and such an answer is never cached.
+  bool rows_in_batch = false;
   uint64_t rows_affected = 0;
   // UPDATE: the rows its WHERE matched (rows_affected counts those it changed, as MySQL does); -1 for anything
   // else. A client that asked for found rows (CLIENT_FOUND_ROWS) is told this one.
@@ -1062,6 +1065,15 @@ struct ColumnStore {
   // the encoding cannot take this value in place (then push_back/set, which
   // decompress, are the fallback and reencode_pending is raised).
   bool append_encoded(const std::string& val);
+  // A value appended in its typed form, no text made and parsed back: what a query result handed to the table that
+  // holds it (a CTE, a derived table) writes. begin_typed makes an empty column TypedInt64 or TypedDouble;
+  // append_int / append_double then add a row to such a column, append_dict_code a row holding a code intern()
+  // gave to a dictionary column of its own. Each keeps the null bitmap, zone maps and segments as append_encoded
+  // does; false when the column is not in that form (nothing is changed then).
+  bool begin_typed(ColumnEncoding enc);
+  bool append_int(int64_t v, bool null);
+  bool append_double(double d, bool null);
+  bool append_dict_code(uint32_t id, bool null);
   bool set_encoded(size_t row, const std::string& val);
   // Zone maps for the segments covering rows [from, to], after a write there.
   void refresh_zone_maps(size_t from, size_t to);

@@ -6845,40 +6845,49 @@ bool infer_item_exact(const SqlExpr* e, const std::vector<QuerySource>& sources)
 // Before the rows go in: append_row normalizes each value to its column's
 // scale, so fitting afterwards read values already rounded to scale 0 (a
 // derived MAX(amount) of 10.25 was stored as 10, and summed as 10).
-void fit_decimal_scales(std::vector<SqlColumn>& columns, const std::vector<SqlRow>& rows) {
+// Over the values of each column, as each(c, fn) hands them over (every non-NULL cell's text, in any order; fn
+// returns false to stop): the rows of a result, or a typed batch (colbatch_each_value), decide alike.
+template <typename Each>
+void fit_decimal_scales_with(std::vector<SqlColumn>& columns, Each&& each) {
   for (size_t c = 0; c < columns.size(); ++c) {
     if (columns[c].type == SqlDataType::Real) {
       // A DOUBLE whose every value shows the same places (ROUND(x, 3), FORMAT): the column keeps them, as
       // MariaDB's derived column carries the expression's decimals. Mixed places mean a plain double.
       int places = -1;
       bool uniform = true;
-      for (const SqlRow& row : rows) {
-        if (c >= row.values.size() || sql_is_null(row.values[c])) continue;
-        const std::string& v = row.values[c];
+      each(c, [&](const std::string& v) {
         const size_t dot = v.find('.');
-        if (v.find_first_of("eE") != std::string::npos) { uniform = false; break; }
+        if (v.find_first_of("eE") != std::string::npos) { uniform = false; return false; }
         const int p = dot == std::string::npos ? 0 : (int)(v.size() - dot - 1);
         if (places < 0) places = p;
-        else if (places != p) { uniform = false; break; }
-      }
+        else if (places != p) { uniform = false; return false; }
+        return true;
+      });
       columns[c].scale = (uint8_t)(uniform && places > 0 ? std::min(places, 30) : 0);
       continue;
     }
     if (columns[c].type != SqlDataType::Decimal) continue;
     int scale = 0, whole = 1;
-    for (const SqlRow& row : rows) {
-      if (c >= row.values.size()) continue;
-      const std::string& v = row.values[c];
-      if (sql_is_null(v)) continue;
+    each(c, [&](const std::string& v) {
       size_t dot = v.find('.');
       size_t start = (!v.empty() && (v[0] == '-' || v[0] == '+')) ? 1 : 0;
       if (dot != std::string::npos) scale = std::max(scale, (int)(v.size() - dot - 1));
       whole = std::max(whole, (int)((dot == std::string::npos ? v.size() : dot) - start));
-    }
+      return true;
+    });
     scale = std::min(scale, 38);
     columns[c].scale = (uint8_t)scale;
     columns[c].precision = (uint8_t)std::min(65, whole + scale);
   }
+}
+
+void fit_decimal_scales(std::vector<SqlColumn>& columns, const std::vector<SqlRow>& rows) {
+  fit_decimal_scales_with(columns, [&](size_t c, auto&& fn) {
+    for (const SqlRow& row : rows) {
+      if (c >= row.values.size() || sql_is_null(row.values[c])) continue;
+      if (!fn(row.values[c])) return;
+    }
+  });
 }
 
 // What a select item will hold, so a result that gets put back into a table
@@ -8234,6 +8243,7 @@ static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols);
 static bool row_in_set_has(const RowInSet& set, const double* key, size_t n);
 
 #include "sql_vprog.inc"
+#include "sql_colbatch.inc"
 
 bool parallel_safe_expr(const SqlExpr* e) {
   if (!e) return true;
@@ -12711,8 +12721,11 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
       // predicate - most of a 3-table tax join over 172/68/43 rows. The text
       // is made only if something asks (Val::str prints to_string for an
       // integer below 1e15, the same text cell() gave).
-      if (!tbl->inferred_types && c < tbl->col_data.size() && tbl->columns[c].type != SqlDataType::Real &&
-          sql_type_numeric(tbl->columns[c].type)) {
+      // A result table's (a CTE's) typed integer column holds canonical integers by construction - append_int
+      // or append_encoded's TypedInt64 check made it so - and reads the same way.
+      if (c < tbl->col_data.size() && tbl->columns[c].type != SqlDataType::Real && sql_type_numeric(tbl->columns[c].type) &&
+          (!tbl->inferred_types || tbl->col_data[c].encoding == ColumnEncoding::TypedInt64 ||
+           tbl->col_data[c].encoding == ColumnEncoding::TypedInt32)) {
         const ColumnStore& cs = tbl->col_data[c];
         if ((cs.encoding == ColumnEncoding::TypedInt32 || cs.encoding == ColumnEncoding::TypedInt64 ||
              cs.encoding == ColumnEncoding::FOR) && r_idx < cs.size()) {
@@ -12726,6 +12739,18 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
             return v;
           }
         }
+      }
+      // A plain DOUBLE column held as doubles: the number itself, as the cell's text would have given it (that
+      // text is the double's shortest form, which reads back as the same double). Its 0 prints "0" whatever its
+      // sign, and is read so.
+      if (c < tbl->col_data.size() && tbl->columns[c].type == SqlDataType::Real && tbl->columns[c].scale == 0 &&
+          tbl->col_data[c].encoding == ColumnEncoding::TypedDouble && r_idx < tbl->col_data[c].size() &&
+          tbl->col_data[c].double_data.size() == tbl->col_data[c].size()) {
+        const ColumnStore& cs = tbl->col_data[c];
+        if (cs.is_null(r_idx)) return val_null();
+        const double d = cs.double_data[r_idx];
+        if (d == 0) { Val z = val_num_with_text(0.0, "0"); z.approx = true; return z; }
+        return val_approx(d);
       }
       const std::string& cell = tbl->cell(r_idx, c);
       if (sql_is_null(cell)) return val_null();
@@ -17903,6 +17928,68 @@ bool ColumnStore::append_encoded(const std::string& val) {
   return true;
 }
 
+bool ColumnStore::begin_typed(ColumnEncoding enc) {
+  if (row_count_ != 0 || shared_dict || (enc != ColumnEncoding::TypedInt64 && enc != ColumnEncoding::TypedDouble)) return false;
+  encoding = enc;
+  int32_data.clear(); int64_data.clear(); double_data.clear();
+  data32.clear(); packed_data.clear();
+  dict.clear(); drop_dict_derived();
+  id_index.clear(); id_tag.clear(); id_index_count = 0;
+  null_bitmap.clear();
+  nulls_known = -1;
+  return true;
+}
+
+// The null bit of the row just added (r): the bitmap reaches only as far as the last NULL, as append_encoded keeps it.
+static inline void typed_mark_null(ColumnStore& cs, size_t r, bool null) {
+  const size_t b = r >> 3;
+  if (null) {
+    if (b >= cs.null_bitmap.size()) { grow_column_vec(cs.null_bitmap, b + 1); cs.null_bitmap.resize(b + 1, 0); }
+    cs.null_bitmap[b] |= (uint8_t)(1 << (r & 7));
+    cs.nulls_known = 1;
+  } else if (b < cs.null_bitmap.size()) {
+    cs.null_bitmap[b] &= (uint8_t)~(1 << (r & 7));
+  }
+}
+
+bool ColumnStore::append_int(int64_t v, bool null) {
+  if (encoding != ColumnEncoding::TypedInt64 || int64_data.size() != row_count_) return false;
+  const size_t r = row_count_;
+  grow_column_vec(int64_data, r + 1);
+  int64_data.push_back(null ? 0 : v);
+  row_count_++;
+  typed_mark_null(*this, r, null);
+  extend_zone_map(*this, r);
+  if ((r + 1) % kSegRows == 0) seal_segment(*this);
+  return true;
+}
+
+bool ColumnStore::append_double(double d, bool null) {
+  if (encoding != ColumnEncoding::TypedDouble || double_data.size() != row_count_) return false;
+  const size_t r = row_count_;
+  grow_column_vec(double_data, r + 1);
+  double_data.push_back(null ? 0.0 : d);
+  row_count_++;
+  typed_mark_null(*this, r, null);
+  extend_zone_map(*this, r);
+  if ((r + 1) % kSegRows == 0) seal_segment(*this);
+  return true;
+}
+
+bool ColumnStore::append_dict_code(uint32_t id, bool null) {
+  if (encoding != ColumnEncoding::DictBitPacked || shared_dict) return false;
+  unpack_segments();
+  const size_t r = row_count_;
+  if (null) id = 0;
+  widen_for(id);
+  row_count_++;
+  typed_mark_null(*this, r, null);
+  write_code(r, id);
+  extend_zone_map(*this, r);
+  if ((r + 1) % kSegRows == 0) seal_segment(*this);
+  return true;
+}
+
 bool ColumnStore::set_encoded(size_t row, const std::string& val) {
   if (row >= row_count_) return false;
   if (sql_is_null(val)) {
@@ -20539,6 +20626,53 @@ void SqlTable::append_rows_bulk(std::vector<std::vector<std::string>>& rows) {
     journal_note(seq_before, mutation_seq, std::move(op));
   }
   rows.clear();
+}
+
+// A fresh result table filled from a typed batch (sql_colbatch.inc), each column in the form it came in: integers
+// into a TypedInt64 column, doubles into a TypedDouble one, a dictionary column's codes through its own dictionary
+// (each entry interned once), text cell by cell - every value normalised for its column as append_rows_bulk
+// normalises it, so the table reads exactly as the rows would have made it. An integer goes in typed only for an
+// INT column, a double only for a DOUBLE of no fixed scale; anything else as its text. False, with the table
+// untouched, for one not to fill so (watched, journaled, keeping undo, not empty): the caller takes rows.
+bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
+  if (!B.filled || t->row_count() != 0 || !t->watch_list->empty() || row_undo_on(t) || t->journal.on) return false;
+  t->ensure_columns();
+  if (t->col_data.size() != B.cols.size() || t->columns.size() != B.cols.size()) return false;
+  for (const auto& cs : t->col_data) if (cs.shared_dict || cs.size() != 0) return false;
+  t->compact_delta_buffer();
+  t->mutation_seq = sql_next_mutation_seq();
+  const size_t n = B.rows;
+  for_each_parallel(B.cols.size(), [&](size_t c) {
+    ColumnStore& cs = t->col_data[c];
+    ColBatch::Col& col = B.cols[c];
+    const SqlColumn& sc = t->columns[c];
+    const bool normalise = sc.type != SqlDataType::Text;
+    auto put_text = [&](const std::string& v) { cs.push_back(normalise ? sql_normalize_value(sc.type, sc.scale, v) : v); };
+    if (col.kind == ColBatch::I64 && sc.type == SqlDataType::Int && !sc.temporal && cs.begin_typed(ColumnEncoding::TypedInt64)) {
+      for (size_t r = 0; r < n; ++r) cs.append_int(col.i[r], col.nul[r] != 0);
+      return;
+    }
+    if (col.kind == ColBatch::F64 && sc.type == SqlDataType::Real && sc.scale == 0 && !sc.temporal && cs.begin_typed(ColumnEncoding::TypedDouble)) {
+      for (size_t r = 0; r < n; ++r) cs.append_double(col.f[r], col.nul[r] != 0);
+      return;
+    }
+    if (col.kind == ColBatch::Codes && cs.encoding == ColumnEncoding::DictBitPacked) {
+      std::vector<uint32_t> ids(col.dict.size(), 0);
+      std::vector<uint8_t> id_null(col.dict.size(), 0);
+      for (size_t k = 0; k < col.dict.size(); ++k) {
+        const std::string v = normalise ? sql_normalize_value(sc.type, sc.scale, col.dict[k]) : col.dict[k];
+        if (sql_is_null(v)) { id_null[k] = 1; continue; }
+        ids[k] = cs.intern(v);
+      }
+      for (size_t r = 0; r < n; ++r) {
+        const bool nul = col.nul[r] || id_null[col.codes[r]];
+        cs.append_dict_code(nul ? 0 : ids[col.codes[r]], nul);
+      }
+      return;
+    }
+    for (size_t r = 0; r < n; ++r) put_text(col.kind == ColBatch::Text ? col.s[r] : col.text(r));
+  });
+  return true;
 }
 
 // A row already in each column's canonical form (a query's own output): appended without normalising it again.
@@ -27732,7 +27866,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
       if (hot) {
         allow_stream = true;
         SqlQueryResult res = run_select();
-        if (sink && res.success && res.rows.size() <= kMaxQueryCacheRows) { *sink = std::make_shared<const SqlQueryResult>(std::move(res)); return SqlQueryResult(); }
+        if (sink && res.success && !res.rows_in_batch && res.rows.size() <= kMaxQueryCacheRows) { *sink = std::make_shared<const SqlQueryResult>(std::move(res)); return SqlQueryResult(); }
         return res;
       }
     }
@@ -27746,7 +27880,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
       // the answer shared gets that entry, one that wants its own copies it.
       // Not an answer a recursive CTE gave (it depends on the session's max_recursive_iterations) or one that
       // raised a warning (a hit would answer without it).
-      if (res.rows.size() <= kMaxQueryCacheRows && !tls_stmt_ran_recursive && tls_conditions.empty()) {
+      if (res.rows.size() <= kMaxQueryCacheRows && !tls_stmt_ran_recursive && tls_conditions.empty() && !res.rows_in_batch) {
         auto shared = std::make_shared<const SqlQueryResult>(std::move(res));
         query_cache_store(cache_key, shared, std::move(deps), reads_view, gen_before);
         if (vx_trace_on()) {
@@ -38317,6 +38451,11 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
   // further down; a shape that cannot stream just materializes as before.
   SqlRowSink* sink = g_vx_sink;
   g_vx_sink = nullptr;
+  // A consumer's request for a typed batch (sql_colbatch.inc), lent by the top select: filled on the plain path -
+  // every selected row, no sort, DISTINCT, HAVING or limit (decided here: the page code below rewrites limit).
+  ColBatch* const vx_col_out = g_vx_col_out;
+  g_vx_col_out = nullptr;
+  const bool vx_batch_ok = vx_col_out && limit < 0 && offset <= 0 && !distinct && order_by.empty() && !having && group_by.empty();
   bool sink_consumed = false;
   struct SinkRestorer {
     SqlRowSink* s;
@@ -39094,6 +39233,44 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
         if (!err.empty()) { *out = make_error(err); return true; }
       }
     }
+    if (vx_batch_ok && !sort_evaluated && !sink) {
+      // The answer as a typed batch: a stored column gathered by row id, a program's lanes, the interpreter's
+      // text otherwise; nothing projected below (the page is spent).
+      ColBatch& B = *vx_col_out;
+      const size_t n = page.size();
+      B.cols.assign(expanded.size(), ColBatch::Col());
+      B.rows = n;
+      if (n && !fast_resolved) { resolve_fast(rd.ev.at(page[0])); if (!err.empty()) { *out = make_error(err); return true; } }
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        ColBatch::Col& col = B.cols[i];
+        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+        if (n && fast_col[i] >= 0 && (size_t)fast_col[i] < t.col_data.size()) {
+          colbatch_gather(t, (size_t)fast_col[i], dest, 0, [&](size_t r) -> size_t { return page[r]; }, n, &col);
+          continue;
+        }
+        if (n >= 64) {
+          if (const vp::Prog* P = vp::program_for(expanded[i].expr.get(), rd.ev.at(page[0]))) {
+            vp::Column vc;
+            std::string verr;
+            if (vp::eval_column_ids(*P, [&](size_t j) { return page[j]; }, n, &vc, &verr)) {
+              colbatch_from_vp(std::move(vc), dest, 0, &col);
+              continue;
+            }
+          }
+        }
+        col.kind = ColBatch::Text;
+        col.s.resize(n);
+        for (size_t j = 0; j < n; ++j) {
+          Val v = eval_expr(expanded[i].expr.get(), rd.ev.at(page[j]));
+          if (!err.empty()) { *out = make_error(err); return true; }
+          col.s[j] = v.null ? sql_null() : v.str();
+        }
+      }
+      for (size_t i = 0; i < expanded.size(); ++i)
+        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+      B.filled = true;
+      page.clear();
+    }
     rows_out.reserve(page.size());
     vp_project_page(page);
     if (!err.empty()) { *out = make_error(err); return true; }
@@ -39504,6 +39681,11 @@ bool try_vx_single_table(SqlDatabase* db, const QuerySource& source, std::vector
     res.column_types.push_back(infer_item_type(it.expr.get(), sources));
     res.column_is_string.push_back(item_is_string(it.expr.get(), sources) ? 1 : 0);
     res.column_origins.push_back(item_origin(it.expr.get(), sources));
+  }
+  if (vx_col_out && vx_col_out->filled) {
+    res.rows_in_batch = true;   // the rows are in the caller's batch
+    *out = std::move(res);
+    return true;
   }
   long long taken = 0;
   if (distinct) {
@@ -43333,6 +43515,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   SqlRowSink* const join_sink = g_join_sink ? g_join_sink : g_vx_sink;
   g_join_sink = nullptr;
   g_vx_sink = nullptr;
+  // A consumer's request for the answer as a typed batch (sql_colbatch.inc): this is the top select, so it is
+  // taken here and nothing nested sees it. Paths that cannot fill it return rows, as before.
+  ColBatch* const col_out = take_col_out();
   // `@v := ...` in it: rows are evaluated one at a time, in order, on this
   // thread - the variable carries from one row to the next.
   bool assigns = expr_assigns(raw_branch.where.get()) || expr_assigns(raw_branch.having.get());
@@ -44454,8 +44639,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   if (sources.size() == 1 && join_conditions.empty() && sources[0].table && !sql_no_vx_env()) {
     SqlQueryResult vx_res;
     lend_sink();
+    g_vx_col_out = col_out;   // the request, lent for this call only
     const bool answered = try_vx_single_table(db, sources[0], items, where, group_by, having, order_by, limit, offset, distinct,
                                               outer_scope, &vx_res);
+    g_vx_col_out = nullptr;
     take_sink();
     if (answered) return vx_res;
   }
@@ -45797,10 +45984,12 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         // hashed by the integer itself, built instead of the text keys below.
         std::unordered_map<int64_t, std::vector<uint32_t>> int_hash_tbl;
         bool single_int_hash = false;
-        if (best_ki < 0 && !xk_join && !js.table->inferred_types && prep_jkeys.size() == 1 && prep_jkeys[0].column >= 0 &&
+        if (best_ki < 0 && !xk_join && prep_jkeys.size() == 1 && prep_jkeys[0].column >= 0 &&
             (size_t)prep_jkeys[0].column < js.table->col_data.size()) {
           const ColumnStore& jcs = js.table->col_data[prep_jkeys[0].column];
-          if (vx::typed_integer(jcs) && jcs.size() == js.table->row_count()) {
+          // (a result table's typed integer column too: its integers are canonical by construction)
+          if (vx::typed_integer(jcs) && jcs.size() == js.table->row_count() &&
+              (!js.table->inferred_types || jcs.encoding == ColumnEncoding::TypedInt64 || jcs.encoding == ColumnEncoding::TypedInt32)) {
             single_int_hash = true;
             int_hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
             for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
@@ -46982,6 +47171,69 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         rows.swap(kept);
       }
     }
+    // The answer as a typed batch, for a consumer that takes one (a CTE's table): each item made over every row
+    // at once - a stored column gathered by row id, a program's lanes, the interpreter's text otherwise - and no
+    // row projected below (rows cleared). Not with a sort, DISTINCT, HAVING or a limit: those work on the rows.
+    if (col_out && !join_sink && order_by.empty() && !distinct && !having && limit < 0 && offset <= 0 && !ordinal_keys && !bounded) {
+      ColBatch& B = *col_out;
+      const size_t n = rows.size();
+      B.cols.assign(expanded.size(), ColBatch::Col());
+      B.rows = n;
+      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+      std::vector<size_t> interp;
+      for (size_t i = 0; i < expanded.size(); ++i) {
+        const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+        if (direct[i].ok) {
+          const size_t ds = direct[i].src;
+          colbatch_gather(*sources[ds].table, direct[i].col, dest, 0,
+                          [&](size_t r) -> size_t { const JoinedRow& jr = rows[r]; return ds < jr.parts.size() ? jr.parts[ds] : kNullRow; }, n, &B.cols[i]);
+          continue;
+        }
+        if (n >= 64) {
+          if (const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx)) {
+            vp::Column col;
+            std::string verr;
+            if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) {
+              colbatch_from_vp(std::move(col), dest, 0, &B.cols[i]);
+              continue;
+            }
+          }
+        }
+        interp.push_back(i);
+      }
+      if (!interp.empty()) {
+        // the rest through the interpreter, the rows in chunks across the pool as project_row's are
+        for (size_t i : interp) { B.cols[i].kind = ColBatch::Text; B.cols[i].s.resize(n); }
+        auto run = [&](size_t b0, size_t b1, std::string* e) {
+          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &sources; ctx.group = nullptr; ctx.err = e;
+          for (size_t r = b0; r < b1 && e->empty(); ++r) {
+            ctx.row = &rows[r];
+            for (size_t i : interp) {
+              Val v = eval_expr(expanded[i].expr.get(), ctx);
+              if (!e->empty()) return;
+              B.cols[i].s[r] = v.null ? sql_null() : v.str();
+            }
+          }
+        };
+        if (n >= 4096 && !SqlThreadPool::is_in_worker_thread()) {
+          const size_t lanes = SqlThreadPool::instance().num_workers() + 1;
+          std::vector<std::string> errs(lanes);
+          SqlThreadPool::instance().for_chunks(n, 1024, n * 4, false, [&](size_t b0, size_t b1, size_t tid) {
+            if (tid >= lanes) tid = 0;
+            run(b0, b1, &errs[tid]);
+          });
+          for (const auto& e : errs) if (!e.empty()) return make_error(e);
+        } else {
+          std::string e;
+          run(0, n, &e);
+          if (!e.empty()) return make_error(e);
+        }
+      }
+      for (size_t i = 0; i < expanded.size(); ++i)
+        if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+      B.filled = true;
+      rows.clear();   // nothing left for the projection below
+    }
     // A select item that compiles to a vectorized program (vp) is evaluated over every projected row at once,
     // its text per row kept here; project_row prints the text instead of interpreting the item per row.
     const size_t vp_proj_count = (order_by.empty() && !distinct && !having && limit >= 0 && offset >= 0)
@@ -47198,9 +47450,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       for (const auto& rgc : res_gcols) {
         if (!coded) break;
         const SqlTable* gt = rgc.src < sources.size() ? sources[rgc.src].table : nullptr;
-        if (!gt || gt->inferred_types || rgc.col_idx >= gt->col_data.size() ||
-            gt->col_data[rgc.col_idx].size() != gt->row_count()) { coded = false; break; }
+        if (!gt || rgc.col_idx >= gt->col_data.size() || gt->col_data[rgc.col_idx].size() != gt->row_count()) { coded = false; break; }
         const ColumnStore& gcs = gt->col_data[rgc.col_idx];
+        // a result table's (a CTE's) column only when it holds typed integers: its text may hold numbers otherwise
+        if (gt->inferred_types && !vx::typed_integer(gcs)) { coded = false; break; }
         if (!vx::dict_coded(gcs) && !vx::typed_integer(gcs)) { coded = false; break; }
         if (vx::dict_coded(gcs) && vx::dict_size(gcs) > rows.size() * 2 && rows.size() < 4096) { coded = false; break; }
       }
@@ -47950,6 +48203,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     res.column_origins.push_back(item_origin(it.expr.get(), sources));
   }
   phases.mark("columns");
+  if (col_out && col_out->filled) {
+    res.rows_in_batch = true;   // the rows are in the caller's batch
+    return res;
+  }
   if (join_sink && !outer_scope) {
     if (sql_interrupted()) return make_error("Query execution was interrupted");
     bool ok = join_sink->begin(res);
@@ -48016,13 +48273,134 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
     return execute_parsed_select_single(db, stmt.branches[0]);
   }
 
-  SqlQueryResult res = execute_parsed_select_single(db, stmt.branches[0]);
+  // A UNION ALL whose consumer takes a typed batch (sql_colbatch.inc): each branch is asked for its own, and the
+  // batches are put end to end where nothing below would change a cell - a column of integers or doubles stays so
+  // (DOUBLE columns are reprinted in their shortest form below, which is how a double lane prints already; an INT
+  // or DECIMAL column's places are evened out, and an integer has none). A text or dictionary column in a number
+  // column, an ORDER BY / LIMIT over the union, or a branch that gave rows: every batch is turned back into the
+  // rows it stands for and the union is made as before.
+  ColBatch* const col_out = take_col_out();
+  std::vector<SqlQueryResult> pre;   // the branches' answers, made ahead when a batch was asked for
+  if (col_out && stmt.union_tail.empty() && stmt.union_is_all.size() + 1 == stmt.branches.size()) {
+    bool all = true;
+    for (size_t u = 0; u < stmt.union_is_all.size(); ++u)
+      if (!stmt.union_is_all[u] || (u < stmt.union_kind.size() && stmt.union_kind[u] != 0)) all = false;
+    if (all) {
+      std::vector<ColBatch> bb(stmt.branches.size());
+      pre.resize(stmt.branches.size());
+      bool batches = true;
+      for (size_t k = 0; k < stmt.branches.size(); ++k) {
+        {
+          ColOutRequest want_columns(&bb[k]);
+          pre[k] = execute_parsed_select_single(db, stmt.branches[k]);
+        }
+        if (!pre[k].success) return pre[k];
+        if (!(pre[k].rows_in_batch && bb[k].filled)) {
+          batches = false;
+          if (vx_trace_on()) vx_trace("colbatch: union branch " + std::to_string(k) + " gave rows");
+        }
+        if (pre[k].columns.size() != pre[0].columns.size()) batches = false;
+      }
+      if (batches) {
+        SqlQueryResult head = pre[0];
+        for (size_t k = 1; k < pre.size(); ++k)
+          for (size_t ci = 0; ci < head.column_types.size() && ci < pre[k].column_types.size(); ++ci)
+            if (pre[k].column_types[ci] == SqlDataType::Real &&
+                (head.column_types[ci] == SqlDataType::Decimal || head.column_types[ci] == SqlDataType::Int))
+              head.column_types[ci] = SqlDataType::Real;
+        const size_t nc = head.columns.size();
+        ColBatch out;
+        out.cols.assign(nc, ColBatch::Col());
+        for (const ColBatch& b : bb) out.rows += b.rows;
+        bool ok = true;
+        // A branch's text or dictionary column in a number column of the union: an INT column's canonical integers
+        // become integer lanes (colbatch_narrow_int); a DOUBLE column's values become doubles where they parse,
+        // which is what the row path does to them below (each reprinted from its double); one that does not parse
+        // leaves the union to the rows.
+        for (size_t ci = 0; ci < nc && ok; ++ci) {
+          const SqlDataType t = ci < head.column_types.size() ? head.column_types[ci] : SqlDataType::Text;
+          for (ColBatch& b : bb) {
+            ColBatch::Col& bc = b.cols[ci];
+            if (t == SqlDataType::Int) colbatch_narrow_int(bc, b.rows);
+            if (t != SqlDataType::Real || (bc.kind != ColBatch::Text && bc.kind != ColBatch::Codes)) continue;
+            std::vector<double> f(b.rows, 0);
+            std::vector<uint8_t> nul(b.rows, 0);
+            for (size_t r = 0; r < b.rows && ok; ++r) {
+              if (bc.is_null(r)) { nul[r] = 1; continue; }
+              double d = 0;
+              if (!parse_number(bc.kind == ColBatch::Text ? bc.s[r] : bc.dict[bc.codes[r]], &d) || !std::isfinite(d)) ok = false;
+              f[r] = d;
+            }
+            if (!ok) break;
+            bc.kind = ColBatch::F64;
+            bc.f.swap(f);
+            bc.nul.swap(nul);
+            std::vector<std::string>().swap(bc.s);
+            std::vector<uint32_t>().swap(bc.codes);
+            std::vector<std::string>().swap(bc.dict);
+          }
+        }
+        if (!ok && vx_trace_on()) vx_trace("colbatch: union DOUBLE column with text that is no number: rows");
+        for (size_t ci = 0; ci < nc && ok; ++ci) {
+          const SqlDataType t = ci < head.column_types.size() ? head.column_types[ci] : SqlDataType::Text;
+          bool all_i = true, all_num = true;
+          for (const ColBatch& b : bb) {
+            const auto k = b.cols[ci].kind;
+            if (k != ColBatch::I64) all_i = false;
+            if (k != ColBatch::I64 && k != ColBatch::F64) all_num = false;
+          }
+          ColBatch::Col& oc = out.cols[ci];
+          if (t == SqlDataType::Int && all_i) {
+            oc.kind = ColBatch::I64;
+            for (const ColBatch& b : bb) {
+              oc.i.insert(oc.i.end(), b.cols[ci].i.begin(), b.cols[ci].i.end());
+              oc.nul.insert(oc.nul.end(), b.cols[ci].nul.begin(), b.cols[ci].nul.end());
+            }
+          } else if (t == SqlDataType::Real && all_num) {
+            oc.kind = ColBatch::F64;
+            for (const ColBatch& b : bb) {
+              const ColBatch::Col& bc = b.cols[ci];
+              for (size_t r = 0; r < b.rows; ++r) {
+                if (bc.kind == ColBatch::I64 && !bc.nul[r] && std::fabs((double)bc.i[r]) > 9007199254740992.0) { ok = false; break; }
+                oc.f.push_back(bc.kind == ColBatch::I64 ? (double)bc.i[r] : bc.f[r]);
+              }
+              oc.nul.insert(oc.nul.end(), bc.nul.begin(), bc.nul.end());
+            }
+          } else if (t == SqlDataType::Text) {
+            oc.kind = ColBatch::Text;
+            oc.s.reserve(out.rows);
+            for (const ColBatch& b : bb) for (size_t r = 0; r < b.rows; ++r) oc.s.push_back(b.cols[ci].text(r));
+          } else {
+            ok = false;   // a number column holding text, or a DECIMAL: the row path's rules
+            if (vx_trace_on()) {
+              std::string kinds;
+              for (const ColBatch& b : bb) kinds += std::to_string((int)b.cols[ci].kind);
+              vx_trace("colbatch: union column " + head.columns[ci] + " type " + std::to_string((int)t) + " kinds " + kinds + ": rows");
+            }
+          }
+        }
+        if (ok) {
+          out.filled = true;
+          *col_out = std::move(out);
+          head.rows.clear();
+          head.rows_in_batch = true;
+          return head;
+        }
+      }
+      for (size_t k = 0; k < pre.size(); ++k)
+        if (pre[k].rows_in_batch) { bb[k].to_rows(&pre[k].rows); pre[k].rows_in_batch = false; }
+    } else {
+      pre.clear();
+    }
+  }
+
+  SqlQueryResult res = pre.empty() ? execute_parsed_select_single(db, stmt.branches[0]) : std::move(pre[0]);
   if (!res.success) return res;
 
   for (size_t u = 0; u < stmt.union_is_all.size(); ++u) {
     bool is_all = stmt.union_is_all[u];
     if (u + 1 >= stmt.branches.size()) break;
-    SqlQueryResult next_res = execute_parsed_select_single(db, stmt.branches[u + 1]);
+    SqlQueryResult next_res = pre.empty() ? execute_parsed_select_single(db, stmt.branches[u + 1]) : std::move(pre[u + 1]);
     if (!next_res.success) return next_res;
     const uint8_t kind = u < stmt.union_kind.size() ? stmt.union_kind[u] : 0;
     // A column that is a DOUBLE in any branch is a DOUBLE: MariaDB's type for DECIMAL beside DOUBLE (and INT beside
@@ -48474,7 +48852,8 @@ SqlQueryResult SqlDatabase::execute_select(const std::string& sql) {
 // column that came from a string column stays a declared string, so an
 // all-digit VARCHAR id is still text. The CTE's own column list, when it has
 // one, names them.
-static void cte_columns_from(const SqlQueryResult& res, const std::vector<std::string>& names, SqlTable* tbl) {
+template <typename Each>
+static void cte_columns_with(const SqlQueryResult& res, const std::vector<std::string>& names, SqlTable* tbl, Each&& each) {
   for (size_t ci = 0; ci < res.columns.size(); ++ci) {
     SqlColumn c;
     c.name = ci < names.size() ? names[ci] : res.columns[ci];
@@ -48486,18 +48865,31 @@ static void cte_columns_from(const SqlQueryResult& res, const std::vector<std::s
     // from such an expression: then the column is a DECIMAL at that scale.
     if (c.type == SqlDataType::Real) {
       bool fixed = false, plain = true;
-      for (const SqlRow& row : res.rows) {
-        if (ci >= row.values.size() || sql_is_null(row.values[ci])) continue;
-        const std::string& s = row.values[ci];
+      each(ci, [&](const std::string& s) {
         const size_t dot = s.find('.');
-        if (s.find_first_of("eE") != std::string::npos) { plain = false; break; }
+        if (s.find_first_of("eE") != std::string::npos) { plain = false; return false; }
         if (dot != std::string::npos && dot + 1 < s.size() && s.back() == '0') fixed = true;
-      }
+        return true;
+      });
       if (fixed && plain) c.type = SqlDataType::Decimal;
     }
     tbl->columns.push_back(c);
   }
-  fit_decimal_scales(tbl->columns, res.rows);
+  fit_decimal_scales_with(tbl->columns, each);
+}
+
+static void cte_columns_from(const SqlQueryResult& res, const std::vector<std::string>& names, SqlTable* tbl) {
+  cte_columns_with(res, names, tbl, [&](size_t c, auto&& fn) {
+    for (const SqlRow& row : res.rows) {
+      if (c >= row.values.size() || sql_is_null(row.values[c])) continue;
+      if (!fn(row.values[c])) return;
+    }
+  });
+}
+
+// The same columns for an answer held in a typed batch (res carries the header, B the rows).
+static void cte_columns_from_batch(const SqlQueryResult& res, const ColBatch& B, const std::vector<std::string>& names, SqlTable* tbl) {
+  cte_columns_with(res, names, tbl, [&](size_t c, auto&& fn) { colbatch_each_value(B, c, fn); });
 }
 
 SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
@@ -48644,14 +49036,18 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       }
 
       SqlQueryResult res;
+      ColBatch batch;
       const uint64_t t0 = trace_merge ? hal_now_ns() : 0;
       {
         RowsOnly rows_only;
+        ColOutRequest want_columns(&batch);   // its rows as typed columns, where the select can give them so
         res = execute_local_query(cte_sql);
       }
       if (!res.success) return res;
+      const bool in_batch = res.rows_in_batch && batch.filled;
       if (trace_merge)
-        std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows\n", cte_name.c_str(), (hal_now_ns() - t0) / 1e6, res.rows.size());
+        std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows%s\n", cte_name.c_str(), (hal_now_ns() - t0) / 1e6,
+                     in_batch ? batch.rows : res.rows.size(), in_batch ? " (columns)" : "");
 
       SqlTable tbl;
       tbl.name = cte_name;
@@ -48659,10 +49055,19 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         return make_error("CTE " + cte_name + " column count mismatch: expected " +
                           std::to_string(cte_cols.size()) + ", got " + std::to_string(res.columns.size()));
       }
-      cte_columns_from(res, cte_cols, &tbl);
+      if (in_batch) cte_columns_from_batch(res, batch, cte_cols, &tbl);
+      else cte_columns_from(res, cte_cols, &tbl);
       tbl.ensure_columns();
-      tbl.reserve(res.rows.size());
-      append_result_rows(&tbl, res.rows);   // the table holds them now
+      tbl.reserve(in_batch ? batch.rows : res.rows.size());
+      const uint64_t ta0 = trace_merge ? hal_now_ns() : 0;
+      if (in_batch && !colbatch_fill_table(&tbl, batch)) {   // a table not to fill so: the rows the row path made
+        batch.to_rows(&res.rows);
+        res.rows_in_batch = false;
+        append_result_rows(&tbl, res.rows);
+      } else if (!in_batch) {
+        append_result_rows(&tbl, res.rows);   // the table holds them now
+      }
+      if (trace_merge) std::fprintf(stderr, "[cte-append] %-21s %8.1f ms\n", cte_name.c_str(), (hal_now_ns() - ta0) / 1e6);
       current_scope[cte_name] = std::make_shared<SqlTable>(std::move(tbl));
     } else {
       // Recursive CTE

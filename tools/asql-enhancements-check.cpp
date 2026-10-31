@@ -262,11 +262,16 @@ int main() {
     assert(some.rows[1].values[col(some, "sum")] == "1.5000");
     assert(db.execute_gateway_query("SHOW THING gt KEYS ()").rows.empty());
     assert(!db.execute_gateway_query("SHOW THING gt KEYS 'A'").success);
-    // A full read is the rows kept for the kind's version: a Thing that goes, or a new one, is in the next read.
+    // A full read is the rows kept for the kind's version: a Thing that goes, or a new one, is in the read after
+    // the reaction to the write has run (WAIT THING, as in the update above).
+    auto clock_of = [&](const SqlQueryResult& r) { return r.rows.empty() ? std::string() : r.rows[0].values[col(r, "clock")]; };
+    std::string since2 = clock_of(db.execute_gateway_query("WAIT THING gt SINCE 0"));
     assert(db.execute_gateway_query("DELETE FROM gt_items WHERE stockid = 'C'").success);
+    since2 = clock_of(db.execute_gateway_query("WAIT THING gt SINCE " + since2 + " TIMEOUT 10"));
     show = db.execute_gateway_query("SHOW THING gt");
     assert(show.success && show.rows.size() == 2);
     assert(db.execute_gateway_query("INSERT INTO gt_items VALUES ('D',1.0,1.00)").success);
+    since2 = clock_of(db.execute_gateway_query("WAIT THING gt SINCE " + since2 + " TIMEOUT 10"));
     show = db.execute_gateway_query("SHOW THING gt");
     assert(show.success && show.rows.size() == 3);
     by_key.clear();
