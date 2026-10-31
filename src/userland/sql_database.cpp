@@ -43809,6 +43809,182 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
   return t;
 }
 
+// GROUP BY over integer lanes (docs/asql-vectorized-plan.md, stage 1b). Every GROUP BY key, every plain select item
+// and every aggregate's argument a compiled program over the joined rows giving signed integers; the aggregates
+// COUNT, MIN and MAX; every output column INT. The general path moved every row into a per-group vector keyed by a
+// string, evaluated each group's items through the interpreter, folded MIN through Vals and printed the answers -
+// 1.1 billion instructions for SQLDoom's depth resolve (78,421 fragments into 53,760 pixels). Here the lanes are
+// made once, each row's group found in a flat table, the aggregates folded as integers. The groups are what the
+// general path makes: numbered by first appearance, NULL keys one group, a plain item read from the group's first
+// row; out is in key order with NULL first - GROUP BY's implicit ORDER BY over integers. out: a column per item, a
+// value per group. False: not that shape (nothing changed). AIOS_SQL_LANE_GROUP=0 turns it off.
+static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sources, const JoinedRows& rows,
+                          const std::vector<ExprPtr>& group_by, const std::vector<SelectItem>& items,
+                          std::vector<vp::Column>* out, size_t* ngroups) {
+  static const bool on = [] { const char* v = std::getenv("AIOS_SQL_LANE_GROUP"); return !(v && *v == '0'); }();
+  if (!on || !vp::enabled() || group_by.empty() || group_by.size() > 8 || rows.empty() || rows.size() >= UINT32_MAX) return false;
+  auto no = [](const std::string& why) { if (vx_trace_on()) vx_trace("group: not over lanes: " + why); return false; };
+  enum Kind { Plain, CountStar, Count, Min, Max };
+  std::vector<Kind> kind(items.size(), Plain);
+  for (size_t i = 0; i < items.size(); ++i) {
+    const SelectItem& it = items[i];
+    const SqlExpr* e = it.expr.get();
+    if (it.star || !e) return no("a star item");
+    if (infer_item_type(e, sources) != SqlDataType::Int) return no("item " + std::to_string(i + 1) + " is not INT");
+    if (!expr_has_aggregate(it.expr)) continue;
+    if (e->op != ExprOp::Func || e->window || e->negated || e->args.size() > 1) return no("item " + std::to_string(i + 1) + " is not a plain aggregate");
+    const std::string& up = func_upper(e);
+    const bool star = e->args.empty() || (e->args[0] && e->args[0]->op == ExprOp::Star);
+    if (up == "COUNT"sv) kind[i] = star ? CountStar : Count;
+    else if (up == "MIN"sv && !star) kind[i] = Min;
+    else if (up == "MAX"sv && !star) kind[i] = Max;
+    else return no("item " + std::to_string(i + 1) + " is " + up);
+    if (kind[i] != CountStar && (!e->args[0] || expr_has_aggregate(e->args[0]))) return no("a nested aggregate");
+  }
+  EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
+  auto lane = [&](const SqlExpr* e, vp::Column* col) -> bool {
+    // A bare column of a typed integer encoding (programs leave bare columns to the column readers): its integers
+    // by row id - the value a cell holds, read as the interpreter reads it.
+    size_t cs_src = 0, cs_col = 0;
+    if (e->op == ExprOp::Column && lookup_column_here(vctx, *e, &cs_src, &cs_col) == ColumnLookup::Found &&
+        cs_src < sources.size() && sources[cs_src].table && cs_col < sources[cs_src].table->col_data.size()) {
+      const SqlTable& tb = *sources[cs_src].table;
+      const ColumnStore& cs = tb.col_data[cs_col];
+      if (!vx::typed_integer(cs) || cs.size() != tb.row_count() || cs_col >= tb.columns.size() || tb.columns[cs_col].temporal ||
+          tb.columns[cs_col].type != SqlDataType::Int)
+        return no("column " + e->source_text.substr(0, 60) + " not typed integers");
+      col->ty = vp::Ty::I64;
+      col->uns = false;
+      col->i.assign(rows.size(), 0);
+      col->n.assign(rows.size(), 0);
+      const bool nulls = vx::has_nulls(cs);
+      for (size_t j = 0; j < rows.size(); ++j) {
+        const size_t r = cs_src < rows[j].parts.size() ? rows[j].parts[cs_src] : kNullRow;
+        if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { col->n[j] = 1; continue; }
+        col->i[j] = vx::typed_int(cs, r);
+      }
+      return true;
+    }
+    const vp::Prog* P = vp::program_for(e, vctx);
+    if (!P) return no("no program for " + e->source_text.substr(0, 60));
+    if (P->out().ty != vp::Ty::I64) return no("not integers: " + e->source_text.substr(0, 60));
+    std::string err;
+    if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), col, &err)) return no("evaluation: " + err);
+    if (col->ty != vp::Ty::I64 || col->size() != rows.size()) return no("lane not integers");
+    return true;
+  };
+  const size_t n = rows.size(), nk = group_by.size();
+  std::vector<vp::Column> keys(nk);
+  for (size_t c = 0; c < nk; ++c) if (!lane(group_by[c].get(), &keys[c])) return false;
+  std::vector<vp::Column> args(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (kind[i] == CountStar) continue;
+    if (!lane(kind[i] == Plain ? items[i].expr.get() : items[i].expr->args[0].get(), &args[i])) return false;
+  }
+  // Each row's group: a flat open-addressed table of the key tuples seen (NULL equal to NULL, as GROUP BY has it).
+  auto mix = [](uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); };
+  auto hash_row = [&](size_t r) {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (size_t c = 0; c < nk; ++c) h = mix(h ^ (keys[c].n[r] ? 0x5bd1e9955bd1e995ull : (uint64_t)keys[c].i[r] * 2 + 1));
+    return h;
+  };
+  std::vector<uint32_t> first;                 // a group's first row
+  std::vector<uint32_t> gid(n);
+  std::vector<uint32_t> slots(64, 0);
+  size_t mask = slots.size() - 1;
+  auto same = [&](size_t a, size_t b) {
+    for (size_t c = 0; c < nk; ++c) {
+      const bool na = keys[c].n[a] != 0, nb = keys[c].n[b] != 0;
+      if (na != nb || (!na && keys[c].i[a] != keys[c].i[b])) return false;
+    }
+    return true;
+  };
+  std::vector<uint64_t> ghash;
+  for (size_t r = 0; r < n; ++r) {
+    const uint64_t h = hash_row(r);
+    size_t at = h & mask;
+    for (;; at = (at + 1) & mask) {
+      const uint32_t s = slots[at];
+      if (!s) break;
+      if (ghash[s - 1] == h && same(first[s - 1], r)) break;
+    }
+    if (slots[at]) { gid[r] = slots[at] - 1; continue; }
+    gid[r] = (uint32_t)first.size();
+    first.push_back((uint32_t)r);
+    ghash.push_back(h);
+    slots[at] = (uint32_t)first.size();
+    if (first.size() * 2 > slots.size()) {
+      slots.assign(slots.size() * 2, 0);
+      mask = slots.size() - 1;
+      for (size_t g = 0; g < first.size(); ++g) {
+        size_t a = ghash[g] & mask;
+        while (slots[a]) a = (a + 1) & mask;
+        slots[a] = (uint32_t)g + 1;
+      }
+    }
+  }
+  const size_t G = first.size();
+  // The aggregates folded over the rows in order.
+  std::vector<vp::Column> res(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    vp::Column& c = res[i];
+    c.ty = vp::Ty::I64;
+    c.i.assign(G, 0);
+    c.n.assign(G, 0);
+    c.uns = kind[i] != CountStar && kind[i] != Count && args[i].uns;   // a value keeps its argument's signedness
+    if (kind[i] == Plain) {
+      for (size_t g = 0; g < G; ++g) { c.n[g] = args[i].n[first[g]]; c.i[g] = args[i].i[first[g]]; }
+      continue;
+    }
+    if (kind[i] == CountStar || kind[i] == Count) {
+      for (size_t r = 0; r < n; ++r) if (kind[i] == CountStar || !args[i].n[r]) ++c.i[gid[r]];
+      continue;
+    }
+    std::vector<uint8_t> has(G, 0);
+    const bool mn = kind[i] == Min;
+    for (size_t r = 0; r < n; ++r) {
+      if (args[i].n[r]) continue;
+      const int64_t v = args[i].i[r];
+      const uint32_t g = gid[r];
+      if (!has[g]) { has[g] = 1; c.i[g] = v; continue; }
+      const bool less = c.uns ? (uint64_t)v < (uint64_t)c.i[g] : v < c.i[g];
+      const bool more = c.uns ? (uint64_t)v > (uint64_t)c.i[g] : v > c.i[g];
+      if (mn ? less : more) c.i[g] = v;
+    }
+    for (size_t g = 0; g < G; ++g) c.n[g] = !has[g];   // every argument NULL: NULL
+  }
+  // Key order, NULL first: the implicit ORDER BY of the keys, over integers. Two groups never share a key tuple.
+  std::vector<uint32_t> order(G);
+  for (size_t g = 0; g < G; ++g) order[g] = (uint32_t)g;
+  std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+    const size_t ra = first[a], rb = first[b];
+    for (size_t c = 0; c < nk; ++c) {
+      const bool na = keys[c].n[ra] != 0, nb = keys[c].n[rb] != 0;
+      if (na != nb) return na;
+      if (!na && keys[c].i[ra] != keys[c].i[rb])
+        return keys[c].uns ? (uint64_t)keys[c].i[ra] < (uint64_t)keys[c].i[rb] : keys[c].i[ra] < keys[c].i[rb];
+    }
+    return false;
+  });
+  out->assign(items.size(), vp::Column());
+  for (size_t i = 0; i < items.size(); ++i) {
+    vp::Column& o = (*out)[i];
+    o.ty = vp::Ty::I64;
+    o.i.resize(G);
+    o.n.resize(G);
+    for (size_t k = 0; k < G; ++k) { o.i[k] = res[i].i[order[k]]; o.n[k] = res[i].n[order[k]]; }
+    // unsigned values all below 2^63 print as the same digits signed: an ordinary integer column
+    o.uns = res[i].uns;
+    if (o.uns) {
+      bool high = false;
+      for (size_t k = 0; k < G && !high; ++k) if (!o.n[k] && o.i[k] < 0) high = true;
+      if (!high) o.uns = false;
+    }
+  }
+  *ngroups = G;
+  return true;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -47801,6 +47977,40 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
     }
   } else {
+    // GROUP BY over integer lanes where the statement is that shape (lane_group_by): the groups below otherwise.
+    bool lane_done = false;
+    if (vx_trace_on() && (star_columnar || distinct || having || order_by.size() != group_by.size()))
+      vx_trace(std::string("group: not over lanes:") + (star_columnar ? " star-columnar" : "") + (distinct ? " DISTINCT" : "") +
+               (having ? " HAVING" : "") + (order_by.size() != group_by.size() ? " its own ORDER BY" : ""));
+    // Under an outer scope too (a CTE, a derived table, a subquery): the lanes are compiled with none, so a column
+    // from further out does not compile and the statement declines; a local column means the same in both.
+    if (!star_columnar && !distinct && !having && !group_by.empty() && order_by.size() == group_by.size()) {
+      bool implicit_order = true;   // GROUP BY's own ORDER BY of its keys, as made above
+      for (size_t i = 0; i < order_by.size(); ++i)
+        if (order_by[i].expr != group_by[i] || order_by[i].ordinal > 0 || order_by[i].descending) implicit_order = false;
+      std::vector<vp::Column> lcols;
+      size_t G = 0;
+      if (implicit_order && lane_group_by(db, sources, rows, group_by, expanded, &lcols, &G)) {
+        lane_done = true;
+        if (vx_trace_on()) vx_trace("group: " + std::to_string(G) + " groups over integer lanes (" + std::to_string(rows.size()) + " rows)");
+        if (col_out && limit < 0 && offset <= 0) {
+          col_out->cols.assign(lcols.size(), ColBatch::Col());
+          for (size_t i = 0; i < lcols.size(); ++i) colbatch_from_vp(std::move(lcols[i]), SqlDataType::Int, 0, &col_out->cols[i]);
+          col_out->rows = G;
+          col_out->filled = true;
+        } else {
+          out_rows.reserve(G);
+          for (size_t g = 0; g < G; ++g) {
+            OutRow o;
+            o.row.values.reserve(lcols.size());
+            for (const vp::Column& c : lcols) o.row.values.push_back(c.text(g));
+            out_rows.push_back(std::move(o));
+          }
+        }
+        order_by.clear();   // in key order already
+      }
+    }
+    if (!lane_done) {
     std::vector<JoinedRows> groups;
     std::vector<std::vector<std::pair<const SqlExpr*, Val>>> star_vals;
     bool star_grouped = false;
@@ -48675,6 +48885,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         emit_row(out_rows, std::move(o));
       }
     }
+    }   // !lane_done
   }
 
   // DISTINCT over grouped rows whose select list carries every GROUP BY key
