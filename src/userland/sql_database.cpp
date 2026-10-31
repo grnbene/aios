@@ -55639,123 +55639,112 @@ std::shared_ptr<SqlDatabase::ProbeIndex> SqlDatabase::get_or_build_probe_index(c
   idx.numeric_column = (size_t)column < t.columns.size() && sql_type_numeric(t.columns[(size_t)column].type) &&
                        !t.columns[(size_t)column].temporal && !t.inferred_types;
 
+  // Each row's number key, as the index has always keyed it: a number by its value; text that is not a number
+  // under its collation key in by_text and, when it starts with digits, under that prefix in by_number (else in
+  // no_numeric_prefix). An index built from its first row takes every row's number key at once
+  // (NumberRows::build_frozen); one that is topped up after rows were appended adds them a row at a time.
+  const bool whole = idx.rows_indexed == 0 && idx.by_number.empty() && idx.by_text.empty() && idx.no_numeric_prefix.empty();
+  auto number_keys = [&](auto&& key_of) {
+    if (whole) { idx.by_number.build_frozen(idx.rows_indexed, end, key_of); return; }
+    for (size_t r = idx.rows_indexed; r < end; ++r) {
+      double d;
+      if (key_of(r, &d)) idx.by_number[d].push_back((uint32_t)r);
+    }
+  };
   if (cstore && (cstore->encoding == ColumnEncoding::DictBitPacked || cstore->encoding == ColumnEncoding::RLE)) {
     const auto& d = cstore->shared_dict ? cstore->shared_dict->dict : cstore->dict;
-    struct DictParsed {
+    // Each dictionary entry read once: its number key (a number's value, or the numeric prefix of text that has
+    // one), and for text its collation key's list in by_text and whether it goes to no_numeric_prefix.
+    struct DictKey {
       bool is_null = false;
-      bool is_numeric = false;
+      bool has_num = false;
       double num = 0.0;
-      std::string low_text;
+      std::vector<uint32_t>* text_rows = nullptr;   // by_text's list (an unordered_map: the pointer stays good)
+      bool no_prefix = false;
+    };
+    std::vector<DictKey> keys(d.size());
+    for (size_t i = 0; i < d.size(); ++i) {
+      if (sql_is_null(d[i])) { keys[i].is_null = true; continue; }
+      Val v = idx.text_column ? val_text(d[i]) : val_cell(d[i]);
+      if (v.numeric) { keys[i].has_num = true; keys[i].num = v.num; continue; }
+      keys[i].text_rows = &idx.by_text[collate_key(v.str())];
       bool had_digits = false;
-      double num_prefix = 0.0;
-    };
-    std::vector<DictParsed> parsed(d.size());
-    for (size_t i = 0; i < d.size(); ++i) {
-      if (sql_is_null(d[i])) {
-        parsed[i].is_null = true;
-      } else {
-        Val v = idx.text_column ? val_text(d[i]) : val_cell(d[i]);
-        if (v.numeric) {
-          parsed[i].is_numeric = true;
-          parsed[i].num = v.num;
-        } else {
-          parsed[i].is_numeric = false;
-          parsed[i].low_text = collate_key(v.str());
-          parsed[i].num_prefix = numeric_prefix_of(v.str(), &parsed[i].had_digits);
-        }
-      }
+      const double np = numeric_prefix_of(v.str(), &had_digits);
+      if (had_digits) { keys[i].has_num = true; keys[i].num = np; } else keys[i].no_prefix = true;
     }
-
-    struct DictBucketTargets {
-      std::vector<uint32_t>* target_num = nullptr;
-      std::vector<uint32_t>* target_text = nullptr;
-      std::vector<uint32_t>* target_prefix = nullptr;
-      std::vector<uint32_t>* target_no_prefix = nullptr;
-    };
-    std::vector<DictBucketTargets> targets(d.size());
-    for (size_t i = 0; i < d.size(); ++i) {
-      if (parsed[i].is_null) continue;
-      if (parsed[i].is_numeric) {
-        targets[i].target_num = &idx.by_number[parsed[i].num];
-      } else {
-        targets[i].target_text = &idx.by_text[parsed[i].low_text];
-        if (parsed[i].had_digits) {
-          targets[i].target_prefix = &idx.by_number[parsed[i].num_prefix];
-        } else {
-          targets[i].target_no_prefix = &idx.no_numeric_prefix;
-        }
-      }
-    }
-
     idx.by_code.resize(d.size());
+    std::vector<uint32_t> code_of(end - idx.rows_indexed, UINT32_MAX);
     for (size_t r = idx.rows_indexed; r < end; ++r) {
       if (cstore->is_null(r)) continue;
-      uint32_t code = cstore->read_code(r);
-      if (code < targets.size()) {
-        const auto& tgt = targets[code];
-        if (tgt.target_num) tgt.target_num->push_back((uint32_t)r);
-        if (tgt.target_text) tgt.target_text->push_back((uint32_t)r);
-        if (tgt.target_prefix) tgt.target_prefix->push_back((uint32_t)r);
-        if (tgt.target_no_prefix) tgt.target_no_prefix->push_back((uint32_t)r);
-        idx.by_code[code].push_back((uint32_t)r);
-      }
+      const uint32_t code = cstore->read_code(r);
+      if (code >= keys.size()) continue;
+      idx.by_code[code].push_back((uint32_t)r);   // every non-NULL row's code, as before (a NULL entry's too)
+      if (keys[code].is_null) continue;
+      code_of[r - idx.rows_indexed] = code;
+      const DictKey& k = keys[code];
+      if (k.text_rows) k.text_rows->push_back((uint32_t)r);
+      if (k.no_prefix) idx.no_numeric_prefix.push_back((uint32_t)r);
     }
+    const size_t from = idx.rows_indexed;
+    number_keys([&](size_t r, double* out) {
+      const uint32_t code = code_of[r - from];
+      if (code == UINT32_MAX || !keys[code].has_num) return false;
+      *out = keys[code].num;
+      return true;
+    });
   } else if (cstore && cstore->encoding == ColumnEncoding::TypedInt32) {
-    for (size_t r = idx.rows_indexed; r < end; ++r) {
-      if (cstore->is_null(r)) continue;
-      if (r < cstore->int32_data.size()) {
-        idx.by_number[static_cast<double>(cstore->int32_data[r])].push_back((uint32_t)r);
-      }
-    }
+    number_keys([&](size_t r, double* out) {
+      if (cstore->is_null(r) || r >= cstore->int32_data.size()) return false;
+      *out = static_cast<double>(cstore->int32_data[r]);
+      return true;
+    });
   } else if (cstore && cstore->encoding == ColumnEncoding::TypedInt64) {
-    for (size_t r = idx.rows_indexed; r < end; ++r) {
-      if (cstore->is_null(r)) continue;
-      if (r < cstore->int64_data.size()) {
-        idx.by_number[static_cast<double>(cstore->int64_data[r])].push_back((uint32_t)r);
-      }
-    }
+    number_keys([&](size_t r, double* out) {
+      if (cstore->is_null(r) || r >= cstore->int64_data.size()) return false;
+      *out = static_cast<double>(cstore->int64_data[r]);
+      return true;
+    });
   } else if (cstore && cstore->encoding == ColumnEncoding::TypedDouble) {
-    for (size_t r = idx.rows_indexed; r < end; ++r) {
-      if (cstore->is_null(r)) continue;
-      if (r < cstore->double_data.size()) {
-        idx.by_number[cstore->double_data[r]].push_back((uint32_t)r);
-      }
-    }
+    number_keys([&](size_t r, double* out) {
+      if (cstore->is_null(r) || r >= cstore->double_data.size()) return false;
+      *out = cstore->double_data[r];
+      return true;
+    });
   } else if (cstore && !idx.text_column && cstore->size() == t.row_count() &&
              (cstore->encoding == ColumnEncoding::FOR || cstore->encoding == ColumnEncoding::SegmentFOR)) {
     // Frame-of-reference integers: a cell prints as its integer, which val_cell reads back as exactly this double.
     // Printed and parsed back a row at a time, they were a third of building a SQLDoom frame's join indexes.
-    for (size_t r = idx.rows_indexed; r < end; ++r) {
-      if (cstore->is_null(r)) continue;
-      idx.by_number[(double)vx::typed_int(*cstore, r)].push_back((uint32_t)r);
-    }
+    number_keys([&](size_t r, double* out) {
+      if (cstore->is_null(r)) return false;
+      *out = (double)vx::typed_int(*cstore, r);
+      return true;
+    });
   } else {
-    for (size_t r = idx.rows_indexed; r < end; ++r) {
+    // NULL never equals anything, so a NULL row can never be a match and is left out of every list.
+    std::vector<uint8_t> has(end - idx.rows_indexed, 0);
+    std::vector<double> num(end - idx.rows_indexed, 0.0);
+    const size_t from = idx.rows_indexed;
+    for (size_t r = from; r < end; ++r) {
       if ((size_t)column >= t.columns.size()) continue;
       const std::string& cell = t.cell(r, (size_t)column);
-      // NULL never equals anything, so a NULL row can never be a match and is
-      // left out of both maps rather than clogging them.
       if (sql_is_null(cell)) continue;
       Val v = idx.text_column ? val_text(cell) : val_cell(cell);
-      if (v.numeric) {
-        idx.by_number[v.num].push_back((uint32_t)r);
-      } else {
-        std::string low = collate_key(v.str());
-        idx.by_text[low].push_back((uint32_t)r);
-        // A value like '709113-00' has to be findable by 709113 as well, because
-        // that is what it equals when it meets an int. One with no leading digits
-        // is worth 0 to MySQL, but it goes in its own list rather than bucket 0 --
-        // otherwise every stockid in the table shares one bucket and the probe
-        // degenerates into the scan it was meant to replace.
-        bool had_digits = false;
-        double np = numeric_prefix_of(v.str(), &had_digits);
-        if (had_digits) {
-          idx.by_number[np].push_back((uint32_t)r);
-        } else {
-          idx.no_numeric_prefix.push_back((uint32_t)r);
-        }
-      }
+      if (v.numeric) { has[r - from] = 1; num[r - from] = v.num; continue; }
+      idx.by_text[collate_key(v.str())].push_back((uint32_t)r);
+      // A value like '709113-00' has to be findable by 709113 as well, because
+      // that is what it equals when it meets an int. One with no leading digits
+      // is worth 0 to MySQL, but it goes in its own list rather than bucket 0 --
+      // otherwise every stockid in the table shares one bucket and the probe
+      // degenerates into the scan it was meant to replace.
+      bool had_digits = false;
+      const double np = numeric_prefix_of(v.str(), &had_digits);
+      if (had_digits) { has[r - from] = 1; num[r - from] = np; } else idx.no_numeric_prefix.push_back((uint32_t)r);
     }
+    number_keys([&](size_t r, double* out) {
+      if (!has[r - from]) return false;
+      *out = num[r - from];
+      return true;
+    });
   }
   idx.shrink_memory();
   idx.rows_indexed = end;

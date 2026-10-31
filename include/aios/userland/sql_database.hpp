@@ -312,6 +312,208 @@ struct SqlCheck {
   bool column_level = false;   // `col INT CHECK (...)`: printed on the column's line
 };
 
+// SqlProbeIndex::by_number: a join index's rows by the number they hold, each key's rows ascending. It was an
+// unordered_map<double, vector>: a node and a vector a distinct key (most of building a SQLDoom frame's join
+// indexes) and a hash, a bucket and two dependent loads a probe. Two forms here, one table of slots:
+//  - frozen: every key's rows in one shared array (CSR), built in two passes over the column (build_frozen) with
+//    no allocation a key - an index built whole, as a statement's result tables have;
+//  - thawed: a vector a key, for the writers that keep an index up to date row by row (operator[], erase, mutable
+//    iteration); a frozen index thaws the first time one of them touches it.
+// Readers (find, const iteration) see either form the same way: a key and a span of its rows. Keys compare as
+// doubles compare (0 and -0 are one key; a NaN is never found), as the map's did. Iteration order is the order
+// keys were first seen, which nothing relies on (the map's was unspecified).
+class NumberRows {
+ public:
+  struct Span {
+    const uint32_t* b = nullptr;
+    const uint32_t* e = nullptr;
+    const uint32_t* begin() const { return b; }
+    const uint32_t* end() const { return e; }
+    size_t size() const { return (size_t)(e - b); }
+    bool empty() const { return b == e; }
+    uint32_t operator[](size_t i) const { return b[i]; }
+  };
+  struct View { double first = 0; Span second; };
+  class const_iterator {
+   public:
+    const_iterator(const NumberRows* m, size_t i) : m_(m), i_(i) {}
+    const View& operator*() const { cur_ = m_->view_at(i_); return cur_; }
+    const View* operator->() const { cur_ = m_->view_at(i_); return &cur_; }
+    const_iterator& operator++() { ++i_; return *this; }
+    bool operator==(const const_iterator& o) const { return i_ == o.i_; }
+    bool operator!=(const const_iterator& o) const { return i_ != o.i_; }
+   private:
+    const NumberRows* m_;
+    size_t i_;
+    mutable View cur_;
+  };
+  struct Entry { double first; std::vector<uint32_t> second; };
+  using iterator = std::vector<Entry>::iterator;
+
+  size_t size() const { return frozen_ ? keys_.size() : entries_.size(); }
+  bool empty() const { return size() == 0; }
+  size_t bucket_count() const { return slots_.size(); }
+  bool frozen() const { return frozen_; }
+  void clear() {
+    entries_.clear(); keys_.clear(); off_.clear(); rows_.clear(); slots_.clear();
+    mask_ = 0; frozen_ = false;
+  }
+  void reserve(size_t n) { if (!frozen_) { entries_.reserve(n); grow_slots(n); } }
+
+  const_iterator begin() const { return const_iterator(this, 0); }
+  const_iterator end() const { return const_iterator(this, size()); }
+  const_iterator find(double k) const {
+    const size_t i = lookup(k);
+    return i == kNone ? end() : const_iterator(this, i);
+  }
+  // The writers' side: thaws.
+  iterator begin() { thaw(); return entries_.begin(); }
+  iterator end() { thaw(); return entries_.end(); }
+  std::vector<uint32_t>& operator[](double k) {
+    thaw();
+    size_t i = lookup(k);
+    if (i == kNone) {
+      grow_slots(entries_.size() + 1);
+      i = entries_.size();
+      entries_.push_back(Entry{k, {}});
+      place(k, i);
+    }
+    return entries_[i].second;
+  }
+  iterator erase(iterator it) {
+    thaw();
+    const size_t i = (size_t)(it - entries_.begin());
+    unplace(i);
+    const size_t last = entries_.size() - 1;
+    if (i != last) {
+      unplace(last);
+      entries_[i] = std::move(entries_[last]);
+      place(entries_[i].first, i);
+    }
+    entries_.pop_back();
+    return entries_.begin() + (std::ptrdiff_t)i;
+  }
+
+  // Rows [from, to) at once, ascending: key_of(r, &d) gives row r's key, false for none (NULL, no number). Replaces
+  // whatever the index held.
+  template <typename KeyOf>
+  void build_frozen(size_t from, size_t to, KeyOf&& key_of) {
+    clear();
+    frozen_ = true;
+    std::vector<uint32_t> id(to > from ? to - from : 0, kNoKey);
+    std::vector<uint32_t> count;
+    grow_slots(1024);
+    for (size_t r = from; r < to; ++r) {
+      double d;
+      if (!key_of(r, &d)) continue;
+      size_t i = lookup(d);
+      if (i == kNone) {
+        grow_slots(keys_.size() + 1);
+        i = keys_.size();
+        keys_.push_back(d);
+        count.push_back(0);
+        place(d, i);
+      }
+      ++count[i];
+      id[r - from] = (uint32_t)i;
+    }
+    off_.assign(keys_.size() + 1, 0);
+    for (size_t i = 0; i < keys_.size(); ++i) off_[i + 1] = off_[i] + count[i];
+    rows_.resize(off_.back());
+    std::vector<uint32_t> at(off_.begin(), off_.end() - 1);
+    for (size_t r = from; r < to; ++r)
+      if (id[r - from] != kNoKey) rows_[at[id[r - from]]++] = (uint32_t)r;
+  }
+
+  void shrink_to_fit() {
+    if (frozen_) { keys_.shrink_to_fit(); off_.shrink_to_fit(); rows_.shrink_to_fit(); return; }
+    for (Entry& e : entries_) e.second.shrink_to_fit();
+    entries_.shrink_to_fit();
+  }
+  size_t memory_bytes() const {
+    size_t sz = slots_.capacity() * sizeof(uint32_t);
+    if (frozen_) return sz + keys_.capacity() * sizeof(double) + (off_.capacity() + rows_.capacity()) * sizeof(uint32_t);
+    sz += entries_.capacity() * sizeof(Entry);
+    for (const Entry& e : entries_) sz += e.second.capacity() * sizeof(uint32_t);
+    return sz;
+  }
+
+ private:
+  static constexpr size_t kNone = ~(size_t)0;
+  static constexpr uint32_t kNoKey = ~(uint32_t)0;
+  bool frozen_ = false;
+  std::vector<Entry> entries_;                 // thawed
+  std::vector<double> keys_;                   // frozen: the keys, first seen first
+  std::vector<uint32_t> off_, rows_;           // frozen: key i's rows are rows_[off_[i], off_[i + 1])
+  std::vector<uint32_t> slots_;                // 1 + a key's index; 0 empty. Linear probing, at most half full.
+  size_t mask_ = 0;
+
+  static uint64_t hash(double k) {
+    if (k == 0) k = 0.0;   // -0 is 0's key
+    uint64_t x;
+    std::memcpy(&x, &k, sizeof x);
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27; x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+  double key_at(size_t i) const { return frozen_ ? keys_[i] : entries_[i].first; }
+  size_t lookup(double k) const {
+    if (slots_.empty()) return kNone;
+    for (size_t at = hash(k) & mask_;; at = (at + 1) & mask_) {
+      const uint32_t s = slots_[at];
+      if (!s) return kNone;
+      if (key_at(s - 1) == k) return s - 1;
+    }
+  }
+  void place(double k, size_t i) {
+    size_t at = hash(k) & mask_;
+    while (slots_[at]) at = (at + 1) & mask_;
+    slots_[at] = (uint32_t)i + 1;
+  }
+  // Key i's slot emptied, and the run after it shifted back so every key stays reachable from its home slot.
+  void unplace(size_t i) {
+    size_t at = hash(key_at(i)) & mask_;
+    while (slots_[at] != (uint32_t)i + 1) at = (at + 1) & mask_;
+    slots_[at] = 0;
+    for (size_t next = (at + 1) & mask_; slots_[next]; next = (next + 1) & mask_) {
+      const size_t home = hash(key_at(slots_[next] - 1)) & mask_;
+      // the entry at `next` may move to the hole when its home is not in (at, next]
+      if (((next - home) & mask_) >= ((next - at) & mask_)) {
+        slots_[at] = slots_[next];
+        slots_[next] = 0;
+        at = next;
+      }
+    }
+  }
+  void grow_slots(size_t n) {
+    if (n * 2 <= slots_.size()) return;
+    size_t cap = slots_.empty() ? 16 : slots_.size();
+    while (cap < n * 2) cap <<= 1;
+    slots_.assign(cap, 0);
+    mask_ = cap - 1;
+    const size_t have = size();
+    for (size_t i = 0; i < have; ++i) place(key_at(i), i);
+  }
+  View view_at(size_t i) const {
+    View v;
+    v.first = key_at(i);
+    if (frozen_) { v.second.b = rows_.data() + off_[i]; v.second.e = rows_.data() + off_[i + 1]; }
+    else { v.second.b = entries_[i].second.data(); v.second.e = v.second.b + entries_[i].second.size(); }
+    return v;
+  }
+  void thaw() {
+    if (!frozen_) return;
+    entries_.clear();
+    entries_.reserve(keys_.size());
+    for (size_t i = 0; i < keys_.size(); ++i)
+      entries_.push_back(Entry{keys_[i], std::vector<uint32_t>(rows_.begin() + off_[i], rows_.begin() + off_[i + 1])});
+    std::vector<double>().swap(keys_);
+    std::vector<uint32_t>().swap(off_);
+    std::vector<uint32_t>().swap(rows_);
+    frozen_ = false;   // the slots hold the same indexes: entries_[i] is keys_[i]
+  }
+};
+
 struct SqlProbeIndex {
   int column = -1;
   size_t rows_indexed = 0;
@@ -319,7 +521,7 @@ struct SqlProbeIndex {
   uint64_t access_count = 0;
   // Row ids are uint32_t, not size_t: 4 billion rows is past what fits in RAM
   // anyway, and the halving is per row of every indexed column.
-  std::unordered_map<double, std::vector<uint32_t>> by_number;
+  NumberRows by_number;
   std::unordered_map<std::string, std::vector<uint32_t>> by_text;
   std::vector<std::vector<uint32_t>> by_code;
   // Indexes a declared string column: a quoted probe matches by text only.
@@ -340,7 +542,7 @@ struct SqlProbeIndex {
   bool sorted_built = false;
 
   void shrink_memory() {
-    for (auto& kv : by_number) kv.second.shrink_to_fit();
+    by_number.shrink_to_fit();
     for (auto& kv : by_text) kv.second.shrink_to_fit();
     for (auto& v : by_code) v.shrink_to_fit();
     sorted_by_number.shrink_to_fit();
@@ -357,8 +559,7 @@ struct SqlProbeIndex {
   // (node + bucket array), not just the values stored in it.
   size_t estimate_memory_bytes() const {
     size_t sz = sizeof(*this);
-    for (const auto& kv : by_number) sz += sizeof(kv) + kv.second.capacity() * sizeof(uint32_t);
-    sz += by_number.bucket_count() * sizeof(void*);
+    sz += by_number.memory_bytes();
     for (const auto& kv : by_text) sz += sizeof(kv) + kv.first.capacity() + kv.second.capacity() * sizeof(uint32_t);
     sz += by_text.bucket_count() * sizeof(void*);
     for (const auto& v : by_code) sz += sizeof(v) + v.capacity() * sizeof(uint32_t);
