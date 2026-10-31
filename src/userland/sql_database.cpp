@@ -49395,8 +49395,12 @@ SqlQueryResult SqlDatabase::execute_select(const std::string& sql) {
 // column that came from a string column stays a declared string, so an
 // all-digit VARCHAR id is still text. The CTE's own column list, when it has
 // one, names them.
-template <typename Each>
-static void cte_columns_with(const SqlQueryResult& res, const std::vector<std::string>& names, SqlTable* tbl, Each&& each) {
+// may_be_fixed(c): whether column c's cells can show a fractional trailing 0 at all - not a batch's integer lanes
+// (no point) or double lanes (shortest form, which never ends in one): for those the scan below cannot change the
+// type, and it printed every double of them (~2,500 instructions each, a seventh of a SQLDoom frame).
+template <typename Each, typename MayBeFixed>
+static void cte_columns_with(const SqlQueryResult& res, const std::vector<std::string>& names, SqlTable* tbl, Each&& each,
+                             MayBeFixed&& may_be_fixed) {
   for (size_t ci = 0; ci < res.columns.size(); ++ci) {
     SqlColumn c;
     c.name = ci < names.size() ? names[ci] : res.columns[ci];
@@ -49406,7 +49410,7 @@ static void cte_columns_with(const SqlQueryResult& res, const std::vector<std::s
     // Real column would print 39. A double in its shortest form never ends
     // in a fractional 0, so a cell like 39.00 or 24.70 can only have come
     // from such an expression: then the column is a DECIMAL at that scale.
-    if (c.type == SqlDataType::Real) {
+    if (c.type == SqlDataType::Real && may_be_fixed(ci)) {
       bool fixed = false, plain = true;
       each(ci, [&](const std::string& s) {
         const size_t dot = s.find('.');
@@ -49427,12 +49431,13 @@ static void cte_columns_from(const SqlQueryResult& res, const std::vector<std::s
       if (c >= row.values.size() || sql_is_null(row.values[c])) continue;
       if (!fn(row.values[c])) return;
     }
-  });
+  }, [](size_t) { return true; });
 }
 
 // The same columns for an answer held in a typed batch (res carries the header, B the rows).
 static void cte_columns_from_batch(const SqlQueryResult& res, const ColBatch& B, const std::vector<std::string>& names, SqlTable* tbl) {
-  cte_columns_with(res, names, tbl, [&](size_t c, auto&& fn) { colbatch_each_value(B, c, fn); });
+  cte_columns_with(res, names, tbl, [&](size_t c, auto&& fn) { colbatch_each_value(B, c, fn); },
+                   [&](size_t c) { return c >= B.cols.size() || (B.cols[c].kind != ColBatch::I64 && B.cols[c].kind != ColBatch::F64); });
 }
 
 SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
