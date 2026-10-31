@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <random>
@@ -85,7 +86,11 @@ int main(int argc, char** argv) {
   std::vector<std::string> cs((size_t)n), pads((size_t)n);
   for (long i = 0; i < n; ++i) { cs[(size_t)i] = chars(rng, 119); pads[(size_t)i] = chars(rng, 59); }
 
+  // WB_ONLY=<phase>: that phase alone (none: the load alone) - to profile one phase, as the others would change
+  // the table it runs on.
+  const char* only = std::getenv("WB_ONLY");
   auto phase = [&](const char* name, long count, const std::function<void(long)>& body) {
+    if (only && std::strcmp(only, name) != 0) return;
     for (long i = 0; i < std::min(count, 200L); ++i) body(i);   // warm-up: plans, caches
     const auto t0 = std::chrono::steady_clock::now();
     for (long i = 0; i < count; ++i) body(i);
