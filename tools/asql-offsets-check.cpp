@@ -1,6 +1,7 @@
 // BlockCompressed keeps its row lengths inside the compressed payload (no offset array), a block written before that
 // still reads, and FSST's row boundaries are 16-bit distances from a base every 16th boundary (wide when one does not
 // fit). Rows read back exactly across writes, a checkpoint and a reopen.
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -280,6 +281,8 @@ void legacy_block_test() {
 void table_tests() {
   char root_dir[] = "/tmp/aios-offsets-XXXXXX";
   if (!mkdtemp(root_dir)) { std::perror("mkdtemp"); g_failures++; return; }
+  // The store goes when this scope does, on every return: test runs left ~100 MB of them in /tmp each.
+  struct RemoveTree { const char* p; ~RemoveTree() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove_root_dir{root_dir};
   KernelConfig cfg;
   cfg.root = root_dir;
   cfg.residency = test_config;

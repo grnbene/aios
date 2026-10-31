@@ -3,6 +3,7 @@
 // DATEDIFF(), CASE WHEN, a correlated scalar subquery in the SELECT list, and
 // IN (SELECT ...). Each check is the shape of a real clause in
 // getInvoicedOnDispatch(), not a synthetic one.
+#include <filesystem>
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -76,6 +77,8 @@ int main() {
     std::perror("mkdtemp");
     return 1;
   }
+  // The store goes when this scope does, on every return: test runs left ~100 MB of them in /tmp each.
+  struct RemoveTree { const char* p; ~RemoveTree() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove_root_dir{root_dir};
 
   KernelConfig cfg;
   cfg.root = root_dir;

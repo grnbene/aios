@@ -2,6 +2,7 @@
 // connecting, and queries answered over the wire.
 
 #undef NDEBUG
+#include <filesystem>
 #include <iostream>
 #include <cassert>
 #include <chrono>
@@ -24,6 +25,8 @@ int main() {
     std::perror("mkdtemp");
     return 1;
   }
+  // The store goes when this scope does, on every return: test runs left ~100 MB of them in /tmp each.
+  struct RemoveTree { const char* p; ~RemoveTree() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove_root_dir{root_dir};
 
   KernelConfig kcfg;
   kcfg.root = root_dir;

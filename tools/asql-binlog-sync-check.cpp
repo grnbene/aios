@@ -2,6 +2,7 @@
 // checks they stream into and sync the store.
 
 #undef NDEBUG
+#include <filesystem>
 #include <iostream>
 #include <cassert>
 #include <chrono>
@@ -155,6 +156,8 @@ int main() {
 
   char aios_root[] = "/tmp/aios-binlog-test-XXXXXX";
   if (!mkdtemp(aios_root)) { std::perror("mkdtemp"); return 1; }
+  // The store goes when this scope does, on every return: test runs left ~100 MB of them in /tmp each.
+  struct RemoveTree { const char* p; ~RemoveTree() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove_aios_root{aios_root};
 
   // 1. Boot AIOS Kernel and ASQL Engine
   std::cout << "[Step 1] Booting AIOS Engine...\n";

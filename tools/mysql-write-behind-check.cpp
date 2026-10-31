@@ -2,6 +2,7 @@
 // server it forwards to.
 
 #undef NDEBUG
+#include <filesystem>
 #include <iostream>
 #include <cassert>
 #include <chrono>
@@ -32,9 +33,12 @@ int main() {
   // Setup temporary test directories
   char aios_root[] = "/tmp/aios-wb-gateway-XXXXXX";
   if (!mkdtemp(aios_root)) { std::perror("mkdtemp"); return 1; }
+  // The store goes when this scope does, on every return: test runs left ~100 MB of them in /tmp each.
+  struct RemoveTree { const char* p; ~RemoveTree() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove_aios_root{aios_root};
 
   char downstream_root[] = "/tmp/aios-wb-downstream-XXXXXX";
   if (!mkdtemp(downstream_root)) { std::perror("mkdtemp"); return 1; }
+  RemoveTree remove_downstream_root{downstream_root};
 
   // 1. Boot Downstream Instance (Simulating real downstream MySQL/MariaDB server)
   std::cout << "[Step 1] Booting downstream database instance & wire server...\n";
