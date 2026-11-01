@@ -9513,6 +9513,20 @@ void cmd_sql(Ctx& c, const Args& a) {
     c.o << "Server version: 5.7.44-aios-asql (AIOS in-memory relational engine)\n";
     c.o << "Type 'help' or '\\h' for help. Type 'exit', 'quit', or '\\q' to exit.\n\n";
     std::string buffer;
+    // A line's trailing `-- ` or `#` comment, outside quotes, taken off. The lines of a statement were joined
+    // with a space, so a comment line swallowed every line up to the next ';' - `-- note` then `SELECT 1;` ran
+    // nothing - and `SELECT 1; -- note` never ended its statement.
+    auto strip_line_comment = [](const std::string& s) {
+      char quote = 0;
+      for (size_t i = 0; i < s.size(); ++i) {
+        const char ch = s[i];
+        if (quote) { if (ch == quote) quote = 0; continue; }
+        if (ch == '\'' || ch == '"' || ch == '`') { quote = ch; continue; }
+        if (ch == '#') return s.substr(0, i);
+        if (ch == '-' && i + 1 < s.size() && s[i + 1] == '-' && (i + 2 >= s.size() || (unsigned char)s[i + 2] <= ' ')) return s.substr(0, i);
+      }
+      return s;
+    };
     while (true) {
       if (buffer.empty()) {
         std::cout << "asql [" << active_db << "]> " << std::flush;
@@ -9521,7 +9535,7 @@ void cmd_sql(Ctx& c, const Args& a) {
       }
       std::string line;
       if (!std::getline(std::cin, line)) break;
-      std::string trimmed = trim_str(line);
+      std::string trimmed = trim_str(strip_line_comment(line));
       if (buffer.empty()) {
         if (trimmed == "exit" || trimmed == "quit" || trimmed == "\\q" || trimmed == "\\q;") {
           std::cout << "Bye\n";
@@ -9543,11 +9557,40 @@ void cmd_sql(Ctx& c, const Args& a) {
         }
       }
       if (trimmed.empty()) continue;
-      buffer += (buffer.empty() ? "" : " ") + trimmed;
+      buffer += (buffer.empty() ? "" : "\n") + trimmed;
       if (buffer.back() == ';' || buffer.back() == '\\') {
-        std::string sql = buffer;
-        if (sql.back() == ';') sql.pop_back();
+        // `SELECT 1; SELECT 2;` on one line is two statements (as the mysql client sends them), split outside
+        // quotes and comments. Not a routine or trigger body - `CREATE FUNCTION f() .. BEGIN ..; RETURN r; END;`
+        // - whose inner ';' are its own (the console takes one without DELIMITER, as it always has); nor a
+        // `\\`-ended line.
+        auto holds_compound = [](const std::string& s) {
+          std::string up;
+          up.reserve(s.size());
+          char quote = 0;
+          for (char ch : s) {
+            if (quote) { if (ch == quote) quote = 0; continue; }
+            if (ch == '\'' || ch == '"' || ch == '`') { quote = ch; up.push_back(' '); continue; }
+            up.push_back((char)std::toupper((unsigned char)ch));
+          }
+          auto word = [&](const char* w) {
+            const size_t n = std::strlen(w);
+            for (size_t at = up.find(w); at != std::string::npos; at = up.find(w, at + 1)) {
+              const bool before = at == 0 || !(std::isalnum((unsigned char)up[at - 1]) || up[at - 1] == '_');
+              const bool after = at + n >= up.size() || !(std::isalnum((unsigned char)up[at + n]) || up[at + n] == '_');
+              if (before && after) return true;
+            }
+            return false;
+          };
+          if (word("BEGIN")) return true;
+          if (up.rfind("CREATE", 0) == 0 && (word("PROCEDURE") || word("FUNCTION") || word("TRIGGER") || word("EVENT"))) return true;
+          return false;
+        };
+        std::vector<std::string> stmts;
+        if (buffer.back() == '\\' || holds_compound(buffer)) stmts.push_back(buffer);
+        else stmts = aios::userland::sql_split_statements(buffer);
         buffer.clear();
+        for (std::string sql : stmts) {
+        if (!sql.empty() && sql.back() == ';') sql.pop_back();
         sql = trim_str(sql);
         if (sql.empty()) continue;
 
@@ -9571,6 +9614,7 @@ void cmd_sql(Ctx& c, const Args& a) {
           std::cout << res.rows.size() << (res.rows.size() == 1 ? " row" : " rows") << " in set (" << std::fixed << std::setprecision(2) << elapsed_ms << " ms)\n\n";
         } else {
           std::cout << "Query OK, " << res.rows_affected << (res.rows_affected == 1 ? " row affected" : " rows affected") << " (" << std::fixed << std::setprecision(2) << elapsed_ms << " ms)\n\n";
+        }
         }
       }
     }

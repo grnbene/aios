@@ -87,6 +87,8 @@ std::string sql_normalize_value(SqlDataType t, int scale, const std::string& v);
 // A double as MariaDB prints it: sig 0 = shortest round-trip (DOUBLE), else
 // that many significant digits (6 for FLOAT).
 std::string sql_format_double(double v, int sig);
+// A script's statements, split at its delimiter outside quotes and comments (DELIMITER directives honoured).
+std::vector<std::string> sql_split_statements(const std::string& text);
 struct SqlColumn;
 void apply_column_type(const std::string& type, const std::vector<int>& args, SqlColumn& col);
 std::string sql_mysql_column_type(const SqlColumn& c);

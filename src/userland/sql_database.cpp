@@ -59540,6 +59540,11 @@ uint8_t code_bits_for(uint64_t v) { return ::aios::userland::code_bits_for(v); }
 void for_each_parallel(size_t n, const std::function<void(size_t)>& fn) { ::aios::userland::for_each_parallel(n, fn); }
 std::string lower_of(const std::string& s) { return ::aios::userland::lower_of(s); }
 bool hidden_table_name(const std::string& n) { return ::aios::userland::hidden_table_name(n); }
+}  // namespace aios::userland::sqle
+namespace aios::userland {
+std::vector<std::string> sql_split_statements(const std::string& text) { return split_sql_statements(text); }
+}  // namespace aios::userland
+namespace aios::userland::sqle {
 uint64_t vjit_native_runs() {
 #if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
   return ::aios::userland::vp::vjit::native_runs().load(std::memory_order_relaxed);
