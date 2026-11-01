@@ -590,6 +590,19 @@ also builds the line table's column index, ~90 ms, as before.) A rerooted-join e
 values, a single date, an empty range, GROUP BY over the join, LIMIT with and without ORDER BY) is identical
 to the build before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
 
+Two join-probe costs. A 1:N step (85k orders to their 257k lines) reserved each chunk's output list for 1.5 rows
+a base row and grew it by doubling past that; the reserve now follows the probing index's own rows per key
+(the joined table's rows over its distinct keys, bounded 1.5-16): the step's list growth 41 -> 28M instructions,
+the step 133 -> 119M. And a LEFT JOIN whose ON clause carries the joined table's own condition (`ON
+s.productid = p.id AND s.onhand > 0`) selected the table's rows by it (js_pass) and then evaluated it again over
+every candidate in lanes; where js_pass holds the ON's own conditions alone (no WHERE part folded in), it is now
+read before a candidate counts as a match and those conjuncts leave the per-candidate checks. The category-stock
+probe 13.8 -> 8.4 ms (its ON checks 4.5 -> 0). An edge set for ON clauses with own conditions (LEFT, INNER and
+RIGHT joins; own conditions alone and with a base-row conjunct; a WHERE on the joined table, on IS NULL, and
+both; selections empty, small enough to key the index by, and too large for that but prefiltered; NULL values)
+is identical to the build before, as are frame bytes, the differential native check, the four oracle suites, the
+lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

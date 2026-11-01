@@ -46944,6 +46944,8 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       join_method = "small table";
       hash_join_done = true;
     }
+    // js_pass is exactly the ON clause's own conditions (no WHERE part folded in): a row failing it is no match
+    const bool pass_is_on = js_prefilter && !js_prefilter_where;
     if (!hash_join_done && (!prep_jkeys.empty() || xk_join)) {
       bool has_extra_join = false;
       std::vector<const SqlExpr*> jparts;
@@ -47476,6 +47478,12 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       std::vector<const vp::Prog*> on_vec_progs;
       if (!base_decided.empty())
         on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return base_decided.count(pc) > 0; }), on_check.end());
+      // The ON clause's own conditions on the joined table, where they alone made js_pass (no WHERE part among
+      // them): js_pass is then their answer for every row, read before a candidate counts (pass_is_on below),
+      // so they are not evaluated again per candidate - `LEFT JOIN stock s ON s.productid = p.id AND
+      // s.onhand > 0` checked onhand over 63k candidates in lanes after selecting the rows by it.
+      if (pass_is_on && !on_own.empty())
+        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_own.begin(), on_own.end(), pc) != on_own.end(); }), on_check.end());
       if (has_extra_join && rows.size() >= 256 && vp::enabled()) {
         EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
         for (const SqlExpr* pc : on_check) {
@@ -47716,10 +47724,17 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         size_t base0 = 0;
       };
       // in-place mode so far -> list mode: the chunk's rows [base0, upto) made from their parts, in order
+      // rows a base row meets, on average, by the probing key's index (the joined table's rows over its distinct
+      // keys): an order's three lines. The chunk lists are reserved to it, so a 1:N step does not grow them by doubling.
+      double fanout = 1.5;
+      if (best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx) {
+        const size_t nk = prep_jkeys[(size_t)best_ki].idx->by_number.size();
+        if (nk > 0) fanout = std::min(16.0, std::max(1.5, 1.1 * (double)js.table->row_count() / (double)nk));
+      }
       auto to_list = [&](ChunkOut& o, size_t upto) {
         // room for a row per base row of the chunk and some second candidates: the list grew by doubling, and
         // the copies of the moves were a third of a 257k-row step
-        if (o.list->capacity() < o.part->size() + o.part->size() / 2) o.list->reserve(o.part->size() + o.part->size() / 2);
+        if (o.list->capacity() < (size_t)((double)o.part->size() * fanout)) o.list->reserve((size_t)((double)o.part->size() * fanout));
         for (size_t bi = o.base0; bi < upto; ++bi) {
           const uint32_t p = (*o.part)[bi - o.base0];
           if (p == kDropPart) continue;
@@ -47772,6 +47787,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
                 const std::vector<uint32_t>& cands = idx->by_code[(size_t)cb];
                 for (uint32_t mr : cands) {
                   if (mr >= js.table->row_count()) continue;
+                  if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) continue;   // the ON's own conditions refuse it
                   if (!other_keys_match(bi, base, mr)) continue;
                   JoinedRow cand;
                   const bool made = cand_checks || sink;
@@ -47791,6 +47807,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         } else if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
           auto take = [&](size_t mr) {
             if (mr >= js.table->row_count()) return;
+            if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) return;   // the ON's own conditions refuse it
             if (!other_keys_match(bi, base, mr)) return;
             JoinedRow cand;
             const bool made = cand_checks || sink;
@@ -47860,6 +47877,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         if (step_timing) { t_gather.fetch_add(pt1 - pt0, std::memory_order_relaxed); n_cands.fetch_add(matches->size(), std::memory_order_relaxed); }
 
         for (size_t match_ri : *matches) {
+          if (pass_is_on && (match_ri >= js_pass.size() || !js_pass[match_ri])) continue;   // the ON's own conditions refuse it
           JoinedRow cand;
           const bool made = cand_checks || sink;
           if (made) { cand = base; cand.parts.push_back(match_ri); ctx.row = &cand; }
@@ -47969,7 +47987,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           o.list = &local_next[ci];
           o.base0 = bstart;
           if (inplace_ok) { local_part[ci].assign(bend - bstart, kDropPart); o.part = &local_part[ci]; }
-          else local_next[ci].reserve((bend - bstart) + (bend - bstart) / 2);   // list mode from the start: a row per base row and some more
+          else local_next[ci].reserve((size_t)((double)(bend - bstart) * fanout));   // list mode from the start: the expected rows
           OnSink sink;
           OnSink* const sk = on_vec.empty() ? nullptr : &sink;
           for (size_t bi = bstart; bi < bend; ++bi) {
