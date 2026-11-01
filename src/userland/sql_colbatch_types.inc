@@ -118,6 +118,25 @@ inline ColBatch* take_col_out() {
   return b;
 }
 
+// A derived table's consumer keeping only the rows whose ROW_NUMBER() column `label` is at most `max` (an outer
+// WHERE rn = 1 / rn <= k over that table alone): the window step may leave the others out, the rows kept in their
+// order (docs: the window's top rows). Taken, as the typed-batch request is, by the select that starts first.
+struct RnKeep {
+  std::string label;
+  int64_t max = -1;                    // -1: no request
+};
+thread_local RnKeep g_rn_keep;
+inline RnKeep take_rn_keep() {
+  RnKeep k = std::move(g_rn_keep);
+  g_rn_keep = RnKeep{};
+  return k;
+}
+struct RnKeepRequest {
+  RnKeep prev;
+  explicit RnKeepRequest(RnKeep k) : prev(std::move(g_rn_keep)) { g_rn_keep = std::move(k); }
+  ~RnKeepRequest() { g_rn_keep = std::move(prev); }
+};
+
 // A consumer's request, for exactly the call it brackets: whatever happens below, the request is gone after.
 struct ColOutRequest {
   ColBatch* prev;

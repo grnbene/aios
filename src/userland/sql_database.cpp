@@ -41111,7 +41111,8 @@ static void radix_sort_pairs(std::vector<std::pair<uint64_t, uint32_t>>& v, int 
   if (src != &v) v.swap(tmp);
 }
 
-static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQueryResult* res, ColBatch* col_out) {
+static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQueryResult* res, ColBatch* col_out,
+                            const RnKeep* rn_keep = nullptr) {
   static const bool off = std::getenv("AIOS_SQL_COLUMNAR_WINDOW") && *std::getenv("AIOS_SQL_COLUMNAR_WINDOW") == '0';
   if (off || !db || b.sources.size() != 1 || !b.join_conditions.empty() || b.distinct || !b.group_by.empty() ||
       b.having || !b.windows.empty() || current_outer_scope())
@@ -41162,6 +41163,20 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     items.push_back(x);
   }
   if (wins.empty()) { if (vx_trace_on()) vx_trace("columnar window: not taken (15)"); return false; }
+  // A derived table's consumer keeping only rn <= keep_max of a ROW_NUMBER() item (RnKeep): the others are left out
+  // here, the rows kept in the order they had - the outer WHERE still runs and finds nothing more to drop. Not where
+  // this select has its own LIMIT / OFFSET, which apply before that WHERE.
+  int keep_win = -1;
+  int64_t keep_max = -1;
+  if (rn_keep && rn_keep->max >= 1 && b.limit < 0 && b.offset <= 0)
+    for (size_t i = 0; i < items.size(); ++i)
+      if (items[i].win >= 0 && wins[(size_t)items[i].win].fn == "ROW_NUMBER" && lower_of(b.items[i].label) == lower_of(rn_keep->label)) {
+        keep_win = items[i].win;
+        keep_max = rn_keep->max;
+        break;
+      }
+  static const bool top_off = std::getenv("AIOS_SQL_WINDOW_TOP") && *std::getenv("AIOS_SQL_WINDOW_TOP") == '0';
+  bool top_done = false;                               // the rn = 1 rows picked a partition at a time, no sort
   // ORDER BY: a select item (by position or label) or a column of the table.
   struct Key { int item = -1; int col = -1; bool desc = false; };
   std::vector<Key> keys;
@@ -41316,7 +41331,8 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       double mn = std::numeric_limits<double>::infinity(), mx = -mn;
       for (double x : *kc[j]) {
         if (x == kNull) continue;
-        if (x != std::floor(x) || std::fabs(x) > 1e15) { if (vx_trace_on()) vx_trace("columnar window: not taken (25)"); return false; }
+        // a whole number within 1e15 (NaN and the infinities fail the first test): as x != floor(x) || |x| > 1e15
+        if (!(std::fabs(x) <= 1e15) || (double)(int64_t)x != x) { if (vx_trace_on()) vx_trace("columnar window: not taken (25)"); return false; }
         mn = std::min(mn, x); mx = std::max(mx, x);
       }
       const uint64_t span = mn > mx ? 1 : (uint64_t)(mx - mn) + 2;   // + the NULL slot
@@ -41382,6 +41398,23 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       int tbits = 0;
       for (size_t j = 0; j < nk; ++j) tbits += bits[j];
       for (size_t j = np; j < nk; ++j) obits += bits[j];
+      // Only each partition's first row wanted (rn = 1), in the window's order: that row is the partition's least
+      // (key, row) - the stable sort's first - found in one pass into an array over the partition values, which
+      // then hands the rows over in partition order, the order the sorted rows had. No sort of every row.
+      const int pbits = tbits - obits;
+      if (!top_off && (int)wi == keep_win && keep_max == 1 && wins.size() == 1 && reuse_win_order && pbits <= 24) {
+        std::vector<uint32_t> best((size_t)1 << pbits, UINT32_MAX);
+        for (size_t i = 0; i < n; ++i) {
+          const size_t p = np == 0 || obits >= 64 ? 0 : (size_t)(enc[i].first >> obits);
+          const uint32_t cur = best[p];
+          if (cur == UINT32_MAX || enc[i].first < enc[cur].first) best[p] = (uint32_t)i;   // ties: the earlier row
+        }
+        win_order.clear();
+        for (uint32_t i : best) if (i != UINT32_MAX) { win_order.push_back(i); wval[wi][i] = 1; }
+        top_done = true;
+        if (vx_trace_on()) vx_trace("columnar window: rn = 1 kept a partition at a time: " + std::to_string(win_order.size()) + " of " + std::to_string(n) + " rows");
+        continue;
+      }
       radix_sort_pairs(enc, tbits);
     } else {
       pr.resize(n);
@@ -41448,7 +41481,11 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   if (b.limit >= 0 && from + (size_t)b.limit < to) to = from + (size_t)b.limit;
   std::vector<uint32_t> ord(n);
   for (size_t i = 0; i < n; ++i) ord[i] = (uint32_t)i;
-  if (reuse_win_order && win_order.size() == n) {
+  if (top_done) {
+    ord.swap(win_order);
+    from = 0;
+    to = ord.size();
+  } else if (reuse_win_order && win_order.size() == n) {
     ord.swap(win_order);
   } else if (!keys.empty()) {
     std::vector<const std::vector<double>*> kc;
@@ -41491,6 +41528,16 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       else std::sort(pr.begin(), pr.end(), less);
       for (size_t i = 0; i < to; ++i) ord[i] = pr[i].i;
     }
+  }
+  if (keep_win >= 0 && !top_done) {
+    // rn <= keep_max: the rows kept in their order
+    std::vector<uint32_t> kept;
+    kept.reserve(to - from);
+    const std::vector<int64_t>& kv = wval[(size_t)keep_win];
+    for (size_t o = from; o < to; ++o) if (kv[ord[o]] <= keep_max) kept.push_back(ord[o]);
+    ord.swap(kept);
+    from = 0;
+    to = ord.size();
   }
   const uint64_t cw_t3 = vx_trace_on() ? hal_now_ns() : 0;
   // The rows kept, as text: columns as the evaluator prints them, windows as integers.
@@ -41559,11 +41606,11 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   return true;
 }
 
-SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, ColBatch* col_out) {
+SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, ColBatch* col_out, const RnKeep* rn_keep) {
   if (expr_has_window(b.where.get())) return make_error("window functions are not allowed in WHERE");
   {
     SqlQueryResult cw;
-    if (columnar_window(db, b, &cw, col_out)) return cw;
+    if (columnar_window(db, b, &cw, col_out, rn_keep)) return cw;
   }
   if (expr_has_window(b.having.get())) return make_error("window functions are not allowed in HAVING");
   for (const auto& g : b.group_by) if (expr_has_window(g.get())) return make_error("window functions are not allowed in GROUP BY");
@@ -52184,10 +52231,40 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
           continue;
         }
         const std::string pushed = expanded_branch.sources.size() == 1 ? derived_pushdown_sql(expanded_branch, s) : std::string();
+        // The outer WHERE keeping only rn = k of this table (alone in FROM): the derived select's window step may
+        // leave out the rows past k of a ROW_NUMBER() column of that name (RnKeep) - a superset of what the WHERE keeps,
+        // in the same order, so the WHERE, run as before, gives the same rows in the same order. Not rn <= k / rn < k:
+        // over the whole table the WHERE selected those through an index by value (all the 1s, then the 2s), over the
+        // smaller one in table order - the same rows, but an outer statement with no ORDER BY would show them otherwise.
+        RnKeep rn_keep;
+        if (expanded_branch.sources.size() == 1 && expanded_branch.join_conditions.empty() && s.column_names.empty() &&
+            expanded_branch.where && pushed.empty()) {
+          std::vector<const SqlExpr*> wp;
+          collect_conjuncts(expanded_branch.where.get(), &wp);
+          for (const SqlExpr* c : wp) {
+            if (!c || c->args.size() != 2 || !c->args[0] || !c->args[1]) continue;
+            const SqlExpr* col = c->args[0].get();
+            const SqlExpr* lit = c->args[1].get();
+            ExprOp op = c->op;
+            if (op != ExprOp::Eq) continue;
+            if (col->op == ExprOp::Literal && lit->op == ExprOp::Column) std::swap(col, lit);   // 1 = rn
+            if (col->op != ExprOp::Column || lit->op != ExprOp::Literal || col->name.rfind("@", 0) == 0) continue;
+            if (!col->qualifier.empty() && lower_of(last_name_part(col->qualifier)) != lower_of(s.alias)) continue;
+            const Val& v = lit->literal;
+            if (v.null || !v.numeric || v.num != std::floor(v.num) || v.num < 1 || v.num > 1e15) continue;
+            const int64_t k = (int64_t)v.num;
+            if (rn_keep.max < 0 || (lower_of(col->name) == lower_of(rn_keep.label) && k < rn_keep.max)) {
+              if (rn_keep.max >= 0 && lower_of(col->name) != lower_of(rn_keep.label)) continue;
+              rn_keep.label = col->name;
+              rn_keep.max = k;
+            }
+          }
+        }
         SqlQueryResult dres;
         ColBatch dbatch;
         {
           RowsOnly rows_only;
+          RnKeepRequest want_rn(rn_keep);
           ColOutRequest want_columns(&dbatch);   // its rows as typed columns, where the select can give them so
           PhysicalPlan dplan;
           const uint64_t dt0 = plan_on() ? hal_now_ns() : 0;
@@ -52466,6 +52543,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   // A consumer's request for the answer as a typed batch (sql_colbatch.inc): this is the top select, so it is
   // taken here and nothing nested sees it. Paths that cannot fill it return rows, as before.
   ColBatch* const col_out = take_col_out();
+  const RnKeep rn_keep = take_rn_keep();   // a derived table's consumer's rn filter, for this top select's window
   // `@v := ...` in it: rows are evaluated one at a time, in order, on this
   // thread - the variable carries from one row to the next.
   bool assigns = expr_assigns(raw_branch.where.get()) || expr_assigns(raw_branch.having.get());
@@ -52475,7 +52553,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
     ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
   } serial_scope(assigns);
-  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out); }
+  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out, &rn_keep); }
   // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
   // table whose rows are in key order: the answer is a run of rows at one end
   // of the table. The statement is run with a key range that holds just that
@@ -53365,6 +53443,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
   // taken here, so no statement run to make a CTE (a recursive one's anchor and steps among them) takes it, and
   // handed back for the final statement alone (below).
   ColBatch* const with_out = take_col_out();
+  RnKeep with_rn = take_rn_keep();         // the same for a consumer's rn filter: the final statement's alone
   std::vector<Token> toks;
   std::string terr;
   if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
@@ -53649,6 +53728,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
   std::string main_sql = sql.substr(main_start);
 
   ColOutRequest main_columns(with_out);
+  RnKeepRequest main_rn(with_rn);
   if (trace_merge) {
     const uint64_t t0 = hal_now_ns();
     SqlQueryResult r = execute_local_query(main_sql);
