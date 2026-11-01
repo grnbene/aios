@@ -418,6 +418,31 @@ INT dictionaries either side, a text dictionary mixing numbers and words left to
 JOIN padding, a single and a two-key join) is identical to the build before, as are frame bytes, the differential
 native check, the oracle suites, the lane checks and the earlier edge sets.
 
+### ERP shapes against DuckDB
+
+A synthetic ERP set (200k orders, 600k order lines, 500k ledger rows, 150k shipments, 30k products, 20k
+customers; the generator, data, query set and both engines' logs live beside the session's scratch files) put
+ASQL against DuckDB 2.0 on identical data, every result compared. Ahead: point lookups (11x), NOT EXISTS (6x),
+IN subqueries (1.8x), GROUP BY .. HAVING (1.2x). Behind, 6-25x: a grouped join whose ORDER BY is its own
+(ORDER BY SUM(..) DESC), a grouped join over text keys, GROUP BY YEAR(), MONTH(), SUM(CASE .. THEN decimal),
+a ROW_NUMBER window filtered through a derived table.
+
+The first of these: the lane GROUP BY (lane_group_by) took only integer keys, integer arguments and the keys'
+implicit order. It now takes a dictionary-coded text key by its entries' collation classes (dict_classes: two
+entries share a class exactly when GROUP BY finds them equal; the group's value is its first row's cell, as the
+row path gives it), double arguments for SUM / AVG / MIN / MAX (the same accumulator as the row path, the
+extreme row's value), and a statement's own ORDER BY whenever each of its keys is an output item (an alias, an
+ordinal, the item's expression): the groups' rows carry sort keys from their cells and the statement's sort
+orders them. A plain column item is read from the group's first row's cell and an aggregate item from its
+folded value, no interpreter per group. Groups the caller sorts stay in first-appearance order, so rows that
+tie come out as the row path's stable sort has them (the cteq oracle caught the key-ordered version on a tie).
+ERP: open orders 3-way join 257 -> 172 ms, top customers 90d 137 -> 57 ms, category stock LEFT JOIN 18 -> 17
+(DuckDB 34 / 11 / 7); the star-columnar grouped join (line sales by location) is unchanged, its path is next.
+A GROUP BY edge set (text keys differing by case and trailing spaces, NULL keys, ORDER BY by alias, ordinal,
+expression and a key not selected, HAVING, doubles under MIN / MAX / SUM / AVG, LEFT JOIN groups, LIMIT and
+OFFSET) is identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the
+earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
