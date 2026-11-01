@@ -29,6 +29,29 @@ inline void colbatch_gather(const SqlTable& t, size_t c, SqlDataType dest, int d
     }
     return;
   }
+  // A DecimalScaled column into a DECIMAL result column, or a DOUBLE one (a DOUBLE column held scaled): its scaled
+  // integers, decoded in a block where the rows cover much of the column.
+  if (whole && !col_temporal && cs.encoding == ColumnEncoding::DecimalScaled &&
+      ((dest == SqlDataType::Decimal) || (dest == SqlDataType::Real && dest_scale == 0 && !cs.decimal_fixed()))) {
+    int places = 0;
+    for (int64_t sf = (int64_t)std::llround(cs.scale_factor); sf > 1 && places < 18; sf /= 10) ++places;
+    out->kind = ColBatch::Dec;
+    out->scale = places;
+    out->fixed = cs.decimal_fixed();
+    out->nul.assign(n, 0);
+    out->i.assign(n, 0);
+    const bool nulls = vx::has_nulls(cs);
+    const size_t total = cs.size();
+    std::vector<uint32_t> all;
+    const bool block = total <= n * 4 + 65536;
+    if (block) { all.resize(total); vx::decode_codes(cs, 0, total, all.data()); }
+    for (size_t r = 0; r < n; ++r) {
+      const size_t id = row_of(r);
+      if (id == kNullRow || id >= total || (nulls && cs.is_null(id))) { out->nul[r] = 1; continue; }
+      out->i[r] = cs.base_int64 + (int64_t)(block ? all[id] : cs.read_code(id));
+    }
+    return;
+  }
   if (codes) {
     // the entries the rows use, each copied once: the batch holds no pointer into a table that may go away
     out->kind = ColBatch::Codes;
@@ -138,7 +161,7 @@ inline void colbatch_permute(ColBatch& B, const std::vector<uint32_t>& perm) {
   for (ColBatch::Col& c : B.cols) {
     switch (c.kind) {
       case ColBatch::Text: { std::vector<std::string> o(n); for (size_t r = 0; r < n; ++r) o[r] = std::move(c.s[perm[r]]); c.s.swap(o); break; }
-      case ColBatch::I64: { std::vector<int64_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.i[perm[r]]; c.i.swap(o); break; }
+      case ColBatch::I64: case ColBatch::Dec: { std::vector<int64_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.i[perm[r]]; c.i.swap(o); break; }
       case ColBatch::F64: { std::vector<double> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.f[perm[r]]; c.f.swap(o); break; }
       case ColBatch::Codes: { std::vector<uint32_t> o(n); for (size_t r = 0; r < n; ++r) o[r] = c.codes[perm[r]]; c.codes.swap(o); break; }
     }

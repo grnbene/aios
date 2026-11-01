@@ -1285,6 +1285,9 @@ struct ColumnStore {
   // maps are made once. What the append_* calls would have left row by row; false (nothing changed) otherwise.
   bool adopt_ints(std::vector<int64_t>&& v, const std::vector<uint8_t>& nul);
   bool adopt_doubles(std::vector<double>&& v, const std::vector<uint8_t>& nul);
+  // An empty column becomes DecimalScaled holding v (scaled integers at `places`), fixed as a DECIMAL(p,s) prints
+  // or trimmed as a DOUBLE held scaled does. False (nothing changed) where the values' range needs more than 32 bits.
+  bool adopt_scaled(const std::vector<int64_t>& v, const std::vector<uint8_t>& nul, int places, bool fixed);
   bool adopt_codes(const std::vector<uint32_t>& ids, const std::vector<uint8_t>& nul);
   bool set_encoded(size_t row, const std::string& val);
   // Zone maps for the segments covering rows [from, to], after a write there.

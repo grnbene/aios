@@ -10,11 +10,43 @@
 // (take_col_out), so nothing nested - a subquery, a derived table - sees it; a select that cannot fill it (a sort,
 // DISTINCT, a LIMIT, an answer from the result cache) leaves it empty and returns rows as before.
 // AIOS_SQL_COLUMNAR=0 turns it off.
+// A DecimalScaled cell's text (ColumnStore::get's rule): sv at `places` decimal places, every place kept for a
+// DECIMAL(p,s) column (fixed), trailing zeros and an empty fraction dropped for a DOUBLE held scaled.
+inline std::string scaled_decimal_cell(int64_t sv, int places, bool fixed) {
+  if (places <= 0) return std::to_string((long long)sv);
+  const bool neg = sv < 0;
+  uint64_t abs_v = neg ? (uint64_t)(-(sv + 1)) + 1 : (uint64_t)sv;
+  uint64_t div = 1;
+  for (int i = 0; i < places; ++i) div *= 10;
+  const uint64_t int_part = abs_v / div, frac_part = abs_v % div;
+  char buf[64];
+  if (fixed) {
+    std::snprintf(buf, sizeof(buf), "%s%llu.%0*llu", neg ? "-" : "", (unsigned long long)int_part, places, (unsigned long long)frac_part);
+    return buf;
+  }
+  if (frac_part == 0) {
+    std::snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "", (unsigned long long)int_part);
+    return buf;
+  }
+  char frac_buf[32];
+  std::snprintf(frac_buf, sizeof(frac_buf), "%0*llu", places, (unsigned long long)frac_part);
+  int flen = (int)std::strlen(frac_buf);
+  while (flen > 0 && frac_buf[flen - 1] == '0') frac_buf[--flen] = '\0';
+  if (flen == 0) std::snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "", (unsigned long long)int_part);
+  else std::snprintf(buf, sizeof(buf), "%s%llu.%s", neg ? "-" : "", (unsigned long long)int_part, frac_buf);
+  return buf;
+}
+
 struct ColBatch {
-  enum Kind : uint8_t { Text, I64, F64, Codes };
+  // Dec: a DecimalScaled column's values as its scaled integers (i) at `scale` places, printed as its cells are
+  // (fixed: a DECIMAL(p,s) keeps its places; a DOUBLE held scaled drops trailing zeros) - no text formatted on the
+  // way out of a statement and parsed back on the way into a table.
+  enum Kind : uint8_t { Text, I64, F64, Codes, Dec };
   struct Col {
     Kind kind = Text;
-    std::vector<int64_t> i;          // I64
+    std::vector<int64_t> i;          // I64, Dec (scaled)
+    int scale = 0;                   // Dec: decimal places
+    bool fixed = false;              // Dec: every place printed
     std::vector<double> f;           // F64
     std::vector<uint32_t> codes;     // Codes: an index into dict
     std::vector<std::string> dict;   // Codes: the entries the rows use, each once
@@ -34,6 +66,7 @@ struct ColBatch {
           return sql_format_double(d, 0);
         }
         case Codes: return nul[r] ? sql_null() : dict[codes[r]];
+        case Dec: return nul[r] ? sql_null() : scaled_decimal_cell(i[r], scale, fixed);
       }
       return sql_null();
     }

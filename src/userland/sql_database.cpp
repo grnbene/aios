@@ -16893,40 +16893,7 @@ const std::string& ColumnStore::get(size_t row) const {
         int64_t tmp = sf;
         while (tmp > 1 && dec_places < 18) { dec_places++; tmp /= 10; }   // an int64 scale has at most 18 places
       }
-      if (dec_places == 0) {
-        s = std::to_string(sv);
-      } else {
-        bool neg = (sv < 0);
-        uint64_t abs_v = neg ? static_cast<uint64_t>(-sv) : static_cast<uint64_t>(sv);
-        uint64_t div = static_cast<uint64_t>(std::round(scale_factor));
-        if (div == 0) div = 1;
-        uint64_t int_part = abs_v / div;
-        uint64_t frac_part = abs_v % div;
-
-        char buf[64];
-        if (decimal_fixed()) {
-          std::snprintf(buf, sizeof(buf), "%s%llu.%0*llu", neg ? "-" : "", (unsigned long long)int_part,
-                        dec_places, (unsigned long long)frac_part);
-        } else if (frac_part == 0) {
-          if (neg) std::snprintf(buf, sizeof(buf), "-%llu", (unsigned long long)int_part);
-          else std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)int_part);
-        } else {
-          char frac_buf[32];
-          std::snprintf(frac_buf, sizeof(frac_buf), "%0*llu", dec_places, (unsigned long long)frac_part);
-          int flen = static_cast<int>(std::strlen(frac_buf));
-          while (flen > 0 && frac_buf[flen - 1] == '0') {
-            frac_buf[--flen] = '\0';
-          }
-          if (flen == 0) {
-            if (neg) std::snprintf(buf, sizeof(buf), "-%llu", (unsigned long long)int_part);
-            else std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)int_part);
-          } else {
-            if (neg) std::snprintf(buf, sizeof(buf), "-%llu.%s", (unsigned long long)int_part, frac_buf);
-            else std::snprintf(buf, sizeof(buf), "%llu.%s", (unsigned long long)int_part, frac_buf);
-          }
-        }
-        s = buf;
-      }
+      s = scaled_decimal_cell(sv, dec_places, decimal_fixed());   // the rule a Dec batch column prints by too
       return s;
     }
 
@@ -18373,6 +18340,36 @@ bool ColumnStore::adopt_doubles(std::vector<double>&& v, const std::vector<uint8
   for (size_t r = 0; r < n; ++r) if (nul[r]) v[r] = 0.0;
   double_data = std::move(v);
   row_count_ = n;
+  adopt_nulls(*this, nul, n);
+  zone_maps.clear();   // as adopt_ints
+  return true;
+}
+
+bool ColumnStore::adopt_scaled(const std::vector<int64_t>& v, const std::vector<uint8_t>& nul, int places, bool fixed) {
+  if (row_count_ != 0 || shared_dict || nul.size() != v.size() || places < 0 || places > 18) return false;
+  const size_t n = v.size();
+  int64_t lo = INT64_MAX, hi = INT64_MIN;
+  for (size_t r = 0; r < n; ++r) if (!nul[r]) { lo = std::min(lo, v[r]); hi = std::max(hi, v[r]); }
+  if (lo > hi) { lo = 0; hi = 0; }   // every row NULL
+  if ((uint64_t)(hi - lo) > 0xFFFFFFFFull || hi - lo < 0) return false;
+  uint8_t bits = 0;
+  while (((uint64_t)(hi - lo) >> bits) > 0 && bits < 32) bits++;
+  if (bits == 0) bits = 1;
+  int64_t sf = 1;
+  for (int i = 0; i < places; ++i) sf *= 10;
+  int32_data.clear(); int64_data.clear(); double_data.clear();
+  dict.clear(); drop_dict_derived();
+  id_index.clear(); id_tag.clear(); id_index_count = 0;
+  encoding = ColumnEncoding::DecimalScaled;
+  base_int64 = lo;
+  scale_factor = (double)sf;
+  inv_scale_factor = (fixed ? -1.0 : 1.0) / (double)sf;
+  bit_width_ = bits;
+  row_count_ = n;
+  data32.clear();
+  if (bits == 32) packed_data.clear(), data32.assign(n, 0);
+  else packed_data.assign(((n * bits + 7) >> 3) + 8, 0);
+  for (size_t r = 0; r < n; ++r) if (!nul[r]) write_code(r, (uint32_t)(v[r] - lo));
   adopt_nulls(*this, nul, n);
   zone_maps.clear();   // as adopt_ints
   return true;
@@ -21073,6 +21070,12 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
       for (size_t r = 0; r < n; ++r) cs.append_double(col.f[r], col.nul[r] != 0);
       return;
     }
+    // Scaled decimals into the DECIMAL column of the same scale, or a DOUBLE column (as the source held them):
+    // the column is DecimalScaled at once, no cell formatted and parsed
+    if (col.kind == ColBatch::Dec && !sc.temporal &&
+        ((sc.type == SqlDataType::Decimal && col.fixed && sc.scale == col.scale) || (sc.type == SqlDataType::Real && sc.scale == 0 && !col.fixed)) &&
+        cs.adopt_scaled(col.i, col.nul, col.scale, col.fixed))
+      return;
     // Text, or dictionary codes, into a REAL column: each distinct text parsed once and the column typed (as an
     // F64 batch above) when every entry is a finite number other than -0 - a TypedDouble cell prints exactly
     // sql_normalize_value's text for it. Anything else (an empty string, 'inf', a word) keeps the text path below.

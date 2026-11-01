@@ -502,6 +502,22 @@ put a third of its instructions in the output lists' growth by doubling (the mov
 reserved ahead now (a row per base row and half as many again), which the instruction count rewards and the
 clock does not - the probe's time is in the index lookups and the scattered candidate lists, not in the copies.
 
+The decimal batch kind. A DECIMAL column (and a DOUBLE column the encoder holds scaled, DecimalScaled) crossed
+between statements as text: formatted cell by cell on the way out of the columnar window (45 ms of the 128), parsed
+and interned on the way into the derived table (17 ms). ColBatch::Dec carries the scaled integers with their places
+and whether every place prints (a DECIMAL(p,s)) or trailing zeros drop (a DOUBLE held scaled), printing exactly as
+ColumnStore::get prints the cell (scaled_decimal_cell, now the one rule for both); colbatch_gather fills it from
+the column in a block, and colbatch_fill_table adopts it straight into a DecimalScaled column of the same scale
+(ColumnStore::adopt_scaled, the codes packed as the encoder packs them). The window shape: 128 -> 47 ms (DuckDB
+19). One answer changed on the way, in the previous step rather than this one, and the decimal edge set made it
+visible: SUM of a DECIMAL column through the columnar window's derived table is the exact decimal (7856.05) where
+the text-typed derived table gave the double (7856.049999999999) - the typed answer is MariaDB's, and the
+text-inferred one is the general window path's remaining gap. A decimal edge set (DECIMAL(10,2), DECIMAL(18,6)
+and a DOUBLE held scaled through derived tables and CTEs: sums, averages, extremes, filters, equality with 0,
+negatives, NULLs, a join of two derived tables, GROUP BY the decimal, CAST to CHAR, the window shape) is
+otherwise identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the
+earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
