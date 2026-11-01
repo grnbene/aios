@@ -321,6 +321,26 @@ Measured: SQLDoom E1M1 medians 471/453/450 -> 284/283/300 ms against the build b
 (5cab6ef), alternating - 2.1 -> 3.5 frames a second; the texel-key programs 4.7 -> 4.5 ms, the five-program
 projection 18.1 -> 17.5 ms (their leaves and chunk overhead, not the native loop, are most of what is left).
 
+### 3b, second part: the leaves gathered by the native code
+
+A program's leaves (its column reads and constants) were each a pass in C++ writing a lane - nine bytes a row
+a leaf - that the native loop read back; 21 leaf reads a row in the key programs before leaves were shared, ~2.5
+ns each. Done: a leaf whose column is laid out flat - a typed int64 or double array, 32-bit dictionary codes
+with the leaf's code table - is gathered by the loop itself from a descriptor filled per chunk (`LeafDesc`:
+the data, the null bitmap and its bytes, the column's rows, the code table and its NULL flags, the source's
+row ids): the row's id from the source's row-id array (kNullRow, a row past the column or a NULL row: NULL, as
+the readers have it; a column with no NULL skips the bitmap, as ColI / ColF's readers do), then the value, into
+the leaf's slot and register as a computed instruction's. Each descriptor carries the layout kind it was filled
+from, and the loop compares it with the kind it was built for before the first row - a column re-encoded since
+bails with 2 and the interpreter takes the chunk; `valid()` then recompiles the program for the new layout. A
+packed or run-length column (a FOR-encoded id, 8-bit codes) keeps the lane path for that leaf.
+
+Measured: the texel-key programs 4.5 -> 3.7 ms over 56,524 rows, the five-program projection 17.5 -> 11.3 ms;
+SQLDoom E1M1 medians 458/467/463 -> 278/276/269 ms against the build before today's commits (5cab6ef),
+alternating - 2.1 -> 3.6 frames a second. The differential check over the frames, the randomized tool under
+eight seeds, frame bytes, the four oracle suites, the lane / mixed / decimal checks and the CAST set are
+identical to the build before.
+
 Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
 casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
 rounding as written, the range error). The renderer's key expressions cast four or five times a row and the

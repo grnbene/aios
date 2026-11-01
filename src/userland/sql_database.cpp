@@ -8306,8 +8306,8 @@ static bool row_in_set_has(const RowInSet& set, const double* key, size_t n);
 namespace vp {
 std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why) { return vjit::build(P, why); }
 int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
-             int64_t* out_i, double* out_f, uint8_t* out_n) {
-  vjit::Env env{n, lane_i, lane_f, lane_n, out_i, out_f, out_n};
+             int64_t* out_i, double* out_f, uint8_t* out_n, const LeafDesc* leaves, const size_t* const* rid) {
+  vjit::Env env{n, lane_i, lane_f, lane_n, out_i, out_f, out_n, leaves, rid};
   const int rc = static_cast<const vjit::Code*>(code)->fn(&env);
   if (rc == 0) vjit::native_runs().fetch_add(1, std::memory_order_relaxed);
   return rc;
@@ -8317,7 +8317,7 @@ bool vjit_check_mode() { return vjit::check_mode(); }
 #else
 namespace vp {
 std::shared_ptr<void> vjit_build_for(const Prog&, std::string* why) { if (why) *why = "no native code on this architecture"; return nullptr; }
-int vjit_run(const void*, size_t, const void* const*, const void* const*, const void* const*, int64_t*, double*, uint8_t*) { return 1; }
+int vjit_run(const void*, size_t, const void* const*, const void* const*, const void* const*, int64_t*, double*, uint8_t*, const LeafDesc*, const size_t* const*) { return 1; }
 bool vjit_check_mode() { return false; }
 }  // namespace vp
 #endif

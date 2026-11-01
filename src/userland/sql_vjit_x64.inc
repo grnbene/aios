@@ -34,8 +34,11 @@ struct Env {
   int64_t* out_i;                 // +32
   double* out_f;                  // +40
   uint8_t* out_n;                 // +48
+  const LeafDesc* leaves;         // +56  the leaves the code gathers itself, by instruction (LeafDesc, 72 bytes each)
+  const size_t* const* rid;       // +64  the chunk's row ids, by source
 };
-using Fn = int (*)(const Env*);   // 0: done; 1: bail - the interpreter decides the chunk
+static_assert(sizeof(LeafDesc) == 72, "LeafDesc layout");
+using Fn = int (*)(const Env*);   // 0: done; 1: bail - the interpreter decides the chunk; 2: a column's layout moved
 
 // The helpers the code calls, in the interpreter's own terms.
 extern "C" {
@@ -121,6 +124,16 @@ struct Asm {
   void load_idx8(Reg d, Reg base, Reg idx) { rex(true, d, idx, base); b(0x8B); modrm_sib8(d, base, idx); }          // mov d, [base+idx*8]
   void store_idx8(Reg base, Reg idx, Reg s) { rex(true, s, idx, base); b(0x89); modrm_sib8(s, base, idx); }         // mov [base+idx*8], s
   void loadb_idx(Reg d, Reg base, Reg idx) { rex(false, d, idx, base); b(0x0F); b(0xB6); modrm_sib1(d, base, idx); }   // movzx d32, byte [base+idx]
+  void modrm_sib4(uint8_t reg, uint8_t base, uint8_t idx) {    // [base + idx*4]
+    b((uint8_t)(0x04 | ((reg & 7) << 3)));
+    b((uint8_t)(0x80 | ((idx & 7) << 3) | (base & 7)));
+  }
+  void load32_idx4(Reg d, Reg base, Reg idx) { rex(false, d, idx, base); b(0x8B); modrm_sib4(d, base, idx); }   // mov d32, [base+idx*4] (zero-extended)
+  void bt(Reg d, Reg bit) { rex(true, bit, 0, d); b(0x0F); b(0xA3); rr(bit, d); }                             // CF = bit `bit` of d
+  void shr_imm(Reg d, uint8_t n) { rex(true, 0, 0, d); b(0xC1); rr(5, d); b(n); }
+  void and_imm32(Reg d, int32_t imm) { rex(true, 0, 0, d); b(0x81); rr(4, d); d32((uint32_t)imm); }
+  void cmp_mem(Reg r, Reg base, int32_t disp) { rex(true, r, 0, base); b(0x3B); modrm_disp(r, base, disp); }       // cmp r, [base+disp]
+  void cmp32_mem_imm(Reg base, int32_t disp, int32_t imm) { rex(false, 0, 0, base); b(0x81); modrm_disp(7, base, disp); d32((uint32_t)imm); }   // cmp dword [base+disp], imm
   void storeb_idx(Reg base, Reg idx, Reg s) { rex(false, s, idx, base, (s & 7) >= 4); b(0x88); modrm_sib1(s, base, idx); }   // mov byte [base+idx], s8
   void alu(uint8_t op, Reg d, Reg s) { rex(true, s, 0, d); b(op); rr(s, d); }
   void add(Reg d, Reg s) { alu(0x01, d, s); }
@@ -193,7 +206,16 @@ class Builder {
     const size_t K = P_.ins.size();
     if (K < 2 || K > 256) { if (why) *why = "program size"; return nullptr; }
     for (size_t x = 0; x < K; ++x) if (!covered(x, why)) return nullptr;
-    frame_ = (int32_t)(16 * K);
+    // the leaves gathered in the loop (P.leaf_kind, filled by compile()) and the sources they read
+    native_.assign(K, 0);
+    nsrc_ = 0;
+    for (size_t x = 0; x < K; ++x) {
+      if (!is_leaf(P_.ins[x].op) || x >= P_.leaf_kind.size() || P_.leaf_kind[x] == LeafLane) continue;
+      if (P_.ins[x].op != Ins::Konst && P_.ins[x].src >= 64) continue;   // past the row-id table: the lane path
+      native_[x] = 1;
+      if (P_.ins[x].op != Ins::Konst && P_.ins[x].src + 1 > nsrc_) nsrc_ = P_.ins[x].src + 1;
+    }
+    frame_ = (int32_t)(16 * K + 8 * nsrc_);
     // rsp after the six pushes and the return address is 8 mod 16; the frame makes it 0 mod 16 for the calls
     if ((frame_ + 8) % 16 != 0) frame_ += 8;
     a_.push(RBX); a_.push(RBP); a_.push(R12); a_.push(R13); a_.push(R14); a_.push(R15);
@@ -202,9 +224,17 @@ class Builder {
     a_.load(R13, RBX, 0);             // n
     a_.load(R14, RBX, 32 + (P_.out().ty == Ty::F64 ? 8 : 0));   // out_i or out_f
     a_.load(R15, RBX, 48);            // out_n
-    // the leaves' lane pointers into their slots
+    a_.load(RBP, RBX, 56);            // the leaf descriptors
+    // the lane leaves' pointers into their slots; the gathered leaves' layouts checked (moved: bail with 2)
+    bool any_native = false;
     for (size_t x = 0; x < K; ++x) {
       if (!is_leaf(P_.ins[x].op)) continue;
+      if (native_[x]) {
+        any_native = true;
+        a_.cmp32_mem_imm(RBP, (int32_t)(72 * x + 68), (int32_t)P_.leaf_kind[x]);
+        moved_.push_back(a_.jcc(CcNE));
+        continue;
+      }
       a_.load(RAX, RBX, P_.ins[x].ty == Ty::F64 ? 16 : 8);
       a_.load(RAX, RAX, (int32_t)(8 * x));
       a_.store(RSP, slot_v(x), RAX);
@@ -212,14 +242,24 @@ class Builder {
       a_.load(RAX, RAX, (int32_t)(8 * x));
       a_.store(RSP, slot_n(x), RAX);
     }
+    // the sources' row-id arrays into their slots
+    for (size_t sidx = 0; sidx < nsrc_; ++sidx) {
+      a_.load(RAX, RBX, 64);
+      a_.load(RAX, RAX, (int32_t)(8 * sidx));
+      a_.store(RSP, slot_rid(sidx), RAX);
+    }
+    (void)any_native;
     a_.mov_imm(R12, 0);
     a_.test(R13, R13);
     const size_t empty = a_.jcc(CcE);
     const size_t loop = a_.here();
-    for (size_t x = 0; x < K; ++x) if (!is_leaf(P_.ins[x].op)) emit(x);
+    for (size_t x = 0; x < K; ++x) {
+      if (native_[x]) emit_leaf(x);
+      else if (!is_leaf(P_.ins[x].op)) emit(x);
+    }
     // the output lane
     const size_t K1 = K - 1;
-    if (is_leaf(P_.ins[K1].op)) { if (why) *why = "a leaf as the result"; return nullptr; }
+    if (is_leaf(P_.ins[K1].op) && !native_[K1]) { if (why) *why = "a leaf as the result"; return nullptr; }
     a_.load(RAX, RSP, slot_v(K1));
     a_.store_idx8(R14, R12, RAX);
     a_.load(RAX, RSP, slot_n(K1));
@@ -234,6 +274,10 @@ class Builder {
     const size_t bail = a_.here();
     for (size_t at : bails_) a_.patch(at, bail);
     a_.mov_imm(RAX, 1);
+    epilogue();
+    const size_t moved = a_.here();
+    for (size_t at : moved_) a_.patch(at, moved);
+    a_.mov_imm(RAX, 2);
     epilogue();
     auto code = std::make_shared<Code>();
     code->bytes = a_.buf.size();
@@ -251,6 +295,11 @@ class Builder {
   Asm a_;
   int32_t frame_ = 0;
   std::vector<size_t> bails_;
+  std::vector<size_t> moved_;      // the layout checks' jumps (bail with 2)
+  std::vector<uint8_t> native_;    // per instruction: a leaf the loop gathers itself
+  size_t nsrc_ = 0;                // sources with a row-id slot
+  int32_t slot_rid(size_t sidx) const { return (int32_t)(16 * P_.ins.size() + 8 * sidx); }
+  bool lane_leaf(size_t x) const { return is_leaf(at(x).op) && !native_[x]; }
   static constexpr Reg X0 = RAX, X1 = RCX, X2 = RDX, X3 = RBX, X4 = RSP;   // xmm0..xmm4 as Reg numbers
   int32_t slot_v(size_t x) const { return (int32_t)(16 * x); }
   int32_t slot_n(size_t x) const { return (int32_t)(16 * x + 8); }
@@ -344,18 +393,112 @@ class Builder {
   // An F64 instruction's register is an xmm whichever way its bits were stored (Neg and Abs of a double store
   // the sign-flipped bits through store_i); an I64 or text one's is a GPR.
   void ld_i(size_t a, Reg d) {
-    if (is_leaf(at(a).op)) { a_.load(d, RSP, slot_v(a)); a_.load_idx8(d, d, R12); }
+    if (lane_leaf(a)) { a_.load(d, RSP, slot_v(a)); a_.load_idx8(d, d, R12); }
     else if (cached(a) >= 0) { if (ty(a) == Ty::F64) a_.movq_rx(d, (Reg)cached(a)); else if ((Reg)cached(a) != d) a_.mov(d, (Reg)cached(a)); }
     else a_.load(d, RSP, slot_v(a));
   }
   void ld_f(size_t a, Reg x, Reg scratch) {
-    if (is_leaf(at(a).op)) { a_.load(scratch, RSP, slot_v(a)); a_.movsd_load_idx8(x, scratch, R12); }
+    if (lane_leaf(a)) { a_.load(scratch, RSP, slot_v(a)); a_.movsd_load_idx8(x, scratch, R12); }
     else if (cached(a) >= 0) { if (ty(a) != Ty::F64) { a_.mov(scratch, (Reg)cached(a)); a_.movq_xr(x, scratch); } else if ((Reg)cached(a) != x) a_.movsd(x, (Reg)cached(a)); }
     else a_.movsd_load(x, RSP, slot_v(a));
   }
   void ld_n(size_t a, Reg d) {
-    if (is_leaf(at(a).op)) { a_.load(d, RSP, slot_n(a)); a_.loadb_idx(d, d, R12); }
+    if (lane_leaf(a)) { a_.load(d, RSP, slot_n(a)); a_.loadb_idx(d, d, R12); }
     else a_.load(d, RSP, slot_n(a));
+  }
+  // A leaf gathered in the loop: the row's id from its source's row ids (kNullRow, past the column or a NULL
+  // row: NULL), then the value from the column's flat storage (LeafDesc, by kind), into the leaf's slot and
+  // register as a computed instruction's - its readers then take it as one.
+  void emit_leaf(size_t x) {
+    const Ins& in = at(x);
+    const int32_t d = (int32_t)(72 * x);   // the descriptor, at [rbp + d]
+    std::vector<size_t> done;
+    if (in.op == Ins::Konst) {
+      if (in.knull) { set_null(x); return; }
+      a_.load(RAX, RBP, d + 56);
+      if (in.ty == Ty::F64) { a_.movq_xr(X0, RAX); store_f(x, X0); } else store_i(x, RAX);
+      set_not_null(x);
+      return;
+    }
+    // rax = the row's id in the source
+    a_.load(RCX, RSP, slot_rid(in.src));
+    a_.load_idx8(RAX, RCX, R12);
+    std::vector<size_t> nulls;   // jumps to the NULL (ColNull: 1) outcome
+    a_.cmp_imm32(RAX, -1);
+    nulls.push_back(a_.jcc(CcE));
+    a_.cmp_mem(RAX, RBP, d + 24);
+    nulls.push_back(a_.jcc(CcAE));
+    // the null bitmap: byte rax>>3, where it is within the bitmap's bytes (0 bytes: no NULL in the column)
+    a_.load(RCX, RBP, d + 16);
+    a_.test(RCX, RCX);
+    const size_t no_bitmap = a_.jcc(CcE);
+    a_.mov(RDX, RAX);
+    a_.shr_imm(RDX, 3);
+    a_.cmp(RDX, RCX);
+    const size_t past_bitmap = a_.jcc(CcAE);
+    a_.load(RCX, RBP, d + 8);
+    a_.loadb_idx(RDX, RCX, RDX);
+    a_.mov(RCX, RAX);
+    a_.and_imm32(RCX, 7);
+    a_.bt(RDX, RCX);
+    nulls.push_back(a_.jcc(CcB));   // CF: the bit is set
+    a_.patch_here(no_bitmap);
+    a_.patch_here(past_bitmap);
+    // the value
+    switch (in.op) {
+      case Ins::ColNull:
+        a_.mov_imm(RAX, 0); store_i(x, RAX); set_not_null(x);
+        done.push_back(a_.jmp());
+        for (size_t j : nulls) a_.patch_here(j);
+        a_.mov_imm(RAX, 1); store_i(x, RAX); set_not_null(x);
+        for (size_t j : done) a_.patch_here(j);
+        return;
+      case Ins::ColI:
+        a_.load(RCX, RBP, d + 0);
+        a_.load_idx8(RDX, RCX, RAX);
+        store_i(x, RDX);
+        break;
+      case Ins::ColF:
+        a_.load(RCX, RBP, d + 0);
+        a_.movsd_load_idx8(X0, RCX, RAX);
+        store_f(x, X0);
+        break;
+      default: {   // 32-bit codes: rdx = the code
+        a_.load(RCX, RBP, d + 0);
+        a_.load32_idx4(RDX, RCX, RAX);
+        if (in.op == Ins::ColS) {
+          a_.load(RCX, RBP, d + 56);
+          a_.or_(RDX, RCX);
+          store_i(x, RDX);
+        } else if (in.op == Ins::StrIn) {
+          a_.cmp_mem(RDX, RBP, d + 48);
+          const size_t past = a_.jcc(CcAE);
+          a_.load(RCX, RBP, d + 40);
+          a_.loadb_idx(RAX, RCX, RDX);
+          const size_t have = a_.jmp();
+          a_.patch_here(past);
+          a_.mov_imm(RAX, 0);
+          a_.patch_here(have);
+          store_i(x, RAX);
+        } else {   // CodeI / CodeF: the code's entry, NULL where the entry is or the code is past the table
+          a_.cmp_mem(RDX, RBP, d + 48);
+          nulls.push_back(a_.jcc(CcAE));
+          a_.load(RCX, RBP, d + 40);
+          a_.loadb_idx(RAX, RCX, RDX);
+          a_.test(RAX, RAX);
+          nulls.push_back(a_.jcc(CcNE));
+          a_.load(RCX, RBP, d + 32);
+          if (in.op == Ins::CodeI) { a_.load_idx8(RAX, RCX, RDX); store_i(x, RAX); }
+          else { a_.movsd_load_idx8(X0, RCX, RDX); store_f(x, X0); }
+        }
+        break;
+      }
+    }
+    set_not_null(x);
+    done.push_back(a_.jmp());
+    for (size_t j : nulls) a_.patch_here(j);
+    set_null(x);
+    for (size_t j : done) a_.patch_here(j);
   }
   // operand a as a double in x (vp::eval's fd)
   void fd(size_t a, Reg x, Reg scratch) {

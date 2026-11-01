@@ -79,6 +79,9 @@ struct Prog {
   bool has_fn = false;
   uint64_t fn_gen = 0;
   const Ins& out() const { return ins.back(); }
+  // The leaves the native code gathers itself and the column layout each was built for (LeafKind; 0: the lane
+  // path), one per instruction; a layout that has moved since recompiles the program (valid).
+  std::vector<uint32_t> leaf_kind;
   // Native code for the program's non-leaf instructions (sql_vjit_x64.inc), built once with the program; null
   // where none (disabled, another architecture, or an instruction the code does not cover).
   std::shared_ptr<void> jit;
@@ -90,10 +93,44 @@ inline bool vjit_leaf(Ins::Op op) {
   return op == Ins::Konst || op == Ins::ColI || op == Ins::ColF || op == Ins::CodeI || op == Ins::CodeF || op == Ins::ColNull ||
          op == Ins::StrIn || op == Ins::ColS;
 }
+// A leaf the native code gathers itself (sql_vjit_x64.inc), described from the column as it is when a chunk runs:
+// the row's id from the source's row ids, then the value straight from a flat column - an int64 or double array,
+// or 32-bit dictionary codes through the leaf's table. `kind` says which layout, 0 where the leaf keeps the lane
+// path (a packed or run-length column); the code compares it with the one it was built for and bails otherwise.
+struct LeafDesc {
+  const void* data = nullptr;          // +0  int64_t* / double* / uint32_t* codes
+  const uint8_t* nulls = nullptr;      // +8  the null bitmap
+  uint64_t nulls_bytes = 0;            // +16 its bytes (0: no NULL in the column, nothing to test)
+  uint64_t size = 0;                   // +24 the column's rows
+  const void* table = nullptr;         // +32 CodeI: int64_t per code; CodeF: double per code
+  const uint8_t* table_null = nullptr; // +40 CodeI / CodeF: 1 where the code's entry is NULL; StrIn: 1 where it matches
+  uint64_t table_n = 0;                // +48 the table's codes
+  uint64_t imm = 0;                    // +56 Konst: the value's bits; ColS: the slot's high word
+  uint32_t src = 0;                    // +64 the source whose row ids to read
+  uint32_t kind = 0;                   // +68 LeafKind
+};
+enum LeafKind : uint32_t { LeafLane = 0, LeafKonst = 1, LeafColNull = 2, LeafI64 = 3, LeafF64 = 4, LeafCodeI = 5, LeafCodeF = 6, LeafColS = 7, LeafStrIn = 8 };
+inline uint32_t leaf_kind_of(const Ins& in) {
+  switch (in.op) {
+    case Ins::Konst: return LeafKonst;
+    case Ins::ColNull: return in.cs ? LeafColNull : LeafLane;
+    case Ins::ColI: return in.cs && in.cs->encoding == ColumnEncoding::TypedInt64 && in.cs->int64_data.size() >= in.cs->size() ? LeafI64 : LeafLane;
+    case Ins::ColF: return in.cs && in.cs->encoding == ColumnEncoding::TypedDouble && in.cs->double_data.size() >= in.cs->size() ? LeafF64 : LeafLane;
+    case Ins::CodeI: case Ins::CodeF: case Ins::ColS: case Ins::StrIn: {
+      const ColumnStore* cs = in.cs;
+      const bool flat = cs && cs->encoding != ColumnEncoding::RLE && cs->encoding != ColumnEncoding::Constant && !cs->seg_packed_ &&
+                        cs->bit_width_ == 32 && cs->data32.size() >= cs->size();
+      if (!flat) return LeafLane;
+      return in.op == Ins::CodeI ? LeafCodeI : in.op == Ins::CodeF ? LeafCodeF : in.op == Ins::ColS ? LeafColS : LeafStrIn;
+    }
+    default: return LeafLane;
+  }
+}
+
 std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why);   // sql_vjit_x64.inc; null elsewhere
 // 0: the output lane is computed; 1: bail (an overflow or a non-finite double the interpreter would refuse)
 int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
-             int64_t* out_i, double* out_f, uint8_t* out_n);
+             int64_t* out_i, double* out_f, uint8_t* out_n, const LeafDesc* leaves, const size_t* const* rid);
 bool vjit_check_mode();
 
 // Every literal of e in tree order, as it would compile: value text and kind.
@@ -915,7 +952,10 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
     return nullptr;
   }
   std::string jwhy;
+  P->leaf_kind.assign(P->ins.size(), LeafLane);
+  for (size_t x = 0; x < P->ins.size(); ++x) if (vjit_leaf(P->ins[x].op)) P->leaf_kind[x] = leaf_kind_of(P->ins[x]);
   P->jit = vjit_build_for(*P, &jwhy);
+  if (!P->jit) P->leaf_kind.assign(P->ins.size(), LeafLane);
   if (vx_trace_on() && !P->jit && !jwhy.empty()) vx_trace("vp: no native code: " + jwhy);
   return P;
 }
@@ -982,6 +1022,8 @@ struct Lanes {
     }
     return rid[src].data();
   }
+  // The chunk's row ids per source, for the leaves the native code gathers (eval).
+  std::vector<std::vector<size_t>> ridc;
   // A different row set: what was worked out over the last one goes.
   void reset_for(size_t total) {
     if (total_rows == total) return;
@@ -1383,23 +1425,66 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
     for (size_t x = 0; x < K; ++x) if (!eval_ins(P, x, rowid, n, L, err)) return false;
     return true;
   }
-  for (size_t x = 0; x < K; ++x) if (vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) return false;
+  // The leaves the native code gathers itself: described from their columns as they are now, with the chunk's
+  // row ids per source; the others through their readers, into lanes.
+  auto native_leaf = [&](size_t x) { return x < P.leaf_kind.size() && P.leaf_kind[x] != LeafLane; };
+  for (size_t x = 0; x < K; ++x) if (vjit_leaf(P.ins[x].op) && !native_leaf(x) && !eval_ins(P, x, rowid, n, L, err)) return false;
   const void* li[256]; const void* lf[256]; const void* ln[256];
+  LeafDesc leaves[256];
+  const size_t* rid[64] = {nullptr};
+  size_t nsrc = 0;
   for (size_t x = 0; x < K; ++x) {
-    const bool leaf = vjit_leaf(P.ins[x].op);
+    const bool leaf = vjit_leaf(P.ins[x].op) && !native_leaf(x);
     li[x] = leaf && P.ins[x].ty != Ty::F64 ? (const void*)L.i[x].data() : nullptr;
     lf[x] = leaf && P.ins[x].ty == Ty::F64 ? (const void*)L.f[x].data() : nullptr;
     ln[x] = leaf ? (const void*)L.n[x].data() : nullptr;
+    if (!native_leaf(x)) continue;
+    const Ins& in = P.ins[x];
+    LeafDesc& d = leaves[x];
+    d = LeafDesc();
+    d.kind = leaf_kind_of(in);
+    d.src = in.src;
+    if (in.op == Ins::Konst) {
+      if (in.ty == Ty::F64) std::memcpy(&d.imm, &in.kf, 8); else d.imm = (uint64_t)in.ki;
+      d.kind = in.knull ? LeafKonst : LeafKonst;   // knull: the code sets NULL (imm unused)
+      d.table_n = in.knull ? 1 : 0;
+      continue;
+    }
+    const ColumnStore& cs = *in.cs;
+    d.size = cs.size();
+    d.nulls = cs.null_bitmap.data();
+    d.nulls_bytes = cs.null_bitmap.size();
+    if ((in.op == Ins::ColI || in.op == Ins::ColF) && !vx::has_nulls(cs)) d.nulls_bytes = 0;   // as their readers skip the bitmap
+    if (d.kind == LeafI64) d.data = cs.int64_data.data();
+    else if (d.kind == LeafF64) d.data = cs.double_data.data();
+    else if (d.kind != LeafColNull) d.data = cs.data32.data();
+    if (in.op == Ins::CodeI) { d.table = in.code_i().data(); d.table_null = in.codes ? in.codes->null.data() : in.code_null.data(); d.table_n = in.code_count(); }
+    else if (in.op == Ins::CodeF) { d.table = in.code_f().data(); d.table_null = in.codes ? in.codes->null.data() : in.code_null.data(); d.table_n = in.code_count(); }
+    else if (in.op == Ins::StrIn) { d.table_null = in.code_null.data(); d.table_n = in.code_null.size(); }
+    else if (in.op == Ins::ColS) d.imm = (uint64_t)(in.slot + 1) << 32;
+    if (in.src >= 64) { d.kind = LeafLane; continue; }   // a source past the row-id table: the code bails to the interpreter
+    if (in.src + 1 > nsrc) nsrc = in.src + 1;
+    if (L.ridc.size() <= in.src) L.ridc.resize(in.src + 1);
+    if (!rid[in.src]) {
+      std::vector<size_t>& r = L.ridc[in.src];
+      r.resize(n);
+      for (size_t j = 0; j < n; ++j) r[j] = rowid(j, in.src);
+      rid[in.src] = r.data();
+    }
   }
   const size_t o = K - 1;
   L.n[o].assign(n, 0);
   if (P.out().ty != Ty::F64) L.i[o].assign(n, 0); else L.f[o].assign(n, 0);
-  const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data());
+  const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data(), leaves, rid);
   if (rc == 0 && !vjit_check_mode()) return true;
+  if (rc == 2) {   // a column laid out differently than the code was built for: the interpreter, the whole chunk
+    for (size_t x = 0; x < K; ++x) if (!eval_ins(P, x, rowid, n, L, err)) return false;
+    return true;
+  }
   if (rc == 0) {
     // check mode: the interpreter's answer must be these bytes exactly
     std::vector<int64_t> ji = L.i[o]; std::vector<double> jf = L.f[o]; std::vector<uint8_t> jn = L.n[o];
-    for (size_t x = 0; x < K; ++x) if (!vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) {
+    for (size_t x = 0; x < K; ++x) if ((!vjit_leaf(P.ins[x].op) || native_leaf(x)) && !eval_ins(P, x, rowid, n, L, err)) {
       std::fprintf(stderr, "[vjit] check: native code answered where the interpreter refuses: %s\n", err->c_str());
       std::abort();
     }
@@ -1420,7 +1505,7 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
     return true;
   }
   // bail: the interpreter decides the chunk (and sets *err where it refuses)
-  for (size_t x = 0; x < K; ++x) if (!vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) return false;
+  for (size_t x = 0; x < K; ++x) if ((!vjit_leaf(P.ins[x].op) || native_leaf(x)) && !eval_ins(P, x, rowid, n, L, err)) return false;
   if (vjit_check_mode()) {
     std::string ops;
     for (const Ins& in : P.ins) { ops += std::to_string((int)in.op) + (in.ty == Ty::F64 ? "f" : in.ty == Ty::Str ? "s" : "i") + "("; for (uint32_t a : in.args) ops += std::to_string(a) + ","; ops += ") "; }
@@ -1564,6 +1649,10 @@ inline bool valid(const Prog& P, const EvalCtx& ctx) {
     // a dictionary that has grown since: codes the tables do not know
     if ((in.op == Ins::CodeI || in.op == Ins::CodeF || in.op == Ins::StrIn) && vx::dict_size(*in.cs) != in.code_count()) return false;
   }
+  // a column the native code reads itself laid out differently now (re-encoded): built again for the new layout
+  if (P.jit)
+    for (size_t x = 0; x < P.ins.size() && x < P.leaf_kind.size(); ++x)
+      if (P.leaf_kind[x] != LeafLane && leaf_kind_of(P.ins[x]) != P.leaf_kind[x]) return false;
   return true;
 }
 
