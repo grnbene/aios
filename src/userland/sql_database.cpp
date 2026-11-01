@@ -3393,6 +3393,9 @@ struct ParsedSelectBranch {
     // generate_series(start, stop [, step]) in FROM: the arguments' text. Made natively (materialize_series);
     // subquery_sql holds `SELECT * FROM generate_series(...)` for whatever reads a derived table as text.
     std::string series_args;
+    // A generate_series over earlier sources' columns, expanded by the join step itself from each base row's
+    // bounds (SeriesSpec, join_steps): set up in place of a materialized lateral table.
+    std::shared_ptr<struct SeriesSpec> series_direct;
     // `(...) AS t(a, b)`, `generate_series(...) AS g(n)`: its columns' names, in order.
     std::vector<std::string> column_names;
     // `JOIN t USING (a, b)` / `NATURAL JOIN t`: the join's columns, turned into
@@ -6098,9 +6101,20 @@ ParsedSelectStatement parse_select_sql(const std::string& sql) {
 // --- evaluation context ---------------------------------------------------
 
 // One table taking part in a query, under the name the query refers to it by.
+// LATERAL generate_series(start, stop [, step]) over the sources before it, expanded by the join step: the bounds
+// are expressions over the base row (over every base row at once where they compile), each base row gets its
+// range's rows, and the numbers go into `table` (the statement's own, one column) as the rows are made - no
+// distinct-key query over the earlier sources, no table made per key value, no key join (materialize_lateral).
+struct SeriesSpec {
+  std::vector<ExprPtr> args;   // start, stop [, step]
+  std::string column;          // the one column's name (the alias, or `AS g(n)`'s)
+  SqlTable* table = nullptr;
+};
+
 struct QuerySource {
   std::string alias;
   const SqlTable* table = nullptr;
+  std::shared_ptr<const SeriesSpec> series;   // a generate_series the join step expands (see SeriesSpec)
 };
 
 constexpr size_t kNullRow = (size_t)-1;
@@ -43599,44 +43613,44 @@ void own_branch_exprs(ParsedSelectBranch& b) {
   for (auto& o : b.order_by) o.expr = clone_expr(o.expr);
 }
 
-// generate_series(start, stop [, step]) as a table: its arguments worked out in the scope it sits in (a LATERAL
-// one's outer row is there), its numbers in one column. A NULL argument makes no rows, as in PostgreSQL; a step of 0
-// is refused. Whole arguments give integers; with a fraction among them the numbers are decimals at the largest scale
-// written (0, 1, 0.25 gives 0.00 ... 1.00), worked out exactly as integers of that scale.
-static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const ParsedSelectBranch::SourceSpec& src, std::string* err) {
-  SqlQueryResult a = db->execute_local_query("SELECT " + src.series_args);
-  if (!a.success) { *err = a.error_message; return nullptr; }
-  if (a.columns.size() < 2 || a.columns.size() > 3 || a.rows.size() != 1) {
-    *err = "generate_series takes (start, stop [, step])";
-    return nullptr;
-  }
-  if (src.column_names.size() > 1) {
-    *err = "generate_series makes one column; " + std::to_string(src.column_names.size()) + " names given";
-    return nullptr;
-  }
-  auto t = std::make_shared<SqlTable>();
-  t->name = src.alias;
-  SqlColumn col;
-  col.name = !src.column_names.empty() ? src.column_names[0] : src.alias;
-  const std::vector<std::string>& v = a.rows[0].values;
+// The rows generate_series(start, stop [, step]) makes of its arguments' values: `n` of them from `start` by
+// `step`, as integers of 10^-scale (scale: the largest number of decimal places among the arguments; 0 for whole
+// ones). None (n = 0) for a NULL argument, as in PostgreSQL, or a range the step never enters. False with *err
+// for a non-number, a step of 0, a bound past 64 bits or over 100,000,000 rows. Whole arguments give integers;
+// with a fraction among them the numbers are decimals at that scale (0, 1, 0.25 gives 0.00 ... 1.00), exact.
+struct SeriesRange {
+  long long start = 0, step = 1;
+  unsigned long long n = 0;
+  int scale = 0;
+};
+static bool series_count(long long start, long long stop, long long step, SeriesRange* r, std::string* err) {
+  if (step == 0) { *err = "generate_series: the step cannot be 0"; return false; }
+  r->start = start;
+  r->step = step;
+  r->n = 0;
+  if ((step > 0 && start > stop) || (step < 0 && start < stop)) return true;
+  const unsigned long long span = step > 0 ? (unsigned long long)(stop - start) : (unsigned long long)(start - stop);
+  const unsigned long long n = span / (unsigned long long)(step > 0 ? step : -step) + 1;
+  if (n > 100000000ull) { *err = "generate_series would make " + std::to_string(n) + " rows (100,000,000 at most)"; return false; }
+  r->n = n;
+  return true;
+}
+static bool series_range_of(const std::vector<std::string>& v, SeriesRange* r, std::string* err) {
+  *r = SeriesRange();
+  if (v.size() < 2 || v.size() > 3) { *err = "generate_series takes (start, stop [, step])"; return false; }
   bool any_null = false;
   int scale = 0;
   std::vector<std::string> digits;
   for (const std::string& x : v) {
     if (sql_is_null(x)) { any_null = true; continue; }
     std::string c = canonical_decimal(x);
-    if (c.empty()) { *err = "generate_series takes numbers, not '" + x + "'"; return nullptr; }
+    if (c.empty()) { *err = "generate_series takes numbers, not '" + x + "'"; return false; }
     const size_t dot = c.find('.');
     if (dot != std::string::npos) scale = std::max(scale, (int)(c.size() - dot - 1));
     digits.push_back(std::move(c));
   }
-  col.type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
-  col.scale = scale;
-  t->columns.push_back(col);
-  t->mark_result_table();
-  t->ensure_columns();
-  t->inferred_types = true;
-  if (any_null) return t;
+  r->scale = scale;
+  if (any_null) return true;
   // Each argument as an integer count of 10^-scale.
   auto scaled = [&](const std::string& c, long long* out) {
     std::string w = c;
@@ -43653,24 +43667,48 @@ static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const Parse
   for (int k = 0; k < scale; ++k) step *= 10;
   if (!scaled(digits[0], &start) || !scaled(digits[1], &stop) || (digits.size() == 3 && !scaled(digits[2], &step))) {
     *err = "generate_series: a bound past the 64-bit range";
+    return false;
+  }
+  return series_count(start, stop, step, r, err);
+}
+// A series number as its text: x counts of 10^-scale.
+static std::string series_text(long long x, int scale) {
+  if (scale == 0) return std::to_string(x);
+  const bool neg = x < 0;
+  std::string d = std::to_string(neg ? -(x + 1) + 1ull : (unsigned long long)x);
+  if (d.size() <= (size_t)scale) d.insert(0, (size_t)scale + 1 - d.size(), '0');
+  d.insert(d.size() - (size_t)scale, ".");
+  return neg ? "-" + d : d;
+}
+
+// generate_series(start, stop [, step]) as a table: its arguments worked out in the scope it sits in (a LATERAL
+// one's outer row is there), its numbers in one column (series_range_of).
+static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const ParsedSelectBranch::SourceSpec& src, std::string* err) {
+  SqlQueryResult a = db->execute_local_query("SELECT " + src.series_args);
+  if (!a.success) { *err = a.error_message; return nullptr; }
+  if (a.columns.size() < 2 || a.columns.size() > 3 || a.rows.size() != 1) {
+    *err = "generate_series takes (start, stop [, step])";
     return nullptr;
   }
-  if (step == 0) { *err = "generate_series: the step cannot be 0"; return nullptr; }
-  if ((step > 0 && start > stop) || (step < 0 && start < stop)) return t;
-  const unsigned long long span = step > 0 ? (unsigned long long)(stop - start) : (unsigned long long)(start - stop);
-  const unsigned long long n = span / (unsigned long long)(step > 0 ? step : -step) + 1;
-  if (n > 100000000ull) { *err = "generate_series would make " + std::to_string(n) + " rows (100,000,000 at most)"; return nullptr; }
-  t->reserve((size_t)n);
-  auto text_of = [&](long long x) {
-    if (scale == 0) return std::to_string(x);
-    const bool neg = x < 0;
-    std::string d = std::to_string(neg ? -(x + 1) + 1ull : (unsigned long long)x);
-    if (d.size() <= (size_t)scale) d.insert(0, (size_t)scale + 1 - d.size(), '0');
-    d.insert(d.size() - (size_t)scale, ".");
-    return neg ? "-" + d : d;
-  };
-  long long x = start;
-  for (unsigned long long i = 0; i < n; ++i, x += step) t->append_row(SqlRow{{text_of(x)}});
+  if (src.column_names.size() > 1) {
+    *err = "generate_series makes one column; " + std::to_string(src.column_names.size()) + " names given";
+    return nullptr;
+  }
+  SeriesRange r;
+  if (!series_range_of(a.rows[0].values, &r, err)) return nullptr;
+  auto t = std::make_shared<SqlTable>();
+  t->name = src.alias;
+  SqlColumn col;
+  col.name = !src.column_names.empty() ? src.column_names[0] : src.alias;
+  col.type = r.scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
+  col.scale = r.scale;
+  t->columns.push_back(col);
+  t->mark_result_table();
+  t->ensure_columns();
+  t->inferred_types = true;
+  t->reserve((size_t)r.n);
+  long long x = r.start;
+  for (unsigned long long i = 0; i < r.n; ++i, x += r.step) t->append_row(SqlRow{{series_text(x, r.scale)}});
   return t;
 }
 
@@ -43681,43 +43719,56 @@ static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const Parse
 // `t.__lateral_key = __LATKEY(those columns)`: one equality, hashed like any other, that pairs each earlier row with
 // the rows made for its values (none: CROSS drops the row, LEFT pads it). Null when it names no earlier column - an
 // ordinary derived table then.
+// The earlier sources' columns a LATERAL source's text names (`alias.col` of an earlier source, or a bare name an
+// earlier source has as a column - a superset of what it reads: never too few), and those sources' tables. False
+// with *err when a source cannot be resolved or the text does not tokenize.
+struct LateralRef { size_t src; std::string col; };
+static std::string lateral_alias_of(const ParsedSelectBranch& b, size_t k) {
+  const auto& o = b.sources[k];
+  return last_name_part(o.alias.empty() ? o.table_name : o.alias);
+}
+static bool lateral_refs(SqlDatabase* db, const ParsedSelectBranch& b, size_t idx, std::vector<const SqlTable*>* before,
+                         std::vector<LateralRef>* refs, std::string* err) {
+  const ParsedSelectBranch::SourceSpec& src = b.sources[idx];
+  before->assign(idx, nullptr);
+  for (size_t k = 0; k < idx; ++k) {
+    (*before)[k] = SelectEngine::resolve_table(db, b.sources[k].table_name);
+    if (!(*before)[k]) { *err = "table not found: " + b.sources[k].table_name; return false; }
+  }
+  refs->clear();
+  auto add = [&](size_t k, const std::string& name) {
+    const SqlTable* t = (*before)[k];
+    const int ci = t->get_column_index(name);
+    if (ci < 0 || (size_t)ci >= t->columns.size() - t->hidden_columns) return;
+    const std::string& col = t->columns[(size_t)ci].name;
+    for (const LateralRef& r : *refs) if (r.src == k && lower_of(r.col) == lower_of(col)) return;
+    refs->push_back({k, col});
+  };
+  const std::string& text = src.series_args.empty() ? src.subquery_sql : src.series_args;
+  std::vector<Token> toks;
+  std::string terr;
+  if (!tokenize_sql(text, &toks, &terr)) { *err = terr; return false; }
+  auto punct = [&](size_t i, const char* c) { return i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == c; };
+  for (size_t i = 0; i < toks.size(); ++i) {
+    if (toks[i].kind != Tok::Ident) continue;
+    if (punct(i + 1, ".") && i + 2 < toks.size() && toks[i + 2].kind == Tok::Ident) {
+      for (size_t k = 0; k < idx; ++k) if (lower_of(lateral_alias_of(b, k)) == lower_of(toks[i].text)) add(k, toks[i + 2].text);
+      i += 2;
+      continue;
+    }
+    if ((i > 0 && punct(i - 1, ".")) || punct(i + 1, "(")) continue;   // a qualified name's tail, a function
+    for (size_t k = 0; k < idx; ++k) add(k, toks[i].text);
+  }
+  return true;
+}
+
 static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSelectBranch& b, size_t idx, std::string* err) {
   ParsedSelectBranch::SourceSpec& src = b.sources[idx];
-  std::vector<const SqlTable*> before(idx, nullptr);
-  auto alias_of = [&](size_t k) {
-    const auto& o = b.sources[k];
-    return last_name_part(o.alias.empty() ? o.table_name : o.alias);
-  };
-  for (size_t k = 0; k < idx; ++k) {
-    before[k] = SelectEngine::resolve_table(db, b.sources[k].table_name);
-    if (!before[k]) { *err = "table not found: " + b.sources[k].table_name; return nullptr; }
-  }
-  struct Ref { size_t src; std::string col; };
+  std::vector<const SqlTable*> before;
+  auto alias_of = [&](size_t k) { return lateral_alias_of(b, k); };
+  using Ref = LateralRef;
   std::vector<Ref> refs;
-  auto add = [&](size_t k, const std::string& name) {
-    const int ci = before[k]->get_column_index(name);
-    if (ci < 0 || (size_t)ci >= before[k]->columns.size() - before[k]->hidden_columns) return;
-    const std::string& col = before[k]->columns[(size_t)ci].name;
-    for (const Ref& r : refs) if (r.src == k && lower_of(r.col) == lower_of(col)) return;
-    refs.push_back({k, col});
-  };
-  {
-    const std::string& text = src.series_args.empty() ? src.subquery_sql : src.series_args;
-    std::vector<Token> toks;
-    std::string terr;
-    if (!tokenize_sql(text, &toks, &terr)) { *err = terr; return nullptr; }
-    auto punct = [&](size_t i, const char* c) { return i < toks.size() && toks[i].kind == Tok::Punct && toks[i].text == c; };
-    for (size_t i = 0; i < toks.size(); ++i) {
-      if (toks[i].kind != Tok::Ident) continue;
-      if (punct(i + 1, ".") && i + 2 < toks.size() && toks[i + 2].kind == Tok::Ident) {
-        for (size_t k = 0; k < idx; ++k) if (lower_of(alias_of(k)) == lower_of(toks[i].text)) add(k, toks[i + 2].text);
-        i += 2;
-        continue;
-      }
-      if ((i > 0 && punct(i - 1, ".")) || punct(i + 1, "(")) continue;   // a qualified name's tail, a function
-      for (size_t k = 0; k < idx; ++k) add(k, toks[i].text);
-    }
-  }
+  if (!lateral_refs(db, b, idx, &before, &refs, err)) return nullptr;
   if (refs.empty()) return nullptr;
 
   // The distinct values of those columns over the earlier sources (their joins; the WHERE comes later).
@@ -45790,7 +45841,141 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
     // An inner join of a table of few rows (a settings row) with no key to probe: each base row gets each of
     // them, no per-row context. Its ON (an inner join's is a filter on the pairs, as a WHERE is) and the WHERE
     // conjuncts pushed to this step apply after it, at once, where they compile; the rest are checked here.
-    if (jkeys.empty() && !xk_join && !join_is_left[j] && !join_is_right[j] && js.table && !right_seen &&
+    // A LATERAL generate_series over the base rows (QuerySource::series, SeriesSpec): each base row's range made
+    // from its own bounds, the numbers going into the series table as the rows are made. A CROSS JOIN drops a
+    // base row whose range is empty, a LEFT JOIN pads it; an inner join's ON and the pushed WHERE conjuncts apply
+    // to the rows at once where they compile (vp_deferred), else to each; a LEFT JOIN's ON decides each
+    // candidate, as the probes do.
+    if (!hash_join_done && js.series && js.series->table && !right_seen) {
+      if (join_is_right[j]) return make_error("RIGHT JOIN LATERAL generate_series(...) is not supported");
+      const SeriesSpec& sp = *js.series;
+      SqlTable* const st = sp.table;
+      const size_t nb = rows.size();
+      const size_t na = sp.args.size();
+      const uint64_t st0 = vx_trace_on() ? hal_now_ns() : 0;
+      // the bounds over every base row at once where they compile; else each row's through the interpreter
+      std::vector<vp::Column> lanes(na);
+      std::vector<char> laned(na, 0);
+      if (nb >= 64) {
+        EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
+        vp::Lanes shared;
+        for (size_t a = 0; a < na; ++a) {
+          const vp::Prog* P = vp::program_for(sp.args[a].get(), bctx);
+          std::string verr;
+          if (P && vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, nb, &lanes[a], &verr, &shared)) laned[a] = 1;
+        }
+      }
+      bool all_int = true;
+      for (size_t a = 0; a < na; ++a) if (!laned[a] || lanes[a].ty != vp::Ty::I64 || lanes[a].uns) all_int = false;
+      std::vector<SeriesRange> rg(nb);
+      int scale = 0;
+      unsigned long long total = 0;
+      {
+        EvalCtx ictx; ictx.db = db; ictx.outer = outer_scope; ictx.sources = &baseonly; ictx.err = &err;
+        std::vector<std::string> vals(na);
+        for (size_t bi = 0; bi < nb; ++bi) {
+          SeriesRange& r = rg[bi];
+          if (all_int) {
+            bool null = false;
+            for (size_t a = 0; a < na; ++a) if (lanes[a].is_null(bi)) null = true;
+            if (null) continue;
+            if (!series_count(lanes[0].i[bi], lanes[1].i[bi], na == 3 ? lanes[2].i[bi] : 1, &r, &err)) return make_error(err);
+          } else {
+            for (size_t a = 0; a < na; ++a) {
+              if (laned[a]) { vals[a] = lanes[a].is_null(bi) ? sql_null() : lanes[a].text(bi); continue; }
+              ictx.row = &rows[bi];
+              Val v = eval_expr(sp.args[a].get(), ictx);
+              if (!err.empty()) return make_error(err);
+              vals[a] = v.null ? sql_null() : v.str();
+            }
+            if (!series_range_of(vals, &r, &err)) return make_error(err);
+          }
+          total += r.n;
+          if (r.scale > scale) scale = r.scale;
+          if (total > 100000000ull) return make_error("generate_series would make over 100,000,000 rows");
+        }
+      }
+      // the series table: every range's numbers in order, as integers, or as decimals at the largest scale
+      st->clear_rows();
+      st->ensure_columns();
+      st->columns[0].type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
+      st->columns[0].scale = scale;
+      bool typed = false;
+      if (scale == 0 && !st->col_data.empty()) {
+        std::vector<int64_t> v;
+        v.reserve((size_t)total);
+        for (size_t bi = 0; bi < nb; ++bi) {
+          long long x = rg[bi].start;
+          for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) v.push_back(x);
+        }
+        std::vector<uint8_t> nul(v.size(), 0);
+        ColumnStore& cs = st->col_data[0];
+        if (cs.begin_typed(ColumnEncoding::TypedInt64) && cs.adopt_ints(std::move(v), nul)) {
+          st->mutation_seq = sql_next_mutation_seq();
+          typed = true;
+        }
+      }
+      if (!typed) {
+        std::vector<SqlRow> srows;
+        srows.reserve((size_t)total);
+        for (size_t bi = 0; bi < nb; ++bi) {
+          long long x = rg[bi].start;
+          for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) srows.push_back(SqlRow{{series_text(x, rg[bi].scale)}});
+        }
+        append_result_rows(st, srows);
+      }
+      // what the rows have to pass: an inner join's ON conjuncts and the pushed WHERE conjuncts, at once where
+      // they compile (vp_deferred), else each; a LEFT JOIN's ON conjuncts decide each candidate
+      std::vector<const SqlExpr*> on_parts;
+      if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &on_parts);
+      std::vector<const SqlExpr*> conds = pushable;
+      if (!join_is_left[j]) for (const SqlExpr* p : on_parts) conds.push_back(p);
+      std::vector<const SqlExpr*> plain;
+      {
+        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+        for (const SqlExpr* p : conds) {
+          bool retry = false;
+          const vp::Prog* P = (unsigned long long)nb * (total ? total / nb : 1) >= 256 && vp::enabled() ? vp::program_for(p, pctx, &retry) : nullptr;
+          if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
+        }
+      }
+      const std::vector<const SqlExpr*>& on_each = join_is_left[j] ? on_parts : std::vector<const SqlExpr*>();
+      if (!reserve_rows((size_t)total + (join_is_left[j] ? nb : 0), sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+      next.reserve((size_t)total + (join_is_left[j] ? nb : 0));
+      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+      auto passes = [&](JoinedRow& cand, const std::vector<const SqlExpr*>& ps) {
+        if (ps.empty()) return true;
+        ctx.row = &cand;
+        for (const SqlExpr* p : ps) if (!predicate_true(p, ctx)) return false;
+        return true;
+      };
+      size_t id = 0;
+      for (size_t bi = 0; bi < nb; ++bi) {
+        const unsigned long long n = rg[bi].n;
+        bool matched = false;
+        for (unsigned long long k = 0; k < n; ++k) {
+          JoinedRow cand = (k + 1 == n && !join_is_left[j]) ? std::move(rows[bi]) : rows[bi];
+          cand.parts.push_back(id++);
+          if (!on_each.empty() && !passes(cand, on_each)) { if (!err.empty()) return make_error(err); continue; }
+          matched = true;
+          if (!plain.empty() && !passes(cand, plain)) { if (!err.empty()) return make_error(err); continue; }
+          next.push_back(std::move(cand));
+        }
+        if (!matched && join_is_left[j]) {
+          JoinedRow padded = std::move(rows[bi]);
+          padded.parts.push_back(kNullRow);
+          if (!plain.empty() && !passes(padded, plain)) { if (!err.empty()) return make_error(err); continue; }
+          next.push_back(std::move(padded));
+        }
+      }
+      JoinedRows().swap(rows);
+      if (vx_trace_on())
+        vx_trace("join: +" + js.alias + " series: " + std::to_string(total) + " rows from " + std::to_string(nb) + " base rows (bounds " +
+                 (all_int ? "in integer lanes" : "as text") + ") in " + std::to_string((hal_now_ns() - st0) / 1000) + " us");
+      join_method = "series";
+      hash_join_done = true;
+    }
+    if (!hash_join_done && jkeys.empty() && !xk_join && !join_is_left[j] && !join_is_right[j] && js.table && !right_seen &&
         js.table->row_count() <= 64 && !rows.empty()) {
       const size_t nj = js.table->row_count();
       std::vector<const SqlExpr*> conds = pushable;
@@ -48868,7 +49053,37 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
         const char* lkind = nullptr;
         {
           PlanScope lscope(plan_on() ? &lplan : nullptr);
-          if (si > 0 && (s.lateral || !s.series_args.empty())) {
+          // generate_series over earlier sources: expanded by the join step from each base row's bounds (SeriesSpec)
+          if (si > 0 && !s.series_args.empty() && s.column_names.size() <= 1) {
+            std::vector<const SqlTable*> before;
+            std::vector<LateralRef> refs;
+            std::string lerr;
+            if (!lateral_refs(db, expanded_branch, si, &before, &refs, &lerr)) return make_error(lerr);
+            if (!refs.empty()) {
+              const ParsedSelectStatement ps = parse_select_sql("SELECT " + s.series_args);
+              bool plain = ps.ok && ps.branches.size() == 1 && ps.branches[0].items.size() >= 2 && ps.branches[0].items.size() <= 3;
+              for (const SelectItem& it : plain ? ps.branches[0].items : std::vector<SelectItem>())
+                if (it.star || !it.expr) plain = false;
+              if (plain) {
+                auto spec = std::make_shared<SeriesSpec>();
+                for (const SelectItem& it : ps.branches[0].items) spec->args.push_back(it.expr);
+                spec->column = !s.column_names.empty() ? s.column_names[0] : s.alias;
+                made = std::make_shared<SqlTable>();
+                made->name = s.alias;
+                SqlColumn col;
+                col.name = spec->column;
+                col.type = SqlDataType::Int;
+                made->columns.push_back(col);
+                made->mark_result_table();
+                made->ensure_columns();
+                made->inferred_types = true;
+                spec->table = made.get();
+                s.series_direct = spec;
+                lkind = "series";
+              }
+            }
+          }
+          if (!made && si > 0 && (s.lateral || !s.series_args.empty())) {
             std::string lerr;
             made = materialize_lateral(db, expanded_branch, si, &lerr);
             if (!lerr.empty()) return make_error(lerr);
@@ -48881,7 +49096,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
             lkind = "series";
           }
         }
-        if (made && plan_on()) {
+        if (made && plan_on() && !s.series_direct) {
           PlanStep ls = plan_step(lkind ? lkind : "lateral", s.alias, "materialized per outer value", made->row_count(), hal_now_ns() - lt0);
           ls.sub = std::move(lplan.steps);
           plan_add(std::move(ls));
@@ -48971,6 +49186,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     QuerySource src;
     src.table = t;
     src.alias = src_spec.alias;
+    src.series = src_spec.series_direct;
     sources.push_back(src);
   }
   if (g_read_capture && !sources.empty()) capture_read(db, sources[0].table);

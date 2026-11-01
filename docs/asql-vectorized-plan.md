@@ -249,7 +249,39 @@ build before.
 
 What the measurements say is left in the programs: leaf gathering ~2.5 ns a leaf read and the native code ~1 ns
 an instruction a row, every intermediate through a stack slot (a store-to-load dependency on each). Values in
-registers and the leaves gathered by the native code itself are the next codegen step (3b). Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
+registers and the leaves gathered by the native code itself are the next codegen step (3b).
+
+### LATERAL generate_series expanded by the join step
+
+The fresh profile (11.8 billion instructions for three frames, down from 15.0) put the next weight in the
+renderer's pixel expansions: `CROSS JOIN LATERAL generate_series(ps.y0, ps.y1) AS y` and its kin (`plane_pixels`,
+`view_holes`, `thing_pixels`), 20-23 ms each a frame. A lateral series was made by `materialize_lateral`: a
+DISTINCT query over the earlier sources for the bound values (re-running their joins), a series table filled per
+distinct value with a hidden key column, and the join `t.__lateral_key = __LATKEY(cols)` probed per base row
+through the interpreter, each output row then copied into a chunk list and again into the step (a 1:N join is
+list mode). `view_holes` spent 21 ms making 53,760 candidate pixels to find there were no holes.
+
+Done: a generate_series whose arguments name earlier sources' columns is a `SeriesSpec` on its source
+(`QuerySource::series`; the series table is the statement's own, one column) and the join step expands it: the
+bounds over every base row at once where they compile (integer lanes: the range straight from the integers;
+otherwise their text, or the interpreter's, through the same rule as `materialize_series` - `series_range_of`,
+shared), each base row's rows made in order with the numbers adopted into the series column (integers typed;
+decimals at the largest scale as text). A CROSS JOIN drops a base row whose range is empty, a LEFT JOIN pads it;
+an inner join's ON and the pushed WHERE conjuncts go through `vp_deferred` where they compile, a LEFT JOIN's ON
+decides each candidate. `materialize_lateral` stays for LATERAL subqueries and for a series without earlier
+references (`materialize_series`).
+
+Measured: SQLDoom E1M1 medians 458/480/474 -> 319/334/330 ms against the build before today's commits
+(5cab6ef), alternating - 2.1 -> 3.0 frames a second; `view_holes` 21 -> ~3 ms, `plane_pixels` 23 -> ~4 ms.
+Frame bytes, the four oracle suites, the lane / mixed / decimal checks and a generate_series set (integer,
+decimal and NULL bounds, steps including 0 and negative, empty ranges under CROSS and LEFT, `AS g(n)` naming,
+`ON true`, ON and WHERE on the series value, two laterals in one FROM, bounds over two earlier sources, a
+non-lateral series, under and over 64 base rows, text bounds refused) are identical to the build before.
+
+Still from this profile: `project_rows` 19% (programs and gathering), `execute_windowed` 11% and the interpreted
+`group_result` 10% (which statements take them is the next thing to measure), `get_or_build_probe_index` 4.7%
+rebuilt per statement for result tables, `colbatch_fill_table` 4.3% (DECIMAL text), and at startup
+`JEPAWorldModel` drawing a million normal variates. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
 an edge-case set for text equality (case, trailing spaces, accents, NULL, result-table columns, numeric-looking
 text) and one for residual ON conditions (LEFT / RIGHT / inner, base-only and two-sided conjuncts, NULL
 conjuncts, numeric-prefix text keys, pushed WHERE with padding, a three-table chain) are identical to the build
