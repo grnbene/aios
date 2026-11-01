@@ -298,6 +298,29 @@ through the groups' first rows into the lanes (53,760 groups).
 Measured: SQLDoom E1M1 medians 446/465/471 -> 291/293/291 ms against the build before today's commits
 (5cab6ef), alternating - 2.1 -> 3.4 frames a second.
 
+### 3b, first part: results in registers; FLOOR and CEIL in line
+
+Every instruction's result went to its stack slot and the next instruction loaded it back: a store-to-load
+dependency (~5 cycles) on each link of a chain, which was ~1 ns an instruction a row. Done: a write-through
+register cache in the builder. A result still goes to its slot and also into a caller-saved register (R8-R11
+for an integer or text lane, xmm5-xmm15 for a double; an F64 instruction's register is an xmm whichever way
+its bits were stored, as Neg and Abs store sign-flipped bits through the integer store), and its readers take
+the register. An instruction keeps one register through every path that stores it (a CASE's branches), so a
+reader sees the same place whichever path ran; a path that leaves it NULL writes no value, and no reader looks
+at a NULL's value - exactly as the slots were. A helper call forgets every register; And / Or use R8-R11 as
+scratch and forget those first. FLOOR and CEIL are in line for |a| below 2^52 and not zero (the truncation
+moved down or up where it passed a; CEIL keeps a's sign, so CEIL(-0.4) is -0 as libm has it); a zero, a NaN,
+an infinity or a larger number is already whole.
+
+Found by the differential check over the frames, not by the randomized tool: the Neg-of-a-double cache case
+(a program whose Sin and Cos read a negated angle), and CEIL's -0 by the vpeq suite. The tool now also prints
+unary operations on a column singly and nested, so a sign of zero or a negated double's bits are compared where
+nothing absorbs them (not re-run against the code before the fixes).
+
+Measured: SQLDoom E1M1 medians 471/453/450 -> 284/283/300 ms against the build before today's commits
+(5cab6ef), alternating - 2.1 -> 3.5 frames a second; the texel-key programs 4.7 -> 4.5 ms, the five-program
+projection 18.1 -> 17.5 ms (their leaves and chunk overhead, not the native loop, are most of what is left).
+
 Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
 casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
 rounding as written, the range error). The renderer's key expressions cast four or five times a row and the

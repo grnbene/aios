@@ -139,7 +139,18 @@ int main() {
     const std::string e = gen(3 + (int)rnd(3), joined);
     const std::string from = joined ? " FROM t CROSS JOIN one o" : " FROM t";
     std::string sql;
-    switch (rnd(5)) {
+    // one in six: unary operations on a column, printed as they are and one inside another - a sign of zero
+    // (CEIL(-0.4) is -0) or a negated double's bits are seen only where nothing absorbs them
+    static const char* const unary[] = {"ABS", "FLOOR", "CEIL", "SQRT", "SIN", "COS", "TAN", "ATAN", "RADIANS", "DEGREES", "-", "CAST_S", "CAST_D"};
+    auto un = [&](const std::string& x) {
+      const char* f = unary[rnd(13)];
+      if (f[0] == '-') return "(-" + x + ")";
+      if (std::string(f) == "CAST_S") return "CAST(" + x + " AS SIGNED)";
+      if (std::string(f) == "CAST_D") return "CAST(" + x + " AS DOUBLE)";
+      return std::string(f) + "(" + x + ")";
+    };
+    switch (rnd(6)) {
+      case 5: { const std::string c = col(joined); sql = "SELECT " + un(c) + " AS v, " + un(un(c)) + " AS w, " + un(un(un(c))) + " AS x" + from + " ORDER BY t.id LIMIT 500"; break; }
       case 0: sql = "SELECT " + e + " AS v" + from + " ORDER BY t.id LIMIT 500"; break;
       case 4: sql = "SELECT " + (rnd(3) == 0 ? "COALESCE(" + text() + ", " + text() + ")" : rnd(2) ? "NULLIF(" + text() + ", " + text() + ")"
                                : "CASE WHEN " + e + " THEN " + text() + " WHEN " + text_pred() + " THEN " + text() + " ELSE " + text() + " END") +

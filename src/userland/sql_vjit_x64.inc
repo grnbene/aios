@@ -302,13 +302,55 @@ class Builder {
     return true;
   }
 
+  // A write-through cache of instruction results in registers. A result still goes to its stack slot, and
+  // also into a caller-saved register when the instruction has one; the instructions reading it then take the
+  // register instead of the slot - each link of an expression chain was a store followed by its own load, a
+  // store-to-load dependency of ~5 cycles. An instruction keeps one register through every path that stores it
+  // (a CASE's branches), so a reader sees the same place whichever path ran; a path that leaves it NULL writes no
+  // value, and no reader looks at a NULL's value. A helper call forgets every register (all are caller-saved);
+  // And / Or use R8-R11 as scratch and forget those first. Nothing is read from a register that a path did not
+  // write except as a NULL's value, exactly as the slots were.
+  static constexpr Reg kGprPool[4] = {R8, R9, R10, R11};
+  static constexpr uint8_t kXmmPool[11] = {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  int gpr_holds_[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // register -> instruction
+  int xmm_holds_[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  std::vector<int> cached_in_;   // instruction -> its register (a GPR for an I64 or text lane, an xmm for F64), or -1
+  size_t rr_gpr_ = 0, rr_xmm_ = 0;
+  int cached(size_t x) const { return x < cached_in_.size() ? cached_in_[x] : -1; }
+  void forget_gprs() { for (Reg r : kGprPool) { if (gpr_holds_[r] >= 0) cached_in_[(size_t)gpr_holds_[r]] = -1; gpr_holds_[r] = -1; } }
+  void forget_all() {
+    forget_gprs();
+    for (uint8_t r : kXmmPool) { if (xmm_holds_[r] >= 0) cached_in_[(size_t)xmm_holds_[r]] = -1; xmm_holds_[r] = -1; }
+  }
+  Reg cache_gpr(size_t x) {   // the register x's value lives in from now on
+    if (cached_in_.size() <= x) cached_in_.resize(x + 1, -1);
+    if (cached_in_[x] >= 0) return (Reg)cached_in_[x];
+    const Reg r = kGprPool[rr_gpr_++ % 4];
+    if (gpr_holds_[r] >= 0) cached_in_[(size_t)gpr_holds_[r]] = -1;
+    gpr_holds_[r] = (int)x;
+    cached_in_[x] = r;
+    return r;
+  }
+  Reg cache_xmm(size_t x) {
+    if (cached_in_.size() <= x) cached_in_.resize(x + 1, -1);
+    if (cached_in_[x] >= 0) return (Reg)cached_in_[x];
+    const Reg r = (Reg)kXmmPool[rr_xmm_++ % 11];
+    if (xmm_holds_[r] >= 0) cached_in_[(size_t)xmm_holds_[r]] = -1;
+    xmm_holds_[r] = (int)x;
+    cached_in_[x] = r;
+    return r;
+  }
   // Operand loads. Value into a GPR (I64 lane) or xmm (F64 lane); the null byte into a GPR (0/1).
+  // An F64 instruction's register is an xmm whichever way its bits were stored (Neg and Abs of a double store
+  // the sign-flipped bits through store_i); an I64 or text one's is a GPR.
   void ld_i(size_t a, Reg d) {
     if (is_leaf(at(a).op)) { a_.load(d, RSP, slot_v(a)); a_.load_idx8(d, d, R12); }
+    else if (cached(a) >= 0) { if (ty(a) == Ty::F64) a_.movq_rx(d, (Reg)cached(a)); else if ((Reg)cached(a) != d) a_.mov(d, (Reg)cached(a)); }
     else a_.load(d, RSP, slot_v(a));
   }
   void ld_f(size_t a, Reg x, Reg scratch) {
     if (is_leaf(at(a).op)) { a_.load(scratch, RSP, slot_v(a)); a_.movsd_load_idx8(x, scratch, R12); }
+    else if (cached(a) >= 0) { if (ty(a) != Ty::F64) { a_.mov(scratch, (Reg)cached(a)); a_.movq_xr(x, scratch); } else if ((Reg)cached(a) != x) a_.movsd(x, (Reg)cached(a)); }
     else a_.movsd_load(x, RSP, slot_v(a));
   }
   void ld_n(size_t a, Reg d) {
@@ -322,10 +364,20 @@ class Builder {
   }
   void set_null(size_t x) { a_.store_imm32(RSP, slot_n(x), 1); }
   void set_not_null(size_t x) { a_.store_imm32(RSP, slot_n(x), 0); }
-  void store_i(size_t x, Reg s) { a_.store(RSP, slot_v(x), s); }
-  void store_f(size_t x, Reg xmm) { a_.movsd_store(RSP, slot_v(x), xmm); }
+  void store_i(size_t x, Reg s) {
+    a_.store(RSP, slot_v(x), s);
+    if (ty(x) == Ty::F64) { a_.movq_xr(cache_xmm(x), s); return; }
+    const Reg r = cache_gpr(x);
+    if (r != s) a_.mov(r, s);
+  }
+  void store_f(size_t x, Reg xmm) {
+    a_.movsd_store(RSP, slot_v(x), xmm);
+    if (ty(x) != Ty::F64) { a_.movq_rx(RAX, xmm); const Reg r = cache_gpr(x); a_.mov(r, RAX); return; }
+    const Reg r = cache_xmm(x);
+    if (r != xmm) a_.movsd(r, xmm);
+  }
   void load_const_f(Reg x, double d, Reg scratch) { uint64_t bits; std::memcpy(&bits, &d, 8); a_.mov_imm(scratch, bits); a_.movq_xr(x, scratch); }
-  void call_fn(const void* fn) { a_.mov_imm(RAX, (uint64_t)(uintptr_t)fn); a_.call(RAX); }
+  void call_fn(const void* fn) { forget_all(); a_.mov_imm(RAX, (uint64_t)(uintptr_t)fn); a_.call(RAX); }
   // the double in xmm0 non-finite: bail (the interpreter's "DOUBLE value is out of range")
   void bail_if_nonfinite_x0() {
     a_.movq_rx(RAX, X0);
@@ -530,6 +582,7 @@ class Builder {
       }
       case Ins::And: case Ins::Or: {
         // an = null(0), bn = null(1); a = !an && truth(0); b = !bn && truth(1)
+        forget_gprs();   // R8-R11 are scratch here
         ld_n(in.args[0], R8);
         ld_n(in.args[1], R9);
         load_truth(in.args[0]); a_.mov(R10, RAX);
@@ -691,7 +744,42 @@ class Builder {
         } else {
           ld_f(in.args[0], X0, RCX);
           if (in.op == Ins::Abs) { a_.movq_rx(RAX, X0); a_.btr63(RAX); store_i(x, RAX); }
-          else { call_fn(in.op == Ins::Floor ? (const void*)&vjit_floor : (const void*)&vjit_ceil); store_f(x, X0); }
+          else {
+            // In line for |a| below 2^52 and not zero: the truncation, moved down (FLOOR) or up (CEIL) where it
+            // passed a. A zero keeps its sign, a NaN, an infinity or a larger number is already whole: itself.
+            a_.movq_rx(RAX, X0);
+            a_.btr63(RAX);
+            { uint64_t lim; const double d = 4503599627370496.0; std::memcpy(&lim, &d, 8); a_.mov_imm(RCX, lim); }
+            a_.cmp(RAX, RCX);
+            const size_t keep1 = a_.jcc(CcAE);
+            a_.test(RAX, RAX);
+            const size_t keep2 = a_.jcc(CcE);
+            a_.cvttsd2si(RAX, X0);
+            a_.cvtsi2sd(X1, RAX);
+            load_const_f(X2, 1.0, RCX);
+            if (in.op == Ins::Floor) {
+              a_.ucomisd(X1, X0);                      // t > a: one down
+              const size_t ok = a_.jcc(CcBE);
+              a_.subsd(X1, X2);
+              a_.patch_here(ok);
+            } else {
+              a_.ucomisd(X1, X0);                      // t < a: one up
+              const size_t ok = a_.jcc(CcAE);
+              a_.addsd(X1, X2);
+              a_.patch_here(ok);
+              // CEIL of a negative above -1 is -0 (as libm's ceil(-0.5) is): a's sign onto the result, which
+              // changes nothing where the result is below zero already
+              a_.movq_rx(RAX, X1);
+              a_.movq_rx(RCX, X0);
+              a_.mov_imm(RDX, 0x8000000000000000ull);
+              a_.and_(RCX, RDX);
+              a_.or_(RAX, RCX);
+              a_.movq_xr(X1, RAX);
+            }
+            a_.movsd(X0, X1);
+            a_.patch_here(keep1); a_.patch_here(keep2);
+            store_f(x, X0);
+          }
         }
         set_not_null(x);
         break;

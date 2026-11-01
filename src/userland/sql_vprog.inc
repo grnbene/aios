@@ -1421,7 +1421,12 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
   }
   // bail: the interpreter decides the chunk (and sets *err where it refuses)
   for (size_t x = 0; x < K; ++x) if (!vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) return false;
-  if (vjit_check_mode()) { std::fprintf(stderr, "[vjit] check: native code bailed where the interpreter accepts (out op %d)\n", (int)P.out().op); std::abort(); }
+  if (vjit_check_mode()) {
+    std::string ops;
+    for (const Ins& in : P.ins) { ops += std::to_string((int)in.op) + (in.ty == Ty::F64 ? "f" : in.ty == Ty::Str ? "s" : "i") + "("; for (uint32_t a : in.args) ops += std::to_string(a) + ","; ops += ") "; }
+    std::fprintf(stderr, "[vjit] check: native code bailed where the interpreter accepts (out op %d): %s\n", (int)P.out().op, ops.c_str());
+    std::abort();
+  }
   return true;
 }
 
