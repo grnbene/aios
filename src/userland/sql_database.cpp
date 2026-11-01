@@ -42873,6 +42873,38 @@ static std::shared_ptr<const StarCodeMap> star_code_map(const StarKey& pk, const
   return m;
 }
 
+// A dictionary-coded column's entries as the numbers the interpreter reads them as, one per code (NaN for a NULL
+// entry), for a join key held as a dictionary - a DECIMAL(65,0) a CREATE TABLE AS inferred from integer arithmetic,
+// an INT kept as codes. Null when an entry is not a whole number a double carries exactly (then the row path's
+// own comparison decides). Kept per column, dictionary size and epoch, as star_code_map keeps its maps.
+static std::shared_ptr<const std::vector<double>> dict_numbers(const ColumnStore& cs) {
+  if (!vx::dict_coded(cs) || cs.shared_dict) return nullptr;
+  const size_t nd = vx::dict_size(cs);
+  if (nd == 0 || nd > (1u << 20)) return nullptr;
+  const uint64_t key = cs.uid.v;
+  struct Known { uint64_t epoch; size_t nd; std::shared_ptr<const std::vector<double>> v; bool bad; };
+  static aios::hal::Mutex mu;
+  static std::unordered_map<uint64_t, Known> cache;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu);
+    auto it = cache.find(key);
+    if (it != cache.end() && it->second.epoch == cs.epoch && it->second.nd == nd) return it->second.bad ? nullptr : it->second.v;
+  }
+  auto v = std::make_shared<std::vector<double>>(nd, std::numeric_limits<double>::quiet_NaN());
+  bool ok = true;
+  for (size_t k = 0; ok && k < nd; ++k) {
+    const std::string& e = vx::dict_entry(cs, (uint32_t)k);
+    if (sql_is_null(e)) continue;
+    double d = 0;
+    if (!parse_number(e, &d) || d != std::floor(d) || std::fabs(d) > 9007199254740992.0) ok = false;
+    else (*v)[k] = d;
+  }
+  std::lock_guard<aios::hal::Mutex> lk(mu);
+  if (cache.size() > 256) cache.clear();
+  cache[key] = Known{cs.epoch, nd, ok ? v : nullptr, !ok};
+  return ok ? v : nullptr;
+}
+
 static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, const std::vector<ExprPtr>& join_conditions,
                       const std::vector<bool>& join_is_left, const SqlExpr* where, const EvalCtx* outer_scope,
                       const uint32_t* base, size_t nbase, std::vector<std::vector<uint32_t>>* P,
@@ -46779,6 +46811,8 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         std::shared_ptr<const StarCodeMap> cmap;         // a text key beside the probing one: its codes mapped to the joined column's
         bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
         double jkval = 0;
+        std::shared_ptr<const std::vector<double>> dnum; // a dictionary-coded number column: the number per code
+        std::shared_ptr<const std::vector<double>> jdnum; // the joined column held as such a dictionary
       };
       std::vector<NumKey> numkeys(prep_jkeys.size());
       static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
@@ -46818,7 +46852,15 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
               if (m && m->ok) { nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m); }
             }
           }
-          if (nk.konst || nk.cmap) {
+          // a number column held as a dictionary (a DECIMAL(65,0) from integer arithmetic, an INT kept as codes, a
+          // result table's numeric text): its entries as numbers, read per row by code
+          if (!nk.konst && !nk.cmap && kc < bt.columns.size() && !bt.columns[kc].temporal && bcs.size() == bt.row_count() &&
+              vx::dict_coded(bcs) && !typed_int && !typed_dbl &&
+              (bt.columns[kc].type == SqlDataType::Int || (bt.columns[kc].type == SqlDataType::Decimal && bt.columns[kc].scale == 0) ||
+               (bt.inferred_types && !bt.columns[kc].declared_text))) {
+            if (std::shared_ptr<const std::vector<double>> dn = dict_numbers(bcs)) { nk.cs = &bcs; nk.src = ks; nk.dnum = std::move(dn); }
+          }
+          if (nk.konst || nk.cmap || nk.dnum) {
             // the joined side is checked below, as every key's is
           } else if (!numeric_type || bcs.size() != bt.row_count() ||
               !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) {
@@ -46837,9 +46879,14 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         if ((int)ki != best_ki && !key_typed[ki] && !nk.cmap) {
           const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
           double jv = 0;
-          if (kcs.encoding == ColumnEncoding::Constant && !js.table->inferred_types && js.table->columns[(size_t)prep_jkeys[ki].column].type == SqlDataType::Int &&
+          const SqlColumn& jcol = js.table->columns[(size_t)prep_jkeys[ki].column];
+          if (kcs.encoding == ColumnEncoding::Constant && !js.table->inferred_types && jcol.type == SqlDataType::Int &&
               !sql_is_null(kcs.constant_val) && parse_number(kcs.constant_val, &jv)) { nk.jkonst = true; nk.jkval = jv; }
-          else {
+          else if (kcs.size() == js.table->row_count() && !jcol.temporal && vx::dict_coded(kcs) &&
+                   (jcol.type == SqlDataType::Int || (jcol.type == SqlDataType::Decimal && jcol.scale == 0) || (js.table->inferred_types && !jcol.declared_text)) &&
+                   (nk.jdnum = dict_numbers(kcs))) {
+            // a number column kept as a dictionary: compared by its entry's number
+          } else {
             batch_ok = false;
             if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + js.table->name + "." + js.table->columns[(size_t)prep_jkeys[ki].column].name +
                                         ") is not a number the joined table holds typed: " + vx_encoding_name(kcs.encoding));
@@ -46873,6 +46920,12 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
         if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
         if (k.konst) { *out = k.kval; return true; }
+        if (k.dnum) {
+          const uint32_t c = vx::code_at(*k.cs, r);
+          if (c >= k.dnum->size() || std::isnan((*k.dnum)[c])) return false;
+          *out = (*k.dnum)[c];
+          return true;
+        }
         *out = k.ints ? (double)vx::typed_int(*k.cs, r) : vx::typed_value(*k.cs, r);
         return true;
       };
@@ -46896,6 +46949,11 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           if (!numkey(nk, bi, base, &w)) return false;
           if (kcs.is_null(mr)) return false;
           if (nk.jkonst) { if (nk.jkval != w) return false; continue; }
+          if (nk.jdnum) {
+            const uint32_t c = vx::code_at(kcs, mr);
+            if (c >= nk.jdnum->size() || (*nk.jdnum)[c] != w) return false;   // NaN (a NULL entry) never equals
+            continue;
+          }
           if (vx::typed_value(kcs, mr) != w) return false;
         }
         return true;
@@ -46919,7 +46977,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
       bool comp_ok = false;
       bool plain_other_keys = true;   // composite hashing reads the other keys as typed numbers only
-      for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst)) plain_other_keys = false;
+      for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst || numkeys[ki].jdnum)) plain_other_keys = false;
       if (batch_ok && !direct_code_join && plain_other_keys && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
         const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
         if (bidx->no_numeric_prefix.empty()) {

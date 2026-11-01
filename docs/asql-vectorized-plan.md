@@ -407,6 +407,17 @@ invariants are not (the micro-benchmark above). Kept for those; off with the swi
 The differential check over the frames, the randomized check under three seeds, frame bytes, the four oracle
 suites, the lane / mixed / decimal checks and the edge sets are identical to the build before.
 
+Keys held as dictionaries: ui_static_pixels.x is a DECIMAL(65,0) a CREATE TABLE AS inferred from integer
+arithmetic, kept as a dictionary, so the ui join probed it row by row, formatting each decimal (7.8 ms a frame
+over 10,240 rows). A dictionary-coded number column - INT or DECIMAL(65,0) declared, or a result table's numeric
+text - now joins through its entries read once as numbers (`dict_numbers`, one double per code, kept per column
+and dictionary epoch as the star code maps are; refused where an entry is not a whole number a double holds
+exactly, and the row path decides as before), on the base side through `numkey` and on the joined side in
+`other_keys_match`. The ui join is batched (1.0 ms), 118 -> 187 batched joins a run. An edge set (DECIMAL and
+INT dictionaries either side, a text dictionary mixing numbers and words left to the row path, NULL keys, LEFT
+JOIN padding, a single and a two-key join) is identical to the build before, as are frame bytes, the differential
+native check, the oracle suites, the lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
