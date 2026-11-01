@@ -8426,6 +8426,22 @@ struct SumAcc {
     else if (!scale_up_exact(&x, escale - xs)) { exact = false; return; }
     if (__builtin_add_overflow(etotal, x, &etotal)) exact = false;
   }
+  // add(val_exact(x, 0)) without the Val: an integer lane's value (its text would parse back to (double)x; exact
+  // at scale 0, printed at scale 0, so dscale stays).
+  void add_i64(int64_t x) {
+    total += (double)x;
+    count++;
+    if (!exact) return;
+    AIOS_INT128 v = (AIOS_INT128)x;
+    if (!scale_up_exact(&v, escale)) { exact = false; return; }
+    if (__builtin_add_overflow(etotal, v, &etotal)) exact = false;
+  }
+  // add(val_approx(d)) without the Val: a DOUBLE is never exact (exact_decimal_of says no to approx).
+  void add_approx(double d) {
+    total += d;
+    count++;
+    exact = false;
+  }
   Val finish(bool avg) const {
     if (count == 0) return val_null();
     Val out;
@@ -43020,6 +43036,38 @@ static std::shared_ptr<const std::vector<int64_t>> dict_classes(const ColumnStor
   return v;
 }
 
+// A dictionary-coded text column's entries ranked in the order compare_vals_as puts text (case_insensitive_compare),
+// one rank per code (-1 for a NULL entry), equal-comparing entries one rank: a sort on the column compares ranks.
+static std::shared_ptr<const std::vector<int64_t>> dict_order_rank(const ColumnStore& cs) {
+  if (!vx::dict_coded(cs) || cs.shared_dict) return nullptr;
+  const size_t nd = vx::dict_size(cs);
+  if (nd == 0 || nd > (1u << 20)) return nullptr;
+  struct Known { uint64_t epoch; size_t nd; std::shared_ptr<const std::vector<int64_t>> v; };
+  static aios::hal::Mutex mu;
+  static std::unordered_map<uint64_t, Known> cache;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(mu);
+    auto it = cache.find(cs.uid.v);
+    if (it != cache.end() && it->second.epoch == cs.epoch && it->second.nd == nd) return it->second.v;
+  }
+  std::vector<uint32_t> order;
+  order.reserve(nd);
+  for (size_t k = 0; k < nd; ++k) if (!sql_is_null(vx::dict_entry(cs, (uint32_t)k))) order.push_back((uint32_t)k);
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+    return case_insensitive_compare(vx::dict_view(cs, x), vx::dict_view(cs, y)) < 0;
+  });
+  auto v = std::make_shared<std::vector<int64_t>>(nd, -1);
+  int64_t rank = 0;
+  for (size_t i = 0; i < order.size(); ++i) {
+    if (i > 0 && case_insensitive_compare(vx::dict_view(cs, order[i - 1]), vx::dict_view(cs, order[i])) != 0) ++rank;
+    (*v)[order[i]] = rank;
+  }
+  std::lock_guard<aios::hal::Mutex> lk(mu);
+  if (cache.size() > 256) cache.clear();
+  cache[cs.uid.v] = Known{cs.epoch, nd, v};
+  return v;
+}
+
 static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, const std::vector<ExprPtr>& join_conditions,
                       const std::vector<bool>& join_is_left, const SqlExpr* where, const EvalCtx* outer_scope,
                       const uint32_t* base, size_t nbase, std::vector<std::vector<uint32_t>>* P,
@@ -44285,11 +44333,20 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
 //    from a lane (MIN / MAX the extreme row's value, SUM / AVG through SumAcc in row order, COUNT a number).
 // False: not that shape, or the interpreter failed on a group (nothing changed; the general path decides).
 // AIOS_SQL_LANE_GROUP=0 turns it off.
+// The statement's ORDER BY as output items (lane_group_by sorts the groups itself where the keys' own order is
+// not the answer): the item each key names, its direction, and the type compare_vals_as compares it as.
+struct LaneOrder {
+  std::vector<size_t> item;
+  std::vector<char> desc;
+  std::vector<SqlDataType> types;
+  long long limit = -1, offset = 0;
+};
 static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sources, const EvalCtx* outer, const JoinedRows& rows,
                           const std::vector<ExprPtr>& group_by, const std::vector<SelectItem>& items, const ExprPtr& having,
                           std::vector<vp::Column>* lanes_out, std::vector<std::vector<std::string>>* text_out, size_t* ngroups,
-                          bool want_key_order, bool* keys_exact) {
+                          bool want_key_order, bool* keys_exact, const LaneOrder* order_spec, bool* sorted_out) {
   *keys_exact = true;
+  *sorted_out = false;
   static const bool on = [] { const char* v = std::getenv("AIOS_SQL_LANE_GROUP"); return !(v && *v == '0'); }();
   if (!on || !vp::enabled() || group_by.empty() || group_by.size() > 8 || rows.empty() || rows.size() >= UINT32_MAX) return false;
   auto no = [](const std::string& why) { if (vx_trace_on()) vx_trace("group: not over lanes: " + why); return false; };
@@ -44365,17 +44422,26 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       col->uns = false;
       if (typed_dbl) col->f.assign(rows.size(), 0); else col->i.assign(rows.size(), 0);
       col->n.assign(rows.size(), 0);
+      // The column decoded whole, in blocks, where it is not far larger than the row set (a dimension table's
+      // 20k names behind 256k joined rows): a code or integer read one row at a time (read_code) cost ~370
+      // instructions each, most of the grouping.
+      const size_t total = cs.size();
+      const bool whole = total <= rows.size() * 16 + 65536;
+      std::vector<uint32_t> all_codes;
+      std::vector<int64_t> all_ints;
+      if (whole && classes) { all_codes.resize(total); vx::decode_codes(cs, 0, total, all_codes.data()); }
+      else if (whole && !typed_dbl) { all_ints.resize(total); vx::typed_ints(cs, 0, total, all_ints.data()); }
       for (size_t j = 0; j < rows.size(); ++j) {
         const size_t r = cs_src < rows[j].parts.size() ? rows[j].parts[cs_src] : kNullRow;
         if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { col->n[j] = 1; continue; }
         if (classes) {
-          const uint32_t c = vx::code_at(cs, r);
+          const uint32_t c = whole ? all_codes[r] : vx::code_at(cs, r);
           if (c >= classes->size() || (*classes)[c] < 0) { col->n[j] = 1; continue; }
           col->i[j] = (*classes)[c];
         } else if (typed_dbl) {
           col->f[j] = cs.double_data[r];
         } else {
-          col->i[j] = vx::typed_int(cs, r);
+          col->i[j] = whole ? all_ints[r] : vx::typed_int(cs, r);
         }
       }
       if (classes) *keys_exact = false;
@@ -44481,16 +44547,22 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       }
     } else {
       sums[k].assign(G, SumAcc());
-      for (size_t r = 0; r < n; ++r) sums[k][gid[r]].add(a.arg.at(r));
+      if (a.arg.ty == vp::Ty::F64 && a.arg.approx) {
+        for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_approx(a.arg.f[r]);
+      } else if (a.arg.ty == vp::Ty::I64 && !a.arg.uns) {
+        for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_i64(a.arg.i[r]);
+      } else {
+        for (size_t r = 0; r < n; ++r) sums[k][gid[r]].add(a.arg.at(r));
+      }
     }
   }
   // Key order, NULL first: the implicit ORDER BY of the keys, over integers. Two groups never share a key tuple.
-  // Where the caller sorts the groups itself (its own ORDER BY, or a text key whose classes are not the text's
-  // order), they stay in first-appearance order, as the general path hands them to its stable sort - so rows that
-  // tie come out as they would there.
+  // Where the statement's own ORDER BY decides (or a text key's classes are not the text's order), the groups
+  // stay in first-appearance order for the stable sort below - so rows that tie come out as the general path's do.
   std::vector<uint32_t> order(G);
   for (size_t g = 0; g < G; ++g) order[g] = (uint32_t)g;
   const bool key_order = want_key_order && *keys_exact;
+  lane_form = lane_form && key_order;   // the lanes come out in key order only
   if (!key_order) {
   } else if (nk == 1) {
     // one key: each group's (NULL, value) beside its id, sorted as records - not through first[] into the lanes
@@ -44556,35 +44628,203 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   EvalCtx ctx; ctx.db = db; ctx.outer = outer; ctx.sources = &sources;
   std::string err;
   ctx.err = &err;
-  std::vector<std::pair<const SqlExpr*, Val>> av(aggs.size());
-  text_out->clear();
-  for (size_t x = 0; x < G; ++x) {
-    const uint32_t g = order[x];
-    for (size_t k = 0; k < aggs.size(); ++k) {
-      const Agg& a = aggs[k];
-      Val v;
+  // Every aggregate's value per group, as the general path makes them (the Vals, not their text: a sort reads
+  // the numbers and only the rows kept are printed).
+  std::vector<std::vector<Val>> aggv(aggs.size(), std::vector<Val>(G));
+  for (size_t k = 0; k < aggs.size(); ++k) {
+    const Agg& a = aggs[k];
+    for (size_t g = 0; g < G; ++g) {
+      Val& v = aggv[k][g];
       switch (a.kind) {
         case CountStar: case Count: v = val_num((double)counts[k][g]); break;
         case Min: case Max: v = extreme[k][g] == UINT32_MAX ? val_null() : a.arg.at(extreme[k][g]); break;
         case Sum: v = nt_adjust(a.node, vctx, sums[k][g].finish(false)); break;
         case Avg: v = sums[k][g].finish(true); break;
       }
-      av[k] = {a.node, std::move(v)};
     }
+  }
+  std::vector<std::pair<const SqlExpr*, Val>> av(aggs.size());
+  auto group_ctx = [&](uint32_t g) {
+    for (size_t k = 0; k < aggs.size(); ++k) av[k] = {aggs[k].node, aggv[k][g]};
     ctx.row = &rows[first[g]];
     ctx.group = nullptr;
     ctx.agg_values = &av;
+  };
+  // the groups kept, in first-appearance (or key) order
+  std::vector<uint32_t> kept;
+  kept.reserve(G);
+  for (size_t x = 0; x < G; ++x) {
+    const uint32_t g = order[x];
     if (having) {
+      group_ctx(g);
       const bool keep = predicate_true(having.get(), ctx);
       if (!err.empty()) return no("HAVING: " + err);
       if (!keep) continue;
     }
+    kept.push_back(g);
+  }
+  // The statement's ORDER BY over the groups, where the keys' own order was not the answer: an aggregate item by
+  // its value (compare_vals_as, the general path's comparison), a dictionary text column by its collation rank
+  // (dict_order_rank: no entry decoded per group), anything else by the Val the interpreter gives the group's
+  // first row; ties keep their order, as the general path's stable sort keeps them. 81,000 groups sorted by a
+  // SUM were formatted to text and parsed back twice over before.
+  size_t to = kept.size();
+  if (order_spec && !order_spec->item.empty() && !key_order) {
+    const size_t nkeys = order_spec->item.size();
+    struct SortKey { std::vector<int64_t> rank; std::vector<Val> vals; std::vector<double> num; std::vector<uint8_t> isnull; bool by_rank = false, by_num = false; int agg = -1; };
+    std::vector<SortKey> sk(nkeys);
+    for (size_t i = 0; i < nkeys; ++i) {
+      const size_t idx = order_spec->item[i];
+      if (idx >= items.size()) return no("an ORDER BY key past the items");
+      SortKey& k = sk[i];
+      if (item_agg[idx] >= 0) { k.agg = item_agg[idx]; continue; }
+      if (item_cell[idx].first != SIZE_MAX) {
+        const size_t ps = item_cell[idx].first, pc = item_cell[idx].second;
+        const SqlTable& pt = *sources[ps].table;
+        const ColumnStore& pcs = pt.col_data[pc];
+        const SqlColumn& pcol = pt.columns[pc];
+        if (pcol.type == SqlDataType::Text && !pcol.temporal && !pcol.binary && (!pt.inferred_types || pcol.declared_text) &&
+            order_spec->types[i] == SqlDataType::Text && vx::dict_coded(pcs) && pcs.size() == pt.row_count()) {
+          if (std::shared_ptr<const std::vector<int64_t>> rk = dict_order_rank(pcs)) {
+            k.by_rank = true;
+            k.rank.assign(kept.size(), -1);
+            for (size_t j = 0; j < kept.size(); ++j) {
+              const JoinedRow& fr = rows[first[kept[j]]];
+              const size_t r = ps < fr.parts.size() ? fr.parts[ps] : kNullRow;
+              if (r == kNullRow || r >= pcs.size() || pcs.is_null(r)) continue;
+              const uint32_t c = vx::code_at(pcs, r);
+              if (c < rk->size()) k.rank[j] = (*rk)[c];
+            }
+            continue;
+          }
+        }
+      }
+      if (item_cell[idx].first != SIZE_MAX) {
+        // a typed number column: its values as the doubles compare_vals_as compares them (an integer below 2^53
+        // exactly, a DOUBLE as it is), NULL where the row has none
+        const size_t ps = item_cell[idx].first, pc = item_cell[idx].second;
+        const SqlTable& pt = *sources[ps].table;
+        const ColumnStore& pcs = pt.col_data[pc];
+        const SqlColumn& pcol = pt.columns[pc];
+        const bool ints = pcol.type == SqlDataType::Int && !pcol.temporal && vx::typed_integer(pcs) && pcs.size() == pt.row_count() &&
+                          (order_spec->types[i] == SqlDataType::Int || order_spec->types[i] == SqlDataType::Real);
+        const bool dbls = pcol.type == SqlDataType::Real && pcol.scale == 0 && !pcol.temporal && pcs.encoding == ColumnEncoding::TypedDouble &&
+                          pcs.size() == pt.row_count() && order_spec->types[i] == SqlDataType::Real;
+        if (ints || dbls) {
+          bool plain = true;
+          k.num.assign(kept.size(), 0);
+          k.isnull.assign(kept.size(), 0);
+          const bool hn = vx::has_nulls(pcs);
+          for (size_t j = 0; j < kept.size() && plain; ++j) {
+            const JoinedRow& fr = rows[first[kept[j]]];
+            const size_t r = ps < fr.parts.size() ? fr.parts[ps] : kNullRow;
+            if (r == kNullRow || r >= pcs.size() || (hn && pcs.is_null(r))) { k.isnull[j] = 1; continue; }
+            if (ints) {
+              const int64_t x = vx::typed_int(pcs, r);
+              if (!(x > -9007199254740992LL && x < 9007199254740992LL)) { plain = false; break; }
+              k.num[j] = (double)x;
+            } else {
+              k.num[j] = pcs.double_data[r];
+            }
+          }
+          if (plain) { k.by_num = true; continue; }
+        }
+      }
+      k.vals.resize(kept.size());
+      for (size_t j = 0; j < kept.size(); ++j) {
+        group_ctx(kept[j]);
+        k.vals[j] = eval_expr(items[idx].expr.get(), ctx);
+        if (!err.empty()) return no("an ORDER BY key: " + err);
+      }
+    }
+    // A key whose every value is a plain number - a DOUBLE result, or an exact number below 2^53 with no long
+    // digits (a COUNT, an integer SUM) - compares as the double alone: that is all compare_vals_as does with such
+    // a pair (exact_text_order and exact_numeric_tie only look further at long exact digits).
+    for (size_t i = 0; i < nkeys; ++i) {
+      SortKey& k = sk[i];
+      if (k.by_rank || k.by_num) continue;
+      const SqlDataType ty = order_spec->types[i];
+      if (ty == SqlDataType::Text) continue;   // text: compare_vals_as reads numbers out of text too; left to it
+      bool plain = true;
+      k.num.resize(kept.size());
+      k.isnull.assign(kept.size(), 0);
+      for (size_t j = 0; j < kept.size() && plain; ++j) {
+        const Val& v = k.agg >= 0 ? aggv[(size_t)k.agg][kept[j]] : k.vals[j];
+        if (v.null) { k.isnull[j] = 1; continue; }
+        if (!v.numeric) { plain = false; break; }
+        if (!v.approx && !(std::fabs(v.num) < 9007199254740992.0 && (!v.text_valid || v.text.size() <= 15))) { plain = false; break; }
+        k.num[j] = v.num;
+      }
+      k.by_num = plain;
+    }
+    std::vector<uint32_t> perm(kept.size());
+    for (size_t j = 0; j < perm.size(); ++j) perm[j] = (uint32_t)j;
+    auto less = [&](uint32_t pa, uint32_t pb) {
+      for (size_t i = 0; i < nkeys; ++i) {
+        const SortKey& k = sk[i];
+        const bool desc = order_spec->desc[i] != 0;
+        if (k.by_rank) {
+          const int64_t ra = k.rank[pa], rb = k.rank[pb];
+          if (ra < 0 && rb < 0) continue;
+          if (ra < 0) return !desc;
+          if (rb < 0) return desc;
+          if (ra == rb) continue;
+          return desc ? ra > rb : ra < rb;
+        }
+        if (k.by_num) {
+          const bool na = k.isnull[pa] != 0, nb = k.isnull[pb] != 0;
+          if (na && nb) continue;
+          if (na) return !desc;
+          if (nb) return desc;
+          const double xa = k.num[pa], xb = k.num[pb];
+          if (xa == xb) continue;
+          return desc ? xa > xb : xa < xb;
+        }
+        const Val& x = k.agg >= 0 ? aggv[(size_t)k.agg][kept[pa]] : k.vals[pa];
+        const Val& y = k.agg >= 0 ? aggv[(size_t)k.agg][kept[pb]] : k.vals[pb];
+        if (x.null && y.null) continue;
+        if (x.null) return !desc;
+        if (y.null) return desc;
+        const int c = compare_vals_as(order_spec->types[i], x, y);
+        if (c == 0) continue;
+        return desc ? c > 0 : c < 0;
+      }
+      return false;
+    };
+    // Only the first offset + limit rows are wanted: a partial sort, ties broken by position (what the stable
+    // sort gives them), when that is much less than all of them.
+    size_t want_n = kept.size();
+    if (order_spec->limit >= 0) {
+      const size_t want = (size_t)std::max<long long>(0, order_spec->offset) + (size_t)order_spec->limit;
+      if (want < want_n) want_n = want;
+    }
+    if (want_n < kept.size() / 4) {
+      auto less_stable = [&](uint32_t pa, uint32_t pb) { if (less(pa, pb)) return true; if (less(pb, pa)) return false; return pa < pb; };
+      std::partial_sort(perm.begin(), perm.begin() + (long)want_n, perm.end(), less_stable);
+    } else {
+      std::stable_sort(perm.begin(), perm.end(), less);
+    }
+    std::vector<uint32_t> sorted(kept.size());
+    for (size_t j = 0; j < perm.size(); ++j) sorted[j] = kept[perm[j]];
+    kept.swap(sorted);
+    if (order_spec->limit >= 0) {
+      const size_t want = (size_t)std::max<long long>(0, order_spec->offset) + (size_t)order_spec->limit;
+      if (want < to) to = want;
+    }
+    *sorted_out = true;
+  }
+  // the rows kept, as text
+  text_out->clear();
+  text_out->reserve(to);
+  for (size_t x = 0; x < to; ++x) {
+    const uint32_t g = kept[x];
+    bool ctx_set = false;
     std::vector<std::string> cells;
     cells.reserve(items.size());
     for (size_t i = 0; i < items.size(); ++i) {
       const SelectItem& it = items[i];
       if (item_agg[i] >= 0) {   // the aggregate itself: its value as made above
-        const Val& v = av[(size_t)item_agg[i]].second;
+        const Val& v = aggv[(size_t)item_agg[i]][g];
         cells.push_back(v.null ? sql_null() : v.str());
         continue;
       }
@@ -44594,6 +44834,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
         cells.push_back(r == kNullRow ? sql_null() : sources[ps].table->cell(r, pc));
         continue;
       }
+      if (!ctx_set) { group_ctx(g); ctx_set = true; }
       Val v = eval_expr(it.expr.get(), ctx);
       if (!err.empty()) return no("an item: " + err);
       cells.push_back(v.null ? sql_null() : v.str());
@@ -44886,36 +45127,32 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
       std::vector<vp::Column> lcols;
       std::vector<std::vector<std::string>> ltext;
       size_t G = 0;
-      bool keys_exact = true;
-      if (lane_group_by(db, sources, outer_scope, rows, group_by, expanded, having, &lcols, &ltext, &G, implicit_order, &keys_exact)) {
+      bool keys_exact = true, sorted_inside = false;
+      LaneOrder lorder;
+      if (order_ok) {
+        lorder.item = order_item;
+        for (const OrderKey& k : order_by) lorder.desc.push_back(k.descending ? 1 : 0);
+        lorder.types = order_types;
+        lorder.limit = limit;
+        lorder.offset = offset;
+      }
+      if (lane_group_by(db, sources, outer_scope, rows, group_by, expanded, having, &lcols, &ltext, &G, implicit_order, &keys_exact,
+                        order_ok ? &lorder : nullptr, &sorted_inside)) {
         lane_done = true;
-        const bool sorted_already = implicit_order && keys_exact;
+        const bool key_sorted = implicit_order && keys_exact;   // the lanes' own order is the statement's
         if (vx_trace_on())
           vx_trace("group: " + std::to_string(G) + " groups over lanes (" + std::to_string(rows.size()) + " rows" +
-                   (lcols.empty() ? ", " + std::to_string(ltext.size()) + " kept, items from cells" : "") + (sorted_already ? ")" : ", sorted after)"));
+                   (lcols.empty() ? ", " + std::to_string(ltext.size()) + " kept, items from cells" : "") +
+                   (key_sorted ? ")" : sorted_inside ? ", sorted there)" : ")"));
         plan_add(plan_step("group by", {}, lcols.empty() ? "lanes, items from cells" : "integer lanes", lcols.empty() ? ltext.size() : G));
-        // a row's sort keys from its cells, for the sort below: a string item's cell is a string whatever it looks
-        // like (as the row path reads a declared text column: '0012' sorts before '12'), any other as its value
-        std::vector<char> order_text(order_by.size(), 0);
-        for (size_t i = 0; i < order_by.size(); ++i)
-          if (order_item[i] < expanded.size() && item_is_string(expanded[order_item[i]].expr.get(), sources)) order_text[i] = 1;
-        auto sort_keys_of = [&](OutRow& o) {
-          if (sorted_already) return;
-          for (size_t i = 0; i < order_by.size(); ++i) {
-            const size_t idx = order_item[i];
-            if (idx >= o.row.values.size() || sql_is_null(o.row.values[idx])) { o.sort_keys.push_back(val_null()); continue; }
-            o.sort_keys.push_back(order_text[i] ? val_text(o.row.values[idx]) : val_cell(o.row.values[idx]));
-          }
-        };
         if (lcols.empty()) {
           out_rows.reserve(ltext.size());
           for (auto& cells : ltext) {
             OutRow o;
             o.row.values = std::move(cells);
-            sort_keys_of(o);
             out_rows.push_back(std::move(o));
           }
-        } else if (sorted_already && col_out && limit < 0 && offset <= 0) {
+        } else if (col_out && limit < 0 && offset <= 0) {
           col_out->cols.assign(lcols.size(), ColBatch::Col());
           for (size_t i = 0; i < lcols.size(); ++i) colbatch_from_vp(std::move(lcols[i]), SqlDataType::Int, 0, &col_out->cols[i]);
           col_out->rows = G;
@@ -44926,11 +45163,10 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
             OutRow o;
             o.row.values.reserve(lcols.size());
             for (const vp::Column& c : lcols) o.row.values.push_back(c.text(g));
-            sort_keys_of(o);
             out_rows.push_back(std::move(o));
           }
         }
-        if (sorted_already) order_by.clear();   // in key order already
+        if (key_sorted || sorted_inside) order_by.clear();   // in order already (lanes: the lane form comes out in key order only)
       }
     }
     if (!lane_done) {

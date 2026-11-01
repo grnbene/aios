@@ -483,6 +483,22 @@ MIN / MAX / COUNT(DISTINCT) of dates and datetimes, a WHERE range beside the GRO
 identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge
 sets.
 
+The grouped join's remaining cost was the lane GROUP BY's own output: 81,000 groups each made into text cells,
+the SUM parsed back out of its text for a sort key, the whole set stable-sorted through compare_vals_as, and
+every group's first-row name decoded from a front-coded dictionary (a profile: to_chars, view_front_coded,
+val_num and the merge sort were most of it). lane_group_by now sorts the groups itself where the statement's
+ORDER BY decides: an aggregate key by its value (compare_vals_as, or the double alone where every value is a
+plain number below 2^53 - a COUNT, a DOUBLE sum), a dictionary text key by its collation rank (dict_order_rank,
+built once per column), a typed number column by its values, anything else by the Val the interpreter gives
+the group's first row; a partial sort to offset + limit where that is a small part of the groups, with ties
+broken by position as the stable sort breaks them; and only the rows kept are printed (LIMIT 20 of 81,000).
+Two more costs went with it: a sum over an integer or DOUBLE lane adds the value itself (SumAcc::add_i64 /
+add_approx, the accumulator's own arithmetic without a Val a row: val_exact formatted and parsed each one),
+and a dictionary or integer key column that is not far larger than the row set is decoded whole once instead
+of a code read per row (read_code at ~370 instructions each). ERP: open orders 3-way join 172 -> 104 ms, top
+customers 90d 57 -> 44 (DuckDB 34 / 11); what is left there is the join itself (36-44 ms of the 104) and the
+group hashing. The group edge set and the rest are identical to the build before.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
