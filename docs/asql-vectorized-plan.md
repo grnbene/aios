@@ -341,6 +341,18 @@ alternating - 2.1 -> 3.6 frames a second. The differential check over the frames
 eight seeds, frame bytes, the four oracle suites, the lane / mixed / decimal checks and the CAST set are
 identical to the build before.
 
+### The probe's own equality is the probe's; a result table's plain text column as a code-join key
+
+Two more things the trace showed in the texel joins. Their ON clause's key equality (`ft.k = <expression>`)
+was still checked for every candidate - in lanes, but every candidate - although the batched probe had found
+each candidate by that very number: where the probe is exact (a typed number column found by its number with
+no wide values, or dictionary codes mapped by their collation keys), the key's conjunct now leaves the ON
+check. And a result table's text column (plane_tex's texture name) could not be a star key because a result
+table's "text" may hold numbers the interpreter compares as numbers; one whose dictionary holds no entry that
+reads as a number (`text_dict_plain`) is compared as text, so it can - `fl.name = p.tex_name` is a direct code
+join now (the per-row probe still; the batched probe takes it next). ft 8.0 -> 5.3 ms, wt 7 -> 5.2 ms a frame;
+SQLDoom E1M1 medians 475/477/484 -> 277/268/291 ms against the build before today's commits (5cab6ef).
+
 Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
 casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
 rounding as written, the range error). The renderer's key expressions cast four or five times a row and the

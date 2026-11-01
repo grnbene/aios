@@ -42705,11 +42705,33 @@ struct StarKey {
   size_t col = 0;
 };
 
+// A result table's text column whose every dictionary entry is plain text (none reads as a number): the
+// interpreter compares its cells as text, so collation equality is their equality, as a declared TEXT column's.
+static bool text_dict_plain(const ColumnStore& cs) {
+  if (!vx::dict_coded(cs) || cs.shared_dict) return false;
+  const size_t nd = vx::dict_size(cs);
+  if (nd > (1u << 16)) return false;
+  for (size_t k = 0; k < nd; ++k) {
+    const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+    double x = 0;
+    if (!sql_is_null(d) && parse_number(d, &x)) return false;
+  }
+  return true;
+}
+
 static bool star_key_of(const SqlTable& t, size_t col, StarKey* k) {
-  if (t.inferred_types || col >= t.columns.size() || col >= t.col_data.size()) return false;
+  if (col >= t.columns.size() || col >= t.col_data.size()) return false;
   const SqlColumn& c = t.columns[col];
   if (c.temporal) return false;
   const ColumnStore& cs = t.col_data[col];
+  if (t.inferred_types) {
+    // a result table: only a text column whose text is plain (text_dict_plain) - its numbers would be compared as numbers
+    if (c.type != SqlDataType::Text || !vx::dict_coded(cs) || !(c.declared_text || text_dict_plain(cs))) return false;
+    k->text = true;
+    k->t = &t;
+    k->col = col;
+    return true;
+  }
   if (c.type == SqlDataType::Int) {
     if (!vx::typed_integer(cs) && !vx::dict_coded(cs)) return false;
     k->text = false;
@@ -46365,7 +46387,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             lookup_column_here(basectx, *bval, &dc_base_src, &dc_base_col) == ColumnLookup::Found &&
             dc_base_src < baseonly.size() && baseonly[dc_base_src].table) {
           const SqlTable& bt = *baseonly[dc_base_src].table;
-          if (!bt.inferred_types && dc_base_col < bt.col_data.size() && bt.col_data[dc_base_col].size() == bt.row_count()) {
+          if (dc_base_col < bt.col_data.size() && bt.col_data[dc_base_col].size() == bt.row_count()) {
             const ColumnStore& bcs = bt.col_data[dc_base_col];
             const int jcol = prep_jkeys[best_ki].column;
             if (jcol >= 0 && (size_t)jcol < js.table->col_data.size()) {
@@ -46742,6 +46764,24 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           nk.ints = !typed_dbl;
         }
         if ((int)ki != best_ki && !key_typed[ki]) batch_ok = false;
+      }
+      if (vx_trace_on() && best_ki >= 0 && !batch_ok)
+        vx_trace("join: +" + js.alias + " not batched: " + (!batch_join_on ? "off" : !prep_jkeys[(size_t)best_ki].idx ? "no index" : link_to_parent || link_to_kids ? "active link" :
+                 direct_code_join ? "direct code join" : best_wide ? "wide numbers" : xk_join ? "expression key" : "a key not held as a number this row has"));
+      // The probe's own equality is exact here - a typed number column found by its number, or dictionary codes
+      // mapped by their collation keys - so the key's conjunct leaves the per-candidate ON checks (it was still
+      // evaluated for every candidate, in lanes or interpreted).
+      if (best_ki >= 0 && ((batch_ok && prep_jkeys[(size_t)best_ki].idx->numeric_column) || direct_code_join)) {
+        const SqlExpr* kv = prep_jkeys[(size_t)best_ki].value;
+        auto is_key_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
+        const size_t before = on_check.size() + on_vec.size();
+        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_key_conj), on_check.end());
+        for (size_t k = 0; k < on_vec.size();) {
+          if (is_key_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
+        }
+        if (vx_trace_on() && before != on_check.size() + on_vec.size())
+          vx_trace("join: +" + js.alias + " ON: the key's equality is the probe's (" + std::string(direct_code_join ? "dictionary codes" : "numbers") + "): " +
+                   std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
       }
       auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
         if (k.lane) {
