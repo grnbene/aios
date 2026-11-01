@@ -47451,6 +47451,9 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       };
       // in-place mode so far -> list mode: the chunk's rows [base0, upto) made from their parts, in order
       auto to_list = [&](ChunkOut& o, size_t upto) {
+        // room for a row per base row of the chunk and some second candidates: the list grew by doubling, and
+        // the copies of the moves were a third of a 257k-row step
+        if (o.list->capacity() < o.part->size() + o.part->size() / 2) o.list->reserve(o.part->size() + o.part->size() / 2);
         for (size_t bi = o.base0; bi < upto; ++bi) {
           const uint32_t p = (*o.part)[bi - o.base0];
           if (p == kDropPart) continue;
@@ -47700,6 +47703,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           o.list = &local_next[ci];
           o.base0 = bstart;
           if (inplace_ok) { local_part[ci].assign(bend - bstart, kDropPart); o.part = &local_part[ci]; }
+          else local_next[ci].reserve((bend - bstart) + (bend - bstart) / 2);   // list mode from the start: a row per base row and some more
           OnSink sink;
           OnSink* const sk = on_vec.empty() ? nullptr : &sink;
           for (size_t bi = bstart; bi < bend; ++bi) {
@@ -47771,6 +47775,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         JoinMemo memo;
         ChunkOut o;
         o.list = &next;   // list mode: the rows themselves
+        if (next.capacity() < rows.size()) next.reserve(rows.size());   // at least a row per base row, usually
         for (const JoinedRow& base : rows) {
           if (sql_interrupted()) break;
           if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, o, nullptr);

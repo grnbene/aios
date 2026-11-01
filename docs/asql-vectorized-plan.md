@@ -497,7 +497,10 @@ add_approx, the accumulator's own arithmetic without a Val a row: val_exact form
 and a dictionary or integer key column that is not far larger than the row set is decoded whole once instead
 of a code read per row (read_code at ~370 instructions each). ERP: open orders 3-way join 172 -> 104 ms, top
 customers 90d 57 -> 44 (DuckDB 34 / 11); what is left there is the join itself (36-44 ms of the 104) and the
-group hashing. The group edge set and the rest are identical to the build before.
+group hashing. The group edge set and the rest are identical to the build before. A profile of the join phase
+put a third of its instructions in the output lists' growth by doubling (the moves of 257k rows); the lists are
+reserved ahead now (a row per base row and half as many again), which the instruction count rewards and the
+clock does not - the probe's time is in the index lookups and the scattered candidate lists, not in the copies.
 
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
