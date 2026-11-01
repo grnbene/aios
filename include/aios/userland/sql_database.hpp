@@ -1040,6 +1040,9 @@ struct ColumnStore {
 
   // Segment Zone Maps for data skipping (1 entry per 2048 rows)
   std::vector<SegmentZoneMap> zone_maps;
+  // A column of a statement's own result table (SqlTable::result_table) keeps none: build_zone_maps leaves it
+  // empty, which every reader takes as "may match".
+  bool zone_maps_off = false;
 
   // Constant encoding:
   std::string constant_val;
@@ -2729,6 +2732,12 @@ struct SqlTable {
   SqlRow get_row(size_t r) const;
   void ensure_columns();
   void reserve(size_t sz);
+  // A table made by a statement for itself - a materialized CTE, a derived table, a LATERAL or UNION step, a view
+  // read as rows - and dropped with it. Its columns keep no zone maps (mark_result_table, ensure_columns): the
+  // stats cost more to build than a scan of the rows they could skip (a SQLDoom frame built them for ~450,000
+  // rows and pruned nothing), and a checkpoint, which builds them for a stored table, never sees these.
+  bool result_table = false;
+  void mark_result_table();
   // Re-encodes every column; `cluster` first sorts the rows into key order (cluster_by_key), which moves them.
   void optimize_storage(bool cluster = true);
   // optimize_storage(false) in three steps, so the encoding itself holds no lock: take_encoding_copy (under the

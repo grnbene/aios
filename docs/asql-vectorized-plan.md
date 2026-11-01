@@ -173,6 +173,31 @@ programs only 12 leaf-only ones (nothing to compute) and 3 tuple-IN ones still i
 Next in 3: the operators' own loops (the batched join probe, the lane GROUP BY's hash and folds) generated per
 pipeline with the program's code fused in, so a chunk is not written to lanes between them; AArch64 emitter.
 
+### Between 3a and 3b: what the profile said to remove first
+
+A three-frame profile after 3a (15.0 billion instructions) put ~1.0 billion in work no reader used: zone maps
+built for the statement's own result tables (`extend_zone_map` on 1.15 million appended cells, `build_zone_maps`
+from `adopt_codes` and `optimize_encoding`), and text cells of those tables normalised, interned and appended one
+at a time (`colbatch_fill_table` -> `ColumnStore::push_back`). Measured first: across three frames the renderer
+filled 273 result tables (108 of them over 16,384 rows, 1.3 million rows in all) and the zone maps pruned 0
+chunks (`Asql_zone_map_pruned` before and after).
+
+Done: `SqlTable::result_table` (`mark_result_table`, set where a CTE, derived table, LATERAL, UNION step, window
+step or view-as-rows table is made, and by every fill from a batch or result rows) puts `zone_maps_off` on the
+table's columns, and `build_zone_maps` leaves such a column without stats - every reader already takes a missing
+zone map as "may match", and a checkpoint never sees these tables. Text or dictionary-coded cells going into a
+REAL result column are parsed once per distinct text and the column typed (TypedDouble, as an F64 batch is),
+when every entry is a finite number other than -0 - what a typed cell prints is exactly `sql_normalize_value`'s
+text; anything else keeps the text path. Fill time per three frames 146 -> 66 ms (text into DECIMAL 140 -> 53
+ns a row, codes into REAL 145 -> 53, text into REAL 653 -> 136); SQLDoom E1M1 medians 469/457/465 -> 424/444/426
+ms, alternating; frame bytes, the four oracle suites (213,644 lines), the lane / mixed / decimal checks and an
+edge-case set for text into REAL ('', 'inf', '-0', '1e500', 'nan', '0x10', ' 1', '1.', '.5', 20-digit integers)
+identical to the build before.
+
+Still there for a Dec batch kind (DECIMAL cells travel as text between stages, 370,000 of them a frame at 53 ns):
+the biggest fill item left; and `active_data_tick`'s re-encoding of the game's written tables (0.6 billion
+instructions on a background thread per three frames), which contends with the frame's workers.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

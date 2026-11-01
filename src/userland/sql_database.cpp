@@ -7350,6 +7350,7 @@ static void append_result_rows(SqlTable* tbl, std::vector<SqlRow>& rows) {
   bulk.reserve(rows.size());
   for (SqlRow& r : rows) bulk.push_back(std::move(r.values));
   { std::vector<SqlRow> gone; gone.swap(rows); }
+  tbl->mark_result_table();
   pretype_result_columns(tbl);
   tbl->append_rows_bulk(bulk);
 }
@@ -18449,7 +18450,7 @@ void ColumnStore::refresh_zone_maps(size_t from, size_t to) {
 void ColumnStore::build_zone_maps() {
   zone_maps.clear();
   zone_loose_.clear();
-  if (row_count_ == 0) return;
+  if (row_count_ == 0 || zone_maps_off) return;   // a result table's column: none kept (SqlTable::result_table)
   constexpr size_t kSegSize = 2048;
   size_t num_segs = (row_count_ + kSegSize - 1) / kSegSize;
   zone_maps.resize(num_segs);
@@ -20376,12 +20377,18 @@ inline int64_t sum_int64(const int64_t* __restrict data, size_t count) {
 
 } // namespace simd
 
+void SqlTable::mark_result_table() {
+  result_table = true;
+  for (auto& cs : col_data) cs.zone_maps_off = true;
+}
+
 void SqlTable::ensure_columns() {
   if (col_data.size() < columns.size()) {
     size_t rows = col_data.empty() ? 0 : col_data[0].size();
     while (col_data.size() < columns.size()) {
       col_data.emplace_back();
       col_data.back().block_codec_pref = text_codec;
+      col_data.back().zone_maps_off = result_table;
       if (rows > 0) {
         col_data.back().resize(rows, sql_null());
       }
@@ -20878,6 +20885,7 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
   t->ensure_columns();
   if (t->col_data.size() != B.cols.size() || t->columns.size() != B.cols.size()) return false;
   for (const auto& cs : t->col_data) if (cs.shared_dict || cs.size() != 0) return false;
+  t->mark_result_table();   // a fresh table filled from a statement's answer is the statement's own
   t->compact_delta_buffer();
   t->mutation_seq = sql_next_mutation_seq();
   const size_t n = B.rows;
@@ -20902,6 +20910,44 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
       if (cs.adopt_doubles(std::move(col.f), col.nul)) return;
       for (size_t r = 0; r < n; ++r) cs.append_double(col.f[r], col.nul[r] != 0);
       return;
+    }
+    // Text, or dictionary codes, into a REAL column: each distinct text parsed once and the column typed (as an
+    // F64 batch above) when every entry is a finite number other than -0 - a TypedDouble cell prints exactly
+    // sql_normalize_value's text for it. Anything else (an empty string, 'inf', a word) keeps the text path below.
+    // Parsing, normalising and interning each cell's text took ~650 ns a row; this is ~20.
+    if ((col.kind == ColBatch::Codes || col.kind == ColBatch::Text) && sc.type == SqlDataType::Real && sc.scale == 0 && !sc.temporal &&
+        cs.encoding == ColumnEncoding::DictBitPacked && !cs.shared_dict) {
+      auto parse = [](const std::string& s, double* d) {
+        if (s.find_first_of("0123456789") == std::string::npos) return false;
+        char* end = nullptr;
+        *d = std::strtod(s.c_str(), &end);
+        return end && *end == 0 && std::isfinite(*d) && !(*d == 0 && std::signbit(*d));
+      };
+      std::vector<double> vals(n, 0.0);
+      std::vector<uint8_t> nul(n, 0);
+      bool ok = true;
+      if (col.kind == ColBatch::Codes) {
+        std::vector<double> dv(col.dict.size(), 0.0);
+        std::vector<uint8_t> dn(col.dict.size(), 0);
+        for (size_t k = 0; ok && k < col.dict.size(); ++k) {
+          if (sql_is_null(col.dict[k])) dn[k] = 1;
+          else if (!parse(col.dict[k], &dv[k])) ok = false;
+        }
+        if (ok) for (size_t r = 0; r < n; ++r) {
+          nul[r] = col.nul[r] || dn[col.codes[r]];
+          if (!nul[r]) vals[r] = dv[col.codes[r]];
+        }
+      } else {
+        for (size_t r = 0; ok && r < n; ++r) {
+          if (sql_is_null(col.s[r])) nul[r] = 1;
+          else if (!parse(col.s[r], &vals[r])) ok = false;
+        }
+      }
+      if (ok && cs.begin_typed(ColumnEncoding::TypedDouble)) {
+        if (cs.adopt_doubles(std::move(vals), nul)) return;
+        for (size_t r = 0; r < n; ++r) cs.append_double(vals[r], nul[r] != 0);
+        return;
+      }
     }
     if (col.kind == ColBatch::Codes && cs.encoding == ColumnEncoding::DictBitPacked) {
       std::vector<uint32_t> ids(col.dict.size(), 0);
@@ -23954,6 +24000,7 @@ std::shared_ptr<SqlTable> SqlDatabase::get_or_build_materialized_view(const SqlV
     }
   }
   fit_decimal_scales(ephem->columns, vres.rows);
+  ephem->mark_result_table();
   ephem->ensure_columns();
   ephem->reserve(vres.rows.size());
   for (const auto& r : vres.rows) {
@@ -41752,6 +41799,7 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
     }
   }
   fit_decimal_scales(tbl->columns, rows);
+  tbl->mark_result_table();
   tbl->ensure_columns();
   tbl->reserve(rows.size());
   // Every cell is already in its column's form (a query's output, or a window's, scaled above): appended as
@@ -43585,6 +43633,7 @@ static std::shared_ptr<SqlTable> materialize_series(SqlDatabase* db, const Parse
   col.type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
   col.scale = scale;
   t->columns.push_back(col);
+  t->mark_result_table();
   t->ensure_columns();
   t->inferred_types = true;
   if (any_null) return t;
@@ -43810,6 +43859,7 @@ static std::shared_ptr<SqlTable> materialize_lateral(SqlDatabase* db, ParsedSele
   key_col.type = SqlDataType::Int;
   t->columns.push_back(key_col);
   t->hidden_columns = 1;
+  t->mark_result_table();
   t->ensure_columns();
   t->reserve(rows.size());
   append_result_rows(t.get(), rows);
@@ -49907,6 +49957,7 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
       u.columns.push_back(col);
     }
     fit_decimal_scales(u.columns, res.rows);
+    u.mark_result_table();
     u.ensure_columns();
     u.reserve(res.rows.size());
     for (const auto& r : res.rows) u.append_row(r);
@@ -50330,6 +50381,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         return make_error("CTE " + cte_name + " column count mismatch");
       }
       cte_columns_from(anchor_res, cte_cols, &accum_tbl);
+      accum_tbl.mark_result_table();
       accum_tbl.ensure_columns();
       for (const auto& r : anchor_res.rows) {
         accum_tbl.append_row(r);
