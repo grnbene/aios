@@ -277,9 +277,40 @@ INSERT into and after a DELETE from the many side) identical with the pipeline o
 the four oracle suites, the 21 edge sets, the one-to-many and ORDER BY .. LIMIT sets and the frame bytes identical;
 frames alternated with the build before: warm 264-325 ms against 272-335, the first frame 552-599 against 530-622.
 
-Next, 3c.2: the fused loop's per-root work (the partner lookup, the key's decode, pack and probe - ~135
-instructions a root row) and the morsel's folds as x86-64 from the 3a emitter, the aggregate's expression program
-inlined.
+### 3c.2, done: the fused loop as native code (x86-64)
+
+`sql_pipe_x64.inc`, on 3a's assembler. Two functions per statement, built in microseconds:
+
+- **The fold** (`pipe_fold_build`): a root row's run of many-side rows folded into its group - a COUNT is one
+  addition for the run, a SUM / AVG's `vx::NumProg` is computed per row in registers from the columns decoded
+  whole (`decoded_values`) and added into the group's total in row order. The operations and their order are
+  np_eval's and the fold's (Neg, Add, Sub, Mul; Div with a zero divisor a NULL row, skipped; a NaN divisor is not
+  zero), so the totals are the same bits. Covered: leaves that are typed columns with no NULL and non-NULL
+  constants, at most 14 instructions, every aggregate a COUNT or a SUM / AVG on the many side.
+- **The root loop** (`pipe_root_build`): each root row's unique partners (dense integer maps over the parent key
+  decoded whole), its run (the one-to-many CSR map), its key - two parts packed as star_aggregate packs them, or one
+  dictionary key's slot - the probe into star_aggregate's own table with its hash, and a call to the fold. A key not
+  there calls back into C++ (`new_group`, key_group's insert in that slot), once a group. Covered: links with no
+  NULL key and no LEFT, keys with no NULL decoded whole (the kept decodes - `decoded_ints` / `decoded_codes` -
+  fetched where the join did not decode them). The key table was sized for at most a group a root row at under
+  half full, so it never grows under the code (a group past that aborts, as an impossibility).
+
+Anything else falls back a step at a time: the fold in morsels (3c.1), the root loop in C++. `AIOS_SQL_PIPE_JIT=0`
+turns the native code off; `AIOS_SQL_PIPE_CHECK=1` checks it - the code records each root row's group, then C++
+walks every root row again (its partners, its run, its group found and not made: the same group, or none where it
+has no row) and folds each run through np_eval itself into shadow arrays, compared with the code's bit for bit at
+the end (counts, totals, exactness); a difference aborts naming the root row or group.
+
+Measured (warm, one statement under callgrind): open orders 99M (3c.1) -> 83M with the native fold -> 65M with the
+native root loop (the two functions 14M of it; the ORDER BY .. LIMIT over 81k groups is most of the rest). Wall:
+open orders 21-23 ms against 31-34 with the pipeline off; top customers 6.2-6.7 ms against 9-13 (DuckDB: 34 and 11).
+
+Checked: the ERP queries' answers identical with the pipeline on and off, and under the check mode (10 statements
+native, every root row and group the same); the pipeline edge set grown with DOUBLE columns the native fold takes
+(a zero divisor, negation and constants, AVG; keys of an integer and a name, a name alone - two spellings one
+collation group - and an integer alone; an empty selection) identical with the pipeline on, off, with the star join
+off, and under the check mode (7 native folds, 3 native root loops, all the same); the oracle suites, the edge sets,
+the one-to-many and ORDER BY .. LIMIT sets and the frame bytes identical.
 
 ### Between 3a and 3b: what the profile said to remove first
 

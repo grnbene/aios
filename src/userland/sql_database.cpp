@@ -8319,8 +8319,95 @@ static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols);
 static bool row_in_set_has(const RowInSet& set, const double* key, size_t n);
 
 #include "sql_vprog.inc"
+namespace vp {
+// The fused star join aggregate's fold as native code (3c.2, sql_pipe_x64.inc): what it is built from.
+struct PipeIns {                       // a vx::NumProg instruction over the many side's decoded columns
+  enum Op : uint8_t { Leaf, Konst, Neg, Add, Sub, Mul, Div } op = Konst;
+  const double* col = nullptr;         // Leaf: the column decoded whole, by row
+  double k = 0;                        // Konst
+  uint32_t a = 0, b = 0;               // operands (earlier instructions)
+};
+struct PipeFoldAgg {
+  int kind = 0;                        // 0: a COUNT - the run's rows added to cnt[g]; 1: SUM / AVG of prog
+  std::vector<PipeIns> prog;
+  uint64_t* cnt = nullptr;
+  double* num = nullptr;
+  uint8_t* exact = nullptr;
+};
+std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>& aggs, std::string* why);
+void pipe_fold_run(const void* code, const uint32_t* rows, size_t n, uint32_t g);
+const void* pipe_fold_entry(const void* code);   // the fold's code address, for the root loop to call
+// The fused loop over the root rows as native code (3c.2): its links, keys and key table.
+struct PipeRootLink {                  // a unique link: parent row -> its partner through a dense map
+  const int64_t* pkeys = nullptr;      // the parent key column decoded whole
+  int64_t lo = 0;
+  const uint32_t* dense = nullptr;
+  uint64_t dense_n = 0;
+  uint32_t parent = 0, child = 0;
+};
+struct PipeRootMulti {                 // the one-to-many link: parent row -> its run of rows (CSR)
+  const int64_t* pkeys = nullptr;
+  int64_t lo = 0;
+  const uint32_t* off = nullptr;
+  uint64_t off_n = 0;
+  const uint32_t* rows = nullptr;
+  uint32_t parent = 0, child = 0;
+};
+struct PipeRootKey {
+  uint32_t src = 0;
+  bool dict = false;
+  const uint32_t* codes = nullptr;     // dict: the column's codes decoded whole, and their canonical ids
+  const uint32_t* canon = nullptr;
+  uint64_t canon_n = 0;
+  const int64_t* ints = nullptr;       // integer: the column decoded whole, offset by ilo when packed with another
+  int64_t ilo = 0;
+};
+struct PipeRootSpec {
+  std::vector<PipeRootLink> links;
+  PipeRootMulti multi;
+  std::vector<PipeRootKey> keys;
+  uint32_t root = 0;
+  const int32_t* tg = nullptr;         // star_aggregate's key table: group per slot (-1 empty), id per slot
+  const uint64_t* tk = nullptr;
+  const int32_t* slots = nullptr;      // or one dictionary key: a group per canonical id (key_group's slot_dict; -1 none),
+                                       // a code past the canonical table reading slot canon_n (the NULL key's)
+  uint64_t mask = 0;
+  unsigned shift = 0;
+  const void* fold_fn = nullptr;
+  uint64_t (*new_group)(void* ctx, const uint32_t* parts, uint64_t id, uint64_t slot) = nullptr;
+};
+struct PipeRootEnv {
+  uint64_t total = 0;                  // +0 rows met (added to)
+  const uint32_t* roots = nullptr;     // +8
+  uint64_t n = 0;                      // +16
+  void* ctx = nullptr;                 // +24 new_group's
+  uint32_t* root_g = nullptr;          // +32 per root row its group (check mode)
+};
+std::shared_ptr<void> pipe_root_build_for(const PipeRootSpec& sp, std::string* why);
+void pipe_root_run(const void* code, PipeRootEnv* env);
+inline bool pipe_jit_on() {
+  static const bool on = [] { const char* v = std::getenv("AIOS_SQL_PIPE_JIT"); return !(v && *v == '0'); }();
+  return on;
+}
+inline bool pipe_check_mode() {
+  static const bool on = [] { const char* v = std::getenv("AIOS_SQL_PIPE_CHECK"); return v && *v == '1'; }();
+  return on;
+}
+}  // namespace vp
 #if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
 #include "sql_vjit_x64.inc"
+#include "sql_pipe_x64.inc"
+namespace vp {
+std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>& aggs, std::string* why) { return vjit::pipe_fold_build(aggs, why); }
+void pipe_fold_run(const void* code, const uint32_t* rows, size_t n, uint32_t g) {
+  static_cast<const vjit::PipeCode*>(code)->fn(rows, n, g);
+}
+const void* pipe_fold_entry(const void* code) { return reinterpret_cast<const void*>(static_cast<const vjit::PipeCode*>(code)->fn); }
+std::shared_ptr<void> pipe_root_build_for(const PipeRootSpec& sp, std::string* why) { return vjit::pipe_root_build(sp, why); }
+void pipe_root_run(const void* code, PipeRootEnv* env) {
+  reinterpret_cast<void (*)(PipeRootEnv*)>(static_cast<const vjit::PipeCode*>(code)->mem)(env);
+}
+}  // namespace vp
 namespace vp {
 std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why, bool* hoisted, uint64_t* hoist_srcs) {
   std::shared_ptr<vjit::Code> c = vjit::build(P, why);
@@ -8346,6 +8433,17 @@ std::shared_ptr<void> vjit_build_for(const Prog&, std::string* why, bool* hoiste
 }
 int vjit_run(const void*, size_t, const void* const*, const void* const*, const void* const*, int64_t*, double*, uint8_t*, const LeafDesc*, const size_t* const*, uint64_t) { return 1; }
 bool vjit_check_mode() { return false; }
+std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>&, std::string* why) {
+  if (why) *why = "no native code on this architecture";
+  return nullptr;
+}
+void pipe_fold_run(const void*, const uint32_t*, size_t, uint32_t) {}
+const void* pipe_fold_entry(const void*) { return nullptr; }
+std::shared_ptr<void> pipe_root_build_for(const PipeRootSpec&, std::string* why) {
+  if (why) *why = "no native code on this architecture";
+  return nullptr;
+}
+void pipe_root_run(const void*, PipeRootEnv*) {}
 }  // namespace vp
 #endif
 #include "sql_colbatch.inc"
@@ -44584,6 +44682,65 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     for (size_t s2 = 0; s2 < NS; ++s2) if (need[s2]) ma[s2].resize(mcap);
     mg.resize(mcap);
     bool padded = false;                                // the morsel holds a NULL-padded row
+    // 3c.2: every aggregate a COUNT or a SUM / AVG of the many side's arithmetic - the run's fold as native code
+    // (sql_pipe_x64.inc), built once the groups' arrays are sized (they do not move during the loop)
+    std::shared_ptr<void> native;
+    std::vector<vp::PipeFoldAgg> pf;
+    std::vector<std::shared_ptr<const std::vector<double>>> pholds;
+    std::vector<char> pcount_star;                      // per aggregate: COUNT(*) (a NULL-padded row counts)
+    std::string native_why;
+    auto build_native = [&]() {
+      if (!vp::pipe_jit_on()) { native_why = "off"; return; }
+      const SqlTable& mt = *sources[mc].table;
+      for (auto& ap : aggs) {
+        A1& a = *ap;
+        vp::PipeFoldAgg f;
+        f.cnt = a.arr.cnt.data();
+        pcount_star.push_back(a.agg.kind == vx::Agg::CountStar);
+        if (a.agg.kind == vx::Agg::CountStar) { f.kind = 0; pf.push_back(std::move(f)); continue; }
+        if (a.src != mc) { native_why = "an aggregate off the many side"; return; }
+        if (a.agg.kind == vx::Agg::Count && a.agg.col_rules && !a.nulls) { f.kind = 0; pf.push_back(std::move(f)); continue; }
+        if (!((a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.prog && !a.agg.mask)) { native_why = "an aggregate"; return; }
+        f.kind = 1;
+        f.num = a.arr.num.data();
+        f.exact = a.arr.exact.data();
+        for (const vx::NumProg::Ins& in : a.agg.prog->ins) {
+          vp::PipeIns pi;
+          pi.a = in.a;
+          pi.b = in.b;
+          switch (in.op) {
+            case vx::NumProg::Typed: {
+              const ColumnStore* cs = in.cs;
+              if (!cs || mt.col_data.empty() || cs < mt.col_data.data() || cs >= mt.col_data.data() + mt.col_data.size() ||
+                  vx::has_nulls(*cs)) { native_why = "a column"; return; }
+              auto d = vx::decoded_values(mt, (size_t)(cs - mt.col_data.data()));
+              if (!d) { native_why = "a column's decode"; return; }
+              pi.op = vp::PipeIns::Leaf;
+              pi.col = d->data();
+              pholds.push_back(std::move(d));
+              break;
+            }
+            case vx::NumProg::Konst:
+              if (in.knull) { native_why = "a NULL constant"; return; }
+              pi.op = vp::PipeIns::Konst;
+              pi.k = in.k;
+              break;
+            case vx::NumProg::Neg: pi.op = vp::PipeIns::Neg; break;
+            case vx::NumProg::Add: pi.op = vp::PipeIns::Add; break;
+            case vx::NumProg::Sub: pi.op = vp::PipeIns::Sub; break;
+            case vx::NumProg::Mul: pi.op = vp::PipeIns::Mul; break;
+            case vx::NumProg::Div: pi.op = vp::PipeIns::Div; break;
+            default: native_why = "an instruction"; return;
+          }
+          f.prog.push_back(pi);
+        }
+        pf.push_back(std::move(f));
+      }
+      native = vp::pipe_fold_build_for(pf, &native_why);
+    };
+    // AIOS_SQL_PIPE_CHECK=1: every run folded again through np_eval (the interpreter) into these, compared at the end
+    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; };
+    std::vector<Shadow> shadow;
     auto flush = [&]() {
       if (n == 0) return;
       for (size_t s2 = 0; s2 < NS; ++s2) mp[s2] = need[s2] ? ma[s2].data() : nullptr;
@@ -44611,9 +44768,159 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       tk.assign(cap, 0);
       tg.assign(cap, -1);
     }
+    build_native();
+    const bool check = native && vp::pipe_check_mode();
+    if (check) {
+      shadow.resize(aggs.size());
+      for (size_t ai = 0; ai < aggs.size(); ++ai) {
+        shadow[ai].cnt.assign(gmax, 0);
+        shadow[ai].num.assign(gmax, 0);
+        shadow[ai].exact.assign(gmax, 1);
+        shadow[ai].S.cover = E->bound;
+        shadow[ai].S.table = sources[mc].table;
+      }
+    }
+    if (vx_trace_on())
+      vx_trace(std::string("join aggregate: fold ") + (native ? "as native code" : "in morsels (no native code: " + native_why + ")") +
+               (check ? ", checked against np_eval" : ""));
     uint32_t parts[8];
     const uint64_t tk0 = vx_trace_on() ? hal_now_ns() : 0;
+    // 3c.2, second part: the root loop itself as native code (pipe_root_build), where its links and keys are the
+    // kinds it covers - dense integer maps with no NULL key and no LEFT link, a key of one or two packed parts read
+    // from columns decoded whole with no NULL - and the fold is native. The key table was sized above for at most a
+    // group a root row at under half full, so it never grows (the code holds its slots' addresses).
+    std::shared_ptr<void> rootcode;
+    std::string root_why = native ? "" : "no native fold";
+    struct NgCtx { std::function<uint64_t(const uint32_t*, uint64_t, uint64_t)> f; } ngctx;
+    std::vector<uint32_t> root_g;
+    vp::PipeRootEnv renv;
+    std::vector<std::shared_ptr<const vx::DecodedInts>> rholds;   // parent keys decoded whole here, where the join did not
+    std::vector<std::shared_ptr<const std::vector<uint32_t>>> rholdc;
+    // a parent key column's integers decoded whole: the join's own, or the kept decode (decoded_ints)
+    auto parent_ints = [&](const StarLink& L) -> const int64_t* {
+      if (L.whole_ints) return L.whole_ints;
+      const SqlTable& pt = *sources[L.parent_src].table;
+      if (!vx::typed_integer(pt.col_data[L.parent_col])) return nullptr;
+      auto d = vx::decoded_ints(pt, L.parent_col);
+      if (!d) return nullptr;
+      rholds.push_back(d);
+      return d->v.data();
+    };
+    if (native) {
+      vp::PipeRootSpec sp;
+      bool ok = (kpath == 3 && cap >= gmax * 2) || kpath == 2;
+      if (!ok) root_why = "the key";
+      for (size_t k = 0; ok && k + 1 < E->links.size(); ++k) {
+        const StarLink& L = E->links[k];
+        const int64_t* pk = L.map.by_dense && !L.parent_nulls && !L.left ? parent_ints(L) : nullptr;
+        if (!pk) { ok = false; root_why = "a unique link"; break; }
+        vp::PipeRootLink rl;
+        rl.pkeys = pk; rl.lo = L.map.lo; rl.dense = L.map.dense.data(); rl.dense_n = L.map.dense.size();
+        rl.parent = (uint32_t)L.parent_src; rl.child = (uint32_t)L.child_src;
+        sp.links.push_back(rl);
+      }
+      const int64_t* mpk = ok && !ML.parent_nulls && !ML.left && ML.mm->off.size() >= 2 ? parent_ints(ML) : nullptr;
+      if (ok && !mpk) { ok = false; root_why = "the one-to-many link"; }
+      if (ok) {
+        sp.multi.pkeys = mpk; sp.multi.lo = ML.mm->lo; sp.multi.off = ML.mm->off.data(); sp.multi.off_n = ML.mm->off.size();
+        sp.multi.rows = ML.mm->rows.data(); sp.multi.parent = (uint32_t)ML.parent_src; sp.multi.child = (uint32_t)mc;
+      }
+      for (size_t k = 0; ok && k < ng; ++k) {
+        vp::PipeRootKey rk;
+        rk.src = (uint32_t)keys[k].src;
+        if (khn[k]) { ok = false; root_why = "a key with NULLs"; break; }
+        if (!keys[k].canon.empty()) {
+          const uint32_t* codes = kc[k];
+          if (!codes) {
+            auto d = vx::decoded_codes(*sources[keys[k].src].table, keys[k].col);
+            if (d) { codes = d->data(); rholdc.push_back(d); }
+          }
+          if (!codes) { ok = false; root_why = "a key's codes"; break; }
+          rk.dict = true; rk.codes = codes; rk.canon = keys[k].canon.data(); rk.canon_n = keys[k].canon.size();
+        } else {
+          const int64_t* ints = ki[k];
+          if (!ints) {
+            auto d = vx::decoded_ints(*sources[keys[k].src].table, keys[k].col);
+            if (d) { ints = d->v.data(); rholds.push_back(d); }
+          }
+          if (!ints) { ok = false; root_why = "a key's integers"; break; }
+          rk.ints = ints; rk.ilo = ilo[k];
+        }
+        sp.keys.push_back(rk);
+      }
+      if (ok) {
+        sp.root = (uint32_t)E->root;
+        if (kpath == 2) sp.slots = slot_dict.data();
+        else { sp.tg = tg.data(); sp.tk = tk.data(); sp.mask = mask; sp.shift = shift; }
+        sp.fold_fn = vp::pipe_fold_entry(native.get());
+        ngctx.f = [&](const uint32_t* prt, uint64_t id, uint64_t slot) -> uint64_t {
+          // key_group's insert, in the slot the code found empty
+          row_at = renv.total;
+          if (kpath == 2) {
+            slot_dict[slot] = (int32_t)new_group([&](size_t s2) { return prt[s2]; });
+            return (uint64_t)slot_dict[slot];
+          }
+          tk[slot] = id;
+          tg[slot] = (int32_t)new_group([&](size_t s2) { return prt[s2]; });
+          if (first.size() * 2 > cap) { fprintf(stderr, "asql: the native root loop's key table filled past its size\n"); abort(); }
+          return (uint64_t)tg[slot];
+        };
+        sp.new_group = [](void* c, const uint32_t* prt, uint64_t id, uint64_t slot) -> uint64_t { return static_cast<NgCtx*>(c)->f(prt, id, slot); };
+        rootcode = vp::pipe_root_build_for(sp, &root_why);
+      }
+    }
+    if (vx_trace_on()) vx_trace(std::string("join aggregate: root loop ") + (rootcode ? "as native code" : "in C++ (" + root_why + ")"));
     uint64_t t_fold = 0;
+    if (rootcode) {
+      renv.total = 0;
+      renv.roots = E->roots.data();
+      renv.n = E->roots.size();
+      renv.ctx = &ngctx;
+      if (check) { root_g.assign(E->roots.size(), UINT32_MAX); renv.root_g = root_g.data(); }
+      vp::pipe_root_run(rootcode.get(), &renv);
+      total = renv.total;
+      if (check) {
+        // every root row again in C++: its partners, its run, its group (found, not made) - the group the code
+        // gave it, or none where it has no row - and its run folded through np_eval into the shadow arrays
+        for (size_t ri = 0; ri < E->roots.size(); ++ri) {
+          parts[E->root] = E->roots[ri];
+          bool keep_row = true;
+          for (size_t k = 0; k + 1 < E->links.size(); ++k) {
+            const StarLink& L = E->links[k];
+            const uint32_t got = star_partner(sources, L, parts[L.parent_src]);
+            if (got == UINT32_MAX) { keep_row = false; break; }
+            parts[L.child_src] = got;
+          }
+          const uint32_t* b = nullptr;
+          const uint32_t* e = nullptr;
+          if (keep_row) star_rows_of(sources, ML, parts[ML.parent_src], &b, &e);
+          if (!keep_row || b == e) {
+            if (root_g[ri] != UINT32_MAX) { fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native root loop gave root row %zu a row\n", ri); abort(); }
+            continue;
+          }
+          parts[mc] = *b;
+          const int64_t g = key_group([&](size_t s2) { return parts[s2]; }, false);
+          if (g < 0 || (uint32_t)g != root_g[ri]) {
+            fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native root loop's group differs: root row %zu\n", ri);
+            abort();
+          }
+          const size_t cnt = (size_t)(e - b);
+          for (size_t ai = 0; ai < aggs.size(); ++ai) {
+            Shadow& sh = shadow[ai];
+            if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            sh.v.resize(cnt);
+            sh.z.resize(cnt);
+            vx::np_eval(*aggs[ai]->agg.prog, 0, b, cnt, sh.S, sh.v.data(), sh.z.data());
+            for (size_t j = 0; j < cnt; ++j) {
+              if (sh.z[j]) continue;
+              sh.num[g] += sh.v[j];
+              sh.cnt[g]++;
+              sh.exact[g] = 0;
+            }
+          }
+        }
+      }
+    } else {
     for (uint32_t rr : E->roots) {
       parts[E->root] = rr;
       bool keep_row = true;
@@ -44636,6 +44943,28 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       parts[mc] = pad ? UINT32_MAX : *b;               // the group's first row, as the expanded rows had it
       row_at = total + n;
       const uint32_t g = (uint32_t)key_group([&](size_t s2) { return parts[s2]; }, true);
+      if (native) {
+        if (pad) {                                     // a NULL-padded row: only COUNT(*) counts it
+          for (size_t ai = 0; ai < aggs.size(); ++ai) if (pcount_star[ai]) { aggs[ai]->arr.cnt[g]++; if (check) shadow[ai].cnt[g]++; }
+        } else {
+          vp::pipe_fold_run(native.get(), b, cnt, g);
+          for (size_t ai = 0; check && ai < aggs.size(); ++ai) {
+            Shadow& sh = shadow[ai];
+            if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            sh.v.resize(cnt);
+            sh.z.resize(cnt);
+            vx::np_eval(*aggs[ai]->agg.prog, 0, b, cnt, sh.S, sh.v.data(), sh.z.data());
+            for (size_t j = 0; j < cnt; ++j) {
+              if (sh.z[j]) continue;
+              sh.num[g] += sh.v[j];
+              sh.cnt[g]++;
+              sh.exact[g] = 0;
+            }
+          }
+        }
+        total += cnt;
+        continue;
+      }
       if (n + cnt > mcap) {
         mcap = std::max(mcap * 2, n + cnt);
         for (size_t s2 = 0; s2 < NS; ++s2) if (need[s2]) ma[s2].resize(mcap);
@@ -44656,8 +44985,24 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         if (!err->empty()) return false;
       }
     }
+    }
     flush();
     if (!err->empty()) return false;
+    if (check) {
+      // the native fold against np_eval's: every group's count, total and exactness, bit for bit
+      for (size_t ai = 0; ai < aggs.size(); ++ai)
+        for (size_t g = 0; g < first.size(); ++g) {
+          const vx::AggArrays& A = aggs[ai]->arr;
+          const Shadow& sh = shadow[ai];
+          bool same = A.cnt[g] == sh.cnt[g];
+          if (pf[ai].kind == 1) same = same && std::memcmp(&A.num[g], &sh.num[g], 8) == 0 && A.exact[g] == sh.exact[g];
+          if (!same) {
+            fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native fold differs from np_eval: aggregate %zu, group %zu\n", ai, g);
+            abort();
+          }
+        }
+      if (vx_trace_on()) vx_trace("join aggregate: native fold checked: " + std::to_string(first.size()) + " groups the same");
+    }
     if (vx_trace_on()) t_keys += hal_now_ns() - tk0 - t_fold;
     N = total;
     if (kpath == 0 && first.empty()) first.push_back(0);   // no rows and no GROUP BY: one group, no row

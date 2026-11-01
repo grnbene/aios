@@ -134,6 +134,9 @@ struct Asm {
     b((uint8_t)(0x80 | ((idx & 7) << 3) | (base & 7)));
   }
   void load32_idx4(Reg d, Reg base, Reg idx) { rex(false, d, idx, base); b(0x8B); modrm_sib4(d, base, idx); }   // mov d32, [base+idx*4] (zero-extended)
+  void load32(Reg d, Reg base, int32_t disp) { rex(false, d, 0, base); b(0x8B); modrm_disp(d, base, disp); }      // mov d32, [base+disp] (zero-extended)
+  void store32(Reg base, int32_t disp, Reg s) { rex(false, s, 0, base); b(0x89); modrm_disp(s, base, disp); }     // mov [base+disp], s32
+  void store32_idx4(Reg base, Reg idx, Reg s) { rex(false, s, idx, base); b(0x89); modrm_sib4(s, base, idx); }    // mov [base+idx*4], s32
   void bt(Reg d, Reg bit) { rex(true, bit, 0, d); b(0x0F); b(0xA3); rr(bit, d); }                             // CF = bit `bit` of d
   void shr_imm(Reg d, uint8_t n) { rex(true, 0, 0, d); b(0xC1); rr(5, d); b(n); }
   void and_imm32(Reg d, int32_t imm) { rex(true, 0, 0, d); b(0x81); rr(4, d); d32((uint32_t)imm); }
@@ -176,6 +179,7 @@ struct Asm {
   void movsd_load(Reg x, Reg base, int32_t disp) { b(0xF2); rex(false, x, 0, base); b(0x0F); b(0x10); modrm_disp(x, base, disp); }
   void movsd_store(Reg base, int32_t disp, Reg x) { b(0xF2); rex(false, x, 0, base); b(0x0F); b(0x11); modrm_disp(x, base, disp); }
   void movsd_load_idx8(Reg x, Reg base, Reg idx) { b(0xF2); rex(false, x, idx, base); b(0x0F); b(0x10); modrm_sib8(x, base, idx); }
+  void movsd_store_idx8(Reg base, Reg idx, Reg x) { b(0xF2); rex(false, x, idx, base); b(0x0F); b(0x11); modrm_sib8(x, base, idx); }
   void movq_xr(Reg x, Reg r) { b(0x66); rex(true, x, 0, r); b(0x0F); b(0x6E); rr(x, r); }   // movq xmm, r64
   void movq_rx(Reg r, Reg x) { b(0x66); rex(true, x, 0, r); b(0x0F); b(0x7E); rr(x, r); }   // movq r64, xmm
   void addsd(Reg x, Reg y) { sse(0xF2, 0x58, x, y); }
