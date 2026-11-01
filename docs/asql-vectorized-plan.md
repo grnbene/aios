@@ -394,6 +394,17 @@ way, three keys, text beside a number, text beside a Constant, LEFT JOIN padding
 keys in WHERE) is identical to the build before, as are frame bytes, the differential native check over the
 frames, the four oracle suites, the lane / mixed / decimal checks and the edge sets above.
 
+Native code, loop-invariant instructions: a constant, a leaf gathered from a one-row source (the camera, the
+render settings - a CROSS JOIN with one row gives every row the same row id there) and every instruction whose
+operands are all such are emitted once before the row loop, into their stack slots, and skipped in it; the loop
+keeps a guarded copy for a chunk whose row ids for those sources are not uniform (eval checks them, Env::hoist
+says which). SIN(c.view_rad) and COS(c.view_rad) over 56,000 rows were a libm call a row each. Same binary,
+AIOS_SQL_VJIT_HOIST=0 against 1 over 100,000 rows: the three plane_world programs 16.8 -> 11.5 ms, SUM(x * SIN(c.a)
++ y * COS(c.a)) 10.5 -> 5.5 ms. The frame-level gain is within this machine's spread today (medians against 5cab6ef
+557-797 -> 329-367 ms with other work running); its own on/off frame measurement follows when the machine is quiet.
+The differential check over the frames, the randomized check under three seeds, frame bytes, the four oracle
+suites, the lane / mixed / decimal checks and the edge sets are identical to the build before.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

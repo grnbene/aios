@@ -19,6 +19,10 @@ inline bool enabled() {
   return on;
 }
 inline std::atomic<uint64_t>& native_runs() { static std::atomic<uint64_t> n{0}; return n; }   // chunks computed natively
+inline bool hoist_enabled() {   // AIOS_SQL_VJIT_HOIST=0: the loop-invariant instructions computed in the loop, as before
+  static const bool on = [] { const char* v = std::getenv("AIOS_SQL_VJIT_HOIST"); return !(v && *v == '0'); }();
+  return on;
+}
 inline bool check_mode() {
   static const bool on = [] { const char* v = std::getenv("AIOS_SQL_VJIT_CHECK"); return v && *v == '1'; }();
   return on;
@@ -36,6 +40,7 @@ struct Env {
   uint8_t* out_n;                 // +48
   const LeafDesc* leaves;         // +56  the leaves the code gathers itself, by instruction (LeafDesc, 72 bytes each)
   const size_t* const* rid;       // +64  the chunk's row ids, by source
+  uint64_t hoist;                 // +72  1: the invariant instructions are computed once before the loop (Code::hoist_srcs)
 };
 static_assert(sizeof(LeafDesc) == 72, "LeafDesc layout");
 using Fn = int (*)(const Env*);   // 0: done; 1: bail - the interpreter decides the chunk; 2: a column's layout moved
@@ -195,6 +200,11 @@ struct Code {
   uint8_t* mem = nullptr;
   size_t bytes = 0;
   Fn fn = nullptr;
+  // Loop-invariant instructions (constants, leaves of a one-row source and everything computed from those alone)
+  // are emitted once before the row loop as well as in it; Env::hoist chooses. The preamble is right when every
+  // source in hoist_srcs has the same row id in every row of the chunk (eval checks).
+  bool hoisted = false;
+  uint64_t hoist_srcs = 0;
   ~Code() { if (mem) munmap(mem, bytes); }
 };
 
@@ -215,6 +225,29 @@ class Builder {
       native_[x] = 1;
       if (P_.ins[x].op != Ins::Konst && P_.ins[x].src + 1 > nsrc_) nsrc_ = P_.ins[x].src + 1;
     }
+    // Loop-invariant instructions: a constant, a leaf gathered from a one-row source (the row id is then the same
+    // for every row of the chunk, or the chunk is computed the plain way - eval checks), and an instruction whose
+    // operands are all invariant. SIN(c.view_rad) over 56,000 rows of a join with a one-row camera table was a
+    // libm call a row; it is one call a chunk.
+    inv_.assign(K, 0);
+    uint64_t hoist_srcs = 0;
+    for (size_t x = 0; x < K; ++x) {
+      const Ins& in = P_.ins[x];
+      if (is_leaf(in.op)) {
+        if (!native_[x]) continue;
+        if (in.op == Ins::Konst) { inv_[x] = 1; continue; }
+        if (in.cs && in.cs->size() == 1 && in.src < 64) { inv_[x] = 1; hoist_srcs |= (uint64_t)1 << in.src; }
+        continue;
+      }
+      if (in.op == Ins::TupleIn || in.args.empty()) continue;
+      bool all = true;
+      for (uint32_t a : in.args) if (a >= x || !inv_[a]) { all = false; break; }
+      if (all) inv_[x] = 1;
+    }
+    bool any_inv = false;
+    for (size_t x = 0; x < K; ++x) if (inv_[x]) any_inv = true;
+    hoisted_ = any_inv && hoist_enabled();
+    hoist_srcs_ = any_inv ? hoist_srcs : 0;
     frame_ = (int32_t)(16 * K + 8 * nsrc_);
     // rsp after the six pushes and the return address is 8 mod 16; the frame makes it 0 mod 16 for the calls
     if ((frame_ + 8) % 16 != 0) frame_ += 8;
@@ -252,8 +285,32 @@ class Builder {
     a_.mov_imm(R12, 0);
     a_.test(R13, R13);
     const size_t empty = a_.jcc(CcE);
+    // the invariant instructions, once, at row 0 of the chunk (Env::hoist set); their slots keep the values
+    auto emit_inv = [&] {
+      for (size_t x = 0; x < K; ++x) {
+        if (!inv_[x]) continue;
+        if (native_[x]) emit_leaf(x);
+        else if (!is_leaf(P_.ins[x].op)) emit(x);
+      }
+      forget_all();
+    };
+    if (hoisted_) {
+      a_.cmp32_mem_imm(RBX, 72, 0);
+      const size_t skip_pre = a_.jcc(CcE);
+      emit_inv();
+      a_.patch_here(skip_pre);
+    }
     const size_t loop = a_.here();
+    if (hoisted_) {
+      // the same instructions in the loop where the chunk's row ids are not uniform (Env::hoist clear); they
+      // come first in the loop since nothing they read is computed in it
+      a_.cmp32_mem_imm(RBX, 72, 0);
+      const size_t skip_loop = a_.jcc(CcNE);
+      emit_inv();
+      a_.patch_here(skip_loop);
+    }
     for (size_t x = 0; x < K; ++x) {
+      if (hoisted_ && inv_[x]) continue;
       if (native_[x]) emit_leaf(x);
       else if (!is_leaf(P_.ins[x].op)) emit(x);
     }
@@ -287,6 +344,8 @@ class Builder {
     if (mprotect(p, code->bytes, PROT_READ | PROT_EXEC) != 0) { munmap(p, code->bytes); if (why) *why = "mprotect"; return nullptr; }
     code->mem = (uint8_t*)p;
     code->fn = reinterpret_cast<Fn>(p);
+    code->hoisted = hoisted_;
+    code->hoist_srcs = hoist_srcs_;
     return code;
   }
 
@@ -297,6 +356,9 @@ class Builder {
   std::vector<size_t> bails_;
   std::vector<size_t> moved_;      // the layout checks' jumps (bail with 2)
   std::vector<uint8_t> native_;    // per instruction: a leaf the loop gathers itself
+  std::vector<uint8_t> inv_;       // per instruction: loop-invariant (Code::hoisted)
+  bool hoisted_ = false;
+  uint64_t hoist_srcs_ = 0;
   size_t nsrc_ = 0;                // sources with a row-id slot
   int32_t slot_rid(size_t sidx) const { return (int32_t)(16 * P_.ins.size() + 8 * sidx); }
   bool lane_leaf(size_t x) const { return is_leaf(at(x).op) && !native_[x]; }

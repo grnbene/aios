@@ -85,6 +85,10 @@ struct Prog {
   // Native code for the program's non-leaf instructions (sql_vjit_x64.inc), built once with the program; null
   // where none (disabled, another architecture, or an instruction the code does not cover).
   std::shared_ptr<void> jit;
+  // The native code computes its loop-invariant instructions once a chunk when every source in hoist_srcs has
+  // one row id across the chunk (a one-row table's leaves); hoisted says the code has such a preamble.
+  bool hoisted = false;
+  uint64_t hoist_srcs = 0;
 };
 
 // The leaves of a program: the instructions that read a column or a constant, which the interpreter's own
@@ -127,10 +131,11 @@ inline uint32_t leaf_kind_of(const Ins& in) {
   }
 }
 
-std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why);   // sql_vjit_x64.inc; null elsewhere
-// 0: the output lane is computed; 1: bail (an overflow or a non-finite double the interpreter would refuse)
+std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why, bool* hoisted, uint64_t* hoist_srcs);   // sql_vjit_x64.inc; null elsewhere
+// 0: the output lane is computed; 1: bail (an overflow or a non-finite double the interpreter would refuse);
+// 2: a column's layout moved. hoist: 1 where the chunk's row ids allow the invariant preamble (Prog::hoist_srcs).
 int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
-             int64_t* out_i, double* out_f, uint8_t* out_n, const LeafDesc* leaves, const size_t* const* rid);
+             int64_t* out_i, double* out_f, uint8_t* out_n, const LeafDesc* leaves, const size_t* const* rid, uint64_t hoist);
 bool vjit_check_mode();
 
 // Every literal of e in tree order, as it would compile: value text and kind.
@@ -954,9 +959,19 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
   std::string jwhy;
   P->leaf_kind.assign(P->ins.size(), LeafLane);
   for (size_t x = 0; x < P->ins.size(); ++x) if (vjit_leaf(P->ins[x].op)) P->leaf_kind[x] = leaf_kind_of(P->ins[x]);
-  P->jit = vjit_build_for(*P, &jwhy);
+  P->jit = vjit_build_for(*P, &jwhy, &P->hoisted, &P->hoist_srcs);
   if (!P->jit) P->leaf_kind.assign(P->ins.size(), LeafLane);
   if (vx_trace_on() && !P->jit && !jwhy.empty()) vx_trace("vp: no native code: " + jwhy);
+  if (vx_trace_on() && P->jit) {
+    size_t one_row = 0, lanes = 0, natives = 0;
+    for (size_t x = 0; x < P->ins.size(); ++x) {
+      if (!vjit_leaf(P->ins[x].op) || P->ins[x].op == Ins::Konst) continue;
+      if (P->leaf_kind[x] == LeafLane) ++lanes; else ++natives;
+      if (P->ins[x].cs && P->ins[x].cs->size() == 1) ++one_row;
+    }
+    vx_trace("vp: native code: " + std::string(P->hoisted ? "hoisted" : "not hoisted") + ", sources " + std::to_string(P->hoist_srcs) +
+             ", one-row leaves " + std::to_string(one_row) + ", lane leaves " + std::to_string(lanes) + ", gathered leaves " + std::to_string(natives));
+  }
   return P;
 }
 
@@ -1433,6 +1448,7 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
   LeafDesc leaves[256];
   const size_t* rid[64] = {nullptr};
   size_t nsrc = 0;
+  uint64_t hoist = P.hoisted ? 1 : 0;   // cleared where a hoisted source's row id varies over the chunk
   for (size_t x = 0; x < K; ++x) {
     const bool leaf = vjit_leaf(P.ins[x].op) && !native_leaf(x);
     li[x] = leaf && P.ins[x].ty != Ty::F64 ? (const void*)L.i[x].data() : nullptr;
@@ -1469,13 +1485,15 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       std::vector<size_t>& r = L.ridc[in.src];
       r.resize(n);
       for (size_t j = 0; j < n; ++j) r[j] = rowid(j, in.src);
+      if (hoist && (P.hoist_srcs >> in.src) & 1)
+        for (size_t j = 1; j < n; ++j) if (r[j] != r[0]) { hoist = 0; break; }
       rid[in.src] = r.data();
     }
   }
   const size_t o = K - 1;
   L.n[o].assign(n, 0);
   if (P.out().ty != Ty::F64) L.i[o].assign(n, 0); else L.f[o].assign(n, 0);
-  const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data(), leaves, rid);
+  const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data(), leaves, rid, hoist);
   if (rc == 0 && !vjit_check_mode()) return true;
   if (rc == 2) {   // a column laid out differently than the code was built for: the interpreter, the whole chunk
     for (size_t x = 0; x < K; ++x) if (!eval_ins(P, x, rowid, n, L, err)) return false;
