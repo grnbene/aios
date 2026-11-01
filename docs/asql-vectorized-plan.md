@@ -400,8 +400,10 @@ operands are all such are emitted once before the row loop, into their stack slo
 keeps a guarded copy for a chunk whose row ids for those sources are not uniform (eval checks them, Env::hoist
 says which). SIN(c.view_rad) and COS(c.view_rad) over 56,000 rows were a libm call a row each. Same binary,
 AIOS_SQL_VJIT_HOIST=0 against 1 over 100,000 rows: the three plane_world programs 16.8 -> 11.5 ms, SUM(x * SIN(c.a)
-+ y * COS(c.a)) 10.5 -> 5.5 ms. The frame-level gain is within this machine's spread today (medians against 5cab6ef
-557-797 -> 329-367 ms with other work running); its own on/off frame measurement follows when the machine is quiet.
++ y * COS(c.a)) 10.5 -> 5.5 ms. At frame level it changes nothing measurable: same binary, hoist off / on alternating,
+medians 292/298, 280/285, 299/291 ms - the frame's programs spend their time in the per-row gathers and
+operators, not in the invariant calls, so the gain stays with statements whose rows are cheap and whose
+invariants are not (the micro-benchmark above). Kept for those; off with the switch where a comparison needs it.
 The differential check over the frames, the randomized check under three seeds, frame bytes, the four oracle
 suites, the lane / mixed / decimal checks and the edge sets are identical to the build before.
 
