@@ -629,6 +629,30 @@ pays. An edge set for one-to-many star joins (LEFT, NULL keys on both sides, two
 without ORDER BY, an empty selection, a derived table, a procedure called before and after an
 INSERT into the many side) is identical between the new links, the star join without them, and the plain join.
 
+### 2c, first part: the join aggregate's ORDER BY .. LIMIT over its arrays; decoded columns kept
+
+The driver step 2c says a grouping hands typed arrays to ORDER BY .. LIMIT instead of a row per group. For the
+star join aggregate that is now so (StarKeep): where every sort key is one of its aggregates, an integer GROUP BY
+column, or a dictionary GROUP BY column (its collation rank), and there is no HAVING or DISTINCT, star_aggregate
+orders the groups over its arrays - the key aggregates finished once per group, the comparison group_result's
+own (compare_vals_as, NULLs first ascending, ties in group order) - and makes only the first n into rows and
+values. Open orders made all 81k groups (a JoinedRow, a value vector and an eval_expr per key each) to keep 20.
+
+Measured warm, a statement of open orders was then 203M instructions, and much of it was the same work every
+time: three 600k-row columns decoded whole (the SUM's two leaves, a GROUP BY key, the join's parent keys), each
+into a fresh zero-filled vector. A table's column decoded whole (vx::decoded_values / decoded_ints /
+decoded_codes) is now kept between statements, valid while the column's uid, epoch and row count and the table's
+mutation_seq (stamped by every write) are what they were; at most 256 MB is held. Two smaller pieces: the join
+no longer attempts a unique map over a column already known (from the kept one-to-many map at the same version)
+to repeat its keys - ~48M instructions over 600k lines, thrown away - and the expanded rows are written through
+pointers rather than a push_back per id.
+
+Open orders ~64 -> 30-40 ms warm, top customers ~29 -> 9-13 ms (DuckDB: 34 and 11). An ORDER BY .. LIMIT edge
+set over grouped star joins (ties, NULL names first and last, mixed directions, names differing only in case,
+COUNT / SUM / AVG / MIN / MAX keys, ordinals and aliases, OFFSET, LIMIT 0; and the shapes it must refuse: a key
+that is an expression of an aggregate, a key not grouped, HAVING; LEFT joins; a derived table; a procedure called
+before and after an UPDATE that moves an order into the first rows) is identical to the plain join.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
