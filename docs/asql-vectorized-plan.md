@@ -147,6 +147,27 @@ against the build before, the suites, the frame's bytes and alternating frame ti
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 
+### 3a, done: native code for the lane programs (x86-64)
+
+`sql_vjit_x64.inc`. The interpreter ran each instruction of a program as a pass over the chunk's rows and allocated
+that instruction's lanes: K passes and K allocations a chunk. The native code is one loop over the rows: every
+non-leaf instruction's value in a stack slot, the leaves (columns the interpreter's vectorized readers decode,
+constants) read from their lanes, only the output lane written. It keeps the interpreter's rules exactly - the NULL
+rule of each operator, integer overflow and a non-finite double bail out of the chunk and the interpreter runs it
+and reports as before, the libm functions and the casts the interpreter calls are called (not re-derived), -0 and
+NaN handled as the interpreter's comparisons do. Not covered (the program runs interpreted as before): text
+results and operands, tuple IN, exact-decimal arithmetic (`exact_dyadic`), POW / ATAN2, programs past 256
+instructions. `AIOS_SQL_VJIT=0` turns it off.
+
+Correctness: `AIOS_SQL_VJIT_CHECK=1` computes every chunk both ways and compares bit for bit (a mismatch, a bail
+the interpreter would accept, or an answer the interpreter would refuse aborts, naming the operator). Under it the
+four oracle suites, the lane GROUP BY / mixed CASE / DECIMAL tests, the SQLDoom frame and the SQL test set all run
+to the same output as before. Measured: SQLDoom E1M1 medians 549/514/508 -> 485/488/491 ms.
+
+Next in 3: the operators' own loops (the batched join probe, the lane GROUP BY's hash and folds) generated per
+pipeline with the program's code fused in, so a chunk is not written to lanes between them; AArch64 emitter.
+
+
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
 (reusing the Grain JITs' emitters: x86-64 and AArch64) and run in place of the operators, with the same answers or

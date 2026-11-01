@@ -8286,6 +8286,24 @@ static bool row_in_set_by_tuple(const RowInSet& set, size_t* ncols);
 static bool row_in_set_has(const RowInSet& set, const double* key, size_t n);
 
 #include "sql_vprog.inc"
+#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+#include "sql_vjit_x64.inc"
+namespace vp {
+std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why) { return vjit::build(P, why); }
+int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
+             int64_t* out_i, double* out_f, uint8_t* out_n) {
+  vjit::Env env{n, lane_i, lane_f, lane_n, out_i, out_f, out_n};
+  return static_cast<const vjit::Code*>(code)->fn(&env);
+}
+bool vjit_check_mode() { return vjit::check_mode(); }
+}  // namespace vp
+#else
+namespace vp {
+std::shared_ptr<void> vjit_build_for(const Prog&, std::string* why) { if (why) *why = "no native code on this architecture"; return nullptr; }
+int vjit_run(const void*, size_t, const void* const*, const void* const*, const void* const*, int64_t*, double*, uint8_t*) { return 1; }
+bool vjit_check_mode() { return false; }
+}  // namespace vp
+#endif
 #include "sql_colbatch.inc"
 
 bool parallel_safe_expr(const SqlExpr* e) {

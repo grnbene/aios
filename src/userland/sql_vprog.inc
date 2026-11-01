@@ -79,7 +79,22 @@ struct Prog {
   bool has_fn = false;
   uint64_t fn_gen = 0;
   const Ins& out() const { return ins.back(); }
+  // Native code for the program's non-leaf instructions (sql_vjit_x64.inc), built once with the program; null
+  // where none (disabled, another architecture, or an instruction the code does not cover).
+  std::shared_ptr<void> jit;
 };
+
+// The leaves of a program: the instructions that read a column or a constant, which the interpreter's own
+// vectorized readers decode into lanes before native code computes the rest.
+inline bool vjit_leaf(Ins::Op op) {
+  return op == Ins::Konst || op == Ins::ColI || op == Ins::ColF || op == Ins::CodeI || op == Ins::CodeF || op == Ins::ColNull ||
+         op == Ins::StrIn || op == Ins::ColS;
+}
+std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why);   // sql_vjit_x64.inc; null elsewhere
+// 0: the output lane is computed; 1: bail (an overflow or a non-finite double the interpreter would refuse)
+int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
+             int64_t* out_i, double* out_f, uint8_t* out_n);
+bool vjit_check_mode();
 
 // Every literal of e in tree order, as it would compile: value text and kind.
 inline void literal_sig(const SqlExpr* e, std::string* out, int depth = 0) {
@@ -825,6 +840,9 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
     if (retry) *retry = c.retry;
     return nullptr;
   }
+  std::string jwhy;
+  P->jit = vjit_build_for(*P, &jwhy);
+  if (vx_trace_on() && !P->jit && !jwhy.empty()) vx_trace("vp: no native code: " + jwhy);
   return P;
 }
 
@@ -868,10 +886,8 @@ struct Lanes {
 // a value the interpreter would refuse comes up (an integer out of range), and the caller takes the interpreter's
 // path.
 template <typename RowId>
-inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* err) {
-  const size_t K = P.ins.size();
-  L.i.resize(K); L.f.resize(K); L.n.resize(K);
-  for (size_t x = 0; x < K; ++x) {
+inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L, std::string* err) {
+  {
     const Ins& in = P.ins[x];
     std::vector<int64_t>& vi = L.i[x];
     std::vector<double>& vf = L.f[x];
@@ -1242,6 +1258,60 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
       }
     }
   }
+  return true;
+}
+
+// Evaluates P over n rows, rowid(j, src) being row j's row in source src (or kNullRow). False with *err set when
+// a value the interpreter would refuse comes up (an integer out of range), and the caller takes the interpreter's
+// path. With native code (P.jit): the leaves through their readers, the rest as one native loop writing the
+// output lane; a bail runs the interpreter over the rest, which reports as it always has.
+template <typename RowId>
+inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* err) {
+  const size_t K = P.ins.size();
+  L.i.resize(K); L.f.resize(K); L.n.resize(K);
+  if (!P.jit) {
+    for (size_t x = 0; x < K; ++x) if (!eval_ins(P, x, rowid, n, L, err)) return false;
+    return true;
+  }
+  for (size_t x = 0; x < K; ++x) if (vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) return false;
+  const void* li[256]; const void* lf[256]; const void* ln[256];
+  for (size_t x = 0; x < K; ++x) {
+    const bool leaf = vjit_leaf(P.ins[x].op);
+    li[x] = leaf && P.ins[x].ty != Ty::F64 ? (const void*)L.i[x].data() : nullptr;
+    lf[x] = leaf && P.ins[x].ty == Ty::F64 ? (const void*)L.f[x].data() : nullptr;
+    ln[x] = leaf ? (const void*)L.n[x].data() : nullptr;
+  }
+  const size_t o = K - 1;
+  L.n[o].assign(n, 0);
+  if (P.out().ty != Ty::F64) L.i[o].assign(n, 0); else L.f[o].assign(n, 0);
+  const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data());
+  if (rc == 0 && !vjit_check_mode()) return true;
+  if (rc == 0) {
+    // check mode: the interpreter's answer must be these bytes exactly
+    std::vector<int64_t> ji = L.i[o]; std::vector<double> jf = L.f[o]; std::vector<uint8_t> jn = L.n[o];
+    for (size_t x = 0; x < K; ++x) if (!vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) {
+      std::fprintf(stderr, "[vjit] check: native code answered where the interpreter refuses: %s\n", err->c_str());
+      std::abort();
+    }
+    const bool same_n = std::memcmp(jn.data(), L.n[o].data(), n) == 0;
+    bool same_v = true;
+    for (size_t j = 0; j < n && same_v; ++j) {
+      if (L.n[o][j]) continue;   // a NULL's value bytes are not compared
+      same_v = P.out().ty != Ty::F64 ? ji[j] == L.i[o][j] : std::memcmp(&jf[j], &L.f[o][j], 8) == 0;
+    }
+    if (!same_n || !same_v) {
+      size_t j = 0;
+      for (; j < n; ++j) if (jn[j] != L.n[o][j] || (!L.n[o][j] && (P.out().ty != Ty::F64 ? ji[j] != L.i[o][j] : std::memcmp(&jf[j], &L.f[o][j], 8) != 0))) break;
+      std::fprintf(stderr, "[vjit] check: mismatch at row %zu of %zu: native null=%d value=%lld/%.17g, interpreter null=%d value=%lld/%.17g (out op %d)\n",
+                   j, n, (int)jn[j], (long long)(j < ji.size() ? ji[j] : 0), j < jf.size() ? jf[j] : 0.0, (int)L.n[o][j],
+                   (long long)(j < L.i[o].size() ? L.i[o][j] : 0), j < L.f[o].size() ? L.f[o][j] : 0.0, (int)P.out().op);
+      std::abort();
+    }
+    return true;
+  }
+  // bail: the interpreter decides the chunk (and sets *err where it refuses)
+  for (size_t x = 0; x < K; ++x) if (!vjit_leaf(P.ins[x].op) && !eval_ins(P, x, rowid, n, L, err)) return false;
+  if (vjit_check_mode()) { std::fprintf(stderr, "[vjit] check: native code bailed where the interpreter accepts (out op %d)\n", (int)P.out().op); std::abort(); }
   return true;
 }
 
