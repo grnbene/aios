@@ -46738,10 +46738,12 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       struct NumKey { const vp::Column* lane = nullptr; const ColumnStore* cs = nullptr; size_t src = 0; bool ints = false; };
       std::vector<NumKey> numkeys(prep_jkeys.size());
       static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
+      // (a direct code join probes its key by dictionary code, below; its other keys as numbers)
       bool batch_ok = batch_join_on && best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx && !link_to_parent && !link_to_kids &&
-                      !direct_code_join && !best_wide && !xk_join;
+                      (!best_wide || direct_code_join) && !xk_join;
       for (size_t ki = 0; batch_ok && ki < prep_jkeys.size(); ++ki) {
         NumKey& nk = numkeys[ki];
+        if (direct_code_join && (int)ki == best_ki) continue;
         if (ki < vp_key_ok.size() && vp_key_ok[ki] && vp_keys[ki].ty != vp::Ty::Str && !vp_keys[ki].uns) {
           nk.lane = &vp_keys[ki];
         } else {
@@ -46812,7 +46814,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       };
       std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
       bool comp_ok = false;
-      if (batch_ok && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
+      if (batch_ok && !direct_code_join && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
         const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
         if (bidx->no_numeric_prefix.empty()) {
           comp.reserve(bidx->by_number.size() * 2);
@@ -46888,8 +46890,43 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad_row(o, bi, ctx); return; }
         bool matched = false;
         double key = 0;
-        if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
-          const auto* idx = prep_jkeys[(size_t)best_ki].idx.get();
+        const auto* idx = prep_jkeys[(size_t)best_ki].idx.get();
+        if (direct_code_join) {
+          // the base row's dictionary code mapped to the joined column's (star_code_map): that code's rows
+          const size_t base_ri = dc_base_src < base.parts.size() ? base.parts[dc_base_src] : kNullRow;
+          if (base_ri != kNullRow && base_ri < dc_base_cs->size() && !dc_base_cs->is_null(base_ri)) {
+            const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
+            if (ca < dc_code_map->p2c.size()) {
+              const int32_t cb = dc_code_map->p2c[ca];
+              if (cb >= 0 && (size_t)cb < idx->by_code.size()) {
+                const std::vector<uint32_t>& cands = idx->by_code[(size_t)cb];
+                for (uint32_t mr : cands) {
+                  if (mr >= js.table->row_count()) continue;
+                  bool other_ok = true;
+                  for (size_t ki = 0; ki < prep_jkeys.size() && other_ok; ++ki) {
+                    if ((int)ki == best_ki) continue;
+                    double w = 0;
+                    if (!numkey(numkeys[ki], bi, base, &w)) { other_ok = false; break; }
+                    const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+                    if (kcs.is_null(mr) || vx::typed_value(kcs, mr) != w) other_ok = false;
+                  }
+                  if (!other_ok) continue;
+                  JoinedRow cand;
+                  const bool made = cand_checks || sink;
+                  if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
+                  if (has_extra_join && !on_true(ctx)) continue;
+                  if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
+                  matched = true;
+                  if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
+                  if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) continue;
+                  bool keep = true;
+                  for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) { keep = false; break; }
+                  if (keep) out_cand(o, bi, mr, made ? &cand : nullptr);
+                }
+              }
+            }
+          }
+        } else if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
           auto take = [&](size_t mr) {
             if (mr >= js.table->row_count()) return;
             for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {

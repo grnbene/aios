@@ -350,8 +350,12 @@ no wide values, or dictionary codes mapped by their collation keys), the key's c
 check. And a result table's text column (plane_tex's texture name) could not be a star key because a result
 table's "text" may hold numbers the interpreter compares as numbers; one whose dictionary holds no entry that
 reads as a number (`text_dict_plain`) is compared as text, so it can - `fl.name = p.tex_name` is a direct code
-join now (the per-row probe still; the batched probe takes it next). ft 8.0 -> 5.3 ms, wt 7 -> 5.2 ms a frame;
-SQLDoom E1M1 medians 475/477/484 -> 277/268/291 ms against the build before today's commits (5cab6ef).
+join now. ft 8.0 -> 5.3 ms, wt 7 -> 5.2 ms a frame; SQLDoom E1M1 medians 475/477/484 -> 277/268/291 ms against
+the build before today's commits (5cab6ef).
+
+The batched probe then took direct code joins (its best key probed by dictionary code through the star code
+map, the other keys as numbers): fl's per-row probe, a vector of candidates per base row, 9.4 -> 1.4 ms a
+frame; medians 456/452/468 -> 274/268/298 ms.
 
 Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
 casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
