@@ -32391,9 +32391,15 @@ void find_rep_rows(const ColumnStore& cs, size_t from, size_t to, RepRows* rr) {
 // The codes a column's rows carry: its dictionary's, or - a narrow
 // frame-of-reference integer column (a status, a type, a flag) - every value
 // its bit width can hold above the base. 0: neither.
+// A date or datetime column's codes (days or seconds past its base) are a frame of reference too: up to 65,536 of
+// them (180 years of days) read per code as a narrow FOR column's are.
+inline bool temporal_codes(const ColumnStore& cs) {
+  return (cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds) && cs.bit_width_ <= 16;
+}
 size_t code_space(const ColumnStore& cs) {
   if (dict_coded(cs)) return dict_size(cs);
   if (cs.encoding == ColumnEncoding::FOR && cs.bit_width_ <= 10) return (size_t)1 << cs.bit_width_;
+  if (temporal_codes(cs)) return (size_t)1 << cs.bit_width_;
   return 0;
 }
 
@@ -36551,7 +36557,10 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
   // SUM(CASE ...) report over 400k orders.
   const bool for_codes = !s.bare_column && !t.inferred_types && cs.encoding == ColumnEncoding::FOR &&
                          cs.bit_width_ <= 10 && cs.size() >= ((size_t)8 << cs.bit_width_);
-  if ((dict_coded(cs) && worth_per_code(cs)) || for_codes) {
+  // A date column, bare (GROUP BY orddate) or in an expression (YEAR(orddate), MONTH(orddate)): its value per
+  // day code, 730 evaluations for 200k orders instead of one per row.
+  const bool day_codes = !t.inferred_types && temporal_codes(cs) && cs.size() >= ((size_t)8 << cs.bit_width_);
+  if ((dict_coded(cs) && worth_per_code(cs)) || for_codes || day_codes) {
     // A bare column's value per code is that code's dictionary entry read as
     // the column's type: the same on every statement until the dictionary
     // changes. Worked out once per column, not per statement - a one-row
@@ -38299,7 +38308,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         else decode_for(a, plans[ai], cs, start, end, cols[ai]);
         // SUM/AVG of a typed DOUBLE column by group: acc_row's column branch
         // without the call and its switches per row.
-        if (gs && !a.prog && (a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && a.src.kind == Source::TypedCol &&
+        if (gs && !a.prog && !a.mask && (a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && a.src.kind == Source::TypedCol &&
             a.col_type != SqlDataType::Decimal && !plans[ai].need_ints) {
           AggArrays& A = totals[ai];
           const double* nums = cols[ai].nums.data();

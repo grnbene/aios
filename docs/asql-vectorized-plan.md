@@ -463,10 +463,25 @@ SUM(CASE WHEN cond THEN col ELSE 0 END), the ERP report's staple: the single-tab
 (select_rows, as a WHERE would; a mask per table row), with ELSE 0 counting the other rows as zeros so a sum of
 none is 0, not NULL, and prints at the column's scale as the row path's does (the edge set caught "0" for
 "0.00" on a DECIMAL column first). The same mask serves the grouped statement (GROUP BY st). ELSE anything else,
-AVG and COUNT keep their paths. 34 -> 3.7 ms (DuckDB 1.9). A SUM(CASE) edge set (DECIMAL, INT and DOUBLE columns
+AVG and COUNT keep their paths. 34 -> 3.7 ms (DuckDB 1.9). The grouped SUM of a DOUBLE column has a kernel
+of its own beside the per-row accumulator; it stood aside for a masked aggregate only after the edge set,
+run again after the next change, came back with the unmasked sum - the single-table path's choices shift with
+what is warm, so an edge set is rerun with every step, not once. A SUM(CASE) edge set (DECIMAL, INT and DOUBLE columns
 with NULLs, ELSE 0 / ELSE NULL / no ELSE, no row matching, compound and text and date conditions, GROUP BY, a WHERE
 beside it, ELSE 1 and ELSE col and AVG and COUNT left alone, 0.0 and 0e0) is identical to the build before, as are
 frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
+
+GROUP BY YEAR(orddate), MONTH(orddate) (78 ms; DuckDB 3.3) and GROUP BY orddate (31 ms) went row by row: a date
+column held as days past a base (TemporalDays, TemporalSeconds) was neither a typed number nor a dictionary to
+the single-table path, so its keys, and every expression of it, were evaluated per row. Its codes are a frame
+of reference like a narrow FOR column's: up to 65,536 of them (180 years of days) now read per code
+(code_space, make_source), the value per day worked out once - 730 evaluations of YEAR() for 200k orders - and
+the bare column itself a per-code source, which also gives MIN / MAX / COUNT(DISTINCT) of a date their per-code
+path. Monthly totals 78 -> 3.0 ms (DuckDB 3.3), GROUP BY orddate 31 -> 1.2 ms. A date-key edge set (GROUP BY a date, by
+YEAR / MONTH / QUARTER / DAYOFWEEK / DATE_FORMAT / DATEDIFF of it, by DATE() and HOUR() of a datetime, NULL dates,
+MIN / MAX / COUNT(DISTINCT) of dates and datetimes, a WHERE range beside the GROUP BY, GROUP BY an alias) is
+identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge
+sets.
 
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
