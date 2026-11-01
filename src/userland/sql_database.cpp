@@ -37702,6 +37702,17 @@ void gather_for(const Agg& a, const AggPlan& p, const ColumnStore& cs, const uin
     np_eval(*a.prog, 0, rows, n, c.scratch, c.nums.data(), c.nul.data());
     return;
   }
+  // Rows that run consecutively (a fact table's every row behind a star join) decode as a block, as decode_for
+  // does: a code or integer read one row at a time costs ~370 instructions through read_code.
+  bool run = n >= 64 && rows[n - 1] - rows[0] == n - 1;
+  for (size_t j = 1; run && j < n; ++j) if (rows[j] != rows[j - 1] + 1) run = false;
+  if (run) {
+    const size_t start = rows[0], end = start + n;
+    if (p.need_codes) { c.codes.resize(n); decode_codes(cs, start, end, c.codes.data()); }
+    if (p.need_nums) { c.nums.resize(n); typed_values(cs, start, end, c.nums.data()); }
+    if (p.need_ints) { c.ints.resize(n); typed_ints(cs, start, end, c.ints.data()); }
+    return;
+  }
   if (p.need_codes) { c.codes.resize(n); for (size_t j = 0; j < n; ++j) c.codes[j] = code_at(cs, rows[j]); }
   if (p.need_nums) { c.nums.resize(n); for (size_t j = 0; j < n; ++j) c.nums[j] = typed_value_at(cs, rows[j]); }
   if (p.need_ints) {
@@ -43164,6 +43175,9 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     StarKey ck, pk;
     bool left = false;
     Map map;
+    bool parent_nulls = true;                // the parent key column has NULLs (checked per row only then)
+    std::vector<uint32_t> whole_codes;       // the parent key column decoded whole (by_code maps), where worth it
+    std::vector<int64_t> whole_ints;         // ... its integers (dense / hashed maps)
   };
   auto select_of = [&](size_t src, const std::vector<const SqlExpr*>& conds, std::vector<uint32_t>* ids) {
     const SqlTable& t = *sources[src].table;
@@ -43256,20 +43270,23 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     }
     return true;
   };
+  // The parent key column decoded whole for a link the rows cover much of (every order line's product id), so
+  // the lookup reads an array and not read_code per row (whole_codes / whole_ints, filled before the row loop).
   auto partner = [&](const Link& L, uint32_t pr) -> uint32_t {
     if (pr == UINT32_MAX) return UINT32_MAX;
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
-    if (pcs.is_null(pr)) return UINT32_MAX;
+    if (L.parent_nulls && pcs.is_null(pr)) return UINT32_MAX;
     const Map& M = L.map;
     if (M.by_code) {
-      const uint32_t code = vx::code_at(pcs, pr);
+      const uint32_t code = L.whole_codes.empty() ? vx::code_at(pcs, pr) : L.whole_codes[pr];
       return code < M.of_code.size() && M.of_code[code] >= 0 ? (uint32_t)M.of_code[code] : UINT32_MAX;
     }
+    const int64_t key = L.whole_ints.empty() ? vx::typed_int(pcs, pr) : L.whole_ints[pr];
     if (M.by_dense) {
-      const uint64_t k = (uint64_t)(vx::typed_int(pcs, pr) - M.lo);
+      const uint64_t k = (uint64_t)(key - M.lo);
       return k < M.dense.size() ? M.dense[(size_t)k] : UINT32_MAX;
     }
-    auto it = M.of_key.find((uint64_t)vx::typed_int(pcs, pr));
+    auto it = M.of_key.find((uint64_t)key);
     return it != M.of_key.end() ? it->second : UINT32_MAX;
   };
 
@@ -43425,6 +43442,13 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   // copy per table). Refused only on KILL, which the scan notices.
   sql_reserve_query_memory(nr * ns * (rerooted ? 12 : 4));
   for (auto& v : *P) v.reserve(nr);
+  for (Link& L : links) {
+    const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
+    L.parent_nulls = vx::has_nulls(pcs);
+    if (pcs.size() > nr * 8 || pcs.size() != sources[L.parent_src].table->row_count()) continue;
+    if (L.map.by_code) { L.whole_codes.resize(pcs.size()); vx::decode_codes(pcs, 0, pcs.size(), L.whole_codes.data()); }
+    else if (vx::typed_integer(pcs)) { L.whole_ints.resize(pcs.size()); vx::typed_ints(pcs, 0, pcs.size(), L.whole_ints.data()); }
+  }
   uint32_t parts[8];
   for (size_t bi = 0; bi < nr; ++bi) {
     parts[root] = rp[bi];
@@ -43646,6 +43670,19 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     std::unordered_map<uint64_t, uint32_t> id_to_group;
     std::unordered_map<std::string, uint32_t> tuple_to_group;
     int64_t null_group = -1;
+    // A key column the rows cover much of (the fact table's own column; a dimension's behind many rows) is decoded
+    // whole once - its codes, or its integers - instead of a read per row through read_code (~370 instructions
+    // each: the keys of a 600k-row star aggregate were 23 ms, most of the statement).
+    std::vector<std::vector<uint32_t>> kcodes(ng);
+    std::vector<std::vector<int64_t>> kints(ng);
+    for (size_t k = 0; k < ng; ++k) {
+      const ColumnStore& cs = sources[keys[k].src].table->col_data[keys[k].col];
+      if (cs.size() > N * 8) continue;
+      if (!keys[k].canon.empty()) { kcodes[k].resize(cs.size()); vx::decode_codes(cs, 0, cs.size(), kcodes[k].data()); }
+      else if (vx::typed_integer(cs)) { kints[k].resize(cs.size()); vx::typed_ints(cs, 0, cs.size(), kints[k].data()); }
+    }
+    auto code_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> uint32_t { return kcodes[k].empty() ? vx::code_at(cs, r) : kcodes[k][r]; };
+    auto int_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> int64_t { return kints[k].empty() ? vx::typed_int(cs, r) : kints[k][r]; };
     // One dictionary key: its canonical id indexes the group directly.
     if (ng == 1 && !keys[0].canon.empty()) {
       const Key& K = keys[0];
@@ -43658,7 +43695,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         const uint32_t r = pr[i];
         size_t id;
         if (r == UINT32_MAX || (hn && cs.is_null(r))) id = nd;
-        else { const uint32_t code = vx::code_at(cs, r); id = code < nd ? K.canon[code] : nd; }
+        else { const uint32_t code = code_of(0, cs, r); id = code < nd ? K.canon[code] : nd; }
         int32_t g = slot[id];
         if (g < 0) { g = slot[id] = (int32_t)first.size(); first.push_back((uint32_t)i); }
         gid[i] = (uint32_t)g;
@@ -43668,12 +43705,28 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
                  return true;
                }()) {
       // One integer key, or two dictionary keys packed into one 64-bit id:
-      // an open-addressing table of ids, no string per row.
+      // an open-addressing table of ids, no string per row. It starts small and doubles as groups appear: sized
+      // to the rows (2M slots for 600k rows and 480 groups) it missed the cache on every probe.
       size_t cap = 1024;
-      while (cap < N * 2 && cap < ((size_t)1 << 30)) cap <<= 1;
+      unsigned shift = 54;   // the product's top log2(cap) bits: well mixed, where its middle bits clustered a small table
       std::vector<uint64_t> tk(cap);
       std::vector<int32_t> tg(cap, -1);
-      const size_t mask = cap - 1;
+      size_t mask = cap - 1;
+      auto hash_of = [&](uint64_t id) { return (size_t)((id * 0x9E3779B97F4A7C15ull) >> shift) & mask; };
+      auto grow = [&]() {
+        const size_t ncap = cap * 2;
+        std::vector<uint64_t> ntk(ncap);
+        std::vector<int32_t> ntg(ncap, -1);
+        const size_t nmask = ncap - 1;
+        const unsigned nshift = shift - 1;
+        for (size_t s0 = 0; s0 < cap; ++s0) {
+          if (tg[s0] < 0) continue;
+          size_t h = (size_t)((tk[s0] * 0x9E3779B97F4A7C15ull) >> nshift) & nmask;
+          while (ntg[h] >= 0) h = (h + 1) & nmask;
+          ntk[h] = tk[s0]; ntg[h] = tg[s0];
+        }
+        tk.swap(ntk); tg.swap(ntg); cap = ncap; mask = nmask; shift = nshift;
+      };
       const ColumnStore* kcs[2] = {nullptr, nullptr};
       for (size_t k = 0; k < ng; ++k) kcs[k] = &sources[keys[k].src].table->col_data[keys[k].col];
       for (size_t i = 0; i < N; ++i) {
@@ -43684,8 +43737,8 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           const uint32_t r = P[K.src][i];
           uint64_t part;
           if (r == UINT32_MAX || kcs[k]->is_null(r)) { part = 0xFFFFFFFFull; nulls_seen = true; }
-          else if (!K.canon.empty()) { const uint32_t code = vx::code_at(*kcs[k], r); part = code < K.canon.size() ? K.canon[code] : 0xFFFFFFFEull; }
-          else part = (uint64_t)vx::typed_int(*kcs[k], r);
+          else if (!K.canon.empty()) { const uint32_t code = code_of(k, *kcs[k], r); part = code < K.canon.size() ? K.canon[code] : 0xFFFFFFFEull; }
+          else part = (uint64_t)int_of(k, *kcs[k], r);
           id = ng == 1 ? part : (k == 0 ? part << 32 : id | (part & 0xFFFFFFFFull));
         }
         // An integer key's NULL is its own group, apart from any value.
@@ -43694,9 +43747,13 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           gid[i] = (uint32_t)null_group;
           continue;
         }
-        size_t h = (size_t)((id * 0x9E3779B97F4A7C15ull) >> 20) & mask;
+        size_t h = hash_of(id);
         for (;;) {
-          if (tg[h] < 0) { tk[h] = id; tg[h] = (int32_t)first.size(); first.push_back((uint32_t)i); break; }
+          if (tg[h] < 0) {
+            tk[h] = id; tg[h] = (int32_t)first.size(); first.push_back((uint32_t)i);
+            if (first.size() * 2 > cap) { grow(); h = hash_of(id); while (tk[h] != id || tg[h] < 0) h = (h + 1) & mask; }
+            break;
+          }
           if (tk[h] == id) break;
           h = (h + 1) & mask;
         }
@@ -43714,10 +43771,10 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         nul[k] = 0;
         if (r == UINT32_MAX || cs.is_null(r)) { ids[k] = 0; nul[k] = 1; continue; }
         if (!K.canon.empty()) {
-          const uint32_t code = vx::code_at(cs, r);
+          const uint32_t code = code_of(k, cs, r);
           ids[k] = code < K.canon.size() ? K.canon[code] : code;
         } else {
-          ids[k] = (uint64_t)vx::typed_int(cs, r);
+          ids[k] = (uint64_t)int_of(k, cs, r);
         }
       }
       uint32_t g;
@@ -43763,6 +43820,19 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         gs_b.push_back(gid[i]);
       }
       vx::gather_for(a.agg, a.plan, cs, rows_b.data(), rows_b.size(), cols);
+      // SUM / AVG of a typed INT column with no NULL: the integers added into their groups without acc_row's
+      // switches per row (what acc_row does on that path: isum, num and cnt)
+      if (!a.nulls && !a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
+          a.agg.src.kind == vx::Source::TypedCol && a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct) {
+        const int64_t* iv = cols.ints.data();
+        for (size_t j = 0; j < rows_b.size(); ++j) {
+          const uint32_t g = gs_b[j];
+          a.arr.isum[g] += (AIOS_INT128)iv[j];
+          a.arr.num[g] += (double)iv[j];
+          a.arr.cnt[g]++;
+        }
+        continue;
+      }
       for (size_t j = 0; j < rows_b.size(); ++j)
         vx::acc_row(a.agg, a.plan, a.arr, gs_b[j], rows_b[j], j, cols, cs, a.nulls, rd);
     }
@@ -44429,7 +44499,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       // 20k names behind 256k joined rows): a code or integer read one row at a time (read_code) cost ~370
       // instructions each, most of the grouping.
       const size_t total = cs.size();
-      const bool whole = total <= rows.size() * 16 + 65536;
+      const bool whole = total <= rows.size() * 8;   // not for a few rows out of a big column (a frame's 100-row groups)
       std::vector<uint32_t> all_codes;
       std::vector<int64_t> all_ints;
       if (whole && classes) { all_codes.resize(total); vx::decode_codes(cs, 0, total, all_codes.data()); }

@@ -518,6 +518,19 @@ negatives, NULLs, a join of two derived tables, GROUP BY the decimal, CAST to CH
 otherwise identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the
 earlier edge sets.
 
+The star-shaped grouped join (line sales by location: 600k order lines to their products, GROUP BY category,
+location): 73 ms against DuckDB's 11, in four pieces the trace names - the base selection (14), the unique-key
+lookup of every line's product (12-17), the group keys (23) and the sum (15). Three were a read per row through
+read_code (a code or integer out of a bit-packed column, ~370 instructions each): the lookup now decodes the
+line's product-id column whole once (star_join: Link::whole_ints / whole_codes where the rows cover an eighth of
+the column), the star aggregate's key columns likewise (code_of / int_of), and gather_for decodes a run of
+consecutive rows as a block. The group-id table was sized to the rows (2M slots for 480 groups) and missed the
+cache on every probe; it starts at 1,024 slots and doubles as groups appear - and hashes by the product's top
+bits, since its middle bits (>> 20, fine spread over 2M slots) clustered a small table into 87 ms of probing.
+An integer SUM with no NULL adds straight into its group. Keys 23 -> 11 ms, aggregates 15 -> 7, the lookup
+unchanged at ~17 (the row loop's own work now); 73 -> 61 ms. The base selection's 14 ms (base_rows over an
+unfiltered fact table) is the next piece of this shape.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
