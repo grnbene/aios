@@ -44,10 +44,19 @@ std::string col(bool joined) {
   if (k == 6) return "o.z";
   return std::string("t.") + cols[k];
 }
+// text: a dictionary-coded column or a literal, compared and passed through CASE / COALESCE / NULLIF
+std::string text() {
+  static const char* lits[] = {"'a'", "'B'", "'ab'", "'A '", "''", "'z'", "NULL"};
+  return rnd(2) ? "t.s" : lits[rnd(7)];
+}
+std::string text_pred() {
+  static const char* c[] = {"=", "<>", "<", "<=", ">", ">="};
+  return "(" + text() + " " + c[rnd(6)] + " " + text() + ")";
+}
 std::string gen(int depth, bool joined) {
   if (depth <= 0 || rnd(4) == 0) return rnd(3) ? col(joined) : lit();
   auto g = [&] { return gen(depth - 1, joined); };
-  switch (rnd(26)) {
+  switch (rnd(28)) {
     case 0: return "(" + g() + " + " + g() + ")";
     case 1: return "(" + g() + " - " + g() + ")";
     case 2: return "(" + g() + " * " + g() + ")";
@@ -73,6 +82,8 @@ std::string gen(int depth, bool joined) {
     case 22: return "(" + g() + " >> " + g() + ")";
     case 23: return "(~" + g() + ")";
     case 24: return "IF(" + g() + ", " + g() + ", " + g() + ")";
+    case 25: return rnd(2) ? text_pred() : "(" + text() + (rnd(2) ? " IS NULL)" : " IS NOT NULL)");
+    case 26: return "POW(" + g() + ", 2)";
     default: return "(" + g() + " + 1)";
   }
 }
@@ -98,7 +109,7 @@ int main() {
   };
   run("CREATE DATABASE IF NOT EXISTS vj");
   run("USE vj");
-  run("CREATE TABLE t (id INT PRIMARY KEY, a BIGINT, b BIGINT, c INT, d DOUBLE, e DOUBLE, u BIGINT UNSIGNED)");
+  run("CREATE TABLE t (id INT PRIMARY KEY, a BIGINT, b BIGINT, c INT, d DOUBLE, e DOUBLE, u BIGINT UNSIGNED, s VARCHAR(4))");
   run("CREATE TABLE one (z INT)");
   run("INSERT INTO one VALUES (3)");
   // random values with the extremes and NULLs: a wide, b small, c tiny, d any double, e near-integers, u unsigned
@@ -115,7 +126,9 @@ int main() {
     std::snprintf(buf, sizeof buf, "%.17g", (double)((long long)rnd(2001) - 1000) + (rnd(3) == 0 ? 0.5 : rnd(3) == 0 ? 0.4999999999 : 0.0));
     std::string e = maybe_null(buf);
     std::string u = maybe_null(rnd(10) == 0 ? "18446744073709551615" : std::to_string(rnd(100000)));
-    batch += (batch.empty() ? "" : ",") + std::string("(") + std::to_string(i) + "," + a + "," + b + "," + c + "," + d + "," + e + "," + u + ")";
+    static const char* texts[] = {"'a'", "'A'", "'b'", "'ab'", "'B '", "''", "'zz'", "'Ab'"};
+    std::string sv = maybe_null(texts[rnd(8)]);
+    batch += (batch.empty() ? "" : ",") + std::string("(") + std::to_string(i) + "," + a + "," + b + "," + c + "," + d + "," + e + "," + u + "," + sv + ")";
     if (batch.size() > 60000 || i + 1 == rows) { run("INSERT INTO t VALUES " + batch); batch.clear(); }
   }
   const uint64_t before = sqle::vjit_native_runs();
@@ -126,8 +139,11 @@ int main() {
     const std::string e = gen(3 + (int)rnd(3), joined);
     const std::string from = joined ? " FROM t CROSS JOIN one o" : " FROM t";
     std::string sql;
-    switch (rnd(4)) {
+    switch (rnd(5)) {
       case 0: sql = "SELECT " + e + " AS v" + from + " ORDER BY t.id LIMIT 500"; break;
+      case 4: sql = "SELECT " + (rnd(3) == 0 ? "COALESCE(" + text() + ", " + text() + ")" : rnd(2) ? "NULLIF(" + text() + ", " + text() + ")"
+                               : "CASE WHEN " + e + " THEN " + text() + " WHEN " + text_pred() + " THEN " + text() + " ELSE " + text() + " END") +
+                    " AS v" + from + " ORDER BY t.id LIMIT 500"; break;
       case 1: sql = "SELECT COUNT(*), SUM(" + e + "), MIN(" + e + "), MAX(" + e + ")" + from; break;
       case 2: sql = "SELECT t.id" + from + " WHERE " + e + " ORDER BY t.id LIMIT 500"; break;
       default: sql = "SELECT t.c, COUNT(*), MAX(" + e + ")" + from + " GROUP BY t.c"; break;

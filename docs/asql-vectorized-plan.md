@@ -155,14 +155,20 @@ non-leaf instruction's value in a stack slot, the leaves (columns the interprete
 constants) read from their lanes, only the output lane written. It keeps the interpreter's rules exactly - the NULL
 rule of each operator, integer overflow and a non-finite double bail out of the chunk and the interpreter runs it
 and reports as before, the libm functions and the casts the interpreter calls are called (not re-derived), -0 and
-NaN handled as the interpreter's comparisons do. Not covered (the program runs interpreted as before): text
-results and operands, tuple IN, exact-decimal arithmetic (`exact_dyadic`), POW / ATAN2, programs past 256
-instructions. `AIOS_SQL_VJIT=0` turns it off.
+NaN handled as the interpreter's comparisons do. Text (a reference into a dictionary or the literals, an I64 lane) is compared through the
+interpreter's own comparison and passed through CASE / COALESCE / NULLIF; exact-decimal arithmetic keeps the
+interpreter's exactness test (a helper); POW / ATAN2 call libm as the interpreter does. Not covered (the program
+runs interpreted as before): tuple IN, text in arithmetic or as a truth value, programs past 256 instructions.
+`AIOS_SQL_VJIT=0` turns it off. No AArch64 emitter yet: this machine has no AArch64 toolchain or emulator to test
+one on, and an emitter that cannot be run against the interpreter is not shipped.
 
 Correctness: `AIOS_SQL_VJIT_CHECK=1` computes every chunk both ways and compares bit for bit (a mismatch, a bail
 the interpreter would accept, or an answer the interpreter would refuse aborts, naming the operator). Under it the
 four oracle suites, the lane GROUP BY / mixed CASE / DECIMAL tests, the SQLDoom frame and the SQL test set all run
-to the same output as before. Measured: SQLDoom E1M1 medians 549/514/508 -> 485/488/491 ms.
+to the same output as before, and `asql.vjit.check` (tools/asql-vjit-check.cpp) runs 600 random expression
+trees a day over random and extreme data, text included, under the same check. Measured: SQLDoom E1M1 medians
+549/514/508 -> 485/488/491 ms at first, 497/495/504 -> 483/480/479 with the wider coverage; of the frame's
+programs only 12 leaf-only ones (nothing to compute) and 3 tuple-IN ones still interpret.
 
 Next in 3: the operators' own loops (the batched join probe, the lane GROUP BY's hash and folds) generated per
 pipeline with the program's code fused in, so a chunk is not written to lanes between them; AArch64 emitter.

@@ -56,6 +56,19 @@ inline int64_t vjit_bits_of_double(double d) {
   return d < 0 ? (int64_t)d : (int64_t)(uint64_t)d;
 }
 // CAST(double AS SIGNED) as the interpreter rounds it (vp::eval's CastI on a double lane); 1: bail.
+inline double vjit_pow(double a, double b) { return std::pow(a, b); }
+inline double vjit_atan2(double a, double b) { return std::atan2(a, b); }
+// Text references compared as the interpreter compares them (pad_compare_ci of the texts they name): -1, 0, 1.
+inline int64_t vjit_text_cmp(const void* prog, int64_t a, int64_t b) {
+  const Prog* P = static_cast<const Prog*>(prog);
+  const int c = pad_compare_ci(P->text_of(a), P->text_of(b));
+  return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+// The exact-decimal check of Add / Sub / Mul (vp::eval): 1 where the lane may not hold the interpreter's exact value.
+inline int64_t vjit_exact_dyadic_bad(double a, double b, double r, int64_t is_mul) {
+  return (std::fabs(r) >= 4503599627370496.0 || (is_mul && std::fabs(a) >= 1073741824.0 && std::fabs(b) >= 1073741824.0) ||
+          (is_mul && std::fma(a, b, -r) != 0)) ? 1 : 0;
+}
 inline int vjit_cast_i(double a, int64_t approx, int64_t* out) {
   if (!(std::fabs(a) < 9.2e18)) return 1;
   if (!approx) { *out = (int64_t)std::llround(a); return 0; }
@@ -255,24 +268,36 @@ class Builder {
     auto no = [&](const char* w) { if (why) *why = std::string(w) + " (" + std::to_string((int)in.op) + ")"; return false; };
     if (is_leaf(in.op)) return true;
     for (uint32_t a : in.args) if (a >= x) return no("operand order");
-    if (in.ty == Ty::Str) return no("text result");
-    for (uint32_t a : in.args) if (ty(a) == Ty::Str) return no("text operand");
-    if (in.exact_dyadic) return no("exact decimal arithmetic");
+    // Text (a reference into a dictionary or the literals) is carried as an I64 lane: compared through the
+    // interpreter's own comparison, passed through CASE / COALESCE / NULLIF; never computed with or made true/false.
+    const bool text_out = in.ty == Ty::Str;
+    bool text_in = false;
+    for (uint32_t a : in.args) if (ty(a) == Ty::Str) text_in = true;
     switch (in.op) {
-      case Ins::Neg: case Ins::Add: case Ins::Sub: case Ins::Mul: case Ins::Div: case Ins::Mod: case Ins::IDiv:
       case Ins::Eq: case Ins::Ne: case Ins::Lt: case Ins::Le: case Ins::Gt: case Ins::Ge:
-      case Ins::And: case Ins::Or: case Ins::Not: case Ins::IsNull: case Ins::NotNull:
-      case Ins::Case: case Ins::Coalesce: case Ins::Greatest: case Ins::Least:
-      case Ins::Abs: case Ins::Floor: case Ins::Ceil: case Ins::Sqrt: case Ins::Sin: case Ins::Cos: case Ins::Tan: case Ins::Atan:
-      case Ins::Radians: case Ins::Degrees: case Ins::CastI: case Ins::CastF:
-      case Ins::BitAnd: case Ins::BitOr: case Ins::BitXor: case Ins::Shl: case Ins::Shr: case Ins::BitNot: case Ins::RoundI:
+        if (text_in && (ty(in.args[0]) != Ty::Str || ty(in.args[1]) != Ty::Str)) return no("text compared with a number");
+        break;
+      case Ins::Case: case Ins::Coalesce:
+        if (text_in && !text_out) return no("text in a numeric CASE");
         break;
       case Ins::NullIf:
         if (in.ty != ty(in.args[0])) return no("NULLIF of mixed kinds");
+        if (ty(in.args[1]) == Ty::Str && ty(in.args[0]) != Ty::Str) return no("NULLIF of text against a number");
+        break;
+      case Ins::IsNull: case Ins::NotNull:
+        break;
+      case Ins::Neg: case Ins::Add: case Ins::Sub: case Ins::Mul: case Ins::Div: case Ins::Mod: case Ins::IDiv:
+      case Ins::And: case Ins::Or: case Ins::Not: case Ins::Greatest: case Ins::Least:
+      case Ins::Abs: case Ins::Floor: case Ins::Ceil: case Ins::Sqrt: case Ins::Sin: case Ins::Cos: case Ins::Tan: case Ins::Atan:
+      case Ins::Atan2: case Ins::Pow:
+      case Ins::Radians: case Ins::Degrees: case Ins::CastI: case Ins::CastF:
+      case Ins::BitAnd: case Ins::BitOr: case Ins::BitXor: case Ins::Shl: case Ins::Shr: case Ins::BitNot: case Ins::RoundI:
+        if (text_in || text_out) return no("text in arithmetic");
         break;
       default:
         return no("operator");
     }
+    if (text_out && in.op != Ins::Case && in.op != Ins::Coalesce && in.op != Ins::NullIf) return no("text result");
     if (in.op == Ins::Case && in.args.size() < 2) return no("CASE arity");
     return true;
   }
@@ -375,9 +400,18 @@ class Builder {
         } else {
           fd(in.args[0], X0, RAX);
           fd(in.args[1], X1, RCX);
+          if (in.exact_dyadic) a_.movsd(X2, X0);   // a, for the exactness check
           if (in.op == Ins::Add) a_.addsd(X0, X1); else if (in.op == Ins::Sub) a_.subsd(X0, X1); else a_.mulsd(X0, X1);
           bail_if_nonfinite_x0();
           store_f(x, X0);
+          if (in.exact_dyadic) {
+            // vjit_exact_dyadic_bad(a, b, r, is_mul): the lane must hold the interpreter's exact decimal
+            a_.movsd(X3, X0); a_.movsd(X0, X2); a_.movsd(X2, X3);
+            a_.mov_imm(RDI, in.op == Ins::Mul ? 1 : 0);
+            call_fn((const void*)&vjit_exact_dyadic_bad);
+            a_.test(RAX, RAX);
+            bail_if(CcNE);
+          }
         }
         set_not_null(x);
         break;
@@ -459,7 +493,18 @@ class Builder {
       case Ins::Eq: case Ins::Ne: case Ins::Lt: case Ins::Le: case Ins::Gt: case Ins::Ge: {
         done.push_back(null_any(x, {in.args[0], in.args[1]}));
         const bool both_int = ty(in.args[0]) == Ty::I64 && ty(in.args[1]) == Ty::I64;
-        if (both_int) {
+        const bool texts = ty(in.args[0]) == Ty::Str;
+        if (texts) {
+          ld_i(in.args[0], RSI);
+          ld_i(in.args[1], RDX);
+          a_.mov_imm(RDI, (uint64_t)(uintptr_t)&P_);
+          call_fn((const void*)&vjit_text_cmp);   // rax = -1, 0, 1
+          a_.mov_imm(RCX, 0);
+          a_.cmp(RAX, RCX);
+          const Cc c = in.op == Ins::Eq ? CcE : in.op == Ins::Ne ? CcNE : in.op == Ins::Lt ? CcL : in.op == Ins::Le ? CcLE : in.op == Ins::Gt ? CcG : CcGE;
+          a_.setcc(c, RAX);
+          a_.movzx_b(RAX, RAX);
+        } else if (both_int) {
           ld_i(in.args[0], RAX);
           ld_i(in.args[1], RCX);
           a_.cmp(RAX, RCX);
@@ -583,7 +628,15 @@ class Builder {
         ld_n(in.args[1], RAX);
         a_.test(RAX, RAX);
         const size_t b_null = a_.jcc(CcNE);
-        if (ty(in.args[0]) == Ty::I64 && ty(in.args[1]) == Ty::I64) {
+        if (ty(in.args[0]) == Ty::Str) {
+          ld_i(in.args[0], RSI); ld_i(in.args[1], RDX);
+          a_.mov_imm(RDI, (uint64_t)(uintptr_t)&P_);
+          call_fn((const void*)&vjit_text_cmp);
+          a_.test(RAX, RAX);
+          const size_t differ = a_.jcc(CcNE);
+          set_null(x); done.push_back(a_.jmp());
+          a_.patch_here(differ);
+        } else if (ty(in.args[0]) == Ty::I64 && ty(in.args[1]) == Ty::I64) {
           ld_i(in.args[0], RAX); ld_i(in.args[1], RCX); a_.cmp(RAX, RCX);
           const size_t differ = a_.jcc(CcNE);
           set_null(x); done.push_back(a_.jmp());
@@ -663,6 +716,16 @@ class Builder {
         } else {
           call_fn(in.op == Ins::Sin ? (const void*)&vjit_sin : in.op == Ins::Cos ? (const void*)&vjit_cos : in.op == Ins::Tan ? (const void*)&vjit_tan : (const void*)&vjit_atan);
         }
+        store_f(x, X0);
+        set_not_null(x);
+        break;
+      }
+      case Ins::Atan2: case Ins::Pow: {
+        done.push_back(null_any(x, {in.args[0], in.args[1]}));
+        fd(in.args[0], X0, RAX);
+        fd(in.args[1], X1, RCX);
+        call_fn(in.op == Ins::Pow ? (const void*)&vjit_pow : (const void*)&vjit_atan2);
+        bail_if_nonfinite_x0();
         store_f(x, X0);
         set_not_null(x);
         break;
