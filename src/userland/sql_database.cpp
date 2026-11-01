@@ -36855,6 +36855,8 @@ struct NumScratch {
   std::vector<std::vector<double>> v;
   std::vector<std::vector<uint8_t>> n;
   std::vector<uint32_t> codes;
+  std::vector<double> span;          // a row list's span decoded as a block (np_eval)
+  std::vector<uint32_t> span_codes;
 };
 
 // Appends e's instructions; *approx says whether its value is approximate.
@@ -36971,6 +36973,14 @@ void np_eval(const NumProg& P, size_t start, const uint32_t* rows, size_t n, Num
       case NumProg::Typed: {
         const ColumnStore& cs = *in.cs;
         if (!rows) typed_values(cs, start, start + n, v);
+        else if (n >= 64 && rows[n - 1] >= rows[0] && rows[n - 1] - rows[0] < n * 8 && std::is_sorted(rows, rows + n)) {
+          // ascending rows packed in a span (a batch of a join's partners): the span decoded as a block, the rows
+          // picked from it - a read per row through read_code was ~10x the work
+          const size_t lo = rows[0], len = (size_t)(rows[n - 1] - rows[0]) + 1;
+          S.span.resize(len);
+          typed_values(cs, lo, lo + len, S.span.data());
+          for (size_t j = 0; j < n; ++j) v[j] = S.span[rows[j] - lo];
+        }
         else for (size_t j = 0; j < n; ++j) v[j] = typed_value_at(cs, rows[j]);
         if (has_nulls(cs)) for (size_t j = 0; j < n; ++j) z[j] = cs.is_null(rows ? rows[j] : start + j);
         else std::memset(z, 0, n);
@@ -36982,6 +36992,12 @@ void np_eval(const NumProg& P, size_t start, const uint32_t* rows, size_t n, Num
         const auto& cn = P.code_null[in.tab];
         S.codes.resize(n);
         if (!rows) decode_codes(cs, start, start + n, S.codes.data());
+        else if (n >= 64 && rows[n - 1] >= rows[0] && rows[n - 1] - rows[0] < n * 8 && std::is_sorted(rows, rows + n)) {
+          const size_t lo = rows[0], len = (size_t)(rows[n - 1] - rows[0]) + 1;
+          S.span_codes.resize(len);
+          decode_codes(cs, lo, lo + len, S.span_codes.data());
+          for (size_t j = 0; j < n; ++j) S.codes[j] = S.span_codes[rows[j] - lo];
+        }
         else for (size_t j = 0; j < n; ++j) S.codes[j] = code_at(cs, rows[j]);
         const bool hn = has_nulls(cs);
         for (size_t j = 0; j < n; ++j) {
@@ -40794,6 +40810,22 @@ static bool branch_has_window(const ParsedSelectBranch& b) {
 // what sorting the pairs gives when the rows come in ascending - by a least
 // significant digit radix sort over the keys' `bits` low bits, 11 bits a pass.
 // 160k window rows sorted twice per statement were most of a ROW_NUMBER query.
+// Row ids ascending, by an LSD radix sort over two 16-bit digits (std::sort under 4,096 of them).
+static void radix_sort_u32(std::vector<uint32_t>& v) {
+  const size_t n = v.size();
+  if (n < 4096) { std::sort(v.begin(), v.end()); return; }
+  std::vector<uint32_t> tmp(n);
+  std::vector<uint32_t> cnt(1u << 16);
+  for (int shift = 0; shift < 32; shift += 16) {
+    std::fill(cnt.begin(), cnt.end(), 0);
+    for (uint32_t x : v) ++cnt[(x >> shift) & 0xFFFF];
+    uint32_t sum = 0;
+    for (auto& c : cnt) { const uint32_t x = c; c = sum; sum += x; }
+    for (uint32_t x : v) tmp[cnt[(x >> shift) & 0xFFFF]++] = x;
+    v.swap(tmp);
+  }
+}
+
 static void radix_sort_pairs(std::vector<std::pair<uint64_t, uint32_t>>& v, int bits) {
   const size_t n = v.size();
   if (n < 2048 || bits <= 0) { std::sort(v.begin(), v.end()); return; }
@@ -43455,7 +43487,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
           const bool pn = vx::has_nulls(pcs);
           for (size_t i = 0; i < nbase; ++i)
             if (!(pn && pcs.is_null(base[i]))) kv.push_back(pall.empty() ? vx::typed_int(pcs, base[i]) : pall[base[i]]);
-          std::sort(kv.begin(), kv.end());
+          if (!std::is_sorted(kv.begin(), kv.end())) std::sort(kv.begin(), kv.end());   // base rows in key order already: no sort
           kv.erase(std::unique(kv.begin(), kv.end()), kv.end());
           bool small = !kv.empty() && kv.size() <= 200000;
           for (int64_t v : kv) if (v > ((int64_t)1 << 53) || v < -((int64_t)1 << 53)) small = false;
@@ -43468,7 +43500,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
               root_ids.clear();
               vx::rows_equal_to_sorted(*ci, ccs, kv, &root_ids, SIZE_MAX);
               held.unlock();
-              std::sort(root_ids.begin(), root_ids.end());
+              radix_sort_u32(root_ids);   // into row order (two 16-bit passes; std::sort was 120 instructions a row)
               root_ids.erase(std::unique(root_ids.begin(), root_ids.end()), root_ids.end());
               small = false;
               direct = true;
@@ -43557,7 +43589,9 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   for (Link& L : links) {
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
     L.parent_nulls = vx::has_nulls(pcs);
-    if (pcs.size() > nr * 8 || pcs.size() != sources[L.parent_src].table->row_count()) continue;
+    // whole when the rows read a third of the column or more: a block decode is ~20 instructions a value against
+    // ~70 for a read_code, so 92k lookups into 600k lines are cheaper one at a time
+    if (pcs.size() > nr * 3 || pcs.size() != sources[L.parent_src].table->row_count()) continue;
     if (L.map.by_code) { L.whole_codes.resize(pcs.size()); vx::decode_codes(pcs, 0, pcs.size(), L.whole_codes.data()); }
     else if (vx::typed_integer(pcs)) { L.whole_ints.resize(pcs.size()); vx::typed_ints(pcs, 0, pcs.size(), L.whole_ints.data()); }
   }
@@ -43580,9 +43614,15 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     // (every later table gives one row or none).
     const size_t n = (*P)[0].size();
     // (key, position) pairs in key order by a radix sort (radix_sort_pairs: the window path's), ties by position
+    // packed to the ids' own widths (a base row below 2^18 and a line below 2^20 sort in 38 bits, four passes)
+    uint32_t m0 = 0, m1 = 0;
+    for (size_t i = 0; i < n; ++i) { m0 = std::max(m0, (*P)[0][i]); m1 = std::max(m1, (*P)[1][i]); }
+    int b0 = 1, b1 = 1;
+    while (b0 < 32 && ((uint64_t)m0 >> b0)) ++b0;
+    while (b1 < 32 && ((uint64_t)m1 >> b1)) ++b1;
     std::vector<std::pair<uint64_t, uint32_t>> enc(n);
-    for (size_t i = 0; i < n; ++i) enc[i] = {((uint64_t)(*P)[0][i] << 32) | (*P)[1][i], (uint32_t)i};
-    radix_sort_pairs(enc, 64);
+    for (size_t i = 0; i < n; ++i) enc[i] = {((uint64_t)(*P)[0][i] << b1) | (*P)[1][i], (uint32_t)i};
+    radix_sort_pairs(enc, b0 + b1);
     for (auto& col : *P) {
       std::vector<uint32_t> sorted(n);
       for (size_t i = 0; i < n; ++i) sorted[i] = col[enc[i].second];

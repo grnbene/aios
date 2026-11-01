@@ -577,6 +577,19 @@ A SUM-format edge set (INT, BIGINT past 2^53, DECIMAL(12,3) and DECIMAL(30,10) s
 NULLs, zeros at scale, groups ordered by the sum) is identical to the build before, as are frame bytes, the four
 oracle suites, the lane checks and the earlier edge sets.
 
+The date-range join (30k orders of two months to their 92k lines, SUM(price * qty)): 24-26 ms warm, against
+DuckDB's 4.3. The profile named four pieces: the SUM's column arithmetic over the joined rows read each leaf
+through read_code (np_eval over a row list: 18.6M instructions), the 30k order keys and the 92k matched line
+ids sorted with std::sort, the 600k-row line key column decoded whole for 92k lookups, and the rerooted rows'
+order radix-sorted over 64 bits. Now: a row list that is ascending and packed into a span under eight times
+its length (a batch of a join's partners) decodes the span as a block and picks its rows; the order keys skip
+the sort when the base rows already hold them ascending; the matched ids sort by a 16-bit-digit radix sort
+(radix_sort_u32); the whole-column decode of a link's key waits until the rows read a third of the column; the
+order's keys pack to the ids' widths (38 bits, four passes). 24-26 -> 11-13 ms warm. (A cold first statement
+also builds the line table's column index, ~90 ms, as before.) A rerooted-join edge set (NULL keys, NULL
+values, a single date, an empty range, GROUP BY over the join, LIMIT with and without ORDER BY) is identical
+to the build before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
