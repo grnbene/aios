@@ -312,6 +312,37 @@ collation group - and an integer alone; an empty selection) identical with the p
 off, and under the check mode (7 native folds, 3 native root loops, all the same); the oracle suites, the edge sets,
 the one-to-many and ORDER BY .. LIMIT sets and the frame bytes identical.
 
+### 3c.3, first part: more star shapes into the pipeline
+
+Measured against DuckDB after 3c.2 (all 15 ERP answers the same), the join shapes still behind were two:
+
+- **order value range** (`order_items JOIN orders WHERE o.orddate BETWEEN ..`, SUM(price * qty)): started from the
+  filtered orders, the first join meets many lines per order, so the star join rerooted - selected the 92k lines
+  through an index (3.7 ms) and radix-sorted them back into FROM order (3.2 ms) - every statement. The one-to-many
+  map over every line is kept (`star_multi_cached`), and an order's run in it is already in the order the sort
+  restores, so where the first joined table is joined whole (no condition of its own) the join now stays in FROM
+  order and expands through that map (`whole_first` / `multi_first`): no reroot, no sort, and the pipeline takes it
+  (no GROUP BY: the native root loop's one group). 12.8 -> 2.7 ms (DuckDB 4.3).
+- **line sales by location** (600k lines JOIN products, GROUP BY p.category, i.loccode, SUM(i.qty)): every link
+  unique, so the join materialized 600k x 2 row ids, the key loop probed per line, and the integer SUM folded apart.
+  Now an all-unique star is handed over unexpanded too when a grouping is to read it, the fused loop takes it with
+  each root row its own run (keys may be read from any source then), the native root loop has that variant (no CSR
+  run: the root row itself), and the native fold has the typed-INT SUM / AVG (128-bit total with carry, the double
+  total, the count - the fold's own fast path, row by row). 21-23 -> ~10 ms (DuckDB 11.4).
+
+Sizing the groups' arrays for a group per root row (3c.1) was right for 86k orders under 81k groups and wrong for
+600k lines under 480 groups (tens of MB zero-filled: 28 ms); they now start at that bound only where it is at most
+2^17 and otherwise small, and double. The native code therefore reads every array's address through the fold's
+spec and the key table's (groups, ids, mask, shift) through its env block, which `ensure_groups` and `new_group`
+update when they grow - the generated code holds no address that can move.
+
+Checked: the ERP answers identical with the pipeline on and off, and under `AIOS_SQL_PIPE_CHECK=1` (25 native folds,
+20 native root loops, every group the same - the INT SUM's shadow reads each row through `typed_int`, not the decode
+the code reads); the pipeline edge set grown by the new shapes (an all-unique star grouped by keys on the root and on
+the partners with INT SUMs, a filtered table joined to a whole bigger one with and without a match, no GROUP BY)
+identical with the pipeline on, off, with the star join off, and under the check mode (21 native folds, 8 native root
+loops).
+
 ### Between 3a and 3b: what the profile said to remove first
 
 A three-frame profile after 3a (15.0 billion instructions) put ~1.0 billion in work no reader used: zone maps

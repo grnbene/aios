@@ -29,17 +29,54 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
   a.mov(R12, RDI);
   a.mov(R13, RSI);
   a.mov(R14, RDX);
-  auto add_cnt = [&](uint64_t* cnt, Reg by) {        // cnt[g] += by
-    a.mov_imm(RAX, (uint64_t)(uintptr_t)cnt);
+  // An array's base read through its field in the spec (PipeFoldAgg lives in the caller's vector, which does not
+  // move): the arrays grow as groups appear, and the caller updates the fields.
+  auto base_of = [&](Reg d, const void* field) { a.mov_imm(d, (uint64_t)(uintptr_t)field); a.load(d, d, 0); };
+  auto add_cnt = [&](uint64_t* const* cnt, Reg by) {   // cnt[g] += by
+    base_of(RAX, cnt);
     a.load_idx8(RBX, RAX, R14);
     a.add(RBX, by);
     a.store_idx8(RAX, R14, RBX);
   };
   for (const PipeFoldAgg& g : aggs) {
-    if (g.kind == 0) { add_cnt(g.cnt, R13); continue; }
+    if (g.kind == 0) { add_cnt(&g.cnt, R13); continue; }
+    if (g.kind == 2) {
+      // SUM / AVG of a typed INT column with no NULL: per row, isum[g] (128 bits) += v, num[g] += (double)v - the
+      // fold's own fast path; cnt[g] += the run
+      base_of(R10, &g.isum);
+      a.mov(RAX, R14);
+      a.shl_imm(RAX, 4);
+      a.add(R10, RAX);
+      a.load(R8, R10, 0);
+      a.load(R9, R10, 8);
+      base_of(RAX, &g.num);
+      a.movsd_load_idx8((Reg)15, RAX, R14);
+      a.xor_(RCX, RCX);
+      const size_t itop = a.here();
+      a.cmp(RCX, R13);
+      const size_t idone = a.jcc(CcAE);
+      a.load32_idx4(RDX, R12, RCX);
+      a.mov_imm(RAX, (uint64_t)(uintptr_t)g.ints);
+      a.load_idx8(RDX, RAX, RDX);
+      a.mov(RAX, RDX);
+      a.sar_imm(RAX, 63);
+      a.add(R8, RDX);
+      a.adc(R9, RAX);
+      a.cvtsi2sd((Reg)0, RDX);
+      a.addsd((Reg)15, (Reg)0);
+      a.inc(RCX);
+      a.patch(a.jmp(), itop);
+      a.patch_here(idone);
+      a.store(R10, 0, R8);
+      a.store(R10, 8, R9);
+      base_of(RAX, &g.num);
+      a.movsd_store_idx8(RAX, R14, (Reg)15);
+      add_cnt(&g.cnt, R13);
+      continue;
+    }
     const size_t K = g.prog.size();
     if (K == 0 || K > 14) { if (why) *why = "program size"; return nullptr; }
-    a.mov_imm(RAX, (uint64_t)(uintptr_t)g.num);
+    base_of(RAX, &g.num);
     a.movsd_load_idx8((Reg)15, RAX, R14);
     a.xor_(R15, R15);
     a.xor_(RCX, RCX);
@@ -95,13 +132,13 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
     a.inc(RCX);
     a.patch(a.jmp(), top);
     a.patch_here(to_done);
-    a.mov_imm(RAX, (uint64_t)(uintptr_t)g.num);
+    base_of(RAX, &g.num);
     a.movsd_store_idx8(RAX, R14, (Reg)15);
-    add_cnt(g.cnt, R15);
+    add_cnt(&g.cnt, R15);
     // a row added: the total is approximate from here (the fold's exact[g] = 0)
     a.test(R15, R15);
     const size_t none = a.jcc(CcE);
-    a.mov_imm(RAX, (uint64_t)(uintptr_t)g.exact);
+    base_of(RAX, &g.exact);
     a.xor_(RBX, RBX);
     a.storeb_idx(RAX, R14, RBX);
     a.patch_here(none);
@@ -126,9 +163,12 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
 // fold (the native fold above, called). A key not in the table: spec.new_group (C++) makes the group in that slot,
 // as key_group does. A root row with no partner or no run makes no row and no group, as before.
 // Env: +0 total rows (added to), +8 root rows, +16 their count, +24 the new_group context, +32 per root row its
-// group (AIOS_SQL_PIPE_CHECK; null otherwise).
+// group (AIOS_SQL_PIPE_CHECK; null otherwise), +40 / +48 / +56 / +64 the key table's groups, ids, mask and shift
+// (new_group updates them when it grows the table).
 inline std::shared_ptr<PipeCode> pipe_root_build(const PipeRootSpec& sp, std::string* why) {
-  if (sp.keys.empty() || sp.keys.size() > 2 || (sp.slots && (sp.keys.size() != 1 || !sp.keys[0].dict))) { if (why) *why = "keys"; return nullptr; }
+  // keys: one or two packed into the table, one dictionary key's slots, or none (one group: slot 0 of sp.slots)
+  if (sp.keys.size() > 2 || (sp.keys.empty() && !sp.slots) || (sp.slots && sp.keys.size() == 1 && !sp.keys[0].dict) ||
+      (sp.slots && sp.keys.size() > 1)) { if (why) *why = "keys"; return nullptr; }
   Asm a;
   a.push(RBX); a.push(RBP); a.push(R12); a.push(R13); a.push(R14); a.push(R15);
   a.sub_rsp(40);                                     // parts[8] (uint32) at [rsp]; 6 pushes + 40: calls aligned
@@ -160,6 +200,11 @@ inline std::shared_ptr<PipeCode> pipe_root_build(const PipeRootSpec& sp, std::st
     a.store32(RSP, (int32_t)(4 * L.child), RAX);
   }
   const PipeRootMulti& M = sp.multi;
+  if (!sp.has_multi) {
+    // no one-to-many link: the run is the root row itself (index RBX into the root rows)
+    a.mov_imm(RBP, 1);
+    a.mov(R15, RBX);
+  } else {
   load_part(RAX, M.parent);
   a.mov_imm(RCX, (uint64_t)(uintptr_t)M.pkeys);
   a.load_idx8(RDX, RCX, RAX);
@@ -181,8 +226,10 @@ inline std::shared_ptr<PipeCode> pipe_root_build(const PipeRootSpec& sp, std::st
   a.mov_imm(RCX, (uint64_t)(uintptr_t)M.rows);
   a.load32_idx4(RAX, RCX, R15);
   a.store32(RSP, (int32_t)(4 * M.child), RAX);       // the group's first row's many-side row
+  }
   // the key: R8
   const size_t ng = sp.keys.size();
+  if (ng == 0) a.xor_(R8, R8);
   for (size_t k = 0; k < ng; ++k) {
     const PipeRootKey& K = sp.keys[k];
     load_part(RAX, K.src);
@@ -226,14 +273,16 @@ inline std::shared_ptr<PipeCode> pipe_root_build(const PipeRootSpec& sp, std::st
     to_found_v.push_back(a.jmp());
   }
   // the probe: h = (id * C) >> shift & mask, linear
+  // (the table, its mask and shift read from the env each row: new_group grows it, as key_group does)
   a.mov(RAX, R8);
   a.mov_imm(RCX, 0x9E3779B97F4A7C15ull);
   a.imul(RAX, RCX);
-  a.shr_imm(RAX, (uint8_t)sp.shift);
-  a.mov_imm(R11, sp.mask);
+  a.load(RCX, R14, 64);
+  a.shr_cl(RAX);
+  a.load(R11, R14, 56);
   a.and_(RAX, R11);
-  a.mov_imm(R9, (uint64_t)(uintptr_t)sp.tg);
-  a.mov_imm(R10, (uint64_t)(uintptr_t)sp.tk);
+  a.load(R9, R14, 40);
+  a.load(R10, R14, 48);
   const size_t probe = a.here();
   a.load32_idx4(RDX, R9, RAX);
   a.mov_imm(RCX, 0xFFFFFFFFull);
@@ -265,7 +314,8 @@ inline std::shared_ptr<PipeCode> pipe_root_build(const PipeRootSpec& sp, std::st
   a.load(RCX, R14, 0);
   a.add(RCX, RBP);
   a.store(R14, 0, RCX);
-  a.mov_imm(RDI, (uint64_t)(uintptr_t)M.rows);
+  if (sp.has_multi) a.mov_imm(RDI, (uint64_t)(uintptr_t)M.rows);
+  else a.mov(RDI, R12);                              // the root rows: the run is root row RBX
   a.mov(RAX, R15);
   a.shl_imm(RAX, 2);
   a.add(RDI, RAX);                                   // rows + b

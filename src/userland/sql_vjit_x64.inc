@@ -146,6 +146,8 @@ struct Asm {
   void alu(uint8_t op, Reg d, Reg s) { rex(true, s, 0, d); b(op); rr(s, d); }
   void add(Reg d, Reg s) { alu(0x01, d, s); }
   void sub(Reg d, Reg s) { alu(0x29, d, s); }
+  void adc(Reg d, Reg s) { alu(0x11, d, s); }
+  void sar_imm(Reg d, uint8_t n) { rex(true, 0, 0, d); b(0xC1); rr(7, d); b(n); }
   void and_(Reg d, Reg s) { alu(0x21, d, s); }
   void or_(Reg d, Reg s) { alu(0x09, d, s); }
   void xor_(Reg d, Reg s) { alu(0x31, d, s); }

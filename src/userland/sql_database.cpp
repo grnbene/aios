@@ -8328,11 +8328,14 @@ struct PipeIns {                       // a vx::NumProg instruction over the man
   uint32_t a = 0, b = 0;               // operands (earlier instructions)
 };
 struct PipeFoldAgg {
-  int kind = 0;                        // 0: a COUNT - the run's rows added to cnt[g]; 1: SUM / AVG of prog
+  int kind = 0;                        // 0: a COUNT - the run's rows added to cnt[g]; 1: SUM / AVG of prog;
+                                       // 2: SUM / AVG of a typed INT column with no NULL (isum, num, cnt)
   std::vector<PipeIns> prog;
   uint64_t* cnt = nullptr;
   double* num = nullptr;
   uint8_t* exact = nullptr;
+  const int64_t* ints = nullptr;       // 2: the column decoded whole
+  void* isum = nullptr;                // 2: the groups' 128-bit totals
 };
 std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>& aggs, std::string* why);
 void pipe_fold_run(const void* code, const uint32_t* rows, size_t n, uint32_t g);
@@ -8364,6 +8367,7 @@ struct PipeRootKey {
 };
 struct PipeRootSpec {
   std::vector<PipeRootLink> links;
+  bool has_multi = true;               // false: no one-to-many link - a root row's run is the row itself
   PipeRootMulti multi;
   std::vector<PipeRootKey> keys;
   uint32_t root = 0;
@@ -8382,7 +8386,12 @@ struct PipeRootEnv {
   uint64_t n = 0;                      // +16
   void* ctx = nullptr;                 // +24 new_group's
   uint32_t* root_g = nullptr;          // +32 per root row its group (check mode)
+  const int32_t* tg = nullptr;         // +40 the key table (new_group moves it when it grows)
+  const uint64_t* tk = nullptr;        // +48
+  uint64_t mask = 0;                   // +56
+  uint64_t shift = 0;                  // +64
 };
+static_assert(offsetof(PipeRootEnv, shift) == 64, "PipeRootEnv layout");
 std::shared_ptr<void> pipe_root_build_for(const PipeRootSpec& sp, std::string* why);
 void pipe_root_run(const void* code, PipeRootEnv* env);
 inline bool pipe_jit_on() {
@@ -43878,8 +43887,11 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   size_t pk_cols = 0;
   for (const auto& c : sources[1].table->columns) if (c.is_primary_key) ++pk_cols;
   const bool sole_pk = pk_cols == 1 && sources[1].table->columns[steps[0].child_col].is_primary_key;
+  // ... unless the first joined table is joined whole (no condition of its own): then its one-to-many map is built
+  // once and kept, and the FROM order expands through it (below: multi_first) with no reroot and no sort back.
+  const bool whole_first = sql_pipe_on() && !multi_off && steps[0].filters.empty() && steps[0].from_where.empty();
   const bool reroot_first = !join_is_left[0] && steps[0].parent_src == 0 && ns <= 8 &&
-                            sources[1].table->row_count() > sources[0].table->row_count() && !sole_pk;
+                            sources[1].table->row_count() > sources[0].table->row_count() && !sole_pk && !whole_first;
   bool fine = !reroot_first;
   for (size_t j = 0; j < steps.size() && fine; ++j) {
     Step& st = steps[j];
@@ -43891,12 +43903,19 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     std::vector<uint32_t> ids;
     if (!select_of(j + 1, conds, &ids)) return false;
     const bool reroot_here = j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0;
-    if (!(!reroot_here && multi_known(L, ids)) && !build(L, ids)) {
+    // The first join over every row of its table (no condition of its own): its one-to-many map is built once and
+    // kept (star_multi_cached), and a base row's run in it is already in the order the rerooted rows are sorted
+    // back into - so the join stays in FROM order and expands there, where rerooting selected the joined rows
+    // through an index and radix-sorted them back each statement (order value range: 3.7 + 3.2 of 12 ms).
+    const bool multi_first = reroot_here && sql_pipe_on() && !multi_off &&
+                             ids.size() == sources[j + 1].table->row_count();
+    if (!((!reroot_here || multi_first) && multi_known(L, ids)) && !build(L, ids)) {
       // The first join meets many rows per base row (an order's lines):
       // started from the joined table instead, the base table is the one
       // looked up - if its key is unique among its selected rows - and the
       // rows are put back in the order the joins in FROM order produce.
-      if (j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0) { fine = false; break; }
+      if (j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0 &&
+          !(multi_first && err->empty() && (L.map = Map(), build_multi(L, ids)))) { fine = false; break; }
       // A later step meeting many rows (orders -> customers -> the orders' lines): the rows expand there.
       if (!err->empty()) return false;
       L.map = Map();
@@ -44043,6 +44062,23 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   uint32_t parts[8];
   bool any_multi = false;
   for (const Link& L : links) if (L.multi) any_multi = true;
+  if (!any_multi && deferred && !rerooted) {
+    // every link unique: handed over unexpanded too (the join aggregate's fused loop reads a base row and its
+    // partners at a time; any other consumer expands them, into the same rows in the same order)
+    auto E = std::make_shared<StarExpansion>();
+    E->sources = &sources;
+    E->ns = ns;
+    E->root = root;
+    E->roots.assign(rp, rp + nr);
+    E->bound = (double)nr;
+    E->links = std::move(links);
+    *deferred = std::move(E);
+    if (vx_trace_on())
+      vx_trace("join: star join handed over unexpanded (" + std::to_string(nr) + " root rows, every link unique), " +
+               std::to_string((hal_now_ns() - t0) / 1000) + " us (maps " + std::to_string((t1 - t0) / 1000) + " us)");
+    P->clear();
+    return true;
+  }
   if (!any_multi) {
   // at most one row per base row: the columns sized to that and written through pointers
   std::vector<uint32_t*> outp(ns);
@@ -44662,9 +44698,12 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
                // that last link's rows (an order's lines under the order and its customer). A root row's group is
                // then found once - its partners, its key, one probe - and its run of lines goes into the morsel
                // under that group with no key work at all: only the aggregates' rows and the group id are written.
+               // (or every link unique: each root row's "run" is the row itself, and any key may be read)
                const size_t nl = E->links.size();
-               if (nl == 0 || !E->links[nl - 1].multi) return false;
-               for (size_t k = 0; k + 1 < nl; ++k) if (E->links[k].multi) return false;
+               if (nl == 0) return false;
+               const bool hm = E->links[nl - 1].multi;
+               for (size_t k = 0; k + (hm ? 1 : 0) < nl; ++k) if (E->links[k].multi) return false;
+               if (!hm) return true;
                const size_t mc = E->links[nl - 1].child_src;
                for (const Key& K : keys) if (K.src == mc) return false;
                if (kpath == 1 && (size_t)by_row == mc) return false;
@@ -44672,7 +44711,15 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
              }()) {
     constexpr size_t kMorsel = 4096;
     const StarLink& ML = E->links.back();
-    const size_t mc = ML.child_src;
+    const bool has_multi = ML.multi;                   // else every link is unique: a root row's run is itself
+    const size_t mc = has_multi ? ML.child_src : E->root;
+    const size_t nuniq = E->links.size() - (has_multi ? 1 : 0);
+    // a root row's run: its rows on the one-to-many link, or the root row itself
+    auto run_of = [&](size_t ri, const uint32_t* prt, const uint32_t** b, const uint32_t** e) {
+      if (has_multi) { star_rows_of(sources, ML, prt[ML.parent_src], b, e); return; }
+      *b = E->roots.data() + ri;
+      *e = *b + 1;
+    };
     std::vector<char> need(NS, 0);                     // the sources the aggregates read
     for (auto& ap : aggs) need[ap->src] = 1;
     std::vector<std::vector<uint32_t>> ma(NS);
@@ -44687,6 +44734,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     std::shared_ptr<void> native;
     std::vector<vp::PipeFoldAgg> pf;
     std::vector<std::shared_ptr<const std::vector<double>>> pholds;
+    std::vector<std::shared_ptr<const vx::DecodedInts>> rholds_fold;
     std::vector<char> pcount_star;                      // per aggregate: COUNT(*) (a NULL-padded row counts)
     std::string native_why;
     auto build_native = [&]() {
@@ -44700,6 +44748,19 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         if (a.agg.kind == vx::Agg::CountStar) { f.kind = 0; pf.push_back(std::move(f)); continue; }
         if (a.src != mc) { native_why = "an aggregate off the many side"; return; }
         if (a.agg.kind == vx::Agg::Count && a.agg.col_rules && !a.nulls) { f.kind = 0; pf.push_back(std::move(f)); continue; }
+        // the fold's typed-INT fast path (fold_rows): same condition
+        if (!a.nulls && !a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
+            a.agg.src.kind == vx::Source::TypedCol && a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct) {
+          auto d = vx::decoded_ints(mt, a.agg.src.col);
+          if (!d) { native_why = "a column's decode"; return; }
+          f.kind = 2;
+          f.ints = d->v.data();
+          f.isum = a.arr.isum.data();
+          f.num = a.arr.num.data();
+          rholds_fold.push_back(std::move(d));
+          pf.push_back(std::move(f));
+          continue;
+        }
         if (!((a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.prog && !a.agg.mask)) { native_why = "an aggregate"; return; }
         f.kind = 1;
         f.num = a.arr.num.data();
@@ -44739,7 +44800,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       native = vp::pipe_fold_build_for(pf, &native_why);
     };
     // AIOS_SQL_PIPE_CHECK=1: every run folded again through np_eval (the interpreter) into these, compared at the end
-    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; };
+    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; std::vector<AIOS_INT128> isum; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; };
     std::vector<Shadow> shadow;
     auto flush = [&]() {
       if (n == 0) return;
@@ -44753,20 +44814,39 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     };
     // At most a group a root row here (no key is read below the last link): the groups' arrays, their first rows and
     // the key table sized for that once, not doubled as groups appear.
+    // At most a group a root row here (no key is read below the last link) - the bound of the check's shadows; the
+    // groups' arrays start small and double as groups appear (sized for every root row up front, 600k lines under
+    // 480 groups zero-filled tens of MB), and the native code reads their addresses through pf (ensure_groups
+    // updates them) and the key table's through renv (new_group updates it).
     const size_t gmax = E->roots.size() + 1;
-    if (acap < gmax) {
-      for (auto& ap : aggs) { if (acap == 0) vx::init_arrays(ap->agg, ap->plan, gmax, ap->arr); else vx::grow_arrays(ap->agg, ap->plan, gmax, ap->arr); }
-      acap = gmax;
-    }
-    first.reserve(gmax);
-    fparts.reserve(gmax * NS);
-    if (kpath == 3 && first.empty()) {
-      size_t want = 1024;
-      unsigned bits = 10;
-      while (want < gmax * 2 && bits < 40) { want *= 2; ++bits; }
-      cap = want; mask = cap - 1; shift = 64 - bits;
-      tk.assign(cap, 0);
-      tg.assign(cap, -1);
+    auto ensure_groups = [&]() {
+      if (first.size() <= acap) return;
+      const size_t ncap = std::max<size_t>({first.size(), acap * 2, 1024});
+      for (auto& ap : aggs) { if (acap == 0) vx::init_arrays(ap->agg, ap->plan, ncap, ap->arr); else vx::grow_arrays(ap->agg, ap->plan, ncap, ap->arr); }
+      acap = ncap;
+      for (size_t ai = 0; ai < pf.size() && ai < aggs.size(); ++ai) {
+        vx::AggArrays& A = aggs[ai]->arr;
+        pf[ai].cnt = A.cnt.data();
+        if (pf[ai].kind == 1) { pf[ai].num = A.num.data(); pf[ai].exact = A.exact.data(); }
+        if (pf[ai].kind == 2) { pf[ai].num = A.num.data(); pf[ai].isum = A.isum.data(); }
+      }
+    };
+    if (acap == 0) {
+      // arrays for the first groups, before the code takes their addresses: for every root row where that is a
+      // moderate count (doubling up to 81k groups for 86k orders cost more than sizing for them once), else small
+      const size_t start = gmax <= ((size_t)1 << 17) ? gmax : 1024;
+      for (auto& ap : aggs) vx::init_arrays(ap->agg, ap->plan, start, ap->arr);
+      acap = start;
+      first.reserve(start);
+      fparts.reserve(start * NS);
+      if (kpath == 3 && first.empty() && start > cap / 2) {
+        size_t want = cap;
+        unsigned bits = 64 - shift;
+        while (want < start * 2 && bits < 40) { want *= 2; ++bits; }
+        cap = want; mask = cap - 1; shift = 64 - bits;
+        tk.assign(cap, 0);
+        tg.assign(cap, -1);
+      }
     }
     build_native();
     const bool check = native && vp::pipe_check_mode();
@@ -44776,6 +44856,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         shadow[ai].cnt.assign(gmax, 0);
         shadow[ai].num.assign(gmax, 0);
         shadow[ai].exact.assign(gmax, 1);
+        shadow[ai].isum.assign(gmax, 0);
         shadow[ai].S.cover = E->bound;
         shadow[ai].S.table = sources[mc].table;
       }
@@ -44791,6 +44872,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     // group a root row at under half full, so it never grows (the code holds its slots' addresses).
     std::shared_ptr<void> rootcode;
     std::string root_why = native ? "" : "no native fold";
+    int32_t slot_none = first.empty() ? -1 : 0;       // no GROUP BY: the one group's slot (made at the first row)
     struct NgCtx { std::function<uint64_t(const uint32_t*, uint64_t, uint64_t)> f; } ngctx;
     std::vector<uint32_t> root_g;
     vp::PipeRootEnv renv;
@@ -44808,9 +44890,9 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     };
     if (native) {
       vp::PipeRootSpec sp;
-      bool ok = (kpath == 3 && cap >= gmax * 2) || kpath == 2;
+      bool ok = kpath == 3 || kpath == 2 || kpath == 0;
       if (!ok) root_why = "the key";
-      for (size_t k = 0; ok && k + 1 < E->links.size(); ++k) {
+      for (size_t k = 0; ok && k < nuniq; ++k) {
         const StarLink& L = E->links[k];
         const int64_t* pk = L.map.by_dense && !L.parent_nulls && !L.left ? parent_ints(L) : nullptr;
         if (!pk) { ok = false; root_why = "a unique link"; break; }
@@ -44819,9 +44901,10 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         rl.parent = (uint32_t)L.parent_src; rl.child = (uint32_t)L.child_src;
         sp.links.push_back(rl);
       }
-      const int64_t* mpk = ok && !ML.parent_nulls && !ML.left && ML.mm->off.size() >= 2 ? parent_ints(ML) : nullptr;
-      if (ok && !mpk) { ok = false; root_why = "the one-to-many link"; }
-      if (ok) {
+      sp.has_multi = has_multi;
+      const int64_t* mpk = ok && has_multi && !ML.parent_nulls && !ML.left && ML.mm->off.size() >= 2 ? parent_ints(ML) : nullptr;
+      if (ok && has_multi && !mpk) { ok = false; root_why = "the one-to-many link"; }
+      if (ok && has_multi) {
         sp.multi.pkeys = mpk; sp.multi.lo = ML.mm->lo; sp.multi.off = ML.mm->off.data(); sp.multi.off_n = ML.mm->off.size();
         sp.multi.rows = ML.mm->rows.data(); sp.multi.parent = (uint32_t)ML.parent_src; sp.multi.child = (uint32_t)mc;
       }
@@ -44851,6 +44934,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       if (ok) {
         sp.root = (uint32_t)E->root;
         if (kpath == 2) sp.slots = slot_dict.data();
+        else if (kpath == 0) sp.slots = &slot_none;
         else { sp.tg = tg.data(); sp.tk = tk.data(); sp.mask = mask; sp.shift = shift; }
         sp.fold_fn = vp::pipe_fold_entry(native.get());
         ngctx.f = [&](const uint32_t* prt, uint64_t id, uint64_t slot) -> uint64_t {
@@ -44858,12 +44942,24 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           row_at = renv.total;
           if (kpath == 2) {
             slot_dict[slot] = (int32_t)new_group([&](size_t s2) { return prt[s2]; });
+            ensure_groups();
             return (uint64_t)slot_dict[slot];
           }
+          if (kpath == 0) {                               // no GROUP BY: the one group
+            if (first.empty()) new_group([&](size_t s2) { return prt[s2]; });
+            slot_none = 0;
+            ensure_groups();
+            return 0;
+          }
           tk[slot] = id;
-          tg[slot] = (int32_t)new_group([&](size_t s2) { return prt[s2]; });
-          if (first.size() * 2 > cap) { fprintf(stderr, "asql: the native root loop's key table filled past its size\n"); abort(); }
-          return (uint64_t)tg[slot];
+          const int32_t g = (int32_t)new_group([&](size_t s2) { return prt[s2]; });
+          tg[slot] = g;
+          if (first.size() * 2 > cap) {                   // key_group's growth, and the table's new place for the code
+            grow();
+            renv.tg = tg.data(); renv.tk = tk.data(); renv.mask = mask; renv.shift = shift;
+          }
+          ensure_groups();
+          return (uint64_t)g;
         };
         sp.new_group = [](void* c, const uint32_t* prt, uint64_t id, uint64_t slot) -> uint64_t { return static_cast<NgCtx*>(c)->f(prt, id, slot); };
         rootcode = vp::pipe_root_build_for(sp, &root_why);
@@ -44876,6 +44972,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       renv.roots = E->roots.data();
       renv.n = E->roots.size();
       renv.ctx = &ngctx;
+      renv.tg = tg.data(); renv.tk = tk.data(); renv.mask = mask; renv.shift = shift;
       if (check) { root_g.assign(E->roots.size(), UINT32_MAX); renv.root_g = root_g.data(); }
       vp::pipe_root_run(rootcode.get(), &renv);
       total = renv.total;
@@ -44885,7 +44982,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         for (size_t ri = 0; ri < E->roots.size(); ++ri) {
           parts[E->root] = E->roots[ri];
           bool keep_row = true;
-          for (size_t k = 0; k + 1 < E->links.size(); ++k) {
+          for (size_t k = 0; k < nuniq; ++k) {
             const StarLink& L = E->links[k];
             const uint32_t got = star_partner(sources, L, parts[L.parent_src]);
             if (got == UINT32_MAX) { keep_row = false; break; }
@@ -44893,7 +44990,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           }
           const uint32_t* b = nullptr;
           const uint32_t* e = nullptr;
-          if (keep_row) star_rows_of(sources, ML, parts[ML.parent_src], &b, &e);
+          if (keep_row) run_of(ri, parts, &b, &e);
           if (!keep_row || b == e) {
             if (root_g[ri] != UINT32_MAX) { fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native root loop gave root row %zu a row\n", ri); abort(); }
             continue;
@@ -44908,6 +45005,16 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           for (size_t ai = 0; ai < aggs.size(); ++ai) {
             Shadow& sh = shadow[ai];
             if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
+              const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
+              for (size_t j = 0; j < cnt; ++j) {
+                const int64_t v = vx::typed_int(ics, b[j]);
+                sh.isum[g] += (AIOS_INT128)v;
+                sh.num[g] += (double)v;
+                sh.cnt[g]++;
+              }
+              continue;
+            }
             sh.v.resize(cnt);
             sh.z.resize(cnt);
             vx::np_eval(*aggs[ai]->agg.prog, 0, b, cnt, sh.S, sh.v.data(), sh.z.data());
@@ -44921,10 +45028,11 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         }
       }
     } else {
-    for (uint32_t rr : E->roots) {
+    for (size_t ri = 0; ri < E->roots.size(); ++ri) {
+      const uint32_t rr = E->roots[ri];
       parts[E->root] = rr;
       bool keep_row = true;
-      for (size_t k = 0; k + 1 < E->links.size(); ++k) {
+      for (size_t k = 0; k < nuniq; ++k) {
         const StarLink& L = E->links[k];
         const uint32_t got = star_partner(sources, L, parts[L.parent_src]);
         if (got == UINT32_MAX && !L.left) { keep_row = false; break; }
@@ -44933,7 +45041,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       if (!keep_row) continue;
       const uint32_t* b = nullptr;
       const uint32_t* e = nullptr;
-      star_rows_of(sources, ML, parts[ML.parent_src], &b, &e);
+      run_of(ri, parts, &b, &e);
       size_t cnt = (size_t)(e - b);
       const bool pad = cnt == 0;
       if (pad) {
@@ -44944,6 +45052,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       row_at = total + n;
       const uint32_t g = (uint32_t)key_group([&](size_t s2) { return parts[s2]; }, true);
       if (native) {
+        ensure_groups();
         if (pad) {                                     // a NULL-padded row: only COUNT(*) counts it
           for (size_t ai = 0; ai < aggs.size(); ++ai) if (pcount_star[ai]) { aggs[ai]->arr.cnt[g]++; if (check) shadow[ai].cnt[g]++; }
         } else {
@@ -44951,6 +45060,16 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           for (size_t ai = 0; check && ai < aggs.size(); ++ai) {
             Shadow& sh = shadow[ai];
             if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
+              const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
+              for (size_t j = 0; j < cnt; ++j) {
+                const int64_t v = vx::typed_int(ics, b[j]);
+                sh.isum[g] += (AIOS_INT128)v;
+                sh.num[g] += (double)v;
+                sh.cnt[g]++;
+              }
+              continue;
+            }
             sh.v.resize(cnt);
             sh.z.resize(cnt);
             vx::np_eval(*aggs[ai]->agg.prog, 0, b, cnt, sh.S, sh.v.data(), sh.z.data());
@@ -44996,6 +45115,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           const Shadow& sh = shadow[ai];
           bool same = A.cnt[g] == sh.cnt[g];
           if (pf[ai].kind == 1) same = same && std::memcmp(&A.num[g], &sh.num[g], 8) == 0 && A.exact[g] == sh.exact[g];
+          if (pf[ai].kind == 2) same = same && A.isum[g] == sh.isum[g] && std::memcmp(&A.num[g], &sh.num[g], 8) == 0;
           if (!same) {
             fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native fold differs from np_eval: aggregate %zu, group %zu\n", ai, g);
             abort();
@@ -51062,8 +51182,12 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
       bp = rids.data();
       bn = rids.size();
     }
+    // handed over unexpanded only where a grouping is to read it (a GROUP BY or an aggregate, no `*`)
+    bool may_group = !group_by.empty();
+    for (const SelectItem& it : items) if (it.expr && expr_has_aggregate(it.expr)) may_group = true;
+    for (const SelectItem& it : items) if (it.star) may_group = false;
     if (star_join(db, sources, join_conditions, join_is_left, where.get(), outer_scope, bp, bn, &star_cols, star_pushed, &serr,
-                  &star_shape, sql_pipe_on() ? &star_def : nullptr)) {
+                  &star_shape, sql_pipe_on() && may_group ? &star_def : nullptr)) {
       base_ids_only = false;
       std::vector<uint32_t>().swap(base_ids);
       star_done = true;
