@@ -281,7 +281,25 @@ non-lateral series, under and over 64 base rows, text bounds refused) are identi
 Still from this profile: `project_rows` 19% (programs and gathering), `execute_windowed` 11% and the interpreted
 `group_result` 10% (which statements take them is the next thing to measure), `get_or_build_probe_index` 4.7%
 rebuilt per statement for result tables, `colbatch_fill_table` 4.3% (DECIMAL text), and at startup
-`JEPAWorldModel` drawing a million normal variates. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
+`JEPAWorldModel` drawing a million normal variates.
+
+### GROUP_CONCAT in lanes; the lane GROUP BY's key sort
+
+The frame's final statement, `SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') FROM framebuffer`, interpreted
+two expressions for each of 64,000 rows and stable-sorted 64,000 Vals: 27 ms a frame. Done: with no DISTINCT,
+the values and keys come from lanes - a value that is a TEXT column of a source straight from its cells (the text
+the interpreter's Val holds for one; a program's text leaf refuses a result column whose text can read as a
+number, which `rgb`'s binary triples do), a key that is a typed number column read as it is (a bare column has
+no program), anything else through its program - the row numbers stable-sorted by the keys as numbers (NULL in
+any key, a text key, DISTINCT or an ordinal past the arguments: the row way), the texts joined. 27 -> 6.6 ms.
+And the lane GROUP BY's order over one key sorts packed (NULL flag, value, group) records instead of comparing
+through the groups' first rows into the lanes (53,760 groups).
+
+Measured: SQLDoom E1M1 medians 446/465/471 -> 291/293/291 ms against the build before today's commits
+(5cab6ef), alternating - 2.1 -> 3.4 frames a second. Frame bytes, the four oracle suites, the lane / mixed /
+decimal checks and a GROUP_CONCAT set (integer, double, expression and ordinal keys, DESC, two keys, NULL keys
+and NULL values, DISTINCT, SEPARATOR, several arguments, string_agg, per-group over GROUP BY, under and over 256
+rows, an unsigned key, MD5 of the whole result) are identical to the build before. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
 an edge-case set for text equality (case, trailing spaces, accents, NULL, result-table columns, numeric-looking
 text) and one for residual ON conditions (LEFT / RIGHT / inner, base-only and two-sided conjuncts, NULL
 conjuncts, numeric-prefix text keys, pushed WHERE with padding, a three-table chain) are identical to the build

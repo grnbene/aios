@@ -8847,6 +8847,129 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
   if (up == "GROUP_CONCAT"sv) {
     if (!ctx.group || ctx.group->empty() || e->args.empty()) return val_null();
 
+    // Over the rows at once (vp) where no DISTINCT is asked, the values and the ORDER BY keys compile, and no key
+    // is NULL in any row: each value's text from its lane (what Val::str prints), a stable sort of the row numbers
+    // by the keys as numbers (DESC reversed), the texts joined. The renderer's frame - GROUP_CONCAT(rgb ORDER BY
+    // pix SEPARATOR '') over 64,000 rows - interpreted two expressions a row and sorted 64,000 Vals: 29 ms a
+    // frame. Anything else (a text key, a NULL key, DISTINCT, an ordinal past the arguments) goes the row way.
+    if (!e->negated && ctx.sources && ctx.group->size() >= 256 && vp::enabled()) {
+      const size_t n = ctx.group->size();
+      std::vector<const SqlExpr*> kexprs;
+      bool ok = true;
+      for (const auto& okey : e->group_order_by) {
+        if (okey.expr) kexprs.push_back(okey.expr.get());
+        else if (okey.ordinal >= 1 && (size_t)okey.ordinal <= e->args.size()) kexprs.push_back(e->args[okey.ordinal - 1].get());
+        else { ok = false; break; }
+      }
+      // A value that is a TEXT column of a source is read straight from its cells (what the interpreter's Val
+      // holds for one: the cell's text, whatever it looks like - a program's text leaf would refuse a result
+      // column whose text can read as a number); any other value through its program.
+      struct ArgLane { bool direct = false; const ColumnStore* cs = nullptr; size_t src = 0; vp::Column col; };
+      std::vector<ArgLane> vals(e->args.size());
+      std::vector<vp::Column> keys(kexprs.size());
+      vp::Lanes shared;
+      auto rowat = [&](size_t j) -> const JoinedRow& { return (*ctx.group)[j]; };
+      for (size_t a = 0; ok && a < e->args.size(); ++a) {
+        const SqlExpr* ax = e->args[a].get();
+        size_t cs_ = 0, cc = 0;
+        if (ax && ax->op == ExprOp::Column && !is_user_var_name(ax->name) && ax->name.rfind("@@", 0) != 0 &&
+            lookup_column_here(ctx, *ax, &cs_, &cc) == ColumnLookup::Found && cs_ < ctx.sources->size() && ctx.sources->at(cs_).table) {
+          const SqlTable* t = ctx.sources->at(cs_).table;
+          if (cc < t->columns.size() && cc < t->col_data.size() && t->columns[cc].type == SqlDataType::Text &&
+              t->col_data[cc].size() == t->row_count()) {
+            vals[a].direct = true;
+            vals[a].cs = &t->col_data[cc];
+            vals[a].src = cs_;
+            continue;
+          }
+        }
+        const vp::Prog* P = vp::program_for(ax, ctx);
+        std::string verr;
+        if (!P || !vp::eval_column(*P, rowat, n, &vals[a].col, &verr, &shared)) {
+          ok = false;
+          if (vx_trace_on()) vx_trace("group_concat: value " + std::to_string(a) + (P ? " failed: " + verr : " has no program") + " (rows)");
+        }
+      }
+      auto cell_of = [&](const ArgLane& v, size_t j, bool* null) -> size_t {   // direct: the row's id in the column
+        const JoinedRow& r = rowat(j);
+        const size_t id = v.src < r.parts.size() ? r.parts[v.src] : kNullRow;
+        *null = id == kNullRow || id >= v.cs->size() || v.cs->is_null(id);
+        return id;
+      };
+      for (size_t k = 0; ok && k < kexprs.size(); ++k) {
+        const SqlExpr* kx = kexprs[k];
+        // a key that is a typed number column of a source (a bare column has no program): read as it is
+        size_t ks = 0, kc = 0;
+        if (kx && kx->op == ExprOp::Column && !is_user_var_name(kx->name) && kx->name.rfind("@@", 0) != 0 &&
+            lookup_column_here(ctx, *kx, &ks, &kc) == ColumnLookup::Found && ks < ctx.sources->size() && ctx.sources->at(ks).table) {
+          const SqlTable* t = ctx.sources->at(ks).table;
+          if (kc < t->columns.size() && kc < t->col_data.size() && !t->columns[kc].temporal && t->col_data[kc].size() == t->row_count() &&
+              lower_of(t->columns[kc].declared).find("unsigned") == std::string::npos) {
+            const ColumnStore& cs = t->col_data[kc];
+            const bool ints = vx::typed_integer(cs) && t->columns[kc].type != SqlDataType::Real;
+            const bool dbls = !ints && cs.encoding == ColumnEncoding::TypedDouble && t->columns[kc].type == SqlDataType::Real &&
+                              t->columns[kc].scale == 0 && cs.double_data.size() == cs.size();
+            if (ints || dbls) {
+              vp::Column& col = keys[k];
+              col.ty = ints ? vp::Ty::I64 : vp::Ty::F64;
+              col.n.assign(n, 0);
+              if (ints) col.i.assign(n, 0); else col.f.assign(n, 0);
+              for (size_t j = 0; j < n; ++j) {
+                const JoinedRow& r = rowat(j);
+                const size_t id = ks < r.parts.size() ? r.parts[ks] : kNullRow;
+                if (id == kNullRow || id >= cs.size() || cs.is_null(id)) { ok = false; break; }   // a NULL key: the row way
+                if (ints) col.i[j] = vx::typed_int(cs, id); else col.f[j] = cs.double_data[id];
+              }
+              if (!ok && vx_trace_on()) vx_trace("group_concat: key " + std::to_string(k) + " is NULL somewhere (rows)");
+              continue;
+            }
+          }
+        }
+        const vp::Prog* P = vp::program_for(kx, ctx);
+        std::string verr;
+        if (!P || P->out().ty == vp::Ty::Str || P->out().uns || !vp::eval_column(*P, rowat, n, &keys[k], &verr, &shared)) ok = false;
+        for (size_t j = 0; ok && j < n; ++j) if (keys[k].is_null(j)) ok = false;
+        if (!ok && vx_trace_on()) vx_trace("group_concat: key " + std::to_string(k) + (!P ? " has no program" : P->out().ty == vp::Ty::Str ? " is text" : " is NULL somewhere or failed") + " (rows)");
+      }
+      if (ok && vx_trace_on()) vx_trace("group_concat: " + std::to_string(n) + " rows in lanes");
+      if (ok) {
+        std::vector<uint32_t> kept;
+        kept.reserve(n);
+        for (size_t j = 0; j < n; ++j) {
+          bool any_null = false;
+          for (const ArgLane& v : vals) {
+            bool null = false;
+            if (v.direct) cell_of(v, j, &null); else null = v.col.is_null(j);
+            if (null) { any_null = true; break; }
+          }
+          if (!any_null) kept.push_back((uint32_t)j);
+        }
+        if (kept.empty()) return val_null();
+        if (!keys.empty())
+          std::stable_sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
+            for (size_t k = 0; k < keys.size(); ++k) {
+              const vp::Column& c = keys[k];
+              int cmp;
+              if (c.ty == vp::Ty::I64) cmp = c.i[a] < c.i[b] ? -1 : c.i[a] > c.i[b] ? 1 : 0;
+              else cmp = c.f[a] < c.f[b] ? -1 : c.f[a] > c.f[b] ? 1 : 0;
+              if (cmp != 0) return e->group_order_by[k].descending ? cmp > 0 : cmp < 0;
+            }
+            return false;
+          });
+        std::string out;
+        const std::string& sep = e->separator;
+        for (size_t i = 0; i < kept.size(); ++i) {
+          if (i > 0) out += sep;
+          for (const ArgLane& v : vals) {
+            if (v.direct) { bool null = false; const size_t id = cell_of(v, kept[i], &null); out += v.cs->get_view(id); continue; }
+            if (v.col.ty == vp::Ty::Str) out += v.col.s[kept[i]];
+            else out += v.col.text(kept[i]);
+          }
+        }
+        return val_text(out);
+      }
+    }
+
     struct GItem {
       std::string val;
       std::vector<Val> order_vals;
@@ -44133,6 +44256,19 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   // Key order, NULL first: the implicit ORDER BY of the keys, over integers. Two groups never share a key tuple.
   std::vector<uint32_t> order(G);
   for (size_t g = 0; g < G; ++g) order[g] = (uint32_t)g;
+  if (nk == 1) {
+    // one key: each group's (NULL, value) beside its id, sorted as records - not through first[] into the lanes
+    // (53,760 groups: the comparisons' reads landed all over the rows)
+    struct K1 { uint8_t nn; int64_t v; uint32_t g; };
+    std::vector<K1> ks(G);
+    for (size_t g = 0; g < G; ++g) { const size_t r = first[g]; ks[g] = K1{(uint8_t)(keys[0].n[r] ? 0 : 1), keys[0].i[r], (uint32_t)g}; }
+    const bool uns = keys[0].uns;
+    std::sort(ks.begin(), ks.end(), [uns](const K1& a, const K1& b) {
+      if (a.nn != b.nn) return a.nn < b.nn;
+      return uns ? (uint64_t)a.v < (uint64_t)b.v : a.v < b.v;
+    });
+    for (size_t g = 0; g < G; ++g) order[g] = ks[g].g;
+  } else
   std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
     const size_t ra = first[a], rb = first[b];
     for (size_t c = 0; c < nk; ++c) {
