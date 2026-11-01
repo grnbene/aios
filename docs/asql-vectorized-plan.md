@@ -457,6 +457,17 @@ RANK / DENSE_RANK / COUNT partitioned by a number or a text, ordered by a date, 
 ascending and descending, filtered through a derived table, with and without LIMIT) is identical to the build
 before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
 
+SUM(CASE WHEN cond THEN col ELSE 0 END), the ERP report's staple: the single-table path knew the constant form
+(THEN 1 ELSE 0, per dictionary code) and took the column form row by row through the interpreter (47 ms over
+200k orders; the same sum as SUM(col) WHERE cond: 1.3 ms). It is now the column summed over the rows cond selects
+(select_rows, as a WHERE would; a mask per table row), with ELSE 0 counting the other rows as zeros so a sum of
+none is 0, not NULL, and prints at the column's scale as the row path's does (the edge set caught "0" for
+"0.00" on a DECIMAL column first). The same mask serves the grouped statement (GROUP BY st). ELSE anything else,
+AVG and COUNT keep their paths. 34 -> 3.7 ms (DuckDB 1.9). A SUM(CASE) edge set (DECIMAL, INT and DOUBLE columns
+with NULLs, ELSE 0 / ELSE NULL / no ELSE, no row matching, compound and text and date conditions, GROUP BY, a WHERE
+beside it, ELSE 1 and ELSE col and AVG and COUNT left alone, 0.0 and 0e0) is identical to the build before, as are
+frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
