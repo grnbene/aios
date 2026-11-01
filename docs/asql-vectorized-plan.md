@@ -135,8 +135,15 @@ against the build before, the suites, the frame's bytes and alternating frame ti
   columns from their cells, items as lanes, the interpreter for the rest, parallel chunks, the bounded emit, the
   batch and sink forms). The select function 89,801 -> 78,167 bytes, `project_rows` 22,425; 4,969 of 5,060
   functions the same size; frames 499/520/522 -> 532/502/521 ms.
-- next: **base** (the base source's selection and rows) and **sources** (resolving and materializing them); the
-  function left is the driver that walks the plan.
+- **base** (done): `BasePlan` + `base_rows` - the 628-line base selection (the base source's WHERE conjuncts in
+  lanes or through probe indexes and zone maps, semi-joins against the joined tables, rows as ids alone where the
+  joins can take them). The select function 78,167 -> 63,657 bytes, `base_rows` 21,008; 4,975 of 5,048 functions
+  the same size; frames 497/508/503 -> 496/497/512 ms.
+- what is left (2,000 lines): **setup** - the sources resolved and materialized (CTEs, derived tables, LATERAL,
+  merged views), the branch rewritten, the join order fixed (983 lines, reads only the branch) - which is the
+  planner, not an operator: its output is the state the operators take; the fast paths and the single-table
+  engine's call; the star join; the residual WHERE and the select-list expansion. Step 2c makes the setup's output
+  a `SelectRun` struct the operators' plans point into, and the function the driver that walks it.
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 

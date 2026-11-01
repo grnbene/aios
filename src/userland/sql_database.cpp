@@ -47133,6 +47133,677 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
   return std::nullopt;
 }
 
+// The base operator (docs/asql-vectorized-plan.md, stage 2b): the base source's rows for the joins to start from -
+// its own WHERE conjuncts selected in lanes or through probe indexes and zone maps, semi-joins against the tables
+// joined to it, the rows as ids alone where the joins can take them so. The pointers refer into
+// execute_parsed_select_single's state; what it changes (the rows and their hold, the base ids, the WHERE parts it
+// pushed down, the WHERE left, the error) is not const.
+struct BasePlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<ExprPtr>* join_conditions;
+  const std::vector<bool>* join_is_left;
+  bool any_right;
+  ExprPtr* where;
+  const std::vector<ExprPtr>* group_by;
+  const std::vector<OrderKey>* order_by;
+  long long limit, offset;
+  const EvalCtx* outer_scope;
+  JoinedRows* rows;
+  QueryMemHold* rows_hold;
+  std::vector<uint32_t>* base_ids;
+  bool* base_ids_only;
+  std::unordered_set<const SqlExpr*>* pushed_where_parts;
+  std::string* err;
+};
+// Empty: the base rows are made, on to the joins; a result: an error to return.
+static std::optional<SqlQueryResult> base_rows(const BasePlan& plan, PhaseClock& phases) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<ExprPtr>& join_conditions = *plan.join_conditions;
+  const std::vector<bool>& join_is_left = *plan.join_is_left;
+  const bool any_right = plan.any_right;
+  ExprPtr& where = *plan.where;
+  const std::vector<ExprPtr>& group_by = *plan.group_by;
+  const std::vector<OrderKey>& order_by = *plan.order_by;
+  const long long limit = plan.limit, offset = plan.offset;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  JoinedRows& rows = *plan.rows;
+  QueryMemHold& rows_hold = *plan.rows_hold;
+  std::vector<uint32_t>& base_ids = *plan.base_ids;
+  bool& base_ids_only = *plan.base_ids_only;
+  std::unordered_set<const SqlExpr*>& pushed_where_parts = *plan.pushed_where_parts;
+  std::string& err = *plan.err;
+  (void)any_right; (void)group_by; (void)order_by; (void)limit; (void)offset; (void)rows_hold; (void)phases;
+  if (where && join_conditions.empty() && sources.size() == 1) {
+    EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+    ctx.sources = &sources;
+    ctx.err = &err;
+    const SqlTable& stbl = *sources[0].table;
+
+    // Look the rows up by candidate equalities or in-lists rather than
+    // walking the entire table.
+    bool probed = false;
+    std::vector<ProbeCandidate> pcands;
+    find_probe_candidates(where.get(), ctx, ctx, &pcands);
+    if (!pcands.empty()) {
+      ctx.row = nullptr;  // the value must not depend on this scan's row
+
+      std::shared_ptr<ProbeIndex> best;
+      const ProbeCandidate* best_cand = nullptr;
+      size_t best_count = (size_t)-1;
+      for (const ProbeCandidate& k : pcands) {
+        std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, stbl, k.column);
+        if (!idx) continue;
+        size_t n = 0;
+        if (k.is_range && k.values.size() == 2) {
+          SelectEngine::ensure_sorted_probe_index(db, idx.get(), stbl);
+          if (!range_probe_safe(idx.get(), k.values[0], k.values[1], k.has_low, k.has_high)) continue;
+          n = probe_count_range(stbl, idx.get(), k.values[0], k.values[1], k.has_low, k.has_high);
+        } else {
+          if (k.values.size() > 128) {
+            size_t sample_n = 0;
+            constexpr size_t kSamples = 32;
+            size_t step = k.values.size() / kSamples;
+            for (size_t si = 0; si < kSamples; ++si) {
+              sample_n += probe_count_matches(idx.get(), k.values[si * step]);
+            }
+            n = (sample_n * k.values.size()) / kSamples;
+          } else {
+            for (const Val& v : k.values) n += probe_count_matches(idx.get(), v);
+          }
+        }
+        if (n < best_count) { best_count = n; best = idx; best_cand = &k; }
+      }
+
+      if (best && best_cand && best_count < stbl.row_count()) {
+        std::vector<size_t> cands;
+        cands.reserve(best_count);
+        if (best_cand->is_range && best_cand->values.size() == 2) {
+          SelectEngine::ensure_sorted_probe_index(db, best.get(), stbl);
+          probe_gather_range(stbl, best.get(), best_cand->values[0], best_cand->values[1], cands,
+                             best_cand->has_low, best_cand->has_high);
+        } else {
+          for (const Val& v : best_cand->values) probe_gather_matches(best.get(), v, cands);
+        }
+        if (best_cand->is_list) {
+          std::sort(cands.begin(), cands.end());
+          cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+        }
+        bool exact_predicate = (!best_cand->is_list && !best_cand->is_range && where->op == ExprOp::Eq);
+        if (!rows_hold.reserve(cands.size() * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+        rows.reserve(cands.size());
+        for (size_t ri : cands) {
+          if (ri >= stbl.row_count()) continue;
+          JoinedRow jr;
+          jr.parts.push_back(ri);
+          if (exact_predicate) {
+            rows.push_back(std::move(jr));
+          } else {
+            ctx.row = &jr;
+            if (predicate_true(where.get(), ctx)) rows.push_back(std::move(jr));
+            if (!err.empty()) return make_error(err);
+          }
+        }
+        g_probe_hits++;
+        g_probe_candidates += (long long)cands.size();
+        probed = true;
+      }
+    }
+
+    if (!probed) {
+      g_scan_fallbacks++;
+      g_scan_rows += (long long)stbl.row_count();
+      // Sized once the matches are counted (below): reserving the whole
+      // table here held 80 bytes per row of it for a scan matching one.
+
+      // Fast-path scalar predicate evaluation for single column OP const
+      size_t fast_where_col = 0;
+      bool fast_where = false;
+      ExprOp fast_op = where ? where->op : ExprOp::Column;
+      double fast_num_const = 0.0;
+      bool fast_num = false;
+      std::string fast_str_const;
+
+      const bool fast_cmp = where && (where->op == ExprOp::Eq || where->op == ExprOp::Ne ||
+                                      where->op == ExprOp::Lt || where->op == ExprOp::Le ||
+                                      where->op == ExprOp::Gt || where->op == ExprOp::Ge);
+      if (fast_cmp && where->args.size() == 2 && where->args[0] && where->args[0]->op == ExprOp::Column &&
+          where->args[1] && where->args[1]->op == ExprOp::Literal) {
+        size_t s = 0, c = 0;
+        if (lookup_column_here(ctx, *where->args[0], &s, &c) == ColumnLookup::Found && s == 0 &&
+            !(probe_temporal(ctx, s, c) && !where->args[1]->literal.numeric)) {
+          fast_where_col = c;
+          const Val& lit = where->args[1]->literal;
+          // A number column against quoted text compares as numbers (see
+          // the aggregate path's same test).
+          const bool num_col = c < stbl.columns.size() && sql_type_numeric(stbl.columns[c].type) && !stbl.columns[c].temporal;
+          if (lit.numeric || (num_col && !lit.null)) {
+            fast_num = true;
+            fast_num_const = lit.numeric ? lit.num : numeric_prefix_of(lit.str());
+            fast_where = true;
+          } else if (!lit.null) {
+            fast_str_const = lit.str();   // compared with pad_compare_ci, as compare_vals does
+            fast_where = true;
+          }
+        }
+      }
+
+      if (fast_where) {
+        size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+        if (total_threads == 0) total_threads = 1;
+        std::vector<JoinedRows> local_rows(((stbl.row_count()) + 2048 - 1) / 2048);
+        SqlThreadPool::instance().for_chunks(stbl.row_count(), 2048, stbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
+          if (tid >= total_threads) tid = 0;
+          auto& l_rows = local_rows[bstart / 2048];
+          for (size_t ri = bstart; ri < bend; ++ri) {
+            if (fast_where_col >= stbl.columns.size()) continue;
+            const std::string& cell = stbl.cell(ri, fast_where_col);
+            if (sql_is_null(cell)) continue;
+            bool match = false;
+            if (fast_num) {
+              // The cell as MySQL reads it against a number: its numeric
+              // prefix, 0 when it has none ('ABC' < 5 is true). strtod
+              // skipped every cell without a leading number, so `sid < 5`
+              // lost 'ABC' and 'X9', and it took 'inf' / '0x1A' as numbers.
+              const double d = numeric_prefix_of(cell);
+              if (fast_op == ExprOp::Gt) match = (d > fast_num_const);
+              else if (fast_op == ExprOp::Ge) match = (d >= fast_num_const);
+              else if (fast_op == ExprOp::Lt) match = (d < fast_num_const);
+              else if (fast_op == ExprOp::Le) match = (d <= fast_num_const);
+              else if (fast_op == ExprOp::Eq) match = (d == fast_num_const);
+              else if (fast_op == ExprOp::Ne) match = (d != fast_num_const);
+            } else {
+              // The collation compare_vals uses (case-insensitive, PAD
+              // SPACE): byte order of the collation keys put 'a ' after
+              // 'a' and made `<` and `>` disagree with every other path.
+              const int cmp = pad_compare_ci(cell, fast_str_const);
+              if (fast_op == ExprOp::Eq) match = cmp == 0;
+              else if (fast_op == ExprOp::Ne) match = cmp != 0;
+              else if (fast_op == ExprOp::Gt) match = cmp > 0;
+              else if (fast_op == ExprOp::Ge) match = cmp >= 0;
+              else if (fast_op == ExprOp::Lt) match = cmp < 0;
+              else if (fast_op == ExprOp::Le) match = cmp <= 0;
+            }
+            if (match) {
+              JoinedRow jr;
+              jr.parts.push_back(ri);
+              l_rows.push_back(std::move(jr));
+            }
+          }
+        });
+        size_t total_match_count = 0;
+        for (const auto& lr : local_rows) total_match_count += lr.size();
+                    if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+        rows.reserve(total_match_count);
+        for (auto& lr : local_rows) {
+          for (auto& r : lr) rows.push_back(std::move(r));
+        }
+      } else {
+        size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+        if (total_threads == 0) total_threads = 1;
+        std::vector<JoinedRows> local_rows(((stbl.row_count()) + 2048 - 1) / 2048);
+        std::vector<std::string> local_errs(total_threads);
+        SqlThreadPool::instance().for_chunks(stbl.row_count(), 2048, stbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
+          if (tid >= total_threads) tid = 0;
+          EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
+          l_ctx.sources = &sources;
+          l_ctx.err = &local_errs[tid];
+          auto& l_rows = local_rows[bstart / 2048];
+          for (size_t ri = bstart; ri < bend; ++ri) {
+            JoinedRow jr;
+            jr.parts.push_back(ri);
+            l_ctx.row = &jr;
+            if (predicate_true(where.get(), l_ctx)) {
+              l_rows.push_back(std::move(jr));
+            }
+            if (!local_errs[tid].empty()) break;
+          }
+        });
+        for (const auto& l_err : local_errs) {
+          if (!l_err.empty()) return make_error(l_err);
+        }
+        size_t total_match_count = 0;
+        for (const auto& lr : local_rows) total_match_count += lr.size();
+                    if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+        rows.reserve(total_match_count);
+        for (auto& lr : local_rows) {
+          for (auto& r : lr) rows.push_back(std::move(r));
+        }
+      }
+    }
+    where = nullptr; // already applied during source scan
+  } else {
+    phases.mark("single");
+    // WHERE pushdown: find conjuncts that reference ONLY the base table
+    // (source 0) and evaluate them during the scan so the join sees fewer
+    // rows. Also propagate equalities/predicates across inner joins: if WHERE has `join_tbl.col = const`
+    // or `join_tbl.col IN (...)` and an ON clause has `base_tbl.col = join_tbl.col`, synthesize for base_tbl.
+    std::vector<const SqlExpr*> base_preds;
+    std::vector<ExprPtr> synth_preds;
+    if (where && !join_conditions.empty() && !any_right) {
+      std::vector<const SqlExpr*> parts;
+      collect_conjuncts(where.get(), &parts);
+      std::vector<QuerySource> base_only(sources.begin(), sources.begin() + 1);
+      EvalCtx check_ctx; check_ctx.sources = &base_only;
+      for (const SqlExpr* p : parts) {
+        if (expr_reads_local(p, check_ctx)) {
+          bool refs_later = false;
+          for (size_t si = 1; si < sources.size() && !refs_later; ++si) {
+            std::vector<QuerySource> later(sources.begin() + si, sources.begin() + si + 1);
+            EvalCtx lctx; lctx.sources = &later;
+            if (expr_reads_local(p, lctx)) refs_later = true;
+          }
+          if (!refs_later) {
+            base_preds.push_back(p);
+            pushed_where_parts.insert(p);
+          }
+        }
+      }
+
+      // Equivalence propagation: for WHERE parts on joined tables
+      for (const SqlExpr* p : parts) {
+        if (!p) continue;
+        // Case 1: p is an equality `col = const` or `const = col`
+        if (p->op == ExprOp::Eq && p->args.size() == 2) {
+          for (int pside = 0; pside < 2; ++pside) {
+            const SqlExpr* pcol = p->args[pside].get();
+            const SqlExpr* pval = p->args[1 - pside].get();
+            if (!pcol || pcol->op != ExprOp::Column) continue;
+            EvalCtx all_ctx; all_ctx.sources = &sources;
+            if (expr_reads_local(pval, all_ctx)) continue;
+
+            for (size_t j = 0; j < join_conditions.size(); ++j) {
+              std::vector<const SqlExpr*> jparts;
+              collect_conjuncts(join_conditions[j].get(), &jparts);
+              for (const SqlExpr* jc : jparts) {
+                if (!jc || jc->op != ExprOp::Eq || jc->args.size() != 2) continue;
+                for (int jside = 0; jside < 2; ++jside) {
+                  const SqlExpr* j_base = jc->args[jside].get();
+                  const SqlExpr* j_other = jc->args[1 - jside].get();
+                  if (!j_base || j_base->op != ExprOp::Column) continue;
+                  if (!j_other || j_other->op != ExprOp::Column) continue;
+                  if (!expr_reads_local(j_base, check_ctx)) continue;
+
+                  size_t s_other = 0, c_other = 0;
+                  size_t s_pcol = 0, c_pcol = 0;
+                  if (resolve_column(all_ctx, *j_other, &s_other, &c_other) &&
+                      resolve_column(all_ctx, *pcol, &s_pcol, &c_pcol) &&
+                      s_other == s_pcol && c_other == c_pcol) {
+                    auto syn = std::make_shared<SqlExpr>();
+                    syn->op = ExprOp::Eq;
+                    syn->args.push_back(clone_expr(j_base));
+                    syn->args.push_back(clone_expr(pval));
+                    base_preds.push_back(syn.get());
+                    synth_preds.push_back(std::move(syn));
+                  }
+                }
+              }
+            }
+          }
+        }
+        // Case 2: p is In, Between, Gt, Lt, Ge, Le, Like where args[0] is a column on a joined table
+        else if ((p->op == ExprOp::In || p->op == ExprOp::Between ||
+                  p->op == ExprOp::Gt || p->op == ExprOp::Lt ||
+                  p->op == ExprOp::Ge || p->op == ExprOp::Le ||
+                  p->op == ExprOp::Like) && !p->args.empty()) {
+          const SqlExpr* pcol = p->args[0].get();
+          if (pcol && pcol->op == ExprOp::Column) {
+            // Check if all other args are independent of local sources
+            EvalCtx all_ctx; all_ctx.sources = &sources;
+            bool other_args_ok = true;
+            for (size_t i = 1; i < p->args.size(); ++i) {
+              if (expr_reads_local(p->args[i].get(), all_ctx)) {
+                other_args_ok = false;
+                break;
+              }
+            }
+            if (other_args_ok) {
+              for (size_t j = 0; j < join_conditions.size(); ++j) {
+                std::vector<const SqlExpr*> jparts;
+                collect_conjuncts(join_conditions[j].get(), &jparts);
+                for (const SqlExpr* jc : jparts) {
+                  if (!jc || jc->op != ExprOp::Eq || jc->args.size() != 2) continue;
+                  for (int jside = 0; jside < 2; ++jside) {
+                    const SqlExpr* j_base = jc->args[jside].get();
+                    const SqlExpr* j_other = jc->args[1 - jside].get();
+                    if (!j_base || j_base->op != ExprOp::Column) continue;
+                    if (!j_other || j_other->op != ExprOp::Column) continue;
+                    if (!expr_reads_local(j_base, check_ctx)) continue;
+
+                    size_t s_other = 0, c_other = 0;
+                    size_t s_pcol = 0, c_pcol = 0;
+                    if (resolve_column(all_ctx, *j_other, &s_other, &c_other) &&
+                        resolve_column(all_ctx, *pcol, &s_pcol, &c_pcol) &&
+                        s_other == s_pcol && c_other == c_pcol) {
+                      auto syn = clone_expr(p);
+                      syn->args[0] = clone_expr(j_base);
+                      base_preds.push_back(syn.get());
+                      synth_preds.push_back(std::move(syn));
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    phases.mark("analysis");
+    if (!base_preds.empty()) {
+      EvalCtx const_ctx;
+      const_ctx.db = db;
+      const_ctx.outer = outer_scope;
+      const_ctx.sources = nullptr;
+      const_ctx.row = nullptr;
+      // The query's own subqueries first: a clone taken afterwards carries
+      // the filled result along. Cloned first, each uncorrelated IN
+      // (SELECT ...) ran twice - once for the clone, once for the WHERE
+      // (nosales' NOT IN over a year of stocktrans: 2.5 s each).
+      if (where) prepare_expr_for_thread_pool(where.get(), const_ctx);
+      // The WHERE itself keeps its IN (subquery) form: a joined table's
+      // `col IN (select ...)` becomes a vectorized semijoin filter that
+      // way, where a literal list would be tested per joined row through
+      // the interpreter (the reports ran 10% slower). Only the predicates
+      // synthesized onto the base table below are inlined - those are what
+      // the base selection walked row by row.
+      for (const auto& jc : join_conditions) if (jc) prepare_expr_for_thread_pool(jc.get(), const_ctx);
+      phases.mark("prepare");
+      std::vector<const SqlExpr*> folded_base_preds;
+      for (const SqlExpr* bp : base_preds) {
+        auto cloned = clone_expr(bp);
+        cloned = fold_constant_subexpressions(cloned, const_ctx);
+        prepare_expr_for_thread_pool(cloned.get(), const_ctx);
+        // The predicates synthesized onto the base from a joined table's
+        // `col IN (subquery)` are clones of the original: rewritten here,
+        // after their own subquery ran, or the base still walks its rows.
+        inline_small_in_subqueries(cloned.get(), 1024);
+        folded_base_preds.push_back(cloned.get());
+        synth_preds.push_back(std::move(cloned));
+      }
+      base_preds = folded_base_preds;
+
+      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+      std::vector<QuerySource> base_only(sources.begin(), sources.begin() + 1);
+      ctx.sources = &base_only;
+      ctx.err = &err;
+      const SqlTable& btbl = *sources[0].table;
+
+      // The same probe-index trick the single-table, no-join path already
+      // uses (find_probe_candidates + get_or_build_probe_index) applies
+      // just as well here: a pushed-down base predicate like
+      // `completed = '0'` is still a plain column-equals-constant, and
+      // walking every row of a 300-400K row table to evaluate it through
+      // the general expression interpreter is the actual cost of this
+      // whole query, not the joins after it. Every candidate the index
+      // returns still goes through the full base_preds check below, so a
+      // narrower-than-expected index can only cost time, never rows.
+      // The vectorized selection (per-value / typed / zone-pruned, index
+      // only where one is ready or the query is correlated) for a big
+      // base table: finding stocktrans' 9 rows of one invoice built a hash
+      // index over 12.4M stockmoves rows first - 9 s.
+      bool vx_selected = false;
+      // Any size: the compiled selection is cheaper than the row-by-row
+      // interpreter even over a handful of rows - st's tax-rates join
+      // (172 rows) spent 123 of its 143 us interpreting its WHERE per row.
+      static const bool no_vx = std::getenv("AIOS_SQL_NO_VX") != nullptr;
+      if (!no_vx && btbl.row_count() > 0 && !btbl.inferred_types) {
+        bool aligned = true;
+        for (const auto& cs : btbl.col_data) if (cs.size() != btbl.row_count()) aligned = false;
+        if (aligned) {
+          ExprPtr conj;
+          for (const SqlExpr* bp : base_preds) {
+            ExprPtr leaf(std::shared_ptr<SqlExpr>(), const_cast<SqlExpr*>(bp));   // not owned
+            if (!conj) { conj = leaf; continue; }
+            auto a = std::make_shared<SqlExpr>();
+            a->op = ExprOp::And;
+            a->args = {conj, leaf};
+            conj = a;
+          }
+          EvalCtx vlocal;
+          vlocal.sources = &base_only;
+          vx::Selection vsel;
+          if (!vx::select_rows(db, btbl, conj.get(), vlocal, ctx, &vsel, &err)) return make_error(err);
+          phases.mark("select");
+          std::vector<uint32_t> ids = vsel.flat();
+          if (!rows_hold.reserve(ids.size() * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+          // Only when the base table's own conditions leave a lot of rows
+          // is it worth filtering the joined tables first (their selection
+          // and key collection cost ~1 s): a date range that already
+          // leaves nothing, or a few thousand rows, joins as it is.
+          if (ids.size() > 100000 && !any_right) {
+            std::vector<ExprPtr> semi_keep;
+            std::vector<vx::Pred> semi = semi_join_filters(db, sources, join_conditions, join_is_left, where.get(),
+                                                           outer_scope, &err, &semi_keep);
+            if (!err.empty()) return make_error(err);
+            if (!semi.empty()) {
+              vx::Pred all = std::move(semi[0]);
+              for (size_t k = 1; k < semi.size(); ++k) {
+                vx::Pred a;
+                a.kind = vx::Pred::And;
+                a.kids.push_back(std::move(all));
+                a.kids.push_back(std::move(semi[k]));
+                all = std::move(a);
+              }
+              vx::Selection kept;
+              kept.total = btbl.row_count();
+              kept.hits.assign(kept.morsels(), {});
+              if (!vx::verify_candidates(all, btbl, ids, ctx, &kept, &err)) return make_error(err);
+              ids = kept.flat();
+            }
+          }
+          if (!join_conditions.empty() && !any_right && ids.size() >= 256) {
+            base_ids = std::move(ids);
+            base_ids_only = true;
+          } else {
+            rows.reserve(ids.size());
+            for (uint32_t r : ids) {
+              JoinedRow jr;
+              jr.parts.push_back(r);
+              rows.push_back(std::move(jr));
+            }
+          }
+          vx_selected = true;
+          if (vx_trace_on()) vx_trace("join base: vectorized selection " + std::to_string(ids.size()) + " rows");
+        }
+      }
+      phases.mark("semi");
+      if (!vx_selected) {
+      std::vector<ProbeCandidate> pcands;
+      for (const SqlExpr* bp : base_preds) find_probe_candidates(bp, ctx, ctx, &pcands);
+
+      // Fold two one-sided ranges over the same column into a single two-sided range
+      for (size_t i = 0; i < pcands.size(); ++i) {
+        ProbeCandidate& a = pcands[i];
+        if (!a.is_range || a.values.size() != 2) continue;
+        for (size_t j = i + 1; j < pcands.size();) {
+          ProbeCandidate& b = pcands[j];
+          if (!b.is_range || b.values.size() != 2 || b.column != a.column ||
+              (a.has_low && b.has_low) || (a.has_high && b.has_high) ||
+              a.values[0].numeric != b.values[0].numeric) {
+            ++j;
+            continue;
+          }
+          if (b.has_low) { a.values[0] = b.values[0]; a.has_low = true; }
+          if (b.has_high) { a.values[1] = b.values[1]; a.has_high = true; }
+          pcands.erase(pcands.begin() + (long)j);
+        }
+      }
+
+      bool probed = false;
+      if (!pcands.empty()) {
+        ctx.row = nullptr;  // the value must not depend on this scan's row
+
+        std::shared_ptr<ProbeIndex> best;
+        const ProbeCandidate* best_cand = nullptr;
+        size_t best_count = (size_t)-1;
+        for (const ProbeCandidate& k : pcands) {
+          std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, btbl, k.column);
+          if (!idx) continue;
+          size_t n = 0;
+          if (k.is_range && k.values.size() == 2) {
+            SelectEngine::ensure_sorted_probe_index(db, idx.get(), btbl);
+            if (!range_probe_safe(idx.get(), k.values[0], k.values[1], k.has_low, k.has_high)) continue;
+            n = probe_count_range(btbl, idx.get(), k.values[0], k.values[1], k.has_low, k.has_high);
+          } else {
+            if (k.values.size() > 128) {
+              size_t sample_n = 0;
+              constexpr size_t kSamples = 32;
+              size_t step = k.values.size() / kSamples;
+              for (size_t si = 0; si < kSamples; ++si) {
+                sample_n += probe_count_matches(idx.get(), k.values[si * step]);
+              }
+              n = (sample_n * k.values.size()) / kSamples;
+            } else {
+              for (const Val& v : k.values) n += probe_count_matches(idx.get(), v);
+            }
+          }
+          if (n < best_count) { best_count = n; best = idx; best_cand = &k; }
+        }
+
+        if (best && best_cand && best_count < btbl.row_count()) {
+          std::vector<size_t> cands;
+          cands.reserve(best_count);
+          if (best_cand->is_range && best_cand->values.size() == 2) {
+            SelectEngine::ensure_sorted_probe_index(db, best.get(), btbl);
+            probe_gather_range(btbl, best.get(), best_cand->values[0], best_cand->values[1], cands,
+                               best_cand->has_low, best_cand->has_high);
+          } else {
+            for (const Val& v : best_cand->values) probe_gather_matches(best.get(), v, cands);
+          }
+          if (best_cand->is_list || best_cand->is_range) {
+            std::sort(cands.begin(), cands.end());
+            cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+          }
+          if (cands.size() >= 512) {
+            size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+            if (total_threads == 0) total_threads = 1;
+            std::vector<JoinedRows> local_rows(((cands.size()) + 512 - 1) / 512);
+            std::vector<std::string> local_errs(total_threads);
+            SqlThreadPool::instance().parallel_for(cands.size(), 512, [&](size_t bstart, size_t bend, size_t tid) {
+              if (tid >= total_threads) tid = 0;
+              EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
+              l_ctx.sources = &base_only;
+              l_ctx.err = &local_errs[tid];
+              auto& l_rows = local_rows[bstart / 512];
+              for (size_t ci = bstart; ci < bend; ++ci) {
+                size_t ri = cands[ci];
+                if (ri >= btbl.row_count()) continue;
+                JoinedRow jr;
+                jr.parts.push_back(ri);
+                l_ctx.row = &jr;
+                bool keep = true;
+                for (const SqlExpr* bp : base_preds) {
+                  if (!predicate_true(bp, l_ctx)) { keep = false; break; }
+                  if (!local_errs[tid].empty()) break;
+                }
+                if (keep) l_rows.push_back(std::move(jr));
+              }
+            });
+            for (const auto& l_err : local_errs) {
+              if (!l_err.empty()) return make_error(l_err);
+            }
+            size_t total_match_count = 0;
+            for (const auto& lr : local_rows) total_match_count += lr.size();
+                            if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+            rows.reserve(total_match_count);
+            for (auto& lr : local_rows) {
+              for (auto& r : lr) rows.push_back(std::move(r));
+            }
+          } else {
+            rows.reserve(cands.size());
+            for (size_t ri : cands) {
+              if (ri >= btbl.row_count()) continue;
+              JoinedRow jr;
+              jr.parts.push_back(ri);
+              ctx.row = &jr;
+              bool keep = true;
+              for (const SqlExpr* bp : base_preds) {
+                if (!predicate_true(bp, ctx)) { keep = false; break; }
+                if (!err.empty()) return make_error(err);
+              }
+              if (keep) rows.push_back(std::move(jr));
+            }
+          }
+          probed = true;
+        }
+      }
+
+      if (!probed) {
+        if (btbl.row_count() >= 2048) {
+          size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+          if (total_threads == 0) total_threads = 1;
+          std::vector<JoinedRows> local_rows(((btbl.row_count()) + 2048 - 1) / 2048);
+          std::vector<std::string> local_errs(total_threads);
+          SqlThreadPool::instance().for_chunks(btbl.row_count(), 2048, btbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
+            if (tid >= total_threads) tid = 0;
+            EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
+            l_ctx.sources = &base_only;
+            l_ctx.err = &local_errs[tid];
+            auto& l_rows = local_rows[bstart / 2048];
+            for (size_t ri = bstart; ri < bend; ++ri) {
+              JoinedRow jr;
+              jr.parts.push_back(ri);
+              l_ctx.row = &jr;
+              bool keep = true;
+              for (const SqlExpr* bp : base_preds) {
+                if (!predicate_true(bp, l_ctx)) { keep = false; break; }
+                if (!local_errs[tid].empty()) break;
+              }
+              if (keep) l_rows.push_back(std::move(jr));
+            }
+          });
+          for (const auto& l_err : local_errs) {
+            if (!l_err.empty()) return make_error(l_err);
+          }
+          size_t total_match_count = 0;
+          for (const auto& lr : local_rows) total_match_count += lr.size();
+                        if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+          rows.reserve(total_match_count);
+          for (auto& lr : local_rows) {
+            for (auto& r : lr) rows.push_back(std::move(r));
+          }
+        } else {
+          rows.reserve(btbl.row_count() / 4);
+          for (size_t ri = 0; ri < btbl.row_count(); ++ri) {
+            JoinedRow jr;
+            jr.parts.push_back(ri);
+            ctx.row = &jr;
+            bool keep = true;
+            for (const SqlExpr* bp : base_preds) {
+              if (!predicate_true(bp, ctx)) { keep = false; break; }
+              if (!err.empty()) return make_error(err);
+            }
+            if (keep) {
+              rows.push_back(jr);
+              if (limit >= 0 && group_by.empty() && order_by.empty() && join_conditions.empty()) {
+                if (rows.size() >= (size_t)(offset + limit)) break;
+              }
+            }
+          }
+        }
+      }
+      }   // !vx_selected
+    } else if (!join_conditions.empty() && !any_right && limit < 0 && sources[0].table->row_count() >= 256) {
+      base_ids.resize(sources[0].table->row_count());
+      for (size_t ri = 0; ri < base_ids.size(); ++ri) base_ids[ri] = (uint32_t)ri;
+      base_ids_only = true;
+    } else {
+      rows.reserve(sources[0].table->row_count());
+      for (size_t ri = 0; ri < sources[0].table->row_count(); ++ri) {
+        JoinedRow jr;
+        jr.parts.push_back(ri);
+        rows.push_back(jr);
+        if (limit >= 0 && group_by.empty() && order_by.empty() && join_conditions.empty()) {
+          if (rows.size() >= (size_t)(offset + limit)) break;
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
   const SqlDatabase* outer_type_db = g_type_db;
   g_type_db = db;
@@ -48362,632 +49033,9 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
       }
     }
     if (!fast_pk_done) {
-      if (where && join_conditions.empty() && sources.size() == 1) {
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.err = &err;
-        const SqlTable& stbl = *sources[0].table;
-
-        // Look the rows up by candidate equalities or in-lists rather than
-        // walking the entire table.
-        bool probed = false;
-        std::vector<ProbeCandidate> pcands;
-        find_probe_candidates(where.get(), ctx, ctx, &pcands);
-        if (!pcands.empty()) {
-          ctx.row = nullptr;  // the value must not depend on this scan's row
-
-          std::shared_ptr<ProbeIndex> best;
-          const ProbeCandidate* best_cand = nullptr;
-          size_t best_count = (size_t)-1;
-          for (const ProbeCandidate& k : pcands) {
-            std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, stbl, k.column);
-            if (!idx) continue;
-            size_t n = 0;
-            if (k.is_range && k.values.size() == 2) {
-              SelectEngine::ensure_sorted_probe_index(db, idx.get(), stbl);
-              if (!range_probe_safe(idx.get(), k.values[0], k.values[1], k.has_low, k.has_high)) continue;
-              n = probe_count_range(stbl, idx.get(), k.values[0], k.values[1], k.has_low, k.has_high);
-            } else {
-              if (k.values.size() > 128) {
-                size_t sample_n = 0;
-                constexpr size_t kSamples = 32;
-                size_t step = k.values.size() / kSamples;
-                for (size_t si = 0; si < kSamples; ++si) {
-                  sample_n += probe_count_matches(idx.get(), k.values[si * step]);
-                }
-                n = (sample_n * k.values.size()) / kSamples;
-              } else {
-                for (const Val& v : k.values) n += probe_count_matches(idx.get(), v);
-              }
-            }
-            if (n < best_count) { best_count = n; best = idx; best_cand = &k; }
-          }
-
-          if (best && best_cand && best_count < stbl.row_count()) {
-            std::vector<size_t> cands;
-            cands.reserve(best_count);
-            if (best_cand->is_range && best_cand->values.size() == 2) {
-              SelectEngine::ensure_sorted_probe_index(db, best.get(), stbl);
-              probe_gather_range(stbl, best.get(), best_cand->values[0], best_cand->values[1], cands,
-                                 best_cand->has_low, best_cand->has_high);
-            } else {
-              for (const Val& v : best_cand->values) probe_gather_matches(best.get(), v, cands);
-            }
-            if (best_cand->is_list) {
-              std::sort(cands.begin(), cands.end());
-              cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
-            }
-            bool exact_predicate = (!best_cand->is_list && !best_cand->is_range && where->op == ExprOp::Eq);
-            if (!rows_hold.reserve(cands.size() * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-            rows.reserve(cands.size());
-            for (size_t ri : cands) {
-              if (ri >= stbl.row_count()) continue;
-              JoinedRow jr;
-              jr.parts.push_back(ri);
-              if (exact_predicate) {
-                rows.push_back(std::move(jr));
-              } else {
-                ctx.row = &jr;
-                if (predicate_true(where.get(), ctx)) rows.push_back(std::move(jr));
-                if (!err.empty()) return make_error(err);
-              }
-            }
-            g_probe_hits++;
-            g_probe_candidates += (long long)cands.size();
-            probed = true;
-          }
-        }
-
-        if (!probed) {
-          g_scan_fallbacks++;
-          g_scan_rows += (long long)stbl.row_count();
-          // Sized once the matches are counted (below): reserving the whole
-          // table here held 80 bytes per row of it for a scan matching one.
-
-          // Fast-path scalar predicate evaluation for single column OP const
-          size_t fast_where_col = 0;
-          bool fast_where = false;
-          ExprOp fast_op = where ? where->op : ExprOp::Column;
-          double fast_num_const = 0.0;
-          bool fast_num = false;
-          std::string fast_str_const;
-
-          const bool fast_cmp = where && (where->op == ExprOp::Eq || where->op == ExprOp::Ne ||
-                                          where->op == ExprOp::Lt || where->op == ExprOp::Le ||
-                                          where->op == ExprOp::Gt || where->op == ExprOp::Ge);
-          if (fast_cmp && where->args.size() == 2 && where->args[0] && where->args[0]->op == ExprOp::Column &&
-              where->args[1] && where->args[1]->op == ExprOp::Literal) {
-            size_t s = 0, c = 0;
-            if (lookup_column_here(ctx, *where->args[0], &s, &c) == ColumnLookup::Found && s == 0 &&
-                !(probe_temporal(ctx, s, c) && !where->args[1]->literal.numeric)) {
-              fast_where_col = c;
-              const Val& lit = where->args[1]->literal;
-              // A number column against quoted text compares as numbers (see
-              // the aggregate path's same test).
-              const bool num_col = c < stbl.columns.size() && sql_type_numeric(stbl.columns[c].type) && !stbl.columns[c].temporal;
-              if (lit.numeric || (num_col && !lit.null)) {
-                fast_num = true;
-                fast_num_const = lit.numeric ? lit.num : numeric_prefix_of(lit.str());
-                fast_where = true;
-              } else if (!lit.null) {
-                fast_str_const = lit.str();   // compared with pad_compare_ci, as compare_vals does
-                fast_where = true;
-              }
-            }
-          }
-
-          if (fast_where) {
-            size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-            if (total_threads == 0) total_threads = 1;
-            std::vector<JoinedRows> local_rows(((stbl.row_count()) + 2048 - 1) / 2048);
-            SqlThreadPool::instance().for_chunks(stbl.row_count(), 2048, stbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
-              if (tid >= total_threads) tid = 0;
-              auto& l_rows = local_rows[bstart / 2048];
-              for (size_t ri = bstart; ri < bend; ++ri) {
-                if (fast_where_col >= stbl.columns.size()) continue;
-                const std::string& cell = stbl.cell(ri, fast_where_col);
-                if (sql_is_null(cell)) continue;
-                bool match = false;
-                if (fast_num) {
-                  // The cell as MySQL reads it against a number: its numeric
-                  // prefix, 0 when it has none ('ABC' < 5 is true). strtod
-                  // skipped every cell without a leading number, so `sid < 5`
-                  // lost 'ABC' and 'X9', and it took 'inf' / '0x1A' as numbers.
-                  const double d = numeric_prefix_of(cell);
-                  if (fast_op == ExprOp::Gt) match = (d > fast_num_const);
-                  else if (fast_op == ExprOp::Ge) match = (d >= fast_num_const);
-                  else if (fast_op == ExprOp::Lt) match = (d < fast_num_const);
-                  else if (fast_op == ExprOp::Le) match = (d <= fast_num_const);
-                  else if (fast_op == ExprOp::Eq) match = (d == fast_num_const);
-                  else if (fast_op == ExprOp::Ne) match = (d != fast_num_const);
-                } else {
-                  // The collation compare_vals uses (case-insensitive, PAD
-                  // SPACE): byte order of the collation keys put 'a ' after
-                  // 'a' and made `<` and `>` disagree with every other path.
-                  const int cmp = pad_compare_ci(cell, fast_str_const);
-                  if (fast_op == ExprOp::Eq) match = cmp == 0;
-                  else if (fast_op == ExprOp::Ne) match = cmp != 0;
-                  else if (fast_op == ExprOp::Gt) match = cmp > 0;
-                  else if (fast_op == ExprOp::Ge) match = cmp >= 0;
-                  else if (fast_op == ExprOp::Lt) match = cmp < 0;
-                  else if (fast_op == ExprOp::Le) match = cmp <= 0;
-                }
-                if (match) {
-                  JoinedRow jr;
-                  jr.parts.push_back(ri);
-                  l_rows.push_back(std::move(jr));
-                }
-              }
-            });
-            size_t total_match_count = 0;
-            for (const auto& lr : local_rows) total_match_count += lr.size();
-                        if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-            rows.reserve(total_match_count);
-            for (auto& lr : local_rows) {
-              for (auto& r : lr) rows.push_back(std::move(r));
-            }
-          } else {
-            size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-            if (total_threads == 0) total_threads = 1;
-            std::vector<JoinedRows> local_rows(((stbl.row_count()) + 2048 - 1) / 2048);
-            std::vector<std::string> local_errs(total_threads);
-            SqlThreadPool::instance().for_chunks(stbl.row_count(), 2048, stbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
-              if (tid >= total_threads) tid = 0;
-              EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
-              l_ctx.sources = &sources;
-              l_ctx.err = &local_errs[tid];
-              auto& l_rows = local_rows[bstart / 2048];
-              for (size_t ri = bstart; ri < bend; ++ri) {
-                JoinedRow jr;
-                jr.parts.push_back(ri);
-                l_ctx.row = &jr;
-                if (predicate_true(where.get(), l_ctx)) {
-                  l_rows.push_back(std::move(jr));
-                }
-                if (!local_errs[tid].empty()) break;
-              }
-            });
-            for (const auto& l_err : local_errs) {
-              if (!l_err.empty()) return make_error(l_err);
-            }
-            size_t total_match_count = 0;
-            for (const auto& lr : local_rows) total_match_count += lr.size();
-                        if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-            rows.reserve(total_match_count);
-            for (auto& lr : local_rows) {
-              for (auto& r : lr) rows.push_back(std::move(r));
-            }
-          }
-        }
-        where = nullptr; // already applied during source scan
-      } else {
-        phases.mark("single");
-        // WHERE pushdown: find conjuncts that reference ONLY the base table
-        // (source 0) and evaluate them during the scan so the join sees fewer
-        // rows. Also propagate equalities/predicates across inner joins: if WHERE has `join_tbl.col = const`
-        // or `join_tbl.col IN (...)` and an ON clause has `base_tbl.col = join_tbl.col`, synthesize for base_tbl.
-        std::vector<const SqlExpr*> base_preds;
-        std::vector<ExprPtr> synth_preds;
-        if (where && !join_conditions.empty() && !any_right) {
-          std::vector<const SqlExpr*> parts;
-          collect_conjuncts(where.get(), &parts);
-          std::vector<QuerySource> base_only(sources.begin(), sources.begin() + 1);
-          EvalCtx check_ctx; check_ctx.sources = &base_only;
-          for (const SqlExpr* p : parts) {
-            if (expr_reads_local(p, check_ctx)) {
-              bool refs_later = false;
-              for (size_t si = 1; si < sources.size() && !refs_later; ++si) {
-                std::vector<QuerySource> later(sources.begin() + si, sources.begin() + si + 1);
-                EvalCtx lctx; lctx.sources = &later;
-                if (expr_reads_local(p, lctx)) refs_later = true;
-              }
-              if (!refs_later) {
-                base_preds.push_back(p);
-                pushed_where_parts.insert(p);
-              }
-            }
-          }
-
-          // Equivalence propagation: for WHERE parts on joined tables
-          for (const SqlExpr* p : parts) {
-            if (!p) continue;
-            // Case 1: p is an equality `col = const` or `const = col`
-            if (p->op == ExprOp::Eq && p->args.size() == 2) {
-              for (int pside = 0; pside < 2; ++pside) {
-                const SqlExpr* pcol = p->args[pside].get();
-                const SqlExpr* pval = p->args[1 - pside].get();
-                if (!pcol || pcol->op != ExprOp::Column) continue;
-                EvalCtx all_ctx; all_ctx.sources = &sources;
-                if (expr_reads_local(pval, all_ctx)) continue;
-
-                for (size_t j = 0; j < join_conditions.size(); ++j) {
-                  std::vector<const SqlExpr*> jparts;
-                  collect_conjuncts(join_conditions[j].get(), &jparts);
-                  for (const SqlExpr* jc : jparts) {
-                    if (!jc || jc->op != ExprOp::Eq || jc->args.size() != 2) continue;
-                    for (int jside = 0; jside < 2; ++jside) {
-                      const SqlExpr* j_base = jc->args[jside].get();
-                      const SqlExpr* j_other = jc->args[1 - jside].get();
-                      if (!j_base || j_base->op != ExprOp::Column) continue;
-                      if (!j_other || j_other->op != ExprOp::Column) continue;
-                      if (!expr_reads_local(j_base, check_ctx)) continue;
-
-                      size_t s_other = 0, c_other = 0;
-                      size_t s_pcol = 0, c_pcol = 0;
-                      if (resolve_column(all_ctx, *j_other, &s_other, &c_other) &&
-                          resolve_column(all_ctx, *pcol, &s_pcol, &c_pcol) &&
-                          s_other == s_pcol && c_other == c_pcol) {
-                        auto syn = std::make_shared<SqlExpr>();
-                        syn->op = ExprOp::Eq;
-                        syn->args.push_back(clone_expr(j_base));
-                        syn->args.push_back(clone_expr(pval));
-                        base_preds.push_back(syn.get());
-                        synth_preds.push_back(std::move(syn));
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            // Case 2: p is In, Between, Gt, Lt, Ge, Le, Like where args[0] is a column on a joined table
-            else if ((p->op == ExprOp::In || p->op == ExprOp::Between ||
-                      p->op == ExprOp::Gt || p->op == ExprOp::Lt ||
-                      p->op == ExprOp::Ge || p->op == ExprOp::Le ||
-                      p->op == ExprOp::Like) && !p->args.empty()) {
-              const SqlExpr* pcol = p->args[0].get();
-              if (pcol && pcol->op == ExprOp::Column) {
-                // Check if all other args are independent of local sources
-                EvalCtx all_ctx; all_ctx.sources = &sources;
-                bool other_args_ok = true;
-                for (size_t i = 1; i < p->args.size(); ++i) {
-                  if (expr_reads_local(p->args[i].get(), all_ctx)) {
-                    other_args_ok = false;
-                    break;
-                  }
-                }
-                if (other_args_ok) {
-                  for (size_t j = 0; j < join_conditions.size(); ++j) {
-                    std::vector<const SqlExpr*> jparts;
-                    collect_conjuncts(join_conditions[j].get(), &jparts);
-                    for (const SqlExpr* jc : jparts) {
-                      if (!jc || jc->op != ExprOp::Eq || jc->args.size() != 2) continue;
-                      for (int jside = 0; jside < 2; ++jside) {
-                        const SqlExpr* j_base = jc->args[jside].get();
-                        const SqlExpr* j_other = jc->args[1 - jside].get();
-                        if (!j_base || j_base->op != ExprOp::Column) continue;
-                        if (!j_other || j_other->op != ExprOp::Column) continue;
-                        if (!expr_reads_local(j_base, check_ctx)) continue;
-
-                        size_t s_other = 0, c_other = 0;
-                        size_t s_pcol = 0, c_pcol = 0;
-                        if (resolve_column(all_ctx, *j_other, &s_other, &c_other) &&
-                            resolve_column(all_ctx, *pcol, &s_pcol, &c_pcol) &&
-                            s_other == s_pcol && c_other == c_pcol) {
-                          auto syn = clone_expr(p);
-                          syn->args[0] = clone_expr(j_base);
-                          base_preds.push_back(syn.get());
-                          synth_preds.push_back(std::move(syn));
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        phases.mark("analysis");
-        if (!base_preds.empty()) {
-          EvalCtx const_ctx;
-          const_ctx.db = db;
-          const_ctx.outer = outer_scope;
-          const_ctx.sources = nullptr;
-          const_ctx.row = nullptr;
-          // The query's own subqueries first: a clone taken afterwards carries
-          // the filled result along. Cloned first, each uncorrelated IN
-          // (SELECT ...) ran twice - once for the clone, once for the WHERE
-          // (nosales' NOT IN over a year of stocktrans: 2.5 s each).
-          if (where) prepare_expr_for_thread_pool(where.get(), const_ctx);
-          // The WHERE itself keeps its IN (subquery) form: a joined table's
-          // `col IN (select ...)` becomes a vectorized semijoin filter that
-          // way, where a literal list would be tested per joined row through
-          // the interpreter (the reports ran 10% slower). Only the predicates
-          // synthesized onto the base table below are inlined - those are what
-          // the base selection walked row by row.
-          for (const auto& jc : join_conditions) if (jc) prepare_expr_for_thread_pool(jc.get(), const_ctx);
-          phases.mark("prepare");
-          std::vector<const SqlExpr*> folded_base_preds;
-          for (const SqlExpr* bp : base_preds) {
-            auto cloned = clone_expr(bp);
-            cloned = fold_constant_subexpressions(cloned, const_ctx);
-            prepare_expr_for_thread_pool(cloned.get(), const_ctx);
-            // The predicates synthesized onto the base from a joined table's
-            // `col IN (subquery)` are clones of the original: rewritten here,
-            // after their own subquery ran, or the base still walks its rows.
-            inline_small_in_subqueries(cloned.get(), 1024);
-            folded_base_preds.push_back(cloned.get());
-            synth_preds.push_back(std::move(cloned));
-          }
-          base_preds = folded_base_preds;
-
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-          std::vector<QuerySource> base_only(sources.begin(), sources.begin() + 1);
-          ctx.sources = &base_only;
-          ctx.err = &err;
-          const SqlTable& btbl = *sources[0].table;
-
-          // The same probe-index trick the single-table, no-join path already
-          // uses (find_probe_candidates + get_or_build_probe_index) applies
-          // just as well here: a pushed-down base predicate like
-          // `completed = '0'` is still a plain column-equals-constant, and
-          // walking every row of a 300-400K row table to evaluate it through
-          // the general expression interpreter is the actual cost of this
-          // whole query, not the joins after it. Every candidate the index
-          // returns still goes through the full base_preds check below, so a
-          // narrower-than-expected index can only cost time, never rows.
-          // The vectorized selection (per-value / typed / zone-pruned, index
-          // only where one is ready or the query is correlated) for a big
-          // base table: finding stocktrans' 9 rows of one invoice built a hash
-          // index over 12.4M stockmoves rows first - 9 s.
-          bool vx_selected = false;
-          // Any size: the compiled selection is cheaper than the row-by-row
-          // interpreter even over a handful of rows - st's tax-rates join
-          // (172 rows) spent 123 of its 143 us interpreting its WHERE per row.
-          static const bool no_vx = std::getenv("AIOS_SQL_NO_VX") != nullptr;
-          if (!no_vx && btbl.row_count() > 0 && !btbl.inferred_types) {
-            bool aligned = true;
-            for (const auto& cs : btbl.col_data) if (cs.size() != btbl.row_count()) aligned = false;
-            if (aligned) {
-              ExprPtr conj;
-              for (const SqlExpr* bp : base_preds) {
-                ExprPtr leaf(std::shared_ptr<SqlExpr>(), const_cast<SqlExpr*>(bp));   // not owned
-                if (!conj) { conj = leaf; continue; }
-                auto a = std::make_shared<SqlExpr>();
-                a->op = ExprOp::And;
-                a->args = {conj, leaf};
-                conj = a;
-              }
-              EvalCtx vlocal;
-              vlocal.sources = &base_only;
-              vx::Selection vsel;
-              if (!vx::select_rows(db, btbl, conj.get(), vlocal, ctx, &vsel, &err)) return make_error(err);
-              phases.mark("select");
-              std::vector<uint32_t> ids = vsel.flat();
-              if (!rows_hold.reserve(ids.size() * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-              // Only when the base table's own conditions leave a lot of rows
-              // is it worth filtering the joined tables first (their selection
-              // and key collection cost ~1 s): a date range that already
-              // leaves nothing, or a few thousand rows, joins as it is.
-              if (ids.size() > 100000 && !any_right) {
-                std::vector<ExprPtr> semi_keep;
-                std::vector<vx::Pred> semi = semi_join_filters(db, sources, join_conditions, join_is_left, where.get(),
-                                                               outer_scope, &err, &semi_keep);
-                if (!err.empty()) return make_error(err);
-                if (!semi.empty()) {
-                  vx::Pred all = std::move(semi[0]);
-                  for (size_t k = 1; k < semi.size(); ++k) {
-                    vx::Pred a;
-                    a.kind = vx::Pred::And;
-                    a.kids.push_back(std::move(all));
-                    a.kids.push_back(std::move(semi[k]));
-                    all = std::move(a);
-                  }
-                  vx::Selection kept;
-                  kept.total = btbl.row_count();
-                  kept.hits.assign(kept.morsels(), {});
-                  if (!vx::verify_candidates(all, btbl, ids, ctx, &kept, &err)) return make_error(err);
-                  ids = kept.flat();
-                }
-              }
-              if (!join_conditions.empty() && !any_right && ids.size() >= 256) {
-                base_ids = std::move(ids);
-                base_ids_only = true;
-              } else {
-                rows.reserve(ids.size());
-                for (uint32_t r : ids) {
-                  JoinedRow jr;
-                  jr.parts.push_back(r);
-                  rows.push_back(std::move(jr));
-                }
-              }
-              vx_selected = true;
-              if (vx_trace_on()) vx_trace("join base: vectorized selection " + std::to_string(ids.size()) + " rows");
-            }
-          }
-          phases.mark("semi");
-          if (!vx_selected) {
-          std::vector<ProbeCandidate> pcands;
-          for (const SqlExpr* bp : base_preds) find_probe_candidates(bp, ctx, ctx, &pcands);
-
-          // Fold two one-sided ranges over the same column into a single two-sided range
-          for (size_t i = 0; i < pcands.size(); ++i) {
-            ProbeCandidate& a = pcands[i];
-            if (!a.is_range || a.values.size() != 2) continue;
-            for (size_t j = i + 1; j < pcands.size();) {
-              ProbeCandidate& b = pcands[j];
-              if (!b.is_range || b.values.size() != 2 || b.column != a.column ||
-                  (a.has_low && b.has_low) || (a.has_high && b.has_high) ||
-                  a.values[0].numeric != b.values[0].numeric) {
-                ++j;
-                continue;
-              }
-              if (b.has_low) { a.values[0] = b.values[0]; a.has_low = true; }
-              if (b.has_high) { a.values[1] = b.values[1]; a.has_high = true; }
-              pcands.erase(pcands.begin() + (long)j);
-            }
-          }
-
-          bool probed = false;
-          if (!pcands.empty()) {
-            ctx.row = nullptr;  // the value must not depend on this scan's row
-
-            std::shared_ptr<ProbeIndex> best;
-            const ProbeCandidate* best_cand = nullptr;
-            size_t best_count = (size_t)-1;
-            for (const ProbeCandidate& k : pcands) {
-              std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, btbl, k.column);
-              if (!idx) continue;
-              size_t n = 0;
-              if (k.is_range && k.values.size() == 2) {
-                SelectEngine::ensure_sorted_probe_index(db, idx.get(), btbl);
-                if (!range_probe_safe(idx.get(), k.values[0], k.values[1], k.has_low, k.has_high)) continue;
-                n = probe_count_range(btbl, idx.get(), k.values[0], k.values[1], k.has_low, k.has_high);
-              } else {
-                if (k.values.size() > 128) {
-                  size_t sample_n = 0;
-                  constexpr size_t kSamples = 32;
-                  size_t step = k.values.size() / kSamples;
-                  for (size_t si = 0; si < kSamples; ++si) {
-                    sample_n += probe_count_matches(idx.get(), k.values[si * step]);
-                  }
-                  n = (sample_n * k.values.size()) / kSamples;
-                } else {
-                  for (const Val& v : k.values) n += probe_count_matches(idx.get(), v);
-                }
-              }
-              if (n < best_count) { best_count = n; best = idx; best_cand = &k; }
-            }
-
-            if (best && best_cand && best_count < btbl.row_count()) {
-              std::vector<size_t> cands;
-              cands.reserve(best_count);
-              if (best_cand->is_range && best_cand->values.size() == 2) {
-                SelectEngine::ensure_sorted_probe_index(db, best.get(), btbl);
-                probe_gather_range(btbl, best.get(), best_cand->values[0], best_cand->values[1], cands,
-                                   best_cand->has_low, best_cand->has_high);
-              } else {
-                for (const Val& v : best_cand->values) probe_gather_matches(best.get(), v, cands);
-              }
-              if (best_cand->is_list || best_cand->is_range) {
-                std::sort(cands.begin(), cands.end());
-                cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
-              }
-              if (cands.size() >= 512) {
-                size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-                if (total_threads == 0) total_threads = 1;
-                std::vector<JoinedRows> local_rows(((cands.size()) + 512 - 1) / 512);
-                std::vector<std::string> local_errs(total_threads);
-                SqlThreadPool::instance().parallel_for(cands.size(), 512, [&](size_t bstart, size_t bend, size_t tid) {
-                  if (tid >= total_threads) tid = 0;
-                  EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
-                  l_ctx.sources = &base_only;
-                  l_ctx.err = &local_errs[tid];
-                  auto& l_rows = local_rows[bstart / 512];
-                  for (size_t ci = bstart; ci < bend; ++ci) {
-                    size_t ri = cands[ci];
-                    if (ri >= btbl.row_count()) continue;
-                    JoinedRow jr;
-                    jr.parts.push_back(ri);
-                    l_ctx.row = &jr;
-                    bool keep = true;
-                    for (const SqlExpr* bp : base_preds) {
-                      if (!predicate_true(bp, l_ctx)) { keep = false; break; }
-                      if (!local_errs[tid].empty()) break;
-                    }
-                    if (keep) l_rows.push_back(std::move(jr));
-                  }
-                });
-                for (const auto& l_err : local_errs) {
-                  if (!l_err.empty()) return make_error(l_err);
-                }
-                size_t total_match_count = 0;
-                for (const auto& lr : local_rows) total_match_count += lr.size();
-                                if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-                rows.reserve(total_match_count);
-                for (auto& lr : local_rows) {
-                  for (auto& r : lr) rows.push_back(std::move(r));
-                }
-              } else {
-                rows.reserve(cands.size());
-                for (size_t ri : cands) {
-                  if (ri >= btbl.row_count()) continue;
-                  JoinedRow jr;
-                  jr.parts.push_back(ri);
-                  ctx.row = &jr;
-                  bool keep = true;
-                  for (const SqlExpr* bp : base_preds) {
-                    if (!predicate_true(bp, ctx)) { keep = false; break; }
-                    if (!err.empty()) return make_error(err);
-                  }
-                  if (keep) rows.push_back(std::move(jr));
-                }
-              }
-              probed = true;
-            }
-          }
-
-          if (!probed) {
-            if (btbl.row_count() >= 2048) {
-              size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-              if (total_threads == 0) total_threads = 1;
-              std::vector<JoinedRows> local_rows(((btbl.row_count()) + 2048 - 1) / 2048);
-              std::vector<std::string> local_errs(total_threads);
-              SqlThreadPool::instance().for_chunks(btbl.row_count(), 2048, btbl.row_count(), false, [&](size_t bstart, size_t bend, size_t tid) {
-                if (tid >= total_threads) tid = 0;
-                EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
-                l_ctx.sources = &base_only;
-                l_ctx.err = &local_errs[tid];
-                auto& l_rows = local_rows[bstart / 2048];
-                for (size_t ri = bstart; ri < bend; ++ri) {
-                  JoinedRow jr;
-                  jr.parts.push_back(ri);
-                  l_ctx.row = &jr;
-                  bool keep = true;
-                  for (const SqlExpr* bp : base_preds) {
-                    if (!predicate_true(bp, l_ctx)) { keep = false; break; }
-                    if (!local_errs[tid].empty()) break;
-                  }
-                  if (keep) l_rows.push_back(std::move(jr));
-                }
-              });
-              for (const auto& l_err : local_errs) {
-                if (!l_err.empty()) return make_error(l_err);
-              }
-              size_t total_match_count = 0;
-              for (const auto& lr : local_rows) total_match_count += lr.size();
-                            if (!rows_hold.reserve(total_match_count * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-              rows.reserve(total_match_count);
-              for (auto& lr : local_rows) {
-                for (auto& r : lr) rows.push_back(std::move(r));
-              }
-            } else {
-              rows.reserve(btbl.row_count() / 4);
-              for (size_t ri = 0; ri < btbl.row_count(); ++ri) {
-                JoinedRow jr;
-                jr.parts.push_back(ri);
-                ctx.row = &jr;
-                bool keep = true;
-                for (const SqlExpr* bp : base_preds) {
-                  if (!predicate_true(bp, ctx)) { keep = false; break; }
-                  if (!err.empty()) return make_error(err);
-                }
-                if (keep) {
-                  rows.push_back(jr);
-                  if (limit >= 0 && group_by.empty() && order_by.empty() && join_conditions.empty()) {
-                    if (rows.size() >= (size_t)(offset + limit)) break;
-                  }
-                }
-              }
-            }
-          }
-          }   // !vx_selected
-        } else if (!join_conditions.empty() && !any_right && limit < 0 && sources[0].table->row_count() >= 256) {
-          base_ids.resize(sources[0].table->row_count());
-          for (size_t ri = 0; ri < base_ids.size(); ++ri) base_ids[ri] = (uint32_t)ri;
-          base_ids_only = true;
-        } else {
-          rows.reserve(sources[0].table->row_count());
-          for (size_t ri = 0; ri < sources[0].table->row_count(); ++ri) {
-            JoinedRow jr;
-            jr.parts.push_back(ri);
-            rows.push_back(jr);
-            if (limit >= 0 && group_by.empty() && order_by.empty() && join_conditions.empty()) {
-              if (rows.size() >= (size_t)(offset + limit)) break;
-            }
-          }
-        }
-      }
+      BasePlan bp{db, &sources, &join_conditions, &join_is_left, any_right, &where, &group_by, &order_by, limit, offset, outer_scope,
+                  &rows, &rows_hold, &base_ids, &base_ids_only, &pushed_where_parts, &err};
+      if (std::optional<SqlQueryResult> r = base_rows(bp, phases)) return std::move(*r);
     }
 
     std::vector<bool> src_referenced(sources.size(), false);
