@@ -44766,24 +44766,47 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   EvalCtx ctx; ctx.db = db; ctx.outer = outer; ctx.sources = &sources;
   std::string err;
   ctx.err = &err;
-  // Every aggregate's value per group, as the general path makes them (the Vals, not their text: a sort reads
-  // the numbers and only the rows kept are printed).
-  std::vector<std::vector<Val>> aggv(aggs.size(), std::vector<Val>(G));
-  for (size_t k = 0; k < aggs.size(); ++k) {
+  // An aggregate's value for a group, as the general path makes it - made where a Val is wanted (a HAVING, an
+  // item printed, a sort key that is not a plain number), not for every group up front: 81,000 groups' SUMs
+  // became Vals (nt_adjust, the exact-sum finish) to print 20 of them.
+  auto agg_val = [&](size_t k, uint32_t g) -> Val {
     const Agg& a = aggs[k];
-    for (size_t g = 0; g < G; ++g) {
-      Val& v = aggv[k][g];
-      switch (a.kind) {
-        case CountStar: case Count: v = val_num((double)counts[k][g]); break;
-        case Min: case Max: v = extreme[k][g] == UINT32_MAX ? val_null() : a.arg.at(extreme[k][g]); break;
-        case Sum: v = nt_adjust(a.node, vctx, sums[k][g].finish(false)); break;
-        case Avg: v = sums[k][g].finish(true); break;
+    switch (a.kind) {
+      case CountStar: case Count: return val_num((double)counts[k][g]);
+      case Min: case Max: return extreme[k][g] == UINT32_MAX ? val_null() : a.arg.at(extreme[k][g]);
+      case Sum: return nt_adjust(a.node, vctx, sums[k][g].finish(false));
+      case Avg: return sums[k][g].finish(true);
+    }
+    return val_null();
+  };
+  // The same as the double compare_vals_as would compare, where the value is a plain number by construction: a
+  // count, a sum or average of DOUBLE lanes (finish gives val_approx of the total), the extreme of a numeric lane
+  // below 2^53. False: the Val decides.
+  auto agg_num = [&](size_t k, uint32_t g, double* out, bool* null) -> bool {
+    const Agg& a = aggs[k];
+    *null = false;
+    switch (a.kind) {
+      case CountStar: case Count: *out = (double)counts[k][g]; return true;
+      case Min: case Max: {
+        const uint32_t r = extreme[k][g];
+        if (r == UINT32_MAX) { *null = true; return true; }
+        if (a.arg.ty == vp::Ty::F64) { *out = a.arg.f[r]; return true; }
+        if (a.arg.ty == vp::Ty::I64 && !a.arg.uns && a.arg.i[r] > -9007199254740992LL && a.arg.i[r] < 9007199254740992LL) { *out = (double)a.arg.i[r]; return true; }
+        return false;
+      }
+      case Sum: case Avg: {
+        if (!(a.arg.ty == vp::Ty::F64 && a.arg.approx)) return false;
+        const SumAcc& acc = sums[k][g];
+        if (acc.count == 0) { *null = true; return true; }
+        *out = a.kind == Sum ? acc.total : acc.total / (double)acc.count;
+        return true;
       }
     }
-  }
+    return false;
+  };
   std::vector<std::pair<const SqlExpr*, Val>> av(aggs.size());
   auto group_ctx = [&](uint32_t g) {
-    for (size_t k = 0; k < aggs.size(); ++k) av[k] = {aggs[k].node, aggv[k][g]};
+    for (size_t k = 0; k < aggs.size(); ++k) av[k] = {aggs[k].node, agg_val(k, g)};
     ctx.row = &rows[first[g]];
     ctx.group = nullptr;
     ctx.agg_values = &av;
@@ -44815,7 +44838,24 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       const size_t idx = order_spec->item[i];
       if (idx >= items.size()) return no("an ORDER BY key past the items");
       SortKey& k = sk[i];
-      if (item_agg[idx] >= 0) { k.agg = item_agg[idx]; continue; }
+      if (item_agg[idx] >= 0) {
+        k.agg = item_agg[idx];
+        if (order_spec->types[i] != SqlDataType::Text) {
+          k.num.assign(kept.size(), 0);
+          k.isnull.assign(kept.size(), 0);
+          bool plain = true;
+          for (size_t j = 0; j < kept.size() && plain; ++j) {
+            bool isnull = false;
+            if (!agg_num((size_t)k.agg, kept[j], &k.num[j], &isnull)) plain = false;
+            else if (isnull) k.isnull[j] = 1;
+          }
+          if (plain) { k.by_num = true; continue; }
+        }
+        k.vals.resize(kept.size());
+        for (size_t j = 0; j < kept.size(); ++j) k.vals[j] = agg_val((size_t)k.agg, kept[j]);
+        k.agg = -1;   // compared through the Vals made
+        continue;
+      }
       if (item_cell[idx].first != SIZE_MAX) {
         const size_t ps = item_cell[idx].first, pc = item_cell[idx].second;
         const SqlTable& pt = *sources[ps].table;
@@ -44887,7 +44927,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       k.num.resize(kept.size());
       k.isnull.assign(kept.size(), 0);
       for (size_t j = 0; j < kept.size() && plain; ++j) {
-        const Val& v = k.agg >= 0 ? aggv[(size_t)k.agg][kept[j]] : k.vals[j];
+        const Val& v = k.vals[j];
         if (v.null) { k.isnull[j] = 1; continue; }
         if (!v.numeric) { plain = false; break; }
         if (!v.approx && !(std::fabs(v.num) < 9007199254740992.0 && (!v.text_valid || v.text.size() <= 15))) { plain = false; break; }
@@ -44918,8 +44958,8 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
           if (xa == xb) continue;
           return desc ? xa > xb : xa < xb;
         }
-        const Val& x = k.agg >= 0 ? aggv[(size_t)k.agg][kept[pa]] : k.vals[pa];
-        const Val& y = k.agg >= 0 ? aggv[(size_t)k.agg][kept[pb]] : k.vals[pb];
+        const Val& x = k.vals[pa];
+        const Val& y = k.vals[pb];
         if (x.null && y.null) continue;
         if (x.null) return !desc;
         if (y.null) return desc;
@@ -44962,7 +45002,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     for (size_t i = 0; i < items.size(); ++i) {
       const SelectItem& it = items[i];
       if (item_agg[i] >= 0) {   // the aggregate itself: its value as made above
-        const Val& v = aggv[(size_t)item_agg[i]][g];
+        const Val v = agg_val((size_t)item_agg[i], g);
         cells.push_back(v.null ? sql_null() : v.str());
         continue;
       }

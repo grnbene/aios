@@ -547,6 +547,12 @@ rows_equal_to_sorted gallops the index once per key), the lookup loop (5.4) and 
 COUNT(DISTINCT) edge set (NULLs, negative values, BIGINTs past the span, several groups, filters that leave
 no row, a date GROUP BY) is identical to the build before.
 
+The lane GROUP BY still made a Val of every aggregate for every group (nt_adjust and the exact-sum finish, 81,000
+times twice, to print 20 rows): a profile of the function put a quarter of it there. The Val is made where one
+is wanted - a HAVING, an item printed, a sort key that is not a plain number; a sort key that is a count, a sum
+or average of DOUBLE lanes, or the extreme of a numeric lane below 2^53 reads its double straight from the
+accumulators (agg_num), the same double compare_vals_as would compare. Open orders' group phase 60 -> 43-50 ms.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
