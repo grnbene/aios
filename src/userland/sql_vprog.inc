@@ -213,6 +213,60 @@ struct Compiler {
     return true;
   }
 
+  // A dictionary-coded text column as column() admits one (the same checks), or null: for text_class_pair.
+  const ColumnStore* text_dict_column(const SqlExpr* e, size_t* src) {
+    if (is_user_var_name(e->name) || e->name.rfind("@@", 0) == 0) return nullptr;
+    size_t s = 0, c = 0;
+    if (!place(e, &s, &c)) return nullptr;
+    const SqlTable* t = (*ctx.sources)[s].table;
+    const SqlColumn& col = t->columns[c];
+    const ColumnStore& cs = t->col_data[c];
+    if (col.temporal || col.type != SqlDataType::Text || cs.shared_dict || !vx::dict_coded(cs)) return nullptr;
+    const size_t nd = vx::dict_size(cs);
+    if (nd == 0 || nd > (1u << 20)) return nullptr;
+    if (t->inferred_types) {   // a result table's "text" may hold numbers, which the interpreter reads as numbers
+      for (size_t k = 0; k < nd; ++k) {
+        const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+        double x = 0;
+        if (!sql_is_null(d) && parse_number(d, &x)) return nullptr;
+      }
+    }
+    *src = s;
+    return &cs;
+  }
+  // text_col = text_col, both dictionary-coded: each dictionary entry's collation class is worked out once (two
+  // entries are in one class exactly when pad_compare_ci finds them equal - they share a collate_key), and the rows
+  // compare as integers: two CodeI leaves holding the classes, for an integer Eq / Ne (native). Each row's two
+  // texts through pad_compare_ci was ~350 ns a row (a join's ON `fl.name = p.tex_name` over 56,000 candidates
+  // in a SQLDoom frame: 20 ms). False (nothing emitted): not two such columns, and the caller compiles as before.
+  bool text_class_pair(const SqlExpr* l, const SqlExpr* r, uint32_t* a, uint32_t* b) {
+    size_t sl = 0, sr = 0;
+    const ColumnStore* cl = text_dict_column(l, &sl);
+    const ColumnStore* cr = cl ? text_dict_column(r, &sr) : nullptr;
+    if (!cl || !cr) return false;
+    std::unordered_map<std::string, int64_t> cls;
+    auto table_of = [&](const ColumnStore& cs) {
+      auto t = std::make_shared<Ins::CodeTable>();
+      const size_t n = vx::dict_size(cs);
+      t->null.assign(n, 0);
+      t->i.assign(n, 0);
+      for (size_t k = 0; k < n; ++k) {
+        const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+        if (sql_is_null(d)) { t->null[k] = 1; continue; }
+        const int64_t next = (int64_t)cls.size();
+        t->i[k] = cls.emplace(collate_key(d), next).first->second;
+      }
+      return t;
+    };
+    auto leaf = [&](const ColumnStore& cs, size_t s, std::shared_ptr<const Ins::CodeTable> t) {
+      Ins in; in.op = Ins::CodeI; in.ty = Ty::I64; in.src = (uint32_t)s; in.cs = &cs; in.codes = std::move(t);
+      return emit(std::move(in));
+    };
+    *a = leaf(*cl, sl, table_of(*cl));
+    *b = leaf(*cr, sr, table_of(*cr));
+    return true;
+  }
+
   uint32_t column(const SqlExpr* e) {
     if (is_user_var_name(e->name) || e->name.rfind("@@", 0) == 0) return fail("variable");
     size_t s = 0, c = 0;
@@ -428,6 +482,10 @@ struct Compiler {
               return e->op == ExprOp::Eq ? m : unary(Ins::Not, m, Ty::I64, false);
             }
           }
+        }
+        if ((e->op == ExprOp::Eq || e->op == ExprOp::Ne) && l && r && l->op == ExprOp::Column && r->op == ExprOp::Column) {
+          uint32_t ca = 0, cb = 0;   // text_col = text_col over the dictionaries' collation classes
+          if (text_class_pair(l, r, &ca, &cb)) return binary(e->op == ExprOp::Eq ? Ins::Eq : Ins::Ne, ca, cb, Ty::I64, false);
         }
         const uint32_t a = compile(l);
         const uint32_t b = compile(r);
@@ -854,27 +912,36 @@ struct Lanes {
   // A column read by the program, decoded whole once (the kernels' block decoders) and gathered by row id, where
   // the column is not much larger than the row set: a per-row accessor (a switch on the encoding, a bit unpack)
   // was 20-40 ns a cell, most of a 55-op program's time.
+  // A column already laid out flat (a typed column's values, a 32-bit dictionary's codes) is read in place. The
+  // decode is skipped only when the column is much larger than the row set this Lanes serves: a program run over
+  // a chunk of a few hundred rows (a join's ON check over a chunk's candidates) decoded a 56,000-row column whole
+  // for each chunk under a flat 65,536 floor - 220 decodes of the column for one pass over it.
   size_t total_rows = 0;
   struct Cached { std::vector<int64_t> i; std::vector<double> f; std::vector<uint32_t> c; bool ints = false, dbls = false, codes = false; };
   std::unordered_map<const ColumnStore*, Cached> cols;
   Cached* cached(const ColumnStore& cs) {
     const size_t sz = cs.size();
-    if (sz > std::max<size_t>(65536, total_rows * 4)) return nullptr;
+    if (sz > std::max<size_t>(4096, total_rows * 16)) return nullptr;
     return &cols[&cs];
   }
   const int64_t* ints(const ColumnStore& cs) {
+    if (cs.encoding == ColumnEncoding::TypedInt64 && cs.int64_data.size() >= cs.size()) return cs.int64_data.data();
     Cached* cc = cached(cs);
     if (!cc) return nullptr;
     if (!cc->ints) { cc->i.resize(cs.size()); if (cs.size()) vx::typed_ints(cs, 0, cs.size(), cc->i.data()); cc->ints = true; }
     return cc->i.data();
   }
   const double* dbls(const ColumnStore& cs) {
+    if (cs.encoding == ColumnEncoding::TypedDouble && cs.double_data.size() >= cs.size()) return cs.double_data.data();
     Cached* cc = cached(cs);
     if (!cc) return nullptr;
     if (!cc->dbls) { cc->f.resize(cs.size()); if (cs.size()) vx::typed_values(cs, 0, cs.size(), cc->f.data()); cc->dbls = true; }
     return cc->f.data();
   }
   const uint32_t* codes(const ColumnStore& cs) {
+    if (cs.encoding != ColumnEncoding::RLE && cs.encoding != ColumnEncoding::Constant && !cs.seg_packed_ && cs.bit_width_ == 32 &&
+        cs.data32.size() >= cs.size())
+      return cs.data32.data();
     Cached* cc = cached(cs);
     if (!cc) return nullptr;
     if (!cc->codes) { cc->c.resize(cs.size()); if (cs.size()) vx::decode_codes(cs, 0, cs.size(), cc->c.data()); cc->codes = true; }

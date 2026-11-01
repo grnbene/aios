@@ -198,6 +198,34 @@ Still there for a Dec batch kind (DECIMAL cells travel as text between stages, 3
 the biggest fill item left; and `active_data_tick`'s re-encoding of the game's written tables (0.6 billion
 instructions on a background thread per three frames), which contends with the frame's workers.
 
+Next by the same profile: `predicate_true` from the join probe, 0.8 billion instructions - the ON clause's
+residual conjuncts interpreted once per candidate row. The trace named the join: `LEFT JOIN flat_textures fl ON
+NOT p.is_sky AND fl.name = p.tex_name`, 56,000 candidates, 24-29 ms of ON checks a frame. Done, in three parts:
+
+- A conjunct the base rows alone decided (`base_refused`, which already padded or dropped the rows it refused)
+  is true for every candidate of a row it kept, so it leaves the per-candidate check.
+- The conjuncts that compile as programs are checked over a chunk's candidates at once in lanes: the probe
+  leaves a chunk's candidates in a sink (`OnSink`) instead of checking each, `flush_sink` runs each program over
+  them and then emits the survivors in base order with what follows the ON (the matched mark, the prefilter,
+  the pushed WHERE conjuncts), padding a base row no candidate passed as the per-row probe pads one. A program
+  that refuses a value hands that conjunct to the interpreter, which reports as before. The rest stay per
+  candidate; the trace line `ON conjuncts: N decided by the base rows, N in lanes, N per candidate` says how
+  each join split.
+- `text_col = text_col` over two dictionary-coded columns compiles to two CodeI leaves holding each dictionary
+  entry's collation class (one class per collate_key, worked out once over both dictionaries) and an integer
+  Eq / Ne, all native; it was each row's two texts through pad_compare_ci (~350 ns a row). And `Lanes` reads a
+  column already laid out flat (a typed column's values, a 32-bit dictionary's codes) in place, and decodes a
+  column whole only when it is at most 16x the row set it serves (4,096 rows at least): under a flat 65,536 floor a
+  program run over a chunk of 256 candidates decoded a 56,000-row result column whole, once per chunk.
+
+Measured, three frames: ON checks 92 -> 39 ms (the flat-texture join 29 -> 7 ms a frame, most of what is left
+being the trace's own two clock reads per candidate); SQLDoom E1M1 medians 456/463/450 -> 413/428/440 ms against
+the build before both steps, alternating. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
+an edge-case set for text equality (case, trailing spaces, accents, NULL, result-table columns, numeric-looking
+text) and one for residual ON conditions (LEFT / RIGHT / inner, base-only and two-sided conjuncts, NULL
+conjuncts, numeric-prefix text keys, pushed WHERE with padding, a three-table chain) are identical to the build
+before.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
