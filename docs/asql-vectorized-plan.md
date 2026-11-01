@@ -357,6 +357,13 @@ The batched probe then took direct code joins (its best key probed by dictionary
 map, the other keys as numbers): fl's per-row probe, a vector of candidates per base row, 9.4 -> 1.4 ms a
 frame; medians 456/452/468 -> 274/268/298 ms.
 
+INT result columns that arrived as dictionary codes stayed dictionary-coded, which made them keys "not held as
+a number" to the batched probe (bsp_order's, thing_pixels', the ui joins) and lane-path leaves to the programs.
+Codes into an INT column whose every entry is a canonical integer are parsed once and the column typed, as an
+I64 batch is (and as codes into REAL were). Medians 481/458/450 -> 274/273/261 ms against 5cab6ef. The trace
+now names the key and encoding that keep a join off the batched probe; what is left there: Constant-encoded
+columns (a map_id that is 1 in every row) and text keys beside the probing one.
+
 Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
 casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
 rounding as written, the range error). The renderer's key expressions cast four or five times a row and the

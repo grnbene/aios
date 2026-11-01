@@ -21086,6 +21086,31 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
         return;
       }
     }
+    // Dictionary codes into an INT column whose every entry is a canonical integer: the entries parsed once and
+    // the column typed (as an I64 batch is) - a dictionary-coded INT result column was a key "not held as a
+    // number" to the batched join probe and a lane-path leaf to the programs.
+    if (col.kind == ColBatch::Codes && sc.type == SqlDataType::Int && !sc.temporal && cs.encoding == ColumnEncoding::DictBitPacked && !cs.shared_dict) {
+      std::vector<int64_t> dv(col.dict.size(), 0);
+      std::vector<uint8_t> dn(col.dict.size(), 0);
+      bool ok = true;
+      for (size_t k = 0; ok && k < col.dict.size(); ++k) {
+        if (sql_is_null(col.dict[k])) dn[k] = 1;
+        else if (!canonical_int(col.dict[k], &dv[k])) ok = false;
+      }
+      if (ok) {
+        std::vector<int64_t> vals(n, 0);
+        std::vector<uint8_t> nul(n, 0);
+        for (size_t r = 0; r < n; ++r) {
+          nul[r] = col.nul[r] || dn[col.codes[r]];
+          if (!nul[r]) vals[r] = dv[col.codes[r]];
+        }
+        if (cs.begin_typed(ColumnEncoding::TypedInt64)) {
+          if (cs.adopt_ints(std::move(vals), nul)) return;
+          for (size_t r = 0; r < n; ++r) cs.append_int(vals[r], nul[r] != 0);
+          return;
+        }
+      }
+    }
     if (col.kind == ColBatch::Codes && cs.encoding == ColumnEncoding::DictBitPacked) {
       std::vector<uint32_t> ids(col.dict.size(), 0);
       std::vector<uint8_t> id_null(col.dict.size(), 0);
@@ -46760,7 +46785,12 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           const bool numeric_type = kc < bt.columns.size() && !bt.columns[kc].temporal &&
                                     (bt.columns[kc].type == SqlDataType::Int || (typed_dbl && bt.columns[kc].type == SqlDataType::Real && bt.columns[kc].scale == 0));
           if (!numeric_type || bcs.size() != bt.row_count() ||
-              !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) { batch_ok = false; break; }
+              !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) {
+            batch_ok = false;
+            if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + bt.name + "." + (kc < bt.columns.size() ? bt.columns[kc].name : "?") +
+                                        ") is not a number this row has: " + vx_encoding_name(bcs.encoding) + (numeric_type ? "" : ", not a number type"));
+            break;
+          }
           nk.cs = &bcs;
           nk.src = ks;
           nk.ints = !typed_dbl;
