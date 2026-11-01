@@ -603,6 +603,32 @@ both; selections empty, small enough to key the index by, and too large for that
 is identical to the build before, as are frame bytes, the differential native check, the four oracle suites, the
 lane checks and the earlier edge sets.
 
+### One-to-many links in the star join (the grouped 1:N shapes)
+
+The 2c gap in the ERP set was not the driver; it was the shapes that join one row to many and then group (open
+orders: 86k orders to their 257k lines, grouped by order number and customer name; top customers: 46k orders to
+139k lines, grouped by name). The star join only took links whose joined side was unique (or rerooted the join so
+that it was), so these went through the row-at-a-time join, JoinedRow vectors, and the generic grouping.
+
+- A link whose joined table is keyed by typed integers on both sides may now be one-to-many: the joined table's
+  selected rows are put in a dense CSR map (key - least key -> a range of row ids, ascending within a key; NULL
+  keys never match), and the row loop expands each base row over its range, depth first over the links. A LEFT
+  link with no rows pads the missing row. Over a table's every row (no condition of its own) the map is kept
+  between statements, keyed by the column, its epoch, the table's mutation_seq and row count: the 600k-key map
+  was 13-20 ms a statement. AIOS_SQL_STAR_MULTI=0 turns the links off.
+- star_aggregate packs an integer key beside a dictionary key into its 64-bit group id (the integer offset from
+  its least value into 32 bits), where it used to build a string per row for the pair: keys 49 -> 9.5 ms.
+- Scattered row lists (a many side's rows in their partners' order) that cover a third of a column or more decode
+  that column whole once (NumScratch::cover, gather_for) instead of a read per row through read_code; COUNT of a
+  column with no NULL and SUM / AVG of an expression with no CASE mask fold straight into their arrays.
+
+Open orders 79-91 -> ~64 ms; top customers 39-43 -> ~29 ms (DuckDB: 34 and 11). What is left on open orders is
+mostly making 81k groups into the generic grouping's per-group objects (a JoinedRow and a value vector per group)
+and sorting them: the place where the driver's step 2c, a grouping that hands typed arrays to ORDER BY .. LIMIT,
+pays. An edge set for one-to-many star joins (LEFT, NULL keys on both sides, two many-steps, rows with and
+without ORDER BY, an empty selection, a derived table, a procedure called before and after an
+INSERT into the many side) is identical between the new links, the star join without them, and the plain join.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
