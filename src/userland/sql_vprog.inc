@@ -142,7 +142,23 @@ struct Compiler {
   // An inlined function's parameter nodes (in its RETURN template) and the lanes its arguments compiled to.
   std::vector<std::pair<const SqlExpr*, uint32_t>> bound;
 
-  uint32_t emit(Ins in) { P.ins.push_back(std::move(in)); return (uint32_t)P.ins.size() - 1; }
+  // A leaf identical to one the program already has (the same column read the same way, the same literal) is
+  // that one: a 55-instruction key expression read `rs.sky_rows` three times and `plane_tex.tex_name` twice, each
+  // a gather of every row into its own lane (21 leaf reads a row, nearly half the program's time).
+  static bool same_leaf(const Ins& a, const Ins& b) {
+    if (a.op != b.op || a.ty != b.ty || a.approx != b.approx || a.dec != b.dec || a.dyadic != b.dyadic || a.taint != b.taint ||
+        a.uns != b.uns || a.knull != b.knull || a.ki != b.ki || std::memcmp(&a.kf, &b.kf, sizeof a.kf) != 0 || a.src != b.src ||
+        a.slot != b.slot || a.cs != b.cs || a.codes.get() != b.codes.get() || a.set.get() != b.set.get())
+      return false;
+    return a.code_null == b.code_null;
+  }
+  uint32_t emit(Ins in) {
+    if (vjit_leaf(in.op) && in.args.empty())
+      for (uint32_t x = 0; x < P.ins.size(); ++x)
+        if (vjit_leaf(P.ins[x].op) && same_leaf(P.ins[x], in)) return x;
+    P.ins.push_back(std::move(in));
+    return (uint32_t)P.ins.size() - 1;
+  }
   const SqlExpr* cur = nullptr;    // the node being compiled, named by a reason-less fail
   uint32_t fail(const std::string& reason = std::string()) {
     if (ok) why = !reason.empty() ? reason : "at " + expr_text(cur);
@@ -947,6 +963,33 @@ struct Lanes {
     if (!cc->codes) { cc->c.resize(cs.size()); if (cs.size()) vx::decode_codes(cs, 0, cs.size(), cc->c.data()); cc->codes = true; }
     return cc->c.data();
   }
+  // The row set's row ids in source `src`, worked out once over the set (rowat(r).parts[src]) and read by the
+  // leaves of every program run over it, instead of each leaf resolving each row's JoinedRow again (a projection
+  // of five programs over 56,000 joined rows resolved 30 row ids a row). Kept across programs when the Lanes is
+  // shared (eval_column's `shared`).
+  std::vector<std::vector<size_t>> rid;
+  std::vector<uint8_t> rid_ok;
+  template <typename RowAt>
+  const size_t* rows_in(uint32_t src, RowAt&& rowat) {
+    if (rid.size() <= src) { rid.resize(src + 1); rid_ok.resize(src + 1, 0); }
+    if (!rid_ok[src]) {
+      rid[src].resize(total_rows);
+      for (size_t r = 0; r < total_rows; ++r) {
+        const JoinedRow& jr = rowat(r);
+        rid[src][r] = src < jr.parts.size() ? jr.parts[src] : kNullRow;
+      }
+      rid_ok[src] = 1;
+    }
+    return rid[src].data();
+  }
+  // A different row set: what was worked out over the last one goes.
+  void reset_for(size_t total) {
+    if (total_rows == total) return;
+    total_rows = total;
+    cols.clear();
+    rid.clear();
+    rid_ok.clear();
+  }
 };
 
 // Evaluates P over n rows, rowid(j, src) being row j's row in source src (or kNullRow). False with *err set when
@@ -1443,23 +1486,30 @@ struct Column {
 };
 
 // P over rows 0..total (rowat(j) the row), in chunks, into *out. False (with *err) where eval fails.
+// `shared`: a Lanes kept by the caller across the programs it runs over the same row set (a projection's items):
+// the row ids per source and the decoded columns are then worked out once for all of them.
 template <typename RowAt>
-inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out, std::string* err) {
+inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out, std::string* err, Lanes* shared = nullptr) {
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
   out->n.assign(total, 0);
   if (o.ty == Ty::Str) out->s.assign(total, std::string());
   else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
-  Lanes L;
-  L.total_rows = total;
+  Lanes own;
+  Lanes& L = shared ? *shared : own;
+  if (shared) L.reset_for(total); else L.total_rows = total;
+  // the sources the program's leaves read: their row ids over the whole set, once
+  std::vector<const size_t*> rs;
+  for (const Ins& in : P.ins) {
+    if (!in.cs) continue;
+    if (rs.size() <= in.src) rs.resize(in.src + 1, nullptr);
+    if (!rs[in.src]) rs[in.src] = L.rows_in(in.src, rowat);
+  }
   const size_t chunk = 4096;
   const size_t K = P.ins.size() - 1;
   for (size_t at = 0; at < total; at += chunk) {
     const size_t n = std::min(chunk, total - at);
-    auto rowid = [&](size_t j, uint32_t src) -> size_t {
-      const JoinedRow& r = rowat(at + j);
-      return src < r.parts.size() ? r.parts[src] : kNullRow;
-    };
+    auto rowid = [&](size_t j, uint32_t src) -> size_t { return src < rs.size() && rs[src] ? rs[src][at + j] : kNullRow; };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
     if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }

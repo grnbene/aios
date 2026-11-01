@@ -220,7 +220,36 @@ NOT p.is_sky AND fl.name = p.tex_name`, 56,000 candidates, 24-29 ms of ON checks
 
 Measured, three frames: ON checks 92 -> 39 ms (the flat-texture join 29 -> 7 ms a frame, most of what is left
 being the trace's own two clock reads per candidate); SQLDoom E1M1 medians 456/463/450 -> 413/428/440 ms against
-the build before both steps, alternating. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
+the build before both steps, alternating.
+
+### The join step's rows extended in place
+
+With the ON checks gone, a lookup join's time was the rows themselves: a LEFT JOIN of 56,000 rows against a texel
+table that met no candidate at all spent ~110 ns a row copying each base row into its chunk's list with the
+NULL part appended, then again into the step's output (and freeing the input): ~6 ms a step, and a frame runs
+many such steps. The step's join phase was 807 ms of three frames.
+
+Done: the probes put a chunk's result into parts (`ChunkOut`: each base row's one joined row, or NULL-padded, or
+dropped) and the base rows are extended where they are - a `parts.push_back` each, the dropped ones compacted
+away, the input vector becoming the output. A base row meeting a second candidate turns its chunk to list mode
+(the rows themselves, in probe order, as before), so a 1:N join makes exactly the rows it made; chunks are joined
+back in order either way. A candidate's row is only made when the interpreter has to see it (per-candidate ON
+conjuncts, pushed WHERE conjuncts). A one-row table joined with nothing to check is appended the same way. Also
+in this step: identical leaves of a program are one leaf (a 55-instruction key expression read `rs.sky_rows`
+three times: 21 leaf reads a row -> 14, 55 -> 44 instructions), and a projection's programs share one `Lanes` -
+the row ids per source and the decoded columns worked out once for all its items.
+
+Measured, three frames: join steps 1,157 -> 531 ms; a 56,000-row LEFT JOIN with no match 6.0 -> 1.3 ms; SQLDoom
+E1M1 medians 449/458/462 -> 357/340/360 ms against the build before these three steps (from 5cab6ef),
+alternating - 2.1 -> 2.8 frames a second. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
+the text-equality and residual-ON sets, and a set for the in-place step (one, two and no candidates mixed
+across chunks, LEFT / inner / RIGHT, pushed WHERE on padded and matched rows, a one-row table then nine more
+joins past the inline parts, text keys with a lane conjunct, a GROUP BY over the step) are identical to the
+build before.
+
+What the measurements say is left in the programs: leaf gathering ~2.5 ns a leaf read and the native code ~1 ns
+an instruction a row, every intermediate through a stack slot (a store-to-load dependency on each). Values in
+registers and the leaves gathered by the native code itself are the next codegen step (3b). Frame bytes, the four oracle suites, the lane / mixed / decimal checks,
 an edge-case set for text equality (case, trailing spaces, accents, NULL, result-table columns, numeric-looking
 text) and one for residual ON conditions (LEFT / RIGHT / inner, base-only and two-sided conjuncts, NULL
 conjuncts, numeric-prefix text keys, pushed WHERE with padding, a three-table chain) are identical to the build

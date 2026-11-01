@@ -45806,6 +45806,11 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       } else {
         plain = conds;
       }
+      if (nj == 1 && plain.empty()) {
+        // one row and nothing to check here: every row takes it where it is (no row copied, no second list)
+        for (JoinedRow& base : rows) base.parts.push_back(0);
+        next.swap(rows);
+      } else {
       if (!reserve_rows(rows.size() * nj, sizeof(JoinedRow))) return make_error("Query execution was interrupted");
       next.reserve(rows.size() * nj);
       EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
@@ -45822,6 +45827,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           }
           next.push_back(std::move(cand));
         }
+      }
       }
       join_method = "small table";
       hash_join_done = true;
@@ -46467,17 +46473,58 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           comp_ok = true;
         }
       }
-      auto batch_probe = [&](size_t bi, EvalCtx& ctx, JoinedRows& l_next, OnSink* sink) {
+      // Where a chunk's probes put their rows. In-place mode (`part`): each base row's one joined row, or
+      // kPadPart (NULL-padded) or kDropPart (dropped), and the base rows are then extended where they are - no
+      // row copied into a chunk list and again into the step's output, which was most of a lookup join's time
+      // (56,000 rows LEFT JOIN a texel table: ~110 ns a row with no candidate at all). A base row meeting a
+      // second candidate turns its chunk to list mode (the rows themselves, in probe order, as the step always
+      // made them); the chunks are joined back in order either way, so the output order is the same.
+      constexpr uint32_t kPadPart = UINT32_MAX, kDropPart = UINT32_MAX - 1;
+      struct ChunkOut {
+        JoinedRows* list = nullptr;
+        std::vector<uint32_t>* part = nullptr;
+        size_t base0 = 0;
+      };
+      // in-place mode so far -> list mode: the chunk's rows [base0, upto) made from their parts, in order
+      auto to_list = [&](ChunkOut& o, size_t upto) {
+        for (size_t bi = o.base0; bi < upto; ++bi) {
+          const uint32_t p = (*o.part)[bi - o.base0];
+          if (p == kDropPart) continue;
+          JoinedRow r = rows[bi];
+          r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
+          o.list->push_back(std::move(r));
+        }
+        o.part = nullptr;
+      };
+      // a candidate that passed every check: base row bi with joined row mr (cand: the row, where one was made)
+      auto out_cand = [&](ChunkOut& o, size_t bi, size_t mr, JoinedRow* cand) {
+        if (o.part) {
+          uint32_t& slot = (*o.part)[bi - o.base0];
+          if (slot == kDropPart) { slot = (uint32_t)mr; return; }
+          to_list(o, bi + 1);   // a second candidate for this base row
+        }
+        if (cand) { o.list->push_back(std::move(*cand)); return; }
+        JoinedRow r = rows[bi];
+        r.parts.push_back(mr);
+        o.list->push_back(std::move(r));
+      };
+      // a LEFT JOIN's padded row for base row bi, where the pushed WHERE conjuncts admit it
+      auto pad_row = [&](ChunkOut& o, size_t bi, EvalCtx& ctx) {
+        if (!join_is_left[j]) return;
+        if (pushable.empty() && o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
+        JoinedRow padded = rows[bi];
+        padded.parts.push_back(kNullRow);
+        ctx.row = &padded;
+        for (const SqlExpr* p : pushable) if (!predicate_true(p, ctx)) return;
+        if (o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
+        o.list->push_back(std::move(padded));
+      };
+      // whether a candidate's row has to be made for the interpreter (the ON's per-candidate conjuncts, the
+      // pushed WHERE conjuncts); otherwise only its row id is kept until the chunk is assembled
+      const bool cand_checks = (has_extra_join && !on_check.empty()) || !pushable_rest.empty();
+      auto batch_probe = [&](size_t bi, EvalCtx& ctx, ChunkOut& o, OnSink* sink) {
         const JoinedRow& base = rows[bi];
-        auto pad = [&]() {
-          if (!join_is_left[j]) return;
-          JoinedRow padded = base;
-          padded.parts.push_back(kNullRow);
-          ctx.row = &padded;
-          for (const SqlExpr* p : pushable) if (!predicate_true(p, ctx)) return;
-          l_next.push_back(std::move(padded));
-        };
-        if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad(); return; }
+        if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad_row(o, bi, ctx); return; }
         bool matched = false;
         double key = 0;
         if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
@@ -46491,16 +46538,16 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
               const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
               if (kcs.is_null(mr) || vx::typed_value(kcs, mr) != w) return;
             }
-            JoinedRow cand = base;
-            cand.parts.push_back(mr);
-            ctx.row = &cand;
+            JoinedRow cand;
+            const bool made = cand_checks || sink;
+            if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
             if (has_extra_join && !on_true(ctx)) return;
             if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); return; }
             matched = true;
             if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
             if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) return;
             for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) return;
-            l_next.push_back(std::move(cand));
+            out_cand(o, bi, mr, made ? &cand : nullptr);
           };
           if (comp_ok) {
             CompKey ck;
@@ -46523,31 +46570,20 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             if (it != idx->by_number.end()) for (uint32_t mr : it->second) take(mr);
           }
         }
-        if (!matched && !sink) pad();
+        if (!matched && !sink) pad_row(o, bi, ctx);
       };
-      auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, JoinedRows& l_next,
+      auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, ChunkOut& o,
                                JoinMemo* memo, OnSink* sink) {
+        const size_t bi = (size_t)(&base - rows.data());
         JoinedRow probe_row = base;
         vctx.row = &probe_row;
         bool matched = false;
         const uint64_t pt0 = step_timing ? hal_now_ns() : 0;
-        if (!base_refused.empty()) {
-          const size_t bri = (size_t)(&base - rows.data());
-          if (bri < base_refused.size() && base_refused[bri]) {
-            // no row of the joined table can meet this one: a LEFT JOIN pads it, an inner join drops it
-            if (step_timing) n_skipped.fetch_add(1, std::memory_order_relaxed);
-            if (join_is_left[j] && !sink) {   // with a sink, flush_sink pads it in its turn
-              JoinedRow padded = base;
-              padded.parts.push_back(kNullRow);
-              ctx.row = &padded;
-              bool keep = true;
-              for (const SqlExpr* p : pushable) {
-                if (!predicate_true(p, ctx)) { keep = false; break; }
-              }
-              if (keep) l_next.push_back(std::move(padded));
-            }
-            return;
-          }
+        if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) {
+          // no row of the joined table can meet this one: a LEFT JOIN pads it, an inner join drops it
+          if (step_timing) n_skipped.fetch_add(1, std::memory_order_relaxed);
+          if (!sink) pad_row(o, bi, ctx);   // with a sink, flush_sink pads it in its turn
+          return;
         }
 
         // Locals, not thread_local scratch: a pushed-down condition can run
@@ -46570,16 +46606,16 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         if (step_timing) { t_gather.fetch_add(pt1 - pt0, std::memory_order_relaxed); n_cands.fetch_add(matches->size(), std::memory_order_relaxed); }
 
         for (size_t match_ri : *matches) {
-          JoinedRow cand = base;
-          cand.parts.push_back(match_ri);
-          ctx.row = &cand;
+          JoinedRow cand;
+          const bool made = cand_checks || sink;
+          if (made) { cand = base; cand.parts.push_back(match_ri); ctx.row = &cand; }
           const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
           const bool on_ok = !has_extra_join || on_true(ctx);
           if (step_timing) t_on.fetch_add(hal_now_ns() - ot0, std::memory_order_relaxed);
           if (!on_ok) {
             continue;
           }
-          if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)(&base - rows.data())); continue; }
+          if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
           // The ON clause matched: this left row is not NULL-padded,
           // whatever WHERE then says about the joined row. Marking it
           // matched only when WHERE also passed padded it instead, and
@@ -46592,26 +46628,17 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           for (const SqlExpr* p : pushable_rest) {
             if (!predicate_true(p, ctx)) { keep = false; break; }
           }
-          if (keep) l_next.push_back(std::move(cand));
+          if (keep) out_cand(o, bi, match_ri, made ? &cand : nullptr);
         }
 
-        if (!matched && join_is_left[j] && !sink) {
-          JoinedRow padded = base;
-          padded.parts.push_back(kNullRow);
-          ctx.row = &padded;
-          bool keep = true;
-          for (const SqlExpr* p : pushable) {
-            if (!predicate_true(p, ctx)) { keep = false; break; }
-          }
-          if (keep) l_next.push_back(std::move(padded));
-        }
+        if (!matched && !sink) pad_row(o, bi, ctx);
       };
       // The candidates a chunk's probes left in the sink: each on_vec conjunct over all of them in lanes (a
       // program that refuses a value - an overflow - hands that conjunct to the interpreter, which reports as it
       // always has), then the survivors in base order with what follows the ON in process_probe (the matched
       // mark, the prefilter, the pushed WHERE conjuncts); a base row left with no candidate passing the ON is
       // padded (LEFT) or dropped, as process_probe pads one.
-      auto flush_sink = [&](OnSink& sink, size_t bstart, size_t bend, EvalCtx& ctx, JoinedRows& l_next) {
+      auto flush_sink = [&](OnSink& sink, size_t bstart, size_t bend, EvalCtx& ctx, ChunkOut& o) {
         const size_t n = sink.cands.size();
         std::vector<uint8_t> fail(n, 0);
         const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
@@ -46643,16 +46670,9 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             ctx.row = &cand;
             bool keep = true;
             for (const SqlExpr* q : pushable_rest) if (!predicate_true(q, ctx)) { keep = false; break; }
-            if (keep) l_next.push_back(std::move(cand));
+            if (keep) out_cand(o, bi, mr, &cand);
           }
-          if (!matched && join_is_left[j]) {
-            JoinedRow padded = rows[bi];
-            padded.parts.push_back(kNullRow);
-            ctx.row = &padded;
-            bool keep = true;
-            for (const SqlExpr* q : pushable) if (!predicate_true(q, ctx)) { keep = false; break; }
-            if (keep) l_next.push_back(std::move(padded));
-          }
+          if (!matched) pad_row(o, bi, ctx);
         }
         sink.cands.clear();
         sink.bi.clear();
@@ -46671,7 +46691,11 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         // 39k chunk lists of ~20 KB for a 10M-row step were too small to leave
         // malloc (JoinBufAlloc) and, freed, held 1.4 GB of emptied regions.
         const size_t kJoinChunk = rows.size() >= 1000000 ? std::max<size_t>(256, rows.size() / (total_threads * 8)) : 256;
-        std::vector<JoinedRows> local_next((rows.size() + kJoinChunk - 1) / kJoinChunk);
+        const size_t nchunks = (rows.size() + kJoinChunk - 1) / kJoinChunk;
+        std::vector<JoinedRows> local_next(nchunks);
+        std::vector<std::vector<uint32_t>> local_part(nchunks);   // in-place mode: each chunk's parts (ChunkOut)
+        std::vector<uint8_t> local_inplace(nchunks, 0);
+        const bool inplace_ok = js.table->row_count() < (size_t)kDropPart;
         std::vector<std::string> local_errs(total_threads);
         std::vector<JoinMemo> memos(memo_ok ? total_threads : 0);
 
@@ -46686,18 +46710,53 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           ctx.sources = &partial;
           ctx.err = &local_errs[tid];
 
-          auto& l_next = local_next[bstart / kJoinChunk];
+          const size_t ci = bstart / kJoinChunk;
+          ChunkOut o;
+          o.list = &local_next[ci];
+          o.base0 = bstart;
+          if (inplace_ok) { local_part[ci].assign(bend - bstart, kDropPart); o.part = &local_part[ci]; }
           OnSink sink;
           OnSink* const sk = on_vec.empty() ? nullptr : &sink;
           for (size_t bi = bstart; bi < bend; ++bi) {
-            if (batch_ok) batch_probe(bi, ctx, l_next, sk);
-            else process_probe(rows[bi], vctx, ctx, l_next, memo_ok ? &memos[tid] : nullptr, sk);
+            if (batch_ok) batch_probe(bi, ctx, o, sk);
+            else process_probe(rows[bi], vctx, ctx, o, memo_ok ? &memos[tid] : nullptr, sk);
           }
-          if (sk) flush_sink(sink, bstart, bend, ctx, l_next);
+          if (sk) flush_sink(sink, bstart, bend, ctx, o);
+          local_inplace[ci] = o.part != nullptr;
         });
 
         for (const auto& l_err : local_errs) {
           if (!l_err.empty()) return make_error(l_err);
+        }
+        bool all_inplace = inplace_ok;
+        for (size_t c = 0; c < nchunks && all_inplace; ++c) if (!local_inplace[c]) all_inplace = false;
+        if (all_inplace) {
+          // Every base row met at most one candidate: the rows are extended where they are, each keeping its
+          // place less the dropped ones, and the input becomes the output (rows_hold covers it: no more rows).
+          size_t w = 0;
+          for (size_t c = 0; c < nchunks; ++c) {
+            const size_t b0 = c * kJoinChunk;
+            const std::vector<uint32_t>& parts = local_part[c];
+            for (size_t k = 0; k < parts.size(); ++k) {
+              const uint32_t p = parts[k];
+              if (p == kDropPart) continue;
+              JoinedRow& r = rows[b0 + k];
+              r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
+              if (w != b0 + k) rows[w] = std::move(r);
+              ++w;
+            }
+          }
+          rows.resize(w);
+          next.swap(rows);
+        } else {
+        // a chunk still in in-place mode among list-mode ones: its rows made from its parts, while the input is here
+        for (size_t c = 0; c < nchunks; ++c) {
+          if (!local_inplace[c]) continue;
+          ChunkOut o;
+          o.list = &local_next[c];
+          o.part = &local_part[c];
+          o.base0 = c * kJoinChunk;
+          to_list(o, o.base0 + local_part[c].size());
         }
         // The step's input is spent: free it before the output is gathered,
         // and free each chunk as it is moved out. Holding the input, every
@@ -46714,6 +46773,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           for (auto& r : ln) next.push_back(std::move(r));
           JoinedRows().swap(ln);
         }
+        }
       } else {
         EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope;
         vctx.sources = &baseonly;
@@ -46724,10 +46784,12 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         ctx.err = &err;
 
         JoinMemo memo;
+        ChunkOut o;
+        o.list = &next;   // list mode: the rows themselves
         for (const JoinedRow& base : rows) {
           if (sql_interrupted()) break;
-          if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, next, nullptr);
-          else process_probe(base, vctx, ctx, next, memo_ok ? &memo : nullptr, nullptr);
+          if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, o, nullptr);
+          else process_probe(base, vctx, ctx, o, memo_ok ? &memo : nullptr, nullptr);
         }
       }
       if (vx_trace_on())
@@ -47133,26 +47195,35 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
     B.rows = n;
     EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
     std::vector<size_t> interp;
+    vp::Lanes shared;   // the row ids and decoded columns, once for every item's program
+    const bool ptrace = vx_trace_on();
+    uint64_t t_direct = 0, t_prog = 0, t_conv = 0;   // the trace: gathered columns, programs run, lanes to batch columns
+    size_t n_direct = 0, n_prog = 0;
     for (size_t i = 0; i < expanded.size(); ++i) {
       const SqlDataType dest = infer_item_type(expanded[i].expr.get(), sources);
+      const uint64_t pt0 = ptrace ? hal_now_ns() : 0;
       if (direct[i].ok) {
         const size_t ds = direct[i].src;
         colbatch_gather(*sources[ds].table, direct[i].col, dest, 0,
                         [&](size_t r) -> size_t { const JoinedRow& jr = rows[r]; return ds < jr.parts.size() ? jr.parts[ds] : kNullRow; }, n, &B.cols[i]);
+        if (ptrace) { t_direct += hal_now_ns() - pt0; ++n_direct; }
         continue;
       }
       if (n >= 64) {
         if (const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx)) {
           vp::Column col;
           std::string verr;
-          if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) {
+          if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr, &shared)) {
+            const uint64_t pt1 = ptrace ? hal_now_ns() : 0;
             colbatch_from_vp(std::move(col), dest, 0, &B.cols[i]);
+            if (ptrace) { t_prog += pt1 - pt0; t_conv += hal_now_ns() - pt1; ++n_prog; }
             continue;
           }
         }
       }
       interp.push_back(i);
     }
+    const uint64_t pt_interp0 = ptrace ? hal_now_ns() : 0;
     if (!interp.empty()) {
       // the rest through the interpreter, the rows in chunks across the pool as project_row's are
       for (size_t i : interp) { B.cols[i].kind = ColBatch::Text; B.cols[i].s.resize(n); }
@@ -47181,8 +47252,14 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
         if (!e.empty()) return make_error(e);
       }
     }
+    const uint64_t pt_narrow0 = ptrace ? hal_now_ns() : 0;
     for (size_t i = 0; i < expanded.size(); ++i)
       if (infer_item_type(expanded[i].expr.get(), sources) == SqlDataType::Int) colbatch_narrow_int(B.cols[i], n);
+    if (ptrace)
+      vx_trace("project: " + std::to_string(n) + " rows to columns: " + std::to_string(n_direct) + " gathered in " + std::to_string(t_direct / 1000) +
+               " us, " + std::to_string(n_prog) + " programs in " + std::to_string(t_prog / 1000) + " us (lanes to columns " + std::to_string(t_conv / 1000) +
+               " us), " + std::to_string(interp.size()) + " interpreted in " + std::to_string((pt_narrow0 - pt_interp0) / 1000) + " us, narrowing " +
+               std::to_string((hal_now_ns() - pt_narrow0) / 1000) + " us");
     B.filled = true;
     rows.clear();   // nothing left for the projection below
   }
@@ -47194,13 +47271,14 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
   if (!ordinal_keys && !having && vp_proj_count >= 256) {
     vp_text.resize(expanded.size());
     EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope; vctx.sources = &sources;
+    vp::Lanes shared;
     for (size_t i = 0; i < expanded.size(); ++i) {
       if (direct[i].ok && !ordinal_needed[i]) continue;
       const vp::Prog* P = vp::program_for(expanded[i].expr.get(), vctx);
       if (!P) continue;
       vp::Column col;
       std::string verr;
-      if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, vp_proj_count, &col, &verr)) continue;
+      if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, vp_proj_count, &col, &verr, &shared)) continue;
       vp_text[i].resize(vp_proj_count);
       for (size_t j = 0; j < vp_proj_count; ++j) vp_text[i][j] = col.text(j);
     }
