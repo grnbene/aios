@@ -296,7 +296,15 @@ And the lane GROUP BY's order over one key sorts packed (NULL flag, value, group
 through the groups' first rows into the lanes (53,760 groups).
 
 Measured: SQLDoom E1M1 medians 446/465/471 -> 291/293/291 ms against the build before today's commits
-(5cab6ef), alternating - 2.1 -> 3.4 frames a second. Frame bytes, the four oracle suites, the lane / mixed /
+(5cab6ef), alternating - 2.1 -> 3.4 frames a second.
+
+Native code, CAST AS SIGNED: a double that is already whole and below 9.2e18 - CAST(FLOOR(x) AS SIGNED), most
+casts - is converted in line (cvttsd2si, checked by converting back); the helper decides the rest (a fraction's
+rounding as written, the range error). The renderer's key expressions cast four or five times a row and the
+call was most of their time: the texel-key programs 6.5-9.8 -> 4.7 ms over 56,524 rows, the five-program
+projection 21 -> 18 ms; a frame within the run-to-run spread. The differential check over the frames, the
+randomized check under six seeds, and a CAST set (fractions at and near a half, negatives, whole doubles up to
+9.2e18 and past it, 2^53+1, -0, 1e300, 1e-300) are identical to the build before. Frame bytes, the four oracle suites, the lane / mixed /
 decimal checks and a GROUP_CONCAT set (integer, double, expression and ordinal keys, DESC, two keys, NULL keys
 and NULL values, DISTINCT, SEPARATOR, several arguments, string_agg, per-group over GROUP BY, under and over 256
 rows, an unsigned key, MD5 of the whole result) are identical to the build before. Frame bytes, the four oracle suites, the lane / mixed / decimal checks,

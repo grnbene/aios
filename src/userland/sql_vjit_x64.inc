@@ -734,12 +734,29 @@ class Builder {
         done.push_back(null_any(x, {in.args[0]}));
         if (ty(in.args[0]) == Ty::I64) { ld_i(in.args[0], RAX); store_i(x, RAX); }
         else {
+          // A double that is already a whole number below 9.2e18 (CAST(FLOOR(x) AS SIGNED), most casts) is its
+          // integer, in line: the helper (vjit_cast_i) decides the rest - a fraction's rounding as written, the
+          // range error. SQLDoom's key expressions cast four or five times a row; the call was most of their time.
           ld_f(in.args[0], X0, RAX);
+          a_.movq_rx(RCX, X0);
+          a_.btr63(RCX);                                   // |a| as bits: ordered as the doubles are
+          { uint64_t lim; const double d = 9.2e18; std::memcpy(&lim, &d, 8); a_.mov_imm(RDX, lim); }
+          a_.cmp(RCX, RDX);
+          const size_t slow1 = a_.jcc(CcAE);               // 9.2e18 or more, or NaN
+          a_.cvttsd2si(RAX, X0);
+          a_.cvtsi2sd(X1, RAX);
+          a_.ucomisd(X1, X0);
+          const size_t slow2 = a_.jcc(CcNE);               // a fraction
+          const size_t slow3 = a_.jcc(CcP);
+          store_i(x, RAX);
+          const size_t fast = a_.jmp();
+          a_.patch_here(slow1); a_.patch_here(slow2); a_.patch_here(slow3);
           a_.mov_imm(RDI, at(in.args[0]).approx ? 1 : 0);
           a_.lea(RSI, RSP, slot_v(x));
           call_fn((const void*)&vjit_cast_i);
           a_.test(RAX, RAX);
           bail_if(CcNE);
+          a_.patch_here(fast);
         }
         set_not_null(x);
         break;
