@@ -8293,7 +8293,9 @@ std::shared_ptr<void> vjit_build_for(const Prog& P, std::string* why) { return v
 int vjit_run(const void* code, size_t n, const void* const* lane_i, const void* const* lane_f, const void* const* lane_n,
              int64_t* out_i, double* out_f, uint8_t* out_n) {
   vjit::Env env{n, lane_i, lane_f, lane_n, out_i, out_f, out_n};
-  return static_cast<const vjit::Code*>(code)->fn(&env);
+  const int rc = static_cast<const vjit::Code*>(code)->fn(&env);
+  if (rc == 0) vjit::native_runs().fetch_add(1, std::memory_order_relaxed);
+  return rc;
 }
 bool vjit_check_mode() { return vjit::check_mode(); }
 }  // namespace vp
@@ -59320,6 +59322,13 @@ uint8_t code_bits_for(uint64_t v) { return ::aios::userland::code_bits_for(v); }
 void for_each_parallel(size_t n, const std::function<void(size_t)>& fn) { ::aios::userland::for_each_parallel(n, fn); }
 std::string lower_of(const std::string& s) { return ::aios::userland::lower_of(s); }
 bool hidden_table_name(const std::string& n) { return ::aios::userland::hidden_table_name(n); }
+uint64_t vjit_native_runs() {
+#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+  return ::aios::userland::vp::vjit::native_runs().load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
 #if defined(__GLIBC__)
 size_t malloc_live_bytes() { return ::malloc_live_bytes(); }
 size_t malloc_mmap_bytes() { return ::malloc_mmap_bytes(); }

@@ -584,6 +584,9 @@ target_link_libraries(aios-asql-grouped-expr-check PRIVATE aios)
 add_executable(aios-asql-wide-number-check tools/asql-wide-number-check.cpp)
 target_link_libraries(aios-asql-wide-number-check PRIVATE aios)
 
+add_executable(aios-asql-vjit-check tools/asql-vjit-check.cpp)
+target_link_libraries(aios-asql-vjit-check PRIVATE aios)
+
 add_executable(aios-asql-admission-check tools/asql-admission-check.cpp)
 target_link_libraries(aios-asql-admission-check PRIVATE aios)
 
@@ -994,6 +997,7 @@ target_link_libraries(aios-asql-round-check PRIVATE aios)
 add_test(NAME asql.round.check COMMAND aios-asql-round-check)
 add_test(NAME asql.grouped_expr.check COMMAND aios-asql-grouped-expr-check)
 add_test(NAME asql.wide_number.check COMMAND aios-asql-wide-number-check)
+add_test(NAME asql.vjit.check COMMAND aios-asql-vjit-check)
 add_test(NAME asql.admission.check COMMAND aios-asql-admission-check)
 add_test(NAME asql.enhancements.check COMMAND aios-asql-enhancements-check)
 add_test(NAME asql.sqlfeatures.check COMMAND aios-asql-sqlfeatures-check)

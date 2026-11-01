@@ -53,6 +53,8 @@ uint8_t code_bits_for(uint64_t v);
 void for_each_parallel(size_t n, const std::function<void(size_t)>& fn);
 
 std::string lower_of(const std::string& s);
+// Chunks of lane programs computed by native code so far (sql_vjit_x64.inc); 0 where there is none.
+uint64_t vjit_native_runs();
 // The engine's own scratch tables ("\x01tmp..."), never saved or listed.
 bool hidden_table_name(const std::string& n);
 

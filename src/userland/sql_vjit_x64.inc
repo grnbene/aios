@@ -18,6 +18,7 @@ inline bool enabled() {
   static const bool on = [] { const char* v = std::getenv("AIOS_SQL_VJIT"); return !(v && *v == '0'); }();
   return on;
 }
+inline std::atomic<uint64_t>& native_runs() { static std::atomic<uint64_t> n{0}; return n; }   // chunks computed natively
 inline bool check_mode() {
   static const bool on = [] { const char* v = std::getenv("AIOS_SQL_VJIT_CHECK"); return v && *v == '1'; }();
   return on;
