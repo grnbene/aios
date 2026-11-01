@@ -443,6 +443,20 @@ expression and a key not selected, HAVING, doubles under MIN / MAX / SUM / AVG, 
 OFFSET) is identical to the build before, as are frame bytes, the four oracle suites, the lane checks and the
 earlier edge sets.
 
+The window shape (the latest order per customer: ROW_NUMBER() OVER (PARTITION BY custid ORDER BY orddate DESC)
+inside a derived table, WHERE rn = 1): 482 ms against DuckDB's 19. The columnar window path (columnar_window)
+was built for exactly this statement but refused it, because an ORDER BY key held as dates (TemporalDays) was
+neither a typed number nor a dictionary to it; a date's order is its day number's, so it is a key now (the
+refusal sites are numbered in the trace: "columnar window: not taken (n)"). Standalone the statement then took
+47 ms instead of 412. As a derived table it still made 200,000 text rows for the outer select to parse back; the
+columnar window now fills the consumer's typed batch itself (the kept rows' columns gathered from the store by
+row id, the windows as integers, the result columns typed as the table's) when one is asked for: 525 -> 128 ms.
+What is left there is the DECIMAL column, which crosses as text both ways (formatted on the way out, parsed on
+the way in, ~60 ms of the 128); a decimal batch kind is the next step on this shape. A window edge set (ROW_NUMBER /
+RANK / DENSE_RANK / COUNT partitioned by a number or a text, ordered by a date, a datetime, a decimal with NULLs,
+ascending and descending, filtered through a derived table, with and without LIMIT) is identical to the build
+before, as are frame bytes, the four oracle suites, the lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

@@ -40663,19 +40663,19 @@ static void radix_sort_pairs(std::vector<std::pair<uint64_t, uint32_t>>& v, int 
   if (src != &v) v.swap(tmp);
 }
 
-static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQueryResult* res) {
+static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQueryResult* res, ColBatch* col_out) {
   static const bool off = std::getenv("AIOS_SQL_COLUMNAR_WINDOW") && *std::getenv("AIOS_SQL_COLUMNAR_WINDOW") == '0';
   if (off || !db || b.sources.size() != 1 || !b.join_conditions.empty() || b.distinct || !b.group_by.empty() ||
       b.having || !b.windows.empty() || current_outer_scope())
-    return false;
+    { if (vx_trace_on()) vx_trace("columnar window: not taken (1)"); return false; }
   const auto& src = b.sources[0];
-  if (src.is_derived() || src.natural || !src.using_cols.empty() || find_cte_table(src.table_name)) return false;
+  if (src.is_derived() || src.natural || !src.using_cols.empty() || find_cte_table(src.table_name)) { if (vx_trace_on()) vx_trace("columnar window: not taken (2)"); return false; }
   const SqlTable* tp = db->resolve_table(src.table_name);
   if (!tp || !db->is_stored_table(tp) || tp->inferred_types || tp->row_count() < 4096 || tp->row_count() >= 0xFFFFFFF0ull)
-    return false;
+    { if (vx_trace_on()) vx_trace("columnar window: not taken (3)"); return false; }
   const SqlTable& t = *tp;
-  for (const auto& cs : t.col_data) if (cs.size() != t.row_count()) return false;
-  if (b.where && (expr_has_subquery(b.where) || expr_has_window(b.where.get()))) return false;
+  for (const auto& cs : t.col_data) if (cs.size() != t.row_count()) { if (vx_trace_on()) vx_trace("columnar window: not taken (4)"); return false; }
+  if (b.where && (expr_has_subquery(b.where) || expr_has_window(b.where.get()))) { if (vx_trace_on()) vx_trace("columnar window: not taken (5)"); return false; }
   const std::string alias = src.alias.empty() ? last_name_part(src.table_name) : lower_of(src.alias);
   auto column_of = [&](const SqlExpr* e) -> int {
     if (!e || e->op != ExprOp::Column || e->name.rfind("@@", 0) == 0) return -1;
@@ -40687,33 +40687,33 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   struct Item { int col = -1; int win = -1; };
   std::vector<Item> items;
   for (const auto& it : b.items) {
-    if (it.star || !it.expr) return false;
+    if (it.star || !it.expr) { if (vx_trace_on()) vx_trace("columnar window: not taken (6)"); return false; }
     Item x;
     const SqlExpr* e = it.expr.get();
     if (e->window) {
       const WindowSpec& sp = *e->window;
-      if (!sp.base.empty() || sp.has_frame || e->negated) return false;
+      if (!sp.base.empty() || sp.has_frame || e->negated) { if (vx_trace_on()) vx_trace("columnar window: not taken (7)"); return false; }
       W w;
       w.fn = upper_of(e->name);
       if (w.fn == "ROW_NUMBER" || w.fn == "RANK" || w.fn == "DENSE_RANK") {
-        if (!e->args.empty()) return false;
+        if (!e->args.empty()) { if (vx_trace_on()) vx_trace("columnar window: not taken (8)"); return false; }
       } else if (w.fn == "COUNT") {
-        if (e->args.size() != 1 || !e->args[0]) return false;
+        if (e->args.size() != 1 || !e->args[0]) { if (vx_trace_on()) vx_trace("columnar window: not taken (9)"); return false; }
         if (e->args[0]->op == ExprOp::Star) w.count_col = -1;
-        else if ((w.count_col = column_of(e->args[0].get())) < 0) return false;
+        else if ((w.count_col = column_of(e->args[0].get())) < 0) { if (vx_trace_on()) vx_trace("columnar window: not taken (10)"); return false; }
       } else {
-        return false;
+        { if (vx_trace_on()) vx_trace("columnar window: not taken (11)"); return false; }
       }
-      for (const auto& pe : sp.partition_by) { const int c = column_of(pe.get()); if (c < 0) return false; w.parts.push_back(c); }
-      for (const auto& k : sp.order_by) { const int c = column_of(k.expr.get()); if (c < 0 || k.ordinal > 0) return false; w.order.emplace_back(c, k.descending); }
+      for (const auto& pe : sp.partition_by) { const int c = column_of(pe.get()); if (c < 0) { if (vx_trace_on()) vx_trace("columnar window: not taken (12)"); return false; } w.parts.push_back(c); }
+      for (const auto& k : sp.order_by) { const int c = column_of(k.expr.get()); if (c < 0 || k.ordinal > 0) { if (vx_trace_on()) vx_trace("columnar window: not taken (13)"); return false; } w.order.emplace_back(c, k.descending); }
       x.win = (int)wins.size();
       wins.push_back(std::move(w));
     } else {
-      if ((x.col = column_of(e)) < 0) return false;
+      if ((x.col = column_of(e)) < 0) { if (vx_trace_on()) vx_trace("columnar window: not taken (14)"); return false; }
     }
     items.push_back(x);
   }
-  if (wins.empty()) return false;
+  if (wins.empty()) { if (vx_trace_on()) vx_trace("columnar window: not taken (15)"); return false; }
   // ORDER BY: a select item (by position or label) or a column of the table.
   struct Key { int item = -1; int col = -1; bool desc = false; };
   std::vector<Key> keys;
@@ -40721,18 +40721,18 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     Key key;
     key.desc = k.descending;
     if (k.ordinal >= 1) {
-      if ((size_t)k.ordinal > items.size()) return false;
+      if ((size_t)k.ordinal > items.size()) { if (vx_trace_on()) vx_trace("columnar window: not taken (16)"); return false; }
       key.item = k.ordinal - 1;
     } else {
-      if (!k.expr || k.expr->op != ExprOp::Column || expr_has_window(k.expr.get())) return false;
+      if (!k.expr || k.expr->op != ExprOp::Column || expr_has_window(k.expr.get())) { if (vx_trace_on()) vx_trace("columnar window: not taken (17)"); return false; }
       if (k.expr->qualifier.empty())
         for (size_t i = 0; i < b.items.size() && key.item < 0; ++i)
           if (lower_of(b.items[i].label) == lower_of(k.expr->name)) key.item = (int)i;
-      if (key.item < 0 && (key.col = column_of(k.expr.get())) < 0) return false;
+      if (key.item < 0 && (key.col = column_of(k.expr.get())) < 0) { if (vx_trace_on()) vx_trace("columnar window: not taken (18)"); return false; }
     }
     keys.push_back(key);
   }
-  if (keys.size() > 4) return false;
+  if (keys.size() > 4) { if (vx_trace_on()) vx_trace("columnar window: not taken (19)"); return false; }
 
   // The rows.
   std::vector<QuerySource> sources(1);
@@ -40751,7 +40751,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     vx::Selection sel;
     if (b.where) {
       ExprPtr w = clone_expr(b.where.get());
-      if (!vx::select_rows(db, t, w.get(), local, base, &sel, &err) || !err.empty()) return false;
+      if (!vx::select_rows(db, t, w.get(), local, base, &sel, &err) || !err.empty()) { if (vx_trace_on()) vx_trace("columnar window: not taken (20)"); return false; }
     } else {
       sel.all = true;
       sel.total = t.row_count();
@@ -40773,7 +40773,9 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     std::vector<double> k(n);
     const bool hn = vx::has_nulls(cs);
     const bool numeric = sql_type_numeric(sc.type) && !sc.temporal;
-    if (numeric && vx::typed_numeric(cs)) {
+    const bool temporal_typed = sc.temporal && (cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds);
+    if ((numeric && vx::typed_numeric(cs)) || temporal_typed) {
+      // a date's or datetime's order is its day or second number's (NULL first, as the general way sorts)
       for (size_t i = 0; i < n; ++i) k[i] = hn && cs.is_null(rows[i]) ? kNull : vx::typed_value(cs, rows[i]);
     } else if (vx::dict_coded(cs) && cs.encoding != ColumnEncoding::Constant) {
       const size_t nd = vx::dict_size(cs);
@@ -40786,7 +40788,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
           if (sql_is_null(v)) { ck[c] = kNull; continue; }
           char* end = nullptr;
           const double d = std::strtod(v.c_str(), &end);
-          if (v.empty() || !end || *end) return nullptr;   // not a plain number: the general way
+          if (v.empty() || !end || *end) { if (vx_trace_on()) vx_trace("columnar window: not taken (21)"); return nullptr; }   // not a plain number: the general way
           ck[c] = d;
         }
       } else if (sc.type == SqlDataType::Text && !sc.temporal) {
@@ -40796,7 +40798,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
         ce->op = ExprOp::Column;
         ce->name = sc.name;
         vx::Source vs = vx::make_source(ce.get(), t, local, base);
-        if (vs.kind != vx::Source::CodeCol || !vs.bare_column || vs.code_val.size() != nd) return nullptr;
+        if (vs.kind != vx::Source::CodeCol || !vs.bare_column || vs.code_val.size() != nd) { if (vx_trace_on()) vx_trace("columnar window: not taken (22)"); return nullptr; }
         const std::vector<int> rk = vx::dict_rank_of(t, vs);
         for (size_t c = 0; c < nd; ++c) ck[c] = c < rk.size() && rk[c] >= 0 ? (double)rk[c] : kNull;
       } else {
@@ -40816,14 +40818,14 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       }
       for (size_t i = 0; i < n; ++i) k[i] = (hn && cs.is_null(rows[i])) || code[i] >= nd ? kNull : ck[code[i]];
     } else {
-      return nullptr;
+      { if (vx_trace_on()) vx_trace("columnar window: not taken (23)"); return nullptr; }
     }
     // Numbers a double cannot tell apart (9007199254740993 and ...992, ids near 2^63): each row's key becomes its
     // exact rank among the selected rows' numbers - the integers a typed column keeps, a dictionary entry's digits.
     // These windows only order and group by their keys (no frame arithmetic), which ranks keep.
     if (numeric && vx::wide_numbers(cs)) {
       const bool ints = vx::exact_int_scale(cs) >= 0;
-      if (!ints && !vx::dict_coded(cs)) return nullptr;
+      if (!ints && !vx::dict_coded(cs)) { if (vx_trace_on()) vx_trace("columnar window: not taken (24)"); return nullptr; }
       std::vector<uint32_t> order;
       order.reserve(n);
       for (size_t i = 0; i < n; ++i) if (k[i] != kNull) order.push_back((uint32_t)i);
@@ -40858,7 +40860,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       double mn = std::numeric_limits<double>::infinity(), mx = -mn;
       for (double x : *kc[j]) {
         if (x == kNull) continue;
-        if (x != std::floor(x) || std::fabs(x) > 1e15) return false;
+        if (x != std::floor(x) || std::fabs(x) > 1e15) { if (vx_trace_on()) vx_trace("columnar window: not taken (25)"); return false; }
         mn = std::min(mn, x); mx = std::max(mx, x);
       }
       const uint64_t span = mn > mx ? 1 : (uint64_t)(mx - mn) + 2;   // + the NULL slot
@@ -40867,7 +40869,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       lo[j] = mn > mx ? 0 : (int64_t)mn;
       bits[j] = width;
       total += width;
-      if (total > 64) return false;
+      if (total > 64) { if (vx_trace_on()) vx_trace("columnar window: not taken (26)"); return false; }
     }
     out->resize(n);
     for (size_t i = 0; i < n; ++i) {
@@ -40907,10 +40909,10 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   for (size_t wi = 0; wi < wins.size(); ++wi) {
     const W& w = wins[wi];
     const size_t np = w.parts.size(), nk = np + w.order.size();
-    if (nk > 8) return false;
+    if (nk > 8) { if (vx_trace_on()) vx_trace("columnar window: not taken (27)"); return false; }
     std::vector<const std::vector<double>*> kc;
-    for (int c : w.parts) { auto* k = col_keys(c); if (!k) return false; kc.push_back(k); }
-    for (const auto& o : w.order) { auto* k = col_keys(o.first); if (!k) return false; kc.push_back(k); }
+    for (int c : w.parts) { auto* k = col_keys(c); if (!k) { if (vx_trace_on()) vx_trace("columnar window: not taken (28)"); return false; } kc.push_back(k); }
+    for (const auto& o : w.order) { auto* k = col_keys(o.first); if (!k) { if (vx_trace_on()) vx_trace("columnar window: not taken (29)"); return false; } kc.push_back(k); }
     // The rows in partition then window order (ties in row order): idx(j) is the j-th, same_part / same_peer
     // say whether two positions share a partition / a peer group.
     std::vector<bool> desc(nk, false);
@@ -40942,12 +40944,12 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     auto idx = [&](size_t j) -> uint32_t { return packed64 ? enc[j].second : pr[j].i; };
     auto same_part = [&](size_t a, size_t bb) {
       if (packed64) return obits >= 64 ? true : (enc[a].first >> obits) == (enc[bb].first >> obits);
-      for (size_t j = 0; j < np; ++j) if (pr[a].k[j] != pr[bb].k[j]) return false;
+      for (size_t j = 0; j < np; ++j) if (pr[a].k[j] != pr[bb].k[j]) { if (vx_trace_on()) vx_trace("columnar window: not taken (30)"); return false; }
       return true;
     };
     auto same_peer = [&](size_t a, size_t bb) {
       if (packed64) return enc[a].first == enc[bb].first;
-      for (size_t j = np; j < nk; ++j) if (pr[a].k[j] != pr[bb].k[j]) return false;
+      for (size_t j = np; j < nk; ++j) if (pr[a].k[j] != pr[bb].k[j]) { if (vx_trace_on()) vx_trace("columnar window: not taken (31)"); return false; }
       return true;
     };
     const ColumnStore* ccs = w.count_col >= 0 ? &t.col_data[(size_t)w.count_col] : nullptr;
@@ -41005,7 +41007,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
         continue;
       }
       auto* c = col_keys(col);
-      if (!c) return false;
+      if (!c) { if (vx_trace_on()) vx_trace("columnar window: not taken (32)"); return false; }
       kc.push_back(c);
     }
     const size_t nk = keys.size();
@@ -41046,11 +41048,37 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       r.column_is_string.push_back(0);
       r.column_origins.push_back(SqlColumnOrigin{});
     } else {
-      r.column_types.push_back(infer_item_type(b.items[i].expr.get(), sources));
+      // the column's own type where it is a number (the items are bare columns; unbound here, infer_item_type
+      // would say Text), so a consumer's table keeps it typed
+      const SqlColumn& sc = t.columns[(size_t)items[i].col];
+      const bool num = !sc.temporal && (sc.type == SqlDataType::Int || sc.type == SqlDataType::Real || sc.type == SqlDataType::Decimal);
+      r.column_types.push_back(num ? sc.type : infer_item_type(b.items[i].expr.get(), sources));
       r.column_is_string.push_back(item_is_string(b.items[i].expr.get(), sources) ? 1 : 0);
       r.column_origins.push_back(item_origin(b.items[i].expr.get(), sources));
     }
   }
+  if (col_out) {
+    // A consumer asked for the rows as typed columns (a derived table, a CTE): the kept rows' columns gathered
+    // from the store by row id, the windows as integers - no text row made (200k rows: 150 ms of them).
+    const size_t nout = to - from;
+    col_out->cols.assign(items.size(), ColBatch::Col());
+    for (size_t c = 0; c < items.size(); ++c) {
+      ColBatch::Col& col = col_out->cols[c];
+      if (items[c].win >= 0) {
+        const auto& wv = wval[(size_t)items[c].win];
+        col.kind = ColBatch::I64;
+        col.i.resize(nout);
+        col.nul.assign(nout, 0);
+        for (size_t o = from; o < to; ++o) col.i[o - from] = wv[ord[o]];
+        continue;
+      }
+      colbatch_gather(t, (size_t)items[c].col, r.column_types[c], 0, [&](size_t o) -> size_t { return rows[ord[from + o]]; }, nout, &col);
+    }
+    col_out->rows = nout;
+    col_out->filled = true;
+    r.rows_in_batch = true;
+    r.rows_affected = nout;
+  } else {
   vx::RowEval ev(base);
   r.rows.resize(to - from);
   for (size_t o = from; o < to; ++o) {
@@ -41060,12 +41088,13 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     for (size_t c = 0; c < items.size(); ++c) {
       if (items[c].win >= 0) { vals.push_back(std::to_string(wval[(size_t)items[c].win][i])); continue; }
       Val v = eval_expr(b.items[c].expr.get(), ev.at(rows[i]));
-      if (!err.empty()) return false;
+      if (!err.empty()) { if (vx_trace_on()) vx_trace("columnar window: not taken (33)"); return false; }
       vals.push_back(v.null ? sql_null() : v.str());
     }
   }
   r.rows_affected = r.rows.size();
   if (!sql_wire_results()) r.formatted_table = SelectEngine::format_result_table(db, r.columns, r.rows);
+  }
   *res = std::move(r);
   if (vx_trace_on())
     vx_trace("columnar window: rows=" + std::to_string(n) + " select " + std::to_string((cw_t1 - cw_t0) / 1000) + " us, windows " +
@@ -41074,11 +41103,11 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   return true;
 }
 
-SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b) {
+SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, ColBatch* col_out) {
   if (expr_has_window(b.where.get())) return make_error("window functions are not allowed in WHERE");
   {
     SqlQueryResult cw;
-    if (columnar_window(db, b, &cw)) return cw;
+    if (columnar_window(db, b, &cw, col_out)) return cw;
   }
   if (expr_has_window(b.having.get())) return make_error("window functions are not allowed in HAVING");
   for (const auto& g : b.group_by) if (expr_has_window(g.get())) return make_error("window functions are not allowed in GROUP BY");
@@ -48724,7 +48753,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
     ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
   } serial_scope(assigns);
-  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch); }
+  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out); }
   // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
   // table whose rows are in key order: the answer is a run of rows at one end
   // of the table. The statement is run with a key range that holds just that
