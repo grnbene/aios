@@ -21,10 +21,15 @@ inline void colbatch_gather(const SqlTable& t, size_t c, SqlDataType dest, int d
     out->nul.assign(n, 0);
     if (ints) out->i.assign(n, 0); else out->f.assign(n, 0);
     const bool nulls = vx::has_nulls(cs);
+    // a bit-packed integer column decoded in a block where the rows cover a quarter of it (read_code per row
+    // was most of handing 200k rows over)
+    std::vector<int64_t> all;
+    const bool packed = ints && cs.encoding != ColumnEncoding::TypedInt64 && cs.encoding != ColumnEncoding::TypedInt32;
+    if (packed && cs.size() <= n * 4 + 65536) { all.resize(cs.size()); vx::typed_ints(cs, 0, cs.size(), all.data()); }
     for (size_t r = 0; r < n; ++r) {
       const size_t id = row_of(r);
       if (id == kNullRow || id >= cs.size() || (nulls && cs.is_null(id))) { out->nul[r] = 1; continue; }
-      if (ints) out->i[r] = vx::typed_int(cs, id);
+      if (ints) out->i[r] = all.empty() ? vx::typed_int(cs, id) : all[id];
       else out->f[r] = cs.double_data[id];
     }
     return;

@@ -553,6 +553,30 @@ is wanted - a HAVING, an item printed, a sort key that is not a plain number; a 
 or average of DOUBLE lanes, or the extreme of a numeric lane below 2^53 reads its double straight from the
 accumulators (agg_num), the same double compare_vals_as would compare. Open orders' group phase 60 -> 43-50 ms.
 
+### Profiles with line numbers; the next set
+
+A second build tree (build-prof: -O3 -g, ignored by git) gives callgrind source lines at full optimization; the
+wall clock in this container swings 2x between identical runs, so the steps below are judged by instruction
+counts first and the clock second.
+
+- Single-table GROUP BY by slot (inventory top items: 500k ledger rows, 30k products, SUM, ORDER BY the sum
+  LIMIT 10): every group's integer SUM was printed and parsed back (scaled_to_decimal built its digits by
+  inserting at the front of a string; then parse_number), and the integer key was read per row through
+  read_code. scaled_to_decimal now writes its digits backward into a buffer; an integer SUM below 2^53 is its
+  number and std::to_string; the key is decoded a morsel at a time; a SUM / AVG of a typed INT column folds
+  straight into isum and cnt. 75 -> 43 million instructions a statement. The trace names the path's stages
+  (aggregate: groups by slot - scan, merge, values).
+- ORDER BY .. LIMIT over a derived table's typed column (the latest-order-per-customer shape's outer select):
+  the "keys as numbers" pass refused any result table; a result table's column that was filled typed
+  (TypedInt, TypedDouble, DecimalScaled) holds canonical values and is read as the numbers it prints as.
+  Emit 14 -> 0.5 ms.
+- The columnar window's number keys and colbatch_gather's integer columns decode in a block where the rows
+  cover a fair part of the column (a read per row for three keys over 200k rows).
+
+A SUM-format edge set (INT, BIGINT past 2^53, DECIMAL(12,3) and DECIMAL(30,10) sums and averages, negatives,
+NULLs, zeros at scale, groups ordered by the sum) is identical to the build before, as are frame bytes, the four
+oracle suites, the lane checks and the earlier edge sets.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

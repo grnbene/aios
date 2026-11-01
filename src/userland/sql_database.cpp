@@ -1350,15 +1350,28 @@ bool decimal_to_scaled(const std::string& s, int scale, AIOS_INT128* out) {
 }
 
 std::string scaled_to_decimal(AIOS_INT128 v, int scale) {
+  // the digits written backward into a buffer (an INT128 has at most 39; a scale pads with zeros), then one string
   const bool neg = v < 0;
-  if (neg) v = -v;
-  std::string digits;
-  do { digits.insert(digits.begin(), char('0' + (int)(v % 10))); v /= 10; } while (v > 0);
-  while ((int)digits.size() <= scale) digits.insert(digits.begin(), '0');
-  std::string out = digits.substr(0, digits.size() - (size_t)scale);
-  if (scale > 0) out += "." + digits.substr(digits.size() - (size_t)scale);
-  const bool zero = out.find_first_not_of("0.") == std::string::npos;
-  return (neg && !zero ? "-" : "") + out;
+  AIOS_UINT128 u = neg ? (AIOS_UINT128)0 - (AIOS_UINT128)v : (AIOS_UINT128)v;
+  char buf[128];
+  char* end = buf + sizeof(buf);
+  char* p = end;
+  int nd = 0;
+  bool zero = true;
+  do {
+    const int d = (int)(u % 10);
+    if (d) zero = false;
+    *--p = char('0' + d);
+    u /= 10;
+    ++nd;
+    if (scale > 0 && nd == scale) *--p = '.';
+  } while (u > 0 && p > buf + 2);
+  if (scale > 0) {
+    while (nd < scale && p > buf + 2) { *--p = '0'; ++nd; if (nd == scale) *--p = '.'; }
+    if (*p == '.') *--p = '0';   // 0.xx: a whole part of 0
+  }
+  if (neg && !zero) *--p = '-';
+  return std::string(p, (size_t)(end - p));
 }
 
 // A DECIMAL kept scaled, as the double its text reads as. x / 10^places is one correctly rounded division while x
@@ -21162,7 +21175,7 @@ bool colbatch_fill_table(SqlTable* t, ColBatch& B) {
   if (tr) {
     std::string m = "colbatch fill " + t->name + " (" + std::to_string(n) + " rows):";
     for (size_t c = 0; c < col_ns.size(); ++c)
-      m += " " + t->columns[c].name + "=" + "TIFC"[col_kind[c]] + "/" + std::to_string((int)t->columns[c].type) + ":" + std::to_string(col_ns[c] / 1000) + "us";
+      m += " " + t->columns[c].name + "=" + "TIFCD"[col_kind[c]] + "/" + std::to_string((int)t->columns[c].type) + ":" + std::to_string(col_ns[c] / 1000) + "us";
     vx_trace(m);
   }
   return true;
@@ -37629,7 +37642,10 @@ Val finish_arrays(const Agg& a, const AggPlan& p, AggArrays& A, size_t g, RowRea
         const bool int_exact = int_col && A.ok[g] && (p.need_ints || p.need_codes || a.src.kind == Source::RowExpr || a.src.kind == Source::CodeCol);
         if (int_exact) {
           if (sum) {
-            const std::string text = scaled_to_decimal(A.isum[g], 0);
+            const AIOS_INT128 x = A.isum[g];
+            // the text's double is the integer itself below 2^53 (no parse); past it, the text decides
+            if (x > -((AIOS_INT128)1 << 53) && x < ((AIOS_INT128)1 << 53)) return val_num_with_text((double)(int64_t)x, std::to_string((long long)x));
+            const std::string text = scaled_to_decimal(x, 0);
             double d = 0;
             parse_number(text, &d);
             return val_num_with_text(d, text);
@@ -37889,6 +37905,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         std::vector<std::vector<AggArrays>> part_totals(lanes);
         std::vector<std::vector<uint32_t>> part_first(lanes);
         std::atomic<bool> off_range{false};   // a value outside the bounds: they were wrong, the general way decides
+        const uint64_t ds_t0 = vx_trace_enabled() ? hal_now_ns() : 0;
         const bool coded = ks.kind == Source::CodeCol;
         const bool hn = has_nulls(cs);
 
@@ -37904,6 +37921,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           c.err = &errs[tid];
           RowReader rd(t, c);
           std::vector<uint32_t> rows, codes;
+          std::vector<int64_t> kints;   // an integer key's values over the morsel, decoded as a block
           std::vector<AggCols> cols(aggs.size());
           uint32_t m_id[kVxMorsel];
 
@@ -37914,6 +37932,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             const bool dense = sel.all;
             const bool sparse = n * 8 < end - start;
             if (coded && !sparse) { codes.resize(end - start); decode_codes(cs, start, end, codes.data()); }
+            if (!coded && !sparse) { kints.resize(end - start); typed_ints(cs, start, end, kints.data()); }
 
             for (size_t ai = 0; ai < aggs.size(); ++ai) {
               const Agg& a = aggs[ai];
@@ -37931,7 +37950,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 const uint32_t k = sparse ? code_at(cs, r) : codes[r - start];
                 id = k < canon0.size() ? canon0[k] : span;
               } else {
-                const int64_t v = typed_int(cs, r);
+                const int64_t v = sparse ? typed_int(cs, r) : kints[r - start];
                 if (v < lo || v > hi) { off_range.store(true, std::memory_order_relaxed); return; }
                 id = (size_t)(v - lo);
               }
@@ -37946,6 +37965,21 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 for (size_t j = 0; j < n; ++j) A.cnt[m_id[j]]++;
               } else if (a.kind == Agg::Count && a.col_rules && !nulls[ai]) {
                 for (size_t j = 0; j < n; ++j) A.cnt[m_id[j]]++;
+              } else if ((a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && !a.prog && !a.mask && a.src.kind == Source::TypedCol &&
+                         a.col_type == SqlDataType::Int && plans[ai].need_ints && !plans[ai].dec_direct) {
+                // SUM / AVG of a typed INT column: acc_row's branch for it (isum, num, cnt) without the call and its
+                // switches per row
+                const ColumnStore& acs = t.col_data[a.src.col];
+                const int64_t* iv = cols[ai].ints.data();
+                const bool an = nulls[ai];
+                for (size_t j = 0; j < n; ++j) {
+                  const size_t r = dense ? start + j : rows[j];
+                  if (an && acs.is_null(r)) continue;
+                  const int64_t x = iv[r - start];
+                  const uint32_t g = m_id[j];
+                  A.isum[g] += (AIOS_INT128)x;   // exact always (an INT128 of int64s): finish reads isum, never num, on this path
+                  A.cnt[g]++;
+                }
               } else {
                 const ColumnStore& acs = t.col_data[a.src.col];
                 for (size_t j = 0; j < n; ++j) {
@@ -37958,6 +37992,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         });
 
         for (auto& e : errs) if (!e.empty()) { *err = e; return false; }
+        const uint64_t ds_t1 = vx_trace_enabled() ? hal_now_ns() : 0;
         if (!off_range.load()) {
           for (size_t id = 0; id < S; ++id) {
             for (size_t tl = 0; tl < lanes; ++tl) {
@@ -37986,6 +38021,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           });
 
           const size_t hits = hit_slots.size();
+          const uint64_t ds_t2 = vx_trace_enabled() ? hal_now_ns() : 0;
           first_row->resize(hits);
           values->assign(hits, aggs.size());
           RowReader rd_main(t, base);
@@ -37996,6 +38032,10 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
               (*values)[g][ai] = finish_arrays(aggs[ai], plans[ai], slot_totals[ai], id, rd_main);
             }
           }
+          if (vx_trace_enabled())
+            vx_trace_line("aggregate: " + std::to_string(hits) + " groups by slot (" + std::to_string(S) + " slots, " + std::to_string(lanes) +
+                          " lanes): scan " + std::to_string((ds_t1 - ds_t0) / 1000) + " us, merge " + std::to_string((ds_t2 - ds_t1) / 1000) +
+                          " us, values " + std::to_string((hal_now_ns() - ds_t2) / 1000) + " us");
           return true;
         }
       }
@@ -40886,8 +40926,16 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     const bool numeric = sql_type_numeric(sc.type) && !sc.temporal;
     const bool temporal_typed = sc.temporal && (cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds);
     if ((numeric && vx::typed_numeric(cs)) || temporal_typed) {
-      // a date's or datetime's order is its day or second number's (NULL first, as the general way sorts)
-      for (size_t i = 0; i < n; ++i) k[i] = hn && cs.is_null(rows[i]) ? kNull : vx::typed_value(cs, rows[i]);
+      // a date's or datetime's order is its day or second number's (NULL first, as the general way sorts). The
+      // column decoded in a block where the selected rows cover an eighth of it: a read per row (read_code) for
+      // three keys over 200k rows was most of the window's time.
+      if (cs.size() <= n * 8 && cs.size() == t.row_count()) {
+        std::vector<double> all(cs.size());
+        vx::typed_values(cs, 0, cs.size(), all.data());
+        for (size_t i = 0; i < n; ++i) k[i] = hn && cs.is_null(rows[i]) ? kNull : all[rows[i]];
+      } else {
+        for (size_t i = 0; i < n; ++i) k[i] = hn && cs.is_null(rows[i]) ? kNull : vx::typed_value(cs, rows[i]);
+      }
     } else if (vx::dict_coded(cs) && cs.encoding != ColumnEncoding::Constant) {
       const size_t nd = vx::dict_size(cs);
       std::vector<uint32_t> code(n);
@@ -48225,10 +48273,20 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
                               ? expanded[(size_t)order_by[i].ordinal - 1].expr.get() : order_by[i].expr.get();
       size_t ks = 0, kc = 0;
       if (!ke || ke->op != ExprOp::Column || lookup_column_here(sctx, *ke, &ks, &kc) != ColumnLookup::Found || ks >= sources.size() ||
-          !sources[ks].table || sources[ks].table->inferred_types) { ok = false; break; }
+          !sources[ks].table) { ok = false; break; }
       const SqlTable& kt = *sources[ks].table;
       if (kc >= kt.col_data.size() || kt.col_data[kc].size() != kt.row_count()) { ok = false; break; }
       const ColumnStore& kcs = kt.col_data[kc];
+      if (kt.inferred_types) {
+        // a result table's column typed when it was filled (a derived table's numbers from a typed batch): its
+        // values canonical, read as the numbers they print as - the one case of a result table taken here
+        const bool typed_result = !kt.columns[kc].temporal && sql_type_numeric(kt.columns[kc].type) && sql_type_numeric(order_types[i]) &&
+                                  (kcs.encoding == ColumnEncoding::TypedInt64 || kcs.encoding == ColumnEncoding::TypedInt32 ||
+                                   kcs.encoding == ColumnEncoding::TypedDouble || kcs.encoding == ColumnEncoding::DecimalScaled);
+        if (!typed_result) { ok = false; break; }
+        rk[i].src = ks; rk[i].col = kc; rk[i].kind = 1;
+        continue;
+      }
       rk[i].src = ks;
       rk[i].col = kc;
       if (vx::typed_numeric(kcs) && sql_type_numeric(kt.columns[kc].type) && sql_type_numeric(order_types[i])) { rk[i].kind = 1; continue; }
