@@ -528,8 +528,11 @@ consecutive rows as a block. The group-id table was sized to the rows (2M slots 
 cache on every probe; it starts at 1,024 slots and doubles as groups appear - and hashes by the product's top
 bits, since its middle bits (>> 20, fine spread over 2M slots) clustered a small table into 87 ms of probing.
 An integer SUM with no NULL adds straight into its group. Keys 23 -> 11 ms, aggregates 15 -> 7, the lookup
-unchanged at ~17 (the row loop's own work now); 73 -> 61 ms. The base selection's 14 ms (base_rows over an
-unfiltered fact table) is the next piece of this shape.
+unchanged at ~17 (the row loop's own work now); 73 -> 61 ms. The base selection's 14 ms were base_rows making a
+JoinedRow of every one of the 600k fact rows because the statement had a LIMIT: the row-id form was kept for
+statements without one, though a join's base cannot stop early at a LIMIT (the early stop is the single table's);
+every joined base of 256 rows or more is ids now. 61 -> 31-37 ms (DuckDB 11); what is left is the lookup loop
+(13-16 ms over 600k rows) and the group keys (11).
 
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,

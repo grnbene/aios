@@ -49084,7 +49084,9 @@ static std::optional<SqlQueryResult> base_rows(const BasePlan& plan, PhaseClock&
         }
       }
       }   // !vx_selected
-    } else if (!join_conditions.empty() && !any_right && limit < 0 && sources[0].table->row_count() >= 256) {
+    } else if (!join_conditions.empty() && !any_right && sources[0].table->row_count() >= 256) {
+      // every row of the base, as ids: a LIMIT cannot stop a join's base early (the early stop below is for a
+      // single table), and 600k joined rows made as JoinedRows here were 15 ms of a 60 ms statement
       base_ids.resize(sources[0].table->row_count());
       for (size_t ri = 0; ri < base_ids.size(); ++ri) base_ids[ri] = (uint32_t)ri;
       base_ids_only = true;
