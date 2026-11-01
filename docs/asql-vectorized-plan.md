@@ -534,6 +534,19 @@ statements without one, though a join's base cannot stop early at a LIMIT (the e
 every joined base of 256 rows or more is ids now. 61 -> 31-37 ms (DuckDB 11); what is left is the lookup loop
 (13-16 ms over 600k rows) and the group keys (11).
 
+Two more aggregate shapes. COUNT(DISTINCT custid) over 150k selected rows put every value into a hash set
+(6.6 ms); a typed integer column whose zone maps bound its values to a span under 2^24 counts into a bitset of
+the span per group (the code path COUNT(DISTINCT) over dictionary classes already had): 7.5 -> 1.2 ms (DuckDB
+3.6). The star join's key map (build) read each joined row's key through read_code and filled a hash table
+before deciding the map's form; integer keys are read in a block where the rows cover an eighth of the column
+and their range decides first - a span of a few million values is an array filled straight from the keys,
+uniqueness checked in it. The rerooted join's order (by base row, then line) is a radix sort of packed keys
+instead of std::sort through a lambda. The order-value-range shape (30k orders of a date range to their 92k
+lines) is 32 -> 26 ms, in three pieces the trace now names: the index lookup of the lines by 30k keys (9.5 ms:
+rows_equal_to_sorted gallops the index once per key), the lookup loop (5.4) and the order (4.4). A
+COUNT(DISTINCT) edge set (NULLs, negative values, BIGINTs past the span, several groups, filters that leave
+no row, a date GROUP BY) is identical to the build before.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code

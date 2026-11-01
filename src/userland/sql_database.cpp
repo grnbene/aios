@@ -37210,7 +37210,9 @@ enum class AggMode { Par, Ser };
 struct AggPlan {
   AggMode mode = AggMode::Ser;
   bool need_codes = false, need_nums = false, need_ints = false;
-  size_t classes = 0;                   // COUNT(DISTINCT) on codes: number of classes
+  size_t classes = 0;                   // COUNT(DISTINCT) on codes: number of classes (int_bits: the integer span)
+  bool int_bits = false;                // COUNT(DISTINCT) on a typed integer column of a known small span: a bitset
+  int64_t int_lo = 0;                   // ... from this value
   std::vector<AIOS_INT128> code_scaled;    // SUM/AVG DECIMAL on codes: scaled value per code
   std::vector<uint8_t> code_scaled_ok;
   std::vector<double> code_num;         // SUM/AVG on codes: parse_number per code
@@ -37243,7 +37245,22 @@ AggPlan plan_mode(const Agg& a, const SqlTable& t) {
       break;
     case Agg::CountDistinct:
       if (coded) { p.mode = AggMode::Par; p.need_codes = true; p.classes = 0; for (uint32_t c : a.canon) p.classes = std::max<size_t>(p.classes, c + 1); }
-      else if (a.col_rules && typed_integer(cs) && a.col_type == SqlDataType::Int) { p.mode = AggMode::Par; p.need_ints = true; }
+      else if (a.col_rules && typed_integer(cs) && a.col_type == SqlDataType::Int) {
+        p.mode = AggMode::Par;
+        p.need_ints = true;
+        // The values' span from the zone maps (every zone known and exact): a bitset of it per group instead of a
+        // hash set of the values seen - 150k customer ids into a set were 6.6 ms, a 20k-bit map is ~0.3.
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        bool known = cs.zone_maps.size() == (cs.size() + kVxMorselZone - 1) / kVxMorselZone && !cs.zone_maps.empty();
+        for (const auto& zm : cs.zone_maps) {
+          if (!known) break;
+          if (!zm.has_stats) { known = false; break; }
+          if (zm.all_null || zm.min_double > zm.max_double) continue;
+          lo = std::min<int64_t>(lo, (int64_t)std::floor(zm.min_double));
+          hi = std::max<int64_t>(hi, (int64_t)std::ceil(zm.max_double));
+        }
+        if (known && hi >= lo && (uint64_t)(hi - lo) < ((uint64_t)1 << 24)) { p.int_bits = true; p.int_lo = lo; p.classes = (size_t)(hi - lo) + 1; }
+      }
       break;
     case Agg::Min:
     case Agg::Max:
@@ -37374,6 +37391,13 @@ inline void acc_row(const Agg& a, const AggPlan& p, AggArrays& A, uint32_t g, si
       if (!rd.val(a.src, r).null) A.cnt[g]++;
       return;
     case Agg::CountDistinct: {
+      if (p.int_bits) {
+        if (nulls && cs.is_null(r)) return;
+        const int64_t v = c.ints[i] - p.int_lo;
+        if (v < 0 || (uint64_t)v >= p.classes) return;   // outside the zone maps' bounds: cannot happen, the maps are the data's
+        A.bits[g][(size_t)v >> 6] |= 1ull << (v & 63);
+        return;
+      }
       if (p.classes > 0) {
         const size_t nd = a.src.code_val.size();
         size_t k = (nulls && cs.is_null(r)) ? nd : c.codes[i];
@@ -43226,11 +43250,46 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     }
     std::unordered_map<std::string, uint64_t> intern;
     std::unordered_map<uint64_t, uint32_t> key_row;
-    key_row.reserve(ids.size() * 2 + 16);
     std::vector<uint64_t> ckey;
     std::vector<uint8_t> cok;
     const bool c_coded = vx::dict_coded(ccs);
     if (c_coded && !star_code_keys(L.ck, intern, true, &ckey, &cok)) return false;
+    // Integer keys of the joined rows, read in a block where the rows cover an eighth of the column (a
+    // read per row through read_code was most of building a 30k-key map); their range decides the map's form
+    // before any hash table is filled: a span of a few million values is an array, uniqueness checked in it.
+    if (!c_coded && !vx::dict_coded(pcs) && !L.pk.text && vx::typed_integer(ccs) && ccs.size() == ct.row_count()) {
+      std::vector<int64_t> all;
+      const bool block = ccs.size() <= ids.size() * 8;
+      if (block) { all.resize(ccs.size()); vx::typed_ints(ccs, 0, ccs.size(), all.data()); }
+      const bool cn = vx::has_nulls(ccs);
+      std::vector<int64_t> keys;
+      keys.reserve(ids.size());
+      std::vector<uint32_t> krows;
+      krows.reserve(ids.size());
+      int64_t lo = INT64_MAX, hi = INT64_MIN;
+      for (uint32_t r : ids) {
+        if (cn && ccs.is_null(r)) continue;
+        const int64_t k = block ? all[r] : vx::typed_int(ccs, r);
+        keys.push_back(k); krows.push_back(r);
+        lo = std::min(lo, k); hi = std::max(hi, k);
+      }
+      if (!keys.empty() && hi - lo >= 0 && (uint64_t)(hi - lo) < std::max<uint64_t>((uint64_t)1 << 22, keys.size() * 8)) {
+        M.by_dense = true;
+        M.lo = lo;
+        M.dense.assign((size_t)(hi - lo) + 1, UINT32_MAX);
+        for (size_t j = 0; j < keys.size(); ++j) {
+          uint32_t& slot = M.dense[(size_t)(keys[j] - lo)];
+          if (slot != UINT32_MAX) return false;   // not unique: rows multiply, the general join's
+          slot = krows[j];
+        }
+        return true;
+      }
+      key_row.reserve(keys.size() * 2 + 16);
+      for (size_t j = 0; j < keys.size(); ++j) if (!key_row.emplace((uint64_t)keys[j], krows[j]).second) return false;
+      M.of_key = std::move(key_row);
+      return true;
+    }
+    key_row.reserve(ids.size() * 2 + 16);
     for (uint32_t r : ids) {
       if (ccs.is_null(r)) continue;
       uint64_t key;
@@ -43343,8 +43402,11 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
             ct.columns[s0.child_col].type == SqlDataType::Int && sources[0].table->columns[s0.parent_col].type == SqlDataType::Int) {
           std::vector<int64_t> kv;
           kv.reserve(nbase);
+          std::vector<int64_t> pall;   // the base key column whole, where the base rows cover an eighth of it
+          if (pcs.size() <= nbase * 8 && pcs.size() == sources[0].table->row_count()) { pall.resize(pcs.size()); vx::typed_ints(pcs, 0, pcs.size(), pall.data()); }
+          const bool pn = vx::has_nulls(pcs);
           for (size_t i = 0; i < nbase; ++i)
-            if (!pcs.is_null(base[i])) kv.push_back(vx::typed_int(pcs, base[i]));
+            if (!(pn && pcs.is_null(base[i]))) kv.push_back(pall.empty() ? vx::typed_int(pcs, base[i]) : pall[base[i]]);
           std::sort(kv.begin(), kv.end());
           kv.erase(std::unique(kv.begin(), kv.end()), kv.end());
           bool small = !kv.empty() && kv.size() <= 200000;
@@ -43383,7 +43445,8 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
       }
       const uint64_t ts0 = vx_trace_on() ? hal_now_ns() : 0;
       if (!direct && !select_of(1, conds, &root_ids)) return false;
-      if (vx_trace_on()) vx_trace("join: reroot select " + std::to_string(root_ids.size()) + " rows, " + std::to_string((hal_now_ns() - ts0) / 1000) + " us");
+      if (vx_trace_on()) vx_trace("join: reroot select " + std::to_string(root_ids.size()) + " rows, " + std::to_string((hal_now_ns() - ts0) / 1000) + " us" +
+                                  (direct ? " (index), keys and index " + std::to_string((ts0 - t0) / 1000) + " us" : ""));
       Link L0;
       L0.child_src = 0; L0.child_col = s0.parent_col; L0.parent_src = 1; L0.parent_col = s0.child_col;
       L0.ck = s0.pk; L0.pk = s0.ck; L0.left = false;
@@ -43433,6 +43496,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   for (const Step& st : steps) for (const SqlExpr* w : st.from_where) pushed.insert(w);
 
   const uint64_t t1 = vx_trace_on() ? hal_now_ns() : 0;
+  uint64_t t_loop = 0;
   // Every row, its partners: one array per source.
   const size_t root = rerooted ? 1 : 0;
   const uint32_t* rp = rerooted ? root_ids.data() : base;
@@ -43462,18 +43526,18 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     if (!keep) continue;
     for (size_t k = 0; k < ns; ++k) (*P)[k].push_back(parts[k]);
   }
+  if (vx_trace_on()) t_loop = hal_now_ns();
   if (rerooted) {
     // The FROM order's: by base row, then by the first joined table's row
     // (every later table gives one row or none).
     const size_t n = (*P)[0].size();
-    std::vector<uint64_t> ord(n);
-    for (size_t i = 0; i < n; ++i) ord[i] = ((uint64_t)(*P)[0][i] << 32) | (*P)[1][i];
-    std::vector<uint32_t> perm(n);
-    for (size_t i = 0; i < n; ++i) perm[i] = (uint32_t)i;
-    std::sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return ord[a] < ord[b]; });
+    // (key, position) pairs in key order by a radix sort (radix_sort_pairs: the window path's), ties by position
+    std::vector<std::pair<uint64_t, uint32_t>> enc(n);
+    for (size_t i = 0; i < n; ++i) enc[i] = {((uint64_t)(*P)[0][i] << 32) | (*P)[1][i], (uint32_t)i};
+    radix_sort_pairs(enc, 64);
     for (auto& col : *P) {
       std::vector<uint32_t> sorted(n);
-      for (size_t i = 0; i < n; ++i) sorted[i] = col[perm[i]];
+      for (size_t i = 0; i < n; ++i) sorted[i] = col[enc[i].second];
       col.swap(sorted);
     }
   }
@@ -43481,7 +43545,8 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   if (vx_trace_on())
     vx_trace(std::string("join: unique-key lookup") + (rerooted ? " (from the first joined table)" : "") + " over " +
              std::to_string(nr) + " rows -> " + std::to_string(nout) + " rows, " +
-             std::to_string((hal_now_ns() - t0) / 1000) + " us (maps " + std::to_string((t1 - t0) / 1000) + " us)");
+             std::to_string((hal_now_ns() - t0) / 1000) + " us (maps " + std::to_string((t1 - t0) / 1000) + " us, loop " +
+             std::to_string((t_loop - t1) / 1000) + " us, order " + std::to_string((hal_now_ns() - t_loop) / 1000) + " us)");
   return true;
 }
 
