@@ -37522,6 +37522,22 @@ void init_arrays(const Agg& a, const AggPlan& p, size_t G, AggArrays& A) {
   }
 }
 
+// The arrays grown to G groups, the groups already there kept as they are: a fused loop (3c.1) meets its groups
+// as it goes and grows them by doubling. The new groups start as init_arrays starts them.
+void grow_arrays(const Agg& a, const AggPlan& p, size_t G, AggArrays& A) {
+  AggArrays B;
+  init_arrays(a, p, G, B);
+  auto keep = [](auto& from, auto& to) {
+    const size_t n = std::min(from.size(), to.size());
+    for (size_t i = 0; i < n; ++i) to[i] = std::move(from[i]);
+  };
+  keep(A.cnt, B.cnt); keep(A.num, B.num); keep(A.rank, B.rank); keep(A.row, B.row); keep(A.isum, B.isum);
+  keep(A.ok, B.ok); keep(A.bits, B.bits); keep(A.ids, B.ids); keep(A.strs, B.strs); keep(A.best, B.best);
+  keep(A.ibest, B.ibest); keep(A.has, B.has); keep(A.exact, B.exact); keep(A.etot, B.etot); keep(A.escale, B.escale);
+  keep(A.dscale, B.dscale);
+  A = std::move(B);
+}
+
 // Row r (index i within its morsel's decoded columns) into group g.
 inline void acc_row(const Agg& a, const AggPlan& p, AggArrays& A, uint32_t g, size_t r, size_t i,
                     const AggCols& c, const ColumnStore& cs, bool nulls, RowReader& rd) {
@@ -43321,6 +43337,7 @@ static std::shared_ptr<const std::vector<int64_t>> dict_order_rank(const ColumnS
 struct StarMultiMap {
   int64_t lo = 0;
   std::vector<uint32_t> off, rows;
+  uint32_t maxrun = 0;                 // the most rows under one key (a deferred expansion's bound)
 };
 static std::shared_ptr<const StarMultiMap> star_multi_cached(const SqlTable& t, size_t col, std::shared_ptr<const StarMultiMap> put) {
   struct Known { uint64_t seq, epoch; size_t rows; std::shared_ptr<const StarMultiMap> m; };
@@ -43338,10 +43355,147 @@ static std::shared_ptr<const StarMultiMap> star_multi_cached(const SqlTable& t, 
   return nullptr;
 }
 
+struct StarMap {
+  std::vector<int64_t> of_code;            // parent dictionary code -> child row (-1 none)
+  std::unordered_map<uint64_t, uint32_t> of_key;   // integer parent without a dictionary
+  std::vector<uint32_t> dense;             // integer keys in a small range: key - lo -> row
+  int64_t lo = 0;
+  bool by_code = false, by_dense = false;
+};
+struct StarLink {                              // child_src's row from parent_src's
+  size_t child_src = 0, child_col = 0, parent_src = 0, parent_col = 0;
+  StarKey ck, pk;
+  bool left = false;
+  StarMap map;
+  bool parent_nulls = true;                // the parent key column has NULLs (checked per row only then)
+  // the parent key column decoded whole (by_code maps: its codes; dense / hashed maps: its integers), where worth
+  // it - kept between statements (vx::decoded_codes / decoded_ints)
+  std::shared_ptr<const std::vector<uint32_t>> wc_hold;
+  std::shared_ptr<const vx::DecodedInts> wi_hold;
+  const uint32_t* whole_codes = nullptr;
+  const int64_t* whole_ints = nullptr;
+  // One-to-many (an order's lines): key - mlo -> the child rows moff[k] .. moff[k+1] of mrows, ascending - the
+  // order the general join meets them in. The row loop below expands a parent row into each of them.
+  bool multi = false;
+  std::shared_ptr<const StarMultiMap> mm;
+};
+// A unique link's partner row of parent row pr (UINT32_MAX: none).
+static uint32_t star_partner(const std::vector<QuerySource>& sources, const StarLink& L, uint32_t pr) {
+  if (pr == UINT32_MAX) return UINT32_MAX;
+  const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
+  if (L.parent_nulls && pcs.is_null(pr)) return UINT32_MAX;
+  const StarMap& M = L.map;
+  if (M.by_code) {
+    const uint32_t code = L.whole_codes ? L.whole_codes[pr] : vx::code_at(pcs, pr);
+    return code < M.of_code.size() && M.of_code[code] >= 0 ? (uint32_t)M.of_code[code] : UINT32_MAX;
+  }
+  const int64_t key = L.whole_ints ? L.whole_ints[pr] : vx::typed_int(pcs, pr);
+  if (M.by_dense) {
+    const uint64_t k = (uint64_t)(key - M.lo);
+    return k < M.dense.size() ? M.dense[(size_t)k] : UINT32_MAX;
+  }
+  auto it = M.of_key.find((uint64_t)key);
+  return it != M.of_key.end() ? it->second : UINT32_MAX;
+}
+// A one-to-many link's rows under parent row pr: [*b, *e), ascending (empty: none).
+static void star_rows_of(const std::vector<QuerySource>& sources, const StarLink& L, uint32_t pr, const uint32_t** b, const uint32_t** e) {
+  *b = *e = nullptr;
+  if (pr == UINT32_MAX) return;
+  const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
+  if (L.parent_nulls && pcs.is_null(pr)) return;
+  const int64_t key = L.whole_ints ? L.whole_ints[pr] : vx::typed_int(pcs, pr);
+  const StarMultiMap& M = *L.mm;
+  const uint64_t k = (uint64_t)(key - M.lo);
+  if (key < M.lo || k + 1 >= M.off.size()) return;
+  *b = M.rows.data() + M.off[(size_t)k];
+  *e = M.rows.data() + M.off[(size_t)k + 1];
+}
+
+// A star join with one-to-many links, not yet expanded (3c.1): its links and root rows. A consumer that can take
+// the rows a root row at a time (the join aggregate's fused loop) walks them; any other expands them into one row
+// id array per source, as the join did. Made only when the expansion is known to stay below the 2^30 rows the
+// expanding loop gives up at, so nothing that ran the general join before runs this instead.
+struct StarExpansion;
+// A deferred star join made into its row id arrays, for a consumer that reads them (no-op when there is none).
+static void star_expand_into(std::shared_ptr<StarExpansion>& def, std::vector<std::vector<uint32_t>>& star_cols);
+struct StarExpansion {
+  const std::vector<QuerySource>* sources = nullptr;
+  std::vector<StarLink> links;
+  size_t ns = 0, root = 0;
+  std::vector<uint32_t> roots;
+  double bound = 0;                    // at most this many rows
+  // Root row rr's rows, depth first over the links in FROM order (the expanding loop's order): emit(parts) each.
+  template <class F>
+  void walk_root(uint32_t rr, F& emit) const {
+    uint32_t parts[8];
+    parts[root] = rr;
+    auto step = [&](size_t k, auto& self) -> void {
+      if (k == links.size()) { emit((const uint32_t*)parts); return; }
+      const StarLink& L = links[k];
+      if (!L.multi) {
+        const uint32_t got = star_partner(*sources, L, parts[L.parent_src]);
+        if (got == UINT32_MAX && !L.left) return;
+        parts[L.child_src] = got;
+        self(k + 1, self);
+        return;
+      }
+      const uint32_t* b = nullptr;
+      const uint32_t* e = nullptr;
+      star_rows_of(*sources, L, parts[L.parent_src], &b, &e);
+      if (b == e) {
+        if (!L.left) return;
+        parts[L.child_src] = UINT32_MAX;
+        self(k + 1, self);
+        return;
+      }
+      for (const uint32_t* q = b; q != e; ++q) {
+        parts[L.child_src] = *q;
+        self(k + 1, self);
+      }
+    };
+    step(0, step);
+  }
+  // Every row into one row id array per source.
+  void expand(std::vector<std::vector<uint32_t>>* P) const {
+    P->assign(ns, {});
+    size_t cap = std::max<size_t>(64, (size_t)std::min(bound, (double)roots.size() * 4.0 + 64));
+    std::vector<uint32_t*> outp(ns);
+    for (size_t s2 = 0; s2 < ns; ++s2) { (*P)[s2].resize(cap); outp[s2] = (*P)[s2].data(); }
+    size_t out_n = 0;
+    auto emit = [&](const uint32_t* parts) {
+      if (out_n == cap) {
+        cap *= 2;
+        for (size_t s2 = 0; s2 < ns; ++s2) { (*P)[s2].resize(cap); outp[s2] = (*P)[s2].data(); }
+      }
+      for (size_t s2 = 0; s2 < ns; ++s2) outp[s2][out_n] = parts[s2];
+      ++out_n;
+    };
+    for (uint32_t rr : roots) walk_root(rr, emit);
+    for (size_t s2 = 0; s2 < ns; ++s2) (*P)[s2].resize(out_n);
+  }
+  // Source s can be a NULL-padded row: a LEFT link reaches it (or a source it hangs from).
+  bool can_pad(size_t s) const {
+    std::vector<char> pad(ns, 0);
+    for (const StarLink& L : links) pad[L.child_src] = pad[L.parent_src] || L.left;
+    return s < ns && pad[s];
+  }
+};
+static void star_expand_into(std::shared_ptr<StarExpansion>& def, std::vector<std::vector<uint32_t>>& star_cols) {
+  if (!def) return;
+  def->expand(&star_cols);
+  def.reset();
+}
+// AIOS_SQL_PIPE=0: no pipeline (3c) - the star join expands its rows and the operators run as before.
+static bool sql_pipe_on() {
+  static const bool off = [] { const char* v = std::getenv("AIOS_SQL_PIPE"); return v && *v == '0'; }();
+  return !off;
+}
+
 static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, const std::vector<ExprPtr>& join_conditions,
                       const std::vector<bool>& join_is_left, const SqlExpr* where, const EvalCtx* outer_scope,
                       const uint32_t* base, size_t nbase, std::vector<std::vector<uint32_t>>* P,
-                      std::unordered_set<const SqlExpr*>& pushed, std::string* err, StarShape* shape) {
+                      std::unordered_set<const SqlExpr*>& pushed, std::string* err, StarShape* shape,
+                      std::shared_ptr<StarExpansion>* deferred = nullptr) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_STAR_JOIN"); return v && *v == '0'; }();
   if (off || join_conditions.empty() || nbase < 256 || sources.size() > 8) return false;
   for (const auto& s : sources) if (!s.table || s.table->inferred_types) return false;
@@ -43419,30 +43573,8 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   // Each joined table: the rows its own conditions keep, keyed. `fixed`:
   // the rows it may use are these (a re-rooted base table's selection).
   const uint64_t t0 = vx_trace_on() ? hal_now_ns() : 0;
-  struct Map {
-    std::vector<int64_t> of_code;            // parent dictionary code -> child row (-1 none)
-    std::unordered_map<uint64_t, uint32_t> of_key;   // integer parent without a dictionary
-    std::vector<uint32_t> dense;             // integer keys in a small range: key - lo -> row
-    int64_t lo = 0;
-    bool by_code = false, by_dense = false;
-  };
-  struct Link {                              // child_src's row from parent_src's
-    size_t child_src = 0, child_col = 0, parent_src = 0, parent_col = 0;
-    StarKey ck, pk;
-    bool left = false;
-    Map map;
-    bool parent_nulls = true;                // the parent key column has NULLs (checked per row only then)
-    // the parent key column decoded whole (by_code maps: its codes; dense / hashed maps: its integers), where worth
-    // it - kept between statements (vx::decoded_codes / decoded_ints)
-    std::shared_ptr<const std::vector<uint32_t>> wc_hold;
-    std::shared_ptr<const vx::DecodedInts> wi_hold;
-    const uint32_t* whole_codes = nullptr;
-    const int64_t* whole_ints = nullptr;
-    // One-to-many (an order's lines): key - mlo -> the child rows moff[k] .. moff[k+1] of mrows, ascending - the
-    // order the general join meets them in. The row loop below expands a parent row into each of them.
-    bool multi = false;
-    std::shared_ptr<const StarMultiMap> mm;
-  };
+  using Map = StarMap;
+  using Link = StarLink;
   auto select_of = [&](size_t src, const std::vector<const SqlExpr*>& conds, std::vector<uint32_t>* ids) {
     const SqlTable& t = *sources[src].table;
     std::vector<QuerySource> only(sources.begin() + (long)src, sources.begin() + (long)src + 1);
@@ -43607,6 +43739,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     for (size_t j = 0; j < ids.size(); ++j) if (!isnull[j]) m->off[(size_t)(keys[j] - lo) + 1]++;
     for (size_t k = 0; k < span; ++k) m->off[k + 1] += m->off[k];
     m->rows.resize(m->off[span]);
+    for (size_t k = 0; k < span; ++k) m->maxrun = std::max(m->maxrun, m->off[k + 1] - m->off[k]);
     std::vector<uint32_t> fill(m->off.begin(), m->off.end() - 1);
     for (size_t j = 0; j < ids.size(); ++j) if (!isnull[j]) m->rows[fill[(size_t)(keys[j] - lo)]++] = ids[j];   // ids ascending: each list too
     L.multi = true;
@@ -43635,23 +43768,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   };
   // The parent key column decoded whole for a link the rows cover much of (every order line's product id), so
   // the lookup reads an array and not read_code per row (whole_codes / whole_ints, filled before the row loop).
-  auto partner = [&](const Link& L, uint32_t pr) -> uint32_t {
-    if (pr == UINT32_MAX) return UINT32_MAX;
-    const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
-    if (L.parent_nulls && pcs.is_null(pr)) return UINT32_MAX;
-    const Map& M = L.map;
-    if (M.by_code) {
-      const uint32_t code = L.whole_codes ? L.whole_codes[pr] : vx::code_at(pcs, pr);
-      return code < M.of_code.size() && M.of_code[code] >= 0 ? (uint32_t)M.of_code[code] : UINT32_MAX;
-    }
-    const int64_t key = L.whole_ints ? L.whole_ints[pr] : vx::typed_int(pcs, pr);
-    if (M.by_dense) {
-      const uint64_t k = (uint64_t)(key - M.lo);
-      return k < M.dense.size() ? M.dense[(size_t)k] : UINT32_MAX;
-    }
-    auto it = M.of_key.find((uint64_t)key);
-    return it != M.of_key.end() ? it->second : UINT32_MAX;
-  };
+  auto partner = [&](const Link& L, uint32_t pr) -> uint32_t { return star_partner(sources, L, pr); };
 
   const size_t ns = sources.size();
   std::vector<Link> links;
@@ -43847,22 +43964,42 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     ++out_n;
   }
   for (size_t k = 0; k < ns; ++k) (*P)[k].resize(out_n);
+  } else if ([&] {
+               // At most root rows x each one-to-many map's longest run: below 2^30, the rows are walked by
+               // StarExpansion - handed over unexpanded (deferred: the join aggregate's fused loop takes them a root
+               // row at a time), or expanded here. Past it, the loop below, which gives up at 2^30 as before.
+               if (rerooted) return false;
+               double bound = (double)nr;
+               for (const Link& L : links)
+                 if (L.multi) bound *= std::max<double>(1.0, (double)L.mm->maxrun);
+               if (bound >= (double)((size_t)1 << 30)) return false;
+               auto E = std::make_shared<StarExpansion>();
+               E->sources = &sources;
+               E->ns = ns;
+               E->root = root;
+               E->roots.assign(rp, rp + nr);
+               E->bound = bound;
+               E->links = std::move(links);
+               if (deferred) {
+                 *deferred = std::move(E);
+                 return true;
+               }
+               E->expand(P);
+               return true;
+             }()) {
+    if (deferred && *deferred) {
+      if (vx_trace_on())
+        vx_trace("join: star join handed over unexpanded (" + std::to_string(nr) + " root rows, at most " +
+                 std::to_string((size_t)(*deferred)->bound) + " rows), " + std::to_string((hal_now_ns() - t0) / 1000) +
+                 " us (maps " + std::to_string((t1 - t0) / 1000) + " us)");
+      P->clear();
+      return true;
+    }
   } else {
     // Depth first over the links in FROM order: a one-to-many link's rows in row order, each followed through
     // the later links - the rows come out as the general join's step-by-step loop makes them (by base row, then
     // by each step's candidate). A LEFT link with no row gives one NULL-padded row.
-    auto rows_of = [&](const Link& L, uint32_t pr, const uint32_t** b, const uint32_t** e) {
-      *b = *e = nullptr;
-      if (pr == UINT32_MAX) return;
-      const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
-      if (L.parent_nulls && pcs.is_null(pr)) return;
-      const int64_t key = L.whole_ints ? L.whole_ints[pr] : vx::typed_int(pcs, pr);
-      const StarMultiMap& M = *L.mm;
-      const uint64_t k = (uint64_t)(key - M.lo);
-      if (key < M.lo || k + 1 >= M.off.size()) return;
-      *b = M.rows.data() + M.off[(size_t)k];
-      *e = M.rows.data() + M.off[(size_t)k + 1];
-    };
+    auto rows_of = [&](const Link& L, uint32_t pr, const uint32_t** b, const uint32_t** e) { star_rows_of(sources, L, pr, b, e); };
     size_t out_n = 0;
     // The output columns written through pointers, grown by doubling: a push_back per row and table (not
     // inlined) was 28 instructions an id, 43M of a 257k-row expansion. Sized first for each base row's rows
@@ -43987,8 +44124,11 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
                            const std::vector<ExprPtr>& group_by,
                            const std::vector<const SqlExpr*>& roots, std::vector<JoinedRows>* groups,
                            std::vector<std::vector<std::pair<const SqlExpr*, Val>>>* agg_out, std::string* err,
-                           StarKeep* keep = nullptr) {
-  const size_t N = P.empty() ? 0 : P[0].size();
+                           StarKeep* keep = nullptr, const StarExpansion* E = nullptr) {
+  // E: the star join unexpanded (3c.1) - P is empty and the rows are walked a root row at a time into morsels. Until
+  // the walk, N is the expansion's bound (it sizes the choices below, which read no row); after it, the rows met.
+  size_t N = E ? (size_t)E->bound : (P.empty() ? 0 : P[0].size());
+  const size_t NS = sources.size();
   EvalCtx all; all.sources = &sources;
   // Group keys: stored dictionary or integer columns.
   struct Key { size_t src, col; std::vector<uint32_t> canon; };
@@ -44108,7 +44248,8 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       // could still have a value there.
       if (a->src > 0 && n->args[0]->op != ExprOp::Column) {
         bool can_be_null = false;
-        for (uint32_t r : P[a->src]) if (r == UINT32_MAX) { can_be_null = true; break; }
+        if (E) can_be_null = E->can_pad(a->src);   // unexpanded: whether a LEFT link reaches it (the expanded rows decide below)
+        else for (uint32_t r : P[a->src]) if (r == UINT32_MAX) { can_be_null = true; break; }
         if (can_be_null) return false;
       }
     }
@@ -44123,38 +44264,38 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     aggs.push_back(std::move(a));
   }
 
-  // Group ids, first row first.
+  // Group ids, first row first. The rows come in morsels: P whole (one morsel), or (E) a root row's rows at a time,
+  // a few thousand together, each grouped and folded before the next is made - no row id array of N per source and
+  // no group id array of N. A group's first row is kept as its row ids (fparts), for the rows made below.
   const uint64_t t0 = vx_trace_on() ? hal_now_ns() : 0;
-  // A group id per row and the key table over them (two slots a row, or a
-  // slot per row of the table grouped by); refused only on KILL.
+  uint64_t t_keys = 0;                                // the time in the key loops (the rest of the pass: the folds)
+  // A group id per row of a morsel and the key table over them; refused only on KILL.
   QueryMemHold gid_hold;
-  gid_hold.reserve(N * 28 + (by_row >= 0 ? (sources[(size_t)by_row].table->row_count() + 1) * 4 : 0));
-  std::vector<uint32_t> gid(N, 0);
-  std::vector<uint32_t> first;
-  if (ng == 0) {
-    first.push_back(0);
-  } else if (by_row >= 0) {
-    std::vector<int32_t> slot(sources[(size_t)by_row].table->row_count() + 1, -1);   // last: a NULL-padded row
-    const uint32_t* pr = P[(size_t)by_row].data();
-    const size_t nslot = slot.size() - 1;
-    for (size_t i = 0; i < N; ++i) {
-      const size_t id = pr[i] == UINT32_MAX || pr[i] >= nslot ? nslot : pr[i];
-      int32_t g = slot[id];
-      if (g < 0) { g = slot[id] = (int32_t)first.size(); first.push_back((uint32_t)i); }
-      gid[i] = (uint32_t)g;
-    }
-  } else {
-    std::unordered_map<uint64_t, uint32_t> id_to_group;
-    std::unordered_map<std::string, uint32_t> tuple_to_group;
-    int64_t null_group = -1;
-    // A key column the rows cover much of (the fact table's own column; a dimension's behind many rows) is decoded
-    // whole once - its codes, or its integers - instead of a read per row through read_code (~370 instructions
-    // each: the keys of a 600k-row star aggregate were 23 ms, most of the statement).
-    // (kept between statements: vx::decoded_codes / decoded_ints)
-    std::vector<std::shared_ptr<const std::vector<uint32_t>>> kch(ng);
-    std::vector<std::shared_ptr<const vx::DecodedInts>> kih(ng);
-    std::vector<const uint32_t*> kc(ng, nullptr);
-    std::vector<const int64_t*> ki(ng, nullptr);
+  gid_hold.reserve((E ? std::min<size_t>(N, 65536) : N) * 28 + (by_row >= 0 ? (sources[(size_t)by_row].table->row_count() + 1) * 4 : 0));
+  std::vector<uint32_t> first;                        // a group's first row (its index among all the rows)
+  std::vector<uint32_t> fparts;                       // ... its row ids, NS a group
+  const uint32_t* const* Pm = nullptr;                // the morsel's row ids, by source
+  size_t gbase = 0;                                   // the morsel's first row's index
+  size_t row_at = 0;                                  // the row being grouped (its index among all the rows)
+  // A new group, its first row's row ids by source (rid(s)).
+  auto new_group = [&](auto&& rid) -> uint32_t {
+    const uint32_t g = (uint32_t)first.size();
+    first.push_back((uint32_t)row_at);
+    for (size_t s2 = 0; s2 < NS; ++s2) fparts.push_back(rid(s2));
+    return g;
+  };
+  std::unordered_map<uint64_t, uint32_t> id_to_group;
+  std::unordered_map<std::string, uint32_t> tuple_to_group;
+  int64_t null_group = -1;
+  // A key column the rows cover much of (the fact table's own column; a dimension's behind many rows) is decoded
+  // whole once - its codes, or its integers - instead of a read per row through read_code (~370 instructions
+  // each: the keys of a 600k-row star aggregate were 23 ms, most of the statement).
+  // (kept between statements: vx::decoded_codes / decoded_ints)
+  std::vector<std::shared_ptr<const std::vector<uint32_t>>> kch(ng);
+  std::vector<std::shared_ptr<const vx::DecodedInts>> kih(ng);
+  std::vector<const uint32_t*> kc(ng, nullptr);
+  std::vector<const int64_t*> ki(ng, nullptr);
+  if (ng > 0 && by_row < 0)
     for (size_t k = 0; k < ng; ++k) {
       const SqlTable& kt = *sources[keys[k].src].table;
       const ColumnStore& cs = kt.col_data[keys[k].col];
@@ -44162,196 +44303,408 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       if (!keys[k].canon.empty()) { kch[k] = vx::decoded_codes(kt, keys[k].col); if (kch[k]) kc[k] = kch[k]->data(); }
       else if (vx::typed_integer(cs)) { kih[k] = vx::decoded_ints(kt, keys[k].col); if (kih[k]) ki[k] = kih[k]->v.data(); }
     }
-    auto code_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> uint32_t { return kc[k] ? kc[k][r] : vx::code_at(cs, r); };
-    auto int_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> int64_t { return ki[k] ? ki[k][r] : vx::typed_int(cs, r); };
-    int64_t ilo[2] = {0, 0};   // a packed pair's integer key: its least value (below)
-    // One dictionary key: its canonical id indexes the group directly.
-    if (ng == 1 && !keys[0].canon.empty()) {
+  auto code_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> uint32_t { return kc[k] ? kc[k][r] : vx::code_at(cs, r); };
+  auto int_of = [&](size_t k, const ColumnStore& cs, uint32_t r) -> int64_t { return ki[k] ? ki[k][r] : vx::typed_int(cs, r); };
+  int64_t ilo[2] = {0, 0};   // a packed pair's integer key: its least value (below)
+  // The key path: 0 no GROUP BY, 1 by the row of a table, 2 one dictionary key, 3 packed ids, 4 tuples.
+  int kpath = 0;
+  if (ng == 0) kpath = 0;
+  else if (by_row >= 0) kpath = 1;
+  else if (ng == 1 && !keys[0].canon.empty()) kpath = 2;
+  else if (ng <= 2 && [&] {
+             // Two keys, one an integer: its values offset from their least into 32 bits (the column decoded
+             // whole above, kints), so the pair still packs into one 64-bit id - an order number beside a name.
+             if (ng == 1) return true;
+             for (size_t k = 0; k < 2; ++k) {
+               if (!keys[k].canon.empty()) continue;
+               if (!kih[k]) return false;
+               int64_t mn = kih[k]->lo, mx = kih[k]->hi;   // over the non-NULL values (a NULL key never offsets)
+               if (mn > mx) mn = mx = 0;
+               if (mx - mn < 0 || (uint64_t)(mx - mn) >= 0xFFFFFFF0ull) return false;
+               ilo[k] = mn;
+             }
+             return true;
+           }())
+    kpath = 3;
+  else kpath = 4;
+  // by row: a slot per row of that table
+  std::vector<int32_t> slot_row;
+  if (kpath == 1) slot_row.assign(sources[(size_t)by_row].table->row_count() + 1, -1);   // last: a NULL-padded row
+  // one dictionary key: its canonical id indexes the group directly
+  std::vector<int32_t> slot_dict;
+  if (kpath == 2) slot_dict.assign(keys[0].canon.size() + 1, -1);   // last: the NULL key
+  // One integer key, or two keys (dictionary, or an integer offset into 32 bits) packed into one 64-bit id:
+  // an open-addressing table of ids, no string per row. It starts small and doubles as groups appear: sized
+  // to the rows (2M slots for 600k rows and 480 groups) it missed the cache on every probe.
+  size_t cap = 1024;
+  unsigned shift = 54;   // the product's top log2(cap) bits: well mixed, where its middle bits clustered a small table
+  std::vector<uint64_t> tk;
+  std::vector<int32_t> tg;
+  if (kpath == 3) { tk.assign(cap, 0); tg.assign(cap, -1); }
+  size_t mask = cap - 1;
+  auto hash_of = [&](uint64_t id) { return (size_t)((id * 0x9E3779B97F4A7C15ull) >> shift) & mask; };
+  auto grow = [&]() {
+    const size_t ncap = cap * 2;
+    std::vector<uint64_t> ntk(ncap);
+    std::vector<int32_t> ntg(ncap, -1);
+    const size_t nmask = ncap - 1;
+    const unsigned nshift = shift - 1;
+    for (size_t s0 = 0; s0 < cap; ++s0) {
+      if (tg[s0] < 0) continue;
+      size_t h = (size_t)((tk[s0] * 0x9E3779B97F4A7C15ull) >> nshift) & nmask;
+      while (ntg[h] >= 0) h = (h + 1) & nmask;
+      ntk[h] = tk[s0]; ntg[h] = tg[s0];
+    }
+    tk.swap(ntk); tg.swap(ntg); cap = ncap; mask = nmask; shift = nshift;
+  };
+  const ColumnStore* kcs[2] = {nullptr, nullptr};
+  bool khn[2] = {false, false};                      // the key column has a NULL somewhere: else no check per row
+  if (kpath == 2 || kpath == 3)
+    for (size_t k = 0; k < ng; ++k) { kcs[k] = &sources[keys[k].src].table->col_data[keys[k].col]; khn[k] = vx::has_nulls(*kcs[k]); }
+  std::vector<uint64_t> tids(ng);
+  std::vector<char> tnul(ng);
+  std::string tkey;
+  // The group of the row whose row ids rid(s) gives: found, or (create) made - or -1, not there and not made.
+  auto key_group = [&](auto&& rid, bool create) -> int64_t {
+    if (kpath == 0) {
+      if (first.empty()) { if (!create) return -1; new_group(rid); }
+      return 0;
+    }
+    if (kpath == 1) {
+      const uint32_t r = rid((size_t)by_row);
+      const size_t nslot = slot_row.size() - 1;
+      const size_t id = r == UINT32_MAX || r >= nslot ? nslot : r;
+      int32_t g = slot_row[id];
+      if (g < 0) { if (!create) return -1; g = slot_row[id] = (int32_t)new_group(rid); }
+      return g;
+    }
+    if (kpath == 2) {
       const Key& K = keys[0];
       const ColumnStore& cs = sources[K.src].table->col_data[K.col];
       const size_t nd = K.canon.size();
-      std::vector<int32_t> slot(nd + 1, -1);          // last: the NULL key
-      const uint32_t* pr = P[K.src].data();
-      const bool hn = vx::has_nulls(cs);
-      for (size_t i = 0; i < N; ++i) {
-        const uint32_t r = pr[i];
-        size_t id;
-        if (r == UINT32_MAX || (hn && cs.is_null(r))) id = nd;
-        else { const uint32_t code = code_of(0, cs, r); id = code < nd ? K.canon[code] : nd; }
-        int32_t g = slot[id];
-        if (g < 0) { g = slot[id] = (int32_t)first.size(); first.push_back((uint32_t)i); }
-        gid[i] = (uint32_t)g;
-      }
-    } else if (ng <= 2 && [&] {
-                 // Two keys, one an integer: its values offset from their least into 32 bits (the column decoded
-                 // whole above, kints), so the pair still packs into one 64-bit id - an order number beside a name.
-                 if (ng == 1) return true;
-                 for (size_t k = 0; k < 2; ++k) {
-                   if (!keys[k].canon.empty()) continue;
-                   if (!kih[k]) return false;
-                   int64_t mn = kih[k]->lo, mx = kih[k]->hi;   // over the non-NULL values (a NULL key never offsets)
-                   if (mn > mx) mn = mx = 0;
-                   if (mx - mn < 0 || (uint64_t)(mx - mn) >= 0xFFFFFFF0ull) return false;
-                   ilo[k] = mn;
-                 }
-                 return true;
-               }()) {
-      // One integer key, or two keys (dictionary, or an integer offset into 32 bits) packed into one 64-bit id:
-      // an open-addressing table of ids, no string per row. It starts small and doubles as groups appear: sized
-      // to the rows (2M slots for 600k rows and 480 groups) it missed the cache on every probe.
-      size_t cap = 1024;
-      unsigned shift = 54;   // the product's top log2(cap) bits: well mixed, where its middle bits clustered a small table
-      std::vector<uint64_t> tk(cap);
-      std::vector<int32_t> tg(cap, -1);
-      size_t mask = cap - 1;
-      auto hash_of = [&](uint64_t id) { return (size_t)((id * 0x9E3779B97F4A7C15ull) >> shift) & mask; };
-      auto grow = [&]() {
-        const size_t ncap = cap * 2;
-        std::vector<uint64_t> ntk(ncap);
-        std::vector<int32_t> ntg(ncap, -1);
-        const size_t nmask = ncap - 1;
-        const unsigned nshift = shift - 1;
-        for (size_t s0 = 0; s0 < cap; ++s0) {
-          if (tg[s0] < 0) continue;
-          size_t h = (size_t)((tk[s0] * 0x9E3779B97F4A7C15ull) >> nshift) & nmask;
-          while (ntg[h] >= 0) h = (h + 1) & nmask;
-          ntk[h] = tk[s0]; ntg[h] = tg[s0];
-        }
-        tk.swap(ntk); tg.swap(ntg); cap = ncap; mask = nmask; shift = nshift;
-      };
-      const ColumnStore* kcs[2] = {nullptr, nullptr};
-      bool khn[2] = {false, false};                  // the key column has a NULL somewhere: else no check per row
-      for (size_t k = 0; k < ng; ++k) { kcs[k] = &sources[keys[k].src].table->col_data[keys[k].col]; khn[k] = vx::has_nulls(*kcs[k]); }
-      for (size_t i = 0; i < N; ++i) {
-        uint64_t id = 0;
-        bool nulls_seen = false;
-        for (size_t k = 0; k < ng; ++k) {
-          const Key& K = keys[k];
-          const uint32_t r = P[K.src][i];
-          uint64_t part;
-          if (r == UINT32_MAX || (khn[k] && kcs[k]->is_null(r))) { part = 0xFFFFFFFFull; nulls_seen = true; }
-          else if (!K.canon.empty()) { const uint32_t code = code_of(k, *kcs[k], r); part = code < K.canon.size() ? K.canon[code] : 0xFFFFFFFEull; }
-          else part = ng == 1 ? (uint64_t)int_of(k, *kcs[k], r) : (uint64_t)(int_of(k, *kcs[k], r) - ilo[k]);
-          id = ng == 1 ? part : (k == 0 ? part << 32 : id | (part & 0xFFFFFFFFull));
-        }
-        // An integer key's NULL is its own group, apart from any value.
-        if (ng == 1 && keys[0].canon.empty() && nulls_seen) {
-          if (null_group < 0) { null_group = (int64_t)first.size(); first.push_back((uint32_t)i); }
-          gid[i] = (uint32_t)null_group;
-          continue;
-        }
-        size_t h = hash_of(id);
-        for (;;) {
-          if (tg[h] < 0) {
-            tk[h] = id; tg[h] = (int32_t)first.size(); first.push_back((uint32_t)i);
-            if (first.size() * 2 > cap) { grow(); h = hash_of(id); while (tk[h] != id || tg[h] < 0) h = (h + 1) & mask; }
-            break;
-          }
-          if (tk[h] == id) break;
-          h = (h + 1) & mask;
-        }
-        gid[i] = (uint32_t)tg[h];
-      }
-    } else {
-    std::vector<uint64_t> ids(ng);
-    std::vector<char> nul(ng);
-    std::string tkey;
-    for (size_t i = 0; i < N; ++i) {
+      const uint32_t r = rid(K.src);
+      size_t id;
+      if (r == UINT32_MAX || (khn[0] && cs.is_null(r))) id = nd;
+      else { const uint32_t code = code_of(0, cs, r); id = code < nd ? K.canon[code] : nd; }
+      int32_t g = slot_dict[id];
+      if (g < 0) { if (!create) return -1; g = slot_dict[id] = (int32_t)new_group(rid); }
+      return g;
+    }
+    if (kpath == 3) {
+      uint64_t id = 0;
+      bool nulls_seen = false;
       for (size_t k = 0; k < ng; ++k) {
         const Key& K = keys[k];
-        const uint32_t r = P[K.src][i];
-        const ColumnStore& cs = sources[K.src].table->col_data[K.col];
-        nul[k] = 0;
-        if (r == UINT32_MAX || cs.is_null(r)) { ids[k] = 0; nul[k] = 1; continue; }
-        if (!K.canon.empty()) {
-          const uint32_t code = code_of(k, cs, r);
-          ids[k] = code < K.canon.size() ? K.canon[code] : code;
-        } else {
-          ids[k] = (uint64_t)int_of(k, cs, r);
+        const uint32_t r = rid(K.src);
+        uint64_t part;
+        if (r == UINT32_MAX || (khn[k] && kcs[k]->is_null(r))) { part = 0xFFFFFFFFull; nulls_seen = true; }
+        else if (!K.canon.empty()) { const uint32_t code = code_of(k, *kcs[k], r); part = code < K.canon.size() ? K.canon[code] : 0xFFFFFFFEull; }
+        else part = ng == 1 ? (uint64_t)int_of(k, *kcs[k], r) : (uint64_t)(int_of(k, *kcs[k], r) - ilo[k]);
+        id = ng == 1 ? part : (k == 0 ? part << 32 : id | (part & 0xFFFFFFFFull));
+      }
+      // An integer key's NULL is its own group, apart from any value.
+      if (ng == 1 && keys[0].canon.empty() && nulls_seen) {
+        if (null_group < 0) { if (!create) return -1; null_group = (int64_t)new_group(rid); }
+        return null_group;
+      }
+      size_t h = hash_of(id);
+      for (;;) {
+        if (tg[h] < 0) {
+          if (!create) return -1;
+          tk[h] = id; tg[h] = (int32_t)new_group(rid);
+          if (first.size() * 2 > cap) { grow(); h = hash_of(id); while (tk[h] != id || tg[h] < 0) h = (h + 1) & mask; }
+          break;
         }
+        if (tk[h] == id) break;
+        h = (h + 1) & mask;
       }
-      uint32_t g;
-      const uint32_t fresh = (uint32_t)first.size();
-      if (ng == 1) {
-        if (nul[0]) { if (null_group < 0) null_group = fresh; g = (uint32_t)null_group; }
-        else g = id_to_group.emplace(ids[0], fresh).first->second;
+      return tg[h];
+    }
+    for (size_t k = 0; k < ng; ++k) {
+      const Key& K = keys[k];
+      const uint32_t r = rid(K.src);
+      const ColumnStore& cs = sources[K.src].table->col_data[K.col];
+      tnul[k] = 0;
+      if (r == UINT32_MAX || cs.is_null(r)) { tids[k] = 0; tnul[k] = 1; continue; }
+      if (!K.canon.empty()) {
+        const uint32_t code = code_of(k, cs, r);
+        tids[k] = code < K.canon.size() ? K.canon[code] : code;
       } else {
-        tkey.assign(reinterpret_cast<const char*>(ids.data()), ng * sizeof(uint64_t));
-        tkey.append(nul.data(), ng);
-        g = tuple_to_group.emplace(tkey, fresh).first->second;
+        tids[k] = (uint64_t)int_of(k, cs, r);
       }
-      if (g == fresh) first.push_back((uint32_t)i);
-      gid[i] = g;
     }
+    const uint32_t fresh = (uint32_t)first.size();
+    if (ng == 1) {
+      if (tnul[0]) {
+        if (null_group < 0) { if (!create) return -1; null_group = fresh; new_group(rid); }
+        return null_group;
+      }
+      if (!create) { auto it = id_to_group.find(tids[0]); return it == id_to_group.end() ? -1 : (int64_t)it->second; }
+      const uint32_t g = id_to_group.emplace(tids[0], fresh).first->second;
+      if (g == fresh) new_group(rid);
+      return g;
     }
-  }
-  const size_t G = first.size();
-  const uint64_t t1 = vx_trace_on() ? hal_now_ns() : 0;
+    tkey.assign(reinterpret_cast<const char*>(tids.data()), ng * sizeof(uint64_t));
+    tkey.append(tnul.data(), ng);
+    if (!create) { auto it = tuple_to_group.find(tkey); return it == tuple_to_group.end() ? -1 : (int64_t)it->second; }
+    const uint32_t g = tuple_to_group.emplace(tkey, fresh).first->second;
+    if (g == fresh) new_group(rid);
+    return g;
+  };
+  // The morsel's rows (Pm, n of them) into their groups (gidm).
+  auto group_rows = [&](size_t n, uint32_t* gidm) {
+    for (size_t j = 0; j < n; ++j) {
+      row_at = gbase + j;
+      gidm[j] = (uint32_t)key_group([&](size_t s2) { return Pm[s2][j]; }, true);
+    }
+  };
 
-  // Each aggregate over its table's rows, in row order.
+  // Each aggregate over its table's rows, in row order: the morsel's rows folded into the groups' arrays, which
+  // grow (doubling) as groups appear.
   constexpr size_t kBatch = 4096;
   std::vector<uint32_t> rows_b, gs_b;
   rows_b.reserve(kBatch);
   gs_b.reserve(kBatch);
-  for (auto& ap : aggs) {
-    A1& a = *ap;
-    vx::init_arrays(a.agg, a.plan, G, a.arr);
-    const SqlTable& t = *sources[a.src].table;
-    const ColumnStore& cs = t.col_data[a.agg.src.col];
-    vx::RowReader rd(t, a.base);
-    vx::AggCols cols;
-    cols.scratch.cover = N;                           // the joined rows: often a table's every row, scattered
-    cols.scratch.table = &t;
-    const bool count_star = a.agg.kind == vx::Agg::CountStar;
-    for (size_t b = 0; b < N; b += kBatch) {
-      const size_t e = std::min(N, b + kBatch);
-      if (count_star) { for (size_t i = b; i < e; ++i) a.arr.cnt[gid[i]]++; continue; }
-      rows_b.resize(e - b);
-      gs_b.resize(e - b);
-      size_t m = 0;
-      const uint32_t* pa = P[a.src].data();
-      for (size_t i = b; i < e; ++i) {
-        const uint32_t r = pa[i];
-        rows_b[m] = r;                                // a LEFT JOIN's missing row (UINT32_MAX) is not kept: a bare column is NULL there
-        gs_b[m] = gid[i];
-        m += r != UINT32_MAX;
-      }
-      rows_b.resize(m);
-      gs_b.resize(m);
-      // COUNT(column) of a column with no NULL: every present row counts (acc_row's col_rules branch), nothing to read
-      if (a.agg.kind == vx::Agg::Count && a.agg.col_rules && !a.nulls) { for (size_t j = 0; j < m; ++j) a.arr.cnt[gs_b[j]]++; continue; }
-      vx::gather_for(a.agg, a.plan, cs, rows_b.data(), rows_b.size(), cols);
-      // SUM / AVG of an expression with no CASE mask: acc_row's prog branch, without its switches per row
-      if (a.agg.prog && !a.agg.mask && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg)) {
-        const double* nv = cols.nums.data();
-        const uint8_t* nz = cols.nul.data();
-        for (size_t j = 0; j < m; ++j) {
-          if (nz[j]) continue;
-          const uint32_t g = gs_b[j];
-          a.arr.num[g] += nv[j];
-          a.arr.cnt[g]++;
-          a.arr.exact[g] = 0;
-        }
-        continue;
-      }
-      // SUM / AVG of a typed INT column with no NULL: the integers added into their groups without acc_row's
-      // switches per row (what acc_row does on that path: isum, num and cnt)
-      if (!a.nulls && !a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
-          a.agg.src.kind == vx::Source::TypedCol && a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct) {
-        const int64_t* iv = cols.ints.data();
-        for (size_t j = 0; j < rows_b.size(); ++j) {
-          const uint32_t g = gs_b[j];
-          a.arr.isum[g] += (AIOS_INT128)iv[j];
-          a.arr.num[g] += (double)iv[j];
-          a.arr.cnt[g]++;
-        }
-        continue;
-      }
-      for (size_t j = 0; j < rows_b.size(); ++j)
-        vx::acc_row(a.agg, a.plan, a.arr, gs_b[j], rows_b[j], j, cols, cs, a.nulls, rd);
-    }
-    if (!err->empty()) return false;
+  std::vector<vx::AggCols> acols(aggs.size());
+  std::vector<std::unique_ptr<vx::RowReader>> areaders;
+  for (size_t ai = 0; ai < aggs.size(); ++ai) {
+    const SqlTable& t = *sources[aggs[ai]->src].table;
+    acols[ai].scratch.cover = N;                      // the joined rows: often a table's every row, scattered
+    acols[ai].scratch.table = &t;
+    areaders.push_back(std::make_unique<vx::RowReader>(t, aggs[ai]->base));
   }
+  size_t acap = 0;                                    // the groups the arrays hold
+  // clean: no row of the morsel is a NULL-padded one, and the rows are read where they are (no staging copy)
+  auto fold_rows = [&](size_t n, const uint32_t* gidm, bool clean = false) {
+    if (first.size() > acap) {
+      const size_t ncap = std::max(first.size(), acap * 2);
+      for (auto& ap : aggs) { if (acap == 0) vx::init_arrays(ap->agg, ap->plan, ncap, ap->arr); else vx::grow_arrays(ap->agg, ap->plan, ncap, ap->arr); }
+      acap = ncap;
+    }
+    for (size_t ai = 0; ai < aggs.size(); ++ai) {
+      A1& a = *aggs[ai];
+      const SqlTable& t = *sources[a.src].table;
+      const ColumnStore& cs = t.col_data[a.agg.src.col];
+      vx::RowReader& rd = *areaders[ai];
+      vx::AggCols& cols = acols[ai];
+      const bool count_star = a.agg.kind == vx::Agg::CountStar;
+      for (size_t b = 0; b < n; b += kBatch) {
+        const size_t e = std::min(n, b + kBatch);
+        if (count_star) { for (size_t i = b; i < e; ++i) a.arr.cnt[gidm[i]]++; continue; }
+        const uint32_t* R;                            // the rows read, and their groups
+        const uint32_t* GS;
+        size_t m = 0;
+        if (clean) {
+          R = Pm[a.src] + b;
+          GS = gidm + b;
+          m = e - b;
+        } else {
+          rows_b.resize(e - b);
+          gs_b.resize(e - b);
+          const uint32_t* pa = Pm[a.src];
+          for (size_t i = b; i < e; ++i) {
+            const uint32_t r = pa[i];
+            rows_b[m] = r;                            // a LEFT JOIN's missing row (UINT32_MAX) is not kept: a bare column is NULL there
+            gs_b[m] = gidm[i];
+            m += r != UINT32_MAX;
+          }
+          rows_b.resize(m);
+          gs_b.resize(m);
+          R = rows_b.data();
+          GS = gs_b.data();
+        }
+        // COUNT(column) of a column with no NULL: every present row counts (acc_row's col_rules branch), nothing to read
+        if (a.agg.kind == vx::Agg::Count && a.agg.col_rules && !a.nulls) { for (size_t j = 0; j < m; ++j) a.arr.cnt[GS[j]]++; continue; }
+        vx::gather_for(a.agg, a.plan, cs, R, m, cols);
+        // SUM / AVG of an expression with no CASE mask: acc_row's prog branch, without its switches per row
+        if (a.agg.prog && !a.agg.mask && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg)) {
+          const double* nv = cols.nums.data();
+          const uint8_t* nz = cols.nul.data();
+          for (size_t j = 0; j < m; ++j) {
+            if (nz[j]) continue;
+            const uint32_t g = GS[j];
+            a.arr.num[g] += nv[j];
+            a.arr.cnt[g]++;
+            a.arr.exact[g] = 0;
+          }
+          continue;
+        }
+        // SUM / AVG of a typed INT column with no NULL: the integers added into their groups without acc_row's
+        // switches per row (what acc_row does on that path: isum, num and cnt)
+        if (!a.nulls && !a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
+            a.agg.src.kind == vx::Source::TypedCol && a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct) {
+          const int64_t* iv = cols.ints.data();
+          for (size_t j = 0; j < m; ++j) {
+            const uint32_t g = GS[j];
+            a.arr.isum[g] += (AIOS_INT128)iv[j];
+            a.arr.num[g] += (double)iv[j];
+            a.arr.cnt[g]++;
+          }
+          continue;
+        }
+        for (size_t j = 0; j < m; ++j)
+          vx::acc_row(a.agg, a.plan, a.arr, GS[j], R[j], j, cols, cs, a.nulls, rd);
+      }
+    }
+  };
+
+  if (!E) {
+    // P whole: one morsel
+    std::vector<const uint32_t*> pp(NS);
+    for (size_t s2 = 0; s2 < NS; ++s2) pp[s2] = s2 < P.size() ? P[s2].data() : nullptr;
+    Pm = pp.data();
+    std::vector<uint32_t> gid(N, 0);
+    const uint64_t tk0 = vx_trace_on() ? hal_now_ns() : 0;
+    group_rows(N, gid.data());
+    if (vx_trace_on()) t_keys += hal_now_ns() - tk0;
+    fold_rows(N, gid.data());
+    if (!err->empty()) return false;
+  } else if ([&] {
+               // The common star shape: every link unique but the last, which is one-to-many, and no key read from
+               // that last link's rows (an order's lines under the order and its customer). A root row's group is
+               // then found once - its partners, its key, one probe - and its run of lines goes into the morsel
+               // under that group with no key work at all: only the aggregates' rows and the group id are written.
+               const size_t nl = E->links.size();
+               if (nl == 0 || !E->links[nl - 1].multi) return false;
+               for (size_t k = 0; k + 1 < nl; ++k) if (E->links[k].multi) return false;
+               const size_t mc = E->links[nl - 1].child_src;
+               for (const Key& K : keys) if (K.src == mc) return false;
+               if (kpath == 1 && (size_t)by_row == mc) return false;
+               return true;
+             }()) {
+    constexpr size_t kMorsel = 4096;
+    const StarLink& ML = E->links.back();
+    const size_t mc = ML.child_src;
+    std::vector<char> need(NS, 0);                     // the sources the aggregates read
+    for (auto& ap : aggs) need[ap->src] = 1;
+    std::vector<std::vector<uint32_t>> ma(NS);
+    std::vector<uint32_t> mg;
+    std::vector<const uint32_t*> mp(NS, nullptr);
+    size_t mcap = kMorsel * 2, n = 0, total = 0;
+    for (size_t s2 = 0; s2 < NS; ++s2) if (need[s2]) ma[s2].resize(mcap);
+    mg.resize(mcap);
+    bool padded = false;                                // the morsel holds a NULL-padded row
+    auto flush = [&]() {
+      if (n == 0) return;
+      for (size_t s2 = 0; s2 < NS; ++s2) mp[s2] = need[s2] ? ma[s2].data() : nullptr;
+      Pm = mp.data();
+      gbase = total;
+      fold_rows(n, mg.data(), !padded);
+      total += n;
+      n = 0;
+      padded = false;
+    };
+    // At most a group a root row here (no key is read below the last link): the groups' arrays, their first rows and
+    // the key table sized for that once, not doubled as groups appear.
+    const size_t gmax = E->roots.size() + 1;
+    if (acap < gmax) {
+      for (auto& ap : aggs) { if (acap == 0) vx::init_arrays(ap->agg, ap->plan, gmax, ap->arr); else vx::grow_arrays(ap->agg, ap->plan, gmax, ap->arr); }
+      acap = gmax;
+    }
+    first.reserve(gmax);
+    fparts.reserve(gmax * NS);
+    if (kpath == 3 && first.empty()) {
+      size_t want = 1024;
+      unsigned bits = 10;
+      while (want < gmax * 2 && bits < 40) { want *= 2; ++bits; }
+      cap = want; mask = cap - 1; shift = 64 - bits;
+      tk.assign(cap, 0);
+      tg.assign(cap, -1);
+    }
+    uint32_t parts[8];
+    const uint64_t tk0 = vx_trace_on() ? hal_now_ns() : 0;
+    uint64_t t_fold = 0;
+    for (uint32_t rr : E->roots) {
+      parts[E->root] = rr;
+      bool keep_row = true;
+      for (size_t k = 0; k + 1 < E->links.size(); ++k) {
+        const StarLink& L = E->links[k];
+        const uint32_t got = star_partner(sources, L, parts[L.parent_src]);
+        if (got == UINT32_MAX && !L.left) { keep_row = false; break; }
+        parts[L.child_src] = got;
+      }
+      if (!keep_row) continue;
+      const uint32_t* b = nullptr;
+      const uint32_t* e = nullptr;
+      star_rows_of(sources, ML, parts[ML.parent_src], &b, &e);
+      size_t cnt = (size_t)(e - b);
+      const bool pad = cnt == 0;
+      if (pad) {
+        if (!ML.left) continue;                        // no line, an inner join: no row, and no group made for it
+        cnt = 1;                                       // a LEFT JOIN's NULL-padded row
+      }
+      parts[mc] = pad ? UINT32_MAX : *b;               // the group's first row, as the expanded rows had it
+      row_at = total + n;
+      const uint32_t g = (uint32_t)key_group([&](size_t s2) { return parts[s2]; }, true);
+      if (n + cnt > mcap) {
+        mcap = std::max(mcap * 2, n + cnt);
+        for (size_t s2 = 0; s2 < NS; ++s2) if (need[s2]) ma[s2].resize(mcap);
+        mg.resize(mcap);
+      }
+      for (size_t s2 = 0; s2 < NS; ++s2) {
+        if (!need[s2]) continue;
+        uint32_t* out = ma[s2].data() + n;
+        if (s2 == mc) { if (pad) { out[0] = UINT32_MAX; padded = true; } else std::memcpy(out, b, cnt * sizeof(uint32_t)); }
+        else { std::fill(out, out + cnt, parts[s2]); if (parts[s2] == UINT32_MAX) padded = true; }   // a LEFT unique link with no partner
+      }
+      std::fill(mg.data() + n, mg.data() + n + cnt, g);
+      n += cnt;
+      if (n >= kMorsel) {
+        const uint64_t tf = vx_trace_on() ? hal_now_ns() : 0;
+        flush();
+        if (vx_trace_on()) t_fold += hal_now_ns() - tf;
+        if (!err->empty()) return false;
+      }
+    }
+    flush();
+    if (!err->empty()) return false;
+    if (vx_trace_on()) t_keys += hal_now_ns() - tk0 - t_fold;
+    N = total;
+    if (kpath == 0 && first.empty()) first.push_back(0);   // no rows and no GROUP BY: one group, no row
+    if (vx_trace_on()) vx_trace("join aggregate: fused over the star join's root rows (" + std::to_string(E->roots.size()) + " root rows)");
+  } else {
+    // The star join's rows a root row at a time into a morsel; grouped and folded when it holds ~4096 rows.
+    constexpr size_t kMorsel = 4096;
+    std::vector<std::vector<uint32_t>> mb(NS);
+    for (auto& v : mb) v.reserve(kMorsel * 2);
+    std::vector<const uint32_t*> mp(NS);
+    std::vector<uint32_t> gid;
+    gid.reserve(kMorsel * 2);
+    size_t total = 0;
+    auto flush = [&]() {
+      const size_t n = mb[0].size();
+      if (n == 0) return;
+      for (size_t s2 = 0; s2 < NS; ++s2) mp[s2] = mb[s2].data();
+      Pm = mp.data();
+      gbase = total;
+      gid.resize(n);
+      const uint64_t tk0 = vx_trace_on() ? hal_now_ns() : 0;
+      group_rows(n, gid.data());
+      if (vx_trace_on()) t_keys += hal_now_ns() - tk0;
+      fold_rows(n, gid.data());
+      total += n;
+      for (auto& v : mb) v.clear();
+    };
+    auto emit = [&](const uint32_t* parts) {
+      for (size_t s2 = 0; s2 < NS; ++s2) mb[s2].push_back(parts[s2]);
+    };
+    for (uint32_t rr : E->roots) {
+      E->walk_root(rr, emit);
+      if (mb[0].size() >= kMorsel) { flush(); if (!err->empty()) return false; }
+    }
+    flush();
+    if (!err->empty()) return false;
+    N = total;
+    if (kpath == 0 && first.empty()) first.push_back(0);   // no rows and no GROUP BY: one group, no row
+  }
+  if (kpath == 0 && first.empty()) first.push_back(0);
+  if (first.size() > acap)                            // groups with no rows folded (no rows at all): arrays for them
+    for (auto& ap : aggs) { if (acap == 0) vx::init_arrays(ap->agg, ap->plan, first.size(), ap->arr); else vx::grow_arrays(ap->agg, ap->plan, first.size(), ap->arr); }
+  const size_t G = first.size();
+  const uint64_t t1 = vx_trace_on() ? t0 + t_keys : 0;
+  // A group's first row's row id of source s2.
+  auto first_part = [&](size_t s2, size_t g) -> uint32_t { return g * NS + s2 < fparts.size() ? fparts[g * NS + s2] : UINT32_MAX; };
+
   // The groups made into rows: every one, or (StarKeep) the first n by the statement's ORDER BY, in that order.
   std::vector<uint32_t> sel;
   std::vector<std::vector<Val>> key_vals(aggs.size());   // an aggregate's finished values, where it is a sort key
@@ -44383,11 +44736,10 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       const bool hn = vx::has_nulls(kcs);
       kint[i].resize(G);
       knul[i].assign(G, 0);
-      const uint32_t* pr = P[k.src].data();
       std::shared_ptr<const vx::DecodedInts> kd;
       if (k.kind == 3 && kcs.size() <= G * 8) kd = vx::decoded_ints(*sources[k.src].table, k.col);
       for (size_t g = 0; g < G; ++g) {
-        const uint32_t r = pr[first[g]];
+        const uint32_t r = first_part(k.src, g);
         if (r == UINT32_MAX || (hn && kcs.is_null(r))) { knul[i][g] = 1; continue; }
         if (k.kind == 3) { kint[i][g] = kd ? kd->v[r] : vx::typed_int(kcs, r); continue; }
         const uint32_t code = vx::code_at(kcs, r);
@@ -44449,8 +44801,10 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
   for (size_t j = 0; j < GS; ++j) {
     if (N == 0) break;                                // no rows and no GROUP BY: one group, no row
     JoinedRow jr;
-    const uint32_t f = first[sel[j]];
-    for (const auto& col : P) jr.parts.push_back(col[f] == UINT32_MAX ? kNullRow : (size_t)col[f]);
+    for (size_t s2 = 0; s2 < NS; ++s2) {
+      const uint32_t r = first_part(s2, sel[j]);
+      jr.parts.push_back(r == UINT32_MAX ? kNullRow : (size_t)r);
+    }
     (*groups)[j].push_back(std::move(jr));
   }
   if (vx_trace_on())
@@ -45779,6 +46133,7 @@ struct GroupPlan {
   std::vector<std::vector<uint32_t>>* star_cols;
   StarShape* star_shape;
   bool* star_columnar;
+  std::shared_ptr<StarExpansion>* star_def;
   std::string* err;
   std::vector<OutRow>* out_rows;
   const std::function<void(std::vector<OutRow>&, OutRow&&)>* emit_row;
@@ -45807,6 +46162,7 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
   std::vector<std::vector<uint32_t>>& star_cols = *plan.star_cols;
   StarShape& star_shape = *plan.star_shape;
   bool& star_columnar = *plan.star_columnar;
+  std::shared_ptr<StarExpansion>& star_def = *plan.star_def;
   std::string& err = *plan.err;
   std::vector<OutRow>& out_rows = *plan.out_rows;
   const std::function<void(std::vector<OutRow>&, OutRow&&)>& emit_row = *plan.emit_row;
@@ -45939,13 +46295,15 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
       }
       keep.n = keep_bound;
       star_grouped = star_aggregate(db, sources, outer_scope, star_cols, star_shape, group_by, roots, &groups, &star_vals, &err,
-                                    keep_ok ? &keep : nullptr);
+                                    keep_ok ? &keep : nullptr, star_def.get());
       if (!err.empty()) return make_error(err);
       if (!star_grouped) {
         groups.clear();
         star_vals.clear();
+        star_expand_into(star_def, star_cols);
         rows = star_materialize(star_cols);
       }
+      star_def.reset();
       star_columnar = false;
       std::vector<std::vector<uint32_t>>().swap(star_cols);
     }
@@ -50025,6 +50383,7 @@ struct ExpandPlan {
   JoinedRows* rows;
   std::vector<std::vector<uint32_t>>* star_cols;
   bool* star_columnar;
+  std::shared_ptr<StarExpansion>* star_def;
   std::vector<SelectItem>* expanded;     // out: the select list with `*` expanded
   std::vector<bool>* ordinal_needed;     // out: the items an ORDER BY ordinal names
   bool* aggregated;                      // out: the statement groups
@@ -50043,6 +50402,7 @@ static std::optional<SqlQueryResult> expand_items(const ExpandPlan& plan, PhaseC
   JoinedRows& rows = *plan.rows;
   std::vector<std::vector<uint32_t>>& star_cols = *plan.star_cols;
   bool& star_columnar = *plan.star_columnar;
+  std::shared_ptr<StarExpansion>& star_def = *plan.star_def;
   std::vector<SelectItem>& expanded = *plan.expanded;
   std::vector<bool>& ordinal_needed = *plan.ordinal_needed;
   bool& aggregated = *plan.aggregated;
@@ -50184,6 +50544,7 @@ static std::optional<SqlQueryResult> expand_items(const ExpandPlan& plan, PhaseC
   for (const OrderKey& k : order_by)
     if (expr_has_aggregate(k.expr)) aggregated = true;
   if (star_columnar && !aggregated) {
+    star_expand_into(star_def, star_cols);
     rows = star_materialize(star_cols);
     star_columnar = false;
   }
@@ -50320,6 +50681,7 @@ struct StarPlan {
   StarShape* star_shape;
   bool* star_columnar;
   bool* star_done;
+  std::shared_ptr<StarExpansion>* star_def;   // a star join handed over unexpanded (3c.1)
 };
 // The star join over the base rows (every join a unique-key or one-to-many link it can take), kept as arrays when
 // a grouping can read them; the base row ids made into rows for the join steps otherwise. Empty: on to the join
@@ -50342,6 +50704,7 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
   StarShape& star_shape = *plan.star_shape;
   bool& star_columnar = *plan.star_columnar;
   bool& star_done = *plan.star_done;
+  std::shared_ptr<StarExpansion>& star_def = *plan.star_def;
   if (!any_right && !fast_pk_done) {
     std::unordered_set<const SqlExpr*> star_pushed;
     std::string serr;
@@ -50355,7 +50718,7 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
       bn = rids.size();
     }
     if (star_join(db, sources, join_conditions, join_is_left, where.get(), outer_scope, bp, bn, &star_cols, star_pushed, &serr,
-                  &star_shape)) {
+                  &star_shape, sql_pipe_on() ? &star_def : nullptr)) {
       base_ids_only = false;
       std::vector<uint32_t>().swap(base_ids);
       star_done = true;
@@ -50376,6 +50739,7 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
         star_columnar = true;
         JoinedRows().swap(rows);
       } else {
+        star_expand_into(star_def, star_cols);
         rows = star_materialize(star_cols);
         std::vector<std::vector<uint32_t>>().swap(star_cols);
       }
@@ -51620,6 +51984,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   std::vector<std::vector<uint32_t>> star_cols;
   StarShape star_shape;
   bool star_columnar = false;
+  std::shared_ptr<StarExpansion> star_def;   // the star join unexpanded, for the join aggregate's fused loop (3c.1)
   // The base table's rows as ids alone, not yet JoinedRows: a unique-key join
   // reads them as they are; anything else builds the rows from them first.
   std::vector<uint32_t> base_ids;
@@ -51655,7 +52020,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     plan_add(plan_step("base", sources.empty() ? std::string() : sources[0].alias, base_ids_only ? "row ids" : "rows", rows.size() + base_ids.size()));
     bool star_done = false;
     StarPlan spl{db, &sources, &items, &join_conditions, &join_is_left, any_right, fast_pk_done, &where, &group_by, outer_scope,
-                 &rows, &base_ids, &base_ids_only, &pushed_where_parts, &star_cols, &star_shape, &star_columnar, &star_done};
+                 &rows, &base_ids, &base_ids_only, &pushed_where_parts, &star_cols, &star_shape, &star_columnar, &star_done,
+                 &star_def};
     if (std::optional<SqlQueryResult> r = star_step(spl)) return std::move(*r);
     JoinPlan jp{db, &sources, &items, &join_conditions, &join_is_left, &join_is_right, last_right, any_right, &where, &group_by, &order_by,
                 limit, offset, outer_scope, &src_referenced, star_done, &rows, &rows_hold, &pushed_where_parts, &err};
@@ -51669,7 +52035,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   std::vector<SelectItem> expanded;
   std::vector<bool> ordinal_needed;
   bool aggregated = false;
-  ExpandPlan xpl{db, &sources, &items, &order_by, &group_by, &having, outer_scope, &rows, &star_cols, &star_columnar,
+  ExpandPlan xpl{db, &sources, &items, &order_by, &group_by, &having, outer_scope, &rows, &star_cols, &star_columnar, &star_def,
                  &expanded, &ordinal_needed, &aggregated};
   if (std::optional<SqlQueryResult> r = expand_items(xpl, phases)) return std::move(*r);
 
@@ -51741,7 +52107,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     const std::function<bool(const OutRow&, const OutRow&)> row_less_fn = row_less;
     GroupPlan gp{db, &sources, &items, &expanded, &group_by, &having, &where, &order_by, &order_types, &join_is_left, &ordinal_needed,
                  limit, offset, distinct, aggregated, bounded, keep_bound, outer_scope, col_out, join_sink,
-                 &rows, &star_cols, &star_shape, &star_columnar, &err, &out_rows, &emit_row_fn, &row_less_fn};
+                 &rows, &star_cols, &star_shape, &star_columnar, &star_def, &err, &out_rows, &emit_row_fn, &row_less_fn};
     if (std::optional<SqlQueryResult> r = group_result(gp, phases)) return std::move(*r);
   }
 

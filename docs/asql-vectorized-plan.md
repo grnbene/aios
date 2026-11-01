@@ -205,6 +205,82 @@ programs only 12 leaf-only ones (nothing to compute) and 3 tuple-IN ones still i
 Next in 3: the operators' own loops (the batched join probe, the lane GROUP BY's hash and folds) generated per
 pipeline with the program's code fused in, so a chunk is not written to lanes between them; AArch64 emitter.
 
+### 3c, design: pipelines fused, then compiled
+
+Measured first (warm, the fourth statement of a run under callgrind - the startup warmer re-encodes a column while
+valgrind's slow second and third statements run, so those rebuild the kept maps and decodes and are not warm): open
+orders is 129M instructions a statement, ~29 ms. The star join is 62M of it (its row loop 40M: three row ids written
+per output row into arrays of 257k), the join aggregate 94M (its key loop and folds 45M, zero-filled arrays 12M,
+the ORDER BY .. LIMIT over the groups ~15M). No one line is the cost: it is the shape - every one of 257k output
+rows has its three row ids stored, its key decoded, packed and probed, its group id stored, and then each aggregate
+reads all of that again in batches. And both keys (`o.orderno`, `c.name`) are the order's: they change 86k times,
+not 257k.
+
+What a compiled pipeline is for here, then, is first the shape and only then the instructions:
+
+- **Fused (3c.1).** The star join hands the aggregate its links (`StarExpansion`: the maps, the root rows) instead
+  of materialized row ids, and one loop walks each root row's matches into a morsel of a few thousand rows that
+  stays in cache, computes each row's group (reusing the previous row's group when every key's row is the same
+  row - an order's lines), and folds the morsel's aggregates. No array of N row ids per source, no group id array
+  of N. The expansion is deferred only when it is known to stay below the 2^30 rows the materializing loop gives up
+  at (root rows times each one-to-many map's longest run), so no statement that ran the general join before runs
+  this one now; any consumer that wants rows expands it as before.
+- **Native (3c.2).** The morsel loop's key packing, hash probe and folds emitted per pipeline as x86-64 by the 3a
+  emitter, the aggregate's expression program fused in (no lane between the gather and the fold), with the same
+  bail-to-interpreter rule as 3a.
+- **More shapes (3c.3).** The join steps' batched probe into the lane GROUP BY, as one pipeline.
+- **AArch64 (3c.4).** When there is a toolchain or emulator to run it against the interpreter.
+
+Considered and not taken: generating machine code for the whole pipeline at once, before fusing - the code would
+encode today's materialized shape, and its cost is mostly the shape; LLVM - a dependency of 100+ MB and
+milliseconds of compile per statement against statements of tens of milliseconds, where 3a's emitter compiles a
+program in microseconds.
+
+Checks for every step: `AIOS_SQL_PIPE=0` turns the pipeline off (the operators run as before); the oracle suites,
+the edge sets, the one-to-many and ORDER BY .. LIMIT sets give the same output with it on and off; the
+ERP and frame times are measured against the build before.
+
+### 3c.1, done: the star join aggregate fused
+
+`StarExpansion` holds a star join with one-to-many links unexpanded: its links (`StarLink`, the unique maps and
+the one-to-many CSR maps, now at namespace scope with `star_partner` / `star_rows_of`) and its root rows. The join
+hands it over (`star_join(..., deferred)`) when it is known to stay below 2^30 rows (root rows times each one-to-many
+map's longest run, `StarMultiMap::maxrun`); past that bound the join's own loop runs and gives up at 2^30 as it did.
+Every consumer that wants rows - the select list's rows, a grouping star_aggregate declines, the generic grouping -
+expands it first (`star_expand_into`), into the same arrays in the same order.
+
+`star_aggregate` takes it two ways:
+
+- **Fused**, when every link is unique but the last, which is one-to-many, and no key is read from the last link's
+  rows (open orders: orders -> customers, orders -> lines, grouped by the order and the customer): a root row's
+  partners, its group (one `key_group`: the key decoded, packed and probed), then its run of lines straight into the
+  morsel under that group - only the aggregates' rows and the group id written. A group is made only when its root
+  row has a row (an order with no line under an inner join makes none, as before); its first row's ids are kept for
+  the rows made after (`fparts`). The groups' arrays, first rows and key table are sized once for at most a group a
+  root row; the folds read the morsel in place when no row in it is NULL-padded.
+- **Morsels** otherwise (a key on the many side, two one-to-many links): the rows walked a root row at a time into
+  morsels of ~4096, each grouped (`key_group`, the same code) and folded before the next; the arrays grow (`grow_arrays`).
+
+The key paths are one function now (`key_group`, a row's group found or made from its row ids), used by the
+materialized path as well (one morsel: the arrays whole), so there is one copy of each key rule.
+
+Measured (warm, one statement under callgrind, the warmer settled first): open orders 129M -> 99M instructions.
+Wall, alternating on and off: open orders 29-31 ms against 32-40 off; top customers 8-11 ms against 10-15 (DuckDB:
+34 and 11). A first cut that walked every row generically into per-source vectors and compared each row's keys
+with the one before it was 145M - more than the materialized path - which is why the shape-specific loop exists.
+
+Checked: the ERP queries' answers identical with `AIOS_SQL_PIPE=0` and without; a pipeline edge set (a key on the
+many side, two keys across the one and the many side, COUNT(*) and plain aggregates with no GROUP BY, LEFT joins on
+the unique and the many link with missing partners, an aggregate over two tables that the join aggregate declines
+so the rows are expanded, a two-link many chain, an empty base, HAVING, and a procedure called before, after an
+INSERT into and after a DELETE from the many side) identical with the pipeline on, off, and with the star join off;
+the four oracle suites, the 21 edge sets, the one-to-many and ORDER BY .. LIMIT sets and the frame bytes identical;
+frames alternated with the build before: warm 264-325 ms against 272-335, the first frame 552-599 against 530-622.
+
+Next, 3c.2: the fused loop's per-root work (the partner lookup, the key's decode, pack and probe - ~135
+instructions a root row) and the morsel's folds as x86-64 from the 3a emitter, the aggregate's expression program
+inlined.
+
 ### Between 3a and 3b: what the profile said to remove first
 
 A three-frame profile after 3a (15.0 billion instructions) put ~1.0 billion in work no reader used: zone maps
