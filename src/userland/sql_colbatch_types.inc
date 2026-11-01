@@ -14,27 +14,27 @@
 // DECIMAL(p,s) column (fixed), trailing zeros and an empty fraction dropped for a DOUBLE held scaled.
 inline std::string scaled_decimal_cell(int64_t sv, int places, bool fixed) {
   if (places <= 0) return std::to_string((long long)sv);
+  // the digits written directly (snprintf was ~1100 instructions a cell: 200k DECIMAL totals of a derived table
+  // printed twice to fit its scale were 450M of a 455M-instruction window statement); the same text it made
   const bool neg = sv < 0;
   uint64_t abs_v = neg ? (uint64_t)(-(sv + 1)) + 1 : (uint64_t)sv;
+  if (places > 19) places = 19;                     // a uint64's digits: 10^19 > its range, every place below kept
   uint64_t div = 1;
   for (int i = 0; i < places; ++i) div *= 10;
-  const uint64_t int_part = abs_v / div, frac_part = abs_v % div;
-  char buf[64];
-  if (fixed) {
-    std::snprintf(buf, sizeof(buf), "%s%llu.%0*llu", neg ? "-" : "", (unsigned long long)int_part, places, (unsigned long long)frac_part);
-    return buf;
-  }
-  if (frac_part == 0) {
-    std::snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "", (unsigned long long)int_part);
-    return buf;
-  }
-  char frac_buf[32];
-  std::snprintf(frac_buf, sizeof(frac_buf), "%0*llu", places, (unsigned long long)frac_part);
-  int flen = (int)std::strlen(frac_buf);
-  while (flen > 0 && frac_buf[flen - 1] == '0') frac_buf[--flen] = '\0';
-  if (flen == 0) std::snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "", (unsigned long long)int_part);
-  else std::snprintf(buf, sizeof(buf), "%s%llu.%s", neg ? "-" : "", (unsigned long long)int_part, frac_buf);
-  return buf;
+  uint64_t int_part = abs_v / div, frac_part = abs_v % div;
+  char frac[24];
+  for (int i = places - 1; i >= 0; --i) { frac[i] = (char)('0' + frac_part % 10); frac_part /= 10; }
+  int flen = places;
+  if (!fixed) while (flen > 0 && frac[flen - 1] == '0') --flen;   // a DOUBLE held scaled: trailing zeros dropped
+  char ibuf[24];
+  int ip = 24;
+  do { ibuf[--ip] = (char)('0' + int_part % 10); int_part /= 10; } while (int_part);
+  std::string out;
+  out.reserve((size_t)(neg + (24 - ip) + (flen ? flen + 1 : 0)));
+  if (neg) out.push_back('-');
+  out.append(ibuf + ip, (size_t)(24 - ip));
+  if (flen > 0) { out.push_back('.'); out.append(frac, (size_t)flen); }
+  return out;
 }
 
 struct ColBatch {

@@ -91,7 +91,7 @@ inline int vjit_cast_i(double a, int64_t approx, int64_t* out) {
 }
 
 enum Reg : uint8_t { RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
-enum Cc : uint8_t { CcO = 0, CcB = 2, CcAE = 3, CcE = 4, CcNE = 5, CcBE = 6, CcA = 7, CcS = 8, CcNS = 9, CcP = 0xA, CcNP = 0xB, CcL = 0xC, CcGE = 0xD, CcLE = 0xE, CcG = 0xF };
+enum Cc : uint8_t { CcO = 0, CcNO = 1, CcB = 2, CcAE = 3, CcE = 4, CcNE = 5, CcBE = 6, CcA = 7, CcS = 8, CcNS = 9, CcP = 0xA, CcNP = 0xB, CcL = 0xC, CcGE = 0xD, CcLE = 0xE, CcG = 0xF };
 
 struct Asm {
   std::vector<uint8_t> buf;

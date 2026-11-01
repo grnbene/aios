@@ -40,6 +40,97 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
   };
   for (const PipeFoldAgg& g : aggs) {
     if (g.kind == 0) { add_cnt(&g.cnt, R13); continue; }
+    if (g.kind == 3) {
+      // SUM / AVG of exact arithmetic (INT and fixed-scale DECIMAL columns, + - *): the evaluator's exact value
+      // per row as a scaled integer x at scale S (every intermediate within 2^53, checked when the program was
+      // made: plain 64-bit arithmetic is exact), then what acc_row does with it - num[g] += x / 10^S (the double
+      // its text parses to: both exact, so the division rounds as strtod does), cnt[g] += 1, and while exact[g]:
+      // escale[g] / dscale[g] to S, etot[g] (128 bits) += x, an overflow ending exactness.
+      const size_t K = g.xprog.size();
+      if (K == 0 || K > 16) { if (why) *why = "program size"; return nullptr; }
+      const int32_t frame = (int32_t)(8 * ((K + 1) & ~(size_t)1));
+      a.sub_rsp(frame);
+      base_of(RAX, &g.exact);
+      a.loadb_idx(R11, RAX, R14);                      // R11: still exact
+      a.test(R11, R11);
+      const size_t inexact = a.jcc(CcE);
+      a.mov_imm(RCX, (uint64_t)g.S);
+      base_of(RAX, &g.escale);
+      a.store32_idx4(RAX, R14, RCX);                   // escale: 0 (nothing added yet) or S - S either way
+      base_of(RAX, &g.dscale);
+      a.load32_idx4(RDX, RAX, R14);
+      a.cmp(RDX, RCX);
+      const size_t ds_ok = a.jcc(CcGE);
+      a.store32_idx4(RAX, R14, RCX);
+      a.patch_here(ds_ok);
+      a.patch_here(inexact);
+      base_of(R10, &g.etot);
+      a.mov(RAX, R14);
+      a.shl_imm(RAX, 4);
+      a.add(R10, RAX);
+      a.load(R8, R10, 0);
+      a.load(R9, R10, 8);
+      base_of(RAX, &g.num);
+      a.movsd_load_idx8((Reg)15, RAX, R14);
+      uint64_t pbits;
+      std::memcpy(&pbits, &g.p10, 8);
+      a.mov_imm(RAX, pbits);
+      a.movq_xr((Reg)14, RAX);
+      a.xor_(RCX, RCX);
+      const size_t xtop = a.here();
+      a.cmp(RCX, R13);
+      const size_t xdone = a.jcc(CcAE);
+      a.load32_idx4(RSI, R12, RCX);                    // the row
+      auto scaled = [&](Reg d, uint32_t x, int to) {   // instruction x's value at scale `to`
+        a.load(d, RSP, (int32_t)(8 * x));
+        int up = to - g.xprog[x].scale;
+        if (up > 0) {
+          uint64_t m = 1;
+          while (up-- > 0) m *= 10;
+          a.mov_imm(RBX, m);
+          a.imul(d, RBX);
+        }
+      };
+      for (size_t x = 0; x < K; ++x) {
+        const PipeXIns& in = g.xprog[x];
+        switch (in.op) {
+          case PipeXIns::Leaf:
+            a.mov_imm(RAX, (uint64_t)(uintptr_t)in.col);
+            a.load_idx8(RDX, RAX, RSI);
+            break;
+          case PipeXIns::Add: scaled(RDX, in.a, in.scale); scaled(RAX, in.b, in.scale); a.add(RDX, RAX); break;
+          case PipeXIns::Sub: scaled(RDX, in.a, in.scale); scaled(RAX, in.b, in.scale); a.sub(RDX, RAX); break;
+          case PipeXIns::Mul: a.load(RDX, RSP, (int32_t)(8 * in.a)); a.load(RAX, RSP, (int32_t)(8 * in.b)); a.imul(RDX, RAX); break;
+        }
+        a.store(RSP, (int32_t)(8 * x), RDX);
+      }
+      // x in RDX
+      a.cvtsi2sd((Reg)0, RDX);
+      a.divsd((Reg)0, (Reg)14);
+      a.addsd((Reg)15, (Reg)0);
+      a.test(R11, R11);
+      const size_t no_exact = a.jcc(CcE);
+      a.mov(RAX, RDX);
+      a.sar_imm(RAX, 63);
+      a.add(R8, RDX);
+      a.adc(R9, RAX);
+      const size_t no_ovf = a.jcc(CcNO);
+      a.xor_(R11, R11);                                // the 128-bit total overflowed: no longer exact (it keeps the wrapped sum, as __builtin_add_overflow leaves it)
+      a.patch_here(no_ovf);
+      a.patch_here(no_exact);
+      a.inc(RCX);
+      a.patch(a.jmp(), xtop);
+      a.patch_here(xdone);
+      a.store(R10, 0, R8);
+      a.store(R10, 8, R9);
+      base_of(RAX, &g.num);
+      a.movsd_store_idx8(RAX, R14, (Reg)15);
+      add_cnt(&g.cnt, R13);
+      base_of(RAX, &g.exact);
+      a.storeb_idx(RAX, R14, R11);                     // 0 if it overflowed (or was 0)
+      a.add_rsp(frame);
+      continue;
+    }
     if (g.kind == 2) {
       // SUM / AVG of a typed INT column with no NULL: per row, isum[g] (128 bits) += v, num[g] += (double)v - the
       // fold's own fast path; cnt[g] += the run

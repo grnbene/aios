@@ -129,6 +129,27 @@ void colbatch_each_value(const ColBatch& b, size_t c, Fn&& fn) {
   }
 }
 
+// colbatch_each_value for fit_decimal_scales_with alone: a fixed-scale DECIMAL column (every value printed with all
+// its places) hands over only its largest-magnitude value's text - the fit reads the widest scale (the column's, on
+// every value) and the widest integer part (that value's), so the one value decides what all of them did, without
+// 200k totals printed to find it. Every other column as colbatch_each_value.
+template <typename Fn>
+void colbatch_each_scale_value(const ColBatch& b, size_t c, Fn&& fn) {
+  if (c >= b.cols.size()) return;
+  const ColBatch::Col& col = b.cols[c];
+  if (col.kind != ColBatch::Dec || !col.fixed) { colbatch_each_value(b, c, fn); return; }
+  bool any = false;
+  uint64_t best = 0;
+  size_t at = 0;
+  for (size_t r = 0; r < b.rows; ++r) {
+    if (col.nul[r]) continue;
+    const int64_t v = col.i[r];
+    const uint64_t m = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+    if (!any || m > best) { best = m; at = r; any = true; }
+  }
+  if (any) fn(col.text(at));
+}
+
 bool canonical_int(const std::string& s, int64_t* out);   // with the column encodings, below
 
 // A text or dictionary column of an INT result whose every value is a canonical integer (a literal 0 the

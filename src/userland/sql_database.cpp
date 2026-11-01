@@ -8327,10 +8327,23 @@ struct PipeIns {                       // a vx::NumProg instruction over the man
   double k = 0;                        // Konst
   uint32_t a = 0, b = 0;               // operands (earlier instructions)
 };
+struct PipeXIns {                      // exact arithmetic: a scaled integer per instruction, at a scale fixed when made
+  enum Op : uint8_t { Leaf, Add, Sub, Mul } op = Leaf;
+  const int64_t* col = nullptr;        // Leaf: the column's scaled integers decoded whole, by row
+  uint32_t a = 0, b = 0;
+  int scale = 0;                       // this instruction's scale (Add / Sub: its operands brought up to it)
+};
 struct PipeFoldAgg {
   int kind = 0;                        // 0: a COUNT - the run's rows added to cnt[g]; 1: SUM / AVG of prog;
-                                       // 2: SUM / AVG of a typed INT column with no NULL (isum, num, cnt)
+                                       // 2: SUM / AVG of a typed INT column with no NULL (isum, num, cnt);
+                                       // 3: SUM / AVG of exact arithmetic (xprog: num, cnt, exact, etot, escale, dscale)
   std::vector<PipeIns> prog;
+  std::vector<PipeXIns> xprog;
+  int S = 0;                           // 3: the result's scale, and 10^S
+  double p10 = 1;
+  void* etot = nullptr;
+  int* escale = nullptr;
+  int* dscale = nullptr;
   uint64_t* cnt = nullptr;
   double* num = nullptr;
   uint8_t* exact = nullptr;
@@ -44761,6 +44774,76 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           pf.push_back(std::move(f));
           continue;
         }
+        // SUM / AVG of exact arithmetic over INT and fixed-scale DECIMAL columns (a.agg.prog is only for approximate
+        // arithmetic): the evaluator's exact values, as scaled integers (kind 3)
+        if ((a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && !a.agg.prog && !a.agg.mask && !a.agg.col_rules &&
+            a.agg.src.kind == vx::Source::RowExpr && a.node && a.node->args.size() == 1) {
+          std::vector<vp::PipeXIns> xp;
+          std::vector<double> bound;                   // per instruction: its value's largest magnitude
+          bool xok = true;
+          std::function<int(const SqlExpr*)> mk = [&](const SqlExpr* e) -> int {
+            if (!e || !xok) { xok = false; return -1; }
+            vp::PipeXIns in;
+            double bd = 0;
+            if (e->op == ExprOp::Column) {
+              size_t s0 = 0, c0 = 0;
+              if (lookup_column_here(a.local, *e, &s0, &c0) != ColumnLookup::Found || s0 != 0 || c0 >= mt.col_data.size()) { xok = false; return -1; }
+              const ColumnStore& cs = mt.col_data[c0];
+              const SqlColumn& col = mt.columns[c0];
+              if (vx::has_nulls(cs)) { xok = false; return -1; }
+              if (col.type == SqlDataType::Int && vx::typed_integer(cs)) {
+                in.scale = 0;                          // an INT cell prints as its integer
+              } else if (col.type == SqlDataType::Decimal && cs.encoding == ColumnEncoding::DecimalScaled && cs.decimal_fixed()) {
+                double p = 1;
+                for (int i = 0; i < col.scale; ++i) p *= 10;
+                if (cs.scale_factor != p) { xok = false; return -1; }   // the stored integers at the declared scale, printed with all its places
+                in.scale = col.scale;
+              } else { xok = false; return -1; }
+              auto d = vx::decoded_ints(mt, c0);
+              if (!d) { xok = false; return -1; }
+              in.op = vp::PipeXIns::Leaf;
+              in.col = d->v.data();
+              bd = std::max(std::fabs((double)d->lo), std::fabs((double)d->hi));
+              rholds_fold.push_back(std::move(d));
+            } else if (e->op == ExprOp::Add || e->op == ExprOp::Sub || e->op == ExprOp::Mul) {
+              if (e->args.size() != 2) { xok = false; return -1; }
+              const int ia = mk(e->args[0].get());
+              const int ib = mk(e->args[1].get());
+              if (!xok) return -1;
+              in.a = (uint32_t)ia; in.b = (uint32_t)ib;
+              const int sa = xp[(size_t)ia].scale, sb = xp[(size_t)ib].scale;
+              if (e->op == ExprOp::Mul) {
+                in.op = vp::PipeXIns::Mul;
+                in.scale = sa + sb;
+                bd = bound[(size_t)ia] * bound[(size_t)ib];
+              } else {
+                in.op = e->op == ExprOp::Add ? vp::PipeXIns::Add : vp::PipeXIns::Sub;
+                in.scale = std::max(sa, sb);
+                const double ua = bound[(size_t)ia] * std::pow(10.0, in.scale - sa), ub = bound[(size_t)ib] * std::pow(10.0, in.scale - sb);
+                if (ua >= 9007199254740992.0 || ub >= 9007199254740992.0) { xok = false; return -1; }
+                bd = ua + ub;
+              }
+            } else { xok = false; return -1; }
+            if (bd >= 9007199254740992.0 || in.scale > 18) { xok = false; return -1; }   // 2^53: 64-bit exact, and exact as a double
+            xp.push_back(in);
+            bound.push_back(bd);
+            return (int)xp.size() - 1;
+          };
+          mk(a.node->args[0].get());
+          if (!xok || xp.empty()) { native_why = "an aggregate's arithmetic"; return; }
+          f.kind = 3;
+          f.xprog = std::move(xp);
+          f.S = f.xprog.back().scale;
+          f.p10 = 1;
+          for (int i = 0; i < f.S; ++i) f.p10 *= 10;
+          f.num = a.arr.num.data();
+          f.exact = a.arr.exact.data();
+          f.etot = a.arr.etot.data();
+          f.escale = a.arr.escale.data();
+          f.dscale = a.arr.dscale.data();
+          pf.push_back(std::move(f));
+          continue;
+        }
         if (!((a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.prog && !a.agg.mask)) { native_why = "an aggregate"; return; }
         f.kind = 1;
         f.num = a.arr.num.data();
@@ -44800,7 +44883,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       native = vp::pipe_fold_build_for(pf, &native_why);
     };
     // AIOS_SQL_PIPE_CHECK=1: every run folded again through np_eval (the interpreter) into these, compared at the end
-    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; std::vector<AIOS_INT128> isum; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; };
+    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; std::vector<AIOS_INT128> isum; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; vx::AggArrays A; };
     std::vector<Shadow> shadow;
     auto flush = [&]() {
       if (n == 0) return;
@@ -44829,6 +44912,10 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         pf[ai].cnt = A.cnt.data();
         if (pf[ai].kind == 1) { pf[ai].num = A.num.data(); pf[ai].exact = A.exact.data(); }
         if (pf[ai].kind == 2) { pf[ai].num = A.num.data(); pf[ai].isum = A.isum.data(); }
+        if (pf[ai].kind == 3) {
+          pf[ai].num = A.num.data(); pf[ai].exact = A.exact.data(); pf[ai].etot = A.etot.data();
+          pf[ai].escale = A.escale.data(); pf[ai].dscale = A.dscale.data();
+        }
       }
     };
     if (acap == 0) {
@@ -44857,6 +44944,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         shadow[ai].num.assign(gmax, 0);
         shadow[ai].exact.assign(gmax, 1);
         shadow[ai].isum.assign(gmax, 0);
+        if (pf[ai].kind == 3) vx::init_arrays(aggs[ai]->agg, aggs[ai]->plan, gmax, shadow[ai].A);
         shadow[ai].S.cover = E->bound;
         shadow[ai].S.table = sources[mc].table;
       }
@@ -45005,6 +45093,12 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           for (size_t ai = 0; ai < aggs.size(); ++ai) {
             Shadow& sh = shadow[ai];
             if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            if (pf[ai].kind == 3) {                    // the evaluator itself, row by row (acc_row: rd.val of the expression)
+              const ColumnStore& xcs = sources[mc].table->col_data[aggs[ai]->agg.src.col];
+              for (size_t j = 0; j < cnt; ++j)
+                vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, acols[ai], xcs, aggs[ai]->nulls, *areaders[ai]);
+              continue;
+            }
             if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
               const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
               for (size_t j = 0; j < cnt; ++j) {
@@ -45060,6 +45154,12 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           for (size_t ai = 0; check && ai < aggs.size(); ++ai) {
             Shadow& sh = shadow[ai];
             if (pf[ai].kind == 0) { sh.cnt[g] += cnt; continue; }
+            if (pf[ai].kind == 3) {                    // the evaluator itself, row by row (acc_row: rd.val of the expression)
+              const ColumnStore& xcs = sources[mc].table->col_data[aggs[ai]->agg.src.col];
+              for (size_t j = 0; j < cnt; ++j)
+                vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, acols[ai], xcs, aggs[ai]->nulls, *areaders[ai]);
+              continue;
+            }
             if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
               const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
               for (size_t j = 0; j < cnt; ++j) {
@@ -45116,6 +45216,11 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           bool same = A.cnt[g] == sh.cnt[g];
           if (pf[ai].kind == 1) same = same && std::memcmp(&A.num[g], &sh.num[g], 8) == 0 && A.exact[g] == sh.exact[g];
           if (pf[ai].kind == 2) same = same && A.isum[g] == sh.isum[g] && std::memcmp(&A.num[g], &sh.num[g], 8) == 0;
+          if (pf[ai].kind == 3) {
+            const vx::AggArrays& R = sh.A;
+            same = A.cnt[g] == R.cnt[g] && std::memcmp(&A.num[g], &R.num[g], 8) == 0 && A.exact[g] == R.exact[g] &&
+                   (!A.exact[g] || (A.etot[g] == R.etot[g] && A.escale[g] == R.escale[g] && A.dscale[g] == R.dscale[g]));
+          }
           if (!same) {
             fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native fold differs from np_eval: aggregate %zu, group %zu\n", ai, g);
             abort();
@@ -45186,10 +45291,34 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     const size_t nk = keep->keys.size();
     std::vector<std::vector<int64_t>> kint(nk);       // kinds 2 and 3: a rank or an integer per group
     std::vector<std::vector<uint8_t>> knul(nk);
+    // A SUM key whose every group is exact at one scale and prints at it (a DECIMAL total): the totals' order is their
+    // scaled integers' order, so they are compared as those - no value with its text made per group (81k exact
+    // totals made and compared as decimals were 30 ms); a group with no row is NULL, as finish_arrays makes it.
+    std::vector<std::vector<AIOS_INT128>> kx(nk);
+    for (size_t i = 0; i < nk; ++i) {
+      const StarKeep::Key& k = keep->keys[i];
+      if (k.kind != 1) continue;
+      const A1& a = *aggs[(size_t)key_agg[i]];
+      if (a.agg.kind != vx::Agg::Sum || a.agg.col_rules || a.agg.prog || a.agg.mask || a.arr.etot.size() < G) continue;
+      bool ok = true;
+      int sc = -1;
+      static const AIOS_INT128 kMax = (AIOS_INT128)1000000000000000000LL * (AIOS_INT128)1000000000000000000LL;   // 10^36
+      for (size_t g = 0; g < G && ok; ++g) {
+        if (a.arr.cnt[g] == 0) continue;
+        if (!a.arr.exact[g] || a.arr.escale[g] != a.arr.dscale[g] || (sc >= 0 && a.arr.escale[g] != sc) ||
+            a.arr.etot[g] >= kMax || a.arr.etot[g] <= -kMax) { ok = false; break; }
+        sc = a.arr.escale[g];
+      }
+      if (!ok) continue;
+      kx[i].resize(G);
+      knul[i].assign(G, 0);
+      for (size_t g = 0; g < G; ++g) { if (a.arr.cnt[g] == 0) knul[i][g] = 1; else kx[i][g] = a.arr.etot[g]; }
+    }
     for (size_t i = 0; i < nk; ++i) {
       const StarKeep::Key& k = keep->keys[i];
       if (k.kind == 1) {
         const size_t ai = (size_t)key_agg[i];
+        if (!kx[i].empty()) continue;                  // compared as exact integers
         if (!key_vals[ai].empty()) continue;
         A1& a = *aggs[ai];
         vx::RowReader rd(*sources[a.src].table, a.base);
@@ -45219,7 +45348,14 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       for (size_t i = 0; i < nk; ++i) {
         const StarKeep::Key& k = keep->keys[i];
         int c;
-        if (k.kind == 1) {
+        if (k.kind == 1 && !kx[i].empty()) {
+          const bool xa = knul[i][a], xb = knul[i][b];
+          if (xa && xb) continue;
+          if (xa) return !k.desc;
+          if (xb) return k.desc;
+          const AIOS_INT128 x = kx[i][a], y = kx[i][b];
+          c = x < y ? -1 : x > y ? 1 : 0;
+        } else if (k.kind == 1) {
           const Val& x = key_vals[(size_t)key_agg[i]][a];
           const Val& y = key_vals[(size_t)key_agg[i]][b];
           if (x.null && y.null) continue;
@@ -52083,7 +52219,7 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
           col.declared_text = ci < dres.column_is_string.size() && dres.column_is_string[ci];
           ephem->columns.push_back(col);
         }
-        if (d_in_batch) fit_decimal_scales_with(ephem->columns, [&](size_t c, auto&& fn) { colbatch_each_value(dbatch, c, fn); });
+        if (d_in_batch) fit_decimal_scales_with(ephem->columns, [&](size_t c, auto&& fn) { colbatch_each_scale_value(dbatch, c, fn); });
         else fit_decimal_scales(ephem->columns, dres.rows);
         ephem->ensure_columns();
         ephem->reserve(d_in_batch ? dbatch.rows : dres.rows.size());
