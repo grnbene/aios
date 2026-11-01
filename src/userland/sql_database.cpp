@@ -46760,7 +46760,17 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       // the digitless rows too, through probe_gather_matches), the same ON, prefilter, WHERE and padding.
       // Not for a key whose numbers a double may not carry (best_wide), a dictionary-code or parent/child link,
       // or a key held as text. AIOS_SQL_BATCH_JOIN=0 turns it off.
-      struct NumKey { const vp::Column* lane = nullptr; const ColumnStore* cs = nullptr; size_t src = 0; bool ints = false; };
+      struct NumKey {
+        const vp::Column* lane = nullptr;
+        const ColumnStore* cs = nullptr;
+        size_t src = 0;
+        bool ints = false;
+        bool konst = false;                              // a Constant-encoded column: every row holds kval
+        double kval = 0;
+        std::shared_ptr<const StarCodeMap> cmap;         // a text key beside the probing one: its codes mapped to the joined column's
+        bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
+        double jkval = 0;
+      };
       std::vector<NumKey> numkeys(prep_jkeys.size());
       static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
       // (a direct code join probes its key by dictionary code, below; its other keys as numbers)
@@ -46784,18 +46794,48 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           // result table's (its values are canonical)
           const bool numeric_type = kc < bt.columns.size() && !bt.columns[kc].temporal &&
                                     (bt.columns[kc].type == SqlDataType::Int || (typed_dbl && bt.columns[kc].type == SqlDataType::Real && bt.columns[kc].scale == 0));
-          if (!numeric_type || bcs.size() != bt.row_count() ||
+          // a Constant-encoded INT column (a map_id that is 1 in every row): its one value
+          if ((int)ki != best_ki && bcs.encoding == ColumnEncoding::Constant && kc < bt.columns.size() && !bt.columns[kc].temporal &&
+              bt.columns[kc].type == SqlDataType::Int && bcs.size() == bt.row_count() && !sql_is_null(bcs.constant_val)) {
+            double kv = 0;
+            if (parse_number(bcs.constant_val, &kv)) { nk.cs = &bcs; nk.src = ks; nk.konst = true; nk.kval = kv; nk.ints = true; }
+          }
+          // a text key beside the probing one, both dictionary-coded: compared by dictionary code through the star
+          // code map (collation equality, as the interpreter compares two texts)
+          if ((int)ki != best_ki && !nk.konst && prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
+            StarKey pk, ck;
+            if (star_key_of(bt, kc, &pk) && star_key_of(*js.table, (size_t)prep_jkeys[ki].column, &ck) && pk.text && ck.text) {
+              std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck);
+              if (m && m->ok) { nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m); }
+            }
+          }
+          if (nk.konst || nk.cmap) {
+            // the joined side is checked below, as every key's is
+          } else if (!numeric_type || bcs.size() != bt.row_count() ||
               !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) {
             batch_ok = false;
             if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + bt.name + "." + (kc < bt.columns.size() ? bt.columns[kc].name : "?") +
                                         ") is not a number this row has: " + vx_encoding_name(bcs.encoding) + (numeric_type ? "" : ", not a number type"));
             break;
+          } else {
+            nk.cs = &bcs;
+            nk.src = ks;
+            nk.ints = !typed_dbl;
           }
-          nk.cs = &bcs;
-          nk.src = ks;
-          nk.ints = !typed_dbl;
         }
-        if ((int)ki != best_ki && !key_typed[ki]) batch_ok = false;
+        // the joined side of a key beside the probing one: a typed number, a Constant-encoded INT (its one value), or
+        // the text column a code map reaches
+        if ((int)ki != best_ki && !key_typed[ki] && !nk.cmap) {
+          const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+          double jv = 0;
+          if (kcs.encoding == ColumnEncoding::Constant && !js.table->inferred_types && js.table->columns[(size_t)prep_jkeys[ki].column].type == SqlDataType::Int &&
+              !sql_is_null(kcs.constant_val) && parse_number(kcs.constant_val, &jv)) { nk.jkonst = true; nk.jkval = jv; }
+          else {
+            batch_ok = false;
+            if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + js.table->name + "." + js.table->columns[(size_t)prep_jkeys[ki].column].name +
+                                        ") is not a number the joined table holds typed: " + vx_encoding_name(kcs.encoding));
+          }
+        }
       }
       if (vx_trace_on() && best_ki >= 0 && !batch_ok)
         vx_trace("join: +" + js.alias + " not batched: " + (!batch_join_on ? "off" : !prep_jkeys[(size_t)best_ki].idx ? "no index" : link_to_parent || link_to_kids ? "active link" :
@@ -46823,7 +46863,32 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         }
         const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
         if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
+        if (k.konst) { *out = k.kval; return true; }
         *out = k.ints ? (double)vx::typed_int(*k.cs, r) : vx::typed_value(*k.cs, r);
+        return true;
+      };
+      // Whether joined row mr meets base row bi on every key beside the probing one: numbers as numbers (a
+      // Constant column's one value either side), a text key by its code through the code map.
+      auto other_keys_match = [&](size_t bi, const JoinedRow& base, size_t mr) -> bool {
+        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+          if ((int)ki == best_ki) continue;
+          const NumKey& nk = numkeys[ki];
+          const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+          if (nk.cmap) {
+            const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
+            if (r == kNullRow || r >= nk.cs->size() || nk.cs->is_null(r)) return false;
+            const uint32_t ca = vx::code_at(*nk.cs, r);
+            if (ca >= nk.cmap->p2c.size()) return false;
+            const int32_t cb = nk.cmap->p2c[ca];
+            if (cb < 0 || kcs.is_null(mr) || vx::code_at(kcs, mr) != (uint32_t)cb) return false;
+            continue;
+          }
+          double w = 0;
+          if (!numkey(nk, bi, base, &w)) return false;
+          if (kcs.is_null(mr)) return false;
+          if (nk.jkonst) { if (nk.jkval != w) return false; continue; }
+          if (vx::typed_value(kcs, mr) != w) return false;
+        }
         return true;
       };
       // Several keys: the joined rows by all of them at once, built for this step by walking the probing key's
@@ -46844,7 +46909,9 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       };
       std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
       bool comp_ok = false;
-      if (batch_ok && !direct_code_join && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
+      bool plain_other_keys = true;   // composite hashing reads the other keys as typed numbers only
+      for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst)) plain_other_keys = false;
+      if (batch_ok && !direct_code_join && plain_other_keys && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
         const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
         if (bidx->no_numeric_prefix.empty()) {
           comp.reserve(bidx->by_number.size() * 2);
@@ -46932,15 +46999,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
                 const std::vector<uint32_t>& cands = idx->by_code[(size_t)cb];
                 for (uint32_t mr : cands) {
                   if (mr >= js.table->row_count()) continue;
-                  bool other_ok = true;
-                  for (size_t ki = 0; ki < prep_jkeys.size() && other_ok; ++ki) {
-                    if ((int)ki == best_ki) continue;
-                    double w = 0;
-                    if (!numkey(numkeys[ki], bi, base, &w)) { other_ok = false; break; }
-                    const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-                    if (kcs.is_null(mr) || vx::typed_value(kcs, mr) != w) other_ok = false;
-                  }
-                  if (!other_ok) continue;
+                  if (!other_keys_match(bi, base, mr)) continue;
                   JoinedRow cand;
                   const bool made = cand_checks || sink;
                   if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
@@ -46959,13 +47018,7 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         } else if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
           auto take = [&](size_t mr) {
             if (mr >= js.table->row_count()) return;
-            for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-              if ((int)ki == best_ki) continue;
-              double w = 0;
-              if (!numkey(numkeys[ki], bi, base, &w)) return;
-              const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-              if (kcs.is_null(mr) || vx::typed_value(kcs, mr) != w) return;
-            }
+            if (!other_keys_match(bi, base, mr)) return;
             JoinedRow cand;
             const bool made = cand_checks || sink;
             if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }

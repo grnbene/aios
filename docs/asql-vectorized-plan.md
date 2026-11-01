@@ -379,6 +379,21 @@ text) and one for residual ON conditions (LEFT / RIGHT / inner, base-only and tw
 conjuncts, numeric-prefix text keys, pushed WHERE with padding, a three-table chain) are identical to the build
 before.
 
+Keys beside the probing one, where the batched probe refused the join: a Constant-encoded INT column (a map_id
+that is 1 in every row, on either side - a result table's or a declared one's) is its one value, parsed once; a
+text key whose both sides are star-keyable (dictionary-coded, plain text) is compared by dictionary code through
+the star code map, as the direct code join compares its probing key. One check (`other_keys_match`) serves the
+numeric and the direct-code probe; the composite hash is built only over keys read as typed numbers. The three-key
+join of bsp_order (map_id, node_id, side) and the ones over player_state.map_id are batched now: 63 -> 118 batched
+joins a run, bsp_order 8.6 -> 5.8 ms. Medians 501/502 -> 294/283/287 ms against 5cab6ef (a slower machine
+hour than the rows above; the pairs ran alternating). The first version of this skipped the joined side's check
+for a Constant base key and read a Constant joined column as 0: frames came out black, which the frame-bytes
+comparison caught before anything else did; the isolated join (node_children to node_path_steps) returned 0 rows
+for 2228. A set for these keys (Constant both sides equal and unequal, Constant against a varying column either
+way, three keys, text beside a number, text beside a Constant, LEFT JOIN padding, LOWER() on the text key, the
+keys in WHERE) is identical to the build before, as are frame bytes, the differential native check over the
+frames, the four oracle suites, the lane / mixed / decimal checks and the edge sets above.
+
 
 Vectorized operators stay the default; a pipeline the plan marks as hot - many rows through a chain of scan,
 filter, join probe and aggregate whose expressions already compile as programs - is compiled to native code
