@@ -110,7 +110,7 @@ at hand - and prints one line a step with rows and time; the table of invented t
 Known gaps, for 2b: a subquery that fills an IN / EXISTS set appears as its own flat steps, not nested; the
 single-table engine is one step with no inner detail; a window statement's inner plan follows the `window` step.
 
-### Stage 2b, in progress: operators out of the select function
+### Stage 2b, done: operators out of the select function
 
 Each phase's code moves verbatim into a static operator function taking its inputs as a plan struct, in
 `sql_database.cpp` for now: the operators use its file-local types (`Val`, `SqlExpr`, `EvalCtx`, `JoinedRow`), and
@@ -139,11 +139,43 @@ against the build before, the suites, the frame's bytes and alternating frame ti
   lanes or through probe indexes and zone maps, semi-joins against the joined tables, rows as ids alone where the
   joins can take them). The select function 78,167 -> 63,657 bytes, `base_rows` 21,008; 4,975 of 5,048 functions
   the same size; frames 497/508/503 -> 496/497/512 ms.
-- what is left (2,000 lines): **setup** - the sources resolved and materialized (CTEs, derived tables, LATERAL,
-  merged views), the branch rewritten, the join order fixed (983 lines, reads only the branch) - which is the
-  planner, not an operator: its output is the state the operators take; the fast paths and the single-table
-  engine's call; the star join; the residual WHERE and the select-list expansion. Step 2c makes the setup's output
-  a `SelectRun` struct the operators' plans point into, and the function the driver that walks it.
+- **star** (done): `StarPlan` + `star_step` - the star join over the base rows, the arrays kept for a grouping
+  that can read them or made into rows; the base row ids made into rows for the join steps otherwise.
+- **filter** (done): `FilterPlan` + `residual_filter` - the WHERE parts no join step applied (the split moved in
+  from the end of the joins; with no sources nothing was pushed, so it is the same split), over the joined rows.
+- **expand** (done): `ExpandPlan` + `expand_items` - `*` expanded, ORDER BY / GROUP BY / HAVING names of select
+  aliases resolved, the ordinals the sort reads, whether the statement groups, a HAVING with no aggregate applied.
+- **fast paths** (done): `FastPlan` + `fast_paths` - COUNT(*) from the row count, the single-table engine, the
+  streaming GROUP BY; `PkPlan` + `pk_rows` - the primary-key equality through the row index.
+- `referenced_sources` - which sources the statement reads (the join steps skip an unread LEFT JOIN).
+
+The moves were checked as before: the sorted-line diff against the build before shows only the glue (plan
+structs, their unpacking, the calls) and the declarations that became references into `SelectRun`; every suite
+(the four oracle suites, the 21 edge sets, the one-to-many and ORDER BY .. LIMIT sets) and the frame's bytes
+identical; frames alternated with the build before, in both orders: warm frames 274-320 ms before, 270-328 after; the first (cold) frame 520-587 before, 508-565 after. The small operators have one caller each and are
+inlined back into the driver; `plan_select` and the operators of the earlier moves stay functions of their own.
+
+### Stage 2c, done: SelectRun and the driver
+
+The setup (1,040 lines: USING joins, decorrelated EXISTS, merged views, materialized views, derived tables,
+LATERAL and series, the sources resolved and their columns checked, RIGHT JOIN as LEFT, the join swap, the join
+kinds, the clauses, MariaDB's implicit GROUP BY order) is `plan_select`, the planner. Its output is `SelectRun`:
+the rewritten branch, the derived tables and the CTE scopes they pushed (`SelectEphemGuard`), the sources, the
+join kinds, the clauses - held in `execute_parsed_select_single`'s frame for the whole statement, its members in
+the order the function declared them, so they are released in the same order. Its declarations became references
+into it, nothing else in it changed.
+
+`execute_parsed_select_single` is the driver: the entry rewrites that rerun the statement in another form (a
+window; ORDER BY the clustered key .. LIMIT; LIMIT in the clustered key's order), then `plan_select`, and then
+the operators in turn - `fast_paths`, `pk_rows`, `base_rows`, `referenced_sources`, `star_step`, `join_steps`,
+`residual_filter`, `expand_items`, then `project_rows` or `group_result`, and `emit_result` - with the trace, the
+EXPLAIN steps and the sort's bounded heap (the keys' types, the comparison, the bound) between them. Its code
+went from 65,737 to 20,675 bytes; `plan_select` is 49,727.
+
+What the compiler needs next comes from this shape: a statement is a `SelectRun` plus a fixed sequence of
+operator calls, each taking a plan struct that points into it, so a pipeline (base -> star or join steps ->
+group) can be recognized from the `SelectRun` and replaced as a whole by compiled code, falling back to the
+operators wherever it is not one the compiler takes.
 
 ## Stage 3: compiled pipelines over the plan (decided: both)
 

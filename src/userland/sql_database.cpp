@@ -49821,115 +49821,628 @@ static std::optional<SqlQueryResult> base_rows(const BasePlan& plan, PhaseClock&
   return std::nullopt;
 }
 
-SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
-  const SqlDatabase* outer_type_db = g_type_db;
-  g_type_db = db;
-  struct TypeDbBack { const SqlDatabase* prev; ~TypeDbBack() { g_type_db = prev; } } type_db_back{outer_type_db};
-  // The statement's row sink, when it is a join or single-table: this is the top select (the
-  // first to start), and nothing nested may see it.
-  SqlRowSink* const join_sink = g_join_sink ? g_join_sink : g_vx_sink;
-  g_join_sink = nullptr;
-  g_vx_sink = nullptr;
-  // A consumer's request for the answer as a typed batch (sql_colbatch.inc): this is the top select, so it is
-  // taken here and nothing nested sees it. Paths that cannot fill it return rows, as before.
-  ColBatch* const col_out = take_col_out();
-  // `@v := ...` in it: rows are evaluated one at a time, in order, on this
-  // thread - the variable carries from one row to the next.
-  bool assigns = expr_assigns(raw_branch.where.get()) || expr_assigns(raw_branch.having.get());
-  for (const auto& it : raw_branch.items) assigns = assigns || expr_assigns(it.expr.get());
-  struct SerialScope {
-    bool on, was;
-    explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
-    ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
-  } serial_scope(assigns);
-  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out); }
-  // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
-  // table whose rows are in key order: the answer is a run of rows at one end
-  // of the table. The statement is run with a key range that holds just that
-  // run (zone maps skip the rest), where it sorted every row before - 4.5 ms
-  // for 300k rows against InnoDB's 0.5 ms along its index.
-  if (raw_branch.order_by.size() == 1 && raw_branch.limit >= 0 && !raw_branch.where && raw_branch.group_by.empty() &&
-      !raw_branch.having && !raw_branch.distinct && raw_branch.sources.size() == 1 && !raw_branch.sources[0].is_derived() &&
-      !assigns && raw_branch.windows.empty() && raw_branch.order_by[0].expr && raw_branch.order_by[0].expr->op == ExprOp::Column &&
-      !db->find_view(raw_branch.sources[0].table_name) && !find_cte_table(raw_branch.sources[0].table_name)) {
-    bool agg = false;
-    for (const auto& it : raw_branch.items) agg = agg || (it.expr && (expr_has_aggregate(it.expr) || it.expr->window));
-    const SqlTable* t = agg ? nullptr : db->resolve_table(raw_branch.sources[0].table_name);
-    if (t && !t->inferred_types && t->scan_order_key().empty()) {
-      const std::vector<size_t> cols = t->cluster_columns();
-      const OrderKey& ok = raw_branch.order_by[0];
-      const auto& src = raw_branch.sources[0];
-      const bool qual_ok = ok.expr->qualifier.empty() || lower_of(ok.expr->qualifier) == lower_of(src.alias) ||
-                           lower_of(ok.expr->qualifier) == lower_of(last_name_part(src.table_name));
-      if (cols.size() == 1 && qual_ok && lower_of(t->columns[cols[0]].name) == lower_of(ok.expr->name) &&
-          sql_type_numeric(t->columns[cols[0]].type) && !t->columns[cols[0]].temporal) {
-        const size_t n = t->row_count();
-        const long long off = std::max<long long>(0, raw_branch.offset);
-        if (n > 0 && (size_t)off < n && raw_branch.limit > 0 && (size_t)off + (size_t)raw_branch.limit < n) {
-          const size_t pivot = ok.descending ? n - 1 - (size_t)off : (size_t)off;
-          const std::string v = t->cell(pivot, cols[0]);
-          if (!sql_is_null(v)) {
-            auto key = std::make_shared<SqlExpr>();
-            key->op = ExprOp::Column;
-            key->name = t->columns[cols[0]].name;
-            key->qualifier = src.alias.empty() ? last_name_part(src.table_name) : src.alias;
-            key->source_text = key->qualifier + "." + key->name;
-            auto lit = std::make_shared<SqlExpr>();
-            lit->op = ExprOp::Literal;
-            lit->literal = val_cell(v);
-            lit->source_text = v;
-            auto cmp = std::make_shared<SqlExpr>();
-            cmp->op = ok.descending ? ExprOp::Le : ExprOp::Ge;
-            cmp->args = {key, lit};
-            ParsedSelectBranch b = raw_branch;
-            b.where = cmp;
-            b.offset = 0;
-            return execute_parsed_select_single(db, b);
-          }
+struct PkPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<ExprPtr>* join_conditions;
+  const ExprPtr* where;
+  const std::vector<ExprPtr>* group_by;
+  JoinedRows* rows;
+  bool* fast_pk_done;
+};
+// One table, its WHERE an equality on the whole primary key: the row (or none) through the table's row index.
+// *fast_pk_done when it answered, and the base selection and joins are skipped.
+static void pk_rows(const PkPlan& plan) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<ExprPtr>& join_conditions = *plan.join_conditions;
+  const ExprPtr& where = *plan.where;
+  const std::vector<ExprPtr>& group_by = *plan.group_by;
+  JoinedRows& rows = *plan.rows;
+  bool& fast_pk_done = *plan.fast_pk_done;
+  if (sources.size() == 1 && join_conditions.empty() && group_by.empty() && where) {
+    std::vector<int> src_pk_cols;
+    for (size_t i = 0; i < sources[0].table->columns.size(); ++i) {
+      if (sources[0].table->columns[i].is_primary_key) src_pk_cols.push_back((int)i);
+    }
+    std::string sel_pk_key;
+    if (extract_pk_equality(where, *sources[0].table, src_pk_cols, sel_pk_key)) {
+      std::shared_ptr<RowIndex> idx_ptr = SelectEngine::find_row_index(db, *sources[0].table);
+      if (idx_ptr) {
+        RowIndex& idx = *idx_ptr;
+        auto hit = idx.pk_to_row.find(sel_pk_key);
+        if (hit != idx.pk_to_row.end() && idx.row_of(hit->second) < sources[0].table->row_count()) {
+          JoinedRow jr;
+          jr.parts.push_back(idx.row_of(hit->second));
+          rows.push_back(std::move(jr));
         }
+        fast_pk_done = true;
       }
     }
   }
-  // SELECT ... LIMIT n with no ORDER BY reads a table in its clustered key's
-  // order, as InnoDB does: rows written since the table was last clustered
-  // sit at its end in the order they came, so the LIMIT took 3, 1, 2 where
-  // MariaDB gives 1, 2, 3. Only then is the key's order asked for.
-  if (raw_branch.order_by.empty() && raw_branch.limit >= 0 && raw_branch.group_by.empty() && !raw_branch.having &&
-      !raw_branch.distinct && raw_branch.sources.size() == 1 && !raw_branch.sources[0].is_derived() && !assigns &&
-      !db->find_view(raw_branch.sources[0].table_name)) {
-    bool agg = false;
-    for (const auto& it : raw_branch.items) agg = agg || expr_has_aggregate(it.expr);
-    const SqlTable* t = agg ? nullptr : db->resolve_table(raw_branch.sources[0].table_name);
-    if (t && !t->inferred_types) {
-      const std::vector<size_t> key = t->scan_order_key();
-      if (!key.empty()) {
-        ParsedSelectBranch b = raw_branch;
-        const auto& src = raw_branch.sources[0];
-        for (size_t c : key) {
-          auto e = std::make_shared<SqlExpr>();
-          e->op = ExprOp::Column;
-          e->name = t->columns[c].name;
-          e->qualifier = src.alias.empty() ? t->name : src.alias;
-          e->source_text = e->qualifier + "." + e->name;
-          OrderKey k;
-          k.expr = e;
-          b.order_by.push_back(k);
-        }
-        return execute_parsed_select_single(db, b);
-      }
-    }
-  }
-  // Phase clock for AIOS_VX_TRACE (top-level statements only).
-  // Fixes the instant NOW() reports for this statement and every subquery under
-  // it; nested calls read the outermost one's clock rather than restarting it.
-  StatementClock stmt_clock;
-  // The query this one is nested inside, if a subquery is what asked for it.
-  const EvalCtx* outer_scope = current_outer_scope();
-  PhaseClock phases(vx_trace_on() && !outer_scope);
+}
 
-  const ParsedSelectBranch* branch_ptr = &raw_branch;
+// The sources the statement reads: in its select list (a `*` reads all it names), WHERE, GROUP BY, HAVING, ORDER BY,
+// and the ON of every join after the source (a LEFT JOIN nothing reads is skipped by the join steps).
+static void referenced_sources(const std::vector<QuerySource>& sources, const std::vector<SelectItem>& items, const ExprPtr& where,
+                               const std::vector<ExprPtr>& group_by, const ExprPtr& having, const std::vector<OrderKey>& order_by,
+                               const std::vector<ExprPtr>& join_conditions, std::vector<bool>& src_referenced) {
+  src_referenced.assign(sources.size(), false);
+  auto mark_src_ref = [&](const SqlExpr* e, auto& self) -> void {
+    if (!e) return;
+    if (e->op == ExprOp::Column) {
+      size_t s = 0, c = 0;
+      EvalCtx all_ctx; all_ctx.sources = &sources;
+      if (resolve_column(all_ctx, *e, &s, &c)) {
+        if (s < src_referenced.size()) src_referenced[s] = true;
+      }
+    }
+    for (const auto& a : e->args) self(a.get(), self);
+  };
+
+  for (const auto& itm : items) {
+    if (itm.expr) mark_src_ref(itm.expr.get(), mark_src_ref);
+    if (itm.star) {
+      for (size_t s = 0; s < sources.size(); ++s) {
+        if (itm.star_qualifier.empty() || lower_of(sources[s].alias) == lower_of(itm.star_qualifier)) {
+          src_referenced[s] = true;
+        }
+      }
+    }
+  }
+  if (where) mark_src_ref(where.get(), mark_src_ref);
+  for (const auto& g : group_by) mark_src_ref(g.get(), mark_src_ref);
+  if (having) mark_src_ref(having.get(), mark_src_ref);
+  for (const auto& o : order_by) {
+    if (o.expr) mark_src_ref(o.expr.get(), mark_src_ref);
+  }
+  // Every join's ON needs the tables before it that it names: an inner join
+  // always runs, and so does a left join that is not skipped. Marking only
+  // the ON of joins that were themselves referenced let `a LEFT JOIN b ON ..
+  // JOIN c ON b.x = c.y` skip b (nothing but c's ON reads it), so c joined
+  // against NULLs and COUNT(*) was 0 - st's ClubWithSalesman, 0 vs 41532.
+  // The joined table's own columns in its ON do not count as a use of it, or
+  // no unread left join could ever be skipped.
+  for (int j = (int)join_conditions.size() - 1; j >= 0; --j) {
+    if (!join_conditions[j]) continue;
+    const bool self = src_referenced[j + 1];
+    mark_src_ref(join_conditions[j].get(), mark_src_ref);
+    src_referenced[j + 1] = self;
+  }
+}
+
+struct FastPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* items;
+  const std::vector<ExprPtr>* join_conditions;
+  const ExprPtr* where;
+  const std::vector<ExprPtr>* group_by;
+  const ExprPtr* having;
+  const std::vector<OrderKey>* order_by;
+  long long limit, offset;
+  bool distinct;
+  const EvalCtx* outer_scope;
+  SqlRowSink* join_sink;
+  ColBatch* col_out;
+};
+// One table, answered whole by a path of its own: COUNT(*) from the row count, the single-table engine
+// (try_vx_single_table), the streaming GROUP BY. A result: the answer (or an error); empty: on to the joins.
+static std::optional<SqlQueryResult> fast_paths(const FastPlan& plan) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<SelectItem>& items = *plan.items;
+  const std::vector<ExprPtr>& join_conditions = *plan.join_conditions;
+  const ExprPtr& where = *plan.where;
+  const std::vector<ExprPtr>& group_by = *plan.group_by;
+  const ExprPtr& having = *plan.having;
+  const std::vector<OrderKey>& order_by = *plan.order_by;
+  const long long limit = plan.limit, offset = plan.offset;
+  const bool distinct = plan.distinct;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  SqlRowSink* const join_sink = plan.join_sink;
+  ColBatch* const col_out = plan.col_out;
+  if (sources.size() == 1 && join_conditions.empty() && sources[0].table &&
+      !where && group_by.empty() && having == nullptr && !distinct) {
+    bool all_count_star = !items.empty();
+    for (const auto& it : items) {
+      if (it.star || !it.expr || it.expr->op != ExprOp::Func || upper_of(it.expr->name) != "COUNT" ||
+          it.expr->negated || it.expr->window) {   // COUNT(DISTINCT 1) is 1; COUNT(*) OVER () is per row
+        all_count_star = false; break;
+      }
+      const auto& args = it.expr->args;
+      bool is_cs = args.empty() || (args.size() == 1 && (args[0]->op == ExprOp::Star || (args[0]->op == ExprOp::Literal && !args[0]->literal.null)));
+      if (!is_cs) { all_count_star = false; break; }
+    }
+    if (all_count_star && (limit < 0 || limit >= 1) && offset <= 0) {
+      plan_add(plan_step("count(*)", sources[0].alias, "the table's row count", 1));
+      SqlQueryResult res;
+      res.is_result_set = true;
+      res.success = true;
+      for (const auto& it : items) {
+        std::string col_name = it.label.empty() ? it.expr->source_text : it.label;
+        res.columns.push_back(col_name);
+        res.column_types.push_back(SqlDataType::Int);
+        res.column_is_string.push_back(0);
+        SqlColumnOrigin org;
+        org.mysql_type = 8; // MYSQL_TYPE_LONGLONG
+        res.column_origins.push_back(org);
+      }
+      SqlRow row;
+      for (size_t i = 0; i < items.size(); ++i) {
+        row.values.push_back(std::to_string(sources[0].table->row_count()));
+      }
+      res.rows.push_back(std::move(row));
+      res.rows_affected = 1;
+      res.formatted_table = SelectEngine::format_result_table(db, res.columns, res.rows);
+      return res;
+    }
+  }
+
+  // The single-table paths below read the statement's sink from g_vx_sink, which this function took into join_sink
+  // above: handed to them, they stream a big answer straight from its columns into packets; they give it back when
+  // they cannot stream (their SinkRestorer), and it is taken back here. Never handed over, every single-table SELECT
+  // built all its rows first (a 1.46M-row SELECT held 670 MB of them) and the sink only sent the finished vector.
+  auto lend_sink = [&] { if (sources.size() == 1 && !outer_scope) g_vx_sink = join_sink; };
+  auto take_sink = [&] { g_vx_sink = nullptr; };
+  if (sources.size() == 1 && join_conditions.empty() && sources[0].table && !sql_no_vx_env()) {
+    SqlQueryResult vx_res;
+    lend_sink();
+    g_vx_col_out = col_out;   // the request, lent for this call only
+    const bool answered = try_vx_single_table(db, sources[0], items, where, group_by, having, order_by, limit, offset, distinct,
+                                              outer_scope, &vx_res);
+    g_vx_col_out = nullptr;
+    take_sink();
+    if (answered) {
+      plan_add(plan_step("single-table", sources[0].alias, vx_res.execution_route.empty() ? "vectorized" : vx_res.execution_route,
+                         vx_res.rows_in_batch && col_out && col_out->filled ? col_out->rows
+                         : vx_res.rows.empty() ? (size_t)vx_res.rows_affected : vx_res.rows.size()));
+      return vx_res;
+    }
+  }
+  if (sources.size() == 1 && join_conditions.empty() && group_by.size() == 1 && !distinct && having == nullptr) {
+    SqlQueryResult fast_res;
+    lend_sink();
+    const bool answered = try_fast_streaming_groupby(db, *sources[0].table, sources[0].alias, items, where, group_by, order_by, limit, offset, outer_scope, &fast_res);
+    take_sink();
+    if (answered) {
+      plan_add(plan_step("single-table", sources[0].alias, "streaming group by", fast_res.rows.size()));
+      return fast_res;
+    }
+  }
+
+  return std::nullopt;
+}
+
+struct ExpandPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* items;
+  std::vector<OrderKey>* order_by;
+  std::vector<ExprPtr>* group_by;
+  ExprPtr* having;
+  const EvalCtx* outer_scope;
+  JoinedRows* rows;
+  std::vector<std::vector<uint32_t>>* star_cols;
+  bool* star_columnar;
+  std::vector<SelectItem>* expanded;     // out: the select list with `*` expanded
+  std::vector<bool>* ordinal_needed;     // out: the items an ORDER BY ordinal names
+  bool* aggregated;                      // out: the statement groups
+};
+// The select list made concrete: `*` expanded, ORDER BY / GROUP BY / HAVING names of select aliases resolved, the
+// ordinals the sort reads, whether the statement groups; a HAVING with no aggregate applied to the rows here.
+// Empty: on; a result: an error to return.
+static std::optional<SqlQueryResult> expand_items(const ExpandPlan& plan, PhaseClock& phases) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<SelectItem>& items = *plan.items;
+  std::vector<OrderKey>& order_by = *plan.order_by;
+  std::vector<ExprPtr>& group_by = *plan.group_by;
+  ExprPtr& having = *plan.having;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  JoinedRows& rows = *plan.rows;
+  std::vector<std::vector<uint32_t>>& star_cols = *plan.star_cols;
+  bool& star_columnar = *plan.star_columnar;
+  std::vector<SelectItem>& expanded = *plan.expanded;
+  std::vector<bool>& ordinal_needed = *plan.ordinal_needed;
+  bool& aggregated = *plan.aggregated;
+  // Expand `*` into the real column list now that the sources are known.
+  // A table's expansion at a given position is the same for every statement
+  // that names it there, so each thread keeps the last few and copies them:
+  // building 100 column expressions was 23 us of a 90 us one-row lookup,
+  // and the ERP asks for `salesorders.*, custbranch.*` once per order.
+  // The copies share the expressions; their bindings are re-asserted, since
+  // a resolver may write them, and a thread never shares with another.
+  struct StarProto {
+    uint64_t schema_gen; const SqlTable* table; size_t si; bool qualify; size_t ncols; std::string alias;
+    std::vector<SelectItem> items;
+  };
+  thread_local std::vector<StarProto> star_protos;
+  const uint64_t schema_gen = db->schema_generation();
+  for (const SelectItem& it : items) {
+    if (!it.star) { expanded.push_back(it); continue; }
+    bool any = false;
+    for (size_t si = 0; si < sources.size(); ++si) {
+      const QuerySource& s = sources[si];
+      if (!it.star_qualifier.empty() && lower_of(s.alias) != lower_of(it.star_qualifier)) continue;
+      any = true;
+      const bool qualify = sources.size() > 1;
+      StarProto* proto = nullptr;
+      for (StarProto& p : star_protos)
+        if (p.table == s.table && p.si == si && p.qualify == qualify && p.schema_gen == schema_gen &&
+            p.ncols == s.table->columns.size() && p.alias == s.alias) { proto = &p; break; }
+      if (proto) {
+        for (const SelectItem& col : proto->items) {
+          col.expr->bound_src = (int)si;
+          col.expr->bound_col = (int)(&col - proto->items.data());
+          col.expr->bound_depth = 0;
+          expanded.push_back(col);
+        }
+        continue;
+      }
+      const size_t first = expanded.size();
+      const size_t shown = s.table->columns.size() - std::min(s.table->hidden_columns, s.table->columns.size());
+      for (size_t ci = 0; ci < shown; ++ci) {
+        const SqlColumn& c = s.table->columns[ci];
+        SelectItem col;
+        auto e = std::make_shared<SqlExpr>();
+        e->op = ExprOp::Column;
+        e->name = c.name;
+        if (sources.size() > 1) e->qualifier = s.alias;
+        // Bound here, where it is known: ORDER BY types its keys from bound
+        // columns, and an unbound one read as text - SELECT * ... ORDER BY id
+        // sorted 1, 10, 2 and a DECIMAL 10.25 before 2.00.
+        e->bound_src = (int)si;
+        e->bound_col = (int)ci;
+        e->bound_depth = 0;
+        col.expr = e;
+        // The column keeps its own name, as MySQL returns it, even when
+        // several tables are joined and two of them have a column of that
+        // name. Qualifying it here would be tidier, but a caller reading the
+        // row by name -- $row['orderno'], which is what the ERP does -- would
+        // find nothing under the name it asked for. Duplicates are MySQL's
+        // behaviour too: the later column wins in an associative fetch.
+        // The expression still carries the alias, so the right table's value
+        // is read regardless of the label.
+        col.label = c.name;
+        expanded.push_back(col);
+      }
+      if (star_protos.size() >= 32) star_protos.erase(star_protos.begin());
+      star_protos.push_back(StarProto{schema_gen, s.table, si, qualify, s.table->columns.size(), s.alias,
+                                      std::vector<SelectItem>(expanded.begin() + (long)first, expanded.end())});
+    }
+    if (!any) return make_error("no table named " + it.star_qualifier + " in this query");
+  }
+  if (expanded.empty()) return make_error("the select list is empty");
+  phases.mark("expand");
+
+  // ORDER BY and GROUP BY may name something the select list invented rather
+  // than a stored column -- `ORDER BY avg_pay` where avg_pay is an alias for
+  // AVG(salary). Resolve those against the projection first, or the sort goes
+  // looking for a column by that name in a table and rightly fails to find it.
+  auto output_label_index = [&expanded](const std::string& want) -> int {
+    for (size_t i = 0; i < expanded.size(); ++i)
+      if (lower_of(expanded[i].label) == lower_of(want)) return (int)i;
+    return -1;
+  };
+  auto names_a_real_column = [&sources](const std::string& want) {
+    for (const QuerySource& s : sources)
+      if (s.table->get_column_index(want) >= 0) return true;
+    return false;
+  };
+  for (OrderKey& k : order_by) {
+    if (k.ordinal > 0 || !k.expr) continue;
+    if (k.expr->op != ExprOp::Column || !k.expr->qualifier.empty()) continue;
+    int at = output_label_index(k.expr->name);
+    if (at >= 0) {
+      k.ordinal = at + 1;
+      k.expr = nullptr;
+    }
+  }
+  for (ExprPtr& g : group_by) {
+    if (!g || g->op != ExprOp::Column || !g->qualifier.empty()) continue;
+    if (names_a_real_column(g->name)) continue;  // a real column wins the name
+    int at = output_label_index(g->name);
+    if (at >= 0) g = expanded[(size_t)at].expr;
+  }
+  if (having) {
+    auto rewrite_having_aliases = [&](auto& self, ExprPtr& e) -> void {
+      if (!e) return;
+      // HAVING reads the select list before the tables, unlike GROUP BY: with
+      // `CASE .. END AS status_id` over joined tables that both have a
+      // status_id, `HAVING status_id <> 80` is the alias on MariaDB, not an
+      // ambiguity between the two columns.
+      if (e->op == ExprOp::Column && e->qualifier.empty()) {
+        int at = output_label_index(e->name);
+        if (at >= 0 && (size_t)at < expanded.size() && expanded[(size_t)at].expr) {
+          e = clone_expr(expanded[(size_t)at].expr);
+          return;
+        }
+      }
+      for (auto& a : e->args) self(self, a);
+    };
+    rewrite_having_aliases(rewrite_having_aliases, having);
+  }
+
+  // The select items an ORDER BY ordinal names: only those need their value
+  // kept for the sort; every other stored column is copied as a cell. Any
+  // ordinal used to send the whole row through the interpreter - a GROUP BY
+  // orderno sorts by the `*` column of that name, and every per-order
+  // `SELECT *, SUM(..) GROUP BY` paid 150 us for it.
+  ordinal_needed.assign(expanded.size(), false);
+  for (const OrderKey& k : order_by)
+    if (k.ordinal > 0 && (size_t)k.ordinal <= expanded.size()) ordinal_needed[(size_t)k.ordinal - 1] = true;
+
+  // Grouping. Aggregates with no GROUP BY fold everything into one group, so
+  // SELECT COUNT(*) on an empty table still answers 0 rather than nothing. A
+  // HAVING groups only when it holds an aggregate: with neither GROUP BY nor
+  // one, MySQL filters the rows by it (select aliases allowed). Read as one
+  // group, `... JOIN ... HAVING total IN (...)` kept the first match alone.
+  aggregated = !group_by.empty() || (having != nullptr && expr_has_aggregate(having));
+  for (const SelectItem& it : expanded)
+    if (expr_has_aggregate(it.expr)) aggregated = true;
+  for (const OrderKey& k : order_by)
+    if (expr_has_aggregate(k.expr)) aggregated = true;
+  if (star_columnar && !aggregated) {
+    rows = star_materialize(star_cols);
+    star_columnar = false;
+  }
+  if (!aggregated && having) {
+    std::string herr;
+    EvalCtx hctx;
+    hctx.db = db;
+    hctx.outer = outer_scope;
+    hctx.sources = &sources;
+    hctx.err = &herr;
+    JoinedRows kept;
+    for (JoinedRow& r : rows) {
+      hctx.row = &r;
+      const bool keep = predicate_true(having.get(), hctx);
+      if (!herr.empty()) return make_error(herr);
+      if (keep) kept.push_back(std::move(r));
+    }
+    rows.swap(kept);
+    having = nullptr;
+  }
+  return std::nullopt;
+}
+
+struct FilterPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  ExprPtr* where;
+  const std::unordered_set<const SqlExpr*>* pushed_where_parts;
+  bool fast_pk_done;
+  const EvalCtx* outer_scope;
+  JoinedRows* rows;
+  std::string* err;
+};
+// The WHERE parts the joins left unchecked, over the joined rows. Empty: on; a result: an error to return.
+static std::optional<SqlQueryResult> residual_filter(const FilterPlan& plan) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  ExprPtr& where = *plan.where;
+  const std::unordered_set<const SqlExpr*>& pushed_where_parts = *plan.pushed_where_parts;
+  const bool fast_pk_done = plan.fast_pk_done;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  JoinedRows& rows = *plan.rows;
+  std::string& err = *plan.err;
+  // The WHERE parts no join step applied: all the pass after the joins has
+  // left to check (empty = check the whole WHERE, as before any pushdown).
+  std::vector<const SqlExpr*> where_residual;
+  if (where && !pushed_where_parts.empty()) {
+    std::vector<const SqlExpr*> all_w_parts;
+    collect_conjuncts(where.get(), &all_w_parts);
+    for (const SqlExpr* wp : all_w_parts)
+      if (pushed_where_parts.find(wp) == pushed_where_parts.end()) where_residual.push_back(wp);
+    if (where_residual.empty()) where = nullptr;
+  }
+  // WHERE (for multi-source joins or if not filtered during single-source scan).
+  // Only what the joins left unchecked: re-evaluating the whole WHERE on
+  // 1.2M joined rows because one part could not be pushed cost 2 s.
+  auto residual_true = [&](const EvalCtx& c) {
+    if (where_residual.empty()) return predicate_true(where.get(), c);
+    for (const SqlExpr* p : where_residual)
+      if (!predicate_true(p, c)) return false;
+    return true;
+  };
+  if (where && !fast_pk_done) {
+    if (vx_trace_on())
+      vx_trace("where after joins: " + std::to_string(where_residual.empty() ? 0 : where_residual.size()) +
+               " residual part(s) over " + std::to_string(rows.size()) + " rows");
+    if (rows.size() >= 4096) {
+      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+      if (total_threads == 0) total_threads = 1;
+      // Big inputs in few big chunks, for the reason a join step's are.
+      const size_t chunk = rows.size() >= 1000000 ? std::max<size_t>(2048, rows.size() / (total_threads * 8)) : 2048;
+      std::vector<JoinedRows> local_rows((rows.size() + chunk - 1) / chunk);
+      std::vector<std::string> local_errs(total_threads);
+      SqlThreadPool::instance().for_chunks(rows.size(), chunk, rows.size(), false, [&](size_t bstart, size_t bend, size_t tid) {
+        if (tid >= total_threads) tid = 0;
+        EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
+        l_ctx.sources = &sources;
+        l_ctx.err = &local_errs[tid];
+        auto& l_rows = local_rows[bstart / chunk];
+        for (size_t ri = bstart; ri < bend; ++ri) {
+          l_ctx.row = &rows[ri];
+          if (residual_true(l_ctx)) {
+            l_rows.push_back(std::move(rows[ri]));
+          }
+          if (!local_errs[tid].empty()) break;
+        }
+      });
+      for (const auto& l_err : local_errs) {
+        if (!l_err.empty()) return make_error(l_err);
+      }
+      // As in a join step: the input is freed before the survivors are
+      // gathered, each chunk as it empties.
+      JoinedRows().swap(rows);
+      size_t total_match_count = 0;
+      for (const auto& lr : local_rows) total_match_count += lr.size();
+      JoinedRows kept;
+      kept.reserve(total_match_count);
+      for (auto& lr : local_rows) {
+        for (auto& r : lr) kept.push_back(std::move(r));
+        JoinedRows().swap(lr);
+      }
+      rows.swap(kept);
+    } else {
+      JoinedRows kept;
+      for (JoinedRow& r : rows) {
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+        ctx.sources = &sources;
+        ctx.row = &r;
+        ctx.err = &err;
+        if (residual_true(ctx)) kept.push_back(r);
+        if (!err.empty()) return make_error(err);
+      }
+      rows.swap(kept);
+    }
+  }
+  return std::nullopt;
+}
+
+struct StarPlan {
+  SqlDatabase* db;
+  const std::vector<QuerySource>* sources;
+  const std::vector<SelectItem>* items;
+  const std::vector<ExprPtr>* join_conditions;
+  const std::vector<bool>* join_is_left;
+  bool any_right, fast_pk_done;
+  ExprPtr* where;
+  const std::vector<ExprPtr>* group_by;
+  const EvalCtx* outer_scope;
+  JoinedRows* rows;
+  std::vector<uint32_t>* base_ids;
+  bool* base_ids_only;
+  std::unordered_set<const SqlExpr*>* pushed_where_parts;
+  std::vector<std::vector<uint32_t>>* star_cols;
+  StarShape* star_shape;
+  bool* star_columnar;
+  bool* star_done;
+};
+// The star join over the base rows (every join a unique-key or one-to-many link it can take), kept as arrays when
+// a grouping can read them; the base row ids made into rows for the join steps otherwise. Empty: on to the join
+// steps; a result: an error to return.
+static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
+  SqlDatabase* const db = plan.db;
+  const std::vector<QuerySource>& sources = *plan.sources;
+  const std::vector<SelectItem>& items = *plan.items;
+  const std::vector<ExprPtr>& join_conditions = *plan.join_conditions;
+  const std::vector<bool>& join_is_left = *plan.join_is_left;
+  const bool any_right = plan.any_right, fast_pk_done = plan.fast_pk_done;
+  ExprPtr& where = *plan.where;
+  const std::vector<ExprPtr>& group_by = *plan.group_by;
+  const EvalCtx* const outer_scope = plan.outer_scope;
+  JoinedRows& rows = *plan.rows;
+  std::vector<uint32_t>& base_ids = *plan.base_ids;
+  bool& base_ids_only = *plan.base_ids_only;
+  std::unordered_set<const SqlExpr*>& pushed_where_parts = *plan.pushed_where_parts;
+  std::vector<std::vector<uint32_t>>& star_cols = *plan.star_cols;
+  StarShape& star_shape = *plan.star_shape;
+  bool& star_columnar = *plan.star_columnar;
+  bool& star_done = *plan.star_done;
+  if (!any_right && !fast_pk_done) {
+    std::unordered_set<const SqlExpr*> star_pushed;
+    std::string serr;
+    std::vector<uint32_t> rids;
+    const uint32_t* bp = base_ids.data();
+    size_t bn = base_ids.size();
+    if (!base_ids_only) {
+      rids.reserve(rows.size());
+      for (const JoinedRow& r : rows) rids.push_back((uint32_t)r.parts[0]);
+      bp = rids.data();
+      bn = rids.size();
+    }
+    if (star_join(db, sources, join_conditions, join_is_left, where.get(), outer_scope, bp, bn, &star_cols, star_pushed, &serr,
+                  &star_shape)) {
+      base_ids_only = false;
+      std::vector<uint32_t>().swap(base_ids);
+      star_done = true;
+      pushed_where_parts.insert(star_pushed.begin(), star_pushed.end());
+      // Kept as arrays when what follows is a GROUP BY or aggregate that
+      // can read them (the whole WHERE applied already, no `*`); built into
+      // rows otherwise, or later if the aggregate turns out not to be one
+      // the arrays can answer.
+      bool columnar = !group_by.empty();
+      for (const SelectItem& it : items) if (it.expr && expr_has_aggregate(it.expr)) columnar = true;
+      for (const SelectItem& it : items) if (it.star) columnar = false;
+      if (columnar && where) {
+        std::vector<const SqlExpr*> wp;
+        collect_conjuncts(where.get(), &wp);
+        for (const SqlExpr* w : wp) if (!pushed_where_parts.count(w)) { columnar = false; break; }
+      }
+      if (columnar) {
+        star_columnar = true;
+        JoinedRows().swap(rows);
+      } else {
+        rows = star_materialize(star_cols);
+        std::vector<std::vector<uint32_t>>().swap(star_cols);
+      }
+    } else if (!serr.empty()) {
+      return make_error(serr);
+    }
+  }
+  if (base_ids_only) {
+    rows.reserve(base_ids.size());
+    for (uint32_t r : base_ids) {
+      JoinedRow jr;
+      jr.parts.push_back(r);
+      rows.push_back(std::move(jr));
+    }
+    base_ids_only = false;
+    std::vector<uint32_t>().swap(base_ids);
+  }
+  return std::nullopt;
+}
+
+// What a branch's setup decides (plan_select) and the operators read: the branch as rewritten (USING joins, merged
+// views, decorrelated EXISTS, materialized derived tables and LATERAL), its sources resolved, the join order and
+// kinds fixed, and the clauses the operators run. Lives in execute_parsed_select_single's frame for the whole
+// statement: the rewritten branch, the derived tables and the CTE scopes they pushed (SelectEphemGuard) are held
+// here, in the order the function declared them, so they go in the same order they did.
+struct SelectEphemGuard {
+  SqlDatabase* db = nullptr;
+  size_t frames = 0;
+  ~SelectEphemGuard() {
+    if (db) {
+      while (frames-- > 0) SelectEngine::pop_cte_scope(db);
+    }
+  }
+};
+struct SelectRun {
+  const ParsedSelectBranch* branch_ptr = nullptr;
   ParsedSelectBranch expanded_branch;
   bool branched = false;
+  SelectEphemGuard ephem_guard;
+  std::vector<std::shared_ptr<SqlTable>> ephem_tables;
+  std::vector<QuerySource> sources;
+  std::vector<bool> swapped_left;
+  bool right_swapped = false;
+  std::vector<bool> join_is_right;
+  int last_right = -1;
+  bool any_right = false;
+  ExprPtr where;
+  std::vector<ExprPtr> group_by;
+  ExprPtr having;
+  std::vector<OrderKey> order_by;
+  long long limit = -1, offset = 0;
+  bool distinct = false;
+  // into the branch (or swapped_left): set at the end of plan_select
+  const ParsedSelectBranch* branch = nullptr;
+  const std::vector<SelectItem>* items = nullptr;
+  const std::vector<ExprPtr>* join_conditions = nullptr;
+  const std::vector<bool>* join_is_left = nullptr;
+};
+
+// The setup, the planner of step 2c: the branch rewritten and its sources made, the join order and kinds fixed, the
+// clauses copied out for the operators (SelectRun). A result: an error (or an answer) to return; empty: run it.
+static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSelectBranch& raw_branch, const EvalCtx* outer_scope,
+                                                 SelectRun& run, PhaseClock& phases) {
+  const ParsedSelectBranch*& branch_ptr = run.branch_ptr;
+  branch_ptr = &raw_branch;
+  ParsedSelectBranch& expanded_branch = run.expanded_branch;
+  bool& branched = run.branched;
 
   // USING / NATURAL joins become ordinary ON joins first, while each source is
   // still the table, view or derived table the statement named.
@@ -49988,17 +50501,10 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
   }
 
-  struct EphemScopeGuard {
-    SqlDatabase* db = nullptr;
-    size_t frames = 0;
-    ~EphemScopeGuard() {
-      if (db) {
-        while (frames-- > 0) SelectEngine::pop_cte_scope(db);
-      }
-    }
-  } ephem_guard{db, 0};
+  SelectEphemGuard& ephem_guard = run.ephem_guard;
+  ephem_guard.db = db;
 
-  std::vector<std::shared_ptr<SqlTable>> ephem_tables;
+  std::vector<std::shared_ptr<SqlTable>>& ephem_tables = run.ephem_tables;
 
   // Every expression under e that a merged view's columns can appear in: its arguments, an aggregate's ORDER BY
   // (GROUP_CONCAT(h ORDER BY h)) and its window's PARTITION BY / ORDER BY (the window copied first: clone_expr
@@ -50771,7 +51277,7 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   }
 
   const ParsedSelectBranch& branch = *branch_ptr;
-  std::vector<QuerySource> sources;
+  std::vector<QuerySource>& sources = run.sources;
   sources.reserve(branch.sources.size());
   for (const auto& src_spec : branch.sources) {
     const SqlTable* t = SelectEngine::resolve_table(db, src_spec.table_name);
@@ -50849,8 +51355,8 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   // LEFT JOIN path (30k items RIGHT JOIN their stock: 3x MariaDB's time).
   // Only the first join, the only RIGHT one, no `*` whose column order would
   // follow, no USING / NATURAL (their merged columns).
-  std::vector<bool> swapped_left;
-  bool right_swapped = false;
+  std::vector<bool>& swapped_left = run.swapped_left;
+  bool& right_swapped = run.right_swapped;
   // Not a FULL join (both flags): turned into a LEFT join from the other side it kept that side's unmatched rows and
   // lost the first side's (customers FULL JOIN orders dropped the customers without orders).
   const bool first_full = !branch.join_is_left.empty() && branch.join_is_left[0];
@@ -50943,20 +51449,24 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   // step: a condition applied early decides which right rows count as
   // unmatched (`WHERE a.x IS NULL` would keep a padding MySQL never makes).
   // Up to the last RIGHT JOIN, WHERE runs after the joins.
-  std::vector<bool> join_is_right(join_conditions.size(), false);
+  std::vector<bool>& join_is_right = run.join_is_right;
+  join_is_right.assign(join_conditions.size(), false);
   for (size_t k = 0; k < branch.join_is_right.size() && k < join_is_right.size(); ++k)
     join_is_right[k] = branch.join_is_right[k];
   if (right_swapped) join_is_right[0] = false;
-  int last_right = -1;
+  int& last_right = run.last_right;
+  last_right = -1;
   for (size_t k = 0; k < join_is_right.size(); ++k) if (join_is_right[k]) last_right = (int)k;
-  const bool any_right = last_right >= 0;
-  ExprPtr where = branch.where;
-  std::vector<ExprPtr> group_by = branch.group_by;
-  ExprPtr having = branch.having;
-  std::vector<OrderKey> order_by = branch.order_by;
-  long long limit = branch.limit;
-  long long offset = branch.offset;
-  bool distinct = branch.distinct;
+  run.any_right = last_right >= 0;
+  run.where = branch.where;
+  std::vector<ExprPtr>& group_by = run.group_by;
+  group_by = branch.group_by;
+  run.having = branch.having;
+  std::vector<OrderKey>& order_by = run.order_by;
+  order_by = branch.order_by;
+  run.limit = branch.limit;
+  run.offset = branch.offset;
+  run.distinct = branch.distinct;
   // MariaDB sorts a GROUP BY result by its groups when no ORDER BY is given
   // (ORDER BY NULL turns that off); reports that print a grouped query
   // without ORDER BY rely on it. First-appearance order was ours.
@@ -50968,74 +51478,137 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     }
   }
 
-  if (sources.size() == 1 && join_conditions.empty() && sources[0].table &&
-      !where && group_by.empty() && having == nullptr && !distinct) {
-    bool all_count_star = !items.empty();
-    for (const auto& it : items) {
-      if (it.star || !it.expr || it.expr->op != ExprOp::Func || upper_of(it.expr->name) != "COUNT" ||
-          it.expr->negated || it.expr->window) {   // COUNT(DISTINCT 1) is 1; COUNT(*) OVER () is per row
-        all_count_star = false; break;
-      }
-      const auto& args = it.expr->args;
-      bool is_cs = args.empty() || (args.size() == 1 && (args[0]->op == ExprOp::Star || (args[0]->op == ExprOp::Literal && !args[0]->literal.null)));
-      if (!is_cs) { all_count_star = false; break; }
-    }
-    if (all_count_star && (limit < 0 || limit >= 1) && offset <= 0) {
-      plan_add(plan_step("count(*)", sources[0].alias, "the table's row count", 1));
-      SqlQueryResult res;
-      res.is_result_set = true;
-      res.success = true;
-      for (const auto& it : items) {
-        std::string col_name = it.label.empty() ? it.expr->source_text : it.label;
-        res.columns.push_back(col_name);
-        res.column_types.push_back(SqlDataType::Int);
-        res.column_is_string.push_back(0);
-        SqlColumnOrigin org;
-        org.mysql_type = 8; // MYSQL_TYPE_LONGLONG
-        res.column_origins.push_back(org);
-      }
-      SqlRow row;
-      for (size_t i = 0; i < items.size(); ++i) {
-        row.values.push_back(std::to_string(sources[0].table->row_count()));
-      }
-      res.rows.push_back(std::move(row));
-      res.rows_affected = 1;
-      res.formatted_table = SelectEngine::format_result_table(db, res.columns, res.rows);
-      return res;
-    }
-  }
+  run.branch = &branch;
+  run.items = &items;
+  run.join_conditions = &join_conditions;
+  run.join_is_left = &join_is_left;
+  return std::nullopt;
+}
 
-  // The single-table paths below read the statement's sink from g_vx_sink, which this function took into join_sink
-  // above: handed to them, they stream a big answer straight from its columns into packets; they give it back when
-  // they cannot stream (their SinkRestorer), and it is taken back here. Never handed over, every single-table SELECT
-  // built all its rows first (a 1.46M-row SELECT held 670 MB of them) and the sink only sent the finished vector.
-  auto lend_sink = [&] { if (sources.size() == 1 && !outer_scope) g_vx_sink = join_sink; };
-  auto take_sink = [&] { g_vx_sink = nullptr; };
-  if (sources.size() == 1 && join_conditions.empty() && sources[0].table && !sql_no_vx_env()) {
-    SqlQueryResult vx_res;
-    lend_sink();
-    g_vx_col_out = col_out;   // the request, lent for this call only
-    const bool answered = try_vx_single_table(db, sources[0], items, where, group_by, having, order_by, limit, offset, distinct,
-                                              outer_scope, &vx_res);
-    g_vx_col_out = nullptr;
-    take_sink();
-    if (answered) {
-      plan_add(plan_step("single-table", sources[0].alias, vx_res.execution_route.empty() ? "vectorized" : vx_res.execution_route,
-                         vx_res.rows_in_batch && col_out && col_out->filled ? col_out->rows
-                         : vx_res.rows.empty() ? (size_t)vx_res.rows_affected : vx_res.rows.size()));
-      return vx_res;
+SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
+  const SqlDatabase* outer_type_db = g_type_db;
+  g_type_db = db;
+  struct TypeDbBack { const SqlDatabase* prev; ~TypeDbBack() { g_type_db = prev; } } type_db_back{outer_type_db};
+  // The statement's row sink, when it is a join or single-table: this is the top select (the
+  // first to start), and nothing nested may see it.
+  SqlRowSink* const join_sink = g_join_sink ? g_join_sink : g_vx_sink;
+  g_join_sink = nullptr;
+  g_vx_sink = nullptr;
+  // A consumer's request for the answer as a typed batch (sql_colbatch.inc): this is the top select, so it is
+  // taken here and nothing nested sees it. Paths that cannot fill it return rows, as before.
+  ColBatch* const col_out = take_col_out();
+  // `@v := ...` in it: rows are evaluated one at a time, in order, on this
+  // thread - the variable carries from one row to the next.
+  bool assigns = expr_assigns(raw_branch.where.get()) || expr_assigns(raw_branch.having.get());
+  for (const auto& it : raw_branch.items) assigns = assigns || expr_assigns(it.expr.get());
+  struct SerialScope {
+    bool on, was;
+    explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
+    ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
+  } serial_scope(assigns);
+  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out); }
+  // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
+  // table whose rows are in key order: the answer is a run of rows at one end
+  // of the table. The statement is run with a key range that holds just that
+  // run (zone maps skip the rest), where it sorted every row before - 4.5 ms
+  // for 300k rows against InnoDB's 0.5 ms along its index.
+  if (raw_branch.order_by.size() == 1 && raw_branch.limit >= 0 && !raw_branch.where && raw_branch.group_by.empty() &&
+      !raw_branch.having && !raw_branch.distinct && raw_branch.sources.size() == 1 && !raw_branch.sources[0].is_derived() &&
+      !assigns && raw_branch.windows.empty() && raw_branch.order_by[0].expr && raw_branch.order_by[0].expr->op == ExprOp::Column &&
+      !db->find_view(raw_branch.sources[0].table_name) && !find_cte_table(raw_branch.sources[0].table_name)) {
+    bool agg = false;
+    for (const auto& it : raw_branch.items) agg = agg || (it.expr && (expr_has_aggregate(it.expr) || it.expr->window));
+    const SqlTable* t = agg ? nullptr : db->resolve_table(raw_branch.sources[0].table_name);
+    if (t && !t->inferred_types && t->scan_order_key().empty()) {
+      const std::vector<size_t> cols = t->cluster_columns();
+      const OrderKey& ok = raw_branch.order_by[0];
+      const auto& src = raw_branch.sources[0];
+      const bool qual_ok = ok.expr->qualifier.empty() || lower_of(ok.expr->qualifier) == lower_of(src.alias) ||
+                           lower_of(ok.expr->qualifier) == lower_of(last_name_part(src.table_name));
+      if (cols.size() == 1 && qual_ok && lower_of(t->columns[cols[0]].name) == lower_of(ok.expr->name) &&
+          sql_type_numeric(t->columns[cols[0]].type) && !t->columns[cols[0]].temporal) {
+        const size_t n = t->row_count();
+        const long long off = std::max<long long>(0, raw_branch.offset);
+        if (n > 0 && (size_t)off < n && raw_branch.limit > 0 && (size_t)off + (size_t)raw_branch.limit < n) {
+          const size_t pivot = ok.descending ? n - 1 - (size_t)off : (size_t)off;
+          const std::string v = t->cell(pivot, cols[0]);
+          if (!sql_is_null(v)) {
+            auto key = std::make_shared<SqlExpr>();
+            key->op = ExprOp::Column;
+            key->name = t->columns[cols[0]].name;
+            key->qualifier = src.alias.empty() ? last_name_part(src.table_name) : src.alias;
+            key->source_text = key->qualifier + "." + key->name;
+            auto lit = std::make_shared<SqlExpr>();
+            lit->op = ExprOp::Literal;
+            lit->literal = val_cell(v);
+            lit->source_text = v;
+            auto cmp = std::make_shared<SqlExpr>();
+            cmp->op = ok.descending ? ExprOp::Le : ExprOp::Ge;
+            cmp->args = {key, lit};
+            ParsedSelectBranch b = raw_branch;
+            b.where = cmp;
+            b.offset = 0;
+            return execute_parsed_select_single(db, b);
+          }
+        }
+      }
     }
   }
-  if (sources.size() == 1 && join_conditions.empty() && group_by.size() == 1 && !distinct && having == nullptr) {
-    SqlQueryResult fast_res;
-    lend_sink();
-    const bool answered = try_fast_streaming_groupby(db, *sources[0].table, sources[0].alias, items, where, group_by, order_by, limit, offset, outer_scope, &fast_res);
-    take_sink();
-    if (answered) {
-      plan_add(plan_step("single-table", sources[0].alias, "streaming group by", fast_res.rows.size()));
-      return fast_res;
+  // SELECT ... LIMIT n with no ORDER BY reads a table in its clustered key's
+  // order, as InnoDB does: rows written since the table was last clustered
+  // sit at its end in the order they came, so the LIMIT took 3, 1, 2 where
+  // MariaDB gives 1, 2, 3. Only then is the key's order asked for.
+  if (raw_branch.order_by.empty() && raw_branch.limit >= 0 && raw_branch.group_by.empty() && !raw_branch.having &&
+      !raw_branch.distinct && raw_branch.sources.size() == 1 && !raw_branch.sources[0].is_derived() && !assigns &&
+      !db->find_view(raw_branch.sources[0].table_name)) {
+    bool agg = false;
+    for (const auto& it : raw_branch.items) agg = agg || expr_has_aggregate(it.expr);
+    const SqlTable* t = agg ? nullptr : db->resolve_table(raw_branch.sources[0].table_name);
+    if (t && !t->inferred_types) {
+      const std::vector<size_t> key = t->scan_order_key();
+      if (!key.empty()) {
+        ParsedSelectBranch b = raw_branch;
+        const auto& src = raw_branch.sources[0];
+        for (size_t c : key) {
+          auto e = std::make_shared<SqlExpr>();
+          e->op = ExprOp::Column;
+          e->name = t->columns[c].name;
+          e->qualifier = src.alias.empty() ? t->name : src.alias;
+          e->source_text = e->qualifier + "." + e->name;
+          OrderKey k;
+          k.expr = e;
+          b.order_by.push_back(k);
+        }
+        return execute_parsed_select_single(db, b);
+      }
     }
   }
+  // Phase clock for AIOS_VX_TRACE (top-level statements only).
+  // Fixes the instant NOW() reports for this statement and every subquery under
+  // it; nested calls read the outermost one's clock rather than restarting it.
+  StatementClock stmt_clock;
+  // The query this one is nested inside, if a subquery is what asked for it.
+  const EvalCtx* outer_scope = current_outer_scope();
+  PhaseClock phases(vx_trace_on() && !outer_scope);
+
+  SelectRun run;
+  if (std::optional<SqlQueryResult> r = plan_select(db, raw_branch, outer_scope, run, phases)) return std::move(*r);
+  const std::vector<QuerySource>& sources = run.sources;
+  const std::vector<SelectItem>& items = *run.items;
+  const std::vector<ExprPtr>& join_conditions = *run.join_conditions;
+  const std::vector<bool>& join_is_left = *run.join_is_left;
+  const std::vector<bool>& join_is_right = run.join_is_right;
+  const int last_right = run.last_right;
+  const bool any_right = run.any_right;
+  ExprPtr& where = run.where;
+  std::vector<ExprPtr>& group_by = run.group_by;
+  ExprPtr& having = run.having;
+  std::vector<OrderKey>& order_by = run.order_by;
+  const long long limit = run.limit, offset = run.offset;
+  const bool distinct = run.distinct;
+  FastPlan fsp{db, &sources, &items, &join_conditions, &where, &group_by, &having, &order_by, limit, offset, distinct, outer_scope,
+               join_sink, col_out};
+  if (std::optional<SqlQueryResult> r = fast_paths(fsp)) return std::move(*r);
 
   phases.mark("fastpaths");
   std::string err;
@@ -51052,83 +51625,22 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
   std::vector<uint32_t> base_ids;
   bool base_ids_only = false;
   std::unordered_set<const SqlExpr*> pushed_where_parts;
-  // The WHERE parts no join step applied: all the pass after the joins has
-  // left to check (empty = check the whole WHERE, as before any pushdown).
-  std::vector<const SqlExpr*> where_residual;
 
   // Build the joined row set.
   if (sources.empty()) {
     rows.push_back(JoinedRow{});
   } else {
-    if (sources.size() == 1 && join_conditions.empty() && group_by.empty() && where) {
-      std::vector<int> src_pk_cols;
-      for (size_t i = 0; i < sources[0].table->columns.size(); ++i) {
-        if (sources[0].table->columns[i].is_primary_key) src_pk_cols.push_back((int)i);
-      }
-      std::string sel_pk_key;
-      if (extract_pk_equality(where, *sources[0].table, src_pk_cols, sel_pk_key)) {
-        std::shared_ptr<RowIndex> idx_ptr = SelectEngine::find_row_index(db, *sources[0].table);
-        if (idx_ptr) {
-          RowIndex& idx = *idx_ptr;
-          auto hit = idx.pk_to_row.find(sel_pk_key);
-          if (hit != idx.pk_to_row.end() && idx.row_of(hit->second) < sources[0].table->row_count()) {
-            JoinedRow jr;
-            jr.parts.push_back(idx.row_of(hit->second));
-            rows.push_back(std::move(jr));
-          }
-          fast_pk_done = true;
-        }
-      }
-    }
+    PkPlan pkp{db, &sources, &join_conditions, &where, &group_by, &rows, &fast_pk_done};
+    pk_rows(pkp);
     if (!fast_pk_done) {
       BasePlan bp{db, &sources, &join_conditions, &join_is_left, any_right, &where, &group_by, &order_by, limit, offset, outer_scope,
                   &rows, &rows_hold, &base_ids, &base_ids_only, &pushed_where_parts, &err};
       if (std::optional<SqlQueryResult> r = base_rows(bp, phases)) return std::move(*r);
     }
 
-    std::vector<bool> src_referenced(sources.size(), false);
-    auto mark_src_ref = [&](const SqlExpr* e, auto& self) -> void {
-      if (!e) return;
-      if (e->op == ExprOp::Column) {
-        size_t s = 0, c = 0;
-        EvalCtx all_ctx; all_ctx.sources = &sources;
-        if (resolve_column(all_ctx, *e, &s, &c)) {
-          if (s < src_referenced.size()) src_referenced[s] = true;
-        }
-      }
-      for (const auto& a : e->args) self(a.get(), self);
-    };
-
+    std::vector<bool> src_referenced;
+    referenced_sources(sources, items, where, group_by, having, order_by, join_conditions, src_referenced);
     phases.mark("basesel");
-    for (const auto& itm : items) {
-      if (itm.expr) mark_src_ref(itm.expr.get(), mark_src_ref);
-      if (itm.star) {
-        for (size_t s = 0; s < sources.size(); ++s) {
-          if (itm.star_qualifier.empty() || lower_of(sources[s].alias) == lower_of(itm.star_qualifier)) {
-            src_referenced[s] = true;
-          }
-        }
-      }
-    }
-    if (where) mark_src_ref(where.get(), mark_src_ref);
-    for (const auto& g : group_by) mark_src_ref(g.get(), mark_src_ref);
-    if (having) mark_src_ref(having.get(), mark_src_ref);
-    for (const auto& o : order_by) {
-      if (o.expr) mark_src_ref(o.expr.get(), mark_src_ref);
-    }
-    // Every join's ON needs the tables before it that it names: an inner join
-    // always runs, and so does a left join that is not skipped. Marking only
-    // the ON of joins that were themselves referenced let `a LEFT JOIN b ON ..
-    // JOIN c ON b.x = c.y` skip b (nothing but c's ON reads it), so c joined
-    // against NULLs and COUNT(*) was 0 - st's ClubWithSalesman, 0 vs 41532.
-    // The joined table's own columns in its ON do not count as a use of it, or
-    // no unread left join could ever be skipped.
-    for (int j = (int)join_conditions.size() - 1; j >= 0; --j) {
-      if (!join_conditions[j]) continue;
-      const bool self = src_referenced[j + 1];
-      mark_src_ref(join_conditions[j].get(), mark_src_ref);
-      src_referenced[j + 1] = self;
-    }
 
     // A Thing's links: every joined table the plan does not skip, captured
     // before an empty base could stop the joins short.
@@ -51142,293 +51654,24 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     phases.mark("base");
     plan_add(plan_step("base", sources.empty() ? std::string() : sources[0].alias, base_ids_only ? "row ids" : "rows", rows.size() + base_ids.size()));
     bool star_done = false;
-    if (!any_right && !fast_pk_done) {
-      std::unordered_set<const SqlExpr*> star_pushed;
-      std::string serr;
-      std::vector<uint32_t> rids;
-      const uint32_t* bp = base_ids.data();
-      size_t bn = base_ids.size();
-      if (!base_ids_only) {
-        rids.reserve(rows.size());
-        for (const JoinedRow& r : rows) rids.push_back((uint32_t)r.parts[0]);
-        bp = rids.data();
-        bn = rids.size();
-      }
-      if (star_join(db, sources, join_conditions, join_is_left, where.get(), outer_scope, bp, bn, &star_cols, star_pushed, &serr,
-                    &star_shape)) {
-        base_ids_only = false;
-        std::vector<uint32_t>().swap(base_ids);
-        star_done = true;
-        pushed_where_parts.insert(star_pushed.begin(), star_pushed.end());
-        // Kept as arrays when what follows is a GROUP BY or aggregate that
-        // can read them (the whole WHERE applied already, no `*`); built into
-        // rows otherwise, or later if the aggregate turns out not to be one
-        // the arrays can answer.
-        bool columnar = !group_by.empty();
-        for (const SelectItem& it : items) if (it.expr && expr_has_aggregate(it.expr)) columnar = true;
-        for (const SelectItem& it : items) if (it.star) columnar = false;
-        if (columnar && where) {
-          std::vector<const SqlExpr*> wp;
-          collect_conjuncts(where.get(), &wp);
-          for (const SqlExpr* w : wp) if (!pushed_where_parts.count(w)) { columnar = false; break; }
-        }
-        if (columnar) {
-          star_columnar = true;
-          JoinedRows().swap(rows);
-        } else {
-          rows = star_materialize(star_cols);
-          std::vector<std::vector<uint32_t>>().swap(star_cols);
-        }
-      } else if (!serr.empty()) {
-        return make_error(serr);
-      }
-    }
-    if (base_ids_only) {
-      rows.reserve(base_ids.size());
-      for (uint32_t r : base_ids) {
-        JoinedRow jr;
-        jr.parts.push_back(r);
-        rows.push_back(std::move(jr));
-      }
-      base_ids_only = false;
-      std::vector<uint32_t>().swap(base_ids);
-    }
+    StarPlan spl{db, &sources, &items, &join_conditions, &join_is_left, any_right, fast_pk_done, &where, &group_by, outer_scope,
+                 &rows, &base_ids, &base_ids_only, &pushed_where_parts, &star_cols, &star_shape, &star_columnar, &star_done};
+    if (std::optional<SqlQueryResult> r = star_step(spl)) return std::move(*r);
     JoinPlan jp{db, &sources, &items, &join_conditions, &join_is_left, &join_is_right, last_right, any_right, &where, &group_by, &order_by,
                 limit, offset, outer_scope, &src_referenced, star_done, &rows, &rows_hold, &pushed_where_parts, &err};
     if (std::optional<SqlQueryResult> r = join_steps(jp, phases)) return std::move(*r);
-
-    if (where && !pushed_where_parts.empty()) {
-      std::vector<const SqlExpr*> all_w_parts;
-      collect_conjuncts(where.get(), &all_w_parts);
-      for (const SqlExpr* wp : all_w_parts)
-        if (pushed_where_parts.find(wp) == pushed_where_parts.end()) where_residual.push_back(wp);
-      if (where_residual.empty()) where = nullptr;
-    }
   }
 
-  // WHERE (for multi-source joins or if not filtered during single-source scan).
-  // Only what the joins left unchecked: re-evaluating the whole WHERE on
-  // 1.2M joined rows because one part could not be pushed cost 2 s.
-  auto residual_true = [&](const EvalCtx& c) {
-    if (where_residual.empty()) return predicate_true(where.get(), c);
-    for (const SqlExpr* p : where_residual)
-      if (!predicate_true(p, c)) return false;
-    return true;
-  };
-  if (where && !fast_pk_done) {
-    if (vx_trace_on())
-      vx_trace("where after joins: " + std::to_string(where_residual.empty() ? 0 : where_residual.size()) +
-               " residual part(s) over " + std::to_string(rows.size()) + " rows");
-    if (rows.size() >= 4096) {
-      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-      if (total_threads == 0) total_threads = 1;
-      // Big inputs in few big chunks, for the reason a join step's are.
-      const size_t chunk = rows.size() >= 1000000 ? std::max<size_t>(2048, rows.size() / (total_threads * 8)) : 2048;
-      std::vector<JoinedRows> local_rows((rows.size() + chunk - 1) / chunk);
-      std::vector<std::string> local_errs(total_threads);
-      SqlThreadPool::instance().for_chunks(rows.size(), chunk, rows.size(), false, [&](size_t bstart, size_t bend, size_t tid) {
-        if (tid >= total_threads) tid = 0;
-        EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
-        l_ctx.sources = &sources;
-        l_ctx.err = &local_errs[tid];
-        auto& l_rows = local_rows[bstart / chunk];
-        for (size_t ri = bstart; ri < bend; ++ri) {
-          l_ctx.row = &rows[ri];
-          if (residual_true(l_ctx)) {
-            l_rows.push_back(std::move(rows[ri]));
-          }
-          if (!local_errs[tid].empty()) break;
-        }
-      });
-      for (const auto& l_err : local_errs) {
-        if (!l_err.empty()) return make_error(l_err);
-      }
-      // As in a join step: the input is freed before the survivors are
-      // gathered, each chunk as it empties.
-      JoinedRows().swap(rows);
-      size_t total_match_count = 0;
-      for (const auto& lr : local_rows) total_match_count += lr.size();
-      JoinedRows kept;
-      kept.reserve(total_match_count);
-      for (auto& lr : local_rows) {
-        for (auto& r : lr) kept.push_back(std::move(r));
-        JoinedRows().swap(lr);
-      }
-      rows.swap(kept);
-    } else {
-      JoinedRows kept;
-      for (JoinedRow& r : rows) {
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.row = &r;
-        ctx.err = &err;
-        if (residual_true(ctx)) kept.push_back(r);
-        if (!err.empty()) return make_error(err);
-      }
-      rows.swap(kept);
-    }
-  }
+  FilterPlan fpl{db, &sources, &where, &pushed_where_parts, fast_pk_done, outer_scope, &rows, &err};
+  if (std::optional<SqlQueryResult> r = residual_filter(fpl)) return std::move(*r);
 
   phases.mark("rows");
-  // Expand `*` into the real column list now that the sources are known.
-  // A table's expansion at a given position is the same for every statement
-  // that names it there, so each thread keeps the last few and copies them:
-  // building 100 column expressions was 23 us of a 90 us one-row lookup,
-  // and the ERP asks for `salesorders.*, custbranch.*` once per order.
-  // The copies share the expressions; their bindings are re-asserted, since
-  // a resolver may write them, and a thread never shares with another.
-  struct StarProto {
-    uint64_t schema_gen; const SqlTable* table; size_t si; bool qualify; size_t ncols; std::string alias;
-    std::vector<SelectItem> items;
-  };
-  thread_local std::vector<StarProto> star_protos;
-  const uint64_t schema_gen = db->schema_generation();
   std::vector<SelectItem> expanded;
-  for (const SelectItem& it : items) {
-    if (!it.star) { expanded.push_back(it); continue; }
-    bool any = false;
-    for (size_t si = 0; si < sources.size(); ++si) {
-      const QuerySource& s = sources[si];
-      if (!it.star_qualifier.empty() && lower_of(s.alias) != lower_of(it.star_qualifier)) continue;
-      any = true;
-      const bool qualify = sources.size() > 1;
-      StarProto* proto = nullptr;
-      for (StarProto& p : star_protos)
-        if (p.table == s.table && p.si == si && p.qualify == qualify && p.schema_gen == schema_gen &&
-            p.ncols == s.table->columns.size() && p.alias == s.alias) { proto = &p; break; }
-      if (proto) {
-        for (const SelectItem& col : proto->items) {
-          col.expr->bound_src = (int)si;
-          col.expr->bound_col = (int)(&col - proto->items.data());
-          col.expr->bound_depth = 0;
-          expanded.push_back(col);
-        }
-        continue;
-      }
-      const size_t first = expanded.size();
-      const size_t shown = s.table->columns.size() - std::min(s.table->hidden_columns, s.table->columns.size());
-      for (size_t ci = 0; ci < shown; ++ci) {
-        const SqlColumn& c = s.table->columns[ci];
-        SelectItem col;
-        auto e = std::make_shared<SqlExpr>();
-        e->op = ExprOp::Column;
-        e->name = c.name;
-        if (sources.size() > 1) e->qualifier = s.alias;
-        // Bound here, where it is known: ORDER BY types its keys from bound
-        // columns, and an unbound one read as text - SELECT * ... ORDER BY id
-        // sorted 1, 10, 2 and a DECIMAL 10.25 before 2.00.
-        e->bound_src = (int)si;
-        e->bound_col = (int)ci;
-        e->bound_depth = 0;
-        col.expr = e;
-        // The column keeps its own name, as MySQL returns it, even when
-        // several tables are joined and two of them have a column of that
-        // name. Qualifying it here would be tidier, but a caller reading the
-        // row by name -- $row['orderno'], which is what the ERP does -- would
-        // find nothing under the name it asked for. Duplicates are MySQL's
-        // behaviour too: the later column wins in an associative fetch.
-        // The expression still carries the alias, so the right table's value
-        // is read regardless of the label.
-        col.label = c.name;
-        expanded.push_back(col);
-      }
-      if (star_protos.size() >= 32) star_protos.erase(star_protos.begin());
-      star_protos.push_back(StarProto{schema_gen, s.table, si, qualify, s.table->columns.size(), s.alias,
-                                      std::vector<SelectItem>(expanded.begin() + (long)first, expanded.end())});
-    }
-    if (!any) return make_error("no table named " + it.star_qualifier + " in this query");
-  }
-  if (expanded.empty()) return make_error("the select list is empty");
-  phases.mark("expand");
-
-  // ORDER BY and GROUP BY may name something the select list invented rather
-  // than a stored column -- `ORDER BY avg_pay` where avg_pay is an alias for
-  // AVG(salary). Resolve those against the projection first, or the sort goes
-  // looking for a column by that name in a table and rightly fails to find it.
-  auto output_label_index = [&expanded](const std::string& want) -> int {
-    for (size_t i = 0; i < expanded.size(); ++i)
-      if (lower_of(expanded[i].label) == lower_of(want)) return (int)i;
-    return -1;
-  };
-  auto names_a_real_column = [&sources](const std::string& want) {
-    for (const QuerySource& s : sources)
-      if (s.table->get_column_index(want) >= 0) return true;
-    return false;
-  };
-  for (OrderKey& k : order_by) {
-    if (k.ordinal > 0 || !k.expr) continue;
-    if (k.expr->op != ExprOp::Column || !k.expr->qualifier.empty()) continue;
-    int at = output_label_index(k.expr->name);
-    if (at >= 0) {
-      k.ordinal = at + 1;
-      k.expr = nullptr;
-    }
-  }
-  for (ExprPtr& g : group_by) {
-    if (!g || g->op != ExprOp::Column || !g->qualifier.empty()) continue;
-    if (names_a_real_column(g->name)) continue;  // a real column wins the name
-    int at = output_label_index(g->name);
-    if (at >= 0) g = expanded[(size_t)at].expr;
-  }
-  if (having) {
-    auto rewrite_having_aliases = [&](auto& self, ExprPtr& e) -> void {
-      if (!e) return;
-      // HAVING reads the select list before the tables, unlike GROUP BY: with
-      // `CASE .. END AS status_id` over joined tables that both have a
-      // status_id, `HAVING status_id <> 80` is the alias on MariaDB, not an
-      // ambiguity between the two columns.
-      if (e->op == ExprOp::Column && e->qualifier.empty()) {
-        int at = output_label_index(e->name);
-        if (at >= 0 && (size_t)at < expanded.size() && expanded[(size_t)at].expr) {
-          e = clone_expr(expanded[(size_t)at].expr);
-          return;
-        }
-      }
-      for (auto& a : e->args) self(self, a);
-    };
-    rewrite_having_aliases(rewrite_having_aliases, having);
-  }
-
-  // The select items an ORDER BY ordinal names: only those need their value
-  // kept for the sort; every other stored column is copied as a cell. Any
-  // ordinal used to send the whole row through the interpreter - a GROUP BY
-  // orderno sorts by the `*` column of that name, and every per-order
-  // `SELECT *, SUM(..) GROUP BY` paid 150 us for it.
-  std::vector<bool> ordinal_needed(expanded.size(), false);
-  for (const OrderKey& k : order_by)
-    if (k.ordinal > 0 && (size_t)k.ordinal <= expanded.size()) ordinal_needed[(size_t)k.ordinal - 1] = true;
-
-  // Grouping. Aggregates with no GROUP BY fold everything into one group, so
-  // SELECT COUNT(*) on an empty table still answers 0 rather than nothing. A
-  // HAVING groups only when it holds an aggregate: with neither GROUP BY nor
-  // one, MySQL filters the rows by it (select aliases allowed). Read as one
-  // group, `... JOIN ... HAVING total IN (...)` kept the first match alone.
-  bool aggregated = !group_by.empty() || (having != nullptr && expr_has_aggregate(having));
-  for (const SelectItem& it : expanded)
-    if (expr_has_aggregate(it.expr)) aggregated = true;
-  for (const OrderKey& k : order_by)
-    if (expr_has_aggregate(k.expr)) aggregated = true;
-  if (star_columnar && !aggregated) {
-    rows = star_materialize(star_cols);
-    star_columnar = false;
-  }
-  if (!aggregated && having) {
-    std::string herr;
-    EvalCtx hctx;
-    hctx.db = db;
-    hctx.outer = outer_scope;
-    hctx.sources = &sources;
-    hctx.err = &herr;
-    JoinedRows kept;
-    for (JoinedRow& r : rows) {
-      hctx.row = &r;
-      const bool keep = predicate_true(having.get(), hctx);
-      if (!herr.empty()) return make_error(herr);
-      if (keep) kept.push_back(std::move(r));
-    }
-    rows.swap(kept);
-    having = nullptr;
-  }
+  std::vector<bool> ordinal_needed;
+  bool aggregated = false;
+  ExpandPlan xpl{db, &sources, &items, &order_by, &group_by, &having, outer_scope, &rows, &star_cols, &star_columnar,
+                 &expanded, &ordinal_needed, &aggregated};
+  if (std::optional<SqlQueryResult> r = expand_items(xpl, phases)) return std::move(*r);
 
   std::vector<OutRow> out_rows;
 
