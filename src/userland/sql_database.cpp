@@ -7425,6 +7425,7 @@ struct DecodedInts { std::vector<int64_t> v; int64_t lo = 0, hi = -1; };   // lo
 std::shared_ptr<const std::vector<double>> decoded_values(const SqlTable& t, size_t col);
 std::shared_ptr<const DecodedInts> decoded_ints(const SqlTable& t, size_t col);
 std::shared_ptr<const std::vector<uint32_t>> decoded_codes(const SqlTable& t, size_t col);
+std::shared_ptr<const std::vector<uint8_t>> decoded_nulls(const SqlTable& t, size_t col);   // 1: the row's cell is NULL
 }
 
 // The groups straight from the column kernels (defined with them): each key's
@@ -8324,12 +8325,14 @@ namespace vp {
 struct PipeIns {                       // a vx::NumProg instruction over the many side's decoded columns
   enum Op : uint8_t { Leaf, Konst, Neg, Add, Sub, Mul, Div } op = Konst;
   const double* col = nullptr;         // Leaf: the column decoded whole, by row
+  const uint8_t* nul = nullptr;        // Leaf: its NULL flags by row (null: the column has none) - a NULL row is skipped
   double k = 0;                        // Konst
   uint32_t a = 0, b = 0;               // operands (earlier instructions)
 };
 struct PipeXIns {                      // exact arithmetic: a scaled integer per instruction, at a scale fixed when made
   enum Op : uint8_t { Leaf, Add, Sub, Mul } op = Leaf;
   const int64_t* col = nullptr;        // Leaf: the column's scaled integers decoded whole, by row
+  const uint8_t* nul = nullptr;        // Leaf: its NULL flags by row (null: none) - a NULL operand makes the row NULL: skipped
   uint32_t a = 0, b = 0;
   int scale = 0;                       // this instruction's scale (Add / Sub: its operands brought up to it)
 };
@@ -8347,7 +8350,9 @@ struct PipeFoldAgg {
   uint64_t* cnt = nullptr;
   double* num = nullptr;
   uint8_t* exact = nullptr;
-  const int64_t* ints = nullptr;       // 2: the column decoded whole
+  const int64_t* ints = nullptr;       // 2: the column decoded whole (a DECIMAL's scaled integers)
+  const uint8_t* nul = nullptr;        // 2: its NULL flags (null: none)
+  bool dec = false;                    // 2: a DECIMAL - its double is v / p10
   void* isum = nullptr;                // 2: the groups' 128-bit totals
 };
 std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>& aggs, std::string* why);
@@ -32366,6 +32371,12 @@ std::shared_ptr<const std::vector<uint32_t>> decoded_codes(const SqlTable& t, si
     decode_codes(cs, 0, n, v.data());
   });
 }
+std::shared_ptr<const std::vector<uint8_t>> decoded_nulls(const SqlTable& t, size_t col) {
+  return decoded_get<std::vector<uint8_t>>(t, col, 3, 1, [](const ColumnStore& cs, size_t n, std::vector<uint8_t>& v) {
+    v.assign(n, 0);
+    if (has_nulls(cs)) for (size_t r = 0; r < n; ++r) v[r] = cs.is_null(r) ? 1 : 0;
+  });
+}
 
 uint32_t code_at(const ColumnStore& cs, size_t r) {
   uint32_t k = 0;
@@ -44795,6 +44806,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
     std::vector<vp::PipeFoldAgg> pf;
     std::vector<std::shared_ptr<const std::vector<double>>> pholds;
     std::vector<std::shared_ptr<const vx::DecodedInts>> rholds_fold;
+    std::vector<std::shared_ptr<const std::vector<uint8_t>>> nholds;
     std::vector<char> pcount_star;                      // per aggregate: COUNT(*) (a NULL-padded row counts)
     std::string native_why;
     auto build_native = [&]() {
@@ -44808,18 +44820,39 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         if (a.agg.kind == vx::Agg::CountStar) { f.kind = 0; pf.push_back(std::move(f)); continue; }
         if (a.src != mc) { native_why = "an aggregate off the many side"; return; }
         if (a.agg.kind == vx::Agg::Count && a.agg.col_rules && !a.nulls) { f.kind = 0; pf.push_back(std::move(f)); continue; }
-        // the fold's typed-INT fast path (fold_rows): same condition
-        if (!a.nulls && !a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
-            a.agg.src.kind == vx::Source::TypedCol && a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct) {
-          auto d = vx::decoded_ints(mt, a.agg.src.col);
-          if (!d) { native_why = "a column's decode"; return; }
-          f.kind = 2;
-          f.ints = d->v.data();
-          f.isum = a.arr.isum.data();
-          f.num = a.arr.num.data();
-          rholds_fold.push_back(std::move(d));
-          pf.push_back(std::move(f));
-          continue;
+        // SUM / AVG of a typed INT column, or of a fixed-scale DECIMAL one (acc_row's column rules: isum, the cell's
+        // double, cnt; a NULL row skipped)
+        if (!a.agg.mask && !a.agg.prog && (a.agg.kind == vx::Agg::Sum || a.agg.kind == vx::Agg::Avg) && a.agg.col_rules &&
+            a.agg.src.kind == vx::Source::TypedCol && a.agg.src.col < mt.col_data.size()) {
+          const ColumnStore& ccs = mt.col_data[a.agg.src.col];
+          bool int_col = a.agg.col_type == SqlDataType::Int && a.plan.need_ints && !a.plan.dec_direct && vx::typed_integer(ccs);
+          bool dec_col = false;
+          if (a.agg.col_type == SqlDataType::Decimal && a.plan.dec_direct && ccs.encoding == ColumnEncoding::DecimalScaled &&
+              ccs.decimal_fixed()) {
+            double p = 1;
+            for (int i = 0; i < a.agg.col_scale; ++i) p *= 10;
+            dec_col = ccs.scale_factor == p;
+            f.p10 = p;
+          }
+          if (int_col || dec_col) {
+            auto d = vx::decoded_ints(mt, a.agg.src.col);
+            if (!d) { native_why = "a column's decode"; return; }
+            if (dec_col && (d->lo <= -((int64_t)1 << 53) || d->hi >= ((int64_t)1 << 53))) { native_why = "a DECIMAL past 2^53"; return; }
+            f.kind = 2;
+            f.dec = dec_col;
+            f.ints = d->v.data();
+            f.isum = a.arr.isum.data();
+            f.num = a.arr.num.data();
+            rholds_fold.push_back(std::move(d));
+            if (vx::has_nulls(ccs)) {
+              auto z = vx::decoded_nulls(mt, a.agg.src.col);
+              if (!z) { native_why = "a column's NULLs"; return; }
+              f.nul = z->data();
+              nholds.push_back(std::move(z));
+            }
+            pf.push_back(std::move(f));
+            continue;
+          }
         }
         // SUM / AVG of exact arithmetic over INT and fixed-scale DECIMAL columns (a.agg.prog is only for approximate
         // arithmetic): the evaluator's exact values, as scaled integers (kind 3)
@@ -44837,7 +44870,12 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
               if (lookup_column_here(a.local, *e, &s0, &c0) != ColumnLookup::Found || s0 != 0 || c0 >= mt.col_data.size()) { xok = false; return -1; }
               const ColumnStore& cs = mt.col_data[c0];
               const SqlColumn& col = mt.columns[c0];
-              if (vx::has_nulls(cs)) { xok = false; return -1; }
+              if (vx::has_nulls(cs)) {                 // the evaluator: a NULL operand, a NULL value, which acc_row skips
+                auto z = vx::decoded_nulls(mt, c0);
+                if (!z) { xok = false; return -1; }
+                in.nul = z->data();
+                nholds.push_back(std::move(z));
+              }
               if (col.type == SqlDataType::Int && vx::typed_integer(cs)) {
                 in.scale = 0;                          // an INT cell prints as its integer
               } else if (col.type == SqlDataType::Decimal && cs.encoding == ColumnEncoding::DecimalScaled && cs.decimal_fixed()) {
@@ -44902,13 +44940,21 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           switch (in.op) {
             case vx::NumProg::Typed: {
               const ColumnStore* cs = in.cs;
-              if (!cs || mt.col_data.empty() || cs < mt.col_data.data() || cs >= mt.col_data.data() + mt.col_data.size() ||
-                  vx::has_nulls(*cs)) { native_why = "a column"; return; }
+              if (!cs || mt.col_data.empty() || cs < mt.col_data.data() || cs >= mt.col_data.data() + mt.col_data.size()) {
+                native_why = "a column";
+                return;
+              }
               auto d = vx::decoded_values(mt, (size_t)(cs - mt.col_data.data()));
               if (!d) { native_why = "a column's decode"; return; }
               pi.op = vp::PipeIns::Leaf;
               pi.col = d->data();
               pholds.push_back(std::move(d));
+              if (vx::has_nulls(*cs)) {                // np_eval: a NULL leaf makes the row NULL, which the fold skips
+                auto z = vx::decoded_nulls(mt, (size_t)(cs - mt.col_data.data()));
+                if (!z) { native_why = "a column's NULLs"; return; }
+                pi.nul = z->data();
+                nholds.push_back(std::move(z));
+              }
               break;
             }
             case vx::NumProg::Konst:
@@ -44930,7 +44976,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
       native = vp::pipe_fold_build_for(pf, &native_why);
     };
     // AIOS_SQL_PIPE_CHECK=1: every run folded again through np_eval (the interpreter) into these, compared at the end
-    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; std::vector<AIOS_INT128> isum; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; vx::AggArrays A; };
+    struct Shadow { std::vector<uint64_t> cnt; std::vector<double> num; std::vector<uint8_t> exact; std::vector<AIOS_INT128> isum; vx::NumScratch S; std::vector<double> v; std::vector<uint8_t> z; vx::AggArrays A; vx::AggCols C; };
     std::vector<Shadow> shadow;
     auto flush = [&]() {
       if (n == 0) return;
@@ -44991,7 +45037,7 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
         shadow[ai].num.assign(gmax, 0);
         shadow[ai].exact.assign(gmax, 1);
         shadow[ai].isum.assign(gmax, 0);
-        if (pf[ai].kind == 3) vx::init_arrays(aggs[ai]->agg, aggs[ai]->plan, gmax, shadow[ai].A);
+        if (pf[ai].kind == 3 || pf[ai].kind == 2) vx::init_arrays(aggs[ai]->agg, aggs[ai]->plan, gmax, shadow[ai].A);
         shadow[ai].S.cover = E->bound;
         shadow[ai].S.table = sources[mc].table;
       }
@@ -45146,14 +45192,11 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
                 vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, acols[ai], xcs, aggs[ai]->nulls, *areaders[ai]);
               continue;
             }
-            if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
+            if (pf[ai].kind == 2) {                    // the operators' own: gathered from the column, folded by acc_row
               const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
-              for (size_t j = 0; j < cnt; ++j) {
-                const int64_t v = vx::typed_int(ics, b[j]);
-                sh.isum[g] += (AIOS_INT128)v;
-                sh.num[g] += (double)v;
-                sh.cnt[g]++;
-              }
+              vx::gather_for(aggs[ai]->agg, aggs[ai]->plan, ics, b, cnt, sh.C);
+              for (size_t j = 0; j < cnt; ++j)
+                vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, sh.C, ics, aggs[ai]->nulls, *areaders[ai]);
               continue;
             }
             sh.v.resize(cnt);
@@ -45207,14 +45250,11 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
                 vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, acols[ai], xcs, aggs[ai]->nulls, *areaders[ai]);
               continue;
             }
-            if (pf[ai].kind == 2) {                    // read row by row (typed_int), not from the decode the code reads
+            if (pf[ai].kind == 2) {                    // the operators' own: gathered from the column, folded by acc_row
               const ColumnStore& ics = sources[mc].table->col_data[aggs[ai]->agg.src.col];
-              for (size_t j = 0; j < cnt; ++j) {
-                const int64_t v = vx::typed_int(ics, b[j]);
-                sh.isum[g] += (AIOS_INT128)v;
-                sh.num[g] += (double)v;
-                sh.cnt[g]++;
-              }
+              vx::gather_for(aggs[ai]->agg, aggs[ai]->plan, ics, b, cnt, sh.C);
+              for (size_t j = 0; j < cnt; ++j)
+                vx::acc_row(aggs[ai]->agg, aggs[ai]->plan, sh.A, (uint32_t)g, b[j], j, sh.C, ics, aggs[ai]->nulls, *areaders[ai]);
               continue;
             }
             sh.v.resize(cnt);
@@ -45262,11 +45302,15 @@ static bool star_aggregate(SqlDatabase* db, const std::vector<QuerySource>& sour
           const Shadow& sh = shadow[ai];
           bool same = A.cnt[g] == sh.cnt[g];
           if (pf[ai].kind == 1) same = same && std::memcmp(&A.num[g], &sh.num[g], 8) == 0 && A.exact[g] == sh.exact[g];
-          if (pf[ai].kind == 2) same = same && A.isum[g] == sh.isum[g] && std::memcmp(&A.num[g], &sh.num[g], 8) == 0;
+          if (pf[ai].kind == 2) {
+            const vx::AggArrays& R = sh.A;
+            same = A.cnt[g] == R.cnt[g] && A.isum[g] == R.isum[g] && std::memcmp(&A.num[g], &R.num[g], 8) == 0 && A.ok[g] == R.ok[g];
+          }
           if (pf[ai].kind == 3) {
             const vx::AggArrays& R = sh.A;
+            // (a group none of whose rows counted is NULL: its scales, set before its rows, say nothing)
             same = A.cnt[g] == R.cnt[g] && std::memcmp(&A.num[g], &R.num[g], 8) == 0 && A.exact[g] == R.exact[g] &&
-                   (!A.exact[g] || (A.etot[g] == R.etot[g] && A.escale[g] == R.escale[g] && A.dscale[g] == R.dscale[g]));
+                   (!A.exact[g] || A.cnt[g] == 0 || (A.etot[g] == R.etot[g] && A.escale[g] == R.escale[g] && A.dscale[g] == R.dscale[g]));
           }
           if (!same) {
             fprintf(stderr, "AIOS_SQL_PIPE_CHECK: native fold differs from np_eval: aggregate %zu, group %zu\n", ai, g);

@@ -81,6 +81,7 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.cmp(RCX, R13);
       const size_t xdone = a.jcc(CcAE);
       a.load32_idx4(RSI, R12, RCX);                    // the row
+      std::vector<size_t> to_xnext;
       auto scaled = [&](Reg d, uint32_t x, int to) {   // instruction x's value at scale `to`
         a.load(d, RSP, (int32_t)(8 * x));
         int up = to - g.xprog[x].scale;
@@ -95,6 +96,12 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
         const PipeXIns& in = g.xprog[x];
         switch (in.op) {
           case PipeXIns::Leaf:
+            if (in.nul) {                              // a NULL operand: the row's value is NULL, skipped
+              a.mov_imm(RAX, (uint64_t)(uintptr_t)in.nul);
+              a.loadb_idx(RBX, RAX, RSI);
+              a.test(RBX, RBX);
+              to_xnext.push_back(a.jcc(CcNE));
+            }
             a.mov_imm(RAX, (uint64_t)(uintptr_t)in.col);
             a.load_idx8(RDX, RAX, RSI);
             break;
@@ -118,6 +125,12 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.xor_(R11, R11);                                // the 128-bit total overflowed: no longer exact (it keeps the wrapped sum, as __builtin_add_overflow leaves it)
       a.patch_here(no_ovf);
       a.patch_here(no_exact);
+      // the row's count: cnt[g] += 1 (not the run's length: a NULL row is not counted)
+      base_of(RAX, &g.cnt);
+      a.load_idx8(RBX, RAX, R14);
+      a.inc(RBX);
+      a.store_idx8(RAX, R14, RBX);
+      for (size_t at : to_xnext) a.patch_here(at);
       a.inc(RCX);
       a.patch(a.jmp(), xtop);
       a.patch_here(xdone);
@@ -125,15 +138,15 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.store(R10, 8, R9);
       base_of(RAX, &g.num);
       a.movsd_store_idx8(RAX, R14, (Reg)15);
-      add_cnt(&g.cnt, R13);
       base_of(RAX, &g.exact);
       a.storeb_idx(RAX, R14, R11);                     // 0 if it overflowed (or was 0)
       a.add_rsp(frame);
       continue;
     }
     if (g.kind == 2) {
-      // SUM / AVG of a typed INT column with no NULL: per row, isum[g] (128 bits) += v, num[g] += (double)v - the
-      // fold's own fast path; cnt[g] += the run
+      // SUM / AVG of a typed INT or fixed-scale DECIMAL column (acc_row's column rules): per row not NULL,
+      // isum[g] (128 bits) += v, num[g] += the cell's double ((double)v, or v / 10^s for a DECIMAL: both exact below
+      // 2^53, so as scaled_decimal_double divides), cnt[g] += 1
       base_of(R10, &g.isum);
       a.mov(RAX, R14);
       a.shl_imm(RAX, 4);
@@ -142,11 +155,25 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.load(R9, R10, 8);
       base_of(RAX, &g.num);
       a.movsd_load_idx8((Reg)15, RAX, R14);
+      if (g.dec) {
+        uint64_t pbits;
+        std::memcpy(&pbits, &g.p10, 8);
+        a.mov_imm(RAX, pbits);
+        a.movq_xr((Reg)14, RAX);
+      }
+      a.xor_(R11, R11);                                // the rows counted
       a.xor_(RCX, RCX);
       const size_t itop = a.here();
       a.cmp(RCX, R13);
       const size_t idone = a.jcc(CcAE);
       a.load32_idx4(RDX, R12, RCX);
+      size_t is_null = 0;
+      if (g.nul) {
+        a.mov_imm(RAX, (uint64_t)(uintptr_t)g.nul);
+        a.loadb_idx(RBX, RAX, RDX);
+        a.test(RBX, RBX);
+        is_null = a.jcc(CcNE);
+      }
       a.mov_imm(RAX, (uint64_t)(uintptr_t)g.ints);
       a.load_idx8(RDX, RAX, RDX);
       a.mov(RAX, RDX);
@@ -154,7 +181,10 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.add(R8, RDX);
       a.adc(R9, RAX);
       a.cvtsi2sd((Reg)0, RDX);
+      if (g.dec) a.divsd((Reg)0, (Reg)14);
       a.addsd((Reg)15, (Reg)0);
+      a.inc(R11);
+      if (g.nul) a.patch_here(is_null);
       a.inc(RCX);
       a.patch(a.jmp(), itop);
       a.patch_here(idone);
@@ -162,7 +192,7 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       a.store(R10, 8, R9);
       base_of(RAX, &g.num);
       a.movsd_store_idx8(RAX, R14, (Reg)15);
-      add_cnt(&g.cnt, R13);
+      add_cnt(&g.cnt, R11);
       continue;
     }
     const size_t K = g.prog.size();
@@ -181,6 +211,12 @@ inline std::shared_ptr<PipeCode> pipe_fold_build(const std::vector<PipeFoldAgg>&
       const Reg d = (Reg)x;
       switch (in.op) {
         case PipeIns::Leaf:
+          if (in.nul) {                                // a NULL cell: the row is NULL, skipped
+            a.mov_imm(RAX, (uint64_t)(uintptr_t)in.nul);
+            a.loadb_idx(RBX, RAX, RDX);
+            a.test(RBX, RBX);
+            to_next.push_back(a.jcc(CcNE));
+          }
           a.mov_imm(RAX, (uint64_t)(uintptr_t)in.col);
           a.movsd_load_idx8(d, RAX, RDX);
           break;
