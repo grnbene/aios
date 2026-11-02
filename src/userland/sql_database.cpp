@@ -43799,6 +43799,34 @@ static uint32_t star_partner(const std::vector<QuerySource>& sources, const Star
   auto it = M.of_key.find((uint64_t)key);
   return it != M.of_key.end() ? it->second : UINT32_MAX;
 }
+// star_partner over n parent rows at once: the map's kind decided once, not per row.
+static void star_partners(const std::vector<QuerySource>& sources, const StarLink& L, const uint32_t* pr, size_t n, uint32_t* out) {
+  const StarMap& M = L.map;
+  if (!L.parent_nulls && M.by_code && L.whole_codes) {
+    const int64_t* oc = M.of_code.data();
+    const size_t nc = M.of_code.size();
+    for (size_t j = 0; j < n; ++j) {
+      const uint32_t p = pr[j];
+      if (p == UINT32_MAX) { out[j] = UINT32_MAX; continue; }
+      const uint32_t code = L.whole_codes[p];
+      out[j] = code < nc && oc[code] >= 0 ? (uint32_t)oc[code] : UINT32_MAX;
+    }
+    return;
+  }
+  if (!L.parent_nulls && !M.by_code && M.by_dense && L.whole_ints) {
+    const uint32_t* dn = M.dense.data();
+    const uint64_t nd = M.dense.size();
+    const int64_t lo = M.lo;
+    for (size_t j = 0; j < n; ++j) {
+      const uint32_t p = pr[j];
+      if (p == UINT32_MAX) { out[j] = UINT32_MAX; continue; }
+      const uint64_t k = (uint64_t)(L.whole_ints[p] - lo);
+      out[j] = k < nd ? dn[k] : UINT32_MAX;
+    }
+    return;
+  }
+  for (size_t j = 0; j < n; ++j) out[j] = star_partner(sources, L, pr[j]);
+}
 // A one-to-many link's rows under parent row pr: [*b, *e), ascending (empty: none).
 static void star_rows_of(const std::vector<QuerySource>& sources, const StarLink& L, uint32_t pr, const uint32_t** b, const uint32_t** e) {
   *b = *e = nullptr;
@@ -43859,6 +43887,35 @@ struct StarExpansion {
   }
   // Every row into one row id array per source.
   void expand(std::vector<std::vector<uint32_t>>* P) const {
+    bool any_multi = false;
+    for (const StarLink& L : links) any_multi = any_multi || L.multi;
+    if (!any_multi) {
+      // Every link unique: a root row has at most one row, so the rows are the roots' in order, each link's
+      // partners gathered a column at a time over the rows so far (an inner link's misses dropped, a LEFT link's
+      // padded) - the rows and order walk_root makes, without its walk per root row.
+      P->assign(ns, {});
+      (*P)[root] = roots;
+      size_t n = roots.size();
+      std::vector<size_t> made{root};
+      std::vector<uint32_t> got(n);
+      for (const StarLink& L : links) {
+        star_partners(*sources, L, (*P)[L.parent_src].data(), n, got.data());
+        if (!L.left) {
+          size_t w = 0;
+          for (size_t j = 0; j < n; ++j) {
+            if (got[j] == UINT32_MAX) continue;
+            if (w != j) { for (size_t s2 : made) (*P)[s2][w] = (*P)[s2][j]; got[w] = got[j]; }
+            ++w;
+          }
+          if (w != n) for (size_t s2 : made) (*P)[s2].resize(w);
+          n = w;
+        }
+        (*P)[L.child_src].assign(got.begin(), got.begin() + (long)n);
+        made.push_back(L.child_src);
+      }
+      for (size_t s2 = 0; s2 < ns; ++s2) if ((*P)[s2].size() != n) (*P)[s2].assign(n, UINT32_MAX);   // a source no link reaches
+      return;
+    }
     P->assign(ns, {});
     size_t cap = std::max<size_t>(64, (size_t)std::min(bound, (double)roots.size() * 4.0 + 64));
     std::vector<uint32_t*> outp(ns);
@@ -44516,8 +44573,19 @@ static JoinedRows star_materialize(const std::vector<std::vector<uint32_t>>& P) 
   const size_t n = P[0].size();
   sql_reserve_query_memory(n * sizeof(JoinedRow));   // refused only on KILL, noticed next
   out.resize(n);
-  for (size_t i = 0; i < n; ++i)
-    for (const auto& col : P) out[i].parts.push_back(col[i] == UINT32_MAX ? kNullRow : (size_t)col[i]);
+  const size_t ns = P.size();
+  if (ns <= JoinedParts::INLINE_CAP) {
+    // the ids straight into each row's inline array: a star row id is 32 bits, its NULL row UINT32_MAX - the
+    // inline array's own marker (push_back's checks per id were most of this)
+    for (size_t s2 = 0; s2 < ns; ++s2) {
+      const uint32_t* col = P[s2].data();
+      for (size_t i = 0; i < n; ++i) out[i].parts.inline_arr[s2] = col[i];
+    }
+    for (size_t i = 0; i < n; ++i) out[i].parts.n = (uint8_t)ns;
+  } else {
+    for (size_t i = 0; i < n; ++i)
+      for (const auto& col : P) out[i].parts.push_back(col[i] == UINT32_MAX ? kNullRow : (size_t)col[i]);
+  }
   if (n >= 1000000) g_trim_after_statement.store(true, std::memory_order_relaxed);
   return out;
 }
@@ -46284,6 +46352,172 @@ struct LaneOrder {
   std::vector<SqlDataType> types;
   long long limit = -1, offset = 0;
 };
+// An expression as exact arithmetic the programs (vp) leave to the interpreter - a DECIMAL column, and
+// + - * over such columns, INT columns and exact literals, from any of the joined tables: each row's value a
+// scaled integer at a scale fixed when compiled, the interpreter's own (exact_arith_display: + - at the larger
+// scale, * at the sum; a fixed-scale DECIMAL cell prints all its places, so its value is (stored integer, scale)).
+// A NULL operand, a NULL row (or a LEFT JOIN's padding): NULL. A value past 64 bits declines the lanes - the
+// interpreter then answers, in 128 bits or with its error - never an approximation.
+static bool exact_lane_of(const std::vector<QuerySource>& sources, const JoinedRows& rows, const SqlExpr* e, vp::Column* col,
+                          int* xscale, std::string* why) {
+  EvalCtx vctx; vctx.sources = &sources;
+  auto no = [&](const char* w) { *why = w; return false; };
+  struct XI { int op = 0; const int64_t* v = nullptr; const uint8_t* nul = nullptr; size_t src = 0; int64_t k = 0; int scale = 0; uint32_t a = 0, b = 0; };
+  std::vector<XI> xs;
+  std::vector<std::shared_ptr<const vx::DecodedInts>> holds;
+  std::vector<std::shared_ptr<const std::vector<uint8_t>>> nholds;
+  std::function<int(const SqlExpr*)> mk = [&](const SqlExpr* x) -> int {
+    if (!x) return -1;
+    XI in;
+    if (x->op == ExprOp::Column) {
+      if (is_user_var_name(x->name) || x->name.rfind("@@", 0) == 0) return -1;
+      size_t ps = 0, pc = 0;
+      if (lookup_column_here(vctx, *x, &ps, &pc) != ColumnLookup::Found || ps >= sources.size() || !sources[ps].table) return -1;
+      const SqlTable& tb = *sources[ps].table;
+      if (tb.inferred_types || pc >= tb.columns.size() || pc >= tb.col_data.size()) return -1;
+      const ColumnStore& cs = tb.col_data[pc];
+      const SqlColumn& sc = tb.columns[pc];
+      if (sc.temporal || cs.size() != tb.row_count()) return -1;
+      if (sc.type == SqlDataType::Int && vx::typed_integer(cs)) {
+        in.scale = 0;
+      } else if (sc.type == SqlDataType::Decimal && cs.encoding == ColumnEncoding::DecimalScaled && cs.decimal_fixed() && sc.scale <= 18) {
+        double p = 1;
+        for (int i = 0; i < sc.scale; ++i) p *= 10;
+        if (cs.scale_factor != p) return -1;
+        in.scale = sc.scale;
+      } else {
+        return -1;
+      }
+      auto d = vx::decoded_ints(tb, pc);
+      if (!d || d->v.size() != cs.size()) return -1;
+      in.op = 0;
+      in.v = d->v.data();
+      in.src = ps;
+      holds.push_back(std::move(d));
+      if (vx::has_nulls(cs)) {
+        auto z = vx::decoded_nulls(tb, pc);
+        if (!z) return -1;
+        in.nul = z->data();
+        nholds.push_back(std::move(z));
+      }
+    } else if (x->op == ExprOp::Literal) {
+      AIOS_INT128 v = 0;
+      int sc = 0, ds = 0;
+      if (x->literal.null || !x->literal.numeric || x->literal.approx || !exact_internal_of(x->literal, &v, &sc, &ds) || sc != ds ||
+          sc > 18 || v > (AIOS_INT128)INT64_MAX || v < (AIOS_INT128)INT64_MIN)
+        return -1;
+      in.op = 1;
+      in.k = (int64_t)v;
+      in.scale = sc;
+    } else if (x->op == ExprOp::Neg) {
+      if (x->args.size() != 1) return -1;
+      const int ia = mk(x->args[0].get());   // -x at x's scale (val_exact_fine(-x, xs, ds))
+      if (ia < 0) return -1;
+      in.op = 5;
+      in.a = (uint32_t)ia;
+      in.scale = xs[(size_t)ia].scale;
+    } else if (x->op == ExprOp::Add || x->op == ExprOp::Sub || x->op == ExprOp::Mul) {
+      if (x->args.size() != 2) return -1;
+      const int ia = mk(x->args[0].get());
+      if (ia < 0) return -1;
+      const int ib = mk(x->args[1].get());
+      if (ib < 0) return -1;
+      in.op = x->op == ExprOp::Add ? 2 : x->op == ExprOp::Sub ? 3 : 4;
+      in.a = (uint32_t)ia;
+      in.b = (uint32_t)ib;
+      const int sa = xs[(size_t)ia].scale, sb = xs[(size_t)ib].scale;
+      in.scale = in.op == 4 ? sa + sb : std::max(sa, sb);
+      if (in.scale > 18) return -1;
+    } else {
+      return -1;
+    }
+    xs.push_back(in);
+    return (int)xs.size() - 1;
+  };
+  if (mk(e) < 0 || xs.empty()) return false;
+  static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
+                                  10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
+                                  1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
+  // An instruction at a time over every row (a column of values and one of NULL flags each), the last one's
+  // the lane: a leaf a gather by row id, an operator one loop - not a switch per instruction per row.
+  const size_t nx = xs.size(), nr = rows.size();
+  std::vector<std::vector<int64_t>> val(nx);
+  std::vector<std::vector<uint8_t>> nul(nx);
+  for (size_t q = 0; q < nx; ++q) {
+    const XI& in = xs[q];
+    std::vector<int64_t>& v = val[q];
+    std::vector<uint8_t>& z = nul[q];
+    v.assign(nr, 0);
+    z.assign(nr, 0);
+    switch (in.op) {
+      case 0:
+        for (size_t j = 0; j < nr; ++j) {
+          const auto& parts = rows[j].parts;
+          const size_t r = in.src < parts.size() ? parts[in.src] : kNullRow;
+          if (r == kNullRow || (in.nul && in.nul[r])) { z[j] = 1; continue; }
+          v[j] = in.v[r];
+        }
+        break;
+      case 1:
+        std::fill(v.begin(), v.end(), in.k);
+        break;
+      case 5: {
+        const std::vector<int64_t>& a = val[in.a];
+        const std::vector<uint8_t>& za = nul[in.a];
+        for (size_t j = 0; j < nr; ++j) {
+          if (za[j]) { z[j] = 1; continue; }
+          if (a[j] == INT64_MIN) return no("an exact negation past 64 bits");
+          v[j] = -a[j];
+        }
+        break;
+      }
+      default: {
+        const std::vector<int64_t>& a = val[in.a];
+        const std::vector<int64_t>& b = val[in.b];
+        const std::vector<uint8_t>& za = nul[in.a];
+        const std::vector<uint8_t>& zb = nul[in.b];
+        bool over = false;
+        if (in.op == 4) {
+          for (size_t j = 0; j < nr; ++j) {
+            z[j] = za[j] | zb[j];
+            over |= __builtin_mul_overflow(a[j], b[j], &v[j]);
+          }
+          if (over) {   // only a row with both operands present counts (a NULL row's operand is 0 here)
+            for (size_t j = 0; j < nr; ++j) { int64_t r = 0; if (!z[j] && __builtin_mul_overflow(a[j], b[j], &r)) return no("an exact product past 64 bits"); }
+          }
+        } else {
+          const int sa = xs[in.a].scale, sb = xs[in.b].scale;
+          const int64_t ma = p10[in.scale - sa], mb = p10[in.scale - sb];
+          const bool add = in.op == 2;
+          for (size_t j = 0; j < nr; ++j) {
+            z[j] = za[j] | zb[j];
+            int64_t x = 0, y = 0;
+            bool o = __builtin_mul_overflow(a[j], ma, &x);
+            o |= __builtin_mul_overflow(b[j], mb, &y);
+            o |= add ? __builtin_add_overflow(x, y, &v[j]) : __builtin_sub_overflow(x, y, &v[j]);
+            if (o && !z[j]) return no("an exact sum past 64 bits");
+          }
+        }
+      }
+    }
+    // an operator's operands are read by it alone (mk builds a tree): freed once it has run
+    if (in.op >= 2) {
+      std::vector<int64_t>().swap(val[in.a]);
+      std::vector<uint8_t>().swap(nul[in.a]);
+      if (in.op != 5) { std::vector<int64_t>().swap(val[in.b]); std::vector<uint8_t>().swap(nul[in.b]); }
+    }
+  }
+  col->ty = vp::Ty::I64;
+  col->approx = false;
+  col->uns = false;
+  col->i = std::move(val[nx - 1]);
+  col->n = std::move(nul[nx - 1]);
+  for (size_t j = 0; j < nr; ++j) if (col->n[j]) col->i[j] = 0;
+  *xscale = xs.back().scale;
+  return true;
+}
+
+
 static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sources, const EvalCtx* outer, const JoinedRows& rows,
                           const std::vector<ExprPtr>& group_by, const std::vector<SelectItem>& items, const ExprPtr& having,
                           std::vector<vp::Column>* lanes_out, std::vector<std::vector<std::string>>* text_out, size_t* ngroups,
@@ -46339,166 +46573,12 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     }
   }
   EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
-  // An aggregate's argument as exact arithmetic the programs (vp) leave to the interpreter - a DECIMAL column, and
-  // + - * over such columns, INT columns and exact literals, from any of the joined tables: each row's value a
-  // scaled integer at a scale fixed when compiled, the interpreter's own (exact_arith_display: + - at the larger
-  // scale, * at the sum; a fixed-scale DECIMAL cell prints all its places, so its value is (stored integer, scale)).
-  // A NULL operand, a NULL row (or a LEFT JOIN's padding): NULL. A value past 64 bits declines the lanes - the
-  // interpreter then answers, in 128 bits or with its error - never an approximation.
+  // An aggregate's argument as exact arithmetic the programs leave to the interpreter (exact_lane_of).
   auto exact_lane = [&](const SqlExpr* e, vp::Column* col, int* xscale) -> bool {
-    struct XI { int op = 0; const int64_t* v = nullptr; const uint8_t* nul = nullptr; size_t src = 0; int64_t k = 0; int scale = 0; uint32_t a = 0, b = 0; };
-    std::vector<XI> xs;
-    std::vector<std::shared_ptr<const vx::DecodedInts>> holds;
-    std::vector<std::shared_ptr<const std::vector<uint8_t>>> nholds;
-    std::function<int(const SqlExpr*)> mk = [&](const SqlExpr* x) -> int {
-      if (!x) return -1;
-      XI in;
-      if (x->op == ExprOp::Column) {
-        if (is_user_var_name(x->name) || x->name.rfind("@@", 0) == 0) return -1;
-        size_t ps = 0, pc = 0;
-        if (lookup_column_here(vctx, *x, &ps, &pc) != ColumnLookup::Found || ps >= sources.size() || !sources[ps].table) return -1;
-        const SqlTable& tb = *sources[ps].table;
-        if (tb.inferred_types || pc >= tb.columns.size() || pc >= tb.col_data.size()) return -1;
-        const ColumnStore& cs = tb.col_data[pc];
-        const SqlColumn& sc = tb.columns[pc];
-        if (sc.temporal || cs.size() != tb.row_count()) return -1;
-        if (sc.type == SqlDataType::Int && vx::typed_integer(cs)) {
-          in.scale = 0;
-        } else if (sc.type == SqlDataType::Decimal && cs.encoding == ColumnEncoding::DecimalScaled && cs.decimal_fixed() && sc.scale <= 18) {
-          double p = 1;
-          for (int i = 0; i < sc.scale; ++i) p *= 10;
-          if (cs.scale_factor != p) return -1;
-          in.scale = sc.scale;
-        } else {
-          return -1;
-        }
-        auto d = vx::decoded_ints(tb, pc);
-        if (!d || d->v.size() != cs.size()) return -1;
-        in.op = 0;
-        in.v = d->v.data();
-        in.src = ps;
-        holds.push_back(std::move(d));
-        if (vx::has_nulls(cs)) {
-          auto z = vx::decoded_nulls(tb, pc);
-          if (!z) return -1;
-          in.nul = z->data();
-          nholds.push_back(std::move(z));
-        }
-      } else if (x->op == ExprOp::Literal) {
-        AIOS_INT128 v = 0;
-        int sc = 0, ds = 0;
-        if (x->literal.null || !x->literal.numeric || x->literal.approx || !exact_internal_of(x->literal, &v, &sc, &ds) || sc != ds ||
-            sc > 18 || v > (AIOS_INT128)INT64_MAX || v < (AIOS_INT128)INT64_MIN)
-          return -1;
-        in.op = 1;
-        in.k = (int64_t)v;
-        in.scale = sc;
-      } else if (x->op == ExprOp::Neg) {
-        if (x->args.size() != 1) return -1;
-        const int ia = mk(x->args[0].get());   // -x at x's scale (val_exact_fine(-x, xs, ds))
-        if (ia < 0) return -1;
-        in.op = 5;
-        in.a = (uint32_t)ia;
-        in.scale = xs[(size_t)ia].scale;
-      } else if (x->op == ExprOp::Add || x->op == ExprOp::Sub || x->op == ExprOp::Mul) {
-        if (x->args.size() != 2) return -1;
-        const int ia = mk(x->args[0].get());
-        if (ia < 0) return -1;
-        const int ib = mk(x->args[1].get());
-        if (ib < 0) return -1;
-        in.op = x->op == ExprOp::Add ? 2 : x->op == ExprOp::Sub ? 3 : 4;
-        in.a = (uint32_t)ia;
-        in.b = (uint32_t)ib;
-        const int sa = xs[(size_t)ia].scale, sb = xs[(size_t)ib].scale;
-        in.scale = in.op == 4 ? sa + sb : std::max(sa, sb);
-        if (in.scale > 18) return -1;
-      } else {
-        return -1;
-      }
-      xs.push_back(in);
-      return (int)xs.size() - 1;
-    };
-    if (mk(e) < 0 || xs.empty()) return false;
-    static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
-                                    10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
-                                    1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
-    // An instruction at a time over every row (a column of values and one of NULL flags each), the last one's
-    // the lane: a leaf a gather by row id, an operator one loop - not a switch per instruction per row.
-    const size_t nx = xs.size(), nr = rows.size();
-    std::vector<std::vector<int64_t>> val(nx);
-    std::vector<std::vector<uint8_t>> nul(nx);
-    for (size_t q = 0; q < nx; ++q) {
-      const XI& in = xs[q];
-      std::vector<int64_t>& v = val[q];
-      std::vector<uint8_t>& z = nul[q];
-      v.assign(nr, 0);
-      z.assign(nr, 0);
-      switch (in.op) {
-        case 0:
-          for (size_t j = 0; j < nr; ++j) {
-            const auto& parts = rows[j].parts;
-            const size_t r = in.src < parts.size() ? parts[in.src] : kNullRow;
-            if (r == kNullRow || (in.nul && in.nul[r])) { z[j] = 1; continue; }
-            v[j] = in.v[r];
-          }
-          break;
-        case 1:
-          std::fill(v.begin(), v.end(), in.k);
-          break;
-        case 5: {
-          const std::vector<int64_t>& a = val[in.a];
-          const std::vector<uint8_t>& za = nul[in.a];
-          for (size_t j = 0; j < nr; ++j) {
-            if (za[j]) { z[j] = 1; continue; }
-            if (a[j] == INT64_MIN) return no("an exact negation past 64 bits");
-            v[j] = -a[j];
-          }
-          break;
-        }
-        default: {
-          const std::vector<int64_t>& a = val[in.a];
-          const std::vector<int64_t>& b = val[in.b];
-          const std::vector<uint8_t>& za = nul[in.a];
-          const std::vector<uint8_t>& zb = nul[in.b];
-          bool over = false;
-          if (in.op == 4) {
-            for (size_t j = 0; j < nr; ++j) {
-              z[j] = za[j] | zb[j];
-              over |= __builtin_mul_overflow(a[j], b[j], &v[j]);
-            }
-            if (over) {   // only a row with both operands present counts (a NULL row's operand is 0 here)
-              for (size_t j = 0; j < nr; ++j) { int64_t r = 0; if (!z[j] && __builtin_mul_overflow(a[j], b[j], &r)) return no("an exact product past 64 bits"); }
-            }
-          } else {
-            const int sa = xs[in.a].scale, sb = xs[in.b].scale;
-            const int64_t ma = p10[in.scale - sa], mb = p10[in.scale - sb];
-            const bool add = in.op == 2;
-            for (size_t j = 0; j < nr; ++j) {
-              z[j] = za[j] | zb[j];
-              int64_t x = 0, y = 0;
-              bool o = __builtin_mul_overflow(a[j], ma, &x);
-              o |= __builtin_mul_overflow(b[j], mb, &y);
-              o |= add ? __builtin_add_overflow(x, y, &v[j]) : __builtin_sub_overflow(x, y, &v[j]);
-              if (o && !z[j]) return no("an exact sum past 64 bits");
-            }
-          }
-        }
-      }
-      // an operator's operands are read by it alone (mk builds a tree): freed once it has run
-      if (in.op >= 2) {
-        std::vector<int64_t>().swap(val[in.a]);
-        std::vector<uint8_t>().swap(nul[in.a]);
-        if (in.op != 5) { std::vector<int64_t>().swap(val[in.b]); std::vector<uint8_t>().swap(nul[in.b]); }
-      }
-    }
-    col->ty = vp::Ty::I64;
-    col->approx = false;
-    col->uns = false;
-    col->i = std::move(val[nx - 1]);
-    col->n = std::move(nul[nx - 1]);
-    for (size_t j = 0; j < nr; ++j) if (col->n[j]) col->i[j] = 0;
-    *xscale = xs.back().scale;
-    return true;
+    std::string why;
+    if (exact_lane_of(sources, rows, e, col, xscale, &why)) return true;
+    if (!why.empty()) no(why);
+    return false;
   };
   // key: a GROUP BY key - a dictionary-coded text column groups by its entries' collation classes (dict_classes),
   // and the groups then come out in class order, not the text's (*keys_exact false: the caller sorts). dbl: an
@@ -46702,7 +46782,42 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       if (a.arg.ty == vp::Ty::F64 && a.arg.approx) {
         for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_approx(a.arg.f[r]);
       } else if (a.xscale > 0) {
-        for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_scaled(a.arg.i[r], a.xscale);
+        // Every value at the one scale: a group's add_scaled calls leave exact, etotal the values' sum at that
+        // scale (128 bits hold 2^64 int64s), escale = dscale = the scale and total the doubles' running sum - made
+        // so here a group at a time from its integer sum, the per-value doubles summed in row order as before.
+        // A value of 2^53 or more goes through add_scaled itself (its double is the Val's).
+        static const double p10d[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+                                        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+        const int xs = a.xscale;
+        bool small = xs <= 22;
+        for (size_t r = 0; r < n && small; ++r)
+          if (!a.arg.n[r] && (a.arg.i[r] <= -9007199254740992LL || a.arg.i[r] >= 9007199254740992LL)) small = false;
+        if (!small) {
+          for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_scaled(a.arg.i[r], xs);
+        } else {
+          std::vector<AIOS_INT128> et(G, 0);
+          std::vector<double> tot(G, 0.0);
+          std::vector<size_t> cnt(G, 0);
+          const double p = p10d[xs];
+          for (size_t r = 0; r < n; ++r) {
+            if (a.arg.n[r]) continue;
+            const uint32_t g = gid[r];
+            const int64_t x = a.arg.i[r];
+            et[g] += x;
+            tot[g] += (double)x / p;
+            ++cnt[g];
+          }
+          for (size_t g = 0; g < G; ++g) {
+            if (!cnt[g]) continue;
+            SumAcc& acc = sums[k][g];
+            acc.total = tot[g];
+            acc.count = cnt[g];
+            acc.exact = true;
+            acc.etotal = et[g];
+            acc.escale = xs;
+            acc.dscale = xs;
+          }
+        }
       } else if (a.arg.ty == vp::Ty::I64 && !a.arg.uns) {
         for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) sums[k][gid[r]].add_i64(a.arg.i[r]);
       } else {
@@ -51756,6 +51871,111 @@ static std::optional<SqlQueryResult> residual_filter(const FilterPlan& plan) {
   // WHERE (for multi-source joins or if not filtered during single-source scan).
   // Only what the joins left unchecked: re-evaluating the whole WHERE on
   // 1.2M joined rows because one part could not be pushed cost 2 s.
+  // The leading conjuncts that compile, a column at a time over the rows, each over the rows the one before it
+  // kept (the interpreter's order, so a row an earlier part drops is never shown to a later one): a program (vp)
+  // whose value is a truth (a comparison, AND / OR / NOT, IS [NOT] NULL), or a comparison of two exact numbers
+  // (exact_lane_of: a DECIMAL column against an INT expression, which no program reads) at their common scale -
+  // the interpreter's exact numeric order. The first part that does not compile, and those after it, stay with
+  // the interpreter below; a part whose lanes fail (an overflow) too - the interpreter then answers, or errs, itself.
+  // `l.price > c.salestype * 10` over 600k joined rows was 190 ms of interpreter.
+  if (where && !fast_pk_done && rows.size() >= 1024 && !sql_no_vx_env()) {
+    std::vector<const SqlExpr*> parts = where_residual;
+    if (parts.empty()) collect_conjuncts(where.get(), &parts);
+    EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
+    auto truth_root = [](vp::Ins::Op op) {
+      return op == vp::Ins::Eq || op == vp::Ins::Ne || op == vp::Ins::Lt || op == vp::Ins::Le || op == vp::Ins::Gt ||
+             op == vp::Ins::Ge || op == vp::Ins::And || op == vp::Ins::Or || op == vp::Ins::Not || op == vp::Ins::IsNull ||
+             op == vp::Ins::NotNull || op == vp::Ins::ColNull || op == vp::Ins::StrIn;
+    };
+    // A part's truth per row, as the interpreter's three values: 1 true, 0 false, -1 NULL.
+    std::function<bool(const SqlExpr*, std::vector<int8_t>*)> tri = [&](const SqlExpr* p, std::vector<int8_t>* out) -> bool {
+      const size_t n = rows.size();
+      if (!p) return false;
+      if (const vp::Prog* P = vp::program_for(p, vctx)) {
+        if (P->out().ty != vp::Ty::I64 || !truth_root(P->out().op)) return false;
+        vp::Column col;
+        std::string verr;
+        if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) return false;
+        if (col.size() != n || col.ty != vp::Ty::I64) return false;
+        out->assign(n, 0);
+        for (size_t j = 0; j < n; ++j) (*out)[j] = col.n[j] ? -1 : col.i[j] != 0;
+        return true;
+      }
+      if ((p->op == ExprOp::And || p->op == ExprOp::Or) && p->args.size() == 2) {
+        std::vector<int8_t> b;
+        if (!tri(p->args[0].get(), out) || !tri(p->args[1].get(), &b)) return false;
+        const bool and_ = p->op == ExprOp::And;
+        for (size_t j = 0; j < n; ++j) {
+          const int8_t x = (*out)[j], y = b[j];
+          (*out)[j] = and_ ? (x == 0 || y == 0 ? 0 : x < 0 || y < 0 ? -1 : 1) : (x == 1 || y == 1 ? 1 : x < 0 || y < 0 ? -1 : 0);
+        }
+        return true;
+      }
+      if (p->op == ExprOp::Not && p->args.size() == 1) {
+        if (!tri(p->args[0].get(), out)) return false;
+        for (int8_t& x : *out) if (x >= 0) x = (int8_t)(1 - x);
+        return true;
+      }
+      if (p->args.size() != 2 || !(p->op == ExprOp::Eq || p->op == ExprOp::Ne || p->op == ExprOp::Lt || p->op == ExprOp::Le ||
+                                   p->op == ExprOp::Gt || p->op == ExprOp::Ge))
+        return false;
+      vp::Column a, b;
+      int sa = 0, sb = 0;
+      std::string why;
+      if (!exact_lane_of(sources, rows, p->args[0].get(), &a, &sa, &why) || !exact_lane_of(sources, rows, p->args[1].get(), &b, &sb, &why))
+        return false;
+      static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
+                                      10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
+                                      1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
+      const int sm = std::max(sa, sb);
+      const int64_t ma = p10[sm - sa], mb = p10[sm - sb];
+      out->assign(n, -1);
+      for (size_t j = 0; j < n; ++j) {
+        if (a.n[j] || b.n[j]) continue;   // NULL
+        int64_t x = 0, y = 0;
+        if (__builtin_mul_overflow(a.i[j], ma, &x) || __builtin_mul_overflow(b.i[j], mb, &y)) return false;
+        bool t = false;
+        switch (p->op) {
+          case ExprOp::Eq: t = x == y; break;
+          case ExprOp::Ne: t = x != y; break;
+          case ExprOp::Lt: t = x < y; break;
+          case ExprOp::Le: t = x <= y; break;
+          case ExprOp::Gt: t = x > y; break;
+          default: t = x >= y; break;
+        }
+        (*out)[j] = t;
+      }
+      return true;
+    };
+    auto keep_of = [&](const SqlExpr* p, std::vector<uint8_t>* keep) -> bool {
+      std::vector<int8_t> t;
+      if (!tri(p, &t)) return false;
+      keep->resize(t.size());
+      for (size_t j = 0; j < t.size(); ++j) (*keep)[j] = t[j] == 1;
+      return true;
+    };
+    size_t done = 0;
+    const uint64_t vt0 = vx_trace_on() ? hal_now_ns() : 0;
+    const size_t before = rows.size();
+    for (; done < parts.size() && !rows.empty(); ++done) {
+      std::vector<uint8_t> keep;
+      if (!keep_of(parts[done], &keep)) break;
+      size_t w = 0;
+      for (size_t j = 0; j < rows.size(); ++j)
+        if (keep[j]) { if (w != j) rows[w] = std::move(rows[j]); ++w; }
+      rows.resize(w);
+    }
+    if (rows.empty()) done = parts.size();   // nothing left for the rest to refuse
+    if (vx_trace_on() && done)
+      vx_trace("where after joins: " + std::to_string(done) + " of " + std::to_string(parts.size()) + " part(s) in lanes, " +
+               std::to_string(before) + " -> " + std::to_string(rows.size()) + " rows, " + std::to_string((hal_now_ns() - vt0) / 1000) + " us");
+    if (done == parts.size()) {
+      where = nullptr;
+      where_residual.clear();
+    } else if (done) {
+      where_residual.assign(parts.begin() + (long)done, parts.end());
+    }
+  }
   auto residual_true = [&](const EvalCtx& c) {
     if (where_residual.empty()) return predicate_true(where.get(), c);
     for (const SqlExpr* p : where_residual)
