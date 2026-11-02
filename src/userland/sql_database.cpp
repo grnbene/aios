@@ -1358,14 +1358,26 @@ std::string scaled_to_decimal(AIOS_INT128 v, int scale) {
   char* p = end;
   int nd = 0;
   bool zero = true;
-  do {
-    const int d = (int)(u % 10);
-    if (d) zero = false;
-    *--p = char('0' + d);
-    u /= 10;
-    ++nd;
-    if (scale > 0 && nd == scale) *--p = '.';
-  } while (u > 0 && p > buf + 2);
+  if (u <= (AIOS_UINT128)UINT64_MAX) {   // the same digits by 64-bit division (a 128-bit one is a library call)
+    uint64_t w = (uint64_t)u;
+    do {
+      const int d = (int)(w % 10);
+      if (d) zero = false;
+      *--p = char('0' + d);
+      w /= 10;
+      ++nd;
+      if (scale > 0 && nd == scale) *--p = '.';
+    } while (w > 0 && p > buf + 2);
+  } else {
+    do {
+      const int d = (int)(u % 10);
+      if (d) zero = false;
+      *--p = char('0' + d);
+      u /= 10;
+      ++nd;
+      if (scale > 0 && nd == scale) *--p = '.';
+    } while (u > 0 && p > buf + 2);
+  }
   if (scale > 0) {
     while (nd < scale && p > buf + 2) { *--p = '0'; ++nd; if (nd == scale) *--p = '.'; }
     if (*p == '.') *--p = '0';   // 0.xx: a whole part of 0
@@ -3072,7 +3084,13 @@ AIOS_INT128 scale_down_half_up(AIOS_INT128 v, int by) {
 Val val_exact(AIOS_INT128 v, int scale) {
   std::string text = scaled_to_decimal(v, scale);
   double d = 0;
-  parse_number(text, &d);
+  // The text's double, as parse_number reads it (strtod: correctly rounded): v / 10^scale divided as doubles is
+  // that same correctly rounded value while both are exact doubles (|v| < 2^53, 10^scale for scale <= 22) - without
+  // strtod's ~1,000 instructions, most of finishing 40k exact group sums.
+  static const double p10[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+                                 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+  if (scale >= 0 && scale <= 22 && v > -(AIOS_INT128)9007199254740992LL && v < (AIOS_INT128)9007199254740992LL) d = (double)(int64_t)v / p10[scale];
+  else parse_number(text, &d);
   return val_num_with_text(d, text);
 }
 
@@ -51195,16 +51213,30 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
       std::vector<uint8_t> kn(R * nk, 0);
       for (size_t i = 0; i < nk; ++i) {
         const RK& f = rk[i];
-        const ColumnStore& kcs = sources[f.src].table->col_data[f.col];
-        for (size_t ri = 0; ri < R; ++ri) {
-          const JoinedRow& r = rows[ri];
-          const size_t pr = f.src < r.parts.size() ? r.parts[f.src] : kNullRow;
-          if (pr == kNullRow || kcs.is_null(pr)) { kn[ri * nk + i] = 1; continue; }
-          if (f.kind == 1) { kv[ri * nk + i] = vx::typed_value(kcs, pr); continue; }
-          const uint32_t code = vx::code_at(kcs, pr);
-          const int rnk = code < f.rank.size() ? f.rank[code] : -1;
-          if (rnk < 0) kn[ri * nk + i] = 1; else kv[ri * nk + i] = rnk;
+        const SqlTable& kt = *sources[f.src].table;
+        const ColumnStore& kcs = kt.col_data[f.col];
+        // the column decoded whole where the rows read much of it (cached between statements), each row's key in
+        // parallel ranges: a value or code read per row (typed_value, code_at) was most of a 257k-row top 20
+        std::shared_ptr<const std::vector<double>> wv;
+        std::shared_ptr<const std::vector<uint32_t>> wc;
+        std::shared_ptr<const std::vector<uint8_t>> wn;
+        if (kcs.size() <= R * 4 && !kt.inferred_types) {
+          if (f.kind == 1) wv = vx::decoded_values(kt, f.col); else wc = vx::decoded_codes(kt, f.col);
+          if (vx::has_nulls(kcs)) wn = vx::decoded_nulls(kt, f.col);
+          if ((f.kind == 1 ? !wv : !wc) || (vx::has_nulls(kcs) && !wn)) { wv.reset(); wc.reset(); wn.reset(); }
         }
+        const bool whole = wv || wc;
+        SqlThreadPool::instance().for_chunks(R, 16384, R, false, [&](size_t r0, size_t r1, size_t) {
+          for (size_t ri = r0; ri < r1; ++ri) {
+            const JoinedRow& r = rows[ri];
+            const size_t pr = f.src < r.parts.size() ? r.parts[f.src] : kNullRow;
+            if (pr == kNullRow || (whole ? (wn && (*wn)[pr]) : kcs.is_null(pr))) { kn[ri * nk + i] = 1; continue; }
+            if (f.kind == 1) { kv[ri * nk + i] = whole ? (*wv)[pr] : vx::typed_value(kcs, pr); continue; }
+            const uint32_t code = whole ? (*wc)[pr] : vx::code_at(kcs, pr);
+            const int rnk = code < f.rank.size() ? f.rank[code] : -1;
+            if (rnk < 0) kn[ri * nk + i] = 1; else kv[ri * nk + i] = rnk;
+          }
+        });
       }
       std::vector<uint32_t> idx(R);
       for (size_t ri = 0; ri < R; ++ri) idx[ri] = (uint32_t)ri;
