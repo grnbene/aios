@@ -84,6 +84,27 @@ void expect_error(SqlDatabase& db, const std::string& label, const std::string& 
   std::cout << "  [ok] " << label << " refused: " << r.error_message << "\n";
 }
 
+// The statement's EXPLAIN lines name `needle` (want) or do not (!want): which rewrite the planner took.
+void expect_plan(SqlDatabase& db, const std::string& label, const std::string& sql, const std::string& needle, bool want) {
+  g_checks++;
+  SqlQueryResult r = db.execute_query("EXPLAIN " + sql);
+  if (!r.success) {
+    std::cerr << "  [FAIL] " << label << ": " << r.error_message << "\n";
+    g_failures++;
+    return;
+  }
+  bool found = false;
+  for (const auto& row : r.rows)
+    if (!row.values.empty() && sql_display(row.values[0]).find(needle) != std::string::npos) found = true;
+  if (found != want) {
+    std::cerr << "  [FAIL] " << label << ": plan " << (want ? "lacks" : "has") << " '" << needle << "'\n";
+    for (const auto& row : r.rows) if (!row.values.empty()) std::cerr << "      " << sql_display(row.values[0]) << "\n";
+    g_failures++;
+    return;
+  }
+  std::cout << "  [ok] " << label << " (" << (want ? "has" : "no") << " '" << needle << "')\n";
+}
+
 void seed(SqlDatabase& db) {
   run_ok(db, "CREATE TABLE stockmaster (stockid VARCHAR(20) PRIMARY KEY, description VARCHAR(100), categoryid VARCHAR(10))");
   run_ok(db, "INSERT INTO stockmaster VALUES ('T1','Tire One','TIRE'),('T2','Tire Two','TIRE'),('O1','Oil Filter','O'),('L1','Labor','L')");
@@ -174,6 +195,44 @@ int main() {
   expect_rows(db, "EXISTS under OR",
               "SELECT s.stockid FROM stockmaster s WHERE s.categoryid = 'L' "
               "OR EXISTS (SELECT 1 FROM purchdata p WHERE p.stockid = s.stockid AND p.supplierno = 'ATD')", 3);
+
+  // km's stocktrans view: `(stockid <> 'ZZMCMISC' OR NOT EXISTS (a write-off line of the same invoice))`. Inside
+  // the OR the subquery ran once per ZZMCMISC row (7,800 statements in one report); it is the hashed NOT IN now.
+  // Rows 4 and 5 have a NULL key: the correlated = never matches them, so NOT EXISTS holds and EXISTS does not.
+  std::cout << "\n-- gap 6b: [NOT] EXISTS inside OR runs once --\n";
+  run_ok(db, "CREATE TABLE wm (id INT PRIMARY KEY, transno INT, type INT, debtorno VARCHAR(10), stockid VARCHAR(20), shown INT)");
+  run_ok(db, "INSERT INTO wm VALUES (1,100,10,'D1','ZZMCMISC',1),(2,100,10,'D1','ZZMCWRITEOFF',0),(3,101,10,'D1','ZZMCMISC',1),"
+             "(4,NULL,10,'D2','ZZMCMISC',1),(5,NULL,10,'D2','ZZMCMISC',0),(6,102,10,'D3','X',1),(7,102,10,'D3','ZZMCMISC',1),"
+             "(8,103,11,'D3','ZZMCMISC',0)");
+  const std::string wo =
+      "(SELECT 1 FROM wm wo WHERE wo.transno = wm.transno AND wo.type = wm.type AND wo.debtorno = wm.debtorno "
+      "AND wo.stockid IN ('ZZMCMISC','ZZMCWRITEOFF') AND wo.shown = 0 LIMIT 1)";
+  const std::string q_or_not = "SELECT id FROM wm WHERE (wm.stockid <> 'ZZMCMISC' OR NOT EXISTS " + wo + ")";
+  expect_rows(db, "NOT EXISTS inside OR (NULL keys kept)", q_or_not, 6);
+  expect_cell(db, "NOT EXISTS inside OR: which rows", "SELECT GROUP_CONCAT(id ORDER BY id) FROM (" + q_or_not + ") x", 0, "2,3,4,5,6,7");
+  expect_plan(db, "NOT EXISTS inside OR is a NOT IN", q_or_not, "NOT EXISTS as NOT IN", true);
+  const std::string q_or = "SELECT id FROM wm WHERE wm.stockid = 'X' OR EXISTS " + wo;
+  expect_cell(db, "EXISTS inside OR: which rows", "SELECT GROUP_CONCAT(id ORDER BY id) FROM (" + q_or + ") x", 0, "1,2,6,8");
+  expect_plan(db, "EXISTS inside OR is an IN", q_or, "EXISTS as IN", true);
+  // Under NOT an unknown is not a false: IN of a NULL key would drop rows 4 and 5. Left correlated.
+  const std::string q_not = "SELECT id FROM wm WHERE NOT (wm.stockid = 'X' OR EXISTS " + wo + ")";
+  expect_cell(db, "EXISTS under NOT (NULL keys kept)", "SELECT GROUP_CONCAT(id ORDER BY id) FROM (" + q_not + ") x", 0, "3,4,5,7");
+  expect_plan(db, "EXISTS under NOT is not rewritten", q_not, "EXISTS as IN", false);
+  const std::string q_nest = "SELECT id FROM wm WHERE wm.id = 1 OR (wm.stockid = 'ZZMCMISC' AND NOT EXISTS " + wo + ")";
+  expect_cell(db, "NOT EXISTS in AND inside OR: which rows", "SELECT GROUP_CONCAT(id ORDER BY id) FROM (" + q_nest + ") x", 0, "1,3,4,5,7");
+  expect_plan(db, "NOT EXISTS in AND inside OR is a NOT IN", q_nest, "NOT EXISTS as NOT IN", true);
+  run_ok(db, "CREATE VIEW wmv AS SELECT wm.id AS id, wm.stockid AS stockid FROM wm WHERE (wm.stockid <> 'ZZMCMISC' OR NOT EXISTS " + wo + ")");
+  expect_cell(db, "the OR NOT EXISTS of a view: which rows", "SELECT GROUP_CONCAT(id ORDER BY id) FROM wmv", 0, "2,3,4,5,6,7");
+  expect_plan(db, "the OR NOT EXISTS of a view is a NOT IN", "SELECT COUNT(*) FROM wmv WHERE stockid <> 'X'", "NOT EXISTS as NOT IN", true);
+  // as MariaDB stores a view (SHOW CREATE VIEW): every name quoted, `from` a column name that is a keyword
+  run_ok(db, "CREATE TABLE wq (id INT PRIMARY KEY, transno INT, `from` VARCHAR(10), stockid VARCHAR(20))");
+  run_ok(db, "INSERT INTO wq VALUES (1,100,'a','ZZMCMISC'),(2,100,'a','ZZMCWRITEOFF'),(3,101,'a','ZZMCMISC'),(4,NULL,'b','ZZMCMISC'),(5,102,NULL,'ZZMCMISC')");
+  run_ok(db, "CREATE VIEW wqv AS select `wq`.`id` AS `id` from `wq` where (`wq`.`stockid` <> 'ZZMCMISC' or not exists(select 1 from `wq` `wo` "
+             "where `wo`.`transno` = `wq`.`transno` and `wo`.`from` = `wq`.`from` and `wo`.`stockid` = 'ZZMCWRITEOFF' limit 1))");
+  expect_cell(db, "a backtick-quoted view's OR NOT EXISTS: which rows", "SELECT GROUP_CONCAT(id ORDER BY id) FROM wqv", 0, "2,3,4,5");
+  expect_plan(db, "a backtick-quoted view's OR NOT EXISTS is a NOT IN", "SELECT COUNT(*) FROM wqv WHERE id > 0", "NOT EXISTS as NOT IN", true);
+  expect_cell(db, "the view joined: which rows",
+              "SELECT GROUP_CONCAT(v.id ORDER BY v.id) FROM wmv v JOIN wm ON wm.id = v.id WHERE wm.type = 10", 0, "2,3,4,5,6,7");
 
   std::cout << "\n-- gap 7: correlated subquery against the JOIN's own target --\n";
   expect_rows(db, "scalar subquery correlated to joined table",

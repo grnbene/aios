@@ -3273,7 +3273,9 @@ bool exact_arith_display(ExprOp op, const Val& l, const Val& r, Val* out) {
 // below, 0 of 9245). Here: the double's shortest digits, rounded to 15 significant digits - what absorbs the binary
 // noise a product or sum leaves - then to d places half away from zero, exactly. A rounded zero has no sign. False
 // for what this does not cover (not finite; past 38 digits), which the binary path then rounds.
-bool round_double_as_written(double value, long long d, Val* out) {
+// round_double_as_written's number: *q at max(d, 0) places (CAST(x AS DECIMAL(p, d)) of a DOUBLE takes its digits
+// from here, the exact lanes too).
+bool round_double_scaled(double value, long long d, AIOS_INT128* q_out) {
   if (!std::isfinite(value) || d > 30 || d < -38) return false;
   char buf[64];
   const auto tc = std::to_chars(buf, buf + sizeof buf, value, std::chars_format::scientific);
@@ -3300,6 +3302,13 @@ bool round_double_as_written(double value, long long d, Val* out) {
     q = drop > 38 ? 0 : scale_down_half_up(m, drop);
     if (d < 0 && !scale_up_exact(&q, (int)-d)) return false;
   }
+  *q_out = q;
+  return true;
+}
+bool round_double_as_written(double value, long long d, Val* out) {
+  AIOS_INT128 q = 0;
+  if (!round_double_scaled(value, d, &q)) return false;
+  const int target = d > 0 ? (int)d : 0;
   const std::string text = scaled_to_decimal(q, target);   // no "-0.00": a rounded zero has no sign
   double dv = 0;
   parse_number(text, &dv);
@@ -7517,6 +7526,14 @@ struct ScalarBatch {
   const SqlTable* t = nullptr;
   uint64_t mseq = 0;
   size_t rows = 0;
+  // Over a view: right while no table has been written since (the database's write generation; the view's own
+  // shell table never changes).
+  const SqlDatabase* gen_db = nullptr;
+  uint64_t gen = 0;
+  bool current() const {
+    if (gen_db) return gen_db->query_cache_generation() == gen;
+    return t->mutation_seq == mseq && t->row_count() == rows;
+  }
   bool text_key = false;
   // The values as the aggregate made them (direct) or as read back from the
   // statement's text (raw false): handed out the way a subquery's answer is,
@@ -7623,8 +7640,28 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
   if (!lookup && (agg->op != ExprOp::Func || agg->window)) return nullptr;
   const std::string up = lookup ? std::string() : upper_of(agg->name);
   if (!lookup && up != "SUM" && up != "COUNT" && up != "AVG" && up != "MIN" && up != "MAX") return nullptr;
-  SqlTable* t = ctx.db->resolve_table(b.sources[0].table_name);
-  if (!t || !ctx.db->is_stored_table(t) || t->inferred_types) return nullptr;
+  // A view (the ERP's stocktrans, ten tables joined): its columns typed as the view's, the grouped statement run
+  // over the view as written - one join for every key instead of one a row - and never the direct readers' (they
+  // read a stored table's columns) nor kept across statements by a table's counters. Not resolved as a table:
+  // that would materialize all of it.
+  const SqlView* view = ctx.db->find_view(b.sources[0].table_name);
+  const bool over_view = view != nullptr;
+  SqlTable view_shell;
+  SqlTable* t = nullptr;
+  if (over_view) {
+    if (lookup) return nullptr;
+    view_shell.name = view->name;
+    view_shell.database = view->database;
+    view_shell.columns = view->columns;
+    t = &view_shell;
+  } else {
+    t = ctx.db->resolve_table(b.sources[0].table_name);
+    if (!t || !ctx.db->is_stored_table(t) || t->inferred_types) return nullptr;
+  }
+  auto view_no = [&](const char* why) -> std::shared_ptr<const ScalarBatch> {
+    if (over_view && vx_trace_on()) vx_trace(std::string("subquery per key over view ") + view->name + ": not batched: " + why);
+    return nullptr;
+  };
   const std::string iname = last_name_part(b.sources[0].table_name);
   const std::string ialias = b.sources[0].alias.empty() ? iname : lower_of(b.sources[0].alias);
   auto inner_q = [&](const std::string& q) { return q.empty() || last_name_part(q) == ialias; };
@@ -7667,7 +7704,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     }
     only_inner(c, false);
   }
-  if (bad || !A || !B) return nullptr;
+  if (bad || !A || !B) return view_no(bad ? "reads more than its own columns" : "no correlation column = outer column");
   // The outer column, and the two key types: text with text, number with number.
   auto ob = std::make_shared<ScalarBatch>();
   ob->outer = clone_expr(B);
@@ -7686,10 +7723,10 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     ob->code_entry = std::vector<std::atomic<int32_t>>(vx::dict_size(otab->col_data[oc]));
     for (auto& x : ob->code_entry) x.store(-2, std::memory_order_relaxed);
   }
-  if (ocol.temporal || icol.temporal) return nullptr;
+  if (ocol.temporal || icol.temporal) return view_no("a temporal key");
   const bool otext = ocol.type == SqlDataType::Text, itext = icol.type == SqlDataType::Text;
-  if (otext != itext) return nullptr;
-  if (!otext && (!sql_type_numeric(ocol.type) || !sql_type_numeric(icol.type))) return nullptr;
+  if (otext != itext) return view_no("keys of two kinds");
+  if (!otext && (!sql_type_numeric(ocol.type) || !sql_type_numeric(icol.type))) return view_no("a key not a number");
   // For a page of outer rows: only their keys, read off the inner table's
   // index (`inner.k IN (...)`), and never kept for other statements.
   ExprPtr page_in;
@@ -7718,7 +7755,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
   // whole batch - every key's aggregate - each time).
   const std::string ckey = e->subquery_sql + '\x1f' + std::to_string((uintptr_t)t) + '\x1f' + std::to_string((uintptr_t)otab) +
                            '\x1f' + std::to_string(os) + '\x1f' + std::to_string(oc) + '\x1f' + std::to_string(ob->outer_depth);
-  if (!page) {
+  if (!page && !over_view) {
     std::lock_guard<aios::hal::Mutex> lk(g_batch_cache_mu);
     auto it = g_batch_cache.find(ckey);
     if (it != g_batch_cache.end()) {
@@ -7735,7 +7772,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     }
   }
   auto remember = [&](std::shared_ptr<ScalarBatch> r) -> std::shared_ptr<const ScalarBatch> {
-    if (!r || page) return r;
+    if (!r || page || over_view) return r;
     BatchCacheEntry ce;
     ce.b = r;
     ce.t = t; ce.mseq = r->mseq; ce.rows = r->rows;
@@ -7780,9 +7817,13 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
   gb.group_by = {clone_expr(A)};
   gb.order_by.clear();
   gb.limit = -1;
-  ob->t = t;
+  ob->t = over_view ? nullptr : t;   // a view's shell is this call's own
   ob->mseq = t->mutation_seq;
   ob->rows = t->row_count();
+  if (over_view) {   // read before the grouped statement runs: a write meanwhile leaves it stale, built again
+    ob->gen_db = ctx.db;
+    ob->gen = ctx.db->query_cache_generation();
+  }
   ob->text_key = otext;
   ob->empty = up == "COUNT" ? val_cell(std::string("0")) : val_null();
   {
@@ -7800,7 +7841,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     };
     ExprPtr kc = clone_expr(A), ac = clone_expr(agg), wc = w ? clone_expr(w.get()) : nullptr;
     const std::string alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
-    if (lookup) {
+    if (lookup && !over_view) {
       if (!scalar_lookup_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store, b.limit == 1)) return nullptr;
       ob->raw = false;     // stored as the answers already
       ob->stored = true;
@@ -7811,7 +7852,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
       plan_key("one lookup a key, for the page's outer rows");
       return remember(ob);
     }
-    if (scalar_batch_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store)) {
+    if (!over_view && scalar_batch_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store)) {
       ob->raw = true;
       ob->stored = true;
       if (vx_trace_on())
@@ -7851,13 +7892,13 @@ static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx,
   // Built and current: no lock (the batch lives as long as the node keeps it,
   // and the node keeps the last one it published while the table is unchanged).
   if (const ScalarBatch* rb = load_ptr(e->sub_batch_ready))
-    if (rb->t->mutation_seq == rb->mseq && rb->t->row_count() == rb->rows) return rb;
+    if (rb->current()) return rb;
   {
     std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
     if (e->sub_batch_no) return nullptr;
     if (e->sub_batch) {
       const ScalarBatch& b = *e->sub_batch;
-      if (b.t->mutation_seq == b.mseq && b.t->row_count() == b.rows) { *hold = e->sub_batch; return hold->get(); }
+      if (b.current()) { *hold = e->sub_batch; return hold->get(); }
       e->sub_batch.reset();   // the table changed: built again
     }
     if (++e->sub_calls <= 64) {
@@ -8659,6 +8700,8 @@ inline bool date_part_of_text(const std::string& s, int part, int64_t* out) {
   *out = part == 1 ? y : part == 2 ? mo : part == 4 ? (mo - 1) / 3 + 1 : d;
   return true;
 }
+// nt_of(e).k for a CASE (below): 3 when MariaDB types the whole CASE a DOUBLE - every branch then reads as one (nt_adjust).
+static int case_result_kind(const SqlExpr* e, const EvalCtx& ctx);
 #include "sql_vprog.inc"
 namespace vp {
 // The fused star join aggregate's fold as native code (3c.2, sql_pipe_x64.inc): what it is built from.
@@ -9817,7 +9860,10 @@ bool pivot_group(const PivotPlan& plan, const EvalCtx& ctx, std::vector<std::pai
         for (size_t k = 0; k < na; ++k)
           acc[k].add(hits[i] >> k & 1 ? xv[i * nx + b.aggs[k].x] : b.aggs[k].other);
     }
-    for (size_t k = 0; k < na; ++k) out->emplace_back(b.aggs[k].node, acc[k].finish(b.aggs[k].avg));
+    // a SUM printed at its argument's type, as the per-aggregate fold prints it (SUM(CASE .. THEN 1.50 ELSE 0 END)
+    // of no matching row is 0.00 to MariaDB)
+    for (size_t k = 0; k < na; ++k)
+      out->emplace_back(b.aggs[k].node, b.aggs[k].avg ? acc[k].finish(true) : nt_adjust(b.aggs[k].node, ctx, acc[k].finish(false)));
   }
   return true;
 }
@@ -13164,12 +13210,27 @@ static NumType nt_of(const SqlExpr* e, const EvalCtx& ctx, int depth = 0) {
       }
       if (up == "IF" && e->args.size() == 3) return nt_unify({arg(1), arg(2)});
       if (up == "NULLIF") return arg(0);
+      if ((up == "CAST" || up == "CONVERT") && e->args.size() >= 2 && e->args[1] && e->args[1]->op == ExprOp::Literal &&
+          !(e->args.size() > 2 && e->args[2] && !e->args[2]->literal.sv().empty())) {   // not x::type (its own rules)
+        // the target type: CAST(x AS DECIMAL(10,2)) is a DECIMAL of 2 places whatever x was
+        const std::string target = upper_of(e->args[1]->literal.str());
+        if (target.rfind("DECIMAL", 0) == 0 || target.rfind("NUMERIC", 0) == 0) {
+          const size_t comma = target.find(',');
+          const int places = comma == std::string::npos ? 0 : std::atoi(target.c_str() + comma + 1);
+          return places > 0 ? NumType{2, (int8_t)std::min(places, 30)} : NumType{1, 0};
+        }
+        if (target.rfind("SIGNED", 0) == 0 || target.rfind("UNSIGNED", 0) == 0 || target.rfind("INT", 0) == 0) return {1, 0};
+        if (target.rfind("DOUBLE", 0) == 0 || target.rfind("FLOAT", 0) == 0 || target.rfind("REAL", 0) == 0) return {3, 0};
+        if (target.rfind("CHAR", 0) == 0 || target.rfind("BINARY", 0) == 0) return {4, 0};
+      }
       return {};
     }
     default:
       return {};
   }
 }
+
+static int case_result_kind(const SqlExpr* e, const EvalCtx& ctx) { return nt_of(e, ctx).k; }
 
 // v re-printed as the type `node`'s branches give it (see above).
 static Val nt_adjust(const SqlExpr* node, const EvalCtx& ctx, Val v) {
@@ -37132,8 +37193,10 @@ struct Source {
 // nothing but that row's columns of this table: no variable, subquery, outer
 // column, clock, session setting or randomness. Two statements writing the
 // same expression share its per-code values (make_source) through it.
-bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out) {
-  if (!e || e->op == ExprOp::Subquery || e->op == ExprOp::Exists || !e->subquery_sql.empty() || !e->group_order_by.empty()) return false;
+// with_source: a column names its source too (the same column number of two joined tables is two columns), and
+// a window function has no key - one statement's lanes over joined rows share values through it (LaneMemo).
+bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out, bool with_source = false) {
+  if (!e || (with_source && e->window) || e->op == ExprOp::Subquery || e->op == ExprOp::Exists || !e->subquery_sql.empty() || !e->group_order_by.empty()) return false;
   if (e->name.rfind("@", 0) == 0) return false;
   if (e->op == ExprOp::Func) {
     static const std::unordered_set<std::string> unstable = {
@@ -37148,7 +37211,7 @@ bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out) {
   if (e->op == ExprOp::Column) {
     size_t si = 0, ci = 0;
     if (lookup_column_here(local, *e, &si, &ci) != ColumnLookup::Found) return false;
-    *out += "(c" + std::to_string(ci) + ")";
+    *out += with_source ? "(c" + std::to_string(si) + "." + std::to_string(ci) + ")" : "(c" + std::to_string(ci) + ")";
     return true;
   }
   if (e->op == ExprOp::Star) return false;
@@ -37162,7 +37225,7 @@ bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out) {
     *out += std::to_string((int)v.temporal);
     if (!v.null) *out += ':' + std::to_string(v.str().size()) + ':' + v.str();
   }
-  for (const auto& a : e->args) if (!stable_expr_key(a.get(), local, out)) return false;
+  for (const auto& a : e->args) if (!stable_expr_key(a.get(), local, out, with_source)) return false;
   *out += ')';
   return true;
 }
@@ -43077,8 +43140,10 @@ static std::string last_name_part(const std::string& s) {
   return lower_of(d == std::string::npos ? s : s.substr(d + 1));
 }
 static bool exists_as_in(SqlDatabase* db, const ParsedSelectBranch& outer, const SqlExpr& ex, bool neg, std::string* out) {
+  // `wo`.`transno` as MariaDB stores a view's text (km's stocktrans): a quoted name is one Ident token, its text
+  // unquoted and its span the quotes too, so the matching and the replacing below read it as a bare one.
   const std::string& sub = ex.subquery_sql;
-  if (sub.empty() || sub.find('`') != std::string::npos) return false;
+  if (sub.empty()) return false;
   ParsedSelectStatement st = parse_select_sql(sub);
   if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty() || !st.with_sql.empty()) return false;
   const ParsedSelectBranch& b = st.branches[0];
@@ -43345,21 +43410,29 @@ bool fast_in_subquery(const EvalCtx& ctx, const ParsedSelectStatement& st, Neste
   return true;
 }
 
-// The WHERE with each top-level [NOT] EXISTS conjunct that exists_as_in
-// takes rewritten; null when none was.
+// The WHERE with each [NOT] EXISTS that exists_as_in takes rewritten, where
+// it is reached from the WHERE's top through AND and OR alone; null when none
+// was. km's stocktrans view is `(stockid <> 'ZZMCMISC' OR NOT EXISTS (..))`:
+// under the OR it ran once per ZZMCMISC row (7,800 statements in a report).
+// The IN form is UNKNOWN where EXISTS is FALSE (a NULL outer key; NOT EXISTS
+// has its IS NULL arm and is two-valued). Through AND and OR an UNKNOWN keeps
+// a row exactly when a FALSE would - the WHERE keeps only TRUE - so the rows
+// are the same. Not under NOT, CASE, a comparison or a function, where an
+// UNKNOWN is not a FALSE: those stay correlated.
 static ExprPtr decorrelate_exists(SqlDatabase* db, const ParsedSelectBranch& branch) {
   static const bool off = std::getenv("AIOS_SQL_NO_DECORRELATE") != nullptr;
   if (off || !db || !branch.where || !expr_has_subquery(branch.where)) return nullptr;
   bool changed = false;
   std::function<ExprPtr(const ExprPtr&)> walk = [&](const ExprPtr& e) -> ExprPtr {
     if (!e) return e;
-    if (e->op == ExprOp::And && e->args.size() == 2) {
+    if ((e->op == ExprOp::And || e->op == ExprOp::Or) && e->args.size() == 2 && !e->negated) {
       ExprPtr l = walk(e->args[0]), r = walk(e->args[1]);
       if (l == e->args[0] && r == e->args[1]) return e;
       auto n = std::make_shared<SqlExpr>();
-      n->op = ExprOp::And;
+      n->op = e->op;
       n->args = {l, r};
-      n->source_text = l->source_text + " AND " + r->source_text;
+      n->source_text = e->op == ExprOp::And ? l->source_text + " AND " + r->source_text
+                                            : "(" + l->source_text + ") OR (" + r->source_text + ")";
       return n;
     }
     bool neg = false;
@@ -43784,6 +43857,122 @@ static bool prune_unused_left_joins(SqlDatabase* db, const ParsedSelectBranch& b
   if (!any_pruned) return false;
   *out = std::move(cur);
   return true;
+}
+
+// A LEFT JOIN anywhere in the chain that nothing reads and that meets at most one row per earlier row (its ON
+// pins a primary or unique key of the joined table) changes neither the rows nor their number, so it is dropped
+// from the statement. The join step skips such a join too (per statement, padding each row), but a merged view
+// brings its unread joins with it (stocktrans: salesorders, salesman, suppliers beside the 8 tables a report reads),
+// and the star join takes at most 8 sources: left in, it refuses the whole statement and every join is probed a
+// row at a time. Only plain tables: a view or a CTE has no key to pin. The expressions are the caller's own (the
+// merge cloned them), so the sources after a dropped one shifting down by one rebinds their columns.
+static bool text_has_ident_dot(const std::string& hay, const std::string& ident) {
+  auto is_ident_ch = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
+  };
+  if (ident.empty()) return false;
+  size_t pos = 0;
+  while ((pos = hay.find(ident, pos)) != std::string::npos) {
+    const bool left_ok = pos == 0 || !is_ident_ch(hay[pos - 1]);
+    size_t end = pos + ident.size();
+    if (left_ok && (end >= hay.size() || !is_ident_ch(hay[end]))) {
+      if (end < hay.size() && hay[end] == '`') ++end;
+      while (end < hay.size() && (hay[end] == ' ' || hay[end] == '\t')) ++end;
+      if (end < hay.size() && hay[end] == '.') return true;
+    }
+    pos += ident.size();
+  }
+  return false;
+}
+static bool prune_dead_left_joins(SqlDatabase* db, ParsedSelectBranch& b) {
+  static const bool off = [] { const char* v = std::getenv("AIOS_SQL_PRUNE_DEAD_LEFT"); return v && *v == '0'; }();
+  if (off || !db || b.sources.size() < 3 || !b.windows.empty() || b.join_conditions.size() + 1 != b.sources.size()) return false;
+  for (size_t k = 0; k < b.join_is_right.size(); ++k) if (b.join_is_right[k]) return false;
+  bool any = false;
+  for (size_t jj = b.join_conditions.size(); jj-- > 0;) {
+    if (jj >= b.join_is_left.size() || !b.join_is_left[jj] || !b.join_conditions[jj]) continue;
+    const auto& ts = b.sources[jj + 1];
+    if (ts.is_derived() || ts.natural || !ts.using_cols.empty() || ts.lateral || !ts.series_args.empty()) continue;
+    if (db->find_view(ts.table_name) || find_cte_table(ts.table_name)) continue;
+    const SqlTable* t = db->resolve_table(ts.table_name);
+    if (!t || t->inferred_types) continue;
+    const std::string tname = last_name_part(ts.table_name);
+    const std::string talias = ts.alias.empty() ? tname : lower_of(ts.alias);
+    if (talias.empty()) continue;
+    bool clash = false;
+    for (size_t i = 0; i < b.sources.size(); ++i) {
+      if (i == jj + 1) continue;
+      const std::string sname = last_name_part(b.sources[i].table_name);
+      const std::string salias = b.sources[i].alias.empty() ? sname : lower_of(b.sources[i].alias);
+      if (salias == talias || sname == talias) { clash = true; break; }
+    }
+    if (clash) continue;
+    // Whether e could read the table: a `*`, a window, a nondeterministic call, a variable, a subquery naming it, a
+    // column qualified by it - or unqualified and named like one of its columns (it may be the table's).
+    auto reads_table = [&](const SqlExpr* e, auto& self) -> bool {
+      if (!e) return false;
+      if (e->window != nullptr) return true;
+      // COUNT(*) counts the rows: it names no table (the dropped join keeps their number)
+      if (e->op == ExprOp::Func && e->args.size() == 1 && e->args[0] && e->args[0]->op == ExprOp::Star && upper_of(e->name) == "COUNT") return false;
+      if (e->op == ExprOp::Star) return true;
+      if (e->op == ExprOp::Func && vx::nondeterministic_func(upper_of(e->name))) return true;
+      if (!e->subquery_sql.empty()) {
+        const std::string low = lower_of(e->subquery_sql);
+        if (text_has_ident_dot(low, talias) || (tname != talias && text_has_ident_dot(low, tname))) return true;
+      }
+      if (e->op == ExprOp::Column) {
+        if (!e->name.empty() && e->name[0] == '@') return e->name.rfind("@@", 0) != 0;
+        if (!e->qualifier.empty()) {
+          const std::string q = last_name_part(e->qualifier);
+          return q == talias || (ts.alias.empty() && q == tname);
+        }
+        return t->get_column_index(e->name) >= 0;
+      }
+      for (const auto& a : e->args) if (self(a.get(), self)) return true;
+      return false;
+    };
+    bool used = false;
+    for (const auto& it : b.items) if (!used && (it.star || reads_table(it.expr.get(), reads_table))) used = true;
+    if (!used && reads_table(b.where.get(), reads_table)) used = true;
+    for (const auto& g : b.group_by) if (!used && reads_table(g.get(), reads_table)) used = true;
+    if (!used && reads_table(b.having.get(), reads_table)) used = true;
+    for (const auto& o : b.order_by) if (!used && reads_table(o.expr.get(), reads_table)) used = true;
+    for (size_t k = 0; k < b.join_conditions.size() && !used; ++k)
+      if (k != jj && reads_table(b.join_conditions[k].get(), reads_table)) used = true;
+    if (used) continue;
+    // Its ON's equalities pin a key of the table: one side the table's own (qualified) column, the other not reading it.
+    std::vector<const SqlExpr*> parts;
+    collect_conjuncts(b.join_conditions[jj].get(), &parts);
+    std::set<std::string> keyed;
+    for (const SqlExpr* pc : parts) {
+      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) continue;
+      for (int side = 0; side < 2; ++side) {
+        const SqlExpr* col = pc->args[side].get();
+        const SqlExpr* val = pc->args[1 - side].get();
+        if (!col || col->op != ExprOp::Column || col->qualifier.empty() || last_name_part(col->qualifier) != talias) continue;
+        if (t->get_column_index(col->name) < 0 || reads_table(val, reads_table)) continue;
+        keyed.insert(lower_of(col->name));
+        break;
+      }
+    }
+    auto covers = [&](const std::vector<std::string>& cols) {
+      if (cols.empty()) return false;
+      for (const auto& c : cols) if (!keyed.count(lower_of(c))) return false;
+      return true;
+    };
+    std::vector<std::string> pk;
+    for (const auto& c : t->columns) if (c.is_primary_key) pk.push_back(c.name);
+    bool at_most_one = covers(pk);
+    for (const auto& ix : t->indices) if (!at_most_one && ix.is_unique) at_most_one = covers(ix.columns);
+    if (!at_most_one) continue;
+    if (vx_trace_on()) vx_trace("prune_dead_left_join: " + ts.table_name + (ts.alias.empty() ? "" : " AS " + ts.alias));
+    b.sources.erase(b.sources.begin() + (long)(jj + 1));
+    b.join_conditions.erase(b.join_conditions.begin() + (long)jj);
+    b.join_is_left.erase(b.join_is_left.begin() + (long)jj);
+    if (jj < b.join_is_right.size()) b.join_is_right.erase(b.join_is_right.begin() + (long)jj);
+    any = true;
+  }
+  return any;
 }
 
 // ---- joins on a unique key, column-wise ---------------------------------------
@@ -44310,8 +44499,45 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     std::shared_ptr<const std::vector<uint32_t>> cc, pcd;
     std::shared_ptr<const vx::DecodedInts> ci, pi;
     std::shared_ptr<const std::vector<uint8_t>> cn, pn;
+    // an integer part with a side held as a dictionary (an INT kept as codes: stockmoves.transno as runs of them):
+    // that side's integer per dictionary code, read through its decoded codes (cc / pcd)
+    bool c_coded = false, p_coded = false;
+    std::vector<int64_t> cnum, pnum;
+    std::vector<uint8_t> cok, pok;
     int64_t lo = 0;
     uint64_t width = 0, mult = 1;
+  };
+  // the integer a dictionary entry stands for, per code (false: an entry that is not a whole number)
+  auto dict_ints = [](const ColumnStore& cs, std::vector<int64_t>* num, std::vector<uint8_t>* ok) {
+    const size_t nd = vx::dict_size(cs);
+    num->assign(nd, 0);
+    ok->assign(nd, 0);
+    for (size_t code = 0; code < nd; ++code) {
+      const std::string& v = vx::dict_entry(cs, (uint32_t)code);
+      if (sql_is_null(v)) continue;
+      char* end = nullptr;
+      errno = 0;
+      const long long x = std::strtoll(v.c_str(), &end, 10);
+      if (v.empty() || errno || *end) return false;
+      (*num)[code] = x;
+      (*ok)[code] = 1;
+    }
+    return true;
+  };
+  // row r's integer of an integer part, on the child's / the parent's side (false: none)
+  auto child_int = [](const Part& P, uint32_t r, int64_t* v) {
+    if (!P.c_coded) { *v = P.ci->v[r]; return true; }
+    const uint32_t code = (*P.cc)[r];
+    if (code >= P.cok.size() || !P.cok[code]) return false;
+    *v = P.cnum[code];
+    return true;
+  };
+  auto parent_int = [](const Part& P, size_t r, int64_t* v) {
+    if (!P.p_coded) { *v = P.pi->v[r]; return true; }
+    const uint32_t code = (*P.pcd)[r];
+    if (code >= P.pok.size() || !P.pok[code]) return false;
+    *v = P.pnum[code];
+    return true;
   };
   std::vector<Part> parts(L.comp.size());
   for (size_t k = 0; k < L.comp.size(); ++k) {
@@ -44323,7 +44549,9 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     if (ccs.size() != ct.row_count() || pcs.size() != pt.row_count()) return no("a column not whole");
     StarKey ck, pk;
     if (!star_key_of(ct, cc, &ck) || !star_key_of(pt, pc, &pk) || ck.text != pk.text) return no("key types");
-    P.text = ck.text;
+    // coded: ids by the child's dictionary code through the star code map - a text key, and an integer one both
+    // sides hold as a dictionary or runs of one (stockmoves.transno, .type; star_code_keys reads those entries as numbers)
+    P.text = ck.text || (vx::dict_coded(ccs) && vx::dict_coded(pcs));
     if (P.text) {
       if (!vx::dict_coded(ccs) || !vx::dict_coded(pcs)) return no("text not dictionary-coded");
       P.cm = star_code_map(pk, ck);
@@ -44333,14 +44561,32 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
       if (!P.cc || !P.pcd) return no("codes not decoded");
       P.width = P.cm->cn;
     } else {
-      if (ct.columns[cc].type != SqlDataType::Int || pt.columns[pc].type != SqlDataType::Int || !vx::typed_integer(ccs) || !vx::typed_integer(pcs))
-        return no("integer keys not typed");
-      P.ci = vx::decoded_ints(ct, cc);
-      P.pi = vx::decoded_ints(pt, pc);
-      if (!P.ci || !P.pi) return no("integers not decoded");
+      P.c_coded = vx::dict_coded(ccs);
+      P.p_coded = vx::dict_coded(pcs);
+      if (ct.columns[cc].type != SqlDataType::Int || pt.columns[pc].type != SqlDataType::Int ||
+          !(P.c_coded || vx::typed_integer(ccs)) || !(P.p_coded || vx::typed_integer(pcs)))
+        return no(("integer keys not typed: " + ct.columns[cc].name + " " + vx_encoding_name(ccs.encoding) + " / " + pt.columns[pc].name + " " + vx_encoding_name(pcs.encoding)).c_str());
+      if (P.c_coded) {
+        P.cc = vx::decoded_codes(ct, cc);
+        if (!P.cc || !dict_ints(ccs, &P.cnum, &P.cok)) return no("child dictionary entries not whole numbers");
+      } else {
+        P.ci = vx::decoded_ints(ct, cc);
+        if (!P.ci) return no("integers not decoded");
+      }
+      if (P.p_coded) {
+        P.pcd = vx::decoded_codes(pt, pc);
+        if (!P.pcd || !dict_ints(pcs, &P.pnum, &P.pok)) return no("parent dictionary entries not whole numbers");
+      } else {
+        P.pi = vx::decoded_ints(pt, pc);
+        if (!P.pi) return no("integers not decoded");
+      }
       int64_t lo = INT64_MAX, hi = INT64_MIN;
       const bool hn = vx::has_nulls(ccs);
-      for (uint32_t r : ids) if (!(hn && ccs.is_null(r))) { lo = std::min(lo, P.ci->v[r]); hi = std::max(hi, P.ci->v[r]); }
+      for (uint32_t r : ids) {
+        int64_t v;
+        if ((hn && ccs.is_null(r)) || !child_int(P, r, &v)) continue;
+        lo = std::min(lo, v); hi = std::max(hi, v);
+      }
       if (lo > hi) { lo = 0; hi = 0; }
       if ((uint64_t)hi - (uint64_t)lo >= ((uint64_t)1 << 40)) return no("an integer range too wide");
       P.lo = lo;
@@ -44363,7 +44609,13 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     bool null = false;
     for (const Part& P : parts) {
       if (P.cn && (*P.cn)[r]) { null = true; break; }
-      const uint64_t id = P.text ? (uint64_t)(*P.cc)[r] : (uint64_t)(P.ci->v[r] - P.lo);
+      uint64_t id;
+      if (P.text) id = (uint64_t)(*P.cc)[r];
+      else {
+        int64_t v;
+        if (!child_int(P, r, &v)) { null = true; break; }
+        id = (uint64_t)(v - P.lo);
+      }
       if (id >= P.width) { null = true; break; }
       key += id * P.mult;
     }
@@ -44374,16 +44626,41 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
   bool dup = false;
   for (size_t j = 0; j < ids.size() && !dup; ++j)
     if (ckey[j] != UINT64_MAX && !key_row.emplace(ckey[j], ids[j]).second) dup = true;
+  // The distinct child keys numbered through a flat hash, for a one-to-many link whose packed key spans too much for
+  // an array (a 4-part key of transno x type x debtorno x branch): the runs are indexed by number, and every parent
+  // row's packed key is looked up to its number (or none) below.
+  std::vector<uint64_t> rk;
+  std::vector<uint32_t> rv;
+  int rshift = 0;
+  bool ranked = false;
   if (dup) {
     if (!multi) return no("not unique");   // rows multiply: one-to-many, or the general join's
-    if (span >= std::max<uint64_t>((uint64_t)1 << 22, ids.size() * 8)) return no("one-to-many over too wide a key");
+    uint64_t cspan = span;
+    if (span >= std::max<uint64_t>((uint64_t)1 << 22, ids.size() * 8)) {
+      size_t cap = 16;
+      while (cap < ids.size() * 2) cap <<= 1;
+      rk.assign(cap, UINT64_MAX);
+      rv.assign(cap, 0);
+      rshift = 64 - __builtin_ctzll((unsigned long long)cap);
+      const size_t rmask = cap - 1;
+      uint32_t nu = 0;
+      for (size_t j = 0; j < ids.size(); ++j) {
+        if (ckey[j] == UINT64_MAX) continue;
+        size_t h = (size_t)((ckey[j] * 0x9E3779B97F4A7C15ull) >> rshift);
+        while (rk[h] != UINT64_MAX && rk[h] != ckey[j]) h = (h + 1) & rmask;
+        if (rk[h] == UINT64_MAX) { rk[h] = ckey[j]; rv[h] = nu++; }
+        ckey[j] = rv[h];
+      }
+      cspan = nu;
+      ranked = true;
+    }
     auto m = std::make_shared<StarMultiMap>();
     m->lo = 0;
-    m->off.assign((size_t)span + 1, 0);
+    m->off.assign((size_t)cspan + 1, 0);
     for (size_t j = 0; j < ids.size(); ++j) if (ckey[j] != UINT64_MAX) m->off[(size_t)ckey[j] + 1]++;
-    for (size_t k = 0; k < (size_t)span; ++k) m->off[k + 1] += m->off[k];
-    m->rows.resize(m->off[(size_t)span]);
-    for (size_t k = 0; k < (size_t)span; ++k) m->maxrun = std::max(m->maxrun, m->off[k + 1] - m->off[k]);
+    for (size_t k = 0; k < (size_t)cspan; ++k) m->off[k + 1] += m->off[k];
+    m->rows.resize(m->off[(size_t)cspan]);
+    for (size_t k = 0; k < (size_t)cspan; ++k) m->maxrun = std::max(m->maxrun, m->off[k + 1] - m->off[k]);
     std::vector<uint32_t> fill(m->off.begin(), m->off.end() - 1);
     for (size_t j = 0; j < ids.size(); ++j) if (ckey[j] != UINT64_MAX) m->rows[fill[(size_t)ckey[j]]++] = ids[j];   // ids ascending: each list too
     L.multi = true;
@@ -44414,13 +44691,22 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
         if (code >= P.cm->p2c.size() || P.cm->p2c[code] < 0) { miss = true; break; }
         id = (uint64_t)P.cm->p2c[code];
       } else {
-        const int64_t v = P.pi->v[r];
-        if (v < P.lo || (uint64_t)(v - P.lo) >= P.width) { miss = true; break; }
+        int64_t v;
+        if (!parent_int(P, r, &v) || v < P.lo || (uint64_t)(v - P.lo) >= P.width) { miss = true; break; }
         id = (uint64_t)(v - P.lo);
       }
       key += id * P.mult;
     }
-    if (!miss) (*pk)[r] = (int64_t)key;
+    if (miss) continue;
+    if (ranked) {
+      const size_t rmask = rk.size() - 1;
+      size_t h = (size_t)((key * 0x9E3779B97F4A7C15ull) >> rshift);
+      while (rk[h] != UINT64_MAX && rk[h] != key) h = (h + 1) & rmask;
+      if (rk[h] == UINT64_MAX) continue;   // no child row has this key
+      (*pk)[r] = (int64_t)rv[h];
+    } else {
+      (*pk)[r] = (int64_t)key;
+    }
   }
   L.comp_pk = std::move(pk);
   if (whole) {
@@ -44439,7 +44725,11 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
                       std::unordered_set<const SqlExpr*>& pushed, std::string* err, StarShape* shape,
                       std::shared_ptr<StarExpansion>* deferred = nullptr, std::vector<const SqlExpr*>* cross_on = nullptr) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_STAR_JOIN"); return v && *v == '0'; }();
-  if (off || join_conditions.empty() || nbase < 256 || sources.size() > 8) return false;
+  if (off || join_conditions.empty() || nbase < 256 || sources.size() > 8) {
+    if (vx_trace_on() && !off && !join_conditions.empty() && nbase >= 256)
+      vx_trace("join: not a star: " + std::to_string(sources.size()) + " sources (at most 8)");
+    return false;
+  }
   for (const auto& s : sources) if (!s.table || s.table->inferred_types) return false;
   EvalCtx all; all.sources = &sources;
   // The sources an expression reads; false for anything not plainly local.
@@ -44504,8 +44794,8 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
           lookup_column_here(all, *b, &sb, &cb) != ColumnLookup::Found) return false;
       if (sb == js && sa < js) { std::swap(sa, sb); std::swap(ca, cb); }
       if (!(sa == js && sb < js)) { if (cross()) continue; return false; }
-      if (have_key) {   // a further key: of the same parent, at most three in all
-        if (sb != st.parent_src || st.extra.size() >= 2 || static_star_comp_off()) return false;
+      if (have_key) {   // a further key: of the same parent, at most four in all
+        if (sb != st.parent_src || st.extra.size() >= 3 || static_star_comp_off()) return false;
         st.extra.emplace_back(ca, cb);
         continue;
       }
@@ -44669,6 +44959,15 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     const SqlTable& ct = *sources[L.child_src].table;
     const ColumnStore& ccs = ct.col_data[L.child_col];
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
+    // A text or dictionary-coded key (a stock id): one part of a composite key - the child's dictionary code its
+    // runs are indexed by, every parent row's code mapped to it (comp_pk), as a composite's parts are.
+    if ((L.pk.text || L.ck.text || !vx::typed_integer(ccs) || !vx::typed_integer(pcs)) && vx::dict_coded(ccs) && vx::dict_coded(pcs) &&
+        ccs.size() == ct.row_count()) {
+      L.comp.assign(1, std::make_pair(L.child_col, L.parent_col));
+      if (star_build_comp(sources, L, ids, true)) return true;
+      L.comp.clear();
+      return false;
+    }
     if (L.pk.text || L.ck.text || !vx::typed_integer(ccs) || !vx::typed_integer(pcs) || ccs.size() != ct.row_count()) return false;
     const bool whole_table = ids.size() == ct.row_count();   // ascending and every row: 0 .. n-1
     if (whole_table) {
@@ -46885,45 +47184,310 @@ struct RowIds {
 // scale, * at the sum; a fixed-scale DECIMAL cell prints all its places, so its value is (stored integer, scale)).
 // A NULL operand, a NULL row (or a LEFT JOIN's padding): NULL. A value past 64 bits declines the lanes - the
 // interpreter then answers, in 128 bits or with its error - never an approximation.
+// Also CAST(x AS DECIMAL(p, s)) - of such exact arithmetic (its digits padded to s places), or of a program's
+// DOUBLE or integer (each row's double rounded as the interpreter's CAST rounds it: round_double_scaled) - and a
+// searched CASE whose conditions are programs and whose branches are any of these, every branch at the CASE's
+// one scale (nt_of: MariaDB's type for the whole CASE, so ELSE 0 is 0.00). A CAST whose value needs more than p
+// digits (the interpreter clamps it to 99..9) declines.
+// LaneMemo: one statement's lanes over one row set, by the expression's structure (stable_expr_key with its
+// sources) - km's thisoverlast writes the view's CAST(price * qty - CAST(..) AS DECIMAL(10,2)) under 12 CASEs,
+// and each built it again: 24 CASTs of 637k doubles, rounded twice a row (round_double_scaled), and 24 month
+// tests for 12 months. A CAST inside a bigger expression is a lane of its own, made once; so is a program's lane.
+struct LaneMemo {
+  std::unordered_map<std::string, std::shared_ptr<const vp::Column>> prog;
+  std::unordered_map<std::string, std::pair<std::shared_ptr<const vp::Column>, int>> exact;   // the lane, its scale
+};
+static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err);
 static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* e, vp::Column* col,
-                          int* xscale, std::string* why) {
+                          int* xscale, std::string* why, LaneMemo* memo = nullptr) {
   EvalCtx vctx; vctx.sources = &sources;
   auto no = [&](const char* w) { *why = w; return false; };
-  struct XI { int op = 0; const int64_t* v = nullptr; const uint8_t* nul = nullptr; size_t src = 0; int64_t k = 0; int scale = 0; uint32_t a = 0, b = 0; };
+  // A memo's key for x, or "" (no key: made here, not shared).
+  auto memo_key = [&](const SqlExpr* x) -> std::string {
+    std::string k;
+    if (!memo || !vx::stable_expr_key(x, vctx, &k, true) || k.size() > 4096) return std::string();
+    return k;
+  };
+  // A shared CAST lane that declined (a value past 64 bits, a CAST past its digits): the whole lane declines, as
+  // it did when the CAST was made in place - no other way of reading it is tried.
+  bool hard = false;
+  // op: 0 column, 1 literal, 2 + 3 - 4 *, 5 negation, 6 CAST of a program's lane (pc), 7 CAST of exact arithmetic
+  // (a), 8 CASE (conds[i] true: br[i]; else br.back() when has_else, NULL without), 9 a lane made before (pc: a
+  // LaneMemo's, by row position), 10 ROUND / TRUNCATE(a, d) of exact arithmetic (round_value's exact rule)
+  struct XI {
+    int op = 0; const int64_t* v = nullptr; const uint8_t* nul = nullptr; size_t src = 0; int64_t k = 0; int scale = 0; uint32_t a = 0, b = 0;
+    const vp::Column* pc = nullptr;
+    int64_t lim = 0;   // 6, 7: 10^p - a value's magnitude must stay below it
+    int drop = 0, up = 0; bool trunc = false;   // 10: places taken off (half up, or toward zero), then put back
+    std::vector<const vp::Column*> conds;
+    std::vector<uint32_t> br;
+    bool has_else = false;
+  };
   std::vector<XI> xs;
   std::vector<std::shared_ptr<const vx::DecodedInts>> holds;
   std::vector<std::shared_ptr<const std::vector<uint8_t>>> nholds;
-  std::function<int(const SqlExpr*)> mk = [&](const SqlExpr* x) -> int {
-    if (!x) return -1;
+  std::vector<std::shared_ptr<const vp::Column>> lanes;   // programs' lanes over all the rows (6's values, 8's conditions)
+  // A program over the rows into a lane of its own: a number (I64 / F64), or null.
+  auto prog_lane = [&](const SqlExpr* x) -> const vp::Column* {
+    const std::string key = memo_key(x);
+    if (!key.empty()) {
+      auto it = memo->prog.find(key);
+      if (it != memo->prog.end()) { lanes.push_back(it->second); return it->second.get(); }
+    }
+    auto c = std::make_shared<vp::Column>();
+    // A bare DOUBLE column (CAST(price AS DECIMAL(20,6)) in summitholding's view): the programs make none for a
+    // bare column, so its doubles are read here by row id - the cells the interpreter reads.
+    size_t bs = 0, bc = 0;
+    if (x->op == ExprOp::Column && lookup_column_here(vctx, *x, &bs, &bc) == ColumnLookup::Found && bs < sources.size() &&
+        sources[bs].table && !sources[bs].table->inferred_types && bc < sources[bs].table->columns.size() &&
+        bc < sources[bs].table->col_data.size()) {
+      const SqlTable& tb = *sources[bs].table;
+      const ColumnStore& cs = tb.col_data[bc];
+      const SqlColumn& sc = tb.columns[bc];
+      if (sc.type != SqlDataType::Real || sc.temporal || cs.size() != tb.row_count()) return nullptr;
+      const bool typed = cs.encoding == ColumnEncoding::TypedDouble;
+      const bool alp = cs.encoding == ColumnEncoding::ALP;   // doubles as per-segment decimal integers
+      // a DOUBLE of few places kept as scaled integers: n / 10^k, correctly rounded, is the double its text reads as
+      std::shared_ptr<const vx::DecodedInts> scaled;
+      double scale_div = 1;
+      if (cs.encoding == ColumnEncoding::DecimalScaled) {
+        double pk = 1;
+        int k = 0;
+        while (pk < cs.scale_factor && k < 22) { pk *= 10; ++k; }
+        if (pk != cs.scale_factor) return nullptr;
+        scaled = vx::decoded_ints(tb, bc);
+        if (!scaled || scaled->v.size() != cs.size()) return nullptr;
+        scale_div = pk;
+      } else if (!typed && !alp && vx::typed_integer(cs)) {   // a DOUBLE of whole numbers kept as integers (qty)
+        scaled = vx::decoded_ints(tb, bc);
+        if (!scaled || scaled->v.size() != cs.size()) return nullptr;
+      }
+      // summitholding's price, qty (Dict) and discountpercent (RLE): each entry's number, read once, by code
+      std::shared_ptr<const std::vector<uint32_t>> codes;
+      std::vector<double> num;
+      std::vector<uint8_t> num_null;
+      if (!typed && !alp && !scaled) {
+        if (!vx::dict_coded(cs)) return nullptr;
+        const size_t nd = vx::dict_size(cs);
+        if (nd == 0 || nd > (1u << 22)) return nullptr;
+        codes = vx::decoded_codes(tb, bc);
+        if (!codes || codes->size() != cs.size()) return nullptr;
+        num.assign(nd, 0);
+        num_null.assign(nd, 0);
+        for (size_t k = 0; k < nd; ++k) {
+          const std::string& ent = vx::dict_entry(cs, (uint32_t)k);
+          double d = 0;
+          if (sql_is_null(ent)) num_null[k] = 1;
+          else if (!parse_number(ent, &d)) return nullptr;   // not a number's text: the interpreter's business
+          else num[k] = d;
+        }
+      }
+      const bool nulls = vx::has_nulls(cs);
+      std::atomic<bool> bad53{false};   // a scaled integer past 2^53: its double is not n / 10^k exactly
+      c->ty = vp::Ty::F64;
+      c->approx = true;
+      c->uns = false;
+      c->f.assign(rows.size(), 0);
+      c->n.assign(rows.size(), 0);
+      SqlThreadPool::instance().for_chunks(rows.size(), 16384, rows.size(), false, [&](size_t j0, size_t j1, size_t) {
+        for (size_t j = j0; j < j1; ++j) {
+          const size_t r = rows.part(j, bs);
+          if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { c->n[j] = 1; continue; }
+          if (typed) { c->f[j] = cs.double_data[r]; continue; }
+          if (alp) { c->f[j] = cs.alp_value(r); continue; }
+          if (scaled) {
+            const int64_t iv = scaled->v[r];
+            if (iv > (1LL << 53) || iv < -(1LL << 53)) { c->n[j] = 1; bad53.store(true); continue; }
+            c->f[j] = (double)iv / scale_div;
+            continue;
+          }
+          const uint32_t k = (*codes)[r];
+          if (k >= num.size() || num_null[k]) { c->n[j] = 1; continue; }
+          c->f[j] = num[k];
+        }
+      });
+      if (bad53.load()) return nullptr;
+    } else {
+      const vp::Prog* P = vp::program_for(x, vctx);
+      if (!P || (P->out().ty != vp::Ty::I64 && P->out().ty != vp::Ty::F64) || P->out().uns) return nullptr;
+      std::string err;
+      if (!vp_eval_rows(*P, rows, c.get(), &err) || c->size() != rows.size() || (c->ty != vp::Ty::I64 && c->ty != vp::Ty::F64)) return nullptr;
+    }
+    lanes.push_back(c);
+    if (!key.empty()) memo->prog.emplace(key, c);
+    return c.get();
+  };
+  static const int64_t lim10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
+                                    10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
+                                    1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
+  std::function<int(const SqlExpr*)> mk;
+  // the last structural "no" (its source line and the expression), for the trace: why a lane was not made (a "no"
+  // that an undo then routed around is overwritten by any later one)
+  int no_line = 0;
+  const SqlExpr* no_expr = nullptr;
+  auto no_at = [&](int line, const SqlExpr* at) -> int {
+    no_line = line;
+    no_expr = at;
+    return -1;
+  };
+  // x as exact arithmetic or nothing: what a failed attempt pushed is taken back, so a caller can try another way.
+  auto mk_or_undo = [&](const SqlExpr* x) -> int {
+    const size_t n0 = xs.size(), h0 = holds.size(), z0 = nholds.size(), l0 = lanes.size();
+    const int r = mk(x);
+    if (r < 0) { xs.resize(n0); holds.resize(h0); nholds.resize(z0); lanes.resize(l0); }
+    return r;
+  };
+  mk = [&](const SqlExpr* x) -> int {
+    if (!x || hard) return no_at(__LINE__, x);
     XI in;
-    if (x->op == ExprOp::Column) {
-      if (is_user_var_name(x->name) || x->name.rfind("@@", 0) == 0) return -1;
+    const bool is_cast = x->op == ExprOp::Func && !x->window && (func_upper(x) == "CAST"sv || func_upper(x) == "CONVERT"sv);
+    // a CAST under this expression: the memo's lane, made once (by this same function, over the same rows)
+    if (is_cast && x != e && memo) {
+      const std::string key = memo_key(x);
+      if (!key.empty()) {
+        auto it = memo->exact.find(key);
+        if (it == memo->exact.end()) {
+          auto c = std::make_shared<vp::Column>();
+          int sc = 0;
+          std::string w;
+          if (!exact_lane_of(sources, rows, x, c.get(), &sc, &w, memo)) {
+            if (!w.empty()) { hard = true; *why = w; }
+            return no_at(__LINE__, x);
+          }
+          it = memo->exact.emplace(key, std::make_pair(std::shared_ptr<const vp::Column>(c), sc)).first;
+        }
+        lanes.push_back(it->second.first);
+        in.op = 9;
+        in.pc = it->second.first.get();
+        in.scale = it->second.second;
+        xs.push_back(in);
+        return (int)xs.size() - 1;
+      }
+    }
+    if (is_cast) {
+      if (x->args.size() < 2 || !x->args[0] || !x->args[1] || x->args[1]->op != ExprOp::Literal) return no_at(__LINE__, x);
+      if (x->args.size() > 2 && x->args[2] && !x->args[2]->literal.sv().empty()) return no_at(__LINE__, x);   // x::type
+      const std::string target = upper_of(x->args[1]->literal.str());
+      if (target.rfind("DECIMAL", 0) != 0 && target.rfind("NUMERIC", 0) != 0) return no_at(__LINE__, x);
+      const size_t lp = target.find('('), comma = target.find(',');
+      const int prec = lp == std::string::npos ? 10 : std::atoi(target.c_str() + lp + 1);
+      const int places = comma == std::string::npos ? 0 : std::atoi(target.c_str() + comma + 1);
+      // DECIMAL(20,6), DECIMAL(20,10) (summitholding's view): past 18 digits every 64-bit value fits its p digits,
+      // so none is clamped; a value past 64 bits declines (fail 5), as one past p digits does.
+      if (prec < 1 || prec > 65 || places < 0 || places > 18 || places > prec) return no_at(__LINE__, x);
+      in.scale = places;
+      in.lim = prec <= 18 ? lim10[prec] : INT64_MAX;
+      const int ia = mk_or_undo(x->args[0].get());
+      if (hard) return no_at(__LINE__, x);
+      if (ia >= 0) {
+        if (xs[(size_t)ia].scale > places) return no_at(__LINE__, x);   // fewer places: the interpreter's rounding of its digits
+        in.op = 7;
+        in.a = (uint32_t)ia;
+      } else {
+        const vp::Column* pc = prog_lane(x->args[0].get());
+        if (!pc) return no_at(__LINE__, x);
+        if (pc->ty == vp::Ty::F64 && !pc->approx) return no_at(__LINE__, x);   // a lane holding an exact decimal: its digits, not the double's
+        in.op = 6;
+        in.pc = pc;
+      }
+    } else if (x->op == ExprOp::Func && !x->window && (func_upper(x) == "ROUND"sv || func_upper(x) == "TRUNCATE"sv)) {
+      // ROUND(x[, d]) / TRUNCATE(x, d) of exact arithmetic, as round_value rounds an exact value: half away from
+      // zero (TRUNCATE: toward zero) on its digits at its scale; asked for more places than it has, a decimal is
+      // padded to them and an integer left as it is; d < 0 rounds to tens, hundreds. A DOUBLE x (MariaDB's
+      // DOUBLE ROUND) is not exact arithmetic: no lane.
+      const bool trunc = func_upper(x) == "TRUNCATE"sv;
+      if (x->args.empty() || x->args.size() > 2 || !x->args[0] || (trunc && x->args.size() != 2)) return no_at(__LINE__, x);
+      long long d = 0;
+      if (x->args.size() == 2) {
+        const SqlExpr* da = x->args[1].get();
+        bool neg = false;
+        if (da && da->op == ExprOp::Neg && da->args.size() == 1) { neg = true; da = da->args[0].get(); }
+        if (!da || da->op != ExprOp::Literal || da->literal.null || !da->literal.numeric) return no_at(__LINE__, x);
+        const double dv = da->literal.num;
+        if (dv != std::floor(dv) || std::fabs(dv) > 60) return no_at(__LINE__, x);
+        d = (long long)(neg ? -dv : dv);
+      }
+      const int ia = mk(x->args[0].get());
+      if (ia < 0) return no_at(__LINE__, x);
+      const int sc = xs[(size_t)ia].scale;
+      in.op = 10;
+      in.a = (uint32_t)ia;
+      in.trunc = trunc;
+      if (d >= 0) {
+        const int drop = sc - (int)std::min<long long>(d, sc);
+        if (drop <= 0) {
+          if (sc == 0 || d <= sc) { in.scale = sc; }                   // as it is
+          else {                                                       // padded to d places
+            const int target = (int)std::min<long long>(d, 38);
+            if (target > 18) return no_at(__LINE__, x);
+            in.up = target - sc;
+            in.scale = target;
+          }
+        } else {
+          in.drop = drop;
+          in.scale = sc - drop;
+        }
+      } else {
+        const int drop = sc + (int)std::min<long long>(-d, 40);
+        if (drop > 18) return no_at(__LINE__, x);
+        in.drop = drop;
+        in.up = drop - sc;
+        in.scale = 0;
+      }
+    } else if (x->op == ExprOp::Case && !x->negated) {
+      // CASE WHEN c THEN v .. [ELSE v] END
+      const size_t na = x->args.size();
+      if (na < 2) return no_at(__LINE__, x);
+      const NumType t = nt_of(x, vctx);
+      if (t.k != 1 && t.k != 2) return no_at(__LINE__, x);   // a DOUBLE or text CASE is not exact arithmetic
+      in.op = 8;
+      in.scale = t.k == 2 ? t.s : 0;
+      if (in.scale > 18) return no_at(__LINE__, x);
+      for (size_t i = 0; i + 1 < na; i += 2) {
+        const vp::Column* c = prog_lane(x->args[i].get());
+        if (!c) return no_at(__LINE__, x);
+        in.conds.push_back(c);
+        const int ib = mk(x->args[i + 1].get());
+        if (ib < 0 || xs[(size_t)ib].scale > in.scale) return no_at(__LINE__, x);
+        in.br.push_back((uint32_t)ib);
+      }
+      if (na % 2 == 1) {
+        const SqlExpr* el = x->args.back().get();
+        if (!(el && el->op == ExprOp::Literal && el->literal.null)) {   // ELSE NULL: as no ELSE
+          const int ie = mk(el);
+          if (ie < 0 || xs[(size_t)ie].scale > in.scale) return no_at(__LINE__, x);
+          in.br.push_back((uint32_t)ie);
+          in.has_else = true;
+        }
+      }
+    } else if (x->op == ExprOp::Column) {
+      if (is_user_var_name(x->name) || x->name.rfind("@@", 0) == 0) return no_at(__LINE__, x);
       size_t ps = 0, pc = 0;
-      if (lookup_column_here(vctx, *x, &ps, &pc) != ColumnLookup::Found || ps >= sources.size() || !sources[ps].table) return -1;
+      if (lookup_column_here(vctx, *x, &ps, &pc) != ColumnLookup::Found || ps >= sources.size() || !sources[ps].table) return no_at(__LINE__, x);
       const SqlTable& tb = *sources[ps].table;
-      if (tb.inferred_types || pc >= tb.columns.size() || pc >= tb.col_data.size()) return -1;
+      if (tb.inferred_types || pc >= tb.columns.size() || pc >= tb.col_data.size()) return no_at(__LINE__, x);
       const ColumnStore& cs = tb.col_data[pc];
       const SqlColumn& sc = tb.columns[pc];
-      if (sc.temporal || cs.size() != tb.row_count()) return -1;
+      if (sc.temporal || cs.size() != tb.row_count()) return no_at(__LINE__, x);
       if (sc.type == SqlDataType::Int && vx::typed_integer(cs)) {
         in.scale = 0;
       } else if (sc.type == SqlDataType::Decimal && cs.encoding == ColumnEncoding::DecimalScaled && cs.decimal_fixed() && sc.scale <= 18) {
         double p = 1;
         for (int i = 0; i < sc.scale; ++i) p *= 10;
-        if (cs.scale_factor != p) return -1;
+        if (cs.scale_factor != p) return no_at(__LINE__, x);
         in.scale = sc.scale;
       } else {
-        return -1;
+        return no_at(__LINE__, x);
       }
       auto d = vx::decoded_ints(tb, pc);
-      if (!d || d->v.size() != cs.size()) return -1;
+      if (!d || d->v.size() != cs.size()) return no_at(__LINE__, x);
       in.op = 0;
       in.v = d->v.data();
       in.src = ps;
       holds.push_back(std::move(d));
       if (vx::has_nulls(cs)) {
         auto z = vx::decoded_nulls(tb, pc);
-        if (!z) return -1;
+        if (!z) return no_at(__LINE__, x);
         in.nul = z->data();
         nholds.push_back(std::move(z));
       }
@@ -46932,36 +47496,40 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
       int sc = 0, ds = 0;
       if (x->literal.null || !x->literal.numeric || x->literal.approx || !exact_internal_of(x->literal, &v, &sc, &ds) || sc != ds ||
           sc > 18 || v > (AIOS_INT128)INT64_MAX || v < (AIOS_INT128)INT64_MIN)
-        return -1;
+        return no_at(__LINE__, x);
       in.op = 1;
       in.k = (int64_t)v;
       in.scale = sc;
     } else if (x->op == ExprOp::Neg) {
-      if (x->args.size() != 1) return -1;
+      if (x->args.size() != 1) return no_at(__LINE__, x);
       const int ia = mk(x->args[0].get());   // -x at x's scale (val_exact_fine(-x, xs, ds))
-      if (ia < 0) return -1;
+      if (ia < 0) return no_at(__LINE__, x);
       in.op = 5;
       in.a = (uint32_t)ia;
       in.scale = xs[(size_t)ia].scale;
     } else if (x->op == ExprOp::Add || x->op == ExprOp::Sub || x->op == ExprOp::Mul) {
-      if (x->args.size() != 2) return -1;
+      if (x->args.size() != 2) return no_at(__LINE__, x);
       const int ia = mk(x->args[0].get());
-      if (ia < 0) return -1;
+      if (ia < 0) return no_at(__LINE__, x);
       const int ib = mk(x->args[1].get());
-      if (ib < 0) return -1;
+      if (ib < 0) return no_at(__LINE__, x);
       in.op = x->op == ExprOp::Add ? 2 : x->op == ExprOp::Sub ? 3 : 4;
       in.a = (uint32_t)ia;
       in.b = (uint32_t)ib;
       const int sa = xs[(size_t)ia].scale, sb = xs[(size_t)ib].scale;
       in.scale = in.op == 4 ? sa + sb : std::max(sa, sb);
-      if (in.scale > 18) return -1;
+      if (in.scale > 18) return no_at(__LINE__, x);
     } else {
-      return -1;
+      return no_at(__LINE__, x);
     }
     xs.push_back(in);
     return (int)xs.size() - 1;
   };
-  if (mk(e) < 0 || xs.empty()) return false;
+  if (mk(e) < 0 || hard || xs.empty()) {
+    if (vx_trace_on() && !hard)
+      vx_trace("exact lane: none (line " + std::to_string(no_line) + ", at " + (no_expr ? vp::expr_text(no_expr) : std::string("?")) + ")");
+    return false;
+  }
   static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
                                   10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
                                   1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
@@ -46974,7 +47542,8 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
   col->uns = false;
   col->i.assign(nr, 0);
   col->n.assign(nr, 0);
-  std::atomic<int> fail{0};   // 1: a product past 64 bits, 2: a sum, 3: a negation
+  // 1: a product past 64 bits, 2: a sum, 3: a negation, 4: a double CAST does not round, 5: a CAST past its digits
+  std::atomic<int> fail{0};
   SqlThreadPool::instance().for_chunks(nr, 16384, nr, false, [&](size_t b0, size_t b1, size_t) {
     if (fail.load(std::memory_order_relaxed)) return;
     const size_t m = b1 - b0;
@@ -46987,6 +47556,79 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
       v.assign(m, 0);
       z.assign(m, 0);
       switch (in.op) {
+        case 6: {
+          const vp::Column& c = *in.pc;
+          const int64_t mul = p10[in.scale];
+          for (size_t j = 0; j < m; ++j) {
+            const size_t r = b0 + j;
+            if (c.n[r]) { z[j] = 1; continue; }
+            AIOS_INT128 q128 = 0;
+            if (c.ty == vp::Ty::F64) {
+              if (!round_double_scaled(c.f[r], in.scale, &q128)) { fail.store(4); return; }
+            } else {
+              q128 = (AIOS_INT128)c.i[r] * mul;
+            }
+            if (q128 >= in.lim || q128 <= -(AIOS_INT128)in.lim) { fail.store(5); return; }
+            v[j] = (int64_t)q128;
+          }
+          break;
+        }
+        case 7: {
+          const std::vector<int64_t>& a = val[in.a];
+          const std::vector<uint8_t>& za = nul[in.a];
+          const int64_t mul = p10[in.scale - xs[in.a].scale];
+          for (size_t j = 0; j < m; ++j) {
+            if (za[j]) { z[j] = 1; continue; }
+            int64_t x = 0;
+            if (__builtin_mul_overflow(a[j], mul, &x) || x >= in.lim || x <= -in.lim) { fail.store(5); return; }
+            v[j] = x;
+          }
+          break;
+        }
+        case 8: {
+          // a branch's value at the CASE's scale; a row no condition holds for: the ELSE, or NULL
+          const size_t nb = in.br.size(), nc = in.conds.size();
+          std::vector<int64_t> mul(nb);
+          for (size_t i = 0; i < nb; ++i) mul[i] = p10[in.scale - xs[in.br[i]].scale];
+          for (size_t j = 0; j < m; ++j) {
+            const size_t r = b0 + j;
+            size_t pick = SIZE_MAX;
+            for (size_t i = 0; i < nc; ++i) {
+              const vp::Column& c = *in.conds[i];
+              if (c.n[r]) continue;
+              if (c.ty == vp::Ty::F64 ? c.f[r] != 0 : c.i[r] != 0) { pick = i; break; }
+            }
+            if (pick == SIZE_MAX) {
+              if (!in.has_else) { z[j] = 1; continue; }
+              pick = nb - 1;
+            }
+            const uint32_t s = in.br[pick];
+            if (nul[s][j]) { z[j] = 1; continue; }
+            if (__builtin_mul_overflow(val[s][j], mul[pick], &v[j])) { fail.store(1); return; }
+          }
+          break;
+        }
+        case 10: {
+          const std::vector<int64_t>& a = val[in.a];
+          const std::vector<uint8_t>& za = nul[in.a];
+          const int64_t pd = p10[in.drop], pu = p10[in.up];
+          for (size_t j = 0; j < m; ++j) {
+            if (za[j]) { z[j] = 1; continue; }
+            int64_t q = a[j];
+            if (in.drop > 0) q = in.trunc ? q / pd : (int64_t)scale_down_half_up((AIOS_INT128)q, in.drop);
+            if (in.up > 0 && __builtin_mul_overflow(q, pu, &q)) { fail.store(1); return; }
+            v[j] = q;
+          }
+          break;
+        }
+        case 9: {
+          const vp::Column& c = *in.pc;
+          for (size_t j = 0; j < m; ++j) {
+            if (c.n[b0 + j]) { z[j] = 1; continue; }
+            v[j] = c.i[b0 + j];
+          }
+          break;
+        }
         case 0:
           for (size_t j = 0; j < m; ++j) {
             const size_t r = rows.part(b0 + j, in.src);
@@ -47033,11 +47675,10 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
         }
       }
       // an operator's operands are read by it alone (mk builds a tree): freed once it has run
-      if (in.op >= 2) {
-        std::vector<int64_t>().swap(val[in.a]);
-        std::vector<uint8_t>().swap(nul[in.a]);
-        if (in.op != 5) { std::vector<int64_t>().swap(val[in.b]); std::vector<uint8_t>().swap(nul[in.b]); }
-      }
+      auto drop = [&](uint32_t o) { std::vector<int64_t>().swap(val[o]); std::vector<uint8_t>().swap(nul[o]); };
+      if (in.op >= 2 && in.op <= 4) { drop(in.a); drop(in.b); }
+      else if (in.op == 5 || in.op == 7 || in.op == 10) drop(in.a);
+      else if (in.op == 8) for (uint32_t o : in.br) drop(o);
     }
     const std::vector<int64_t>& v = val[nx - 1];
     const std::vector<uint8_t>& z = nul[nx - 1];
@@ -47046,7 +47687,9 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
       col->i[b0 + j] = z[j] ? 0 : v[j];
     }
   });
-  if (const int f = fail.load()) return no(f == 1 ? "an exact product past 64 bits" : f == 2 ? "an exact sum past 64 bits" : "an exact negation past 64 bits");
+  if (const int f = fail.load())
+    return no(f == 1 ? "an exact product past 64 bits" : f == 2 ? "an exact sum past 64 bits" : f == 3 ? "an exact negation past 64 bits"
+              : f == 4 ? "a DOUBLE the CAST does not round" : "a CAST past its digits");
   *xscale = xs.back().scale;
   return true;
 }
@@ -47146,10 +47789,12 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     }
   }
   EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
-  // An aggregate's argument as exact arithmetic the programs leave to the interpreter (exact_lane_of).
+  // An aggregate's argument as exact arithmetic the programs leave to the interpreter (exact_lane_of), the lanes
+  // its arguments have in common made once (memo: this statement's, over these rows).
+  LaneMemo memo;
   auto exact_lane = [&](const SqlExpr* e, vp::Column* col, int* xscale) -> bool {
     std::string why;
-    if (exact_lane_of(sources, rows, e, col, xscale, &why)) return true;
+    if (exact_lane_of(sources, rows, e, col, xscale, &why, &memo)) return true;
     if (!why.empty()) no(why);
     return false;
   };
@@ -47216,6 +47861,35 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     const vp::Prog* P = vp::program_for(e, vctx);
     if (!P && xscale && exact_lane(e, col, xscale)) return true;
     if (!P) return no("no program for " + e->source_text.substr(0, 60));
+    if (key && P->out().ty == vp::Ty::Str) {
+      // A text key (COALESCE(brand, 'UNBRANDED')): each row's text by its collation class, the class numbered by
+      // the key the general path groups by (append_collate_key) - so the same rows group together. The classes
+      // are not the text's order (*keys_exact false: the caller sorts).
+      vp::Column t;
+      std::string err;
+      if (!vp_eval_rows(*P, rows, &t, &err)) return no("evaluation: " + err);
+      if (t.ty != vp::Ty::Str || t.size() != rows.size()) return no("text key lane");
+      col->ty = vp::Ty::I64;
+      col->approx = false;
+      col->uns = false;
+      col->i.assign(rows.size(), 0);
+      col->n = std::move(t.n);
+      std::unordered_map<std::string, int64_t> by_text, by_class;
+      std::string ck;
+      for (size_t j = 0; j < rows.size(); ++j) {
+        if (col->n[j]) continue;
+        auto it = by_text.find(t.s[j]);
+        if (it == by_text.end()) {
+          ck.clear();
+          append_collate_key(ck, t.s[j]);
+          const int64_t c = by_class.emplace(ck, (int64_t)by_class.size()).first->second;
+          it = by_text.emplace(t.s[j], c).first;
+        }
+        col->i[j] = it->second;
+      }
+      *keys_exact = false;
+      return true;
+    }
     if (P->out().ty != vp::Ty::I64 && !(dbl && P->out().ty == vp::Ty::F64)) return no("not integers: " + e->source_text.substr(0, 60));
     std::string err;
     if (!vp_eval_rows(*P, rows, col, &err)) return no("evaluation: " + err);
@@ -52579,6 +53253,11 @@ static bool conjunct_truths(SqlDatabase* db, const std::vector<QuerySource>& sou
   EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
   const size_t n = rows.size();
   if (!p) return false;
+  // a constant (a view's `WHERE 1 AND ...`): one truth for every row
+  if (p->op == ExprOp::Literal) {
+    out->assign(n, p->literal.null ? (int8_t)-1 : (int8_t)(val_truthy(p->literal) ? 1 : 0));
+    return true;
+  }
   if (const vp::Prog* P = vp::program_for(p, vctx)) {
     if (P->out().ty != vp::Ty::I64 || !truth_root(P->out().op)) return false;
     vp::Column col;
@@ -52894,8 +53573,13 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
             if (pushed_where_parts.count(w)) continue;
             ++left;
             if (applied + 1 != left || star_cols.empty()) continue;   // after one that did not compile: in order, later
+            // a constant true (a view's `WHERE 1 AND ...`) keeps every row: nothing to decide or to compact
+            if (w->op == ExprOp::Literal && !w->literal.null && val_truthy(w->literal)) { pushed_where_parts.insert(w); ++applied; continue; }
             std::vector<int8_t> t;
-            if (!conjunct_truths(db, sources, RowIds(star_cols), w, &t)) continue;
+            if (!conjunct_truths(db, sources, RowIds(star_cols), w, &t)) {
+              if (vx_trace_on()) vx_trace("join: star WHERE part not decided over the arrays: " + w->source_text.substr(0, 200));
+              continue;
+            }
             const size_t n = t.size();
             size_t keep = 0;
             for (size_t r = 0; r < n; ++r) keep += t[r] == 1;
@@ -53090,6 +53774,7 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
   };
 
   bool exprs_owned = false;
+  bool views_merged = false;
   if (db && db->has_views()) {
     int expand_loops = 0;
     // A chain of merged CTEs (execute_with) is one level a pass.
@@ -53684,8 +54369,16 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
         }
       }
       if (!expanded_any) break;
+      views_merged = true;
     }
   }
+  // A merged view's WHERE came in after decorrelate_exists ran above: km's stocktrans view carries the
+  // `OR NOT EXISTS` its every report filtered through, once per row.
+  if (db && views_merged && branched) {
+    if (ExprPtr w = decorrelate_exists(db, expanded_branch)) expanded_branch.where = w;
+  }
+  // the merged view's joins nothing reads (and that cannot multiply rows) go, so the star join sees only the tables read
+  if (db && views_merged && branched) prune_dead_left_joins(db, expanded_branch);
 
   // A derived table is run once, here, and left where a CTE would be, so the
   // rest of the engine only ever sees an ordinary named source.

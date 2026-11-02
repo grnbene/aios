@@ -26,7 +26,12 @@ struct Ins {
     Case, Coalesce, NullIf, Greatest, Least, Abs, Floor, Ceil, Sqrt, Pow, Sin, Cos, Tan, Atan, Atan2, Radians,
     Degrees, CastI, CastF, BitAnd, BitOr, BitXor, Shl, Shr, BitNot,
     RoundI,  // a stored routine's INT parameter or result: the double rounded half away from zero (std::round)
-    TupleIn  // (a, b) IN (SELECT ..): the tuple of numbers looked up in the subquery's rows, hashed whole
+    TupleIn,  // (a, b) IN (SELECT ..): the tuple of numbers looked up in the subquery's rows, hashed whole
+    // CAST(x AS DECIMAL(p, s)) of a DOUBLE or an integer, read by the double arithmetic around it: each row's value
+    // rounded as the interpreter's CAST rounds it (round_double_scaled), the lane the double that decimal reads as
+    // (its digits over 10^s: the nearest double, as parse_number of its text). An exact decimal (dec): only a
+    // double's arithmetic, a comparison or a CAST may read it, as a decimal literal's lane is read.
+    CastDec
   } op = Konst;
   Ty ty = Ty::I64;
   bool approx = false;    // the interpreter's Val here would be approximate (a DOUBLE)
@@ -53,6 +58,8 @@ struct Ins {
   int64_t ki = 0;
   uint32_t src = 0;       // a column's source
   uint32_t slot = 0;      // ColS: the column's index in Prog::text_cols
+  int dplaces = 0;        // CastDec: s
+  int64_t dlim = 0;       // CastDec: 10^p, past which the interpreter clamps (the chunk is the interpreter's then)
   const ColumnStore* cs = nullptr;
   std::vector<uint32_t> args;
   std::shared_ptr<const RowInSet> set;   // TupleIn: the subquery's rows
@@ -620,6 +627,9 @@ struct Compiler {
           return emit(std::move(in));
         }
         const Ins::Op op = e->op == ExprOp::Add ? Ins::Add : e->op == ExprOp::Sub ? Ins::Sub : e->op == ExprOp::Mul ? Ins::Mul : Ins::Mod;
+        // A double beside an exact decimal (price * qty - CAST(.. AS DECIMAL(10,2)), x - 0.5) is a double at every row
+        // (exact_arith declines a DOUBLE operand): tainted only through an operand that may itself be either.
+        if (approx) return binary(op, a, b, ty, approx, at(a).taint || at(b).taint);
         return binary(op, a, b, ty, approx, tainted(a, b));
       }
       case ExprOp::Eq: case ExprOp::Ne: case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt: case ExprOp::Ge: {
@@ -730,6 +740,7 @@ struct Compiler {
           }
           if (first) return fail("CASE of no values");
           if (!uns_kinds(in)) return fail("unsigned CASE branch mixed with a non-integer");
+          double_case(e, &in);
           return emit(std::move(in));
         }
         // CASE x WHEN v THEN r ...: each WHEN is x = v (a NULL never equal, as compare_vals has it) - of a text
@@ -777,6 +788,7 @@ struct Compiler {
         }
         if (first) return fail("CASE of no values");
         if (!uns_kinds(in)) return fail("unsigned CASE branch mixed with a non-integer");
+        double_case(e, &in);
         return emit(std::move(in));
       }
       case ExprOp::Func: {
@@ -869,6 +881,27 @@ struct Compiler {
           if (target.rfind("SIGNED", 0) == 0) return unary(Ins::CastI, a, Ty::I64, false);
           if (target.rfind("DOUBLE", 0) == 0 || target.rfind("FLOAT", 0) == 0 || target.rfind("REAL", 0) == 0)
             return unary(Ins::CastF, a, Ty::F64, true);
+          if (target.rfind("DECIMAL", 0) == 0 || target.rfind("NUMERIC", 0) == 0) {
+            // of a DOUBLE (its rounding is round_double_scaled's) or an exact integer (its digits, padded); not of an
+            // exact decimal, whose digits the lane does not hold. At most 15 digits: every such value has its own
+            // double, so the double's comparisons are the decimal's.
+            const size_t lp = target.find('('), comma = target.find(',');
+            const int prec = lp == std::string::npos ? 10 : std::atoi(target.c_str() + lp + 1);
+            const int places = comma == std::string::npos ? 0 : std::atoi(target.c_str() + comma + 1);
+            if (prec < 1 || prec > 15 || places < 0 || places > prec) return fail("CAST to DECIMAL past 15 digits");
+            const Ins& x = at(a);
+            if (x.uns || x.taint || x.day || (x.ty == Ty::F64 && !x.approx)) return fail("CAST to DECIMAL of an exact decimal");
+            Ins in;
+            in.op = Ins::CastDec;
+            in.ty = Ty::F64;
+            in.approx = false;
+            in.dec = true;
+            in.dplaces = places;
+            in.dlim = 1;
+            for (int i = 0; i < prec; ++i) in.dlim *= 10;
+            in.args = {a};
+            return emit(std::move(in));
+          }
           return fail();
         }
         if (up == "IF"sv) {
@@ -1025,6 +1058,14 @@ struct Compiler {
     if (in.ty != Ty::I64) return false;
     if (in.has_signed) in.uns_check = true; else in.uns = true;
     return true;
+  }
+  // A CASE MariaDB types a DOUBLE (a DOUBLE branch beside integers: CASE WHEN m = 1 THEN qty ELSE 0 END): the
+  // interpreter hands back every branch as a DOUBLE (nt_adjust), so the lane is one at every row - not tainted.
+  void double_case(const SqlExpr* e, Ins* in) {
+    if (in->ty != Ty::F64 || in->has_uns) return;
+    if (case_result_kind(e, ctx) != 3) return;
+    in->approx = true;
+    in->taint = false;
   }
   bool same_kind(Ins& in, const Ins& v, bool* first) {
     if (v.knull) return true;
@@ -1462,6 +1503,19 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
           vf[j] = P.ins[in.args[0]].uns ? (double)(uint64_t)A(0)[j] : fd(0, j);
         }
         break;
+      case Ins::CastDec: {
+        static const double p10d[16] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+        const double div = p10d[in.dplaces];
+        for (size_t j = 0; j < n; ++j) {
+          if (N(0)[j]) { nl[j] = 1; continue; }
+          AIOS_INT128 q = 0;
+          if (ty(0) == Ty::I64) q = (AIOS_INT128)A(0)[j] * (int64_t)div;
+          else if (!round_double_scaled(F(0)[j], in.dplaces, &q)) { *err = "CAST of a DOUBLE: the interpreter's"; return false; }
+          if (q >= in.dlim || q <= -(AIOS_INT128)in.dlim) { *err = "CAST past its digits: the interpreter clamps it"; return false; }
+          vf[j] = (double)(int64_t)q / div;
+        }
+        break;
+      }
       case Ins::TupleIn: {
         // a NULL in the tuple is unknown (the set holds no NULL row to equal it); a value past a double's 53 bits
         // the interpreter compares by its digits - the interpreter's path, then
