@@ -44056,6 +44056,11 @@ struct StarLink {                              // child_src's row from parent_sr
   std::shared_ptr<const vx::DecodedInts> wi_hold;
   const uint32_t* whole_codes = nullptr;
   const int64_t* whole_ints = nullptr;
+  // A composite key (`ON s.productid = i.productid AND s.loccode = i.loccode`): every key's (child, parent) column,
+  // the first the link's own; the parent rows' keys packed into one integer each (comp_pk, INT64_MIN where a part
+  // is NULL or meets no child value), read as whole_ints - the child rows' keys packed the same way in the map.
+  std::vector<std::pair<size_t, size_t>> comp;
+  std::shared_ptr<std::vector<int64_t>> comp_pk;
   // One-to-many (an order's lines): key - mlo -> the child rows moff[k] .. moff[k+1] of mrows, ascending - the
   // order the general join meets them in. The row loop below expands a parent row into each of them.
   bool multi = false;
@@ -44230,6 +44235,186 @@ static bool sql_pipe_on() {
   return !off;
 }
 
+// AIOS_SQL_STAR_COMP=0: a join with several key equalities is not taken as a star link (the general join's).
+static bool static_star_comp_off() {
+  static const bool off = [] { const char* v = std::getenv("AIOS_SQL_STAR_COMP"); return v && *v == '0'; }();
+  return off;
+}
+// A composite-key link's map: each key part an integer id - an INT column's value less the child rows' least, a
+// text column's child dictionary code (the parent's through the star code map: the interpreter's collation
+// equality) - packed into one integer, the child rows keyed by theirs (unique, or false: rows multiply, the general
+// join's), and every parent row's packed key in L.comp_pk (INT64_MIN: a NULL part, or a value no child row has).
+// multi: a key several child rows share makes the link one-to-many (its rows by packed key in row order, as
+// build_multi lays out an integer key's) instead of refusing it.
+// A composite link's maps over a whole child table, kept while neither table changes (the key columns, both tables'
+// identity, mutation count and rows): building them read and packed every parent row's keys - 18 ms over 600k
+// order lines, every statement.
+struct CompKept {
+  const SqlTable* ct = nullptr; const SqlTable* pt = nullptr;
+  uint64_t cseq = 0, pseq = 0;
+  size_t crows = 0, prows = 0;
+  std::vector<std::pair<size_t, size_t>> comp;
+  std::vector<uint64_t> stamp;   // every key column's store identity and epoch (a table dropped and made again moves them)
+  bool multi = false;
+  StarMap map;
+  std::shared_ptr<const StarMultiMap> mm;
+  std::shared_ptr<std::vector<int64_t>> pk;
+};
+static aios::hal::Mutex g_comp_mu;
+static std::vector<CompKept> g_comp_kept;
+static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L, const std::vector<uint32_t>& ids, bool multi = false) {
+  const SqlTable& ct = *sources[L.child_src].table;
+  const SqlTable& pt = *sources[L.parent_src].table;
+  const bool whole = ids.size() == ct.row_count() && !ct.inferred_types && !pt.inferred_types;
+  std::vector<uint64_t> stamp;
+  for (const auto& cp : L.comp) {
+    if (cp.first >= ct.col_data.size() || cp.second >= pt.col_data.size()) return false;
+    stamp.push_back(ct.col_data[cp.first].uid.v); stamp.push_back(ct.col_data[cp.first].epoch);
+    stamp.push_back(pt.col_data[cp.second].uid.v); stamp.push_back(pt.col_data[cp.second].epoch);
+  }
+  if (whole) {
+    std::lock_guard<aios::hal::Mutex> lk(g_comp_mu);
+    for (const CompKept& k : g_comp_kept)
+      if (k.ct == &ct && k.pt == &pt && k.cseq == ct.mutation_seq && k.pseq == pt.mutation_seq && k.crows == ct.row_count() &&
+          k.prows == pt.row_count() && k.comp == L.comp && k.stamp == stamp && (multi || !k.multi)) {
+        L.map = k.map; L.multi = k.multi; L.mm = k.mm; L.comp_pk = k.pk;
+        return true;
+      }
+  }
+  auto no = [&](const char* why) {
+    if (vx_trace_on()) vx_trace(std::string("join: composite key of ") + ct.name + " not a star link: " + why);
+    return false;
+  };
+  if (ct.inferred_types || pt.inferred_types) return no("a result table");
+  struct Part {
+    bool text = false;
+    std::shared_ptr<const StarCodeMap> cm;
+    std::shared_ptr<const std::vector<uint32_t>> cc, pcd;
+    std::shared_ptr<const vx::DecodedInts> ci, pi;
+    std::shared_ptr<const std::vector<uint8_t>> cn, pn;
+    int64_t lo = 0;
+    uint64_t width = 0, mult = 1;
+  };
+  std::vector<Part> parts(L.comp.size());
+  for (size_t k = 0; k < L.comp.size(); ++k) {
+    Part& P = parts[k];
+    const size_t cc = L.comp[k].first, pc = L.comp[k].second;
+    if (cc >= ct.col_data.size() || pc >= pt.col_data.size()) return no("a column");
+    const ColumnStore& ccs = ct.col_data[cc];
+    const ColumnStore& pcs = pt.col_data[pc];
+    if (ccs.size() != ct.row_count() || pcs.size() != pt.row_count()) return no("a column not whole");
+    StarKey ck, pk;
+    if (!star_key_of(ct, cc, &ck) || !star_key_of(pt, pc, &pk) || ck.text != pk.text) return no("key types");
+    P.text = ck.text;
+    if (P.text) {
+      if (!vx::dict_coded(ccs) || !vx::dict_coded(pcs)) return no("text not dictionary-coded");
+      P.cm = star_code_map(pk, ck);
+      if (!P.cm || !P.cm->ok) return no("text keys not comparable by code");   // two child entries one key, or keys not comparable by code
+      P.cc = vx::decoded_codes(ct, cc);
+      P.pcd = vx::decoded_codes(pt, pc);
+      if (!P.cc || !P.pcd) return no("codes not decoded");
+      P.width = P.cm->cn;
+    } else {
+      if (ct.columns[cc].type != SqlDataType::Int || pt.columns[pc].type != SqlDataType::Int || !vx::typed_integer(ccs) || !vx::typed_integer(pcs))
+        return no("integer keys not typed");
+      P.ci = vx::decoded_ints(ct, cc);
+      P.pi = vx::decoded_ints(pt, pc);
+      if (!P.ci || !P.pi) return no("integers not decoded");
+      int64_t lo = INT64_MAX, hi = INT64_MIN;
+      const bool hn = vx::has_nulls(ccs);
+      for (uint32_t r : ids) if (!(hn && ccs.is_null(r))) { lo = std::min(lo, P.ci->v[r]); hi = std::max(hi, P.ci->v[r]); }
+      if (lo > hi) { lo = 0; hi = 0; }
+      if ((uint64_t)hi - (uint64_t)lo >= ((uint64_t)1 << 40)) return no("an integer range too wide");
+      P.lo = lo;
+      P.width = (uint64_t)(hi - lo) + 1;
+    }
+    if (vx::has_nulls(ccs)) { P.cn = vx::decoded_nulls(ct, cc); if (!P.cn) return false; }
+    if (vx::has_nulls(pcs)) { P.pn = vx::decoded_nulls(pt, pc); if (!P.pn) return false; }
+  }
+  uint64_t span = 1;
+  for (Part& P : parts) {
+    P.mult = span;
+    if (P.width == 0 || span > ((uint64_t)1 << 62) / P.width) return no("keys too wide together");
+    span *= P.width;
+  }
+  // the child rows by packed key
+  std::vector<uint64_t> ckey(ids.size(), UINT64_MAX);   // UINT64_MAX: a NULL part, meets nothing
+  for (size_t j = 0; j < ids.size(); ++j) {
+    const uint32_t r = ids[j];
+    uint64_t key = 0;
+    bool null = false;
+    for (const Part& P : parts) {
+      if (P.cn && (*P.cn)[r]) { null = true; break; }
+      const uint64_t id = P.text ? (uint64_t)(*P.cc)[r] : (uint64_t)(P.ci->v[r] - P.lo);
+      if (id >= P.width) { null = true; break; }
+      key += id * P.mult;
+    }
+    if (!null) ckey[j] = key;
+  }
+  std::unordered_map<uint64_t, uint32_t> key_row;
+  key_row.reserve(ids.size() * 2 + 16);
+  bool dup = false;
+  for (size_t j = 0; j < ids.size() && !dup; ++j)
+    if (ckey[j] != UINT64_MAX && !key_row.emplace(ckey[j], ids[j]).second) dup = true;
+  if (dup) {
+    if (!multi) return no("not unique");   // rows multiply: one-to-many, or the general join's
+    if (span >= std::max<uint64_t>((uint64_t)1 << 22, ids.size() * 8)) return no("one-to-many over too wide a key");
+    auto m = std::make_shared<StarMultiMap>();
+    m->lo = 0;
+    m->off.assign((size_t)span + 1, 0);
+    for (size_t j = 0; j < ids.size(); ++j) if (ckey[j] != UINT64_MAX) m->off[(size_t)ckey[j] + 1]++;
+    for (size_t k = 0; k < (size_t)span; ++k) m->off[k + 1] += m->off[k];
+    m->rows.resize(m->off[(size_t)span]);
+    for (size_t k = 0; k < (size_t)span; ++k) m->maxrun = std::max(m->maxrun, m->off[k + 1] - m->off[k]);
+    std::vector<uint32_t> fill(m->off.begin(), m->off.end() - 1);
+    for (size_t j = 0; j < ids.size(); ++j) if (ckey[j] != UINT64_MAX) m->rows[fill[(size_t)ckey[j]]++] = ids[j];   // ids ascending: each list too
+    L.multi = true;
+    L.mm = m;
+    L.map = StarMap();
+  }
+  StarMap& M = L.map;
+  if (dup) {
+  } else if (span < std::max<uint64_t>((uint64_t)1 << 22, key_row.size() * 8)) {
+    M.by_dense = true;
+    M.lo = 0;
+    M.dense.assign((size_t)span, UINT32_MAX);
+    for (const auto& kv : key_row) M.dense[(size_t)kv.first] = kv.second;
+  } else {
+    M.of_key = std::move(key_row);
+  }
+  // every parent row's packed key
+  const size_t pn = pt.row_count();
+  auto pk = std::make_shared<std::vector<int64_t>>(pn, INT64_MIN);
+  for (size_t r = 0; r < pn; ++r) {
+    uint64_t key = 0;
+    bool miss = false;
+    for (const Part& P : parts) {
+      if (P.pn && (*P.pn)[r]) { miss = true; break; }
+      uint64_t id;
+      if (P.text) {
+        const uint32_t code = (*P.pcd)[r];
+        if (code >= P.cm->p2c.size() || P.cm->p2c[code] < 0) { miss = true; break; }
+        id = (uint64_t)P.cm->p2c[code];
+      } else {
+        const int64_t v = P.pi->v[r];
+        if (v < P.lo || (uint64_t)(v - P.lo) >= P.width) { miss = true; break; }
+        id = (uint64_t)(v - P.lo);
+      }
+      key += id * P.mult;
+    }
+    if (!miss) (*pk)[r] = (int64_t)key;
+  }
+  L.comp_pk = std::move(pk);
+  if (whole) {
+    std::lock_guard<aios::hal::Mutex> lk(g_comp_mu);
+    if (g_comp_kept.size() >= 16) g_comp_kept.erase(g_comp_kept.begin());
+    CompKept k;
+    k.ct = &ct; k.pt = &pt; k.cseq = ct.mutation_seq; k.pseq = pt.mutation_seq; k.crows = ct.row_count(); k.prows = pt.row_count();
+    k.comp = L.comp; k.stamp = stamp; k.multi = L.multi; k.map = L.map; k.mm = L.mm; k.pk = L.comp_pk;
+    g_comp_kept.push_back(std::move(k));
+  }
+  return true;
+}
 static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, const std::vector<ExprPtr>& join_conditions,
                       const std::vector<bool>& join_is_left, const SqlExpr* where, const EvalCtx* outer_scope,
                       const uint32_t* base, size_t nbase, std::vector<std::vector<uint32_t>>* P,
@@ -44267,6 +44452,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
 
   struct Step {
     size_t parent_src = 0, parent_col = 0, child_col = 0;
+    std::vector<std::pair<size_t, size_t>> extra;   // further key equalities with the same parent: (child, parent) columns
     StarKey pk, ck;
     std::vector<const SqlExpr*> filters;   // the joined table's own conditions
     std::vector<const SqlExpr*> from_where;
@@ -44283,7 +44469,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
       uint32_t m = 0;
       if (!reads(pc, &m)) return false;
       if (m == (1u << js)) { st.filters.push_back(pc); continue; }
-      if (have_key || !pc || pc->op != ExprOp::Eq || pc->args.size() != 2) return false;
+      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) return false;
       const SqlExpr* a = pc->args[0].get();
       const SqlExpr* b = pc->args[1].get();
       if (!a || !b || a->op != ExprOp::Column || b->op != ExprOp::Column) return false;
@@ -44292,6 +44478,11 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
           lookup_column_here(all, *b, &sb, &cb) != ColumnLookup::Found) return false;
       if (sb == js && sa < js) { std::swap(sa, sb); std::swap(ca, cb); }
       if (!(sa == js && sb < js)) return false;
+      if (have_key) {   // a further key: of the same parent, at most three in all
+        if (sb != st.parent_src || st.extra.size() >= 2 || static_star_comp_off()) return false;
+        st.extra.emplace_back(ca, cb);
+        continue;
+      }
       st.child_col = ca;
       st.parent_src = sb;
       st.parent_col = cb;
@@ -44337,6 +44528,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     return true;
   };
   auto build = [&](Link& L, const std::vector<uint32_t>& ids) {
+    if (!L.comp.empty()) return star_build_comp(sources, L, ids);
     const SqlTable& ct = *sources[L.child_src].table;
     const ColumnStore& ccs = ct.col_data[L.child_col];
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
@@ -44447,6 +44639,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   static const bool multi_off = [] { const char* v = std::getenv("AIOS_SQL_STAR_MULTI"); return v && *v == '0'; }();
   auto build_multi = [&](Link& L, const std::vector<uint32_t>& ids) -> bool {
     if (multi_off) return false;
+    if (!L.comp.empty()) return star_build_comp(sources, L, ids, true);
     const SqlTable& ct = *sources[L.child_src].table;
     const ColumnStore& ccs = ct.col_data[L.child_col];
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
@@ -44489,6 +44682,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   // the key is known not unique there, so the unique map is not attempted first - over 600k order lines that
   // attempt was ~48M instructions a statement, thrown away.
   auto multi_known = [&](Link& L, const std::vector<uint32_t>& ids) {
+    if (!L.comp.empty()) return false;
     if (multi_off) return false;
     const SqlTable& ct = *sources[L.child_src].table;
     if (ids.size() != ct.row_count() || L.child_col >= ct.col_data.size()) return false;
@@ -44530,6 +44724,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     Link L;
     L.child_src = j + 1; L.child_col = st.child_col; L.parent_src = st.parent_src; L.parent_col = st.parent_col;
     L.ck = st.ck; L.pk = st.pk; L.left = join_is_left[j];
+    if (!st.extra.empty()) { L.comp.emplace_back(st.child_col, st.parent_col); L.comp.insert(L.comp.end(), st.extra.begin(), st.extra.end()); }
     std::vector<const SqlExpr*> conds = st.filters;
     conds.insert(conds.end(), st.from_where.begin(), st.from_where.end());
     std::vector<uint32_t> ids;
@@ -44559,6 +44754,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     auto try_reroot = [&]() {
       links.clear();
       Step& s0 = steps[0];
+      if (!s0.extra.empty()) return false;   // a composite key is looked up from the parent side only
       std::vector<const SqlExpr*> conds = s0.filters;
       conds.insert(conds.end(), s0.from_where.begin(), s0.from_where.end());
       // A few base rows against a big joined table: only its rows holding
@@ -44631,6 +44827,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
         Link L;
         L.child_src = j + 1; L.child_col = st.child_col; L.parent_src = st.parent_src; L.parent_col = st.parent_col;
         L.ck = st.ck; L.pk = st.pk; L.left = join_is_left[j];
+        if (!st.extra.empty()) { L.comp.emplace_back(st.child_col, st.parent_col); L.comp.insert(L.comp.end(), st.extra.begin(), st.extra.end()); }
         std::vector<const SqlExpr*> conds2 = st.filters;
         conds2.insert(conds2.end(), st.from_where.begin(), st.from_where.end());
         std::vector<uint32_t> ids;
@@ -44651,6 +44848,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
         Link L;
         L.child_src = j + 1; L.child_col = st.child_col; L.parent_src = st.parent_src; L.parent_col = st.parent_col;
         L.ck = st.ck; L.pk = st.pk; L.left = join_is_left[j];
+        if (!st.extra.empty()) { L.comp.emplace_back(st.child_col, st.parent_col); L.comp.insert(L.comp.end(), st.extra.begin(), st.extra.end()); }
         std::vector<const SqlExpr*> conds2 = st.filters;
         conds2.insert(conds2.end(), st.from_where.begin(), st.from_where.end());
         std::vector<uint32_t> ids;
@@ -44665,7 +44863,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     for (const Link& L : links) {
       if (L.multi) continue;   // many rows under one parent row: neither decided by it nor unique on the key
       shape->parent[L.child_src] = (int)L.parent_src;
-      shape->uniq_col[L.child_src] = (int)L.child_col;
+      shape->uniq_col[L.child_src] = L.comp.empty() ? (int)L.child_col : -1;   // a composite key: unique on no one column
     }
   }
   for (const Step& st : steps) for (const SqlExpr* w : st.from_where) pushed.insert(w);
@@ -44682,6 +44880,11 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   sql_reserve_query_memory(nr * ns * (rerooted ? 12 : 4));
   for (auto& v : *P) v.reserve(nr);
   for (Link& L : links) {
+    if (L.comp_pk) {   // the packed parent keys: NULL already a key the map lacks
+      L.parent_nulls = false;
+      L.whole_ints = L.comp_pk->data();
+      continue;
+    }
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
     L.parent_nulls = vx::has_nulls(pcs);
     // whole when the rows read a third of the column or more: a block decode is ~20 instructions a value against
