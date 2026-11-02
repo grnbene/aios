@@ -7404,6 +7404,7 @@ bool vx_trace_on();
 void vx_trace(const std::string& msg);
 uint64_t hal_now_ns();
 static std::string last_name_part(const std::string& s);
+static void radix_sort_pairs(std::vector<std::pair<uint64_t, uint32_t>>& v, int bits);   // (key, row) pairs, by key, ties by row
 namespace vx {
 bool nondeterministic_func(const std::string& up);
 bool dict_coded(const ColumnStore& cs);
@@ -38070,6 +38071,72 @@ struct AggValues {
   void clear() { flat.clear(); }
 };
 
+// SUM / AVG into the one group (no GROUP BY): acc_row's branch for it - a per-code value (SUM(CASE WHEN code THEN x
+// ELSE y END)) or a typed column under its CASE mask - row by row in row order with the totals held in locals,
+// without the call and the switch per row: the same operations in the same order. The rows: [start, start + n)
+// (dense) or rows[0..n); the morsel's columns already decoded into c.
+inline bool sum_kernel_applies(const Agg& a, const AggPlan& p) {
+  return (a.kind == Agg::Sum || a.kind == Agg::Avg) && !a.prog &&
+         ((p.expr_codes && !a.mask && !a.col_rules) || (a.col_rules && a.src.kind == Source::TypedCol));
+}
+inline void sum_kernel(const Agg& a, const AggPlan& p, AggArrays& A, const ColumnStore& cs, const AggCols& c, bool nn,
+                       bool dense, size_t start, const uint32_t* rows, size_t n) {
+  double num = A.num[0];
+  uint64_t cnt = A.cnt[0];
+  if (p.expr_codes) {
+    const size_t nd = p.ec_num.size() - 1;
+    uint8_t exact = A.exact[0];
+    AIOS_INT128 etot = A.etot[0];
+    int escale = A.escale[0], dscale = A.dscale[0];
+    for (size_t j = 0; j < n; ++j) {
+      const size_t r = dense ? start + j : rows[j];
+      const size_t k = (nn && cs.is_null(r)) ? nd : c.codes[r - start];
+      if (k > nd || p.ec_skip[k]) continue;
+      num += p.ec_num[k];
+      ++cnt;
+      if (!exact) continue;
+      if (!p.ec_xok[k]) { exact = 0; continue; }
+      if (escale != p.ec_scale) {
+        if (escale > p.ec_scale || !scale_up_exact(&etot, p.ec_scale - escale)) { exact = 0; continue; }
+        escale = p.ec_scale;
+      }
+      dscale = std::max(dscale, p.ec_ds[k]);
+      if (__builtin_add_overflow(etot, p.ec_x[k], &etot)) exact = 0;
+    }
+    A.exact[0] = exact; A.etot[0] = etot; A.escale[0] = escale; A.dscale[0] = dscale;
+  } else {
+    const bool dec = a.col_type == SqlDataType::Decimal;
+    const bool scale_ints = dec && p.dec_direct && typed_integer(cs);
+    uint8_t ok = A.ok[0];
+    AIOS_INT128 isum = A.isum[0];
+    const std::vector<uint8_t>* mk = a.mask.get();
+    for (size_t j = 0; j < n; ++j) {
+      const size_t r = dense ? start + j : rows[j];
+      if (mk && (r >= mk->size() || !(*mk)[r])) { if (a.mask_else_zero) ++cnt; continue; }
+      if (nn && cs.is_null(r)) continue;
+      const size_t i = r - start;
+      if (dec && ok) {
+        if (p.dec_direct) {
+          AIOS_INT128 v = (AIOS_INT128)c.ints[i];
+          if (scale_ints && !scale_up_exact(&v, a.col_scale)) ok = 0; else isum += v;
+        } else {
+          AIOS_INT128 v = 0;
+          if (decimal_to_scaled(cs.get(r), a.col_scale, &v)) isum += v; else ok = 0;
+        }
+      } else if (p.need_ints) {                   // as acc_row: also a DECIMAL no longer exact
+        isum += (AIOS_INT128)c.ints[i];
+      }
+      num += c.nums[i];
+      ++cnt;
+    }
+    A.ok[0] = ok; A.isum[0] = isum;
+  }
+  A.num[0] = num;
+  A.cnt[0] = cnt;
+  A.num[0] = num;
+  A.cnt[0] = cnt;
+}
+
 // Groups (first row of each, in first-row order) and every aggregate's value per group.
 bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Source>& key_src,
                   const std::vector<std::vector<uint32_t>>& key_canon, bool has_group_by, const std::vector<Agg>& aggs,
@@ -38295,22 +38362,41 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
               }
             }
           }
+          // An aggregate the lanes folded with the typed-INT kernel above touched only isum and cnt (its other
+          // arrays are as init_arrays left them in every lane): those two are merged, not every array a SUM has.
+          auto int_kernel = [&](size_t ai) {
+            const Agg& a = aggs[ai];
+            return (a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && !a.prog && !a.mask && a.src.kind == Source::TypedCol &&
+                   a.col_type == SqlDataType::Int && plans[ai].need_ints && !plans[ai].dec_direct;
+          };
           for (size_t tl = 0; tl < lanes; ++tl) {
             if (!part_totals[tl].empty()) {
               for (size_t ai = 0; ai < aggs.size(); ++ai) {
+                if (int_kernel(ai)) {
+                  AggArrays& D = slot_totals[ai];
+                  const AggArrays& P = part_totals[tl][ai];
+                  for (size_t id = 0; id < S; ++id) { D.isum[id] += P.isum[id]; D.cnt[id] += P.cnt[id]; }
+                  continue;
+                }
                 merge_arrays(aggs[ai], plans[ai], slot_totals[ai], part_totals[tl][ai]);
               }
             }
           }
 
+          // The groups in first-row order: (first row, slot) pairs radix-sorted (first rows are distinct)
           std::vector<uint32_t> hit_slots;
-          hit_slots.reserve(S);
-          for (size_t id = 0; id < S; ++id) {
-            if (slot_first[id] != UINT32_MAX) hit_slots.push_back((uint32_t)id);
+          {
+            std::vector<std::pair<uint64_t, uint32_t>> fo;
+            fo.reserve(S);
+            uint32_t maxr = 0;
+            for (size_t id = 0; id < S; ++id)
+              if (slot_first[id] != UINT32_MAX) { fo.push_back({slot_first[id], (uint32_t)id}); maxr = std::max(maxr, slot_first[id]); }
+            int rbits = 1;
+            while (rbits < 32 && ((uint64_t)maxr >> rbits)) ++rbits;
+            radix_sort_pairs(fo, rbits);
+            hit_slots.reserve(fo.size());
+            for (const auto& e : fo) hit_slots.push_back(e.second);
           }
-          std::sort(hit_slots.begin(), hit_slots.end(), [&](uint32_t a, uint32_t b) {
-            return slot_first[a] < slot_first[b];
-          });
 
           const size_t hits = hit_slots.size();
           const uint64_t ds_t2 = vx_trace_enabled() ? hal_now_ns() : 0;
@@ -38643,6 +38729,12 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
               }
               continue;
             }
+            if (sum_kernel_applies(a, p)) {
+              if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
+              else decode_for(a, p, cs, start, end, cols[ai]);
+              sum_kernel(a, p, A, cs, cols[ai], nulls[ai], dense, start, rows.data(), n);
+              continue;
+            }
           }
           if (!(a.kind == Agg::CountStar)) {
             if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
@@ -38692,6 +38784,10 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         }
         if (!sel.all && n * 8 < end - start) decode_for_rows(a, plans[ai], cs, start, end, rows.data(), n, cols[ai]);
         else decode_for(a, plans[ai], cs, start, end, cols[ai]);
+        if (!gs && sum_kernel_applies(a, plans[ai])) {   // one group, in row order (a DOUBLE's sum: the serial pass)
+          sum_kernel(a, plans[ai], totals[ai], cs, cols[ai], nulls[ai], false, start, rows.data(), n);
+          continue;
+        }
         // SUM/AVG of a typed DOUBLE column by group: acc_row's column branch
         // without the call and its switches per row.
         if (gs && !a.prog && !a.mask && (a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && a.src.kind == Source::TypedCol &&
