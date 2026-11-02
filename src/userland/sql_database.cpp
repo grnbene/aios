@@ -101,6 +101,10 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #elif !defined(AIOS_METAL) && !defined(__wasi__)
 #include <sys/mman.h>
 #endif
+#if defined(__aarch64__) && defined(__APPLE__) && !defined(AIOS_METAL)
+#include <libkern/OSCacheControl.h>   // sys_icache_invalidate: the lane programs' AArch64 code (sql_vjit_a64.inc)
+#include <pthread.h>                   // pthread_jit_write_protect_np
+#endif
 #include <fstream>
 #if defined(__GLIBC__) || defined(__linux__)
 #include <malloc.h>
@@ -8761,9 +8765,15 @@ inline bool pipe_check_mode() {
   return on;
 }
 }  // namespace vp
-#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(_WIN32) && !defined(AIOS_METAL)
+#include "sql_vjit_common.inc"
+#if defined(__x86_64__)
 #include "sql_vjit_x64.inc"
 #include "sql_pipe_x64.inc"
+#else
+#include "sql_vjit_a64.inc"
+#include "sql_pipe_a64.inc"
+#endif
 namespace vp {
 std::shared_ptr<void> pipe_fold_build_for(const std::vector<PipeFoldAgg>& aggs, std::string* why) { return vjit::pipe_fold_build(aggs, why); }
 void pipe_fold_run(const void* code, const uint32_t* rows, size_t n, uint32_t g) {
@@ -64206,7 +64216,7 @@ std::vector<std::string> sql_split_statements(const std::string& text) { return 
 }  // namespace aios::userland
 namespace aios::userland::sqle {
 uint64_t vjit_native_runs() {
-#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(_WIN32) && !defined(AIOS_METAL)
   return ::aios::userland::vp::vjit::native_runs().load(std::memory_order_relaxed);
 #else
   return 0;
