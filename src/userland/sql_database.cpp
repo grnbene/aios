@@ -7871,6 +7871,275 @@ static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx,
   return hold->get();
 }
 
+// A correlated scalar subquery of one table, its WHERE equalities between the table's columns and outer columns
+// (and conditions on the table alone), grouped or aggregated: the table's rows by their correlation values,
+// indexed once, and each outer row's answer made from its rows with no nested statement run - the rows matched,
+// the table's own conditions checked, and the item evaluated over the one group they form, the outer row in scope,
+// as the nested SELECT evaluates it. An open-orders page asked `(SELECT (SELECT SUM(quantity) FROM locstock ..)
+// >= SUM(pick) FROM pickingfreeze WHERE linenumber = sod.orderlineno AND pickingfreeze.orderno = sod.orderno
+// GROUP BY linenumber, stockid, pickingfreeze.orderno)` once per order: 11,667 nested statements, 2.7 s.
+// Keys: typed INT against typed INT by value, text against text by collation key (NULL meets nothing). Not
+// answered here (the nested statement then runs): a shape outside this, rows forming more than one group (its
+// error), no row without a GROUP BY (an aggregate of no rows).
+bool predicate_true(const SqlExpr* e, const EvalCtx& ctx);   // with the evaluator, below
+struct CorrIndex {
+  std::string sql;
+  const SqlTable* t = nullptr;
+  uint64_t mseq = 0;
+  size_t rows = 0;
+  std::shared_ptr<ParsedSelectStatement> st;      // owns the expressions below
+  std::vector<QuerySource> sources;               // the table, as the nested statement names it
+  std::vector<ExprPtr> outer;                     // per key: the outer column, read in the outer row's scope
+  std::vector<bool> text;                         // per key: compared as text (collation key) or as an integer
+  std::vector<const SqlExpr*> conds;              // the table's own conditions
+  // key -> its rows, in row order: a function of the subquery's text and the table alone, so shared by every copy
+  // of the expression (each statement's, each worker's) while the table is unchanged (g_corr_rows)
+  std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> rows_of;
+};
+struct CorrRows {
+  const SqlTable* t = nullptr;
+  uint64_t mseq = 0;
+  size_t rows = 0;
+  std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> map;
+};
+static std::unordered_map<std::string, CorrRows> g_corr_rows;   // under g_corr_mu
+static aios::hal::Mutex g_corr_mu;
+static std::unordered_map<const SqlExpr*, std::shared_ptr<const CorrIndex>> g_corr;
+static std::unordered_map<const SqlExpr*, std::string> g_corr_no;   // the subquery text found not to fit
+
+// exists: for EXISTS (SELECT .. WHERE ..) - whether the outer row has a row at all; its select list is not read.
+static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const EvalCtx& ctx, bool exists) {
+  if (!ctx.db || e->subquery_sql.empty()) return nullptr;
+  auto ci = std::make_shared<CorrIndex>();
+  ci->sql = e->subquery_sql;
+  ci->st = std::make_shared<ParsedSelectStatement>(parse_select_sql(e->subquery_sql));
+  const ParsedSelectStatement& st = *ci->st;
+  if (!st.ok || st.branches.size() != 1 || !st.union_tail.empty() || !st.with_sql.empty()) return nullptr;
+  const ParsedSelectBranch& b = st.branches[0];
+  if (b.sources.size() != 1 || b.sources[0].is_derived() || !b.sources[0].using_cols.empty() || b.sources[0].natural ||
+      !b.join_conditions.empty() || b.having || b.limit >= 0 || b.offset != 0 || !b.windows.empty() || !b.where || b.distinct ||
+      !b.order_by.empty())
+    return nullptr;
+  if (exists) {
+    // rows or none: no grouping, and a select list of plain values (an aggregate would make one row of none)
+    if (!b.group_by.empty()) return nullptr;
+    for (const auto& it : b.items) {
+      if (it.star) continue;
+      if (!it.expr || expr_has_aggregate(it.expr) || (it.expr->op != ExprOp::Literal && it.expr->op != ExprOp::Column)) return nullptr;
+    }
+  } else {
+    if (b.items.size() != 1 || b.items[0].star || !b.items[0].expr) return nullptr;
+    if (b.group_by.empty() && !expr_has_aggregate(b.items[0].expr)) return nullptr;   // a plain lookup: the batch's
+  }
+  if (find_cte_table(b.sources[0].table_name)) return nullptr;
+  SqlTable* t = ctx.db->resolve_table(b.sources[0].table_name);
+  if (!t || !ctx.db->is_stored_table(t) || t->inferred_types || t->col_data.size() < t->columns.size()) return nullptr;
+  for (const auto& cs : t->col_data) if (cs.size() != t->row_count()) return nullptr;
+  ci->t = t; ci->mseq = t->mutation_seq; ci->rows = t->row_count();
+  QuerySource qs;
+  qs.table = t;
+  qs.alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
+  ci->sources.push_back(qs);
+  const std::string ialias = lower_of(last_name_part(qs.alias));
+  auto inner_q = [&](const std::string& q) { return q.empty() || lower_of(last_name_part(q)) == ialias; };
+  auto inner_col = [&](const SqlExpr* x) -> int {
+    if (!x || x->op != ExprOp::Column || !inner_q(x->qualifier)) return -1;
+    return t->get_column_index(x->name);
+  };
+  auto outer_col = [&](const SqlExpr* x) { return x && x->op == ExprOp::Column && !x->qualifier.empty() && !inner_q(x->qualifier); };
+  std::vector<const SqlExpr*> conj;
+  collect_conjuncts(b.where.get(), &conj);
+  std::vector<int> icols;
+  for (const SqlExpr* c : conj) {
+    if (c && c->op == ExprOp::Eq && c->args.size() == 2 && !c->negated) {
+      const SqlExpr* l = c->args[0].get();
+      const SqlExpr* r = c->args[1].get();
+      int ic = -1;
+      const SqlExpr* oe = nullptr;
+      if ((ic = inner_col(l)) >= 0 && outer_col(r)) oe = r;
+      else if ((ic = inner_col(r)) >= 0 && outer_col(l)) oe = l;
+      if (oe) {
+        // the outer column's type, as the outer scope holds it
+        size_t os = 0, oc = 0;
+        const EvalCtx* owner = nullptr;
+        ExprPtr ox = clone_expr(oe);
+        if (!resolve_column(ctx, *ox, &os, &oc, &owner) || !owner || !owner->sources || os >= owner->sources->size()) return nullptr;
+        const SqlTable* ot = (*owner->sources)[os].table;
+        if (!ot || ot->inferred_types || oc >= ot->columns.size() || oc >= ot->col_data.size()) return nullptr;
+        const SqlColumn& ocol = ot->columns[oc];
+        const SqlColumn& icol = t->columns[(size_t)ic];
+        if (ocol.temporal || icol.temporal || ocol.binary || icol.binary) return nullptr;
+        bool txt;
+        if (ocol.type == SqlDataType::Text && icol.type == SqlDataType::Text) txt = true;
+        else if (ocol.type == SqlDataType::Int && icol.type == SqlDataType::Int) txt = false;   // any encoding: read as integers
+        else return nullptr;
+        icols.push_back(ic);
+        ci->outer.push_back(std::move(ox));
+        ci->text.push_back(txt);
+        continue;
+      }
+    }
+    // the table's own: no outer column, no subquery
+    bool own = true;
+    std::function<void(const SqlExpr*)> walk = [&](const SqlExpr* x) {
+      if (!x || !own) return;
+      if (x->op == ExprOp::Subquery || x->op == ExprOp::Exists || (x->op == ExprOp::In && !x->subquery_sql.empty())) { own = false; return; }
+      if (x->op == ExprOp::Column && x->name.rfind("@@", 0) != 0 && inner_col(x) < 0) { own = false; return; }
+      if (x->op == ExprOp::Func && vx::nondeterministic_func(upper_of(x->name))) { own = false; return; }
+      for (const auto& a : x->args) walk(a.get());
+    };
+    walk(c);
+    if (!own) return nullptr;
+    ci->conds.push_back(c);
+  }
+  if (icols.empty()) return nullptr;
+  const std::string rkey = ci->sql + '\x1e' + std::string(ci->text.begin(), ci->text.end());
+  {
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    auto it = g_corr_rows.find(rkey);
+    if (it != g_corr_rows.end() && it->second.t == t && it->second.mseq == t->mutation_seq && it->second.rows == t->row_count()) {
+      ci->rows_of = it->second.map;
+      return ci;
+    }
+  }
+  auto rows_of = std::make_shared<std::unordered_map<std::string, std::vector<uint32_t>>>();
+  // the index: each row's key, its values' texts (collation keys) or integers
+  const size_t n = t->row_count();
+  std::vector<std::shared_ptr<const vx::DecodedInts>> ints(icols.size());
+  for (size_t k = 0; k < icols.size(); ++k)
+    if (!ci->text[k] && vx::typed_integer(t->col_data[(size_t)icols[k]]) && !(ints[k] = vx::decoded_ints(*t, (size_t)icols[k]))) return nullptr;
+  std::string key;
+  for (size_t r = 0; r < n; ++r) {
+    key.clear();
+    bool null = false;
+    for (size_t k = 0; k < icols.size() && !null; ++k) {
+      const ColumnStore& cs = t->col_data[(size_t)icols[k]];
+      if (cs.is_null(r)) { null = true; break; }
+      if (ci->text[k]) key += collate_key(t->cell(r, (size_t)icols[k]));
+      else if (ints[k]) key += std::to_string(ints[k]->v[r]);
+      else {
+        // an INT held otherwise (run-length, a dictionary): its cell, which must be a plain integer
+        const std::string& c = t->cell(r, (size_t)icols[k]);
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(c.c_str(), &end, 10);
+        if (c.empty() || errno == ERANGE || !end || *end != '\0') return nullptr;
+        key += std::to_string(v);
+      }
+      key.push_back('\x1f');
+    }
+    if (!null) (*rows_of)[key].push_back((uint32_t)r);
+  }
+  ci->rows_of = rows_of;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    if (g_corr_rows.size() > 64) g_corr_rows.clear();
+    g_corr_rows[rkey] = CorrRows{t, t->mutation_seq, t->row_count(), rows_of};
+  }
+  return ci;
+}
+
+// The answer for the outer row in ctx: 1 (*out set), or 0 - not answered here, the nested statement decides.
+static int corr_index_answer(const SqlExpr* e, const EvalCtx& ctx, Val* out, bool exists = false) {
+  static const bool off = [] { const char* v = std::getenv("AIOS_SQL_CORR_INDEX"); return v && *v == '0'; }();
+  if (off || !ctx.db) return 0;
+  std::shared_ptr<const CorrIndex> ci;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    auto no = g_corr_no.find(e);
+    if (no != g_corr_no.end() && no->second == e->subquery_sql) return 0;
+    auto it = g_corr.find(e);
+    // the same text, the same table (resolved again: a dropped one's address can return) and unchanged
+    if (it != g_corr.end() && it->second->sql == e->subquery_sql &&
+        ctx.db->resolve_table(it->second->st->branches[0].sources[0].table_name) == it->second->t &&
+        it->second->t->mutation_seq == it->second->mseq && it->second->t->row_count() == it->second->rows)
+      ci = it->second;
+  }
+  if (!ci) {
+    std::shared_ptr<const CorrIndex> made = build_corr_index(e, ctx, exists);
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    if (g_corr.size() > 256) { g_corr.clear(); g_corr_no.clear(); }
+    if (!made) { g_corr_no[e] = e->subquery_sql; return 0; }
+    g_corr[e] = made;
+    ci = made;
+    if (vx_trace_on()) vx_trace("subquery by correlation index: " + std::to_string(ci->rows_of->size()) + " keys of " + ci->t->name);
+  }
+  // the outer row's key
+  std::string key;
+  for (size_t k = 0; k < ci->outer.size(); ++k) {
+    Val v = eval_expr(ci->outer[k].get(), ctx);
+    if (ctx.err && !ctx.err->empty()) return 0;
+    const ParsedSelectBranch& b = ci->st->branches[0];
+    if (v.null) {   // meets no row
+      if (exists) { *out = val_num(0); return 1; }
+      if (b.group_by.empty()) return 0;
+      *out = val_null();
+      return 1;
+    }
+    if (ci->text[k]) {
+      if (v.numeric) return 0;   // a number against text: compared as numbers, not here
+      key += collate_key(v.str());
+    } else {
+      AIOS_INT128 x = 0;
+      int xs = 0, xd = 0;
+      if (!v.numeric || v.approx || !exact_internal_of(v, &x, &xs, &xd) || xs != 0 || x > (AIOS_INT128)INT64_MAX || x < (AIOS_INT128)INT64_MIN) return 0;
+      key += std::to_string((long long)x);
+    }
+    key.push_back('\x1f');
+  }
+  const ParsedSelectBranch& b = ci->st->branches[0];
+  JoinedRows group;
+  auto it = ci->rows_of->find(key);
+  std::string ierr;
+  EvalCtx ictx;
+  ictx.db = ctx.db;
+  ictx.outer = &ctx;
+  ictx.sources = &ci->sources;
+  ictx.err = &ierr;
+  if (it != ci->rows_of->end()) {
+    for (uint32_t r : it->second) {
+      JoinedRow jr;
+      jr.parts.push_back(r);
+      bool keep = true;
+      if (!ci->conds.empty()) {
+        ictx.row = &jr;
+        for (const SqlExpr* c : ci->conds) if (!predicate_true(c, ictx)) { keep = false; break; }
+        if (!ierr.empty()) return 0;
+      }
+      if (keep) {
+        if (exists) { *out = val_num(1); return 1; }
+        group.push_back(std::move(jr));
+      }
+    }
+  }
+  if (exists) { *out = val_num(0); return 1; }
+  if (group.empty()) {
+    if (b.group_by.empty()) return 0;   // an aggregate of no rows: the nested statement's own answer
+    *out = val_null();
+    return 1;
+  }
+  // one group, or the nested statement (more than one: its error)
+  if (!b.group_by.empty() && group.size() > 1) {
+    std::vector<Val> first;
+    ictx.row = &group[0];
+    for (const auto& g : b.group_by) first.push_back(eval_expr(g.get(), ictx));
+    for (size_t i = 1; i < group.size(); ++i) {
+      ictx.row = &group[i];
+      for (size_t k = 0; k < b.group_by.size(); ++k) {
+        const Val v = eval_expr(b.group_by[k].get(), ictx);
+        if (v.null != first[k].null || (!v.null && compare_vals(v, first[k]) != 0)) return 0;
+      }
+    }
+    if (!ierr.empty()) return 0;
+  }
+  ictx.row = &group[0];
+  ictx.group = &group;
+  Val v = eval_expr(b.items[0].expr.get(), ictx);
+  if (!ierr.empty()) return 0;   // its error, as the nested statement would raise it
+  *out = std::move(v);
+  return 1;
+}
+
 // A batch for e restricted to the outer rows a statement is about to project
 // (keys gives their key values), published on e like a whole-table batch: a
 // page of 20 orders asked its correlated MAX 20 times, each a statement of its
@@ -13445,6 +13714,10 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
           return bt->lookup(k);
         }
       }
+      if (e->sub_correlated) {
+        Val fast;
+        if (corr_index_answer(e, ctx, &fast)) return fast;
+      }
       // A correlated subquery runs once per outer row, and that loop checked for KILL nowhere: the read that stalled
       // atl was this shape, and a KILL QUERY (or the read deadline) could not reach it.
       if (sql_interrupted()) { ctx_fail(ctx, "Query execution was interrupted"); return val_null(); }
@@ -13551,6 +13824,13 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
         }
       }
 
+      if (e->sub_correlated) {
+        Val fast;
+        if (corr_index_answer(e, ctx, &fast, true)) {
+          const bool ex = !fast.null && fast.num != 0;
+          return val_num(e->negated ? !ex : ex);
+        }
+      }
       NestedResult r;
       if (fill_subquery(e, ctx, &r)) {
         bool ex = r.row_count > 0;
@@ -49104,6 +49384,10 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
             ndv = vx::typed_numeric(kcs) ? SIZE_MAX : vx::dict_coded(kcs) ? vx::dict_size(kcs) : (size_t)1 << 20;
           }
+          // The index's own count of distinct numbers where it has one: two typed integer keys both read as SIZE_MAX
+          // and the first in the ON won - `stockmoves.orderlineref` (4 values) over `transno`, each of 47k open
+          // order lines then walking 290k candidates: 145 s of a 150 s open-orders page, 0.2 s by transno.
+          if (prep_jkeys[ki].idx && prep_jkeys[ki].idx->by_number.size() > 0) ndv = prep_jkeys[ki].idx->by_number.size();
           if (best_ki < 0 || ndv > best_ndv) { best_ki = (int)ki; best_ndv = ndv; }
         }
       }
