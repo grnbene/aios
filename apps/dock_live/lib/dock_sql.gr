@@ -147,21 +147,57 @@ fn when(v) {
   return slice(t, 0, 19)
 }
 
-// A line's pick from its rows: quantities summed across bins (getPickingFreezeLoaded), the bin and picker of its
-// first row, and who holds a claim on any of them - a claim is per row, so the first row alone can miss it.
+// Who handled a pick row, as a person on the floor. A pick scan writes userid and date_pickupdate together
+// (model/oms/orders.php), and a claim writes claimed_user. userid alone is whoever created the row - often the
+// salesperson who wrote the order - and the bulk "order picked" paths (markSalesOrderPickOrder, updatepicked) set
+// picked = pick without touching either, so a line picked that way has nobody and shows nobody.
+fn handler(r) {
+  if not is_blank(r.claimed_user) { return s(r.claimed_user) }
+  if when(r.date_pickupdate) != "" and not is_blank(r.userid) { return s(r.userid) }
+  return ""
+}
+
+// A line's pick from its rows: quantities summed across bins (getPickingFreezeLoaded), the bin of its first row, the
+// picker (handler() of the first row that has one), and who holds a claim on any of them - a claim is per row, so the first row alone can miss it.
 // Its clocks, from the rows' own times:
 //   released_at  the earliest row frozen for picking (date_created): how long it has waited for a picker
 //   claim_at     when someone claimed it (claimed_date, only when a claimer is named - the column defaults to the
 //                row's creation, so on an unclaimed row it means nothing)
 //   picked_at    the last pick scan (date_pickupdate; empty for a line picked other than by scan)
+//   parts        per bin, in pick order: {bin, pick, picked, loaded, picker, claimed_by, claimed_at, released_at,
+//                picked_at} - one entry when the line is all from one bin
 // Nothing records when a line went on the truck; the bay's loading clock (timestarted) covers loading.
 fn line_pick(rows) {
   let p = {"pick": 0.0, "picked": 0.0, "loaded": 0.0, "bin": "", "picker": "", "claimed_by": "", "claimed_at": "",
-           "claim_at": "", "released_at": "", "picked_at": "", "frozen": rows != nil and len(rows) > 0}
+           "claim_at": "", "released_at": "", "picked_at": "", "parts": [], "frozen": rows != nil and len(rows) > 0}
   if not p.frozen { return p }
   p.bin = s(rows[0].bin)
-  p.picker = s(rows[0].userid)
+  // a line picked from two bins: each bin as its own part (how many, picked and loaded there, who has it), so the
+  // board can say where the rest still is - added up, the line named only its first bin, and the half still in
+  // the racks read as NEEDS PICKER at the bin already picked (910520, 2026-11-02). Two rows from one bin are one part.
+  let by_bin = {}
   for r in rows {
+    let claimed = not is_blank(r.claimed_user) and s(r.claimed) == "1"
+    let b = s(r.bin)
+    let pt = by_bin[b]
+    if pt == nil {
+      pt = {"bin": b, "pick": 0.0, "picked": 0.0, "loaded": 0.0, "picker": "", "claimed_by": "", "claimed_at": "",
+            "released_at": when(r.date_created), "picked_at": ""}
+      by_bin[b] = pt
+      push(p.parts, pt)
+    }
+    pt.pick = pt.pick + n(r.pick)
+    pt.picked = pt.picked + n(r.picked)
+    pt.loaded = pt.loaded + n(r.loaded)
+    pt.picked_at = max(pt.picked_at, when(r.date_pickupdate))
+    if pt.picker == "" { pt.picker = handler(r) }
+    if claimed and pt.claimed_by == "" {
+      pt.claimed_by = s(r.claimed_user)
+      pt.claimed_at = when(r.claimed_date)
+    }
+  }
+  for r in rows {
+    if p.picker == "" { p.picker = handler(r) }
     p.pick = p.pick + n(r.pick)
     p.picked = p.picked + n(r.picked)
     p.loaded = p.loaded + n(r.loaded)

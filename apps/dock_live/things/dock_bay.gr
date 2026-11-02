@@ -93,7 +93,9 @@ fn things(ks, sh) {
             let line = {"line": ln.line, "stockid": ln.stockid, "description": ln.description, "qty": qty,
                         "pick": p.frozen ? p.pick : qty, "picked": picked, "loaded": loaded, "bin": p.bin,
                         "picker": p.picker, "claimed_by": p.claimed_by, "claimed_at": p.claimed_at, "pickable": ln.pickable,
-                        "released_at": p.released_at, "claim_at": p.claim_at, "picked_at": p.picked_at}
+                        "released_at": p.released_at, "claim_at": p.claim_at, "picked_at": p.picked_at,
+                        // a line split over bins: one part per bin (lib/dock_sql.gr line_pick); one bin: none
+                        "parts": not forced and len(p.parts) > 1 ? p.parts : []}
             push(order.lines, line)
             order.units = order.units + qty
             order.picked = order.picked + min(picked, qty)
@@ -101,7 +103,10 @@ fn things(ks, sh) {
             bay.lines = bay.lines + 1
             if picked < qty {
               bay.lines_open = bay.lines_open + 1
-              if line.claimed_by == "" {
+              // waiting for anyone: a bin still to pick that nobody has (a split line can be half claimed)
+              let waiting = len(line.parts) == 0 ? line.claimed_by == "" :
+                            len(filter(line.parts, fn (pt) { return pt.picked < pt.pick and pt.claimed_by == "" })) > 0
+              if waiting {
                 bay.lines_unclaimed = bay.lines_unclaimed + 1
                 // the longest a line on this truck has waited for anyone to take it
                 if p.released_at != "" and (bay.unclaimed_since == "" or p.released_at < bay.unclaimed_since) {

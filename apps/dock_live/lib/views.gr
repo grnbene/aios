@@ -97,6 +97,10 @@ let BOARD_CSS = join([
   ".ln { display: flex; flex-wrap: wrap; align-items: center; gap: " + u(4) + " " + u(10) + "; margin-top: " + u(4) + "; font-size: " + u(25) + "; }",
   ".ln .qty { flex: 0 0 " + u(62) + "; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }",
   ".ln .item { flex: 1 1 " + u(180) + "; font-size: " + u(30) + "; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ln .state { margin-left: auto; }",
+  // a split line's bins, a row each under it: smaller and set in, so they read as parts of the line above
+  ".ln.part { margin-top: " + u(2) + "; font-size: " + u(21) + "; } .ln.part .qty { font-weight: 700; color: var(--muted); }",
+  ".ln.part .item { font-size: " + u(22) + "; font-weight: 600; color: var(--muted); padding-left: " + u(14) + "; }",
+  ".next-parts { margin-top: " + u(6) + "; }",
   ".ln .bin { color: var(--muted); font-size: " + u(20) + "; font-weight: 500; margin-left: " + u(6) + "; }",
   // a line keeps its tag as it moves along (NO CLAIM, a picker, PICKED, LOADED): the colour fades to the next one
   ".tag { padding: " + u(3) + " " + u(10) + "; border-radius: " + u(5) + "; font-size: " + u(20) + "; font-weight: 700; white-space: nowrap; transition: background-color .6s, color .6s; }",
@@ -150,13 +154,16 @@ fn line_state(l) {
   return {"cls": "open", "text": "NO CLAIM"}
 }
 
-// Who picked what is on the dock - small and grey to the left of the tag (so the tags stay in line), for when it can't be found and someone has to ask.
+// Who has it - small and grey to the left of the tag (so the tags stay in line): who picked what is on the dock, for
+// when it can't be found and someone has to ask; who claimed what is still being picked.
 fn by_node(l, st) {
+  if st.cls == "claimed" { return l.claimed_by == "" ? "" : el("span", {"class": "by"}, l.claimed_by) }
   if st.cls != "picked" and not contains(st.text, "ON DOCK") and not contains(st.text, "STAGING") { return "" }
   return l.picker == "" ? "" : el("span", {"class": "by"}, l.picker)
 }
 
-// The loader's view of a line: on the truck, on the dock (picked and waiting to go on), or still in its bin needing a picker.
+// The loader's view of a line (or of one bin of a split line): on the truck, on the dock (picked and waiting to go
+// on), being picked (claimed), or still in its bin needing a picker.
 fn load_state(l) {
   let qty = real(l.qty)
   let loaded = real(l.loaded)
@@ -164,12 +171,24 @@ fn load_state(l) {
   let left = qty - loaded
   let dock = max(0, min(left, real(l.picked) - loaded))
   let fetch = left - dock
-  let bin = l.bin == "" ? "" : " · " + l.bin
+  // a split line's bin row shows its bin already
+  let bin = l.bin == "" or l.bin_shown == true ? "" : " · " + l.bin
   // picked out of STAGING it is still in staging, not on the dock - the loaders were searching the dock for it
   let where = upper(trim(l.bin)) == "STAGING" ? "STAGING" : "ON DOCK"
   if fetch <= 0 { return {"cls": "picked", "text": where} }
-  if dock <= 0 { return {"cls": "open", "text": "NEEDS PICKER" + bin} }
-  return {"cls": "open", "text": qty_text(dock) + " " + where + " · " + qty_text(fetch) + " NEEDS PICKER" + bin}
+  // someone has the rest: it is coming, nobody else is needed for it
+  let rest = l.claimed_by != "" ? "PICKING" : "NEEDS PICKER"
+  let cls = l.claimed_by != "" ? "claimed" : "open"
+  if dock <= 0 { return {"cls": cls, "text": rest + bin} }
+  return {"cls": cls, "text": qty_text(dock) + " " + where + " · " + qty_text(fetch) + " " + rest + bin}
+}
+
+// A line as the loader works it: its bins, each with its own count, bin, who has it and state - one for a line from
+// one bin (the line itself), one per bin for a split line, so the half still in the racks is named by its own bin
+// and not by the first one's.
+fn line_parts(l) {
+  if len(l.parts ?? []) == 0 { return [l] }
+  return map(l.parts, fn (p) { return merge(p, {"qty": p.pick, "bin_shown": true}) })
 }
 
 fn line_rank(l) {
@@ -232,6 +251,19 @@ fn load_attrs(cls, bay, o, l, delta) {
           "data-stock": l.stockid}
 }
 
+// A split line's bins, a row each under it: how many from that bin, the bin, who has them and where they are.
+fn part_rows(l) {
+  let out = []
+  for pair in enumerate(line_parts(l)) {
+    let p = pair[1]
+    let st = load_state(p)
+    push(out, el("div", {"class": "ln part", "data-key": "line-" + str(l.line) + "-bin-" + str(pair[0])},
+                 el("span", {"class": "qty"}, qty_text(p.qty) + "x"), el("span", {"class": "item"}, p.bin),
+                 el("span", {"class": "state"}, by_node(p, st), el("span", {"class": "tag " + st.cls}, st.text))))
+  }
+  return out
+}
+
 // active: the bay when this is its order to load now (the one the loading screen takes scans for), else "".
 // shown: the line already up big in Next to load ("" for none) - not listed a second time under it.
 fn order_node(o, active, shown) {
@@ -257,17 +289,21 @@ fn order_node(o, active, shown) {
   }
   for l in sort_by(o.lines ?? [], fn (l) { return l.line }) {
     if active != "" and l.line == shown { continue }
+    let split = len(l.parts ?? []) > 0
     let st = load_state(l)
+    // a split line names no one bin on its own row: its bins follow, one row each
+    let bin = split ? "" : l.bin
     let qty = el("span", {"class": "qty"}, qty_text(l.qty) + "x")
-    let item = el("span", {"class": "item"}, l.stockid, el("span", {"class": "bin"}, l.bin))
+    let item = el("span", {"class": "item"}, l.stockid, el("span", {"class": "bin"}, bin))
     if active != "" {
       // loaded so far, as the loading screen's badge shows it
       let left = real(l.loaded) < real(l.qty)
       qty = el("span", left ? load_attrs("qty", active, o, l, "1") : {"class": "qty"}, qty_text(l.loaded) + "/" + qty_text(l.qty))
-      if real(l.loaded) > 0 { item = el("span", load_attrs("item", active, o, l, "-1"), l.stockid, el("span", {"class": "bin"}, l.bin)) }
+      if real(l.loaded) > 0 { item = el("span", load_attrs("item", active, o, l, "-1"), l.stockid, el("span", {"class": "bin"}, bin)) }
     }
     push(rows, el("div", {"class": "ln", "data-key": "line-" + str(l.line)}, qty, item,
-                  el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))))
+                  split ? "" : el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))))
+    if split { for n in part_rows(l) { push(rows, n) } }
   }
   // its only line is the one up in Next to load, which names the order and customer too
   if len(rows) == 0 { return "" }
@@ -320,7 +356,9 @@ fn next_node(b) {
             el("div", {"class": "next-desc"}, l.description),
             el("div", {"class": "next-meta"},
                el("span", "#" + n.order.orderno + " · " + n.order.customer),
-               el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))))
+               len(l.parts ?? []) > 0 ? "" : el("span", {"class": "state"}, by_node(l, st), el("span", {"class": "tag " + st.cls}, st.text))),
+            // split over bins: where each part of it is, so the loader goes to the part that is ready
+            len(l.parts ?? []) > 0 ? el("div", {"class": "next-parts"}, ...part_rows(l)) : "")
 }
 
 fn bay_node(b) {
@@ -335,7 +373,8 @@ fn bay_node(b) {
   let to_get = 0.0
   for o in b.orders ?? [] {
     if o.credit { continue }
-    for l in o.lines ?? [] {
+    // by bin: a split line's half picked out of staging is in staging, its other half wherever its own bin says
+    for l in flat_map(o.lines ?? [], line_parts) {
       let left = real(l.qty) - real(l.loaded)
       if left > 0 {
         let dock = max(0, min(left, real(l.picked) - real(l.loaded)))
