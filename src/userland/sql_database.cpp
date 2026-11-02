@@ -49623,6 +49623,10 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
         bool konst = false;                              // a Constant-encoded column: every row holds kval
         double kval = 0;
         std::shared_ptr<const StarCodeMap> cmap;         // a text key beside the probing one: its codes mapped to the joined column's
+        // cmap: both columns' codes and NULL flags decoded whole (vx::decoded_*, kept between statements) - a code
+        // decoded per row (code_at) cost ~100 instructions each, 108M of a 600k-row composite join's 560M
+        std::shared_ptr<const std::vector<uint32_t>> bcodes, jcodes;
+        std::shared_ptr<const std::vector<uint8_t>> bnulls, jnulls;
         bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
         double jkval = 0;
         std::shared_ptr<const std::vector<double>> dnum; // a dictionary-coded number column: the number per code
@@ -49663,7 +49667,20 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             StarKey pk, ck;
             if (star_key_of(bt, kc, &pk) && star_key_of(*js.table, (size_t)prep_jkeys[ki].column, &ck) && pk.text && ck.text) {
               std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck);
-              if (m && m->ok) { nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m); }
+              if (m && m->ok) {
+                nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m);
+                const size_t jc = (size_t)prep_jkeys[ki].column;
+                if (bcs.size() == bt.row_count() && js.table->col_data[jc].size() == js.table->row_count()) {
+                  nk.bcodes = vx::decoded_codes(bt, kc);
+                  nk.jcodes = vx::decoded_codes(*js.table, jc);
+                  if (vx::has_nulls(bcs)) nk.bnulls = vx::decoded_nulls(bt, kc);
+                  if (vx::has_nulls(js.table->col_data[jc])) nk.jnulls = vx::decoded_nulls(*js.table, jc);
+                  // all or none: a missing one (the budget) leaves the per-row reads
+                  if (!nk.bcodes || !nk.jcodes || (vx::has_nulls(bcs) && !nk.bnulls) || (vx::has_nulls(js.table->col_data[jc]) && !nk.jnulls)) {
+                    nk.bcodes.reset(); nk.jcodes.reset(); nk.bnulls.reset(); nk.jnulls.reset();
+                  }
+                }
+              }
             }
           }
           // a number column held as a dictionary (a DECIMAL(65,0) from integer arithmetic, an INT kept as codes, a
@@ -49725,6 +49742,21 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           vx_trace("join: +" + js.alias + " ON: the key's equality is the probe's (" + std::string(direct_code_join ? "dictionary codes" : "numbers") + "): " +
                    std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
       }
+      // A text key beside the probing one, matched by code through its code map (other_keys_match - the
+      // interpreter's collation equality, NULL never equal): its conjunct is decided there for every candidate, so it
+      // leaves the per-candidate checks too (`s.loccode = i.loccode` beside `s.productid = i.productid` was
+      // interpreted for each of 100k candidates after the codes had already said yes).
+      if (batch_ok && !direct_code_join) {
+        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+          if ((int)ki == best_ki || !numkeys[ki].cmap) continue;
+          const SqlExpr* kv = prep_jkeys[ki].value;
+          auto is_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
+          on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_conj), on_check.end());
+          for (size_t k = 0; k < on_vec.size();) {
+            if (is_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
+          }
+        }
+      }
       auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
         if (k.lane) {
           if (k.lane->is_null(bi)) return false;
@@ -49752,7 +49784,16 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
           const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
           if (nk.cmap) {
             const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
-            if (r == kNullRow || r >= nk.cs->size() || nk.cs->is_null(r)) return false;
+            if (r == kNullRow || r >= nk.cs->size()) return false;
+            if (nk.bcodes) {
+              if (nk.bnulls && (*nk.bnulls)[r]) return false;
+              const uint32_t ca = (*nk.bcodes)[r];
+              if (ca >= nk.cmap->p2c.size()) return false;
+              const int32_t cb = nk.cmap->p2c[ca];
+              if (cb < 0 || mr >= nk.jcodes->size() || (nk.jnulls && (*nk.jnulls)[mr]) || (*nk.jcodes)[mr] != (uint32_t)cb) return false;
+              continue;
+            }
+            if (nk.cs->is_null(r)) return false;
             const uint32_t ca = vx::code_at(*nk.cs, r);
             if (ca >= nk.cmap->p2c.size()) return false;
             const int32_t cb = nk.cmap->p2c[ca];
@@ -49791,6 +49832,8 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
       std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
       bool comp_ok = false;
       bool plain_other_keys = true;   // composite hashing reads the other keys as typed numbers only
+      // (a text key by code map is not hashed: building the composite table each statement - 360k stock rows into a
+      // node map - cost more than the probing key's lists it saves walking, 75 ms against 50)
       for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst || numkeys[ki].jdnum)) plain_other_keys = false;
       if (batch_ok && !direct_code_join && plain_other_keys && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
         const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
@@ -49804,7 +49847,13 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
               for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
                 if ((int)ki == best_ki) { ck.v[ki] = kv.first == 0 ? 0.0 : kv.first; continue; }
                 const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+                if (numkeys[ki].jcodes) {
+                  if (numkeys[ki].jnulls && (*numkeys[ki].jnulls)[mr]) { null = true; break; }
+                  ck.v[ki] = (double)(*numkeys[ki].jcodes)[mr];
+                  continue;
+                }
                 if (kcs.is_null(mr)) { null = true; break; }
+                if (numkeys[ki].cmap) { ck.v[ki] = (double)vx::code_at(kcs, mr); continue; }
                 const double d = vx::typed_value(kcs, mr);
                 ck.v[ki] = d == 0 ? 0.0 : d;
               }
@@ -49928,7 +49977,17 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
             bool null = false;
             for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
               double w = key;
-              if ((int)ki != best_ki && !numkey(numkeys[ki], bi, base, &w)) null = true;
+              const NumKey& nk = numkeys[ki];
+              if ((int)ki != best_ki && nk.cmap) {
+                const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
+                if (r == kNullRow || r >= nk.cs->size()) { null = true; break; }
+                if (nk.bcodes ? nk.bnulls && (*nk.bnulls)[r] : nk.cs->is_null(r)) { null = true; break; }
+                const uint32_t ca = nk.bcodes ? (*nk.bcodes)[r] : vx::code_at(*nk.cs, r);
+                if (ca >= nk.cmap->p2c.size() || nk.cmap->p2c[ca] < 0) { null = true; break; }
+                ck.v[ki] = (double)nk.cmap->p2c[ca];
+                continue;
+              }
+              if ((int)ki != best_ki && !numkey(nk, bi, base, &w)) null = true;
               ck.v[ki] = w == 0 ? 0.0 : w;
             }
             if (!null) {

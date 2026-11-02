@@ -38,6 +38,11 @@ struct Ins {
   // to SIGNED, a comparison, a truth test), never printed.
   bool taint = false;
   bool uns = false;       // the bit operators' unsigned 64-bit result, printed as such
+  // A DATE's day number (days since 1970-01-01), dlo..dhi the values it can hold: an integer lane at run time, but to
+  // the compiler a date - compared with another date or moved by an INTERVAL of days, never read as a number (to
+  // MariaDB a date in arithmetic is YYYYMMDD) and never a program's value (emit, compile).
+  bool day = false;
+  int64_t dlo = 0, dhi = 0;
   // CASE whose branches mix unsigned values with signed ones: the interpreter hands back each row's branch as it
   // is, so the lane is signed and a row whose unsigned branch holds a value past INT64_MAX (where the two would
   // print and compare differently) fails the program - the interpreter takes those rows.
@@ -190,12 +195,23 @@ struct Compiler {
   // a gather of every row into its own lane (21 leaf reads a row, nearly half the program's time).
   static bool same_leaf(const Ins& a, const Ins& b) {
     if (a.op != b.op || a.ty != b.ty || a.approx != b.approx || a.dec != b.dec || a.dyadic != b.dyadic || a.taint != b.taint ||
-        a.uns != b.uns || a.knull != b.knull || a.ki != b.ki || std::memcmp(&a.kf, &b.kf, sizeof a.kf) != 0 || a.src != b.src ||
+        a.uns != b.uns || a.day != b.day || a.knull != b.knull || a.ki != b.ki || std::memcmp(&a.kf, &b.kf, sizeof a.kf) != 0 || a.src != b.src ||
         a.slot != b.slot || a.cs != b.cs || a.codes.get() != b.codes.get() || a.set.get() != b.set.get())
       return false;
     return a.code_null == b.code_null;
   }
   uint32_t emit(Ins in) {
+    // A date reaches only a comparison with another date or IS [NOT] NULL (an INTERVAL's move makes its own day
+    // instruction): anything else would read the day number as a number.
+    if (!in.day) {
+      bool any = false, all = !in.args.empty();
+      for (uint32_t x : in.args) { const bool d = x < P.ins.size() && P.ins[x].day; any = any || d; all = all && d; }
+      if (any) {
+        const bool cmp = in.op == Ins::Eq || in.op == Ins::Ne || in.op == Ins::Lt || in.op == Ins::Le || in.op == Ins::Gt || in.op == Ins::Ge;
+        const bool nul = in.op == Ins::IsNull || in.op == Ins::NotNull;
+        if (!((cmp && all) || nul)) return fail("a date read as a number");
+      }
+    }
     if (vjit_leaf(in.op) && in.args.empty())
       for (uint32_t x = 0; x < P.ins.size(); ++x)
         if (vjit_leaf(P.ins[x].op) && same_leaf(P.ins[x], in)) return x;
@@ -240,7 +256,7 @@ struct Compiler {
     if (n == 0 || n > (1u << 20)) return false;
     CodeCache& cc = code_cache();
     for (const auto& e : cc.entries)
-      if (e.uid == cs.uid.v && e.n == n && e.as_int == as_int && e.part == 0) {
+      if (e.uid == cs.uid.v && e.n == n && e.as_int == as_int && e.part == 0 && !(e.table && e.table->temporal)) {
         if (e.bad) return false;
         in->codes = e.table;
         return true;
@@ -285,6 +301,7 @@ struct Compiler {
     // it (temporal_codes): code k is day base + k, its cell's text temporal_format's - the table works the date part
     // out of that text. A dictionary-coded text column: out of each entry.
     const bool days = col.temporal && cs.encoding == ColumnEncoding::TemporalDays && cs.bit_width_ <= 16 && cs.size() == t->row_count();
+    if (part == 0 && !days) return fail("temporal column");
     if (!days && (col.type != SqlDataType::Text || cs.shared_dict || !vx::dict_coded(cs))) return fail("date part of a column not dictionary-coded or days");
     const size_t n = days ? (size_t)1 << cs.bit_width_ : vx::dict_size(cs);
     if (n == 0 || n > (1u << 20)) return fail("dictionary too large");
@@ -294,6 +311,11 @@ struct Compiler {
     in.src = (uint32_t)s;
     in.cs = &cs;
     CodeCache& cc = code_cache();
+    if (part == 0) {   // the day itself: code k is day base + k
+      in.day = true;
+      in.dlo = cs.base_int64;
+      in.dhi = cs.base_int64 + (int64_t)n - 1;
+    }
     for (const auto& en : cc.entries)
       if (en.uid == cs.uid.v && en.n == n && en.part == part && en.table && en.table->temporal == days && (!days || en.table->base == cs.base_int64)) {
         in.codes = en.table;
@@ -307,6 +329,7 @@ struct Compiler {
     tb->bits = days ? (int)cs.bit_width_ : 0;
     std::string text;
     for (size_t k = 0; k < n; ++k) {
+      if (part == 0) { tb->i[k] = cs.base_int64 + (int64_t)k; continue; }
       if (days) sql_temporal_format(cs.base_int64 + (int64_t)k, false, text);
       const std::string& v = days ? text : vx::dict_entry(cs, (uint32_t)k);
       if ((!days && sql_is_null(v)) || !date_part_of_text(v, part, &tb->i[k])) tb->null[k] = 1;
@@ -380,7 +403,11 @@ struct Compiler {
     const SqlTable* t = (*ctx.sources)[s].table;
     const SqlColumn& col = t->columns[c];
     const ColumnStore& cs = t->col_data[c];
-    if (col.temporal) return fail("temporal column");
+    if (col.temporal) {
+      // a DATE held as days in a 16-bit code space: its day numbers (date_part's part 0)
+      if (cs.encoding == ColumnEncoding::TemporalDays && cs.bit_width_ <= 16 && cs.size() == t->row_count()) return date_part(e, 0);
+      return fail("temporal column");
+    }
     Ins in;
     in.src = (uint32_t)s;
     in.cs = &cs;
@@ -551,6 +578,30 @@ struct Compiler {
       }
       case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div: case ExprOp::Mod: {
         if (e->args.size() != 2) return fail();
+        // date +/- INTERVAL n DAY | WEEK: the interpreter's apply_date_interval moves the day by n (7n) and prints the
+        // date - the same day number, while it stays within years 1..9999 (refused where it might not)
+        if ((e->op == ExprOp::Add || e->op == ExprOp::Sub) && e->args[1] && e->args[1]->op == ExprOp::Func &&
+            upper_of(e->args[1]->name) == "INTERVAL") {
+          const SqlExpr* iv = e->args[1].get();
+          if (iv->args.size() != 2 || !iv->args[0] || !iv->args[1] || iv->args[0]->op != ExprOp::Literal || iv->args[1]->op != ExprOp::Literal)
+            return fail("an INTERVAL not of literals");
+          const Val& q = iv->args[0]->literal;
+          const Val& u = iv->args[1]->literal;
+          if (q.null || u.null || !q.numeric || q.approx || q.num != std::floor(q.num) || std::fabs(q.num) > 1e7) return fail("an INTERVAL not of whole days");
+          const std::string unit = upper_of(u.str());
+          if (unit != "DAY" && unit != "DAYS" && unit != "WEEK" && unit != "WEEKS") return fail("an INTERVAL of " + unit);
+          const uint32_t a = compile(e->args[0].get());
+          if (!ok) return 0;
+          if (!at(a).day) return fail("an INTERVAL on what is not a date");
+          int64_t nd = (int64_t)q.num * (unit[0] == 'W' ? 7 : 1);
+          if (e->op == ExprOp::Sub) nd = -nd;
+          const int64_t lo = at(a).dlo + nd, hi = at(a).dhi + nd;
+          if (lo < -719162 || hi > 2932896) return fail("an INTERVAL past the years 1..9999");
+          Ins k; k.op = Ins::Konst; k.ty = Ty::I64; k.ki = nd;
+          const uint32_t kx = emit(std::move(k));
+          Ins in; in.op = Ins::Add; in.ty = Ty::I64; in.args = {a, kx}; in.day = true; in.dlo = lo; in.dhi = hi;
+          return emit(std::move(in));
+        }
         const uint32_t a = compile(e->args[0].get());
         const uint32_t b = compile(e->args[1].get());
         if (!ok) return 0;
@@ -1003,8 +1054,8 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
   P->pg_division = tls_pg_division;
   Compiler c{ctx, *P};
   c.compile(e);
-  if (!c.ok || P->ins.empty() || P->ins.size() > 256 || P->out().taint || P->out().dec) {
-    if (why) *why = !c.ok ? c.why : (P->ins.size() > 256 ? "too long" : "result may be an exact decimal");
+  if (!c.ok || P->ins.empty() || P->ins.size() > 256 || P->out().taint || P->out().dec || P->out().day) {
+    if (why) *why = !c.ok ? c.why : P->ins.size() > 256 ? "too long" : P->out().day ? "a date's value" : "result may be an exact decimal";
     if (retry) *retry = c.retry;
     return nullptr;
   }
