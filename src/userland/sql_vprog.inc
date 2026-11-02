@@ -1730,6 +1730,34 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
   return true;
 }
 
+// P over rows given as one row-id column per source (a star join's arrays: ids[src][first + j], UINT32_MAX for a
+// NULL-padded row), rows first .. first + total: no joined row made.
+inline bool eval_column_srcs(const Prog& P, const std::vector<const uint32_t*>& ids, size_t first, size_t total, Column* out, std::string* err) {
+  const Ins& o = P.out();
+  out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
+  out->n.assign(total, 0);
+  if (o.ty == Ty::Str) out->s.assign(total, std::string());
+  else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
+  Lanes L;
+  L.total_rows = total;
+  const size_t chunk = 4096;
+  const size_t K = P.ins.size() - 1;
+  for (size_t at = 0; at < total; at += chunk) {
+    const size_t n = std::min(chunk, total - at);
+    auto rowid = [&](size_t j, uint32_t src) -> size_t {
+      if (src >= ids.size() || !ids[src]) return kNullRow;
+      const uint32_t r = ids[src][first + at + j];
+      return r == UINT32_MAX ? kNullRow : (size_t)r;
+    };
+    if (!eval(P, rowid, n, L, err)) return false;
+    std::memcpy(out->n.data() + at, L.n[K].data(), n);
+    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
+  }
+  return true;
+}
+
 // P over a single table's rows: ids(j) is row j's row id in that table (the program's only source, 0).
 template <typename Ids>
 inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out, std::string* err) {

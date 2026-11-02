@@ -44857,11 +44857,13 @@ static JoinedRows star_materialize(const std::vector<std::vector<uint32_t>>& P) 
   if (ns <= JoinedParts::INLINE_CAP) {
     // the ids straight into each row's inline array: a star row id is 32 bits, its NULL row UINT32_MAX - the
     // inline array's own marker (push_back's checks per id were most of this)
-    for (size_t s2 = 0; s2 < ns; ++s2) {
-      const uint32_t* col = P[s2].data();
-      for (size_t i = 0; i < n; ++i) out[i].parts.inline_arr[s2] = col[i];
-    }
-    for (size_t i = 0; i < n; ++i) out[i].parts.n = (uint8_t)ns;
+    SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t i0, size_t i1, size_t) {
+      for (size_t s2 = 0; s2 < ns; ++s2) {
+        const uint32_t* col = P[s2].data();
+        for (size_t i = i0; i < i1; ++i) out[i].parts.inline_arr[s2] = col[i];
+      }
+      for (size_t i = i0; i < i1; ++i) out[i].parts.n = (uint8_t)ns;
+    });
   } else {
     for (size_t i = 0; i < n; ++i)
       for (const auto& col : P) out[i].parts.push_back(col[i] == UINT32_MAX ? kNullRow : (size_t)col[i]);
@@ -46632,13 +46634,29 @@ struct LaneOrder {
   std::vector<SqlDataType> types;
   long long limit = -1, offset = 0;
 };
+// The joined rows a lane is made over: built rows, or a star join's arrays - one row-id column per source,
+// UINT32_MAX for a NULL-padded row - read as they are (no row made of each).
+struct RowIds {
+  const JoinedRows* rows = nullptr;
+  const std::vector<std::vector<uint32_t>>* cols = nullptr;
+  size_t n = 0;
+  RowIds(const JoinedRows& r) : rows(&r), n(r.size()) {}
+  explicit RowIds(const std::vector<std::vector<uint32_t>>& c) : cols(&c), n(c.empty() ? 0 : c[0].size()) {}
+  size_t size() const { return n; }
+  size_t part(size_t j, size_t s) const {
+    if (rows) { const auto& p = (*rows)[j].parts; return s < p.size() ? p[s] : kNullRow; }
+    if (s >= cols->size()) return kNullRow;
+    const uint32_t v = (*cols)[s][j];
+    return v == UINT32_MAX ? kNullRow : (size_t)v;
+  }
+};
 // An expression as exact arithmetic the programs (vp) leave to the interpreter - a DECIMAL column, and
 // + - * over such columns, INT columns and exact literals, from any of the joined tables: each row's value a
 // scaled integer at a scale fixed when compiled, the interpreter's own (exact_arith_display: + - at the larger
 // scale, * at the sum; a fixed-scale DECIMAL cell prints all its places, so its value is (stored integer, scale)).
 // A NULL operand, a NULL row (or a LEFT JOIN's padding): NULL. A value past 64 bits declines the lanes - the
 // interpreter then answers, in 128 bits or with its error - never an approximation.
-static bool exact_lane_of(const std::vector<QuerySource>& sources, const JoinedRows& rows, const SqlExpr* e, vp::Column* col,
+static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* e, vp::Column* col,
                           int* xscale, std::string* why) {
   EvalCtx vctx; vctx.sources = &sources;
   auto no = [&](const char* w) { *why = w; return false; };
@@ -46718,94 +46736,140 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const JoinedR
   static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
                                   10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
                                   1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
-  // An instruction at a time over every row (a column of values and one of NULL flags each), the last one's
-  // the lane: a leaf a gather by row id, an operator one loop - not a switch per instruction per row.
+  // An instruction at a time over a chunk of rows (a column of values and one of NULL flags each), the last one's
+  // the lane: a leaf a gather by row id, an operator one loop - not a switch per instruction per row. The chunks
+  // run in parallel, each into its own range of the lane; an overflow in any declines the whole.
   const size_t nx = xs.size(), nr = rows.size();
-  std::vector<std::vector<int64_t>> val(nx);
-  std::vector<std::vector<uint8_t>> nul(nx);
-  for (size_t q = 0; q < nx; ++q) {
-    const XI& in = xs[q];
-    std::vector<int64_t>& v = val[q];
-    std::vector<uint8_t>& z = nul[q];
-    v.assign(nr, 0);
-    z.assign(nr, 0);
-    switch (in.op) {
-      case 0:
-        for (size_t j = 0; j < nr; ++j) {
-          const auto& parts = rows[j].parts;
-          const size_t r = in.src < parts.size() ? parts[in.src] : kNullRow;
-          if (r == kNullRow || (in.nul && in.nul[r])) { z[j] = 1; continue; }
-          v[j] = in.v[r];
-        }
-        break;
-      case 1:
-        std::fill(v.begin(), v.end(), in.k);
-        break;
-      case 5: {
-        const std::vector<int64_t>& a = val[in.a];
-        const std::vector<uint8_t>& za = nul[in.a];
-        for (size_t j = 0; j < nr; ++j) {
-          if (za[j]) { z[j] = 1; continue; }
-          if (a[j] == INT64_MIN) return no("an exact negation past 64 bits");
-          v[j] = -a[j];
-        }
-        break;
-      }
-      default: {
-        const std::vector<int64_t>& a = val[in.a];
-        const std::vector<int64_t>& b = val[in.b];
-        const std::vector<uint8_t>& za = nul[in.a];
-        const std::vector<uint8_t>& zb = nul[in.b];
-        bool over = false;
-        if (in.op == 4) {
-          for (size_t j = 0; j < nr; ++j) {
-            z[j] = za[j] | zb[j];
-            over |= __builtin_mul_overflow(a[j], b[j], &v[j]);
-          }
-          if (over) {   // only a row with both operands present counts (a NULL row's operand is 0 here)
-            for (size_t j = 0; j < nr; ++j) { int64_t r = 0; if (!z[j] && __builtin_mul_overflow(a[j], b[j], &r)) return no("an exact product past 64 bits"); }
-          }
-        } else {
-          const int sa = xs[in.a].scale, sb = xs[in.b].scale;
-          const int64_t ma = p10[in.scale - sa], mb = p10[in.scale - sb];
-          const bool add = in.op == 2;
-          for (size_t j = 0; j < nr; ++j) {
-            z[j] = za[j] | zb[j];
-            int64_t x = 0, y = 0;
-            bool o = __builtin_mul_overflow(a[j], ma, &x);
-            o |= __builtin_mul_overflow(b[j], mb, &y);
-            o |= add ? __builtin_add_overflow(x, y, &v[j]) : __builtin_sub_overflow(x, y, &v[j]);
-            if (o && !z[j]) return no("an exact sum past 64 bits");
-          }
-        }
-      }
-    }
-    // an operator's operands are read by it alone (mk builds a tree): freed once it has run
-    if (in.op >= 2) {
-      std::vector<int64_t>().swap(val[in.a]);
-      std::vector<uint8_t>().swap(nul[in.a]);
-      if (in.op != 5) { std::vector<int64_t>().swap(val[in.b]); std::vector<uint8_t>().swap(nul[in.b]); }
-    }
-  }
   col->ty = vp::Ty::I64;
   col->approx = false;
   col->uns = false;
-  col->i = std::move(val[nx - 1]);
-  col->n = std::move(nul[nx - 1]);
-  for (size_t j = 0; j < nr; ++j) if (col->n[j]) col->i[j] = 0;
+  col->i.assign(nr, 0);
+  col->n.assign(nr, 0);
+  std::atomic<int> fail{0};   // 1: a product past 64 bits, 2: a sum, 3: a negation
+  SqlThreadPool::instance().for_chunks(nr, 16384, nr, false, [&](size_t b0, size_t b1, size_t) {
+    if (fail.load(std::memory_order_relaxed)) return;
+    const size_t m = b1 - b0;
+    std::vector<std::vector<int64_t>> val(nx);
+    std::vector<std::vector<uint8_t>> nul(nx);
+    for (size_t q = 0; q < nx; ++q) {
+      const XI& in = xs[q];
+      std::vector<int64_t>& v = val[q];
+      std::vector<uint8_t>& z = nul[q];
+      v.assign(m, 0);
+      z.assign(m, 0);
+      switch (in.op) {
+        case 0:
+          for (size_t j = 0; j < m; ++j) {
+            const size_t r = rows.part(b0 + j, in.src);
+            if (r == kNullRow || (in.nul && in.nul[r])) { z[j] = 1; continue; }
+            v[j] = in.v[r];
+          }
+          break;
+        case 1:
+          std::fill(v.begin(), v.end(), in.k);
+          break;
+        case 5: {
+          const std::vector<int64_t>& a = val[in.a];
+          const std::vector<uint8_t>& za = nul[in.a];
+          for (size_t j = 0; j < m; ++j) {
+            if (za[j]) { z[j] = 1; continue; }
+            if (a[j] == INT64_MIN) { fail.store(3); return; }
+            v[j] = -a[j];
+          }
+          break;
+        }
+        default: {
+          const std::vector<int64_t>& a = val[in.a];
+          const std::vector<int64_t>& b = val[in.b];
+          const std::vector<uint8_t>& za = nul[in.a];
+          const std::vector<uint8_t>& zb = nul[in.b];
+          if (in.op == 4) {
+            for (size_t j = 0; j < m; ++j) {
+              z[j] = za[j] | zb[j];
+              if (__builtin_mul_overflow(a[j], b[j], &v[j]) && !z[j]) { fail.store(1); return; }   // a NULL row's operand is 0 here
+            }
+          } else {
+            const int sa = xs[in.a].scale, sb = xs[in.b].scale;
+            const int64_t ma = p10[in.scale - sa], mb = p10[in.scale - sb];
+            const bool add = in.op == 2;
+            for (size_t j = 0; j < m; ++j) {
+              z[j] = za[j] | zb[j];
+              int64_t x = 0, y = 0;
+              bool o = __builtin_mul_overflow(a[j], ma, &x);
+              o |= __builtin_mul_overflow(b[j], mb, &y);
+              o |= add ? __builtin_add_overflow(x, y, &v[j]) : __builtin_sub_overflow(x, y, &v[j]);
+              if (o && !z[j]) { fail.store(2); return; }
+            }
+          }
+        }
+      }
+      // an operator's operands are read by it alone (mk builds a tree): freed once it has run
+      if (in.op >= 2) {
+        std::vector<int64_t>().swap(val[in.a]);
+        std::vector<uint8_t>().swap(nul[in.a]);
+        if (in.op != 5) { std::vector<int64_t>().swap(val[in.b]); std::vector<uint8_t>().swap(nul[in.b]); }
+      }
+    }
+    const std::vector<int64_t>& v = val[nx - 1];
+    const std::vector<uint8_t>& z = nul[nx - 1];
+    for (size_t j = 0; j < m; ++j) {
+      col->n[b0 + j] = z[j];
+      col->i[b0 + j] = z[j] ? 0 : v[j];
+    }
+  });
+  if (const int f = fail.load()) return no(f == 1 ? "an exact product past 64 bits" : f == 2 ? "an exact sum past 64 bits" : "an exact negation past 64 bits");
   *xscale = xs.back().scale;
   return true;
 }
 
+// vp::eval_column over joined rows, in parallel ranges joined in order where there are rows enough: the same lane.
+static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err) {
+  const size_t n = ri.size();
+  const size_t parts = n >= 131072 ? std::min<size_t>(SqlThreadPool::instance().num_workers() + 1, 8) : 1;
+  std::vector<const uint32_t*> ids;
+  if (ri.cols) for (const auto& c : *ri.cols) ids.push_back(c.data());
+  auto range = [&](size_t b, size_t e, vp::Column* out, std::string* er) -> bool {
+    if (ri.cols) return vp::eval_column_srcs(P, ids, b, e - b, out, er);
+    const JoinedRows& rows = *ri.rows;
+    return vp::eval_column(P, [&](size_t j) -> const JoinedRow& { return rows[b + j]; }, e - b, out, er);
+  };
+  if (parts <= 1 || SqlThreadPool::is_in_worker_thread()) return range(0, n, col, err);
+  std::vector<vp::Column> got(parts);
+  std::vector<std::string> errs(parts);
+  std::vector<uint8_t> ok(parts, 0);
+  const size_t per = (n + parts - 1) / parts;
+  SqlThreadPool::instance().for_chunks(parts, 1, n, true, [&](size_t p0, size_t p1, size_t) {
+    for (size_t p = p0; p < p1; ++p) {
+      const size_t b = p * per, e = std::min(n, b + per);
+      if (b >= e) { ok[p] = 1; continue; }
+      ok[p] = range(b, e, &got[p], &errs[p]);
+    }
+  });
+  for (size_t p = 0; p < parts; ++p) if (!ok[p]) { *err = errs[p]; return false; }
+  *col = std::move(got[0]);
+  for (size_t p = 1; p < parts; ++p) {
+    vp::Column& g = got[p];
+    if (g.size() == 0) continue;
+    if (g.ty != col->ty) { *err = "lanes of two types"; return false; }
+    col->approx = col->approx || g.approx;
+    col->uns = col->uns || g.uns;
+    col->i.insert(col->i.end(), g.i.begin(), g.i.end());
+    col->f.insert(col->f.end(), g.f.begin(), g.f.end());
+    col->n.insert(col->n.end(), g.n.begin(), g.n.end());
+    for (auto& x : g.s) col->s.push_back(std::move(x));
+  }
+  return true;
+}
 
-static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sources, const EvalCtx* outer, const JoinedRows& rows,
+
+static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sources, const EvalCtx* outer, const RowIds& rows,
                           const std::vector<ExprPtr>& group_by, const std::vector<SelectItem>& items, const ExprPtr& having,
                           std::vector<vp::Column>* lanes_out, std::vector<std::vector<std::string>>* text_out, size_t* ngroups,
                           bool want_key_order, bool* keys_exact, const LaneOrder* order_spec, bool* sorted_out) {
   *keys_exact = true;
   *sorted_out = false;
   static const bool on = [] { const char* v = std::getenv("AIOS_SQL_LANE_GROUP"); return !(v && *v == '0'); }();
-  if (!on || !vp::enabled() || group_by.empty() || group_by.size() > 8 || rows.empty() || rows.size() >= UINT32_MAX) return false;
+  if (!on || !vp::enabled() || group_by.empty() || group_by.size() > 8 || rows.size() == 0 || rows.size() >= UINT32_MAX) return false;
   auto no = [](const std::string& why) { if (vx_trace_on()) vx_trace("group: not over lanes: " + why); return false; };
   enum Kind { CountStar, Count, Min, Max, Sum, Avg };
   // xscale >= 0: arg is an exact lane (exact_lane) - each row's value the scaled integer i at that scale.
@@ -46901,19 +46965,22 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       std::vector<int64_t> all_ints;
       if (whole && classes) { all_codes.resize(total); vx::decode_codes(cs, 0, total, all_codes.data()); }
       else if (whole && !typed_dbl) { all_ints.resize(total); vx::typed_ints(cs, 0, total, all_ints.data()); }
-      for (size_t j = 0; j < rows.size(); ++j) {
-        const size_t r = cs_src < rows[j].parts.size() ? rows[j].parts[cs_src] : kNullRow;
-        if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { col->n[j] = 1; continue; }
-        if (classes) {
-          const uint32_t c = whole ? all_codes[r] : vx::code_at(cs, r);
-          if (c >= classes->size() || (*classes)[c] < 0) { col->n[j] = 1; continue; }
-          col->i[j] = (*classes)[c];
-        } else if (typed_dbl) {
-          col->f[j] = cs.double_data[r];
-        } else {
-          col->i[j] = whole ? all_ints[r] : vx::typed_int(cs, r);
+      // in parallel ranges, each row's own slot
+      SqlThreadPool::instance().for_chunks(rows.size(), 16384, rows.size(), false, [&](size_t j0, size_t j1, size_t) {
+        for (size_t j = j0; j < j1; ++j) {
+          const size_t r = rows.part(j, cs_src);
+          if (r == kNullRow || r >= cs.size() || (nulls && cs.is_null(r))) { col->n[j] = 1; continue; }
+          if (classes) {
+            const uint32_t c = whole ? all_codes[r] : vx::code_at(cs, r);
+            if (c >= classes->size() || (*classes)[c] < 0) { col->n[j] = 1; continue; }
+            col->i[j] = (*classes)[c];
+          } else if (typed_dbl) {
+            col->f[j] = cs.double_data[r];
+          } else {
+            col->i[j] = whole ? all_ints[r] : vx::typed_int(cs, r);
+          }
         }
-      }
+      });
       if (classes) *keys_exact = false;
       return true;
     }
@@ -46922,7 +46989,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     if (!P) return no("no program for " + e->source_text.substr(0, 60));
     if (P->out().ty != vp::Ty::I64 && !(dbl && P->out().ty == vp::Ty::F64)) return no("not integers: " + e->source_text.substr(0, 60));
     std::string err;
-    if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), col, &err)) return no("evaluation: " + err);
+    if (!vp_eval_rows(*P, rows, col, &err)) return no("evaluation: " + err);
     if ((col->ty != vp::Ty::I64 && col->ty != vp::Ty::F64) || col->size() != rows.size()) return no("lane not numbers");
     return true;
   };
@@ -46938,9 +47005,13 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     if (item_agg[i] >= 0 ? (aggs[(size_t)item_agg[i]].kind == Sum || aggs[(size_t)item_agg[i]].kind == Avg) : expr_has_aggregate(items[i].expr))
       lane_form = false;
   }
+  // (trace: the time in keys, arguments, group ids, folds and the answer)
+  const uint64_t lt0 = vx_trace_on() ? hal_now_ns() : 0;
   std::vector<vp::Column> keys(nk);
   for (size_t c = 0; c < nk; ++c) if (!lane(group_by[c].get(), &keys[c], true, false)) return false;
+  const uint64_t lt1 = vx_trace_on() ? hal_now_ns() : 0;
   for (Agg& a : aggs) if (a.kind != CountStar && !lane(a.node->args[0].get(), &a.arg, false, a.kind != Count, &a.xscale)) return false;
+  const uint64_t lt2 = vx_trace_on() ? hal_now_ns() : 0;
   // an exact lane's MIN / MAX is a decimal, not an INT result: the text form
   for (const Agg& a : aggs) if (a.xscale > 0) lane_form = false;
   // a MIN / MAX of doubles is not an INT result: the text form
@@ -46981,7 +47052,15 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       int64_t mn = INT64_MAX, mx = INT64_MIN;
       const std::vector<int64_t>& ki = keys[c].i;
       const std::vector<uint8_t>& kn = keys[c].n;
-      for (size_t r = 0; r < n; ++r) if (!kn[r]) { mn = std::min(mn, ki[r]); mx = std::max(mx, ki[r]); }
+      {
+        aios::hal::Mutex mmu;
+        SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
+          int64_t a = INT64_MAX, b = INT64_MIN;
+          for (size_t r = r0; r < r1; ++r) if (!kn[r]) { a = std::min(a, ki[r]); b = std::max(b, ki[r]); }
+          std::lock_guard<aios::hal::Mutex> lk(mmu);
+          mn = std::min(mn, a); mx = std::max(mx, b);
+        });
+      }
       if (mn > mx) { mn = 0; mx = -1; }
       if (mx >= mn && (uint64_t)mx - (uint64_t)mn >= ((uint64_t)1 << 24)) { direct = false; break; }
       lo[c] = mn;
@@ -46998,7 +47077,9 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
         const std::vector<uint8_t>& kn = keys[c].n;
         const uint64_t m = mul[c], nul_at = (width[c] - 1) * m;
         const int64_t l = lo[c];
-        for (size_t r = 0; r < n; ++r) idx[r] += kn[r] ? nul_at : (uint64_t)(ki[r] - l) * m;
+        SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
+          for (size_t r = r0; r < r1; ++r) idx[r] += kn[r] ? nul_at : (uint64_t)(ki[r] - l) * m;
+        });
       }
       for (size_t r = 0; r < n; ++r) {
         int32_t& g = slot[idx[r]];
@@ -47031,6 +47112,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     }
   }
   const size_t G = first.size();
+  const uint64_t lt3 = vx_trace_on() ? hal_now_ns() : 0;
   // The aggregates, folded over the rows in order: counts; for MIN / MAX the row holding the extreme (the first
   // such, as a fold that replaces only on a strict improvement keeps); for SUM / AVG the accumulator itself.
   std::vector<std::vector<uint64_t>> counts(aggs.size());
@@ -47079,13 +47161,34 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
           std::vector<double> tot(G, 0.0);
           std::vector<size_t> cnt(G, 0);
           const double p = p10d[xs];
-          for (size_t r = 0; r < n; ++r) {
-            if (a.arg.n[r]) continue;
-            const uint32_t g = gid[r];
-            const int64_t x = a.arg.i[r];
-            et[g] += x;
-            tot[g] += (double)x / p;
-            ++cnt[g];
+          // the integers summed in parallel ranges where the groups are few (each range its own totals, added
+          // after - an integer sum is the same in any order); the doubles in row order, as add_scaled made them
+          const size_t parts = G <= 4096 && n >= 131072 && !SqlThreadPool::is_in_worker_thread()
+                                   ? std::min<size_t>(SqlThreadPool::instance().num_workers() + 1, 8) : 1;
+          if (parts > 1) {
+            std::vector<std::vector<AIOS_INT128>> pe(parts, std::vector<AIOS_INT128>(G, 0));
+            std::vector<std::vector<size_t>> pc(parts, std::vector<size_t>(G, 0));
+            const size_t per = (n + parts - 1) / parts;
+            SqlThreadPool::instance().for_chunks(parts, 1, n, true, [&](size_t p0, size_t p1, size_t) {
+              for (size_t q = p0; q < p1; ++q)
+                for (size_t r = q * per; r < std::min(n, q * per + per); ++r) {
+                  if (a.arg.n[r]) continue;
+                  pe[q][gid[r]] += a.arg.i[r];
+                  ++pc[q][gid[r]];
+                }
+            });
+            for (size_t q = 0; q < parts; ++q)
+              for (size_t g = 0; g < G; ++g) { et[g] += pe[q][g]; cnt[g] += pc[q][g]; }
+            for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) tot[gid[r]] += (double)a.arg.i[r] / p;
+          } else {
+            for (size_t r = 0; r < n; ++r) {
+              if (a.arg.n[r]) continue;
+              const uint32_t g = gid[r];
+              const int64_t x = a.arg.i[r];
+              et[g] += x;
+              tot[g] += (double)x / p;
+              ++cnt[g];
+            }
           }
           for (size_t g = 0; g < G; ++g) {
             if (!cnt[g]) continue;
@@ -47105,6 +47208,10 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       }
     }
   }
+  if (vx_trace_on())
+    vx_trace("group lanes: keys " + std::to_string((lt1 - lt0) / 1000) + " us, arguments " + std::to_string((lt2 - lt1) / 1000) +
+             " us, group ids " + std::to_string((lt3 - lt2) / 1000) + " us (" + (direct ? "direct" : "hashed") + "), folds " +
+             std::to_string((hal_now_ns() - lt3) / 1000) + " us");
   // Key order, NULL first: the implicit ORDER BY of the keys, over integers. Two groups never share a key tuple.
   // Where the statement's own ORDER BY decides (or a text key's classes are not the text's order), the groups
   // stay in first-appearance order for the stable sort below - so rows that tie come out as the general path's do.
@@ -47220,9 +47327,21 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     return false;
   };
   std::vector<std::pair<const SqlExpr*, Val>> av(aggs.size());
+  // a group's first row, whole, for the interpreter: the row itself, or made from a star join's arrays (a row a
+  // group, made once - not one per joined row)
+  std::vector<JoinedRow> frow;
+  auto first_row = [&](uint32_t g) -> const JoinedRow& {
+    if (rows.rows) return (*rows.rows)[first[g]];
+    if (frow.empty()) {
+      frow.resize(G);
+      const size_t ns = rows.cols->size();
+      for (size_t x = 0; x < G; ++x) for (size_t s2 = 0; s2 < ns; ++s2) frow[x].parts.push_back(rows.part(first[x], s2));
+    }
+    return frow[g];
+  };
   auto group_ctx = [&](uint32_t g) {
     for (size_t k = 0; k < aggs.size(); ++k) av[k] = {aggs[k].node, agg_val(k, g)};
-    ctx.row = &rows[first[g]];
+    ctx.row = &first_row(g);
     ctx.group = nullptr;
     ctx.agg_values = &av;
   };
@@ -47282,8 +47401,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
             k.by_rank = true;
             k.rank.assign(kept.size(), -1);
             for (size_t j = 0; j < kept.size(); ++j) {
-              const JoinedRow& fr = rows[first[kept[j]]];
-              const size_t r = ps < fr.parts.size() ? fr.parts[ps] : kNullRow;
+              const size_t r = rows.part(first[kept[j]], ps);
               if (r == kNullRow || r >= pcs.size() || pcs.is_null(r)) continue;
               const uint32_t c = vx::code_at(pcs, r);
               if (c < rk->size()) k.rank[j] = (*rk)[c];
@@ -47309,8 +47427,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
           k.isnull.assign(kept.size(), 0);
           const bool hn = vx::has_nulls(pcs);
           for (size_t j = 0; j < kept.size() && plain; ++j) {
-            const JoinedRow& fr = rows[first[kept[j]]];
-            const size_t r = ps < fr.parts.size() ? fr.parts[ps] : kNullRow;
+            const size_t r = rows.part(first[kept[j]], ps);
             if (r == kNullRow || r >= pcs.size() || (hn && pcs.is_null(r))) { k.isnull[j] = 1; continue; }
             if (ints) {
               const int64_t x = vx::typed_int(pcs, r);
@@ -47423,7 +47540,7 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       }
       if (i < item_cell.size() && item_cell[i].first != SIZE_MAX) {   // a plain column: the group's first row's cell, as the row path reads it
         const size_t ps = item_cell[i].first, pc = item_cell[i].second;
-        const size_t r = ps < rows[first[g]].parts.size() ? rows[first[g]].parts[ps] : kNullRow;
+        const size_t r = rows.part(first[g], ps);
         cells.push_back(r == kNullRow ? sql_null() : sources[ps].table->cell(r, pc));
         continue;
       }
@@ -47701,6 +47818,7 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
     std::vector<JoinedRows> groups;
     std::vector<std::vector<std::pair<const SqlExpr*, Val>>> star_vals;
     bool star_grouped = false;
+    bool star_cols_pending = false;   // a declined star join's arrays, not yet made into rows
     if (star_columnar) {
       std::vector<const SqlExpr*> roots;
       for (const auto& it : expanded) roots.push_back(it.expr.get());
@@ -47760,11 +47878,11 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
         groups.clear();
         star_vals.clear();
         star_expand_into(star_def, star_cols);
-        rows = star_materialize(star_cols);
+        star_cols_pending = true;   // the lanes read the arrays; rows are made only if they decline
       }
       star_def.reset();
       star_columnar = false;
-      std::vector<std::vector<uint32_t>>().swap(star_cols);
+      if (!star_cols_pending) std::vector<std::vector<uint32_t>>().swap(star_cols);
     }
     // GROUP BY over integer lanes where the statement is that shape (lane_group_by): the groups below otherwise.
     bool lane_done = false;
@@ -47803,7 +47921,7 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
         lorder.limit = limit;
         lorder.offset = offset;
       }
-      if (lane_group_by(db, sources, outer_scope, rows, group_by, expanded, having, &lcols, &ltext, &G, implicit_order, &keys_exact,
+      if (lane_group_by(db, sources, outer_scope, star_cols_pending ? RowIds(star_cols) : RowIds(rows), group_by, expanded, having, &lcols, &ltext, &G, implicit_order, &keys_exact,
                         order_ok ? &lorder : nullptr, &sorted_inside)) {
         lane_done = true;
         const bool key_sorted = implicit_order && keys_exact;   // the lanes' own order is the statement's
@@ -47835,6 +47953,11 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
         }
         if (key_sorted || sorted_inside) order_by.clear();   // in order already (lanes: the lane form comes out in key order only)
       }
+    }
+    if (star_cols_pending) {
+      if (!lane_done) rows = star_materialize(star_cols);
+      std::vector<std::vector<uint32_t>>().swap(star_cols);
+      star_cols_pending = false;
     }
     if (!lane_done) {
     bool singleton_group = false;
@@ -52198,6 +52321,82 @@ static std::optional<SqlQueryResult> expand_items(const ExpandPlan& plan, PhaseC
   return std::nullopt;
 }
 
+// A program value conjunct_truths reads as a truth (a comparison, AND / OR / NOT, IS [NOT] NULL, IN of texts).
+static bool truth_root(vp::Ins::Op op) {
+  return op == vp::Ins::Eq || op == vp::Ins::Ne || op == vp::Ins::Lt || op == vp::Ins::Le || op == vp::Ins::Gt ||
+         op == vp::Ins::Ge || op == vp::Ins::And || op == vp::Ins::Or || op == vp::Ins::Not || op == vp::Ins::IsNull ||
+         op == vp::Ins::NotNull || op == vp::Ins::ColNull || op == vp::Ins::StrIn;
+}
+// A WHERE or ON part's truth over the joined rows, as the interpreter's three values per row (1 true, 0 false,
+// -1 NULL), a column at a time: a program (vp) whose value is a truth; a comparison of two exact lanes (exact_lane_of,
+// where a DECIMAL keeps the programs out) at their common scale - the interpreter's exact numeric order; AND / OR /
+// NOT of such, in three values. False where the part is not that, or its lanes fail (an overflow): the interpreter's.
+static bool conjunct_truths(SqlDatabase* db, const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* p,
+                            std::vector<int8_t>* out) {
+  EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
+  const size_t n = rows.size();
+  if (!p) return false;
+  if (const vp::Prog* P = vp::program_for(p, vctx)) {
+    if (P->out().ty != vp::Ty::I64 || !truth_root(P->out().op)) return false;
+    vp::Column col;
+    std::string verr;
+    if (!vp_eval_rows(*P, rows, &col, &verr)) return false;
+    if (col.size() != n || col.ty != vp::Ty::I64) return false;
+    out->assign(n, 0);
+    for (size_t j = 0; j < n; ++j) (*out)[j] = col.n[j] ? -1 : col.i[j] != 0;
+    return true;
+  }
+  if ((p->op == ExprOp::And || p->op == ExprOp::Or) && p->args.size() == 2) {
+    std::vector<int8_t> b;
+    if (!conjunct_truths(db, sources, rows, p->args[0].get(), out) || !conjunct_truths(db, sources, rows, p->args[1].get(), &b)) return false;
+    const bool and_ = p->op == ExprOp::And;
+    for (size_t j = 0; j < n; ++j) {
+      const int8_t x = (*out)[j], y = b[j];
+      (*out)[j] = and_ ? (x == 0 || y == 0 ? 0 : x < 0 || y < 0 ? -1 : 1) : (x == 1 || y == 1 ? 1 : x < 0 || y < 0 ? -1 : 0);
+    }
+    return true;
+  }
+  if (p->op == ExprOp::Not && p->args.size() == 1) {
+    if (!conjunct_truths(db, sources, rows, p->args[0].get(), out)) return false;
+    for (int8_t& x : *out) if (x >= 0) x = (int8_t)(1 - x);
+    return true;
+  }
+  if (p->args.size() != 2 || !(p->op == ExprOp::Eq || p->op == ExprOp::Ne || p->op == ExprOp::Lt || p->op == ExprOp::Le ||
+                               p->op == ExprOp::Gt || p->op == ExprOp::Ge))
+    return false;
+  vp::Column a, b;
+  int sa = 0, sb = 0;
+  std::string why;
+  if (!exact_lane_of(sources, rows, p->args[0].get(), &a, &sa, &why) || !exact_lane_of(sources, rows, p->args[1].get(), &b, &sb, &why))
+    return false;
+  static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
+                                  10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
+                                  1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
+  const int sm = std::max(sa, sb);
+  const int64_t ma = p10[sm - sa], mb = p10[sm - sb];
+  out->assign(n, -1);
+  std::atomic<bool> over{false};
+  SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t j0, size_t j1, size_t) {
+    for (size_t j = j0; j < j1; ++j) {
+      if (a.n[j] || b.n[j]) continue;   // NULL
+      int64_t x = 0, y = 0;
+      if (__builtin_mul_overflow(a.i[j], ma, &x) || __builtin_mul_overflow(b.i[j], mb, &y)) { over.store(true); return; }
+      bool t = false;
+      switch (p->op) {
+        case ExprOp::Eq: t = x == y; break;
+        case ExprOp::Ne: t = x != y; break;
+        case ExprOp::Lt: t = x < y; break;
+        case ExprOp::Le: t = x <= y; break;
+        case ExprOp::Gt: t = x > y; break;
+        default: t = x >= y; break;
+      }
+      (*out)[j] = t;
+    }
+  });
+  if (over.load()) return false;
+  return true;
+}
+
 struct FilterPlan {
   SqlDatabase* db;
   const std::vector<QuerySource>* sources;
@@ -52222,11 +52421,11 @@ static std::optional<SqlQueryResult> residual_filter(const FilterPlan& plan) {
   // left to check (empty = check the whole WHERE, as before any pushdown).
   std::vector<const SqlExpr*> where_residual;
   if (where && !pushed_where_parts.empty()) {
-    std::vector<const SqlExpr*> all_w_parts;
-    collect_conjuncts(where.get(), &all_w_parts);
-    for (const SqlExpr* wp : all_w_parts)
-      if (pushed_where_parts.find(wp) == pushed_where_parts.end()) where_residual.push_back(wp);
-    if (where_residual.empty()) where = nullptr;
+  std::vector<const SqlExpr*> all_w_parts;
+  collect_conjuncts(where.get(), &all_w_parts);
+  for (const SqlExpr* wp : all_w_parts)
+    if (pushed_where_parts.find(wp) == pushed_where_parts.end()) where_residual.push_back(wp);
+  if (where_residual.empty()) where = nullptr;
   }
   // WHERE (for multi-source joins or if not filtered during single-source scan).
   // Only what the joins left unchecked: re-evaluating the whole WHERE on
@@ -52239,161 +52438,97 @@ static std::optional<SqlQueryResult> residual_filter(const FilterPlan& plan) {
   // the interpreter below; a part whose lanes fail (an overflow) too - the interpreter then answers, or errs, itself.
   // `l.price > c.salestype * 10` over 600k joined rows was 190 ms of interpreter.
   if (where && !fast_pk_done && rows.size() >= 1024 && !sql_no_vx_env()) {
-    std::vector<const SqlExpr*> parts = where_residual;
-    if (parts.empty()) collect_conjuncts(where.get(), &parts);
-    EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
-    auto truth_root = [](vp::Ins::Op op) {
-      return op == vp::Ins::Eq || op == vp::Ins::Ne || op == vp::Ins::Lt || op == vp::Ins::Le || op == vp::Ins::Gt ||
-             op == vp::Ins::Ge || op == vp::Ins::And || op == vp::Ins::Or || op == vp::Ins::Not || op == vp::Ins::IsNull ||
-             op == vp::Ins::NotNull || op == vp::Ins::ColNull || op == vp::Ins::StrIn;
-    };
-    // A part's truth per row, as the interpreter's three values: 1 true, 0 false, -1 NULL.
-    std::function<bool(const SqlExpr*, std::vector<int8_t>*)> tri = [&](const SqlExpr* p, std::vector<int8_t>* out) -> bool {
-      const size_t n = rows.size();
-      if (!p) return false;
-      if (const vp::Prog* P = vp::program_for(p, vctx)) {
-        if (P->out().ty != vp::Ty::I64 || !truth_root(P->out().op)) return false;
-        vp::Column col;
-        std::string verr;
-        if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, n, &col, &verr)) return false;
-        if (col.size() != n || col.ty != vp::Ty::I64) return false;
-        out->assign(n, 0);
-        for (size_t j = 0; j < n; ++j) (*out)[j] = col.n[j] ? -1 : col.i[j] != 0;
-        return true;
-      }
-      if ((p->op == ExprOp::And || p->op == ExprOp::Or) && p->args.size() == 2) {
-        std::vector<int8_t> b;
-        if (!tri(p->args[0].get(), out) || !tri(p->args[1].get(), &b)) return false;
-        const bool and_ = p->op == ExprOp::And;
-        for (size_t j = 0; j < n; ++j) {
-          const int8_t x = (*out)[j], y = b[j];
-          (*out)[j] = and_ ? (x == 0 || y == 0 ? 0 : x < 0 || y < 0 ? -1 : 1) : (x == 1 || y == 1 ? 1 : x < 0 || y < 0 ? -1 : 0);
-        }
-        return true;
-      }
-      if (p->op == ExprOp::Not && p->args.size() == 1) {
-        if (!tri(p->args[0].get(), out)) return false;
-        for (int8_t& x : *out) if (x >= 0) x = (int8_t)(1 - x);
-        return true;
-      }
-      if (p->args.size() != 2 || !(p->op == ExprOp::Eq || p->op == ExprOp::Ne || p->op == ExprOp::Lt || p->op == ExprOp::Le ||
-                                   p->op == ExprOp::Gt || p->op == ExprOp::Ge))
-        return false;
-      vp::Column a, b;
-      int sa = 0, sb = 0;
-      std::string why;
-      if (!exact_lane_of(sources, rows, p->args[0].get(), &a, &sa, &why) || !exact_lane_of(sources, rows, p->args[1].get(), &b, &sb, &why))
-        return false;
-      static const int64_t p10[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
-                                      10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL,
-                                      1000000000000000LL, 10000000000000000LL, 100000000000000000LL, 1000000000000000000LL};
-      const int sm = std::max(sa, sb);
-      const int64_t ma = p10[sm - sa], mb = p10[sm - sb];
-      out->assign(n, -1);
-      for (size_t j = 0; j < n; ++j) {
-        if (a.n[j] || b.n[j]) continue;   // NULL
-        int64_t x = 0, y = 0;
-        if (__builtin_mul_overflow(a.i[j], ma, &x) || __builtin_mul_overflow(b.i[j], mb, &y)) return false;
-        bool t = false;
-        switch (p->op) {
-          case ExprOp::Eq: t = x == y; break;
-          case ExprOp::Ne: t = x != y; break;
-          case ExprOp::Lt: t = x < y; break;
-          case ExprOp::Le: t = x <= y; break;
-          case ExprOp::Gt: t = x > y; break;
-          default: t = x >= y; break;
-        }
-        (*out)[j] = t;
-      }
-      return true;
-    };
-    auto keep_of = [&](const SqlExpr* p, std::vector<uint8_t>* keep) -> bool {
-      std::vector<int8_t> t;
-      if (!tri(p, &t)) return false;
-      keep->resize(t.size());
-      for (size_t j = 0; j < t.size(); ++j) (*keep)[j] = t[j] == 1;
-      return true;
-    };
-    size_t done = 0;
-    const uint64_t vt0 = vx_trace_on() ? hal_now_ns() : 0;
-    const size_t before = rows.size();
-    for (; done < parts.size() && !rows.empty(); ++done) {
-      std::vector<uint8_t> keep;
-      if (!keep_of(parts[done], &keep)) break;
-      size_t w = 0;
-      for (size_t j = 0; j < rows.size(); ++j)
-        if (keep[j]) { if (w != j) rows[w] = std::move(rows[j]); ++w; }
-      rows.resize(w);
-    }
-    if (rows.empty()) done = parts.size();   // nothing left for the rest to refuse
-    if (vx_trace_on() && done)
-      vx_trace("where after joins: " + std::to_string(done) + " of " + std::to_string(parts.size()) + " part(s) in lanes, " +
-               std::to_string(before) + " -> " + std::to_string(rows.size()) + " rows, " + std::to_string((hal_now_ns() - vt0) / 1000) + " us");
-    if (done == parts.size()) {
-      where = nullptr;
-      where_residual.clear();
-    } else if (done) {
-      where_residual.assign(parts.begin() + (long)done, parts.end());
-    }
-  }
-  auto residual_true = [&](const EvalCtx& c) {
-    if (where_residual.empty()) return predicate_true(where.get(), c);
-    for (const SqlExpr* p : where_residual)
-      if (!predicate_true(p, c)) return false;
+  std::vector<const SqlExpr*> parts = where_residual;
+  if (parts.empty()) collect_conjuncts(where.get(), &parts);
+  EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
+  auto tri = [&](const SqlExpr* p, std::vector<int8_t>* out) { return conjunct_truths(db, sources, RowIds(rows), p, out); };
+  auto keep_of = [&](const SqlExpr* p, std::vector<uint8_t>* keep) -> bool {
+    std::vector<int8_t> t;
+    if (!tri(p, &t)) return false;
+    keep->resize(t.size());
+    for (size_t j = 0; j < t.size(); ++j) (*keep)[j] = t[j] == 1;
     return true;
   };
+  size_t done = 0;
+  const uint64_t vt0 = vx_trace_on() ? hal_now_ns() : 0;
+  const size_t before = rows.size();
+  for (; done < parts.size() && !rows.empty(); ++done) {
+    std::vector<uint8_t> keep;
+    if (!keep_of(parts[done], &keep)) break;
+    size_t w = 0;
+    for (size_t j = 0; j < rows.size(); ++j)
+      if (keep[j]) { if (w != j) rows[w] = std::move(rows[j]); ++w; }
+    rows.resize(w);
+  }
+  if (rows.empty()) done = parts.size();   // nothing left for the rest to refuse
+  if (vx_trace_on() && done)
+    vx_trace("where after joins: " + std::to_string(done) + " of " + std::to_string(parts.size()) + " part(s) in lanes, " +
+             std::to_string(before) + " -> " + std::to_string(rows.size()) + " rows, " + std::to_string((hal_now_ns() - vt0) / 1000) + " us");
+  if (done == parts.size()) {
+    where = nullptr;
+    where_residual.clear();
+  } else if (done) {
+    where_residual.assign(parts.begin() + (long)done, parts.end());
+  }
+  }
+  auto residual_true = [&](const EvalCtx& c) {
+  if (where_residual.empty()) return predicate_true(where.get(), c);
+  for (const SqlExpr* p : where_residual)
+    if (!predicate_true(p, c)) return false;
+  return true;
+  };
   if (where && !fast_pk_done) {
-    if (vx_trace_on())
-      vx_trace("where after joins: " + std::to_string(where_residual.empty() ? 0 : where_residual.size()) +
-               " residual part(s) over " + std::to_string(rows.size()) + " rows");
-    if (rows.size() >= 4096) {
-      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-      if (total_threads == 0) total_threads = 1;
-      // Big inputs in few big chunks, for the reason a join step's are.
-      const size_t chunk = rows.size() >= 1000000 ? std::max<size_t>(2048, rows.size() / (total_threads * 8)) : 2048;
-      std::vector<JoinedRows> local_rows((rows.size() + chunk - 1) / chunk);
-      std::vector<std::string> local_errs(total_threads);
-      SqlThreadPool::instance().for_chunks(rows.size(), chunk, rows.size(), false, [&](size_t bstart, size_t bend, size_t tid) {
-        if (tid >= total_threads) tid = 0;
-        EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
-        l_ctx.sources = &sources;
-        l_ctx.err = &local_errs[tid];
-        auto& l_rows = local_rows[bstart / chunk];
-        for (size_t ri = bstart; ri < bend; ++ri) {
-          l_ctx.row = &rows[ri];
-          if (residual_true(l_ctx)) {
-            l_rows.push_back(std::move(rows[ri]));
-          }
-          if (!local_errs[tid].empty()) break;
+  if (vx_trace_on())
+    vx_trace("where after joins: " + std::to_string(where_residual.empty() ? 0 : where_residual.size()) +
+             " residual part(s) over " + std::to_string(rows.size()) + " rows");
+  if (rows.size() >= 4096) {
+    size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+    if (total_threads == 0) total_threads = 1;
+    // Big inputs in few big chunks, for the reason a join step's are.
+    const size_t chunk = rows.size() >= 1000000 ? std::max<size_t>(2048, rows.size() / (total_threads * 8)) : 2048;
+    std::vector<JoinedRows> local_rows((rows.size() + chunk - 1) / chunk);
+    std::vector<std::string> local_errs(total_threads);
+    SqlThreadPool::instance().for_chunks(rows.size(), chunk, rows.size(), false, [&](size_t bstart, size_t bend, size_t tid) {
+      if (tid >= total_threads) tid = 0;
+      EvalCtx l_ctx; l_ctx.db = db; l_ctx.outer = outer_scope;
+      l_ctx.sources = &sources;
+      l_ctx.err = &local_errs[tid];
+      auto& l_rows = local_rows[bstart / chunk];
+      for (size_t ri = bstart; ri < bend; ++ri) {
+        l_ctx.row = &rows[ri];
+        if (residual_true(l_ctx)) {
+          l_rows.push_back(std::move(rows[ri]));
         }
-      });
-      for (const auto& l_err : local_errs) {
-        if (!l_err.empty()) return make_error(l_err);
+        if (!local_errs[tid].empty()) break;
       }
-      // As in a join step: the input is freed before the survivors are
-      // gathered, each chunk as it empties.
-      JoinedRows().swap(rows);
-      size_t total_match_count = 0;
-      for (const auto& lr : local_rows) total_match_count += lr.size();
-      JoinedRows kept;
-      kept.reserve(total_match_count);
-      for (auto& lr : local_rows) {
-        for (auto& r : lr) kept.push_back(std::move(r));
-        JoinedRows().swap(lr);
-      }
-      rows.swap(kept);
-    } else {
-      JoinedRows kept;
-      for (JoinedRow& r : rows) {
-        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-        ctx.sources = &sources;
-        ctx.row = &r;
-        ctx.err = &err;
-        if (residual_true(ctx)) kept.push_back(r);
-        if (!err.empty()) return make_error(err);
-      }
-      rows.swap(kept);
+    });
+    for (const auto& l_err : local_errs) {
+      if (!l_err.empty()) return make_error(l_err);
     }
+    // As in a join step: the input is freed before the survivors are
+    // gathered, each chunk as it empties.
+    JoinedRows().swap(rows);
+    size_t total_match_count = 0;
+    for (const auto& lr : local_rows) total_match_count += lr.size();
+    JoinedRows kept;
+    kept.reserve(total_match_count);
+    for (auto& lr : local_rows) {
+      for (auto& r : lr) kept.push_back(std::move(r));
+      JoinedRows().swap(lr);
+    }
+    rows.swap(kept);
+  } else {
+    JoinedRows kept;
+    for (JoinedRow& r : rows) {
+      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+      ctx.sources = &sources;
+      ctx.row = &r;
+      ctx.err = &err;
+      if (residual_true(ctx)) kept.push_back(r);
+      if (!err.empty()) return make_error(err);
+    }
+    rows.swap(kept);
+  }
   }
   return std::nullopt;
 }
@@ -52473,14 +52608,65 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
         std::vector<const SqlExpr*> wp;
         collect_conjuncts(where.get(), &wp);
         for (const SqlExpr* w : wp) if (!pushed_where_parts.count(w)) { columnar = false; break; }
+        // The WHERE parts the star join did not apply, decided here over its arrays where they compile
+        // (conjunct_truths), in order, each over the rows the one before kept - then the whole WHERE is applied
+        // and the arrays go on to the grouping as they are (the fused join aggregate), with no row built of the
+        // 600k a part reading two tables (`i.price > c.salestype * 10`) used to need. A part that does not
+        // compile, and those after it, stay with the pass after the joins, over the rows kept so far.
+        if (!columnar && !sql_no_vx_env()) {
+          const uint64_t wt0 = vx_trace_on() ? hal_now_ns() : 0;
+          // A star with every link unique stays unexpanded (its fused aggregate walks the roots): the rows are
+          // made into arrays to be decided, and the roots of the rows kept become its roots - each root has at
+          // most one row, so walking them makes exactly those rows. Otherwise the arrays are the rows from here.
+          bool uniq = star_def != nullptr;
+          if (star_def) for (const StarLink& L : star_def->links) if (L.multi) uniq = false;
+          if (uniq) star_def->expand(&star_cols);
+          else star_expand_into(star_def, star_cols);
+          const size_t before = star_cols.empty() ? 0 : star_cols[0].size();
+          size_t applied = 0, left = 0;
+          for (const SqlExpr* w : wp) {
+            if (pushed_where_parts.count(w)) continue;
+            ++left;
+            if (applied + 1 != left || star_cols.empty()) continue;   // after one that did not compile: in order, later
+            std::vector<int8_t> t;
+            if (!conjunct_truths(db, sources, RowIds(star_cols), w, &t)) continue;
+            const size_t n = t.size();
+            size_t keep = 0;
+            for (size_t r = 0; r < n; ++r) keep += t[r] == 1;
+            for (auto& c : star_cols) {
+              size_t k = 0;
+              for (size_t r = 0; r < n; ++r) if (t[r] == 1) c[k++] = c[r];
+              c.resize(keep);
+            }
+            pushed_where_parts.insert(w);
+            ++applied;
+          }
+          const size_t after = star_cols.empty() ? 0 : star_cols[0].size();
+          if (applied == left && uniq) {
+            star_def->roots = star_cols[star_def->root];
+            star_def->bound = (double)star_def->roots.size();
+            std::vector<std::vector<uint32_t>>().swap(star_cols);
+            columnar = true;
+          } else if (uniq) {
+            star_def.reset();   // the arrays, filtered so far, are the rows
+          }
+          if (vx_trace_on() && applied)
+            vx_trace("join: star WHERE: " + std::to_string(applied) + " of " + std::to_string(left) + " part(s) over its arrays, " +
+                     std::to_string(before) + " -> " + std::to_string(after) + " rows, " +
+                     std::to_string((hal_now_ns() - wt0) / 1000) + " us");
+        }
       }
       if (columnar) {
         star_columnar = true;
         JoinedRows().swap(rows);
       } else {
+        const uint64_t xt0 = vx_trace_on() ? hal_now_ns() : 0;
         star_expand_into(star_def, star_cols);
+        const uint64_t xt1 = vx_trace_on() ? hal_now_ns() : 0;
         rows = star_materialize(star_cols);
         std::vector<std::vector<uint32_t>>().swap(star_cols);
+        if (vx_trace_on())
+          vx_trace("join: star rows made: expanded " + std::to_string((xt1 - xt0) / 1000) + " us, rows " + std::to_string((hal_now_ns() - xt1) / 1000) + " us");
       }
     } else if (!serr.empty()) {
       return make_error(serr);
