@@ -131,8 +131,12 @@ against the build before, the suites, the frame's bytes and alternating frame ti
 - **join** (done): `JoinPlan` + `join_steps` - the 1,375-line loop over the join steps (each step's own conditions,
   key and method choice, probe, outer-join padding, conjuncts in lanes after the step). The select function
   137,276 -> 89,801 bytes, `join_steps` 53,923; 4,933 of 5,046 functions the same size; frames 522/517/510 ->
-  521/510/503 ms. One step is still one iteration of that loop; splitting the step into its own operator with a
-  `JoinStepPlan` node comes with the compiler's needs.
+  521/510/503 ms. Each step is now its own operator: `JoinStepPlan` (the join's plan and the step's index) +
+  `join_step`, the loop body moved whole; `join_steps` is the loop over the steps. The loop's two exits became the
+  step's - the empty-rows break (`*stop`) and the skipped unread LEFT JOIN (an early return) - found by compiling the
+  body outside any loop; every return in it was already an error. Checked as the others: the sorted-line diff shows
+  only that glue, every suite and the frame's bytes identical, frames alternated 543/297/279 and 493/373/402 before,
+  521/282/294 and 513/287/267 after.
 - **project** (done): `ProjectPlan` + `project_rows` - the ungrouped statement's 391-line projection (stored
   columns from their cells, items as lanes, the interpreter for the rest, parallel chunks, the bounded emit, the
   batch and sink forms). The select function 89,801 -> 78,167 bytes, `project_rows` 22,425; 4,969 of 5,060

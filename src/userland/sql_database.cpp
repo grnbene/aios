@@ -7776,9 +7776,9 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     auto plan_key = [&](const char* method) {
       if (!kscope) return;
       kscope.reset();
-      PlanStep st = plan_step("subquery", t->name, method, ob->store.size(), hal_now_ns() - bt0);
-      st.sub = std::move(kplan.steps);
-      plan_add(std::move(st));
+      PlanStep ks = plan_step("subquery", t->name, method, ob->store.size(), hal_now_ns() - bt0);
+      ks.sub = std::move(kplan.steps);
+      plan_add(std::move(ks));
     };
     ExprPtr kc = clone_expr(A), ac = clone_expr(agg), wc = w ? clone_expr(w.get()) : nullptr;
     const std::string alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
@@ -48725,8 +48725,16 @@ struct JoinPlan {
   std::unordered_set<const SqlExpr*>* pushed_where_parts;
   std::string* err;
 };
-// Empty: the rows are joined, on to the WHERE and the emit; a result: an error to return.
-static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock& phases) {
+// One join step (docs/asql-vectorized-plan.md, stage 2b): source j + 1 joined to the rows so far - its own
+// conditions, its key and method, the probe, outer-join padding, the conjuncts in lanes after it - the rows replaced
+// by the step's. Empty: on to the next step (*stop: no step after this one); a result: an error to return.
+struct JoinStepPlan {
+  const JoinPlan* plan;
+  size_t j;
+};
+static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseClock& phases, bool* stop) {
+  const JoinPlan& plan = *sp.plan;
+  const size_t j = sp.j;
   SqlDatabase* const db = plan.db;
   const std::vector<QuerySource>& sources = *plan.sources;
   const std::vector<SelectItem>& items = *plan.items;
@@ -48747,1889 +48755,1898 @@ static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock
   std::unordered_set<const SqlExpr*>& pushed_where_parts = *plan.pushed_where_parts;
   std::string& err = *plan.err;
   (void)items; (void)last_right; (void)any_right; (void)group_by; (void)order_by; (void)limit; (void)offset; (void)src_referenced; (void)rows_hold; (void)phases;
-  for (size_t j = 0; !star_done && j < join_conditions.size(); ++j) {
-    const QuerySource& js = sources[j + 1];
-    JoinedRows next;
-    std::vector<QuerySource> partial(sources.begin(), sources.begin() + (j + 2));
-    const uint64_t jt0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
-    const char* join_method = "scan";
-    // Nothing left to join (inner or left, every later join keeps it empty):
-    // no index and no key-column read on the joined table. A RIGHT JOIN
-    // still to come keeps its own rows whatever came before.
-    if (rows.empty() && (int)j > last_right) break;
+  (void)star_done;   // the loop's: join_steps runs no step after a star join
+  const QuerySource& js = sources[j + 1];
+  JoinedRows next;
+  std::vector<QuerySource> partial(sources.begin(), sources.begin() + (j + 2));
+  const uint64_t jt0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
+  const char* join_method = "scan";
+  // Nothing left to join (inner or left, every later join keeps it empty):
+  // no index and no key-column read on the joined table. A RIGHT JOIN
+  // still to come keeps its own rows whatever came before.
+  if (rows.empty() && (int)j > last_right) { *stop = true; return std::nullopt; }
 
-    // `ON a.x = b.y` names a row of the table being joined, so it can be
-    // looked up instead of searched for. Without this every base row walked
-    // the whole of the joined table -- 65,177 rows of dispatch, per row, per
-    // join. The value side changes with the base row, which is fine: it is
-    // evaluated per base row and the lookup is still constant time.
-    std::vector<QuerySource> newonly(sources.begin() + (j + 1), sources.begin() + (j + 2));
-    std::vector<QuerySource> baseonly(sources.begin(), sources.begin() + (j + 1));
-    EvalCtx newctx; newctx.sources = &newonly;
-    EvalCtx basectx; basectx.sources = &baseonly;
-    std::vector<ProbeKey> jkeys;
-    {
-      std::vector<const SqlExpr*> parts;
-      collect_conjuncts(join_conditions[j].get(), &parts);
-      for (const SqlExpr* pc : parts) {
-        if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) continue;
-        for (int side = 0; side < 2; ++side) {
-          const SqlExpr* col = pc->args[side].get();
-          const SqlExpr* val = pc->args[1 - side].get();
-          if (!col || col->op != ExprOp::Column) continue;
-          size_t s2 = 0, c2 = 0;
-          if (lookup_column_here(newctx, *col, &s2, &c2) != ColumnLookup::Found) continue;
-          // The name must belong to the joined table alone. If a base table
-          // has it too, which side this equality really constrains is
-          // ambiguous, and guessing could drop rows the scan would keep.
-          size_t s3 = 0, c3 = 0;
-          if (lookup_column_here(basectx, *col, &s3, &c3) != ColumnLookup::NotFound) continue;
-          if (expr_reads_local(val, newctx)) continue;
-          ProbeKey k; k.column = (int)c2; k.value = val;
-          jkeys.push_back(k);
-          break;
-        }
+  // `ON a.x = b.y` names a row of the table being joined, so it can be
+  // looked up instead of searched for. Without this every base row walked
+  // the whole of the joined table -- 65,177 rows of dispatch, per row, per
+  // join. The value side changes with the base row, which is fine: it is
+  // evaluated per base row and the lookup is still constant time.
+  std::vector<QuerySource> newonly(sources.begin() + (j + 1), sources.begin() + (j + 2));
+  std::vector<QuerySource> baseonly(sources.begin(), sources.begin() + (j + 1));
+  EvalCtx newctx; newctx.sources = &newonly;
+  EvalCtx basectx; basectx.sources = &baseonly;
+  std::vector<ProbeKey> jkeys;
+  {
+    std::vector<const SqlExpr*> parts;
+    collect_conjuncts(join_conditions[j].get(), &parts);
+    for (const SqlExpr* pc : parts) {
+      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) continue;
+      for (int side = 0; side < 2; ++side) {
+        const SqlExpr* col = pc->args[side].get();
+        const SqlExpr* val = pc->args[1 - side].get();
+        if (!col || col->op != ExprOp::Column) continue;
+        size_t s2 = 0, c2 = 0;
+        if (lookup_column_here(newctx, *col, &s2, &c2) != ColumnLookup::Found) continue;
+        // The name must belong to the joined table alone. If a base table
+        // has it too, which side this equality really constrains is
+        // ambiguous, and guessing could drop rows the scan would keep.
+        size_t s3 = 0, c3 = 0;
+        if (lookup_column_here(basectx, *col, &s3, &c3) != ColumnLookup::NotFound) continue;
+        if (expr_reads_local(val, newctx)) continue;
+        ProbeKey k; k.column = (int)c2; k.value = val;
+        jkeys.push_back(k);
+        break;
       }
     }
+  }
 
-    const uint64_t jt_a = vx_trace_on() ? hal_now_ns() : 0;   // keys found
-    // A LEFT JOIN nothing in the query reads can be skipped (each base row
-    // padded with NULL) only if it cannot change how many rows there are:
-    // its ON equalities pin a primary or unique key of the joined table, so
-    // a base row meets at most one row there. Otherwise a base row meeting
-    // several becomes several rows - `SELECT COUNT(*) FROM stockmaster LEFT
-    // JOIN purchdata ON ...` counted 52,058 where MariaDB counts 136,124
-    // (several suppliers per item), and every inlined view over such a join
-    // (salesview) lost its fan-out the same way.
-    // (not for a join with a right side: a FULL JOIN is left and right, and skipping the table would also skip its
-    // unmatched rows, which the right side adds)
-    if (join_is_left[j] && !any_right && !src_referenced[j + 1] && js.table) {
-      std::set<std::string> keyed;
-      for (const ProbeKey& k : jkeys)
-        if (k.column >= 0 && (size_t)k.column < js.table->columns.size()) keyed.insert(lower_of(js.table->columns[(size_t)k.column].name));
-      auto covers = [&](const std::vector<std::string>& cols) {
-        if (cols.empty()) return false;
-        for (const auto& c : cols) if (!keyed.count(lower_of(c))) return false;
-        return true;
-      };
-      std::vector<std::string> pk;
-      for (const auto& c : js.table->columns) if (c.is_primary_key) pk.push_back(c.name);
-      bool at_most_one = covers(pk);
-      for (const auto& ix : js.table->indices) if (!at_most_one && ix.is_unique) at_most_one = covers(ix.columns);
-      if (at_most_one) {
-        for (JoinedRow& base : rows) base.parts.push_back(kNullRow);
-        continue;
-      }
-    }
-
-    // An equality between an expression of the joined table alone and one
-    // of the tables before it (`ON UPPER(sm.stockid) = ls.stockid`): no
-    // column to look up by, so the joined table's side is worked out once
-    // per row into a hash table and each earlier row probes it with its
-    // own side. The table holds every key the value could compare equal
-    // under (its collation key; its number), the probe gathers all of
-    // them, and the whole ON is checked on each candidate - so it can only
-    // narrow what the row-by-row loop would have tried. That loop ran the
-    // ON for every pair: 300k x 30k rows, past ten minutes.
-    const SqlExpr* xk_join = nullptr;
-    const SqlExpr* xk_base = nullptr;
-    bool var_key = false;
-    for (const ProbeKey& k : jkeys) if (expr_reads_local(k.value, basectx)) var_key = true;
-    // Column keys that hold one or two values (`s.map_id = p.map_id`, one map loaded) find every row: an
-    // expression key beside them (`s.seg_id + 0 = p.seg_id`) is the one that selects, so it is hashed instead.
-    bool keys_flat = !jkeys.empty() && js.table;
-    for (const ProbeKey& k : jkeys) {
-      if (!keys_flat) break;
-      if (k.column < 0 || (size_t)k.column >= js.table->col_data.size()) { keys_flat = false; break; }
-      const ColumnStore& kcs = js.table->col_data[(size_t)k.column];
-      if (!(kcs.encoding == ColumnEncoding::Constant || (vx::dict_coded(kcs) && vx::dict_size(kcs) <= 2))) keys_flat = false;
-    }
-    if ((!var_key || keys_flat) && join_conditions[j] && rows.size() >= 64 && js.table && js.table->row_count() >= 64) {
-      auto only_in = [&](const SqlExpr* e, const EvalCtx& in, const EvalCtx& notin) {
-        bool ok = true, any = false;
-        auto walk = [&](const SqlExpr* x, auto& self) -> void {
-          if (!x || !ok) return;
-          if (x->op == ExprOp::Subquery || x->op == ExprOp::Exists || x->op == ExprOp::Star ||
-              (x->op == ExprOp::In && !x->subquery_sql.empty()) ||
-              (x->op == ExprOp::Func && (is_aggregate_name(upper_of(x->name)) || vx::nondeterministic_func(upper_of(x->name))))) {
-            ok = false; return;
-          }
-          if (x->op == ExprOp::Column) {
-            if (x->name.rfind("@@", 0) == 0) return;
-            size_t s1 = 0, c1 = 0;
-            if (lookup_column_here(in, *x, &s1, &c1) != ColumnLookup::Found ||
-                lookup_column_here(notin, *x, &s1, &c1) != ColumnLookup::NotFound) { ok = false; return; }
-            any = true;
-            return;
-          }
-          for (const auto& a : x->args) self(a.get(), self);
-        };
-        walk(e, walk);
-        return ok && any;
-      };
-      std::vector<const SqlExpr*> xparts;
-      collect_conjuncts(join_conditions[j].get(), &xparts);
-      for (const SqlExpr* pc : xparts) {
-        if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) continue;
-        for (int side = 0; side < 2 && !xk_join; ++side) {
-          const SqlExpr* a = pc->args[side].get();
-          const SqlExpr* b = pc->args[1 - side].get();
-          // over one-valued column keys, the expression that selects is wanted, not another such column
-          if (keys_flat && var_key && a->op == ExprOp::Column) continue;
-          if (only_in(a, newctx, basectx) && only_in(b, basectx, newctx)) { xk_join = a; xk_base = b; }
-        }
-        if (xk_join) break;
-      }
-      if (vx_trace_on() && xk_join) vx_trace("join: +" + js.alias + " expression key hashed" + (keys_flat && var_key ? " (over one-valued column keys)" : ""));
-    }
-    // A key compared with a constant (`AND sm.discontinued = 0`) is a
-    // condition on the joined table, not a way to find a row's partners:
-    // looked up per row it handed every row all 28k discontinued = 0 rows
-    // to check. Where a real key exists (a column of an earlier table, or
-    // the expression key above) the constant ones are left to the ON check
-    // and the own-conditions selection.
-    if (xk_join) jkeys.clear();
-    else if (var_key)
-      jkeys.erase(std::remove_if(jkeys.begin(), jkeys.end(),
-                                 [&](const ProbeKey& k) { return !expr_reads_local(k.value, basectx); }),
-                  jkeys.end());
-
-    std::vector<const SqlExpr*> pushable;
-    if (where && (int)j > last_right) {
-      std::vector<const SqlExpr*> parts;
-      collect_conjuncts(where.get(), &parts);
-      EvalCtx pctx; pctx.sources = &partial;
-      for (const SqlExpr* p : parts) {
-        // Already applied to the base selection or an earlier join: those
-        // tables' values do not change as more are joined. Re-checking them
-        // cost every row the view's own WHERE again, once per join.
-        if (pushed_where_parts.count(p)) continue;
-        if (!expr_reads_local(p, pctx)) continue;
-        bool refs_later = false;
-        for (size_t si = j + 2; si < sources.size() && !refs_later; ++si) {
-          std::vector<QuerySource> later(sources.begin() + si, sources.begin() + si + 1);
-          EvalCtx lctx; lctx.sources = &later;
-          if (expr_reads_local(p, lctx)) refs_later = true;
-        }
-        if (!refs_later) {
-          pushable.push_back(p);
-          pushed_where_parts.insert(p);
-        }
-      }
-    }
-
-    // The joined table's own WHERE conditions (`WHERE purchdata.stockid = ?`
-    // on `suppliers JOIN purchdata`), selected once over that table - the
-    // vectorized way, through its index - instead of interpreted on every
-    // candidate row of every probe. Taken only when they leave few rows;
-    // each candidate is then checked against a bitmap. 91 suppliers x ~200
-    // purchdata rows each ran the predicate 18,167 times to keep one row:
-    // 3 ms of a 3.4 ms statement (MariaDB 0.4 ms).
-    std::vector<uint8_t> js_pass;                 // per row of the joined table
-    bool js_prefilter = false;
-    bool js_prefilter_where = false;              // WHERE conditions are among what js_pass checked
-    std::vector<uint32_t> js_rows;                // the rows js_pass admits, ascending
-    std::vector<const SqlExpr*> pushable_rest = pushable;   // what a candidate still has to pass
-    std::vector<const SqlExpr*> vp_deferred;                // WHERE conjuncts applied to the step's rows at once (below)
-    // The ON clause's conditions on the joined table alone (`LEFT JOIN
-    // locstock ls ON ls.stockid = sm.stockid AND ls.loccode = 'L001'`) select
-    // its rows the same way, for any join kind: a row failing them never
-    // matches, and the ON clause is still checked on every candidate. They
-    // were only checked per candidate, after a probe over the whole table -
-    // 300k candidates to keep 7,500 (MariaDB 3x faster on that statement).
-    std::vector<const SqlExpr*> on_own;
-    if (j < join_conditions.size() && join_conditions[j] && js.table) {
-      std::vector<QuerySource> js_src(1, js);
-      EvalCtx only; only.sources = &js_src;
-      std::vector<const SqlExpr*> parts;
-      collect_conjuncts(join_conditions[j].get(), &parts);
-      for (const SqlExpr* p : parts)
-        if (expr_only_reads(p, only) && !expr_has_subquery_raw(p)) on_own.push_back(p);
-    }
-    // (A huge joined table meeting a handful of base rows keeps the probe: an
-    // unindexed selective condition would scan it whole for a few candidates.)
-    if ((!pushable.empty() || !on_own.empty()) && !jkeys.empty() && js.table && !js.table->inferred_types && !rows.empty() &&
-        (js.table->row_count() <= (size_t(1) << 20) || rows.size() >= 256)) {
-      std::vector<QuerySource> js_src(1, js);
-      EvalCtx only; only.sources = &js_src;
-      ExprPtr conj;
-      std::vector<const SqlExpr*> rest;
-      auto add_conj = [&](const SqlExpr* p) {
-        ExprPtr c = clone_expr(p);   // compiling binds columns to this one-table scope
-        if (!conj) { conj = c; return; }
-        auto a = std::make_shared<SqlExpr>();
-        a->op = ExprOp::And;
-        a->args = {conj, c};
-        conj = a;
-      };
-      for (const SqlExpr* p : pushable) {
-        if (!expr_only_reads(p, only)) { rest.push_back(p); continue; }
-        add_conj(p);
-        js_prefilter_where = true;
-      }
-      for (const SqlExpr* p : on_own) add_conj(p);
-      bool aligned = true;
-      for (const auto& cs : js.table->col_data) if (cs.size() != js.table->row_count()) aligned = false;
-      if (conj && aligned) {
-        EvalCtx vbase; vbase.db = db; vbase.outer = outer_scope; vbase.sources = &js_src;
-        std::string verr;
-        vbase.err = &verr;
-        vx::Selection vsel;
-        const uint64_t pt0 = vx_trace_on() ? hal_now_ns() : 0;
-        // Stops once the selection is no narrower than a few rows per base
-        // row: past that the per-candidate check is the cheaper one.
-        const size_t cap = std::max<size_t>(4096, rows.size() * 4);
-        if (vx::select_rows(db, *js.table, conj.get(), only, vbase, &vsel, &verr, nullptr, cap, true) &&
-            verr.empty() && !vsel.all && vsel.count < cap) {
-          js_pass.assign(js.table->row_count(), 0);
-          for (const auto& h : vsel.hits)
-            for (uint32_t r : h)
-              if (r < js_pass.size()) js_pass[r] = 1;
-          for (size_t r = 0; r < js_pass.size(); ++r) if (js_pass[r]) js_rows.push_back((uint32_t)r);
-          js_prefilter = true;
-          pushable_rest = rest;
-          if (vx_trace_on())
-            vx_trace("join: +" + js.alias + " own conditions selected " + std::to_string(vsel.count) + " of " +
-                     std::to_string(js.table->row_count()) + " rows, " + std::to_string((hal_now_ns() - pt0) / 1000) + " us");
-        }
-      }
-    }
-
-    // Semi-join from the selective side. When this inner join's own
-    // conditions pick few rows of the joined table (one customer's orders
-    // among 969k), those rows' key values decide which base rows can match
-    // at all: an integer set, checked once per base row, before any probe.
-    // getOpenOrders(debtor) probed salesorders for all 8,716 open lines to
-    // keep 2 - 10 ms of its 11. A pure filter (a base row without a key in
-    // the set has no match), so INNER only, one typed-integer key each side.
-    if (!join_is_left[j] && rows.size() >= 1024 && jkeys.size() == 1 && !pushable.empty() &&
-        !js.table->inferred_types && jkeys[0].column >= 0 && (size_t)jkeys[0].column < js.table->col_data.size()) {
-      std::vector<QuerySource> js_src(1, js);
-      EvalCtx only; only.sources = &js_src;
-      ExprPtr conj;
-      for (const SqlExpr* p : pushable) {
-        if (!expr_only_reads(p, only)) continue;
-        ExprPtr c = clone_expr(p);   // compiling binds columns to this one-table scope
-        if (!conj) { conj = c; continue; }
-        auto a = std::make_shared<SqlExpr>();
-        a->op = ExprOp::And;
-        a->args = {conj, c};
-        conj = a;
-      }
-      const ColumnStore& jcs = js.table->col_data[(size_t)jkeys[0].column];
-      size_t bs = 0, bc = 0;
-      const SqlExpr* bv = jkeys[0].value;
-      bool aligned = jcs.size() == js.table->row_count();
-      for (const auto& cs : js.table->col_data) if (cs.size() != js.table->row_count()) aligned = false;
-      if (conj && aligned && vx::typed_integer(jcs) && bv && bv->op == ExprOp::Column &&
-          lookup_column_here(basectx, *bv, &bs, &bc) == ColumnLookup::Found && bs < baseonly.size() &&
-          baseonly[bs].table && !baseonly[bs].table->inferred_types && bc < baseonly[bs].table->col_data.size() &&
-          vx::typed_integer(baseonly[bs].table->col_data[bc]) &&
-          baseonly[bs].table->col_data[bc].size() == baseonly[bs].table->row_count()) {
-        EvalCtx vbase; vbase.db = db; vbase.outer = outer_scope; vbase.sources = &js_src;
-        std::string verr;
-        vbase.err = &verr;
-        vx::Selection vsel;
-        const uint64_t st0 = vx_trace_on() ? hal_now_ns() : 0;
-        // Stops as soon as it has as many rows as there are base rows: by
-        // then the filter is no narrower than the base, and scanning the rest
-        // of the table to find that out cost the location page 10 ms
-        // (`fromstkloc IN (...)` holds for most of salesorders' 969k rows).
-        if (vx::select_rows(db, *js.table, conj.get(), only, vbase, &vsel, &verr, nullptr, rows.size(), true) &&
-            verr.empty() && !vsel.all && vsel.count < rows.size()) {
-          std::unordered_set<int64_t> keys;
-          keys.reserve(vsel.count * 2 + 1);
-          for (const auto& h : vsel.hits)
-            for (uint32_t r : h)
-              if (!jcs.is_null(r)) keys.insert(vx::typed_int(jcs, r));
-          const ColumnStore& bcs = baseonly[bs].table->col_data[bc];
-          JoinedRows kept;
-          for (JoinedRow& b : rows) {
-            const size_t br = bs < b.parts.size() ? b.parts[bs] : kNullRow;
-            if (br == kNullRow || bcs.is_null(br)) continue;
-            if (keys.count(vx::typed_int(bcs, br))) kept.push_back(std::move(b));
-          }
-          if (vx_trace_on())
-            vx_trace("join: +" + js.alias + " semi-join from its own conditions: " + std::to_string(vsel.count) +
-                     " rows, " + std::to_string(rows.size()) + " -> " + std::to_string(kept.size()) + " base rows, " +
-                     std::to_string((hal_now_ns() - st0) / 1000) + " us");
-          rows.swap(kept);
-        }
-      }
-    }
-
-    struct PreparedJoinKey {
-      int column;
-      const SqlExpr* value;
-      std::shared_ptr<ProbeIndex> idx;
+  const uint64_t jt_a = vx_trace_on() ? hal_now_ns() : 0;   // keys found
+  // A LEFT JOIN nothing in the query reads can be skipped (each base row
+  // padded with NULL) only if it cannot change how many rows there are:
+  // its ON equalities pin a primary or unique key of the joined table, so
+  // a base row meets at most one row there. Otherwise a base row meeting
+  // several becomes several rows - `SELECT COUNT(*) FROM stockmaster LEFT
+  // JOIN purchdata ON ...` counted 52,058 where MariaDB counts 136,124
+  // (several suppliers per item), and every inlined view over such a join
+  // (salesview) lost its fan-out the same way.
+  // (not for a join with a right side: a FULL JOIN is left and right, and skipping the table would also skip its
+  // unmatched rows, which the right side adds)
+  if (join_is_left[j] && !any_right && !src_referenced[j + 1] && js.table) {
+    std::set<std::string> keyed;
+    for (const ProbeKey& k : jkeys)
+      if (k.column >= 0 && (size_t)k.column < js.table->columns.size()) keyed.insert(lower_of(js.table->columns[(size_t)k.column].name));
+    auto covers = [&](const std::vector<std::string>& cols) {
+      if (cols.empty()) return false;
+      for (const auto& c : cols) if (!keyed.count(lower_of(c))) return false;
+      return true;
     };
-    std::vector<PreparedJoinKey> prep_jkeys;
-    // Few rows meeting a big table: a key already indexed is used as it is;
-    // otherwise the matches are found by reading the key column (see
-    // semi_join_index) instead of indexing the whole table for them.
-    // The joined table's own conditions left few rows: the key index is
-    // built over those alone - a hash of a few thousand rows - instead of
-    // over every row whose key some base row has.
-    // When the base rows are many against the joined table (one in 32 or
-    // more), their keys reach most of it: the semi-join would hash most of
-    // the table for this statement alone, where the probe index is built
-    // once and kept for the next (30k items LEFT JOIN 300k stock rows:
-    // 190 ms a statement, every statement).
-    bool semi = db && !jkeys.empty() && rows.size() <= 65536 && js.table->row_count() >= 32768 &&
-                rows.size() * 32 < js.table->row_count();
-    // (An outer join only when the ON clause alone chose them: a row the ON
-    // clause matches and WHERE then drops is not NULL-padded, so those rows
-    // must still be found.)
-    const bool outer = join_is_left[j] || join_is_right[j];
-    if (js_prefilter && !(outer && js_prefilter_where) && !jkeys.empty() &&
-        js_rows.size() <= std::max<size_t>(65536, rows.size()) &&
-        js_rows.size() * 4 <= js.table->row_count()) {
-      if (auto idx = rows_join_index(*js.table, jkeys[0].column, js_rows)) {
-        prep_jkeys.push_back({jkeys[0].column, jkeys[0].value, idx});
-        for (size_t ki = 1; ki < jkeys.size(); ++ki) prep_jkeys.push_back({jkeys[ki].column, jkeys[ki].value, nullptr});
-        semi = false;
-        if (vx_trace_on()) vx_trace("join: +" + js.alias + " keyed over its " + std::to_string(js_rows.size()) + " selected rows");
-      }
+    std::vector<std::string> pk;
+    for (const auto& c : js.table->columns) if (c.is_primary_key) pk.push_back(c.name);
+    bool at_most_one = covers(pk);
+    for (const auto& ix : js.table->indices) if (!at_most_one && ix.is_unique) at_most_one = covers(ix.columns);
+    if (at_most_one) {
+      for (JoinedRow& base : rows) base.parts.push_back(kNullRow);
+      return std::nullopt;
     }
-    if (semi && prep_jkeys.empty()) {
-      int ready = -1;
-      for (size_t ki = 0; ki < jkeys.size() && ready < 0; ++ki)
-        if (vx::probe_index_ready(*js.table, jkeys[ki].column)) ready = (int)ki;
-      size_t use = ready >= 0 ? (size_t)ready : 0;
-      std::shared_ptr<ProbeIndex> idx;
-      if (ready >= 0) {
-        idx = SelectEngine::get_or_build_probe_index(db, *js.table, jkeys[use].column);
-      } else {
-        std::vector<Val> wants;
-        wants.reserve(rows.size());
-        EvalCtx wc; wc.db = db; wc.outer = outer_scope; wc.sources = &partial; wc.err = &err;
-        for (const JoinedRow& b : rows) {
-          wc.row = &b;
-          wants.push_back(eval_expr(jkeys[use].value, wc));
+  }
+
+  // An equality between an expression of the joined table alone and one
+  // of the tables before it (`ON UPPER(sm.stockid) = ls.stockid`): no
+  // column to look up by, so the joined table's side is worked out once
+  // per row into a hash table and each earlier row probes it with its
+  // own side. The table holds every key the value could compare equal
+  // under (its collation key; its number), the probe gathers all of
+  // them, and the whole ON is checked on each candidate - so it can only
+  // narrow what the row-by-row loop would have tried. That loop ran the
+  // ON for every pair: 300k x 30k rows, past ten minutes.
+  const SqlExpr* xk_join = nullptr;
+  const SqlExpr* xk_base = nullptr;
+  bool var_key = false;
+  for (const ProbeKey& k : jkeys) if (expr_reads_local(k.value, basectx)) var_key = true;
+  // Column keys that hold one or two values (`s.map_id = p.map_id`, one map loaded) find every row: an
+  // expression key beside them (`s.seg_id + 0 = p.seg_id`) is the one that selects, so it is hashed instead.
+  bool keys_flat = !jkeys.empty() && js.table;
+  for (const ProbeKey& k : jkeys) {
+    if (!keys_flat) break;
+    if (k.column < 0 || (size_t)k.column >= js.table->col_data.size()) { keys_flat = false; break; }
+    const ColumnStore& kcs = js.table->col_data[(size_t)k.column];
+    if (!(kcs.encoding == ColumnEncoding::Constant || (vx::dict_coded(kcs) && vx::dict_size(kcs) <= 2))) keys_flat = false;
+  }
+  if ((!var_key || keys_flat) && join_conditions[j] && rows.size() >= 64 && js.table && js.table->row_count() >= 64) {
+    auto only_in = [&](const SqlExpr* e, const EvalCtx& in, const EvalCtx& notin) {
+      bool ok = true, any = false;
+      auto walk = [&](const SqlExpr* x, auto& self) -> void {
+        if (!x || !ok) return;
+        if (x->op == ExprOp::Subquery || x->op == ExprOp::Exists || x->op == ExprOp::Star ||
+            (x->op == ExprOp::In && !x->subquery_sql.empty()) ||
+            (x->op == ExprOp::Func && (is_aggregate_name(upper_of(x->name)) || vx::nondeterministic_func(upper_of(x->name))))) {
+          ok = false; return;
         }
-        if (!err.empty()) return make_error(err);
-        idx = semi_join_index(*js.table, jkeys[use].column, wants);
+        if (x->op == ExprOp::Column) {
+          if (x->name.rfind("@@", 0) == 0) return;
+          size_t s1 = 0, c1 = 0;
+          if (lookup_column_here(in, *x, &s1, &c1) != ColumnLookup::Found ||
+              lookup_column_here(notin, *x, &s1, &c1) != ColumnLookup::NotFound) { ok = false; return; }
+          any = true;
+          return;
+        }
+        for (const auto& a : x->args) self(a.get(), self);
+      };
+      walk(e, walk);
+      return ok && any;
+    };
+    std::vector<const SqlExpr*> xparts;
+    collect_conjuncts(join_conditions[j].get(), &xparts);
+    for (const SqlExpr* pc : xparts) {
+      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) continue;
+      for (int side = 0; side < 2 && !xk_join; ++side) {
+        const SqlExpr* a = pc->args[side].get();
+        const SqlExpr* b = pc->args[1 - side].get();
+        // over one-valued column keys, the expression that selects is wanted, not another such column
+        if (keys_flat && var_key && a->op == ExprOp::Column) continue;
+        if (only_in(a, newctx, basectx) && only_in(b, basectx, newctx)) { xk_join = a; xk_base = b; }
       }
-      if (idx) {
-        prep_jkeys.push_back({jkeys[use].column, jkeys[use].value, idx});
-        for (size_t ki = 0; ki < jkeys.size(); ++ki)
-          if (ki != use) prep_jkeys.push_back({jkeys[ki].column, jkeys[ki].value, nullptr});
-      } else {
-        semi = false;
+      if (xk_join) break;
+    }
+    if (vx_trace_on() && xk_join) vx_trace("join: +" + js.alias + " expression key hashed" + (keys_flat && var_key ? " (over one-valued column keys)" : ""));
+  }
+  // A key compared with a constant (`AND sm.discontinued = 0`) is a
+  // condition on the joined table, not a way to find a row's partners:
+  // looked up per row it handed every row all 28k discontinued = 0 rows
+  // to check. Where a real key exists (a column of an earlier table, or
+  // the expression key above) the constant ones are left to the ON check
+  // and the own-conditions selection.
+  if (xk_join) jkeys.clear();
+  else if (var_key)
+    jkeys.erase(std::remove_if(jkeys.begin(), jkeys.end(),
+                               [&](const ProbeKey& k) { return !expr_reads_local(k.value, basectx); }),
+                jkeys.end());
+
+  std::vector<const SqlExpr*> pushable;
+  if (where && (int)j > last_right) {
+    std::vector<const SqlExpr*> parts;
+    collect_conjuncts(where.get(), &parts);
+    EvalCtx pctx; pctx.sources = &partial;
+    for (const SqlExpr* p : parts) {
+      // Already applied to the base selection or an earlier join: those
+      // tables' values do not change as more are joined. Re-checking them
+      // cost every row the view's own WHERE again, once per join.
+      if (pushed_where_parts.count(p)) continue;
+      if (!expr_reads_local(p, pctx)) continue;
+      bool refs_later = false;
+      for (size_t si = j + 2; si < sources.size() && !refs_later; ++si) {
+        std::vector<QuerySource> later(sources.begin() + si, sources.begin() + si + 1);
+        EvalCtx lctx; lctx.sources = &later;
+        if (expr_reads_local(p, lctx)) refs_later = true;
+      }
+      if (!refs_later) {
+        pushable.push_back(p);
+        pushed_where_parts.insert(p);
       }
     }
-    if (!semi && prep_jkeys.empty()) {
-      for (const ProbeKey& k : jkeys) {
-        std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, *js.table, k.column);
-        if (idx) prep_jkeys.push_back({k.column, k.value, idx});
+  }
+
+  // The joined table's own WHERE conditions (`WHERE purchdata.stockid = ?`
+  // on `suppliers JOIN purchdata`), selected once over that table - the
+  // vectorized way, through its index - instead of interpreted on every
+  // candidate row of every probe. Taken only when they leave few rows;
+  // each candidate is then checked against a bitmap. 91 suppliers x ~200
+  // purchdata rows each ran the predicate 18,167 times to keep one row:
+  // 3 ms of a 3.4 ms statement (MariaDB 0.4 ms).
+  std::vector<uint8_t> js_pass;                 // per row of the joined table
+  bool js_prefilter = false;
+  bool js_prefilter_where = false;              // WHERE conditions are among what js_pass checked
+  std::vector<uint32_t> js_rows;                // the rows js_pass admits, ascending
+  std::vector<const SqlExpr*> pushable_rest = pushable;   // what a candidate still has to pass
+  std::vector<const SqlExpr*> vp_deferred;                // WHERE conjuncts applied to the step's rows at once (below)
+  // The ON clause's conditions on the joined table alone (`LEFT JOIN
+  // locstock ls ON ls.stockid = sm.stockid AND ls.loccode = 'L001'`) select
+  // its rows the same way, for any join kind: a row failing them never
+  // matches, and the ON clause is still checked on every candidate. They
+  // were only checked per candidate, after a probe over the whole table -
+  // 300k candidates to keep 7,500 (MariaDB 3x faster on that statement).
+  std::vector<const SqlExpr*> on_own;
+  if (j < join_conditions.size() && join_conditions[j] && js.table) {
+    std::vector<QuerySource> js_src(1, js);
+    EvalCtx only; only.sources = &js_src;
+    std::vector<const SqlExpr*> parts;
+    collect_conjuncts(join_conditions[j].get(), &parts);
+    for (const SqlExpr* p : parts)
+      if (expr_only_reads(p, only) && !expr_has_subquery_raw(p)) on_own.push_back(p);
+  }
+  // (A huge joined table meeting a handful of base rows keeps the probe: an
+  // unindexed selective condition would scan it whole for a few candidates.)
+  if ((!pushable.empty() || !on_own.empty()) && !jkeys.empty() && js.table && !js.table->inferred_types && !rows.empty() &&
+      (js.table->row_count() <= (size_t(1) << 20) || rows.size() >= 256)) {
+    std::vector<QuerySource> js_src(1, js);
+    EvalCtx only; only.sources = &js_src;
+    ExprPtr conj;
+    std::vector<const SqlExpr*> rest;
+    auto add_conj = [&](const SqlExpr* p) {
+      ExprPtr c = clone_expr(p);   // compiling binds columns to this one-table scope
+      if (!conj) { conj = c; return; }
+      auto a = std::make_shared<SqlExpr>();
+      a->op = ExprOp::And;
+      a->args = {conj, c};
+      conj = a;
+    };
+    for (const SqlExpr* p : pushable) {
+      if (!expr_only_reads(p, only)) { rest.push_back(p); continue; }
+      add_conj(p);
+      js_prefilter_where = true;
+    }
+    for (const SqlExpr* p : on_own) add_conj(p);
+    bool aligned = true;
+    for (const auto& cs : js.table->col_data) if (cs.size() != js.table->row_count()) aligned = false;
+    if (conj && aligned) {
+      EvalCtx vbase; vbase.db = db; vbase.outer = outer_scope; vbase.sources = &js_src;
+      std::string verr;
+      vbase.err = &verr;
+      vx::Selection vsel;
+      const uint64_t pt0 = vx_trace_on() ? hal_now_ns() : 0;
+      // Stops once the selection is no narrower than a few rows per base
+      // row: past that the per-candidate check is the cheaper one.
+      const size_t cap = std::max<size_t>(4096, rows.size() * 4);
+      if (vx::select_rows(db, *js.table, conj.get(), only, vbase, &vsel, &verr, nullptr, cap, true) &&
+          verr.empty() && !vsel.all && vsel.count < cap) {
+        js_pass.assign(js.table->row_count(), 0);
+        for (const auto& h : vsel.hits)
+          for (uint32_t r : h)
+            if (r < js_pass.size()) js_pass[r] = 1;
+        for (size_t r = 0; r < js_pass.size(); ++r) if (js_pass[r]) js_rows.push_back((uint32_t)r);
+        js_prefilter = true;
+        pushable_rest = rest;
+        if (vx_trace_on())
+          vx_trace("join: +" + js.alias + " own conditions selected " + std::to_string(vsel.count) + " of " +
+                   std::to_string(js.table->row_count()) + " rows, " + std::to_string((hal_now_ns() - pt0) / 1000) + " us");
       }
     }
+  }
 
-    // RIGHT JOIN: which rows of the joined table some earlier row met on the
-    // ON clause (set where a candidate is found to match, before WHERE),
-    // so the rest can be emitted NULL-padded once the step is done.
-    std::unique_ptr<std::atomic<uint8_t>[]> right_seen_buf;
-    std::atomic<uint8_t>* right_seen = nullptr;
-    size_t right_n = 0;
-    if (join_is_right[j] && js.table) {
-      right_n = js.table->row_count();
-      right_seen_buf.reset(new std::atomic<uint8_t>[right_n > 0 ? right_n : 1]());
-      right_seen = right_seen_buf.get();
+  // Semi-join from the selective side. When this inner join's own
+  // conditions pick few rows of the joined table (one customer's orders
+  // among 969k), those rows' key values decide which base rows can match
+  // at all: an integer set, checked once per base row, before any probe.
+  // getOpenOrders(debtor) probed salesorders for all 8,716 open lines to
+  // keep 2 - 10 ms of its 11. A pure filter (a base row without a key in
+  // the set has no match), so INNER only, one typed-integer key each side.
+  if (!join_is_left[j] && rows.size() >= 1024 && jkeys.size() == 1 && !pushable.empty() &&
+      !js.table->inferred_types && jkeys[0].column >= 0 && (size_t)jkeys[0].column < js.table->col_data.size()) {
+    std::vector<QuerySource> js_src(1, js);
+    EvalCtx only; only.sources = &js_src;
+    ExprPtr conj;
+    for (const SqlExpr* p : pushable) {
+      if (!expr_only_reads(p, only)) continue;
+      ExprPtr c = clone_expr(p);   // compiling binds columns to this one-table scope
+      if (!conj) { conj = c; continue; }
+      auto a = std::make_shared<SqlExpr>();
+      a->op = ExprOp::And;
+      a->args = {conj, c};
+      conj = a;
     }
-
-    // Text meets text by collation, a number meets a number or text by
-    // value (text read as a number): the joined side's text by collation
-    // key (hash_tbl) and by the number it reads as (xk_tnum), its numbers
-    // by value (xk_num). A text probe looks in hash_tbl and xk_num, a
-    // number in xk_num and xk_tnum.
-    std::unordered_map<double, std::vector<uint32_t>> xk_num, xk_tnum;
-    bool xk_has_text = false;   // the expression hash holds a text-keyed row (its equality is then checked per candidate)
-
-    // High-Performance Multi-Key Parallel Indexed Probe / Hash Join
-    const uint64_t jt_b = vx_trace_on() ? hal_now_ns() : 0;   // indexes / own-condition selection ready
-    bool hash_join_done = false;
-    // An inner join of a table of few rows (a settings row) with no key to probe: each base row gets each of
-    // them, no per-row context. Its ON (an inner join's is a filter on the pairs, as a WHERE is) and the WHERE
-    // conjuncts pushed to this step apply after it, at once, where they compile; the rest are checked here.
-    // A LATERAL generate_series over the base rows (QuerySource::series, SeriesSpec): each base row's range made
-    // from its own bounds, the numbers going into the series table as the rows are made. A CROSS JOIN drops a
-    // base row whose range is empty, a LEFT JOIN pads it; an inner join's ON and the pushed WHERE conjuncts apply
-    // to the rows at once where they compile (vp_deferred), else to each; a LEFT JOIN's ON decides each
-    // candidate, as the probes do.
-    if (!hash_join_done && js.series && js.series->table && !right_seen) {
-      if (join_is_right[j]) return make_error("RIGHT JOIN LATERAL generate_series(...) is not supported");
-      const SeriesSpec& sp = *js.series;
-      SqlTable* const st = sp.table;
-      const size_t nb = rows.size();
-      const size_t na = sp.args.size();
+    const ColumnStore& jcs = js.table->col_data[(size_t)jkeys[0].column];
+    size_t bs = 0, bc = 0;
+    const SqlExpr* bv = jkeys[0].value;
+    bool aligned = jcs.size() == js.table->row_count();
+    for (const auto& cs : js.table->col_data) if (cs.size() != js.table->row_count()) aligned = false;
+    if (conj && aligned && vx::typed_integer(jcs) && bv && bv->op == ExprOp::Column &&
+        lookup_column_here(basectx, *bv, &bs, &bc) == ColumnLookup::Found && bs < baseonly.size() &&
+        baseonly[bs].table && !baseonly[bs].table->inferred_types && bc < baseonly[bs].table->col_data.size() &&
+        vx::typed_integer(baseonly[bs].table->col_data[bc]) &&
+        baseonly[bs].table->col_data[bc].size() == baseonly[bs].table->row_count()) {
+      EvalCtx vbase; vbase.db = db; vbase.outer = outer_scope; vbase.sources = &js_src;
+      std::string verr;
+      vbase.err = &verr;
+      vx::Selection vsel;
       const uint64_t st0 = vx_trace_on() ? hal_now_ns() : 0;
-      // the bounds over every base row at once where they compile; else each row's through the interpreter
-      std::vector<vp::Column> lanes(na);
-      std::vector<char> laned(na, 0);
-      if (nb >= 64) {
-        EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
-        vp::Lanes shared;
-        for (size_t a = 0; a < na; ++a) {
-          const vp::Prog* P = vp::program_for(sp.args[a].get(), bctx);
-          std::string verr;
-          if (P && vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, nb, &lanes[a], &verr, &shared)) laned[a] = 1;
+      // Stops as soon as it has as many rows as there are base rows: by
+      // then the filter is no narrower than the base, and scanning the rest
+      // of the table to find that out cost the location page 10 ms
+      // (`fromstkloc IN (...)` holds for most of salesorders' 969k rows).
+      if (vx::select_rows(db, *js.table, conj.get(), only, vbase, &vsel, &verr, nullptr, rows.size(), true) &&
+          verr.empty() && !vsel.all && vsel.count < rows.size()) {
+        std::unordered_set<int64_t> keys;
+        keys.reserve(vsel.count * 2 + 1);
+        for (const auto& h : vsel.hits)
+          for (uint32_t r : h)
+            if (!jcs.is_null(r)) keys.insert(vx::typed_int(jcs, r));
+        const ColumnStore& bcs = baseonly[bs].table->col_data[bc];
+        JoinedRows kept;
+        for (JoinedRow& b : rows) {
+          const size_t br = bs < b.parts.size() ? b.parts[bs] : kNullRow;
+          if (br == kNullRow || bcs.is_null(br)) continue;
+          if (keys.count(vx::typed_int(bcs, br))) kept.push_back(std::move(b));
         }
+        if (vx_trace_on())
+          vx_trace("join: +" + js.alias + " semi-join from its own conditions: " + std::to_string(vsel.count) +
+                   " rows, " + std::to_string(rows.size()) + " -> " + std::to_string(kept.size()) + " base rows, " +
+                   std::to_string((hal_now_ns() - st0) / 1000) + " us");
+        rows.swap(kept);
       }
-      bool all_int = true;
-      for (size_t a = 0; a < na; ++a) if (!laned[a] || lanes[a].ty != vp::Ty::I64 || lanes[a].uns) all_int = false;
-      std::vector<SeriesRange> rg(nb);
-      int scale = 0;
-      unsigned long long total = 0;
-      {
-        EvalCtx ictx; ictx.db = db; ictx.outer = outer_scope; ictx.sources = &baseonly; ictx.err = &err;
-        std::vector<std::string> vals(na);
-        for (size_t bi = 0; bi < nb; ++bi) {
-          SeriesRange& r = rg[bi];
-          if (all_int) {
-            bool null = false;
-            for (size_t a = 0; a < na; ++a) if (lanes[a].is_null(bi)) null = true;
-            if (null) continue;
-            if (!series_count(lanes[0].i[bi], lanes[1].i[bi], na == 3 ? lanes[2].i[bi] : 1, &r, &err)) return make_error(err);
-          } else {
-            for (size_t a = 0; a < na; ++a) {
-              if (laned[a]) { vals[a] = lanes[a].is_null(bi) ? sql_null() : lanes[a].text(bi); continue; }
-              ictx.row = &rows[bi];
-              Val v = eval_expr(sp.args[a].get(), ictx);
-              if (!err.empty()) return make_error(err);
-              vals[a] = v.null ? sql_null() : v.str();
-            }
-            if (!series_range_of(vals, &r, &err)) return make_error(err);
-          }
-          total += r.n;
-          if (r.scale > scale) scale = r.scale;
-          if (total > 100000000ull) return make_error("generate_series would make over 100,000,000 rows");
-        }
+    }
+  }
+
+  struct PreparedJoinKey {
+    int column;
+    const SqlExpr* value;
+    std::shared_ptr<ProbeIndex> idx;
+  };
+  std::vector<PreparedJoinKey> prep_jkeys;
+  // Few rows meeting a big table: a key already indexed is used as it is;
+  // otherwise the matches are found by reading the key column (see
+  // semi_join_index) instead of indexing the whole table for them.
+  // The joined table's own conditions left few rows: the key index is
+  // built over those alone - a hash of a few thousand rows - instead of
+  // over every row whose key some base row has.
+  // When the base rows are many against the joined table (one in 32 or
+  // more), their keys reach most of it: the semi-join would hash most of
+  // the table for this statement alone, where the probe index is built
+  // once and kept for the next (30k items LEFT JOIN 300k stock rows:
+  // 190 ms a statement, every statement).
+  bool semi = db && !jkeys.empty() && rows.size() <= 65536 && js.table->row_count() >= 32768 &&
+              rows.size() * 32 < js.table->row_count();
+  // (An outer join only when the ON clause alone chose them: a row the ON
+  // clause matches and WHERE then drops is not NULL-padded, so those rows
+  // must still be found.)
+  const bool outer = join_is_left[j] || join_is_right[j];
+  if (js_prefilter && !(outer && js_prefilter_where) && !jkeys.empty() &&
+      js_rows.size() <= std::max<size_t>(65536, rows.size()) &&
+      js_rows.size() * 4 <= js.table->row_count()) {
+    if (auto idx = rows_join_index(*js.table, jkeys[0].column, js_rows)) {
+      prep_jkeys.push_back({jkeys[0].column, jkeys[0].value, idx});
+      for (size_t ki = 1; ki < jkeys.size(); ++ki) prep_jkeys.push_back({jkeys[ki].column, jkeys[ki].value, nullptr});
+      semi = false;
+      if (vx_trace_on()) vx_trace("join: +" + js.alias + " keyed over its " + std::to_string(js_rows.size()) + " selected rows");
+    }
+  }
+  if (semi && prep_jkeys.empty()) {
+    int ready = -1;
+    for (size_t ki = 0; ki < jkeys.size() && ready < 0; ++ki)
+      if (vx::probe_index_ready(*js.table, jkeys[ki].column)) ready = (int)ki;
+    size_t use = ready >= 0 ? (size_t)ready : 0;
+    std::shared_ptr<ProbeIndex> idx;
+    if (ready >= 0) {
+      idx = SelectEngine::get_or_build_probe_index(db, *js.table, jkeys[use].column);
+    } else {
+      std::vector<Val> wants;
+      wants.reserve(rows.size());
+      EvalCtx wc; wc.db = db; wc.outer = outer_scope; wc.sources = &partial; wc.err = &err;
+      for (const JoinedRow& b : rows) {
+        wc.row = &b;
+        wants.push_back(eval_expr(jkeys[use].value, wc));
       }
-      // the series table: every range's numbers in order, as integers, or as decimals at the largest scale
-      st->clear_rows();
-      st->ensure_columns();
-      st->columns[0].type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
-      st->columns[0].scale = scale;
-      bool typed = false;
-      if (scale == 0 && !st->col_data.empty()) {
-        std::vector<int64_t> v;
-        v.reserve((size_t)total);
-        for (size_t bi = 0; bi < nb; ++bi) {
-          long long x = rg[bi].start;
-          for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) v.push_back(x);
-        }
-        std::vector<uint8_t> nul(v.size(), 0);
-        ColumnStore& cs = st->col_data[0];
-        if (cs.begin_typed(ColumnEncoding::TypedInt64) && cs.adopt_ints(std::move(v), nul)) {
-          st->mutation_seq = sql_next_mutation_seq();
-          typed = true;
-        }
+      if (!err.empty()) return make_error(err);
+      idx = semi_join_index(*js.table, jkeys[use].column, wants);
+    }
+    if (idx) {
+      prep_jkeys.push_back({jkeys[use].column, jkeys[use].value, idx});
+      for (size_t ki = 0; ki < jkeys.size(); ++ki)
+        if (ki != use) prep_jkeys.push_back({jkeys[ki].column, jkeys[ki].value, nullptr});
+    } else {
+      semi = false;
+    }
+  }
+  if (!semi && prep_jkeys.empty()) {
+    for (const ProbeKey& k : jkeys) {
+      std::shared_ptr<ProbeIndex> idx = SelectEngine::get_or_build_probe_index(db, *js.table, k.column);
+      if (idx) prep_jkeys.push_back({k.column, k.value, idx});
+    }
+  }
+
+  // RIGHT JOIN: which rows of the joined table some earlier row met on the
+  // ON clause (set where a candidate is found to match, before WHERE),
+  // so the rest can be emitted NULL-padded once the step is done.
+  std::unique_ptr<std::atomic<uint8_t>[]> right_seen_buf;
+  std::atomic<uint8_t>* right_seen = nullptr;
+  size_t right_n = 0;
+  if (join_is_right[j] && js.table) {
+    right_n = js.table->row_count();
+    right_seen_buf.reset(new std::atomic<uint8_t>[right_n > 0 ? right_n : 1]());
+    right_seen = right_seen_buf.get();
+  }
+
+  // Text meets text by collation, a number meets a number or text by
+  // value (text read as a number): the joined side's text by collation
+  // key (hash_tbl) and by the number it reads as (xk_tnum), its numbers
+  // by value (xk_num). A text probe looks in hash_tbl and xk_num, a
+  // number in xk_num and xk_tnum.
+  std::unordered_map<double, std::vector<uint32_t>> xk_num, xk_tnum;
+  bool xk_has_text = false;   // the expression hash holds a text-keyed row (its equality is then checked per candidate)
+
+  // High-Performance Multi-Key Parallel Indexed Probe / Hash Join
+  const uint64_t jt_b = vx_trace_on() ? hal_now_ns() : 0;   // indexes / own-condition selection ready
+  bool hash_join_done = false;
+  // An inner join of a table of few rows (a settings row) with no key to probe: each base row gets each of
+  // them, no per-row context. Its ON (an inner join's is a filter on the pairs, as a WHERE is) and the WHERE
+  // conjuncts pushed to this step apply after it, at once, where they compile; the rest are checked here.
+  // A LATERAL generate_series over the base rows (QuerySource::series, SeriesSpec): each base row's range made
+  // from its own bounds, the numbers going into the series table as the rows are made. A CROSS JOIN drops a
+  // base row whose range is empty, a LEFT JOIN pads it; an inner join's ON and the pushed WHERE conjuncts apply
+  // to the rows at once where they compile (vp_deferred), else to each; a LEFT JOIN's ON decides each
+  // candidate, as the probes do.
+  if (!hash_join_done && js.series && js.series->table && !right_seen) {
+    if (join_is_right[j]) return make_error("RIGHT JOIN LATERAL generate_series(...) is not supported");
+    const SeriesSpec& sp = *js.series;
+    SqlTable* const st = sp.table;
+    const size_t nb = rows.size();
+    const size_t na = sp.args.size();
+    const uint64_t st0 = vx_trace_on() ? hal_now_ns() : 0;
+    // the bounds over every base row at once where they compile; else each row's through the interpreter
+    std::vector<vp::Column> lanes(na);
+    std::vector<char> laned(na, 0);
+    if (nb >= 64) {
+      EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
+      vp::Lanes shared;
+      for (size_t a = 0; a < na; ++a) {
+        const vp::Prog* P = vp::program_for(sp.args[a].get(), bctx);
+        std::string verr;
+        if (P && vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, nb, &lanes[a], &verr, &shared)) laned[a] = 1;
       }
-      if (!typed) {
-        std::vector<SqlRow> srows;
-        srows.reserve((size_t)total);
-        for (size_t bi = 0; bi < nb; ++bi) {
-          long long x = rg[bi].start;
-          for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) srows.push_back(SqlRow{{series_text(x, rg[bi].scale)}});
-        }
-        append_result_rows(st, srows);
-      }
-      // what the rows have to pass: an inner join's ON conjuncts and the pushed WHERE conjuncts, at once where
-      // they compile (vp_deferred), else each; a LEFT JOIN's ON conjuncts decide each candidate
-      std::vector<const SqlExpr*> on_parts;
-      if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &on_parts);
-      std::vector<const SqlExpr*> conds = pushable;
-      if (!join_is_left[j]) for (const SqlExpr* p : on_parts) conds.push_back(p);
-      std::vector<const SqlExpr*> plain;
-      {
-        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-        for (const SqlExpr* p : conds) {
-          bool retry = false;
-          const vp::Prog* P = (unsigned long long)nb * (total ? total / nb : 1) >= 256 && vp::enabled() ? vp::program_for(p, pctx, &retry) : nullptr;
-          if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
-        }
-      }
-      const std::vector<const SqlExpr*>& on_each = join_is_left[j] ? on_parts : std::vector<const SqlExpr*>();
-      if (!reserve_rows((size_t)total + (join_is_left[j] ? nb : 0), sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-      next.reserve((size_t)total + (join_is_left[j] ? nb : 0));
-      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
-      auto passes = [&](JoinedRow& cand, const std::vector<const SqlExpr*>& ps) {
-        if (ps.empty()) return true;
-        ctx.row = &cand;
-        for (const SqlExpr* p : ps) if (!predicate_true(p, ctx)) return false;
-        return true;
-      };
-      size_t id = 0;
+    }
+    bool all_int = true;
+    for (size_t a = 0; a < na; ++a) if (!laned[a] || lanes[a].ty != vp::Ty::I64 || lanes[a].uns) all_int = false;
+    std::vector<SeriesRange> rg(nb);
+    int scale = 0;
+    unsigned long long total = 0;
+    {
+      EvalCtx ictx; ictx.db = db; ictx.outer = outer_scope; ictx.sources = &baseonly; ictx.err = &err;
+      std::vector<std::string> vals(na);
       for (size_t bi = 0; bi < nb; ++bi) {
-        const unsigned long long n = rg[bi].n;
-        bool matched = false;
-        for (unsigned long long k = 0; k < n; ++k) {
-          JoinedRow cand = (k + 1 == n && !join_is_left[j]) ? std::move(rows[bi]) : rows[bi];
-          cand.parts.push_back(id++);
-          if (!on_each.empty() && !passes(cand, on_each)) { if (!err.empty()) return make_error(err); continue; }
-          matched = true;
-          if (!plain.empty() && !passes(cand, plain)) { if (!err.empty()) return make_error(err); continue; }
-          next.push_back(std::move(cand));
-        }
-        if (!matched && join_is_left[j]) {
-          JoinedRow padded = std::move(rows[bi]);
-          padded.parts.push_back(kNullRow);
-          if (!plain.empty() && !passes(padded, plain)) { if (!err.empty()) return make_error(err); continue; }
-          next.push_back(std::move(padded));
-        }
-      }
-      JoinedRows().swap(rows);
-      if (vx_trace_on())
-        vx_trace("join: +" + js.alias + " series: " + std::to_string(total) + " rows from " + std::to_string(nb) + " base rows (bounds " +
-                 (all_int ? "in integer lanes" : "as text") + ") in " + std::to_string((hal_now_ns() - st0) / 1000) + " us");
-      join_method = "series";
-      hash_join_done = true;
-    }
-    if (!hash_join_done && jkeys.empty() && !xk_join && !join_is_left[j] && !join_is_right[j] && js.table && !right_seen &&
-        js.table->row_count() <= 64 && !rows.empty()) {
-      const size_t nj = js.table->row_count();
-      std::vector<const SqlExpr*> conds = pushable;
-      if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &conds);
-      std::vector<const SqlExpr*> plain;
-      if (rows.size() >= 256 && vp::enabled()) {
-        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-        for (const SqlExpr* p : conds) {
-          bool retry = false;
-          const vp::Prog* P = vp::program_for(p, pctx, &retry);
-          if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
-        }
-      } else {
-        plain = conds;
-      }
-      if (nj == 1 && plain.empty()) {
-        // one row and nothing to check here: every row takes it where it is (no row copied, no second list)
-        for (JoinedRow& base : rows) base.parts.push_back(0);
-        next.swap(rows);
-      } else {
-      if (!reserve_rows(rows.size() * nj, sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-      next.reserve(rows.size() * nj);
-      EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
-      for (JoinedRow& base : rows) {
-        for (size_t ri = 0; ri < nj; ++ri) {
-          JoinedRow cand = ri + 1 == nj ? std::move(base) : base;
-          cand.parts.push_back(ri);
-          if (!plain.empty()) {
-            ctx.row = &cand;
-            bool keep = true;
-            for (const SqlExpr* p : plain) if (!predicate_true(p, ctx)) { keep = false; break; }
-            if (!err.empty()) return make_error(err);
-            if (!keep) continue;
-          }
-          next.push_back(std::move(cand));
-        }
-      }
-      }
-      join_method = "small table";
-      hash_join_done = true;
-    }
-    // js_pass is exactly the ON clause's own conditions (no WHERE part folded in): a row failing it is no match
-    const bool pass_is_on = js_prefilter && !js_prefilter_where;
-    if (!hash_join_done && (!prep_jkeys.empty() || xk_join)) {
-      bool has_extra_join = false;
-      std::vector<const SqlExpr*> jparts;
-      collect_conjuncts(join_conditions[j].get(), &jparts);
-      if (jparts.size() != prep_jkeys.size() || xk_join) has_extra_join = true;
-      // The ON conjuncts a candidate is checked against: every one, less those an inner join leaves to the
-      // vectorized pass after the step (on_deferred) - a conjunct that compiles as a program and is no key
-      // equality the probe already answers. A LEFT or RIGHT join's ON decides its padding, so it keeps all.
-      std::vector<const SqlExpr*> on_check = jparts;
-      std::vector<const SqlExpr*> on_deferred;
-      if (has_extra_join && !join_is_left[j] && !join_is_right[j] && rows.size() >= 256 && vp::enabled()) {
-        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-        for (const SqlExpr* pc : jparts) {
-          bool is_key = false;
-          for (const PreparedJoinKey& k : prep_jkeys)
-            if (pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == k.value || pc->args[1].get() == k.value)) is_key = true;
-          if (xk_join && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == xk_join || pc->args[1].get() == xk_join)) is_key = true;
-          if (is_key) continue;
-          const vp::Prog* P = vp::program_for(pc, pctx);
-          if (!P || P->out().ty == vp::Ty::Str) continue;
-          on_deferred.push_back(pc);
-        }
-        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_deferred.begin(), on_deferred.end(), pc) != on_deferred.end(); }), on_check.end());
-        for (const SqlExpr* pc : on_deferred) vp_deferred.push_back(pc);
-      }
-      // the conjunct that is the expression key's equality: settled by the hash where this probe's matches came
-      // from exact numbers alone (xk_exact), so it is not interpreted again per candidate
-      const SqlExpr* xk_conj = nullptr;
-      if (xk_join)
-        for (const SqlExpr* pc : jparts)
-          if (pc->op == ExprOp::Eq && pc->args.size() == 2 &&
-              ((pc->args[0].get() == xk_join && pc->args[1].get() == xk_base) || (pc->args[1].get() == xk_join && pc->args[0].get() == xk_base)))
-            xk_conj = pc;
-      thread_local bool xk_exact = false;
-      auto on_true = [&](EvalCtx& ctx) {
-        for (const SqlExpr* pc : on_check) {
-          if (pc == xk_conj && xk_exact) continue;
-          if (!predicate_true(pc, ctx)) return false;
-        }
-        return true;
-      };
-
-      // The indexed key whose column tells rows apart best: a typed integer column, else the dictionary with
-      // the most entries. The first indexed key took `ON s.map_id = p.map_id AND s.seg_id = p.seg_id` by
-      // map_id - one value, every row a candidate, each then checked on seg_id.
-      int best_ki = -1;
-      {
-        size_t best_ndv = 0;
-        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-          if (!prep_jkeys[ki].idx) continue;
-          size_t ndv = 1;
-          if (prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
-            const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-            ndv = vx::typed_numeric(kcs) ? SIZE_MAX : vx::dict_coded(kcs) ? vx::dict_size(kcs) : (size_t)1 << 20;
-          }
-          // The index's own count of distinct numbers where it has one: two typed integer keys both read as SIZE_MAX
-          // and the first in the ON won - `stockmoves.orderlineref` (4 values) over `transno`, each of 47k open
-          // order lines then walking 290k candidates: 145 s of a 150 s open-orders page, 0.2 s by transno.
-          if (prep_jkeys[ki].idx && prep_jkeys[ki].idx->by_number.size() > 0) ndv = prep_jkeys[ki].idx->by_number.size();
-          if (best_ki < 0 || ndv > best_ndv) { best_ki = (int)ki; best_ndv = ndv; }
-        }
-      }
-
-      std::unordered_map<std::string, std::vector<uint32_t>> hash_tbl;
-      // A hash table over the joined table's rows, built for this statement:
-      // a node, a key string and a row list per row.
-      QueryMemHold hash_hold;   // given back when this join step is done
-      if ((xk_join || best_ki < 0) && !hash_hold.reserve(js.table->row_count() * 112))
-        return make_error("Query execution was interrupted");
-      if (xk_join) {
-        // A copy: evaluating binds its columns to the one-table scope.
-        ExprPtr xk_copy = clone_expr(xk_join);
-        EvalCtx xc; xc.db = db; xc.outer = outer_scope; xc.sources = &newonly; xc.err = &err;
-        JoinedRow xr;
-        xr.parts.push_back(0);
-        xc.row = &xr;
-        hash_tbl.reserve(std::min(js.table->row_count(), (size_t)1 << 20));
-        xk_has_text = false;
-        // the expression over every row of the joined table at once, where it compiles (vp): its numbers go
-        // straight into the hash; a text-valued key, or one that does not compile, is interpreted per row
-        bool vp_built = false;
-        if (const vp::Prog* P = vp::program_for(xk_copy.get(), xc)) {
-          if (P->out().ty != vp::Ty::Str) {
-            vp::Column col;
-            std::string verr;
-            const size_t nrows = js.table->row_count();
-            if (vp::eval_column_ids(*P, [](size_t r) { return r; }, nrows, &col, &verr)) {
-              for (size_t ri = 0; ri < nrows; ++ri) {
-                if (col.is_null(ri)) continue;
-                const double d = col.ty == vp::Ty::I64 ? (col.uns ? (double)(uint64_t)col.i[ri] : (double)col.i[ri]) : col.f[ri];
-                xk_num[d == 0 ? 0.0 : d].push_back((uint32_t)ri);
-              }
-              vp_built = true;
-            }
-          }
-        }
-        if (vx_trace_on()) vx_trace("join: +" + js.alias + " expression key hash of " + std::to_string(js.table->row_count()) + " rows built in " +
-                                    std::to_string((hal_now_ns() - jt0) / 1000) + " us" + (vp_built ? " (vectorized)" : ""));
-        for (size_t ri = 0; !vp_built && ri < js.table->row_count(); ++ri) {
-          xr.parts.set_inline(0, ri);
-          Val v = eval_expr(xk_copy.get(), xc);
-          if (!err.empty()) return make_error(err);
-          if (v.null) continue;
-          if (v.numeric) {
-            xk_num[v.num == 0 ? 0.0 : v.num].push_back((uint32_t)ri);
-          } else {
-            xk_has_text = true;
-            hash_tbl[collate_key(v.str())].push_back((uint32_t)ri);
-            const double n = numeric_prefix_of(v.str());
-            xk_tnum[n == 0 ? 0.0 : n].push_back((uint32_t)ri);
-          }
-        }
-      }
-      const uint64_t jt_c = vx_trace_on() ? hal_now_ns() : 0;   // expression-key hash built
-      // One key, on a typed integer column, and no index: the joined rows
-      // hashed by the integer itself, built instead of the text keys below.
-      std::unordered_map<int64_t, std::vector<uint32_t>> int_hash_tbl;
-      bool single_int_hash = false;
-      if (best_ki < 0 && !xk_join && prep_jkeys.size() == 1 && prep_jkeys[0].column >= 0 &&
-          (size_t)prep_jkeys[0].column < js.table->col_data.size()) {
-        const ColumnStore& jcs = js.table->col_data[prep_jkeys[0].column];
-        // (a result table's typed integer column too: its integers are canonical by construction)
-        if (vx::typed_integer(jcs) && jcs.size() == js.table->row_count() &&
-            (!js.table->inferred_types || jcs.encoding == ColumnEncoding::TypedInt64 || jcs.encoding == ColumnEncoding::TypedInt32)) {
-          single_int_hash = true;
-          int_hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
-          for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
-            if (jcs.is_null(ri)) continue;
-            int_hash_tbl[vx::typed_int(jcs, ri)].push_back((uint32_t)ri);
-          }
-        }
-      }
-      if (best_ki < 0 && !xk_join && !single_int_hash) {
-        // Fallback: build dynamic hash table if no probe index exists
-        hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
-        for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
-          bool any_null = false;
-          std::string composite_key;
-          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-            if (js.table->col_data[prep_jkeys[ki].column].is_null(ri)) { any_null = true; break; }
-            if (ki > 0) composite_key.push_back('\x1f');
-            composite_key += collate_key(js.table->cell(ri, prep_jkeys[ki].column));
-          }
-          if (!any_null) {
-            hash_tbl[composite_key].push_back((uint32_t)ri);
-          }
-        }
-      }
-
-      // Each key's value side as a stored column of an earlier table, read
-      // as its dictionary code or integer: when every key is one, the rows
-      // a base row matches depend only on those codes, and consecutive base
-      // rows share them (an invoice's lines, a customer's branch). Each
-      // thread keeps code tuple -> matching rows, so a repeated key skips
-      // the evaluation, the probe and the other keys' checks.
-      struct MemoKey { size_t src; size_t col; bool typed; };
-      std::vector<MemoKey> memo_keys;
-      bool memo_ok = !prep_jkeys.empty();
-      for (size_t ki = 0; ki < prep_jkeys.size() && memo_ok; ++ki) {
-        const SqlExpr* v = prep_jkeys[ki].value;
-        size_t ms = 0, mc = 0;
-        if (!v || v->op != ExprOp::Column || lookup_column_here(basectx, *v, &ms, &mc) != ColumnLookup::Found ||
-            ms >= baseonly.size() || !baseonly[ms].table) { memo_ok = false; break; }
-        const SqlTable& mt = *baseonly[ms].table;
-        if (mt.inferred_types || mc >= mt.col_data.size() || mt.col_data[mc].size() != mt.row_count()) { memo_ok = false; break; }
-        const ColumnStore& mcs = mt.col_data[mc];
-        if (vx::dict_coded(mcs)) memo_keys.push_back({ms, mc, false});
-        else if (vx::typed_integer(mcs)) memo_keys.push_back({ms, mc, true});
-        else memo_ok = false;
-      }
-      using JoinMemo = std::unordered_map<std::string, std::vector<size_t>>;
-      // The memo key of a base row; false: look it up the ordinary way
-      // (a NULL key, a NULL-padded side).
-      auto memo_key_of = [&](const JoinedRow& base, std::string* key) {
-        key->clear();
-        for (const MemoKey& mk : memo_keys) {
-          if (mk.src >= base.parts.size()) return false;
-          const size_t r = base.parts[mk.src];
-          if (r == kNullRow) return false;
-          const ColumnStore& mcs = baseonly[mk.src].table->col_data[mk.col];
-          if (r >= mcs.size() || mcs.is_null(r)) return false;
-          uint64_t v;
-          if (mk.typed) v = (uint64_t)vx::typed_int(mcs, r);
-          else { uint32_t k = 0; vx::decode_codes(mcs, r, r + 1, &k); v = k; }
-          key->append(reinterpret_cast<const char*>(&v), sizeof v);
-        }
-        return true;
-      };
-      // Which keys' columns hold typed numbers, read as numbers below.
-      std::vector<char> key_typed(prep_jkeys.size(), 0);
-      for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-        const int c = prep_jkeys[ki].column;
-        if (c < 0 || (size_t)c >= js.table->col_data.size()) continue;
-        const ColumnStore& kcs = js.table->col_data[c];
-        if (kcs.size() != js.table->row_count()) continue;
-        if (!js.table->inferred_types)
-          key_typed[ki] = vx::typed_integer(kcs) || kcs.encoding == ColumnEncoding::TypedDouble ||
-                          kcs.encoding == ColumnEncoding::DecimalScaled;
-        else   // a result table's typed column (sql_colbatch.inc): canonical values, whose text reads back as the number
-          key_typed[ki] = kcs.encoding == ColumnEncoding::TypedInt64 || kcs.encoding == ColumnEncoding::TypedInt32 ||
-                          kcs.encoding == ColumnEncoding::TypedDouble;
-      }
-      // Direct-Code Equi-Join: when both sides of best_ki are dictionary-coded columns,
-      // map base dictionary codes to joined dictionary codes via star_code_map.
-      bool direct_code_join = false;
-      size_t dc_base_src = 0;
-      size_t dc_base_col = 0;
-      std::shared_ptr<const StarCodeMap> dc_code_map;
-      const ColumnStore* dc_base_cs = nullptr;
-
-      if (best_ki >= 0 && prep_jkeys[best_ki].idx && !prep_jkeys[best_ki].idx->by_code.empty()) {
-        const SqlExpr* bval = prep_jkeys[best_ki].value;
-        if (bval && bval->op == ExprOp::Column &&
-            lookup_column_here(basectx, *bval, &dc_base_src, &dc_base_col) == ColumnLookup::Found &&
-            dc_base_src < baseonly.size() && baseonly[dc_base_src].table) {
-          const SqlTable& bt = *baseonly[dc_base_src].table;
-          if (dc_base_col < bt.col_data.size() && bt.col_data[dc_base_col].size() == bt.row_count()) {
-            const ColumnStore& bcs = bt.col_data[dc_base_col];
-            const int jcol = prep_jkeys[best_ki].column;
-            if (jcol >= 0 && (size_t)jcol < js.table->col_data.size()) {
-              const ColumnStore& jcs = js.table->col_data[jcol];
-              if (vx::dict_coded(bcs) && vx::dict_coded(jcs)) {
-                StarKey pk, ck;
-                // Both keys compared alike (text with text, numbers with numbers), as star_join requires: an INT
-                // column's codes mapped to a text column's met nothing, though MariaDB joins 100 to '100' by value
-                // (the probe below does).
-                if (star_key_of(bt, dc_base_col, &pk) && star_key_of(*js.table, jcol, &ck) && pk.text == ck.text) {
-                  dc_code_map = star_code_map(pk, ck);
-                  if (dc_code_map && dc_code_map->ok) {
-                    direct_code_join = true;
-                    dc_base_cs = &bcs;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // An active link on this very join (CREATE ACTIVE LINK): the base row's own row number says which
-      // row(s) of the joined table it meets, with no key to evaluate or hash. Only integer keys are linked,
-      // so no collation or number/text bridging is involved; the candidates then pass every check below.
-      const std::vector<uint32_t>* link_to_parent = nullptr;
-      const std::vector<std::vector<uint32_t>>* link_to_kids = nullptr;
-      size_t link_src = 0;
-      if (best_ki >= 0 && !direct_code_join && db && db->active_data() && !xk_join) {
-        const SqlExpr* bval = prep_jkeys[best_ki].value;
-        size_t ls = 0, lc = 0;
-        if (bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &ls, &lc) == ColumnLookup::Found &&
-            ls < baseonly.size() && baseonly[ls].table && prep_jkeys[best_ki].column >= 0) {
-          auto ll = db->active_data()->find_link(*baseonly[ls].table, lc, *js.table, (size_t)prep_jkeys[best_ki].column);
-          if (ll.found) { link_to_parent = ll.to_parent; link_to_kids = ll.to_children; link_src = ls; }
-        }
-      }
-
-      bool direct_num_join = false;
-      size_t dn_base_src = 0;
-      size_t dn_base_col = 0;
-      const ColumnStore* dn_base_cs = nullptr;
-      bool dn_base_is_int = false;
-
-      if (best_ki >= 0 && !direct_code_join && !link_to_parent && !link_to_kids && prep_jkeys[best_ki].idx &&
-          prep_jkeys[best_ki].idx->numeric_column) {
-        const SqlExpr* bval = prep_jkeys[best_ki].value;
-        if (bval && bval->op == ExprOp::Column &&
-            lookup_column_here(basectx, *bval, &dn_base_src, &dn_base_col) == ColumnLookup::Found &&
-            dn_base_src < baseonly.size() && baseonly[dn_base_src].table) {
-          const SqlTable& bt = *baseonly[dn_base_src].table;
-          if (!bt.inferred_types && dn_base_col < bt.col_data.size() && bt.col_data[dn_base_col].size() == bt.row_count()) {
-            const ColumnStore& bcs = bt.col_data[dn_base_col];
-            if (vx::typed_integer(bcs) || bcs.encoding == ColumnEncoding::TypedDouble ||
-                bcs.encoding == ColumnEncoding::DecimalScaled) {
-              direct_num_join = true;
-              dn_base_cs = &bcs;
-              dn_base_is_int = vx::typed_integer(bcs);
-            }
-          }
-        }
-      }
-
-      // Numbers a double cannot carry on either side of the main key: matches are confirmed by their digits.
-      bool best_wide = false;
-      bool js_key_wide = false;
-      if (best_ki >= 0 && prep_jkeys[best_ki].column >= 0 && (size_t)prep_jkeys[best_ki].column < js.table->col_data.size()) {
-        best_wide = js_key_wide = vx::wide_numbers(js.table->col_data[(size_t)prep_jkeys[best_ki].column]);
-        const SqlExpr* bval = prep_jkeys[best_ki].value;
-        size_t bs = 0, bc = 0;
-        if (!best_wide && bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &bs, &bc) == ColumnLookup::Found &&
-            bs < baseonly.size() && baseonly[bs].table && bc < baseonly[bs].table->col_data.size())
-          best_wide = vx::wide_numbers(baseonly[bs].table->col_data[bc]);
-        else if (!best_wide && bval && bval->op != ExprOp::Column && bval->op != ExprOp::Literal)
-          best_wide = true;   // an expression: its values are not known ahead
-      }
-      // A key that is an expression of the base row (sy * 320 + sx = pix) is evaluated over every base row
-      // at once where it compiles (vp); key_val reads this row's value back, or interprets the key.
-      std::vector<vp::Column> vp_keys;
-      std::vector<char> vp_key_ok;
-      if (rows.size() >= 256) {
-        vp_keys.resize(prep_jkeys.size());
-        vp_key_ok.assign(prep_jkeys.size(), 0);
-        EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope; kctx.sources = &baseonly;
-        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-          const uint64_t kt0 = vx_trace_on() ? hal_now_ns() : 0;
-          const vp::Prog* P = vp::program_for(prep_jkeys[ki].value, kctx);
-          const uint64_t kt1 = vx_trace_on() ? hal_now_ns() : 0;
-          if (!P) { if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " not compiled (" + std::to_string((kt1 - kt0) / 1000) + " us)"); continue; }
-          std::string verr;
-          vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
-          if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " compiled in " + std::to_string((kt1 - kt0) / 1000) + " us, " +
-                                      std::to_string(P->ins.size()) + " ops over " + std::to_string(rows.size()) + " rows in " + std::to_string((hal_now_ns() - kt1) / 1000) + " us" + (vp_key_ok[ki] ? "" : " (failed)"));
-        }
-      }
-      // An expression key whose values are all known now, and all within a double's 53 bits: the probe's double
-      // finds exactly its matches, so no candidate has to be confirmed by its digits.
-      if (best_wide && !js_key_wide && best_ki >= 0 && (size_t)best_ki < vp_key_ok.size() && vp_key_ok[(size_t)best_ki]) {
-        const vp::Column& kc = vp_keys[(size_t)best_ki];
-        bool narrow = kc.ty == vp::Ty::I64 && !kc.uns;
-        for (size_t r = 0; narrow && r < kc.size(); ++r)
-          if (!kc.is_null(r) && (kc.i[r] > 9007199254740992LL || kc.i[r] < -9007199254740992LL)) narrow = false;
-        if (narrow) best_wide = false;
-      }
-      const uint64_t jt_d = vx_trace_on() ? hal_now_ns() : 0;   // hash tables, memo keys, vectorized keys ready
-      auto key_val = [&](size_t ki, const JoinedRow& base, EvalCtx& vctx) -> Val {
-        if (ki < vp_key_ok.size() && vp_key_ok[ki]) {
-          const size_t ri = (size_t)(&base - rows.data());
-          if (ri < vp_keys[ki].size()) return vp_keys[ki].at(ri);
-        }
-        return eval_expr(prep_jkeys[ki].value, vctx);
-      };
-      // A pushed-down WHERE conjunct that compiles as a program over this step's sources is left out of the
-      // per-candidate checks and applied to the step's rows all at once, after it (vp_deferred below). Not when
-      // a LIMIT ends the step early: the count it stops at would be of unfiltered rows.
-      const bool step_limited = limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j];
-      if (!step_limited && !pushable.empty() && rows.size() >= 256 && vp::enabled()) {
-        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-        for (const SqlExpr* p : pushable) {
-          bool retry = false;
-          const vp::Prog* P = vp::program_for(p, pctx, &retry);
-          // one waiting on a subquery's set ((x, y) NOT IN (SELECT ..)): the interpreter runs it on the step's
-          // first row, which fills the set, and the program compiles then
-          if (!P && !retry) continue;
-          if (P && P->out().ty == vp::Ty::Str) continue;
-          vp_deferred.push_back(p);
-        }
-        if (!vp_deferred.empty()) {
-          auto drop = [&](std::vector<const SqlExpr*>& v) {
-            v.erase(std::remove_if(v.begin(), v.end(), [&](const SqlExpr* p) { return std::find(vp_deferred.begin(), vp_deferred.end(), p) != vp_deferred.end(); }), v.end());
-          };
-          drop(pushable);
-          drop(pushable_rest);
-        }
-      }
-      // The joined rows whose keys equal this base row's.
-      auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
-        out.clear();
-        if (best_ki >= 0) {
-          std::vector<size_t> match_cands;
-          if (link_to_parent || link_to_kids) {
-            const size_t base_ri = link_src < base.parts.size() ? base.parts[link_src] : kNullRow;
-            if (base_ri == kNullRow) return;
-            if (link_to_parent) {
-              if (base_ri >= link_to_parent->size()) return;
-              const uint32_t pr = (*link_to_parent)[base_ri];
-              if (pr == UINT32_MAX) return;
-              match_cands.push_back(pr);
-            } else {
-              if (base_ri >= link_to_kids->size()) return;
-              const auto& kids = (*link_to_kids)[base_ri];
-              match_cands.assign(kids.begin(), kids.end());
-            }
-          } else if (direct_code_join) {
-            const size_t base_ri = (dc_base_src < base.parts.size()) ? base.parts[dc_base_src] : kNullRow;
-            if (base_ri == kNullRow || base_ri >= dc_base_cs->size() || dc_base_cs->is_null(base_ri)) return;
-            const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
-            if (ca >= dc_code_map->p2c.size()) return;
-            const int32_t cb = dc_code_map->p2c[ca];
-            if (cb < 0 || (size_t)cb >= prep_jkeys[best_ki].idx->by_code.size()) return;
-            const auto& cands = prep_jkeys[best_ki].idx->by_code[(size_t)cb];
-            match_cands.assign(cands.begin(), cands.end());
-          } else if (direct_num_join) {
-            const size_t base_ri = (dn_base_src < base.parts.size()) ? base.parts[dn_base_src] : kNullRow;
-            if (base_ri == kNullRow || base_ri >= dn_base_cs->size() || dn_base_cs->is_null(base_ri)) return;
-            double num = 0.0;
-            if (dn_base_is_int) num = (double)vx::typed_int(*dn_base_cs, base_ri);
-            else if (!dn_base_cs->get_double(base_ri, &num)) return;
-            // val_num, not Val(num): Val is an aggregate, and Val(num) put the number in its first member -
-            // `null` - so every key but 0 probed as NULL and a join of two typed tables met almost nothing
-            probe_gather_matches(prep_jkeys[best_ki].idx.get(), val_num(num), match_cands);
-            if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
-          } else {
-            Val want = key_val((size_t)best_ki, base, vctx);
-            if (want.null) return;
-            probe_gather_matches(prep_jkeys[best_ki].idx.get(), want, match_cands);
-          }
-          // The index finds numbers by their double, which joins 9007199254740993 to ...992 and every BIGINT
-          // UNSIGNED near 2^64 to its neighbours. Where either side holds such numbers, each candidate's key is
-          // checked against this row's by its digits.
-          if (best_wide && !link_to_parent && !link_to_kids && !direct_code_join && !match_cands.empty()) {
-            const Val want = key_val((size_t)best_ki, base, vctx);
-            const ColumnStore& jcs = js.table->col_data[(size_t)prep_jkeys[best_ki].column];
-            size_t w = 0;
-            for (size_t mi = 0; mi < match_cands.size(); ++mi) {
-              const size_t mr = match_cands[mi];
-              if (mr >= jcs.size() || jcs.is_null(mr)) continue;
-              const std::string& cell = jcs.get(mr);
-              double d = 0;
-              if (!parse_number(cell, &d)) { match_cands[w++] = mr; continue; }
-              if (compare_vals(want, val_num_with_text(d, cell)) == 0) match_cands[w++] = mr;
-            }
-            match_cands.resize(w);
-          }
-          std::vector<Val> other(prep_jkeys.size());
-          bool other_ready = false;
-          for (size_t match_ri : match_cands) {
-            if (match_ri >= js.table->row_count()) continue;
-            if (!other_ready) {
-              for (size_t ki = 0; ki < prep_jkeys.size(); ++ki)
-                if ((int)ki != best_ki) other[ki] = key_val(ki, base, vctx);
-              other_ready = true;
-            }
-            bool all_keys_match = true;
-            for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-              if ((int)ki == best_ki) continue;
-              const Val& want_k = other[ki];
-              if (want_k.null) { all_keys_match = false; break; }
-              int col_idx = prep_jkeys[ki].column;
-              if (js.table->col_data[col_idx].is_null(match_ri)) { all_keys_match = false; break; }
-              if (want_k.numeric) {
-                // A typed column holds the number itself; printing it to
-                // text and strtod-ing it back, per candidate, was most of
-                // the stockmoves join on the open-orders page (146k
-                // transno candidates for 6k (transno, orderlineref) rows).
-                if (key_typed[ki]) {
-                  if (vx::typed_value(js.table->col_data[col_idx], match_ri) != want_k.num) {
-                    all_keys_match = false; break;
-                  }
-                  continue;
-                }
-                double cell_num = 0.0;
-                if (!parse_number(js.table->cell(match_ri, col_idx), &cell_num) || cell_num != want_k.num) {
-                  all_keys_match = false; break;
-                }
-              } else {
-                if (!strcase_eq(js.table->cell(match_ri, col_idx), want_k.str())) {
-                  all_keys_match = false; break;
-                }
-              }
-            }
-            if (all_keys_match) out.push_back(match_ri);
-          }
-        } else if (xk_join) {
-          Val want = eval_expr(xk_base, vctx);
-          xk_exact = false;
-          if (want.null) return;
-          const std::vector<uint32_t>* a = nullptr;
-          const std::vector<uint32_t>* b = nullptr;
-          if (want.numeric) {
-            const double n = want.num == 0 ? 0.0 : want.num;
-            auto h1 = xk_num.find(n);
-            if (h1 != xk_num.end()) a = &h1->second;
-            auto h2 = xk_tnum.find(n);
-            if (h2 != xk_tnum.end()) b = &h2->second;
-          } else {
-            auto h1 = hash_tbl.find(collate_key(want.str()));
-            if (h1 != hash_tbl.end()) a = &h1->second;
-            if (!xk_num.empty()) {
-              const double n0 = numeric_prefix_of(want.str());
-              auto h2 = xk_num.find(n0 == 0 ? 0.0 : n0);
-              if (h2 != xk_num.end()) b = &h2->second;
-            }
-          }
-          if (a) out.assign(a->begin(), a->end());
-          // exact numbers on both sides (the hash holds the joined expression's numbers, this probe's is one, a
-          // double carries both): every candidate equals it; a text-prefix match (b) does not say so
-          xk_exact = a && !b && want.numeric && !InLookupSet::is_wide(want) && !xk_has_text;
-          if (b) {
-            out.insert(out.end(), b->begin(), b->end());
-            std::sort(out.begin(), out.end());
-            out.erase(std::unique(out.begin(), out.end()), out.end());
-          }
-        } else if (single_int_hash) {
-          Val want = eval_expr(prep_jkeys[0].value, vctx);
-          if (want.null) return;
-          // The probe as a number; one with a fraction, or past int64, equals no integer.
-          double d = 0.0;
-          if (want.numeric) d = want.num;
-          else if (!parse_number(want.str(), &d)) return;
-          if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0) || d != std::trunc(d)) return;
-          const int64_t iv = (int64_t)d;
-          auto hit = int_hash_tbl.find(iv);
-          if (hit != int_hash_tbl.end()) out.assign(hit->second.begin(), hit->second.end());
-          if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
+        SeriesRange& r = rg[bi];
+        if (all_int) {
+          bool null = false;
+          for (size_t a = 0; a < na; ++a) if (lanes[a].is_null(bi)) null = true;
+          if (null) continue;
+          if (!series_count(lanes[0].i[bi], lanes[1].i[bi], na == 3 ? lanes[2].i[bi] : 1, &r, &err)) return make_error(err);
         } else {
-          std::string probe_key;
-          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-            Val want = key_val(ki, base, vctx);
-            if (want.null) return;
-            if (ki > 0) probe_key.push_back('\x1f');
-            probe_key += collate_key(want.str());
+          for (size_t a = 0; a < na; ++a) {
+            if (laned[a]) { vals[a] = lanes[a].is_null(bi) ? sql_null() : lanes[a].text(bi); continue; }
+            ictx.row = &rows[bi];
+            Val v = eval_expr(sp.args[a].get(), ictx);
+            if (!err.empty()) return make_error(err);
+            vals[a] = v.null ? sql_null() : v.str();
           }
-          auto hit = hash_tbl.find(probe_key);
-          if (hit != hash_tbl.end()) out.assign(hit->second.begin(), hit->second.end());
+          if (!series_range_of(vals, &r, &err)) return make_error(err);
         }
-      };
+        total += r.n;
+        if (r.scale > scale) scale = r.scale;
+        if (total > 100000000ull) return make_error("generate_series would make over 100,000,000 rows");
+      }
+    }
+    // the series table: every range's numbers in order, as integers, or as decimals at the largest scale
+    st->clear_rows();
+    st->ensure_columns();
+    st->columns[0].type = scale > 0 ? SqlDataType::Decimal : SqlDataType::Int;
+    st->columns[0].scale = scale;
+    bool typed = false;
+    if (scale == 0 && !st->col_data.empty()) {
+      std::vector<int64_t> v;
+      v.reserve((size_t)total);
+      for (size_t bi = 0; bi < nb; ++bi) {
+        long long x = rg[bi].start;
+        for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) v.push_back(x);
+      }
+      std::vector<uint8_t> nul(v.size(), 0);
+      ColumnStore& cs = st->col_data[0];
+      if (cs.begin_typed(ColumnEncoding::TypedInt64) && cs.adopt_ints(std::move(v), nul)) {
+        st->mutation_seq = sql_next_mutation_seq();
+        typed = true;
+      }
+    }
+    if (!typed) {
+      std::vector<SqlRow> srows;
+      srows.reserve((size_t)total);
+      for (size_t bi = 0; bi < nb; ++bi) {
+        long long x = rg[bi].start;
+        for (unsigned long long k = 0; k < rg[bi].n; ++k, x += rg[bi].step) srows.push_back(SqlRow{{series_text(x, rg[bi].scale)}});
+      }
+      append_result_rows(st, srows);
+    }
+    // what the rows have to pass: an inner join's ON conjuncts and the pushed WHERE conjuncts, at once where
+    // they compile (vp_deferred), else each; a LEFT JOIN's ON conjuncts decide each candidate
+    std::vector<const SqlExpr*> on_parts;
+    if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &on_parts);
+    std::vector<const SqlExpr*> conds = pushable;
+    if (!join_is_left[j]) for (const SqlExpr* p : on_parts) conds.push_back(p);
+    std::vector<const SqlExpr*> plain;
+    {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* p : conds) {
+        bool retry = false;
+        const vp::Prog* P = (unsigned long long)nb * (total ? total / nb : 1) >= 256 && vp::enabled() ? vp::program_for(p, pctx, &retry) : nullptr;
+        if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
+      }
+    }
+    const std::vector<const SqlExpr*>& on_each = join_is_left[j] ? on_parts : std::vector<const SqlExpr*>();
+    if (!reserve_rows((size_t)total + (join_is_left[j] ? nb : 0), sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+    next.reserve((size_t)total + (join_is_left[j] ? nb : 0));
+    EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+    auto passes = [&](JoinedRow& cand, const std::vector<const SqlExpr*>& ps) {
+      if (ps.empty()) return true;
+      ctx.row = &cand;
+      for (const SqlExpr* p : ps) if (!predicate_true(p, ctx)) return false;
+      return true;
+    };
+    size_t id = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+      const unsigned long long n = rg[bi].n;
+      bool matched = false;
+      for (unsigned long long k = 0; k < n; ++k) {
+        JoinedRow cand = (k + 1 == n && !join_is_left[j]) ? std::move(rows[bi]) : rows[bi];
+        cand.parts.push_back(id++);
+        if (!on_each.empty() && !passes(cand, on_each)) { if (!err.empty()) return make_error(err); continue; }
+        matched = true;
+        if (!plain.empty() && !passes(cand, plain)) { if (!err.empty()) return make_error(err); continue; }
+        next.push_back(std::move(cand));
+      }
+      if (!matched && join_is_left[j]) {
+        JoinedRow padded = std::move(rows[bi]);
+        padded.parts.push_back(kNullRow);
+        if (!plain.empty() && !passes(padded, plain)) { if (!err.empty()) return make_error(err); continue; }
+        next.push_back(std::move(padded));
+      }
+    }
+    JoinedRows().swap(rows);
+    if (vx_trace_on())
+      vx_trace("join: +" + js.alias + " series: " + std::to_string(total) + " rows from " + std::to_string(nb) + " base rows (bounds " +
+               (all_int ? "in integer lanes" : "as text") + ") in " + std::to_string((hal_now_ns() - st0) / 1000) + " us");
+    join_method = "series";
+    hash_join_done = true;
+  }
+  if (!hash_join_done && jkeys.empty() && !xk_join && !join_is_left[j] && !join_is_right[j] && js.table && !right_seen &&
+      js.table->row_count() <= 64 && !rows.empty()) {
+    const size_t nj = js.table->row_count();
+    std::vector<const SqlExpr*> conds = pushable;
+    if (join_conditions[j]) collect_conjuncts(join_conditions[j].get(), &conds);
+    std::vector<const SqlExpr*> plain;
+    if (rows.size() >= 256 && vp::enabled()) {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* p : conds) {
+        bool retry = false;
+        const vp::Prog* P = vp::program_for(p, pctx, &retry);
+        if ((P && P->out().ty != vp::Ty::Str) || (!P && retry)) vp_deferred.push_back(p); else plain.push_back(p);
+      }
+    } else {
+      plain = conds;
+    }
+    if (nj == 1 && plain.empty()) {
+      // one row and nothing to check here: every row takes it where it is (no row copied, no second list)
+      for (JoinedRow& base : rows) base.parts.push_back(0);
+      next.swap(rows);
+    } else {
+    if (!reserve_rows(rows.size() * nj, sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+    next.reserve(rows.size() * nj);
+    EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+    for (JoinedRow& base : rows) {
+      for (size_t ri = 0; ri < nj; ++ri) {
+        JoinedRow cand = ri + 1 == nj ? std::move(base) : base;
+        cand.parts.push_back(ri);
+        if (!plain.empty()) {
+          ctx.row = &cand;
+          bool keep = true;
+          for (const SqlExpr* p : plain) if (!predicate_true(p, ctx)) { keep = false; break; }
+          if (!err.empty()) return make_error(err);
+          if (!keep) continue;
+        }
+        next.push_back(std::move(cand));
+      }
+    }
+    }
+    join_method = "small table";
+    hash_join_done = true;
+  }
+  // js_pass is exactly the ON clause's own conditions (no WHERE part folded in): a row failing it is no match
+  const bool pass_is_on = js_prefilter && !js_prefilter_where;
+  if (!hash_join_done && (!prep_jkeys.empty() || xk_join)) {
+    bool has_extra_join = false;
+    std::vector<const SqlExpr*> jparts;
+    collect_conjuncts(join_conditions[j].get(), &jparts);
+    if (jparts.size() != prep_jkeys.size() || xk_join) has_extra_join = true;
+    // The ON conjuncts a candidate is checked against: every one, less those an inner join leaves to the
+    // vectorized pass after the step (on_deferred) - a conjunct that compiles as a program and is no key
+    // equality the probe already answers. A LEFT or RIGHT join's ON decides its padding, so it keeps all.
+    std::vector<const SqlExpr*> on_check = jparts;
+    std::vector<const SqlExpr*> on_deferred;
+    if (has_extra_join && !join_is_left[j] && !join_is_right[j] && rows.size() >= 256 && vp::enabled()) {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* pc : jparts) {
+        bool is_key = false;
+        for (const PreparedJoinKey& k : prep_jkeys)
+          if (pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == k.value || pc->args[1].get() == k.value)) is_key = true;
+        if (xk_join && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == xk_join || pc->args[1].get() == xk_join)) is_key = true;
+        if (is_key) continue;
+        const vp::Prog* P = vp::program_for(pc, pctx);
+        if (!P || P->out().ty == vp::Ty::Str) continue;
+        on_deferred.push_back(pc);
+      }
+      on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_deferred.begin(), on_deferred.end(), pc) != on_deferred.end(); }), on_check.end());
+      for (const SqlExpr* pc : on_deferred) vp_deferred.push_back(pc);
+    }
+    // the conjunct that is the expression key's equality: settled by the hash where this probe's matches came
+    // from exact numbers alone (xk_exact), so it is not interpreted again per candidate
+    const SqlExpr* xk_conj = nullptr;
+    if (xk_join)
+      for (const SqlExpr* pc : jparts)
+        if (pc->op == ExprOp::Eq && pc->args.size() == 2 &&
+            ((pc->args[0].get() == xk_join && pc->args[1].get() == xk_base) || (pc->args[1].get() == xk_join && pc->args[0].get() == xk_base)))
+          xk_conj = pc;
+    thread_local bool xk_exact = false;
+    auto on_true = [&](EvalCtx& ctx) {
+      for (const SqlExpr* pc : on_check) {
+        if (pc == xk_conj && xk_exact) continue;
+        if (!predicate_true(pc, ctx)) return false;
+      }
+      return true;
+    };
 
-      std::atomic<uint64_t> t_gather{0}, t_on{0}, n_cands{0}, n_skipped{0};   // step diagnostics, in the trace
-      const bool step_timing = vx_trace_on();
-      // The ON conjuncts that read the base rows alone (`LEFT JOIN wt ON p.is_sky AND wt.k = ..`), evaluated in
-      // lanes over every base row first: a row they refuse is padded (or dropped) without a probe.
-      std::vector<uint8_t> base_refused;
-      std::unordered_set<const SqlExpr*> base_decided;   // the conjuncts base_refused settled, for every candidate of a row it kept
-      if (has_extra_join && rows.size() >= 256 && vp::enabled() && !join_is_right[j]) {
-        EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
-        for (const SqlExpr* pc : jparts) {
-          if (!expr_only_reads(pc, bctx) || expr_has_subquery_raw(pc)) continue;
-          const vp::Prog* P = vp::program_for(pc, bctx);
-          if (!P || P->out().ty == vp::Ty::Str) continue;
+    // The indexed key whose column tells rows apart best: a typed integer column, else the dictionary with
+    // the most entries. The first indexed key took `ON s.map_id = p.map_id AND s.seg_id = p.seg_id` by
+    // map_id - one value, every row a candidate, each then checked on seg_id.
+    int best_ki = -1;
+    {
+      size_t best_ndv = 0;
+      for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+        if (!prep_jkeys[ki].idx) continue;
+        size_t ndv = 1;
+        if (prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
+          const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+          ndv = vx::typed_numeric(kcs) ? SIZE_MAX : vx::dict_coded(kcs) ? vx::dict_size(kcs) : (size_t)1 << 20;
+        }
+        // The index's own count of distinct numbers where it has one: two typed integer keys both read as SIZE_MAX
+        // and the first in the ON won - `stockmoves.orderlineref` (4 values) over `transno`, each of 47k open
+        // order lines then walking 290k candidates: 145 s of a 150 s open-orders page, 0.2 s by transno.
+        if (prep_jkeys[ki].idx && prep_jkeys[ki].idx->by_number.size() > 0) ndv = prep_jkeys[ki].idx->by_number.size();
+        if (best_ki < 0 || ndv > best_ndv) { best_ki = (int)ki; best_ndv = ndv; }
+      }
+    }
+
+    std::unordered_map<std::string, std::vector<uint32_t>> hash_tbl;
+    // A hash table over the joined table's rows, built for this statement:
+    // a node, a key string and a row list per row.
+    QueryMemHold hash_hold;   // given back when this join step is done
+    if ((xk_join || best_ki < 0) && !hash_hold.reserve(js.table->row_count() * 112))
+      return make_error("Query execution was interrupted");
+    if (xk_join) {
+      // A copy: evaluating binds its columns to the one-table scope.
+      ExprPtr xk_copy = clone_expr(xk_join);
+      EvalCtx xc; xc.db = db; xc.outer = outer_scope; xc.sources = &newonly; xc.err = &err;
+      JoinedRow xr;
+      xr.parts.push_back(0);
+      xc.row = &xr;
+      hash_tbl.reserve(std::min(js.table->row_count(), (size_t)1 << 20));
+      xk_has_text = false;
+      // the expression over every row of the joined table at once, where it compiles (vp): its numbers go
+      // straight into the hash; a text-valued key, or one that does not compile, is interpreted per row
+      bool vp_built = false;
+      if (const vp::Prog* P = vp::program_for(xk_copy.get(), xc)) {
+        if (P->out().ty != vp::Ty::Str) {
           vp::Column col;
           std::string verr;
-          if (!vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, rows.size(), &col, &verr)) continue;
-          if (base_refused.empty()) base_refused.assign(rows.size(), 0);
-          for (size_t r = 0; r < rows.size(); ++r)
-            if (col.is_null(r) || (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0)) base_refused[r] = 1;
-          base_decided.insert(pc);
-        }
-      }
-      // What a candidate still has to pass of the ON clause. A conjunct the base rows alone decided (above) reads
-      // nothing of the joined row: true for every candidate of a row that was not refused, so it is not checked
-      // again. A conjunct that compiles as a program is checked over a chunk's candidates at once in lanes
-      // (on_vec: OnSink / flush_sink below), not interpreted per candidate - the flat-texture join of a SQLDoom
-      // frame interpreted `fl.name = p.tex_name` for 56,000 candidates, 29 ms of a 480 ms frame. The rest, and
-      // the expression key's own equality (settled by xk_exact where it can be), stay per candidate in on_true.
-      std::vector<const SqlExpr*> on_vec;
-      std::vector<const vp::Prog*> on_vec_progs;
-      if (!base_decided.empty())
-        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return base_decided.count(pc) > 0; }), on_check.end());
-      // The ON clause's own conditions on the joined table, where they alone made js_pass (no WHERE part among
-      // them): js_pass is then their answer for every row, read before a candidate counts (pass_is_on below),
-      // so they are not evaluated again per candidate - `LEFT JOIN stock s ON s.productid = p.id AND
-      // s.onhand > 0` checked onhand over 63k candidates in lanes after selecting the rows by it.
-      if (pass_is_on && !on_own.empty())
-        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_own.begin(), on_own.end(), pc) != on_own.end(); }), on_check.end());
-      if (has_extra_join && rows.size() >= 256 && vp::enabled()) {
-        EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-        for (const SqlExpr* pc : on_check) {
-          if (pc == xk_conj || expr_has_subquery_raw(pc)) continue;
-          const vp::Prog* P = vp::program_for(pc, pctx);
-          if (!P || P->out().ty == vp::Ty::Str) continue;
-          on_vec.push_back(pc);
-          on_vec_progs.push_back(P);
-        }
-        if (!on_vec.empty())
-          on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_vec.begin(), on_vec.end(), pc) != on_vec.end(); }), on_check.end());
-      }
-      if (vx_trace_on() && has_extra_join)
-        vx_trace("join: +" + js.alias + " ON conjuncts: " + std::to_string(base_decided.size()) + " decided by the base rows, " +
-                 std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
-      // A chunk's candidates that passed on_true and await on_vec, in base order (bi: the base row of each).
-      struct OnSink {
-        JoinedRows cands;
-        std::vector<uint32_t> bi;
-      };
-      // The batched probe: where every key of the step is a number this row already holds - the probing key in a
-      // program's lanes or a typed column of an earlier table, each other key likewise and a typed column on the
-      // joined side - a base row's matches are read straight off the index's number map and checked against the
-      // other keys as numbers, with no Val, context or candidate list per row. It makes exactly the rows
-      // process_probe makes, in the same order: the same candidates (the index's list for the number; for 0,
-      // the digitless rows too, through probe_gather_matches), the same ON, prefilter, WHERE and padding.
-      // Not for a key whose numbers a double may not carry (best_wide), a dictionary-code or parent/child link,
-      // or a key held as text. AIOS_SQL_BATCH_JOIN=0 turns it off.
-      struct NumKey {
-        const vp::Column* lane = nullptr;
-        const ColumnStore* cs = nullptr;
-        size_t src = 0;
-        bool ints = false;
-        bool konst = false;                              // a Constant-encoded column: every row holds kval
-        double kval = 0;
-        std::shared_ptr<const StarCodeMap> cmap;         // a text key beside the probing one: its codes mapped to the joined column's
-        // cmap: both columns' codes and NULL flags decoded whole (vx::decoded_*, kept between statements) - a code
-        // decoded per row (code_at) cost ~100 instructions each, 108M of a 600k-row composite join's 560M
-        std::shared_ptr<const std::vector<uint32_t>> bcodes, jcodes;
-        std::shared_ptr<const std::vector<uint8_t>> bnulls, jnulls;
-        bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
-        double jkval = 0;
-        std::shared_ptr<const std::vector<double>> dnum; // a dictionary-coded number column: the number per code
-        std::shared_ptr<const std::vector<double>> jdnum; // the joined column held as such a dictionary
-      };
-      std::vector<NumKey> numkeys(prep_jkeys.size());
-      static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
-      // (a direct code join probes its key by dictionary code, below; its other keys as numbers)
-      bool batch_ok = batch_join_on && best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx && !link_to_parent && !link_to_kids &&
-                      (!best_wide || direct_code_join) && !xk_join;
-      for (size_t ki = 0; batch_ok && ki < prep_jkeys.size(); ++ki) {
-        NumKey& nk = numkeys[ki];
-        if (direct_code_join && (int)ki == best_ki) continue;
-        if (ki < vp_key_ok.size() && vp_key_ok[ki] && vp_keys[ki].ty != vp::Ty::Str && !vp_keys[ki].uns) {
-          nk.lane = &vp_keys[ki];
-        } else {
-          const SqlExpr* kv = prep_jkeys[ki].value;
-          size_t ks = 0, kc = 0;
-          if (!kv || kv->op != ExprOp::Column || lookup_column_here(basectx, *kv, &ks, &kc) != ColumnLookup::Found ||
-              ks >= baseonly.size() || !baseonly[ks].table || kc >= baseonly[ks].table->col_data.size()) { batch_ok = false; break; }
-          const SqlTable& bt = *baseonly[ks].table;
-          const ColumnStore& bcs = bt.col_data[kc];
-          const bool typed_int = bcs.encoding == ColumnEncoding::TypedInt64 || bcs.encoding == ColumnEncoding::TypedInt32;
-          const bool typed_dbl = bcs.encoding == ColumnEncoding::TypedDouble;
-          // a number the interpreter reads as exactly this value: a declared table's typed integer or double, or a
-          // result table's (its values are canonical)
-          const bool numeric_type = kc < bt.columns.size() && !bt.columns[kc].temporal &&
-                                    (bt.columns[kc].type == SqlDataType::Int || (typed_dbl && bt.columns[kc].type == SqlDataType::Real && bt.columns[kc].scale == 0));
-          // a Constant-encoded INT column (a map_id that is 1 in every row): its one value
-          if ((int)ki != best_ki && bcs.encoding == ColumnEncoding::Constant && kc < bt.columns.size() && !bt.columns[kc].temporal &&
-              bt.columns[kc].type == SqlDataType::Int && bcs.size() == bt.row_count() && !sql_is_null(bcs.constant_val)) {
-            double kcv = 0;
-            if (parse_number(bcs.constant_val, &kcv)) { nk.cs = &bcs; nk.src = ks; nk.konst = true; nk.kval = kcv; nk.ints = true; }
+          const size_t nrows = js.table->row_count();
+          if (vp::eval_column_ids(*P, [](size_t r) { return r; }, nrows, &col, &verr)) {
+            for (size_t ri = 0; ri < nrows; ++ri) {
+              if (col.is_null(ri)) continue;
+              const double d = col.ty == vp::Ty::I64 ? (col.uns ? (double)(uint64_t)col.i[ri] : (double)col.i[ri]) : col.f[ri];
+              xk_num[d == 0 ? 0.0 : d].push_back((uint32_t)ri);
+            }
+            vp_built = true;
           }
-          // a text key beside the probing one, both dictionary-coded: compared by dictionary code through the star
-          // code map (collation equality, as the interpreter compares two texts)
-          if ((int)ki != best_ki && !nk.konst && prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
-            StarKey pk, ck;
-            if (star_key_of(bt, kc, &pk) && star_key_of(*js.table, (size_t)prep_jkeys[ki].column, &ck) && pk.text && ck.text) {
-              std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck);
-              if (m && m->ok) {
-                nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m);
-                const size_t jc = (size_t)prep_jkeys[ki].column;
-                if (bcs.size() == bt.row_count() && js.table->col_data[jc].size() == js.table->row_count()) {
-                  nk.bcodes = vx::decoded_codes(bt, kc);
-                  nk.jcodes = vx::decoded_codes(*js.table, jc);
-                  if (vx::has_nulls(bcs)) nk.bnulls = vx::decoded_nulls(bt, kc);
-                  if (vx::has_nulls(js.table->col_data[jc])) nk.jnulls = vx::decoded_nulls(*js.table, jc);
-                  // all or none: a missing one (the budget) leaves the per-row reads
-                  if (!nk.bcodes || !nk.jcodes || (vx::has_nulls(bcs) && !nk.bnulls) || (vx::has_nulls(js.table->col_data[jc]) && !nk.jnulls)) {
-                    nk.bcodes.reset(); nk.jcodes.reset(); nk.bnulls.reset(); nk.jnulls.reset();
-                  }
+        }
+      }
+      if (vx_trace_on()) vx_trace("join: +" + js.alias + " expression key hash of " + std::to_string(js.table->row_count()) + " rows built in " +
+                                  std::to_string((hal_now_ns() - jt0) / 1000) + " us" + (vp_built ? " (vectorized)" : ""));
+      for (size_t ri = 0; !vp_built && ri < js.table->row_count(); ++ri) {
+        xr.parts.set_inline(0, ri);
+        Val v = eval_expr(xk_copy.get(), xc);
+        if (!err.empty()) return make_error(err);
+        if (v.null) continue;
+        if (v.numeric) {
+          xk_num[v.num == 0 ? 0.0 : v.num].push_back((uint32_t)ri);
+        } else {
+          xk_has_text = true;
+          hash_tbl[collate_key(v.str())].push_back((uint32_t)ri);
+          const double n = numeric_prefix_of(v.str());
+          xk_tnum[n == 0 ? 0.0 : n].push_back((uint32_t)ri);
+        }
+      }
+    }
+    const uint64_t jt_c = vx_trace_on() ? hal_now_ns() : 0;   // expression-key hash built
+    // One key, on a typed integer column, and no index: the joined rows
+    // hashed by the integer itself, built instead of the text keys below.
+    std::unordered_map<int64_t, std::vector<uint32_t>> int_hash_tbl;
+    bool single_int_hash = false;
+    if (best_ki < 0 && !xk_join && prep_jkeys.size() == 1 && prep_jkeys[0].column >= 0 &&
+        (size_t)prep_jkeys[0].column < js.table->col_data.size()) {
+      const ColumnStore& jcs = js.table->col_data[prep_jkeys[0].column];
+      // (a result table's typed integer column too: its integers are canonical by construction)
+      if (vx::typed_integer(jcs) && jcs.size() == js.table->row_count() &&
+          (!js.table->inferred_types || jcs.encoding == ColumnEncoding::TypedInt64 || jcs.encoding == ColumnEncoding::TypedInt32)) {
+        single_int_hash = true;
+        int_hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
+        for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
+          if (jcs.is_null(ri)) continue;
+          int_hash_tbl[vx::typed_int(jcs, ri)].push_back((uint32_t)ri);
+        }
+      }
+    }
+    if (best_ki < 0 && !xk_join && !single_int_hash) {
+      // Fallback: build dynamic hash table if no probe index exists
+      hash_tbl.reserve(std::min(js.table->row_count(), (size_t)65536));
+      for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
+        bool any_null = false;
+        std::string composite_key;
+        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+          if (js.table->col_data[prep_jkeys[ki].column].is_null(ri)) { any_null = true; break; }
+          if (ki > 0) composite_key.push_back('\x1f');
+          composite_key += collate_key(js.table->cell(ri, prep_jkeys[ki].column));
+        }
+        if (!any_null) {
+          hash_tbl[composite_key].push_back((uint32_t)ri);
+        }
+      }
+    }
+
+    // Each key's value side as a stored column of an earlier table, read
+    // as its dictionary code or integer: when every key is one, the rows
+    // a base row matches depend only on those codes, and consecutive base
+    // rows share them (an invoice's lines, a customer's branch). Each
+    // thread keeps code tuple -> matching rows, so a repeated key skips
+    // the evaluation, the probe and the other keys' checks.
+    struct MemoKey { size_t src; size_t col; bool typed; };
+    std::vector<MemoKey> memo_keys;
+    bool memo_ok = !prep_jkeys.empty();
+    for (size_t ki = 0; ki < prep_jkeys.size() && memo_ok; ++ki) {
+      const SqlExpr* v = prep_jkeys[ki].value;
+      size_t ms = 0, mc = 0;
+      if (!v || v->op != ExprOp::Column || lookup_column_here(basectx, *v, &ms, &mc) != ColumnLookup::Found ||
+          ms >= baseonly.size() || !baseonly[ms].table) { memo_ok = false; break; }
+      const SqlTable& mt = *baseonly[ms].table;
+      if (mt.inferred_types || mc >= mt.col_data.size() || mt.col_data[mc].size() != mt.row_count()) { memo_ok = false; break; }
+      const ColumnStore& mcs = mt.col_data[mc];
+      if (vx::dict_coded(mcs)) memo_keys.push_back({ms, mc, false});
+      else if (vx::typed_integer(mcs)) memo_keys.push_back({ms, mc, true});
+      else memo_ok = false;
+    }
+    using JoinMemo = std::unordered_map<std::string, std::vector<size_t>>;
+    // The memo key of a base row; false: look it up the ordinary way
+    // (a NULL key, a NULL-padded side).
+    auto memo_key_of = [&](const JoinedRow& base, std::string* key) {
+      key->clear();
+      for (const MemoKey& mk : memo_keys) {
+        if (mk.src >= base.parts.size()) return false;
+        const size_t r = base.parts[mk.src];
+        if (r == kNullRow) return false;
+        const ColumnStore& mcs = baseonly[mk.src].table->col_data[mk.col];
+        if (r >= mcs.size() || mcs.is_null(r)) return false;
+        uint64_t v;
+        if (mk.typed) v = (uint64_t)vx::typed_int(mcs, r);
+        else { uint32_t k = 0; vx::decode_codes(mcs, r, r + 1, &k); v = k; }
+        key->append(reinterpret_cast<const char*>(&v), sizeof v);
+      }
+      return true;
+    };
+    // Which keys' columns hold typed numbers, read as numbers below.
+    std::vector<char> key_typed(prep_jkeys.size(), 0);
+    for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+      const int c = prep_jkeys[ki].column;
+      if (c < 0 || (size_t)c >= js.table->col_data.size()) continue;
+      const ColumnStore& kcs = js.table->col_data[c];
+      if (kcs.size() != js.table->row_count()) continue;
+      if (!js.table->inferred_types)
+        key_typed[ki] = vx::typed_integer(kcs) || kcs.encoding == ColumnEncoding::TypedDouble ||
+                        kcs.encoding == ColumnEncoding::DecimalScaled;
+      else   // a result table's typed column (sql_colbatch.inc): canonical values, whose text reads back as the number
+        key_typed[ki] = kcs.encoding == ColumnEncoding::TypedInt64 || kcs.encoding == ColumnEncoding::TypedInt32 ||
+                        kcs.encoding == ColumnEncoding::TypedDouble;
+    }
+    // Direct-Code Equi-Join: when both sides of best_ki are dictionary-coded columns,
+    // map base dictionary codes to joined dictionary codes via star_code_map.
+    bool direct_code_join = false;
+    size_t dc_base_src = 0;
+    size_t dc_base_col = 0;
+    std::shared_ptr<const StarCodeMap> dc_code_map;
+    const ColumnStore* dc_base_cs = nullptr;
+
+    if (best_ki >= 0 && prep_jkeys[best_ki].idx && !prep_jkeys[best_ki].idx->by_code.empty()) {
+      const SqlExpr* bval = prep_jkeys[best_ki].value;
+      if (bval && bval->op == ExprOp::Column &&
+          lookup_column_here(basectx, *bval, &dc_base_src, &dc_base_col) == ColumnLookup::Found &&
+          dc_base_src < baseonly.size() && baseonly[dc_base_src].table) {
+        const SqlTable& bt = *baseonly[dc_base_src].table;
+        if (dc_base_col < bt.col_data.size() && bt.col_data[dc_base_col].size() == bt.row_count()) {
+          const ColumnStore& bcs = bt.col_data[dc_base_col];
+          const int jcol = prep_jkeys[best_ki].column;
+          if (jcol >= 0 && (size_t)jcol < js.table->col_data.size()) {
+            const ColumnStore& jcs = js.table->col_data[jcol];
+            if (vx::dict_coded(bcs) && vx::dict_coded(jcs)) {
+              StarKey pk, ck;
+              // Both keys compared alike (text with text, numbers with numbers), as star_join requires: an INT
+              // column's codes mapped to a text column's met nothing, though MariaDB joins 100 to '100' by value
+              // (the probe below does).
+              if (star_key_of(bt, dc_base_col, &pk) && star_key_of(*js.table, jcol, &ck) && pk.text == ck.text) {
+                dc_code_map = star_code_map(pk, ck);
+                if (dc_code_map && dc_code_map->ok) {
+                  direct_code_join = true;
+                  dc_base_cs = &bcs;
                 }
               }
             }
           }
-          // a number column held as a dictionary (a DECIMAL(65,0) from integer arithmetic, an INT kept as codes, a
-          // result table's numeric text): its entries as numbers, read per row by code
-          if (!nk.konst && !nk.cmap && kc < bt.columns.size() && !bt.columns[kc].temporal && bcs.size() == bt.row_count() &&
-              vx::dict_coded(bcs) && !typed_int && !typed_dbl &&
-              (bt.columns[kc].type == SqlDataType::Int || (bt.columns[kc].type == SqlDataType::Decimal && bt.columns[kc].scale == 0) ||
-               (bt.inferred_types && !bt.columns[kc].declared_text))) {
-            if (std::shared_ptr<const std::vector<double>> dn = dict_numbers(bcs)) { nk.cs = &bcs; nk.src = ks; nk.dnum = std::move(dn); }
+        }
+      }
+    }
+
+    // An active link on this very join (CREATE ACTIVE LINK): the base row's own row number says which
+    // row(s) of the joined table it meets, with no key to evaluate or hash. Only integer keys are linked,
+    // so no collation or number/text bridging is involved; the candidates then pass every check below.
+    const std::vector<uint32_t>* link_to_parent = nullptr;
+    const std::vector<std::vector<uint32_t>>* link_to_kids = nullptr;
+    size_t link_src = 0;
+    if (best_ki >= 0 && !direct_code_join && db && db->active_data() && !xk_join) {
+      const SqlExpr* bval = prep_jkeys[best_ki].value;
+      size_t ls = 0, lc = 0;
+      if (bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &ls, &lc) == ColumnLookup::Found &&
+          ls < baseonly.size() && baseonly[ls].table && prep_jkeys[best_ki].column >= 0) {
+        auto ll = db->active_data()->find_link(*baseonly[ls].table, lc, *js.table, (size_t)prep_jkeys[best_ki].column);
+        if (ll.found) { link_to_parent = ll.to_parent; link_to_kids = ll.to_children; link_src = ls; }
+      }
+    }
+
+    bool direct_num_join = false;
+    size_t dn_base_src = 0;
+    size_t dn_base_col = 0;
+    const ColumnStore* dn_base_cs = nullptr;
+    bool dn_base_is_int = false;
+
+    if (best_ki >= 0 && !direct_code_join && !link_to_parent && !link_to_kids && prep_jkeys[best_ki].idx &&
+        prep_jkeys[best_ki].idx->numeric_column) {
+      const SqlExpr* bval = prep_jkeys[best_ki].value;
+      if (bval && bval->op == ExprOp::Column &&
+          lookup_column_here(basectx, *bval, &dn_base_src, &dn_base_col) == ColumnLookup::Found &&
+          dn_base_src < baseonly.size() && baseonly[dn_base_src].table) {
+        const SqlTable& bt = *baseonly[dn_base_src].table;
+        if (!bt.inferred_types && dn_base_col < bt.col_data.size() && bt.col_data[dn_base_col].size() == bt.row_count()) {
+          const ColumnStore& bcs = bt.col_data[dn_base_col];
+          if (vx::typed_integer(bcs) || bcs.encoding == ColumnEncoding::TypedDouble ||
+              bcs.encoding == ColumnEncoding::DecimalScaled) {
+            direct_num_join = true;
+            dn_base_cs = &bcs;
+            dn_base_is_int = vx::typed_integer(bcs);
           }
-          if (nk.konst || nk.cmap || nk.dnum) {
-            // the joined side is checked below, as every key's is
-          } else if (!numeric_type || bcs.size() != bt.row_count() ||
-              !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) {
-            batch_ok = false;
-            if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + bt.name + "." + (kc < bt.columns.size() ? bt.columns[kc].name : "?") +
-                                        ") is not a number this row has: " + vx_encoding_name(bcs.encoding) + (numeric_type ? "" : ", not a number type"));
-            break;
+        }
+      }
+    }
+
+    // Numbers a double cannot carry on either side of the main key: matches are confirmed by their digits.
+    bool best_wide = false;
+    bool js_key_wide = false;
+    if (best_ki >= 0 && prep_jkeys[best_ki].column >= 0 && (size_t)prep_jkeys[best_ki].column < js.table->col_data.size()) {
+      best_wide = js_key_wide = vx::wide_numbers(js.table->col_data[(size_t)prep_jkeys[best_ki].column]);
+      const SqlExpr* bval = prep_jkeys[best_ki].value;
+      size_t bs = 0, bc = 0;
+      if (!best_wide && bval && bval->op == ExprOp::Column && lookup_column_here(basectx, *bval, &bs, &bc) == ColumnLookup::Found &&
+          bs < baseonly.size() && baseonly[bs].table && bc < baseonly[bs].table->col_data.size())
+        best_wide = vx::wide_numbers(baseonly[bs].table->col_data[bc]);
+      else if (!best_wide && bval && bval->op != ExprOp::Column && bval->op != ExprOp::Literal)
+        best_wide = true;   // an expression: its values are not known ahead
+    }
+    // A key that is an expression of the base row (sy * 320 + sx = pix) is evaluated over every base row
+    // at once where it compiles (vp); key_val reads this row's value back, or interprets the key.
+    std::vector<vp::Column> vp_keys;
+    std::vector<char> vp_key_ok;
+    if (rows.size() >= 256) {
+      vp_keys.resize(prep_jkeys.size());
+      vp_key_ok.assign(prep_jkeys.size(), 0);
+      EvalCtx kctx; kctx.db = db; kctx.outer = outer_scope; kctx.sources = &baseonly;
+      for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+        const uint64_t kt0 = vx_trace_on() ? hal_now_ns() : 0;
+        const vp::Prog* P = vp::program_for(prep_jkeys[ki].value, kctx);
+        const uint64_t kt1 = vx_trace_on() ? hal_now_ns() : 0;
+        if (!P) { if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " not compiled (" + std::to_string((kt1 - kt0) / 1000) + " us)"); continue; }
+        std::string verr;
+        vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
+        if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " compiled in " + std::to_string((kt1 - kt0) / 1000) + " us, " +
+                                    std::to_string(P->ins.size()) + " ops over " + std::to_string(rows.size()) + " rows in " + std::to_string((hal_now_ns() - kt1) / 1000) + " us" + (vp_key_ok[ki] ? "" : " (failed)"));
+      }
+    }
+    // An expression key whose values are all known now, and all within a double's 53 bits: the probe's double
+    // finds exactly its matches, so no candidate has to be confirmed by its digits.
+    if (best_wide && !js_key_wide && best_ki >= 0 && (size_t)best_ki < vp_key_ok.size() && vp_key_ok[(size_t)best_ki]) {
+      const vp::Column& kc = vp_keys[(size_t)best_ki];
+      bool narrow = kc.ty == vp::Ty::I64 && !kc.uns;
+      for (size_t r = 0; narrow && r < kc.size(); ++r)
+        if (!kc.is_null(r) && (kc.i[r] > 9007199254740992LL || kc.i[r] < -9007199254740992LL)) narrow = false;
+      if (narrow) best_wide = false;
+    }
+    const uint64_t jt_d = vx_trace_on() ? hal_now_ns() : 0;   // hash tables, memo keys, vectorized keys ready
+    auto key_val = [&](size_t ki, const JoinedRow& base, EvalCtx& vctx) -> Val {
+      if (ki < vp_key_ok.size() && vp_key_ok[ki]) {
+        const size_t ri = (size_t)(&base - rows.data());
+        if (ri < vp_keys[ki].size()) return vp_keys[ki].at(ri);
+      }
+      return eval_expr(prep_jkeys[ki].value, vctx);
+    };
+    // A pushed-down WHERE conjunct that compiles as a program over this step's sources is left out of the
+    // per-candidate checks and applied to the step's rows all at once, after it (vp_deferred below). Not when
+    // a LIMIT ends the step early: the count it stops at would be of unfiltered rows.
+    const bool step_limited = limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j];
+    if (!step_limited && !pushable.empty() && rows.size() >= 256 && vp::enabled()) {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* p : pushable) {
+        bool retry = false;
+        const vp::Prog* P = vp::program_for(p, pctx, &retry);
+        // one waiting on a subquery's set ((x, y) NOT IN (SELECT ..)): the interpreter runs it on the step's
+        // first row, which fills the set, and the program compiles then
+        if (!P && !retry) continue;
+        if (P && P->out().ty == vp::Ty::Str) continue;
+        vp_deferred.push_back(p);
+      }
+      if (!vp_deferred.empty()) {
+        auto drop = [&](std::vector<const SqlExpr*>& v) {
+          v.erase(std::remove_if(v.begin(), v.end(), [&](const SqlExpr* p) { return std::find(vp_deferred.begin(), vp_deferred.end(), p) != vp_deferred.end(); }), v.end());
+        };
+        drop(pushable);
+        drop(pushable_rest);
+      }
+    }
+    // The joined rows whose keys equal this base row's.
+    auto gather_matches = [&](const JoinedRow& base, EvalCtx& vctx, std::vector<size_t>& out) {
+      out.clear();
+      if (best_ki >= 0) {
+        std::vector<size_t> match_cands;
+        if (link_to_parent || link_to_kids) {
+          const size_t base_ri = link_src < base.parts.size() ? base.parts[link_src] : kNullRow;
+          if (base_ri == kNullRow) return;
+          if (link_to_parent) {
+            if (base_ri >= link_to_parent->size()) return;
+            const uint32_t pr = (*link_to_parent)[base_ri];
+            if (pr == UINT32_MAX) return;
+            match_cands.push_back(pr);
           } else {
-            nk.cs = &bcs;
-            nk.src = ks;
-            nk.ints = !typed_dbl;
+            if (base_ri >= link_to_kids->size()) return;
+            const auto& kids = (*link_to_kids)[base_ri];
+            match_cands.assign(kids.begin(), kids.end());
           }
+        } else if (direct_code_join) {
+          const size_t base_ri = (dc_base_src < base.parts.size()) ? base.parts[dc_base_src] : kNullRow;
+          if (base_ri == kNullRow || base_ri >= dc_base_cs->size() || dc_base_cs->is_null(base_ri)) return;
+          const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
+          if (ca >= dc_code_map->p2c.size()) return;
+          const int32_t cb = dc_code_map->p2c[ca];
+          if (cb < 0 || (size_t)cb >= prep_jkeys[best_ki].idx->by_code.size()) return;
+          const auto& cands = prep_jkeys[best_ki].idx->by_code[(size_t)cb];
+          match_cands.assign(cands.begin(), cands.end());
+        } else if (direct_num_join) {
+          const size_t base_ri = (dn_base_src < base.parts.size()) ? base.parts[dn_base_src] : kNullRow;
+          if (base_ri == kNullRow || base_ri >= dn_base_cs->size() || dn_base_cs->is_null(base_ri)) return;
+          double num = 0.0;
+          if (dn_base_is_int) num = (double)vx::typed_int(*dn_base_cs, base_ri);
+          else if (!dn_base_cs->get_double(base_ri, &num)) return;
+          // val_num, not Val(num): Val is an aggregate, and Val(num) put the number in its first member -
+          // `null` - so every key but 0 probed as NULL and a join of two typed tables met almost nothing
+          probe_gather_matches(prep_jkeys[best_ki].idx.get(), val_num(num), match_cands);
+          if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          Val want = key_val((size_t)best_ki, base, vctx);
+          if (want.null) return;
+          probe_gather_matches(prep_jkeys[best_ki].idx.get(), want, match_cands);
         }
-        // the joined side of a key beside the probing one: a typed number, a Constant-encoded INT (its one value), or
-        // the text column a code map reaches
-        if ((int)ki != best_ki && !key_typed[ki] && !nk.cmap) {
-          const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-          double jv = 0;
-          const SqlColumn& jcol = js.table->columns[(size_t)prep_jkeys[ki].column];
-          if (kcs.encoding == ColumnEncoding::Constant && !js.table->inferred_types && jcol.type == SqlDataType::Int &&
-              !sql_is_null(kcs.constant_val) && parse_number(kcs.constant_val, &jv)) { nk.jkonst = true; nk.jkval = jv; }
-          else if (kcs.size() == js.table->row_count() && !jcol.temporal && vx::dict_coded(kcs) &&
-                   (jcol.type == SqlDataType::Int || (jcol.type == SqlDataType::Decimal && jcol.scale == 0) || (js.table->inferred_types && !jcol.declared_text)) &&
-                   (nk.jdnum = dict_numbers(kcs))) {
-            // a number column kept as a dictionary: compared by its entry's number
-          } else {
-            batch_ok = false;
-            if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + js.table->name + "." + js.table->columns[(size_t)prep_jkeys[ki].column].name +
-                                        ") is not a number the joined table holds typed: " + vx_encoding_name(kcs.encoding));
+        // The index finds numbers by their double, which joins 9007199254740993 to ...992 and every BIGINT
+        // UNSIGNED near 2^64 to its neighbours. Where either side holds such numbers, each candidate's key is
+        // checked against this row's by its digits.
+        if (best_wide && !link_to_parent && !link_to_kids && !direct_code_join && !match_cands.empty()) {
+          const Val want = key_val((size_t)best_ki, base, vctx);
+          const ColumnStore& jcs = js.table->col_data[(size_t)prep_jkeys[best_ki].column];
+          size_t w = 0;
+          for (size_t mi = 0; mi < match_cands.size(); ++mi) {
+            const size_t mr = match_cands[mi];
+            if (mr >= jcs.size() || jcs.is_null(mr)) continue;
+            const std::string& cell = jcs.get(mr);
+            double d = 0;
+            if (!parse_number(cell, &d)) { match_cands[w++] = mr; continue; }
+            if (compare_vals(want, val_num_with_text(d, cell)) == 0) match_cands[w++] = mr;
           }
+          match_cands.resize(w);
         }
-      }
-      if (vx_trace_on() && best_ki >= 0 && !batch_ok)
-        vx_trace("join: +" + js.alias + " not batched: " + (!batch_join_on ? "off" : !prep_jkeys[(size_t)best_ki].idx ? "no index" : link_to_parent || link_to_kids ? "active link" :
-                 direct_code_join ? "direct code join" : best_wide ? "wide numbers" : xk_join ? "expression key" : "a key not held as a number this row has"));
-      // The probe's own equality is exact here - a typed number column found by its number, or dictionary codes
-      // mapped by their collation keys - so the key's conjunct leaves the per-candidate ON checks (it was still
-      // evaluated for every candidate, in lanes or interpreted).
-      if (best_ki >= 0 && ((batch_ok && prep_jkeys[(size_t)best_ki].idx->numeric_column) || direct_code_join)) {
-        const SqlExpr* kv = prep_jkeys[(size_t)best_ki].value;
-        auto is_key_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
-        const size_t before = on_check.size() + on_vec.size();
-        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_key_conj), on_check.end());
-        for (size_t k = 0; k < on_vec.size();) {
-          if (is_key_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
-        }
-        if (vx_trace_on() && before != on_check.size() + on_vec.size())
-          vx_trace("join: +" + js.alias + " ON: the key's equality is the probe's (" + std::string(direct_code_join ? "dictionary codes" : "numbers") + "): " +
-                   std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
-      }
-      // A text key beside the probing one, matched by code through its code map (other_keys_match - the
-      // interpreter's collation equality, NULL never equal): its conjunct is decided there for every candidate, so it
-      // leaves the per-candidate checks too (`s.loccode = i.loccode` beside `s.productid = i.productid` was
-      // interpreted for each of 100k candidates after the codes had already said yes).
-      if (batch_ok && !direct_code_join) {
-        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-          if ((int)ki == best_ki || !numkeys[ki].cmap) continue;
-          const SqlExpr* kv = prep_jkeys[ki].value;
-          auto is_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
-          on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_conj), on_check.end());
-          for (size_t k = 0; k < on_vec.size();) {
-            if (is_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
+        std::vector<Val> other(prep_jkeys.size());
+        bool other_ready = false;
+        for (size_t match_ri : match_cands) {
+          if (match_ri >= js.table->row_count()) continue;
+          if (!other_ready) {
+            for (size_t ki = 0; ki < prep_jkeys.size(); ++ki)
+              if ((int)ki != best_ki) other[ki] = key_val(ki, base, vctx);
+            other_ready = true;
           }
-        }
-      }
-      auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
-        if (k.lane) {
-          if (k.lane->is_null(bi)) return false;
-          *out = k.lane->ty == vp::Ty::I64 ? (double)k.lane->i[bi] : k.lane->f[bi];
-          return true;
-        }
-        const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
-        if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
-        if (k.konst) { *out = k.kval; return true; }
-        if (k.dnum) {
-          const uint32_t c = vx::code_at(*k.cs, r);
-          if (c >= k.dnum->size() || std::isnan((*k.dnum)[c])) return false;
-          *out = (*k.dnum)[c];
-          return true;
-        }
-        *out = k.ints ? (double)vx::typed_int(*k.cs, r) : vx::typed_value(*k.cs, r);
-        return true;
-      };
-      // Whether joined row mr meets base row bi on every key beside the probing one: numbers as numbers (a
-      // Constant column's one value either side), a text key by its code through the code map.
-      auto other_keys_match = [&](size_t bi, const JoinedRow& base, size_t mr) -> bool {
-        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
-          if ((int)ki == best_ki) continue;
-          const NumKey& nk = numkeys[ki];
-          const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-          if (nk.cmap) {
-            const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
-            if (r == kNullRow || r >= nk.cs->size()) return false;
-            if (nk.bcodes) {
-              if (nk.bnulls && (*nk.bnulls)[r]) return false;
-              const uint32_t ca = (*nk.bcodes)[r];
-              if (ca >= nk.cmap->p2c.size()) return false;
-              const int32_t cb = nk.cmap->p2c[ca];
-              if (cb < 0 || mr >= nk.jcodes->size() || (nk.jnulls && (*nk.jnulls)[mr]) || (*nk.jcodes)[mr] != (uint32_t)cb) return false;
-              continue;
+          bool all_keys_match = true;
+          for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+            if ((int)ki == best_ki) continue;
+            const Val& want_k = other[ki];
+            if (want_k.null) { all_keys_match = false; break; }
+            int col_idx = prep_jkeys[ki].column;
+            if (js.table->col_data[col_idx].is_null(match_ri)) { all_keys_match = false; break; }
+            if (want_k.numeric) {
+              // A typed column holds the number itself; printing it to
+              // text and strtod-ing it back, per candidate, was most of
+              // the stockmoves join on the open-orders page (146k
+              // transno candidates for 6k (transno, orderlineref) rows).
+              if (key_typed[ki]) {
+                if (vx::typed_value(js.table->col_data[col_idx], match_ri) != want_k.num) {
+                  all_keys_match = false; break;
+                }
+                continue;
+              }
+              double cell_num = 0.0;
+              if (!parse_number(js.table->cell(match_ri, col_idx), &cell_num) || cell_num != want_k.num) {
+                all_keys_match = false; break;
+              }
+            } else {
+              if (!strcase_eq(js.table->cell(match_ri, col_idx), want_k.str())) {
+                all_keys_match = false; break;
+              }
             }
-            if (nk.cs->is_null(r)) return false;
-            const uint32_t ca = vx::code_at(*nk.cs, r);
+          }
+          if (all_keys_match) out.push_back(match_ri);
+        }
+      } else if (xk_join) {
+        Val want = eval_expr(xk_base, vctx);
+        xk_exact = false;
+        if (want.null) return;
+        const std::vector<uint32_t>* a = nullptr;
+        const std::vector<uint32_t>* b = nullptr;
+        if (want.numeric) {
+          const double n = want.num == 0 ? 0.0 : want.num;
+          auto h1 = xk_num.find(n);
+          if (h1 != xk_num.end()) a = &h1->second;
+          auto h2 = xk_tnum.find(n);
+          if (h2 != xk_tnum.end()) b = &h2->second;
+        } else {
+          auto h1 = hash_tbl.find(collate_key(want.str()));
+          if (h1 != hash_tbl.end()) a = &h1->second;
+          if (!xk_num.empty()) {
+            const double n0 = numeric_prefix_of(want.str());
+            auto h2 = xk_num.find(n0 == 0 ? 0.0 : n0);
+            if (h2 != xk_num.end()) b = &h2->second;
+          }
+        }
+        if (a) out.assign(a->begin(), a->end());
+        // exact numbers on both sides (the hash holds the joined expression's numbers, this probe's is one, a
+        // double carries both): every candidate equals it; a text-prefix match (b) does not say so
+        xk_exact = a && !b && want.numeric && !InLookupSet::is_wide(want) && !xk_has_text;
+        if (b) {
+          out.insert(out.end(), b->begin(), b->end());
+          std::sort(out.begin(), out.end());
+          out.erase(std::unique(out.begin(), out.end()), out.end());
+        }
+      } else if (single_int_hash) {
+        Val want = eval_expr(prep_jkeys[0].value, vctx);
+        if (want.null) return;
+        // The probe as a number; one with a fraction, or past int64, equals no integer.
+        double d = 0.0;
+        if (want.numeric) d = want.num;
+        else if (!parse_number(want.str(), &d)) return;
+        if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0) || d != std::trunc(d)) return;
+        const int64_t iv = (int64_t)d;
+        auto hit = int_hash_tbl.find(iv);
+        if (hit != int_hash_tbl.end()) out.assign(hit->second.begin(), hit->second.end());
+        if (db) db->metrics().radix_joins.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        std::string probe_key;
+        for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+          Val want = key_val(ki, base, vctx);
+          if (want.null) return;
+          if (ki > 0) probe_key.push_back('\x1f');
+          probe_key += collate_key(want.str());
+        }
+        auto hit = hash_tbl.find(probe_key);
+        if (hit != hash_tbl.end()) out.assign(hit->second.begin(), hit->second.end());
+      }
+    };
+
+    std::atomic<uint64_t> t_gather{0}, t_on{0}, n_cands{0}, n_skipped{0};   // step diagnostics, in the trace
+    const bool step_timing = vx_trace_on();
+    // The ON conjuncts that read the base rows alone (`LEFT JOIN wt ON p.is_sky AND wt.k = ..`), evaluated in
+    // lanes over every base row first: a row they refuse is padded (or dropped) without a probe.
+    std::vector<uint8_t> base_refused;
+    std::unordered_set<const SqlExpr*> base_decided;   // the conjuncts base_refused settled, for every candidate of a row it kept
+    if (has_extra_join && rows.size() >= 256 && vp::enabled() && !join_is_right[j]) {
+      EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
+      for (const SqlExpr* pc : jparts) {
+        if (!expr_only_reads(pc, bctx) || expr_has_subquery_raw(pc)) continue;
+        const vp::Prog* P = vp::program_for(pc, bctx);
+        if (!P || P->out().ty == vp::Ty::Str) continue;
+        vp::Column col;
+        std::string verr;
+        if (!vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, rows.size(), &col, &verr)) continue;
+        if (base_refused.empty()) base_refused.assign(rows.size(), 0);
+        for (size_t r = 0; r < rows.size(); ++r)
+          if (col.is_null(r) || (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0)) base_refused[r] = 1;
+        base_decided.insert(pc);
+      }
+    }
+    // What a candidate still has to pass of the ON clause. A conjunct the base rows alone decided (above) reads
+    // nothing of the joined row: true for every candidate of a row that was not refused, so it is not checked
+    // again. A conjunct that compiles as a program is checked over a chunk's candidates at once in lanes
+    // (on_vec: OnSink / flush_sink below), not interpreted per candidate - the flat-texture join of a SQLDoom
+    // frame interpreted `fl.name = p.tex_name` for 56,000 candidates, 29 ms of a 480 ms frame. The rest, and
+    // the expression key's own equality (settled by xk_exact where it can be), stay per candidate in on_true.
+    std::vector<const SqlExpr*> on_vec;
+    std::vector<const vp::Prog*> on_vec_progs;
+    if (!base_decided.empty())
+      on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return base_decided.count(pc) > 0; }), on_check.end());
+    // The ON clause's own conditions on the joined table, where they alone made js_pass (no WHERE part among
+    // them): js_pass is then their answer for every row, read before a candidate counts (pass_is_on below),
+    // so they are not evaluated again per candidate - `LEFT JOIN stock s ON s.productid = p.id AND
+    // s.onhand > 0` checked onhand over 63k candidates in lanes after selecting the rows by it.
+    if (pass_is_on && !on_own.empty())
+      on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_own.begin(), on_own.end(), pc) != on_own.end(); }), on_check.end());
+    if (has_extra_join && rows.size() >= 256 && vp::enabled()) {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* pc : on_check) {
+        if (pc == xk_conj || expr_has_subquery_raw(pc)) continue;
+        const vp::Prog* P = vp::program_for(pc, pctx);
+        if (!P || P->out().ty == vp::Ty::Str) continue;
+        on_vec.push_back(pc);
+        on_vec_progs.push_back(P);
+      }
+      if (!on_vec.empty())
+        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_vec.begin(), on_vec.end(), pc) != on_vec.end(); }), on_check.end());
+    }
+    if (vx_trace_on() && has_extra_join)
+      vx_trace("join: +" + js.alias + " ON conjuncts: " + std::to_string(base_decided.size()) + " decided by the base rows, " +
+               std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
+    // A chunk's candidates that passed on_true and await on_vec, in base order (bi: the base row of each).
+    struct OnSink {
+      JoinedRows cands;
+      std::vector<uint32_t> bi;
+    };
+    // The batched probe: where every key of the step is a number this row already holds - the probing key in a
+    // program's lanes or a typed column of an earlier table, each other key likewise and a typed column on the
+    // joined side - a base row's matches are read straight off the index's number map and checked against the
+    // other keys as numbers, with no Val, context or candidate list per row. It makes exactly the rows
+    // process_probe makes, in the same order: the same candidates (the index's list for the number; for 0,
+    // the digitless rows too, through probe_gather_matches), the same ON, prefilter, WHERE and padding.
+    // Not for a key whose numbers a double may not carry (best_wide), a dictionary-code or parent/child link,
+    // or a key held as text. AIOS_SQL_BATCH_JOIN=0 turns it off.
+    struct NumKey {
+      const vp::Column* lane = nullptr;
+      const ColumnStore* cs = nullptr;
+      size_t src = 0;
+      bool ints = false;
+      bool konst = false;                              // a Constant-encoded column: every row holds kval
+      double kval = 0;
+      std::shared_ptr<const StarCodeMap> cmap;         // a text key beside the probing one: its codes mapped to the joined column's
+      // cmap: both columns' codes and NULL flags decoded whole (vx::decoded_*, kept between statements) - a code
+      // decoded per row (code_at) cost ~100 instructions each, 108M of a 600k-row composite join's 560M
+      std::shared_ptr<const std::vector<uint32_t>> bcodes, jcodes;
+      std::shared_ptr<const std::vector<uint8_t>> bnulls, jnulls;
+      bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
+      double jkval = 0;
+      std::shared_ptr<const std::vector<double>> dnum; // a dictionary-coded number column: the number per code
+      std::shared_ptr<const std::vector<double>> jdnum; // the joined column held as such a dictionary
+    };
+    std::vector<NumKey> numkeys(prep_jkeys.size());
+    static const bool batch_join_on = [] { const char* v = std::getenv("AIOS_SQL_BATCH_JOIN"); return !(v && *v == '0'); }();
+    // (a direct code join probes its key by dictionary code, below; its other keys as numbers)
+    bool batch_ok = batch_join_on && best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx && !link_to_parent && !link_to_kids &&
+                    (!best_wide || direct_code_join) && !xk_join;
+    for (size_t ki = 0; batch_ok && ki < prep_jkeys.size(); ++ki) {
+      NumKey& nk = numkeys[ki];
+      if (direct_code_join && (int)ki == best_ki) continue;
+      if (ki < vp_key_ok.size() && vp_key_ok[ki] && vp_keys[ki].ty != vp::Ty::Str && !vp_keys[ki].uns) {
+        nk.lane = &vp_keys[ki];
+      } else {
+        const SqlExpr* kv = prep_jkeys[ki].value;
+        size_t ks = 0, kc = 0;
+        if (!kv || kv->op != ExprOp::Column || lookup_column_here(basectx, *kv, &ks, &kc) != ColumnLookup::Found ||
+            ks >= baseonly.size() || !baseonly[ks].table || kc >= baseonly[ks].table->col_data.size()) { batch_ok = false; break; }
+        const SqlTable& bt = *baseonly[ks].table;
+        const ColumnStore& bcs = bt.col_data[kc];
+        const bool typed_int = bcs.encoding == ColumnEncoding::TypedInt64 || bcs.encoding == ColumnEncoding::TypedInt32;
+        const bool typed_dbl = bcs.encoding == ColumnEncoding::TypedDouble;
+        // a number the interpreter reads as exactly this value: a declared table's typed integer or double, or a
+        // result table's (its values are canonical)
+        const bool numeric_type = kc < bt.columns.size() && !bt.columns[kc].temporal &&
+                                  (bt.columns[kc].type == SqlDataType::Int || (typed_dbl && bt.columns[kc].type == SqlDataType::Real && bt.columns[kc].scale == 0));
+        // a Constant-encoded INT column (a map_id that is 1 in every row): its one value
+        if ((int)ki != best_ki && bcs.encoding == ColumnEncoding::Constant && kc < bt.columns.size() && !bt.columns[kc].temporal &&
+            bt.columns[kc].type == SqlDataType::Int && bcs.size() == bt.row_count() && !sql_is_null(bcs.constant_val)) {
+          double kcv = 0;
+          if (parse_number(bcs.constant_val, &kcv)) { nk.cs = &bcs; nk.src = ks; nk.konst = true; nk.kval = kcv; nk.ints = true; }
+        }
+        // a text key beside the probing one, both dictionary-coded: compared by dictionary code through the star
+        // code map (collation equality, as the interpreter compares two texts)
+        if ((int)ki != best_ki && !nk.konst && prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
+          StarKey pk, ck;
+          if (star_key_of(bt, kc, &pk) && star_key_of(*js.table, (size_t)prep_jkeys[ki].column, &ck) && pk.text && ck.text) {
+            std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck);
+            if (m && m->ok) {
+              nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m);
+              const size_t jc = (size_t)prep_jkeys[ki].column;
+              if (bcs.size() == bt.row_count() && js.table->col_data[jc].size() == js.table->row_count()) {
+                nk.bcodes = vx::decoded_codes(bt, kc);
+                nk.jcodes = vx::decoded_codes(*js.table, jc);
+                if (vx::has_nulls(bcs)) nk.bnulls = vx::decoded_nulls(bt, kc);
+                if (vx::has_nulls(js.table->col_data[jc])) nk.jnulls = vx::decoded_nulls(*js.table, jc);
+                // all or none: a missing one (the budget) leaves the per-row reads
+                if (!nk.bcodes || !nk.jcodes || (vx::has_nulls(bcs) && !nk.bnulls) || (vx::has_nulls(js.table->col_data[jc]) && !nk.jnulls)) {
+                  nk.bcodes.reset(); nk.jcodes.reset(); nk.bnulls.reset(); nk.jnulls.reset();
+                }
+              }
+            }
+          }
+        }
+        // a number column held as a dictionary (a DECIMAL(65,0) from integer arithmetic, an INT kept as codes, a
+        // result table's numeric text): its entries as numbers, read per row by code
+        if (!nk.konst && !nk.cmap && kc < bt.columns.size() && !bt.columns[kc].temporal && bcs.size() == bt.row_count() &&
+            vx::dict_coded(bcs) && !typed_int && !typed_dbl &&
+            (bt.columns[kc].type == SqlDataType::Int || (bt.columns[kc].type == SqlDataType::Decimal && bt.columns[kc].scale == 0) ||
+             (bt.inferred_types && !bt.columns[kc].declared_text))) {
+          if (std::shared_ptr<const std::vector<double>> dn = dict_numbers(bcs)) { nk.cs = &bcs; nk.src = ks; nk.dnum = std::move(dn); }
+        }
+        if (nk.konst || nk.cmap || nk.dnum) {
+          // the joined side is checked below, as every key's is
+        } else if (!numeric_type || bcs.size() != bt.row_count() ||
+            !(typed_int || typed_dbl || (!bt.inferred_types && vx::typed_integer(bcs)))) {
+          batch_ok = false;
+          if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + bt.name + "." + (kc < bt.columns.size() ? bt.columns[kc].name : "?") +
+                                      ") is not a number this row has: " + vx_encoding_name(bcs.encoding) + (numeric_type ? "" : ", not a number type"));
+          break;
+        } else {
+          nk.cs = &bcs;
+          nk.src = ks;
+          nk.ints = !typed_dbl;
+        }
+      }
+      // the joined side of a key beside the probing one: a typed number, a Constant-encoded INT (its one value), or
+      // the text column a code map reaches
+      if ((int)ki != best_ki && !key_typed[ki] && !nk.cmap) {
+        const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+        double jv = 0;
+        const SqlColumn& jcol = js.table->columns[(size_t)prep_jkeys[ki].column];
+        if (kcs.encoding == ColumnEncoding::Constant && !js.table->inferred_types && jcol.type == SqlDataType::Int &&
+            !sql_is_null(kcs.constant_val) && parse_number(kcs.constant_val, &jv)) { nk.jkonst = true; nk.jkval = jv; }
+        else if (kcs.size() == js.table->row_count() && !jcol.temporal && vx::dict_coded(kcs) &&
+                 (jcol.type == SqlDataType::Int || (jcol.type == SqlDataType::Decimal && jcol.scale == 0) || (js.table->inferred_types && !jcol.declared_text)) &&
+                 (nk.jdnum = dict_numbers(kcs))) {
+          // a number column kept as a dictionary: compared by its entry's number
+        } else {
+          batch_ok = false;
+          if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " (" + js.table->name + "." + js.table->columns[(size_t)prep_jkeys[ki].column].name +
+                                      ") is not a number the joined table holds typed: " + vx_encoding_name(kcs.encoding));
+        }
+      }
+    }
+    if (vx_trace_on() && best_ki >= 0 && !batch_ok)
+      vx_trace("join: +" + js.alias + " not batched: " + (!batch_join_on ? "off" : !prep_jkeys[(size_t)best_ki].idx ? "no index" : link_to_parent || link_to_kids ? "active link" :
+               direct_code_join ? "direct code join" : best_wide ? "wide numbers" : xk_join ? "expression key" : "a key not held as a number this row has"));
+    // The probe's own equality is exact here - a typed number column found by its number, or dictionary codes
+    // mapped by their collation keys - so the key's conjunct leaves the per-candidate ON checks (it was still
+    // evaluated for every candidate, in lanes or interpreted).
+    if (best_ki >= 0 && ((batch_ok && prep_jkeys[(size_t)best_ki].idx->numeric_column) || direct_code_join)) {
+      const SqlExpr* kv = prep_jkeys[(size_t)best_ki].value;
+      auto is_key_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
+      const size_t before = on_check.size() + on_vec.size();
+      on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_key_conj), on_check.end());
+      for (size_t k = 0; k < on_vec.size();) {
+        if (is_key_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
+      }
+      if (vx_trace_on() && before != on_check.size() + on_vec.size())
+        vx_trace("join: +" + js.alias + " ON: the key's equality is the probe's (" + std::string(direct_code_join ? "dictionary codes" : "numbers") + "): " +
+                 std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
+    }
+    // A text key beside the probing one, matched by code through its code map (other_keys_match - the
+    // interpreter's collation equality, NULL never equal): its conjunct is decided there for every candidate, so it
+    // leaves the per-candidate checks too (`s.loccode = i.loccode` beside `s.productid = i.productid` was
+    // interpreted for each of 100k candidates after the codes had already said yes).
+    if (batch_ok && !direct_code_join) {
+      for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+        if ((int)ki == best_ki || !numkeys[ki].cmap) continue;
+        const SqlExpr* kv = prep_jkeys[ki].value;
+        auto is_conj = [&](const SqlExpr* pc) { return pc && pc->op == ExprOp::Eq && pc->args.size() == 2 && (pc->args[0].get() == kv || pc->args[1].get() == kv); };
+        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), is_conj), on_check.end());
+        for (size_t k = 0; k < on_vec.size();) {
+          if (is_conj(on_vec[k])) { on_vec.erase(on_vec.begin() + (long)k); on_vec_progs.erase(on_vec_progs.begin() + (long)k); } else ++k;
+        }
+      }
+    }
+    auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
+      if (k.lane) {
+        if (k.lane->is_null(bi)) return false;
+        *out = k.lane->ty == vp::Ty::I64 ? (double)k.lane->i[bi] : k.lane->f[bi];
+        return true;
+      }
+      const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
+      if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
+      if (k.konst) { *out = k.kval; return true; }
+      if (k.dnum) {
+        const uint32_t c = vx::code_at(*k.cs, r);
+        if (c >= k.dnum->size() || std::isnan((*k.dnum)[c])) return false;
+        *out = (*k.dnum)[c];
+        return true;
+      }
+      *out = k.ints ? (double)vx::typed_int(*k.cs, r) : vx::typed_value(*k.cs, r);
+      return true;
+    };
+    // Whether joined row mr meets base row bi on every key beside the probing one: numbers as numbers (a
+    // Constant column's one value either side), a text key by its code through the code map.
+    auto other_keys_match = [&](size_t bi, const JoinedRow& base, size_t mr) -> bool {
+      for (size_t ki = 0; ki < prep_jkeys.size(); ++ki) {
+        if ((int)ki == best_ki) continue;
+        const NumKey& nk = numkeys[ki];
+        const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+        if (nk.cmap) {
+          const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
+          if (r == kNullRow || r >= nk.cs->size()) return false;
+          if (nk.bcodes) {
+            if (nk.bnulls && (*nk.bnulls)[r]) return false;
+            const uint32_t ca = (*nk.bcodes)[r];
             if (ca >= nk.cmap->p2c.size()) return false;
             const int32_t cb = nk.cmap->p2c[ca];
-            if (cb < 0 || kcs.is_null(mr) || vx::code_at(kcs, mr) != (uint32_t)cb) return false;
+            if (cb < 0 || mr >= nk.jcodes->size() || (nk.jnulls && (*nk.jnulls)[mr]) || (*nk.jcodes)[mr] != (uint32_t)cb) return false;
             continue;
           }
-          double w = 0;
-          if (!numkey(nk, bi, base, &w)) return false;
-          if (kcs.is_null(mr)) return false;
-          if (nk.jkonst) { if (nk.jkval != w) return false; continue; }
-          if (nk.jdnum) {
-            const uint32_t c = vx::code_at(kcs, mr);
-            if (c >= nk.jdnum->size() || (*nk.jdnum)[c] != w) return false;   // NaN (a NULL entry) never equals
-            continue;
-          }
-          if (vx::typed_value(kcs, mr) != w) return false;
+          if (nk.cs->is_null(r)) return false;
+          const uint32_t ca = vx::code_at(*nk.cs, r);
+          if (ca >= nk.cmap->p2c.size()) return false;
+          const int32_t cb = nk.cmap->p2c[ca];
+          if (cb < 0 || kcs.is_null(mr) || vx::code_at(kcs, mr) != (uint32_t)cb) return false;
+          continue;
         }
-        return true;
-      };
-      // Several keys: the joined rows by all of them at once, built for this step by walking the probing key's
-      // index lists in their own order - so each composite list holds exactly the candidates the old check kept,
-      // in the order it kept them, and a probe is one lookup instead of a walk of the probing key's list
-      // checking the others (34 levels x 256 palette entries: 34 candidates read per pixel). Only where the
-      // joined table is not much larger than the probe side; NULLs never match, a 0 and a -0 are one key.
-      struct CompKey {
-        double v[4] = {0, 0, 0, 0};
-        bool operator==(const CompKey& o) const { return v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3]; }
-      };
-      struct CompHash {
-        size_t operator()(const CompKey& k) const {
-          uint64_t h = 1469598103934665603ULL;
-          for (double d : k.v) { uint64_t b; std::memcpy(&b, &d, 8); h = (h ^ b) * 1099511628211ULL; h ^= h >> 29; }
-          return (size_t)h;
+        double w = 0;
+        if (!numkey(nk, bi, base, &w)) return false;
+        if (kcs.is_null(mr)) return false;
+        if (nk.jkonst) { if (nk.jkval != w) return false; continue; }
+        if (nk.jdnum) {
+          const uint32_t c = vx::code_at(kcs, mr);
+          if (c >= nk.jdnum->size() || (*nk.jdnum)[c] != w) return false;   // NaN (a NULL entry) never equals
+          continue;
         }
-      };
-      std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
-      bool comp_ok = false;
-      bool plain_other_keys = true;   // composite hashing reads the other keys as typed numbers only
-      // (a text key by code map is not hashed: building the composite table each statement - 360k stock rows into a
-      // node map - cost more than the probing key's lists it saves walking, 75 ms against 50)
-      for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst || numkeys[ki].jdnum)) plain_other_keys = false;
-      if (batch_ok && !direct_code_join && plain_other_keys && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
-        const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
-        if (bidx->no_numeric_prefix.empty()) {
-          comp.reserve(bidx->by_number.size() * 2);
-          for (const auto& kv : bidx->by_number) {
-            for (uint32_t mr : kv.second) {
-              if (mr >= js.table->row_count()) continue;
-              CompKey ck;
-              bool null = false;
-              for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
-                if ((int)ki == best_ki) { ck.v[ki] = kv.first == 0 ? 0.0 : kv.first; continue; }
-                const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
-                if (numkeys[ki].jcodes) {
-                  if (numkeys[ki].jnulls && (*numkeys[ki].jnulls)[mr]) { null = true; break; }
-                  ck.v[ki] = (double)(*numkeys[ki].jcodes)[mr];
-                  continue;
-                }
-                if (kcs.is_null(mr)) { null = true; break; }
-                if (numkeys[ki].cmap) { ck.v[ki] = (double)vx::code_at(kcs, mr); continue; }
-                const double d = vx::typed_value(kcs, mr);
-                ck.v[ki] = d == 0 ? 0.0 : d;
-              }
-              if (!null) comp[ck].push_back(mr);
-            }
-          }
-          comp_ok = true;
-        }
+        if (vx::typed_value(kcs, mr) != w) return false;
       }
-      // Where a chunk's probes put their rows. In-place mode (`part`): each base row's one joined row, or
-      // kPadPart (NULL-padded) or kDropPart (dropped), and the base rows are then extended where they are - no
-      // row copied into a chunk list and again into the step's output, which was most of a lookup join's time
-      // (56,000 rows LEFT JOIN a texel table: ~110 ns a row with no candidate at all). A base row meeting a
-      // second candidate turns its chunk to list mode (the rows themselves, in probe order, as the step always
-      // made them); the chunks are joined back in order either way, so the output order is the same.
-      constexpr uint32_t kPadPart = UINT32_MAX, kDropPart = UINT32_MAX - 1;
-      struct ChunkOut {
-        JoinedRows* list = nullptr;
-        std::vector<uint32_t>* part = nullptr;
-        size_t base0 = 0;
-      };
-      // in-place mode so far -> list mode: the chunk's rows [base0, upto) made from their parts, in order
-      // rows a base row meets, on average, by the probing key's index (the joined table's rows over its distinct
-      // keys): an order's three lines. The chunk lists are reserved to it, so a 1:N step does not grow them by doubling.
-      double fanout = 1.5;
-      if (best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx) {
-        const size_t nk = prep_jkeys[(size_t)best_ki].idx->by_number.size();
-        if (nk > 0) fanout = std::min(16.0, std::max(1.5, 1.1 * (double)js.table->row_count() / (double)nk));
+      return true;
+    };
+    // Several keys: the joined rows by all of them at once, built for this step by walking the probing key's
+    // index lists in their own order - so each composite list holds exactly the candidates the old check kept,
+    // in the order it kept them, and a probe is one lookup instead of a walk of the probing key's list
+    // checking the others (34 levels x 256 palette entries: 34 candidates read per pixel). Only where the
+    // joined table is not much larger than the probe side; NULLs never match, a 0 and a -0 are one key.
+    struct CompKey {
+      double v[4] = {0, 0, 0, 0};
+      bool operator==(const CompKey& o) const { return v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3]; }
+    };
+    struct CompHash {
+      size_t operator()(const CompKey& k) const {
+        uint64_t h = 1469598103934665603ULL;
+        for (double d : k.v) { uint64_t b; std::memcpy(&b, &d, 8); h = (h ^ b) * 1099511628211ULL; h ^= h >> 29; }
+        return (size_t)h;
       }
-      auto to_list = [&](ChunkOut& o, size_t upto) {
-        // room for a row per base row of the chunk and some second candidates: the list grew by doubling, and
-        // the copies of the moves were a third of a 257k-row step
-        if (o.list->capacity() < (size_t)((double)o.part->size() * fanout)) o.list->reserve((size_t)((double)o.part->size() * fanout));
-        for (size_t bi = o.base0; bi < upto; ++bi) {
-          const uint32_t p = (*o.part)[bi - o.base0];
-          if (p == kDropPart) continue;
-          JoinedRow r = rows[bi];
-          r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
-          o.list->push_back(std::move(r));
-        }
-        o.part = nullptr;
-      };
-      // a candidate that passed every check: base row bi with joined row mr (cand: the row, where one was made)
-      auto out_cand = [&](ChunkOut& o, size_t bi, size_t mr, JoinedRow* cand) {
-        if (o.part) {
-          uint32_t& slot = (*o.part)[bi - o.base0];
-          if (slot == kDropPart) { slot = (uint32_t)mr; return; }
-          to_list(o, bi + 1);   // a second candidate for this base row
-        }
-        if (cand) { o.list->push_back(std::move(*cand)); return; }
-        JoinedRow r = rows[bi];
-        r.parts.push_back(mr);
-        o.list->push_back(std::move(r));
-      };
-      // a LEFT JOIN's padded row for base row bi, where the pushed WHERE conjuncts admit it
-      auto pad_row = [&](ChunkOut& o, size_t bi, EvalCtx& ctx) {
-        if (!join_is_left[j]) return;
-        if (pushable.empty() && o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
-        JoinedRow padded = rows[bi];
-        padded.parts.push_back(kNullRow);
-        ctx.row = &padded;
-        for (const SqlExpr* p : pushable) if (!predicate_true(p, ctx)) return;
-        if (o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
-        o.list->push_back(std::move(padded));
-      };
-      // whether a candidate's row has to be made for the interpreter (the ON's per-candidate conjuncts, the
-      // pushed WHERE conjuncts); otherwise only its row id is kept until the chunk is assembled
-      const bool cand_checks = (has_extra_join && !on_check.empty()) || !pushable_rest.empty();
-      auto batch_probe = [&](size_t bi, EvalCtx& ctx, ChunkOut& o, OnSink* sink) {
-        const JoinedRow& base = rows[bi];
-        if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad_row(o, bi, ctx); return; }
-        bool matched = false;
-        double key = 0;
-        const auto* idx = prep_jkeys[(size_t)best_ki].idx.get();
-        if (direct_code_join) {
-          // the base row's dictionary code mapped to the joined column's (star_code_map): that code's rows
-          const size_t base_ri = dc_base_src < base.parts.size() ? base.parts[dc_base_src] : kNullRow;
-          if (base_ri != kNullRow && base_ri < dc_base_cs->size() && !dc_base_cs->is_null(base_ri)) {
-            const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
-            if (ca < dc_code_map->p2c.size()) {
-              const int32_t cb = dc_code_map->p2c[ca];
-              if (cb >= 0 && (size_t)cb < idx->by_code.size()) {
-                const std::vector<uint32_t>& cands = idx->by_code[(size_t)cb];
-                for (uint32_t mr : cands) {
-                  if (mr >= js.table->row_count()) continue;
-                  if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) continue;   // the ON's own conditions refuse it
-                  if (!other_keys_match(bi, base, mr)) continue;
-                  JoinedRow cand;
-                  const bool made = cand_checks || sink;
-                  if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
-                  if (has_extra_join && !on_true(ctx)) continue;
-                  if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
-                  matched = true;
-                  if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
-                  if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) continue;
-                  bool keep = true;
-                  for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) { keep = false; break; }
-                  if (keep) out_cand(o, bi, mr, made ? &cand : nullptr);
-                }
-              }
-            }
-          }
-        } else if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
-          auto take = [&](size_t mr) {
-            if (mr >= js.table->row_count()) return;
-            if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) return;   // the ON's own conditions refuse it
-            if (!other_keys_match(bi, base, mr)) return;
-            JoinedRow cand;
-            const bool made = cand_checks || sink;
-            if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
-            if (has_extra_join && !on_true(ctx)) return;
-            if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); return; }
-            matched = true;
-            if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
-            if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) return;
-            for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) return;
-            out_cand(o, bi, mr, made ? &cand : nullptr);
-          };
-          if (comp_ok) {
+    };
+    std::unordered_map<CompKey, std::vector<uint32_t>, CompHash> comp;
+    bool comp_ok = false;
+    bool plain_other_keys = true;   // composite hashing reads the other keys as typed numbers only
+    // (a text key by code map is not hashed: building the composite table each statement - 360k stock rows into a
+    // node map - cost more than the probing key's lists it saves walking, 75 ms against 50)
+    for (size_t ki = 0; ki < numkeys.size(); ++ki) if ((int)ki != best_ki && (numkeys[ki].cmap || numkeys[ki].jkonst || numkeys[ki].jdnum)) plain_other_keys = false;
+    if (batch_ok && !direct_code_join && plain_other_keys && prep_jkeys.size() >= 2 && prep_jkeys.size() <= 4 && js.table->row_count() <= rows.size() * 4 + 65536) {
+      const auto* bidx = prep_jkeys[(size_t)best_ki].idx.get();
+      if (bidx->no_numeric_prefix.empty()) {
+        comp.reserve(bidx->by_number.size() * 2);
+        for (const auto& kv : bidx->by_number) {
+          for (uint32_t mr : kv.second) {
+            if (mr >= js.table->row_count()) continue;
             CompKey ck;
             bool null = false;
             for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
-              double w = key;
-              const NumKey& nk = numkeys[ki];
-              if ((int)ki != best_ki && nk.cmap) {
-                const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
-                if (r == kNullRow || r >= nk.cs->size()) { null = true; break; }
-                if (nk.bcodes ? nk.bnulls && (*nk.bnulls)[r] : nk.cs->is_null(r)) { null = true; break; }
-                const uint32_t ca = nk.bcodes ? (*nk.bcodes)[r] : vx::code_at(*nk.cs, r);
-                if (ca >= nk.cmap->p2c.size() || nk.cmap->p2c[ca] < 0) { null = true; break; }
-                ck.v[ki] = (double)nk.cmap->p2c[ca];
+              if ((int)ki == best_ki) { ck.v[ki] = kv.first == 0 ? 0.0 : kv.first; continue; }
+              const ColumnStore& kcs = js.table->col_data[(size_t)prep_jkeys[ki].column];
+              if (numkeys[ki].jcodes) {
+                if (numkeys[ki].jnulls && (*numkeys[ki].jnulls)[mr]) { null = true; break; }
+                ck.v[ki] = (double)(*numkeys[ki].jcodes)[mr];
                 continue;
               }
-              if ((int)ki != best_ki && !numkey(nk, bi, base, &w)) null = true;
-              ck.v[ki] = w == 0 ? 0.0 : w;
+              if (kcs.is_null(mr)) { null = true; break; }
+              if (numkeys[ki].cmap) { ck.v[ki] = (double)vx::code_at(kcs, mr); continue; }
+              const double d = vx::typed_value(kcs, mr);
+              ck.v[ki] = d == 0 ? 0.0 : d;
             }
-            if (!null) {
-              auto it = comp.find(ck);
-              if (it != comp.end()) for (uint32_t mr : it->second) take(mr);
-            }
-          } else if (key == 0 && !idx->no_numeric_prefix.empty()) {
-            std::vector<size_t> zero;   // 0 also finds the rows with no digits, merged in row order
-            probe_gather_matches(idx, val_num(0.0), zero);
-            for (size_t mr : zero) take(mr);
-          } else {
-            auto it = idx->by_number.find(key);
-            if (it != idx->by_number.end()) for (uint32_t mr : it->second) take(mr);
+            if (!null) comp[ck].push_back(mr);
           }
         }
-        if (!matched && !sink) pad_row(o, bi, ctx);
-      };
-      auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, ChunkOut& o,
-                               JoinMemo* memo, OnSink* sink) {
-        const size_t bi = (size_t)(&base - rows.data());
-        JoinedRow probe_row = base;
-        vctx.row = &probe_row;
-        bool matched = false;
-        const uint64_t pt0 = step_timing ? hal_now_ns() : 0;
-        if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) {
-          // no row of the joined table can meet this one: a LEFT JOIN pads it, an inner join drops it
-          if (step_timing) n_skipped.fetch_add(1, std::memory_order_relaxed);
-          if (!sink) pad_row(o, bi, ctx);   // with a sink, flush_sink pads it in its turn
-          return;
-        }
-
-        // Locals, not thread_local scratch: a pushed-down condition can run
-        // a correlated subquery whose own join probes on this thread.
-        std::vector<size_t> fresh;
-        std::string mkey;
-        const std::vector<size_t>* matches = &fresh;
-        if (memo && memo_key_of(base, &mkey)) {
-          auto it = memo->find(mkey);
-          if (it == memo->end()) {
-            gather_matches(base, vctx, fresh);
-            if (memo->size() >= (1u << 20)) memo->clear();
-            it = memo->emplace(mkey, fresh).first;
+        comp_ok = true;
+      }
+    }
+    // Where a chunk's probes put their rows. In-place mode (`part`): each base row's one joined row, or
+    // kPadPart (NULL-padded) or kDropPart (dropped), and the base rows are then extended where they are - no
+    // row copied into a chunk list and again into the step's output, which was most of a lookup join's time
+    // (56,000 rows LEFT JOIN a texel table: ~110 ns a row with no candidate at all). A base row meeting a
+    // second candidate turns its chunk to list mode (the rows themselves, in probe order, as the step always
+    // made them); the chunks are joined back in order either way, so the output order is the same.
+    constexpr uint32_t kPadPart = UINT32_MAX, kDropPart = UINT32_MAX - 1;
+    struct ChunkOut {
+      JoinedRows* list = nullptr;
+      std::vector<uint32_t>* part = nullptr;
+      size_t base0 = 0;
+    };
+    // in-place mode so far -> list mode: the chunk's rows [base0, upto) made from their parts, in order
+    // rows a base row meets, on average, by the probing key's index (the joined table's rows over its distinct
+    // keys): an order's three lines. The chunk lists are reserved to it, so a 1:N step does not grow them by doubling.
+    double fanout = 1.5;
+    if (best_ki >= 0 && prep_jkeys[(size_t)best_ki].idx) {
+      const size_t nk = prep_jkeys[(size_t)best_ki].idx->by_number.size();
+      if (nk > 0) fanout = std::min(16.0, std::max(1.5, 1.1 * (double)js.table->row_count() / (double)nk));
+    }
+    auto to_list = [&](ChunkOut& o, size_t upto) {
+      // room for a row per base row of the chunk and some second candidates: the list grew by doubling, and
+      // the copies of the moves were a third of a 257k-row step
+      if (o.list->capacity() < (size_t)((double)o.part->size() * fanout)) o.list->reserve((size_t)((double)o.part->size() * fanout));
+      for (size_t bi = o.base0; bi < upto; ++bi) {
+        const uint32_t p = (*o.part)[bi - o.base0];
+        if (p == kDropPart) continue;
+        JoinedRow r = rows[bi];
+        r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
+        o.list->push_back(std::move(r));
+      }
+      o.part = nullptr;
+    };
+    // a candidate that passed every check: base row bi with joined row mr (cand: the row, where one was made)
+    auto out_cand = [&](ChunkOut& o, size_t bi, size_t mr, JoinedRow* cand) {
+      if (o.part) {
+        uint32_t& slot = (*o.part)[bi - o.base0];
+        if (slot == kDropPart) { slot = (uint32_t)mr; return; }
+        to_list(o, bi + 1);   // a second candidate for this base row
+      }
+      if (cand) { o.list->push_back(std::move(*cand)); return; }
+      JoinedRow r = rows[bi];
+      r.parts.push_back(mr);
+      o.list->push_back(std::move(r));
+    };
+    // a LEFT JOIN's padded row for base row bi, where the pushed WHERE conjuncts admit it
+    auto pad_row = [&](ChunkOut& o, size_t bi, EvalCtx& ctx) {
+      if (!join_is_left[j]) return;
+      if (pushable.empty() && o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
+      JoinedRow padded = rows[bi];
+      padded.parts.push_back(kNullRow);
+      ctx.row = &padded;
+      for (const SqlExpr* p : pushable) if (!predicate_true(p, ctx)) return;
+      if (o.part) { (*o.part)[bi - o.base0] = kPadPart; return; }
+      o.list->push_back(std::move(padded));
+    };
+    // whether a candidate's row has to be made for the interpreter (the ON's per-candidate conjuncts, the
+    // pushed WHERE conjuncts); otherwise only its row id is kept until the chunk is assembled
+    const bool cand_checks = (has_extra_join && !on_check.empty()) || !pushable_rest.empty();
+    auto batch_probe = [&](size_t bi, EvalCtx& ctx, ChunkOut& o, OnSink* sink) {
+      const JoinedRow& base = rows[bi];
+      if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad_row(o, bi, ctx); return; }
+      bool matched = false;
+      double key = 0;
+      const auto* idx = prep_jkeys[(size_t)best_ki].idx.get();
+      if (direct_code_join) {
+        // the base row's dictionary code mapped to the joined column's (star_code_map): that code's rows
+        const size_t base_ri = dc_base_src < base.parts.size() ? base.parts[dc_base_src] : kNullRow;
+        if (base_ri != kNullRow && base_ri < dc_base_cs->size() && !dc_base_cs->is_null(base_ri)) {
+          const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
+          if (ca < dc_code_map->p2c.size()) {
+            const int32_t cb = dc_code_map->p2c[ca];
+            if (cb >= 0 && (size_t)cb < idx->by_code.size()) {
+              const std::vector<uint32_t>& cands = idx->by_code[(size_t)cb];
+              for (uint32_t mr : cands) {
+                if (mr >= js.table->row_count()) continue;
+                if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) continue;   // the ON's own conditions refuse it
+                if (!other_keys_match(bi, base, mr)) continue;
+                JoinedRow cand;
+                const bool made = cand_checks || sink;
+                if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
+                if (has_extra_join && !on_true(ctx)) continue;
+                if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
+                matched = true;
+                if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
+                if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) continue;
+                bool keep = true;
+                for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) { keep = false; break; }
+                if (keep) out_cand(o, bi, mr, made ? &cand : nullptr);
+              }
+            }
           }
-          matches = &it->second;
-        } else {
-          gather_matches(base, vctx, fresh);
         }
-        const uint64_t pt1 = step_timing ? hal_now_ns() : 0;
-        if (step_timing) { t_gather.fetch_add(pt1 - pt0, std::memory_order_relaxed); n_cands.fetch_add(matches->size(), std::memory_order_relaxed); }
-
-        for (size_t match_ri : *matches) {
-          if (pass_is_on && (match_ri >= js_pass.size() || !js_pass[match_ri])) continue;   // the ON's own conditions refuse it
+      } else if (numkey(numkeys[(size_t)best_ki], bi, base, &key)) {
+        auto take = [&](size_t mr) {
+          if (mr >= js.table->row_count()) return;
+          if (pass_is_on && (mr >= js_pass.size() || !js_pass[mr])) return;   // the ON's own conditions refuse it
+          if (!other_keys_match(bi, base, mr)) return;
           JoinedRow cand;
           const bool made = cand_checks || sink;
-          if (made) { cand = base; cand.parts.push_back(match_ri); ctx.row = &cand; }
-          const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
-          const bool on_ok = !has_extra_join || on_true(ctx);
-          if (step_timing) t_on.fetch_add(hal_now_ns() - ot0, std::memory_order_relaxed);
-          if (!on_ok) {
-            continue;
-          }
-          if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
-          // The ON clause matched: this left row is not NULL-padded,
-          // whatever WHERE then says about the joined row. Marking it
-          // matched only when WHERE also passed padded it instead, and
-          // `WHERE ISNULL(right.col)` then kept the padding (107 rows
-          // where MariaDB has none).
+          if (made) { cand = base; cand.parts.push_back(mr); ctx.row = &cand; }
+          if (has_extra_join && !on_true(ctx)) return;
+          if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); return; }
           matched = true;
-          if (right_seen && match_ri < right_n) right_seen[match_ri].store(1, std::memory_order_relaxed);
-          if (js_prefilter && (match_ri >= js_pass.size() || !js_pass[match_ri])) continue;
-          bool keep = true;
-          for (const SqlExpr* p : pushable_rest) {
-            if (!predicate_true(p, ctx)) { keep = false; break; }
-          }
-          if (keep) out_cand(o, bi, match_ri, made ? &cand : nullptr);
-        }
-
-        if (!matched && !sink) pad_row(o, bi, ctx);
-      };
-      // The candidates a chunk's probes left in the sink: each on_vec conjunct over all of them in lanes (a
-      // program that refuses a value - an overflow - hands that conjunct to the interpreter, which reports as it
-      // always has), then the survivors in base order with what follows the ON in process_probe (the matched
-      // mark, the prefilter, the pushed WHERE conjuncts); a base row left with no candidate passing the ON is
-      // padded (LEFT) or dropped, as process_probe pads one.
-      auto flush_sink = [&](OnSink& sink, size_t bstart, size_t bend, EvalCtx& ctx, ChunkOut& o) {
-        const size_t n = sink.cands.size();
-        std::vector<uint8_t> fail(n, 0);
-        const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
-        for (size_t pi = 0; pi < on_vec_progs.size() && n > 0; ++pi) {
-          vp::Column col;
-          std::string verr;
-          if (vp::eval_column(*on_vec_progs[pi], [&](size_t k) -> const JoinedRow& { return sink.cands[k]; }, n, &col, &verr)) {
-            for (size_t k = 0; k < n; ++k)
-              if (!fail[k] && (col.is_null(k) || (col.ty == vp::Ty::I64 ? col.i[k] == 0 : col.f[k] == 0))) fail[k] = 1;
-          } else {
-            for (size_t k = 0; k < n; ++k) {
-              if (fail[k]) continue;
-              ctx.row = &sink.cands[k];
-              if (!predicate_true(on_vec[pi], ctx)) fail[k] = 1;
+          if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
+          if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) return;
+          for (const SqlExpr* p : pushable_rest) if (!predicate_true(p, ctx)) return;
+          out_cand(o, bi, mr, made ? &cand : nullptr);
+        };
+        if (comp_ok) {
+          CompKey ck;
+          bool null = false;
+          for (size_t ki = 0; ki < prep_jkeys.size() && !null; ++ki) {
+            double w = key;
+            const NumKey& nk = numkeys[ki];
+            if ((int)ki != best_ki && nk.cmap) {
+              const size_t r = nk.src < base.parts.size() ? base.parts[nk.src] : kNullRow;
+              if (r == kNullRow || r >= nk.cs->size()) { null = true; break; }
+              if (nk.bcodes ? nk.bnulls && (*nk.bnulls)[r] : nk.cs->is_null(r)) { null = true; break; }
+              const uint32_t ca = nk.bcodes ? (*nk.bcodes)[r] : vx::code_at(*nk.cs, r);
+              if (ca >= nk.cmap->p2c.size() || nk.cmap->p2c[ca] < 0) { null = true; break; }
+              ck.v[ki] = (double)nk.cmap->p2c[ca];
+              continue;
             }
+            if ((int)ki != best_ki && !numkey(nk, bi, base, &w)) null = true;
+            ck.v[ki] = w == 0 ? 0.0 : w;
           }
-        }
-        if (step_timing) t_on.fetch_add(hal_now_ns() - ot0, std::memory_order_relaxed);
-        size_t p = 0;
-        for (size_t bi = bstart; bi < bend; ++bi) {
-          bool matched = false;
-          for (; p < n && sink.bi[p] == bi; ++p) {
-            if (fail[p]) continue;
-            matched = true;
-            JoinedRow& cand = sink.cands[p];
-            const size_t mr = cand.parts[cand.parts.size() - 1];
-            if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
-            if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) continue;
-            ctx.row = &cand;
-            bool keep = true;
-            for (const SqlExpr* q : pushable_rest) if (!predicate_true(q, ctx)) { keep = false; break; }
-            if (keep) out_cand(o, bi, mr, &cand);
+          if (!null) {
+            auto it = comp.find(ck);
+            if (it != comp.end()) for (uint32_t mr : it->second) take(mr);
           }
-          if (!matched) pad_row(o, bi, ctx);
-        }
-        sink.cands.clear();
-        sink.bi.clear();
-      };
-
-      const uint64_t jt_probe0 = vx_trace_on() ? hal_now_ns() : 0;
-      if (rows.size() >= 256) {
-        size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
-        if (total_threads == 0) total_threads = 1;
-        // One output list per chunk of base rows, joined back in chunk order:
-        // the joined rows keep the base order every run. Per-thread lists
-        // came back in whatever order the threads finished, so a column a
-        // GROUP BY did not aggregate (the salesman's loccode) showed a
-        // different row's value from one run to the next.
-        // Past a million rows, ~8 chunks a thread instead of 256 rows each:
-        // 39k chunk lists of ~20 KB for a 10M-row step were too small to leave
-        // malloc (JoinBufAlloc) and, freed, held 1.4 GB of emptied regions.
-        const size_t kJoinChunk = rows.size() >= 1000000 ? std::max<size_t>(256, rows.size() / (total_threads * 8)) : 256;
-        const size_t nchunks = (rows.size() + kJoinChunk - 1) / kJoinChunk;
-        std::vector<JoinedRows> local_next(nchunks);
-        std::vector<std::vector<uint32_t>> local_part(nchunks);   // in-place mode: each chunk's parts (ChunkOut)
-        std::vector<uint8_t> local_inplace(nchunks, 0);
-        const bool inplace_ok = js.table->row_count() < (size_t)kDropPart;
-        std::vector<std::string> local_errs(total_threads);
-        std::vector<JoinMemo> memos(memo_ok ? total_threads : 0);
-
-        // A joined row costs several scanned rows (its chunk is 256, not 2048).
-        SqlThreadPool::instance().for_chunks(rows.size(), kJoinChunk, rows.size() * 8, false, [&](size_t bstart, size_t bend, size_t tid) {
-          if (tid >= total_threads) tid = 0;
-          EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope;
-          vctx.sources = &baseonly;
-          vctx.err = &local_errs[tid];
-
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
-          ctx.sources = &partial;
-          ctx.err = &local_errs[tid];
-
-          const size_t ci = bstart / kJoinChunk;
-          ChunkOut o;
-          o.list = &local_next[ci];
-          o.base0 = bstart;
-          if (inplace_ok) { local_part[ci].assign(bend - bstart, kDropPart); o.part = &local_part[ci]; }
-          else local_next[ci].reserve((size_t)((double)(bend - bstart) * fanout));   // list mode from the start: the expected rows
-          OnSink sink;
-          OnSink* const sk = on_vec.empty() ? nullptr : &sink;
-          for (size_t bi = bstart; bi < bend; ++bi) {
-            if (batch_ok) batch_probe(bi, ctx, o, sk);
-            else process_probe(rows[bi], vctx, ctx, o, memo_ok ? &memos[tid] : nullptr, sk);
-          }
-          if (sk) flush_sink(sink, bstart, bend, ctx, o);
-          local_inplace[ci] = o.part != nullptr;
-        });
-
-        for (const auto& l_err : local_errs) {
-          if (!l_err.empty()) return make_error(l_err);
-        }
-        bool all_inplace = inplace_ok;
-        for (size_t c = 0; c < nchunks && all_inplace; ++c) if (!local_inplace[c]) all_inplace = false;
-        if (all_inplace) {
-          // Every base row met at most one candidate: the rows are extended where they are, each keeping its
-          // place less the dropped ones, and the input becomes the output (rows_hold covers it: no more rows).
-          size_t w = 0;
-          for (size_t c = 0; c < nchunks; ++c) {
-            const size_t b0 = c * kJoinChunk;
-            const std::vector<uint32_t>& parts = local_part[c];
-            for (size_t k = 0; k < parts.size(); ++k) {
-              const uint32_t p = parts[k];
-              if (p == kDropPart) continue;
-              JoinedRow& r = rows[b0 + k];
-              r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
-              if (w != b0 + k) rows[w] = std::move(r);
-              ++w;
-            }
-          }
-          rows.resize(w);
-          next.swap(rows);
+        } else if (key == 0 && !idx->no_numeric_prefix.empty()) {
+          std::vector<size_t> zero;   // 0 also finds the rows with no digits, merged in row order
+          probe_gather_matches(idx, val_num(0.0), zero);
+          for (size_t mr : zero) take(mr);
         } else {
-        // a chunk still in in-place mode among list-mode ones: its rows made from its parts, while the input is here
-        for (size_t c = 0; c < nchunks; ++c) {
-          if (!local_inplace[c]) continue;
-          ChunkOut o;
-          o.list = &local_next[c];
-          o.part = &local_part[c];
-          o.base0 = c * kJoinChunk;
-          to_list(o, o.base0 + local_part[c].size());
+          auto it = idx->by_number.find(key);
+          if (it != idx->by_number.end()) for (uint32_t mr : it->second) take(mr);
         }
-        // The step's input is spent: free it before the output is gathered,
-        // and free each chunk as it is moved out. Holding the input, every
-        // chunk and the gathered output at once was three copies of the
-        // widest step - stocktrans' 10M joined rows peaked the process at
-        // 6.3 GB for a COUNT(*).
-        JoinedRows().swap(rows);
-        size_t total_out = 0;
-        for (const auto& ln : local_next) total_out += ln.size();
-        rows_hold.release();   // the step's input, freed above
-        if (!rows_hold.reserve(total_out * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
-        next.reserve(total_out);
-        for (auto& ln : local_next) {
-          for (auto& r : ln) next.push_back(std::move(r));
-          JoinedRows().swap(ln);
+      }
+      if (!matched && !sink) pad_row(o, bi, ctx);
+    };
+    auto process_probe = [&](const JoinedRow& base, EvalCtx& vctx, EvalCtx& ctx, ChunkOut& o,
+                             JoinMemo* memo, OnSink* sink) {
+      const size_t bi = (size_t)(&base - rows.data());
+      JoinedRow probe_row = base;
+      vctx.row = &probe_row;
+      bool matched = false;
+      const uint64_t pt0 = step_timing ? hal_now_ns() : 0;
+      if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) {
+        // no row of the joined table can meet this one: a LEFT JOIN pads it, an inner join drops it
+        if (step_timing) n_skipped.fetch_add(1, std::memory_order_relaxed);
+        if (!sink) pad_row(o, bi, ctx);   // with a sink, flush_sink pads it in its turn
+        return;
+      }
+
+      // Locals, not thread_local scratch: a pushed-down condition can run
+      // a correlated subquery whose own join probes on this thread.
+      std::vector<size_t> fresh;
+      std::string mkey;
+      const std::vector<size_t>* matches = &fresh;
+      if (memo && memo_key_of(base, &mkey)) {
+        auto it = memo->find(mkey);
+        if (it == memo->end()) {
+          gather_matches(base, vctx, fresh);
+          if (memo->size() >= (1u << 20)) memo->clear();
+          it = memo->emplace(mkey, fresh).first;
         }
-        }
+        matches = &it->second;
       } else {
+        gather_matches(base, vctx, fresh);
+      }
+      const uint64_t pt1 = step_timing ? hal_now_ns() : 0;
+      if (step_timing) { t_gather.fetch_add(pt1 - pt0, std::memory_order_relaxed); n_cands.fetch_add(matches->size(), std::memory_order_relaxed); }
+
+      for (size_t match_ri : *matches) {
+        if (pass_is_on && (match_ri >= js_pass.size() || !js_pass[match_ri])) continue;   // the ON's own conditions refuse it
+        JoinedRow cand;
+        const bool made = cand_checks || sink;
+        if (made) { cand = base; cand.parts.push_back(match_ri); ctx.row = &cand; }
+        const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
+        const bool on_ok = !has_extra_join || on_true(ctx);
+        if (step_timing) t_on.fetch_add(hal_now_ns() - ot0, std::memory_order_relaxed);
+        if (!on_ok) {
+          continue;
+        }
+        if (sink) { sink->cands.push_back(std::move(cand)); sink->bi.push_back((uint32_t)bi); continue; }
+        // The ON clause matched: this left row is not NULL-padded,
+        // whatever WHERE then says about the joined row. Marking it
+        // matched only when WHERE also passed padded it instead, and
+        // `WHERE ISNULL(right.col)` then kept the padding (107 rows
+        // where MariaDB has none).
+        matched = true;
+        if (right_seen && match_ri < right_n) right_seen[match_ri].store(1, std::memory_order_relaxed);
+        if (js_prefilter && (match_ri >= js_pass.size() || !js_pass[match_ri])) continue;
+        bool keep = true;
+        for (const SqlExpr* p : pushable_rest) {
+          if (!predicate_true(p, ctx)) { keep = false; break; }
+        }
+        if (keep) out_cand(o, bi, match_ri, made ? &cand : nullptr);
+      }
+
+      if (!matched && !sink) pad_row(o, bi, ctx);
+    };
+    // The candidates a chunk's probes left in the sink: each on_vec conjunct over all of them in lanes (a
+    // program that refuses a value - an overflow - hands that conjunct to the interpreter, which reports as it
+    // always has), then the survivors in base order with what follows the ON in process_probe (the matched
+    // mark, the prefilter, the pushed WHERE conjuncts); a base row left with no candidate passing the ON is
+    // padded (LEFT) or dropped, as process_probe pads one.
+    auto flush_sink = [&](OnSink& sink, size_t bstart, size_t bend, EvalCtx& ctx, ChunkOut& o) {
+      const size_t n = sink.cands.size();
+      std::vector<uint8_t> fail(n, 0);
+      const uint64_t ot0 = step_timing ? hal_now_ns() : 0;
+      for (size_t pi = 0; pi < on_vec_progs.size() && n > 0; ++pi) {
+        vp::Column col;
+        std::string verr;
+        if (vp::eval_column(*on_vec_progs[pi], [&](size_t k) -> const JoinedRow& { return sink.cands[k]; }, n, &col, &verr)) {
+          for (size_t k = 0; k < n; ++k)
+            if (!fail[k] && (col.is_null(k) || (col.ty == vp::Ty::I64 ? col.i[k] == 0 : col.f[k] == 0))) fail[k] = 1;
+        } else {
+          for (size_t k = 0; k < n; ++k) {
+            if (fail[k]) continue;
+            ctx.row = &sink.cands[k];
+            if (!predicate_true(on_vec[pi], ctx)) fail[k] = 1;
+          }
+        }
+      }
+      if (step_timing) t_on.fetch_add(hal_now_ns() - ot0, std::memory_order_relaxed);
+      size_t p = 0;
+      for (size_t bi = bstart; bi < bend; ++bi) {
+        bool matched = false;
+        for (; p < n && sink.bi[p] == bi; ++p) {
+          if (fail[p]) continue;
+          matched = true;
+          JoinedRow& cand = sink.cands[p];
+          const size_t mr = cand.parts[cand.parts.size() - 1];
+          if (right_seen && mr < right_n) right_seen[mr].store(1, std::memory_order_relaxed);
+          if (js_prefilter && (mr >= js_pass.size() || !js_pass[mr])) continue;
+          ctx.row = &cand;
+          bool keep = true;
+          for (const SqlExpr* q : pushable_rest) if (!predicate_true(q, ctx)) { keep = false; break; }
+          if (keep) out_cand(o, bi, mr, &cand);
+        }
+        if (!matched) pad_row(o, bi, ctx);
+      }
+      sink.cands.clear();
+      sink.bi.clear();
+    };
+
+    const uint64_t jt_probe0 = vx_trace_on() ? hal_now_ns() : 0;
+    if (rows.size() >= 256) {
+      size_t total_threads = SqlThreadPool::instance().num_workers() + 1;
+      if (total_threads == 0) total_threads = 1;
+      // One output list per chunk of base rows, joined back in chunk order:
+      // the joined rows keep the base order every run. Per-thread lists
+      // came back in whatever order the threads finished, so a column a
+      // GROUP BY did not aggregate (the salesman's loccode) showed a
+      // different row's value from one run to the next.
+      // Past a million rows, ~8 chunks a thread instead of 256 rows each:
+      // 39k chunk lists of ~20 KB for a 10M-row step were too small to leave
+      // malloc (JoinBufAlloc) and, freed, held 1.4 GB of emptied regions.
+      const size_t kJoinChunk = rows.size() >= 1000000 ? std::max<size_t>(256, rows.size() / (total_threads * 8)) : 256;
+      const size_t nchunks = (rows.size() + kJoinChunk - 1) / kJoinChunk;
+      std::vector<JoinedRows> local_next(nchunks);
+      std::vector<std::vector<uint32_t>> local_part(nchunks);   // in-place mode: each chunk's parts (ChunkOut)
+      std::vector<uint8_t> local_inplace(nchunks, 0);
+      const bool inplace_ok = js.table->row_count() < (size_t)kDropPart;
+      std::vector<std::string> local_errs(total_threads);
+      std::vector<JoinMemo> memos(memo_ok ? total_threads : 0);
+
+      // A joined row costs several scanned rows (its chunk is 256, not 2048).
+      SqlThreadPool::instance().for_chunks(rows.size(), kJoinChunk, rows.size() * 8, false, [&](size_t bstart, size_t bend, size_t tid) {
+        if (tid >= total_threads) tid = 0;
         EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope;
         vctx.sources = &baseonly;
-        vctx.err = &err;
+        vctx.err = &local_errs[tid];
 
         EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
         ctx.sources = &partial;
-        ctx.err = &err;
+        ctx.err = &local_errs[tid];
 
-        JoinMemo memo;
+        const size_t ci = bstart / kJoinChunk;
         ChunkOut o;
-        o.list = &next;   // list mode: the rows themselves
-        if (next.capacity() < rows.size()) next.reserve(rows.size());   // at least a row per base row, usually
-        for (const JoinedRow& base : rows) {
-          if (sql_interrupted()) break;
-          if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, o, nullptr);
-          else process_probe(base, vctx, ctx, o, memo_ok ? &memo : nullptr, nullptr);
+        o.list = &local_next[ci];
+        o.base0 = bstart;
+        if (inplace_ok) { local_part[ci].assign(bend - bstart, kDropPart); o.part = &local_part[ci]; }
+        else local_next[ci].reserve((size_t)((double)(bend - bstart) * fanout));   // list mode from the start: the expected rows
+        OnSink sink;
+        OnSink* const sk = on_vec.empty() ? nullptr : &sink;
+        for (size_t bi = bstart; bi < bend; ++bi) {
+          if (batch_ok) batch_probe(bi, ctx, o, sk);
+          else process_probe(rows[bi], vctx, ctx, o, memo_ok ? &memos[tid] : nullptr, sk);
         }
-      }
-      if (vx_trace_on())
-        vx_trace("join: +" + js.alias + " prepared in " + std::to_string((jt_probe0 - jt0) / 1000) + " us (keys " + std::to_string((jt_a - jt0) / 1000) +
-                 ", indexes " + std::to_string((jt_b - jt_a) / 1000) + ", expression hash " + std::to_string((jt_c - jt_b) / 1000) + ", hash tables and lanes " +
-                 std::to_string((jt_d - jt_c) / 1000) + ", rest " + std::to_string((jt_probe0 - jt_d) / 1000) + "), probed " + std::to_string(rows.size()) +
-                 " rows in " + std::to_string((hal_now_ns() - jt_probe0) / 1000) + " us" + (best_ki >= 0 ? " (index)" : xk_join ? " (expression hash)" : single_int_hash ? " (int hash)" : " (text hash)") +
-                 (batch_ok ? " (batched)" : "") +
-                 (step_timing ? " [gather " + std::to_string(t_gather.load() / 1000) + " us, " + std::to_string(n_cands.load()) + " candidates, ON checks " +
-                                std::to_string(t_on.load() / 1000) + " us, " + std::to_string(n_skipped.load()) + " base rows refused by their own ON conjuncts]" : ""));
-      join_method = best_ki >= 0 ? (batch_ok ? "index probe, batched" : "index probe") : xk_join ? "expression hash" : single_int_hash ? "int hash" : "text hash";
-      hash_join_done = true;
-    }
+        if (sk) flush_sink(sink, bstart, bend, ctx, o);
+        local_inplace[ci] = o.part != nullptr;
+      });
 
-    if (!hash_join_done) for (JoinedRow& base : rows) {
-      if (sql_interrupted()) break;
-      bool matched = false;
+      for (const auto& l_err : local_errs) {
+        if (!l_err.empty()) return make_error(l_err);
+      }
+      bool all_inplace = inplace_ok;
+      for (size_t c = 0; c < nchunks && all_inplace; ++c) if (!local_inplace[c]) all_inplace = false;
+      if (all_inplace) {
+        // Every base row met at most one candidate: the rows are extended where they are, each keeping its
+        // place less the dropped ones, and the input becomes the output (rows_hold covers it: no more rows).
+        size_t w = 0;
+        for (size_t c = 0; c < nchunks; ++c) {
+          const size_t b0 = c * kJoinChunk;
+          const std::vector<uint32_t>& parts = local_part[c];
+          for (size_t k = 0; k < parts.size(); ++k) {
+            const uint32_t p = parts[k];
+            if (p == kDropPart) continue;
+            JoinedRow& r = rows[b0 + k];
+            r.parts.push_back(p == kPadPart ? kNullRow : (size_t)p);
+            if (w != b0 + k) rows[w] = std::move(r);
+            ++w;
+          }
+        }
+        rows.resize(w);
+        next.swap(rows);
+      } else {
+      // a chunk still in in-place mode among list-mode ones: its rows made from its parts, while the input is here
+      for (size_t c = 0; c < nchunks; ++c) {
+        if (!local_inplace[c]) continue;
+        ChunkOut o;
+        o.list = &local_next[c];
+        o.part = &local_part[c];
+        o.base0 = c * kJoinChunk;
+        to_list(o, o.base0 + local_part[c].size());
+      }
+      // The step's input is spent: free it before the output is gathered,
+      // and free each chunk as it is moved out. Holding the input, every
+      // chunk and the gathered output at once was three copies of the
+      // widest step - stocktrans' 10M joined rows peaked the process at
+      // 6.3 GB for a COUNT(*).
+      JoinedRows().swap(rows);
+      size_t total_out = 0;
+      for (const auto& ln : local_next) total_out += ln.size();
+      rows_hold.release();   // the step's input, freed above
+      if (!rows_hold.reserve(total_out * sizeof(JoinedRow))) return make_error("Query execution was interrupted");
+      next.reserve(total_out);
+      for (auto& ln : local_next) {
+        for (auto& r : ln) next.push_back(std::move(r));
+        JoinedRows().swap(ln);
+      }
+      }
+    } else {
+      EvalCtx vctx; vctx.db = db; vctx.outer = outer_scope;
+      vctx.sources = &baseonly;
+      vctx.err = &err;
+
       EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
       ctx.sources = &partial;
       ctx.err = &err;
 
-      g_scan_fallbacks++;
-      g_scan_rows += (long long)js.table->row_count();
-      for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
-        JoinedRow cand = base;
-        cand.parts.push_back(ri);
-        ctx.row = &cand;
-        if (!join_conditions[j] || predicate_true(join_conditions[j].get(), ctx)) {
-          matched = true;
-          if (right_seen && ri < right_n) right_seen[ri].store(1, std::memory_order_relaxed);
-          bool keep = true;
-          for (const SqlExpr* p : pushable) {
-            if (!predicate_true(p, ctx)) { keep = false; break; }
-          }
-          if (keep) {
-            next.push_back(cand);
-          }
-        }
-        if (!err.empty()) return make_error(err);
+      JoinMemo memo;
+      ChunkOut o;
+      o.list = &next;   // list mode: the rows themselves
+      if (next.capacity() < rows.size()) next.reserve(rows.size());   // at least a row per base row, usually
+      for (const JoinedRow& base : rows) {
+        if (sql_interrupted()) break;
+        if (batch_ok) batch_probe((size_t)(&base - rows.data()), ctx, o, nullptr);
+        else process_probe(base, vctx, ctx, o, memo_ok ? &memo : nullptr, nullptr);
       }
+    }
+    if (vx_trace_on())
+      vx_trace("join: +" + js.alias + " prepared in " + std::to_string((jt_probe0 - jt0) / 1000) + " us (keys " + std::to_string((jt_a - jt0) / 1000) +
+               ", indexes " + std::to_string((jt_b - jt_a) / 1000) + ", expression hash " + std::to_string((jt_c - jt_b) / 1000) + ", hash tables and lanes " +
+               std::to_string((jt_d - jt_c) / 1000) + ", rest " + std::to_string((jt_probe0 - jt_d) / 1000) + "), probed " + std::to_string(rows.size()) +
+               " rows in " + std::to_string((hal_now_ns() - jt_probe0) / 1000) + " us" + (best_ki >= 0 ? " (index)" : xk_join ? " (expression hash)" : single_int_hash ? " (int hash)" : " (text hash)") +
+               (batch_ok ? " (batched)" : "") +
+               (step_timing ? " [gather " + std::to_string(t_gather.load() / 1000) + " us, " + std::to_string(n_cands.load()) + " candidates, ON checks " +
+                              std::to_string(t_on.load() / 1000) + " us, " + std::to_string(n_skipped.load()) + " base rows refused by their own ON conjuncts]" : ""));
+    join_method = best_ki >= 0 ? (batch_ok ? "index probe, batched" : "index probe") : xk_join ? "expression hash" : single_int_hash ? "int hash" : "text hash";
+    hash_join_done = true;
+  }
 
-      if (!matched && join_is_left[j]) {
-        JoinedRow cand = base;
-        cand.parts.push_back(kNullRow);
-        ctx.row = &cand;
+  if (!hash_join_done) for (JoinedRow& base : rows) {
+    if (sql_interrupted()) break;
+    bool matched = false;
+    EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
+    ctx.sources = &partial;
+    ctx.err = &err;
+
+    g_scan_fallbacks++;
+    g_scan_rows += (long long)js.table->row_count();
+    for (size_t ri = 0; ri < js.table->row_count(); ++ri) {
+      JoinedRow cand = base;
+      cand.parts.push_back(ri);
+      ctx.row = &cand;
+      if (!join_conditions[j] || predicate_true(join_conditions[j].get(), ctx)) {
+        matched = true;
+        if (right_seen && ri < right_n) right_seen[ri].store(1, std::memory_order_relaxed);
         bool keep = true;
         for (const SqlExpr* p : pushable) {
           if (!predicate_true(p, ctx)) { keep = false; break; }
         }
-        if (keep) next.push_back(cand);
+        if (keep) {
+          next.push_back(cand);
+        }
       }
+      if (!err.empty()) return make_error(err);
+    }
 
-      if (limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j]) {
-        if (next.size() >= (size_t)(offset + limit)) break;
+    if (!matched && join_is_left[j]) {
+      JoinedRow cand = base;
+      cand.parts.push_back(kNullRow);
+      ctx.row = &cand;
+      bool keep = true;
+      for (const SqlExpr* p : pushable) {
+        if (!predicate_true(p, ctx)) { keep = false; break; }
       }
+      if (keep) next.push_back(cand);
     }
-    if (right_seen) {
-      // Every row of the joined table no earlier row met: kept, with each
-      // source before it NULL.
-      size_t padded = 0;
-      for (size_t r = 0; r < right_n; ++r) {
-        if (right_seen[r].load(std::memory_order_relaxed)) continue;
-        JoinedRow pr;
-        for (size_t k = 0; k <= j; ++k) pr.parts.push_back(kNullRow);
-        pr.parts.push_back(r);
-        next.push_back(std::move(pr));
-        ++padded;
+
+    if (limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j]) {
+      if (next.size() >= (size_t)(offset + limit)) break;
+    }
+  }
+  if (right_seen) {
+    // Every row of the joined table no earlier row met: kept, with each
+    // source before it NULL.
+    size_t padded = 0;
+    for (size_t r = 0; r < right_n; ++r) {
+      if (right_seen[r].load(std::memory_order_relaxed)) continue;
+      JoinedRow pr;
+      for (size_t k = 0; k <= j; ++k) pr.parts.push_back(kNullRow);
+      pr.parts.push_back(r);
+      next.push_back(std::move(pr));
+      ++padded;
+    }
+    if (vx_trace_on()) vx_trace("join: +" + js.alias + " (right): " + std::to_string(padded) + " unmatched rows kept");
+  }
+  if (!vp_deferred.empty() && !next.empty()) {
+    // the WHERE conjuncts left to this point, over every row of the step at once: a row stays while each is
+    // true (a NULL is not, as predicate_true has it)
+    EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+    std::vector<uint8_t> keep(next.size(), 1);
+    for (const SqlExpr* p : vp_deferred) {
+      const vp::Prog* P = vp::program_for(p, pctx);
+      if (!P) {
+        // its subquery's set is filled by one interpreted evaluation; then it may compile
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+        ctx.row = &next[0];
+        (void)predicate_true(p, ctx);
+        if (!err.empty()) return make_error(err);
+        P = vp::program_for(p, pctx);
       }
-      if (vx_trace_on()) vx_trace("join: +" + js.alias + " (right): " + std::to_string(padded) + " unmatched rows kept");
-    }
-    if (!vp_deferred.empty() && !next.empty()) {
-      // the WHERE conjuncts left to this point, over every row of the step at once: a row stays while each is
-      // true (a NULL is not, as predicate_true has it)
-      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-      std::vector<uint8_t> keep(next.size(), 1);
-      for (const SqlExpr* p : vp_deferred) {
-        const vp::Prog* P = vp::program_for(p, pctx);
-        if (!P) {
-          // its subquery's set is filled by one interpreted evaluation; then it may compile
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
-          ctx.row = &next[0];
-          (void)predicate_true(p, ctx);
-          if (!err.empty()) return make_error(err);
-          P = vp::program_for(p, pctx);
-        }
-        vp::Column col;
-        std::string verr;
-        if (!P || !vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return next[r]; }, next.size(), &col, &verr)) {
-          // the program failed on these rows (a value out of range): the interpreter decides, row by row
-          EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
-          for (size_t r = 0; r < next.size(); ++r) {
-            if (!keep[r]) continue;
-            ctx.row = &next[r];
-            if (!predicate_true(p, ctx)) keep[r] = 0;
-            if (!err.empty()) return make_error(err);
-          }
-          continue;
-        }
+      vp::Column col;
+      std::string verr;
+      if (!P || !vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return next[r]; }, next.size(), &col, &verr)) {
+        // the program failed on these rows (a value out of range): the interpreter decides, row by row
+        EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
         for (size_t r = 0; r < next.size(); ++r) {
-          if (!keep[r] || col.is_null(r)) { keep[r] = 0; continue; }
-          if (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0) keep[r] = 0;
+          if (!keep[r]) continue;
+          ctx.row = &next[r];
+          if (!predicate_true(p, ctx)) keep[r] = 0;
+          if (!err.empty()) return make_error(err);
         }
+        continue;
       }
-      size_t w = 0;
-      for (size_t r = 0; r < next.size(); ++r) if (keep[r]) { if (w != r) next[w] = std::move(next[r]); ++w; }
-      next.resize(w);
+      for (size_t r = 0; r < next.size(); ++r) {
+        if (!keep[r] || col.is_null(r)) { keep[r] = 0; continue; }
+        if (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0) keep[r] = 0;
+      }
     }
-    if (vx_trace_on())
-      vx_trace("join: +" + js.alias + (join_is_left[j] ? " (left)" : "") + " -> " + std::to_string(next.size()) +
-               " rows, " + std::to_string((hal_now_ns() - jt0) / 1000) + " us" +
-               (hash_join_done ? "" : " (scanned" + (join_conditions[j] ? ", on: " + join_conditions[j]->source_text.substr(0, 80) : std::string(", no ON")) +
-                                      ", " + std::to_string(pushable.size()) + " pushed conjuncts, " + std::to_string(js.table ? js.table->row_count() : 0) + " joined rows)") +
-               (vp_deferred.empty() ? "" : " (" + std::to_string(vp_deferred.size()) + " conjuncts vectorized)"));
-    if (plan_on()) {
-      PlanStep st = plan_step(join_is_left[j] ? "left join" : join_is_right[j] ? "right join" : "join", js.alias, join_method, next.size(), jt0 ? hal_now_ns() - jt0 : 0);
-      if (join_conditions[j] && !join_conditions[j]->source_text.empty()) st.detail = "on " + join_conditions[j]->source_text.substr(0, 60);
-      plan_add(std::move(st));
-    }
-    if (next.size() >= 1000000) g_trim_after_statement.store(true, std::memory_order_relaxed);
-    rows.swap(next);
+    size_t w = 0;
+    for (size_t r = 0; r < next.size(); ++r) if (keep[r]) { if (w != r) next[w] = std::move(next[r]); ++w; }
+    next.resize(w);
+  }
+  if (vx_trace_on())
+    vx_trace("join: +" + js.alias + (join_is_left[j] ? " (left)" : "") + " -> " + std::to_string(next.size()) +
+             " rows, " + std::to_string((hal_now_ns() - jt0) / 1000) + " us" +
+             (hash_join_done ? "" : " (scanned" + (join_conditions[j] ? ", on: " + join_conditions[j]->source_text.substr(0, 80) : std::string(", no ON")) +
+                                    ", " + std::to_string(pushable.size()) + " pushed conjuncts, " + std::to_string(js.table ? js.table->row_count() : 0) + " joined rows)") +
+             (vp_deferred.empty() ? "" : " (" + std::to_string(vp_deferred.size()) + " conjuncts vectorized)"));
+  if (plan_on()) {
+    PlanStep st = plan_step(join_is_left[j] ? "left join" : join_is_right[j] ? "right join" : "join", js.alias, join_method, next.size(), jt0 ? hal_now_ns() - jt0 : 0);
+    if (join_conditions[j] && !join_conditions[j]->source_text.empty()) st.detail = "on " + join_conditions[j]->source_text.substr(0, 60);
+    plan_add(std::move(st));
+  }
+  if (next.size() >= 1000000) g_trim_after_statement.store(true, std::memory_order_relaxed);
+  rows.swap(next);
+  return std::nullopt;
+}
+
+// Empty: the rows are joined, on to the WHERE and the emit; a result: an error to return.
+static std::optional<SqlQueryResult> join_steps(const JoinPlan& plan, PhaseClock& phases) {
+  for (size_t j = 0; !plan.star_done && j < plan.join_conditions->size(); ++j) {
+    bool stop = false;
+    if (std::optional<SqlQueryResult> r = join_step(JoinStepPlan{&plan, j}, phases, &stop)) return r;
+    if (stop) break;
   }
   return std::nullopt;
 }
