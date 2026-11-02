@@ -107,8 +107,10 @@ sort, the emit form (typed columns / client sink / rows, with the limit), and ea
 series as a step with its own nested plan. Recording is off (a null check) unless EXPLAIN asked, measured identical
 on every suite. `EXPLAIN <select>` runs the statement with the answer discarded - the plan is decided from the data
 at hand - and prints one line a step with rows and time; the table of invented text it printed before is gone.
-Known gaps, for 2b: a subquery that fills an IN / EXISTS set appears as its own flat steps, not nested; the
-single-table engine is one step with no inner detail; a window statement's inner plan follows the `window` step.
+Those gaps are closed: each vectorized predicate is a `filter` step (its kernel and column), an IN / EXISTS set's
+subquery nested under the filter or `subquery` step that built it (a correlated one recorded once, marked run per
+outer row), the single-table engine's filters and `aggregate` (how its group ids were made) nested under it, a
+NOT EXISTS rewrite a `rewrite` step, and a window's rows, functions and order nested under `window`.
 
 ### Stage 2b, done: operators out of the select function
 

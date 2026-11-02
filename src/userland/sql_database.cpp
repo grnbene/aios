@@ -7767,7 +7767,18 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
   ob->text_key = otext;
   ob->empty = up == "COUNT" ? val_cell(std::string("0")) : val_null();
   {
-    const uint64_t bt0 = vx_trace_on() ? hal_now_ns() : 0;
+    const uint64_t bt0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
+    // Under EXPLAIN what it runs nests under its step; an attempt that does not answer leaves nothing.
+    PhysicalPlan kplan;
+    std::optional<PlanScope> kscope;
+    if (plan_on()) kscope.emplace(&kplan);
+    auto plan_key = [&](const char* method) {
+      if (!kscope) return;
+      kscope.reset();
+      PlanStep st = plan_step("subquery", t->name, method, ob->store.size(), hal_now_ns() - bt0);
+      st.sub = std::move(kplan.steps);
+      plan_add(std::move(st));
+    };
     ExprPtr kc = clone_expr(A), ac = clone_expr(agg), wc = w ? clone_expr(w.get()) : nullptr;
     const std::string alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
     if (lookup) {
@@ -7778,6 +7789,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
       if (vx_trace_on())
         vx_trace("subquery lookup per key: " + std::to_string(ob->store.size()) + " keys of " + t->name + ", " +
                  std::to_string((hal_now_ns() - bt0) / 1000) + " us");
+      plan_key("one lookup a key, for the page's outer rows");
       return remember(ob);
     }
     if (scalar_batch_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store)) {
@@ -7786,6 +7798,7 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
       if (vx_trace_on())
         vx_trace("subquery per key (column-wise): " + std::to_string(ob->store.size()) + " keys of " + t->name +
                  ", " + std::to_string((hal_now_ns() - bt0) / 1000) + " us");
+      plan_key("grouped once by its key, for the page's outer rows");
       return remember(ob);
     }
     ob->store = BatchStore();
@@ -7880,7 +7893,32 @@ static void scalar_batch_for_page(const SqlExpr* e, const EvalCtx& ctx, const Ba
   if (vx_trace_on()) vx_trace("subquery per key: batch for the page's outer rows");
 }
 
+bool fill_subquery_run(const SqlExpr* e, const EvalCtx& ctx, NestedResult* out);
+// Under EXPLAIN, a subquery's first answer is a step of its own, its statement's steps nested under it; a correlated
+// one's later runs (one an outer row) record nothing, so the plan holds it once, marked as run per row.
 bool fill_subquery(const SqlExpr* e, const EvalCtx& ctx, NestedResult* out) {
+  if (!plan_on()) return fill_subquery_run(e, ctx, out);
+  if (e->sub_evaluated) {
+    PlanScope off(nullptr);
+    return fill_subquery_run(e, ctx, out);
+  }
+  PhysicalPlan inner;
+  const uint64_t t0 = hal_now_ns();
+  bool ok;
+  {
+    PlanScope scope(&inner);
+    ok = fill_subquery_run(e, ctx, out);
+  }
+  if (!ok) return false;   // not answered here (a speculative run, or the cache's): the run that answers records it
+  std::string method = e->op == ExprOp::In ? "IN set" : e->op == ExprOp::Exists ? "EXISTS" : e->op == ExprOp::Func ? "row IN set" : "scalar";
+  if (e->sub_evaluated) method += e->sub_correlated ? ", correlated: run per outer row" : ", run once";
+  // A correlated one's row count is its first outer row's only: not shown.
+  PlanStep st = plan_step("subquery", {}, method, e->sub_evaluated && e->sub_correlated ? SIZE_MAX : out->row_count, hal_now_ns() - t0);
+  st.sub = std::move(inner.steps);
+  plan_add(std::move(st));
+  return true;
+}
+bool fill_subquery_run(const SqlExpr* e, const EvalCtx& ctx, NestedResult* out) {
   {
     if (e->sub_mu) {
       std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
@@ -33941,13 +33979,34 @@ Pred compile_pred(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, con
     p.expr = e;
     return p;
   }
-  const uint64_t t0 = vx_trace_enabled() ? (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() : 0;
-  Pred p = compile_pred_impl(e, t, local, base);
-  if (vx_trace_enabled() && p.kind != Pred::And && p.kind != Pred::Or && p.kind != Pred::Not) {
-    // Indexed by Pred::Kind - keep in its order.
-    const char* kinds[] = {"and", "or", "not", "per-code", "num-cmp", "text-cmp", "in-num", "is-null", "in-subquery",
-                           "in-subquery-per-code", "col-cmp", "concat-like", "row-eval"};
-    static_assert(sizeof(kinds) / sizeof(kinds[0]) == (size_t)Pred::Row + 1, "a name per Pred::Kind");
+  const uint64_t t0 = vx_trace_enabled() || plan_on() ? (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() : 0;
+  // Under EXPLAIN each leaf is a filter step, and what compiling it ran (an IN set's subquery) nests under it.
+  PhysicalPlan inner;
+  PhysicalPlan* const outer_plan = g_plan;
+  Pred p;
+  {
+    PlanScope scope(outer_plan ? &inner : nullptr);
+    p = compile_pred_impl(e, t, local, base);
+  }
+  // Indexed by Pred::Kind - keep in its order.
+  static const char* const kinds[] = {"and", "or", "not", "per-code", "num-cmp", "text-cmp", "in-num", "is-null", "in-subquery",
+                                      "in-subquery-per-code", "col-cmp", "concat-like", "row-eval"};
+  static_assert(sizeof(kinds) / sizeof(kinds[0]) == (size_t)Pred::Row + 1, "a name per Pred::Kind");
+  const bool leaf = p.kind != Pred::And && p.kind != Pred::Or && p.kind != Pred::Not;
+  if (outer_plan) {
+    if (leaf) {
+      std::string method = std::string(p.kind == Pred::Row ? "row by row" : kinds[(int)p.kind]);
+      if (p.kind != Pred::Row) method += " on " + t.columns[p.col].name;
+      PlanStep st = plan_step("filter", t.name, std::move(method), SIZE_MAX,
+                              (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() - t0);
+      st.detail = e->source_text;
+      st.sub = std::move(inner.steps);
+      plan_add(std::move(st));
+    } else {
+      for (PlanStep& k : inner.steps) plan_add(std::move(k));
+    }
+  }
+  if (vx_trace_enabled() && leaf) {
     std::string m = t.name + " where " + (e->source_text.empty() ? std::string("?") : e->source_text) + " <- " + kinds[(int)p.kind];
     if (p.kind != Pred::Row)
       m += std::string(" [") + t.columns[p.col].name + " " + vx_enc_name(t.col_data[p.col].encoding) + " ndv=" +
@@ -38155,6 +38214,15 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
   // --- group ids ---
   size_t G = 1;
   first_row->clear();
+  // Under EXPLAIN: how the group ids were made, one step at each way out that answered.
+  const uint64_t ag_t0 = plan_on() ? hal_now_ns() : 0;
+  std::string gmethod = has_group_by ? "" : "one group";
+  auto plan_agg = [&](size_t groups) {
+    if (!plan_on()) return;
+    PlanStep st = plan_step("aggregate", t.name, gmethod, groups, hal_now_ns() - ag_t0);
+    st.detail = std::to_string(key_src.size()) + " key(s), " + std::to_string(aggs.size()) + " aggregate(s)";
+    plan_add(std::move(st));
+  };
   // The morsels that can hold a selected row (all of them for a scan).
   const size_t mb = sel.m_begin(), me = sel.m_end();
   if (!has_group_by) {
@@ -38414,6 +38482,8 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             vx_trace_line("aggregate: " + std::to_string(hits) + " groups by slot (" + std::to_string(S) + " slots, " + std::to_string(lanes) +
                           " lanes): scan " + std::to_string((ds_t1 - ds_t0) / 1000) + " us, merge " + std::to_string((ds_t2 - ds_t1) / 1000) +
                           " us, values " + std::to_string((hal_now_ns() - ds_t2) / 1000) + " us");
+          gmethod = "slot arrays a lane (" + std::to_string(S) + " slots), merged";
+          plan_agg(hits);
           return true;
         }
       }
@@ -38460,7 +38530,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             out[j] = (uint32_t)g;
           }
         }
-        if (direct) G = first_row->size();
+        if (direct) { G = first_row->size(); gmethod = "direct slot array (" + std::to_string(span) + " slots)"; }
         else first_row->clear();
       }
     }
@@ -38568,6 +38638,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
     std::vector<uint32_t> rank_of(order.size());
     for (size_t i = 0; i < order.size(); ++i) rank_of[order[i]] = (uint32_t)i;
     G = order.size();
+    gmethod = single_id ? "hash of integer keys a lane, merged" : id_keys ? "hash of packed keys a lane, merged" : "hash of key text a lane, merged";
     first_row->resize(G);
     for (size_t i = 0; i < G; ++i) (*first_row)[i] = gfirst[order[i]];
     SqlThreadPool::instance().for_chunks(me - mb, 16, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t) {
@@ -38577,7 +38648,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
       }
     });
     }   // !direct
-    if (G == 0) { values->clear(); return true; }
+    if (G == 0) { values->clear(); plan_agg(0); return true; }
   }
 
   // --- aggregates ---
@@ -38815,6 +38886,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
   if (base.err && !base.err->empty()) { *err = *base.err; return false; }
   for (size_t ai = 0; ai < aggs.size(); ++ai)
     for (size_t g = 0; g < G; ++g) (*values)[g][ai] = finish_arrays(aggs[ai], plans[ai], totals[ai], g, rd_main);
+  plan_agg(G);
   return true;
 }
 
@@ -41315,7 +41387,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   base.db = db;
   base.sources = &sources;
   base.err = &err;
-  const uint64_t cw_t0 = vx_trace_on() ? hal_now_ns() : 0;
+  const uint64_t cw_t0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
   std::vector<uint32_t> rows;
   {
     vx::Selection sel;
@@ -41464,7 +41536,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     if (bits_of) *bits_of = bits;
     return true;
   };
-  const uint64_t cw_t1 = vx_trace_on() ? hal_now_ns() : 0;
+  const uint64_t cw_t1 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
   // Each window's value for each selected row.
   std::vector<std::vector<int64_t>> wval(wins.size(), std::vector<int64_t>(n, 0));
   // The rows in the first window's order, when ORDER BY asks for exactly that
@@ -41580,7 +41652,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       ps = pe;
     }
   }
-  const uint64_t cw_t2 = vx_trace_on() ? hal_now_ns() : 0;
+  const uint64_t cw_t2 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
   // ORDER BY and LIMIT over the selected rows.
   size_t from = b.offset > 0 ? (size_t)b.offset : 0;
   if (from > n) from = n;
@@ -41646,7 +41718,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     from = 0;
     to = ord.size();
   }
-  const uint64_t cw_t3 = vx_trace_on() ? hal_now_ns() : 0;
+  const uint64_t cw_t3 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
   // The rows kept, as text: columns as the evaluator prints them, windows as integers.
   SqlQueryResult r;
   r.success = true;
@@ -41704,6 +41776,17 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   }
   r.rows_affected = r.rows.size();
   if (!sql_wire_results()) r.formatted_table = SelectEngine::format_result_table(db, r.columns, r.rows);
+  }
+  if (plan_on()) {
+    plan_add(plan_step("rows", sources[0].alias, b.where ? "selected in lanes" : "every row", n, cw_t1 - cw_t0));
+    std::string fns;
+    for (const auto& w : wins) fns += (fns.empty() ? "" : ", ") + w.fn + (w.parts.empty() ? std::string() : " by " + std::to_string(w.parts.size()) + " key(s)");
+    PlanStep fs = plan_step("functions", {}, top_done ? "rn = 1: each partition's first row in one pass, no sort" : "columnar, one sort a partition order",
+                            top_done ? ord.size() : n, cw_t2 - cw_t1);
+    fs.detail = fns;
+    plan_add(std::move(fs));
+    if (!top_done && (!keys.empty() || keep_win >= 0))
+      plan_add(plan_step("order", {}, keep_win >= 0 ? "rows over rn <= " + std::to_string(keep_max) + " dropped" : "sort", to - from, cw_t3 - cw_t2));
   }
   *res = std::move(r);
   if (vx_trace_on())
@@ -42957,6 +43040,11 @@ static ExprPtr decorrelate_exists(SqlDatabase* db, const ParsedSelectBranch& bra
     if (p.failed() || !n || !p.at_end()) return e;
     changed = true;
     if (vx_trace_on()) vx_trace("decorrelated: " + text);
+    if (plan_on()) {
+      PlanStep st = plan_step("rewrite", {}, neg ? "NOT EXISTS as NOT IN" : "EXISTS as IN");
+      st.detail = text;
+      plan_add(std::move(st));
+    }
     return n;
   };
   ExprPtr w = walk(branch.where);
@@ -51135,16 +51223,27 @@ static std::optional<SqlQueryResult> fast_paths(const FastPlan& plan) {
     SqlQueryResult vx_res;
     lend_sink();
     g_vx_col_out = col_out;   // the request, lent for this call only
-    const bool answered = try_vx_single_table(db, sources[0], items, where, group_by, having, order_by, limit, offset, distinct,
-                                              outer_scope, &vx_res);
+    PhysicalPlan vplan;   // its filters and what they ran, nested under it
+    const uint64_t vt0 = plan_on() ? hal_now_ns() : 0;
+    bool answered;
+    {
+      PlanScope vscope(plan_on() ? &vplan : nullptr);
+      answered = try_vx_single_table(db, sources[0], items, where, group_by, having, order_by, limit, offset, distinct,
+                                     outer_scope, &vx_res);
+    }
     g_vx_col_out = nullptr;
     take_sink();
     if (answered) {
-      plan_add(plan_step("single-table", sources[0].alias, vx_res.execution_route.empty() ? "vectorized" : vx_res.execution_route,
-                         vx_res.rows_in_batch && col_out && col_out->filled ? col_out->rows
-                         : vx_res.rows.empty() ? (size_t)vx_res.rows_affected : vx_res.rows.size()));
+      if (plan_on()) {
+        PlanStep st = plan_step("single-table", sources[0].alias, vx_res.execution_route.empty() ? "vectorized" : vx_res.execution_route,
+                                vx_res.rows_in_batch && col_out && col_out->filled ? col_out->rows
+                                : vx_res.rows.empty() ? (size_t)vx_res.rows_affected : vx_res.rows.size(), hal_now_ns() - vt0);
+        st.sub = std::move(vplan.steps);
+        plan_add(std::move(st));
+      }
       return vx_res;
     }
+    // Not answered here: what it tried is not the plan - the path that answers records its own steps.
   }
   if (sources.size() == 1 && join_conditions.empty() && group_by.size() == 1 && !distinct && having == nullptr) {
     SqlQueryResult fast_res;
@@ -52693,7 +52792,22 @@ SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectB
     explicit SerialScope(bool o) : on(o), was(SqlThreadPool::is_in_worker_thread()) { if (on) SqlThreadPool::set_in_worker_thread(true); }
     ~SerialScope() { if (on) SqlThreadPool::set_in_worker_thread(was); }
   } serial_scope(assigns);
-  if (branch_has_window(raw_branch)) { plan_add(plan_step("window")); return execute_windowed(db, raw_branch, col_out, &rn_keep); }
+  if (branch_has_window(raw_branch)) {
+    if (!plan_on()) return execute_windowed(db, raw_branch, col_out, &rn_keep);
+    // Its steps - the rows it reads, how the functions ran - nested under it.
+    PhysicalPlan wplan;
+    const uint64_t wt0 = hal_now_ns();
+    SqlQueryResult wres;
+    {
+      PlanScope wscope(&wplan);
+      wres = execute_windowed(db, raw_branch, col_out, &rn_keep);
+    }
+    PlanStep ws = plan_step("window", {}, {}, !wres.success ? SIZE_MAX : wres.rows_in_batch && col_out && col_out->filled ? col_out->rows : wres.rows.size(),
+                            hal_now_ns() - wt0);
+    ws.sub = std::move(wplan.steps);
+    plan_add(std::move(ws));
+    return wres;
+  }
   // SELECT ... ORDER BY <the clustered key> [DESC] LIMIT n [OFFSET m] over a
   // table whose rows are in key order: the answer is a run of rows at one end
   // of the table. The statement is run with a key range that holds just that
