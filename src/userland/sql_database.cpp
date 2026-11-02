@@ -28962,24 +28962,28 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
 
     // What the answer depends on: every table or view name the statement
     // mentions (a column that shares a table's name still counts - only an
-    // extra drop), or everything when one of them is a view, whose tables
-    // the text does not show. Only names a write can target are kept: every
-    // identifier used to go in, and a 40-name statement cost 40 map inserts
-    // under the cache lock on every miss for the three that mattered.
+    // extra drop), and for a view the tables its text reads
+    // (view_base_tables_lower) - or everything, where a view's text cannot say.
+    // Only names a write can target are kept: every identifier used to go in,
+    // and a 40-name statement cost 40 map inserts under the cache lock on
+    // every miss for the three that mattered.
     std::vector<std::string> deps;
     bool reads_view = false;
     {
       const auto view_names = view_names_lower();
       const auto table_names = table_names_lower();
+      std::vector<std::string> view_tables;
       for (const auto& t : toks) {
         if (t.kind != Tok::Ident || t.text.empty()) continue;
         std::string n = lower_of(t.text);
         const bool is_view = view_names->count(n) != 0;
         if (!is_view && !table_names->count(n)) continue;
         if (std::find(deps.begin(), deps.end(), n) != deps.end()) continue;
-        if (is_view) reads_view = true;
+        if (is_view && !reads_view && !view_base_tables_lower(n, &view_tables)) reads_view = true;
         deps.push_back(std::move(n));
       }
+      for (auto& v : view_tables)
+        if (std::find(deps.begin(), deps.end(), v) == deps.end()) deps.push_back(std::move(v));
     }
     // A table it reads is being written right now: answered without the
     // cache (streamed, as a first sight is), not stored to be dropped.
@@ -61450,6 +61454,109 @@ std::shared_ptr<const std::unordered_set<std::string>> SqlDatabase::view_names_l
   view_names_lower_ = names;
   view_names_gen_ = gen;
   return view_names_lower_;
+}
+
+// The tables an answer through a view reads, from the view's text and the texts of the views it reads: every
+// identifier that names a table (a column sharing a table's name only adds a dependency, never loses one). The
+// result cache kept such an answer against every table - on st, with the binlog writing customer_online every few
+// seconds, no report through stocktrans was ever answered from the cache. Unknowable, and so every table again:
+// a call to a stored function (it may read anything), and a name in a table position (after FROM / JOIN, or a
+// comma of a FROM list, past a database qualifier) that is neither a table nor a view - one the engine does not
+// hold, whose writes it never sees.
+bool SqlDatabase::view_base_tables_lower(const std::string& view_lower, std::vector<std::string>* out) const {
+  const auto tables = table_names_lower();
+  const auto views = view_names_lower();
+  const uint64_t vg = views_gen_.load(std::memory_order_acquire), sg = schema_gen_.load(std::memory_order_acquire),
+                 pg = programs_gen_.load(std::memory_order_acquire);
+  auto give = [&](const std::shared_ptr<const std::vector<std::string>>& deps) {
+    if (!deps) return false;
+    for (const auto& d : *deps)
+      if (std::find(out->begin(), out->end(), d) == out->end()) out->push_back(d);
+    return true;
+  };
+  {
+    hal::LockGuard lock(view_deps_mu_);
+    if (view_deps_views_gen_ != vg || view_deps_schema_gen_ != sg || view_deps_programs_gen_ != pg || view_deps_tables_ != tables->size()) {
+      view_deps_.clear();
+      view_deps_views_gen_ = vg;
+      view_deps_schema_gen_ = sg;
+      view_deps_programs_gen_ = pg;
+      view_deps_tables_ = tables->size();
+    }
+    auto it = view_deps_.find(view_lower);
+    if (it != view_deps_.end()) return give(it->second);
+  }
+  auto deps = std::make_shared<std::vector<std::string>>();
+  bool known = true;
+  std::vector<std::string> todo{view_lower};
+  std::unordered_set<std::string> seen{view_lower};
+  const bool functions = has_stored_functions();
+  for (size_t qi = 0; qi < todo.size() && known; ++qi) {
+    if (qi >= 64) { known = false; break; }
+    // every view of that name, in any database (the name alone is what the statement's text gave)
+    std::vector<std::pair<std::string, std::string>> texts;   // (database, query_sql)
+    {
+      StatementLock vl(rw_lock_, false);
+      for (const auto& kv : views_)
+        if (lower_of(kv.second.name) == todo[qi]) texts.emplace_back(kv.second.database, kv.second.query_sql);
+    }
+    if (texts.empty()) { known = false; break; }
+    for (const auto& [vdb, sql] : texts) {
+      std::vector<Token> toks;
+      std::string terr;
+      if (!tokenize_sql_uncached(sql, &toks, &terr)) { known = false; break; }
+      // per parenthesis depth: inside a FROM list (from FROM until the clause that ends it)
+      std::vector<uint8_t> in_from(1, 0);
+      for (size_t i = 0; i < toks.size() && known; ++i) {
+        const Token& t = toks[i];
+        if (t.kind == Tok::Punct) {
+          if (t.text == "(") in_from.push_back(0);
+          else if (t.text == ")" && in_from.size() > 1) in_from.pop_back();
+          continue;
+        }
+        if (t.kind != Tok::Ident || t.text.empty()) continue;
+        if (!t.quoted) {
+          const std::string& u = t.up;
+          if (u == "FROM"sv) { in_from.back() = 1; continue; }
+          if (u == "WHERE"sv || u == "GROUP"sv || u == "HAVING"sv || u == "ORDER"sv || u == "LIMIT"sv || u == "UNION"sv ||
+              u == "ON"sv || u == "USING"sv || u == "WINDOW"sv || u == "SELECT"sv)
+            in_from.back() = 0;
+        }
+        const std::string n = lower_of(t.text);
+        const bool call = i + 1 < toks.size() && toks[i + 1].kind == Tok::Punct && toks[i + 1].text == "(";
+        if (call && functions && (find_program('F', vdb + "." + n) || find_program('F', n))) { known = false; break; }
+        if (tables->count(n)) {
+          if (std::find(deps->begin(), deps->end(), n) == deps->end()) deps->push_back(n);
+          continue;
+        }
+        if (views->count(n)) {
+          // a view it reads: its tables too, and its own name (a CREATE OR REPLACE of it drops the answer)
+          if (seen.insert(n).second) {
+            todo.push_back(n);
+            if (std::find(deps->begin(), deps->end(), n) == deps->end()) deps->push_back(n);
+          }
+          continue;
+        }
+        if (call) continue;   // a function
+        // a table position: right after FROM / JOIN, after a comma of a FROM list, or the name after `db.` there
+        size_t at = i;
+        if (at >= 2 && toks[at - 1].kind == Tok::Punct && toks[at - 1].text == "." && toks[at - 2].kind == Tok::Ident) at -= 2;
+        else if (i + 2 < toks.size() && toks[i + 1].kind == Tok::Punct && toks[i + 1].text == ".") continue;   // a qualifier: its name decides
+        if (at == 0) continue;
+        const Token& p = toks[at - 1];
+        const bool after_kw = p.kind == Tok::Ident && !p.quoted && (p.up == "FROM"sv || p.up == "JOIN"sv);
+        const bool after_comma = p.kind == Tok::Punct && p.text == "," && in_from.back();
+        if (after_kw || after_comma) known = false;
+      }
+    }
+  }
+  std::shared_ptr<const std::vector<std::string>> kept;
+  if (known) kept = deps;
+  {
+    hal::LockGuard lock(view_deps_mu_);
+    if (view_deps_views_gen_ == vg && view_deps_schema_gen_ == sg && view_deps_programs_gen_ == pg) view_deps_[view_lower] = kept;
+  }
+  return give(kept);
 }
 
 // The capability gate. It reads a statement the way the executor will (same

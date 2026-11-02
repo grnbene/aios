@@ -4152,6 +4152,15 @@ class SqlDatabase {
   mutable std::shared_ptr<const std::unordered_set<std::string>> view_names_lower_;
   mutable uint64_t view_names_gen_ = ~0ull;
   std::shared_ptr<const std::unordered_set<std::string>> view_names_lower() const;
+  // A view's base tables, lower-cased and through the views it reads, for the result cache's dependencies (appended
+  // to *out). False when its text cannot say them all - a stored function it calls, a source in a table position
+  // that is neither a table nor a view, views nested past 64 - and the answer then depends on every table, as any
+  // answer through a view did. Kept per view until the views, the schema or the stored programs change.
+  bool view_base_tables_lower(const std::string& view_lower, std::vector<std::string>* out) const;
+  mutable hal::Mutex view_deps_mu_;
+  mutable std::unordered_map<std::string, std::shared_ptr<const std::vector<std::string>>> view_deps_;   // null: unknowable
+  mutable uint64_t view_deps_views_gen_ = ~0ull, view_deps_schema_gen_ = ~0ull, view_deps_programs_gen_ = ~0ull;
+  mutable size_t view_deps_tables_ = 0;
   hal::Mutex table_list_mu_;
   std::string table_list_dir_;
   uint64_t table_list_sig_ = ~0ull;                         // schema_gen_/table count last published

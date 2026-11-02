@@ -646,6 +646,73 @@ int main() {
     for (int i = 0; i < 3; ++i) gw("sum cached again (" + std::to_string(i) + ")", q, 1, "21");
     gw_ok("DELETE FROM qc_det WHERE ln = 99");
     gw("cached count after DELETE", q, 0, "2");
+
+    // An answer through a view depends on the view's tables, not on every table: a write to another table (the
+    // binlog's customer_online on st, every few seconds) leaves it cached, a write to one the view reads - directly
+    // or through a view it reads - drops it. A view that calls a stored function may read anything: any write.
+    auto hits = [&]() -> long long {
+      SqlQueryResult r = db.execute_gateway_query("SHOW GLOBAL STATUS LIKE 'Asql_cache_hits'");
+      return r.success && !r.rows.empty() && r.rows[0].values.size() > 1 ? std::atoll(r.rows[0].values[1].c_str()) : -1;
+    };
+    // the statement answered twice more: from the cache both times (hit) or recomputed both times
+    auto served = [&](const std::string& label, const std::string& sql, const std::string& want, bool cached) {
+      const long long h0 = hits();
+      gw(label + " (1)", sql, 0, want);
+      gw(label + " (2)", sql, 0, want);
+      g_checks++;
+      const long long dh = hits() - h0;
+      if (cached ? dh < 2 : dh != 0) { std::cerr << "  [FAIL] " << label << ": " << dh << " cache hits of 2, want " << (cached ? 2 : 0) << "\n"; g_failures++; }
+      else std::cout << "  [ok] " << label << ": " << (cached ? "from the cache" : "recomputed") << "\n";
+    };
+    gw_ok("CREATE TABLE qv_mv (id INT PRIMARY KEY, t INT, amt INT)");
+    gw_ok("CREATE TABLE qv_hdr (t INT PRIMARY KEY, who VARCHAR(10))");
+    gw_ok("CREATE TABLE qv_other (id INT PRIMARY KEY, url VARCHAR(40))");
+    gw_ok("INSERT INTO qv_mv VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5)");
+    gw_ok("INSERT INTO qv_hdr VALUES (1, 'a'), (2, 'b')");
+    gw_ok("INSERT INTO qv_other VALUES (1, 'x')");
+    gw_ok("CREATE VIEW qv_lines AS SELECT `qv_mv`.`amt` AS `amt`, `qv_hdr`.`who` AS `who` FROM (`qv_mv` JOIN `qv_hdr` ON (`qv_mv`.`t` = `qv_hdr`.`t`))");
+    gw_ok("CREATE VIEW qv_outer AS SELECT amt, who FROM qv_lines WHERE amt > 0");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    const std::string qv = "SELECT SUM(amt) FROM qv_lines WHERE who = 'a'";
+    const std::string qo = "SELECT SUM(amt) FROM qv_outer WHERE who = 'a'";
+    for (int i = 0; i < 2; ++i) {   // seen twice: stored from the second sight
+      gw("view sum, first sights", qv, 0, "30");
+      gw("nested view sum, first sights", qo, 0, "30");
+    }
+    served("view sum", qv, "30", true);
+    served("nested view sum", qo, "30", true);
+    gw_ok("UPDATE qv_other SET url = 'y' WHERE id = 1");   // a table neither view reads
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    served("view sum after a write to another table", qv, "30", true);
+    served("nested view sum after a write to another table", qo, "30", true);
+    gw_ok("INSERT INTO qv_mv VALUES (4, 1, 7)");            // a table under both
+    gw("view sum after a write to its table", qv, 0, "37");
+    gw("nested view sum after a write to its table", qo, 0, "37");
+    gw_ok("UPDATE qv_hdr SET who = 'z' WHERE t = 2");         // the other table under both
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    gw("view sum after a write to its other table", qv, 0, "37");
+    gw_ok("UPDATE qv_hdr SET who = 'a' WHERE t = 2");
+    gw("view sum after the write that changes it", qv, 0, "42");
+    gw("nested view sum after the write that changes it", qo, 0, "42");
+    gw_ok("CREATE OR REPLACE VIEW qv_lines AS SELECT `qv_mv`.`amt` * 2 AS `amt`, `qv_hdr`.`who` AS `who` FROM (`qv_mv` JOIN `qv_hdr` ON (`qv_mv`.`t` = `qv_hdr`.`t`))");
+    gw("view sum after CREATE OR REPLACE VIEW", qv, 0, "84");
+    gw("nested view sum after the view under it is replaced", qo, 0, "84");
+    // a stored function in the view may read any table: its answer goes with any write, as every answer through
+    // a view did - here a write to qv_hdr, which neither the view nor the function reads
+    gw_ok("CREATE FUNCTION qv_other_count() RETURNS INT READS SQL DATA RETURN (SELECT COUNT(*) FROM qv_other)");
+    gw_ok("CREATE VIEW qv_fn AS SELECT `qv_mv`.`amt` + qv_other_count() AS `amt` FROM `qv_mv`");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    const std::string qf = "SELECT SUM(amt) FROM qv_fn";
+    for (int i = 0; i < 2; ++i) gw("view calling a function, first sights", qf, 0, "46");
+    served("view calling a function", qf, "46", true);
+    gw_ok("UPDATE qv_hdr SET who = who WHERE t = 1");
+    gw_ok("UPDATE qv_hdr SET who = 'q' WHERE t = 2");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    const long long fh0 = hits();
+    gw("view calling a function after any write", qf, 0, "46");
+    g_checks++;
+    if (hits() != fh0) { std::cerr << "  [FAIL] view calling a function: answered from the cache after a write\n"; g_failures++; }
+    else std::cout << "  [ok] view calling a function: recomputed after any write\n";
   }
 
   std::cout << "\n=== " << (g_checks - g_failures) << "/" << g_checks << " gap checks pass ===\n";
