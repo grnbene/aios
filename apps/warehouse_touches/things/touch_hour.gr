@@ -170,7 +170,7 @@ fn things_span(ks, sh) {
            "rec": {"scans": 0, "qty_in": 0.0, "qty_out": 0.0, "items": [], "vendors": []},
            "pick": {"lines": 0, "qty": 0.0, "orders": []},
            "moves": {}, "runs": {}, "units": {},
-           "packed": {}, "staged": {}, "binds": [], "pickups": {}, "cleared": {}, "dname": nil, "lasts": {}}
+           "packed": {}, "staged": {}, "binds": [], "pickups": {}, "cleared": {}, "rmas": {}, "dname": nil, "lasts": {}}
       of_hour[key] = u
     }
     return u
@@ -350,6 +350,24 @@ fn things_span(ks, sh) {
       let pd = get_or_put(get_or_put(get_or_put(per_disp, dn, {}), id, {}), dv, {"units": 0.0, "orders": []})
       pd.units = pd.units + num(r.units)
       if r.orderno != nil { push(pd.orders, str(r.orderno)) }
+    }
+    // RMA pickups: a run's credit order stops (dispatch type 11, the invoice a creditorders number), the returned
+    // merchandise its driver brought back. Nothing scans them onto the truck (creditloading.loaded stays 0), so the
+    // units are the credit order's line quantities. Each counts on its own run (number and truck), in the run's last
+    // hour, for the driver named on the stop; kept by credit order number, so a range counts it once.
+    let last_hour = {}
+    for rk in keys(runs) { last_hour[runs[rk].id] = max(last_hour[runs[rk].id], runs[rk].hour) }
+    for r in read_raw("SELECT d.dispnumber, d.truckid, d.driveruserid AS driver, d.invoice AS rma, SUM(cod.quantity) AS units " +
+                      "FROM dispatch d INNER JOIN creditorderdetails cod ON cod.orderno = d.invoice " +
+                      "INNER JOIN stockmaster sm ON sm.stockid = cod.stkcode " +
+                      "INNER JOIN product_types pt ON pt.label = sm.mbflag AND pt.requirespick = 1 " +
+                      "WHERE d.type = 11 AND d.dispnumber IN (?) AND d.driveruserid IS NOT NULL AND d.driveruserid <> '' AND cod.quantity > 0" +
+                      replace(MERCH, "pf.stockid", "cod.stkcode") +
+                      " GROUP BY d.dispnumber, d.truckid, d.driveruserid, d.invoice", disps) {
+      let hour = last_hour[str(int(r.dispnumber)) + "-" + str(int(r.truckid))]
+      if hour == nil { continue }   // a stop on a truck that is not this run's
+      let u = driver_user(hour, r.driver)
+      if u != nil { u.rmas[str(r.rma)] = {"u": num(r.units), "d": slice(hour, 0, 10)} }
     }
     for rk in keys(runs) {
       let run = runs[rk]
@@ -577,6 +595,9 @@ fn touched(table, op, before, after, sh) {
         for d in order_run_days(row.orderno) { push(ds, d) }
         for d in delivery_hours(row.orderno) { push(ds, d) }
       }
+    } else if t == "creditorderdetails" {
+      // an RMA's lines: the runs it is a stop on (section 4)
+      if row.orderno != nil { for d in order_run_days(row.orderno) { push(ds, d) } }
     } else if t == "salesorderdetails" {
       if row.orderno != nil {
         for d in sticker_days(row.orderno) { push(ds, d) }

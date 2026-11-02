@@ -24,7 +24,7 @@ The heavy work is done once, by ASQL, not on every page view.
 
 The tables `touch_hour` reads: `recscan`, `pickingfreeze`, `stockmaster`, `product_types`, `binmovements_details`,
 `www_users`, `loadingbays`, `dispatch`, `stickerscanout`, `salesorderdetails`, `trackinginfo`, `salesorders`,
-`debtortrans`, `stockmoves`.
+`debtortrans`, `stockmoves`, `creditorderdetails`.
 
 Two places where the app counts differently from `touches.php`, on purpose:
 
@@ -34,6 +34,9 @@ Two places where the app counts differently from `touches.php`, on purpose:
   when) are still `recscan`'s, and each move is placed in the hour its receiver scanned that item.
 - **Deliveries cleared from their run** (status "needs invoiced") count as loads, on a "Cleared from run (no
   driver)" line: their dispatch row is gone, but the loaded quantity is still in `pickingfreeze`.
+- **RMA pickups** (a run's credit order stops, dispatch type 11) count as loads for the run's driver, shown as "RMA
+  pickups" under Loads. Nothing scans returns onto the truck (`creditloading.loaded` stays 0), so their units are the
+  credit order's merchandise line quantities. They are left out of Units per Dispatch and Skipped %.
 
 ## Where it runs
 
