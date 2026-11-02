@@ -22153,6 +22153,13 @@ SqlDatabase::~SqlDatabase() {
   redo_drain();   // the records no commit has synced yet: into the file
 #if !defined(AIOS_INLINE_THREADS)
   {
+    // A conversion under way finishes (or is dropped at its check); the rest of the queue waits for the next start.
+    std::lock_guard<aios::hal::Mutex> lk(upkeep_mu_);
+    upkeep_stop_ = true;
+    upkeep_cv_.notify_all();
+  }
+  if (upkeep_thread_.joinable()) upkeep_thread_.join();
+  {
     // A snapshot still being written lands before the process goes.
     std::lock_guard<aios::hal::Mutex> lk(checkpoint_mu_);
     checkpoint_stop_ = true;
@@ -25010,7 +25017,195 @@ void SqlDatabase::checkpoint() {
   flush_impl(true);
 }
 
-void SqlDatabase::maintain_storage() {
+// A column's conversion to the form its values allow, as a checkpoint makes it: a dictionary-coded INT column
+// typed, a DOUBLE / DECIMAL one whose entries scale exactly scaled, a DATE / DATETIME one of canonical text days or
+// seconds, one marked reencode_pending re-encoded. True when the column changed (its flags alone may move too: a
+// column looked at once and found not to scale is not looked at again).
+static bool column_convert(ColumnStore& cs, const SqlColumn& col, const std::string& tname) {
+  bool changed = false;
+  // A DOUBLE column the same way, when every value it holds is a
+  // decimal of at most four places that reads back as written (the
+  // scaled encoding's condition; checked on the dictionary's entries,
+  // not the rows): summed and compared as numbers, it was a string copy
+  // and a strtod per row - half a 1.5M-row monthly report's time.
+  const bool promote = !cs.reencode_pending && !cs.typed_tried && cs.encoding == ColumnEncoding::DictBitPacked &&
+                       !cs.shared_dict && cs.size() > 0 &&
+                       (col.type == SqlDataType::Int ||
+                        (col.type == SqlDataType::Real && !col.temporal && cs.dict_scales_exactly()) ||
+                        (col.type == SqlDataType::Decimal && col.scale >= 1 && col.scale <= 9 && cs.dict_scales_exactly(col.scale)));
+  if (!promote && !cs.typed_tried && (col.type == SqlDataType::Real || col.type == SqlDataType::Decimal) && cs.encoding == ColumnEncoding::DictBitPacked)
+    cs.typed_tried = true;   // looked at once; a column that cannot scale stays as it is
+  // A DATE / DATETIME / TIMESTAMP column the same way: its dictionary
+  // entries (not the rows) say whether every value is canonical text, and
+  // it becomes days / seconds in FOR integers (dict_to_temporal). A column
+  // still too small for the encoding is looked at again at the next checkpoint.
+  if (col.temporal && !cs.reencode_pending && !cs.typed_tried &&
+      (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) &&
+      !cs.shared_dict && cs.dict.size() > kTemporalMinDistinct) {
+    cs.typed_tried = true;
+    if (cs.dict_temporal_fits()) {
+      static const bool store_trace_t = std::getenv("AIOS_STORE_TRACE") != nullptr;
+      if (store_trace_t) fprintf(stderr, "[store] %s.%s: temporal at checkpoint\n", tname.c_str(), col.name.c_str());
+      cs.dict_to_temporal();
+      cs.ensure_dict_doubles();
+      cs.ensure_dict_ints();
+      changed = true;
+    }
+  }
+  if (cs.reencode_pending || promote) {
+    static const bool store_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+    if (store_trace) fprintf(stderr, "[store] %s.%s: %s at checkpoint\n", tname.c_str(), col.name.c_str(), promote ? "typed" : "re-encoded");
+    if (promote && !cs.reencode_pending && col.type == SqlDataType::Real) cs.dict_to_scaled();
+    else if (promote && !cs.reencode_pending && col.type == SqlDataType::Decimal) cs.dict_to_scaled(col.scale);
+    else cs.optimize_encoding(col.type, col.scale, col.temporal);
+    cs.reencode_pending = false;
+    cs.typed_tried = true;
+    changed = true;
+  }
+  return changed;
+}
+
+// Whether column_convert would convert the column (not only move its flags): its flags and its dictionary say.
+static bool column_convert_due(const ColumnStore& cs, const SqlColumn& col) {
+  if (cs.reencode_pending) return true;
+  if (cs.typed_tried || cs.shared_dict || cs.size() == 0) return false;
+  if (cs.encoding == ColumnEncoding::DictBitPacked &&
+      (col.type == SqlDataType::Int || (col.type == SqlDataType::Real && !col.temporal && cs.dict_scales_exactly()) ||
+       (col.type == SqlDataType::Decimal && col.scale >= 1 && col.scale <= 9 && cs.dict_scales_exactly(col.scale))))
+    return true;
+  return col.temporal && (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) &&
+         cs.dict.size() > kTemporalMinDistinct && cs.dict_temporal_fits();
+}
+
+// ---- column conversions off the lock ----
+// A checkpoint converted every column due for it under the exclusive lock (maintain_storage): the first one after a
+// restart typed the columns a load left as dictionaries - 4 x 2M-row INT columns, 1,044 of the checkpoint's 1,063 ms,
+// with every statement waiting and the first write after the boot paying it all before its answer. A column past
+// kUpkeepOffLockRows rows is now queued instead; upkeep_loop copies it under the exclusive lock (memcpy speed), converts
+// the copy under no lock, and puts it in place under the exclusive lock only if its table took no write meanwhile -
+// what the checkpoint would have made, at the same place. A table written in between keeps its column as it is,
+// and the next checkpoint queues it again. AIOS_SQL_UPKEEP_OFFLOCK=0: all of it under the lock, as before.
+bool SqlDatabase::upkeep_off_lock() {
+#if defined(AIOS_INLINE_THREADS)
+  return false;
+#else
+  static const bool on = [] { const char* v = std::getenv("AIOS_SQL_UPKEEP_OFFLOCK"); return !(v && *v == '0'); }();
+  return on;
+#endif
+}
+
+void SqlDatabase::upkeep_enqueue(const std::string& table_key, const std::string& column) {
+#if !defined(AIOS_INLINE_THREADS)
+  std::lock_guard<aios::hal::Mutex> lk(upkeep_mu_);
+  if (upkeep_stop_ || !upkeep_queued_.insert({table_key, column}).second) return;
+  upkeep_queue_.emplace_back(table_key, column);
+  if (!upkeep_thread_.joinable()) upkeep_thread_ = aios::hal::Thread([this] { upkeep_loop(); });
+  upkeep_cv_.notify_all();
+#else
+  (void)table_key; (void)column;
+#endif
+}
+
+void SqlDatabase::upkeep_loop() {
+  std::unique_lock<aios::hal::Mutex> lk(upkeep_mu_);
+  for (;;) {
+    upkeep_cv_.wait(lk, [&] { return upkeep_stop_ || !upkeep_queue_.empty(); });
+    if (upkeep_stop_) return;
+    const std::pair<std::string, std::string> job = upkeep_queue_.front();
+    upkeep_queue_.pop_front();
+    upkeep_busy_ = true;
+    lk.unlock();
+    upkeep_column(job.first, job.second);
+    lk.lock();
+    upkeep_queued_.erase(job);
+    upkeep_busy_ = false;
+    upkeep_cv_.notify_all();
+  }
+}
+
+void SqlDatabase::wait_warm_up() const {
+  while (warm_running_.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
+void SqlDatabase::upkeep_wait_idle() {
+#if !defined(AIOS_INLINE_THREADS)
+  std::unique_lock<aios::hal::Mutex> lk(upkeep_mu_);
+  upkeep_cv_.wait(lk, [&] { return upkeep_stop_ || (upkeep_queue_.empty() && !upkeep_busy_); });
+#endif
+}
+
+bool SqlDatabase::upkeep_column(const std::string& table_key, const std::string& column) {
+  static const bool trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
+  const uint64_t t0 = kernel_.host().monotonic_ns();
+  ColumnStore copy;
+  SqlColumn col;
+  std::string tname;
+  uint64_t seq = 0, epoch = 0;
+  size_t rows = 0, ci = 0;
+  {
+    // The copy under the exclusive lock, as the checkpoint's snapshot copies: a reader under the shared one may be
+    // filling the column's own caches (its dictionary's numbers) as it is copied. A copy is memcpy speed.
+    StatementLock lock(rw_lock_, true);
+    auto it = tables_.find(table_key);
+    if (it == tables_.end()) return false;
+    const SqlTable& t = it->second;
+    const int c = t.get_column_index(column);
+    if (c < 0 || (size_t)c >= t.col_data.size() || (size_t)c >= t.columns.size()) return false;
+    const ColumnStore& cs = t.col_data[(size_t)c];
+    if (!column_convert_due(cs, t.columns[(size_t)c])) return false;
+    copy = cs;
+    col = t.columns[(size_t)c];
+    tname = t.name;
+    seq = t.mutation_seq;
+    rows = t.row_count();
+    epoch = cs.epoch;
+    ci = (size_t)c;
+  }
+  const uint64_t t1 = kernel_.host().monotonic_ns();
+  const bool converted = column_convert(copy, col, tname);
+  // AIOS_SQL_UPKEEP_DELAY_MS: a pause before the column is put in place, which widens the window a write can land
+  // in (asql-upkeep-check makes one land there); 0 by default.
+  static const uint64_t delay_ms = [] { const char* v = std::getenv("AIOS_SQL_UPKEEP_DELAY_MS"); return v && *v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+  if (delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  const uint64_t t2 = kernel_.host().monotonic_ns();
+  ColumnStore old;   // the column it replaces, freed after the lock is let go
+  uint64_t t3 = 0, t4 = 0;
+  {
+    StatementLock lock(rw_lock_, true);
+    t3 = kernel_.host().monotonic_ns();
+    auto it = tables_.find(table_key);
+    // in place only as the checkpoint would have done it: no transaction open (its undo names the cells as they
+    // are), no load or replay going on, the table and the column as the copy found them
+    const bool same = it != tables_.end() && open_txns_.load() == 0 && !bulk_load_ && !redo_replaying_ &&
+                      it->second.mutation_seq == seq && it->second.row_count() == rows && ci < it->second.col_data.size() &&
+                      ci < it->second.columns.size() && it->second.columns[ci].name == col.name && it->second.col_data[ci].epoch == epoch;
+    if (!same) {
+      upkeep_dropped_.fetch_add(1, std::memory_order_relaxed);
+      if (trace) fprintf(stderr, "[store] %s.%s: changed while converted off the lock - left for the next checkpoint\n", tname.c_str(), col.name.c_str());
+      return false;
+    }
+    SqlTable& t = it->second;
+    old = std::move(t.col_data[ci]);
+    t.col_data[ci] = std::move(copy);
+    if (converted) {
+      t.stamp_form_change();
+      t.layout_seq = t.mutation_seq;
+      if (t.probe_mu) {
+        std::lock_guard<aios::hal::Mutex> lk(*t.probe_mu);
+        t.probe_indices.clear();
+      }
+    }
+    t4 = kernel_.host().monotonic_ns();
+  }
+  if (converted) upkeep_converted_.fetch_add(1, std::memory_order_relaxed);
+  if (trace)
+    fprintf(stderr, "[store] %s.%s: converted off the lock (copied in %.1f ms and put in place in %.1f ms under the lock; "
+            "converted in %.1f ms, waited %.1f ms for the lock)\n", tname.c_str(), col.name.c_str(), (t1 - t0) / 1e6, (t4 - t3) / 1e6,
+            (t2 - t1) / 1e6, (t3 - t2) / 1e6);
+  return converted;
+}
+
+void SqlDatabase::maintain_storage(bool off_lock) {
   // Segments whose stats a delete dropped are refreshed a few at a time:
   // the refresh is a string copy and a collate key per row (2048 rows a
   // segment), and this runs under the exclusive lock. 16 segments per
@@ -25051,44 +25246,10 @@ void SqlDatabase::maintain_storage() {
           changed = true;
         }
       }
-      // A DOUBLE column the same way, when every value it holds is a
-      // decimal of at most four places that reads back as written (the
-      // scaled encoding's condition; checked on the dictionary's entries,
-      // not the rows): summed and compared as numbers, it was a string copy
-      // and a strtod per row - half a 1.5M-row monthly report's time.
-      const bool promote = !cs.reencode_pending && !cs.typed_tried && cs.encoding == ColumnEncoding::DictBitPacked &&
-                           !cs.shared_dict && cs.size() > 0 &&
-                           (t.columns[c].type == SqlDataType::Int ||
-                            (t.columns[c].type == SqlDataType::Real && !t.columns[c].temporal && cs.dict_scales_exactly()) ||
-                            (t.columns[c].type == SqlDataType::Decimal && t.columns[c].scale >= 1 && t.columns[c].scale <= 9 &&
-                             cs.dict_scales_exactly(t.columns[c].scale)));
-      if (!promote && !cs.typed_tried && (t.columns[c].type == SqlDataType::Real || t.columns[c].type == SqlDataType::Decimal) && cs.encoding == ColumnEncoding::DictBitPacked)
-        cs.typed_tried = true;   // looked at once; a column that cannot scale stays as it is
-      // A DATE / DATETIME / TIMESTAMP column the same way: its dictionary
-      // entries (not the rows) say whether every value is canonical text, and
-      // it becomes days / seconds in FOR integers (dict_to_temporal). A column
-      // still too small for the encoding is looked at again at the next checkpoint.
-      if (t.columns[c].temporal && !cs.reencode_pending && !cs.typed_tried &&
-          (cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) &&
-          !cs.shared_dict && cs.dict.size() > kTemporalMinDistinct) {
-        cs.typed_tried = true;
-        if (cs.dict_temporal_fits()) {
-          static const bool store_trace_t = std::getenv("AIOS_STORE_TRACE") != nullptr;
-          if (store_trace_t) fprintf(stderr, "[store] %s.%s: temporal at checkpoint\n", t.name.c_str(), t.columns[c].name.c_str());
-          cs.dict_to_temporal();
-          cs.ensure_dict_doubles();
-          cs.ensure_dict_ints();
-          changed = true;
-        }
-      }
-      if (cs.reencode_pending || promote) {
-        static const bool store_trace = std::getenv("AIOS_STORE_TRACE") != nullptr;
-        if (store_trace) fprintf(stderr, "[store] %s.%s: %s at checkpoint\n", t.name.c_str(), t.columns[c].name.c_str(), promote ? "typed" : "re-encoded");
-        if (promote && !cs.reencode_pending && t.columns[c].type == SqlDataType::Real) cs.dict_to_scaled();
-        else if (promote && !cs.reencode_pending && t.columns[c].type == SqlDataType::Decimal) cs.dict_to_scaled(t.columns[c].scale);
-        else cs.optimize_encoding(t.columns[c].type, t.columns[c].scale, t.columns[c].temporal);
-        cs.reencode_pending = false;
-        cs.typed_tried = true;
+      // A big column's conversion is made off the exclusive lock (upkeep_column), a small one's here.
+      if (off_lock && upkeep_off_lock() && cs.size() >= kUpkeepOffLockRows && column_convert_due(cs, t.columns[c])) {
+        upkeep_enqueue(kv.first, t.columns[c].name);
+      } else if (column_convert(cs, t.columns[c], t.name)) {
         changed = true;
       }
       // The table's TEXT_CODEC reaches its block columns here: blocks packed
@@ -25354,7 +25515,7 @@ Result<void> SqlDatabase::flush_impl(bool async, bool maintain) {
   last_checkpoint_ns_ = t0;
   // Storage maintenance (dictionary compaction, re-encoding, stats) is the checkpoint's job, not a snapshot's: under
   // the lock it was 390 of an EXPORT SNAPSHOT's 409 ms there (the snapshot itself 18).
-  if (maintain) maintain_storage();
+  if (maintain) maintain_storage(async);
   const uint64_t t_maint = kernel_.host().monotonic_ns();
   // The Things caught up with the tables, then saved with them - before the
   // redo log that would re-deliver their notices is rotated away.
@@ -26687,6 +26848,7 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
     }
   }
   if (!want.empty() || !want_probes.empty() || !want_rows.empty()) {
+    warm_running_.store(true, std::memory_order_release);
     index_warm_ = aios::hal::Thread([this, want, want_probes, want_rows]() {
       const uint64_t t0 = kernel_.host().monotonic_ns();
       // Each index is built under a shared statement lock of its own, never one held across the whole warm-up: that
@@ -26720,6 +26882,13 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       size_t rows_warmed = 0, rows_skipped = 0;
       const size_t budget = row_index_budget_bytes();
       for (const auto& name : want_rows) {
+        // Built off the lock where it can be (warm_row_index_off_lock): a writer waited for the whole of a map here.
+        if (upkeep_off_lock()) {
+          const int r = warm_row_index_off_lock(name, budget);
+          if (r == 1) { ++rows_warmed; continue; }
+          if (r == 0) { ++rows_skipped; continue; }
+          if (r == -1) continue;   // gone, or written meanwhile: its first keyed write builds the map, as before
+        }
         StatementLock lock(rw_lock_, false);
         for (const auto& kv : tables_) {
           if (lower_of(kv.second.name) != name) continue;
@@ -26758,6 +26927,7 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       // code narrowing, the forms added since the files were written - takes it to 400 MB. A restarted atl sat at
       // the fat size for as long as replication took to reach the count.
       checkpoint_due_.store(true, std::memory_order_release);
+      warm_running_.store(false, std::memory_order_release);
     });
   } else {
     checkpoint_due_.store(true, std::memory_order_release);
@@ -59114,6 +59284,8 @@ SqlQueryResult SqlDatabase::execute_show(const std::string& sql) {
       {"Asql_avg_latency_us", std::to_string(avg_lat_us)},
       {"Asql_bloom_filter_pruned", std::to_string(metrics_.bloom_filter_pruned_blocks.load(std::memory_order_relaxed) + vx_bloom_pruned_blocks())},
       {"Asql_cache_hits", std::to_string(c_hits)},
+      {"Asql_upkeep_converted", std::to_string(upkeep_converted_.load(std::memory_order_relaxed))},
+      {"Asql_upkeep_dropped", std::to_string(upkeep_dropped_.load(std::memory_order_relaxed))},
       {"Asql_insert_key_via_map", std::to_string(metrics_.insert_key_via_map.load(std::memory_order_relaxed))},
       {"Asql_insert_key_via_index", std::to_string(metrics_.insert_key_via_index.load(std::memory_order_relaxed))},
       {"Asql_cache_misses", std::to_string(c_miss)},
@@ -62712,6 +62884,113 @@ void SqlDatabase::grow_row_index(const SqlTable& t) {
 // The warm-up's build of a table's whole map, a chunk at a time with row_index_mu_ let go between chunks. Every
 // INSERT takes that mutex for its own table's map, so one 2M-row map built under it at once (half a second to a
 // second and a half) held up a write to any other table - a two-row one - for all of it; now for one chunk at most.
+// A boot warm-up's primary-key row map, built off the lock. warm_row_index built it in place under a shared lock held
+// for the whole table (st's 12M-row maps: seconds), and every writer - the replication applier first - waited for it.
+// Here the key columns (and the rows still in the delta buffer) are copied under the exclusive lock (a writer under
+// the shared lock, AIOS_TXN_CONCURRENT, could be changing them), the map is made from the copies with no lock held -
+// keys as sync_row_index makes them, each row its own id (a new map has no gaps) - and it goes in under the exclusive
+// lock only if the table took no write and no map was made for it meanwhile. 1: built, 0: over the row-index budget,
+// -1: not built (no such table, no key, or written meanwhile: its first keyed write builds it, as before the warm-up),
+// -2: a map is there already - the in-place path carries it on.
+int SqlDatabase::warm_row_index_off_lock(const std::string& name, size_t budget) {
+  struct KeyCol { int col = -1; ColumnStore cs; std::vector<std::string> delta; };
+  std::vector<KeyCol> keys;
+  KeyCol ai;
+  std::vector<int> pk_cols;
+  std::string tname;
+  uint64_t seq = 0;
+  size_t rows = 0;
+  {
+    StatementLock lock(rw_lock_, true);
+    const SqlTable* t = nullptr;
+    for (const auto& kv : tables_) if (lower_of(kv.second.name) == name) { t = &kv.second; break; }
+    if (!t) return -1;
+    for (size_t i = 0; i < t->columns.size(); ++i) {
+      if (t->columns[i].is_primary_key) pk_cols.push_back((int)i);
+      if (t->columns[i].auto_increment) ai.col = (int)i;
+    }
+    if (pk_cols.empty() && ai.col < 0) return -1;
+    // a key column whose dictionary other columns share (a domain dictionary): its copy would read entries a writer
+    // may be adding, so that map is built in place
+    for (int c : pk_cols) if ((size_t)c < t->col_data.size() && t->col_data[(size_t)c].shared_dict) return -2;
+    if (ai.col >= 0 && (size_t)ai.col < t->col_data.size() && t->col_data[(size_t)ai.col].shared_dict) return -2;
+    // What the map will take, before it is built (st's stockmovestaxes, 20M rows, is about a gigabyte on its own:
+    // checked after the build, the last map took the total to twice the budget). A key is ~24 bytes in a map, a text
+    // key about twice that.
+    bool text_key = false;
+    for (int c : pk_cols) if (t->columns[(size_t)c].type == SqlDataType::Text) text_key = true;
+    {
+      std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+      if (table_row_indices_.count(name)) return -2;
+      if (row_indices_memory_bytes_locked() + t->row_count() * (text_key ? 48 : 24) > budget) return 0;
+    }
+    auto take = [&](KeyCol& k) {
+      if (k.col < 0 || (size_t)k.col >= t->col_data.size()) return;
+      k.cs = t->col_data[(size_t)k.col];
+      const size_t base = k.cs.size();
+      if (t->delta_buffer.mu && t->row_count() > base) {
+        std::lock_guard<aios::hal::Mutex> lk(*t->delta_buffer.mu);
+        for (const auto& row : t->delta_buffer.rows) k.delta.push_back((size_t)k.col < row.values.size() ? row.values[(size_t)k.col] : sql_null());
+      }
+    };
+    for (int c : pk_cols) { KeyCol k; k.col = c; take(k); keys.push_back(std::move(k)); }
+    take(ai);
+    tname = t->name;
+    seq = t->mutation_seq;
+    rows = t->row_count();
+  }
+  auto value = [](const KeyCol& k, size_t r) -> const std::string& {   // SqlTable::cell over the copies
+    const size_t base = k.cs.size();
+    if (r < base) return k.cs.get(r);
+    return r - base < k.delta.size() ? k.delta[r - base] : sql_null();
+  };
+  auto idx = std::make_shared<RowIndex>();
+  idx->table = tname;
+  idx->pk_columns = pk_cols;
+  idx->ai_column = ai.col;
+  idx->pk_to_row.reserve(rows);
+  idx->pk_to_row.trace_name(idx->table.c_str());
+  std::string key;
+  for (size_t i = 0; i < rows; ++i) {
+    key.clear();
+    bool keyed = !keys.empty();
+    for (const KeyCol& k : keys) {
+      const std::string& val = value(k, i);
+      if (sql_is_null(val)) { keyed = false; break; }
+      const size_t prev_sz = key.size();
+      key.resize(prev_sz + val.size() + 1);
+      for (size_t c = 0; c < val.size(); ++c) key[prev_sz + c] = char_lower(val[c]);
+      key.back() = '\x1f';   // as row_key builds it
+    }
+    if (keyed) idx->pk_to_row.emplace(key, i);
+    if (ai.col >= 0) {
+      const std::string& av = value(ai, i);
+      if (!sql_is_null(av)) {
+        const long long v = std::strtoll(sql_display(av).c_str(), nullptr, 10);
+        if (v > idx->auto_max) idx->auto_max = v;
+      }
+    }
+  }
+  idx->rows_indexed = rows;
+  // AIOS_SQL_UPKEEP_DELAY_MS, as for a column (upkeep_column): the window a write can land in before the map goes in
+  static const uint64_t delay_ms = [] { const char* v = std::getenv("AIOS_SQL_UPKEEP_DELAY_MS"); return v && *v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+  if (delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  StatementLock lock(rw_lock_, true);
+  const SqlTable* t = nullptr;
+  for (const auto& kv : tables_) if (lower_of(kv.second.name) == name) { t = &kv.second; break; }
+  if (!t || t->mutation_seq != seq || t->row_count() != rows) {
+    if (std::getenv("AIOS_STORE_TRACE")) fprintf(stderr, "[store] %s: written while its row map was built off the lock - left for its first write\n", tname.c_str());
+    return -1;
+  }
+  std::lock_guard<aios::hal::Mutex> lk(row_index_mu_);
+  if (table_row_indices_.count(name)) return -1;   // a write made one meanwhile
+  prune_all_row_indices_locked(row_index_budget_bytes(), name);
+  idx->last_access_ns = 0;   // one built here is not a use: the budget can take it back if nothing needs it
+  table_row_indices_[name] = idx;
+  metrics_.row_index_rows_indexed.fetch_add(rows, std::memory_order_relaxed);
+  return 1;
+}
+
 void SqlDatabase::warm_row_index(const SqlTable& t) {
   std::vector<int> pk_cols;
   int ai_idx = -1;

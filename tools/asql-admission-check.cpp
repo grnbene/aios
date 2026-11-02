@@ -168,7 +168,10 @@ int main() {
     one = db.query_memory_peak() - before;
     CHECK(db.query_memory_reserved() == 0, "%zu bytes still reserved after the statement ended", db.query_memory_reserved());
     CHECK(want.size() > 100, "the report answered nothing: %s", want.substr(0, 80).c_str());
-    CHECK(one >= ((size_t)8 << 20), "one report reserved only %zu bytes", one);
+    // Run as a star join folded root row by root row (the fused join aggregate), the report makes none of its 400k
+    // joined rows: it reserves 4.8 MB, where expanded into arrays it was 13.7 MB (AIOS_SQL_PIPE=0) and as rows 23 MB
+    // (AIOS_SQL_STAR_JOIN=0). The floor is that it reserves megabytes, not what one way of running it takes.
+    CHECK(one >= ((size_t)4 << 20), "one report reserved only %zu bytes", one);
     std::printf("  [ok] one report reserves %.1f MB\n", one / 1048576.0);
   }
   {

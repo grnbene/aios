@@ -3124,7 +3124,9 @@ class SqlDatabase {
   SqlQueryResult export_snapshot_statement(const std::string& q);
   // Re-encode columns a write had to decompress, rebuild dropped zone maps -
   // the engine tidying its own storage, run from the periodic flush.
-  void maintain_storage();
+  // off_lock: a big column's conversion is queued for upkeep_column (a checkpoint written in the background), not
+  // made here (a flush a caller waits for: the store it returns to is in its final form)
+  void maintain_storage(bool off_lock = false);
   void save_index_list();
   // Things (sql_things.hpp): change notices from the write paths, and the
   // reactions they call for.
@@ -3444,6 +3446,27 @@ class SqlDatabase {
   aios::hal::CondVar checkpoint_cv_;
   bool checkpoint_stop_ = false;
   std::unique_ptr<CheckpointImage> checkpoint_pending_;
+  // Column conversions a checkpoint found due on a column of kUpkeepOffLockRows rows or more, made off the exclusive
+  // lock (upkeep_column, sql_database.cpp): queued by table key and column name, each once.
+  static constexpr size_t kUpkeepOffLockRows = 65536;
+  static bool upkeep_off_lock();
+  void upkeep_enqueue(const std::string& table_key, const std::string& column);
+  void upkeep_loop();
+  bool upkeep_column(const std::string& table_key, const std::string& column);
+  aios::hal::Thread upkeep_thread_;
+  aios::hal::Mutex upkeep_mu_;
+  aios::hal::CondVar upkeep_cv_;
+  bool upkeep_stop_ = false;
+  bool upkeep_busy_ = false;   // a conversion taken off the queue and not done
+  std::deque<std::pair<std::string, std::string>> upkeep_queue_;
+  std::set<std::pair<std::string, std::string>> upkeep_queued_;
+  std::atomic<uint64_t> upkeep_converted_{0}, upkeep_dropped_{0};   // SHOW STATUS Asql_upkeep_converted / _dropped
+ public:
+  // Until no column conversion is queued or under way (upkeep_column): what a background checkpoint left to make is made.
+  void upkeep_wait_idle();
+  // Until the boot warm-up (init: column, join and primary-key indexes) has finished.
+  void wait_warm_up() const;
+ private:
   // The column copies of the last checkpoint, per table, kept for the next
   // snapshot to copy into: a fresh 90 MB costs 2.5 us a page in first-touch
   // faults on a microVM, most of the time the snapshot held the lock.
@@ -3468,6 +3491,7 @@ class SqlDatabase {
   // (sql_db/indexes.list), so the first lookups do not pay for them. Joined
   // by the destructor.
   aios::hal::Thread index_warm_;
+  std::atomic<bool> warm_running_{false};   // the boot warm-up (index_warm_) has not finished
   // Builds the indexes request_background_probe asks for. Joined by the
   // destructor.
   aios::hal::Thread bg_probe_thread_;
@@ -3999,6 +4023,7 @@ class SqlDatabase {
   // path must never be what creates it.
   void grow_row_index(const SqlTable& t);
   void warm_row_index(const SqlTable& t);
+  int warm_row_index_off_lock(const std::string& name, size_t budget);
   std::shared_ptr<RowIndex> find_row_index(const SqlTable& t);
   void invalidate_row_index() {
     {
