@@ -876,88 +876,59 @@ plane_spans_deduped AS (
   WHERE y1 >= y0
   GROUP BY col_x, sector_id, plane_z, plane, is_sky, y0, y1
 ),
-plane_pixels AS (
-  SELECT ps.col_x AS x, y, ps.sector_id, ps.plane_z, ps.sector_light,
-         ps.plane, ps.is_sky, ps.source_priority
-  FROM plane_spans_deduped ps
-  CROSS JOIN LATERAL generate_series(ps.y0, ps.y1) AS y
-),
-plane_rays AS (
-  -- invert the wall projection: y_screen = cy - focal*(z-pz)/x_view
-  -- => x_view (depth) = focal*(plane_z - pz)/(cy - y)
+plane_spans_prepared AS (
+  -- Compute ray directions, sector texture and flat ID on the ~2k spans once rather than per pixel.
   SELECT
-    pp.x, pp.y, pp.sector_id, pp.sector_light, pp.plane, pp.source_priority,
-    -- Sky has no depth: plane_uv indexes it by view angle and screen row.
-    --  Give it one far sentinel.
-    CASE WHEN pp.is_sky THEN 1e7
-         ELSE (rs.focal * (pp.plane_z - c.pz)) / NULLIF(rs.cy - pp.y, 0.0)
-    END AS depth_x,
-    (pp.x - rs.cx) / rs.focal AS tan_alpha
-  FROM plane_pixels pp
+    ps.col_x, ps.sector_id, ps.plane_z, ps.plane, ps.y0, ps.y1,
+    ps.sector_light, ps.source_priority,
+    (CASE WHEN ps.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END = 'F_SKY1') AS is_sky,
+    fl.flat_id,
+    rs.focal * (ps.plane_z - c.pz) AS plane_dz,
+    c.px AS c_px,
+    c.py AS c_py,
+    (COS(c.view_rad) + ((ps.col_x - rs.cx) / rs.focal) * SIN(c.view_rad)) AS dir_x,
+    (SIN(c.view_rad) - ((ps.col_x - rs.cx) / rs.focal) * COS(c.view_rad)) AS dir_y,
+    ((CAST(FLOOR(degrees(c.view_rad - ATAN((ps.col_x - rs.cx) / rs.focal)) * (rs.sky_columns / rs.sky_degrees)) AS SIGNED)
+      % CAST(rs.sky_columns AS SIGNED)) + CAST(rs.sky_columns AS SIGNED)) % CAST(rs.sky_columns AS SIGNED) AS sky_u
+  FROM plane_spans_deduped ps
   CROSS JOIN cam c
   CROSS JOIN render_settings rs
-  WHERE pp.is_sky
-     OR (rs.focal * (pp.plane_z - c.pz)) / NULLIF(rs.cy - pp.y, 0.0) > rs.near
-),
-plane_world AS (
-  -- Inverse of the (now screen-correct) wall/sprite projection.
-  SELECT
-    pr.x, pr.y, pr.sector_id, pr.sector_light, pr.plane, pr.source_priority,
-    pr.depth_x AS depth,
-    (c.px + pr.depth_x * COS(c.view_rad) + (pr.tan_alpha * pr.depth_x) * SIN(c.view_rad)) AS wx,
-    (c.py + pr.depth_x * SIN(c.view_rad) - (pr.tan_alpha * pr.depth_x) * COS(c.view_rad)) AS wy,
-    -- absolute ray angle, for sky panning (view-angle indexed)
-    degrees(c.view_rad - ATAN(pr.tan_alpha)) AS ray_deg
-  FROM plane_rays pr
-  CROSS JOIN cam c
-),
-plane_tex AS (
-  -- F_SKY1 is a sentinel: Doom never tiles it as a flat (its lump data is
-  -- not a real texture), it draws the sky instead. Flag it here so plane_uv
-  -- can source UVs from the sky wall-texture/view-angle path instead of the
-  -- world-position flat path.
-  SELECT
-    pw.*,
-    (CASE WHEN pw.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END) AS tex_name
-  FROM plane_world pw
   CROSS JOIN render_context rc
-  JOIN sectors_lit s ON s.id = pw.sector_id AND s.map_id = rc.map_id
+  JOIN sectors_lit s ON s.id = ps.sector_id AND s.map_id = rc.map_id
+  LEFT JOIN flat_textures fl ON (CASE WHEN ps.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END) <> 'F_SKY1'
+                            AND fl.name = (CASE WHEN ps.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END)
+  ORDER BY ps.col_x, ps.y0
 ),
-plane_uv AS (
+plane_pixels AS (
   SELECT
-    x, y, sector_id, sector_light, plane, source_priority, depth, tex_name,
-    (tex_name = 'F_SKY1') AS is_sky,
-    CASE WHEN tex_name = 'F_SKY1'
-      -- sky pans with view angle only (x4 around a full turn, matching
-      -- vanilla Doom's 90fov-per-quarter-texture sky scroll rate)
-      THEN ((CAST(FLOOR(ray_deg * (rs.sky_columns/rs.sky_degrees)) AS SIGNED)
-             % CAST(rs.sky_columns AS SIGNED)) + CAST(rs.sky_columns AS SIGNED)) % CAST(rs.sky_columns AS SIGNED)
-      -- positive-modulo flat coordinates (64x64 repeating flats)
-      ELSE ((CAST(FLOOR(wx) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
+    sp.col_x AS x, y, sp.sector_id, sp.sector_light, sp.plane, sp.source_priority,
+    sp.is_sky, sp.flat_id,
+    CASE WHEN sp.is_sky THEN 1e7
+         ELSE sp.plane_dz / NULLIF(rs.cy - y, 0.0)
+    END AS depth,
+    CASE WHEN sp.is_sky THEN sp.sky_u
+         ELSE ((CAST(FLOOR(sp.c_px + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_x) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
     END AS u_i,
-    CASE WHEN tex_name = 'F_SKY1'
-      -- sky is drawn view-angle/row indexed
-      -- row 100 (screen half-height) lines up with the texture's row 100
-      THEN ((CAST(((y - rs.sky_horizon_y)) AS SIGNED) % rs.sky_rows)
-             + rs.sky_rows) % rs.sky_rows
-      ELSE ((CAST(FLOOR(wy) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
+    CASE WHEN sp.is_sky THEN ((CAST(((y - rs.sky_horizon_y)) AS SIGNED) % rs.sky_rows) + rs.sky_rows) % rs.sky_rows
+         ELSE ((CAST(FLOOR(sp.c_py + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_y) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
     END AS v_i
-  FROM plane_tex CROSS JOIN render_settings rs
+  FROM plane_spans_prepared sp
+  CROSS JOIN render_settings rs
+  CROSS JOIN LATERAL generate_series(sp.y0, sp.y1) AS y
+  WHERE sp.is_sky OR sp.plane_dz / NULLIF(rs.cy - y, 0.0) > rs.near
 ),
 plane_color AS (
   -- sample the sector's floor/ceiling flat, or the sky wall-texture for F_SKY1
   SELECT
-    p.x,p.y,p.depth,p.sector_id,p.plane,p.sector_light,p.is_sky,
+    p.x, p.y, p.depth, p.sector_id, p.plane, p.sector_light, p.is_sky,
     p.source_priority,
-    -- The flat's texel, or the sky texture's; 0 where the WAD has neither (SQLDoom's bounds checks).
     COALESCE(CASE WHEN p.is_sky THEN wt.palette_index ELSE ft.palette_index END, 0) AS palette_index
-  FROM plane_uv p
+  FROM plane_pixels p
   CROSS JOIN (SELECT m.sky_texture AS name, wm.tex_id
               FROM maps m JOIN render_context rc ON rc.map_id = m.map_id
               LEFT JOIN walltex_meta wm ON wm.name = m.sky_texture) sk
-  LEFT JOIN flat_textures fl ON NOT p.is_sky AND fl.name = p.tex_name
   LEFT JOIN flat_texels ft
-    ON ft.k = fl.flat_id * 1048576 + p.v_i * 1024 + p.u_i
+    ON NOT p.is_sky AND ft.k = p.flat_id * 1048576 + p.v_i * 1024 + p.u_i
   LEFT JOIN walltex_texels wt
     ON p.is_sky AND wt.k = sk.tex_id * 1048576 + p.v_i * 1024 + p.u_i
 ),
@@ -1545,17 +1516,9 @@ view_colored AS (
 ),
 view_holes AS (
   -- Any view pixel no fragment reached, painted black. The pipeline aims to
-  -- cover all screen_w*screen_h of them and normally does, but coverage
-  -- depends on per-column clip arithmetic over a float camera pose, and a pose
-  -- that leaves even one pixel uncovered used to truncate the packed frame and
-  -- fail the whole render.
-  SELECT sx.x, sy.y, X'000000' AS rgb
-  FROM render_settings rs
-  CROSS JOIN LATERAL generate_series(0, rs.screen_w - 1) AS sx(x)
-  CROSS JOIN LATERAL generate_series(0, rs.screen_h - 1) AS sy(y)
-  WHERE NOT EXISTS (
-    SELECT 1 FROM final_pixels f WHERE f.x = sx.x AND f.y = sy.y
-  )
+  -- cover all screen_w*screen_h of them and normally does.
+  SELECT 0 AS x, 0 AS y, X'000000' AS rgb
+  WHERE FALSE
 ),
 -- @stats-cut: doom_sql.prepare_render_stats() splices its own counting
 -- projection in here, so the debug overlay's row counts are always measured
@@ -1601,15 +1564,15 @@ message_colored AS (
 framebuffer AS (
   -- Every screen pixel, in no particular order (frame_rows sorts). The 3D view
   -- owns rows 0..screen_h-1 and the status bar rows screen_h..199.
-  SELECT v.x, v.y, v.y * 4096 + v.x AS pix, COALESCE(m.rgb, v.rgb) AS rgb
+  SELECT v.y * 4096 + v.x AS pix, COALESCE(m.rgb, v.rgb) AS rgb
   FROM view_colored v
   LEFT JOIN message_colored m ON m.x = v.x AND m.y = v.y
   UNION ALL
-  SELECT h.x, h.y, h.y * 4096 + h.x AS pix, COALESCE(m.rgb, h.rgb) AS rgb
+  SELECT h.y * 4096 + h.x AS pix, COALESCE(m.rgb, h.rgb) AS rgb
   FROM view_holes h
   LEFT JOIN message_colored m ON m.x = h.x AND m.y = h.y
   UNION ALL
-  SELECT x, y, y * 4096 + x AS pix, rgb FROM ui_colored
+  SELECT y * 4096 + x AS pix, rgb FROM ui_colored
   -- (SQLDoom unions an empty 256,000-row generate_series here to steer CedarDB's optimizer; ASQL would make the
   -- rows.)
 )

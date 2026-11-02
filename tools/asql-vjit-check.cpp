@@ -168,7 +168,7 @@ int main() {
   const uint64_t native = sqle::vjit_native_runs() - before;
   std::printf("%zu statements: %zu answered, %zu refused as out of range; %llu chunks computed natively and matched the interpreter\n",
               statements, ok, refused, (unsigned long long)native);
-#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(_WIN32) && !defined(AIOS_METAL)
   if (native == 0) { std::printf("  [FAIL] no native code ran: the check exercised nothing\n"); return 1; }
 #endif
   std::printf("PASSED\n");

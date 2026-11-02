@@ -2591,7 +2591,7 @@ bool tokenize_sql(const std::string& sql, std::vector<Token>* out, std::string* 
     tl_handoff_sql.clear();
     return true;
   }
-  const bool keep = out->empty() && sql.size() >= 64 && sql.size() <= (64u << 10);
+  const bool keep = out->empty() && sql.size() >= 64 && sql.size() <= (256u << 10);
   if (keep && !tl_last_sql.empty() && sql == tl_last_sql && tl_last_pipes == tls_pipes_as_concat) { *out = tl_last_toks; return true; }
   if (!tokenize_sql_uncached(sql, out, err)) return false;
   if (keep && remember) { tl_last_sql = sql; tl_last_toks = *out; tl_last_pipes = tls_pipes_as_concat; }
@@ -7190,13 +7190,21 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
           up == "POWER"sv || up == "RAND"sv)
         return SqlDataType::Real;
       if (up == "__BITXOR"sv || up == "__BITOR"sv || up == "__BITAND"sv || up == "__SHL"sv || up == "__SHR"sv) return SqlDataType::Int;
-      // MIN/MAX/COALESCE/IFNULL/LEAST/GREATEST/MOD keep whatever came in.
-      if (up == "MIN"sv || up == "MAX"sv || up == "COALESCE"sv || up == "IFNULL"sv || up == "NULLIF"sv ||
-          up == "LEAST"sv || up == "GREATEST"sv || up == "MOD"sv) {
+      // MIN/MAX/NULLIF keep whatever came in; COALESCE/IFNULL/LEAST/GREATEST/MOD promote mixed numbers to Real/Decimal.
+      if (up == "MIN"sv || up == "MAX"sv || up == "NULLIF"sv) {
         for (const auto& a : e->args) {
           SqlDataType t = infer_item_type(a.get(), sources);
           if (t != SqlDataType::Text) return t;
         }
+      }
+      if (up == "COALESCE"sv || up == "IFNULL"sv || up == "LEAST"sv || up == "GREATEST"sv || up == "MOD"sv) {
+        SqlDataType best = SqlDataType::Text;
+        for (const auto& a : e->args) {
+          SqlDataType t = infer_item_type(a.get(), sources);
+          if (t == SqlDataType::Real) return SqlDataType::Real;
+          if (t == SqlDataType::Decimal || (t == SqlDataType::Int && best == SqlDataType::Text)) best = t;
+        }
+        return best;
       }
       return SqlDataType::Text;
     }
@@ -9543,6 +9551,11 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
           });
         std::string out;
         const std::string& sep = e->separator;
+        if (!vals.empty() && vals[0].direct && vals[0].cs && vals[0].cs->size() > 0) {
+          out.reserve(kept.size() * (vals[0].cs->get_view(0).size() + sep.size()));
+        } else {
+          out.reserve(kept.size() * (3 + sep.size()));
+        }
         for (size_t i = 0; i < kept.size(); ++i) {
           if (i > 0) out += sep;
           for (const ArgLane& v : vals) {
@@ -13000,17 +13013,17 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   // program generation on this thread: find_program takes the programs lock, and a function in a SELECT list is
   // called once per row (SQLDoom's light functions, 56,000 pixels a frame).
   if (ctx.db && ctx.db->has_stored_functions()) {
-    struct FnCache { uint64_t gen; const SqlDatabase* db; std::shared_ptr<const SqlDatabase::StoredProgram> fn; };
+    struct FnCache { uint64_t gen; const SqlDatabase* db; std::string name; std::shared_ptr<const SqlDatabase::StoredProgram> fn; };
     thread_local std::unordered_map<const SqlExpr*, FnCache> fn_cache;
     const uint64_t gen = ctx.db->programs_generation();
     std::shared_ptr<const SqlDatabase::StoredProgram> fn;
     auto it = fn_cache.find(e);
-    if (it != fn_cache.end() && it->second.gen == gen && it->second.db == ctx.db) {
+    if (it != fn_cache.end() && it->second.gen == gen && it->second.db == ctx.db && it->second.name == e->name) {
       fn = it->second.fn;
     } else {
       fn = ctx.db->find_program('F', e->name);
       if (fn_cache.size() > 4096) fn_cache.clear();
-      fn_cache[e] = {gen, ctx.db, fn};
+      fn_cache[e] = {gen, ctx.db, e->name, fn};
     }
     if (fn) {
       std::vector<Val> args;
@@ -13077,8 +13090,16 @@ static NumType nt_of(const SqlExpr* e, const EvalCtx& ctx, int depth = 0) {
       const EvalCtx* owner = nullptr;
       if (!resolve_column(ctx, *e, &si, &ci, &owner) || !owner || !owner->sources || si >= owner->sources->size()) return {};
       const SqlTable* t = owner->sources->at(si).table;
-      if (!t || t->inferred_types || ci >= t->columns.size()) return {};
+      if (!t || ci >= t->columns.size()) return {};
       const SqlColumn& c = t->columns[ci];
+      if (t->inferred_types) {
+        if (c.temporal) return {4, 0};
+        if (c.type == SqlDataType::Real && c.scale == 0) return {3, 0};
+        if (c.type == SqlDataType::Int && ci < t->col_data.size() &&
+            (t->col_data[ci].encoding == ColumnEncoding::TypedInt64 || t->col_data[ci].encoding == ColumnEncoding::TypedInt32))
+          return {1, 0};
+        return {};
+      }
       if (c.temporal || c.type == SqlDataType::Text) return {4, 0};
       if (c.type == SqlDataType::Int) return {1, 0};
       if (c.type == SqlDataType::Decimal) return c.scale > 0 ? NumType{2, (int8_t)std::min<int>(c.scale, 38)} : NumType{1, 0};
@@ -13186,6 +13207,10 @@ static NumType nt_of(const SqlExpr* e, const EvalCtx& ctx, int depth = 0) {
         return {};
       }
       if (up == "MIN" || up == "MAX" || up == "ABS") { NumType a = arg(0); return a.k == 1 || a.k == 2 || a.k == 3 ? a : NumType{}; }
+      if (up == "SQRT" || up == "SIN" || up == "COS" || up == "TAN" || up == "ATAN" || up == "ATAN2" ||
+          up == "ACOS" || up == "ASIN" || up == "RADIANS" || up == "DEGREES" || up == "POW" || up == "POWER" ||
+          up == "EXP" || up == "LN" || up == "LOG" || up == "LOG10" || up == "LOG2")
+        return {3, 0};
       if (up == "IFNULL" || up == "COALESCE" || up == "GREATEST" || up == "LEAST") {
         std::vector<NumType> v;
         for (size_t i = 0; i < e->args.size(); ++i) v.push_back(arg(i));
@@ -26244,6 +26269,7 @@ size_t SqlDatabase::replay_redo_file(const std::string& path) {
     applied++;
   }
   redo_replaying_ = false;
+  sql_set_session_mode("DEFAULT");
   // The stream resumes after the last change the redo log held; written
   // before flush_now, which empties the log it came from.
   if (commit_pos > 0) {
@@ -42246,7 +42272,23 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     inner.items.push_back(mark);
   }
   int nhidden = 0;
+  std::function<bool(const SqlExpr*)> pure_hidden = [&](const SqlExpr* x) -> bool {
+    if (!x || x->source_text.empty() || x->window) return false;
+    switch (x->op) {
+      case ExprOp::Column: case ExprOp::Literal: return true;
+      case ExprOp::Star: case ExprOp::Func: case ExprOp::Subquery: case ExprOp::Exists: return false;
+      default:
+        for (const auto& a : x->args) if (!pure_hidden(a.get())) return false;
+        return true;
+    }
+  };
+  std::unordered_map<std::string, int> hidden_by_src;
   auto hidden = [&](const ExprPtr& e) {
+    if (pure_hidden(e.get())) {
+      auto it = hidden_by_src.find(e->source_text);
+      if (it != hidden_by_src.end()) return it->second;
+      hidden_by_src.emplace(e->source_text, nhidden);
+    }
     SelectItem it;
     it.expr = e;
     it.label = "__h" + std::to_string(nhidden);
@@ -42339,8 +42381,14 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     wt_last = now;
   };
   // step 1
-  SqlQueryResult r1 = execute_parsed_select_single(db, inner);
+  ColBatch b1;
+  SqlQueryResult r1;
+  {
+    ColOutRequest want_b1(&b1);
+    r1 = execute_parsed_select_single(db, inner);
+  }
   if (!r1.success) return r1;
+  const bool b1_in_batch = r1.rows_in_batch && b1.filled;
   wmark("rows");
   std::unordered_map<std::string, size_t> at;
   for (size_t c = 0; c < r1.columns.size(); ++c) at.emplace(r1.columns[c], c);
@@ -42351,20 +42399,33 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     hcol[h] = f->second;
   }
   auto is_string = [&](size_t c) { return c < r1.column_is_string.size() && r1.column_is_string[c]; };
+  auto cell_is_null = [&](size_t row, size_t c) -> bool {
+    return b1_in_batch ? b1.cols[c].is_null(row) : sql_is_null(r1.rows[row].values[c]);
+  };
   // one cell as a value (NTILE's n, LAG's offset, a default): everything else reads the cells or keycol/numcol
   auto value = [&](size_t row, size_t c) -> Val {
+    if (b1_in_batch) {
+      const ColBatch::Col& col = b1.cols[c];
+      if (col.is_null(row)) return val_null();
+      if (!is_string(c)) {
+        if (col.kind == ColBatch::I64) return val_num((double)col.i[row]);
+        if (col.kind == ColBatch::F64) return val_approx(col.f[row]);
+      }
+      const std::string cell = col.text(row);
+      return sql_is_null(cell) ? val_null() : is_string(c) ? val_text(cell) : val_cell(cell);
+    }
     const std::string& cell = r1.rows[row].values[c];
     return sql_is_null(cell) ? val_null() : is_string(c) ? val_text(cell) : val_cell(cell);
   };
 
   // step 2: each window over the rows
-  const size_t n = r1.rows.size();
+  const size_t n = b1_in_batch ? b1.rows : r1.rows.size();
   // The windows' text, the sort keys, then a full copy of the rows (and a
   // table of them) for the outer select.
   if (!reserve_rows(n, (wins.size() + 2 * r1.columns.size()) * kQmemCellBytes + 64))
     return make_error("Query execution was interrupted");
-  std::vector<std::vector<std::string>> wcells(wins.size(), std::vector<std::string>(n));   // each window's output, as text
-  auto put = [&](size_t wi, size_t row, const Val& v) { wcells[wi][row] = v.null ? sql_null() : v.str(); };
+  std::vector<ColBatch::Col> wcols(wins.size());
+  auto put = [&](size_t wi, size_t row, const Val& v) { wcols[wi].s[row] = v.null ? sql_null() : v.str(); };
   // Sort and partition keys as plain arrays: a column's class (NULL, number, text), its number, or its text -
   // the order compare_vals_ordered gives, without a Val per comparison.
   // A column of text and NULLs only is ranked: each text's place among the column's distinct texts (in the
@@ -42381,6 +42442,13 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     bool int_col = false;
     bool unsigned_vals = false;   // ... holding a value past INT64_MAX: BIGINT UNSIGNED
   };
+  bool any_range_offset = false;
+  for (const Win& w : wins) {
+    if (!w.spec.has_frame || w.spec.rows) continue;
+    if (w.spec.start == WindowSpec::Preceding || w.spec.start == WindowSpec::Following ||
+        w.spec.end == WindowSpec::Preceding || w.spec.end == WindowSpec::Following)
+      any_range_offset = true;
+  }
   std::unordered_map<size_t, KeyCol> keycols;
   auto make_keycol = [&](auto&& cell_at, bool str) {
     KeyCol k;
@@ -42478,11 +42546,59 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     }
     return k;
   };
+  const std::string kNullCell = sql_null();
+  auto make_keycol_from_col = [&](ColBatch::Col& col, bool str, bool is_int_type) -> KeyCol {
+    if (!str && col.kind == ColBatch::I64) {
+      bool wide = false;
+      for (size_t r = 0; r < n && !wide; ++r)
+        if (!col.nul[r] && (col.i[r] >= 9007199254740992LL || col.i[r] <= -9007199254740992LL)) wide = true;
+      if (!wide) {
+        KeyCol k;
+        k.cls.resize(n);
+        k.num.resize(n);
+        k.int_col = is_int_type;
+        for (size_t r = 0; r < n; ++r) {
+          if (col.nul[r]) { k.cls[r] = 0; k.num[r] = 0.0; }
+          else { k.cls[r] = 1; k.num[r] = (double)col.i[r]; }
+        }
+        return k;
+      }
+    }
+    if (!str && col.kind == ColBatch::F64 && !any_range_offset) {
+      bool all_finite = true;
+      for (size_t r = 0; r < n && all_finite; ++r)
+        if (!col.nul[r] && !std::isfinite(col.f[r])) all_finite = false;
+      if (all_finite) {
+        KeyCol k;
+        k.cls.resize(n);
+        k.num.resize(n);
+        k.int_col = false;
+        for (size_t r = 0; r < n; ++r) {
+          if (col.nul[r]) { k.cls[r] = 0; k.num[r] = 0.0; }
+          else { k.cls[r] = 1; k.num[r] = col.f[r]; }
+        }
+        return k;
+      }
+    }
+    if (col.kind == ColBatch::Codes) {
+      KeyCol k = make_keycol([&](size_t r) -> const std::string& {
+        return col.nul[r] ? kNullCell : col.dict[col.codes[r]];
+      }, str);
+      k.int_col = is_int_type;
+      return k;
+    }
+    col.to_text(n);
+    KeyCol k = make_keycol([&](size_t r) -> const std::string& { return col.s[r]; }, str);
+    k.int_col = is_int_type;
+    return k;
+  };
   auto keycol = [&](size_t c) -> const KeyCol& {
     auto f = keycols.find(c);
     if (f != keycols.end()) return f->second;
+    const bool is_int = c < r1.column_types.size() && r1.column_types[c] == SqlDataType::Int;
+    if (b1_in_batch) return keycols.emplace(c, make_keycol_from_col(b1.cols[c], is_string(c), is_int)).first->second;
     KeyCol k = make_keycol([&](size_t r) -> const std::string& { return r1.rows[r].values[c]; }, is_string(c));
-    k.int_col = c < r1.column_types.size() && r1.column_types[c] == SqlDataType::Int;
+    k.int_col = is_int;
     return keycols.emplace(c, std::move(k)).first->second;
   };
   // SUM / AVG / COUNT arguments as numbers, once: each value's double, and - when every value of the column is
@@ -42494,13 +42610,25 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     auto f = numcols.find(c);
     if (f != numcols.end()) return f->second;
     NumCol nc;
+    const bool str = is_string(c);
+    if (b1_in_batch && !str && b1.cols[c].kind == ColBatch::I64) {
+      const ColBatch::Col& col = b1.cols[c];
+      nc.null = col.nul;
+      nc.d.resize(n);
+      nc.e.resize(n);
+      nc.scale = 0;
+      nc.exact = true;
+      for (size_t r = 0; r < n; ++r)
+        if (!col.nul[r]) { nc.d[r] = (double)col.i[r]; nc.e[r] = (AIOS_INT128)col.i[r]; }
+      return numcols.emplace(c, std::move(nc)).first->second;
+    }
+    if (b1_in_batch && b1.cols[c].kind != ColBatch::Text) b1.cols[c].to_text(n);
     nc.null.resize(n);
     nc.d.resize(n);
     nc.e.resize(n);
     std::vector<int> sc(n, 0);
-    const bool str = is_string(c);
     for (size_t r = 0; r < n; ++r) {
-      const std::string& cell = r1.rows[r].values[c];
+      const std::string& cell = b1_in_batch ? b1.cols[c].s[r] : r1.rows[r].values[c];
       if (sql_is_null(cell)) { nc.null[r] = 1; continue; }
       // a number's text read once: its double, and (while the column stays exact) its digits and scale - what
       // val_cell and exact_decimal_of would make of it
@@ -42543,6 +42671,7 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
   };
   std::vector<SqlDataType> wtype(wins.size(), SqlDataType::Int);
   std::vector<bool> wstring(wins.size(), false);
+  std::vector<size_t> idx(n);
   for (size_t wi = 0; wi < wins.size(); ++wi) {
     const Win& w = wins[wi];
     const std::string& fn = w.fn;
@@ -42561,9 +42690,26 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     }
     if (fn == "SUM" || fn == "AVG") wtype[wi] = SqlDataType::Decimal;
 
+    const bool int_win = fn == "ROW_NUMBER" || fn == "RANK" || fn == "DENSE_RANK" || fn == "NTILE" || fn == "COUNT";
+    const bool f64_win = fn == "PERCENT_RANK" || fn == "CUME_DIST";
+    const bool pick_win = offset_fn || value_fn || fn == "MIN" || fn == "MAX";
+    std::vector<size_t> win_src;
+    if (int_win) {
+      wcols[wi].kind = ColBatch::I64;
+      wcols[wi].i.assign(n, 0);
+      wcols[wi].nul.assign(n, 0);
+    } else if (f64_win) {
+      wcols[wi].kind = ColBatch::F64;
+      wcols[wi].f.assign(n, 0.0);
+      wcols[wi].nul.assign(n, 0);
+    } else if (pick_win) {
+      win_src.assign(n, SIZE_MAX);
+    } else {
+      wcols[wi].kind = ColBatch::Text;
+      wcols[wi].s.resize(n);
+    }
+
     // rows in partition order, then window order (ties in input order)
-    std::vector<size_t> idx(n);
-    for (size_t i = 0; i < n; ++i) idx[i] = i;
     std::vector<const KeyCol*> pkeys, okeys;
     std::vector<bool> odesc;
     for (int p : w.parts) pkeys.push_back(&keycol(hcol[(size_t)p]));
@@ -42585,32 +42731,36 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
       for (const KeyCol* k : okeys) if (kcmp(*k, a, bb) != 0) return false;
       return true;
     };
-    // Up to four keys that hold only numbers and NULLs (ids, quantities, amounts - the usual window): sorted as
-    // packed records, the keys beside the row number, instead of row numbers that look their keys up.
-    bool packed = pkeys.size() + okeys.size() <= 4 && !(pkeys.empty() && okeys.empty());
-    for (const KeyCol* k : pkeys) for (size_t r = 0; packed && r < n; ++r) if (k->cls[r] == 2) packed = false;
-    for (const KeyCol* k : okeys) for (size_t r = 0; packed && r < n; ++r) if (k->cls[r] == 2) packed = false;
-    if (packed) {
-      struct Packed { double k[4]; uint32_t row; };
-      const size_t nk = pkeys.size() + okeys.size();
-      std::vector<Packed> pr(n);
-      const double kNull = -std::numeric_limits<double>::infinity();   // NULL first, as compare_vals_ordered
-      for (size_t r = 0; r < n; ++r) {
-        size_t j = 0;
-        for (const KeyCol* k : pkeys) pr[r].k[j++] = k->cls[r] ? k->num[r] : kNull;
-        for (size_t o = 0; o < okeys.size(); ++o) {
-          const double x = okeys[o]->cls[r] ? okeys[o]->num[r] : kNull;
-          pr[r].k[j++] = odesc[o] ? -x : x;   // DESC: NULL last, as the comparison negated gives
+    const bool same_sort = wi > 0 && w.parts == wins[wi - 1].parts && w.order == wins[wi - 1].order;
+    if (!same_sort) {
+      for (size_t i = 0; i < n; ++i) idx[i] = i;
+      // Up to four keys that hold only numbers and NULLs (ids, quantities, amounts - the usual window): sorted as
+      // packed records, the keys beside the row number, instead of row numbers that look their keys up.
+      bool packed = pkeys.size() + okeys.size() <= 4 && !(pkeys.empty() && okeys.empty());
+      for (const KeyCol* k : pkeys) for (size_t r = 0; packed && r < n; ++r) if (k->cls[r] == 2) packed = false;
+      for (const KeyCol* k : okeys) for (size_t r = 0; packed && r < n; ++r) if (k->cls[r] == 2) packed = false;
+      if (packed) {
+        struct Packed { double k[4]; uint32_t row; };
+        const size_t nk = pkeys.size() + okeys.size();
+        std::vector<Packed> pr(n);
+        const double kNull = -std::numeric_limits<double>::infinity();   // NULL first, as compare_vals_ordered
+        for (size_t r = 0; r < n; ++r) {
+          size_t j = 0;
+          for (const KeyCol* k : pkeys) pr[r].k[j++] = k->cls[r] ? k->num[r] : kNull;
+          for (size_t o = 0; o < okeys.size(); ++o) {
+            const double x = okeys[o]->cls[r] ? okeys[o]->num[r] : kNull;
+            pr[r].k[j++] = odesc[o] ? -x : x;   // DESC: NULL last, as the comparison negated gives
+          }
+          pr[r].row = (uint32_t)r;
         }
-        pr[r].row = (uint32_t)r;
-      }
-      std::sort(pr.begin(), pr.end(), [nk](const Packed& a, const Packed& bb) {
-        for (size_t j = 0; j < nk; ++j) if (a.k[j] != bb.k[j]) return a.k[j] < bb.k[j];
-        return a.row < bb.row;
-      });
-      for (size_t r = 0; r < n; ++r) idx[r] = pr[r].row;
-    } else if (!pkeys.empty() || !okeys.empty())
-      std::sort(idx.begin(), idx.end(), [&](size_t a, size_t bb) { const int c = cmp_keys(a, bb, true); return c ? c < 0 : a < bb; });
+        std::sort(pr.begin(), pr.end(), [nk](const Packed& a, const Packed& bb) {
+          for (size_t j = 0; j < nk; ++j) if (a.k[j] != bb.k[j]) return a.k[j] < bb.k[j];
+          return a.row < bb.row;
+        });
+        for (size_t r = 0; r < n; ++r) idx[r] = pr[r].row;
+      } else if (!pkeys.empty() || !okeys.empty())
+        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t bb) { const int c = cmp_keys(a, bb, true); return c ? c < 0 : a < bb; });
+    }
 
     for (size_t ps = 0; ps < n;) {
       size_t pe = ps + 1;
@@ -42768,12 +42918,13 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
       const NumCol* ncol = nullptr;
       bool overflow = false;
       if (prefixed) {
-        if (!w.count_star) ncol = &numcol(arg_col(0));
+        const size_t ac = !w.count_star ? arg_col(0) : 0;
+        if (!w.count_star && fn != "COUNT") ncol = &numcol(ac);
         pn.assign(m + 1, 0);
         if (fn != "COUNT") { pd_sum.assign(m + 1, 0.0); if (ncol->exact) pe_sum.assign(m + 1, 0); }
         for (size_t k = 0; k < m; ++k) {
           const size_t r = idx[ps + k];
-          const bool has = w.count_star || !ncol->null[r];
+          const bool has = w.count_star || (fn == "COUNT" ? !cell_is_null(r, ac) : !ncol->null[r]);
           pn[k + 1] = pn[k] + (has ? 1 : 0);
           if (fn == "COUNT") continue;
           pd_sum[k + 1] = pd_sum[k] + (has ? ncol->d[r] : 0.0);
@@ -42801,7 +42952,7 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
           if (!frame(k, &lo, &hi)) return make_error(err);
           const bool empty = hi < lo || lo >= m;
           const long long cnt = empty ? 0 : pn[hi + 1] - pn[lo];
-          if (fn == "COUNT") { put(wi, row, val_num((double)cnt)); continue; }
+          if (fn == "COUNT") { wcols[wi].i[row] = (int64_t)cnt; continue; }
           SumAcc acc;
           acc.count = (size_t)cnt;
           if (empty) acc.total = 0.0;
@@ -42816,11 +42967,11 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
             // SumAcc::finish's exact answer, written straight from the integer: SUM at the column's scale, AVG at
             // four more places rounded half up
             const AIOS_INT128 total = empty ? 0 : pe_sum[hi + 1] - pe_sum[lo];
-            if (cnt == 0) { wcells[wi][row] = sql_null(); continue; }
-            if (fn == "SUM") { wcells[wi][row] = scaled_to_decimal(total, ncol->scale); continue; }
+            if (cnt == 0) { wcols[wi].s[row] = sql_null(); continue; }
+            if (fn == "SUM") { wcols[wi].s[row] = scaled_to_decimal(total, ncol->scale); continue; }
             AIOS_INT128 num = total;
             if (scale_up_exact(&num, 5)) {
-              wcells[wi][row] = scaled_to_decimal(scale_down_half_up(num / (AIOS_INT128)cnt, 1), ncol->scale + 4);
+              wcols[wi].s[row] = scaled_to_decimal(scale_down_half_up(num / (AIOS_INT128)cnt, 1), ncol->scale + 4);
               continue;
             }
             acc.etotal = total;
@@ -42842,16 +42993,16 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
               if (better(r, run_best)) run_best = r;
             }
             run_hi = want_hi;
-            wcells[wi][row] = run_best == SIZE_MAX ? sql_null() : r1.rows[run_best].values[arg_col(0)];
+            win_src[row] = run_best;
             continue;
           }
           // a frame that shrank (an n FOLLOWING end near the partition's end does not; this is a fallback)
         }
-        if (fn == "ROW_NUMBER") v = val_num((double)(k + 1));
-        else if (fn == "RANK") v = val_num((double)(gstart[k] + 1));
-        else if (fn == "DENSE_RANK") v = val_num((double)dense_of[k]);
-        else if (fn == "PERCENT_RANK") v = val_approx(m > 1 ? (double)gstart[k] / (double)(m - 1) : 0.0);
-        else if (fn == "CUME_DIST") v = val_approx((double)gend[k] / (double)m);
+        if (fn == "ROW_NUMBER") { wcols[wi].i[row] = (int64_t)(k + 1); continue; }
+        else if (fn == "RANK") { wcols[wi].i[row] = (int64_t)(gstart[k] + 1); continue; }
+        else if (fn == "DENSE_RANK") { wcols[wi].i[row] = (int64_t)dense_of[k]; continue; }
+        else if (fn == "PERCENT_RANK") { wcols[wi].f[row] = m > 1 ? (double)gstart[k] / (double)(m - 1) : 0.0; continue; }
+        else if (fn == "CUME_DIST") { wcols[wi].f[row] = (double)gend[k] / (double)m; continue; }
         else if (fn == "NTILE") {
           const Val nb = value(row, arg_col(0));
           const long long buckets = nb.null ? 0 : (long long)(nb.numeric ? nb.num : std::strtod(nb.str().c_str(), nullptr));
@@ -42859,7 +43010,8 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
           const long long q = (long long)m / buckets, r = (long long)m % buckets;
           // the first r buckets hold q + 1 rows
           const long long big = r * (q + 1);
-          v = val_num((double)((long long)k < big ? (long long)k / (q + 1) + 1 : r + ((long long)k - big) / (q ? q : 1) + 1));
+          wcols[wi].i[row] = (int64_t)((long long)k < big ? (long long)k / (q + 1) + 1 : r + ((long long)k - big) / (q ? q : 1) + 1);
+          continue;
         } else if (offset_fn) {
           long long off = 1;
           if (w.args.size() > 1) {
@@ -42867,8 +43019,8 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
             off = o.null ? 0 : (long long)(o.numeric ? o.num : std::strtod(o.str().c_str(), nullptr));
           }
           const long long target = fn == "LAG" ? (long long)k - off : (long long)k + off;
-          if (target >= 0 && target < (long long)m) wcells[wi][row] = r1.rows[idx[ps + (size_t)target]].values[arg_col(0)];
-          else wcells[wi][row] = w.args.size() > 2 ? r1.rows[row].values[arg_col(2)] : sql_null();
+          if (target >= 0 && target < (long long)m) win_src[row] = idx[ps + (size_t)target];
+          else win_src[row] = w.args.size() > 2 ? (SIZE_MAX - 1) : SIZE_MAX;
           continue;
         } else {
           size_t lo, hi;
@@ -42885,12 +43037,13 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
               if (at_n <= 0) return make_error("NTH_VALUE() needs a positive position");
               if (lo + (size_t)at_n - 1 <= hi) pick = lo + (size_t)at_n - 1;
             }
-            wcells[wi][row] = pick == SIZE_MAX ? sql_null() : r1.rows[idx[ps + pick]].values[arg_col(0)];
+            win_src[row] = pick == SIZE_MAX ? SIZE_MAX : idx[ps + pick];
             continue;
           } else if (fn == "COUNT") {
             long long cnt = 0;
-            if (!empty) for (size_t j = lo; j <= hi; ++j) if (w.count_star || !value(idx[ps + j], arg_col(0)).null) ++cnt;
-            v = val_num((double)cnt);
+            if (!empty) for (size_t j = lo; j <= hi; ++j) if (w.count_star || !cell_is_null(idx[ps + j], arg_col(0))) ++cnt;
+            wcols[wi].i[row] = (int64_t)cnt;
+            continue;
           } else if (fn == "SUM" || fn == "AVG") {
             SumAcc acc;
             if (!empty) for (size_t j = lo; j <= hi; ++j) acc.add(value(idx[ps + j], arg_col(0)));
@@ -42901,13 +43054,79 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
             if (!empty)
               for (size_t j = lo; j <= hi; ++j)
                 if (better(idx[ps + j], best)) best = idx[ps + j];
-            wcells[wi][row] = best == SIZE_MAX ? sql_null() : r1.rows[best].values[arg_col(0)];
+            win_src[row] = best;
             continue;
           }
         }
         put(wi, row, v);
       }
       ps = pe;
+    }
+
+    if (pick_win) {
+      const size_t ac = arg_col(0);
+      const bool has_def = offset_fn && w.args.size() > 2;
+      const size_t dc = has_def ? arg_col(2) : 0;
+      if (b1_in_batch) {
+        const ColBatch::Col& sc = b1.cols[ac];
+        const ColBatch::Col* defc = has_def ? &b1.cols[dc] : nullptr;
+        if (sc.kind == ColBatch::I64 && (!defc || defc->kind == ColBatch::I64)) {
+          wcols[wi].kind = ColBatch::I64;
+          wcols[wi].i.assign(n, 0);
+          wcols[wi].nul.assign(n, 1);
+          for (size_t r = 0; r < n; ++r) {
+            const size_t s = win_src[r];
+            if (s < n && !sc.nul[s]) { wcols[wi].i[r] = sc.i[s]; wcols[wi].nul[r] = 0; }
+            else if (s == SIZE_MAX - 1 && defc && !defc->nul[r]) { wcols[wi].i[r] = defc->i[r]; wcols[wi].nul[r] = 0; }
+          }
+        } else if (sc.kind == ColBatch::F64 && (!defc || defc->kind == ColBatch::F64)) {
+          wcols[wi].kind = ColBatch::F64;
+          wcols[wi].f.assign(n, 0.0);
+          wcols[wi].nul.assign(n, 1);
+          for (size_t r = 0; r < n; ++r) {
+            const size_t s = win_src[r];
+            if (s < n && !sc.nul[s]) { wcols[wi].f[r] = sc.f[s]; wcols[wi].nul[r] = 0; }
+            else if (s == SIZE_MAX - 1 && defc && !defc->nul[r]) { wcols[wi].f[r] = defc->f[r]; wcols[wi].nul[r] = 0; }
+          }
+        } else if (sc.kind == ColBatch::Dec && !defc) {
+          wcols[wi].kind = ColBatch::Dec;
+          wcols[wi].scale = sc.scale;
+          wcols[wi].fixed = sc.fixed;
+          wcols[wi].i.assign(n, 0);
+          wcols[wi].nul.assign(n, 1);
+          for (size_t r = 0; r < n; ++r) {
+            const size_t s = win_src[r];
+            if (s < n && !sc.nul[s]) { wcols[wi].i[r] = sc.i[s]; wcols[wi].nul[r] = 0; }
+          }
+        } else if (sc.kind == ColBatch::Codes && !defc) {
+          wcols[wi].kind = ColBatch::Codes;
+          wcols[wi].dict = sc.dict;
+          wcols[wi].codes.assign(n, 0);
+          wcols[wi].nul.assign(n, 1);
+          for (size_t r = 0; r < n; ++r) {
+            const size_t s = win_src[r];
+            if (s < n && !sc.nul[s]) { wcols[wi].codes[r] = sc.codes[s]; wcols[wi].nul[r] = 0; }
+          }
+        } else {
+          wcols[wi].kind = ColBatch::Text;
+          wcols[wi].s.resize(n);
+          for (size_t r = 0; r < n; ++r) {
+            const size_t s = win_src[r];
+            if (s < n) wcols[wi].s[r] = sc.text(s);
+            else if (s == SIZE_MAX - 1 && defc) wcols[wi].s[r] = defc->text(r);
+            else wcols[wi].s[r] = sql_null();
+          }
+        }
+      } else {
+        wcols[wi].kind = ColBatch::Text;
+        wcols[wi].s.resize(n);
+        for (size_t r = 0; r < n; ++r) {
+          const size_t s = win_src[r];
+          if (s < n) wcols[wi].s[r] = r1.rows[s].values[ac];
+          else if (s == SIZE_MAX - 1 && has_def) wcols[wi].s[r] = r1.rows[r].values[dc];
+          else wcols[wi].s[r] = sql_null();
+        }
+      }
     }
   }
 
@@ -42942,8 +43161,8 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
   for (size_t wi = 0; wi < wins.size(); ++wi) by_name["__w" + std::to_string(wi)] = Src{true, wi};
   // A DECIMAL window (SUM, AVG) prints every row at the column's widest scale, as a DECIMAL column does.
   for (size_t wi = 0; wi < wins.size(); ++wi) {
-    if (wtype[wi] != SqlDataType::Decimal) continue;
-    auto& cells = wcells[wi];
+    if (wtype[wi] != SqlDataType::Decimal || wcols[wi].kind != ColBatch::Text) continue;
+    auto& cells = wcols[wi].s;
     int scale = 0;
     for (size_t r = 0; r < n; ++r) {
       if (sql_is_null(cells[r])) continue;
@@ -42984,14 +43203,14 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
       if (!found) direct = false;
     }
     if (direct) {
-      // sorted on key arrays: an input column's, or a window's from its text
+      // sorted on key arrays: an input column's, or a window's from its column
       std::vector<KeyCol> wkeys;
       std::vector<std::pair<const KeyCol*, bool>> sort_keys;
       wkeys.reserve(keys.size());
       for (const auto& k : keys) {
         if (!k.first.window) { sort_keys.emplace_back(&keycol(k.first.at), k.second); continue; }
-        const auto& cells = wcells[k.first.at];
-        wkeys.push_back(make_keycol([&](size_t r) -> const std::string& { return cells[r]; }, wstring[k.first.at]));
+        const size_t wi = k.first.at;
+        wkeys.push_back(make_keycol_from_col(wcols[wi], wstring[wi], wtype[wi] == SqlDataType::Int));
         sort_keys.emplace_back(&wkeys.back(), k.second);
       }
       std::vector<size_t> ord(n);
@@ -43051,12 +43270,81 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
         if (!r1.column_origins.empty())
           res.column_origins.push_back(!sr.window && sr.at < r1.column_origins.size() ? r1.column_origins[sr.at] : SqlColumnOrigin{});
       }
+      if (col_out && b1_in_batch) {
+        const size_t out_n = to - from;
+        col_out->rows = out_n;
+        col_out->cols.resize(isrc.size());
+        const bool identity = sort_keys.empty() && from == 0 && to == n;
+        std::vector<size_t> b1_uses(b1.cols.size(), 0), w_uses(wcols.size(), 0);
+        if (identity) {
+          for (const Src& sr : isrc) {
+            if (sr.window) ++w_uses[sr.at];
+            else ++b1_uses[sr.at];
+          }
+        }
+        for (size_t i = 0; i < isrc.size(); ++i) {
+          const Src& sr = isrc[i];
+          ColBatch::Col& src = sr.window ? wcols[sr.at] : b1.cols[sr.at];
+          ColBatch::Col& dst = col_out->cols[i];
+          if (identity) {
+            size_t& rem = sr.window ? w_uses[sr.at] : b1_uses[sr.at];
+            if (--rem == 0) dst = std::move(src);
+            else dst = src;
+            continue;
+          }
+          dst.kind = src.kind;
+          dst.scale = src.scale;
+          dst.fixed = src.fixed;
+          switch (src.kind) {
+            case ColBatch::Text:
+              dst.s.resize(out_n);
+              for (size_t o = 0; o < out_n; ++o) dst.s[o] = src.s[ord[from + o]];
+              break;
+            case ColBatch::I64:
+            case ColBatch::Dec:
+              dst.i.resize(out_n);
+              dst.nul.resize(out_n);
+              for (size_t o = 0; o < out_n; ++o) {
+                const size_t r = ord[from + o];
+                dst.i[o] = src.i[r];
+                dst.nul[o] = src.nul[r];
+              }
+              break;
+            case ColBatch::F64:
+              dst.f.resize(out_n);
+              dst.nul.resize(out_n);
+              for (size_t o = 0; o < out_n; ++o) {
+                const size_t r = ord[from + o];
+                dst.f[o] = src.f[r];
+                dst.nul[o] = src.nul[r];
+              }
+              break;
+            case ColBatch::Codes:
+              dst.dict = src.dict;
+              dst.codes.resize(out_n);
+              dst.nul.resize(out_n);
+              for (size_t o = 0; o < out_n; ++o) {
+                const size_t r = ord[from + o];
+                dst.codes[o] = src.codes[r];
+                dst.nul[o] = src.nul[r];
+              }
+              break;
+          }
+        }
+        col_out->filled = true;
+        res.rows_in_batch = true;
+        res.rows_affected = out_n;
+        wmark("direct");
+        if (wtrace) vx_trace("window:" + wt_log + " rows=" + std::to_string(n));
+        return res;
+      }
       res.rows.resize(to - from);
       for (size_t o = from; o < to; ++o) {
         const size_t r = ord[o];
         auto& vals = res.rows[o - from].values;
         vals.reserve(isrc.size());
-        for (const Src& sr : isrc) vals.push_back(sr.window ? wcells[sr.at][r] : r1.rows[r].values[sr.at]);
+        for (const Src& sr : isrc)
+          vals.push_back(sr.window ? wcols[sr.at].text(r) : (b1_in_batch ? b1.cols[sr.at].text(r) : r1.rows[r].values[sr.at]));
       }
       wmark("direct");
       if (wtrace) vx_trace("window:" + wt_log + " rows=" + std::to_string(n));
@@ -43084,22 +43372,52 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
     }
     tbl->columns.push_back(col);
   }
-  std::vector<SqlRow> rows(n);
-  for (size_t r = 0; r < n; ++r) {
-    rows[r].values.reserve(names.size());
+  if (b1_in_batch) {
+    ColBatch wb;
+    wb.rows = n;
+    wb.cols.resize(names.size());
+    std::vector<size_t> b1_uses(b1.cols.size(), 0);
+    for (size_t c = 0; c < names.size(); ++c)
+      if (src_col[c] != SIZE_MAX) ++b1_uses[src_col[c]];
     for (size_t c = 0; c < names.size(); ++c) {
-      if (src_col[c] != SIZE_MAX) rows[r].values.push_back(r1.rows[r].values[src_col[c]]);
-      else rows[r].values.push_back(wcells[c - (names.size() - wins.size())][r]);
+      if (src_col[c] != SIZE_MAX) {
+        const size_t sc = src_col[c];
+        if (--b1_uses[sc] == 0) wb.cols[c] = std::move(b1.cols[sc]);
+        else wb.cols[c] = b1.cols[sc];
+      } else {
+        const size_t wi = c - (names.size() - wins.size());
+        wb.cols[c] = std::move(wcols[wi]);
+      }
     }
+    wb.filled = true;
+    fit_decimal_scales_with(tbl->columns, [&](size_t c, auto&& fn) { colbatch_each_scale_value(wb, c, fn); });
+    tbl->mark_result_table();
+    tbl->ensure_columns();
+    tbl->reserve(n);
+    if (!colbatch_fill_table(tbl.get(), wb)) {
+      std::vector<SqlRow> rows;
+      wb.to_rows(&rows);
+      for (auto& r : rows) tbl->append_row_canonical(std::move(r.values));
+    }
+    tbl->inferred_types = true;
+  } else {
+    std::vector<SqlRow> rows(n);
+    for (size_t r = 0; r < n; ++r) {
+      rows[r].values.reserve(names.size());
+      for (size_t c = 0; c < names.size(); ++c) {
+        if (src_col[c] != SIZE_MAX) rows[r].values.push_back(r1.rows[r].values[src_col[c]]);
+        else rows[r].values.push_back(wcols[c - (names.size() - wins.size())].text(r));
+      }
+    }
+    fit_decimal_scales(tbl->columns, rows);
+    tbl->mark_result_table();
+    tbl->ensure_columns();
+    tbl->reserve(rows.size());
+    // Every cell is already in its column's form (a query's output, or a window's, scaled above): appended as
+    // it is - normalising it again reformatted every double, most of this step's time.
+    for (auto& r : rows) tbl->append_row_canonical(std::move(r.values));
+    tbl->inferred_types = true;
   }
-  fit_decimal_scales(tbl->columns, rows);
-  tbl->mark_result_table();
-  tbl->ensure_columns();
-  tbl->reserve(rows.size());
-  // Every cell is already in its column's form (a query's output, or a window's, scaled above): appended as
-  // it is - normalising it again reformatted every double, most of this step's time.
-  for (auto& r : rows) tbl->append_row_canonical(std::move(r.values));
-  tbl->inferred_types = true;
 
   wmark("table");
   SelectEngine::push_cte_scope(db);
@@ -43115,7 +43433,11 @@ SqlQueryResult execute_windowed(SqlDatabase* db, const ParsedSelectBranch& b, Co
   outer.order_by = std::move(outer_order);
   outer.limit = b.limit;
   outer.offset = b.offset;
-  SqlQueryResult res = execute_parsed_select_single(db, outer);
+  SqlQueryResult res;
+  {
+    ColOutRequest want_outer(col_out);
+    res = execute_parsed_select_single(db, outer);
+  }
   wmark("select");
   if (wtrace) vx_trace("window:" + wt_log + " rows=" + std::to_string(n));
   return res;
@@ -47920,9 +48242,17 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   // a MIN / MAX of doubles is not an INT result: the text form
   for (const Agg& a : aggs) if ((a.kind == Min || a.kind == Max) && a.arg.ty == vp::Ty::F64) lane_form = false;
   std::vector<vp::Column> plain(items.size());
-  if (lane_form)
-    for (size_t i = 0; i < items.size(); ++i)
-      if (item_agg[i] < 0 && !lane(items[i].expr.get(), &plain[i], false, false)) return false;
+  std::vector<int> item_key(items.size(), -1);
+  if (lane_form) {
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (item_agg[i] >= 0) continue;
+      if (*keys_exact && items[i].expr && !items[i].expr->source_text.empty()) {
+        for (size_t c = 0; c < nk; ++c)
+          if (group_by[c] && group_by[c]->source_text == items[i].expr->source_text) { item_key[i] = (int)c; break; }
+      }
+      if (item_key[i] < 0 && !lane(items[i].expr.get(), &plain[i], false, false)) return false;
+    }
+  }
   // Each row's group: a flat open-addressed table of the key tuples seen (NULL equal to NULL, as GROUP BY has it).
   auto mix = [](uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); };
   auto hash_row = [&](size_t r) {
@@ -47946,16 +48276,24 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   // straight from the values, NULL a slot of its own past each key's range - no hash, no compare. The groups are
   // numbered in first-appearance order, as the table below numbers them.
   bool direct = n >= 1024 && nk >= 1;
+  std::vector<int64_t> direct_lo;
+  std::vector<uint64_t> direct_width;
+  std::vector<int32_t> direct_slot;
   if (direct) {
     const uint64_t cap = std::max<uint64_t>((uint64_t)1 << 16, (uint64_t)n * 2);
-    std::vector<int64_t> lo(nk, 0);
-    std::vector<uint64_t> width(nk, 1), mul(nk, 1);
+    direct_lo.assign(nk, 0);
+    direct_width.assign(nk, 1);
+    std::vector<uint64_t> mul(nk, 1);
     uint64_t span = 1;
     for (size_t c = 0; c < nk && direct; ++c) {
       int64_t mn = INT64_MAX, mx = INT64_MIN;
       const std::vector<int64_t>& ki = keys[c].i;
       const std::vector<uint8_t>& kn = keys[c].n;
-      {
+      if (n < 131072) {
+        const int64_t* kip = ki.data();
+        const uint8_t* knp = kn.data();
+        for (size_t r = 0; r < n; ++r) if (!knp[r]) { mn = std::min(mn, kip[r]); mx = std::max(mx, kip[r]); }
+      } else {
         aios::hal::Mutex mmu;
         SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
           int64_t a = INT64_MAX, b = INT64_MIN;
@@ -47966,28 +48304,44 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       }
       if (mn > mx) { mn = 0; mx = -1; }
       if (mx >= mn && (uint64_t)mx - (uint64_t)mn >= ((uint64_t)1 << 24)) { direct = false; break; }
-      lo[c] = mn;
-      width[c] = (mx >= mn ? (uint64_t)(mx - mn) + 1 : 0) + 1;   // the last: NULL
+      direct_lo[c] = mn;
+      direct_width[c] = (mx >= mn ? (uint64_t)(mx - mn) + 1 : 0) + 1;   // the last: NULL
       mul[c] = span;
-      span *= width[c];
+      span *= direct_width[c];
       if (span > cap) direct = false;
     }
     if (direct) {
-      std::vector<int32_t> slot(span, -1);
-      std::vector<uint64_t> idx(n, 0);
-      for (size_t c = 0; c < nk; ++c) {
-        const std::vector<int64_t>& ki = keys[c].i;
-        const std::vector<uint8_t>& kn = keys[c].n;
-        const uint64_t m = mul[c], nul_at = (width[c] - 1) * m;
-        const int64_t l = lo[c];
-        SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
-          for (size_t r = r0; r < r1; ++r) idx[r] += kn[r] ? nul_at : (uint64_t)(ki[r] - l) * m;
-        });
-      }
-      for (size_t r = 0; r < n; ++r) {
-        int32_t& g = slot[idx[r]];
-        if (g < 0) { g = (int32_t)first.size(); first.push_back((uint32_t)r); }
-        gid[r] = (uint32_t)g;
+      direct_slot.assign(span, -1);
+      if (nk == 1) {
+        const int64_t* ki = keys[0].i.data();
+        const uint8_t* kn = keys[0].n.data();
+        const uint64_t nul_at = direct_width[0] - 1;
+        const int64_t l = direct_lo[0];
+        for (size_t r = 0; r < n; ++r) {
+          int32_t& g = direct_slot[kn[r] ? nul_at : (uint64_t)(ki[r] - l)];
+          if (g < 0) { g = (int32_t)first.size(); first.push_back((uint32_t)r); }
+          gid[r] = (uint32_t)g;
+        }
+      } else {
+        std::vector<uint64_t> idx(n, 0);
+        for (size_t c = 0; c < nk; ++c) {
+          const std::vector<int64_t>& ki = keys[c].i;
+          const std::vector<uint8_t>& kn = keys[c].n;
+          const uint64_t m = mul[c], nul_at = (direct_width[c] - 1) * m;
+          const int64_t l = direct_lo[c];
+          if (n < 131072) {
+            for (size_t r = 0; r < n; ++r) idx[r] += kn[r] ? nul_at : (uint64_t)(ki[r] - l) * m;
+          } else {
+            SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
+              for (size_t r = r0; r < r1; ++r) idx[r] += kn[r] ? nul_at : (uint64_t)(ki[r] - l) * m;
+            });
+          }
+        }
+        for (size_t r = 0; r < n; ++r) {
+          int32_t& g = direct_slot[idx[r]];
+          if (g < 0) { g = (int32_t)first.size(); first.push_back((uint32_t)r); }
+          gid[r] = (uint32_t)g;
+        }
       }
     }
   }
@@ -48123,6 +48477,12 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   const bool key_order = want_key_order && *keys_exact;
   lane_form = lane_form && key_order;   // the lanes come out in key order only
   if (!key_order) {
+  } else if (nk == 1 && direct && (!keys[0].uns || direct_lo[0] >= 0)) {
+    size_t out_g = 0;
+    const uint64_t w = direct_width[0];
+    if (w > 0 && direct_slot[w - 1] >= 0) order[out_g++] = (uint32_t)direct_slot[w - 1];
+    for (uint64_t s = 0; s + 1 < w; ++s)
+      if (direct_slot[s] >= 0) order[out_g++] = (uint32_t)direct_slot[s];
   } else if (nk == 1) {
     // one key: each group's (NULL, value) beside its id, sorted as records - not through first[] into the lanes
     // (53,760 groups: the comparisons' reads landed all over the rows)
@@ -48154,7 +48514,8 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
       o.i.assign(G, 0);
       o.n.assign(G, 0);
       const int k = item_agg[i];
-      const vp::Column* src = k < 0 ? &plain[i] : (aggs[(size_t)k].kind == Min || aggs[(size_t)k].kind == Max) ? &aggs[(size_t)k].arg : nullptr;
+      const vp::Column* src = k < 0 ? (item_key[i] >= 0 ? &keys[(size_t)item_key[i]] : &plain[i])
+                                    : (aggs[(size_t)k].kind == Min || aggs[(size_t)k].kind == Max) ? &aggs[(size_t)k].arg : nullptr;
       o.uns = src && src->uns;   // a value keeps its argument's signedness
       for (size_t x = 0; x < G; ++x) {
         const uint32_t g = order[x];
@@ -50656,6 +51017,35 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
       else if (!best_wide && bval && bval->op != ExprOp::Column && bval->op != ExprOp::Literal)
         best_wide = true;   // an expression: its values are not known ahead
     }
+    // The ON conjuncts that read the base rows alone (`LEFT JOIN wt ON p.is_sky AND wt.k = ..`), evaluated in
+    // lanes over every base row first: a row they refuse is padded (or dropped) without a probe.
+    std::vector<uint8_t> base_refused;
+    std::unordered_set<const SqlExpr*> base_decided;   // the conjuncts base_refused settled, for every candidate of a row it kept
+    if (has_extra_join && rows.size() >= 256 && vp::enabled() && !join_is_right[j]) {
+      EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
+      for (const SqlExpr* pc : jparts) {
+        if (!expr_only_reads(pc, bctx) || expr_has_subquery_raw(pc)) continue;
+        const vp::Prog* P = vp::program_for(pc, bctx);
+        if (!P || P->out().ty == vp::Ty::Str) continue;
+        vp::Column col;
+        std::string verr;
+        if (!vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, rows.size(), &col, &verr)) continue;
+        if (base_refused.empty()) base_refused.assign(rows.size(), 0);
+        for (size_t r = 0; r < rows.size(); ++r)
+          if (col.is_null(r) || (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0)) base_refused[r] = 1;
+        base_decided.insert(pc);
+      }
+    }
+    size_t base_kept = rows.size();
+    std::vector<uint32_t> base_kept_idx;
+    if (!base_refused.empty()) {
+      base_kept = 0;
+      for (size_t r = 0; r < rows.size(); ++r) if (!base_refused[r]) ++base_kept;
+      if (base_kept > 0 && base_kept * 2 <= rows.size()) {
+        base_kept_idx.reserve(base_kept);
+        for (size_t r = 0; r < rows.size(); ++r) if (!base_refused[r]) base_kept_idx.push_back((uint32_t)r);
+      }
+    }
     // A key that is an expression of the base row (sy * 320 + sx = pix) is evaluated over every base row
     // at once where it compiles (vp); key_val reads this row's value back, or interprets the key.
     std::vector<vp::Column> vp_keys;
@@ -50670,9 +51060,40 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
         const uint64_t kt1 = vx_trace_on() ? hal_now_ns() : 0;
         if (!P) { if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " not compiled (" + std::to_string((kt1 - kt0) / 1000) + " us)"); continue; }
         std::string verr;
-        vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
+        if (base_kept == 0 && P->out().ty != vp::Ty::Str && !P->out().uns) {
+          vp_keys[ki].ty = P->out().ty;
+          vp_keys[ki].approx = P->out().approx;
+          vp_key_ok[ki] = 1;
+        } else if (!base_kept_idx.empty() && P->out().ty != vp::Ty::Str && !P->out().uns) {
+          vp::Column sub;
+          if (vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[base_kept_idx[j]]; }, base_kept_idx.size(), &sub, &verr)) {
+            vp::Column& dst = vp_keys[ki];
+            dst.ty = sub.ty;
+            dst.approx = sub.approx;
+            dst.uns = sub.uns;
+            dst.n.assign(rows.size(), 1);
+            if (sub.ty == vp::Ty::I64) {
+              dst.i.assign(rows.size(), 0);
+              for (size_t j = 0; j < base_kept_idx.size(); ++j) {
+                const uint32_t r = base_kept_idx[j];
+                dst.n[r] = sub.n[j];
+                dst.i[r] = sub.i[j];
+              }
+            } else {
+              dst.f.assign(rows.size(), 0);
+              for (size_t j = 0; j < base_kept_idx.size(); ++j) {
+                const uint32_t r = base_kept_idx[j];
+                dst.n[r] = sub.n[j];
+                dst.f[r] = sub.f[j];
+              }
+            }
+            vp_key_ok[ki] = 1;
+          }
+        } else {
+          vp_key_ok[ki] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_keys[ki], &verr) ? 1 : 0;
+        }
         if (vx_trace_on()) vx_trace("join: +" + js.alias + " key " + std::to_string(ki) + " compiled in " + std::to_string((kt1 - kt0) / 1000) + " us, " +
-                                    std::to_string(P->ins.size()) + " ops over " + std::to_string(rows.size()) + " rows in " + std::to_string((hal_now_ns() - kt1) / 1000) + " us" + (vp_key_ok[ki] ? "" : " (failed)"));
+                                    std::to_string(P->ins.size()) + " ops over " + std::to_string(base_kept < rows.size() && (base_kept == 0 || !base_kept_idx.empty()) ? base_kept : rows.size()) + " rows in " + std::to_string((hal_now_ns() - kt1) / 1000) + " us" + (vp_key_ok[ki] ? "" : " (failed)"));
       }
     }
     // An expression key whose values are all known now, and all within a double's 53 bits: the probe's double
@@ -50870,25 +51291,6 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
 
     std::atomic<uint64_t> t_gather{0}, t_on{0}, n_cands{0}, n_skipped{0};   // step diagnostics, in the trace
     const bool step_timing = vx_trace_on();
-    // The ON conjuncts that read the base rows alone (`LEFT JOIN wt ON p.is_sky AND wt.k = ..`), evaluated in
-    // lanes over every base row first: a row they refuse is padded (or dropped) without a probe.
-    std::vector<uint8_t> base_refused;
-    std::unordered_set<const SqlExpr*> base_decided;   // the conjuncts base_refused settled, for every candidate of a row it kept
-    if (has_extra_join && rows.size() >= 256 && vp::enabled() && !join_is_right[j]) {
-      EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
-      for (const SqlExpr* pc : jparts) {
-        if (!expr_only_reads(pc, bctx) || expr_has_subquery_raw(pc)) continue;
-        const vp::Prog* P = vp::program_for(pc, bctx);
-        if (!P || P->out().ty == vp::Ty::Str) continue;
-        vp::Column col;
-        std::string verr;
-        if (!vp::eval_column(*P, [&](size_t r) -> const JoinedRow& { return rows[r]; }, rows.size(), &col, &verr)) continue;
-        if (base_refused.empty()) base_refused.assign(rows.size(), 0);
-        for (size_t r = 0; r < rows.size(); ++r)
-          if (col.is_null(r) || (col.ty == vp::Ty::I64 ? col.i[r] == 0 : col.f[r] == 0)) base_refused[r] = 1;
-        base_decided.insert(pc);
-      }
-    }
     // What a candidate still has to pass of the ON clause. A conjunct the base rows alone decided (above) reads
     // nothing of the joined row: true for every candidate of a row that was not refused, so it is not checked
     // again. A conjunct that compiles as a program is checked over a chunk's candidates at once in lanes
@@ -50905,21 +51307,6 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
     // s.onhand > 0` checked onhand over 63k candidates in lanes after selecting the rows by it.
     if (pass_is_on && !on_own.empty())
       on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_own.begin(), on_own.end(), pc) != on_own.end(); }), on_check.end());
-    if (has_extra_join && rows.size() >= 256 && vp::enabled()) {
-      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
-      for (const SqlExpr* pc : on_check) {
-        if (pc == xk_conj || expr_has_subquery_raw(pc)) continue;
-        const vp::Prog* P = vp::program_for(pc, pctx);
-        if (!P || P->out().ty == vp::Ty::Str) continue;
-        on_vec.push_back(pc);
-        on_vec_progs.push_back(P);
-      }
-      if (!on_vec.empty())
-        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_vec.begin(), on_vec.end(), pc) != on_vec.end(); }), on_check.end());
-    }
-    if (vx_trace_on() && has_extra_join)
-      vx_trace("join: +" + js.alias + " ON conjuncts: " + std::to_string(base_decided.size()) + " decided by the base rows, " +
-               std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
     // A chunk's candidates that passed on_true and await on_vec, in base order (bi: the base row of each).
     struct OnSink {
       JoinedRows cands;
@@ -51075,6 +51462,21 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
         }
       }
     }
+    if (has_extra_join && rows.size() >= 256 && vp::enabled() && base_kept > 0) {
+      EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+      for (const SqlExpr* pc : on_check) {
+        if (pc == xk_conj || expr_has_subquery_raw(pc)) continue;
+        const vp::Prog* P = vp::program_for(pc, pctx);
+        if (!P || P->out().ty == vp::Ty::Str) continue;
+        on_vec.push_back(pc);
+        on_vec_progs.push_back(P);
+      }
+      if (!on_vec.empty())
+        on_check.erase(std::remove_if(on_check.begin(), on_check.end(), [&](const SqlExpr* pc) { return std::find(on_vec.begin(), on_vec.end(), pc) != on_vec.end(); }), on_check.end());
+    }
+    if (vx_trace_on() && has_extra_join)
+      vx_trace("join: +" + js.alias + " ON conjuncts: " + std::to_string(base_decided.size()) + " decided by the base rows, " +
+               std::to_string(on_vec.size()) + " in lanes, " + std::to_string(on_check.size()) + " per candidate");
     auto numkey = [&](const NumKey& k, size_t bi, const JoinedRow& base, double* out) -> bool {
       if (k.lane) {
         if (k.lane->is_null(bi)) return false;
@@ -51993,6 +52395,23 @@ static std::optional<SqlQueryResult> project_rows(const ProjectPlan& plan, Phase
         const size_t ds = direct[i].src;
         colbatch_gather(*sources[ds].table, direct[i].col, dest, 0,
                         [&](size_t r) -> size_t { const JoinedRow& jr = rows[r]; return ds < jr.parts.size() ? jr.parts[ds] : kNullRow; }, n, &B.cols[i]);
+        if (ptrace) { t_direct += hal_now_ns() - pt0; ++n_direct; }
+        continue;
+      }
+      if (expanded[i].expr && expanded[i].expr->op == ExprOp::Literal) {
+        const Val& v = expanded[i].expr->literal;
+        if (dest == SqlDataType::Int) {
+          int64_t iv = 0;
+          if (v.null || canonical_int(v.str(), &iv)) {
+            B.cols[i].kind = ColBatch::I64;
+            B.cols[i].i.assign(n, v.null ? 0 : iv);
+            B.cols[i].nul.assign(n, v.null ? 1 : 0);
+            if (ptrace) { t_direct += hal_now_ns() - pt0; ++n_direct; }
+            continue;
+          }
+        }
+        B.cols[i].kind = ColBatch::Text;
+        B.cols[i].s.assign(n, v.null ? sql_null() : v.str());
         if (ptrace) { t_direct += hal_now_ns() - pt0; ++n_direct; }
         continue;
       }
@@ -54229,14 +54648,14 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
             for (size_t j = 0; j < si; ++j) {
               const auto& ps = branch.sources[j];
               pkey[j] = last_seg(ps.alias.empty() ? ps.table_name : ps.alias);
-              ptab[j] = ps.is_derived() ? nullptr : db->find_table(ps.table_name);
+              ptab[j] = ps.is_derived() ? nullptr : (find_cte_table(ps.table_name) ? find_cte_table(ps.table_name) : db->find_table(ps.table_name));
             }
             std::unordered_set<std::string> vkeys;
             std::vector<const SqlTable*> vtab;
             for (size_t k = si; k < si + n; ++k) {
               const auto& vs = branch.sources[k];
               vkeys.insert(last_seg(vs.alias.empty() ? vs.table_name : vs.alias));
-              vtab.push_back(vs.is_derived() ? nullptr : db->find_table(vs.table_name));
+              vtab.push_back(vs.is_derived() ? nullptr : (find_cte_table(vs.table_name) ? find_cte_table(vs.table_name) : db->find_table(vs.table_name)));
             }
             // The last caller table a part of the ON reads (-1: only the view's).
             std::function<void(const SqlExpr*, int*)> reads = [&](const SqlExpr* e, int* last) {
@@ -54315,6 +54734,46 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
               branch.join_is_left = std::move(nl);
               branch.join_is_right = std::move(nr);
               if (vx_trace_on()) vx_trace("view " + v->name + " moved ahead of the " + std::to_string(si) + " table(s) joined before it");
+            } else if (!jl(si - 1) && !jr(si - 1) && branch.join_conditions[si - 1]) {
+              // When the view stays in place (e.g. a conjunct contains a subquery) and is inner-joined,
+              // any conjunct on branch.join_conditions[si - 1] that reads the view's later tables
+              // (si + 1 .. si + n - 1) is deferred to branch.where so it runs once those tables are joined.
+              std::unordered_set<std::string> later_vkeys;
+              for (size_t k = si + 1; k < si + n; ++k) {
+                const auto& vs = branch.sources[k];
+                later_vkeys.insert(last_seg(vs.alias.empty() ? vs.table_name : vs.alias));
+              }
+              std::function<bool(const SqlExpr*)> reads_later_v = [&](const SqlExpr* e) -> bool {
+                if (!e) return false;
+                if (e->op == ExprOp::Column && e->name.rfind("@@", 0) != 0) {
+                  if (!e->qualifier.empty()) {
+                    if (later_vkeys.count(last_seg(e->qualifier))) return true;
+                  } else {
+                    for (size_t k = 1; k < n; ++k)
+                      if (vtab[k] && vtab[k]->get_column_index(e->name) >= 0) return true;
+                  }
+                }
+                for (const auto& a : e->args) if (reads_later_v(a.get())) return true;
+                return false;
+              };
+              std::vector<const SqlExpr*> parts;
+              collect_conjuncts(branch.join_conditions[si - 1].get(), &parts);
+              ExprPtr keep_on, defer_where;
+              auto and_of = [](ExprPtr a, ExprPtr b) -> ExprPtr {
+                if (!a) return b;
+                auto e = std::make_shared<SqlExpr>();
+                e->op = ExprOp::And;
+                e->args = {a, b};
+                return e;
+              };
+              for (const SqlExpr* p : parts) {
+                if (reads_later_v(p)) defer_where = and_of(defer_where, clone_expr(p));
+                else keep_on = and_of(keep_on, clone_expr(p));
+              }
+              if (defer_where) {
+                branch.join_conditions[si - 1] = keep_on;
+                branch.where = and_of(branch.where, defer_where);
+              }
             }
           }
           si += num_v_sources;
@@ -64899,7 +65358,7 @@ std::vector<std::string> sql_split_statements(const std::string& text) { return 
 }  // namespace aios::userland
 namespace aios::userland::sqle {
 uint64_t vjit_native_runs() {
-#if defined(__x86_64__) && !defined(_WIN32) && !defined(AIOS_METAL)
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(_WIN32) && !defined(AIOS_METAL)
   return ::aios::userland::vp::vjit::native_runs().load(std::memory_order_relaxed);
 #else
   return 0;

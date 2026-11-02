@@ -102,6 +102,7 @@ struct Prog {
   // one row id across the chunk (a one-row table's leaves); hoisted says the code has such a preamble.
   bool hoisted = false;
   uint64_t hoist_srcs = 0;
+  std::vector<uint8_t> inv;
 };
 
 // The leaves of a program: the instructions that read a column or a constant, which the interpreter's own
@@ -615,8 +616,9 @@ struct Compiler {
         Ty ty; bool approx;
         if (!numeric_pair(a, b, &ty, &approx)) return fail("decimal arithmetic");
         if (e->op == ExprOp::Div) {
-          if (pg_div || !approx) return fail(pg_div ? "PG division" : "exact division");   // two exact operands divide as decimals
-          return binary(Ins::Div, a, b, Ty::F64, true, tainted(a, b));
+          const bool pure_approx = (at(a).approx && !decimalish(at(a))) || (at(b).approx && !decimalish(at(b)));
+          if ((pg_div && !pure_approx) || !approx) return fail(pg_div ? "PG division" : "exact division");   // two exact operands divide as decimals
+          return binary(Ins::Div, a, b, Ty::F64, true, at(a).taint || at(b).taint);
         }
         if (e->op == ExprOp::Mod && ty == Ty::F64 && !approx) return fail("decimal MOD");   // exact decimals' MOD
         if (ty == Ty::F64 && !approx && (e->op == ExprOp::Add || e->op == ExprOp::Sub || e->op == ExprOp::Mul)) {
@@ -916,6 +918,7 @@ struct Compiler {
             if (i > 0 && !same_kind(in, at(a), &first)) return fail();
           }
           if (!uns_kinds(in)) return fail("unsigned IF branch mixed with a non-integer");
+          double_case(e, &in);
           return emit(std::move(in));
         }
         if (up == "COALESCE"sv || up == "IFNULL"sv || up == "GREATEST"sv || up == "LEAST"sv || up == "NULLIF"sv) {
@@ -938,6 +941,7 @@ struct Compiler {
           }
           if (first) return fail();
           if (in.has_uns) return fail("unsigned argument");   // these run without CASE's check: as before
+          if (up != "NULLIF"sv) double_case(e, &in);
           return emit(std::move(in));
         }
         if (up == "__ROW_IN"sv) return tuple_in(e);
@@ -1104,7 +1108,26 @@ inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::
   P->leaf_kind.assign(P->ins.size(), LeafLane);
   for (size_t x = 0; x < P->ins.size(); ++x) if (vjit_leaf(P->ins[x].op)) P->leaf_kind[x] = leaf_kind_of(P->ins[x]);
   P->jit = vjit_build_for(*P, &jwhy, &P->hoisted, &P->hoist_srcs);
-  if (!P->jit) P->leaf_kind.assign(P->ins.size(), LeafLane);
+  if (!P->jit) {
+    P->leaf_kind.assign(P->ins.size(), LeafLane);
+    P->inv.assign(P->ins.size(), 0);
+    uint64_t hsrcs = 0;
+    bool any_inv = false;
+    for (size_t x = 0; x < P->ins.size(); ++x) {
+      const Ins& in = P->ins[x];
+      if (in.op == Ins::Konst) { P->inv[x] = 1; continue; }
+      if (vjit_leaf(in.op)) {
+        if (in.cs && in.cs->size() == 1 && in.src < 64) { P->inv[x] = 1; hsrcs |= (1ULL << in.src); }
+        continue;
+      }
+      if (in.args.empty()) continue;
+      bool all = true;
+      for (uint32_t a : in.args) if (a >= x || !P->inv[a]) { all = false; break; }
+      if (all) { P->inv[x] = 1; any_inv = true; }
+    }
+    P->hoisted = any_inv;
+    P->hoist_srcs = any_inv ? hsrcs : 0;
+  }
   if (vx_trace_on() && !P->jit && !jwhy.empty()) vx_trace("vp: no native code: " + jwhy);
   if (vx_trace_on() && P->jit) {
     size_t one_row = 0, lanes = 0, natives = 0;
@@ -1204,7 +1227,7 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
     std::vector<double>& vf = L.f[x];
     std::vector<uint8_t>& nl = L.n[x];
     nl.assign(n, 0);
-    if (in.ty != Ty::F64) vi.assign(n, 0); else vf.assign(n, 0);
+    if (in.ty != Ty::F64) vi.resize(n); else vf.resize(n);
     auto A = [&](size_t k) -> const std::vector<int64_t>& { return L.i[in.args[k]]; };
     auto F = [&](size_t k) -> const std::vector<double>& { return L.f[in.args[k]]; };
     auto N = [&](size_t k) -> const std::vector<uint8_t>& { return L.n[in.args[k]]; };
@@ -1594,7 +1617,28 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
   const size_t K = P.ins.size();
   L.i.resize(K); L.f.resize(K); L.n.resize(K);
   if (!P.jit) {
-    for (size_t x = 0; x < K; ++x) if (!eval_ins(P, x, rowid, n, L, err)) return false;
+    bool can_hoist = P.hoisted && n > 1 && !vjit_check_mode();
+    for (uint32_t s = 0; can_hoist && s < 64; ++s) {
+      if (!((P.hoist_srcs >> s) & 1)) continue;
+      const size_t r0 = rowid(0, s);
+      for (size_t j = 1; j < n; ++j) if (rowid(j, s) != r0) { can_hoist = false; break; }
+    }
+    for (size_t x = 0; x < K; ++x) {
+      if (can_hoist && x < P.inv.size() && P.inv[x]) {
+        if (!eval_ins(P, x, rowid, 1, L, err)) return false;
+        const uint8_t n0 = L.n[x][0];
+        L.n[x].assign(n, n0);
+        if (P.ins[x].ty != Ty::F64) {
+          const int64_t v0 = L.i[x][0];
+          if (!n0) L.i[x].assign(n, v0); else L.i[x].resize(n);
+        } else {
+          const double v0 = L.f[x][0];
+          if (!n0) L.f[x].assign(n, v0); else L.f[x].resize(n);
+        }
+      } else {
+        if (!eval_ins(P, x, rowid, n, L, err)) return false;
+      }
+    }
     return true;
   }
   // The leaves the native code gathers itself: described from their columns as they are now, with the chunk's
@@ -1648,8 +1692,8 @@ inline bool eval(const Prog& P, RowId&& rowid, size_t n, Lanes& L, std::string* 
     }
   }
   const size_t o = K - 1;
-  L.n[o].assign(n, 0);
-  if (P.out().ty != Ty::F64) L.i[o].assign(n, 0); else L.f[o].assign(n, 0);
+  L.n[o].resize(n);
+  if (P.out().ty != Ty::F64) L.i[o].resize(n); else L.f[o].resize(n);
   const int rc = vjit_run(P.jit.get(), n, li, lf, ln, L.i[o].data(), L.f[o].data(), L.n[o].data(), leaves, rid, hoist);
   if (rc == 0 && !vjit_check_mode()) return true;
   if (rc == 2) {   // a column laid out differently than the code was built for: the interpreter, the whole chunk
