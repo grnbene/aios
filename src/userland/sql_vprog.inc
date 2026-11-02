@@ -53,7 +53,8 @@ struct Ins {
   std::shared_ptr<const RowInSet> set;   // TupleIn: the subquery's rows
   // CodeI / CodeF: the dictionary's entries as numbers, one per code, shared across the programs that read the
   // column (CodeTable); StrIn: 1 per code where the entry matches.
-  struct CodeTable { std::vector<int64_t> i; std::vector<double> f; std::vector<uint8_t> null; };
+  // temporal: a date column's table over its codes (days past `base`, 1 << bits of them), not a dictionary's
+  struct CodeTable { std::vector<int64_t> i; std::vector<double> f; std::vector<uint8_t> null; bool temporal = false; int64_t base = 0; int bits = 0; };
   std::shared_ptr<const CodeTable> codes;
   std::vector<uint8_t> code_null;
   const std::vector<int64_t>& code_i() const { return codes->i; }
@@ -229,7 +230,7 @@ struct Compiler {
   // this thread (CodeCache), since every program over the column asks for the same table and a result table's
   // 50,000-entry dictionary took milliseconds to parse per statement.
   struct CodeCache {
-    struct Entry { uint64_t uid; size_t n; bool as_int; std::shared_ptr<const Ins::CodeTable> table; bool bad; };
+    struct Entry { uint64_t uid; size_t n; bool as_int; std::shared_ptr<const Ins::CodeTable> table; bool bad; int part = 0; };
     std::vector<Entry> entries;   // a few dozen live at once; cleared when many have gone stale
   };
   static CodeCache& code_cache() { thread_local CodeCache c; return c; }
@@ -239,7 +240,7 @@ struct Compiler {
     if (n == 0 || n > (1u << 20)) return false;
     CodeCache& cc = code_cache();
     for (const auto& e : cc.entries)
-      if (e.uid == cs.uid.v && e.n == n && e.as_int == as_int) {
+      if (e.uid == cs.uid.v && e.n == n && e.as_int == as_int && e.part == 0) {
         if (e.bad) return false;
         in->codes = e.table;
         return true;
@@ -269,6 +270,53 @@ struct Compiler {
     if (!ok) return false;
     in->codes = t;
     return true;
+  }
+
+  // YEAR / MONTH / DAY / QUARTER (part 1..4) of a dictionary-coded text column (a DATE column's text): each entry's
+  // value worked out once by the interpreter's own rule (date_part_of_text), and the lane reads it by code (CodeI).
+  uint32_t date_part(const SqlExpr* e, int part) {
+    if (e->op != ExprOp::Column || is_user_var_name(e->name) || e->name.rfind("@@", 0) == 0) return fail("date part of an expression");
+    size_t s = 0, c = 0;
+    if (!place(e, &s, &c)) return fail("column not in this scope");
+    const SqlTable* t = (*ctx.sources)[s].table;
+    const SqlColumn& col = t->columns[c];
+    const ColumnStore& cs = t->col_data[c];
+    // A DATE column held as days (TemporalDays) whose span fits 16 bits is read per code, as the column kernels read
+    // it (temporal_codes): code k is day base + k, its cell's text temporal_format's - the table works the date part
+    // out of that text. A dictionary-coded text column: out of each entry.
+    const bool days = col.temporal && cs.encoding == ColumnEncoding::TemporalDays && cs.bit_width_ <= 16 && cs.size() == t->row_count();
+    if (!days && (col.type != SqlDataType::Text || cs.shared_dict || !vx::dict_coded(cs))) return fail("date part of a column not dictionary-coded or days");
+    const size_t n = days ? (size_t)1 << cs.bit_width_ : vx::dict_size(cs);
+    if (n == 0 || n > (1u << 20)) return fail("dictionary too large");
+    Ins in;
+    in.op = Ins::CodeI;
+    in.ty = Ty::I64;
+    in.src = (uint32_t)s;
+    in.cs = &cs;
+    CodeCache& cc = code_cache();
+    for (const auto& en : cc.entries)
+      if (en.uid == cs.uid.v && en.n == n && en.part == part && en.table && en.table->temporal == days && (!days || en.table->base == cs.base_int64)) {
+        in.codes = en.table;
+        return emit(std::move(in));
+      }
+    auto tb = std::make_shared<Ins::CodeTable>();
+    tb->null.assign(n, 0);
+    tb->i.assign(n, 0);
+    tb->temporal = days;
+    tb->base = days ? cs.base_int64 : 0;
+    tb->bits = days ? (int)cs.bit_width_ : 0;
+    std::string text;
+    for (size_t k = 0; k < n; ++k) {
+      if (days) sql_temporal_format(cs.base_int64 + (int64_t)k, false, text);
+      const std::string& v = days ? text : vx::dict_entry(cs, (uint32_t)k);
+      if ((!days && sql_is_null(v)) || !date_part_of_text(v, part, &tb->i[k])) tb->null[k] = 1;
+    }
+    if (cc.entries.size() >= 512) cc.entries.clear();
+    CodeCache::Entry en{cs.uid.v, n, true, tb, false};
+    en.part = part;
+    cc.entries.push_back(std::move(en));
+    in.codes = std::move(tb);
+    return emit(std::move(in));
   }
 
   // A dictionary-coded text column as column() admits one (the same checks), or null: for text_class_pair.
@@ -692,6 +740,10 @@ struct Compiler {
           if (at(a).uns || is_text(at(a))) return fail("text operand");
           return unary(op, a, ty, approx);
         };
+        if (up == "YEAR"sv || up == "MONTH"sv || up == "DAY"sv || up == "DAYOFMONTH"sv || up == "QUARTER"sv) {
+          if (n != 1 || !e->args[0]) return fail();
+          return date_part(e->args[0].get(), up == "YEAR"sv ? 1 : up == "MONTH"sv ? 2 : up == "QUARTER"sv ? 4 : 3);
+        }
         if (up == "ABS"sv || up == "FLOOR"sv || up == "CEIL"sv || up == "CEILING"sv) {
           if (n != 1) return fail();
           const uint32_t a = compile(e->args[0].get());
@@ -1665,7 +1717,12 @@ inline bool valid(const Prog& P, const EvalCtx& ctx) {
       if (&cs == in.cs) { found = true; break; }
     if (!found || in.cs->size() != t->row_count()) return false;
     // a dictionary that has grown since: codes the tables do not know
-    if ((in.op == Ins::CodeI || in.op == Ins::CodeF || in.op == Ins::StrIn) && vx::dict_size(*in.cs) != in.code_count()) return false;
+    if (in.codes && in.codes->temporal) {
+      // a date column's table: the same base and code width, or the codes mean other days now
+      if (in.cs->encoding != ColumnEncoding::TemporalDays || (int)in.cs->bit_width_ != in.codes->bits || in.cs->base_int64 != in.codes->base) return false;
+    } else if ((in.op == Ins::CodeI || in.op == Ins::CodeF || in.op == Ins::StrIn) && vx::dict_size(*in.cs) != in.code_count()) {
+      return false;
+    }
   }
   // a column the native code reads itself laid out differently now (re-encoded): built again for the new layout
   if (P.jit)
