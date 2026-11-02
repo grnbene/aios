@@ -44801,7 +44801,8 @@ struct CompKept {
 };
 static aios::hal::Mutex g_comp_mu;
 static std::vector<CompKept> g_comp_kept;
-static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L, const std::vector<uint32_t>& ids, bool multi = false) {
+static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L, const std::vector<uint32_t>& ids, bool multi = false,
+                            size_t parent_need = SIZE_MAX) {
   const SqlTable& ct = *sources[L.child_src].table;
   const SqlTable& pt = *sources[L.parent_src].table;
   const bool whole = ids.size() == ct.row_count() && !ct.inferred_types && !pt.inferred_types;
@@ -44825,6 +44826,11 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     return false;
   };
   if (ct.inferred_types || pt.inferred_types) return no("a result table");
+  // A child selection (one customer's debtortrans rows) is not kept, so its maps are built every statement - and they
+  // pack every parent row's key: 12.4M stockmoves rows for a lookup that reads 5,175 of them, 200-400 ms where the
+  // join steps probe those rows in ~15. Few parent rows against the whole parent table: left to the join steps.
+  if (!whole && parent_need != SIZE_MAX && parent_need * 16 < pt.row_count())
+    return no("a selected child under few parent rows: the join steps probe them");
   struct Part {
     bool text = false;
     std::shared_ptr<const StarCodeMap> cm;
@@ -45175,8 +45181,12 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     *ids = sel.flat();
     return true;
   };
+  // The rows each source is read for so far: the base's, then each joined table's selection (the parent rows a link
+  // looks up from; SIZE_MAX not known)
+  std::vector<size_t> need_rows(sources.size(), SIZE_MAX);
+  need_rows[0] = nbase;
   auto build = [&](Link& L, const std::vector<uint32_t>& ids) {
-    if (!L.comp.empty()) return star_build_comp(sources, L, ids);
+    if (!L.comp.empty()) return star_build_comp(sources, L, ids, false, need_rows[L.parent_src]);
     const SqlTable& ct = *sources[L.child_src].table;
     const ColumnStore& ccs = ct.col_data[L.child_col];
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
@@ -45287,7 +45297,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   static const bool multi_off = [] { const char* v = std::getenv("AIOS_SQL_STAR_MULTI"); return v && *v == '0'; }();
   auto build_multi = [&](Link& L, const std::vector<uint32_t>& ids) -> bool {
     if (multi_off) return false;
-    if (!L.comp.empty()) return star_build_comp(sources, L, ids, true);
+    if (!L.comp.empty()) return star_build_comp(sources, L, ids, true, need_rows[L.parent_src]);
     const SqlTable& ct = *sources[L.child_src].table;
     const ColumnStore& ccs = ct.col_data[L.child_col];
     const ColumnStore& pcs = sources[L.parent_src].table->col_data[L.parent_col];
@@ -45296,7 +45306,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     if ((L.pk.text || L.ck.text || !vx::typed_integer(ccs) || !vx::typed_integer(pcs)) && vx::dict_coded(ccs) && vx::dict_coded(pcs) &&
         ccs.size() == ct.row_count()) {
       L.comp.assign(1, std::make_pair(L.child_col, L.parent_col));
-      if (star_build_comp(sources, L, ids, true)) return true;
+      if (star_build_comp(sources, L, ids, true, need_rows[L.parent_src])) return true;
       L.comp.clear();
       return false;
     }
@@ -45386,6 +45396,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     conds.insert(conds.end(), st.from_where.begin(), st.from_where.end());
     std::vector<uint32_t> ids;
     if (!select_of(j + 1, conds, &ids)) return false;
+    need_rows[j + 1] = ids.size();
     const bool reroot_here = j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0;
     // The first join over every row of its table (no condition of its own): its one-to-many map is built once and
     // kept (star_multi_cached), and a base row's run in it is already in the order the rerooted rows are sorted
