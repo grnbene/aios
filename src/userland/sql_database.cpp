@@ -16277,12 +16277,19 @@ uint32_t ColumnStore::read_code(size_t row) const {
   if (row >= row_count_) return 0;
   if (encoding == ColumnEncoding::RLE) {
     if (rle_num_runs == 0) return 0;
-    // The last run found, remembered per thread.
+    // The last run found, remembered per thread - for this column as it is now: its epoch (moved by a write and by a
+    // re-encode), its rows and its runs (an append extends the last run or adds one, and moves neither). Keyed by the
+    // column's address alone, a column re-encoded in place (a checkpoint's optimize_encoding, an OPTIMIZE, a
+    // conversion put in place) kept it, and a thread that had read the column went on reading the old run's code over
+    // the new runs' rows: one run of 1s re-encoded to 1 x 777, 2 x 1, 1 x 199222 read row 777 as 1 - the UPDATE that
+    // wrote 2 there read back as lost after the checkpoint, and from the store after a restart.
     thread_local const ColumnStore* tl_owner = nullptr;
+    thread_local uint64_t tl_epoch = 0;
+    thread_local size_t tl_rows = 0, tl_runs = 0;
     thread_local size_t tl_idx = 0;
     thread_local uint32_t tl_start = 0;
     thread_local uint32_t tl_end = 0;
-    if (tl_owner == this && tl_idx < rle_num_runs) {
+    if (tl_owner == this && tl_epoch == epoch && tl_rows == row_count_ && tl_runs == rle_num_runs && tl_idx < rle_num_runs) {
       if (row >= tl_start && row < tl_end) return rle_get_code(tl_idx);
       // A scan walks into the next run far more often than it jumps.
       if (tl_idx + 1 < rle_num_runs && row >= tl_end) {
@@ -16296,6 +16303,9 @@ uint32_t ColumnStore::read_code(size_t row) const {
     }
     size_t idx = rle_find_run(row);
     tl_owner = this;
+    tl_epoch = epoch;
+    tl_rows = row_count_;
+    tl_runs = rle_num_runs;
     tl_idx = idx;
     tl_start = rle_get_start_row(idx);
     tl_end = tl_start + rle_get_length(idx);

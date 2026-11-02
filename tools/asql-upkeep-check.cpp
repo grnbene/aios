@@ -160,6 +160,7 @@ int main() {
     SqlDatabase db(**k);
     db.init("sql_db");
     run(db, "USE updb");
+    expect(keyed(db, "UPDATE ue SET v = v WHERE id = 'k0'") == 0, "a keyed no-op during the warm-up");
     db.wait_warm_up();
     expect(status(db, "Asql_row_index_mem_bytes") > 0, "the warm-up built ue's row map: " + std::to_string(status(db, "Asql_row_index_mem_bytes")) + " bytes");
     expect(keyed(db, "UPDATE ue SET v = v + 1 WHERE id = 'k777'") == 1, "a keyed write after the warm-up finds its row");
@@ -171,16 +172,19 @@ int main() {
   }
   {
     // restarted, a keyed write while the map is built (400 ms before it would go in): the write builds its own, the
-    // warm-up's is not put in, and every write stands - read once the warm-up is done (a read during it can miss a
-    // write just made: a separate fault, older than the map built off the lock)
+    // warm-up's is not put in, and every write stands - read back at once, during the warm-up (a thread's RLE run
+    // cursor kept across a column re-encoded in place read such a write back as the old value: asql-rle-check)
     SqlDatabase db(**k);
     db.init("sql_db");
     run(db, "USE updb");
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     expect(keyed(db, "UPDATE ue SET v = 10 WHERE id = 'k1234'") == 1, "a keyed write during the warm-up finds its row");
+    expect(cell(db, "SELECT v FROM ue WHERE id = 'k1234'") == "10", "read back at once during the warm-up: " + cell(db, "SELECT v FROM ue WHERE id = 'k1234'"));
+    expect(keyed(db, "UPDATE ue SET v = v + 1 WHERE id = 'k777'") == 1, "a second keyed write during the warm-up");
+    expect(cell(db, "SELECT v FROM ue WHERE id = 'k777'") == "4", "read back at once: " + cell(db, "SELECT v FROM ue WHERE id = 'k777'"));
     db.wait_warm_up();
     expect(cell(db, "SELECT v FROM ue WHERE id = 'k1234'") == "10", "the write during the warm-up stands: " + cell(db, "SELECT v FROM ue WHERE id = 'k1234'"));
-    expect(keyed(db, "UPDATE ue SET v = v + 1 WHERE id = 'k777'") == 1 && cell(db, "SELECT v FROM ue WHERE id = 'k777'") == "4", "k777 is 4 after it");
+    expect(cell(db, "SELECT v FROM ue WHERE id = 'k777'") == "4", "k777 is 4 after the warm-up");
     expect(cell(db, "SELECT COUNT(*) FROM ue WHERE v > 1") == "3", "three rows changed in all: " + cell(db, "SELECT COUNT(*) FROM ue WHERE v > 1"));
     expect(cell(db, "SELECT COUNT(*) FROM ue") == "200000", "200000 rows");
   }

@@ -1,4 +1,5 @@
 // Comprehensive test suite for ColumnStore Compact RLE
+#include <filesystem>
 #include <iostream>
 #include <cstdio>
 #include <chrono>
@@ -285,6 +286,51 @@ void test_query_and_checkpoint() {
   std::printf("  [PASS] Queries and checkpoint save/restore verified successfully\n");
 }
 
+
+// A thread's last RLE run (read_code) must not outlive the layout it was read from. Keyed by the column's address
+// alone, it did. A one-run column (200k rows of 1, as INSERT ... VALUES leaves it) read on this thread - the UPDATE
+// below reads it to turn it into a dictionary - re-encoded in place by the next checkpoint to 1 x 777, 2 x 1,
+// 1 x 199222: row 777 read back as 1, and that checkpoint wrote the 1 to the store, so a restart lost the write too.
+void test_cursor_across_reencode() {
+  std::printf("--- Test 9: a write read back after a checkpoint re-encodes its column in place ---\n");
+  const std::string root = "/tmp/aios-asql-rle-cursor-test";
+  std::filesystem::remove_all(root);
+  KernelConfig cfg;
+  cfg.root = root;
+  auto k_res = Kernel::boot(cfg);
+  TEST_ASSERT(k_res.ok());
+  auto v_of = [](SqlDatabase& db, const char* id) {
+    SqlQueryResult r = db.execute_local_query(std::string("SELECT v FROM rc WHERE id = '") + id + "'");
+    return r.success && !r.rows.empty() ? sql_display(r.rows[0].values[0]) : std::string("?");
+  };
+  {
+    SqlDatabase db(**k_res);
+    db.init("sql_db");
+    db.execute_local_query("CREATE TABLE rc (id VARCHAR(24) PRIMARY KEY, v INT)");
+    for (int b = 0; b < 200000; b += 4000) {
+      std::string sql = "INSERT INTO rc VALUES ";
+      for (int i = b; i < b + 4000; ++i) sql += std::string(i == b ? "" : ",") + "('k" + std::to_string(i) + "',1)";
+      TEST_ASSERT(db.execute_local_query(sql).success);
+    }
+    TEST_ASSERT(db.execute_local_query("UPDATE rc SET v = 2 WHERE id = 'k777'").rows_affected == 1);
+    TEST_ASSERT(v_of(db, "k777") == "2");
+    TEST_ASSERT(db.execute_local_query("FLUSH TABLES").success);   // re-encodes rc.v in place
+    const std::string after = v_of(db, "k777");
+    std::printf("  k777 after the checkpoint: %s (want 2)\n", after.c_str());
+    TEST_ASSERT(after == "2");
+    SqlQueryResult n = db.execute_local_query("SELECT COUNT(*) FROM rc WHERE v = 2");
+    TEST_ASSERT(n.success && sql_display(n.rows[0].values[0]) == "1");
+  }
+  {
+    SqlDatabase db(**k_res);   // from the store that checkpoint wrote
+    db.init("sql_db");
+    const std::string after = v_of(db, "k777");
+    std::printf("  k777 after a restart: %s (want 2)\n", after.c_str());
+    TEST_ASSERT(after == "2");
+  }
+  std::filesystem::remove_all(root);
+}
+
 int main() {
   std::printf("=== Running ColumnStore Compact RLE Suite ===\n");
   test_single_run();
@@ -295,6 +341,7 @@ int main() {
   test_mutation_materialization();
   test_scan_and_get_speed();
   test_query_and_checkpoint();
+  test_cursor_across_reencode();
   std::printf("=== ALL COMPACT RLE TESTS PASSED! ===\n");
   return 0;
 }
