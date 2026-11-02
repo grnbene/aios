@@ -44419,7 +44419,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
                       const std::vector<bool>& join_is_left, const SqlExpr* where, const EvalCtx* outer_scope,
                       const uint32_t* base, size_t nbase, std::vector<std::vector<uint32_t>>* P,
                       std::unordered_set<const SqlExpr*>& pushed, std::string* err, StarShape* shape,
-                      std::shared_ptr<StarExpansion>* deferred = nullptr) {
+                      std::shared_ptr<StarExpansion>* deferred = nullptr, std::vector<const SqlExpr*>* cross_on = nullptr) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_STAR_JOIN"); return v && *v == '0'; }();
   if (off || join_conditions.empty() || nbase < 256 || sources.size() > 8) return false;
   for (const auto& s : sources) if (!s.table || s.table->inferred_types) return false;
@@ -44469,15 +44469,23 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
       uint32_t m = 0;
       if (!reads(pc, &m)) return false;
       if (m == (1u << js)) { st.filters.push_back(pc); continue; }
-      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) return false;
+      // An inner join's condition on the joined table and those before it that is no key equality
+      // (`s.shipdate > o.orddate + INTERVAL 3 DAY`): to an inner join an ON part is a WHERE part, so it is handed
+      // back (cross_on) to be applied over the star's rows as one. A LEFT join's decides its padding: refused.
+      auto cross = [&]() {
+        if (!cross_on || join_is_left[j] || (m & (1u << js)) == 0 || (m >> (js + 1)) != 0) return false;
+        cross_on->push_back(pc);
+        return true;
+      };
+      if (!pc || pc->op != ExprOp::Eq || pc->args.size() != 2) { if (cross()) continue; return false; }
       const SqlExpr* a = pc->args[0].get();
       const SqlExpr* b = pc->args[1].get();
-      if (!a || !b || a->op != ExprOp::Column || b->op != ExprOp::Column) return false;
+      if (!a || !b || a->op != ExprOp::Column || b->op != ExprOp::Column) { if (cross()) continue; return false; }
       size_t sa = 0, ca = 0, sb = 0, cb = 0;
       if (lookup_column_here(all, *a, &sa, &ca) != ColumnLookup::Found ||
           lookup_column_here(all, *b, &sb, &cb) != ColumnLookup::Found) return false;
       if (sb == js && sa < js) { std::swap(sa, sb); std::swap(ca, cb); }
-      if (!(sa == js && sb < js)) return false;
+      if (!(sa == js && sb < js)) { if (cross()) continue; return false; }
       if (have_key) {   // a further key: of the same parent, at most three in all
         if (sb != st.parent_src || st.extra.size() >= 2 || static_star_comp_off()) return false;
         st.extra.emplace_back(ca, cb);
@@ -52794,8 +52802,31 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
     bool may_group = !group_by.empty();
     for (const SelectItem& it : items) if (it.expr && expr_has_aggregate(it.expr)) may_group = true;
     for (const SelectItem& it : items) if (it.star) may_group = false;
+    std::vector<const SqlExpr*> cross_on;
     if (star_join(db, sources, join_conditions, join_is_left, where.get(), outer_scope, bp, bn, &star_cols, star_pushed, &serr,
-                  &star_shape, sql_pipe_on() && may_group ? &star_def : nullptr)) {
+                  &star_shape, sql_pipe_on() && may_group ? &star_def : nullptr, &cross_on)) {
+      // the inner joins' cross-table ON parts: this run's WHERE parts from here (the parsed WHERE is shared and left
+      // as it is; the parts keep their own nodes, held through their ON clause)
+      if (!cross_on.empty()) {
+        ExprPtr w = where;
+        for (const SqlExpr* pc : cross_on) {
+          ExprPtr part;
+          for (const auto& jc : join_conditions)
+            if (jc) {
+              std::vector<const SqlExpr*> cs;
+              collect_conjuncts(jc.get(), &cs);
+              if (std::find(cs.begin(), cs.end(), pc) != cs.end()) { part = ExprPtr(jc, const_cast<SqlExpr*>(pc)); break; }
+            }
+          if (!part) { part = clone_expr(pc); }
+          if (!w) { w = part; continue; }
+          auto a = std::make_shared<SqlExpr>();
+          a->op = ExprOp::And;
+          a->args = {w, part};
+          a->source_text = w->source_text + " AND " + part->source_text;
+          w = a;
+        }
+        where = w;
+      }
       base_ids_only = false;
       std::vector<uint32_t>().swap(base_ids);
       star_done = true;
