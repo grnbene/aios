@@ -2988,6 +2988,27 @@ class SqlDatabase {
   std::string effective_database() const;
   SqlQueryResult execute_query(const std::string& sql_query, const std::string& session_db = "");
   SqlQueryResult execute_local_query(const std::string& sql_query, const std::string& session_db = "");
+  // The same, for a caller that wants a SELECT's numbers as numbers (grain's sql()): where the engine produced the
+  // rows as typed columns, they come back in *cols (cols->filled, the result's rows left empty) instead of being
+  // printed to text for the caller to parse back. Each column is the same answer the rows would have held: an
+  // Int column of an INT, DOUBLE or DECIMAL result is the integer each cell's text spells, a Double column of a
+  // DOUBLE or DECIMAL result the double each cell's text reads back as (a double prints as its shortest text that
+  // does), and anything else Text, the cells themselves. A statement that is not a SELECT or WITH at its top, or
+  // a select that could not give its rows so, answers as execute_local_query does.
+  struct ResultColumns {
+    enum Kind : uint8_t { Text, Int, Double };
+    struct Col {
+      Kind kind = Text;
+      std::vector<int64_t> i;        // Int
+      std::vector<double> f;         // Double
+      std::vector<std::string> s;    // Text: the cell, sql_null() for NULL
+      std::vector<uint8_t> nul;      // Int, Double: 1 where the cell is NULL
+    };
+    bool filled = false;
+    size_t rows = 0;
+    std::vector<Col> cols;
+  };
+  SqlQueryResult execute_local_query_columns(const std::string& sql_query, ResultColumns* cols);
   // The same, without the out-of-memory guard (the guarded entry points wrap these).
   SqlQueryResult execute_local_query_unguarded(const std::string& sql_query, const std::string& session_db = "");
   SqlQueryResult execute_gateway_query_unguarded(const std::string& sql_query, const std::string& session_db = "");

@@ -28,6 +28,43 @@ Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const
 namespace psm {
 Val as_returns_type(const Val& v, const std::string& returns);
 
+// AIOS_ROUTINE_PROFILE=1: every statement a stored routine runs timed (inclusive of what it calls), by its text as
+// written, and the most expensive printed to stderr when the process ends - what a game tic of 9,000 lines spends
+// its time on, which no single statement's trace shows.
+struct RoutineProfile {
+  struct Entry { uint64_t ns = 0, calls = 0, worst = 0; };
+  std::mutex mu;
+  std::unordered_map<std::string, Entry> by_text;
+  static bool on() { static const bool v = std::getenv("AIOS_ROUTINE_PROFILE") != nullptr; return v; }
+  static RoutineProfile& get() { static RoutineProfile p; return p; }
+  void add(const std::string& sql, uint64_t ns) {
+    std::string key;
+    key.reserve(160);
+    bool space = false;
+    for (char c : sql) {
+      if (key.size() >= 150) break;
+      if (c == '\n' || c == '\r' || c == '\t' || c == ' ') { space = true; continue; }
+      if (space && !key.empty()) key.push_back(' ');
+      space = false;
+      key.push_back(c);
+    }
+    std::lock_guard<std::mutex> g(mu);
+    Entry& e = by_text[key];
+    e.ns += ns;
+    ++e.calls;
+    e.worst = std::max(e.worst, ns);
+  }
+  ~RoutineProfile() {
+    if (by_text.empty()) return;
+    std::vector<std::pair<std::string, Entry>> v(by_text.begin(), by_text.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    std::fprintf(stderr, "[routine profile] %zu statements; the most time first (inclusive ms, calls, ms a call, worst ms)\n", v.size());
+    for (size_t i = 0; i < v.size() && i < 40; ++i)
+      std::fprintf(stderr, "  %9.1f %7llu %8.3f %8.2f  %s\n", v[i].second.ns / 1e6, (unsigned long long)v[i].second.calls,
+                   v[i].second.ns / 1e6 / (double)v[i].second.calls, v[i].second.worst / 1e6, v[i].first.c_str());
+  }
+};
+
 struct Node;
 using Nodes = std::vector<Node>;
 
@@ -613,7 +650,10 @@ struct Run {
       ~ChangesData() { tls_stmt_changes_data = was; }
     } changes_data;
     tls_stmt_changes_data = sql_statement_changes_data(bound);
+    const bool prof = RoutineProfile::on();
+    const auto p0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     *res = db.execute_local_query_unguarded(bound, session_db);
+    if (prof) RoutineProfile::get().add(sql, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - p0).count());
     if (!res->success) {
       // AIOS_ROUTINE_TRACE=1: the statement a routine failed on, as it ran (its variables bound), to stderr.
       static const bool trace = std::getenv("AIOS_ROUTINE_TRACE") != nullptr;
@@ -707,7 +747,31 @@ struct Run {
     return true;
   }
 
-  bool eval_scalar(const std::string& expr_str, Val* out) {
+  // The fast path below works an expression out as it parses it, so a stored function in it runs the moment it is
+  // read - and when the fast path then gave up (a builtin it does not have, further along) or the function failed,
+  // eval() ran the whole expression again as a SELECT: the function's writes happened twice, and the second run,
+  // seeing the first's rows, could take another branch and succeed, so the error was lost (pr_tic's DO
+  // pr_business(..) inserted an order, failed on its lines, and returned as if nothing had gone wrong). So an
+  // expression that calls a stored function is first read through with each call standing in as NULL; only if that
+  // gets to the end is it worked out for real, once, and a failure of a function then is the expression's error.
+  bool scalar_probe_ = false;   // reading through: a stored function is not run
+  bool scalar_calls_ = false;   // the read-through met a stored function
+  std::string scalar_err_;      // a stored function the real pass ran failed with this
+  bool eval_scalar(const std::string& expr_str, Val* out, std::string* err) {
+    scalar_probe_ = true;
+    scalar_calls_ = false;
+    Val probe;
+    const bool ok = eval_scalar_pass(expr_str, &probe);
+    scalar_probe_ = false;
+    if (!ok) return false;                         // not one for the fast path: the caller runs it, once
+    if (!scalar_calls_) { *out = probe; return true; }   // nothing ran that the read-through stood in for
+    scalar_err_.clear();
+    if (eval_scalar_pass(expr_str, out)) return true;
+    *err = scalar_err_.empty() ? "could not evaluate " + trim(expr_str) : scalar_err_;
+    return false;
+  }
+
+  bool eval_scalar_pass(const std::string& expr_str, Val* out) {
     std::string s = trim(expr_str);
     if (s.empty()) { *out = val_null(); return true; }
     if (!s.empty() && (std::isalpha((unsigned char)s[0]) || s[0] == '_')) {
@@ -1042,13 +1106,13 @@ struct Run {
             }
             auto fn = db.find_program('F', name);
             if (fn) {
+              if (scalar_probe_) { scalar_calls_ = true; *v = val_null(); return true; }
               std::string ferr;
               Val r = sql_run_function(db, *fn, args, session_db, &ferr);
-              if (ferr.empty() && !r.null) {
-                doom_const_cache[cname] = r.num;
-                *v = r;
-                return true;
-              }
+              if (!ferr.empty()) { scalar_err_ = ferr; return false; }
+              if (!r.null) doom_const_cache[cname] = r.num;
+              *v = r;
+              return true;
             }
           }
           if (up == "GREATEST") {
@@ -1109,9 +1173,10 @@ struct Run {
           }
           auto fn = db.find_program('F', name);
           if (fn) {
+            if (scalar_probe_) { scalar_calls_ = true; *v = val_null(); return true; }
             std::string ferr;
             Val r = sql_run_function(db, *fn, args, session_db, &ferr);
-            if (!ferr.empty()) return false;
+            if (!ferr.empty()) { scalar_err_ = ferr; return false; }
             *v = r;
             return true;
           }
@@ -1131,7 +1196,9 @@ struct Run {
 
   bool eval(const std::string& expr, Val* out, Condition* cond) {
     if (trim(expr).empty()) { *out = val_null(); return true; }
-    if (eval_scalar(expr, out)) return true;
+    std::string serr;
+    if (eval_scalar(expr, out, &serr)) return true;
+    if (!serr.empty()) { cond->kind = Condition::Exception; cond->message = serr; return false; }
     SqlQueryResult r;
     if (!exec("SELECT " + expr, &r, cond)) return false;
     *out = cell_val(r, 0, 0);

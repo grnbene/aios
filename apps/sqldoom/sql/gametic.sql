@@ -757,7 +757,7 @@ BEGIN
            COALESCE(ps.position_y, t.y)::float8 AS py,
            COS(RADIANS(COALESCE(ps.view_angle, t.angle)::float8)) AS dx,
            SIN(RADIANS(COALESCE(ps.view_angle, t.angle)::float8)) AS dy,
-           GREATEST(v_use_range, 200.0::double precision) AS use_range
+           GREATEST(v_use_range, 250.0::double precision) AS use_range
     FROM game_tic_commands g
     JOIN things t ON t.map_id=g.map_id AND t.id=g.player_thing_id
     LEFT JOIN player_state ps ON ps.map_id=g.map_id AND ps.player_thing_id=g.player_thing_id
@@ -3490,7 +3490,7 @@ BEGIN
   ),
   numbered AS (
     SELECT a.*,COALESCE((SELECT MAX(projectile_id)
-           FROM monster_projectiles mp WHERE mp.map_id=a.map_id),0)
+           FROM monster_projectiles mp WHERE mp.map_id=a_map_id),0)
            +ROW_NUMBER() OVER (ORDER BY player_thing_id) AS projectile_id
     FROM aimed a
   )
@@ -3501,7 +3501,12 @@ BEGIN
          speed*COS(angle),speed*SIN(angle),
          speed*COALESCE((tz-sz)/NULLIF(along,0),0.0),
          sector_id,'fly',0,damage::smallint,FALSE
-  FROM numbered;
+  FROM numbered
+  ON CONFLICT (map_id, projectile_id) DO UPDATE SET
+    owner_thing_id=EXCLUDED.owner_thing_id, projectile_type=EXCLUDED.projectile_type,
+    x=EXCLUDED.x, y=EXCLUDED.y, z=EXCLUDED.z, vx=EXCLUDED.vx, vy=EXCLUDED.vy, vz=EXCLUDED.vz,
+    sector_id=EXCLUDED.sector_id, state=EXCLUDED.state, age=EXCLUDED.age, damage=EXCLUDED.damage,
+    impact_player=EXCLUDED.impact_player;
   -- swept collision against actors/player/walls
   WITH
   params AS (SELECT a_map_id::int AS map_id,a_player_thing_id::int AS player_thing_id),
@@ -3616,7 +3621,8 @@ BEGIN
          f.x+n.t*f.vx,f.y+n.t*f.vy,f.z+n.t*f.vz,
          n.target_player,n.target_thing_id,
          CASE WHEN n.target_player THEN n.target_thing_id END
-  FROM nearest n JOIN flying f ON f.projectile_id=n.projectile_id;
+  FROM nearest n JOIN flying f ON f.projectile_id=n.projectile_id
+  ON CONFLICT (map_id, projectile_id) DO NOTHING;
   -- direct player-projectile damage
   INSERT INTO projectile_damage
     (map_id,projectile_id,damage_kind,hit_index,thing_id,damage)
@@ -3627,7 +3633,8 @@ BEGIN
   WHERE i.map_id=a_map_id::int
     AND i.target_thing_id IS NOT NULL
     AND i.projectile_type IN ('rocket','plasma','bfg',
-                              'imp_fireball','baron_fireball','caco_fireball');
+                              'imp_fireball','baron_fireball','caco_fireball')
+  ON CONFLICT (map_id, projectile_id, damage_kind, hit_index) DO NOTHING;
   -- rocket radius damage
   WITH
   params AS (SELECT a_map_id::int AS map_id),
@@ -3680,7 +3687,8 @@ BEGIN
   INSERT INTO projectile_damage
     (map_id,projectile_id,damage_kind,hit_index,thing_id,damage)
   SELECT map_id,projectile_id,'splash',thing_id,thing_id,damage
-  FROM radial WHERE damage>0;
+  FROM radial WHERE damage>0
+  ON CONFLICT (map_id, projectile_id, damage_kind, hit_index) DO NOTHING;
   -- BFG spray, 40 rays across 90 degrees
   WITH
   params AS (SELECT a_map_id::int AS map_id),
@@ -3765,7 +3773,8 @@ BEGIN
          (SELECT SUM(doom_prandom(h.thing_id, h.projectile_id*64 + h.ray_index,
                                  h.spray_random_base + g.i) % h.dmg_dice_count + 1)
          FROM generate_series(0, h.spray_dice - 1) g(i))
-  FROM hits h;
+  FROM hits h
+  ON CONFLICT (map_id, projectile_id, damage_kind, hit_index) DO NOTHING;
   -- apply accumulated actor damage
   UPDATE thing_health h
   SET health=h.health-d.damage,alive=h.health-d.damage>0
@@ -8008,6 +8017,8 @@ BEGIN
       DO doom_cs_sound(a_map_id,a_p4);
     END IF;
     SET v_fired = v_fired | 65536::bigint;
+  ELSE
+    UPDATE monster_ai SET fired_this_tick=FALSE WHERE map_id=a_map_id AND fired_this_tick;
   END IF;
   DO doom_cs_monsters(a_map_id,v_pm);
   SET v_fired = v_fired | 131072::bigint;

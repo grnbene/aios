@@ -1,0 +1,51 @@
+# Running a file of SQL statements through sql().
+
+# Whether only spaces, then a line break, a -- comment or the end, follow position i.
+fn ends_line(text, i) {
+  while i < len(text) and (slice(text, i, i + 1) == " " or slice(text, i, i + 1) == "\t") { i = i + 1 }
+  return i >= len(text) or slice(text, i, i + 1) == "\n" or slice(text, i, i + 2) == "--"
+}
+
+# A file of statements, split at `sep` (";" or ";;") where it ends a line outside quotes and comments.
+fn run_sql_file(path, sep) {
+  let text = read_file(path)
+  let stmts = []
+  let cur = ""
+  let quote = ""
+  let i = 0
+  let n = len(text)
+  while i < n {
+    let c = slice(text, i, i + 1)
+    if quote != "" {
+      cur = cur + c
+      if c == quote {
+        if slice(text, i + 1, i + 2) == quote { cur = cur + quote
+                                                 i = i + 1 }
+        else { quote = "" }
+      }
+      i = i + 1
+      continue
+    }
+    if c == "-" and slice(text, i, i + 2) == "--" {
+      let e = index_of(text, "\n", i)
+      if e < 0 { e = n }
+      i = e
+      continue
+    }
+    if c == "'" or c == "\"" or c == "`" { quote = c }
+    if slice(text, i, i + len(sep)) == sep and ends_line(text, i + len(sep)) {
+      if trim(cur) != "" { push(stmts, trim(cur)) }
+      cur = ""
+      i = i + len(sep)
+      continue
+    }
+    cur = cur + c
+    i = i + 1
+  }
+  if trim(cur) != "" { push(stmts, trim(cur)) }
+  for s in stmts {
+    let r = pcall(sql, s)
+    if not r.ok { error(basename(path) + ": " + str(r.error) + "\n  in: " + slice(s, 0, 200)) }
+  }
+  return len(stmts)
+}

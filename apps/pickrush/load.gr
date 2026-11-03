@@ -1,0 +1,18 @@
+# Pick Rush: make database `pickrush` and build the warehouse in it, from nothing.
+#
+#   aios --root R grain run --steps 0 apps/pickrush/load.gr
+#
+# Run again to start over: every table is dropped and built afresh.
+import { run_sql_file } from "lib/sqlfile.gr"
+
+let here = abspath(env("PICKRUSH_DIR", "apps/pickrush"))
+sql("CREATE DATABASE IF NOT EXISTS pickrush")
+sql("USE pickrush")
+for f in ["schema.sql", "build_world.sql", "tic.sql"] {
+  let t0 = clock()
+  let n = run_sql_file(path_join(here, "sql/" + f), ";;")
+  print(format("{}: {} statements, {:.0f} ms", f, n, clock() - t0))
+}
+let c = sql("SELECT (SELECT COUNT(*) FROM parts) AS parts, (SELECT COUNT(*) FROM slots) AS slots, " +
+            "(SELECT COUNT(*) FROM entities WHERE kind = 'pallet') AS pallets, (SELECT COUNT(*) FROM solids) AS solids")[0]
+print(format("warehouse: {} parts, {} slots, {} pallets, {} solid boxes", c.parts, c.slots, c.pallets, c.solids))

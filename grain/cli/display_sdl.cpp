@@ -357,10 +357,15 @@ class SdlDisplay final : public g::Display {
   }
 
   bool loop(g::Vm& vm, const g::DisplayRun& opts, std::string& error) {
-    constexpr uint32_t kFrameMs = 16;   // about 60 frames a second
+    // 60 frames a second, on a schedule: each frame is due 1/60 s after the one before, by the high-resolution
+    // clock. A whole-millisecond budget (16) per frame, slept with SDL_Delay - which on macOS wakes a millisecond or
+    // so late - made every frame about 17 ms however little it cost: 57-58 frames a second.
+    const uint64_t hz = SDL_GetPerformanceFrequency();
+    const uint64_t period = hz / 60;
+    uint64_t due = SDL_GetPerformanceCounter();
     size_t scripted = 0;
     for (int64_t frame = 0; opts.max_frames <= 0 || frame < opts.max_frames; ++frame) {
-      const uint32_t started = SDL_GetTicks();
+      due += period;
       if (!sync(vm, error)) return false;
       if (windows_.empty()) return true;   // every pane closed: run_panes() is done
       if (scripted < opts.script.size() && !push_scripted(vm, opts.script[scripted++], error)) return false;
@@ -371,8 +376,14 @@ class SdlDisplay final : public g::Display {
       { std::string timer_error; g::run_timers(vm, timer_error); if (!timer_error.empty()) { error = "run_panes(): " + timer_error; return false; } }   // data that changes on its own; the draw below shows it
       for (auto& [id, w] : windows_)
         if (!draw(vm, id, w, error)) return false;
-      const uint32_t spent = SDL_GetTicks() - started;
-      if (spent < kFrameMs) SDL_Delay(kFrameMs - spent);
+      // Sleep while more than 2 ms remain (a late wake still lands before the frame is due), then yield until it is.
+      // A frame that ran past its time takes the next slot from now: a stall is not made up for with a burst.
+      for (uint64_t now = SDL_GetPerformanceCounter(); now < due; now = SDL_GetPerformanceCounter()) {
+        const uint64_t left_ms = (due - now) * 1000 / hz;
+        SDL_Delay(left_ms > 2 ? static_cast<uint32_t>(left_ms - 2) : 0);
+      }
+      const uint64_t now = SDL_GetPerformanceCounter();
+      if (now - due > period) due = now;
     }
     return true;
   }

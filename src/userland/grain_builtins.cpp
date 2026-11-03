@@ -4185,6 +4185,43 @@ Value bi_canvas_set_pixels(Vm&, std::vector<Value>& args, std::string& error) {
   return args[0];
 }
 
+Value bi_canvas_set_indexed_pixels(Vm&, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_set_indexed_pixels");
+  if (!cv) return Value::nil();
+  if (args[1].type != Type::Str && args[1].type != Type::Bytes) {
+    error = "canvas_set_indexed_pixels() wants bytes or string";
+    return Value::nil();
+  }
+  const uint8_t* d = args[1].type == Type::Bytes ? args[1].bytes_data().data() : reinterpret_cast<const uint8_t*>(args[1].str().data());
+  size_t n = args[1].type == Type::Bytes ? args[1].bytes_data().size() : args[1].str().size();
+
+  const size_t total_px = cv->pixels.size();
+  std::memset(cv->pixels.data(), 0, total_px * sizeof(uint32_t));
+
+  const size_t count = n / 5;
+  for (size_t i = 0; i < count; ++i) {
+    const uint8_t* p = d + i * 5;
+    size_t idx = (size_t(p[0]) << 8) | size_t(p[1]);
+    if (idx < total_px) {
+      cv->pixels[idx] = 0xFF000000u | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 8) | uint32_t(p[4]);
+    }
+  }
+
+  // 1-pass hole fill: if any pixel was missed by ray-casting, copy from left or above
+  for (size_t i = 0; i < total_px; ++i) {
+    if ((cv->pixels[i] >> 24) == 0) {
+      if (i > 0 && (cv->pixels[i - 1] >> 24) != 0) {
+        cv->pixels[i] = cv->pixels[i - 1];
+      } else if (i >= cv->width && (cv->pixels[i - cv->width] >> 24) != 0) {
+        cv->pixels[i] = cv->pixels[i - cv->width];
+      } else {
+        cv->pixels[i] = 0xFF000000u;
+      }
+    }
+  }
+  return args[0];
+}
+
 // image_decode(data) -> a canvas holding the picture (PNG, JPEG, GIF, BMP); data is bytes or a string of them.
 Value bi_image_decode(Vm&, std::vector<Value>& args, std::string& error) {
   ByteSpan in;
@@ -4259,88 +4296,144 @@ Value bi_canvas_set_image_smoothing(Vm&, std::vector<Value>& args, std::string& 
 Value bi_canvas_postprocess_modern(Vm&, std::vector<Value>& args, std::string& error) {
   auto cv = get_canvas(args[0], error, "canvas_postprocess_modern");
   if (!cv) return Value::nil();
-  double bloom_strength = args.size() > 1 ? args[1].as_double() : 0.40;
-  double vignette = args.size() > 2 ? args[2].as_double() : 0.22;
+  double bloom_strength = args.size() > 1 ? args[1].as_double() : 0.35;
+  double vignette = args.size() > 2 ? args[2].as_double() : 0.20;
 
   const int w = (int)cv->width;
   const int h = (int)cv->height;
   if (w <= 0 || h <= 0) return args[0];
 
+  const int total = w * h;
+  static thread_local std::vector<uint32_t> s_orig;
+  static thread_local std::vector<uint32_t> s_filtered;
+  static thread_local std::vector<uint16_t> s_bloom_r, s_bloom_g, s_bloom_b;
+  static thread_local std::vector<uint16_t> s_hblur_r, s_hblur_g, s_hblur_b;
+
+  if ((int)s_orig.size() < total) {
+    s_orig.resize(total);
+    s_filtered.resize(total);
+    s_bloom_r.resize(total);
+    s_bloom_g.resize(total);
+    s_bloom_b.resize(total);
+    s_hblur_r.resize(total);
+    s_hblur_g.resize(total);
+    s_hblur_b.resize(total);
+  }
+
+  std::memcpy(s_orig.data(), cv->pixels.data(), total * sizeof(uint32_t));
+
+  // Pass 1: Edge-preserving bilateral reconstruction
+  // Eliminates 1993 8-bit palette checkerboard dithering while keeping wall/door/monster silhouette edges crisp!
+  for (int y = 0; y < h; ++y) {
+    const int row = y * w;
+    const int row_prev = (y > 0) ? (y - 1) * w : row;
+    const int row_next = (y < h - 1) ? (y + 1) * w : row;
+
+    for (int x = 0; x < w; ++x) {
+      uint32_t c0 = s_orig[row + x];
+      int r0 = (c0 >> 16) & 0xFF;
+      int g0 = (c0 >> 8) & 0xFF;
+      int b0 = c0 & 0xFF;
+      uint32_t a0 = (c0 >> 24) & 0xFF;
+
+      int total_r = r0 * 4;
+      int total_g = g0 * 4;
+      int total_b = b0 * 4;
+      int weight_sum = 4;
+
+      // Sample 4 cross neighbors
+      int left_x = (x > 0) ? x - 1 : x;
+      int right_x = (x < w - 1) ? x + 1 : x;
+
+      auto blend_neighbor = [&](uint32_t nc) {
+        int nr = (nc >> 16) & 0xFF;
+        int ng = (nc >> 8) & 0xFF;
+        int nb = nc & 0xFF;
+        int diff = std::abs(r0 - nr) + std::abs(g0 - ng) + std::abs(b0 - nb);
+        if (diff < 42) {
+          int w_n = (42 - diff);
+          total_r += nr * w_n;
+          total_g += ng * w_n;
+          total_b += nb * w_n;
+          weight_sum += w_n;
+        }
+      };
+
+      blend_neighbor(s_orig[row + left_x]);
+      blend_neighbor(s_orig[row + right_x]);
+      blend_neighbor(s_orig[row_prev + x]);
+      blend_neighbor(s_orig[row_next + x]);
+
+      int fr = total_r / weight_sum;
+      int fg = total_g / weight_sum;
+      int fb = total_b / weight_sum;
+
+      s_filtered[row + x] = (a0 << 24) | ((uint32_t)fr << 16) | ((uint32_t)fg << 8) | (uint32_t)fb;
+
+      // Emissive extraction (ceiling fluorescent lights, computer panels, toxic slime pools)
+      int lum = (fr * 77 + fg * 150 + fb * 29) >> 8;
+      bool is_slime = (fg > 75 && fg > (fr * 11 >> 3) && fg > (fb * 12 >> 3));
+      if (lum > 165 || is_slime) {
+        int boost = is_slime ? 120 : (lum - 165);
+        s_bloom_r[row + x] = (uint16_t)std::min(255, (fr * boost) >> 7);
+        s_bloom_g[row + x] = (uint16_t)std::min(255, (fg * boost) >> 7);
+        s_bloom_b[row + x] = (uint16_t)std::min(255, (fb * boost) >> 7);
+      } else {
+        s_bloom_r[row + x] = 0;
+        s_bloom_g[row + x] = 0;
+        s_bloom_b[row + x] = 0;
+      }
+    }
+  }
+
+  // Pass 2: Fast separable Gaussian bloom blur (radius 5)
+  for (int y = 0; y < h; ++y) {
+    const int row = y * w;
+    for (int x = 0; x < w; ++x) {
+      int sr = 0, sg = 0, sb = 0;
+      int x0 = std::max(0, x - 5);
+      int x1 = std::min(w - 1, x + 5);
+      for (int kx = x0; kx <= x1; ++kx) {
+        sr += s_bloom_r[row + kx];
+        sg += s_bloom_g[row + kx];
+        sb += s_bloom_b[row + kx];
+      }
+      int cnt = x1 - x0 + 1;
+      s_hblur_r[row + x] = (uint16_t)(sr / cnt);
+      s_hblur_g[row + x] = (uint16_t)(sg / cnt);
+      s_hblur_b[row + x] = (uint16_t)(sb / cnt);
+    }
+  }
+
+  // Pass 3: Vertical blur + Specular micro-relief + Tone mapping + Vignette
   const double cx = w * 0.5;
   const double cy = h * 0.5;
-  const double max_dist_sq = (cx * cx + cy * cy);
+  const double max_dist_sq = cx * cx + cy * cy;
 
-  // Buffer for emissive bloom & ambient occlusion
-  std::vector<uint32_t> orig(cv->pixels.begin(), cv->pixels.end());
-  std::vector<uint16_t> bloom_r(w * h, 0);
-  std::vector<uint16_t> bloom_g(w * h, 0);
-  std::vector<uint16_t> bloom_b(w * h, 0);
-
-  // Pass 1: Extract emissive highlights (lights, consoles, slime, fire, eyes)
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      uint32_t px = orig[(size_t)y * w + x];
-      int r = (px >> 16) & 0xFF;
-      int g = (px >> 8) & 0xFF;
-      int b = px & 0xFF;
-      int lum = (r * 77 + g * 150 + b * 29) >> 8;
-      if (lum > 135) {
-        int excess = lum - 135;
-        bloom_r[y * w + x] = (uint16_t)((r * excess) >> 7);
-        bloom_g[y * w + x] = (uint16_t)((g * excess) >> 7);
-        bloom_b[y * w + x] = (uint16_t)((b * excess) >> 7);
-      }
+  // Precomputed filmic contrast LUT
+  static bool lut_init = false;
+  static uint8_t lut[256];
+  if (!lut_init) {
+    for (int i = 0; i < 256; ++i) {
+      double norm = i / 255.0;
+      // S-curve contrast with preserved shadows and highlights
+      double sc = norm * norm * (3.0 - 2.0 * norm);
+      double mapped = norm * 0.35 + sc * 0.65;
+      lut[i] = (uint8_t)std::clamp((int)(mapped * 255.0 + 0.5), 0, 255);
     }
+    lut_init = true;
   }
 
-  // Pass 2: Fast separable 2-pass Gaussian bloom (horizontal then vertical)
-  std::vector<uint16_t> hblur_r(w * h, 0), hblur_g(w * h, 0), hblur_b(w * h, 0);
   for (int y = 0; y < h; ++y) {
-    const int row_off = y * w;
-    for (int x = 0; x < w; ++x) {
-      int sr = 0, sg = 0, sb = 0;
-      int x_min = std::max(0, x - 4);
-      int x_max = std::min(w - 1, x + 4);
-      for (int kx = x_min; kx <= x_max; ++kx) {
-        int idx = row_off + kx;
-        sr += bloom_r[idx];
-        sg += bloom_g[idx];
-        sb += bloom_b[idx];
-      }
-      int count = x_max - x_min + 1;
-      hblur_r[row_off + x] = (uint16_t)(sr / count);
-      hblur_g[row_off + x] = (uint16_t)(sg / count);
-      hblur_b[row_off + x] = (uint16_t)(sb / count);
-    }
-  }
-
-  std::vector<uint16_t> blur_r(w * h, 0), blur_g(w * h, 0), blur_b(w * h, 0);
-  for (int y = 0; y < h; ++y) {
-    int y_min = std::max(0, y - 4);
-    int y_max = std::min(h - 1, y + 4);
-    int count = y_max - y_min + 1;
-    for (int x = 0; x < w; ++x) {
-      int sr = 0, sg = 0, sb = 0;
-      for (int ky = y_min; ky <= y_max; ++ky) {
-        int idx = ky * w + x;
-        sr += hblur_r[idx];
-        sg += hblur_g[idx];
-        sb += hblur_b[idx];
-      }
-      blur_r[y * w + x] = (uint16_t)(sr / count);
-      blur_g[y * w + x] = (uint16_t)(sg / count);
-      blur_b[y * w + x] = (uint16_t)(sb / count);
-    }
-  }
-
-  // Pass 3: Edge-aware SSAO contact shadows, HDR emissive bloom & ACES color grading
-  for (int y = 0; y < h; ++y) {
-    uint32_t* row = &cv->pixels[(size_t)y * w];
-    double dy = (y - cy);
-    double dy_sq = dy * dy;
+    uint32_t* dst_row = &cv->pixels[(size_t)y * w];
+    const double dy = (y - cy);
+    const double dy_sq = dy * dy;
+    const int y0 = std::max(0, y - 5);
+    const int y1 = std::min(h - 1, y + 5);
+    const int cnt_y = y1 - y0 + 1;
 
     for (int x = 0; x < w; ++x) {
-      uint32_t px = orig[(size_t)y * w + x];
+      uint32_t px = s_filtered[(size_t)y * w + x];
       uint32_t a = (px >> 24) & 0xFF;
       if (a == 0) continue;
 
@@ -4348,75 +4441,52 @@ Value bi_canvas_postprocess_modern(Vm&, std::vector<Value>& args, std::string& e
       int g = (px >> 8) & 0xFF;
       int b = px & 0xFF;
 
-      // Screen-space Ambient Occlusion & Edge Detail Enhancement
+      // Emissive bloom blur sample
+      int br_sum = 0, bg_sum = 0, bb_sum = 0;
+      for (int ky = y0; ky <= y1; ++ky) {
+        int idx = ky * w + x;
+        br_sum += s_hblur_r[idx];
+        bg_sum += s_hblur_g[idx];
+        bb_sum += s_hblur_b[idx];
+      }
+      int bl_r = (int)((br_sum / cnt_y) * bloom_strength);
+      int bl_g = (int)((bg_sum / cnt_y) * bloom_strength);
+      int bl_b = (int)((bb_sum / cnt_y) * bloom_strength);
+
+      // Specular surface normal glint on metallic surfaces
       if (x > 0 && x < w - 1 && y > 0 && y < h - 1) {
-        uint32_t p_left = orig[(size_t)y * w + (x - 1)];
-        uint32_t p_right = orig[(size_t)y * w + (x + 1)];
-        uint32_t p_up = orig[(size_t)(y - 1) * w + x];
-        uint32_t p_down = orig[(size_t)(y + 1) * w + x];
+        uint32_t left = s_filtered[y * w + (x - 1)];
+        uint32_t right = s_filtered[y * w + (x + 1)];
+        uint32_t up = s_filtered[(y - 1) * w + x];
+        uint32_t down = s_filtered[(y + 1) * w + x];
 
-        int l_cur = (r * 77 + g * 150 + b * 29) >> 8;
-        int l_left = (((p_left >> 16) & 0xFF) * 77 + ((p_left >> 8) & 0xFF) * 150 + (p_left & 0xFF) * 29) >> 8;
-        int l_right = (((p_right >> 16) & 0xFF) * 77 + ((p_right >> 8) & 0xFF) * 150 + (p_right & 0xFF) * 29) >> 8;
-        int l_up = (((p_up >> 16) & 0xFF) * 77 + ((p_up >> 8) & 0xFF) * 150 + (p_up & 0xFF) * 29) >> 8;
-        int l_down = (((p_down >> 16) & 0xFF) * 77 + ((p_down >> 8) & 0xFF) * 150 + (p_down & 0xFF) * 29) >> 8;
+        int l_l = (((left >> 16) & 0xFF) * 77 + ((left >> 8) & 0xFF) * 150 + (left & 0xFF) * 29) >> 8;
+        int l_r = (((right >> 16) & 0xFF) * 77 + ((right >> 8) & 0xFF) * 150 + (right & 0xFF) * 29) >> 8;
+        int l_u = (((up >> 16) & 0xFF) * 77 + ((up >> 8) & 0xFF) * 150 + (up & 0xFF) * 29) >> 8;
+        int l_d = (((down >> 16) & 0xFF) * 77 + ((down >> 8) & 0xFF) * 150 + (down & 0xFF) * 29) >> 8;
 
-        // Ambient contact shadow along horizontal floor/ceiling/sprite creases
-        int vert_grad = std::abs(l_down - l_up);
-        if (vert_grad > 28 && y > h / 3) {
-          r = (r * 200) >> 8;
-          g = (g * 200) >> 8;
-          b = (b * 200) >> 8;
-        }
+        int gx = l_r - l_l;
+        int gy = l_d - l_u;
 
-        // SSAO depth creasing and micro-contrast
-        int laplacian = (l_cur << 2) - l_left - l_right - l_up - l_down;
-        if (laplacian < -18) {
-          int occl = std::min(60, (-laplacian) * 3 >> 1);
-          r = std::max(0, r - occl);
-          g = std::max(0, g - occl);
-          b = std::max(0, b - occl);
-        } else if (laplacian > 12 && laplacian < 85) {
-          int boost = (laplacian * 45) >> 8;
-          r = std::clamp(r + boost, 0, 255);
-          g = std::clamp(g + boost, 0, 255);
-          b = std::clamp(b + boost, 0, 255);
+        // Light direction from upper-left
+        int dot = (-gx * 3 - gy * 4) >> 3;
+        if (dot > 8) {
+          int spec = std::min(35, (dot * dot) >> 4);
+          r = std::min(255, r + spec);
+          g = std::min(255, g + spec);
+          b = std::min(255, b + spec);
         }
       }
 
-      // Additive emissive bloom light injection
-      if (bloom_strength > 0.0) {
-        int bidx = y * w + x;
-        int br = (int)(blur_r[bidx] * bloom_strength);
-        int bg = (int)(blur_g[bidx] * bloom_strength);
-        int bb = (int)(blur_b[bidx] * bloom_strength);
-        r = std::min(255, r + br);
-        g = std::min(255, g + bg);
-        b = std::min(255, b + bb);
-      }
+      // Add bloom injection
+      r = std::min(255, r + bl_r);
+      g = std::min(255, g + bl_g);
+      b = std::min(255, b + bl_b);
 
-      // Color Vibrancy & Saturation Tuning (Modern 2026 grade)
-      int max_c = std::max({r, g, b});
-      int min_c = std::min({r, g, b});
-      int delta = max_c - min_c;
-      if (delta > 8) {
-        int avg = (r + g + b) / 3;
-        r = std::clamp(avg + ((r - avg) * 310 >> 8), 0, 255);
-        g = std::clamp(avg + ((g - avg) * 310 >> 8), 0, 255);
-        b = std::clamp(avg + ((b - avg) * 310 >> 8), 0, 255);
-      }
-
-      // ACES Filmic Tone Mapping Curve (standard in modern 2026 real-time renderers)
-      float fr = r / 255.0f;
-      float fg = g / 255.0f;
-      float fb = b / 255.0f;
-      auto aces = [](float x) {
-        float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
-        return std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0f, 1.0f);
-      };
-      r = std::clamp((int)(aces(fr) * 255.0f), 0, 255);
-      g = std::clamp((int)(aces(fg) * 255.0f), 0, 255);
-      b = std::clamp((int)(aces(fb) * 255.0f), 0, 255);
+      // S-curve Filmic LUT
+      r = lut[r];
+      g = lut[g];
+      b = lut[b];
 
       // Vignette
       if (vignette > 0.0) {
@@ -4428,9 +4498,301 @@ Value bi_canvas_postprocess_modern(Vm&, std::vector<Value>& args, std::string& e
         b = (int)(b * vig);
       }
 
-      row[x] = (a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+      dst_row[x] = (a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
     }
   }
+  return args[0];
+}
+
+Value bi_canvas_remaster_modern(Vm&, std::vector<Value>& args, std::string& error) {
+  auto dst = get_canvas(args[0], error, "canvas_remaster_modern");
+  if (!dst) return Value::nil();
+  auto src = get_canvas(args[1], error, "canvas_remaster_modern");
+  if (!src) return Value::nil();
+
+  const int dw = (int)dst->width;
+  const int dh = (int)dst->height;
+  const int sw = (int)src->width;
+  const int sh = (int)src->height;
+  if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return args[0];
+
+  double bloom_strength = args.size() > 2 ? args[2].as_double() : 0.35;
+  double spec_strength = args.size() > 3 ? args[3].as_double() : 0.0;
+  (void)spec_strength;
+  double vignette = args.size() > 4 ? args[4].as_double() : 0.14;
+
+  const int total_src = sw * sh;
+
+  // Step 1: Pre-filter source image to suppress 8-bit palette dither while preserving real edges (Bilateral filter)
+  static thread_local std::vector<uint32_t> s_clean_src;
+  static thread_local std::vector<uint8_t> s_is_emissive;
+  if ((int)s_clean_src.size() < total_src) {
+    s_clean_src.resize(total_src);
+    s_is_emissive.resize(total_src);
+  }
+
+  const uint32_t* src_px = src->pixels.data();
+
+  // Dither suppression pass on 320x200
+  for (int y = 0; y < sh; ++y) {
+    const int row = y * sw;
+    const int y_prev = (y > 0) ? (y - 1) * sw : row;
+    const int y_next = (y < sh - 1) ? (y + 1) * sw : row;
+
+    for (int x = 0; x < sw; ++x) {
+      uint32_t c = src_px[row + x];
+      int r = (c >> 16) & 0xFF;
+      int g = (c >> 8) & 0xFF;
+      int b = c & 0xFF;
+      int lum = (r * 77 + g * 150 + b * 29) >> 8;
+
+      // Emissive detection: light sources & terminal monitors
+      bool is_monitor = (g > 140 && g > r * 1.3 && g > b * 1.3) || (b > 160 && b > r * 1.4);
+      bool is_light = (lum > 200);
+      s_is_emissive[row + x] = (is_monitor || is_light) ? 1 : 0;
+
+      // Color grading: transform radioactive neon cobalt blue carpet into elegant slate navy
+      bool is_blue = (b > 70 && b > (r * 11 >> 3) && b > (g * 10 >> 3));
+      if (is_blue) {
+        r = std::clamp((r * 2 + 20) / 3, 10, 65);
+        g = std::clamp((g * 2 + 35) / 3, 15, 85);
+        b = std::clamp((b * 135) >> 8, 30, 115);
+      }
+
+      // Check 4-neighborhood for 8-bit palette dither smoothing
+      const int x_prev = (x > 0) ? x - 1 : x;
+      const int x_next = (x < sw - 1) ? x + 1 : x;
+
+      uint32_t c_u = src_px[y_prev + x];
+      uint32_t c_d = src_px[y_next + x];
+      uint32_t c_l = src_px[row + x_prev];
+      uint32_t c_r = src_px[row + x_next];
+
+      int ru = (c_u >> 16) & 0xFF, gu = (c_u >> 8) & 0xFF, bu = c_u & 0xFF;
+      int rd = (c_d >> 16) & 0xFF, gd = (c_d >> 8) & 0xFF, bd = c_d & 0xFF;
+      int rl = (c_l >> 16) & 0xFF, gl = (c_l >> 8) & 0xFF, bl = c_l & 0xFF;
+      int rr = (c_r >> 16) & 0xFF, gr = (c_r >> 8) & 0xFF, br = c_r & 0xFF;
+
+      int diff_u = std::abs(r - ru) + std::abs(g - gu) + std::abs(b - bu);
+      int diff_d = std::abs(r - rd) + std::abs(g - gd) + std::abs(b - bd);
+      int diff_l = std::abs(r - rl) + std::abs(g - gl) + std::abs(b - bl);
+      int diff_r = std::abs(r - rr) + std::abs(g - gr) + std::abs(b - br);
+      int max_diff = std::max({diff_u, diff_d, diff_l, diff_r});
+
+      // If neighbor variance is low (under 48), this is 8-bit palette dither: smooth it silky smooth!
+      if (max_diff < 48 && !s_is_emissive[row + x]) {
+        r = (r * 4 + ru + rd + rl + rr + 4) / 8;
+        g = (g * 4 + gu + gd + gl + gr + 4) / 8;
+        b = (b * 4 + bu + bd + bl + br + 4) / 8;
+      }
+
+      s_clean_src[row + x] = 0xFF000000u | (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
+    }
+  }
+
+  // Step 2: Downsampled Bloom Buffer (160x120 for fast Gaussian bloom)
+  const int bw = 160;
+  const int bh = 120;
+  const int total_bloom = bw * bh;
+  static thread_local std::vector<uint16_t> s_bloom_r;
+  static thread_local std::vector<uint16_t> s_bloom_g;
+  static thread_local std::vector<uint16_t> s_bloom_b;
+  static thread_local std::vector<uint16_t> s_bloom_tmp_r;
+  static thread_local std::vector<uint16_t> s_bloom_tmp_g;
+  static thread_local std::vector<uint16_t> s_bloom_tmp_b;
+
+  if ((int)s_bloom_r.size() < total_bloom) {
+    s_bloom_r.resize(total_bloom);
+    s_bloom_g.resize(total_bloom);
+    s_bloom_b.resize(total_bloom);
+    s_bloom_tmp_r.resize(total_bloom);
+    s_bloom_tmp_g.resize(total_bloom);
+    s_bloom_tmp_b.resize(total_bloom);
+  }
+
+  const double bx_scale = (double)sw / bw;
+  const double by_scale = (double)sh / bh;
+  for (int by = 0; by < bh; ++by) {
+    int sy = std::min(sh - 1, (int)(by * by_scale));
+    int brow = by * bw;
+    int srow = sy * sw;
+    for (int bx = 0; bx < bw; ++bx) {
+      int sx = std::min(sw - 1, (int)(bx * bx_scale));
+      int sidx = srow + sx;
+      if (s_is_emissive[sidx]) {
+        uint32_t c = s_clean_src[sidx];
+        int r = (c >> 16) & 0xFF;
+        int g = (c >> 8) & 0xFF;
+        int b = c & 0xFF;
+        s_bloom_r[brow + bx] = (uint16_t)(r * 3 >> 2);
+        s_bloom_g[brow + bx] = (uint16_t)(g * 3 >> 2);
+        s_bloom_b[brow + bx] = (uint16_t)(b * 3 >> 2);
+      } else {
+        s_bloom_r[brow + bx] = 0;
+        s_bloom_g[brow + bx] = 0;
+        s_bloom_b[brow + bx] = 0;
+      }
+    }
+  }
+
+  // Gaussian blur horizontal (radius 5)
+  for (int by = 0; by < bh; ++by) {
+    int row = by * bw;
+    for (int bx = 0; bx < bw; ++bx) {
+      int rsum = 0, gsum = 0, bsum = 0;
+      int x0 = std::max(0, bx - 5);
+      int x1 = std::min(bw - 1, bx + 5);
+      for (int kx = x0; kx <= x1; ++kx) {
+        rsum += s_bloom_r[row + kx];
+        gsum += s_bloom_g[row + kx];
+        bsum += s_bloom_b[row + kx];
+      }
+      int cnt = x1 - x0 + 1;
+      s_bloom_tmp_r[row + bx] = (uint16_t)(rsum / cnt);
+      s_bloom_tmp_g[row + bx] = (uint16_t)(gsum / cnt);
+      s_bloom_tmp_b[row + bx] = (uint16_t)(bsum / cnt);
+    }
+  }
+
+  // Gaussian blur vertical (radius 5)
+  for (int bx = 0; bx < bw; ++bx) {
+    for (int by = 0; by < bh; ++by) {
+      int rsum = 0, gsum = 0, bsum = 0;
+      int y0 = std::max(0, by - 5);
+      int y1 = std::min(bh - 1, by + 5);
+      for (int ky = y0; ky <= y1; ++ky) {
+        int idx = ky * bw + bx;
+        rsum += s_bloom_tmp_r[idx];
+        gsum += s_bloom_tmp_g[idx];
+        bsum += s_bloom_tmp_b[idx];
+      }
+      int cnt = y1 - y0 + 1;
+      int idx = by * bw + bx;
+      s_bloom_r[idx] = (uint16_t)(rsum / cnt);
+      s_bloom_g[idx] = (uint16_t)(gsum / cnt);
+      s_bloom_b[idx] = (uint16_t)(bsum / cnt);
+    }
+  }
+
+  // Step 3: ACES Filmic Tone Mapping LUT
+  static bool s_lut_ready = false;
+  static uint8_t s_aces_lut[256];
+  if (!s_lut_ready) {
+    for (int i = 0; i < 256; ++i) {
+      double x = i / 255.0;
+      double a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+      double mapped = std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+      s_aces_lut[i] = (uint8_t)(mapped * 255.0 + 0.5);
+    }
+    s_lut_ready = true;
+  }
+
+  // Step 4: High-Resolution Smooth Upsampling to 1280x960
+  const double inv_dw = (double)sw / dw;
+  const double inv_dh = (double)sh / dh;
+  const double cx = dw * 0.5;
+  const double cy = dh * 0.5;
+  const double max_dist_sq = cx * cx + cy * cy;
+
+  const uint32_t* clean_px = s_clean_src.data();
+  uint32_t* dst_px = dst->pixels.data();
+
+  for (int dy = 0; dy < dh; ++dy) {
+    const double v = (dy + 0.5) * inv_dh - 0.5;
+    const int y0 = std::clamp((int)std::floor(v), 0, sh - 1);
+    const int y1 = std::clamp(y0 + 1, 0, sh - 1);
+    const double fy = std::clamp(v - y0, 0.0, 1.0);
+    const int wy1 = (int)(fy * 256.0 + 0.5);
+    const int wy0 = 256 - wy1;
+
+    const uint32_t* row0 = &clean_px[y0 * sw];
+    const uint32_t* row1 = &clean_px[y1 * sw];
+    uint32_t* dst_row = &dst_px[dy * dw];
+
+    const double bloom_v = (dy + 0.5) * ((double)bh / dh) - 0.5;
+    const int by0 = std::clamp((int)std::floor(bloom_v), 0, bh - 1);
+    const int by1 = std::clamp(by0 + 1, 0, bh - 1);
+    const double f_by = std::clamp(bloom_v - by0, 0.0, 1.0);
+    const int bwy1 = (int)(f_by * 256.0 + 0.5);
+    const int bwy0 = 256 - bwy1;
+    const int brow0 = by0 * bw;
+    const int brow1 = by1 * bw;
+
+    const double delta_y = dy - cy;
+    const double dy_sq = delta_y * delta_y;
+
+    for (int dx = 0; dx < dw; ++dx) {
+      const double u = (dx + 0.5) * inv_dw - 0.5;
+      const int x0 = std::clamp((int)std::floor(u), 0, sw - 1);
+      const int x1 = std::clamp(x0 + 1, 0, sw - 1);
+      const double fx = std::clamp(u - x0, 0.0, 1.0);
+      const int wx1 = (int)(fx * 256.0 + 0.5);
+      const int wx0 = 256 - wx1;
+
+      // Bilinear interpolation from dither-filtered source
+      uint32_t c00 = row0[x0], c10 = row0[x1];
+      uint32_t c01 = row1[x0], c11 = row1[x1];
+
+      int r00 = (c00 >> 16) & 0xFF, g00 = (c00 >> 8) & 0xFF, b00 = c00 & 0xFF;
+      int r10 = (c10 >> 16) & 0xFF, g10 = (c10 >> 8) & 0xFF, b10 = c10 & 0xFF;
+      int r01 = (c01 >> 16) & 0xFF, g01 = (c01 >> 8) & 0xFF, b01 = c01 & 0xFF;
+      int r11 = (c11 >> 16) & 0xFF, g11 = (c11 >> 8) & 0xFF, b11 = c11 & 0xFF;
+
+      int r0 = (r00 * wx0 + r10 * wx1) >> 8;
+      int g0 = (g00 * wx0 + g10 * wx1) >> 8;
+      int b0 = (b00 * wx0 + b10 * wx1) >> 8;
+
+      int r1 = (r01 * wx0 + r11 * wx1) >> 8;
+      int g1 = (g01 * wx0 + g11 * wx1) >> 8;
+      int b1 = (b01 * wx0 + b11 * wx1) >> 8;
+
+      int r = (r0 * wy0 + r1 * wy1) >> 8;
+      int g = (g0 * wy0 + g1 * wy1) >> 8;
+      int b = (b0 * wy0 + b1 * wy1) >> 8;
+
+      // Volumetric Bloom
+      const double bloom_u = (dx + 0.5) * ((double)bw / dw) - 0.5;
+      const int bx0 = std::clamp((int)std::floor(bloom_u), 0, bw - 1);
+      const int bx1 = std::clamp(bx0 + 1, 0, bw - 1);
+      const double f_bx = std::clamp(bloom_u - bx0, 0.0, 1.0);
+      const int bwx1 = (int)(f_bx * 256.0 + 0.5);
+      const int bwx0 = 256 - bwx1;
+
+      int br0 = (s_bloom_r[brow0 + bx0] * bwx0 + s_bloom_r[brow0 + bx1] * bwx1) >> 8;
+      int bg0 = (s_bloom_g[brow0 + bx0] * bwx0 + s_bloom_g[brow0 + bx1] * bwx1) >> 8;
+      int bb0 = (s_bloom_b[brow0 + bx0] * bwx0 + s_bloom_b[brow0 + bx1] * bwx1) >> 8;
+
+      int br1 = (s_bloom_r[brow1 + bx0] * bwx0 + s_bloom_r[brow1 + bx1] * bwx1) >> 8;
+      int bg1 = (s_bloom_g[brow1 + bx0] * bwx0 + s_bloom_g[brow1 + bx1] * bwx1) >> 8;
+      int bb1 = (s_bloom_b[brow1 + bx0] * bwx0 + s_bloom_b[brow1 + bx1] * bwx1) >> 8;
+
+      int bl_r = (int)(((br0 * bwy0 + br1 * bwy1) >> 8) * bloom_strength);
+      int bl_g = (int)(((bg0 * bwy0 + bg1 * bwy1) >> 8) * bloom_strength);
+      int bl_b = (int)(((bb0 * bwy0 + bb1 * bwy1) >> 8) * bloom_strength);
+
+      r = std::min(255, r + bl_r);
+      g = std::min(255, g + bl_g);
+      b = std::min(255, b + bl_b);
+
+      // ACES Filmic Tone Mapping Curve
+      r = s_aces_lut[r];
+      g = s_aces_lut[g];
+      b = s_aces_lut[b];
+
+      // Subtle edge vignette
+      if (vignette > 0.0) {
+        double delta_x = dx - cx;
+        double dist_sq = delta_x * delta_x + dy_sq;
+        double vig = 1.0 - (dist_sq / max_dist_sq) * vignette;
+        r = (int)(r * vig);
+        g = (int)(g * vig);
+        b = (int)(b * vig);
+      }
+
+      dst_row[dx] = (uint32_t)(0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+    }
+  }
+
   return args[0];
 }
 
@@ -7869,6 +8231,7 @@ void install_core_builtins(Vm& vm) {
   install_hash_builtins(vm);
   install_bytes_builtins(vm);
   install_kv_builtins(vm);
+  install_raster3d_builtins(vm);
   install_process_builtins(vm);   // refuses unless the host set Vm::allow_process
   install_regex_builtins(vm);
   install_time_builtins(vm);
@@ -8070,6 +8433,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("canvas_set_pixel", 4, 4, bi_canvas_set_pixel);
   vm.define_native("canvas_get_pixels", 1, 1, bi_canvas_get_pixels);
   vm.define_native("canvas_set_pixels", 2, 2, bi_canvas_set_pixels);
+  vm.define_native("canvas_set_indexed_pixels", 2, 2, bi_canvas_set_indexed_pixels);
   vm.define_native("image_decode", 1, 1, bi_image_decode);
 
   // Styling & Colors
@@ -8082,6 +8446,7 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("canvas_set_image_smoothing", 1, 2, bi_canvas_set_image_smoothing);
   vm.define_native("canvas_image_smoothing", 1, 2, bi_canvas_set_image_smoothing);
   vm.define_native("canvas_postprocess_modern", 1, 3, bi_canvas_postprocess_modern);
+  vm.define_native("canvas_remaster_modern", 2, 5, bi_canvas_remaster_modern);
   vm.define_native("color_rgb", 3, 3, bi_color_rgb);
   vm.define_native("color_rgba", 3, 4, bi_color_rgba);
   vm.define_native("rgb", 3, 3, bi_color_rgb);

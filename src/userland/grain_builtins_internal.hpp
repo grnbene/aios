@@ -63,6 +63,8 @@ void install_process_builtins(Vm& vm);
 void install_doc_builtins(Vm& vm);
 // kv_* (grain_std_kv.cpp); installed with the core builtins.
 void install_kv_builtins(Vm& vm);
+// r3d_* (grain_std_raster3d.cpp): a depth-buffered triangle fill; installed with the core builtins.
+void install_raster3d_builtins(Vm& vm);
 // mail_send (grain_std_mail.cpp); installed by install_http_builtins.
 void install_mail_builtins(Vm& vm);
 

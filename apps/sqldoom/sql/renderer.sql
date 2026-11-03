@@ -328,7 +328,7 @@ heights AS (
     s.b_floor, s.b_ceil, s.b_ceil_tex,
     COALESCE(alb.light_level, s.b_light) AS b_light
   FROM on_screen p
-  JOIN render_segs s ON s.map_id = p.map_id AND s.seg_id + 0 = p.seg_id -- psst, optimizer hack
+  JOIN render_segs s ON s.map_id = p.map_id AND s.seg_id = p.seg_id
   CROSS JOIN frame_clock fc
   LEFT JOIN animated_light alf ON alf.sector_id = s.fsec
   LEFT JOIN animated_light alb ON alb.sector_id = s.bsec
@@ -337,14 +337,14 @@ heights AS (
 seg_light_bias AS (
   -- Doom gives horizontal walls one darker light step and vertical
   -- walls one brighter step, so edges/corners are easier to see
-  SELECT s.seg_id + 0 AS seg_id, s.light_bias -- psst, optimizer hack
+  SELECT s.seg_id AS seg_id, s.light_bias
   FROM render_segs s
   CROSS JOIN render_context rc
   WHERE s.map_id = rc.map_id
 ),
 seg_bsp AS (
   -- which subsector (and thus bsp_seq) each seg belongs to
-  SELECT s.seg_id + 0 AS seg_id, bo.bsp_seq
+  SELECT s.seg_id AS seg_id, bo.bsp_seq
   FROM render_segs s
   JOIN bsp_order bo ON bo.ssector_id = s.ssector_id
   CROSS JOIN render_context rc
@@ -769,7 +769,7 @@ plane_spans_raw AS (
                    rs0.cy - rs0.focal * (k0.carried_ceil_z - c0.pz)
                            / rs0.max_plane_depth, k0.f_ceil_y_f))
       END
-    ))) AS SIGNED) - 1 AS y1
+    ))) AS SIGNED) AS y1
     FROM panel_clips k0 CROSS JOIN render_settings rs0 CROSS JOIN cam c0
   ) k
   CROSS JOIN render_settings rs
@@ -802,7 +802,7 @@ plane_spans_raw AS (
                       rs0.cy - rs0.focal * (k0.carried_floor_z - c0.pz)
                               / rs0.max_plane_depth, k0.f_floor_y_f))
       END
-    ))) AS SIGNED) + 1 AS y0
+    ))) AS SIGNED) AS y0
     FROM panel_clips k0 CROSS JOIN render_settings rs0 CROSS JOIN cam c0
   ) k
   CROSS JOIN render_settings rs
@@ -821,10 +821,10 @@ plane_spans_raw AS (
     FALSE AS is_sky,
     'floor' AS plane,
     0 AS source_priority,
-    CASE WHEN np.depth_x IS NULL THEN CAST(FLOOR(rs.cy) AS SIGNED) + 1
+    CASE WHEN np.depth_x IS NULL THEN CAST(FLOOR(rs.cy) AS SIGNED)
          ELSE CAST(FLOOR(LEAST(rs.screen_h - 1.0, GREATEST(0.0,
            rs.cy - rs.focal * (ps.floor_height - c.pz) / np.depth_x
-         ))) AS SIGNED) + 1
+         ))) AS SIGNED)
     END AS y0,
     rs.screen_h - 1 AS y1
   FROM render_settings rs
@@ -843,10 +843,10 @@ plane_spans_raw AS (
     'ceil' AS plane,
     0 AS source_priority,
     0 AS y0,
-    CASE WHEN np.depth_x IS NULL THEN CAST(CEIL(rs.cy) AS SIGNED) - 1
+    CASE WHEN np.depth_x IS NULL THEN CAST(CEIL(rs.cy) AS SIGNED)
          ELSE CAST(CEIL(LEAST(rs.screen_h - 1.0, GREATEST(0.0,
            rs.cy - rs.focal * (ps.ceil_height - c.pz) / np.depth_x
-         ))) AS SIGNED) - 1
+         ))) AS SIGNED)
     END AS y1
   FROM render_settings rs
   CROSS JOIN cam c

@@ -31,7 +31,10 @@ struct Ins {
     // rounded as the interpreter's CAST rounds it (round_double_scaled), the lane the double that decimal reads as
     // (its digits over 10^s: the nearest double, as parse_number of its text). An exact decimal (dec): only a
     // double's arithmetic, a comparison or a CAST may read it, as a decimal literal's lane is read.
-    CastDec
+    CastDec,
+    // ROUND(x) of a DOUBLE: the double the interpreter's ROUND gives (round_value: half away from zero on its 15
+    // significant digits as written, a rounded zero unsigned), still a DOUBLE
+    RoundF
   } op = Konst;
   Ty ty = Ty::I64;
   bool approx = false;    // the interpreter's Val here would be approximate (a DOUBLE)
@@ -455,10 +458,58 @@ struct Compiler {
       for (uint32_t k = 0; k < P.text_cols.size(); ++k) if (P.text_cols[k] == &cs) { slot = k; break; }
       if (slot == P.text_cols.size()) P.text_cols.push_back(&cs);
       in.slot = slot;
+    } else if (col.type == SqlDataType::Decimal) {
+      // A DECIMAL with places: each value's nearest double, held as a decimal literal's lane is (dec) - only a
+      // double's arithmetic, a comparison or a CAST may read it (numeric_pair keeps it out of exact arithmetic, and
+      // no program's result is one), which is all MariaDB does with it there: DECIMAL beside a DOUBLE is the
+      // DOUBLE's arithmetic on the decimal's double. Only where every value has at most 15 significant digits, so
+      // the doubles keep the decimals' order and no two are equal. A camera's `SET @cy = 3.6` read through a CTE
+      // is such a column, and every expression it met went row by row (a Pick Rush frame: 14 ms of 42).
+      in.ty = Ty::F64;
+      in.dec = true;
+      in.dyadic = false;
+      if (vx::dict_coded(cs) && !cs.shared_dict) {
+        const size_t nd = vx::dict_size(cs);
+        if (nd == 0 || nd > (1u << 20)) return fail("DECIMAL column " + t->name + "." + col.name + ": dictionary too large");
+        for (size_t k = 0; k < nd; ++k) {
+          const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+          if (sql_is_null(d)) continue;
+          if (significant_digits(d) > 15) return fail("DECIMAL column " + t->name + "." + col.name + " finer than a double");
+        }
+        if (!codes_of(cs, false, &in)) return fail("DECIMAL column " + t->name + "." + col.name + " not numbers");
+        in.op = Ins::CodeF;
+      } else if (cs.encoding == ColumnEncoding::DecimalScaled && cs.bit_width_ < 63) {
+        const double lo = (double)cs.base_int64, hi = (double)cs.base_int64 + std::ldexp(1.0, (int)cs.bit_width_);
+        if (std::max(std::fabs(lo), std::fabs(hi)) >= 1e15) return fail("DECIMAL column " + t->name + "." + col.name + " finer than a double");
+        in.op = Ins::ColF;
+      } else {
+        return fail("DECIMAL column " + t->name + "." + col.name);
+      }
     } else {
       return fail("DECIMAL column " + t->name + "." + col.name);
     }
     return emit(std::move(in));
+  }
+
+  // The significant digits of a number's text (3.60 has 2, 0.0036 has 2, 120 has 3), or 99 when it is not plain
+  // decimal digits.
+  static int significant_digits(const std::string& d) {
+    size_t i = 0;
+    if (i < d.size() && (d[i] == '-' || d[i] == '+')) ++i;
+    std::string digits;
+    bool point = false;
+    for (; i < d.size(); ++i) {
+      const char c = d[i];
+      if (c == '.' && !point) { point = true; continue; }
+      if (c < '0' || c > '9') return 99;
+      digits.push_back(c);
+    }
+    const size_t first = digits.find_first_not_of('0');
+    if (first == std::string::npos) return 0;
+    // trailing zeros do not count, in the fraction (3.60) or the whole part (1200 is 12 * 100): the order and the
+    // distinctness of the doubles depend only on how many digits come between the first and last that are not 0
+    const size_t last = digits.find_last_not_of('0');
+    return (int)(last - first + 1);
   }
 
   uint32_t literal(const Val& v) {
@@ -611,11 +662,18 @@ struct Compiler {
           Ins in; in.op = Ins::Add; in.ty = Ty::I64; in.args = {a, kx}; in.day = true; in.dlo = lo; in.dhi = hi;
           return emit(std::move(in));
         }
-        const uint32_t a = compile(e->args[0].get());
-        const uint32_t b = compile(e->args[1].get());
+        uint32_t a = compile(e->args[0].get());
+        uint32_t b = compile(e->args[1].get());
         if (!ok) return 0;
+        // A bit operator's BIGINT UNSIGNED beside a DOUBLE (((color >> 16) & 255) * shade): the DOUBLE's arithmetic
+        // on the unsigned number, as MariaDB does it - converted through CastF, which reads the lane unsigned.
+        if (e->op != ExprOp::Mod) {
+          auto pure_double = [&](uint32_t x) { return at(x).ty == Ty::F64 && at(x).approx && !decimalish(at(x)); };
+          if (at(a).uns && pure_double(b)) a = unary(Ins::CastF, a, Ty::F64, true);
+          else if (at(b).uns && pure_double(a)) b = unary(Ins::CastF, b, Ty::F64, true);
+        }
         Ty ty; bool approx;
-        if (!numeric_pair(a, b, &ty, &approx)) return fail("decimal arithmetic");
+        if (!numeric_pair(a, b, &ty, &approx)) return fail(at(a).uns || at(b).uns ? "unsigned arithmetic" : "decimal arithmetic");
         if (e->op == ExprOp::Div) {
           const bool pure_approx = (at(a).approx && !decimalish(at(a))) || (at(b).approx && !decimalish(at(b)));
           if ((pg_div && !pure_approx) || !approx) return fail(pg_div ? "PG division" : "exact division");   // two exact operands divide as decimals
@@ -817,6 +875,20 @@ struct Compiler {
           if (at(a).uns || is_text(at(a))) return fail("text operand");
           // FLOOR of an exact decimal is an exact integer, of a double a double: the same number, so tainted
           return unary(up == "ABS"sv ? Ins::Abs : up == "FLOOR"sv ? Ins::Floor : Ins::Ceil, a, at(a).ty, at(a).approx, decimalish(at(a)));
+        }
+        if (up == "ROUND"sv) {
+          // ROUND(x) or ROUND(x, 0): of an integer that integer, of a DOUBLE a DOUBLE (RoundF). An exact decimal
+          // rounds on its digits to a decimal: the interpreter's.
+          if (n != 1 && !(n == 2 && e->args[1] && e->args[1]->op == ExprOp::Literal && e->args[1]->literal.numeric &&
+                          !e->args[1]->literal.approx && e->args[1]->literal.str() == "0"))
+            return fail("ROUND to places");
+          const uint32_t a = compile(e->args[0].get());
+          if (!ok) return 0;
+          const Ins& x = at(a);
+          if (x.uns || is_text(x) || x.day) return fail("ROUND operand");
+          if (x.ty == Ty::I64 && !decimalish(x)) return a;
+          if (x.ty == Ty::F64 && x.approx && !decimalish(x)) return unary(Ins::RoundF, a, Ty::F64, true);
+          return fail("ROUND of an exact decimal");
         }
         if (up == "SQRT"sv) return one(Ins::Sqrt, Ty::F64, true);
         if (up == "SIN"sv) return one(Ins::Sin, Ty::F64, true);
@@ -1217,6 +1289,20 @@ struct Lanes {
   }
 };
 
+// A DOUBLE rounded to a whole number as the interpreter rounds it (round_value -> round_double_as_written): half
+// away from zero on its 15 significant digits as written. Writing the double out and reading it back is ~300 ns,
+// so it is done only where it can differ from std::round: a fraction within the rendering's resolution of a half
+// (2.4999999999999996 is written 2.5).
+inline double round_whole_as_written(double a) {
+  const double fl = std::floor(a);
+  const double frac = a - fl;
+  const double tol = std::fabs(a) * 1e-13 + 1e-13;
+  if (frac == 0) return a;
+  if (std::fabs(frac - 0.5) > tol) return std::round(a);
+  Val r;
+  return round_double_as_written(a, 0, &r) ? r.num : std::nearbyint(a);
+}
+
 // Evaluates P over n rows, rowid(j, src) being row j's row in source src (or kNullRow). False with *err set when
 // a value the interpreter would refuse comes up (an integer out of range), and the caller takes the interpreter's
 // path.
@@ -1513,12 +1599,14 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
           // row, so it is done only where it can differ from std::round: a fraction within the rendering's
           // resolution of a half (2.4999999999999996 is written 2.5).
           if (!P.ins[in.args[0]].approx) { vi[j] = (int64_t)std::llround(a); continue; }
-          const double fl = std::floor(a);
-          const double frac = a - fl;
-          const double tol = std::fabs(a) * 1e-13 + 1e-13;
-          if (frac == 0) vi[j] = (int64_t)a;
-          else if (std::fabs(frac - 0.5) > tol) vi[j] = (int64_t)std::round(a);
-          else { Val r; vi[j] = round_double_as_written(a, 0, &r) ? (int64_t)std::llround(r.num) : (int64_t)std::nearbyint(a); }
+          vi[j] = (int64_t)round_whole_as_written(a);
+        }
+        break;
+      case Ins::RoundF:
+        for (size_t j = 0; j < n; ++j) {
+          if (N(0)[j]) { nl[j] = 1; continue; }
+          const double r = round_whole_as_written(F(0)[j]);
+          vf[j] = r == 0 ? 0.0 : r;   // ROUND(-0.4) is 0, not -0 (its text is "0")
         }
         break;
       case Ins::CastF:

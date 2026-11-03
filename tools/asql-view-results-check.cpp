@@ -92,6 +92,24 @@ int main() {
   expect(db, "SELECT COUNT(*) FROM (SELECT * FROM avg_all) x", "1");
   expect(db, "SELECT n FROM avg_all", "158000");
 
+  // A sub-query of the statement reading a view or a WITH's CTE that correlates on its alias (SQLDoom's walk-over
+  // line trigger: EXISTS (... a.line_id = c.line_id) over a merged CTE c failed "no such column: c.line_id").
+  std::printf("a sub-query correlated on a merged view's alias\n");
+  db.execute_local_query("CREATE TABLE ln (map_id INT, id INT, once BOOLEAN)");
+  db.execute_local_query("CREATE TABLE act (map_id INT, line_id INT)");
+  db.execute_local_query("INSERT INTO ln VALUES (1, 10, TRUE), (1, 11, TRUE), (1, 12, FALSE), (2, 13, TRUE)");
+  db.execute_local_query("INSERT INTO act VALUES (1, 10), (1, 12)");
+  db.execute_local_query("CREATE VIEW ln1 AS SELECT ld.id AS line_id, ld.once FROM ln ld WHERE ld.map_id = 1");
+  const std::string crossed =
+      "WITH params AS (SELECT 1 AS map_id), crossed AS (SELECT ld.id AS line_id, ld.once FROM params p JOIN ln ld ON ld.map_id = p.map_id) ";
+  expect(db, crossed + "SELECT GROUP_CONCAT(c.line_id ORDER BY c.line_id) FROM crossed c CROSS JOIN params p "
+             "WHERE NOT (c.once AND EXISTS (SELECT 1 FROM act a WHERE a.map_id = p.map_id AND a.line_id = c.line_id))", "11,12");
+  expect(db, crossed + ", eligible AS (SELECT c.* FROM crossed c CROSS JOIN params p "
+             "WHERE NOT (c.once AND EXISTS (SELECT 1 FROM act a WHERE a.map_id = p.map_id AND a.line_id = c.line_id))) "
+             "SELECT GROUP_CONCAT(e.line_id ORDER BY e.line_id) FROM eligible e CROSS JOIN params p", "11,12");
+  expect(db, "SELECT GROUP_CONCAT(v.line_id ORDER BY v.line_id) FROM ln1 v WHERE v.line_id NOT IN (SELECT a.line_id FROM act a WHERE a.line_id = v.line_id)", "11");
+  expect(db, "SELECT GROUP_CONCAT((SELECT COUNT(*) FROM act a WHERE a.line_id = `v`.line_id) ORDER BY v.line_id) FROM ln1 v", "1,0,1");
+
   std::printf("%s\n", failures ? "FAILED" : "all ok");
   return failures ? 1 : 0;
 }

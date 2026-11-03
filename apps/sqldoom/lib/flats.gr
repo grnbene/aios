@@ -1,0 +1,126 @@
+# Floors and ceilings as triangles, for the 3D renderer (sql/client/geometry.sql): each subsector's convex
+# polygon, fanned into ssector_tris. Doom's BSP leaves have no polygons of their own (its software renderer never
+# needed them): a subsector is the part of the map on its side of every partition line above it, and inside every
+# one of its segs, so its polygon is the map's bounds clipped by each partition on the path from the root and then
+# by each seg (the subsector lies to the right of a seg, as it lies on the chosen side of a partition).
+#
+#   build_ssector_tris(map_id) -> how many triangles it stored (the map's old ones replaced)
+
+# A number as a DOUBLE literal (12.5e0; 1e-05 as it is).
+fn dbl(x) {
+  let s = str(x)
+  return (index_of(s, "e") >= 0 or index_of(s, "E") >= 0) ? s : s + "e0"
+}
+
+# The part of a convex polygon (a list of [x, y]) where a x + b y + c >= 0.
+fn clip_poly(poly, a, b, c) {
+  let out = []
+  let n = len(poly)
+  if n == 0 { return out }
+  let i = 0
+  while i < n {
+    let p = poly[i]
+    let q = poly[(i + 1) % n]
+    let dp = a * p[0] + b * p[1] + c
+    let dq = a * q[0] + b * q[1] + c
+    if dp >= -0.001e0 { push(out, p) }
+    if (dp >= -0.001e0) != (dq >= -0.001e0) {
+      let k = dp / (dp - dq)
+      push(out, [p[0] + (q[0] - p[0]) * k, p[1] + (q[1] - p[1]) * k])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn ensure_ssector_tris_table() {
+  sql("CREATE TABLE IF NOT EXISTS ssector_tris (map_id INT NOT NULL, ssector_id INT NOT NULL, t INT NOT NULL, " +
+      "sector_id INT NOT NULL, x0 DOUBLE NOT NULL, y0 DOUBLE NOT NULL, x1 DOUBLE NOT NULL, y1 DOUBLE NOT NULL, " +
+      "x2 DOUBLE NOT NULL, y2 DOUBLE NOT NULL, PRIMARY KEY (map_id, ssector_id, t))")
+}
+
+fn build_ssector_tris(map_id) {
+  let m = str(map_id)
+  ensure_ssector_tris_table()
+  sql("DELETE FROM ssector_tris WHERE map_id = " + m)
+  let vx = {}
+  let lo_x = 1e9
+  let lo_y = 1e9
+  let hi_x = -1e9
+  let hi_y = -1e9
+  for v in sql("SELECT id, x, y FROM vertexes WHERE map_id = " + m) {
+    vx[str(v.id)] = v
+    lo_x = min(lo_x, v.x)
+    lo_y = min(lo_y, v.y)
+    hi_x = max(hi_x, v.x)
+    hi_y = max(hi_y, v.y)
+  }
+  let nodes = {}
+  for n in sql("SELECT id, x, y, dx, dy FROM nodes WHERE map_id = " + m) { nodes[str(n.id)] = n }
+  let paths = {}
+  for s in sql("SELECT ssector_id, depth, node_id, side FROM node_path_steps WHERE map_id = " + m + " ORDER BY ssector_id, depth") {
+    let k = str(s.ssector_id)
+    if not has(paths, k) { paths[k] = [] }
+    push(paths[k], s)
+  }
+  # each seg with its ends and the sector in front of it
+  let segs = {}
+  let q = "SELECT sg.id, sg.v1_id, sg.v2_id, sd.sector_id FROM segs sg " +
+          "JOIN linedefs ld ON ld.map_id = sg.map_id AND ld.id = sg.linedef_id " +
+          "JOIN sidedefs sd ON sd.map_id = sg.map_id AND sd.id = (CASE WHEN sg.direction = 0 THEN ld.right_sd_id ELSE ld.left_sd_id END) " +
+          "WHERE sg.map_id = " + m
+  for s in sql(q) { segs[str(s.id)] = s }
+  let rows = []
+  let skipped = 0
+  for ss in sql("SELECT id, first_seg_id, seg_count FROM ssectors WHERE map_id = " + m + " ORDER BY id") {
+    # (all as doubles: a decimal literal is exact in grain, and clipping it again and again grows past 38 digits)
+    let x_lo = real(lo_x - 64)
+    let y_lo = real(lo_y - 64)
+    let x_hi = real(hi_x + 64)
+    let y_hi = real(hi_y + 64)
+    let poly = [[x_lo, y_lo], [x_hi, y_lo], [x_hi, y_hi], [x_lo, y_hi]]
+    for st in get(paths, str(ss.id), []) {
+      let n = nodes[str(st.node_id)]
+      # the right side of the partition (x, y) + t (dx, dy): dy (X - x) - dx (Y - y) >= 0; the left the other way
+      let a = real(n.dy)
+      let b = real(-n.dx)
+      let c = real(-(n.dy * n.x - n.dx * n.y))
+      if st.side == "L" {
+        a = -a
+        b = -b
+        c = -c
+      }
+      poly = clip_poly(poly, a, b, c)
+    }
+    let sector = nil
+    for k in range(ss.first_seg_id, ss.first_seg_id + ss.seg_count) {
+      let sg = get(segs, str(k), nil)
+      if sg == nil { continue }
+      if sector == nil { sector = sg.sector_id }
+      let p1 = vx[str(sg.v1_id)]
+      let p2 = vx[str(sg.v2_id)]
+      let dx = real(p2.x - p1.x)
+      let dy = real(p2.y - p1.y)
+      poly = clip_poly(poly, dy, -dx, -(dy * real(p1.x) - dx * real(p1.y)))
+    }
+    if sector == nil or len(poly) < 3 {
+      skipped = skipped + 1
+      continue
+    }
+    for i in range(1, len(poly) - 1) {
+      let a = poly[0]
+      let b = poly[i]
+      let c = poly[i + 1]
+      let area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+      if abs(area) < 0.01e0 { continue }
+      push(rows, format("({}, {}, {}, {}, {}, {}, {}, {}, {}, {})", map_id, ss.id, i, sector, dbl(a[0]), dbl(a[1]), dbl(b[0]), dbl(b[1]), dbl(c[0]), dbl(c[1])))
+    }
+  }
+  let i = 0
+  while i < len(rows) {
+    sql("INSERT INTO ssector_tris (map_id, ssector_id, t, sector_id, x0, y0, x1, y1, x2, y2) VALUES " + join(slice(rows, i, i + 400), ", "))
+    i = i + 400
+  }
+  if skipped > 0 { print(format("ssector_tris: {} subsector(s) left no polygon", skipped)) }
+  return len(rows)
+}

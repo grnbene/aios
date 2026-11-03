@@ -1,0 +1,95 @@
+# SQLDoom's 3D renderer, the client half: the WAD's pictures uploaded once as true-colour textures, and each frame
+# the sky, the triangles sql/client/geometry.sql works out for the camera, and the weapon (sql/client/psprite.sql),
+# filled by the r3d builtins at the target's own size. Replaces the 320x200 SQL software renderer for play.gr's
+# modern mode (sql/renderer.sql stays the classic one).
+import { build_ssector_tris, ensure_ssector_tris_table } from "flats.gr"
+
+# A number as a DOUBLE literal (12.5e0): `SET @x = 12.5` would be a DECIMAL, which the frame's arithmetic then
+# works out exactly, row by row.
+fn r3d_dbl(x) {
+  let s = str(x)
+  return (index_of(s, "e") >= 0 or index_of(s, "E") >= 0 or index_of(s, "n") >= 0) ? s : s + "e0"
+}
+
+# The renderer for map_id on a w x h target: textures loaded, floors triangulated (once per map, kept in
+# ssector_tris). Returns the state draw_3d_frame takes.
+fn r3d_doom_open(here, map_id, w, h) {
+  let t0 = clock()
+  let t = r3d_target(w, h)
+  # Doom's pixels are 1.2 times as tall as wide (320x200 on a 4:3 screen): the same here, so the world keeps its
+  # proportions, and the horizontal field of view stays Doom's 90 degrees
+  r3d_options(t, {"y_scale": 1.2, "bilinear": true, "mipmaps": true})
+  let pal = bytes(768)
+  for c in sql("SELECT palette_index, r, g, b FROM colormap_rgb WHERE pal = 0 AND level = 0 ORDER BY palette_index") {
+    bytes_set(pal, c.palette_index * 3, "u8", c.r)
+    bytes_set(pal, c.palette_index * 3 + 1, "u8", c.g)
+    bytes_set(pal, c.palette_index * 3 + 2, "u8", c.b)
+  }
+  let n = 0
+  for x in sql("SELECT tex_id, width, height, palette_indices FROM walltex_meta") {
+    r3d_texture(t, x.tex_id, x.width, x.height, x.palette_indices, pal)
+    n = n + 1
+  }
+  for f in sql("SELECT flat_id, palette_indices FROM flat_textures") {
+    r3d_texture(t, 10000 + f.flat_id, 64, 64, f.palette_indices, pal)
+    n = n + 1
+  }
+  let dims = {}
+  for d in sql("SELECT lump_name, MAX(width) AS w, MAX(height) AS h FROM sprite_frames GROUP BY lump_name") { dims[d.lump_name] = d }
+  for s in sql("SELECT lump_name, lump_id, pixels, mask FROM sprite_lumps") {
+    let d = get(dims, s.lump_name, nil)
+    if d == nil { continue }
+    r3d_texture(t, 20000 + s.lump_id, d.w, d.h, s.pixels, pal, s.mask)
+    n = n + 1
+  }
+  let sky = sql(format("SELECT wm.tex_id FROM maps m JOIN walltex_meta wm ON wm.name = m.sky_texture WHERE m.map_id = {}", map_id))
+  # floors and ceilings: the subsectors' polygons, worked out once a map and checkpointed
+  ensure_ssector_tris_table()
+  let built = false
+  if sql(format("SELECT COUNT(*) AS n FROM ssector_tris WHERE map_id = {}", map_id))[0].n == 0 {
+    build_ssector_tris(map_id)
+    pcall(sql, "FLUSH TABLES")
+    built = true
+  }
+  print(format("3d renderer: {} textures{}, {:.0f} ms", n, built ? ", floors triangulated" : "", clock() - t0))
+  return {"t": t, "w": w, "h": h, "map_id": map_id, "sky": len(sky) > 0 ? sky[0].tex_id : nil,
+          "geo": read_file(path_join(here, "sql/client/geometry.sql")),
+          "psprite": read_file(path_join(here, "sql/client/psprite.sql")),
+          "canvas": canvas_create(w, h), "tris": 0, "sql_ms": 0.0, "fill_ms": 0.0}
+}
+
+# A tic's scene, worked out in SQL: run by the tic's worker (play.gr) right after the tic, so no frame waits on the
+# database. `sq` is the SQL call to use (the worker's own), pose the camera at the tic (x, y, z eye, angle in
+# degrees), tic the gameplay clock. Returns the triangles (world points, sql/client/geometry.sql) and the weapon's
+# layers (sql/client/psprite.sql) for r3d_doom_draw.
+fn r3d_doom_scene(sq, geo, psprite, map_id, player, skill, pose, tic) {
+  sq(format("SET @map_id = {}, @player_thing_id = {}, @skill = {}, @x = {}, @y = {}, @z = {}, @angle = {}, @tic = {}",
+            map_id, player, skill, r3d_dbl(pose.x), r3d_dbl(pose.y), r3d_dbl(pose.z), r3d_dbl(pose.angle), int(tic)))
+  let t0 = clock()
+  let tris = sq(geo)
+  let weapon = sq(psprite)
+  return {"map_id": map_id, "tris": tris, "weapon": weapon, "sql_ms": clock() - t0}
+}
+
+# One frame into state.canvas: a tic's scene (r3d_doom_scene) seen from the camera where it is now (x, y, z eye,
+# angle in degrees) - natively, no SQL.
+fn r3d_doom_draw(st, scene, pose) {
+  let t = st.t
+  let t1 = clock()
+  # the scene, then the sky where the scene left nothing (r3d_sky reads the depth)
+  if st.sky != nil { r3d_clear_depth(t) } else { r3d_clear(t, 0) }
+  r3d_draw_tex(t, scene.tris, 90, {"x": pose.x * 1.0e0, "y": pose.y * 1.0e0, "z": pose.z * 1.0e0, "angle": pose.angle * 1.0e0})
+  if st.sky != nil { r3d_sky(t, st.sky, pose.angle, 90) }
+  # the weapon, on Doom's 320x200 screen scaled to the target
+  let kx = st.w / 320.0e0
+  let ky = st.h / 200.0e0
+  for wl in scene.weapon {
+    let light = wl.fullbright ? 255 : min(255, (wl.light == nil ? 160 : wl.light) + 40)
+    r3d_blit(t, 20000 + wl.lump_id, wl.x * kx, wl.y * ky, wl.width * kx, wl.height * ky, light)
+  }
+  canvas_set_pixels(st.canvas, r3d_pixels(t))
+  st.tris = len(scene.tris)
+  st.sql_ms = scene.sql_ms
+  st.fill_ms = clock() - t1
+  return st.canvas
+}

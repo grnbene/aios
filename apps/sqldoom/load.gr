@@ -422,4 +422,6 @@ sql("UPDATE linedefs ld JOIN line_special_defs d ON d.special = ld.special " +
     "ld.monster_crossable = d.monster_crossable, ld.scrolls = d.scrolls")
 progress("Building derived tables...")
 run_sql_file(path_join(here, "sql/derived.sql"), ";")
+progress("Flushing database tables to disk...")
+sql("FLUSH TABLES")
 progress("Import complete in " + format("{:.1f}", (clock() - started) / 1000) + "s.")

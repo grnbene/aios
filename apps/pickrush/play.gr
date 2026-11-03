@@ -1,0 +1,269 @@
+# Pick Rush: drive a forklift round a 3D warehouse, ship the orders and put away what comes in. The game is in ASQL:
+# every tic is the stored function pr_tic (sql/tic.sql), every frame's triangles one query (sql/frame.sql); this file
+# is input, timing, the camera and the HUD, and r3d_draw fills the triangles.
+#
+#   aios --root R grain run --steps 0 apps/pickrush/load.gr      (once, or to start over)
+#   aios --root R grain serve apps/pickrush/play.gr               (the pane in a browser)
+#
+# Keys: W/S or Up/Down drive, A/D or Left/Right steer, R and F raise and lower the forks, Space picks up or sets
+# down, C switches between the chase camera and the cab.
+#
+# PICKRUSH_FRAMES=n runs n tics and frames with no display and saves the last to PICKRUSH_SHOT (default
+# pickrush.png), with the keys in PICKRUSH_KEYS held throughout (e.g. "up,r"); PICKRUSH_CAM=cab starts in the cab.
+let W = 960
+let H = 600
+let FOV = 75.0
+let TIC_MS = 1000.0 / 30.0
+let here = abspath(env("PICKRUSH_DIR", "apps/pickrush"))
+
+sql("USE pickrush")
+let have = sql("SELECT COUNT(*) AS n FROM game")
+if len(have) == 0 or have[0].n == 0 { error("no game here: run apps/pickrush/load.gr first") }
+let frame_sql = read_file(path_join(here, "sql/frame.sql"))
+
+let target = r3d_target(W, H)
+let frame = canvas_create(W, H)
+let held = {}
+let pending_action = false
+let cam_mode = env("PICKRUSH_CAM", "chase")
+let tan_half = tan(FOV * 3.141592653589793 / 360.0)
+
+# The last tic's state for the HUD, read once a tic.
+let hud = {"tic": 0, "score": 0, "shipped": 0, "late": 0, "putaways": 0}
+let orders = []
+let events = []
+let carry = nil
+let hint = ""
+let me = {"x": 32.0, "z": 18.0, "yaw": 0.0, "fork_h": 0.0}
+let prev_me = me
+let last_tic_ms = clock()
+let sim_start = nil
+let sim_tics = 0
+let timing = {"tic": 0.0, "frame_sql": 0.0, "fill": 0.0, "hud": 0.0, "tris": 0}
+
+# A number as a DOUBLE literal (31.5e0): `SET @v = 31.5` makes @v a DECIMAL, as MySQL does, and a camera at
+# 1.5707963267948966 is a 17-digit decimal that every expression it meets must then work out exactly, row by row.
+fn dbl(x) {
+  let s = str(x)
+  return (index_of(s, "e") >= 0 or index_of(s, "E") >= 0) ? s : s + "e0"
+}
+
+fn down(k) { return get(held, k, false) }
+fn axis(plus, minus) { return (plus ? 1 : 0) - (minus ? 1 : 0) }
+
+fn read_state() {
+  let t0 = clock()
+  prev_me = me
+  me = sql("SELECT x, z, yaw, fork_h FROM entities WHERE entity_id = 1")[0]
+  hud = sql("SELECT tic, score, shipped, late, putaways FROM game WHERE id = 1")[0]
+  orders = sql("SELECT o.order_id, o.due_tic, l.line_no, l.sku, l.need, l.picked FROM orders o " +
+               "JOIN order_lines l ON l.order_id = o.order_id WHERE o.status = 'open' ORDER BY o.due_tic, o.order_id, l.line_no")
+  events = sql("SELECT msg FROM events ORDER BY event_id DESC LIMIT 4")
+  let c = sql("SELECT sku, zone FROM entities WHERE carried_by = 1")
+  carry = len(c) > 0 ? c[0] : nil
+  # what is in front of the forks: the slot (and whether the forks are at its height), or the dock
+  let fx = me.x + sin(me.yaw) * 1.45
+  let fz = me.z + cos(me.yaw) * 1.45
+  # the slot the forks are nearest, if one is close ahead: how far it is along and across the forks, the forks'
+  # height against it, and how far the truck is from square to the rack (north or south)
+  let s = sql(format("SELECT label, pallet_id, x, y, z FROM slots WHERE POW(x - {}, 2) + POW(z - {}, 2) < 6.25 " +
+                     "ORDER BY POW(x - {}, 2) + POW(z - {}, 2), ABS(y - {}) LIMIT 1", dbl(fx), dbl(fz), dbl(fx), dbl(fz), dbl(me.fork_h)))
+  if len(s) > 0 {
+    let sl = s[0]
+    let dx = sl.x - fx
+    let dz = sl.z - fz
+    let ahead = dx * sin(me.yaw) + dz * cos(me.yaw)
+    let across = dx * cos(me.yaw) - dz * sin(me.yaw)
+    let up = sl.y - me.fork_h
+    # how far round from north or south, whichever is nearer, in degrees
+    let off = wrap_angle(me.yaw)
+    if off > 1.5707963 { off = off - 3.141592653589793 }
+    if off < -1.5707963 { off = off + 3.141592653589793 }
+    let parts = []
+    if abs(off) > 0.33 { push(parts, format("turn {} {:.0f} deg", off > 0 ? "left" : "right", abs(off) * 57.3)) }
+    if abs(across) > 0.3 { push(parts, format("{:.1f} m {}", abs(across), across > 0 ? "right" : "left")) }
+    if ahead > 0.3 { push(parts, format("{:.1f} m ahead", ahead)) }
+    if abs(up) > 0.3 { push(parts, format("forks {} {:.1f} m", up > 0 ? "up" : "down", abs(up))) }
+    hint = sl.label + (sl.pallet_id == nil ? " (empty)" : " (full)") + ":  " + (len(parts) == 0 ? "lined up - Space" : join(parts, ", "))
+  } else if fx >= 34 and fx <= 42 and fz >= 26 and fz <= 34 {
+    hint = "SHIPPING DOCK"
+  } else if fx >= 34 and fx <= 42 and fz >= 2 and fz <= 10 {
+    hint = "RECEIVING"
+  } else {
+    hint = ""
+  }
+  timing.hud = clock() - t0
+}
+
+fn run_tic() {
+  let thr = axis(down("w") or down("up"), down("s") or down("down"))
+  let steer = axis(down("d") or down("right"), down("a") or down("left"))
+  let lift = axis(down("r") or down("pageup"), down("f") or down("pagedown"))
+  let act = pending_action ? 1 : 0
+  pending_action = false
+  let t0 = clock()
+  sql(format("SELECT pr_tic({}, {}, {}, {}) AS t", thr, steer, lift, act))
+  timing.tic = clock() - t0
+  last_tic_ms = clock()
+  read_state()
+}
+
+fn run_due_tics() {
+  let now = clock()
+  if sim_start == nil {
+    sim_start = now
+    sim_tics = 0
+  }
+  let want = int((now - sim_start) / TIC_MS)
+  # at most two tics a frame: a slow frame slows the game down rather than piling tics up behind it
+  let n = 0
+  while sim_tics < want and n < 2 {
+    run_tic()
+    sim_tics = sim_tics + 1
+    n = n + 1
+  }
+  if sim_tics < want { sim_tics = want }
+}
+
+fn wrap_angle(a) {
+  let d = a
+  while d > 3.141592653589793 { d = d - 6.283185307179586 }
+  while d < -3.141592653589793 { d = d + 6.283185307179586 }
+  return d
+}
+
+fn lerp_angle(a, b, t) {
+  let d = b - a
+  while d > 3.141592653589793 { d = d - 6.283185307179586 }
+  while d < -3.141592653589793 { d = d + 6.283185307179586 }
+  return a + d * t
+}
+
+fn render_frame() {
+  # the pose between the last two tics, by how far into this tic the clock is
+  let t = min(1.0, (clock() - last_tic_ms) / TIC_MS)
+  let x = prev_me.x + (me.x - prev_me.x) * t
+  let z = prev_me.z + (me.z - prev_me.z) * t
+  let yaw = lerp_angle(prev_me.yaw, me.yaw, t)
+  let cx = 0.0
+  let cy = 0.0
+  let cz = 0.0
+  let pitch = 0.0
+  if cam_mode == "cab" {
+    cx = x - sin(yaw) * 0.35
+    cz = z - cos(yaw) * 0.35
+    cy = 1.95
+    pitch = 0.10
+  } else {
+    # above the racks (4.6 m) and behind, looking down into the aisle: lower, a rack row would fill the view
+    cx = min(43.4, max(0.6, x - sin(yaw) * 5.0))
+    cz = min(35.4, max(0.6, z - cos(yaw) * 5.0))
+    cy = 5.6
+    pitch = 0.62
+  }
+  let t0 = clock()
+  sql(format("SET @cx = {}, @cy = {}, @cz = {}, @cyaw = {}, @cpitch = {}, @tanh = {}, @far = 70e0", dbl(cx), dbl(cy), dbl(cz), dbl(yaw), dbl(pitch), dbl(tan_half)))
+  let tris = sql(frame_sql)
+  timing.frame_sql = clock() - t0
+  let t1 = clock()
+  r3d_clear(target, 0x1c2026)
+  r3d_draw(target, tris, FOV)
+  canvas_set_pixels(frame, r3d_pixels(target))
+  timing.fill = clock() - t1
+  timing.tris = len(tris)
+}
+
+fn text_panel(cv, x, y, w, h) { canvas_fill_round_rect(cv, x, y, w, h, 8, "#0b0f14d8") }
+
+fn draw_hud(cv) {
+  canvas_set_font(cv, "ui", 15)
+  # score
+  text_panel(cv, 14, 12, 300, 62)
+  let secs = int(hud.tic / 30)
+  canvas_fill_text(cv, format("SCORE {}", hud.score), 28, 20, "#fbbf24")
+  canvas_fill_text(cv, format("{}:{:02d}   shipped {}   late {}   put away {}", int(secs / 60), secs % 60, hud.shipped, hud.late, hud.putaways),
+                   28, 44, "#cbd5e1")
+  # open orders
+  let rows = len(orders)
+  text_panel(cv, W - 300, 12, 286, 30 + max(1, rows) * 21)
+  canvas_fill_text(cv, "OPEN ORDERS", W - 286, 20, "#93c5fd")
+  if rows == 0 { canvas_fill_text(cv, "none - check receiving", W - 286, 42, "#64748b") }
+  let i = 0
+  for o in orders {
+    let left = int((o.due_tic - hud.tic) / 30)
+    let done = o.picked >= o.need
+    let line = format("#{} {}  {}", o.order_id, o.sku, done ? "loaded" : format("{}s", left))
+    canvas_fill_text(cv, line, W - 286, 42 + i * 21, done ? "#34d399" : (left < 20 ? "#f87171" : "#e2e8f0"))
+    i = i + 1
+  }
+  # forks, load, what is in front of them
+  text_panel(cv, 14, H - 92, W - 28, 78)
+  canvas_fill_text(cv, format("FORKS {:.2f} m", me.fork_h), 28, H - 84, "#e2e8f0")
+  canvas_fill_text(cv, carry == nil ? "empty" : ("carrying " + carry.sku + (carry.zone == "inbound" ? " (inbound)" : "")),
+                   160, H - 84, carry == nil ? "#64748b" : "#fbbf24")
+  canvas_fill_text(cv, hint, 28, H - 60, "#7dd3fc")
+  canvas_fill_text(cv, format("tic {:.0f} ms  frame sql {:.0f} ms  fill {:.0f} ms  {} tris", timing.tic, timing.frame_sql, timing.fill, timing.tris),
+                   28, H - 36, "#64748b")
+  let keys = "W/S drive   A/D steer   R/F forks   Space pick / set down   C camera"
+  canvas_fill_text(cv, keys, W - 30 - canvas_measure_text(cv, keys).width, H - 36, "#94a3b8")
+  # what happened
+  let j = 0
+  for e in events {
+    if j < 2 {
+      let m = canvas_measure_text(cv, e.msg)
+      let w = m.width + 24
+      # just above the bottom panel, the newest nearest it
+      canvas_fill_round_rect(cv, int(W / 2 - w / 2), H - 124 - j * 26, w, 22, 6, j == 0 ? "#0f172ae0" : "#0f172a90")
+      canvas_fill_text(cv, e.msg, int(W / 2 - m.width / 2), H - 121 - j * 26, j == 0 ? "#f8fafc" : "#94a3b8")
+    }
+    j = j + 1
+  }
+}
+
+let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
+              " ": "space", "spacebar": "space", "pageup": "pageup", "pagedown": "pagedown"}
+fn key_name(e) { return get(keymap, lower(e.key), lower(e.key)) }
+
+read_state()
+prev_me = me
+
+let pane = create_pane({"title": "Pick Rush - a warehouse in ASQL", "width": W, "height": H,
+  "on_draw": fn (cv) {
+    run_due_tics()
+    render_frame()
+    canvas_draw_image(cv, frame, 0, 0)
+    draw_hud(cv)
+  },
+  "on_event": fn (p, e) {
+    if e.type != "key" and e.type != "key_up" { return nil }
+    let k = key_name(e)
+    if e.type == "key_up" {
+      held[k] = false
+      return nil
+    }
+    if not get(held, k, false) {
+      if k == "space" { pending_action = true }
+      if k == "c" { cam_mode = cam_mode == "cab" ? "chase" : "cab" }
+    }
+    held[k] = true
+    return nil
+  }
+})
+
+let frames = int(env("PICKRUSH_FRAMES", "0"))
+if frames > 0 {
+  for k in split(env("PICKRUSH_KEYS", ""), ",") { if k != "" { held[k] = true } }
+  let acts = {}
+  for a in split(env("PICKRUSH_ACT_AT", ""), ",") { if a != "" { acts[a] = true } }
+  for i in range(0, frames) {
+    if get(acts, str(i), false) { pending_action = true }
+    run_tic()
+    render_frame()
+    print(format("tic {}: tic {:.1f} ms, frame sql {:.1f} ms, fill {:.1f} ms, hud {:.1f} ms, {} tris  {}", hud.tic,
+                 timing.tic, timing.frame_sql, timing.fill, timing.hud, timing.tris, len(events) > 0 ? events[0].msg : ""))
+  }
+  draw_hud(frame)
+  canvas_save_png(frame, env("PICKRUSH_SHOT", "pickrush.png"))
+} else {
+  run_panes({})
+}

@@ -1,0 +1,251 @@
+# Pick Rush, played by a script through the same pr_tic the keys drive: it ships the open orders (to the rack the
+# SKU is in, forks up, in, pick, back out, down, to the shipping dock, set down) and puts away what comes in at
+# receiving. It is the game's end-to-end check: it prints what the game said at each step, and fails if an order it
+# loaded does not ship or a pallet it carried does not land where it meant it to.
+#
+#   aios --root R grain run --steps 0 apps/pickrush/load.gr
+#   aios --root R grain run --steps 0 apps/pickrush/autoplay.gr [tasks]     (tasks: how many to do, default 4)
+#
+# AUTOPLAY_SHOT=dir saves a frame of each step there (rendered as play.gr does).
+let PI = 3.141592653589793
+let tasks_wanted = len(args) > 0 ? int(args[0]) : 4
+let shot_dir = env("AUTOPLAY_SHOT", "")
+let here = abspath(env("PICKRUSH_DIR", "apps/pickrush"))
+sql("USE pickrush")
+let frame_sql = read_file(path_join(here, "sql/frame.sql"))
+
+let tic_ms_total = 0.0
+let tics = 0
+let shots = 0
+
+# A number as a DOUBLE literal (31.5e0): `SET @v = 31.5` makes @v a DECIMAL, as MySQL does, and a camera at
+# 1.5707963267948966 is a 17-digit decimal that every expression it meets must then work out exactly, row by row.
+fn dbl(x) {
+  let s = str(x)
+  return (index_of(s, "e") >= 0 or index_of(s, "E") >= 0) ? s : s + "e0"
+}
+
+fn me() { return sql("SELECT x, z, yaw, fork_h, speed FROM entities WHERE entity_id = 1")[0] }
+fn last_event() { return sql("SELECT msg FROM events ORDER BY event_id DESC LIMIT 1")[0].msg }
+
+fn tic(thr, steer, lift, act) {
+  let t0 = clock()
+  sql(format("SELECT pr_tic({}, {}, {}, {}) AS t", thr, steer, lift, act))
+  tic_ms_total = tic_ms_total + (clock() - t0)
+  tics = tics + 1
+}
+
+fn shot(label) {
+  if shot_dir == "" { return nil }
+  let p = me()
+  let t = r3d_target(960, 600)
+  sql(format("SET @cx = {}, @cy = 5.6e0, @cz = {}, @cyaw = {}, @cpitch = 0.62e0, @tanh = {}, @far = 70e0",
+             dbl(p.x - sin(p.yaw) * 5.0), dbl(p.z - cos(p.yaw) * 5.0), dbl(p.yaw), dbl(tan(75 * PI / 360))))
+  r3d_clear(t, 0x1c2026)
+  r3d_draw(t, sql(frame_sql), 75)
+  let cv = canvas_create(960, 600)
+  canvas_set_pixels(cv, r3d_pixels(t))
+  canvas_set_font(cv, "ui", 16)
+  canvas_fill_round_rect(cv, 12, 12, 936, 30, 6, "#0b0f14d8")
+  canvas_fill_text(cv, label + "  |  " + last_event(), 24, 18, "#f8fafc")
+  shots = shots + 1
+  canvas_save_png(cv, path_join(shot_dir, format("{:02d}.png", shots)))
+}
+
+fn wrap(a) {
+  let d = a
+  while d > PI { d = d - 2 * PI }
+  while d < -PI { d = d + 2 * PI }
+  return d
+}
+fn clamp(v, lo, hi) { return max(lo, min(hi, v)) }
+
+# Stop: throttle against the way it is going until it stands.
+fn brake() {
+  let k = 0
+  while abs(me().speed) > 0.03 and k < 90 {
+    let v = me().speed
+    tic(v > 0 ? -0.6 : 0.6, 0, 0, 0)
+    if (v > 0) != (me().speed > 0) { tic(0, 0, 0, 0) }
+    k = k + 1
+  }
+}
+
+# Drive the forklift's centre to (tx, tz): turn toward it, go, ease off near it. Fails after `limit` tics.
+fn drive_to(tx, tz, tol, limit) {
+  let n = 0
+  while n < limit {
+    let p = me()
+    let dx = tx - p.x
+    let dz = tz - p.z
+    let d = sqrt(dx * dx + dz * dz)
+    if d < tol {
+      brake()
+      return true
+    }
+    let err = wrap(atan2(dx, dz) - p.yaw)
+    let steer = clamp(err * 2.5, -1, 1)
+    # ease in: about 0.4 m/s over the last half metre, so it stops where it was told to
+    let thr = abs(err) > 0.6 ? 0 : clamp(d / 3.0, 0.08, 1)
+    if abs(err) > 0.6 and abs(p.speed) < 0.3 { thr = 0.12 }
+    tic(thr, steer, 0, 0)
+    n = n + 1
+  }
+  error(format("drive_to({}, {}): not there after {} tics (at {:.2f}, {:.2f})", tx, tz, limit, me().x, me().z))
+}
+
+# Turn on the spot (creeping) to face `yaw`.
+fn face(yaw) {
+  let n = 0
+  while n < 400 {
+    let p = me()
+    let err = wrap(yaw - p.yaw)
+    if abs(err) < 0.03 {
+      let k = 0
+      while abs(me().speed) > 0.02 and k < 60 { tic(0, 0, 0, 0)
+                                                 k = k + 1 }
+      return true
+    }
+    tic(0, clamp(err * 3, -1, 1), 0, 0)   # on the spot: creeping while turning drifts it off the slot
+    n = n + 1
+  }
+  error("face(): did not turn round")
+}
+
+fn forks_to(h) {
+  let n = 0
+  while abs(me().fork_h - h) > 0.02 and n < 300 {
+    let d = h - me().fork_h
+    tic(0, 0, clamp(d * 6, -1, 1), 0)
+    n = n + 1
+  }
+}
+
+# Straight along the heading (north, into a rack) until the centre's z is z, slowly.
+fn creep_to_z(z, forward) {
+  let n = 0
+  while n < 300 {
+    let p = me()
+    let d = z - p.z
+    if (forward and d <= 0.02) or (not forward and d >= -0.02) { break }
+    tic(forward ? clamp(d, 0.08, 0.35) : clamp(d, -0.35, -0.08), clamp(wrap(0 - p.yaw) * 3, -1, 1), 0, 0)
+    n = n + 1
+  }
+  let k = 0
+  while abs(me().speed) > 0.02 and k < 60 { tic(0, 0, 0, 0)
+                                             k = k + 1 }
+}
+
+fn act(label) {
+  if env("AUTOPLAY_DEBUG", "") != "" {
+    let p = me()
+    print(format("    at {:.3f}, {:.3f} yaw {:.3f} forks {:.3f}: fork centre {:.3f}, {:.3f}", p.x, p.z, p.yaw, p.fork_h,
+                 p.x + sin(p.yaw) * 1.45, p.z + cos(p.yaw) * 1.45))
+  }
+  tic(0, 0, 0, 1)
+  let m = last_event()
+  print("  " + label + ": " + m)
+  return m
+}
+
+# The aisle a rack row is reached from: its centre line, and the eastern cross aisle.
+fn aisle_z(rack_row) { return 6 + 4.8 * rack_row - 2.4 }
+let EAST = 31.5
+
+# From anywhere in the open, onto the eastern cross aisle at aisle z (going round the rack ends).
+fn to_aisle(z) {
+  let p = me()
+  if p.x < 30 { drive_to(p.x, aisle_z(round((p.z - 3.6) / 4.8)), 0.5, 600) }
+  drive_to(EAST, me().z, 0.5, 600)
+  drive_to(EAST, z, 0.5, 900)
+}
+
+fn in_and_pick(slot) {
+  to_aisle(aisle_z(slot.rack_row))
+  drive_to(slot.x, aisle_z(slot.rack_row), 0.12, 900)
+  face(0)
+  forks_to(slot.y)
+  creep_to_z(slot.z - 1.45, true)
+  let m = act("pick " + slot.label)
+  shot("picked at " + slot.label)
+  creep_to_z(aisle_z(slot.rack_row), false)
+  forks_to(0.3)
+  return m
+}
+
+fn ship() {
+  to_aisle(aisle_z(5))
+  drive_to(EAST, 30, 0.5, 600)
+  drive_to(36.5, 30, 0.3, 600)
+  forks_to(0)
+  let m = act("ship")
+  shot("shipped")
+  forks_to(0.3)
+  return m
+}
+
+let done = 0
+let failures = []
+while done < tasks_wanted {
+  # an inbound pallet waiting: put it away first
+  let inbound = sql("SELECT entity_id, x, z, sku FROM entities WHERE zone = 'inbound' AND carried_by IS NULL ORDER BY entity_id LIMIT 1")
+  if len(inbound) > 0 {
+    let ib = inbound[0]
+    print(format("task {}: put away inbound {} from receiving", done + 1, ib.sku))
+    drive_to(EAST, 8.0, 0.5, 900)
+    drive_to(ib.x, ib.z + 3.2, 0.2, 900)
+    face(PI)
+    forks_to(0)
+    let n = 0
+    while sqrt(pow(me().x + sin(me().yaw) * 1.45 - ib.x, 2) + pow(me().z + cos(me().yaw) * 1.45 - ib.z, 2)) > 0.15 and n < 300 {
+      tic(0.15, clamp(wrap(atan2(ib.x - me().x, ib.z - me().z) - me().yaw) * 3, -1, 1), 0, 0)
+      n = n + 1
+    }
+    let m = act("pick inbound")
+    if index_of(m, "Picked") < 0 { push(failures, "inbound pick: " + m) }
+    forks_to(0.3)
+    drive_to(EAST, 8.0, 0.5, 900)
+    let slot = sql("SELECT slot_id, label, rack_row, x, y, z FROM slots WHERE pallet_id IS NULL ORDER BY rack_row DESC, level, bay DESC LIMIT 1")[0]
+    to_aisle(aisle_z(slot.rack_row))
+    drive_to(slot.x, aisle_z(slot.rack_row), 0.12, 900)
+    face(0)
+    forks_to(slot.y)
+    creep_to_z(slot.z - 1.45, true)
+    let m2 = act("put away in " + slot.label)
+    shot("put away " + slot.label)
+    let landed = sql(format("SELECT pallet_id FROM slots WHERE slot_id = {}", slot.slot_id))[0].pallet_id
+    if landed != ib.entity_id { push(failures, format("put away: slot {} holds {}, wanted {} ({})", slot.label, landed, ib.entity_id, m2)) }
+    creep_to_z(aisle_z(slot.rack_row), false)
+    forks_to(0.3)
+    done = done + 1
+    continue
+  }
+  let want = sql("SELECT l.order_id, l.sku FROM order_lines l JOIN orders o ON o.order_id = l.order_id " +
+                 "WHERE o.status = 'open' AND l.picked < l.need ORDER BY o.due_tic, l.order_id, l.line_no LIMIT 1")
+  if len(want) == 0 {
+    tic(0, 0, 0, 0)
+    continue
+  }
+  let w = want[0]
+  let p = me()
+  # the nearest pallet of it on the floor level or one up (where the forks reach fastest)
+  let s = sql(format("SELECT s.slot_id, s.label, s.rack_row, s.x, s.y, s.z FROM slots s JOIN entities e ON e.entity_id = s.pallet_id " +
+                     "WHERE e.sku = '{}' ORDER BY s.level, POW(s.x - {}, 2) + POW(s.z - {}, 2) LIMIT 1", w.sku, p.x, p.z))
+  if len(s) == 0 { error("no " + w.sku + " in the racks") }
+  let slot = s[0]
+  print(format("task {}: order {} wants {} - it is in {}", done + 1, w.order_id, w.sku, slot.label))
+  let m = in_and_pick(slot)
+  if index_of(m, "Picked") < 0 { push(failures, "pick " + slot.label + ": " + m) }
+  let m2 = ship()
+  if index_of(m2, "shipped") < 0 and index_of(m2, "Loaded") < 0 { push(failures, "ship: " + m2) }
+  done = done + 1
+}
+
+let g = sql("SELECT tic, score, shipped, late, putaways FROM game WHERE id = 1")[0]
+print(format("after {} tics ({:.1f} ms a tic): score {}, shipped {}, late {}, put away {}", g.tic, tic_ms_total / max(1, tics),
+             g.score, g.shipped, g.late, g.putaways))
+if len(failures) > 0 {
+  for f in failures { print("FAILED: " + f) }
+  error(format("{} step(s) did not do what they should", len(failures)))
+}
+print("all steps did what they should")

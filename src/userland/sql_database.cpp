@@ -1163,6 +1163,9 @@ struct Val {
   // Bytes, not text: read from a BINARY/VARBINARY/BLOB column or made by BINARY x / COLLATE *_bin. Compared
   // byte for byte, no case folding, no PAD SPACE.
   bool bin = false;
+  // A 0x.. literal: its bytes are the text, and going into a numeric column it is the number they spell (MariaDB's
+  // hex hybrid: INSERT INTO t (int_col) VALUES (0x41) stores 65). X'41' is only a string and does not set this.
+  bool hexnum = false;
   double num = 0;
   // A quoted literal's reading as a number, worked out once when it is
   // parsed: `taxgroupid = '1'` against an INT column compares numerically, and
@@ -2806,6 +2809,7 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
       while (j < sql.size() && std::isxdigit((unsigned char)sql[j])) j++;
       if (j > i + 2) {
         std::string hex_str = sql.substr(i + 2, j - i - 2);
+        if (hex_str.size() % 2 != 0) hex_str.insert(hex_str.begin(), '0');   // 0xABC is 0x0ABC, as MySQL reads it
         std::string raw_bytes;
         raw_bytes.reserve(hex_str.size() / 2);
         for (size_t k = 0; k + 1 < hex_str.size(); k += 2) {
@@ -3123,6 +3127,14 @@ bool exact_internal_of(const Val& v, AIOS_INT128* out, int* scale, int* dscale) 
 // MariaDB stores 1/3 into DECIMAL(20,10) as 0.3333333330 (not 0.3333000000).
 std::string val_store_text(const Val& v, SqlDataType t) {
   if (v.null) return sql_null();
+  if (v.hexnum && !v.numeric && (t == SqlDataType::Int || t == SqlDataType::Real || t == SqlDataType::Decimal)) {
+    const std::string& b = v.str();
+    if (b.size() <= 8) {
+      uint64_t n = 0;
+      for (unsigned char ch : b) n = (n << 8) | ch;
+      return std::to_string(n);
+    }
+  }
   // A DOUBLE into an integer column: rint, as MariaDB converts it (2.5e0 is 2; the decimal 2.5 is 3).
   if (t == SqlDataType::Int && v.numeric && v.approx && std::isfinite(v.num) && std::fabs(v.num) < 9.2e18)
     return std::to_string((long long)std::nearbyint(v.num));
@@ -4413,6 +4425,7 @@ class SqlParser {
         double n = 0;
         for (unsigned char ch : t.text) n = n * 256 + ch;
         e->literal.prefix_num = n;
+        e->literal.hexnum = true;
       }
       if (!t.spelled.empty()) e->source_text = t.spelled;
       e->tok_index = (int)p_;
@@ -30031,6 +30044,69 @@ inline std::string obj_fmt_number(double d) {
 
 }  // namespace
 
+SqlQueryResult SqlDatabase::execute_local_query_columns(const std::string& sql_query, ResultColumns* out) {
+  out->filled = false;
+  out->rows = 0;
+  out->cols.clear();
+  // Only a statement whose top is a select: that select is the first to start, and takes the request (a WITH's
+  // CTEs leave it for the final statement, execute_with). Under any other statement a select nested in it - an
+  // UPDATE's subquery - would take a batch its own consumer does not read.
+  size_t i = 0;
+  const std::string& q = sql_query;
+  for (;;) {
+    while (i < q.size() && (std::isspace((unsigned char)q[i]) || q[i] == '(')) ++i;
+    if (q.compare(i, 2, "--") == 0 || (i < q.size() && q[i] == '#')) { const size_t e = q.find('\n', i); i = e == std::string::npos ? q.size() : e + 1; continue; }
+    if (q.compare(i, 2, "/*") == 0) { const size_t e = q.find("*/", i + 2); i = e == std::string::npos ? q.size() : e + 2; continue; }
+    break;
+  }
+  auto word_at = [&](const char* w) {
+    const size_t n = std::strlen(w);
+    if (i + n > q.size()) return false;
+    for (size_t k = 0; k < n; ++k) if (std::toupper((unsigned char)q[i + k]) != w[k]) return false;
+    return i + n == q.size() || !(std::isalnum((unsigned char)q[i + n]) || q[i + n] == '_');
+  };
+  if (!word_at("SELECT") && !word_at("WITH")) return execute_local_query(sql_query);
+  ColBatch batch;
+  SqlQueryResult r;
+  {
+    ColOutRequest want(&batch);
+    r = execute_local_query(sql_query);
+  }
+  if (!r.success || !r.rows_in_batch) return r;
+  if (!batch.filled || batch.cols.size() != r.columns.size()) {   // not one to read column by column: its rows
+    if (batch.filled) batch.to_rows(&r.rows);
+    r.rows_in_batch = false;
+    return r;
+  }
+  const size_t n = batch.rows;
+  out->rows = n;
+  out->cols.resize(batch.cols.size());
+  for (size_t c = 0; c < batch.cols.size(); ++c) {
+    ColBatch::Col& bc = batch.cols[c];
+    ResultColumns::Col& oc = out->cols[c];
+    const SqlDataType t = c < r.column_types.size() ? r.column_types[c] : SqlDataType::Text;
+    const bool numeric = t == SqlDataType::Int || t == SqlDataType::Real || t == SqlDataType::Decimal;
+    if (bc.kind == ColBatch::I64 && numeric) {
+      oc.kind = ResultColumns::Int;
+      oc.i = std::move(bc.i);
+      oc.nul = std::move(bc.nul);
+    } else if (bc.kind == ColBatch::F64 && (t == SqlDataType::Real || t == SqlDataType::Decimal)) {
+      oc.kind = ResultColumns::Double;
+      oc.f = std::move(bc.f);
+      oc.nul = std::move(bc.nul);
+    } else if (bc.kind == ColBatch::Text) {
+      oc.s = std::move(bc.s);
+    } else {
+      oc.s.resize(n);
+      for (size_t k = 0; k < n; ++k) oc.s[k] = bc.text(k);
+    }
+  }
+  out->filled = true;
+  r.rows_in_batch = false;
+  r.rows.clear();
+  return r;
+}
+
 SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, const std::string& session_db) {
   // An embedded caller waits for no sync: its statement's record is in the
   // log file when the call returns (its locks let go first), as it was when
@@ -52854,7 +52930,96 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
     hash_join_done = true;
   }
 
-  if (!hash_join_done) for (JoinedRow& base : rows) {
+  // A join with no key to hash or look up (a box-overlap ON, a band join): every base row against every row of the
+  // table. The ON and the pushed conjuncts were evaluated by the interpreter for each pair - SQLDoom's monsters
+  // against 359 blocking lines, 11,000 pairs, 5 ms a statement. Where they compile they are evaluated as programs
+  // over chunks of the pairs instead, the pairs kept in the same order with the same LEFT / RIGHT bookkeeping; a
+  // program that does not compile or fails on the rows leaves the step to the interpreter, as before.
+  bool scan_vectorized = false;
+  if (!hash_join_done && join_conditions[j] && js.table && !rows.empty() && js.table->row_count() > 0 &&
+      rows.size() * js.table->row_count() >= 512 &&
+      !(limit >= 0 && group_by.empty() && order_by.empty() && j + 1 == join_conditions.size() && !join_is_right[j])) {
+    EvalCtx pctx; pctx.db = db; pctx.outer = outer_scope; pctx.sources = &partial;
+    const vp::Prog* on_prog = vp::program_for(join_conditions[j].get(), pctx);
+    std::vector<const vp::Prog*> push_progs;
+    bool all_compiled = on_prog != nullptr;
+    for (const SqlExpr* p : pushable) {
+      if (!all_compiled) break;
+      const vp::Prog* P = vp::program_for(p, pctx);
+      if (!P) all_compiled = false;
+      push_progs.push_back(P);
+    }
+    if (all_compiled) {
+      const size_t tn = js.table->row_count();
+      const size_t per_chunk = std::max<size_t>(1, 65536 / tn);   // base rows a chunk, its pairs at most ~64k
+      JoinedRows vnext;
+      std::vector<JoinedRow> cands;
+      std::vector<uint8_t> on_true, keep;
+      std::vector<uint8_t> seen_local(right_seen ? right_n : 0, 0);
+      bool ok = true;
+      auto truth = [](const vp::Column& col, size_t r) {
+        return !col.is_null(r) && (col.ty == vp::Ty::I64 ? col.i[r] != 0 : col.f[r] != 0);
+      };
+      for (size_t b0 = 0; ok && b0 < rows.size() && !sql_interrupted(); b0 += per_chunk) {
+        const size_t b1 = std::min(rows.size(), b0 + per_chunk);
+        cands.clear();
+        cands.reserve((b1 - b0) * tn);
+        for (size_t b = b0; b < b1; ++b)
+          for (size_t ri = 0; ri < tn; ++ri) {
+            JoinedRow cand = rows[b];
+            cand.parts.push_back(ri);
+            cands.push_back(std::move(cand));
+          }
+        const size_t n = cands.size();
+        auto at = [&](size_t r) -> const JoinedRow& { return cands[r]; };
+        vp::Column col;
+        std::string verr;
+        if (!vp::eval_column(*on_prog, at, n, &col, &verr)) { ok = false; break; }
+        on_true.assign(n, 0);
+        for (size_t r = 0; r < n; ++r) on_true[r] = truth(col, r) ? 1 : 0;
+        keep = on_true;
+        for (const vp::Prog* P : push_progs) {
+          vp::Column pc;
+          if (!vp::eval_column(*P, at, n, &pc, &verr)) { ok = false; break; }
+          for (size_t r = 0; r < n; ++r) if (keep[r] && !truth(pc, r)) keep[r] = 0;
+        }
+        if (!ok) break;
+        for (size_t b = b0; b < b1; ++b) {
+          const size_t first = (b - b0) * tn;
+          bool matched = false;
+          for (size_t ri = 0; ri < tn; ++ri) {
+            if (!on_true[first + ri]) continue;
+            matched = true;
+            if (right_seen && ri < right_n) seen_local[ri] = 1;
+            if (keep[first + ri]) vnext.push_back(std::move(cands[first + ri]));
+          }
+          if (!matched && join_is_left[j]) {
+            JoinedRow cand = rows[b];
+            cand.parts.push_back(kNullRow);
+            EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope; ctx.sources = &partial; ctx.err = &err;
+            ctx.row = &cand;
+            bool keep_null = true;
+            for (const SqlExpr* p : pushable) {
+              if (!predicate_true(p, ctx)) { keep_null = false; break; }
+            }
+            if (!err.empty()) return make_error(err);
+            if (keep_null) vnext.push_back(std::move(cand));
+          }
+        }
+      }
+      if (ok && !sql_interrupted()) {
+        for (size_t r = 0; r < seen_local.size(); ++r)
+          if (seen_local[r]) right_seen[r].store(1, std::memory_order_relaxed);
+        g_scan_fallbacks++;
+        g_scan_rows += (long long)tn;
+        for (auto& r : vnext) next.push_back(std::move(r));
+        scan_vectorized = true;
+        if (vx_trace_on()) vx_trace("join: +" + js.alias + " scanned as programs: " + std::to_string(rows.size() * tn) + " pairs");
+      }
+    }
+  }
+
+  if (!hash_join_done && !scan_vectorized) for (JoinedRow& base : rows) {
     if (sql_interrupted()) break;
     bool matched = false;
     EvalCtx ctx; ctx.db = db; ctx.outer = outer_scope;
@@ -54989,6 +55154,9 @@ struct SelectRun {
 
 // The setup, the planner of step 2c: the branch rewritten and its sources made, the join order and kinds fixed, the
 // clauses copied out for the operators (SelectRun). A result: an error (or an answer) to return; empty: run it.
+// (defined with execute_parsed_select_single, below)
+static bool inline_scalar_laterals(SqlDatabase* db, ParsedSelectBranch& b);
+
 static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSelectBranch& raw_branch, const EvalCtx* outer_scope,
                                                  SelectRun& run, PhaseClock& phases) {
   const ParsedSelectBranch*& branch_ptr = run.branch_ptr;
@@ -55148,6 +55316,42 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
         if (mergeable)
           for (const auto& bs : branch.sources)
             if (bs.lateral || !bs.series_args.empty()) { mergeable = false; break; }
+        // So is a sub-query of the caller's (EXISTS, IN, a scalar one): it is text too, and once merged the view's
+        // alias it correlates on is gone - `WHERE EXISTS (... a.line_id = c.line_id)` over a merged CTE c found no
+        // column c.line_id. The view is not merged when a sub-query names its alias.
+        if (mergeable) {
+          const std::string a_low = lower_of(src_spec.alias.empty() ? src_spec.table_name : src_spec.alias);
+          auto names_alias = [&](const std::string& text) {
+            const std::string t = lower_of(text);
+            auto ident = [](char ch) { return std::isalnum((unsigned char)ch) || ch == '_' || ch == '$'; };
+            for (size_t at = t.find(a_low); at != std::string::npos; at = t.find(a_low, at + 1)) {
+              size_t b = at, e = at + a_low.size();
+              if (b > 0 && t[b - 1] == '`' && e < t.size() && t[e] == '`') { --b; ++e; }
+              if (b > 0 && ident(t[b - 1])) continue;
+              size_t k = e;
+              while (k < t.size() && std::isspace((unsigned char)t[k])) ++k;
+              if (k < t.size() && t[k] == '.') return true;
+            }
+            return false;
+          };
+          std::function<bool(const ExprPtr&)> sub_names = [&](const ExprPtr& e) -> bool {
+            if (!e) return false;
+            if (!e->subquery_sql.empty() && names_alias(e->subquery_sql)) return true;
+            for (const auto& a : e->args) if (sub_names(a)) return true;
+            for (const auto& k : e->group_order_by) if (sub_names(k.expr)) return true;
+            if (e->window) {
+              for (const auto& pe : e->window->partition_by) if (sub_names(pe)) return true;
+              for (const auto& k : e->window->order_by) if (sub_names(k.expr)) return true;
+            }
+            return false;
+          };
+          bool named = sub_names(branch.where) || sub_names(branch.having);
+          for (const auto& it : branch.items) named = named || sub_names(it.expr);
+          for (const auto& g : branch.group_by) named = named || sub_names(g);
+          for (const auto& o : branch.order_by) named = named || sub_names(o.expr);
+          for (const auto& j : branch.join_conditions) named = named || sub_names(j);
+          if (named) mergeable = false;
+        }
         // The view as the NULL-padded side of a LEFT JOIN: its WHERE must hold before the padding, so it goes into
         // that join's ON, not the statement's WHERE (which dropped every row the view had no match for - a
         // LEFT JOIN scrolling_segs sc lost every wall that does not scroll). A view of several tables there would
@@ -55746,6 +55950,7 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
         branch_ptr = &expanded_branch;
         branched = true;
       }
+      inline_scalar_laterals(db, expanded_branch);
       for (size_t si = 0; si < expanded_branch.sources.size(); ++si) {
         auto& s = expanded_branch.sources[si];
         if (!s.is_derived()) continue;
@@ -56114,6 +56319,242 @@ static std::optional<SqlQueryResult> plan_select(SqlDatabase* db, const ParsedSe
   run.join_conditions = &join_conditions;
   run.join_is_left = &join_is_left;
   return std::nullopt;
+}
+
+// `CROSS JOIN LATERAL (SELECT e1 AS a, e2 AS b) t`: no FROM, no WHERE, no grouping - exactly one row, of values
+// worked out from the sources before it. SQLDoom's tic (converted from PostgreSQL) names its intermediate
+// arithmetic this way, four laterals deep: each was made by materialize_lateral, which ran the join of every
+// source before it to find the outer values and the subquery for each - the prefix join again for every lateral,
+// 3.3 ms of setup in a 4.4 ms statement. Here such a lateral is inlined instead: every t.a is its expression (the
+// laterals before it already inlined into it), an ON it carried (a WHERE conjunct moved onto it) joins the WHERE,
+// and the source goes. Only where that is the same answer: an inner join; nothing read through `*`, an unqualified
+// name, a subquery's text or a later derived table; no aggregate or window (one row of them would differ), and
+// nothing volatile or a stored function (inlined, either would run once a reference).
+static bool lateral_expr_inlinable(SqlDatabase* db, const SqlExpr* e) {
+  if (!e) return true;
+  if (e->window || !e->subquery_sql.empty()) return false;
+  if (e->op == ExprOp::Func) {
+    const std::string up = upper_of(e->name);
+    // a value that differs from one evaluation to the next, or a call with an effect
+    static const char* const kNotTwice[] = {
+        "NOW", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "SYSDATE", "CURDATE", "CURRENT_DATE", "CURTIME",
+        "CURRENT_TIME", "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP", "UNIX_TIMESTAMP", "UUID", "UUID_SHORT", "RAND",
+        "SLEEP", "GET_LOCK", "RELEASE_LOCK", "LAST_INSERT_ID", "ROW_COUNT", "FOUND_ROWS", "NEXTVAL", "SETVAL"};
+    if (is_aggregate_name(up)) return false;
+    for (const char* v : kNotTwice) if (up == v) return false;
+    if (db && db->find_program('F', e->name)) return false;
+  }
+  for (const auto& a : e->args) if (!lateral_expr_inlinable(db, a.get())) return false;
+  return true;
+}
+
+struct LateralDefs {
+  // per inlined lateral: its alias (lower case), and each column's name (lower case) with its expression
+  std::vector<std::pair<std::string, std::vector<std::pair<std::string, ExprPtr>>>> defs;
+  const ExprPtr* find(const std::string& qual, const std::string& name) const {
+    const std::string q = lower_of(qual), n = lower_of(name);
+    for (const auto& d : defs) {
+      if (d.first != q) continue;
+      for (const auto& c : d.second) if (c.first == n) return &c.second;
+      return nullptr;
+    }
+    return nullptr;
+  }
+  bool is_alias(const std::string& qual) const {
+    const std::string q = lower_of(qual);
+    for (const auto& d : defs) if (d.first == q) return true;
+    return false;
+  }
+  bool is_column_name(const std::string& name) const {
+    const std::string n = lower_of(name);
+    for (const auto& d : defs) for (const auto& c : d.second) if (c.first == n) return true;
+    return false;
+  }
+};
+
+// Whether e reads an inlined lateral anywhere (its window's PARTITION BY / ORDER BY included); *bad when it reads one
+// in a way inlining cannot follow (a column the lateral does not have, an unqualified name one of them has, a
+// subquery whose text names one).
+static bool lateral_refs_in(const SqlExpr* e, const LateralDefs& L, bool* bad) {
+  if (!e) return false;
+  bool any = false;
+  if (e->op == ExprOp::Column) {
+    if (!e->qualifier.empty() && L.is_alias(e->qualifier)) {
+      if (!L.find(e->qualifier, e->name)) *bad = true;
+      return true;
+    }
+    if (e->qualifier.empty() && L.is_column_name(e->name)) *bad = true;
+  }
+  if (!e->subquery_sql.empty()) {
+    const std::string low = lower_of(e->subquery_sql);
+    for (const auto& d : L.defs)
+      if (low.find(d.first + ".") != std::string::npos) *bad = true;
+  }
+  for (const auto& a : e->args) any = lateral_refs_in(a.get(), L, bad) || any;
+  for (const auto& ok : e->group_order_by) any = lateral_refs_in(ok.expr.get(), L, bad) || any;
+  if (e->window) {
+    for (const auto& pb : e->window->partition_by) any = lateral_refs_in(pb.get(), L, bad) || any;
+    for (const auto& ob : e->window->order_by) any = lateral_refs_in(ob.expr.get(), L, bad) || any;
+  }
+  return any;
+}
+
+// e with each lateral column it reads replaced by that column's expression: a new tree where anything changes (the
+// parsed statement's own is shared with its cache), e itself where nothing does.
+static ExprPtr lateral_subst(const ExprPtr& e, const LateralDefs& L) {
+  if (!e) return e;
+  bool bad = false;
+  if (!lateral_refs_in(e.get(), L, &bad)) return e;
+  if (e->op == ExprOp::Column && !e->qualifier.empty()) {
+    if (const ExprPtr* d = L.find(e->qualifier, e->name)) return clone_expr(*d);
+  }
+  ExprPtr c = clone_expr(e);
+  for (auto& a : c->args) a = lateral_subst(a, L);
+  for (auto& ok : c->group_order_by) ok.expr = lateral_subst(ok.expr, L);
+  if (c->window) {
+    auto w = std::make_shared<WindowSpec>(*c->window);
+    for (auto& pb : w->partition_by) pb = lateral_subst(pb, L);
+    for (auto& ob : w->order_by) ob.expr = lateral_subst(ob.expr, L);
+    c->window = w;
+  }
+  return c;
+}
+
+static bool inline_scalar_laterals(SqlDatabase* db, ParsedSelectBranch& b) {
+  static const bool off = [] { const char* v = std::getenv("AIOS_SQL_INLINE_LATERAL"); return v && *v == '0'; }();
+  if (off) return false;
+  LateralDefs L;
+  std::vector<size_t> drop;
+  std::vector<ExprPtr> filters;   // the inlined laterals' ON conditions
+  std::vector<size_t> filter_at;  // the source each came from
+  // which sources have a scalar lateral's shape (one SELECT of expressions, no FROM): a later one that reads an
+  // earlier is inlined with it, so only the other derived tables count as reading a lateral that is inlined
+  auto scalar_shape = [&](size_t si) {
+    const auto& s = b.sources[si];
+    if (si == 0 || !s.lateral || !s.series_args.empty() || !s.column_names.empty() || s.subquery_sql.empty()) return false;
+    const ParsedSelectStatement ps = parse_select_sql(s.subquery_sql);
+    if (!ps.ok || ps.branches.size() != 1) return false;
+    const ParsedSelectBranch& lb = ps.branches[0];
+    return lb.sources.empty() && !lb.where && lb.group_by.empty() && !lb.having && lb.limit < 0;
+  };
+  std::vector<uint8_t> shaped(b.sources.size(), 0);
+  for (size_t si = 1; si < b.sources.size(); ++si) shaped[si] = scalar_shape(si) ? 1 : 0;
+  for (size_t si = 1; si < b.sources.size(); ++si) {
+    const auto& s = b.sources[si];
+    if (!s.lateral || !s.series_args.empty() || !s.column_names.empty() || s.subquery_sql.empty() ||
+        !s.using_cols.empty() || s.natural || s.series_direct)
+      continue;
+    const size_t j = si - 1;
+    if ((j < b.join_is_left.size() && b.join_is_left[j]) || (j < b.join_is_right.size() && b.join_is_right[j])) continue;
+    const ParsedSelectStatement ps = parse_select_sql(s.subquery_sql);
+    auto refuse = [&](const char* why) { if (vx_trace_on()) vx_trace(std::string("lateral: ") + s.alias + " not inlined: " + why); };
+    if (!ps.ok || ps.branches.size() != 1 || !ps.with_sql.empty() || !ps.union_tail.empty()) { refuse("not one plain SELECT"); continue; }
+    const ParsedSelectBranch& lb = ps.branches[0];
+    if (!lb.sources.empty() || lb.where || !lb.group_by.empty() || lb.having || !lb.order_by.empty() || lb.limit >= 0 ||
+        lb.offset || lb.distinct || lb.rollup || !lb.windows.empty() || lb.items.empty()) {
+      refuse("has FROM, WHERE, grouping or a limit");
+      continue;
+    }
+    std::vector<std::pair<std::string, ExprPtr>> cols;
+    bool ok = true;
+    for (const SelectItem& it : lb.items) {
+      if (it.star || !it.expr || it.label.empty() || !lateral_expr_inlinable(db, it.expr.get())) { refuse("an item that cannot be repeated"); ok = false; break; }
+      bool bad = false;
+      lateral_refs_in(it.expr.get(), L, &bad);
+      if (bad) { refuse("reads an earlier lateral in a way it cannot follow"); ok = false; break; }
+      cols.push_back({lower_of(it.label), lateral_subst(it.expr, L)});
+    }
+    if (!ok) continue;
+    // a later source of this branch that is derived text and names this lateral reads it: leave it be
+    const std::string al = lower_of(s.alias);
+    bool read_later = false;
+    for (size_t k = si + 1; k < b.sources.size(); ++k)
+      if (b.sources[k].is_derived() && !shaped[k] && lower_of(b.sources[k].subquery_sql).find(al + ".") != std::string::npos) read_later = true;
+    if (read_later) { refuse("a later derived table reads it"); continue; }
+    if (j < b.join_conditions.size() && b.join_conditions[j]) filters.push_back(b.join_conditions[j]);
+    filter_at.resize(filters.size(), si);
+    L.defs.push_back({al, std::move(cols)});
+    drop.push_back(si);
+  }
+  if (drop.empty()) return false;
+  // a derived table that stays (one refused after all) must not read a lateral that goes
+  for (size_t k = 0; k < b.sources.size(); ++k) {
+    if (!b.sources[k].is_derived() || std::find(drop.begin(), drop.end(), k) != drop.end()) continue;
+    const std::string low = lower_of(b.sources[k].subquery_sql);
+    for (const auto& d : L.defs)
+      if (low.find(d.first + ".") != std::string::npos) {
+        if (vx_trace_on()) vx_trace("lateral: none inlined: " + b.sources[k].alias + " stays and reads " + d.first);
+        return false;
+      }
+  }
+  // what the rest of the statement reads of them must be something inlining can follow
+  bool bad = false;
+  for (const SelectItem& it : b.items) {
+    if (it.star && (it.star_qualifier.empty() || L.is_alias(it.star_qualifier))) { if (vx_trace_on()) vx_trace("lateral: none inlined: a * reads them"); return false; }
+    lateral_refs_in(it.expr.get(), L, &bad);
+  }
+  lateral_refs_in(b.where.get(), L, &bad);
+  lateral_refs_in(b.having.get(), L, &bad);
+  for (const auto& g : b.group_by) lateral_refs_in(g.get(), L, &bad);
+  for (const auto& o : b.order_by) lateral_refs_in(o.expr.get(), L, &bad);
+  for (const auto& jc : b.join_conditions) lateral_refs_in(jc.get(), L, &bad);
+  for (const auto& f : filters) lateral_refs_in(f.get(), L, &bad);
+  for (const auto& w : b.windows) {
+    if (!w.second) continue;
+    for (const auto& pb : w.second->partition_by) lateral_refs_in(pb.get(), L, &bad);
+    for (const auto& ob : w.second->order_by) lateral_refs_in(ob.expr.get(), L, &bad);
+  }
+  if (bad) { if (vx_trace_on()) vx_trace("lateral: none inlined: the statement reads them in a way inlining cannot follow"); return false; }
+  for (SelectItem& it : b.items) {
+    const bool was = lateral_refs_in(it.expr.get(), L, &bad);
+    if (was && !it.aliased && it.label.empty()) it.label = it.expr->source_text;
+    it.expr = lateral_subst(it.expr, L);
+  }
+  b.having = lateral_subst(b.having, L);
+  for (auto& g : b.group_by) g = lateral_subst(g, L);
+  for (auto& o : b.order_by) o.expr = lateral_subst(o.expr, L);
+  for (auto& w : b.windows) {
+    if (!w.second) continue;
+    auto ws = std::make_shared<WindowSpec>(*w.second);
+    for (auto& pb : ws->partition_by) pb = lateral_subst(pb, L);
+    for (auto& ob : ws->order_by) ob.expr = lateral_subst(ob.expr, L);
+    w.second = ws;
+  }
+  auto and_of = [](const ExprPtr& x, const ExprPtr& y) -> ExprPtr {
+    if (!x) return y;
+    auto both = std::make_shared<SqlExpr>();
+    both->op = ExprOp::And;
+    both->args = {x, y};
+    both->source_text = x->source_text + " AND " + y->source_text;
+    return both;
+  };
+  b.where = lateral_subst(b.where, L);
+  for (auto& jc : b.join_conditions) jc = lateral_subst(jc, L);
+  // An inlined lateral's ON (a WHERE conjunct that was moved onto it) is checked where the lateral was joined: on
+  // the nearest inner join before it that stays, so it still runs after that join has cut the rows down - in the
+  // WHERE it was pushed to the first join that had its columns, over every candidate there (the monsters against
+  // every line, 2,370 rows, 15 ms, where after the next join it was 35). With no such join (the first source, or
+  // a LEFT JOIN, whose ON it must not join), the WHERE.
+  for (size_t fi = 0; fi < filters.size(); ++fi) {
+    ExprPtr fs = lateral_subst(filters[fi], L);
+    size_t k = filter_at[fi];
+    while (k > 0 && std::find(drop.begin(), drop.end(), k) != drop.end()) --k;
+    const size_t jk = k - 1;
+    const bool inner = k > 0 && !(jk < b.join_is_left.size() && b.join_is_left[jk]) && !(jk < b.join_is_right.size() && b.join_is_right[jk]) &&
+                       jk < b.join_conditions.size();
+    if (inner) b.join_conditions[jk] = and_of(b.join_conditions[jk], fs);
+    else b.where = and_of(b.where, fs);
+  }
+  // the sources go, last first, with their join entries (join k belongs to source k + 1)
+  for (auto it = drop.rbegin(); it != drop.rend(); ++it) {
+    const size_t si = *it, j = si - 1;
+    b.sources.erase(b.sources.begin() + (long)si);
+    if (j < b.join_conditions.size()) b.join_conditions.erase(b.join_conditions.begin() + (long)j);
+    if (j < b.join_is_left.size()) b.join_is_left.erase(b.join_is_left.begin() + (long)j);
+    if (j < b.join_is_right.size()) b.join_is_right.erase(b.join_is_right.begin() + (long)j);
+  }
+  if (vx_trace_on()) vx_trace("lateral: " + std::to_string(drop.size()) + " scalar LATERAL(s) inlined");
+  return true;
 }
 
 SqlQueryResult execute_parsed_select_single(SqlDatabase* db, const ParsedSelectBranch& raw_branch) {
@@ -57384,7 +57825,26 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       cte_columns_from(anchor_res, cte_cols, &accum_tbl);
       accum_tbl.mark_result_table();
       accum_tbl.ensure_columns();
+      // UNION (not ALL): no row twice in the whole result - not the anchor's own duplicates, and not two of one
+      // step's (two sectors that each reach a third in the same step). Each row's key: its cells' collation keys,
+      // NULL as its own mark (MariaDB counts NULLs equal here). Only rows already kept were looked at, one by one,
+      // so a step's duplicates were all kept, each grew its own copies the next step, and Doom's 85-sector sound
+      // flood became 2,070 rows and 170 ms.
+      const bool distinct_rows = !step.union_all;
+      std::unordered_set<std::string> kept_keys;
+      auto row_key = [](const SqlRow& r) {
+        std::string k;
+        for (const std::string& v : r.values) {
+          if (sql_is_null(v)) { k += '\x01'; continue; }
+          const std::string c = collate_key(sql_display(v));
+          k += std::to_string(c.size());
+          k += ':';
+          k += c;
+        }
+        return k;
+      };
       for (const auto& r : anchor_res.rows) {
+        if (distinct_rows && !kept_keys.insert(row_key(r)).second) continue;
         accum_tbl.append_row(r);
       }
 
@@ -57411,25 +57871,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         if (rec_res.rows.empty()) break;
 
         std::vector<SqlRow> new_rows;
-        if (step.union_all) {
+        if (!distinct_rows) {
           new_rows = std::move(rec_res.rows);
         } else {
-          for (auto& r : rec_res.rows) {
-            bool found = false;
-            size_t accum_cnt = accum_tbl.row_count();
-            for (size_t ri = 0; ri < accum_cnt; ++ri) {
-              if (accum_tbl.columns.size() != r.values.size()) continue;
-              bool match = true;
-              for (size_t vi = 0; vi < r.values.size(); ++vi) {
-                if (collate_key(sql_display(accum_tbl.cell(ri, vi))) != collate_key(sql_display(r.values[vi]))) {
-                  match = false;
-                  break;
-                }
-              }
-              if (match) { found = true; break; }
-            }
-            if (!found) new_rows.push_back(std::move(r));
-          }
+          for (auto& r : rec_res.rows)
+            if (kept_keys.insert(row_key(r)).second) new_rows.push_back(std::move(r));
         }
 
         if (new_rows.empty()) break;
@@ -61129,13 +61575,55 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     size_t b = end_tok < toks.size() && toks[end_tok].kind != Tok::End ? toks[end_tok].start_pos : sql.size();
     std::string sel = sql.substr(a, b - a);
     while (!sel.empty() && (sel.back() == ';' || std::isspace((unsigned char)sel.back()))) sel.pop_back();
+    // Which of the outermost SELECT's items are a bare 0x.. literal (with or without an alias): those columns of the
+    // result are its bytes, but going into a numeric column each is the number they spell, as MariaDB stores
+    // INSERT INTO t (int_col) SELECT 0x41 (65). The result has no such mark, so it is read off the statement.
+    std::vector<uint8_t> hex_item;
+    {
+      size_t i = from;
+      int d = 0;
+      for (; i < end_tok; ++i) {   // past a WITH's definitions, which are all in brackets
+        if (toks[i].kind == Tok::Punct && toks[i].text == "(") d++;
+        else if (toks[i].kind == Tok::Punct && toks[i].text == ")") d--;
+        else if (d == 0 && toks[i].kind == Tok::Ident && !toks[i].quoted && toks[i].up == "SELECT") break;
+      }
+      if (i < end_tok) {
+        ++i;
+        while (i < end_tok && toks[i].kind == Tok::Ident && !toks[i].quoted &&
+               (toks[i].up == "DISTINCT" || toks[i].up == "ALL" || toks[i].up == "DISTINCTROW")) ++i;
+        size_t item_start = i;
+        d = 0;
+        for (; i <= end_tok; ++i) {
+          const bool at_end = i == end_tok || toks[i].kind == Tok::End;
+          const Token& tk = toks[std::min(i, toks.size() - 1)];
+          if (!at_end && tk.kind == Tok::Punct && tk.text == "(") { d++; continue; }
+          if (!at_end && tk.kind == Tok::Punct && tk.text == ")") { d--; continue; }
+          const bool stop = at_end || (d == 0 && tk.kind == Tok::Ident && !tk.quoted &&
+                                       (tk.up == "FROM" || tk.up == "WHERE" || tk.up == "UNION" || tk.up == "GROUP" ||
+                                        tk.up == "ORDER" || tk.up == "LIMIT" || tk.up == "HAVING" || tk.up == "WINDOW" ||
+                                        tk.up == "INTO" || tk.up == "EXCEPT" || tk.up == "INTERSECT"));
+          if (stop || (d == 0 && tk.kind == Tok::Punct && tk.text == ",")) {
+            const size_t n = i - item_start;
+            const bool hex = n >= 1 && toks[item_start].hex &&
+                             (n == 1 || (n == 2 && toks[item_start + 1].kind == Tok::Ident) ||
+                              (n == 3 && toks[item_start + 1].up == "AS" && toks[item_start + 2].kind == Tok::Ident));
+            hex_item.push_back(hex ? 1 : 0);
+            item_start = i + 1;
+            if (stop) break;
+          }
+        }
+      }
+    }
     SqlQueryResult sr = execute_local_query(sel);
     if (!sr.success) return sr;
     tuples.reserve(sr.rows.size());
     for (const auto& row : sr.rows) {
       std::vector<Val> tuple;
       tuple.reserve(row.values.size());
-      for (const auto& v : row.values) tuple.push_back(sql_is_null(v) ? val_null() : val_text(v));
+      for (const auto& v : row.values) {
+        tuple.push_back(sql_is_null(v) ? val_null() : val_text(v));
+        if (tuple.size() <= hex_item.size() && hex_item[tuple.size() - 1] && !tuple.back().null) tuple.back().hexnum = true;
+      }
       tuples.push_back(std::move(tuple));
     }
     p.seek(end_tok);
@@ -61559,7 +62047,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     SqlRow cur = t->get_row(target);
     if (dup_literal_only) {
       const SqlRow before = cur;
-      for (const auto& d : dup_sets) cur.values[d.col] = d.value->literal.null ? sql_null() : d.value->literal.str();
+      for (const auto& d : dup_sets) cur.values[d.col] = val_store_text(d.value->literal, t->columns[d.col].type);
       *out = cur;
       bump_on_update(before, out);
       return true;

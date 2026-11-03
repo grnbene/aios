@@ -9,6 +9,7 @@
 #
 # SQLDOOM_FRAMES=n draws n frames with no display and saves the last to SQLDOOM_SHOT (default frame.png); the keys
 # held meanwhile are SQLDOOM_KEYS (e.g. "up,ctrl").
+import { r3d_doom_open, r3d_doom_scene, r3d_doom_draw } from "lib/render3d.gr"
 let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
 let clean_args = []
 let arg_i = 0
@@ -26,6 +27,7 @@ let skill = len(clean_args) > 1 ? int(clean_args[1]) : 2
 
 setenv("AIOS_NO_REDO", "1")
 setenv("AIOS_REDO_SYNC", "0")
+setenv("AIOS_CTE_MERGE_SKIP", "visible_children")
 
 sql("USE doom")
 pcall(sql, "ALTER TABLE game_tic_commands ADD COLUMN IF NOT EXISTS jump_requested BOOLEAN NOT NULL DEFAULT FALSE")
@@ -61,6 +63,9 @@ fn bind(text, params) {
   return out
 }
 let camera_sql = read_file(path_join(here, "sql/client/camera_pose.sql"))
+# The 3D renderer (lib/render3d.gr): walls, floors and sprites worked out in SQL each frame (sql/client/geometry.sql)
+# and filled at the window's size in true colour; the 320x200 SQL software renderer is the classic mode.
+let r3 = r3d_doom_open(here, map_id, 1280, 960)
 let snapshot_sql = read_file(path_join(here, "sql/client/game_tick_finish.sql"))
 let renderer_sql = read_file(path_join(here, "sql/renderer.sql"))
 
@@ -129,8 +134,12 @@ let has_red = false
 let interact_prompt = nil
 let toast_msg = nil
 let toast_timer = 0
+let movers_active_until = 0
+let weapon_firing_until = 0
 
-fn check_interact(px, py, angle) {
+# The line the player would use from (px, py) facing angle: the query (run on the main thread for the classic
+# renderer, in the tic's worker for the 3D one) and what its answer means for the prompt.
+fn interact_query(px, py, angle, mid) {
   let rad = angle * 3.141592653589793 / 180.0
   let dx = cos(rad)
   let dy = sin(rad)
@@ -140,9 +149,11 @@ fn check_interact(px, py, angle) {
     "FROM linedef_geom ld " +
     "JOIN line_special_defs sd ON sd.special = ld.special " +
     "WHERE ld.map_id = {} AND sd.use_activated " +
-    "HAVING dist BETWEEN 0 AND 200 AND frac BETWEEN -0.15 AND 1.15 " +
-    "ORDER BY dist LIMIT 1", px, py, dx, dy, px, dy, py, dx, dx, dy, map_id)
-  let r = sql(q)
+    "HAVING dist BETWEEN 0 AND 250 AND frac BETWEEN -0.20 AND 1.20 " +
+    "ORDER BY dist LIMIT 1", px, py, dx, dy, px, dy, py, dx, dx, dy, mid)
+  return q
+}
+fn interact_prompt_of(r) {
   if len(r) > 0 {
     let hit = r[0]
     if hit.is_exit == 1 { return "EXIT LEVEL" }
@@ -151,11 +162,79 @@ fn check_interact(px, py, angle) {
   }
   return nil
 }
+fn check_interact(px, py, angle) { return interact_prompt_of(sql(interact_query(px, py, angle, map_id))) }
 
 fn down(k) { return get(held, k, false) }
 fn axis(plus, minus) { return (plus ? 1 : 0) - (minus ? 1 : 0) }
 
-fn run_tic() {
+let map_titles = {
+  "E1M1": "HANGAR",
+  "E1M2": "NUCLEAR PLANT",
+  "E1M3": "TOXIN REFINERY",
+  "E1M4": "COMMAND CONTROL",
+  "E1M5": "PHOBOS LAB",
+  "E1M6": "CENTRAL PROCESSING",
+  "E1M7": "COMPUTER STATION",
+  "E1M8": "PHOBOS ANOMALY",
+  "E1M9": "MILITARY BASE"
+}
+
+fn advance_to_next_level(secret) {
+  let cur_id = map_id
+  let cur_name = map_name
+  let next_id = nil
+  let next_name = nil
+
+  if secret {
+    next_id = 9
+    next_name = "E1M9"
+  } else if cur_id < 8 {
+    next_id = cur_id + 1
+    next_name = "E1M" + str(next_id)
+  } else if cur_id == 9 {
+    next_id = 4
+    next_name = "E1M4"
+  } else {
+    toast_msg = "EPISODE 1 COMPLETED! VICTORY!"
+    toast_timer = clock() + 6000
+    level_over = true
+    return nil
+  }
+
+  print(format("Advancing from {} to {} (map_id {})", cur_name, next_name, next_id))
+
+  let old_player = player
+  let old_map = map_id
+  map_id = next_id
+  map_name = next_name
+  let pl_rows = sql("SELECT id FROM things WHERE map_id = " + str(map_id) + " AND type = 1")
+  if len(pl_rows) == 0 {
+    print("Cannot find player start in " + map_name)
+    level_over = true
+    return nil
+  }
+  player = pl_rows[0].id
+  sql("SET @map_id = " + str(map_id) + ", @player_thing_id = " + str(player) + ", @skill = " + str(skill))
+
+  # Transition using Doom engine routine:
+  sql("SELECT doom_enter_level(" + str(map_id) + ", " + str(player) + ", " + str(skill) + ", " + str(old_map) + ", " + str(old_player) + ")")
+  sql("UPDATE player_weapons SET state = 'ready', sy = 32.0 WHERE map_id = " + str(map_id))
+  r3 = r3d_doom_open(here, map_id, 1280, 960)
+
+  level_over = false
+  sim_start = nil
+  sim_tics = 0
+  tics = 0
+  last_render_x = nil
+  last_render_y = nil
+  last_render_z = nil
+  last_render_angle = nil
+
+  toast_msg = "ENTERING " + map_name + " • " + get(map_titles, map_name, "")
+  toast_timer = clock() + 3000
+}
+
+fn tic_command() {
   let fwd = axis(down("up") or down("w"), down("down") or down("s"))
   let strafe = axis(down("d"), down("a"))
   let turn = axis(down("right"), down("left")) * 4.5 + mouse_turn
@@ -168,6 +247,7 @@ fn run_tic() {
     use = true
   }
 
+  if fire { weapon_firing_until = clock() + 600 }
   let q = "SELECT doom_run_game_tic(" + join([str(map_id), str(player), str(skill), str(fwd) + "e0", str(strafe) + "e0",
             run ? "TRUE" : "FALSE", str(turn) + "e0", fire ? "TRUE" : "FALSE", pending_weapon == nil ? "NULL" : str(pending_weapon),
             use ? "TRUE" : "FALSE", jump ? "TRUE" : "FALSE"], ", ") + ")"
@@ -175,10 +255,89 @@ fn run_tic() {
   pending_use = false
   pending_jump = false
   pending_fire = false
+  return {"q": q, "use": use}
+}
+
+# What the tic's worker works out for the 3D renderer after the tic: the camera at the tic before and at this one,
+# the scene for it and the use prompt there. nil in classic mode (its renderer runs on the main thread).
+fn scene_inputs() {
+  if hud_mode != "modern" { return nil }
+  return {"cam0": bind(camera_sql, [map_id, player, 0.0]), "cam1": bind(camera_sql, [map_id, player, 1.0]),
+          "geo": r3.geo, "psprite": r3.psprite, "map_id": map_id, "player": player, "skill": skill, "tic": tics + 1}
+}
+
+fn run_tic() {
+  let c = tic_command()
   let t0 = clock()
-  sql(q)
+  finish_tic(tic_sql(c.q, bind(snapshot_sql, [map_id, player]), scene_inputs()), c.use, t0)
+}
+
+# The tic in a worker: the keys read now, the SQL (the tic, then its scene) run on another thread, the result taken
+# by the draw loop when it is done (tic_poll) - so frames keep coming, without touching the database, while it
+# works out the next tic.
+let tic_task = nil
+fn tic_start() {
+  let c = tic_command()
+  tic_task = {"task": spawn(tic_sql, c.q, bind(snapshot_sql, [map_id, player]), scene_inputs()), "use": c.use, "t0": clock()}
+}
+# How long the worker's tic takes (tic, snapshot and scene), as it measures it: a rolling average.
+let tic_work_ms = 0.0
+fn tic_collect() {
+  let t = tic_task
+  tic_task = nil
+  let res = await(t.task)
+  tic_work_ms = tic_work_ms <= 0.0 ? res.ms : tic_work_ms * 0.8 + res.ms * 0.2
+  finish_tic(res, t.use, t.t0)
+}
+# The running tic taken if it is done - or, wait_ms > 0, waited for if it should be done within wait_ms. A tic takes
+# longer than a frame: taken only when a frame finds it done, it would wait up to a frame more each time and the
+# game would run at half the display's rate. So a frame that has drawn waits for a tic about to finish (by how long
+# tics take) in the time left before the display wants the next frame. A tic past its usual time (a stall) is not
+# waited for.
+fn tic_poll(wait_ms) {
+  if tic_task == nil { return false }
+  if not task_done(tic_task.task) {
+    if wait_ms <= 0.0 or tic_work_ms <= 0.0 { return false }
+    let left = tic_work_ms - (clock() - tic_task.t0)
+    if left > wait_ms or left < -3.0 { return false }
+  }
+  tic_collect()
+  return true
+}
+
+# The game tic, its snapshot and (sc not nil) its scene, as one call: run here (headless), or in a worker
+# (tic_start) while the main loop keeps drawing.
+fn tic_sql(q, snap_q, sc) {
+  let t0 = clock()
+  _raw_sql("USE doom")
+  _raw_sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+  _raw_sql(q)
+  let out = {"snap": _raw_sql(snap_q), "scene": nil, "ms": 0.0}
+  if sc == nil {
+    out.ms = clock() - t0
+    return out
+  }
+  let c0 = _raw_sql(sc.cam0)
+  let c1 = _raw_sql(sc.cam1)
+  if len(c1) == 0 {
+    out.ms = clock() - t0
+    return out
+  }
+  let p1 = c1[0]
+  let scene = r3d_doom_scene(_raw_sql, sc.geo, sc.psprite, sc.map_id, sc.player, sc.skill, p1, sc.tic)
+  scene.p0 = len(c0) > 0 ? c0[0] : p1
+  scene.p1 = p1
+  scene.interact = interact_prompt_of(_raw_sql(interact_query(p1.x, p1.y, p1.angle, sc.map_id)))
+  out.scene = scene
+  out.ms = clock() - t0
+  return out
+}
+
+# What a finished tic changes on the client: the HUD's numbers, the use and exit results.
+let cur_scene = nil
+fn finish_tic(res, use, t0) {
+  let snap = res.snap
   tics = tics + 1
-  let snap = sql(bind(snapshot_sql, [map_id, player]))
   if len(snap) > 0 {
     let s = snap[0]
     if s.health != nil { cur_health = s.health }
@@ -195,6 +354,7 @@ fn run_tic() {
       if s.use_activated == 1 {
         toast_msg = "DOOR / SWITCH ACTIVATED"
         toast_timer = clock() + 1500
+        movers_active_until = clock() + 5000
       } else if s.use_locked == 1 {
         toast_msg = "LOCKED: NEED " + upper(str(s.required_key)) + " KEY"
         toast_timer = clock() + 2000
@@ -205,11 +365,17 @@ fn run_tic() {
     }
 
     if s.use_exit == 1 or s.cross_exit == 1 or s.use_secret_exit == 1 or s.cross_secret_exit == 1 or s.sector_exit == 1 or s.boss_exit == 1 {
-      level_over = true
-      status = map_name + " done"
+      advance_to_next_level(s.use_secret_exit == 1 or s.cross_secret_exit == 1)
     } else if s.alive == 0 {
       status = "dead"
     }
+  }
+  # the tic's scene, unless the tic took the player to another map (the next tic's is for that one)
+  if res.scene != nil and res.scene.map_id == map_id {
+    cur_scene = res.scene
+    interact_prompt = cur_scene.interact
+  } else if res.scene != nil {
+    cur_scene = nil
   }
   status = format("{} tic {} ({:.0f} ms)", level_over ? map_name + " done" : map_name, tics, clock() - t0)
   last_tic_ms = clock()
@@ -220,8 +386,15 @@ let last_render_y = nil
 let last_render_z = nil
 let last_render_angle = nil
 let last_render_hud = nil
+let last_sql_time = 0.0
+let modern_buf = canvas_create(1280, 960)
+let modern_ready = false
 
 fn render_frame() {
+  if hud_mode == "modern" {
+    render_frame_3d()
+    return
+  }
   let t_start = clock()
   let alpha = 1.0
   let pose = sql(bind(camera_sql, [map_id, player, alpha]))
@@ -232,21 +405,35 @@ fn render_frame() {
     interact_prompt = check_interact(p.x, p.y, p.angle)
   }
 
-  if p.x == last_render_x and p.y == last_render_y and p.z == last_render_z and p.angle == last_render_angle and tics == last_frame_tic and hud_mode == last_render_hud {
+  let pose_changed = (p.x != last_render_x or p.y != last_render_y or p.z != last_render_z or p.angle != last_render_angle)
+  let hud_changed = (hud_mode != last_render_hud)
+  let movers_active = (clock() < movers_active_until)
+  let weapon_active = (clock() < weapon_firing_until)
+  let periodic_tic = (tics - last_frame_tic >= 15)
+
+  if not pose_changed and not hud_changed and not movers_active and not weapon_active and not periodic_tic and last_frame_tic != -1 {
     return
   }
+
+  # Pace 3D SQL raytracer updates to keep display frame rate high and buttery smooth
+  let now = clock()
+  if pose_changed and (now - last_sql_time < 55.0) and last_frame_tic != -1 and not hud_changed {
+    return
+  }
+
   last_render_x = p.x
   last_render_y = p.y
   last_render_z = p.z
   last_render_angle = p.angle
   last_render_hud = hud_mode
+  last_sql_time = now
 
   let render_q = renderer_sql
   if hud_mode == "modern" {
     render_q = replace(render_q, "COALESCE(@screen_h, 200) AS screen_h,", "200 AS screen_h,")
     let cut_pos = index_of(render_q, "-- @hud-cut")
     if cut_pos != -1 {
-      render_q = slice(render_q, 0, cut_pos) + "SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') AS frame_rgb FROM view_colored;"
+      render_q = slice(render_q, 0, cut_pos) + "SELECT GROUP_CONCAT(cm.rgb ORDER BY pix SEPARATOR '') AS frame_rgb FROM view_colored;"
     }
   } else {
     render_q = replace(render_q, "COALESCE(@screen_h, 200) AS screen_h,", "168 AS screen_h,")
@@ -265,8 +452,9 @@ fn render_frame() {
       rgb = slice(rgb, 0, 192000)
     }
     canvas_set_pixels(frame, rgb)
-    if hud_mode == "modern" {
-      canvas_postprocess_modern(frame, 0.35, 0.22)
+    if hud_mode == "modern" and texture_filtering {
+      canvas_remaster_modern(modern_buf, frame, 0.35, 0.0, 0.14)
+      modern_ready = true
     }
   }
   let t_can = clock() - t_c0
@@ -274,6 +462,28 @@ fn render_frame() {
   if frames > 0 {
     print(format("  breakdown: cam={:.1f}ms sql={:.1f}ms can={:.1f}ms", t_cam, t_sql, t_can))
   }
+}
+
+# The modern renderer: every frame, the last tic's scene seen from the camera where it is between that tic and the
+# one before (alpha, as camera_pose.sql has it), worked out here - so the picture moves at the display's rate
+# however often the game ticks, and no frame waits on the database.
+let r3_last_ms = 0.0
+fn render_frame_3d() {
+  let t0 = clock()
+  if cur_scene == nil { return }
+  let alpha = min(1.0, max(0.0, (t0 - last_tic_ms) / (1000.0 / 35.0)))
+  let a = cur_scene.p0
+  let b = cur_scene.p1
+  let turn = b.angle - a.angle + 180.0
+  turn = turn - 360.0 * floor(turn / 360.0) - 180.0
+  let ang = a.angle + turn * alpha
+  let pose = {"x": a.x + (b.x - a.x) * alpha, "y": a.y + (b.y - a.y) * alpha, "z": a.z + (b.z - a.z) * alpha,
+              "angle": ang - 360.0 * floor(ang / 360.0)}
+  r3d_options(r3.t, {"bilinear": texture_filtering, "mipmaps": texture_filtering})
+  r3d_doom_draw(r3, cur_scene, pose)
+  r3_last_ms = clock() - t0
+  last_frame_tic = tics
+  if frames > 0 { print(format("  3d: tic's scene sql {:.1f} ms, frame {:.1f} ms, {} triangles", r3.sql_ms, r3.fill_ms, r3.tris)) }
 }
 
 let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
@@ -285,7 +495,7 @@ fn key_name(e) { return get(keymap, lower(e.key), lower(e.key)) }
 let sim_start = nil
 let sim_tics = 0
 
-fn run_due_tics() {
+fn run_due_tics(wait_ms) {
   if level_over or menu_open { return }
   let now = clock()
   if sim_start == nil {
@@ -293,17 +503,21 @@ fn run_due_tics() {
     sim_tics = 0
   }
   let target_tics = int((now - sim_start) / (1000 / 35))
-  if sim_tics < target_tics {
-    run_tic()
+  tic_poll(wait_ms)
+  if tic_task == nil and sim_tics < target_tics {
+    tic_start()
     sim_tics = sim_tics + 1
-    if sim_tics < target_tics {
-      sim_tics = target_tics
-    }
+    # more than a few tics behind (a level change, a stall): catch the clock up instead of racing to it
+    if sim_tics < target_tics - 4 { sim_tics = target_tics }
   }
 }
 
+let pane_frames = int(env("SQLDOOM_PANE_FRAMES", "0"))
+let fps_t0 = nil
+let fps_tics0 = 0
 let last_draw_time = nil
 let fps_rolling = 0.0
+let draw_frame_count = 0
 
 let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width": 1280, "height": 960,
   "on_draw": fn (cv) {
@@ -311,24 +525,41 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
     if last_draw_time != nil {
       let dt = now - last_draw_time
       if dt > 0 {
-        let cur_fps = 1000.0 / dt
-        fps_rolling = fps_rolling == 0.0 ? cur_fps : (fps_rolling * 0.85 + cur_fps * 0.15)
+        let cur_fps = min(60.0, 1000.0 / dt)
+        fps_rolling = fps_rolling <= 0.0 ? cur_fps : (fps_rolling * 0.70 + cur_fps * 0.30)
       }
+    } else {
+      fps_rolling = 35.0
     }
     last_draw_time = now
 
     if not menu_open {
-      run_due_tics()
+      run_due_tics(0.0)
       render_frame()
     }
+    # SQLDOOM_PANE_FRAMES runs (a timed window): the frame rate and the game's tic rate, every 60 frames
+    draw_frame_count = draw_frame_count + 1
+    if pane_frames > 0 and draw_frame_count % 60 == 0 {
+      if fps_t0 != nil {
+        let dt = (now - fps_t0) / 1000.0
+        print(format("window: {:.1f} frames/s, {:.1f} tics/s, last frame {:.1f} ms (sql {:.1f}, fill {:.1f}), {} triangles",
+                     60.0 / dt, (tics - fps_tics0) / dt, r3_last_ms, r3.sql_ms, r3.fill_ms, r3.tris))
+      }
+      fps_t0 = now
+      fps_tics0 = tics
+    }
 
-    # Apply bilinear smoothing when texture_filtering is enabled (Modern 2026 presentation)
-    canvas_set_image_smoothing(cv, texture_filtering)
-    canvas_clear(cv, "#000000")
-    canvas_save(cv)
-    canvas_scale(cv, 4, 4.8)
-    canvas_draw_image(cv, frame, 0, 0)
-    canvas_restore(cv)
+    # Modern 2026 Remastering Engine vs Classic 1993 Presentation
+    if hud_mode == "modern" {
+      canvas_draw_image(cv, r3.canvas, 0, 0)
+    } else {
+      canvas_set_image_smoothing(cv, texture_filtering)
+      canvas_clear(cv, "#000000")
+      canvas_save(cv)
+      canvas_scale(cv, 4, 4.8)
+      canvas_draw_image(cv, frame, 0, 0)
+      canvas_restore(cv)
+    }
 
     # Modern 2026 Precision Crosshair
     if hud_mode == "modern" {
@@ -342,22 +573,22 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
     # Interactive Prompt under Crosshair (Properly centered in box)
     if interact_prompt != nil {
       let p_txt = "[E] " + interact_prompt
-      let p_w = 360
-      let p_x = 640 - int(p_w / 2)
-      canvas_fill_round_rect(cv, p_x, 515, p_w, 34, 6, "#030712d8")
-      canvas_stroke_round_rect(cv, p_x, 515, p_w, 34, 6, "#38bdf888", 1)
-      let t_w = int(len(p_txt) * 8.5)
-      canvas_fill_text(cv, p_txt, 640 - int(t_w / 2), 524, "#38bdf8")
+      let pm = canvas_measure_text(cv, p_txt)
+      let p_w = pm.width + 36
+      let p_x = int((1280 - p_w) / 2)
+      canvas_fill_round_rect(cv, p_x, 515, p_w, 36, 6, "#030712d8")
+      canvas_stroke_round_rect(cv, p_x, 515, p_w, 36, 6, "#38bdf888", 1)
+      canvas_fill_text(cv, p_txt, p_x + 18, 515 + int((36 - pm.height) / 2), "#38bdf8")
     }
 
     # Toast / Feedback Banner (Centered text)
     if toast_timer > now and toast_msg != nil {
-      let b_w = 400
-      let b_x = 640 - int(b_w / 2)
-      canvas_fill_round_rect(cv, b_x, 560, b_w, 34, 6, "#0f172ad8")
-      canvas_stroke_round_rect(cv, b_x, 560, b_w, 34, 6, "#10b98188", 1)
-      let msg_w = int(len(toast_msg) * 8.5)
-      canvas_fill_text(cv, toast_msg, 640 - int(msg_w / 2), 569, "#34d399")
+      let tm = canvas_measure_text(cv, toast_msg)
+      let b_w = tm.width + 48
+      let b_x = int((1280 - b_w) / 2)
+      canvas_fill_round_rect(cv, b_x, 560, b_w, 36, 6, "#0f172ad8")
+      canvas_stroke_round_rect(cv, b_x, 560, b_w, 36, 6, "#10b98188", 1)
+      canvas_fill_text(cv, toast_msg, b_x + 24, 560 + int((36 - tm.height) / 2), "#34d399")
     }
 
     if crt_enabled {
@@ -370,51 +601,61 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
       canvas_blit(cv, crt_overlay, 0, 0, 0, 0, 1280, 960, 0.45)
     }
 
-    # Sleek Top HUD Badges (Vertically centered: text_y = box_y + (36 - 16)/2 = 26)
-    canvas_fill_round_rect(cv, 24, 16, 260, 36, 8, "#030712d0")
-    canvas_stroke_round_rect(cv, 24, 16, 260, 36, 8, "#38bdf844", 1)
-    canvas_fill_text(cv, format("MISSION: {} • HANGAR", map_name), 40, 26, "#38bdf8")
+    # Sleek Top HUD Badges (Dynamically measured to avoid any text overflow)
+    let title_txt = format("MISSION: {} • {}", map_name, get(map_titles, map_name, "LEVEL"))
+    let tm = canvas_measure_text(cv, title_txt)
+    let b_w = tm.width + 36
+    canvas_fill_round_rect(cv, 24, 16, b_w, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, 24, 16, b_w, 36, 8, "#38bdf844", 1)
+    canvas_fill_text(cv, title_txt, 24 + 18, 16 + int((36 - tm.height) / 2), "#38bdf8")
 
     # Center Menu button
-    canvas_fill_round_rect(cv, 530, 16, 220, 36, 8, "#030712d0")
-    canvas_stroke_round_rect(cv, 530, 16, 220, 36, 8, "#94a3b844", 1)
     let m_btn_txt = hud_mode == "modern" ? "SETTINGS [ESC] (MODERN)" : "SETTINGS [ESC] (CLASSIC)"
-    canvas_fill_text(cv, m_btn_txt, 545, 26, "#38bdf8")
+    let c_tm = canvas_measure_text(cv, m_btn_txt)
+    let c_w = c_tm.width + 36
+    let c_x = int((1280 - c_w) / 2)
+    canvas_fill_round_rect(cv, c_x, 16, c_w, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, c_x, 16, c_w, 36, 8, "#94a3b844", 1)
+    canvas_fill_text(cv, m_btn_txt, c_x + 18, 16 + int((36 - c_tm.height) / 2), "#38bdf8")
 
     let fps_val = fps_rolling > 0.0 ? fps_rolling : 35.0
-    canvas_fill_round_rect(cv, 996, 16, 260, 36, 8, "#030712d0")
-    canvas_stroke_round_rect(cv, 996, 16, 260, 36, 8, "#10b98144", 1)
-    canvas_fill_text(cv, format("{:.1f} FPS • 35 Hz REALTIME", fps_val), 1016, 26, "#10b981")
+    let fps_txt = format("{:.1f} FPS • 35 Hz REALTIME", fps_val)
+    let r_tm = canvas_measure_text(cv, fps_txt)
+    let r_w = r_tm.width + 32
+    let r_x = 1280 - 24 - r_w
+    canvas_fill_round_rect(cv, r_x, 16, r_w, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, r_x, 16, r_w, 36, 8, "#10b98144", 1)
+    canvas_fill_text(cv, fps_txt, r_x + 16, 16 + int((36 - r_tm.height) / 2), "#10b981")
 
     # Modern 2026 Status HUD (Cleanly separated label, value, and progress bar)
     if hud_mode == "modern" {
       # Health Card (Bottom-Left: y=836, h=76)
       canvas_fill_round_rect(cv, 24, 836, 240, 76, 8, "#030712d8")
       canvas_stroke_round_rect(cv, 24, 836, 240, 76, 8, "#22c55e44", 1)
-      canvas_fill_text(cv, "HEALTH", 40, 848, "#94a3b8")
+      canvas_fill_text(cv, "HEALTH", 40, 846, "#94a3b8")
       let hp_col = cur_health > 50 ? "#22c55e" : (cur_health > 25 ? "#f59e0b" : "#ef4444")
-      canvas_fill_text(cv, format("{} HP", cur_health), 40, 868, hp_col)
+      canvas_fill_text(cv, format("{} HP", cur_health), 40, 866, hp_col)
       canvas_fill_round_rect(cv, 40, 894, 208, 6, 3, "#1e293b")
       let hp_w = int(208.0 * max(0.0, min(100.0, cur_health * 1.0)) / 100.0)
       if hp_w > 0 { canvas_fill_round_rect(cv, 40, 894, hp_w, 6, 3, hp_col) }
 
       # Armor & Security Card (Bottom-Center: y=836, h=76)
-      canvas_fill_round_rect(cv, 490, 836, 300, 76, 8, "#030712d8")
-      canvas_stroke_round_rect(cv, 490, 836, 300, 76, 8, "#0ea5e944", 1)
-      canvas_fill_text(cv, "ARMOR & SECURITY", 506, 848, "#94a3b8")
-      canvas_fill_text(cv, format("{}%", cur_armor), 506, 868, "#0ea5e9")
-      canvas_fill_text(cv, has_blue ? "[BLUE]" : "[-]", 616, 868, has_blue ? "#38bdf8" : "#475569")
-      canvas_fill_text(cv, has_yellow ? "[YEL]" : "[-]", 676, 868, has_yellow ? "#eab308" : "#475569")
-      canvas_fill_text(cv, has_red ? "[RED]" : "[-]", 730, 868, has_red ? "#ef4444" : "#475569")
-      canvas_fill_round_rect(cv, 506, 894, 268, 6, 3, "#1e293b")
-      let arm_w = int(268.0 * max(0.0, min(100.0, cur_armor * 1.0)) / 100.0)
-      if arm_w > 0 { canvas_fill_round_rect(cv, 506, 894, arm_w, 6, 3, "#0ea5e9") }
+      canvas_fill_round_rect(cv, 460, 836, 360, 76, 8, "#030712d8")
+      canvas_stroke_round_rect(cv, 460, 836, 360, 76, 8, "#0ea5e944", 1)
+      canvas_fill_text(cv, "ARMOR & SECURITY", 476, 846, "#94a3b8")
+      canvas_fill_text(cv, format("{}%", cur_armor), 476, 866, "#0ea5e9")
+      canvas_fill_text(cv, has_blue ? "[BLUE]" : "[-]", 606, 866, has_blue ? "#38bdf8" : "#475569")
+      canvas_fill_text(cv, has_yellow ? "[YEL]" : "[-]", 676, 866, has_yellow ? "#eab308" : "#475569")
+      canvas_fill_text(cv, has_red ? "[RED]" : "[-]", 746, 866, has_red ? "#ef4444" : "#475569")
+      canvas_fill_round_rect(cv, 476, 894, 328, 6, 3, "#1e293b")
+      let arm_w = int(328.0 * max(0.0, min(100.0, cur_armor * 1.0)) / 100.0)
+      if arm_w > 0 { canvas_fill_round_rect(cv, 476, 894, arm_w, 6, 3, "#0ea5e9") }
 
       # Ammo Card (Bottom-Right: y=836, h=76)
       canvas_fill_round_rect(cv, 1016, 836, 240, 76, 8, "#030712d8")
       canvas_stroke_round_rect(cv, 1016, 836, 240, 76, 8, "#38bdf844", 1)
-      canvas_fill_text(cv, "BULLETS", 1032, 848, "#94a3b8")
-      canvas_fill_text(cv, format("{} / 200", cur_bullets), 1032, 868, "#38bdf8")
+      canvas_fill_text(cv, "BULLETS", 1032, 846, "#94a3b8")
+      canvas_fill_text(cv, format("{} / 200", cur_bullets), 1032, 866, "#38bdf8")
       canvas_fill_round_rect(cv, 1032, 894, 208, 6, 3, "#1e293b")
       let am_w = int(208.0 * max(0.0, min(200.0, cur_bullets * 1.0)) / 200.0)
       if am_w > 0 { canvas_fill_round_rect(cv, 1032, 894, am_w, 6, 3, "#38bdf8") }
@@ -422,29 +663,33 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
 
     # Sleek footer controls bar (shown in Modern mode so Classic status bar remains unobstructed)
     if hud_mode == "modern" {
-      canvas_fill_rect(cv, 0, 926, 1280, 34, "#020617ee")
-      canvas_fill_text(cv, "WASD: Move  •  Space: Jump  •  E: Use  •  Mouse: Look  •  Shift: Walk  •  Esc: Settings Menu  •  C: Scanlines", 140, 935, "#94a3b8")
+      canvas_fill_rect(cv, 0, 920, 1280, 40, "#020617ee")
+      let foot_txt = "WASD: Move  •  Space: Jump  •  E: Use  •  Mouse: Look  •  Shift: Walk  •  Esc: Settings Menu  •  C: Scanlines"
+      let fm = canvas_measure_text(cv, foot_txt)
+      canvas_fill_text(cv, foot_txt, int((1280 - fm.width) / 2), 922 + int((30 - fm.height) / 2), "#94a3b8")
     }
 
     # Interactive Settings Menu (Classic vs Modern 2026)
     if menu_open {
       canvas_fill_rect(cv, 0, 0, 1280, 960, "#000000a8")
-      let mx = 360
-      let my = 180
-      let mw = 560
+      let mw = 640
       let mh = 560
+      let mx = int((1280 - mw) / 2)
+      let my = 180
       canvas_fill_round_rect(cv, mx, my, mw, mh, 12, "#030712f4")
       canvas_stroke_round_rect(cv, mx, my, mw, mh, 12, "#38bdf899", 2)
 
       # Title & Subtitle
-      canvas_fill_text(cv, "SQLDOOM CONFIGURATION", mx + 160, my + 24, "#38bdf8")
-      canvas_fill_text(cv, "Toggle between Modern 2026 & Classic 1993", mx + 125, my + 46, "#94a3b8")
+      let tm = canvas_measure_text(cv, "SQLDOOM CONFIGURATION")
+      canvas_fill_text(cv, "SQLDOOM CONFIGURATION", mx + int((mw - tm.width) / 2), my + 20, "#38bdf8")
+      let sm = canvas_measure_text(cv, "Toggle between Modern 2026 & Classic 1993")
+      canvas_fill_text(cv, "Toggle between Modern 2026 & Classic 1993", mx + int((mw - sm.width) / 2), my + 44, "#94a3b8")
       canvas_fill_rect(cv, mx + 30, my + 72, mw - 60, 1, "#334155")
 
       let items = [
         {"label": "Game Experience", "val": hud_mode == "modern" ? "Modern 2026 Remaster" : "Classic 1993 Retro", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
-        {"label": "Environment & Monsters", "val": texture_filtering ? "Remastered (HD SSAO)" : "Original Retro Pixels", "col": texture_filtering ? "#22c55e" : "#f59e0b"},
-        {"label": "HUD Interface", "val": hud_mode == "modern" ? "2026 Cyber Vector" : "1993 Status Bar", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
+        {"label": "Environment & Monsters", "val": texture_filtering ? "Remastered (Modern 2026)" : "Classic Original (1993)", "col": texture_filtering ? "#22c55e" : "#f59e0b"},
+        {"label": "HUD Interface", "val": hud_mode == "modern" ? "2026 Cyber Vector" : "1993 Classic Bar", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
         {"label": "Jump Physics", "val": jump_enabled ? "Enabled (Space)" : "Disabled", "col": jump_enabled ? "#22c55e" : "#64748b"},
         {"label": "CRT Scanlines", "val": crt_enabled ? "Enabled" : "Disabled", "col": crt_enabled ? "#22c55e" : "#64748b"}
       ]
@@ -459,31 +704,40 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
           canvas_fill_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#0f172a80")
           canvas_stroke_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#1e293b", 1)
         }
-        canvas_fill_text(cv, items[i].label, mx + 40, iy + 16, is_sel ? "#ffffff" : "#cbd5e1")
+        let lm = canvas_measure_text(cv, items[i].label)
+        canvas_fill_text(cv, items[i].label, mx + 40, iy + int((48 - lm.height) / 2), is_sel ? "#ffffff" : "#cbd5e1")
 
         # Value pill badge
-        let pill_w = 210
+        let pill_w = 250
         let pill_x = mx + mw - 24 - pill_w - 10
         canvas_fill_round_rect(cv, pill_x, iy + 8, pill_w, 32, 6, "#020617")
         canvas_stroke_round_rect(cv, pill_x, iy + 8, pill_w, 32, 6, items[i].col + "66", 1)
         let v_txt = items[i].val
-        let v_w = int(len(v_txt) * 8.2)
-        canvas_fill_text(cv, v_txt, pill_x + int((pill_w - v_w) / 2), iy + 16, items[i].col)
+        let vm = canvas_measure_text(cv, v_txt)
+        canvas_fill_text(cv, v_txt, pill_x + int((pill_w - vm.width) / 2), iy + 8 + int((32 - vm.height) / 2), items[i].col)
       }
 
       # Resume button (Row 5)
       let is_res_sel = (menu_sel == 5)
       canvas_fill_round_rect(cv, mx + 24, my + 410, mw - 48, 48, 8, is_res_sel ? "#0284c7" : "#0369a1")
       canvas_stroke_round_rect(cv, mx + 24, my + 410, mw - 48, 48, 8, "#38bdf8", 1.5)
-      canvas_fill_text(cv, "RESUME GAME", mx + 225, my + 426, "#ffffff")
+      let rm = canvas_measure_text(cv, "RESUME GAME")
+      canvas_fill_text(cv, "RESUME GAME", mx + 24 + int((mw - 48 - rm.width) / 2), my + 410 + int((48 - rm.height) / 2), "#ffffff")
 
       # Navigation helper
-      canvas_fill_text(cv, "↑/↓: Navigate  •  Enter/Space/Click: Toggle  •  Esc: Close", mx + 68, my + 490, "#64748b")
+      let nm = canvas_measure_text(cv, "↑/↓: Navigate  •  Enter/Space/Click: Toggle  •  Esc: Close")
+      canvas_fill_text(cv, "↑/↓: Navigate  •  Enter/Space/Click: Toggle  •  Esc: Close", mx + int((mw - nm.width) / 2), my + 490, "#64748b")
     }
 
     if env("SQLDOOM_PANE_SHOT", "") != "" {
-      canvas_save_png(cv, env("SQLDOOM_PANE_SHOT", ""))
+      # the last frame of the run only (draw_frame_count is counted above)
+      let max_pf = int(env("SQLDOOM_PANE_FRAMES", "1"))
+      if draw_frame_count == max_pf {
+        canvas_save_png(cv, env("SQLDOOM_PANE_SHOT", ""))
+      }
     }
+    # the frame drawn: a tic about to finish is taken (and the next started) in what is left of the display's 1/60 s
+    if not menu_open { run_due_tics(1000.0 / 60.0 - (clock() - now) - 2.5) }
   },
   # every event: a key or mouse button held from its down event to its up event
   "on_event": fn (p, e) {
@@ -536,7 +790,11 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
 
       let b = e.button
       if b == "left" or b == 0 or b == "0" or b == nil {
-        pending_fire = true
+        if interact_prompt != nil {
+          pending_use = true
+        } else {
+          pending_fire = true
+        }
       } else if b == "right" or b == 2 or b == "2" {
         pending_use = true
       }
@@ -616,7 +874,7 @@ if frames > 0 {
     render_frame()
     print(status + format(", frame {:.0f} ms", clock() - t0))
   }
-  canvas_save_png(frame, env("SQLDOOM_SHOT", "frame.png"))
+  canvas_save_png(hud_mode == "modern" ? r3.canvas : frame, env("SQLDOOM_SHOT", "frame.png"))
 } else {
   let script = []
   for k in split(env("SQLDOOM_TEST_KEYS", ""), ",") {

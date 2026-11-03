@@ -257,6 +257,26 @@ int main() {
   }
   expect_warnings(db, "... warns", "Warning|1931|" + kWarn100);
 
+  // UNION (not ALL) keeps no row twice anywhere in the result: not the anchor's duplicates, not two rows one step
+  // makes (a diamond: 1 reaches 4 through 2 and through 3 in the same step), compared by collation (a = A) with
+  // NULLs equal. Each want is MariaDB 10.11's answer. Only earlier steps' rows were checked, so a step's
+  // duplicates all stayed and multiplied: Doom's 85-sector sound flood made 2,070 rows.
+  std::cout << "\n[4] recursive UNION drops every duplicate\n";
+  run_ok(db, "CREATE TABLE rn (v INT)");
+  run_ok(db, "INSERT INTO rn VALUES (1), (1), (2)");
+  run_ok(db, "CREATE TABLE re (a INT, b INT)");
+  run_ok(db, "INSERT INTO re VALUES (1, 2), (1, 3), (2, 4), (3, 4), (4, 5)");
+  expect_cell(db, "anchor duplicates", "WITH RECURSIVE f AS (SELECT v FROM rn UNION SELECT v + 1 FROM f WHERE v < 3) "
+              "SELECT GROUP_CONCAT(v ORDER BY v) FROM f", "1,2,3");
+  expect_cell(db, "UNION ALL keeps them", "WITH RECURSIVE f AS (SELECT v FROM rn UNION ALL SELECT v + 1 FROM f WHERE v < 3) "
+              "SELECT GROUP_CONCAT(v ORDER BY v) FROM f", "1,1,2,2,2,3,3,3");
+  expect_cell(db, "one step's duplicates", "WITH RECURSIVE f AS (SELECT 1 AS s UNION SELECT re.b FROM f JOIN re ON re.a = f.s) "
+              "SELECT GROUP_CONCAT(s ORDER BY s) FROM f", "1,2,3,4,5");
+  expect_cell(db, "by collation", "WITH RECURSIVE f AS (SELECT 'a' AS s UNION SELECT 'A' FROM f WHERE s = 'a') "
+              "SELECT GROUP_CONCAT(s) FROM f", "a");
+  expect_cell(db, "NULLs equal", "WITH RECURSIVE f AS (SELECT NULL AS s, 1 AS k UNION SELECT NULL, 1 FROM f WHERE k < 2) "
+              "SELECT COUNT(*) FROM f", "1");
+
   std::error_code ec;
   std::filesystem::remove_all(root_dir, ec);
   std::cout << "\n=== " << (g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES: " + std::to_string(g_failures)) << " ===\n";

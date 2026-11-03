@@ -305,6 +305,14 @@ Result<SqlQueryResult> sql_on_peer(Kernel& k, const std::string& peer_prefix, co
 namespace {
 Kernel* g_vm_kernel = nullptr;   // NativeFn is a plain function pointer; one kernel per process
 
+// One cell's text as a grain value, by its column's type.
+grain::Value cell_to_grain(const std::string& v, SqlDataType t) {
+  if (sql_is_null(v)) return grain::Value::nil();
+  if (t == SqlDataType::Int) { char* e = nullptr; long long n = std::strtoll(v.c_str(), &e, 10); return (e && *e == 0 && !v.empty()) ? grain::Value::integer(n) : grain::Value::string(v); }
+  if (t == SqlDataType::Real || t == SqlDataType::Decimal) { char* e = nullptr; double d = std::strtod(v.c_str(), &e); return (e && *e == 0 && !v.empty()) ? grain::Value::real(d) : grain::Value::string(v); }
+  return grain::Value::string(v);
+}
+
 grain::Value to_grain(const SqlQueryResult& r) {
   if (!r.is_result_set) {
     auto m = std::make_shared<grain::MapObj>();
@@ -316,14 +324,36 @@ grain::Value to_grain(const SqlQueryResult& r) {
   for (const auto& row : r.rows) {
     auto m = std::make_shared<grain::MapObj>();
     for (size_t i = 0; i < r.columns.size() && i < row.values.size(); ++i) {
-      const std::string& v = row.values[i];
       const SqlDataType t = i < r.column_types.size() ? r.column_types[i] : SqlDataType::Text;
+      m->put(r.columns[i], cell_to_grain(row.values[i], t));
+    }
+    rows.push_back(grain::Value::object(grain::Type::Map, m));
+  }
+  return grain::Value::list(std::move(rows));
+}
+
+// The rows as typed columns (execute_local_query_columns), into the same maps to_grain makes of their text: a
+// frame of 3,000 triangles' 33,000 numbers was printed to text by the engine and parsed back here, two thirds of
+// the time sql() took for it.
+grain::Value to_grain_columns(const SqlQueryResult& r, SqlDatabase::ResultColumns& cols) {
+  std::vector<grain::Value> rows;
+  rows.reserve(cols.rows);
+  const size_t nc = std::min(cols.cols.size(), r.columns.size());
+  for (size_t k = 0; k < cols.rows; ++k) {
+    auto m = std::make_shared<grain::MapObj>();
+    for (size_t c = 0; c < nc; ++c) {
+      const SqlDatabase::ResultColumns::Col& col = cols.cols[c];
+      const SqlDataType t = c < r.column_types.size() ? r.column_types[c] : SqlDataType::Text;
       grain::Value gv;
-      if (sql_is_null(v)) gv = grain::Value::nil();
-      else if (t == SqlDataType::Int) { char* e = nullptr; long long n = std::strtoll(v.c_str(), &e, 10); gv = (e && *e == 0 && !v.empty()) ? grain::Value::integer(n) : grain::Value::string(v); }
-      else if (t == SqlDataType::Real || t == SqlDataType::Decimal) { char* e = nullptr; double d = std::strtod(v.c_str(), &e); gv = (e && *e == 0 && !v.empty()) ? grain::Value::real(d) : grain::Value::string(v); }
-      else gv = grain::Value::string(v);
-      m->put(r.columns[i], gv);
+      if (col.kind == SqlDatabase::ResultColumns::Int) {
+        if (col.nul[k]) gv = grain::Value::nil();
+        else gv = t == SqlDataType::Int ? grain::Value::integer(col.i[k]) : grain::Value::real((double)col.i[k]);
+      } else if (col.kind == SqlDatabase::ResultColumns::Double) {
+        gv = col.nul[k] ? grain::Value::nil() : grain::Value::real(col.f[k]);
+      } else {
+        gv = cell_to_grain(col.s[k], t);
+      }
+      m->put(r.columns[c], gv);
     }
     rows.push_back(grain::Value::object(grain::Type::Map, m));
   }
@@ -334,8 +364,10 @@ grain::Value bi_sql(grain::Vm&, std::vector<grain::Value>& args, std::string& er
   if (args[0].type != grain::Type::Str) { error = "sql() wants a statement string"; return grain::Value::nil(); }
   SqlDatabase* db = g_vm_kernel ? machine_sql(*g_vm_kernel) : nullptr;
   if (!db) { error = "sql(): the SQL engine did not open on this machine"; return grain::Value::nil(); }
-  SqlQueryResult r = db->execute_local_query(args[0].str());
+  SqlDatabase::ResultColumns cols;
+  SqlQueryResult r = db->execute_local_query_columns(args[0].str(), &cols);
   if (!r.success) { error = "sql(): " + r.error_message; return grain::Value::nil(); }
+  if (cols.filled && r.is_result_set) return to_grain_columns(r, cols);
   return to_grain(r);
 }
 
