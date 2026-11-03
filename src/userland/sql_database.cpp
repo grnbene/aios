@@ -7956,10 +7956,24 @@ static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx,
 // answered here (the nested statement then runs): a shape outside this, rows forming more than one group (its
 // error), no row without a GROUP BY (an aggregate of no rows).
 bool predicate_true(const SqlExpr* e, const EvalCtx& ctx);   // with the evaluator, below
+// What a key -> rows map was built from: each key column's identity and version (ColumnStore::uid, epoch), which
+// move when that column's stored rows change or move (set, erase, recode, re-encode, a swap) and not otherwise.
+// Writes to the table's other columns leave the map as it was: the order-entry search writes a price, and keying
+// the map on the table's mutation_seq rebuilt it over all 881k prices rows on every search (70 ms each time).
+using CorrStamp = std::vector<std::pair<uint64_t, uint64_t>>;
+static CorrStamp corr_stamp(const SqlTable* t, const std::vector<int>& icols) {
+  CorrStamp s;
+  s.reserve(icols.size());
+  for (int c : icols)   // a column gone (ALTER TABLE) reads as no column: never the stamp a map was made with
+    s.push_back((size_t)c < t->col_data.size() ? std::make_pair(t->col_data[(size_t)c].uid.v, t->col_data[(size_t)c].epoch)
+                                                : std::make_pair(uint64_t(0), uint64_t(0)));
+  return s;
+}
 struct CorrIndex {
   std::string sql;
   const SqlTable* t = nullptr;
-  uint64_t mseq = 0;
+  std::vector<int> icols;                         // the table's key columns, as the keys are made
+  CorrStamp stamp;                                // corr_stamp of icols when rows_of was made
   size_t rows = 0;
   std::shared_ptr<ParsedSelectStatement> st;      // owns the expressions below
   std::vector<QuerySource> sources;               // the table, as the nested statement names it
@@ -7972,7 +7986,7 @@ struct CorrIndex {
 };
 struct CorrRows {
   const SqlTable* t = nullptr;
-  uint64_t mseq = 0;
+  CorrStamp stamp;
   size_t rows = 0;
   std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> map;
 };
@@ -8009,7 +8023,7 @@ static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const
   SqlTable* t = ctx.db->resolve_table(b.sources[0].table_name);
   if (!t || !ctx.db->is_stored_table(t) || t->inferred_types || t->col_data.size() < t->columns.size()) return nullptr;
   for (const auto& cs : t->col_data) if (cs.size() != t->row_count()) return nullptr;
-  ci->t = t; ci->mseq = t->mutation_seq; ci->rows = t->row_count();
+  ci->t = t; ci->rows = t->row_count();
   QuerySource qs;
   qs.table = t;
   qs.alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
@@ -8067,12 +8081,15 @@ static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const
     ci->conds.push_back(c);
   }
   if (icols.empty()) return nullptr;
+  ci->icols = icols;
+  ci->stamp = corr_stamp(t, icols);
   const std::string rkey = ci->sql + '\x1e' + std::string(ci->text.begin(), ci->text.end());
   {
     std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
     auto it = g_corr_rows.find(rkey);
-    if (it != g_corr_rows.end() && it->second.t == t && it->second.mseq == t->mutation_seq && it->second.rows == t->row_count()) {
+    if (it != g_corr_rows.end() && it->second.t == t && it->second.stamp == ci->stamp && it->second.rows == t->row_count()) {
       ci->rows_of = it->second.map;
+      if (vx_trace_on()) vx_trace("subquery correlation index: kept, " + std::to_string(ci->rows_of->size()) + " keys of " + t->name);
       return ci;
     }
   }
@@ -8108,7 +8125,7 @@ static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const
   {
     std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
     if (g_corr_rows.size() > 64) g_corr_rows.clear();
-    g_corr_rows[rkey] = CorrRows{t, t->mutation_seq, t->row_count(), rows_of};
+    g_corr_rows[rkey] = CorrRows{t, ci->stamp, t->row_count(), rows_of};
   }
   return ci;
 }
@@ -8126,7 +8143,7 @@ static int corr_index_answer(const SqlExpr* e, const EvalCtx& ctx, Val* out, boo
     // the same text, the same table (resolved again: a dropped one's address can return) and unchanged
     if (it != g_corr.end() && it->second->sql == e->subquery_sql &&
         ctx.db->resolve_table(it->second->st->branches[0].sources[0].table_name) == it->second->t &&
-        it->second->t->mutation_seq == it->second->mseq && it->second->t->row_count() == it->second->rows)
+        it->second->t->row_count() == it->second->rows && corr_stamp(it->second->t, it->second->icols) == it->second->stamp)
       ci = it->second;
   }
   if (!ci) {
@@ -8188,7 +8205,17 @@ static int corr_index_answer(const SqlExpr* e, const EvalCtx& ctx, Val* out, boo
   }
   if (exists) { *out = val_num(0); return 1; }
   if (group.empty()) {
-    if (b.group_by.empty()) return 0;   // an aggregate of no rows: the nested statement's own answer
+    // One plain aggregate of no rows answers as SQL has it: COUNT 0, the rest NULL. The order-entry search's
+    // `(SELECT MIN(startdate) .. WHERE startdate > CURRENT_DATE)` meets no row for almost every item, and each of
+    // those ran the nested statement (300 us) - 95 ms a search. Anything else: the nested statement's own answer.
+    if (b.group_by.empty()) {
+      const SqlExpr* it0 = b.items[0].expr.get();
+      if (!it0 || it0->op != ExprOp::Func || it0->window) return 0;   // DISTINCT or not: the same over no rows
+      const std::string fn = upper_of(it0->name);
+      if (fn == "COUNT") { *out = val_num(0); return 1; }
+      if (fn == "MIN" || fn == "MAX" || fn == "SUM" || fn == "AVG") { *out = val_null(); return 1; }
+      return 0;
+    }
     *out = val_null();
     return 1;
   }
@@ -16506,7 +16533,7 @@ static inline void shed_slack(V& v) {
 
 namespace { aios::hal::Mutex& block_cache_mutex(const void* col); }
 
-void ColumnStore::release_slack() {
+void ColumnStore::release_slack(bool drop_write_index) {
   shed_slack(null_bitmap); shed_slack(zone_maps); shed_slack(rle_codes_data); shed_slack(rle_run_lengths); shed_slack(rle_escape_runs);
   shed_slack(rle_escape_lengths); shed_slack(rle_seg_base_rows);
   shed_slack(fsst_data); shed_slack(fsst_offsets); shed_slack(fsst_off_base); shed_slack(fsst_off_rel); shed_slack(packed_data); shed_slack(data32);
@@ -16516,12 +16543,16 @@ void ColumnStore::release_slack() {
   shed_slack(seg_base); shed_slack(seg_bits); shed_slack(seg_byte_at);
   shed_slack(alp_exp); shed_slack(alp_exc_rows); shed_slack(alp_exc_vals);
   dict.shrink_to_fit();
-  // Rebuilt on demand: the value -> code index by the next write (intern),
-  // the numeric readings of the dictionary by ensure_dict_*, the unpacked
-  // blocks by the next get().
-  std::vector<uint32_t>().swap(id_index);
-  std::vector<uint8_t>().swap(id_tag);
-  id_index_count = 0;
+  // Rebuilt on demand: the numeric readings of the dictionary by ensure_dict_*, the unpacked blocks by the next get()
+  // - and, only when asked (a table idle for long: drop_write_index), the value -> code index by the next write
+  // (intern). That index is not slack: rebuilding it hashes every entry of the dictionary, every compressed block
+  // decoded, and a table idle for 30 s lost it every time - the next one-row INSERT into versioneight.audittrail
+  // (17M rows) took 2-5 s under the write lock, every read waiting behind it.
+  if (drop_write_index) {
+    std::vector<uint32_t>().swap(id_index);
+    std::vector<uint8_t>().swap(id_tag);
+    id_index_count = 0;
+  }
   std::vector<double>().swap(dict_doubles);
   std::vector<uint8_t>().swap(dict_doubles_valid);
   std::vector<int64_t>().swap(dict_ints);
@@ -16533,8 +16564,8 @@ void ColumnStore::release_slack() {
   }
 }
 
-void SqlTable::release_slack() {
-  for (ColumnStore& cs : col_data) cs.release_slack();
+void SqlTable::release_slack(bool drop_write_index) {
+  for (ColumnStore& cs : col_data) cs.release_slack(drop_write_index);
 }
 
 void ColumnStore::write_code(size_t row, uint32_t code) {
@@ -19238,9 +19269,36 @@ static void extend_zone_map(ColumnStore& cs, size_t r) {
     zm.null_count++;
   } else {
     double d = 0.0;
-    if (cs.get_double(r, &d)) { if (d < zm.min_double) zm.min_double = d; if (d > zm.max_double) zm.max_double = d; }
     int64_t iv = 0;
-    if (cs.get_int64(r, &iv)) { if (iv < zm.min_int64) zm.min_int64 = iv; if (iv > zm.max_int64) zm.max_int64 = iv; }
+    bool has_d = false, has_i = false;
+    if ((cs.encoding == ColumnEncoding::DictBitPacked || cs.encoding == ColumnEncoding::RLE) && !cs.shared_dict) {
+      // One entry's readings, as get_double / get_int64 give them (ensure_dict_doubles / ensure_dict_ints: strtod,
+      // strtoll of the entry's text; none for an empty one): from the caches where they reach this code, else from
+      // the entry itself. get_double / get_int64 built them for the whole dictionary first - after the idle tick had
+      // dropped them, every entry of audittrail's text dictionary decoded and parsed for a one-row INSERT.
+      const uint32_t code = cs.read_code(r);
+      if (code < cs.dict_doubles.size() && code < cs.dict_ints.size()) {
+        has_d = code < cs.dict_doubles_valid.size() && cs.dict_doubles_valid[code];
+        if (has_d) d = cs.dict_doubles[code];
+        has_i = code < cs.dict_ints_valid.size() && cs.dict_ints_valid[code];
+        if (has_i) iv = cs.dict_ints[code];
+      } else if (code != 0 && code < cs.dict.size()) {
+        const std::string e(cs.dict.view(code));
+        if (!e.empty() && !sql_is_null(e)) {
+          char* endp = nullptr;
+          const double dv = std::strtod(e.c_str(), &endp);
+          if (endp != e.c_str()) { d = dv; has_d = true; }
+          endp = nullptr;
+          const long long lv = std::strtoll(e.c_str(), &endp, 10);
+          if (endp != e.c_str()) { iv = (int64_t)lv; has_i = true; }
+        }
+      }
+    } else {
+      has_d = cs.get_double(r, &d);
+      has_i = cs.get_int64(r, &iv);
+    }
+    if (has_d) { if (d < zm.min_double) zm.min_double = d; if (d > zm.max_double) zm.max_double = d; }
+    if (has_i) { if (iv < zm.min_int64) zm.min_int64 = iv; if (iv > zm.max_int64) zm.max_int64 = iv; }
     const std::string_view sv = cs.get_view(r);
     static thread_local std::string tls_low;
     tls_low.clear();
@@ -40168,11 +40226,23 @@ std::shared_ptr<SqlProbeIndex> rows_join_index(const SqlTable& t, int col, const
   return idx;
 }
 
-std::shared_ptr<SqlProbeIndex> semi_join_index(const SqlTable& t, int col, const std::vector<Val>& wants) {
+std::shared_ptr<SqlProbeIndex> semi_join_index(const SqlTable& t, int col, const std::vector<Val>& all_wants) {
   if (col < 0 || (size_t)col >= t.col_data.size()) return nullptr;
   const ColumnStore& cs = t.col_data[(size_t)col];
   if (cs.size() != t.row_count()) return nullptr;
   const bool text_col = t.columns[(size_t)col].type == SqlDataType::Text && !t.inferred_types;
+  // Each base value once: 2,000 order lines over 4 line numbers looked each number up 500 times, every lookup
+  // appending its 50k rows (100M row ids sorted down to 200k, 1.4 s).
+  std::vector<Val> wants;
+  {
+    std::unordered_set<double> nums;
+    std::unordered_set<std::string> texts;
+    wants.reserve(std::min<size_t>(all_wants.size(), 4096));
+    for (const Val& w : all_wants) {
+      if (w.null) continue;
+      if (w.numeric ? nums.insert(w.num).second : texts.insert(w.str()).second) wants.push_back(w);
+    }
+  }
   // A big table's key column with (or worth) a row index: the candidate rows
   // come from it - the codes (or values) equal to each probe value, plus the
   // rows appended since it was built - instead of from reading the column.
@@ -51031,23 +51101,78 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
     }
   }
   if (semi && prep_jkeys.empty()) {
-    int ready = -1;
-    for (size_t ki = 0; ki < jkeys.size() && ready < 0; ++ki)
-      if (vx::probe_index_ready(*js.table, jkeys[ki].column)) ready = (int)ki;
-    size_t use = ready >= 0 ? (size_t)ready : 0;
-    std::shared_ptr<ProbeIndex> idx;
-    if (ready >= 0) {
-      idx = SelectEngine::get_or_build_probe_index(db, *js.table, jkeys[use].column);
-    } else {
-      std::vector<Val> wants;
-      wants.reserve(rows.size());
-      EvalCtx wc; wc.db = db; wc.outer = outer_scope; wc.sources = &partial; wc.err = &err;
+    // The key whose index gives the fewest candidate rows for these base rows. A key whose base values are all
+    // NULL meets no row at all and is taken at once. A key with an index built is counted (cheap: each distinct
+    // base value looked up). Another key's index is built for these base values only while the best so far is
+    // poor (more than 64 candidates a base row on average), or when no key has an index, in ON order: building one
+    // for every key to compare them made st's open-orders count 1.9 s - `stockmoves.orderlineref` (a few line
+    // numbers over 3M rows) gathered and sorted beside a `transno` index that already gave a few rows. Taking the
+    // first key took `ON stockmoves.orderlineref = quote_details.orderlineno AND debtortrans.transno =
+    // stockmoves.transno` by orderlineref (every row a candidate): 2 s a customer lookup, 80 ms by transno.
+    EvalCtx wc; wc.db = db; wc.outer = outer_scope; wc.sources = &partial; wc.err = &err;
+    auto wants_of = [&](size_t ki) {
+      std::vector<Val> w;
+      w.reserve(rows.size());
       for (const JoinedRow& b : rows) {
         wc.row = &b;
-        wants.push_back(eval_expr(jkeys[use].value, wc));
+        w.push_back(eval_expr(jkeys[ki].value, wc));
       }
+      return w;
+    };
+    auto index_for = [&](size_t ki, const std::vector<Val>& w) -> std::shared_ptr<ProbeIndex> {
+      if (vx::probe_index_ready(*js.table, jkeys[ki].column)) return SelectEngine::get_or_build_probe_index(db, *js.table, jkeys[ki].column);
+      return semi_join_index(*js.table, jkeys[ki].column, w);
+    };
+    size_t use = 0;
+    std::shared_ptr<ProbeIndex> idx;
+    if (jkeys.size() == 1) {
+      std::vector<Val> w = wants_of(0);
       if (!err.empty()) return make_error(err);
-      idx = semi_join_index(*js.table, jkeys[use].column, wants);
+      idx = index_for(0, w);
+    } else {
+      std::vector<std::vector<Val>> ws(jkeys.size());
+      std::vector<bool> ready(jkeys.size());
+      int all_null = -1;
+      for (size_t ki = 0; ki < jkeys.size(); ++ki) {
+        ws[ki] = wants_of(ki);
+        if (!err.empty()) return make_error(err);
+        ready[ki] = vx::probe_index_ready(*js.table, jkeys[ki].column);
+        if (all_null < 0 && std::all_of(ws[ki].begin(), ws[ki].end(), [](const Val& v) { return v.null; })) all_null = (int)ki;
+      }
+      if (all_null >= 0) {
+        use = (size_t)all_null;
+        idx = index_for(use, ws[use]);
+      } else {
+        size_t best = SIZE_MAX;
+        // the ready keys, counted
+        for (size_t ki = 0; ki < jkeys.size(); ++ki) {
+          if (!ready[ki]) continue;
+          std::shared_ptr<ProbeIndex> ki_idx = SelectEngine::get_or_build_probe_index(db, *js.table, jkeys[ki].column);
+          if (!ki_idx) continue;
+          size_t cands = 0;
+          std::unordered_set<std::string> seen;   // each distinct base value once; past the best key's count this one has lost
+          std::vector<size_t> got;
+          for (const Val& v : ws[ki]) {
+            if (v.null || !seen.insert(v.numeric ? "n" + std::to_string(v.num) : "t" + collate_key(v.str())).second) continue;
+            got.clear();
+            probe_gather_matches(ki_idx.get(), v, got);
+            cands += got.size();
+            if (cands >= best) break;
+          }
+          if (cands < best) { best = cands; use = ki; idx = std::move(ki_idx); }
+        }
+        // the others, built for these base values, while what there is is poor
+        const size_t poor = rows.size() * 64;
+        for (size_t ki = 0; ki < jkeys.size() && (!idx || best > poor); ++ki) {
+          if (ready[ki]) continue;
+          std::shared_ptr<ProbeIndex> ki_idx = semi_join_index(*js.table, jkeys[ki].column, ws[ki]);
+          if (!ki_idx) continue;
+          size_t cands = 0;
+          for (const auto& kv : ki_idx->by_number) cands += kv.second.size();
+          for (const auto& kv : ki_idx->by_text) cands += kv.second.size();
+          if (cands < best) { best = cands; use = ki; idx = std::move(ki_idx); }
+        }
+      }
     }
     if (idx) {
       prep_jkeys.push_back({jkeys[use].column, jkeys[use].value, idx});
@@ -51302,8 +51427,29 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
             ((pc->args[0].get() == xk_join && pc->args[1].get() == xk_base) || (pc->args[1].get() == xk_join && pc->args[0].get() == xk_base)))
           xk_conj = pc;
     thread_local bool xk_exact = false;
+    // Once the probe's conjuncts are settled (on_split): those holding a subquery last, after every other one -
+    // the lane conjuncts too, interpreted here first - so a subquery runs only for a candidate the rest let
+    // through. The order-entry search's `prices.typeabbrev = 'H' AND prices.startdate = COALESCE((SELECT MAX(..)
+    // ..), (SELECT MIN(..) ..))` ran both subqueries for all 18 price types of each item, 5,760 candidates for 320
+    // rows. One AND of the same conjuncts: the same answer.
+    std::vector<const SqlExpr*> on_early, on_late, on_pre;
+    bool on_split = false;
     auto on_true = [&](EvalCtx& ctx) {
-      for (const SqlExpr* pc : on_check) {
+      if (!on_split) {
+        for (const SqlExpr* pc : on_check) {
+          if (pc == xk_conj && xk_exact) continue;
+          if (!predicate_true(pc, ctx)) return false;
+        }
+        return true;
+      }
+      for (const SqlExpr* pc : on_early) {
+        if (pc == xk_conj && xk_exact) continue;
+        if (!predicate_true(pc, ctx)) return false;
+      }
+      if (on_late.empty()) return true;
+      for (const SqlExpr* pc : on_pre)
+        if (!predicate_true(pc, ctx)) return false;
+      for (const SqlExpr* pc : on_late) {
         if (pc == xk_conj && xk_exact) continue;
         if (!predicate_true(pc, ctx)) return false;
       }
@@ -52207,6 +52353,9 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
     // whether a candidate's row has to be made for the interpreter (the ON's per-candidate conjuncts, the
     // pushed WHERE conjuncts); otherwise only its row id is kept until the chunk is assembled
     const bool cand_checks = (has_extra_join && !on_check.empty()) || !pushable_rest.empty();
+    for (const SqlExpr* pc : on_check) (expr_has_subquery_raw(pc) ? on_late : on_early).push_back(pc);
+    if (!on_late.empty()) on_pre = on_vec;
+    on_split = true;
     auto batch_probe = [&](size_t bi, EvalCtx& ctx, ChunkOut& o, OnSink* sink) {
       const JoinedRow& base = rows[bi];
       if (!base_refused.empty() && bi < base_refused.size() && base_refused[bi]) { if (!sink) pad_row(o, bi, ctx); return; }
@@ -56610,6 +56759,26 @@ bool SqlThreadPool::dispatch_parallel(const std::function<void(size_t)>& task, s
 
 void SqlThreadPool::wait_parallel(std::shared_ptr<DispatchJob>& job) {
   if (!job) return;
+  // The lanes no worker has taken yet are the caller's to run: with every worker busy on another statement's long
+  // scan, a small lookup's lanes sat queued behind it and the lookup waited the whole scan out (a 15 s report made
+  // every customer page take 12 s). A dynamic split's lane finds the morsels gone and returns at once; a static
+  // split's runs its own morsels here.
+  if (job->remaining.load(std::memory_order_acquire) > 0) {
+    std::vector<size_t> mine;
+    {
+      std::unique_lock<aios::hal::Mutex> lock(queue_mu_);
+      for (auto it = work_queue_.begin(); it != work_queue_.end();) {
+        if (it->job == job) { mine.push_back(it->lane); it = work_queue_.erase(it); }
+        else ++it;
+      }
+    }
+    if (!mine.empty()) {
+      struct Restore { bool was; ~Restore() { in_worker_thread_ = was; } } restore{in_worker_thread_};
+      in_worker_thread_ = true;
+      for (size_t lane : mine) job->task(lane);
+      job->remaining.fetch_sub(mine.size(), std::memory_order_acq_rel);
+    }
+  }
   if (job->remaining.load(std::memory_order_acquire) > 0) {
     std::unique_lock<aios::hal::Mutex> lock(job->job_mu);
     job->done_cv.wait(lock, [&]() {

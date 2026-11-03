@@ -1353,7 +1353,7 @@ struct ColumnStore {
   uint32_t read_code(size_t row) const;
   void write_code(size_t row, uint32_t code);
   // Hands back the capacity the column's vectors grew past their size (appends over-allocate).
-  void release_slack();
+  void release_slack(bool drop_write_index = false);   // drop_write_index: id_index too (the next write rebuilds it, over the whole dictionary)
   // dec_scale: a DECIMAL(p,s) column's s, so DecimalScaled may hold it with
   // its fixed s places ("12.50"); 0 for any other column.
   // `temporal` is the declared column's SqlColumnDecl::temporal: a DATE / DATETIME / TIMESTAMP
@@ -2726,7 +2726,7 @@ struct SqlTable {
   void append_row_hot(const std::vector<std::string>& vals);
   void append_row_hot(const SqlRow& r);
   void compact_delta_buffer() const;
-  void release_slack();   // every column's spare vector capacity goes back to the allocator
+  void release_slack(bool drop_write_index = false);   // every column's spare vector capacity goes back to the allocator
   // Materialized grouped views reading this table (see MatViewWatch). Weak: a
   // view dropped or replaced stops being told without the table knowing.
   mutable std::shared_ptr<MatViewWatchList> watch_list = std::make_shared<MatViewWatchList>();

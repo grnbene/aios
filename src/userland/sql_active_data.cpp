@@ -1584,6 +1584,7 @@ std::vector<ActiveDataEngine::TierWork> ActiveDataEngine::tick_scan() {
       tel.changed_ns = now;
       tel.reencoded = false;
       tel.slack_released = false;
+      tel.index_released = false;
       continue;
     }
     const uint64_t idle = now - tel.changed_ns;
@@ -1592,7 +1593,14 @@ std::vector<ActiveDataEngine::TierWork> ActiveDataEngine::tick_scan() {
     if (idle > 5000000000ull && t.delta_buffer.count.load(std::memory_order_relaxed) > 0) w.fold_delta = true;
     if (idle > 60000000000ull && !tel.reencoded && t.row_count() > 0 && t.row_count() <= kTierRowCap) w.reencode = true;
     if (idle > 30000000000ull && !tel.slack_released && t.row_count() > 0) w.release_slack = true;
-    if (w.fold_delta || w.reencode || w.release_slack) work.push_back(std::move(w));
+    // The write path's value -> code indexes only after a long idle (AIOS_SQL_IDINDEX_IDLE_SECS, default 30 min): the
+    // first write after their release rebuilds each over its whole dictionary, under the write lock.
+    static const uint64_t index_idle_ns = [] {
+      const char* e = std::getenv("AIOS_SQL_IDINDEX_IDLE_SECS");
+      return (e && *e ? std::strtoull(e, nullptr, 10) : 1800ull) * 1000000000ull;
+    }();
+    if (idle > index_idle_ns && !tel.index_released && t.row_count() > 0) w.release_index = true;
+    if (w.fold_delta || w.reencode || w.release_slack || w.release_index) work.push_back(std::move(w));
   }
   for (auto it = telemetry_.begin(); it != telemetry_.end();) it = db_.tables_.count(it->first) ? std::next(it) : telemetry_.erase(it);
   return work;
@@ -1605,12 +1613,13 @@ void ActiveDataEngine::tick_apply(const std::vector<TierWork>& work) {
     SqlTable& t = it->second;
     if (w.fold_delta) t.compact_delta_buffer();
     if (w.reencode) t.optimize_storage(false);   // false: rows keep their positions
-    if (w.release_slack) t.release_slack();
+    if (w.release_slack || w.release_index) t.release_slack(w.release_index);
     std::lock_guard<aios::hal::Mutex> lk(mu_);
     TableTelemetry& tel = telemetry_[w.key];
     tel.seen_seq = t.mutation_seq;   // this was maintenance, not a write
     if (w.reencode) tel.reencoded = true;
     if (w.release_slack) tel.slack_released = true;
+    if (w.release_index) tel.index_released = true;
   }
 }
 

@@ -90,6 +90,7 @@ class ActiveDataEngine {
     bool fold_delta = false;
     bool reencode = false;
     bool release_slack = false;   // spare vector capacity from appends goes back
+    bool release_index = false;   // and, idle for long, the columns' value -> code indexes (rebuilt by the next write)
   };
   bool tick_due();
   std::vector<TierWork> tick_scan();
@@ -193,6 +194,7 @@ class ActiveDataEngine {
     uint64_t changed_ns = 0;
     bool reencoded = false;
     bool slack_released = false;
+    bool index_released = false;
   };
 
   SqlDatabase& db_;
