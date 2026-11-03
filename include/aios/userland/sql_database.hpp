@@ -3509,6 +3509,7 @@ class SqlDatabase {
   aios::hal::CondVar things_clock_cv_;
   std::string last_index_list_;
   std::string last_probe_list_;   // probes.list as last written: the join hash indexes to warm at boot
+  std::string last_corr_list_;    // corrmaps.list as last written: the correlated subqueries' maps to warm at boot
   std::string last_rowindex_list_;   // rowindexes.list as last written: the tables whose primary-key row map is built at boot
 
   // Schemas that exist, so an empty one still shows in SHOW DATABASES and a
@@ -4200,6 +4201,16 @@ class SqlDatabase {
   // Bumped by every invalidation: an answer computed while a write landed is
   // not stored, or it would outlive the write that made it stale.
   mutable std::atomic<uint64_t> query_cache_gen_{0};
+  // Which writes landed while an answer was being computed, so that only one to a table it reads refuses it: the
+  // generation each write moved query_cache_gen_ to, by the table's slot (4096, to keep a few thousand tables
+  // apart), and the last generation that dropped everything (invalidate_query_cache: DDL, a flush). One global
+  // generation for every table refused nearly every report on a busy ERP - something is always being written.
+  static size_t query_cache_write_slot(const std::string& lower_name) { return std::hash<std::string>{}(lower_name) & 4095; }
+  mutable std::array<std::atomic<uint64_t>, 4096> dep_write_gen_{};
+  mutable std::atomic<uint64_t> query_cache_flush_gen_{0};
+  // True when an answer that depends on `deps` (all: on every table) and was computed from generation gen_before
+  // on may be out of date: a write to one of them, or a drop of everything, since.
+  bool query_cache_written_since(const std::vector<std::string>& deps, bool all, uint64_t gen_before) const;
   // Readers (a probe for a cached answer, twice per statement) share a
   // shard's lock; a store, an attach of wire packets, an eviction or an
   // invalidation takes it alone. One mutex around every probe was the most

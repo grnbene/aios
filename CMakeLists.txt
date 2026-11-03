@@ -586,6 +586,12 @@ target_link_libraries(aios-asql-upkeep-check PRIVATE aios)
 add_executable(aios-asql-lookup-latency-check tools/asql-lookup-latency-check.cpp)
 target_link_libraries(aios-asql-lookup-latency-check PRIVATE aios)
 
+add_executable(aios-asql-routine-freshness-check tools/asql-routine-freshness-check.cpp)
+target_link_libraries(aios-asql-routine-freshness-check PRIVATE aios)
+
+add_executable(aios-asql-cache-deps-check tools/asql-cache-deps-check.cpp)
+target_link_libraries(aios-asql-cache-deps-check PRIVATE aios)
+
 add_executable(aios-asql-literal-compare-check tools/asql-literal-compare-check.cpp)
 target_link_libraries(aios-asql-literal-compare-check PRIVATE aios)
 
@@ -1004,6 +1010,8 @@ add_test(NAME asql.segment_encoding.check COMMAND aios-asql-segment-encoding-che
 add_test(NAME asql.dict_coding.check COMMAND aios-asql-dict-coding-check)
 add_test(NAME asql.upkeep.check COMMAND aios-asql-upkeep-check)
 add_test(NAME asql.lookup.latency.check COMMAND aios-asql-lookup-latency-check)
+add_test(NAME asql.routine_freshness.check COMMAND aios-asql-routine-freshness-check)
+add_test(NAME asql.cache_deps.check COMMAND aios-asql-cache-deps-check)
 add_test(NAME asql.literal_compare.check COMMAND aios-asql-literal-compare-check)
 add_executable(aios-asql-round-check tools/asql-round-check.cpp)
 target_link_libraries(aios-asql-round-check PRIVATE aios)

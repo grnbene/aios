@@ -7989,11 +7989,67 @@ struct CorrRows {
   CorrStamp stamp;
   size_t rows = 0;
   std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> map;
+  // what it was made from, for corrmaps.list (a restart makes it again in the warm-up: corr_rows_warm)
+  std::vector<int> icols;
+  std::vector<bool> text;
 };
 static std::unordered_map<std::string, CorrRows> g_corr_rows;   // under g_corr_mu
 static aios::hal::Mutex g_corr_mu;
+// One build of a key -> rows map at a time per subquery text: held while it is made, so the others wanting the
+// same map wait for it and take it instead of each making their own. After a restart the order-entry search's
+// first run had its 8 lanes' copies of 3 price-date subqueries all miss g_corr_rows at once and make 24 maps of
+// the 876k prices rows side by side: 3.2 s, against 160 ms once made. (Entries under g_corr_mu.)
+static std::unordered_map<std::string, std::shared_ptr<aios::hal::Mutex>> g_corr_building;
 static std::unordered_map<const SqlExpr*, std::shared_ptr<const CorrIndex>> g_corr;
 static std::unordered_map<const SqlExpr*, std::string> g_corr_no;   // the subquery text found not to fit
+
+// A table's rows by their values in icols (text[k]: the k-th compared as text, by collation key; else as an
+// integer), each key's rows in row order; null where a key column's INT is no plain integer.
+static std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> corr_rows_make(
+    const SqlTable* t, const std::vector<int>& icols, const std::vector<bool>& text) {
+  auto rows_of = std::make_shared<std::unordered_map<std::string, std::vector<uint32_t>>>();
+  // the index: each row's key, its values' texts (collation keys) or integers
+  const size_t n = t->row_count();
+  std::vector<std::shared_ptr<const vx::DecodedInts>> ints(icols.size());
+  for (size_t k = 0; k < icols.size(); ++k)
+    if (!text[k] && vx::typed_integer(t->col_data[(size_t)icols[k]]) && !(ints[k] = vx::decoded_ints(*t, (size_t)icols[k]))) return nullptr;
+  std::string key;
+  for (size_t r = 0; r < n; ++r) {
+    key.clear();
+    bool null = false;
+    for (size_t k = 0; k < icols.size() && !null; ++k) {
+      const ColumnStore& cs = t->col_data[(size_t)icols[k]];
+      if (cs.is_null(r)) { null = true; break; }
+      if (text[k]) key += collate_key(t->cell(r, (size_t)icols[k]));
+      else if (ints[k]) key += std::to_string(ints[k]->v[r]);
+      else {
+        // an INT held otherwise (run-length, a dictionary): its cell, which must be a plain integer
+        const std::string& c = t->cell(r, (size_t)icols[k]);
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(c.c_str(), &end, 10);
+        if (c.empty() || errno == ERANGE || !end || *end != '\0') return nullptr;
+        key += std::to_string(v);
+      }
+      key.push_back('\x1f');
+    }
+    if (!null) (*rows_of)[key].push_back((uint32_t)r);
+  }
+  return rows_of;
+}
+static void corr_rows_keep(const std::string& rkey, CorrRows made) {
+  std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+  if (g_corr_rows.size() > 64) g_corr_rows.clear();
+  g_corr_rows[rkey] = std::move(made);
+}
+// A map is the table's rows by its key columns and how each is compared - nothing of the subquery's text: the
+// order-entry search's two price-date subqueries (MIN and MAX of startdate, by stockid, typeabbrev, currabrev)
+// share one map of the 876k prices rows instead of making two.
+static std::string corr_rows_key(const SqlTable* t, const std::vector<int>& icols, const std::vector<bool>& text) {
+  std::string k = std::to_string((uintptr_t)t);
+  for (size_t i = 0; i < icols.size(); ++i) k += (i < text.size() && text[i] ? ",t" : ",i") + std::to_string(icols[i]);
+  return k;
+}
 
 // exists: for EXISTS (SELECT .. WHERE ..) - whether the outer row has a row at all; its select list is not read.
 static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const EvalCtx& ctx, bool exists) {
@@ -8083,53 +8139,85 @@ static std::shared_ptr<const CorrIndex> build_corr_index(const SqlExpr* e, const
   if (icols.empty()) return nullptr;
   ci->icols = icols;
   ci->stamp = corr_stamp(t, icols);
-  const std::string rkey = ci->sql + '\x1e' + std::string(ci->text.begin(), ci->text.end());
+  const std::string rkey = corr_rows_key(t, icols, ci->text);
+  // the map as made for this table at this stamp, if it is there (under g_corr_mu)
+  auto kept = [&]() -> bool {
+    auto it = g_corr_rows.find(rkey);
+    if (it == g_corr_rows.end() || it->second.t != t || it->second.stamp != ci->stamp || it->second.rows != t->row_count())
+      return false;
+    ci->rows_of = it->second.map;
+    return true;
+  };
+  std::shared_ptr<aios::hal::Mutex> building;
   {
     std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
-    auto it = g_corr_rows.find(rkey);
-    if (it != g_corr_rows.end() && it->second.t == t && it->second.stamp == ci->stamp && it->second.rows == t->row_count()) {
-      ci->rows_of = it->second.map;
+    if (kept()) {
       if (vx_trace_on()) vx_trace("subquery correlation index: kept, " + std::to_string(ci->rows_of->size()) + " keys of " + t->name);
       return ci;
     }
+    std::shared_ptr<aios::hal::Mutex>& b = g_corr_building[rkey];
+    if (!b) b = std::make_shared<aios::hal::Mutex>();
+    building = b;
   }
-  auto rows_of = std::make_shared<std::unordered_map<std::string, std::vector<uint32_t>>>();
-  // the index: each row's key, its values' texts (collation keys) or integers
-  const size_t n = t->row_count();
-  std::vector<std::shared_ptr<const vx::DecodedInts>> ints(icols.size());
-  for (size_t k = 0; k < icols.size(); ++k)
-    if (!ci->text[k] && vx::typed_integer(t->col_data[(size_t)icols[k]]) && !(ints[k] = vx::decoded_ints(*t, (size_t)icols[k]))) return nullptr;
-  std::string key;
-  for (size_t r = 0; r < n; ++r) {
-    key.clear();
-    bool null = false;
-    for (size_t k = 0; k < icols.size() && !null; ++k) {
-      const ColumnStore& cs = t->col_data[(size_t)icols[k]];
-      if (cs.is_null(r)) { null = true; break; }
-      if (ci->text[k]) key += collate_key(t->cell(r, (size_t)icols[k]));
-      else if (ints[k]) key += std::to_string(ints[k]->v[r]);
-      else {
-        // an INT held otherwise (run-length, a dictionary): its cell, which must be a plain integer
-        const std::string& c = t->cell(r, (size_t)icols[k]);
-        char* end = nullptr;
-        errno = 0;
-        const long long v = std::strtoll(c.c_str(), &end, 10);
-        if (c.empty() || errno == ERANGE || !end || *end != '\0') return nullptr;
-        key += std::to_string(v);
-      }
-      key.push_back('\x1f');
-    }
-    if (!null) (*rows_of)[key].push_back((uint32_t)r);
-  }
-  ci->rows_of = rows_of;
+  std::unique_lock<aios::hal::Mutex> one_build(*building);
   {
     std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
-    if (g_corr_rows.size() > 64) g_corr_rows.clear();
-    g_corr_rows[rkey] = CorrRows{t, ci->stamp, t->row_count(), rows_of};
+    if (kept()) {   // made while this one waited
+      if (vx_trace_on()) vx_trace("subquery correlation index: waited for, " + std::to_string(ci->rows_of->size()) + " keys of " + t->name);
+      return ci;
+    }
   }
+  const uint64_t build_t0 = hal_now_ns();
+  std::shared_ptr<const std::unordered_map<std::string, std::vector<uint32_t>>> rows_of = corr_rows_make(t, icols, ci->text);
+  if (!rows_of) return nullptr;
+  ci->rows_of = rows_of;
+  corr_rows_keep(rkey, CorrRows{t, ci->stamp, t->row_count(), rows_of, icols, ci->text});
+  if (vx_trace_on())
+    vx_trace("subquery correlation index: made, " + std::to_string(rows_of->size()) + " keys of " + t->name + " in " +
+             std::to_string((hal_now_ns() - build_t0) / 1000) + "us");
   return ci;
 }
 
+// The key -> rows maps kept now, as corrmaps.list remembers them: the table, its key columns, how each is compared.
+struct CorrListed { const SqlTable* t; std::vector<int> icols; std::vector<bool> text; };
+static std::vector<CorrListed> corr_rows_listed() {
+  std::vector<CorrListed> out;
+  std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+  for (const auto& kv : g_corr_rows)
+    if (kv.second.t && kv.second.map && !kv.second.icols.empty())
+      out.push_back({kv.second.t, kv.second.icols, kv.second.text});
+  return out;
+}
+// One listed map made again after a restart, before a query asks for it (the warm-up, under a shared statement
+// lock): the map the subquery's first run would make, under the same one-build-at-a-time lock, so a query that
+// comes while it is being made waits for it instead of making its own. 1 made, 0 already there, -1 not made.
+static int corr_rows_warm(const SqlTable* t, const std::vector<int>& icols, const std::vector<bool>& text) {
+  if (!t || icols.empty() || icols.size() != text.size()) return -1;
+  for (int c : icols) if (c < 0 || (size_t)c >= t->col_data.size() || t->col_data[(size_t)c].size() != t->row_count()) return -1;
+  const std::string rkey = corr_rows_key(t, icols, text);
+  const CorrStamp stamp = corr_stamp(t, icols);
+  auto there = [&] {
+    auto it = g_corr_rows.find(rkey);
+    return it != g_corr_rows.end() && it->second.t == t && it->second.stamp == stamp && it->second.rows == t->row_count();
+  };
+  std::shared_ptr<aios::hal::Mutex> building;
+  {
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    if (there()) return 0;
+    std::shared_ptr<aios::hal::Mutex>& b = g_corr_building[rkey];
+    if (!b) b = std::make_shared<aios::hal::Mutex>();
+    building = b;
+  }
+  std::unique_lock<aios::hal::Mutex> one_build(*building);
+  {
+    std::lock_guard<aios::hal::Mutex> lk(g_corr_mu);
+    if (there()) return 0;
+  }
+  auto map = corr_rows_make(t, icols, text);
+  if (!map) return -1;
+  corr_rows_keep(rkey, CorrRows{t, stamp, t->row_count(), map, icols, text});
+  return 1;
+}
 // The answer for the outer row in ctx: 1 (*out set), or 0 - not answered here, the nested statement decides.
 static int corr_index_answer(const SqlExpr* e, const EvalCtx& ctx, Val* out, bool exists = false) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_CORR_INDEX"); return v && *v == '0'; }();
@@ -25982,7 +26070,7 @@ SqlQueryResult SqlDatabase::export_snapshot(const std::string& name, const std::
     bytes += d->size();
     return std::string();
   };
-  for (const char* f : {"cdc_position", "seed_positions", "indexes.list", "probes.list", "rowindexes.list", "schema_views.db"}) {
+  for (const char* f : {"cdc_position", "seed_positions", "indexes.list", "probes.list", "rowindexes.list", "corrmaps.list", "schema_views.db"}) {
     if (std::string(f) == "cdc_position" && !cdc_file.empty()) {
       // The position taken under the lock, with the snapshot: the live file is rewritten as the stream goes on, and
       // a copy of it could be later than the tables just exported (a mirror seeded from it would skip events).
@@ -27031,6 +27119,36 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   };
   auto want = read_list("indexes.list");
   auto want_probes = read_list("probes.list");
+  struct WantCorr { std::string table; std::vector<std::string> cols; std::vector<bool> text; };
+  std::vector<WantCorr> want_corr;
+  if (auto cl = kernel_.host().read_file(root_path_ + "/corrmaps.list"); cl.ok()) {
+    std::string text(cl->begin(), cl->end());
+    for (size_t at = 0; at < text.size();) {
+      size_t nl = text.find('\n', at);
+      if (nl == std::string::npos) nl = text.size();
+      const std::string line = text.substr(at, nl - at);
+      at = nl + 1;
+      std::vector<std::string> f;
+      for (size_t p = 0;;) {
+        size_t tab = line.find('\t', p);
+        f.push_back(line.substr(p, tab == std::string::npos ? std::string::npos : tab - p));
+        if (tab == std::string::npos) break;
+        p = tab + 1;
+      }
+      WantCorr w;
+      if (f.size() != 3 || f[0].empty() || f[2].empty()) continue;
+      w.table = f[0];
+      for (size_t p = 0;;) {
+        size_t comma = f[1].find(',', p);
+        w.cols.push_back(f[1].substr(p, comma == std::string::npos ? std::string::npos : comma - p));
+        if (comma == std::string::npos) break;
+        p = comma + 1;
+      }
+      bool ok = w.cols.size() == f[2].size();
+      for (char k : f[2]) { if (k != 't' && k != 'i') ok = false; w.text.push_back(k == 't'); }
+      if (ok) want_corr.push_back(std::move(w));
+    }
+  }
   std::vector<std::string> want_rows;
   if (auto rl = kernel_.host().read_file(root_path_ + "/rowindexes.list"); rl.ok()) {
     std::string text(rl->begin(), rl->end());
@@ -27041,9 +27159,9 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       at = nl + 1;
     }
   }
-  if (!want.empty() || !want_probes.empty() || !want_rows.empty()) {
+  if (!want.empty() || !want_probes.empty() || !want_rows.empty() || !want_corr.empty()) {
     warm_running_.store(true, std::memory_order_release);
-    index_warm_ = aios::hal::Thread([this, want, want_probes, want_rows]() {
+    index_warm_ = aios::hal::Thread([this, want, want_probes, want_rows, want_corr]() {
       const uint64_t t0 = kernel_.host().monotonic_ns();
       // Each index is built under a shared statement lock of its own, never one held across the whole warm-up: that
       // one kept every writer - the replication applier, CHANGE REPLICATION SOURCE and START REPLICA at start-up, so
@@ -27066,6 +27184,19 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
           if (c < 0) continue;
           if (probe) get_or_build_probe_index(it->second, c);
           else if (it->second.col_data[(size_t)c].size() == it->second.row_count()) warm_column_index(it->second, (size_t)c);
+        }
+      });
+      // The correlated subqueries' key -> rows maps, one per lane at a time as the indexes above.
+      std::atomic<size_t> corr_warmed{0};
+      SqlThreadPool::instance().parallel_for_static(want_corr.size(), 1, [&](size_t b0, size_t b1, size_t) {
+        for (size_t i = b0; i < b1; ++i) {
+          StatementLock lock(rw_lock_, false);
+          const WantCorr& w = want_corr[i];
+          auto it = tables_.find(w.table);
+          if (it == tables_.end()) continue;
+          std::vector<int> icols;
+          for (const auto& c : w.cols) icols.push_back(it->second.get_column_index(c));
+          if (corr_rows_warm(&it->second, icols, w.text) == 1) corr_warmed.fetch_add(1);
         }
       });
       // Primary-key row maps (what a keyed write - the applier's UPDATE or DELETE - finds its row with): the list is
@@ -27112,6 +27243,8 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
       fprintf(stderr, "asql: warmed %zu column, %zu join and %zu primary-key indexes in %.1f s (%zu primary-key maps left for "
               "their first write: over the %zu MB budget; row maps %zu MB)\n", want.size(), want_probes.size(), rows_warmed,
               (double)(kernel_.host().monotonic_ns() - t0) / 1e9, rows_skipped, budget >> 20, row_mb);
+      if (!want_corr.empty())
+        fprintf(stderr, "asql: warmed %zu of %zu correlated subquery maps\n", corr_warmed.load(), want_corr.size());
       fflush(stderr);
       // The builds' scratch (candidate lists, sort buffers) came from every
       // pool lane's own arena; hand it back before the first query arrives.
@@ -32988,6 +33121,34 @@ bool statement_constant_func(const std::string& up) {
          up == "UTC_TIME"sv || up == "UTC_TIMESTAMP"sv || up == "UNIX_TIMESTAMP"sv || up == "CONNECTION_ID"sv;
 }
 
+// A call by this name as a stored function (CREATE FUNCTION) sees it: 0 there is none, 1 its body is RETURN
+// <expression> over its parameters with nothing in it but other such functions and builtins that give the same
+// answer for the same arguments - the same per value within a statement, though not across statements (a DROP +
+// CREATE gives the name another body); 2 anything else: a body that reads a table (`RETURN (SELECT price FROM
+// prices WHERE stockid = s)`), runs statements or calls something that changes between calls. Such a call's
+// answer for a value holds only until a table it reads is written, so it is never worked out once per value.
+// A builtin of the same name is what a call runs, so this is only ever more careful than it needs to be.
+int stored_call_kind(const SqlDatabase* db, const std::string& name, int depth = 0) {
+  if (!db || !db->has_stored_functions()) return 0;
+  std::shared_ptr<const SqlDatabase::StoredProgram> fn = db->find_program('F', name);
+  if (!fn) return 0;
+  if (depth >= 8 || fn->aggregate) return 2;
+  std::shared_ptr<const FastReturn> fr = fast_return_of(*fn);
+  if (!fr || !fr->tmpl) return 2;
+  bool same = true;
+  std::function<void(const SqlExpr*)> walk = [&](const SqlExpr* e) {
+    if (!e || !same) return;
+    if (e->op == ExprOp::Subquery || e->op == ExprOp::Exists || !e->subquery_sql.empty()) { same = false; return; }
+    if (e->op == ExprOp::Func) {
+      const std::string up = upper_of(e->name);
+      if (nondeterministic_func(up) || stored_call_kind(db, e->name, depth + 1) == 2) { same = false; return; }
+    }
+    for (const auto& a : e->args) walk(a.get());
+  };
+  walk(fr->tmpl.get());
+  return same ? 1 : 2;
+}
+
 // What an expression reads: the local columns it names, and whether it can be
 // evaluated once per distinct input (no subquery, no aggregate, nothing that
 // changes between two evaluations on the same row).
@@ -32997,6 +33158,9 @@ struct ExprShape {
   bool aggregate = false;
   bool window = false;
   bool statement_time = false;   // reads NOW() and the like
+  // In: the database a call is looked up in, to tell a stored function's call (stored_call_kind) - a vectorized
+  // path's `local` names its sources only. Null: local.db.
+  const SqlDatabase* db = nullptr;
 };
 
 void shape_of(const SqlExpr* e, const EvalCtx& local, ExprShape* out) {
@@ -33021,6 +33185,11 @@ void shape_of(const SqlExpr* e, const EvalCtx& local, ExprShape* out) {
       if (is_aggregate_name(up)) out->aggregate = true;
       if (nondeterministic_func(up)) out->pure = false;
       if (statement_constant_func(up)) out->statement_time = true;
+      if (!is_aggregate_name(up)) {
+        const int sk = stored_call_kind(out->db ? out->db : local.db, e->name);
+        if (sk == 2) out->pure = false;
+        if (sk == 1) out->statement_time = true;   // its body can change under the same name
+      }
       break;
     }
     case ExprOp::In:
@@ -34566,6 +34735,7 @@ namespace vx {
 
 bool constant_value(const SqlExpr* e, const EvalCtx& local, const EvalCtx& base, Val* out) {
   ExprShape sh;
+  sh.db = base.db;
   shape_of(e, local, &sh);
   if (!sh.cols.empty() || sh.aggregate || sh.window) return false;
   // Outer references are fine here: the outer row is fixed for this execution.
@@ -35516,6 +35686,7 @@ Pred compile_pred_impl(const SqlExpr* e, const SqlTable& t, const EvalCtx& local
     }
   }
   ExprShape sh;
+  sh.db = base.db;
   shape_of(e, local, &sh);
   p.expr = e;
   if (!sh.aggregate && !sh.window && sh.cols.size() == 1) {
@@ -37652,7 +37823,8 @@ struct Source {
 // same expression share its per-code values (make_source) through it.
 // with_source: a column names its source too (the same column number of two joined tables is two columns), and
 // a window function has no key - one statement's lanes over joined rows share values through it (LaneMemo).
-bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out, bool with_source = false) {
+bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out, bool with_source = false,
+                     const SqlDatabase* db = nullptr) {
   if (!e || (with_source && e->window) || e->op == ExprOp::Subquery || e->op == ExprOp::Exists || !e->subquery_sql.empty() || !e->group_order_by.empty()) return false;
   if (e->name.rfind("@", 0) == 0) return false;
   if (e->op == ExprOp::Func) {
@@ -37664,6 +37836,11 @@ bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out, b
         "GET_LOCK", "RELEASE_LOCK", "IS_FREE_LOCK", "IS_USED_LOCK", "NEXTVAL", "LASTVAL", "SETVAL", "VALUES",
         "DATE_FORMAT", "TIME_FORMAT", "MONTHNAME", "DAYNAME", "FORMAT", "GROUP_CONCAT", "__ASSIGN", "COLLATION", "CHARSET"};
     if (unstable.count(func_upper(e)) || is_aggregate_name(func_upper(e))) return false;
+    // A stored function: its name is no key for its values - another body may take the name, and one that reads
+    // a table answers otherwise once that table is written. Within one statement (with_source: LaneMemo) a
+    // function of its parameters alone is still the same per value.
+    const int sk = stored_call_kind(db ? db : local.db, e->name);
+    if (sk == 2 || (sk == 1 && !with_source)) return false;
   }
   if (e->op == ExprOp::Column) {
     size_t si = 0, ci = 0;
@@ -37682,7 +37859,7 @@ bool stable_expr_key(const SqlExpr* e, const EvalCtx& local, std::string* out, b
     *out += std::to_string((int)v.temporal);
     if (!v.null) *out += ':' + std::to_string(v.str().size()) + ':' + v.str();
   }
-  for (const auto& a : e->args) if (!stable_expr_key(a.get(), local, out, with_source)) return false;
+  for (const auto& a : e->args) if (!stable_expr_key(a.get(), local, out, with_source, db)) return false;
   *out += ')';
   return true;
 }
@@ -37691,6 +37868,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
   Source s;
   s.expr = e;
   ExprShape sh;
+  sh.db = base.db;
   shape_of(e, local, &sh);
   if (e->op == ExprOp::Column && sh.cols.size() == 1) {
     s.bare_column = true;
@@ -37760,7 +37938,7 @@ Source make_source(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, co
     std::string ekey;
     if (!s.bare_column && !t.inferred_types && dict_coded(cs)) {
       std::string k;
-      if (stable_expr_key(e, local, &k) && k.size() <= 4096) {
+      if (stable_expr_key(e, local, &k, false, base.db) && k.size() <= 4096) {
         ekey = std::to_string(cs.uid.v) + "|" + k;
         std::lock_guard<aios::hal::Mutex> lk(expr_mu);
         auto it = expr_cache.find(ekey);
@@ -38031,6 +38209,7 @@ bool np_compile(const SqlExpr* e, const SqlTable& t, const EvalCtx& local, const
                 bool* approx) {
   if (!e) return false;
   ExprShape sh;
+  sh.db = base.db;
   shape_of(e, local, &sh);
   if (!sh.pure || sh.aggregate || sh.window) return false;
   NumProg::Ins in;
@@ -38270,6 +38449,7 @@ bool plan_agg(const SqlExpr* node, const SqlTable& t, const EvalCtx& local, cons
     const SqlExpr* els = arg->args.size() == 3 ? arg->args[2].get() : nullptr;
     const bool else_ok = !els || (els->op == ExprOp::Literal && (els->literal.null || (els->literal.numeric && els->literal.num == 0 && !els->literal.approx)));
     ExprShape csh, tsh;
+    csh.db = tsh.db = base.db;
     shape_of(cond, local, &csh);
     shape_of(arg->args[1].get(), local, &tsh);
     if (else_ok && csh.pure && !csh.aggregate && !csh.window && !expr_has_subquery(arg->args[0]) && tsh.cols.size() == 1) {
@@ -62085,7 +62265,7 @@ struct GraveyardFlush { ~GraveyardFlush() { g_cache_graveyard.clear(); } };
 void SqlDatabase::invalidate_query_cache() {
   schema_gen_.fetch_add(1, std::memory_order_acq_rel);
   sql_result_views_invalidate_all(result_views_.get());
-  query_cache_gen_.fetch_add(1, std::memory_order_acq_rel);
+  query_cache_flush_gen_.store(query_cache_gen_.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
   for (auto& sh : query_cache_shards_) {
     // The old tables are swapped into these and freed after the lock: clear()
     // on an unordered_map zeroes its whole bucket array (megabytes after 100k
@@ -62126,8 +62306,16 @@ void SqlDatabase::invalidate_query_cache_for(const std::string& table) {
 void SqlDatabase::invalidate_query_cache_for(const std::vector<std::string>& tables) {
   sql_result_views_invalidate(result_views_.get(), tables);
   // The generation moves even with nothing cached: an answer computed while
-  // this write landed must not be stored.
-  query_cache_gen_.fetch_add(1, std::memory_order_acq_rel);
+  // this write landed must not be stored. Each table's slot is given it before any entry is dropped below: an
+  // answer stored after the drop finds it there (query_cache_written_since), one stored before is dropped.
+  {
+    const uint64_t g = query_cache_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (const auto& t : tables) {
+      std::atomic<uint64_t>& slot = dep_write_gen_[query_cache_write_slot(lower_of(t))];
+      uint64_t was = slot.load(std::memory_order_acquire);
+      while (was < g && !slot.compare_exchange_weak(was, g, std::memory_order_acq_rel)) {}
+    }
+  }
   if (query_cache_budget_bytes() > 0) {   // only the result cache reads these
     const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -62695,6 +62883,14 @@ void SqlDatabase::query_cache_refuse(const std::string& key) const {
   query_cache_seen_[(h ^ (h >> 29)) & (kSlots - 1)].store(~h, std::memory_order_relaxed);
 }
 
+bool SqlDatabase::query_cache_written_since(const std::vector<std::string>& deps, bool all, uint64_t gen_before) const {
+  if (all) return query_cache_gen_.load(std::memory_order_acquire) != gen_before;
+  if (query_cache_flush_gen_.load(std::memory_order_acquire) > gen_before) return true;
+  for (const auto& d : deps)
+    if (dep_write_gen_[query_cache_write_slot(d)].load(std::memory_order_acquire) > gen_before) return true;
+  return false;
+}
+
 void SqlDatabase::query_cache_store(const std::string& key, std::shared_ptr<const SqlQueryResult> shared,
                                     std::vector<std::string> deps, bool all, uint64_t gen_before) {
   const SqlQueryResult& r = *shared;
@@ -62711,7 +62907,7 @@ void SqlDatabase::query_cache_store(const std::string& key, std::shared_ptr<cons
   const size_t shard_budget = query_cache_budget_bytes() / kQueryCacheShards;
   const size_t shard_entries = kMaxQueryCacheEntries / kQueryCacheShards;
   std::lock_guard<SqlRwLock> lock(sh.mu);
-  if (query_cache_gen_.load(std::memory_order_acquire) != gen_before) return;   // a write landed meanwhile
+  if (query_cache_written_since(deps, all, gen_before)) return;   // a write to what it reads landed meanwhile
   auto old = sh.lookup.find(key);
   if (old != sh.lookup.end()) query_cache_erase_locked(sh, old->second);
   // Second chance: an entry hit since it was last passed over goes back to
@@ -62782,15 +62978,16 @@ void SqlDatabase::attach_cached_wire_packets(const std::string& sql_query, const
   QueryCacheShard& sh = query_cache_shard(key);
   {
     std::shared_lock<SqlRwLock> peek(sh.mu);
-    if (query_cache_gen_.load(std::memory_order_acquire) != gen_before) return;
-    if (sh.lookup.find(key) == sh.lookup.end()) return;
+    auto it = sh.lookup.find(key);
+    if (it == sh.lookup.end() || query_cache_written_since(it->second->deps, it->second->all, gen_before)) return;
   }
   auto blob = std::make_shared<const std::string>(std::move(packets));
   GraveyardFlush graveyard_flush;
   std::lock_guard<SqlRwLock> lock(sh.mu);
-  if (query_cache_gen_.load(std::memory_order_acquire) != gen_before) return;   // a write landed meanwhile
   auto it = sh.lookup.find(key);
-  if (it == sh.lookup.end()) return;
+  // The packets are of the answer this session computed from gen_before on: not for an entry a write to what it
+  // reads has made since (another session's newer answer under the same key).
+  if (it == sh.lookup.end() || query_cache_written_since(it->second->deps, it->second->all, gen_before)) return;
   QueryCacheEntry& e = *it->second;
   std::shared_ptr<const std::string>& slot = latin1 ? (binary ? e.wire_bin_l1 : e.wire_l1) : (binary ? e.wire_bin : e.wire);
   std::string& slot_db = latin1 ? (binary ? e.wire_bin_l1_db : e.wire_l1_db) : (binary ? e.wire_bin_db : e.wire_db);
@@ -65585,6 +65782,27 @@ void SqlDatabase::save_index_list() {
   if (!plist.empty() && plist != last_probe_list_ &&
       kernel_.host().write_file(root_path_ + "/probes.list", ByteSpan((const uint8_t*)plist.data(), plist.size())).ok())
     last_probe_list_ = plist;
+  // And the correlated subqueries' key -> rows maps (corr_index_answer): the order-entry search's first run after a
+  // restart made its map of the 876k prices rows, 0.55 s, on its own time. One line a map: table, key columns
+  // (comma-separated), each key's comparison (t text, i integer).
+  std::string clist;
+  for (const CorrListed& c : corr_rows_listed()) {
+    for (const auto& kv : tables_) {
+      if (&kv.second != c.t) continue;
+      std::string cols, kinds;
+      bool ok = true;
+      for (size_t k = 0; k < c.icols.size(); ++k) {
+        if (c.icols[k] < 0 || (size_t)c.icols[k] >= kv.second.columns.size()) { ok = false; break; }
+        cols += (k ? "," : "") + kv.second.columns[(size_t)c.icols[k]].name;
+        kinds += c.text[k] ? 't' : 'i';
+      }
+      if (ok) clist += kv.first + "\t" + cols + "\t" + kinds + "\n";
+      break;
+    }
+  }
+  if (!clist.empty() && clist != last_corr_list_ &&
+      kernel_.host().write_file(root_path_ + "/corrmaps.list", ByteSpan((const uint8_t*)clist.data(), clist.size())).ok())
+    last_corr_list_ = clist;
   if (list.empty() || list == last_index_list_) return;
   if (kernel_.host().write_file(root_path_ + "/indexes.list", ByteSpan((const uint8_t*)list.data(), list.size())).ok())
     last_index_list_ = list;
