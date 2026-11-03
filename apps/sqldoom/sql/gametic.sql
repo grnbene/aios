@@ -3392,7 +3392,7 @@ BEGIN
     SELECT v.*,(SELECT sh.level_tics FROM shadow sh) AS level_tics,
            ROW_NUMBER() OVER (ORDER BY thing_id) AS rn,
            COALESCE((SELECT MAX(projectile_id) FROM monster_projectiles mp
-                     JOIN params p ON mp.map_id=p.map_id),0) AS max_id
+                     WHERE mp.map_id=a_map_id),0) AS max_id
     FROM velocity v
   )
   INSERT INTO monster_projectiles
@@ -3424,7 +3424,12 @@ BEGIN
          (n.missile_dice
           *(doom_prandom(n.thing_id, n.level_tics, 7) % n.dmg_dice_count + 1))::smallint,FALSE
   FROM numbered n CROSS JOIN params p
-  WHERE n.horizontal_len>0;
+  WHERE n.horizontal_len>0
+  ON CONFLICT (map_id, projectile_id) DO UPDATE SET
+    owner_thing_id=EXCLUDED.owner_thing_id, projectile_type=EXCLUDED.projectile_type,
+    x=EXCLUDED.x, y=EXCLUDED.y, z=EXCLUDED.z, vx=EXCLUDED.vx, vy=EXCLUDED.vy, vz=EXCLUDED.vz,
+    sector_id=EXCLUDED.sector_id, state=EXCLUDED.state, age=EXCLUDED.age, damage=EXCLUDED.damage,
+    impact_player=EXCLUDED.impact_player;
   -- spawn player rockets/plasma/BFG
   WITH
   params AS (SELECT a_map_id::int AS map_id,a_player_thing_id::int AS player_thing_id),

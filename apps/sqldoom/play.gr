@@ -253,7 +253,7 @@ fn render_frame() {
   }
 
   let render_query = replace(render_q, "SELECT @x AS x, @y AS y, @z AS z, @angle AS angle",
-    format("SELECT /* SQL_NO_CACHE */ {:.4f}e0 AS x, {:.4f}e0 AS y, {:.4f}e0 AS z, {:.4f}e0 AS angle", p.x, p.y, p.z, p.angle))
+    format("SELECT {:.4f}e0 AS x, {:.4f}e0 AS y, {:.4f}e0 AS z, {:.4f}e0 AS angle", p.x, p.y, p.z, p.angle))
   let t_r0 = clock()
   let rgb = sql(render_query)[0].frame_rgb
   let t_sql = clock() - t_r0
