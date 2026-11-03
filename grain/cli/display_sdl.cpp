@@ -27,6 +27,27 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <dlfcn.h>
+typedef void* (*objc_getClass_fn)(const char*);
+typedef void* (*sel_registerName_fn)(const char*);
+typedef void* (*objc_msgSend_fn)(void*, void*, ...);
+
+static void macos_activate_app() {
+  static auto get_class = reinterpret_cast<objc_getClass_fn>(dlsym(RTLD_DEFAULT, "objc_getClass"));
+  static auto sel_reg = reinterpret_cast<sel_registerName_fn>(dlsym(RTLD_DEFAULT, "sel_registerName"));
+  static auto msg_send = reinterpret_cast<objc_msgSend_fn>(dlsym(RTLD_DEFAULT, "objc_msgSend"));
+  if (!get_class || !sel_reg || !msg_send) return;
+
+  void* nsapp_class = get_class("NSApplication");
+  if (!nsapp_class) return;
+  void* app = msg_send(nsapp_class, sel_reg("sharedApplication"));
+  if (!app) return;
+  msg_send(app, sel_reg("setActivationPolicy:"), (ptrdiff_t)0);
+  msg_send(app, sel_reg("activateIgnoringOtherApps:"), (int)1);
+}
+#endif
+
 namespace grain_cli {
 
 namespace g = aios::userland::grain;
@@ -86,13 +107,15 @@ class SdlDisplay final : public g::Display {
  public:
   bool run(g::Vm& vm, const g::DisplayRun& opts, std::string& error) override {
     SDL_SetMainReady();
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");   // a canvas drawn at 1x, shown on a 2x screen, scaled smoothly
+    const char* sq = std::getenv("GRAIN_SCALE_QUALITY");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, sq ? sq : "0");   // nearest-pixel filtering for crisp retro art
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { error = std::string("run_panes(): cannot open the display: ") + SDL_GetError(); return false; }
-    SDL_StartTextInput();
+#if defined(__APPLE__)
+    macos_activate_app();
+#endif
     bool ok = loop(vm, opts, error);
     for (auto& [id, w] : windows_) destroy(w);
     windows_.clear();
-    SDL_StopTextInput();
     SDL_Quit();
     return ok;
   }
@@ -110,6 +133,7 @@ class SdlDisplay final : public g::Display {
   uint64_t pane_of(uint32_t sdl_id) const {
     for (const auto& [id, w] : windows_)
       if (w.sdl_id == sdl_id) return id;
+    if (windows_.size() == 1) return windows_.begin()->first;
     return 0;
   }
 
@@ -125,7 +149,18 @@ class SdlDisplay final : public g::Display {
     for (const auto& p : panes) {
       if (windows_.count(p.id)) continue;
       Window w;
-      w.window = SDL_CreateWindow(p.title.c_str(), SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, p.width, p.height,
+      int scale = 1;
+      if (const char* env_s = std::getenv("GRAIN_SCALE")) {
+        scale = std::max(1, std::atoi(env_s));
+      } else if (p.width <= 320) {
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(0, &dm) == 0 && dm.h >= 1000) {
+          scale = 4;   // 1280px wide on modern displays (>= 1000p)
+        } else {
+          scale = 3;   // 960px wide on smaller displays
+        }
+      }
+      w.window = SDL_CreateWindow(p.title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, p.width * scale, p.height * scale,
                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
       if (!w.window) { error = std::string("run_panes(): cannot open a window for \"") + p.title + "\": " + SDL_GetError(); return false; }
       w.renderer = SDL_CreateRenderer(w.window, -1, SDL_RENDERER_ACCELERATED);
@@ -133,6 +168,10 @@ class SdlDisplay final : public g::Display {
       if (!w.renderer) { error = std::string("run_panes(): no renderer for \"") + p.title + "\": " + SDL_GetError(); destroy(w); return false; }
       w.sdl_id = SDL_GetWindowID(w.window);
       SDL_RenderSetLogicalSize(w.renderer, p.width, p.height);   // from the first event on (see draw)
+      SDL_RaiseWindow(w.window);
+#if defined(__APPLE__)
+      macos_activate_app();
+#endif
       windows_[p.id] = w;
     }
     return true;
@@ -238,6 +277,8 @@ class SdlDisplay final : public g::Display {
         g::Value ev = event_map("mouse_move", pane);
         fields(ev).put("x", g::Value::integer(e.motion.x));
         fields(ev).put("y", g::Value::integer(e.motion.y));
+        fields(ev).put("dx", g::Value::integer(e.motion.xrel));
+        fields(ev).put("dy", g::Value::integer(e.motion.yrel));
         return g::pane_event(vm, pane, ev, error);
       }
       case SDL_MOUSEWHEEL: {

@@ -381,8 +381,8 @@ BEGIN
   SELECT map_id, thing_id, 'stand', -1, 0, NULL, 0, FALSE
   FROM thing_health WHERE map_id = a_map_id;
   DELETE FROM player_weapons WHERE map_id = a_map_id;
-  INSERT INTO player_weapons (map_id, player_thing_id)
-  SELECT t.map_id, t.id FROM things t
+  INSERT INTO player_weapons (map_id, player_thing_id, state, sy)
+  SELECT t.map_id, t.id, 'ready', 32.0 FROM things t
   JOIN thing_role_defs r ON r.thing_type = t.type AND r.player_number = 1
   WHERE t.map_id = a_map_id;
   -- Vanilla starts every player with the fist and pistol (weapon_id 1, 2).
@@ -556,7 +556,7 @@ END;;
 
 -- ==== 08_cs_begin.sql ====
 DROP FUNCTION IF EXISTS doom_cs_begin;;
-CREATE FUNCTION doom_cs_begin(a_map_id INT, a_player_thing_id INT, a_skill INT, a_move_fwd DOUBLE, a_move_strafe DOUBLE, a_running BOOLEAN, a_turn_degrees DOUBLE, a_attack_held BOOLEAN, a_weapon_switch_to INT, a_use_requested BOOLEAN) RETURNS INT
+CREATE FUNCTION doom_cs_begin(a_map_id INT, a_player_thing_id INT, a_skill INT, a_move_fwd DOUBLE, a_move_strafe DOUBLE, a_running BOOLEAN, a_turn_degrees DOUBLE, a_attack_held BOOLEAN, a_weapon_switch_to INT, a_use_requested BOOLEAN, a_jump_requested BOOLEAN) RETURNS INT
 BEGIN
   -- Clear the previous tic's transient pickup hand-offs.
   DELETE FROM pickup_touches
@@ -567,14 +567,14 @@ BEGIN
   INSERT INTO game_tic_commands
     (map_id,player_thing_id,command_serial,skill,skill_bit,
      move_fwd,move_strafe,running,turn_degrees,attack_held,
-     weapon_switch_to,use_requested,movement_mode)
+     weapon_switch_to,use_requested,movement_mode,jump_requested)
   VALUES
     (a_map_id::int,a_player_thing_id::int,1,a_skill::int,
      -- P_SpawnMapThing's own mapping: sk_baby and sk_easy share MTF_EASY,
      -- sk_medium is MTF_NORMAL, sk_hard and sk_nightmare share MTF_HARD.
      CASE WHEN a_skill::int<=1 THEN 1 WHEN a_skill::int=2 THEN 2 ELSE 4 END,
      a_move_fwd::real,a_move_strafe::real,a_running::boolean,a_turn_degrees::real,a_attack_held::boolean,
-     a_weapon_switch_to::int,a_use_requested::boolean,'idle')
+     a_weapon_switch_to::int,a_use_requested::boolean,'idle',COALESCE(a_jump_requested,FALSE)::boolean)
   ON CONFLICT (map_id,player_thing_id) DO UPDATE SET
     command_serial=game_tic_commands.command_serial+1,
     skill=EXCLUDED.skill,
@@ -586,6 +586,7 @@ BEGIN
     attack_held=EXCLUDED.attack_held,
     weapon_switch_to=EXCLUDED.weapon_switch_to,
     use_requested=EXCLUDED.use_requested,
+    jump_requested=EXCLUDED.jump_requested,
     movement_mode='idle';
   RETURN 0;
 END;;
@@ -752,12 +753,14 @@ BEGIN
   WITH
   params AS (
     SELECT g.map_id,g.player_thing_id,
-           t.x::float8 AS px,t.y::float8 AS py,
-           COS(RADIANS(t.angle::float8)) AS dx,
-           SIN(RADIANS(t.angle::float8)) AS dy,
-           v_use_range AS use_range
+           COALESCE(ps.position_x, t.x)::float8 AS px,
+           COALESCE(ps.position_y, t.y)::float8 AS py,
+           COS(RADIANS(COALESCE(ps.view_angle, t.angle)::float8)) AS dx,
+           SIN(RADIANS(COALESCE(ps.view_angle, t.angle)::float8)) AS dy,
+           GREATEST(v_use_range, 200.0::double precision) AS use_range
     FROM game_tic_commands g
     JOIN things t ON t.map_id=g.map_id AND t.id=g.player_thing_id
+    LEFT JOIN player_state ps ON ps.map_id=g.map_id AND ps.player_thing_id=g.player_thing_id
     WHERE g.map_id=a_map_id::int AND g.player_thing_id=a_player_thing_id::int
       AND g.use_requested
   ),
@@ -786,19 +789,23 @@ BEGIN
   trace_candidates AS (
     SELECT i.* FROM intersections i CROSS JOIN params p
     WHERE i.distance BETWEEN 0 AND p.use_range
-      AND i.line_fraction BETWEEN 0 AND 1
+      AND i.line_fraction BETWEEN -0.05 AND 1.05
       AND (i.special<>0 OR i.left_sd_id=-1 OR i.right_sd_id=-1
         OR (i.flags&1)<>0
         OR (LEAST(i.front_ceil,i.back_ceil)
           - GREATEST(i.front_floor,i.back_floor))<=0)
   ),
-  hit AS (SELECT * FROM trace_candidates ORDER BY distance,id LIMIT 1),
+  hit AS (
+    SELECT * FROM trace_candidates
+    ORDER BY (CASE WHEN special <> 0 THEN 0 ELSE 1 END), distance, id
+    LIMIT 1
+  ),
   decision AS (
     SELECT h.*,
       COALESCE((d.key_required='red'    AND NOT ps.key_red)
             OR (d.key_required='blue'   AND NOT ps.key_blue)
             OR (d.key_required='yellow' AND NOT ps.key_yellow),FALSE) AS locked,
-      (h.from_front AND COALESCE(d.use_activated,FALSE)) AS supported,
+      (COALESCE(d.use_activated,FALSE) AND (d.mechanic='door' OR h.from_front)) AS supported,
       COALESCE(d.use_once,FALSE) AS one_shot
     FROM hit h CROSS JOIN params p
     LEFT JOIN line_special_defs d ON d.special=h.special
@@ -814,7 +821,13 @@ BEGIN
              WHERE a.map_id=p.map_id AND a.line_id=d.id
            )),
          d.from_front
-  FROM decision d CROSS JOIN params p;
+  FROM decision d CROSS JOIN params p
+  ON CONFLICT (map_id,player_thing_id) DO UPDATE SET
+    line_id=EXCLUDED.line_id,
+    special=EXCLUDED.special,
+    locked=EXCLUDED.locked,
+    eligible=EXCLUDED.eligible,
+    from_front=EXCLUDED.from_front;
   -- Queue the staged decision.
   INSERT INTO line_special_events
     (map_id,player_thing_id,line_id,trigger_type,from_front)
@@ -991,7 +1004,7 @@ BEGIN
     -- Doors: manual back-sector doors plus tagged remote doors.
     WITH
     events AS (
-      SELECT e.map_id,e.line_id,e.trigger_type,ld.special,ld.tag,ld.left_sd_id
+      SELECT e.map_id,e.line_id,e.trigger_type,e.from_front,ld.special,ld.tag,ld.left_sd_id,ld.right_sd_id
       FROM line_special_events e
       JOIN linedefs ld ON ld.map_id=e.map_id AND ld.id=e.line_id
       WHERE e.map_id=a_map_id
@@ -1001,12 +1014,15 @@ BEGIN
       -- sector behind the line; 'tag' is a remote door, which moves every sector
       -- carrying the line's tag.
       SELECT e.*,
-        CASE WHEN d.door_target='back' THEN back.sector_id ELSE s.id END AS sector_id
+        CASE WHEN d.door_target='back' THEN
+          COALESCE(CASE WHEN e.from_front THEN back.sector_id ELSE front.sector_id END, back.sector_id, front.sector_id)
+        ELSE s.id END AS sector_id
       FROM events e
       JOIN line_special_defs d ON d.special=e.special AND d.mechanic='door'
       LEFT JOIN sidedefs back ON back.map_id=e.map_id AND back.id=e.left_sd_id
+      LEFT JOIN sidedefs front ON front.map_id=e.map_id AND front.id=e.right_sd_id
       LEFT JOIN sectors s ON s.map_id=e.map_id AND s.tag=e.tag
-      WHERE (d.door_target='back' AND back.sector_id IS NOT NULL)
+      WHERE (d.door_target='back' AND (back.sector_id IS NOT NULL OR front.sector_id IS NOT NULL))
          OR (d.door_target='tag'  AND s.id IS NOT NULL)
     ),
     adjacency AS (
@@ -1288,7 +1304,9 @@ BEGIN
        just_restored)
     SELECT map_id,line_id,sidedef_id,texture_part,tex,
       ('SW2'||SUBSTRING(tex FROM 4))::varchar(8),countdown,FALSE
-    FROM parts;
+    FROM parts
+    ON CONFLICT (map_id,line_id,sidedef_id,texture_part) DO UPDATE SET
+      countdown=EXCLUDED.countdown;
     WITH changed AS (
       SELECT DISTINCT b.map_id,b.sidedef_id
       FROM line_buttons b
@@ -1325,7 +1343,8 @@ BEGIN
       ON ld.map_id=e.map_id AND ld.id=e.line_id
     JOIN line_special_defs d ON d.special=ld.special
       AND (d.cross_once OR d.use_once)
-    WHERE e.map_id=a_map_id;
+    WHERE e.map_id=a_map_id
+    ON CONFLICT (map_id, line_id) DO NOTHING;
   END IF;
   IF (v_flags & 128) <> 0 THEN
     -- Floor RAISES. height_target says where it stops: 'lowest_ceiling' is the
@@ -1738,22 +1757,6 @@ BEGIN
   UPDATE line_buttons
   SET just_restored=(countdown=1),countdown=GREATEST(0,countdown-1)
   WHERE map_id=a_map_id AND countdown>=0;
-  WITH original AS (
-    SELECT DISTINCT map_id,sidedef_id
-    FROM line_buttons WHERE map_id=a_map_id AND just_restored
-  )
-  UPDATE sidedefs sd
-  SET upper_tex=COALESCE(u.original_tex,sd.upper_tex),
-      mid_tex=COALESCE(m.original_tex,sd.mid_tex),
-      lower_tex=COALESCE(l.original_tex,sd.lower_tex)
-  FROM original o
-  LEFT JOIN line_buttons u ON u.map_id=o.map_id AND u.sidedef_id=o.sidedef_id
-    AND u.texture_part='upper'
-  LEFT JOIN line_buttons m ON m.map_id=o.map_id AND m.sidedef_id=o.sidedef_id
-    AND m.texture_part='middle'
-  LEFT JOIN line_buttons l ON l.map_id=o.map_id AND l.sidedef_id=o.sidedef_id
-    AND l.texture_part='lower'
-  WHERE sd.map_id=o.map_id AND sd.id=o.sidedef_id;
   SET v_any_restored = false;
   BEGIN
     DECLARE b1_done INT DEFAULT 0;
@@ -1768,6 +1771,22 @@ BEGIN
     CLOSE b1_rows;
   END;
   IF v_any_restored THEN
+    WITH original AS (
+      SELECT DISTINCT map_id,sidedef_id
+      FROM line_buttons WHERE map_id=a_map_id AND just_restored
+    )
+    UPDATE sidedefs sd
+    SET upper_tex=COALESCE(u.original_tex,sd.upper_tex),
+        mid_tex=COALESCE(m.original_tex,sd.mid_tex),
+        lower_tex=COALESCE(l.original_tex,sd.lower_tex)
+    FROM original o
+    LEFT JOIN line_buttons u ON u.map_id=o.map_id AND u.sidedef_id=o.sidedef_id
+      AND u.texture_part='upper'
+    LEFT JOIN line_buttons m ON m.map_id=o.map_id AND m.sidedef_id=o.sidedef_id
+      AND m.texture_part='middle'
+    LEFT JOIN line_buttons l ON l.map_id=o.map_id AND l.sidedef_id=o.sidedef_id
+      AND l.texture_part='lower'
+    WHERE sd.map_id=o.map_id AND sd.id=o.sidedef_id;
     UPDATE render_segs rs
     SET upper_tex=sd.upper_tex,mid_tex=sd.mid_tex,lower_tex=sd.lower_tex
     FROM linedefs ld,sidedefs sd
@@ -1777,6 +1796,22 @@ BEGIN
       AND EXISTS (SELECT 1 FROM line_buttons b
         WHERE b.map_id=rs.map_id AND b.line_id=rs.linedef_id AND b.just_restored);
   END IF;
+  BEGIN
+    DECLARE v_has_movers BOOLEAN DEFAULT FALSE;
+    DECLARE b2_done INT DEFAULT 0;
+    DECLARE b2_rows CURSOR FOR SELECT EXISTS (SELECT 1 FROM sector_movers WHERE map_id=a_map_id AND direction<>2) AS e;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET b2_done = 1;
+    OPEN b2_rows;
+    b2_each: LOOP
+      FETCH b2_rows INTO v_e;
+      IF b2_done THEN LEAVE b2_each; END IF;
+      SET v_has_movers = v_e;
+    END LOOP;
+    CLOSE b2_rows;
+    IF NOT v_has_movers THEN
+      RETURN 0;
+    END IF;
+  END;
   WITH
   params AS (
     SELECT t.map_id,t.x::float8 AS px,t.y::float8 AS py
@@ -1968,6 +2003,8 @@ BEGIN
     WHEN ABS(g.move_fwd)>0 OR ABS(g.move_strafe)>0
       OR ABS(ps.momentum_x)>0.0000001 OR ABS(ps.momentum_y)>0.0000001
       OR ABS(ps.momentum_z)>0.0000001
+      OR (ps.base_z - 41.0 > s.floor_height + 0.5)
+      OR COALESCE(g.jump_requested, FALSE)
       OR ps.bob_strength>0.0000001
       OR ABS(ps.view_z-ps.base_z)>0.0000001
       OR EXISTS (
@@ -1979,6 +2016,7 @@ BEGIN
     ELSE 'idle'
   END
   FROM player_state ps
+  JOIN sectors s ON s.map_id=ps.map_id AND s.id=ps.sector_id
   WHERE g.map_id=a_map_id::int AND g.player_thing_id=a_player_thing_id::int
     AND ps.map_id=g.map_id AND ps.player_thing_id=g.player_thing_id;
   -- Normalize the movement endpoints on an idle tic. Without this,
@@ -2063,6 +2101,7 @@ BEGIN
       g.move_strafe::float8 AS move_side,
       g.running,
       g.turn_degrees::float8 AS turn_degrees,
+      COALESCE(g.jump_requested, FALSE) AS jump_requested,
       v_player_radius AS radius,
       ps2.noclip,
       v_player_height AS player_h,
@@ -2085,7 +2124,7 @@ BEGIN
            ps.momentum_y::float8 AS old_mom_y,
            ps.momentum_z::float8 AS old_mom_z,
            (ps.base_z-p.eye_h)::float8 AS feet_z,
-           (ps.momentum_z=0) AS on_ground,
+           (ps.momentum_z=0 AND (ps.base_z-p.eye_h) <= s.floor_height + 0.5) AS on_ground,
            ps.level_tics,
            CASE WHEN p.running THEN v_forwardmove_run ELSE v_forwardmove END
              * v_thrust_unit AS forward_thrust,
@@ -2095,6 +2134,7 @@ BEGIN
     JOIN things t ON t.map_id=p.map_id AND t.id=p.player_thing_id
     JOIN player_state ps ON ps.map_id=p.map_id
       AND ps.player_thing_id=p.player_thing_id
+    JOIN sectors s ON s.map_id=ps.map_id AND s.id=ps.sector_id
   ),
   turned AS (
     SELECT c.*,
@@ -2109,13 +2149,19 @@ BEGIN
              + CASE WHEN t.on_ground THEN
                  t.move_fwd*t.forward_thrust*COS(RADIANS(t.new_angle))
                  + t.move_side*t.side_thrust*SIN(RADIANS(t.new_angle))
-               ELSE 0.0 END)) AS raw_mom_x,
+               ELSE
+                 0.35 * (t.move_fwd*t.forward_thrust*COS(RADIANS(t.new_angle))
+                         + t.move_side*t.side_thrust*SIN(RADIANS(t.new_angle)))
+               END)) AS raw_mom_x,
            LEAST(t.max_move,GREATEST(-t.max_move,
              t.old_mom_y
              + CASE WHEN t.on_ground THEN
                  t.move_fwd*t.forward_thrust*SIN(RADIANS(t.new_angle))
                  - t.move_side*t.side_thrust*COS(RADIANS(t.new_angle))
-               ELSE 0.0 END)) AS raw_mom_y
+               ELSE
+                 0.35 * (t.move_fwd*t.forward_thrust*SIN(RADIANS(t.new_angle))
+                         - t.move_side*t.side_thrust*COS(RADIANS(t.new_angle)))
+               END)) AS raw_mom_y
     FROM turned t
   ),
   lines_here AS (
@@ -2264,7 +2310,7 @@ BEGIN
     SELECT cx,cy FROM candidate_blocked WHERE NOT blocked ORDER BY pri LIMIT 1
   ),
   sector_floor AS (
-    SELECT s.id AS sector_id,s.floor_height
+    SELECT s.id AS sector_id,s.floor_height,s.ceil_height
     FROM params p CROSS JOIN best_pos bp
     JOIN sectors s ON s.map_id=p.map_id
      AND s.id=doom_sector_at(p.map_id,bp.cx,bp.cy)
@@ -2279,16 +2325,30 @@ BEGIN
            CASE WHEN ABS(bp.cy-(t.py+t.raw_mom_y))<v_pos_epsilon
                 THEN t.raw_mom_y ELSE 0.0 END AS slide_mom_y
     FROM thrusted t CROSS JOIN best_pos bp CROSS JOIN sector_floor sf
-    -- P_ZMovement: apply the pending fall, land if that reaches the floor,
-    -- otherwise accelerate downward. Stepping up still snaps instantly.
+    -- P_ZMovement: apply the pending fall or jump, land if that reaches the floor,
+    -- bonk if that hits the ceiling, otherwise accelerate downward.
     CROSS JOIN LATERAL (
       SELECT
-        CASE WHEN t.feet_z+t.old_mom_z<=sf.floor_height
-             THEN sf.floor_height::float8
-             ELSE t.feet_z+t.old_mom_z END AS feet,
-        CASE WHEN t.feet_z+t.old_mom_z<=sf.floor_height THEN 0.0
-             WHEN t.old_mom_z=0.0 THEN -2.0*t.gravity
-             ELSE t.old_mom_z-t.gravity END AS next_mom_z
+        CASE
+          WHEN t.on_ground AND t.jump_requested AND sf.floor_height + 8.5 + t.player_h <= sf.ceil_height
+            THEN sf.floor_height::float8 + 8.5
+          WHEN t.feet_z + t.old_mom_z <= sf.floor_height
+            THEN sf.floor_height::float8
+          WHEN t.feet_z + t.old_mom_z + t.player_h >= sf.ceil_height
+            THEN sf.ceil_height::float8 - t.player_h
+          ELSE t.feet_z + t.old_mom_z
+        END AS feet,
+        CASE
+          WHEN t.on_ground AND t.jump_requested AND sf.floor_height + 8.5 + t.player_h <= sf.ceil_height
+            THEN 8.5 - t.gravity
+          WHEN t.feet_z + t.old_mom_z <= sf.floor_height
+            THEN 0.0
+          WHEN t.feet_z + t.old_mom_z + t.player_h >= sf.ceil_height
+            THEN -1.0 * t.gravity
+          WHEN t.old_mom_z = 0.0
+            THEN -2.0 * t.gravity
+          ELSE t.old_mom_z - t.gravity
+        END AS next_mom_z
     ) z
   ),
   motion AS (
@@ -2538,7 +2598,8 @@ BEGIN
          d.cap,d.is_set_min,d.weapon_id,d.armor_class
   FROM selected_items s
   JOIN pickup_defs d ON d.thing_type=s.thing_type
-  CROSS JOIN params p;
+  CROSS JOIN params p
+  ON CONFLICT (map_id,player_thing_id,thing_id,kind) DO NOTHING;
   -- health, armor class, backpack, and keys
   WITH staged AS (
     SELECT
@@ -3241,6 +3302,28 @@ BEGIN
   DECLARE v_spawn_ahead DOUBLE;
   DECLARE v_nightmare_missile_speed DOUBLE;
   DECLARE v_melee_reach DOUBLE;
+  DECLARE v_has_missiles BOOLEAN;
+  DECLARE v_e BOOLEAN;
+  SET v_has_missiles = false;
+  BEGIN
+    DECLARE b_done INT DEFAULT 0;
+    DECLARE b_rows CURSOR FOR SELECT EXISTS (SELECT 1 FROM monster_projectiles WHERE map_id=a_map_id)
+                                  OR EXISTS (SELECT 1 FROM monster_ai WHERE map_id=a_map_id AND fired_this_tick)
+                                  OR EXISTS (SELECT 1 FROM player_weapons WHERE map_id=a_map_id AND fired_this_tick AND current_weapon IN (5,6,7)) AS e;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET b_done = 1;
+    OPEN b_rows;
+    b_each: LOOP
+      FETCH b_rows INTO v_e;
+      IF b_done THEN LEAVE b_each; END IF;
+      SET v_has_missiles = v_e;
+    END LOOP;
+    CLOSE b_rows;
+  END;
+  IF NOT v_has_missiles THEN
+    DELETE FROM projectile_damage WHERE map_id=a_map_id;
+    DELETE FROM projectile_impacts WHERE map_id=a_map_id;
+    RETURN 0;
+  END IF;
   SET v_player_radius = doom_const('PLAYER_RADIUS');
   SET v_player_height = doom_const('PLAYER_HEIGHT');
   SET v_view_height = doom_const('VIEWHEIGHT');
@@ -3919,8 +4002,7 @@ BEGIN
     FROM input i JOIN things t ON t.map_id=i.map_id AND t.id=i.player_thing_id
   ),
   sound_pick AS (
-    SELECT d.thing_type, d.cue, d.variant, d.sound_name,
-           COUNT(*) OVER (PARTITION BY d.thing_type, d.cue) AS n
+    SELECT d.thing_type, d.cue, d.variant, d.sound_name, 1 AS n
     FROM thing_sound_defs d
   ),
   events AS (
@@ -7975,7 +8057,7 @@ END;;
 
 -- Single player: the client's command straight in, then the shared tic.
 DROP FUNCTION IF EXISTS doom_run_game_tic;;
-CREATE FUNCTION doom_run_game_tic(a_map_id INT, a_player_thing_id INT, a_skill INT, a_move_fwd DOUBLE, a_move_strafe DOUBLE, a_running BOOLEAN, a_turn_degrees DOUBLE, a_attack_held BOOLEAN, a_weapon_switch_to INT, a_use_requested BOOLEAN) RETURNS BOOLEAN
+CREATE FUNCTION doom_run_game_tic(a_map_id INT, a_player_thing_id INT, a_skill INT, a_move_fwd DOUBLE, a_move_strafe DOUBLE, a_running BOOLEAN, a_turn_degrees DOUBLE, a_attack_held BOOLEAN, a_weapon_switch_to INT, a_use_requested BOOLEAN, a_jump_requested BOOLEAN) RETURNS BOOLEAN
 BEGIN
   DECLARE v_playing INT;
   DECLARE v_recording INT;
@@ -7987,8 +8069,8 @@ BEGIN
   DECLARE v_e BOOLEAN;
   DECLARE v_nobody INT;
   DO doom_cs_begin(
-  a_map_id,a_player_thing_id,a_skill,a_move_fwd,a_move_strafe,
-  a_running,a_turn_degrees,a_attack_held,a_weapon_switch_to,a_use_requested);
+    a_map_id,a_player_thing_id,a_skill,a_move_fwd,a_move_strafe,
+    a_running,a_turn_degrees,a_attack_held,a_weapon_switch_to,a_use_requested,a_jump_requested);
   -- G_ReadDemoTiccmd / G_WriteDemoTiccmd: while a demo plays, its recorded
   -- command replaces the client's; while one records, the command is appended.
   -- Past the last recorded tic the demo ends, and if the attract loop started
@@ -8114,7 +8196,7 @@ BEGIN
     END LOOP;
     CLOSE b1_rows;
   END;
-  DO doom_cs_begin(a_map_id,a_p,a_skill,v_mf,v_ms,v_mr,v_mt,v_ma,v_mw,v_mu);
+  DO doom_cs_begin(a_map_id,a_p,a_skill,v_mf,v_ms,v_mr,v_mt,v_ma,v_mw,v_mu,FALSE);
   RETURN 1;
 END;;
 

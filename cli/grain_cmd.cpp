@@ -19,6 +19,9 @@
 #include "grain_host.hpp"   // popen, BSD sockets: hosted only
 #endif
 #include "grain_net.hpp"
+#if defined(AIOS_HAS_SDL2)
+#include "../grain/cli/display_sdl.hpp"
+#endif
 
 namespace aios::cli {
 
@@ -162,6 +165,9 @@ bool compile_and_run(Kernel& k, Out& o, const std::string& source,
 
   grain::Vm vm;
   grain::install_builtins(vm);
+#if defined(AIOS_HAS_SDL2)
+  grain::set_display(&grain_cli::sdl_display());
+#endif
   install_machine(vm, k);
   vm.files = &g_host_files;
 #if !defined(AIOS_METAL)

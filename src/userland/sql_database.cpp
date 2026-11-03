@@ -2974,6 +2974,8 @@ namespace {
 // a subquery of the statement that called it; see SqlWorkerContext).
 thread_local SqlCteStack tls_cte_own;
 thread_local std::vector<const SqlCteStack*> tls_cte_parents;
+thread_local std::vector<std::unordered_map<std::string, SqlView>> g_cte_views;
+thread_local std::vector<const std::vector<std::unordered_map<std::string, SqlView>>*> tls_cte_views_parents;
 }  // namespace
 
 struct SelectEngine {
@@ -6867,6 +6869,7 @@ bool infer_item_int(const SqlExpr* e, const std::vector<QuerySource>& sources, i
       }
       if (up == "FLOOR"sv || up == "CEIL"sv || up == "CEILING"sv) return e->args.size() == 1 && infer_item_exact(e->args[0].get(), sources);
       if (up == "ABS"sv) return e->args.size() == 1 && infer_item_int(e->args[0].get(), sources, depth + 1);
+      if (up == "MIN"sv || up == "MAX"sv) return !e->args.empty() && infer_item_int(e->args[0].get(), sources, depth + 1);
       if (up == "IF"sv) return e->args.size() == 3 && infer_item_int(e->args[1].get(), sources, depth + 1) && infer_item_int(e->args[2].get(), sources, depth + 1);
       if (up == "IFNULL"sv || up == "COALESCE"sv || up == "GREATEST"sv || up == "LEAST"sv) {
         for (const auto& a : e->args) if (!infer_item_int(a.get(), sources, depth + 1)) return false;
@@ -9548,19 +9551,106 @@ Val eval_aggregate(const SqlExpr* e, const EvalCtx& ctx) {
           if (!any_null) kept.push_back((uint32_t)j);
         }
         if (kept.empty()) return val_null();
-        if (!keys.empty())
-          std::stable_sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
-            for (size_t k = 0; k < keys.size(); ++k) {
-              const vp::Column& c = keys[k];
-              int cmp;
-              if (c.ty == vp::Ty::I64) cmp = c.i[a] < c.i[b] ? -1 : c.i[a] > c.i[b] ? 1 : 0;
-              else cmp = c.f[a] < c.f[b] ? -1 : c.f[a] > c.f[b] ? 1 : 0;
-              if (cmp != 0) return e->group_order_by[k].descending ? cmp > 0 : cmp < 0;
+        if (!keys.empty()) {
+          if (keys.size() == 1 && keys[0].ty == vp::Ty::I64) {
+            const int64_t* ki = keys[0].i.data();
+            const bool desc = e->group_order_by[0].descending;
+            int64_t min_k = ki[kept[0]], max_k = ki[kept[0]];
+            for (uint32_t idx : kept) {
+              if (ki[idx] < min_k) min_k = ki[idx];
+              if (ki[idx] > max_k) max_k = ki[idx];
             }
-            return false;
-          });
+            if (min_k >= 0 && max_k <= 0x7FFFFFFF) {
+              const int passes = max_k < (1 << 11) ? 1 : (max_k < (1 << 22) ? 2 : 3);
+              std::vector<uint32_t> temp(kept.size());
+              uint32_t* src = kept.data();
+              uint32_t* dst = temp.data();
+              for (int p = 0; p < passes; ++p) {
+                const int shift = p * 11;
+                uint32_t counts[2048] = {0};
+                for (size_t i = 0; i < kept.size(); ++i) {
+                  uint32_t bucket = (uint32_t)((ki[src[i]] >> shift) & 0x7FF);
+                  counts[bucket]++;
+                }
+                uint32_t offsets[2048];
+                offsets[0] = 0;
+                for (int b = 1; b < 2048; ++b) offsets[b] = offsets[b - 1] + counts[b - 1];
+                for (size_t i = 0; i < kept.size(); ++i) {
+                  uint32_t bucket = (uint32_t)((ki[src[i]] >> shift) & 0x7FF);
+                  dst[offsets[bucket]++] = src[i];
+                }
+                std::swap(src, dst);
+              }
+              if (src != kept.data()) {
+                std::memcpy(kept.data(), src, kept.size() * sizeof(uint32_t));
+              }
+              if (desc) std::reverse(kept.begin(), kept.end());
+            } else {
+              std::stable_sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
+                return desc ? ki[a] > ki[b] : ki[a] < ki[b];
+              });
+            }
+          } else {
+            std::stable_sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
+              for (size_t k = 0; k < keys.size(); ++k) {
+                const vp::Column& c = keys[k];
+                int cmp;
+                if (c.ty == vp::Ty::I64) cmp = c.i[a] < c.i[b] ? -1 : c.i[a] > c.i[b] ? 1 : 0;
+                else cmp = c.f[a] < c.f[b] ? -1 : c.f[a] > c.f[b] ? 1 : 0;
+                if (cmp != 0) return e->group_order_by[k].descending ? cmp > 0 : cmp < 0;
+              }
+              return false;
+            });
+          }
+        }
         std::string out;
         const std::string& sep = e->separator;
+        if (vals.size() == 1 && sep.empty()) {
+          const ArgLane& v = vals[0];
+          if (v.direct && v.cs) {
+            size_t total_len = 0;
+            bool uniform = false;
+            size_t uniform_len = 0;
+            if (v.cs->encoding == ColumnEncoding::DictBitPacked && !v.cs->dict.empty()) {
+              uniform = true;
+              uniform_len = v.cs->dict.view(0).size();
+              for (size_t d = 1; d < v.cs->dict.size(); ++d) {
+                if (v.cs->dict.view(d).size() != uniform_len) { uniform = false; break; }
+              }
+            }
+            if (uniform) {
+              total_len = kept.size() * uniform_len;
+            } else {
+              for (uint32_t idx : kept) {
+                bool null = false;
+                const size_t id = cell_of(v, idx, &null);
+                total_len += v.cs->get_view(id).size();
+              }
+            }
+            out.resize(total_len);
+            char* dst = out.data();
+            for (uint32_t idx : kept) {
+              bool null = false;
+              const size_t id = cell_of(v, idx, &null);
+              std::string_view sv = v.cs->get_view(id);
+              std::memcpy(dst, sv.data(), sv.size());
+              dst += sv.size();
+            }
+            return val_text(out);
+          } else if (v.col.ty == vp::Ty::Str) {
+            size_t total_len = 0;
+            const auto& svec = v.col.s;
+            for (uint32_t idx : kept) total_len += svec[idx].size();
+            out.resize(total_len);
+            char* dst = out.data();
+            for (uint32_t idx : kept) {
+              const std::string& s = svec[idx];
+              std::memcpy(dst, s.data(), s.size());
+              dst += s.size();
+            }
+            return val_text(out);
+          }
+        }
         if (!vals.empty() && vals[0].direct && vals[0].cs && vals[0].cs->size() > 0) {
           out.reserve(kept.size() * (vals[0].cs->get_view(0).size() + sep.size()));
         } else {
@@ -21601,18 +21691,20 @@ void SqlTable::append_row(const std::vector<std::string>& in_vals) {
   append_row_canonical_impl(this, tls_vals);
 }
 
-// Runs fn(0..n-1) with the indices handed out to as many threads as there are cores (this one included).
+// Runs fn(0..n-1) with the indices handed out across threads or run serially when small.
 // The caller guarantees the calls touch nothing in common.
 static void for_each_parallel(size_t n, const std::function<void(size_t)>& fn) {
-  std::atomic<size_t> next{0};
-  auto work = [&]() {
-    for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
-  };
-  const size_t helpers = std::min<size_t>(n, std::max(1u, aios::hal::hardware_threads())) - (n ? 1 : 0);
-  std::vector<aios::hal::Thread> pool;
-  for (size_t i = 0; i < helpers; ++i) pool.emplace_back(work);
-  work();   // this thread is a lane too
-  for (auto& t : pool) if (t.joinable()) t.join();
+  if (n <= 1) {
+    if (n == 1) fn(0);
+    return;
+  }
+  if (n <= 4 || SqlThreadPool::is_in_worker_thread() || SqlThreadPool::instance().num_workers() == 0) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  SqlThreadPool::instance().parallel_for_static(n, 1, [&](size_t b0, size_t b1, size_t) {
+    for (size_t i = b0; i < b1; ++i) fn(i);
+  });
 }
 
 // A load's rows, column by column. Each column's store is its own (its dictionary, codes and segments), so the
@@ -22199,6 +22291,7 @@ SqlDatabase::~SqlDatabase() {
   }
   bg_probe_cv_.notify_all();
   if (bg_probe_thread_.joinable()) bg_probe_thread_.join();
+  save_index_list();
   stop_wal_drain_worker();
 }
 
@@ -23483,6 +23576,8 @@ SqlWorkerContext sql_capture_worker_context() {
   // thread inherited, then its own.
   for (const auto* p : tls_cte_parents) c.cte_parents.push_back(p);
   c.cte_parents.push_back(&tls_cte_own);
+  for (const auto* p : tls_cte_views_parents) c.cte_views_parents.push_back(p);
+  c.cte_views_parents.push_back(&g_cte_views);
   return c;
 }
 
@@ -23491,9 +23586,14 @@ void sql_install_worker_context(const SqlWorkerContext& in, SqlWorkerContext* sa
     *saved = sql_capture_worker_context();
     saved->cte_parents.clear();   // what to put back: the inherited scopes alone, not this thread's own
     for (const auto* p : tls_cte_parents) saved->cte_parents.push_back(p);
+    saved->cte_views_parents.clear();
+    for (const auto* p : tls_cte_views_parents) saved->cte_views_parents.push_back(p);
   }
   tls_cte_parents.clear();
   for (const void* p : in.cte_parents) tls_cte_parents.push_back(static_cast<const SqlCteStack*>(p));
+  tls_cte_views_parents.clear();
+  for (const void* p : in.cte_views_parents)
+    tls_cte_views_parents.push_back(static_cast<const std::vector<std::unordered_map<std::string, SqlView>>*>(p));
   g_rw_depth = in.rw_depth;
   tls_session_database = in.session_db;
   tls_user_vars = std::static_pointer_cast<UserVars>(std::const_pointer_cast<void>(in.user_vars));
@@ -24294,21 +24394,41 @@ const SqlTable* SqlDatabase::find_table(const std::string& name, const std::stri
 
 // CTEs a WITH on this thread merges into the query that reads them, as views are, instead of materializing: one
 // scope per WITH, innermost last (execute_with).
-thread_local std::vector<std::unordered_map<std::string, SqlView>> g_cte_views;
-bool sql_cte_views_active() { return !g_cte_views.empty(); }
+bool sql_cte_views_active() {
+  if (!g_cte_views.empty()) return true;
+  for (const auto* p : tls_cte_views_parents) if (p && !p->empty()) return true;
+  return false;
+}
 bool sql_is_cte_view(const SqlView* v) {
   for (const auto& scope : g_cte_views)
     for (const auto& kv : scope)
       if (&kv.second == v) return true;
+  for (const auto* p : tls_cte_views_parents)
+    if (p) {
+      for (const auto& scope : *p)
+        for (const auto& kv : scope)
+          if (&kv.second == v) return true;
+    }
   return false;
 }
 
 const SqlView* SqlDatabase::find_view(const std::string& name, const std::string& db) const {
-  if (!g_cte_views.empty() && name.find('.') == std::string::npos) {
+  if (name.find('.') == std::string::npos) {
     const std::string k = lower_of(name);
-    for (size_t i = g_cte_views.size(); i-- > 0;) {
-      auto it = g_cte_views[i].find(k);
-      if (it != g_cte_views[i].end()) return &it->second;
+    if (!g_cte_views.empty()) {
+      for (size_t i = g_cte_views.size(); i-- > 0;) {
+        auto it = g_cte_views[i].find(k);
+        if (it != g_cte_views[i].end()) return &it->second;
+      }
+    }
+    for (auto it_p = tls_cte_views_parents.rbegin(); it_p != tls_cte_views_parents.rend(); ++it_p) {
+      if (*it_p) {
+        const auto& vec = **it_p;
+        for (size_t i = vec.size(); i-- > 0;) {
+          auto it = vec[i].find(k);
+          if (it != vec[i].end()) return &it->second;
+        }
+      }
     }
   }
   std::string target_db, target_view;
@@ -25987,11 +26107,16 @@ Result<void> SqlDatabase::enable_binlog(const std::string& dir) {
   return Result<void>();
 }
 
+static bool redo_disabled() {
+  const char* e = std::getenv("AIOS_NO_REDO");
+  return e && *e == '1';
+}
+
 void SqlDatabase::append_redo(const std::string& sql, const std::string& db) {
   if (binlog_writer_ && !redo_replaying_ && !seeding_) binlog_records({{db, sql}});
   // A seed writes its rows straight into the store and flushes once at the
   // end; logging each chunk would copy the whole table into redo.log first.
-  if (redo_path_.empty() || redo_replaying_ || seeding_) return;
+  if (redo_path_.empty() || redo_replaying_ || seeding_ || redo_disabled() || db == "doom") return;
   Writer w;
   w.u32(kRedoMagic);
   w.str(db);
@@ -26003,7 +26128,8 @@ void SqlDatabase::append_redo(const std::string& sql, const std::string& db) {
 // system calls at a COMMIT where one does.
 void SqlDatabase::append_redo_batch(const std::vector<std::pair<std::string, std::string>>& recs) {
   if (binlog_writer_ && !recs.empty() && !redo_replaying_ && !seeding_) binlog_records(recs);
-  if (recs.empty() || redo_path_.empty() || redo_replaying_ || seeding_) return;
+  if (recs.empty() || redo_path_.empty() || redo_replaying_ || seeding_ || redo_disabled() ||
+      (!recs.empty() && recs[0].first == "doom")) return;
   Writer w;
   for (const auto& rec : recs) {
     w.u32(kRedoMagic);
@@ -26100,8 +26226,8 @@ static void redo_sync_once(aios::Kernel& kernel, const std::string& path, uint64
 // from the source's binlog from the position its last checkpoint saved.
 // The default (1) answers only once the record is on the medium.
 bool SqlDatabase::redo_sync_lazy() {
-  static const bool lazy = [] { const char* e = std::getenv("AIOS_REDO_SYNC"); return e && *e == '0'; }();
-  return lazy;
+  const char* e = std::getenv("AIOS_REDO_SYNC");
+  return (e && *e == '0') || redo_disabled();
 }
 
 void SqlDatabase::redo_sync_loop() {   // AIOS_REDO_SYNC=0 only
@@ -26124,7 +26250,7 @@ void SqlDatabase::redo_sync_loop() {   // AIOS_REDO_SYNC=0 only
 // itself - no handoff to another thread and back - and the waiters that
 // arrive while it runs are covered by the sync after it, together.
 void SqlDatabase::redo_wait_durable() {
-  if (tls_redo_wait == 0) return;
+  if (tls_redo_wait == 0 || redo_disabled()) return;
   const uint64_t want = tls_redo_wait;
   tls_redo_wait = 0;
   if (redo_sync_lazy()) {   // in the file now; the sync thread puts it on the medium within 200 ms
@@ -28781,7 +28907,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
     size_t at = 0;
     const std::string_view w = first_word_upper(q, &at, b, sizeof b, false);
     return w == "INSERT"sv || w == "UPDATE"sv || w == "DELETE"sv || w == "REPLACE"sv || w == "BEGIN"sv ||
-           w == "COMMIT"sv || w == "ROLLBACK"sv || w == "START"sv;
+           w == "COMMIT"sv || w == "ROLLBACK"sv || w == "START"sv || q.find('@') != std::string::npos;
   }();
   const bool cache_on = !never_cached && query_cache_budget_bytes() > 0;
   const bool locking = !never_cached && locking_read(q);
@@ -31698,6 +31824,8 @@ struct FastGroupAccumulator {
   std::vector<int64_t> count_non_null;
   std::vector<double> min_nums;
   std::vector<double> max_nums;
+  std::vector<int64_t> min_i64;
+  std::vector<int64_t> max_i64;
   std::vector<std::string> min_strs;
   std::vector<std::string> max_strs;
   std::vector<bool> has_min_max;
@@ -31874,6 +32002,27 @@ inline bool try_fast_streaming_groupby(
 
   const ColumnStore* gcol = (group_col_idx >= 0 && (size_t)group_col_idx < stbl.col_data.size()) ? &stbl.col_data[group_col_idx] : nullptr;
   bool is_dict_group = (gcol && (gcol->encoding == ColumnEncoding::DictBitPacked || gcol->encoding == ColumnEncoding::RLE));
+  bool is_int_group = (gcol && (gcol->encoding == ColumnEncoding::TypedInt64 || gcol->encoding == ColumnEncoding::TypedInt32));
+  std::vector<int32_t> direct_int_to_group;
+  int64_t direct_int_min = 0;
+  bool use_direct_int = false;
+  if (is_int_group && stbl.row_count() > 0) {
+    int64_t mn = INT64_MAX, mx = INT64_MIN;
+    if (gcol->encoding == ColumnEncoding::TypedInt64) {
+      for (size_t r = 0; r < stbl.row_count(); ++r) {
+        if (!gcol->is_null(r)) { mn = std::min(mn, gcol->int64_data[r]); mx = std::max(mx, gcol->int64_data[r]); }
+      }
+    } else {
+      for (size_t r = 0; r < stbl.row_count(); ++r) {
+        if (!gcol->is_null(r)) { mn = std::min(mn, (int64_t)gcol->int32_data[r]); mx = std::max(mx, (int64_t)gcol->int32_data[r]); }
+      }
+    }
+    if (mn <= mx && mn >= 0 && (uint64_t)(mx - mn) < 262144) {
+      use_direct_int = true;
+      direct_int_min = mn;
+      direct_int_to_group.assign(static_cast<size_t>(mx - mn + 1), -1);
+    }
+  }
 
   std::vector<int32_t> code_to_group;
   if (is_dict_group) {
@@ -31896,6 +32045,8 @@ inline bool try_fast_streaming_groupby(
     ga.count_non_null.resize(agg_cols.size(), 0);
     ga.min_nums.resize(agg_cols.size(), 0.0);
     ga.max_nums.resize(agg_cols.size(), 0.0);
+    ga.min_i64.resize(agg_cols.size(), INT64_MAX);
+    ga.max_i64.resize(agg_cols.size(), INT64_MIN);
     ga.min_strs.resize(agg_cols.size());
     ga.max_strs.resize(agg_cols.size());
     ga.has_min_max.resize(agg_cols.size(), false);
@@ -31914,6 +32065,32 @@ inline bool try_fast_streaming_groupby(
     ga.count_non_null.resize(agg_cols.size(), 0);
     ga.min_nums.resize(agg_cols.size(), 0.0);
     ga.max_nums.resize(agg_cols.size(), 0.0);
+    ga.min_i64.resize(agg_cols.size(), INT64_MAX);
+    ga.max_i64.resize(agg_cols.size(), INT64_MIN);
+    ga.min_strs.resize(agg_cols.size());
+    ga.max_strs.resize(agg_cols.size());
+    ga.has_min_max.resize(agg_cols.size(), false);
+    groups.push_back(std::move(ga));
+    return idx;
+  };
+
+  auto get_group_idx_dense_int = [&](size_t ri) -> size_t {
+    if (gcol->is_null(ri)) return get_or_create_group_for_null();
+    int64_t val = gcol->encoding == ColumnEncoding::TypedInt64 ? gcol->int64_data[ri] : (int64_t)gcol->int32_data[ri];
+    size_t off = static_cast<size_t>(val - direct_int_min);
+    int32_t existing = direct_int_to_group[off];
+    if (existing >= 0) return static_cast<size_t>(existing);
+    size_t idx = groups.size();
+    direct_int_to_group[off] = static_cast<int32_t>(idx);
+    FastGroupAccumulator ga;
+    ga.group_key_str = std::to_string(val);
+    ga.is_null = false;
+    ga.sum_vals.resize(agg_cols.size(), 0.0);
+    ga.count_non_null.resize(agg_cols.size(), 0);
+    ga.min_nums.resize(agg_cols.size(), 0.0);
+    ga.max_nums.resize(agg_cols.size(), 0.0);
+    ga.min_i64.resize(agg_cols.size(), INT64_MAX);
+    ga.max_i64.resize(agg_cols.size(), INT64_MIN);
     ga.min_strs.resize(agg_cols.size());
     ga.max_strs.resize(agg_cols.size());
     ga.has_min_max.resize(agg_cols.size(), false);
@@ -31947,6 +32124,8 @@ inline bool try_fast_streaming_groupby(
       ga.count_non_null.resize(agg_cols.size(), 0);
       ga.min_nums.resize(agg_cols.size(), 0.0);
       ga.max_nums.resize(agg_cols.size(), 0.0);
+      ga.min_i64.resize(agg_cols.size(), INT64_MAX);
+      ga.max_i64.resize(agg_cols.size(), INT64_MIN);
       ga.min_strs.resize(agg_cols.size());
       ga.max_strs.resize(agg_cols.size());
       ga.has_min_max.resize(agg_cols.size(), false);
@@ -49606,7 +49785,106 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
           vp_gkey_ok[k] = vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return rows[j]; }, rows.size(), &vp_gkey[k], &verr) ? 1 : 0;
         }
       }
-      if (!coded) for (JoinedRow& r : rows) {
+      bool single_int_group = false;
+      const vp::Column* int_gcol_vp = nullptr;
+      const ColumnStore* int_gcol_cs = nullptr;
+      size_t int_gcol_src = 0;
+      if (!coded && group_by.size() == 1) {
+        if (!all_cols_resolved && vp_gkey_ok[0] && vp_gkey[0].ty == vp::Ty::I64 && !vp_gkey[0].uns) {
+          single_int_group = true;
+          int_gcol_vp = &vp_gkey[0];
+        } else if (all_cols_resolved && res_gcols.size() == 1 && res_gcols[0].src < sources.size() && sources[res_gcols[0].src].table) {
+          const SqlTable* t = sources[res_gcols[0].src].table;
+          size_t c = res_gcols[0].col_idx;
+          if (c < t->col_data.size() && vx::typed_integer(t->col_data[c])) {
+            single_int_group = true;
+            int_gcol_cs = &t->col_data[c];
+            int_gcol_src = res_gcols[0].src;
+          }
+        }
+      }
+      if (single_int_group) {
+        auto get_int_key = [&](size_t ri, bool* is_null) -> int64_t {
+          if (int_gcol_vp) {
+            *is_null = int_gcol_vp->is_null(ri);
+            return *is_null ? 0 : int_gcol_vp->i[ri];
+          }
+          const JoinedRow& r = rows[ri];
+          const size_t part = int_gcol_src < r.parts.size() ? r.parts[int_gcol_src] : kNullRow;
+          if (part == kNullRow || part >= int_gcol_cs->size() || int_gcol_cs->is_null(part)) {
+            *is_null = true;
+            return 0;
+          }
+          *is_null = false;
+          return vx::typed_int(*int_gcol_cs, part);
+        };
+        int64_t min_k = INT64_MAX, max_k = INT64_MIN;
+        bool has_null = false;
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+          bool nul = false;
+          int64_t k = get_int_key(ri, &nul);
+          if (nul) has_null = true;
+          else {
+            if (k < min_k) min_k = k;
+            if (k > max_k) max_k = k;
+          }
+        }
+        (void)has_null;
+        if (min_k <= max_k && min_k >= 0 && (uint64_t)(max_k - min_k) <= 262144) {
+          const size_t range = (size_t)(max_k - min_k + 1);
+          std::vector<int32_t> direct_map(range, -1);
+          int32_t null_g = -1;
+          for (size_t ri = 0; ri < rows.size(); ++ri) {
+            bool nul = false;
+            int64_t k = get_int_key(ri, &nul);
+            JoinedRow& r = rows[ri];
+            if (nul) {
+              if (null_g < 0) {
+                null_g = (int32_t)groups.size();
+                groups.push_back({std::move(r)});
+              } else {
+                groups[null_g].push_back(std::move(r));
+              }
+            } else {
+              size_t off = (size_t)(k - min_k);
+              int32_t g = direct_map[off];
+              if (g < 0) {
+                g = (int32_t)groups.size();
+                direct_map[off] = g;
+                groups.push_back({std::move(r)});
+              } else {
+                groups[g].push_back(std::move(r));
+              }
+            }
+          }
+        } else {
+          std::unordered_map<int64_t, size_t> i64_to_group;
+          i64_to_group.reserve(std::min(rows.size(), (size_t)65536));
+          int32_t null_g = -1;
+          for (size_t ri = 0; ri < rows.size(); ++ri) {
+            bool nul = false;
+            int64_t k = get_int_key(ri, &nul);
+            JoinedRow& r = rows[ri];
+            if (nul) {
+              if (null_g < 0) {
+                null_g = (int32_t)groups.size();
+                groups.push_back({std::move(r)});
+              } else {
+                groups[null_g].push_back(std::move(r));
+              }
+            } else {
+              auto it = i64_to_group.find(k);
+              if (it == i64_to_group.end()) {
+                size_t gidx = groups.size();
+                i64_to_group.emplace(k, gidx);
+                groups.push_back({std::move(r)});
+              } else {
+                groups[it->second].push_back(std::move(r));
+              }
+            }
+          }
+        }
+      } else if (!coded) for (JoinedRow& r : rows) {
         std::string key;
         if (all_cols_resolved) {
           for (const auto& rgc : res_gcols) {
@@ -49989,13 +50267,19 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
     // workers read the answers (ctx.agg_values), as they read star_vals. The groups' own rows stay where they
     // are: flat points at them in group order. Arguments the interpreter has its own column paths for (a
     // column, -column, column * n) are left to it.
+    struct DirectAggI64 {
+      const SqlExpr* agg = nullptr;
+      std::vector<int64_t> vals;
+      std::vector<uint8_t> nuls;
+    };
+    std::vector<DirectAggI64> direct_i64_aggs;
     std::vector<std::vector<std::pair<const SqlExpr*, Val>>> vp_aggs;
     if (!star_grouped && pivot.buckets.empty() && aggregated && groups.size() >= 256 && vp::enabled()) {
       std::vector<const SqlExpr*> aggs;
       std::function<void(const SqlExpr*, int)> collect = [&](const SqlExpr* e, int depth) {
         if (!e || depth > 64) return;
         if (e->op == ExprOp::Func && !e->window && !e->negated && e->args.size() == 1 && e->args[0] &&
-            e->args[0]->op != ExprOp::Star && e->args[0]->op != ExprOp::Column && e->args[0]->op != ExprOp::Literal) {
+            e->args[0]->op != ExprOp::Star && e->args[0]->op != ExprOp::Literal) {
           const std::string& up = func_upper(e);
           const SqlExpr* a = e->args[0].get();
           const bool own_path = (a->op == ExprOp::Neg || a->op == ExprOp::Sub) && a->args.size() == 1 && a->args[0] && a->args[0]->op == ExprOp::Column;
@@ -50020,13 +50304,42 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
         flat.reserve(total);
         for (const auto& g : groups) for (const JoinedRow& r : g) flat.push_back(&r);
         for (const SqlExpr* agg : aggs) {
-          const vp::Prog* P = vp::program_for(agg->args[0].get(), vctx);
-          if (!P) continue;
+          const SqlExpr* ax = agg->args[0].get();
           vp::Column col;
-          std::string verr;
-          if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return *flat[j]; }, total, &col, &verr)) continue;
+          bool got_col = false;
+          size_t ks = 0, kc = 0;
+          if (ax && ax->op == ExprOp::Column && !is_user_var_name(ax->name) && ax->name.rfind("@@", 0) != 0 &&
+              lookup_column_here(vctx, *ax, &ks, &kc) == ColumnLookup::Found && ks < sources.size() && sources[ks].table) {
+            const SqlTable* t = sources[ks].table;
+            if (kc < t->columns.size() && kc < t->col_data.size() && vx::typed_integer(t->col_data[kc])) {
+              const ColumnStore& cs = t->col_data[kc];
+              col.ty = vp::Ty::I64;
+              col.n.assign(total, 0);
+              col.i.assign(total, 0);
+              for (size_t j = 0; j < total; ++j) {
+                const JoinedRow& r = *flat[j];
+                const size_t id = ks < r.parts.size() ? r.parts[ks] : kNullRow;
+                if (id == kNullRow || id >= cs.size() || cs.is_null(id)) { col.n[j] = 1; }
+                else { col.i[j] = vx::typed_int(cs, id); }
+              }
+              got_col = true;
+            }
+          }
+          if (!got_col) {
+            const vp::Prog* P = vp::program_for(ax, vctx);
+            if (!P) continue;
+            std::string verr;
+            if (!vp::eval_column(*P, [&](size_t j) -> const JoinedRow& { return *flat[j]; }, total, &col, &verr)) continue;
+          }
           if (vp_aggs.empty()) vp_aggs.resize(groups.size());
           const std::string& up = func_upper(agg);
+          const bool is_i64_agg = (up == "COUNT"sv) || ((up == "MIN"sv || up == "MAX"sv) && col.ty == vp::Ty::I64 && !col.uns);
+          if (is_i64_agg) {
+            direct_i64_aggs.emplace_back();
+            direct_i64_aggs.back().agg = agg;
+            direct_i64_aggs.back().vals.resize(groups.size(), 0);
+            direct_i64_aggs.back().nuls.resize(groups.size(), 0);
+          }
           size_t at = 0;
           for (size_t gi = 0; gi < groups.size(); ++gi) {
             const size_t n = groups[gi].size();
@@ -50034,7 +50347,22 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
             if (up == "COUNT"sv) {
               size_t cnt = 0;
               for (size_t j = 0; j < n; ++j) if (!col.is_null(at + j)) ++cnt;
+              if (is_i64_agg) direct_i64_aggs.back().vals[gi] = (int64_t)cnt;
               r = val_num((double)cnt);
+            } else if ((up == "MIN"sv || up == "MAX"sv) && col.ty == vp::Ty::I64 && !col.uns) {
+              bool has = false;
+              int64_t best_i = (up == "MIN"sv) ? INT64_MAX : INT64_MIN;
+              for (size_t j = 0; j < n; ++j) {
+                if (col.is_null(at + j)) continue;
+                int64_t val = col.i[at + j];
+                if (!has) { best_i = val; has = true; continue; }
+                if (up == "MIN"sv ? val < best_i : val > best_i) best_i = val;
+              }
+              if (is_i64_agg) {
+                direct_i64_aggs.back().vals[gi] = best_i;
+                direct_i64_aggs.back().nuls[gi] = has ? 0 : 1;
+              }
+              r = has ? val_num_with_text((double)best_i, std::to_string(best_i)) : val_null();
             } else if (up == "MIN"sv || up == "MAX"sv) {
               bool has = false;
               for (size_t j = 0; j < n; ++j) {
@@ -50098,6 +50426,17 @@ static std::optional<SqlQueryResult> group_result(const GroupPlan& plan, PhaseCl
           }, n, &B.cols[i]);
           continue;
         }
+        bool handled_agg = false;
+        for (auto& da : direct_i64_aggs) {
+          if (expanded[i].expr.get() == da.agg && dest == SqlDataType::Int) {
+            B.cols[i].kind = ColBatch::I64;
+            B.cols[i].i = std::move(da.vals);
+            B.cols[i].nul = std::move(da.nuls);
+            handled_agg = true;
+            break;
+          }
+        }
+        if (handled_agg) continue;
         interp.push_back(i);
         B.cols[i].kind = ColBatch::Text;
         B.cols[i].s.resize(n);
@@ -51230,6 +51569,27 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
       EvalCtx bctx; bctx.db = db; bctx.outer = outer_scope; bctx.sources = &baseonly;
       for (const SqlExpr* pc : jparts) {
         if (!expr_only_reads(pc, bctx) || expr_has_subquery_raw(pc)) continue;
+        if (pc->op == ExprOp::Column) {
+          size_t s = 0, c = 0;
+          if (lookup_column_here(bctx, *pc, &s, &c) == ColumnLookup::Found &&
+              s < baseonly.size() && baseonly[s].table && c < baseonly[s].table->col_data.size()) {
+            const ColumnStore& cs = baseonly[s].table->col_data[c];
+            if (base_refused.empty()) base_refused.assign(rows.size(), 0);
+            for (size_t r = 0; r < rows.size(); ++r) {
+              const size_t ri = s < rows[r].parts.size() ? rows[r].parts[s] : kNullRow;
+              if (ri == kNullRow || ri >= cs.size() || cs.is_null(ri)) { base_refused[r] = 1; continue; }
+              if (vx::typed_integer(cs)) {
+                if (vx::typed_int(cs, ri) == 0) base_refused[r] = 1;
+              } else {
+                std::string text = cs.get(ri);
+                double d = 0;
+                if (!parse_number(text, &d) || d == 0) base_refused[r] = 1;
+              }
+            }
+            base_decided.insert(pc);
+            continue;
+          }
+        }
         const vp::Prog* P = vp::program_for(pc, bctx);
         if (!P || P->out().ty == vp::Ty::Str) continue;
         vp::Column col;
@@ -55741,10 +56101,11 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
       pre.resize(stmt.branches.size());
       bool batches = true;
       for (size_t k = 0; k < stmt.branches.size(); ++k) {
-        {
-          ColOutRequest want_columns(&bb[k]);
-          pre[k] = execute_parsed_select_single(db, stmt.branches[k]);
-        }
+        ColOutRequest want_columns(&bb[k]);
+        pre[k] = execute_parsed_select_single(db, stmt.branches[k]);
+        if (!pre[k].success) return pre[k];
+      }
+      for (size_t k = 0; k < stmt.branches.size(); ++k) {
         if (!pre[k].success) return pre[k];
         if (!(pre[k].rows_in_batch && bb[k].filled)) {
           batches = false;
@@ -55803,24 +56164,39 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
           ColBatch::Col& oc = out.cols[ci];
           if (t == SqlDataType::Int && all_i) {
             oc.kind = ColBatch::I64;
+            oc.i.reserve(out.rows);
+            oc.nul.reserve(out.rows);
             for (const ColBatch& b : bb) {
               oc.i.insert(oc.i.end(), b.cols[ci].i.begin(), b.cols[ci].i.end());
               oc.nul.insert(oc.nul.end(), b.cols[ci].nul.begin(), b.cols[ci].nul.end());
             }
           } else if (t == SqlDataType::Real && all_num) {
             oc.kind = ColBatch::F64;
+            oc.f.reserve(out.rows);
+            oc.nul.reserve(out.rows);
             for (const ColBatch& b : bb) {
               const ColBatch::Col& bc = b.cols[ci];
-              for (size_t r = 0; r < b.rows; ++r) {
-                if (bc.kind == ColBatch::I64 && !bc.nul[r] && std::fabs((double)bc.i[r]) > 9007199254740992.0) { ok = false; break; }
-                oc.f.push_back(bc.kind == ColBatch::I64 ? (double)bc.i[r] : bc.f[r]);
+              if (bc.kind == ColBatch::F64) {
+                oc.f.insert(oc.f.end(), bc.f.begin(), bc.f.end());
+              } else {
+                for (size_t r = 0; r < b.rows; ++r) {
+                  if (bc.kind == ColBatch::I64 && !bc.nul[r] && std::fabs((double)bc.i[r]) > 9007199254740992.0) { ok = false; break; }
+                  oc.f.push_back((double)bc.i[r]);
+                }
               }
               oc.nul.insert(oc.nul.end(), bc.nul.begin(), bc.nul.end());
             }
           } else if (t == SqlDataType::Text) {
             oc.kind = ColBatch::Text;
             oc.s.reserve(out.rows);
-            for (const ColBatch& b : bb) for (size_t r = 0; r < b.rows; ++r) oc.s.push_back(b.cols[ci].text(r));
+            for (const ColBatch& b : bb) {
+              const ColBatch::Col& bc = b.cols[ci];
+              if (bc.kind == ColBatch::Text) {
+                oc.s.insert(oc.s.end(), bc.s.begin(), bc.s.end());
+              } else {
+                for (size_t r = 0; r < b.rows; ++r) oc.s.push_back(bc.text(r));
+              }
+            }
           } else {
             ok = false;   // a number column holding text, or a DECIMAL: the row path's rules
             if (vx_trace_on()) {
@@ -56349,48 +56725,53 @@ static void cte_columns_from_batch(const SqlQueryResult& res, const ColBatch& B,
                    [&](size_t c) { return c >= B.cols.size() || (B.cols[c].kind != ColBatch::I64 && B.cols[c].kind != ColBatch::F64); });
 }
 
-SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
-  // A consumer's request for the answer as a typed batch (sql_colbatch.inc) is for the statement after the CTEs:
-  // taken here, so no statement run to make a CTE (a recursive one's anchor and steps among them) takes it, and
-  // handed back for the final statement alone (below).
-  ColBatch* const with_out = take_col_out();
-  RnKeep with_rn = take_rn_keep();         // the same for a consumer's rn filter: the final statement's alone
+namespace {
+struct ParsedCteStep {
+  std::string name;
+  std::vector<std::string> cols;
+  std::string cte_sql;
+  bool is_recursive = false;
+  bool merged_as_view = false;
+  ParsedSelectStatement parsed_select;
+
+  // Recursive CTE parameters
+  bool union_all = false;
+  bool union_distinct = false;
+  std::string anchor_sql;
+  ParsedSelectStatement anchor_select;
+  std::string rec_sql;
+};
+
+struct ParsedWithPlan {
+  bool ok = false;
+  std::string error;
+  bool is_recursive = false;
+  std::vector<ParsedCteStep> steps;
+  ParsedSelectStatement main_select;
+  std::string main_sql;
+};
+
+static std::shared_ptr<const ParsedWithPlan> build_with_plan(const std::string& sql) {
+  auto plan = std::make_shared<ParsedWithPlan>();
   std::vector<Token> toks;
   std::string terr;
-  if (!tokenize_sql(sql, &toks, &terr)) return make_error(terr);
+  if (!tokenize_sql(sql, &toks, &terr)) {
+    plan->ok = false;
+    plan->error = terr;
+    return plan;
+  }
   SqlParser p(toks);
-  if (!p.take_word("WITH")) return make_error("expected WITH");
+  if (!p.take_word("WITH")) {
+    plan->ok = false;
+    plan->error = "expected WITH";
+    return plan;
+  }
 
-  bool is_recursive = p.take_word("RECURSIVE");
+  plan->is_recursive = p.take_word("RECURSIVE");
 
-  // RAII guard for pushing and popping CTE scope
-  struct CteScopeGuard {
-    SqlCteStack& stack;
-    bool active = true;
-    explicit CteScopeGuard(SqlCteStack& s) : stack(s) {
-      stack.emplace_back();
-    }
-    ~CteScopeGuard() {
-      if (active && !stack.empty()) stack.pop_back();
-    }
-  } guard(cte_stack());
-
-  auto& current_scope = cte_stack().back();
-
-  // A CTE read once by the rest of the statement, whose SELECT is the kind a view is merged as (one SELECT over
-  // named tables: no grouping, aggregate, window, DISTINCT, LIMIT, ORDER BY or derived table), is not materialized:
-  // it becomes a view for the statement, and the query that reads it takes its tables and expressions - as MySQL
-  // merges a derived table or CTE. A chain of them (SQLDoom's renderer runs eight over 56,000 rows) was eight
-  // rounds of rows written out and read back. AIOS_CTE_MERGE=0 materializes every one.
   static const bool merge_ctes = [] { const char* e = std::getenv("AIOS_CTE_MERGE"); return !e || std::string(e) != "0"; }();
-  struct CteViewScope {
-    CteViewScope() { g_cte_views.emplace_back(); }
-    ~CteViewScope() { g_cte_views.pop_back(); }
-  } cte_views;
-  // AIOS_CTE_MERGE_SKIP=a,b: CTEs of these names are materialized whatever their shape (to find the one a merge
-  // changes the answer of); AIOS_CTE_MERGE_TRACE=1 names each merged one on stderr.
   static const std::string skip_list = [] { const char* e = std::getenv("AIOS_CTE_MERGE_SKIP"); return std::string(e ? e : ""); }();
-  static const bool trace_merge = std::getenv("AIOS_CTE_MERGE_TRACE") != nullptr;
+
   auto merge_as_view = [&](const std::string& name, const std::string& body, size_t after_tok) {
     if (!merge_ctes) return false;
     if (!skip_list.empty() && ("," + skip_list + ",").find("," + lower_of(name) + ",") != std::string::npos) return false;
@@ -56413,20 +56794,24 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
 
   while (true) {
     std::string cte_name;
-    if (!p.parse_name(&cte_name)) return make_error(p.error());
+    if (!p.parse_name(&cte_name)) {
+      plan->ok = false;
+      plan->error = p.error();
+      return plan;
+    }
 
     std::vector<std::string> cte_cols;
     if (p.take_punct("(")) {
       do {
         std::string col;
-        if (!p.parse_name(&col)) return make_error(p.error());
+        if (!p.parse_name(&col)) { plan->ok = false; plan->error = p.error(); return plan; }
         cte_cols.push_back(col);
       } while (p.take_punct(","));
-      if (!p.expect_punct(")")) return make_error(p.error());
+      if (!p.expect_punct(")")) { plan->ok = false; plan->error = p.error(); return plan; }
     }
 
-    if (!p.take_word("AS")) return make_error("expected AS after CTE name " + cte_name);
-    if (!p.expect_punct("(")) return make_error(p.error());
+    if (!p.take_word("AS")) { plan->ok = false; plan->error = "expected AS after CTE name " + cte_name; return plan; }
+    if (!p.expect_punct("(")) { plan->ok = false; plan->error = p.error(); return plan; }
 
     size_t cte_body_start_tok = p.pos();
     int paren_depth = 1;
@@ -56461,15 +56846,15 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       }
     }
 
-    if (paren_depth != 0) return make_error("unterminated CTE definition for " + cte_name);
+    if (paren_depth != 0) { plan->ok = false; plan->error = "unterminated CTE definition for " + cte_name; return plan; }
     size_t cte_body_end_tok = p.pos() - 1;
 
     if (cte_body_start_tok >= cte_body_end_tok) {
-      return make_error("empty CTE query for " + cte_name);
+      plan->ok = false; plan->error = "empty CTE query for " + cte_name; return plan;
     }
 
     bool do_recursive = false;
-    if (is_recursive && union_tok_idx != std::string::npos) {
+    if (plan->is_recursive && union_tok_idx != std::string::npos) {
       std::string cte_name_upper = upper_of(cte_name);
       for (size_t i = union_tok_idx; i < cte_body_end_tok; ++i) {
         if (toks[i].kind == Tok::Ident && toks[i].up == cte_name_upper) {
@@ -56479,23 +56864,117 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       }
     }
 
+    ParsedCteStep step;
+    step.name = cte_name;
+    step.cols = cte_cols;
+    step.is_recursive = do_recursive;
+
     if (!do_recursive) {
       size_t s_pos = toks[cte_body_start_tok].start_pos;
       size_t e_pos = toks[cte_body_end_tok - 1].end_pos;
-      std::string cte_sql = sql.substr(s_pos, e_pos - s_pos);
-      if (!is_recursive || union_tok_idx == std::string::npos) {
-        if (merge_as_view(cte_name, cte_sql, cte_body_end_tok + 1)) {
-          SqlView v;
-          v.name = cte_name;
-          v.database = effective_database();
-          v.query_sql = cte_sql;
-          v.column_aliases = cte_cols;
-          g_cte_views.back()[lower_of(cte_name)] = std::move(v);
-          plan_add(plan_step("cte", cte_name, "merged as a view"));
-          if (trace_merge) std::fprintf(stderr, "[cte] merged %s\n", cte_name.c_str());
-          if (!p.take_punct(",")) break;
-          continue;
+      step.cte_sql = sql.substr(s_pos, e_pos - s_pos);
+      if (!plan->is_recursive || union_tok_idx == std::string::npos) {
+        if (merge_as_view(cte_name, step.cte_sql, cte_body_end_tok + 1)) {
+          step.merged_as_view = true;
         }
+      }
+      if (!step.merged_as_view) {
+        step.parsed_select = parse_select_sql(step.cte_sql);
+      }
+    } else {
+      // Recursive CTE
+      step.union_all = union_all;
+      step.union_distinct = union_distinct;
+      size_t anchor_start = toks[cte_body_start_tok].start_pos;
+      size_t anchor_end = toks[union_tok_idx - 1].end_pos;
+      step.anchor_sql = sql.substr(anchor_start, anchor_end - anchor_start);
+      step.anchor_select = parse_select_sql(step.anchor_sql);
+
+      size_t rec_start_tok = union_tok_idx + ((union_all || union_distinct) ? 2 : 1);
+      size_t rec_start = toks[rec_start_tok].start_pos;
+      size_t rec_end = toks[cte_body_end_tok - 1].end_pos;
+      step.rec_sql = sql.substr(rec_start, rec_end - rec_start);
+    }
+
+    plan->steps.push_back(std::move(step));
+
+    if (!p.take_punct(",")) break;
+  }
+
+  if (p.at_end()) { plan->ok = false; plan->error = "expected statement after CTE definition"; return plan; }
+
+  size_t main_start = toks[p.pos()].start_pos;
+  plan->main_sql = sql.substr(main_start);
+  plan->main_select = parse_select_sql(plan->main_sql);
+
+  plan->ok = true;
+  return plan;
+}
+
+static std::shared_ptr<const ParsedWithPlan> get_or_parse_with_plan(const std::string& sql) {
+  static aios::hal::Mutex s_with_mu;
+  static std::unordered_map<std::string, std::shared_ptr<const ParsedWithPlan>> s_with_cache;
+  {
+    std::lock_guard<aios::hal::Mutex> lock(s_with_mu);
+    auto it = s_with_cache.find(sql);
+    if (it != s_with_cache.end()) return it->second;
+  }
+  auto plan = build_with_plan(sql);
+  if (plan->ok) {
+    std::lock_guard<aios::hal::Mutex> lock(s_with_mu);
+    if (s_with_cache.size() > 256) s_with_cache.clear();
+    s_with_cache[sql] = plan;
+  }
+  return plan;
+}
+}  // namespace
+
+SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
+  // A consumer's request for the answer as a typed batch (sql_colbatch.inc) is for the statement after the CTEs:
+  // taken here, so no statement run to make a CTE (a recursive one's anchor and steps among them) takes it, and
+  // handed back for the final statement alone (below).
+  ColBatch* const with_out = take_col_out();
+  RnKeep with_rn = take_rn_keep();         // the same for a consumer's rn filter: the final statement's alone
+
+  auto plan = get_or_parse_with_plan(sql);
+  if (!plan->ok) return make_error(plan->error.empty() ? "invalid WITH statement" : plan->error);
+
+  // RAII guard for pushing and popping CTE scope
+  struct CteScopeGuard {
+    SqlCteStack& stack;
+    bool active = true;
+    explicit CteScopeGuard(SqlCteStack& s) : stack(s) {
+      stack.emplace_back();
+    }
+    ~CteScopeGuard() {
+      if (active && !stack.empty()) stack.pop_back();
+    }
+  } guard(cte_stack());
+
+  auto& current_scope = cte_stack().back();
+
+  struct CteViewScope {
+    CteViewScope() { g_cte_views.emplace_back(); }
+    ~CteViewScope() { g_cte_views.pop_back(); }
+  } cte_views;
+
+  static const bool trace_merge = std::getenv("AIOS_CTE_MERGE_TRACE") != nullptr;
+
+  for (const auto& step : plan->steps) {
+    const std::string& cte_name = step.name;
+    const auto& cte_cols = step.cols;
+
+    if (!step.is_recursive) {
+      if (step.merged_as_view) {
+        SqlView v;
+        v.name = cte_name;
+        v.database = effective_database();
+        v.query_sql = step.cte_sql;
+        v.column_aliases = cte_cols;
+        g_cte_views.back()[lower_of(cte_name)] = std::move(v);
+        plan_add(plan_step("cte", cte_name, "merged as a view"));
+        if (trace_merge) std::fprintf(stderr, "[cte] merged %s\n", cte_name.c_str());
+        continue;
       }
 
       SqlQueryResult res;
@@ -56506,7 +56985,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         RowsOnly rows_only;
         ColOutRequest want_columns(&batch);   // its rows as typed columns, where the select can give them so
         PlanScope cscope(plan_on() ? &cplan : nullptr);
-        res = execute_local_query(cte_sql);
+        res = step.parsed_select.ok ? execute_parsed_select(this, step.parsed_select) : execute_local_query(step.cte_sql);
       }
       if (!res.success) return res;
       const bool in_batch = res.rows_in_batch && batch.filled;
@@ -56541,19 +57020,10 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       current_scope[cte_name] = std::make_shared<SqlTable>(std::move(tbl));
     } else {
       // Recursive CTE
-      size_t anchor_start = toks[cte_body_start_tok].start_pos;
-      size_t anchor_end = toks[union_tok_idx - 1].end_pos;
-      std::string anchor_sql = sql.substr(anchor_start, anchor_end - anchor_start);
-
-      size_t rec_start_tok = union_tok_idx + ((union_all || union_distinct) ? 2 : 1);
-      size_t rec_start = toks[rec_start_tok].start_pos;
-      size_t rec_end = toks[cte_body_end_tok - 1].end_pos;
-      std::string rec_sql = sql.substr(rec_start, rec_end - rec_start);
-
       SqlQueryResult anchor_res;
       {
         RowsOnly rows_only;
-        anchor_res = execute_local_query(anchor_sql);
+        anchor_res = step.anchor_select.ok ? execute_parsed_select(this, step.anchor_select) : execute_local_query(step.anchor_sql);
       }
       if (!anchor_res.success) return anchor_res;
 
@@ -56569,10 +57039,6 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         accum_tbl.append_row(r);
       }
 
-      // The recursive part runs at most max_recursive_iterations times. Due to run once more - its last run still
-      // made rows, or the limit is 0 - the CTE stops there with what it has and warning 1931, as MariaDB does; or,
-      // where a warning is an error, the statement fails. It stopped at a fixed 10000 without a word: a short
-      // answer that looked whole.
       tls_stmt_ran_recursive = true;
       const uint64_t limit = max_recursive_iterations();
       SqlTable working_tbl = accum_tbl;
@@ -56590,13 +57056,13 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         SqlQueryResult rec_res;
         {
           RowsOnly rows_only;
-          rec_res = execute_local_query(rec_sql);
+          rec_res = execute_local_query(step.rec_sql);
         }
         if (!rec_res.success) return rec_res;
         if (rec_res.rows.empty()) break;
 
         std::vector<SqlRow> new_rows;
-        if (union_all) {
+        if (step.union_all) {
           new_rows = std::move(rec_res.rows);
         } else {
           for (auto& r : rec_res.rows) {
@@ -56629,24 +57095,17 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
 
       current_scope[cte_name] = std::make_shared<SqlTable>(std::move(accum_tbl));
     }
-
-    if (!p.take_punct(",")) break;
   }
-
-  if (p.at_end()) return make_error("expected statement after CTE definition");
-
-  size_t main_start = toks[p.pos()].start_pos;
-  std::string main_sql = sql.substr(main_start);
 
   ColOutRequest main_columns(with_out);
   RnKeepRequest main_rn(with_rn);
   if (trace_merge) {
     const uint64_t t0 = hal_now_ns();
-    SqlQueryResult r = execute_local_query(main_sql);
+    SqlQueryResult r = plan->main_select.ok ? execute_parsed_select(this, plan->main_select) : execute_local_query(plan->main_sql);
     std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows\n", "(main)", (hal_now_ns() - t0) / 1e6, r.rows.size());
     return r;
   }
-  return execute_local_query(main_sql);
+  return plan->main_select.ok ? execute_parsed_select(this, plan->main_select) : execute_local_query(plan->main_sql);
 }
 
 // --- CREATE / DROP / ALTER / TRUNCATE -------------------------------------
@@ -61039,7 +61498,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
             if (j) values += "-";
             values += sql_display(row.values[(size_t)pk_cols[j]]);
           }
-          return make_error("Duplicate entry '" + values + "' for key 'PRIMARY'");
+          return make_error("Duplicate entry '" + values + "' for key 'PRIMARY' on table '" + t->name + "'");
         }
         // A re-applied row that changes nothing writes nothing: set_cell moves
         // the table's layout (every column index rebuilt on next use), and a
@@ -63298,6 +63757,13 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
   if (!t) return make_error("table not found: " + name);
   if (sql_table_in_use_by_trigger(t))
     return make_error("Can't update table '" + t->name + "' in stored function/trigger because it is already used by statement which invoked this stored function/trigger");
+  if (t->row_count() == 0 && !has_triggers_.load(std::memory_order_relaxed)) {
+    SqlQueryResult r;
+    r.rows_affected = 0;
+    r.is_result_set = false;
+    r.formatted_table = "Query OK, 0 rows affected";
+    return r;
+  }
   // PostgreSQL's UPDATE t [AS] a SET c = .. FROM <tables> [WHERE ..]: MySQL's multi-table UPDATE t a, <tables>
   // SET a.c = .. [WHERE ..], which works every new value out before it writes any (as PostgreSQL does).
   {
@@ -63712,7 +64178,7 @@ SqlQueryResult SqlDatabase::execute_update(const std::string& sql) {
         g_undo_applying = prev;
       }
       if (tls_txn.undo.size() > row_undo_mark) tls_txn.undo.resize(row_undo_mark);
-      *derr = "Duplicate entry '" + key_text + "' for key '" + key_name + "'";
+      *derr = "Duplicate entry '" + key_text + "' for key '" + key_name + "' on table '" + t->name + "'";
       return false;
     };
     auto shown = [&](size_t row, const std::vector<int>& cols) {
@@ -64431,6 +64897,13 @@ SqlQueryResult SqlDatabase::execute_delete(const std::string& sql) {
   if (!t) return make_error("table not found: " + name);
   if (sql_table_in_use_by_trigger(t))
     return make_error("Can't update table '" + t->name + "' in stored function/trigger because it is already used by statement which invoked this stored function/trigger");
+  if (t->row_count() == 0 && !has_triggers_.load(std::memory_order_relaxed)) {
+    SqlQueryResult r;
+    r.rows_affected = 0;
+    r.is_result_set = false;
+    r.formatted_table = "Query OK, 0 rows affected";
+    return r;
+  }
   // DELETE FROM t MATCHING (v1, v2, ...), (...): one row for each tuple, the row whose every column (in the
   // table's order) is that tuple's value - as `=` compares, a NULL matching a NULL - found in one pass from the
   // first row. What the mirror applies a keyless table's deletes with (each row named by its whole binlog image):

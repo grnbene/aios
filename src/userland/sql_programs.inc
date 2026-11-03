@@ -22,8 +22,11 @@ bool sql_signal_state(const std::string& msg, std::string* state) {
 namespace {
 std::vector<SqlQueryResult> sql_run_procedure(SqlDatabase& db, const SqlDatabase::StoredProgram& p, const std::vector<Val>& in,
                                               std::vector<Val>* out, const std::string& session_db, std::string* err);
+Val sql_run_function(SqlDatabase& db, const SqlDatabase::StoredProgram& f, const std::vector<Val>& args,
+                     const std::string& session_db, std::string* err);
 
 namespace psm {
+Val as_returns_type(const Val& v, const std::string& returns);
 
 struct Node;
 using Nodes = std::vector<Node>;
@@ -31,7 +34,7 @@ using Nodes = std::vector<Node>;
 struct Node {
   enum Kind {
     Block, DeclareVar, DeclareCursor, DeclareHandler, DeclareCondition, Set, SelectInto, If, Case, While, Repeat,
-    Loop, Leave, Iterate, Return, Open, Fetch, Close, Signal, Call, Sql, GetDiag
+    Loop, Leave, Iterate, Return, Open, Fetch, Close, Signal, Call, Sql, GetDiag, Do
   } kind = Sql;
   std::string label;                 // Block / Loop / While / Repeat
   std::string text;                  // Sql / Call / SelectInto (without INTO) / Return / cursor query / signal state
@@ -341,6 +344,14 @@ class Parser {
       end_stmt();
       return n;
     }
+    if (word("DO")) {
+      size_t e = stmt_end(i_);
+      n.kind = Node::Do;
+      n.text = trim(slice(i_ + 1, e));
+      i_ = e;
+      end_stmt();
+      return n;
+    }
     size_t e = stmt_end(i_);
     n.kind = Node::Sql;
     n.text = slice(i_, e);
@@ -614,8 +625,513 @@ struct Run {
     last_row_count = res->is_result_set ? -1 : (long long)res->rows_affected;
     return true;
   }
+  struct STok {
+    enum Kind { End, Num, Str, Ident, Punct, Keyword } kind = End;
+    std::string text;
+    double num_val = 0;
+    bool is_float = false;
+  };
+
+  static bool tok_scalar(const std::string& s, std::vector<STok>* toks) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+      while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+      if (i >= n) break;
+      if (s[i] == '-' && i + 1 < n && s[i + 1] == '-') {
+        while (i < n && s[i] != '\n') ++i;
+        continue;
+      }
+      if (s[i] == '\'') {
+        std::string str;
+        ++i;
+        while (i < n) {
+          if (s[i] == '\'') {
+            if (i + 1 < n && s[i + 1] == '\'') { str += '\''; i += 2; }
+            else { ++i; break; }
+          } else {
+            str += s[i++];
+          }
+        }
+        toks->push_back({STok::Str, str, 0, false});
+        continue;
+      }
+      if (std::isdigit((unsigned char)s[i]) || (s[i] == '.' && i + 1 < n && std::isdigit((unsigned char)s[i + 1]))) {
+        size_t start = i;
+        bool has_dot = false, has_exp = false;
+        while (i < n && (std::isdigit((unsigned char)s[i]) || s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
+               ((s[i] == '+' || s[i] == '-') && (s[i - 1] == 'e' || s[i - 1] == 'E')))) {
+          if (s[i] == '.') has_dot = true;
+          if (s[i] == 'e' || s[i] == 'E') has_exp = true;
+          ++i;
+        }
+        std::string text = s.substr(start, i - start);
+        char* endp = nullptr;
+        double v = std::strtod(text.c_str(), &endp);
+        toks->push_back({STok::Num, text, v, has_dot || has_exp});
+        continue;
+      }
+      if (std::isalpha((unsigned char)s[i]) || s[i] == '_' || s[i] == '`') {
+        size_t start = i;
+        if (s[i] == '`') {
+          ++i;
+          while (i < n && s[i] != '`') ++i;
+          if (i < n && s[i] == '`') ++i;
+        } else {
+          while (i < n && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+        }
+        std::string text = s.substr(start, i - start);
+        if (!text.empty() && text.front() == '`' && text.back() == '`') text = text.substr(1, text.size() - 2);
+        std::string up = upper_of(text);
+        if (up == "NULL" || up == "TRUE" || up == "FALSE" || up == "NOT" || up == "AND" || up == "OR" ||
+            up == "IS" || up == "DIV" || up == "MOD" || up == "XOR" || up == "CASE" || up == "WHEN" ||
+            up == "THEN" || up == "ELSE" || up == "END") {
+          toks->push_back({STok::Keyword, up, 0, false});
+        } else {
+          toks->push_back({STok::Ident, text, 0, false});
+        }
+        continue;
+      }
+      if (i + 1 < n) {
+        std::string two = s.substr(i, 2);
+        if (two == "::" || two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "<<" || two == ">>" || two == "||" || two == "&&") {
+          toks->push_back({STok::Punct, two, 0, false});
+          i += 2;
+          continue;
+        }
+      }
+      std::string one(1, s[i]);
+      toks->push_back({STok::Punct, one, 0, false});
+      ++i;
+    }
+    toks->push_back({STok::End, "", 0, false});
+    return true;
+  }
+
+  bool eval_scalar(const std::string& expr_str, Val* out) {
+    std::string s = trim(expr_str);
+    if (s.empty()) { *out = val_null(); return true; }
+    if (!s.empty() && (std::isalpha((unsigned char)s[0]) || s[0] == '_')) {
+      bool is_id = true;
+      for (size_t k = 1; k < s.size(); ++k) {
+        if (!std::isalnum((unsigned char)s[k]) && s[k] != '_') { is_id = false; break; }
+      }
+      if (is_id) {
+        std::string up = upper_of(s);
+        if (up == "NULL") { *out = val_null(); return true; }
+        if (up == "TRUE") { *out = val_num(1); return true; }
+        if (up == "FALSE") { *out = val_num(0); return true; }
+        Val* v = find_var(s);
+        if (v) { *out = *v; return true; }
+      }
+    }
+
+    std::vector<STok> toks;
+    if (!tok_scalar(s, &toks) || toks.empty() || toks[0].kind == STok::End) return false;
+
+    size_t pos = 0;
+    auto peek = [&]() -> const STok& {
+      return (pos < toks.size()) ? toks[pos] : toks.back();
+    };
+    auto take = [&]() -> const STok& {
+      const STok& t = (pos < toks.size()) ? toks[pos] : toks.back();
+      if (pos < toks.size()) ++pos;
+      return t;
+    };
+    auto take_kw = [&](const std::string& kw) -> bool {
+      if (pos < toks.size() && toks[pos].kind == STok::Keyword && toks[pos].text == kw) {
+        ++pos; return true;
+      }
+      return false;
+    };
+    auto take_punct = [&](const std::string& p) -> bool {
+      if (pos < toks.size() && toks[pos].kind == STok::Punct && toks[pos].text == p) {
+        ++pos; return true;
+      }
+      return false;
+    };
+
+    std::function<bool(Val*)> p_expr;
+    std::function<bool(Val*)> p_or;
+    std::function<bool(Val*)> p_and;
+    std::function<bool(Val*)> p_bitor;
+    std::function<bool(Val*)> p_bitxor;
+    std::function<bool(Val*)> p_bitand;
+    std::function<bool(Val*)> p_eq;
+    std::function<bool(Val*)> p_cmp;
+    std::function<bool(Val*)> p_shift;
+    std::function<bool(Val*)> p_add;
+    std::function<bool(Val*)> p_mul;
+    std::function<bool(Val*)> p_unary;
+    std::function<bool(Val*)> p_postfix;
+    std::function<bool(Val*)> p_prim;
+
+    p_expr = [&](Val* v) -> bool { return p_or(v); };
+
+    p_or = [&](Val* v) -> bool {
+      if (!p_and(v)) return false;
+      while (take_kw("OR") || (!tls_pipes_as_concat && take_punct("||"))) {
+        Val rhs; if (!p_and(&rhs)) return false;
+        *v = val_num((truthy(*v) || truthy(rhs)) ? 1 : 0);
+      }
+      return true;
+    };
+
+    p_and = [&](Val* v) -> bool {
+      if (!p_bitor(v)) return false;
+      while (take_kw("AND") || take_punct("&&")) {
+        Val rhs; if (!p_bitor(&rhs)) return false;
+        *v = val_num((truthy(*v) && truthy(rhs)) ? 1 : 0);
+      }
+      return true;
+    };
+
+    p_bitor = [&](Val* v) -> bool {
+      if (!p_bitxor(v)) return false;
+      while (take_punct("|")) {
+        Val rhs; if (!p_bitxor(&rhs)) return false;
+        if (v->null || rhs.null) *v = val_null();
+        else *v = val_num((double)((int64_t)v->num | (int64_t)rhs.num));
+      }
+      return true;
+    };
+
+    p_bitxor = [&](Val* v) -> bool {
+      if (!p_bitand(v)) return false;
+      while (take_punct("^") || take_kw("XOR")) {
+        Val rhs; if (!p_bitand(&rhs)) return false;
+        if (v->null || rhs.null) *v = val_null();
+        else *v = val_num((double)((int64_t)v->num ^ (int64_t)rhs.num));
+      }
+      return true;
+    };
+
+    p_bitand = [&](Val* v) -> bool {
+      if (!p_eq(v)) return false;
+      while (take_punct("&")) {
+        Val rhs; if (!p_eq(&rhs)) return false;
+        if (v->null || rhs.null) *v = val_null();
+        else *v = val_num((double)((int64_t)v->num & (int64_t)rhs.num));
+      }
+      return true;
+    };
+
+    p_eq = [&](Val* v) -> bool {
+      if (!p_cmp(v)) return false;
+      while (true) {
+        if (take_punct("=") || take_punct("==")) {
+          Val rhs; if (!p_cmp(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num == rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() == rhs.sv() ? 1 : 0);
+        } else if (take_punct("<>") || take_punct("!=")) {
+          Val rhs; if (!p_cmp(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num != rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() != rhs.sv() ? 1 : 0);
+        } else if (take_kw("IS")) {
+          bool is_not = take_kw("NOT");
+          if (!take_kw("NULL")) return false;
+          *v = val_num((v->null != is_not) ? 1 : 0);
+        } else break;
+      }
+      return true;
+    };
+
+    p_cmp = [&](Val* v) -> bool {
+      if (!p_shift(v)) return false;
+      while (true) {
+        if (take_punct("<")) {
+          Val rhs; if (!p_shift(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num < rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() < rhs.sv() ? 1 : 0);
+        } else if (take_punct("<=")) {
+          Val rhs; if (!p_shift(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_num(v->num <= rhs.num ? 1 : 0);
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num <= rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() <= rhs.sv() ? 1 : 0);
+        } else if (take_punct(">")) {
+          Val rhs; if (!p_shift(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num > rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() > rhs.sv() ? 1 : 0);
+        } else if (take_punct(">=")) {
+          Val rhs; if (!p_shift(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else if (v->numeric && rhs.numeric) *v = val_num(v->num >= rhs.num ? 1 : 0);
+          else *v = val_num(v->sv() >= rhs.sv() ? 1 : 0);
+        } else break;
+      }
+      return true;
+    };
+
+    p_shift = [&](Val* v) -> bool {
+      if (!p_add(v)) return false;
+      while (true) {
+        if (take_punct("<<")) {
+          Val rhs; if (!p_add(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else *v = val_num((double)((int64_t)v->num << (int64_t)rhs.num));
+        } else if (take_punct(">>")) {
+          Val rhs; if (!p_add(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else *v = val_num((double)((int64_t)v->num >> (int64_t)rhs.num));
+        } else break;
+      }
+      return true;
+    };
+
+    p_add = [&](Val* v) -> bool {
+      if (!p_mul(v)) return false;
+      while (true) {
+        if (take_punct("+")) {
+          Val rhs; if (!p_mul(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else {
+            double res = v->num + rhs.num;
+            *v = (v->approx || rhs.approx) ? val_approx(res) : val_num(res);
+          }
+        } else if (take_punct("-")) {
+          Val rhs; if (!p_mul(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else {
+            double res = v->num - rhs.num;
+            *v = (v->approx || rhs.approx) ? val_approx(res) : val_num(res);
+          }
+        } else if (tls_pipes_as_concat && take_punct("||")) {
+          Val rhs; if (!p_mul(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else *v = val_text(v->str() + rhs.str());
+        } else break;
+      }
+      return true;
+    };
+
+    p_mul = [&](Val* v) -> bool {
+      if (!p_unary(v)) return false;
+      while (true) {
+        if (take_punct("*")) {
+          Val rhs; if (!p_unary(&rhs)) return false;
+          if (v->null || rhs.null) *v = val_null();
+          else {
+            double res = v->num * rhs.num;
+            *v = (v->approx || rhs.approx) ? val_approx(res) : val_num(res);
+          }
+        } else if (take_punct("/")) {
+          Val rhs; if (!p_unary(&rhs)) return false;
+          if (v->null || rhs.null || rhs.num == 0.0) *v = val_null();
+          else if (tls_pg_division && !v->approx && !rhs.approx) {
+            *v = val_num((double)((int64_t)v->num / (int64_t)rhs.num));
+          } else {
+            *v = val_approx(v->num / rhs.num);
+          }
+        } else if (take_kw("DIV")) {
+          Val rhs; if (!p_unary(&rhs)) return false;
+          if (v->null || rhs.null || rhs.num == 0.0) *v = val_null();
+          else *v = val_num((double)((int64_t)v->num / (int64_t)rhs.num));
+        } else if (take_punct("%") || take_kw("MOD")) {
+          Val rhs; if (!p_unary(&rhs)) return false;
+          if (v->null || rhs.null || rhs.num == 0.0) *v = val_null();
+          else *v = val_num((double)((int64_t)v->num % (int64_t)rhs.num));
+        } else break;
+      }
+      return true;
+    };
+
+    p_unary = [&](Val* v) -> bool {
+      if (take_punct("+")) return p_unary(v);
+      if (take_punct("-")) {
+        if (!p_unary(v)) return false;
+        if (!v->null) {
+          if (v->approx) *v = val_approx(-v->num);
+          else *v = val_num(-v->num);
+        }
+        return true;
+      }
+      if (take_punct("~")) {
+        if (!p_unary(v)) return false;
+        if (!v->null) *v = val_num((double)(~(int64_t)v->num));
+        return true;
+      }
+      if (take_kw("NOT") || take_punct("!")) {
+        if (!p_unary(v)) return false;
+        if (!v->null) *v = val_num(truthy(*v) ? 0 : 1);
+        return true;
+      }
+      return p_postfix(v);
+    };
+
+    p_postfix = [&](Val* v) -> bool {
+      if (!p_prim(v)) return false;
+      while (take_punct("::")) {
+        const STok& tk = peek();
+        if (tk.kind != STok::Ident && tk.kind != STok::Keyword) return false;
+        std::string typ = take().text;
+        if (lower_of(typ) == "double" && peek().kind == STok::Ident && lower_of(peek().text) == "precision") {
+          typ += " " + take().text;
+        }
+        *v = as_returns_type(*v, typ);
+      }
+      return true;
+    };
+
+    p_prim = [&](Val* v) -> bool {
+      if (take_punct("(")) {
+        if (!p_expr(v)) return false;
+        if (!take_punct(")")) return false;
+        return true;
+      }
+      if (take_kw("CASE")) {
+        bool matched = false;
+        Val res = val_null();
+        while (take_kw("WHEN")) {
+          Val cond; if (!p_expr(&cond)) return false;
+          if (!take_kw("THEN")) return false;
+          Val branch_val; if (!p_expr(&branch_val)) return false;
+          if (!matched && truthy(cond)) {
+            res = branch_val;
+            matched = true;
+          }
+        }
+        if (take_kw("ELSE")) {
+          Val else_val; if (!p_expr(&else_val)) return false;
+          if (!matched) res = else_val;
+        }
+        if (!take_kw("END")) return false;
+        *v = res;
+        return true;
+      }
+      const STok& t = peek();
+      if (t.kind == STok::Num) {
+        take();
+        *v = t.is_float ? val_approx(t.num_val) : val_num(t.num_val);
+        return true;
+      }
+      if (t.kind == STok::Str) {
+        take();
+        *v = val_text(t.text);
+        return true;
+      }
+      if (t.kind == STok::Keyword) {
+        if (take_kw("NULL")) { *v = val_null(); return true; }
+        if (take_kw("TRUE")) { *v = val_num(1); return true; }
+        if (take_kw("FALSE")) { *v = val_num(0); return true; }
+        return false;
+      }
+      if (t.kind == STok::Ident) {
+        std::string name = take().text;
+        if (peek().kind == STok::Punct && peek().text == "(") {
+          take_punct("(");
+          std::vector<Val> args;
+          if (!take_punct(")")) {
+            while (true) {
+              Val arg; if (!p_expr(&arg)) return false;
+              args.push_back(std::move(arg));
+              if (take_punct(")")) break;
+              if (!take_punct(",")) return false;
+            }
+          }
+          std::string up = upper_of(name);
+          static thread_local std::unordered_map<std::string, double> doom_const_cache;
+          if (up == "DOOM_CONST" && args.size() == 1 && !args[0].null) {
+            std::string cname = args[0].str();
+            auto it = doom_const_cache.find(cname);
+            if (it != doom_const_cache.end()) {
+              *v = val_approx(it->second);
+              return true;
+            }
+            auto fn = db.find_program('F', name);
+            if (fn) {
+              std::string ferr;
+              Val r = sql_run_function(db, *fn, args, session_db, &ferr);
+              if (ferr.empty() && !r.null) {
+                doom_const_cache[cname] = r.num;
+                *v = r;
+                return true;
+              }
+            }
+          }
+          if (up == "GREATEST") {
+            if (args.empty()) return false;
+            Val best = args[0];
+            for (size_t i = 1; i < args.size(); ++i) {
+              if (best.null || (!args[i].null && args[i].num > best.num)) best = args[i];
+            }
+            *v = best;
+            return true;
+          }
+          if (up == "LEAST") {
+            if (args.empty()) return false;
+            Val best = args[0];
+            for (size_t i = 1; i < args.size(); ++i) {
+              if (best.null || (!args[i].null && args[i].num < best.num)) best = args[i];
+            }
+            *v = best;
+            return true;
+          }
+          if (up == "COALESCE") {
+            *v = val_null();
+            for (const auto& a : args) if (!a.null) { *v = a; break; }
+            return true;
+          }
+          if (up == "NULLIF") {
+            if (args.size() != 2) return false;
+            *v = (compare_vals(args[0], args[1]) == 0) ? val_null() : args[0];
+            return true;
+          }
+          if (up == "ABS" && args.size() == 1) {
+            if (args[0].null) *v = val_null();
+            else *v = args[0].approx ? val_approx(std::fabs(args[0].num)) : val_num(std::fabs(args[0].num));
+            return true;
+          }
+          if (up == "ROUND" && args.size() == 1) {
+            if (args[0].null) *v = val_null();
+            else *v = val_num(std::round(args[0].num));
+            return true;
+          }
+          if (up == "FLOOR" && args.size() == 1) {
+            if (args[0].null) *v = val_null();
+            else *v = val_num(std::floor(args[0].num));
+            return true;
+          }
+          if ((up == "CEIL" || up == "CEILING") && args.size() == 1) {
+            if (args[0].null) *v = val_null();
+            else *v = val_num(std::ceil(args[0].num));
+            return true;
+          }
+          if (up == "UPPER" && args.size() == 1) {
+            *v = args[0].null ? val_null() : val_text(upper_of(args[0].str()));
+            return true;
+          }
+          if (up == "LOWER" && args.size() == 1) {
+            *v = args[0].null ? val_null() : val_text(lower_of(args[0].str()));
+            return true;
+          }
+          auto fn = db.find_program('F', name);
+          if (fn) {
+            std::string ferr;
+            Val r = sql_run_function(db, *fn, args, session_db, &ferr);
+            if (!ferr.empty()) return false;
+            *v = r;
+            return true;
+          }
+          return false;
+        }
+        Val* var = find_var(name);
+        if (var) { *v = *var; return true; }
+        return false;
+      }
+      return false;
+    };
+
+    if (!p_expr(out)) return false;
+    if (peek().kind != STok::End) return false;
+    return true;
+  }
+
   bool eval(const std::string& expr, Val* out, Condition* cond) {
     if (trim(expr).empty()) { *out = val_null(); return true; }
+    if (eval_scalar(expr, out)) return true;
     SqlQueryResult r;
     if (!exec("SELECT " + expr, &r, cond)) return false;
     *out = cell_val(r, 0, 0);
@@ -900,6 +1416,11 @@ struct Run {
       case Node::Call:
         call(n.text, &c);
         return;
+      case Node::Do: {
+        Val dummy;
+        if (!eval(n.text, &dummy, &c)) { raise(c); return; }
+        return;
+      }
       case Node::Sql: {
         SqlQueryResult r;
         if (!exec(n.text, &r, &c)) { raise(c); return; }

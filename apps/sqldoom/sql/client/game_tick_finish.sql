@@ -52,6 +52,8 @@ boss_exit AS (
 )
 SELECT
   ps.position_x,ps.position_y,ps.view_angle,ps.view_z,ps.alive,
+  ps.health,ps.armor,ps.ammo_bullets,ps.ammo_shells,ps.ammo_rockets,ps.ammo_cells,
+  ps.key_blue,ps.key_yellow,ps.key_red,ps.damage_count,ps.bonus_count,ps.message,ps.message_tics,
   COALESCE(ur.locked,FALSE) AS use_locked,
   CASE WHEN COALESCE(ur.locked,FALSE) THEN usd.key_required::text END
     AS required_key,
@@ -59,6 +61,7 @@ SELECT
     AS use_exit,
   COALESCE(c.use_requested AND ur.eligible AND usd.secret_exit,FALSE)
     AS use_secret_exit,
+  COALESCE(c.use_requested AND ur.eligible,FALSE) AS use_activated,
   ce.requested AS cross_exit,ce.secret AS cross_secret_exit,
   se.requested AS sector_exit,be.requested AS boss_exit,
   -- The computer area map reveals the whole automap for the rest of the level.

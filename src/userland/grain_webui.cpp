@@ -224,6 +224,10 @@ const char* kCanvasScript = R"JS(
     post({type:'key',key:k,shift:e.shiftKey?'1':'',ctrl:e.ctrlKey?'1':'',alt:e.altKey?'1':'',meta:e.metaKey?'1':''});
     if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey)post({type:'text',text:e.key});
   });
+  document.addEventListener('keyup',function(e){
+    var k=keys[e.key]||(e.key.length===1?e.key.toLowerCase():null);if(!k)return;
+    post({type:'key_up',key:k});
+  });
   if(window.EventSource){var es=new EventSource(location.pathname+location.search);es.onmessage=function(m){try{var d=JSON.parse(m.data);if(String(d.seq)!==seq)apply(d)}catch(x){}}}
 })();
 )JS";

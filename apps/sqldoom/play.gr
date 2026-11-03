@@ -10,16 +10,42 @@
 # SQLDOOM_FRAMES=n draws n frames with no display and saves the last to SQLDOOM_SHOT (default frame.png); the keys
 # held meanwhile are SQLDOOM_KEYS (e.g. "up,ctrl").
 let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
-let map_name = len(args) > 0 ? upper(args[0]) : "E1M1"
-let skill = len(args) > 1 ? int(args[1]) : 2
+let clean_args = []
+let arg_i = 0
+while arg_i < len(args) {
+  let a = args[arg_i]
+  if starts_with(a, "--") {
+    if a == "--port" or a == "--host" or a == "--max-body" { arg_i = arg_i + 1 }
+  } else {
+    push(clean_args, a)
+  }
+  arg_i = arg_i + 1
+}
+let map_name = len(clean_args) > 0 ? upper(clean_args[0]) : "E1M1"
+let skill = len(clean_args) > 1 ? int(clean_args[1]) : 2
+
+setenv("AIOS_NO_REDO", "1")
+setenv("AIOS_REDO_SYNC", "0")
 
 sql("USE doom")
+pcall(sql, "ALTER TABLE game_tic_commands ADD COLUMN IF NOT EXISTS jump_requested BOOLEAN NOT NULL DEFAULT FALSE")
 # The client's statements and the renderer are SQLDoom's PostgreSQL, as the game tic's are.
 sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+let _raw_sql = sql
+fn sql(q) {
+  let r = pcall(_raw_sql, q)
+  if not r.ok {
+    print("[SQL FATAL] " + r.error)
+    print("[SQL QUERY] " + q)
+    error(r.error)
+  }
+  return r.value
+}
 let m = sql("SELECT map_id FROM maps WHERE name = '" + map_name + "'")
 if len(m) == 0 { error("map " + map_name + " is not loaded (apps/sqldoom/load.gr)") }
 let map_id = m[0].map_id
 let player = sql("SELECT id FROM things WHERE map_id = " + str(map_id) + " AND type = 1")[0].id
+sql("SET @map_id = " + str(map_id) + ", @player_thing_id = " + str(player) + ", @skill = " + str(skill))
 
 # A prepared statement of SQLDoom's client: $1, $2, .. filled in as SQL literals (the highest first, so $1 does not
 # eat $10's digits).
@@ -40,10 +66,15 @@ let renderer_sql = read_file(path_join(here, "sql/renderer.sql"))
 
 sql("SELECT doom_reset_stage(" + str(map_id) + ", " + str(skill) + ")")
 sql("SELECT doom_spawn_player(" + str(map_id) + ", " + str(player) + ")")
+sql("UPDATE player_weapons SET state = 'ready', sy = 32.0 WHERE map_id = " + str(map_id))
 
 let held = {}
 let pending_weapon = nil
 let pending_use = false
+let pending_jump = false
+let pending_fire = false
+let mouse_turn = 0.0
+let last_mouse_x = nil
 let tics = 0
 let last_tic_ms = clock()
 let last_frame_tic = -1
@@ -51,26 +82,128 @@ let status = "E1M1"
 let level_over = false
 let frame = canvas_create(320, 200)
 
+let hud_mode = "modern"
+let texture_filtering = true
+let jump_enabled = true
+let crt_enabled = false
+let crt_overlay = nil
+
+let menu_open = false
+let menu_sel = 0
+
+fn toggle_menu_item(idx) {
+  if idx == 0 {
+    # Display Preset: toggle between Modern 2026 and Classic 1993
+    if hud_mode == "modern" {
+      hud_mode = "classic"
+      texture_filtering = false
+      jump_enabled = false
+    } else {
+      hud_mode = "modern"
+      texture_filtering = true
+      jump_enabled = true
+    }
+  } else if idx == 1 {
+    texture_filtering = not texture_filtering
+  } else if idx == 2 {
+    hud_mode = hud_mode == "modern" ? "classic" : "modern"
+  } else if idx == 3 {
+    jump_enabled = not jump_enabled
+  } else if idx == 4 {
+    crt_enabled = not crt_enabled
+  } else if idx == 5 {
+    menu_open = false
+  }
+}
+
+let cur_health = 100
+let cur_armor = 0
+let cur_bullets = 50
+let cur_shells = 0
+let cur_rockets = 0
+let cur_cells = 0
+let has_blue = false
+let has_yellow = false
+let has_red = false
+
+let interact_prompt = nil
+let toast_msg = nil
+let toast_timer = 0
+
+fn check_interact(px, py, angle) {
+  let rad = angle * 3.141592653589793 / 180.0
+  let dx = cos(rad)
+  let dy = sin(rad)
+  let q = format("SELECT ld.linedef_id, ld.special, sd.use_activated, sd.is_exit, sd.key_required, " +
+    "((ld.x1 - {:.2f})*(ld.y2 - ld.y1) - (ld.y1 - ({:.2f}))*(ld.x2 - ld.x1)) / NULLIF({:.4f}*(ld.y2 - ld.y1) - {:.4f}*(ld.x2 - ld.x1), 0) AS dist, " +
+    "((ld.x1 - {:.2f})*{:.4f} - (ld.y1 - ({:.2f}))*{:.4f}) / NULLIF({:.4f}*(ld.y2 - ld.y1) - {:.4f}*(ld.x2 - ld.x1), 0) AS frac " +
+    "FROM linedef_geom ld " +
+    "JOIN line_special_defs sd ON sd.special = ld.special " +
+    "WHERE ld.map_id = {} AND sd.use_activated " +
+    "HAVING dist BETWEEN 0 AND 200 AND frac BETWEEN -0.15 AND 1.15 " +
+    "ORDER BY dist LIMIT 1", px, py, dx, dy, px, dy, py, dx, dx, dy, map_id)
+  let r = sql(q)
+  if len(r) > 0 {
+    let hit = r[0]
+    if hit.is_exit == 1 { return "EXIT LEVEL" }
+    if hit.key_required != nil and hit.key_required != "" { return "UNLOCK " + upper(str(hit.key_required)) + " DOOR" }
+    return "OPEN DOOR"
+  }
+  return nil
+}
+
 fn down(k) { return get(held, k, false) }
 fn axis(plus, minus) { return (plus ? 1 : 0) - (minus ? 1 : 0) }
 
 fn run_tic() {
   let fwd = axis(down("up") or down("w"), down("down") or down("s"))
   let strafe = axis(down("d"), down("a"))
-  let turn = axis(down("right"), down("left")) * 3.2   # TURN_DEGREES_PER_TIC
-  let fire = down("ctrl") or down("f")
-  let run = down("shift")
+  let turn = axis(down("right"), down("left")) * 4.5 + mouse_turn
+  mouse_turn = 0.0
+  let fire = down("ctrl") or down("f") or down("mouse_left") or pending_fire
+  let run = not down("shift")   # Modern FPS: Always Run ON by default (Shift to walk)
+  let jump = jump_enabled and (down("space") or pending_jump)
+  let use = down("e") or down("return") or pending_use
+  if jump and interact_prompt != nil {
+    use = true
+  }
+
   let q = "SELECT doom_run_game_tic(" + join([str(map_id), str(player), str(skill), str(fwd) + "e0", str(strafe) + "e0",
             run ? "TRUE" : "FALSE", str(turn) + "e0", fire ? "TRUE" : "FALSE", pending_weapon == nil ? "NULL" : str(pending_weapon),
-            pending_use ? "TRUE" : "FALSE"], ", ") + ")"
+            use ? "TRUE" : "FALSE", jump ? "TRUE" : "FALSE"], ", ") + ")"
   pending_weapon = nil
   pending_use = false
+  pending_jump = false
+  pending_fire = false
   let t0 = clock()
   sql(q)
   tics = tics + 1
   let snap = sql(bind(snapshot_sql, [map_id, player]))
   if len(snap) > 0 {
     let s = snap[0]
+    if s.health != nil { cur_health = s.health }
+    if s.armor != nil { cur_armor = s.armor }
+    if s.ammo_bullets != nil { cur_bullets = s.ammo_bullets }
+    if s.ammo_shells != nil { cur_shells = s.ammo_shells }
+    if s.ammo_rockets != nil { cur_rockets = s.ammo_rockets }
+    if s.ammo_cells != nil { cur_cells = s.ammo_cells }
+    has_blue = s.key_blue == 1
+    has_yellow = s.key_yellow == 1
+    has_red = s.key_red == 1
+
+    if use {
+      if s.use_activated == 1 {
+        toast_msg = "DOOR / SWITCH ACTIVATED"
+        toast_timer = clock() + 1500
+      } else if s.use_locked == 1 {
+        toast_msg = "LOCKED: NEED " + upper(str(s.required_key)) + " KEY"
+        toast_timer = clock() + 2000
+      } else {
+        toast_msg = "NOTHING TO USE"
+        toast_timer = clock() + 800
+      }
+    }
+
     if s.use_exit == 1 or s.cross_exit == 1 or s.use_secret_exit == 1 or s.cross_secret_exit == 1 or s.sector_exit == 1 or s.boss_exit == 1 {
       level_over = true
       status = map_name + " done"
@@ -82,35 +215,350 @@ fn run_tic() {
   last_tic_ms = clock()
 }
 
+let last_render_x = nil
+let last_render_y = nil
+let last_render_z = nil
+let last_render_angle = nil
+let last_render_hud = nil
+
 fn render_frame() {
-  # how far the clock is into the next tic: the camera between the last two
-  let alpha = min(1, max(0, (clock() - last_tic_ms) / (1000 / 35)))
+  let t_start = clock()
+  let alpha = 1.0
   let pose = sql(bind(camera_sql, [map_id, player, alpha]))
+  let t_cam = clock() - t_start
   if len(pose) == 0 { return }
   let p = pose[0]
-  sql("SET @map_id = " + str(map_id) + ", @player_thing_id = " + str(player) + ", @skill = " + str(skill) +
-      ", @x = " + str(p.x) + "e0, @y = " + str(p.y) + "e0, @z = " + str(p.z) + "e0, @angle = " + str(p.angle) + "e0")
-  let rgb = sql(renderer_sql)[0].frame_rgb
-  if rgb != nil { canvas_set_pixels(frame, rgb) }
+  if tics % 2 == 0 {
+    interact_prompt = check_interact(p.x, p.y, p.angle)
+  }
+
+  if p.x == last_render_x and p.y == last_render_y and p.z == last_render_z and p.angle == last_render_angle and tics == last_frame_tic and hud_mode == last_render_hud {
+    return
+  }
+  last_render_x = p.x
+  last_render_y = p.y
+  last_render_z = p.z
+  last_render_angle = p.angle
+  last_render_hud = hud_mode
+
+  let render_q = renderer_sql
+  if hud_mode == "modern" {
+    render_q = replace(render_q, "COALESCE(@screen_h, 200) AS screen_h,", "200 AS screen_h,")
+    let cut_pos = index_of(render_q, "-- @hud-cut")
+    if cut_pos != -1 {
+      render_q = slice(render_q, 0, cut_pos) + "SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') AS frame_rgb FROM view_colored;"
+    }
+  } else {
+    render_q = replace(render_q, "COALESCE(@screen_h, 200) AS screen_h,", "168 AS screen_h,")
+  }
+
+  let render_query = replace(render_q, "SELECT @x AS x, @y AS y, @z AS z, @angle AS angle",
+    format("SELECT /* SQL_NO_CACHE */ {:.4f}e0 AS x, {:.4f}e0 AS y, {:.4f}e0 AS z, {:.4f}e0 AS angle", p.x, p.y, p.z, p.angle))
+  let t_r0 = clock()
+  let rgb = sql(render_query)[0].frame_rgb
+  let t_sql = clock() - t_r0
+  let t_c0 = clock()
+  if rgb != nil {
+    if len(rgb) < 192000 {
+      rgb = rgb + repeat("\x00", 192000 - len(rgb))
+    } else if len(rgb) > 192000 {
+      rgb = slice(rgb, 0, 192000)
+    }
+    canvas_set_pixels(frame, rgb)
+    if hud_mode == "modern" {
+      canvas_postprocess_modern(frame, 0.35, 0.22)
+    }
+  }
+  let t_can = clock() - t_c0
   last_frame_tic = tics
+  if frames > 0 {
+    print(format("  breakdown: cam={:.1f}ms sql={:.1f}ms can={:.1f}ms", t_cam, t_sql, t_can))
+  }
 }
 
-let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right", "control": "ctrl",
-              "lctrl": "ctrl", "rctrl": "ctrl", "lshift": "shift", "rshift": "shift", " ": "space"}
+let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
+              "control": "ctrl", "left ctrl": "ctrl", "right ctrl": "ctrl", "lctrl": "ctrl", "rctrl": "ctrl",
+              "shift": "shift", "left shift": "shift", "right shift": "shift", "lshift": "shift", "rshift": "shift",
+              " ": "space", "return": "return", "enter": "return"}
 fn key_name(e) { return get(keymap, lower(e.key), lower(e.key)) }
 
-# 35 tics a second, as Doom's clock runs. A tic that is slow makes the next late; none are made up.
-every(1 / 35, fn () { if not level_over { run_tic() } })
+let sim_start = nil
+let sim_tics = 0
 
-let pane = create_pane({"title": "SQLDoom on ASQL", "width": 320, "height": 218,
+fn run_due_tics() {
+  if level_over or menu_open { return }
+  let now = clock()
+  if sim_start == nil {
+    sim_start = now
+    sim_tics = 0
+  }
+  let target_tics = int((now - sim_start) / (1000 / 35))
+  if sim_tics < target_tics {
+    run_tic()
+    sim_tics = sim_tics + 1
+    if sim_tics < target_tics {
+      sim_tics = target_tics
+    }
+  }
+}
+
+let last_draw_time = nil
+let fps_rolling = 0.0
+
+let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width": 1280, "height": 960,
   "on_draw": fn (cv) {
-    if tics != last_frame_tic { render_frame() }
+    let now = clock()
+    if last_draw_time != nil {
+      let dt = now - last_draw_time
+      if dt > 0 {
+        let cur_fps = 1000.0 / dt
+        fps_rolling = fps_rolling == 0.0 ? cur_fps : (fps_rolling * 0.85 + cur_fps * 0.15)
+      }
+    }
+    last_draw_time = now
+
+    if not menu_open {
+      run_due_tics()
+      render_frame()
+    }
+
+    # Apply bilinear smoothing when texture_filtering is enabled (Modern 2026 presentation)
+    canvas_set_image_smoothing(cv, texture_filtering)
     canvas_clear(cv, "#000000")
+    canvas_save(cv)
+    canvas_scale(cv, 4, 4.8)
     canvas_draw_image(cv, frame, 0, 0)
-    canvas_fill_text(cv, status, 6, 214, "#9aa4b2")
+    canvas_restore(cv)
+
+    # Modern 2026 Precision Crosshair
+    if hud_mode == "modern" {
+      canvas_fill_rect(cv, 639, 479, 3, 3, "#38bdf8ee")
+      canvas_fill_rect(cv, 626, 480, 8, 1, "#38bdf8cc")
+      canvas_fill_rect(cv, 646, 480, 8, 1, "#38bdf8cc")
+      canvas_fill_rect(cv, 640, 466, 1, 8, "#38bdf8cc")
+      canvas_fill_rect(cv, 640, 486, 1, 8, "#38bdf8cc")
+    }
+
+    # Interactive Prompt under Crosshair (Properly centered in box)
+    if interact_prompt != nil {
+      let p_txt = "[E] " + interact_prompt
+      let p_w = 360
+      let p_x = 640 - int(p_w / 2)
+      canvas_fill_round_rect(cv, p_x, 515, p_w, 34, 6, "#030712d8")
+      canvas_stroke_round_rect(cv, p_x, 515, p_w, 34, 6, "#38bdf888", 1)
+      let t_w = int(len(p_txt) * 8.5)
+      canvas_fill_text(cv, p_txt, 640 - int(t_w / 2), 524, "#38bdf8")
+    }
+
+    # Toast / Feedback Banner (Centered text)
+    if toast_timer > now and toast_msg != nil {
+      let b_w = 400
+      let b_x = 640 - int(b_w / 2)
+      canvas_fill_round_rect(cv, b_x, 560, b_w, 34, 6, "#0f172ad8")
+      canvas_stroke_round_rect(cv, b_x, 560, b_w, 34, 6, "#10b98188", 1)
+      let msg_w = int(len(toast_msg) * 8.5)
+      canvas_fill_text(cv, toast_msg, 640 - int(msg_w / 2), 569, "#34d399")
+    }
+
+    if crt_enabled {
+      if crt_overlay == nil {
+        crt_overlay = canvas_create(1280, 960, "#00000000")
+        for y in range(0, 960) {
+          if y % 2 == 0 { canvas_fill_rect(crt_overlay, 0, y, 1280, 1, "#00000038") }
+        }
+      }
+      canvas_blit(cv, crt_overlay, 0, 0, 0, 0, 1280, 960, 0.45)
+    }
+
+    # Sleek Top HUD Badges (Vertically centered: text_y = box_y + (36 - 16)/2 = 26)
+    canvas_fill_round_rect(cv, 24, 16, 260, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, 24, 16, 260, 36, 8, "#38bdf844", 1)
+    canvas_fill_text(cv, format("MISSION: {} • HANGAR", map_name), 40, 26, "#38bdf8")
+
+    # Center Menu button
+    canvas_fill_round_rect(cv, 530, 16, 220, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, 530, 16, 220, 36, 8, "#94a3b844", 1)
+    let m_btn_txt = hud_mode == "modern" ? "SETTINGS [ESC] (MODERN)" : "SETTINGS [ESC] (CLASSIC)"
+    canvas_fill_text(cv, m_btn_txt, 545, 26, "#38bdf8")
+
+    let fps_val = fps_rolling > 0.0 ? fps_rolling : 35.0
+    canvas_fill_round_rect(cv, 996, 16, 260, 36, 8, "#030712d0")
+    canvas_stroke_round_rect(cv, 996, 16, 260, 36, 8, "#10b98144", 1)
+    canvas_fill_text(cv, format("{:.1f} FPS • 35 Hz REALTIME", fps_val), 1016, 26, "#10b981")
+
+    # Modern 2026 Status HUD (Cleanly separated label, value, and progress bar)
+    if hud_mode == "modern" {
+      # Health Card (Bottom-Left: y=836, h=76)
+      canvas_fill_round_rect(cv, 24, 836, 240, 76, 8, "#030712d8")
+      canvas_stroke_round_rect(cv, 24, 836, 240, 76, 8, "#22c55e44", 1)
+      canvas_fill_text(cv, "HEALTH", 40, 848, "#94a3b8")
+      let hp_col = cur_health > 50 ? "#22c55e" : (cur_health > 25 ? "#f59e0b" : "#ef4444")
+      canvas_fill_text(cv, format("{} HP", cur_health), 40, 868, hp_col)
+      canvas_fill_round_rect(cv, 40, 894, 208, 6, 3, "#1e293b")
+      let hp_w = int(208.0 * max(0.0, min(100.0, cur_health * 1.0)) / 100.0)
+      if hp_w > 0 { canvas_fill_round_rect(cv, 40, 894, hp_w, 6, 3, hp_col) }
+
+      # Armor & Security Card (Bottom-Center: y=836, h=76)
+      canvas_fill_round_rect(cv, 490, 836, 300, 76, 8, "#030712d8")
+      canvas_stroke_round_rect(cv, 490, 836, 300, 76, 8, "#0ea5e944", 1)
+      canvas_fill_text(cv, "ARMOR & SECURITY", 506, 848, "#94a3b8")
+      canvas_fill_text(cv, format("{}%", cur_armor), 506, 868, "#0ea5e9")
+      canvas_fill_text(cv, has_blue ? "[BLUE]" : "[-]", 616, 868, has_blue ? "#38bdf8" : "#475569")
+      canvas_fill_text(cv, has_yellow ? "[YEL]" : "[-]", 676, 868, has_yellow ? "#eab308" : "#475569")
+      canvas_fill_text(cv, has_red ? "[RED]" : "[-]", 730, 868, has_red ? "#ef4444" : "#475569")
+      canvas_fill_round_rect(cv, 506, 894, 268, 6, 3, "#1e293b")
+      let arm_w = int(268.0 * max(0.0, min(100.0, cur_armor * 1.0)) / 100.0)
+      if arm_w > 0 { canvas_fill_round_rect(cv, 506, 894, arm_w, 6, 3, "#0ea5e9") }
+
+      # Ammo Card (Bottom-Right: y=836, h=76)
+      canvas_fill_round_rect(cv, 1016, 836, 240, 76, 8, "#030712d8")
+      canvas_stroke_round_rect(cv, 1016, 836, 240, 76, 8, "#38bdf844", 1)
+      canvas_fill_text(cv, "BULLETS", 1032, 848, "#94a3b8")
+      canvas_fill_text(cv, format("{} / 200", cur_bullets), 1032, 868, "#38bdf8")
+      canvas_fill_round_rect(cv, 1032, 894, 208, 6, 3, "#1e293b")
+      let am_w = int(208.0 * max(0.0, min(200.0, cur_bullets * 1.0)) / 200.0)
+      if am_w > 0 { canvas_fill_round_rect(cv, 1032, 894, am_w, 6, 3, "#38bdf8") }
+    }
+
+    # Sleek footer controls bar (shown in Modern mode so Classic status bar remains unobstructed)
+    if hud_mode == "modern" {
+      canvas_fill_rect(cv, 0, 926, 1280, 34, "#020617ee")
+      canvas_fill_text(cv, "WASD: Move  •  Space: Jump  •  E: Use  •  Mouse: Look  •  Shift: Walk  •  Esc: Settings Menu  •  C: Scanlines", 140, 935, "#94a3b8")
+    }
+
+    # Interactive Settings Menu (Classic vs Modern 2026)
+    if menu_open {
+      canvas_fill_rect(cv, 0, 0, 1280, 960, "#000000a8")
+      let mx = 360
+      let my = 180
+      let mw = 560
+      let mh = 560
+      canvas_fill_round_rect(cv, mx, my, mw, mh, 12, "#030712f4")
+      canvas_stroke_round_rect(cv, mx, my, mw, mh, 12, "#38bdf899", 2)
+
+      # Title & Subtitle
+      canvas_fill_text(cv, "SQLDOOM CONFIGURATION", mx + 160, my + 24, "#38bdf8")
+      canvas_fill_text(cv, "Toggle between Modern 2026 & Classic 1993", mx + 125, my + 46, "#94a3b8")
+      canvas_fill_rect(cv, mx + 30, my + 72, mw - 60, 1, "#334155")
+
+      let items = [
+        {"label": "Game Experience", "val": hud_mode == "modern" ? "Modern 2026 Remaster" : "Classic 1993 Retro", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
+        {"label": "Environment & Monsters", "val": texture_filtering ? "Remastered (HD SSAO)" : "Original Retro Pixels", "col": texture_filtering ? "#22c55e" : "#f59e0b"},
+        {"label": "HUD Interface", "val": hud_mode == "modern" ? "2026 Cyber Vector" : "1993 Status Bar", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
+        {"label": "Jump Physics", "val": jump_enabled ? "Enabled (Space)" : "Disabled", "col": jump_enabled ? "#22c55e" : "#64748b"},
+        {"label": "CRT Scanlines", "val": crt_enabled ? "Enabled" : "Disabled", "col": crt_enabled ? "#22c55e" : "#64748b"}
+      ]
+
+      for i in range(0, 5) {
+        let iy = my + 90 + i * 62
+        let is_sel = (menu_sel == i)
+        if is_sel {
+          canvas_fill_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#1e293be0")
+          canvas_stroke_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#38bdf8", 1.5)
+        } else {
+          canvas_fill_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#0f172a80")
+          canvas_stroke_round_rect(cv, mx + 24, iy, mw - 48, 48, 8, "#1e293b", 1)
+        }
+        canvas_fill_text(cv, items[i].label, mx + 40, iy + 16, is_sel ? "#ffffff" : "#cbd5e1")
+
+        # Value pill badge
+        let pill_w = 210
+        let pill_x = mx + mw - 24 - pill_w - 10
+        canvas_fill_round_rect(cv, pill_x, iy + 8, pill_w, 32, 6, "#020617")
+        canvas_stroke_round_rect(cv, pill_x, iy + 8, pill_w, 32, 6, items[i].col + "66", 1)
+        let v_txt = items[i].val
+        let v_w = int(len(v_txt) * 8.2)
+        canvas_fill_text(cv, v_txt, pill_x + int((pill_w - v_w) / 2), iy + 16, items[i].col)
+      }
+
+      # Resume button (Row 5)
+      let is_res_sel = (menu_sel == 5)
+      canvas_fill_round_rect(cv, mx + 24, my + 410, mw - 48, 48, 8, is_res_sel ? "#0284c7" : "#0369a1")
+      canvas_stroke_round_rect(cv, mx + 24, my + 410, mw - 48, 48, 8, "#38bdf8", 1.5)
+      canvas_fill_text(cv, "RESUME GAME", mx + 225, my + 426, "#ffffff")
+
+      # Navigation helper
+      canvas_fill_text(cv, "↑/↓: Navigate  •  Enter/Space/Click: Toggle  •  Esc: Close", mx + 68, my + 490, "#64748b")
+    }
+
+    if env("SQLDOOM_PANE_SHOT", "") != "" {
+      canvas_save_png(cv, env("SQLDOOM_PANE_SHOT", ""))
+    }
   },
-  # every event: a key held from its key event to its key_up
+  # every event: a key or mouse button held from its down event to its up event
   "on_event": fn (p, e) {
+    if e.type == "mouse_down" {
+      let b = e.button
+      if b == "left" or b == 0 or b == "0" or b == nil {
+        held["mouse_left"] = true
+        if not menu_open { pending_fire = true }
+      } else if b == "right" or b == 2 or b == "2" {
+        if not menu_open {
+          pending_use = true
+          if interact_prompt == nil {
+            toast_msg = "NOTHING TO USE"
+            toast_timer = clock() + 800
+          }
+        }
+      }
+      return nil
+    }
+    if e.type == "click" {
+      if menu_open {
+        let mx = 360
+        let my = 180
+        let mw = 560
+        let mh = 560
+        if e.x >= mx and e.x <= mx + mw and e.y >= my and e.y <= my + mh {
+          for i in range(0, 5) {
+            let iy = my + 90 + i * 62
+            if e.y >= iy and e.y <= iy + 48 {
+              menu_sel = i
+              toggle_menu_item(i)
+              return nil
+            }
+          }
+          if e.y >= my + 410 and e.y <= my + 458 {
+            menu_open = false
+            return nil
+          }
+        } else {
+          menu_open = false
+        }
+        return nil
+      }
+
+      # If clicked on top Settings [ESC] button
+      if e.x >= 540 and e.x <= 740 and e.y >= 16 and e.y <= 52 {
+        menu_open = true
+        return nil
+      }
+
+      let b = e.button
+      if b == "left" or b == 0 or b == "0" or b == nil {
+        pending_fire = true
+      } else if b == "right" or b == 2 or b == "2" {
+        pending_use = true
+      }
+      return nil
+    }
+    if e.type == "mouse_up" {
+      let b = e.button
+      if b == "left" or b == 0 or b == "0" or b == nil { held["mouse_left"] = false }
+      return nil
+    }
+    if e.type == "mouse_move" {
+      if not menu_open {
+        if e.dx != nil and e.dx != 0 {
+          mouse_turn = mouse_turn + e.dx * 0.55
+        } else if last_mouse_x != nil {
+          let dx = e.x - last_mouse_x
+          if dx != 0 { mouse_turn = mouse_turn + dx * 0.55 }
+        }
+      }
+      last_mouse_x = e.x
+      return nil
+    }
     if e.type != "key" and e.type != "key_up" { return nil }
     let k = key_name(e)
     if e.type == "key_up" {
@@ -118,11 +566,41 @@ let pane = create_pane({"title": "SQLDoom on ASQL", "width": 320, "height": 218,
       return nil
     }
     if k == "escape" {
-      unregister_pane(p.id)
+      menu_open = not menu_open
+      return nil
+    }
+    if menu_open {
+      if k == "up" or k == "w" {
+        menu_sel = (menu_sel - 1 + 6) % 6
+        return nil
+      }
+      if k == "down" or k == "s" {
+        menu_sel = (menu_sel + 1) % 6
+        return nil
+      }
+      if k == "return" or k == "space" or k == "left" or k == "right" {
+        toggle_menu_item(menu_sel)
+        return nil
+      }
+      return nil
+    }
+    if k == "c" or k == "f1" {
+      crt_enabled = not crt_enabled
+      return nil
+    }
+    if k == "tab" {
+      hud_mode = hud_mode == "modern" ? "classic" : "modern"
       return nil
     }
     held[k] = true
-    if k == "space" or k == "e" { pending_use = true }
+    if k == "space" {
+      if jump_enabled { pending_jump = true }
+      if interact_prompt != nil { pending_use = true }
+    }
+    if k == "e" or k == "return" {
+      pending_use = true
+    }
+    if k == "ctrl" or k == "f" { pending_fire = true }
     if regex_test("^[1-7]$", k) { pending_weapon = int(k) }
     return nil
   }
@@ -140,5 +618,17 @@ if frames > 0 {
   }
   canvas_save_png(frame, env("SQLDOOM_SHOT", "frame.png"))
 } else {
-  run_panes()
+  let script = []
+  for k in split(env("SQLDOOM_TEST_KEYS", ""), ",") {
+    if k != "" { push(script, {"type": "key", "pane": pane.id, "key": k}) }
+  }
+  if env("SQLDOOM_TEST_W", "0") == "1" {
+    push(script, {"type": "key", "pane": pane.id, "key": "w"})
+  }
+  let max_f = int(env("SQLDOOM_PANE_FRAMES", "0"))
+  if max_f > 0 {
+    run_panes({"frames": max_f, "script": script})
+  } else {
+    run_panes({"script": script})
+  }
 }

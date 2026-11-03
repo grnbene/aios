@@ -3139,6 +3139,7 @@ struct GrainCanvas {
   double tx = 0, ty = 0;
   double sx = 1, sy = 1;
   double rotation = 0;
+  bool image_smoothing = false;
 
   struct Point { double x, y; };
   struct Subpath {
@@ -3158,13 +3159,14 @@ struct GrainCanvas {
     std::string font_name;
     int font_size;
     double tx, ty, sx, sy, rotation;
+    bool image_smoothing;
   };
   std::vector<State> state_stack;
 
   void save() {
     state_stack.push_back({fill_color, stroke_color, fill_gradient, stroke_gradient,
                            line_width, global_alpha, font_name, font_size,
-                           tx, ty, sx, sy, rotation});
+                           tx, ty, sx, sy, rotation, image_smoothing});
   }
 
   void restore() {
@@ -3180,6 +3182,7 @@ struct GrainCanvas {
     font_name = s.font_name;
     font_size = s.font_size;
     tx = s.tx; ty = s.ty; sx = s.sx; sy = s.sy; rotation = s.rotation;
+    image_smoothing = s.image_smoothing;
   }
 
   Point transform(double x, double y) const {
@@ -3942,6 +3945,126 @@ void blit_canvas(GrainCanvas& dst, const GrainCanvas& src, int dx, int dy,
                  int sx, int sy, int sw, int sh, double alpha = 1.0) {
   if (sw <= 0) sw = src.width - sx;
   if (sh <= 0) sh = src.height - sy;
+  const double sc_x = dst.sx;
+  const double sc_y = dst.sy;
+  const double trans_x = dst.tx;
+  const double trans_y = dst.ty;
+  if (sc_x != 1.0 || sc_y != 1.0 || trans_x != 0.0 || trans_y != 0.0) {
+    if (dst.image_smoothing && sc_x > 0.0 && sc_y > 0.0) {
+      int dst_y0 = (int)std::floor(dy * sc_y + trans_y);
+      int dst_y1 = (int)std::ceil((dy + sh) * sc_y + trans_y);
+      int dst_x0 = (int)std::floor(dx * sc_x + trans_x);
+      int dst_x1 = (int)std::ceil((dx + sw) * sc_x + trans_x);
+      dst_y0 = std::max(0, dst_y0);
+      dst_y1 = std::min((int)dst.height, dst_y1);
+      dst_x0 = std::max(0, dst_x0);
+      dst_x1 = std::min((int)dst.width, dst_x1);
+
+      const double inv_sc_x = 1.0 / sc_x;
+      const double inv_sc_y = 1.0 / sc_y;
+      const int src_w = (int)src.width;
+      const int src_h = (int)src.height;
+
+      struct XSample {
+        int cx0, cx1;
+        uint32_t wx0, wx1;
+      };
+      const int x_count = dst_x1 - dst_x0;
+      std::vector<XSample> x_samples(x_count > 0 ? (size_t)x_count : 0);
+      for (int px = dst_x0; px < dst_x1; ++px) {
+        double u = ((px + 0.5 - trans_x) * inv_sc_x - dx) + sx - 0.5;
+        int x0 = (int)std::floor(u);
+        int x1 = x0 + 1;
+        double fx = u - x0;
+        int cx0 = std::clamp(x0, 0, src_w - 1);
+        int cx1 = std::clamp(x1, 0, src_w - 1);
+        uint32_t wx1 = (uint32_t)(fx * 256.0 + 0.5);
+        uint32_t wx0 = 256 - wx1;
+        x_samples[(size_t)(px - dst_x0)] = {cx0, cx1, wx0, wx1};
+      }
+
+      for (int py = dst_y0; py < dst_y1; ++py) {
+        double v = ((py + 0.5 - trans_y) * inv_sc_y - dy) + sy - 0.5;
+        int y0 = (int)std::floor(v);
+        int y1 = y0 + 1;
+        double fy = v - y0;
+        int cy0 = std::clamp(y0, 0, src_h - 1);
+        int cy1 = std::clamp(y1, 0, src_h - 1);
+        uint32_t wy1 = (uint32_t)(fy * 256.0 + 0.5);
+        uint32_t wy0 = 256 - wy1;
+
+        const uint32_t* row0 = &src.pixels[(size_t)cy0 * src_w];
+        const uint32_t* row1 = &src.pixels[(size_t)cy1 * src_w];
+        uint32_t* dst_row = &dst.pixels[(size_t)py * dst.width];
+
+        for (int px = dst_x0; px < dst_x1; ++px) {
+          const auto& xs = x_samples[(size_t)(px - dst_x0)];
+          uint32_t c00 = row0[xs.cx0];
+          uint32_t c10 = row0[xs.cx1];
+          uint32_t c01 = row1[xs.cx0];
+          uint32_t c11 = row1[xs.cx1];
+
+          uint32_t a0 = (((c00 >> 24) & 0xFF) * xs.wx0 + ((c10 >> 24) & 0xFF) * xs.wx1) >> 8;
+          uint32_t r0 = (((c00 >> 16) & 0xFF) * xs.wx0 + ((c10 >> 16) & 0xFF) * xs.wx1) >> 8;
+          uint32_t g0 = (((c00 >> 8) & 0xFF) * xs.wx0 + ((c10 >> 8) & 0xFF) * xs.wx1) >> 8;
+          uint32_t b0 = ((c00 & 0xFF) * xs.wx0 + (c10 & 0xFF) * xs.wx1) >> 8;
+
+          uint32_t a1 = (((c01 >> 24) & 0xFF) * xs.wx0 + ((c11 >> 24) & 0xFF) * xs.wx1) >> 8;
+          uint32_t r1 = (((c01 >> 16) & 0xFF) * xs.wx0 + ((c11 >> 16) & 0xFF) * xs.wx1) >> 8;
+          uint32_t g1 = (((c01 >> 8) & 0xFF) * xs.wx0 + ((c11 >> 8) & 0xFF) * xs.wx1) >> 8;
+          uint32_t b1 = ((c01 & 0xFF) * xs.wx0 + (c11 & 0xFF) * xs.wx1) >> 8;
+
+          uint32_t a = (a0 * wy0 + a1 * wy1) >> 8;
+          uint32_t r = (r0 * wy0 + r1 * wy1) >> 8;
+          uint32_t g = (g0 * wy0 + g1 * wy1) >> 8;
+          uint32_t b = (b0 * wy0 + b1 * wy1) >> 8;
+
+          uint32_t final_col = (a << 24) | (r << 16) | (g << 8) | b;
+          if (alpha >= 1.0 && a == 0xFF) {
+            dst_row[px] = final_col;
+          } else {
+            blend_pixel(dst, px, py, final_col, alpha);
+          }
+        }
+      }
+      return;
+    }
+    const bool full_alpha = (alpha >= 1.0);
+    for (int y = 0; y < sh; ++y) {
+      int src_y = sy + y;
+      if (src_y < 0 || src_y >= (int)src.height) continue;
+      int dst_y0 = (int)std::floor((dy + y) * sc_y + trans_y);
+      int dst_y1 = (int)std::floor((dy + y + 1) * sc_y + trans_y);
+      if (dst_y1 <= 0 || dst_y0 >= (int)dst.height) continue;
+      dst_y0 = std::max(0, dst_y0);
+      dst_y1 = std::min((int)dst.height, dst_y1);
+      for (int x = 0; x < sw; ++x) {
+        int src_x = sx + x;
+        if (src_x < 0 || src_x >= (int)src.width) continue;
+        int dst_x0 = (int)std::floor((dx + x) * sc_x + trans_x);
+        int dst_x1 = (int)std::floor((dx + x + 1) * sc_x + trans_x);
+        if (dst_x1 <= 0 || dst_x0 >= (int)dst.width) continue;
+        dst_x0 = std::max(0, dst_x0);
+        dst_x1 = std::min((int)dst.width, dst_x1);
+        uint32_t col = src.pixels[(size_t)src_y * src.width + src_x];
+        const uint32_t a = (col >> 24) & 0xFF;
+        if (a == 0) continue;
+        if (full_alpha && a == 0xFF) {
+          const int span_len = dst_x1 - dst_x0;
+          for (int py = dst_y0; py < dst_y1; ++py) {
+            std::fill_n(dst.pixels.data() + (size_t)py * dst.width + dst_x0, span_len, col);
+          }
+        } else {
+          for (int py = dst_y0; py < dst_y1; ++py) {
+            for (int px = dst_x0; px < dst_x1; ++px) {
+              blend_pixel(dst, px, py, col, alpha);
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
   for (int y = 0; y < sh; ++y) {
     int src_y = sy + y;
     int dst_y = dy + y;
@@ -4121,6 +4244,193 @@ Value bi_canvas_set_global_alpha(Vm&, std::vector<Value>& args, std::string& err
   if (!cv) return Value::nil();
   if (!want_number(args[1], error, "canvas_set_global_alpha")) return Value::nil();
   cv->global_alpha = std::clamp(args[1].as_double(), 0.0, 1.0);
+  return args[0];
+}
+
+Value bi_canvas_set_image_smoothing(Vm&, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_set_image_smoothing");
+  if (!cv) return Value::nil();
+  if (args.size() > 1) {
+    cv->image_smoothing = args[1].truthy();
+  }
+  return args[0];
+}
+
+Value bi_canvas_postprocess_modern(Vm&, std::vector<Value>& args, std::string& error) {
+  auto cv = get_canvas(args[0], error, "canvas_postprocess_modern");
+  if (!cv) return Value::nil();
+  double bloom_strength = args.size() > 1 ? args[1].as_double() : 0.40;
+  double vignette = args.size() > 2 ? args[2].as_double() : 0.22;
+
+  const int w = (int)cv->width;
+  const int h = (int)cv->height;
+  if (w <= 0 || h <= 0) return args[0];
+
+  const double cx = w * 0.5;
+  const double cy = h * 0.5;
+  const double max_dist_sq = (cx * cx + cy * cy);
+
+  // Buffer for emissive bloom & ambient occlusion
+  std::vector<uint32_t> orig(cv->pixels.begin(), cv->pixels.end());
+  std::vector<uint16_t> bloom_r(w * h, 0);
+  std::vector<uint16_t> bloom_g(w * h, 0);
+  std::vector<uint16_t> bloom_b(w * h, 0);
+
+  // Pass 1: Extract emissive highlights (lights, consoles, slime, fire, eyes)
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      uint32_t px = orig[(size_t)y * w + x];
+      int r = (px >> 16) & 0xFF;
+      int g = (px >> 8) & 0xFF;
+      int b = px & 0xFF;
+      int lum = (r * 77 + g * 150 + b * 29) >> 8;
+      if (lum > 135) {
+        int excess = lum - 135;
+        bloom_r[y * w + x] = (uint16_t)((r * excess) >> 7);
+        bloom_g[y * w + x] = (uint16_t)((g * excess) >> 7);
+        bloom_b[y * w + x] = (uint16_t)((b * excess) >> 7);
+      }
+    }
+  }
+
+  // Pass 2: Fast separable 2-pass Gaussian bloom (horizontal then vertical)
+  std::vector<uint16_t> hblur_r(w * h, 0), hblur_g(w * h, 0), hblur_b(w * h, 0);
+  for (int y = 0; y < h; ++y) {
+    const int row_off = y * w;
+    for (int x = 0; x < w; ++x) {
+      int sr = 0, sg = 0, sb = 0;
+      int x_min = std::max(0, x - 4);
+      int x_max = std::min(w - 1, x + 4);
+      for (int kx = x_min; kx <= x_max; ++kx) {
+        int idx = row_off + kx;
+        sr += bloom_r[idx];
+        sg += bloom_g[idx];
+        sb += bloom_b[idx];
+      }
+      int count = x_max - x_min + 1;
+      hblur_r[row_off + x] = (uint16_t)(sr / count);
+      hblur_g[row_off + x] = (uint16_t)(sg / count);
+      hblur_b[row_off + x] = (uint16_t)(sb / count);
+    }
+  }
+
+  std::vector<uint16_t> blur_r(w * h, 0), blur_g(w * h, 0), blur_b(w * h, 0);
+  for (int y = 0; y < h; ++y) {
+    int y_min = std::max(0, y - 4);
+    int y_max = std::min(h - 1, y + 4);
+    int count = y_max - y_min + 1;
+    for (int x = 0; x < w; ++x) {
+      int sr = 0, sg = 0, sb = 0;
+      for (int ky = y_min; ky <= y_max; ++ky) {
+        int idx = ky * w + x;
+        sr += hblur_r[idx];
+        sg += hblur_g[idx];
+        sb += hblur_b[idx];
+      }
+      blur_r[y * w + x] = (uint16_t)(sr / count);
+      blur_g[y * w + x] = (uint16_t)(sg / count);
+      blur_b[y * w + x] = (uint16_t)(sb / count);
+    }
+  }
+
+  // Pass 3: Edge-aware SSAO contact shadows, HDR emissive bloom & ACES color grading
+  for (int y = 0; y < h; ++y) {
+    uint32_t* row = &cv->pixels[(size_t)y * w];
+    double dy = (y - cy);
+    double dy_sq = dy * dy;
+
+    for (int x = 0; x < w; ++x) {
+      uint32_t px = orig[(size_t)y * w + x];
+      uint32_t a = (px >> 24) & 0xFF;
+      if (a == 0) continue;
+
+      int r = (px >> 16) & 0xFF;
+      int g = (px >> 8) & 0xFF;
+      int b = px & 0xFF;
+
+      // Screen-space Ambient Occlusion & Edge Detail Enhancement
+      if (x > 0 && x < w - 1 && y > 0 && y < h - 1) {
+        uint32_t p_left = orig[(size_t)y * w + (x - 1)];
+        uint32_t p_right = orig[(size_t)y * w + (x + 1)];
+        uint32_t p_up = orig[(size_t)(y - 1) * w + x];
+        uint32_t p_down = orig[(size_t)(y + 1) * w + x];
+
+        int l_cur = (r * 77 + g * 150 + b * 29) >> 8;
+        int l_left = (((p_left >> 16) & 0xFF) * 77 + ((p_left >> 8) & 0xFF) * 150 + (p_left & 0xFF) * 29) >> 8;
+        int l_right = (((p_right >> 16) & 0xFF) * 77 + ((p_right >> 8) & 0xFF) * 150 + (p_right & 0xFF) * 29) >> 8;
+        int l_up = (((p_up >> 16) & 0xFF) * 77 + ((p_up >> 8) & 0xFF) * 150 + (p_up & 0xFF) * 29) >> 8;
+        int l_down = (((p_down >> 16) & 0xFF) * 77 + ((p_down >> 8) & 0xFF) * 150 + (p_down & 0xFF) * 29) >> 8;
+
+        // Ambient contact shadow along horizontal floor/ceiling/sprite creases
+        int vert_grad = std::abs(l_down - l_up);
+        if (vert_grad > 28 && y > h / 3) {
+          r = (r * 200) >> 8;
+          g = (g * 200) >> 8;
+          b = (b * 200) >> 8;
+        }
+
+        // SSAO depth creasing and micro-contrast
+        int laplacian = (l_cur << 2) - l_left - l_right - l_up - l_down;
+        if (laplacian < -18) {
+          int occl = std::min(60, (-laplacian) * 3 >> 1);
+          r = std::max(0, r - occl);
+          g = std::max(0, g - occl);
+          b = std::max(0, b - occl);
+        } else if (laplacian > 12 && laplacian < 85) {
+          int boost = (laplacian * 45) >> 8;
+          r = std::clamp(r + boost, 0, 255);
+          g = std::clamp(g + boost, 0, 255);
+          b = std::clamp(b + boost, 0, 255);
+        }
+      }
+
+      // Additive emissive bloom light injection
+      if (bloom_strength > 0.0) {
+        int bidx = y * w + x;
+        int br = (int)(blur_r[bidx] * bloom_strength);
+        int bg = (int)(blur_g[bidx] * bloom_strength);
+        int bb = (int)(blur_b[bidx] * bloom_strength);
+        r = std::min(255, r + br);
+        g = std::min(255, g + bg);
+        b = std::min(255, b + bb);
+      }
+
+      // Color Vibrancy & Saturation Tuning (Modern 2026 grade)
+      int max_c = std::max({r, g, b});
+      int min_c = std::min({r, g, b});
+      int delta = max_c - min_c;
+      if (delta > 8) {
+        int avg = (r + g + b) / 3;
+        r = std::clamp(avg + ((r - avg) * 310 >> 8), 0, 255);
+        g = std::clamp(avg + ((g - avg) * 310 >> 8), 0, 255);
+        b = std::clamp(avg + ((b - avg) * 310 >> 8), 0, 255);
+      }
+
+      // ACES Filmic Tone Mapping Curve (standard in modern 2026 real-time renderers)
+      float fr = r / 255.0f;
+      float fg = g / 255.0f;
+      float fb = b / 255.0f;
+      auto aces = [](float x) {
+        float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+        return std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0f, 1.0f);
+      };
+      r = std::clamp((int)(aces(fr) * 255.0f), 0, 255);
+      g = std::clamp((int)(aces(fg) * 255.0f), 0, 255);
+      b = std::clamp((int)(aces(fb) * 255.0f), 0, 255);
+
+      // Vignette
+      if (vignette > 0.0) {
+        double dx = (x - cx);
+        double dist_ratio = (dx * dx + dy_sq) / max_dist_sq;
+        double vig = 1.0 - dist_ratio * vignette;
+        r = (int)(r * vig);
+        g = (int)(g * vig);
+        b = (int)(b * vig);
+      }
+
+      row[x] = (a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+  }
   return args[0];
 }
 
@@ -7769,6 +8079,9 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("canvas_set_stroke_color", 2, 2, bi_canvas_set_stroke_style);
   vm.define_native("canvas_set_line_width", 2, 2, bi_canvas_set_line_width);
   vm.define_native("canvas_set_global_alpha", 2, 2, bi_canvas_set_global_alpha);
+  vm.define_native("canvas_set_image_smoothing", 1, 2, bi_canvas_set_image_smoothing);
+  vm.define_native("canvas_image_smoothing", 1, 2, bi_canvas_set_image_smoothing);
+  vm.define_native("canvas_postprocess_modern", 1, 3, bi_canvas_postprocess_modern);
   vm.define_native("color_rgb", 3, 3, bi_color_rgb);
   vm.define_native("color_rgba", 3, 4, bi_color_rgba);
   vm.define_native("rgb", 3, 3, bi_color_rgb);

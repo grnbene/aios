@@ -630,7 +630,7 @@ Dispatched at `cli/commands.cpp:10963` → `cmd_app` (`cli/commands.cpp:1528`).
 
 ## `grain`
 
-Dispatched at `cli/commands.cpp:11000` → `run_grain_command` (`cli/grain_cmd.cpp:239`).
+Dispatched at `cli/commands.cpp:11000` → `run_grain_command` (`cli/grain_cmd.cpp:245`).
 
 **grain run|eval|repl|dis|serve|ps** - The grain language *(Applications & Shell)*
 

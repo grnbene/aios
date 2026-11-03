@@ -98,7 +98,7 @@ WITH RECURSIVE render_context AS (
       16e0 * ((b.screen_w/2e0)/tan(b.fov_rad/2e0)) AS max_plane_depth
     FROM (SELECT
       320  AS screen_w,
-      168  AS screen_h,  -- 200 minus the real 32px status bar
+      COALESCE(@screen_h, 200) AS screen_h,
       radians(90e0) AS fov_rad,
       1e-3 AS near,
       202.5e0 AS rotation_offset,
@@ -897,60 +897,31 @@ plane_spans_prepared AS (
   JOIN sectors_lit s ON s.id = ps.sector_id AND s.map_id = rc.map_id
   LEFT JOIN flat_textures fl ON (CASE WHEN ps.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END) <> 'F_SKY1'
                             AND fl.name = (CASE WHEN ps.plane = 'floor' THEN s.floor_tex ELSE s.ceil_tex END)
-  ORDER BY ps.col_x, ps.y0
 ),
-plane_pixels AS (
+plane_fragments AS (
   SELECT
-    sp.col_x AS x, y, sp.sector_id, sp.sector_light, sp.plane, sp.source_priority,
-    sp.is_sky, sp.flat_id,
-    CASE WHEN sp.is_sky THEN 1e7
-         ELSE sp.plane_dz / NULLIF(rs.cy - y, 0.0)
-    END AS depth,
-    CASE WHEN sp.is_sky THEN sp.sky_u
-         ELSE ((CAST(FLOOR(sp.c_px + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_x) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
-    END AS u_i,
-    CASE WHEN sp.is_sky THEN ((CAST(((y - rs.sky_horizon_y)) AS SIGNED) % rs.sky_rows) + rs.sky_rows) % rs.sky_rows
-         ELSE ((CAST(FLOOR(sp.c_py + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_y) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size
-    END AS v_i
+    sp.col_x AS x, y,
+    CASE WHEN sp.is_sky THEN 1e7 ELSE sp.plane_dz / NULLIF(rs.cy - y, 0.0) END AS depth,
+    sp.source_priority,
+    CASE WHEN sp.is_sky THEN 0
+         WHEN wr.invuln THEN rs.light_index_invuln
+         ELSE doom_light_index(sp.sector_light, wr.extra_light,
+                               doom_light_zdepth(CASE WHEN sp.is_sky THEN 1e7 ELSE sp.plane_dz / NULLIF(rs.cy - y, 0.0) END))
+    END AS light_index,
+    COALESCE(CASE WHEN sp.is_sky THEN wt.palette_index ELSE ft.palette_index END, 0) AS palette_index,
+    CAST((CAST(sp.sector_id AS SIGNED)*2 + CASE WHEN sp.plane='floor' THEN 0 ELSE 1 END) AS SIGNED) AS stable_id
   FROM plane_spans_prepared sp
   CROSS JOIN render_settings rs
+  CROSS JOIN weapon_runtime wr
   CROSS JOIN LATERAL generate_series(sp.y0, sp.y1) AS y
-  WHERE sp.is_sky OR sp.plane_dz / NULLIF(rs.cy - y, 0.0) > rs.near
-),
-plane_color AS (
-  -- sample the sector's floor/ceiling flat, or the sky wall-texture for F_SKY1
-  SELECT
-    p.x, p.y, p.depth, p.sector_id, p.plane, p.sector_light, p.is_sky,
-    p.source_priority,
-    COALESCE(CASE WHEN p.is_sky THEN wt.palette_index ELSE ft.palette_index END, 0) AS palette_index
-  FROM plane_pixels p
   CROSS JOIN (SELECT m.sky_texture AS name, wm.tex_id
               FROM maps m JOIN render_context rc ON rc.map_id = m.map_id
               LEFT JOIN walltex_meta wm ON wm.name = m.sky_texture) sk
   LEFT JOIN flat_texels ft
-    ON NOT p.is_sky AND ft.k = p.flat_id * 1048576 + p.v_i * 1024 + p.u_i
+    ON NOT sp.is_sky AND ft.k = sp.flat_id * 1048576 + (((CAST(FLOOR(sp.c_py + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_y) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size) * 1024 + (((CAST(FLOOR(sp.c_px + (sp.plane_dz / NULLIF(rs.cy - y, 0.0)) * sp.dir_x) AS SIGNED) % rs.flat_size) + rs.flat_size) % rs.flat_size)
   LEFT JOIN walltex_texels wt
-    ON p.is_sky AND wt.k = sk.tex_id * 1048576 + p.v_i * 1024 + p.u_i
-),
-plane_lit AS (
-  SELECT
-    x,y,depth,sector_id,plane,source_priority,is_sky,palette_index,
-    -- R_InitLightTables' zlight selection, expressed in map-unit floats.
-    CASE WHEN wr.invuln THEN rs.light_index_invuln
-         ELSE doom_light_index(sector_light, wr.extra_light,
-                               doom_light_zdepth(depth))
-    END AS light_index
-  FROM plane_color CROSS JOIN weapon_runtime wr
-  CROSS JOIN render_settings rs
-),
-plane_fragments AS (
-  SELECT
-    p.x, p.y, p.depth, p.source_priority,
-    CASE WHEN p.is_sky THEN 0 ELSE p.light_index END AS light_index,
-    p.palette_index,
-    CAST((CAST(p.sector_id AS SIGNED)*2
-      + CASE WHEN p.plane='floor' THEN 0 ELSE 1 END) AS SIGNED) AS stable_id
-  FROM plane_lit p
+    ON sp.is_sky AND wt.k = sk.tex_id * 1048576 + (((CAST(((y - rs.sky_horizon_y)) AS SIGNED) % rs.sky_rows) + rs.sky_rows) % rs.sky_rows) * 1024 + sp.sky_u
+  WHERE sp.is_sky OR sp.plane_dz / NULLIF(rs.cy - y, 0.0) > rs.near
 ),
 
 -- Next up: Sprites.
@@ -1254,7 +1225,7 @@ psprite_patches AS (
   SELECT p.*, sf.width, sf.height, sf.left_offset, sf.top_offset,
          sf.lump_name,
          p.sx - sf.left_offset AS x_left_f,
-         p.sy - sf.top_offset + rs.cy - 100.0 - 0.5 AS y_top_f
+         p.sy - sf.top_offset + rs.cy - 100.0 AS y_top_f
   FROM psprite_layers p
   CROSS JOIN render_settings rs
   JOIN sprite_frames sf ON sf.sprite=p.sprite AND sf.frame=p.frame
@@ -1342,6 +1313,20 @@ palette_map AS (
   CROSS JOIN active_palette ap
   WHERE cm.pal = ap.pal
 ),
+view_colored AS (
+  -- Resolve COLORMAP on the view's pixels.
+  SELECT r.x, r.y, r.y * 4096 + r.x AS pix, cm.rgb
+  FROM final_pixels r
+  LEFT JOIN palette_map cm
+    ON cm.level = r.light_index
+   AND cm.palette_index = r.palette_index
+),
+view_holes AS (
+  SELECT 0 AS x, 0 AS y, X'000000' AS rgb
+  WHERE FALSE
+)
+-- @hud-cut
+,
 weapon_ownership AS (
   SELECT slot.weapon_id,
          EXISTS (
@@ -1480,101 +1465,32 @@ ui_layer_patches AS (
   JOIN ui_patches p ON p.name = l.patch
 ),
 ui_pixels AS (
-  SELECT ulp.layer,ulp.dest_x+px.dx AS x,ulp.dest_y+px.dy AS y,
+  SELECT ulp.layer, (ulp.dest_y+px.dy) * 4096 + (ulp.dest_x+px.dx) AS pix,
          px.palette_index
   FROM ui_layer_patches ulp
   JOIN ui_hud_pixels px ON px.name=ulp.patch
 ),
 ui_resolved AS (
   -- The top layer's index at each pixel (SQLDoom's ARG_MAX(palette_index, layer)).
-  SELECT x, y, palette_index
-  FROM (SELECT p.*, ROW_NUMBER() OVER (PARTITION BY p.x, p.y ORDER BY p.layer DESC) AS rn FROM ui_pixels p) r
+  SELECT pix, palette_index
+  FROM (SELECT p.layer, p.pix, p.palette_index, ROW_NUMBER() OVER (PARTITION BY p.pix ORDER BY p.layer DESC) AS rn FROM ui_pixels p) r
   WHERE rn = 1
 ),
 ui_colored AS (
-  SELECT s.x, s.y,
+  SELECT s.y * 4096 + s.x AS pix,
          COALESCE(ovcm.rgb,
                   CASE WHEN ap.pal = 0 THEN s.rgb ELSE barcm.rgb END,
                   s.rgb) AS rgb
   FROM ui_static_pixels s
   CROSS JOIN active_palette ap
-  LEFT JOIN ui_resolved ur ON ur.x = s.x AND ur.y = s.y
+  LEFT JOIN ui_resolved ur ON ur.pix = s.y * 4096 + s.x
   LEFT JOIN palette_map ovcm
     ON ovcm.level = 0 AND ovcm.palette_index = ur.palette_index
   LEFT JOIN palette_map barcm
     ON ap.pal <> 0 AND barcm.level = 0
    AND barcm.palette_index = s.palette_index
-),
-
-view_colored AS (
-  -- Resolve COLORMAP on the view's pixels.
-  SELECT r.x, r.y, COALESCE(cm.rgb,X'000000') AS rgb
-  FROM final_pixels r
-  LEFT JOIN palette_map cm
-    ON cm.level = r.light_index
-   AND cm.palette_index = r.palette_index
-),
-view_holes AS (
-  -- Any view pixel no fragment reached, painted black. The pipeline aims to
-  -- cover all screen_w*screen_h of them and normally does.
-  SELECT 0 AS x, 0 AS y, X'000000' AS rgb
-  WHERE FALSE
-),
--- @stats-cut: doom_sql.prepare_render_stats() splices its own counting
--- projection in here, so the debug overlay's row counts are always measured
--- against this exact pipeline instead of a hand-kept copy of it.
--- HU_Drawer: the pickup line, in the small STCFN font at the top-left of the
--- view. Only the glyphs of the message join ui_patch_pixels, and only while
--- one is up -- an empty message makes every CTE below empty.
-message_glyphs AS (
-  SELECT gs.i AS pos,
-         substring(UPPER(pu.message) FROM gs.i FOR 1) AS ch
-  FROM player_ui_state pu
-  CROSS JOIN LATERAL generate_series(1, length(pu.message)) AS gs(i)
-  WHERE pu.message IS NOT NULL AND pu.message_tics > 0
-),
-message_placed AS (
-  -- HUlib_drawTextLine walks the line accumulating each glyph's own width; a
-  -- space has no patch and advances by 4.
-  SELECT g.pos, g.ch,
-         CASE WHEN g.ch = ' ' THEN NULL
-              ELSE CONCAT('STCFN', LPAD(CAST(ASCII(g.ch) AS CHAR), 3, '0')) END AS patch,
-         SUM(CASE WHEN g.ch = ' ' THEN 4
-                  ELSE COALESCE((SELECT p.width FROM ui_patches p
-                                 WHERE p.name = CONCAT('STCFN',
-                                    LPAD(CAST(ASCII(g.ch) AS CHAR), 3, '0'))), 4)
-             END) OVER (ORDER BY g.pos ROWS BETWEEN UNBOUNDED PRECEDING
-                                             AND 1 PRECEDING) AS pen
-  FROM message_glyphs g
-),
-message_pixels AS (
-  SELECT CAST(COALESCE(mp.pen, 0) AS SIGNED) + px.dx AS x, 1 + px.dy AS y,
-         px.palette_index
-  FROM message_placed mp
-  JOIN ui_hud_pixels px ON px.name = mp.patch
-  WHERE mp.patch IS NOT NULL
-),
-message_colored AS (
-  SELECT m.x, m.y, cm.rgb
-  FROM message_pixels m
-  CROSS JOIN render_context rc
-  JOIN palette_map cm ON cm.level = 0 AND cm.palette_index = m.palette_index
-  WHERE m.x BETWEEN 0 AND 319 AND m.y BETWEEN 0 AND 167
-),
-framebuffer AS (
-  -- Every screen pixel, in no particular order (frame_rows sorts). The 3D view
-  -- owns rows 0..screen_h-1 and the status bar rows screen_h..199.
-  SELECT v.y * 4096 + v.x AS pix, COALESCE(m.rgb, v.rgb) AS rgb
-  FROM view_colored v
-  LEFT JOIN message_colored m ON m.x = v.x AND m.y = v.y
-  UNION ALL
-  SELECT h.y * 4096 + h.x AS pix, COALESCE(m.rgb, h.rgb) AS rgb
-  FROM view_holes h
-  LEFT JOIN message_colored m ON m.x = h.x AND m.y = h.y
-  UNION ALL
-  SELECT y * 4096 + x AS pix, rgb FROM ui_colored
-  -- (SQLDoom unions an empty 256,000-row generate_series here to steer CedarDB's optimizer; ASQL would make the
-  -- rows.)
 )
-SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') AS frame_rgb
-FROM framebuffer
+SELECT CONCAT(
+  (SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') FROM view_colored),
+  (SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') FROM ui_colored)
+) AS frame_rgb;

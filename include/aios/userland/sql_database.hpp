@@ -666,6 +666,7 @@ struct MorselScheduler {
 // SELECTs a nested subquery's columns may refer to.
 struct SqlWorkerContext {
   std::vector<const void*> cte_parents;   // the submitting thread's CTE scopes, read-only for a worker
+  std::vector<const void*> cte_views_parents; // the submitting thread's merged CTE view scopes, read-only for a worker
   int rw_depth = 0;              // the statement lock the caller already holds
   std::string session_db;
   int clock_depth = 0;

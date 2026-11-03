@@ -924,6 +924,7 @@ CREATE TABLE IF NOT EXISTS game_tic_commands (
   attack_held      BOOLEAN NOT NULL DEFAULT FALSE,
   weapon_switch_to INT,
   use_requested    BOOLEAN NOT NULL DEFAULT FALSE,
+  jump_requested   BOOLEAN NOT NULL DEFAULT FALSE,
   -- Filled by the CedarScript movement planner after movers are advanced;
   -- the client dispatches the one prepared movement path selected by SQL.
   movement_mode    ENUM('idle', 'turn', 'full') NOT NULL DEFAULT 'idle',

@@ -198,14 +198,16 @@ struct Compiler {
   // An inlined function's parameter nodes (in its RETURN template) and the lanes its arguments compiled to.
   std::vector<std::pair<const SqlExpr*, uint32_t>> bound;
 
-  // A leaf identical to one the program already has (the same column read the same way, the same literal) is
-  // that one: a 55-instruction key expression read `rs.sky_rows` three times and `plane_tex.tex_name` twice, each
-  // a gather of every row into its own lane (21 leaf reads a row, nearly half the program's time).
-  static bool same_leaf(const Ins& a, const Ins& b) {
+  // Common subexpression elimination (CSE): any instruction identical to one the program already has
+  // (the same column read the same way, the same literal, or the same operator over the same input lanes)
+  // is reused directly.
+  static bool same_ins(const Ins& a, const Ins& b) {
     if (a.op != b.op || a.ty != b.ty || a.approx != b.approx || a.dec != b.dec || a.dyadic != b.dyadic || a.taint != b.taint ||
         a.uns != b.uns || a.day != b.day || a.knull != b.knull || a.ki != b.ki || std::memcmp(&a.kf, &b.kf, sizeof a.kf) != 0 || a.src != b.src ||
-        a.slot != b.slot || a.cs != b.cs || a.codes.get() != b.codes.get() || a.set.get() != b.set.get())
+        a.slot != b.slot || a.cs != b.cs || a.codes.get() != b.codes.get() || a.set.get() != b.set.get() || a.dplaces != b.dplaces || a.dlim != b.dlim ||
+        a.args.size() != b.args.size())
       return false;
+    for (size_t i = 0; i < a.args.size(); ++i) if (a.args[i] != b.args[i]) return false;
     return a.code_null == b.code_null;
   }
   uint32_t emit(Ins in) {
@@ -220,9 +222,8 @@ struct Compiler {
         if (!((cmp && all) || nul)) return fail("a date read as a number");
       }
     }
-    if (vjit_leaf(in.op) && in.args.empty())
-      for (uint32_t x = 0; x < P.ins.size(); ++x)
-        if (vjit_leaf(P.ins[x].op) && same_leaf(P.ins[x], in)) return x;
+    for (uint32_t x = 0; x < P.ins.size(); ++x)
+      if (same_ins(P.ins[x], in)) return x;
     P.ins.push_back(std::move(in));
     return (uint32_t)P.ins.size() - 1;
   }

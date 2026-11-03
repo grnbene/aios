@@ -107,6 +107,12 @@ inline void colbatch_from_vp(vp::Column&& col, SqlDataType dest, int dest_scale,
       return;
     }
   }
+  if (col.ty == vp::Ty::Str) {
+    out->kind = ColBatch::Text;
+    out->s = std::move(col.s);
+    out->nul = std::move(col.n);
+    return;
+  }
   out->kind = ColBatch::Text;
   out->s.resize(n);
   for (size_t r = 0; r < n; ++r) out->s[r] = col.text(r);
