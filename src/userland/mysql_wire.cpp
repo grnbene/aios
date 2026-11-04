@@ -507,6 +507,10 @@ void map_engine_error(const std::string& msg, uint16_t* code, const char** sqlst
   if (starts("Statement aborted because lock(s) could not be acquired immediately")) { *code = 3572; *sqlstate = "HY000"; return; }
   if (starts("Incorrect number of arguments for")) { *code = 1318; *sqlstate = "42000"; return; }
   if (starts("Can't update table") && has("stored function/trigger")) { *code = 1442; *sqlstate = "HY000"; return; }
+  if (starts("The MariaDB server is running with the --secure-file-priv")) { *code = 1290; *sqlstate = "HY000"; return; }
+  if (starts("The used command is not allowed because the MariaDB server or client has disabled the local infile")) { *code = 4166; *sqlstate = "HY000"; return; }
+  if (starts("File '") && has("not found")) { *code = 29; *sqlstate = "HY000"; return; }
+  if (starts("LOAD DATA ")) { *code = 1235; *sqlstate = "42000"; return; }
   if (starts("Result consisted of more than one row")) { *code = 1172; *sqlstate = "42000"; return; }
   if (starts("Subquery returns more than 1 row")) { *code = 1242; *sqlstate = "21000"; return; }
   if (has("is a GLOBAL variable and should be set with SET GLOBAL")) { *code = 1229; *sqlstate = "HY000"; return; }
@@ -771,6 +775,48 @@ namespace {
 // The compressed protocol's codecs, for both ends (MysqlWireServer's sessions and MariaWireSession).
 constexpr uint8_t kWireZlib = 1, kWireZstd = 2;
 constexpr uint32_t kCapCompress = 0x00000020, kCapZstd = 1u << 26;   // CLIENT_COMPRESS, CLIENT_ZSTD_COMPRESSION_ALGORITHM
+constexpr uint32_t kCapLocalFiles = 0x00000080;   // CLIENT_LOCAL_FILES
+
+// The file name of a `LOAD DATA [LOW_PRIORITY | CONCURRENT] LOCAL INFILE 'name' ...`, else false. Read here, on the
+// client's own bytes, because the server must ask the client for that file before the statement can run.
+bool load_local_infile_name(const std::string& q, std::string* name) {
+  size_t i = 0;
+  auto skip = [&] {
+    for (;;) {
+      while (i < q.size() && (q[i] == ' ' || q[i] == '\t' || q[i] == '\r' || q[i] == '\n')) ++i;
+      if (i + 1 < q.size() && q[i] == '/' && q[i + 1] == '*') { const size_t e = q.find("*/", i + 2); if (e == std::string::npos) return; i = e + 2; continue; }
+      if (i + 1 < q.size() && q[i] == '-' && q[i + 1] == '-') { while (i < q.size() && q[i] != '\n') ++i; continue; }
+      if (i < q.size() && q[i] == '#') { while (i < q.size() && q[i] != '\n') ++i; continue; }
+      return;
+    }
+  };
+  auto word = [&](const char* w) {
+    skip();
+    const size_t n = std::strlen(w);
+    if (q.size() - i < n) return false;
+    for (size_t k = 0; k < n; ++k) if (std::toupper((unsigned char)q[i + k]) != w[k]) return false;
+    if (i + n < q.size() && (std::isalnum((unsigned char)q[i + n]) || q[i + n] == '_')) return false;
+    i += n;
+    return true;
+  };
+  if (!word("LOAD") || !word("DATA")) return false;
+  if (!word("LOW_PRIORITY")) word("CONCURRENT");
+  if (!word("LOCAL") || !word("INFILE")) return false;
+  skip();
+  if (i >= q.size() || (q[i] != '\'' && q[i] != '"')) return false;
+  const char quote = q[i++];
+  std::string out;
+  for (; i < q.size(); ++i) {
+    if (q[i] == '\\' && i + 1 < q.size()) {
+      ++i;
+      switch (q[i]) { case 'n': out += '\n'; break; case 't': out += '\t'; break; case 'r': out += '\r'; break; case '0': out += '\0'; break; default: out += q[i]; }
+    } else if (q[i] == quote) {
+      if (i + 1 < q.size() && q[i + 1] == quote) { out += quote; ++i; }
+      else { *name = out; return true; }
+    } else out += q[i];
+  }
+  return false;
+}
 constexpr size_t kWireMinCompress = 50;    // smaller pieces go stored, as MySQL's MIN_COMPRESS_LENGTH
 
 // `n` bytes compressed onto `out`; 0 when the algorithm could not (the piece then goes stored).
@@ -2747,7 +2793,7 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
   hs.insert(hs.end(), salt.begin(), salt.begin() + 8);  // salt part 1 (8 bytes)
   hs.push_back(0);  // filler
 
-  uint32_t caps = CAP_LONG_PASSWORD | CAP_FOUND_ROWS | CAP_LONG_FLAG |
+  uint32_t caps = CAP_LONG_PASSWORD | CAP_FOUND_ROWS | CAP_LONG_FLAG | kCapLocalFiles |
                   CAP_CONNECT_WITH_DB | CAP_PROTOCOL_41 | CAP_TRANSACTIONS |
                   CAP_SECURE_CONNECTION | CAP_MULTI_STATEMENTS | CAP_MULTI_RESULTS |
                   CAP_PLUGIN_AUTH;
@@ -4290,6 +4336,35 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       if (!multi) { stmts.clear(); stmts.push_back(query_text); }
       const std::string wire_db = session_database.empty() ? db_.effective_database() : session_database;
       uint8_t curr_seq = 1;
+      // LOAD DATA LOCAL INFILE 'f': the client is asked for the file (a 0xFB packet naming it) and sends it in packets
+      // up to an empty one; the statement then runs with those bytes, and the answer is numbered after the client's
+      // last packet. A client that did not announce CLIENT_LOCAL_FILES is not asked: the statement runs with no data
+      // and is refused as MariaDB refuses it.
+      std::string local_data;
+      bool local_given = false;
+      struct LocalInfileReset { ~LocalInfileReset() { sql_set_local_infile(false, nullptr); } } local_infile_reset;
+      if (std::string local_name; !multi && load_local_infile_name(query_text, &local_name)) {
+        if (client_flags & kCapLocalFiles) {
+          std::vector<uint8_t> ask;
+          ask.push_back(0xfb);
+          ask.insert(ask.end(), local_name.begin(), local_name.end());
+          if (!send_packet(client_conn, ask.data(), ask.size(), curr_seq).ok()) break;
+          uint8_t last_seq = curr_seq;
+          bool broken = false;
+          for (;;) {
+            std::vector<uint8_t> chunk;
+            uint8_t cseq = 0;
+            if (!recv_packet(client_conn, &chunk, &cseq).ok()) { broken = true; break; }
+            last_seq = cseq;
+            if (chunk.empty()) break;
+            local_data.append((const char*)chunk.data(), chunk.size());
+          }
+          if (broken) break;
+          local_given = true;
+          curr_seq = (uint8_t)(last_seq + 1);
+        }
+        sql_set_local_infile(true, local_given ? &local_data : nullptr);
+      }
       for (size_t si = 0; si < stmts.size(); ++si) {
         const std::string& stmt_text = multi ? stmts[si] : query_text;
         const bool last = si + 1 == stmts.size();

@@ -1,0 +1,26 @@
+.timer on
+LOAD mysql_scanner; ATTACH '' AS m (TYPE mysql, READ_ONLY);
+CREATE OR REPLACE TABLE "salesorderdetails" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `salesorderdetails`'); SELECT 'salesorderdetails' AS loaded, COUNT(*) FROM "salesorderdetails";
+CREATE OR REPLACE TABLE "salesorderpaymentmethod" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `salesorderpaymentmethod`'); SELECT 'salesorderpaymentmethod' AS loaded, COUNT(*) FROM "salesorderpaymentmethod";
+CREATE OR REPLACE TABLE "salesorders" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `salesorders`'); SELECT 'salesorders' AS loaded, COUNT(*) FROM "salesorders";
+CREATE OR REPLACE TABLE "dispatch" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `dispatch`'); SELECT 'dispatch' AS loaded, COUNT(*) FROM "dispatch";
+CREATE OR REPLACE TABLE "salesordertopurchaseorder" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `salesordertopurchaseorder`'); SELECT 'salesordertopurchaseorder' AS loaded, COUNT(*) FROM "salesordertopurchaseorder";
+CREATE OR REPLACE TABLE "debtortrans" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `debtortrans`'); SELECT 'debtortrans' AS loaded, COUNT(*) FROM "debtortrans";
+CREATE OR REPLACE TABLE "locstock" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `locstock`'); SELECT 'locstock' AS loaded, COUNT(*) FROM "locstock";
+CREATE OR REPLACE TABLE "order_status" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `order_status`'); SELECT 'order_status' AS loaded, COUNT(*) FROM "order_status";
+CREATE OR REPLACE TABLE "suppliers" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `suppliers`'); SELECT 'suppliers' AS loaded, COUNT(*) FROM "suppliers";
+CREATE OR REPLACE TABLE "stockmoves" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `stockmoves`'); SELECT 'stockmoves' AS loaded, COUNT(*) FROM "stockmoves";
+CREATE OR REPLACE TABLE "oms_snoozed" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `oms_snoozed`'); SELECT 'oms_snoozed' AS loaded, COUNT(*) FROM "oms_snoozed";
+CREATE OR REPLACE TABLE "stockmaster" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `stockmaster`'); SELECT 'stockmaster' AS loaded, COUNT(*) FROM "stockmaster";
+CREATE OR REPLACE TABLE "metrc_runtime_config" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `metrc_runtime_config`'); SELECT 'metrc_runtime_config' AS loaded, COUNT(*) FROM "metrc_runtime_config";
+CREATE OR REPLACE TABLE "trackinginfo" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `trackinginfo`'); SELECT 'trackinginfo' AS loaded, COUNT(*) FROM "trackinginfo";
+CREATE OR REPLACE TABLE "shippers" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `shippers`'); SELECT 'shippers' AS loaded, COUNT(*) FROM "shippers";
+CREATE OR REPLACE TABLE "taxgroups" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `taxgroups`'); SELECT 'taxgroups' AS loaded, COUNT(*) FROM "taxgroups";
+CREATE OR REPLACE TABLE "debtorsmaster" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `debtorsmaster`'); SELECT 'debtorsmaster' AS loaded, COUNT(*) FROM "debtorsmaster";
+CREATE OR REPLACE TABLE "locationusers" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `locationusers`'); SELECT 'locationusers' AS loaded, COUNT(*) FROM "locationusers";
+CREATE OR REPLACE TABLE "authorizations" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `authorizations`'); SELECT 'authorizations' AS loaded, COUNT(*) FROM "authorizations";
+CREATE OR REPLACE TABLE "custbranch" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `custbranch`'); SELECT 'custbranch' AS loaded, COUNT(*) FROM "custbranch";
+CREATE OR REPLACE TABLE "purchorders" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `purchorders`'); SELECT 'purchorders' AS loaded, COUNT(*) FROM "purchorders";
+CREATE OR REPLACE TABLE "pickingfreeze" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `pickingfreeze`'); SELECT 'pickingfreeze' AS loaded, COUNT(*) FROM "pickingfreeze";
+CREATE OR REPLACE TABLE "tpl3pl_shipments" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `tpl3pl_shipments`'); SELECT 'tpl3pl_shipments' AS loaded, COUNT(*) FROM "tpl3pl_shipments";
+CREATE OR REPLACE TABLE "order" AS SELECT * FROM mysql_query('m', 'SELECT * FROM `order`'); SELECT 'order' AS loaded, COUNT(*) FROM "order";

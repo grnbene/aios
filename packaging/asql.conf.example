@@ -15,6 +15,10 @@ AIOS_ROOT=/opt/aios/root
 # off for a MariaDB that runs with sql_mode empty ("Strict mode" in the docs).
 #export AIOS_SQL_STRICT=1
 
+# The one directory LOAD DATA INFILE (without LOCAL) may read a file from; unset, such a statement is refused
+# (MariaDB's secure_file_priv). An absolute path; no .. and no symbolic link out of it.
+#export AIOS_SQL_SECURE_FILE_PRIV=/opt/aios/import
+
 # Raw JSON RPC socket, worker lanes, and the ASQL engine toggle.
 RPC_PORT=7311
 LANES=8

@@ -30,6 +30,8 @@ It combines in-memory columnar execution, ACID write-ahead durability, full MySQ
   - [Configuration (`/etc/aios/asql.conf`)](#configuration-etcaiosasqlconf)
   - [Operator Tools & Acceptance Checks](#operator-tools--acceptance-checks)
   - [Online Backup & Restore (`asql-export` / `asql-import`)](#online-backup--restore-asql-export--asql-import)
+  - [Loading a File (`LOAD DATA INFILE`)](#loading-a-file-load-data-infile)
+  - [Copying a MariaDB/MySQL Database (`aios sql copy`)](#copying-a-mariadbmysql-database-aios-sql-copy)
 - [Troubleshooting & FAQ](#troubleshooting--faq)
 
 ---
@@ -427,7 +429,7 @@ DROP USER 'reporter';
 ASQL implements a rich relational SQL dialect:
 
 * **DDL**: `CREATE DATABASE`, `USE`, `CREATE/DROP/ALTER TABLE`, `PRIMARY KEY` (including composite keys), `AUTO_INCREMENT`, `UNIQUE`, `DEFAULT`, `CREATE VIEW`, `CREATE TYPE ... AS ENUM`.
-* **DML**: `SELECT`, `INSERT ... VALUES`, `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `UPDATE`, `DELETE`, multi-table updates (`UPDATE a JOIN b ... SET`), and multi-table deletes.
+* **DML**: `SELECT`, `INSERT ... VALUES`, `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `LOAD DATA [LOCAL] INFILE`, `UPDATE`, `DELETE`, multi-table updates (`UPDATE a JOIN b ... SET`), and multi-table deletes.
 * **Joins**: `INNER JOIN`, `LEFT/RIGHT/FULL [OUTER] JOIN`, `CROSS JOIN`, `NATURAL JOIN`, `JOIN ... USING (...)`, and comma joins with automatic hash-join optimization.
 * **CTEs & Subqueries**: Correlated scalar subqueries, `WITH`, and `WITH RECURSIVE` (with configurable `max_recursive_iterations`).
 * **Window Functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()`, `NTILE()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()`, with `PARTITION BY`, `ORDER BY`, and `ROWS/RANGE BETWEEN` frame specifications.
@@ -514,6 +516,77 @@ packaging/asql-export.sh -o /tmp/asql-backup.tar.gz
 # Restore snapshot to another host/root:
 packaging/asql-import.sh /tmp/asql-backup.tar.gz
 ```
+
+### Loading a File (`LOAD DATA INFILE`)
+
+```sql
+LOAD DATA [LOW_PRIORITY | CONCURRENT] [LOCAL] INFILE 'file' [REPLACE | IGNORE] INTO TABLE t
+  [CHARACTER SET cs]
+  [{FIELDS | COLUMNS} [TERMINATED BY 's'] [[OPTIONALLY] ENCLOSED BY 'c'] [ESCAPED BY 'c']]
+  [LINES [STARTING BY 's'] [TERMINATED BY 's']]
+  [IGNORE n {LINES | ROWS}]
+  [(col_or_@var, ...)]
+  [SET col = expr, ...]
+```
+
+Read as MariaDB reads it: an enclosed field ends at the closing character followed by a terminator (the character twice
+is one of it); `\N` as a whole field, or the bare word `NULL` when `ENCLOSED BY` is set, is NULL; `\0 \b \n \r \t \Z` are
+those bytes and any other escaped character is itself; a line with fewer fields than columns takes the column's
+default (else NULL, else 0 or `''`) and counts a warning; `SET` and `@variables` work as in MariaDB.
+
+* **One statement.** The load is atomic: a duplicate key (without `IGNORE` or `REPLACE`) or any other error leaves none of
+  its rows, however many batches had gone in, and inside an open transaction only its own rows are taken back. It is
+  logged as `INSERT`s of 16,384 rows, so a restart or a replica never needs the file.
+* **A file on the server** (no `LOCAL`) is read only from the directory named by the environment variable
+  `AIOS_SQL_SECURE_FILE_PRIV` (an absolute path; the same idea as MariaDB's `secure_file_priv`). Unset, the statement is
+  refused (error 1290): a SQL login is not handed the server's files unless the operator names a directory. A relative
+  name is in that directory; a `..`, an absolute path outside it, or a symbolic link on the way is refused.
+* **`LOCAL`** reads the file from the client: over the wire the client sends it (`mysql --local-infile=1`), and it is never read from the server. As in MariaDB a `LOCAL` load skips duplicate keys
+  as `IGNORE` does. Capability (scoped) logins cannot run `LOAD DATA` at all.
+* **Not supported**: `LOAD XML`, `PARTITION (...)`, fixed-width rows (`TERMINATED BY ''` with no `ENCLOSED BY`),
+  loading into a view, and character sets other than utf8mb4, utf8, latin1, ascii and binary.
+* **Speed**: 500,000 rows of six columns load in 1.4-1.6 s (MariaDB's `LOAD DATA`: 0.54-0.62 s). The rows go through the
+  engine's ordinary `INSERT` path; a bulk path is not built (`docs/asql-benchmarks.md`, Test 1). For a copy from
+  another MariaDB/MySQL server use `aios sql copy` below, which appends columns in bulk.
+
+### Copying a MariaDB/MySQL Database (`aios sql copy`)
+
+A one-off copy of a live MariaDB or MySQL database into an ASQL store, over TCP or a Unix socket. It is the mirror's seeding copy with no replication stream after it, so the source needs no binary log. (`asql`, `mariadb` and `db` are other names for the `sql` command: `aios asql copy` is the same thing.)
+
+```bash
+# The store must not be open: the engine holds a lock on its root, and a second process is refused.
+systemctl stop aios-compute
+
+# Every table and view of `shop`, over TCP:
+/opt/aios/bin/aios --root /opt/aios/root sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shop
+
+# Some tables, over the source's Unix socket; `audit_log` created empty:
+/opt/aios/bin/aios --root /opt/aios/root sql copy host=/run/mysqld/mysqld.sock user=reader pass_file=/root/src.pass \
+  db=shop tables=products,orders,audit_log no_data=audit_log
+
+systemctl start aios-compute
+```
+
+| Option | Meaning |
+|---|---|
+| `host=` | A host name, or a path starting with `/` for a Unix socket. `port=` defaults to 3306. |
+| `user=`, `pass_file=` | The login. `pass_file` is read for its first line; `pass=` works too, but shows in `ps` and the shell history. |
+| `db=` | The source database. The tables land in a database of the same name here. |
+| `tables=` | `t1,t2`, or `@file` with one name per line (`#` comments allowed). Without it, every table and view is copied. |
+| `no_data=` | Tables created from their definition with no rows. |
+| `replace=1` | Copy every named table again: each one is dropped here and copied fresh. Without it, tables already present are skipped. |
+| `compress=0` | Turn off the wire's compressed protocol. It is on by default: zstd where the source offers it, otherwise zlib. |
+
+How it works (`seed_from_source` in `src/userland/sql_database.cpp`, `sql copy` in `cli/commands.cpp`):
+
+* **One snapshot.** The copy reads inside `START TRANSACTION WITH CONSISTENT SNAPSHOT` at `REPEATABLE READ`, so every table is read as of the same moment. The exception is a resumed table (below).
+* **Privileges.** `SELECT` on the tables, plus `SHOW VIEW` to read view definitions. It runs no `SUPER`, `RELOAD` or replication statement.
+* **No INSERT statements.** Each table is created from the source's `SHOW CREATE TABLE`, then read with one `SELECT *`. Rows go into the column store 16,384 at a time, the columns of each batch filled in parallel. No SQL text is built or parsed for the rows.
+* **Views stay views.** A source view is created here from `SHOW CREATE VIEW`, after the tables, so it reads the copied tables as they change. If its definition does not apply here, the copy says so, goes on to the next name, and counts it as failed.
+* **A broken connection.** A table with a single-column primary key is read in key order. If the stream breaks, the copy reconnects and continues after the last key, up to 30 times. It continues on a new snapshot, so that table can hold rows from two moments. A table without such a key is started again once from its first row. A table that still fails is reported, and the command exits with an error naming how many failed.
+* **Durable per table.** Each table is saved to the store before the next one starts, and its completion is recorded. Without `replace=1`, a rerun copies only the names that are missing here or whose copy was cut off. A table already present is skipped, even one made some other way.
+
+A measured run (2026-11-04, from a local ASQL server's Unix socket, zlib): `debtortrans`, 457,124 rows, streamed in 3.2 s, packed in 1.4 s and saved in 0.2 s. Five objects (four tables and one view) took 5.8 s, and the copied counts, totals and the view's answer matched the source.
 
 ---
 

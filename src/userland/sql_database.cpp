@@ -27917,6 +27917,16 @@ static bool starts_what_if(const std::string& sql) {
   return sql.size() - i >= 2 && strncasecmp(sql.c_str() + i, "IF", 2) == 0 && (sql.size() - i == 2 || std::isspace((unsigned char)sql[i + 2]));
 }
 
+// LOAD DATA runs as a transaction of its own (execute_load_data). Where a BEGIN takes the writer lock
+// (AIOS_TXN_CONCURRENT=0), the gateway takes it for the load the same way, before the statement lock.
+static bool loads_data(const std::string& sql) {
+  size_t i = 0;
+  while (i < sql.size() && ascii_space(sql[i])) ++i;
+  if (sql.size() - i < 4) return false;
+  for (size_t k = 0; k < 4; ++k) if (char_upper(sql[i + k]) != "LOAD"[k]) return false;
+  return i + 4 == sql.size() || !(ascii_alnum(sql[i + 4]) || sql[i + 4] == '_');
+}
+
 static bool starts_transaction(const std::string& sql) {
   size_t i = 0;
   const size_t n = sql.size();
@@ -28541,7 +28551,8 @@ SqlQueryResult SqlDatabase::execute_gateway_query_inner(const std::string& sql_q
     }
   } prelock;
   // WHAT IF's own transaction takes the writer lock the same way, before the statement lock
-  if ((begins || (g_rw_depth == 0 && starts_what_if(sql_query))) && !tls_txn.open && !tls_txn.begin_prelocked) {
+  if ((begins || (g_rw_depth == 0 && (starts_what_if(sql_query) || (!txn_concurrent() && loads_data(sql_query))))) &&
+      !tls_txn.open && !tls_txn.begin_prelocked) {
     writer_mu_.lock();
     tls_txn.begin_prelocked = true;
     prelock.db = this;
@@ -30151,7 +30162,7 @@ SqlQueryResult SqlDatabase::execute_local_query(const std::string& sql_query, co
       if (db && tls_txn.begin_prelocked) { tls_txn.begin_prelocked = false; db->writer_mu_.unlock(); }
     }
   } prelock;
-  if (g_rw_depth == 0 && !tls_txn.open && !tls_txn.begin_prelocked && !txn_concurrent() && (starts_transaction(sql_query) || starts_what_if(sql_query))) {
+  if (g_rw_depth == 0 && !tls_txn.open && !tls_txn.begin_prelocked && !txn_concurrent() && (starts_transaction(sql_query) || starts_what_if(sql_query) || loads_data(sql_query))) {
     writer_mu_.lock();
     tls_txn.begin_prelocked = true;
     prelock.db = this;
@@ -30593,6 +30604,7 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       if (defer_redo && ins.rows_affected > 0) append_redo(deferred_redo.second, deferred_redo.first);
       return ins;
     }
+    if (verb == "LOAD") return execute_load_data(q);
     if (verb == "SELECT") {
       // SELECT ... INTO @a [, @b ...]: the one row's values into the variables (1172 for more than one row).
       size_t into_at = 0;
@@ -61854,6 +61866,10 @@ static bool rewrite_view_dml(SqlDatabase* db, const std::string& sql, const SqlV
   return true;
 }
 
+// The rows for the next execute_insert on this thread, in place of a VALUES list (LOAD DATA). Taken by that call;
+// its caller clears it after the call too, so an INSERT that returns before reading it leaves nothing behind.
+thread_local std::vector<std::vector<Val>>* tls_insert_given = nullptr;
+
 SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   bool first_generated_id = true;   // LAST_INSERT_ID: the first id this statement generates
   std::vector<Token> toks;
@@ -61951,6 +61967,12 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   std::vector<std::vector<Val>> tuples;
   bool via_select = false;
   bool from_select = false;
+  // Rows handed in whole (LOAD DATA, tls_insert_given): the statement is `INSERT .. INTO t (cols)` and nothing more;
+  // the rows are values as a VALUES list's would be, and go through the same path from here.
+  if (tls_insert_given) {
+    tuples = std::move(*tls_insert_given);
+    tls_insert_given = nullptr;
+  } else
   // INSERT ... SELECT: the rows a query returns, through the same path.
   if (p.is_word("SELECT") || p.is_word("WITH") || p.is_punct("(")) {
     from_select = true;
@@ -62898,6 +62920,8 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   append_guard.armed = false;
   return res;
 }
+
+#include "sql_load_data.inc"
 
 // ---- foreign keys ------------------------------------------------------------
 // InnoDB's rules for the constraints a table declares (they used to be parsed,

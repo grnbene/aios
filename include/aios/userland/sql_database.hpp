@@ -695,6 +695,11 @@ bool sql_interrupted();
 // memory admission), waiting while the budget is taken. False: the statement
 // was KILLed while it waited. A no-op on any other thread, and below 1 MB.
 bool sql_reserve_query_memory(size_t bytes);
+// LOAD DATA LOCAL INFILE over the wire: the wire server sets, for the statement about to run on this thread, the
+// bytes the client sent for the file (null: the client did not send it - it lacks the capability, or refused), and
+// clears it after. Not set at all (the default) means the statement did not come over the wire: LOCAL reads the
+// file itself, the client being this process.
+void sql_set_local_infile(bool over_wire, const std::string* data);
 SqlWorkerContext sql_capture_worker_context();
 // Installs `in` on this thread; the previous state goes to *saved if given.
 void sql_install_worker_context(const SqlWorkerContext& in, SqlWorkerContext* saved);
@@ -4262,6 +4267,9 @@ class SqlDatabase {
   SqlQueryResult execute_create_table(const std::string& sql);
   SqlQueryResult execute_create_view(const std::string& sql);
   SqlQueryResult execute_insert(const std::string& sql);
+  // LOAD DATA [LOCAL] INFILE (sql_load_data.inc): the file's rows through execute_insert, in batches, as one
+  // statement - its own transaction, or a savepoint of the one open.
+  SqlQueryResult execute_load_data(const std::string& sql);
   SqlQueryResult execute_select(const std::string& sql);
   SqlQueryResult execute_select_single(const std::string& sql);
   SqlQueryResult execute_with(const std::string& sql);
