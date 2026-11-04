@@ -88,6 +88,43 @@ let r3 = r3d_doom_open(here, map_id, 1280, 960)
 let snapshot_sql = read_file(path_join(here, "sql/client/game_tick_finish.sql"))
 let renderer_sql = read_file(path_join(here, "sql/renderer.sql"))
 
+# The text of renderer.sql from `from` up to (not including) `to`: the classic renderer's own SQL, reused as it is.
+fn renderer_part(from, to) {
+  let a = index_of(renderer_sql, from)
+  let b = a == -1 ? -1 : index_of(slice(renderer_sql, a, len(renderer_sql)), to)
+  if a == -1 or b == -1 { error("sql/renderer.sql has no part from '" + from + "' to '" + to + "'") }
+  return slice(renderer_sql, a, a + b)
+}
+# Doom's status bar on its own (320x32, as RGB bytes), for the 3D renderer with the classic HUD: renderer.sql's
+# status bar - the CTEs after its @hud-cut - over the CTEs of it that they read, in the base palette (the flash is
+# laid over the whole screen, bar and all, as Doom's palette change was). The tic's worker runs it, so the player
+# and map are literals rather than the main connection's @ variables.
+let status_bar_sql = renderer_part("WITH RECURSIVE render_context AS (", "), pos AS (") +
+  "), render_settings AS (SELECT 168 AS screen_h),\n" +
+  renderer_part("player_ui_state AS (", "active_palette AS (") +
+  "active_palette AS (SELECT 0 AS pal),\n" +
+  renderer_part("palette_map AS (", "view_colored AS (") +
+  renderer_part("weapon_ownership AS (", "SELECT CONCAT(") +
+  "SELECT GROUP_CONCAT(rgb ORDER BY pix SEPARATOR '') AS bar_rgb FROM ui_colored"
+fn status_bar_query(mid, pid, sk) {
+  return replace(replace(replace(status_bar_sql, "@map_id", str(mid)), "@player_thing_id", str(pid)), "@skill", str(sk))
+}
+
+# The screen flashes (pain, pickups, radiation suit) for the 3D renderer: each palette's tint and amount, from the
+# WAD's palettes (sql/client/flash_tints.sql), as the colour laid over the screen.
+let flash_fill = {}
+for ft in sql(read_file(path_join(here, "sql/client/flash_tints.sql"))) {
+  flash_fill[str(ft.pal)] = format("#{:02x}{:02x}{:02x}{:02x}", ft.r, ft.g, ft.b, int(round(min(1.0, max(0.0, ft.amount)) * 255.0)))
+}
+# Doom's palette for the moment (ST_doPaletteStuff, as renderer.sql's active_palette has it): red while hurt, gold
+# after a pickup, the radiation suit's green (blinking as it runs out); 0 for none.
+fn flash_palette(damage, bonus, radsuit) {
+  if damage > 0 { return min(7, int((damage + 7) / 8)) + 1 }
+  if bonus > 0 { return min(3, int((bonus + 7) / 8)) + 9 }
+  if radsuit > 128 or (radsuit % 16) >= 8 { return 13 }
+  return 0
+}
+
 sql("SELECT doom_reset_stage(" + str(map_id) + ", " + str(skill) + ")")
 sql("SELECT doom_spawn_player(" + str(map_id) + ", " + str(player) + ")")
 sql("UPDATE player_weapons SET state = 'ready', sy = 32.0 WHERE map_id = " + str(map_id))
@@ -125,7 +162,13 @@ let status = "E1M1"
 let level_over = false
 let frame = canvas_create(320, 200)
 
+# hud_mode: the renderer ("modern": the 3D one; "classic": the 320x200 SQL one). hud_style: the HUD drawn over it,
+# whichever renderer ("modern": the cards; "classic": Doom's status bar). SQLDOOM_HUD=classic starts with the bar.
 let hud_mode = "modern"
+let hud_style = env("SQLDOOM_HUD", "modern") == "classic" ? "classic" : "modern"
+# Doom's status bar for the 3D renderer with the classic HUD, as the tic's worker last drew it
+let status_bar = canvas_create(320, 32)
+let status_bar_ready = false
 let texture_filtering = true
 let jump_enabled = true
 let crt_enabled = false
@@ -139,17 +182,20 @@ fn toggle_menu_item(idx) {
     # Display Preset: toggle between Modern 2026 and Classic 1993
     if hud_mode == "modern" {
       hud_mode = "classic"
+      hud_style = "classic"
       texture_filtering = false
       jump_enabled = false
     } else {
       hud_mode = "modern"
+      hud_style = "modern"
       texture_filtering = true
       jump_enabled = true
     }
   } else if idx == 1 {
     texture_filtering = not texture_filtering
   } else if idx == 2 {
-    hud_mode = hud_mode == "modern" ? "classic" : "modern"
+    # the HUD alone: the renderer stays as it is
+    hud_style = hud_style == "modern" ? "classic" : "modern"
   } else if idx == 3 {
     jump_enabled = not jump_enabled
   } else if idx == 4 {
@@ -168,6 +214,12 @@ let cur_cells = 0
 let has_blue = false
 let has_yellow = false
 let has_red = false
+# the tic counters Doom's screen flashes run on (player_state): pain, pickups, the radiation suit
+let cur_damage = 0
+let cur_bonus = 0
+let cur_radsuit = 0
+# where the last tic left the player (x,y), for the headless run's lines
+let cur_at = ""
 
 let interact_prompt = nil
 let toast_msg = nil
@@ -306,7 +358,8 @@ fn tic_command() {
 fn scene_inputs() {
   if hud_mode != "modern" { return nil }
   return {"cam0": bind(camera_sql, [map_id, player, 0.0]), "cam1": bind(camera_sql, [map_id, player, 1.0]),
-          "geo": r3.geo, "things": r3.things, "psprite": r3.psprite, "map_id": map_id, "player": player, "skill": skill, "tic": tics + 1}
+          "geo": r3.geo, "things": r3.things, "psprite": r3.psprite, "map_id": map_id, "player": player, "skill": skill, "tic": tics + 1,
+          "bar": hud_style == "classic" ? status_bar_query(map_id, player, skill) : nil}
 }
 
 fn run_tic() {
@@ -372,6 +425,7 @@ fn tic_sql(qs, snap_q, sc) {
   scene.p0 = len(c0) > 0 ? c0[0] : p1
   scene.p1 = p1
   scene.interact = interact_prompt_of(_raw_sql(interact_query(p1.x, p1.y, p1.angle, sc.map_id)))
+  scene.bar = sc.bar == nil ? nil : _raw_sql(sc.bar)[0].bar_rgb
   out.scene = scene
   out.ms = clock() - t0
   return out
@@ -394,6 +448,10 @@ fn finish_tic(res, use, t0) {
     has_blue = s.key_blue == 1
     has_yellow = s.key_yellow == 1
     has_red = s.key_red == 1
+    cur_damage = s.damage_count == nil ? 0 : s.damage_count
+    cur_bonus = s.bonus_count == nil ? 0 : s.bonus_count
+    cur_radsuit = s.radsuit_tics == nil ? 0 : s.radsuit_tics
+    cur_at = format("{:.0f},{:.0f}", s.position_x, s.position_y)
 
     if use {
       if s.use_activated == 1 {
@@ -420,6 +478,13 @@ fn finish_tic(res, use, t0) {
     prev_scene = cur_scene
     cur_scene = res.scene
     interact_prompt = cur_scene.interact
+    if cur_scene.bar != nil {
+      if len(cur_scene.bar) != 320 * 32 * 3 {
+        error(format("the status bar query gave {} bytes, not the {} of 320x32 RGB (sql/renderer.sql's bar)", len(cur_scene.bar), 320 * 32 * 3))
+      }
+      canvas_set_pixels(status_bar, cur_scene.bar)
+      status_bar_ready = true
+    }
   } else if res.scene != nil {
     cur_scene = nil
     prev_scene = nil
@@ -453,7 +518,7 @@ fn render_frame() {
   }
 
   let pose_changed = (p.x != last_render_x or p.y != last_render_y or p.z != last_render_z or p.angle != last_render_angle)
-  let hud_changed = (hud_mode != last_render_hud)
+  let hud_changed = (hud_mode + "/" + hud_style != last_render_hud)
   let movers_active = (clock() < movers_active_until)
   let weapon_active = (clock() < weapon_firing_until)
   let periodic_tic = (tics - last_frame_tic >= 15)
@@ -472,11 +537,12 @@ fn render_frame() {
   last_render_y = p.y
   last_render_z = p.z
   last_render_angle = p.angle
-  last_render_hud = hud_mode
+  last_render_hud = hud_mode + "/" + hud_style
   last_sql_time = now
 
   let render_q = renderer_sql
-  if hud_mode == "modern" {
+  # the modern HUD over the classic renderer: the whole 200 rows are the view, the bar left out
+  if hud_style == "modern" {
     render_q = replace(render_q, "COALESCE(@screen_h, 200) AS screen_h,", "200 AS screen_h,")
     let cut_pos = index_of(render_q, "-- @hud-cut")
     if cut_pos != -1 {
@@ -562,6 +628,32 @@ fn run_due_tics(wait_ms) {
   }
 }
 
+# The picture on a 1280x960 canvas: the 3D renderer's (with Doom's status bar under it for the classic HUD, and the
+# screen flash over both, as Doom's palette change took the whole screen), or the classic renderer's 320x200 scaled
+# up (its flash and bar are its SQL's own).
+fn draw_world(cv) {
+  if hud_mode == "modern" {
+    canvas_draw_image(cv, r3.canvas, 0, 0)
+    if hud_style == "classic" and status_bar_ready {
+      canvas_set_image_smoothing(cv, texture_filtering)
+      canvas_save(cv)
+      canvas_translate(cv, 0, 960 - 32 * 4.8)
+      canvas_scale(cv, 4, 4.8)
+      canvas_draw_image(cv, status_bar, 0, 0)
+      canvas_restore(cv)
+    }
+    let fill = get(flash_fill, str(flash_palette(cur_damage, cur_bonus, cur_radsuit)), nil)
+    if fill != nil { canvas_fill_rect(cv, 0, 0, 1280, 960, fill) }
+  } else {
+    canvas_set_image_smoothing(cv, texture_filtering)
+    canvas_clear(cv, "#000000")
+    canvas_save(cv)
+    canvas_scale(cv, 4, 4.8)
+    canvas_draw_image(cv, frame, 0, 0)
+    canvas_restore(cv)
+  }
+}
+
 let pane_frames = int(env("SQLDOOM_PANE_FRAMES", "0"))
 let fps_t0 = nil
 let fps_tics0 = 0
@@ -606,17 +698,7 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
       fps_tics0 = tics
     }
 
-    # Modern 2026 Remastering Engine vs Classic 1993 Presentation
-    if hud_mode == "modern" {
-      canvas_draw_image(cv, r3.canvas, 0, 0)
-    } else {
-      canvas_set_image_smoothing(cv, texture_filtering)
-      canvas_clear(cv, "#000000")
-      canvas_save(cv)
-      canvas_scale(cv, 4, 4.8)
-      canvas_draw_image(cv, frame, 0, 0)
-      canvas_restore(cv)
-    }
+    draw_world(cv)
 
     # Modern 2026 Precision Crosshair
     if hud_mode == "modern" {
@@ -685,7 +767,7 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
     canvas_fill_text(cv, fps_txt, r_x + 16, 16 + int((36 - r_tm.height) / 2), "#10b981")
 
     # Modern 2026 Status HUD (Cleanly separated label, value, and progress bar)
-    if hud_mode == "modern" {
+    if hud_style == "modern" {
       # Health Card (Bottom-Left: y=836, h=76)
       canvas_fill_round_rect(cv, 24, 836, 240, 76, 8, "#030712d8")
       canvas_stroke_round_rect(cv, 24, 836, 240, 76, 8, "#22c55e44", 1)
@@ -718,8 +800,8 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
       if am_w > 0 { canvas_fill_round_rect(cv, 1032, 894, am_w, 6, 3, "#38bdf8") }
     }
 
-    # Sleek footer controls bar (shown in Modern mode so Classic status bar remains unobstructed)
-    if hud_mode == "modern" {
+    # Sleek footer controls bar (shown with the modern HUD so Classic status bar remains unobstructed)
+    if hud_style == "modern" {
       canvas_fill_rect(cv, 0, 920, 1280, 40, "#020617ee")
       let foot_txt = "WASD: Move  •  Space: Jump  •  E: Use  •  Mouse: Look  •  Shift: Walk  •  Esc: Settings Menu  •  C: Scanlines"
       let fm = canvas_measure_text(cv, foot_txt)
@@ -746,7 +828,7 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
       let items = [
         {"label": "Game Experience", "val": hud_mode == "modern" ? "Modern 2026 Remaster" : "Classic 1993 Retro", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
         {"label": "Environment & Monsters", "val": texture_filtering ? "Remastered (Modern 2026)" : "Classic Original (1993)", "col": texture_filtering ? "#22c55e" : "#f59e0b"},
-        {"label": "HUD Interface", "val": hud_mode == "modern" ? "2026 Cyber Vector" : "1993 Classic Bar", "col": hud_mode == "modern" ? "#38bdf8" : "#f59e0b"},
+        {"label": "HUD Interface", "val": hud_style == "modern" ? "2026 Cyber Vector" : "1993 Classic Bar", "col": hud_style == "modern" ? "#38bdf8" : "#f59e0b"},
         {"label": "Jump Physics", "val": jump_enabled ? "Enabled (Space)" : "Disabled", "col": jump_enabled ? "#22c55e" : "#64748b"},
         {"label": "CRT Scanlines", "val": crt_enabled ? "Enabled" : "Disabled", "col": crt_enabled ? "#22c55e" : "#64748b"}
       ]
@@ -929,9 +1011,17 @@ if frames > 0 {
     run_tic()
     let t0 = clock()
     render_frame()
-    print(status + format(", frame {:.0f} ms", clock() - t0))
+    let fp = flash_palette(cur_damage, cur_bonus, cur_radsuit)
+    print(status + format(", frame {:.0f} ms, at {} health {} bullets {}", clock() - t0, cur_at, cur_health, cur_bullets) + (fp > 0 ? format(", flash palette {} (pain {}, pickup {})", fp, cur_damage, cur_bonus) : ""))
   }
-  canvas_save_png(hud_mode == "modern" ? r3.canvas : frame, env("SQLDOOM_SHOT", "frame.png"))
+  if hud_mode == "modern" {
+    # the 3D picture as the window has it under its HUD text: the classic bar and the screen flash with it
+    let shot = canvas_create(1280, 960)
+    draw_world(shot)
+    canvas_save_png(shot, env("SQLDOOM_SHOT", "frame.png"))
+  } else {
+    canvas_save_png(frame, env("SQLDOOM_SHOT", "frame.png"))
+  }
 } else {
   let script = []
   for k in split(env("SQLDOOM_TEST_KEYS", ""), ",") {

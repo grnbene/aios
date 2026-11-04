@@ -53,7 +53,7 @@ boss_exit AS (
 SELECT
   ps.position_x,ps.position_y,ps.view_angle,ps.view_z,ps.alive,
   ps.health,ps.armor,ps.ammo_bullets,ps.ammo_shells,ps.ammo_rockets,ps.ammo_cells,
-  ps.key_blue,ps.key_yellow,ps.key_red,ps.damage_count,ps.bonus_count,ps.message,ps.message_tics,
+  ps.key_blue,ps.key_yellow,ps.key_red,ps.damage_count,ps.bonus_count,ps.radsuit_tics,ps.message,ps.message_tics,
   COALESCE(ur.locked,FALSE) AS use_locked,
   CASE WHEN COALESCE(ur.locked,FALSE) THEN usd.key_required::text END
     AS required_key,
