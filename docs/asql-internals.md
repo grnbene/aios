@@ -1,4 +1,7 @@
-# ASQL: the SQL engine, its MySQL wire, replication, Things and Cells
+# ASQL Internals: engine architecture, MySQL wire, replication, Things, Cells & verification
+
+> [!NOTE]
+> For the developer quickstart, client integrations (Grain, Python, Node, PHP), and high-level user guide, see [`README-ASQL.md`](../README-ASQL.md). This document provides the deep architectural specification, low-level engine internals, and verbatim test verification transcripts.
 
 ASQL is the relational engine inside AIOS. Tables live in memory and are saved
 to the kernel root. It speaks the MySQL wire protocol, so the stock `mysql`
@@ -30,6 +33,63 @@ Sources: `src/userland/sql_database.cpp`, `include/aios/userland/sql_database.hp
 
 ---
 
+## Table of Contents
+
+- [Four ways to start it](#four-ways-to-start-it)
+  - [`sql serve`: the quickest server](#sql-serve-the-quickest-server)
+  - [`compute serve sql=1`: the production path](#compute-serve-sql1-the-production-path)
+  - [`aios-engine`: the standalone engine](#aios-engine-the-standalone-engine)
+  - [The capability key](#the-capability-key)
+  - [Running one statement with no server](#running-one-statement-with-no-server)
+  - [Copying a live database (`sql copy`)](#copying-a-live-database-sql-copy)
+  - [The operator tools](#the-operator-tools)
+- [Rounding: where ASQL answers differently from MariaDB](#rounding-where-asql-answers-differently-from-mariadb-on-purpose)
+- [Connecting and querying from Grain](#connecting-and-querying-from-grain)
+  - [1. In-process engine: `sql()` and `sql_on()`](#1-in-process-engine-sql-and-sql_on)
+  - [2. Wire client protocol: `db_connect()`, `db_query()`, `db_transaction()`](#2-wire-client-protocol-db_connect-db_query-db_transaction)
+  - [3. Loopback one-shot helpers: `asql_query()` and `asql_exec()`](#3-loopback-one-shot-helpers-asql_query-and-asql_exec)
+  - [4. Reactive polling: `live()`](#4-reactive-polling-live)
+- [Connection profiles: `connections.ini`](#connection-profiles-connectionsini)
+- [`ASQL_CHANGES()`: has a table been written](#asql_changes-has-a-table-been-written)
+- [Write modes: local, write-through, write-behind](#write-modes-local-write-through-write-behind)
+- [Replicating a MariaDB (binlog CDC)](#replicating-a-mariadb-binlog-cdc)
+  - [What the upstream needs](#what-the-upstream-needs)
+  - [The `compute serve` path (seeds, then streams)](#the-compute-serve-path-seeds-then-streams)
+  - [The `aios-engine` path](#the-aios-engine-path)
+- [Things: Grouped Query Results & Reactive Actions](#things)
+  - [Syntax (aggregate and row Things)](#syntax-aggregate-and-row-things)
+  - [Things and transactions](#things-and-transactions)
+  - [`AS OF`: a Thing as it stood at a moment](#as-of-a-thing-as-it-stood-at-a-moment)
+  - [`EXPLAIN THING`: the rows behind a value](#explain-thing-the-rows-behind-a-value)
+  - [`INTO`: a Thing as a table, and Things built on Things](#into-a-thing-as-a-table-and-things-built-on-things)
+  - [`WHAT IF`: a write's effect on the Things, before it is made](#what-if-a-writes-effect-on-the-things-before-it-is-made)
+  - [`WAIT THING`: told when a Thing changes](#wait-thing-told-when-a-thing-changes)
+  - [Resources and claims: allocating stock to orders](#resources-and-claims-allocating-stock-to-orders)
+  - [Event Things: a program that runs once, at a set time](#event-things-a-program-that-runs-once-at-a-set-time)
+  - [Grain Things](#grain-things)
+  - [Conflicts: `SOURCE BY` keeps both sides](#conflicts-source-by-keeps-both-sides)
+  - [Settling conflicts together, and checking the picks](#settling-conflicts-together-and-checking-the-picks)
+  - [Worked examples](#worked-example-a-running-total-per-customer)
+- [Cells: Per-key Counters, Bits & Notifications](#cells)
+  - [Syntax](#syntax)
+  - [NOTIFY templates](#notify-templates)
+  - [Secrets](#secrets)
+  - [Mailers](#mailers)
+  - [Worked examples & Production alert rules](#worked-example-picking-progress-per-order-with-notify)
+- [Active data: filters, caches, links, views](#active-data-filters-caches-links-views)
+- [Transactions: rollback, and running them side by side](#transactions-rollback-and-running-them-side-by-side)
+- [Durability: redo log, group commit, checkpoints](#durability-redo-log-group-commit-checkpoints)
+- [Admission: query memory and connections](#admission-query-memory-and-connections)
+- [Storage compression: table files and columns](#storage-compression-table-files-and-columns)
+- [Strict mode: `AIOS_SQL_STRICT=1`](#strict-mode-aios_sql_strict1)
+- [Prepared statements, typed columns, DISTINCT](#prepared-statements-typed-columns-distinct)
+- [What SQL works, and its gaps](#what-sql-works-and-its-gaps)
+  - [PostgreSQL's spellings](#postgresqls-spellings)
+  - [Window functions](#window-functions)
+- [Running it as a service](#running-it-as-a-service)
+
+---
+
 ## Four ways to start it
 
 | Entry point | Store directory | Wire accounts | Unix socket | Replication | Use it for |
@@ -56,7 +116,7 @@ Ready for Navicat, DBeaver, TablePlus, and MySQL CLI connections.
 
 `port=` defaults to 3307 and `bind=` to `0.0.0.0`. It takes no account. The
 wire's rule with no account is that only loopback clients get in, with any
-user name and any password (`mysql_wire.cpp:1831`). A remote client is refused
+user name and any password (`mysql_wire.cpp:2595`). A remote client is refused
 even when `bind=0.0.0.0`.
 
 ```
@@ -128,7 +188,7 @@ $ mysql -S /tmp/aios-docs-asql/r7.sock -u app -e "select 1"
 ERROR 1045 (28000): Access denied for user 'app'
 ```
 
-These keys are read in `cli/commands.cpp` (`compute serve`, about lines 2261-2482):
+These keys are read in `cli/commands.cpp` (`compute serve`, lines 2970-3290):
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -153,7 +213,7 @@ created mode `srw-rw-rw-`. Access is by password, not by file mode.
 
 **The RPC `sql` op only reads.** It is a 4-byte big-endian length followed by
 a JSON object. It takes `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `WITH` and
-replication control, and refuses everything else (`compute_serve.cpp:175`):
+replication control, and refuses everything else (`compute_serve.cpp:181`):
 
 ```
 $ python3 rpc.py '{"op":"sql","token":"tok123","db":"shop","query":"SELECT id, name FROM items ORDER BY id"}'
@@ -274,8 +334,7 @@ Machines that must accept each other's tokens share the file.
 
 ### Running one statement with no server
 
-`aios sql` opens `<root>/sql_db` directly. Do not run it against a store a
-running server has open.
+`aios sql` opens `<root>/sql_db` directly.
 
 ```
 $ AIOS_NO_ACCEL=1 aios --root /tmp/aios-docs-asql/r7 exec 'sql query "SELECT * FROM shop.items"'

@@ -66,6 +66,10 @@ struct Ins {
   const ColumnStore* cs = nullptr;
   std::vector<uint32_t> args;
   std::shared_ptr<const RowInSet> set;   // TupleIn: the subquery's rows
+  // CodeI of text_col [NOT] IN (SELECT ..) (sub_in): the IN node and the set its truths per code were read from -
+  // the program holds only while the node still has that set (valid)
+  const SqlExpr* in_node = nullptr;
+  std::shared_ptr<const InLookupSet> in_set;
   // CodeI / CodeF: the dictionary's entries as numbers, one per code, shared across the programs that read the
   // column (CodeTable); StrIn: 1 per code where the entry matches.
   // temporal: a date column's table over its codes (days past `base`, 1 << bits of them), not a dictionary's
@@ -771,6 +775,7 @@ struct Compiler {
         return e->negated ? unary(Ins::Not, both, Ty::I64, false) : both;
       }
       case ExprOp::In: {
+        if (e->args.size() == 1 && !e->subquery_sql.empty()) return sub_in(e);
         // text_col IN ('a', 'b'): literals only, the column dictionary-coded
         if (e->args.size() < 2) return fail();
         const SqlExpr* col = e->args[0].get();
@@ -1026,6 +1031,61 @@ struct Compiler {
     }
   }
 
+  // text_col [NOT] IN (SELECT ..) whose subquery has run and read nothing from outside: the truth of each of the
+  // column's dictionary entries, read from the subquery's set as the interpreter reads it (InLookupSet::contains of
+  // the entry's text - a text value meets the set by its text alone), NULL where it is not found and the set holds
+  // a NULL; a NULL cell is NULL. A set of no rows: the IN is false (NOT IN true) for every row, a NULL cell too. A
+  // set not run yet is left to the interpreter this time (retry; conjunct_truths runs it first).
+  uint32_t sub_in(const SqlExpr* e) {
+    const SqlExpr* col = e->args[0].get();
+    if (!col || col->op != ExprOp::Column) return fail("IN (SELECT ..) of an expression");
+    std::shared_ptr<const InLookupSet> set;
+    {
+      std::unique_lock<aios::hal::Mutex> lock;
+      if (e->sub_mu) lock = std::unique_lock<aios::hal::Mutex>(*e->sub_mu);
+      if (e->sub_evaluated && !e->sub_correlated) set = e->sub_set;
+    }
+    if (!set) { retry = true; return fail("IN set not run yet"); }
+    size_t s = 0, c = 0;
+    if (!place(col, &s, &c)) return fail("column not in this scope");
+    const SqlTable* t = (*ctx.sources)[s].table;
+    const SqlColumn& sc = t->columns[c];
+    const ColumnStore& cs = t->col_data[c];
+    // a result table's "text" may be numbers, read as numbers: only a declared text column
+    if (t->inferred_types || sc.type != SqlDataType::Text || sc.temporal || cs.shared_dict || !vx::dict_coded(cs))
+      return fail("IN (SELECT ..) of a column not dictionary-coded text");
+    const size_t n = vx::dict_size(cs);
+    if (n == 0 || n > (1u << 20)) return fail("dictionary too large");
+    if (!set->has_null && !set->has_numeric && !set->has_string) {
+      Ins k;
+      k.op = Ins::Konst;
+      k.ty = Ty::I64;
+      k.ki = e->negated ? 1 : 0;
+      k.in_node = e;   // while the set is still empty
+      k.in_set = std::move(set);
+      return emit(std::move(k));
+    }
+    auto tb = std::make_shared<Ins::CodeTable>();
+    tb->i.assign(n, 0);
+    tb->null.assign(n, 0);
+    for (size_t k = 0; k < n; ++k) {
+      const std::string& d = vx::dict_entry(cs, (uint32_t)k);
+      if (sql_is_null(d)) { tb->null[k] = 1; continue; }
+      const bool hit = set->contains(val_text(d));
+      if (!hit && set->has_null) { tb->null[k] = 1; continue; }
+      tb->i[k] = e->negated ? !hit : hit;
+    }
+    Ins in;
+    in.op = Ins::CodeI;
+    in.ty = Ty::I64;
+    in.src = (uint32_t)s;
+    in.cs = &cs;
+    in.codes = std::move(tb);
+    in.in_node = e;
+    in.in_set = std::move(set);
+    return emit(std::move(in));
+  }
+
   // (a, b) [NOT] IN (SELECT x, y ..) whose subquery has run and read nothing from outside, and whose rows are all
   // numbers (RowInSet::by_tuple): each row's tuple is one lookup. A set not run yet is left to the interpreter
   // this time, and tried again on the next statement (retry).
@@ -1164,9 +1224,12 @@ struct Compiler {
 
 
 // The program for e over ctx's sources, or null.
-inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::string* why = nullptr, bool* retry = nullptr) {
+// bare_column: a bare column too (program_for leaves those to the column readers - nothing to gain for one - but a
+// caller that wants a column's values exactly as a program around it reads them asks for one: a grouped pivot's x).
+inline std::shared_ptr<Prog> compile(const SqlExpr* e, const EvalCtx& ctx, std::string* why = nullptr, bool* retry = nullptr,
+                                     bool bare_column = false) {
   if (!enabled() || !e || !ctx.sources) return nullptr;
-  if (e->op == ExprOp::Literal || e->op == ExprOp::Column) return nullptr;   // nothing to gain
+  if (e->op == ExprOp::Literal || (e->op == ExprOp::Column && !bare_column)) return nullptr;   // nothing to gain
   auto P = std::make_shared<Prog>();
   literal_sig(e, &P->lit_sig);
   P->pg_division = tls_pg_division;
@@ -1230,6 +1293,14 @@ struct Lanes {
   size_t total_rows = 0;
   struct Cached { std::vector<int64_t> i; std::vector<double> f; std::vector<uint32_t> c; bool ints = false, dbls = false, codes = false; };
   std::unordered_map<const ColumnStore*, Cached> cols;
+  // A run-length column the decode above leaves alone (much larger than this row set: a part of a scan's survivors
+  // over a big table) is read through a cursor on its runs. The rows come in increasing order (a scan's survivors, a
+  // part's range of them), so a row is in the run the last one was in or a few runs on: a step, a search only on a
+  // jump. Each row was a search over the runs (rle_find_run, then rle_get_end_row walking up to 32 run lengths
+  // again): a third of thisoverlast's CPU over 3.2M of stockmoves' 12.5M rows, the scan in 8 parts of 400k each.
+  struct RleCur { size_t ri = SIZE_MAX, start = 0, end = 0; uint32_t code = 0; };
+  std::unordered_map<const ColumnStore*, RleCur> rle;
+  RleCur* rle_cursor(const ColumnStore& cs) { return cs.encoding == ColumnEncoding::RLE && cs.rle_num_runs ? &rle[&cs] : nullptr; }
   Cached* cached(const ColumnStore& cs) {
     const size_t sz = cs.size();
     if (sz > std::max<size_t>(4096, total_rows * 16)) return nullptr;
@@ -1284,10 +1355,39 @@ struct Lanes {
     if (total_rows == total) return;
     total_rows = total;
     cols.clear();
+    rle.clear();
     rid.clear();
     rid_ok.clear();
   }
 };
+
+// Row r's code in RLE column cs through cursor c (Lanes::rle_cursor): the code decode_codes gives for r.
+inline uint32_t rle_code_at(const ColumnStore& cs, Lanes::RleCur& c, size_t r) {
+  if (r >= c.start && r < c.end) return c.code;
+  if (c.ri != SIZE_MAX && r >= c.end) {
+    // a few runs on: stepped to, each run's length read once
+    size_t ri = c.ri, start = c.start, end = c.end;
+    for (int step = 0; step < 16 && ri + 1 < cs.rle_num_runs; ++step) {
+      ++ri;
+      start = end;
+      end = start + cs.rle_get_length(ri);
+      if (r < end) {
+        c.ri = ri; c.start = start; c.end = end; c.code = cs.rle_get_code(ri);
+        return c.code;
+      }
+    }
+  }
+  c.ri = cs.rle_find_run(r);
+  c.start = cs.rle_get_start_row(c.ri);
+  c.end = c.start + cs.rle_get_length(c.ri);
+  while (r >= c.end && c.ri + 1 < cs.rle_num_runs) {   // as decode_codes walks on from the run it was given
+    ++c.ri;
+    c.start = c.end;
+    c.end = c.start + cs.rle_get_length(c.ri);
+  }
+  c.code = cs.rle_get_code(c.ri);
+  return c.code;
+}
 
 // A DOUBLE rounded to a whole number as the interpreter rounds it (round_value -> round_double_as_written): half
 // away from zero on its 15 significant digits as written. Writing the double out and reading it back is ~300 ns,
@@ -1332,10 +1432,11 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
         const ColumnStore& cs = *in.cs;
         const int64_t hi = (int64_t)((uint64_t)(in.slot + 1) << 32);
         const uint32_t* cc = L.codes(cs);
+        Lanes::RleCur* rc = cc ? nullptr : L.rle_cursor(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          vi[j] = hi | (int64_t)(cc ? cc[r] : vx::code_at(cs, r));
+          vi[j] = hi | (int64_t)(cc ? cc[r] : rc ? rle_code_at(cs, *rc, r) : vx::code_at(cs, r));
         }
         break;
       }
@@ -1357,10 +1458,11 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
       case Ins::CodeI: case Ins::CodeF: {
         const ColumnStore& cs = *in.cs;
         const uint32_t* cc = L.codes(cs);
+        Lanes::RleCur* rc = cc ? nullptr : L.rle_cursor(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          const uint32_t k = cc ? cc[r] : vx::code_at(cs, r);
+          const uint32_t k = cc ? cc[r] : rc ? rle_code_at(cs, *rc, r) : vx::code_at(cs, r);
           if (k >= in.code_count() || in.code_is_null(k)) { nl[j] = 1; continue; }
           if (in.op == Ins::CodeI) vi[j] = in.code_i()[k]; else vf[j] = in.code_f()[k];
         }
@@ -1377,10 +1479,11 @@ inline bool eval_ins(const Prog& P, size_t x, RowId&& rowid, size_t n, Lanes& L,
       case Ins::StrIn: {
         const ColumnStore& cs = *in.cs;
         const uint32_t* cc = L.codes(cs);
+        Lanes::RleCur* rc = cc ? nullptr : L.rle_cursor(cs);
         for (size_t j = 0; j < n; ++j) {
           const size_t r = row_of(j);
           if (r == kNullRow || r >= cs.size() || cs.is_null(r)) { nl[j] = 1; continue; }
-          const uint32_t k = cc ? cc[r] : vx::code_at(cs, r);
+          const uint32_t k = cc ? cc[r] : rc ? rle_code_at(cs, *rc, r) : vx::code_at(cs, r);
           vi[j] = k < in.code_null.size() && in.code_null[k] ? 1 : 0;
         }
         break;
@@ -1856,6 +1959,9 @@ inline std::string text_at(const Prog& P, const Lanes& L, size_t j) {
 struct Column {
   Ty ty = Ty::I64;
   bool approx = false, uns = false;
+  // Str as the program's text references in i (Prog::text_of), no strings made: a caller that only tells texts
+  // apart (a GROUP BY key's classes) asked for them (eval_column's refs)
+  bool refs = false;
   std::vector<int64_t> i;
   std::vector<double> f;
   std::vector<uint8_t> n;
@@ -1887,12 +1993,14 @@ struct Column {
 // `shared`: a Lanes kept by the caller across the programs it runs over the same row set (a projection's items):
 // the row ids per source and the decoded columns are then worked out once for all of them.
 template <typename RowAt>
-inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out, std::string* err, Lanes* shared = nullptr) {
+inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out, std::string* err, Lanes* shared = nullptr,
+                        bool refs = false) {
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
+  out->refs = refs && o.ty == Ty::Str;
   out->n.assign(total, 0);
-  if (o.ty == Ty::Str) out->s.assign(total, std::string());
-  else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
+  if (o.ty == Ty::Str && !out->refs) out->s.assign(total, std::string());
+  else if (o.ty == Ty::I64 || out->refs) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes own;
   Lanes& L = shared ? *shared : own;
   if (shared) L.reset_for(total); else L.total_rows = total;
@@ -1910,8 +2018,8 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
     auto rowid = [&](size_t j, uint32_t src) -> size_t { return src < rs.size() && rs[src] ? rs[src][at + j] : kNullRow; };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
-    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
-    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    if (o.ty == Ty::Str && !out->refs) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64 || out->refs) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
     else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
   }
   return true;
@@ -1919,12 +2027,14 @@ inline bool eval_column(const Prog& P, RowAt&& rowat, size_t total, Column* out,
 
 // P over rows given as one row-id column per source (a star join's arrays: ids[src][first + j], UINT32_MAX for a
 // NULL-padded row), rows first .. first + total: no joined row made.
-inline bool eval_column_srcs(const Prog& P, const std::vector<const uint32_t*>& ids, size_t first, size_t total, Column* out, std::string* err) {
+inline bool eval_column_srcs(const Prog& P, const std::vector<const uint32_t*>& ids, size_t first, size_t total, Column* out, std::string* err,
+                             bool refs = false) {
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
+  out->refs = refs && o.ty == Ty::Str;
   out->n.assign(total, 0);
-  if (o.ty == Ty::Str) out->s.assign(total, std::string());
-  else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
+  if (o.ty == Ty::Str && !out->refs) out->s.assign(total, std::string());
+  else if (o.ty == Ty::I64 || out->refs) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
   L.total_rows = total;
   const size_t chunk = 4096;
@@ -1938,8 +2048,8 @@ inline bool eval_column_srcs(const Prog& P, const std::vector<const uint32_t*>& 
     };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
-    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
-    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    if (o.ty == Ty::Str && !out->refs) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64 || out->refs) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
     else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
   }
   return true;
@@ -1951,6 +2061,7 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
   const Ins& o = P.out();
   out->ty = o.ty; out->approx = o.approx; out->uns = o.uns;
   out->n.assign(total, 0);
+  out->refs = false;
   if (o.ty == Ty::Str) out->s.assign(total, std::string());
   else if (o.ty == Ty::I64) out->i.assign(total, 0); else out->f.assign(total, 0);
   Lanes L;
@@ -1962,8 +2073,8 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
     auto rowid = [&](size_t j, uint32_t src) -> size_t { return src == 0 ? (size_t)ids(at + j) : kNullRow; };
     if (!eval(P, rowid, n, L, err)) return false;
     std::memcpy(out->n.data() + at, L.n[K].data(), n);
-    if (o.ty == Ty::Str) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
-    else if (o.ty == Ty::I64) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
+    if (o.ty == Ty::Str && !out->refs) { for (size_t j = 0; j < n; ++j) if (!L.n[K][j]) out->s[at + j] = std::string(P.text_of(L.i[K][j])); }
+    else if (o.ty == Ty::I64 || out->refs) std::memcpy(out->i.data() + at, L.i[K].data(), n * sizeof(int64_t));
     else std::memcpy(out->f.data() + at, L.f[K].data(), n * sizeof(double));
   }
   return true;
@@ -1974,6 +2085,12 @@ inline bool eval_column_ids(const Prog& P, Ids&& ids, size_t total, Column* out,
 inline bool valid(const Prog& P, const EvalCtx& ctx) {
   if (!ctx.sources) return false;
   for (const Ins& in : P.ins) {
+    if (in.in_node) {   // an IN (SELECT ..)'s truths: from the set the node has now, or built again
+      const SqlExpr* e = in.in_node;
+      std::unique_lock<aios::hal::Mutex> lock;
+      if (e->sub_mu) lock = std::unique_lock<aios::hal::Mutex>(*e->sub_mu);
+      if (!e->sub_evaluated || e->sub_correlated || e->sub_set.get() != in.in_set.get()) return false;
+    }
     if (!in.cs) continue;
     if (in.src >= ctx.sources->size()) return false;
     const SqlTable* t = (*ctx.sources)[in.src].table;

@@ -7914,6 +7914,21 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
 }
 
 // The batch for e (built after the first few rows; null: run it per row).
+// A batch taken off its node (out of date, or replaced) under sub_mu: readers that took no lock may still be
+// reading it through sub_batch_ready, so it is unpublished and kept alive in a graveyard rather than freed. Freed at
+// once, a lane of the same statement that loaded sub_batch_ready while another lane rebuilt read the freed batch's
+// table pointer: a SIGSEGV at 0x58 (t->mutation_seq) on nopurchase's correlated subqueries over the stocktrans view.
+static void retire_scalar_batch(const SqlExpr* e) {
+  if (!e->sub_batch) return;
+  store_ptr<const ScalarBatch>(e->sub_batch_ready, nullptr);
+  static aios::hal::Mutex gmu;
+  static std::vector<std::shared_ptr<const ScalarBatch>> graveyard;
+  std::lock_guard<aios::hal::Mutex> g(gmu);
+  if (graveyard.size() > 64) graveyard.erase(graveyard.begin());
+  graveyard.push_back(std::move(e->sub_batch));
+  e->sub_batch.reset();
+}
+
 static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx, std::shared_ptr<const ScalarBatch>* hold) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_SUBQUERY_BATCH"); return v && *v == '0'; }();
   if (off || !e->sub_mu || !e->fill_mu) return nullptr;
@@ -7927,7 +7942,7 @@ static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx,
     if (e->sub_batch) {
       const ScalarBatch& b = *e->sub_batch;
       if (b.current()) { *hold = e->sub_batch; return hold->get(); }
-      e->sub_batch.reset();   // the table changed: built again
+      retire_scalar_batch(e);   // the table changed: built again
     }
     if (++e->sub_calls <= 64) {
       // Batched straight away when one is kept for this subquery.
@@ -7944,14 +7959,7 @@ static const ScalarBatch* scalar_batch_for(const SqlExpr* e, const EvalCtx& ctx,
   auto b = build_scalar_batch(e, ctx);
   std::unique_lock<aios::hal::Mutex> lock(*e->sub_mu);
   if (!b) { e->sub_batch_no = true; return nullptr; }
-  // The one before stays alive in the graveyard: a reader may still hold its pointer.
-  if (e->sub_batch) {
-    static aios::hal::Mutex gmu;
-    static std::vector<std::shared_ptr<const ScalarBatch>> graveyard;
-    std::lock_guard<aios::hal::Mutex> g(gmu);
-    if (graveyard.size() > 64) graveyard.erase(graveyard.begin());
-    graveyard.push_back(e->sub_batch);
-  }
+  retire_scalar_batch(e);   // the one before, if another thread published one meanwhile
   e->sub_batch = b;
   store_ptr<const ScalarBatch>(e->sub_batch_ready, b.get());
   *hold = b;
@@ -14391,15 +14399,12 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
     }
     case ExprOp::In: {
       Val l = eval_expr(e->args[0].get(), ctx);
-      if (l.null) {
-        // NULL [NOT] IN a subquery that returned nothing: false (true), as
-        // nothing is compared; against any value it is unknown.
-        if (!e->subquery_sql.empty()) {
-          if (const InLookupSet* ready = load_ptr(e->sub_set_ready))
-            if (!ready->has_null && !ready->has_numeric && !ready->has_string) return val_num(e->negated);
-        }
-        return val_null();
-      }
+      // NULL [NOT] IN a list: unknown. NULL [NOT] IN a subquery: false (true) where it returned nothing, as nothing
+      // is compared, unknown otherwise - so its rows are needed first, as for any other value. Answered from the set
+      // only once another row had published it, a NULL on the first rows was unknown: `code NOT IN (SELECT ..)` of
+      // no rows kept 149,999 of 150,000 rows, or all of them, from run to run.
+      if (l.null && e->subquery_sql.empty()) return val_null();
+      auto null_in = [&](bool empty) { return empty ? val_num(e->negated) : val_null(); };
       bool any_null = false, hit = false;
 
       // IN (SELECT ...): the right side is a statement rather than a list. An
@@ -14407,6 +14412,7 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
       // one scan for the whole query instead of one per row.
       if (!e->subquery_sql.empty()) {
         if (const InLookupSet* ready = load_ptr(e->sub_set_ready)) {
+          if (l.null) return null_in(!ready->has_null && !ready->has_numeric && !ready->has_string);
           hit = ready->contains(l);
           any_null = ready->has_null;
           if (hit) return val_num(!e->negated);
@@ -14506,6 +14512,10 @@ Val eval_expr(const SqlExpr* e, const EvalCtx& ctx) {
             sub_set = e->sub_set;
             sub_values = e->sub_values;
           }
+        }
+        if (l.null) {
+          if (sub_set) return null_in(!sub_set->has_null && !sub_set->has_numeric && !sub_set->has_string);
+          return null_in(!sub_values || sub_values->empty());
         }
         if (sub_set) {
           hit = sub_set->contains(l);
@@ -48240,7 +48250,7 @@ struct LaneMemo {
   std::unordered_map<std::string, std::shared_ptr<const vp::Column>> prog;
   std::unordered_map<std::string, std::pair<std::shared_ptr<const vp::Column>, int>> exact;   // the lane, its scale
 };
-static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err);
+static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err, bool refs = false);
 static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* e, vp::Column* col,
                           int* xscale, std::string* why, LaneMemo* memo = nullptr) {
   EvalCtx vctx; vctx.sources = &sources;
@@ -48587,7 +48597,32 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
   col->n.assign(nr, 0);
   // 1: a product past 64 bits, 2: a sum, 3: a negation, 4: a double CAST does not round, 5: a CAST past its digits
   std::atomic<int> fail{0};
-  SqlThreadPool::instance().for_chunks(nr, 16384, nr, false, [&](size_t b0, size_t b1, size_t) {
+  // A CAST of a DOUBLE lane (op 6): round_double_scaled writes the double out and reads its digits back (~300 ns),
+  // and a column of prices holds few values over many rows - summitholding's stockmoves 27,582 over 12.5M, which
+  // brandbylocation CASTs twice a row: a third of its CPU. Its answer for a value, kept per thread and per CAST in a
+  // table by the value's bits, is the same call's answer.
+  struct RoundMemo { std::vector<uint64_t> bits; std::vector<AIOS_INT128> q; std::vector<uint8_t> st; };   // st: 0 empty, 1 rounds, 2 does not
+  constexpr size_t kMemo = (size_t)1 << 15;
+  const size_t nthreads = SqlThreadPool::instance().num_workers() + 1;
+  std::vector<std::vector<RoundMemo>> memo_of(nx);
+  for (size_t q = 0; q < nx; ++q)
+    if (xs[q].op == 6 && xs[q].pc && xs[q].pc->ty == vp::Ty::F64 && nr >= 65536) memo_of[q].resize(nthreads);
+  auto rounded = [&](size_t q, size_t tid, double v, int scale, AIOS_INT128* out) -> bool {
+    std::vector<RoundMemo>& per = memo_of[q];
+    if (per.empty() || tid >= per.size()) return round_double_scaled(v, scale, out);
+    RoundMemo& rm = per[tid];
+    if (rm.bits.empty()) { rm.bits.assign(kMemo, 0); rm.q.assign(kMemo, 0); rm.st.assign(kMemo, 0); }
+    uint64_t b = 0;
+    std::memcpy(&b, &v, 8);
+    const size_t at = (size_t)((b * 0x9E3779B97F4A7C15ull) >> 49) & (kMemo - 1);
+    if (rm.st[at] && rm.bits[at] == b) { *out = rm.q[at]; return rm.st[at] == 1; }
+    const bool ok = round_double_scaled(v, scale, out);
+    rm.bits[at] = b;
+    rm.q[at] = ok ? *out : 0;
+    rm.st[at] = ok ? 1 : 2;
+    return ok;
+  };
+  SqlThreadPool::instance().for_chunks(nr, 16384, nr, false, [&](size_t b0, size_t b1, size_t tid) {
     if (fail.load(std::memory_order_relaxed)) return;
     const size_t m = b1 - b0;
     std::vector<std::vector<int64_t>> val(nx);
@@ -48607,7 +48642,7 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
             if (c.n[r]) { z[j] = 1; continue; }
             AIOS_INT128 q128 = 0;
             if (c.ty == vp::Ty::F64) {
-              if (!round_double_scaled(c.f[r], in.scale, &q128)) { fail.store(4); return; }
+              if (!rounded(q, tid, c.f[r], in.scale, &q128)) { fail.store(4); return; }
             } else {
               q128 = (AIOS_INT128)c.i[r] * mul;
             }
@@ -48658,7 +48693,13 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
           for (size_t j = 0; j < m; ++j) {
             if (za[j]) { z[j] = 1; continue; }
             int64_t q = a[j];
-            if (in.drop > 0) q = in.trunc ? q / pd : (int64_t)scale_down_half_up((AIOS_INT128)q, in.drop);
+            // half away from zero, as scale_down_half_up - in 64 bits (|rem| * 2 < 2 * 10^18): its 128-bit division
+            // was a sixth of brandbylocation's CPU
+            if (in.drop > 0) {
+              if (in.trunc) q /= pd;
+              else if (in.drop <= 18) { const int64_t a = q / pd, rem = q % pd; q = (rem < 0 ? -rem : rem) * 2 >= pd ? a + (q < 0 ? -1 : 1) : a; }
+              else q = (int64_t)scale_down_half_up((AIOS_INT128)q, in.drop);
+            }
             if (in.up > 0 && __builtin_mul_overflow(q, pu, &q)) { fail.store(1); return; }
             v[j] = q;
           }
@@ -48738,15 +48779,16 @@ static bool exact_lane_of(const std::vector<QuerySource>& sources, const RowIds&
 }
 
 // vp::eval_column over joined rows, in parallel ranges joined in order where there are rows enough: the same lane.
-static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err) {
+// refs: a text result as the program's references (vp::Column::refs), no strings made.
+static bool vp_eval_rows(const vp::Prog& P, const RowIds& ri, vp::Column* col, std::string* err, bool refs) {
   const size_t n = ri.size();
   const size_t parts = n >= 131072 ? std::min<size_t>(SqlThreadPool::instance().num_workers() + 1, 8) : 1;
   std::vector<const uint32_t*> ids;
   if (ri.cols) for (const auto& c : *ri.cols) ids.push_back(c.data());
   auto range = [&](size_t b, size_t e, vp::Column* out, std::string* er) -> bool {
-    if (ri.cols) return vp::eval_column_srcs(P, ids, b, e - b, out, er);
+    if (ri.cols) return vp::eval_column_srcs(P, ids, b, e - b, out, er, refs);
     const JoinedRows& rows = *ri.rows;
-    return vp::eval_column(P, [&](size_t j) -> const JoinedRow& { return rows[b + j]; }, e - b, out, er);
+    return vp::eval_column(P, [&](size_t j) -> const JoinedRow& { return rows[b + j]; }, e - b, out, er, nullptr, refs);
   };
   if (parts <= 1 || SqlThreadPool::is_in_worker_thread()) return range(0, n, col, err);
   std::vector<vp::Column> got(parts);
@@ -48907,27 +48949,35 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
     if (key && P->out().ty == vp::Ty::Str) {
       // A text key (COALESCE(brand, 'UNBRANDED')): each row's text by its collation class, the class numbered by
       // the key the general path groups by (append_collate_key) - so the same rows group together. The classes
-      // are not the text's order (*keys_exact false: the caller sorts).
+      // are not the text's order (*keys_exact false: the caller sorts). The rows' texts as the program's
+      // references (a dictionary entry, a literal): a text made, and its key, once per reference, not per row -
+      // 10M strings made and hashed were 0.48 s of brandbylocation. Classes numbered as the rows first show them.
       vp::Column t;
       std::string err;
-      if (!vp_eval_rows(*P, rows, &t, &err)) return no("evaluation: " + err);
-      if (t.ty != vp::Ty::Str || t.size() != rows.size()) return no("text key lane");
+      if (!vp_eval_rows(*P, rows, &t, &err, true)) return no("evaluation: " + err);
+      if (t.ty != vp::Ty::Str || !t.refs || t.size() != rows.size()) return no("text key lane");
       col->ty = vp::Ty::I64;
       col->approx = false;
       col->uns = false;
-      col->i.assign(rows.size(), 0);
+      col->i = std::move(t.i);
       col->n = std::move(t.n);
-      std::unordered_map<std::string, int64_t> by_text, by_class;
+      std::unordered_map<int64_t, int64_t> by_ref;
+      std::unordered_map<std::string, int64_t> by_class;
       std::string ck;
+      int64_t last_ref = 0, last_class = -1;
       for (size_t j = 0; j < rows.size(); ++j) {
         if (col->n[j]) continue;
-        auto it = by_text.find(t.s[j]);
-        if (it == by_text.end()) {
+        const int64_t ref = col->i[j];
+        if (last_class >= 0 && ref == last_ref) { col->i[j] = last_class; continue; }
+        auto it = by_ref.find(ref);
+        if (it == by_ref.end()) {
           ck.clear();
-          append_collate_key(ck, t.s[j]);
+          append_collate_key(ck, P->text_of(ref));
           const int64_t c = by_class.emplace(ck, (int64_t)by_class.size()).first->second;
-          it = by_text.emplace(t.s[j], c).first;
+          it = by_ref.emplace(ref, c).first;
         }
+        last_ref = ref;
+        last_class = it->second;
         col->i[j] = it->second;
       }
       *keys_exact = false;
@@ -48956,7 +49006,145 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   std::vector<vp::Column> keys(nk);
   for (size_t c = 0; c < nk; ++c) if (!lane(group_by[c].get(), &keys[c], true, false)) return false;
   const uint64_t lt1 = vx_trace_on() ? hal_now_ns() : 0;
-  for (Agg& a : aggs) if (a.kind != CountStar && !lane(a.node->args[0].get(), &a.arg, false, a.kind != Count, &a.xscale)) return false;
+  // Pivots (pivot_plan, as the general path finds them): SUM(CASE WHEN k = lit THEN x ELSE c END) - or IF(k = lit,
+  // x, c), CASE k WHEN lit .. - for several lits over one k. Each such SUM as a lane of its own was a CASE column
+  // over every row, and a fold of it: thisoverlast's 36 month x measure sums over 3.2M rows were 36 columns of
+  // 29 MB and 36 folds, 1.0 s of its 1.8 s. Here k's lane and each distinct x's are made once, and one pass over
+  // the rows adds x into the sums whose lit is the row's k (where the aggregates fold, below). A SUM is taken only
+  // where its own lane would have been x's values or c (an integer literal; NULL with no ELSE): x's integers at x's
+  // scale, its total then the same integer at the same scale; or x's DOUBLEs, added in the same row order. It
+  // prints what its own lane's fold prints, to the last digit.
+  // hits: some integer equals lit (no k is 1.5); approx: x a DOUBLE lane; other: c, at x's scale where x is exact
+  struct PivotSum { size_t agg; bool hits; int64_t lit; size_t x; bool other_null; int64_t other; bool approx = false; };
+  struct PivotLanes {
+    const PivotBucket* b = nullptr;
+    vp::Column key;
+    std::vector<vp::Column> xs;
+    std::vector<int> xsc;   // x's scale; -1: a DOUBLE lane
+    std::vector<uint8_t> xprog;   // x's lane its own program's (a bare column the column readers above refuse)
+    std::vector<PivotSum> sums;
+  };
+  std::vector<PivotLanes> pivots;
+  std::vector<uint8_t> in_pivot(aggs.size(), 0);
+  std::vector<const SqlExpr*> roots;
+  for (const Agg& a : aggs) if (a.kind == Sum) roots.push_back(a.node);
+  const PivotPlan plan = roots.size() >= 2 ? pivot_plan(roots) : PivotPlan();
+  // (trace: why a SUM of a pivot keeps its own lane)
+  auto own = [&](const char* why, const SqlExpr* node) {
+    if (vx_trace_on()) vx_trace(std::string("group lanes: pivot sum on its own lane (") + why + "): " + vp::expr_text(node));
+  };
+  // The candidates first, from their literals alone: k = lit with a numeric lit (one equal to an integer, or one
+  // no integer equals - a text lit may compare as text: its own lane), c an integer literal or no ELSE.
+  for (const PivotBucket& b : plan.buckets) {
+    PivotLanes pl;
+    pl.b = &b;
+    auto int_literal = [](const Val& v, int64_t* out) {
+      AIOS_INT128 x = 0;
+      int xs = 0, ds = 0;
+      if (v.null || !v.numeric || v.hexnum || !exact_internal_of(v, &x, &xs, &ds) || xs != 0 || ds != 0) return false;
+      if (x <= -((AIOS_INT128)1 << 31) || x >= ((AIOS_INT128)1 << 31)) return false;
+      *out = (int64_t)x;
+      return true;
+    };
+    for (const PivotAgg& p : b.aggs) {
+      size_t k = 0;
+      while (k < aggs.size() && aggs[k].node != p.node) ++k;
+      if (k == aggs.size() || aggs[k].kind != Sum || in_pivot[k]) continue;
+      if (!p.lit.numeric || p.lit.hexnum || !std::isfinite(p.lit.num) || std::fabs(p.lit.num) >= 9007199254740992.0) { own("lit not a number", p.node); continue; }
+      // whether an integer equals lit: from its exact digits where it has them (2.0000000000000000001 is 2.0 as a
+      // double, and no integer equals it), from the double otherwise (a DOUBLE literal: compared as one)
+      PivotSum ps{k, false, 0, p.x, p.other.null, 0};
+      AIOS_INT128 lx = 0;
+      int lxs = 0, lds = 0;
+      if (!p.lit.approx && exact_internal_of(p.lit, &lx, &lxs, &lds)) {
+        AIOS_INT128 pw = 1;
+        for (int d = 0; d < lxs && d < 38; ++d) pw *= 10;
+        if (lxs <= 37 && lx % pw == 0 && lx / pw > -((AIOS_INT128)1 << 53) && lx / pw < ((AIOS_INT128)1 << 53)) { ps.hits = true; ps.lit = (int64_t)(lx / pw); }
+      } else if (std::nearbyint(p.lit.num) == p.lit.num) {
+        ps.hits = true;
+        ps.lit = (int64_t)p.lit.num;
+      }
+      if (!ps.other_null && !int_literal(p.other, &ps.other)) { own("ELSE not an integer literal", p.node); continue; }
+      pl.sums.push_back(ps);
+    }
+    if (pl.sums.size() < 2) continue;   // one SUM alone: its own lane, as before
+    for (const PivotSum& ps : pl.sums) in_pivot[ps.agg] = 1;
+    pivots.push_back(std::move(pl));
+  }
+  // Every other aggregate's lane before any pivot's: one with none declines the statement before the pivots' lanes
+  // are made for nothing.
+  for (size_t k = 0; k < aggs.size(); ++k) {
+    Agg& a = aggs[k];
+    if (a.kind != CountStar && !in_pivot[k] && !lane(a.node->args[0].get(), &a.arg, false, a.kind != Count, &a.xscale)) return false;
+  }
+  // The pivots' lanes: k's, each x's. A SUM is folded with its pivot only where its own lane would have been x's
+  // integers at x's scale, or c there: its program's integers (scale 0), or - no program - its exact lane at x's
+  // scale. Any other goes back to its own lane.
+  static const int64_t p10s[19] = {1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL,
+                                   1000000000LL, 10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL,
+                                   100000000000000LL, 1000000000000000LL, 10000000000000000LL, 100000000000000000LL,
+                                   1000000000000000000LL};
+  std::vector<size_t> back;   // aggregates that go back to their own lanes
+  for (PivotLanes& pl : pivots) {
+    const PivotBucket& b = *pl.b;
+    std::vector<PivotSum> kept;
+    if (lane(b.key, &pl.key, false, false) && pl.key.ty == vp::Ty::I64 && !pl.key.uns && pl.key.size() == n) {
+      pl.xs.resize(b.xs.size());
+      pl.xsc.assign(b.xs.size(), -2);   // -2: not made yet; -3: no lane of integers or DOUBLEs
+      pl.xprog.assign(b.xs.size(), 0);
+      for (PivotSum ps : pl.sums) {
+        const SqlExpr* node = aggs[ps.agg].node;
+        int& sc = pl.xsc[ps.x];
+        if (sc == -2) {
+          vp::Column& xc = pl.xs[ps.x];
+          auto kind = [&](int xs) {
+            if (xc.size() != n || xc.uns) return -3;
+            if (xc.ty == vp::Ty::I64 && !xc.approx) return std::max(xs, 0) <= 18 ? std::max(xs, 0) : -3;
+            if (xc.ty == vp::Ty::F64 && xc.approx) return -1;
+            return -3;
+          };
+          int xs = -1;
+          sc = lane(b.xs[ps.x], &xc, false, true, &xs) ? kind(xs) : -3;
+          if (sc == -3) {
+            // x's own program, the leaf the CASE's program reads it through (stockmoves.qty: a DOUBLE column
+            // dictionary-coded, which the bare-column reader above takes only as typed numbers)
+            xc = vp::Column();
+            std::string err;
+            const std::shared_ptr<vp::Prog> XP = !SqlThreadPool::is_in_worker_thread() ? vp::compile(b.xs[ps.x], vctx, nullptr, nullptr, true) : nullptr;
+            if (XP && vp_eval_rows(*XP, rows, &xc, &err)) { sc = kind(-1); pl.xprog[ps.x] = 1; }
+            if (vx_trace_on() && sc == -3)
+              vx_trace("group lanes: pivot value " + vp::expr_text(b.xs[ps.x]) + (XP ? std::string(" lane ") + (xc.ty == vp::Ty::F64 ? "DOUBLE" : xc.ty == vp::Ty::I64 ? "INT" : "text") + (xc.approx ? " approx" : "") + (xc.uns ? " unsigned" : "") + (err.empty() ? "" : ", " + err) : std::string(": no program")));
+          }
+        }
+        if (sc == -3) { own("value neither exact integers nor DOUBLEs", node); back.push_back(ps.agg); continue; }
+        ps.approx = sc == -1;
+        const vp::Prog* P = vp::program_for(node->args[0].get(), vctx);
+        // (x through its program: the SUM's own lane must be a program too - its exact lane reads x another way)
+        const bool same = ps.approx ? P && P->out().ty == vp::Ty::F64 && P->out().approx && !P->out().uns
+                                    : (!P && !pl.xprog[ps.x]) || (P && P->out().ty == vp::Ty::I64 && !P->out().approx && !P->out().uns && sc == 0);
+        if (!same) { own("its own lane differs", node); back.push_back(ps.agg); continue; }
+        if (!ps.approx && !ps.other_null && __builtin_mul_overflow(ps.other, p10s[sc], &ps.other)) { own("ELSE past 64 bits", node); back.push_back(ps.agg); continue; }
+        kept.push_back(ps);
+      }
+    } else {
+      for (const PivotSum& ps : pl.sums) { own("k not a lane of integers", aggs[ps.agg].node); back.push_back(ps.agg); }
+    }
+    if (kept.size() < 2) { for (const PivotSum& ps : kept) back.push_back(ps.agg); kept.clear(); }
+    pl.sums = std::move(kept);
+    for (const PivotSum& ps : pl.sums) {
+      aggs[ps.agg].xscale = pl.xsc[ps.x] > 0 ? pl.xsc[ps.x] : -1;
+      aggs[ps.agg].arg.ty = ps.approx ? vp::Ty::F64 : vp::Ty::I64;   // as its own lane's: agg_num reads a DOUBLE sum's total
+      aggs[ps.agg].arg.approx = ps.approx;
+    }
+    if (vx_trace_on() && !pl.sums.empty())
+      vx_trace("group lanes: pivot of " + std::to_string(pl.sums.size()) + " sums over " + std::to_string(b.xs.size()) + " values by " +
+               vp::expr_text(b.key));
+  }
+  pivots.erase(std::remove_if(pivots.begin(), pivots.end(), [](const PivotLanes& pl) { return pl.sums.empty(); }), pivots.end());
+  for (size_t k : back) {
+    in_pivot[k] = 0;
+    if (!lane(aggs[k].node->args[0].get(), &aggs[k].arg, false, true, &aggs[k].xscale)) return false;
+  }
   const uint64_t lt2 = vx_trace_on() ? hal_now_ns() : 0;
   // an exact lane's MIN / MAX is a decimal, not an INT result: the text form
   for (const Agg& a : aggs) if (a.xscale > 0) lane_form = false;
@@ -49096,8 +49284,149 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
   std::vector<std::vector<uint64_t>> counts(aggs.size());
   std::vector<std::vector<uint32_t>> extreme(aggs.size());
   std::vector<std::vector<SumAcc>> sums(aggs.size());
+  // The pivots' sums (see above), one pass over the rows a pivot: a row's k picks the sums it adds x to, and each
+  // sum's other rows add c. In parts of the rows where the groups are few, each part its own totals, added after:
+  // integer sums, the same in any order.
+  for (const PivotLanes& pl : pivots) {
+    const size_t na = pl.sums.size();
+    // the sums each value of k feeds: by k's value through a table where the lits span little, else a search
+    std::vector<int64_t> lits;
+    for (const PivotSum& ps : pl.sums) if (ps.hits) lits.push_back(ps.lit);
+    std::sort(lits.begin(), lits.end());
+    lits.erase(std::unique(lits.begin(), lits.end()), lits.end());
+    std::vector<uint32_t> off(lits.size() + 1, 0), which;
+    for (size_t u = 0; u < lits.size(); ++u) {
+      for (size_t s = 0; s < na; ++s) if (pl.sums[s].hits && pl.sums[s].lit == lits[u]) which.push_back((uint32_t)s);
+      off[u + 1] = (uint32_t)which.size();
+    }
+    const int64_t lo = lits.empty() ? 0 : lits.front();
+    std::vector<int32_t> at;   // k - lo -> its lit's index, -1: no sum's
+    if (!lits.empty() && (uint64_t)lits.back() - (uint64_t)lo < 4096) {
+      at.assign((size_t)((uint64_t)lits.back() - (uint64_t)lo) + 1, -1);
+      for (size_t u = 0; u < lits.size(); ++u) at[(size_t)((uint64_t)lits[u] - (uint64_t)lo)] = (int32_t)u;
+    }
+    const size_t cells = G * na;
+    const size_t parts = n >= 131072 && cells <= 65536 && !SqlThreadPool::is_in_worker_thread()
+                             ? std::min<size_t>(SqlThreadPool::instance().num_workers() + 1, 8) : 1;
+    std::vector<std::vector<AIOS_INT128>> psum(parts, std::vector<AIOS_INT128>(cells, 0));
+    std::vector<std::vector<uint64_t>> phit(parts, std::vector<uint64_t>(cells, 0)), pnn(parts, std::vector<uint64_t>(cells, 0));
+    std::vector<std::vector<uint64_t>> prows(parts, std::vector<uint64_t>(G, 0));
+    const size_t per = (n + parts - 1) / parts;
+    auto fold_part = [&](size_t q) {
+      AIOS_INT128* sm = psum[q].data();
+      uint64_t* ht = phit[q].data();
+      uint64_t* nn = pnn[q].data();
+      uint64_t* rw = prows[q].data();
+      const int64_t* kv = pl.key.i.data();
+      const uint8_t* kn = pl.key.n.data();
+      const size_t r1 = std::min(n, q * per + per);
+      for (size_t r = q * per; r < r1; ++r) {
+        const uint32_t g = gid[r];
+        ++rw[g];
+        if (kn[r] || lits.empty()) continue;   // k NULL: no lit's
+        const int64_t v = kv[r];
+        size_t u;
+        if (!at.empty()) {
+          if (v < lo) continue;
+          const uint64_t d = (uint64_t)v - (uint64_t)lo;
+          if (d >= at.size() || at[d] < 0) continue;
+          u = (size_t)at[d];
+        } else {
+          auto it = std::lower_bound(lits.begin(), lits.end(), v);
+          if (it == lits.end() || *it != v) continue;
+          u = (size_t)(it - lits.begin());
+        }
+        for (uint32_t w = off[u]; w < off[u + 1]; ++w) {
+          const size_t s = which[w];
+          const size_t c = (size_t)g * na + s;
+          ++ht[c];
+          const vp::Column& xc = pl.xs[pl.sums[s].x];
+          if (xc.n[r]) continue;   // x NULL: the CASE's value NULL, not summed
+          if (!pl.sums[s].approx) sm[c] += xc.i[r];   // a DOUBLE's total: in row order, below
+          ++nn[c];
+        }
+      }
+    };
+    if (parts > 1) SqlThreadPool::instance().for_chunks(parts, 1, n, true, [&](size_t p0, size_t p1, size_t) { for (size_t q = p0; q < p1; ++q) fold_part(q); });
+    else fold_part(0);
+    // The DOUBLE sums' totals, in row order as add_approx made them: each row's x where it hits, c where it does
+    // not (+0.0 left out: from +0.0 a sum of doubles never reaches -0.0, and t + 0.0 is t for every other t).
+    std::vector<double> tot;
+    bool any_approx = false;
+    for (const PivotSum& ps : pl.sums) any_approx = any_approx || ps.approx;
+    if (any_approx) {
+      tot.assign(cells, 0.0);
+      std::vector<size_t> with_c;   // DOUBLE sums whose c is not 0 or NULL: added on every row they miss
+      for (size_t s = 0; s < na; ++s) if (pl.sums[s].approx && !pl.sums[s].other_null && pl.sums[s].other != 0) with_c.push_back(s);
+      const int64_t* kv = pl.key.i.data();
+      const uint8_t* kn = pl.key.n.data();
+      for (size_t r = 0; r < n; ++r) {
+        const uint32_t g = gid[r];
+        double* t = tot.data() + (size_t)g * na;
+        if (!kn[r] && !lits.empty()) {
+          const int64_t v = kv[r];
+          size_t u = SIZE_MAX;
+          if (!at.empty()) {
+            const uint64_t d = (uint64_t)v - (uint64_t)lo;
+            if (v >= lo && d < at.size() && at[d] >= 0) u = (size_t)at[d];
+          } else {
+            auto it = std::lower_bound(lits.begin(), lits.end(), v);
+            if (it != lits.end() && *it == v) u = (size_t)(it - lits.begin());
+          }
+          if (u != SIZE_MAX)
+            for (uint32_t w = off[u]; w < off[u + 1]; ++w) {
+              const PivotSum& ps = pl.sums[which[w]];
+              if (!ps.approx || (!ps.other_null && ps.other != 0)) continue;
+              const vp::Column& xc = pl.xs[ps.x];
+              if (!xc.n[r]) t[which[w]] += xc.f[r];
+            }
+        }
+        for (size_t s : with_c) {
+          const PivotSum& ps = pl.sums[s];
+          if (!kn[r] && ps.hits && kv[r] == ps.lit) {
+            const vp::Column& xc = pl.xs[ps.x];
+            if (!xc.n[r]) t[s] += xc.f[r];
+          } else {
+            t[s] += (double)ps.other;
+          }
+        }
+      }
+    }
+    static const double p10d[19] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
+    for (size_t s = 0; s < na; ++s) {
+      const PivotSum& ps = pl.sums[s];
+      const int sc = pl.xsc[ps.x];
+      std::vector<SumAcc>& out = sums[ps.agg];
+      out.assign(G, SumAcc());
+      for (size_t g = 0; g < G; ++g) {
+        AIOS_INT128 et = 0;
+        uint64_t hit = 0, nn = 0, rows_g = 0;
+        for (size_t q = 0; q < parts; ++q) { et += psum[q][g * na + s]; hit += phit[q][g * na + s]; nn += pnn[q][g * na + s]; rows_g += prows[q][g]; }
+        const uint64_t cnt = nn + (ps.other_null ? 0 : rows_g - hit);
+        if (!cnt) continue;   // no value: NULL
+        if (ps.approx) {   // as add_approx leaves it
+          SumAcc& acc = out[g];
+          acc.count = cnt;
+          acc.exact = false;
+          acc.total = tot[g * na + s];
+          continue;
+        }
+        if (!ps.other_null) et += (AIOS_INT128)ps.other * (AIOS_INT128)(rows_g - hit);
+        // as add_scaled / add_i64 leave it: exact at x's scale, printed there; the double total is read only by a
+        // sum that is not exact (finish), which this one is
+        SumAcc& acc = out[g];
+        acc.count = cnt;
+        acc.exact = true;
+        acc.etotal = et;
+        acc.escale = sc;
+        acc.dscale = sc;
+        acc.total = (double)et / p10d[sc];
+      }
+    }
+  }
   for (size_t k = 0; k < aggs.size(); ++k) {
     const Agg& a = aggs[k];
+    if (in_pivot[k]) continue;
     if (a.kind == CountStar || a.kind == Count) {
       counts[k].assign(G, 0);
       for (size_t r = 0; r < n; ++r) if (a.kind == CountStar || !a.arg.n[r]) ++counts[k][gid[r]];
@@ -49157,7 +49486,10 @@ static bool lane_group_by(SqlDatabase* db, const std::vector<QuerySource>& sourc
             });
             for (size_t q = 0; q < parts; ++q)
               for (size_t g = 0; g < G; ++g) { et[g] += pe[q][g]; cnt[g] += pc[q][g]; }
-            for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) tot[gid[r]] += (double)a.arg.i[r] / p;
+            // A SUM's double total is never read (finish: an exact sum is its etotal); an AVG's is, where its
+            // quotient does not fit the exact form - summed in row order, as add_scaled did.
+            if (a.kind == Avg) { for (size_t r = 0; r < n; ++r) if (!a.arg.n[r]) tot[gid[r]] += (double)a.arg.i[r] / p; }
+            else for (size_t g = 0; g < G; ++g) tot[g] = (double)et[g] / p;
           } else {
             for (size_t r = 0; r < n; ++r) {
               if (a.arg.n[r]) continue;
@@ -54728,27 +55060,60 @@ static std::optional<SqlQueryResult> expand_items(const ExpandPlan& plan, PhaseC
 }
 
 // A program value conjunct_truths reads as a truth (a comparison, AND / OR / NOT, IS [NOT] NULL, IN of texts).
-static bool truth_root(vp::Ins::Op op) {
+// (an IN (SELECT ..)'s leaf, in_node: its truths per code, 1 / 0 / NULL)
+static bool truth_root(const vp::Ins& in) {
+  const vp::Ins::Op op = in.op;
   return op == vp::Ins::Eq || op == vp::Ins::Ne || op == vp::Ins::Lt || op == vp::Ins::Le || op == vp::Ins::Gt ||
          op == vp::Ins::Ge || op == vp::Ins::And || op == vp::Ins::Or || op == vp::Ins::Not || op == vp::Ins::IsNull ||
-         op == vp::Ins::NotNull || op == vp::Ins::ColNull || op == vp::Ins::StrIn;
+         op == vp::Ins::NotNull || op == vp::Ins::ColNull || op == vp::Ins::StrIn || in.in_node != nullptr;
 }
 // A WHERE or ON part's truth over the joined rows, as the interpreter's three values per row (1 true, 0 false,
 // -1 NULL), a column at a time: a program (vp) whose value is a truth; a comparison of two exact lanes (exact_lane_of,
 // where a DECIMAL keeps the programs out) at their common scale - the interpreter's exact numeric order; AND / OR /
 // NOT of such, in three values. False where the part is not that, or its lanes fail (an overflow): the interpreter's.
+// The IN (SELECT ..) subqueries in p not run yet, run now through the interpreter's own IN on the first row (which
+// runs an uncorrelated one once and keeps its set on the node), so p's program can read their sets (vp sub_in): the
+// interpreter would have run each on its first row anyway. The NOT IN (SELECT ..) of the stocktrans view's
+// customer types left its 3.2M joined rows to the interpreter, three parts of the WHERE a row - 0.4 s of
+// thisoverlast. One that reads the row (correlated), or fails, stays with the interpreter.
+static void prime_in_sets(SqlDatabase* db, const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* p) {
+  if (!p || rows.size() == 0 || SqlThreadPool::is_in_worker_thread()) return;
+  std::vector<const SqlExpr*> ins;
+  std::function<void(const SqlExpr*)> walk = [&](const SqlExpr* e) {
+    if (!e || e->op == ExprOp::Subquery || e->op == ExprOp::Exists) return;
+    if (e->op == ExprOp::In && e->args.size() == 1 && !e->subquery_sql.empty()) { ins.push_back(e); return; }
+    for (const auto& a : e->args) walk(a.get());
+  };
+  walk(p);
+  for (const SqlExpr* e : ins) {
+    {
+      std::unique_lock<aios::hal::Mutex> lock;
+      if (e->sub_mu) lock = std::unique_lock<aios::hal::Mutex>(*e->sub_mu);
+      if (e->sub_evaluated) continue;
+    }
+    JoinedRow first;
+    if (rows.rows) first = (*rows.rows)[0];
+    else for (size_t s = 0; s < rows.cols->size(); ++s) first.parts.push_back(rows.part(0, s));
+    EvalCtx c; c.db = db; c.sources = &sources; c.row = &first;
+    std::string err;
+    c.err = &err;
+    (void)eval_expr(e, c);   // an error: the interpreter meets it again, and reports it, on the rows
+  }
+}
+
 static bool conjunct_truths(SqlDatabase* db, const std::vector<QuerySource>& sources, const RowIds& rows, const SqlExpr* p,
                             std::vector<int8_t>* out) {
   EvalCtx vctx; vctx.db = db; vctx.sources = &sources;
   const size_t n = rows.size();
   if (!p) return false;
+  prime_in_sets(db, sources, rows, p);
   // a constant (a view's `WHERE 1 AND ...`): one truth for every row
   if (p->op == ExprOp::Literal) {
     out->assign(n, p->literal.null ? (int8_t)-1 : (int8_t)(val_truthy(p->literal) ? 1 : 0));
     return true;
   }
   if (const vp::Prog* P = vp::program_for(p, vctx)) {
-    if (P->out().ty != vp::Ty::I64 || !truth_root(P->out().op)) return false;
+    if (P->out().ty != vp::Ty::I64 || !truth_root(P->out())) return false;
     vp::Column col;
     std::string verr;
     if (!vp_eval_rows(*P, rows, &col, &verr)) return false;
@@ -55088,6 +55453,12 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
             columnar = true;
           } else if (uniq) {
             star_def.reset();   // the arrays, filtered so far, are the rows
+          } else if (applied == left) {
+            // A one-to-many link (stocktrans's debtortrans): the arrays, expanded above, are the rows and the whole
+            // WHERE is applied - the grouping reads them as they are (star_aggregate, then the lanes over row-id
+            // columns), not 10M JoinedRows made first (0.58 s of brandbylocation).
+            columnar = true;
+            if (vx_trace_on()) vx_trace("join: star WHERE applied whole: its expanded arrays go to the grouping as rows");
           }
           if (vx_trace_on() && applied)
             vx_trace("join: star WHERE: " + std::to_string(applied) + " of " + std::to_string(left) + " part(s) over its arrays, " +

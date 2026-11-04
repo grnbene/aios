@@ -27,7 +27,14 @@ aios --root R grain serve apps/sqldoom/play.gr [MAP] [skill]
 `doom_spawn_player`), runs `doom_run_game_tic` 35 times a second from the keys held, reads SQLDoom's per-tic snapshot
 (`sql/client/game_tick_finish.sql`) for exits and death, and draws each frame with the renderer at the camera
 `sql/client/camera_pose.sql` interpolates between tics. `aios grain serve` shows the pane in a browser (`aios grain
-run` has no display); `SQLDOOM_FRAMES=n` runs n tics and frames with no display and saves the last.
+run` has no display); `SQLDOOM_FRAMES=n` runs n tics and frames with no display and saves the last
+(`SQLDOOM_SHOT_EACH=1` saves every one, numbered; `SQLDOOM_KEYS=ctrl` holds fire; `SQLDOOM_WEAPON=n` starts with
+weapon n of `weapon_defs` in hand and ammo for it).
+
+In the modern 3D view the weapon in hand is a model (`lib/arms.gr`): each of the eight weapons designed with the
+player's hands on it, built into ASQL (`weapon_model`, with how it is held and kicks) and drawn in front of the scene,
+lit by the room and the dynamic lights, bobbing, swaying and playing its fire clip from the tic a shot goes off; a
+gun's muzzle flash is a separate model drawn with it for that moment. `SQLDOOM_ARMS=0` draws Doom's sprites instead.
 
 It is not playable at speed: a tic takes 25-45 ms with the monsters asleep and over 100 ms once they chase (Doom's
 budget is 28.6 ms), a frame about 1.2 s.
@@ -72,7 +79,7 @@ the engine of its own. `AIOS_CTE_MERGE_TRACE=1` prints each CTE's time, `AIOS_VX
   (`sql/render_light.sql`) are stored functions.
 - **The game tic** (`sql/gametic.sql`) is SQLDoom's CedarScript as ASQL stored functions, its SQL left as PostgreSQL
   wrote it: ASQL reads `::`, `ON CONFLICT`, `UPDATE .. FROM`, `DELETE .. USING`, `BOOL_OR`, `ARG_MAX`,
-  `string_agg`, `FILTER`, `LATERAL` and `generate_series` (docs/asql.md, "PostgreSQL's spellings"), and the functions
+  `string_agg`, `FILTER`, `LATERAL` and `generate_series` (docs/asql-internals.md, "PostgreSQL's spellings"), and the functions
   are made under `sql_mode` `PIPES_AS_CONCAT,PG_DIVISION` so `||` and `/` mean what they do there.
   `tools/cs2my.py` converted the procedural layer (`let`, `if {}`, `SELECT .. {block}` to `DECLARE`, `IF`, a cursor
   loop); by hand: `doom_prandom` (PostgreSQL's `#` xor), a `^` power, the stairs builder's visited-sector array, the

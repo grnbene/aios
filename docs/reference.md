@@ -309,7 +309,7 @@ Dispatched at `cli/commands.cpp:11008` → `cmd_compute` (`cli/commands.cpp:2969
 | subcommand | usage | what it does |
 |---|---|---|
 | `kernels` | `compute kernels` | the kernels each device runs |
-| `serve` | `compute serve [port=7311] [lanes=N] [token=T] [public=1] [sql=1] [mysql_port=P] [cdc_host=H cdc_db=DB ...]` | serve compute; with sql=1, ASQL: a MySQL-speaking database that can mirror a MariaDB (see docs/asql.md) |
+| `serve` | `compute serve [port=7311] [lanes=N] [token=T] [public=1] [sql=1] [mysql_port=P] [cdc_host=H cdc_db=DB ...]` | serve compute; with sql=1, ASQL: a MySQL-speaking database that can mirror a MariaDB (see docs/asql-internals.md) |
 
 ## `sat`
 

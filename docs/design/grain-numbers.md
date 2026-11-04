@@ -50,7 +50,7 @@ would get.
    and rounding its shortest digits would give `0.46` where the sum by hand, PHP and the ERP's own invoices give `0.47`
    (measured: on 762,816 price x discount x qty lines, shortest digits differ from PHP on 1,778, the 15-digit rule on
    none; MariaDB's binary half-to-even ROUND on 10,274). `round(x)` is an int; `round(x, n)` a decimal with exactly
-   `n` places (`round(2.5, 2)` prints `2.50`). ASQL rounds DOUBLEs by the same rule (docs/asql.md).
+   `n` places (`round(2.5, 2)` prints `2.50`). ASQL rounds DOUBLEs by the same rule (docs/asql-internals.md).
 7. **Printing says what a number is.** An int prints its digits; a decimal prints its digits with its scale
    (`59.97`, `1.50`); a real prints the shortest text that reads back as the same real, with a point or an
    exponent so it never looks like an int (`0.30000000000000004`, `3.0`, `1e+16`). `str`, `print`, `repr`, JSON

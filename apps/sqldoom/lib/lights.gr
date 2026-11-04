@@ -1,0 +1,127 @@
+# Dynamic lights for the 3D renderer: what glows in the world, as point lights r3d_lights hands the fill.
+#
+# What gives light, and how, is a table in ASQL (sprite_lights: a sprite, the frames of it that glow - '' for all -,
+# a colour, how far it reaches, how high on the thing it sits, how much it flickers), the way a modern port keeps
+# its light definitions beside the game's own data. Each frame the things the last tic left (sql/client/things.sql)
+# are matched against it - fireballs, rockets and plasma in flight and as they burst, bullet puffs, torches and
+# lamps, a monster on a frame that fires, a barrel going up - with the player's muzzle flash from the weapon's flash
+# layer, and the floors that glow (nukage, lava, slime, blood), worked out once a map from their subsectors.
+#
+#   lights_tables()                       sprite_lights, filled with the defaults if it is empty
+#   lights_load()                         -> {sprite: [defs]}
+#   lights_floor_glows(map_id)            -> lights for the glowing floors of a map
+#   lights_frame(defs, glows, scene, prev, alpha, pose, now_s) -> the frame's lights, for r3d_lights
+
+fn lights_tables() {
+  sql("CREATE TABLE IF NOT EXISTS sprite_lights (sprite VARCHAR(4) NOT NULL, frames VARCHAR(29) NOT NULL, " +
+      "r DOUBLE NOT NULL, g DOUBLE NOT NULL, b DOUBLE NOT NULL, radius DOUBLE NOT NULL, height DOUBLE NOT NULL, " +
+      "flicker DOUBLE NOT NULL DEFAULT 0, PRIMARY KEY (sprite, frames))")
+  if sql("SELECT COUNT(*) AS n FROM sprite_lights")[0].n > 0 { return nil }
+  # sprite, frames ('' all), r g b (a share of the lit surface's colour added at the heart), radius, height, flicker
+  let defs = [
+    # what flies, and what it does when it lands
+    ["BAL1", "AB", 1.6, 0.75, 0.25, 200, 0, 0.1], ["BAL1", "CDE", 2.2, 1.0, 0.35, 280, 0, 0.0],
+    ["BAL2", "AB", 1.3, 0.45, 1.5, 200, 0, 0.1], ["BAL2", "CDE", 1.8, 0.6, 2.0, 280, 0, 0.0],
+    ["BAL7", "AB", 0.5, 1.6, 0.4, 200, 0, 0.1], ["BAL7", "CDE", 0.7, 2.1, 0.5, 280, 0, 0.0],
+    ["MISL", "A", 1.8, 1.0, 0.45, 220, 0, 0.1], ["MISL", "BCD", 2.6, 1.4, 0.5, 380, 0, 0.0],
+    ["PLSS", "", 0.45, 0.9, 2.0, 200, 0, 0.1], ["PLSE", "", 0.6, 1.1, 2.4, 260, 0, 0.0],
+    ["BFS1", "", 0.6, 2.2, 0.6, 320, 0, 0.1], ["BFE1", "", 0.9, 2.8, 0.9, 480, 0, 0.0],
+    ["PUFF", "AB", 1.0, 0.85, 0.55, 90, 0, 0.0],
+    ["BEXP", "BCDE", 2.6, 1.3, 0.45, 400, 24, 0.0],
+    # a monster on the frame it fires on, and the lost soul, which burns
+    ["POSS", "F", 1.6, 1.2, 0.6, 260, 40, 0.0], ["SPOS", "F", 1.7, 1.25, 0.6, 300, 40, 0.0],
+    ["CPOS", "EF", 1.7, 1.25, 0.6, 300, 40, 0.0], ["SKUL", "ABCD", 1.4, 0.8, 0.35, 160, 24, 0.2],
+    # torches, candles and lamps
+    ["TBLU", "", 0.35, 0.55, 1.6, 220, 64, 0.25], ["TGRN", "", 0.4, 1.5, 0.45, 220, 64, 0.25],
+    ["TRED", "", 1.6, 0.45, 0.3, 220, 64, 0.25],
+    ["SMBT", "", 0.35, 0.55, 1.4, 160, 40, 0.25], ["SMGT", "", 0.4, 1.3, 0.45, 160, 40, 0.25],
+    ["SMRT", "", 1.4, 0.45, 0.3, 160, 40, 0.25],
+    ["CAND", "", 1.1, 0.8, 0.4, 96, 8, 0.15], ["CBRA", "", 1.3, 1.0, 0.5, 192, 48, 0.12],
+    ["COLU", "", 1.3, 1.2, 0.9, 256, 44, 0.0], ["TLMP", "", 1.2, 1.2, 1.2, 256, 72, 0.0],
+    ["TLP2", "", 1.2, 1.2, 1.2, 220, 56, 0.0], ["FCAN", "", 1.7, 0.85, 0.3, 240, 32, 0.25],
+    ["CEYE", "", 0.4, 1.4, 0.4, 128, 48, 0.2], ["FSKU", "", 1.6, 0.8, 0.3, 160, 40, 0.25]]
+  let rows = []
+  for d in defs {
+    push(rows, format("('{}', '{}', {}e0, {}e0, {}e0, {}e0, {}e0, {}e0)", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]))
+  }
+  sql("INSERT INTO sprite_lights (sprite, frames, r, g, b, radius, height, flicker) VALUES " + join(rows, ", "))
+  return nil
+}
+
+fn lights_load() {
+  let by = {}
+  for d in sql("SELECT sprite, frames, r, g, b, radius, height, flicker FROM sprite_lights") {
+    if not has(by, d.sprite) { by[d.sprite] = [] }
+    push(by[d.sprite], d)
+  }
+  return by
+}
+
+# A light for each subsector of a glowing floor, at its middle, a little over the floor, reaching about as far as the
+# subsector is wide; its colour the flat's. A floor that moves (a lift of nukage) keeps the height it had here.
+fn lights_floor_glows(map_id) {
+  let q = format(
+    "WITH glow (prefix, r, g, b) AS (SELECT 'NUKAGE', 0.30e0, 1.10e0, 0.25e0 UNION ALL SELECT 'SLIME', 0.40e0, 1.0e0, 0.25e0 " +
+    "UNION ALL SELECT 'LAVA', 1.30e0, 0.55e0, 0.15e0 UNION ALL SELECT 'BLOOD', 1.10e0, 0.15e0, 0.12e0 " +
+    "UNION ALL SELECT 'FWATER', 0.20e0, 0.40e0, 0.90e0), " +
+    "tris AS (SELECT t.ssector_id, s.floor_height AS fz, g.r, g.g, g.b, (t.x0 + t.x1 + t.x2) / 3e0 AS cx, (t.y0 + t.y1 + t.y2) / 3e0 AS cy, " +
+    "ABS((t.x1 - t.x0) * (t.y2 - t.y0) - (t.x2 - t.x0) * (t.y1 - t.y0)) / 2e0 AS area " +
+    "FROM ssector_tris t JOIN sectors s ON s.map_id = t.map_id AND s.id = t.sector_id " +
+    "JOIN glow g ON s.floor_tex LIKE CONCAT(g.prefix, '%') WHERE t.map_id = {}) " +
+    "SELECT ssector_id, MAX(fz) AS fz, MAX(r) AS r, MAX(g) AS g, MAX(b) AS b, SUM(cx * area) / SUM(area) AS x, SUM(cy * area) / SUM(area) AS y, " +
+    "SUM(area) AS area FROM tris GROUP BY ssector_id HAVING SUM(area) > 0", map_id)
+  let out = []
+  for s in sql(q) {
+    let radius = max(112.0e0, min(320.0e0, sqrt(s.area * 1.0e0) * 1.1e0))
+    push(out, {"x": s.x * 1.0e0, "y": s.y * 1.0e0, "z": s.fz + 20.0e0, "radius": radius,
+               "r": s.r * 0.55e0, "g": s.g * 0.55e0, "b": s.b * 0.55e0, "pulse": (s.ssector_id * 37 % 100) / 100.0e0})
+  }
+  return out
+}
+
+# The frame's lights: each glowing thing where it is between the last two tics, a torch's flicker, the muzzle flash
+# at the gun, the floors' glow breathing slowly. Moving lights first: a surface takes the first eight that reach it.
+fn lights_frame(defs, glows, scene, prev, alpha, pose, now_s) {
+  let out = []
+  let before = {}
+  if prev != nil and prev.map_id == scene.map_id {
+    for r in prev.things { before[str(r.thing_id)] = r }
+  }
+  # the player's gun: a flash layer on the weapon this tic
+  for wl in scene.weapon {
+    if wl.layer == 2 {
+      let a = pose.angle * 3.141592653589793e0 / 180.0e0
+      push(out, {"x": pose.x + cos(a) * 40.0e0, "y": pose.y + sin(a) * 40.0e0, "z": pose.z - 6.0e0, "radius": 380.0e0,
+                 "r": 1.7e0, "g": 1.3e0, "b": 0.7e0})
+    }
+  }
+  for r in scene.things {
+    let list = get(defs, r.sprite, nil)
+    if list == nil { continue }
+    let d = nil
+    for c in list { if c.frames == "" or index_of(c.frames, r.frame) >= 0 { d = c } }
+    if d == nil { continue }
+    # a monster lights up only on a frame that fires (Doom draws those full bright)
+    if r.type != nil and r.alive == 1 and r.fullbright != 1 and d.frames == "" { continue }
+    let x = r.x * 1.0e0
+    let y = r.y * 1.0e0
+    let z = r.z * 1.0e0
+    let b = get(before, str(r.thing_id), nil)
+    if b != nil and (x - b.x) * (x - b.x) + (y - b.y) * (y - b.y) < 128.0e0 * 128.0e0 {
+      x = b.x + (x - b.x) * alpha
+      y = b.y + (y - b.y) * alpha
+      z = b.z + (z - b.z) * alpha
+    }
+    let k = 1.0e0
+    if d.flicker > 0 {
+      let ph = (r.thing_id % 97) * 0.37e0
+      k = 1.0e0 - d.flicker * (0.5e0 + 0.5e0 * sin(now_s * 9.0e0 + ph) * sin(now_s * 5.3e0 + ph * 1.7e0))
+    }
+    push(out, {"x": x, "y": y, "z": z + d.height, "radius": d.radius, "r": d.r * k, "g": d.g * k, "b": d.b * k})
+  }
+  for g in glows {
+    let k = 0.85e0 + 0.15e0 * sin(now_s * 1.6e0 + g.pulse * 6.28e0)
+    push(out, {"x": g.x, "y": g.y, "z": g.z, "radius": g.radius, "r": g.r * k, "g": g.g * k, "b": g.b * k})
+  }
+  return out
+}

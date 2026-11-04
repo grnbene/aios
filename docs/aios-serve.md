@@ -167,7 +167,7 @@ the answer is a 502/503 after the same retries a route gets. Driven by `scripts/
 two app hosts on loopback).
 
 `apps/warehouse_touches` puts the two together: its `/quickreportevents` route waits on the `touch_day` Thing with
-`WAIT THING` (see `docs/asql.md`) and pushes the new figures when a day of the page's range changes.
+`WAIT THING` (see `docs/asql-internals.md`) and pushes the new figures when a day of the page's range changes.
 
 ---
 

@@ -4,7 +4,7 @@ This directory contains standalone SQL reference declarations and proof-harness 
 
 > [!NOTE]
 > For the comprehensive user and architecture guide on Things (covering IVM, `WHEN ... DO`, `AS OF`, `EXPLAIN THING`, `WHAT IF`, and `INTO`), see [docs/things.md](../docs/things.md).
-> For engine internals and grammar reference, see [docs/asql.md](../docs/asql.md#things).
+> For engine internals and grammar reference, see [docs/asql-internals.md](../docs/asql-internals.md#things).
 
 ---
 

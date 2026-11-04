@@ -138,6 +138,16 @@ if env("SQLDOOM_START", "") != "" {
       ", view_angle = " + sa + ", previous_view_angle = " + sa + " WHERE map_id = " + str(map_id) + " AND player_thing_id = " + str(player))
   sql("UPDATE things SET x = " + sx + ", y = " + sy + ", angle = " + sa + " WHERE map_id = " + str(map_id) + " AND id = " + str(player))
 }
+# SQLDOOM_WEAPON=n: the player starts owning weapon n (weapon_defs' id) with it in hand and ammo for it
+if env("SQLDOOM_WEAPON", "") != "" {
+  let wid = int(env("SQLDOOM_WEAPON", ""))
+  let where = " WHERE map_id = " + str(map_id) + " AND player_thing_id = " + str(player)
+  sql("INSERT INTO player_weapon_owned (map_id, player_thing_id, weapon_id) VALUES (" + str(map_id) + ", " + str(player) + ", " + str(wid) +
+      ") ON CONFLICT (map_id, player_thing_id, weapon_id) DO NOTHING")
+  sql("UPDATE player_weapons SET current_weapon = " + str(wid) + ", pending_weapon = NULL, state = 'ready', seq_index = 0, tics = 1, sy = 32.0" + where)
+  sql("UPDATE player_state SET ammo_bullets = GREATEST(ammo_bullets, 200), ammo_shells = GREATEST(ammo_shells, 50), " +
+      "ammo_rockets = GREATEST(ammo_rockets, 50), ammo_cells = GREATEST(ammo_cells, 300)" + where)
+}
 
 let held = {}
 let pending_weapon = nil
@@ -599,7 +609,9 @@ fn render_frame_3d() {
   r3d_doom_draw(r3, cur_scene, prev_scene, alpha, pose, t0 / 1000.0e0)
   r3_last_ms = clock() - t0
   last_frame_tic = tics
-  if frames > 0 { print(format("  3d: tic's scene sql {:.1f} ms, frame {:.1f} ms, {} triangles", r3.sql_ms, r3.fill_ms, r3.tris)) }
+  if frames > 0 { print(format("  3d: tic's scene sql {:.1f} ms, frame {:.1f} ms, {} triangles, {} lights, weapon layers {}{}", r3.sql_ms, r3.fill_ms, r3.tris, r3.nlights, len(cur_scene.weapon),
+                                  cur_scene.wstate == nil ? "" : format(", weapon {} {} {} shot {} ({:.2f} s since)", cur_scene.wstate.weapon, cur_scene.wstate.state, cur_scene.wstate.seq, cur_scene.wstate.shot,
+                                                                         t0 / 1000.0e0 - r3.vm.fire_t))) }
 }
 
 let keymap = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
@@ -1013,6 +1025,13 @@ if frames > 0 {
     render_frame()
     let fp = flash_palette(cur_damage, cur_bonus, cur_radsuit)
     print(status + format(", frame {:.0f} ms, at {} health {} bullets {}", clock() - t0, cur_at, cur_health, cur_bullets) + (fp > 0 ? format(", flash palette {} (pain {}, pickup {})", fp, cur_damage, cur_bonus) : ""))
+    # SQLDOOM_SHOT_EACH=1: every frame saved, SQLDOOM_SHOT's name with the frame's number before its extension
+    if env("SQLDOOM_SHOT_EACH", "") == "1" and hud_mode == "modern" {
+      let each = canvas_create(1280, 960)
+      draw_world(each)
+      let base = env("SQLDOOM_SHOT", "frame.png")
+      canvas_save_png(each, replace(base, ".png", format("_{:03d}.png", i)))
+    }
   }
   if hud_mode == "modern" {
     # the 3D picture as the window has it under its HUD text: the classic bar and the screen flash with it

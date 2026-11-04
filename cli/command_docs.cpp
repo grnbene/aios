@@ -135,7 +135,7 @@ const std::vector<CommandDoc>& command_docs() {
   }},
   {"compute", "COMPUTE & GRAPH EXECUTION", "compute kernels|serve", "Compute kernels, and the compute/SQL server (ASQL)", {
     {"kernels", "compute kernels", "the kernels each device runs"},
-    {"serve", "compute serve [port=7311] [lanes=N] [token=T] [public=1] [sql=1] [mysql_port=P] [cdc_host=H cdc_db=DB ...]", "serve compute; with sql=1, ASQL: a MySQL-speaking database that can mirror a MariaDB (see docs/asql.md)"},
+    {"serve", "compute serve [port=7311] [lanes=N] [token=T] [public=1] [sql=1] [mysql_port=P] [cdc_host=H cdc_db=DB ...]", "serve compute; with sql=1, ASQL: a MySQL-speaking database that can mirror a MariaDB (see docs/asql-internals.md)"},
   }},
   {"sat", "COMPUTE & GRAPH EXECUTION", "sat devices|solve|fleet", "SAT solver", {
     {"devices", "sat devices", "devices that can run the solver"},

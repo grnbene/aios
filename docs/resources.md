@@ -922,7 +922,7 @@ checked only by the `CapabilityGuard` that holds the same key.
 
 `aios-engine` boots a kernel on `--root`, starts the ASQL database and its
 MySQL-wire server, and constructs the sidecar subsystems
-(`tools/aios-engine.cpp`). The SQL side is documented in [asql.md](asql.md).
+(`tools/aios-engine.cpp`). The SQL side is documented in [asql-internals.md](asql-internals.md).
 Its flags, all `--name=value`:
 
 | Flag | Default | Used for |

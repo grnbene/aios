@@ -1046,7 +1046,7 @@ compute service listening on 127.0.0.1:13485 lanes=4 max_points=15
 ```
 
 Unit files and the conf itself are covered in
-[asql.md](asql.md#running-it-as-a-service).
+[asql-internals.md](asql-internals.md#running-it-as-a-service).
 
 ---
 

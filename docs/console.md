@@ -783,7 +783,7 @@ state objects inside the current process, so a later `exec` does not see it.
 | `grain` | the machine's own language (`grain eval 1+2` → `3`) |
 | `mind` · `qwen` (`llm`, `spark`) · `ask` · `dream` · `organ` · `face` | the intelligence slot (above) |
 
-**Database**, see [asql.md](asql.md): `sql` (`asql`, `mariadb`, `db`).
+**Database**, see [README-ASQL.md](../README-ASQL.md) and [asql-internals.md](asql-internals.md): `sql` (`asql`, `mariadb`, `db`).
 
 **Network and fleet**, see [network.md](network.md)
 

@@ -161,7 +161,7 @@ Grain syntax is modern and approachable (resembling TypeScript and Python). Refe
 
 - [Writing Grain Apps](../../docs/grain-app-writing.md) — Routing, request/response lifecycle, configuration, and hooks.
 - [Grain Language Reference](../../docs/grain-reference.md) — Language specifications and built-in standard library functions.
-- [Things in AIOS](../../docs/things.md) and [ASQL Grain Things](../../docs/asql.md#grain-things) — Architecture and sandbox rules for ASQL Things (table access constraints, pure execution rules).
+- [Things in AIOS](../../docs/things.md) and [ASQL Grain Things](../../docs/asql-internals.md#grain-things) — Architecture and sandbox rules for ASQL Things (table access constraints, pure execution rules).
 - Quick experiments: Run standalone Grain scripts with `grain run <script.gr>`.
 
 ## 8. Verifying Logic & Calculations

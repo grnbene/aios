@@ -17,7 +17,7 @@ ids), the tables invoicing writes besides (`extra.sql`), and 40 picked orders ov
     php concurrency.php 33500           # the concurrent-transaction rules, over real connections
 
 `up.sh` expects the schema, `extra.sql`, `seed-base.sql` and `orders.sql` beside it (edit the paths at its top).
-What it found and what changed in the engine: docs/asql.md, "Transactions".
+What it found and what changed in the engine: docs/asql-internals.md, "Transactions".
 
 `createInvoice-atomic.patch` is the change to the ERP's `system/library/weberp/b2b.php` these drives were run
 against (apply in a v8-server checkout with `git am` or `git apply`):

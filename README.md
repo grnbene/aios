@@ -71,7 +71,8 @@ allocated CPU slots.
 | guide | covers |
 |---|---|
 | [docs/console.md](docs/console.md) | the `aios` console, roots, the resident machine, the familiar shell, entities and capabilities, the optional mind |
-| [docs/asql.md](docs/asql.md) | running ASQL, the MySQL wire server, replicating MariaDB, write modes, Things and Cells, running it as a service |
+| [README-ASQL.md](README-ASQL.md) | ASQL developer guide: in-memory engine, Grain & MySQL client integration, quickstart, Things, Cells, write modes |
+| [docs/asql-internals.md](docs/asql-internals.md) | ASQL engine internals, verification transcripts, storage format, replication, and service operations |
 | [docs/things.md](docs/things.md) | Things, the practical guide: one worked example from a first Thing to acting on it safely (shadow, then live), looking back (`AS OF`, `EXPLAIN`), previewing a write (`WHAT IF`) and building one Thing on another (`INTO`) |
 | [docs/network.md](docs/network.md) | the web server, TLS, SSH, linking two machines, moving a running workload, the fleet relay and gateway, the native TCP/IP stack |
 | [docs/fleet.md](docs/fleet.md) | several machines as one: membership and keys, discovery, remote devices and memory, moving running work, fleet-wide SQL, the orchestrator, running a fleet |

@@ -22,7 +22,7 @@ Around that core, a Thing does what usually takes several other systems:
 This guide covers the query-built Things above. Other kinds of Thing - computed by a program, reconciling several
 source systems, allocating stock, running once at a time, following another machine - are listed at the end.
 
-For complete grammar specifications and engine internals, see [asql.md](asql.md#things).
+For complete grammar specifications and engine internals, see [asql-internals.md](asql-internals.md#things).
 
 ---
 
@@ -217,17 +217,17 @@ The Things in this guide are made by a query. The same engine has other kinds, f
 
 - **Grain Things** (`CREATE THING ... GRAIN KEY ... AS '<program>'`): values computed by a Grain program instead of a
   query - for state a `GROUP BY` cannot express (the warehouse app's `touch_hour` is one). See
-  [asql.md - Grain Things](asql.md#grain-things).
+  [asql-internals.md - Grain Things](asql-internals.md#grain-things).
 - **Conflicts across sources** (`SOURCE BY`, `RESOLVE THING`, `CHECK THING`): one Thing fed by several systems,
   keeping each side's values, settling the fields they disagree on, and checking the picks are consistent. See
-  [asql.md - Conflicts](asql.md#conflicts-source-by-keeps-both-sides) and
-  [Settling conflicts together](asql.md#settling-conflicts-together-and-checking-the-picks).
+  [asql-internals.md - Conflicts](asql-internals.md#conflicts-source-by-keeps-both-sides) and
+  [Settling conflicts together](asql-internals.md#settling-conflicts-together-and-checking-the-picks).
 - **Resources and claims** (`RESOURCE`, `CLAIMS`): stock that orders claim, shared out again as either side
   changes - first come first served, or so that the most orders are complete (`ALLOCATE READY`). See
-  [asql.md - Resources and claims](asql.md#resources-and-claims-allocating-stock-to-orders).
+  [asql-internals.md - Resources and claims](asql-internals.md#resources-and-claims-allocating-stock-to-orders).
 - **Event Things** (`CREATE THING <name> AT '<time>' GRAIN ...`): a planned piece of work - a midnight price change -
   that runs once at its time, writes only what it was given leave to (`AIOS_THING_WRITES=1`), and leaves a receipt.
-  See [asql.md - Event Things](asql.md#event-things-a-program-that-runs-once-at-a-set-time).
+  See [asql-internals.md - Event Things](asql-internals.md#event-things-a-program-that-runs-once-at-a-set-time).
 - **Mirrors** (`CREATE THING <name> MIRROR <kind> ON <machine>`): another machine's Things, followed over the fleet,
   with history and alerts of their own here. See [fleet.md - Mirrors](fleet.md#mirrors-things-about-another-machine).
 
@@ -270,7 +270,7 @@ The Things in this guide are made by a query. The same engine has other kinds, f
 
 ## References
 
-- [asql.md - Things Reference](asql.md#things)
+- [asql-internals.md - Things Reference](asql-internals.md#things)
 - [design/thing-time-travel.md](design/thing-time-travel.md)
 - [design/thing-what-if.md](design/thing-what-if.md)
 - [design/thing-into.md](design/thing-into.md)

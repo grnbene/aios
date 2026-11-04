@@ -10,7 +10,7 @@ AIOS_ROOT=/opt/aios/root
 # Engine environment. This file is sourced by asql-serve, so an exported
 # variable reaches the engine. The unit already sets AIOS_NO_ACCEL=1 and
 # AIOS_TXN_CONCURRENT=1 (transactions side by side; "Transactions" in
-# docs/asql.md). AIOS_SQL_STRICT=1 refuses an INSERT or UPDATE whose value
+# docs/asql-internals.md). AIOS_SQL_STRICT=1 refuses an INSERT or UPDATE whose value
 # does not fit its column, as MariaDB's STRICT_TRANS_TABLES does; leave it
 # off for a MariaDB that runs with sql_mode empty ("Strict mode" in the docs).
 #export AIOS_SQL_STRICT=1

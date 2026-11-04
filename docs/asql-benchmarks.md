@@ -1,3 +1,131 @@
+# ASQL against DuckDB on the ERP's own reports, tenth pass: 2026-11-04
+
+The first pass against DuckDB rather than MariaDB, and the first on the ERP's
+real data and real report statements: summitholding's `stocktrans` view (the
+8-way join over `stockmoves`, 12.5M rows, and its parents) behind three
+reports. Earlier DuckDB comparisons, on a synthetic ERP set, are in
+`asql-vectorized-plan.md` ("ERP shapes against DuckDB"). The MariaDB passes
+below were not re-run for this one, so their numbers are as they were taken.
+
+- **thisoverlast**: sales, cost and units per month for each year since
+  2024 - 36 `SUM(CASE WHEN tranmnth = m THEN .. ELSE 0 END)` over 3.2M
+  joined rows, filtered by `categoryid IN (SELECT ..)` and
+  `loccode IN (SELECT ..)`.
+- **nopurchase**: correlated subqueries over the view, 100 rows out.
+- **brandbylocation**: quantity and total per brand,
+  `GROUP BY COALESCE(BRANDNAME, 'UNBRANDED')` over 10M joined rows.
+
+Setup: the local ASQL server (port 3307, the summitholding root, 8 lanes) on
+the development Mac, and DuckDB on a copy of the same tables; both on the same
+machine, one at a time. Each ASQL figure is 5 runs of the statement after
+one warm-up run, as the mysql client reports it; each DuckDB figure 5 runs by
+its `.timer`, the first counted. The
+machine carried other load all afternoon (load average 6-12), so a single
+run is noisy; ranges are shown and the first run is noted where it stood
+out. At each step ASQL's output was compared with the step before it, byte
+for byte: identical every time. ASQL's output was not compared with
+DuckDB's in this pass.
+
+Seconds:
+
+| report | ASQL this morning | + RLE runs, pivot fold | + IN (SELECT ..) in lanes | + DECIMAL rounding, text keys, arrays to the grouping | DuckDB |
+|---|---|---|---|---|---|
+| thisoverlast | 1.49-1.51 | 0.82-0.93 | 0.68-0.69 | **0.39-0.40** | 0.54-0.56 |
+| nopurchase | 0.73-0.74 | 0.70-0.72 | 0.70-0.72 | **0.71-0.72** | 1.53-1.57 |
+| brandbylocation | 2.57-2.82 | 2.30-2.57 | 2.00-2.24 | **0.81-0.82** | 1.42-1.46 |
+
+Each ASQL column is one build on 3307 after a restart; the IN column was
+taken just before the last step's restart. Runs left out of the ranges:
+brandbylocation's first five after the pivot step's restart were 2.92-3.74
+(again 2.30-2.57 once warm, and the same on both builds in a phase-by-phase
+trace); in the last column one thisoverlast run at 0.80 and
+brandbylocation's first at 1.05. DuckDB's first runs: 0.78, 1.78, 1.58.
+
+Where the time went, from the engine's phase trace on a copy of the root
+(`AIOS_VX_TRACE=1`):
+- thisoverlast this morning: 1.77 s - joins and WHERE 627 ms, the grouping
+  1,038 ms (the 36 sums' arguments 629 ms, folding them 379 ms). After the
+  pivot step the grouping was 239-252 ms (arguments 209 ms, folding 16 ms);
+  after the IN step 0.74-0.82 s warm, joins and WHERE 433-485 ms. Not traced
+  after the last step.
+- brandbylocation before the last step: 2.88-2.96 s - the WHERE over the
+  join's arrays 628 ms, 10M joined rows made 535 ms, the brand key 487 ms,
+  the two SUMs' arguments 670 ms. After it: the rows are not made, the key
+  is 61-136 ms and the arguments 124-463 ms (the machine's load moved these
+  most).
+
+What changed:
+- **RLE columns read in parts.** A scan's survivors are split into parts for
+  the lanes, and each part's column cache turned down a column more than 16x
+  its rows, so each row of a run-length column was a binary search over its
+  runs. A part's rows come in order: a cursor now steps from run to run and
+  searches only on a jump. On its own this barely moved thisoverlast; it is
+  a general cost removed from every lane program over a big RLE table.
+- **Pivot sums folded in one pass.** `SUM(CASE WHEN k = lit THEN x ELSE c
+  END)` for several lits over one k (also `IF()`, `CASE k WHEN`, no ELSE),
+  as the interpreter's pivot already found them: k's lane and each distinct
+  x's are made once, and one parallel pass adds x into the sums whose lit is
+  the row's k. Before, each of the 36 sums built a full CASE column and was
+  folded on its own. A sum is taken only where its own lane would have given
+  the same total at the same scale - exact integers, or DOUBLEs added in the
+  same row order - and any other keeps its own lane. Folding 379 ms -> 16 ms.
+  An exact SUM also no longer adds its doubles row by row in a serial pass;
+  only an AVG reads them.
+- **`text_col [NOT] IN (SELECT ..)` decided a column at a time.** The
+  subquery runs once through the interpreter's own IN; each dictionary
+  entry's answer is read from that set as the interpreter reads it, and each
+  row is one table lookup. thisoverlast's view has a `NOT debtorno IN
+  (SELECT ..)`, which stopped the WHERE being decided over the join's
+  arrays, so its 3.2M rows went to the interpreter three parts a row.
+- **CAST of a DOUBLE to DECIMAL, kept per value.** It prints the double's
+  shortest digits and reads them back (about 300 ns); `price` has 27,582
+  distinct values over 12.5M rows and the view casts it twice a row. Each
+  thread keeps the answer per value (the same call's answer, by the
+  double's bits). ROUND of an exact value divides in 64 bits where it fits,
+  not 128, by the same half-away-from-zero rule.
+- **A text GROUP BY key by reference.** `COALESCE(BRANDNAME, 'UNBRANDED')`
+  made a string per row and hashed it; the lane now carries the program's
+  reference (a dictionary entry or a literal), and each distinct reference's
+  collation class is worked out once, numbered in the order the rows show
+  them - the same groups.
+- **One-to-many star joins hand their arrays to the grouping.** With every
+  WHERE part decided over the arrays, a star join whose links were all
+  unique already went to the grouping unexpanded. One with a one-to-many
+  link (the view's `debtortrans`) made its 10M expanded rows into joined
+  rows first; the arrays now go to the grouping as the rows.
+
+Fixed on the way:
+- `NULL NOT IN (SELECT ..)` of a subquery that returns no rows is true (and
+  `NULL IN` false), as MariaDB 10.11 answers it. The interpreter answered
+  that only once another row had filled the subquery's set, so a NULL on the
+  first rows was unknown and the same statement kept 149,999 or 150,000 of
+  150,000 rows from run to run. A NULL now waits for the set like any other
+  value.
+
+Checked: each change has a check in `asql-grouped-expr-check` against a
+second way of answering the same statement (each pivot SUM alone; the
+interpreter, through a form no lane program takes; joined rows made), and
+the checks were shown to fail with the change broken on purpose (the ELSE
+left out of a pivot, its DOUBLEs added backwards, the NULL-in-set rule
+dropped). The DECIMAL rounding memo, the text key by reference and the
+arrays handed to the grouping were not broken on purpose: the trace shows
+both ways of answering ran for the last, and all three reports' output is
+byte-identical over the real 3.2M and 10M rows. The 37 ASQL checks pass; in one of four parallel runs
+`asql.stall.check`, which times reads during a big write, failed and then
+passed alone and in the three reruns.
+
+Still behind, and why:
+- **The joins and WHERE.** brandbylocation's largest phase left is deciding
+  its WHERE over the join's 10M arrays: 510-940 ms in the traces on the
+  root copy (under the afternoon's load; up to 1.7 s at its worst), then the
+  star join's key maps, about 0.1 s. Before the last step thisoverlast spent
+  433-485 ms in its joins and WHERE.
+- Two interpreter answers that differ from the lanes, found on the way and
+  not fixed: `k = 2.0000000000000000001` with an integer k matches 2 in the
+  interpreter's pivot (it compares as a double) and no row in the lanes; and
+  `DECIMAL * INT` across two joined tables has no exact lane, so a statement
+  holding one goes to the interpreter.
+
 # ASQL against MariaDB 10.11, ninth pass: same-table writes side by side, 2026-10-19
 
 Writes to one table no longer run one at a time: a single-row UPDATE by its

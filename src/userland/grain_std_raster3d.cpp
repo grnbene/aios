@@ -40,6 +40,7 @@ struct R3dTex {
     std::vector<uint32_t> px;
   };
   std::vector<Level> mips;
+  Level sky_smooth;     // r3d_sky's: level 0 smoothed along its rows, made the first time it is a sky
   bool alpha = false;   // some texel is transparent
   int scale = 1;        // texels per texel of the picture as given (r3d_options' upscale when it was uploaded)
 };
@@ -53,8 +54,14 @@ struct R3dSet {
   std::vector<R3dView> views;
 };
 
+// A point light: where (in the world as r3d_lights was given it; turned to the camera for each draw), its colour
+// (each channel 0..1 and past: how much of the surface's own colour it adds at its heart) and how far it reaches.
+struct R3dLight { double x, y, z, r, g, b, radius; };
+
 struct R3dTarget {
   int w = 0, h = 0;
+  std::vector<R3dLight> lights_world;   // r3d_lights
+  std::vector<R3dLight> lights_cam;     // the same in camera space, for the draw under way
   std::vector<uint32_t> color;  // 0x00RRGGBB
   std::vector<float> depth;     // 1/z of what is drawn there; 0 is nothing (an infinitely far background)
   int64_t tris = 0, filled = 0, clipped = 0, pixels = 0;
@@ -527,7 +534,29 @@ struct STri {
   const R3dTex* tex;
   float light;                   // 0..1
   int flags;
+  // the lights that can reach it (indices into the target's lights_cam), and its face's normal in camera space
+  uint8_t nl = 0;
+  uint8_t li[8];
+  float fnx = 0, fny = 0, fnz = -1;
 };
+
+// What the lights in reach add at a point of a surface (camera space) with normal n: per channel, as a share of the
+// surface's own colour. Each falls off smoothly to nothing at its radius, and lights only what faces it.
+inline void dyn_light(const R3dTarget& t, const STri& s, double px, double py, double pz, double nx, double ny, double nz,
+                      double* dr, double* dg, double* db) {
+  for (int i = 0; i < s.nl; ++i) {
+    const R3dLight& L = t.lights_cam[s.li[i]];
+    const double dx = L.x - px, dy = L.y - py, dz = L.z - pz;
+    const double d2 = dx * dx + dy * dy + dz * dz, r2 = L.radius * L.radius;
+    if (d2 >= r2) continue;
+    const double inv = 1.0 / std::sqrt(std::max(1e-6, d2));
+    const double ndl = (nx * dx + ny * dy + nz * dz) * inv;
+    if (ndl <= 0) continue;
+    const double f = 1.0 - d2 / r2;
+    const double k = f * f * (0.35 + 0.65 * ndl);
+    *dr += L.r * k; *dg += L.g * k; *db += L.b * k;
+  }
+}
 
 // A vertex: where it is (camera space), its texel, and - a mesh's, drawn without a texture - its lit colour (0..1+).
 struct TV {
@@ -618,13 +647,17 @@ void fill_col_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
       }
       const double z = 1.0 / q;
       double nx = A[3] * z, ny = A[4] * z, nz = A[5] * z;
-      // fine relief: the noise's slope at the surface's own point tips the normal (less on what is polished; a
-      // textured model's own picture has its detail)
-      if (!s.tex) {
+      // the smooth normal, for the dynamic lights: relief that only shades the key light would turn to blotches
+      // under a strong light close by
+      double sn = 1.0 / std::sqrt(std::max(1e-12, nx * nx + ny * ny + nz * nz));
+      const double snx = nx * sn, sny = ny * sn, snz = nz * sn;
+      // fine relief: the noise's slope at the surface's own point tips the normal (less on what is polished, none
+      // on a mirror; a textured model's own picture has its detail)
+      if (!s.tex && shine < 1.0) {
         const double ox = A[6] * z * 1.3, oy = A[7] * z * 1.3, oz = A[8] * z * 1.3, e = 0.35;
         const double n0 = vnoise(ox, oy, oz);
         const double gx = vnoise(ox + e, oy, oz) - n0, gy = vnoise(ox, oy + e, oz) - n0, gz = vnoise(ox, oy, oz + e) - n0;
-        const double amp = 1.5 * (1.0 - 0.6 * shine);
+        const double amp = 1.5 * (1.0 - 0.6 * shine) * std::min(1.0, 2.0 * (1.0 - shine));
         nx -= gx * amp; ny -= gz * amp; nz -= gy * amp;
       }
       const double nl = 1.0 / std::sqrt(std::max(1e-12, nx * nx + ny * ny + nz * nz));
@@ -667,8 +700,11 @@ void fill_col_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
         const double cmap = std::min(31.0, std::max(0.0, 60.0 - L * 63.75 - fall / std::max(z, 1.0)));
         b *= std::min(1.0, std::max(0.0, 1.0 - cmap / 32.0 * gain + lift));
       }
-      crow[x] = ((uint32_t)std::min(255.0, std::max(0.0, r * b)) << 16) | ((uint32_t)std::min(255.0, std::max(0.0, g * b)) << 8) |
-                (uint32_t)std::min(255.0, std::max(0.0, bl * b));
+      double dr = 0, dg = 0, db = 0;
+      if (s.nl && !bright) dyn_light(t, s, cxp, cyp, z, snx, sny, snz, &dr, &dg, &db);
+      crow[x] = ((uint32_t)std::min(255.0, std::max(0.0, r * b + ar * dr * 255.0)) << 16) |
+                ((uint32_t)std::min(255.0, std::max(0.0, g * b + ag * dg * 255.0)) << 8) |
+                (uint32_t)std::min(255.0, std::max(0.0, bl * b + ab * db * 255.0));
       drow[x] = qf;
       ++*pixels;
     }
@@ -687,6 +723,7 @@ void fill_tex_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
   const float L = s.light;
   const double gain = t.light_gain, lift = t.light_lift, fall = t.light_fall;
   const bool bil = t.bilinear, mips = t.mipmaps;
+  const double lcx = t.w * 0.5, lcy = t.h * 0.5, lfy = t.focal * t.y_scale;
   const int y_lo = std::max(s.y0, ya), y_hi = std::min(s.y1, yb - 1);
   for (int y = y_lo; y <= y_hi; ++y) {
     const double py = y + 0.5;
@@ -742,7 +779,11 @@ void fill_tex_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
         const double cmap = std::min(31.0, std::max(0.0, 60.0 - L * 63.75 - fall / std::max(z, 1.0)));
         b *= std::min(1.0, std::max(0.0, 1.0 - cmap / 32.0 * gain + lift));
       }
-      const uint32_t r = (uint32_t)(((p >> 16) & 255) * b), g = (uint32_t)(((p >> 8) & 255) * b), bl = (uint32_t)((p & 255) * b);
+      double br = b, bg = b, bb = b;
+      if (s.nl && !bright)
+        dyn_light(t, s, (x + 0.5 - lcx) / t.focal * z, (lcy - py) / lfy * z, z, s.fnx, s.fny, s.fnz, &br, &bg, &bb);
+      const uint32_t r = (uint32_t)std::min(255.0, ((p >> 16) & 255) * br), g = (uint32_t)std::min(255.0, ((p >> 8) & 255) * bg),
+                     bl = (uint32_t)std::min(255.0, (p & 255) * bb);
       crow[x] = (r << 16) | (g << 8) | bl;
       drow[x] = qf;
       ++*pixels;
@@ -773,6 +814,38 @@ void clip_project(const R3dTarget& t, const TV* v, double focal, const R3dTex* t
       }
     }
   }
+  // the face's normal (camera space, turned toward the eye) and the lights whose reach meets its box and that are
+  // in front of it
+  float fn[3] = {0, 0, -1};
+  uint8_t li[8];
+  uint8_t nl = 0;
+  if (!t.lights_cam.empty() && !(flags & 2)) {
+    const double ax = p[1].x - p[0].x, ay = p[1].y - p[0].y, az = p[1].z - p[0].z;
+    const double bx = p[2].x - p[0].x, by = p[2].y - p[0].y, bz = p[2].z - p[0].z;
+    double nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+    const double nn = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nn > 1e-12) {
+      nx /= nn; ny /= nn; nz /= nn;
+      if (nx * p[0].x + ny * p[0].y + nz * p[0].z > 0) { nx = -nx; ny = -ny; nz = -nz; }
+      fn[0] = (float)nx; fn[1] = (float)ny; fn[2] = (float)nz;
+    }
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (int i = 0; i < n; ++i) {
+      lo[0] = std::min(lo[0], p[i].x); hi[0] = std::max(hi[0], p[i].x);
+      lo[1] = std::min(lo[1], p[i].y); hi[1] = std::max(hi[1], p[i].y);
+      lo[2] = std::min(lo[2], p[i].z); hi[2] = std::max(hi[2], p[i].z);
+    }
+    const bool mesh = !tx || (flags & 64);   // a model's own normals vary across a face: no facing test for it
+    for (size_t k = 0; k < t.lights_cam.size() && nl < 8; ++k) {
+      const R3dLight& L = t.lights_cam[k];
+      const double ex = std::max(0.0, std::max(lo[0] - L.x, L.x - hi[0]));
+      const double ey = std::max(0.0, std::max(lo[1] - L.y, L.y - hi[1]));
+      const double ez = std::max(0.0, std::max(lo[2] - L.z, L.z - hi[2]));
+      if (ex * ex + ey * ey + ez * ez >= L.radius * L.radius) continue;
+      if (!mesh && fn[0] * (L.x - p[0].x) + fn[1] * (L.y - p[0].y) + fn[2] * (L.z - p[0].z) <= 0) continue;
+      li[nl++] = (uint8_t)k;
+    }
+  }
   double sx[4], sy[4], q[4], uq[4], vq[4], aqv[kAttrs][4];
   const double cx = t.w * 0.5, cy = t.h * 0.5, fy = focal * t.y_scale;
   for (int i = 0; i < n; ++i) {
@@ -798,6 +871,9 @@ void clip_project(const R3dTarget& t, const TV* v, double focal, const R3dTex* t
     s.tex = tx;
     s.light = light;
     s.flags = flags;
+    s.nl = nl;
+    for (int i = 0; i < nl; ++i) s.li[i] = li[i];
+    s.fnx = fn[0]; s.fny = fn[1]; s.fnz = fn[2];
     out->push_back(s);
   }
 }
@@ -972,7 +1048,8 @@ Value bi_r3d_mesh(Vm&, std::vector<Value>& args, std::string& error) {
   auto* opt = static_cast<MapObj*>(args[3].obj.get());
   double cell = 1.0;
   field(opt, "cell", cell);
-  if (!(cell >= 0.25 && cell <= 8)) { error = "r3d_mesh(): cell wants 0.25..8 units"; return Value::nil(); }
+  // as fine as a weapon held at the eye wants (a pistol is seven units long); the grid itself is bounded below
+  if (!(cell >= 0.05 && cell <= 8)) { error = "r3d_mesh(): cell wants 0.05..8 units"; return Value::nil(); }
   Value* restv = opt->find("rest");
   if (!restv || restv->type != Type::List || restv->list_items().empty() || restv->list_items().size() % 12 != 0) {
     error = "r3d_mesh(): rest wants the bones' rest matrices, 12 numbers a bone";
@@ -1149,11 +1226,21 @@ Value bi_r3d_mesh(Vm&, std::vector<Value>& args, std::string& error) {
         dmin = std::min(dmin, d);
         near.push_back({d, si});
       }
+      // the shape the point lies on: a seam's colour spreads as far as the seam's own fillet, the smaller of the two
+      // shapes' blends - wide between two soft forms, sharp where a hand meets steel (blend 0.35 and over spread as
+      // they always did)
+      double blend_here = 0.8;
+      for (const auto& nd : near)
+        if (nd.first == dmin) { blend_here = sc.shapes[nd.second].blend; break; }
       for (const auto& nd : near) {
         const Shape& s = sc.shapes[nd.second];
         double f;
         s.dist(p, &f);
-        const double w = std::exp(-(nd.first - dmin) / std::max(0.35, s.blend * 0.35));
+        const double bseam = std::min(s.blend, blend_here);
+        // the colour's spread: 0.35 units for a seam of blend 0.35 and over (as always), falling off faster than the
+        // blend below it so a hard seam (a cuff on skin, a hand on steel) changes colour at its edge, not in a fade
+        const double cfall = bseam >= 0.35 ? std::max(0.35, bseam * 0.35) : std::max(0.01, 0.35 * std::pow(bseam / 0.35, 1.5));
+        const double w = std::exp(-(nd.first - dmin) / cfall);
         double r = ((s.c1 >> 16) & 255) * (1 - f) + ((s.c2 >> 16) & 255) * f;
         double g = ((s.c1 >> 8) & 255) * (1 - f) + ((s.c2 >> 8) & 255) * f;
         double b = (s.c1 & 255) * (1 - f) + (s.c2 & 255) * f;
@@ -1163,7 +1250,11 @@ Value bi_r3d_mesh(Vm&, std::vector<Value>& args, std::string& error) {
           r *= k; g *= k; b *= k;
         }
         R += w * r; G += w * g; B += w * b; S += w * s.shine; Gl += w * s.glow; W += w;
-        wsum[(size_t)s.bone] += std::exp(-(nd.first - dmin) / 1.2);
+        // its bones likewise: flesh bends across a soft seam (1.2 units, blend 0.35 and over), a hard one is rigid -
+        // a slide, a pump, a muzzle flash moves alone, not dragging the frame, barrel or bore beside it into a sheet
+        const double hard = std::min(1.0, std::max(0.0, (bseam - 0.02) / 0.33));
+        const double bone_fall = std::max(0.01, 1.2 * hard * hard);
+        wsum[(size_t)s.bone] += std::exp(-(nd.first - dmin) / bone_fall);
       }
       int b0 = 0, b1 = 0;
       for (int b = 0; b < nb; ++b) if (wsum[(size_t)b] > wsum[(size_t)b0]) b0 = b;
@@ -1662,6 +1753,16 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
     const double x = ex * sa - ey * ca, f = ex * ca + ey * sa;
     return Vec{x, ez * cp - f * sp, ez * sp + f * cp};
   };
+  // the lights, turned to the camera with the scene (none for a draw without one: its rows are camera space already
+  // and so would the lights have to be); those wholly behind the eye are left out
+  t->lights_cam.clear();
+  if (world)
+    for (const R3dLight& L : t->lights_world) {
+      const Vec c = to_cam(L.x - cxw, L.y - cyw, L.z - czw);
+      if (c.z < -L.radius) continue;
+      t->lights_cam.push_back({c.x, c.y, c.z, L.r, L.g, L.b, L.radius});
+      if (t->lights_cam.size() >= 255) break;
+    }
   static const std::string kx[3] = {"x0", "x1", "x2"}, ky[3] = {"y0", "y1", "y2"}, kz[3] = {"z0", "z1", "z2"};
   static const std::string ku[3] = {"u0", "u1", "u2"}, kv[3] = {"v0", "v1", "v2"};
   static const std::string ktex = "tex", klight = "light", kflags = "flags";
@@ -1764,8 +1865,20 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
           if (md.nodes[(size_t)i].parent < 0) std::memcpy(&world[(size_t)i * 12], L, sizeof L);
           else m34_mul(&world[(size_t)md.nodes[(size_t)i].parent * 12], L, &world[(size_t)i * 12]);
         }
+        // which way it faces (angle), and, for what is not stood on the ground (a weapon in the eye's hand), how far it
+        // tips its nose up (pitch) and rolls to its right (roll), in degrees: Rz(angle) Ry(-pitch) Rx(roll)
+        double pitchv = 0, rollv = 0;
+        field(m, "pitch", pitchv);
+        field(m, "roll", rollv);
         const double th = ang * kPi / 180.0, ct = std::cos(th), st = std::sin(th);
-        const double place[12] = {ct * scale, -st * scale, 0, X, st * scale, ct * scale, 0, Y, 0, 0, scale, Z};
+        const double ph = -pitchv * kPi / 180.0, cph = std::cos(ph), sph = std::sin(ph);
+        const double rh = rollv * kPi / 180.0, crh = std::cos(rh), srh = std::sin(rh);
+        // Rz * Ry * Rx, row by row
+        const double R00 = ct * cph, R01 = ct * sph * srh - st * crh, R02 = ct * sph * crh + st * srh;
+        const double R10 = st * cph, R11 = st * sph * srh + ct * crh, R12 = st * sph * crh - ct * srh;
+        const double R20 = -sph, R21 = cph * srh, R22 = cph * crh;
+        const double place[12] = {R00 * scale, R01 * scale, R02 * scale, X, R10 * scale, R11 * scale, R12 * scale, Y,
+                                  R20 * scale, R21 * scale, R22 * scale, Z};
         double to_world[12];
         m34_mul(place, md.root, to_world);
         std::vector<double> skin(md.joints.size() * 12);
@@ -1970,15 +2083,80 @@ Value bi_r3d_sky(Vm&, std::vector<Value>& args, std::string& error) {
     const double el = std::atan2(t->h * 0.5 - (y + 0.5), fy) + t->pitch;
     vrow[(size_t)y] = 100.0 - std::tan(std::max(-1.45, std::min(1.45, el))) * rows_per_unit;
   }
+  // Past the picture's top (looking up, which Doom never could) and its bottom: the picture fades into the mean
+  // colour of its top (bottom) eighth, from a quarter inside the edge to half the picture's height past it, and is
+  // that colour beyond. Held at
+  // the edge row, every column was its own top texel straight up the screen: vertical stripes.
+  auto mean_rows = [&](int r0, int r1) {
+    uint64_t R = 0, G = 0, B = 0, n = 0;
+    for (int r = std::max(0, r0); r < std::min(L.h, r1); ++r)
+      for (int x = 0; x < L.w; ++x) {
+        const uint32_t p = L.px[(size_t)r * L.w + x];
+        R += (p >> 16) & 255; G += (p >> 8) & 255; B += p & 255; ++n;
+      }
+    if (!n) return 0u;
+    return (uint32_t)(((R / n) << 16) | ((G / n) << 8) | (B / n));
+  };
+  const int eighth = std::max(1, L.h / 8);
+  const uint32_t cap_top = mean_rows(0, eighth), cap_bottom = mean_rows(L.h - eighth, L.h);
+  const double fade = std::max(1.0, L.h * 0.5);
+  auto mix = [](uint32_t a, uint32_t b, double f) {
+    const double g = 1.0 - f;
+    return ((uint32_t)(((a >> 16) & 255) * g + ((b >> 16) & 255) * f) << 16) |
+           ((uint32_t)(((a >> 8) & 255) * g + ((b >> 8) & 255) * f) << 8) | (uint32_t)((a & 255) * g + (b & 255) * f);
+  };
+  // Doom's skies are streaked in their upper part (each column's colour run down), invisible at 320x200 and stripes
+  // across a large screen: toward the top the picture blends into a copy of itself smoothed along each row (a box of
+  // 1/16 of the picture's width), the mountains below it left as they are.
+  // made once a texture (a running sum along each row) and kept with it
+  if (tx->sky_smooth.px.size() != L.px.size()) {
+    R3dTex::Level sm = L;
+    const int rad = std::max(1, L.w / 32);
+    const uint32_t n = (uint32_t)(2 * rad + 1);
+    for (int r = 0; r < L.h; ++r) {
+      const uint32_t* src = &L.px[(size_t)r * L.w];
+      uint32_t* dst = &sm.px[(size_t)r * L.w];
+      auto at = [&](int x) { return src[((x % L.w) + L.w) % L.w]; };
+      uint32_t R = 0, G = 0, B = 0;
+      for (int k = -rad; k <= rad; ++k) { const uint32_t p = at(k); R += (p >> 16) & 255; G += (p >> 8) & 255; B += p & 255; }
+      for (int x = 0; x < L.w; ++x) {
+        dst[x] = 0xFF000000u | ((R / n) << 16) | ((G / n) << 8) | (B / n);
+        const uint32_t out = at(x - rad), in = at(x + rad + 1);
+        R += ((in >> 16) & 255) - ((out >> 16) & 255);
+        G += ((in >> 8) & 255) - ((out >> 8) & 255);
+        B += (in & 255) - (out & 255);
+      }
+    }
+    tx->sky_smooth = std::move(sm);
+  }
+  const R3dTex::Level& smooth = tx->sky_smooth;
+  const double smooth_to = L.h * 0.6;   // from this row up the smoothed copy takes over, wholly by the top
   const bool bil = t->bilinear;
   R3dTarget& T = *t;
   auto rows = [&](size_t y0, size_t y1, size_t) {
     for (size_t y = y0; y < y1; ++y) {
-      const double v = std::min((double)L.h - 0.51, std::max(0.0, vrow[y] * sc));
+      const double vr = vrow[y] * sc;
+      double g = vr < smooth_to ? std::min(1.0, (smooth_to - vr) / smooth_to) : 0.0;
+      g = g * g * (3.0 - 2.0 * g);
+      const double v = std::min((double)L.h - 0.51, std::max(0.0, vr));
+      // how far past an edge, as a smooth 0..1
+      // the fade starts inside the picture (a quarter of it from the edge, where Doom's skies already streak: their
+      // top rows are a column's colour run down) and ends half a picture past it
+      double f = 0.0;
+      uint32_t cap = cap_top;
+      const double inner = L.h * 0.25;
+      if (vr < inner) f = std::min(1.0, (inner - vr) / (inner + fade));
+      else if (vr > L.h - 1 - inner) { f = std::min(1.0, (vr - (L.h - 1 - inner)) / (inner + fade)); cap = cap_bottom; }
+      f = f * f * (3.0 - 2.0 * f);
       uint32_t* crow = &T.color[y * T.w];
       const float* drow = &T.depth[y * T.w];
-      for (int x = 0; x < T.w; ++x)
-        if (drow[x] == 0.0f) crow[x] = sample(L, col[(size_t)x], v, false, bil) & 0xFFFFFF;
+      for (int x = 0; x < T.w; ++x) {
+        if (drow[x] != 0.0f) continue;
+        if (f >= 1.0) { crow[x] = cap; continue; }
+        uint32_t p = sample(L, col[(size_t)x], v, false, bil) & 0xFFFFFF;
+        if (g > 0.0) p = mix(p, sample(smooth, col[(size_t)x], v, false, bil) & 0xFFFFFF, g);
+        crow[x] = f > 0.0 ? mix(p, cap, f) : p;
+      }
     }
   };
   SqlThreadPool::instance().for_chunks((size_t)t->h, 32, (size_t)t->w * (size_t)t->h, false, rows);
@@ -2018,6 +2196,32 @@ Value bi_r3d_clear_depth(Vm&, std::vector<Value>& args, std::string& error) {
   if (!t) return Value::nil();
   std::fill(t->depth.begin(), t->depth.end(), 0.0f);
   return args[0];
+}
+
+// r3d_lights(t, rows) -> how many: the point lights for the draws that follow, each {x, y, z, radius, r, g, b} on the
+// world's axes (as r3d_draw_tex's camera is), colour channels 0..1 and past (a share of the lit surface's own
+// colour added at the light's heart). An empty list puts them out.
+Value bi_r3d_lights(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_lights");
+  if (!t) return Value::nil();
+  if (!want_list(args[1], error, "r3d_lights")) return Value::nil();
+  std::vector<R3dLight> out;
+  size_t at = 0;
+  for (const Value& row : args[1].list_items()) {
+    if (row.type != Type::Map) { error = "r3d_lights(): light " + std::to_string(at) + " is a " + type_name(row.type) + ", not a map"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(row.obj.get());
+    R3dLight L{};
+    if (!field(m, "x", L.x) || !field(m, "y", L.y) || !field(m, "z", L.z) || !field(m, "radius", L.radius) ||
+        !field(m, "r", L.r) || !field(m, "g", L.g) || !field(m, "b", L.b)) {
+      error = "r3d_lights(): light " + std::to_string(at) + " needs numbers x y z radius r g b";
+      return Value::nil();
+    }
+    ++at;
+    if (!(L.radius > 0)) continue;
+    out.push_back(L);
+  }
+  t->lights_world = std::move(out);
+  return Value::integer((int64_t)t->lights_world.size());
 }
 
 Value bi_r3d_options(Vm&, std::vector<Value>& args, std::string& error) {
@@ -2067,6 +2271,7 @@ void install_raster3d_builtins(Vm& vm) {
   vm.define_native("r3d_blit", 7, 7, bi_r3d_blit);
   vm.define_native("r3d_options", 2, 2, bi_r3d_options);
   vm.define_native("r3d_clear_depth", 1, 1, bi_r3d_clear_depth);
+  vm.define_native("r3d_lights", 2, 2, bi_r3d_lights);
   vm.define_native("r3d_target", 2, 2, bi_r3d_target);
   vm.define_native("r3d_clear", 1, 2, bi_r3d_clear);
   vm.define_native("r3d_draw", 2, 3, bi_r3d_draw);

@@ -30,7 +30,7 @@ browser; `aios` never sees your password.)
 
 ## Signing in on a server (sending mail from ASQL)
 
-A mailer (`CREATE MAILER ... OAUTH 'google' ACCOUNT '<email>'`, see [asql.md - Mailers](asql.md#mailers)) sends with
+A mailer (`CREATE MAILER ... OAUTH 'google' ACCOUNT '<email>'`, see [asql-internals.md - Mailers](asql-internals.md#mailers)) sends with
 the tokens that `google auth` keeps under the root of the machine that runs ASQL. On a server this has four
 differences from the desktop sign-in:
 

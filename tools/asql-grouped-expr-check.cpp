@@ -227,6 +227,266 @@ void check_pivot(SqlDatabase& db) {
   }
 }
 
+// The pivot shapes lane_group_by folds in one pass (PivotLanes): every SUM in one statement must print what it
+// prints in a statement of its own, where it is no pivot and its own CASE lane is folded (the per-aggregate way).
+// No ELSE (NULL), an ELSE other than 0, IF(), CASE k WHEN, `lit = k`, a k and an x with NULLs, a DOUBLE x (its
+// sums added in row order, as its own lane's fold adds them, to the last bit), a lit no integer
+// equals (1.5), a lit no row has, an x from the other table - over 200,000 joined rows, so the fold runs in parts;
+// then with a text lit, which sends the statement to the interpreter's pivot.
+void check_pivot_shapes(SqlDatabase& db) {
+  exec(db, "DROP TABLE IF EXISTS pc");
+  exec(db, "DROP TABLE IF EXISTS pk");
+  exec(db, "CREATE TABLE pk (k INT PRIMARY KEY, w INT NOT NULL)");
+  exec(db, "INSERT INTO pk VALUES (0, 1), (1, 2), (2, 3)");
+  exec(db, "CREATE TABLE pc (id INT PRIMARY KEY, g INT NOT NULL, j INT NOT NULL, k INT, x DECIMAL(10,2), q INT NOT NULL, d DOUBLE)");
+  const int n = 200000;
+  for (int b = 0; b < n; b += 4000) {
+    std::string v;
+    for (int i = b; i < b + 4000; ++i) {
+      char k[16], x[24], d[32], row[160];
+      if (i % 17 == 0) std::snprintf(k, sizeof k, "NULL"); else std::snprintf(k, sizeof k, "%d", 1 + (i * 7) % 4);
+      if (i % 13 == 0) std::snprintf(x, sizeof x, "NULL"); else std::snprintf(x, sizeof x, "%.2f", (double)(i % 997) * 0.37 - 90.0);
+      // a DOUBLE no binary fraction holds (0.1 steps): its sums depend on the order they are added in
+      if (i % 19 == 0) std::snprintf(d, sizeof d, "NULL"); else std::snprintf(d, sizeof d, "%.1f", (double)(i % 101) * 0.1 - 3.3);
+      std::snprintf(row, sizeof row, "%s(%d,%d,%d,%s,%s,%d,%s)", v.empty() ? "" : ",", i, i % 5, i % 3, k, x, i % 11 - 5, d);
+      v += row;
+    }
+    exec(db, "INSERT INTO pc VALUES " + v);
+  }
+  std::vector<std::string> sums;
+  for (int l = 1; l <= 4; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.x ELSE 0 END)");
+  for (int l = 1; l <= 3; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.x END)");
+  for (int l = 1; l <= 3; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.q ELSE 7 END)");
+  for (int l = 1; l <= 3; ++l) sums.push_back("SUM(IF(pc.k = " + std::to_string(l) + ", pc.x * pc.q, 0))");
+  for (int l = 1; l <= 3; ++l) sums.push_back("SUM(CASE pc.k WHEN " + std::to_string(l) + " THEN pc.q ELSE -2 END)");
+  for (int l = 1; l <= 2; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.d ELSE 0 END)");
+  for (int l = 1; l <= 2; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.d END)");
+  for (int l = 1; l <= 2; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pc.d ELSE 3 END)");
+  sums.push_back("SUM(CASE WHEN 2 = pc.k THEN pc.x ELSE 0 END)");
+  sums.push_back("SUM(CASE WHEN pc.k = 1.5 THEN pc.x ELSE 0 END)");
+  sums.push_back("SUM(CASE WHEN pc.k = 2.0 THEN pc.x ELSE 0 END)");
+  sums.push_back("SUM(CASE WHEN pc.k = 2.0000000000000000001 THEN pc.x ELSE 0 END)");   // 2.0 as a double: no k equals it
+  sums.push_back("SUM(CASE WHEN pc.k = 9 THEN pc.x ELSE 0 END)");
+  sums.push_back("-1*SUM(CASE WHEN pc.k = 4 THEN pc.x ELSE 0 END)");
+  for (int l = 1; l <= 2; ++l) sums.push_back("SUM(CASE WHEN pc.k = " + std::to_string(l) + " THEN pk.w ELSE 0 END)");
+  const std::string from = " FROM pc JOIN pk ON pk.k = pc.j GROUP BY pc.g ORDER BY pc.g";
+  auto compare = [&](const std::vector<std::string>& list, const std::string& what) {
+    std::string sel = "SELECT pc.g";
+    for (const std::string& s : list) sel += ", " + s;
+    const SqlQueryResult all = run(db, sel + from);
+    expect(all.rows.size() == 5, what + ": 5 groups, got " + std::to_string(all.rows.size()));
+    for (size_t c = 0; c < list.size(); ++c) {
+      const SqlQueryResult one = run(db, "SELECT pc.g, " + list[c] + from);
+      expect(one.rows.size() == all.rows.size(), what + ": " + list[c] + " alone, groups");
+      for (size_t g = 0; g < all.rows.size() && g < one.rows.size(); ++g) {
+        const std::string got = sql_display(all.rows[g].values[c + 1]), want = sql_display(one.rows[g].values[1]);
+        expect(got == want, what + " group " + std::to_string(g) + " " + list[c] + ": " + got + ", alone " + want);
+      }
+    }
+    return sel + from;
+  };
+  // every SUM has a lane: the statement is answered over lanes, the pivot's sums in one fold
+  const std::string sel = compare(sums, "pivot shapes");
+  const SqlQueryResult ex = run(db, "EXPLAIN ANALYZE " + sel);
+  std::string plan;
+  for (const auto& r : ex.rows) for (const auto& v : r.values) plan += sql_display(v) + "\n";
+  if (ex.rows.empty()) plan = ex.formatted_table;
+  expect(plan.find("group by [lanes") != std::string::npos, "pivot shapes: grouped over lanes");
+  // a text lit, and a DECIMAL times another table's INT (no lane for either: the interpreter answers the
+  // statement, with its own pivot pass)
+  // (not the 2.0000000000000000001 lit: the interpreter's pivot compares k with it as a double, where it is 2)
+  std::vector<std::string> with_text;
+  for (const std::string& x : sums) if (x.find("2.0000000000000000001") == std::string::npos) with_text.push_back(x);
+  with_text.push_back("SUM(CASE WHEN pc.k = '2' THEN pc.x ELSE 0 END)");
+  with_text.push_back("SUM(CASE WHEN pc.k = 4 THEN pc.x * pk.w ELSE 0 END)");
+  compare(with_text, "pivot shapes with a text lit");
+}
+
+// text_col [NOT] IN (SELECT ..) decided a column at a time (vp sub_in, its set run first by conjunct_truths): every
+// statement must keep the rows the interpreter keeps, which it does for CONCAT(col, '') - the same text, a form no
+// program takes. Sets with and without a NULL, an empty one, NULL cells, entries that meet only by collation
+// ('ABC', 'abc  '), and parts over two tables (OR with the other's column), so they are decided after the join.
+void check_in_subquery_lanes(SqlDatabase& db) {
+  for (const char* t : {"ia", "ib", "ic"}) exec(db, std::string("DROP TABLE IF EXISTS ") + t);
+  exec(db, "CREATE TABLE ic (k INT PRIMARY KEY, w INT NOT NULL)");
+  exec(db, "INSERT INTO ic VALUES (0, 1), (1, 5), (2, 7), (3, 5)");
+  exec(db, "CREATE TABLE ib (id INT PRIMARY KEY, code VARCHAR(12), kind INT NOT NULL)");
+  exec(db, "INSERT INTO ib VALUES (1, 'abc', 1), (2, 'DEF', 1), (3, 'g7', 1), (4, 'abc', 2), (5, NULL, 2), (6, 'q1', 2), (7, 'ABC', 3), (8, 'zz', 3)");
+  exec(db, "CREATE TABLE ia (id INT PRIMARY KEY, g INT NOT NULL, j INT NOT NULL, code VARCHAR(12), v INT NOT NULL)");
+  const char* codes[] = {"abc", "ABC", "abc  ", "def", "g7", "q1", "zz", "other", "x9"};
+  const int n = 150000;
+  for (int b = 0; b < n; b += 5000) {
+    std::string v;
+    for (int i = b; i < b + 5000; ++i) {
+      char row[96];
+      const std::string c = i % 23 == 0 ? std::string("NULL") : "'" + std::string(codes[(i / 3) % 9]) + "'";
+      std::snprintf(row, sizeof row, "%s(%d,%d,%d,%s,%d)", v.empty() ? "" : ",", i, i % 7, i % 4, c.c_str(), i % 101);
+      v += row;
+    }
+    exec(db, "INSERT INTO ia VALUES " + v);
+  }
+  const std::vector<std::string> conds = {
+      "ia.code IN (SELECT code FROM ib WHERE kind = 1)",
+      "NOT ia.code IN (SELECT code FROM ib WHERE kind = 1)",
+      "ia.code NOT IN (SELECT code FROM ib WHERE kind = 1)",
+      "ia.code NOT IN (SELECT code FROM ib WHERE kind = 2)",   // a NULL in the set: no row
+      "ia.code IN (SELECT code FROM ib WHERE kind = 2)",
+      "ia.code IN (SELECT code FROM ib WHERE kind = 99)",      // no rows in the set
+      "ia.code NOT IN (SELECT code FROM ib WHERE kind = 99)",  // every row, a NULL code too
+      "(ia.code IN (SELECT code FROM ib WHERE kind = 3) OR ic.w = 7)",
+      "(NOT ia.code IN (SELECT code FROM ib WHERE kind = 1) OR ic.w = 5)",
+      "(ia.code NOT IN (SELECT code FROM ib WHERE kind = 2) OR ic.w = 1)",
+  };
+  for (const std::string& c : conds) {
+    std::string oracle = c;
+    for (size_t at = 0; (at = oracle.find("ia.code", at)) != std::string::npos; at += 20) oracle.replace(at, 7, "CONCAT(ia.code, '')");
+    const std::string q = "SELECT ia.g, COUNT(*), SUM(ia.v), SUM(ic.w) FROM ia JOIN ic ON ic.k = ia.j WHERE ia.v >= 0 AND ";
+    const SqlQueryResult got = run(db, q + c + " GROUP BY ia.g ORDER BY ia.g");
+    const SqlQueryResult want = run(db, q + oracle + " GROUP BY ia.g ORDER BY ia.g");
+    std::string gt, wt;
+    for (const auto& r : got.rows) { for (const auto& v : r.values) gt += sql_display(v) + ","; gt += ";"; }
+    for (const auto& r : want.rows) { for (const auto& v : r.values) wt += sql_display(v) + ","; wt += ";"; }
+    expect(!want.rows.empty() || c.find("NOT IN (SELECT code FROM ib WHERE kind = 2)") != std::string::npos || c.find("99)") != std::string::npos,
+           "in subquery: the interpreter keeps rows for " + c);
+    expect(gt == wt, "in subquery: " + c + ": " + gt.substr(0, 160) + " | interpreter " + wt.substr(0, 160));
+  }
+}
+
+// A star join with a one-to-many link (as stocktrans's debtortrans: a line's key matches several header rows) whose
+// whole WHERE is decided over its arrays: the arrays, expanded, go to the grouping as its rows (no joined row made).
+// Each statement must group what the same statement does when a WHERE part only the interpreter takes
+// (CONCAT(.., '')) sends it through joined rows.
+void check_star_multi_grouped(SqlDatabase& db) {
+  for (const char* t : {"ml", "mh", "mp", "mu"}) exec(db, std::string("DROP TABLE IF EXISTS ") + t);
+  exec(db, "CREATE TABLE mp (pid INT PRIMARY KEY, brand VARCHAR(16))");
+  exec(db, "INSERT INTO mp VALUES (0, 'Acme'), (1, 'acme'), (2, NULL), (3, 'Zed'), (4, 'Bolt  '), (5, 'bolt')");
+  exec(db, "CREATE TABLE mu (id INT PRIMARY KEY, loc VARCHAR(8), ok INT NOT NULL)");
+  exec(db, "INSERT INTO mu VALUES (1, 'L1', 1), (2, 'L3', 1), (3, 'L4', 0)");
+  exec(db, "CREATE TABLE mh (hid INT PRIMARY KEY, k INT NOT NULL, typ INT NOT NULL, w INT NOT NULL)");
+  {
+    std::string v;
+    for (int h = 0; h < 6000; ++h) {   // 1 to 3 header rows a key
+      const int k = h / 2 - (h % 7 == 0 ? 1 : 0);
+      v += (v.empty() ? "" : ",") + std::string("(") + std::to_string(h) + "," + std::to_string(k < 0 ? 0 : k) + "," +
+           std::to_string(h % 4) + "," + std::to_string(1 + h % 9) + ")";
+    }
+    exec(db, "INSERT INTO mh VALUES " + v);
+  }
+  exec(db, "CREATE TABLE ml (id INT PRIMARY KEY, k INT NOT NULL, pid INT NOT NULL, loc VARCHAR(8), qty DOUBLE NOT NULL, price DOUBLE NOT NULL, d DATE NOT NULL)");
+  const int n = 160000;
+  for (int b = 0; b < n; b += 5000) {
+    std::string v;
+    for (int i = b; i < b + 5000; ++i) {
+      char row[160];
+      std::snprintf(row, sizeof row, "%s(%d,%d,%d,'L%d',%.1f,%.2f,'2025-%02d-%02d')", v.empty() ? "" : ",", i, (i * 13) % 3000, i % 6,
+                    1 + i % 5, (double)(i % 7) - 2.5, (double)(i % 211) * 1.37 + 0.05, 1 + i % 12, 1 + i % 28);
+      v += row;
+    }
+    exec(db, "INSERT INTO ml VALUES " + v);
+  }
+  const std::string from = " FROM ml JOIN mh ON mh.k = ml.k JOIN mp ON mp.pid = ml.pid WHERE ml.d BETWEEN '2025-01-01' AND '2025-12-31' AND ";
+  const std::vector<std::pair<std::string, std::string>> shapes = {
+      {"SELECT COALESCE(mp.brand, 'NONE') AS b, CAST(SUM(ml.qty * -1) AS DECIMAL(16, 0)) AS q, CAST(SUM(CAST(ml.price AS DECIMAL(20,6)) * mh.w) AS DECIMAL(16, 2)) AS t",
+       " GROUP BY b ORDER BY t DESC, b ASC"},
+      {"SELECT YEAR(ml.d) AS y, MONTH(ml.d) AS m, COUNT(*), SUM(mh.w), SUM(CASE WHEN mh.typ = 1 THEN ml.qty ELSE 0 END), SUM(CASE WHEN mh.typ = 2 THEN ml.qty ELSE 0 END)",
+       " GROUP BY YEAR(ml.d), MONTH(ml.d) ORDER BY y, m"},
+  };
+  const std::vector<std::pair<std::string, std::string>> wheres = {
+      {"ml.loc IN (SELECT loc FROM mu WHERE ok = 1) AND NOT mh.typ = 3", "CONCAT(ml.loc, '') IN (SELECT loc FROM mu WHERE ok = 1) AND NOT mh.typ = 3"},
+      {"mh.typ <> 0 AND ml.qty <> 0 AND ml.loc NOT IN (SELECT loc FROM mu WHERE ok = 0)",
+       "mh.typ <> 0 AND ml.qty <> 0 AND CONCAT(ml.loc, '') NOT IN (SELECT loc FROM mu WHERE ok = 0)"},
+  };
+  for (const auto& sh : shapes)
+    for (const auto& w : wheres) {
+      const SqlQueryResult got = run(db, sh.first + from + w.first + sh.second);
+      const SqlQueryResult want = run(db, sh.first + from + w.second + sh.second);
+      std::string gt, wt;
+      for (const auto& r : got.rows) { for (const auto& v : r.values) gt += sql_display(v) + ","; gt += ";"; }
+      for (const auto& r : want.rows) { for (const auto& v : r.values) wt += sql_display(v) + ","; wt += ";"; }
+      expect(!want.rows.empty(), "star multi grouped: rows for " + w.second);
+      expect(gt == wt, "star multi grouped: " + sh.first.substr(0, 40) + " WHERE " + w.first + ": " + gt.substr(0, 200) + " | rows " + wt.substr(0, 200));
+    }
+}
+
+// Run-length columns of a table much larger than the rows a grouped statement keeps: the lanes split the 150,000
+// rows kept into 8 parts, each too small beside the 400,000-row table to decode its columns whole, so each part
+// reads the runs through a cursor (Lanes::rle_cursor) - stepping run to run, and searching on a jump past many
+// short runs. Every month pivot, tag sum and short-run count must be what the generated rows add up to. The rows
+// are joined to a small parent, as the ERP's stocktrans view joins stockmoves to its parents, so the grouping is
+// lane_group_by's over joined rows (a single table's is answered by slot, its own way).
+void check_rle_parts(SqlDatabase& db) {
+  exec(db, "DROP TABLE IF EXISTS rl");
+  exec(db, "DROP TABLE IF EXISTS rk");
+  // a parent each row joins (as stocktrans joins stockmoves to its parents): the grouping is then over joined rows
+  exec(db, "CREATE TABLE rk (k INT PRIMARY KEY, w INT NOT NULL)");
+  exec(db, "INSERT INTO rk VALUES (0, 10), (1, 20), (2, 30), (3, 40)");
+  exec(db, "CREATE TABLE rl (id INT PRIMARY KEY, d DATE NOT NULL, tag VARCHAR(4) NOT NULL, r5 INT NOT NULL, amt INT NOT NULL, keep INT NOT NULL)");
+  const int n = 400000;
+  struct R { int y, m, day; char tag; int r5, amt, keep; };
+  auto row = [](int i) {
+    const int block = i / 1000;   // dates in runs of 1,000 rows, 2024-01 .. 2027-12
+    R r;
+    r.y = 2024 + block / 100;
+    r.m = 1 + (block % 100) / 9;
+    r.day = 1 + (block % 9) * 3;
+    r.tag = "abc"[(i / 700) % 3];   // runs of 700
+    r.r5 = (i / 5) % 4;             // runs of 5: a kept block of 50 skips 50 of them
+    r.amt = (int)(((long long)i * 37) % 101) - 50;
+    r.keep = (i / 50) % 8 < 3 ? 1 : 0;   // 3 blocks of 50 in 8
+    return r;
+  };
+  for (int b = 0; b < n; b += 4000) {
+    std::string v;
+    for (int i = b; i < b + 4000; ++i) {
+      const R r = row(i);
+      char x[96];
+      std::snprintf(x, sizeof x, "%s(%d,'%04d-%02d-%02d','%c',%d,%d,%d)", v.empty() ? "" : ",", i, r.y, r.m, r.day, r.tag, r.r5, r.amt, r.keep);
+      v += x;
+    }
+    exec(db, "INSERT INTO rl VALUES " + v);
+  }
+  db.optimize_all_tables("gexdb");
+  const SqlQueryResult st = run(db, "SHOW ASQL STORAGE rl");
+  for (const char* c : {"d", "tag", "r5"}) {
+    std::string enc = "(none)";
+    for (const auto& r : st.rows) if (r.values.size() > 3 && sql_display(r.values[1]) == c) enc = sql_display(r.values[3]);
+    expect(enc == "RLE", std::string("rle parts: column ") + c + " is RLE (" + enc + ")");
+  }
+  // the answers, from the rows as generated
+  std::map<int, std::array<long long, 16>> want;   // year -> 12 months, tag b, r5 = 2 count, COUNT(*), SUM(rk.w)
+  for (int i = 0; i < n; ++i) {
+    const R r = row(i);
+    if (!r.keep) continue;
+    auto& w = want[r.y];
+    w[(size_t)r.m - 1] += r.amt;
+    if (r.tag == 'b') w[12] += r.amt;
+    if (r.r5 == 2) w[13] += 1;
+    w[14] += 1;
+    w[15] += 10 * (r.r5 + 1);
+  }
+  std::string sel = "SELECT YEAR(rl.d) AS y";
+  for (int m = 1; m <= 12; ++m) sel += ", SUM(CASE WHEN MONTH(rl.d) = " + std::to_string(m) + " THEN rl.amt ELSE 0 END)";
+  sel += ", SUM(CASE WHEN rl.tag = 'b' THEN rl.amt ELSE 0 END), SUM(CASE WHEN rl.r5 = 2 THEN 1 ELSE 0 END), COUNT(*), SUM(rk.w) FROM rl JOIN rk ON rk.k = rl.r5 WHERE rl.keep = 1 GROUP BY YEAR(rl.d) ORDER BY y";
+  const SqlQueryResult ex = run(db, "EXPLAIN ANALYZE " + sel);
+  std::string plan;
+  for (const auto& r : ex.rows) for (const auto& v : r.values) plan += sql_display(v) + "\n";
+  if (ex.rows.empty()) plan = ex.formatted_table;
+  expect(plan.find("group by [lanes") != std::string::npos, "rle parts: grouped over lanes");
+  for (int pass = 0; pass < 2; ++pass) {   // twice: the second run over columns already read once
+    const SqlQueryResult got = run(db, sel);
+    expect(got.rows.size() == want.size(), "rle parts: " + std::to_string(want.size()) + " years, got " + std::to_string(got.rows.size()));
+    for (const auto& r : got.rows) {
+      const int y = std::atoi(sql_display(r.values[0]).c_str());
+      auto it = want.find(y);
+      if (it == want.end()) { expect(false, "rle parts: year " + std::to_string(y) + " not in the rows"); continue; }
+      for (size_t k = 0; k < 16; ++k) {
+        const std::string g = sql_display(r.values[k + 1]), w = std::to_string(it->second[k]);
+        expect(g == w, "rle parts pass " + std::to_string(pass) + " year " + std::to_string(y) + " item " + std::to_string(k + 1) + ": " + g + ", rows give " + w);
+      }
+    }
+  }
+}
+
 // summitholding's stocktrans view: its money columns are ROUND()s of CAST(.. AS DECIMAL(20,6)) - wider than 18
 // digits, and ROUND, neither of which the exact lanes took, so `SUM(discountedlinetotal)` over 10M rows ran in the
 // interpreter (17.7 s of a 23 s report). Each grouped SUM over lanes must be what the rows' own values (the row
@@ -489,6 +749,10 @@ int main(int argc, char** argv) {
   run_table(db, "big", big, "big, re-encoded");
   check_names(db);
   check_pivot(db);
+  check_pivot_shapes(db);
+  check_in_subquery_lanes(db);
+  check_star_multi_grouped(db);
+  check_rle_parts(db);
   check_round_lanes(db);
   check_star_links(db, "after load");
   check_star_links(db, "again");

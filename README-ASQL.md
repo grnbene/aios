@@ -1,24 +1,49 @@
 # ASQL — AIOS In-Memory Relational SQL Engine
 
-**ASQL** is the high-performance, in-memory relational SQL database engine built natively into **AIOS** (All-In-One System) in dependency-free C++20.
+**ASQL** is the high-performance, in-memory relational SQL engine built natively into **AIOS** (All-In-One System) in dependency-free C++20.
 
-It combines in-memory columnar indexing with broad MariaDB/MySQL dialect coverage, MySQL 5.7 wire-protocol compatibility, ACID transactions, and flexible deployment models:
-- **Standalone Primary Database**: A pure in-memory SQL database with write-ahead redo logging, periodic checkpoints, and point-in-time snapshot exports. No external database required.
-- **Real-Time CDC Replica**: Ingests live MariaDB/MySQL binlogs with sub-millisecond lag and zero RAM bloat, serving as a high-speed read accelerator.
-- **Write-Through / Write-Behind Gateway**: Synchronously or asynchronously synchronizes mutations to an external downstream database while serving reads instantly from RAM.
+It combines in-memory columnar execution, ACID write-ahead durability, full MySQL 5.7 wire protocol compatibility, and PostgreSQL dialect extensions with two novel reactive primitives: **Things** (live, stateful materialized views) and **Cells** (per-key event-trigger bitsets and counters).
+
+---
+
+## Table of Contents
+
+- [Key Highlights](#key-highlights)
+- [Architecture Overview](#architecture-overview)
+- [30-Second Quickstart](#30-second-quickstart)
+- [Client Integration & Usage](#client-integration--usage)
+  - [1. Native Grain Language (AIOS First-Class API)](#1-native-grain-language-aios-first-class-api)
+  - [2. Standard MySQL Wire Protocol (CLI, Python, Node.js, PHP, Go)](#2-standard-mysql-wire-protocol-cli-python-nodejs-php-go)
+  - [3. GUI Tools (DBeaver, DataGrip, TablePlus, Navicat)](#3-gui-tools-dbeaver-datagrip-tableplus-navicat)
+  - [4. Low-Overhead JSON RPC (Port 7311)](#4-low-overhead-json-rpc-port-7311)
+- [Reactive Primitives: Things and Cells](#reactive-primitives-things-and-cells)
+  - [Things: Stateful Grouped Aggregates](#things-stateful-grouped-aggregates)
+  - [Cells: Per-Key Bits, Counters & Webhook/Email Triggers](#cells-per-key-bits-counters--webhookemail-triggers)
+- [Operating Modes & Write Synchronization](#operating-modes--write-synchronization)
+  - [1. Standalone Primary Database](#1-standalone-primary-database)
+  - [2. Real-Time CDC Replica (Binlog Read Accelerator)](#2-real-time-cdc-replica-binlog-read-accelerator)
+  - [3. Write Synchronization Modes (`local`, `write_through`, `write_behind`)](#3-write-synchronization-modes-local-write_through-write_behind)
+- [Security: Capabilities & Named Users](#security-capabilities--named-users)
+- [SQL Dialect Coverage](#sql-dialect-coverage)
+- [Production Deployment & Administration](#production-deployment--administration)
+  - [Packaging & Installation](#packaging--installation)
+  - [Configuration (`/etc/aios/asql.conf`)](#configuration-etcaiosasqlconf)
+  - [Operator Tools & Acceptance Checks](#operator-tools--acceptance-checks)
+  - [Online Backup & Restore (`asql-export` / `asql-import`)](#online-backup--restore-asql-export--asql-import)
+- [Troubleshooting & FAQ](#troubleshooting--faq)
 
 ---
 
 ## Key Highlights
 
-- **Pure In-Memory Speed**: In-memory tables, plan cache, subquery shape cache, and result cache; benchmarked against MariaDB with `tools/asql-diff-runner.mjs`.
-- **Zero External Dependencies**: Pure C++20 implementation. No `libmysqlclient`, `libmariadb`, `sqlite`, or third-party query engines linked.
-- **MySQL Wire Protocol (Port 3307)**: Native listener supporting standard clients: MySQL CLI, Navicat, DBeaver, TablePlus, DataGrip, PHP PDO, Python (`pymysql`), Node.js (`mysql2`), and Go.
-- **Raw RPC Socket (Port 7311)**: Length-prefixed JSON protocol for low-overhead service-to-service communication.
-- **Virtual `information_schema`**: Dynamic emulation of MySQL system metadata tables for transparent GUI and ORM introspection.
-- **ACID Transactions & Row Locking**: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `SELECT ... FOR UPDATE` with snapshot isolation and transaction rollback safety.
-- **Flexible Write Modes**: Run `local` (self-contained), `write_through` (synchronously confirmed downstream), or `write_behind` (high-velocity local commit with persistent WAL drain).
-- **Capability-Based Security**: Cryptographically signed bearer credentials (`CAPABILITY MINT` / `REVOKE`) with offline attenuation alongside traditional named user logins.
+- **Pure In-Memory Speed**: Sub-microsecond reads, columnar indexing, plan caching, and vectorization with zero external dependencies (no `libmysqlclient`, `sqlite`, or external query engines).
+- **Dual Protocols**: Speaks standard MySQL 5.7 wire protocol on port `3307` and UNIX domain sockets, alongside a length-prefixed raw JSON RPC service on port `7311`.
+- **First-Class Grain Integration**: In-process direct execution via `sql()`, client networking via `db_connect()` and `db_query()`, safe `?` parameterized bindings, nested savepoint transactions via `db_transaction()`, and reactive invalidation via `live()`.
+- **Reactive Primitives (Things & Cells)**: Materialized query aggregates that update incrementally on mutation, plus per-key bitsets and counters that trigger HTTP webhooks (`NOTIFY`) and emails (`MAIL`) automatically.
+- **Dialect Versatility**: MySQL 5.7 / MariaDB dialect coverage plus PostgreSQL syntax (`::type` casts, `generate_series`, `LATERAL`, `ON CONFLICT DO UPDATE`, `FILTER (WHERE ...)`), window functions, and recursive CTEs.
+- **ACID Durability**: Group-committed write-ahead redo logging (`redo.log`), background checkpoints, and instant crash recovery.
+- **Flexible Write Modes**: Run self-contained (`local`), synchronously write-through to an upstream/downstream database (`write_through`), or queue asynchronously via WAL drain (`write_behind`).
+- **Cryptographic Capability Security**: Attenuable, bearer-token credentials (`CAPABILITY MINT` / `REVOKE`) with table, column, row-budget, and TTL restrictions alongside standard named users.
 
 ---
 
@@ -27,9 +52,10 @@ It combines in-memory columnar indexing with broad MariaDB/MySQL dialect coverag
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                                  CLIENT APPLICATIONS                                   │
-│         MySQL CLI · Navicat / DBeaver · PHP (PDO) · Python · Node.js · Raw RPC         │
+│    Native Grain Apps · MySQL CLI · DBeaver / Navicat · Python · Node.js · PHP · Go     │
 └───────────────────────────┬────────────────────────────────┬───────────────────────────┘
                             │ MySQL Wire Protocol (port 3307)│ Raw JSON RPC (port 7311)
+                            │ or UNIX Domain Socket          │
 ┌───────────────────────────▼────────────────────────────────▼───────────────────────────┐
 │                                       ASQL ENGINE                                      │
 │  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
@@ -39,23 +65,287 @@ It combines in-memory columnar indexing with broad MariaDB/MySQL dialect coverag
 │  │ In-Memory Data Store & Columnar Indices                                          │  │
 │  │  • PK / Unique Hash Index   • Probe Index (Hash & Sorted)                        │  │
 │  │  • Auto-Increment Tracker   • Dynamic info_schema Views                          │  │
-│  └────────────────────────────────────────▲─────────────────────────────────────────┘  │
-│  ┌────────────────────────────────────────┴─────────────────────────────────────────┐  │
-│  │ Multi-Tenant Database Namespace Isolation (e.g. appdb, analytics, shop)          │  │
-│  └──────┬─────────────────────────────────┬─────────────────────────────────▲───────┘  │
-│         │                                 │                                 │          │
-│  ┌──────▼───────────────────┐     ┌───────▼──────────────────┐     ┌────────┴────────┐ │
-│  │ Durability Subsystem     │     │ Write Synchronization    │     │ CDC Consumer    │ │
-│  │ • Write-Ahead Redo Log   │     │ • local (self-contained) │     │ (Zero-RAM       │ │
-│  │ • Periodic Checkpoints   │     │ • write_through (sync)   │     │  Binlog Ingress)│ │
-│  │ • Export Snapshots       │     │ • write_behind (WAL)     │     │                 │ │
-│  └──────────────────────────┘     └───────┬──────────────────┘     └────────▲────────┘ │
-└───────────────────────────────────────────┼─────────────────────────────────┼──────────┘
-                                            │ Forward Writes                  │ COM_BINLOG_DUMP
-                                            ▼                                 │
-                             ┌─────────────────────────────┐   ┌──────────────┴──────────┐
+│  └──────────────┬─────────────────────────┬─────────────────────────┬───────────────┘  │
+│                 │                         │                         │                  │
+│  ┌──────────────▼───────────┐  ┌──────────▼──────────────┐  ┌───────▼───────────────┐  │
+│  │ Things Subsystem         │  │ Cells Subsystem         │  │ Multi-Tenant Schemas  │  │
+│  │ • Live Grouped Queries   │  │ • Per-Key Bitsets       │  │ (appdb, shop, stats)  │  │
+│  │ • Incremental Updates    │  │ • Automated Webhooks    │  │                       │  │
+│  │ • WAIT THING / WHAT IF   │  │ • OAuth Mail Triggers   │  │                       │  │
+│  └──────────────────────────┘  └─────────────────────────┘  └───────┬───────────────┘  │
+│                                                                     │                  │
+│  ┌──────────────────────────┐  ┌─────────────────────────┐  ┌───────▼───────────────┐  │
+│  │ Durability Subsystem     │  │ Write Synchronization   │  │ CDC Consumer          │  │
+│  │ • Write-Ahead Redo Log   │  │ • local (self-contained)│  │ (Zero-RAM             │  │
+│  │ • Periodic Checkpoints   │  │ • write_through (sync)  │  │  Binlog Ingress)      │  │
+│  │ • Export Snapshots       │  │ • write_behind (WAL)    │  │                       │  │
+│  └──────────────────────────┘  └──────────┬──────────────┘  └───────▲───────────────┘  │
+└───────────────────────────────────────────┼─────────────────────────┼──────────────────┘
+                                            │ Forward Writes          │ COM_BINLOG_DUMP
+                                            ▼                         │
+                             ┌─────────────────────────────┐   ┌──────┴──────────────────┐
                              │ Downstream Database/Gateway │   │ Upstream MySQL/MariaDB  │
                              └─────────────────────────────┘   └─────────────────────────┘
+```
+
+---
+
+## 30-Second Quickstart
+
+### 1. Launch a Local ASQL Server
+Run a self-contained local server on loopback with no external dependencies:
+
+```bash
+# Starts ASQL MySQL wire listener on port 3307 and a throwaway data root
+AIOS_NO_ACCEL=1 aios --root /tmp/asql-quickstart exec "sql serve port=3307 bind=127.0.0.1"
+```
+
+### 2. Connect and Query
+With no account configured, loopback connections (`127.0.0.1`) are granted unrestricted local access under any username:
+
+```bash
+# Connect with standard mysql CLI
+mysql -h 127.0.0.1 -P 3307 -u root -e "
+  CREATE DATABASE shop;
+  USE shop;
+  CREATE TABLE products (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    sku VARCHAR(32) NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    stock INT DEFAULT 0
+  );
+  INSERT INTO products (sku, price, stock) VALUES ('BOLT-01', 0.45, 1200), ('NUT-01', 0.25, 3400);
+  SELECT sku, price, stock FROM products WHERE stock > 1500;
+"
+```
+
+Output:
+```
++--------+-------+-------+
+| sku    | price | stock |
++--------+-------+-------+
+| NUT-01 |  0.25 |  3400 |
++--------+-------+-------+
+```
+
+Data commits to `/tmp/asql-quickstart/sql_db/` with durability logs and survives server restarts.
+
+---
+
+## Client Integration & Usage
+
+### 1. Native Grain Language (AIOS First-Class API)
+
+Grain scripts have three direct access mechanisms to ASQL:
+
+#### A. In-Process Pointer Access: `sql()` and `sql_on()`
+When running inside the AIOS runtime (`aios grain ...`, system services, or bare-metal), Grain accesses `SqlDatabase` directly in memory without socket serialization overhead:
+
+```grain
+// Result queries return a list of maps:
+let items = sql("SELECT id, sku, price FROM shop.products WHERE price < 1.00")
+for item in items {
+  print(item.sku + ": $" + str(item.price))
+}
+
+// Data modification statements return {"affected": <integer>}:
+let res = sql("UPDATE shop.products SET stock = stock + 100 WHERE sku = 'BOLT-01'")
+print("Updated " + str(res.affected) + " records")
+
+// Fleet mesh query across peer nodes:
+let cluster_stats = sql_on("worker-node-2", "SELECT COUNT(*) AS total FROM logs")
+```
+
+#### B. Client Network Protocol: `db_connect()`, `db_query()`, `db_transaction()`
+For standalone Grain processes, background workers, or external network calls:
+
+```grain
+// Connect via TCP or UNIX domain socket:
+let res = db_connect("127.0.0.1", 3307, "app", "secretpass", "shop")
+if !res.ok {
+  print("Connection error: " + res.error)
+  return nil
+}
+let db = res.conn
+
+// Safe Parameter Binding with ? placeholders:
+let low_stock = db_query(db, "SELECT sku, stock FROM products WHERE stock < ?", [500])
+for row in low_stock.records {
+  print(row.sku + " has low stock: " + str(row.stock))
+}
+
+// Automatic list expansion for SQL IN (?):
+let skus = ["BOLT-01", "NUT-01", "WASH-02"]
+let batch = db_query(db, "SELECT sku, price FROM products WHERE sku IN (?)", [skus])
+
+// ACID Transactions with automatic rollback and nested savepoints:
+let order_id = db_transaction(db, fn(tx) {
+  let ins = db_query(tx, "INSERT INTO orders (created_at, total) VALUES (NOW(), ?)", [45.20])
+  if !ins.ok { error("Failed to insert order: " + ins.error) }
+  
+  let deduct = db_query(tx, "UPDATE products SET stock = stock - 10 WHERE sku = ?", ["BOLT-01"])
+  if !deduct.ok { error("Failed stock update: " + deduct.error) }
+  
+  return ins.last_insert_id
+})
+```
+
+#### C. Reactive Polling: `live()`
+Drive reactive dashboards without querying heavy tables repeatedly. `live()` polls ASQL's mutation tracker via `ASQL_CHANGES()` and re-evaluates the callback only when underlying table tokens change:
+
+```grain
+live(db, ["products", "orders"], fn() {
+  let snapshot = db_query(db, "SELECT COUNT(*) AS pending FROM orders WHERE status = 'open'")
+  render_dashboard(snapshot.records[0].pending)
+})
+```
+
+---
+
+### 2. Standard MySQL Wire Protocol (CLI, Python, Node.js, PHP, Go)
+
+ASQL speaks native MySQL 5.7 wire protocol on port `3307` and over local UNIX domain sockets:
+
+#### Python (`pymysql` / `mysqlclient`)
+```python
+import pymysql
+
+conn = pymysql.connect(
+    host="127.0.0.1",
+    port=3307,
+    user="app",
+    password="wirepassword",
+    database="shop",
+    cursorclass=pymysql.cursors.DictCursor
+)
+
+with conn.cursor() as cursor:
+    cursor.execute("SELECT sku, price FROM products WHERE stock > %s", (100,))
+    rows = cursor.fetchall()
+    for row in rows:
+        print(f"{row['sku']}: ${row['price']}")
+```
+
+#### Node.js (`mysql2`)
+```javascript
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: '127.0.0.1',
+  port: 3307,
+  user: 'app',
+  password: 'wirepassword',
+  database: 'shop',
+  connectionLimit: 10
+});
+
+const [rows] = await pool.query('SELECT sku, price FROM products WHERE stock > ?', [100]);
+console.log(rows);
+```
+
+#### PHP (PDO)
+```php
+$dsn = "mysql:host=127.0.0.1;port=3307;dbname=shop;charset=utf8mb4";
+// Or UNIX socket: "mysql:unix_socket=/opt/aios/run/asql.sock;dbname=shop;charset=utf8mb4"
+$pdo = new PDO($dsn, "app", "wirepassword", [
+    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+]);
+
+$stmt = $pdo->prepare("SELECT sku, price FROM products WHERE stock > :stock");
+$stmt->execute(['stock' => 100]);
+$products = $stmt->fetchAll();
+```
+
+---
+
+### 3. GUI Tools (DBeaver, DataGrip, TablePlus, Navicat)
+
+ASQL dynamically synthesizes MySQL `information_schema` views (`tables`, `columns`, `schemata`, `views`, etc.). You can connect standard database GUI tools directly:
+
+1. **Driver**: MySQL
+2. **Host / Port**: `127.0.0.1` / `3307`
+3. **Database**: `shop` (or your configured schema)
+4. **User / Password**: Configured operator account or capability token
+
+---
+
+### 4. Low-Overhead JSON RPC (Port 7311)
+
+For microservices that avoid SQL drivers, ASQL exposes a length-prefixed JSON RPC endpoint on port `7311`:
+* **Framing**: 4-byte big-endian payload length + UTF-8 JSON body.
+* **Safety**: RPC `sql` operations are strictly **read-only** (`SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `WITH`). Writes are rejected at the gate.
+
+```bash
+# Request payload:
+# {"op": "sql", "db": "shop", "token": "tok123", "query": "SELECT sku, price FROM products LIMIT 2"}
+
+# Response:
+# {"ok": true, "columns": ["sku", "price"], "rows": [["BOLT-01", "0.45"], ["NUT-01", "0.25"]], "row_count": 2}
+```
+
+---
+
+## Reactive Primitives: Things and Cells
+
+Beyond standard relational tables, ASQL maintains two reactive in-memory constructs:
+
+### Things: Stateful Grouped Aggregates
+
+A **Thing** is a live, materialized grouped query result that updates incrementally in memory as underlying rows mutate. Things avoid repeated table scans and can notify listeners or take programmatic action when conditions become true:
+
+```sql
+-- Define a Thing that maintains real-time item counts and balances per department:
+CREATE THING dept_summary ON transactions KEY dept_id AS
+  SELECT dept_id, COUNT(*) AS txn_count, SUM(amount) AS total_spent
+  FROM transactions
+  GROUP BY dept_id;
+
+-- Read instantaneous materialized state:
+SHOW THING dept_summary;
+SHOW THING dept_summary KEYS (10, 20);
+
+-- Inspect underlying source rows responsible for a specific aggregate:
+EXPLAIN THING dept_summary KEY 10;
+
+-- Wait for changes without polling (blocking until mutation or timeout):
+WAIT THING dept_summary SINCE '2026-11-04 12:00:00' TIMEOUT 5000;
+
+-- Preview the exact impact of a pending write before executing it:
+WHAT IF INSERT INTO transactions (dept_id, amount) VALUES (10, 250.00)
+ON THING dept_summary;
+```
+
+---
+
+### Cells: Per-Key Bits, Counters & Webhook/Email Triggers
+
+**Cells** track small per-key bitsets (flags) and integer counters that react to row updates. When a bit rises or falls, Cells execute automated actions, including templated HTTPS webhooks and authenticated emails:
+
+```sql
+-- Track order fulfillment steps per order_id:
+CREATE CELLS order_progress ON orders KEY order_id (
+  scanned BIT DEFAULT 0,
+  packed BIT DEFAULT 0,
+  shipped BIT DEFAULT 0,
+  item_count INT DEFAULT 0
+);
+
+-- Store an encrypted secret (AES-256-GCM) for notification payloads:
+CREATE SECRET slack_webhook AS 'https://hooks.slack.com/services/T00/B00/XXXX';
+
+-- Automatically dispatch an HTTPS POST when the 'shipped' bit flips from 0 to 1:
+ON RISE shipped NOTIFY '{{secret:slack_webhook}}'
+  HEADER 'Content-Type: application/json'
+  BODY '{"text": "Order #{{key}} has shipped! Total items: {{item_count}}"}';
+
+-- Configure an OAuth mailer and send an automated email alert on threshold:
+CREATE MAILER alerts_mailer OAUTH 'google' ACCOUNT 'admin@example.com';
+
+ON RISE alert_triggered MAIL alerts_mailer
+  TO 'ops@example.com'
+  SUBJECT 'Fulfillment Warning for Order #{{key}}'
+  BODY 'Order #{{key}} has flagged an exception.';
 ```
 
 ---
@@ -64,414 +354,193 @@ It combines in-memory columnar indexing with broad MariaDB/MySQL dialect coverag
 
 ASQL supports three primary operational architectures and three write synchronization policies:
 
+| Mode | Target | Write Latency | Downstream Dependency | Downstream Failure Behavior |
+|---|---|---|---|---|
+| **`local`** (Default) | In-Memory + Local Redo Log | Sub-millisecond | None | Completely independent. |
+| **`write_through`** | Downstream first, then local | 1x Downstream RTT | Synchronous | Refuses write locally; nothing committed. |
+| **`write_behind`** | Local first, then async WAL drain | Sub-millisecond | Asynchronous | Commits locally; queues in persistent WAL and retries. |
+
 ### 1. Standalone Primary Database
 Run ASQL as an independent, primary in-memory SQL database without an upstream or downstream database:
-- **Durability**: Every mutating transaction is recorded to an append-only write-ahead redo log (`redo.log`). Sync behavior is configurable via `AIOS_REDO_SYNC` (group commit by default; `0` syncs asynchronously every 200ms).
-- **Checkpoints**: The store checkpoints automatically every 20,000 statements or 64 MB of redo (`AIOS_CHECKPOINT_SECS`, default 30s). On startup, ASQL loads the latest checkpoint and replays any trailing redo records.
-- **Backups & Snapshots**: Consistent point-in-time snapshots can be exported online with `asql-export.sh` or `EXPORT SNAPSHOT` without interrupting concurrent readers.
-- **Running Standalone**:
+- **Write-Ahead Redo Log**: Every mutating transaction appends to `redo.log`. Sync behavior is controlled by `AIOS_REDO_SYNC` (default group commit).
+- **Checkpoints**: Automatically snapshots to disk every 20,000 statements or 64 MB of redo (`AIOS_CHECKPOINT_SECS`, default 30s). On boot, ASQL loads the snapshot and replays trailing redo entries.
+- **Starting Standalone**:
   ```bash
-  # Standalone daemon via aios-engine
+  # Standalone service daemon:
   build/aios-engine --root=/opt/aios/root --port=3307 --sql-user=app --sql-pass-file=/opt/aios/mysql.pass
-
-  # Or via aios CLI
-  aios --root=/opt/aios/root exec "compute serve sql=1 port=7311 mysql_port=3307 mysql_user=app mysql_pass_file=/opt/aios/mysql.pass"
   ```
 
-### 2. CDC Ingress Replica (Read Accelerator)
-ASQL connects to an upstream MariaDB or MySQL instance as a replication slave (`COM_BINLOG_DUMP`):
-- **Zero-RAM-Bloat Streaming**: Reads row-based binlog events (`WRITE_ROWS`, `UPDATE_ROWS`, `DELETE_ROWS`) and applies mutations into in-memory columnar vectors within milliseconds.
-- **Table Whitelist**: Whitelist specific tables via `CDC_TABLES` (csv or `@file`). Unlisted tables are ignored, bounding memory usage.
-- **Automatic Initial Seeding**: Tables listed in `CDC_TABLES` that do not exist locally are automatically snapshotted from the source at startup, recording per-table binlog coordinates before streaming resumes.
+### 2. Real-Time CDC Replica (Binlog Read Accelerator)
+Connect ASQL to an upstream MariaDB or MySQL instance as a replication slave (`COM_BINLOG_DUMP`):
+- **Zero-RAM-Bloat Ingress**: Streams row-based binlog events (`WRITE_ROWS`, `UPDATE_ROWS`, `DELETE_ROWS`) directly into columnar in-memory tables.
+- **Table Whitelist**: Replicate only specified tables (`CDC_TABLES=orders,products`), ignoring unneeded tables to bound memory usage.
+- **Automatic Seeding**: Missing tables are snapshotted automatically over the wire during startup before binlog streaming begins.
 
 ### 3. Write Synchronization Modes (`local`, `write_through`, `write_behind`)
-
-When client applications issue write statements (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`, DDL), ASQL's behavior is governed by its sync mode (`WriteSyncMode`):
-
-| Mode | Target | Latency | Consistency | Downstream Failure Behavior |
-|---|---|---|---|---|
-| **`local`** (Default) | In-Memory + Redo Log | Sub-millisecond | Local ACID | No downstream required. |
-| **`write_through`** | Downstream first, then local | 1x Downstream RTT | Synchronous dual-write | Refuses local write; nothing applied. |
-| **`write_behind`** | Local first, then async WAL drain | Sub-millisecond | Eventual downstream sync | Queues in WAL; retries in order until up. |
-
-#### Pattern A: `local` (The Default)
-Statements run entirely against the local in-memory tables and are made durable by the local redo log and checkpoints:
-- **Standalone**: All changes remain within the local ASQL instance.
-- **CDC Read Replica**: Local writes are committed to the local in-memory store and are **never replicated upstream**. This provides a safe staging or analytics environment where writes cannot corrupt upstream production data. If upstream subsequently mutates a row that was changed locally, incoming CDC replication overwrites it with upstream truth.
-
-#### Pattern B: `write_through` (Synchronous Forwarding)
-Modifying statements (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `RENAME`) and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`) are forwarded to the configured `--downstream` server **first**, using the client's own dedicated downstream session:
-- The write is applied locally in ASQL only after downstream successfully accepts and executes it.
-- If the downstream database is unreachable or rejects the statement (e.g. `Duplicate entry for key 'PRIMARY'`), ASQL immediately refuses the statement with the downstream error and modifies nothing locally.
-- Reads (`SELECT`, `WITH`), `SHOW`, `SET`, and `USE` are answered instantly from ASQL in memory.
-- Example flag: `--mode=write_through --downstream=127.0.0.1:3306 --downstream-user=app --downstream-db=appdb`.
-
-#### Pattern C: `write_behind` (Asynchronous WAL Drain)
-Writes execute and commit locally in ASQL first for maximum execution speed:
-- On commit, mutations are appended to `<store>/write_behind.wal`.
-- An internal drain worker wakes every 20ms to replay committed statements downstream in batches of 100 in strict chronological order, marking WAL progress as downstream acknowledges each statement.
-- Rolled-back transactions (`ROLLBACK`) are discarded locally and never written to the WAL.
-- If downstream becomes unreachable or rejects a statement, unacknowledged statements persist safely across restarts in the WAL. Subsequent statements wait behind the blocked write to preserve serial consistency until downstream recovers.
-- Activate via `--mode=write_behind --downstream=...` or environment variable `AIOS_WRITE_BEHIND=1`.
+- **`local`**: Writes remain strictly local to ASQL. In CDC replica mode, local writes are committed in-memory and **never written upstream**, providing a safe local staging/analytics sandbox.
+- **`write_through`**: Mutations are executed on the downstream MySQL/MariaDB server first; once confirmed, they are applied to ASQL's in-memory tables.
+- **`write_behind`**: Writes commit locally in sub-milliseconds, appending to `<store>/write_behind.wal`. A background worker drains transactions downstream sequentially every 20ms.
 
 ---
 
-## Installing ASQL on a Server
+## Security: Capabilities & Named Users
 
-ASQL packages into a self-contained tarball runnable on any x86_64 Linux with glibc 2.17+ (CentOS 7, AlmaLinux 8/9, Rocky, Debian, Ubuntu).
+ASQL supports two complementary authentication models:
 
-### 1. Build the Package
-
-```bash
-cd aios   # top-level checkout
-# Compile the engine and operator utilities against glibc 2.17
-TARGETS="aios-cli aios-asql-top aios-asql-console" packaging/build-centos7.sh origin/main build-centos7
-packaging/pack.sh build-centos7 packaging/dist        # -> packaging/dist/aios-asql-<sha>-linux-x86_64-glibc2.17.tar.gz
-```
-
-### 2. Install
-
-```bash
-tar xzf aios-asql-*.tar.gz && cd aios-asql-*/
-sudo ./install-asql.sh --dry-run       # preview changes without executing
-sudo ./install-asql.sh                 # creates user aios, /opt/aios, systemd service
-./install-asql.sh --host user@remote   # or deploy remotely over SSH
-```
-
-What lands on the host:
-
-```
-/opt/aios/bin/aios                 the unified engine
-/opt/aios/bin/asql-serve           translates /etc/aios/asql.conf into engine arguments
-/opt/aios/bin/aios-asql-console    interactive SQL CLI client
-/opt/aios/bin/aios-asql-top        real-time interactive terminal monitor
-/opt/aios/bin/asql-export.sh       online snapshot exporter
-/opt/aios/bin/asql-import.sh       snapshot importer
-/opt/aios/root/sql_db/             database store (tables/, cdc_position, redo.log, things/)
-/opt/aios/run/asql.sock            UNIX domain socket for same-host clients
-/opt/aios/cdc.pass                 upstream replication password (0600 aios:aios)
-/opt/aios/mysql.pass               wire operator password (0600 aios:aios)
-/etc/aios/asql.conf                system configuration file
-```
-
-### 3. Configure: `/etc/aios/asql.conf`
-
-```bash
-sudo vi /etc/aios/asql.conf
-echo 'replication-pass' | sudo tee /opt/aios/cdc.pass   >/dev/null
-echo 'wire-pass'        | sudo tee /opt/aios/mysql.pass >/dev/null
-sudo chown aios:aios /opt/aios/*.pass && sudo chmod 600 /opt/aios/*.pass
-/opt/aios/bin/asql-serve --print       # view assembled command string
-sudo systemctl restart aios-compute
-```
-
-| Key | Default | Meaning |
-|---|---|---|
-| `AIOS_BIN`, `AIOS_ROOT` | `/opt/aios/bin/aios`, `/opt/aios/root` | Engine binary and kernel data root |
-| `RPC_PORT` | `7311` | Raw JSON RPC socket (`compute serve port=`) |
-| `LANES` | `8` | Worker lane concurrency |
-| `SQL`, `SQL_DB` | `1`, `sql_db` | Enable SQL engine; storage subdirectory |
-| `PUBLIC` | `1` | `0` keeps the RPC port on loopback |
-| `MYSQL_PORT`, `MYSQL_BIND` | `3307`, `127.0.0.1` | MySQL wire listener; `0.0.0.0` accepts remote connections |
-| `MYSQL_USER`, `MYSQL_PASS_FILE` | `app`, `/opt/aios/mysql.pass` | Operator wire account. Without a user, loopback clients enter freely |
-| `MYSQL_SOCKET` | `/opt/aios/run/asql.sock` | UNIX socket path (~10 µs lower latency than TCP on localhost) |
-| `MYSQL_CHARSET` | empty | `1` honours client charset (e.g. latin1 gets cp1252 bytes) |
-| `MYSQL_DB` | empty | Default database for console and top (defaults to `CDC_DB`) |
-| `CDC_HOST`, `CDC_PORT` | `127.0.0.1`, `3306` | Upstream MariaDB/MySQL instance. Leave empty for standalone mode |
-| `CDC_USER`, `CDC_PASS_FILE` | `replicator`, `/opt/aios/cdc.pass` | Replication credentials (`REPLICATION SLAVE, SELECT`) |
-| `CDC_DB` | `appdb` | Source database schema to mirror |
-| `CDC_TABLES` | (csv list or `@file`) | Table whitelist. Empty mirrors all tables mentioned in binlog |
-| `CDC_LOG_FILE`, `CDC_LOG_POS` | empty | Pin binlog coordinates; empty auto-discovers or resumes saved state |
-| `FLEET_HOST`, `FLEET_PORT`, `FLEET_KEY_FILE` | empty | Fleet mesh connection settings (optional cluster read-mesh) |
-
-### 4. Verify
-
-```bash
-systemctl status aios-compute
-journalctl -u aios-compute -f     # view startup, indexing, and CDC logs
-aios-asql-top -1                  # snapshot of tables, rows, RSS, cache, CDC lag
-aios-asql-console -e "SHOW STATUS LIKE 'Asql_%'"
-aios-asql-console                 # interactive SQL prompt
-mysql -S /opt/aios/run/asql.sock -u app -p"$(cat /opt/aios/mysql.pass)" appdb
-```
-
-### 5. Moving Data Between Servers
-
-```bash
-# On source server: creates atomic snapshot archive + .sha256
-asql-export.sh -o /tmp/asql.tar.gz
-
-# On target server: verifies checksum, stops service, swaps store, resumes
-asql-import.sh /tmp/asql.tar.gz
-```
-
----
-
-## Users and Permissions: Capability Credentials
-
-ASQL provides two authentication mechanisms:
-1. **Operator Account** (`MYSQL_USER`): Defined in `asql.conf` with full administrative authority across all schemas.
-2. **Capability Credentials**: Cryptographically signed bearer tokens that attenuate authority (restricting accessible tables, rights, time-to-live, and maximum row budget).
-
-```bash
-# Operator mints a capability credential (over SQL or CLI)
-CAPABILITY MINT 'shop.orders,shop.customers' RIGHTS 'read' TTL 600 ROWS 1000;   -- returns signed bearer token
-CAPABILITY REVOKE '<credential>';
-
-# Holder attenuates credential offline without contacting server
-aios asqlcap attenuate <credential> tables=shop.orders rights=read ttl=60 rows=100
-
-# Client connects with username "cap" and token as password
-mysql -h 127.0.0.1 -P 3307 -u cap --enable-cleartext-plugin -p"<credential>" shop
-```
-
-### Named Users
-
-Named users provide standard login credentials backed by an underlying capability:
+### 1. Cryptographic Capability Credentials
+Capability credentials are cryptographically signed bearer tokens that attenuate authority (restricting accessible schemas, operations, execution duration, and row budget):
 
 ```sql
--- Create user restricted to specific tables and rights
-CREATE USER 'reporter' IDENTIFIED BY 'secret' TABLES 'analytics.*' RIGHTS 'read' TTL 86400 ROWS 50000;
-ALTER USER 'reporter' IDENTIFIED BY 'newsecret';
+-- Mint a restricted credential over SQL or CLI:
+CAPABILITY MINT 'shop.products,shop.orders' RIGHTS 'read' TTL 3600 ROWS 5000;
+-- Returns a signed bearer token
+
+-- Revoke a compromised token:
+CAPABILITY REVOKE '<token>';
+```
+
+Holders can attenuate credentials **offline** without contacting the database:
+```bash
+# Attenuate token to a single table, shorter TTL, and lower row limit:
+aios asqlcap attenuate <token> tables=shop.products rights=read ttl=300 rows=100
+```
+
+Clients log in with username `"cap"` and the token as password:
+```bash
+mysql -h 127.0.0.1 -P 3307 -u cap --enable-cleartext-plugin -p"<token>" shop
+```
+
+### 2. Named Users
+Standard database logins bound to explicit permission scopes:
+
+```sql
+CREATE USER 'reporter' IDENTIFIED BY 'rep_secret' TABLES 'shop.*' RIGHTS 'read' TTL 86400 ROWS 50000;
 ALTER USER 'reporter' RIGHTS 'read,write';
 SHOW USERS;
 DROP USER 'reporter';
 ```
 
-```bash
-# Connect using standard MySQL drivers
-mysql -h 127.0.0.1 -P 3307 -u reporter -psecret analytics
-```
+---
 
-- **Scope & Rights**: Scope is `db.*` or `db.table`. Rights: `read` (`SELECT`), `write` (`INSERT`, `UPDATE`, `REPLACE`), `delete` (`DELETE`), `execute` (stored functions), and `admin` (DDL).
-- **Row Budget**: Enforces a strict limit on cumulative rows returned or mutated per session.
+## SQL Dialect Coverage
+
+ASQL implements a rich relational SQL dialect:
+
+* **DDL**: `CREATE DATABASE`, `USE`, `CREATE/DROP/ALTER TABLE`, `PRIMARY KEY` (including composite keys), `AUTO_INCREMENT`, `UNIQUE`, `DEFAULT`, `CREATE VIEW`, `CREATE TYPE ... AS ENUM`.
+* **DML**: `SELECT`, `INSERT ... VALUES`, `INSERT ... ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `UPDATE`, `DELETE`, multi-table updates (`UPDATE a JOIN b ... SET`), and multi-table deletes.
+* **Joins**: `INNER JOIN`, `LEFT/RIGHT/FULL [OUTER] JOIN`, `CROSS JOIN`, `NATURAL JOIN`, `JOIN ... USING (...)`, and comma joins with automatic hash-join optimization.
+* **CTEs & Subqueries**: Correlated scalar subqueries, `WITH`, and `WITH RECURSIVE` (with configurable `max_recursive_iterations`).
+* **Window Functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()`, `NTILE()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()`, with `PARTITION BY`, `ORDER BY`, and `ROWS/RANGE BETWEEN` frame specifications.
+* **PostgreSQL Extensions**:
+  * Cast operator `expr::type` (`int`, `numeric(p,s)`, `text`, `boolean`, `timestamp`).
+  * `a IS [NOT] DISTINCT FROM b`.
+  * `generate_series(start, stop [, step])` and `LATERAL` joins.
+  * `INSERT ... ON CONFLICT (cols) DO NOTHING | DO UPDATE SET ...`
+  * Aggregate filters: `agg(...) FILTER (WHERE ...)`.
+* **JSON Functions**: `JSON_EXTRACT`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `JSON_SET`, `JSON_REPLACE`, `JSON_REMOVE`, `JSON_CONTAINS_PATH`, etc.
+* **Stored Procedures & Triggers**: `CREATE PROCEDURE`, `CREATE FUNCTION`, `CREATE TRIGGER` (`BEFORE`/`AFTER`), control flow (`IF`, `WHILE`, `LOOP`, `CURSOR`, `HANDLER`).
 
 ---
 
-## Running by Hand (Development & Testing)
+## Production Deployment & Administration
+
+### Packaging & Installation
+Build a portable release binary against glibc 2.17+ to run across all enterprise Linux distributions (CentOS 7, AlmaLinux 8/9, Rocky, Debian, Ubuntu):
 
 ```bash
-# Run standalone in-memory database without CDC
-aios --root /tmp/asql-dev exec "compute serve port=7801 lanes=8 sql=1 \
-  mysql_port=14501 mysql_bind=127.0.0.1 mysql_user=app mysql_pass_file=/opt/aios/mysql.pass"
+# Build binary package
+TARGETS="aios-cli aios-asql-top aios-asql-console" packaging/build-centos7.sh origin/main build-centos7
+packaging/pack.sh build-centos7 packaging/dist
 
-# Run standalone engine binary directly with write-through forwarding
-build/aios-engine --root=/tmp/asql-engine --port=13593 --bind=127.0.0.1 \
-  --mode=write_through --downstream=127.0.0.1:3306 --downstream-user=app --downstream-db=appdb
-
-# Execute single statement against a datadir without starting a daemon
-aios --root /tmp/asql-dev exec 'sql query "SELECT * FROM appdb.users LIMIT 5"'
+# Install on target host
+tar xzf aios-asql-*.tar.gz && cd aios-asql-*/
+sudo ./install-asql.sh                 # provisions user 'aios', /opt/aios, systemd unit
+sudo systemctl restart aios-compute
 ```
 
-### Core Environment Knobs
+### Configuration (`/etc/aios/asql.conf`)
+The central service configuration file:
 
-- `AIOS_NO_ACCEL=1`: Disable GPU initialization (saves ~0.7s startup and 400 MB RAM).
-- `AIOS_SQL_PROBE_MB`: Join/probe index cache budget in MB (default 2048).
-- `AIOS_SQL_CACHE_MB`: Result cache budget in MB (default 1024; `0` disables).
-- `AIOS_QUERY_MEMORY_MB`: Intermediate query memory limit before queuing (default 2048).
-- `AIOS_CHECKPOINT_SECS`: Minimum seconds between automatic checkpoints (default 30).
-- `AIOS_REDO_SYNC=0`: Group commit writes to log and sync asynchronously every 200ms (MariaDB `innodb_flush_log_at_trx_commit=2` equivalent). Default (`1`) syncs synchronously to storage.
-- `AIOS_TXN_CONCURRENT=1`: Row-level concurrent transactions rather than global writer lock.
-- `AIOS_WRITE_BEHIND=1`: Force write-behind WAL mode.
+```ini
+AIOS_ROOT=/opt/aios/root
+SQL=1
+SQL_DB=sql_db
+RPC_PORT=7311
+PUBLIC=1
+LANES=8
 
----
+# MySQL Wire Listener
+MYSQL_PORT=3307
+MYSQL_BIND=0.0.0.0
+MYSQL_USER=app
+MYSQL_PASS_FILE=/opt/aios/mysql.pass
+MYSQL_SOCKET=/opt/aios/run/asql.sock
 
-## Client Integration Guide
-
-### 1. MySQL CLI / Shell
-
-```bash
-# Connect via UNIX domain socket
-mysql -S /opt/aios/run/asql.sock -u app -p"$(cat /opt/aios/mysql.pass)" appdb
-
-# Connect over TCP
-mysql -h 127.0.0.1 -P 3307 -u app -p appdb
+# CDC Ingress (optional, for MariaDB/MySQL replication)
+CDC_HOST=127.0.0.1
+CDC_PORT=3306
+CDC_USER=replicator
+CDC_PASS_FILE=/opt/aios/cdc.pass
+CDC_DB=shop
+CDC_TABLES=products,orders,inventory
 ```
 
-### 2. PHP (PDO)
+### Operator Tools & Acceptance Checks
 
-```php
-$dsn = "mysql:unix_socket=/opt/aios/run/asql.sock;dbname=appdb;charset=utf8mb4";
-$pdo = new PDO($dsn, "app", trim(file_get_contents("/opt/aios/mysql.pass")), [
-    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-]);
-
-$stmt = $pdo->query("SELECT id, user_id, total, created_at FROM orders WHERE status = 'pending' LIMIT 10");
-$orders = $stmt->fetchAll();
-```
-
-### 3. Python (`pymysql`)
-
-```python
-import pymysql
-
-conn = pymysql.connect(
-    host="127.0.0.1",
-    port=3307,
-    user="app",
-    password=open("/opt/aios/mysql.pass").read().strip(),
-    database="appdb",
-    cursorclass=pymysql.cursors.DictCursor
-)
-
-with conn.cursor() as cursor:
-    cursor.execute("SELECT COUNT(*) AS total FROM orders")
-    print(cursor.fetchone())
-```
-
-### 4. Node.js (`mysql2`)
-
-```javascript
-import mysql from 'mysql2/promise';
-
-const conn = await mysql.createConnection({
-  host: '127.0.0.1',
-  port: 3307,
-  user: 'app',
-  password: 'your-wire-password',
-  database: 'appdb'
-});
-
-const [rows] = await conn.query('SELECT id, user_id, status FROM orders LIMIT 5');
-console.log(rows);
-```
-
-### 5. GUI Clients (Navicat / DBeaver / TablePlus / DataGrip)
-
-- **Connection**: MySQL
-- **Host / Port**: `127.0.0.1` / `3307`
-- **User / Password**: `MYSQL_USER` and contents of `MYSQL_PASS_FILE`
-- **Database**: `appdb`
-- Dynamic virtual `information_schema` populates schemas, tables, and column metadata out of the box.
-
-### 6. Raw JSON RPC (Port 7311)
-
-For microservices desiring low serialization overhead:
-- **Framing**: 4-byte big-endian length prefix followed by UTF-8 JSON.
-- **Request**:
-  ```json
-  {"op": "sql", "query": "SELECT id, user_id, status FROM orders WHERE status = 'active' LIMIT 2"}
+* **Acceptance Verification (`asql-check`)**:
+  ```bash
+  /opt/aios/bin/asql-check            # full verification of mirror parity & things
+  /opt/aios/bin/asql-check --quick    # quick status of service, wire socket, and binlog lag
   ```
-- **Response**:
-  ```json
-  {
-    "ok": true,
-    "op": "sql",
-    "columns": ["id", "user_id", "status"],
-    "rows": [[1001, "USR42", "active"], [1002, "USR88", "active"]],
-    "row_count": 2
-  }
+* **Interactive Terminal Top (`aios-asql-top`)**:
+  ```bash
+  aios-asql-top                       # real-time screen showing active queries, memory, and CDC lag
+  aios-asql-top -1                    # one-line snapshot for monitoring scripts
+  ```
+* **Interactive CLI Prompt (`aios-asql-console`)**:
+  ```bash
+  aios-asql-console                   # direct SQL prompt
+  aios-asql-console -e "SHOW STATUS LIKE 'Asql_%'"
   ```
 
----
+### Online Backup & Restore (`asql-export` / `asql-import`)
 
-## Data Import & Ingestion
-
-### Import from `.sql` Dump
+Create point-in-time consistent backups while queries are running:
 
 ```bash
-# Import a mysqldump file into ASQL
-aios --root /opt/aios/root exec "sql import file=/path/to/backup.sql"
+# Export consistent snapshot archive (includes tables, Things, and Cells):
+packaging/asql-export.sh -o /tmp/asql-backup.tar.gz
 
-# Import direct SQL statements
-aios --root /opt/aios/root exec 'sql import sql="CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT); INSERT INTO t1 VALUES (1, '\''hello'\'');"'
+# Restore snapshot to another host/root:
+packaging/asql-import.sh /tmp/asql-backup.tar.gz
 ```
-
-### Copy a Live MariaDB/MySQL Database (no binlog needed)
-
-```bash
-# Every table and view of shopdb, over the wire, in one consistent snapshot
-aios --root /opt/aios/root exec "sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shopdb"
-
-# Only some tables, copying them again if already present
-aios --root /opt/aios/root exec "sql copy host=db.example.com user=reader pass_file=/root/src.pass db=shopdb tables=orders,stock replace=1"
-```
-
-Needs only `SELECT` on the source. See `docs/asql.md` ("Copying a live database").
-
-### Initial CDC Seeding from Upstream MariaDB/MySQL
-
-When `CDC_HOST`, `CDC_DB`, and `CDC_TABLES` are configured, ASQL automatically copies missing tables from upstream during startup. To seed manually from a consistent snapshot:
-
-1. **Dump tables with master coordinates**:
-   ```bash
-   mysqldump -u replicator -p --single-transaction --master-data=2 \
-     appdb users orders order_items products inventory > /tmp/asql_initial.sql
-   ```
-2. **Find coordinates**:
-   ```bash
-   grep "CHANGE MASTER TO" /tmp/asql_initial.sql
-   # e.g.: MASTER_LOG_FILE='mariadb-bin.000124', MASTER_LOG_POS=3019482
-   ```
-3. **Import and pin coordinates**:
-   ```bash
-   aios --root /opt/aios/root exec "sql import file=/tmp/asql_initial.sql"
-   # Set CDC_LOG_FILE and CDC_LOG_POS in /etc/aios/asql.conf before restarting
-   ```
-
----
-
-## SQL Dialect & Feature Reference
-
-### Schema & Data Definition (DDL)
-- `CREATE TABLE [IF NOT EXISTS] ... (col TYPE [NOT NULL] [DEFAULT val] [AUTO_INCREMENT] [PRIMARY KEY], ...)`
-- `CREATE TABLE t LIKE src` and `CREATE TABLE t [AS] SELECT ...`
-- `DROP TABLE [IF EXISTS]`, `TRUNCATE [TABLE]`
-- `ALTER TABLE ... ADD COLUMN / DROP COLUMN / MODIFY COLUMN / RENAME TO`
-- `CREATE VIEW ... AS SELECT ...` / `DROP VIEW`
-
-### Queries & Data Manipulation (DML)
-- `SELECT [DISTINCT] [expr AS alias, ...] FROM tbl [JOIN ...] [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ...] [LIMIT n [OFFSET m]]`
-- `INSERT INTO tbl [(cols...)] VALUES (...), (...) [ON DUPLICATE KEY UPDATE ...]`
-- `REPLACE INTO tbl [(cols...)] VALUES (...)`
-- `UPDATE tbl SET col = val, ... [WHERE ...] [LIMIT n]`
-- `DELETE FROM tbl [WHERE ...] [LIMIT n]`
-
-### Joins, CTEs & Advanced Querying
-- `INNER JOIN`, `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN`
-- `UNION` / `UNION ALL`
-- Common Table Expressions (CTEs): `WITH [RECURSIVE] cte_name AS (SELECT ...) SELECT ...`
-- Subqueries: Scalar, `IN (SELECT ...)`, `EXISTS (SELECT ...)`, Correlated subqueries
-- Window Functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `SUM() OVER (...)`, etc.
-
-### Stored Programs & Triggers
-- `CREATE PROCEDURE`, `CREATE FUNCTION`, `CREATE TRIGGER` (`BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE`), `CREATE EVENT`.
-- Control flow: `IF`, `CASE`, `WHILE`, `REPEAT`, `LOOP`, `LEAVE`, `ITERATE`, `DECLARE CURSOR`, `DECLARE HANDLER`, `SIGNAL SQLSTATE`.
-- Routines persist across restarts in `<root>/programs.db`.
-- `CREATE SECRET name AS '...'` seals a value (AES-256-GCM); a Cells `NOTIFY 'https://...' HEADER ... BODY '...{{secret:name}}...'` uses it at send time, for example to post a Telegram message when a row arrives. See [docs/asql.md](docs/asql.md#secrets).
-- `CREATE MAILER name OAUTH 'google' ACCOUNT '...'` and a Cells `ON RISE bit MAIL name TO '...' SUBJECT '...' BODY '...'` send email through AIOS's own SMTP client, signed in with the machine's Google OAuth sign-in. See [docs/asql.md](docs/asql.md#mailers).
-
----
-
-## Benchmarks & Verification
-
-Compare queries on both ASQL and MariaDB using the diff runner:
-
-```bash
-# Verify identical result sets and compare execution latency
-node tools/asql-diff-runner.mjs --query "SELECT COUNT(*) FROM orders WHERE status = 'completed'"
-node tools/asql-diff-runner.mjs --file test_queries.sql
-```
-
-The test runner validates result set parity across both engines. `sysbench` OLTP workloads run out-of-the-box via standard MySQL wire protocol connections. Detailed benchmarks and architectural optimizations are documented in [docs/asql-benchmarks.md](docs/asql-benchmarks.md).
 
 ---
 
 ## Troubleshooting & FAQ
 
-### 1. Strict vs. Permissive Mode
-By default, ASQL matches MariaDB with `sql_mode = ''` (permissive casting and truncation).
-- For strict validation, export `AIOS_SQL_STRICT=1` (enforcing `STRICT_TRANS_TABLES`).
-- `PRIMARY KEY` and `UNIQUE` constraints are **always enforced** regardless of mode.
+### 1. Permissive vs. Strict SQL Mode
+By default, ASQL runs in permissive mode (`sql_mode = ''`). To enforce strict validation (rejecting truncation and invalid zero-dates), set:
+```bash
+export AIOS_SQL_STRICT=1
+```
+`PRIMARY KEY` and `UNIQUE` constraints are always enforced regardless of mode.
 
-### 2. Resyncing CDC Tables
-If local data diverges or a table file is corrupted:
-- **Resync one table**: Stop service, delete `/opt/aios/root/sql_db/tables/<hex_of_db.table>`, restart. ASQL fetches a fresh upstream snapshot for that table.
-- **Resync entire database**: Stop service, move `/opt/aios/root/sql_db/tables/` and `/opt/aios/root/sql_db/cdc_position` aside, and restart.
+### 2. Permission Denied on Loopback Connection
+If you configured `MYSQL_USER` and `MYSQL_PASS_FILE`, all connections (including loopback and UNIX socket) **must provide the valid password**. If no user is configured, loopback enters freely, but remote clients are blocked.
 
-### 3. Service Exits with Code 78
-Exit code 78 means `asql-serve` cannot read `/etc/aios/asql.conf`. Ensure directory permissions are readable by user `aios` (`root:aios 0750`, file `0640`).
+### 3. Exit Code 78 on Startup
+Exit code `78` from `asql-serve` indicates that `/etc/aios/asql.conf` is missing or unreadable by the `aios` service user. Verify file ownership and permissions (`root:aios 0640`).
 
-### 4. Query Cache Hits Stay at 0
-Queries using `SQL_NO_CACHE` bypass the result cache deliberately. Furthermore, table writes invalidate cached results that reference the mutated table. View status with `SHOW STATUS LIKE 'Asql_cache%'`.
+### 4. Forcing CDC Table Resync
+To force ASQL to re-seed a table from upstream:
+```bash
+sudo systemctl stop aios-compute
+rm -f /opt/aios/root/sql_db/tables/<hex_db_table_name>*
+sudo systemctl start aios-compute
+```
+ASQL will snapshot the table anew from upstream before resuming replication.
+
+---
+
+*For detailed internal design and engine specifications, see [docs/asql-internals.md](docs/asql-internals.md), [docs/asql-source-layout.md](docs/asql-source-layout.md), and [docs/asql-benchmarks.md](docs/asql-benchmarks.md).*

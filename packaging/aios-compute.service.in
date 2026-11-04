@@ -11,7 +11,7 @@ WorkingDirectory=/opt/aios
 Environment=AIOS_NO_ACCEL=1
 # Transactions run side by side (rows owned as they are written) instead of
 # each holding the one writer lock from BEGIN to COMMIT; see "Transactions"
-# in docs/asql.md. Without it, sessions that wrap their statements in
+# in docs/asql-internals.md. Without it, sessions that wrap their statements in
 # BEGIN ... COMMIT (every ORM, sysbench) serialize on that lock.
 Environment=AIOS_TXN_CONCURRENT=1
 ExecStart=/opt/aios/bin/asql-serve

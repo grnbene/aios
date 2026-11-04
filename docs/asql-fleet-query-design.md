@@ -26,7 +26,7 @@ taking `sat fleet` (`cli/sat_cmd.cpp`) as the model.
 ## The case it is for: replicas of one source
 
 The production shape is `compute serve sql=1` / `asql-serve` with binlog CDC
-from one MariaDB (`docs/asql.md`, "Replicating a MariaDB"). Every such member
+from one MariaDB (`docs/asql-internals.md`, "Replicating a MariaDB"). Every such member
 already holds **every row of every whitelisted table**. That decides most of
 the design:
 
@@ -79,7 +79,7 @@ is wrong, and wrong silently. So a fleet query runs behind a **fence**:
    position and the others catch up to it. Positions only move forward, so
    this converges in one or two rounds.
 4. Slices run. CDC apply already takes the exclusive statement lock
-   (`docs/asql.md`, Transactions), so nothing changes under a read anyway; the
+   (`docs/asql-internals.md`, Transactions), so nothing changes under a read anyway; the
    fence makes that hold across **all** of a query's slices, not one.
 5. The coordinator releases the fence; the members catch up.
 

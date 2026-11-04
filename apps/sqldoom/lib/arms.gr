@@ -1,0 +1,587 @@
+# The player's weapons in the hand, as 3D models: each a design written into the bestiary's tables (lib/bestiary.gr)
+# and built into a model like the monsters are, then drawn by the renderer in front of everything (r3d_doom_draw)
+# where Doom drew its weapon sprite - lit by the room and by the lights, following where the eye looks, swaying,
+# bobbing with the step, kicking when it fires.
+#
+# A design is in weapon space: x along the barrel, y to the gun's left, z up, the origin where the right hand grips;
+# the hand and the forearm reach back from it toward the eye, and a long gun's left hand holds its fore-end. Its clips:
+# "idle" (looped: the chainsaw runs), and "fire", played once from the tic a shot goes off (what moves when it shoots:
+# the fist thrown, the pistol's slide, the shotgun's pump, the chaingun's barrels, a rocket leaving). A gun's muzzle
+# flash is a model of its own in the same space, drawn with it for the moment its flash lasts.
+# Every weapon in weapon_defs has one: fist, pistol, shotgun, chaingun, rocket launcher, plasma rifle, BFG, chainsaw.
+#
+#   arms_install()    -> {weapon_id: {model, flash, flash_s, hold, turn, kick}}: the designs built into models and
+#                        listed in weapon_model with how each is held (once; after that what weapon_model holds)
+
+import { new_design, bone, mat, limb, blob, slab, cut_blob, cut_limb, clip, design_write } from "bestiary_designs.gr"
+import { bestiary_tables, bestiary_build } from "bestiary.gr"
+
+# a key of a clip, any bone moved (r: yaw pitch roll degrees, d: dx dy dz)
+fn key(D, clipname, t, bname, r, d) {
+  push(D.keys, {"clip": clipname, "t": t, "bone": D.ids[bname], "r": r, "d": d})
+}
+
+# The hands' kit: the marine's armoured gauntlets. Built of hard pieces, as the guns are (soft sculpted skin never read as
+# a hand here): a dark synthetic glove whose fingers are jointed segments, a green armour plate over the back of the
+# hand and studs on the knuckles, a heavy wrist cuff and a vambrace of plate round the forearm, the cloth sleeve behind
+# it. Every blend is small, so each piece keeps its edges; a hand is written into its design before the weapon, so the
+# weapon's own small blend makes the seam where they touch.
+fn hand_mats() {
+  return {
+    "glove": mat(0x393b32, 0x26281f, {"mottle": 0.35, "grain": 0.25, "shine": 0.1, "blend": 0.05, "rough": 0.018, "round": 0.5}),
+    "joint": mat(0x1e201a, 0x141510, {"mottle": 0.2, "grain": 0.3, "shine": 0.2, "blend": 0.04, "rough": 0.01}),
+    "plate": mat(0x56723e, 0x3c5230, {"mottle": 0.25, "grain": 1.4, "shine": 0.55, "blend": 0.04, "rough": 0.006, "round": 0.12}),
+    "edge": mat(0x70905a, 0x56723e, {"mottle": 0.2, "grain": 1.4, "shine": 0.65, "blend": 0.03, "round": 0.06}),
+    "metal": mat(0x8a8c88, 0x5e605c, {"mottle": 0.1, "shine": 0.9, "blend": 0.03, "round": 0.04}),
+    "band": mat(0x26231f, 0x1a1814, {"mottle": 0.3, "grain": 0.6, "shine": 0.25, "blend": 0.04}),
+    "sleeve": mat(0x4a6a3a, 0x34502a, {"mottle": 0.35, "grain": 0.5, "shine": 0.12, "blend": 0.06, "rough": 0.04}),
+    "fold": mat(0x4e7040, 0x3a5430, {"mottle": 0.35, "grain": 0.5, "shine": 0.12, "blend": 0.25, "rough": 0.03})
+  }
+}
+
+fn lerp3(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t] }
+
+# A gloved finger through its joints p0 (its knuckle) .. p3 (its tip), r its radius at the knuckle: three segments
+# tapering to the tip, each a little short of its joint so a dark groove marks the bend.
+fn finger(D, bn, p, r, S) {
+  let rs = [[r, r * 0.92], [r * 0.9, r * 0.84], [r * 0.82, r * 0.74]]
+  for i in range(0, 3) {
+    limb(D, bn, lerp3(p[i], p[i + 1], i == 0 ? 0.0 : 0.1), lerp3(p[i], p[i + 1], i == 2 ? 1.0 : 0.9), rs[i][0], rs[i][1], S.glove)
+  }
+  blob(D, bn, p[1], [r * 0.82, r * 0.82, r * 0.82], nil, S.joint)
+  blob(D, bn, p[2], [r * 0.74, r * 0.74, r * 0.74], nil, S.joint)
+}
+
+# The forearm's armour from the wrist at `a` back to `b` round an arm of radius r: the glove's heavy cuff at the wrist,
+# the vambrace (a shell of plate, wider toward the elbow), a strap round each end, a ridge along its top, rivets.
+fn vambrace(D, bn, a, b, r, S) {
+  let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+  let len = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+  let u = [d[0] / len, d[1] / len, d[2] / len]
+  # up: the world's up made square to the arm
+  let k = u[2]
+  let up0 = [-k * u[0], -k * u[1], 1.0 - k * u[2]]
+  let ul = sqrt(up0[0] * up0[0] + up0[1] * up0[1] + up0[2] * up0[2])
+  let up = [up0[0] / ul, up0[1] / ul, up0[2] / ul]
+  let at = fn (t, h) { return [a[0] + u[0] * t + up[0] * h, a[1] + u[1] * t + up[1] * h, a[2] + u[2] * t + up[2] * h] }
+  limb(D, bn, at(0.0, 0.0), at(0.5, 0.0), r + 0.12, r + 0.14, S.glove)
+  limb(D, bn, at(0.55, 0.0), at(len, 0.0), r + 0.2, r + 0.32, S.plate)
+  limb(D, bn, at(0.65, 0.0), at(0.95, 0.0), r + 0.27, r + 0.28, S.band)
+  limb(D, bn, at(len - 0.55, 0.0), at(len - 0.25, 0.0), r + 0.37, r + 0.38, S.band)
+  limb(D, bn, at(1.1, r + 0.22), at(len - 0.7, r + 0.33), 0.1, 0.1, S.edge)
+  for t in [0.8, len - 0.4] {
+    for side in [-0.55, 0.55] {
+      let c = at(t, 0.0)
+      let h = r + 0.29 + (t > 1.0 ? 0.1 : 0.0)
+      blob(D, bn, [c[0] + up[0] * h * 0.84 + side * (u[1] * up[2] - u[2] * up[1]) * h,
+                   c[1] + up[1] * h * 0.84 + side * (u[2] * up[0] - u[0] * up[2]) * h,
+                   c[2] + up[2] * h * 0.84 + side * (u[0] * up[1] - u[1] * up[0]) * h], [0.08, 0.08, 0.08], nil, S.metal)
+    }
+  }
+}
+
+# A sleeve of cloth from `a` (inside the vambrace's end) back to `b`: matte, with soft folds where it bunches.
+fn sleeve(D, bn, a, b, r0, r1, S) {
+  limb(D, bn, a, b, r0, r1, S.sleeve)
+  for t in [0.3, 0.55] {
+    let p = lerp3(a, b, t)
+    let q = lerp3(a, b, t + 0.06)
+    limb(D, bn, p, q, r0 + (r1 - r0) * t + 0.06, r0 + (r1 - r0) * t + 0.06, S.fold)
+  }
+}
+
+# The right gauntlet gripping at the origin (on bone `bn`) a grip leaning back `grip_tilt` degrees, the forearm going
+# back and down to the eye's right. The back of the hand faces the gun's right (y-), toward the eye: its armour plate
+# and the studs on its knuckles show there.
+fn hand_and_arm(D, bn, grip_tilt) {
+  let S = hand_mats()
+  # the flat of the hand down the grip's right side and round its back, the web over the top, the heel below
+  slab(D, bn, [-1.1, -0.66, -1.55], [0.9, 0.24, 1.15], [0.0, grip_tilt, 0.0], S.glove)
+  blob(D, bn, [-1.62, -0.15, -1.7], [0.4, 0.62, 1.05], [0.0, grip_tilt, 0.0], S.glove)
+  blob(D, bn, [-1.05, 0.05, -0.5], [0.5, 0.55, 0.26], nil, S.glove)
+  blob(D, bn, [-1.3, 0.5, -1.0], [0.55, 0.32, 0.55], nil, S.glove)
+  # the plate over the back of the hand, riveted
+  slab(D, bn, [-1.2, -0.95, -1.55], [0.72, 0.09, 0.9], [0.0, grip_tilt, 0.0], S.plate)
+  for c in [[-1.75, -1.05, -0.85], [-1.4, -1.05, -2.25]] { blob(D, bn, c, [0.07, 0.07, 0.07], nil, S.metal) }
+  # three fingers round the front of the grip and back along its left side, the little one smaller, a stud on each
+  # knuckle
+  for i in range(0, 3) {
+    let z = -1.3 - i * 0.74
+    let x0 = -0.6 + z * 0.2
+    let r = i == 2 ? 0.22 : 0.26
+    finger(D, bn, [[x0, -0.7, z], [x0 + 0.95, -0.56, z - 0.02], [x0 + 1.08, 0.24, z - 0.06], [x0 + 0.62, 0.62, z - 0.1]], r, S)
+    slab(D, bn, [x0 - 0.05, -0.97, z], [0.2, 0.07, 0.22], nil, S.edge)
+  }
+  # the index finger along the guard, straight, off the trigger
+  finger(D, bn, [[-0.35, -0.7, -0.62], [0.55, -0.6, -0.5], [1.35, -0.57, -0.44], [2.0, -0.55, -0.4]], 0.26, S)
+  slab(D, bn, [-0.42, -0.96, -0.6], [0.2, 0.07, 0.2], nil, S.edge)
+  # the thumb along the far side, over the fingers
+  limb(D, bn, [-1.3, 0.55, -0.85], [-0.35, 0.72, -0.5], 0.34, 0.29, S.glove)
+  finger(D, bn, [[-0.35, 0.72, -0.5], [0.15, 0.7, -0.42], [0.5, 0.64, -0.35], [0.75, 0.6, -0.3]], 0.28, S)
+  # the wrist, the vambrace, the sleeve behind it: only as far back as the view ever shows
+  limb(D, bn, [-1.75, -0.3, -2.3], [-4.4, -0.6, -4.1], 0.8, 0.9, S.glove)
+  vambrace(D, bn, [-2.3, -0.36, -2.67], [-6.4, -0.9, -5.45], 0.85, S)
+  sleeve(D, bn, [-6.2, -0.88, -5.3], [-8.8, -1.25, -6.9], 1.1, 1.35, S)
+}
+
+# The pistol: a squared dark-steel automatic, its slide running back on the frame when it fires.
+fn pistol() {
+  let D = new_design("arm_pistol", 0.11e0, 0.3e0, 0.0e0, "the pistol in the player's hand: steel automatic, armoured gauntlet")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "slide", "root", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  let steel = mat(0x3a3d42, 0x2a2c30, {"mottle": 0.08, "grain": 0.5, "shine": 0.85, "blend": 0.06, "round": 0.25})
+  let worn = mat(0x4e5258, 0x3a3d42, {"mottle": 0.1, "grain": 0.4, "shine": 0.95, "blend": 0.05, "round": 0.3})
+  let grip_m = mat(0x26211c, 0x14110e, {"mottle": 0.4, "grain": 0.35, "shine": 0.25, "blend": 0.08, "rough": 0.05, "round": 0.4})
+  let dark = mat(0x0c0c0d, 0x060606, {"blend": 0.05})
+  let dot = mat(0xe8e0c0, 0xc8c0a0, {"shine": 0.4, "blend": 0.02})
+  # the frame under the slide, the dust cover forward of the guard
+  slab(D, "root", [1.6, 0.0, 0.05], [3.3, 0.42, 0.42], nil, steel)
+  # the slide: its flat top, the cocking serrations at the back, the ejection port, the sights
+  slab(D, "slide", [1.75, 0.0, 0.8], [3.55, 0.47, 0.42], nil, worn)
+  for i in range(0, 5) { cut_blob(D, "slide", [-1.2 + i * 0.28, 0.5, 0.8], [0.06, 0.08, 0.32], nil, dark) }
+  for i in range(0, 5) { cut_blob(D, "slide", [-1.2 + i * 0.28, -0.5, 0.8], [0.06, 0.08, 0.32], nil, dark) }
+  cut_blob(D, "slide", [2.0, -0.45, 0.95], [0.6, 0.2, 0.2], nil, dark)
+  slab(D, "slide", [4.95, 0.0, 1.3], [0.18, 0.08, 0.12], nil, steel)
+  blob(D, "slide", [4.95, 0.0, 1.36], [0.05, 0.05, 0.05], nil, dot)
+  slab(D, "slide", [-1.5, 0.0, 1.3], [0.2, 0.36, 0.12], nil, steel)
+  cut_blob(D, "slide", [-1.5, 0.0, 1.42], [0.24, 0.1, 0.1], nil, dark)
+  # the muzzle: the barrel's end in the slide's face, its bore
+  limb(D, "slide", [5.1, 0.0, 0.78], [5.32, 0.0, 0.78], 0.27, 0.27, steel)
+  cut_limb(D, "slide", [5.0, 0.0, 0.78], [5.6, 0.0, 0.78], 0.15, 0.15, dark)
+  # the grip, leaning back, its panels; the magazine's foot; the hammer and the beavertail
+  slab(D, "root", [-0.85, 0.0, -1.7], [0.72, 0.44, 1.65], [0.0, -14.0, 0.0], steel)
+  for s2 in [1.0, -1.0] { slab(D, "root", [-0.85, 0.44 * s2, -1.6], [0.6, 0.06, 1.4], [0.0, -14.0, 0.0], grip_m) }
+  slab(D, "root", [-1.25, 0.0, -3.35], [0.82, 0.5, 0.14], [0.0, -14.0, 0.0], steel)
+  slab(D, "root", [-1.95, 0.0, 0.75], [0.16, 0.14, 0.28], [0.0, 20.0, 0.0], steel)
+  # the trigger guard and the trigger
+  limb(D, "root", [-0.05, 0.0, -0.4], [0.35, 0.0, -1.0], 0.1, 0.1, steel)
+  limb(D, "root", [0.35, 0.0, -1.0], [1.45, 0.0, -1.0], 0.1, 0.1, steel)
+  limb(D, "root", [1.45, 0.0, -1.0], [1.55, 0.0, -0.35], 0.1, 0.1, steel)
+  limb(D, "root", [0.45, 0.0, -0.35], [0.6, 0.0, -0.75], 0.08, 0.06, steel)
+  # clips: idle, fire (the slide back and home)
+  let home = [0.0, 0.0, 0.0]
+  clip(D, "idle", 1.0)
+  for tt in [0.0, 1.0] { key(D, "idle", tt, "slide", home, home) }
+  clip(D, "fire", 0.3)
+  for k in [[0.0, 0.0], [0.03, -1.25], [0.06, -1.25], [0.09, -1.0], [0.18, -0.3], [0.3, 0.0]] { key(D, "fire", k[0], "slide", home, [k[1], 0.0, 0.0]) }
+  return D
+}
+
+
+# ---- what the long guns share ----------------------------------------------------------------------------------------
+
+fn vplus(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+
+# the left gauntlet cupped under a fore-end whose underside is at `c` (on bone `bn`), `w` its half width: the flat of the
+# hand under it, the fingers up its left side, the thumb up its right, the vambraced forearm going back and down to the
+# eye's left, the sleeve behind it
+fn support_hand(D, bn, c, w) {
+  let S = hand_mats()
+  slab(D, bn, vplus(c, [-0.2, 0.05, -0.36]), [0.95, 0.7, 0.2], nil, S.glove)
+  for i in range(0, 4) {
+    let x = 0.75 - i * 0.52
+    let r = i == 3 ? 0.21 : 0.25
+    finger(D, bn, [vplus(c, [x, 0.55, -0.32]), vplus(c, [x + 0.05, w + 0.2, -0.18]), vplus(c, [x + 0.05, w + 0.23, 0.26]),
+                   vplus(c, [x, w + 0.1, 0.62])], r, S)
+  }
+  limb(D, bn, vplus(c, [-0.9, -0.45, -0.38]), vplus(c, [-0.05, -w - 0.18, -0.08]), 0.33, 0.29, S.glove)
+  finger(D, bn, [vplus(c, [-0.05, -w - 0.18, -0.08]), vplus(c, [0.35, -w - 0.18, 0.08]), vplus(c, [0.65, -w - 0.16, 0.24]),
+                 vplus(c, [0.9, -w - 0.12, 0.34])], 0.27, S)
+  limb(D, bn, vplus(c, [-1.0, 0.2, -0.55]), vplus(c, [-4.0, 1.6, -3.0]), 0.78, 0.9, S.glove)
+  vambrace(D, bn, vplus(c, [-1.6, 0.48, -1.04]), vplus(c, [-5.7, 2.3, -4.3]), 0.82, S)
+  sleeve(D, bn, vplus(c, [-5.5, 2.2, -4.15]), vplus(c, [-8.8, 3.5, -6.5]), 1.1, 1.35, S)
+}
+
+# a pistol grip under a long gun's receiver, for the right hand (hand_and_arm) to hold at the origin
+fn rifle_grip(D, m) {
+  slab(D, "root", [-0.75, 0.0, -1.55], [0.62, 0.44, 1.55], [0.0, -14.0, 0.0], m)
+}
+
+# A weapon's muzzle flash, a model of its own (`name`, in the weapon's space, drawn with it at the same place while the
+# shot's flash lasts): out from a muzzle at `at` along x, a hot core, a plume `len` long, petals round it. Apart from
+# the weapon's mesh, nothing of the weapon moves or stretches with it, and it needs no hiding between shots.
+fn flash_design(name, at, rad, len, core_col, col) {
+  let D = new_design(name, 0.11e0, 0.3e0, 0.0e0, "a weapon's muzzle flash")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  let core = mat(core_col, col, {"glow": 1.0, "blend": 0.05})
+  let outer = mat(col, col, {"glow": 1.0, "blend": 0.05})
+  blob(D, "root", vplus(at, [rad * 1.2, 0.0, 0.0]), [rad, rad * 0.85, rad * 0.85], nil, core)
+  blob(D, "root", vplus(at, [rad * 2.0 + len * 0.5, 0.0, 0.0]), [len * 0.5, rad * 0.65, rad * 0.6], nil, outer)
+  blob(D, "root", vplus(at, [rad * 2.2 + len, 0.0, 0.0]), [len * 0.3, rad * 0.3, rad * 0.28], nil, outer)
+  for a in [0.0, 72.0, 144.0, 216.0, 288.0] {
+    let r = a / 57.29578
+    blob(D, "root", vplus(at, [rad * 1.5, sin(r) * rad * 1.15, cos(r) * rad * 1.15]), [rad * 0.6, rad * 0.28, rad * 0.28], nil, outer)
+  }
+  return D
+}
+
+fn gun_mats() {
+  return {
+    "blued": mat(0x2e3238, 0x22252a, {"mottle": 0.08, "grain": 0.5, "shine": 0.85, "blend": 0.06, "round": 0.25}),
+    "worn": mat(0x4e5258, 0x3a3d42, {"mottle": 0.1, "grain": 0.4, "shine": 0.95, "blend": 0.05, "round": 0.3}),
+    "wood": mat(0x6e4626, 0x4a2c16, {"mottle": 0.5, "grain": 0.45, "shine": 0.35, "blend": 0.08, "rough": 0.02, "round": 0.5}),
+    "grip": mat(0x26211c, 0x14110e, {"mottle": 0.4, "grain": 0.35, "shine": 0.25, "blend": 0.08, "rough": 0.05, "round": 0.4}),
+    "dark": mat(0x0c0c0d, 0x060606, {"blend": 0.05}),
+    "dot": mat(0xe8e0c0, 0xc8c0a0, {"shine": 0.4, "blend": 0.02})
+  }
+}
+
+# ---- the weapons -----------------------------------------------------------------------------------------------------
+
+# The fist: the right gauntlet closed, as a fist folds - the plated back of the hand ending in the row of knuckles, a
+# stud on each, every finger dropping straight down from its knuckle to make the fist's flat front, turning back under
+# it; the thumb along the side and locked across the front of the first two fingers. Held turned in toward the middle
+# of the view (as Doom drew its fist), so the eye sees its thumb side, the vambraced forearm behind it.
+# Thrown at the target when the punch lands.
+fn fist() {
+  let D = new_design("arm_fist", 0.08e0, 0.3e0, 0.0e0, "the player's fist: armoured gauntlet, vambrace, sleeve")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "fist", "root", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  let S = hand_mats()
+  # the back of the hand and the palm under it, narrowing to the wrist
+  slab(D, "fist", [-1.25, -0.05, 0.08], [1.25, 1.05, 0.36], nil, S.glove)
+  blob(D, "fist", [-1.05, 0.0, -0.45], [1.15, 1.0, 0.5], nil, S.glove)
+  slab(D, "fist", [-2.4, -0.05, -0.1], [0.45, 0.85, 0.4], nil, S.glove)
+  # the plate over the back of the hand, riveted at its corners
+  slab(D, "fist", [-1.35, -0.05, 0.5], [0.95, 0.92, 0.1], [0.0, -3.0, 0.0], S.plate)
+  for c in [[-2.1, 0.7, 0.62], [-2.1, -0.8, 0.62], [-0.6, 0.7, 0.58], [-0.6, -0.8, 0.58]] { blob(D, "fist", c, [0.08, 0.08, 0.07], nil, S.metal) }
+  # the fingers, index (by the thumb, y+) to little: knuckle; straight down the fist's front; back under it; tucked
+  let fy = [0.8, 0.25, -0.3, -0.82]
+  let fx = [0.0, 0.06, 0.0, -0.2]
+  let fz = [0.3, 0.36, 0.3, 0.2]
+  let fr = [0.3, 0.31, 0.29, 0.25]
+  for i in range(0, 4) {
+    let y = fy[i]
+    let x = fx[i]
+    let z = fz[i]
+    finger(D, "fist", [[x, y, z], [x + 0.28, y, z - 0.95], [x - 0.42, y, z - 1.25], [x - 0.8, y * 0.92, z - 0.9]], fr[i], S)
+    # the armoured stud over its knuckle
+    slab(D, "fist", [x - 0.02, y, z + 0.3], [0.26, fr[i] * 0.85, 0.1], [0.0, -10.0, 0.0], S.edge)
+  }
+  # the thumb: along the side of the palm, then its two joints forward and across the front of the first two fingers
+  blob(D, "fist", [-1.25, 0.95, -0.45], [0.75, 0.3, 0.38], [0.0, 10.0, -15.0], S.glove)
+  limb(D, "fist", [-1.8, 0.9, -0.5], [-0.55, 1.18, -0.58], 0.33, 0.3, S.glove)
+  finger(D, "fist", [[-0.55, 1.18, -0.58], [0.05, 1.14, -0.7], [0.4, 0.82, -0.8], [0.52, 0.4, -0.84]], 0.29, S)
+  # the wrist, the vambrace, the sleeve behind it
+  limb(D, "fist", [-2.6, -0.05, -0.15], [-4.4, -0.2, -0.85], 0.78, 0.88, S.glove)
+  vambrace(D, "fist", [-3.0, -0.08, -0.3], [-7.6, -0.75, -2.9], 0.85, S)
+  sleeve(D, "fist", [-7.4, -0.72, -2.8], [-11.0, -1.4, -4.8], 1.1, 1.4, S)
+  # clips: idle (still), fire (thrown forward and in toward the middle of the view, then back)
+  let home = [0.0, 0.0, 0.0]
+  let roll = 0.0
+  clip(D, "idle", 1.0)
+  for tt in [0.0, 1.0] { key(D, "idle", tt, "fist", [0.0, 0.0, roll], home) }
+  clip(D, "fire", 0.5)
+  # (the fist is held turned 38 degrees in, so its own forward already leans in: this throw, in its space, ends on the
+  # middle of the view)
+  # and as it lands it turns a little toward straight ahead, knuckles leading
+  let ks = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.06, 5.5, -1.1, 1.2, -6.0, -15.0], [0.16, 5.0, -1.0, 1.1, -5.0, -14.0], [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]]
+  for k in ks { key(D, "fire", k[0], "fist", [k[5], k[4], roll], [k[1], k[2], k[3]]) }
+  return D
+}
+
+# The shotgun: a pump gun, blued barrel over its magazine tube, a wooden pump the left hand works after each shot.
+fn shotgun() {
+  let D = new_design("arm_shotgun", 0.11e0, 0.3e0, 0.0e0, "the shotgun in the player's hands: pump action, wooden furniture")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "pump", "root", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  support_hand(D, "pump", [8.6, 0.0, 0.08], 0.58)
+  let M = gun_mats()
+  # the receiver, its ejection port, the trigger guard and trigger
+  slab(D, "root", [1.6, 0.0, 1.0], [1.9, 0.5, 0.62], nil, M.blued)
+  cut_blob(D, "root", [1.9, -0.5, 1.25], [0.7, 0.16, 0.24], nil, M.dark)
+  limb(D, "root", [0.2, 0.0, 0.4], [0.5, 0.0, -0.3], 0.1, 0.1, M.blued)
+  limb(D, "root", [0.5, 0.0, -0.3], [1.9, 0.0, -0.3], 0.1, 0.1, M.blued)
+  limb(D, "root", [1.9, 0.0, -0.3], [2.1, 0.0, 0.38], 0.1, 0.1, M.blued)
+  limb(D, "root", [1.0, 0.0, 0.38], [1.15, 0.0, -0.05], 0.08, 0.06, M.blued)
+  # the barrel and its bore, the bead, the magazine tube under it, the band joining them
+  limb(D, "root", [3.4, 0.0, 1.35], [17.0, 0.0, 1.35], 0.34, 0.32, M.worn)
+  cut_limb(D, "root", [16.6, 0.0, 1.35], [17.6, 0.0, 1.35], 0.2, 0.2, M.dark)
+  blob(D, "root", [16.6, 0.0, 1.72], [0.1, 0.1, 0.1], nil, M.dot)
+  limb(D, "root", [3.4, 0.0, 0.62], [15.4, 0.0, 0.62], 0.3, 0.3, M.blued)
+  slab(D, "root", [15.0, 0.0, 1.0], [0.25, 0.3, 0.6], nil, M.blued)
+  # the pump: wood, grooved for the fingers
+  slab(D, "pump", [8.6, 0.0, 0.55], [2.4, 0.58, 0.46], nil, M.wood)
+  for i in range(0, 7) {
+    for s2 in [1.0, -1.0] { cut_blob(D, "pump", [6.8 + i * 0.6, 0.58 * s2, 0.55], [0.08, 0.08, 0.36], nil, M.dark) }
+  }
+  # the pistol grip and the stock going back under the eye
+  rifle_grip(D, M.wood)
+  limb(D, "root", [-0.4, 0.0, 0.75], [-4.5, 0.0, 0.2], 0.6, 0.75, M.wood)
+  # clips: idle; fire (the pump racked back and home after the shot, as Doom's sprite does it)
+  let home = [0.0, 0.0, 0.0]
+  clip(D, "idle", 1.0)
+  for tt in [0.0, 1.0] { key(D, "idle", tt, "pump", home, home) }
+  clip(D, "fire", 1.0)
+  for k in [[0.0, 0.0], [0.32, 0.0], [0.46, -2.4], [0.6, -2.4], [0.76, 0.0], [1.0, 0.0]] {
+    key(D, "fire", k[0], "pump", home, [k[1], 0.0, 0.0])
+  }
+  return D
+}
+
+# The chaingun: six barrels round a spindle that turns a barrel's width for every round, a carrying handle on top.
+fn chaingun() {
+  let D = new_design("arm_chaingun", 0.11e0, 0.3e0, 0.0e0, "the chaingun in the player's hands: six turning barrels")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "barrels", "root", [4.0, 0.0, 1.1], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  support_hand(D, "root", [2.9, 0.0, 0.1], 0.85)
+  let M = gun_mats()
+  let olive = mat(0x40463a, 0x2c3028, {"mottle": 0.2, "grain": 0.8, "shine": 0.5, "blend": 0.08, "round": 0.4})
+  # the housing, the carrying handle, the front ring the barrels turn in, the feed on the right
+  slab(D, "root", [1.3, 0.0, 0.95], [2.4, 0.85, 0.85], nil, olive)
+  limb(D, "root", [0.2, 0.0, 1.8], [0.2, 0.0, 2.35], 0.16, 0.16, M.blued)
+  limb(D, "root", [2.6, 0.0, 1.8], [2.6, 0.0, 2.35], 0.16, 0.16, M.blued)
+  limb(D, "root", [0.2, 0.0, 2.35], [2.6, 0.0, 2.35], 0.18, 0.18, M.blued)
+  limb(D, "root", [3.6, 0.0, 1.1], [4.3, 0.0, 1.1], 1.05, 1.05, M.blued)
+  slab(D, "root", [1.2, -0.95, 0.7], [0.9, 0.2, 0.45], nil, M.blued)
+  for i in range(0, 5) { blob(D, "root", [0.6 + i * 0.32, -1.2, 0.35 - i * 0.18], [0.14, 0.2, 0.12], nil, mat(0xb08a3a, 0x8a6a2a, {"shine": 0.8, "blend": 0.04})) }
+  # the barrels, in the spindle's space
+  limb(D, "barrels", [0.2, 0.0, 0.0], [11.0, 0.0, 0.0], 0.22, 0.22, M.blued)
+  for x in [4.0, 9.6] { limb(D, "barrels", [x, 0.0, 0.0], [x + 0.3, 0.0, 0.0], 0.95, 0.95, M.blued) }
+  for k in range(0, 6) {
+    let a = k * 60.0 / 57.29578
+    let y = sin(a) * 0.62
+    let z = cos(a) * 0.62
+    limb(D, "barrels", [0.2, y, z], [11.0, y, z], 0.22, 0.22, M.worn)
+    cut_limb(D, "barrels", [10.7, y, z], [11.4, y, z], 0.12, 0.12, M.dark)
+  }
+  rifle_grip(D, M.grip)
+  # clips: idle; fire, one round: the barrels a sixth of a turn (so round after round they spin)
+  let home = [0.0, 0.0, 0.0]
+  clip(D, "idle", 1.0)
+  for tt in [0.0, 1.0] { key(D, "idle", tt, "barrels", home, home) }
+  clip(D, "fire", 0.114)
+  key(D, "fire", 0.0, "barrels", home, home)
+  key(D, "fire", 0.114, "barrels", [0.0, 0.0, 60.0], home)
+  return D
+}
+
+# The rocket launcher: a fat tube on the shoulder, a sight on top, a rocket's nose in the bore that leaves with the
+# shot and the next one slid up behind it.
+fn rocket_launcher() {
+  let D = new_design("arm_rocket", 0.13e0, 0.3e0, 0.0e0, "the rocket launcher in the player's hands: tube, sight, rocket in the bore")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "rocket", "root", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  support_hand(D, "root", [6.0, 0.0, 0.6], 1.2)
+  let M = gun_mats()
+  let tube = mat(0x4c5440, 0x30362a, {"mottle": 0.3, "grain": 1.0, "shine": 0.45, "blend": 0.1, "round": 0.5})
+  let stripe = mat(0xc8a030, 0x9a7820, {"mottle": 0.2, "shine": 0.4, "blend": 0.04})
+  let warhead = mat(0xa83828, 0x701c14, {"mottle": 0.2, "shine": 0.6, "blend": 0.05})
+  # the tube, the ring at its mouth, the bore, the stripes; the mount under it, the sight on top
+  limb(D, "root", [-2.5, 0.0, 1.8], [12.6, 0.0, 1.8], 1.2, 1.2, tube)
+  limb(D, "root", [12.4, 0.0, 1.8], [13.4, 0.0, 1.8], 1.38, 1.38, M.blued)
+  cut_limb(D, "root", [10.0, 0.0, 1.8], [14.0, 0.0, 1.8], 0.95, 0.95, M.dark)
+  for x in [9.6, 10.4] { limb(D, "root", [x, 0.0, 1.8], [x + 0.4, 0.0, 1.8], 1.24, 1.24, stripe) }
+  slab(D, "root", [0.9, 0.0, 0.45], [1.6, 0.45, 0.4], nil, M.blued)
+  slab(D, "root", [3.6, 0.0, 3.25], [1.6, 0.3, 0.32], nil, M.blued)
+  limb(D, "root", [2.4, 0.0, 2.6], [2.4, 0.0, 3.0], 0.18, 0.18, M.blued)
+  limb(D, "root", [4.8, 0.0, 2.6], [4.8, 0.0, 3.0], 0.18, 0.18, M.blued)
+  blob(D, "root", [5.25, 0.0, 3.25], [0.06, 0.22, 0.22], nil, mat(0x50a0a0, 0x306060, {"shine": 1.0, "blend": 0.02}))
+  # the rocket in the bore: its nose up to the mouth
+  limb(D, "rocket", [8.0, 0.0, 1.8], [11.6, 0.0, 1.8], 0.8, 0.8, warhead)
+  blob(D, "rocket", [11.7, 0.0, 1.8], [0.9, 0.8, 0.8], nil, warhead)
+  rifle_grip(D, M.grip)
+  # clips: idle; fire: the rocket gone (back down the tube, out of sight in the bore), the next one slid up to the mouth
+  let home = [0.0, 0.0, 0.0]
+  clip(D, "idle", 1.0)
+  for tt in [0.0, 1.0] { key(D, "idle", tt, "rocket", home, home) }
+  clip(D, "fire", 0.6)
+  for k in [[0.0, 0.0], [0.02, -10.0], [0.3, -10.0], [0.55, 0.0], [0.6, 0.0]] { key(D, "fire", k[0], "rocket", home, [k[1], 0.0, 0.0]) }
+  return D
+}
+
+# The plasma rifle: a long blue-grey body, glowing coils round the barrel, a cell under it with its charge showing.
+fn plasma_rifle() {
+  let D = new_design("arm_plasma", 0.11e0, 0.3e0, 0.0e0, "the plasma rifle in the player's hands: coils, cell, emitter")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  support_hand(D, "root", [5.4, 0.0, 0.25], 0.9)
+  let M = gun_mats()
+  let body = mat(0x5a6470, 0x3a424c, {"mottle": 0.15, "grain": 0.8, "shine": 0.7, "blend": 0.1, "round": 0.5})
+  let coil = mat(0x70b0ff, 0x3a70e0, {"glow": 0.8, "shine": 0.6, "blend": 0.05})
+  let cell = mat(0x60f0ff, 0x30a0c0, {"glow": 0.9, "blend": 0.03})
+  # the body, its rail, the vents down its sides
+  slab(D, "root", [2.8, 0.0, 1.0], [4.2, 0.9, 0.75], nil, body)
+  slab(D, "root", [2.8, 0.0, 1.85], [3.6, 0.25, 0.12], nil, M.blued)
+  for i in range(0, 5) {
+    for s2 in [1.0, -1.0] { cut_blob(D, "root", [0.2 + i * 0.85, 0.9 * s2, 1.05], [0.15, 0.1, 0.42], nil, M.dark) }
+  }
+  # the barrel, the coils round it, the emitter with its glow in the bore
+  limb(D, "root", [6.8, 0.0, 1.0], [11.2, 0.0, 1.0], 0.42, 0.42, M.blued)
+  for i in range(0, 5) { blob(D, "root", [7.4 + i * 0.8, 0.0, 1.0], [0.18, 0.72, 0.72], nil, coil) }
+  limb(D, "root", [11.0, 0.0, 1.0], [11.7, 0.0, 1.0], 0.62, 0.6, M.blued)
+  cut_limb(D, "root", [11.3, 0.0, 1.0], [12.1, 0.0, 1.0], 0.36, 0.36, M.dark)
+  blob(D, "root", [11.35, 0.0, 1.0], [0.22, 0.32, 0.32], nil, cell)
+  # the cell under the body, its window on the right
+  slab(D, "root", [1.4, 0.0, -0.05], [1.0, 0.7, 0.5], nil, M.blued)
+  blob(D, "root", [1.4, -0.7, -0.05], [0.65, 0.07, 0.26], nil, cell)
+  rifle_grip(D, M.grip)
+  clip(D, "idle", 1.0)
+  clip(D, "fire", 0.086)
+  return D
+}
+
+# The BFG: a great dark-green box, an emitter of green fire at its mouth, glass tubes of it down its flanks.
+fn bfg() {
+  let D = new_design("arm_bfg", 0.13e0, 0.3e0, 0.0e0, "the BFG in the player's hands: green emitter and tubes")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "root", 14.0)
+  support_hand(D, "root", [6.0, 0.0, 0.1], 1.6)
+  let M = gun_mats()
+  let body = mat(0x3c463a, 0x262c24, {"mottle": 0.3, "grain": 1.2, "shine": 0.5, "blend": 0.15, "round": 0.6})
+  let green = mat(0x70ff70, 0x30c040, {"glow": 1.0, "blend": 0.04})
+  let glass = mat(0x60e070, 0x309040, {"glow": 0.6, "shine": 1.0, "blend": 0.04})
+  # the body, its top plate, the bolts down it
+  slab(D, "root", [3.0, 0.0, 1.4], [5.0, 1.6, 1.3], nil, body)
+  slab(D, "root", [2.0, 0.0, 2.85], [3.0, 0.65, 0.3], nil, M.blued)
+  for i in range(0, 4) { blob(D, "root", [0.0 + i * 1.8, -1.6, 2.2], [0.18, 0.1, 0.18], nil, M.worn) }
+  # the emitter and the green fire inside it
+  limb(D, "root", [7.8, 0.0, 1.4], [9.2, 0.0, 1.4], 1.35, 1.25, M.blued)
+  cut_limb(D, "root", [8.5, 0.0, 1.4], [9.8, 0.0, 1.4], 0.95, 0.95, M.dark)
+  blob(D, "root", [8.55, 0.0, 1.4], [0.45, 0.85, 0.85], nil, green)
+  # the glass tubes down each flank, held by clamps
+  for s2 in [1.0, -1.0] {
+    limb(D, "root", [-1.0, 1.65 * s2, 2.0], [7.0, 1.65 * s2, 2.0], 0.34, 0.34, glass)
+    for x in [0.5, 3.5, 6.0] { limb(D, "root", [x, 1.65 * s2, 2.0], [x + 0.3, 1.65 * s2, 2.0], 0.44, 0.44, M.blued) }
+  }
+  rifle_grip(D, M.grip)
+  clip(D, "idle", 1.0)
+  clip(D, "fire", 0.6)
+  return D
+}
+
+# The chainsaw: an orange engine block held by its rear handle and a bar along its left flank, the guide bar out in
+# front with its chain running round it; it shakes as it runs, and more when it cuts.
+fn chainsaw() {
+  let D = new_design("arm_chainsaw", 0.11e0, 0.3e0, 0.0e0, "the chainsaw in the player's hands: engine, bar, running chain")
+  bone(D, "root", nil, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "saw", "root", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "chain_top", "saw", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  bone(D, "chain_bottom", "saw", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  # the hands first: the weapon's own small blend makes the seam where it touches them
+  hand_and_arm(D, "saw", 14.0)
+  support_hand(D, "saw", [2.7, 1.9, 0.48], 0.32)
+  let M = gun_mats()
+  let housing = mat(0xc06a1c, 0x8a4410, {"mottle": 0.2, "grain": 1.0, "shine": 0.55, "blend": 0.12, "round": 0.6})
+  let bar = mat(0x8a9098, 0x5a6068, {"mottle": 0.1, "grain": 0.5, "shine": 0.9, "blend": 0.05, "round": 0.9})
+  # the engine block, the vents in its side, the muffler, the rear handle
+  slab(D, "saw", [2.4, 0.0, 0.6], [2.6, 1.15, 1.25], nil, housing)
+  for i in range(0, 4) { cut_blob(D, "saw", [1.2 + i * 0.7, -1.15, 0.8], [0.18, 0.1, 0.6], nil, M.dark) }
+  limb(D, "saw", [3.4, -1.25, -0.2], [4.6, -1.25, -0.2], 0.35, 0.35, M.blued)
+  slab(D, "saw", [-0.75, 0.0, -1.55], [0.62, 0.44, 1.55], [0.0, -14.0, 0.0], M.grip)
+  # the bar along the left flank for the left hand, on two standoffs
+  limb(D, "saw", [1.2, 1.15, 0.8], [1.2, 1.9, 0.8], 0.22, 0.22, M.grip)
+  limb(D, "saw", [4.2, 1.15, 0.8], [4.2, 1.9, 0.8], 0.22, 0.22, M.grip)
+  limb(D, "saw", [1.2, 1.9, 0.8], [4.2, 1.9, 0.8], 0.32, 0.32, M.grip)
+  # the guide bar, the chain's teeth along its top and its bottom
+  slab(D, "saw", [10.0, 0.0, 0.4], [5.6, 0.12, 0.8], nil, bar)
+  for i in range(0, 15) {
+    blob(D, "chain_top", [4.8 + i * 0.7, 0.0, 1.24], [0.22, 0.18, 0.16], nil, M.worn)
+    blob(D, "chain_bottom", [4.8 + i * 0.7, 0.0, -0.44], [0.22, 0.18, 0.16], nil, M.worn)
+  }
+  # clips, each a loop: the chain a tooth's pitch round (forward along the top, back along the bottom), the engine's
+  # shake, small idling, larger cutting
+  let home = [0.0, 0.0, 0.0]
+  for c in [["idle", 0.2, 0.06], ["fire", 0.114, 0.22]] {
+    let n = c[0]
+    let len = c[1]
+    let a = c[2]
+    clip(D, n, len)
+    key(D, n, 0.0, "chain_top", home, home)
+    key(D, n, len, "chain_top", home, [0.7, 0.0, 0.0])
+    key(D, n, 0.0, "chain_bottom", home, home)
+    key(D, n, len, "chain_bottom", home, [-0.7, 0.0, 0.0])
+    let shake = [[0.0, 0.0, 0.0, 0.0], [0.25, a, a * 0.6, a * 0.8], [0.5, -a * 0.5, -a * 0.7, 0.0], [0.75, a * 0.4, 0.0, -a * 0.9], [1.0, 0.0, 0.0, 0.0]]
+    for s in shake { key(D, n, s[0] * len, "saw", [0.0, s[3] * 8.0, 0.0], [s[1], s[2], s[3]]) }
+  }
+  return D
+}
+
+# Each weapon (weapon_defs' id) and its design, and how it is held: hold [forward, right, up] of the grip from the eye,
+# its turn [yaw left, pitch up] in degrees toward the middle of the view, and the shot's kick [back, pitch up]; a gun's
+# flash [muzzle, radius, plume length, core colour, colour, seconds shown].
+let ARMS = {
+  "arm_fist": {"weapon": 1, "make": fist, "hold": [9.5, 3.4, -2.8], "turn": [38.0, 8.0], "kick": [0.0, 0.0], "flash": nil},
+  "arm_pistol": {"weapon": 2, "make": pistol, "hold": [10.0, 3.3, -3.5], "turn": [5.0, 3.0], "kick": [1.3, 5.0],
+                 "flash": [[5.75, 0.0, 0.78], 0.45, 2.0, 0xfff4d0, 0xffb040, 0.07]},
+  "arm_shotgun": {"weapon": 3, "make": shotgun, "hold": [9.0, 3.8, -6.0], "turn": [5.0, 1.5], "kick": [2.2, 8.0],
+                  "flash": [[17.6, 0.0, 1.35], 0.75, 3.2, 0xfff4d0, 0xffb040, 0.08]},
+  "arm_chaingun": {"weapon": 4, "make": chaingun, "hold": [9.0, 3.8, -6.0], "turn": [5.0, 1.5], "kick": [0.7, 2.0],
+                   "flash": [[15.2, 0.0, 1.1], 0.9, 3.0, 0xfff4d0, 0xffb040, 0.05]},
+  "arm_rocket": {"weapon": 5, "make": rocket_launcher, "hold": [9.0, 4.2, -7.0], "turn": [5.5, 1.5], "kick": [2.6, 6.0],
+                 "flash": [[13.6, 0.0, 1.8], 1.2, 2.6, 0xfff4d0, 0xff9030, 0.09]},
+  "arm_plasma": {"weapon": 6, "make": plasma_rifle, "hold": [9.0, 3.8, -5.8], "turn": [5.0, 1.5], "kick": [0.6, 1.5],
+                 "flash": [[11.9, 0.0, 1.0], 0.7, 1.6, 0xe8f4ff, 0x5a9cff, 0.04]},
+  "arm_bfg": {"weapon": 7, "make": bfg, "hold": [9.5, 4.4, -7.2], "turn": [6.0, 1.5], "kick": [3.0, 7.0],
+              "flash": [[9.9, 0.0, 1.4], 1.5, 3.0, 0xe8ffe8, 0x50ff50, 0.15]},
+  "arm_chainsaw": {"weapon": 8, "make": chainsaw, "hold": [9.0, 4.0, -6.2], "turn": [5.0, 1.0], "kick": [0.0, 0.0], "flash": nil}
+}
+
+# what a design was built from: a design whose text changed is built again (its rows replaced)
+let ARMS_VERSION = 24
+
+fn arms_tables() {
+  sql("CREATE TABLE IF NOT EXISTS weapon_model (weapon_id INT PRIMARY KEY, design VARCHAR(40) NOT NULL, model_id INT NOT NULL, " +
+      "version INT NOT NULL DEFAULT 0, hold_f DOUBLE NOT NULL DEFAULT 10, hold_r DOUBLE NOT NULL DEFAULT 3.3, " +
+      "hold_u DOUBLE NOT NULL DEFAULT -3.5, turn_yaw DOUBLE NOT NULL DEFAULT 5, turn_pitch DOUBLE NOT NULL DEFAULT 3, " +
+      "kick_back DOUBLE NOT NULL DEFAULT 1.3, kick_pitch DOUBLE NOT NULL DEFAULT 5, flash_model INT NULL, flash_s DOUBLE NOT NULL DEFAULT 0)")
+  for c in ["version INT NOT NULL DEFAULT 0", "hold_f DOUBLE NOT NULL DEFAULT 10", "hold_r DOUBLE NOT NULL DEFAULT 3.3",
+            "hold_u DOUBLE NOT NULL DEFAULT -3.5", "turn_yaw DOUBLE NOT NULL DEFAULT 5", "turn_pitch DOUBLE NOT NULL DEFAULT 3",
+            "kick_back DOUBLE NOT NULL DEFAULT 1.3", "kick_pitch DOUBLE NOT NULL DEFAULT 5", "flash_model INT NULL",
+            "flash_s DOUBLE NOT NULL DEFAULT 0"] {
+    pcall(sql, "ALTER TABLE weapon_model ADD COLUMN IF NOT EXISTS " + c)
+  }
+}
+
+fn dbl(v) {
+  let s = str(v * 1.0e0)
+  return (index_of(s, "e") >= 0) ? s : s + "e0"
+}
+
+# -> {weapon_id (a string): {model, flash (its flash model, or nil), flash_s, hold [f r u], turn [yaw pitch], kick [back pitch]}}
+fn arms_install() {
+  bestiary_tables()
+  arms_tables()
+  let have = {}
+  for r in sql("SELECT weapon_id, design, model_id, version FROM weapon_model") { have[r.design] = r }
+  let built = false
+  for name in keys(ARMS) {
+    if has(have, name) and have[name].version == ARMS_VERSION { continue }
+    let A = ARMS[name]
+    sql(format("DELETE FROM weapon_model WHERE weapon_id = {}", A.weapon))
+    let t0 = clock()
+    design_write(A.make())
+    let r = bestiary_build(name)
+    let flash_model = "NULL"
+    let flash_s = 0.0
+    let fl = A.flash
+    if fl != nil {
+      design_write(flash_design(name + "_flash", fl[0], fl[1], fl[2], fl[3], fl[4]))
+      flash_model = str(bestiary_build(name + "_flash").model)
+      flash_s = fl[5]
+    }
+    sql(format("INSERT INTO weapon_model (weapon_id, design, model_id, version, hold_f, hold_r, hold_u, turn_yaw, turn_pitch, kick_back, kick_pitch, " +
+               "flash_model, flash_s) VALUES ({}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", A.weapon, name, r.model, ARMS_VERSION,
+               dbl(A.hold[0]), dbl(A.hold[1]), dbl(A.hold[2]), dbl(A.turn[0]), dbl(A.turn[1]), dbl(A.kick[0]), dbl(A.kick[1]), flash_model, dbl(flash_s)))
+    print(format("arms: {} built as model {} ({} triangles){} in {:.0f} ms", name, r.model, r.tris,
+                 flash_model == "NULL" ? "" : ", its flash model " + flash_model, clock() - t0))
+    built = true
+  }
+  if built { sql("FLUSH TABLES") }
+  let out = {}
+  for r in sql("SELECT weapon_id, model_id, hold_f, hold_r, hold_u, turn_yaw, turn_pitch, kick_back, kick_pitch, flash_model, flash_s FROM weapon_model") {
+    out[str(r.weapon_id)] = {"model": r.model_id, "flash": r.flash_model, "flash_s": r.flash_s * 1.0e0, "hold": [r.hold_f, r.hold_r, r.hold_u],
+                             "turn": [r.turn_yaw, r.turn_pitch], "kick": [r.kick_back, r.kick_pitch]}
+  }
+  return out
+}

@@ -4,6 +4,8 @@
 # modern mode (sql/renderer.sql stays the classic one).
 import { build_ssector_tris, ensure_ssector_tris_table } from "flats.gr"
 import { model_tables, model_load } from "models.gr"
+import { lights_tables, lights_load, lights_floor_glows, lights_frame } from "lights.gr"
+import { arms_install } from "arms.gr"
 import { designs_install } from "bestiary_designs.gr"
 
 # A number as a DOUBLE literal (12.5e0): `SET @x = 12.5` would be a DECIMAL, which the frame's arithmetic then
@@ -20,7 +22,7 @@ fn r3d_doom_open(here, map_id, w, h) {
   let t = r3d_target(w, h)
   # Doom's pixels are 1.2 times as tall as wide (320x200 on a 4:3 screen): the same here, so the world keeps its
   # proportions, and the horizontal field of view stays Doom's 90 degrees
-  r3d_options(t, {"y_scale": 1.2, "bilinear": true, "mipmaps": true, "upscale": int(env("SQLDOOM_UPSCALE", "1"))})
+  r3d_options(t, {"y_scale": 1.2, "bilinear": true, "mipmaps": true, "upscale": int(env("SQLDOOM_UPSCALE", "4"))})
   let pal = bytes(768)
   for c in sql("SELECT palette_index, r, g, b FROM colormap_rgb WHERE pal = 0 AND level = 0 ORDER BY palette_index") {
     bytes_set(pal, c.palette_index * 3, "u8", c.r)
@@ -101,10 +103,33 @@ fn r3d_doom_open(here, map_id, w, h) {
     pcall(sql, "FLUSH TABLES")
     built = true
   }
-  print(format("3d renderer: {} textures{}, {:.0f} ms", n, built ? ", floors triangulated" : "", clock() - t0))
+  # the weapons in the hand (lib/arms.gr): built into ASQL the first time, each loaded as a model
+  let arms = {}
+  if env("SQLDOOM_ARMS", "1") != "0" {
+    let built = arms_install()
+    for wk in keys(built) {
+      let A = built[wk]
+      let L = model_load(t, A.model, 70000 + A.model * 100)
+      # how long its fire clip runs: the shot's moment lasts that long
+      let fire_s = 0.3e0
+      for a in sql(format("SELECT duration FROM model_anim WHERE model_id = {} AND name = 'fire'", A.model)) { fire_s = a.duration * 1.0e0 }
+      # its muzzle flash, a model of its own drawn with it while the flash lasts
+      if A.flash != nil { model_load(t, A.flash, 70000 + A.flash * 100) }
+      arms[wk] = {"model": A.model, "idle": get(L.anims, "idle", -1), "fire": get(L.anims, "fire", -1), "fire_s": fire_s,
+                  "flash": A.flash, "flash_s": A.flash_s, "hold": A.hold, "turn": A.turn, "kick": A.kick}
+    }
+  }
+  # what gives light (lib/lights.gr): the definitions in ASQL, the glowing floors of this map
+  let lights_on = env("SQLDOOM_LIGHTS", "1") != "0"
+  lights_tables()
+  let light_defs = lights_on ? lights_load() : {}
+  let glows = lights_on ? lights_floor_glows(map_id) : []
+  print(format("3d renderer: {} textures{}, {} glowing floor lights, {:.0f} ms", n, built ? ", floors triangulated" : "", len(glows), clock() - t0))
   let common = read_file(path_join(here, "sql/client/scene_common.sql"))
   return {"t": t, "w": w, "h": h, "map_id": map_id, "sky": len(sky) > 0 ? sky[0].tex_id : nil,
-          "sets": sets, "anims": {}, "models": models,
+          "sets": sets, "anims": {}, "models": models, "light_defs": light_defs, "glows": glows, "lights_on": lights_on, "nlights": 0,
+          "arms": arms, "vm": {"fire_t": -10.0e0, "shot": -1, "t": nil, "x": 0.0e0, "y": 0.0e0, "ang": 0.0e0,
+                                "speed": 0.0e0, "phase": 0.0e0, "turn": 0.0e0},
           "geo": common + read_file(path_join(here, "sql/client/geometry.sql")),
           "things": common + read_file(path_join(here, "sql/client/things.sql")),
           "psprite": read_file(path_join(here, "sql/client/psprite.sql")),
@@ -122,7 +147,10 @@ fn r3d_doom_scene(sq, geo, things, psprite, map_id, player, skill, pose, tic) {
   let tris = sq(geo)
   let th = sq(things)
   let weapon = sq(psprite)
-  return {"map_id": map_id, "tris": tris, "things": th, "weapon": weapon, "sql_ms": clock() - t0}
+  # the weapon in the hand as it stands this tic: which, doing what, how far raised
+  let ws = sq(format("SELECT current_weapon AS weapon, state, seq_index AS seq, sy, flash_seq_index AS flash, shot_serial AS shot FROM player_weapons " +
+                     "WHERE map_id = {} AND player_thing_id = {}", map_id, player))
+  return {"map_id": map_id, "tris": tris, "things": th, "weapon": weapon, "wstate": len(ws) > 0 ? ws[0] : nil, "sql_ms": clock() - t0}
 }
 
 # A monster's animation state, carried from frame to frame: how far it has walked (its stride follows the ground it
@@ -243,6 +271,67 @@ fn model_instance(md, a, state, x, y, z, ang, light, now_s, prev_state, prev_sin
   return inst
 }
 
+# The weapon in the hand as a thing for r3d_draw_tex: where it is in front of the eye this frame (raised or
+# lowered as Doom's sy has it, bobbing with the step, lagging a turn, kicked back by a shot), which way it points
+# (the eye's, with that sway), its clip (fire from the shot that started it, else idle) - and, for the moment after a
+# shot, its muzzle flash in the same place: a list of things.
+fn view_model(st, arm, ws, pose, now_s, light) {
+  let vm = st.vm
+  let dt = vm.t == nil ? 0.016e0 : max(0.001e0, min(0.1e0, now_s - vm.t))
+  # how fast the player goes and turns, smoothed
+  if vm.t != nil {
+    let dx = pose.x - vm.x
+    let dy = pose.y - vm.y
+    let sp = sqrt(dx * dx + dy * dy) / dt
+    if sp > 2000.0e0 { sp = 0.0e0 }
+    vm.speed = vm.speed + (sp - vm.speed) * min(1.0e0, dt * 8.0e0)
+    let da = pose.angle - vm.ang
+    while da > 180.0e0 { da = da - 360.0e0 }
+    while da < -180.0e0 { da = da + 360.0e0 }
+    vm.turn = vm.turn + (da / dt - vm.turn) * min(1.0e0, dt * 10.0e0)
+  }
+  vm.t = now_s
+  vm.x = pose.x
+  vm.y = pose.y
+  vm.ang = pose.angle
+  # a shot: the game's count of shots fired moved on (the tic the weapon's attack frame went off)
+  if vm.shot >= 0 and ws.shot != vm.shot { vm.fire_t = now_s }
+  vm.shot = ws.shot
+  let since = now_s - vm.fire_t
+  let kick = since < 0.6e0 ? exp(-since * 12.0e0) : 0.0e0
+  # the step's bob: a figure of eight, as big as the pace (Doom's runs at about 8 units a tic)
+  let pace = min(1.0e0, vm.speed / 280.0e0)
+  vm.phase = vm.phase + dt * (4.0e0 + 7.0e0 * pace)
+  let bob_side = sin(vm.phase) * 0.55e0 * pace
+  let bob_up = -abs(cos(vm.phase)) * 0.45e0 * pace
+  # raised and lowered: Doom's sy, 32 ready, 128 down
+  let drop = max(0.0e0, min(1.0e0, (ws.sy - 32.0e0) / 96.0e0))
+  let sway = max(-4.0e0, min(4.0e0, -vm.turn * 0.02e0))
+  # its place in the eye's frame (forward, right, up), then on the map
+  let F = arm.hold[0] - arm.kick[0] * kick
+  let R = arm.hold[1] + bob_side
+  let U = arm.hold[2] + bob_up - drop * 12.0e0 + 0.25e0 * kick
+  let yaw = pose.angle * 3.141592653589793e0 / 180.0e0
+  let pit = get(pose, "pitch", 0.0) * 3.141592653589793e0 / 180.0e0
+  let cy = cos(yaw)
+  let sy = sin(yaw)
+  let cp = cos(pit)
+  let sp2 = sin(pit)
+  let x = pose.x + F * cy * cp + R * sy - U * cy * sp2
+  let y = pose.y + F * sy * cp - R * cy - U * sy * sp2
+  let z = pose.z + F * sp2 + U * cp
+  # the fire clip once from the shot (held at its end), else the idle clip round and round
+  let firing = arm.fire >= 0 and since < arm.fire_s
+  let ang = pose.angle + arm.turn[0] + sway
+  let pitch = get(pose, "pitch", 0.0) + arm.kick[1] * kick + arm.turn[1]
+  let out = [{"model": arm.model, "anim": firing ? arm.fire : arm.idle, "time": firing ? since : now_s, "hold": firing,
+              "x": x, "y": y, "z": z, "angle": ang, "pitch": pitch, "roll": bob_side * 2.0e0, "light": min(255, light + 30), "flags": 0}]
+  if arm.flash != nil and since < arm.flash_s {
+    push(out, {"model": arm.flash, "x": x, "y": y, "z": z, "angle": ang, "pitch": pitch, "roll": bob_side * 2.0e0, "light": 255, "flags": 0})
+  }
+  return out
+}
+
 # One frame into state.canvas: a tic's scene (r3d_doom_scene) seen from the camera where it is now (x, y, z eye,
 # angle in degrees), what stands in it alpha of the way from the tic before (prev, or nil) - natively, no SQL.
 fn r3d_doom_draw(st, scene, prev, alpha, pose, now_s) {
@@ -250,15 +339,26 @@ fn r3d_doom_draw(st, scene, prev, alpha, pose, now_s) {
   let t1 = clock()
   r3d_options(t, {"time": now_s})
   let things = r3d_doom_things(st, scene, prev, alpha, pose, now_s)
+  let lights = st.lights_on ? lights_frame(st.light_defs, st.glows, scene, prev, alpha, pose, now_s) : []
+  st.nlights = r3d_lights(t, lights)
   # the scene, then the sky where the scene left nothing (r3d_sky reads the depth)
   if st.sky != nil { r3d_clear_depth(t) } else { r3d_clear(t, 0) }
   r3d_draw_tex(t, scene.tris, 90, {"x": pose.x * 1.0e0, "y": pose.y * 1.0e0, "z": pose.z * 1.0e0, "angle": pose.angle * 1.0e0,
                                     "pitch": get(pose, "pitch", 0.0) * 1.0e0}, things)
   if st.sky != nil { r3d_sky(t, st.sky, pose.angle, 90) }
-  # the weapon, on Doom's 320x200 screen scaled to the target
+  # the weapon: a model in the hand where there is one for it, else Doom's sprite on its 320x200 screen scaled
   let kx = st.w / 320.0e0
   let ky = st.h / 200.0e0
-  for wl in scene.weapon {
+  let ws = get(scene, "wstate", nil)
+  let arm = ws == nil ? nil : get(st.arms, str(ws.weapon), nil)
+  if arm != nil {
+    let light = 160
+    for wl in scene.weapon { if wl.layer == 1 and wl.light != nil { light = wl.light } }
+    r3d_clear_depth(t)
+    r3d_draw_tex(t, [], 90, {"x": pose.x * 1.0e0, "y": pose.y * 1.0e0, "z": pose.z * 1.0e0, "angle": pose.angle * 1.0e0,
+                             "pitch": get(pose, "pitch", 0.0) * 1.0e0}, view_model(st, arm, ws, pose, now_s, light))
+  }
+  for wl in (arm != nil ? [] : scene.weapon) {
     let light = wl.fullbright ? 255 : min(255, (wl.light == nil ? 160 : wl.light) + 40)
     r3d_blit(t, 20000 + wl.lump_id, wl.x * kx, wl.y * ky, wl.width * kx, wl.height * ky, light)
   }
