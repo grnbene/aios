@@ -55,3 +55,6 @@ CLAUDE.local.md
 
 # per-machine config: copy the .example beside it
 /v8-local.conf
+
+# Doom WADs: game data loaded into a root by apps/sqldoom/load.gr, not source
+*.wad

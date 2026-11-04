@@ -1,0 +1,212 @@
+# The bestiary: SQLDoom's own monsters, authored as rows in ASQL and built into models (lib/models.gr's tables) in
+# AIOS itself. A creature is a skeleton (creature_bone), the forms sculpted on it (creature_shape: limbs, masses,
+# plates, teeth; carved hollows), and its animation clips as keyframes (creature_clip, creature_key). bestiary_build
+# sculpts the forms into one continuous skinned surface (r3d_mesh: a smooth union of every form, roughened, coloured
+# and weighted to its two nearest bones), at two levels of detail, and writes the result as models - so the game
+# draws a monster exactly as it draws any model, from ASQL.
+#
+#   bestiary_tables()                  the tables, if they are not there
+#   bestiary_build(design)             -> {model, far, tris, far_tris, ms}: the design's models written to ASQL
+
+import { model_tables } from "models.gr"
+
+let BESTIARY_SQL = [
+  # a creature: how finely it is sculpted near and far (units a cell), how far one second of its walk carries it,
+  # and how tall it stands (units; the game scales nothing)
+  "CREATE TABLE IF NOT EXISTS creature_design (design VARCHAR(32) PRIMARY KEY, cell DOUBLE NOT NULL, far_cell DOUBLE NOT NULL, " +
+    "walk_speed DOUBLE NOT NULL, notes TEXT)",
+  # its skeleton: each bone's joint in its parent's space at rest, and how it is turned in the pose it is sculpted in
+  # (degrees: yaw about z, pitch about y - positive tips +x down - roll about x)
+  "CREATE TABLE IF NOT EXISTS creature_bone (design VARCHAR(32) NOT NULL, bone_id INT NOT NULL, name VARCHAR(32) NOT NULL, parent INT NULL, " +
+    "x DOUBLE NOT NULL, y DOUBLE NOT NULL, z DOUBLE NOT NULL, yaw DOUBLE NOT NULL DEFAULT 0, pitch DOUBLE NOT NULL DEFAULT 0, roll DOUBLE NOT NULL DEFAULT 0, " +
+    "PRIMARY KEY (design, bone_id))",
+  # a form, in its bone's space: a limb (a rounded cone a -> b, radii r0 r1), an ellipsoid or a box (centre c, half
+  # sizes r, turned yaw pitch roll); its colour grading col -> col2, mottling, shine, glow, how far it melts into what
+  # it meets (blend), its relief (rough, in patches of grain), a box's rounding; carve: cut out instead of added
+  "CREATE TABLE IF NOT EXISTS creature_shape (design VARCHAR(32) NOT NULL, shape_id INT NOT NULL, bone_id INT NOT NULL, kind VARCHAR(10) NOT NULL, " +
+    "ax DOUBLE NOT NULL, ay DOUBLE NOT NULL, az DOUBLE NOT NULL, bx DOUBLE NULL, by_ DOUBLE NULL, bz DOUBLE NULL, " +
+    "r0 DOUBLE NULL, r1 DOUBLE NULL, rx DOUBLE NULL, ry DOUBLE NULL, rz DOUBLE NULL, yaw DOUBLE NULL, pitch DOUBLE NULL, roll DOUBLE NULL, " +
+    "col INT NOT NULL, col2 INT NOT NULL, mottle DOUBLE NOT NULL DEFAULT 0, grain DOUBLE NOT NULL DEFAULT 4, shine DOUBLE NOT NULL DEFAULT 0, " +
+    "glow DOUBLE NOT NULL DEFAULT 0, blend DOUBLE NOT NULL DEFAULT 0.8, rough DOUBLE NOT NULL DEFAULT 0, round_ DOUBLE NOT NULL DEFAULT 0.6, " +
+    "carve BOOLEAN NOT NULL DEFAULT FALSE, PRIMARY KEY (design, shape_id))",
+  "CREATE TABLE IF NOT EXISTS creature_clip (design VARCHAR(32) NOT NULL, clip VARCHAR(16) NOT NULL, duration DOUBLE NOT NULL, " +
+    "PRIMARY KEY (design, clip))",
+  # a key: at time t of a clip, a bone turned (from how it stands at rest - not from the sculpting pose) and, the
+  # root, moved (dx dy dz from its rest place)
+  "CREATE TABLE IF NOT EXISTS creature_key (design VARCHAR(32) NOT NULL, clip VARCHAR(16) NOT NULL, t DOUBLE NOT NULL, bone_id INT NOT NULL, " +
+    "yaw DOUBLE NOT NULL DEFAULT 0, pitch DOUBLE NOT NULL DEFAULT 0, roll DOUBLE NOT NULL DEFAULT 0, " +
+    "dx DOUBLE NOT NULL DEFAULT 0, dy DOUBLE NOT NULL DEFAULT 0, dz DOUBLE NOT NULL DEFAULT 0, PRIMARY KEY (design, clip, t, bone_id))"
+]
+
+fn bestiary_tables() {
+  model_tables()
+  for q in BESTIARY_SQL { sql(q) }
+}
+
+let BRAD = 3.141592653589793e0 / 180.0e0
+
+# yaw (z), pitch (y), roll (x) in degrees as a quaternion [x y z w]: Rz Ry Rx, as m_joint turns a joint
+fn quat_ypr(yaw, pitch, roll) {
+  let cy = cos(yaw * BRAD * 0.5e0)
+  let sy = sin(yaw * BRAD * 0.5e0)
+  let cp = cos(pitch * BRAD * 0.5e0)
+  let sp = sin(pitch * BRAD * 0.5e0)
+  let cr = cos(roll * BRAD * 0.5e0)
+  let sr = sin(roll * BRAD * 0.5e0)
+  return [sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy]
+}
+
+# a joint as a row-major 3x4 (the same turn as quat_ypr)
+fn joint34(x, y, z, yaw, pitch, roll) {
+  let cy = cos(yaw * BRAD)
+  let sy = sin(yaw * BRAD)
+  let cp = cos(pitch * BRAD)
+  let sp = sin(pitch * BRAD)
+  let cr = cos(roll * BRAD)
+  let sr = sin(roll * BRAD)
+  return [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, x,
+          sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, y,
+          -sp, cp * sr, cp * cr, z]
+}
+fn mul34(a, b) {
+  return [a[0] * b[0] + a[1] * b[4] + a[2] * b[8], a[0] * b[1] + a[1] * b[5] + a[2] * b[9], a[0] * b[2] + a[1] * b[6] + a[2] * b[10], a[0] * b[3] + a[1] * b[7] + a[2] * b[11] + a[3],
+          a[4] * b[0] + a[5] * b[4] + a[6] * b[8], a[4] * b[1] + a[5] * b[5] + a[6] * b[9], a[4] * b[2] + a[5] * b[6] + a[6] * b[10], a[4] * b[3] + a[5] * b[7] + a[6] * b[11] + a[7],
+          a[8] * b[0] + a[9] * b[4] + a[10] * b[8], a[8] * b[1] + a[9] * b[5] + a[10] * b[9], a[8] * b[2] + a[9] * b[6] + a[10] * b[10], a[8] * b[3] + a[9] * b[7] + a[10] * b[11] + a[11]]
+}
+
+fn f32s(values) {
+  let b = bytes(len(values) * 4)
+  for i in range(0, len(values)) { bytes_set(b, i * 4, "f32le", values[i] * 1.0e0) }
+  return b
+}
+
+fn bq(v) {
+  if v == nil { return "NULL" }
+  let ty = type(v)
+  if ty == "bytes" { return "X'" + bytes_hex(v) + "'" }
+  if ty == "bool" { return v ? "TRUE" : "FALSE" }
+  if ty == "string" { return "'" + replace(v, "'", "''") + "'" }
+  if ty == "real" or ty == "decimal" {
+    let s = str(v * 1.0e0)
+    return (index_of(s, "e") >= 0 or index_of(s, "n") >= 0) ? s : s + "e0"
+  }
+  return str(v)
+}
+fn bins(table, cols, vals) {
+  let lits = []
+  for v in vals { push(lits, bq(v)) }
+  sql("INSERT INTO " + table + " (" + cols + ") VALUES (" + join(lits, ", ") + ")")
+}
+
+# Build design's models from its rows: the near one named design, the far one design + "_far". Returns their ids,
+# their triangle counts and how long it took.
+fn bestiary_build(design) {
+  bestiary_tables()
+  let t0 = clock()
+  let d = sql("SELECT cell, far_cell FROM creature_design WHERE design = " + bq(design))
+  if len(d) == 0 { error("bestiary_build(): no design " + design) }
+  let bones = sql("SELECT bone_id, name, parent, x, y, z, yaw, pitch, roll FROM creature_bone WHERE design = " + bq(design) + " ORDER BY bone_id")
+  if len(bones) == 0 { error("bestiary_build(): " + design + " has no bones") }
+  # each bone's matrix in the sculpting pose (parents come first: a bone's parent has a lower id)
+  let world = []
+  let rest = []
+  for b in bones {
+    if b.bone_id != len(world) { error(format("bestiary_build(): {}'s bones are not numbered 0, 1, 2 ..", design)) }
+    if b.parent != nil and b.parent >= b.bone_id { error(format("bestiary_build(): {}'s bone {} has a parent after it", design, b.name)) }
+    let local = joint34(b.x * 1.0e0, b.y * 1.0e0, b.z * 1.0e0, b.yaw * 1.0e0, b.pitch * 1.0e0, b.roll * 1.0e0)
+    let w = b.parent == nil ? local : mul34(world[b.parent], local)
+    push(world, w)
+    for v in w { push(rest, v) }
+  }
+  let parts = []
+  for s in sql("SELECT * FROM creature_shape WHERE design = " + bq(design) + " ORDER BY shape_id") {
+    let p = {"kind": s.kind, "bone": s.bone_id, "col": s.col, "col2": s.col2, "mottle": s.mottle, "grain": s.grain, "shine": s.shine,
+             "glow": s.glow, "blend": s.blend, "rough": s.rough, "round": s.round_, "carve": s.carve == 1}
+    if s.kind == "limb" {
+      p.a = [s.ax, s.ay, s.az]
+      p.b = [s.bx, s.by_, s.bz]
+      p.r0 = s.r0
+      p.r1 = s.r1 == nil ? s.r0 : s.r1
+    } else {
+      p.c = [s.ax, s.ay, s.az]
+      p.r = [s.rx, s.ry, s.rz]
+      p.rot = [s.yaw == nil ? 0.0 : s.yaw, s.pitch == nil ? 0.0 : s.pitch, s.roll == nil ? 0.0 : s.roll]
+    }
+    push(parts, p)
+  }
+  if len(parts) == 0 { error("bestiary_build(): " + design + " has no shapes") }
+  let t = r3d_target(4, 4)
+  let near = r3d_mesh(t, 1, parts, {"rest": rest, "cell": d[0].cell})
+  let far = r3d_mesh(t, 2, parts, {"rest": rest, "cell": d[0].far_cell})
+  let ids = []
+  for lod in [[design, 1], [design + "_far", 2]] {
+    let name = lod[0]
+    let old = sql("SELECT model_id FROM model WHERE name = " + bq(name))
+    let id = 0
+    if len(old) > 0 {
+      id = old[0].model_id
+      for tb in ["model_node", "model_joint", "model_texture", "model_prim", "model_anim", "model_channel", "model"] {
+        sql("DELETE FROM " + tb + " WHERE model_id = " + str(id))
+      }
+    } else {
+      id = sql("SELECT COALESCE(MAX(model_id), 0) + 1 AS n FROM model")[0].n
+    }
+    bins("model", "model_id, name, source, up", [id, name, "bestiary:" + design, "z"])
+    # the skeleton: each bone a node at its rest joint; each a joint, its inverse bind the
+    # inverse of its sculpting-pose matrix (column-major 4x4)
+    for b in bones {
+      # at rest a bone is unturned (its clips turn it); the sculpting turn is only in its inverse bind
+      bins("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
+           [id, b.bone_id, b.parent, b.name, b.x * 1.0e0, b.y * 1.0e0, b.z * 1.0e0, 0.0e0, 0.0e0, 0.0e0, 1.0e0, 1.0e0, 1.0e0, 1.0e0])
+      let w = world[b.bone_id]
+      # inverse of a rigid 3x4: the rotation transposed, the translation turned back
+      let ix = -(w[0] * w[3] + w[4] * w[7] + w[8] * w[11])
+      let iy = -(w[1] * w[3] + w[5] * w[7] + w[9] * w[11])
+      let iz = -(w[2] * w[3] + w[6] * w[7] + w[10] * w[11])
+      bins("model_joint", "model_id, joint_id, node_id, inv_bind",
+           [id, b.bone_id, b.bone_id, f32s([w[0], w[1], w[2], 0.0e0, w[4], w[5], w[6], 0.0e0, w[8], w[9], w[10], 0.0e0, ix, iy, iz, 1.0e0])])
+    }
+    let md = r3d_mesh_data(t, lod[1])
+    bins("model_prim", "model_id, prim_id, node_id, skinned, texture_id, cr, cg, cb, ca, vertex_count, positions, normals, uvs, joints, weights, indices, colors, mats",
+         [id, 0, 0, true, nil, 1.0e0, 1.0e0, 1.0e0, 1.0e0, md.verts, md.positions, md.normals, nil, md.joints, md.weights, md.indices, md.colors, md.mats])
+    # the clips: each bone's turn (rest turn, then the key's) and the root's place, key by key
+    let ai = 0
+    for c in sql("SELECT clip, duration FROM creature_clip WHERE design = " + bq(design) + " ORDER BY clip") {
+      let keys = sql("SELECT t, bone_id, yaw, pitch, roll, dx, dy, dz FROM creature_key WHERE design = " + bq(design) + " AND clip = " + bq(c.clip) + " ORDER BY bone_id, t")
+      let by_bone = {}
+      for k in keys {
+        let kb = str(k.bone_id)
+        if get(by_bone, kb, nil) == nil { by_bone[kb] = [] }
+        push(by_bone[kb], k)
+      }
+      let ci = 0
+      for b in bones {
+        let ks = get(by_bone, str(b.bone_id), nil)
+        if ks == nil { continue }
+        let times = []
+        let rots = []
+        let moves = []
+        let moved = false
+        for k in ks {
+          push(times, k.t)
+          # the key's turn is from the bone's rest (unturned) joint: the sculpting turn is only how it was made
+          let q = quat_ypr(k.yaw * 1.0e0, k.pitch * 1.0e0, k.roll * 1.0e0)
+          for e in q { push(rots, e) }
+          for e in [b.x + k.dx, b.y + k.dy, b.z + k.dz] { push(moves, e) }
+          if k.dx != 0 or k.dy != 0 or k.dz != 0 { moved = true }
+        }
+        bins("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals", [id, ai, ci, b.bone_id, "rotation", "LINEAR", f32s(times), f32s(rots)])
+        ci = ci + 1
+        if moved {
+          bins("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals", [id, ai, ci, b.bone_id, "translation", "LINEAR", f32s(times), f32s(moves)])
+          ci = ci + 1
+        }
+      }
+      bins("model_anim", "model_id, anim_id, name, duration", [id, ai, c.clip, c.duration])
+      ai = ai + 1
+    }
+    push(ids, id)
+  }
+  sql("FLUSH TABLES")
+  return {"model": ids[0], "far": ids[1], "tris": near.tris, "far_tris": far.tris, "ms": clock() - t0}
+}

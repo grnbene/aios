@@ -110,6 +110,40 @@ int main() {
   expect(db, "SELECT GROUP_CONCAT(v.line_id ORDER BY v.line_id) FROM ln1 v WHERE v.line_id NOT IN (SELECT a.line_id FROM act a WHERE a.line_id = v.line_id)", "11");
   expect(db, "SELECT GROUP_CONCAT((SELECT COUNT(*) FROM act a WHERE a.line_id = `v`.line_id) ORDER BY v.line_id) FROM ln1 v", "1,0,1");
 
+  // A table no row has been stored in has no column stores yet: the batch projection read col_data[c] past an
+  // empty vector and a SELECT of it died with SIGSEGV (a fresh CREATE TABLE, then SELECT).
+  std::printf("a new table no row has been stored in\n");
+  db.execute_local_query("CREATE TABLE fresh (a INT PRIMARY KEY, b VARCHAR(10), c DOUBLE)");
+  expect(db, "SELECT COUNT(*) FROM (SELECT a FROM fresh) x", "0");
+  expect(db, "SELECT COALESCE(MAX(a), 0) + 1 FROM fresh", "1");
+  {
+    auto r = db.execute_local_query("SELECT a, b, c FROM fresh");
+    const bool ok = r.success && r.rows.empty();
+    std::printf("  [%s] SELECT a, b, c FROM fresh -> %zu rows%s\n", ok ? "ok" : "FAIL", r.rows.size(), r.success ? "" : (" ERROR " + r.error_message).c_str());
+    if (!ok) ++failures;
+  }
+  db.execute_local_query("INSERT INTO fresh VALUES (1, 'x', 2.5)");
+  expect(db, "SELECT b FROM fresh WHERE a = 1", "x");
+
+  // A WITH statement's parse is cached; run on those cached trees, an uncorrelated subquery kept the answer of the
+  // statement's first run for every later one, whatever was written since (a game's aim read its first value for
+  // good). Each run of it, and of a function holding it, sees the table as it is.
+  std::printf("a WITH statement run again after its table changed\n");
+  db.execute_local_query("CREATE TABLE aimp (id INT PRIMARY KEY, v DOUBLE NULL)");
+  db.execute_local_query("CREATE TABLE aimo (k INT PRIMARY KEY, s DOUBLE)");
+  db.execute_local_query("INSERT INTO aimp VALUES (1, NULL)");
+  db.execute_local_query("INSERT INTO aimo VALUES (1, 0)");
+  db.execute_local_query("CREATE FUNCTION aimf(a_id INT) RETURNS INT BEGIN WITH x AS (SELECT COALESCE((SELECT q.v FROM aimp q "
+                         "WHERE q.id = a_id), -1) AS s) UPDATE aimo SET s = (SELECT s FROM x) WHERE k = 1; RETURN 0; END");
+  for (const char* v : {"NULL", "7", "8", "NULL"}) {
+    db.execute_local_query(std::string("UPDATE aimp SET v = ") + v + " WHERE id = 1");
+    const std::string want = std::string(v) == "NULL" ? "-1" : v;
+    expect(db, "WITH x AS (SELECT COALESCE((SELECT q.v FROM aimp q WHERE q.id = 1), -1) AS s) SELECT s FROM x", want);
+    expect(db, "WITH x AS (SELECT q.id FROM aimp q WHERE q.v IN (SELECT r.v FROM aimp r)) SELECT COUNT(*) FROM x", std::string(v) == "NULL" ? "0" : "1");
+    db.execute_local_query("SELECT aimf(1)");
+    expect(db, "SELECT s FROM aimo WHERE k = 1", want);
+  }
+
   std::printf("%s\n", failures ? "FAILED" : "all ok");
   return failures ? 1 : 0;
 }

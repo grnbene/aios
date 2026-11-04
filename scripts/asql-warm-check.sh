@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # asql-warm-check.sh [aios binary]: an engine restarted with primary-key row maps to warm
 #   [1] answers, and takes a keyed write, without waiting for the warm-up to finish;
-#   [2] warms the row maps only as far as the row-index budget (AIOS_SQL_ROWINDEX_MB), most recently used first.
+#   [2] warms the row maps only as far as the row-index budget (AIOS_SQL_ROWINDEX_MB), most recently used first;
+#   [3] warms a join index (probes.list) of a table whose rows are all in its file's parts - at start-up they wait in
+#       the table's delta buffer, not yet in its column store - and that index finds them.
 #
 # st's engine warmed 23 row maps (2 GB of a 1 GB budget) under one statement lock held for all of it: 34 s
 # unanswering on every restart, and every map marked "in use" so none could be evicted.
@@ -78,4 +80,31 @@ left=$(echo "$warm" | sed -nE 's/.*\(([0-9]+) primary-key maps left.*/\1/p')
 check "$( [ -n "$n" ] && [ "$n" -ge 1 ] && [ "${left:-0}" -ge 1 ] && echo ok)" "warmed ${n:-?} row maps and left ${left:-?} for their first write: a $budget_mb MB budget holds some of the $((one >> 20)) MB, not all"
 check "$( [ "$mem" -le $(( (budget_mb << 20) + per * 2 )) ] && echo ok)" "row maps after the warm-up: $((mem >> 20)) MB (budget $budget_mb MB, plus at most the last one built)"
 stop
+
+# [3] A table written as an empty image and then appended to at each checkpoint: its file is the image and 5 parts,
+# and a restart replays the parts' 100 rows into the delta buffer. The join index warmed then was built from the
+# column store alone - empty - and marked those rows indexed: model_id = 1 found 0 rows of 20 until the next restart.
+mkdir -p "$work/parts"
+cat > "$work/parts1.gr" <<'GR'
+sql("CREATE DATABASE ix")
+sql("USE ix")
+sql("CREATE TABLE mn (model_id INT NOT NULL, node_id INT NOT NULL, tx DOUBLE NOT NULL, PRIMARY KEY (model_id, node_id))")
+sql("FLUSH TABLES")
+for m in range(1, 6) {
+  let vals = []
+  for n in range(0, 20) { push(vals, format("({}, {}, {}e0)", m, n, n * 1.5)) }
+  sql("INSERT INTO mn VALUES " + join(vals, ", "))
+  sql("FLUSH TABLES")
+}
+GR
+cat > "$work/parts2.gr" <<'GR'
+sql("USE ix")
+print("eq " + str(sql("SELECT COUNT(*) AS n FROM mn WHERE model_id = 1")[0].n) + " in " + str(sql("SELECT COUNT(*) AS n FROM mn WHERE model_id IN (1, 2)")[0].n) + " scan " + str(sql("SELECT COUNT(*) AS n FROM mn WHERE model_id + 0 = 1")[0].n))
+GR
+AIOS_NO_ACCEL=1 AIOS_STORE_TRACE=1 "$bin" --root "$work/parts" exec "grain run $work/parts1.gr" > "$work/parts1.log" 2>&1
+check "$(grep -q 'appended to .* as part 5' "$work/parts1.log" && echo ok)" "ix.mn is an empty image and 5 parts"
+printf 'ix.mn\tmodel_id\n' > "$work/parts/sql_db/probes.list"
+got=$(AIOS_NO_ACCEL=1 "$bin" --root "$work/parts" exec "grain run $work/parts2.gr" 2>&1 | tee "$work/parts2.log" | grep '^eq ' || true)
+warmed=$(grep -c 'warmed 0 column, 1 join' "$work/parts2.log" || true)
+check "$( [ "$warmed" = 1 ] && [ "$got" = "eq 20 in 40 scan 20" ] && echo ok)" "a join index warmed over rows still in the delta buffer finds them: ${got:-no answer} (want eq 20 in 40 scan 20)"
 exit $fail

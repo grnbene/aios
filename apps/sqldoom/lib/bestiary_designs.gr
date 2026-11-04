@@ -1,0 +1,840 @@
+# SQLDoom's monsters, designed: each written into the bestiary's tables (lib/bestiary.gr) as its skeleton, the
+# forms sculpted on it and its clips as keyframes - our own creatures for the game's monster types.
+#
+#   designs_write()      every design's rows into ASQL (replacing what was there)
+#   DESIGNS              design -> {types: [thing types it stands for], height, fuzz}
+import { bestiary_tables, bestiary_build } from "bestiary.gr"
+import { model_map_creature } from "models.gr"
+
+let PI = 3.141592653589793e0
+
+# ---- authoring --------------------------------------------------------------------------------------------------------
+
+fn new_design(name, cell, far_cell, walk_speed, notes) {
+  return {"name": name, "cell": cell, "far_cell": far_cell, "walk_speed": walk_speed, "notes": notes,
+          "bones": [], "ids": {}, "shapes": [], "clips": [], "keys": []}
+}
+fn bone(D, name, parent, at, bind) {
+  let id = len(D.bones)
+  push(D.bones, {"id": id, "name": name, "parent": parent == nil ? nil : D.ids[parent], "at": at, "bind": bind})
+  D.ids[name] = id
+  return id
+}
+# a material: colour grading col -> col2, and how it looks
+fn mat(col, col2, extra) {
+  let m = {"col": col, "col2": col2, "mottle": 0.0, "grain": 4.0, "shine": 0.0, "glow": 0.0, "blend": 0.8, "rough": 0.0, "round": 0.6}
+  for k in keys(extra) { m[k] = extra[k] }
+  return m
+}
+fn add_shape(D, bname, kind, a, b, r0, r1, c, r, rot, m, carve) {
+  push(D.shapes, {"bone": D.ids[bname], "kind": kind, "a": a, "b": b, "r0": r0, "r1": r1, "c": c, "r": r, "rot": rot, "m": m, "carve": carve})
+}
+fn limb(D, bname, a, b, r0, r1, m) { add_shape(D, bname, "limb", a, b, r0, r1, nil, nil, nil, m, false) }
+fn blob(D, bname, c, r, rot, m) { add_shape(D, bname, "ellipsoid", nil, nil, nil, nil, c, r, rot, m, false) }
+fn slab(D, bname, c, r, rot, m) { add_shape(D, bname, "box", nil, nil, nil, nil, c, r, rot, m, false) }
+fn cut_blob(D, bname, c, r, rot, m) { add_shape(D, bname, "ellipsoid", nil, nil, nil, nil, c, r, rot, m, true) }
+fn cut_limb(D, bname, a, b, r0, r1, m) { add_shape(D, bname, "limb", a, b, r0, r1, nil, nil, nil, m, true) }
+# both sides: f(side_prefix, s) with s = 1 left, -1 right
+fn sym(f) {
+  f("l_", 1.0e0)
+  f("r_", -1.0e0)
+}
+fn ys(v, s) { return [v[0], v[1] * s, v[2]] }
+
+fn clip(D, name, duration) { push(D.clips, {"name": name, "duration": duration}) }
+# a sampled clip: pose(u) for u = 0 .. 1 at n + 1 keys (a loop's last key is its first again)
+fn sample_clip(D, name, duration, n, pose) {
+  clip(D, name, duration)
+  for i in range(0, n + 1) {
+    let u = i * 1.0e0 / n
+    let p = pose(u)
+    for bn in keys(p) {
+      if bn == "root_d" { continue }
+      let r = p[bn]
+      let d = (bn == "pelvis" and get(p, "root_d", nil) != nil) ? p.root_d : [0.0e0, 0.0e0, 0.0e0]
+      push(D.keys, {"clip": name, "t": u * duration, "bone": D.ids[bn], "r": r, "d": d})
+    }
+  }
+}
+
+fn ease(x) { return x <= 0.0e0 ? 0.0e0 : (x >= 1.0e0 ? 1.0e0 : x * x * (3.0e0 - 2.0e0 * x)) }
+
+# ---- writing a design into ASQL ---------------------------------------------------------------------------------------
+
+fn lit(v) {
+  if v == nil { return "NULL" }
+  let ty = type(v)
+  if ty == "bool" { return v ? "TRUE" : "FALSE" }
+  if ty == "string" { return "'" + replace(v, "'", "''") + "'" }
+  if ty == "real" or ty == "decimal" {
+    let s = str(v * 1.0e0)
+    return (index_of(s, "e") >= 0 or index_of(s, "n") >= 0) ? s : s + "e0"
+  }
+  return str(v)
+}
+fn insert_many(table, cols, rows) {
+  let at = 0
+  while at < len(rows) {
+    let chunk = []
+    for i in range(at, min(len(rows), at + 200)) {
+      let lits = []
+      for v in rows[i] { push(lits, lit(v)) }
+      push(chunk, "(" + join(lits, ", ") + ")")
+    }
+    sql("INSERT INTO " + table + " (" + cols + ") VALUES " + join(chunk, ", "))
+    at = at + 200
+  }
+}
+fn design_write(D) {
+  let q = lit(D.name)
+  for tb in ["creature_design", "creature_bone", "creature_shape", "creature_clip", "creature_key"] { sql("DELETE FROM " + tb + " WHERE design = " + q) }
+  insert_many("creature_design", "design, cell, far_cell, walk_speed, notes", [[D.name, D.cell, D.far_cell, D.walk_speed, D.notes]])
+  let rows = []
+  for b in D.bones { push(rows, [D.name, b.id, b.name, b.parent, b.at[0], b.at[1], b.at[2], b.bind[0], b.bind[1], b.bind[2]]) }
+  insert_many("creature_bone", "design, bone_id, name, parent, x, y, z, yaw, pitch, roll", rows)
+  rows = []
+  let i = 0
+  for s in D.shapes {
+    let m = s.m
+    if s.kind == "limb" {
+      push(rows, [D.name, i, s.bone, s.kind, s.a[0], s.a[1], s.a[2], s.b[0], s.b[1], s.b[2], s.r0, s.r1, nil, nil, nil, nil, nil, nil,
+                  m.col, m.col2, m.mottle, m.grain, m.shine, m.glow, m.blend, m.rough, m.round, s.carve])
+    } else {
+      let rot = s.rot == nil ? [0.0, 0.0, 0.0] : s.rot
+      push(rows, [D.name, i, s.bone, s.kind, s.c[0], s.c[1], s.c[2], nil, nil, nil, nil, nil, s.r[0], s.r[1], s.r[2], rot[0], rot[1], rot[2],
+                  m.col, m.col2, m.mottle, m.grain, m.shine, m.glow, m.blend, m.rough, m.round, s.carve])
+    }
+    i = i + 1
+  }
+  insert_many("creature_shape", "design, shape_id, bone_id, kind, ax, ay, az, bx, by_, bz, r0, r1, rx, ry, rz, yaw, pitch, roll, " +
+              "col, col2, mottle, grain, shine, glow, blend, rough, round_, carve", rows)
+  rows = []
+  for c in D.clips { push(rows, [D.name, c.name, c.duration]) }
+  insert_many("creature_clip", "design, clip, duration", rows)
+  rows = []
+  for k in D.keys { push(rows, [D.name, k.clip, k.t, k.bone, k.r[0], k.r[1], k.r[2], k.d[0], k.d[1], k.d[2]]) }
+  insert_many("creature_key", "design, clip, t, bone_id, yaw, pitch, roll, dx, dy, dz", rows)
+  return {"bones": len(D.bones), "shapes": len(D.shapes), "keys": len(D.keys)}
+}
+
+# ---- the biped: skeleton and motion -----------------------------------------------------------------------------------
+# dims: hip (pelvis height), spine, chest, neck (segment lengths up), head (head joint above the neck's top), fwd (how
+# far forward the neck leans), sw (shoulder half-width), su (shoulder height on the chest), arm, fore, hand, hw (hip
+# half-width), thigh, shin, ankle; dig: digitigrade (a long ankle stood on its toes); tail: tail segments (0: none).
+fn biped_skeleton(D, d) {
+  bone(D, "pelvis", nil, [0.0, 0.0, d.hip], [0.0, 0.0, 0.0])
+  bone(D, "spine", "pelvis", [0.0, 0.0, d.spine], [0.0, 0.0, 0.0])
+  bone(D, "chest", "spine", [0.0, 0.0, d.chest], [0.0, 0.0, 0.0])
+  bone(D, "neck", "chest", [d.fwd * 0.5, 0.0, d.neck], [0.0, 0.0, 0.0])
+  bone(D, "head", "neck", [d.fwd * 0.5, 0.0, d.head], [0.0, 0.0, 0.0])
+  bone(D, "jaw", "head", [d.jaw_x, 0.0, d.jaw_z], [0.0, 0.0, 0.0])
+  sym(fn (p, s) {
+    bone(D, p + "arm", "chest", [0.0, d.sw * s, d.su], [0.0, -10.0, 42.0 * s])
+    bone(D, p + "fore", p + "arm", [0.0, 0.0, -d.arm], [0.0, -15.0, 0.0])
+    bone(D, p + "hand", p + "fore", [0.0, 0.0, -d.fore], [0.0, 0.0, 0.0])
+  })
+  sym(fn (p, s) {
+    bone(D, p + "thigh", "pelvis", [0.0, d.hw * s, -1.5], [0.0, 0.0, 9.0 * s])
+    bone(D, p + "shin", p + "thigh", [0.0, 0.0, -d.thigh], [0.0, 0.0, 0.0])
+    bone(D, p + "ankle", p + "shin", [0.0, 0.0, -d.shin], [0.0, 0.0, 0.0])
+    bone(D, p + "toe", p + "ankle", [0.0, 0.0, -d.ankle], [0.0, 0.0, 0.0])
+  })
+  let prev = "pelvis"
+  for i in range(0, d.tail) {
+    let n = "tail" + str(i)
+    bone(D, n, prev, i == 0 ? [-4.0, 0.0, 0.5] : [-d.tail_len, 0.0, 0.0], [0.0, 0.0, 0.0])
+    prev = n
+  }
+}
+
+# how a biped stands, before any motion: its lean, its legs (digitigrade folded), its arms out from its sides
+fn biped_base(d) {
+  let p = {}
+  for n in ["spine", "chest", "neck", "head", "jaw", "l_arm", "l_fore", "l_hand", "r_arm", "r_fore", "r_hand",
+            "l_thigh", "l_shin", "l_ankle", "l_toe", "r_thigh", "r_shin", "r_ankle", "r_toe", "pelvis"] { p[n] = [0.0e0, 0.0e0, 0.0e0] }
+  for i in range(0, d.tail) { p["tail" + str(i)] = [0.0e0, 8.0e0 + i * 4.0e0, 0.0e0] }
+  p.spine = [0.0e0, d.hunch * 0.5e0, 0.0e0]
+  p.chest = [0.0e0, d.hunch * 0.5e0, 0.0e0]
+  p.neck = [0.0e0, -d.hunch * 0.45e0, 0.0e0]
+  p.head = [0.0e0, -d.hunch * 0.55e0, 0.0e0]
+  p.l_arm = [0.0e0, 4.0e0, d.arm_out]
+  p.r_arm = [0.0e0, 4.0e0, -d.arm_out]
+  p.l_fore = [0.0e0, -18.0e0, 0.0e0]
+  p.r_fore = [0.0e0, -18.0e0, 0.0e0]
+  if d.dig {
+    for s in ["l_", "r_"] {
+      p[s + "thigh"] = [0.0e0, -32.0e0, s == "l_" ? 3.0e0 : -3.0e0]
+      p[s + "shin"] = [0.0e0, 66.0e0, 0.0e0]
+      p[s + "ankle"] = [0.0e0, -62.0e0, 0.0e0]
+      p[s + "toe"] = [0.0e0, 28.0e0, 0.0e0]
+    }
+  } else {
+    for s in ["l_", "r_"] {
+      p[s + "thigh"] = [0.0e0, -5.0e0, s == "l_" ? 2.0e0 : -2.0e0]
+      p[s + "shin"] = [0.0e0, 8.0e0, 0.0e0]
+      p[s + "ankle"] = [0.0e0, -3.0e0, 0.0e0]
+    }
+  }
+  return p
+}
+fn padd(p, bn, dy, dp, dr) { p[bn] = [p[bn][0] + dy, p[bn][1] + dp, p[bn][2] + dr] }
+
+# the clips: idle, walk, attack (by style: "gun" the right forearm is a weapon brought up and fired, "throw" a
+# wind-up and hurl, "slam" both arms overhead and down), pain, die
+fn biped_clips(D, d) {
+  sample_clip(D, "idle", 2.4e0, 12, fn (u) {
+    let p = biped_base(d)
+    let b = sin(u * 2.0e0 * PI)
+    padd(p, "chest", 0.0e0, b * 2.0e0, 0.0e0)
+    padd(p, "head", sin(u * PI * 2.0e0) * 9.0e0, -b * 2.0e0, 0.0e0)
+    padd(p, "l_arm", 0.0e0, b * 3.0e0, 0.0e0)
+    padd(p, "r_arm", 0.0e0, -b * 3.0e0, 0.0e0)
+    for i in range(0, d.tail) { padd(p, "tail" + str(i), sin((u * 2.0e0 - i * 0.15e0) * PI) * 12.0e0, 0.0e0, 0.0e0) }
+    p.root_d = [0.0e0, 0.0e0, b * 0.4e0]
+    return p
+  })
+  sample_clip(D, "walk", 1.0e0, 16, fn (u) {
+    let p = biped_base(d)
+    let s = sin(u * 2.0e0 * PI)
+    let c = cos(u * 2.0e0 * PI)
+    let sw = d.dig ? 24.0e0 : 30.0e0
+    let lt = -s * sw
+    let rt = s * sw
+    let lk = max(0.0e0, -c) * 48.0e0
+    let rk = max(0.0e0, c) * 48.0e0
+    padd(p, "l_thigh", 0.0e0, lt, 0.0e0)
+    padd(p, "r_thigh", 0.0e0, rt, 0.0e0)
+    padd(p, "l_shin", 0.0e0, lk, 0.0e0)
+    padd(p, "r_shin", 0.0e0, rk, 0.0e0)
+    padd(p, "l_ankle", 0.0e0, -lt - lk * (d.dig ? 0.6e0 : 1.0e0), 0.0e0)
+    padd(p, "r_ankle", 0.0e0, -rt - rk * (d.dig ? 0.6e0 : 1.0e0), 0.0e0)
+    padd(p, "l_arm", 0.0e0, s * 24.0e0, 0.0e0)
+    padd(p, "l_fore", 0.0e0, -max(0.0e0, s) * 20.0e0, 0.0e0)
+    if d.style != "gun" {
+      padd(p, "r_arm", 0.0e0, -s * 24.0e0, 0.0e0)
+      padd(p, "r_fore", 0.0e0, -max(0.0e0, -s) * 20.0e0, 0.0e0)
+    } else {
+      padd(p, "r_arm", 0.0e0, -28.0e0 - s * 6.0e0, -6.0e0)
+      padd(p, "r_fore", 0.0e0, -44.0e0, 0.0e0)
+    }
+    padd(p, "chest", -s * 7.0e0, 3.0e0, 0.0e0)
+    padd(p, "head", s * 5.0e0, 0.0e0, 0.0e0)
+    padd(p, "pelvis", s * 6.0e0, 4.0e0, s * 3.0e0)
+    for i in range(0, d.tail) { padd(p, "tail" + str(i), sin((u * 2.0e0 - i * 0.2e0) * PI) * 15.0e0, 0.0e0, 0.0e0) }
+    p.root_d = [0.0e0, 0.0e0, -abs(c) * 1.8e0]
+    return p
+  })
+  sample_clip(D, "attack", 0.7e0, 14, fn (u) {
+    let p = biped_base(d)
+    if d.style == "gun" {
+      let up = ease(u / 0.2e0)
+      let kick = max(0.0e0, 1.0e0 - abs(u - 0.45e0) / 0.08e0) + max(0.0e0, 1.0e0 - abs(u - 0.7e0) / 0.08e0)
+      p.r_arm = [8.0e0 * up, -28.0e0 - 58.0e0 * up + kick * 9.0e0, -14.0e0 + 6.0e0 * up]
+      p.r_fore = [0.0e0, -44.0e0 + 40.0e0 * up, 0.0e0]
+      p.l_arm = [-28.0e0 * up, -10.0e0 - 52.0e0 * up, 22.0e0]
+      p.l_fore = [-25.0e0 * up, -40.0e0 - 25.0e0 * up, 0.0e0]
+      padd(p, "chest", -12.0e0 * up, -kick * 6.0e0, 0.0e0)
+      padd(p, "head", 10.0e0 * up, 4.0e0 * up, 0.0e0)
+    } else if d.style == "throw" {
+      let wind = ease(u / 0.5e0)
+      let fling = ease((u - 0.5e0) / 0.22e0)
+      p.r_arm = [0.0e0, 75.0e0 * wind - 190.0e0 * fling, -20.0e0 + 12.0e0 * fling]
+      p.r_fore = [0.0e0, -80.0e0 * wind + 70.0e0 * fling, 0.0e0]
+      padd(p, "chest", 28.0e0 * wind - 50.0e0 * fling, -6.0e0 * wind + 10.0e0 * fling, 0.0e0)
+      padd(p, "l_arm", 0.0e0, -40.0e0 * wind + 30.0e0 * fling, 20.0e0)
+      padd(p, "head", -10.0e0 * wind + 15.0e0 * fling, 0.0e0, 0.0e0)
+    } else {
+      let up = ease(u / 0.45e0)
+      let down = ease((u - 0.45e0) / 0.2e0)
+      for s in ["l_", "r_"] {
+        p[s + "arm"] = [0.0e0, -170.0e0 * up + 130.0e0 * down, s == "l_" ? 18.0e0 : -18.0e0]
+        p[s + "fore"] = [0.0e0, -30.0e0 * up + 10.0e0 * down, 0.0e0]
+      }
+      padd(p, "chest", 0.0e0, -14.0e0 * up + 34.0e0 * down, 0.0e0)
+      padd(p, "spine", 0.0e0, -6.0e0 * up + 14.0e0 * down, 0.0e0)
+    }
+    if d.jaw { padd(p, "jaw", 0.0e0, 0.0e0, 0.0e0) }
+    p.jaw = [0.0e0, d.jaw_open * ease(u / 0.3e0) * (1.0e0 - ease((u - 0.75e0) / 0.25e0)), 0.0e0]
+    return p
+  })
+  sample_clip(D, "pain", 0.4e0, 8, fn (u) {
+    let p = biped_base(d)
+    let k = sin(u * PI) * (1.0e0 - u * 0.4e0)
+    padd(p, "chest", 0.0e0, -24.0e0 * k, 8.0e0 * k)
+    padd(p, "spine", 0.0e0, -10.0e0 * k, 0.0e0)
+    padd(p, "head", 18.0e0 * k, -28.0e0 * k, 14.0e0 * k)
+    padd(p, "l_arm", 0.0e0, -20.0e0 * k, 30.0e0 * k)
+    padd(p, "r_arm", 0.0e0, -20.0e0 * k, -30.0e0 * k)
+    p.jaw = [0.0e0, d.jaw_open * k, 0.0e0]
+    p.root_d = [-2.5e0 * k, 0.0e0, -1.0e0 * k]
+    return p
+  })
+  sample_clip(D, "die", 1.1e0, 16, fn (u) {
+    let p = biped_base(d)
+    let kneel = ease(u / 0.35e0)
+    let fall = ease((u - 0.22e0) / 0.7e0)
+    let tw = sin(u * PI * 3.0e0) * (1.0e0 - u) * 10.0e0
+    padd(p, "l_thigh", 0.0e0, -45.0e0 * kneel + 50.0e0 * fall, 8.0e0)
+    padd(p, "r_thigh", 0.0e0, -30.0e0 * kneel + 55.0e0 * fall, -10.0e0)
+    padd(p, "l_shin", 0.0e0, 75.0e0 * kneel - 65.0e0 * fall, 0.0e0)
+    padd(p, "r_shin", 0.0e0, 60.0e0 * kneel - 55.0e0 * fall, 0.0e0)
+    padd(p, "l_arm", 0.0e0, -50.0e0 * fall, 55.0e0 * fall)
+    padd(p, "r_arm", 0.0e0, -70.0e0 * fall, -50.0e0 * fall)
+    padd(p, "head", 25.0e0 * fall + tw, -20.0e0 * fall, 15.0e0 * fall)
+    padd(p, "chest", tw, -12.0e0 * fall, 0.0e0)
+    p.jaw = [0.0e0, d.jaw_open * fall, 0.0e0]
+    p.pelvis = [0.0e0, -86.0e0 * fall, 6.0e0 * fall]
+    p.root_d = [0.0e0, 0.0e0, -d.hip * (0.30e0 * kneel * (1.0e0 - fall) + 0.80e0 * fall)]
+    return p
+  })
+}
+
+# ---- the designs ------------------------------------------------------------------------------------------------------
+
+# The husk (the rifle soldier, 3004): a soldier the invasion killed and rebuilt - dead grey-blue skin pulled tight over
+# the bones, the ribs bared where the chest was opened, a bolted plate over the heart, cables run from its spine into
+# its skull, one eye socket burned out and lit red, the jaw slack; its right forearm is gone, replaced by a rifle grown
+# into the bone.
+fn husk(heavy) {
+  let D = new_design(heavy ? "ravager" : "husk", 0.75e0, 1.8e0, heavy ? 52.0e0 : 58.0e0,
+                     heavy ? "the shotgun soldier: a heavier husk, gas-masked, a double barrel for a forearm" : "the rifle soldier: a dead soldier rebuilt")
+  let d = {"hip": heavy ? 30.0 : 31.0, "spine": 6.5, "chest": 7.0, "neck": 7.5, "head": 3.0, "fwd": heavy ? 3.0 : 1.5, "sw": heavy ? 9.0 : 7.8, "su": 6.0,
+           "arm": 11.0, "fore": 10.0, "hand": 3.0, "hw": 4.0, "thigh": 13.5, "shin": 13.5, "ankle": 2.5, "dig": false, "tail": 0, "tail_len": 0.0,
+           "jaw_x": 2.5, "jaw_z": 1.0, "hunch": heavy ? 16.0 : 8.0, "arm_out": heavy ? 14.0 : 10.0, "style": "gun", "jaw": true, "jaw_open": 22.0}
+  biped_skeleton(D, d)
+  let skin = mat(0x8a9196, 0x5c6468, {"mottle": 0.55, "grain": 2.5, "shine": 0.3, "blend": 2.2, "rough": 0.25})
+  let bruise = mat(0x6a5560, 0x3a2c34, {"mottle": 0.6, "grain": 2.0, "shine": 0.35, "blend": 1.8, "rough": 0.2})
+  let cloth = mat(heavy ? 0x2a2c2e : 0x3e4636, heavy ? 0x141516 : 0x22261e, {"mottle": 0.5, "grain": 2.0, "blend": 1.6, "rough": 0.35})
+  let plate = mat(heavy ? 0x4a4d52 : 0x5e5f58, heavy ? 0x2a2c30 : 0x3a3b36, {"mottle": 0.3, "grain": 3.0, "shine": 0.75, "blend": 0.4, "round": 0.5})
+  let rust = mat(0x6e4a32, 0x3a2416, {"mottle": 0.7, "grain": 1.5, "shine": 0.4, "blend": 0.5, "round": 0.4})
+  let bone_m = mat(0xd8ccb4, 0x9a8c74, {"mottle": 0.4, "grain": 2.0, "shine": 0.45, "blend": 1.0})
+  let meat = mat(0x6a1a1c, 0x2a0606, {"mottle": 0.5, "grain": 1.5, "shine": 0.85, "blend": 1.2})
+  let cable = mat(0x1c1e20, 0x2e2a26, {"shine": 0.6, "blend": 0.6})
+  let lit = mat(heavy ? 0xff8a20 : 0xff2a14, heavy ? 0xffc040 : 0xff6040, {"glow": 1.0})
+  let metal = mat(0x2a2c2f, 0x141516, {"mottle": 0.2, "grain": 3.0, "shine": 0.9, "blend": 0.3, "round": 0.4})
+  # pelvis and belly: fatigues, a webbing belt with pouches
+  blob(D, "pelvis", [0.0, 0.0, 0.5], [5.0, 6.8, 4.6], nil, cloth)
+  slab(D, "pelvis", [0.0, 0.0, 3.6], [5.4, 7.1, 1.0], nil, mat(0x2a2620, 0x1a1712, {"mottle": 0.4, "grain": 1.0, "blend": 0.3, "round": 0.3}))
+  for s2 in [1.0, -1.0] {
+    slab(D, "pelvis", [4.0, 4.2 * s2, 2.0], [1.6, 2.0, 2.2], [0.0, 0.0, 0.0], mat(0x3a3428, 0x262118, {"mottle": 0.5, "grain": 1.0, "blend": 0.3, "round": 0.5}))
+    slab(D, "pelvis", [-2.5, 5.6 * s2, 2.0], [1.4, 1.2, 2.0], nil, mat(0x3a3428, 0x262118, {"mottle": 0.5, "grain": 1.0, "blend": 0.3, "round": 0.5}))
+  }
+  # the gut: skin sunk in, the spine's line at the back
+  blob(D, "spine", [0.5, 0.0, 3.0], [4.2, 5.8, 5.0], nil, skin)
+  for i in range(0, 4) { blob(D, "spine", [-3.6, 0.0, 0.5 + i * 2.0], [1.2, 1.4, 0.9], nil, bone_m) }
+  # the chest: a ribcage over a dark cavity, a bolted plate on the left, collarbones
+  blob(D, "chest", [0.0, 0.0, 3.5], [5.2, 8.0, 6.2], nil, skin)
+  cut_blob(D, "chest", [4.8, -2.0, 2.5], [2.6, 3.4, 4.0], nil, mat(0x000000, 0x000000, {"blend": 1.0}))
+  blob(D, "chest", [3.0, -2.0, 2.5], [1.6, 3.0, 3.6], nil, meat)
+  for i in range(0, 4) {
+    let z = 0.5 + i * 1.6
+    limb(D, "chest", [3.6, 1.0, z + 1.0], [4.6, -4.6, z], 0.42, 0.34, bone_m)
+  }
+  slab(D, "chest", [4.6, 3.6, 3.5], [1.0, 3.2, 4.2], [0.0, -6.0, 0.0], plate)
+  for z in [1.0, 6.0] { for y in [2.0, 5.2] { blob(D, "chest", [5.7, y, z], [0.55, 0.55, 0.55], nil, rust) } }
+  sym(fn (p, s) {
+    limb(D, "chest", [2.5, 0.8 * s, 8.6], [1.0, 7.0 * s, 8.2], 0.8, 0.7, bone_m)
+    # shoulder blades and the trapezius into the neck
+    blob(D, "chest", [-3.4, 3.6 * s, 6.0], [1.6, 3.2, 3.4], nil, skin)
+  })
+  if heavy {
+    # a shoulder guard of overlapping plates on the gun side, a tank on the back
+    for i in range(0, 3) { slab(D, "chest", [0.0, -8.0 - i * 0.6, 8.0 - i * 1.6], [4.6 - i * 0.4, 2.6, 1.2], [0.0, 0.0, -25.0 - i * 6.0], plate) }
+    limb(D, "chest", [-6.2, 2.0, 1.0], [-6.2, 2.0, 8.0], 2.4, 2.4, metal)
+    limb(D, "chest", [-6.2, -2.4, 1.0], [-6.2, -2.4, 8.0], 2.4, 2.4, metal)
+    limb(D, "chest", [-4.0, 2.0, 8.5], [1.0, 0.8, 11.5], 0.7, 0.6, cable)
+  }
+  # cables from the spine into the back of the skull
+  for i in range(0, 3) {
+    let y = (i - 1) * 1.6
+    limb(D, "chest", [-3.0, y, 6.5], [-2.6, y * 0.6, 13.5], 0.45, 0.4, cable)
+  }
+  # neck: tendons standing out
+  limb(D, "neck", [0.0, 0.0, -1.0], [0.0, 0.0, 3.5], 2.4, 2.2, skin)
+  sym(fn (p, s) { limb(D, "neck", [0.8, 1.1 * s, -1.0], [1.2, 0.6 * s, 3.2], 0.55, 0.45, skin) })
+  if heavy {
+    # a gas mask over the face, two lit lenses, a filter canister
+    blob(D, "head", [0.4, 0.0, 3.6], [4.0, 3.6, 4.2], nil, skin)
+    blob(D, "head", [1.6, 0.0, 3.8], [3.4, 3.8, 3.6], nil, mat(0x1e2022, 0x101112, {"mottle": 0.3, "grain": 1.5, "shine": 0.6, "blend": 0.8}))
+    sym(fn (p, s) {
+      limb(D, "head", [3.6, 1.6 * s, 4.6], [4.6, 1.8 * s, 4.6], 1.15, 1.15, metal)
+      blob(D, "head", [4.75, 1.8 * s, 4.6], [0.35, 0.95, 0.95], nil, lit)
+    })
+    limb(D, "head", [3.8, 0.0, 2.0], [5.8, 0.0, 0.6], 1.3, 1.5, metal)
+    slab(D, "head", [6.0, 0.0, 0.5], [0.3, 1.3, 1.3], nil, rust)
+  } else {
+    # the skull under tight skin: brow, sunken cheeks, one eye burned out and lit, a slack jaw, the cables' ports
+    blob(D, "head", [0.6, 0.0, 3.6], [3.9, 3.3, 4.2], nil, skin)
+    blob(D, "head", [2.8, 0.0, 5.2], [1.6, 3.0, 1.0], nil, skin)
+    cut_blob(D, "head", [3.9, 1.5, 4.0], [1.1, 1.0, 0.9], nil, mat(0x000000, 0x000000, {"blend": 0.6}))
+    cut_blob(D, "head", [3.9, -1.5, 4.0], [1.1, 1.0, 0.9], nil, mat(0x000000, 0x000000, {"blend": 0.6}))
+    blob(D, "head", [3.4, -1.5, 4.0], [0.55, 0.55, 0.5], nil, lit)
+    blob(D, "head", [3.3, 1.5, 4.0], [0.5, 0.5, 0.45], nil, mat(0x2a1a14, 0x1a0e0a, {"shine": 0.9}))
+    limb(D, "head", [3.4, 0.0, 3.2], [4.4, 0.0, 2.6], 0.5, 0.7, skin)
+    for y in [-1.6, 0.0, 1.6] { blob(D, "head", [-3.0, y * 0.7, 3.4], [0.6, 0.6, 0.6], nil, metal) }
+    # a helmet's remains: a cracked shell on the crown
+    blob(D, "head", [-0.2, 0.0, 6.4], [3.6, 3.4, 1.6], [0.0, 8.0, 0.0], plate)
+  }
+  # the jaw, hanging, its teeth
+  blob(D, "jaw", [1.0, 0.0, -0.8], [2.0, 2.4, 1.0], nil, skin)
+  for i in range(0, 5) {
+    let y = (i - 2) * 0.75
+    limb(D, "jaw", [2.3, y, -0.3], [2.5, y, 0.6], 0.28, 0.12, bone_m)
+    limb(D, "head", [3.3, y, 2.2], [3.4, y, 1.3], 0.28, 0.12, bone_m)
+  }
+  # arms: the left whole, a wrapped hand; the right ends in the gun
+  sym(fn (p, s) {
+    limb(D, p + "arm", [0.0, 0.0, 0.8], [0.0, 0.0, -11.0], 2.7, 2.0, s > 0 ? skin : cloth)
+    blob(D, p + "arm", [0.0, 0.4 * s, -0.6], [3.4, 3.3, 3.4], nil, heavy ? plate : cloth)
+    blob(D, p + "arm", [1.2, 0.0, -5.0], [1.5, 1.7, 3.6], nil, s > 0 ? skin : cloth)
+  })
+  limb(D, "l_fore", [0.0, 0.0, 0.5], [0.0, 0.0, -9.5], 2.0, 1.5, skin)
+  limb(D, "l_fore", [1.0, 0.0, -1.0], [0.8, 0.0, -6.0], 1.2, 0.6, skin)
+  blob(D, "l_hand", [0.6, 0.0, -1.6], [1.6, 1.1, 2.0], nil, bruise)
+  for i in range(0, 4) {
+    let y = (i - 1.5) * 0.65
+    limb(D, "l_hand", [1.6, y, -2.6], [2.4, y, -4.6], 0.35, 0.24, bruise)
+  }
+  limb(D, "l_hand", [0.4, 1.1, -1.2], [1.6, 1.6, -3.0], 0.4, 0.28, bruise)
+  # the gun-arm: bone and cable fused into a receiver, a barrel (two for the ravager) along the forearm's line,
+  # heat vents lit along it, a muzzle
+  limb(D, "r_fore", [0.0, 0.0, 0.5], [0.0, 0.0, -3.0], 2.1, 2.2, skin)
+  slab(D, "r_fore", [0.2, 0.0, -5.0], [2.2, 2.0, 3.4], nil, metal)
+  limb(D, "r_fore", [-1.0, 1.6, -1.0], [-0.2, 1.4, -6.0], 0.5, 0.45, cable)
+  limb(D, "r_fore", [-1.0, -1.6, -1.0], [-0.2, -1.4, -6.0], 0.5, 0.45, cable)
+  let barrels = heavy ? [[0.6, 0.85], [0.6, -0.85]] : [[0.4, 0.0]]
+  for br in barrels {
+    limb(D, "r_fore", [br[0], br[1], -6.0], [br[0], br[1], -19.0], heavy ? 0.9 : 0.75, heavy ? 0.9 : 0.7, metal)
+    cut_limb(D, "r_fore", [br[0], br[1], -15.0], [br[0], br[1], -19.6], heavy ? 0.5 : 0.38, heavy ? 0.5 : 0.38, mat(0x000000, 0x000000, {"blend": 0.2}))
+  }
+  for i in range(0, 4) { slab(D, "r_fore", [1.7, 0.0, -6.5 - i * 1.8], [0.25, 1.1, 0.4], nil, lit) }
+  slab(D, "r_fore", [-1.2, 0.0, -8.0], [1.0, 0.9, 3.0], nil, rust)
+  # legs: fatigues, knee pads, boots
+  sym(fn (p, s) {
+    limb(D, p + "thigh", [0.0, 0.0, 1.0], [0.0, 0.0, -13.5], 3.9, 3.0, cloth)
+    blob(D, p + "thigh", [1.0, 0.0, -5.0], [2.6, 2.8, 4.6], nil, cloth)
+    slab(D, p + "thigh", [0.8, 2.6 * s, -6.0], [1.6, 0.8, 2.2], nil, mat(0x3a3428, 0x262118, {"mottle": 0.5, "grain": 1.0, "blend": 0.3, "round": 0.5}))
+    limb(D, p + "shin", [0.0, 0.0, 0.5], [0.0, 0.0, -11.0], 3.0, 2.3, cloth)
+    blob(D, p + "shin", [1.7, 0.0, -0.5], [1.5, 2.2, 2.4], nil, plate)
+    blob(D, p + "shin", [-1.0, 0.0, -4.5], [1.8, 2.1, 3.8], nil, cloth)
+    limb(D, p + "shin", [0.0, 0.0, -8.5], [0.0, 0.0, -13.5], 2.7, 2.6, metal)
+    slab(D, p + "ankle", [1.5, 0.0, -1.0], [3.8, 2.2, 1.4], nil, metal)
+    slab(D, p + "ankle", [1.6, 0.0, -2.3], [4.2, 2.4, 0.5], nil, mat(0x121212, 0x0a0a0a, {"mottle": 0.3, "grain": 0.8, "blend": 0.2, "round": 0.3}))
+  })
+  biped_clips(D, d)
+  return D
+}
+
+# The cinder stalker (the fire-thrower, 3001): tall and starved, it walks on the balls of long back-bent feet; its
+# hide is cooled volcanic glass, black and split, the magma under it showing through the seams; a crest of horns
+# sweeps back from a narrow skull, the arms reach its knees and end in three long claws; a tail balances it. It
+# gathers fire in its hand and hurls it.
+fn stalker() {
+  let D = new_design("stalker", 0.7e0, 1.8e0, 62.0e0, "the fire-thrower: a gaunt digitigrade creature of black glass and magma")
+  let d = {"hip": 33.0, "spine": 6.5, "chest": 7.5, "neck": 8.0, "head": 3.0, "fwd": 4.5, "sw": 7.0, "su": 6.5,
+           "arm": 13.0, "fore": 12.5, "hand": 4.0, "hw": 3.6, "thigh": 14.0, "shin": 15.0, "ankle": 9.0, "dig": true, "tail": 4, "tail_len": 6.0,
+           "jaw_x": 3.0, "jaw_z": 1.2, "hunch": 18.0, "arm_out": 12.0, "style": "throw", "jaw": true, "jaw_open": 30.0}
+  biped_skeleton(D, d)
+  let hide = mat(0x231c1a, 0x0e0a0a, {"mottle": 0.75, "grain": 1.6, "shine": 0.8, "blend": 2.0, "rough": 0.45})
+  let ash = mat(0x3a302c, 0x1a1412, {"mottle": 0.7, "grain": 1.4, "shine": 0.4, "blend": 1.6, "rough": 0.35})
+  let magma = mat(0xff5a10, 0xffb040, {"glow": 1.0, "blend": 0.7})
+  let horn = mat(0x2a2420, 0xd8c8a8, {"mottle": 0.4, "grain": 1.2, "shine": 0.6, "blend": 0.9})
+  let claw = mat(0x1a1614, 0xe8dcc4, {"shine": 0.8, "blend": 0.5})
+  let eye = mat(0xffe060, 0xfff0a0, {"glow": 1.0})
+  blob(D, "pelvis", [0.0, 0.0, 0.8], [4.4, 5.6, 4.0], nil, hide)
+  blob(D, "spine", [0.0, 0.0, 3.0], [3.4, 4.6, 4.8], nil, hide)
+  for i in range(0, 4) { blob(D, "spine", [-2.8, 0.0, 0.4 + i * 1.7], [1.2, 1.0, 0.7], nil, horn) }
+  blob(D, "chest", [0.6, 0.0, 3.8], [5.0, 7.4, 6.0], nil, hide)
+  # a keel of a breastbone, ribs showing through the glass, the seams lit
+  limb(D, "chest", [4.8, 0.0, 0.0], [5.2, 0.0, 7.0], 1.1, 0.9, ash)
+  sym(fn (p, s) {
+    for i in range(0, 3) { limb(D, "chest", [4.2, 0.8 * s, 1.0 + i * 2.0], [2.0, 6.4 * s, 0.5 + i * 2.0], 0.5, 0.4, ash) }
+    limb(D, "chest", [4.6, 1.6 * s, 6.5], [3.4, 5.6 * s, 2.0], 0.32, 0.22, magma)
+    limb(D, "chest", [-3.0, 2.0 * s, 7.0], [-3.8, 5.0 * s, 1.5], 0.3, 0.2, magma)
+    blob(D, "chest", [-2.6, 4.2 * s, 6.2], [2.2, 2.6, 3.0], nil, hide)
+  })
+  # dorsal spines down the back
+  for i in range(0, 5) {
+    let z = 8.0 - i * 1.8
+    limb(D, "chest", [-4.2, 0.0, z], [-9.0 + i * 0.4, 0.0, z + 3.5 - i * 0.3], 0.9, 0.12, horn)
+  }
+  limb(D, "neck", [0.0, 0.0, -1.0], [0.0, 0.0, 4.0], 2.0, 1.8, hide)
+  limb(D, "neck", [-1.4, 0.0, -0.5], [-1.0, 0.0, 3.5], 0.7, 0.5, horn)
+  # the skull: long, narrow, a heavy brow over deep sockets lit gold, cheekbones, a crest of horns swept back
+  blob(D, "head", [1.4, 0.0, 3.0], [4.6, 2.9, 3.0], [0.0, -8.0, 0.0], hide)
+  blob(D, "head", [4.2, 0.0, 2.2], [2.6, 1.9, 1.7], nil, hide)
+  blob(D, "head", [2.6, 0.0, 4.6], [1.6, 2.8, 0.9], nil, ash)
+  sym(fn (p, s) {
+    cut_blob(D, "head", [3.6, 1.3 * s, 3.8], [0.9, 0.75, 0.6], nil, mat(0x000000, 0x000000, {"blend": 0.5}))
+    blob(D, "head", [3.3, 1.3 * s, 3.8], [0.5, 0.55, 0.45], nil, eye)
+    limb(D, "head", [2.2, 2.4 * s, 2.4], [4.2, 1.6 * s, 1.6], 0.6, 0.4, ash)
+    limb(D, "head", [0.6, 1.6 * s, 5.0], [-6.5, 3.6 * s, 8.0], 1.1, 0.5, horn)
+    limb(D, "head", [-6.5, 3.6 * s, 8.0], [-10.0, 4.2 * s, 7.2], 0.5, 0.06, horn)
+    limb(D, "head", [0.0, 2.2 * s, 3.4], [-5.0, 4.4 * s, 4.4], 0.7, 0.08, horn)
+    limb(D, "head", [2.6, 2.2 * s, 1.2], [3.4, 3.4 * s, -0.4], 0.4, 0.05, horn)
+  })
+  limb(D, "head", [1.5, 0.0, 6.0], [-4.0, 0.0, 7.6], 0.9, 0.1, horn)
+  # the jaw: a long underbite of needle teeth, a glow in the throat
+  blob(D, "jaw", [1.8, 0.0, -0.6], [3.0, 1.8, 0.8], nil, hide)
+  blob(D, "jaw", [-0.5, 0.0, 0.2], [1.2, 1.0, 0.8], nil, magma)
+  for i in range(0, 6) {
+    let x = 0.6 + i * 0.7
+    for s2 in [1.0, -1.0] {
+      limb(D, "jaw", [x, 1.2 * s2, -0.2], [x + 0.2, 1.1 * s2, 1.4], 0.22, 0.04, claw)
+      limb(D, "head", [x + 1.6, 1.1 * s2, 1.4], [x + 1.7, 1.0 * s2, 0.2], 0.2, 0.04, claw)
+    }
+  }
+  # arms: long, sinew over bone, seams of fire; hands of three long claws, fire gathered in the right
+  sym(fn (p, s) {
+    limb(D, p + "arm", [0.0, 0.0, 1.0], [0.0, 0.0, -13.0], 2.6, 1.7, hide)
+    blob(D, p + "arm", [0.0, 0.6 * s, -0.4], [3.0, 2.8, 3.2], nil, hide)
+    blob(D, p + "arm", [1.0, 0.0, -5.0], [1.3, 1.5, 3.6], nil, hide)
+    limb(D, p + "arm", [1.6, 0.6 * s, -2.0], [1.0, 0.8 * s, -10.0], 0.22, 0.18, magma)
+    limb(D, p + "fore", [0.0, 0.0, 0.5], [0.0, 0.0, -12.0], 1.8, 1.2, hide)
+    limb(D, p + "fore", [-1.0, 0.0, -0.5], [-0.6, 0.0, -9.0], 0.9, 0.5, ash)
+    limb(D, p + "fore", [1.2, 0.0, -2.0], [0.8, 0.0, -10.0], 0.18, 0.15, magma)
+    limb(D, p + "fore", [-1.4, 0.0, -2.0], [-3.0, 0.0, 1.0], 0.5, 0.05, horn)
+    blob(D, p + "hand", [0.4, 0.0, -1.2], [1.6, 1.2, 1.8], nil, hide)
+    for k in range(0, 3) {
+      let y = (k - 1) * 0.9
+      limb(D, p + "hand", [1.0, y, -2.2], [2.4, y * 1.3, -6.0], 0.42, 0.3, hide)
+      limb(D, p + "hand", [2.4, y * 1.3, -6.0], [3.6, y * 1.4, -9.2], 0.3, 0.04, claw)
+    }
+    limb(D, p + "hand", [0.0, 1.3 * s, -1.2], [1.6, 2.4 * s, -3.6], 0.35, 0.05, claw)
+  })
+  blob(D, "r_hand", [2.4, 0.0, -4.0], [1.4, 1.4, 1.4], nil, magma)
+  # digitigrade legs: a heavy thigh, a long shin, the long ankle stood on three toes and a spur
+  sym(fn (p, s) {
+    limb(D, p + "thigh", [0.0, 0.0, 1.0], [0.0, 0.0, -14.0], 3.6, 2.2, hide)
+    blob(D, p + "thigh", [1.2, 0.0, -5.0], [2.4, 2.4, 5.0], nil, hide)
+    limb(D, p + "thigh", [1.8, 1.0 * s, -3.0], [0.8, 1.2 * s, -12.0], 0.22, 0.18, magma)
+    limb(D, p + "shin", [0.0, 0.0, 0.5], [0.0, 0.0, -15.0], 2.2, 1.4, hide)
+    blob(D, p + "shin", [-1.0, 0.0, -4.0], [1.6, 1.6, 4.0], nil, hide)
+    limb(D, p + "shin", [1.0, 0.0, -1.0], [2.6, 0.0, 3.0], 0.6, 0.06, horn)
+    limb(D, p + "ankle", [0.0, 0.0, 0.5], [0.0, 0.0, -9.0], 1.3, 0.9, ash)
+    for k in range(0, 3) {
+      let y = (k - 1) * 0.9
+      limb(D, p + "toe", [0.0, y, 0.0], [4.2, y * 1.6, -0.4], 0.6, 0.35, hide)
+      limb(D, p + "toe", [4.2, y * 1.6, -0.4], [5.8, y * 1.7, -1.0], 0.35, 0.04, claw)
+    }
+    limb(D, p + "toe", [-0.4, 0.0, 0.2], [-2.0, 0.0, -0.6], 0.45, 0.05, claw)
+  })
+  # the tail: tapering, spined
+  let r = [2.2, 1.8, 1.3, 0.9]
+  for i in range(0, 4) {
+    let n = "tail" + str(i)
+    limb(D, n, [0.0, 0.0, 0.0], [-6.2, 0.0, 0.0], r[i], i < 3 ? r[i + 1] : 0.15, hide)
+    limb(D, n, [-2.0, 0.0, r[i] * 0.8], [-4.0, 0.0, r[i] * 0.8 + 2.0 - i * 0.4], 0.5, 0.06, horn)
+  }
+  biped_clips(D, d)
+  return D
+}
+
+# The warlord (the baron, 3003): a horned giant - a ram's skull grown thick with bone armour, plates of it over the
+# chest and shoulders, leathery crimson hide over slabs of muscle, goat-jointed legs shaggy to the hoof, tusks; its
+# forearms burn green to the elbow, and it hurls what burns there.
+fn warlord() {
+  let D = new_design("warlord", 0.85e0, 2.0e0, 60.0e0, "the baron: a horned giant in bone armour on goat legs, green fire in its hands")
+  let d = {"hip": 36.0, "spine": 7.5, "chest": 8.5, "neck": 8.0, "head": 3.0, "fwd": 3.0, "sw": 10.5, "su": 7.0,
+           "arm": 13.0, "fore": 12.0, "hand": 4.0, "hw": 5.2, "thigh": 15.0, "shin": 16.0, "ankle": 8.0, "dig": true, "tail": 0, "tail_len": 0.0,
+           "jaw_x": 2.8, "jaw_z": 1.0, "hunch": 10.0, "arm_out": 14.0, "style": "throw", "jaw": true, "jaw_open": 26.0}
+  biped_skeleton(D, d)
+  let hide = mat(0x9a4a3a, 0x5a2218, {"mottle": 0.55, "grain": 2.6, "shine": 0.35, "blend": 2.6, "rough": 0.35})
+  let dark = mat(0x5a2218, 0x2a0e0a, {"mottle": 0.55, "grain": 2.2, "shine": 0.3, "blend": 2.2, "rough": 0.3})
+  let fur = mat(0x3a2a22, 0x1a120e, {"mottle": 0.9, "grain": 0.9, "blend": 1.8, "rough": 0.6})
+  let armour = mat(0xd8ccb0, 0x8a7a60, {"mottle": 0.5, "grain": 2.0, "shine": 0.5, "blend": 1.0, "rough": 0.2})
+  let horn = mat(0xc8b894, 0x4a3a2a, {"mottle": 0.6, "grain": 1.0, "shine": 0.45, "blend": 1.0})
+  let fel = mat(0x30ff40, 0xc0ff80, {"glow": 1.0, "blend": 1.2})
+  let fel_skin = mat(0x1e4a1a, 0x2a8a20, {"glow": 0.45, "mottle": 0.5, "grain": 1.5, "shine": 0.5, "blend": 2.0, "rough": 0.3})
+  let hoof = mat(0x1a1410, 0x0a0806, {"shine": 0.7, "blend": 0.6})
+  blob(D, "pelvis", [0.0, 0.0, 0.5], [6.2, 8.0, 5.4], nil, fur)
+  blob(D, "spine", [0.6, 0.0, 3.5], [5.6, 7.8, 6.6], nil, hide)
+  # the abdominal wall: segmented
+  for i in range(0, 3) { sym(fn (p, s) { blob(D, "spine", [5.0, 1.8 * s, 1.0 + i * 2.6], [1.2, 1.8, 1.3], nil, hide) }) }
+  blob(D, "chest", [1.0, 0.0, 4.6], [7.0, 11.0, 7.6], nil, hide)
+  sym(fn (p, s) {
+    blob(D, "chest", [4.4, 4.4 * s, 4.4], [3.0, 4.6, 3.6], nil, hide)
+    # breastplate of bone over each pectoral, a pauldron of plates on each shoulder
+    slab(D, "chest", [6.4, 4.4 * s, 4.8], [1.0, 4.0, 3.0], [0.0, -10.0, 8.0 * s], armour)
+    for i in range(0, 3) { slab(D, "chest", [0.0, (10.0 + i * 0.8) * s, 9.5 - i * 1.8], [5.0 - i * 0.6, 2.6, 1.3], [0.0, 0.0, (32.0 + i * 8.0) * s], armour) }
+    limb(D, "chest", [0.0, 11.0 * s, 10.5], [-1.0, 14.0 * s, 15.0], 1.2, 0.1, horn)
+    blob(D, "chest", [-4.0, 4.6 * s, 6.6], [3.0, 3.6, 3.6], nil, hide)
+  })
+  slab(D, "chest", [6.8, 0.0, 6.2], [0.8, 1.6, 4.0], nil, armour)
+  # the hump of muscle behind the neck
+  blob(D, "chest", [-2.0, 0.0, 9.6], [4.4, 6.0, 3.4], nil, dark)
+  limb(D, "neck", [0.0, 0.0, -2.0], [0.0, 0.0, 4.0], 4.0, 3.4, dark)
+  # the head: a ram's skull, a thick brow, eyes lit green, a muzzle with tusks, horns curled round
+  blob(D, "head", [1.2, 0.0, 3.6], [4.4, 3.8, 4.2], nil, dark)
+  blob(D, "head", [3.4, 0.0, 5.6], [2.2, 3.6, 1.3], nil, armour)
+  blob(D, "head", [4.6, 0.0, 2.6], [2.8, 2.6, 2.2], nil, hide)
+  sym(fn (p, s) {
+    cut_blob(D, "head", [4.6, 1.6 * s, 4.4], [0.9, 0.8, 0.6], nil, mat(0x000000, 0x000000, {"blend": 0.5}))
+    blob(D, "head", [4.3, 1.6 * s, 4.4], [0.5, 0.6, 0.45], nil, fel)
+    # the horn: back, out, down and round (a spiral of segments)
+    let pts = [[0.5, 2.6, 6.4], [-2.8, 5.0, 8.4], [-5.6, 7.4, 6.6], [-5.4, 9.0, 2.8], [-2.6, 9.2, 0.6], [0.2, 8.4, 1.4]]
+    let rad = [2.2, 2.0, 1.7, 1.4, 1.0, 0.6, 0.15]
+    for i in range(0, len(pts) - 1) {
+      limb(D, "head", ys(pts[i], s), ys(pts[i + 1], s), rad[i], rad[i + 1], horn)
+    }
+    limb(D, "jaw", [2.6, 1.6 * s, -0.2], [3.4, 2.4 * s, 3.0], 0.55, 0.08, horn)
+  })
+  blob(D, "jaw", [2.0, 0.0, -0.8], [3.0, 2.6, 1.2], nil, dark)
+  for i in range(0, 5) {
+    let y = (i - 2) * 0.8
+    limb(D, "jaw", [4.0, y, -0.2], [4.2, y, 0.8], 0.3, 0.1, horn)
+  }
+  # arms: slabs of muscle, the forearms burning green into the hands
+  sym(fn (p, s) {
+    limb(D, p + "arm", [0.0, 0.0, 1.0], [0.0, 0.0, -13.0], 4.0, 3.0, hide)
+    blob(D, p + "arm", [1.6, 0.0, -5.0], [2.4, 2.4, 4.6], nil, hide)
+    blob(D, p + "arm", [-1.6, 0.0, -5.5], [2.0, 2.2, 4.2], nil, dark)
+    limb(D, p + "fore", [0.0, 0.0, 0.5], [0.0, 0.0, -12.0], 3.2, 2.4, fel_skin)
+    blob(D, p + "fore", [0.8, 0.0, -3.0], [2.4, 2.6, 4.2], nil, fel_skin)
+    for k in range(0, 3) { slab(D, p + "fore", [-2.4, 0.0, -2.0 - k * 3.0], [0.8, 2.0, 1.2], [0.0, 15.0, 0.0], armour) }
+    blob(D, p + "hand", [0.6, 0.0, -1.6], [2.4, 1.8, 2.4], nil, fel_skin)
+    for k in range(0, 4) {
+      let y = (k - 1.5) * 1.0
+      limb(D, p + "hand", [1.8, y, -3.0], [2.8, y, -6.4], 0.6, 0.35, fel_skin)
+      limb(D, p + "hand", [2.8, y, -6.4], [3.2, y, -7.8], 0.35, 0.05, horn)
+    }
+    blob(D, p + "hand", [2.0, 0.0, -4.0], [2.0, 2.0, 2.0], nil, fel)
+  })
+  # goat legs: a shaggy thigh, the long backward shin, the cannon bone, a cloven hoof
+  sym(fn (p, s) {
+    limb(D, p + "thigh", [0.0, 0.0, 1.0], [0.0, 0.0, -15.0], 5.2, 3.4, fur)
+    blob(D, p + "thigh", [1.6, 0.0, -6.0], [3.2, 3.4, 6.0], nil, fur)
+    limb(D, p + "shin", [0.0, 0.0, 0.5], [0.0, 0.0, -16.0], 3.2, 2.0, fur)
+    blob(D, p + "shin", [-1.2, 0.0, -4.0], [2.2, 2.4, 4.6], nil, fur)
+    limb(D, p + "ankle", [0.0, 0.0, 0.5], [0.0, 0.0, -8.0], 1.8, 1.4, dark)
+    blob(D, p + "toe", [1.8, 0.8, -0.8], [2.2, 1.0, 1.4], nil, hoof)
+    blob(D, p + "toe", [1.8, -0.8, -0.8], [2.2, 1.0, 1.4], nil, hoof)
+    blob(D, p + "toe", [0.0, 0.0, 0.6], [1.8, 2.0, 1.4], nil, fur)
+  })
+  biped_clips(D, d)
+  return D
+}
+
+# ---- the hound: a quadruped -------------------------------------------------------------------------------------------
+# The maw hound (the demon, 3002; the spectre, 58, is one half-unseen): low, all shoulders and jaw on four short
+# powerful legs - raw red muscle striped with pale tendon, a ridge of bone plates down the back, small sunken eyes
+# over a mouth that splits the head to the throat, rows of teeth. It runs at you and bites.
+fn hound() {
+  let D = new_design("hound", 0.8e0, 2.0e0, 70.0e0, "the demon: a quadruped of raw muscle and bone plates, all jaw")
+  let hip = 24.0
+  bone(D, "pelvis", nil, [-11.0, 0.0, hip], [0.0, 0.0, 0.0])
+  bone(D, "spine", "pelvis", [9.0, 0.0, 1.5], [0.0, 0.0, 0.0])
+  bone(D, "chest", "spine", [9.0, 0.0, 2.0], [0.0, 0.0, 0.0])
+  bone(D, "neck", "chest", [8.0, 0.0, 2.5], [0.0, 0.0, 0.0])
+  bone(D, "head", "neck", [5.0, 0.0, 0.5], [0.0, 0.0, 0.0])
+  bone(D, "jaw", "head", [1.0, 0.0, -1.5], [0.0, 0.0, 0.0])
+  sym(fn (p, s) {
+    bone(D, p + "fleg", "chest", [2.0, 7.5 * s, -2.0], [0.0, 0.0, 8.0 * s])
+    bone(D, p + "fshin", p + "fleg", [0.0, 0.0, -11.0], [0.0, 0.0, 0.0])
+    bone(D, p + "fpaw", p + "fshin", [0.0, 0.0, -10.0], [0.0, 0.0, 0.0])
+  })
+  sym(fn (p, s) {
+    bone(D, p + "bleg", "pelvis", [0.0, 6.5 * s, -1.0], [0.0, 0.0, 8.0 * s])
+    bone(D, p + "bshin", p + "bleg", [0.0, 0.0, -11.0], [0.0, 0.0, 0.0])
+    bone(D, p + "bpaw", p + "bshin", [0.0, 0.0, -10.0], [0.0, 0.0, 0.0])
+  })
+  bone(D, "tail0", "pelvis", [-5.0, 0.0, 1.0], [0.0, 0.0, 0.0])
+  bone(D, "tail1", "tail0", [-6.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+  let flesh = mat(0xa83a44, 0x5a121c, {"mottle": 0.6, "grain": 2.2, "shine": 0.7, "blend": 3.0, "rough": 0.45})
+  let tendon = mat(0xd8a890, 0x9a6050, {"mottle": 0.3, "grain": 1.5, "shine": 0.6, "blend": 1.2})
+  let plate = mat(0xd4c4a4, 0x7a6a52, {"mottle": 0.5, "grain": 2.0, "shine": 0.5, "blend": 1.0, "rough": 0.2})
+  let tooth = mat(0xf0e6cc, 0xb0a080, {"shine": 0.8, "blend": 0.4})
+  let gums = mat(0x5a0a14, 0x2a0408, {"shine": 0.9, "blend": 1.0})
+  let eye = mat(0xfff060, 0xffffa0, {"glow": 1.0})
+  let claw = mat(0x2a2018, 0x0e0a08, {"shine": 0.7, "blend": 0.4})
+  blob(D, "pelvis", [0.0, 0.0, 0.5], [6.5, 6.8, 6.0], nil, flesh)
+  blob(D, "spine", [0.0, 0.0, 1.0], [7.0, 7.4, 6.8], nil, flesh)
+  blob(D, "chest", [1.0, 0.0, 0.5], [8.0, 9.6, 8.6], nil, flesh)
+  # the shoulders: humped, striped with tendon
+  sym(fn (p, s) {
+    blob(D, "chest", [2.0, 6.4 * s, 2.4], [5.0, 4.2, 6.0], nil, flesh)
+    for i in range(0, 3) { limb(D, "chest", [4.0 - i * 2.2, 8.6 * s, 5.0], [3.0 - i * 2.2, 9.6 * s, -3.0], 0.4, 0.3, tendon) }
+    for i in range(0, 4) { limb(D, "spine", [5.0 - i * 3.0, 6.2 * s, 2.0], [4.0 - i * 3.0, 6.0 * s, -4.0], 0.35, 0.3, tendon) }
+  })
+  # bone plates down the back, overlapping
+  let plates = [["chest", 2.0, 8.6, 5.6], ["chest", -3.0, 8.0, 5.2], ["spine", 3.0, 6.8, 4.6], ["spine", -2.0, 6.6, 4.4], ["pelvis", 2.0, 6.0, 4.0], ["pelvis", -3.0, 5.6, 3.6]]
+  for pl in plates {
+    slab(D, pl[0], [pl[1], 0.0, pl[2]], [2.6, pl[3], 1.0], [0.0, 10.0, 0.0], plate)
+    limb(D, pl[0], [pl[1], 0.0, pl[2] + 0.8], [pl[1] - 2.0, 0.0, pl[2] + 3.4], 0.8, 0.1, plate)
+  }
+  limb(D, "neck", [-1.0, 0.0, 0.0], [3.0, 0.0, 0.0], 6.4, 5.6, flesh)
+  # the head: a skull of plates, the upper jaw a slab of teeth, small eyes sunk under the brow
+  blob(D, "head", [2.0, 0.0, 1.4], [5.4, 5.8, 4.2], nil, flesh)
+  slab(D, "head", [3.0, 0.0, 4.6], [3.4, 4.6, 1.0], [0.0, 6.0, 0.0], plate)
+  blob(D, "head", [6.4, 0.0, 0.4], [3.4, 4.6, 1.8], nil, flesh)
+  sym(fn (p, s) {
+    cut_blob(D, "head", [5.4, 3.6 * s, 3.2], [0.8, 0.8, 0.6], nil, mat(0x000000, 0x000000, {"blend": 0.5}))
+    blob(D, "head", [5.1, 3.6 * s, 3.2], [0.45, 0.5, 0.4], nil, eye)
+    limb(D, "head", [2.0, 4.6 * s, 3.4], [-2.0, 7.6 * s, 6.8], 1.1, 0.12, plate)
+  })
+  cut_blob(D, "head", [6.6, 0.0, -1.4], [4.0, 4.0, 1.4], nil, mat(0x000000, 0x000000, {"blend": 0.6}))
+  blob(D, "head", [5.0, 0.0, -0.6], [3.4, 3.6, 0.8], nil, gums)
+  # teeth all round the upper jaw and the lower
+  for i in range(0, 9) {
+    let a = (i - 4) * 0.33
+    let x = 6.4 + cos(a) * 3.2
+    let y = sin(a) * 3.8
+    limb(D, "head", [x, y, -0.2], [x + 0.3, y * 1.02, -2.4], 0.42, 0.06, tooth)
+    limb(D, "jaw", [x - 1.0, y * 0.95, -0.6], [x - 0.8, y * 0.95, 1.4], 0.42, 0.06, tooth)
+  }
+  blob(D, "jaw", [4.0, 0.0, -1.6], [4.4, 4.4, 1.4], nil, flesh)
+  blob(D, "jaw", [4.4, 0.0, -0.8], [3.4, 3.6, 0.7], nil, gums)
+  sym(fn (p, s) {
+    limb(D, p + "fleg", [0.0, 0.0, 1.0], [0.0, 0.0, -11.0], 4.4, 3.2, flesh)
+    blob(D, p + "fleg", [0.6, 0.0, -3.5], [3.2, 3.0, 4.6], nil, flesh)
+    limb(D, p + "fshin", [0.0, 0.0, 0.5], [0.0, 0.0, -10.0], 3.0, 2.4, flesh)
+    limb(D, p + "fshin", [-1.4, 0.0, 0.0], [-1.2, 0.0, -8.0], 0.45, 0.35, tendon)
+    blob(D, p + "fpaw", [1.4, 0.0, -1.2], [3.0, 2.6, 1.6], nil, flesh)
+    for k in range(0, 3) { limb(D, p + "fpaw", [3.4, (k - 1) * 1.3, -1.2], [5.6, (k - 1) * 1.6, -2.4], 0.6, 0.08, claw) }
+    limb(D, p + "bleg", [0.0, 0.0, 1.0], [0.0, 0.0, -11.0], 4.6, 3.0, flesh)
+    blob(D, p + "bleg", [-0.8, 0.0, -3.0], [3.4, 3.0, 5.0], nil, flesh)
+    limb(D, p + "bshin", [0.0, 0.0, 0.5], [0.0, 0.0, -10.0], 2.8, 2.2, flesh)
+    blob(D, p + "bpaw", [1.4, 0.0, -1.2], [2.8, 2.4, 1.5], nil, flesh)
+    for k in range(0, 3) { limb(D, p + "bpaw", [3.2, (k - 1) * 1.2, -1.2], [5.2, (k - 1) * 1.5, -2.4], 0.55, 0.08, claw) }
+  })
+  limb(D, "tail0", [0.0, 0.0, 0.0], [-6.0, 0.0, 0.0], 2.4, 1.6, flesh)
+  limb(D, "tail1", [0.0, 0.0, 0.0], [-7.0, 0.0, 0.0], 1.6, 0.2, flesh)
+  limb(D, "tail0", [-2.0, 0.0, 2.0], [-4.0, 0.0, 4.0], 0.6, 0.08, plate)
+  # its motion: a trot (diagonal legs together), a lunge and bite, a flinch, a fall onto its side
+  let base = fn () {
+    let p = {}
+    for n in ["pelvis", "spine", "chest", "neck", "head", "jaw", "tail0", "tail1", "l_fleg", "l_fshin", "l_fpaw", "r_fleg", "r_fshin", "r_fpaw",
+              "l_bleg", "l_bshin", "l_bpaw", "r_bleg", "r_bshin", "r_bpaw"] { p[n] = [0.0e0, 0.0e0, 0.0e0] }
+    p.neck = [0.0e0, 8.0e0, 0.0e0]
+    p.head = [0.0e0, -6.0e0, 0.0e0]
+    p.tail0 = [0.0e0, 10.0e0, 0.0e0]
+    p.tail1 = [0.0e0, 8.0e0, 0.0e0]
+    for s in ["l_", "r_"] {
+      p[s + "fleg"] = [0.0e0, -8.0e0, s == "l_" ? 4.0e0 : -4.0e0]
+      p[s + "fshin"] = [0.0e0, 12.0e0, 0.0e0]
+      p[s + "fpaw"] = [0.0e0, -4.0e0, 0.0e0]
+      p[s + "bleg"] = [0.0e0, -14.0e0, s == "l_" ? 4.0e0 : -4.0e0]
+      p[s + "bshin"] = [0.0e0, 30.0e0, 0.0e0]
+      p[s + "bpaw"] = [0.0e0, -16.0e0, 0.0e0]
+    }
+    return p
+  }
+  sample_clip(D, "idle", 2.0e0, 10, fn (u) {
+    let p = base()
+    let b = sin(u * 2.0e0 * PI)
+    padd(p, "chest", 0.0e0, b * 2.0e0, 0.0e0)
+    padd(p, "head", sin(u * 2.0e0 * PI) * 10.0e0, b * 3.0e0, 0.0e0)
+    p.jaw = [0.0e0, 6.0e0 + b * 4.0e0, 0.0e0]
+    padd(p, "tail0", b * 15.0e0, 0.0e0, 0.0e0)
+    p.root_d = [0.0e0, 0.0e0, b * 0.5e0]
+    return p
+  })
+  sample_clip(D, "walk", 0.8e0, 16, fn (u) {
+    let p = base()
+    let s = sin(u * 2.0e0 * PI)
+    let c = cos(u * 2.0e0 * PI)
+    let legs = [["l_f", s], ["r_b", s], ["r_f", -s], ["l_b", -s]]
+    for lg in legs {
+      let k = lg[1]
+      let lift = max(0.0e0, k) * 38.0e0
+      let fr = slice(lg[0], 2, 3) == "f"
+      let pre = slice(lg[0], 0, 2)
+      if fr {
+        padd(p, pre + "fleg", 0.0e0, -k * 30.0e0, 0.0e0)
+        padd(p, pre + "fshin", 0.0e0, lift, 0.0e0)
+        padd(p, pre + "fpaw", 0.0e0, k * 30.0e0 - lift, 0.0e0)
+      } else {
+        padd(p, pre + "bleg", 0.0e0, -k * 30.0e0, 0.0e0)
+        padd(p, pre + "bshin", 0.0e0, lift, 0.0e0)
+        padd(p, pre + "bpaw", 0.0e0, k * 30.0e0 - lift, 0.0e0)
+      }
+    }
+    padd(p, "chest", s * 6.0e0, c * 3.0e0, s * 4.0e0)
+    padd(p, "head", -s * 6.0e0, -c * 5.0e0, 0.0e0)
+    padd(p, "tail0", -s * 20.0e0, 0.0e0, 0.0e0)
+    p.jaw = [0.0e0, 10.0e0 + abs(c) * 6.0e0, 0.0e0]
+    p.root_d = [0.0e0, 0.0e0, abs(s) * 1.6e0]
+    return p
+  })
+  sample_clip(D, "attack", 0.55e0, 12, fn (u) {
+    let p = base()
+    let crouch = ease(u / 0.35e0) * (1.0e0 - ease((u - 0.35e0) / 0.15e0))
+    let lunge = ease((u - 0.35e0) / 0.15e0) * (1.0e0 - ease((u - 0.65e0) / 0.35e0))
+    p.jaw = [0.0e0, 45.0e0 * ease(u / 0.4e0) * (1.0e0 - ease((u - 0.5e0) / 0.1e0)), 0.0e0]
+    padd(p, "neck", 0.0e0, 14.0e0 * crouch - 18.0e0 * lunge, 0.0e0)
+    padd(p, "head", 0.0e0, -20.0e0 * crouch + 10.0e0 * lunge, 0.0e0)
+    for s in ["l_", "r_"] {
+      padd(p, s + "bleg", 0.0e0, -20.0e0 * crouch + 25.0e0 * lunge, 0.0e0)
+      padd(p, s + "bshin", 0.0e0, 25.0e0 * crouch - 20.0e0 * lunge, 0.0e0)
+      padd(p, s + "fleg", 0.0e0, 15.0e0 * crouch - 35.0e0 * lunge, 0.0e0)
+    }
+    p.root_d = [-3.0e0 * crouch + 8.0e0 * lunge, 0.0e0, -3.0e0 * crouch + 1.5e0 * lunge]
+    return p
+  })
+  sample_clip(D, "pain", 0.4e0, 8, fn (u) {
+    let p = base()
+    let k = sin(u * PI)
+    padd(p, "neck", 12.0e0 * k, -20.0e0 * k, 0.0e0)
+    padd(p, "head", 15.0e0 * k, -18.0e0 * k, 10.0e0 * k)
+    p.jaw = [0.0e0, 30.0e0 * k, 0.0e0]
+    padd(p, "chest", 0.0e0, -6.0e0 * k, 8.0e0 * k)
+    p.root_d = [-3.0e0 * k, 0.0e0, 0.0e0]
+    return p
+  })
+  sample_clip(D, "die", 1.0e0, 14, fn (u) {
+    let p = base()
+    let fall = ease(u / 0.8e0)
+    let kick = sin(u * PI * 4.0e0) * (1.0e0 - u) * 18.0e0
+    p.pelvis = [0.0e0, 0.0e0, 84.0e0 * fall]
+    for s in ["l_", "r_"] {
+      padd(p, s + "fleg", 0.0e0, -30.0e0 * fall + kick, 0.0e0)
+      padd(p, s + "bleg", 0.0e0, 20.0e0 * fall - kick, 0.0e0)
+      padd(p, s + "fshin", 0.0e0, 20.0e0 * fall, 0.0e0)
+    }
+    padd(p, "neck", 0.0e0, 25.0e0 * fall, 0.0e0)
+    p.jaw = [0.0e0, 30.0e0 * fall, 0.0e0]
+    p.root_d = [0.0e0, 0.0e0, -hip * 0.72e0 * fall]
+    return p
+  })
+  return D
+}
+
+# ---- every design -----------------------------------------------------------------------------------------------------
+
+# design -> the monster types it stands for, how tall it stands, and whether it is drawn half-unseen (the spectre)
+let DESIGNS = {
+  "husk": {"types": [3004], "make": fn () { return husk(false) }},
+  "ravager": {"types": [9], "make": fn () { return husk(true) }},
+  "stalker": {"types": [3001], "make": stalker},
+  "hound": {"types": [3002, 58], "make": hound},
+  "warlord": {"types": [3003], "make": warlord}
+}
+
+fn designs_write() {
+  bestiary_tables()
+  let out = {}
+  for name in keys(DESIGNS) {
+    let D = DESIGNS[name].make()
+    out[name] = design_write(D)
+  }
+  sql("FLUSH TABLES")
+  return out
+}
+
+# Every design written, built into models and given its monster types (creature_model): what the game draws. Returns
+# what it made and how long it took.
+fn designs_install() {
+  let t0 = clock()
+  let made = designs_write()
+  for name in keys(DESIGNS) {
+    let r = bestiary_build(name)
+    for ty in DESIGNS[name].types {
+      model_map_creature(ty, r.model, {"height": 56.0, "idle": "idle", "walk": "walk", "attack": "attack", "pain": "pain", "die": "die",
+                                       "walk_speed": sql("SELECT walk_speed FROM creature_design WHERE design = '" + name + "'")[0].walk_speed,
+                                       "far": r.far})
+    }
+    made[name].tris = r.tris
+  }
+  sql("FLUSH TABLES")
+  return {"designs": made, "ms": clock() - t0}
+}

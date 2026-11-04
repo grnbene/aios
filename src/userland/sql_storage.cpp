@@ -113,6 +113,13 @@ constexpr size_t kPartHeader = 4 + 8 + 8 + 8 + 4 + 8 + 8;
 // the next checkpoint writes the table whole again (the parts fold in).
 constexpr size_t kPartMaxRowsFloor = 50000;    // appended rows a table may hold as parts, at least ...
 constexpr uint32_t kPartMaxCount = 64;         // ... and at most this many parts
+// ... and the file at most this much bigger than one plain copy of the table: parts bounded by rows alone let a
+// table of a few large values, replaced again and again (a model's mesh blobs on every rebuild), grow its file by
+// all of them each time - 10 rows were 38 MB for 5.8 MB live. Past it the table is written whole, the dead values
+// left behind.
+inline bool parts_within_bytes(uint64_t file_bytes, size_t plain_bytes) {
+  return file_bytes <= (uint64_t)plain_bytes + std::max<uint64_t>((uint64_t)1 << 20, (uint64_t)plain_bytes / 4);
+}
 inline bool table_has_comments(const SqlTable& t) {
   if (!t.comment.empty()) return true;
   for (const auto& col : t.columns) if (!col.comment.empty()) return true;
@@ -688,7 +695,7 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     // tripled the process's memory). The same bounds as appended rows; past them it is written whole again.
     if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) && ops_parts_enabled() &&
         prev->second.seq != state.seq && prev->second.shape == state.shape && prev->second.file_bytes > 0 &&
-        prev->second.parts < kPartMaxCount) {
+        prev->second.parts < kPartMaxCount && parts_within_bytes(prev->second.file_bytes, prev->second.bytes)) {
       std::lock_guard<aios::hal::Mutex> jl(*t.journal_mu);
       const SqlTable::ChangeJournal& j = t.journal;
       const size_t ncols = t.col_data.size();
@@ -776,7 +783,7 @@ Result<void> SqlDatabase::snapshot_tables_v4(CheckpointImage& img) {
     if (!force_whole && prev != saved_tables_.end() && !dense && !unpacked_tables_.count(kv.first) &&
         prev->second.seq != state.seq && state.rows > prev->second.rows && prev->second.shape == state.shape &&
         (prev->second.layout == t.layout_seq || only_appended()) &&
-        prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount &&
+        prev->second.file_bytes > 0 && prev->second.parts < kPartMaxCount && parts_within_bytes(prev->second.file_bytes, prev->second.bytes) &&
         prev->second.part_rows + (state.rows - prev->second.rows) <= std::max(kPartMaxRowsFloor, prev->second.base_rows / 4)) {
       auto st = kernel_.host().stat(dir + "/" + prev->second.file);
       if (st.ok() && (uint64_t)st->size == prev->second.file_bytes) {

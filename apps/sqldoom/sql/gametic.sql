@@ -2948,8 +2948,14 @@ BEGIN
         WHERE NOT w.solid AND w.tslope > w.bslope
           AND b.thing_top >= w.bslope AND b.thing_bot <= w.tslope
       ),
+      -- Free aim (the modern client's mouse look: player_state.view_pitch set): the shot goes where the player
+      -- looks, along the pitch's slope. Without it, Doom's autoaim: the nearest target in the slope window.
       aim AS (
         SELECT COALESCE((
+          SELECT TAN(RADIANS(LEAST(85.0, GREATEST(-85.0, fa.view_pitch))))
+          FROM player_state fa
+          WHERE fa.map_id = a_map_id::int AND fa.player_thing_id = a_player_thing_id::int AND fa.view_pitch IS NOT NULL
+        ), (
           SELECT v.aimslope
           FROM visible_aim_targets v
           ORDER BY v.priority, v.distance, v.thing_id
@@ -3440,6 +3446,9 @@ BEGIN
            RADIANS(t.angle::double precision) AS angle,
            wd.projectile_type,
            pd.speed::double precision AS speed,
+           -- free aim (the modern client's mouse look): the missile flies along the view's slope
+           CASE WHEN fa.view_pitch IS NULL THEN NULL
+                ELSE TAN(RADIANS(LEAST(85.0, GREATEST(-85.0, fa.view_pitch)))) END AS free_slope,
            -- A_FireMissile 20d8, A_FirePlasma 5d8, A_FireBFG 100d8, each keyed
            -- on the shot that fired it and on its own call site.
            pd.dmg_dice_mult
@@ -3455,6 +3464,7 @@ BEGIN
     JOIN projectile_defs pd ON pd.projectile_type=wd.projectile_type
     JOIN things t ON t.map_id=pw.map_id AND t.id=pw.player_thing_id
     LEFT JOIN render_things rt ON rt.map_id=t.map_id AND rt.thing_id=t.id
+    LEFT JOIN player_state fa ON fa.map_id=pw.map_id AND fa.player_thing_id=pw.player_thing_id
     WHERE pw.fired_this_tick
   ),
   targets AS (
@@ -3499,7 +3509,7 @@ BEGIN
      sector_id,state,age,damage,impact_player)
   SELECT map_id,projectile_id,player_thing_id,projectile_type,sx,sy,sz,
          speed*COS(angle),speed*SIN(angle),
-         speed*COALESCE((tz-sz)/NULLIF(along,0),0.0),
+         speed*COALESCE(free_slope,(tz-sz)/NULLIF(along,0),0.0),
          sector_id,'fly',0,damage::smallint,FALSE
   FROM numbered
   ON CONFLICT (map_id, projectile_id) DO UPDATE SET

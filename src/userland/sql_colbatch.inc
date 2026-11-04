@@ -9,6 +9,18 @@
 template <typename RowId>
 inline void colbatch_gather(const SqlTable& t, size_t c, SqlDataType dest, int dest_scale, RowId&& row_of, size_t n,
                             ColBatch::Col* out) {
+  // A table no row has been stored in yet has no column stores (a fresh CREATE TABLE): whatever rows there are
+  // (in the delta buffer) are read as cells. Reading col_data[c] there read past an empty vector - a SELECT of a
+  // new, empty table died with SIGSEGV.
+  if (c >= t.col_data.size()) {
+    out->kind = ColBatch::Text;
+    out->s.resize(n);
+    for (size_t r = 0; r < n; ++r) {
+      const size_t id = row_of(r);
+      out->s[r] = id == kNullRow ? sql_null() : t.cell(id, c);
+    }
+    return;
+  }
   const ColumnStore& cs = t.col_data[c];
   const bool whole = cs.size() == t.row_count();   // no rows in a delta buffer
   const bool col_temporal = c < t.columns.size() && t.columns[c].temporal;

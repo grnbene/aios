@@ -1,0 +1,257 @@
+# Models kept in ASQL: a model's skeleton (its nodes), its parts (vertex data as packed blobs), its textures (as their
+# PNG or JPEG bytes) and its animations (keyframe channels) are rows, read back by the renderer. glTF 2.0 files are
+# one way in (model_import_gltf); models built in AIOS itself go into the same tables. creature_model says which
+# model a monster type is drawn as and which of its animations play for what the monster is doing.
+#
+#   model_tables()                                   the tables, if they are not there
+#   model_import_gltf(path, name)                    -> model_id: a .glb (or a .gltf with embedded buffers) stored
+#   model_load(t, model_id, tex_base)                -> {model, anims: {name: anim id}, height}: on the r3d target
+#   model_map_creature(thing_type, model_id, cfg)    a monster type drawn as that model (cfg: heights, animations)
+
+let MODEL_SQL = [
+  "CREATE TABLE IF NOT EXISTS model (model_id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, source TEXT, up CHAR(1) NOT NULL DEFAULT 'y')",
+  # a node of the skeleton: its parent (NULL at a root) and its rest transform in the parent's space
+  "CREATE TABLE IF NOT EXISTS model_node (model_id INT NOT NULL, node_id INT NOT NULL, parent INT NULL, name TEXT, " +
+    "tx DOUBLE NOT NULL, ty DOUBLE NOT NULL, tz DOUBLE NOT NULL, rx DOUBLE NOT NULL, ry DOUBLE NOT NULL, rz DOUBLE NOT NULL, rw DOUBLE NOT NULL, " +
+    "sx DOUBLE NOT NULL, sy DOUBLE NOT NULL, sz DOUBLE NOT NULL, PRIMARY KEY (model_id, node_id))",
+  # the skin's joints in order (what a vertex's joint numbers mean) and each one's inverse bind matrix (16 float32)
+  "CREATE TABLE IF NOT EXISTS model_joint (model_id INT NOT NULL, joint_id INT NOT NULL, node_id INT NOT NULL, inv_bind LONGBLOB NOT NULL, " +
+    "PRIMARY KEY (model_id, joint_id))",
+  "CREATE TABLE IF NOT EXISTS model_texture (model_id INT NOT NULL, texture_id INT NOT NULL, image LONGBLOB NOT NULL, " +
+    "PRIMARY KEY (model_id, texture_id))",
+  # a part: drawn at its node (or by the skin), its material's colour and texture, its vertices packed
+  # (positions, normals: float32 xyz; uvs: float32 uv; joints: uint32 x4; weights: float32 x4; indices: uint32)
+  "CREATE TABLE IF NOT EXISTS model_prim (model_id INT NOT NULL, prim_id INT NOT NULL, node_id INT NOT NULL, skinned BOOLEAN NOT NULL, " +
+    "texture_id INT NULL, cr DOUBLE NOT NULL, cg DOUBLE NOT NULL, cb DOUBLE NOT NULL, ca DOUBLE NOT NULL, vertex_count INT NOT NULL, " +
+    "positions LONGBLOB NOT NULL, normals LONGBLOB NULL, uvs LONGBLOB NULL, joints LONGBLOB NULL, weights LONGBLOB NULL, indices LONGBLOB NOT NULL, " +
+    "colors LONGBLOB NULL, mats LONGBLOB NULL, PRIMARY KEY (model_id, prim_id))",
+  # (a sculpted part's own colour and its shine and glow, a vertex each: float32 rgb, float32 shine glow)
+  "ALTER TABLE model_prim ADD COLUMN IF NOT EXISTS colors LONGBLOB NULL",
+  "ALTER TABLE model_prim ADD COLUMN IF NOT EXISTS mats LONGBLOB NULL",
+  "CREATE TABLE IF NOT EXISTS model_anim (model_id INT NOT NULL, anim_id INT NOT NULL, name VARCHAR(64) NOT NULL, duration DOUBLE NOT NULL, " +
+    "PRIMARY KEY (model_id, anim_id))",
+  "CREATE TABLE IF NOT EXISTS model_channel (model_id INT NOT NULL, anim_id INT NOT NULL, channel_id INT NOT NULL, node_id INT NOT NULL, " +
+    "path VARCHAR(16) NOT NULL, interp VARCHAR(16) NOT NULL, times LONGBLOB NOT NULL, vals LONGBLOB NOT NULL, PRIMARY KEY (model_id, anim_id, channel_id))",
+  # a monster type drawn as a model: how tall it stands (units), which way the model faces (degrees, added), the
+  # animation for each thing it does, and how far a walk cycle carries it (units a second of the walk animation)
+  "CREATE TABLE IF NOT EXISTS creature_model (thing_type INT PRIMARY KEY, model_id INT NOT NULL, height DOUBLE NOT NULL, yaw DOUBLE NOT NULL DEFAULT 0, " +
+    "idle VARCHAR(64) NULL, walk VARCHAR(64) NULL, attack VARCHAR(64) NULL, pain VARCHAR(64) NULL, die VARCHAR(64) NULL, " +
+    "walk_speed DOUBLE NOT NULL DEFAULT 60)",
+  # the lighter model drawn when it is far off (NULL: the same one)
+  "ALTER TABLE creature_model ADD COLUMN IF NOT EXISTS far_model_id INT NULL"
+]
+
+fn model_tables() { for q in MODEL_SQL { sql(q) } }
+
+fn mq_lit(v) {
+  if v == nil { return "NULL" }
+  let ty = type(v)
+  if ty == "bytes" { return "X'" + bytes_hex(v) + "'" }
+  if ty == "bool" { return v ? "TRUE" : "FALSE" }
+  if ty == "string" { return "'" + replace(v, "'", "''") + "'" }
+  if ty == "real" or ty == "decimal" { return str(v * 1.0e0) + (index_of(str(v * 1.0e0), "e") >= 0 or index_of(str(v * 1.0e0), "n") >= 0 ? "" : "e0") }
+  return str(v)
+}
+fn mq_insert(table, cols, vals) {
+  let lits = []
+  for v in vals { push(lits, mq_lit(v)) }
+  sql("INSERT INTO " + table + " (" + cols + ") VALUES (" + join(lits, ", ") + ")")
+}
+
+# A node's rest transform as t r s, from its translation/rotation/scale or its matrix (column-major, no shear).
+fn node_trs(n) {
+  let m = get(n, "matrix", nil)
+  if m == nil {
+    return {"t": get(n, "translation", [0.0, 0.0, 0.0]), "r": get(n, "rotation", [0.0, 0.0, 0.0, 1.0]), "s": get(n, "scale", [1.0, 1.0, 1.0])}
+  }
+  let sx = sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2])
+  let sy = sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6])
+  let sz = sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10])
+  # the rotation's rows from the normalised columns
+  let r00 = m[0] / sx
+  let r10 = m[1] / sx
+  let r20 = m[2] / sx
+  let r01 = m[4] / sy
+  let r11 = m[5] / sy
+  let r21 = m[6] / sy
+  let r02 = m[8] / sz
+  let r12 = m[9] / sz
+  let r22 = m[10] / sz
+  let tr = r00 + r11 + r22
+  let q = nil
+  if tr > 0 {
+    let k = sqrt(tr + 1.0) * 2.0
+    q = [(r21 - r12) / k, (r02 - r20) / k, (r10 - r01) / k, 0.25 * k]
+  } else if r00 > r11 and r00 > r22 {
+    let k = sqrt(1.0 + r00 - r11 - r22) * 2.0
+    q = [0.25 * k, (r01 + r10) / k, (r02 + r20) / k, (r21 - r12) / k]
+  } else if r11 > r22 {
+    let k = sqrt(1.0 + r11 - r00 - r22) * 2.0
+    q = [(r01 + r10) / k, 0.25 * k, (r12 + r21) / k, (r02 - r20) / k]
+  } else {
+    let k = sqrt(1.0 + r22 - r00 - r11) * 2.0
+    q = [(r02 + r20) / k, (r12 + r21) / k, 0.25 * k, (r10 - r01) / k]
+  }
+  return {"t": [m[12], m[13], m[14]], "r": q, "s": [sx, sy, sz]}
+}
+
+# A .glb (or .gltf with embedded buffers) stored as model `name`; returns its model_id. A model of that name already
+# there is replaced.
+fn model_import_gltf(path, name) {
+  model_tables()
+  let g = gltf_read(read_bytes(path))
+  let j = g.json
+  let old = sql("SELECT model_id FROM model WHERE name = " + mq_lit(name))
+  let id = 0
+  if len(old) > 0 {
+    id = old[0].model_id
+    for tb in ["model_node", "model_joint", "model_texture", "model_prim", "model_anim", "model_channel", "model"] {
+      sql("DELETE FROM " + tb + " WHERE model_id = " + str(id))
+    }
+  } else {
+    id = sql("SELECT COALESCE(MAX(model_id), 0) + 1 AS n FROM model")[0].n
+  }
+  mq_insert("model", "model_id, name, source, up", [id, name, path, "y"])
+  # the nodes, each with its parent (glTF lists children)
+  let parent = {}
+  let nodes = j.nodes
+  for i in range(0, len(nodes)) { for c in get(nodes[i], "children", []) { parent[str(c)] = i } }
+  for i in range(0, len(nodes)) {
+    let n = nodes[i]
+    let trs = node_trs(n)
+    mq_insert("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
+              [id, i, get(parent, str(i), nil), get(n, "name", nil), trs.t[0] * 1.0, trs.t[1] * 1.0, trs.t[2] * 1.0,
+               trs.r[0] * 1.0, trs.r[1] * 1.0, trs.r[2] * 1.0, trs.r[3] * 1.0, trs.s[0] * 1.0, trs.s[1] * 1.0, trs.s[2] * 1.0])
+  }
+  # the first skin's joints
+  let skins = get(j, "skins", [])
+  if len(skins) > 0 {
+    let sk = skins[0]
+    let ib = get(sk, "inverseBindMatrices", nil)
+    let mats = ib == nil ? nil : gltf_accessor(g.model, ib).data
+    for k in range(0, len(sk.joints)) {
+      let m = bytes(64)
+      if mats == nil {
+        for d in [0, 5, 10, 15] { bytes_set(m, d * 4, "f32le", 1.0) }
+      } else {
+        bytes_copy(m, 0, mats, k * 64, 64)
+      }
+      mq_insert("model_joint", "model_id, joint_id, node_id, inv_bind", [id, k, sk.joints[k], m])
+    }
+  }
+  # textures: each glTF texture's image, as its file bytes
+  let texs = get(j, "textures", [])
+  for k in range(0, len(texs)) {
+    let src = get(texs[k], "source", nil)
+    if src == nil { continue }
+    mq_insert("model_texture", "model_id, texture_id, image", [id, k, gltf_image(g.model, src).data])
+  }
+  # the parts: every primitive of every node with a mesh
+  let prim_id = 0
+  for ni in range(0, len(nodes)) {
+    let n = nodes[ni]
+    let mi = get(n, "mesh", nil)
+    if mi == nil { continue }
+    let skinned = get(n, "skin", nil) != nil and len(skins) > 0
+    for p in j.meshes[mi].primitives {
+      let mode = get(p, "mode", 4)
+      if mode != 4 { error(format("model_import_gltf(): {}: a primitive of mode {} (only triangles are read)", path, mode)) }
+      let at = p.attributes
+      let pos = gltf_accessor(g.model, at.POSITION)
+      let acc = fn (k) { return get(at, k, nil) == nil ? nil : gltf_accessor(g.model, at[k]).data }
+      let indices = get(p, "indices", nil) == nil ? nil : gltf_accessor(g.model, p.indices).data
+      if indices == nil {
+        indices = bytes(pos.count * 4)
+        for v in range(0, pos.count) { bytes_set(indices, v * 4, "u32le", v) }
+      }
+      let col = [1.0, 1.0, 1.0, 1.0]
+      let tex = nil
+      let mat = get(p, "material", nil)
+      if mat != nil {
+        let pbr = get(j.materials[mat], "pbrMetallicRoughness", {})
+        col = get(pbr, "baseColorFactor", col)
+        let bt = get(pbr, "baseColorTexture", nil)
+        if bt != nil { tex = bt.index }
+      }
+      mq_insert("model_prim", "model_id, prim_id, node_id, skinned, texture_id, cr, cg, cb, ca, vertex_count, positions, normals, uvs, joints, weights, indices",
+                [id, prim_id, ni, skinned, tex, col[0] * 1.0, col[1] * 1.0, col[2] * 1.0, col[3] * 1.0, pos.count, pos.data,
+                 acc("NORMAL"), acc("TEXCOORD_0"), skinned ? acc("JOINTS_0") : nil, skinned ? acc("WEIGHTS_0") : nil, indices])
+      prim_id = prim_id + 1
+    }
+  }
+  # animations: each channel's keys and values
+  let anims = get(j, "animations", [])
+  for ai in range(0, len(anims)) {
+    let a = anims[ai]
+    let dur = 0.0
+    for ci in range(0, len(a.channels)) {
+      let ch = a.channels[ci]
+      let node = get(ch.target, "node", nil)
+      if node == nil { continue }
+      let path2 = ch.target.path
+      if path2 != "translation" and path2 != "rotation" and path2 != "scale" { continue }
+      let smp = a.samplers[ch.sampler]
+      let times = gltf_accessor(g.model, smp.input)
+      let vals = gltf_accessor(g.model, smp.output)
+      for k in range(0, times.count) { dur = max(dur, bytes_get(times.data, k * 4, "f32le")) }
+      mq_insert("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals",
+                [id, ai, ci, node, path2, get(smp, "interpolation", "LINEAR"), times.data, vals.data])
+    }
+    mq_insert("model_anim", "model_id, anim_id, name, duration", [id, ai, get(a, "name", format("anim{}", ai)), dur])
+  }
+  # checkpointed: what is written stays when the program ends
+  sql("FLUSH TABLES")
+  return id
+}
+
+# Model model_id from ASQL onto r3d target t, as r3d model model_id; its textures from tex_base on. Returns
+# {model, anims: {name: anim id}, height (in its own units: what a creature's height is scaled from)}.
+fn model_load(t, model_id, tex_base) {
+  let m = sql(format("SELECT model_id, up FROM model WHERE model_id = {}", model_id))
+  if len(m) == 0 { error(format("model_load(): no model {}", model_id)) }
+  for tx in sql(format("SELECT texture_id, image FROM model_texture WHERE model_id = {}", model_id)) {
+    let cv = image_decode(tx.image)
+    r3d_texture_rgba(t, tex_base + tx.texture_id, canvas_width(cv), canvas_height(cv), canvas_to_bytes(cv, "argb"), "argb")
+  }
+  let nodes = []
+  for n in sql(format("SELECT node_id, parent, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz FROM model_node WHERE model_id = {} ORDER BY node_id", model_id)) {
+    push(nodes, {"parent": n.parent == nil ? -1 : n.parent, "t": [n.tx, n.ty, n.tz], "r": [n.rx, n.ry, n.rz, n.rw], "s": [n.sx, n.sy, n.sz]})
+  }
+  let joints = []
+  let parts = []
+  for jr in sql(format("SELECT node_id, inv_bind FROM model_joint WHERE model_id = {} ORDER BY joint_id", model_id)) {
+    push(joints, jr.node_id)
+    push(parts, jr.inv_bind)
+  }
+  # (a BLOB comes back as a string of its bytes)
+  let inv = join(parts, "")
+  let prims = []
+  for p in sql(format("SELECT * FROM model_prim WHERE model_id = {} ORDER BY prim_id", model_id)) {
+    push(prims, {"node": p.node_id, "skinned": p.skinned == 1, "tex": p.texture_id == nil ? -1 : tex_base + p.texture_id,
+                 "color": [p.cr, p.cg, p.cb, p.ca], "positions": p.positions, "normals": p.normals, "uvs": p.uvs,
+                 "joints": p.joints, "weights": p.weights, "indices": p.indices, "colors": p.colors, "mats": p.mats})
+  }
+  let r = r3d_model(t, model_id, {"nodes": nodes, "joints": joints, "inv_bind": inv, "prims": prims, "up": m[0].up, "scale": 1.0})
+  let anims = {}
+  for a in sql(format("SELECT anim_id, name FROM model_anim WHERE model_id = {} ORDER BY anim_id", model_id)) {
+    let chans = []
+    for c in sql(format("SELECT node_id, path, interp, times, vals FROM model_channel WHERE model_id = {} AND anim_id = {} ORDER BY channel_id", model_id, a.anim_id)) {
+      push(chans, {"node": c.node_id, "path": c.path, "interp": c.interp, "times": c.times, "vals": c.vals})
+    }
+    r3d_anim(t, model_id, a.anim_id, chans)
+    anims[a.name] = a.anim_id
+  }
+  return {"model": model_id, "anims": anims, "height": r.height, "tris": r.tris}
+}
+
+# Monster type thing_type drawn as model model_id: cfg {height (units it stands), yaw (degrees the model is turned),
+# idle, walk, attack, pain, die (its animations' names), walk_speed (units one second of the walk carries it), far (a
+# lighter model for far off)}.
+fn model_map_creature(thing_type, model_id, cfg) {
+  model_tables()
+  sql(format("DELETE FROM creature_model WHERE thing_type = {}", thing_type))
+  mq_insert("creature_model", "thing_type, model_id, height, yaw, idle, walk, attack, pain, die, walk_speed, far_model_id",
+            [thing_type, model_id, get(cfg, "height", 56.0) * 1.0, get(cfg, "yaw", 0.0) * 1.0, get(cfg, "idle", nil), get(cfg, "walk", nil),
+             get(cfg, "attack", nil), get(cfg, "pain", nil), get(cfg, "die", nil), get(cfg, "walk_speed", 60.0) * 1.0, get(cfg, "far", nil)])
+  sql("FLUSH TABLES")
+}

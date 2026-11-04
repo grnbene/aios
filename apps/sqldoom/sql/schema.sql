@@ -906,6 +906,8 @@ CREATE TABLE IF NOT EXISTS player_state (
   death_tics       INT NOT NULL DEFAULT 0,
   killer_id        INT,
   sprite_frame     CHAR(1) NOT NULL DEFAULT 'A',
+  -- the modern client's look up or down (degrees; NULL: Doom's own autoaim): the slope shots and missiles go at
+  view_pitch       DOUBLE NULL,
   PRIMARY KEY (map_id, player_thing_id)
 );
 

@@ -3,6 +3,8 @@
 # filled by the r3d builtins at the target's own size. Replaces the 320x200 SQL software renderer for play.gr's
 # modern mode (sql/renderer.sql stays the classic one).
 import { build_ssector_tris, ensure_ssector_tris_table } from "flats.gr"
+import { model_tables, model_load } from "models.gr"
+import { designs_install } from "bestiary_designs.gr"
 
 # A number as a DOUBLE literal (12.5e0): `SET @x = 12.5` would be a DECIMAL, which the frame's arithmetic then
 # works out exactly, row by row.
@@ -18,7 +20,7 @@ fn r3d_doom_open(here, map_id, w, h) {
   let t = r3d_target(w, h)
   # Doom's pixels are 1.2 times as tall as wide (320x200 on a 4:3 screen): the same here, so the world keeps its
   # proportions, and the horizontal field of view stays Doom's 90 degrees
-  r3d_options(t, {"y_scale": 1.2, "bilinear": true, "mipmaps": true})
+  r3d_options(t, {"y_scale": 1.2, "bilinear": true, "mipmaps": true, "upscale": int(env("SQLDOOM_UPSCALE", "1"))})
   let pal = bytes(768)
   for c in sql("SELECT palette_index, r, g, b FROM colormap_rgb WHERE pal = 0 AND level = 0 ORDER BY palette_index") {
     bytes_set(pal, c.palette_index * 3, "u8", c.r)
@@ -42,6 +44,54 @@ fn r3d_doom_open(here, map_id, w, h) {
     r3d_texture(t, 20000 + s.lump_id, d.w, d.h, s.pixels, pal, s.mask)
     n = n + 1
   }
+  # every sprite frame, for what is drawn as a picture (items, decorations, effects, projectiles): its eight views,
+  # or its one
+  let sets = {}
+  let views = {}
+  for f in sql("SELECT sf.sprite, sf.frame, sf.rotation, sf.flipped, sf.left_offset, sf.top_offset, sl.lump_id " +
+               "FROM sprite_frames sf JOIN sprite_lumps sl ON sl.lump_name = sf.lump_name ORDER BY sf.sprite, sf.frame, sf.rotation") {
+    let k = f.sprite + f.frame
+    if get(views, k, nil) == nil { views[k] = [] }
+    push(views[k], {"rot": f.rotation, "tex": 20000 + f.lump_id, "flip": f.flipped == 1, "left": f.left_offset, "top": f.top_offset})
+  }
+  let next_set = 1
+  for k in keys(views) {
+    let vs = views[k]
+    let use = []
+    if len(vs) >= 8 {
+      for r in range(1, 9) { for v in vs { if v.rot == r { push(use, v); break } } }
+    }
+    if len(use) != 8 { use = [vs[0]] }
+    r3d_sprite_set(t, next_set, use)
+    sets[k] = next_set
+    next_set = next_set + 1
+  }
+  # the monsters: models kept in ASQL (creature_model; lib/models.gr), each loaded once. The bestiary's own
+  # (lib/bestiary_designs.gr) are built into the database the first time.
+  model_tables()
+  if len(sql("SELECT thing_type FROM creature_model WHERE thing_type = 3004")) == 0 {
+    let made = designs_install()
+    print(format("3d renderer: the bestiary built into ASQL in {:.0f} ms", made.ms))
+  }
+  let models = {}
+  let loaded = {}
+  for cm in sql("SELECT thing_type, model_id, height, yaw, idle, walk, attack, pain, die, walk_speed, far_model_id FROM creature_model") {
+    let key = str(cm.model_id)
+    if get(loaded, key, nil) == nil { loaded[key] = model_load(t, cm.model_id, 60000 + cm.model_id * 100) }
+    let L = loaded[key]
+    let far_id = cm.far_model_id == nil ? cm.model_id : cm.far_model_id
+    if get(loaded, str(far_id), nil) == nil { loaded[str(far_id)] = model_load(t, far_id, 60000 + far_id * 100) }
+    let pick = fn (name, fallback) { return name != nil and get(L.anims, name, nil) != nil ? L.anims[name] : fallback }
+    let walk = pick(cm.walk, -1)
+    let idle = pick(cm.idle, walk)
+    # the bestiary's models stand their own height; an imported one is scaled to the monster's
+    let scale = cm.model_id == far_id or abs(L.height - cm.height) > 12.0e0 ? cm.height / max(0.001e0, L.height) : 1.0e0
+    models[str(cm.thing_type)] = {"model": cm.model_id, "far": far_id, "scale": scale, "yaw": cm.yaw * 1.0e0,
+      "fuzz": cm.thing_type == 58,
+      "idle": idle, "walk": walk, "attack": pick(cm.attack, idle), "pain": pick(cm.pain, idle), "die": pick(cm.die, -1),
+      "walk_speed": cm.walk_speed * 1.0e0, "idle_moves": cm.idle != nil}
+    print(format("3d renderer: monster type {} drawn as model {} ({} triangles)", cm.thing_type, cm.model_id, L.tris))
+  }
   let sky = sql(format("SELECT wm.tex_id FROM maps m JOIN walltex_meta wm ON wm.name = m.sky_texture WHERE m.map_id = {}", map_id))
   # floors and ceilings: the subsectors' polygons, worked out once a map and checkpointed
   ensure_ssector_tris_table()
@@ -52,33 +102,158 @@ fn r3d_doom_open(here, map_id, w, h) {
     built = true
   }
   print(format("3d renderer: {} textures{}, {:.0f} ms", n, built ? ", floors triangulated" : "", clock() - t0))
+  let common = read_file(path_join(here, "sql/client/scene_common.sql"))
   return {"t": t, "w": w, "h": h, "map_id": map_id, "sky": len(sky) > 0 ? sky[0].tex_id : nil,
-          "geo": read_file(path_join(here, "sql/client/geometry.sql")),
+          "sets": sets, "anims": {}, "models": models,
+          "geo": common + read_file(path_join(here, "sql/client/geometry.sql")),
+          "things": common + read_file(path_join(here, "sql/client/things.sql")),
           "psprite": read_file(path_join(here, "sql/client/psprite.sql")),
           "canvas": canvas_create(w, h), "tris": 0, "sql_ms": 0.0, "fill_ms": 0.0}
 }
 
 # A tic's scene, worked out in SQL: run by the tic's worker (play.gr) right after the tic, so no frame waits on the
 # database. `sq` is the SQL call to use (the worker's own), pose the camera at the tic (x, y, z eye, angle in
-# degrees), tic the gameplay clock. Returns the triangles (world points, sql/client/geometry.sql) and the weapon's
-# layers (sql/client/psprite.sql) for r3d_doom_draw.
-fn r3d_doom_scene(sq, geo, psprite, map_id, player, skill, pose, tic) {
+# degrees), tic the gameplay clock. Returns the walls and floors (sql/client/geometry.sql), what stands in the
+# world (sql/client/things.sql) and the weapon's layers (sql/client/psprite.sql) for r3d_doom_draw.
+fn r3d_doom_scene(sq, geo, things, psprite, map_id, player, skill, pose, tic) {
   sq(format("SET @map_id = {}, @player_thing_id = {}, @skill = {}, @x = {}, @y = {}, @z = {}, @angle = {}, @tic = {}",
             map_id, player, skill, r3d_dbl(pose.x), r3d_dbl(pose.y), r3d_dbl(pose.z), r3d_dbl(pose.angle), int(tic)))
   let t0 = clock()
   let tris = sq(geo)
+  let th = sq(things)
   let weapon = sq(psprite)
-  return {"map_id": map_id, "tris": tris, "weapon": weapon, "sql_ms": clock() - t0}
+  return {"map_id": map_id, "tris": tris, "things": th, "weapon": weapon, "sql_ms": clock() - t0}
+}
+
+# A monster's animation state, carried from frame to frame: how far it has walked (its stride follows the ground it
+# covers), how fast (smoothed: a creature that stops, settles), what it is doing and since when.
+fn thing_anim(prev, state, x, y, now_s) {
+  if prev == nil { return {"state": state, "since": now_s - 10.0e0, "phase": 0.0e0, "x": x, "y": y, "moved": 0.0e0, "t": now_s} }
+  let a = prev
+  let dx = x - a.x
+  let dy = y - a.y
+  let step = sqrt(dx * dx + dy * dy)
+  if step > 64.0e0 { step = 0.0e0 }   # a teleport is not a stride
+  let dt = max(0.001e0, now_s - a.t)
+  a.moved = a.moved * 0.85e0 + (step / dt) * 0.15e0
+  a.phase = a.phase + step
+  a.x = x
+  a.y = y
+  a.t = now_s
+  if state != a.state {
+    a.state = state
+    a.since = now_s
+  }
+  return a
+}
+
+fn lerp_angle(a, b, k) {
+  let d = b - a + 180.0e0
+  d = d - 360.0e0 * floor(d / 360.0e0) - 180.0e0
+  return a + d * k
+}
+
+# What stands in the world this frame, for r3d_draw_tex: each thing where it is between the last two tics (alpha
+# of the way from prev's to scene's), a creature posed for what it is doing (its animation carried in st.anims), the
+# rest their sprite frames.
+fn r3d_doom_things(st, scene, prev, alpha, pose, now_s) {
+  let before = {}
+  if prev != nil and prev.map_id == scene.map_id {
+    for r in prev.things { before[str(r.thing_id)] = r }
+  }
+  let rad = pose.angle * 3.141592653589793e0 / 180.0e0
+  let fx = cos(rad)
+  let fy = sin(rad)
+  let out = []
+  let seen = {}
+  for r in scene.things {
+    let id = str(r.thing_id)
+    let x = r.x * 1.0e0
+    let y = r.y * 1.0e0
+    let z = r.z * 1.0e0
+    let ang = r.angle * 1.0e0
+    let b = get(before, id, nil)
+    if b != nil {
+      let dx = x - b.x
+      let dy = y - b.y
+      # a thing that moved further than anything walks in a tic was put there (a teleport, a respawn): no slide
+      if dx * dx + dy * dy < 128.0e0 * 128.0e0 {
+        x = b.x + dx * alpha
+        y = b.y + dy * alpha
+        z = b.z * 1.0e0 + (z - b.z) * alpha
+        ang = lerp_angle(b.angle * 1.0e0, ang, alpha)
+      }
+    }
+    let light = r.light == nil ? 160 : r.light
+    let flags = (r.fullbright == 1 ? 2 : 0) + (r.fuzz == 1 ? 8 : 0)
+    let md = r.type == nil ? nil : get(st.models, str(r.type), nil)
+    if md != nil {
+      seen[id] = true
+      let prev_a = get(st.anims, id, nil)
+      let prev_state = prev_a == nil ? nil : prev_a.state
+      let prev_since = prev_a == nil ? now_s : prev_a.since
+      let a = thing_anim(prev_a, r.state, x, y, now_s)
+      st.anims[id] = a
+      let ex = x - pose.x
+      let ey = y - pose.y
+      if ex * fx + ey * fy < -80.0e0 { continue }
+      let far = ex * ex + ey * ey > 420.0e0 * 420.0e0
+      push(out, model_instance(md, a, r.state, x, y, z, ang, light, now_s, prev_state, prev_since, far))
+      continue
+    }
+    # anything else: its sprite frame, turned to the eye
+    let set = get(st.sets, r.sprite + r.frame, nil)
+    if set == nil { continue }
+    push(out, {"set": set, "x": x, "y": y, "z": z, "angle": ang, "light": light, "flags": flags})
+  }
+  # creatures gone from the scene (picked up, removed) forget their animation
+  for k in keys(st.anims) { if get(seen, k, nil) == nil { del(st.anims, k) } }
+  return out
+}
+
+# The animation a model plays for what its thing is doing, and when in it: a walk by the ground it has covered (its
+# feet keep pace), the rest from when it began (a death once, then held). Returns [anim, time, hold].
+fn model_anim_for(md, a, state, now_s) {
+  let since = now_s - a.since
+  if state == "see" or state == "stand" {
+    if a.moved > 6.0e0 and md.walk >= 0 { return [md.walk, a.phase / md.walk_speed, false] }
+    return [md.idle, md.idle_moves ? now_s : 0.0e0, md.idle_moves ? false : true]
+  }
+  if state == "missile" { return [md.attack, since, false] }
+  if state == "pain" { return [md.pain, since, false] }
+  if state == "die" or state == "xdeath" { return [md.die, since, true] }
+  if state == "dead" { return [md.die, 1000.0e0, true] }
+  return [md.idle, now_s, false]
+}
+
+# A thing drawn as its model: posed by its animation, cross-faded for 0.2 s from what it was doing before.
+fn model_instance(md, a, state, x, y, z, ang, light, now_s, prev_state, prev_since, far) {
+  let cur = model_anim_for(md, a, state, now_s)
+  let inst = {"model": far ? md.far : md.model, "anim": cur[0], "time": cur[1], "hold": cur[2], "scale": md.scale,
+              "x": x, "y": y, "z": z, "angle": ang + md.yaw, "light": light, "flags": md.fuzz ? 8 : 0}
+  let fade = 1.0e0 - (now_s - a.since) / 0.2e0
+  if fade > 0.0e0 and prev_state != nil and prev_state != state {
+    let old = {"state": prev_state, "since": prev_since, "moved": a.moved, "phase": a.phase}
+    let was = model_anim_for(md, old, prev_state, a.since)
+    inst.anim2 = was[0]
+    inst.time2 = was[1]
+    inst.hold2 = was[2]
+    inst.mix = fade
+  }
+  return inst
 }
 
 # One frame into state.canvas: a tic's scene (r3d_doom_scene) seen from the camera where it is now (x, y, z eye,
-# angle in degrees) - natively, no SQL.
-fn r3d_doom_draw(st, scene, pose) {
+# angle in degrees), what stands in it alpha of the way from the tic before (prev, or nil) - natively, no SQL.
+fn r3d_doom_draw(st, scene, prev, alpha, pose, now_s) {
   let t = st.t
   let t1 = clock()
+  r3d_options(t, {"time": now_s})
+  let things = r3d_doom_things(st, scene, prev, alpha, pose, now_s)
   # the scene, then the sky where the scene left nothing (r3d_sky reads the depth)
   if st.sky != nil { r3d_clear_depth(t) } else { r3d_clear(t, 0) }
-  r3d_draw_tex(t, scene.tris, 90, {"x": pose.x * 1.0e0, "y": pose.y * 1.0e0, "z": pose.z * 1.0e0, "angle": pose.angle * 1.0e0})
+  r3d_draw_tex(t, scene.tris, 90, {"x": pose.x * 1.0e0, "y": pose.y * 1.0e0, "z": pose.z * 1.0e0, "angle": pose.angle * 1.0e0,
+                                    "pitch": get(pose, "pitch", 0.0) * 1.0e0}, things)
   if st.sky != nil { r3d_sky(t, st.sky, pose.angle, 90) }
   # the weapon, on Doom's 320x200 screen scaled to the target
   let kx = st.w / 320.0e0

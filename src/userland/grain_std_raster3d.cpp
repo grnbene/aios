@@ -13,11 +13,16 @@
 //   r3d_pixels(t)                  -> the colour buffer as bytes, 4 a pixel (R, G, B, A), for canvas_set_pixels
 //   r3d_stats(t)                   -> {tris, filled, clipped, pixels}: the last draw's counts
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <optional>
 #include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "aios/userland/grain.hpp"
@@ -36,6 +41,16 @@ struct R3dTex {
   };
   std::vector<Level> mips;
   bool alpha = false;   // some texel is transparent
+  int scale = 1;        // texels per texel of the picture as given (r3d_options' upscale when it was uploaded)
+};
+
+// One view of a sprite frame: its picture (a texture id), mirrored or not, and where its origin is in it.
+struct R3dView { int64_t tex = 0; bool flip = false; double left = 0, top = 0; };
+
+// A sprite frame: one view (seen the same from everywhere) or eight (rotations 1..8: the viewer at the thing's
+// facing + 45 degrees each, counter-clockwise).
+struct R3dSet {
+  std::vector<R3dView> views;
 };
 
 struct R3dTarget {
@@ -51,6 +66,13 @@ struct R3dTarget {
   // 1 - c/32 - here not cut into 32 steps. light_gain scales how dark that gets, light_lift brightens all.
   double light_gain = 1.0, light_lift = 0.0, light_fall = 1280.0;
   double y_scale = 1.0;   // vertical pixels per horizontal one in projection (Doom's 320x200 on 4:3 is 1.2)
+  std::unordered_map<int64_t, R3dSet> sets;   // r3d_sprite_set's, by id
+  int upscale = 1;       // what r3d_texture enlarges a picture by (1, 2 or 4), with the pixel-art scaler
+  double focal = 1;      // the last r3d_draw_tex's focal length in pixels, for the fill's eye directions
+  double pitch = 0;      // the last r3d_draw_tex camera's pitch (radians): the sky follows it
+  double time = 0;       // seconds, for what moves on its own (a spectre's shimmer, liquids): r3d_options' time
+  std::unordered_map<int64_t, std::shared_ptr<struct R3dMesh>> meshes;   // r3d_mesh's, by id
+  std::unordered_map<int64_t, std::shared_ptr<struct R3dModel>> models;  // r3d_model's, by id
 };
 
 std::shared_ptr<R3dTarget> get_target(const Value& v, std::string& error, const char* who) {
@@ -297,8 +319,13 @@ Value bi_r3d_stats(Vm&, std::vector<Value>& args, std::string& error) {
 //   r3d_texture(t, id, w, h, indices, palette[, mask])  -> id
 //       a w x h picture of palette indices (bytes, row by row), its colours from palette (256 RGB triples, 768
 //       bytes); with mask (bytes, w x h), the texels it marks 0 are transparent. Kept with mipmaps.
-//   r3d_draw_tex(t, rows, fov_deg[, camera])             -> how many triangles were filled; with camera
-//       {x, y, z, angle} the rows are world points on Doom's map axes (x east, y north, z up), turned here
+//   r3d_draw_tex(t, rows, fov_deg[, camera[, things]])   -> how many triangles were filled; with camera
+//       {x, y, z, angle[, pitch]} the rows are world points on Doom's map axes (x east, y north, z up), turned here
+//       (pitch: degrees looking up, negative down).
+//       things (with a camera): maps {set, x, y, z, angle, light, flags} - a sprite frame (r3d_sprite_set) where
+//       a thing stands (z its feet), facing angle (degrees), lit light (0..255), flags 2 full bright, 8 fuzz: its
+//       picture upright facing the camera, the view of the eight for where the camera is. Turned here each frame,
+//       so a thing faces the eye as it is now; drawn with the rows, in the same passes.
 //       rows: maps with x0 y0 z0 u0 v0 .. x2 y2 z2 u2 v2 (camera space; u v in texels), tex (an id given to
 //       r3d_texture), light (0..255) and flags: 1 masked (transparent texels let through what is behind), 2 full
 //       bright (no light, no falloff), 4 clamp v (the texture is not repeated up or down: a masked middle texture),
@@ -307,7 +334,9 @@ Value bi_r3d_stats(Vm&, std::vector<Value>& args, std::string& error) {
 //       horizon, its rows down from the top of the view), wherever nothing has been drawn: call it after r3d_draw_tex
 //   r3d_blit(t, tex, x, y, w, h, light)                  -> t: the picture scaled to x, y, w, h on top of
 //       everything (a weapon), transparent texels skipped
-//   r3d_options(t, {bilinear, mipmaps, y_scale, light_gain, light_lift, light_fall}) -> t
+//   r3d_options(t, {bilinear, mipmaps, upscale, y_scale, light_gain, light_lift, light_fall}) -> t
+//       upscale (1, 2, 4): what the pictures r3d_texture is given from then on are enlarged by, with a pixel-art
+//       scaler (edges that run on a slant are followed, not stepped); their texel coordinates stay the picture's own
 //   r3d_clear_depth(t)                                   -> t, the depth emptied and the colour kept
 
 std::shared_ptr<R3dTex> tex_of(const R3dTarget& t, int64_t id) {
@@ -333,6 +362,52 @@ R3dTex::Level half_of(const R3dTex::Level& a) {
       }
       const uint32_t A = al / 4;
       b.px[(size_t)y * b.w + x] = n ? ((A << 24) | ((r / n) << 16) | ((g / n) << 8) | (bl / n)) : 0;
+    }
+  return b;
+}
+
+// The pixel-art scaler: a picture twice the size, each texel four, where a corner of the four takes its neighbour's
+// colour when an edge runs across that corner on a slant (Scale2x's rule - the two neighbours that meet at the
+// corner alike, the two across from them not) - so a staircase of texels becomes a straight slanted edge, and
+// everything else stays as it was drawn. "Alike" is close in brightness and hue (hq2x's limits: dithered texels
+// of one surface count as one colour), transparent alike with transparent only. Tiling pictures wrap at their
+// edges; one with transparent texels (a sprite) has nothing beyond its edge.
+namespace {
+inline bool alike(uint32_t a, uint32_t b) {
+  const bool ta = (a >> 24) < 128, tb = (b >> 24) < 128;
+  if (ta || tb) return ta == tb;
+  const int ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+  const int br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
+  const int y = std::abs((299 * (ar - br) + 587 * (ag - bg) + 114 * (ab - bb)) / 1000);
+  const int u = std::abs((-169 * (ar - br) - 331 * (ag - bg) + 500 * (ab - bb)) / 1000);
+  const int v = std::abs((500 * (ar - br) - 419 * (ag - bg) - 81 * (ab - bb)) / 1000);
+  return y <= 48 && u <= 7 && v <= 6;
+}
+}  // namespace
+
+R3dTex::Level scale2x(const R3dTex::Level& a, bool wrap) {
+  R3dTex::Level b;
+  b.w = a.w * 2;
+  b.h = a.h * 2;
+  b.px.resize((size_t)b.w * b.h);
+  auto at = [&](int x, int y) -> uint32_t {
+    if (wrap) { x = ((x % a.w) + a.w) % a.w; y = ((y % a.h) + a.h) % a.h; }
+    else if (x < 0 || y < 0 || x >= a.w || y >= a.h) return 0;
+    return a.px[(size_t)y * a.w + x];
+  };
+  for (int y = 0; y < a.h; ++y)
+    for (int x = 0; x < a.w; ++x) {
+      const uint32_t P = at(x, y), A = at(x, y - 1), B = at(x + 1, y), C = at(x - 1, y), D = at(x, y + 1);
+      uint32_t e0 = P, e1 = P, e2 = P, e3 = P;
+      if (!alike(A, D) && !alike(C, B)) {
+        if (alike(C, A)) e0 = A;
+        if (alike(A, B)) e1 = B;
+        if (alike(D, C)) e2 = C;
+        if (alike(B, D)) e3 = D;
+      }
+      uint32_t* o = &b.px[(size_t)(y * 2) * b.w + x * 2];
+      o[0] = e0; o[1] = e1;
+      o[b.w] = e2; o[b.w + 1] = e3;
     }
   return b;
 }
@@ -370,6 +445,10 @@ Value bi_r3d_texture(Vm&, std::vector<Value>& args, std::string& error) {
     L0.px[i] = opaque ? (0xFF000000u | ((uint32_t)(uint8_t)pal[k * 3] << 16) | ((uint32_t)(uint8_t)pal[k * 3 + 1] << 8) |
                          (uint32_t)(uint8_t)pal[k * 3 + 2])
                       : 0u;
+  }
+  for (int s2 = 1; s2 < t->upscale; s2 *= 2) {
+    L0 = scale2x(L0, !tx->alpha);
+    tx->scale *= 2;
   }
   tx->mips.push_back(std::move(L0));
   while (tx->mips.back().w > 1 || tx->mips.back().h > 1) tx->mips.push_back(half_of(tx->mips.back()));
@@ -410,21 +489,56 @@ inline uint32_t sample(const R3dTex::Level& L, double u, double v, bool wrap_v, 
   return (std::min<uint32_t>(alpha, 255) << 24) | ((uint32_t)(R / A) << 16) | ((uint32_t)(G / A) << 8) | (uint32_t)(B / A);
 }
 
+// Noise, for a sculpt's relief and colour and the fill's fine relief.
+double hash3(int x, int y, int z) {
+  uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + (uint32_t)z * 2147483647u;
+  h = (h ^ (h >> 13)) * 1274126177u;
+  return ((h ^ (h >> 16)) & 0xFFFFFF) / 16777215.0;
+}
+// smooth value noise in [0, 1]
+double vnoise(double x, double y, double z) {
+  const int xi = (int)std::floor(x), yi = (int)std::floor(y), zi = (int)std::floor(z);
+  const double fx = x - xi, fy = y - yi, fz = z - zi;
+  auto sm = [](double f) { return f * f * (3 - 2 * f); };
+  const double u = sm(fx), v = sm(fy), w = sm(fz);
+  double acc = 0;
+  for (int k = 0; k < 8; ++k) {
+    const int dx = k & 1, dy = (k >> 1) & 1, dz = k >> 2;
+    acc += hash3(xi + dx, yi + dy, zi + dz) * (dx ? u : 1 - u) * (dy ? v : 1 - v) * (dz ? w : 1 - w);
+  }
+  return acc;
+}
+// three octaves: broad lumps, then folds, then grain
+double fbm(double x, double y, double z) {
+  return vnoise(x, y, z) * 0.55 + vnoise(x * 2.03 + 11.1, y * 2.03, z * 2.03) * 0.30 + vnoise(x * 4.1, y * 4.1 + 7.7, z * 4.1) * 0.15;
+}
+constexpr int kAttrs = 9;   // a mesh vertex's: r g b, nx ny nz, ox oy oz
+
 // One triangle in screen space with what the fill interpolates: 1/z, u/z and v/z are linear on the screen.
 struct STri {
   int x0, x1, y0, y1;            // bounding box, clipped to the target
   double ea[3], eb[3], ec[3];    // edge functions, positive inside
   double qx, qy, qc;             // 1/z = qx x + qy y + qc
   double ux, uy, uc, vx, vy, vc; // u/z, v/z likewise
+  // a mesh's triangle (tex null): its attributes over z, each linear on the screen as u/z is - colour r g b, normal
+  // nx ny nz (camera space), the surface's own point ox oy oz (where it is on the model, for its fine relief)
+  double ap[kAttrs][3];
+  float shine = 0, glow = 0;
   const R3dTex* tex;
   float light;                   // 0..1
   int flags;
 };
 
-struct TV { double x, y, z, u, v; };
+// A vertex: where it is (camera space), its texel, and - a mesh's, drawn without a texture - its lit colour (0..1+).
+struct TV {
+  double x, y, z, u, v;
+  double a[kAttrs] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  float shine = 0, glow = 0;
+};
 
 // The screen triangle of three projected points (sx, sy, 1/z, u/z, v/z); false when it covers nothing.
-bool setup(const R3dTarget& t, const double* sx, const double* sy, const double* q, const double* uq, const double* vq, STri* o) {
+bool setup(const R3dTarget& t, const double* sx, const double* sy, const double* q, const double* uq, const double* vq, STri* o,
+           const double (*aq)[3] = nullptr) {
   double area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
   if (!(std::fabs(area) > 1e-9)) return false;
   const double sgn = area > 0 ? 1.0 : -1.0;
@@ -450,15 +564,126 @@ bool setup(const R3dTarget& t, const double* sx, const double* sy, const double*
   plane(q, &o->qx, &o->qy, &o->qc);
   plane(uq, &o->ux, &o->uy, &o->uc);
   plane(vq, &o->vx, &o->vy, &o->vc);
+  if (aq)
+    for (int k = 0; k < kAttrs; ++k) plane(aq[k], &o->ap[k][0], &o->ap[k][1], &o->ap[k][2]);
   return true;
+}
+
+// Fill rows [ya, yb) of a mesh's triangle, lit per pixel: its colour under a key light from above the eye's left
+// shoulder and a cool fill from behind, light scattered under the skin past the shadow's edge, a highlight as
+// tight as the surface is polished, a rim where it turns from the eye, fine relief from the surface's own point
+// (so it stays on the creature as it moves) - then the sector's light and its fall with distance as for every
+// surface (not for full bright or what glows). Fuzz: what is behind it, bent and darkened.
+void fill_col_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels) {
+  const bool bright = (s.flags & 2) != 0, fuzz = (s.flags & 8) != 0;
+  const float L = s.light;
+  const double gain = t.light_gain, lift = t.light_lift, fall = t.light_fall;
+  const double cx = t.w * 0.5, cy = t.h * 0.5, focal = t.focal, fy = t.focal * t.y_scale;
+  // camera space: x right, y up, z ahead; each the direction toward the light
+  static const double kl[3] = {-0.4170, 0.6157, -0.6686}, fl[3] = {0.5, -0.35, 0.79};
+  const double shine = s.shine, glow = s.glow;
+  const double spec_pow = 10.0 + 70.0 * shine;
+  const int y_lo = std::max(s.y0, ya), y_hi = std::min(s.y1, yb - 1);
+  for (int y = y_lo; y <= y_hi; ++y) {
+    const double py = y + 0.5;
+    double lo = s.x0 + 0.5, hi = s.x1 + 0.5;
+    double c[3];
+    bool empty = false;
+    for (int i = 0; i < 3 && !empty; ++i) {
+      c[i] = s.eb[i] * py + s.ec[i];
+      if (s.ea[i] > 0) lo = std::max(lo, -c[i] / s.ea[i]);
+      else if (s.ea[i] < 0) hi = std::min(hi, -c[i] / s.ea[i]);
+      else if (c[i] < 0) empty = true;
+    }
+    if (empty || lo > hi) continue;
+    const int xa = std::max(s.x0, (int)std::floor(lo - 0.5) - 1), xb = std::min(s.x1, (int)std::ceil(hi - 0.5) + 1);
+    float* drow = &t.depth[(size_t)y * t.w];
+    uint32_t* crow = &t.color[(size_t)y * t.w];
+    const double px0 = xa + 0.5;
+    double e0 = s.ea[0] * px0 + c[0], e1 = s.ea[1] * px0 + c[1], e2 = s.ea[2] * px0 + c[2];
+    double q = s.qx * px0 + s.qy * py + s.qc;
+    double A[kAttrs];
+    for (int k = 0; k < kAttrs; ++k) A[k] = s.ap[k][0] * px0 + s.ap[k][1] * py + s.ap[k][2];
+    for (int x = xa; x <= xb; ++x, e0 += s.ea[0], e1 += s.ea[1], e2 += s.ea[2], q += s.qx) {
+      if (x > xa) for (int k = 0; k < kAttrs; ++k) A[k] += s.ap[k][0];
+      if (e0 < 0 || e1 < 0 || e2 < 0 || q <= 0) continue;
+      const float qf = (float)q;
+      if (qf <= drow[x]) continue;
+      if (fuzz) {
+        const int sx2 = std::min(t.w - 1, std::max(0, x + (int)(std::sin(y * 0.21 + t.time * 7.0) * 3.0)));
+        const uint32_t d = crow[sx2];
+        const uint32_t k = 110 + (uint32_t)(((x * 7 + y * 13 + (int)(t.time * 40)) ^ (x >> 2)) & 63);
+        crow[x] = ((((d >> 16) & 255) * k >> 8) << 16) | ((((d >> 8) & 255) * k >> 8) << 8) | (((d & 255) * k) >> 8);
+        continue;
+      }
+      const double z = 1.0 / q;
+      double nx = A[3] * z, ny = A[4] * z, nz = A[5] * z;
+      // fine relief: the noise's slope at the surface's own point tips the normal (less on what is polished; a
+      // textured model's own picture has its detail)
+      if (!s.tex) {
+        const double ox = A[6] * z * 1.3, oy = A[7] * z * 1.3, oz = A[8] * z * 1.3, e = 0.35;
+        const double n0 = vnoise(ox, oy, oz);
+        const double gx = vnoise(ox + e, oy, oz) - n0, gy = vnoise(ox, oy + e, oz) - n0, gz = vnoise(ox, oy, oz + e) - n0;
+        const double amp = 1.5 * (1.0 - 0.6 * shine);
+        nx -= gx * amp; ny -= gz * amp; nz -= gy * amp;
+      }
+      const double nl = 1.0 / std::sqrt(std::max(1e-12, nx * nx + ny * ny + nz * nz));
+      nx *= nl; ny *= nl; nz *= nl;
+      const double cxp = (x + 0.5 - cx) / focal * z, cyp = -(py - cy) / fy * z;
+      const double vl = 1.0 / std::sqrt(cxp * cxp + cyp * cyp + z * z);
+      const double vx = -cxp * vl, vy = -cyp * vl, vz = -z * vl;
+      const double ndl = nx * kl[0] + ny * kl[1] + nz * kl[2];
+      const double lam = std::max(0.0, ndl);
+      const double wrap = std::max(0.0, (ndl + 0.45) / 1.45);
+      const double fill = std::max(0.0, nx * fl[0] + ny * fl[1] + nz * fl[2]) * 0.18;
+      const double ndv = std::max(0.0, nx * vx + ny * vy + nz * vz);
+      const double hx = kl[0] + vx, hy = kl[1] + vy, hz = kl[2] + vz;
+      const double hl = 1.0 / std::sqrt(std::max(1e-12, hx * hx + hy * hy + hz * hz));
+      const double ndh = std::max(0.0, (nx * hx + ny * hy + nz * hz) * hl);
+      const double spec = shine * 1.1 * std::pow(ndh, spec_pow) * (0.25 + 0.75 * lam);
+      const double rim = 0.30 * std::pow(1.0 - ndv, 4.0);
+      const double scat = (wrap - lam) * 0.55;
+      double ar = A[0] * z, ag = A[1] * z, ab = A[2] * z;
+      if (s.tex) {
+        const R3dTex& tx = *s.tex;
+        const double u = (s.ux * (x + 0.5) + s.uy * py + s.uc) * z, v = (s.vx * (x + 0.5) + s.vy * py + s.vc) * z;
+        int lv = 0;
+        if (t.mipmaps && tx.mips.size() > 1) {
+          const double dux = (s.ux - u * s.qx) * z, dvx = (s.vx - v * s.qx) * z, duy = (s.uy - u * s.qy) * z, dvy = (s.vy - v * s.qy) * z;
+          const double rho2 = std::sqrt((dux * dux + dvx * dvx) * (duy * duy + dvy * dvy));
+          if (rho2 > 1.0) { int e = 0; std::frexp(rho2, &e); lv = std::min((int)tx.mips.size() - 1, (e - 1) / 2); }
+        }
+        const R3dTex::Level& LV = tx.mips[(size_t)lv];
+        const uint32_t p = sample(LV, u * LV.w / tx.mips[0].w, v * LV.h / tx.mips[0].h, true, t.bilinear);
+        if ((p >> 24) < 128) continue;
+        ar *= ((p >> 16) & 255) / 255.0; ag *= ((p >> 8) & 255) / 255.0; ab *= (p & 255) / 255.0;
+      }
+      const double amb = 0.16;
+      const double r = ar * (amb + lam * 0.95 + fill + scat * 1.0 + glow * 2.2) + spec + rim * 0.9;
+      const double g = ag * (amb + lam * 0.95 + fill + scat * 0.45 + glow * 2.2) + spec + rim * 0.95;
+      const double bl = ab * (amb + lam * 0.95 + fill * 1.3 + scat * 0.30 + glow * 2.2) + spec + rim * 1.1;
+      double b = 255.0;
+      if (!bright && glow < 0.5) {
+        const double cmap = std::min(31.0, std::max(0.0, 60.0 - L * 63.75 - fall / std::max(z, 1.0)));
+        b *= std::min(1.0, std::max(0.0, 1.0 - cmap / 32.0 * gain + lift));
+      }
+      crow[x] = ((uint32_t)std::min(255.0, std::max(0.0, r * b)) << 16) | ((uint32_t)std::min(255.0, std::max(0.0, g * b)) << 8) |
+                (uint32_t)std::min(255.0, std::max(0.0, bl * b));
+      drow[x] = qf;
+      ++*pixels;
+    }
+  }
 }
 
 // Fill rows [ya, yb) of one triangle.
 void fill_tex_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels) {
+  if (!s.tex || (s.flags & 64)) { fill_col_rows(t, s, ya, yb, pixels); return; }
   const R3dTex* tx = s.tex;
   const bool masked = (s.flags & 1) != 0, bright = (s.flags & 2) != 0, wrap_v = (s.flags & 4) == 0, fuzz = (s.flags & 8) != 0;
   const int levels = (int)tx->mips.size();
-  const double W0 = tx->mips[0].w, H0 = tx->mips[0].h;
+  // u, v are in the picture's own texels; level 0 has `scale` of its texels to each
+  const double W0 = (double)tx->mips[0].w / tx->scale, H0 = (double)tx->mips[0].h / tx->scale;
+  const double rho_scale = (double)tx->scale * tx->scale;
   const float L = s.light;
   const double gain = t.light_gain, lift = t.light_lift, fall = t.light_fall;
   const bool bil = t.bilinear, mips = t.mipmaps;
@@ -495,7 +720,7 @@ void fill_tex_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
         // the geometric mean of the two directions' steps: a floor seen at a slant steps far along one and little
         // along the other, and the larger alone would blur it to one colour (the cost of not filtering it
         // anisotropically)
-        const double rho2 = std::sqrt((dux * dux + dvx * dvx) * (duy * duy + dvy * dvy));
+        const double rho2 = std::sqrt((dux * dux + dvx * dvx) * (duy * duy + dvy * dvy)) * rho_scale;
         if (rho2 > 1.0) {
           int e = 0;
           std::frexp(rho2, &e);   // rho2 in [2^(e-1), 2^e): log2(rho) about (e - 1) / 2
@@ -515,7 +740,7 @@ void fill_tex_rows(R3dTarget& t, const STri& s, int ya, int yb, int64_t* pixels)
       double b = 1.0;
       if (!bright) {
         const double cmap = std::min(31.0, std::max(0.0, 60.0 - L * 63.75 - fall / std::max(z, 1.0)));
-        b = std::min(1.0, std::max(0.0, 1.0 - cmap / 32.0 * gain + lift));
+        b *= std::min(1.0, std::max(0.0, 1.0 - cmap / 32.0 * gain + lift));
       }
       const uint32_t r = (uint32_t)(((p >> 16) & 255) * b), g = (uint32_t)(((p >> 8) & 255) * b), bl = (uint32_t)((p & 255) * b);
       crow[x] = (r << 16) | (g << 8) | bl;
@@ -540,12 +765,15 @@ void clip_project(const R3dTarget& t, const TV* v, double focal, const R3dTex* t
       if (in[i]) p[n++] = v[i];
       if (in[i] != in[j]) {
         const double k = (kNear - v[i].z) / (v[j].z - v[i].z);
-        p[n++] = {v[i].x + (v[j].x - v[i].x) * k, v[i].y + (v[j].y - v[i].y) * k, kNear,
-                  v[i].u + (v[j].u - v[i].u) * k, v[i].v + (v[j].v - v[i].v) * k};
+        TV m{v[i].x + (v[j].x - v[i].x) * k, v[i].y + (v[j].y - v[i].y) * k, kNear,
+             v[i].u + (v[j].u - v[i].u) * k, v[i].v + (v[j].v - v[i].v) * k};
+        for (int e = 0; e < kAttrs; ++e) m.a[e] = v[i].a[e] + (v[j].a[e] - v[i].a[e]) * k;
+        m.shine = v[i].shine; m.glow = v[i].glow;
+        p[n++] = m;
       }
     }
   }
-  double sx[4], sy[4], q[4], uq[4], vq[4];
+  double sx[4], sy[4], q[4], uq[4], vq[4], aqv[kAttrs][4];
   const double cx = t.w * 0.5, cy = t.h * 0.5, fy = focal * t.y_scale;
   for (int i = 0; i < n; ++i) {
     q[i] = 1.0 / p[i].z;
@@ -553,18 +781,842 @@ void clip_project(const R3dTarget& t, const TV* v, double focal, const R3dTex* t
     sy[i] = cy - p[i].y * fy * q[i];
     uq[i] = p[i].u * q[i];
     vq[i] = p[i].v * q[i];
+    for (int e = 0; e < kAttrs; ++e) aqv[e][i] = p[i].a[e] * q[i];
   }
   for (int k = 0; k + 2 < n; ++k) {   // (0 1 2), and for a quad (0 2 3)
     const int a = 0, b = k + 1, c = k + 2;
     const double tsx[3] = {sx[a], sx[b], sx[c]}, tsy[3] = {sy[a], sy[b], sy[c]}, tq[3] = {q[a], q[b], q[c]};
     const double tu[3] = {uq[a], uq[b], uq[c]}, tv[3] = {vq[a], vq[b], vq[c]};
     STri s;
-    if (!setup(t, tsx, tsy, tq, tu, tv, &s)) continue;
+    if (!tx || (flags & 64)) {
+      double ta[kAttrs][3];
+      for (int e = 0; e < kAttrs; ++e) { ta[e][0] = aqv[e][a]; ta[e][1] = aqv[e][b]; ta[e][2] = aqv[e][c]; }
+      if (!setup(t, tsx, tsy, tq, tu, tv, &s, ta)) continue;
+      s.shine = (p[a].shine + p[b].shine + p[c].shine) / 3.0f;
+      s.glow = (p[a].glow + p[b].glow + p[c].glow) / 3.0f;
+    } else if (!setup(t, tsx, tsy, tq, tu, tv, &s)) continue;
     s.tex = tx;
     s.light = light;
     s.flags = flags;
     out->push_back(s);
   }
+}
+
+// ---- meshes --------------------------------------------------------------------------------------------------------
+//
+//   r3d_mesh(t, id, parts, {rest, cell}) -> {verts, tris, ms}
+//       a sculpted model: one continuous surface, the shapes in `parts` melted into each other where they meet
+//       (a smooth union, each shape's `blend` how far its seam spreads), roughened by its `rough` (relief of that
+//       many units, in patches of `grain`), built into a mesh at `cell` units of detail. Each shape is fixed to a
+//       bone; each point of the surface is weighted between its two nearest bones, so it bends as flesh does
+//       where two meet. rest: the bones' matrices at rest (12 numbers a bone, the model's space from each bone's,
+//       as r3d_draw_tex's things give them posed). Shapes, in their bone's space (x forward, y left, z up):
+//         {kind: "limb", bone, a: [x y z], b: [x y z], r0, r1}     a rounded cone from a (radius r0) to b (r1)
+//         {kind: "ellipsoid", bone, c: [x y z], r: [rx ry rz], rot: [yaw pitch roll]?}
+//         {kind: "box", bone, c: [x y z], r: [half sizes], rot?, round}   a box, its edges rounded by `round`
+//       and each col (0xRRGGBB), col2 (a second colour it grades into: a limb from a to b, the rest bottom to top),
+//       mottle (0..1, its colour's variation over the surface in patches of `grain` units), shine (0..1),
+//       glow (it lights itself), blend (units; default 0.8), rough (units; default 0), grain (default 4), and
+//       carve: true to cut the shape out of what is there instead of adding it (a mouth, an eye socket).
+
+struct R3dMesh {
+  struct V { float x, y, z, nx, ny, nz, r, g, b, shine, glow; uint8_t bone[2]; float w0; };
+  std::vector<V> v;
+  std::vector<uint32_t> idx;
+  std::vector<double> inv_rest;   // per bone: the inverse of its rest matrix (12 numbers)
+  int bones = 1;
+  double radius = 0, height = 0;
+};
+
+namespace {
+struct Vec { double x, y, z; };
+Vec vadd(Vec a, Vec b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+Vec vsub(Vec a, Vec b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+Vec vmul(Vec a, double k) { return {a.x * k, a.y * k, a.z * k}; }
+double vdot(Vec a, Vec b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+double vlen(Vec a) { return std::sqrt(vdot(a, a)); }
+Vec vcross(Vec a, Vec b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+Vec vnorm(Vec a) { const double l = vlen(a); return l > 1e-12 ? vmul(a, 1.0 / l) : Vec{0, 0, 1}; }
+// a 3x3 rotation, yaw about z then pitch about y then roll about x (degrees): its rows
+void rot_rows(const double* ypr, double* R) {
+  const double kD = 3.14159265358979323846 / 180.0;
+  const double cy = std::cos(ypr[0] * kD), sy = std::sin(ypr[0] * kD), cp = std::cos(ypr[1] * kD), sp = std::sin(ypr[1] * kD);
+  const double cr = std::cos(ypr[2] * kD), sr = std::sin(ypr[2] * kD);
+  const double M[9] = {cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr,
+                       sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr,
+                       -sp, cp * sr, cp * cr};
+  for (int i = 0; i < 9; ++i) R[i] = M[i];
+}
+Vec m34_point(const double* M, Vec p) {
+  return {M[0] * p.x + M[1] * p.y + M[2] * p.z + M[3], M[4] * p.x + M[5] * p.y + M[6] * p.z + M[7], M[8] * p.x + M[9] * p.y + M[10] * p.z + M[11]};
+}
+Vec m34_dir(const double* M, Vec p) {
+  return {M[0] * p.x + M[1] * p.y + M[2] * p.z, M[4] * p.x + M[5] * p.y + M[6] * p.z, M[8] * p.x + M[9] * p.y + M[10] * p.z};
+}
+// the inverse of a rigid 3x4 (rotation and translation)
+void m34_inverse_rigid(const double* M, double* I) {
+  I[0] = M[0]; I[1] = M[4]; I[2] = M[8];
+  I[4] = M[1]; I[5] = M[5]; I[6] = M[9];
+  I[8] = M[2]; I[9] = M[6]; I[10] = M[10];
+  I[3] = -(I[0] * M[3] + I[1] * M[7] + I[2] * M[11]);
+  I[7] = -(I[4] * M[3] + I[5] * M[7] + I[6] * M[11]);
+  I[11] = -(I[8] * M[3] + I[9] * M[7] + I[10] * M[11]);
+}
+void m34_mul(const double* A, const double* B, double* O) {
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 4; ++c)
+      O[r * 4 + c] = A[r * 4] * B[c] + A[r * 4 + 1] * B[4 + c] + A[r * 4 + 2] * B[8 + c] + (c == 3 ? A[r * 4 + 3] : 0.0);
+  }
+}
+bool vec_field(MapObj* m, const char* k, double* out, int n, std::string& error, size_t part) {
+  Value* v = m->find(k);
+  if (!v) return false;
+  if (v->type != Type::List || v->list_items().size() != (size_t)n) {
+    error = "r3d_mesh(): part " + std::to_string(part) + "'s " + k + " wants a list of " + std::to_string(n) + " numbers";
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    const Value& e = v->list_items()[(size_t)i];
+    if (!e.is_number()) { error = "r3d_mesh(): part " + std::to_string(part) + "'s " + k + " wants numbers"; return false; }
+    out[i] = e.as_double();
+  }
+  return true;
+}
+
+// One shape of a sculpt, placed in the model's space at rest.
+struct Shape {
+  int kind = 0;               // 0 limb, 1 ellipsoid, 2 box
+  int bone = 0;
+  Vec a{0, 0, 0}, b{0, 0, 0}; // a limb's ends; an ellipsoid's or box's centre is a
+  double r0 = 1, r1 = 1;
+  double R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};   // model-space -> shape-space rotation (rows)
+  Vec half{1, 1, 1};
+  double round = 0.6;
+  double blend = 0.8, rough = 0.0, grain = 4.0;
+  bool carve = false;
+  uint32_t c1 = 0x808080, c2 = 0x808080;
+  double mottle = 0, shine = 0, glow = 0;
+  Vec bc{0, 0, 0};             // a sphere round it all, for skipping it far away
+  double br = 0;
+  int seed = 0;
+  // its distance (negative inside), without its roughness; f: where along its gradient the point is (0..1)
+  double dist(Vec p, double* f) const {
+    if (kind == 0) {
+      // a round cone (Inigo Quilez's): the capsule of two spheres of radii r0, r1 and the cone that joins them
+      const Vec ba = vsub(b, a), pa = vsub(p, a);
+      const double l2 = vdot(ba, ba);
+      const double rr = r0 - r1, a2 = l2 - rr * rr, il2 = 1.0 / std::max(l2, 1e-9);
+      const double y = vdot(pa, ba), z = y - l2;
+      const Vec xv = vsub(vmul(pa, l2), vmul(ba, y));
+      const double x2 = vdot(xv, xv), y2 = y * y * l2, z2 = z * z * l2;
+      const double k = (rr > 0 ? 1.0 : -1.0) * rr * rr * x2;
+      *f = std::min(1.0, std::max(0.0, y * il2));
+      if ((z > 0 ? 1.0 : -1.0) * a2 * z2 > k) return std::sqrt(x2 + z2) * il2 - r1;
+      if ((y > 0 ? 1.0 : -1.0) * a2 * y2 < k) return std::sqrt(x2 + y2) * il2 - r0;
+      return (std::sqrt(x2 * a2 * il2) + y * rr) * il2 - r0;
+    }
+    const Vec d = vsub(p, a);
+    const Vec q{R[0] * d.x + R[1] * d.y + R[2] * d.z, R[3] * d.x + R[4] * d.y + R[5] * d.z, R[6] * d.x + R[7] * d.y + R[8] * d.z};
+    if (kind == 1) {
+      *f = std::min(1.0, std::max(0.0, (q.z / half.z + 1) * 0.5));
+      const Vec q0{q.x / half.x, q.y / half.y, q.z / half.z}, q1{q.x / (half.x * half.x), q.y / (half.y * half.y), q.z / (half.z * half.z)};
+      const double k0 = vlen(q0), k1 = vlen(q1);
+      return k1 > 1e-12 ? k0 * (k0 - 1.0) / k1 : -std::min({half.x, half.y, half.z});
+    }
+    *f = std::min(1.0, std::max(0.0, (q.z / half.z + 1) * 0.5));
+    const double rd = std::min({round, half.x, half.y, half.z});
+    const Vec e{std::fabs(q.x) - half.x + rd, std::fabs(q.y) - half.y + rd, std::fabs(q.z) - half.z + rd};
+    const Vec m{std::max(e.x, 0.0), std::max(e.y, 0.0), std::max(e.z, 0.0)};
+    return vlen(m) + std::min(std::max(e.x, std::max(e.y, e.z)), 0.0) - rd;
+  }
+};
+
+// the polynomial smooth minimum: a and b joined with a fillet k wide
+inline double smin(double a, double b, double k) {
+  if (k <= 0) return std::min(a, b);
+  const double h = std::max(k - std::fabs(a - b), 0.0) / k;
+  return std::min(a, b) - h * h * k * 0.25;
+}
+inline double smax(double a, double b, double k) { return -smin(-a, -b, k); }
+
+struct Sculpt {
+  std::vector<Shape> shapes;
+  // the surface's distance at p (negative inside)
+  double field(Vec p) const {
+    double d = 1e9;
+    for (const Shape& s : shapes) {
+      if (s.carve) continue;
+      const double far = vlen(vsub(p, s.bc)) - s.br;
+      if (far > d + s.blend + s.rough) continue;
+      double f;
+      double di = s.dist(p, &f);
+      if (s.rough > 0) di -= s.rough * (fbm(p.x / s.grain + s.seed * 13.7, p.y / s.grain, p.z / s.grain) - 0.5) * 2.0;
+      d = smin(d, di, s.blend);
+    }
+    for (const Shape& s : shapes) {
+      if (!s.carve) continue;
+      if (vlen(vsub(p, s.bc)) - s.br > s.blend) continue;
+      double f;
+      d = smax(d, -s.dist(p, &f), s.blend);
+    }
+    return d;
+  }
+};
+}  // namespace
+
+Value bi_r3d_mesh(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_mesh");
+  if (!t) return Value::nil();
+  if (!want_number(args[1], error, "r3d_mesh") || !want_list(args[2], error, "r3d_mesh")) return Value::nil();
+  if (args[3].type != Type::Map) { error = "r3d_mesh(): the fourth argument wants a map {rest, cell}"; return Value::nil(); }
+  auto* opt = static_cast<MapObj*>(args[3].obj.get());
+  double cell = 1.0;
+  field(opt, "cell", cell);
+  if (!(cell >= 0.25 && cell <= 8)) { error = "r3d_mesh(): cell wants 0.25..8 units"; return Value::nil(); }
+  Value* restv = opt->find("rest");
+  if (!restv || restv->type != Type::List || restv->list_items().empty() || restv->list_items().size() % 12 != 0) {
+    error = "r3d_mesh(): rest wants the bones' rest matrices, 12 numbers a bone";
+    return Value::nil();
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const int nb = (int)(restv->list_items().size() / 12);
+  if (nb > 64) { error = "r3d_mesh(): at most 64 bones"; return Value::nil(); }
+  std::vector<double> rest((size_t)nb * 12);
+  for (size_t i = 0; i < rest.size(); ++i) {
+    const Value& e = restv->list_items()[i];
+    if (!e.is_number()) { error = "r3d_mesh(): rest wants numbers"; return Value::nil(); }
+    rest[i] = e.as_double();
+  }
+  Sculpt sc;
+  size_t pi = 0;
+  for (const Value& pv : args[2].list_items()) {
+    if (pv.type != Type::Map) { error = "r3d_mesh(): part " + std::to_string(pi) + " is not a map"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(pv.obj.get());
+    Value* kv = m->find("kind");
+    const std::string kind = kv && kv->type == Type::Str ? kv->str() : "";
+    Shape s;
+    double bone = 0, col = 0x808080, col2 = -1;
+    field(m, "bone", bone); field(m, "col", col); field(m, "col2", col2);
+    field(m, "mottle", s.mottle); field(m, "grain", s.grain); field(m, "shine", s.shine); field(m, "glow", s.glow);
+    field(m, "blend", s.blend); field(m, "rough", s.rough); field(m, "round", s.round);
+    if (Value* cv = m->find("carve")) s.carve = cv->type == Type::Bool && cv->b;
+    if (bone < 0 || bone >= nb) { error = "r3d_mesh(): part " + std::to_string(pi) + "'s bone " + std::to_string((int)bone) + " has no rest matrix"; return Value::nil(); }
+    s.bone = (int)bone;
+    s.c1 = (uint32_t)col;
+    s.c2 = col2 < 0 ? s.c1 : (uint32_t)col2;
+    s.grain = std::max(0.5, s.grain);
+    s.seed = (int)pi;
+    const double* M = &rest[(size_t)s.bone * 12];
+    if (kind == "limb") {
+      double a[3], b[3];
+      if (!vec_field(m, "a", a, 3, error, pi) || !vec_field(m, "b", b, 3, error, pi) || !field(m, "r0", s.r0)) {
+        if (error.empty()) error = "r3d_mesh(): limb part " + std::to_string(pi) + " needs a, b and r0";
+        return Value::nil();
+      }
+      if (!field(m, "r1", s.r1)) s.r1 = s.r0;
+      s.kind = 0;
+      s.a = m34_point(M, {a[0], a[1], a[2]});
+      s.b = m34_point(M, {b[0], b[1], b[2]});
+      if (vlen(vsub(s.b, s.a)) < 1e-6) s.b = vadd(s.a, {0, 0, 1e-3});
+      s.bc = vmul(vadd(s.a, s.b), 0.5);
+      s.br = vlen(vsub(s.b, s.a)) * 0.5 + std::max(s.r0, s.r1);
+    } else if (kind == "ellipsoid" || kind == "box") {
+      double c[3], r[3], ypr[3] = {0, 0, 0};
+      if (!vec_field(m, "c", c, 3, error, pi) || !vec_field(m, "r", r, 3, error, pi)) {
+        if (error.empty()) error = "r3d_mesh(): " + kind + " part " + std::to_string(pi) + " needs c and r";
+        return Value::nil();
+      }
+      if (m->find("rot") && !vec_field(m, "rot", ypr, 3, error, pi)) return Value::nil();
+      s.kind = kind == "ellipsoid" ? 1 : 2;
+      s.a = m34_point(M, {c[0], c[1], c[2]});
+      s.half = {std::max(0.05, r[0]), std::max(0.05, r[1]), std::max(0.05, r[2])};
+      // the shape's axes in the model's space: the bone's rotation, then its own; R takes model to shape
+      double Rs[9];
+      rot_rows(ypr, Rs);
+      double W[9];
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) W[i * 3 + j] = M[i * 4] * Rs[j] + M[i * 4 + 1] * Rs[3 + j] + M[i * 4 + 2] * Rs[6 + j];
+      for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) s.R[i * 3 + j] = W[j * 3 + i];
+      s.bc = s.a;
+      s.br = vlen(s.half);
+    } else {
+      error = "r3d_mesh(): part " + std::to_string(pi) + "'s kind is \"" + kind + "\": limb, ellipsoid or box";
+      return Value::nil();
+    }
+    s.br += s.rough;
+    sc.shapes.push_back(s);
+    ++pi;
+  }
+  if (sc.shapes.empty()) { error = "r3d_mesh(): no parts"; return Value::nil(); }
+  // the grid round it all
+  Vec lo{1e9, 1e9, 1e9}, hi{-1e9, -1e9, -1e9};
+  for (const Shape& s : sc.shapes) {
+    if (s.carve) continue;
+    const double r = s.br + s.blend + cell * 2;
+    lo = {std::min(lo.x, s.bc.x - r), std::min(lo.y, s.bc.y - r), std::min(lo.z, s.bc.z - r)};
+    hi = {std::max(hi.x, s.bc.x + r), std::max(hi.y, s.bc.y + r), std::max(hi.z, s.bc.z + r)};
+  }
+  const int NX = (int)std::ceil((hi.x - lo.x) / cell) + 1, NY = (int)std::ceil((hi.y - lo.y) / cell) + 1, NZ = (int)std::ceil((hi.z - lo.z) / cell) + 1;
+  if ((int64_t)NX * NY * NZ > 24 * 1024 * 1024) { error = "r3d_mesh(): too fine a cell for the model's size"; return Value::nil(); }
+  std::vector<float> F((size_t)NX * NY * NZ);
+  auto gi = [&](int i, int j, int k) { return ((size_t)k * NY + j) * NX + i; };
+  SqlThreadPool::instance().for_chunks((size_t)NZ, 1, (size_t)NX * NY * NZ * 8, false, [&](size_t k0, size_t k1, size_t) {
+    for (size_t k = k0; k < k1; ++k)
+      for (int j = 0; j < NY; ++j)
+        for (int i = 0; i < NX; ++i)
+          F[gi(i, j, (int)k)] = (float)sc.field({lo.x + i * cell, lo.y + j * cell, lo.z + k * cell});
+  });
+  // Surface nets: a vertex in each cell the surface crosses, at the mean of where it crosses the cell's edges;
+  // a quad across each grid edge it crosses, joining the four cells round that edge.
+  std::vector<int32_t> cellv((size_t)NX * NY * NZ, -1);
+  std::vector<Vec> pos;
+  static const int corner[8][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}, {0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}};
+  static const int edges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+  for (int k = 0; k + 1 < NZ; ++k)
+    for (int j = 0; j + 1 < NY; ++j)
+      for (int i = 0; i + 1 < NX; ++i) {
+        float v[8];
+        int inside = 0;
+        for (int c = 0; c < 8; ++c) {
+          v[c] = F[gi(i + corner[c][0], j + corner[c][1], k + corner[c][2])];
+          inside += v[c] < 0;
+        }
+        if (inside == 0 || inside == 8) continue;
+        Vec acc{0, 0, 0};
+        int n = 0;
+        for (const auto& e : edges) {
+          const float a = v[e[0]], b = v[e[1]];
+          if ((a < 0) == (b < 0)) continue;
+          const double tt = a / (double)(a - b);
+          const int* ca = corner[e[0]], *cb = corner[e[1]];
+          acc = vadd(acc, {ca[0] + (cb[0] - ca[0]) * tt, ca[1] + (cb[1] - ca[1]) * tt, ca[2] + (cb[2] - ca[2]) * tt});
+          ++n;
+        }
+        acc = vmul(acc, 1.0 / n);
+        cellv[gi(i, j, k)] = (int32_t)pos.size();
+        pos.push_back({lo.x + (i + acc.x) * cell, lo.y + (j + acc.y) * cell, lo.z + (k + acc.z) * cell});
+      }
+  auto mesh = std::make_shared<R3dMesh>();
+  for (int k = 1; k + 1 < NZ; ++k)
+    for (int j = 1; j + 1 < NY; ++j)
+      for (int i = 1; i + 1 < NX; ++i) {
+        const float f0 = F[gi(i, j, k)];
+        for (int ax = 0; ax < 3; ++ax) {
+          const int di = ax == 0, dj = ax == 1, dk = ax == 2;
+          if (i + di >= NX || j + dj >= NY || k + dk >= NZ) continue;
+          const float f1 = F[gi(i + di, j + dj, k + dk)];
+          if ((f0 < 0) == (f1 < 0)) continue;
+          // the four cells sharing this edge
+          int c[4];
+          if (ax == 0) { c[0] = cellv[gi(i, j - 1, k - 1)]; c[1] = cellv[gi(i, j, k - 1)]; c[2] = cellv[gi(i, j, k)]; c[3] = cellv[gi(i, j - 1, k)]; }
+          else if (ax == 1) { c[0] = cellv[gi(i - 1, j, k - 1)]; c[1] = cellv[gi(i - 1, j, k)]; c[2] = cellv[gi(i, j, k)]; c[3] = cellv[gi(i, j, k - 1)]; }
+          else { c[0] = cellv[gi(i - 1, j - 1, k)]; c[1] = cellv[gi(i, j - 1, k)]; c[2] = cellv[gi(i, j, k)]; c[3] = cellv[gi(i - 1, j, k)]; }
+          if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[3] < 0) continue;
+          const bool flip = f0 < 0;
+          if (flip) { mesh->idx.insert(mesh->idx.end(), {(uint32_t)c[0], (uint32_t)c[1], (uint32_t)c[2], (uint32_t)c[0], (uint32_t)c[2], (uint32_t)c[3]}); }
+          else { mesh->idx.insert(mesh->idx.end(), {(uint32_t)c[0], (uint32_t)c[2], (uint32_t)c[1], (uint32_t)c[0], (uint32_t)c[3], (uint32_t)c[2]}); }
+        }
+      }
+  // each vertex: onto the surface (a step along the field's gradient), its normal the gradient, its colour, shine
+  // and glow from the shapes nearest it (blended across their seams), its bones the two nearest
+  mesh->v.resize(pos.size());
+  SqlThreadPool::instance().for_chunks(pos.size(), 256, pos.size() * 64, false, [&](size_t v0, size_t v1, size_t) {
+    std::vector<double> wsum((size_t)nb);
+    for (size_t vi = v0; vi < v1; ++vi) {
+      Vec p = pos[vi];
+      const double h = cell * 0.25;
+      auto grad = [&](Vec q) {
+        return Vec{sc.field({q.x + h, q.y, q.z}) - sc.field({q.x - h, q.y, q.z}), sc.field({q.x, q.y + h, q.z}) - sc.field({q.x, q.y - h, q.z}),
+                   sc.field({q.x, q.y, q.z + h}) - sc.field({q.x, q.y, q.z - h})};
+      };
+      for (int it = 0; it < 2; ++it) {
+        const double d = sc.field(p);
+        const Vec g = grad(p);
+        const double g2 = vdot(g, g) / (4 * h * h);
+        if (g2 > 1e-9) p = vsub(p, vmul(g, d / (2 * h) / g2));
+      }
+      const Vec n = vnorm(grad(p));
+      double R = 0, G = 0, B = 0, S = 0, Gl = 0, W = 0;
+      std::fill(wsum.begin(), wsum.end(), 0.0);
+      double dmin = 1e9;
+      std::vector<std::pair<double, size_t>> near;
+      for (size_t si = 0; si < sc.shapes.size(); ++si) {
+        const Shape& s = sc.shapes[si];
+        if (s.carve) continue;
+        if (vlen(vsub(p, s.bc)) - s.br > dmin + 6.0) continue;
+        double f;
+        const double d = s.dist(p, &f);
+        dmin = std::min(dmin, d);
+        near.push_back({d, si});
+      }
+      for (const auto& nd : near) {
+        const Shape& s = sc.shapes[nd.second];
+        double f;
+        s.dist(p, &f);
+        const double w = std::exp(-(nd.first - dmin) / std::max(0.35, s.blend * 0.35));
+        double r = ((s.c1 >> 16) & 255) * (1 - f) + ((s.c2 >> 16) & 255) * f;
+        double g = ((s.c1 >> 8) & 255) * (1 - f) + ((s.c2 >> 8) & 255) * f;
+        double b = (s.c1 & 255) * (1 - f) + (s.c2 & 255) * f;
+        if (s.mottle > 0) {
+          const double gs = 1.0 / s.grain;
+          const double k = 1.0 + s.mottle * (fbm(p.x * gs + 3.1 * s.seed, p.y * gs, p.z * gs) - 0.5) * 1.8;
+          r *= k; g *= k; b *= k;
+        }
+        R += w * r; G += w * g; B += w * b; S += w * s.shine; Gl += w * s.glow; W += w;
+        wsum[(size_t)s.bone] += std::exp(-(nd.first - dmin) / 1.2);
+      }
+      int b0 = 0, b1 = 0;
+      for (int b = 0; b < nb; ++b) if (wsum[(size_t)b] > wsum[(size_t)b0]) b0 = b;
+      b1 = b0;
+      for (int b = 0; b < nb; ++b) if (b != b0 && (b1 == b0 || wsum[(size_t)b] > wsum[(size_t)b1])) b1 = b;
+      const double w0 = wsum[(size_t)b0] + wsum[(size_t)b1] > 0 ? wsum[(size_t)b0] / (wsum[(size_t)b0] + wsum[(size_t)b1]) : 1.0;
+      W = std::max(W, 1e-9);
+      // a cavity (where the surface folds in) is darker: the field a little way out along the normal tells
+      const double occ = std::min(1.0, std::max(0.35, sc.field(vadd(p, vmul(n, 2.5))) / 2.5));
+      R3dMesh::V V{(float)p.x, (float)p.y, (float)p.z, (float)n.x, (float)n.y, (float)n.z,
+                   (float)(R / W / 255.0 * occ), (float)(G / W / 255.0 * occ), (float)(B / W / 255.0 * occ),
+                   (float)(S / W), (float)(Gl / W), {(uint8_t)b0, (uint8_t)b1}, (float)w0};
+      mesh->v[vi] = V;
+    }
+  });
+  mesh->bones = nb;
+  mesh->inv_rest.resize((size_t)nb * 12);
+  for (int b = 0; b < nb; ++b) m34_inverse_rigid(&rest[(size_t)b * 12], &mesh->inv_rest[(size_t)b * 12]);
+  for (const auto& V : mesh->v) {
+    mesh->radius = std::max(mesh->radius, std::hypot((double)V.x, (double)V.y));
+    mesh->height = std::max(mesh->height, (double)V.z);
+  }
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  auto out = std::make_shared<MapObj>();
+  out->put("verts", Value::integer((int64_t)mesh->v.size()));
+  out->put("tris", Value::integer((int64_t)(mesh->idx.size() / 3)));
+  out->put("ms", Value::real(ms));
+  t->meshes[args[1].as_int()] = std::move(mesh);
+  return Value::object(Type::Map, out);
+}
+
+// ---- models (a skeleton, skinned textured parts, animations: glTF's shape) ---------------------------------------
+//
+//   r3d_texture_rgba(t, id, w, h, px[, layout]) -> id: a true-colour picture, top row first, with mipmaps; px bytes
+//       (or a string of them), 4 a pixel: R G B A, or with layout "argb" a little-endian 0xAARRGGBB word each (what
+//       canvas_to_bytes(canvas, "argb") gives: an image_decode'd picture as it is)
+//   r3d_model(t, id, spec)                -> {nodes, joints, tris}
+//       spec: {nodes: [{parent, t: [x y z], r: [x y z w], s: [x y z]}]  (each node's rest transform in its parent's)
+//              joints: [node ids], inv_bind: bytes (a 4x4 float32 matrix a joint, column after column),
+//              prims: [{node, skinned, tex (an r3d_texture_rgba id, or -1), color: [r g b a],
+//                       positions, normals, uvs, joints, weights (bytes: float32 xyz, xyz, uv; uint32 x4; float32 x4),
+//                       indices (bytes, uint32 each), colors (float32 rgb a vertex), mats (float32 shine glow)}],
+//              up: "y" (glTF's: y up, the model facing +z) or "z" (x forward, y left, z up, as everything here),
+//              scale: units a model unit}
+//   r3d_anim(t, model id, anim id, channels) -> its duration (seconds)
+//       channels: [{node, path ("translation" | "rotation" | "scale"), interp ("LINEAR" | "STEP" | "CUBICSPLINE"),
+//                   times (float32 each), vals (float32: 3 or 4 a key; three times that for CUBICSPLINE)}]
+//   r3d_draw_tex's things also take {model, anim, time, hold, anim2, time2, hold2, mix, scale, ...}: the model posed
+//   by its animation at that time (seconds: round its length again and again, or with hold once and then held at
+//   its end), blended mix of the way to anim2 at time2.
+
+struct R3dModel {
+  struct Node { int parent = -1; double t[3] = {0, 0, 0}, r[4] = {0, 0, 0, 1}, s[3] = {1, 1, 1}; };
+  struct Vert { float p[3], n[3], uv[2]; uint8_t j[4]; float w[4]; float c[3] = {1, 1, 1}; float shine = 0, glow = 0; };
+  struct Prim { int node = 0; bool skinned = false; std::shared_ptr<R3dTex> tex; float col[4] = {1, 1, 1, 1}; bool relief = false; std::vector<Vert> v; std::vector<uint32_t> idx; };
+  struct Channel { int node = 0; int path = 0; int interp = 0; std::vector<float> times, vals; };   // path 0 t, 1 r, 2 s; interp 0 linear, 1 step, 2 cubic
+  struct Anim { std::vector<Channel> ch; double duration = 0; };
+  std::vector<Node> nodes;
+  std::vector<int> order;            // nodes parents first
+  std::vector<int> joints;
+  std::vector<double> inv_bind;      // 12 a joint, row-major 3x4
+  std::vector<Prim> prims;
+  std::unordered_map<int64_t, Anim> anims;
+  double root[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};   // the model's space into ours (axes and scale)
+  double radius = 0, height = 0;
+};
+
+namespace {
+// a rotation, translation and scale as a row-major 3x4
+void trs_matrix(const double* t, const double* q, const double* s, double* M) {
+  const double x = q[0], y = q[1], z = q[2], w = q[3];
+  const double xx = x * x, yy = y * y, zz = z * z, xy = x * y, xz = x * z, yz = y * z, wx = w * x, wy = w * y, wz = w * z;
+  M[0] = (1 - 2 * (yy + zz)) * s[0]; M[1] = 2 * (xy - wz) * s[1]; M[2] = 2 * (xz + wy) * s[2]; M[3] = t[0];
+  M[4] = 2 * (xy + wz) * s[0]; M[5] = (1 - 2 * (xx + zz)) * s[1]; M[6] = 2 * (yz - wx) * s[2]; M[7] = t[1];
+  M[8] = 2 * (xz - wy) * s[0]; M[9] = 2 * (yz + wx) * s[1]; M[10] = (1 - 2 * (xx + yy)) * s[2]; M[11] = t[2];
+}
+void nlerp_q(const double* a, const double* b, double k, double* o) {
+  const double d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const double sgn = d < 0 ? -1.0 : 1.0;
+  double l = 0;
+  for (int i = 0; i < 4; ++i) { o[i] = a[i] * (1 - k) + b[i] * sgn * k; l += o[i] * o[i]; }
+  l = l > 1e-12 ? 1.0 / std::sqrt(l) : 0;
+  for (int i = 0; i < 4; ++i) o[i] *= l;
+}
+// one channel's value at time tm (n numbers: 3 or 4)
+void sample_channel(const R3dModel::Channel& c, double tm, double* out) {
+  const int n = c.path == 1 ? 4 : 3;
+  const size_t keys = c.times.size();
+  const int per = c.interp == 2 ? 3 : 1;   // a cubic key: in-tangent, value, out-tangent
+  auto val = [&](size_t k, int part, int i) { return (double)c.vals[(k * per + (per == 3 ? part : 0)) * n + i]; };
+  if (keys == 0) return;
+  if (tm <= c.times[0] || keys == 1) { for (int i = 0; i < n; ++i) out[i] = val(0, 1, i); return; }
+  if (tm >= c.times[keys - 1]) { for (int i = 0; i < n; ++i) out[i] = val(keys - 1, 1, i); return; }
+  size_t lo = 0, hi = keys - 1;
+  while (hi - lo > 1) { const size_t mid = (lo + hi) / 2; if (c.times[mid] <= tm) lo = mid; else hi = mid; }
+  const double t0 = c.times[lo], t1 = c.times[hi], dt = std::max(1e-9, t1 - t0), k = (tm - t0) / dt;
+  if (c.interp == 1) { for (int i = 0; i < n; ++i) out[i] = val(lo, 1, i); return; }
+  if (c.interp == 2) {
+    const double k2 = k * k, k3 = k2 * k;
+    const double h00 = 2 * k3 - 3 * k2 + 1, h10 = k3 - 2 * k2 + k, h01 = -2 * k3 + 3 * k2, h11 = k3 - k2;
+    for (int i = 0; i < n; ++i) out[i] = h00 * val(lo, 1, i) + h10 * dt * val(lo, 2, i) + h01 * val(hi, 1, i) + h11 * dt * val(hi, 0, i);
+    if (n == 4) { double l = 0; for (int i = 0; i < 4; ++i) l += out[i] * out[i]; l = l > 1e-12 ? 1 / std::sqrt(l) : 0; for (int i = 0; i < 4; ++i) out[i] *= l; }
+    return;
+  }
+  if (n == 4) { const double a[4] = {val(lo, 1, 0), val(lo, 1, 1), val(lo, 1, 2), val(lo, 1, 3)}, b[4] = {val(hi, 1, 0), val(hi, 1, 1), val(hi, 1, 2), val(hi, 1, 3)}; nlerp_q(a, b, k, out); return; }
+  for (int i = 0; i < n; ++i) out[i] = val(lo, 1, i) * (1 - k) + val(hi, 1, i) * k;
+}
+// every node's local transform posed: rest, overwritten by what the animation moves
+void pose_nodes(const R3dModel& m, const R3dModel::Anim* a, double tm, bool hold, std::vector<R3dModel::Node>* out) {
+  *out = m.nodes;
+  if (!a) return;
+  if (hold) tm = std::min(std::max(tm, 0.0), a->duration);   // played once, then held at its end
+  else if (a->duration > 0) tm = std::fmod(std::fmod(tm, a->duration) + a->duration, a->duration);
+  for (const auto& c : a->ch) {
+    if (c.node < 0 || (size_t)c.node >= out->size()) continue;
+    auto& nd = (*out)[(size_t)c.node];
+    sample_channel(c, tm, c.path == 0 ? nd.t : c.path == 1 ? nd.r : nd.s);
+  }
+}
+}  // namespace
+
+// r3d_mesh_data(t, id) -> a sculpted mesh (r3d_mesh's) as packed data, the way models are kept (r3d_model's prims):
+//   {positions, normals (float32 xyz), colors (float32 rgb), mats (float32 shine glow), joints (uint32 x4),
+//    weights (float32 x4), indices (uint32), verts, tris} - its points in the model's space at rest
+Value bi_r3d_mesh_data(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_mesh_data");
+  if (!t) return Value::nil();
+  if (!want_number(args[1], error, "r3d_mesh_data")) return Value::nil();
+  auto it = t->meshes.find(args[1].as_int());
+  if (it == t->meshes.end()) { error = "r3d_mesh_data(): no mesh " + std::to_string(args[1].as_int()); return Value::nil(); }
+  const R3dMesh& m = *it->second;
+  const size_t n = m.v.size();
+  std::vector<uint8_t> P(n * 12), N(n * 12), C(n * 12), M(n * 8), J(n * 16, 0), W(n * 16, 0), I(m.idx.size() * 4);
+  auto putf = [](std::vector<uint8_t>& b, size_t i, float f) { std::memcpy(&b[i * 4], &f, 4); };
+  auto putu = [](std::vector<uint8_t>& b, size_t i, uint32_t u) { std::memcpy(&b[i * 4], &u, 4); };
+  for (size_t i = 0; i < n; ++i) {
+    const auto& V = m.v[i];
+    putf(P, i * 3, V.x); putf(P, i * 3 + 1, V.y); putf(P, i * 3 + 2, V.z);
+    putf(N, i * 3, V.nx); putf(N, i * 3 + 1, V.ny); putf(N, i * 3 + 2, V.nz);
+    putf(C, i * 3, V.r); putf(C, i * 3 + 1, V.g); putf(C, i * 3 + 2, V.b);
+    putf(M, i * 2, V.shine); putf(M, i * 2 + 1, V.glow);
+    putu(J, i * 4, V.bone[0]); putu(J, i * 4 + 1, V.bone[1]);
+    putf(W, i * 4, V.w0); putf(W, i * 4 + 1, 1.0f - V.w0);
+  }
+  for (size_t i = 0; i < m.idx.size(); ++i) putu(I, i, m.idx[i]);
+  auto out = std::make_shared<MapObj>();
+  out->put("positions", Value::bytes(std::move(P)));
+  out->put("normals", Value::bytes(std::move(N)));
+  out->put("colors", Value::bytes(std::move(C)));
+  out->put("mats", Value::bytes(std::move(M)));
+  out->put("joints", Value::bytes(std::move(J)));
+  out->put("weights", Value::bytes(std::move(W)));
+  out->put("indices", Value::bytes(std::move(I)));
+  out->put("verts", Value::integer((int64_t)n));
+  out->put("tris", Value::integer((int64_t)(m.idx.size() / 3)));
+  return Value::object(Type::Map, out);
+}
+
+Value bi_r3d_texture_rgba(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_texture_rgba");
+  if (!t) return Value::nil();
+  for (int i = 1; i <= 3; ++i) if (!want_number(args[(size_t)i], error, "r3d_texture_rgba")) return Value::nil();
+  const int64_t id = args[1].as_int(), w = args[2].as_int(), h = args[3].as_int();
+  if (id < 0 || id > 1000000) { error = "r3d_texture_rgba(): id out of range (0..1000000)"; return Value::nil(); }
+  if (w < 1 || h < 1 || w > 8192 || h > 8192) { error = "r3d_texture_rgba(): size out of range (1..8192)"; return Value::nil(); }
+  const uint8_t* px = nullptr;
+  size_t plen = 0;
+  if (args[4].type == Type::Bytes) { px = args[4].bytes_data().data(); plen = args[4].bytes_data().size(); }
+  else if (args[4].type == Type::Str) { px = (const uint8_t*)args[4].str().data(); plen = args[4].str().size(); }
+  if (!px || plen < (size_t)(w * h * 4)) { error = "r3d_texture_rgba(): the pixels want w x h x 4 bytes"; return Value::nil(); }
+  const bool argb = args.size() > 5 && args[5].type == Type::Str && args[5].str() == "argb";
+  if (args.size() > 5 && args[5].type != Type::Nil && !argb) { error = "r3d_texture_rgba(): layout wants \"argb\" (or nothing, for R G B A)"; return Value::nil(); }
+  auto tx = std::make_shared<R3dTex>();
+  R3dTex::Level L0;
+  L0.w = (int)w; L0.h = (int)h;
+  L0.px.resize((size_t)w * h);
+  for (size_t i = 0; i < L0.px.size(); ++i) {
+    const uint8_t* q = px + i * 4;
+    const uint32_t v = argb ? ((uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24))
+                            : (((uint32_t)q[3] << 24) | ((uint32_t)q[0] << 16) | ((uint32_t)q[1] << 8) | q[2]);
+    if ((v >> 24) < 255) tx->alpha = true;
+    L0.px[i] = v;
+  }
+  tx->mips.push_back(std::move(L0));
+  while (tx->mips.back().w > 1 || tx->mips.back().h > 1) tx->mips.push_back(half_of(tx->mips.back()));
+  if ((size_t)id >= t->tex.size()) t->tex.resize((size_t)id + 1);
+  t->tex[(size_t)id] = std::move(tx);
+  return Value::integer(id);
+}
+
+namespace {
+bool num_list(const Value* v, double* out, int n) {
+  if (!v || v->type != Type::List || v->list_items().size() != (size_t)n) return false;
+  for (int i = 0; i < n; ++i) { if (!v->list_items()[(size_t)i].is_number()) return false; out[i] = v->list_items()[(size_t)i].as_double(); }
+  return true;
+}
+// packed binary data a map member holds: bytes, or a string of them (what sql() gives for a BLOB column)
+struct Blob {
+  const uint8_t* p = nullptr;
+  size_t n = 0;
+  size_t size() const { return n; }
+};
+std::optional<Blob> bytes_member(MapObj* m, const char* k) {
+  Value* v = m->find(k);
+  if (!v) return std::nullopt;
+  if (v->type == Type::Bytes) return Blob{v->bytes_data().data(), v->bytes_data().size()};
+  if (v->type == Type::Str) return Blob{(const uint8_t*)v->str().data(), v->str().size()};
+  return std::nullopt;
+}
+float f32_at(const Blob& b, size_t i) { float f; std::memcpy(&f, b.p + i * 4, 4); return f; }
+uint32_t u32_at(const Blob& b, size_t i) { uint32_t u; std::memcpy(&u, b.p + i * 4, 4); return u; }
+}  // namespace
+
+Value bi_r3d_model(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_model");
+  if (!t) return Value::nil();
+  if (!want_number(args[1], error, "r3d_model")) return Value::nil();
+  if (args[2].type != Type::Map) { error = "r3d_model(): the spec wants a map {nodes, joints, inv_bind, prims, up, scale}"; return Value::nil(); }
+  auto* spec = static_cast<MapObj*>(args[2].obj.get());
+  auto md = std::make_shared<R3dModel>();
+  Value* nodes = spec->find("nodes");
+  if (!nodes || nodes->type != Type::List || nodes->list_items().empty()) { error = "r3d_model(): nodes wants a list of {parent, t, r, s}"; return Value::nil(); }
+  for (const Value& nv : nodes->list_items()) {
+    if (nv.type != Type::Map) { error = "r3d_model(): each node is a map"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(nv.obj.get());
+    R3dModel::Node nd;
+    double par = -1;
+    field(m, "parent", par);
+    nd.parent = (int)par;
+    if (m->find("t") && !num_list(m->find("t"), nd.t, 3)) { error = "r3d_model(): a node's t wants 3 numbers"; return Value::nil(); }
+    if (m->find("r") && !num_list(m->find("r"), nd.r, 4)) { error = "r3d_model(): a node's r wants 4 numbers (a quaternion x y z w)"; return Value::nil(); }
+    if (m->find("s") && !num_list(m->find("s"), nd.s, 3)) { error = "r3d_model(): a node's s wants 3 numbers"; return Value::nil(); }
+    md->nodes.push_back(nd);
+  }
+  const int nn = (int)md->nodes.size();
+  for (const auto& nd : md->nodes) if (nd.parent < -1 || nd.parent >= nn) { error = "r3d_model(): a node's parent is out of range"; return Value::nil(); }
+  // parents first (and no cycles)
+  {
+    std::vector<int> state((size_t)nn, 0);
+    std::function<bool(int)> visit = [&](int i) {
+      if (state[(size_t)i] == 2) return true;
+      if (state[(size_t)i] == 1) return false;
+      state[(size_t)i] = 1;
+      if (md->nodes[(size_t)i].parent >= 0 && !visit(md->nodes[(size_t)i].parent)) return false;
+      state[(size_t)i] = 2;
+      md->order.push_back(i);
+      return true;
+    };
+    for (int i = 0; i < nn; ++i) if (!visit(i)) { error = "r3d_model(): the nodes' parents form a cycle"; return Value::nil(); }
+  }
+  if (Value* jv = spec->find("joints"); jv && jv->type == Type::List) {
+    for (const Value& j : jv->list_items()) {
+      if (!j.is_number() || j.as_int() < 0 || j.as_int() >= nn) { error = "r3d_model(): joints wants node ids"; return Value::nil(); }
+      md->joints.push_back((int)j.as_int());
+    }
+    const auto ib = bytes_member(spec, "inv_bind");
+    if (!md->joints.empty() && (!ib || ib->size() < md->joints.size() * 64)) { error = "r3d_model(): inv_bind wants a 4x4 float32 matrix a joint"; return Value::nil(); }
+    if (md->joints.size() > 255) { error = "r3d_model(): at most 255 joints"; return Value::nil(); }
+    md->inv_bind.resize(md->joints.size() * 12);
+    for (size_t j = 0; j < md->joints.size(); ++j)
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) md->inv_bind[j * 12 + (size_t)r * 4 + c] = f32_at(*ib, j * 16 + (size_t)c * 4 + r);   // column-major in
+  }
+  double scale = 1;
+  field(spec, "scale", scale);
+  Value* up = spec->find("up");
+  const bool yup = !up || (up->type == Type::Str && up->str() == "y");
+  if (yup) {   // glTF's y up, facing +z -> ours: x forward (their z), y left (their x), z up (their y)
+    const double R[12] = {0, 0, scale, 0, scale, 0, 0, 0, 0, scale, 0, 0};
+    std::memcpy(md->root, R, sizeof R);
+  } else {
+    const double R[12] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0};
+    std::memcpy(md->root, R, sizeof R);
+  }
+  Value* prims = spec->find("prims");
+  if (!prims || prims->type != Type::List) { error = "r3d_model(): prims wants a list"; return Value::nil(); }
+  int64_t tris = 0;
+  size_t pi = 0;
+  for (const Value& pv : prims->list_items()) {
+    if (pv.type != Type::Map) { error = "r3d_model(): prim " + std::to_string(pi) + " is not a map"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(pv.obj.get());
+    R3dModel::Prim pr;
+    double nodev = 0, texv = -1;
+    field(m, "node", nodev); field(m, "tex", texv);
+    pr.node = (int)nodev;
+    if (pr.node < 0 || pr.node >= nn) { error = "r3d_model(): prim " + std::to_string(pi) + "'s node is out of range"; return Value::nil(); }
+    if (Value* sk = m->find("skinned")) pr.skinned = sk->type == Type::Bool ? sk->b : (sk->is_number() && sk->as_int() != 0);
+    if (texv >= 0) { pr.tex = tex_of(*t, (int64_t)texv); if (!pr.tex) { error = "r3d_model(): prim " + std::to_string(pi) + " names texture " + std::to_string((int64_t)texv) + ", which was not given"; return Value::nil(); } }
+    double col[4] = {1, 1, 1, 1};
+    if (m->find("color") && !num_list(m->find("color"), col, 4)) { error = "r3d_model(): prim " + std::to_string(pi) + "'s color wants 4 numbers"; return Value::nil(); }
+    for (int i = 0; i < 4; ++i) pr.col[i] = (float)col[i];
+    const auto P = bytes_member(m, "positions");
+    const auto N = bytes_member(m, "normals");
+    const auto U = bytes_member(m, "uvs");
+    const auto J = bytes_member(m, "joints");
+    const auto W = bytes_member(m, "weights");
+    const auto I = bytes_member(m, "indices");
+    const auto Cc = bytes_member(m, "colors");
+    const auto Mt = bytes_member(m, "mats");
+    if (!P || P->size() % 12) { error = "r3d_model(): prim " + std::to_string(pi) + " needs positions (float32 xyz)"; return Value::nil(); }
+    const size_t nv = P->size() / 12;
+    if (N && N->size() != nv * 12) { error = "r3d_model(): prim " + std::to_string(pi) + "'s normals are not one a vertex"; return Value::nil(); }
+    if (U && U->size() != nv * 8) { error = "r3d_model(): prim " + std::to_string(pi) + "'s uvs are not one a vertex"; return Value::nil(); }
+    if (pr.skinned && (!J || !W || J->size() != nv * 16 || W->size() != nv * 16 || md->joints.empty())) {
+      error = "r3d_model(): prim " + std::to_string(pi) + " is skinned but lacks joints and weights (4 a vertex) or the model its joints";
+      return Value::nil();
+    }
+    if (Cc && Cc->size() != nv * 12) { error = "r3d_model(): prim " + std::to_string(pi) + "'s colors are not one a vertex (float32 r g b)"; return Value::nil(); }
+    if (Mt && Mt->size() != nv * 8) { error = "r3d_model(): prim " + std::to_string(pi) + "'s mats are not one a vertex (float32 shine glow)"; return Value::nil(); }
+    // a sculpted part (vertex colours, no texture) gets the fill's fine relief, as the sculptor's own meshes do
+    pr.relief = Cc.has_value() && !pr.tex;
+    pr.v.resize(nv);
+    for (size_t i = 0; i < nv; ++i) {
+      auto& V = pr.v[i];
+      for (int k = 0; k < 3; ++k) { V.p[k] = f32_at(*P, i * 3 + k); V.n[k] = N ? f32_at(*N, i * 3 + k) : 0.0f; }
+      V.uv[0] = U ? f32_at(*U, i * 2) : 0.0f; V.uv[1] = U ? f32_at(*U, i * 2 + 1) : 0.0f;
+      if (Cc) for (int k = 0; k < 3; ++k) V.c[k] = f32_at(*Cc, i * 3 + k);
+      if (Mt) { V.shine = f32_at(*Mt, i * 2); V.glow = f32_at(*Mt, i * 2 + 1); }
+      for (int k = 0; k < 4; ++k) {
+        const uint32_t j = pr.skinned ? u32_at(*J, i * 4 + k) : 0;
+        if (pr.skinned && j >= md->joints.size()) { error = "r3d_model(): prim " + std::to_string(pi) + " names joint " + std::to_string(j) + " of " + std::to_string(md->joints.size()); return Value::nil(); }
+        V.j[k] = (uint8_t)j;
+        V.w[k] = pr.skinned ? f32_at(*W, i * 4 + k) : (k == 0 ? 1.0f : 0.0f);
+      }
+      if (pr.skinned) {   // weights that do not add to 1 are made to
+        const float s = V.w[0] + V.w[1] + V.w[2] + V.w[3];
+        if (s > 1e-6f) for (int k = 0; k < 4; ++k) V.w[k] /= s;
+      }
+    }
+    if (I) {
+      if (I->size() % 12) { error = "r3d_model(): prim " + std::to_string(pi) + "'s indices are not whole triangles"; return Value::nil(); }
+      pr.idx.resize(I->size() / 4);
+      for (size_t i = 0; i < pr.idx.size(); ++i) {
+        pr.idx[i] = u32_at(*I, i);
+        if (pr.idx[i] >= nv) { error = "r3d_model(): prim " + std::to_string(pi) + " has an index past its vertices"; return Value::nil(); }
+      }
+    } else {
+      if (nv % 3) { error = "r3d_model(): prim " + std::to_string(pi) + " has no indices and not whole triangles"; return Value::nil(); }
+      for (uint32_t i = 0; i < nv; ++i) pr.idx.push_back(i);
+    }
+    // no normals: each vertex the mean of its triangles' faces
+    if (!N) {
+      for (size_t i = 0; i + 2 < pr.idx.size(); i += 3) {
+        auto& A = pr.v[pr.idx[i]]; auto& B = pr.v[pr.idx[i + 1]]; auto& C = pr.v[pr.idx[i + 2]];
+        const Vec fn = vcross(vsub({B.p[0], B.p[1], B.p[2]}, {A.p[0], A.p[1], A.p[2]}), vsub({C.p[0], C.p[1], C.p[2]}, {A.p[0], A.p[1], A.p[2]}));
+        for (auto* V : {&A, &B, &C}) { V->n[0] += (float)fn.x; V->n[1] += (float)fn.y; V->n[2] += (float)fn.z; }
+      }
+      for (auto& V : pr.v) { const Vec n = vnorm({V.n[0], V.n[1], V.n[2]}); V.n[0] = (float)n.x; V.n[1] = (float)n.y; V.n[2] = (float)n.z; }
+    }
+    tris += (int64_t)pr.idx.size() / 3;
+    md->prims.push_back(std::move(pr));
+    ++pi;
+  }
+  // its size in our space at rest, for culling
+  {
+    std::vector<double> world((size_t)nn * 12);
+    for (int i : md->order) {
+      double L[12];
+      trs_matrix(md->nodes[(size_t)i].t, md->nodes[(size_t)i].r, md->nodes[(size_t)i].s, L);
+      if (md->nodes[(size_t)i].parent < 0) std::memcpy(&world[(size_t)i * 12], L, sizeof L);
+      else m34_mul(&world[(size_t)md->nodes[(size_t)i].parent * 12], L, &world[(size_t)i * 12]);
+    }
+    for (const auto& pr : md->prims)
+      for (const auto& V : pr.v) {
+        Vec p{V.p[0], V.p[1], V.p[2]};
+        if (!pr.skinned) p = m34_point(&world[(size_t)pr.node * 12], p);
+        else { double M[12]; m34_mul(&world[(size_t)md->joints[V.j[0]] * 12], &md->inv_bind[(size_t)V.j[0] * 12], M); p = m34_point(M, p); }
+        p = m34_point(md->root, p);
+        md->radius = std::max(md->radius, std::hypot(p.x, p.y));
+        md->height = std::max(md->height, p.z);
+      }
+  }
+  auto out = std::make_shared<MapObj>();
+  out->put("nodes", Value::integer(nn));
+  out->put("joints", Value::integer((int64_t)md->joints.size()));
+  out->put("tris", Value::integer(tris));
+  out->put("height", Value::real(md->height));
+  out->put("radius", Value::real(md->radius));
+  t->models[args[1].as_int()] = std::move(md);
+  return Value::object(Type::Map, out);
+}
+
+Value bi_r3d_anim(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_anim");
+  if (!t) return Value::nil();
+  if (!want_number(args[1], error, "r3d_anim") || !want_number(args[2], error, "r3d_anim") || !want_list(args[3], error, "r3d_anim")) return Value::nil();
+  auto it = t->models.find(args[1].as_int());
+  if (it == t->models.end()) { error = "r3d_anim(): no model " + std::to_string(args[1].as_int()); return Value::nil(); }
+  R3dModel& md = *it->second;
+  R3dModel::Anim an;
+  size_t ci = 0;
+  for (const Value& cv : args[3].list_items()) {
+    if (cv.type != Type::Map) { error = "r3d_anim(): channel " + std::to_string(ci) + " is not a map"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(cv.obj.get());
+    R3dModel::Channel c;
+    double nodev = -1;
+    field(m, "node", nodev);
+    c.node = (int)nodev;
+    if (c.node < 0 || (size_t)c.node >= md.nodes.size()) { error = "r3d_anim(): channel " + std::to_string(ci) + "'s node is out of range"; return Value::nil(); }
+    Value* pv = m->find("path");
+    const std::string path = pv && pv->type == Type::Str ? pv->str() : "";
+    if (path == "translation") c.path = 0; else if (path == "rotation") c.path = 1; else if (path == "scale") c.path = 2;
+    else { error = "r3d_anim(): channel " + std::to_string(ci) + "'s path \"" + path + "\" (translation, rotation or scale)"; return Value::nil(); }
+    Value* iv = m->find("interp");
+    const std::string interp = iv && iv->type == Type::Str ? iv->str() : "LINEAR";
+    c.interp = interp == "STEP" ? 1 : interp == "CUBICSPLINE" ? 2 : 0;
+    const auto T = bytes_member(m, "times");
+    const auto V = bytes_member(m, "vals");
+    if (!T || !V || T->size() % 4 || V->size() % 4) { error = "r3d_anim(): channel " + std::to_string(ci) + " needs times and vals (float32 bytes)"; return Value::nil(); }
+    const size_t keys = T->size() / 4, n = c.path == 1 ? 4 : 3, per = c.interp == 2 ? 3 : 1;
+    if (V->size() / 4 != keys * n * per) { error = "r3d_anim(): channel " + std::to_string(ci) + " has " + std::to_string(V->size() / 4) + " values for " + std::to_string(keys) + " keys"; return Value::nil(); }
+    c.times.resize(keys);
+    for (size_t k = 0; k < keys; ++k) { c.times[k] = f32_at(*T, k); an.duration = std::max(an.duration, (double)c.times[k]); }
+    c.vals.resize(V->size() / 4);
+    for (size_t k = 0; k < c.vals.size(); ++k) c.vals[k] = f32_at(*V, k);
+    an.ch.push_back(std::move(c));
+    ++ci;
+  }
+  const double dur = an.duration;
+  md.anims[args[2].as_int()] = std::move(an);
+  return Value::real(dur);
+}
+
+// ---- sprite frames ---------------------------------------------------------------------------------------------
+//
+//   r3d_sprite_set(t, id, views) -> id
+//       a sprite frame for r3d_draw_tex's things: views is one map (seen the same from everywhere) or eight
+//       (rotations 1..8), each {tex (an id given to r3d_texture), flip, left, top} - the picture, mirrored or not,
+//       and its origin (Doom's left and top offsets, in the picture's own texels).
+
+Value bi_r3d_sprite_set(Vm&, std::vector<Value>& args, std::string& error) {
+  auto t = get_target(args[0], error, "r3d_sprite_set");
+  if (!t) return Value::nil();
+  if (!want_number(args[1], error, "r3d_sprite_set") || !want_list(args[2], error, "r3d_sprite_set")) return Value::nil();
+  const int64_t id = args[1].as_int();
+  R3dSet set;
+  for (const Value& vv : args[2].list_items()) {
+    if (vv.type != Type::Map) { error = "r3d_sprite_set(): each view is a map {tex, flip, left, top}"; return Value::nil(); }
+    auto* m = static_cast<MapObj*>(vv.obj.get());
+    R3dView v;
+    double texv = 0;
+    if (!field(m, "tex", texv) || !field(m, "left", v.left) || !field(m, "top", v.top)) {
+      error = "r3d_sprite_set(): each view needs numbers tex, left and top";
+      return Value::nil();
+    }
+    v.tex = (int64_t)texv;
+    if (!tex_of(*t, v.tex)) { error = "r3d_sprite_set(): texture " + std::to_string(v.tex) + " was not given to r3d_texture"; return Value::nil(); }
+    if (Value* f = m->find("flip")) v.flip = f->type == Type::Bool ? f->b : (f->is_number() && f->as_double() != 0);
+    set.views.push_back(v);
+  }
+  if (set.views.size() != 1 && set.views.size() != 8) { error = "r3d_sprite_set(): a sprite frame has 1 view or 8, not " + std::to_string(set.views.size()); return Value::nil(); }
+  t->sets[id] = std::move(set);
+  return Value::integer(id);
 }
 
 Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
@@ -578,11 +1630,13 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
   }
   if (!(fov > 1.0 && fov < 179.0)) { error = "r3d_draw_tex(): fov_deg must be between 1 and 179"; return Value::nil(); }
   const double focal = (t->w * 0.5) / std::tan(fov * 3.14159265358979323846 / 360.0);
+  t->focal = focal;
   t->tris = t->filled = t->clipped = t->pixels = 0;
+  t->pitch = 0;
   // With a camera {x, y, z, angle} (Doom's map axes: x east, y north, z up, angle in degrees from east), the rows
   // are in the world and are turned to the camera here, each frame, from geometry worked out once a tic.
   bool world = false;
-  double cxw = 0, cyw = 0, czw = 0, ca = 1, sa = 0;
+  double cxw = 0, cyw = 0, czw = 0, ca = 1, sa = 0, cp = 1, sp = 0;
   if (args.size() > 3 && args[3].type != Type::Nil) {
     if (args[3].type != Type::Map) { error = "r3d_draw_tex(): the camera wants a map {x, y, z, angle}"; return Value::nil(); }
     auto* cm = static_cast<MapObj*>(args[3].obj.get());
@@ -594,8 +1648,20 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
     const double r = ang * 3.14159265358979323846 / 180.0;
     ca = std::cos(r);
     sa = std::sin(r);
+    // looking up (positive) or down: degrees, a little short of straight up or down
+    double pitch = 0;
+    field(cm, "pitch", pitch);
+    pitch = std::max(-85.0, std::min(85.0, pitch)) * 3.14159265358979323846 / 180.0;
+    cp = std::cos(pitch);
+    sp = std::sin(pitch);
+    t->pitch = pitch;
     world = true;
   }
+  // a point (or, without the eye's place, a direction) of the world as the camera sees it: x right, y up, z ahead
+  auto to_cam = [&](double ex, double ey, double ez) {
+    const double x = ex * sa - ey * ca, f = ex * ca + ey * sa;
+    return Vec{x, ez * cp - f * sp, ez * sp + f * cp};
+  };
   static const std::string kx[3] = {"x0", "x1", "x2"}, ky[3] = {"y0", "y1", "y2"}, kz[3] = {"z0", "z1", "z2"};
   static const std::string ku[3] = {"u0", "u1", "u2"}, kv[3] = {"v0", "v1", "v2"};
   static const std::string ktex = "tex", klight = "light", kflags = "flags";
@@ -616,7 +1682,8 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
     if (world)
       for (int i = 0; i < 3; ++i) {
         const double dx = v[i].x - cxw, dy = v[i].y - cyw;
-        v[i] = {dx * sa - dy * ca, v[i].z - czw, dx * ca + dy * sa, v[i].u, v[i].v};
+        const Vec c = to_cam(dx, dy, v[i].z - czw);
+        v[i] = {c.x, c.y, c.z, v[i].u, v[i].v};
       }
     double texv = 0, lightv = 255, flagsv = 0;
     if (!field(m, ktex, texv)) { error = "r3d_draw_tex(): row " + std::to_string(at) + " needs a number tex"; return Value::nil(); }
@@ -629,6 +1696,228 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
     clip_project(*t, v, focal, tx.get(), (float)(std::min(255.0, std::max(0.0, lightv)) / 255.0), flags,
                  &tris[(flags & 8) ? 2 : (flags & 1) ? 1 : 0], &t->clipped);
     ++at;
+  }
+  if (args.size() > 4 && args[4].type != Type::Nil) {
+    if (!world) { error = "r3d_draw_tex(): things want a camera"; return Value::nil(); }
+    if (!want_list(args[4], error, "r3d_draw_tex")) return Value::nil();
+    constexpr double kPi = 3.14159265358979323846;
+    const double half_fov = std::atan(t->w * 0.5 / focal);
+    static const std::string kset = "set", kangle = "angle", kz0 = "z", kx0 = "x", ky0 = "y";
+    size_t ti = 0;
+    for (const Value& row : args[4].list_items()) {
+      if (row.type != Type::Map) { error = "r3d_draw_tex(): thing " + std::to_string(ti) + " is not a map"; return Value::nil(); }
+      auto* m = static_cast<MapObj*>(row.obj.get());
+      double setv = -1, meshv = -1, modelv = -1, X = 0, Y = 0, Z = 0, ang = 0, lightv = 255, flagsv = 0;
+      field(m, kset, setv);
+      field(m, "mesh", meshv);
+      field(m, "model", modelv);
+      if ((setv < 0 && meshv < 0 && modelv < 0) || !field(m, kx0, X) || !field(m, ky0, Y) || !field(m, kz0, Z)) {
+        error = "r3d_draw_tex(): thing " + std::to_string(ti) + " needs a set, a mesh or a model, and numbers x, y and z";
+        return Value::nil();
+      }
+      field(m, kangle, ang);
+      field(m, klight, lightv);
+      field(m, kflags, flagsv);
+      ++ti;
+      const float light = (float)(std::min(255.0, std::max(0.0, lightv)) / 255.0);
+      const int tflags = (int)flagsv & (2 | 8);
+      const double dx = X - cxw, dy = Y - cyw;
+      const double fwd = dx * ca + dy * sa, side = dx * sa - dy * ca;
+      if (modelv >= 0) {
+        auto mit = t->models.find((int64_t)modelv);
+        if (mit == t->models.end()) { error = "r3d_draw_tex(): thing " + std::to_string(ti - 1) + " names model " + std::to_string((int64_t)modelv) + ", which r3d_model was not given"; return Value::nil(); }
+        const R3dModel& md = *mit->second;
+        double scale = 1.0;
+        field(m, "scale", scale);
+        const double reach = (md.radius + md.height) * scale;
+        if (fwd < -reach) continue;
+        if (fwd > 0 && std::fabs(side) - reach > std::tan(half_fov) * fwd + reach) continue;
+        // the pose: its animation at its time, blended with a second
+        double animv = -1, tm = 0, anim2v = -1, tm2 = 0, mix = 0;
+        field(m, "anim", animv); field(m, "time", tm); field(m, "anim2", anim2v); field(m, "time2", tm2); field(m, "mix", mix);
+        auto flag_of = [&](const char* k) { Value* v = m->find(k); return v && v->type == Type::Bool && v->b; };
+        const bool hold = flag_of("hold"), hold2 = flag_of("hold2");
+        auto find_anim = [&](double id) -> const R3dModel::Anim* {
+          if (id < 0) return nullptr;
+          auto a = md.anims.find((int64_t)id);
+          return a == md.anims.end() ? nullptr : &a->second;
+        };
+        std::vector<R3dModel::Node> posed, posed2;
+        pose_nodes(md, find_anim(animv), tm, hold, &posed);
+        if (anim2v >= 0 && mix > 0) {
+          pose_nodes(md, find_anim(anim2v), tm2, hold2, &posed2);
+          const double k = std::min(1.0, mix);
+          for (size_t i = 0; i < posed.size(); ++i) {
+            for (int e = 0; e < 3; ++e) { posed[i].t[e] += (posed2[i].t[e] - posed[i].t[e]) * k; posed[i].s[e] += (posed2[i].s[e] - posed[i].s[e]) * k; }
+            double q[4];
+            nlerp_q(posed[i].r, posed2[i].r, k, q);
+            std::memcpy(posed[i].r, q, sizeof q);
+          }
+        }
+        // every node in the model's space, then each joint's skin matrix, all into ours (axes, scale, where the
+        // thing stands and which way it faces)
+        const size_t nn = md.nodes.size();
+        std::vector<double> world(nn * 12);
+        for (int i : md.order) {
+          double L[12];
+          trs_matrix(posed[(size_t)i].t, posed[(size_t)i].r, posed[(size_t)i].s, L);
+          if (md.nodes[(size_t)i].parent < 0) std::memcpy(&world[(size_t)i * 12], L, sizeof L);
+          else m34_mul(&world[(size_t)md.nodes[(size_t)i].parent * 12], L, &world[(size_t)i * 12]);
+        }
+        const double th = ang * kPi / 180.0, ct = std::cos(th), st = std::sin(th);
+        const double place[12] = {ct * scale, -st * scale, 0, X, st * scale, ct * scale, 0, Y, 0, 0, scale, Z};
+        double to_world[12];
+        m34_mul(place, md.root, to_world);
+        std::vector<double> skin(md.joints.size() * 12);
+        for (size_t j = 0; j < md.joints.size(); ++j) {
+          double M[12];
+          m34_mul(&world[(size_t)md.joints[j] * 12], &md.inv_bind[j * 12], M);
+          m34_mul(to_world, M, &skin[j * 12]);
+        }
+        for (const auto& pr : md.prims) {
+          double node_m[12];
+          if (!pr.skinned) m34_mul(to_world, &world[(size_t)pr.node * 12], node_m);
+          std::vector<TV> cam(pr.v.size());
+          std::vector<Vec> wp(pr.v.size());
+          for (size_t i = 0; i < pr.v.size(); ++i) {
+            const auto& V = pr.v[i];
+            double M[12];
+            if (pr.skinned) {
+              for (int e = 0; e < 12; ++e) M[e] = 0;
+              for (int k = 0; k < 4; ++k) {
+                if (V.w[k] == 0) continue;
+                const double* S = &skin[(size_t)V.j[k] * 12];
+                for (int e = 0; e < 12; ++e) M[e] += S[e] * V.w[k];
+              }
+            } else {
+              std::memcpy(M, node_m, sizeof M);
+            }
+            const Vec W = m34_point(M, {V.p[0], V.p[1], V.p[2]});
+            const Vec N = vnorm(m34_dir(M, {V.n[0], V.n[1], V.n[2]}));
+            wp[i] = W;
+            const double ex = W.x - cxw, ey = W.y - cyw;
+            const Vec c = to_cam(ex, ey, W.z - czw);
+            TV tv{c.x, c.y, c.z, V.uv[0], V.uv[1]};
+            tv.a[0] = pr.col[0] * V.c[0]; tv.a[1] = pr.col[1] * V.c[1]; tv.a[2] = pr.col[2] * V.c[2];
+            tv.shine = V.shine; tv.glow = V.glow;
+            if (pr.relief) { tv.a[6] = V.p[0]; tv.a[7] = V.p[1]; tv.a[8] = V.p[2]; }
+            const Vec nc = to_cam(N.x, N.y, N.z);
+            tv.a[3] = nc.x; tv.a[4] = nc.y; tv.a[5] = nc.z;
+            cam[i] = tv;
+          }
+          const R3dTex* tex = pr.tex.get();
+          // texture coordinates are 0..1 across the picture: in its texels for the fill
+          if (tex) for (auto& c : cam) { c.u *= tex->mips[0].w; c.v *= tex->mips[0].h; }
+          auto& out = tris[(tflags & 8) ? 2 : 0];
+          for (size_t i = 0; i + 2 < pr.idx.size(); i += 3) {
+            const uint32_t a = pr.idx[i], b = pr.idx[i + 1], c = pr.idx[i + 2];
+            const Vec fn = vcross(vsub(wp[b], wp[a]), vsub(wp[c], wp[a]));
+            if (vdot(fn, vsub({cxw, cyw, czw}, wp[a])) <= 0) continue;
+            const TV v3[3] = {cam[a], cam[b], cam[c]};
+            ++t->tris;
+            clip_project(*t, v3, focal, tex, light, tflags | 64, &out, &t->clipped);
+          }
+        }
+        continue;
+      }
+      if (meshv >= 0) {
+        auto mit = t->meshes.find((int64_t)meshv);
+        if (mit == t->meshes.end()) { error = "r3d_draw_tex(): thing " + std::to_string(ti - 1) + " names mesh " + std::to_string((int64_t)meshv) + ", which r3d_mesh was not given"; return Value::nil(); }
+        const R3dMesh& mesh = *mit->second;
+        const double reach = mesh.radius + mesh.height;
+        if (fwd < -reach) continue;
+        if (fwd > 0 && std::fabs(side) - reach > std::tan(half_fov) * fwd + reach) continue;
+        // the bones' poses: 3x4 matrices row by row (the model's space from each bone's), identity if not given
+        std::vector<double> bm((size_t)mesh.bones * 12, 0.0);
+        for (int b = 0; b < mesh.bones; ++b) { bm[(size_t)b * 12] = 1; bm[(size_t)b * 12 + 5] = 1; bm[(size_t)b * 12 + 10] = 1; }
+        if (Value* bv = m->find("bones")) {
+          if (bv->type != Type::List) { error = "r3d_draw_tex(): thing " + std::to_string(ti - 1) + "'s bones wants a list of numbers"; return Value::nil(); }
+          const auto& L = bv->list_items();
+          for (size_t i = 0; i < L.size() && i < bm.size(); ++i) {
+            if (!L[i].is_number()) { error = "r3d_draw_tex(): thing " + std::to_string(ti - 1) + "'s bones wants numbers"; return Value::nil(); }
+            bm[i] = L[i].as_double();
+          }
+        }
+        double scale = 1.0;
+        field(m, "scale", scale);
+        const double th = ang * kPi / 180.0, ct = std::cos(th), st = std::sin(th);
+        std::vector<TV> cam(mesh.v.size());
+        std::vector<Vec> wp(mesh.v.size());
+        // each bone's skin matrix: from the model at rest to the bone posed (posed x inverse rest)
+        std::vector<double> skin((size_t)mesh.bones * 12);
+        for (int b = 0; b < mesh.bones; ++b) m34_mul(&bm[(size_t)b * 12], &mesh.inv_rest[(size_t)b * 12], &skin[(size_t)b * 12]);
+        for (size_t i = 0; i < mesh.v.size(); ++i) {
+          const auto& V = mesh.v[i];
+          const double* A = &skin[(size_t)V.bone[0] * 12];
+          const double* Bm = &skin[(size_t)V.bone[1] * 12];
+          const double w0 = V.w0, w1 = 1.0 - V.w0;
+          double M[12];
+          for (int e = 0; e < 12; ++e) M[e] = A[e] * w0 + Bm[e] * w1;
+          const double px = M[0] * V.x + M[1] * V.y + M[2] * V.z + M[3];
+          const double py = M[4] * V.x + M[5] * V.y + M[6] * V.z + M[7];
+          const double pz = M[8] * V.x + M[9] * V.y + M[10] * V.z + M[11];
+          const double nx = M[0] * V.nx + M[1] * V.ny + M[2] * V.nz;
+          const double ny = M[4] * V.nx + M[5] * V.ny + M[6] * V.nz;
+          const double nz = M[8] * V.nx + M[9] * V.ny + M[10] * V.nz;
+          const Vec W{X + (px * ct - py * st) * scale, Y + (px * st + py * ct) * scale, Z + pz * scale};
+          const Vec N = vnorm({nx * ct - ny * st, nx * st + ny * ct, nz});
+          wp[i] = W;
+          const double ex = W.x - cxw, ey = W.y - cyw;
+          const Vec c = to_cam(ex, ey, W.z - czw);
+          TV tv{c.x, c.y, c.z, 0, 0};
+          tv.a[0] = V.r; tv.a[1] = V.g; tv.a[2] = V.b;
+          // the normal in camera space
+          const Vec nc = to_cam(N.x, N.y, N.z);
+          tv.a[3] = nc.x; tv.a[4] = nc.y; tv.a[5] = nc.z;
+          tv.a[6] = V.x; tv.a[7] = V.y; tv.a[8] = V.z;
+          tv.shine = V.shine; tv.glow = V.glow;
+          cam[i] = tv;
+        }
+        auto& out = tris[(tflags & 8) ? 2 : 0];
+        for (size_t i = 0; i + 2 < mesh.idx.size(); i += 3) {
+          const uint32_t a = mesh.idx[i], b = mesh.idx[i + 1], c = mesh.idx[i + 2];
+          const Vec fn = vcross(vsub(wp[b], wp[a]), vsub(wp[c], wp[a]));
+          if (vdot(fn, vsub({cxw, cyw, czw}, wp[a])) <= 0) continue;
+          const TV v3[3] = {cam[a], cam[b], cam[c]};
+          ++t->tris;
+          clip_project(*t, v3, focal, nullptr, light, tflags, &out, &t->clipped);
+        }
+        continue;
+      }
+      auto it = t->sets.find((int64_t)setv);
+      if (it == t->sets.end()) { error = "r3d_draw_tex(): thing " + std::to_string(ti - 1) + " names sprite set " + std::to_string((int64_t)setv) + ", which r3d_sprite_set was not given"; return Value::nil(); }
+      const R3dSet& set = it->second;
+      // well behind the eye, or well off either side of the view: nothing to draw
+      if (fwd < -128.0) continue;
+      if (fwd > 0 && std::fabs(side) - 128.0 > std::tan(half_fov) * fwd + 128.0) continue;
+      // the picture, upright, across the line of sight: the view for where the camera stands
+      const R3dView* view = &set.views[0];
+      if (set.views.size() == 8) {
+        const double toward = std::atan2(cyw - Y, cxw - X) * 180.0 / kPi;
+        double rel = toward - ang + 22.5;
+        rel -= 360.0 * std::floor(rel / 360.0);
+        view = &set.views[(size_t)std::min(7, (int)(rel / 45.0))];
+      }
+      auto tx = tex_of(*t, view->tex);
+      if (!tx) continue;
+      const double W = tx->mips[0].w / tx->scale, H = tx->mips[0].h / tx->scale;
+      const double h0 = -view->left, h1 = W - view->left;
+      const double ax = X + sa * h0, ay = Y - ca * h0, bx = X + sa * h1, by = Y - ca * h1;
+      const double zb = Z + view->top - H, zt = Z + view->top;
+      const double ul = view->flip ? W : 0, ur = view->flip ? 0 : W;
+      auto cam_of = [&](double wx, double wy, double wz, double u, double vv) {
+        const double ex = wx - cxw, ey = wy - cyw;
+        const Vec c = to_cam(ex, ey, wz - czw);
+        return TV{c.x, c.y, c.z, u, vv};
+      };
+      const TV A = cam_of(ax, ay, zb, ul, H), B = cam_of(bx, by, zb, ur, H), C = cam_of(bx, by, zt, ur, 0), D = cam_of(ax, ay, zt, ul, 0);
+      const int sflags = 1 | 4 | tflags;
+      auto& out = tris[(sflags & 8) ? 2 : 1];
+      const TV q0[3] = {A, B, C}, q1[3] = {A, C, D};
+      t->tris += 2;
+      clip_project(*t, q0, focal, tx.get(), light, sflags, &out, &t->clipped);
+      clip_project(*t, q1, focal, tx.get(), light, sflags, &out, &t->clipped);
+    }
   }
   // The rows of the target in bands, one band per task: every triangle is filled band by band, so no two threads
   // write a pixel, and each pass (opaque, masked, fuzz) is finished before the next starts.
@@ -662,21 +1951,30 @@ Value bi_r3d_sky(Vm&, std::vector<Value>& args, std::string& error) {
   if (!(fov > 1.0 && fov < 179.0)) { error = "r3d_sky(): fov_deg must be between 1 and 179"; return Value::nil(); }
   const double focal = (t->w * 0.5) / std::tan(fov * 3.14159265358979323846 / 360.0);
   const R3dTex::Level& L = tx->mips[0];
+  const double sc = tx->scale;
   // Doom's: 1024 sky columns round the horizon (a 256-wide texture four times), each screen row the texture row
   // it would be on Doom's 200-row view (the horizon at row 100), the rows below the texture its last one.
   std::vector<double> col((size_t)t->w);
   for (int x = 0; x < t->w; ++x) {
     const double ang = -yaw + std::atan2(x + 0.5 - t->w * 0.5, focal) * 57.29577951308232;
-    col[(size_t)x] = ang / 360.0 * 1024.0 * L.w / 256.0;
+    col[(size_t)x] = ang / 360.0 * 1024.0 * L.w / (256.0 * sc) * sc;
   }
   // Only the pixels nothing has been drawn on (depth 0): drawn after the scene, the sky costs what shows of it,
   // not the whole screen (6 ms a frame at 1280x960 when it went first), in bands across the pool as the fill is.
-  const double rows_per_px = 200.0 / t->h;
+  // each screen row's height on Doom's 200-row view of the sky (its horizon at row 100), looking up or down by the
+  // last draw's pitch: the elevation of the row's ray, turned back to where that row would be with the view level
+  const double fy = focal * t->y_scale;
+  const double rows_per_unit = 200.0 / t->h * fy;   // Doom-rows per unit of tan(elevation)
+  std::vector<double> vrow((size_t)t->h);
+  for (int y = 0; y < t->h; ++y) {
+    const double el = std::atan2(t->h * 0.5 - (y + 0.5), fy) + t->pitch;
+    vrow[(size_t)y] = 100.0 - std::tan(std::max(-1.45, std::min(1.45, el))) * rows_per_unit;
+  }
   const bool bil = t->bilinear;
   R3dTarget& T = *t;
   auto rows = [&](size_t y0, size_t y1, size_t) {
     for (size_t y = y0; y < y1; ++y) {
-      const double v = std::min((double)L.h - 0.51, (y + 0.5) * rows_per_px);
+      const double v = std::min((double)L.h - 0.51, std::max(0.0, vrow[y] * sc));
       uint32_t* crow = &T.color[y * T.w];
       const float* drow = &T.depth[y * T.w];
       for (int x = 0; x < T.w; ++x)
@@ -733,6 +2031,12 @@ Value bi_r3d_options(Vm&, std::vector<Value>& args, std::string& error) {
     if (k == "bilinear" || k == "mipmaps") {
       if (v.type != Type::Bool) { error = "r3d_options(): " + k + " wants true or false"; return Value::nil(); }
       (k == "bilinear" ? t->bilinear : t->mipmaps) = v.b;
+    } else if (k == "time") {
+      if (!v.is_number()) { error = "r3d_options(): time wants a number (seconds)"; return Value::nil(); }
+      t->time = v.as_double();
+    } else if (k == "upscale") {
+      if (!v.is_number() || (v.as_int() != 1 && v.as_int() != 2 && v.as_int() != 4)) { error = "r3d_options(): upscale wants 1, 2 or 4"; return Value::nil(); }
+      t->upscale = (int)v.as_int();
     } else if (k == "y_scale" || k == "light_gain" || k == "light_lift" || k == "light_fall") {
       if (!v.is_number()) { error = "r3d_options(): " + k + " wants a number"; return Value::nil(); }
       const double d = v.as_double();
@@ -741,7 +2045,7 @@ Value bi_r3d_options(Vm&, std::vector<Value>& args, std::string& error) {
       else if (k == "light_lift") t->light_lift = d;
       else t->light_fall = d;
     } else {
-      error = "r3d_options(): no option " + k + " (bilinear, mipmaps, y_scale, light_gain, light_lift, light_fall)";
+      error = "r3d_options(): no option " + k + " (bilinear, mipmaps, upscale, time, y_scale, light_gain, light_lift, light_fall)";
       return Value::nil();
     }
   }
@@ -752,7 +2056,13 @@ Value bi_r3d_options(Vm&, std::vector<Value>& args, std::string& error) {
 
 void install_raster3d_builtins(Vm& vm) {
   vm.define_native("r3d_texture", 6, 7, bi_r3d_texture);
-  vm.define_native("r3d_draw_tex", 2, 4, bi_r3d_draw_tex);
+  vm.define_native("r3d_draw_tex", 2, 5, bi_r3d_draw_tex);
+  vm.define_native("r3d_sprite_set", 3, 3, bi_r3d_sprite_set);
+  vm.define_native("r3d_mesh", 4, 4, bi_r3d_mesh);
+  vm.define_native("r3d_texture_rgba", 5, 6, bi_r3d_texture_rgba);
+  vm.define_native("r3d_model", 3, 3, bi_r3d_model);
+  vm.define_native("r3d_mesh_data", 2, 2, bi_r3d_mesh_data);
+  vm.define_native("r3d_anim", 4, 4, bi_r3d_anim);
   vm.define_native("r3d_sky", 4, 4, bi_r3d_sky);
   vm.define_native("r3d_blit", 7, 7, bi_r3d_blit);
   vm.define_native("r3d_options", 2, 2, bi_r3d_options);

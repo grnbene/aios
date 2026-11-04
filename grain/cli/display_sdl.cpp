@@ -331,6 +331,14 @@ class SdlDisplay final : public g::Display {
     }
   }
 
+  bool capture_mouse(uint64_t pane, bool on, std::string& error) override {
+    auto it = windows_.find(pane);
+    if (it == windows_.end() || !it->second.window) { error = "pane_capture_mouse(): that pane has no window yet (call it once the panes run)"; return false; }
+    SDL_SetWindowGrab(it->second.window, on ? SDL_TRUE : SDL_FALSE);
+    if (SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE) != 0) { error = std::string("pane_capture_mouse(): ") + SDL_GetError(); return false; }
+    return true;
+  }
+
   bool draw(g::Vm& vm, uint64_t id, Window& w, std::string& error) {
     std::vector<uint32_t> px;
     int pw = 0, ph = 0;

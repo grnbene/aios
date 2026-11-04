@@ -8232,6 +8232,7 @@ void install_core_builtins(Vm& vm) {
   install_bytes_builtins(vm);
   install_kv_builtins(vm);
   install_raster3d_builtins(vm);
+  install_gltf_builtins(vm);
   install_process_builtins(vm);   // refuses unless the host set Vm::allow_process
   install_regex_builtins(vm);
   install_time_builtins(vm);
@@ -9119,7 +9120,28 @@ Value bi_run_panes(Vm& vm, std::vector<Value>& args, std::string& error) {
   return Value::boolean(true);
 }
 
+// pane_capture_mouse(pane, on) -> true: the mouse held by the pane's window (hidden, kept there, its moves arriving
+// as mouse_move events' dx/dy) or let go; an error where the display cannot.
+Value bi_pane_capture_mouse(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!g_display) { error = "pane_capture_mouse(): this grain has no display"; return Value::nil(); }
+  int64_t id = 0;
+  if (args[0].type == Type::Map) {
+    Value* v = static_cast<MapObj*>(args[0].obj.get())->find("id");
+    if (!v || !v->is_number()) { error = "pane_capture_mouse() wants a pane (create_pane's) or its id"; return Value::nil(); }
+    id = v->as_int();
+  } else if (args[0].is_number()) {
+    id = args[0].as_int();
+  } else {
+    error = "pane_capture_mouse() wants a pane (create_pane's) or its id";
+    return Value::nil();
+  }
+  if (args[1].type != Type::Bool) { error = "pane_capture_mouse() wants true or false"; return Value::nil(); }
+  if (!g_display->capture_mouse((uint64_t)id, args[1].b, error)) return Value::nil();
+  return Value::boolean(true);
+}
+
 void install_window_builtins(Vm& vm) {
+  vm.define_native("pane_capture_mouse", 2, 2, bi_pane_capture_mouse);
   vm.define_native("run_panes", 0, 1, bi_run_panes);
   install_face_builtins(vm);
   vm.define_native("register_pane", 1, 6, bi_register_pane);

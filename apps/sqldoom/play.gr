@@ -10,6 +10,7 @@
 # SQLDOOM_FRAMES=n draws n frames with no display and saves the last to SQLDOOM_SHOT (default frame.png); the keys
 # held meanwhile are SQLDOOM_KEYS (e.g. "up,ctrl").
 import { r3d_doom_open, r3d_doom_scene, r3d_doom_draw } from "lib/render3d.gr"
+import { run_sql_file } from "lib/sqlfile.gr"
 let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
 let clean_args = []
 let arg_i = 0
@@ -33,6 +34,24 @@ sql("USE doom")
 pcall(sql, "ALTER TABLE game_tic_commands ADD COLUMN IF NOT EXISTS jump_requested BOOLEAN NOT NULL DEFAULT FALSE")
 # The client's statements and the renderer are SQLDoom's PostgreSQL, as the game tic's are.
 sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
+# The game's own SQL as this client has it: the mouse-look column, and the tic's functions installed again when
+# sql/gametic.sql is not what the database was given (its hash kept in client_meta) - a store loaded before a change
+# to the game runs the game as it is now.
+pcall(sql, "ALTER TABLE player_state ADD COLUMN IF NOT EXISTS view_pitch DOUBLE NULL")
+sql("CREATE TABLE IF NOT EXISTS client_meta (k VARCHAR(64) PRIMARY KEY, v TEXT)")
+{
+  let gt_path = path_join(here, "sql/gametic.sql")
+  let gt_hash = sha256(read_file(gt_path))
+  let have = sql("SELECT v FROM client_meta WHERE k = 'gametic_sha256'")
+  if len(have) == 0 or have[0].v != gt_hash {
+    let t0 = clock()
+    run_sql_file(gt_path, ";;")
+    sql("DELETE FROM client_meta WHERE k = 'gametic_sha256'")
+    sql("INSERT INTO client_meta (k, v) VALUES ('gametic_sha256', '" + gt_hash + "')")
+    sql("FLUSH TABLES")
+    print(format("the game tic's functions installed from sql/gametic.sql ({:.0f} ms)", clock() - t0))
+  }
+}
 let _raw_sql = sql
 fn sql(q) {
   let r = pcall(_raw_sql, q)
@@ -72,6 +91,16 @@ let renderer_sql = read_file(path_join(here, "sql/renderer.sql"))
 sql("SELECT doom_reset_stage(" + str(map_id) + ", " + str(skill) + ")")
 sql("SELECT doom_spawn_player(" + str(map_id) + ", " + str(player) + ")")
 sql("UPDATE player_weapons SET state = 'ready', sy = 32.0 WHERE map_id = " + str(map_id))
+# SQLDOOM_START="x,y,angle": the player put there to begin with (for looking at one place of a map headless)
+if env("SQLDOOM_START", "") != "" {
+  let at = split(env("SQLDOOM_START", ""), ",")
+  let sx = at[0] + "e0"
+  let sy = at[1] + "e0"
+  let sa = at[2] + "e0"
+  sql("UPDATE player_state SET position_x = " + sx + ", position_y = " + sy + ", previous_x = " + sx + ", previous_y = " + sy +
+      ", view_angle = " + sa + ", previous_view_angle = " + sa + " WHERE map_id = " + str(map_id) + " AND player_thing_id = " + str(player))
+  sql("UPDATE things SET x = " + sx + ", y = " + sy + ", angle = " + sa + " WHERE map_id = " + str(map_id) + " AND id = " + str(player))
+}
 
 let held = {}
 let pending_weapon = nil
@@ -79,6 +108,15 @@ let pending_use = false
 let pending_jump = false
 let pending_fire = false
 let mouse_turn = 0.0
+# looking up (positive) or down, degrees: the mouse's, while it is held by the window
+let view_pitch = 0.0
+let mouse_held = false
+let pane_frames_env = int(env("SQLDOOM_PANE_FRAMES", "0"))
+# the mouse is taken when the game is played in a window by a person (not a timed or scripted run)
+let capture_allowed = env("SQLDOOM_NO_MOUSE_CAPTURE", "") == "" and pane_frames_env == 0 and int(env("SQLDOOM_FRAMES", "0")) == 0
+let look_sens = 0.16
+# SQLDOOM_PITCH: a headless run looking up (positive) or down
+view_pitch = int(env("SQLDOOM_PITCH", "0")) * 1.0
 let last_mouse_x = nil
 let tics = 0
 let last_tic_ms = clock()
@@ -237,7 +275,9 @@ fn advance_to_next_level(secret) {
 fn tic_command() {
   let fwd = axis(down("up") or down("w"), down("down") or down("s"))
   let strafe = axis(down("d"), down("a"))
-  let turn = axis(down("right"), down("left")) * 4.5 + mouse_turn
+  let kbd_turn = axis(down("right"), down("left")) * 4.5
+  let mouse_part = mouse_turn
+  let turn = kbd_turn + mouse_part
   mouse_turn = 0.0
   let fire = down("ctrl") or down("f") or down("mouse_left") or pending_fire
   let run = not down("shift")   # Modern FPS: Always Run ON by default (Shift to walk)
@@ -255,7 +295,10 @@ fn tic_command() {
   pending_use = false
   pending_jump = false
   pending_fire = false
-  return {"q": q, "use": use}
+  # where the player looks up or down, for the tic's shots (free aim); the classic display aims Doom's way (NULL)
+  let pitch_q = format("UPDATE player_state SET view_pitch = {} WHERE map_id = {} AND player_thing_id = {}",
+                       hud_mode == "modern" ? format("{:.4f}e0", view_pitch) : "NULL", map_id, player)
+  return {"q": q, "pitch_q": pitch_q, "use": use, "turn": {"kbd": kbd_turn, "mouse": mouse_part, "t": clock()}}
 }
 
 # What the tic's worker works out for the 3D renderer after the tic: the camera at the tic before and at this one,
@@ -263,13 +306,13 @@ fn tic_command() {
 fn scene_inputs() {
   if hud_mode != "modern" { return nil }
   return {"cam0": bind(camera_sql, [map_id, player, 0.0]), "cam1": bind(camera_sql, [map_id, player, 1.0]),
-          "geo": r3.geo, "psprite": r3.psprite, "map_id": map_id, "player": player, "skill": skill, "tic": tics + 1}
+          "geo": r3.geo, "things": r3.things, "psprite": r3.psprite, "map_id": map_id, "player": player, "skill": skill, "tic": tics + 1}
 }
 
 fn run_tic() {
   let c = tic_command()
   let t0 = clock()
-  finish_tic(tic_sql(c.q, bind(snapshot_sql, [map_id, player]), scene_inputs()), c.use, t0)
+  finish_tic(tic_sql([c.pitch_q, c.q], bind(snapshot_sql, [map_id, player]), scene_inputs()), c.use, t0)
 }
 
 # The tic in a worker: the keys read now, the SQL (the tic, then its scene) run on another thread, the result taken
@@ -278,7 +321,8 @@ fn run_tic() {
 let tic_task = nil
 fn tic_start() {
   let c = tic_command()
-  tic_task = {"task": spawn(tic_sql, c.q, bind(snapshot_sql, [map_id, player]), scene_inputs()), "use": c.use, "t0": clock()}
+  tic_task = {"task": spawn(tic_sql, [c.pitch_q, c.q], bind(snapshot_sql, [map_id, player]), scene_inputs()), "use": c.use, "t0": clock(),
+              "turn": c.turn}
 }
 # How long the worker's tic takes (tic, snapshot and scene), as it measures it: a rolling average.
 let tic_work_ms = 0.0
@@ -307,11 +351,11 @@ fn tic_poll(wait_ms) {
 
 # The game tic, its snapshot and (sc not nil) its scene, as one call: run here (headless), or in a worker
 # (tic_start) while the main loop keeps drawing.
-fn tic_sql(q, snap_q, sc) {
+fn tic_sql(qs, snap_q, sc) {
   let t0 = clock()
   _raw_sql("USE doom")
   _raw_sql("SET sql_mode = 'PIPES_AS_CONCAT,PG_DIVISION'")
-  _raw_sql(q)
+  for q in qs { _raw_sql(q) }
   let out = {"snap": _raw_sql(snap_q), "scene": nil, "ms": 0.0}
   if sc == nil {
     out.ms = clock() - t0
@@ -324,7 +368,7 @@ fn tic_sql(q, snap_q, sc) {
     return out
   }
   let p1 = c1[0]
-  let scene = r3d_doom_scene(_raw_sql, sc.geo, sc.psprite, sc.map_id, sc.player, sc.skill, p1, sc.tic)
+  let scene = r3d_doom_scene(_raw_sql, sc.geo, sc.things, sc.psprite, sc.map_id, sc.player, sc.skill, p1, sc.tic)
   scene.p0 = len(c0) > 0 ? c0[0] : p1
   scene.p1 = p1
   scene.interact = interact_prompt_of(_raw_sql(interact_query(p1.x, p1.y, p1.angle, sc.map_id)))
@@ -335,6 +379,7 @@ fn tic_sql(q, snap_q, sc) {
 
 # What a finished tic changes on the client: the HUD's numbers, the use and exit results.
 let cur_scene = nil
+let prev_scene = nil
 fn finish_tic(res, use, t0) {
   let snap = res.snap
   tics = tics + 1
@@ -372,10 +417,12 @@ fn finish_tic(res, use, t0) {
   }
   # the tic's scene, unless the tic took the player to another map (the next tic's is for that one)
   if res.scene != nil and res.scene.map_id == map_id {
+    prev_scene = cur_scene
     cur_scene = res.scene
     interact_prompt = cur_scene.interact
   } else if res.scene != nil {
     cur_scene = nil
+    prev_scene = nil
   }
   status = format("{} tic {} ({:.0f} ms)", level_over ? map_name + " done" : map_name, tics, clock() - t0)
   last_tic_ms = clock()
@@ -474,13 +521,16 @@ fn render_frame_3d() {
   let alpha = min(1.0, max(0.0, (t0 - last_tic_ms) / (1000.0 / 35.0)))
   let a = cur_scene.p0
   let b = cur_scene.p1
-  let turn = b.angle - a.angle + 180.0
-  turn = turn - 360.0 * floor(turn / 360.0) - 180.0
-  let ang = a.angle + turn * alpha
+  # Where it looks is the player's own, at once: the last tic's angle, less the turns sent with the tic still
+  # being worked out (the mouse's whole, the keys' a tic's worth as the tic goes by) and the mouse's since (the
+  # tic turns by new = old - turn); up and down is the client's alone. Where it stands follows the tics.
+  let inflight = tic_task == nil ? nil : tic_task.turn
+  let ang = b.angle - mouse_turn
+  if inflight != nil { ang = ang - inflight.mouse - inflight.kbd * min(1.0, max(0.0, (t0 - inflight.t) / (1000.0 / 35.0))) }
   let pose = {"x": a.x + (b.x - a.x) * alpha, "y": a.y + (b.y - a.y) * alpha, "z": a.z + (b.z - a.z) * alpha,
-              "angle": ang - 360.0 * floor(ang / 360.0)}
+              "angle": ang - 360.0 * floor(ang / 360.0), "pitch": view_pitch}
   r3d_options(r3.t, {"bilinear": texture_filtering, "mipmaps": texture_filtering})
-  r3d_doom_draw(r3, cur_scene, pose)
+  r3d_doom_draw(r3, cur_scene, prev_scene, alpha, pose, t0 / 1000.0e0)
   r3_last_ms = clock() - t0
   last_frame_tic = tics
   if frames > 0 { print(format("  3d: tic's scene sql {:.1f} ms, frame {:.1f} ms, {} triangles", r3.sql_ms, r3.fill_ms, r3.tris)) }
@@ -522,6 +572,13 @@ let draw_frame_count = 0
 let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width": 1280, "height": 960,
   "on_draw": fn (cv) {
     let now = clock()
+    # the mouse held while the game is played, let go for the menu (Escape opens it; closing it takes the mouse back)
+    let want_held = capture_allowed and not menu_open and hud_mode == "modern"
+    if want_held != mouse_held {
+      let r = pcall(pane_capture_mouse, pane, want_held)
+      mouse_held = r.ok ? want_held : false
+      if not r.ok { capture_allowed = false; print("mouse look: " + r.error) }
+    }
     if last_draw_time != nil {
       let dt = now - last_draw_time
       if dt > 0 {
@@ -806,13 +863,13 @@ let pane = create_pane({"title": "SQLDoom on ASQL (Modern 2026 Display)", "width
       return nil
     }
     if e.type == "mouse_move" {
-      if not menu_open {
-        if e.dx != nil and e.dx != 0 {
-          mouse_turn = mouse_turn + e.dx * 0.55
-        } else if last_mouse_x != nil {
-          let dx = e.x - last_mouse_x
-          if dx != 0 { mouse_turn = mouse_turn + dx * 0.55 }
-        }
+      # held by the window (playing): the mouse turns and looks up and down; let go (the menu, Escape), it is
+      # only a pointer
+      if mouse_held and not menu_open {
+        let dx = e.dx == nil ? 0 : e.dx
+        let dy = e.dy == nil ? 0 : e.dy
+        mouse_turn = mouse_turn + dx * look_sens
+        view_pitch = max(-80.0, min(80.0, view_pitch - dy * look_sens))
       }
       last_mouse_x = e.x
       return nil

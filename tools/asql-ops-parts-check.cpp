@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "aios/kernel/kernel.hpp"
@@ -301,6 +302,55 @@ int main_mode(const char* root_dir) {
     check(db.flush_now().ok(), "only_appended: checkpoint");
     check(table_files(dir) == files_before, "only_appended: appends with new dictionary keys appended a part");
     reopened_matches("only_appended: rows verified on reopen");
+  }
+
+  // 10. a few large values replaced again and again (a model's mesh blobs, rebuilt): every round deletes the rows
+  //     and inserts new ones. Parts bounded by rows alone kept every round's values in the file - it grew by all
+  //     of them each time (a 10-row table of 5.8 MB live reached 38 MB in ten rounds); bounded by bytes too, it is
+  //     written whole once it holds much more than its rows.
+  {
+    must(db, "CREATE TABLE blobs (id INT PRIMARY KEY, data LONGBLOB NOT NULL)");
+    uint32_t seed = 12345;
+    auto blob_hex = [&](size_t n) {   // bytes no compressor shrinks
+      static const char* hx = "0123456789ABCDEF";
+      std::string h;
+      h.reserve(n * 2);
+      for (size_t i = 0; i < n; ++i) { seed = seed * 1664525u + 1013904223u; const uint8_t b = (uint8_t)(seed >> 24); h += hx[b >> 4]; h += hx[b & 15]; }
+      return h;
+    };
+    const size_t kRows = 10, kBytes = 200 * 1024;
+    uint64_t live_sum = 0;
+    for (int round = 0; round < 10; ++round) {
+      must(db, "DELETE FROM blobs");
+      for (size_t r = 0; r < kRows; ++r) must(db, "INSERT INTO blobs VALUES (" + std::to_string(r) + ", X'" + blob_hex(kBytes) + "')");
+      check(db.flush_now().ok(), "replaced blobs: checkpoint round " + std::to_string(round));
+    }
+    {
+      auto r = db.execute_query("SELECT SUM(CRC32(data)) AS c, SUM(LENGTH(data)) AS n FROM blobs");
+      if (r.success && !r.rows.empty()) live_sum = std::strtoull(r.rows[0].values[0].c_str(), nullptr, 10);
+    }
+    // the table's file(s): their names are the table's name in hex
+    uint64_t file_bytes = 0;
+    if (DIR* d = opendir(dir.c_str())) {
+      while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.find("626c6f6273") == std::string::npos) continue;   // "blobs"
+        struct stat stt;
+        if (stat((dir + "/" + n).c_str(), &stt) == 0) file_bytes += (uint64_t)stt.st_size;
+      }
+      closedir(d);
+    }
+    const uint64_t live = kRows * kBytes;
+    std::cout << "  replaced blobs: " << file_bytes << " bytes on disk for " << live << " live\n";
+    check(file_bytes > 0 && file_bytes <= live * 3, "replaced blobs: the table's file stays within 3x its live rows after 10 rounds");
+    SqlDatabase again(kernel);
+    again.init("sql_db");
+    auto r = again.execute_query("SELECT SUM(CRC32(data)) AS c, COUNT(*) AS n FROM blobs");
+    check(r.success && !r.rows.empty() && std::strtoull(r.rows[0].values[0].c_str(), nullptr, 10) == live_sum && r.rows[0].values[1] == "10",
+          "replaced blobs: reopened, every row as it was");
+    // gone again: the cases after this one (other processes on this store) compare its table files
+    must(again, "DROP TABLE blobs");
+    check(again.flush_now().ok(), "replaced blobs: dropped, checkpoint");
   }
 
   std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks << " checks passed\n";

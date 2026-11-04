@@ -18642,7 +18642,12 @@ bool ColumnStore::compact_dictionary() {
   const bool was_blocked = dict.blocked();   // the survivors go back into blocks below (push_from copies them plain)
   const uint32_t block_per = dict.per_block();
   const size_t nd = dict.size();
-  if (nd <= row_count_ + row_count_ / 2 + 1024) return false;
+  // Worth compacting when the entries far outnumber the rows - or, few as they are, when they hold a lot of bytes:
+  // a table of a few large values replaced again and again (a model's mesh blobs, rewritten on every rebuild) kept
+  // every old value, and every write of its file carried them all (10 rows of 2 MB live made a 20 MB file).
+  const bool many = nd > row_count_ + row_count_ / 2 + 1024;
+  const bool heavy = nd > row_count_ + 1 && nd <= 100000 && dict.byte_size() >= ((size_t)1 << 20);
+  if (!many && !heavy) return false;
   std::vector<uint32_t> codes(row_count_);   // read_code decodes a per-segment layout as it is
   for (size_t r = 0; r < row_count_; ++r) codes[r] = read_code(r);
   std::vector<uint8_t> used(nd, 0);
@@ -18650,7 +18655,13 @@ bool ColumnStore::compact_dictionary() {
   for (size_t r = 0; r < row_count_; ++r) if (!is_null(r) && codes[r] < nd) used[codes[r]] = 1;
   size_t live = 0;
   for (uint8_t u : used) live += u;
-  if (live + live / 2 + 1024 >= nd) return false;
+  if (live + live / 2 + 1024 >= nd) {
+    if (!heavy) return false;
+    // few entries: compacted only when the unused ones hold at least as many bytes as the used (and a megabyte)
+    size_t dead_bytes = 0, live_bytes = 0;
+    for (size_t k = 1; k < nd; ++k) (used[k] ? live_bytes : dead_bytes) += dict.view(k).size();
+    if (dead_bytes < std::max(live_bytes, (size_t)1 << 20)) return false;
+  }
   // The codes are rewritten whole below: drop the segment layout (a decode of it would be thrown away).
   seg_packed_ = false;
   seg_hdr.clear(); seg_hdr.shrink_to_fit();
@@ -57701,6 +57712,16 @@ static std::shared_ptr<const ParsedWithPlan> build_with_plan(const std::string& 
   return plan;
 }
 
+// A cached statement's parse, with trees of its own to run. Running the cached trees themselves kept what one run
+// learned in them for every later run: an uncorrelated subquery's answer (`WITH x AS (SELECT (SELECT v FROM p ..))`
+// answered with p as it was the first time, whatever was written since - a game's aim read its first value for
+// good), an IN list inlined from a subquery's rows.
+static ParsedSelectStatement own_run_copy(const ParsedSelectStatement& cached) {
+  ParsedSelectStatement run = cached;
+  for (auto& b : run.branches) own_branch_exprs(b);
+  return run;
+}
+
 static std::shared_ptr<const ParsedWithPlan> get_or_parse_with_plan(const std::string& sql) {
   static aios::hal::Mutex s_with_mu;
   static std::unordered_map<std::string, std::shared_ptr<const ParsedWithPlan>> s_with_cache;
@@ -57775,7 +57796,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
         RowsOnly rows_only;
         ColOutRequest want_columns(&batch);   // its rows as typed columns, where the select can give them so
         PlanScope cscope(plan_on() ? &cplan : nullptr);
-        res = step.parsed_select.ok ? execute_parsed_select(this, step.parsed_select) : execute_local_query(step.cte_sql);
+        res = step.parsed_select.ok ? execute_parsed_select(this, own_run_copy(step.parsed_select)) : execute_local_query(step.cte_sql);
       }
       if (!res.success) return res;
       const bool in_batch = res.rows_in_batch && batch.filled;
@@ -57813,7 +57834,7 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
       SqlQueryResult anchor_res;
       {
         RowsOnly rows_only;
-        anchor_res = step.anchor_select.ok ? execute_parsed_select(this, step.anchor_select) : execute_local_query(step.anchor_sql);
+        anchor_res = step.anchor_select.ok ? execute_parsed_select(this, own_run_copy(step.anchor_select)) : execute_local_query(step.anchor_sql);
       }
       if (!anchor_res.success) return anchor_res;
 
@@ -57896,11 +57917,11 @@ SqlQueryResult SqlDatabase::execute_with(const std::string& sql) {
   RnKeepRequest main_rn(with_rn);
   if (trace_merge) {
     const uint64_t t0 = hal_now_ns();
-    SqlQueryResult r = plan->main_select.ok ? execute_parsed_select(this, plan->main_select) : execute_local_query(plan->main_sql);
+    SqlQueryResult r = plan->main_select.ok ? execute_parsed_select(this, own_run_copy(plan->main_select)) : execute_local_query(plan->main_sql);
     std::fprintf(stderr, "[cte] %-28s %8.1f ms %7zu rows\n", "(main)", (hal_now_ns() - t0) / 1e6, r.rows.size());
     return r;
   }
-  return plan->main_select.ok ? execute_parsed_select(this, plan->main_select) : execute_local_query(plan->main_sql);
+  return plan->main_select.ok ? execute_parsed_select(this, own_run_copy(plan->main_select)) : execute_local_query(plan->main_sql);
 }
 
 // --- CREATE / DROP / ALTER / TRUNCATE -------------------------------------
@@ -63923,7 +63944,13 @@ std::shared_ptr<SqlDatabase::ProbeIndex> SqlDatabase::get_or_build_probe_index(c
   const size_t end = max_rows ? std::min(t.row_count(), idx.rows_indexed + max_rows) : t.row_count();
   g_index_rows_built += (long long)(end - idx.rows_indexed);
 
-  const ColumnStore* cstore = (column >= 0 && (size_t)column < t.col_data.size()) ? &t.col_data[(size_t)column] : nullptr;
+  // The encoded paths read the column store, which holds only the rows folded into it: rows still in the table's
+  // delta buffer (appended, or replayed from a file's parts at start-up, until the next fold) are counted by
+  // row_count but read only by cell(). Built from the store then, those rows were marked indexed without being in
+  // it - a warmed join index of a table loaded from parts found nothing (model_node: model_id = 1 gave 0 rows of 20)
+  // for good, as the fold changes no row count. Such a column is read by cells below.
+  const ColumnStore* cstore = (column >= 0 && (size_t)column < t.col_data.size() && t.col_data[(size_t)column].size() >= end)
+                                  ? &t.col_data[(size_t)column] : nullptr;
   idx.text_column = (size_t)column < t.columns.size() &&
                     t.columns[(size_t)column].type == SqlDataType::Text && !t.inferred_types;
   idx.numeric_column = (size_t)column < t.columns.size() && sql_type_numeric(t.columns[(size_t)column].type) &&
@@ -64011,6 +64038,9 @@ std::shared_ptr<SqlDatabase::ProbeIndex> SqlDatabase::get_or_build_probe_index(c
     });
   } else {
     // NULL never equals anything, so a NULL row can never be a match and is left out of every list.
+    // Rows added here are not in by_code: lists by code built earlier would miss them, and a join reads by_code
+    // whenever it has any, so they go (the lookups fall back to by_number / by_text).
+    idx.by_code.clear();
     std::vector<uint8_t> has(end - idx.rows_indexed, 0);
     std::vector<double> num(end - idx.rows_indexed, 0.0);
     const size_t from = idx.rows_indexed;
@@ -64064,7 +64094,10 @@ void SqlDatabase::ensure_sorted_probe_index(ProbeIndex* idx, const SqlTable& t) 
     return;
   }
 
-  const ColumnStore* cstore = (col >= 0 && (size_t)col < t.col_data.size()) ? &t.col_data[(size_t)col] : nullptr;
+  // As in get_or_build_probe_index: the codes cover only the rows folded into the column store, so a column with
+  // rows still in the delta buffer is read by cells below.
+  const ColumnStore* cstore = (col >= 0 && (size_t)col < t.col_data.size() && t.col_data[(size_t)col].size() >= t.row_count())
+                                  ? &t.col_data[(size_t)col] : nullptr;
   if (cstore && (cstore->encoding == ColumnEncoding::DictBitPacked || cstore->encoding == ColumnEncoding::RLE)) {
     const auto& d = cstore->shared_dict ? cstore->shared_dict->dict : cstore->dict;
     if (!d.empty()) {

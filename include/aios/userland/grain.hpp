@@ -756,6 +756,13 @@ class Display {
  public:
   virtual ~Display() = default;
   virtual bool run(Vm& vm, const DisplayRun& run, std::string& error) = 0;
+  // The mouse held by pane's window (on: the pointer hidden and kept there, moves arriving as dx/dy only - what a
+  // game looking around with the mouse needs) or let go. A display that cannot says so.
+  virtual bool capture_mouse(uint64_t pane, bool on, std::string& error) {
+    (void)pane; (void)on;
+    error = "this display cannot hold the mouse";
+    return false;
+  }
 };
 void set_display(Display* d);   // not owned
 Display* display();
