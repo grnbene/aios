@@ -178,6 +178,16 @@ list(APPEND AIOS_SOURCES ${AIOS_TS_SOURCES})
 add_library(aios STATIC ${AIOS_SOURCES})
 target_include_directories(aios PRIVATE third_party/tree-sitter/lib/include)
 
+# The public release: `aios` and `aios-webserver` run AIOS_TRIAL_DAYS from their first run on a machine, then only
+# with a license signed by the issuer's key (src/license/license.cpp). OFF, the default, is our own build: no check.
+option(AIOS_PUBLIC_BUILD "Public release build: a trial, then a signed license" OFF)
+set(AIOS_TRIAL_DAYS 30 CACHE STRING "Days a public build runs without a license")
+# Only the three files that read them get the definitions; nothing else is built differently.
+if(AIOS_PUBLIC_BUILD)
+  set_source_files_properties(cli/main.cpp tools/aios-webserver.cpp src/license/license.cpp PROPERTIES
+    COMPILE_DEFINITIONS "AIOS_LICENSE_REQUIRED=1;AIOS_TRIAL_DAYS=${AIOS_TRIAL_DAYS}")
+endif()
+
 # aios-ts-pack: not part of the normal build (it compiles every grammar's original parser.c a second time, under another
 # name, to read its tables). Needs the aios library only for deflate and the language runtime.
 set(AIOS_TS_PACK_GEN ${CMAKE_BINARY_DIR}/ts-pack)

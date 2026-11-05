@@ -11,6 +11,7 @@ It combines in-memory columnar execution, ACID write-ahead durability, full MySQ
 - [Key Highlights](#key-highlights)
 - [Architecture Overview](#architecture-overview)
 - [30-Second Quickstart](#30-second-quickstart)
+- [License](#license)
 - [Client Integration & Usage](#client-integration--usage)
   - [1. Native Grain Language (AIOS First-Class API)](#1-native-grain-language-aios-first-class-api)
   - [2. Standard MySQL Wire Protocol (CLI, Python, Node.js, PHP, Go)](#2-standard-mysql-wire-protocol-cli-python-nodejs-php-go)
@@ -131,6 +132,25 @@ Output:
 ```
 
 Data commits to `/tmp/asql-quickstart/sql_db/` with durability logs and survives server restarts.
+
+---
+
+## License
+
+The public release runs for **30 days from the first time it runs on a machine**. After that, `aios` and
+`aios-webserver` start only with a license: a short signed text file naming who it is for and until when (or
+`never`). `aios-asql-console` and `aios-asql-top` need none; they only talk to a running engine.
+
+```bash
+aios license status                  # trial days left, or the license in use
+aios license install customer.license   # checks it, then writes /etc/aios/license (else ~/.aios/license)
+aios license verify customer.license    # checks it without installing
+```
+
+A license is looked for in `$AIOS_LICENSE`, `ROOT/license` (the `--root` directory), `/etc/aios/license`, then
+`~/.aios/license`. Install it where the service's user can read it: `/etc/aios/license` for the systemd units. A
+license that has been changed, or has ended, refuses to start, with a message saying which file and why. From 7
+days before the trial ends (14 for a dated license), each start prints a reminder on stderr.
 
 ---
 

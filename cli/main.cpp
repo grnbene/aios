@@ -21,6 +21,7 @@
 #include <poll.h>
 #include <cerrno>
 #include "../tools/aios-git/git_cli.hpp"
+#include "aios/license/license.hpp"
 
 int aios_webserver_run(int argc, char** argv);   // tools/aios-webserver.cpp
 #ifdef AIOS_HAVE_SH
@@ -125,6 +126,17 @@ int main(int argc, char** argv) {
     else args.push_back(argv[i]);
   }
   if (args.empty()) { usage(); return 2; }
+
+  // `aios license ...` works whatever the license says: it is how one is checked and installed.
+  if (args[0] == "license") return aios::license::command(args, root, std::cout, std::cerr);
+#ifdef AIOS_LICENSE_REQUIRED
+  // A public build: before anything runs (git, sh and webserver included), a license or the trial.
+  {
+    const aios::license::Verdict v = aios::license::check(root);
+    if (!v.ok) { std::cerr << v.message << "\n"; return aios::license::kRefused; }
+    if (!v.message.empty() && !quiet) std::cerr << v.message << "\n";
+  }
+#endif
 
   // `aios webserver CONFIG` is the vhost HTTP(S) server, the same code as the aios-webserver binary.
   if (args[0] == "webserver" || args[0] == "aios-webserver") {

@@ -24,7 +24,11 @@ CMAKE_BOOT=${CMAKE_BOOT:-3.28.6}
 OPENCL_HEADERS=${OPENCL_HEADERS:-v2023.12.14}
 
 VERSION=${VERSION:-$(git -C "$SRC" describe --always --dirty 2>/dev/null || date +%Y%m%d)}
-STAMP="aios-asql-${VERSION}-linux-x86_64-glibc2.17"
+# PUBLIC=1: the public release (AIOS_PUBLIC_BUILD: a 30-day trial, then a license); otherwise our own, no check.
+PUBLIC=${PUBLIC:-0}
+PUBLIC_FLAG=-DAIOS_PUBLIC_BUILD=OFF
+[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=-DAIOS_PUBLIC_BUILD=ON
+STAMP="aios-asql-${VERSION}$([ "$PUBLIC" = 1 ] && echo -public)-linux-x86_64-glibc2.17"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'build-portable: %s\n' "$*" >&2; exit 1; }
@@ -94,7 +98,7 @@ if [ ! -e /usr/include/CL/cl.h ]; then
 fi
 
 "\$CM" -S . -B build-portable \
-  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_BUILD_TYPE=Release $PUBLIC_FLAG \
   -DCMAKE_CXX_FLAGS="-O2\$CLINC" \
   -DCMAKE_EXE_LINKER_FLAGS='-static-libstdc++ -static-libgcc' >/dev/null
 "\$CM" --build build-portable --target aios-cli aios-asql-top aios-asql-console -j${JOBS:-\$(nproc)}
@@ -140,6 +144,7 @@ version=$VERSION
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 builder=$BUILDER
 glibc_floor=$FLOOR
+license=$([ "$PUBLIC" = 1 ] && echo trial || echo none)
 sha256=$(shasum -a 256 "$PKG/$STAMP/bin/aios" | cut -d' ' -f1)
 MANIFEST
 
