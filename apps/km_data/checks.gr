@@ -1,0 +1,8 @@
+// Pre-cutover checks: the replica answers, and the data routes refuse a request without a key.
+fn check(app) {
+  let h = http_get(app.url + "/health")
+  if h.status != 200 { return "GET /health answered " + str(h.status) }
+  let r = http_get(app.url + "/v1/customers")
+  if r.status != 401 { return "GET /v1/customers without a key answered " + str(r.status) + ", not 401" }
+  return true
+}

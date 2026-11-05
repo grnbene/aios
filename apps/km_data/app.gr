@@ -1,0 +1,25 @@
+// km_data: read-only data API over the ASQL replica of KM's ERP database (km).
+// Every read goes to ASQL; live MariaDB only feeds the replica through its binlog.
+let app = {
+  "name": "km_data",
+  "description": "KM data API: customers, orders, invoices, receivables, inventory, vendors, purchasing",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8595,
+  "listen": "local",
+  "settings": {
+    "ASQL_HOST": "127.0.0.1",
+    "ASQL_PORT": "3307",
+    "ASQL_USER": "erp",
+    "ASQL_DB": "km",
+    // apikeys rows of this database are the keys the API accepts (still only those in KMDATA_KEYS)
+    "KMDATA_KEY_DB": "km"
+  },
+  // KMDATA_KEYS: comma-separated keycodes allowed on this API (each must also be an active apikeys row)
+  "secrets": ["ASQL_PASSWORD", "KMDATA_KEYS"],
+  "requires": ["db"],
+  "health": {"path": "/health", "ok": [200]},
+  "check": "checks.gr",
+  "deployed": "deployed.gr",
+  "max_steps": 0
+}

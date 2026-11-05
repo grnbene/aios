@@ -1,0 +1,667 @@
+// The entities the API serves, each a mapping from ERP columns to clean API names.
+//
+// fields:  [api name, SQL expression, type]   types: id, nid (numeric id: text out, numeric cursor), text, int, num, money, rate, date, datetime, bool
+// key:     the API names that order the rows and make the paging cursor (unique together)
+// date:    the SQL date column ?from= / ?to= filter on (optional)
+// filters: ?name=value equality filters, API name -> SQL expression
+// where:   a fixed condition (optional)
+// enrich:  a function name in service.gr that adds fields to a page of rows (optional)
+
+// The ERP's item cost (model/weberp/items.php getItem, getValuation): material + labour + overhead, or the last
+// cost when that is zero.
+let ITEM_COST = "CASE WHEN s.materialcost + s.labourcost + s.overheadcost = 0 THEN s.lastcost ELSE s.materialcost + s.labourcost + s.overheadcost END"
+
+// Stock the ERP counts as on hand (items.php getItemStock): not the transfer warehouse, not the PO holding bin.
+let COUNTS_ON_HAND = "(k.loccode <> (SELECT TransferWarehouse FROM companies LIMIT 1) AND k.bin <> COALESCE((SELECT confvalue FROM config WHERE confname = 'HoldingBin'), ''))"
+
+// The ERP's discounted line amount (the stocktrans view, migrations/stocktrans_decimal_line_math.sql): the price
+// rounded to cents, less its discount rounded to cents, times the quantity, rounded to cents.
+fn line_amount_sql(price, disc, qty) {
+  let p = "ROUND(CAST(" + price + " AS DECIMAL(20,6)), 2)"
+  let unit = "ROUND(" + p + " - ROUND(" + p + " * ROUND(CAST(" + disc + " AS DECIMAL(20,10)), 4), 2), 2)"
+  return "ROUND(" + unit + " * CAST(" + qty + " AS DECIMAL(20,6)), 2)"
+}
+
+// A write-off credit note (creditorders.options credit_type 'writeoff') carries a stock line and its reversal; the
+// printed credit note shows only the positive line (controller/apir/documents/credits.php), so the API does too.
+let NOT_WRITEOFF_REVERSAL = "NOT (m.type = 11 AND m.qty < 0 AND m.transno IN (SELECT invoiceno FROM creditorders WHERE options LIKE '%\"credit_type\":\"writeoff\"%'))"
+
+let TXN_TOTAL = "(t.ovamount + t.ovgst + t.ovfee + t.ovfreight + t.ovdiscount)"
+
+fn txn_fields() {
+  return [
+    ["transaction_id", "t.id", "nid"],
+    ["document_no", "t.transno", "id"],
+    ["customer_id", "t.debtorno", "id"],
+    ["location_id", "t.branchcode", "id"],
+    ["date", "t.trandate", "date"],
+    ["due_date", "t.duedate", "date"],
+    ["period", "t.prd", "int"],
+    ["order_id", "t.order_", "id"],
+    ["reference", "t.reference", "text"],
+    ["price_list_id", "t.tpe", "id"],
+    ["salesperson_id", "t.salesperson", "id"],
+    ["payment_terms_id", "t.payterms", "id"],
+    ["subtotal", "t.ovamount", "money"],
+    ["tax", "t.ovgst", "money"],
+    ["freight", "t.ovfreight", "money"],
+    ["fees", "t.ovfee", "money"],
+    ["discount", "t.ovdiscount", "money"],
+    ["total", TXN_TOTAL, "money"],
+    ["amount_applied", "t.alloc", "money"],
+    ["open_amount", TXN_TOTAL + " - t.alloc", "money"],
+    ["settled", "t.settled", "bool"],
+    ["exchange_rate", "t.rate", "num"],
+    ["note", "t.invtext", "text"],
+    ["created_at", "t.inputdate", "datetime"]
+  ]
+}
+
+let ENTITIES = {
+  "customers": {
+    "description": "Customer accounts: name, address, terms, credit status, balance and invoice dates.",
+    "from": "debtorsmaster d LEFT JOIN debtortype ty ON ty.typeid = d.typeid LEFT JOIN holdreasons h ON h.reasoncode = d.holdreason LEFT JOIN paymentterms pt ON pt.termsindicator = d.paymentterms LEFT JOIN salestypes st ON st.typeabbrev = d.salestype",
+    "key": ["customer_id"],
+    "filters": {"customer_id": "d.debtorno", "parent_customer_id": "d.parentdebtorno"},
+    "enrich": "customer_balances",
+    "fields": [
+      ["customer_id", "d.debtorno", "id"],
+      ["customer_name", "d.name", "text"],
+      ["address_line1", "d.address1", "text"],
+      ["address_line2", "d.address2", "text"],
+      ["city", "d.address3", "text"],
+      ["region", "d.address4", "text"],
+      ["postal_code", "d.address5", "text"],
+      ["country", "d.address6", "text"],
+      ["customer_type_id", "d.typeid", "id"],
+      ["customer_type", "ty.typename", "text"],
+      ["currency", "d.currcode", "id"],
+      ["price_list_id", "d.salestype", "id"],
+      ["price_list", "st.sales_type", "text"],
+      ["customer_since", "d.clientsince", "date"],
+      ["hold_reason_id", "d.holdreason", "id"],
+      ["hold_reason", "h.reasondescription", "text"],
+      ["on_hold", "h.dissallowinvoices", "bool"],
+      ["payment_terms_id", "d.paymentterms", "id"],
+      ["payment_terms", "pt.terms", "text"],
+      ["credit_limit", "d.creditlimit", "money"],
+      ["discount_rate", "d.discount", "rate"],
+      ["tax_ref", "d.taxref", "text"],
+      ["parent_customer_id", "d.parentdebtorno", "id"],
+      ["invoice_email", "d.invoiceemailaddress", "text"],
+      ["license_no", "d.cosm_license", "text"],
+      ["license_expires", "d.licExpDate", "date"],
+      ["email_statements", "d.emailstatement", "text"],
+      ["is_active", "d.isactive", "bool"]
+    ],
+    "extra": [
+      ["balance", "money"], ["ledger_balance", "money"], ["lifetime_invoiced", "money"], ["first_invoice_date", "date"],
+      ["last_invoice_date", "date"], ["last_receipt_date", "date"]
+    ]
+  },
+
+  "customer_locations": {
+    "description": "Ship-to locations (branches) of each customer.",
+    "from": "custbranch b LEFT JOIN salesman s ON s.salesmancode = b.salesman LEFT JOIN areas a ON a.areacode = b.area LEFT JOIN shippers sh ON sh.shipper_id = b.defaultshipvia LEFT JOIN territory tr ON tr.territory_id = b.territory_id",
+    "key": ["customer_id", "location_id"],
+    "filters": {"customer_id": "b.debtorno", "salesperson_id": "b.salesman"},
+    "fields": [
+      ["customer_id", "b.debtorno", "id"],
+      ["location_id", "b.branchcode", "id"],
+      ["location_name", "b.brname", "text"],
+      ["address_line1", "b.braddress1", "text"],
+      ["address_line2", "b.braddress2", "text"],
+      ["city", "b.braddress3", "text"],
+      ["region", "b.braddress4", "text"],
+      ["postal_code", "b.braddress5", "text"],
+      ["country", "b.braddress6", "text"],
+      ["latitude", "b.lat", "num"],
+      ["longitude", "b.lng", "num"],
+      ["phone", "b.phoneno", "text"],
+      ["phone_alt", "b.phoneno_alt", "text"],
+      ["fax", "b.faxno", "text"],
+      ["email", "b.email", "text"],
+      ["contact_name", "b.contactname", "text"],
+      ["salesperson_id", "b.salesman", "id"],
+      ["salesperson_name", "s.salesmanname", "text"],
+      ["area_id", "b.area", "id"],
+      ["area", "a.areadescription", "text"],
+      ["territory_id", "b.territory_id", "id"],
+      ["territory", "tr.territory_name", "text"],
+      ["warehouse_id", "b.defaultlocation", "id"],
+      ["ship_via_id", "b.defaultshipvia", "id"],
+      ["ship_via", "sh.shippername", "text"],
+      ["tax_group_id", "b.taxgroupid", "id"],
+      ["tax_ref", "b.tax_ref", "text"],
+      ["route", "b.route", "text"],
+      ["price_level", "b.pricelevel", "text"],
+      ["special_instructions", "b.specialinstructions", "text"],
+      ["disabled", "b.disabletrans", "bool"],
+      ["created_at", "b.branch_created", "datetime"]
+    ]
+  },
+
+  "sales_orders": {
+    "description": "Sales order headers, quotes included (is_quote).",
+    "from": "salesorders o LEFT JOIN order_status os ON os.order_status_id = o.orderstatusid AND os.language_id = 1",
+    "key": ["order_id"],
+    "date": "o.orddate",
+    "filters": {"customer_id": "o.debtorno", "salesperson_id": "o.salesperson", "is_quote": "o.quotation", "status_id": "o.orderstatusid"},
+    "fields": [
+      ["order_id", "o.orderno", "nid"],
+      ["customer_id", "o.debtorno", "id"],
+      ["location_id", "o.branchcode", "id"],
+      ["order_date", "o.orddate", "date"],
+      ["requested_date", "o.deliverydate", "date"],
+      ["is_quote", "o.quotation", "bool"],
+      ["customer_po", "o.customerref", "text"],
+      ["buyer_name", "o.buyername", "text"],
+      ["salesperson_id", "o.salesperson", "id"],
+      ["salesperson2_id", "o.salesperson2", "id"],
+      ["warehouse_id", "o.fromstkloc", "id"],
+      ["ship_via_id", "o.shipvia", "id"],
+      ["payment_terms_id", "o.payterms", "id"],
+      ["freight", "o.freightcost", "money"],
+      ["status_id", "o.orderstatusid", "id"],
+      ["status", "os.name", "text"],
+      ["is_cancelled", "o.orderstatusid = 90", "bool"],
+      ["invoice_no", "o.invoiceno", "id"],
+      ["ship_to_name", "o.deliverto", "text"],
+      ["ship_to_line1", "o.deladd1", "text"],
+      ["ship_to_line2", "o.deladd2", "text"],
+      ["ship_to_city", "o.deladd3", "text"],
+      ["ship_to_region", "o.deladd4", "text"],
+      ["ship_to_postal_code", "o.deladd5", "text"],
+      ["ship_to_country", "o.deladd6", "text"],
+      ["contact_phone", "o.contactphone", "text"],
+      ["contact_email", "o.contactemail", "text"],
+      ["invoice_note", "o.comments", "text"],
+      ["dispatch_note", "o.notes", "text"],
+      ["entered_by", "o.enteredby", "text"],
+      ["created_at", "o.date_created", "datetime"],
+      ["updated_at", "o.date_updated", "datetime"]
+    ]
+  },
+
+  "sales_order_lines": {
+    "description": "The lines of every sales order and quote.",
+    "from": "salesorderdetails l",
+    "key": ["order_id", "line_no"],
+    "filters": {"order_id": "l.orderno", "sku": "l.stkcode"},
+    "fields": [
+      ["order_id", "l.orderno", "nid"],
+      ["line_no", "l.orderlineno", "int"],
+      ["sku", "l.stkcode", "id"],
+      ["description", "l.itemdesc", "text"],
+      ["qty_ordered", "l.quantity", "num"],
+      ["qty_invoiced", "l.qtyinvoiced", "num"],
+      ["unit_price", "l.unitprice", "money"],
+      ["discount_rate", "l.discountpercent", "rate"],
+      ["line_amount", line_amount_sql("l.unitprice", "l.discountpercent", "l.quantity"), "money"],
+      ["list_price", "l.listprice", "money"],
+      ["completed", "l.completed", "bool"],
+      ["dispatched_at", "l.actualdispatchdate", "datetime"],
+      ["due_date", "l.itemdue", "date"],
+      ["customer_po_line", "l.poline", "text"],
+      ["note", "l.narrative", "text"]
+    ]
+  },
+
+  "invoices": {
+    "description": "Customer invoices, one row per invoice.",
+    "from": "debtortrans t", "where": "t.type = 10",
+    "key": ["transaction_id"], "date": "t.trandate",
+    "filters": {"customer_id": "t.debtorno", "salesperson_id": "t.salesperson", "order_id": "t.order_"},
+    "fields": txn_fields()
+  },
+
+  "credit_notes": {
+    "description": "Customer credit notes, one row per credit note. Amounts are negative.",
+    "from": "debtortrans t", "where": "t.type = 11",
+    "key": ["transaction_id"], "date": "t.trandate",
+    "filters": {"customer_id": "t.debtorno", "salesperson_id": "t.salesperson", "order_id": "t.order_"},
+    "fields": txn_fields()
+  },
+
+  "payments": {
+    "description": "Customer payments received, one row per receipt. Amounts are negative: they reduce the account.",
+    "from": "debtortrans t", "where": "t.type = 12",
+    "key": ["transaction_id"], "date": "t.trandate",
+    "filters": {"customer_id": "t.debtorno"},
+    "fields": txn_fields()
+  },
+
+  "customer_transactions": {
+    "description": "The whole customer ledger: invoices, credit notes, receipts and adjustments together, with type_id telling them apart.",
+    "from": "debtortrans t LEFT JOIN systypes sy ON sy.typeid = t.type",
+    "key": ["transaction_id"], "date": "t.trandate",
+    "filters": {"customer_id": "t.debtorno", "type_id": "t.type"},
+    "fields": concat([["type_id", "t.type", "int"], ["type", "sy.typename", "text"]], txn_fields())
+  },
+
+  "invoice_lines": {
+    "description": "The lines of every invoice and credit note as printed on it: item, quantity, price, discount and cost.",
+    "from": "stockmoves m", "where": "m.type IN (10, 11) AND m.show_on_inv_crds = 1 AND " + NOT_WRITEOFF_REVERSAL,
+    "key": ["line_id"], "date": "m.trandate",
+    "filters": {"customer_id": "m.debtorno", "sku": "m.stockid", "document_no": "m.transno"},
+    "fields": [
+      ["line_id", "m.stkmoveno", "nid"],
+      ["type_id", "m.type", "int"],
+      ["document_no", "m.transno", "id"],
+      ["customer_id", "m.debtorno", "id"],
+      ["location_id", "m.branchcode", "id"],
+      ["warehouse_id", "m.loccode", "id"],
+      ["date", "m.trandate", "date"],
+      ["period", "m.prd", "int"],
+      ["sku", "m.stockid", "id"],
+      ["qty", "-m.qty", "num"],
+      ["unit_price", "m.price", "money"],
+      ["discount_rate", "m.discountpercent", "rate"],
+      ["line_amount", line_amount_sql("m.price", "m.discountpercent", "-m.qty"), "money"],
+      ["unit_cost", "m.standardcost", "money"],
+      ["order_line_no", "m.orderlineref", "int"],
+      ["reference", "m.reference", "text"],
+      ["note", "m.narrative", "text"]
+    ]
+  },
+
+  "allocations": {
+    "description": "How receipts and credit notes were applied to invoices.",
+    "from": "custallocns c",
+    "key": ["allocation_id"], "date": "c.datealloc",
+    "filters": {"from_transaction_id": "c.transid_allocfrom", "to_transaction_id": "c.transid_allocto"},
+    "fields": [
+      ["allocation_id", "c.id", "nid"],
+      ["amount", "c.amt", "money"],
+      ["date", "c.datealloc", "date"],
+      ["from_transaction_id", "c.transid_allocfrom", "id"],
+      ["to_transaction_id", "c.transid_allocto", "id"]
+    ]
+  },
+
+  "receivables": {
+    "description": "Every open customer item (anything not fully paid or applied), aged on today's date against its due date.",
+    "from": "debtortrans t LEFT JOIN systypes sy ON sy.typeid = t.type",
+    "where": "ABS(" + TXN_TOTAL + " - t.alloc) > 0.005",
+    "key": ["transaction_id"], "date": "t.trandate",
+    "filters": {"customer_id": "t.debtorno", "salesperson_id": "t.salesperson"},
+    "enrich": "aging",
+    "fields": [
+      ["transaction_id", "t.id", "nid"],
+      ["type_id", "t.type", "int"],
+      ["type", "sy.typename", "text"],
+      ["document_no", "t.transno", "id"],
+      ["customer_id", "t.debtorno", "id"],
+      ["location_id", "t.branchcode", "id"],
+      ["date", "t.trandate", "date"],
+      ["due_date", "t.duedate", "date"],
+      ["salesperson_id", "t.salesperson", "id"],
+      ["order_id", "t.order_", "id"],
+      ["reference", "t.reference", "text"],
+      ["total", TXN_TOTAL, "money"],
+      ["amount_applied", "t.alloc", "money"],
+      ["open_amount", TXN_TOTAL + " - t.alloc", "money"]
+    ],
+    "extra": [["days_overdue", "int"], ["aging_bucket", "text"]]
+  },
+
+  "salespeople": {
+    "description": "Sales reps.",
+    "from": "salesman s",
+    "key": ["salesperson_id"],
+    "fields": [
+      ["salesperson_id", "s.salesmancode", "id"],
+      ["name", "s.salesmanname", "text"],
+      ["phone", "s.smantel", "text"],
+      ["email", "s.smaneamil", "text"],
+      ["is_current", "s.current", "bool"],
+      ["manager", "s.manager", "text"],
+      ["territory_id", "s.territory_id", "id"],
+      ["warehouse_id", "s.defaultloc", "id"],
+      ["commission_rate", "s.commissionrate1", "rate"],
+      ["commission_breakpoint", "s.breakpoint", "money"],
+      ["commission_rate_above", "s.commissionrate2", "rate"]
+    ]
+  },
+
+  "vendors": {
+    "description": "Vendors (suppliers). Bank details are not included.",
+    "from": "suppliers v LEFT JOIN paymentterms pt ON pt.termsindicator = v.paymentterms",
+    "key": ["vendor_id"],
+    "fields": [
+      ["vendor_id", "v.supplierid", "id"],
+      ["vendor_name", "v.suppname", "text"],
+      ["address_line1", "v.address1", "text"],
+      ["address_line2", "v.address2", "text"],
+      ["city", "v.address3", "text"],
+      ["region", "v.address4", "text"],
+      ["postal_code", "v.address5", "text"],
+      ["country", "v.address6", "text"],
+      ["currency", "v.currcode", "id"],
+      ["vendor_since", "v.suppliersince", "date"],
+      ["payment_terms_id", "v.paymentterms", "id"],
+      ["payment_terms", "pt.terms", "text"],
+      ["phone", "v.telephone", "text"],
+      ["email", "v.email", "text"],
+      ["website", "v.url", "text"],
+      ["tax_ref", "v.taxref", "text"],
+      ["last_payment_amount", "v.lastpaid", "money"],
+      ["last_payment_date", "v.lastpaiddate", "date"],
+      ["is_active", "v.active", "bool"]
+    ]
+  },
+
+  "vendor_transactions": {
+    "description": "The vendor ledger: vendor invoices (type_id 20), credits (21), payments (22) and adjustments.",
+    "from": "supptrans p LEFT JOIN systypes sy ON sy.typeid = p.type LEFT JOIN suppliers v ON v.supplierid = p.supplierno",
+    "key": ["transaction_id"], "date": "p.trandate",
+    "filters": {"vendor_id": "p.supplierno", "type_id": "p.type"},
+    "fields": [
+      ["transaction_id", "p.id", "nid"],
+      ["type_id", "p.type", "int"],
+      ["type", "sy.typename", "text"],
+      ["document_no", "p.transno", "id"],
+      ["vendor_id", "p.supplierno", "id"],
+      ["vendor_reference", "p.suppreference", "text"],
+      ["date", "p.trandate", "date"],
+      ["due_date", "p.duedate", "date"],
+      ["currency", "v.currcode", "id"],
+      ["subtotal", "p.ovamount", "money"],
+      ["tax", "p.ovgst", "money"],
+      ["fees", "p.ovfee", "money"],
+      ["total", "p.ovamount + p.ovgst + p.ovfee", "money"],
+      ["amount_applied", "p.alloc", "money"],
+      ["open_amount", "p.ovamount + p.ovgst + p.ovfee - p.alloc", "money"],
+      ["settled", "p.settled", "bool"],
+      ["on_hold", "p.hold", "bool"],
+      ["exchange_rate", "p.rate", "num"],
+      ["note", "p.transtext", "text"],
+      ["created_at", "p.inputdate", "datetime"]
+    ]
+  },
+
+  "items": {
+    "description": "Products, with category and brand.",
+    "from": "stockmaster s LEFT JOIN stockcategory c ON c.categoryid = s.categoryid LEFT JOIN product_types ptp ON ptp.label = s.mbflag",
+    "key": ["sku"],
+    "filters": {"sku": "s.stockid", "category_id": "s.categoryid"},
+    "enrich": "item_extras",
+    "fields": [
+      ["sku", "s.stockid", "id"],
+      ["description", "s.description", "text"],
+      ["category_id", "s.categoryid", "id"],
+      ["category", "c.categorydescription", "text"],
+      ["product_line_id", "s.lineid", "id"],
+      ["units", "s.units", "text"],
+      ["item_type", "s.mbflag", "id"],
+      ["item_type_name", "ptp.description", "text"],
+      ["reduces_stock", "ptp.reducesstock", "bool"],
+      ["unit_cost", ITEM_COST, "money"],
+      ["last_cost", "s.lastcost", "money"],
+      ["last_cost_update", "s.lastcostupdate", "date"],
+      ["discontinued", "s.discontinued", "bool"],
+      ["enabled", "s.enabled", "bool"],
+      ["barcode", "s.barcode", "text"],
+      ["mfg_part_no", "s.mfgpart", "text"],
+      ["gross_weight", "s.grossweight", "num"],
+      ["net_weight", "s.netweight", "num"],
+      ["volume", "s.volume", "num"],
+      ["tax_category_id", "s.taxcatid", "id"],
+      ["created_at", "s.date_created", "datetime"]
+    ],
+    "extra": [["brand_id", "id"], ["brand", "text"], ["qty_on_hand", "num"], ["qty_on_open_orders", "num"], ["qty_on_open_pos", "num"]]
+  },
+
+  "item_prices": {
+    "description": "Price list entries. A customer_id or location_id set means a customer-specific price.",
+    "from": "prices p",
+    "key": ["sku", "price_list_id", "currency", "customer_id", "location_id", "start_date", "end_date"],
+    "filters": {"sku": "p.stockid", "price_list_id": "p.typeabbrev"},
+    "fields": [
+      ["sku", "p.stockid", "id"],
+      ["price_list_id", "p.typeabbrev", "id"],
+      ["currency", "p.currabrev", "id"],
+      ["customer_id", "p.debtorno", "id"],
+      ["location_id", "p.branchcode", "id"],
+      ["start_date", "p.startdate", "date"],
+      ["end_date", "p.enddate", "date"],
+      ["price", "p.price", "money"],
+      ["updated_at", "p.priceupdated", "datetime"]
+    ]
+  },
+
+  "inventory_levels": {
+    "description": "Stock on hand per warehouse and bin.",
+    "from": "locstock k",
+    "key": ["warehouse_id", "sku", "bin"],
+    "filters": {"warehouse_id": "k.loccode", "sku": "k.stockid"},
+    "fields": [
+      ["warehouse_id", "k.loccode", "id"],
+      ["sku", "k.stockid", "id"],
+      ["bin", "k.bin", "text"],
+      ["qty_on_hand", "k.quantity", "num"],
+      ["counts_as_on_hand", COUNTS_ON_HAND, "bool"],
+      ["reorder_level", "k.reorderlevel", "num"],
+      ["min_qty", "k.minimum", "num"],
+      ["max_qty", "k.maximum", "num"],
+      ["last_received", "k.daterec", "datetime"]
+    ]
+  },
+
+  "inventory_movements": {
+    "description": "Every stock movement: sales, receipts, transfers and adjustments.",
+    "from": "stockmoves m LEFT JOIN systypes sy ON sy.typeid = m.type",
+    "key": ["movement_id"], "date": "m.trandate",
+    "filters": {"sku": "m.stockid", "warehouse_id": "m.loccode", "type_id": "m.type"},
+    "fields": [
+      ["movement_id", "m.stkmoveno", "nid"],
+      ["type_id", "m.type", "int"],
+      ["type", "sy.typename", "text"],
+      ["document_no", "m.transno", "id"],
+      ["date", "m.trandate", "date"],
+      ["period", "m.prd", "int"],
+      ["sku", "m.stockid", "id"],
+      ["warehouse_id", "m.loccode", "id"],
+      ["qty", "m.qty", "num"],
+      ["qty_after", "m.newqoh", "num"],
+      ["unit_price", "m.price", "money"],
+      ["unit_cost", "m.standardcost", "money"],
+      ["customer_id", "m.debtorno", "id"],
+      ["location_id", "m.branchcode", "id"],
+      ["reference", "m.reference", "text"],
+      ["user_id", "m.userid", "text"]
+    ]
+  },
+
+  "purchase_orders": {
+    "description": "Purchase order headers.",
+    "from": "purchorders po LEFT JOIN po_status ps ON ps.status_id = po.status_id LEFT JOIN suppliers v ON v.supplierid = po.supplierno",
+    "key": ["po_id"], "date": "po.orddate",
+    "filters": {"vendor_id": "po.supplierno", "status_id": "po.status_id"},
+    "fields": [
+      ["po_id", "po.orderno", "nid"],
+      ["vendor_id", "po.supplierno", "id"],
+      ["order_date", "po.orddate", "date"],
+      ["warehouse_id", "po.intostocklocation", "id"],
+      ["status_id", "po.status_id", "id"],
+      ["status", "ps.name", "text"],
+      ["is_closed", "ps.pocompleted", "bool"],
+      ["currency", "v.currcode", "id"],
+      ["requested_by", "po.initiator", "text"],
+      ["requisition_no", "po.requisitionno", "text"],
+      ["delivery_date", "po.deliverydate", "date"],
+      ["arrived_at", "po.datearrived", "datetime"],
+      ["exchange_rate", "po.rate", "num"],
+      ["payment_terms_id", "po.paymentterms", "id"],
+      ["vendor_contact", "po.suppliercontact", "text"],
+      ["vendor_invoice_no", "po.invoicenumber", "text"],
+      ["comments", "po.comments", "text"]
+    ]
+  },
+
+  "purchase_order_lines": {
+    "description": "Purchase order lines.",
+    "from": "purchorderdetails pl LEFT JOIN purchorders po ON po.orderno = pl.orderno LEFT JOIN suppliers v ON v.supplierid = po.supplierno",
+    "key": ["po_line_id"],
+    "filters": {"po_id": "pl.orderno", "sku": "pl.itemcode"},
+    "fields": [
+      ["po_line_id", "pl.podetailitem", "nid"],
+      ["po_id", "pl.orderno", "id"],
+      ["sku", "pl.itemcode", "id"],
+      ["description", "pl.itemdescription", "text"],
+      ["vendor_part_no", "pl.suppliers_partno", "text"],
+      ["qty_ordered", "pl.quantityord", "num"],
+      ["qty_received", "pl.quantityrecd", "num"],
+      ["qty_invoiced", "pl.qtyinvoiced", "num"],
+      ["currency", "v.currcode", "id"],
+      ["unit_price", "pl.unitprice", "money"],
+      ["unit_cost", "pl.stdcostunit", "money"],
+      ["delivery_date", "pl.deliverydate", "date"],
+      ["gl_account", "pl.glcode", "id"],
+      ["completed", "pl.completed", "bool"]
+    ]
+  },
+
+  "receipts": {
+    "description": "Goods received against purchase order lines.",
+    "from": "grns g",
+    "key": ["receipt_id"], "date": "g.deliverydate",
+    "filters": {"po_id": "g.poorderno", "vendor_id": "g.supplierid", "sku": "g.itemcode"},
+    "fields": [
+      ["receipt_id", "g.grnno", "nid"],
+      ["batch_no", "g.grnbatch", "id"],
+      ["po_id", "g.poorderno", "id"],
+      ["po_line_id", "g.podetailitem", "id"],
+      ["vendor_id", "g.supplierid", "id"],
+      ["sku", "g.itemcode", "id"],
+      ["description", "g.itemdescription", "text"],
+      ["qty_received", "g.qtyrecd", "num"],
+      ["qty_invoiced", "g.quantityinv", "num"],
+      ["unit_cost", "g.stdcostunit", "money"],
+      ["received_date", "g.deliverydate", "date"],
+      ["vendor_reference", "g.supplieref", "text"],
+      ["created_at", "g.added_date", "datetime"]
+    ]
+  }
+}
+
+// The small reference tables, served together by /v1/lookups.
+let LOOKUPS = {
+  "warehouses": ["SELECT loccode AS id, locationname AS name, deladd3 AS city, deladd4 AS region FROM locations ORDER BY loccode", ["id", "name", "city", "region"]],
+  "payment_terms": ["SELECT termsindicator AS id, terms AS name, daysbeforedue AS days_before_due, dayinfollowingmonth AS day_in_following_month FROM paymentterms ORDER BY termsindicator", ["id", "name", "days_before_due", "day_in_following_month"]],
+  "price_lists": ["SELECT typeabbrev AS id, sales_type AS name FROM salestypes ORDER BY typeabbrev", ["id", "name"]],
+  "categories": ["SELECT categoryid AS id, categorydescription AS name FROM stockcategory ORDER BY categoryid", ["id", "name"]],
+  "brands": ["SELECT manufacturer_id AS id, name, mfg_code AS code FROM manufacturer ORDER BY manufacturer_id", ["id", "name", "code"]],
+  "areas": ["SELECT areacode AS id, areadescription AS name FROM areas ORDER BY areacode", ["id", "name"]],
+  "territories": ["SELECT territory_id AS id, territory_name AS name FROM territory ORDER BY territory_id", ["id", "name"]],
+  "hold_reasons": ["SELECT reasoncode AS id, reasondescription AS name FROM holdreasons ORDER BY reasoncode", ["id", "name"]],
+  "customer_types": ["SELECT typeid AS id, typename AS name FROM debtortype ORDER BY typeid", ["id", "name"]],
+  "ship_via": ["SELECT shipper_id AS id, shippername AS name FROM shippers ORDER BY shipper_id", ["id", "name"]],
+  "currencies": ["SELECT currabrev AS id, currency AS name, rate FROM currencies ORDER BY currabrev", ["id", "name", "rate"]],
+  "po_statuses": ["SELECT status_id AS id, name, pocompleted AS closes_po FROM po_status ORDER BY status_id", ["id", "name", "closes_po"]],
+  "item_types": ["SELECT label AS id, description AS name, reducesstock AS reduces_stock FROM product_types ORDER BY label", ["id", "name", "reduces_stock"]],
+  "transaction_types": ["SELECT typeid AS id, typename AS name FROM systypes ORDER BY typeid", ["id", "name"]]
+}
+
+// The order the documentation lists the entities in, by area.
+let ENTITY_GROUPS = [
+  ["Customers", ["customers", "customer_locations"]],
+  ["Sales", ["sales_orders", "sales_order_lines"]],
+  ["Receivables", ["invoices", "credit_notes", "payments", "customer_transactions", "invoice_lines", "allocations", "receivables"]],
+  ["Salespeople", ["salespeople"]],
+  ["Inventory", ["items", "item_prices", "inventory_levels", "inventory_movements"]],
+  ["Vendors and purchasing", ["vendors", "vendor_transactions", "purchase_orders", "purchase_order_lines", "receipts"]]
+]
+
+// What a field means where its name does not say it all: "entity.field" first, then "field" for every entity.
+let FIELD_NOTES = {
+  "customer_id": "The customer account number.",
+  "location_id": "The customer's ship-to location (branch) code; with customer_id it identifies a location.",
+  "warehouse_id": "A KM warehouse (lookups: warehouses).",
+  "salesperson_id": "A sales rep (salespeople).",
+  "price_list_id": "A price list (lookups: price_lists).",
+  "payment_terms_id": "Payment terms (lookups: payment_terms).",
+  "ship_via_id": "A carrier (lookups: ship_via).",
+  "territory_id": "A sales territory (lookups: territories).",
+  "area_id": "A sales area (lookups: areas).",
+  "type_id": "The ERP transaction type (lookups: transaction_types): 10 invoice, 11 credit note, 12 receipt, 20 vendor invoice, 21 vendor credit, 22 vendor payment.",
+  "document_no": "The document number as printed (invoice, credit note or receipt number); unique within a type_id.",
+  "transaction_id": "The ledger row's unique id.",
+  "period": "The ERP accounting period number.",
+  "discount_rate": "A fraction: 0.10 is 10%. 1 on a sales line is a free-goods line.",
+  "exchange_rate": "Rate to the home currency (CAD); 1 for CAD.",
+  "note": "Free text entered on the document.",
+  "created_at": "When the row was entered.",
+  "customers.balance": "What the customer owes: the sum of their open items (receivables), as the ERP's aged analysis buckets and statements total it. Positive is owed to KM.",
+  "customers.ledger_balance": "Every document on the account added up, as the Balance column on the ERP's customer aging shows it. Equal to balance unless the account's allocation records are inconsistent.",
+  "customers.lifetime_invoiced": "All invoices ever, before tax and freight.",
+  "customers.hold_reason": "The account's credit status (lookups: hold_reasons).",
+  "customers.on_hold": "True when the hold reason stops new invoices (any reason but Good History).",
+  "customers.credit_limit": "Credit limit in CAD.",
+  "customers.parent_customer_id": "The head-office account this customer rolls up to, if any.",
+  "customers.license_no": "The customer's cosmetology licence number.",
+  "customers.is_active": "False when the account has been closed.",
+  "customer_locations.disabled": "True when no new orders may be taken for this location.",
+  "customer_locations.warehouse_id": "The warehouse this location ships from by default.",
+  "customer_locations.price_level": "The location's own price level, when it differs from the account's.",
+  "sales_orders.is_quote": "True for a quotation that is not (yet) an order.",
+  "sales_orders.requested_date": "The delivery date asked for.",
+  "sales_orders.customer_po": "The customer's purchase order reference.",
+  "sales_orders.invoice_note": "The note printed on the invoice.",
+  "sales_orders.dispatch_note": "Note for the warehouse and delivery.",
+  "sales_orders.invoice_no": "The invoice number once invoiced (also invoices.document_no).",
+  "sales_orders.status_id": "The order's workflow status (status names it).",
+  "sales_orders.is_cancelled": "True for a cancelled order (status 90).",
+  "sales_order_lines.line_amount": "qty_ordered x discounted unit price, before tax, rounded as the ERP rounds it (unit price and its discount to cents first).",
+  "sales_order_lines.qty_invoiced": "How much of the line has been invoiced so far; the rest is open or back-ordered.",
+  "sales_order_lines.completed": "True once the line is closed (fully invoiced or cancelled).",
+  "invoices.subtotal": "Goods before tax, freight and fees (net of line discounts).",
+  "invoices.total": "subtotal + tax + freight + fees + discount: the document's amount on the customer's account (the ERP's ledger and aged analysis).",
+  "invoices.amount_applied": "How much of the total has been paid or credited (allocations).",
+  "invoices.open_amount": "total - amount_applied: still owed.",
+  "invoices.order_id": "The sales order the invoice came from.",
+  "credit_notes.total": "Negative: what the credit takes off the account, including any discount adjustment (the printed credit note leaves that adjustment out).",
+  "payments.total": "Negative: the receipt's amount as it reduces the account.",
+  "invoice_lines.qty": "Units sold; negative on a credit note.",
+  "invoice_lines.line_amount": "qty x discounted unit price, before tax, rounded as the invoice rounds it; an invoice's lines add up to its subtotal.",
+  "invoice_lines.unit_cost": "The item's cost when it was invoiced.",
+  "invoice_lines.document_no": "The invoice or credit note number (invoices.document_no).",
+  "invoice_lines.order_line_no": "The sales order line it came from (sales_order_lines.line_no).",
+  "allocations.from_transaction_id": "The receipt or credit note applied (customer_transactions.transaction_id).",
+  "allocations.to_transaction_id": "The invoice it was applied to (customer_transactions.transaction_id).",
+  "receivables.days_overdue": "Days past the due date as of today; negative before it is due.",
+  "receivables.aging_bucket": "The ERP's aged-analysis bucket: future (due in more than 30 days), current (due within 30 days, or no due date), 0_29, 30_59, 60_89 or 90_plus days past due.",
+  "salespeople.is_current": "False for reps no longer active.",
+  "salespeople.commission_rate": "Commission as a fraction, up to commission_breakpoint; commission_rate_above after it.",
+  "items.item_type": "The ERP item type code; item_type_name says what it is (B Purchased covers almost every item).",
+  "items.reduces_stock": "False for kits and internal items, which carry no stock of their own.",
+  "items.qty_on_hand": "Units on hand across warehouses, as the ERP's item screen counts it: not the transfer warehouse, not the PO holding bin. (The ERP's valuation report does count the holding bin; inventory_levels has every bin.)",
+  "items.qty_on_open_orders": "Units on open sales orders not yet invoiced (quotes and drop-ship orders excluded).",
+  "items.qty_on_open_pos": "Units on open purchase orders not yet received.",
+  "items.unit_cost": "The ERP's cost: weighted average cost, or the last cost when there is no average.",
+  "items.last_cost": "The cost before the most recent receipt changed it.",
+  "items.brand": "The item's brand (lookups: brands).",
+  "item_prices.price_list_id": "A1 is the ERP's price list (lookups: price_lists) and the one orders are priced from. R1, ST and C1 rows exist in the data but no ERP screen or order uses them.",
+  "item_prices.customer_id": "Empty for a list price; set for a price only that customer gets.",
+  "item_prices.end_date": "9999-12-31 means open-ended.",
+  "inventory_levels.qty_on_hand": "Units in that warehouse and bin. Warehouse 01 is the 3PL (PGS): its quantity is what PGS reports as available, refreshed every 15 minutes.",
+  "inventory_levels.counts_as_on_hand": "False for the transfer warehouse and the PO holding bin, which the ERP leaves out of on-hand.",
+  "inventory_movements.qty": "Signed: positive into the warehouse, negative out.",
+  "inventory_movements.qty_after": "Stock on hand in that warehouse after the movement.",
+  "inventory_movements.unit_price": "Selling price on a sale or credit; the PO price in the vendor's currency on a purchase receipt (type 25).",
+  "inventory_movements.unit_cost": "Cost in CAD at the time of the movement.",
+  "vendor_transactions.total": "Positive for an invoice, negative for a payment or credit.",
+  "vendor_transactions.currency": "The vendor's currency; every amount on the row is in it.",
+  "purchase_orders.status": "The PO's workflow status (lookups: po_statuses).",
+  "purchase_orders.is_closed": "True once the PO is completed, cancelled or rejected.",
+  "purchase_order_lines.unit_price": "Price in the vendor's currency (currency).",
+  "purchase_order_lines.unit_cost": "Cost in CAD.",
+  "receipts.qty_invoiced": "How much of the receipt the vendor has invoiced.",
+  "receipts.unit_cost": "Cost in CAD at receipt."
+}
+
+fn field_note(ename, field) {
+  let n = FIELD_NOTES[ename + "." + field]
+  if n != nil { return n }
+  return FIELD_NOTES[field]
+}

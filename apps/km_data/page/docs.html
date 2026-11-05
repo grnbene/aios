@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KM Data API</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1f21; --muted: #5f6368; --line: #e2e2de; --soft: #f0f0ec;
+  --accent: #1f5fae; --accent-ink: #ffffff; --ok: #1e7a3c; --bad: #b3261e; --code-bg: #f3f3ef; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141517; --panel: #1c1d20; --ink: #e8e8e6; --muted: #a0a3a8; --line: #2e3034; --soft: #232428;
+          --accent: #6ea2e8; --accent-ink: #0f1115; --ok: #6cc28a; --bad: #f08a80; --code-bg: #232428; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow: auto; margin: 10px 0; white-space: pre; }
+.layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
+nav { position: sticky; top: 0; height: 100vh; overflow: auto; padding: 22px 16px; border-right: 1px solid var(--line); background: var(--panel); }
+nav .brand { font-weight: 700; font-size: 17px; margin-bottom: 14px; }
+nav h4 { margin: 16px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+nav a { display: block; padding: 3px 8px; border-radius: 6px; color: var(--ink); font-size: 14px; }
+nav a:hover { background: var(--soft); text-decoration: none; }
+main { padding: 28px 40px 80px; max-width: 1100px; }
+h1 { font-size: 28px; margin: 0 0 6px; }
+h2 { font-size: 21px; margin: 40px 0 10px; padding-top: 8px; }
+h3 { font-size: 17px; margin: 0; }
+.lead { color: var(--muted); margin: 0 0 18px; max-width: 760px; }
+.keybar { position: sticky; top: 0; z-index: 5; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+          background: var(--bg); padding: 10px 0 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.keybar label { font-weight: 600; }
+input, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#key { width: 260px; font-family: var(--mono); }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 4px; font-size: 14px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+td.f { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+td.t { color: var(--muted); white-space: nowrap; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 16px 0; scroll-margin-top: 70px; }
+.card-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.path { font-family: var(--mono); font-size: 14px; }
+.method { display: inline-block; font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent-ink); background: var(--accent); border-radius: 4px; padding: 1px 6px; margin-right: 6px; }
+.meta { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0; font-size: 14px; }
+.meta span b { font-weight: 600; }
+details { margin-top: 8px; }
+summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.try { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); }
+.try-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+.try-row label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
+.try-row input, .try-row select { width: 150px; }
+button { font: inherit; font-weight: 600; cursor: pointer; border-radius: 6px; padding: 7px 14px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); }
+button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+.result { margin-top: 10px; }
+.status { font-family: var(--mono); font-size: 13px; }
+.status.ok { color: var(--ok); }
+.status.bad { color: var(--bad); }
+.result pre { max-height: 420px; }
+.callout { background: var(--soft); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 6px; margin: 12px 0; max-width: 820px; }
+ol li, ul li { margin: 3px 0; }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  main { padding: 18px 16px 60px; }
+  #key { width: 100%; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav id="nav">
+  <div class="brand">KM Data API</div>
+  <h4>Guide</h4>
+  <a href="#start">Getting started</a>
+  <a href="#paging">Paging</a>
+  <a href="#filters">Filters and CSV</a>
+  <a href="#values">Values</a>
+  <a href="#errors">Errors</a>
+  <a href="#loading">A daily load</a>
+  <h4>Reference</h4>
+  <a href="#schema">schema</a>
+  <a href="#lookups">lookups</a>
+  <a href="#sales_by_salesperson">sales_by_salesperson</a>
+  <a href="#health">health</a>
+  <div id="nav-entities"></div>
+</nav>
+
+<main>
+  <div class="keybar">
+    <label for="key">API key</label>
+    <input id="key" type="password" autocomplete="off" placeholder="paste your key to try requests">
+    <button class="ghost" id="key-show" type="button">Show</button>
+    <span class="muted small">Kept in this browser tab only, sent as the Authorization header.</span>
+  </div>
+
+  <h1>KM Data API</h1>
+  <p class="lead">Read-only access to KM Canada East's ERP data: customers, sales orders, invoices, receivables,
+  salespeople, inventory, vendors and purchasing. Built for loading into a data warehouse; the data is a live copy
+  of the ERP, normally a few seconds behind it.</p>
+
+  <section id="start">
+    <h2>Getting started</h2>
+    <p>Every request is a <code>GET</code> to <code id="base"></code>
+    with your key in the <code>Authorization</code> header:</p>
+    <pre id="ex-curl"></pre>
+    <p>An answer is one page of rows, in the entity's key order:</p>
+<pre>{
+  "entity": "customers",
+  "count": 1000,
+  "next": "WyIwMTIzNCJd",
+  "rows": [ { "customer_id": "00012", "customer_name": "...", ... }, ... ]
+}</pre>
+    <p>Keys are issued by QBC. Keep yours out of URLs, logs and source control. A key can be switched off at any
+    time; ask for a new one if it stops working.</p>
+  </section>
+
+  <section id="paging">
+    <h2>Paging</h2>
+    <ul>
+      <li><code>limit</code>: rows per page, 1 to <span id="maxlimit"></span> (default <span id="deflimit"></span>).</li>
+      <li><code>next</code> in each answer is the cursor for the following page: send it back as
+        <code>after</code>. When <code>next</code> is <code>null</code> you have every row.</li>
+      <li>Rows always come in key order (the <b>key</b> shown on each entity), so pages never repeat or skip rows,
+        even while new rows are being added. Treat the cursor as opaque.</li>
+    </ul>
+<pre>GET v1/invoices?limit=5000
+GET v1/invoices?limit=5000&amp;after=WzM0NTY3OF0
+...until "next" is null</pre>
+  </section>
+
+  <section id="filters">
+    <h2>Filters and CSV</h2>
+    <ul>
+      <li><code>from</code> / <code>to</code> (YYYY-MM-DD, both inclusive) on entities with a date. Each entity
+        says which of its fields they filter on.</li>
+      <li>Equality filters, listed on each entity: for example <code>customer_id=00012</code>,
+        <code>sku=KMU15287</code>, <code>order_id=1100003</code>.</li>
+      <li><code>format=csv</code> answers the page as CSV with a header row. The cursor for the next page is in the
+        <code>X-Next</code> response header (absent on the last page) and the row count in <code>X-Count</code>.</li>
+      <li>A parameter the entity does not have is refused with 400, so a typo never quietly returns everything.</li>
+    </ul>
+  </section>
+
+  <section id="values">
+    <h2>Values</h2>
+    <table id="types"><thead><tr><th>Type</th><th>Format</th></tr></thead><tbody></tbody></table>
+    <p class="muted small">Missing values, and dates the ERP holds as blank, are <code>null</code>. All amounts are
+    CAD unless a field says otherwise.</p>
+  </section>
+
+  <section id="errors">
+    <h2>Errors</h2>
+    <p>An error answers <code>{"error": "&lt;code&gt;", "message": "..."}</code>:</p>
+    <table>
+      <thead><tr><th>Status</th><th>error</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td class="f">400</td><td class="f">bad_parameter</td><td>An unknown parameter, a bad date, a limit out of range, or a cursor from another entity.</td></tr>
+        <tr><td class="f">401</td><td class="f">unauthorized</td><td>No key, or a key that is not active on this API.</td></tr>
+        <tr><td class="f">404</td><td class="f">not_found</td><td>No such entity.</td></tr>
+        <tr><td class="f">500</td><td class="f">server_error</td><td>The request failed on our side; it is logged. Retry later.</td></tr>
+        <tr><td class="f">503</td><td class="f">unavailable</td><td>The data copy is briefly unreachable. Retry after a minute.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="loading">
+    <h2>A daily load</h2>
+    <ol>
+      <li><b>First load:</b> page through every entity in full and store the rows keyed on each entity's key.</li>
+      <li><b>Every day after:</b>
+        <ul>
+          <li>Reload the small entities in full: customers, customer_locations, salespeople, vendors, items,
+            item_prices, inventory_levels, purchase_orders, purchase_order_lines, receipts and lookups.</li>
+          <li>For the large dated ones (sales_orders, invoices, credit_notes, payments, customer_transactions,
+            invoice_lines, allocations, inventory_movements, vendor_transactions), load a recent window with
+            <code>from</code> (for example the last 7 days) and insert-or-update on the key.</li>
+          <li>sales_order_lines has no date of its own: load the lines of the orders you just loaded
+            (<code>order_id=</code>), or reload it in full weekly.</li>
+          <li>Reload <code>receivables</code> in full: it is the current open items, and older invoices drop out of
+            it as they are paid.</li>
+        </ul>
+      </li>
+      <li>An invoice's <code>amount_applied</code> and <code>open_amount</code> change as it is paid after its
+        date. <code>receivables</code> and the customers' <code>balance</code> are always current.</li>
+    </ol>
+    <div class="callout small">Please run one request at a time per key. Pages of 5,000 rows usually answer in
+    under two seconds.</div>
+  </section>
+
+  <h2>Reference</h2>
+
+  <div class="card" id="schema">
+    <div class="card-head"><h3><span class="method">GET</span><span class="path">v1/schema</span></h3></div>
+    <p>Every entity, its key, filters and fields with their types, as JSON. Use it to generate your tables.</p>
+    <div class="try" data-path="v1/schema" data-params=""></div>
+  </div>
+
+  <div class="card" id="lookups">
+    <div class="card-head"><h3><span class="method">GET</span><span class="path">v1/lookups</span></h3></div>
+    <p>The small reference tables in one answer, each a list of rows with <code>id</code> and <code>name</code>:
+    <span id="lookup-names"></span>.</p>
+    <div class="try" data-path="v1/lookups" data-params=""></div>
+  </div>
+
+  <div class="card" id="sales_by_salesperson">
+    <div class="card-head"><h3><span class="method">GET</span><span class="path">v1/sales_by_salesperson</span></h3></div>
+    <p>Sales per rep per day, on the same basis as the ERP's commission report: the invoice and credit note lines
+    as printed, credited to the rep on the document, before tax and freight, without the ERP's adjustment items
+    (prompt-payment discounts, accruals, write-offs). <code>from</code> and <code>to</code> are required, at most
+    366 days apart; <code>salesperson_id</code> and <code>format=csv</code> are optional.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td class="f">salesperson_id</td><td class="t">id</td><td>The rep on the invoice or credit note.</td></tr>
+        <tr><td class="f">salesperson_name</td><td class="t">text</td><td>The rep's name.</td></tr>
+        <tr><td class="f">date</td><td class="t">date</td><td>The line's date.</td></tr>
+        <tr><td class="f">invoiced</td><td class="t">money</td><td>Invoice lines, after line discounts.</td></tr>
+        <tr><td class="f">credited</td><td class="t">money</td><td>Credit note lines (negative).</td></tr>
+        <tr><td class="f">net_sales</td><td class="t">money</td><td>invoiced + credited.</td></tr>
+        <tr><td class="f">cost</td><td class="t">money</td><td>Cost of the units sold, at the cost when invoiced.</td></tr>
+        <tr><td class="f">gross_profit</td><td class="t">money</td><td>net_sales - cost.</td></tr>
+        <tr><td class="f">units</td><td class="t">num</td><td>Units sold, net of returns.</td></tr>
+        <tr><td class="f">invoices</td><td class="t">int</td><td>Number of invoices.</td></tr>
+        <tr><td class="f">customers</td><td class="t">int</td><td>Customers invoiced or credited.</td></tr>
+      </tbody>
+    </table>
+    <div class="try" data-path="v1/sales_by_salesperson" data-params="from,to,salesperson_id" data-required="from,to"></div>
+  </div>
+
+  <div class="card" id="health">
+    <div class="card-head"><h3><span class="method">GET</span><span class="path">health</span></h3></div>
+    <p>Whether the data copy is reachable and how many seconds it is behind the ERP. No key needed.</p>
+    <div class="try" data-path="health" data-params="" data-nokey="1"></div>
+  </div>
+
+  <div id="entities"></div>
+</main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var BASE = location.pathname.replace(/docs\/?$/, "");
+  var ORIGIN = location.origin;
+  var keyInput = document.getElementById("key");
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      if (k === "text") e.textContent = attrs[k];
+      else if (k === "html") e.innerHTML = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) { if (c != null) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
+    return e;
+  }
+
+  try { keyInput.value = sessionStorage.getItem("kmdata_key") || ""; } catch (e) {}
+  keyInput.addEventListener("input", function () { try { sessionStorage.setItem("kmdata_key", keyInput.value.trim()); } catch (e) {} });
+  document.getElementById("key-show").addEventListener("click", function () {
+    var show = keyInput.type === "password";
+    keyInput.type = show ? "text" : "password";
+    this.textContent = show ? "Hide" : "Show";
+  });
+
+  document.getElementById("base").textContent = ORIGIN + BASE + "v1/<entity>";
+  document.getElementById("ex-curl").textContent =
+    'curl -H "Authorization: Bearer YOUR_KEY" \\\n  "' + ORIGIN + BASE + 'v1/customers?limit=1000"';
+
+  function curlFor(path, qs, nokey) {
+    return "curl " + (nokey ? "" : '-H "Authorization: Bearer YOUR_KEY" ') + '"' + ORIGIN + BASE + path + (qs ? "?" + qs : "") + '"';
+  }
+
+  // A "Try it" panel: inputs for the given parameters, a Send, and the answer.
+  function buildTry(box, path, params, opts) {
+    opts = opts || {};
+    var row = el("div", {"class": "try-row"});
+    var inputs = {};
+    params.forEach(function (p) {
+      var inp;
+      if (p === "format") {
+        inp = el("select", {}, [el("option", {value: "", text: "json"}), el("option", {value: "csv", text: "csv"})]);
+      } else {
+        inp = el("input", {type: "text", placeholder: p === "from" || p === "to" ? "YYYY-MM-DD" : (p === "limit" ? "5" : "")});
+        if (p === "limit") inp.value = "5";
+      }
+      inputs[p] = inp;
+      row.appendChild(el("label", {}, [p + ((opts.required || []).indexOf(p) >= 0 ? " *" : ""), inp]));
+    });
+    var send = el("button", {type: "button", text: "Send"});
+    var nextBtn = el("button", {type: "button", "class": "ghost", text: "Next page"});
+    nextBtn.disabled = true;
+    row.appendChild(send);
+    row.appendChild(nextBtn);
+    var curl = el("pre", {"class": "small"});
+    var out = el("div", {"class": "result"});
+    box.appendChild(el("div", {"class": "small muted", text: "Try it"}));
+    box.appendChild(row);
+    box.appendChild(curl);
+    box.appendChild(out);
+
+    var cursor = null;
+    function query(after) {
+      var q = [];
+      params.forEach(function (p) {
+        var v = (inputs[p].value || "").trim();
+        if (v !== "") q.push(encodeURIComponent(p) + "=" + encodeURIComponent(v));
+      });
+      if (after) q.push("after=" + encodeURIComponent(after));
+      return q.join("&");
+    }
+    function refreshCurl() { curl.textContent = curlFor(path, query(null), opts.nokey); }
+    Object.keys(inputs).forEach(function (p) { inputs[p].addEventListener("input", refreshCurl); inputs[p].addEventListener("change", refreshCurl); });
+    refreshCurl();
+
+    function run(after) {
+      var key = keyInput.value.trim();
+      if (!opts.nokey && !key) {
+        out.innerHTML = "";
+        out.appendChild(el("div", {"class": "status bad", text: "Paste your API key at the top of the page first."}));
+        keyInput.focus();
+        return;
+      }
+      var qs = query(after);
+      send.disabled = true; nextBtn.disabled = true;
+      out.innerHTML = "";
+      out.appendChild(el("div", {"class": "status muted", text: "Asking..."}));
+      var t0 = performance.now();
+      var headers = opts.nokey ? {} : {"Authorization": "Bearer " + key};
+      fetch(BASE + path + (qs ? "?" + qs : ""), {headers: headers}).then(function (res) {
+        return res.text().then(function (body) { return {res: res, body: body}; });
+      }).then(function (r) {
+        var ms = Math.round(performance.now() - t0);
+        var ct = r.res.headers.get("content-type") || "";
+        var shown = r.body, line = r.res.status + " " + (r.res.ok ? "OK" : "") + "  " + ms + " ms  " + (r.body.length / 1024).toFixed(1) + " KB";
+        cursor = null;
+        if (ct.indexOf("json") >= 0) {
+          try {
+            var d = JSON.parse(r.body);
+            if (d && typeof d === "object" && "count" in d) { line += "  count " + d.count + "  next " + (d.next ? d.next : "null"); cursor = d.next || null; }
+            shown = JSON.stringify(d, null, 2);
+          } catch (e) {}
+        } else {
+          var xn = r.res.headers.get("X-Next"), xc = r.res.headers.get("X-Count");
+          if (xc !== null) line += "  X-Count " + xc;
+          line += "  X-Next " + (xn || "none");
+          cursor = xn || null;
+        }
+        if (shown.length > 200000) shown = shown.slice(0, 200000) + "\n... (cut here; " + r.body.length + " characters in all)";
+        out.innerHTML = "";
+        out.appendChild(el("div", {"class": "status " + (r.res.ok ? "ok" : "bad"), text: line}));
+        out.appendChild(el("pre", {text: shown}));
+        nextBtn.disabled = !cursor;
+      }).catch(function (e) {
+        out.innerHTML = "";
+        out.appendChild(el("div", {"class": "status bad", text: "Request failed: " + e.message}));
+      }).then(function () { send.disabled = false; });
+    }
+    send.addEventListener("click", function () { run(null); });
+    nextBtn.addEventListener("click", function () { if (cursor) run(cursor); });
+  }
+
+  function entityCard(e) {
+    var fieldRows = e.fields.map(function (f) {
+      return el("tr", {}, [el("td", {"class": "f", text: f.name}), el("td", {"class": "t", text: f.type}), el("td", {text: f.note || ""})]);
+    });
+    var params = ["limit"].concat(e.date_field ? ["from", "to"] : [], e.filters, ["format"]);
+    var meta = el("div", {"class": "meta"}, [
+      el("span", {}, [el("b", {text: "Key: "}), el("code", {text: e.key.join(", ")})]),
+      el("span", {}, [el("b", {text: "Dates: "}), e.date_field ? el("code", {text: "from/to on " + e.date_field}) : "none"]),
+      el("span", {}, [el("b", {text: "Filters: "}), e.filters.length ? el("code", {text: e.filters.join(", ")}) : "none"])
+    ]);
+    var tryBox = el("div", {"class": "try"});
+    var card = el("div", {"class": "card", id: e.entity}, [
+      el("div", {"class": "card-head"}, [el("h3", {}, [el("span", {"class": "method", text: "GET"}), el("span", {"class": "path", text: "v1/" + e.entity})]),
+        el("span", {"class": "muted small", text: e.fields.length + " fields"})]),
+      el("p", {text: e.description}),
+      meta,
+      el("details", {}, [el("summary", {text: "Fields"}),
+        el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {text: "Field"}), el("th", {text: "Type"}), el("th", {text: "Meaning"})])]), el("tbody", {}, fieldRows)])]),
+      tryBox
+    ]);
+    buildTry(tryBox, "v1/" + e.entity, params);
+    return card;
+  }
+
+  fetch(BASE + "docs/schema").then(function (r) { return r.json(); }).then(function (s) {
+    document.getElementById("maxlimit").textContent = s.max_limit;
+    document.getElementById("deflimit").textContent = s.default_limit;
+    document.getElementById("lookup-names").textContent = s.lookups.join(", ");
+    var tb = document.querySelector("#types tbody");
+    Object.keys(s.types).forEach(function (t) { tb.appendChild(el("tr", {}, [el("td", {"class": "f", text: t}), el("td", {text: s.types[t]})])); });
+    var nav = document.getElementById("nav-entities"), host = document.getElementById("entities");
+    s.groups.forEach(function (g) {
+      nav.appendChild(el("h4", {text: g.group}));
+      host.appendChild(el("h2", {text: g.group}));
+      g.entities.forEach(function (e) {
+        nav.appendChild(el("a", {href: "#" + e.entity, text: e.entity}));
+        host.appendChild(entityCard(e));
+      });
+    });
+    document.querySelectorAll(".try[data-path]").forEach(function (b) {
+      var ps = b.getAttribute("data-params"), req = b.getAttribute("data-required");
+      buildTry(b, b.getAttribute("data-path"), ps ? ps.split(",").concat(b.getAttribute("data-path") === "v1/sales_by_salesperson" ? ["format"] : []) : [],
+               {nokey: b.hasAttribute("data-nokey"), required: req ? req.split(",") : []});
+    });
+    if (location.hash) { var t = document.getElementById(location.hash.slice(1)); if (t) t.scrollIntoView(); }
+  }).catch(function (e) {
+    document.getElementById("entities").appendChild(el("p", {"class": "status bad", text: "Could not load the schema: " + e.message}));
+  });
+})();
+</script>
+</body>
+</html>

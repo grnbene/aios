@@ -1,0 +1,510 @@
+// km_data: KM's read-only data API.
+//
+//   GET /v1/schema                       every entity, its fields and their types
+//   GET /v1/lookups                      the small reference tables in one answer
+//   GET /v1/<entity>?limit=&after=       one page of an entity, ordered by its key
+//   GET /v1/sales_by_salesperson?from=&to=   net sales per rep per day
+//   GET /health                          replica state (no key needed)
+//
+// Every read is on the ASQL replica of km (ASQL_HOST:ASQL_PORT). Paging is keyset: each answer carries
+// `next`, sent back as ?after= until it is null. Rows come in key order, so a page is never repeated
+// or skipped while rows are added. ?format=csv answers CSV with the cursor in the X-Next header.
+
+import "lib/entities.gr"
+
+fn env(name, fallback) {
+  let v = getenv(name)
+  if v == nil or v == "" { return fallback }
+  return v
+}
+
+fn secret(name) {
+  let v = getenv(name)
+  if v != nil and v != "" { return v }
+  let f = getenv(name + "_FILE")
+  if f != nil and f != "" { return trim(read_file(f)) }
+  return ""
+}
+
+let ASQL = {
+  "host": env("ASQL_HOST", "127.0.0.1"), "port": int(env("ASQL_PORT", "3307")),
+  "user": env("ASQL_USER", "erp"), "password": secret("ASQL_PASSWORD"), "db": env("ASQL_DB", "km")
+}
+let KEY_DB = env("KMDATA_KEY_DB", "km")
+let MAX_LIMIT = 10000
+let DEFAULT_LIMIT = 1000
+let BALANCE_THING = "kmdata_customer_balance"
+
+// ---- database -------------------------------------------------------------------------------------
+
+// One connection per request: connections cannot cross the host's worker threads.
+fn open_db() {
+  let c = db_connect(ASQL.host, ASQL.port, ASQL.user, ASQL.password, ASQL.db)
+  if not c.ok { error("cannot connect to ASQL " + ASQL.host + ":" + str(ASQL.port) + ": " + c.error) }
+  return c
+}
+
+fn q(db, sql, params) {
+  let r = db_query(db, sql, params)
+  if not r.ok { error(r.error + " :: " + sql) }
+  return r
+}
+
+// ---- values ---------------------------------------------------------------------------------------
+
+fn zero_date(v) { return v == nil or v == "" or starts_with(str(v), "0000-00-00") }
+
+fn out_value(v, kind) {
+  if v == nil { return nil }
+  if kind == "id" or kind == "nid" or kind == "text" { return str(v) }
+  if kind == "int" { return int(to_number(v)) }
+  if kind == "money" { return round(to_number(v), 2) }
+  if kind == "num" or kind == "rate" { return to_number(v) }
+  if kind == "date" { return zero_date(v) ? nil : slice(str(v), 0, 10) }
+  if kind == "datetime" { return zero_date(v) ? nil : replace(slice(str(v), 0, 19), " ", "T") }
+  if kind == "bool" { return not (v == 0 or v == "0" or v == "" or v == false) }
+  return v
+}
+
+let DATE_RE = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+
+fn today() { return date_format(now(), "%F", "local") }
+
+// ---- answers --------------------------------------------------------------------------------------
+
+fn fail(status, code, message) {
+  return {"status": status, "content_type": "application/json; charset=utf-8",
+          "body": json_stringify({"error": code, "message": message})}
+}
+
+fn answer_json(body) {
+  return {"status": 200, "content_type": "application/json; charset=utf-8", "body": json_stringify(body)}
+}
+
+fn answer_csv(columns, rows, next) {
+  let lines = []
+  for r in rows {
+    let line = []
+    for c in columns {
+      let v = r[c]
+      push(line, v == nil ? "" : str(v))
+    }
+    push(lines, line)
+  }
+  let headers = {"X-Count": str(len(rows))}
+  if next != nil { headers["X-Next"] = next }
+  return {"status": 200, "content_type": "text/csv; charset=utf-8", "headers": headers, "body": data_to_csv(columns, lines)}
+}
+
+// ---- auth -----------------------------------------------------------------------------------------
+
+// The key is an apikeys row of KEY_DB (active), and it must also be on this API's own list (KMDATA_KEYS),
+// so no other ERP key reaches the data. A token of the form <key>_<userid> is read as its key, as validate.php does.
+fn authenticate(req, db) {
+  let h = req.headers?.authorization
+  let m = regex_match("^Bearer\\s+(\\S+)$", trim(h == nil ? "" : h), "i")
+  if m == nil { return {"fail": fail(401, "unauthorized", "Authorization: Bearer <key> is required")} }
+  let key = split(m.groups[0], "_")[0]
+  let allowed = false
+  for k in split(secret("KMDATA_KEYS"), ",") {
+    let kk = trim(k)
+    if kk != "" and hash_equals(kk, key) { allowed = true }
+  }
+  if not allowed { return {"fail": fail(401, "unauthorized", "This key is not allowed on the data API")} }
+  let r = q(db, "SELECT assigned FROM apikeys WHERE keycode = ? AND active = 1 AND `database` = ?", [key, KEY_DB])
+  if len(r.records) == 0 { return {"fail": fail(401, "unauthorized", "This key is not active")} }
+  return {"who": str(r.records[0].assigned)}
+}
+
+// ---- paging ---------------------------------------------------------------------------------------
+
+fn encode_cursor(values) { return replace(replace(replace(base64_encode(json_stringify(values)), "+", "-"), "/", "_"), "=", "") }
+
+fn decode_cursor(text, n) {
+  let b = replace(replace(text, "-", "+"), "_", "/")
+  while len(b) % 4 != 0 { b = b + "=" }
+  let r = pcall(fn () { return json_parse(base64_decode(b)) })
+  if not r.ok or type(r.value) != "list" or len(r.value) != n { return nil }
+  return r.value
+}
+
+fn field_map(ent) {
+  let m = {}
+  for f in ent.fields { m[f[0]] = f }
+  return m
+}
+
+// One page of an entity. Returns {rows, next, columns} or {fail}.
+fn page(db, ent, params) {
+  let fm = field_map(ent)
+  let allowed = {"limit": true, "after": true, "format": true}
+  if ent.date != nil {
+    allowed["from"] = true
+    allowed["to"] = true
+  }
+  let filters = ent.filters == nil ? {} : ent.filters
+  for k in keys(filters) { allowed[k] = true }
+  for k in keys(params) {
+    if not has(allowed, k) { return {"fail": fail(400, "bad_parameter", "Unknown parameter: " + k)} }
+  }
+
+  let limit = DEFAULT_LIMIT
+  if params.limit != nil {
+    if not regex_test("^[0-9]+$", params.limit) { return {"fail": fail(400, "bad_parameter", "limit must be a whole number")} }
+    limit = int(params.limit)
+    if limit < 1 or limit > MAX_LIMIT { return {"fail": fail(400, "bad_parameter", "limit must be 1 to " + str(MAX_LIMIT))} }
+  }
+
+  let cols = []
+  for f in ent.fields { push(cols, f[1] + " AS `" + f[0] + "`") }
+  let where = []
+  let args = []
+  if ent.where != nil { push(where, "(" + ent.where + ")") }
+  for k in keys(filters) {
+    if params[k] != nil {
+      push(where, filters[k] + " = ?")
+      push(args, params[k])
+    }
+  }
+  if ent.date != nil {
+    if params.from != nil {
+      if not regex_test(DATE_RE, params.from) { return {"fail": fail(400, "bad_parameter", "from must be YYYY-MM-DD")} }
+      push(where, ent.date + " >= ?")
+      push(args, params.from)
+    }
+    if params.to != nil {
+      if not regex_test(DATE_RE, params.to) { return {"fail": fail(400, "bad_parameter", "to must be YYYY-MM-DD")} }
+      push(where, ent.date + " <= ?")
+      push(args, params.to + " 23:59:59")
+    }
+  }
+  let key_exprs = []
+  for k in ent.key { push(key_exprs, fm[k][1]) }
+  if params.after != nil {
+    let after = decode_cursor(params.after, len(ent.key))
+    if after == nil { return {"fail": fail(400, "bad_parameter", "after is not a cursor this entity gave")} }
+    let ph = []
+    for v in after {
+      push(ph, "?")
+      push(args, v)
+    }
+    push(where, "(" + join(key_exprs, ", ") + ") > (" + join(ph, ", ") + ")")
+  }
+  let sql = "SELECT " + join(cols, ", ") + " FROM " + ent.from +
+            (len(where) > 0 ? " WHERE " + join(where, " AND ") : "") +
+            " ORDER BY " + join(key_exprs, ", ") + " LIMIT " + str(limit)
+  let r = q(db, sql, args)
+
+  let rows = []
+  for rec in r.records {
+    let o = {}
+    for f in ent.fields { o[f[0]] = out_value(rec[f[0]], f[2]) }
+    push(rows, o)
+  }
+  let next = nil
+  if len(r.records) == limit {
+    let last = r.records[len(r.records) - 1]
+    let kv = []
+    for k in ent.key {
+      let kind = fm[k][2]
+      push(kv, (kind == "nid" or kind == "int") ? to_number(last[k]) : last[k])
+    }
+    next = encode_cursor(kv)
+  }
+  let columns = []
+  for f in ent.fields { push(columns, f[0]) }
+  if ent.extra != nil { for x in ent.extra { push(columns, x[0]) } }
+  return {"rows": rows, "next": next, "columns": columns}
+}
+
+// ---- enrichments: fields that come from more than the entity's own row ------------------------------
+
+// balance and invoice dates per customer, kept by the ASQL Thing kmdata_customer_balance (deployed.gr), which
+// recomputes a customer whenever one of their debtortrans rows changes. Read with the same query straight from
+// debtortrans while the Thing is missing or still building.
+//   balance:        open items (total - applied), what the aged analysis buckets and statements add up
+//   ledger_balance: every document's total, the Balance column of the ERP's aged analysis (cli/statement), which
+//                   INNER JOINs paymentterms and so leaves out a document whose terms code matches none
+let BALANCE_SQL = "SELECT debtortrans.debtorno, " +
+  "SUM(ovamount + ovgst + ovfee + ovfreight + ovdiscount - alloc) AS balance, " +
+  "SUM(CASE WHEN pt.termsindicator IS NOT NULL THEN ovamount + ovgst + ovfee + ovfreight + ovdiscount ELSE 0 END) AS ledger_balance, " +
+  "MAX(2) AS definition, " +
+  "SUM(CASE WHEN type = 10 THEN ovamount ELSE 0 END) AS lifetime_invoiced, " +
+  "MIN(CASE WHEN type = 10 THEN trandate END) AS first_invoice_date, " +
+  "MAX(CASE WHEN type = 10 THEN trandate END) AS last_invoice_date, " +
+  "MAX(CASE WHEN type = 12 THEN trandate END) AS last_receipt_date " +
+  "FROM debtortrans LEFT JOIN paymentterms pt ON pt.termsindicator = debtortrans.payterms"
+
+fn customer_balances(db, rows) {
+  if len(rows) == 0 { return rows }
+  let by = {}
+  let held = pcall(db_query, db, "SHOW THING " + BALANCE_THING, [])
+  if held.ok and held.value.ok and len(held.value.records) > 0 and str(held.value.records[0]?.definition) == "2" {
+    for b in held.value.records { by[str(b.debtorno)] = b }
+  } else {
+    let ids = []
+    for r in rows { push(ids, r.customer_id) }
+    for b in q(db, BALANCE_SQL + " WHERE debtortrans.debtorno IN (?) GROUP BY debtortrans.debtorno", [ids]).records { by[str(b.debtorno)] = b }
+  }
+  for r in rows {
+    let b = by[r.customer_id]
+    r["balance"] = b == nil ? round(0, 2) : out_value(b.balance, "money")
+    r["ledger_balance"] = b == nil ? round(0, 2) : out_value(b.ledger_balance, "money")
+    r["lifetime_invoiced"] = b == nil ? round(0, 2) : out_value(b.lifetime_invoiced, "money")
+    r["first_invoice_date"] = b == nil ? nil : out_value(b.first_invoice_date, "date")
+    r["last_invoice_date"] = b == nil ? nil : out_value(b.last_invoice_date, "date")
+    r["last_receipt_date"] = b == nil ? nil : out_value(b.last_receipt_date, "date")
+  }
+  return rows
+}
+
+// days overdue against today and the ERP's aged-analysis buckets (model/cli/statement.php getAgedAnalysisBatch):
+// future (due in more than 30 days), current (due within 30 days, or no due date), 0-29, 30-59, 60-89, 90+ past due.
+// The ERP leaves an item due in exactly 30 days out of every bucket; here it is current.
+fn aging(db, rows) {
+  let t = date_parse(today())
+  for r in rows {
+    if r.due_date == nil {
+      r["days_overdue"] = nil
+      r["aging_bucket"] = "current"
+      continue
+    }
+    let d = int(floor((t - date_parse(r.due_date)) / 86400))
+    r["days_overdue"] = d
+    r["aging_bucket"] = d < -30 ? "future" : (d < 0 ? "current" : (d < 30 ? "0_29" : (d < 60 ? "30_59" : (d < 90 ? "60_89" : "90_plus"))))
+  }
+  return rows
+}
+
+// an item's brand (product_to_manufacturer, the ERP's brand link; the lowest brand id when it has several) and its
+// stock figures as the ERP's item screen works them out (model/weberp/items.php, system/library/weberp/b2b.php):
+//   qty_on_hand:        locstock, not the transfer warehouse, not the PO holding bin (getItemStock)
+//   qty_on_open_orders: open sales order lines not yet invoiced, no quotes, no drop-ship orders (getItemDemand)
+//   qty_on_open_pos:    open PO lines not yet received, on POs not received, completed, cancelled or rejected (getOnOpenPO)
+fn item_extras(db, rows) {
+  if len(rows) == 0 { return rows }
+  let skus = []
+  for r in rows { push(skus, r.sku) }
+  let links = q(db, "SELECT p.stockid, MIN(p.manufacturer_id) AS brand_id FROM product_to_manufacturer p WHERE p.stockid IN (?) GROUP BY p.stockid", [skus]).records
+  let ids = []
+  let brand_of = {}
+  for l in links {
+    brand_of[str(l.stockid)] = l.brand_id
+    push(ids, l.brand_id)
+  }
+  let names = {}
+  if len(ids) > 0 {
+    for m in q(db, "SELECT manufacturer_id, name FROM manufacturer WHERE manufacturer_id IN (?)", [ids]).records {
+      names[str(m.manufacturer_id)] = m.name
+    }
+  }
+  let onhand = {}
+  for x in q(db, "SELECT k.stockid, SUM(k.quantity) AS qty FROM locstock k WHERE k.stockid IN (?) AND " + COUNTS_ON_HAND + " GROUP BY k.stockid", [skus]).records {
+    onhand[str(x.stockid)] = x.qty
+  }
+  let demand = {}
+  for x in q(db, "SELECT l.stkcode, SUM(l.quantity - l.qtyinvoiced) AS qty FROM salesorderdetails l " +
+                 "JOIN salesorders o ON o.orderno = l.orderno JOIN shippers sh ON sh.shipper_id = o.shipvia " +
+                 "WHERE l.stkcode IN (?) AND l.completed = 0 AND o.quotation = 0 AND sh.shippername <> 'dropship' GROUP BY l.stkcode", [skus]).records {
+    demand[str(x.stkcode)] = x.qty
+  }
+  let onpo = {}
+  for x in q(db, "SELECT pl.itemcode, SUM(pl.quantityord) - SUM(pl.quantityrecd) AS qty FROM purchorderdetails pl " +
+                 "JOIN purchorders po ON po.orderno = pl.orderno WHERE pl.itemcode IN (?) AND pl.completed <> 1 " +
+                 "AND pl.quantityrecd < pl.quantityord AND po.status_id NOT IN (80, 100, 140, 200) GROUP BY pl.itemcode", [skus]).records {
+    onpo[str(x.itemcode)] = x.qty
+  }
+  for r in rows {
+    let b = brand_of[r.sku]
+    r["brand_id"] = b == nil ? nil : str(b)
+    r["brand"] = b == nil ? nil : names[str(b)]
+    r["qty_on_hand"] = onhand[r.sku] == nil ? 0 : to_number(onhand[r.sku])
+    r["qty_on_open_orders"] = demand[r.sku] == nil ? 0 : to_number(demand[r.sku])
+    r["qty_on_open_pos"] = onpo[r.sku] == nil ? 0 : to_number(onpo[r.sku])
+  }
+  return rows
+}
+
+let ENRICH = {"customer_balances": customer_balances, "aging": aging, "item_extras": item_extras}
+
+// ---- routes ---------------------------------------------------------------------------------------
+
+fn log_call(who, path, rows, started, status) {
+  print(date_format(now(), "%F %T", "local") + " " + who + " " + path + " " + str(status) + " rows=" + str(rows) +
+        " ms=" + str(int(clock() - started)))
+}
+
+fn with_auth(handler) {
+  return fn (req) {
+    let started = clock()
+    let c = pcall(open_db)
+    if not c.ok {
+      print(date_format(now(), "%F %T", "local") + " error " + req.path + ": " + c.error)
+      return fail(503, "unavailable", "The data replica is not reachable")
+    }
+    let db = c.value
+    let r = pcall(fn () {
+      let a = authenticate(req, db)
+      if a.fail != nil { return {"res": a.fail, "who": "-", "rows": 0} }
+      let out = handler(req, db)
+      return {"res": out.res, "who": a.who, "rows": out.rows}
+    })
+    pcall(db_close, db)
+    if not r.ok {
+      print(date_format(now(), "%F %T", "local") + " error " + req.path + ": " + r.error)
+      return fail(500, "server_error", "The request failed; it has been logged")
+    }
+    log_call(r.value.who, req.path + (req.query == nil or req.query == "" ? "" : "?" + req.query), r.value.rows, started, r.value.res.status)
+    return r.value.res
+  }
+}
+
+fn entity_route(req, db) {
+  let name = req.params["entity"]
+  let ent = ENTITIES[name]
+  if ent == nil { return {"res": fail(404, "not_found", "No entity " + name + "; GET /v1/schema lists them"), "rows": 0} }
+  let params = req.query_params == nil ? {} : req.query_params
+  let p = page(db, ent, params)
+  if p.fail != nil { return {"res": p.fail, "rows": 0} }
+  let rows = p.rows
+  if ent.enrich != nil { rows = ENRICH[ent.enrich](db, rows) }
+  if params.format == "csv" { return {"res": answer_csv(p.columns, rows, p.next), "rows": len(rows)} }
+  if params.format != nil and params.format != "json" { return {"res": fail(400, "bad_parameter", "format is json or csv"), "rows": 0} }
+  return {"res": answer_json({"entity": name, "count": len(rows), "next": p.next, "rows": rows}), "rows": len(rows)}
+}
+
+// The whole API described: what /v1/schema answers and the /docs page draws.
+fn schema_doc() {
+  let groups = []
+  for g in ENTITY_GROUPS {
+    let ents = []
+    for name in g[1] {
+      let ent = ENTITIES[name]
+      let fields = []
+      let date_field = nil
+      for f in ent.fields {
+        push(fields, {"name": f[0], "type": f[2] == "nid" ? "id" : f[2], "note": field_note(name, f[0])})
+        if ent.date != nil and f[1] == ent.date and date_field == nil { date_field = f[0] }
+      }
+      if ent.extra != nil { for x in ent.extra { push(fields, {"name": x[0], "type": x[1], "note": field_note(name, x[0])}) } }
+      push(ents, {
+        "entity": name, "description": ent.description, "key": ent.key, "date_field": date_field,
+        "filters": ent.filters == nil ? [] : sort(keys(ent.filters)), "fields": fields
+      })
+    }
+    push(groups, {"group": g[0], "entities": ents})
+  }
+  let lookups = sort(keys(LOOKUPS))
+  return {"groups": groups, "lookups": lookups, "max_limit": MAX_LIMIT, "default_limit": DEFAULT_LIMIT, "types": {
+    "id": "Text identifier.", "text": "Text.", "int": "Whole number.", "num": "Number.",
+    "money": "Amount in CAD, 2 decimals.", "rate": "Fraction: 0.10 is 10%.", "date": "YYYY-MM-DD.",
+    "datetime": "YYYY-MM-DDTHH:MM:SS, Eastern time.", "bool": "true or false."
+  }}
+}
+
+fn schema_route(req, db) {
+  let d = schema_doc()
+  return {"res": answer_json(d), "rows": len(d.groups)}
+}
+
+fn lookups_route(req, db) {
+  let out = {}
+  let n = 0
+  for name in keys(LOOKUPS) {
+    let l = LOOKUPS[name]
+    let rows = []
+    for rec in q(db, l[0], []).records {
+      let o = {}
+      for c in l[1] { o[c] = rec[c] == nil ? nil : (c == "rate" ? rec[c] : str(rec[c])) }
+      push(rows, o)
+    }
+    out[name] = rows
+    n = n + len(rows)
+  }
+  return {"res": answer_json(out), "rows": n}
+}
+
+// Sales per rep per day on the ERP's commission report basis (model/report/commissionreport.php
+// getCommissionStockMoveRows, controller apir/reports.php commissioned_sales): invoice and credit note lines
+// (stockmoves joined to debtortrans on transno and type), as printed (show_on_inv_crds = 1), rep from the
+// document (debtortrans.salesperson), dated by the line, without the adjustment SKUs the report leaves out.
+// line = -price x qty x (1 - discount); cost = -qty x standardcost; gross profit = line - cost.
+let COMMISSION_EXCLUDE = ["PPD_DISCOUNT", "PROMPT PAYMENT", "ACCRUAL", "NEW DOORS", "ZZMCMISC", "ZZMCWRITEOFF"]
+
+fn sales_by_salesperson_route(req, db) {
+  let p = req.query_params == nil ? {} : req.query_params
+  for k in keys(p) {
+    if k != "from" and k != "to" and k != "salesperson_id" and k != "format" {
+      return {"res": fail(400, "bad_parameter", "Unknown parameter: " + k), "rows": 0}
+    }
+  }
+  if p.from == nil or p.to == nil or not regex_test(DATE_RE, p.from) or not regex_test(DATE_RE, p.to) {
+    return {"res": fail(400, "bad_parameter", "from and to (YYYY-MM-DD) are required"), "rows": 0}
+  }
+  if (date_parse(p.to) - date_parse(p.from)) / 86400 > 366 {
+    return {"res": fail(400, "bad_parameter", "At most 366 days per request"), "rows": 0}
+  }
+  if p.format != nil and p.format != "json" and p.format != "csv" {
+    return {"res": fail(400, "bad_parameter", "format is json or csv"), "rows": 0}
+  }
+  let args = [p.from, p.to, COMMISSION_EXCLUDE]
+  let rep = ""
+  if p.salesperson_id != nil {
+    rep = " AND t.salesperson = ?"
+    push(args, p.salesperson_id)
+  }
+  let line = "((-1 * m.price * m.qty) - (-1 * m.price * m.qty * m.discountpercent))"
+  let r = q(db, "SELECT t.salesperson AS salesperson_id, s.salesmanname AS salesperson_name, m.trandate AS date, " +
+    "SUM(CASE WHEN m.type = 10 THEN " + line + " ELSE 0 END) AS invoiced, " +
+    "SUM(CASE WHEN m.type = 11 THEN " + line + " ELSE 0 END) AS credited, " +
+    "SUM(" + line + ") AS net_sales, " +
+    "SUM(-1 * m.qty * m.standardcost) AS cost, " +
+    "SUM(-1 * m.qty) AS units, " +
+    "COUNT(DISTINCT CASE WHEN m.type = 10 THEN m.transno END) AS invoices, " +
+    "COUNT(DISTINCT t.debtorno) AS customers " +
+    "FROM debtortrans t " +
+    "JOIN stockmoves m ON m.transno = t.transno AND m.type = t.type " +
+    "JOIN custbranch b ON b.debtorno = t.debtorno AND b.branchcode = t.branchcode " +
+    "JOIN stockmaster sm ON sm.stockid = m.stockid " +
+    "JOIN salesman s ON s.salesmancode = t.salesperson " +
+    "WHERE m.trandate BETWEEN ? AND ? AND m.stockid NOT IN (?) AND m.show_on_inv_crds = 1" + rep +
+    " GROUP BY t.salesperson, s.salesmanname, m.trandate ORDER BY m.trandate, t.salesperson", args)
+  let rows = []
+  for rec in r.records {
+    let net = to_number(rec.net_sales)
+    let cost = to_number(rec.cost)
+    push(rows, {
+      "salesperson_id": out_value(rec.salesperson_id, "id"), "salesperson_name": out_value(rec.salesperson_name, "text"),
+      "date": out_value(rec.date, "date"),
+      "invoiced": out_value(rec.invoiced, "money"), "credited": out_value(rec.credited, "money"),
+      "net_sales": round(net, 2), "cost": round(cost, 2), "gross_profit": round(net - cost, 2),
+      "units": to_number(rec.units), "invoices": int(to_number(rec.invoices)), "customers": int(to_number(rec.customers))
+    })
+  }
+  let cols = ["salesperson_id", "salesperson_name", "date", "invoiced", "credited", "net_sales", "cost", "gross_profit", "units", "invoices", "customers"]
+  if p.format == "csv" { return {"res": answer_csv(cols, rows, nil), "rows": len(rows)} }
+  return {"res": answer_json({"entity": "sales_by_salesperson", "count": len(rows), "next": nil, "rows": rows}), "rows": len(rows)}
+}
+
+fn health(req) {
+  let r = pcall(fn () {
+    let db = open_db()
+    let s = pcall(db_query, db, "SHOW REPLICA STATUS", [])
+    pcall(db_close, db)
+    if not s.ok or not s.value.ok or len(s.value.records) == 0 { return {"replicating": false} }
+    let x = s.value.records[0]
+    return {"replicating": true, "seconds_behind": x.Seconds_Behind_Master}
+  })
+  if not r.ok { return {"status": 503, "content_type": "application/json", "body": json_stringify({"ok": false, "error": "ASQL unreachable"})} }
+  return answer_json({"ok": true, "replica": r.value})
+}
+
+serve_routes({
+  "GET /health": health,
+  "GET /docs": fn (req) { return {"status": 200, "content_type": "text/html; charset=utf-8", "body": read_file("page/docs.html")} },
+  "GET /docs/schema": fn (req) { return answer_json(schema_doc()) },
+  "GET /v1/schema": with_auth(schema_route),
+  "GET /v1/lookups": with_auth(lookups_route),
+  "GET /v1/sales_by_salesperson": with_auth(sales_by_salesperson_route),
+  "GET /v1/:entity": with_auth(entity_route)
+})

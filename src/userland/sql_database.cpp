@@ -113,9 +113,17 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 namespace {
 // glibc's view of the heap: bytes handed out and still held (arena blocks in use plus mmapped blocks), and bytes
 // free but kept (what RSS carries beyond the live data).
+#if __GLIBC_PREREQ(2, 33)
 size_t malloc_live_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.uordblks + mi.hblkhd; }
 size_t malloc_mmap_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.hblkhd; }   // blocks past the mmap threshold: the big arrays
 size_t malloc_free_bytes() { struct mallinfo2 mi = mallinfo2(); return mi.fordblks; }
+#else
+// glibc < 2.33 (the glibc 2.17 portable build) has only mallinfo(), whose int fields wrap past 2 GiB; read them
+// unsigned so the figures hold to 4 GiB. These feed the memory report only.
+size_t malloc_live_bytes() { struct mallinfo mi = mallinfo(); return (size_t)(unsigned)mi.uordblks + (size_t)(unsigned)mi.hblkhd; }
+size_t malloc_mmap_bytes() { struct mallinfo mi = mallinfo(); return (size_t)(unsigned)mi.hblkhd; }
+size_t malloc_free_bytes() { struct mallinfo mi = mallinfo(); return (size_t)(unsigned)mi.fordblks; }
+#endif
 }  // namespace
 #endif
 #if defined(__APPLE__)
