@@ -6379,72 +6379,83 @@ struct JoinedParts {
   // vector's 24 bytes sat in every joined row to serve a case that does not
   // occur, 96 bytes a row where 80 do - 160 MB of stocktrans' 10M joined rows,
   // each held two and three times over while a join step runs.
-  // 7 inline: n, the ids and the spill pointer fill 40 bytes. At 16 a joined row was 80 bytes whatever the join's
-  // width - 800 MB for a 10M-row two-table join that needs 80 - and joins of more than 7 tables are rare (they
-  // spill to the heap copy, as 17 did).
-  static constexpr size_t INLINE_CAP = 7;
+  // 9 inline in the same 40 bytes: n, the spilled flag and nine ids. A row that outgrows them keeps its heap copy's
+  // pointer in the first 8 bytes of the id array (a row is inline or spilled, never both), so the spill costs no slot
+  // of its own. At 7 inline, a 9-table join (the ERP's stocktrans view) put a malloc and a vector grow on every row
+  // of its last two steps - 1.3M rows - and joins of more than 9 tables are rare (they spill, as 17 did).
+  static constexpr size_t INLINE_CAP = 9;
   static constexpr uint32_t kInlineNull = UINT32_MAX;
   uint8_t n = 0;
+  bool spilled = false;
   uint32_t inline_arr[INLINE_CAP] = {0};
-  std::unique_ptr<std::vector<size_t>> spill;
+
+  std::vector<size_t>* sp() const { std::vector<size_t>* q; std::memcpy(&q, inline_arr, sizeof q); return q; }
+  void set_sp(std::vector<size_t>* q) { std::memcpy(inline_arr, &q, sizeof q); }
+  void release() { if (spilled) { delete sp(); spilled = false; } }
+  void spill_now(size_t room) {
+    auto* v = new std::vector<size_t>();
+    v->reserve(room);
+    for (size_t i = 0; i < n; ++i) v->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
+    set_sp(v);
+    spilled = true;
+  }
 
   JoinedParts() = default;
-  JoinedParts(const JoinedParts& o) : n(o.n) {
-    if (o.spill) spill = std::make_unique<std::vector<size_t>>(*o.spill);
+  ~JoinedParts() { release(); }
+  JoinedParts(const JoinedParts& o) : n(o.n), spilled(o.spilled) {
+    if (spilled) set_sp(new std::vector<size_t>(*o.sp()));
     else std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
   }
-  JoinedParts(JoinedParts&& o) noexcept : n(o.n), spill(std::move(o.spill)) {
-    if (!spill) std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
+  JoinedParts(JoinedParts&& o) noexcept : n(o.n), spilled(o.spilled) {
+    std::memcpy(inline_arr, o.inline_arr, spilled ? sizeof(void*) : n * sizeof(uint32_t));
     o.n = 0;
+    o.spilled = false;
   }
   JoinedParts& operator=(const JoinedParts& o) {
     if (this == &o) return *this;
+    release();
     n = o.n;
-    if (o.spill) spill = std::make_unique<std::vector<size_t>>(*o.spill);
-    else { spill.reset(); std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t)); }
+    spilled = o.spilled;
+    if (spilled) set_sp(new std::vector<size_t>(*o.sp()));
+    else std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
     return *this;
   }
   JoinedParts& operator=(JoinedParts&& o) noexcept {
     if (this == &o) return *this;
+    release();
     n = o.n;
-    spill = std::move(o.spill);
-    if (!spill) std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
+    spilled = o.spilled;
+    std::memcpy(inline_arr, o.inline_arr, spilled ? sizeof(void*) : n * sizeof(uint32_t));
     o.n = 0;
+    o.spilled = false;
     return *this;
   }
 
   size_t size() const { return n; }
   bool empty() const { return n == 0; }
   size_t operator[](size_t i) const {
-    if (!spill) {
+    if (!spilled) {
       const uint32_t v = inline_arr[i];
       return v == kInlineNull ? kNullRow : (size_t)v;
     }
-    return (*spill)[i];
+    return (*sp())[i];
   }
   void push_back(size_t r) {
     const bool fits = r == kNullRow || r < (size_t)kInlineNull;
-    if (n < INLINE_CAP && !spill && fits) {
+    if (n < INLINE_CAP && !spilled && fits) {
       inline_arr[n++] = r == kNullRow ? kInlineNull : (uint32_t)r;
     } else {
-      if (!spill) {
-        spill = std::make_unique<std::vector<size_t>>();
-        spill->reserve(n + 4);
-        for (size_t i = 0; i < n; ++i) spill->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
-      }
-      spill->push_back(r);
+      if (!spilled) spill_now(n + 4);
+      sp()->push_back(r);
       n++;
     }
   }
-  void clear() { n = 0; spill.reset(); }
+  void clear() { release(); n = 0; }
   // Only a row that will outgrow the inline slots needs room reserved.
   void reserve(size_t sz) {
     if (sz <= INLINE_CAP) return;
-    if (!spill) {
-      spill = std::make_unique<std::vector<size_t>>();
-      for (size_t i = 0; i < n; ++i) spill->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
-    }
-    spill->reserve(sz);
+    if (!spilled) spill_now(sz);
+    else sp()->reserve(sz);
   }
   // Set an inline slot already pushed (the single-table evaluator reuses one).
   void set_inline(size_t i, size_t r) { inline_arr[i] = r == kNullRow ? kInlineNull : (uint32_t)r; }
