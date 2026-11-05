@@ -37,6 +37,7 @@
 #include "aios/net/tls_sni.hpp"
 #include "aios/userland/grain.hpp"
 #include "aios/userland/grain_webui.hpp"
+#include "aios/license/license.hpp"
 
 using namespace aios;
 
@@ -1314,5 +1315,13 @@ int aios_webserver_run(int argc, char** argv) {
 }
 
 #ifndef AIOS_WEBSERVER_NO_MAIN
-int main(int argc, char** argv) { return aios_webserver_run(argc, argv); }
+int main(int argc, char** argv) {
+#ifdef AIOS_LICENSE_REQUIRED
+  // A public build: the same license or trial as `aios` (which checks before it hands `aios webserver` here).
+  const aios::license::Verdict v = aios::license::check("");
+  if (!v.ok) { std::fprintf(stderr, "%s\n", v.message.c_str()); return aios::license::kRefused; }
+  if (!v.message.empty()) std::fprintf(stderr, "%s\n", v.message.c_str());
+#endif
+  return aios_webserver_run(argc, argv);
+}
 #endif

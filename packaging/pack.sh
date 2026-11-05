@@ -21,7 +21,10 @@ VERSION=${3:-$(git -C "$SRC" describe --always --dirty 2>/dev/null || date +%Y%m
 FLOOR=$(objdump -T "$BIN_DIR/aios" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
 : "${FLOOR:=GLIBC_2.17}"
 ARCH=$(uname -m)
-STAMP="aios-asql-${VERSION}-linux-${ARCH}-glibc${FLOOR#GLIBC_}"
+# A public build (AIOS_PUBLIC_BUILD) carries the line `aios license status` prints for it; ours carries the other.
+LICENSE=none
+grep -q "build: public (" "$BIN_DIR/aios" && LICENSE=trial
+STAMP="aios-asql-${VERSION}$([ "$LICENSE" = trial ] && echo -public)-linux-${ARCH}-glibc${FLOOR#GLIBC_}"
 
 PKG=$(mktemp -d); trap 'rm -rf "$PKG"' EXIT
 mkdir -p "$PKG/$STAMP/bin" "$PKG/$STAMP/systemd" "$PKG/$STAMP/conf"
@@ -43,6 +46,7 @@ version=$VERSION
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 builder=$(hostname -s)
 glibc_floor=$FLOOR
+license=$LICENSE
 sha256=$(sha256sum "$PKG/$STAMP/bin/aios" | cut -d' ' -f1)
 webserver=$([ -f "$PKG/$STAMP/bin/aios-webserver" ] && echo yes || echo no)
 MANIFEST

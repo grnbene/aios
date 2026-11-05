@@ -50,6 +50,33 @@ Output is `dist/aios-asql-<version>-linux-x86_64-glibc2.17.tar.gz` plus a
 `.sha256`. The script refuses to package a binary whose glibc requirement came
 out above the 2.17 floor, and smoke-tests it on the builder first.
 
+### The public release: `PUBLIC=1`
+
+    PUBLIC=1 ./build-centos7.sh origin/main ../build-centos7-public
+    ./pack.sh ../build-centos7-public dist   # aios-asql-<version>-public-linux-...tar.gz, MANIFEST license=trial
+
+`PUBLIC=1` builds with `-DAIOS_PUBLIC_BUILD=ON`: `aios` and `aios-webserver` then run 30 days
+(`-DAIOS_TRIAL_DAYS=N` to change it) from their first run on a machine, and after that only with a license
+signed by our key. Without it, the build is ours and never checks. `pack.sh` reads which one it was given from
+the binary itself and names the tarball `-public` and writes `license=trial` (else `license=none`) in MANIFEST.
+
+The trial start is kept in several places (`ROOT/.aios-trial`, `~/.aios/trial`, `/var/tmp/.aios-trial`,
+`/var/lib/aios/.aios-trial`); the earliest one counts, so a new `--root` or deleting one copy does not restart it,
+and the latest time any run saw is kept too, so setting the clock back does not either. A record edited by hand
+refuses to start.
+
+Issuing a license (only where the signing key is; never copy the key to a server):
+
+    aios license issue --key ~/.config/aios/license-signing.key --to "Acme Ltd" --days 365 --out acme.license
+    aios license issue --key ~/.config/aios/license-signing.key --to "Acme Ltd" --until 2027-12-31 --out acme.license
+    aios license issue --key ~/.config/aios/license-signing.key --to "Sean" --forever --out sean.license
+
+The binary carries only the public half of that key (`kIssuerPublicKey`, src/license/license.cpp). Lose the
+private key and no new license can be made for the builds already out; back it up. `aios license keygen FILE`
+makes a new key, but a build carrying the old public key refuses every license the new key signs.
+
+What it does not stop: someone editing the compiled binary to skip the check, or deleting every trial record.
+
 ## Install
 
 Unpack the tarball and run the installer inside it:
