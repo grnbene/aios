@@ -99,7 +99,10 @@ if ! "$HERE/bin/aios" --help >/dev/null 2>"$PROBE/err"; then
 fi
 say "load probe passed (--help ran clean)"
 
-SYSTEMD_VER=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}')
+# Only where there is a systemctl: under pipefail a missing one (a container, --no-service) failed this assignment
+# and set -e ended the install here without a word.
+SYSTEMD_VER=""
+if command -v systemctl >/dev/null; then SYSTEMD_VER=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}'); fi
 if [ "$NO_SERVICE" = 1 ]; then
   READWRITEPATHS=""; MEMORYLIMITS=""
 elif [ "$SYSTEMD_VER" -ge 231 ] 2>/dev/null; then
