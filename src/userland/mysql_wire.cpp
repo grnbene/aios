@@ -3304,6 +3304,7 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       bool have_password = false;
       AsqlGrant g;
       bool regrant = false;
+      bool have_tables = false, have_rights = false, have_ttl = false, have_rows = false;
       for (; i < w.size(); i += 2) {
         const std::string key = up(w[i]);
         if (key == "IDENTIFIED") {
@@ -3318,15 +3319,19 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
         char* end = nullptr;
         if (key == "TABLES") {
           if (!asql_parse_scopes(val, &g.scopes, &err)) return fail(err);
+          have_tables = true;
         } else if (key == "RIGHTS") {
           if (!asql_parse_rights(val, &g.rights, &err)) return fail(err);
+          have_rights = true;
         } else if (key == "TTL") {
           const unsigned long long s = std::strtoull(val.c_str(), &end, 10);
           if (val.empty() || *end) return fail("TTL is a number of seconds (0 = never expires)");
           g.ttl_ns = s * 1000000000ull;
+          have_ttl = true;
         } else if (key == "ROWS") {
           g.rows_cap = std::strtoull(val.c_str(), &end, 10);
           if (val.empty() || *end) return fail("ROWS is a number");
+          have_rows = true;
         } else {
           return fail("unknown option " + w[i] + "; " + usage);
         }
@@ -3354,15 +3359,20 @@ void MysqlWireServer::serve_client(hal::Connection& raw_conn) {
       if (regrant) {
         // A changed grant is a new credential; the old one is revoked so a
         // session still holding it is cut off at its next statement.
-        AsqlAuthority old;
-        if (exists && !g.scopes.empty() && asql_verify(*cap_guard_, existing.credential, &old, &err)) {
-          if (!asql_revoke(*cap_guard_, existing.credential, &err)) return fail(err);
-        } else if (exists && g.scopes.empty()) {
-          // Only rights/ttl/rows changed: keep the scope the user already has.
-          if (!asql_verify(*cap_guard_, existing.credential, &old, &err)) return fail("the user's credential is " + err + "; give TABLES to grant afresh");
-          g.scopes = old.scopes;
-          if (!g.rights) g.rights = old.rights;
-          if (!asql_revoke(*cap_guard_, existing.credential, &err)) return fail(err);
+        // An ALTER changes only what it names: TABLES, RIGHTS, TTL or ROWS left out keep the user's current value
+        // (the expiry stays the same moment, not a fresh TTL). Before, a left-out TTL or ROWS fell back to never /
+        // unlimited, so ALTER USER 'u' RIGHTS 'read,write' silently lifted the user's expiry and row limit.
+        if (exists) {
+          AsqlAuthority old;
+          const bool old_ok = asql_verify(*cap_guard_, existing.credential, &old, &err);
+          if (!old_ok && !have_tables) return fail("the user's credential is " + err + "; give TABLES to grant afresh");
+          if (old_ok) {
+            if (!have_tables) g.scopes = old.scopes;
+            if (!have_rights) g.rights = old.rights;
+            if (!have_ttl) g.ttl_ns = asql_remaining_ttl_ns(old);
+            if (!have_rows) g.rows_cap = old.rows_cap;
+            if (!asql_revoke(*cap_guard_, existing.credential, &err)) return fail(err);
+          }
         }
         if (!g.rights) g.rights = 1;
         if (!asql_mint(*cap_guard_, g, &user.credential, &err)) return fail(err);
