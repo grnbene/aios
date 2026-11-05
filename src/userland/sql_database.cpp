@@ -19371,6 +19371,7 @@ bool ColumnStore::append_encoded(const std::string& val) {
         for (int f = frac < 0 ? 0 : frac; f < places; ++f) acc *= 10;
         sv = (int64_t)(neg ? -acc : acc);
       }
+      if (r == 0 && !null) base_int64 = sv;   // an empty column: any base serves, the first value's best (as FOR's)
       if (sv < base_int64 && !rebase_packed(*this, sv)) return false;
       const uint64_t delta = (uint64_t)(sv - base_int64);
       if (delta > 0xFFFFFFFFull) return false;
@@ -22212,6 +22213,24 @@ static void start_typed_if_empty(SqlTable* t, size_t c) {
     cs.data32.clear();
     cs.packed_data.clear();
     cs.fresh_typed = true;   // laid out as optimize_encoding chooses where a dictionary column would be
+    return;
+  }
+  // A DECIMAL(p, s) of 1 to 9 places: scaled integers from the start (DecimalScaled), every place kept, as the
+  // checkpoint's conversion (Rule 3b) makes of a dictionary column whose entries are all the canonical text of their
+  // scaled integers. A value that is not (a wrong scale, '+1.50', '01.50', '-0.00', a span past 32 bits) turns the
+  // column back into a dictionary right there, as an append to any typed column does. As a dictionary every value
+  // was interned as text (half a DECIMAL load's time) and read back as text until a checkpoint typed the column.
+  if (sc.type == SqlDataType::Decimal && sc.scale >= 1 && sc.scale <= 9) {
+    if (!cs.begin_typed(ColumnEncoding::TypedInt64)) return;
+    double sf = 1.0;
+    for (int i = 0; i < (int)sc.scale; ++i) sf *= 10.0;
+    cs.encoding = ColumnEncoding::DecimalScaled;
+    cs.base_int64 = 0;
+    cs.scale_factor = sf;
+    cs.inv_scale_factor = -1.0 / sf;   // negative: decimal_fixed()
+    cs.bit_width_ = 0;
+    cs.data32.clear();
+    cs.packed_data.clear();
     return;
   }
   // A DOUBLE: its numbers as they are, scaled (DecimalScaled) at the checkpoint as a dictionary column would be.
@@ -63153,6 +63172,57 @@ static bool rewrite_view_dml(SqlDatabase* db, const std::string& sql, const SqlV
 // its caller clears it after the call too, so an INSERT that returns before reading it leaves nothing behind.
 thread_local std::vector<std::vector<Val>>* tls_insert_given = nullptr;
 
+// A set of int64 keys in one flat array (open addressing), for the primary-key check of a load that spans many
+// batches: a node-per-key hash map would be a malloc per row.
+class FlatI64Set {
+ public:
+  // False when the key was there already.
+  bool insert(int64_t k) {
+    if (k == kNone) { if (has_none_) return false; has_none_ = true; return true; }
+    if ((count_ + 1) * 4 > keys_.size() * 3) grow();
+    size_t i = mix((uint64_t)k) & (keys_.size() - 1);
+    while (keys_[i] != kNone) {
+      if (keys_[i] == k) return false;
+      i = (i + 1) & (keys_.size() - 1);
+    }
+    keys_[i] = k;
+    ++count_;
+    return true;
+  }
+  // Room for about n keys up front, so a load of known size does not grow (and re-insert every key) as it goes.
+  void reserve(size_t n) {
+    size_t cap = 1024;
+    while (cap * 3 < n * 4) cap *= 2;
+    if (cap > keys_.size() && count_ == 0) keys_.assign(cap, kNone);
+  }
+ private:
+  static constexpr int64_t kNone = INT64_MIN;
+  static size_t mix(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; return (size_t)x; }
+  void grow() {
+    std::vector<int64_t> old;
+    old.swap(keys_);
+    keys_.assign(old.empty() ? 1024 : old.size() * 2, kNone);
+    count_ = 0;
+    for (int64_t k : old) if (k != kNone) insert(k);
+  }
+  std::vector<int64_t> keys_;
+  size_t count_ = 0;
+  bool has_none_ = false;
+};
+// Rows a load has already made canonical (each value is exactly the text the column stores - LOAD DATA checked it
+// as it read them), handed to execute_insert in place of tuples of Val: no conversion pass, no per-row loop. The
+// primary key, when there is one and it is an integer column, is checked here for the whole load (the key set
+// lives as long as the load); a table with any other key, or any UNIQUE key, takes the rows as tuples.
+struct LoadCanonBatch {
+  std::vector<std::vector<std::string>>* rows = nullptr;
+  int pk = -1;                  // the integer primary-key column, or -1: no key to check
+  FlatI64Set* keys = nullptr;
+  bool no_undo = false;         // the load runs in a transaction of its own, holding the table: no row is logged for undo
+                                // or claimed (a failure cuts the table back to where the load began instead)
+  bool undo_skipped = false;    // set by execute_insert: it took the batch that way
+};
+thread_local LoadCanonBatch* tls_insert_canon = nullptr;
+
 SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   bool first_generated_id = true;   // LAST_INSERT_ID: the first id this statement generates
   std::vector<Token> toks;
@@ -63252,7 +63322,12 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   bool from_select = false;
   // Rows handed in whole (LOAD DATA, tls_insert_given): the statement is `INSERT .. INTO t (cols)` and nothing more;
   // the rows are values as a VALUES list's would be, and go through the same path from here.
-  if (tls_insert_given) {
+  LoadCanonBatch* canon = tls_insert_canon;
+  tls_insert_canon = nullptr;
+  if (canon) {
+    // the rows are in canon->rows; `tuples` stays empty and nothing below reads them as tuples unless the statement
+    // turns out not to take them canonical (converted back, at defer_rows)
+  } else if (tls_insert_given) {
     tuples = std::move(*tls_insert_given);
     tls_insert_given = nullptr;
   } else
@@ -63533,13 +63608,19 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       if (!named || at >= tuple.size() || tuple[at].null || zero) { big_needs_ai = true; break; }
     }
   }
-  if (!pk_cols.empty() || ai_idx >= 0) {
-    if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
-    // A chunk of the key map per insert, never the whole table: this runs under the statement lock, and the first
-    // insert after a restart walked every row (stockmoves, 12.5M: 19 s) with every reader of every table waiting.
-    // The duplicate check answers from the column index (find_big_pk) until the map is whole.
-    else if (t->row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(*t, pk_cols, ai_idx, 16384);
-  }
+  // (Not for canonical rows of a load, which check their own keys: the previous batch's rows were indexed here, a
+  // key string and a map entry each, for a map the load never reads. The index catches up when a statement next
+  // needs it; rows that turn out not to go in canonical run this below.)
+  auto sync_key_index = [&]() {
+    if (!pk_cols.empty() || ai_idx >= 0) {
+      if (!big_pk) sync_row_index(*t, pk_cols, ai_idx);
+      // A chunk of the key map per insert, never the whole table: this runs under the statement lock, and the first
+      // insert after a restart walked every row (stockmoves, 12.5M: 19 s) with every reader of every table waiting.
+      // The duplicate check answers from the column index (find_big_pk) until the map is whole.
+      else if (t->row_count() * 24 <= row_index_budget_bytes() / 2) sync_row_index(*t, pk_cols, ai_idx, 16384);
+    }
+  };
+  if (!canon) sync_key_index();
   auto find_big_pk = [&](const SqlRow& row, const std::string& pk_key) -> long long {
     // Candidates from whichever key column narrows them most for this row:
     // salesorderdetails' key starts with orderlineno, and every order has a
@@ -63860,8 +63941,9 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   auto note_touched = [&](size_t r) {
     if (ai_idx >= 0) touched_id = std::strtoull(sql_display(t->cell(r, (size_t)ai_idx)).c_str(), nullptr, 10);
   };
-  if (!tuples.empty()) {
-    t->reserve(t->row_count() + tuples.size());
+  const size_t nin = canon ? canon->rows->size() : tuples.size();   // the rows this statement was given
+  if (nin > 0) {
+    t->reserve(t->row_count() + nin);
   }
   // Many plain rows into a table nothing follows row by row: each row's checks run as always, one after another,
   // but the rows that pass wait in `pend` and go into the columns together, the columns side by side
@@ -63870,10 +63952,34 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   // key check from the key map knows the waiting rows (a key among them flushes before the duplicate is handled),
   // anything else (a big table's key search, an error's return) flushes. Their undo entries are written as they
   // pass, in order, as append_row_canonical_impl writes them.
-  bool defer_rows = tuples.size() >= 256 && ukeys.empty() && ins_trig.empty() && upd_trig.empty() && del_trig.empty() &&
+  bool defer_rows = (nin >= 256 || canon) && ukeys.empty() && ins_trig.empty() && upd_trig.empty() && del_trig.empty() &&
                     !replace && !on_duplicate && !fk_child && !fk_rows && !things_watch(*t) && t->watch_list->empty() &&
                     !t->journal.on && t->col_data.size() >= 4 && !redo_replaying_;
   for (const auto& cs : t->col_data) if (cs.shared_dict) defer_rows = false;
+  // Canonical rows are taken as they are where the rows go in deferred (the same conditions) into a table of the shape
+  // the loader checked: every column given in order, no AUTO_INCREMENT or generated column, no rule, and the
+  // primary key the one integer column it was told of (or none). Otherwise they become tuples again (the text of
+  // each value, as the loader's reader would have made them) and the rows go the way they always did.
+  bool canon_taken = false;
+  if (canon) {
+    bool shape = defer_rows && !t->has_rules() && ai_idx < 0 && target_cols.size() == t->columns.size() &&
+                 (canon->pk >= 0 ? (pk_cols.size() == 1 && pk_cols[0] == canon->pk) : pk_cols.empty());
+    for (size_t i = 0; shape && i < target_cols.size(); ++i)
+      if (t->get_column_index(target_cols[i]) != (int)i || !t->columns[i].generated.empty()) shape = false;
+    canon_taken = shape;
+    canon->undo_skipped = shape && canon->no_undo;
+    if (!canon_taken) {
+      tuples.reserve(nin);
+      for (auto& r : *canon->rows) {
+        std::vector<Val> tu;
+        tu.reserve(r.size());
+        for (auto& f : r) tu.push_back(val_text(f));
+        tuples.push_back(std::move(tu));
+      }
+      canon->rows->clear();
+      sync_key_index();   // the index the rows below are checked against, as it would have been
+    }
+  }
   std::vector<std::vector<std::string>> pend;
   std::vector<std::string> pend_claims;   // the waiting rows' keys, claimed (claim_rows) as they go in
   size_t pend_touch = SIZE_MAX;   // the last waiting row note_touched is owed, by its row number once appended
@@ -63881,7 +63987,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   // The waiting rows' undo entries are made here, after the rows went in, each taking its row (moved, not
   // copied) - in the order the rows came, as row_undo_inserted makes them one at a time, and their keys claimed
   // first as it claims them. Nothing else of this statement writes an entry between a row's turn and this.
-  const bool pend_undo = row_undo_on(t);
+  const bool pend_undo = row_undo_on(t) && !(canon_taken && canon->no_undo);
   const std::string pend_undo_key = pend_undo ? make_table_key(t->database, t->name) : std::string();
   auto flush_pend = [&]() {
     if (pend.empty()) return;
@@ -63926,7 +64032,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     std::function<void()> f;
     ~PendFlush() { f(); }   // before append_guard's destructor (declared earlier) and any rollback after it
   } pend_flush{flush_pend};
-  if (defer_rows) pend.reserve(std::min<size_t>(tuples.size(), 65536));
+  if (defer_rows) pend.reserve(std::min<size_t>(nin, 65536));
   // Each value's position -> its column, once (it was looked up by name for every value of every row).
   const size_t ntv = target_cols.empty() ? t->columns.size() : target_cols.size();
   std::vector<size_t> col_of(ntv);
@@ -63966,6 +64072,26 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
         }
       }
     });
+  }
+  if (canon_taken) {
+    // The rows wait as they are: no value is converted, no key string made. The key of an integer primary key is
+    // checked against every row of the load so far, and a duplicate is the error a plain INSERT gives (the rows
+    // before it still go in, as the statement's own undo then takes them back).
+    auto& rows = *canon->rows;
+    for (auto& r : rows) {
+      if (canon->pk >= 0) {
+        const std::string& kt = r[(size_t)canon->pk];
+        int64_t k = 0;
+        size_t i = !kt.empty() && kt[0] == '-' ? 1 : 0;
+        for (size_t j = i; j < kt.size(); ++j) k = k * 10 + (kt[j] - '0');   // plain digits (checked by the loader)
+        if (i) k = -k;
+        if (!canon->keys->insert(k)) return make_error("Duplicate entry '" + kt + "' for key 'PRIMARY' on table '" + t->name + "'");
+      }
+      pend.push_back(std::move(r));
+    }
+    inserted = rows.size();
+    affected = inserted;
+    rows.clear();
   }
   std::vector<uint8_t> done_col(t->columns.size(), 0);
   std::vector<const std::string*> done_err(t->columns.size(), nullptr);
@@ -64354,8 +64480,8 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
                         (updated ? ", " + std::to_string(updated) + " replaced" : "") + ".";
   // MySQL words it for a multi-row VALUES and for INSERT ... SELECT: the rows given, those that met an existing
   // key (replaced, updated or - IGNORE - skipped with a warning each).
-  if (via_select || tuples.size() > 1) {
-    const uint64_t records = tuples.size();
+  if (via_select || nin > 1) {
+    const uint64_t records = nin;
     const uint64_t dups = replace ? updated : (records > inserted ? records - inserted : 0);
     const uint64_t warns = insert_ignore && !replace && !on_duplicate ? dups : 0;
     res.ok_info = "Records: " + std::to_string(records) + "  Duplicates: " + std::to_string(dups) +

@@ -219,6 +219,111 @@ bool normalize_load_path(const std::string& path, std::string* out) {
 }
 }  // namespace
 
+namespace {
+// Whether a load reads its file the plain way: set while a load that found a value it cannot take as it stands
+// (see LoadColCheck) is run again with every value converted, as an INSERT's would be.
+thread_local bool tls_load_canon_off = false;
+
+// What it takes for a field read from a file to be stored exactly as it is read - the text the column holds is the
+// file's text, no conversion, no clamping, no warning - for the column types a load commonly has. Each is the
+// condition under which sql_normalize_value, lenient_cell_value and strict_cell_error all leave the value alone
+// (they are the rules it is held to, and a value that is not plainly so is left to them: the load runs again the
+// ordinary way). Anything else about the column - a type not listed, a binary, enum or set, a TIME - is Unsupported.
+struct LoadColCheck {
+  enum Kind { Unsupported, Int, Real, Decimal, Varchar, FreeText, Date } kind = Unsupported;
+  AIOS_INT128 lo = 0, hi = 0;   // Int: the type's range
+  int scale = 0, precision = 0;
+  size_t maxlen = 0;            // Varchar: at most this many bytes (so characters)
+  bool char_pad = false;        // CHAR(n): a trailing space is cut on the way in
+  bool tiny = false;            // TINYTEXT: at most 255 bytes
+  bool is_unsigned = false;
+  SqlDataType type = SqlDataType::Text;
+  SqlColumn col;                // canonical_temporal reads the column
+};
+
+LoadColCheck make_load_col_check(const SqlColumn& c) {
+  LoadColCheck k;
+  k.col = c;
+  if (c.auto_increment || !c.generated.empty()) return k;
+  const std::string d = lower_of(c.declared);
+  k.is_unsigned = d.find(" unsigned") != std::string::npos;
+  k.type = c.type;
+  if (c.temporal == 1 || c.temporal == 2) { k.kind = LoadColCheck::Date; return k; }
+  if (c.temporal != 0) return k;
+  switch (c.type) {
+    case SqlDataType::Int:
+      if (!d.empty() && int_type_range(d, &k.lo, &k.hi)) k.kind = LoadColCheck::Int;
+      return k;
+    case SqlDataType::Real:
+      if (c.scale <= 0) { k.kind = LoadColCheck::Real; k.scale = c.scale; }
+      return k;
+    case SqlDataType::Decimal:
+      if (c.precision > 0) { k.kind = LoadColCheck::Decimal; k.scale = (int)c.scale; k.precision = (int)c.precision; }
+      return k;
+    case SqlDataType::Text: {
+      if (c.binary != 0) return k;
+      const bool is_varchar = d.rfind("varchar", 0) == 0, is_char = d.rfind("char", 0) == 0;
+      if (is_varchar || is_char) {
+        const size_t a = d.find('(');
+        if (a == std::string::npos) { k.kind = LoadColCheck::FreeText; return k; }
+        const long n = std::atol(d.c_str() + a + 1);
+        if (n < 0) return k;
+        k.kind = LoadColCheck::Varchar;
+        k.maxlen = (size_t)n;
+        k.char_pad = is_char;
+        return k;
+      }
+      if (d.rfind("tinytext", 0) == 0) { k.kind = LoadColCheck::FreeText; k.tiny = true; return k; }
+      if (d.rfind("text", 0) == 0 || d.rfind("mediumtext", 0) == 0 || d.rfind("longtext", 0) == 0) k.kind = LoadColCheck::FreeText;
+      return k;
+    }
+    default:
+      return k;
+  }
+}
+
+bool load_field_plain(const LoadColCheck& k, const std::string& v) {
+  switch (k.kind) {
+    case LoadColCheck::Int: {
+      const size_t s0 = !v.empty() && v[0] == '-' ? 1 : 0;
+      const size_t nd = v.size() - s0;
+      if (nd < 1 || nd > 18 || (v[s0] == '0' && !(nd == 1 && s0 == 0))) return false;
+      int64_t x = 0;
+      for (size_t i = s0; i < v.size(); ++i) {
+        if (v[i] < '0' || v[i] > '9') return false;
+        x = x * 10 + (v[i] - '0');
+      }
+      const AIOS_INT128 xv = s0 ? -(AIOS_INT128)x : (AIOS_INT128)x;
+      return xv >= k.lo && xv <= k.hi;
+    }
+    case LoadColCheck::Real:
+      return !v.empty() && !(k.is_unsigned && v[0] == '-') && normalized_already(SqlDataType::Real, k.scale, v);
+    case LoadColCheck::Decimal:
+      return !v.empty() && !(k.is_unsigned && v[0] == '-') && normalized_already(SqlDataType::Decimal, k.scale, v) &&
+             decimal_text_out_of_range(v, k.precision, k.scale) == 0;
+    case LoadColCheck::Varchar:
+      return v.size() <= k.maxlen && !(k.char_pad && !v.empty() && v.back() == ' ');
+    case LoadColCheck::FreeText:
+      return !k.tiny || v.size() <= 255;
+    case LoadColCheck::Date:
+      return !v.empty() && canonical_temporal(k.col, v) == v;
+    default:
+      return false;
+  }
+}
+// The text a field is stored as, when that is plain (load_field_plain): the field as it is, or - for a number - what
+// sql_normalize_value makes of it first, as the insert of the row would (448.80 into a DOUBLE is 448.8, 1.5 into a
+// DECIMAL(12,2) is 1.50, 007 into an INT is 7), checked again. False: the value is left to the ordinary way.
+bool load_field_canon(const LoadColCheck& k, std::string& v) {
+  if (load_field_plain(k, v)) return true;
+  if (v.empty() || (k.kind != LoadColCheck::Int && k.kind != LoadColCheck::Real && k.kind != LoadColCheck::Decimal)) return false;
+  std::string n = sql_normalize_value(k.type, k.scale, v);
+  if (n == v || !load_field_plain(k, n)) return false;
+  v = std::move(n);
+  return true;
+}
+}  // namespace
+
 void sql_set_local_infile(bool over_wire, const std::string* data) {
   tls_infile_over_wire = over_wire;
   tls_infile_data = data;
@@ -464,6 +569,11 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
   LoadReader rd(data, size, fmt);
   std::vector<LoadField> fields;
   std::vector<std::vector<Val>> batch;
+  std::vector<std::vector<std::string>> canon_rows;   // a batch of a plain load (below): rows already as stored
+  FlatI64Set canon_keys;                              // its integer primary key's values so far
+  bool use_canon = false;
+  bool canon_unlogged = false;   // a batch went in with no row logged for undo: a failure cuts the table back instead
+  const size_t rows_at_start = t->row_count();
   constexpr size_t kBatch = 16384;
   uint64_t records = 0, affected = 0, dups = 0, field_warnings = 0;
   size_t line_no = 0;
@@ -486,21 +596,53 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
       rec += ')';
     }
   };
+  auto batch_text_canon = [&head](const std::vector<std::vector<std::string>>& rows, std::string& rec) {
+    rec.clear();
+    rec.reserve(head.size() + 16 + rows.size() * (rows[0].size() * 12 + 4));
+    rec += head;
+    rec += " VALUES ";
+    for (size_t r = 0; r < rows.size(); ++r) {
+      rec += r ? ",(" : "(";
+      for (size_t k = 0; k < rows[r].size(); ++k) {
+        if (k) rec += ',';
+        append_sql_literal(rec, rows[r][k]);
+      }
+      rec += ')';
+    }
+  };
   std::string* batch_rec = nullptr;   // the batch's text, made already (by the reader)
+  int canon_pk = -1;   // set below, with the checks, before the first flush
   auto flush = [&]() -> bool {
-    if (batch.empty()) return true;
+    if (use_canon ? canon_rows.empty() : batch.empty()) return true;
     const uint64_t f0 = hal_now_ns();
     std::string rec;
     if (batch_rec) rec = std::move(*batch_rec);
-    else batch_text(batch, rec);
+    else batch_text(batch, rec);   // (a plain load's text is always made by its reader)
     batch_rec = nullptr;
-    const size_t n = batch.size();
+    const size_t n = use_canon ? canon_rows.size() : batch.size();
     const uint64_t f1 = hal_now_ns();
     ns_rec += f1 - f0;
-    tls_insert_given = &batch;
-    SqlQueryResult r = execute_insert(head);
-    tls_insert_given = nullptr;
-    batch.clear();
+    SqlQueryResult r;
+    if (use_canon) {
+      LoadCanonBatch cb;
+      cb.rows = &canon_rows;
+      cb.pk = canon_pk;
+      cb.keys = &canon_keys;
+      // Its own transaction (not a savepoint of one the session has open): the table is held for the whole statement
+      // - no other session writes it meanwhile and its rows stay where they are - so the rows need no undo entry
+      // each: a failure cuts the table back to its length at the start, as an INSERT's own guard does.
+      cb.no_undo = own_txn;
+      tls_insert_canon = &cb;
+      r = execute_insert(head);
+      tls_insert_canon = nullptr;
+      if (cb.undo_skipped) canon_unlogged = true;
+      canon_rows.clear();
+    } else {
+      tls_insert_given = &batch;
+      r = execute_insert(head);
+      tls_insert_given = nullptr;
+      batch.clear();
+    }
     ns_ins += hal_now_ns() - f1;
     if (!r.success) { failure = r.error_message; return false; }
     affected += r.rows_affected;
@@ -527,8 +669,41 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
   // insert waited. The reader gives back each line's fields and which columns it gave; a column a line has no field
   // for takes its value here (missing_value: a default may be the statement's own time), in order, as before.
   const bool pipelined = sets.empty() && !any_var && size >= ((size_t)1 << 18);
+  // A plain load: a plain INSERT of the file's rows, every column given in the table's order, into a table with no
+  // AUTO_INCREMENT or generated column and no rule, each column of a kind LoadColCheck knows, and an integer primary
+  // key (or none) of a table that is empty. Each value is then checked as it is read and, if it is stored exactly as
+  // it reads, the rows travel as the text they are stored as (LoadCanonBatch) - no Val, no conversion pass. A value
+  // that is not, or a line with the wrong number of fields, or a NULL, ends it: the load is taken back and run again
+  // the ordinary way.
+  std::vector<LoadColCheck> checks;
+  bool canon_ok = pipelined && !tls_load_canon_off && verb == "INSERT" && fmt.enclosed < 0 && !g_cdc_thread &&
+                  !redo_replaying_ && !seeding_ && ins_cols.size() == t->columns.size() && targets.size() == t->columns.size() &&
+                  !t->has_rules();
+  for (size_t k = 0; canon_ok && k < ins_cols.size(); ++k)
+    if (ins_cols[k] != (int)k || field_slot[k] != (int)k) canon_ok = false;
+  if (canon_ok) {
+    std::vector<int> pks;
+    for (size_t k = 0; k < t->columns.size(); ++k) {
+      checks.push_back(make_load_col_check(t->columns[k]));
+      if (checks.back().kind == LoadColCheck::Unsupported) canon_ok = false;
+      if (t->columns[k].is_primary_key) pks.push_back((int)k);
+    }
+    if (canon_ok) {
+      if (pks.size() == 1 && checks[(size_t)pks[0]].kind == LoadColCheck::Int && t->row_count() == 0) canon_pk = pks[0];
+      else if (!pks.empty()) canon_ok = false;
+    }
+  }
+  bool canon_abort = false;
+  if (canon_ok && canon_pk >= 0) {
+    // about as many keys as the file has lines (the first line's length is the guess)
+    size_t first_len = 0;
+    while (first_len < 4096 && first_len < size && data[first_len] != '\n') ++first_len;
+    if (first_len > 0) canon_keys.reserve(size / (first_len + 1) + 1024);
+  }
   if (pipelined) {
     struct Parsed {
+      std::vector<std::vector<std::string>> canon;   // a plain load's rows, as stored
+      bool failed = false;                            // a plain load met what it cannot take as it stands
       std::vector<std::vector<Val>> rows;
       std::vector<std::vector<uint8_t>> given;
       uint64_t warnings = 0;
@@ -544,12 +719,30 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
       std::vector<LoadField> fl;
       for (;;) {
         Parsed p;
-        p.rows.reserve(kBatch);
-        p.given.reserve(kBatch);
+        if (canon_ok) {
+          p.canon.reserve(kBatch);
+        } else {
+          p.rows.reserve(kBatch);
+          p.given.reserve(kBatch);
+        }
         bool end = false;
-        while (p.rows.size() < kBatch) {
+        while ((canon_ok ? p.canon.size() : p.rows.size()) < kBatch) {
           if (!rd.next_line(&fl)) { end = true; break; }
           if (++ln <= skip_lines) continue;
+          if (canon_ok) {
+            bool good = fl.size() == targets.size();
+            std::vector<std::string> crow;
+            if (good) {
+              crow.reserve(fl.size());
+              for (size_t f = 0; f < fl.size(); ++f) {
+                if (fl[f].null || !load_field_canon(checks[f], fl[f].text)) { good = false; break; }
+                crow.push_back(std::move(fl[f].text));
+              }
+            }
+            if (!good) { p.failed = true; end = true; break; }
+            p.canon.push_back(std::move(crow));
+            continue;
+          }
           std::vector<Val> row(ins_cols.size());
           std::vector<uint8_t> given(ins_cols.size(), 0);
           if (fl.size() != targets.size()) ++p.warnings;   // too few (1261) or too many (1262) fields
@@ -565,11 +758,12 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
         // The logged text too, here, while the insert runs (it was a tenth of the load on the inserting thread):
         // only when no line left a column to its default, which is worked out on that thread.
         if (!p.rows.empty() && p.all_given) batch_text(p.rows, p.rec);
+        if (!p.canon.empty()) batch_text_canon(p.canon, p.rec);
         {
           std::unique_lock<aios::hal::Mutex> lk(qmu);
           qcv.wait(lk, [&] { return queue.size() < 2 || reader_stop; });
           if (reader_stop) return;
-          if (!p.rows.empty()) queue.push_back(std::move(p));
+          if (!p.rows.empty() || !p.canon.empty() || p.failed) queue.push_back(std::move(p));
           if (end) reader_done = true;
         }
         qcv.notify_all();
@@ -587,6 +781,15 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
       }
       qcv.notify_all();
       if (sql_interrupted()) { failure = "Query execution was interrupted"; break; }
+      if (p.failed) { canon_abort = true; break; }
+      if (canon_ok) {
+        records += p.canon.size();
+        canon_rows = std::move(p.canon);
+        batch_rec = &p.rec;
+        use_canon = true;
+        if (!flush()) break;
+        continue;
+      }
       field_warnings += p.warnings;
       for (size_t i = 0; i < p.rows.size(); ++i)
         for (size_t k = 0; k < ins_cols.size(); ++k)
@@ -602,6 +805,16 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
     }
     qcv.notify_all();
     reader.join();
+  }
+  if (canon_abort) {
+    // what the plain way cannot take as it stands: everything taken back, and the load run again with every value
+    // converted as an INSERT's would be
+    if (canon_unlogged && t->row_count() > rows_at_start) cut_back_appended(*t, rows_at_start);
+    undo_all();
+    if (vx_trace_on()) vx_trace("load data: a value is not stored as it reads; the load is run again with every value converted");
+    tls_load_canon_off = true;
+    struct ResetCanon { ~ResetCanon() { tls_load_canon_off = false; } } reset_canon;
+    return execute_load_data(sql);
   }
   while (!pipelined && rd.next_line(&fields)) {
     ++line_no;
@@ -637,6 +850,7 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
   if (failure.empty()) flush();
   const uint64_t t_read = hal_now_ns();
   if (!failure.empty()) {
+    if (canon_unlogged && t->row_count() > rows_at_start) cut_back_appended(*t, rows_at_start);
     undo_all();
     return make_error(failure);
   }
@@ -646,7 +860,8 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
     if (vx_trace_on())
       vx_trace("load data: " + std::to_string(records) + " rows, read+insert " + std::to_string((t_read - t_start) / 1000) +
                " us (redo text " + std::to_string(ns_rec / 1000) + " us, execute_insert " + std::to_string(ns_ins / 1000) +
-               " us), commit " + std::to_string((hal_now_ns() - t_read) / 1000) + " us");
+               " us), commit " + std::to_string((hal_now_ns() - t_read) / 1000) + " us" +
+               (canon_ok ? (canon_unlogged ? ", plain load, no undo log" : ", plain load") : ""));
   } else {
     execute_savepoint_statement("RELEASE SAVEPOINT `__asql_load_data`");
   }
