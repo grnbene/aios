@@ -7695,7 +7695,8 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
 // A lookup `(SELECT x FROM t WHERE t.k = outer.c ...)`: each key's first row's
 // answer, in table order (what the subquery hands back when several match).
 bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string& alias, const SqlExpr* key_col,
-                          const SqlExpr* item, const SqlExpr* where, bool text_key, BatchStore* out, bool first_wins);
+                          const SqlExpr* item, const SqlExpr* where, bool text_key, BatchStore* out, bool first_wins,
+                          const SqlExpr* order_col = nullptr, bool order_desc = false);
 
 // A key as the whole number an integer key column would have to hold to equal it: exactly from an exact
 // number's digits (or a quoted plain number, as MariaDB reads one against an INT), through the double for a
@@ -7866,7 +7867,10 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
   const SqlExpr* agg = b.items[0].expr.get();
   // Not an aggregate: a lookup of the matching row's value.
   const bool lookup = !expr_has_aggregate(b.items[0].expr);
-  if (lookup && (!b.order_by.empty() || b.limit > 1)) return nullptr;
+  // A lookup may be ordered by one plain column with LIMIT 1 (the last invoice of a debtor): its best row a key.
+  const bool ordered_lookup = lookup && b.order_by.size() == 1 && b.order_by[0].ordinal < 0 && b.order_by[0].expr &&
+                              b.order_by[0].expr->op == ExprOp::Column && b.limit == 1;
+  if (lookup && ((!b.order_by.empty() && !ordered_lookup) || b.limit > 1)) return nullptr;
   if (!lookup && (agg->op != ExprOp::Func || agg->window)) return nullptr;
   const std::string up = lookup ? std::string() : upper_of(agg->name);
   if (!lookup && up != "SUM" && up != "COUNT" && up != "AVG" && up != "MIN" && up != "MAX") return nullptr;
@@ -8072,7 +8076,9 @@ static std::shared_ptr<const ScalarBatch> build_scalar_batch(const SqlExpr* e, c
     ExprPtr kc = clone_expr(A), ac = clone_expr(agg), wc = w ? clone_expr(w.get()) : nullptr;
     const std::string alias = b.sources[0].alias.empty() ? b.sources[0].table_name : b.sources[0].alias;
     if (lookup && !over_view) {
-      if (!scalar_lookup_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store, b.limit == 1)) return nullptr;
+      ExprPtr oc = ordered_lookup ? clone_expr(b.order_by[0].expr.get()) : nullptr;
+      if (!scalar_lookup_direct(ctx.db, *t, alias, kc.get(), ac.get(), wc.get(), otext, &ob->store, b.limit == 1, oc.get(),
+                                ordered_lookup && b.order_by[0].descending)) return nullptr;
       ob->raw = false;     // stored as the answers already
       ob->stored = true;
       ob->empty = val_null();
@@ -41411,7 +41417,8 @@ bool scalar_batch_direct(SqlDatabase* db, const SqlTable& t, const std::string& 
 }
 
 bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string& alias, const SqlExpr* key_col,
-                          const SqlExpr* item, const SqlExpr* where, bool text_key, BatchStore* out, bool first_wins) {
+                          const SqlExpr* item, const SqlExpr* where, bool text_key, BatchStore* out, bool first_wins,
+                          const SqlExpr* order_col, bool order_desc) {
   if (t.inferred_types || t.row_count() == 0) return false;
   for (const auto& cs : t.col_data) if (cs.size() != t.row_count()) return false;
   QuerySource src;
@@ -41428,6 +41435,96 @@ bool scalar_lookup_direct(SqlDatabase* db, const SqlTable& t, const std::string&
   vx::Selection sel;
   if (!vx::select_rows(db, t, where, local, base, &sel, &err) || !err.empty()) return false;
   std::vector<uint32_t> ids = sel.flat();
+  if (order_col) {
+    // ORDER BY col [DESC] LIMIT 1: each key's best row - the first in table order among equals, as a stable sort
+    // would leave it - in one pass, then the rows below are one a key. Only an integer column or a date/time one
+    // held as a dictionary (ranked by its entries' text, which orders canonical dates), and a key held as a
+    // dictionary (text) or typed integers; anything else is left to the subquery run per row.
+    size_t os = 0, oc = 0;
+    if (lookup_column_here(local, *order_col, &os, &oc) != ColumnLookup::Found || oc >= t.col_data.size() || oc >= t.columns.size()) return false;
+    const ColumnStore& ocs = t.col_data[oc];
+    std::shared_ptr<const std::vector<uint32_t>> ocodes;
+    std::shared_ptr<const std::vector<uint8_t>> onulls;
+    std::shared_ptr<const vx::DecodedInts> oints;
+    std::vector<int64_t> orank;   // dictionary code -> rank of its entry (NULL entry lowest)
+    if (t.columns[oc].temporal && vx::dict_coded(ocs)) {
+      ocodes = vx::decoded_codes(t, oc);
+      if (!ocodes) return false;
+      const size_t nd = vx::dict_size(ocs);
+      std::vector<uint32_t> ord(nd);
+      for (size_t c = 0; c < nd; ++c) ord[c] = (uint32_t)c;
+      auto nullent = [&](uint32_t c) { return sql_is_null(vx::dict_entry(ocs, c)); };
+      std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+        const bool na = nullent(a), nb = nullent(b);
+        if (na != nb) return na;
+        if (na) return false;
+        return vx::dict_entry(ocs, a) < vx::dict_entry(ocs, b);
+      });
+      orank.assign(nd, -1);
+      int64_t rk = 0;
+      for (size_t i = 0; i < nd; ++i) {
+        if (nullent(ord[i])) continue;
+        if (i > 0 && !nullent(ord[i - 1]) && vx::dict_entry(ocs, ord[i - 1]) != vx::dict_entry(ocs, ord[i])) ++rk;
+        orank[ord[i]] = rk;
+      }
+    } else if (!t.columns[oc].temporal && vx::typed_integer(ocs)) {
+      oints = vx::decoded_ints(t, oc);
+      if (!oints) return false;
+    } else {
+      return false;
+    }
+    if (vx::has_nulls(ocs)) { onulls = vx::decoded_nulls(t, oc); if (!onulls) return false; }
+    auto ord_of = [&](uint32_t r) -> int64_t {
+      if (onulls && (*onulls)[r]) return INT64_MIN;
+      return ocodes ? orank[(*ocodes)[r]] : oints->v[r];
+    };
+    std::shared_ptr<const std::vector<uint32_t>> kcodes;
+    std::shared_ptr<const std::vector<uint8_t>> knulls;
+    std::vector<int64_t> cid;     // text key: dictionary code -> collation class (-1: NULL entry)
+    size_t nclass = 0;
+    if (text_key) {
+      if (!vx::dict_coded(kcs)) return false;
+      kcodes = vx::decoded_codes(t, kc);
+      if (!kcodes) return false;
+      if (vx::has_nulls(kcs)) { knulls = vx::decoded_nulls(t, kc); if (!knulls) return false; }
+      const size_t nd = vx::dict_size(kcs);
+      cid.assign(nd, -1);
+      std::unordered_map<std::string, int64_t> classes;
+      for (size_t c = 0; c < nd; ++c) {
+        const std::string& e = vx::dict_entry(kcs, (uint32_t)c);
+        if (sql_is_null(e)) continue;
+        auto it = classes.emplace(collate_key(e), (int64_t)classes.size()).first;
+        cid[c] = it->second;
+      }
+      nclass = classes.size();
+    }
+    std::vector<uint32_t> best_row;   // per key class (text) / per key value (integer)
+    std::vector<int64_t> best_ord;
+    std::unordered_map<int64_t, size_t> by_int;
+    if (text_key) { best_row.assign(nclass, UINT32_MAX); best_ord.assign(nclass, 0); }
+    else if (!vx::typed_integer(kcs)) return false;
+    for (uint32_t r : ids) {
+      size_t slot;
+      if (text_key) {
+        if (knulls && (*knulls)[r]) continue;
+        const int64_t k = cid[(*kcodes)[r]];
+        if (k < 0) continue;
+        slot = (size_t)k;
+      } else {
+        if (kcs.is_null(r)) continue;
+        auto it = by_int.emplace(vx::typed_int(kcs, r), best_row.size());
+        if (it.second) { best_row.push_back(UINT32_MAX); best_ord.push_back(0); }
+        slot = it.first->second;
+      }
+      const int64_t ov = ord_of(r);
+      if (best_row[slot] == UINT32_MAX || (order_desc ? ov > best_ord[slot] : ov < best_ord[slot])) { best_row[slot] = r; best_ord[slot] = ov; }
+    }
+    std::vector<uint32_t> chosen;
+    chosen.reserve(best_row.size());
+    for (uint32_t r : best_row) if (r != UINT32_MAX) chosen.push_back(r);
+    std::sort(chosen.begin(), chosen.end());
+    ids = std::move(chosen);
+  }
   vx::RowEval ev(base);
   // The answer the subquery's result would hand back: text for a text item,
   // a number read back from its text otherwise.
