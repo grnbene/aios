@@ -546,7 +546,7 @@ default (else NULL, else 0 or `''`) and counts a warning; `SET` and `@variables`
 * **Not supported**: `LOAD XML`, `PARTITION (...)`, fixed-width rows (`TERMINATED BY ''` with no `ENCLOSED BY`),
   loading into a view, and character sets other than utf8mb4, utf8, latin1, ascii and binary.
 * **Speed**: 500,000 rows of six columns load in 1.4-1.6 s (MariaDB's `LOAD DATA`: 0.54-0.62 s). The rows go through the
-  engine's ordinary `INSERT` path; a bulk path is not built (`docs/asql-benchmarks.md`, Test 1). For a copy from
+  engine's ordinary `INSERT` path; a bulk path is not built (`docs/asql-benchmarks.md` has current load times). For a copy from
   another MariaDB/MySQL server use `aios sql copy` below, which appends columns in bulk.
 
 ### Copying a MariaDB/MySQL Database (`aios sql copy`)

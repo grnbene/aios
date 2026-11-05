@@ -12,6 +12,8 @@ mkdir -p data results && python3 -I gen.py           # data/bench_sales.csv and 
 ```
 
 Engines (fresh containers from the images; the data folder is mounted read-only for the bulk loaders):
+On a machine whose Docker data root is on a slower disk than the one ASQL and DuckDB use, bind-mount the engines' data
+folders from that disk (`-v DIR:/var/lib/mysql`, `-v DIR:/var/lib/cedardb/data`), or the containers measure the disk.
 
 ```bash
 docker run -d --name asqlbench-maria -p 127.0.0.1:13306:3306 -e MARIADB_ROOT_PASSWORD="$(cat pw)" \

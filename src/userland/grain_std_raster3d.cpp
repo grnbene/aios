@@ -479,11 +479,40 @@ inline uint32_t sample(const R3dTex::Level& L, double u, double v, bool wrap_v, 
   const double fu = u - 0.5, fv = v - 0.5;
   const int x0 = (int)std::floor(fu), y0 = (int)std::floor(fv);
   const uint32_t ax = (uint32_t)((fu - x0) * 256.0), ay = (uint32_t)((fv - y0) * 256.0);
-  const uint32_t p00 = texel(L, x0, y0, wrap_v), p10 = texel(L, x0 + 1, y0, wrap_v);
-  const uint32_t p01 = texel(L, x0, y0 + 1, wrap_v), p11 = texel(L, x0 + 1, y0 + 1, wrap_v);
+  // the four texels as texel() has them, with one wrap of each coordinate rather than one per texel: an integer
+  // divide is 26-90 cycles on x86 (a few on Apple's cores), and this runs for every pixel of every textured surface
+  // a power-of-two size (Doom's walls and flats all but always) wraps with a mask: the same as the divide's
+  // remainder made positive, two's complement making x & (w - 1) that for negative x too
+  int xa;
+  if ((L.w & (L.w - 1)) == 0) xa = x0 & (L.w - 1);
+  else { xa = x0 % L.w; if (xa < 0) xa += L.w; }
+  const int xb = xa + 1 == L.w ? 0 : xa + 1;
+  uint32_t p00, p10, p01, p11;
+  if (wrap_v) {
+    int ya;
+    if ((L.h & (L.h - 1)) == 0) ya = y0 & (L.h - 1);
+    else { ya = y0 % L.h; if (ya < 0) ya += L.h; }
+    const int yb = ya + 1 == L.h ? 0 : ya + 1;
+    const uint32_t* ra = &L.px[(size_t)ya * L.w];
+    const uint32_t* rb = &L.px[(size_t)yb * L.w];
+    p00 = ra[xa]; p10 = ra[xb]; p01 = rb[xa]; p11 = rb[xb];
+  } else {
+    const bool ina = y0 >= 0 && y0 < L.h, inb = y0 + 1 >= 0 && y0 + 1 < L.h;
+    const uint32_t* ra = ina ? &L.px[(size_t)y0 * L.w] : nullptr;
+    const uint32_t* rb = inb ? &L.px[(size_t)(y0 + 1) * L.w] : nullptr;
+    p00 = ra ? ra[xa] : 0; p10 = ra ? ra[xb] : 0; p01 = rb ? rb[xa] : 0; p11 = rb ? rb[xb] : 0;
+  }
   // weights of the four, and each channel weighted by its texel's alpha (so a transparent neighbour does not
   // bleed its black in): colour = sum(c a w) / sum(a w), alpha = sum(a w)
   const uint32_t w00 = (256 - ax) * (256 - ay), w10 = ax * (256 - ay), w01 = (256 - ax) * ay, w11 = ax * ay;
+  // all four opaque (a wall's or a flat's texels): the weights sum to 65536 and every alpha is 255, so
+  // sum(c a w) / sum(a w) is sum(c w) >> 16 exactly - no divides
+  if ((p00 & p10 & p01 & p11) >> 24 == 255) {
+    auto ch = [&](int sh) {
+      return (((p00 >> sh) & 255) * w00 + ((p10 >> sh) & 255) * w10 + ((p01 >> sh) & 255) * w01 + ((p11 >> sh) & 255) * w11) >> 16;
+    };
+    return 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+  }
   uint64_t A = 0, R = 0, G = 0, B = 0;
   auto add = [&](uint32_t p, uint32_t w) {
     const uint64_t a = (uint64_t)(p >> 24) * w;
@@ -2041,12 +2070,16 @@ Value bi_r3d_draw_tex(Vm&, std::vector<Value>& args, std::string& error) {
     const std::vector<STri>& list = tris[pass];
     if (list.empty()) continue;
     t->filled += (int64_t)list.size();
+    // each task counts its pixels on its own stack and adds them once: the counters side by side in px share a
+    // cache line, and an increment there per pixel bounced that line between the cores (a third of the fill)
     auto run = [&](size_t b0, size_t b1, size_t tid) {
+      int64_t n = 0;
       for (size_t b = b0; b < b1; ++b) {
         const int ya = (int)b * band, yb = std::min(t->h, ya + band);
         for (const STri& s : list)
-          if (s.y1 >= ya && s.y0 < yb) fill_tex_rows(*t, s, ya, yb, &px[std::min(tid, px.size() - 1)]);
+          if (s.y1 >= ya && s.y0 < yb) fill_tex_rows(*t, s, ya, yb, &n);
       }
+      px[std::min(tid, px.size() - 1)] += n;
     };
     SqlThreadPool::instance().for_chunks(nb, 1, (size_t)t->w * (size_t)t->h, false, run);
   }
