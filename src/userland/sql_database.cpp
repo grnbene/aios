@@ -46711,6 +46711,8 @@ static void star_rows_of(const std::vector<QuerySource>& sources, const StarLink
 // the rows a root row at a time (the join aggregate's fused loop) walks them; any other expands them into one row
 // id array per source, as the join did. Made only when the expansion is known to stay below the 2^30 rows the
 // expanding loop gives up at, so nothing that ran the general join before runs this instead.
+// The star join's row-id arrays are this wide: a merged ERP view joins 9 tables for a report that reads a few of them.
+constexpr size_t kStarMaxSources = 12;
 struct StarExpansion;
 // A deferred star join made into its row id arrays, for a consumer that reads them (no-op when there is none).
 static void star_expand_into(std::shared_ptr<StarExpansion>& def, std::vector<std::vector<uint32_t>>& star_cols);
@@ -46723,7 +46725,7 @@ struct StarExpansion {
   // Root row rr's rows, depth first over the links in FROM order (the expanding loop's order): emit(parts) each.
   template <class F>
   void walk_root(uint32_t rr, F& emit) const {
-    uint32_t parts[8];
+    uint32_t parts[kStarMaxSources];
     parts[root] = rr;
     auto step = [&](size_t k, auto& self) -> void {
       if (k == links.size()) { emit((const uint32_t*)parts); return; }
@@ -46934,8 +46936,8 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     P.text = ck.text || (vx::dict_coded(ccs) && vx::dict_coded(pcs));
     if (P.text) {
       if (!vx::dict_coded(ccs) || !vx::dict_coded(pcs)) return no("text not dictionary-coded");
-      P.cm = star_code_map(pk, ck);
-      if (!P.cm || !P.cm->ok) return no("text keys not comparable by code");   // two child entries one key, or keys not comparable by code
+      P.cm = star_code_map(pk, ck, true);   // two child entries of one key are allowed: their ids are made alike below (c2k)
+      if (!P.cm || !P.cm->ok) return no("text keys not comparable by code");   // keys not comparable by code
       P.cc = vx::decoded_codes(ct, cc);
       P.pcd = vx::decoded_codes(pt, pc);
       if (!P.cc || !P.pcd) return no("codes not decoded");
@@ -46990,7 +46992,11 @@ static bool star_build_comp(const std::vector<QuerySource>& sources, StarLink& L
     for (const Part& P : parts) {
       if (P.cn && (*P.cn)[r]) { null = true; break; }
       uint64_t id;
-      if (P.text) id = (uint64_t)(*P.cc)[r];
+      if (P.text) {
+        const uint32_t cd = (*P.cc)[r];
+        const std::vector<int32_t>& c2k = P.cm->c2k;   // child entries of one key share the first one's id
+        id = (uint64_t)(c2k.empty() || cd >= c2k.size() || c2k[cd] < 0 ? (int64_t)cd : (int64_t)c2k[cd]);
+      }
       else {
         int64_t v;
         if (!child_int(P, r, &v)) { null = true; break; }
@@ -47105,9 +47111,9 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
                       std::unordered_set<const SqlExpr*>& pushed, std::string* err, StarShape* shape,
                       std::shared_ptr<StarExpansion>* deferred = nullptr, std::vector<const SqlExpr*>* cross_on = nullptr) {
   static const bool off = [] { const char* v = std::getenv("AIOS_SQL_STAR_JOIN"); return v && *v == '0'; }();
-  if (off || join_conditions.empty() || nbase < 256 || sources.size() > 8) {
+  if (off || join_conditions.empty() || nbase < 256 || sources.size() > kStarMaxSources) {
     if (vx_trace_on() && !off && !join_conditions.empty() && nbase >= 256)
-      vx_trace("join: not a star: " + std::to_string(sources.size()) + " sources (at most 8)");
+      vx_trace("join: not a star: " + std::to_string(sources.size()) + " sources (at most " + std::to_string(kStarMaxSources) + ")");
     return false;
   }
   for (const auto& s : sources) if (!s.table || s.table->inferred_types) return false;
@@ -47425,7 +47431,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
   // ... unless the first joined table is joined whole (no condition of its own): then its one-to-many map is built
   // once and kept, and the FROM order expands through it (below: multi_first) with no reroot and no sort back.
   const bool whole_first = sql_pipe_on() && !multi_off && steps[0].filters.empty() && steps[0].from_where.empty();
-  const bool reroot_first = !join_is_left[0] && steps[0].parent_src == 0 && ns <= 8 &&
+  const bool reroot_first = !join_is_left[0] && steps[0].parent_src == 0 && ns <= kStarMaxSources &&
                             sources[1].table->row_count() > sources[0].table->row_count() && !sole_pk && !whole_first;
   bool fine = !reroot_first;
   for (size_t j = 0; j < steps.size() && fine; ++j) {
@@ -47439,7 +47445,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     std::vector<uint32_t> ids;
     if (!select_of(j + 1, conds, &ids)) return false;
     need_rows[j + 1] = ids.size();
-    const bool reroot_here = j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0;
+    const bool reroot_here = j == 0 && !join_is_left[0] && ns <= kStarMaxSources && st.parent_src == 0;
     // The first join over every row of its table (no condition of its own): its one-to-many map is built once and
     // kept (star_multi_cached), and a base row's run in it is already in the order the rerooted rows are sorted
     // back into - so the join stays in FROM order and expands there, where rerooting selected the joined rows
@@ -47451,7 +47457,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
       // started from the joined table instead, the base table is the one
       // looked up - if its key is unique among its selected rows - and the
       // rows are put back in the order the joins in FROM order produce.
-      if (j == 0 && !join_is_left[0] && ns <= 8 && st.parent_src == 0 &&
+      if (j == 0 && !join_is_left[0] && ns <= kStarMaxSources && st.parent_src == 0 &&
           !(multi_first && err->empty() && (L.map = Map(), build_multi(L, ids)))) { fine = false; break; }
       // A later step meeting many rows (orders -> customers -> the orders' lines): the rows expand there.
       if (!err->empty()) return false;
@@ -47604,7 +47610,7 @@ static bool star_join(SqlDatabase* db, const std::vector<QuerySource>& sources, 
     if (L.map.by_code) { L.wc_hold = vx::decoded_codes(ptab, L.parent_col); if (L.wc_hold) L.whole_codes = L.wc_hold->data(); }
     else if (vx::typed_integer(pcs)) { L.wi_hold = vx::decoded_ints(ptab, L.parent_col); if (L.wi_hold) L.whole_ints = L.wi_hold->v.data(); }
   }
-  uint32_t parts[8];
+  uint32_t parts[kStarMaxSources];
   bool any_multi = false;
   for (const Link& L : links) if (L.multi) any_multi = true;
   if (!any_multi && deferred && !rerooted) {
@@ -53984,6 +53990,10 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
       bool jkonst = false;                             // the joined column is Constant-encoded, holding jkval
       double jkval = 0;
       std::shared_ptr<const std::vector<double>> dnum; // a dictionary-coded number column: the number per code
+      // dnum: the column's codes decoded whole (kept between statements). Read row by row, a run-length column's
+      // code is a binary search over its runs - 2M of them for a fact table's order number.
+      std::shared_ptr<const std::vector<uint32_t>> dcodes;
+      std::shared_ptr<const std::vector<uint8_t>> dnulls;
       std::shared_ptr<const std::vector<double>> jdnum; // the joined column held as such a dictionary
     };
     std::vector<NumKey> numkeys(prep_jkeys.size());
@@ -54044,7 +54054,11 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
             vx::dict_coded(bcs) && !typed_int && !typed_dbl &&
             (bt.columns[kc].type == SqlDataType::Int || (bt.columns[kc].type == SqlDataType::Decimal && bt.columns[kc].scale == 0) ||
              (bt.inferred_types && !bt.columns[kc].declared_text))) {
-          if (std::shared_ptr<const std::vector<double>> dn = dict_numbers(bcs)) { nk.cs = &bcs; nk.src = ks; nk.dnum = std::move(dn); }
+          if (std::shared_ptr<const std::vector<double>> dn = dict_numbers(bcs)) {
+            nk.cs = &bcs; nk.src = ks; nk.dnum = std::move(dn);
+            nk.dcodes = vx::decoded_codes(bt, kc);
+            if (nk.dcodes && vx::has_nulls(bcs)) { nk.dnulls = vx::decoded_nulls(bt, kc); if (!nk.dnulls) nk.dcodes.reset(); }
+          }
         }
         if (nk.konst || nk.cmap || nk.dnum) {
           // the joined side is checked below, as every key's is
@@ -54134,7 +54148,15 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
         return true;
       }
       const size_t r = k.src < base.parts.size() ? base.parts[k.src] : kNullRow;
-      if (r == kNullRow || r >= k.cs->size() || k.cs->is_null(r)) return false;
+      if (r == kNullRow || r >= k.cs->size()) return false;
+      if (k.dcodes) {
+        if (r >= k.dcodes->size() || (k.dnulls && (*k.dnulls)[r])) return false;
+        const uint32_t c = (*k.dcodes)[r];
+        if (c >= k.dnum->size() || std::isnan((*k.dnum)[c])) return false;
+        *out = (*k.dnum)[c];
+        return true;
+      }
+      if (k.cs->is_null(r)) return false;
       if (k.konst) { *out = k.kval; return true; }
       if (k.dnum) {
         const uint32_t c = vx::code_at(*k.cs, r);
