@@ -1,0 +1,55 @@
+// The ASQL Things km_data keeps per customer: deployed.gr creates them, service.gr reads them (and reads the same
+// query straight from the tables while a Thing is missing or still building). Each carries MAX(<n>) AS definition,
+// so a changed definition is noticed and rebuilt.
+
+import "entities.gr"
+
+// Balance and invoice dates, recomputed for a customer whenever a debtortrans row of theirs changes.
+//   balance:        open items (total - applied), what the aged analysis buckets and statements add up
+//   ledger_balance: every document's total, the Balance column of the ERP's aged analysis (cli/statement), which
+//                   INNER JOINs paymentterms and so leaves out a document whose terms code matches none
+let BALANCE_THING = "kmdata_customer_balance"
+let BALANCE_DEFINITION = "2"
+let BALANCE_SQL = "SELECT debtortrans.debtorno, " +
+  "SUM(ovamount + ovgst + ovfee + ovfreight + ovdiscount - alloc) AS balance, " +
+  "SUM(CASE WHEN pt.termsindicator IS NOT NULL THEN ovamount + ovgst + ovfee + ovfreight + ovdiscount ELSE 0 END) AS ledger_balance, " +
+  "MAX(2) AS definition, " +
+  "SUM(CASE WHEN type = 10 THEN ovamount ELSE 0 END) AS lifetime_invoiced, " +
+  "MIN(CASE WHEN type = 10 THEN trandate END) AS first_invoice_date, " +
+  "MAX(CASE WHEN type = 10 THEN trandate END) AS last_invoice_date, " +
+  "MAX(CASE WHEN type = 12 THEN trandate END) AS last_receipt_date " +
+  "FROM debtortrans LEFT JOIN paymentterms pt ON pt.termsindicator = debtortrans.payterms"
+let BALANCE_THING_SQL = "CREATE THING " + BALANCE_THING + " KEY debtorno READS debtortrans, paymentterms AS " +
+  replace(BALANCE_SQL, "SELECT debtortrans.debtorno, ", "SELECT debtorno, ") + " GROUP BY debtorno"
+
+// What the customer has bought: the sales lines of the ERP card's Total Spend / Last Purchase / Avg Monthly Sales /
+// Return % (customers.php getcustomer, model/weberp/customer.php), which read the km stocktrans view: printed invoice
+// and credit lines (types 10, 11, show_on_inv_crds = 1) that have their ledger document, without SUAA% items,
+// ZZMCWRITEOFF, or ZZMCMISC on a write-off document, at the invoice's rounded line amount.
+// It reads only tables keyed by customer (stockmoves, debtortrans), so every change re-reads one customer. Two of the
+// view's joins are left out on purpose:
+//   - stockmaster / purchdata / suppliers / territory / product_to_manufacturer: a Thing reading them is recomputed
+//     whole (5-10 s, inside the replicating write) on any item, cost or supplier change; they also drop lines whose
+//     item has no preferred supplier and count an item once per brand row
+//   - the debtortrans join is an EXISTS, so a line counts once even where a document number repeats in the ledger
+//     (R0001 document 565595 has 62 ledger rows, and the view counts each of its 62 lines 62 times)
+let SALES_THING = "kmdata_customer_sales"
+let SALES_DEFINITION = "1"
+let SALES_BODY = "SELECT debtorno, " +
+  "-SUM(CAST(" + line_amount_sql("m.price", "m.discountpercent", "m.qty") + " AS DECIMAL(12,2))) AS total_spend, " +
+  "MIN(m.trandate) AS first_purchase_date, MAX(m.trandate) AS last_purchase_date, " +
+  "COUNT(DISTINCT DATE_FORMAT(m.trandate, '%Y-%m')) AS months_active, " +
+  "SUM(CASE WHEN m.qty < 0 THEN -m.qty ELSE 0 END) AS units_sold, " +
+  "SUM(CASE WHEN m.qty > 0 THEN m.qty ELSE 0 END) AS units_returned, " +
+  "MAX(1) AS definition " +
+  "FROM stockmoves m WHERE m.type IN (10, 11) AND m.show_on_inv_crds = 1 AND m.stockid NOT LIKE 'SUAA%' AND m.stockid <> 'ZZMCWRITEOFF' " +
+  "AND (m.stockid <> 'ZZMCMISC' OR NOT EXISTS (SELECT 1 FROM stockmoves wo WHERE wo.transno = m.transno AND wo.type = m.type " +
+  "AND wo.debtorno = m.debtorno AND wo.branchcode = m.branchcode AND wo.stockid IN ('ZZMCMISC', 'ZZMCWRITEOFF') AND wo.show_on_inv_crds = 0)) " +
+  "AND EXISTS (SELECT 1 FROM debtortrans t WHERE t.transno = m.transno AND t.debtorno = m.debtorno AND t.branchcode = m.branchcode)"
+let SALES_THING_SQL = "CREATE THING " + SALES_THING + " KEY debtorno READS stockmoves, debtortrans AS " + SALES_BODY + " GROUP BY debtorno"
+
+// [name, definition, CREATE statement] for deployed.gr
+let CUSTOMER_THINGS = [
+  [BALANCE_THING, BALANCE_DEFINITION, BALANCE_THING_SQL],
+  [SALES_THING, SALES_DEFINITION, SALES_THING_SQL]
+]

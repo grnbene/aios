@@ -11,6 +11,7 @@
 // or skipped while rows are added. ?format=csv answers CSV with the cursor in the X-Next header.
 
 import "lib/entities.gr"
+import "lib/things.gr"
 
 fn env(name, fallback) {
   let v = getenv(name)
@@ -31,9 +32,9 @@ let ASQL = {
   "user": env("ASQL_USER", "erp"), "password": secret("ASQL_PASSWORD"), "db": env("ASQL_DB", "km")
 }
 let KEY_DB = env("KMDATA_KEY_DB", "km")
-let MAX_LIMIT = 10000
-let DEFAULT_LIMIT = 1000
-let BALANCE_THING = "kmdata_customer_balance"
+let MAX_LIMIT = 50000
+let DEFAULT_LIMIT = 5000
+let MAX_SALES_DAYS = 1096
 
 // ---- database -------------------------------------------------------------------------------------
 
@@ -219,32 +220,77 @@ fn page(db, ent, params) {
 
 // ---- enrichments: fields that come from more than the entity's own row ------------------------------
 
-// balance and invoice dates per customer, kept by the ASQL Thing kmdata_customer_balance (deployed.gr), which
-// recomputes a customer whenever one of their debtortrans rows changes. Read with the same query straight from
-// debtortrans while the Thing is missing or still building.
-//   balance:        open items (total - applied), what the aged analysis buckets and statements add up
-//   ledger_balance: every document's total, the Balance column of the ERP's aged analysis (cli/statement), which
-//                   INNER JOINs paymentterms and so leaves out a document whose terms code matches none
-let BALANCE_SQL = "SELECT debtortrans.debtorno, " +
-  "SUM(ovamount + ovgst + ovfee + ovfreight + ovdiscount - alloc) AS balance, " +
-  "SUM(CASE WHEN pt.termsindicator IS NOT NULL THEN ovamount + ovgst + ovfee + ovfreight + ovdiscount ELSE 0 END) AS ledger_balance, " +
-  "MAX(2) AS definition, " +
-  "SUM(CASE WHEN type = 10 THEN ovamount ELSE 0 END) AS lifetime_invoiced, " +
-  "MIN(CASE WHEN type = 10 THEN trandate END) AS first_invoice_date, " +
-  "MAX(CASE WHEN type = 10 THEN trandate END) AS last_invoice_date, " +
-  "MAX(CASE WHEN type = 12 THEN trandate END) AS last_receipt_date " +
-  "FROM debtortrans LEFT JOIN paymentterms pt ON pt.termsindicator = debtortrans.payterms"
+// Customer figures kept by the ASQL Things in lib/things.gr (made by deployed.gr); while one is missing or still
+// building, its query is run for just the page's customers.
+// A Thing's rows by key when it holds the given definition, else nil (missing, still building, or older).
+fn thing_rows(db, name, definition) {
+  let held = pcall(db_query, db, "SHOW THING " + name, [])
+  if not held.ok or not held.value.ok or len(held.value.records) == 0 { return nil }
+  if str(held.value.records[0]?.definition) != definition { return nil }
+  let by = {}
+  for b in held.value.records { by[str(b.debtorno)] = b }
+  return by
+}
+
+fn days_ago(n) { return date_format(date_parse(today()) - n * 86400, "%F", "local") }
 
 fn customer_balances(db, rows) {
   if len(rows) == 0 { return rows }
-  let by = {}
-  let held = pcall(db_query, db, "SHOW THING " + BALANCE_THING, [])
-  if held.ok and held.value.ok and len(held.value.records) > 0 and str(held.value.records[0]?.definition) == "2" {
-    for b in held.value.records { by[str(b.debtorno)] = b }
-  } else {
-    let ids = []
-    for r in rows { push(ids, r.customer_id) }
+  let ids = []
+  for r in rows { push(ids, r.customer_id) }
+  let by = thing_rows(db, BALANCE_THING, BALANCE_DEFINITION)
+  if by == nil {
+    by = {}
     for b in q(db, BALANCE_SQL + " WHERE debtortrans.debtorno IN (?) GROUP BY debtortrans.debtorno", [ids]).records { by[str(b.debtorno)] = b }
+  }
+  let sales = thing_rows(db, SALES_THING, SALES_DEFINITION)
+  if sales == nil {
+    sales = {}
+    for b in q(db, SALES_BODY + " AND m.debtorno IN (?) GROUP BY debtorno", [ids]).records { sales[str(b.debtorno)] = b }
+  }
+  // the latest receipt's amount (the ERP card's Last Paid, model/weberp/customer.php getLastPaid: newest trandate, then id)
+  let paid = {}
+  for p in q(db, "SELECT t.id, t.debtorno, -(t.ovamount + t.ovgst + t.ovdiscount + t.ovfee) AS amount FROM debtortrans t " +
+                 "JOIN (SELECT debtorno, MAX(trandate) AS last FROM debtortrans WHERE type = 12 AND debtorno IN (?) GROUP BY debtorno) x " +
+                 "ON x.debtorno = t.debtorno AND x.last = t.trandate WHERE t.type = 12", [ids]).records {
+    let k = str(p.debtorno)
+    if paid[k] == nil or to_number(p.id) > to_number(paid[k].id) { paid[k] = p }
+  }
+  // Avg Order (L365) on the card (customer.php getAvgSpend): invoices' ovamount, DATEDIFF(NOW(), trandate) < 365
+  let recent = {}
+  for a in q(db, "SELECT debtorno, AVG(ovamount) AS avg_amount, COUNT(*) AS n FROM debtortrans WHERE type = 10 AND trandate >= ? " +
+                 "AND debtorno IN (?) GROUP BY debtorno", [days_ago(364), ids]).records { recent[str(a.debtorno)] = a }
+  // Most Purchased Brands (L365) (customer.php getTopThreeBrandsAsArray): units sold per brand, last 365 days
+  let brands = {}
+  for x in q(db, "SELECT m.debtorno, mf.name, -SUM(m.qty) AS units FROM stockmoves m JOIN product_to_manufacturer p ON p.stockid = m.stockid " +
+                 "JOIN manufacturer mf ON mf.manufacturer_id = p.manufacturer_id WHERE m.trandate >= ? AND m.qty < 0 AND m.debtorno IN (?) " +
+                 "GROUP BY m.debtorno, mf.name", [days_ago(365), ids]).records {
+    let k = str(x.debtorno)
+    if brands[k] == nil { brands[k] = [] }
+    push(brands[k], {"name": str(x.name), "units": to_number(x.units)})
+  }
+  for r in rows {
+    let s = sales[r.customer_id]
+    let months = s == nil ? 0 : int(to_number(s.months_active))
+    let spend = s == nil ? 0 : to_number(s.total_spend)
+    let sold = s == nil ? 0 : to_number(s.units_sold)
+    let returned = s == nil ? 0 : to_number(s.units_returned)
+    r["total_spend"] = round(spend, 2)
+    r["first_purchase_date"] = s == nil ? nil : out_value(s.first_purchase_date, "date")
+    r["last_purchase_date"] = s == nil ? nil : out_value(s.last_purchase_date, "date")
+    r["months_active"] = months
+    r["avg_monthly_sales"] = months == 0 ? nil : round(spend / months, 2)
+    r["avg_monthly_units"] = months == 0 ? nil : round((sold - returned) / months, 2)
+    r["units_sold"] = sold
+    r["units_returned"] = returned
+    r["return_rate"] = sold == 0 ? nil : round(returned / sold, 4)
+    let p = paid[r.customer_id]
+    r["last_receipt_amount"] = p == nil ? nil : out_value(p.amount, "money")
+    let a = recent[r.customer_id]
+    r["avg_invoice_last_365"] = a == nil ? nil : out_value(a.avg_amount, "money")
+    r["invoices_last_365"] = a == nil ? 0 : int(to_number(a.n))
+    let top = brands[r.customer_id] == nil ? [] : sort_by(brands[r.customer_id], fn (x) { return [-x.units, x.name] })
+    for i in [0, 1, 2] { r["top_brand_" + str(i + 1)] = i < len(top) ? top[i].name : nil }
   }
   for r in rows {
     let b = by[r.customer_id]
@@ -325,7 +371,66 @@ fn item_extras(db, rows) {
   return rows
 }
 
-let ENRICH = {"customer_balances": customer_balances, "aging": aging, "item_extras": item_extras}
+// A money amount as the ERP writes it into payment_details text ("1,816.50", "$450.22"); nil when there is none.
+fn money_text(t) {
+  if t == nil { return nil }
+  let s = replace(replace(replace(str(t), ",", ""), "$", ""), " ", "")
+  if not regex_test("^-?[0-9]+(\\.[0-9]+)?$", s) { return nil }
+  return round(to_number(s), 2)
+}
+
+// An order's totals two ways:
+//   from its lines (salesorderdetails): line_count, units, lines_subtotal (every line's qty_ordered x discounted
+//     price, rounded as the ERP rounds a line) and open_subtotal (what is not yet invoiced on open lines: the
+//     ERP's Open Orders list, model/oms/orders.php getOrderTotals)
+//   as saved with the order (salesorders.payment_details, written from the cart's totals when the order is saved,
+//     controller/apir/cart.php): subtotal, shipping, tax (every tax line added) and total, what the ERP's Order
+//     Inquiry and the order confirmation show. nil where the order has none saved.
+fn order_totals(db, rows) {
+  if len(rows) == 0 { return rows }
+  let ids = []
+  for r in rows { push(ids, to_number(r.order_id)) }
+  let open_qty = "CASE WHEN l.completed = 0 AND l.quantity > l.qtyinvoiced THEN l.quantity - l.qtyinvoiced ELSE 0 END"
+  let lines = {}
+  for x in q(db, "SELECT l.orderno, COUNT(*) AS n, SUM(l.quantity) AS units, SUM(l.qtyinvoiced) AS invoiced, " +
+                 "SUM(" + line_amount_sql("l.unitprice", "l.discountpercent", "l.quantity") + ") AS amount, " +
+                 "SUM(" + line_amount_sql("l.unitprice", "l.discountpercent", open_qty) + ") AS open_amount " +
+                 "FROM salesorderdetails l WHERE l.orderno IN (?) GROUP BY l.orderno", [ids]).records {
+    lines[str(x.orderno)] = x
+  }
+  let saved = {}
+  for x in q(db, "SELECT orderno, payment_details FROM salesorders WHERE orderno IN (?)", [ids]).records {
+    let p = pcall(fn () { return json_parse(str(x.payment_details)) })
+    if not p.ok or type(p.value) != "list" { continue }
+    let t = {"subtotal": nil, "shipping": nil, "tax": nil, "total": nil}
+    for item in p.value {
+      if type(item) != "map" { continue }
+      let v = money_text(item.text)
+      if v == nil { continue }
+      if item.code == "sub_total" { t["subtotal"] = v }
+      if item.code == "shipping" { t["shipping"] = round((t.shipping == nil ? 0 : t.shipping) + v, 2) }
+      if item.code == "tax" { t["tax"] = round((t.tax == nil ? 0 : t.tax) + v, 2) }
+      if item.code == "total" { t["total"] = v }
+    }
+    saved[str(x.orderno)] = t
+  }
+  for r in rows {
+    let l = lines[r.order_id]
+    r["line_count"] = l == nil ? 0 : int(to_number(l.n))
+    r["units_ordered"] = l == nil ? 0 : to_number(l.units)
+    r["units_invoiced"] = l == nil ? 0 : to_number(l.invoiced)
+    r["lines_subtotal"] = l == nil ? round(0, 2) : out_value(l.amount, "money")
+    r["open_subtotal"] = l == nil ? round(0, 2) : out_value(l.open_amount, "money")
+    let t = saved[r.order_id]
+    r["subtotal"] = t == nil ? nil : t.subtotal
+    r["shipping"] = t == nil ? nil : t.shipping
+    r["tax"] = t == nil ? nil : t.tax
+    r["total"] = t == nil ? nil : t.total
+  }
+  return rows
+}
+
+let ENRICH = {"customer_balances": customer_balances, "aging": aging, "item_extras": item_extras, "order_totals": order_totals}
 
 // ---- routes ---------------------------------------------------------------------------------------
 
@@ -459,8 +564,8 @@ fn sales_by_salesperson_route(req, db) {
   if p.from == nil or p.to == nil or not regex_test(DATE_RE, p.from) or not regex_test(DATE_RE, p.to) {
     return {"res": fail(400, "bad_parameter", "from and to (YYYY-MM-DD) are required"), "rows": 0}
   }
-  if (date_parse(p.to) - date_parse(p.from)) / 86400 > 366 {
-    return {"res": fail(400, "bad_parameter", "At most 366 days per request"), "rows": 0}
+  if (date_parse(p.to) - date_parse(p.from)) / 86400 > MAX_SALES_DAYS {
+    return {"res": fail(400, "bad_parameter", "At most " + str(MAX_SALES_DAYS) + " days per request"), "rows": 0}
   }
   if p.format != nil and p.format != "json" and p.format != "csv" {
     return {"res": fail(400, "bad_parameter", "format is json or csv"), "rows": 0}

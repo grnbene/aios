@@ -1,6 +1,8 @@
-// Post-deploy hook: the ASQL Thing kmdata_customer_balance keeps each customer's balance and invoice dates,
-// recomputed for just that customer whenever a debtortrans row of theirs changes (service.gr reads it
-// for /v1/customers, and reads debtortrans directly while it is missing). Rebuilt when its definition changes.
+// Post-deploy hook: the ASQL Things in lib/things.gr (customer balances, customer sales) are created on first
+// deploy and left in place after; one whose definition changed is dropped and built again. service.gr reads them
+// for /v1/customers, and runs their query for just the page's customers while one is missing or still building.
+
+import "lib/things.gr"
 
 fn setting(name, fallback) {
   let v = getenv(name)
@@ -10,16 +12,23 @@ fn setting(name, fallback) {
   return fallback
 }
 
-let THING = "kmdata_customer_balance"
-let QUERY = "SELECT debtorno, " +
-  "SUM(ovamount + ovgst + ovfee + ovfreight + ovdiscount - alloc) AS balance, " +
-  "SUM(CASE WHEN pt.termsindicator IS NOT NULL THEN ovamount + ovgst + ovfee + ovfreight + ovdiscount ELSE 0 END) AS ledger_balance, " +
-  "MAX(2) AS definition, " +
-  "SUM(CASE WHEN type = 10 THEN ovamount ELSE 0 END) AS lifetime_invoiced, " +
-  "MIN(CASE WHEN type = 10 THEN trandate END) AS first_invoice_date, " +
-  "MAX(CASE WHEN type = 10 THEN trandate END) AS last_invoice_date, " +
-  "MAX(CASE WHEN type = 12 THEN trandate END) AS last_receipt_date " +
-  "FROM debtortrans LEFT JOIN paymentterms pt ON pt.termsindicator = debtortrans.payterms GROUP BY debtorno"
+// One Thing: keep it when it holds this definition, else drop the old one and create it. true or an error text.
+fn ensure_thing(c, present, name, definition, create_sql) {
+  if present[name] != nil {
+    let cur = db_query(c, "SHOW THING " + name, [])
+    if cur.ok and len(cur.records) > 0 and str(cur.records[0]?.definition) == definition {
+      print(name + ": present, " + str(present[name]) + " customers")
+      return true
+    }
+    let d = db_query(c, "DROP THING " + name, [])
+    if not d.ok { return name + ": cannot drop the old definition: " + d.error }
+    print(name + ": old definition dropped")
+  }
+  let r = db_query(c, create_sql, [])
+  if not r.ok { return name + ": " + r.error }
+  print(name + ": created")
+  return true
+}
 
 fn deployed(app) {
   let c = db_connect(setting("ASQL_HOST", "127.0.0.1"), int(setting("ASQL_PORT", "3307")), setting("ASQL_USER", "erp"),
@@ -30,26 +39,15 @@ fn deployed(app) {
     db_close(c)
     return "SHOW THINGS: " + have.error
   }
-  for r in have.records {
-    if r.thing == THING {
-      // present: keep it when it is this definition (definition = 2); otherwise drop it and build this one
-      let cur = db_query(c, "SHOW THING " + THING, [])
-      if cur.ok and len(cur.records) > 0 and str(cur.records[0]?.definition) == "2" {
-        db_close(c)
-        print(THING + ": present, " + str(r.things) + " customers")
-        return true
-      }
-      let d = db_query(c, "DROP THING " + THING, [])
-      if not d.ok {
-        db_close(c)
-        return THING + ": cannot drop the old definition: " + d.error
-      }
-      print(THING + ": old definition dropped")
+  let present = {}
+  for r in have.records { present[str(r.thing)] = r.things }
+  for t in CUSTOMER_THINGS {
+    let ok = ensure_thing(c, present, t[0], t[1], t[2])
+    if ok != true {
+      db_close(c)
+      return ok
     }
   }
-  let r = db_query(c, "CREATE THING " + THING + " KEY debtorno READS debtortrans, paymentterms AS " + QUERY, [])
   db_close(c)
-  if not r.ok { return THING + ": " + r.error }
-  print(THING + ": created")
   return true
 }

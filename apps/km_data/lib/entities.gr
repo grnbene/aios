@@ -91,12 +91,62 @@ let ENTITIES = {
       ["invoice_email", "d.invoiceemailaddress", "text"],
       ["license_no", "d.cosm_license", "text"],
       ["license_expires", "d.licExpDate", "date"],
-      ["email_statements", "d.emailstatement", "text"],
+      ["email_statements", "d.emailstatement = 'Y'", "bool"],
+      ["print_statements", "d.edireference = 'Y'", "bool"],
+      ["email_invoices", "d.ediinvoices", "bool"],
+      ["refused_email", "d.refusedemail", "bool"],
+      ["quote_email", "d.quote_email", "text"],
+      ["signed_contract", "d.signed_mor", "text"],
+      ["price_list2_id", "d.salestype2", "id"],
+      ["discount_level", "d.price_type", "text"],
+      ["prompt_payment_discount", "d.pymtdiscount", "rate"],
+      ["commission_rate", "d.commpct", "num"],
+      ["target_potential", "d.targetpotential", "money"],
+      ["estimated_potential", "d.estimatedpotential", "money"],
       ["is_active", "d.isactive", "bool"]
     ],
     "extra": [
       ["balance", "money"], ["ledger_balance", "money"], ["lifetime_invoiced", "money"], ["first_invoice_date", "date"],
-      ["last_invoice_date", "date"], ["last_receipt_date", "date"]
+      ["last_invoice_date", "date"], ["last_receipt_date", "date"], ["last_receipt_amount", "money"],
+      ["total_spend", "money"], ["first_purchase_date", "date"], ["last_purchase_date", "date"], ["months_active", "int"],
+      ["avg_monthly_sales", "money"], ["avg_monthly_units", "num"], ["units_sold", "num"], ["units_returned", "num"],
+      ["return_rate", "rate"], ["avg_invoice_last_365", "money"], ["invoices_last_365", "int"],
+      ["top_brand_1", "text"], ["top_brand_2", "text"], ["top_brand_3", "text"]
+    ]
+  },
+
+  "customer_contacts": {
+    "description": "The contacts on each customer account (the Contacts list on the ERP's customer card).",
+    "from": "custcontacts c",
+    "key": ["contact_id"],
+    "filters": {"customer_id": "c.debtorno"},
+    "fields": [
+      ["contact_id", "c.contid", "nid"],
+      ["customer_id", "c.debtorno", "id"],
+      ["name", "c.contactname", "text"],
+      ["role", "c.role", "text"],
+      ["roles", "c.serialized_roles", "text"],
+      ["phone", "c.phoneno", "text"],
+      ["email", "c.email", "text"],
+      ["note", "c.notes", "text"]
+    ]
+  },
+
+  "customer_notes": {
+    "description": "Notes kept on each customer account (the Notes on the ERP's customer card).",
+    "from": "custnotes n",
+    "key": ["note_id"], "date": "n.notedate",
+    "filters": {"customer_id": "n.debtorno"},
+    "fields": [
+      ["note_id", "n.noteid", "nid"],
+      ["customer_id", "n.debtorno", "id"],
+      ["date", "n.notedate", "date"],
+      ["code", "n.note_code", "text"],
+      ["topic", "n.notetopic", "text"],
+      ["priority", "n.priority", "text"],
+      ["note", "n.note", "text"],
+      ["entered_by", "n.noteuserid", "text"],
+      ["created_at", "n.date_added", "datetime"]
     ]
   },
 
@@ -143,24 +193,42 @@ let ENTITIES = {
 
   "sales_orders": {
     "description": "Sales order headers, quotes included (is_quote).",
-    "from": "salesorders o LEFT JOIN order_status os ON os.order_status_id = o.orderstatusid AND os.language_id = 1",
+    "from": "salesorders o LEFT JOIN order_status os ON os.order_status_id = o.orderstatusid AND os.language_id = 1 " +
+            "LEFT JOIN debtorsmaster d ON d.debtorno = o.debtorno LEFT JOIN custbranch b ON b.debtorno = o.debtorno AND b.branchcode = o.branchcode " +
+            "LEFT JOIN salesman s ON s.salesmancode = o.salesperson LEFT JOIN shippers sh ON sh.shipper_id = o.shipvia " +
+            "LEFT JOIN locations lc ON lc.loccode = o.fromstkloc",
     "key": ["order_id"],
     "date": "o.orddate",
-    "filters": {"customer_id": "o.debtorno", "salesperson_id": "o.salesperson", "is_quote": "o.quotation", "status_id": "o.orderstatusid"},
+    "filters": {"customer_id": "o.debtorno", "salesperson_id": "o.salesperson", "is_quote": "o.quotation", "status_id": "o.orderstatusid", "invoice_no": "o.invoiceno"},
+    "enrich": "order_totals",
     "fields": [
       ["order_id", "o.orderno", "nid"],
       ["customer_id", "o.debtorno", "id"],
+      ["customer_name", "d.name", "text"],
       ["location_id", "o.branchcode", "id"],
+      ["location_name", "b.brname", "text"],
       ["order_date", "o.orddate", "date"],
       ["requested_date", "o.deliverydate", "date"],
       ["is_quote", "o.quotation", "bool"],
       ["customer_po", "o.customerref", "text"],
       ["buyer_name", "o.buyername", "text"],
       ["salesperson_id", "o.salesperson", "id"],
+      ["salesperson_name", "s.salesmanname", "text"],
       ["salesperson2_id", "o.salesperson2", "id"],
       ["warehouse_id", "o.fromstkloc", "id"],
+      ["warehouse_name", "lc.locationname", "text"],
       ["ship_via_id", "o.shipvia", "id"],
+      ["ship_via", "sh.shippername", "text"],
       ["payment_terms_id", "o.payterms", "id"],
+      ["price_list_id", "o.ordertype", "id"],
+      ["placed_from", "o.placedfrom", "id"],
+      ["quote_no", "o.quoteno", "id"],
+      ["confirmed_date", "o.confirmeddate", "date"],
+      ["packing_slip_printed", "o.printedpackingslip", "bool"],
+      ["payment_status", "o.payment_status", "int"],
+      ["coupon", "o.coupon_used", "text"],
+      ["additional_charge", "o.additionalcharge", "money"],
+      ["additional_charge_text", "o.additionaltext", "text"],
       ["freight", "o.freightcost", "money"],
       ["status_id", "o.orderstatusid", "id"],
       ["status", "os.name", "text"],
@@ -177,9 +245,15 @@ let ENTITIES = {
       ["contact_email", "o.contactemail", "text"],
       ["invoice_note", "o.comments", "text"],
       ["dispatch_note", "o.notes", "text"],
+      ["sales_note", "o.salesnotes", "text"],
       ["entered_by", "o.enteredby", "text"],
+      ["taken_by", "o.takenby", "text"],
       ["created_at", "o.date_created", "datetime"],
       ["updated_at", "o.date_updated", "datetime"]
+    ],
+    "extra": [
+      ["line_count", "int"], ["units_ordered", "num"], ["units_invoiced", "num"], ["lines_subtotal", "money"],
+      ["open_subtotal", "money"], ["subtotal", "money"], ["shipping", "money"], ["tax", "money"], ["total", "money"]
     ]
   },
 
@@ -195,15 +269,21 @@ let ENTITIES = {
       ["description", "l.itemdesc", "text"],
       ["qty_ordered", "l.quantity", "num"],
       ["qty_invoiced", "l.qtyinvoiced", "num"],
+      ["qty_outstanding", "CASE WHEN l.completed = 0 AND l.quantity > l.qtyinvoiced THEN l.quantity - l.qtyinvoiced ELSE 0 END", "num"],
       ["unit_price", "l.unitprice", "money"],
       ["discount_rate", "l.discountpercent", "rate"],
       ["line_amount", line_amount_sql("l.unitprice", "l.discountpercent", "l.quantity"), "money"],
+      ["open_amount", line_amount_sql("l.unitprice", "l.discountpercent", "CASE WHEN l.completed = 0 AND l.quantity > l.qtyinvoiced THEN l.quantity - l.qtyinvoiced ELSE 0 END"), "money"],
       ["list_price", "l.listprice", "money"],
+      ["taxable", "l.taxable IN ('Yes', 'Y')", "bool"],
+      ["fee", "l.fetcharge", "money"],
+      ["parent_line_no", "l.parentlineno", "int"],
       ["completed", "l.completed", "bool"],
       ["dispatched_at", "l.actualdispatchdate", "datetime"],
       ["due_date", "l.itemdue", "date"],
       ["customer_po_line", "l.poline", "text"],
-      ["note", "l.narrative", "text"]
+      ["note", "l.narrative", "text"],
+      ["line_notes", "l.notes", "text"]
     ]
   },
 
@@ -266,16 +346,35 @@ let ENTITIES = {
   },
 
   "allocations": {
-    "description": "How receipts and credit notes were applied to invoices.",
-    "from": "custallocns c",
+    "description": "How receipts and credit notes were applied to invoices: each side's type, document number and date. Allocations go back to 1999 but the ledger starts in December 2019, so on older allocations the from_ and to_ document fields are empty.",
+    "from": "custallocns c LEFT JOIN debtortrans fa ON fa.id = c.transid_allocfrom LEFT JOIN debtortrans ta ON ta.id = c.transid_allocto " +
+            "LEFT JOIN systypes fs ON fs.typeid = fa.type LEFT JOIN systypes ts ON ts.typeid = ta.type",
     "key": ["allocation_id"], "date": "c.datealloc",
-    "filters": {"from_transaction_id": "c.transid_allocfrom", "to_transaction_id": "c.transid_allocto"},
+    "filters": {
+      "customer_id": "fa.debtorno", "from_transaction_id": "c.transid_allocfrom", "to_transaction_id": "c.transid_allocto",
+      "from_document_no": "fa.transno", "to_document_no": "ta.transno", "from_type_id": "fa.type", "to_type_id": "ta.type"
+    },
     "fields": [
       ["allocation_id", "c.id", "nid"],
-      ["amount", "c.amt", "money"],
       ["date", "c.datealloc", "date"],
+      ["amount", "c.amt", "money"],
+      ["customer_id", "fa.debtorno", "id"],
       ["from_transaction_id", "c.transid_allocfrom", "id"],
-      ["to_transaction_id", "c.transid_allocto", "id"]
+      ["from_type_id", "fa.type", "int"],
+      ["from_type", "fs.typename", "text"],
+      ["from_document_no", "fa.transno", "id"],
+      ["from_date", "fa.trandate", "date"],
+      ["from_reference", "fa.reference", "text"],
+      ["from_total", "(fa.ovamount + fa.ovgst + fa.ovfee + fa.ovfreight + fa.ovdiscount)", "money"],
+      ["to_transaction_id", "c.transid_allocto", "id"],
+      ["to_type_id", "ta.type", "int"],
+      ["to_type", "ts.typename", "text"],
+      ["to_document_no", "ta.transno", "id"],
+      ["to_date", "ta.trandate", "date"],
+      ["to_due_date", "ta.duedate", "date"],
+      ["to_customer_id", "ta.debtorno", "id"],
+      ["to_total", "(ta.ovamount + ta.ovgst + ta.ovfee + ta.ovfreight + ta.ovdiscount)", "money"],
+      ["applied_by", "c.userid", "text"]
     ]
   },
 
@@ -627,8 +726,22 @@ let FIELD_NOTES = {
   "invoice_lines.unit_cost": "The item's cost when it was invoiced.",
   "invoice_lines.document_no": "The invoice or credit note number (invoices.document_no).",
   "invoice_lines.order_line_no": "The sales order line it came from (sales_order_lines.line_no).",
+  "allocations.amount": "The amount applied. Negative when an earlier application was reversed (almost always a receipt taken back off an invoice).",
+  "allocations.customer_id": "The account of the receipt or credit note applied.",
   "allocations.from_transaction_id": "The receipt or credit note applied (customer_transactions.transaction_id).",
-  "allocations.to_transaction_id": "The invoice it was applied to (customer_transactions.transaction_id).",
+  "allocations.from_type_id": "What was applied: 12 receipt, 11 credit note, or another ledger type (lookups: transaction_types).",
+  "allocations.from_document_no": "The receipt or credit note number as printed (with from_type_id, payments.document_no or credit_notes.document_no).",
+  "allocations.from_date": "The date of the receipt or credit note.",
+  "allocations.from_reference": "The receipt's reference (cheque or payment reference).",
+  "allocations.from_total": "The receipt's or credit note's whole amount (negative), of which amount is one application.",
+  "allocations.to_transaction_id": "The document it was applied to, usually an invoice (customer_transactions.transaction_id).",
+  "allocations.to_type_id": "What it was applied to: 10 invoice, or another ledger type (lookups: transaction_types).",
+  "allocations.to_document_no": "The invoice number as printed (with to_type_id, invoices.document_no).",
+  "allocations.to_date": "The invoice's date.",
+  "allocations.to_due_date": "The invoice's due date.",
+  "allocations.to_customer_id": "The account of the invoice; the same as customer_id except on the rare cross-account application.",
+  "allocations.to_total": "The invoice's whole amount, of which amount is one payment.",
+  "allocations.applied_by": "The ERP user who made the allocation.",
   "receivables.days_overdue": "Days past the due date as of today; negative before it is due.",
   "receivables.aging_bucket": "The ERP's aged-analysis bucket: future (due in more than 30 days), current (due within 30 days, or no due date), 0_29, 30_59, 60_89 or 90_plus days past due.",
   "salespeople.is_current": "False for reps no longer active.",

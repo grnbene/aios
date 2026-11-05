@@ -17,7 +17,7 @@ All need `Authorization: Bearer <key>` except `/health`.
 | `GET /v1/schema` | every entity, its key, filters, fields and types |
 | `GET /v1/lookups` | warehouses, payment terms, price lists, categories, brands, areas, territories, hold reasons, customer types, ship via, currencies, transaction types |
 | `GET /v1/<entity>` | one page of an entity, in key order |
-| `GET /v1/sales_by_salesperson?from=&to=` | net sales (invoices less credits, before tax and freight) per rep per day; at most 366 days |
+| `GET /v1/sales_by_salesperson?from=&to=` | net sales (invoices less credits, before tax and freight) per rep per day; at most 1,096 days (3 years) |
 | `GET /health` | whether the replica is reachable and how far behind it is |
 
 Entities: `customers`, `customer_locations`, `sales_orders`, `sales_order_lines`, `invoices`, `credit_notes`,
@@ -27,7 +27,7 @@ Entities: `customers`, `customer_locations`, `sales_orders`, `sales_order_lines`
 
 Parameters on an entity:
 
-- `limit` (1-5000, default 1000) and `after` (the `next` of the previous page). Paging is keyset: rows come in
+- `limit` (1-50000, default 5000) and `after` (the `next` of the previous page). Paging is keyset: rows come in
   key order and `next` is null on the last page, so pages never repeat or skip rows.
 - `from` / `to` (YYYY-MM-DD) on entities with a date (`date_filter` in the schema).
 - Equality filters listed per entity in the schema (`customer_id`, `sku`, `order_id`, ...).
