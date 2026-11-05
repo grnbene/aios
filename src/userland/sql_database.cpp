@@ -46851,19 +46851,19 @@ struct StarExpansion {
     step(0, step);
   }
   // Every row into one row id array per source.
+  //
+  // The links in FROM order over whole columns. A unique link gathers its partners (an inner link's misses dropped,
+  // a LEFT link's padded), and a one-to-many link repeats each row once for every row it meets (a LEFT link's
+  // unmatched row once, padded) - so the rows come out in the order walk_root's depth-first walk makes (a root row's
+  // rows, each link's in turn), a column at a time and over the lanes instead of a recursive call a row a link.
   void expand(std::vector<std::vector<uint32_t>>* P) const {
-    bool any_multi = false;
-    for (const StarLink& L : links) any_multi = any_multi || L.multi;
-    if (!any_multi) {
-      // Every link unique: a root row has at most one row, so the rows are the roots' in order, each link's
-      // partners gathered a column at a time over the rows so far (an inner link's misses dropped, a LEFT link's
-      // padded) - the rows and order walk_root makes, without its walk per root row.
-      P->assign(ns, {});
-      (*P)[root] = roots;
-      size_t n = roots.size();
-      std::vector<size_t> made{root};
-      std::vector<uint32_t> got(n);
-      for (const StarLink& L : links) {
+    P->assign(ns, {});
+    (*P)[root] = roots;
+    size_t n = roots.size();
+    std::vector<size_t> made{root};
+    for (const StarLink& L : links) {
+      if (!L.multi) {
+        std::vector<uint32_t> got(n);
         star_partners(*sources, L, (*P)[L.parent_src].data(), n, got.data());
         if (!L.left) {
           size_t w = 0;
@@ -46877,25 +46877,44 @@ struct StarExpansion {
         }
         (*P)[L.child_src].assign(got.begin(), got.begin() + (long)n);
         made.push_back(L.child_src);
+        continue;
       }
-      for (size_t s2 = 0; s2 < ns; ++s2) if ((*P)[s2].size() != n) (*P)[s2].assign(n, UINT32_MAX);   // a source no link reaches
-      return;
+      const uint32_t* par = (*P)[L.parent_src].data();
+      std::vector<const uint32_t*> bp(n);   // the rows the link meets, per row (null: none)
+      std::vector<uint32_t> cnt(n);         // the rows it makes of it
+      SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t i0, size_t i1, size_t) {
+        for (size_t j = i0; j < i1; ++j) {
+          const uint32_t* b = nullptr;
+          const uint32_t* e = nullptr;
+          star_rows_of(*sources, L, par[j], &b, &e);
+          bp[j] = b == e ? nullptr : b;
+          cnt[j] = (uint32_t)(e - b) + (b == e && L.left ? 1u : 0u);
+        }
+      });
+      std::vector<size_t> off(n + 1, 0);
+      for (size_t j = 0; j < n; ++j) off[j + 1] = off[j] + cnt[j];
+      const size_t total = off[n];
+      std::vector<std::vector<uint32_t>> grown(made.size());
+      for (auto& v : grown) v.resize(total);
+      std::vector<uint32_t> child(total);
+      SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t i0, size_t i1, size_t) {
+        for (size_t j = i0; j < i1; ++j) {
+          const size_t o = off[j];
+          const uint32_t c = cnt[j];
+          for (size_t m = 0; m < made.size(); ++m) {
+            const uint32_t v = (*P)[made[m]][j];
+            uint32_t* d = grown[m].data() + o;
+            for (uint32_t t = 0; t < c; ++t) d[t] = v;
+          }
+          for (uint32_t t = 0; t < c; ++t) child[o + t] = bp[j] ? bp[j][t] : UINT32_MAX;
+        }
+      });
+      for (size_t m = 0; m < made.size(); ++m) (*P)[made[m]] = std::move(grown[m]);
+      (*P)[L.child_src] = std::move(child);
+      made.push_back(L.child_src);
+      n = total;
     }
-    P->assign(ns, {});
-    size_t cap = std::max<size_t>(64, (size_t)std::min(bound, (double)roots.size() * 4.0 + 64));
-    std::vector<uint32_t*> outp(ns);
-    for (size_t s2 = 0; s2 < ns; ++s2) { (*P)[s2].resize(cap); outp[s2] = (*P)[s2].data(); }
-    size_t out_n = 0;
-    auto emit = [&](const uint32_t* parts) {
-      if (out_n == cap) {
-        cap *= 2;
-        for (size_t s2 = 0; s2 < ns; ++s2) { (*P)[s2].resize(cap); outp[s2] = (*P)[s2].data(); }
-      }
-      for (size_t s2 = 0; s2 < ns; ++s2) outp[s2][out_n] = parts[s2];
-      ++out_n;
-    };
-    for (uint32_t rr : roots) walk_root(rr, emit);
-    for (size_t s2 = 0; s2 < ns; ++s2) (*P)[s2].resize(out_n);
+    for (size_t s2 = 0; s2 < ns; ++s2) if ((*P)[s2].size() != n) (*P)[s2].assign(n, UINT32_MAX);   // a source no link reaches
   }
   // Source s can be a NULL-padded row: a LEFT link reaches it (or a source it hangs from).
   bool can_pad(size_t s) const {
@@ -56886,6 +56905,7 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
           if (uniq) star_def->expand(&star_cols);
           else star_expand_into(star_def, star_cols);
           const size_t before = star_cols.empty() ? 0 : star_cols[0].size();
+          if (vx_trace_on()) vx_trace("join: star WHERE: arrays expanded, " + std::to_string((hal_now_ns() - wt0) / 1000) + " us");
           size_t applied = 0, left = 0;
           for (const SqlExpr* w : wp) {
             if (pushed_where_parts.count(w)) continue;
@@ -56894,10 +56914,12 @@ static std::optional<SqlQueryResult> star_step(const StarPlan& plan) {
             // a constant true (a view's `WHERE 1 AND ...`) keeps every row: nothing to decide or to compact
             if (w->op == ExprOp::Literal && !w->literal.null && val_truthy(w->literal)) { pushed_where_parts.insert(w); ++applied; continue; }
             std::vector<int8_t> t;
+            const uint64_t pt0 = vx_trace_on() ? hal_now_ns() : 0;
             if (!conjunct_truths(db, sources, RowIds(star_cols), w, &t)) {
               if (vx_trace_on()) vx_trace("join: star WHERE part not decided over the arrays: " + w->source_text.substr(0, 200));
               continue;
             }
+            if (vx_trace_on()) vx_trace("join: star WHERE part over the arrays, " + std::to_string((hal_now_ns() - pt0) / 1000) + " us: " + w->source_text.substr(0, 160));
             const size_t n = t.size();
             size_t keep = 0;
             for (size_t r = 0; r < n; ++r) keep += t[r] == 1;
