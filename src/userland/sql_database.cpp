@@ -6379,72 +6379,83 @@ struct JoinedParts {
   // vector's 24 bytes sat in every joined row to serve a case that does not
   // occur, 96 bytes a row where 80 do - 160 MB of stocktrans' 10M joined rows,
   // each held two and three times over while a join step runs.
-  // 7 inline: n, the ids and the spill pointer fill 40 bytes. At 16 a joined row was 80 bytes whatever the join's
-  // width - 800 MB for a 10M-row two-table join that needs 80 - and joins of more than 7 tables are rare (they
-  // spill to the heap copy, as 17 did).
-  static constexpr size_t INLINE_CAP = 7;
+  // 9 inline in the same 40 bytes: n, the spilled flag and nine ids. A row that outgrows them keeps its heap copy's
+  // pointer in the first 8 bytes of the id array (a row is inline or spilled, never both), so the spill costs no slot
+  // of its own. At 7 inline, a 9-table join (the ERP's stocktrans view) put a malloc and a vector grow on every row
+  // of its last two steps - 1.3M rows - and joins of more than 9 tables are rare (they spill, as 17 did).
+  static constexpr size_t INLINE_CAP = 9;
   static constexpr uint32_t kInlineNull = UINT32_MAX;
   uint8_t n = 0;
+  bool spilled = false;
   uint32_t inline_arr[INLINE_CAP] = {0};
-  std::unique_ptr<std::vector<size_t>> spill;
+
+  std::vector<size_t>* sp() const { std::vector<size_t>* q; std::memcpy(&q, inline_arr, sizeof q); return q; }
+  void set_sp(std::vector<size_t>* q) { std::memcpy(inline_arr, &q, sizeof q); }
+  void release() { if (spilled) { delete sp(); spilled = false; } }
+  void spill_now(size_t room) {
+    auto* v = new std::vector<size_t>();
+    v->reserve(room);
+    for (size_t i = 0; i < n; ++i) v->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
+    set_sp(v);
+    spilled = true;
+  }
 
   JoinedParts() = default;
-  JoinedParts(const JoinedParts& o) : n(o.n) {
-    if (o.spill) spill = std::make_unique<std::vector<size_t>>(*o.spill);
+  ~JoinedParts() { release(); }
+  JoinedParts(const JoinedParts& o) : n(o.n), spilled(o.spilled) {
+    if (spilled) set_sp(new std::vector<size_t>(*o.sp()));
     else std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
   }
-  JoinedParts(JoinedParts&& o) noexcept : n(o.n), spill(std::move(o.spill)) {
-    if (!spill) std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
+  JoinedParts(JoinedParts&& o) noexcept : n(o.n), spilled(o.spilled) {
+    std::memcpy(inline_arr, o.inline_arr, spilled ? sizeof(void*) : n * sizeof(uint32_t));
     o.n = 0;
+    o.spilled = false;
   }
   JoinedParts& operator=(const JoinedParts& o) {
     if (this == &o) return *this;
+    release();
     n = o.n;
-    if (o.spill) spill = std::make_unique<std::vector<size_t>>(*o.spill);
-    else { spill.reset(); std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t)); }
+    spilled = o.spilled;
+    if (spilled) set_sp(new std::vector<size_t>(*o.sp()));
+    else std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
     return *this;
   }
   JoinedParts& operator=(JoinedParts&& o) noexcept {
     if (this == &o) return *this;
+    release();
     n = o.n;
-    spill = std::move(o.spill);
-    if (!spill) std::memcpy(inline_arr, o.inline_arr, n * sizeof(uint32_t));
+    spilled = o.spilled;
+    std::memcpy(inline_arr, o.inline_arr, spilled ? sizeof(void*) : n * sizeof(uint32_t));
     o.n = 0;
+    o.spilled = false;
     return *this;
   }
 
   size_t size() const { return n; }
   bool empty() const { return n == 0; }
   size_t operator[](size_t i) const {
-    if (!spill) {
+    if (!spilled) {
       const uint32_t v = inline_arr[i];
       return v == kInlineNull ? kNullRow : (size_t)v;
     }
-    return (*spill)[i];
+    return (*sp())[i];
   }
   void push_back(size_t r) {
     const bool fits = r == kNullRow || r < (size_t)kInlineNull;
-    if (n < INLINE_CAP && !spill && fits) {
+    if (n < INLINE_CAP && !spilled && fits) {
       inline_arr[n++] = r == kNullRow ? kInlineNull : (uint32_t)r;
     } else {
-      if (!spill) {
-        spill = std::make_unique<std::vector<size_t>>();
-        spill->reserve(n + 4);
-        for (size_t i = 0; i < n; ++i) spill->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
-      }
-      spill->push_back(r);
+      if (!spilled) spill_now(n + 4);
+      sp()->push_back(r);
       n++;
     }
   }
-  void clear() { n = 0; spill.reset(); }
+  void clear() { release(); n = 0; }
   // Only a row that will outgrow the inline slots needs room reserved.
   void reserve(size_t sz) {
     if (sz <= INLINE_CAP) return;
-    if (!spill) {
-      spill = std::make_unique<std::vector<size_t>>();
-      for (size_t i = 0; i < n; ++i) spill->push_back(inline_arr[i] == kInlineNull ? kNullRow : (size_t)inline_arr[i]);
-    }
-    spill->reserve(sz);
+    if (!spilled) spill_now(sz);
+    else sp()->reserve(sz);
   }
   // Set an inline slot already pushed (the single-table evaluator reuses one).
   void set_inline(size_t i, size_t r) { inline_arr[i] = r == kNullRow ? kInlineNull : (uint32_t)r; }
@@ -46438,14 +46449,15 @@ struct StarShape {
 struct StarCodeMap {
   uint64_t pe = 0, ce = 0;
   size_t pn = 0, cn = 0;
-  bool ok = false;                   // false: two joined-side entries share a key
-  std::vector<int32_t> p2c;
+  bool ok = false;                   // false: two joined-side entries share a key (unless the join asked for duplicates)
+  std::vector<int32_t> p2c;          // parent code -> the first joined code holding the key
+  std::vector<int32_t> c2k;          // only with duplicates: joined code -> the first joined code holding its key (-1: none)
 };
 
-static std::shared_ptr<const StarCodeMap> star_code_map(const StarKey& pk, const StarKey& ck) {
+static std::shared_ptr<const StarCodeMap> star_code_map(const StarKey& pk, const StarKey& ck, bool allow_dups = false) {
   const ColumnStore& pcs = pk.t->col_data[pk.col];
   const ColumnStore& ccs = ck.t->col_data[ck.col];
-  const uint64_t key = pcs.uid.v * 0x9E3779B97F4A7C15ull ^ ccs.uid.v;
+  const uint64_t key = (pcs.uid.v * 0x9E3779B97F4A7C15ull ^ ccs.uid.v) + (allow_dups ? 0x5851F42D4C957F2Dull : 0);
   static aios::hal::Mutex mu;
   static std::unordered_map<uint64_t, std::shared_ptr<const StarCodeMap>> cache;
   const size_t pn = vx::dict_size(pcs), cn = vx::dict_size(ccs);
@@ -46465,8 +46477,15 @@ static std::shared_ptr<const StarCodeMap> star_code_map(const StarKey& pk, const
   if (m->ok) {
     std::unordered_map<uint64_t, int32_t> k2c;
     k2c.reserve(cn * 2 + 1);
-    for (size_t c = 0; c < cn && m->ok; ++c)
-      if (cok[c] && !k2c.emplace(ckey[c], (int32_t)c).second) m->ok = false;
+    for (size_t c = 0; c < cn && m->ok; ++c) {
+      if (!cok[c]) continue;
+      auto ins = k2c.emplace(ckey[c], (int32_t)c);
+      if (ins.second) continue;
+      if (!allow_dups) { m->ok = false; break; }
+      if (m->c2k.empty()) { m->c2k.assign(cn, -1); for (size_t q = 0; q < c; ++q) if (cok[q]) m->c2k[q] = k2c[ckey[q]]; }
+    }
+    if (m->ok && !m->c2k.empty())
+      for (size_t c = 0; c < cn; ++c) if (cok[c]) m->c2k[c] = k2c[ckey[c]];
     if (m->ok) {
       m->p2c.assign(pn, -1);
       for (size_t c = 0; c < pn; ++c) {
@@ -53535,6 +53554,10 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
     size_t dc_base_col = 0;
     std::shared_ptr<const StarCodeMap> dc_code_map;
     const ColumnStore* dc_base_cs = nullptr;
+    // the base column's codes and NULL flags decoded whole (kept between statements): a run-length column's code
+    // read row by row is a binary search over its runs each time
+    std::shared_ptr<const std::vector<uint32_t>> dc_base_codes;
+    std::shared_ptr<const std::vector<uint8_t>> dc_base_nulls;
 
     if (best_ki >= 0 && prep_jkeys[best_ki].idx && !prep_jkeys[best_ki].idx->by_code.empty()) {
       const SqlExpr* bval = prep_jkeys[best_ki].value;
@@ -53557,6 +53580,8 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
                 if (dc_code_map && dc_code_map->ok) {
                   direct_code_join = true;
                   dc_base_cs = &bcs;
+                  dc_base_codes = vx::decoded_codes(bt, dc_base_col);
+                  if (dc_base_codes && vx::has_nulls(bcs)) { dc_base_nulls = vx::decoded_nulls(bt, dc_base_col); if (!dc_base_nulls) dc_base_codes.reset(); }
                 }
               }
             }
@@ -53779,8 +53804,9 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
           }
         } else if (direct_code_join) {
           const size_t base_ri = (dc_base_src < base.parts.size()) ? base.parts[dc_base_src] : kNullRow;
-          if (base_ri == kNullRow || base_ri >= dc_base_cs->size() || dc_base_cs->is_null(base_ri)) return;
-          const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
+          if (base_ri == kNullRow || base_ri >= dc_base_cs->size()) return;
+          if (dc_base_codes ? (dc_base_nulls && (*dc_base_nulls)[base_ri]) : dc_base_cs->is_null(base_ri)) return;
+          const uint32_t ca = dc_base_codes ? (*dc_base_codes)[base_ri] : vx::code_at(*dc_base_cs, base_ri);
           if (ca >= dc_code_map->p2c.size()) return;
           const int32_t cb = dc_code_map->p2c[ca];
           if (cb < 0 || (size_t)cb >= prep_jkeys[best_ki].idx->by_code.size()) return;
@@ -53994,7 +54020,8 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
         if ((int)ki != best_ki && !nk.konst && prep_jkeys[ki].column >= 0 && (size_t)prep_jkeys[ki].column < js.table->col_data.size()) {
           StarKey pk, ck;
           if (star_key_of(bt, kc, &pk) && star_key_of(*js.table, (size_t)prep_jkeys[ki].column, &ck) && pk.text && ck.text) {
-            std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck);
+            std::shared_ptr<const StarCodeMap> m = star_code_map(pk, ck, true);
+            if (!(m && m->ok) && vx_trace_on()) vx_trace("join: code map refused for " + std::string(bt.name) + "." + bt.columns[kc].name);
             if (m && m->ok) {
               nk.cs = &bcs; nk.src = ks; nk.cmap = std::move(m);
               const size_t jc = (size_t)prep_jkeys[ki].column;
@@ -54133,14 +54160,18 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
             const uint32_t ca = (*nk.bcodes)[r];
             if (ca >= nk.cmap->p2c.size()) return false;
             const int32_t cb = nk.cmap->p2c[ca];
-            if (cb < 0 || mr >= nk.jcodes->size() || (nk.jnulls && (*nk.jnulls)[mr]) || (*nk.jcodes)[mr] != (uint32_t)cb) return false;
+            if (cb < 0 || mr >= nk.jcodes->size() || (nk.jnulls && (*nk.jnulls)[mr])) return false;
+            const uint32_t jc = (*nk.jcodes)[mr];
+            if ((nk.cmap->c2k.empty() ? (int64_t)jc : (jc < nk.cmap->c2k.size() ? (int64_t)nk.cmap->c2k[jc] : -1)) != cb) return false;
             continue;
           }
           if (nk.cs->is_null(r)) return false;
           const uint32_t ca = vx::code_at(*nk.cs, r);
           if (ca >= nk.cmap->p2c.size()) return false;
           const int32_t cb = nk.cmap->p2c[ca];
-          if (cb < 0 || kcs.is_null(mr) || vx::code_at(kcs, mr) != (uint32_t)cb) return false;
+          if (cb < 0 || kcs.is_null(mr)) return false;
+          const uint32_t jc = vx::code_at(kcs, mr);
+          if ((nk.cmap->c2k.empty() ? (int64_t)jc : (jc < nk.cmap->c2k.size() ? (int64_t)nk.cmap->c2k[jc] : -1)) != cb) return false;
           continue;
         }
         double w = 0;
@@ -54277,8 +54308,9 @@ static std::optional<SqlQueryResult> join_step(const JoinStepPlan& sp, PhaseCloc
       if (direct_code_join) {
         // the base row's dictionary code mapped to the joined column's (star_code_map): that code's rows
         const size_t base_ri = dc_base_src < base.parts.size() ? base.parts[dc_base_src] : kNullRow;
-        if (base_ri != kNullRow && base_ri < dc_base_cs->size() && !dc_base_cs->is_null(base_ri)) {
-          const uint32_t ca = vx::code_at(*dc_base_cs, base_ri);
+        if (base_ri != kNullRow && base_ri < dc_base_cs->size() &&
+            !(dc_base_codes ? (dc_base_nulls && (*dc_base_nulls)[base_ri]) : dc_base_cs->is_null(base_ri))) {
+          const uint32_t ca = dc_base_codes ? (*dc_base_codes)[base_ri] : vx::code_at(*dc_base_cs, base_ri);
           if (ca < dc_code_map->p2c.size()) {
             const int32_t cb = dc_code_map->p2c[ca];
             if (cb >= 0 && (size_t)cb < idx->by_code.size()) {
