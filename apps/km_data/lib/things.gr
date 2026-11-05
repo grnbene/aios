@@ -34,22 +34,75 @@ let BALANCE_THING_SQL = "CREATE THING " + BALANCE_THING + " KEY debtorno READS d
 //   - the debtortrans join is an EXISTS, so a line counts once even where a document number repeats in the ledger
 //     (R0001 document 565595 has 62 ledger rows, and the view counts each of its 62 lines 62 times)
 let SALES_THING = "kmdata_customer_sales"
-let SALES_DEFINITION = "1"
-let SALES_BODY = "SELECT debtorno, " +
-  "-SUM(CAST(" + line_amount_sql("m.price", "m.discountpercent", "m.qty") + " AS DECIMAL(12,2))) AS total_spend, " +
-  "MIN(m.trandate) AS first_purchase_date, MAX(m.trandate) AS last_purchase_date, " +
-  "COUNT(DISTINCT DATE_FORMAT(m.trandate, '%Y-%m')) AS months_active, " +
-  "SUM(CASE WHEN m.qty < 0 THEN -m.qty ELSE 0 END) AS units_sold, " +
-  "SUM(CASE WHEN m.qty > 0 THEN m.qty ELSE 0 END) AS units_returned, " +
-  "MAX(1) AS definition " +
-  "FROM stockmoves m WHERE m.type IN (10, 11) AND m.show_on_inv_crds = 1 AND m.stockid NOT LIKE 'SUAA%' AND m.stockid <> 'ZZMCWRITEOFF' " +
+let SALES_DEFINITION = "3"
+// The sales lines every customer sales figure counts (also the period sales service.gr works out per page).
+let SALES_LINE_AMOUNT = "CAST(" + line_amount_sql("m.price", "m.discountpercent", "m.qty") + " AS DECIMAL(12,2))"
+let SALES_WHERE = "m.type IN (10, 11) AND m.show_on_inv_crds = 1 AND m.stockid NOT LIKE 'SUAA%' AND m.stockid <> 'ZZMCWRITEOFF' " +
   "AND (m.stockid <> 'ZZMCMISC' OR NOT EXISTS (SELECT 1 FROM stockmoves wo WHERE wo.transno = m.transno AND wo.type = m.type " +
   "AND wo.debtorno = m.debtorno AND wo.branchcode = m.branchcode AND wo.stockid IN ('ZZMCMISC', 'ZZMCWRITEOFF') AND wo.show_on_inv_crds = 0)) " +
   "AND EXISTS (SELECT 1 FROM debtortrans t WHERE t.transno = m.transno AND t.debtorno = m.debtorno AND t.branchcode = m.branchcode)"
+// first / last purchase are invoice lines only: a credit note is not a purchase (definition 3; 2 counted credits too)
+let SALES_BODY = "SELECT debtorno, " +
+  "-SUM(" + SALES_LINE_AMOUNT + ") AS total_spend, " +
+  "MIN(CASE WHEN m.type = 10 THEN m.trandate END) AS first_purchase_date, MAX(CASE WHEN m.type = 10 THEN m.trandate END) AS last_purchase_date, " +
+  "COUNT(DISTINCT DATE_FORMAT(m.trandate, '%Y-%m')) AS months_active, " +
+  "SUM(CASE WHEN m.qty < 0 THEN -m.qty ELSE 0 END) AS units_sold, " +
+  "SUM(CASE WHEN m.qty > 0 THEN m.qty ELSE 0 END) AS units_returned, " +
+  "MAX(" + SALES_DEFINITION + ") AS definition " +
+  "FROM stockmoves m WHERE " + SALES_WHERE
 let SALES_THING_SQL = "CREATE THING " + SALES_THING + " KEY debtorno READS stockmoves, debtortrans AS " + SALES_BODY + " GROUP BY debtorno"
+
+// Sales by period on the same lines as total_spend, against the database's date (CURDATE()):
+//   sales_mtd             this month to today
+//   sales_ytd             1 January to today
+//   sales_last_year_ytd   last year, 1 January to this day last year (the YTD comparison)
+//   sales_last_year       all of last year
+//   sales_last_12_months  the day after this day last year, to today (from 29 February: 1 March)
+// A Thing that reads CURDATE() is worked out whole once each new day and per customer on every change in between,
+// so the figures move with the date without a page working them out (5 line amounts on 486,000 lines: 3 s).
+let PERIODS_THING = "kmdata_customer_periods"
+let PERIODS_DEFINITION = "1"
+let PERIOD_THIS_MONTH = "DATE_FORMAT(CURDATE(), '%Y-%m-01')"
+let PERIOD_THIS_YEAR = "DATE_FORMAT(CURDATE(), '%Y-01-01')"
+let PERIOD_LAST_YEAR = "DATE_FORMAT(CURDATE() - INTERVAL 1 YEAR, '%Y-01-01')"
+let PERIOD_YEAR_AGO_NEXT = "(CURDATE() - INTERVAL 1 YEAR + INTERVAL 1 DAY)"
+let PERIODS_BODY = "SELECT debtorno, " +
+  "-SUM(CASE WHEN m.trandate >= " + PERIOD_THIS_MONTH + " THEN " + SALES_LINE_AMOUNT + " ELSE 0 END) AS sales_mtd, " +
+  "-SUM(CASE WHEN m.trandate >= " + PERIOD_THIS_YEAR + " THEN " + SALES_LINE_AMOUNT + " ELSE 0 END) AS sales_ytd, " +
+  "-SUM(CASE WHEN m.trandate < " + PERIOD_YEAR_AGO_NEXT + " THEN " + SALES_LINE_AMOUNT + " ELSE 0 END) AS sales_last_year_ytd, " +
+  "-SUM(CASE WHEN m.trandate < " + PERIOD_THIS_YEAR + " THEN " + SALES_LINE_AMOUNT + " ELSE 0 END) AS sales_last_year, " +
+  "-SUM(CASE WHEN m.trandate >= " + PERIOD_YEAR_AGO_NEXT + " THEN " + SALES_LINE_AMOUNT + " ELSE 0 END) AS sales_last_12_months, " +
+  "MAX(" + PERIODS_DEFINITION + ") AS definition " +
+  "FROM stockmoves m WHERE m.trandate >= " + PERIOD_LAST_YEAR + " AND " + SALES_WHERE
+let PERIODS_THING_SQL = "CREATE THING " + PERIODS_THING + " KEY debtorno READS stockmoves, debtortrans AS " + PERIODS_BODY + " GROUP BY debtorno"
+
+// The customer's open items (total - applied, more than half a cent) in the ERP's aged-analysis buckets, the same
+// items and rule as /v1/receivables (service.gr aging), so a customer's buckets add up to its balance. Days overdue
+// are DATEDIFF(today, due date); an item with no due date is current. Worked out whole once each new day.
+// Only open items are read (the WHERE): the cash account 99999 has 263,000 ledger rows and almost none open, so a
+// change to it re-reads in 0.14 s, not the 1.2 s of bucketing every row.
+let AGING_THING = "kmdata_customer_aging"
+let AGING_DEFINITION = "1"
+let AGING_DUE = "t.duedate > '1000-01-01'"
+let AGING_DAYS = "DATEDIFF(CURDATE(), t.duedate)"
+fn aging_bucket_sql(label, test) {
+  return "SUM(CASE WHEN " + test + " THEN " + TXN_TOTAL + " - t.alloc ELSE 0 END) AS aging_" + label
+}
+let AGING_BODY = "SELECT debtorno, " +
+  aging_bucket_sql("future", AGING_DUE + " AND " + AGING_DAYS + " < -30") + ", " +
+  aging_bucket_sql("current", "(NOT (" + AGING_DUE + ") OR t.duedate IS NULL OR (" + AGING_DAYS + " >= -30 AND " + AGING_DAYS + " < 0))") + ", " +
+  aging_bucket_sql("0_29", AGING_DUE + " AND " + AGING_DAYS + " >= 0 AND " + AGING_DAYS + " < 30") + ", " +
+  aging_bucket_sql("30_59", AGING_DUE + " AND " + AGING_DAYS + " >= 30 AND " + AGING_DAYS + " < 60") + ", " +
+  aging_bucket_sql("60_89", AGING_DUE + " AND " + AGING_DAYS + " >= 60 AND " + AGING_DAYS + " < 90") + ", " +
+  aging_bucket_sql("90_plus", AGING_DUE + " AND " + AGING_DAYS + " >= 90") + ", " +
+  "MAX(" + AGING_DEFINITION + ") AS definition " +
+  "FROM debtortrans t WHERE ABS(" + TXN_TOTAL + " - t.alloc) > 0.005"
+let AGING_THING_SQL = "CREATE THING " + AGING_THING + " KEY debtorno READS debtortrans AS " + AGING_BODY + " GROUP BY debtorno"
 
 // [name, definition, CREATE statement] for deployed.gr
 let CUSTOMER_THINGS = [
   [BALANCE_THING, BALANCE_DEFINITION, BALANCE_THING_SQL],
-  [SALES_THING, SALES_DEFINITION, SALES_THING_SQL]
+  [SALES_THING, SALES_DEFINITION, SALES_THING_SQL],
+  [PERIODS_THING, PERIODS_DEFINITION, PERIODS_THING_SQL],
+  [AGING_THING, AGING_DEFINITION, AGING_THING_SQL]
 ]

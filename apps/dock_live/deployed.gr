@@ -1,4 +1,4 @@
-// Post-deploy hook: creates or replaces the dock_bay Thing in this machine's ASQL (things/dock_bay.gr,
+// Post-deploy hook: creates or replaces the dock_bay and pick_open Things in this machine's ASQL (things/dock_bay.gr,
 // each built beside its old version and swapped in when its first pass is done, so the screens keep reading the
 // old one meanwhile).
 
@@ -12,7 +12,10 @@ fn setting(name, fallback) {
 
 let THINGS = [
   {"name": "dock_bay", "key": "bay",
-   "reads": "loadingbays, trucks, dispatch, custbranch, salesorderdetails, creditorderdetails, stockmaster, pickingfreeze, tagalong, product_types"}
+   "reads": "loadingbays, trucks, dispatch, custbranch, salesorderdetails, creditorderdetails, stockmaster, pickingfreeze, tagalong, product_types"},
+  // every open order's pick lines, for the pick screens (Item Pick, pick board): one order rebuilt per scan
+  {"name": "pick_open", "key": "orderno",
+   "reads": "pickingfreeze, stockmaster, product_types, dispatch, dispatch_status, salesorders, custbranch, salesordertopurchaseorder, purchorderdetails"}
 ]
 
 fn deployed(app) {

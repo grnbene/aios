@@ -275,7 +275,7 @@ and `metal/mkdisk.sh`. Not driven here.
 Other helpers:
 
 - `metal/console.py start --disk IMG [--iso ISO] [--smp N] [--mem M] [--mind SOCK]`, then `send "<line>"`, `read`, `stop`. This is a serial proxy for one exchange at a time; state is kept in `$AIOS_CONSOLE_DIR` (default `/tmp/aios-console`).
-- `metal/mind-wire.py SOCK` connects COM2 to `intelligence/assay/bridge.cjs`. Then `mind bind mind wire` inside the machine attaches a model. Provider and model come from `~/.assay/config.json` or `AIOS_MODEL_PROVIDER`/`AIOS_MODEL`.
+- `metal/mind-wire.py SOCK` connects COM2 to `intelligence/assay/bridge.cjs`. Then `mind bind mind wire` inside the machine attaches a model. Provider and model come from `AOS_PROVIDER`/`AOS_MODEL` in `aos.conf` or `AIOS_MODEL_PROVIDER`/`AIOS_MODEL`; `~/.assay/config.json` only supplies credentials and hosts for the provider you named, never the provider or model.
 - `metal/prove-baremetal.sh` waits for a running `metal/build.sh`, refuses a kernel older than the newest source, boots it under `qemu-system-x86_64` (from `PATH`, else Homebrew's; `QEMU=` overrides) and appends the run to `build/metal/prove-baremetal.log` ending `SETTLE: PASS|FAIL`. It runs on Linux and macOS.
 
 #### Processes, the idle learner, and the system-call edges

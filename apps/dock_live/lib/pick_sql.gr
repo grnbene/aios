@@ -1,0 +1,85 @@
+// What the pick_open Thing reads: Cleve's open pick rows, one order at a time, with the order's header - the same
+// rows and fields v8's apir/oms/picking (index()) builds, read set-wise instead of three queries a line.
+//
+// Shared by things/pick_open.gr (inside the engine) and service.gr (shaping the rows for the screens).
+
+import "dock_sql.gr"
+
+// The columns a pick screen shows or a pick changes. An update that touches none of them (a cost re-price, a
+// cleared flag) is not a change to the list.
+let PICK_USED = {
+  "pickingfreeze": ["pick_id", "orderno", "linenumber", "stockid", "loccode", "bin", "qoh", "ordered", "pick", "picked",
+                    "loaded", "completed", "invoiced", "type", "claimed", "claimed_user", "claimed_date", "userid",
+                    "date_pickupdate", "pickstatus", "putbin"],
+  "salesorders": ["orderno", "debtorno", "branchcode", "shipvia", "notes", "deliverydate"],
+  "dispatch": ["invoice", "status_id"],
+  "custbranch": ["debtorno", "branchcode", "brname", "braddress3", "route"]
+}
+
+fn pick_unchanged(table, before, after) {
+  let cols = PICK_USED[table]
+  if cols == nil or before == nil or after == nil { return false }
+  for c in cols { if s(before[c]) != s(after[c]) { return false } }
+  return true
+}
+
+// Orders with a pick row not yet signed off or invoiced: the keys that may be a pick_open Thing. One with no row a
+// picker could pick (all credits, all non-pick items, its run no longer pickable) is left out by things().
+fn open_pick_orders() {
+  let out = []
+  for r in read("SELECT DISTINCT orderno FROM pickingfreeze WHERE completed = 0 AND invoiced = 0") { push(out, s(r.orderno)) }
+  return out
+}
+
+// The pick rows of these orders as index() lists them: not signed off, not invoiced, an item that needs picking,
+// not a credit (type 11), and the order's run not in a status that stops picking. Rows already picked in full are
+// kept (index() drops them) so a screen sees a line reach pick/pick; a screen opening fresh leaves those out itself.
+fn open_pick_rows(ordernos) {
+  let blocked = {}
+  for d in read("SELECT d.invoice FROM dispatch d JOIN dispatch_status ds ON ds.order_status_id = d.status_id " +
+                "WHERE ds.ispickable = 0 AND d.invoice IN (?)", ordernos) {
+    blocked[s(int(n(d.invoice)))] = true
+  }
+  let by_order = {}
+  // read_raw: every column as the text the wire carries, as PHP hands them to the screens (pick_id "189127", not
+  // 189127). A screen matches lines by pick_id against what PHP gave it; a number there is a different key.
+  for r in read_raw("SELECT p.*, s.description, s.mfgpart, s.mbflag, s.decimalplaces FROM pickingfreeze p " +
+                "JOIN stockmaster s ON s.stockid = p.stockid " +
+                "WHERE p.orderno IN (?) AND p.completed = 0 AND p.invoiced = 0 " +
+                "AND s.mbflag IN (SELECT label FROM product_types WHERE requirespick = 1) ORDER BY p.bin", ordernos) {
+    let o = s(r.orderno)
+    if blocked[o] or s(r.type) == "11" { continue }
+    if by_order[o] == nil { by_order[o] = [] }
+    push(by_order[o], r)
+  }
+  return by_order
+}
+
+// Each order's header as getOrder() joins it, and its fill test (actualNotFillable: every frozen row of the order).
+fn order_heads(ordernos) {
+  let out = {}
+  for h in read("SELECT so.orderno, so.debtorno, so.branchcode, so.shipvia, so.notes, so.deliverydate, " +
+                "cb.branchcode AS cb_branch, cb.brname, cb.braddress3, cb.route FROM salesorders so " +
+                "LEFT JOIN custbranch cb ON cb.debtorno = so.debtorno AND cb.branchcode = so.branchcode " +
+                "WHERE so.orderno IN (?)", ordernos) {
+    out[s(h.orderno)] = h
+  }
+  for f in read("SELECT orderno, SUM(qoh) - SUM(pick) AS fillable FROM pickingfreeze WHERE orderno IN (?) GROUP BY orderno", ordernos) {
+    let h = out[s(f.orderno)]
+    if h != nil { h.fillable = n(f.fillable) }
+  }
+  return out
+}
+
+// MST (special order) lines take their description from the purchase order raised for them (getPoDetails).
+fn mst_descriptions(ordernos) {
+  let out = {}
+  if len(ordernos) == 0 { return out }
+  for p in read("SELECT sp.sales_orderno, pod.itemdescription FROM salesordertopurchaseorder sp " +
+                "JOIN purchorderdetails pod ON pod.orderno = sp.purchase_orderno " +
+                "WHERE sp.sales_orderno IN (?) AND pod.itemcode = 'MST'", ordernos) {
+    let o = s(p.sales_orderno)
+    if out[o] == nil { out[o] = s(p.itemdescription) }
+  }
+  return out
+}

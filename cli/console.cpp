@@ -57,7 +57,11 @@ std::string machine_conf(Session& s, const std::string& key) {
     size_t vb = v.find_first_not_of(" \t");
     size_t ve = v.find_last_not_of(" \t\r");
     if (vb == std::string::npos) return {};
-    return v.substr(vb, ve - vb + 1);
+    v = v.substr(vb, ve - vb + 1);
+    // `aos` writes the file with shell quoting (AOS_PROVIDER=''), and the
+    // bridge strips it, so an empty quoted value must read as empty here too.
+    if (v.size() > 1 && ((v.front() == '\'' && v.back() == '\'') || (v.front() == '"' && v.back() == '"'))) v = v.substr(1, v.size() - 2);
+    return v;
   }
   return {};
 }
@@ -123,14 +127,20 @@ Result<void> auto_bind_mind(Session& s, const std::string& label) {
     return s.me->bind_mind(mind_id, std::move(*wire));
   }
 
+  // The bridge sends what the console is asked to a model provider, so it is
+  // started only when someone chose one: AOS_PROVIDER in aos.conf (what
+  // `mind set` writes) or AIOS_MODEL_PROVIDER in the environment. With neither,
+  // nothing is bound and a line that is not a command is an unknown command.
+  // This used to start the bridge regardless, and the bridge took its provider
+  // and model from ~/.assay/config.json, a different tool's default, so a
+  // machine nobody had set up sent free text to whatever that file named.
+  const char* env_provider = std::getenv("AIOS_MODEL_PROVIDER");
+  const bool chosen = (env_provider && *env_provider) || !machine_conf(s, "AOS_PROVIDER").empty();
+  if (!chosen) return Ok();
+
   auto ext = spawn_bridge_mind(s);
   if (ext.ok()) return s.me->bind_mind(mind_id, std::move(*ext));
-
-  auto echo = make_echo_intelligence();
-  if (echo) {
-    return s.me->bind_mind(mind_id, std::move(echo));
-  }
-  return Ok();
+  return Result<void>(Status::NotFound, "AOS_PROVIDER is set but the bridge could not start: " + ext.error().str());
 }
 
 Result<void> hot_swap_mind(Session& s, const std::string& label) {
@@ -149,6 +159,7 @@ Result<void> hot_swap_mind(Session& s, const std::string& label) {
   std::string model = env_model ? env_model : "spark";
 
   std::unique_ptr<Intelligence> new_mind;
+  std::string bridge_why;
   if (kind == "qwen" || kind == "spark" || kind == "llm" || env_url != nullptr) {
     if (url.empty())
       return Result<void>(Status::Invalid, "AIOS_MIND_KIND=" + kind + " needs AIOS_MIND_URL (e.g. http://<host>:8000/v1/chat/completions); no endpoint is built in");
@@ -169,11 +180,13 @@ Result<void> hot_swap_mind(Session& s, const std::string& label) {
     // hot_swap could never reach it before: it went wire -> the removed fake
     // CUDA mind -> echo, and the fake always succeeded.
     auto ext = spawn_bridge_mind(s);
-    if (ext.ok()) new_mind = std::move(*ext);
+    if (ext.ok()) new_mind = std::move(*ext); else bridge_why = ext.error().str();
   }
-  if (!new_mind) {
-    new_mind = make_echo_intelligence();
-  }
+  // No fallback to the echo reference here: `mind set` named a provider, and
+  // a machine that cannot reach it must say so rather than report a mind that
+  // only repeats its briefing back. `echo` is bound only when asked for
+  // (AIOS_MIND_KIND=echo, or `mind bind <e> echo`).
+  if (!new_mind) return Result<void>(Status::NotFound, bridge_why.empty() ? std::string("no mind could be created") : bridge_why);
 
   if (new_mind) {
     return s.me->swap_mind(mind_id, std::move(new_mind));

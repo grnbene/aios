@@ -7,12 +7,14 @@
 // Endpoints:
 //   GET /            the wall board (live: the page is pushed when a bay changes)
 //   GET /bays        {success, clock, bays: [...]}                       ?bays=1,2,3 for some of them
+//   GET /picks       {success, clock, orders: [{orderno, loccode, lines}]}  every open order's pick lines (pick_open)
 //   GET /stream      server-sent events: "snapshot" once, then "change" {clock, rows, gone} whenever the Thing
-//                    changes, "ping" while it does not.  ?kind=bays
+//                    changes, "ping" while it does not.  ?kind=bays or ?kind=picks
 //   GET /dockauth    the key check atl's nginx asks before every request (204 / 401)
 //   GET /health
 
 import "lib/views.gr"
+import "lib/pick_sql.gr"
 
 fn env(name, fallback) {
   let v = getenv(name)
@@ -43,7 +45,9 @@ fn db_open() { return db_connect(DB_CFG.host, DB_CFG.port, DB_CFG.user, DB_CFG.p
 // warehouse, ~450 a minute, and each reaction holds the engine's one Things lock (~300 ms a reaction on atl), so
 // every other Thing's readers - this board, the touches report - stalled 4-16 s at a time. The bays change a few
 // times a minute.
-let KINDS = {"bays": "dock_bay"}
+let KINDS = {"bays": "dock_bay", "picks": "pick_open"}
+// the column that names a row of each kind (a stream's `gone` lists these)
+let KEY_COL = {"bays": "bay", "picks": "orderno"}
 
 // The screens are served from Cleve's own hosts and read this one. The host already puts
 // Access-Control-Allow-Origin on a JSON answer and Cache-Control on a stream; adding either again sends it twice,
@@ -71,6 +75,91 @@ fn strip(row) {
   return row
 }
 
+// ---- Picks: an order's lines as apir/oms/picking hands them to the pick screens -----------------------------------
+
+// What a pick line needs from outside the Thing, read once per answer: ship-via names, PickToBin, today.
+fn pick_context(c) {
+  let ctx = {"shipvia": {}, "picktobin": "", "today": date_format(now(), "%Y-%m-%d")}
+  let sh = db_query(c, "SELECT shipper_id, shippername FROM shippers", [])
+  if sh.ok { for r in sh.records { ctx.shipvia[str(r.shipper_id)] = str(r.shippername ?? "") } }
+  let pb = db_query(c, "SELECT value FROM setting WHERE `key` = 'PickToBin' LIMIT 1", [])
+  if pb.ok and len(pb.records) > 0 { ctx.picktobin = trim(str(pb.records[0].value ?? "")) }
+  return ctx
+}
+
+// "YYYY-MM-DD..." as m/d/Y (date_format_short); "" when unset
+fn mdy(v) {
+  let t = str(v ?? "")
+  if len(t) < 10 or slice(t, 0, 4) == "0000" { return "" }
+  return slice(t, 5, 7) + "/" + slice(t, 8, 10) + "/" + slice(t, 0, 4)
+}
+
+// "YYYY-MM-DD HH:MM:SS" as m/d/Y h:i A (date_time_format_short)
+fn mdy_hm(v) {
+  let t = str(v ?? "")
+  if len(t) < 16 or slice(t, 0, 4) == "0000" { return "" }
+  let h = int(slice(t, 11, 13))
+  let ap = h >= 12 ? "PM" : "AM"
+  let h12 = h % 12 == 0 ? 12 : h % 12
+  return mdy(t) + " " + (h12 < 10 ? "0" : "") + str(h12) + ":" + slice(t, 14, 16) + " " + ap
+}
+
+fn days_between(from_ymd, to_v) {
+  let t = str(to_v ?? "")
+  if len(t) < 10 or slice(t, 0, 4) == "0000" { return 0.0 }
+  return (date_parse(slice(t, 0, 10)) - date_parse(from_ymd)) / 86400.0
+}
+
+// One order (a pick_open row) as the lines index() would list - the same fields, worked out the same way - plus
+// `open`: false for a line already picked in full (index() leaves those out; a screen opening fresh does too).
+fn pick_lines(order, ctx) {
+  let lines = type(order.lines) == "string" ? (json_parse(order.lines) ?? []) : (order.lines ?? [])
+  let notes = str(order.notes ?? "")
+  let asap = index_of(notes, "Ship ASAP") >= 0
+  let branch = str(order.has_branch ?? "1") == "1"
+  let wanted = branch ? mdy(order.deliverydate) : ""
+  let fillable = to_number(str(order.fillable ?? "0"))
+  let out = []
+  for l in lines {
+    let qoh = real(l.qoh ?? 0)
+    let pick = real(l.pick ?? 0)
+    let picked = real(l.picked ?? 0)
+    let notfillable = true
+    if qoh >= pick { notfillable = fillable < 0 }
+    if notfillable and picked == pick { notfillable = false }
+    l.shipvia = ctx.shipvia[str(order.shipvia)]
+    l.sortvalue = (asap ? "0" : "1000") + str(l.pick_id) + str(l.bin ?? "")
+    l.date_created = mdy_hm(l.date_created)
+    l.date_wanted = wanted != "" ? wanted : mdy(ctx.today)
+    l.debtorno = str(order.debtorno ?? "")
+    l.branchcode = str(order.branchcode ?? "")
+    l.completed = pick == picked
+    l.zone = nil
+    l.customer = branch ? str(order.customer ?? "") : nil
+    l.city = branch ? str(order.city ?? "") : nil
+    l.route = branch ? str(order.route ?? "") : nil
+    l.notes = notes
+    l.ordertype = l.type
+    l.qoh = qoh
+    l.ordered = real(l.ordered ?? 0)
+    l.pick = pick
+    l.picked = picked
+    l.loaded = real(l.loaded ?? 0)
+    l.notfillable = notfillable
+    l.pick_to_bin = ctx.picktobin
+    l.pick_complete = picked == pick
+    l.partial_pick = picked < pick and picked > 0
+    l.info = {"daystilldue": int(days_between(ctx.today, order.deliverydate))}
+    l.open = picked < pick
+    push(out, l)
+  }
+  return out
+}
+
+fn pick_order(order, ctx) {
+  return {"orderno": str(order.orderno), "loccode": str(order.loccode ?? ""), "lines": pick_lines(order, ctx)}
+}
+
 fn json_res(status, body) {
   return {"status": status, "content_type": "application/json; charset=utf-8", "headers": JSON_HEADERS, "json": body}
 }
@@ -90,6 +179,10 @@ fn clock_of(c, thing) {
 // landing between the two is announced again rather than lost.
 fn read_rows(c, thing, ks) {
   let rows = ks == nil ? thing_rows(c, thing) : thing_rows(c, thing, ks)
+  if thing == "pick_open" {
+    let ctx = pick_context(c)
+    return map(rows, fn (r) { return pick_order(r, ctx) })
+  }
   return map(rows, strip)
 }
 
@@ -140,6 +233,20 @@ fn handle_bays(req) {
   return json_res(200, {"success": true, "clock": clock, "bays": bay_sort(got.value)})
 }
 
+// GET /picks: every open order's lines (?loccode=01 for one warehouse), as {success, clock, orders: [...]}
+fn handle_picks(req) {
+  let q = req.query_params ?? {}
+  let loc = trim(str(q.loccode ?? ""))
+  let c = db_open()
+  if not c.ok { return json_res(503, {"success": false, "message": "no database: " + c.error}) }
+  let clock = clock_of(c, "pick_open")
+  let got = pcall(read_rows, c, "pick_open", nil)
+  db_close(c)
+  if not got.ok { return json_res(503, {"success": false, "message": str(got.error)}) }
+  let orders = loc == "" ? got.value : filter(got.value, fn (o) { return o.loccode == loc })
+  return json_res(200, {"success": true, "clock": clock, "orders": orders})
+}
+
 // GET /stream: the Thing's rows once, then each change as it lands. The engine wakes the WAIT THING when it commits
 // a change (no polling here or in the browser); `changed` names the keys, which are read and sent - a key that is
 // no longer a Thing (a pick invoiced, a bay emptied of its row) is sent in `gone`. EventSource reconnects on its
@@ -152,7 +259,7 @@ fn handle_stream(req, writer) {
   writer.header("X-Accel-Buffering", "no")
   if thing == nil {
     writer.status(400)
-    writer.write_sse({"event": "error", "data": {"message": "kind is bays"}})
+    writer.write_sse({"event": "error", "data": {"message": "kind is bays or picks"}})
     return nil
   }
   let c = db_open()
@@ -192,7 +299,7 @@ fn handle_stream(req, writer) {
     let got = pcall(read_rows, c, thing, changed)
     if not got.ok { break }
     let present = {}
-    let id = kind == "bays" ? "bay" : "pick_id"
+    let id = KEY_COL[kind]
     for row in got.value { present[str(row[id])] = true }
     let gone = filter(map(changed, str), fn (k) { return not has(present, k) })
     writer.write_sse({"event": "change", "data": {"kind": kind, "clock": clock, "rows": got.value, "gone": gone}})
@@ -234,6 +341,7 @@ ui.pane({
     "/health": handle_health,
     "/dockauth": handle_auth,
     "/bays": handle_bays,
+    "/picks": handle_picks,
     "/stream": handle_stream
   }
 })

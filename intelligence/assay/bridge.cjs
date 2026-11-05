@@ -56,16 +56,24 @@ function loadConfig() {
   for (const f of files) {
     try { Object.assign(cfg, JSON.parse(fs.readFileSync(f, 'utf8'))); break; } catch { /* next */ }
   }
-  // aos.conf is this machine's choice and outranks the assay-wide default it
-  // inherited; an explicit AIOS_* in the environment still outranks both.
+  // The assay config is another tool's setup. It may supply credentials and
+  // per-provider hosts for a provider this machine was told to use, but never
+  // the provider or the model: those are this machine's own choice (aos.conf
+  // or AIOS_*), and a machine nobody configured must not send what it is asked
+  // to whichever provider that file happens to name.
+  const assayProvider = cfg.provider;
+  delete cfg.provider; delete cfg.model;
+  // aos.conf is this machine's choice; an explicit AIOS_* in the environment
+  // still outranks it.
   const mc = loadMachineConf();
-  const configuredProvider = mc.AOS_PROVIDER || cfg.provider;   // the provider any host left in the config belongs to
+  const configuredProvider = mc.AOS_PROVIDER || assayProvider;   // the provider any host left in the config belongs to
   if (mc.AOS_PROVIDER) cfg.provider = mc.AOS_PROVIDER;
   if (mc.AOS_MODEL) cfg.model = mc.AOS_MODEL;
   if (mc.AOS_MODEL_HOST) cfg.host = mc.AOS_MODEL_HOST;
   // A host carried over from the assay default belongs to that provider, not
   // to the one aos.conf just named.
   if (mc.AOS_PROVIDER && !mc.AOS_MODEL_HOST && cfg.provider !== 'ollama') delete cfg.host;
+  if (mc.AOS_PROVIDER && cfg.provider !== assayProvider && cfg.provider === 'ollama' && !mc.AOS_MODEL_HOST) delete cfg.host;   // the assay config's host belongs to the assay provider
   // The CLIs this machine thinks with live in the user's own bin, which a
   // systemd unit's sanitised PATH does not include.
   if (mc.AOS_PATH && !String(process.env.PATH || '').includes(mc.AOS_PATH.split(':')[0]))
@@ -112,7 +120,7 @@ const SYSTEM = [
 
 async function think(contextBytes) {
   if (!providers) throw new Error('assay providers.cjs not found (set ASSAY_ROOT or ASSAY_PROVIDERS)');
-  if (!cfg || !cfg.provider || !cfg.model) throw new Error('no model configured: ~/.assay/config.json or AIOS_MODEL_PROVIDER/AIOS_MODEL/AIOS_MODEL_HOST/AIOS_MODEL_KEY');
+  if (!cfg || !cfg.provider || !cfg.model) throw new Error('no model configured: set AOS_PROVIDER and AOS_MODEL in aos.conf (mind set <provider> <model>) or AIOS_MODEL_PROVIDER/AIOS_MODEL in the environment');
   const text = contextBytes.toString('utf8');
   const res = await providers.callModel({
     provider: cfg.provider, model: cfg.model, host: cfg.host, apiKey: cfg.apiKey,

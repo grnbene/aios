@@ -15,10 +15,11 @@ let ITEM_COST = "CASE WHEN s.materialcost + s.labourcost + s.overheadcost = 0 TH
 let COUNTS_ON_HAND = "(k.loccode <> (SELECT TransferWarehouse FROM companies LIMIT 1) AND k.bin <> COALESCE((SELECT confvalue FROM config WHERE confname = 'HoldingBin'), ''))"
 
 // The ERP's discounted line amount (the stocktrans view, migrations/stocktrans_decimal_line_math.sql): the price
-// rounded to cents, less its discount rounded to cents, times the quantity, rounded to cents.
+// rounded to cents, less its discount rounded to cents, times the quantity, rounded to cents. A missing discount
+// (stockmoves.discountpercent is nullable: seven $0 lines of March 2026) is no discount, so the line is 0, not null.
 fn line_amount_sql(price, disc, qty) {
   let p = "ROUND(CAST(" + price + " AS DECIMAL(20,6)), 2)"
-  let unit = "ROUND(" + p + " - ROUND(" + p + " * ROUND(CAST(" + disc + " AS DECIMAL(20,10)), 4), 2), 2)"
+  let unit = "ROUND(" + p + " - ROUND(" + p + " * ROUND(CAST(COALESCE(" + disc + ", 0) AS DECIMAL(20,10)), 4), 2), 2)"
   return "ROUND(" + unit + " * CAST(" + qty + " AS DECIMAL(20,6)), 2)"
 }
 
@@ -103,6 +104,10 @@ let ENTITIES = {
       ["commission_rate", "d.commpct", "num"],
       ["target_potential", "d.targetpotential", "money"],
       ["estimated_potential", "d.estimatedpotential", "money"],
+      ["po_required", "d.customerpoline", "bool"],
+      ["ar_interest_rate", "d.arintrate", "rate"],
+      ["aboriginal", "d.aboriginal", "bool"],
+      ["has_web_account", "d.hasprofile", "bool"],
       ["is_active", "d.isactive", "bool"]
     ],
     "extra": [
@@ -111,7 +116,16 @@ let ENTITIES = {
       ["total_spend", "money"], ["first_purchase_date", "date"], ["last_purchase_date", "date"], ["months_active", "int"],
       ["avg_monthly_sales", "money"], ["avg_monthly_units", "num"], ["units_sold", "num"], ["units_returned", "num"],
       ["return_rate", "rate"], ["avg_invoice_last_365", "money"], ["invoices_last_365", "int"],
-      ["top_brand_1", "text"], ["top_brand_2", "text"], ["top_brand_3", "text"]
+      ["top_brand_1", "text"], ["top_brand_2", "text"], ["top_brand_3", "text"],
+      ["sales_mtd", "money"], ["sales_ytd", "money"], ["sales_last_year_ytd", "money"], ["sales_last_year", "money"],
+      ["sales_last_12_months", "money"],
+      ["aging_future", "money"], ["aging_current", "money"], ["aging_0_29", "money"], ["aging_30_59", "money"],
+      ["aging_60_89", "money"], ["aging_90_plus", "money"],
+      ["main_location_id", "id"], ["location_count", "int"], ["salesperson_id", "id"], ["salesperson_name", "text"],
+      ["phone", "text"], ["email", "text"], ["contact_name", "text"], ["area_id", "id"], ["area", "text"],
+      ["territory_id", "id"], ["territory", "text"],
+      ["open_orders", "int"], ["open_quotes", "int"], ["last_web_login", "datetime"], ["reward_points", "int"],
+      ["clubs", "text"]
     ]
   },
 
@@ -129,6 +143,23 @@ let ENTITIES = {
       ["phone", "c.phoneno", "text"],
       ["email", "c.email", "text"],
       ["note", "c.notes", "text"]
+    ]
+  },
+
+  "customer_clubs": {
+    "description": "Club and loyalty programs each customer has joined (the Clubs Joined on the ERP's customer card).",
+    "from": "clubs_joined j LEFT JOIN clubs c ON c.id = j.clubid",
+    "key": ["membership_id"],
+    "filters": {"customer_id": "j.cust_id"},
+    "fields": [
+      ["membership_id", "j.id", "nid"],
+      ["customer_id", "j.cust_id", "id"],
+      ["location_id", "j.branchcode", "id"],
+      ["club_id", "j.clubid", "id"],
+      ["club", "c.club", "text"],
+      ["club_name_on_join", "j.club_joined", "text"],
+      ["level", "j.club_level", "text"],
+      ["member_no", "j.accountid", "text"]
     ]
   },
 
@@ -169,6 +200,14 @@ let ENTITIES = {
       ["longitude", "b.lng", "num"],
       ["phone", "b.phoneno", "text"],
       ["phone_alt", "b.phoneno_alt", "text"],
+      ["phone_alt2", "b.altphone1", "text"],
+      ["phone_alt3", "b.altphone2", "text"],
+      ["mail_address_line1", "b.brpostaddr1", "text"],
+      ["mail_address_line2", "b.brpostaddr2", "text"],
+      ["mail_city", "b.brpostaddr3", "text"],
+      ["mail_region", "b.brpostaddr4", "text"],
+      ["mail_postal_code", "b.brpostaddr5", "text"],
+      ["mail_country", "b.brpostaddr6", "text"],
       ["fax", "b.faxno", "text"],
       ["email", "b.email", "text"],
       ["contact_name", "b.contactname", "text"],
@@ -664,7 +703,7 @@ let LOOKUPS = {
 
 // The order the documentation lists the entities in, by area.
 let ENTITY_GROUPS = [
-  ["Customers", ["customers", "customer_locations"]],
+  ["Customers", ["customers", "customer_locations", "customer_contacts", "customer_clubs", "customer_notes"]],
   ["Sales", ["sales_orders", "sales_order_lines"]],
   ["Receivables", ["invoices", "credit_notes", "payments", "customer_transactions", "invoice_lines", "allocations", "receivables"]],
   ["Salespeople", ["salespeople"]],
@@ -700,6 +739,73 @@ let FIELD_NOTES = {
   "customers.parent_customer_id": "The head-office account this customer rolls up to, if any.",
   "customers.license_no": "The customer's cosmetology licence number.",
   "customers.is_active": "False when the account has been closed.",
+  "customers.email_statements": "Statements are emailed (the card's Email Statement).",
+  "customers.print_statements": "Statements are printed and mailed (the card's Print Statement).",
+  "customers.email_invoices": "Invoices are emailed (the card's Email Invoice).",
+  "customers.refused_email": "The customer has asked for no email (the card's REFUSED EMAIL).",
+  "customers.signed_contract": "Whether the customer signed KM's contract (Yes / No).",
+  "customers.price_list2_id": "A second price list (lookups: price_lists), when the account has one.",
+  "customers.discount_level": "The account's discount level (the card's Discount Level).",
+  "customers.prompt_payment_discount": "Prompt-payment discount, a fraction.",
+  "customers.commission_rate": "The account's commission rate as the ERP stores it (the card's Commission Rate).",
+  "customers.target_potential": "Sales potential set as a target on the account (the card's Target Potential).",
+  "customers.estimated_potential": "Estimated sales potential (the card's Est Potential).",
+  "customers.last_receipt_amount": "The latest payment's amount (the card's Last Paid).",
+  "customers.total_spend": "Every printed invoice and credit line, net of credits, after line discounts, before tax and freight (the card's Total Spend). Kept up to date by the ASQL Thing kmdata_customer_sales.",
+  "customers.first_purchase_date": "The first invoice line's date.",
+  "customers.last_purchase_date": "The latest invoice line's date. A credit note is not a purchase (the ERP card's Last Purchase counts credits too).",
+  "customers.months_active": "Calendar months with at least one invoice or credit line.",
+  "customers.avg_monthly_sales": "total_spend / months_active (the card's Avg Monthly Sales).",
+  "customers.avg_monthly_units": "Units sold less units returned, / months_active (the card's Avg Monthly Qty).",
+  "customers.units_sold": "Units invoiced, all time.",
+  "customers.units_returned": "Units credited back, all time.",
+  "customers.return_rate": "units_returned / units_sold (the card's Return %, as a fraction).",
+  "customers.avg_invoice_last_365": "Average invoice before tax and freight over the last 365 days (the card's Avg Order L365).",
+  "customers.invoices_last_365": "Invoices in the last 365 days.",
+  "customers.top_brand_1": "The brand with the most units bought in the last 365 days (the card's Most Purchased Brands); top_brand_2 and top_brand_3 follow.",
+  "customers.po_required": "The customer requires a PO number on each order line.",
+  "customers.ar_interest_rate": "Interest charged on overdue balances, a fraction (0.02 is 2%).",
+  "customers.aboriginal": "Indigenous tax-exempt status on the account (debtorsmaster.aboriginal).",
+  "customers.has_web_account": "The customer has a web store account.",
+  "customers.sales_mtd": "Sales this month to today, on the total_spend basis (net of credits, before tax and freight).",
+  "customers.sales_ytd": "Sales 1 January to today.",
+  "customers.sales_last_year_ytd": "Sales last year from 1 January to this day last year: the comparison for sales_ytd.",
+  "customers.sales_last_year": "Sales in all of last year.",
+  "customers.sales_last_12_months": "Sales from the day after this day last year to today.",
+  "customers.aging_future": "Open amount due in more than 30 days. The six aging_ fields add up to balance, as /v1/receivables buckets each item.",
+  "customers.aging_current": "Open amount due within 30 days, or with no due date (open credits and unapplied payments, negative, usually land here).",
+  "customers.aging_0_29": "Open amount 0-29 days past due.",
+  "customers.aging_30_59": "Open amount 30-59 days past due.",
+  "customers.aging_60_89": "Open amount 60-89 days past due.",
+  "customers.aging_90_plus": "Open amount 90 or more days past due.",
+  "customers.main_location_id": "The account's main ship-to: the location coded as the account number, else its lowest location code. salesperson, phone, email, contact_name, area and territory are that location's.",
+  "customers.location_count": "Ship-to locations on the account (customer_locations).",
+  "customers.salesperson_id": "The rep on the main ship-to (salespeople); each location can have its own (customer_locations).",
+  "customers.open_orders": "Orders with a line not yet completed, cancelled orders left out (the card's Open Orders count).",
+  "customers.open_quotes": "Quotes with a line not yet completed (the card's Open Quotes count).",
+  "customers.last_web_login": "When the customer last logged in to the web store.",
+  "customers.reward_points": "Loyalty points balance (earned less spent). KM's ERP has the loyalty program switched off (LoyaltyPointsActive 0), so its card shows 0.",
+  "customers.clubs": "Clubs joined, as 'club: member number', comma-separated (customer_clubs has one row each).",
+  "customer_locations.mail_address_line1": "The location's mailing address, where it differs from the ship-to address (the mail_ fields).",
+  "customer_contacts.roles": "The contact's roles as the ERP stores them (JSON).",
+  "customer_notes.code": "The note's kind (ORDER, CREDIT, ...).",
+  "sales_orders.price_list_id": "The price list the order was priced from (lookups: price_lists).",
+  "sales_orders.placed_from": "Where the order was entered, as the ERP codes it (4 is online).",
+  "sales_orders.quote_no": "The quote the order came from.",
+  "sales_orders.taken_by": "The ERP user who last edited the order.",
+  "sales_orders.sales_note": "Internal sales note.",
+  "sales_orders.additional_charge": "An extra charge added to the order (additional_charge_text says what); not in total.",
+  "sales_orders.line_count": "Lines on the order.",
+  "sales_orders.lines_subtotal": "Every line's qty_ordered x discounted price, before tax (sales_order_lines.line_amount added up).",
+  "sales_orders.open_subtotal": "What is not yet invoiced on open lines, before tax (the ERP's Open Orders list).",
+  "sales_orders.subtotal": "The subtotal saved with the order when it was last saved (the ERP's Order Inquiry); null if none was saved.",
+  "sales_orders.shipping": "Shipping saved with the order.",
+  "sales_orders.tax": "Tax saved with the order, every tax line added.",
+  "sales_orders.total": "The total saved with the order: subtotal + shipping + tax.",
+  "sales_order_lines.qty_outstanding": "Not yet invoiced on an open line; 0 once the line is completed.",
+  "sales_order_lines.open_amount": "qty_outstanding x discounted price, before tax.",
+  "sales_order_lines.fee": "A per-unit fee charged on the line (the ERP's FET charge).",
+  "sales_order_lines.parent_line_no": "The line this one belongs to (a kit's component), if any.",
   "customer_locations.disabled": "True when no new orders may be taken for this location.",
   "customer_locations.warehouse_id": "The warehouse this location ships from by default.",
   "customer_locations.price_level": "The location's own price level, when it differs from the account's.",

@@ -20,7 +20,7 @@ All need `Authorization: Bearer <key>` except `/health`.
 | `GET /v1/sales_by_salesperson?from=&to=` | net sales (invoices less credits, before tax and freight) per rep per day; at most 1,096 days (3 years) |
 | `GET /health` | whether the replica is reachable and how far behind it is |
 
-Entities: `customers`, `customer_locations`, `sales_orders`, `sales_order_lines`, `invoices`, `credit_notes`,
+Entities: `customers`, `customer_locations`, `customer_contacts`, `customer_notes`, `sales_orders`, `sales_order_lines`, `invoices`, `credit_notes`,
 `payments`, `customer_transactions`, `invoice_lines`, `allocations`, `receivables`, `salespeople`, `vendors`,
 `vendor_transactions`, `items`, `item_prices`, `inventory_levels`, `inventory_movements`, `purchase_orders`,
 `purchase_order_lines`, `receipts`.
@@ -41,8 +41,14 @@ free-goods line), dates are `YYYY-MM-DD`, date-times `YYYY-MM-DDTHH:MM:SS` (East
 
 `receivables` is every open customer item (total less applied not zero), with `days_overdue` and
 `aging_bucket` (`not_due`, `0_29`, `30_59`, `60_89`, `90_plus`) worked out on today's date against the due
-date, as the ERP's aged analysis does. `customers` carries `balance`, `lifetime_invoiced` and first and last
-invoice and receipt dates from the ASQL Thing `kmdata_customer_balance`.
+date, as the ERP's aged analysis does. `customers` carries what the ERP's Customer Info card shows: `balance`, `lifetime_invoiced` and first and
+last invoice and receipt dates from the ASQL Thing `kmdata_customer_balance`; total spend, purchase dates, monthly
+averages and return rate from the Thing `kmdata_customer_sales`; sales MTD / YTD / last year YTD / last year / last
+12 months from the Thing `kmdata_customer_periods`; aging buckets that add up to `balance` from the Thing
+`kmdata_customer_aging`; last payment, average invoice and top three brands over the last 365 days, the main
+ship-to's rep and contact, open order and quote counts, last web login, reward points and clubs, worked out per page.
+The full 5,000-customer page takes 0.5 s on full km (4.1 s when periods and aging were worked out per page). `sales_orders` carries the order's line totals and the subtotal, shipping,
+tax and total saved with it. `allocations` names both documents of each application (type, number, date).
 
 ## Where each figure comes from in the ERP
 
@@ -56,6 +62,9 @@ compared with that code's own SQL run on the same data (km copy to 2026-10-30):
 | `customers.balance` | sum of the open items above | equals the receivables total ($313,341.61) |
 | `invoice_lines.line_amount` | the stocktrans view's rounding (`migrations/stocktrans_decimal_line_math.sql`); printed lines only (`show_on_inv_crds = 1`); a write-off credit shows its positive line only (`controller/apir/documents/credits.php`) | lines add to the header subtotal on 2,454 of 2,459 documents (Sep-Oct); the 5 others are 1-5 cent header rounding |
 | `sales_by_salesperson` | the km `stocktrans` view, which the ERP's sales reports read (`model/reports/report.php` getSRPT / getSPSLS); reproduced join for join, since ASQL replicates tables, not views. As the view does, it leaves out lines whose item has no preferred purchdata row or whose preferred supplier does not exist (ZZZSWITCHOUT switch-out credits, blank-SKU lines) and counts an item once per brand row | September 2026 on aar's replica vs live `stocktrans`: all 13 reps equal to the cent on sales, cost and units ($649,844.91); October checked the same way on live km |
+| `customers.total_spend`, `avg_monthly_sales`, `avg_monthly_units`, `return_rate`, `last_purchase_date` | the card's Total Spend / Avg Monthly Sales / Qty / Return % / Last Purchase (`controller/apir/customers.php` getcustomer, `model/weberp/customer.php`), which read `stocktrans`: printed type 10/11 lines with their ledger document, the view's item exclusions and line rounding. Two of the view's joins are left out so the Thing reads only per-customer tables: the item/supplier/brand joins (a Thing reading them is rebuilt whole, 5-10 s inside the replicating write, on any item or cost change) and the ledger join's fan-out (`R0001` document 565595 has 62 ledger rows, so the view counts each of its 62 lines 62 times) | customer 00048 on the 10-30 copy: $84,578.26, equal to the view's joins; Thing reacts to a ledger change (one invoice unhooked: -$1,517.50, restored) |
+| `customers.last_receipt_amount`, `avg_invoice_last_365`, `top_brand_1..3` | `customer.php` getLastPaid, getAvgSpend, getTopThreeBrandsAsArray | same expressions |
+| `sales_orders.subtotal` / `shipping` / `tax` / `total` | `salesorders.payment_details`, saved from the cart's totals (`controller/apir/cart.php`), what Order Inquiry shows; `open_subtotal` is the Open Orders list's basis (`model/oms/orders.php` getOrderTotals) | order 1667135: lines $1,517.50 = saved subtotal = invoice 1803123 |
 | `items.unit_cost` | `model/weberp/items.php` getItem / getValuation (material + labour + overhead, else lastcost) | same expression |
 | `items.qty_on_hand` | `items.php` getItemStock (no transfer warehouse, no PO holding bin) | valuation report counts the holding bin too: $10,398.70 / 2,235 units on ZPOREQ, the whole difference |
 | `items.qty_on_open_orders` | `items.php` getItemDemand | equal, less 14 units on order lines with a blank SKU |
@@ -99,4 +108,13 @@ Secrets: `ASQL_PASSWORD`, `KMDATA_KEYS` (comma-separated keycodes).
    ```
 3. nginx: proxy a path on the API's HTTPS host to `127.0.0.1:8595`.
 
-`deployed.gr` creates the `kmdata_customer_balance` Thing on first deploy and leaves it in place after.
+`deployed.gr` creates the `kmdata_customer_balance`, `kmdata_customer_sales`, `kmdata_customer_periods` and
+`kmdata_customer_aging` Things (`lib/things.gr`) on first deploy and leaves them in place after; one whose definition
+changed is rebuilt (on full km: sales about 6 s, periods 4.4 s, aging 3.3 s). Periods and aging read `CURDATE()`, so
+ASQL works each out whole once a new day starts, and per customer on every change in between. On the full km copy a
+single stockmoves write for a customer took about 0.3 s more with the periods Thing (its ledger check reads
+debtortrans whole); a debtortrans write on the cash account 99999 (263,000 rows) about 0.1 s more with aging.
+
+On aar, `CDC_TABLES` must also carry `config`, `po_status`, `product_types`, `quotes`, `quote_details`, `customer_login`,
+`loyaltytrans` and `clubs` (besides `apikeys`): items, inventory_levels, purchase_orders, lookups, customers and
+customer_clubs read them, and aar did not replicate them on 2026-11-05.

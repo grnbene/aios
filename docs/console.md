@@ -674,7 +674,7 @@ FAILED: unsupported: the resident 'mind' is bound to the echo reference, which c
 With the bridge and nothing configured it fails outright:
 
 ```
-error: io-error: the mind failed during cycle 1: think: peer error: no model configured: ~/.assay/config.json or AIOS_MODEL_PROVIDER/AIOS_MODEL/AIOS_MODEL_HOST/AIOS_MODEL_KEY
+error: io-error: the mind failed during cycle 1: think: peer error: no model configured: set AOS_PROVIDER and AOS_MODEL in aos.conf (mind set <provider> <model>) or AIOS_MODEL_PROVIDER/AIOS_MODEL in the environment
 ```
 
 `aos ask "<question>"` is `aos send "ask <question>"`.

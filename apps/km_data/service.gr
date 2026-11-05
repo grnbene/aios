@@ -232,7 +232,8 @@ fn thing_rows(db, name, definition) {
   return by
 }
 
-fn days_ago(n) { return date_format(date_parse(today()) - n * 86400, "%F", "local") }
+// today's date less n days, as YYYY-MM-DD (date_parse reads the date as UTC midnight, so it is written back in UTC)
+fn days_ago(n) { return date_format(date_parse(today()) - n * 86400, "%F", "utc") }
 
 fn customer_balances(db, rows) {
   if len(rows) == 0 { return rows }
@@ -243,28 +244,30 @@ fn customer_balances(db, rows) {
     by = {}
     for b in q(db, BALANCE_SQL + " WHERE debtortrans.debtorno IN (?) GROUP BY debtortrans.debtorno", [ids]).records { by[str(b.debtorno)] = b }
   }
-  let sales = thing_rows(db, SALES_THING, SALES_DEFINITION)
-  if sales == nil {
-    sales = {}
-    for b in q(db, SALES_BODY + " AND m.debtorno IN (?) GROUP BY debtorno", [ids]).records { sales[str(b.debtorno)] = b }
-  }
+  let sales = customer_thing(db, SALES_THING, SALES_DEFINITION, SALES_BODY, "m.debtorno", ids)
   // the latest receipt's amount (the ERP card's Last Paid, model/weberp/customer.php getLastPaid: newest trandate, then id)
   let paid = {}
+  let pargs = []
+  let pf = page_filter("debtorno", ids, pargs)
   for p in q(db, "SELECT t.id, t.debtorno, -(t.ovamount + t.ovgst + t.ovdiscount + t.ovfee) AS amount FROM debtortrans t " +
-                 "JOIN (SELECT debtorno, MAX(trandate) AS last FROM debtortrans WHERE type = 12 AND debtorno IN (?) GROUP BY debtorno) x " +
-                 "ON x.debtorno = t.debtorno AND x.last = t.trandate WHERE t.type = 12", [ids]).records {
+                 "JOIN (SELECT debtorno, MAX(trandate) AS last FROM debtortrans WHERE type = 12" + pf + " GROUP BY debtorno) x " +
+                 "ON x.debtorno = t.debtorno AND x.last = t.trandate WHERE t.type = 12", pargs).records {
     let k = str(p.debtorno)
     if paid[k] == nil or to_number(p.id) > to_number(paid[k].id) { paid[k] = p }
   }
   // Avg Order (L365) on the card (customer.php getAvgSpend): invoices' ovamount, DATEDIFF(NOW(), trandate) < 365
   let recent = {}
-  for a in q(db, "SELECT debtorno, AVG(ovamount) AS avg_amount, COUNT(*) AS n FROM debtortrans WHERE type = 10 AND trandate >= ? " +
-                 "AND debtorno IN (?) GROUP BY debtorno", [days_ago(364), ids]).records { recent[str(a.debtorno)] = a }
+  let rargs = [days_ago(364)]
+  let rf = page_filter("debtorno", ids, rargs)
+  for a in q(db, "SELECT debtorno, AVG(ovamount) AS avg_amount, COUNT(*) AS n FROM debtortrans WHERE type = 10 AND trandate >= ?" + rf +
+                 " GROUP BY debtorno", rargs).records { recent[str(a.debtorno)] = a }
   // Most Purchased Brands (L365) (customer.php getTopThreeBrandsAsArray): units sold per brand, last 365 days
   let brands = {}
+  let bargs = [days_ago(365)]
+  let bf = page_filter("m.debtorno", ids, bargs)
   for x in q(db, "SELECT m.debtorno, mf.name, -SUM(m.qty) AS units FROM stockmoves m JOIN product_to_manufacturer p ON p.stockid = m.stockid " +
-                 "JOIN manufacturer mf ON mf.manufacturer_id = p.manufacturer_id WHERE m.trandate >= ? AND m.qty < 0 AND m.debtorno IN (?) " +
-                 "GROUP BY m.debtorno, mf.name", [days_ago(365), ids]).records {
+                 "JOIN manufacturer mf ON mf.manufacturer_id = p.manufacturer_id WHERE m.trandate >= ? AND m.qty < 0" + bf +
+                 " GROUP BY m.debtorno, mf.name", bargs).records {
     let k = str(x.debtorno)
     if brands[k] == nil { brands[k] = [] }
     push(brands[k], {"name": str(x.name), "units": to_number(x.units)})
@@ -289,7 +292,7 @@ fn customer_balances(db, rows) {
     let a = recent[r.customer_id]
     r["avg_invoice_last_365"] = a == nil ? nil : out_value(a.avg_amount, "money")
     r["invoices_last_365"] = a == nil ? 0 : int(to_number(a.n))
-    let top = brands[r.customer_id] == nil ? [] : sort_by(brands[r.customer_id], fn (x) { return [-x.units, x.name] })
+    let top = brands[r.customer_id] == nil ? [] : sort_by(brands[r.customer_id], fn (x) { return [-real(x.units), x.name] })   // real: older sort_by cannot order decimals
     for i in [0, 1, 2] { r["top_brand_" + str(i + 1)] = i < len(top) ? top[i].name : nil }
   }
   for r in rows {
@@ -301,7 +304,127 @@ fn customer_balances(db, rows) {
     r["last_invoice_date"] = b == nil ? nil : out_value(b.last_invoice_date, "date")
     r["last_receipt_date"] = b == nil ? nil : out_value(b.last_receipt_date, "date")
   }
+  customer_period_sales(db, rows, ids)
+  customer_aging(db, rows, ids)
+  customer_profile(db, rows, ids)
   return rows
+}
+
+// "AND <column> IN (?)" for a page of up to 200 customers. A bigger page reads every customer's rows and keeps its
+// own: these queries are cheaper over the whole table than through a list of thousands (period sales over full km:
+// 0.9 s whole, 3.1 s through 5,444 ids).
+fn page_filter(column, ids, args) {
+  if len(ids) > 200 { return "" }
+  push(args, ids)
+  return " AND " + column + " IN (?)"
+}
+
+// A customer Thing's rows by customer, or (while the Thing is missing, still building or an older definition) its
+// query run for the page's customers. body is the Thing's SELECT up to its WHERE; column is its customer column.
+fn customer_thing(db, name, definition, body, column, ids) {
+  let by = thing_rows(db, name, definition)
+  if by != nil { return by }
+  by = {}
+  let args = []
+  for x in q(db, body + page_filter(column, ids, args) + " GROUP BY debtorno", args).records { by[str(x.debtorno)] = x }
+  return by
+}
+
+// Sales by period (lib/things.gr PERIODS_THING): month, year and last year to date, last year, last 12 months.
+fn customer_period_sales(db, rows, ids) {
+  let by = customer_thing(db, PERIODS_THING, PERIODS_DEFINITION, PERIODS_BODY, "m.debtorno", ids)
+  for r in rows {
+    let x = by[r.customer_id]
+    for f in ["sales_mtd", "sales_ytd", "sales_last_year_ytd", "sales_last_year", "sales_last_12_months"] {
+      r[f] = x == nil ? round(0, 2) : out_value(x[f], "money")
+    }
+  }
+}
+
+// The customer's open items by aged-analysis bucket (lib/things.gr AGING_THING), adding up to its balance.
+fn customer_aging(db, rows, ids) {
+  let by = customer_thing(db, AGING_THING, AGING_DEFINITION, AGING_BODY, "t.debtorno", ids)
+  for r in rows {
+    let x = by[r.customer_id]
+    for b in ["future", "current", "0_29", "30_59", "60_89", "90_plus"] {
+      r["aging_" + b] = x == nil ? round(0, 2) : out_value(x["aging_" + b], "money")
+    }
+  }
+}
+
+// From the rest of the ERP's customer card (controller/apir/customers.php getcustomer):
+//   the main ship-to's rep, phone, email, contact, area and territory: the location whose code is the account
+//     number, else the lowest location code (158 accounts have no location coded as the account)
+//   open_orders / open_quotes: orders and quotes with an open line, cancelled orders left out (getCustomerOpenCounts)
+//   last_web_login: customer_login.date_modified for the account's web login (branch_attributes.email)
+//   reward_points: loyaltytrans points balance (model/weberp/rewards.php getCustomerPoints), whether or not the ERP's
+//     LoyaltyPointsActive setting shows it
+//   clubs: "club: member number" for each club joined, as the card lists them
+fn customer_profile(db, rows, ids) {
+  let args = []
+  let main = {}
+  let count = {}
+  for b in q(db, "SELECT b.debtorno, b.branchcode, b.salesman, s.salesmanname, b.phoneno, b.email, b.contactname, b.area, " +
+                 "a.areadescription, b.territory_id, tr.territory_name FROM custbranch b LEFT JOIN salesman s ON s.salesmancode = b.salesman " +
+                 "LEFT JOIN areas a ON a.areacode = b.area LEFT JOIN territory tr ON tr.territory_id = b.territory_id WHERE 1 = 1" +
+                 page_filter("b.debtorno", ids, args), args).records {
+    let k = str(b.debtorno)
+    count[k] = (count[k] == nil ? 0 : count[k]) + 1
+    let cur = main[k]
+    let code = str(b.branchcode)
+    if cur == nil or (code == k and str(cur.branchcode) != k) or (str(cur.branchcode) != k and code < str(cur.branchcode)) { main[k] = b }
+  }
+  args = []
+  let orders = {}
+  for x in q(db, "SELECT o.debtorno, COUNT(DISTINCT o.orderno) AS n FROM salesorderdetails l JOIN salesorders o ON o.orderno = l.orderno " +
+                 "WHERE l.completed = 0 AND o.orderstatusid NOT IN (SELECT order_status_id FROM order_status WHERE name IN ('Canceled', 'Cancelled'))" +
+                 page_filter("o.debtorno", ids, args) + " GROUP BY o.debtorno", args).records { orders[str(x.debtorno)] = int(to_number(x.n)) }
+  args = []
+  let quotes = {}
+  for x in q(db, "SELECT q.debtorno, COUNT(DISTINCT q.orderno) AS n FROM quote_details l JOIN quotes q ON q.orderno = l.orderno " +
+                 "WHERE l.completed = 0" + page_filter("q.debtorno", ids, args) + " GROUP BY q.debtorno", args).records {
+    quotes[str(x.debtorno)] = int(to_number(x.n))
+  }
+  args = []
+  let logins = {}
+  for x in q(db, "SELECT ba.debtorno, MAX(cl.date_modified) AS last FROM branch_attributes ba JOIN customer_login cl ON cl.email = ba.email " +
+                 "WHERE ba.email <> ''" + page_filter("ba.debtorno", ids, args) + " GROUP BY ba.debtorno", args).records {
+    logins[str(x.debtorno)] = x.last
+  }
+  args = []
+  let points = {}
+  for x in q(db, "SELECT debtorno, SUM(pointvalue) AS points FROM loyaltytrans WHERE 1 = 1" + page_filter("debtorno", ids, args) +
+                 " GROUP BY debtorno", args).records { points[str(x.debtorno)] = int(to_number(x.points)) }
+  args = []
+  let clubs = {}
+  for x in q(db, "SELECT j.cust_id, c.club, j.club_joined, j.accountid FROM clubs_joined j LEFT JOIN clubs c ON c.id = j.clubid " +
+                 "WHERE 1 = 1" + page_filter("j.cust_id", ids, args) + " ORDER BY j.cust_id, j.id", args).records {
+    let k = str(x.cust_id)
+    let name = x.club == nil ? str(x.club_joined) : str(x.club)
+    let member = x.accountid == nil ? "" : trim(str(x.accountid))
+    if clubs[k] == nil { clubs[k] = [] }
+    push(clubs[k], member == "" ? name : name + ": " + member)
+  }
+  for r in rows {
+    let k = r.customer_id
+    let b = main[k]
+    r["main_location_id"] = b == nil ? nil : str(b.branchcode)
+    r["location_count"] = count[k] == nil ? 0 : count[k]
+    r["salesperson_id"] = b == nil ? nil : out_value(b.salesman, "id")
+    r["salesperson_name"] = b == nil ? nil : out_value(b.salesmanname, "text")
+    r["phone"] = b == nil ? nil : out_value(b.phoneno, "text")
+    r["email"] = b == nil ? nil : out_value(b.email, "text")
+    r["contact_name"] = b == nil ? nil : out_value(b.contactname, "text")
+    r["area_id"] = b == nil ? nil : out_value(b.area, "id")
+    r["area"] = b == nil ? nil : out_value(b.areadescription, "text")
+    r["territory_id"] = b == nil ? nil : out_value(b.territory_id, "id")
+    r["territory"] = b == nil ? nil : out_value(b.territory_name, "text")
+    r["open_orders"] = orders[k] == nil ? 0 : orders[k]
+    r["open_quotes"] = quotes[k] == nil ? 0 : quotes[k]
+    r["last_web_login"] = out_value(logins[k], "datetime")
+    r["reward_points"] = points[k] == nil ? 0 : points[k]
+    r["clubs"] = clubs[k] == nil ? nil : join(clubs[k], ", ")
+  }
 }
 
 // days overdue against today and the ERP's aged-analysis buckets (model/cli/statement.php getAgedAnalysisBatch):

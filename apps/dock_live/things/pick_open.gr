@@ -1,0 +1,67 @@
+// pick_open - an ASQL Thing: one order's open pick lines, as the v8 pick screens list them.
+//
+// Key: the order (pickingfreeze.orderno). Values: the warehouse it picks from, its header (customer, branch, ship
+// via, notes, wanted date, city, route, whether stock covers it) and its lines as JSON text. An order leaves when no
+// line is left to pick (signed off, invoiced, its run stopped), and a screen drops it.
+//
+// A pick, claim or release on any device writes pickingfreeze; touched() names that one order, so only it is read
+// again and only it wakes the screens (WAIT THING pick_open). This replaces apir/oms/picking rebuilding the whole
+// warehouse list - every order, three queries a line - after every scan.
+
+import "../lib/pick_sql.gr"
+
+let DAY_SAFE = true   // nothing here depends on the clock; the service works out days-till-due when it reads
+
+fn enroll() { return open_pick_orders() }
+
+fn shared() { return {} }
+
+fn things(ks, sh) {
+  let ordernos = map(ks, s)
+  let rows_of = open_pick_rows(ordernos)
+  let have = keys(rows_of)
+  if len(have) == 0 { return {} }
+  let heads = order_heads(have)
+  let mst = mst_descriptions(filter(have, fn (o) { return len(filter(rows_of[o], fn (r) { return s(r.stockid) == "MST" })) > 0 }))
+  let out = {}
+  for o in have {
+    let h = heads[o] ?? {}
+    let lines = rows_of[o]
+    if mst[o] != nil {
+      for r in lines { if s(r.stockid) == "MST" { r.description = mst[o] } }
+    }
+    out[o] = {
+      "orderno": o,
+      "loccode": s(lines[0].loccode),
+      "debtorno": s(h.debtorno), "branchcode": s(h.branchcode), "customer": s(h.brname), "city": s(h.braddress3),
+      "route": s(h.route), "shipvia": s(h.shipvia), "notes": s(h.notes), "deliverydate": s(h.deliverydate),
+      "fillable": n(h.fillable),
+      // getOrder() joins the branch: with none there, index() sends no customer/city/route and today as wanted
+      "has_branch": h.cb_branch != nil ? "1" : "0",
+      "lines": json_stringify(lines)
+    }
+  }
+  return out
+}
+
+fn touched(table, op, before, after, sh) {
+  let t = lower(table)
+  if pick_unchanged(t, before, after) { return [] }
+  let rows = compact([before, after])
+  if t == "pickingfreeze" or t == "salesorders" { return unique(map(rows, fn (r) { return s(r.orderno) })) }
+  if t == "dispatch" { return unique(compact(map(rows, fn (r) { let o = s(int(n(r.invoice))); return o == "0" ? nil : o }))) }
+  if t == "custbranch" {
+    let out = []
+    for r in rows {
+      for o in read("SELECT DISTINCT p.orderno FROM pickingfreeze p JOIN salesorders so ON so.orderno = p.orderno " +
+                    "WHERE p.completed = 0 AND p.invoiced = 0 AND so.debtorno = ? AND so.branchcode = ?", s(r.debtorno), s(r.branchcode)) {
+        push(out, s(o.orderno))
+      }
+    }
+    return unique(out)
+  }
+  if t == "product_types" or t == "dispatch_status" { return "all" }
+  // stockmaster (a description), purchorderdetails / salesordertopurchaseorder (an MST description): wait for the
+  // order's next change rather than react to every cost or PO edit
+  return nil
+}

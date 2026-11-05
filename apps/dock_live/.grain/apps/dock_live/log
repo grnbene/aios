@@ -1,0 +1,18 @@
+2026-11-05 16:44:32  [host] deploying version f34d140a43c4a0ee
+2026-11-05 16:44:32  [host] warning: secret DB_PASSWORD is not set on this machine (`grain app secret dock_live DB_PASSWORD`)
+2026-11-05 16:44:32  [host] starting version f34d140a43c4a0ee (web, port 8577)
+2026-11-05 16:44:33  dock_bay: replaced in place, 5 things
+2026-11-05 16:44:33  pick_open: replaced in place, 182 things
+2026-11-05 16:44:33  [host] version f34d140a43c4a0ee is running
+2026-11-05 16:45:13  [host] deploying version 2b375d13d0fccc8b
+2026-11-05 16:45:13  [host] warning: secret DB_PASSWORD is not set on this machine (`grain app secret dock_live DB_PASSWORD`)
+2026-11-05 16:45:13  [host] starting version 2b375d13d0fccc8b (web, port 8577)
+2026-11-05 16:45:14  dock_bay: replaced in place, 5 things
+2026-11-05 16:45:14  pick_open: replaced in place, 182 things
+2026-11-05 16:45:14  [host] version 2b375d13d0fccc8b is running
+2026-11-05 17:15:26  [host] deploying version 26b67e9a0c72435c
+2026-11-05 17:15:26  [host] warning: secret DB_PASSWORD is not set on this machine (`grain app secret dock_live DB_PASSWORD`)
+2026-11-05 17:15:26  [host] starting version 26b67e9a0c72435c (web, port 8577)
+2026-11-05 17:15:28  dock_bay: replaced in place, 5 things
+2026-11-05 17:15:28  pick_open: replaced in place, 184 things
+2026-11-05 17:15:28  [host] version 26b67e9a0c72435c is running
