@@ -39967,6 +39967,8 @@ struct RawBuf {
   const T* data() const { return p.get(); }
 };
 struct DealtRow { uint32_t r, g; };
+// A row dealt with its value and a bit for each sum whose mask (or none) takes it: what a pivot's lanes add.
+struct DealtVal { double v; uint32_t g, bits; };
 
 bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Source>& key_src,
                   const std::vector<std::vector<uint32_t>>& key_canon, bool has_group_by, const std::vector<Agg>& aggs,
@@ -40106,6 +40108,24 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         const uint64_t ds_t0 = vx_trace_enabled() ? hal_now_ns() : 0;
         const bool coded = ks.kind == Source::CodeCol;
         const bool hn = has_nulls(cs);
+        // SUM / AVG of a DECIMAL column held scaled (DecimalScaled), with or without a CASE's mask and no NULL: what
+        // acc_row does for each row, in a loop of its own that adds the row's integer, its double and its count
+        // where the mask takes it and nothing where not (an integer add of 0, a double add of +0.0 - a total is
+        // never -0.0 - so the same totals), with no branch on the mask. A pivot's sums share one column: decoded once.
+        std::vector<uint8_t> dkern(aggs.size(), 0);
+        std::vector<size_t> drep(aggs.size());
+        for (size_t ai = 0; ai < aggs.size(); ++ai) {
+          drep[ai] = ai;
+          const Agg& a = aggs[ai];
+          const AggPlan& p = plans[ai];
+          if ((a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && !a.prog && a.src.kind == Source::TypedCol &&
+              a.col_type == SqlDataType::Decimal && p.dec_direct && p.need_ints && p.need_nums && !p.need_codes && !nulls[ai] &&
+              !typed_integer(t.col_data[a.src.col])) {
+            dkern[ai] = 1;
+            for (size_t e = 0; e < ai; ++e)
+              if (dkern[e] && drep[e] == e && aggs[e].src.col == a.src.col) { drep[ai] = e; break; }
+          }
+        }
 
         SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t tid) {
           const size_t m0 = mb + c0, m1 = mb + c1;
@@ -40134,7 +40154,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
 
             for (size_t ai = 0; ai < aggs.size(); ++ai) {
               const Agg& a = aggs[ai];
-              if (a.kind != Agg::CountStar) {
+              if (a.kind != Agg::CountStar && drep[ai] == ai) {
                 if (!dense && sparse) decode_for_rows(a, plans[ai], t.col_data[a.src.col], start, end, rows.data(), n, cols[ai]);
                 else decode_for(a, plans[ai], t.col_data[a.src.col], start, end, cols[ai]);
               }
@@ -40178,6 +40198,34 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                   A.isum[g] += (AIOS_INT128)x;   // exact always (an INT128 of int64s): finish reads isum, never num, on this path
                   A.cnt[g]++;
                 }
+              } else if (dkern[ai]) {
+                const AggCols& dc = cols[drep[ai]];
+                const int64_t* iv = dc.ints.data();
+                const double* nv = dc.nums.data();
+                const uint8_t* mk = a.mask ? a.mask->data() : nullptr;
+                const size_t msz = a.mask ? a.mask->size() : 0;
+                const uint64_t ew = a.mask_else_zero ? 1 : 0;
+                auto rows_loop = [&](auto HasMask, auto InRange) {
+                  for (size_t j = 0; j < n; ++j) {
+                    const size_t r = dense ? start + j : rows[j];
+                    uint64_t take = 1;
+                    if constexpr (decltype(HasMask)::value) {
+                      if constexpr (decltype(InRange)::value) take = mk[r] != 0; else take = r < msz && mk[r] != 0;
+                    }
+                    const uint32_t g = m_id[j];
+                    A.isum[g] += (AIOS_INT128)(iv[r - start] & -(int64_t)take);
+                    uint64_t db;
+                    std::memcpy(&db, &nv[r - start], 8);
+                    db &= 0 - take;
+                    double dd;
+                    std::memcpy(&dd, &db, 8);
+                    A.num[g] += dd;
+                    A.cnt[g] += take | ew;
+                  }
+                };
+                if (!mk) rows_loop(std::false_type{}, std::true_type{});
+                else if (msz >= sel.total) rows_loop(std::true_type{}, std::true_type{});
+                else rows_loop(std::true_type{}, std::false_type{});
               } else {
                 const ColumnStore& acs = t.col_data[a.src.col];
                 for (size_t j = 0; j < n; ++j) {
@@ -40715,7 +40763,21 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
     // chip (half of them on this one) held the adding up.
     const size_t L = std::min(G, lanes * 4);
     // per row: the decoded values (8 bytes a column, 1 more for a coded one's flag) and the dealt (row, group) pair
-    const size_t row_bytes = 8 + dcols.size() * 9;
+    // A pivot: sums of one DOUBLE column under masks, with no NULL or dictionary entry to test. Each row is dealt with
+    // its value and a bit per sum for its mask, and a lane adds its rows in one pass with no branch and no gather of
+    // the column per row - the add had a mispredicted mask test in front of a cache miss on every row.
+    bool fused = gser.size() >= 1 && gser.size() <= 8;
+    bool any_mask = false;
+    for (size_t ai : gser) {
+      const size_t k = dslot[ai];
+      if (nulls[ai] || (k != SIZE_MAX && dcols[k].coded) || aggs[ai].src.col != aggs[gser[0]].src.col || dslot[ai] != dslot[gser[0]]) fused = false;
+      if (aggs[ai].mask) any_mask = true;
+    }
+    if (!any_mask) fused = false;
+    // With few groups their sums (a total and a count for each sum) stay in the cache, and one pass over the rows in
+    // order adds them all: no dealing, no second pass, nothing written but the totals.
+    const bool fused_one = fused && G * gser.size() * 16 <= ((size_t)128 << 10);
+    const size_t row_bytes = 8 + dcols.size() * 9 + (fused && !fused_one ? 8 : 0);
     constexpr size_t kWindowBytes = (size_t)48 << 20;
     const size_t win = std::max<size_t>(1, std::min(total_m, kWindowBytes / (kVxMorsel * row_bytes)));
     if (!gser.empty() && sql_reserve_query_memory(win * kVxMorsel * row_bytes)) {
@@ -40731,6 +40793,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         for (size_t g = G * lane / L; g < G * (lane + 1) / L; ++g) lane_of[g] = (uint16_t)lane;
       std::vector<uint32_t> cnt(win * L), off(win * L);
       std::vector<RawBuf<DealtRow>> dealt(L);
+      std::vector<RawBuf<DealtVal>> dealtv(L);
       std::vector<size_t> dealt_n(L, 0);
       auto& pool = SqlThreadPool::instance();
       for (size_t w0 = mb; w0 < me; w0 += win) {
@@ -40747,7 +40810,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           if (aggs[ai].mask || nulls[ai] || (k != SIZE_MAX && dcols[k].coded)) one_pass = false;
         }
         // 1. each morsel: its columns decoded, and its rows counted by the lane they go to
-        if (!(one_pass && dcols.empty()))
+        if (!((one_pass || fused_one) && dcols.empty()))
         pool.for_chunks(nw, 1, sel.work_rows(), false, [&](size_t c0, size_t c1, size_t) {
           static thread_local std::vector<uint32_t> codes;   // kept from call to call (a call a morsel)
           for (size_t m = w0 + c0; m < w0 + c1; ++m) {
@@ -40767,7 +40830,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 v[i] = use ? p.code_num[c] : 0.0;
               }
             }
-            if (one_pass) continue;
+            if (one_pass || fused_one) continue;
             const size_t n = gid[m].size();   // the morsel's selected rows, one group each
             const uint32_t* gs = gid[m].data();
             uint32_t* cm = cnt.data() + (m - w0) * L;
@@ -40776,6 +40839,69 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           }
         });
         const uint64_t gs1 = vx_trace_enabled() ? hal_now_ns() : 0;
+        if (fused_one) {
+          const size_t na1 = gser.size();
+          const size_t wbase1 = w0 * kVxMorsel;
+          const size_t k0 = dslot[gser[0]];
+          const double* fnums1 = k0 == SIZE_MAX ? t.col_data[aggs[gser[0]].src.col].double_data.data() : val[k0].data();
+          const size_t fbase1 = k0 == SIZE_MAX ? 0 : wbase1;
+          // Each sum is a chain of its own (a group's total adds its rows in order, whatever the other sums do), so
+          // the sums run on a thread each: every row in row order, adding the row's value where the sum's mask takes
+          // it and +0.0 where not (selected, not multiplied: a NaN or an infinity in a row the mask leaves out is not
+          // added; a total is never -0.0, so +0.0 leaves it as it is) - the same totals as testing each row, with no
+          // branch to miss.
+          const bool tot_in = true;
+          (void)tot_in;
+          pool.for_chunks(na1, 1, sel.work_rows(), false, [&](size_t k0c, size_t k1c, size_t) {
+            static thread_local std::vector<uint32_t> srows_t;
+            std::vector<double> num;
+            std::vector<uint64_t> cnt;
+            for (size_t kk = k0c; kk < k1c; ++kk) {
+              const Agg& a = aggs[gser[kk]];
+              AggArrays& A = totals[gser[kk]];
+              num.assign(A.num.begin(), A.num.begin() + G);
+              cnt.assign(A.cnt.begin(), A.cnt.begin() + G);
+              const uint8_t* mk = a.mask ? a.mask->data() : nullptr;
+              const size_t msz = a.mask ? a.mask->size() : 0;
+              const uint64_t ew = a.mask_else_zero ? 1 : 0;
+              const bool in_range = !mk || msz >= sel.total;   // every row has its mask byte: no test of it per row
+              auto rows_loop = [&](auto HasMask, auto InRange) {
+                for (size_t m = w0; m < w1; ++m) {
+                  const size_t n = gid[m].size();
+                  if (n == 0) continue;
+                  const size_t start = m * kVxMorsel;
+                  const uint32_t* gs = gid[m].data();
+                  const uint32_t* rws = nullptr;
+                  if (!sel.all) { sel.rows_of(m, srows_t); rws = srows_t.data(); }
+                  for (size_t j = 0; j < n; ++j) {
+                    const size_t r = rws ? rws[j] : start + j;
+                    uint64_t take = 1;
+                    if constexpr (decltype(HasMask)::value) {
+                      if constexpr (decltype(InRange)::value) take = mk[r] != 0; else take = r < msz && mk[r] != 0;
+                    }
+                    uint64_t vb;
+                    std::memcpy(&vb, &fnums1[r - fbase1], 8);
+                    vb &= 0 - take;
+                    double add;
+                    std::memcpy(&add, &vb, 8);
+                    const uint32_t g = gs[j];
+                    num[g] += add;
+                    cnt[g] += take | ew;
+                  }
+                }
+              };
+              if (!mk) rows_loop(std::false_type{}, std::true_type{});
+              else if (in_range) rows_loop(std::true_type{}, std::true_type{});
+              else rows_loop(std::true_type{}, std::false_type{});
+              std::copy(num.begin(), num.end(), A.num.begin());
+              std::copy(cnt.begin(), cnt.end(), A.cnt.begin());
+            }
+          });
+          if (vx_trace_enabled())
+            vx_trace_line("grouped sums in row order: " + std::to_string(G) + " groups, fused one pass: decode " +
+                          std::to_string((gs1 - gs0) / 1000) + " us, add " + std::to_string((hal_now_ns() - gs1) / 1000) + " us");
+          continue;
+        }
         if (one_pass) {
           const size_t wbase1 = w0 * kVxMorsel;
           static thread_local std::vector<uint32_t> srows;
@@ -40823,8 +40949,28 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         std::vector<size_t> lane_n(L, 0);
         for (size_t c = 0; c < nw; ++c)
           for (size_t lane = 0; lane < L; ++lane) { off[c * L + lane] = (uint32_t)lane_n[lane]; lane_n[lane] += cnt[c * L + lane]; }
-        for (size_t lane = 0; lane < L; ++lane) { dealt[lane].reserve_n(lane_n[lane]); dealt_n[lane] = lane_n[lane]; }
+        for (size_t lane = 0; lane < L; ++lane) {
+          if (fused) dealtv[lane].reserve_n(lane_n[lane]); else dealt[lane].reserve_n(lane_n[lane]);
+          dealt_n[lane] = lane_n[lane];
+        }
         const size_t wbase = w0 * kVxMorsel;
+        // the fused deal: the value column as the adding reads it, and each sum's mask
+        const size_t na = gser.size();
+        const double* fnums = nullptr;
+        size_t fbase = 0;
+        const uint8_t* fmk[8] = {};
+        size_t fmsz[8] = {};
+        uint32_t always_bits = 0, else_bits = 0;
+        if (fused) {
+          const size_t k0 = dslot[gser[0]];
+          fnums = k0 == SIZE_MAX ? t.col_data[aggs[gser[0]].src.col].double_data.data() : val[k0].data();
+          fbase = k0 == SIZE_MAX ? 0 : wbase;
+          for (size_t k = 0; k < na; ++k) {
+            const Agg& a = aggs[gser[k]];
+            if (a.mask) { fmk[k] = a.mask->data(); fmsz[k] = a.mask->size(); } else always_bits |= 1u << k;
+            if (a.mask_else_zero) else_bits |= 1u << k;
+          }
+        }
         pool.for_chunks(nw, 1, sel.work_rows(), false, [&](size_t c0, size_t c1, size_t) {
           static thread_local std::vector<uint32_t> rows, pos;   // kept from call to call (a call a morsel)
           pos.resize(L);
@@ -40833,6 +40979,17 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             const size_t mstart = m * kVxMorsel;
             const size_t n = sel.all ? std::min(mstart + kVxMorsel, sel.total) - mstart : sel.rows_of(m, rows);
             const uint32_t* gs = gid[m].data();
+            if (fused) {
+              for (size_t j = 0; j < n; ++j) {
+                const uint32_t g = gs[j];
+                const size_t r = sel.all ? mstart + j : rows[j];
+                uint32_t bits = always_bits;
+                for (size_t k = 0; k < na; ++k) bits |= (uint32_t)(fmk[k] && r < fmsz[k] && fmk[k][r] != 0) << k;
+                const size_t lane = lane_of[g];
+                dealtv[lane].data()[pos[lane]++] = DealtVal{fnums[r - fbase], g, bits};
+              }
+              continue;
+            }
             for (size_t j = 0; j < n; ++j) {
               const uint32_t g = gs[j];
               dealt[lane_of[g]].data()[pos[lane_of[g]]++] = DealtRow{sel.all ? (uint32_t)(mstart + j) : rows[j], g};
@@ -40841,6 +40998,49 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         });
         const uint64_t gs2 = vx_trace_enabled() ? hal_now_ns() : 0;
         // 3. each lane: its own rows, in row order, added as acc_row adds them
+        if (fused) {
+          pool.for_chunks(L, 1, sel.work_rows(), false, [&](size_t l0, size_t l1, size_t) {
+            std::vector<double> numv;
+            std::vector<uint64_t> cntv;
+            for (size_t lane = l0; lane < l1; ++lane) {
+              const DealtVal* D = dealtv[lane].data();
+              const size_t Dn = dealt_n[lane];
+              const uint32_t g0 = (uint32_t)(G * lane / L), g1 = (uint32_t)(G * (lane + 1) / L);
+              const size_t ng = g1 - g0;
+              // a group's sums side by side: a row's adds are in one place, and the lanes' groups are apart
+              numv.resize(ng * na);
+              cntv.resize(ng * na);
+              for (size_t k = 0; k < na; ++k)
+                for (size_t gl = 0; gl < ng; ++gl) {
+                  numv[gl * na + k] = totals[gser[k]].num[g0 + gl];
+                  cntv[gl * na + k] = totals[gser[k]].cnt[g0 + gl];
+                }
+              for (size_t q = 0; q < Dn; ++q) {
+                const DealtVal d = D[q];
+                double* pn = &numv[(size_t)(d.g - g0) * na];
+                uint64_t* pc = &cntv[(size_t)(d.g - g0) * na];
+                uint64_t vb;
+                std::memcpy(&vb, &d.v, 8);
+                const uint32_t cb = d.bits | else_bits;
+                for (size_t k = 0; k < na; ++k) {
+                  // the row's value where this sum's mask takes it, +0.0 where not: selected, not multiplied, so a
+                  // NaN or an infinity in a row the mask leaves out is not added; a total is never -0.0, so adding
+                  // +0.0 leaves it as it is
+                  const uint64_t add_bits = vb & (0 - (uint64_t)((d.bits >> k) & 1));
+                  double add;
+                  std::memcpy(&add, &add_bits, 8);
+                  pn[k] += add;
+                  pc[k] += (cb >> k) & 1;
+                }
+              }
+              for (size_t k = 0; k < na; ++k)
+                for (size_t gl = 0; gl < ng; ++gl) {
+                  totals[gser[k]].num[g0 + gl] = numv[gl * na + k];
+                  totals[gser[k]].cnt[g0 + gl] = cntv[gl * na + k];
+                }
+            }
+          });
+        } else
         pool.for_chunks(L, 1, sel.work_rows(), false, [&](size_t l0, size_t l1, size_t) {
           std::vector<double> num;
           std::vector<uint64_t> cnt_l;
@@ -40878,7 +41078,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           }
         });
         if (vx_trace_enabled())
-          vx_trace_line("grouped sums in row order: " + std::to_string(G) + " groups, " + std::to_string(L) + " lanes: decode " +
+          vx_trace_line("grouped sums in row order: " + std::to_string(G) + " groups, " + std::to_string(L) + (fused ? " lanes fused: decode " : " lanes: decode ") +
                         std::to_string((gs1 - gs0) / 1000) + " us, deal " + std::to_string((gs2 - gs1) / 1000) + " us, add " +
                         std::to_string((hal_now_ns() - gs2) / 1000) + " us");
       }
