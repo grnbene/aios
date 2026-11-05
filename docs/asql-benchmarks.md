@@ -8,11 +8,12 @@ two passes; best in bold (several where ranges overlap).
 | | |
 |---|---|
 | Host | Intel i5-7600K (4 cores, 3.8 GHz), 19 GB, Linux 6.17, WD Blue SN570 NVMe, ext4 |
-| ASQL | `5.7.44-aios-asql`, commit `96b80bf` plus the `DECIMAL` aggregate, lazy-accelerator and scan-scheduling changes, 4 lanes, default durability (one `fdatasync` per commit) |
+| ASQL | `5.7.44-aios-asql`, commit `bf3bd8e`, 4 lanes, default durability (one `fdatasync` per commit) |
 | MariaDB | 10.11.9 (Docker), InnoDB, `innodb_buffer_pool_size=1G`, `innodb_flush_log_at_trx_commit=1` |
 | CedarDB | v2026-11-04 (Docker), defaults |
 | DuckDB | v1.5.5, in process (C API), database file |
 
+- Tests 1-4 were measured on `e3c16d2`, before the join changes that followed it. ASQL's side was run again on `bf3bd8e`: every answer identical, every figure inside the ranges below.
 - All engines' data on the same NVMe (a flush costs about 0.5 ms there); containers use bind mounts.
 - The table is about 21 MB and fits in every engine's cache; no engine was disk-bound for the queries.
 - Machine shared with other work: load average 1.7-2.9 on 4 cores.
@@ -150,6 +151,33 @@ SELECT id, customer_id, amount, status FROM bench_sales WHERE id = N
 -- update (2,000, random ids, autocommit)
 UPDATE bench_sales SET amount = amount + 0.01 WHERE id = N
 ```
+
+## ERP reports on real data
+
+Three of the ERP's report pages, run on a snapshot of a production `km` database (`asql-km-20261102`: `stockmoves` 2.8M
+rows, `debtortrans` 670k, and the `stocktrans` view that joins nine tables, 1.64M rows). ASQL and DuckDB on the same
+box; DuckDB holds the same tables copied through its `mysql_scanner` and the same view. Median ms of 5 timed runs
+after one warm-up; ASQL over 3 passes, DuckDB over 2.
+
+| Report | ASQL | DuckDB |
+|---|---|---|
+| `thisoverlast`: sales, cost and units by month, 36 `SUM(CASE ...)` over the view | **313-419** | 421-434 |
+| `nopurchase`: customers with no purchase in 60 days but one in 365, four correlated subqueries each | **136-142** | 554-632 |
+| `brandbylocation`: quantity and total per brand over the view | **543-620** | 623-693 |
+
+Statements are in `tools/asql-bench/erp/`. The data is private, so this part cannot be reproduced from the repository.
+
+How the answers compare:
+
+- The rows agree. The money columns differ by cents, because ASQL rounds a DOUBLE as the ERP's PHP does (15
+  significant digits, then half away from zero; `docs/asql.md`, "Rounding"). Over all 1,642,699 non-NULL lines of the
+  view ASQL equals that rule exactly. MariaDB 10.11.9 and DuckDB each differ from it, in different lines: for the same
+  formula MariaDB's own result differs from ASQL's in 4,793 lines and from DuckDB's in 5,029, each by one cent. A
+  100,000-line cash account's total differs by a few dollars between engines for that reason.
+- `nopurchase` ends in `LIMIT 100` with no `ORDER BY`, so each engine may return a different 100 debtors. Without the
+  `LIMIT` (and with the same timestamp bound on DuckDB's side) both return the same 919 debtors.
+- Earlier figures for these reports (2026-11-04) were on a different data set (summitholding, 12.5M rows) and are not
+  comparable.
 
 ## Latency tails
 
