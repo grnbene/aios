@@ -212,10 +212,10 @@ GET v1/invoices?limit=5000&amp;after=WzM0NTY3OF0
 
   <div class="card" id="sales_by_salesperson">
     <div class="card-head"><h3><span class="method">GET</span><span class="path">v1/sales_by_salesperson</span></h3></div>
-    <p>Sales per rep per day, on the same basis as the ERP's commission report: the invoice and credit note lines
-    as printed, credited to the rep on the document, before tax and freight, without the ERP's adjustment items
-    (prompt-payment discounts, accruals, write-offs). <code>from</code> and <code>to</code> are required, at most
-    366 days apart; <code>salesperson_id</code> and <code>format=csv</code> are optional.</p>
+    <p>Sales per rep per day, on the same basis as the ERP's sales reports (its sales lines, <code>stocktrans</code>):
+    invoice and credit note lines as printed, credited to the rep on the document, after line discounts, before tax
+    and freight. <code>from</code> and <code>to</code> are required, at most 366 days apart;
+    <code>salesperson_id</code> and <code>format=csv</code> are optional.</p>
     <table>
       <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
       <tbody>

@@ -424,12 +424,30 @@ fn lookups_route(req, db) {
   return {"res": answer_json(out), "rows": n}
 }
 
-// Sales per rep per day on the ERP's commission report basis (model/report/commissionreport.php
-// getCommissionStockMoveRows, controller apir/reports.php commissioned_sales): invoice and credit note lines
-// (stockmoves joined to debtortrans on transno and type), as printed (show_on_inv_crds = 1), rep from the
-// document (debtortrans.salesperson), dated by the line, without the adjustment SKUs the report leaves out.
-// line = -price x qty x (1 - discount); cost = -qty x standardcost; gross profit = line - cost.
-let COMMISSION_EXCLUDE = ["PPD_DISCOUNT", "PROMPT PAYMENT", "ACCRUAL", "NEW DOORS", "ZZMCMISC", "ZZMCWRITEOFF"]
+// Sales per rep per day on the basis of the ERP's sales reports (model/reports/report.php getSRPT / getSPSLS), which
+// read the km `stocktrans` view. ASQL replicates tables, not views, so the view is reproduced here as it stands on
+// km - its joins and filters exactly, including what they do to the figures:
+//   - stockmoves join debtortrans on transno + debtorno + branchcode (not type)
+//   - INNER JOINs custbranch, territory, purchdata (preferred = 1), suppliers and stockmaster: a line whose item has
+//     no preferred purchdata row, or whose preferred supplier does not exist, is not counted
+//   - LEFT JOIN product_to_manufacturer: an item with several brand rows is counted once per row
+//   - types 10 and 11, printed lines only, no SUAA% items, no ZZMCWRITEOFF, no ZZMCMISC on a write-off document
+// sales = -SUM(discountedlinetotal), cost = -SUM(costtotal), units = -SUM(qty), rep = debtortrans.salesperson,
+// dated by the line.
+let ST_LINE = "CAST(" + line_amount_sql("m.price", "m.discountpercent", "m.qty") + " AS DECIMAL(10,2))"
+let ST_COST = "CAST(m.qty * m.standardcost AS DECIMAL(10,2))"
+let ST_FROM = "FROM stockmoves m " +
+  "JOIN debtortrans t ON m.transno = t.transno AND m.debtorno = t.debtorno AND m.branchcode = t.branchcode " +
+  "JOIN custbranch b ON b.debtorno = t.debtorno AND b.branchcode = t.branchcode " +
+  "JOIN territory tr ON tr.territory_id = b.territory_id " +
+  "JOIN purchdata pd ON pd.stockid = m.stockid AND pd.preferred = 1 " +
+  "JOIN suppliers su ON su.supplierid = pd.supplierno " +
+  "LEFT JOIN salesman s ON s.salesmancode = t.salesperson " +
+  "JOIN stockmaster sm ON sm.stockid = m.stockid " +
+  "LEFT JOIN product_to_manufacturer p2m ON p2m.stockid = sm.stockid " +
+  "WHERE m.type IN (10, 11) AND m.show_on_inv_crds = 1 AND m.stockid NOT LIKE 'SUAA%' AND m.stockid <> 'ZZMCWRITEOFF' " +
+  "AND (m.stockid <> 'ZZMCMISC' OR NOT EXISTS (SELECT 1 FROM stockmoves wo WHERE wo.transno = m.transno AND wo.type = m.type " +
+  "AND wo.debtorno = m.debtorno AND wo.branchcode = m.branchcode AND wo.stockid IN ('ZZMCMISC', 'ZZMCWRITEOFF') AND wo.show_on_inv_crds = 0)) "
 
 fn sales_by_salesperson_route(req, db) {
   let p = req.query_params == nil ? {} : req.query_params
@@ -447,28 +465,22 @@ fn sales_by_salesperson_route(req, db) {
   if p.format != nil and p.format != "json" and p.format != "csv" {
     return {"res": fail(400, "bad_parameter", "format is json or csv"), "rows": 0}
   }
-  let args = [p.from, p.to, COMMISSION_EXCLUDE]
+  let args = [p.from, p.to]
   let rep = ""
   if p.salesperson_id != nil {
     rep = " AND t.salesperson = ?"
     push(args, p.salesperson_id)
   }
-  let line = "((-1 * m.price * m.qty) - (-1 * m.price * m.qty * m.discountpercent))"
-  let r = q(db, "SELECT t.salesperson AS salesperson_id, s.salesmanname AS salesperson_name, m.trandate AS date, " +
-    "SUM(CASE WHEN m.type = 10 THEN " + line + " ELSE 0 END) AS invoiced, " +
-    "SUM(CASE WHEN m.type = 11 THEN " + line + " ELSE 0 END) AS credited, " +
-    "SUM(" + line + ") AS net_sales, " +
-    "SUM(-1 * m.qty * m.standardcost) AS cost, " +
-    "SUM(-1 * m.qty) AS units, " +
+  let r = q(db, "SELECT t.salesperson AS salesperson_id, MAX(s.salesmanname) AS salesperson_name, m.trandate AS date, " +
+    "SUM(CASE WHEN m.type = 10 THEN -" + ST_LINE + " ELSE 0 END) AS invoiced, " +
+    "SUM(CASE WHEN m.type = 11 THEN -" + ST_LINE + " ELSE 0 END) AS credited, " +
+    "SUM(-" + ST_LINE + ") AS net_sales, " +
+    "SUM(-" + ST_COST + ") AS cost, " +
+    "SUM(-m.qty) AS units, " +
     "COUNT(DISTINCT CASE WHEN m.type = 10 THEN m.transno END) AS invoices, " +
     "COUNT(DISTINCT t.debtorno) AS customers " +
-    "FROM debtortrans t " +
-    "JOIN stockmoves m ON m.transno = t.transno AND m.type = t.type " +
-    "JOIN custbranch b ON b.debtorno = t.debtorno AND b.branchcode = t.branchcode " +
-    "JOIN stockmaster sm ON sm.stockid = m.stockid " +
-    "JOIN salesman s ON s.salesmancode = t.salesperson " +
-    "WHERE m.trandate BETWEEN ? AND ? AND m.stockid NOT IN (?) AND m.show_on_inv_crds = 1" + rep +
-    " GROUP BY t.salesperson, s.salesmanname, m.trandate ORDER BY m.trandate, t.salesperson", args)
+    ST_FROM + "AND m.trandate BETWEEN ? AND ?" + rep +
+    " GROUP BY t.salesperson, m.trandate ORDER BY m.trandate, t.salesperson", args)
   let rows = []
   for rec in r.records {
     let net = to_number(rec.net_sales)
