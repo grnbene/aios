@@ -8,19 +8,24 @@ two passes; best in bold (several where ranges overlap).
 | | |
 |---|---|
 | Host | Intel i5-7600K (4 cores, 3.8 GHz), 19 GB, Linux 6.17, WD Blue SN570 NVMe, ext4 |
-| ASQL | `5.7.44-aios-asql`, commit `cef63cc`, 4 lanes, default durability (one `fdatasync` per commit) |
+| ASQL | `5.7.44-aios-asql`, commit `cef63cc` plus the wire-`INSERT` fast path, 4 lanes, default durability (one `fdatasync` per commit) |
 | MariaDB | 10.11.9 (Docker), InnoDB, `innodb_buffer_pool_size=1G`, `innodb_flush_log_at_trx_commit=1` |
 | CedarDB | v2026-11-04 (Docker), defaults |
 | DuckDB | v1.5.5, in process (C API), database file |
 
 - All engines' data on the same NVMe (a flush costs about 0.5 ms there); containers use bind mounts.
-- Machine shared with other work: load average 1.7-2.8 on 4 cores.
+- The table is about 21 MB and fits in every engine's cache; no engine was disk-bound for the queries.
+- Machine shared with other work: load average 1.7-2.9 on 4 cores.
 - Data: `bench_sales(id INT PRIMARY KEY, customer_id INT, category_id INT, amount, trans_date DATE, status VARCHAR(16))`,
   500,000 rows from a fixed seed (`tools/asql-bench/gen.py`), run with `amount DOUBLE` and with `amount DECIMAL(12,2)`
   (`NUMERIC(12,2)` in CedarDB), each a fresh table.
 - Timing: per statement at the client (PHP `mysqli`/`pgsql`, one persistent loopback connection; DuckDB around
   `duckdb_query`, in process, so no network). Queries: 1 warm-up, median of 5; ASQL timed with `SQL_NO_CACHE`.
 - Every query's rows from every engine were compared with MariaDB's (within 1e-9 relative): all matched.
+- Memory and CPU are the engine's own process, read from `/proc/<pid>` (a container's main process): resident memory
+  (`VmRSS`; peak is `VmHWM`) and CPU time (user + system, all threads) summed over a phase. Each engine is started
+  fresh for each amount type, so peaks are per run. The PHP client's CPU is not counted. Query CPU is measured over
+  at least 1 s of repeated runs, as `/proc` counts CPU in 10 ms ticks; "cores" is CPU time divided by wall time.
 
 ## Results
 
@@ -28,38 +33,90 @@ two passes; best in bold (several where ranges overlap).
 
 | Test | ASQL | MariaDB 10.11 | CedarDB | DuckDB |
 |---|---|---|---|---|
-| Bulk load from CSV (500k rows) | 972-1,023 | 1,137-1,214 | **284-293** | 378 |
-| 100 `INSERT`s of 5,000 rows | 3,207-3,237 | **2,008-2,076** | 5,071-5,160 | 12,485-12,578 |
-| Full-table aggregate | **0.785-0.798** | 91.1-91.7 | 1.41-1.59 | 2.33-4.36 |
-| `GROUP BY` + top 10 | **1.42-1.68** | 116-117 | 2.20-2.62 | **1.44-2.19** |
-| Filtered range aggregate | **0.911-1.21** | 77.9-78.8 | 1.24-1.28 | 1.72-2.54 |
-| Pivot, 3 `SUM(CASE ...)` | 5.09-6.70 | 179-181 | **3.95-4.04** | 7.20-7.46 |
-| `ROW_NUMBER() OVER (PARTITION BY ...)` | **22.3-22.5** | 416-426 | 50.9-53.2 | 37.0-37.7 |
-| Point lookup, median | **0.050** | 0.088-0.089 | 0.442-0.445 | 0.294 |
-| Point lookups, one client | **18,044-18,474 QPS** | 10,504-10,768 QPS | 2,152-2,207 QPS | 3,131-3,181 QPS |
-| Single-row update, median | **0.364-0.424** | 0.562-0.574 | 0.493-0.498 | 1.03 |
-| Single-row updates, one client | **2,024-2,248 TPS** | 1,664-1,730 TPS | 1,923-1,955 TPS | 924-927 TPS |
+| Bulk load from CSV (500k rows) | 948-993 | 1,139-1,171 | **309-340** | 400-403 |
+| 100 `INSERT`s of 5,000 rows | **1,302-1,350** | 2,080-2,138 | 5,091-5,127 | 12,395-12,482 |
+| Full-table aggregate | **0.802-0.817** | 91.3-92.9 | 1.61-1.72 | 2.29-2.32 |
+| `GROUP BY` + top 10 | **1.39-2.07** | 115-117 | 2.29-5.45 | **1.44-2.15** |
+| Filtered range aggregate | **0.870-1.16** | 78.3-80.7 | 1.23-1.24 | 1.70-2.59 |
+| Pivot, 3 `SUM(CASE ...)` | 5.28-9.24 | 182-198 | **4.10-5.09** | **4.08-6.59** |
+| `ROW_NUMBER() OVER (PARTITION BY ...)` | **26.0-28.4** | 413-420 | 61.5-66.8 | 34.8-37.7 |
+| Point lookup, median | **0.051-0.052** | 0.089-0.099 | 0.440-0.446 | 0.282-0.283 |
+| Point lookups, one client | **15,960-17,190 QPS** | 8,767-10,676 QPS | 2,195-2,207 QPS | 3,324-3,363 QPS |
+| Single-row update, median | **0.362-0.373** | 0.548-0.561 | 0.500-0.503 | 1.02-1.07 |
+| Single-row updates, one client | **2,222-2,235 TPS** | 1,656-1,758 TPS | 1,920-1,955 TPS | 854-930 TPS |
 
 **`amount DECIMAL(12,2)`**
 
 | Test | ASQL | MariaDB 10.11 | CedarDB | DuckDB |
 |---|---|---|---|---|
-| Bulk load from CSV (500k rows) | 893-968 | 1,112-1,235 | **272-327** | 383-384 |
-| 100 `INSERT`s of 5,000 rows | 2,682-3,058 | **1,994-2,066** | 5,170-5,176 | 12,659-12,669 |
-| Full-table aggregate | 2.13-3.98 | 159 | **1.68-2.24** | **1.10-2.10** |
-| `GROUP BY` + top 10 | 2.67-5.02 | 170 | 2.46-2.75 | **1.29-1.99** |
-| Filtered range aggregate | 1.64-3.01 | 86.6-89.8 | **1.13-1.20** | **1.08-1.58** |
-| Pivot, 3 `SUM(CASE ...)` | 6.97-12.8 | 338-350 | **4.25** | 5.72-6.82 |
-| `ROW_NUMBER() OVER (PARTITION BY ...)` | **23.4-25.0** | 445-450 | 53.3-65.3 | 38.3-46.1 |
-| Point lookup, median | **0.056** | 0.087 | 0.438-0.447 | 0.284-0.287 |
-| Point lookups, one client | **16,130-16,444 QPS** | 10,695-10,869 QPS | 2,144-2,217 QPS | 3,313-3,421 QPS |
-| Single-row update, median | **0.377-0.455** | 0.542-0.549 | 0.507-0.538 | 1.05-1.06 |
-| Single-row updates, one client | **1,865-2,007 TPS** | 1,722-1,771 TPS | **1,729-1,922 TPS** | 888-913 TPS |
+| Bulk load from CSV (500k rows) | 993-1,089 | 1,114-1,149 | **318-331** | 375-411 |
+| 100 `INSERT`s of 5,000 rows | **1,442-1,449** | 2,041-2,063 | 5,148-5,185 | 12,559-12,628 |
+| Full-table aggregate | 1.92-3.52 | 157-158 | **1.86-2.14** | **1.80-1.88** |
+| `GROUP BY` + top 10 | 4.81-7.06 | 169-173 | 2.67-3.28 | **1.88-2.22** |
+| Filtered range aggregate | 1.70-2.54 | 85.6-88.2 | **1.18-1.25** | 1.57-1.65 |
+| Pivot, 3 `SUM(CASE ...)` | 6.79-9.94 | 332-338 | **4.26-4.35** | 6.85-7.20 |
+| `ROW_NUMBER() OVER (PARTITION BY ...)` | **28.0** | 449 | 63.7-68.4 | **27.2-34.4** |
+| Point lookup, median | **0.050-0.051** | 0.087-0.092 | 0.449-0.452 | 0.283 |
+| Point lookups, one client | **17,607-17,889 QPS** | 10,186-10,910 QPS | 2,115-2,155 QPS | 3,428-3,434 QPS |
+| Single-row update, median | **0.368-0.372** | 0.549-0.569 | 0.502-0.518 | 1.05 |
+| Single-row updates, one client | **2,062-2,164 TPS** | 1,679-1,729 TPS | 1,854-1,918 TPS | 902-911 TPS |
 
-- ASQL leads or ties on analytics, window functions, point lookups and single-row updates with a DOUBLE amount.
-- It trails on file loading (CedarDB 3x, DuckDB 2.6x faster), wire `INSERT`s (MariaDB 1.6x faster) and the pivot
-  (CedarDB 1.3-1.7x faster).
-- With DECIMAL, the full aggregate, `GROUP BY`, range query and pivot take 1.0-3.9x the fastest engine's time.
+- **DOUBLE**: ASQL is fastest or level on the wire `INSERT`s (MariaDB takes 1.5-1.6x as long), full aggregate,
+  `GROUP BY`, range query, window function, point lookups and single-row updates. It trails on file loading (CedarDB
+  2.8-3.2x faster, DuckDB 2.4-2.5x; ASQL is ahead of MariaDB) and the pivot (CedarDB and DuckDB up to 2.3x).
+- **DECIMAL**: the wire `INSERT`s, window function (level with DuckDB), point lookups and updates are ahead or level.
+  The analytics trail CedarDB and DuckDB: the full aggregate by up to 2.0x, range query 1.0-2.2x, pivot up to 2.3x and
+  `GROUP BY` 1.5-3.8x (the ASQL figures vary between passes); loading a file is 2.4-3.4x behind.
+
+## Memory and CPU
+
+Resident memory of the engine's process, in MB (range over the two passes):
+
+| Resident memory (RSS), MB | ASQL | MariaDB 10.11 | CedarDB | DuckDB |
+|---|---|---|---|---|
+| Idle, empty database | 453-454 | 116 | 178 | 33 |
+| Peak during the run, DOUBLE | 858-860 | 240-243 | 463-497 | 126-128 |
+| Peak during the run, DECIMAL | 852-853 | 230-234 | 457-469 | 126-133 |
+| After the run, DOUBLE | 608-610 | 240-243 | 463-497 | 80-81 |
+| After the run, DECIMAL | 652-664 | 230-234 | 457-469 | 79-80 |
+
+ASQL holds its data in memory: an empty server is already 454 MB resident, and it has the largest footprint for this
+table (peak 1.7-1.9x CedarDB's, 3.5-3.7x MariaDB's, 6.4-6.8x DuckDB's).
+
+Server CPU time per phase (mean of the two passes; "cores" = CPU time / wall time):
+
+| Server CPU, DOUBLE | ASQL | MariaDB 10.11 | CedarDB | DuckDB |
+|---|---|---|---|---|
+| Bulk load from CSV | 1,570 ms, 1.6 cores | 1,170 ms, 1.0 cores | 395 ms, 1.2 cores | 557 ms, 1.4 cores |
+| 100 `INSERT`s of 5,000 rows | 1,565 ms, 1.2 cores | 2,455 ms, 1.2 cores | 6,140 ms, 1.2 cores | 12,423 ms, 1.0 cores |
+| Full-table aggregate, per run | 0.93 ms, 1.1 cores | 90.9 ms, 1.0 cores | 3.62 ms, 1.9 cores | 8.09 ms, 3.3 cores |
+| `GROUP BY` + top 10, per run | 3.00 ms, 1.7 cores | 117 ms, 1.0 cores | 5.44 ms, 1.9 cores | 4.33 ms, 2.6 cores |
+| Filtered range aggregate, per run | 1.98 ms, 1.7 cores | 78.5 ms, 1.0 cores | 2.37 ms, 1.9 cores | 5.78 ms, 2.6 cores |
+| Pivot, per run | 17.1 ms, 2.2 cores | 194 ms, 1.0 cores | 11.6 ms, 2.4 cores | 15.8 ms, 2.3 cores |
+| Window function, per run | 28.5 ms, 1.0 cores | 414 ms, 1.0 cores | 177 ms, 2.4 cores | 96.0 ms, 2.6 cores |
+| Point lookup, each | 56 µs, 0.9 cores | 57 µs, 0.5 cores | 392 µs, 0.9 cores | 419 µs, 1.4 cores |
+| Single-row update, each | 185 µs, 0.4 cores | 115 µs, 0.2 cores | 535 µs, 1.0 cores | 859 µs, 0.8 cores |
+
+| Server CPU, DECIMAL | ASQL | MariaDB 10.11 | CedarDB | DuckDB |
+|---|---|---|---|---|
+| Bulk load from CSV | 1,730 ms, 1.7 cores | 1,170 ms, 1.0 cores | 380 ms, 1.2 cores | 525 ms, 1.3 cores |
+| 100 `INSERT`s of 5,000 rows | 1,740 ms, 1.2 cores | 2,385 ms, 1.2 cores | 6,465 ms, 1.3 cores | 12,505 ms, 1.0 cores |
+| Full-table aggregate, per run | 6.70 ms, 1.9 cores | 159 ms, 1.0 cores | 3.47 ms, 1.9 cores | 3.47 ms, 1.9 cores |
+| `GROUP BY` + top 10, per run | 9.39 ms, 2.2 cores | 169 ms, 1.0 cores | 5.53 ms, 1.9 cores | 4.02 ms, 1.8 cores |
+| Filtered range aggregate, per run | 4.89 ms, 2.1 cores | 87.1 ms, 1.0 cores | 2.21 ms, 1.7 cores | 3.17 ms, 1.9 cores |
+| Pivot, per run | 24.2 ms, 2.5 cores | 337 ms, 1.0 cores | 12.3 ms, 2.6 cores | 15.0 ms, 2.3 cores |
+| Window function, per run | 29.9 ms, 1.0 cores | 448 ms, 1.0 cores | 181 ms, 3.4 cores | 97.0 ms, 3.0 cores |
+| Point lookup, each | 55 µs, 1.0 cores | 54 µs, 0.6 cores | 406 µs, 0.9 cores | 434 µs, 1.5 cores |
+| Single-row update, each | 215 µs, 0.5 cores | 112 µs, 0.2 cores | 545 µs, 1.0 cores | 835 µs, 0.8 cores |
+
+- With DOUBLE, ASQL spends the least CPU on four of the five analytics (all but the pivot, where CedarDB's 11.6 ms is
+  below ASQL's 17.1 ms): the full aggregate takes 0.9 ms against 3.6-91 ms, and the window function runs on one core.
+  With DECIMAL it spends 1.5-2.3x the CPU of CedarDB or DuckDB on the aggregates (6.7 ms against 3.5 ms for the full
+  aggregate), and the pivot costs 24 ms against 12-15 ms.
+- File loading costs ASQL 1.6-1.7 s of CPU against 0.4-0.6 s for CedarDB and DuckDB; the wire `INSERT`s cost it
+  1.6-1.7 s, against 2.4 s for MariaDB and 6.1-6.5 s for CedarDB.
+- Point lookups cost 55 µs of CPU in ASQL and MariaDB, 400 µs in CedarDB and DuckDB; a single-row update costs 185-215 µs
+  in ASQL, 115 µs in MariaDB.
 
 ## Test queries
 
@@ -94,12 +151,12 @@ p99, ms.
 
 | | ASQL | MariaDB | CedarDB | DuckDB |
 |---|---|---|---|---|
-| Point lookup, DOUBLE | 0.084-0.089 | 0.155-0.172 | 0.658-0.824 | 0.523-0.548 |
-| Update, DOUBLE | 0.932-1.01 | 0.767-1.02 | 0.821-0.931 | 1.46-2.66 |
+| Point lookup, DOUBLE | 0.105-0.146 | 0.151-0.231 | 0.668-0.672 | 0.427-0.467 |
+| Update, DOUBLE | 0.939-1.09 | 0.926-1.22 | 0.697-0.877 | 1.50-3.43 |
 
 ## ASQL's result cache
 
-Repeating a query without `SQL_NO_CACHE` is answered from the cache in 0.02-0.08 ms. The other engines have no
+Repeating a query without `SQL_NO_CACHE` is answered from the cache in 0.02-0.11 ms. The other engines have no
 result cache; every figure above is a computed answer.
 
 ## Storage

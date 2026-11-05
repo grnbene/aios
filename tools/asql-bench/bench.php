@@ -11,6 +11,15 @@ if (!isset($cfg[$engine])) { fwrite(STDERR, "usage: bench.php asql|maria|cedar\n
 [$kind, $port] = $cfg[$engine];
 
 function now_ms() { return hrtime(true) / 1e6; }
+// The server's own resource use, from /proc/<SERVER_PID> (the engine's process; for a container its main process):
+// CPU time (user + system, all threads) and resident memory (VmRSS now, VmHWM the peak so far).
+$spid = (int)(getenv('SERVER_PID') ?: 0);
+function srv_cpu_ms() { global $spid; if (!$spid) return null; $s = @file_get_contents("/proc/$spid/stat"); if ($s === false) return null;
+  $f = explode(' ', substr($s, strrpos($s, ')') + 2)); return ((int)$f[11] + (int)$f[12]) * 1000 / 100; }
+function srv_mem_mb() { global $spid; if (!$spid) return null; $t = @file_get_contents("/proc/$spid/status"); if ($t === false) return null;
+  preg_match('/VmRSS:\s+(\d+)/', $t, $a); preg_match('/VmHWM:\s+(\d+)/', $t, $b); return ['rss_mb' => $a[1] / 1024, 'hwm_mb' => $b[1] / 1024]; }
+function probe() { return ['cpu' => srv_cpu_ms(), 'wall' => now_ms()]; }
+function res($p0) { $p1 = probe(); return ['cpu_ms' => $p0['cpu'] === null ? null : $p1['cpu'] - $p0['cpu'], 'wall_ms' => $p1['wall'] - $p0['wall']] + (srv_mem_mb() ?? []); }
 function median($a) { sort($a); $n = count($a); return $n % 2 ? $a[intdiv($n, 2)] : ($a[$n / 2 - 1] + $a[$n / 2]) / 2; }
 function pct($a, $p) { sort($a); return $a[min(count($a) - 1, (int)floor($p / 100 * count($a)))]; }
 
@@ -32,6 +41,7 @@ if ($kind === 'mysql') {
   };
 }
 $out = ['engine' => $engine];
+$out['res'] = ['start' => srv_mem_mb()];
 // The amount column: AMOUNT=decimal (the default; the ERP's money columns are DECIMAL) or AMOUNT=double. ASQL adds a
 // DOUBLE column in row order, one thread, so that its sums are MariaDB's to the last bit; a DECIMAL it adds in parallel.
 $amount = getenv('AMOUNT') ?: 'decimal';
@@ -46,9 +56,9 @@ else { $q("DROP TABLE IF EXISTS bench_sales"); $q("DROP TABLE IF EXISTS bench_lo
 // 1B. the 500,000 rows over the wire: 100 INSERTs of 5,000 rows, one connection, autocommit
 $q($ddl('bench_sales'));
 $lines = file("$dir/data/inserts.sql", FILE_IGNORE_NEW_LINES);
-$t0 = now_ms();
+$t0 = now_ms(); $p0 = probe();
 foreach ($lines as $l) $q(rtrim($l, ';'));
-$out['wire_insert_ms'] = now_ms() - $t0;
+$out['wire_insert_ms'] = now_ms() - $t0; $out['res']['wire_insert'] = res($p0);
 $out['rows'] = (int)$q("SELECT COUNT(*) FROM bench_sales")[0][0];
 
 // 1A. the same rows from the CSV file, by the engine's own bulk loader
@@ -57,7 +67,7 @@ $load = ['maria' => "LOAD DATA INFILE '/data/bench_sales.csv' INTO TABLE bench_l
          'cedar' => "COPY bench_load FROM '/data/bench_sales.csv' WITH (FORMAT csv)",
          'asql'  => "LOAD DATA INFILE '$dir/data/bench_sales.csv' INTO TABLE bench_load FIELDS TERMINATED BY ','"][$engine];
 try {
-  $t0 = now_ms(); $q($load); $out['bulk_load_ms'] = now_ms() - $t0;
+  $t0 = now_ms(); $p0 = probe(); $q($load); $out['bulk_load_ms'] = now_ms() - $t0; $out['res']['bulk_load'] = res($p0);
   $out['bulk_rows'] = (int)$q("SELECT COUNT(*) FROM bench_load")[0][0];
 } catch (Exception $e) { $out['bulk_load_error'] = $e->getMessage(); }
 $q("DROP TABLE bench_load");
@@ -76,6 +86,10 @@ foreach ($queries as $name => $sql) {
   $q($s);
   $ts = [];
   for ($i = 0; $i < 5; $i++) { $t0 = now_ms(); $rows = $q($s); $ts[] = now_ms() - $t0; }
+  // the server's CPU for this query: it is run for at least a second (and 5 times), as /proc counts CPU in 10 ms ticks
+  $p0 = probe(); $n = 0; $t1 = now_ms();
+  while ($n < 5 || now_ms() - $t1 < 1000) { $q($s); $n++; }
+  $out['res']['query'][$name] = res($p0) + ['n' => $n];
   $out['query'][$name] = ['median_ms' => median($ts), 'min_ms' => min($ts), 'max_ms' => max($ts), 'answer' => $rows];
   if ($engine === 'asql') {   // the same text again and again: what ASQL's result cache answers
     $q($sql); $q($sql);
@@ -88,16 +102,18 @@ foreach ($queries as $name => $sql) {
 // 3. point lookups: 10,000 random ids, one after another
 mt_srand(7);
 $ids = []; for ($i = 0; $i < 10000; $i++) $ids[] = mt_rand(1, 500000);
-$ts = []; $t0 = now_ms();
+$ts = []; $t0 = now_ms(); $p0 = probe();
 foreach ($ids as $id) { $a = now_ms(); $q("SELECT id, customer_id, amount, status FROM bench_sales WHERE id = $id"); $ts[] = now_ms() - $a; }
 $total = now_ms() - $t0;
+$out['res']['point'] = res($p0);
 $out['point'] = ['n' => 10000, 'p50_ms' => pct($ts, 50), 'p99_ms' => pct($ts, 99), 'qps' => 10000 / ($total / 1000)];
 
 // 4. single-row updates: 2,000, autocommit
 mt_srand(11);
-$ts = []; $t0 = now_ms();
+$ts = []; $t0 = now_ms(); $p0 = probe();
 for ($i = 0; $i < 2000; $i++) { $id = mt_rand(1, 500000); $a = now_ms(); $q("UPDATE bench_sales SET amount = amount + 0.01 WHERE id = $id"); $ts[] = now_ms() - $a; }
 $total = now_ms() - $t0;
+$out['res']['update'] = res($p0);
 $out['update'] = ['n' => 2000, 'p50_ms' => pct($ts, 50), 'p99_ms' => pct($ts, 99), 'tps' => 2000 / ($total / 1000)];
 
 // storage the engine reports for the table

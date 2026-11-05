@@ -37,6 +37,10 @@ for e in asql maria cedar; do AMOUNT=double php bench.php $e > results/$e.json; 
 php cmp.php results; php table.php        # table.php reads results/ and results2/ (a second pass)
 ```
 
+`SERVER_PID=<pid of the engine's process>` (for a container, `docker inspect -f '{{.State.Pid}}' NAME`) makes `bench.php` also
+record the server's CPU time and resident memory per phase from `/proc`; `duckbench` records its own. Start each engine fresh
+for each `AMOUNT`, as peak memory is for the process's life.
+
 `bench.php` times each statement around the client call that sends it and reads its whole answer, over one
 persistent loopback connection (`mysqli` for ASQL and MariaDB, `pgsql` for CedarDB). `duckbench` times
 `duckdb_query` in process. For ASQL each query is timed with `SQL_NO_CACHE`, and again without it (`query_cached`):

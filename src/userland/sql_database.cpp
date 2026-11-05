@@ -1398,6 +1398,22 @@ bool parse_number(const std::string& s, double* out) {
     *out = s[0] == '-' ? -d : d;
     return true;
   }
+  // A decimal of up to 15 digits with no exponent: its digits as one integer (below 2^53) over a power of ten that a
+  // double holds exactly (10^0 .. 10^15), one division - correctly rounded, so exactly the double strtod gives.
+  if (dot && !expo && i - start - 1 <= 15) {
+    static const double kPow10[16] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+    int64_t m = 0;
+    int frac = 0;
+    bool seen_dot = false;
+    for (size_t k = start; k < i; ++k) {
+      if (s[k] == '.') { seen_dot = true; continue; }
+      m = m * 10 + (s[k] - '0');
+      if (seen_dot) ++frac;
+    }
+    const double d = (double)m / kPow10[frac];
+    *out = s[0] == '-' ? -d : d;
+    return true;
+  }
   *out = std::strtod(s.c_str(), nullptr);
   return true;
 }
@@ -1736,13 +1752,18 @@ Val numeric_literal_val(const std::string& text) {
   double d = 0;
   parse_number(text, &d);
   if (text.find_first_of("eE") != std::string::npos) return val_approx(d);
-  std::string ip = text, fp;
+  // the integer part without its leading zeros ("0" when none are left), then the digits after the point if there
+  // are any (the digits after it are the scale)
   const size_t dot = text.find('.');
-  bool has_dot = dot != std::string::npos;
-  if (has_dot) { ip = text.substr(0, dot); fp = text.substr(dot + 1); }
-  const size_t nz = ip.find_first_not_of('0');
-  ip = nz == std::string::npos ? "0" : ip.substr(nz);
-  return val_num_with_text(d, has_dot && !fp.empty() ? ip + "." + fp : ip);
+  const bool has_dot = dot != std::string::npos;
+  const size_t ip_end = has_dot ? dot : text.size();
+  size_t nz = 0;
+  while (nz < ip_end && text[nz] == '0') ++nz;
+  std::string canon;
+  if (nz == ip_end) canon = "0";
+  else canon.assign(text, nz, ip_end - nz);
+  if (has_dot && dot + 1 < text.size()) { canon += '.'; canon.append(text, dot + 1, std::string::npos); }
+  return val_num_with_text(d, canon);
 }
 
 Val val_null() { return Val(); }
@@ -2762,6 +2783,91 @@ bool statement_write_names(const std::vector<Token>& toks, std::vector<std::stri
   return !names->empty();
 }
 
+// A number literal starting at sql[i] (a digit, or a . and a digit): one past its last character. One reading, for the
+// tokenizer and the INSERT fast path.
+size_t scan_sql_number_end(const std::string& sql, size_t i) {
+  size_t j = i;
+  bool dot = false, expo = false;
+  while (j < sql.size()) {
+    char d = sql[j];
+    if (d >= '0' && d <= '9') { j++; continue; }
+    if (d == '.' && !dot && !expo) { dot = true; j++; continue; }
+    if ((d == 'e' || d == 'E') && !expo && j + 1 < sql.size()) {
+      size_t k = j + 1;
+      if (sql[k] == '+' || sql[k] == '-') k++;
+      if (k < sql.size() && sql[k] >= '0' && sql[k] <= '9') { expo = true; j = k; continue; }
+    }
+    break;
+  }
+  return j;
+}
+
+// A number and a quoted string as a literal in a statement: what the parser makes of the token, for SqlParser and
+// the INSERT fast path alike.
+Val sql_number_literal_val(const std::string& text) {
+  // The literal keeps the digits it was written with: a DECIMAL column stores 12345678901234.56 exactly, which the
+  // double it also carries cannot. Columns normalise what they store (SqlTable::normalize_cell), so an INT or
+  // DOUBLE still keeps its canonical form. 1e3 is a DOUBLE literal; 1000 and 10.00 are exact.
+  Val v = numeric_literal_val(text);
+  v.approx = text.find_first_of("eE") != std::string::npos;
+  return v;
+}
+Val sql_string_literal_val(const std::string& body) {
+  Val v = val_text(body);
+  // A quoted literal is text even when it looks like a number, so that '007' does not silently become 7 on the way
+  // into a row.
+  v.numeric = false;
+  v.prefix_num = numeric_prefix_of(body);
+  v.has_prefix = true;
+  return v;
+}
+
+// A quoted string literal starting at sql[i] (a ' or a "): its body with the escapes resolved, and where it ends (one
+// past the closing quote). False when it is not closed. One reading, for the tokenizer and the INSERT fast path.
+bool scan_sql_string_literal(const std::string& sql, size_t i, std::string* body_out, size_t* end_out) {
+  const char quote = sql[i];
+  const size_t n = sql.size();
+  std::string& body = *body_out;
+  size_t j = i + 1;
+  bool closed = false;
+  while (j < n) {
+    // a run of ordinary bytes at once: only a backslash or the quote is special
+    size_t k = j;
+    while (k < n && sql[k] != '\\' && sql[k] != quote) ++k;
+    if (k > j) { body.append(sql, j, k - j); j = k; if (j >= n) break; }
+    if (sql[j] == '\\' && j + 1 < n) {
+      // MySQL/MariaDB backslash escapes: most map to a real control
+      // byte, not the literal letter that follows the backslash. This
+      // used to just append sql[j+1] verbatim, so 'available\ndwi12'
+      // came out as 'availablendwi12' -- the newline never happened,
+      // it silently became the letter 'n'.
+      char esc = sql[j + 1];
+      switch (esc) {
+        case 'n': body += '\n'; break;
+        case 't': body += '\t'; break;
+        case 'r': body += '\r'; break;
+        case '0': body += '\0'; break;
+        case 'b': body += '\b'; break;
+        case 'Z': body += '\x1a'; break;
+        case '%': case '_': body += '\\'; body += esc; break;   // kept: LIKE reads them as escapes (MySQL keeps the backslash)
+        default: body += esc; break;  // \\ \' \" and anything else: literal char
+      }
+      j += 2;
+      continue;
+    }
+    if (sql[j] == quote) {
+      if (j + 1 < n && sql[j + 1] == quote) { body += quote; j += 2; continue; }
+      closed = true;
+      j++;
+      break;
+    }
+    body += sql[j++];   // a backslash that ends the text
+  }
+  if (!closed) return false;
+  *end_out = j;
+  return true;
+}
+
 bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std::string* err) {
   // About one token per five characters of SQL; growing the vector as it went
   // re-copied every token (two strings each) several times per statement.
@@ -2816,40 +2922,9 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
     }
     // String literals. '' and \' both escape a quote inside one.
     if (c == '\'' || c == '"') {
-      char quote = c;
       std::string body;
-      size_t j = i + 1;
-      bool closed = false;
-      while (j < sql.size()) {
-        if (sql[j] == '\\' && j + 1 < sql.size()) {
-          // MySQL/MariaDB backslash escapes: most map to a real control
-          // byte, not the literal letter that follows the backslash. This
-          // used to just append sql[j+1] verbatim, so 'available\ndwi12'
-          // came out as 'availablendwi12' -- the newline never happened,
-          // it silently became the letter 'n'.
-          char esc = sql[j + 1];
-          switch (esc) {
-            case 'n': body += '\n'; break;
-            case 't': body += '\t'; break;
-            case 'r': body += '\r'; break;
-            case '0': body += '\0'; break;
-            case 'b': body += '\b'; break;
-            case 'Z': body += '\x1a'; break;
-            case '%': case '_': body += '\\'; body += esc; break;   // kept: LIKE reads them as escapes (MySQL keeps the backslash)
-            default: body += esc; break;  // \\ \' \" and anything else: literal char
-          }
-          j += 2;
-          continue;
-        }
-        if (sql[j] == quote) {
-          if (j + 1 < sql.size() && sql[j + 1] == quote) { body += quote; j += 2; continue; }
-          closed = true;
-          j++;
-          break;
-        }
-        body += sql[j++];
-      }
-      if (!closed) { *err = "unterminated string literal"; return false; }
+      size_t j = 0;
+      if (!scan_sql_string_literal(sql, i, &body, &j)) { *err = "unterminated string literal"; return false; }
       Token t;
       t.kind = Tok::Str;
       t.text = std::move(body);   // not a copy of a 120-character value per literal
@@ -2954,19 +3029,7 @@ bool tokenize_sql_uncached(const std::string& sql, std::vector<Token>* out, std:
     }
     if ((c >= '0' && c <= '9') ||
         (c == '.' && i + 1 < sql.size() && sql[i + 1] >= '0' && sql[i + 1] <= '9')) {
-      size_t j = i;
-      bool dot = false, expo = false;
-      while (j < sql.size()) {
-        char d = sql[j];
-        if (d >= '0' && d <= '9') { j++; continue; }
-        if (d == '.' && !dot && !expo) { dot = true; j++; continue; }
-        if ((d == 'e' || d == 'E') && !expo && j + 1 < sql.size()) {
-          size_t k = j + 1;
-          if (sql[k] == '+' || sql[k] == '-') k++;
-          if (k < sql.size() && sql[k] >= '0' && sql[k] <= '9') { expo = true; j = k; continue; }
-        }
-        break;
-      }
+      const size_t j = scan_sql_number_end(sql, i);
       Token t;
       t.kind = Tok::Num;
       t.text = sql.substr(i, j - i);
@@ -4525,15 +4588,7 @@ class SqlParser {
     const Token& t = peek();
     if (t.kind == Tok::Num) {
       auto e = make(ExprOp::Literal);
-      double d = 0;
-      parse_number(t.text, &d);
-      // The literal keeps the digits it was written with: a DECIMAL column
-      // stores 12345678901234.56 exactly, which the double it also carries
-      // cannot. Columns normalise what they store (SqlTable::normalize_cell),
-      // so an INT or DOUBLE still keeps its canonical form.
-      e->literal = numeric_literal_val(t.text);
-      // 1e3 is a DOUBLE literal; 1000 and 10.00 are exact.
-      e->literal.approx = t.text.find_first_of("eE") != std::string::npos;
+      e->literal = sql_number_literal_val(t.text);
       e->source_text = t.text;
       e->tok_index = (int)p_;
       p_++;
@@ -4541,12 +4596,7 @@ class SqlParser {
     }
     if (t.kind == Tok::Str) {
       auto e = make(ExprOp::Literal);
-      e->literal = val_text(t.text);
-      // A quoted literal is text even when it looks like a number, so that
-      // '007' does not silently become 7 on the way into a row.
-      e->literal.numeric = false;
-      e->literal.prefix_num = numeric_prefix_of(t.text);
-      e->literal.has_prefix = true;
+      e->literal = sql_string_literal_val(t.text);
       e->source_text = "'" + t.text + "'";
       if (t.hex) {
         double n = 0;
@@ -29529,6 +29579,160 @@ ShapeEntry* shape_take(const std::string& q, const std::vector<Token>& toks, Par
 
 namespace { static bool expr_has_window(const SqlExpr* e); }
 
+// The rows of a plain `INSERT [IGNORE] [INTO] t [(cols)] VALUES (..), (..)` read off the statement's text, and handed
+// to execute_insert beside the tokens of the part before them. A 5,000-row statement was 70,000 tokens (two strings
+// each) and a parse and an expression tree per value before the first row was stored: half the CPU of loading it.
+// Only what reads the same either way is taken here - numbers, quoted strings, NULL, TRUE, FALSE and a sign on a
+// number, each built as the parser builds it, nothing after the last row but a ';' - and anything else leaves the
+// statement to the tokenizer and parser, which read it as they always did.
+struct PendingInsertRows {
+  bool valid = false;
+  std::string sql;                          // the statement they were read from
+  std::vector<std::vector<Val>> tuples;
+};
+thread_local PendingInsertRows tl_pending_insert;
+thread_local bool tl_insert_full_tokens = false;   // execute_insert read the whole text again: its rows were gone
+bool sql_fast_insert_enabled() {
+  static const bool on = std::getenv("AIOS_SQL_NO_FAST_INSERT") == nullptr;
+  return on;
+}
+bool sql_fast_insert_values(const std::string& q, std::vector<Token>* toks) {
+  if (!toks->empty() || q.size() < 256 || !sql_fast_insert_enabled()) return false;
+  const size_t n = q.size();
+  size_t i = 0;
+  auto ws = [&] { while (i < n && (q[i] == ' ' || q[i] == '\t' || q[i] == '\r' || q[i] == '\n')) ++i; };
+  auto ident_ch = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$'; };
+  // a word, in either case, with nothing that continues a name after it
+  auto word = [&](const char* w) {
+    size_t k = 0;
+    while (w[k]) { if (i + k >= n || (q[i + k] | 0x20) != (w[k] | 0x20)) return false; ++k; }
+    if (i + k < n && (ident_ch(q[i + k]) || q[i + k] == '@')) return false;
+    i += k;
+    return true;
+  };
+  // a name: bare, or in backticks (what the tokenizer reads as one)
+  auto name = [&](bool* is_objects) {
+    if (i < n && q[i] == '`') {
+      const size_t e = q.find('`', i + 1);
+      if (e == std::string::npos || e == i + 1) return false;
+      i = e + 1;
+      return true;
+    }
+    const size_t from = i;
+    while (i < n && ident_ch(q[i])) ++i;
+    if (i == from) return false;
+    if (is_objects && i - from == 7 && (q.compare(from, 7, "objects") == 0 || q.compare(from, 7, "OBJECTS") == 0 || [&] { for (size_t k = 0; k < 7; ++k) if ((q[from + k] | 0x20) != "objects"[k]) return false; return true; }())) *is_objects = true;
+    return true;
+  };
+  ws();
+  if (!word("INSERT")) return false;
+  ws();
+  word("IGNORE");
+  ws();
+  word("INTO");
+  ws();
+  bool objects = false;
+  if (!name(&objects) || objects) return false;
+  if (i < n && q[i] == '.') { ++i; if (!name(nullptr)) return false; }
+  ws();
+  if (i < n && q[i] == '(') {   // the column list
+    ++i;
+    for (;;) {
+      ws();
+      if (!name(nullptr)) return false;
+      ws();
+      if (i < n && q[i] == ',') { ++i; continue; }
+      if (i < n && q[i] == ')') { ++i; break; }
+      return false;
+    }
+    ws();
+  }
+  if (!word("VALUES") && !word("VALUE")) return false;
+  const size_t prefix_end = i;
+  // the rows
+  std::vector<std::vector<Val>> tuples;
+  size_t width = 8;
+  EvalCtx ctx;
+  std::string verr;
+  ctx.err = &verr;
+  for (;;) {
+    ws();
+    if (i >= n || q[i] != '(') return false;
+    ++i;
+    std::vector<Val> tuple;
+    tuple.reserve(width);
+    for (;;) {
+      ws();
+      if (i >= n) return false;
+      const char c = q[i];
+      Val v;
+      if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+        bool neg = false;
+        if (c == '-' || c == '+') {
+          neg = c == '-';
+          ++i;
+          ws();
+          if (i >= n) return false;
+        }
+        const char d = q[i];
+        if (!((d >= '0' && d <= '9') || (d == '.' && i + 1 < n && q[i + 1] >= '0' && q[i + 1] <= '9'))) return false;
+        if (d == '0' && i + 1 < n && (q[i + 1] == 'x' || q[i + 1] == 'X' || q[i + 1] == 'b' || q[i + 1] == 'B')) return false;   // 0x.., 0b..
+        const size_t e = scan_sql_number_end(q, i);
+        const std::string text = q.substr(i, e - i);
+        i = e;
+        v = sql_number_literal_val(text);
+        if (neg) {   // the evaluator's own negation of the literal, as `-5` is evaluated
+          auto lit = std::make_shared<SqlExpr>();
+          lit->op = ExprOp::Literal;
+          lit->literal = v;
+          lit->source_text = text;
+          SqlExpr ng;
+          ng.op = ExprOp::Neg;
+          ng.args = {lit};
+          verr.clear();
+          v = eval_expr(&ng, ctx);
+          if (!verr.empty()) return false;
+        }
+      } else if (c == '\'' || c == '"') {
+        std::string body;
+        size_t e = 0;
+        if (!scan_sql_string_literal(q, i, &body, &e)) return false;
+        i = e;
+        v = sql_string_literal_val(body);
+      } else if (word("NULL")) {
+        v = val_null();
+      } else if (word("TRUE")) {
+        v = val_num(1);
+      } else if (word("FALSE")) {
+        v = val_num(0);
+      } else {
+        return false;
+      }
+      tuple.push_back(std::move(v));
+      ws();
+      if (i >= n) return false;
+      if (q[i] == ',') { ++i; continue; }
+      if (q[i] == ')') { ++i; break; }
+      return false;
+    }
+    width = tuple.size();
+    if (tuples.empty()) tuples.reserve(std::min<size_t>(n / std::max<size_t>(i - prefix_end, 1) + 2, 1u << 20));
+    tuples.push_back(std::move(tuple));
+    ws();
+    if (i >= n) break;
+    if (q[i] == ';') { ++i; ws(); if (i < n) return false; break; }
+    if (q[i] != ',') return false;
+    ++i;
+  }
+  // the tokens of the part before the rows: all anything else in the gateway has to look at
+  std::string terr;
+  if (!tokenize_sql_uncached(q.substr(0, prefix_end), toks, &terr)) { toks->clear(); return false; }
+  tl_pending_insert.sql = q;
+  tl_pending_insert.tuples = std::move(tuples);
+  tl_pending_insert.valid = true;
+  return true;
+}
+
 SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& sql_query, const std::string& session_db) {
   ScopedSessionDb guard(session_db);
   // Taken here, before anything nested can run, so a subquery's answer never
@@ -29698,7 +29902,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
   TokenVec tv;
   std::vector<Token>& toks = tv.toks;
   std::string terr;
-  if (!tokenize_sql(q, &toks, &terr, false)) {
+  if (!sql_fast_insert_values(q, &toks) && !tokenize_sql(q, &toks, &terr, false)) {
     // Text that does not tokenize: the engine's own forms by their text, else
     // 100% transparent fallback routing for obscure queries or syntax edge cases.
     const std::string upper_q = upper_of_statement(q);
@@ -62844,6 +63048,19 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   if (!p.take_word("VALUES") && !p.take_word("VALUE"))
     return make_error("expected VALUES");
 
+  // The rows read off the text by the gateway (sql_fast_insert_values), which tokenized only what is before them.
+  const bool pre_parsed = tl_pending_insert.valid && p.at_end() && tl_pending_insert.sql == sql;
+  if (pre_parsed) {
+    tuples = std::move(tl_pending_insert.tuples);
+    tl_pending_insert.valid = false;
+  } else if (p.at_end() && !tl_insert_full_tokens && sql.size() >= 256) {
+    // Those tokens are all there are, and their rows are gone (this statement ran before and was sent again): read
+    // the whole text.
+    tl_insert_full_tokens = true;
+    struct Reset { ~Reset() { tl_insert_full_tokens = false; } } reset;
+    return execute_insert(sql);
+  }
+  if (!pre_parsed) {
   const size_t expected_cols = target_cols.empty() ? t->columns.size() : target_cols.size();
   size_t est_tuples = 1;
   for (size_t k = p.pos(); k < toks.size(); ++k)
@@ -62886,6 +63103,7 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
     tuples.push_back(std::move(tuple));
   } while (p.take_punct(","));
   tuples.shrink_to_fit();
+  }
   }
 
   // MySQL's upsert tail: the assignments apply to the row the new one
