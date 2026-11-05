@@ -143,6 +143,11 @@ float measured_reward(const SubstrateState& s_t, const SubstrateState& s_t1);
 // silently returned nothing would be worse than no device.
 using MatmulOffload = bool (*)(const float* A, const float* B, float* C, int M, int K, int N);
 void set_matmul_offload(MatmulOffload fn, const char* what);
+// An offload to find when it is first wanted rather than at boot: `binder` runs once, on the first matrix product (or
+// the first question about the offload), and registers one by set_matmul_offload if the machine has a device for it.
+// Finding a device maps the OpenCL, CUDA and Vulkan runtimes - hundreds of MB - which a process that never runs the
+// predictor (a SQL server) should not pay. An explicit set_matmul_offload cancels a binder not yet run.
+void set_matmul_offload_binder(void (*binder)());
 bool matmul_offload_is_live();
 const char* matmul_offload_name();
 // What it has actually done, so the claim can be checked rather than believed.

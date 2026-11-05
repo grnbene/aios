@@ -1539,6 +1539,20 @@ inline double scaled_decimal_double(int64_t x, double sf) {
   return std::strtod(text.c_str(), nullptr);
 }
 
+// n scaled integers as the doubles scaled_decimal_double gives them: when every one lies below 2^53 (tested once for
+// all, not per value) each is one correctly rounded division, in a loop a compiler can vectorize.
+inline void scaled_decimal_doubles(const int64_t* x, size_t n, double sf, double* out) {
+  if (sf <= 0.0) sf = 1.0;
+  const int64_t lim = (int64_t)1 << 53;
+  bool small = true;
+  for (size_t i = 0; i < n; ++i) small &= (x[i] < lim) & (x[i] > -lim);
+  if (small) {
+    for (size_t i = 0; i < n; ++i) out[i] = (double)x[i] / sf;
+    return;
+  }
+  for (size_t i = 0; i < n; ++i) out[i] = scaled_decimal_double(x[i], sf);
+}
+
 // A set of doubles in one flat array (open addressing): the node-per-value
 // std::unordered_set it replaces made an IN (subquery) over 250k keys a
 // malloc per key to build and a free per key to drop - over half of a
@@ -34042,7 +34056,12 @@ void typed_values(const ColumnStore& cs, size_t start, size_t end, double* out) 
       decode_codes(cs, start, end, codes.data());
       if (cs.encoding == ColumnEncoding::FOR)
         for (size_t i = 0; i < n; ++i) out[i] = (double)(cs.base_int64 + (int64_t)codes[i]);
-      else
+      else if (cs.base_int64 > -((int64_t)1 << 53) && cs.base_int64 + (int64_t)0xFFFFFFFFll < ((int64_t)1 << 53)) {
+        // every code is below 2^32, so every value is below 2^53: the divide alone, as scaled_decimal_double does it
+        const double sf = cs.scale_factor <= 0.0 ? 1.0 : cs.scale_factor;
+        const int64_t base = cs.base_int64;
+        for (size_t i = 0; i < n; ++i) out[i] = (double)(base + (int64_t)codes[i]) / sf;
+      } else
         for (size_t i = 0; i < n; ++i) out[i] = scaled_decimal_double(cs.base_int64 + (int64_t)codes[i], cs.scale_factor);
       return;
     }
@@ -38497,7 +38516,8 @@ bool select_rows(SqlDatabase* db, const SqlTable& t, const SqlExpr* where, const
     if (found >= stop_after) from = m_end_bound;
   }
   if (from < m_end_bound)
-    SqlThreadPool::instance().for_chunks(m_end_bound - from, 1, std::min(total, m_end_bound * kVxMorsel) - std::min(total, from * kVxMorsel), true,
+    // each morsel's hits are its own result, whichever thread scans it: handed out to whichever is free
+    SqlThreadPool::instance().for_chunks(m_end_bound - from, 1, std::min(total, m_end_bound * kVxMorsel) - std::min(total, from * kVxMorsel), false,
                                          [&](size_t m0, size_t m1, size_t tid) { scan(from + m0, from + m1, tid, false); });
   for (auto& e : errs) if (!e.empty()) { *err = e; return false; }
   out->count = 0;
@@ -39828,6 +39848,16 @@ void decode_for(const Agg& a, const AggPlan& p, const ColumnStore& cs, size_t st
     return;
   }
   if (p.need_codes) { c.codes.resize(n); decode_codes(cs, start, end, c.codes.data()); }
+  if (p.need_nums && p.need_ints && (cs.encoding == ColumnEncoding::FOR || cs.encoding == ColumnEncoding::DecimalScaled)) {
+    // both from one unpack of the codes: typed_values makes a FOR column's doubles of its integers, and a
+    // DecimalScaled one's from the same integers by scaled_decimal_double
+    c.ints.resize(n);
+    c.nums.resize(n);
+    typed_ints(cs, start, end, c.ints.data());
+    if (cs.encoding == ColumnEncoding::FOR) for (size_t i = 0; i < n; ++i) c.nums[i] = (double)c.ints[i];
+    else scaled_decimal_doubles(c.ints.data(), n, cs.scale_factor, c.nums.data());
+    return;
+  }
   if (p.need_nums) { c.nums.resize(n); typed_values(cs, start, end, c.nums.data()); }
   if (p.need_ints) {
     c.ints.resize(n);
@@ -39927,6 +39957,23 @@ inline void sum_kernel(const Agg& a, const AggPlan& p, AggArrays& A, const Colum
     uint8_t ok = A.ok[0];
     AIOS_INT128 isum = A.isum[0];
     const std::vector<uint8_t>* mk = a.mask.get();
+    if (!mk && !nn && dec && ok && p.dec_direct && !scale_ints) {
+      // A scaled DECIMAL with no mask, no NULL and nothing to rescale: every row adds its integer to the exact total
+      // and its double to the approximate one, in row order, and counts - the loop below without its tests, the
+      // totals in registers (the 128-bit one was read and written through memory on every row).
+      const int64_t* iv = c.ints.data();
+      const double* nv = c.nums.data();
+      AIOS_INT128 acc = isum;
+      double d = num;
+      if (dense) {
+        for (size_t j = 0; j < n; ++j) { acc += (AIOS_INT128)iv[j]; d += nv[j]; }
+      } else {
+        for (size_t j = 0; j < n; ++j) { const size_t i = rows[j] - start; acc += (AIOS_INT128)iv[i]; d += nv[i]; }
+      }
+      isum = acc;
+      num = d;
+      cnt += n;
+    } else
     for (size_t j = 0; j < n; ++j) {
       const size_t r = dense ? start + j : rows[j];
       if (mk && (r >= mk->size() || !(*mk)[r])) { if (a.mask_else_zero) ++cnt; continue; }
@@ -39969,6 +40016,24 @@ struct RawBuf {
 struct DealtRow { uint32_t r, g; };
 // A row dealt with its value and a bit for each sum whose mask (or none) takes it: what a pivot's lanes add.
 struct DealtVal { double v; uint32_t g, bits; };
+
+// Whether an aggregate's total is the same whichever thread adds which morsel: a count, an exact INT or scaled DECIMAL
+// sum (an integer total, which the answer is made of - the double beside it is never read), and the MIN or MAX of such
+// a column (equal numbers are the same text). The scans of aggregates that are all of these hand out morsels to
+// whichever thread is free; a thread that shares its core with another process then does less, instead of holding
+// every query up at the pace of its static share. A DOUBLE total depends on the order of its additions, so those
+// scans keep one fixed share a thread.
+inline bool agg_order_free(const SqlTable& t, const Agg& a, const AggPlan& p) {
+  if (a.kind == Agg::CountStar) return true;
+  if (a.kind == Agg::Count) return a.col_rules;
+  if (a.prog || !a.col_rules || a.src.kind != Source::TypedCol || !p.need_ints) return false;
+  const ColumnStore& cs = t.col_data[a.src.col];
+  if (a.kind == Agg::Sum || a.kind == Agg::Avg)
+    return (a.col_type == SqlDataType::Decimal && p.dec_direct && !typed_integer(cs)) ||
+           (a.col_type == SqlDataType::Int && typed_integer(cs));
+  if (a.kind == Agg::Min || a.kind == Agg::Max) return a.col_type == SqlDataType::Decimal || a.col_type == SqlDataType::Int;
+  return false;
+}
 
 bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Source>& key_src,
                   const std::vector<std::vector<uint32_t>>& key_canon, bool has_group_by, const std::vector<Agg>& aggs,
@@ -40127,7 +40192,9 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
           }
         }
 
-        SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t tid) {
+        bool slot_free = true;
+        for (size_t ai = 0; ai < aggs.size(); ++ai) if (!agg_order_free(t, aggs[ai], plans[ai])) slot_free = false;
+        SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), !slot_free, [&](size_t c0, size_t c1, size_t tid) {
           const size_t m0 = mb + c0, m1 = mb + c1;
           if (tid >= lanes) tid = 0;
           if (part_first[tid].empty()) {
@@ -40381,7 +40448,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             radix_sort_pairs(fo, rbits);   // first rows are distinct
             for (const auto& e : fo) { slot[e.second] = (int32_t)first_row->size(); first_row->push_back((uint32_t)e.first); }
             const uint64_t gk1 = vx_trace_enabled() ? hal_now_ns() : 0;
-            SqlThreadPool::instance().for_chunks(me - mb, 16, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t) {
+            SqlThreadPool::instance().for_chunks(me - mb, 16, sel.work_rows(), false, [&](size_t c0, size_t c1, size_t) {
               for (size_t m = mb + c0; m < mb + c1; ++m)
                 for (auto& x : gid[m]) x = (uint32_t)slot[x];
             });
@@ -40436,7 +40503,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
     };
     std::vector<Local> loc(lanes);
     std::vector<uint32_t> owner(M, 0);
-    SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t tid) {
+    SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), false, [&](size_t c0, size_t c1, size_t tid) {
       const size_t m0 = mb + c0, m1 = mb + c1;
       if (tid >= lanes) tid = 0;
       Local& L = loc[tid];
@@ -40533,7 +40600,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
     gmethod = single_id ? "hash of integer keys a lane, merged" : id_keys ? "hash of packed keys a lane, merged" : "hash of key text a lane, merged";
     first_row->resize(G);
     for (size_t i = 0; i < G; ++i) (*first_row)[i] = gfirst[order[i]];
-    SqlThreadPool::instance().for_chunks(me - mb, 16, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t) {
+    SqlThreadPool::instance().for_chunks(me - mb, 16, sel.work_rows(), false, [&](size_t c0, size_t c1, size_t) {
       for (size_t m = mb + c0; m < mb + c1; ++m) {
         const auto& rm = remap[owner[m]];
         for (auto& x : gid[m]) x = rank_of[rm[x]];
@@ -40641,7 +40708,27 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
   for (size_t ai = 0; ai < aggs.size(); ++ai) if (plans[ai].mode == AggMode::Par && !done[ai]) par.push_back(ai);
   if (!par.empty()) {
     std::vector<std::vector<AggArrays>> part(lanes);
-    SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), true, [&](size_t c0, size_t c1, size_t tid) {
+    // The aggregates that read a morsel's column the same way (a full aggregate's SUM, AVG, MIN and MAX of one column)
+    // share one decode of it: the first of them decodes, the rest read what it left. Those that need no decode
+    // (a COUNT) and those that run a program of their own decode for themselves.
+    std::vector<size_t> prep(aggs.size());
+    std::vector<uint8_t> pdec(aggs.size(), 0);
+    for (size_t pi = 0; pi < par.size(); ++pi) {
+      const size_t ai = par[pi];
+      const Agg& a = aggs[ai];
+      prep[ai] = ai;
+      pdec[ai] = !(a.kind == Agg::CountStar || (a.kind == Agg::Count && a.col_rules && !nulls[ai]));
+      if (!pdec[ai] || a.prog) continue;
+      for (size_t pj = 0; pj < pi; ++pj) {
+        const size_t aj = par[pj];
+        if (pdec[aj] && prep[aj] == aj && !aggs[aj].prog && aggs[aj].src.col == a.src.col &&
+            plans[aj].need_codes == plans[ai].need_codes && plans[aj].need_nums == plans[ai].need_nums &&
+            plans[aj].need_ints == plans[ai].need_ints) { prep[ai] = aj; break; }
+      }
+    }
+    bool par_free = true;
+    for (size_t ai : par) if (!agg_order_free(t, aggs[ai], plans[ai])) par_free = false;
+    SqlThreadPool::instance().for_chunks(me - mb, 1, sel.work_rows(), !par_free, [&](size_t c0, size_t c1, size_t tid) {
       const size_t m0 = mb + c0, m1 = mb + c1;
       if (tid >= lanes) tid = 0;
       auto& P = part[tid];
@@ -40660,17 +40747,23 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         const size_t start = m * kVxMorsel, end = std::min(start + kVxMorsel, sel.total);
         const bool dense = sel.all;    // rows == [start, end)
         for (size_t ai : par) {
+          if (!pdec[ai] || prep[ai] != ai) continue;
+          const Agg& a = aggs[ai];
+          const ColumnStore& cs = t.col_data[a.src.col];
+          if (!dense && n * 8 < end - start) decode_for_rows(a, plans[ai], cs, start, end, rows.data(), n, cols[ai]);
+          else decode_for(a, plans[ai], cs, start, end, cols[ai]);
+        }
+        for (size_t ai : par) {
           const Agg& a = aggs[ai];
           const AggPlan& p = plans[ai];
           const ColumnStore& cs = t.col_data[a.src.col];
           AggArrays& A = P[ai];
+          const AggCols& cc = cols[prep[ai]];
           if (!has_group_by) {
             // Single-group kernels: a tight loop instead of a call per row.
             if (a.kind == Agg::CountStar) { A.cnt[0] += n; continue; }
             if (a.kind == Agg::Count && a.col_rules && !nulls[ai]) { A.cnt[0] += n; continue; }
             if ((a.kind == Agg::Min || a.kind == Agg::Max) && (p.need_nums || p.need_codes || p.need_ints)) {
-              if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
-              else decode_for(a, p, cs, start, end, cols[ai]);
               const bool is_min = a.kind == Agg::Min;
               const bool nn = nulls[ai];
               for (size_t j = 0; j < n; ++j) {
@@ -40678,13 +40771,13 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 if (nn && cs.is_null(r)) continue;
                 const size_t i = r - start;
                 if (p.need_ints) {
-                  const int64_t x = cols[ai].ints[i];
+                  const int64_t x = cc.ints[i];
                   if (!A.has[0] || (is_min ? x < A.ibest[0] : x > A.ibest[0])) { A.has[0] = 1; A.ibest[0] = x; A.row[0] = (int64_t)r; }
                 } else if (p.need_nums) {
-                  double d = cols[ai].nums[i];
+                  double d = cc.nums[i];
                   if (!A.has[0] || (is_min ? d < A.num[0] : d > A.num[0])) { A.has[0] = 1; A.num[0] = d; A.row[0] = (int64_t)r; }
                 } else {
-                  uint32_t k = cols[ai].codes[i];
+                  uint32_t k = cc.codes[i];
                   if (k >= a.min_rank.size()) continue;
                   int rk = a.min_rank[k];
                   if (!A.has[0] || (is_min ? rk < A.rank[0] : rk > A.rank[0])) { A.has[0] = 1; A.rank[0] = rk; A.row[0] = (int64_t)r; }
@@ -40693,9 +40786,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
               continue;
             }
             if (sum_kernel_applies(a, p)) {
-              if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
-              else decode_for(a, p, cs, start, end, cols[ai]);
-              sum_kernel(a, p, A, cs, cols[ai], nulls[ai], dense, start, rows.data(), n);
+              sum_kernel(a, p, A, cs, cc, nulls[ai], dense, start, rows.data(), n);
               continue;
             }
           }
@@ -40705,14 +40796,10 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
             for (size_t j = 0; j < n; ++j) A.cnt[gs[j]]++;
             continue;
           }
-          if (!(a.kind == Agg::CountStar)) {
-            if (!dense && n * 8 < end - start) decode_for_rows(a, p, cs, start, end, rows.data(), n, cols[ai]);
-            else decode_for(a, p, cs, start, end, cols[ai]);
-          }
           const uint32_t* gs = has_group_by ? gid[m].data() : nullptr;
           for (size_t j = 0; j < n; ++j) {
             const size_t r = dense ? start + j : rows[j];
-            acc_row(a, p, A, gs ? gs[j] : 0, r, r - start, cols[ai], cs, nulls[ai], rd);
+            acc_row(a, p, A, gs ? gs[j] : 0, r, r - start, cc, cs, nulls[ai], rd);
           }
         }
       }

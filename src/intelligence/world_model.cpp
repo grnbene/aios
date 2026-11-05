@@ -401,18 +401,25 @@ namespace {
 MatmulOffload g_matmul = nullptr;
 const char* g_matmul_what = "scalar CPU (freestanding kernel core)";
 MatmulOffloadCount g_matmul_counts;
+std::atomic<void (*)()> g_matmul_binder{nullptr};   // run once, by whichever asks first
+void run_matmul_binder() {
+  if (auto b = g_matmul_binder.exchange(nullptr)) b();
+}
 }  // namespace
 
 void set_matmul_offload(MatmulOffload fn, const char* what) {
+  g_matmul_binder.store(nullptr);   // an explicit choice stands
   g_matmul = fn;
   g_matmul_what = (fn && what && *what) ? what : "scalar CPU (freestanding kernel core)";
 }
-bool matmul_offload_is_live() { return g_matmul != nullptr; }
-const char* matmul_offload_name() { return g_matmul_what; }
-MatmulOffloadCount matmul_offload_counters() { return g_matmul_counts; }
+void set_matmul_offload_binder(void (*binder)()) { g_matmul_binder.store(binder); }
+bool matmul_offload_is_live() { run_matmul_binder(); return g_matmul != nullptr; }
+const char* matmul_offload_name() { run_matmul_binder(); return g_matmul_what; }
+MatmulOffloadCount matmul_offload_counters() { run_matmul_binder(); return g_matmul_counts; }
 
 void matmul(const float* A, const float* B, float* C, int M, int K, int N) {
   if (M <= 0 || K <= 0 || N <= 0) return;
+  if (g_matmul_binder.load(std::memory_order_relaxed)) run_matmul_binder();
   if (g_matmul) {
     if (g_matmul(A, B, C, M, K, N)) {
       ++g_matmul_counts.offloaded;

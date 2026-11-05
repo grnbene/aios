@@ -4146,22 +4146,18 @@ bool fabric_matmul(const float* A, const float* B, float* C, int M, int K, int N
 }
 
 // Pick the device once: a GPU that says it can do a matmul, preferring one
-// whose name says it is actually dispatching rather than simulating.
-void bind_predictor_offload(Ctx& c, bool on) {
-  if (!on) {
-    g_mm_kernel = nullptr;
-    g_mm_device = nullptr;
-    intelligence::set_matmul_offload(nullptr, nullptr);
-    return;
-  }
-  g_mm_kernel = &c.k;
+// whose name says it is actually dispatching rather than simulating. Finding the devices maps the OpenCL, CUDA and
+// Vulkan runtimes, so this runs when the predictor first multiplies (set_matmul_offload_binder), not at boot.
+void bind_predictor_offload_now() {
+  if (!g_mm_kernel) return;
+  Kernel& k = *g_mm_kernel;
   g_mm_device = nullptr;
   Operation probe;
   probe.code = OpCode::MatMul;
   probe.inputs.push_back(Tensor{MemoryID{}, DType::F32, {4, 4}, 0});
   probe.inputs.push_back(Tensor{MemoryID{}, DType::F32, {4, 4}, 0});
   probe.outputs.push_back(Tensor{MemoryID{}, DType::F32, {4, 4}, 0});
-  for (auto* d : c.k.devices().of_type(DeviceType::GPU)) {
+  for (auto* d : k.devices().of_type(DeviceType::GPU)) {
     if (!d->supports(probe)) continue;
     if (d->name().rfind("vulkan:", 0) == 0 || d->name().find("Vulkan") != std::string::npos) { g_mm_device = d; break; }
     if (!g_mm_device) g_mm_device = d;
@@ -4173,6 +4169,16 @@ void bind_predictor_offload(Ctx& c, bool on) {
   static std::string what;
   what = g_mm_device->name() + " through the compute fabric";
   intelligence::set_matmul_offload(&fabric_matmul, what.c_str());
+}
+void bind_predictor_offload(Ctx& c, bool on) {
+  if (!on) {
+    g_mm_kernel = nullptr;
+    g_mm_device = nullptr;
+    intelligence::set_matmul_offload(nullptr, nullptr);
+    return;
+  }
+  g_mm_kernel = &c.k;
+  bind_predictor_offload_now();
 }
 }  // namespace
 
@@ -4577,7 +4583,13 @@ void cmd_jepa(Ctx& c, const Args& a) {
   // declines the rest back to the CPU. `jepa gpu off` unbinds it, and
   // `jepa bench` is what decided the threshold.
   static bool bound_once = false;
-  if (!bound_once && sub != "gpu") { bound_once = true; bind_predictor_offload(c, true); }
+  if (!bound_once && sub != "gpu") {
+    bound_once = true;
+    // bound by default, found when the predictor first multiplies: every aios process runs `jepa reboot-resume` at
+    // boot, and finding the devices there mapped the GPU runtimes (385 MB) into a SQL server that never multiplies
+    g_mm_kernel = &c.k;
+    intelligence::set_matmul_offload_binder(&bind_predictor_offload_now);
+  }
   // And the levers. Without this the recorder chose an action every step and
   // nothing consumed it: `jepa status` said "Actuation: NOT BOUND" on a machine
   // that owns two of the four levers outright.
