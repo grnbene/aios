@@ -49,7 +49,12 @@ struct LoadField {
 // ENCLOSED BY set, an unenclosed field that is the word NULL is NULL as well.
 class LoadReader {
  public:
-  LoadReader(const char* data, size_t size, const LoadFormat& f) : p_(data), end_(data + size), f_(f) {}
+  LoadReader(const char* data, size_t size, const LoadFormat& f) : p_(data), end_(data + size), f_(f) {
+    // The bytes that can end or change an unenclosed field: a terminator's first byte, the escape character.
+    if (!f_.field_term.empty()) special_[(unsigned char)f_.field_term[0]] = 1;
+    if (!f_.line_term.empty()) special_[(unsigned char)f_.line_term[0]] = 1;
+    if (f_.escape >= 0) special_[(unsigned char)f_.escape] = 1;
+  }
   bool at_end() const { return p_ >= end_; }
 
   // The next line's fields into *out. False at the end of the data. A line without LINES STARTING BY's prefix is
@@ -73,6 +78,7 @@ class LoadReader {
   const char* p_;
   const char* end_;
   const LoadFormat& f_;
+  uint8_t special_[256] = {};
 
   bool at(const char* q, const std::string& s) const {
     return !s.empty() && (size_t)(end_ - q) >= s.size() && std::memcmp(q, s.data(), s.size()) == 0;
@@ -128,6 +134,17 @@ class LoadReader {
         bool escaped_any = false;
         for (;;) {
           if (p_ >= end_) { line_done = true; break; }
+          // A run of bytes none of which is special: the field's text, as the steps below would add it a byte at
+          // a time (no terminator starts at any of them, and none is the escape) - one append instead of two
+          // compares and an append per byte.
+          if (!special_[(unsigned char)*p_]) {
+            const char* q = p_ + 1;
+            while (q < end_ && !special_[(unsigned char)*q]) ++q;
+            if (fld.null) fld.null = false;
+            fld.text.append(p_, (size_t)(q - p_));
+            p_ = q;
+            continue;
+          }
           if (at(p_, f_.field_term)) { p_ += f_.field_term.size(); break; }
           if (at(p_, f_.line_term)) { p_ += f_.line_term.size(); line_done = true; break; }
           const char c = *p_;
@@ -452,23 +469,31 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
   size_t line_no = 0;
   std::string failure;
 
-  auto flush = [&]() -> bool {
-    if (batch.empty()) return true;
-    const uint64_t f0 = hal_now_ns();
-    std::string rec;
-    rec.reserve(head.size() + 16 + batch.size() * (batch[0].size() * 12 + 4));
+  // The batch as the INSERT that is logged.
+  auto batch_text = [&head](const std::vector<std::vector<Val>>& rows, std::string& rec) {
+    rec.clear();
+    rec.reserve(head.size() + 16 + rows.size() * (rows[0].size() * 12 + 4));
     rec += head;
     rec += " VALUES ";
-    for (size_t r = 0; r < batch.size(); ++r) {
+    for (size_t r = 0; r < rows.size(); ++r) {
       rec += r ? ",(" : "(";
-      for (size_t k = 0; k < batch[r].size(); ++k) {
-        const Val& v = batch[r][k];
+      for (size_t k = 0; k < rows[r].size(); ++k) {
+        const Val& v = rows[r][k];
         if (k) rec += ',';
         if (v.null) rec += "NULL";
         else append_sql_literal(rec, v.str());
       }
       rec += ')';
     }
+  };
+  std::string* batch_rec = nullptr;   // the batch's text, made already (by the reader)
+  auto flush = [&]() -> bool {
+    if (batch.empty()) return true;
+    const uint64_t f0 = hal_now_ns();
+    std::string rec;
+    if (batch_rec) rec = std::move(*batch_rec);
+    else batch_text(batch, rec);
+    batch_rec = nullptr;
     const size_t n = batch.size();
     const uint64_t f1 = hal_now_ns();
     ns_rec += f1 - f0;
@@ -497,7 +522,88 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
     return true;
   };
 
-  while (rd.next_line(&fields)) {
+  // A load with no SET and no @variable: the file is read on a thread of its own, a batch ahead, while this one
+  // inserts the batch before - reading and splitting the lines was a quarter of a load's time, all of it while the
+  // insert waited. The reader gives back each line's fields and which columns it gave; a column a line has no field
+  // for takes its value here (missing_value: a default may be the statement's own time), in order, as before.
+  const bool pipelined = sets.empty() && !any_var && size >= ((size_t)1 << 18);
+  if (pipelined) {
+    struct Parsed {
+      std::vector<std::vector<Val>> rows;
+      std::vector<std::vector<uint8_t>> given;
+      uint64_t warnings = 0;
+      bool all_given = true;   // every line gave every column: `rec` is the batch's logged text
+      std::string rec;
+    };
+    aios::hal::Mutex qmu;
+    aios::hal::CondVar qcv;
+    std::deque<Parsed> queue;
+    bool reader_done = false, reader_stop = false;
+    aios::hal::Thread reader([&] {
+      size_t ln = 0;
+      std::vector<LoadField> fl;
+      for (;;) {
+        Parsed p;
+        p.rows.reserve(kBatch);
+        p.given.reserve(kBatch);
+        bool end = false;
+        while (p.rows.size() < kBatch) {
+          if (!rd.next_line(&fl)) { end = true; break; }
+          if (++ln <= skip_lines) continue;
+          std::vector<Val> row(ins_cols.size());
+          std::vector<uint8_t> given(ins_cols.size(), 0);
+          if (fl.size() != targets.size()) ++p.warnings;   // too few (1261) or too many (1262) fields
+          for (size_t f = 0; f < targets.size() && f < fl.size(); ++f) {
+            if (field_slot[f] < 0) continue;
+            row[(size_t)field_slot[f]] = fl[f].null ? val_null() : val_text(std::move(fl[f].text));
+            given[(size_t)field_slot[f]] = 1;
+          }
+          for (uint8_t g : given) if (!g) p.all_given = false;
+          p.rows.push_back(std::move(row));
+          p.given.push_back(std::move(given));
+        }
+        // The logged text too, here, while the insert runs (it was a tenth of the load on the inserting thread):
+        // only when no line left a column to its default, which is worked out on that thread.
+        if (!p.rows.empty() && p.all_given) batch_text(p.rows, p.rec);
+        {
+          std::unique_lock<aios::hal::Mutex> lk(qmu);
+          qcv.wait(lk, [&] { return queue.size() < 2 || reader_stop; });
+          if (reader_stop) return;
+          if (!p.rows.empty()) queue.push_back(std::move(p));
+          if (end) reader_done = true;
+        }
+        qcv.notify_all();
+        if (end) return;
+      }
+    });
+    for (;;) {
+      Parsed p;
+      {
+        std::unique_lock<aios::hal::Mutex> lk(qmu);
+        qcv.wait(lk, [&] { return !queue.empty() || reader_done; });
+        if (queue.empty()) break;
+        p = std::move(queue.front());
+        queue.pop_front();
+      }
+      qcv.notify_all();
+      if (sql_interrupted()) { failure = "Query execution was interrupted"; break; }
+      field_warnings += p.warnings;
+      for (size_t i = 0; i < p.rows.size(); ++i)
+        for (size_t k = 0; k < ins_cols.size(); ++k)
+          if (!p.given[i][k]) p.rows[i][k] = missing_value(ins_cols[k]);
+      records += p.rows.size();
+      batch = std::move(p.rows);
+      if (p.all_given) batch_rec = &p.rec;
+      if (!flush()) break;
+    }
+    {
+      std::lock_guard<aios::hal::Mutex> lk(qmu);
+      reader_stop = true;
+    }
+    qcv.notify_all();
+    reader.join();
+  }
+  while (!pipelined && rd.next_line(&fields)) {
     ++line_no;
     if (line_no <= skip_lines) continue;
     if (sql_interrupted()) { failure = "Query execution was interrupted"; break; }

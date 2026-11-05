@@ -364,7 +364,7 @@ ASQL supports three primary operational architectures and three write synchroniz
 
 ### 1. Standalone Primary Database
 Run ASQL as an independent, primary in-memory SQL database without an upstream or downstream database:
-- **Write-Ahead Redo Log**: Every mutating transaction appends to `redo.log`. Sync behavior is controlled by `AIOS_REDO_SYNC` (default group commit).
+- **Write-Ahead Redo Log**: Every mutating transaction appends to `redo.log`. Sync behavior is controlled by `AIOS_REDO_SYNC`: unset or `1` (default) a commit is flushed to the medium, group-committed; `0` answers once the record is in the file and syncs every 200 ms; `barrier` orders each commit on the medium without flushing the drive's cache (`F_BARRIERFSYNC` on macOS, a full sync elsewhere), so a power cut can lose the newest commits but never keep a later one without an earlier one.
 - **Checkpoints**: Automatically snapshots to disk every 20,000 statements or 64 MB of redo (`AIOS_CHECKPOINT_SECS`, default 30s). On boot, ASQL loads the snapshot and replays trailing redo entries.
 - **Starting Standalone**:
   ```bash

@@ -1325,6 +1325,10 @@ struct ColumnStore {
   // by INSERT are dictionary-coded, and only an import ever re-encoded them,
   // so a table built by INSERTs compared its integer key as text, row by row.
   bool typed_tried = false;
+  // An INT column that started typed (frame-of-reference) instead of as a dictionary: still to be laid out the way
+  // optimize_encoding chooses for its values (run-length, constant, ...), where a dictionary column of them would
+  // be - at the same insert thresholds (promote_int_columns_now) or the next checkpoint (column_convert).
+  bool fresh_typed = false;
   // A DOUBLE column's dictionary fits the scaled encoding exactly; with dec_scale (a DECIMAL(p,s)'s s) every entry
   // is the canonical text of its scaled integer, all s places printed.
   bool dict_scales_exactly(int dec_scale = 0) const;
@@ -2749,6 +2753,9 @@ struct SqlTable {
   // rows and pruned nothing), and a checkpoint, which builds them for a stored table, never sees these.
   bool result_table = false;
   void mark_result_table();
+  // Filled whole from a statement's typed columns (colbatch_fill_table): every value went in normalized for its
+  // column's type, so a numeric column holds its numbers even where the types were inferred.
+  bool typed_fill = false;
   // Re-encodes every column; `cluster` first sorts the rows into key order (cluster_by_key), which moves them.
   void optimize_storage(bool cluster = true);
   // optimize_storage(false) in three steps, so the encoding itself holds no lock: take_encoding_copy (under the

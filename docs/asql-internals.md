@@ -1894,6 +1894,14 @@ with `0` a single session's write transactions run twice as fast (1,924
 against 929 sysbench write_only transactions a second on the benchmark
 box).
 
+`AIOS_REDO_SYNC=barrier` keeps every commit waiting for its own sync but
+makes that sync an ordering barrier rather than a flush of the drive's
+cache (`Host::sync_file_ordered`: `F_BARRIERFSYNC` on macOS, where
+`F_FULLFSYNC` waits about 2.7 ms on an Apple SSD and the barrier 0.3; a
+host without the distinction syncs fully). A process crash loses nothing;
+a power cut can lose the newest commits, never keep a later one without
+an earlier one.
+
 Every write statement is appended to `redo.log` under the store root before it
 is answered; the store's table files are rewritten at a checkpoint (every
 20,000 statements or 64 MB of redo, and at shutdown), and a restart loads the

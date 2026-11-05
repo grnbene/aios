@@ -248,6 +248,66 @@ class MacHost final : public Host {
     return Ok();
   }
 
+  // The writes the SQL redo log makes between syncs: in the file, not yet on
+  // the medium; sync_file puts everything written so far there. Without them
+  // the defaults fell back to append_file, so every drain was a full
+  // F_FULLFSYNC of its own, group commit synced once per statement and
+  // AIOS_REDO_SYNC=0 changed nothing on a Mac.
+  Result<void> append_file_unsynced(const std::string& path, ByteSpan data) override {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return Result<void>(Status::IoError, path + ": " + strerror(errno));
+    auto w = write_all_at(fd, data, -1);
+    ::close(fd);
+    if (!w.empty()) return Result<void>(Status::IoError, path + ": " + w);
+    return Ok();
+  }
+
+  Result<void> write_at_unsynced(const std::string& path, uint64_t offset, ByteSpan data) override {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return Result<void>(Status::IoError, path + ": " + strerror(errno));
+    auto w = write_all_at(fd, data, (int64_t)offset);
+    ::close(fd);
+    if (!w.empty()) return Result<void>(Status::IoError, path + ": " + w);
+    return Ok();
+  }
+
+  // F_FULLFSYNC flushes the file's data and then the drive's cache, whichever
+  // descriptor wrote it.
+  Result<void> sync_file(const std::string& path) override {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return Result<void>(Status::IoError, path + ": " + strerror(errno));
+    int rc = ::fcntl(fd, F_FULLFSYNC, 0);
+    if (rc == -1) rc = ::fsync(fd);
+    const int e = errno;
+    ::close(fd);
+    if (rc != 0) return Result<void>(Status::IoError, path + ": " + strerror(e));
+    return Ok();
+  }
+
+  Result<void> sync_file_ordered(const std::string& path) override {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return Result<void>(Status::IoError, path + ": " + strerror(errno));
+    int rc = ::fcntl(fd, F_BARRIERFSYNC, 0);
+    if (rc == -1) rc = ::fcntl(fd, F_FULLFSYNC, 0);   // a file system without barriers: the full flush
+    if (rc == -1) rc = ::fsync(fd);
+    const int e = errno;
+    ::close(fd);
+    if (rc != 0) return Result<void>(Status::IoError, path + ": " + strerror(e));
+    return Ok();
+  }
+
+  // Every byte of `data` written at `offset` (or appended, offset < 0); the error text, empty when all went in.
+  static std::string write_all_at(int fd, ByteSpan data, int64_t offset) {
+    size_t off = 0;
+    while (off < data.size()) {
+      ssize_t n = offset < 0 ? ::write(fd, data.data() + off, data.size() - off)
+                             : ::pwrite(fd, data.data() + off, data.size() - off, (off_t)(offset + (int64_t)off));
+      if (n < 0) { if (errno == EINTR) continue; return strerror(errno); }
+      off += (size_t)n;
+    }
+    return std::string();
+  }
+
   Result<ByteBuffer> read_file(const std::string& path) override {
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return Result<ByteBuffer>(errno == ENOENT ? Status::NotFound : Status::IoError, path + ": " + strerror(errno));

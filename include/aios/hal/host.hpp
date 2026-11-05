@@ -130,6 +130,11 @@ class Host {
   // the distinction appends durably and has nothing left to sync.
   virtual Result<void> append_file_unsynced(const std::string& path, ByteSpan data) { return append_file(path, data); }
   virtual Result<void> sync_file(const std::string& path) { (void)path; return Ok(); }
+  // What was written to `path` so far, ordered on the medium before anything written after: a barrier, not a
+  // flush of the drive's cache, so power lost right after can lose the newest writes but never keeps a later one
+  // without an earlier one. Darwin's F_BARRIERFSYNC, a tenth of F_FULLFSYNC's wait on an Apple SSD. A host
+  // without the distinction syncs fully.
+  virtual Result<void> sync_file_ordered(const std::string& path) { return sync_file(path); }
   // Creates `path` holding `data`, failing with Status::Conflict when it already exists: how a lock file is taken.
   // Checking for the file and then writing it lets two takers both see it absent and both believe they hold it, so a
   // substrate that can create exclusively in one step must override this; the default, for one that cannot, is that
