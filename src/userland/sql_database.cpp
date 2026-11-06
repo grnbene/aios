@@ -39492,6 +39492,10 @@ struct AggPlan {
   std::vector<uint8_t> code_num_ok;     // parsed and non-empty
   std::vector<uint8_t> code_empty;
   bool dec_direct = false;              // DECIMAL read straight from DecimalScaled / integers
+  // SUM / AVG of a DecimalScaled column read direct: the answer is the exact total (isum - finish never reads num, as
+  // ok cannot fall), so decode_for leaves its doubles at zero instead of dividing every row by the scale (two thirds
+  // of a DECIMAL range query's decode)
+  bool nums_unread = false;
   // SUM/AVG of an expression worked out per code (SUM(CASE WHEN status = 0
   // THEN 1 ELSE 0 END)): each code's value read once - its number, and its
   // exact scaled integer at one scale for all - instead of a Val per row.
@@ -39606,6 +39610,8 @@ AggPlan plan_mode(const Agg& a, const SqlTable& t) {
                           std::llround(cs.scale_factor) == (long long)std::llround(std::pow(10.0, a.col_scale))) ||
                          typed_integer(cs);
           if (p.dec_direct) { p.need_ints = true; p.mode = AggMode::Par; }
+          p.nums_unread = p.dec_direct && (a.kind == Agg::Sum || a.kind == Agg::Avg) && !a.prog &&
+                          cs.encoding == ColumnEncoding::DecimalScaled && !typed_integer(cs);
         } else if (a.col_type == SqlDataType::Int && typed_integer(cs)) {
           p.need_ints = true;
           p.mode = AggMode::Par;
@@ -39981,7 +39987,9 @@ void decode_for_rows(const Agg& a, const AggPlan& p, const ColumnStore& cs, size
     c.codes.resize(len);
     for (size_t j = 0; j < n; ++j) c.codes[rows[j] - start] = code_at(cs, rows[j]);
   }
-  if (p.need_nums) {
+  if (p.need_nums && p.nums_unread) {
+    if (c.nums.size() < len) c.nums.resize(len, 0.0);
+  } else if (p.need_nums) {
     c.nums.resize(len);
     for (size_t j = 0; j < n; ++j) c.nums[rows[j] - start] = typed_value_at(cs, rows[j]);
   }
@@ -40007,8 +40015,12 @@ void decode_for(const Agg& a, const AggPlan& p, const ColumnStore& cs, size_t st
     // both from one unpack of the codes: typed_values makes a FOR column's doubles of its integers, and a
     // DecimalScaled one's from the same integers by scaled_decimal_double
     c.ints.resize(n);
-    c.nums.resize(n);
     typed_ints(cs, start, end, c.ints.data());
+    if (p.nums_unread) {   // zeros, written once: no decode writes this aggregate's doubles
+      if (c.nums.size() < n) c.nums.resize(n, 0.0);
+      return;
+    }
+    c.nums.resize(n);
     if (cs.encoding == ColumnEncoding::FOR) for (size_t i = 0; i < n; ++i) c.nums[i] = (double)c.ints[i];
     else scaled_decimal_doubles(c.ints.data(), n, cs.scale_factor, c.nums.data());
     return;
@@ -40905,7 +40917,7 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
         const size_t aj = par[pj];
         if (pdec[aj] && prep[aj] == aj && !aggs[aj].prog && aggs[aj].src.col == a.src.col &&
             plans[aj].need_codes == plans[ai].need_codes && plans[aj].need_nums == plans[ai].need_nums &&
-            plans[aj].need_ints == plans[ai].need_ints) { prep[ai] = aj; break; }
+            plans[aj].need_ints == plans[ai].need_ints && plans[aj].nums_unread == plans[ai].nums_unread) { prep[ai] = aj; break; }
       }
     }
     bool par_free = true;
