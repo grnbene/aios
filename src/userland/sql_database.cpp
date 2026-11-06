@@ -34013,6 +34013,21 @@ std::string_view dict_view(const ColumnStore& cs, uint32_t k) {
 
 // Codes for rows [start, end) - RLE walked run by run rather than through
 // read_code's shared cursor, which parallel morsels would fight over.
+// `groups` groups of eight W-bit codes from p (each group W bytes), into out: the bit stream decode_codes reads, with W
+// a constant. Every 8-byte read must lie inside the buffer (decode_codes passes only rows it found safe).
+template <unsigned W>
+static inline void unpack_groups_of_8(const uint8_t* p, size_t groups, uint32_t* out) {
+  constexpr uint64_t mask = (1ull << W) - 1;
+  for (size_t g = 0; g < groups; ++g, p += W, out += 8) {
+#pragma GCC unroll 8
+    for (unsigned k = 0; k < 8; ++k) {
+      uint64_t word;
+      std::memcpy(&word, p + (k * W) / 8, 8);
+      out[k] = (uint32_t)((word >> ((k * W) & 7)) & mask);
+    }
+  }
+}
+
 void decode_codes(const ColumnStore& cs, size_t start, size_t end, uint32_t* out) {
   if (cs.encoding == ColumnEncoding::Constant) {
     std::fill(out, out + (end - start), 0u);
@@ -34065,9 +34080,28 @@ void decode_codes(const ColumnStore& cs, size_t start, size_t end, uint32_t* out
         const size_t last_row = ((bytes - 8) * 8) / w;   // rows below this read in full
         safe = last_row > start ? std::min(n, last_row - start) : 0;
       }
+      size_t done = 0;
+      if ((start & 7) == 0 && w < 32) {
+        // eight rows at a time with the width a constant: eight W-bit codes are exactly W bytes, so every shift
+        // and offset in the group is fixed and the loop unrolls (a morsel always starts on a multiple of 8 rows)
+        const size_t groups = safe / 8;
+        const uint8_t* gp = base + (start / 8) * w;
+        switch (w) {
+#define AIOS_UNPACK_CASE(W) case W: unpack_groups_of_8<W>(gp, groups, out); break;
+          AIOS_UNPACK_CASE(1) AIOS_UNPACK_CASE(2) AIOS_UNPACK_CASE(3) AIOS_UNPACK_CASE(4) AIOS_UNPACK_CASE(5)
+          AIOS_UNPACK_CASE(6) AIOS_UNPACK_CASE(7) AIOS_UNPACK_CASE(9) AIOS_UNPACK_CASE(10) AIOS_UNPACK_CASE(11)
+          AIOS_UNPACK_CASE(12) AIOS_UNPACK_CASE(13) AIOS_UNPACK_CASE(14) AIOS_UNPACK_CASE(15) AIOS_UNPACK_CASE(17)
+          AIOS_UNPACK_CASE(18) AIOS_UNPACK_CASE(19) AIOS_UNPACK_CASE(20) AIOS_UNPACK_CASE(21) AIOS_UNPACK_CASE(22)
+          AIOS_UNPACK_CASE(23) AIOS_UNPACK_CASE(24) AIOS_UNPACK_CASE(25) AIOS_UNPACK_CASE(26) AIOS_UNPACK_CASE(27)
+          AIOS_UNPACK_CASE(28) AIOS_UNPACK_CASE(29) AIOS_UNPACK_CASE(30) AIOS_UNPACK_CASE(31)
+#undef AIOS_UNPACK_CASE
+          default: break;
+        }
+        done = groups * 8;
+      }
       {
-        size_t bit_pos = start * w;
-        for (size_t i = 0; i < safe; ++i, bit_pos += w) {
+        size_t bit_pos = (start + done) * w;
+        for (size_t i = done; i < safe; ++i, bit_pos += w) {
           uint64_t word;
           std::memcpy(&word, base + (bit_pos >> 3), 8);
           out[i] = (uint32_t)((word >> (bit_pos & 7)) & mask);
@@ -37122,6 +37156,12 @@ static void scan_eq_direct(const ColumnStore& cs, size_t start, size_t n, uint32
 // Truth of `p` for rows [start, start+n) into out[0..n). Where `live` is given,
 // rows with live[i] == 0 are already decided by the caller and their result
 // is not read: the ordinary evaluator is not run on them.
+// A NumCmp on a FOR or DecimalScaled column, answered from its codes (eval_pred's NumCmp case): numeric bounds only.
+inline bool numcmp_by_code(const ColumnStore& cs, const Pred& p) {
+  return (cs.encoding == ColumnEncoding::FOR || cs.encoding == ColumnEncoding::DecimalScaled) && cs.bit_width_ >= 1 &&
+         cs.bit_width_ <= 32 && !std::isnan(p.lo) && !std::isnan(p.hi);
+}
+
 void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval& ev,
                std::vector<uint32_t>& codes, uint8_t* out, const uint8_t* live = nullptr) {
   switch (p.kind) {
@@ -37317,6 +37357,47 @@ void eval_pred(const Pred& p, const SqlTable& t, size_t start, size_t n, RowEval
         const int64_t lo = p.ilo, hi = p.ihi;
         if (p.iout) for (size_t i = 0; i < n; ++i) out[i] = xs[i] < lo || xs[i] > hi;
         else for (size_t i = 0; i < n; ++i) out[i] = xs[i] >= lo && xs[i] <= hi;
+        if (p.nulls) set_null_rows(cs, start, n, out, kN);
+        return;
+      }
+      // A FOR or DecimalScaled column: each value is f(code) for a function f that never decreases (base + code, or
+      // that over the scale, as typed_values reads it), so the rows that pass are those whose code lies in one range
+      // [clo, chi] (or outside it, for != and NOT BETWEEN), found once by binary search over f itself - the same
+      // doubles compared as below, without making one per row. NaN bounds keep the loop below.
+      if (numcmp_by_code(cs, p)) {
+        const uint64_t maxc = cs.bit_width_ == 32 ? 0xFFFFFFFFull : ((1ull << cs.bit_width_) - 1);
+        const bool scaled = cs.encoding == ColumnEncoding::DecimalScaled;
+        auto f = [&](uint64_t c) -> double {
+          const int64_t x = cs.base_int64 + (int64_t)c;
+          return scaled ? scaled_decimal_double(x, cs.scale_factor) : (double)x;
+        };
+        // the least code whose value is >= v (or > v), maxc + 1 when none is
+        auto first = [&](double v, bool strict) -> uint64_t {
+          uint64_t a = 0, b = maxc + 1;
+          while (a < b) {
+            const uint64_t m = a + (b - a) / 2;
+            if (strict ? f(m) > v : f(m) >= v) b = m; else a = m + 1;
+          }
+          return a;
+        };
+        uint64_t clo = 0, chi = 0;   // [clo, chi) pass
+        bool outside = false;
+        switch (p.op) {
+          case ExprOp::Eq: clo = first(p.lo, false); chi = first(p.lo, true); break;
+          case ExprOp::Ne: clo = first(p.lo, false); chi = first(p.lo, true); outside = true; break;
+          case ExprOp::Lt: clo = 0; chi = first(p.lo, false); break;
+          case ExprOp::Le: clo = 0; chi = first(p.lo, true); break;
+          case ExprOp::Gt: clo = first(p.lo, true); chi = maxc + 1; break;
+          case ExprOp::Ge: clo = first(p.lo, false); chi = maxc + 1; break;
+          default: clo = first(p.lo, false); chi = first(p.hi, true); if (chi < clo) chi = clo; outside = p.negated; break;
+        }
+        static thread_local std::vector<uint32_t> codesv;
+        if (codesv.size() < n) codesv.resize(n);
+        uint32_t* cd = codesv.data();
+        decode_codes(cs, start, start + n, cd);
+        const uint64_t width = chi - clo;
+        if (outside) for (size_t i = 0; i < n; ++i) out[i] = (uint64_t)cd[i] - clo >= width;
+        else for (size_t i = 0; i < n; ++i) out[i] = (uint64_t)cd[i] - clo < width;
         if (p.nulls) set_null_rows(cs, start, n, out, kN);
         return;
       }
@@ -37808,7 +37889,8 @@ static void eval_pred_bitmask(const Pred& p, const SqlTable& t, size_t start, si
     if (is_and) bitmask_and_words(mask_out, other, num_words);
     else bitmask_or_words(mask_out, other, num_words);
     return;
-  } else if (p.kind == Pred::NumCmp && !p.int_mode) {   // integer mode: eval_pred's loop below
+  } else if (p.kind == Pred::NumCmp && !p.int_mode && !numcmp_by_code(t.col_data[p.col], p)) {
+    // integer mode, and a FOR / DecimalScaled column compared by its codes: eval_pred's loops below
     const ColumnStore& cs = t.col_data[p.col];
     static thread_local std::vector<double> valsv;
     if (valsv.size() < n) valsv.resize(n);
