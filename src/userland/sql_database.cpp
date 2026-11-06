@@ -26320,6 +26320,17 @@ Result<void> SqlDatabase::flush_for_exit() {
 // (shutdown, EXPORT SNAPSHOT, replay) write inline and return once the
 // store is on the medium.
 Result<void> SqlDatabase::flush_impl(bool async, bool maintain) {
+  // Not while the log is being replayed: what the tables hold then is only part of what the log says, and a
+  // checkpoint would drop the log as covered by them. A replayed DROP / CREATE DATABASE checkpointed mid-replay and
+  // deleted the log with a whole LOAD after it still to apply; a stop or crash before the replay's own checkpoint
+  // at its end then lost every committed statement past that point. Nor from another thread while the start is
+  // still replaying (a stop that came mid-start). The store and the log stay as they are; replay_redo checkpoints
+  // once every record is in, and a start that did not get there replays it all again.
+  if (redo_replaying_ ||
+      (startup_replay_open_.load(std::memory_order_acquire) && std::this_thread::get_id() != startup_replay_thread_)) {
+    if (!redo_replaying_) std::fprintf(stderr, "sql store: the redo log is still being replayed - no checkpoint now (the next start replays it again)\n");
+    return Ok();
+  }
   // A write still in flight finishes first: the next snapshot reuses the
   // files it is writing, and the cleanup after its manifest must not see
   // files of a generation after it.
@@ -27596,7 +27607,10 @@ Result<void> SqlDatabase::init(const std::string& db_dir) {
   active_data_ = std::make_unique<ActiveDataEngine>(*this);
   init_lap("things and cells loaded");
   g_cdc_thread = true;          // replayed statements react once, below
+  startup_replay_thread_ = std::this_thread::get_id();
+  startup_replay_open_.store(true, std::memory_order_release);
   replay_redo();
+  startup_replay_open_.store(false, std::memory_order_release);
   g_cdc_thread = false;
   init_lap("redo log replayed");
   // Tables created since the last save exist only after the log replays, and the replay writes through paths

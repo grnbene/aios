@@ -12,6 +12,7 @@
 #include <memory>
 #include <array>
 #include <atomic>
+#include <thread>
 #include <mutex>
 #include <shared_mutex>
 #include <functional>
@@ -3588,6 +3589,11 @@ class SqlDatabase {
   std::atomic<uint64_t> redo_bytes_{0};   // written by every committing session
   std::atomic<size_t> redo_records_{0};
   bool redo_replaying_ = false;
+  // Set while init() replays the redo log, with the thread doing it: a checkpoint from any other thread (the
+  // exit handler's flush_for_exit on a stop mid-start) would save tables the log has not finished filling and
+  // then drop the log as covered - every statement not yet replayed lost. Those checkpoints wait for it.
+  std::atomic<bool> startup_replay_open_{false};
+  std::thread::id startup_replay_thread_;
   // A checkpoint rewrites every changed table's file under the writer lock;
   // 2,000 statements made that a stall every half second of OLTP writes.
   size_t checkpoint_every_ = 20000;
