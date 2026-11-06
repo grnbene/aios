@@ -19946,7 +19946,12 @@ void ColumnStore::refresh_zone_maps(size_t from, size_t to) {
 void ColumnStore::build_zone_maps() {
   zone_maps.clear();
   zone_loose_.clear();
+  zone_exact_.clear();
   if (row_count_ == 0 || zone_maps_off) return;   // a result table's column: none kept (SqlTable::result_table)
+  // Built here from the column's own values: exact, as refresh_zone_maps' are - so a cell's first write adjusts its
+  // segment's stats in place (update_zone_map_cell) instead of rescanning 2048 rows, printing each one (a DOUBLE
+  // column's first UPDATE into each segment cost ~300 us that way). Stats read back from the store stay unmarked.
+  struct MarkExact { ColumnStore& c; ~MarkExact() { c.zone_exact_.assign(c.zone_maps.size(), 1); } } mark_exact{*this};
   constexpr size_t kSegSize = 2048;
   size_t num_segs = (row_count_ + kSegSize - 1) / kSegSize;
   zone_maps.resize(num_segs);
@@ -63948,6 +63953,7 @@ static bool load_adopt_columns(SqlTable* t, LoadColumns& lc) {
     if (lc.n > 0) {
       cs.zone_maps = std::move(col.zones);
       cs.zone_loose_.clear();
+      cs.zone_exact_.assign(cs.zone_maps.size(), 1);   // built from these values, by build_zone_maps' rules: exact
     }
   });
   // Not expected (every condition was checked above); should a column refuse, the table is put back empty.
