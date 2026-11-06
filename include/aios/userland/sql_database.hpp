@@ -4274,6 +4274,7 @@ class SqlDatabase {
  public:
   // Drops the cached answers whose statement names `table` (unqualified).
   void invalidate_query_cache_for(const std::string& table);
+  void keep_object_names(std::vector<std::string>& names) const;   // a write's names that name a table or view
   void invalidate_query_cache_for(const std::vector<std::string>& tables);
  private:
 

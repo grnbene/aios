@@ -30274,7 +30274,7 @@ SqlQueryResult SqlDatabase::execute_gateway_query_unguarded(const std::string& s
   const bool txn_boundary = verb == "START" || verb == "BEGIN" || verb == "COMMIT" || verb == "SAVEPOINT" || verb == "RELEASE";
   if (is_mutation && !txn_boundary && query_cache_budget_bytes() > 0) {
     std::vector<std::string> names;
-    if (statement_write_names(toks, &names)) invalidate_query_cache_for(names);
+    if (statement_write_names(toks, &names)) { keep_object_names(names); invalidate_query_cache_for(names); }
     else invalidate_query_cache();
   }
   tokenize_handoff_move(q, std::move(toks));   // the local executor tokenizes the same text
@@ -30975,7 +30975,7 @@ SqlQueryResult SqlDatabase::execute_local_query_unguarded(const std::string& sql
       // change; everything for DDL and CALL (a replicated row is the common
       // case, and it emptied the whole cache).
       std::vector<std::string> names;
-      if (statement_write_names(toks, &names)) invalidate_query_cache_for(names);
+      if (statement_write_names(toks, &names)) { keep_object_names(names); invalidate_query_cache_for(names); }
       else invalidate_query_cache();
     }
 
@@ -65375,6 +65375,18 @@ void SqlDatabase::invalidate_query_cache() {
   }
 }
 
+// A write statement's identifiers (statement_write_names takes every one) less those that name no table or view: the
+// keywords and column names. Each name stamps its slot of dep_write_ns_ "written just now", and the slots are few
+// (64): INSERT INTO b VALUES (...) stamped VALUES, which shares its slot with a view `av`, and a read of av was then
+// never stored while anything at all was being inserted. A name kept is any table or view of that name, as before.
+void SqlDatabase::keep_object_names(std::vector<std::string>& names) const {
+  const auto tables = table_names_lower();
+  const auto views = view_names_lower();
+  names.erase(std::remove_if(names.begin(), names.end(),
+                             [&](const std::string& n) { return !tables->count(n) && !views->count(n); }),
+              names.end());
+}
+
 void SqlDatabase::invalidate_query_cache_for(const std::string& table) {
   invalidate_query_cache_for(std::vector<std::string>{table});
 }
@@ -65398,7 +65410,6 @@ void SqlDatabase::invalidate_query_cache_for(const std::vector<std::string>& tab
   if (query_cache_budget_bytes() > 0) {   // only the result cache reads these
     const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now().time_since_epoch()).count();
-    for (const auto& t : tables) dep_write_ns_[query_cache_dep_slot(lower_of(t))].store(now, std::memory_order_relaxed);
   }
   if (query_cache_entries_.load(std::memory_order_acquire) > 0) {
     GraveyardFlush graveyard_flush;
