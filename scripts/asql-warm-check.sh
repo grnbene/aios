@@ -104,7 +104,8 @@ GR
 AIOS_NO_ACCEL=1 AIOS_STORE_TRACE=1 "$bin" --root "$work/parts" exec "grain run $work/parts1.gr" > "$work/parts1.log" 2>&1
 check "$(grep -q 'appended to .* as part 5' "$work/parts1.log" && echo ok)" "ix.mn is an empty image and 5 parts"
 printf 'ix.mn\tmodel_id\n' > "$work/parts/sql_db/probes.list"
-got=$(AIOS_NO_ACCEL=1 "$bin" --root "$work/parts" exec "grain run $work/parts2.gr" 2>&1 | tee "$work/parts2.log" | grep '^eq ' || true)
+# (the answer found wherever it is on its line: the warm-up thread's stderr line can land in front of it, unbroken)
+got=$(AIOS_NO_ACCEL=1 "$bin" --root "$work/parts" exec "grain run $work/parts2.gr" 2>&1 | tee "$work/parts2.log" | grep -o 'eq [0-9]* in [0-9]* scan [0-9]*' || true)
 warmed=$(grep -c 'warmed 0 column, 1 join' "$work/parts2.log" || true)
 check "$( [ "$warmed" = 1 ] && [ "$got" = "eq 20 in 40 scan 20" ] && echo ok)" "a join index warmed over rows still in the delta buffer finds them: ${got:-no answer} (want eq 20 in 40 scan 20)"
 exit $fail
