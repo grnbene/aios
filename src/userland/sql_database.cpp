@@ -19794,6 +19794,9 @@ static void extend_zone_map(ColumnStore& cs, size_t r, const std::string* text) 
     zm.min_int64 = INT64_MAX; zm.max_int64 = INT64_MIN;
     zm.min_double = 1e300; zm.max_double = -1e300;
     zm.null_count = 0; zm.has_stats = true; zm.bloom_filter = 0;
+    // begun here from its first row and kept up row by row: exact, so a later one-cell UPDATE adjusts it in place
+    if (seg >= cs.zone_exact_.size()) cs.zone_exact_.resize(cs.zone_maps.size(), 0);
+    cs.zone_exact_[seg] = 1;
   }
   const size_t before = r - start;                        // rows already in the segment
   const bool first = before - zm.null_count == 0;         // no non-NULL value seen yet
