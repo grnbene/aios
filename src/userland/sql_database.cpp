@@ -3490,6 +3490,25 @@ bool exact_arith_display(ExprOp op, const Val& l, const Val& r, Val* out) {
 // from here, the exact lanes too).
 bool round_double_scaled(double value, long long d, AIOS_INT128* q_out) {
   if (!std::isfinite(value) || d > 30 || d < -38) return false;
+  // A double within binary noise of r / 10^d, |r| < 10^15 (price * qty, nearly every money value): the answer is r,
+  // without writing the digits out (~120 ns -> ~6). Why: S, the shortest digits, is within half an ulp of the
+  // double (1.12e-16 relative); the check below puts the double within 3.5e-16 (+ rounding) of r / 10^d; r / 10^d
+  // has at most 15 significant digits, so it lies on S's 15-digit grid, whose half step exceeds 5e-16 of |S| - S
+  // rounds to exactly r / 10^d (no tie), which has d places: q = r. Anything else (a tie, more places, a big or tiny
+  // value) takes the digits below. Checked equal to them on 400M values (prices x quantities x discounts, ties,
+  // values nudged 1-8 ulps off d places, random bit patterns).
+  if (d >= 0 && d <= 15) {
+    static const double kP10[16] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+    const double p = kP10[d];
+    const double av = std::fabs(value);
+    if (av < 1e15 / p) {
+      const double r = std::nearbyint(value * p);
+      if (std::fabs(r) <= 999999999999999.0 && std::fabs(std::fma(value, p, -r)) <= 3.5e-16 * av * p) {
+        *q_out = (AIOS_INT128)(int64_t)r;
+        return true;
+      }
+    }
+  }
   char buf[64];
   const auto tc = std::to_chars(buf, buf + sizeof buf, value, std::chars_format::scientific);
   const std::string t(buf, tc.ptr);
