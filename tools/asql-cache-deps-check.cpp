@@ -97,7 +97,7 @@ int main() {
     for (int s = 1; s <= kRows; s += 5000) {
       std::string sql = "INSERT INTO a VALUES ";
       for (int i = s; i < s + 5000 && i <= kRows; ++i)
-        sql += (i == s ? "" : ",") + std::string("(") + std::to_string(i) + "," + std::to_string((i * 7919) % 100003) + ",'g" +
+        sql += (i == s ? "" : ",") + std::string("(") + std::to_string(i) + "," + std::to_string((int64_t)i * 7919 % 100003) + ",'g" +
                std::to_string(i % 13) + "')";
       run(db, sql);
     }
