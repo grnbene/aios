@@ -15711,7 +15711,7 @@ std::string lenient_cell_value(const SqlColumn& c, const std::string& v) {
 //    the places sql_format_double prints plainly (at most 15 integer digits, at most 14 zeros after the point
 //    before the first digit). 15 significant digits always read back from the double they make, so the shortest
 //    digits that do are these, and printed plainly they are this text.
-static bool normalized_already(SqlDataType t, int scale, const std::string& v) {
+static bool normalized_already(SqlDataType t, int scale, std::string_view v) {
   const size_t n = v.size();
   size_t i = v[0] == '-' ? 1 : 0;
   const size_t i0 = i;
@@ -19106,7 +19106,7 @@ bool ColumnStore::code_dictionary(size_t budget) {
 
 static void extend_zone_map(ColumnStore& cs, size_t r, const std::string* text = nullptr);
 static bool zone_plain_number(std::string_view e, double* d, int64_t* iv);
-static bool normalized_already(SqlDataType t, int scale, const std::string& v);
+static bool normalized_already(SqlDataType t, int scale, std::string_view v);
 
 // A FOR / DecimalScaled column meeting a value below its base: every code
 // shifted up by the difference, the base lowered, widths grown as needed.
@@ -26825,6 +26825,9 @@ void SqlDatabase::append_redo_batch(const std::vector<std::pair<std::string, std
   if (recs.empty() || redo_path_.empty() || redo_replaying_ || seeding_ || redo_disabled() ||
       (!recs.empty() && recs[0].first == "doom")) return;
   Writer w;
+  size_t total = 0;
+  for (const auto& rec : recs) total += 4 + 8 + rec.first.size() + 8 + rec.second.size();
+  w.buf().reserve(total);   // one allocation (a load's records are tens of MB, and doubling copied them over and over)
   for (const auto& rec : recs) {
     w.u32(kRedoMagic);
     w.str(rec.first);
@@ -32309,7 +32312,8 @@ SqlQueryResult SqlDatabase::execute_transaction(const std::string& verb) {
     if (!tls_txn.open) { res.formatted_table = "No transaction is open."; return res; }
     // The redo records were held back so a rolled-back transaction leaves
     // nothing behind to replay. Durable at this point, not before.
-    auto buffered = tls_txn.redo;
+    auto buffered = std::move(tls_txn.redo);   // a load's is its whole file as INSERTs: moved, not copied
+    tls_txn.redo.clear();
     tls_txn.open = false;
     append_redo_batch(buffered);
     deliver_held_notices();   // the Things learn of it now that it is committed
@@ -40277,29 +40281,53 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
               }
             }
 
-            for (size_t j = 0; j < n; ++j) {
-              const size_t r = dense ? start + j : rows[j];
-              size_t id;
-              if (hn && cs.is_null(r)) id = coded && ks.code_val.size() < canon0.size() ? canon0[ks.code_val.size()] : span;
-              else if (coded) {
-                const uint32_t k = sparse ? code_at(cs, r) : codes[r - start];
-                id = k < canon0.size() ? canon0[k] : span;
+            uint32_t* const pf = part_first[tid].data();   // in a local: the loop's stores to m_id made it reload the vector's pointer per row
+            if (dense && !hn && !sparse) {
+              // every row of the morsel, no NULL key: the slot straight from the block of codes / values
+              if (coded) {
+                const uint32_t* cd = codes.data();
+                const uint32_t* c0 = canon0.data();
+                const size_t nc = canon0.size();
+                for (size_t j = 0; j < n; ++j) {
+                  const uint32_t k = cd[j];
+                  const uint32_t id = k < nc ? c0[k] : (uint32_t)span;
+                  m_id[j] = id;
+                  if (pf[id] == UINT32_MAX) pf[id] = (uint32_t)(start + j);
+                }
               } else {
-                const int64_t v = sparse ? typed_int(cs, r) : kints[r - start];
-                if (v < lo || v > hi) { off_range.store(true, std::memory_order_relaxed); return; }
-                id = (size_t)(v - lo);
+                const int64_t* kv = kints.data();
+                for (size_t j = 0; j < n; ++j) {
+                  const int64_t v = kv[j];
+                  if (v < lo || v > hi) { off_range.store(true, std::memory_order_relaxed); return; }
+                  const uint32_t id = (uint32_t)(v - lo);
+                  m_id[j] = id;
+                  if (pf[id] == UINT32_MAX) pf[id] = (uint32_t)(start + j);
+                }
               }
-              m_id[j] = (uint32_t)id;
-              if (part_first[tid][id] == UINT32_MAX) part_first[tid][id] = (uint32_t)r;
+            } else {
+              for (size_t j = 0; j < n; ++j) {
+                const size_t r = dense ? start + j : rows[j];
+                size_t id;
+                if (hn && cs.is_null(r)) id = coded && ks.code_val.size() < canon0.size() ? canon0[ks.code_val.size()] : span;
+                else if (coded) {
+                  const uint32_t k = sparse ? code_at(cs, r) : codes[r - start];
+                  id = k < canon0.size() ? canon0[k] : span;
+                } else {
+                  const int64_t v = sparse ? typed_int(cs, r) : kints[r - start];
+                  if (v < lo || v > hi) { off_range.store(true, std::memory_order_relaxed); return; }
+                  id = (size_t)(v - lo);
+                }
+                m_id[j] = (uint32_t)id;
+                if (pf[id] == UINT32_MAX) pf[id] = (uint32_t)r;
+              }
             }
 
             for (size_t ai = 0; ai < aggs.size(); ++ai) {
               const Agg& a = aggs[ai];
               AggArrays& A = part_totals[tid][ai];
-              if (a.kind == Agg::CountStar) {
-                for (size_t j = 0; j < n; ++j) A.cnt[m_id[j]]++;
-              } else if (a.kind == Agg::Count && a.col_rules && !nulls[ai]) {
-                for (size_t j = 0; j < n; ++j) A.cnt[m_id[j]]++;
+              if (a.kind == Agg::CountStar || (a.kind == Agg::Count && a.col_rules && !nulls[ai])) {
+                auto* cnt = A.cnt.data();
+                for (size_t j = 0; j < n; ++j) cnt[m_id[j]]++;
               } else if ((a.kind == Agg::Sum || a.kind == Agg::Avg) && a.col_rules && !a.prog && !a.mask && a.src.kind == Source::TypedCol &&
                          a.col_type == SqlDataType::Int && plans[ai].need_ints && !plans[ai].dec_direct) {
                 // SUM / AVG of a typed INT column: acc_row's branch for it (isum, num, cnt) without the call and its
@@ -40322,6 +40350,9 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                 const uint8_t* mk = a.mask ? a.mask->data() : nullptr;
                 const size_t msz = a.mask ? a.mask->size() : 0;
                 const uint64_t ew = a.mask_else_zero ? 1 : 0;
+                auto* isum = A.isum.data();   // locals: through A the stores made each row reload the pointers
+                auto* num = A.num.data();
+                auto* cnt = A.cnt.data();
                 auto rows_loop = [&](auto HasMask, auto InRange) {
                   for (size_t j = 0; j < n; ++j) {
                     const size_t r = dense ? start + j : rows[j];
@@ -40330,14 +40361,14 @@ bool vx_aggregate(const SqlTable& t, const Selection& sel, const std::vector<Sou
                       if constexpr (decltype(InRange)::value) take = mk[r] != 0; else take = r < msz && mk[r] != 0;
                     }
                     const uint32_t g = m_id[j];
-                    A.isum[g] += (AIOS_INT128)(iv[r - start] & -(int64_t)take);
+                    isum[g] += (AIOS_INT128)(iv[r - start] & -(int64_t)take);
                     uint64_t db;
                     std::memcpy(&db, &nv[r - start], 8);
                     db &= 0 - take;
                     double dd;
                     std::memcpy(&dd, &db, 8);
-                    A.num[g] += dd;
-                    A.cnt[g] += take | ew;
+                    num[g] += dd;
+                    cnt[g] += take | ew;
                   }
                 };
                 if (!mk) rows_loop(std::false_type{}, std::true_type{});
@@ -43971,6 +44002,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
   base.err = &err;
   const uint64_t cw_t0 = vx_trace_on() || plan_on() ? hal_now_ns() : 0;
   std::vector<uint32_t> rows;
+  bool rows_all = false;   // every row of the table, in order: rows[i] == i
   {
     vx::Selection sel;
     if (b.where) {
@@ -43980,7 +44012,7 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       sel.all = true;
       sel.total = t.row_count();
     }
-    if (sel.all) { rows.resize(t.row_count()); for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t)i; }
+    if (sel.all) { rows.resize(t.row_count()); for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t)i; rows_all = true; }
     else { rows.reserve(sel.count); for (size_t m = sel.m_begin(); m < sel.m_end(); ++m) rows.insert(rows.end(), sel.hits[m].begin(), sel.hits[m].end()); }
   }
   const size_t n = rows.size();
@@ -44002,7 +44034,13 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       // a date's or datetime's order is its day or second number's (NULL first, as the general way sorts). The
       // column decoded in a block where the selected rows cover an eighth of it: a read per row (read_code) for
       // three keys over 200k rows was most of the window's time.
-      if (cs.size() <= n * 8 && cs.size() == t.row_count()) {
+      if (rows_all && cs.size() == n) {
+        // every row: decoded straight into the keys, a block of rows per thread (RLE reads keep a cursor: one thread)
+        SqlThreadPool::instance().for_chunks(n, 65536, cs.encoding == ColumnEncoding::RLE ? 0 : n, false, [&](size_t r0, size_t r1, size_t) {
+          vx::typed_values(cs, r0, r1, k.data() + r0);
+          if (hn) for (size_t i = r0; i < r1; ++i) if (cs.is_null(i)) k[i] = kNull;
+        });
+      } else if (cs.size() <= n * 8 && cs.size() == t.row_count()) {
         std::vector<double> all(cs.size());
         vx::typed_values(cs, 0, cs.size(), all.data());
         for (size_t i = 0; i < n; ++i) k[i] = hn && cs.is_null(rows[i]) ? kNull : all[rows[i]];
@@ -44012,7 +44050,10 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     } else if (vx::dict_coded(cs) && cs.encoding != ColumnEncoding::Constant) {
       const size_t nd = vx::dict_size(cs);
       std::vector<uint32_t> code(n);
-      for (size_t i = 0; i < n; ++i) code[i] = vx::code_at(cs, rows[i]);
+      if (rows_all && cs.size() == n && cs.encoding != ColumnEncoding::RLE)
+        SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) { vx::decode_codes(cs, r0, r1, code.data() + r0); });
+      else
+        for (size_t i = 0; i < n; ++i) code[i] = vx::code_at(cs, rows[i]);
       std::vector<double> ck(nd, 0);
       if (numeric) {
         for (size_t c = 0; c < nd; ++c) {
@@ -44048,7 +44089,9 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
           ck[present[i]] = rk;
         }
       }
-      for (size_t i = 0; i < n; ++i) k[i] = (hn && cs.is_null(rows[i])) || code[i] >= nd ? kNull : ck[code[i]];
+      SqlThreadPool::instance().for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t) {
+        for (size_t i = r0; i < r1; ++i) k[i] = (hn && cs.is_null(rows[i])) || code[i] >= nd ? kNull : ck[code[i]];
+      });
     } else {
       { if (vx_trace_on()) vx_trace("columnar window: not taken (23)"); return nullptr; }
     }
@@ -44088,14 +44131,29 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     std::vector<int64_t> lo(kc.size(), 0);
     std::vector<int> bits(kc.size(), 0);
     int total = 0;
+    auto& pool = SqlThreadPool::instance();
+    constexpr size_t kChunk = 65536;
+    const size_t nchunks = (n + kChunk - 1) / kChunk;
     for (size_t j = 0; j < kc.size(); ++j) {
+      // each block of rows' least and greatest, then theirs
+      std::vector<double> cmn(nchunks, std::numeric_limits<double>::infinity()), cmx(nchunks, -std::numeric_limits<double>::infinity());
+      std::atomic<bool> whole{true};
+      const std::vector<double>& kv = *kc[j];
+      pool.for_chunks(n, kChunk, n, false, [&](size_t r0, size_t r1, size_t) {
+        double mn = std::numeric_limits<double>::infinity(), mx = -mn;
+        for (size_t i = r0; i < r1; ++i) {
+          const double x = kv[i];
+          if (x == kNull) continue;
+          // a whole number within 1e15 (NaN and the infinities fail the first test): as x != floor(x) || |x| > 1e15
+          if (!(std::fabs(x) <= 1e15) || (double)(int64_t)x != x) { whole.store(false, std::memory_order_relaxed); return; }
+          mn = std::min(mn, x); mx = std::max(mx, x);
+        }
+        cmn[r0 / kChunk] = mn;
+        cmx[r0 / kChunk] = mx;
+      });
+      if (!whole.load()) { if (vx_trace_on()) vx_trace("columnar window: not taken (25)"); return false; }
       double mn = std::numeric_limits<double>::infinity(), mx = -mn;
-      for (double x : *kc[j]) {
-        if (x == kNull) continue;
-        // a whole number within 1e15 (NaN and the infinities fail the first test): as x != floor(x) || |x| > 1e15
-        if (!(std::fabs(x) <= 1e15) || (double)(int64_t)x != x) { if (vx_trace_on()) vx_trace("columnar window: not taken (25)"); return false; }
-        mn = std::min(mn, x); mx = std::max(mx, x);
-      }
+      for (size_t c = 0; c < nchunks; ++c) { mn = std::min(mn, cmn[c]); mx = std::max(mx, cmx[c]); }
       const uint64_t span = mn > mx ? 1 : (uint64_t)(mx - mn) + 2;   // + the NULL slot
       int width = 1;
       while (width < 64 && (1ull << width) <= span) ++width;
@@ -44105,16 +44163,18 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       if (total > 64) { if (vx_trace_on()) vx_trace("columnar window: not taken (26)"); return false; }
     }
     out->resize(n);
-    for (size_t i = 0; i < n; ++i) {
-      uint64_t k = 0;
-      for (size_t j = 0; j < kc.size(); ++j) {
-        const double x = (*kc[j])[i];
-        uint64_t v = x == kNull ? 0 : (uint64_t)((int64_t)x - lo[j]) + 1;
-        if (desc[j]) v = ((bits[j] == 64 ? ~0ull : (1ull << bits[j]) - 1)) - v;
-        k = bits[j] == 64 ? v : (k << bits[j]) | v;
+    pool.for_chunks(n, kChunk, n, false, [&](size_t r0, size_t r1, size_t) {
+      for (size_t i = r0; i < r1; ++i) {
+        uint64_t k = 0;
+        for (size_t j = 0; j < kc.size(); ++j) {
+          const double x = (*kc[j])[i];
+          uint64_t v = x == kNull ? 0 : (uint64_t)((int64_t)x - lo[j]) + 1;
+          if (desc[j]) v = ((bits[j] == 64 ? ~0ull : (1ull << bits[j]) - 1)) - v;
+          k = bits[j] == 64 ? v : (k << bits[j]) | v;
+        }
+        (*out)[i] = {k, (uint32_t)i};
       }
-      (*out)[i] = {k, (uint32_t)i};
-    }
+    });
     if (bits_of) *bits_of = bits;
     return true;
   };
@@ -44138,9 +44198,161 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
     const Key& last = keys.back();
     if (last.desc || last.item < 0 || items[(size_t)last.item].win != 0) reuse_win_order = false;
   }
+  // rn = 1 of a lone ROW_NUMBER whose keys are all columns read as integers - a typed integer column's numbers,
+  // a date's day codes, a dictionary column's rank per code - straight from the table's decoded columns (kept
+  // between statements): each row's packed key made and compared in one pass over the rows, a thread a block,
+  // each partition's least (key, row) kept beside it; then the threads' bests merged. No per-row key arrays, no
+  // sort: the rows the one-pass way below picks (the partition's least key, ties the earlier row), from less work.
+  auto fused_top = [&](const W& w) -> bool {
+    struct KeyCol {
+      std::shared_ptr<const vx::DecodedInts> ints;        // a typed integer column's numbers
+      std::shared_ptr<const std::vector<uint32_t>> codes; // or its codes
+      std::vector<uint32_t> rank;                         // a dictionary column's code -> rank + 1 (0: NULL)
+      std::shared_ptr<const std::vector<uint8_t>> nulls;  // set when the column has NULLs
+      int64_t lo = 0;
+      uint64_t maxv = 0;                                  // the greatest value a row's part takes (0: NULL)
+      int width = 0;
+      bool desc = false;
+    };
+    const size_t np = w.parts.size(), nk = np + w.order.size();
+    if (nk == 0 || nk > 8) return false;
+    std::vector<KeyCol> kcs(nk);
+    for (size_t j = 0; j < nk; ++j) {
+      const int col = j < np ? w.parts[j] : w.order[j - np].first;
+      KeyCol& kc = kcs[j];
+      kc.desc = j >= np && w.order[j - np].second;
+      if (col < 0 || (size_t)col >= t.col_data.size() || (size_t)col >= t.columns.size()) return false;
+      const ColumnStore& cs = t.col_data[(size_t)col];
+      const SqlColumn& sc = t.columns[(size_t)col];
+      const bool numeric = sql_type_numeric(sc.type) && !sc.temporal;
+      if (vx::has_nulls(cs) && !(kc.nulls = vx::decoded_nulls(t, (size_t)col))) return false;
+      if (numeric && vx::typed_integer(cs)) {
+        if (vx::wide_numbers(cs) || !(kc.ints = vx::decoded_ints(t, (size_t)col))) return false;
+        if (kc.ints->lo > kc.ints->hi) { kc.lo = 0; kc.maxv = 0; }
+        else {
+          if ((uint64_t)(kc.ints->hi - kc.ints->lo) >= ((uint64_t)1 << 62)) return false;
+          kc.lo = kc.ints->lo;
+          kc.maxv = (uint64_t)(kc.ints->hi - kc.ints->lo) + 1;
+        }
+      } else if (sc.temporal && (cs.encoding == ColumnEncoding::TemporalDays || cs.encoding == ColumnEncoding::TemporalSeconds)) {
+        // base + code: the code orders as the day or second does
+        if (cs.bit_width_ > 32 || !(kc.codes = vx::decoded_codes(t, (size_t)col))) return false;
+        kc.lo = -1;   // a row's part is its code + 1
+        kc.maxv = (uint64_t)1 << cs.bit_width_;
+      } else if (vx::dict_coded(cs) && cs.encoding != ColumnEncoding::Constant) {
+        if (numeric && vx::wide_numbers(cs)) return false;
+        const size_t nd = vx::dict_size(cs);
+        if (!(kc.codes = vx::decoded_codes(t, (size_t)col))) return false;
+        // each code's sort value, as col_keys reads it (a number; a text's collation rank; else its case-insensitive
+        // place), then the codes ranked by it - equal values one rank
+        std::vector<double> ck(nd, kNull);
+        if (numeric) {
+          for (size_t c = 0; c < nd; ++c) {
+            const std::string& v = vx::dict_entry(cs, (uint32_t)c);
+            if (sql_is_null(v)) continue;
+            char* end = nullptr;
+            const double d = std::strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end) return false;
+            ck[c] = d;
+          }
+        } else if (sc.type == SqlDataType::Text && !sc.temporal) {
+          auto ce = std::make_shared<SqlExpr>();
+          ce->op = ExprOp::Column;
+          ce->name = sc.name;
+          vx::Source vs = vx::make_source(ce.get(), t, local, base);
+          if (vs.kind != vx::Source::CodeCol || !vs.bare_column || vs.code_val.size() != nd) return false;
+          const std::vector<int> rk = vx::dict_rank_of(t, vs);
+          for (size_t c = 0; c < nd; ++c) ck[c] = c < rk.size() && rk[c] >= 0 ? (double)rk[c] : kNull;
+        } else {
+          std::vector<uint32_t> all;
+          for (uint32_t c = 0; c < nd; ++c) if (!sql_is_null(vx::dict_entry(cs, c))) all.push_back(c);
+          std::sort(all.begin(), all.end(), [&](uint32_t a, uint32_t bb) {
+            const int c = case_insensitive_compare(vx::dict_view(cs, a), vx::dict_view(cs, bb));
+            return c ? c < 0 : a < bb;
+          });
+          double rk = 0;
+          for (size_t i = 0; i < all.size(); ++i) {
+            if (i > 0 && case_insensitive_compare(vx::dict_view(cs, all[i - 1]), vx::dict_view(cs, all[i])) != 0) ++rk;
+            ck[all[i]] = rk;
+          }
+        }
+        std::vector<double> vals;
+        for (double d : ck) if (d != kNull) vals.push_back(d);
+        std::sort(vals.begin(), vals.end());
+        vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+        kc.rank.assign(nd, 0);
+        for (size_t c = 0; c < nd; ++c)
+          if (ck[c] != kNull) kc.rank[c] = (uint32_t)(std::lower_bound(vals.begin(), vals.end(), ck[c]) - vals.begin()) + 1;
+        kc.maxv = vals.size();
+      } else {
+        return false;
+      }
+      int width = 1;
+      while (width < 64 && (kc.maxv >> width) != 0) ++width;
+      kc.width = width;
+    }
+    int tbits = 0, obits = 0;
+    for (size_t j = 0; j < nk; ++j) { tbits += kcs[j].width; if (j >= np) obits += kcs[j].width; }
+    const int pbits = tbits - obits;
+    if (tbits > 64 || pbits > 24) return false;
+    const size_t nparts = (size_t)1 << pbits;
+    auto& pool = SqlThreadPool::instance();
+    const size_t lanes = pool.num_workers() + 1;
+    if (nparts * lanes > ((size_t)1 << 22)) return false;
+    // a row's packed key: each part most significant first, NULL below every value, a DESC part's bits inverted
+    auto key_of = [&](size_t i) -> uint64_t {
+      const size_t r = rows[i];
+      uint64_t k = 0;
+      for (size_t j = 0; j < nk; ++j) {
+        const KeyCol& kc = kcs[j];
+        uint64_t v;
+        if (kc.nulls && (*kc.nulls)[r]) v = 0;
+        else if (kc.ints) v = (uint64_t)(kc.ints->v[r] - kc.lo) + 1;
+        else if (!kc.rank.empty()) { const uint32_t c = (*kc.codes)[r]; v = c < kc.rank.size() ? kc.rank[c] : 0; }
+        else v = (uint64_t)(*kc.codes)[r] + 1;
+        if (kc.desc) v = (kc.width == 64 ? ~0ull : (1ull << kc.width) - 1) - v;
+        k = kc.width == 64 ? v : (k << kc.width) | v;
+      }
+      return k;
+    };
+    std::vector<std::vector<uint32_t>> lane_best(lanes);
+    std::vector<std::vector<uint64_t>> lane_key(lanes);
+    pool.for_chunks(n, 65536, n, false, [&](size_t r0, size_t r1, size_t tid) {
+      const size_t l = tid < lanes ? tid : 0;
+      auto& lb = lane_best[l];
+      auto& lk = lane_key[l];
+      if (lb.empty()) { lb.assign(nparts, UINT32_MAX); lk.assign(nparts, 0); }
+      for (size_t i = r0; i < r1; ++i) {
+        const uint64_t key = key_of(i);
+        const size_t p = obits >= 64 ? 0 : (size_t)(key >> obits);
+        if (lb[p] == UINT32_MAX || key < lk[p]) { lb[p] = (uint32_t)i; lk[p] = key; }   // ties: the earlier row
+      }
+    });
+    std::vector<uint32_t> best(nparts, UINT32_MAX);
+    std::vector<uint64_t> best_key(nparts, 0);
+    for (size_t l = 0; l < lanes; ++l) {
+      const auto& lb = lane_best[l];
+      const auto& lk = lane_key[l];
+      if (lb.empty()) continue;
+      for (size_t p = 0; p < nparts; ++p) {
+        const uint32_t c = lb[p], cur = best[p];
+        if (c == UINT32_MAX) continue;
+        if (cur == UINT32_MAX || lk[p] < best_key[p] || (lk[p] == best_key[p] && c < cur)) { best[p] = c; best_key[p] = lk[p]; }
+      }
+    }
+    win_order.clear();
+    for (uint32_t i : best) if (i != UINT32_MAX) win_order.push_back(i);
+    return true;
+  };
   struct Packed { double k[8]; uint32_t i; };
   for (size_t wi = 0; wi < wins.size(); ++wi) {
     const W& w = wins[wi];
+    if (!top_off && (int)wi == keep_win && keep_max == 1 && wins.size() == 1 && reuse_win_order && fused_top(w)) {
+      for (uint32_t i : win_order) wval[wi][i] = 1;
+      top_done = true;
+      if (vx_trace_on()) vx_trace("columnar window: rn = 1 in one pass over the decoded columns: " + std::to_string(win_order.size()) + " of " + std::to_string(n) + " rows");
+      continue;
+    }
     const size_t np = w.parts.size(), nk = np + w.order.size();
     if (nk > 8) { if (vx_trace_on()) vx_trace("columnar window: not taken (27)"); return false; }
     std::vector<const std::vector<double>*> kc;
@@ -44164,11 +44376,46 @@ static bool columnar_window(SqlDatabase* db, const ParsedSelectBranch& b, SqlQue
       // then hands the rows over in partition order, the order the sorted rows had. No sort of every row.
       const int pbits = tbits - obits;
       if (!top_off && (int)wi == keep_win && keep_max == 1 && wins.size() == 1 && reuse_win_order && pbits <= 24) {
-        std::vector<uint32_t> best((size_t)1 << pbits, UINT32_MAX);
-        for (size_t i = 0; i < n; ++i) {
-          const size_t p = np == 0 || obits >= 64 ? 0 : (size_t)(enc[i].first >> obits);
-          const uint32_t cur = best[p];
-          if (cur == UINT32_MAX || enc[i].first < enc[cur].first) best[p] = (uint32_t)i;   // ties: the earlier row
+        const size_t nparts = (size_t)1 << pbits;
+        auto part_of = [&](size_t i) -> size_t { return np == 0 || obits >= 64 ? 0 : (size_t)(enc[i].first >> obits); };
+        // Each partition's best (key, row) so far kept side by side: the key beside the row, not read back from
+        // enc at the row (a cache miss per row in an array of every row).
+        std::vector<uint32_t> best(nparts, UINT32_MAX);
+        std::vector<uint64_t> best_key(nparts, 0);
+        auto& pool = SqlThreadPool::instance();
+        const size_t lanes = pool.num_workers() + 1;
+        if (n >= 131072 && nparts * lanes <= ((size_t)1 << 22)) {
+          // a best row per partition per thread (each thread's rows ascending: ties keep the earlier), then the
+          // least (key, row) of the threads' for each partition - the serial pass's answer
+          std::vector<std::vector<uint32_t>> lane_best(lanes);
+          std::vector<std::vector<uint64_t>> lane_key(lanes);
+          pool.parallel_for(n, 65536, [&](size_t r0, size_t r1, size_t tid) {
+            const size_t l = tid < lanes ? tid : 0;
+            auto& lb = lane_best[l];
+            auto& lk = lane_key[l];
+            if (lb.empty()) { lb.assign(nparts, UINT32_MAX); lk.assign(nparts, 0); }
+            for (size_t i = r0; i < r1; ++i) {
+              const uint64_t key = enc[i].first;
+              const size_t p = part_of(i);
+              if (lb[p] == UINT32_MAX || key < lk[p]) { lb[p] = (uint32_t)i; lk[p] = key; }
+            }
+          });
+          for (size_t l = 0; l < lanes; ++l) {
+            const auto& lb = lane_best[l];
+            const auto& lk = lane_key[l];
+            if (lb.empty()) continue;
+            for (size_t p = 0; p < nparts; ++p) {
+              const uint32_t c = lb[p], cur = best[p];
+              if (c == UINT32_MAX) continue;
+              if (cur == UINT32_MAX || lk[p] < best_key[p] || (lk[p] == best_key[p] && c < cur)) { best[p] = c; best_key[p] = lk[p]; }
+            }
+          }
+        } else {
+          for (size_t i = 0; i < n; ++i) {
+            const uint64_t key = enc[i].first;
+            const size_t p = part_of(i);
+            if (best[p] == UINT32_MAX || key < best_key[p]) { best[p] = (uint32_t)i; best_key[p] = key; }   // ties: the earlier row
+          }
         }
         win_order.clear();
         for (uint32_t i : best) if (i != UINT32_MAX) { win_order.push_back(i); wval[wi][i] = 1; }
@@ -59195,6 +59442,29 @@ SqlQueryResult execute_parsed_select(SqlDatabase* db, const ParsedSelectStatemen
 uint64_t vx_zone_pruned_blocks() { return vx::g_zone_pruned_blocks.load(std::memory_order_relaxed); }
 uint64_t vx_bloom_pruned_blocks() { return vx::g_bloom_pruned_blocks.load(std::memory_order_relaxed); }
 
+// Lanes queued and not yet taken: what an idle worker polls for while it spins (spin-then-park, worker_loop).
+static std::atomic<size_t> g_pool_queued{0};
+static std::atomic<bool> g_pool_stopping{false};
+// How long a worker that has just finished a lane keeps polling for the next before it sleeps. A statement's next
+// parallel step, or the next statement's, mostly comes within it; asleep, a worker took the futex wake, the
+// scheduler and the core's idle state to come back - a lane of a 1.5 ms GROUP BY joined 400 to 950 us late, or not
+// at all. Spinning costs CPU only right after work, never while the server is idle. AIOS_SQL_POOL_SPIN_US
+// (default 1000; 0: sleep at once, as before).
+static uint64_t pool_spin_ns() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("AIOS_SQL_POOL_SPIN_US");
+    return (e && *e ? (uint64_t)std::strtoull(e, nullptr, 10) : (uint64_t)1000) * 1000;
+  }();
+  return v;
+}
+static inline void pool_cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield");
+#endif
+}
+
 SqlThreadPool& SqlThreadPool::instance() {
   static SqlThreadPool pool;
   return pool;
@@ -59218,6 +59488,7 @@ SqlThreadPool::SqlThreadPool() {
 }
 
 SqlThreadPool::~SqlThreadPool() {
+  g_pool_stopping.store(true);
   {
     std::unique_lock<aios::hal::Mutex> lock(queue_mu_);
     stop_ = true;
@@ -59254,6 +59525,7 @@ bool SqlThreadPool::dispatch_parallel(const std::function<void(size_t)>& task, s
     for (size_t i = 0; i < worker_count; ++i) {
       work_queue_.push_back(QueueItem{out_job, i + 1});
     }
+    g_pool_queued.fetch_add(worker_count, std::memory_order_release);
     if (worker_count == 1) queue_cv_.notify_one();
     else queue_cv_.notify_all();
   }
@@ -59274,6 +59546,7 @@ void SqlThreadPool::wait_parallel(std::shared_ptr<DispatchJob>& job) {
         if (it->job == job) { mine.push_back(it->lane); it = work_queue_.erase(it); }
         else ++it;
       }
+      if (!mine.empty()) g_pool_queued.fetch_sub(mine.size(), std::memory_order_relaxed);
     }
     if (!mine.empty()) {
       struct Restore { bool was; ~Restore() { in_worker_thread_ = was; } } restore{in_worker_thread_};
@@ -59292,8 +59565,20 @@ void SqlThreadPool::wait_parallel(std::shared_ptr<DispatchJob>& job) {
 
 void SqlThreadPool::worker_loop(size_t worker_id) {
   in_worker_thread_ = true;
+  const uint64_t spin = pool_spin_ns();
+  bool worked = false;   // spins only after a lane: an idle server's workers sleep
   while (true) {
     QueueItem item;
+    if (worked && spin) {
+      const uint64_t t0 = hal_now_ns();
+      // polled with the core handed to anything else runnable on it between looks (sched_yield returns at once
+      // when nothing is): a spinning worker never holds up a lane still working, or another process
+      while (g_pool_queued.load(std::memory_order_acquire) == 0 && !g_pool_stopping.load(std::memory_order_relaxed)) {
+        for (int i = 0; i < 16; ++i) pool_cpu_relax();
+        std::this_thread::yield();
+        if (hal_now_ns() - t0 >= spin) break;
+      }
+    }
     {
       std::unique_lock<aios::hal::Mutex> lock(queue_mu_);
       queue_cv_.wait(lock, [&]() {
@@ -59303,10 +59588,12 @@ void SqlThreadPool::worker_loop(size_t worker_id) {
       if (!work_queue_.empty()) {
         item = std::move(work_queue_.front());
         work_queue_.pop_front();
+        g_pool_queued.fetch_sub(1, std::memory_order_relaxed);
       } else {
         continue;
       }
     }
+    worked = true;
 
     if (item.job && item.job->task) {
       (void)worker_id;
@@ -63407,8 +63694,131 @@ struct LoadCanonBatch {
   bool no_undo = false;         // the load runs in a transaction of its own, holding the table: no row is logged for undo
                                 // or claimed (a failure cuts the table back to where the load began instead)
   bool undo_skipped = false;    // set by execute_insert: it took the batch that way
+  // A whole load read into columns (LoadColumns) instead of rows: taken only into a table still as it was made
+  // (load_columns_fit), else refused with nothing changed (cols_taken stays false) and the load goes row-wise.
+  struct LoadColumns* cols = nullptr;
+  bool cols_taken = false;
 };
 thread_local LoadCanonBatch* tls_insert_canon = nullptr;
+
+// A plain load's file read whole, on every core, straight into its columns: what LOAD DATA hands execute_insert in
+// place of rows when the table is empty and the load is a transaction of its own. Each column is in the form its
+// first append would have started it in (start_typed_if_empty): FOR integers, DecimalScaled, TypedDouble, or a
+// dictionary - each value checked, as it was read, to be one append_encoded stores exactly as it reads - and the
+// typed columns' zone maps were made segment by segment as the file was read, from the same text and readings
+// extend_zone_map takes. Row by row, the same load was a string per value, parsed again by each column's append.
+struct LoadColumns {
+  enum Kind : uint8_t { For, Scaled, Double, Dict };
+  struct Col {
+    Kind kind = Dict;
+    int places = 0;                       // Scaled: the DECIMAL's s
+    int64_t lo = INT64_MAX, hi = INT64_MIN;   // For / Scaled: the least and greatest value
+    std::vector<int64_t> ints;            // For: the values; Scaled: the scaled integers
+    std::vector<double> dbls;             // Double
+    std::vector<uint32_t> codes;          // Dict: each row's index into entries
+    std::vector<std::string> entries;     // Dict: the distinct values, in the order the rows first hold them
+    std::vector<SegmentZoneMap> zones;    // For / Scaled / Double: one per 2048 rows
+  };
+  size_t n = 0;
+  std::vector<Col> cols;
+};
+
+// The column form start_typed_if_empty gives an empty column of this declaration.
+static LoadColumns::Kind load_column_kind(const SqlColumn& sc) {
+  if (sc.temporal || sc.binary) return LoadColumns::Dict;
+  if (sc.type == SqlDataType::Int) return LoadColumns::For;
+  if (sc.type == SqlDataType::Decimal && sc.scale >= 1 && sc.scale <= 9) return LoadColumns::Scaled;
+  if (sc.type == SqlDataType::Real && sc.scale <= 0) return LoadColumns::Double;
+  return LoadColumns::Dict;
+}
+
+// A table whose columns are all still as CREATE TABLE made them (no row, no dictionary entry, nothing shared), so
+// that start_typed_if_empty gives each the form load_column_kind names and the columns can be taken whole.
+static bool load_columns_fit(const SqlTable& t) {
+  if (t.result_table || t.inferred_types || t.row_count() != 0 || t.col_data.size() > t.columns.size()) return false;
+  for (const auto& cs : t.col_data)
+    if (cs.size() != 0 || cs.shared_dict || cs.encoding != ColumnEncoding::DictBitPacked || cs.dict.size() > 1 ||
+        cs.bit_width_ != 32 || cs.seg_packed_ || cs.zone_maps_off)
+      return false;
+  return true;
+}
+
+// An empty FOR column (start_typed_if_empty) holding v: base the least value, the width the span needs - what
+// append_encoded's FOR case leaves, give or take where its base settled.
+static bool load_adopt_for(ColumnStore& cs, const std::vector<int64_t>& v, int64_t lo, int64_t hi) {
+  if (cs.encoding != ColumnEncoding::FOR || cs.row_count_ != 0) return false;
+  const size_t n = v.size();
+  if (n == 0) return true;
+  const uint64_t span = (uint64_t)hi - (uint64_t)lo;
+  if (hi < lo || span > 0xFFFFFFFFull) return false;
+  cs.base_int64 = lo;
+  cs.bit_width_ = code_bits_for(span);
+  cs.row_count_ = n;
+  cs.data32.clear();
+  cs.packed_data.clear();
+  if (cs.bit_width_ == 32) cs.data32.assign(n, 0);
+  else cs.packed_data.assign(((n * cs.bit_width_ + 7) >> 3) + 8, 0);
+  for (size_t r = 0; r < n; ++r) cs.write_code(r, (uint32_t)(v[r] - lo));
+  cs.null_bitmap.clear();
+  cs.nulls_known = 0;
+  return true;
+}
+
+// The columns of `lc` made the table's: every column started as its first append would start it, then given its
+// rows whole. False, with nothing changed, when the table is no longer one that can take them (load_columns_fit).
+static bool load_adopt_columns(SqlTable* t, LoadColumns& lc) {
+  t->ensure_columns();
+  t->compact_delta_buffer();
+  if (!load_columns_fit(*t) || lc.cols.size() != t->columns.size()) return false;
+  for (size_t c = 0; c < lc.cols.size(); ++c) {
+    const LoadColumns::Col& col = lc.cols[c];
+    if (col.kind != load_column_kind(t->columns[c])) return false;
+    const size_t have = col.kind == LoadColumns::Double ? col.dbls.size()
+                        : col.kind == LoadColumns::Dict ? col.codes.size() : col.ints.size();
+    if (have != lc.n) return false;
+    if ((col.kind == LoadColumns::For || col.kind == LoadColumns::Scaled) && lc.n > 0 &&
+        (col.hi < col.lo || (uint64_t)col.hi - (uint64_t)col.lo > 0xFFFFFFFFull))
+      return false;
+  }
+  t->mutation_seq = sql_next_mutation_seq();
+  const std::vector<uint8_t> nul(lc.n, 0);
+  std::atomic<bool> ok{true};
+  for_each_parallel(lc.cols.size(), [&](size_t c) {
+    ColumnStore& cs = t->col_data[c];
+    LoadColumns::Col& col = lc.cols[c];
+    start_typed_if_empty(t, c);
+    bool done = false;
+    switch (col.kind) {
+      case LoadColumns::For: done = load_adopt_for(cs, col.ints, col.lo, col.hi); break;
+      case LoadColumns::Scaled: done = cs.adopt_scaled(col.ints, nul, col.places, true); break;
+      case LoadColumns::Double: done = cs.adopt_doubles(std::move(col.dbls), nul); break;
+      case LoadColumns::Dict: {
+        std::vector<uint32_t> id(col.entries.size());
+        for (size_t k = 0; k < col.entries.size(); ++k) id[k] = cs.intern(col.entries[k]);
+        // adopt_codes, less its build_zone_maps: the loader made them as it read the rows
+        if (cs.encoding != ColumnEncoding::DictBitPacked || cs.row_count_ != 0 || cs.bit_width_ != 32) break;
+        cs.row_count_ = lc.n;
+        adopt_nulls(cs, nul, lc.n);
+        cs.packed_data.clear();
+        cs.data32.resize(lc.n);
+        for (size_t r = 0; r < lc.n; ++r) cs.data32[r] = id[col.codes[r]];
+        done = true;
+        break;
+      }
+    }
+    if (!done) { ok.store(false); return; }
+    if (lc.n > 0) {
+      cs.zone_maps = std::move(col.zones);
+      cs.zone_loose_.clear();
+    }
+  });
+  // Not expected (every condition was checked above); should a column refuse, the table is put back empty.
+  if (!ok.load()) {
+    for (auto& cs : t->col_data) cs.clear();
+    return false;
+  }
+  return true;
+}
 
 SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   bool first_generated_id = true;   // LAST_INSERT_ID: the first id this statement generates
@@ -64128,8 +64538,8 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
   auto note_touched = [&](size_t r) {
     if (ai_idx >= 0) touched_id = std::strtoull(sql_display(t->cell(r, (size_t)ai_idx)).c_str(), nullptr, 10);
   };
-  const size_t nin = canon ? canon->rows->size() : tuples.size();   // the rows this statement was given
-  if (nin > 0) {
+  const size_t nin = canon ? (canon->cols ? canon->cols->n : canon->rows->size()) : tuples.size();   // the rows given
+  if (nin > 0 && !(canon && canon->cols)) {
     t->reserve(t->row_count() + nin);
   }
   // Many plain rows into a table nothing follows row by row: each row's checks run as always, one after another,
@@ -64260,7 +64670,14 @@ SqlQueryResult SqlDatabase::execute_insert(const std::string& sql) {
       }
     });
   }
-  if (canon_taken) {
+  if (canon_taken && canon->cols) {
+    // The load's columns, whole (its key already checked by the loader): refused with the table unchanged when it
+    // is not as CREATE TABLE left it, and the loader then goes row by row.
+    if (!canon->no_undo || !load_adopt_columns(t, *canon->cols)) return make_error("load: columns not taken whole");
+    canon->cols_taken = true;
+    inserted = canon->cols->n;
+    affected = inserted;
+  } else if (canon_taken) {
     // The rows wait as they are: no value is converted, no key string made. The key of an integer primary key is
     // checked against every row of the load so far, and a duplicate is the error a plain INSERT gives (the rows
     // before it still go in, as the statement's own undo then takes them back).

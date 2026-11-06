@@ -322,6 +322,477 @@ bool load_field_canon(const LoadColCheck& k, std::string& v) {
   v = std::move(n);
   return true;
 }
+
+// append_sql_literal for a view.
+void append_sql_literal_sv(std::string& out, std::string_view s) {
+  out += '\'';
+  size_t from = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c != '\'' && c != '\\') continue;
+    out.append(s.data() + from, i - from);
+    out += c == '\'' ? "''" : "\\\\";
+    from = i + 1;
+  }
+  out.append(s.data() + from, s.size() - from);
+  out += '\'';
+}
+
+// load_field_plain's Int case on a view, with the value: plain digits, no leading zero, within the type's range.
+inline bool load_int_plain(const LoadColCheck& k, std::string_view v, int64_t* out) {
+  const size_t s0 = !v.empty() && v[0] == '-' ? 1 : 0;
+  const size_t nd = v.size() - s0;
+  if (nd < 1 || nd > 18 || (v[s0] == '0' && !(nd == 1 && s0 == 0))) return false;
+  int64_t x = 0;
+  for (size_t i = s0; i < v.size(); ++i) {
+    const unsigned d = (unsigned)(v[i] - '0');
+    if (d > 9) return false;
+    x = x * 10 + (int64_t)d;
+  }
+  const AIOS_INT128 xv = s0 ? -(AIOS_INT128)x : (AIOS_INT128)x;
+  if (xv < k.lo || xv > k.hi) return false;
+  *out = s0 ? -x : x;
+  return true;
+}
+
+// A DECIMAL(p,s) field already as stored, read as its scaled integer: [-]digits '.' s digits, no leading zero, not
+// a negative zero, at most min(9, p - s) digits before the point - the text load_field_plain takes (normalized,
+// within the precision) that decimal_fixed_scaled also takes. Anything else is left to those two.
+inline bool load_decimal_plain(const LoadColCheck& k, std::string_view v, int places, int64_t* out) {
+  const size_t s0 = !v.empty() && v[0] == '-' ? 1 : 0;
+  if (s0 && k.is_unsigned) return false;
+  if (v.size() < s0 + 2 + (size_t)places) return false;
+  const size_t dot = v.size() - (size_t)places - 1;
+  if (v[dot] != '.') return false;
+  const size_t ilen = dot - s0;
+  if (ilen < 1 || ilen > 9 || (int)ilen > k.precision - k.scale || (ilen > 1 && v[s0] == '0')) return false;
+  int64_t acc = 0;
+  for (size_t i = s0; i < v.size(); ++i) {
+    if (i == dot) continue;
+    const unsigned d = (unsigned)(v[i] - '0');
+    if (d > 9) return false;
+    acc = acc * 10 + (int64_t)d;
+  }
+  if (s0 && acc == 0) return false;
+  *out = s0 ? -acc : acc;
+  return true;
+}
+
+// A hash of a field's bytes for the loader's own dictionaries: eight bytes at a time.
+inline uint64_t load_hash(std::string_view v) {
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ v.size();
+  size_t i = 0;
+  for (; i + 8 <= v.size(); i += 8) {
+    uint64_t w;
+    std::memcpy(&w, v.data() + i, 8);
+    h = (h ^ w) * 0xff51afd7ed558ccdull;
+    h ^= h >> 32;
+  }
+  if (i < v.size()) {
+    uint64_t w = 0;
+    std::memcpy(&w, v.data() + i, v.size() - i);
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
+  }
+  return h ^ (h >> 29);
+}
+
+// A plain load read whole into its columns (LoadColumns), on every core: the file's lines found first, then each
+// 16,384-line group (8 zone-map segments, one logged INSERT) read on its own - its values checked and converted,
+// its typed columns' zone maps made, its INSERT's text written - with each thread keeping its own dictionaries,
+// merged after in the order the rows first hold their values. Only a file that splits plainly: one-byte field
+// terminator, '\n' lines, no enclosing, no escape character anywhere in it. False (with *why) wherever the
+// row-wise load would do something other than store each value as it reads: that load then runs instead.
+bool load_read_columns(const char* data, size_t size, const LoadFormat& fmt, size_t skip_lines,
+                       const std::vector<LoadColCheck>& checks, const SqlTable& t, int pk, const std::string& head,
+                       LoadColumns* out, std::vector<std::string>* recs, std::string* why) {
+  constexpr size_t kSeg = 2048, kGroup = 16384;
+  const size_t ncols = checks.size();
+  if (fmt.field_term.size() != 1 || fmt.line_term != "\n" || !fmt.line_start.empty() || fmt.enclosed >= 0 ||
+      fmt.field_term[0] == '\n' || (fmt.escape >= 0 && (fmt.escape == '\n' || fmt.escape == fmt.field_term[0])) ||
+      ncols == 0 || ncols != t.columns.size()) {
+    *why = "format";
+    return false;
+  }
+  if (!load_columns_fit(t)) { *why = "table not as created"; return false; }
+  const char ft = fmt.field_term[0];
+  auto& pool = SqlThreadPool::instance();
+  const uint64_t ph0 = hal_now_ns();
+  uint64_t ph1 = 0, ph2 = 0;
+  const size_t lanes = pool.num_workers() + 1;
+
+  // 1. The lines: where each starts, found a slice of the file per thread; and no escape character anywhere.
+  const size_t nslices = std::min<size_t>(lanes * 2, std::max<size_t>(1, size >> 16));
+  std::vector<std::vector<size_t>> slice_starts(nslices);
+  std::atomic<bool> escaped{false};
+  pool.parallel_for(nslices, 1, [&](size_t s0, size_t s1, size_t) {
+    for (size_t s = s0; s < s1; ++s) {
+      const size_t b = size * s / nslices, e = size * (s + 1) / nslices;
+      if (fmt.escape >= 0 && std::memchr(data + b, fmt.escape, e - b)) escaped.store(true);
+      auto& v = slice_starts[s];
+      v.reserve((e - b) / 32 + 16);
+      for (const char* q = data + b; q < data + e;) {
+        const char* nl = (const char*)std::memchr(q, '\n', (size_t)(data + e - q));
+        if (!nl) break;
+        if ((size_t)(nl + 1 - data) < size) v.push_back((size_t)(nl + 1 - data));
+        q = nl + 1;
+      }
+    }
+  });
+  if (escaped.load()) { *why = "escape character in the file"; return false; }
+  std::vector<size_t> starts;
+  {
+    size_t total = 1;
+    for (const auto& v : slice_starts) total += v.size();
+    starts.reserve(total + 1);
+    starts.push_back(0);
+    for (auto& v : slice_starts) { starts.insert(starts.end(), v.begin(), v.end()); std::vector<size_t>().swap(v); }
+  }
+  if (size == 0) starts.clear();
+  if (skip_lines >= starts.size()) { *why = "no lines"; return false; }
+  starts.erase(starts.begin(), starts.begin() + (ptrdiff_t)skip_lines);
+  const size_t n = starts.size();
+  // A line's end: the byte before the next line's start (its '\n'), or for the last line the file's end less a
+  // final '\n'.
+  auto line_end = [&](size_t r) -> size_t {
+    if (r + 1 < n) return starts[r + 1] - 1;
+    return size > 0 && data[size - 1] == '\n' && size - 1 >= starts[r] ? size - 1 : size;
+  };
+
+  ph1 = hal_now_ns();
+  out->n = n;
+  out->cols.assign(ncols, {});
+  const size_t nsegs = (n + kSeg - 1) / kSeg, ngroups = (n + kGroup - 1) / kGroup;
+  std::vector<int64_t> scale_div(ncols, 1);
+  std::vector<double> scale_f(ncols, 1.0);
+  for (size_t c = 0; c < ncols; ++c) {
+    auto& col = out->cols[c];
+    col.kind = load_column_kind(t.columns[c]);
+    // the kind of check a value of the column has must be one that gives that column's values
+    const LoadColCheck::Kind ck = checks[c].kind;
+    const bool fits = col.kind == LoadColumns::For ? ck == LoadColCheck::Int
+                      : col.kind == LoadColumns::Scaled ? ck == LoadColCheck::Decimal
+                      : col.kind == LoadColumns::Double ? ck == LoadColCheck::Real
+                      : ck != LoadColCheck::Unsupported;
+    if (!fits) { *why = "column " + t.columns[c].name + " is not one read whole"; return false; }
+    if (col.kind == LoadColumns::Scaled) {
+      col.places = (int)t.columns[c].scale;
+      for (int i = 0; i < col.places; ++i) { scale_div[c] *= 10; scale_f[c] *= 10.0; }
+    }
+    if (col.kind == LoadColumns::Double) col.dbls.resize(n);
+    else if (col.kind == LoadColumns::Dict) col.codes.resize(n);
+    else col.ints.resize(n);
+    col.zones.resize(nsegs);
+  }
+  if (pk >= 0 && out->cols[(size_t)pk].kind != LoadColumns::For) { *why = "key"; return false; }
+
+  // Per thread: a dictionary per dictionary column (the file's text -> a code of the thread's own, with what the
+  // column stores and what its zone maps take of it: build_zone_maps' readings of an entry), the least and greatest
+  // value of each For / Scaled column, and which of its codes the segment being read holds.
+  struct Local {
+    // the file's text -> code: open addressing over (hash, code + 1), the text compared against raw[code]
+    std::vector<uint64_t> slot_hash;
+    std::vector<uint32_t> slot_code;
+    std::vector<std::string_view> raw;
+    size_t mask = 0;
+    std::vector<std::string> text, low, lit;   // as stored; its collation key; as a quoted literal
+    std::vector<size_t> first_row;
+    std::vector<uint64_t> h_orig, h_low;
+    std::vector<double> d;
+    std::vector<int64_t> i;
+    std::vector<uint8_t> has_d, has_i;
+    std::vector<uint32_t> stamp, seen;           // the segment (+1) each code was last seen in; the segment's codes
+  };
+  struct Lane {
+    std::vector<Local> dicts;
+    std::vector<int64_t> lo, hi;
+    std::string tmp;
+  };
+  std::vector<Lane> lane(lanes);
+  for (auto& l : lane) { l.dicts.resize(ncols); l.lo.assign(ncols, INT64_MAX); l.hi.assign(ncols, INT64_MIN); }
+  std::vector<uint32_t> group_lane(ngroups, 0);
+  recs->assign(ngroups, std::string());
+  std::atomic<bool> failed{false};
+  aios::hal::Mutex why_mu;
+  auto fail = [&](std::string w) {
+    std::lock_guard<aios::hal::Mutex> lk(why_mu);
+    if (!failed.exchange(true)) *why = std::move(w);
+  };
+  // A new entry of a thread's dictionary: false when it is not a value stored as it reads.
+  auto add_entry = [&](Local& d, size_t c, std::string_view v, size_t r, uint32_t* code) -> bool {
+    std::string s(v);
+    if (!load_field_canon(checks[c], s) || sql_is_null(s)) return false;
+    *code = (uint32_t)d.text.size();
+    d.raw.push_back(v);
+    if ((d.raw.size() + 1) * 2 > d.slot_code.size()) {   // grown (and every code placed again) at half full
+      const size_t cap = std::max<size_t>(64, d.slot_code.size() * 2);
+      d.slot_code.assign(cap, 0);
+      d.slot_hash.assign(cap, 0);
+      d.mask = cap - 1;
+      for (uint32_t k2 = 0; k2 < (uint32_t)d.raw.size(); ++k2) {
+        const uint64_t h = load_hash(d.raw[k2]);
+        size_t at = h & d.mask;
+        while (d.slot_code[at]) at = (at + 1) & d.mask;
+        d.slot_code[at] = k2 + 1;
+        d.slot_hash[at] = h;
+      }
+    } else {
+      const uint64_t h = load_hash(v);
+      size_t at = h & d.mask;
+      while (d.slot_code[at]) at = (at + 1) & d.mask;
+      d.slot_code[at] = *code + 1;
+      d.slot_hash[at] = h;
+    }
+    std::string low = collate_key(s), lit;
+    append_sql_literal_sv(lit, s);
+    d.h_orig.push_back(fnv1a(std::string_view(s)));
+    d.h_low.push_back(fnv1a(std::string_view(low)));
+    // ensure_dict_doubles / ensure_dict_ints: strtod and strtoll of the entry, none for an empty one
+    double dv = 0;
+    long long lv = 0;
+    bool hd = false, hi = false;
+    if (!s.empty()) {
+      char* endp = nullptr;
+      dv = std::strtod(s.c_str(), &endp);
+      hd = endp != s.c_str();
+      endp = nullptr;
+      lv = std::strtoll(s.c_str(), &endp, 10);
+      hi = endp != s.c_str();
+    }
+    d.d.push_back(hd ? dv : 0.0);
+    d.has_d.push_back(hd ? 1 : 0);
+    d.i.push_back(hi ? (int64_t)lv : 0);
+    d.has_i.push_back(hi ? 1 : 0);
+    d.text.push_back(std::move(s));
+    d.low.push_back(std::move(low));
+    d.lit.push_back(std::move(lit));
+    d.first_row.push_back(r);
+    d.stamp.push_back(0);
+    return true;
+  };
+
+  std::atomic<uint64_t> busy_ns{0};
+  std::atomic<uint32_t> lanes_used{0};
+  pool.parallel_for(ngroups, 1, [&](size_t g0, size_t g1, size_t tid) {
+    const uint64_t tb0 = hal_now_ns();
+    struct Busy { std::atomic<uint64_t>& b; uint64_t t0; ~Busy() { b.fetch_add(hal_now_ns() - t0); } } busy{busy_ns, tb0};
+    Lane& L = lane[tid < lanes ? tid : 0];
+    lanes_used.fetch_or(1u << (tid & 31));
+    // per segment, per typed column: the text bounds so far
+    std::vector<std::string> mn(ncols), mx(ncols);
+    std::vector<uint8_t> first(ncols, 1);
+    for (size_t g = g0; g < g1 && !failed.load(std::memory_order_relaxed); ++g) {
+      group_lane[g] = (uint32_t)tid;
+      const size_t r0 = g * kGroup, r1 = std::min(n, r0 + kGroup);
+      // The INSERT's text, written straight into its buffer.
+      std::string& rec = (*recs)[g];
+      rec.resize(head.size() + 16 + (line_end(r1 - 1) - starts[r0]) * 5 / 4 + (r1 - r0) * (ncols * 2 + 4));
+      char* w = rec.data();
+      char* wend = rec.data() + rec.size();
+      auto need = [&](size_t k) {
+        if ((size_t)(wend - w) >= k) return;
+        const size_t used = (size_t)(w - rec.data());
+        rec.resize(std::max(rec.size() * 2, used + k + 4096));
+        w = rec.data() + used;
+        wend = rec.data() + rec.size();
+      };
+      auto put = [&](const char* s, size_t k) { need(k); std::memcpy(w, s, k); w += k; };
+      put(head.data(), head.size());
+      put(" VALUES ", 8);
+      for (size_t r = r0; r < r1; ++r) {
+        const size_t seg = r / kSeg;
+        const bool seg_start = r % kSeg == 0, seg_end = r % kSeg == kSeg - 1 || r + 1 == n;
+        if (seg_start) {
+          for (size_t c = 0; c < ncols; ++c) {
+            SegmentZoneMap& zm = out->cols[c].zones[seg];
+            zm.min_int64 = INT64_MAX; zm.max_int64 = INT64_MIN;
+            zm.min_double = 1e300; zm.max_double = -1e300;
+            zm.null_count = 0; zm.has_stats = true; zm.bloom_filter = 0;
+            first[c] = 1;
+            L.dicts[c].seen.clear();
+          }
+        }
+        const char* p = data + starts[r];
+        const char* const e = data + line_end(r);
+        if (r == r0) put("(", 1); else put(",(", 2);
+        for (size_t c = 0; c < ncols; ++c) {
+          const char* q = p;
+          while (q < e && *q != ft) ++q;
+          if (c + 1 < ncols) {
+            if (q == e) { fail("line " + std::to_string(r + 1 + skip_lines) + " has too few fields"); return; }
+          } else if (q != e) {
+            fail("line " + std::to_string(r + 1 + skip_lines) + " has too many fields");
+            return;
+          }
+          std::string_view v(p, (size_t)(q - p));
+          p = q + 1;
+          LoadColumns::Col& col = out->cols[c];
+          const LoadColCheck& k = checks[c];
+          if (c) put(",", 1);
+          if (col.kind == LoadColumns::Dict) {
+            Local& d = L.dicts[c];
+            uint32_t code = UINT32_MAX;
+            if (d.mask) {
+              const uint64_t h = load_hash(v);
+              for (size_t at = h & d.mask; d.slot_code[at]; at = (at + 1) & d.mask) {
+                const uint32_t k2 = d.slot_code[at] - 1;
+                if (d.slot_hash[at] == h && d.raw[k2] == v) { code = k2; break; }
+              }
+            }
+            if (code == UINT32_MAX && !add_entry(d, c, v, r, &code)) { fail("a value of " + t.columns[c].name + " is not stored as it reads"); return; }
+            col.codes[r] = code;
+            if (d.stamp[code] != seg + 1) { d.stamp[code] = (uint32_t)(seg + 1); d.seen.push_back(code); }
+            put(d.lit[code].data(), d.lit[code].size());
+            continue;
+          }
+          // a typed column: the value, the text it is stored as, and its readings for the zone map
+          std::string_view text = v;
+          double dv = 0;
+          int64_t iv = 0;
+          bool ok = false;
+          if (col.kind == LoadColumns::For) {
+            int64_t x = 0;
+            ok = load_int_plain(k, v, &x);
+            if (!ok) {
+              L.tmp.assign(v);
+              ok = load_field_canon(k, L.tmp) && canonical_int(L.tmp, &x);
+              text = L.tmp;
+            }
+            col.ints[r] = x;
+            dv = (double)x;
+            iv = x;
+          } else if (col.kind == LoadColumns::Scaled) {
+            int64_t sv = 0;
+            ok = load_decimal_plain(k, v, col.places, &sv);
+            if (!ok) {
+              L.tmp.assign(v);
+              ok = load_field_canon(k, L.tmp) && decimal_fixed_scaled(L.tmp, col.places, &sv);
+              text = L.tmp;
+            }
+            col.ints[r] = sv;
+            dv = scaled_decimal_double(sv, scale_f[c]);
+            iv = sv / scale_div[c];
+          } else {   // Double: as append_encoded's TypedDouble case takes it without printing it back
+            int64_t ip = 0;
+            ok = !(k.is_unsigned && !v.empty() && v[0] == '-') && normalized_already(SqlDataType::Real, 0, v) &&
+                 zone_plain_number(v, &dv, &ip);
+            if (!ok) {
+              L.tmp.assign(v);
+              ok = load_field_canon(k, L.tmp) && normalized_already(SqlDataType::Real, 0, L.tmp) &&
+                   zone_plain_number(L.tmp, &dv, &ip);
+              text = L.tmp;
+            }
+            col.dbls[r] = dv;
+            iv = (int64_t)dv;
+          }
+          if (!ok) { fail("a value of " + t.columns[c].name + " is not stored as it reads"); return; }
+          if (col.kind != LoadColumns::Double) {
+            const int64_t x = col.ints[r];
+            if (x < L.lo[c]) L.lo[c] = x;
+            if (x > L.hi[c]) L.hi[c] = x;
+          }
+          // extend_zone_map's reading of the row. A number's text ([-]digits[.digits]) is its own collation key,
+          // and PAD SPACE, case-insensitive order on such text is plain byte order (every byte is above the space
+          // and none is a letter).
+          SegmentZoneMap& zm = col.zones[seg];
+          if (dv < zm.min_double) zm.min_double = dv;
+          if (dv > zm.max_double) zm.max_double = dv;
+          if (iv < zm.min_int64) zm.min_int64 = iv;
+          if (iv > zm.max_int64) zm.max_int64 = iv;
+          zm.add_bloom(fnv1a(text));
+          if (first[c]) { mn[c].assign(text); mx[c].assign(text); first[c] = 0; }
+          else if (text.compare(mn[c]) < 0) mn[c].assign(text);
+          else if (text.compare(mx[c]) > 0) mx[c].assign(text);
+          need(text.size() + 2);
+          *w++ = '\'';
+          std::memcpy(w, text.data(), text.size());
+          w += text.size();
+          *w++ = '\'';
+        }
+        put(")", 1);
+        if (seg_end) {
+          for (size_t c = 0; c < ncols; ++c) {
+            SegmentZoneMap& zm = out->cols[c].zones[seg];
+            if (out->cols[c].kind == LoadColumns::Dict) {
+              // build_zone_maps' dictionary pass over the segment's distinct codes, in the order the rows first
+              // hold them (so a tie under the collation goes the same way)
+              const Local& d = L.dicts[c];
+              const std::string* lo_s = nullptr;
+              const std::string* hi_s = nullptr;
+              for (uint32_t k2 : d.seen) {
+                if (d.has_d[k2]) { if (d.d[k2] < zm.min_double) zm.min_double = d.d[k2]; if (d.d[k2] > zm.max_double) zm.max_double = d.d[k2]; }
+                if (d.has_i[k2]) { if (d.i[k2] < zm.min_int64) zm.min_int64 = d.i[k2]; if (d.i[k2] > zm.max_int64) zm.max_int64 = d.i[k2]; }
+                zm.add_bloom(d.h_orig[k2]);
+                zm.add_bloom(d.h_low[k2]);
+                if (!lo_s || pad_compare_ci(d.low[k2], *lo_s) < 0) lo_s = &d.low[k2];
+                if (!hi_s || pad_compare_ci(d.low[k2], *hi_s) > 0) hi_s = &d.low[k2];
+              }
+              if (lo_s) zone_set_min(zm, *lo_s);
+              if (hi_s) zone_set_max(zm, *hi_s);
+            } else {
+              zone_set_min(zm, mn[c]);
+              zone_set_max(zm, mx[c]);
+            }
+            zm.all_null = false;
+          }
+        }
+      }
+      rec.resize((size_t)(w - rec.data()));
+    }
+  });
+  if (failed.load()) return false;
+  ph2 = hal_now_ns();
+
+  // 2. Each For / Scaled column's range (a span past 32 bits is a dictionary row-wise), and the key.
+  for (size_t c = 0; c < ncols; ++c) {
+    auto& col = out->cols[c];
+    if (col.kind != LoadColumns::For && col.kind != LoadColumns::Scaled) continue;
+    for (const auto& l : lane) { col.lo = std::min(col.lo, l.lo[c]); col.hi = std::max(col.hi, l.hi[c]); }
+    if ((uint64_t)col.hi - (uint64_t)col.lo > 0xFFFFFFFFull) { *why = "the values of " + t.columns[c].name + " span past 32 bits"; return false; }
+  }
+  if (pk >= 0) {
+    const auto& k = out->cols[(size_t)pk].ints;
+    bool rising = true;
+    for (size_t r = 1; r < n && rising; ++r) rising = k[r] > k[r - 1];
+    if (!rising) {
+      std::vector<int64_t> s(k);
+      std::sort(s.begin(), s.end());
+      if (std::adjacent_find(s.begin(), s.end()) != s.end()) { *why = "a duplicate key"; return false; }
+    }
+  }
+
+  // 3. The dictionaries: every thread's values in the order rows first hold them, one entry per text, and each
+  // row's code turned into its entry's index.
+  for (size_t c = 0; c < ncols; ++c) {
+    auto& col = out->cols[c];
+    if (col.kind != LoadColumns::Dict) continue;
+    struct Ent { size_t row; uint32_t lane, code; };
+    std::vector<Ent> all;
+    for (size_t l = 0; l < lanes; ++l)
+      for (size_t k = 0; k < lane[l].dicts[c].text.size(); ++k) all.push_back({lane[l].dicts[c].first_row[k], (uint32_t)l, (uint32_t)k});
+    std::sort(all.begin(), all.end(), [](const Ent& a, const Ent& b) { return a.row < b.row; });
+    std::vector<std::vector<uint32_t>> remap(lanes);
+    for (size_t l = 0; l < lanes; ++l) remap[l].assign(lane[l].dicts[c].text.size(), 0);
+    std::unordered_map<std::string_view, uint32_t> global;
+    global.reserve(all.size());
+    for (const Ent& en : all) {
+      const std::string& s = lane[en.lane].dicts[c].text[en.code];
+      auto ins = global.emplace(std::string_view(s), (uint32_t)col.entries.size());
+      if (ins.second) col.entries.push_back(s);
+      remap[en.lane][en.code] = ins.first->second;
+    }
+    pool.parallel_for(ngroups, 1, [&](size_t g0, size_t g1, size_t) {
+      for (size_t g = g0; g < g1; ++g) {
+        const auto& m = remap[group_lane[g]];
+        for (size_t r = g * kGroup, r1 = std::min(n, r + kGroup); r < r1; ++r) col.codes[r] = m[col.codes[r]];
+      }
+    });
+  }
+  if (vx_trace_on())
+    vx_trace("load data: lines " + std::to_string((ph1 - ph0) / 1000) + " us, read " + std::to_string((ph2 - ph1) / 1000) +
+             " us (lanes " + std::to_string(__builtin_popcount(lanes_used.load())) + ", busy " + std::to_string(busy_ns.load() / 1000) +
+             " us), keys and dictionaries " + std::to_string((hal_now_ns() - ph2) / 1000) + " us");
+  return true;
+}
 }  // namespace
 
 void sql_set_local_infile(bool over_wire, const std::string* data) {
@@ -700,7 +1171,56 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
     while (first_len < 4096 && first_len < size && data[first_len] != '\n') ++first_len;
     if (first_len > 0) canon_keys.reserve(size / (first_len + 1) + 1024);
   }
-  if (pipelined) {
+  // An empty table and a load of its own: the file is read whole into the columns on every core
+  // (load_read_columns) and the columns taken as they are. Anything it does not read plainly leaves the table as it
+  // was and the load goes on row by row below.
+  bool bulk_done = false;
+  static const bool bulk_off = std::getenv("AIOS_SQL_LOAD_ROWWISE") != nullptr;
+  if (canon_ok && own_txn && rows_at_start == 0 && !bulk_off) {
+    const uint64_t b0 = hal_now_ns();
+    LoadColumns lc;
+    std::vector<std::string> recs;
+    std::string why;
+    if (load_read_columns(data, size, fmt, skip_lines, checks, *t, canon_pk, head, &lc, &recs, &why)) {
+      const uint64_t b1 = hal_now_ns();
+      std::vector<std::vector<std::string>> none;
+      LoadCanonBatch cb;
+      cb.rows = &none;
+      cb.pk = canon_pk;
+      cb.keys = &canon_keys;
+      cb.no_undo = true;
+      cb.cols = &lc;
+      t->ensure_columns();   // a table never written has none yet, and execute_insert takes rows deferred only into columns
+      tls_insert_canon = &cb;
+      SqlQueryResult r = execute_insert(head);
+      tls_insert_canon = nullptr;
+      if (cb.cols_taken) {
+        bulk_done = true;
+        if (cb.undo_skipped) canon_unlogged = true;
+        if (!r.success) {
+          failure = r.error_message;
+        } else {
+          records = lc.n;
+          affected = r.rows_affected;
+          if (!redo_replaying_ && !g_undo_applying) {
+            for (auto& rec : recs) {
+              if (g_stmt_clock_depth > 0 && !g_cdc_thread)
+                rec = std::string(kRedoClockTag) + std::to_string((long long)g_stmt_clock_at) + "*/ " + rec;
+              tls_txn.redo.push_back({effective_database(), std::move(rec)});
+            }
+          }
+        }
+        if (vx_trace_on())
+          vx_trace("load data: read whole into the columns: " + std::to_string(lc.n) + " rows, read " +
+                   std::to_string((b1 - b0) / 1000) + " us, taken " + std::to_string((hal_now_ns() - b1) / 1000) + " us");
+      } else if (vx_trace_on()) {
+        vx_trace("load data: the columns were not taken whole (" + r.error_message + ")");
+      }
+    } else if (vx_trace_on()) {
+      vx_trace("load data: not read whole: " + why);
+    }
+  }
+  if (pipelined && !bulk_done) {
     struct Parsed {
       std::vector<std::vector<std::string>> canon;   // a plain load's rows, as stored
       bool failed = false;                            // a plain load met what it cannot take as it stands
@@ -816,7 +1336,7 @@ SqlQueryResult SqlDatabase::execute_load_data(const std::string& sql) {
     struct ResetCanon { ~ResetCanon() { tls_load_canon_off = false; } } reset_canon;
     return execute_load_data(sql);
   }
-  while (!pipelined && rd.next_line(&fields)) {
+  while (!pipelined && !bulk_done && rd.next_line(&fields)) {
     ++line_no;
     if (line_no <= skip_lines) continue;
     if (sql_interrupted()) { failure = "Query execution was interrupted"; break; }
