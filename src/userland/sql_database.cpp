@@ -19656,6 +19656,31 @@ bool ColumnStore::set_encoded(size_t row, const std::string& val) {
       write_code(row, (uint32_t)delta);
       break;
     }
+    case ColumnEncoding::DecimalScaled: {
+      // A fixed-scale DECIMAL cell rewritten in place, as FOR's: the text as the scaled integer the column holds, kept
+      // only when get() prints it back byte for byte (append_encoded's rule) - else the cell is put back and the
+      // column takes the dictionary path. Without this an UPDATE of one amount turned the whole column into a
+      // dictionary: 500k cells printed and interned, ~60 ms, and every later scan read text codes, not numbers.
+      if (!decimal_fixed()) return false;
+      int places = 0;
+      for (double t = std::round(scale_factor); t > 1; t /= 10) ++places;
+      int64_t sv = 0;
+      if (!decimal_fixed_scaled(val, places, &sv)) return false;
+      if (sv < base_int64 && !rebase_packed(*this, sv)) return false;
+      const uint64_t delta = (uint64_t)(sv - base_int64);
+      if (delta > 0xFFFFFFFFull) return false;
+      if (bit_width_ < 32 && (bit_width_ == 0 || (delta >> bit_width_))) repack_codes(*this, code_bits_for(delta));
+      const bool was_null = is_null(row);
+      const uint32_t old_code = read_code(row);
+      write_code(row, (uint32_t)delta);
+      if (was_null) set_null(row, false);
+      if (get(row) != val) {
+        write_code(row, old_code);
+        if (was_null) set_null(row, true);
+        return false;
+      }
+      break;
+    }
     case ColumnEncoding::SegmentFOR:
     case ColumnEncoding::ALP: {
       // The row counts as non-NULL while its segment is laid out again.
@@ -67183,6 +67208,30 @@ std::shared_ptr<SqlDatabase::RowIndex> SqlDatabase::sync_row_index(const SqlTabl
   const size_t upto = max_rows == SIZE_MAX || t.row_count() - row_index_.rows_indexed <= max_rows
                           ? t.row_count() : row_index_.rows_indexed + max_rows;
   size_t i = row_index_.rows_indexed;
+  // One typed-integer key column held whole in its column (no delta rows, no auto-increment to read): the keys made
+  // from its decoded integers. Every typed integer encoding prints a cell as std::to_string of its int64 (get()), so
+  // each key is byte for byte what the loop below makes - without get()'s string per row; that string and its
+  // to_string were half of a 500k-row table's first UPDATE by key (~30 ms).
+  if (pk_cols.size() == 1 && ai_idx < 0 && (size_t)pk_cols[0] < ncols && (size_t)pk_cols[0] < t.col_data.size() &&
+      t.col_data[(size_t)pk_cols[0]].size() >= upto && vx::typed_integer(t.col_data[(size_t)pk_cols[0]])) {
+    const ColumnStore& kcs = t.col_data[(size_t)pk_cols[0]];
+    const bool nulls = vx::has_nulls(kcs);
+    constexpr size_t kBlock = 4096;
+    int64_t vals[kBlock];
+    char buf[24];
+    while (i < upto) {
+      const size_t e = std::min(upto, i + kBlock);
+      vx::typed_ints(kcs, i, e, vals);
+      for (size_t r = i; r < e; ++r) {
+        if (nulls && kcs.is_null(r)) continue;
+        const auto tc = std::to_chars(buf, buf + sizeof buf, vals[r - i]);
+        key.assign(buf, tc.ptr);
+        key.push_back('\x1f');   // as row_key builds it
+        row_index_.pk_to_row.emplace(key, r + row_index_.gaps.size());
+      }
+      i = e;
+    }
+  }
   for (; i < upto; ++i) {
     key.clear();
     bool keyed = !pk_cols.empty();
