@@ -236,7 +236,13 @@ class TcpConnection final : public Connection {
     // the recv were three system calls on every request that had not
     // arrived yet, which between a client's answer and its next question
     // is every request.
-    if (const unsigned spin = spin_us(); spin && timeout_ms != 0 && spin_take()) {
+    // A connection whose spins keep missing stops spinning: after a write the client's next statement mostly came
+    // later than the spin (two in three missed on the bench's single-row UPDATEs), so the spin was 30 us of CPU
+    // and the sleep anyway - and the commit's own threads ran slower beside it (p50 0.42 ms against 0.35 without).
+    // Point lookups' spins all hit and keep spinning. A hit counts +1, a miss -2; below zero only every 16th wait
+    // tries again, so a connection that turns back to quick reads finds its spin again.
+    bool spin_now = spin_score_ >= 0 || (++spin_probe_ & 15) == 0;
+    if (const unsigned spin = spin_us(); spin && spin_now && timeout_ms != 0 && spin_take()) {
       // Poll briefly before sleeping: a client that answers within the spin
       // costs no sleep and no wake on either side. Only a few connections
       // spin at once - when many are busy the spin would only take the CPU
@@ -245,7 +251,7 @@ class TcpConnection final : public Connection {
       const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
       do {
         const ssize_t n = ::recv(fd_, rbuf_, sizeof rbuf_, MSG_DONTWAIT);
-        if (n > 0) { rlen_ = (size_t)n; return 1; }
+        if (n > 0) { rlen_ = (size_t)n; if (spin_score_ < 3) ++spin_score_; return 1; }
         if (n == 0) { dead_ = true; last_eof_ = true; return -1; }
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { dead_ = true; return -1; }
         for (int i = 0; i < 32; ++i) {   // a spin hint: pause on x86, yield on arm64 (the Pi), nothing elsewhere
@@ -256,6 +262,7 @@ class TcpConnection final : public Connection {
 #endif
         }
       } while (std::chrono::steady_clock::now() < until);
+      spin_score_ = spin_score_ > -4 ? spin_score_ - 2 : -4;
     }
     if (timeout_ms != rcv_timeout_ms_) {
       timeval tv{};
@@ -304,6 +311,8 @@ class TcpConnection final : public Connection {
   int rcv_timeout_ms_ = -2;   // the SO_RCVTIMEO the socket holds (-1 forever; -2 never set)
   unsigned char rbuf_[16384];
   size_t rpos_ = 0, rlen_ = 0;
+  int spin_score_ = 0;          // fill's spin: hits +1 (to 3), misses -2 (to -4); spins while >= 0
+  unsigned spin_probe_ = 0;     // below zero: every 16th wait spins again
 #ifdef AIOS_HAVE_URING
   std::mutex tx_mu_;   // one send_all at a time per connection, so two senders' bytes never interleave
 #endif
