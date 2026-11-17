@@ -3349,6 +3349,27 @@ std::shared_ptr<GrainCanvas> get_canvas(const Value& v, std::string& error, cons
   return nullptr;
 }
 
+}  // namespace
+
+bool canvas_pixels(const Value& v, uint32_t* w, uint32_t* h, const std::vector<uint32_t>** px, std::string& error, const char* func) {
+  auto cv = get_canvas(v, error, func);
+  if (!cv) return false;
+  *w = cv->width;
+  *h = cv->height;
+  *px = &cv->pixels;
+  return true;
+}
+
+Value canvas_value(uint32_t w, uint32_t h, std::vector<uint32_t> px) {
+  auto cv = std::make_shared<GrainCanvas>();
+  cv->width = w;
+  cv->height = h;
+  cv->pixels = std::move(px);
+  return Value::object(Type::Extern, std::make_shared<ExternObj>("canvas", cv));
+}
+
+namespace {
+
 std::shared_ptr<GrainGradient> get_gradient(const Value& v, std::string& error, const char* func) {
   if (v.type == Type::Extern) {
     auto ext = static_cast<ExternObj*>(v.obj.get());
@@ -8233,6 +8254,7 @@ void install_core_builtins(Vm& vm) {
   install_kv_builtins(vm);
   install_raster3d_builtins(vm);
   install_gltf_builtins(vm);
+  install_carve_builtins(vm);
   install_process_builtins(vm);   // refuses unless the host set Vm::allow_process
   install_regex_builtins(vm);
   install_time_builtins(vm);

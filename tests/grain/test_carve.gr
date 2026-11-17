@@ -1,0 +1,220 @@
+// image_cutout / image_quantize / mesh_inflate (src/userland/grain_std_carve.cpp): a subject cut from a photo-like
+// background, colours put on a palette, a silhouette inflated into a closed surface. Every check measures the
+// result against what the input makes true by construction (an area, a radius, a closed surface, exact colours).
+fn check(c, msg) { assert_true(c, msg) }
+
+// a repeatable noise: a background that is not one flat colour, the way paper under a lamp is not
+let seed = 12345
+fn rnd() {
+  seed = (seed * 1103515245 + 12345) % 2147483648
+  return seed
+}
+fn noisy(cv, w, h, r, g, b, amp) {
+  for y in 0..h {
+    for x in 0..w {
+      // a lighting gradient across the picture and a few units of grain
+      let shade = idiv(x * 12, w) - 6
+      let n = rnd() % (amp * 2 + 1) - amp
+      let c = fn (v) { return max(0, min(255, v + shade + n)) }
+      canvas_set_pixel(cv, x, y, 0xFF000000 + (c(r) << 16) + (c(g) << 8) + c(b))
+    }
+  }
+}
+fn alpha_at(mask, w, x, y) { return bytes_get(mask, y * w + x, "u8") }
+
+// ---- image_cutout: a red disc with a white eye, on noisy off-white paper ----
+let W = 160
+let H = 120
+let cv = canvas_create(W, H)
+noisy(cv, W, H, 236, 232, 222, 6)
+canvas_set_fill_color(cv, "#b02818")
+canvas_fill_circle(cv, 80, 60, 40)
+// the eye: the background's own colour, but enclosed - it is part of the subject, not a hole
+canvas_set_fill_color(cv, "#ece8de")
+canvas_fill_circle(cv, 92, 50, 6)
+// a speck of dirt on the paper, away from the subject
+canvas_set_fill_color(cv, "#202020")
+canvas_fill_rect(cv, 10, 10, 2, 2)
+
+let cut = image_cutout(cv)
+check(cut.w == W and cut.h == H, "the mask is the picture's size")
+let area = 0
+for y in 0..H { for x in 0..W { if alpha_at(cut.mask, W, x, y) >= 128 { area = area + 1 } } }
+let disc = PI * 40 * 40
+check(abs(area - disc) / disc < 0.04, format("the subject's area is the disc's: {} against {:.0f}", area, disc))
+check(alpha_at(cut.mask, W, 92, 50) == 255, "the enclosed eye is kept (background colour, but not reachable from the border)")
+check(alpha_at(cut.mask, W, 11, 11) == 0, "the speck of dirt is not the subject (only the largest piece is)")
+check(alpha_at(cut.mask, W, 2, 2) == 0 and alpha_at(cut.mask, W, 80, 60) == 255, "corner out, centre in")
+check(abs(cut.bbox.x - 40) <= 1 and abs(cut.bbox.y - 20) <= 1 and abs(cut.bbox.w - 80) <= 2 and abs(cut.bbox.h - 80) <= 2,
+      format("its bounding box is the disc's: {}", cut.bbox))
+check(((canvas_get_pixel(cut.canvas, 2, 2) >> 24) & 255) == 0, "outside is transparent on the cut canvas")
+check(canvas_get_pixel(cut.canvas, 70, 70) == canvas_get_pixel(cv, 70, 70), "inside keeps its pixel exactly")
+let bgc = cut.background
+check(len(bgc) == 3 and abs(bgc[0] - 236) < 12 and abs(bgc[2] - 222) < 12, format("the background found is the paper's: {}", bgc))
+
+// keep: "all" keeps a second subject of comparable size; "largest" drops it
+let two = canvas_create(160, 80)
+noisy(two, 160, 80, 30, 120, 40, 4)
+canvas_set_fill_color(two, "#f0d020")
+canvas_fill_rect(two, 20, 20, 40, 40)
+canvas_fill_rect(two, 100, 25, 30, 30)
+let one_piece = image_cutout(two)
+let all_pieces = image_cutout(two, {"keep": "all"})
+check(alpha_at(one_piece.mask, 160, 115, 40) == 0 and alpha_at(one_piece.mask, 160, 40, 40) == 255, "largest: the smaller square goes")
+check(alpha_at(all_pieces.mask, 160, 115, 40) == 255 and alpha_at(all_pieces.mask, 160, 40, 40) == 255, "all: both squares stay")
+check(!try_call(image_cutout, two, {"keep": "some"}).ok, "keep is largest or all")
+check(!try_call(image_cutout, 42).ok, "a canvas is wanted")
+
+// a picture with nothing in it is refused, not guessed at
+let blank = canvas_create(64, 64)
+noisy(blank, 64, 64, 200, 200, 200, 2)
+check(!try_call(image_cutout, blank).ok, "nothing stands out: refused")
+
+// ---- image_quantize ----
+let pal = bytes(4 * 3)
+let cols = [[0, 0, 0], [255, 0, 0], [0, 255, 0], [255, 255, 255]]
+for i in 0..4 { for k in 0..3 { bytes_set(pal, i * 3 + k, "u8", cols[i][k]) } }
+let q = canvas_create(4, 2)
+canvas_set_pixel(q, 0, 0, 0xFF000000)
+canvas_set_pixel(q, 1, 0, 0xFFFF0000)
+canvas_set_pixel(q, 2, 0, 0xFF00FF00)
+canvas_set_pixel(q, 3, 0, 0xFFFFFFFF)
+canvas_set_pixel(q, 0, 1, 0xFFE01010)   // near red
+canvas_set_pixel(q, 1, 1, 0xFF10F020)   // near green
+canvas_set_pixel(q, 2, 1, 0)            // transparent (an int with no alpha byte reads as opaque; 0 is clear)
+canvas_set_pixel(q, 3, 1, 0xFFF4F4F4)   // near white
+let r = image_quantize(q, pal)
+let got = []
+for i in 0..8 { push(got, bytes_get(r.indices, i, "u8")) }
+check(got[0] == 0 and got[1] == 1 and got[2] == 2 and got[3] == 3, format("exact colours are their own index: {}", got))
+check(got[4] == 1 and got[5] == 2 and got[7] == 3, format("near colours go to the nearest: {}", got))
+check(bytes_get(r.mask, 6, "u8") == 0 and bytes_get(r.mask, 0, "u8") == 1, "the transparent pixel is out of the mask")
+let ex = image_quantize(q, pal, {"exclude": [1]})
+check(bytes_get(ex.indices, 1, "u8") != 1, "an excluded index is never chosen")
+// dithering a mid grey between black and white averages to it
+let grey = canvas_create(32, 32)
+canvas_set_fill_color(grey, "#808080")
+canvas_fill_rect(grey, 0, 0, 32, 32)
+let bw = bytes(6)
+for k in 0..3 { bytes_set(bw, 3 + k, "u8", 255) }
+let flat = image_quantize(grey, bw)
+let dith = image_quantize(grey, bw, {"dither": true})
+let ones_flat = 0
+let ones_dith = 0
+for i in 0..1024 { ones_flat = ones_flat + bytes_get(flat.indices, i, "u8"); ones_dith = ones_dith + bytes_get(dith.indices, i, "u8") }
+check(ones_flat == 0 or ones_flat == 1024, "without dithering a flat grey is one colour")
+check(abs(ones_dith - 1024 * 128 / 255) < 40, format("dithered, the share of white is the grey's level: {} of 1024", ones_dith))
+check(!try_call(image_quantize, q, bytes(5)).ok, "a palette is 3 bytes a colour")
+
+// ---- image_resample ----
+let src = canvas_create(8, 4)
+for y in 0..4 { for x in 0..8 { canvas_set_pixel(src, x, y, x < 4 ? 0xFFFF0000 : 0xFF0000FF) } }
+let half = image_resample(src, 4, 2)
+check(canvas_width(half) == 4 and canvas_height(half) == 2, "the new size")
+check(canvas_get_pixel(half, 0, 0) == 0xFFFF0000 and canvas_get_pixel(half, 3, 1) == 0xFF0000FF, "whole blocks keep their colour")
+let mid = image_resample(src, 1, 1, {"x": 3, "y": 0, "w": 2, "h": 4})
+check(canvas_get_pixel(mid, 0, 0) == 0xFF800080 or canvas_get_pixel(mid, 0, 0) == 0xFF7F007F, format("a crop over the seam is half and half: {}", color_to_hex(canvas_get_pixel(mid, 0, 0))))
+// a transparent neighbour does not darken an edge (premultiplied)
+let edge = canvas_create(2, 1)
+canvas_set_pixel(edge, 0, 0, 0xFFFFFFFF)
+canvas_set_pixel(edge, 1, 0, 0x00000000)
+let e1 = canvas_get_pixel(image_resample(edge, 1, 1), 0, 0)
+check((e1 & 0xFFFFFF) == 0xFFFFFF and abs(((e1 >> 24) & 255) - 128) <= 1, format("half covered: white at half alpha, {}", e1))
+check(!try_call(image_resample, src, 2, 2, {"x": 6, "y": 0, "w": 4, "h": 4}).ok, "a crop outside the picture is refused")
+
+// ---- mesh_inflate: a disc inflates to a sphere ----
+let R = 20
+let N = 2 * R + 4
+let m = bytes(N * N)
+for y in 0..N { for x in 0..N {
+  let dx = x + 0.5 - N / 2.0
+  let dy = y + 0.5 - N / 2.0
+  if dx * dx + dy * dy <= R * R { bytes_set(m, y * N + x, "u8", 255) }
+} }
+let s = mesh_inflate(m, N, N, {"smooth": 0})
+check(abs(s.depth - 2 * R) < 2.5, format("a disc of radius {} inflates as deep as it is wide: depth {:.2f}", R, s.depth))
+// every front vertex on the sphere: x (depth) squared plus its distance from the centre in the picture's plane
+let fr = s.front
+// (positions: x depth, y across the picture from its centre, z up from the silhouette's bottom row)
+let cy = s.height - 0.5 - N / 2.0
+let worst = 0.0
+for i in 0..fr.vertex_count {
+  let px = bytes_get(fr.positions, i * 12, "f32le")
+  let py = bytes_get(fr.positions, i * 12 + 4, "f32le")
+  let pz = bytes_get(fr.positions, i * 12 + 8, "f32le")
+  let rr = sqrt(px * px + py * py + (pz - cy + 0.5) * (pz - cy + 0.5))
+  worst = max(worst, abs(rr - R))
+}
+check(worst < 1.6, format("the front is a hemisphere of radius {}: farthest off by {:.2f}", R, worst))
+// normals point away from the centre (outward)
+let outward = 0
+for i in 0..fr.vertex_count {
+  let px = bytes_get(fr.positions, i * 12, "f32le")
+  let nx = bytes_get(fr.normals, i * 12, "f32le")
+  if px > 2.0 and nx > 0.0 { outward = outward + 1 }
+  if px > 2.0 and nx <= 0.0 { outward = outward - 1000 }
+}
+check(outward > 0, "front normals face forward")
+
+// closed: put the two halves together by position, every edge is in exactly two triangles, and the volume is a
+// sphere's (a surface with a hole or a flipped triangle does not add up to it)
+fn key(b, i) { return format("{:.3f},{:.3f},{:.3f}", bytes_get(b, i * 12, "f32le"), bytes_get(b, i * 12 + 4, "f32le"), bytes_get(b, i * 12 + 8, "f32le")) }
+let ids = {}
+let nid = 0
+let edges = {}
+let vol = 0.0
+for half in [s.front, s.back] {
+  let local = []
+  for i in 0..half.vertex_count {
+    let k = key(half.positions, i)
+    if get(ids, k, nil) == nil { ids[k] = nid; nid = nid + 1 }
+    push(local, ids[k])
+  }
+  let nt = idiv(len(half.indices), 12)
+  for t in 0..nt {
+    let a = bytes_get(half.indices, t * 12, "u32le")
+    let b = bytes_get(half.indices, t * 12 + 4, "u32le")
+    let c = bytes_get(half.indices, t * 12 + 8, "u32le")
+    for e in [[local[a], local[b]], [local[b], local[c]], [local[c], local[a]]] {
+      let ek = format("{}-{}", min(e[0], e[1]), max(e[0], e[1]))
+      edges[ek] = get(edges, ek, 0) + 1
+    }
+    // the signed volume of the tetrahedron with the origin
+    let p = fn (i) { return [bytes_get(half.positions, i * 12, "f32le"), bytes_get(half.positions, i * 12 + 4, "f32le"), bytes_get(half.positions, i * 12 + 8, "f32le") - cy] }
+    let A = p(a)
+    let B = p(b)
+    let C = p(c)
+    vol = vol + (A[0] * (B[1] * C[2] - B[2] * C[1]) - A[1] * (B[0] * C[2] - B[2] * C[0]) + A[2] * (B[0] * C[1] - B[1] * C[0])) / 6.0
+  }
+}
+let open_edges = 0
+for ek in keys(edges) { if edges[ek] != 2 { open_edges = open_edges + 1 } }
+check(open_edges == 0, format("the surface is closed: {} edges not shared by exactly two triangles", open_edges))
+let sphere = 4.0 / 3.0 * PI * R * R * R
+check(abs(vol - sphere) / sphere < 0.12, format("the enclosed volume is the sphere's: {:.0f} against {:.0f}", vol, sphere))
+check(s.tris == idiv(len(s.front.indices) + len(s.back.indices), 12), "tris counts both halves")
+
+// a thin bar stays as thick as it is wide, not as thick as the body it hangs off
+let bw2 = 60
+let bh2 = 40
+let bar = bytes(bw2 * bh2)
+for y in 0..bh2 { for x in 0..bw2 {
+  let body = (x - 15) * (x - 15) + (y - 20) * (y - 20) <= 14 * 14
+  let arm = x >= 28 and x < 58 and y >= 18 and y < 22
+  if body or arm { bytes_set(bar, y * bw2 + x, "u8", 255) }
+} }
+let sb = mesh_inflate(bar, bw2, bh2, {"smooth": 0})
+let arm_depth = 0.0
+let body_depth = 0.0
+for i in 0..sb.front.vertex_count {
+  let px = bytes_get(sb.front.positions, i * 12, "f32le")
+  let py = bytes_get(sb.front.positions, i * 12 + 4, "f32le")
+  // y is the picture's x less half its width (30): the arm (x >= 32) is y >= 2, the body (x < 24) y < -6
+  if py >= 2.0 { arm_depth = max(arm_depth, px) }
+  if py < -6.0 { body_depth = max(body_depth, px) }
+}
+check(arm_depth < 2.6 and body_depth > 12.0, format("the arm (4 wide) is about 2 deep, the body (28 wide) about 14: {:.2f}, {:.2f}", arm_depth, body_depth))
+
+check(!try_call(mesh_inflate, bytes(10), 4, 4).ok, "the mask is w*h bytes")
+check(!try_call(mesh_inflate, bytes(16), 4, 4).ok, "an empty mask is refused")
+print("PASS: test_carve")

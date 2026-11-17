@@ -67,6 +67,13 @@ void install_kv_builtins(Vm& vm);
 void install_raster3d_builtins(Vm& vm);
 // gltf_* (grain_std_gltf.cpp): reading glTF 2.0 models; installed with the core builtins.
 void install_gltf_builtins(Vm& vm);
+// image_cutout, image_quantize, mesh_inflate (grain_std_carve.cpp): photos into game assets; installed with the
+// core builtins.
+void install_carve_builtins(Vm& vm);
+// A canvas's size and pixels (0xAARRGGBB, top row first) - false, with error naming `func`, when v is not a canvas.
+bool canvas_pixels(const Value& v, uint32_t* w, uint32_t* h, const std::vector<uint32_t>** px, std::string& error, const char* func);
+// A new canvas holding those pixels.
+Value canvas_value(uint32_t w, uint32_t h, std::vector<uint32_t> px);
 // mail_send (grain_std_mail.cpp); installed by install_http_builtins.
 void install_mail_builtins(Vm& vm);
 

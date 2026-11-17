@@ -105,6 +105,7 @@ set(GRAIN_LANG_SOURCES
   ${AIOS_ROOT}/src/userland/web_svg.cpp
   ${AIOS_ROOT}/src/userland/web_layout.cpp
   ${AIOS_ROOT}/src/userland/grain_std_doc.cpp
+  ${AIOS_ROOT}/src/userland/grain_std_carve.cpp
   ${AIOS_ROOT}/src/userland/archive.cpp
   ${AIOS_ROOT}/src/net/deflate.cpp)
 
