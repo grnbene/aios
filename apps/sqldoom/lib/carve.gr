@@ -110,12 +110,13 @@ fn carve_clips() {
 }
 
 # A clip's keys resampled every `step` seconds (linearly between the keys), each with the lift that puts the body's
-# lowest point at the floor in that pose: [t, quat, lift, sz]. pts: the body's points (x y z, model units), a sample
-# of its vertices.
-fn ground_clip(keys, pts, step) {
+# lowest point at the floor in that pose: [t, quat, lift, sz]. positions: the body's vertices (bytes, or a list of
+# bytes), every one of them weighed (mesh_lowest).
+fn ground_clip(keys, positions, step) {
   let dur = keys[len(keys) - 1][0] * 1.0e0
   let n = max(1, round(dur / step))
   let out = []
+  let poses = []
   let k = 0
   for i in range(0, n + 1) {
     let t = dur * i / n
@@ -123,38 +124,14 @@ fn ground_clip(keys, pts, step) {
     let a = keys[k]
     let b = keys[min(k + 1, len(keys) - 1)]
     let f = b[0] > a[0] ? min(1.0e0, max(0.0e0, (t - a[0]) / (b[0] - a[0]))) : 0.0e0
-    let roll = a[1] + (b[1] - a[1]) * f
-    let pitch = a[2] + (b[2] - a[2]) * f
-    let yaw = a[3] + (b[3] - a[3]) * f
+    let q = pose_q(a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f)
     let sz = a[4] + (b[4] - a[4]) * f
-    let q = pose_q(roll, pitch, yaw)
-    # the rotation's third row: what a point's height becomes
-    let x = q[0]
-    let y = q[1]
-    let z = q[2]
-    let w = q[3]
-    let r0 = 2.0e0 * (x * z - w * y)
-    let r1 = 2.0e0 * (y * z + w * x)
-    let r2 = 1.0e0 - 2.0e0 * (x * x + y * y)
-    let low = 1.0e30
-    let j = 0
-    while j < len(pts) {
-      low = min(low, r0 * pts[j] + r1 * pts[j + 1] + r2 * pts[j + 2] * sz)
-      j = j + 3
-    }
-    push(out, [t, q, -low, sz])
+    push(out, [t, q, 0.0, sz])
+    push(poses, [q[0], q[1], q[2], q[3], sz])
   }
+  let low = mesh_lowest(positions, poses)
+  for i in 0..len(out) { out[i][2] = -low[i] }
   return out
-}
-
-# Every `stride`th vertex of a half's positions, as a flat list.
-fn sample_points(half, stride, into) {
-  let i = 0
-  while i < half.vertex_count {
-    push(into, bytes_get(half.positions, i * 12, "f32le"), bytes_get(half.positions, i * 12 + 4, "f32le"), bytes_get(half.positions, i * 12 + 8, "f32le"))
-    i = i + stride
-  }
-  return into
 }
 
 fn delete_model(name) {
@@ -169,7 +146,7 @@ fn delete_model(name) {
 
 # A rigid model written as `name`: its parts (prims: model_prim's columns, each {vertex_count, positions, normals,
 # indices, and uvs with texture 0 or colors}), a texture (PNG bytes, or nil), and the five clips, each sample lifted
-# so the body (pts: a sample of its points, x y z flat) rests on the floor. Returns its id.
+# so the body (pts: its vertices' positions, bytes or a list of bytes) rests on the floor. Returns its id.
 fn write_model(name, source, texture, prims, pts) {
   let id = delete_model(name)
   cv_insert("model", "model_id, name, source, up", [id, name, source, "z"])
@@ -223,7 +200,7 @@ fn write_carved(name, cut, rows, opts) {
   front.shade = 1.0
   let back = mesh.back
   back.shade = 0.72
-  let pts = sample_points(mesh.back, max(1, idiv(mesh.back.vertex_count, 3000)), sample_points(mesh.front, max(1, idiv(mesh.front.vertex_count, 3000)), []))
+  let pts = [mesh.front.positions, mesh.back.positions]
   let id = write_model(name, "carved from a photo (lib/carve.gr)", bytes(canvas_to_png(tex)), [front, back], pts)
   return {"model": id, "tris": mesh.tris, "depth": mesh.depth, "height": mesh.height}
 }
@@ -273,9 +250,11 @@ fn frame_pose(letter, clips) {
 # drawn, its origin the feet.
 fn render_view(t, R, md, scale, rot, pose) {
   # far off and narrow, so near enough orthographic (a point 50 units behind the origin lands under half a row
-  # off): D units away, the 128-wide target spans 128 units
+  # off): D units away, the target spans R units - drawn at twice that (the target is 2R across) and averaged down,
+  # so a part thinner than a texel still shows as the share of it that is there
+  let K = 2
   let fov = 2.0e0
-  let D = 64.0e0 / tan(fov * 3.141592653589793e0 / 360.0e0)
+  let D = (R / 2.0e0) / tan(fov * 3.141592653589793e0 / 360.0e0)
   let eye_z = 40.0e0
   let ang = 180.0e0 - 45.0e0 * (rot - 1)
   let thing = {"model": md.model, "anim": md.anims[pose[0]], "time": pose[1], "hold": pose[2], "scale": scale,
@@ -288,18 +267,24 @@ fn render_view(t, R, md, scale, rot, pose) {
   r3d_clear(t, 0xFFFF00FF)
   r3d_draw_tex(t, [], fov, cam, [thing])
   let b = bytes(r3d_pixels(t))
-  let cv = canvas_create(R, R)
+  let RK = R * K
+  let px = bytes(RK * RK * 4)
+  for o in range(0, RK * RK) {
+    let pa = bytes_get(a, o * 4, "u32le")
+    if pa == bytes_get(b, o * 4, "u32le") { bytes_set(px, o * 4, "u32le", pa | 0xFF000000) }
+  }
+  let big = canvas_create(RK, RK)
+  canvas_set_pixels(big, px)
+  let cv = image_resample(big, R, R)
+  # drawn: a texel at least 3/8 covered
+  let argb = bytes(canvas_to_bytes(cv, "argb"))
   let x0 = R
   let y0 = R
   let x1 = -1
   let y1 = -1
-  let px = bytes(R * R * 4)
   for y in range(0, R) {
     for x in range(0, R) {
-      let o = (y * R + x) * 4
-      let pa = bytes_get(a, o, "u32le")
-      if pa == bytes_get(b, o, "u32le") {
-        bytes_set(px, o, "u32le", pa | 0xFF000000)
+      if bytes_get(argb, (y * R + x) * 4 + 3, "u8") >= 96 {
         x0 = min(x0, x)
         y0 = min(y0, y)
         x1 = max(x1, x)
@@ -308,7 +293,6 @@ fn render_view(t, R, md, scale, rot, pose) {
     }
   }
   if x1 < 0 { error(format("carve_sprites(): the model drew nothing at rotation {}", rot)) }
-  canvas_set_pixels(cv, px)
   let crop = image_resample(cv, x1 - x0 + 1, y1 - y0 + 1, {"x": x0, "y": y0, "w": x1 - x0 + 1, "h": y1 - y0 + 1})
   # the eye is level at eye_z: the feet (z = 0) are eye_z rows below the middle row
   return {"canvas": crop, "w": x1 - x0 + 1, "h": y1 - y0 + 1, "left": idiv(R, 2) - x0, "top": idiv(R, 2) + round(eye_z) - y0}
@@ -327,7 +311,7 @@ fn carve_sprites(sprite, m, opts) {
     bytes_set(pal, c.palette_index * 3 + 2, "u8", c.b)
   }
   let R = 128
-  let t = r3d_target(R, R)
+  let t = r3d_target(R * 2, R * 2)
   r3d_options(t, {"y_scale": 1.0, "bilinear": true, "mipmaps": true})
   let md = model_load(t, m.model, 1000)
   let height = get(opts, "height", 56.0) * 1.0e0
@@ -341,7 +325,7 @@ fn carve_sprites(sprite, m, opts) {
     let frame = slice(l.lump_name, 4, 5)
     let rot = int(slice(l.lump_name, 5, 6))
     let v = render_view(t, R, md, scale, rot == 0 ? 1 : rot, frame_pose(frame, clips))
-    let q = image_quantize(v.canvas, pal, {"dither": get(opts, "dither", false)})
+    let q = image_quantize(v.canvas, pal, {"dither": get(opts, "dither", false), "alpha": 96})
     sql(format("UPDATE sprite_lumps SET pixels = {}, mask = {} WHERE lump_name = {}", cv_lit(q.indices), cv_lit(q.mask), cv_lit(l.lump_name)))
     sql(format("UPDATE sprite_frames SET width = {}, height = {}, left_offset = {}, top_offset = {} WHERE lump_name = {}",
                v.w, v.h, v.left, v.top, cv_lit(l.lump_name)))
@@ -469,8 +453,6 @@ fn hull_prim(h) {
   let cy = (h.min[1] + h.max[1]) / 2.0
   let P = bytes(n * 12)
   let N = bytes(n * 12)
-  let pts = []
-  let stride = max(1, idiv(n, 4000))
   for i in 0..n {
     let x = bytes_get(h.positions, i * 12, "f32le") - cx
     let y = bytes_get(h.positions, i * 12 + 4, "f32le") - cy
@@ -482,9 +464,8 @@ fn hull_prim(h) {
     bytes_set(N, i * 12, "f32le", -bytes_get(h.normals, i * 12 + 4, "f32le"))
     bytes_set(N, i * 12 + 4, "f32le", bytes_get(h.normals, i * 12, "f32le"))
     bytes_set(N, i * 12 + 8, "f32le", bytes_get(h.normals, i * 12 + 8, "f32le"))
-    if i % stride == 0 { push(pts, -y, x, z) }
   }
-  return {"prim": {"vertex_count": n, "positions": P, "normals": N, "indices": h.indices, "colors": h.colors}, "pts": pts}
+  return {"prim": {"vertex_count": n, "positions": P, "normals": N, "indices": h.indices, "colors": h.colors}, "pts": P}
 }
 
 # The photos (bytes each) as model `name` and `name`_far: carve_model's result, rebuilt in 3D.

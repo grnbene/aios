@@ -616,12 +616,29 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
         if (on * 2 > all) sure_bg[(size_t)y * w + x] = 1;
       }
   }
+  // opts.foreground_mask: the same, nonzero where it is certainly the subject (a swipe along it)
+  std::vector<uint8_t> sure_fg(n, 0);
+  if (o) if (const Value* fm = o->find("foreground_mask"); fm && fm->type != Type::Nil) {
+    if (fm->type != Type::Bytes || fm->bytes_data().size() != (size_t)W * H) { error = "image_cutout(): foreground_mask wants bytes, one a pixel of the picture"; return Value::nil(); }
+    const auto& B = fm->bytes_data();
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const int x0 = (int)(x * (double)W / w), x1 = std::max(x0 + 1, (int)((x + 1) * (double)W / w));
+        const int y0 = (int)(y * (double)H / h), y1 = std::max(y0 + 1, (int)((y + 1) * (double)H / h));
+        bool any = false;
+        for (int yy = y0; yy < std::min<int>(y1, H) && !any; ++yy)
+          for (int xx = x0; xx < std::min<int>(x1, W) && !any; ++xx) any = B[(size_t)yy * W + xx] != 0;
+        if (any) { sure_fg[(size_t)y * w + x] = 1; sure_bg[(size_t)y * w + x] = 0; }
+      }
+  }
   // whether anything stands out at all: how many cells are far (3 spreads) from every colour of the border
   const std::vector<Cluster> border_colours = kmeans(border, 5);
   {
     size_t far = 0;
     for (size_t i = 0; i < n; ++i) if (!sure_bg[i] && cluster_distance(L[i], border_colours, 2.5f) >= 3.0f) ++far;
-    if (far * 1000 < n) { error = "image_cutout(): nothing stands out from the background (a plainer background, or the subject filling more of the picture, helps)"; return Value::nil(); }
+    bool marked = false;
+    for (uint8_t v : sure_fg) if (v) { marked = true; break; }
+    if (far * 1000 < n && !marked) { error = "image_cutout(): nothing stands out from the background (a plainer background, or the subject filling more of the picture, helps)"; return Value::nil(); }
   }
 
   // GrabCut (Rother, Kolmogorov and Blake): colour models of the subject and the background (mixtures of five
@@ -663,6 +680,7 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
     const double big = 1e9;
     for (size_t i = 0; i < n; ++i) {
       if (sure_bg[i]) { g.set_tweights((int)i, 0, big); continue; }
+      if (sure_fg[i]) { g.set_tweights((int)i, big, 0); continue; }
       // the source side is the subject: its capacity is the cost of calling the cell background, and the other way
       g.set_tweights((int)i, gbg.cost(L[i]), gfg.cost(L[i]));
     }
@@ -677,7 +695,7 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
     g.run();
     size_t changed = 0;
     for (size_t i = 0; i < n; ++i) {
-      const uint8_t v = sure_bg[i] ? 0 : (g.source_side((int)i) ? 1 : 0);
+      const uint8_t v = sure_bg[i] ? 0 : (sure_fg[i] || g.source_side((int)i) ? 1 : 0);
       changed += v != fg[i];
       fg[i] = v;
     }
@@ -2607,6 +2625,32 @@ Value bi_image_difference(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, res);
 }
 
+// mesh_lowest(positions, poses) -> [z ...]: for each pose [qx, qy, qz, qw, sz] (a rotation, after stretching z by
+// sz), the lowest height any of the points reaches - positions: bytes of float32 xyz, or a list of such bytes
+Value bi_mesh_lowest(Vm&, std::vector<Value>& args, std::string& error) {
+  std::vector<const std::vector<uint8_t>*> sets;
+  if (args[0].type == Type::Bytes) sets.push_back(&args[0].bytes_data());
+  else if (args[0].type == Type::List) { for (const Value& v : args[0].list_items()) if (v.type == Type::Bytes) sets.push_back(&v.bytes_data()); }
+  if (sets.empty()) { error = "mesh_lowest() wants positions: bytes of float32 xyz, or a list of them"; return Value::nil(); }
+  if (args[1].type != Type::List) { error = "mesh_lowest() wants a list of poses [qx, qy, qz, qw, sz]"; return Value::nil(); }
+  std::vector<Value> out;
+  for (const Value& pv : args[1].list_items()) {
+    if (pv.type != Type::List || pv.list_items().size() < 5) { error = "mesh_lowest(): each pose is [qx, qy, qz, qw, sz]"; return Value::nil(); }
+    const auto& q = pv.list_items();
+    const double x = q[0].as_double(), y = q[1].as_double(), z = q[2].as_double(), w = q[3].as_double(), sz = q[4].as_double();
+    const double r0 = 2 * (x * z - w * y), r1 = 2 * (y * z + w * x), r2 = 1 - 2 * (x * x + y * y);
+    double low = 1e300;
+    for (const auto* b : sets)
+      for (size_t i = 0; i + 12 <= b->size(); i += 12) {
+        float px, py, pz;
+        std::memcpy(&px, &(*b)[i], 4); std::memcpy(&py, &(*b)[i + 4], 4); std::memcpy(&pz, &(*b)[i + 8], 4);
+        low = std::min(low, r0 * px + r1 * py + r2 * pz * sz);
+      }
+    out.push_back(Value::real(low));
+  }
+  return Value::list(std::move(out));
+}
+
 // ---- tires ----------------------------------------------------------------------------------------------------
 
 Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
@@ -2661,6 +2705,7 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("image_difference", 2, 3, bi_image_difference);
   vm.define_native("camera_pose_rect", 5, 6, bi_camera_pose_rect);
   vm.define_native("box_face_views", 6, 6, bi_box_face_views);
+  vm.define_native("mesh_lowest", 2, 2, bi_mesh_lowest);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }
