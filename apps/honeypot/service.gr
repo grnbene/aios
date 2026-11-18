@@ -4,6 +4,9 @@ fn setting(n, d) { let v = getenv(n) return v == nil or v == "" ? d : v }
 let FEED = setting("HONEYPOT_FEED", "/var/log/aios/honeypot.jsonl")
 let NODE = setting("AIOS_NODE", setting("HOSTNAME", "node"))
 let PAGE = app_program("page.html")
+let JOIN_TMPL = app_program("join.sh.tmpl")
+// the hub's public base, e.g. https://hub.example.com/honeypot - set by install-hub.sh; nodes report to <it>/ingest
+let PUBLIC_URL = setting("PUBLIC_URL", "")
 
 fn now_iso() { return date_format(now(), "%Y-%m-%dT%H:%M:%SZ", "utc") }
 
@@ -66,7 +69,11 @@ fn all_events() {
   let out = []
   for ln in split(r.value, "\n") {
     let t = trim(ln)
-    if t != "" { let p = pcall(json_parse, t) if p.ok { push(out, p.value) } }
+    if t != "" {
+      let p = pcall(json_parse, t)
+      // the join script's own self-test request is not evidence of anything - keep it out of exports and reports
+      if p.ok and get(p.value, "ua", "") != "aios-honeypot-selftest" { push(out, p.value) }
+    }
   }
   return out
 }
@@ -87,6 +94,7 @@ fn have_id(id) {
 let FLEET_STATUS = "fleet_status.jsonl"
 fn record_fleet_seen(node, t, kind) {
   if node == "" { return }
+  if kind == "honeypot.leave" { forget_node(node) return }
   let r = pcall(read_file, FLEET_STATUS)
   let roster = {}
   if r.ok {
@@ -103,6 +111,20 @@ fn record_fleet_seen(node, t, kind) {
   let lines = []
   for k in keys(roster) { push(lines, json_stringify(roster[k])) }
   pcall(write_file, FLEET_STATUS, join(lines, "\n") + "\n")
+}
+// drop a node from the roster: it was uninstalled (join.sh --uninstall says so), or you removed it on the dashboard
+fn forget_node(node) {
+  let r = pcall(read_file, FLEET_STATUS)
+  if not r.ok { return }
+  let lines = []
+  for ln in split(r.value, "\n") {
+    let t = trim(ln)
+    if t != "" {
+      let p = pcall(json_parse, t)
+      if p.ok and get(p.value, "node", "") != node { push(lines, t) }
+    }
+  }
+  pcall(write_file, FLEET_STATUS, len(lines) == 0 ? "" : join(lines, "\n") + "\n")
 }
 fn fleet_roster() {
   let r = pcall(read_file, FLEET_STATUS)
@@ -436,13 +458,19 @@ serve_routes({
     record_fleet_seen(node, get(p.value, "t", now_iso()), kind)
     // a heartbeat proves the node is alive and forwarding works; it isn't an event, so it never joins the feed
     // (one every 60s per node would otherwise drown real grabs out of the recent-history window over time).
-    if kind == "honeypot.heartbeat" { return res_json({"ok": true, "heartbeat": true}) }
+    if kind == "honeypot.heartbeat" or kind == "honeypot.leave" { return res_json({"ok": true}) }
     if have_id(get(p.value, "id", "")) { return res_json({"ok": true, "dup": true}) }
     append_file(FEED, line + "\n")
     return res_json({"ok": true})
   },
   // the fleet roster: every node that has ever reported in, when it was last heard from, and whether it's still
   // sending heartbeats (client decides "stale" from last_heartbeat; see stale_after_seconds).
+  "POST /api/fleet/forget": fn (req) { let g = dash_guard(req) if g != nil { return g }
+    let node = trim(get(req.query_params, "node", ""))
+    if node == "" { return res_error(400, "node required") }
+    forget_node(node)
+    return res_json({"ok": true})
+  },
   "GET /api/fleet": fn (req) { let g = dash_guard(req) if g != nil { return g }  return res_json({"nodes": fleet_roster(), "stale_after_seconds": 150}) },
   "GET /api/grabs": fn (req) { let g = dash_guard(req) if g != nil { return g } 
     let limit = int(get(req.query_params, "limit", "400"))
@@ -471,6 +499,29 @@ serve_routes({
     }
     return res_download(json_stringify({"node": NODE, "generated": now_iso(), "count": len(all), "events": all}),
                         "honeypot-evidence.json")
+  },
+  // --- joining a server: one command from the dashboard does the rest -------------------------------------------
+  // the script a new server pipes into bash: hub URL and fleet token filled in. Needs the token to fetch, so it
+  // is only ever handed to someone who already has it (i.e. copied it from this password-protected dashboard).
+  "GET /join.sh": fn (req) {
+    if not fleet_ok(req) { return res_error(401, "bad or missing fleet token") }
+    if PUBLIC_URL == "" { return res_error(503, "PUBLIC_URL is not set on the hub (install-hub.sh sets it)") }
+    let body = replace(replace(JOIN_TMPL, "__HUB__", PUBLIC_URL), "__TOKEN__", FLEET_TOKEN)
+    return res_text(body, 200, {"Cache-Control": "no-store"})
+  },
+  // the static x86_64 aios-webserver the join script installs (install-hub.sh copies it into this app's data dir)
+  "GET /dl/aios-webserver": fn (req) {
+    if not fleet_ok(req) { return res_error(401, "bad or missing fleet token") }
+    let r = pcall(read_bytes, "aios-webserver.bin")
+    if not r.ok { return res_error(404, "no aios-webserver.bin on the hub - re-run install-hub.sh") }
+    return res_download(r.value, "aios-webserver")
+  },
+  "GET /api/join": fn (req) { let g = dash_guard(req) if g != nil { return g }
+    if PUBLIC_URL == "" or FLEET_TOKEN == "" { return res_json({"ready": false}) }
+    let has_bin = pcall(read_bytes, "aios-webserver.bin").ok
+    return res_json({"ready": has_bin,
+      "command": "curl -fsSL -H \"X-Fleet-Token: " + FLEET_TOKEN + "\" " + PUBLIC_URL + "/join.sh | sudo bash -s -- --name NAME",
+      "uninstall": "curl -fsSL -H \"X-Fleet-Token: " + FLEET_TOKEN + "\" " + PUBLIC_URL + "/join.sh | sudo bash -s -- --uninstall"})
   },
   "GET /api/report": fn (req) { let g = dash_guard(req) if g != nil { return g }  return res_download(build_report(), "honeypot-incident-report.txt") },
   // real identification, on demand: who registered this address's block, their abuse contact, what it actually

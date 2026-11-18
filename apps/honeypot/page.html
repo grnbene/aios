@@ -62,9 +62,16 @@ tr[data-origin] { cursor:pointer; }
   <div class="card"><div class="n" id="c_cb" style="color:var(--hot)">0</div><div class="l">bait callbacks</div></div>
   <div class="card"><div class="n" id="c_top" style="font-size:16px">—</div><div class="l">top origin</div></div>
 </div>
-<div id="fleetwrap" style="display:none">
-  <h2 style="font-size:16px;margin:4px 0">Fleet <span class="muted" style="font-weight:400;font-size:13px">— every node that forwards here, and whether it still is</span></h2>
-  <div id="fleetrows" class="cards" style="margin-bottom:14px"></div>
+<div id="fleetwrap">
+  <h2 style="font-size:16px;margin:4px 0">Fleet <span class="muted" style="font-weight:400;font-size:13px">— every server that reports here, and whether it still is</span></h2>
+  <div id="fleetrows" class="cards" style="margin-bottom:10px"></div>
+  <div class="card" id="joinbox" style="margin-bottom:14px">
+    <div style="font-weight:600;margin-bottom:4px">➕ Add a server</div>
+    <div class="muted" style="font-size:13px;margin-bottom:8px">Run this on any Linux server running nginx or Apache (replace NAME). It installs the honeypot next to your web server, wires every site, tests itself, and appears above within a minute. Your sites keep serving normally.</div>
+    <div style="display:flex;gap:8px;align-items:flex-start"><code id="joincmd" class="mono" style="flex:1;background:#0d1014;border:1px solid var(--line);border-radius:7px;padding:8px;color:var(--ink);overflow-wrap:anywhere">loading…</code>
+    <button id="joincopy" class="expbtn" style="margin:0;cursor:pointer">copy</button></div>
+    <div class="muted" style="font-size:12px;margin-top:6px">Remove from a server: same command with <code>--uninstall</code> instead of <code>--name NAME</code>. The command contains your fleet secret — share it only with people who run your servers.</div>
+  </div>
 </div>
 <div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
 <div id="mapwrap">
@@ -226,11 +233,21 @@ async function tick(){
 }
 $('f_dc').addEventListener('change', tick);
 // "they all need to report back to the hub" - show every node that ever has, and flag one that's gone quiet.
+async function loadJoin(){
+  let j; try { j = await (await fetch('api/join')).json(); } catch(e){ return; }
+  $('joincmd').textContent = j.ready ? j.command : 'not set up yet: run apps/honeypot/deploy/install-hub.sh on this hub';
+  $('joincopy').style.display = j.ready ? '' : 'none';
+}
+$('joincopy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('joincmd').textContent); $('joincopy').textContent = 'copied'; }
+  catch(e){ const r = document.createRange(); r.selectNodeContents($('joincmd')); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); $('joincopy').textContent = 'select + copy'; }
+  setTimeout(() => $('joincopy').textContent = 'copy', 2000);
+});
+loadJoin();
 async function tickFleet(){
   let j; try { j = await (await fetch('api/fleet')).json(); } catch(e){ return; }
   const nodes = j.nodes || [];
-  $('fleetwrap').style.display = nodes.length ? 'block' : 'none';
-  if (!nodes.length) return;
+  if (!nodes.length) { $('fleetrows').innerHTML = ''; return; }
   const staleAfter = (j.stale_after_seconds || 150) * 1000;
   $('fleetrows').innerHTML = nodes.map(n => {
     const hb = n.last_heartbeat || '';
@@ -241,8 +258,15 @@ async function tickFleet(){
       '<div class="l"><span class="fdot"></span>'+(stale ? 'NOT REPORTING' : 'reporting')+
       (hb ? ' · heartbeat '+esc(ago(hb)) : ' · no heartbeat yet')+'</div>'+
       (n.last_seen ? '<div class="l" style="margin-top:2px">last event '+esc(ago(n.last_seen))+' ('+esc(n.last_kind||'')+')</div>' : '')+
+      (stale ? '<div class="l" style="margin-top:4px"><a href="#" class="forget" data-node="'+esc(n.node)+'" style="color:var(--muted)">gone for good? forget it</a></div>' : '')+
       '</div>';
   }).join('');
+  document.querySelectorAll('a.forget').forEach(a => a.addEventListener('click', async ev => {
+    ev.preventDefault();
+    if (!confirm('Remove "' + a.dataset.node + '" from the fleet list? (Its recorded events stay.)')) return;
+    await fetch('api/fleet/forget?node=' + encodeURIComponent(a.dataset.node), { method: 'POST' });
+    tickFleet();
+  }));
 }
 tick(); tickFleet(); setInterval(tick, 3000); setInterval(tickFleet, 5000);
 </script>

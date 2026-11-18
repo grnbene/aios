@@ -119,6 +119,8 @@ struct VhostConfig {
   // but ONLY when the TCP peer is a trusted front proxy (loopback, or an `env_honeypot_trusted_proxy <ip>`). The
   // front proxy overwrites that header with the address it actually saw, so an attacker can't forge their origin
   // with a header of their own (a forged CF-Connecting-IP / X-Forwarded-For is still recorded, as a hop).
+  // `env_honeypot_node <name>`: this node's name on the hub's dashboard (else $AIOS_NODE, else $HOSTNAME).
+  std::string env_honeypot_node;
   std::string env_honeypot_real_ip_header;
   std::vector<std::string> env_honeypot_trusted_proxies;
   // `honeypot_hub <prefix> <upstream>`: relay requests under <prefix> (e.g. /honeypot) to the hub dashboard app
@@ -307,6 +309,8 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         } else {
           std::fprintf(stderr, "[env-honeypot] cannot read env_honeypot_token_file %s\n", path.c_str());
         }
+      } else if (tok == "env_honeypot_node") {
+        ls >> cur->env_honeypot_node;
       } else if (tok == "env_honeypot_real_ip_header") {
         ls >> cur->env_honeypot_real_ip_header;
       } else if (tok == "env_honeypot_trusted_proxy") {
@@ -823,7 +827,7 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
                   e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
                   "\",\"lat\":\"" + json_escape(e.lat) + "\",\"lon\":\"" + json_escape(e.lon) +
                   "\",\"via\":\"" + json_escape(e.via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
-                  json_escape(head.host) + "\",\"node\":\"" + json_escape(honeypot_node_name()) +
+                  json_escape(head.host) + "\",\"node\":\"" + json_escape(vh.env_honeypot_node.empty() ? honeypot_node_name() : vh.env_honeypot_node) +
                   "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
                   json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
                   json_escape(head.header("user-agent").value_or("")) + "\",\"vec\":[";
@@ -1818,10 +1822,15 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
 // The server proper. `aios webserver CONFIG` (cli/main.cpp) calls this; so does the standalone
 // aios-webserver below. argv[0] is the program name, argv[1] the config file.
 int aios_webserver_run(int argc, char** argv) {
+  // `aios-webserver --check <config>`: parse the config and load every certificate/key, then exit 0 (or 1 with the
+  // reason) without listening - so an installer can validate a change before restarting a live server.
+  bool check_only = false;
+  if (argc >= 3 && std::string(argv[1]) == "--check") { check_only = true; argv[1] = argv[2]; argc = 2; }
   if (argc < 2 || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h" || std::string(argv[1]) == "help") {
     std::fprintf(stdout,
       "aios-webserver — vhost-aware HTTP(S) edge server with PHP-FPM\n\n"
-      "usage: %s <config-file>\n\n"
+      "usage: %s <config-file>\n"
+      "       aios-webserver --check <config-file>   validate (certs included) and exit, without listening\n\n"
       "Configuration format:\n"
       "  vhost <domain> {\n"
       "    listen <port> [ssl] [loopback]\n"
@@ -1856,6 +1865,7 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot_forward <url>       # POST each event to a fleet collector (repeatable); whole-fleet view\n"
       "    env_honeypot_token <secret>      # shared fleet secret, sent as X-Fleet-Token on every forward/heartbeat\n"
       "    env_honeypot_token_file <path>   # same, read from a file (keeps the secret out of the config)\n"
+      "    env_honeypot_node <name>         # this node's name on the hub dashboard (default $AIOS_NODE, else hostname)\n"
       "    env_honeypot_real_ip_header <h>  # behind nginx/Apache: client IP from header <h>, trusted only from loopback/trusted_proxy\n"
       "    env_honeypot_trusted_proxy <ip>  # a front proxy (besides loopback) whose real-ip header is believed (repeatable)\n"
       "    honeypot_hub <prefix> <upstream> # relay <prefix>/... to the hub dashboard app, e.g. /honeypot http://127.0.0.1:8577\n"
@@ -1883,6 +1893,7 @@ int aios_webserver_run(int argc, char** argv) {
   // minute per forwarding vhost, same path as a real event (forward_event, now with its own retry), so a hub
   // that stops hearing from a node for more than a couple of minutes knows that node stopped reporting.
   for (auto& vh : vhosts) {
+    if (check_only) break;
     if (!vh.env_honeypot || vh.env_honeypot_forward.empty()) continue;
     // a raw pointer into `vhosts`, not a reference to the range-for loop variable: `vh` itself is rebound each
     // iteration and goes out of scope at the end of this block, so capturing it by reference would dangle the
@@ -1895,7 +1906,7 @@ int aios_webserver_run(int argc, char** argv) {
         char iso[32];
         std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
         std::string j = "{\"kind\":\"honeypot.heartbeat\",\"t\":\"" + std::string(iso) + "\",\"node\":\"" +
-                        json_escape(honeypot_node_name()) + "\",\"forward_count\":" +
+                        json_escape(vhp->env_honeypot_node.empty() ? honeypot_node_name() : vhp->env_honeypot_node) + "\",\"forward_count\":" +
                         std::to_string(vhp->env_honeypot_forward.size()) + "}\n";
         forward_event(vhp->env_honeypot_forward, j, vhp->env_honeypot_token);
         std::this_thread::sleep_for(std::chrono::seconds(60));
@@ -1916,6 +1927,19 @@ int aios_webserver_run(int argc, char** argv) {
     if (!key.ok()) { std::fprintf(stderr, "vhost %s: bad private key: %s\n", vh.server_name.c_str(), key.error().str().c_str()); return 1; }
     vh.tls_key = std::move(*key);
     std::fprintf(stderr, "aios-webserver: loaded TLS identity for %s (%zu cert(s) in chain)\n", vh.server_name.c_str(), vh.tls_chain.size());
+  }
+
+  if (check_only) {
+    for (const auto& vh : vhosts) {
+      if (!vh.hub_prefix.empty() && !aios::channel::parse_endpoint(vh.hub_upstream + "/").ok()) {
+        std::fprintf(stderr, "vhost %s: honeypot_hub upstream is not a URL: %s\n", vh.server_name.c_str(), vh.hub_upstream.c_str());
+        return 1;
+      }
+      if (vh.env_honeypot && !vh.env_honeypot_forward.empty() && vh.env_honeypot_token.empty())
+        std::fprintf(stderr, "vhost %s: warning: env_honeypot_forward without a fleet token - the hub will refuse it\n", vh.server_name.c_str());
+    }
+    std::fprintf(stdout, "config ok: %zu vhost(s)\n", vhosts.size());
+    return 0;
   }
 
   std::map<uint16_t, std::vector<VhostConfig*>> by_port;
