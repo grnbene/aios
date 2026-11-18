@@ -1,0 +1,166 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bin capacity</title>
+<style>
+:root { --bg: #f4f2ee; --panel: #ffffff; --ink: #1d1f22; --muted: #6b6a66; --line: #dedbd4; --accent: #c4511f; --ok: #2f7d4f; --warn: #b8860b; --full: #b3261e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #15171a; --panel: #1f2226; --ink: #ecebe7; --muted: #9d9b95; --line: #33373d; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 system-ui, sans-serif; }
+main { max-width: 820px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 22px; margin: 4px 0 4px; }
+h2 { font-size: 17px; margin: 0 0 10px; }
+p.lead, .muted { color: var(--muted); }
+p.lead { margin: 0 0 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+input, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+input { width: 100%; }
+button.go { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .5; }
+.row { display: flex; gap: 10px; align-items: end; margin-top: 10px; }
+.row > * { flex: 1; }
+label.f { display: block; font-size: 13px; color: var(--muted); }
+label.shot { display: block; text-align: center; padding: 16px; border: 2px dashed var(--line); border-radius: 10px; cursor: pointer; margin-top: 10px; }
+label.shot input { display: none; }
+#stage { position: relative; margin-top: 12px; display: none; touch-action: none; }
+#stage canvas { width: 100%; display: block; border-radius: 8px; }
+#status, #mstatus, #rstatus { min-height: 1.4em; margin-top: 8px; color: var(--muted); white-space: pre-wrap; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+td:first-child { white-space: nowrap; }
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; min-width: 60px; }
+.bar > i { display: block; height: 100%; }
+a { color: var(--accent); }
+</style></head>
+<body><main>
+<h1>Bin capacity</h1>
+<p class="lead">How full every bin is from what the ERP says is in it, and where a size still fits. Measure a bin with your phone: <a href="/marker.png" target="_blank">print the marker</a>, tape it flat on the bin's front, photograph the bin, then drag the four corners onto the opening.</p>
+
+<div class="card">
+  <h2>Measure a bin</h2>
+  <div class="row"><div><label class="f" for="bin">Bin</label><input id="bin" placeholder="e.g. R1-01" autocomplete="off"></div>
+    <div><label class="f" for="depth">Depth, mm</label><input id="depth" inputmode="numeric" value="1000"></div></div>
+  <label class="shot">Photograph the bin with the marker on it<input id="photo" type="file" accept="image/*" capture="environment"></label>
+  <div id="stage"><canvas id="cv"></canvas></div>
+  <button class="go" id="save" disabled style="width:100%;margin-top:10px">Save this bin's size</button>
+  <div id="mstatus"></div>
+</div>
+
+<div class="card">
+  <h2>Where does a size fit?</h2>
+  <div class="row"><div><input id="size" placeholder="e.g. 225/45R17"></div><button id="find" style="flex:0 0 auto">Find room</button></div>
+  <div id="rstatus"></div>
+  <table id="room" style="display:none"><thead><tr><th>Bin</th><th class="n">Room</th><th class="n">Holds</th><th>Way</th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card">
+  <h2>Bins, fullest first</h2>
+  <div id="status"></div>
+  <table id="board"><thead><tr><th>Bin</th><th>Fill</th><th class="n">%</th><th class="n">Units</th><th class="n">W x D x H mm</th></tr></thead><tbody></tbody></table>
+</div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({error: r.statusText}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function colour(f) { return f >= 1 ? 'var(--full)' : f >= 0.85 ? 'var(--warn)' : 'var(--ok)'; }
+async function board() {
+  try {
+    const j = await api('/api/board');
+    const tb = $('board').querySelector('tbody');
+    tb.innerHTML = j.bins.map(b => '<tr><td>' + esc(b.bin) + (b.unplaced > 0 ? ' <span class="muted">(' + b.unplaced + ' unsized)</span>' : '') +
+      '</td><td><div class="bar"><i style="width:' + Math.min(100, b.fill * 100) + '%;background:' + colour(b.fill) + '"></i></div></td>' +
+      '<td class="n">' + Math.round(b.fill * 100) + '</td><td class="n">' + b.units + '</td>' +
+      '<td class="n">' + Math.round(b.width_mm) + ' x ' + Math.round(b.depth_mm) + ' x ' + Math.round(b.height_mm) + '</td></tr>').join('');
+    $('status').textContent = j.bins.length ? 'Location ' + j.loccode + ', ' + j.bins.length + (j.bins.length === 1 ? ' measured bin.' : ' measured bins.') : 'No bins measured yet.';
+  } catch (e) { $('status').textContent = 'Could not read the board: ' + e.message; }
+}
+
+// ---- measuring: the photo, its marker, four corners dragged onto the opening ----
+let shot = null;      // {img, photo_id, marker, w, h}
+let corners = null;   // [[x y] x4] in photo pixels
+const cv = $('cv');
+function draw() {
+  const c = cv.getContext('2d');
+  c.drawImage(shot.img, 0, 0, cv.width, cv.height);
+  const k = cv.width / shot.w;
+  c.lineWidth = Math.max(2, cv.width / 300);
+  c.strokeStyle = '#2f9d5f';
+  c.beginPath(); shot.marker.corners.forEach((p, i) => i ? c.lineTo(p[0] * k, p[1] * k) : c.moveTo(p[0] * k, p[1] * k)); c.closePath(); c.stroke();
+  c.strokeStyle = '#ff6a2b'; c.fillStyle = 'rgba(255,106,43,.15)';
+  c.beginPath(); corners.forEach((p, i) => i ? c.lineTo(p[0] * k, p[1] * k) : c.moveTo(p[0] * k, p[1] * k)); c.closePath(); c.fill(); c.stroke();
+  const r = Math.max(10, cv.width / 50);
+  for (const p of corners) { c.beginPath(); c.arc(p[0] * k, p[1] * k, r, 0, 7); c.fillStyle = 'rgba(255,106,43,.85)'; c.fill(); }
+}
+$('photo').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const bin = $('bin').value.trim();
+  if (!bin) { $('mstatus').textContent = 'Name the bin first.'; e.target.value = ''; return; }
+  $('mstatus').textContent = 'Finding the marker...';
+  const bmp = await createImageBitmap(f);
+  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  try {
+    const j = await api('/api/photo?bin=' + encodeURIComponent(bin), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+    shot = {img: c, photo_id: j.photo_id, marker: j.marker, w: j.w, h: j.h};
+    // the opening's corners start a little way out from the marker: drag each onto the opening's corner
+    const m = j.marker.corners, cx = j.marker.centre[0], cy = j.marker.centre[1], s = j.marker.side_px * 2.5;
+    // (kept 6% inside the photo: a handle on its very edge cannot be grabbed)
+    const mx = j.w * 0.06, my = j.h * 0.06;
+    corners = [[cx - s, cy - s], [cx + s, cy - s], [cx + s, cy + s], [cx - s, cy + s]].map(p => [Math.max(mx, Math.min(j.w - mx, p[0])), Math.max(my, Math.min(j.h - my, p[1]))]);
+    cv.width = c.width; cv.height = c.height;
+    $('stage').style.display = 'block';
+    draw();
+    $('save').disabled = false;
+    $('mstatus').textContent = 'Marker found (green), ' + j.mm_per_px.toFixed(2) + ' mm a pixel there. Drag the orange corners onto the bin opening\'s corners.';
+  } catch (err) { $('mstatus').textContent = err.message; }
+});
+let drag = -1;
+function at(ev) { const r = cv.getBoundingClientRect(), k = shot.w / r.width; return [(ev.clientX - r.left) * k, (ev.clientY - r.top) * k]; }
+cv.addEventListener('pointerdown', (ev) => {
+  if (!shot) return;
+  const p = at(ev), r = cv.getBoundingClientRect(), reach = 30 * shot.w / r.width;
+  let best = -1, bd = Infinity;
+  corners.forEach((c, i) => { const d = Math.hypot(c[0] - p[0], c[1] - p[1]); if (d < bd) { bd = d; best = i; } });
+  if (bd < reach) { drag = best; cv.setPointerCapture(ev.pointerId); }
+});
+cv.addEventListener('pointermove', (ev) => { if (drag < 0) return; corners[drag] = at(ev); draw(); });
+cv.addEventListener('pointerup', () => { drag = -1; });
+$('save').addEventListener('click', async () => {
+  $('save').disabled = true;
+  try {
+    const j = await api('/api/measure', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_id: shot.photo_id, opening: corners, depth_mm: Number($('depth').value)})});
+    $('mstatus').textContent = j.bin + ': ' + Math.round(j.width_mm) + ' wide x ' + Math.round(j.height_mm) + ' high x ' + Math.round(j.depth_mm) + ' deep (mm), saved.' +
+      (j.board ? ' Now ' + Math.round(j.board.fill * 100) + '% full.' : '') + (j.warning ? '\n' + j.warning : '');
+    board();
+  } catch (err) { $('mstatus').textContent = 'Not saved: ' + err.message; }
+  $('save').disabled = false;
+});
+
+// ---- where a size fits ----
+$('find').addEventListener('click', async () => {
+  const size = $('size').value.trim();
+  try {
+    const j = await api('/api/room?size=' + encodeURIComponent(size));
+    const tb = $('room').querySelector('tbody');
+    tb.innerHTML = j.bins.map(b => '<tr><td>' + esc(b.bin) + '</td><td class="n">' + b.room + '</td><td class="n">' + b.holds + '</td><td>' + esc(b.mode) + '</td></tr>').join('');
+    $('room').style.display = j.bins.length ? 'table' : 'none';
+    $('rstatus').textContent = (j.tire ? size + ': ' + Math.round(j.tire.width_mm) + ' mm wide, ' + Math.round(j.tire.diameter_mm) + ' mm across. ' : '') +
+      (j.bins.length ? j.bins.reduce((a, b) => a + b.room, 0) + ' more fit, in ' + j.bins.length + (j.bins.length === 1 ? ' bin.' : ' bins.') : 'No measured bin has room for one.');
+  } catch (err) { $('rstatus').textContent = err.message; $('room').style.display = 'none'; }
+});
+board();
+setInterval(board, 15000);
+</script>
+</body></html>

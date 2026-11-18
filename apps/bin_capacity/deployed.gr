@@ -1,0 +1,11 @@
+// Post-deploy hook: the bin tables and the bin_fill Thing in the ASQL the app points at (made again on each deploy,
+// so a changed BIN_LOCCODE takes).
+import { q, bin_cfg } from "lib/db.gr"
+import { bins_install } from "lib/bins.gr"
+
+fn deployed(app) {
+  let r = pcall(bins_install, q, bin_cfg())
+  if not r.ok { return "bin_fill: " + str(r.error) }
+  print("bin_fill: " + r.value + " for location " + bin_cfg().loccode)
+  return true
+}

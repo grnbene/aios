@@ -1,0 +1,30 @@
+// Bin capacity application manifest.
+// How full every bin is and where a tire size still fits, from bin sizes measured on a phone photo (a printed marker
+// gives the scale) and the ERP's stock (locstock, tireinfo), kept live in ASQL by the bin_fill Thing.
+let app = {
+  "name": "bin_capacity",
+  "description": "bin sizes from phone photos, live bin fill and free room by tire size",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8575,
+  "listen": "local",
+  "settings": {
+    "DB_HOST": "127.0.0.1",
+    "DB_PORT": "3307",
+    "DB_USER": "root",
+    "DB_NAME": "versioneight",
+    // the location whose bins these are
+    "BIN_LOCCODE": "01",
+    // the printed marker's black square, as a ruler says it printed
+    "MARKER_MM": "150",
+    // a bin's depth when only its front is photographed
+    "BIN_DEPTH_MM": "1000"
+  },
+  "secrets": ["DB_PASSWORD"],
+  "requires": ["db"],
+  "health": {"path": "/health", "ok": [200]},
+  "deployed": "deployed.gr",
+  // a phone photo, scaled in the browser, is well under this
+  "max_body": 12582912,
+  "max_steps": 0
+}

@@ -1,0 +1,103 @@
+// Bin capacity web service.
+//
+//   GET  /                      the page: the board of bins by fill, measuring a bin with the phone, where a size fits
+//   GET  /health                200 when ASQL answers
+//   GET  /marker.png            the marker to print (MARKER_MM across at 300 dpi)
+//   GET  /api/board             every measured bin: size, units, items, fill (1.0 = full), unplaced units
+//   GET  /api/bin?bin=B         what is in bin B: each item, how many of it the bin holds alone, its share
+//   GET  /api/room?size=S       where tires of size S still fit, most room first
+//   POST /api/photo?bin=B       body: a photo of B's front with the marker on it -> {photo_id, marker, w, h}
+//   POST /api/measure           {photo_id, opening: [[x y] x4 clockwise from top left, photo px], depth_mm} -> the
+//                               bin's size, saved; then its fill
+//   POST /api/dims              {bin, width_mm, depth_mm, height_mm}: a size entered by hand
+//
+// Sizes and photos are kept in ASQL (bin_dims, bin_photos); fill is the bin_fill Thing's (lib/bins.gr).
+
+import { q, bin_cfg, setting } from "lib/db.gr"
+import { bins_install, bins_measure, bins_save, bins_board, bins_contents, bins_room, bins_marker_png } from "lib/bins.gr"
+
+let PAGE = app_program("page.html")
+
+// the tables and the Thing, when the app is run without a deploy (app run)
+let started = pcall(fn () {
+  let have = false
+  for r in q("SHOW THINGS", []) { if get(r, "thing", "") == "bin_fill" { have = true } }
+  if not have { bins_install(q, bin_cfg()) }
+})
+if not started.ok { print("bin_capacity: not installed yet - " + str(started.error)) }
+
+fn api(f) {
+  return fn (req) {
+    let r = pcall(f, req)
+    if r.ok { return r.value }
+    return res_error(422, str(r.error))
+  }
+}
+
+fn bin_name(v) {
+  let b = trim(str(v == nil ? "" : v))
+  if b == "" or len(b) > 40 { error("a bin is named by its code (1 to 40 characters)") }
+  return b
+}
+
+fn photo_id() { return time_ms() * 1000 + rand(0, 999) }
+
+serve_routes({
+  "GET /": fn (req) { return res_html(PAGE) },
+  "GET /health": fn (req) {
+    let r = pcall(q, "SELECT 1 AS ok", [])
+    return r.ok ? res_json({"ok": true}) : res_error(503, str(r.error))
+  },
+  "GET /marker.png": fn (req) {
+    return {"status": 200, "content_type": "image/png", "body": bins_marker_png(round(bin_cfg().marker_mm))}
+  },
+  "GET /api/board": api(fn (req) { return res_json({"loccode": bin_cfg().loccode, "bins": bins_board(q)}) }),
+  "GET /api/bin": api(fn (req) {
+    let b = bin_name(get(req.query_params, "bin", ""))
+    let dims = q("SELECT width_mm, depth_mm, height_mm, source, measured_at FROM bin_dims WHERE loccode = ? AND bin = ?", [bin_cfg().loccode, b])
+    return res_json({"bin": b, "dims": len(dims) > 0 ? dims[0] : nil, "items": bins_contents(q, bin_cfg(), b)})
+  }),
+  "GET /api/room": api(fn (req) {
+    let size = trim(get(req.query_params, "size", ""))
+    return res_json({"size": size, "tire": tire_size(size), "bins": bins_room(q, bin_cfg(), size)})
+  }),
+  "POST /api/photo": api(fn (req) {
+    let b = bin_name(get(req.query_params, "bin", ""))
+    let photo = bytes(req.body)
+    let cv = image_decode(photo)
+    let m = image_find_marker(cv)
+    if m == nil { error("no marker found: print /marker.png, tape it flat on the bin's front, and get all of it in the photo") }
+    let id = photo_id()
+    q("INSERT INTO bin_photos (photo_id, loccode, bin, taken_at, image, marker) VALUES (?, ?, ?, NOW(), ?, ?)",
+      [id, bin_cfg().loccode, b, photo, json_stringify(m)])
+    return res_json({"photo_id": id, "bin": b, "marker": m, "w": canvas_width(cv), "h": canvas_height(cv),
+                     "mm_per_px": bin_cfg().marker_mm / m.side_px})
+  }),
+  "POST /api/measure": api(fn (req) {
+    let j = req.json
+    let rows = q("SELECT bin, image FROM bin_photos WHERE photo_id = ?", [j.photo_id])
+    if len(rows) == 0 { error("no photo " + str(j.photo_id)) }
+    let m = bins_measure(bytes(rows[0].image), j.opening, bin_cfg())
+    let depth = to_number(get(j, "depth_mm", bin_cfg().depth_mm), bin_cfg().depth_mm) * 1.0
+    if depth <= 0 { error("the depth is a number of millimetres") }
+    let b = rows[0].bin
+    bins_save(q, {"loccode": bin_cfg().loccode, "bin": b, "width_mm": m.width_mm, "depth_mm": depth, "height_mm": m.height_mm,
+                  "source": "photo", "photo_id": j.photo_id})
+    q("UPDATE bin_photos SET opening = ? WHERE photo_id = ?", [json_stringify(j.opening), j.photo_id])
+    let fill = nil
+    for r in bins_board(q) { if r.bin == b { fill = r } }
+    return res_json({"bin": b, "width_mm": m.width_mm, "height_mm": m.height_mm, "depth_mm": depth, "skew": m.skew,
+                     "warning": m.skew > 0.05 ? "the opening's opposite edges disagree by more than 5%: is the marker flat on the bin's front?" : nil,
+                     "board": fill})
+  }),
+  "POST /api/dims": api(fn (req) {
+    let j = req.json
+    let b = bin_name(get(j, "bin", ""))
+    let w = to_number(get(j, "width_mm", 0), 0) * 1.0
+    let d = to_number(get(j, "depth_mm", 0), 0) * 1.0
+    let h = to_number(get(j, "height_mm", 0), 0) * 1.0
+    if w <= 0 or d <= 0 or h <= 0 { error("width, depth and height are millimetres, each more than 0") }
+    bins_save(q, {"loccode": bin_cfg().loccode, "bin": b, "width_mm": w, "depth_mm": d, "height_mm": h, "source": "entered"})
+    return res_json({"bin": b, "width_mm": w, "depth_mm": d, "height_mm": h})
+  })
+}, {"workers": false})

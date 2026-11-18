@@ -1,0 +1,136 @@
+// Bin capacity: how big each bin is (measured from a photo with a printed marker in it, or entered), what is in it
+// (the ERP's locstock and tireinfo), and how full that makes it - kept live by ASQL as a Thing.
+//
+// Everything here takes `q`, a function (sql, params) -> list of row maps, so the same code runs over the MySQL wire
+// (db_query, in the app) and in-process (sql(), in the checks).
+//
+//   bins_install(q, cfg)               the tables and the bin_fill Thing (made again when it is there)
+//   bins_measure(photo, opening, cfg)  -> {width_mm, height_mm, marker, ...}: a bin's opening measured on a photo
+//   bins_save(q, rec)                  a bin's size (and the photo it came from) written
+//   bins_board(q)                      -> every measured bin with its fill, fullest first
+//   bins_contents(q, cfg, bin)         -> what is in a bin: each item's quantity, how many of it the bin holds, its share
+//   bins_room(q, cfg, size)            -> where `size` tires still fit: each bin with room for at least one, most first
+//
+// cfg: {loccode (the location whose bins these are; "01"), marker_mm (the printed marker's black square, measured
+// with a ruler after printing; 150), depth_mm (a bin's depth when only its front was photographed; 1000)}
+//
+// How full a bin is: each item's quantity over how many of that item alone the bin would hold (TIRE_FIT: lying in
+// stacks or standing, whichever holds more), summed - so 1.0 is full whatever the mix. Mixing sizes in one bin packs
+// a little worse than this says; a bin at 0.9 of mixed sizes may already be full.
+
+let BIN_TABLES = [
+  "CREATE TABLE IF NOT EXISTS bin_dims (loccode VARCHAR(10) NOT NULL, bin VARCHAR(40) NOT NULL, width_mm DOUBLE NOT NULL, " +
+    "depth_mm DOUBLE NOT NULL, height_mm DOUBLE NOT NULL, source VARCHAR(16) NOT NULL, photo_id BIGINT NULL, " +
+    "measured_by VARCHAR(64) NULL, measured_at DATETIME NOT NULL, PRIMARY KEY (loccode, bin))",
+  "CREATE TABLE IF NOT EXISTS bin_photos (photo_id BIGINT NOT NULL PRIMARY KEY, loccode VARCHAR(10) NOT NULL, bin VARCHAR(40) NOT NULL, " +
+    "taken_at DATETIME NOT NULL, image LONGBLOB NOT NULL, marker TEXT NULL, opening TEXT NULL)"
+]
+
+fn fill_query(cfg) {
+  return "SELECT l.bin AS bin, MAX(b.width_mm) AS width_mm, MAX(b.depth_mm) AS depth_mm, MAX(b.height_mm) AS height_mm, " +
+         "SUM(l.quantity) AS units, COUNT(*) AS items, " +
+         "SUM(l.quantity / TIRE_FIT(b.width_mm, b.depth_mm, b.height_mm, t.size)) AS fill, " +
+         "SUM(CASE WHEN TIRE_FIT(b.width_mm, b.depth_mm, b.height_mm, t.size) IS NULL OR TIRE_FIT(b.width_mm, b.depth_mm, b.height_mm, t.size) = 0 " +
+         "THEN l.quantity ELSE 0 END) AS unplaced " +
+         "FROM locstock l JOIN bin_dims b ON b.loccode = l.loccode AND b.bin = l.bin " +
+         "LEFT JOIN tireinfo t ON t.stockid = l.stockid " +
+         "WHERE l.loccode = '" + replace(cfg.loccode, "'", "''") + "' AND l.quantity > 0 GROUP BY l.bin"
+}
+
+fn bins_install(q, cfg) {
+  for t in BIN_TABLES { q(t, []) }
+  let have = {}
+  for r in q("SHOW THINGS", []) { have[get(r, "thing", "")] = true }
+  // (CREATE OR REPLACE is for Things built by a program; a query's is dropped and made again - one pass over the bins)
+  if has(have, "bin_fill") { q("DROP THING bin_fill", []) }
+  q("CREATE THING bin_fill KEY l.bin PARTITION BY l.bin READS locstock, bin_dims, tireinfo AS " + fill_query(cfg), [])
+  return has(have, "bin_fill") ? "replaced" : "created"
+}
+
+fn dist(a, b) { return sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])) }
+
+// A bin's opening measured on a photo: the marker found, the four corners of the opening (in the photo's pixels,
+// clockwise from the top left) taken to millimetres on the marker's plane, each size the mean of its two edges.
+// The marker must be flat on the bin's front, in the plane of the opening.
+fn bins_measure(photo, opening, cfg) {
+  let cv = image_decode(photo)
+  let m = image_find_marker(cv)
+  if m == nil { error("no marker in the photo: print it (GET /marker.png), tape it flat on the bin's front and photograph both") }
+  let s = cfg.marker_mm * 1.0
+  let to_mm = homography(m.corners, [[0, 0], [s, 0], [s, s], [0, s]])
+  let mm = homography_apply(to_mm, opening)
+  let top = dist(mm[0], mm[1])
+  let bottom = dist(mm[3], mm[2])
+  let left = dist(mm[0], mm[3])
+  let right = dist(mm[1], mm[2])
+  // the edges' disagreement: a large one means the corners or the marker are not in one plane
+  let skew = max(abs(top - bottom) / max(top, bottom), abs(left - right) / max(left, right))
+  return {"width_mm": (top + bottom) / 2.0, "height_mm": (left + right) / 2.0, "skew": skew, "marker": m,
+          "marker_px": m.side_px, "mm_per_px": s / m.side_px, "w": canvas_width(cv), "h": canvas_height(cv)}
+}
+
+fn bins_save(q, rec) {
+  q("REPLACE INTO bin_dims (loccode, bin, width_mm, depth_mm, height_mm, source, photo_id, measured_by, measured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+    [rec.loccode, rec.bin, rec.width_mm * 1.0, rec.depth_mm * 1.0, rec.height_mm * 1.0, rec.source, get(rec, "photo_id", nil), get(rec, "by", nil)])
+}
+
+fn num(v) { return v == nil ? 0.0 : to_number(v, 0) * 1.0 }
+
+fn bins_board(q) {
+  let out = []
+  for r in q("SHOW THING bin_fill", []) {
+    push(out, {"bin": r.bin, "width_mm": num(r.width_mm), "depth_mm": num(r.depth_mm), "height_mm": num(r.height_mm),
+               "units": num(r.units), "items": int(num(r.items)), "fill": num(r.fill), "unplaced": num(r.unplaced)})
+  }
+  // measured bins with nothing in them are on the board too, empty
+  let seen = {}
+  for b in out { seen[b.bin] = true }
+  for r in q("SELECT bin, width_mm, depth_mm, height_mm FROM bin_dims", []) {
+    if not has(seen, r.bin) {
+      push(out, {"bin": r.bin, "width_mm": num(r.width_mm), "depth_mm": num(r.depth_mm), "height_mm": num(r.height_mm),
+                 "units": 0.0, "items": 0, "fill": 0.0, "unplaced": 0.0})
+    }
+  }
+  return sort_by(out, fn (b) { return -b.fill })
+}
+
+fn bins_contents(q, cfg, bin) {
+  return q("SELECT l.stockid AS stockid, t.size AS size, l.quantity AS quantity, " +
+           "TIRE_FIT(b.width_mm, b.depth_mm, b.height_mm, t.size) AS holds, TIRE_FIT_MODE(b.width_mm, b.depth_mm, b.height_mm, t.size) AS mode, " +
+           "l.quantity / TIRE_FIT(b.width_mm, b.depth_mm, b.height_mm, t.size) AS share " +
+           "FROM locstock l JOIN bin_dims b ON b.loccode = l.loccode AND b.bin = l.bin LEFT JOIN tireinfo t ON t.stockid = l.stockid " +
+           "WHERE l.loccode = ? AND l.bin = ? AND l.quantity > 0 ORDER BY share DESC", [cfg.loccode, bin])
+}
+
+// Where tires of `size` still fit: each measured bin's free share times how many of that size it holds alone.
+fn bins_room(q, cfg, size) {
+  if tire_size(size) == nil { error(format("\"{}\" is not a tire size", size)) }
+  let fill = {}
+  for b in bins_board(q) { fill[b.bin] = b.fill }
+  let out = []
+  for r in q("SELECT bin, width_mm, depth_mm, height_mm FROM bin_dims WHERE loccode = ?", [cfg.loccode]) {
+    let f = tire_fit(num(r.width_mm), num(r.depth_mm), num(r.height_mm), size)
+    let free = max(0.0, 1.0 - get(fill, r.bin, 0.0))
+    let room = floor(f.count * free + 1e-9)
+    if room >= 1 { push(out, {"bin": r.bin, "room": int(room), "holds": f.count, "mode": f.mode, "fill": get(fill, r.bin, 0.0)}) }
+  }
+  return sort_by(out, fn (b) { return -b.room })
+}
+
+// The marker to print: a black square with a white square half its side in the middle, on white, at 300 dots an
+// inch so it prints `mm` millimetres across at 100% (measure it after printing and set MARKER_MM to what it is).
+fn bins_marker_png(mm) {
+  let dots = round(mm / 25.4 * 300)
+  let margin = idiv(dots, 4)
+  let cv = canvas_create(dots + 2 * margin, dots + 2 * margin + 120)
+  canvas_set_fill_color(cv, "#ffffff")
+  canvas_fill_rect(cv, 0, 0, dots + 2 * margin, dots + 2 * margin + 120)
+  canvas_set_fill_color(cv, "#000000")
+  canvas_fill_rect(cv, margin, margin, dots, dots)
+  canvas_set_fill_color(cv, "#ffffff")
+  canvas_fill_rect(cv, margin + idiv(dots, 4), margin + idiv(dots, 4), idiv(dots, 2), idiv(dots, 2))
+  canvas_set_fill_color(cv, "#000000")
+  canvas_set_font(cv, "ui", 40)
+  canvas_fill_text(cv, format("bin marker - the black square is {} mm: print at 100%, check with a ruler", mm), margin, dots + 2 * margin + 60)
+  return canvas_to_png(cv)
+}

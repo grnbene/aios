@@ -1,0 +1,95 @@
+// apps/bin_capacity/lib/bins.gr end to end, in-process (aios grain run): a bin's front photographed with the marker
+// on it (drawn through a known perspective), measured, saved; stock put in it; the bin_fill Thing's fill checked
+// against TIRE_FIT by hand, kept current as stock and size change; where a size still fits. Uses its own database
+// (bins_test), dropped at the end.
+import { bins_install, bins_measure, bins_save, bins_board, bins_contents, bins_room, bins_marker_png } from "../../apps/bin_capacity/lib/bins.gr"
+
+fn check(c, msg) { assert_true(c, msg) }
+fn q(s, p) { return sql(s, p) }
+
+sql("DROP DATABASE IF EXISTS bins_test")
+sql("CREATE DATABASE bins_test")
+sql("USE bins_test")
+// the ERP's tables, as much of them as bin capacity reads
+sql("CREATE TABLE locstock (loccode VARCHAR(5), stockid VARCHAR(20), bin VARCHAR(20), quantity DOUBLE, PRIMARY KEY (loccode, stockid))")
+sql("CREATE TABLE tireinfo (stockid VARCHAR(20) PRIMARY KEY, size VARCHAR(40))")
+let cfg = {"loccode": "01", "marker_mm": 150, "depth_mm": 900}
+check(bins_install(q, cfg) == "created", "tables and the Thing made")
+check(bins_install(q, cfg) == "replaced", "a second install replaces the Thing in place")
+
+// ---- a bin's front: a 1200 x 1000 mm opening in a rack face, the marker on the beam below it, seen at an angle ----
+let plane = [[0, 0], [1600, 0], [1600, 1400], [0, 1400]]
+let pic = [[60, 40], [1500, 120], [1460, 1080], [90, 1150]]
+let P = homography(plane, pic)
+fn to_pic(pts) { return homography_apply(P, pts) }
+let cv = canvas_create(1560, 1200)
+canvas_set_fill_color(cv, "#55524c")
+canvas_fill_rect(cv, 0, 0, 1560, 1200)
+canvas_set_fill_color(cv, "#c9632b")
+canvas_fill_polygon(cv, to_pic(plane))
+let opening = [[200, 100], [1400, 100], [1400, 1100], [200, 1100]]
+canvas_set_fill_color(cv, "#2b2a28")
+canvas_fill_polygon(cv, to_pic(opening))
+canvas_set_fill_color(cv, "#ece8dc")
+canvas_fill_polygon(cv, to_pic([[700, 1150], [900, 1150], [900, 1350], [700, 1350]]))
+canvas_set_fill_color(cv, "#111111")
+canvas_fill_polygon(cv, to_pic([[725, 1175], [875, 1175], [875, 1325], [725, 1325]]))
+canvas_set_fill_color(cv, "#ece8dc")
+canvas_fill_polygon(cv, to_pic([[762.5, 1212.5], [837.5, 1212.5], [837.5, 1287.5], [762.5, 1287.5]]))
+let photo = canvas_to_jpeg(cv, 90)
+
+let m = bins_measure(photo, to_pic(opening), cfg)
+check(abs(m.width_mm - 1200) < 12 and abs(m.height_mm - 1000) < 10,
+      format("the opening measures 1200 x 1000 mm within 1%: {:.1f} x {:.1f}", m.width_mm, m.height_mm))
+// (a 150 mm marker's half-pixel corners, extrapolated across 1200 mm at this angle, leave each edge within a few
+// percent; their means cancel most of it - skew past 5% means the marker is not in the opening's plane)
+check(m.skew < 0.05, format("its opposite edges agree within 5%: skew {:.4f}", m.skew))
+check(!try_call(bins_measure, canvas_to_jpeg(canvas_create(300, 200), 90), opening, cfg).ok, "a photo with no marker is refused")
+bins_save(q, {"loccode": "01", "bin": "R1-01", "width_mm": m.width_mm, "depth_mm": cfg.depth_mm, "height_mm": m.height_mm, "source": "photo"})
+bins_save(q, {"loccode": "01", "bin": "R1-02", "width_mm": 2400, "depth_mm": 1300, "height_mm": 460, "source": "entered"})
+
+// ---- stock in the bins, and how full the Thing says they are ----
+sql("INSERT INTO tireinfo VALUES ('A1', '225/45R17'), ('B2', 'LT265/70R17'), ('C3', '195/65R15'), ('X9', 'not a size')")
+sql("INSERT INTO locstock VALUES ('01', 'A1', 'R1-01', 3), ('01', 'B2', 'R1-02', 2), ('01', 'C3', 'R1-02', 4), ('02', 'C3', 'R1-01', 50)")
+fn board_bin(b) {
+  for r in bins_board(q) { if r.bin == b { return r } }
+  return nil
+}
+let fit_a1 = tire_fit(m.width_mm, 900, m.height_mm, "225/45R17").count
+let r1 = board_bin("R1-01")
+check(abs(r1.fill - 3.0 / fit_a1) < 1e-6, format("R1-01: 3 of the {} 225/45R17 it holds: fill {:.3f}", fit_a1, r1.fill))
+check(r1.units == 3, "another location's stock in a bin of the same name is not counted")
+let fit_b2 = tire_fit(2400, 1300, 460, "LT265/70R17").count
+let fit_c3 = tire_fit(2400, 1300, 460, "195/65R15").count
+let r2 = board_bin("R1-02")
+check(abs(r2.fill - (2.0 / fit_b2 + 4.0 / fit_c3)) < 1e-6, format("R1-02 mixes two sizes: 2/{} + 4/{} = {:.3f}", fit_b2, fit_c3, r2.fill))
+check(bins_board(q)[0].bin == "R1-02", "fullest first")
+
+// kept current: more stock, a bigger bin, an item whose size is not a size
+sql("UPDATE locstock SET quantity = 6 WHERE stockid = 'A1' AND loccode = '01'")
+check(abs(board_bin("R1-01").fill - 6.0 / fit_a1) < 1e-6, "more stock in the bin: the Thing has it")
+bins_save(q, {"loccode": "01", "bin": "R1-01", "width_mm": m.width_mm, "depth_mm": 900, "height_mm": 1400, "source": "entered"})
+let fit_a1_tall = tire_fit(m.width_mm, 900, 1400, "225/45R17").count
+check(fit_a1_tall > fit_a1 and abs(board_bin("R1-01").fill - 6.0 / fit_a1_tall) < 1e-6, format("a taller bin holds more ({} not {}): the fill falls", fit_a1_tall, fit_a1))
+sql("INSERT INTO locstock VALUES ('01', 'X9', 'R1-01', 2)")
+check(board_bin("R1-01").unplaced == 2, "an item with no tire size is counted as unplaced, not guessed at")
+
+let contents = bins_contents(q, cfg, "R1-02")
+check(len(contents) == 2 and contents[0].holds != nil and contents[0].mode != "", format("what is in R1-02, with how many of each it holds: {}", contents))
+
+// where 225/45R17s still fit: each bin's free share of what it holds of them
+let room = bins_room(q, cfg, "225/45R17")
+let want = floor(fit_a1_tall * (1.0 - 6.0 / fit_a1_tall) + 1e-9)
+let got = 0
+for r in room { if r.bin == "R1-01" { got = r.room } }
+check(got == want, format("room for {} more 225/45R17 in R1-01: {}", want, got))
+check(!try_call(bins_room, q, cfg, "banana").ok, "a size that is not one is refused")
+
+// the marker to print: 150 mm at 300 dpi is 1772 dots, and it is found in its own picture
+let png = bins_marker_png(150)
+let mk = image_find_marker(image_decode(bytes(png)))
+check(mk != nil and abs(mk.side_px - 1772) < 4, format("the printable marker is found, 1772 dots a side: {:.1f}", mk == nil ? 0 : mk.side_px))
+
+sql("DROP THING bin_fill")
+sql("DROP DATABASE bins_test")
+print("PASS: test_bins")
