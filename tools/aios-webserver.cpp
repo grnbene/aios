@@ -28,7 +28,9 @@
 #include <vector>
 
 #include "aios/core/bytes.hpp"
+#include "aios/core/ids.hpp"
 #include "aios/crypto/x509.hpp"
+#include "aios/storage/object_store.hpp"
 #include "aios/hal/host.hpp"
 #include "aios/hal/net.hpp"
 #include "aios/net/fastcgi_client.hpp"
@@ -75,6 +77,10 @@ struct VhostConfig {
   // the time, so if any of those fake credentials is ever presented to this fleet, the auth log's canary traces
   // straight back to the exact grab. Off by default — serving a fake file is harmless, but opt in per vhost.
   bool env_honeypot = false;
+  // `env_honeypot_store <dir>`: record each grab into the aios object-store substrate at this root (the dir holding
+  // objects.log), the same append-only, provenance-carrying, tamper-evident log the kernel writes - so a grab is a
+  // StoredObject the resident can query by AQL and join to a later credential-use. Empty = log to stderr only.
+  std::string env_honeypot_store;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -233,6 +239,8 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
       } else if (tok == "env_honeypot") {
         std::string v; ls >> v;
         cur->env_honeypot = (v == "on" || v == "true" || v == "1");
+      } else if (tok == "env_honeypot_store") {
+        ls >> cur->env_honeypot_store;
       } else if (tok == "deny") {
         int status = 0;
         std::string pattern;
@@ -395,17 +403,124 @@ std::string mint_canary() {
   return std::string(buf);
 }
 
+// Records grabs into the aios object-store substrate at a root: one recorder per root, opened once, appended under a
+// lock. The log is multi-writer by design, so this appends safely while a kernel runs on the same root; the grab is
+// then a StoredObject the resident can read and query (AQL on meta.kind / meta.canary) and join to a later
+// credential-use - the trace reaches origin through the same substrate everything else lives in.
+class HoneypotStore {
+ public:
+  explicit HoneypotStore(const std::string& dir)
+      : ids_((uint64_t)std::random_device{}() << 32 ^ (uint64_t)std::random_device{}(),
+             (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count()),
+        store_(hal::process_host(), ids_, dir) {
+    opened_ = store_.open().ok();
+    if (!opened_) std::fprintf(stderr, "[env-honeypot] could not open substrate store at %s (logging only)\n", dir.c_str());
+  }
+  bool ok() const { return opened_; }
+  void put(aios::StoredObject obj) {
+    std::lock_guard<std::mutex> lk(m_);
+    auto r = store_.put(std::move(obj));
+    if (!r.ok()) std::fprintf(stderr, "[env-honeypot] substrate put failed: %s\n", r.error().message.c_str());
+  }
+ private:
+  std::mutex m_;
+  aios::IdGenerator ids_;
+  aios::ObjectStore store_;
+  bool opened_ = false;
+};
+
+HoneypotStore* honeypot_store(const std::string& dir) {
+  static std::mutex m;
+  std::lock_guard<std::mutex> lk(m);
+  static std::map<std::string, std::unique_ptr<HoneypotStore>> stores;
+  auto it = stores.find(dir);
+  if (it == stores.end()) it = stores.emplace(dir, std::make_unique<HoneypotStore>(dir)).first;
+  return it->second->ok() ? it->second.get() : nullptr;
+}
+
+// FNV-1a 64, for a stable producer identity from a string.
+uint64_t fnv1a(const std::string& s, uint64_t seed) {
+  uint64_t h = seed;
+  for (unsigned char c : s) { h ^= c; h *= 0x100000001b3ull; }
+  return h;
+}
+
+// The origin chain, edge inward: the direct TCP peer, then every forwarding header verbatim (nothing dropped), and a
+// best-guess true client from the ones a trusted proxy sets. A probe through a CDN has its real client here, not in
+// the peer - this is what "trace to origin all the way" needs before the substrate can hold it.
+struct Origin {
+  std::string best;                                        // best-guess true client ip
+  std::vector<std::pair<std::string, std::string>> hops;   // label -> value, for the record
+};
+Origin trace_origin(const net::HttpRequestHead& head, const std::string& peer) {
+  Origin o;
+  o.hops.push_back({"peer", peer});
+  auto add = [&](const char* name) {
+    if (auto v = head.header(name)) o.hops.push_back({name, *v});
+    return head.header(name);
+  };
+  auto cf = add("cf-connecting-ip");
+  auto tci = add("true-client-ip");
+  auto xff = add("x-forwarded-for");
+  auto xri = add("x-real-ip");
+  add("forwarded");
+  add("x-forwarded-host");
+  add("via");
+  // the real client: the proxy-set single-IP headers first, then the leftmost (original) hop of X-Forwarded-For
+  if (cf) o.best = *cf;
+  else if (tci) o.best = *tci;
+  else if (xff) { o.best = xff->substr(0, xff->find(',')); }
+  else if (xri) o.best = *xri;
+  else o.best = peer;
+  // trim
+  size_t a = o.best.find_first_not_of(" \t"), b = o.best.find_last_not_of(" \t");
+  o.best = a == std::string::npos ? peer : o.best.substr(a, b - a + 1);
+  return o;
+}
+
 // Serve the decoy. Small, and powerless: every host is on the .invalid TLD (resolves nowhere), the DB points at
-// loopback, and the keys are this grab's canary — not credentials to anything. The grab is logged with the client's
-// IP, the path and the time, so the canary presented later ties back here.
-void serve_env_honeypot(hal::Connection& conn, const std::string& path, const std::string& client_ip) {
+// loopback, and the keys are this grab's canary — not credentials to anything. The grab is logged and, when the
+// vhost names a store, recorded into the substrate with the full origin chain, so the canary presented later ties
+// back here all the way to the true client.
+void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh,
+                        const std::string& path, const std::string& peer) {
   const std::string canary = mint_canary();
+  const Origin origin = trace_origin(head, peer);
   std::time_t now = std::time(nullptr);
   char iso[32] = "";
   std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
-  std::fprintf(stderr, "[env-honeypot] canary=%s ip=%s path=%s t=%s\n",
-               canary.c_str(), client_ip.c_str(), path.c_str(), iso);
+  std::fprintf(stderr, "[env-honeypot] canary=%s origin=%s peer=%s host=%s path=%s t=%s\n",
+               canary.c_str(), origin.best.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), iso);
   std::fflush(stderr);
+
+  if (!vh.env_honeypot_store.empty()) {
+    if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) {
+      aios::StoredObject obj;
+      obj.timestamp_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::system_clock::now().time_since_epoch()).count();
+      obj.provenance = aios::EntityID{aios::Id128{fnv1a("aios-webserver", 0xcbf29ce484222325ull),
+                                                  fnv1a("env_honeypot", 0xcbf29ce484222325ull)}};
+      auto m = [&](const std::string& k, const std::string& v) { obj.metadata.push_back({k, v}); };
+      m("kind", "honeypot.env_grab");
+      m("canary", canary);
+      m("origin", origin.best);
+      m("peer", peer);
+      m("host", head.host);
+      m("scheme", vh.ssl ? "https" : "http");
+      m("method", head.method);
+      m("path", path);
+      m("target", head.target);
+      if (auto ua = head.header("user-agent")) m("user_agent", *ua);
+      m("t", iso);
+      // the full chain and every header, verbatim, as the payload: nothing lost for a later investigation
+      std::string body = "honeypot.env_grab canary=" + canary + "\norigin=" + origin.best + "\ntime=" + iso + "\n";
+      for (auto& [k, v] : origin.hops) body += k + ": " + v + "\n";
+      body += "--- request headers ---\n";
+      for (const auto& h : head.headers) body += h.name + ": " + h.value + "\n";
+      obj.payload.assign(body.begin(), body.end());
+      hs->put(std::move(obj));
+    }
+  }
   std::string body =
       "# aios runtime environment\n"
       "# generated " + std::string(iso) + " build " + canary.substr(0, 8) + " — do not commit\n"
@@ -1129,7 +1244,7 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
 
     // Before the dotfile rule 404s it: a .env probe on an opted-in vhost gets the inert, traceable decoy.
     if (vh->env_honeypot && is_env_probe(path_only)) {
-      serve_env_honeypot(*conn, path_only, conn->peer());
+      serve_env_honeypot(*conn, head, *vh, path_only, conn->peer());
       break;
     }
 
@@ -1315,6 +1430,7 @@ int aios_webserver_run(int argc, char** argv) {
       "    grain_steps <n>                # Instructions one request may run. Default: 200000000\n"
       "    deny <status> <path-regex>\n"
       "    env_honeypot on            # serve a traceable, powerless decoy for .env probes instead of 404\n"
+      "    env_honeypot_store <dir>   # record each grab (origin chain + canary) into the aios object store there\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
     return argc < 2 ? 1 : 0;
