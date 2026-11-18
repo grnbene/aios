@@ -49,6 +49,7 @@
 #include <cstring>
 #include <array>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -1921,6 +1922,239 @@ Value bi_camera_ray(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, m);
 }
 
+// ---- a plane with a known square and a rectangle on it -------------------------------------------------------
+
+// Levenberg-Marquardt over any parameters: residual(params, out) fills the residuals; returns the rms
+double lm_solve(std::vector<double>& p, const std::function<void(const std::vector<double>&, std::vector<double>&)>& residual, int iters = 100) {
+  std::vector<double> r, ra, rb;
+  residual(p, r);
+  auto sq = [](const std::vector<double>& v) { double e = 0; for (double x : v) e += x * x; return e; };
+  double e = sq(r), lam = 1e-3;
+  const size_t np = p.size();
+  for (int it = 0; it < iters; ++it) {
+    std::vector<std::vector<double>> J(np);
+    for (size_t k = 0; k < np; ++k) {
+      const double h = 1e-6 * std::max(1.0, std::fabs(p[k]));
+      std::vector<double> pp(p), pm(p);
+      pp[k] += h; pm[k] -= h;
+      residual(pp, ra); residual(pm, rb);
+      J[k].resize(r.size());
+      for (size_t i = 0; i < r.size(); ++i) J[k][i] = (ra[i] - rb[i]) / (2 * h);
+    }
+    std::vector<std::vector<double>> A(np, std::vector<double>(np + 1, 0));
+    for (size_t a = 0; a < np; ++a) {
+      for (size_t b = 0; b < np; ++b) for (size_t i = 0; i < r.size(); ++i) A[a][b] += J[a][i] * J[b][i];
+      for (size_t i = 0; i < r.size(); ++i) A[a][np] -= J[a][i] * r[i];
+    }
+    bool improved = false;
+    for (int tries = 0; tries < 10 && !improved; ++tries) {
+      auto M = A;
+      for (size_t a = 0; a < np; ++a) M[a][a] *= 1 + lam;
+      bool ok = true;
+      for (size_t c = 0; c < np && ok; ++c) {
+        size_t piv = c;
+        for (size_t rr = c + 1; rr < np; ++rr) if (std::fabs(M[rr][c]) > std::fabs(M[piv][c])) piv = rr;
+        if (std::fabs(M[piv][c]) < 1e-20) { ok = false; break; }
+        std::swap(M[c], M[piv]);
+        for (size_t rr = 0; rr < np; ++rr) {
+          if (rr == c) continue;
+          const double f = M[rr][c] / M[c][c];
+          for (size_t k = c; k <= np; ++k) M[rr][k] -= f * M[c][k];
+        }
+      }
+      if (!ok) { lam *= 10; continue; }
+      std::vector<double> pn(p);
+      for (size_t a = 0; a < np; ++a) pn[a] += M[a][np] / M[a][a];
+      std::vector<double> rn;
+      residual(pn, rn);
+      const double en = sq(rn);
+      if (std::isfinite(en) && en < e) { p = pn; r = rn; e = en; lam = std::max(1e-12, lam / 10); improved = true; }
+      else lam *= 10;
+    }
+    if (!improved) break;
+  }
+  return std::sqrt(e / std::max<size_t>(1, r.size() / 2));
+}
+
+// camera_pose_rect(marker, marker_px, rect_px, w, h[, opts]) -> {camera, rect: {corners (mm, on the plane), x, y,
+//   angle (degrees), width, height}, rms_px}
+//   A plane with a square of known size on it (marker: its corners in mm, as camera_pose takes them; marker_px:
+//   where the picture has them) and a rectangle of unknown size (rect_px: its corners in the picture, clockwise from
+//   the top left). The rectangle's right angles say a great deal about the camera that a small square cannot; the
+//   camera (focal length included unless opts.focal fixes it) and the rectangle (where it is, how it is turned, how
+//   big) are found together, by least squares on the picture positions of all eight corners.
+Value bi_camera_pose_rect(Vm&, std::vector<Value>& args, std::string& error) {
+  std::vector<P2> mw, mp, rp;
+  if (!read_points(args[0], mw, 0, error, "camera_pose_rect") || !read_points(args[1], mp, mw.size(), error, "camera_pose_rect") ||
+      !read_points(args[2], rp, 4, error, "camera_pose_rect")) return Value::nil();
+  if (mw.size() < 4) { error = "camera_pose_rect() wants the square's four corners"; return Value::nil(); }
+  if (!want_number(args[3], error, "camera_pose_rect") || !want_number(args[4], error, "camera_pose_rect")) return Value::nil();
+  MapObj* o = opts_map(args, 5);
+  const double W = args[3].as_double(), H = args[4].as_double();
+  Cam c;
+  c.cx = W / 2; c.cy = H / 2;
+  const double fixed = opt_num(o, "focal", 0);
+  // a start: the focal length from the rectangle's vanishing points (its edges are two pairs of parallels at right
+  // angles), else from the square, else a phone's usual
+  double f0 = fixed;
+  if (f0 <= 0) {
+    auto line = [](P2 a, P2 b) { return std::array<double, 3>{a.y - b.y, b.x - a.x, a.x * b.y - b.x * a.y}; };
+    auto meet3 = [](const std::array<double, 3>& l, const std::array<double, 3>& m) {
+      return std::array<double, 3>{l[1] * m[2] - l[2] * m[1], l[2] * m[0] - l[0] * m[2], l[0] * m[1] - l[1] * m[0]};
+    };
+    const auto v1 = meet3(line(rp[0], rp[1]), line(rp[3], rp[2])), v2 = meet3(line(rp[0], rp[3]), line(rp[1], rp[2]));
+    const double num = -((v1[0] - c.cx * v1[2]) * (v2[0] - c.cx * v2[2]) + (v1[1] - c.cy * v1[2]) * (v2[1] - c.cy * v2[2]));
+    const double den = v1[2] * v2[2];
+    if (std::fabs(den) > 1e-12 && num / den > 0) f0 = std::sqrt(num / den);
+    const double dflt = 0.8 * std::max(W, H);
+    if (!(f0 > 0.2 * dflt && f0 < 5 * dflt)) {
+      double Hm[9];
+      f0 = fit_homography(mw, mp, Hm) ? focal_of(Hm, c.cx, c.cy) : 0;
+      if (!(f0 > 0.2 * dflt && f0 < 5 * dflt)) f0 = dflt;
+    }
+  }
+  c.f = f0;
+  double Hm[9];
+  if (!fit_homography(mw, mp, Hm) || !pose_from_h(Hm, c)) { error = "camera_pose_rect(): no pose fits the square"; return Value::nil(); }
+  // the rectangle's start: its corners on the plane by the square's homography
+  double Hi[9];
+  {
+    std::vector<P2> pw(mw), pp(mp);
+    if (!fit_homography(pp, pw, Hi)) { error = "camera_pose_rect(): the square is degenerate"; return Value::nil(); }
+  }
+  P2 q[4];
+  for (int i = 0; i < 4; ++i) q[i] = apply_h(Hi, rp[(size_t)i]);
+  const double ang0 = std::atan2(q[2].y - q[3].y, q[2].x - q[3].x);
+  const double w0 = (std::hypot(q[1].x - q[0].x, q[1].y - q[0].y) + std::hypot(q[2].x - q[3].x, q[2].y - q[3].y)) / 2;
+  const double h0 = (std::hypot(q[3].x - q[0].x, q[3].y - q[0].y) + std::hypot(q[2].x - q[1].x, q[2].y - q[1].y)) / 2;
+  // parameters: rotation (3), translation (3), rectangle (bottom-left x, y, angle, width, height), focal (unless fixed)
+  std::vector<double> p(11 + (fixed > 0 ? 0 : 1));
+  double rv[3];
+  rodrigues_of(c.R, rv);
+  p[0] = rv[0]; p[1] = rv[1]; p[2] = rv[2]; p[3] = c.t[0]; p[4] = c.t[1]; p[5] = c.t[2];
+  p[6] = q[3].x; p[7] = q[3].y; p[8] = ang0; p[9] = w0; p[10] = h0;
+  if (fixed <= 0) p[11] = c.f;
+  auto unpack = [&](const std::vector<double>& v, Cam& o2, P2 rc[4]) {
+    o2 = c;
+    rodrigues(v.data(), o2.R);
+    o2.t[0] = v[3]; o2.t[1] = v[4]; o2.t[2] = v[5];
+    if (fixed <= 0) o2.f = v[11];
+    const double ux = std::cos(v[8]), uy = std::sin(v[8]);
+    const P2 bl{v[6], v[7]};
+    rc[3] = bl;
+    rc[2] = {bl.x + ux * v[9], bl.y + uy * v[9]};
+    rc[0] = {bl.x - uy * v[10], bl.y + ux * v[10]};
+    rc[1] = {rc[2].x - uy * v[10], rc[2].y + ux * v[10]};
+  };
+  auto residual = [&](const std::vector<double>& v, std::vector<double>& r) {
+    Cam o2;
+    P2 rc[4];
+    unpack(v, o2, rc);
+    r.clear();
+    auto add = [&](P2 wpt, P2 obs) {
+      const double X[3] = {wpt.x, wpt.y, 0};
+      P2 q2;
+      if (!project(o2, X, &q2)) q2 = {1e6, 1e6};
+      r.push_back(q2.x - obs.x); r.push_back(q2.y - obs.y);
+    };
+    for (size_t i = 0; i < mw.size(); ++i) add(mw[i], mp[i]);
+    for (int i = 0; i < 4; ++i) add(rc[i], rp[(size_t)i]);
+  };
+  const double rms = lm_solve(p, residual);
+  Cam out;
+  P2 rc[4];
+  unpack(p, out, rc);
+  auto rect = std::make_shared<MapObj>();
+  rect->put("corners", points_value(std::vector<P2>(rc, rc + 4)));
+  rect->put("x", Value::real(p[6]));
+  rect->put("y", Value::real(p[7]));
+  rect->put("angle", Value::real(p[8] * 180.0 / M_PI));
+  rect->put("width", Value::real(p[9]));
+  rect->put("height", Value::real(p[10]));
+  auto res = std::make_shared<MapObj>();
+  res->put("camera", cam_value(out, rms));
+  res->put("rect", Value::object(Type::Map, rect));
+  res->put("rms_px", Value::real(rms));
+  return Value::object(Type::Map, res);
+}
+
+// box_face_views(photo, camera, ref, ref_camera, box, mm_per_px) -> {actual, expected, w, h, known}
+//   A box open on its front (its front face the plane z = 0 from (0, 0) to (box.w, box.h) in the cameras' world,
+//   its inside reaching back to z = -box.d, away from the cameras) seen in two photos: ref, when it was empty, and
+//   photo, now. actual: the front face as photo shows it, flattened at mm_per_px; expected: the same view of the
+//   empty box made from ref - each pixel's ray followed inside to the wall, floor or back it meets, and that point
+//   taken from ref where ref sees it (transparent where ref's view of it is cut off by the front). Their difference
+//   is what is in the box now and was not, from wherever each photo was taken.
+Value bi_box_face_views(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0, RW = 0, RH = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  const std::vector<uint32_t>* rpx = nullptr;
+  Cam c, rc;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "box_face_views") || !read_cam(args[1], c, error, "box_face_views") ||
+      !canvas_pixels(args[2], &RW, &RH, &rpx, error, "box_face_views") || !read_cam(args[3], rc, error, "box_face_views")) return Value::nil();
+  MapObj* b = args[4].type == Type::Map ? static_cast<MapObj*>(args[4].obj.get()) : nullptr;
+  const double bw = opt_num(b, "w", 0), bh = opt_num(b, "h", 0), bd = opt_num(b, "d", 0);
+  if (!(bw > 0 && bh > 0 && bd > 0)) { error = "box_face_views() wants the box as {w, h, d} (mm, each more than 0)"; return Value::nil(); }
+  if (!want_number(args[5], error, "box_face_views")) return Value::nil();
+  const double mpp = args[5].as_double();
+  if (!(mpp > 0)) { error = "box_face_views(): mm_per_px is more than 0"; return Value::nil(); }
+  const int ow = std::max(1, (int)std::lround(bw / mpp)), oh = std::max(1, (int)std::lround(bh / mpp));
+  if ((size_t)ow * oh > 16u * 1024 * 1024) { error = "box_face_views(): that face is too many pixels at that scale"; return Value::nil(); }
+  auto sample = [](const std::vector<uint32_t>& im, uint32_t iw, uint32_t ih, P2 q) -> uint32_t {
+    const double fx = q.x - 0.5, fy = q.y - 0.5;
+    if (fx < 0 || fy < 0 || fx > iw - 1 || fy > ih - 1) return 0;
+    const int x0 = (int)fx, y0 = (int)fy, x1 = std::min<int>(x0 + 1, iw - 1), y1 = std::min<int>(y0 + 1, ih - 1);
+    const double tx = fx - x0, ty = fy - y0;
+    uint32_t out = 0xFF000000u;
+    for (int sh = 0; sh < 24; sh += 8) {
+      auto g = [&](int xx, int yy) { return (double)((im[(size_t)yy * iw + xx] >> sh) & 255); };
+      const double v = (g(x0, y0) * (1 - tx) + g(x1, y0) * tx) * (1 - ty) + (g(x0, y1) * (1 - tx) + g(x1, y1) * tx) * ty;
+      out |= (uint32_t)std::clamp(std::lround(v), 0L, 255L) << sh;
+    }
+    return out;
+  };
+  double from[3];
+  for (int i = 0; i < 3; ++i) from[i] = -(c.R[i] * c.t[0] + c.R[3 + i] * c.t[1] + c.R[6 + i] * c.t[2]);
+  double rfrom[3];
+  for (int i = 0; i < 3; ++i) rfrom[i] = -(rc.R[i] * rc.t[0] + rc.R[3 + i] * rc.t[1] + rc.R[6 + i] * rc.t[2]);
+  std::vector<uint32_t> act((size_t)ow * oh, 0), exp((size_t)ow * oh, 0);
+  size_t known = 0;
+  for (int y = 0; y < oh; ++y)
+    for (int x = 0; x < ow; ++x) {
+      // the face point (top row first: the face's top is y = h)
+      const double F[3] = {(x + 0.5) * mpp, bh - (y + 0.5) * mpp, 0};
+      P2 q;
+      if (!project(c, F, &q)) continue;
+      act[(size_t)y * ow + x] = sample(*px, W, H, q);
+      // into the box: from the face point along the ray away from the camera, to where it leaves the box
+      double d[3] = {F[0] - from[0], F[1] - from[1], F[2] - from[2]};
+      if (d[2] >= 0) continue;   // the camera behind the face
+      double t = (-bd - F[2]) / d[2];   // the back
+      if (d[0] > 0) t = std::min(t, (bw - F[0]) / d[0]); else if (d[0] < 0) t = std::min(t, (0 - F[0]) / d[0]);
+      if (d[1] > 0) t = std::min(t, (bh - F[1]) / d[1]); else if (d[1] < 0) t = std::min(t, (0 - F[1]) / d[1]);
+      const double X[3] = {F[0] + d[0] * t, F[1] + d[1] * t, F[2] + d[2] * t};
+      // ref sees it only through the opening: where ref's ray to it crosses the face
+      const double e[3] = {X[0] - rfrom[0], X[1] - rfrom[1], X[2] - rfrom[2]};
+      if (std::fabs(e[2]) < 1e-12) continue;
+      const double s = -rfrom[2] / e[2];
+      const double cxp = rfrom[0] + e[0] * s, cyp = rfrom[1] + e[1] * s;
+      if (cxp < -0.5 * mpp || cyp < -0.5 * mpp || cxp > bw + 0.5 * mpp || cyp > bh + 0.5 * mpp) continue;
+      P2 rq;
+      if (!project(rc, X, &rq)) continue;
+      const uint32_t v = sample(*rpx, RW, RH, rq);
+      if (!v) continue;
+      exp[(size_t)y * ow + x] = v;
+      ++known;
+    }
+  auto res = std::make_shared<MapObj>();
+  res->put("actual", canvas_value((uint32_t)ow, (uint32_t)oh, std::move(act)));
+  res->put("expected", canvas_value((uint32_t)ow, (uint32_t)oh, std::move(exp)));
+  res->put("w", Value::integer(ow));
+  res->put("h", Value::integer(oh));
+  res->put("known", Value::real((double)known / ((double)ow * oh)));
+  return Value::object(Type::Map, res);
+}
+
 // ---- reconstruction: silhouettes carved into a solid ----------------------------------------------------------
 
 struct Box3 { double lo[3], hi[3]; };
@@ -2309,6 +2543,70 @@ Value bi_visual_hull(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, res_m);
 }
 
+// image_difference(a, b[, opts]) -> {changed, compared, gain, mask, w, h}: where two pictures of the same view (the
+// same size) differ - each blurred over 3 x 3, a's lightness scaled by the median of the pixels' ratios (a lamp on or
+// off is not a change), then CIELAB distance past opts.threshold (12) - with specks of one cell dropped; only pixels
+// both pictures have (alpha) count. changed: the share of those; compared: their share of the picture.
+Value bi_image_difference(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0, W2 = 0, H2 = 0;
+  const std::vector<uint32_t>* a = nullptr;
+  const std::vector<uint32_t>* b = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &a, error, "image_difference") || !canvas_pixels(args[1], &W2, &H2, &b, error, "image_difference")) return Value::nil();
+  if (W != W2 || H != H2) { error = "image_difference(): the pictures are " + std::to_string(W) + "x" + std::to_string(H) + " and " + std::to_string(W2) + "x" + std::to_string(H2) + ": resample one to the other first"; return Value::nil(); }
+  MapObj* o = opts_map(args, 2);
+  const double thr = std::clamp(opt_num(o, "threshold", 12), 1.0, 100.0);
+  const size_t n = (size_t)W * H;
+  auto lab_of = [&](const std::vector<uint32_t>& px) {
+    std::vector<Lab> L(n);
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) {
+        double r = 0, g = 0, bb = 0;
+        int c = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx) {
+            const int xx = (int)x + dx, yy = (int)y + dy;
+            if (xx < 0 || yy < 0 || xx >= (int)W || yy >= (int)H) continue;
+            const uint32_t p = px[(size_t)yy * W + xx];
+            r += (p >> 16) & 255; g += (p >> 8) & 255; bb += p & 255; ++c;
+          }
+        L[(size_t)y * W + x] = to_lab((uint8_t)(r / c + 0.5), (uint8_t)(g / c + 0.5), (uint8_t)(bb / c + 0.5));
+      }
+    return L;
+  };
+  std::vector<Lab> A = lab_of(*a), B = lab_of(*b);
+  // only where both pictures have something (alpha): a pixel either lacks is left out of the count
+  std::vector<uint8_t> use(n);
+  size_t nuse = 0;
+  for (size_t i = 0; i < n; ++i) { use[i] = ((*a)[i] >> 24) >= 128 && ((*b)[i] >> 24) >= 128; nuse += use[i]; }
+  if (nuse == 0) { error = "image_difference(): the pictures have no pixel in common"; return Value::nil(); }
+  // the lighting: the median of the lightness ratios (what changed is under half, so the median is the light's)
+  std::vector<double> ratios;
+  for (size_t i = 0; i < n; ++i) if (use[i] && A[i].l > 2 && B[i].l > 2) ratios.push_back(B[i].l / A[i].l);
+  double gain = 1;
+  if (!ratios.empty()) { std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end()); gain = ratios[ratios.size() / 2]; }
+  std::vector<uint8_t> ch(n, 0);
+  for (size_t i = 0; i < n; ++i) {
+    if (!use[i]) continue;
+    const double dl = A[i].l * gain - B[i].l, da = A[i].a - B[i].a, db = A[i].b - B[i].b;
+    ch[i] = std::sqrt(dl * dl + da * da + db * db) > thr;
+  }
+  // specks dropped: an opening by one cell
+  std::vector<uint8_t> m = ch;
+  morph(m, (int)W, (int)H, 1, false);
+  morph(m, (int)W, (int)H, 1, true);
+  size_t cnt = 0;
+  std::vector<uint8_t> out(n);
+  for (size_t i = 0; i < n; ++i) { cnt += m[i] && use[i]; out[i] = m[i] && use[i] ? 255 : 0; }
+  auto res = std::make_shared<MapObj>();
+  res->put("changed", Value::real((double)cnt / nuse));
+  res->put("compared", Value::real((double)nuse / n));
+  res->put("gain", Value::real(gain));
+  res->put("mask", Value::bytes(std::move(out)));
+  res->put("w", Value::integer(W));
+  res->put("h", Value::integer(H));
+  return Value::object(Type::Map, res);
+}
+
 // ---- tires ----------------------------------------------------------------------------------------------------
 
 Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
@@ -2360,6 +2658,9 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("camera_ray", 2, 2, bi_camera_ray);
   vm.define_native("camera_box_mask", 4, 4, bi_camera_box_mask);
   vm.define_native("visual_hull", 2, 3, bi_visual_hull);
+  vm.define_native("image_difference", 2, 3, bi_image_difference);
+  vm.define_native("camera_pose_rect", 5, 6, bi_camera_pose_rect);
+  vm.define_native("box_face_views", 6, 6, bi_box_face_views);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }

@@ -25,6 +25,24 @@ touched are worked out again before the write returns.
    counted as `unplaced`, not guessed at.
 4. **Where a size fits.** For each measured bin, its free share times what it holds of that size.
 
+## From the photo alone
+
+- **Depth from a tap.** The blue handle goes on the back corner of the bin's floor. The camera and the opening are
+  found together (`camera_pose_rect`: the marker gives the scale, the opening's right angles the lens and the tilt;
+  the lens from the photo's EXIF when the phone wrote one, read in the browser before it shrinks the photo). The
+  floor is the plane through the opening's bottom edge square to the front; the tap's ray meets it at the depth.
+  On the rendered check (tests/grain/test_bin_photo.gr) a 1200 x 1000 x 900 mm bin measures 1200.7 x 1000.6 x 899.3
+  with no lens given, the lens itself 1383 px against 1386.
+- **What is really in it.** Tick "the bin is empty now" when measuring an empty bin: that photo and its camera are
+  kept. Any later photo of the bin's front with the marker in view (`POST /api/check`, "Check a bin" on the page)
+  needs no tapping: the opening is found through the marker, the empty bin is re-made as this photo's camera would
+  see it (`box_face_views`: its walls, floor and back are planes, so the empty photo can be re-projected from
+  anywhere in front), and the share of the opening that differs is what is in it (`image_difference`, lighting
+  evened). That is set against the ERP's fill: `erp_has_more` (the ERP has stock there, the bin looks empty),
+  `photo_has_more` (something is there the ERP does not have), `agrees`, or `unsure` (too little could be
+  compared). Checks are kept in `bin_checks`. The photo sees the front, the ERP counts the volume: only a clear
+  contradiction is flagged.
+
 ## Measuring well
 
 - The marker must be flat and in the plane of the opening; if the opening's opposite edges disagree by more than
@@ -64,11 +82,14 @@ phones on the floor).
 | `GET /api/bin?bin=B` | what is in a bin, how many of each it holds, each item's share |
 | `GET /api/room?size=S` | where tires of size `S` still fit |
 | `POST /api/photo?bin=B` | a photo of the bin's front: the marker found, the photo kept |
-| `POST /api/measure` | `{photo_id, opening, depth_mm}`: the size measured and saved |
+| `POST /api/measure` | `{photo_id, opening, back, focal, depth_mm, empty}`: the size measured (depth from the `back` tap, else `depth_mm`) and saved; `empty` keeps the photo to check against |
+| `POST /api/check?bin=B&focal=F` | a photo of the bin's front: `{changed, compared, erp_fill, verdict}`, kept in `bin_checks` |
 | `POST /api/dims` | `{bin, width_mm, depth_mm, height_mm}`: a size entered by hand |
 
 ## Checks
 
+`tests/grain/test_bin_photo.gr` renders a bin in 3D from known cameras and checks the size and depth from one
+photo and a tap, and empty / stocked against the empty photo from two other viewpoints.
 `tests/grain/test_bins.gr` (run with `aios grain run --steps 0`) measures a bin's front drawn through a known
 perspective, saves it, puts stock in, and checks the Thing's fill against `tire_fit` as stock and sizes change;
 `tests/grain/test_measure.gr` checks the marker, homographies and tire sizes.

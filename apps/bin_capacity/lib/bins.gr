@@ -10,6 +10,9 @@
 //   bins_board(q)                      -> every measured bin with its fill, fullest first
 //   bins_contents(q, cfg, bin)         -> what is in a bin: each item's quantity, how many of it the bin holds, its share
 //   bins_room(q, cfg, size)            -> where `size` tires still fit: each bin with room for at least one, most first
+//   bins_geometry(photo, opening, back, cfg, focal) -> width, height and depth from one photo and a tap
+//   bins_occupancy(photo, focal, empty_photo, empty_cam, dims, cfg) -> how much of the opening differs from it empty
+//   bins_verdict(changed, compared, erp_fill) -> "agrees" | "erp_has_more" | "photo_has_more" | "unsure"
 //
 // cfg: {loccode (the location whose bins these are; "01"), marker_mm (the printed marker's black square, measured
 // with a ruler after printing; 150), depth_mm (a bin's depth when only its front was photographed; 1000)}
@@ -19,11 +22,21 @@
 // a little worse than this says; a bin at 0.9 of mixed sizes may already be full.
 
 let BIN_TABLES = [
+  "CREATE TABLE IF NOT EXISTS bin_checks (check_id BIGINT NOT NULL PRIMARY KEY, loccode VARCHAR(10) NOT NULL, bin VARCHAR(40) NOT NULL, " +
+    "taken_at DATETIME NOT NULL, photo_id BIGINT NULL, changed DOUBLE NOT NULL, compared DOUBLE NOT NULL, erp_fill DOUBLE NULL, verdict VARCHAR(24) NOT NULL)",
   "CREATE TABLE IF NOT EXISTS bin_dims (loccode VARCHAR(10) NOT NULL, bin VARCHAR(40) NOT NULL, width_mm DOUBLE NOT NULL, " +
     "depth_mm DOUBLE NOT NULL, height_mm DOUBLE NOT NULL, source VARCHAR(16) NOT NULL, photo_id BIGINT NULL, " +
     "measured_by VARCHAR(64) NULL, measured_at DATETIME NOT NULL, PRIMARY KEY (loccode, bin))",
   "CREATE TABLE IF NOT EXISTS bin_photos (photo_id BIGINT NOT NULL PRIMARY KEY, loccode VARCHAR(10) NOT NULL, bin VARCHAR(40) NOT NULL, " +
-    "taken_at DATETIME NOT NULL, image LONGBLOB NOT NULL, marker TEXT NULL, opening TEXT NULL)"
+    "taken_at DATETIME NOT NULL, image LONGBLOB NOT NULL, marker TEXT NULL, opening TEXT NULL)",
+  // measured from a photo: the opening on the front (marker mm), where the depth came from, the lens, and the bin's
+  // photo and camera when it was empty (what later photos are checked against)
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS rect TEXT NULL",
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS depth_source VARCHAR(16) NULL",
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS focal_px DOUBLE NULL",
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS photo_w INT NULL",
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS empty_photo_id BIGINT NULL",
+  "ALTER TABLE bin_dims ADD COLUMN IF NOT EXISTS empty_camera TEXT NULL"
 ]
 
 fn fill_query(cfg) {
@@ -70,8 +83,22 @@ fn bins_measure(photo, opening, cfg) {
 }
 
 fn bins_save(q, rec) {
-  q("REPLACE INTO bin_dims (loccode, bin, width_mm, depth_mm, height_mm, source, photo_id, measured_by, measured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    [rec.loccode, rec.bin, rec.width_mm * 1.0, rec.depth_mm * 1.0, rec.height_mm * 1.0, rec.source, get(rec, "photo_id", nil), get(rec, "by", nil)])
+  q("REPLACE INTO bin_dims (loccode, bin, width_mm, depth_mm, height_mm, source, photo_id, measured_by, measured_at, rect, depth_source, " +
+    "focal_px, photo_w, empty_photo_id, empty_camera) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)",
+    [rec.loccode, rec.bin, rec.width_mm * 1.0, rec.depth_mm * 1.0, rec.height_mm * 1.0, rec.source, get(rec, "photo_id", nil), get(rec, "by", nil),
+     get(rec, "rect", nil) == nil ? nil : json_stringify(rec.rect), get(rec, "depth_source", nil), get(rec, "focal_px", nil),
+     get(rec, "photo_w", nil), get(rec, "empty_photo_id", nil), get(rec, "empty_camera", nil) == nil ? nil : json_stringify(rec.empty_camera)])
+}
+
+// What a check of a bin says, from what the photo shows (changed: the share of the opening that differs from the
+// empty bin) and what the ERP says (fill): "agrees", "erp_has_more" (the ERP has stock in it, the photo an empty
+// bin), "photo_has_more" (the photo shows stock the ERP does not have there), "unsure" (too little of the opening
+// could be compared). The photo sees the front, the ERP counts the volume, so only a clear contradiction is flagged.
+fn bins_verdict(changed, compared, erp_fill) {
+  if compared < 0.5 { return "unsure" }
+  if erp_fill >= 0.25 and changed < 0.05 { return "erp_has_more" }
+  if erp_fill <= 0.0 and changed > 0.15 { return "photo_has_more" }
+  return "agrees"
 }
 
 fn num(v) { return v == nil ? 0.0 : to_number(v, 0) * 1.0 }
@@ -133,4 +160,86 @@ fn bins_marker_png(mm) {
   canvas_set_font(cv, "ui", 40)
   canvas_fill_text(cv, format("bin marker - the black square is {} mm: print at 100%, check with a ruler", mm), margin, dots + 2 * margin + 60)
   return canvas_to_png(cv)
+}
+
+// ---- from the photo alone: depth, and what is really in the bin --------------------------------------------------
+//
+// One photo of the bin's front with the marker on it: the camera and the opening found together
+// (camera_pose_rect: the marker gives the scale, the opening's right angles the lens and the tilt; the lens from
+// the photo's EXIF when the phone gave one). The bin's floor is the plane through the opening's bottom edge square
+// to the front, so a tap on the floor's back corner is the depth. The opening is kept on the front in the marker's
+// millimetres, so any later photo with the marker in it finds the bin by itself; with the bin's photo when it was
+// empty, the view of the empty bin from the later photo's camera is made (box_face_views: the box's walls, floor and
+// back are planes), and what differs is what is in it.
+
+fn v3sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn v3dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+
+// the marker's corners on the front (mm: x right, y up, the front z = 0), as image_find_marker orders them
+fn marker_world(cfg) {
+  let s = cfg.marker_mm * 1.0
+  return [[0.0, s], [s, s], [s, 0.0], [0.0, 0.0]]
+}
+
+fn find_marker(cv) {
+  let m = image_find_marker(cv)
+  if m == nil { error("no marker found: print it, tape it flat on the bin's front, and get all of it in the photo") }
+  return m
+}
+
+// a camera in the marker's frame turned into the bin's: its origin the opening's bottom-left corner, x along the
+// bottom edge, y up the front, z out toward the camera (a marker point is o + M p for bin point p: R' = R M,
+// t' = R o + t)
+fn to_bin_frame(cam, rect) {
+  let a = rect.angle * PI / 180.0
+  let c = cos(a)
+  let s = sin(a)
+  let R = cam.rot
+  let RM = [R[0] * c + R[1] * s, -R[0] * s + R[1] * c, R[2],
+            R[3] * c + R[4] * s, -R[3] * s + R[4] * c, R[5],
+            R[6] * c + R[7] * s, -R[6] * s + R[7] * c, R[8]]
+  let t = [R[0] * rect.x + R[1] * rect.y + cam.t[0], R[3] * rect.x + R[4] * rect.y + cam.t[1], R[6] * rect.x + R[7] * rect.y + cam.t[2]]
+  return {"focal": cam.focal, "cx": cam.cx, "cy": cam.cy, "rot": RM, "t": t}
+}
+
+// A bin measured from one photo: the opening's corners (picture, clockwise from the top left) and, optionally, the
+// back corner of its floor (picture). focal: the lens from the photo's EXIF (pixels at this photo's size), or nil.
+// -> {width_mm, height_mm, depth_mm (nil without the tap), rect (the opening on the front, marker mm), camera (in
+// the bin's frame), rms_px, focal_from}
+fn bins_geometry(photo, opening, back, cfg, focal) {
+  let cv = image_decode(photo)
+  let m = find_marker(cv)
+  let r = camera_pose_rect(marker_world(cfg), m.corners, opening, canvas_width(cv), canvas_height(cv), focal == nil ? {} : {"focal": focal * 1.0})
+  let cam = to_bin_frame(r.camera, r.rect)
+  let depth = nil
+  if back != nil {
+    // the floor is y = 0 in the bin's frame; its inside z < 0
+    let ray = camera_ray(cam, back)
+    if abs(ray.dir[1]) < 1e-9 { error("the tapped point's ray runs along the floor: tap the back corner of the bin's floor") }
+    let t = -ray.from[1] / ray.dir[1]
+    let z = ray.from[2] + ray.dir[2] * t
+    if t <= 0 or z >= 0 { error("the tapped point is not inside the bin: tap the back corner of its floor") }
+    depth = -z
+  }
+  return {"width_mm": r.rect.width, "height_mm": r.rect.height, "depth_mm": depth, "rect": r.rect, "camera": cam,
+          "rms_px": r.rms_px, "focal_from": focal == nil ? "rectangle" : "photo"}
+}
+
+// A later photo's camera in the bin's frame: from the marker, with the lens given - the photo's EXIF, or the one
+// the bin was measured with (the same phone; scale it to this photo's width).
+fn bins_camera(cv, rect, cfg, focal) {
+  let m = find_marker(cv)
+  let cam = camera_pose(marker_world(cfg), m.corners, canvas_width(cv), canvas_height(cv), focal == nil ? {} : {"focal": focal * 1.0})
+  return to_bin_frame(cam, rect)
+}
+
+// What is in a bin, from a photo now and its photo when empty (each with its EXIF lens or nil): {changed (the share
+// of the opening that differs from the empty bin seen from here), compared (the share both photos could show),
+// actual, expected (the flattened faces)}
+fn bins_occupancy(photo, focal, empty_photo, empty_cam, dims, cfg) {
+  let cv = image_decode(photo)
+  let cam = bins_camera(cv, dims.rect, cfg, focal)
+  let v = box_face_views(cv, cam, image_decode(empty_photo), empty_cam, {"w": dims.width_mm, "h": dims.height_mm, "d": dims.depth_mm}, 5.0)
+  let d = image_difference(v.expected, v.actual)
+  return {"changed": d.changed, "compared": d.compared * v.known, "actual": v.actual, "expected": v.expected, "camera": cam}
 }

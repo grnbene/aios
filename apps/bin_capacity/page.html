@@ -35,16 +35,25 @@ a { color: var(--accent); }
 </style></head>
 <body><main>
 <h1>Bin capacity</h1>
-<p class="lead">How full every bin is from what the ERP says is in it, and where a size still fits. Measure a bin with your phone: <a href="/marker.png" target="_blank">print the marker</a>, tape it flat on the bin's front, photograph the bin, then drag the four corners onto the opening.</p>
+<p class="lead">How full every bin is from what the ERP says is in it, and where a size still fits. Measure a bin with your phone: <a href="/marker.png" target="_blank">print the marker</a>, tape it flat on the bin's front, photograph the bin, drag the four corners onto the opening and the blue one onto the back corner of its floor. Photograph it again any time to check what is really in it.</p>
 
 <div class="card">
   <h2>Measure a bin</h2>
   <div class="row"><div><label class="f" for="bin">Bin</label><input id="bin" placeholder="e.g. R1-01" autocomplete="off"></div>
-    <div><label class="f" for="depth">Depth, mm</label><input id="depth" inputmode="numeric" value="1000"></div></div>
+    <div><label class="f" for="depth">Depth, mm (if not tapped)</label><input id="depth" inputmode="numeric" value="1000"></div></div>
   <label class="shot">Photograph the bin with the marker on it<input id="photo" type="file" accept="image/*" capture="environment"></label>
   <div id="stage"><canvas id="cv"></canvas></div>
+  <label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-size:15px"><input type="checkbox" id="isempty" style="width:auto"> The bin is empty now (keep this photo to check it against later)</label>
   <button class="go" id="save" disabled style="width:100%;margin-top:10px">Save this bin's size</button>
   <div id="mstatus"></div>
+</div>
+
+<div class="card">
+  <h2>Check a bin</h2>
+  <p class="muted" style="margin:0 0 6px">Photograph a measured bin's front with its marker in view: what is in it is compared with its empty photo and with what the ERP says.</p>
+  <div class="row"><div><input id="cbin" placeholder="Bin, e.g. R1-01" autocomplete="off"></div></div>
+  <label class="shot">Photograph the bin<input id="cphoto" type="file" accept="image/*" capture="environment"></label>
+  <div id="cstatus"></div>
 </div>
 
 <div class="card">
@@ -82,9 +91,35 @@ async function board() {
   } catch (e) { $('status').textContent = 'Could not read the board: ' + e.message; }
 }
 
+// ---- the lens: the photo's EXIF 35 mm-equivalent focal length (the browser's shrinking drops EXIF, so read first) ----
+async function exifFocal35(file) {
+  try {
+    const b = new DataView(await file.slice(0, 131072).arrayBuffer());
+    if (b.getUint16(0) !== 0xFFD8) return null;
+    let o = 2;
+    while (o + 4 < b.byteLength) {
+      const marker = b.getUint16(o), len = b.getUint16(o + 2);
+      if (marker === 0xFFE1 && b.getUint32(o + 4) === 0x45786966) {
+        const t = o + 10, le = b.getUint16(t) === 0x4949;
+        const u16 = (p) => b.getUint16(t + p, le), u32 = (p) => b.getUint32(t + p, le);
+        const ifd = (off, want) => { const n = u16(off); for (let i = 0; i < n; i++) { const e = off + 2 + i * 12; if (u16(e) === want) return e; } return -1; };
+        const ex = ifd(u32(4), 0x8769);
+        if (ex < 0) return null;
+        const f = ifd(u32(ex + 8), 0xA405);
+        return f < 0 ? null : (u16(f + 8) || null);
+      }
+      if ((marker & 0xFF00) !== 0xFF00) return null;
+      o += 2 + len;
+    }
+  } catch (e) {}
+  return null;
+}
+// pixels of focal length for a w x h picture from a 35 mm-equivalent (which is by the diagonal: 43.27 mm)
+const focalPx = (f35, w, h) => f35 ? f35 * Math.hypot(w, h) / 43.27 : null;
+
 // ---- measuring: the photo, its marker, four corners dragged onto the opening ----
 let shot = null;      // {img, photo_id, marker, w, h}
-let corners = null;   // [[x y] x4] in photo pixels
+let corners = null;   // [[x y] x4] in photo pixels, then the floor's back corner as the fifth
 const cv = $('cv');
 function draw() {
   const c = cv.getContext('2d');
@@ -94,9 +129,9 @@ function draw() {
   c.strokeStyle = '#2f9d5f';
   c.beginPath(); shot.marker.corners.forEach((p, i) => i ? c.lineTo(p[0] * k, p[1] * k) : c.moveTo(p[0] * k, p[1] * k)); c.closePath(); c.stroke();
   c.strokeStyle = '#ff6a2b'; c.fillStyle = 'rgba(255,106,43,.15)';
-  c.beginPath(); corners.forEach((p, i) => i ? c.lineTo(p[0] * k, p[1] * k) : c.moveTo(p[0] * k, p[1] * k)); c.closePath(); c.fill(); c.stroke();
+  c.beginPath(); corners.slice(0, 4).forEach((p, i) => i ? c.lineTo(p[0] * k, p[1] * k) : c.moveTo(p[0] * k, p[1] * k)); c.closePath(); c.fill(); c.stroke();
   const r = Math.max(10, cv.width / 50);
-  for (const p of corners) { c.beginPath(); c.arc(p[0] * k, p[1] * k, r, 0, 7); c.fillStyle = 'rgba(255,106,43,.85)'; c.fill(); }
+  corners.forEach((p, i) => { c.beginPath(); c.arc(p[0] * k, p[1] * k, r, 0, 7); c.fillStyle = i < 4 ? 'rgba(255,106,43,.85)' : 'rgba(43,160,255,.9)'; c.fill(); });
 }
 $('photo').addEventListener('change', async (e) => {
   const f = e.target.files[0];
@@ -110,19 +145,20 @@ $('photo').addEventListener('change', async (e) => {
   c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
   const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  const f35 = await exifFocal35(f);
   try {
     const j = await api('/api/photo?bin=' + encodeURIComponent(bin), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
-    shot = {img: c, photo_id: j.photo_id, marker: j.marker, w: j.w, h: j.h};
+    shot = {img: c, photo_id: j.photo_id, marker: j.marker, w: j.w, h: j.h, focal: focalPx(f35, j.w, j.h)};
     // the opening's corners start a little way out from the marker: drag each onto the opening's corner
     const m = j.marker.corners, cx = j.marker.centre[0], cy = j.marker.centre[1], s = j.marker.side_px * 2.5;
     // (kept 6% inside the photo: a handle on its very edge cannot be grabbed)
     const mx = j.w * 0.06, my = j.h * 0.06;
-    corners = [[cx - s, cy - s], [cx + s, cy - s], [cx + s, cy + s], [cx - s, cy + s]].map(p => [Math.max(mx, Math.min(j.w - mx, p[0])), Math.max(my, Math.min(j.h - my, p[1]))]);
+    corners = [[cx - s, cy - s], [cx + s, cy - s], [cx + s, cy + s], [cx - s, cy + s], [cx - s * 0.6, cy - s * 0.2]].map(p => [Math.max(mx, Math.min(j.w - mx, p[0])), Math.max(my, Math.min(j.h - my, p[1]))]);
     cv.width = c.width; cv.height = c.height;
     $('stage').style.display = 'block';
     draw();
     $('save').disabled = false;
-    $('mstatus').textContent = 'Marker found (green), ' + j.mm_per_px.toFixed(2) + ' mm a pixel there. Drag the orange corners onto the bin opening\'s corners.';
+    $('mstatus').textContent = 'Marker found (green). Drag the orange corners onto the bin opening\'s corners, and the blue one onto the back corner of the bin\'s floor (for its depth).' + (shot.focal ? ' Lens from the photo.' : '');
   } catch (err) { $('mstatus').textContent = err.message; }
 });
 let drag = -1;
@@ -140,12 +176,37 @@ $('save').addEventListener('click', async () => {
   $('save').disabled = true;
   try {
     const j = await api('/api/measure', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({photo_id: shot.photo_id, opening: corners, depth_mm: Number($('depth').value)})});
-    $('mstatus').textContent = j.bin + ': ' + Math.round(j.width_mm) + ' wide x ' + Math.round(j.height_mm) + ' high x ' + Math.round(j.depth_mm) + ' deep (mm), saved.' +
-      (j.board ? ' Now ' + Math.round(j.board.fill * 100) + '% full.' : '') + (j.warning ? '\n' + j.warning : '');
+      body: JSON.stringify({photo_id: shot.photo_id, opening: corners.slice(0, 4), back: corners[4], focal: shot.focal,
+                            depth_mm: Number($('depth').value), empty: $('isempty').checked})});
+    $('mstatus').textContent = j.bin + ': ' + Math.round(j.width_mm) + ' wide x ' + Math.round(j.height_mm) + ' high x ' + Math.round(j.depth_mm) + ' deep (mm' +
+      (j.depth_source === 'photo' ? ', depth from the photo' : ', depth typed') + '), saved.' +
+      (j.board ? ' Now ' + Math.round(j.board.fill * 100) + '% full by the ERP.' : '') + (j.empty_kept ? ' Its empty photo is kept for checks.' : '') + (j.warning ? '\n' + j.warning : '');
     board();
   } catch (err) { $('mstatus').textContent = 'Not saved: ' + err.message; }
   $('save').disabled = false;
+});
+
+// ---- checking a bin ----
+const VERDICT = {agrees: 'The photo agrees with the ERP.', erp_has_more: 'The ERP has stock in this bin, but it looks empty.',
+                 photo_has_more: 'Something is in this bin the ERP does not have there.', unsure: 'Too little of the bin could be compared: photograph it straighter on, with the marker in view.'};
+$('cphoto').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const bin = $('cbin').value.trim();
+  if (!bin) { $('cstatus').textContent = 'Name the bin first.'; e.target.value = ''; return; }
+  $('cstatus').textContent = 'Checking...';
+  const bmp = await createImageBitmap(f);
+  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  const fp = focalPx(await exifFocal35(f), c.width, c.height);
+  try {
+    const j = await api('/api/check?bin=' + encodeURIComponent(bin) + (fp ? '&focal=' + fp.toFixed(1) : ''), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+    $('cstatus').textContent = bin + ': ' + Math.round(j.changed * 100) + '% of the opening shows stock; the ERP has it ' + Math.round(j.erp_fill * 100) + '% full. ' + VERDICT[j.verdict];
+  } catch (err) { $('cstatus').textContent = err.message; }
+  e.target.value = '';
 });
 
 // ---- where a size fits ----

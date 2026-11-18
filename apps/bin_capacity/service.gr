@@ -7,14 +7,18 @@
 //   GET  /api/bin?bin=B         what is in bin B: each item, how many of it the bin holds alone, its share
 //   GET  /api/room?size=S       where tires of size S still fit, most room first
 //   POST /api/photo?bin=B       body: a photo of B's front with the marker on it -> {photo_id, marker, w, h}
-//   POST /api/measure           {photo_id, opening: [[x y] x4 clockwise from top left, photo px], depth_mm} -> the
-//                               bin's size, saved; then its fill
+//   POST /api/measure           {photo_id, opening: [[x y] x4 clockwise from top left, photo px], back: [x y] (the
+//                               floor's back corner; else depth_mm is used), focal (the lens in px from the photo's
+//                               EXIF, or nil), empty (true: the bin is empty now, keep this photo to check against)}
+//                               -> the bin's size, saved; then its fill
+//   POST /api/check?bin=B&focal=F  body: a photo of B's front: what is in it against its empty photo, and the ERP's
+//                               fill -> {changed, compared, erp_fill, verdict}
 //   POST /api/dims              {bin, width_mm, depth_mm, height_mm}: a size entered by hand
 //
 // Sizes and photos are kept in ASQL (bin_dims, bin_photos); fill is the bin_fill Thing's (lib/bins.gr).
 
 import { q, bin_cfg, setting } from "lib/db.gr"
-import { bins_install, bins_measure, bins_save, bins_board, bins_contents, bins_room, bins_marker_png } from "lib/bins.gr"
+import { bins_install, bins_save, bins_board, bins_contents, bins_room, bins_marker_png, bins_geometry, bins_occupancy, bins_verdict } from "lib/bins.gr"
 
 let PAGE = app_program("page.html")
 
@@ -77,18 +81,61 @@ serve_routes({
     let j = req.json
     let rows = q("SELECT bin, image FROM bin_photos WHERE photo_id = ?", [j.photo_id])
     if len(rows) == 0 { error("no photo " + str(j.photo_id)) }
-    let m = bins_measure(bytes(rows[0].image), j.opening, bin_cfg())
-    let depth = to_number(get(j, "depth_mm", bin_cfg().depth_mm), bin_cfg().depth_mm) * 1.0
-    if depth <= 0 { error("the depth is a number of millimetres") }
     let b = rows[0].bin
-    bins_save(q, {"loccode": bin_cfg().loccode, "bin": b, "width_mm": m.width_mm, "depth_mm": depth, "height_mm": m.height_mm,
-                  "source": "photo", "photo_id": j.photo_id})
+    let photo = bytes(rows[0].image)
+    let focal = get(j, "focal", nil)
+    let g = bins_geometry(photo, j.opening, get(j, "back", nil), bin_cfg(), focal)
+    let depth = g.depth_mm
+    let depth_source = "photo"
+    if depth == nil {
+      depth = to_number(get(j, "depth_mm", bin_cfg().depth_mm), bin_cfg().depth_mm) * 1.0
+      depth_source = "typed"
+    }
+    if depth <= 0 { error("the depth is a number of millimetres") }
+    let rec = {"loccode": bin_cfg().loccode, "bin": b, "width_mm": g.width_mm, "depth_mm": depth, "height_mm": g.height_mm,
+               "source": "photo", "photo_id": j.photo_id, "rect": g.rect, "depth_source": depth_source, "focal_px": g.camera.focal,
+               "photo_w": canvas_width(image_decode(photo))}
+    // the empty photo: this one when it is said to be empty, else the one kept before
+    let kept = q("SELECT empty_photo_id, empty_camera FROM bin_dims WHERE loccode = ? AND bin = ?", [bin_cfg().loccode, b])
+    if get(j, "empty", false) {
+      rec.empty_photo_id = j.photo_id
+      rec.empty_camera = g.camera
+    } else if len(kept) > 0 and kept[0].empty_photo_id != nil {
+      rec.empty_photo_id = kept[0].empty_photo_id
+      rec.empty_camera = json_parse(kept[0].empty_camera)
+    }
+    bins_save(q, rec)
     q("UPDATE bin_photos SET opening = ? WHERE photo_id = ?", [json_stringify(j.opening), j.photo_id])
     let fill = nil
     for r in bins_board(q) { if r.bin == b { fill = r } }
-    return res_json({"bin": b, "width_mm": m.width_mm, "height_mm": m.height_mm, "depth_mm": depth, "skew": m.skew,
-                     "warning": m.skew > 0.05 ? "the opening's opposite edges disagree by more than 5%: is the marker flat on the bin's front?" : nil,
+    return res_json({"bin": b, "width_mm": g.width_mm, "height_mm": g.height_mm, "depth_mm": depth, "depth_source": depth_source,
+                     "focal_from": g.focal_from, "rms_px": g.rms_px, "empty_kept": get(rec, "empty_photo_id", nil) != nil,
+                     "warning": g.rms_px > 3.0 ? "the corners do not fit one rectangle on the marker's plane well: is the marker flat on the bin's front, and each corner on the opening's?" : nil,
                      "board": fill})
+  }),
+  "POST /api/check": api(fn (req) {
+    let b = bin_name(get(req.query_params, "bin", ""))
+    let d = q("SELECT width_mm, height_mm, depth_mm, rect, focal_px, photo_w, empty_photo_id, empty_camera FROM bin_dims WHERE loccode = ? AND bin = ?",
+              [bin_cfg().loccode, b])
+    if len(d) == 0 or d[0].rect == nil { error("measure " + b + " from a photo first") }
+    if d[0].empty_photo_id == nil { error("no photo of " + b + " empty yet: measure it once when it is empty, ticking that it is") }
+    let photo = bytes(req.body)
+    let cv = image_decode(photo)
+    let f = get(req.query_params, "focal", "")
+    // the lens: this photo's EXIF, else the one the bin was measured with (the same phone), to this photo's width
+    let focal = f != "" ? to_number(f) * 1.0 : to_number(d[0].focal_px) * canvas_width(cv) / to_number(d[0].photo_w)
+    let empty = q("SELECT image FROM bin_photos WHERE photo_id = ?", [d[0].empty_photo_id])
+    let dims = {"width_mm": to_number(d[0].width_mm) * 1.0, "height_mm": to_number(d[0].height_mm) * 1.0, "depth_mm": to_number(d[0].depth_mm) * 1.0,
+                "rect": json_parse(d[0].rect)}
+    let o = bins_occupancy(photo, focal, bytes(empty[0].image), json_parse(d[0].empty_camera), dims, bin_cfg())
+    let erp = 0.0
+    for r in bins_board(q) { if r.bin == b { erp = r.fill } }
+    let verdict = bins_verdict(o.changed, o.compared, erp)
+    let id = photo_id()
+    q("INSERT INTO bin_photos (photo_id, loccode, bin, taken_at, image) VALUES (?, ?, ?, NOW(), ?)", [id, bin_cfg().loccode, b, photo])
+    q("INSERT INTO bin_checks (check_id, loccode, bin, taken_at, photo_id, changed, compared, erp_fill, verdict) VALUES (?, ?, ?, NOW(), ?, ?, ?, ?, ?)",
+      [id, bin_cfg().loccode, b, id, o.changed, o.compared, erp, verdict])
+    return res_json({"bin": b, "changed": o.changed, "compared": o.compared, "erp_fill": erp, "verdict": verdict})
   }),
   "POST /api/dims": api(fn (req) {
     let j = req.json
