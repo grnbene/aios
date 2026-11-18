@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet chat</title>
+<style>
+:root { --bg:#0e1116; --panel:#171b22; --ink:#e7ebf0; --muted:#8b93a0; --line:#262c36; --accent:#d0542a; --ok:#3fb950; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,sans-serif; }
+main { max-width:760px; margin:0 auto; padding:16px; }
+h1 { font-size:21px; margin:2px 0 2px; } .sub { color:var(--muted); margin:0 0 14px; }
+.live { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--ok); margin-right:6px; animation:p 1.6s infinite; }
+@keyframes p { 0%,100%{opacity:1} 50%{opacity:.25} }
+.compose { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:16px; position:sticky; top:8px; }
+textarea { width:100%; min-height:60px; resize:vertical; background:#0d1014; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px; font:inherit; }
+.row { display:flex; gap:10px; align-items:center; margin-top:8px; }
+.row .grow { flex:1; }
+button { font:inherit; padding:9px 16px; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+button:disabled { opacity:.5; }
+label.file { color:var(--muted); cursor:pointer; } label.file input { display:none; }
+#prev { max-height:120px; border-radius:8px; margin-top:8px; display:none; }
+#send_status { color:var(--muted); font-size:13px; margin-top:6px; min-height:1.2em; }
+.msg { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:10px; }
+.msg .meta { color:var(--muted); font-size:13px; margin-bottom:5px; }
+.msg .node { color:var(--accent); font-weight:600; }
+.msg .text { white-space:pre-wrap; word-break:break-word; }
+.msg img { max-width:100%; border-radius:8px; margin-top:8px; display:block; }
+.new { animation:flash 2s; } @keyframes flash { from{background:rgba(208,84,43,.25)} to{background:var(--panel)} }
+.muted { color:var(--muted); }
+</style></head>
+<body><main>
+<h1><span class="live"></span>Fleet chat</h1>
+<p class="sub">A one-way broadcast — your message, and a picture if you add one, lands on every node. No replies.</p>
+<div class="compose">
+  <textarea id="text" placeholder="Message to the fleet…"></textarea>
+  <div class="row">
+    <label class="file grow">📎 <span id="fname">attach a picture</span><input id="file" type="file" accept="image/*"></label>
+    <button id="send">Broadcast</button>
+  </div>
+  <img id="prev" alt="preview">
+  <div id="send_status"></div>
+</div>
+<div id="stream"></div>
+<p class="sub" id="foot"></p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function ago(iso){ const t=Date.parse(iso+(iso&&iso.endsWith('Z')?'':'Z')); if(isNaN(t)) return iso||''; const s=Math.max(0,(Date.now()-t)/1000);
+  if(s<60) return Math.floor(s)+'s ago'; if(s<3600) return Math.floor(s/60)+'m ago'; if(s<86400) return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
+let seen = new Set();
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  $('fname').textContent = f ? f.name : 'attach a picture';
+  const pv = $('prev');
+  if (f) { pv.src = URL.createObjectURL(f); pv.style.display='block'; } else pv.style.display='none';
+});
+$('send').addEventListener('click', async () => {
+  const text = $('text').value.trim(); const f = $('file').files[0];
+  if (!text && !f) { $('send_status').textContent = 'type something or attach a picture.'; return; }
+  const fd = new FormData(); fd.append('text', text); if (f) fd.append('file', f);
+  $('send').disabled = true; $('send_status').textContent = 'broadcasting…';
+  try {
+    const r = await fetch('/send', { method:'POST', body: fd });
+    const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText);
+    $('text').value=''; $('file').value=''; $('fname').textContent='attach a picture'; $('prev').style.display='none';
+    $('send_status').textContent = 'sent to the fleet.';
+    tick();
+  } catch (e) { $('send_status').textContent = 'not sent: ' + e.message; }
+  $('send').disabled = false;
+});
+async function tick(){
+  let j; try { j = await (await fetch('/api/messages?limit=200')).json(); } catch(e){ $('foot').textContent='offline: '+e.message; return; }
+  const m = j.messages || [];
+  $('stream').innerHTML = m.length ? m.map(x=>{
+    const nw = !seen.has(x.id); seen.add(x.id);
+    const img = x.file ? '<img src="/file/'+encodeURIComponent(x.id)+'" alt="'+esc(x.filename)+'">' : '';
+    return '<div class="msg '+(nw?'new':'')+'">'+
+      '<div class="meta"><span class="node">'+esc(x.node)+'</span> · '+esc(ago(x.t))+'</div>'+
+      (x.text?'<div class="text">'+esc(x.text)+'</div>':'')+img+'</div>';
+  }).join('') : '<p class="muted">no messages yet.</p>';
+  $('foot').textContent = 'this node: '+esc(j.node)+' · '+m.length+' messages · '+new Date().toLocaleTimeString();
+}
+tick(); setInterval(tick, 3000);
+</script>
+</body></html>

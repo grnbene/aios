@@ -1,0 +1,122 @@
+// Fleet chat service. Messages are JSON lines in chat.jsonl (relative, inside the app's own data dir - the app host
+// sandboxes paths). A picture is stored as f_<id> beside it, its mime on the message. A send fans out to each peer's
+// /recv (the file as base64) so every node carries the same broadcast. One way: nothing here replies.
+fn setting(n, d) { let v = getenv(n) return v == nil or v == "" ? d : v }
+let PEERS = setting("FLEET_PEERS", "")
+let MAX_KB = int(setting("MAX_FILE_KB", "4096"))
+let NODE = setting("AIOS_NODE", setting("HOSTNAME", "node"))
+let FEED = "chat.jsonl"
+let PAGE = app_program("page.html")
+
+fn now_iso() { return date_format(now(), "%Y-%m-%dT%H:%M:%SZ", "utc") }
+
+fn messages(limit) {
+  let r = pcall(read_file, FEED)
+  if not r.ok { return [] }
+  let lines = split(r.value, "\n")
+  let out = []
+  let i = len(lines) - 1
+  while i >= 0 and len(out) < limit {
+    let ln = trim(lines[i])
+    if ln != "" { let p = pcall(json_parse, ln) if p.ok { push(out, p.value) } }
+    i = i - 1
+  }
+  return out
+}
+
+// has this id already landed? (de-dup across fleet fan-out)
+fn have(id) {
+  for m in messages(500) { if get(m, "id", "") == id { return true } }
+  return false
+}
+
+fn ext_for(mime) {
+  if index_of(mime, "png") >= 0 { return "png" }
+  if index_of(mime, "jpeg") >= 0 or index_of(mime, "jpg") >= 0 { return "jpg" }
+  if index_of(mime, "gif") >= 0 { return "gif" }
+  if index_of(mime, "webp") >= 0 { return "webp" }
+  return "bin"
+}
+
+// store a message record (and its file bytes if given), then return the record
+fn store(rec, file_bytes) {
+  if file_bytes != nil and rec.file != "" { write_bytes("f_" + rec.id, file_bytes) }
+  append_file(FEED, json_stringify(rec) + "\n")
+  return rec
+}
+
+// fan a record out to the peers (file as base64), each at /recv; best-effort
+fn fan_out(rec, file_bytes) {
+  if PEERS == "" { return }
+  let b64 = file_bytes == nil ? "" : base64_encode(bytes_str(file_bytes))
+  let payload = {"id": rec.id, "t": rec.t, "node": rec.node, "text": rec.text, "mime": rec.mime,
+                 "filename": rec.filename, "file_b64": b64}
+  for base in split(PEERS, ",") {
+    let u = trim(base)
+    if u == "" { continue }
+    pcall(http_request, {"url": u + "/recv", "method": "POST", "headers": {"Content-Type": "application/json"},
+                         "body": json_stringify(payload), "timeout_ms": 5000})
+  }
+}
+
+serve_routes({
+  "GET /": fn (req) { return res_html(PAGE) },
+  "GET /health": fn (req) { return res_json({"ok": true, "node": NODE}) },
+  "GET /api/messages": fn (req) {
+    return res_json({"node": NODE, "messages": messages(int(get(req.query_params, "limit", "200")))})
+  },
+  "GET /file/:id": fn (req) {
+    let id = req.params.id
+    for m in messages(500) {
+      if get(m, "id", "") == id and get(m, "file", "") != "" {
+        let r = pcall(read_bytes, "f_" + id)
+        if not r.ok { return res_error(404, "gone") }
+        return {"status": 200, "content_type": get(m, "mime", "application/octet-stream"), "body": r.value}
+      }
+    }
+    return res_error(404, "no such file")
+  },
+  // compose from a browser: multipart form (text + optional file)
+  "POST /send": fn (req) {
+    let text = ""
+    let fb = nil
+    let mime = ""
+    let fname = ""
+    let ct = get(req.headers, "content-type", "")
+    if index_of(lower(ct), "multipart/form-data") >= 0 {
+      let mp = http_parse_multipart(req.body, ct)
+      text = trim(get(mp.form, "text", ""))
+      for name in keys(mp.files) {
+        let f = mp.files[name]
+        fb = bytes(f.data)
+        mime = get(f, "type", "application/octet-stream")
+        fname = get(f, "filename", "")
+      }
+    } else {
+      let j = pcall(json_parse, req.body)
+      if j.ok { text = trim(get(j.value, "text", "")) }
+    }
+    if text == "" and fb == nil { return res_error(400, "nothing to send") }
+    if fb != nil and len(fb) > MAX_KB * 1024 { return res_error(413, format("the picture is over {} KB", MAX_KB)) }
+    let id = uuid_v4()
+    let rec = {"id": id, "t": now_iso(), "node": NODE, "text": text, "file": fb == nil ? "" : id, "mime": mime, "filename": fname}
+    store(rec, fb)
+    fan_out(rec, fb)
+    return res_json({"ok": true, "id": id})
+  },
+  // a peer forwards a broadcast here; store it, do not re-forward (one hop)
+  "POST /recv": fn (req) {
+    let j = pcall(json_parse, req.body)
+    if not j.ok { return res_error(400, "bad json") }
+    let m = j.value
+    let id = get(m, "id", "")
+    if id == "" or have(id) { return res_json({"ok": true, "dup": true}) }
+    let fb = nil
+    let b64 = get(m, "file_b64", "")
+    if b64 != "" { fb = bytes(base64_decode(b64)) }
+    let rec = {"id": id, "t": get(m, "t", now_iso()), "node": get(m, "node", "?"), "text": get(m, "text", ""),
+               "file": fb == nil ? "" : id, "mime": get(m, "mime", ""), "filename": get(m, "filename", "")}
+    store(rec, fb)
+    return res_json({"ok": true})
+  }
+}, {"workers": false})

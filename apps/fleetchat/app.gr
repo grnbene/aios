@@ -1,0 +1,16 @@
+// Fleet chat: a one-way broadcast across the fleet. An operator sends a message (and, if they like, a picture);
+// every node shows it. No replies, no threads - a bulletin the whole fleet sees at once.
+let app = {
+  "name": "fleetchat",
+  "description": "one-way fleet broadcast: a message and a picture to every node",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8578,
+  "listen": "local",
+  // FLEET_PEERS: comma-separated base URLs of the other nodes' fleetchat (e.g. http://node-b:8578). A send fans out
+  // to each peer's /recv so all nodes carry it. Empty = this node only.
+  "settings": {"FLEET_PEERS": "", "MAX_FILE_KB": "4096"},
+  "health": {"path": "/health", "ok": [200]},
+  "max_body": 8388608,
+  "max_steps": 0
+}
