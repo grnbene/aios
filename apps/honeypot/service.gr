@@ -7,6 +7,41 @@ let PAGE = app_program("page.html")
 
 fn now_iso() { return date_format(now(), "%Y-%m-%dT%H:%M:%SZ", "utc") }
 
+// --- access control. The app listens on all interfaces (other nodes must reach /ingest), so:
+//   /ingest  needs X-Fleet-Token == FLEET_TOKEN (the edge server's env_honeypot_token); with no FLEET_TOKEN set
+//            it takes events from this machine only.
+//   the dashboard, exports, report and whois need HTTP Basic auth with DASH_PASSWORD (any username); with no
+//            DASH_PASSWORD set they answer this machine only.
+// Secrets are compared as sha256 digests, so the comparison's timing says nothing about the secret.
+let FLEET_TOKEN = setting("FLEET_TOKEN", "")
+let DASH_PASSWORD = setting("DASH_PASSWORD", "")
+fn is_loopback(req) {
+  let r = get(req, "remote", "")
+  return starts_with(r, "127.") or starts_with(r, "[::1]") or starts_with(r, "::1") or r == "localhost"
+}
+fn same_secret(a, b) { return a != "" and sha256(a) == sha256(b) }
+fn fleet_ok(req) {
+  if FLEET_TOKEN == "" { return is_loopback(req) }
+  return same_secret(get(req.headers, "x-fleet-token", ""), FLEET_TOKEN)
+}
+fn basic_password(req) {
+  let h = get(req.headers, "authorization", "")
+  if not starts_with(lower(h), "basic ") { return "" }
+  let d = pcall(base64_decode, trim(slice(h, 6, len(h))))
+  if not d.ok { return "" }
+  let i = index_of(d.value, ":")
+  return i >= 0 ? slice(d.value, i + 1, len(d.value)) : ""
+}
+// nil when the request may see the dashboard; otherwise the response to send instead
+fn dash_guard(req) {
+  if DASH_PASSWORD == "" {
+    if is_loopback(req) { return nil }
+    return res_text("Dashboard is local-only: set DASH_PASSWORD on this app to open it to other machines.\n", 403)
+  }
+  if same_secret(basic_password(req), DASH_PASSWORD) { return nil }
+  return res_text("Login required.\n", 401, {"WWW-Authenticate": "Basic realm=\"honeypot\", charset=\"UTF-8\""})
+}
+
 // the most recent `limit` grabs, newest first
 fn grabs(limit) {
   let r = pcall(read_file, FEED)
@@ -385,10 +420,11 @@ fn build_report() {
 }
 
 serve_routes({
-  "GET /": fn (req) { return res_html(PAGE) },
+  "GET /": fn (req) { let g = dash_guard(req) if g != nil { return g }  return res_html(PAGE) },
   "GET /health": fn (req) { return res_json({"ok": true}) },
   // the fleet collector: other edge nodes POST each event's JSON line here, so this node's feed is the whole fleet
   "POST /ingest": fn (req) {
+    if not fleet_ok(req) { return res_error(401, "bad or missing fleet token") }
     let line = trim(req.body)
     if line == "" { return res_error(400, "empty") }
     let p = pcall(json_parse, line)
@@ -405,8 +441,8 @@ serve_routes({
   },
   // the fleet roster: every node that has ever reported in, when it was last heard from, and whether it's still
   // sending heartbeats (client decides "stale" from last_heartbeat; see stale_after_seconds).
-  "GET /api/fleet": fn (req) { return res_json({"nodes": fleet_roster(), "stale_after_seconds": 150}) },
-  "GET /api/grabs": fn (req) {
+  "GET /api/fleet": fn (req) { let g = dash_guard(req) if g != nil { return g }  return res_json({"nodes": fleet_roster(), "stale_after_seconds": 150}) },
+  "GET /api/grabs": fn (req) { let g = dash_guard(req) if g != nil { return g } 
     let limit = int(get(req.query_params, "limit", "400"))
     let all = grabs(limit)
     let g = []
@@ -417,7 +453,7 @@ serve_routes({
     return res_json({"grabs": g, "callbacks": cb, "count": len(all)})
   },
   // the full record, for handing to someone else - a provider's abuse desk, your own counsel, or law enforcement.
-  "GET /api/export": fn (req) {
+  "GET /api/export": fn (req) { let g = dash_guard(req) if g != nil { return g } 
     let fmt = lower(get(req.query_params, "format", "json"))
     let all = all_events()
     if fmt == "csv" {
@@ -434,13 +470,14 @@ serve_routes({
     return res_download(json_stringify({"node": NODE, "generated": now_iso(), "count": len(all), "events": all}),
                         "honeypot-evidence.json")
   },
-  "GET /api/report": fn (req) { return res_download(build_report(), "honeypot-incident-report.txt") },
+  "GET /api/report": fn (req) { let g = dash_guard(req) if g != nil { return g }  return res_download(build_report(), "honeypot-incident-report.txt") },
   // real identification, on demand: who registered this address's block, their abuse contact, what it actually
   // resolves to, and whether that matches any crawler identity its user-agent claims. Passive (RDAP + reverse
   // DNS only, nothing sent to the origin itself), and cached so re-opening an origin doesn't re-query every time.
-  "GET /api/whois": fn (req) {
+  "GET /api/whois": fn (req) { let g = dash_guard(req) if g != nil { return g } 
     let ip = trim(get(req.query_params, "ip", ""))
     if ip == "" { return res_error(400, "ip required") }
+    if ip_family(ip) != "ipv4" or not ip_is_public(ip) { return res_error(400, "a public IPv4 address is required") }
     let ua = ""
     for e in grabs(2000) { if ua == "" and get(e, "origin", "") == ip { ua = get(e, "ua", "") } }
     return res_json(whois_lookup(ip, ua))

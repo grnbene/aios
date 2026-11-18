@@ -5,8 +5,8 @@ let app = {
   "main": "service.gr",
   "kind": "web",
   "port": 8577,
-  "listen": "local",
-  "settings": {"HONEYPOT_FEED": "honeypot.jsonl"},
+  "listen": "all",
+  "settings": {"HONEYPOT_FEED": "honeypot.jsonl", "FLEET_TOKEN": "", "DASH_PASSWORD": "", "AIOS_NODE": "hub"},
   "health": {"path": "/health", "ok": [200]},
   "max_steps": 0
 }

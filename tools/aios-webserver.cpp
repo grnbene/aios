@@ -111,6 +111,10 @@ struct VhostConfig {
   // dashboard then carries the whole fleet's telemetry, not just its own. /ingest dedupes by the event's own `id`
   // (apps/honeypot/service.gr:have_id), so A -> B and A -> C -> B (through a third node) doesn't double-count.
   std::vector<std::string> env_honeypot_forward;
+  // `env_honeypot_token <secret>` (or `env_honeypot_token_file <path>`): a shared fleet secret sent as the
+  // X-Fleet-Token header on every forward and heartbeat, so a hub only accepts events from its own nodes - an
+  // open /ingest would let anyone who finds the URL plant fake grabs in evidence. Never logged.
+  std::string env_honeypot_token;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -279,6 +283,19 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         ls >> cur->env_honeypot_collect_url;
       } else if (tok == "env_honeypot_collect") {
         ls >> cur->env_honeypot_collect;
+      } else if (tok == "env_honeypot_token") {
+        ls >> cur->env_honeypot_token;
+      } else if (tok == "env_honeypot_token_file") {
+        std::string path;
+        ls >> path;
+        std::ifstream tf(path);
+        std::string t;
+        if (tf && std::getline(tf, t)) {
+          while (!t.empty() && (t.back() == '\r' || t.back() == '\n' || t.back() == ' ')) t.pop_back();
+          cur->env_honeypot_token = t;
+        } else {
+          std::fprintf(stderr, "[env-honeypot] cannot read env_honeypot_token_file %s\n", path.c_str());
+        }
       } else if (tok == "env_honeypot_forward") {
         std::string u; ls >> u;
         if (!u.empty()) cur->env_honeypot_forward.push_back(u);
@@ -665,9 +682,9 @@ std::string honeypot_node_name() {
 
 // POST an event's JSON to each fleet collector, fire-and-forget: a detached thread per URL, short timeout, every
 // failure swallowed. The edge node never blocks or fails a response because a collector is slow or down.
-void forward_event(const std::vector<std::string>& urls, const std::string& json) {
+void forward_event(const std::vector<std::string>& urls, const std::string& json, const std::string& token) {
   for (const std::string& url : urls) {
-    std::thread([url, json]() {
+    std::thread([url, json, token]() {
       auto ep = aios::channel::parse_endpoint(url);
       if (!ep.ok()) return;
       // a hub that's briefly down or slow shouldn't silently drop the event: three tries, short backoff, still
@@ -679,10 +696,19 @@ void forward_event(const std::vector<std::string>& urls, const std::string& json
         req.timeout_ms = 4000;
         req.host = &hal::process_host();
         req.headers.push_back({"Content-Type", "application/json"});
+        if (!token.empty()) req.headers.push_back({"X-Fleet-Token", token});
         req.body.assign(json.begin(), json.end());
         auto r = aios::channel::http_send(req);
-        if (r.ok() && r->status < 500) return;   // delivered (2xx/4xx both mean the hub answered); 5xx/timeout -> retry
+        if (r.ok() && (r->status == 401 || r->status == 403)) {
+          // the hub answered but refused us: wrong/missing fleet token. Say so (never the token itself) - retrying won't help.
+          std::fprintf(stderr, "[env-honeypot] hub %s refused this node (HTTP %d): check env_honeypot_token matches the hub's FLEET_TOKEN\n",
+                       url.c_str(), r->status);
+          return;
+        }
+        if (r.ok() && r->status < 500) return;   // delivered; 5xx/timeout -> retry
         if (attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+        else std::fprintf(stderr, "[env-honeypot] could not deliver to hub %s after 3 tries (%s)\n", url.c_str(),
+                          r.ok() ? ("HTTP " + std::to_string(r->status)).c_str() : r.error().message.c_str());
       }
     }).detach();
   }
@@ -766,7 +792,7 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
     j += (i ? "," : "") + std::string("{\"") + json_escape(e.origin.hops[i].first) + "\":\"" + json_escape(e.origin.hops[i].second) + "\"}";
   j += "]}\n";
   if (!vh.env_honeypot_feed.empty()) hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
-  if (!vh.env_honeypot_forward.empty()) forward_event(vh.env_honeypot_forward, j);
+  if (!vh.env_honeypot_forward.empty()) forward_event(vh.env_honeypot_forward, j, vh.env_honeypot_token);
 }
 
 // The bait's callback has landed: the attacker's own tooling, validating the stolen canary creds, connected to a URL
@@ -1729,6 +1755,8 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot_collect_url <base>  # decoy's bait callback: embeds <base>/<canary> as its API endpoint\n"
       "    env_honeypot_collect <prefix>    # a request under this prefix IS a callback: record its full telemetry\n"
       "    env_honeypot_forward <url>       # POST each event to a fleet collector (repeatable); whole-fleet view\n"
+      "    env_honeypot_token <secret>      # shared fleet secret, sent as X-Fleet-Token on every forward/heartbeat\n"
+      "    env_honeypot_token_file <path>   # same, read from a file (keeps the secret out of the config)\n"
       "    honeypot_path <regex>            # any path matching is bait too, not just .env (repeatable)\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
@@ -1767,7 +1795,7 @@ int aios_webserver_run(int argc, char** argv) {
         std::string j = "{\"kind\":\"honeypot.heartbeat\",\"t\":\"" + std::string(iso) + "\",\"node\":\"" +
                         json_escape(honeypot_node_name()) + "\",\"forward_count\":" +
                         std::to_string(vhp->env_honeypot_forward.size()) + "}\n";
-        forward_event(vhp->env_honeypot_forward, j);
+        forward_event(vhp->env_honeypot_forward, j, vhp->env_honeypot_token);
         std::this_thread::sleep_for(std::chrono::seconds(60));
       }
     }).detach();
