@@ -1,0 +1,148 @@
+// markers_find / marker_image / camera_pose / camera_project / camera_ray (src/userland/grain_std_carve.cpp).
+// A printed mat - A4 paper with coded markers 0..3 at its corners - is drawn with r3d_draw from cameras whose
+// position and focal length are known; what is found and solved is checked against them.
+fn check(c, msg) { assert_true(c, msg) }
+fn sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+fn cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+fn unit(a) { let l = sqrt(dot(a, a)) return [a[0] / l, a[1] / l, a[2] / l] }
+
+// ---- the mat (mm; z up out of the paper, y up the page) ----
+let S = 50.0
+let MARKERS = [{"id": 0, "x": -100.0, "y": 92.0}, {"id": 1, "x": 50.0, "y": 92.0}, {"id": 2, "x": 50.0, "y": -142.0}, {"id": 3, "x": -100.0, "y": -142.0}]
+// a marker's cells, read off its own picture: 1 white
+fn cells(id) {
+  let img = marker_image(id, 60)
+  let out = []
+  for cy in 0..6 {
+    let row = []
+    for cx in 0..6 { push(row, (canvas_get_pixel(img, 10 + cx * 10 + 5, 10 + cy * 10 + 5) & 255) > 128 ? 1 : 0) }
+    push(out, row)
+  }
+  return out
+}
+// a marker's own corners (top left, top right, bottom right, bottom left as printed) on the mat
+fn corners_of(m) { return [[m.x, m.y + S, 0], [m.x + S, m.y + S, 0], [m.x + S, m.y, 0], [m.x, m.y, 0]] }
+fn quad(tris, a, b, c, d, col) {
+  push(tris, {"p": [a, b, c], "col": col})
+  push(tris, {"p": [a, c, d], "col": col})
+}
+let world = []
+quad(world, [-105.0, -148.5, 0.0], [105.0, -148.5, 0.0], [105.0, 148.5, 0.0], [-105.0, 148.5, 0.0], 0xEEEBE3)
+for m in MARKERS {
+  let g = cells(m.id)
+  let k = S / 6.0
+  for cy in 0..6 {
+    for cx in 0..6 {
+      if g[cy][cx] == 1 { continue }
+      let x0 = m.x + cx * k
+      let y1 = m.y + S - cy * k
+      quad(world, [x0, y1 - k, 0.3], [x0 + k, y1 - k, 0.3], [x0 + k, y1, 0.3], [x0, y1, 0.3], 0x101010)
+    }
+  }
+}
+
+// ---- a photo from camera position C looking at target T, horizontal field of view fov ----
+let W = 1280
+let H = 960
+fn photo(C, T, fov) {
+  let f = unit(sub(T, C))
+  let r = unit(cross(f, [0.0, 0.0, 1.0]))
+  let u = cross(r, f)
+  let rows = []
+  for tri in world {
+    let row = {"col": tri.col}
+    for i in 0..3 {
+      let d = sub(tri.p[i], C)
+      row["x" + str(i)] = dot(d, r)
+      row["y" + str(i)] = dot(d, u)
+      row["z" + str(i)] = dot(d, f)
+    }
+    push(rows, row)
+  }
+  let t = r3d_target(W, H)
+  r3d_clear(t, 0x6A655C)
+  r3d_draw(t, rows, fov)
+  let cv = canvas_create(W, H)
+  canvas_set_pixels(cv, r3d_pixels(t))
+  return cv
+}
+fn true_focal(fov) { return (W / 2.0) / tan(fov * PI / 360.0) }
+
+// the solve from one photo: every marker found, its corners matched to the mat's
+fn solve(cv, opts) {
+  let found = markers_find(cv)
+  let wp = []
+  let ip = []
+  let ids = []
+  for fm in found {
+    for m in MARKERS {
+      if m.id == fm.id {
+        push(ids, fm.id)
+        let wc = corners_of(m)
+        for i in 0..4 { push(wp, [wc[i][0], wc[i][1]]) push(ip, fm.corners[i]) }
+      }
+    }
+  }
+  return {"ids": ids, "cam": len(wp) >= 4 ? camera_pose(wp, ip, W, H, opts) : nil}
+}
+
+let views = [
+  {"C": [0.0, -420.0, 380.0], "fov": 60.0, "name": "from the front, 42 degrees up"},
+  {"C": [380.0, 200.0, 300.0], "fov": 60.0, "name": "from the right and behind"},
+  {"C": [-300.0, -250.0, 220.0], "fov": 50.0, "name": "low from the left, a longer lens"},
+  {"C": [150.0, -350.0, 520.0], "fov": 70.0, "name": "high, a wide lens"}
+]
+let worst_f = 0.0
+let worst_pos = 0.0
+for v in views {
+  let cv = photo(v.C, [0.0, 0.0, 0.0], v.fov)
+  let r = solve(cv, {})
+  check(len(r.ids) == 4, format("{}: all four markers found by id: {}", v.name, r.ids))
+  let ft = true_focal(v.fov)
+  let ferr = abs(r.cam.focal - ft) / ft
+  let perr = sqrt(dot(sub(r.cam.pos, v.C), sub(r.cam.pos, v.C)))
+  worst_f = max(worst_f, ferr)
+  worst_pos = max(worst_pos, perr / sqrt(dot(v.C, v.C)))
+  check(ferr < 0.02, format("{}: focal {:.1f} px against {:.1f}", v.name, r.cam.focal, ft))
+  check(perr / sqrt(dot(v.C, v.C)) < 0.02, format("{}: camera at {} against {} ({:.1f} mm off)", v.name, r.cam.pos, v.C, perr))
+  check(r.cam.rms_px < 1.5, format("{}: corners reproject within {:.2f} px", v.name, r.cam.rms_px))
+  // the solved camera puts a point of the mat where the picture has it, and its ray goes back through it
+  let p = camera_project(r.cam, [[0.0, 0.0, 0.0]])[0]
+  let ray = camera_ray(r.cam, p)
+  let tt = -ray.from[2] / ray.dir[2]
+  check(abs(ray.from[0] + ray.dir[0] * tt) < 2.0 and abs(ray.from[1] + ray.dir[1] * tt) < 2.0, "camera_ray back through camera_project meets the mat's centre")
+}
+print(format("worst focal error {:.2f}%, worst camera position error {:.2f}% of its distance", worst_f * 100.0, worst_pos * 100.0))
+
+// one marker alone, the focal length known: still a pose
+let one = photo([200.0, -300.0, 350.0], [0.0, 0.0, 0.0], 60.0)
+let fm = markers_find(one)
+let m0 = nil
+for m in fm { if m.id == 2 { m0 = m } }
+check(m0 != nil, "marker 2 found on its own")
+let wc = corners_of(MARKERS[2])
+let cam1 = camera_pose([[wc[0][0], wc[0][1]], [wc[1][0], wc[1][1]], [wc[2][0], wc[2][1]], [wc[3][0], wc[3][1]]], m0.corners, W, H, {"focal": true_focal(60.0)})
+let e1 = sqrt(dot(sub(cam1.pos, [200.0, -300.0, 350.0]), sub(cam1.pos, [200.0, -300.0, 350.0])))
+check(e1 < 15.0, format("one 50 mm marker and a known lens: camera within {:.1f} mm at 0.5 m", e1))
+
+// each marker reads as itself, its top-left corner its own (the mats above, seen from behind, are the turned case)
+for id in [0, 5, 17, 30] {
+  let img = marker_image(id, 120)
+  let big = canvas_create(400, 400)
+  canvas_set_fill_color(big, "#ffffff")
+  canvas_fill_rect(big, 0, 0, 400, 400)
+  canvas_draw_image(big, img, 120, 120)
+  let got = markers_find(big)
+  check(len(got) == 1 and got[0].id == id, format("marker {} reads as itself: {}", id, got))
+  // its top-left corner is its own: the printed top left
+  check(abs(got[0].corners[0][0] - 140) < 2 and abs(got[0].corners[0][1] - 140) < 2, format("marker {}: its top-left corner {}", id, got[0].corners[0]))
+}
+check(!try_call(marker_image, 31, 60).ok, "ids are 0 to 30")
+let blank = canvas_create(300, 200)
+canvas_set_fill_color(blank, "#ffffff")
+canvas_fill_rect(blank, 0, 0, 300, 200)
+canvas_set_fill_color(blank, "#000000")
+canvas_fill_rect(blank, 100, 50, 80, 80)
+check(len(markers_find(blank)) == 0, "a black square is no coded marker")
+print("PASS: test_cameras")

@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -1244,12 +1245,12 @@ double quad_area(const P2* q) {
   return std::fabs(a) / 2;
 }
 
-Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
-  uint32_t W = 0, H = 0;
-  const std::vector<uint32_t>* px = nullptr;
-  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_find_marker")) return Value::nil();
-  MapObj* o = opts_map(args, 1);
-  const int max_side = (int)std::clamp(opt_num(o, "max_side", 1200), 128.0, 4096.0);
+// A dark quadrilateral with holes in it (a printed marker of either kind): its corners in the picture's pixels,
+// clockwise from the top left, refined along each side; how much of it its holes are, how far off its centre they
+// sit, and whether they are bright (the paper's white) against it.
+struct DarkQuad { P2 c[4]; double side = 0, fill = 0, hole_share = 0, off = 0; bool bright = false; };
+
+std::vector<DarkQuad> find_dark_quads(const std::vector<uint32_t>* px, uint32_t W, uint32_t H, int max_side) {
   const double sc = std::max(1.0, (double)std::max(W, H) / max_side);
   const int w = std::max(8, (int)std::lround(W / sc)), h = std::max(8, (int)std::lround(H / sc));
   const size_t n = (size_t)w * h;
@@ -1305,8 +1306,7 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
   std::vector<int> lab;
   std::vector<size_t> sizes;
   label_pieces(dark, w, h, lab, sizes);
-  struct Cand { P2 c[4]; double score; double side; };
-  std::vector<Cand> cands;
+  std::vector<DarkQuad> out;
   for (size_t id = 0; id < sizes.size(); ++id) {
     if (sizes[id] < std::max<size_t>(64, n / 4000)) continue;
     // its bounding box, a cell bigger
@@ -1350,7 +1350,7 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
     if (hole < 16 || edge.size() < 16) continue;
     cx /= sizes[id]; cy /= sizes[id]; hx /= hole; hy /= hole;
     // the hole is the print's white: well lighter than its ring
-    if (hole_g / hole < piece_g / sizes[id] + 40.0) continue;
+    const bool bright = hole_g / hole >= piece_g / sizes[id] + 40.0;
     // the quadrilateral: the edge point farthest from the centre, the one farthest from it, then the farthest from
     // that diagonal on either side
     P2 q[4];
@@ -1369,8 +1369,8 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
     const double fill = (sizes[id] + hole) / qa;
     const double hole_share = hole / qa;
     const double off = std::hypot(hx - cx, hy - cy) / std::sqrt(qa);
-    // a filled square with a centred hole of about a quarter: not a tire, not a shadow, not text
-    if (fill < 0.85 || fill > 1.15 || hole_share < 0.13 || hole_share > 0.42 || off > 0.12) continue;
+    // a filled quadrilateral (its holes in it): not a tire, not a shadow, not text
+    if (fill < 0.85 || fill > 1.15) continue;
     // each side refined: a line through the edge points nearest it, away from the corners
     P2 at[4], dir[4];
     bool ok = true;
@@ -1407,10 +1407,33 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
     std::sort(rq, rq + 4, [&](const P2& a, const P2& b) { return std::atan2(a.y - ccy, a.x - ccx) < std::atan2(b.y - ccy, b.x - ccx); });
     int tl = 0;
     for (int i = 1; i < 4; ++i) if (rq[i].x + rq[i].y < rq[tl].x + rq[tl].y) tl = i;
+    DarkQuad dq;
+    for (int i = 0; i < 4; ++i) dq.c[i] = rq[(tl + i) % 4];
+    dq.side = std::sqrt(quad_area(dq.c));
+    dq.fill = fill;
+    dq.hole_share = hole_share;
+    dq.off = off;
+    dq.bright = bright;
+    out.push_back(dq);
+  }
+  return out;
+}
+
+Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_find_marker")) return Value::nil();
+  MapObj* o = opts_map(args, 1);
+  const int max_side = (int)std::clamp(opt_num(o, "max_side", 1200), 128.0, 4096.0);
+  // the bin marker: a filled square with one bright centred hole of about a quarter
+  struct Cand { P2 c[4]; double score; double side; };
+  std::vector<Cand> cands;
+  for (const DarkQuad& d : find_dark_quads(px, W, H, max_side)) {
+    if (!d.bright || d.hole_share < 0.13 || d.hole_share > 0.42 || d.off > 0.12) continue;
     Cand cd;
-    for (int i = 0; i < 4; ++i) cd.c[i] = rq[(tl + i) % 4];
-    cd.side = std::sqrt(quad_area(cd.c));
-    cd.score = (1.0 - std::fabs(fill - 1.0)) * (1.0 - std::fabs(hole_share - 0.25)) * (1.0 - off);
+    for (int i = 0; i < 4; ++i) cd.c[i] = d.c[i];
+    cd.side = d.side;
+    cd.score = (1.0 - std::fabs(d.fill - 1.0)) * (1.0 - std::fabs(d.hole_share - 0.25)) * (1.0 - d.off);
     cands.push_back(cd);
   }
   if (cands.empty()) return Value::nil();
@@ -1425,6 +1448,462 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
   res->put("score", Value::real(best.score));
   res->put("found", Value::integer((int64_t)cands.size()));
   return Value::object(Type::Map, res);
+}
+
+// ---- coded markers ------------------------------------------------------------------------------------------
+//
+// A marker that says which it is and which way up: 6 x 6 cells, the outer ring black, the inner 4 x 4 a code (1 a
+// white cell) from a dictionary made here - each code differs from every other in every rotation by 5 cells or more
+// and from its own rotations by 4 or more, so a misread cell is corrected and no marker is taken for another or
+// turned. Ids 0 to 30 (the 31 codes the search finds).
+
+int rot16(int code) {   // the inner 4 x 4 turned a quarter counter-clockwise: new[y][x] = old[x][3 - y]
+  int out = 0;
+  for (int y = 0; y < 4; ++y)
+    for (int x = 0; x < 4; ++x)
+      if (code >> (x * 4 + (3 - y)) & 1) out |= 1 << (y * 4 + x);
+  return out;
+}
+int hamming16(int a, int b) { return __builtin_popcount((unsigned)(a ^ b) & 0xFFFF); }
+
+const std::vector<int>& marker_codes() {
+  static const std::vector<int> codes = [] {
+    std::vector<int> out;
+    uint32_t x = 2463534242u;   // a fixed walk through the 16-bit codes (xorshift), so the dictionary never changes
+    for (int tries = 0; tries < 200000 && out.size() < 31; ++tries) {
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      const int c = (int)(x & 0xFFFF);
+      const int ones = __builtin_popcount((unsigned)c);
+      if (ones < 5 || ones > 11) continue;
+      int r = c, self = 99;
+      for (int k = 1; k < 4; ++k) { r = rot16(r); self = std::min(self, hamming16(c, r)); }
+      if (self < 4) continue;
+      bool ok = true;
+      for (int o : out) {
+        int ro = o;
+        for (int k = 0; k < 4 && ok; ++k) { if (hamming16(c, ro) < 5) ok = false; ro = rot16(ro); }
+        if (!ok) break;
+      }
+      if (ok) out.push_back(c);
+    }
+    return out;
+  }();
+  return codes;
+}
+
+double luma_at(const std::vector<uint32_t>& px, uint32_t W, uint32_t H, double x, double y) {
+  x = std::clamp(x - 0.5, 0.0, (double)W - 1); y = std::clamp(y - 0.5, 0.0, (double)H - 1);
+  const int x0 = (int)x, y0 = (int)y, x1 = std::min<int>(x0 + 1, W - 1), y1 = std::min<int>(y0 + 1, H - 1);
+  const double tx = x - x0, ty = y - y0;
+  auto l = [&](int xx, int yy) { const uint32_t p = px[(size_t)yy * W + xx]; return 0.299 * ((p >> 16) & 255) + 0.587 * ((p >> 8) & 255) + 0.114 * (p & 255); };
+  return (l(x0, y0) * (1 - tx) + l(x1, y0) * tx) * (1 - ty) + (l(x0, y1) * (1 - tx) + l(x1, y1) * tx) * ty;
+}
+
+Value bi_markers_find(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "markers_find")) return Value::nil();
+  MapObj* o = opts_map(args, 1);
+  const int max_side = (int)std::clamp(opt_num(o, "max_side", 1600), 128.0, 4096.0);
+  const auto& codes = marker_codes();
+  struct Found { int id; P2 c[4]; double side; int errors; };
+  std::vector<Found> found;
+  for (const DarkQuad& d : find_dark_quads(px, W, H, max_side)) {
+    if (d.hole_share < 0.04 || d.side < 12) continue;
+    // the 6 x 6 cells read through the homography from the unit square onto the quadrilateral: each the mean of
+    // nine samples about its middle
+    const P2 unit[4] = {{0, 0}, {6, 0}, {6, 6}, {0, 6}};
+    double M[9];
+    if (!solve_homography(unit, d.c, M)) continue;
+    double cell[36], lo = 1e9, hi = -1e9;
+    for (int cy = 0; cy < 6; ++cy)
+      for (int cx = 0; cx < 6; ++cx) {
+        double sum = 0;
+        for (int sy = -1; sy <= 1; ++sy)
+          for (int sx = -1; sx <= 1; ++sx) {
+            const P2 q = apply_h(M, {cx + 0.5 + sx * 0.22, cy + 0.5 + sy * 0.22});
+            sum += luma_at(*px, W, H, q.x, q.y);
+          }
+        cell[cy * 6 + cx] = sum / 9;
+        lo = std::min(lo, cell[cy * 6 + cx]); hi = std::max(hi, cell[cy * 6 + cx]);
+      }
+    if (hi - lo < 40) continue;
+    const double t = (lo + hi) / 2;
+    int ring_white = 0, bits = 0;
+    for (int cy = 0; cy < 6; ++cy)
+      for (int cx = 0; cx < 6; ++cx) {
+        const bool white = cell[cy * 6 + cx] > t;
+        if (cx == 0 || cy == 0 || cx == 5 || cy == 5) { ring_white += white; continue; }
+        if (white) bits |= 1 << ((cy - 1) * 4 + (cx - 1));
+      }
+    if (ring_white > 1) continue;
+    // which code, and turned how far: the observed cells turned k quarters counter-clockwise match it
+    int best_id = -1, best_k = 0, best_e = 99, r = bits;
+    for (int k = 0; k < 4; ++k) {
+      for (size_t i = 0; i < codes.size(); ++i) {
+        const int e = hamming16(r, codes[i]);
+        if (e < best_e) { best_e = e; best_id = (int)i; best_k = k; }
+      }
+      r = rot16(r);
+    }
+    if (best_id < 0 || best_e > 1) continue;
+    Found f;
+    f.id = best_id;
+    // the marker's own top-left is the observed corner k (turning counter-clockwise brings corner k to the top left)
+    for (int i = 0; i < 4; ++i) f.c[i] = d.c[(best_k + i) % 4];
+    f.side = d.side;
+    f.errors = best_e + ring_white;
+    found.push_back(f);
+  }
+  // one per id: the biggest (a marker seen twice is a reflection or a second print)
+  std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.id != b.id ? a.id < b.id : a.side > b.side; });
+  std::vector<Value> out;
+  int last = -1;
+  for (const Found& f : found) {
+    if (f.id == last) continue;
+    last = f.id;
+    auto m = std::make_shared<MapObj>();
+    m->put("id", Value::integer(f.id));
+    m->put("corners", points_value(std::vector<P2>(f.c, f.c + 4)));
+    double mx = 0, my = 0;
+    for (const P2& p : f.c) { mx += p.x / 4; my += p.y / 4; }
+    m->put("centre", Value::list({Value::real(mx), Value::real(my)}));
+    m->put("side_px", Value::real(f.side));
+    m->put("errors", Value::integer(f.errors));
+    out.push_back(Value::object(Type::Map, m));
+  }
+  return Value::list(std::move(out));
+}
+
+// marker_image(id, px) -> canvas: the coded marker `id`, px pixels across its black square, with a white margin of
+// a cell all round (what has to be printed: the white ring is part of it)
+Value bi_marker_image(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_number(args[0], error, "marker_image") || !want_number(args[1], error, "marker_image")) return Value::nil();
+  const auto& codes = marker_codes();
+  const int64_t id = args[0].as_int(), side = args[1].as_int();
+  if (id < 0 || id >= (int64_t)codes.size()) { error = "marker_image(): ids are 0 to " + std::to_string(codes.size() - 1); return Value::nil(); }
+  if (side < 12 || side > 8192) { error = "marker_image(): the square is 12 to 8192 pixels"; return Value::nil(); }
+  const double cellpx = side / 6.0;
+  const int margin = (int)std::lround(cellpx), total = (int)side + 2 * margin;
+  std::vector<uint32_t> px((size_t)total * total, 0xFFFFFFFFu);
+  for (int y = 0; y < (int)side; ++y)
+    for (int x = 0; x < (int)side; ++x) {
+      const int cx = std::min(5, (int)(x / cellpx)), cy = std::min(5, (int)(y / cellpx));
+      bool white = false;
+      if (cx > 0 && cy > 0 && cx < 5 && cy < 5) white = codes[(size_t)id] >> ((cy - 1) * 4 + (cx - 1)) & 1;
+      px[(size_t)(y + margin) * total + x + margin] = white ? 0xFFFFFFFFu : 0xFF000000u;
+    }
+  return canvas_value((uint32_t)total, (uint32_t)total, std::move(px));
+}
+
+// ---- cameras ----------------------------------------------------------------------------------------------------
+//
+// A pinhole camera: a world point X goes to the camera's frame as R X + t (x right, y down, z ahead in the picture's
+// sense) and to the picture at (cx + f x / z, cy + f y / z).
+
+struct Cam { double f = 1, cx = 0, cy = 0, R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, t[3] = {0, 0, 0}; };
+
+void rodrigues(const double v[3], double R[9]) {
+  const double th = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (th < 1e-12) { const double I[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; std::memcpy(R, I, sizeof I); return; }
+  const double x = v[0] / th, y = v[1] / th, z = v[2] / th, c = std::cos(th), s = std::sin(th), C = 1 - c;
+  const double M[9] = {c + x * x * C, x * y * C - z * s, x * z * C + y * s,
+                       y * x * C + z * s, c + y * y * C, y * z * C - x * s,
+                       z * x * C - y * s, z * y * C + x * s, c + z * z * C};
+  std::memcpy(R, M, sizeof M);
+}
+void rodrigues_of(const double R[9], double v[3]) {
+  const double c = std::clamp((R[0] + R[4] + R[8] - 1) / 2, -1.0, 1.0), th = std::acos(c);
+  if (th < 1e-9) { v[0] = v[1] = v[2] = 0; return; }
+  if (std::fabs(th - M_PI) < 1e-6) {
+    // a half turn: the axis from the diagonal
+    double x = std::sqrt(std::max(0.0, (R[0] + 1) / 2)), y = std::sqrt(std::max(0.0, (R[4] + 1) / 2)), z = std::sqrt(std::max(0.0, (R[8] + 1) / 2));
+    if (R[1] < 0) y = -y;
+    if (R[2] < 0) z = -z;
+    v[0] = x * th; v[1] = y * th; v[2] = z * th;
+    return;
+  }
+  const double k = th / (2 * std::sin(th));
+  v[0] = (R[7] - R[5]) * k; v[1] = (R[2] - R[6]) * k; v[2] = (R[3] - R[1]) * k;
+}
+bool project(const Cam& c, const double X[3], P2* out, double* depth = nullptr) {
+  const double x = c.R[0] * X[0] + c.R[1] * X[1] + c.R[2] * X[2] + c.t[0];
+  const double y = c.R[3] * X[0] + c.R[4] * X[1] + c.R[5] * X[2] + c.t[1];
+  const double z = c.R[6] * X[0] + c.R[7] * X[1] + c.R[8] * X[2] + c.t[2];
+  if (depth) *depth = z;
+  if (z <= 1e-9) return false;
+  *out = {c.cx + c.f * x / z, c.cy + c.f * y / z};
+  return true;
+}
+
+// the homography from plane points to picture points by least squares (normalized; h33 = 1)
+bool fit_homography(const std::vector<P2>& a, const std::vector<P2>& b, double H[9]) {
+  const size_t n = a.size();
+  if (n < 4 || b.size() != n) return false;
+  auto norm = [](const std::vector<P2>& p, double T[3]) {
+    double mx = 0, my = 0;
+    for (const P2& q : p) { mx += q.x; my += q.y; }
+    mx /= p.size(); my /= p.size();
+    double d = 0;
+    for (const P2& q : p) d += std::hypot(q.x - mx, q.y - my);
+    d /= p.size();
+    const double s = d > 0 ? std::sqrt(2.0) / d : 1;
+    T[0] = s; T[1] = -s * mx; T[2] = -s * my;
+  };
+  double Ta[3], Tb[3];
+  norm(a, Ta); norm(b, Tb);
+  double AtA[8][8] = {{0}}, Atb[8] = {0};
+  for (size_t i = 0; i < n; ++i) {
+    const double x = Ta[0] * a[i].x + Ta[1], y = Ta[0] * a[i].y + Ta[2], u = Tb[0] * b[i].x + Tb[1], v = Tb[0] * b[i].y + Tb[2];
+    const double r0[8] = {x, y, 1, 0, 0, 0, -u * x, -u * y}, r1[8] = {0, 0, 0, x, y, 1, -v * x, -v * y};
+    for (int p = 0; p < 8; ++p) {
+      for (int q = 0; q < 8; ++q) AtA[p][q] += r0[p] * r0[q] + r1[p] * r1[q];
+      Atb[p] += r0[p] * u + r1[p] * v;
+    }
+  }
+  double M[8][9];
+  for (int p = 0; p < 8; ++p) { for (int q = 0; q < 8; ++q) M[p][q] = AtA[p][q]; M[p][8] = Atb[p]; }
+  for (int c = 0; c < 8; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < 8; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+    if (std::fabs(M[piv][c]) < 1e-14) return false;
+    if (piv != c) for (int k = 0; k < 9; ++k) std::swap(M[c][k], M[piv][k]);
+    for (int r = 0; r < 8; ++r) {
+      if (r == c) continue;
+      const double f = M[r][c] / M[c][c];
+      for (int k = c; k < 9; ++k) M[r][k] -= f * M[c][k];
+    }
+  }
+  double Hn[9];
+  for (int i = 0; i < 8; ++i) Hn[i] = M[i][8] / M[i][i];
+  Hn[8] = 1;
+  // undo the normalizations: H = Tb^-1 Hn Ta
+  const double TaM[9] = {Ta[0], 0, Ta[1], 0, Ta[0], Ta[2], 0, 0, 1};
+  const double TbI[9] = {1 / Tb[0], 0, -Tb[1] / Tb[0], 0, 1 / Tb[0], -Tb[2] / Tb[0], 0, 0, 1};
+  double T1[9];
+  for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) { T1[r * 3 + c] = 0; for (int k = 0; k < 3; ++k) T1[r * 3 + c] += Hn[r * 3 + k] * TaM[k * 3 + c]; }
+  for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) { H[r * 3 + c] = 0; for (int k = 0; k < 3; ++k) H[r * 3 + c] += TbI[r * 3 + k] * T1[k * 3 + c]; }
+  for (int i = 0; i < 9; ++i) H[i] /= H[8];
+  return true;
+}
+
+// the focal length a plane's homography implies (the principal point at cx, cy; square pixels): from the two
+// orthonormality conditions on its first two columns, each where it is well conditioned; 0 when neither is
+double focal_of(const double H0[9], double cx, double cy) {
+  double H[9];
+  // move the principal point to the origin
+  for (int c = 0; c < 3; ++c) { H[c] = H0[c] - cx * H0[6 + c]; H[3 + c] = H0[3 + c] - cy * H0[6 + c]; H[6 + c] = H0[6 + c]; }
+  double num = 0, den = 0;
+  const double d1 = H[6] * H[7], n1 = -(H[0] * H[1] + H[3] * H[4]);
+  const double d2 = H[6] * H[6] - H[7] * H[7], n2 = -(H[0] * H[0] + H[3] * H[3] - H[1] * H[1] - H[4] * H[4]);
+  // each condition says f^2 * d = n: combined by least squares
+  num = n1 * d1 + n2 * d2;
+  den = d1 * d1 + d2 * d2;
+  if (den <= 1e-30) return 0;
+  const double f2 = num / den;
+  return f2 > 0 ? std::sqrt(f2) : 0;
+}
+
+// a camera's pose from the homography of a plane (z = 0) and its focal length
+bool pose_from_h(const double H[9], Cam& c) {
+  // K^-1 H
+  double A[9];
+  for (int k = 0; k < 3; ++k) {
+    A[k] = (H[k] - c.cx * H[6 + k]) / c.f;
+    A[3 + k] = (H[3 + k] - c.cy * H[6 + k]) / c.f;
+    A[6 + k] = H[6 + k];
+  }
+  const double l1 = std::sqrt(A[0] * A[0] + A[3] * A[3] + A[6] * A[6]), l2 = std::sqrt(A[1] * A[1] + A[4] * A[4] + A[7] * A[7]);
+  if (l1 < 1e-12 || l2 < 1e-12) return false;
+  double lam = 2.0 / (l1 + l2);
+  if (A[8] * lam < 0) lam = -lam;   // the plane in front of the camera
+  double r1[3] = {A[0] * lam, A[3] * lam, A[6] * lam}, r2[3] = {A[1] * lam, A[4] * lam, A[7] * lam};
+  // made orthonormal: the two columns' bisector and its perpendicular in their plane
+  auto nrm = [](double* v) { const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); for (int i = 0; i < 3; ++i) v[i] /= l; };
+  double r3[3] = {r1[1] * r2[2] - r1[2] * r2[1], r1[2] * r2[0] - r1[0] * r2[2], r1[0] * r2[1] - r1[1] * r2[0]};
+  nrm(r3);
+  double a[3] = {r1[0] + r2[0], r1[1] + r2[1], r1[2] + r2[2]};
+  nrm(a);
+  double b[3] = {r3[1] * a[2] - r3[2] * a[1], r3[2] * a[0] - r3[0] * a[2], r3[0] * a[1] - r3[1] * a[0]};
+  nrm(b);
+  for (int i = 0; i < 3; ++i) { r1[i] = (a[i] - b[i]) / std::sqrt(2.0); r2[i] = (a[i] + b[i]) / std::sqrt(2.0); }
+  for (int i = 0; i < 3; ++i) { c.R[i * 3] = r1[i]; c.R[i * 3 + 1] = r2[i]; c.R[i * 3 + 2] = r3[i]; c.t[i] = A[i * 3 + 2] * lam; }
+  return true;
+}
+
+// reprojection refined by Levenberg-Marquardt over rotation, translation and (unless fixed) the focal length
+double refine_camera(Cam& c, const std::vector<std::array<double, 3>>& X, const std::vector<P2>& u, bool free_f) {
+  const int np = free_f ? 7 : 6;
+  auto params = [&](double* p) { rodrigues_of(c.R, p); p[3] = c.t[0]; p[4] = c.t[1]; p[5] = c.t[2]; if (free_f) p[6] = c.f; };
+  auto apply = [&](const double* p, Cam& o) { o = c; rodrigues(p, o.R); o.t[0] = p[3]; o.t[1] = p[4]; o.t[2] = p[5]; if (free_f) o.f = p[6]; };
+  auto resid = [&](const Cam& o, std::vector<double>& r) {
+    r.resize(u.size() * 2);
+    double e = 0;
+    for (size_t i = 0; i < u.size(); ++i) {
+      P2 q;
+      if (!project(o, X[i].data(), &q)) q = {1e6, 1e6};
+      r[i * 2] = q.x - u[i].x; r[i * 2 + 1] = q.y - u[i].y;
+      e += r[i * 2] * r[i * 2] + r[i * 2 + 1] * r[i * 2 + 1];
+    }
+    return e;
+  };
+  double p[7];
+  params(p);
+  std::vector<double> r, r2;
+  Cam cur;
+  apply(p, cur);
+  double e = resid(cur, r), lam = 1e-3;
+  for (int it = 0; it < 60; ++it) {
+    // the Jacobian by central differences
+    std::vector<std::vector<double>> J(np, std::vector<double>(r.size()));
+    for (int k = 0; k < np; ++k) {
+      const double h = k < 3 ? 1e-6 : (k < 6 ? 1e-4 * std::max(1.0, std::fabs(p[k])) : 1e-3 * std::max(1.0, p[k]));
+      double pp[7], pm[7];
+      std::memcpy(pp, p, sizeof pp); std::memcpy(pm, p, sizeof pm);
+      pp[k] += h; pm[k] -= h;
+      Cam a, b;
+      apply(pp, a); apply(pm, b);
+      std::vector<double> ra, rb;
+      resid(a, ra); resid(b, rb);
+      for (size_t i = 0; i < r.size(); ++i) J[k][i] = (ra[i] - rb[i]) / (2 * h);
+    }
+    double A[7][8];
+    for (int a = 0; a < np; ++a) {
+      for (int b = 0; b < np; ++b) { A[a][b] = 0; for (size_t i = 0; i < r.size(); ++i) A[a][b] += J[a][i] * J[b][i]; }
+      A[a][np] = 0;
+      for (size_t i = 0; i < r.size(); ++i) A[a][np] -= J[a][i] * r[i];
+    }
+    bool improved = false;
+    for (int tries = 0; tries < 8 && !improved; ++tries) {
+      double M[7][8];
+      for (int a = 0; a < np; ++a) { for (int b = 0; b <= np; ++b) M[a][b] = A[a][b]; M[a][a] *= 1 + lam; }
+      bool ok = true;
+      for (int col = 0; col < np && ok; ++col) {
+        int piv = col;
+        for (int rr = col + 1; rr < np; ++rr) if (std::fabs(M[rr][col]) > std::fabs(M[piv][col])) piv = rr;
+        if (std::fabs(M[piv][col]) < 1e-18) { ok = false; break; }
+        if (piv != col) for (int k = 0; k <= np; ++k) std::swap(M[col][k], M[piv][k]);
+        for (int rr = 0; rr < np; ++rr) {
+          if (rr == col) continue;
+          const double f = M[rr][col] / M[col][col];
+          for (int k = col; k <= np; ++k) M[rr][k] -= f * M[col][k];
+        }
+      }
+      if (!ok) { lam *= 10; continue; }
+      double pn[7];
+      for (int a = 0; a < np; ++a) pn[a] = p[a] + M[a][np] / M[a][a];
+      if (free_f && pn[6] <= 1) { lam *= 10; continue; }
+      Cam o;
+      apply(pn, o);
+      const double en = resid(o, r2);
+      if (en < e) { std::memcpy(p, pn, sizeof pn); e = en; r = r2; lam = std::max(1e-9, lam / 10); improved = true; }
+      else lam *= 10;
+    }
+    if (!improved) break;
+  }
+  apply(p, c);
+  return std::sqrt(e / std::max<size_t>(1, u.size()));
+}
+
+bool read_cam(const Value& v, Cam& c, std::string& error, const char* who) {
+  MapObj* m = v.type == Type::Map ? static_cast<MapObj*>(v.obj.get()) : nullptr;
+  auto num = [&](const char* k, double* out) { const Value* x = m ? m->find(k) : nullptr; if (!x || !x->is_number()) return false; *out = x->as_double(); return true; };
+  auto arr = [&](const char* k, double* out, size_t n) {
+    const Value* x = m ? m->find(k) : nullptr;
+    if (!x || x->type != Type::List || x->list_items().size() != n) return false;
+    for (size_t i = 0; i < n; ++i) { if (!x->list_items()[i].is_number()) return false; out[i] = x->list_items()[i].as_double(); }
+    return true;
+  };
+  if (!num("focal", &c.f) || !num("cx", &c.cx) || !num("cy", &c.cy) || !arr("rot", c.R, 9) || !arr("t", c.t, 3)) {
+    error = std::string(who) + "() wants a camera: {focal, cx, cy, rot (9 numbers), t (3)} as camera_pose gives";
+    return false;
+  }
+  return true;
+}
+Value cam_value(const Cam& c, double rms) {
+  auto m = std::make_shared<MapObj>();
+  m->put("focal", Value::real(c.f));
+  m->put("cx", Value::real(c.cx));
+  m->put("cy", Value::real(c.cy));
+  std::vector<Value> R, t, pos;
+  for (double v : c.R) R.push_back(Value::real(v));
+  for (double v : c.t) t.push_back(Value::real(v));
+  // where the camera is in the world: -R^T t
+  for (int i = 0; i < 3; ++i) pos.push_back(Value::real(-(c.R[i] * c.t[0] + c.R[3 + i] * c.t[1] + c.R[6 + i] * c.t[2])));
+  m->put("rot", Value::list(std::move(R)));
+  m->put("t", Value::list(std::move(t)));
+  m->put("pos", Value::list(std::move(pos)));
+  m->put("rms_px", Value::real(rms));
+  return Value::object(Type::Map, m);
+}
+
+// camera_pose(world, picture, w, h[, opts]) -> camera: world points on a plane ([x, y], or [x, y, 0]: z = 0) and
+// where they are in a w x h picture; the focal length found from the plane's homography (opts.focal fixes it),
+// the pose from that, both refined against every point's reprojection
+Value bi_camera_pose(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::List || args[1].type != Type::List) { error = "camera_pose() wants the world points and the picture points as lists"; return Value::nil(); }
+  std::vector<P2> wp, ip;
+  for (const Value& v : args[0].list_items()) {
+    if (v.type != Type::List || v.list_items().size() < 2) { error = "camera_pose() wants each world point as [x, y] (on the plane z = 0)"; return Value::nil(); }
+    if (v.list_items().size() > 2 && std::fabs(v.list_items()[2].as_double()) > 1e-9) { error = "camera_pose(): the world points must lie on the plane z = 0"; return Value::nil(); }
+    wp.push_back({v.list_items()[0].as_double(), v.list_items()[1].as_double()});
+  }
+  if (!read_points(args[1], ip, wp.size(), error, "camera_pose")) return Value::nil();
+  if (wp.size() < 4) { error = "camera_pose() wants four points or more"; return Value::nil(); }
+  if (!want_number(args[2], error, "camera_pose") || !want_number(args[3], error, "camera_pose")) return Value::nil();
+  MapObj* o = opts_map(args, 4);
+  Cam c;
+  c.cx = args[2].as_double() / 2; c.cy = args[3].as_double() / 2;
+  double H[9];
+  if (!fit_homography(wp, ip, H)) { error = "camera_pose(): the points are degenerate (in a line)"; return Value::nil(); }
+  const double fixed = opt_num(o, "focal", 0);
+  double f = fixed > 0 ? fixed : focal_of(H, c.cx, c.cy);
+  const double dflt = 0.8 * std::max(args[2].as_double(), args[3].as_double());
+  // a plane seen square on says nothing about the focal length: a phone's usual, then refined
+  if (!(f > 0.2 * dflt && f < 5 * dflt)) f = dflt;
+  c.f = f;
+  if (!pose_from_h(H, c)) { error = "camera_pose(): no pose fits the points"; return Value::nil(); }
+  std::vector<std::array<double, 3>> X;
+  for (const P2& p : wp) X.push_back({p.x, p.y, 0.0});
+  const double rms = refine_camera(c, X, ip, fixed <= 0 && wp.size() >= 6);
+  return cam_value(c, rms);
+}
+
+// camera_project(camera, points) -> [[x, y] | nil ...]: world points [x, y, z] where the camera sees them (nil
+// behind it)
+Value bi_camera_project(Vm&, std::vector<Value>& args, std::string& error) {
+  Cam c;
+  if (!read_cam(args[0], c, error, "camera_project")) return Value::nil();
+  if (args[1].type != Type::List) { error = "camera_project() wants a list of [x, y, z] points"; return Value::nil(); }
+  std::vector<Value> out;
+  for (const Value& v : args[1].list_items()) {
+    if (v.type != Type::List || v.list_items().size() < 3) { error = "camera_project() wants each point as [x, y, z]"; return Value::nil(); }
+    const double X[3] = {v.list_items()[0].as_double(), v.list_items()[1].as_double(), v.list_items()[2].as_double()};
+    P2 q;
+    if (project(c, X, &q)) out.push_back(Value::list({Value::real(q.x), Value::real(q.y)}));
+    else out.push_back(Value::nil());
+  }
+  return Value::list(std::move(out));
+}
+
+// camera_ray(camera, [x, y]) -> {from: [x y z], dir: [x y z]}: the world ray through a picture point
+Value bi_camera_ray(Vm&, std::vector<Value>& args, std::string& error) {
+  Cam c;
+  if (!read_cam(args[0], c, error, "camera_ray")) return Value::nil();
+  std::vector<P2> pt;
+  if (args[1].type != Type::List || args[1].list_items().size() != 2) { error = "camera_ray() wants a picture point [x, y]"; return Value::nil(); }
+  const double u = args[1].list_items()[0].as_double(), v = args[1].list_items()[1].as_double();
+  const double d[3] = {(u - c.cx) / c.f, (v - c.cy) / c.f, 1};
+  double w[3], from[3];
+  for (int i = 0; i < 3; ++i) {
+    w[i] = c.R[i] * d[0] + c.R[3 + i] * d[1] + c.R[6 + i] * d[2];
+    from[i] = -(c.R[i] * c.t[0] + c.R[3 + i] * c.t[1] + c.R[6 + i] * c.t[2]);
+  }
+  const double l = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+  auto m = std::make_shared<MapObj>();
+  m->put("from", Value::list({Value::real(from[0]), Value::real(from[1]), Value::real(from[2])}));
+  m->put("dir", Value::list({Value::real(w[0] / l), Value::real(w[1] / l), Value::real(w[2] / l)}));
+  return Value::object(Type::Map, m);
 }
 
 // ---- tires ----------------------------------------------------------------------------------------------------
@@ -1471,6 +1950,11 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("homography", 2, 2, bi_homography);
   vm.define_native("homography_apply", 2, 2, bi_homography_apply);
   vm.define_native("image_rectify", 4, 4, bi_image_rectify);
+  vm.define_native("markers_find", 1, 2, bi_markers_find);
+  vm.define_native("marker_image", 2, 2, bi_marker_image);
+  vm.define_native("camera_pose", 4, 5, bi_camera_pose);
+  vm.define_native("camera_project", 2, 2, bi_camera_project);
+  vm.define_native("camera_ray", 2, 2, bi_camera_ray);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }
