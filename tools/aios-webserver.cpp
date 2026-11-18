@@ -10,10 +10,13 @@
 // the 499s / large-payload stalls this replaces nginx to get away from.
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <random>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -66,6 +69,12 @@ struct VhostConfig {
   std::string php_host;   // empty = static-only vhost
   uint16_t php_port = 0;
   bool php_off = false;       // isolate PHP (503) while keeping static files live
+  // `env_honeypot on`: a request for a .env-style secret file is answered 200 with a small, inert decoy instead of
+  // 404'd by the dotfile rule. The decoy looks like an aios env but grants nothing (sinkhole hosts on the .invalid
+  // TLD, fake keys); every grab mints a unique canary stamped into every value and logged with the client's IP and
+  // the time, so if any of those fake credentials is ever presented to this fleet, the auth log's canary traces
+  // straight back to the exact grab. Off by default — serving a fake file is harmless, but opt in per vhost.
+  bool env_honeypot = false;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -221,6 +230,9 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         }
       } else if (tok == "max_body_size") {
         ls >> cur->max_body_size;
+      } else if (tok == "env_honeypot") {
+        std::string v; ls >> v;
+        cur->env_honeypot = (v == "on" || v == "true" || v == "1");
       } else if (tok == "deny") {
         int status = 0;
         std::string pattern;
@@ -354,6 +366,62 @@ void write_simple_response(hal::Connection& conn, int status, const std::string&
   net::ResponseWriter w(conn, rh, int64_t(body.size()));
   if (w.write_head()) w.write_body_chunk(span_of(body));
   w.finish();
+}
+
+// ---- .env honeypot --------------------------------------------------------------------------------------------
+//
+// The last path segment is a .env-style secret probe: exactly ".env", or ".env" followed by '.', '_' or '-'
+// (.env.local, .env.production, .env.bak, .env_sample, ...). Case-insensitive.
+bool is_env_probe(const std::string& path) {
+  auto slash = path.find_last_of('/');
+  std::string seg = slash == std::string::npos ? path : path.substr(slash + 1);
+  std::string low;
+  low.reserve(seg.size());
+  for (char c : seg) low.push_back((char)std::tolower((unsigned char)c));
+  if (low.rfind(".env", 0) != 0) return false;
+  if (low.size() == 4) return true;
+  const char c = low[4];
+  return c == '.' || c == '_' || c == '-';
+}
+
+// A fresh canary, unique per grab: 16 hex of randomness so two grabs never collide.
+std::string mint_canary() {
+  static std::mutex m;
+  std::lock_guard<std::mutex> lk(m);
+  static std::mt19937_64 rng((uint64_t)std::random_device{}() ^
+                             (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+  char buf[17];
+  std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)rng());
+  return std::string(buf);
+}
+
+// Serve the decoy. Small, and powerless: every host is on the .invalid TLD (resolves nowhere), the DB points at
+// loopback, and the keys are this grab's canary — not credentials to anything. The grab is logged with the client's
+// IP, the path and the time, so the canary presented later ties back here.
+void serve_env_honeypot(hal::Connection& conn, const std::string& path, const std::string& client_ip) {
+  const std::string canary = mint_canary();
+  std::time_t now = std::time(nullptr);
+  char iso[32] = "";
+  std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
+  std::fprintf(stderr, "[env-honeypot] canary=%s ip=%s path=%s t=%s\n",
+               canary.c_str(), client_ip.c_str(), path.c_str(), iso);
+  std::fflush(stderr);
+  std::string body =
+      "# aios runtime environment\n"
+      "# generated " + std::string(iso) + " build " + canary.substr(0, 8) + " — do not commit\n"
+      "APP_ENV=production\n"
+      "AIOS_NODE_ID=edge-" + canary.substr(0, 6) + "\n"
+      "AIOS_API_BASE=https://api-" + canary.substr(0, 8) + ".aios-internal.invalid\n"
+      "AIOS_DB_HOST=127.0.0.1\n"
+      "AIOS_DB_PORT=3307\n"
+      "AIOS_DB_NAME=versioneight\n"
+      "AIOS_DB_USER=svc_" + canary.substr(0, 6) + "\n"
+      "AIOS_DB_PASSWORD=" + canary + "\n"
+      "AIOS_JWT_SECRET=" + canary + canary + "\n"
+      "WORKER_TOKEN=aios_live_" + canary + "\n"
+      "ASQL_PASSWORD=" + canary + "\n"
+      "# canary " + canary + "\n";
+  write_simple_response(conn, 200, "OK", body);
 }
 
 void serve_static(hal::Host& host, hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh,
@@ -1059,6 +1127,12 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       break;
     }
 
+    // Before the dotfile rule 404s it: a .env probe on an opted-in vhost gets the inert, traceable decoy.
+    if (vh->env_honeypot && is_env_probe(path_only)) {
+      serve_env_honeypot(*conn, path_only, conn->peer());
+      break;
+    }
+
     if (int st = denied_status(*vh, path_only)) {
       // write_simple_response says Connection: close, and any body is unread.
       write_simple_response(*conn, st, st == 403 ? "Forbidden" : "Not Found", st == 403 ? "forbidden" : "not found");
@@ -1240,6 +1314,7 @@ int aios_webserver_run(int argc, char** argv) {
       "    grain_max_body <bytes>         # Default: 1 MiB. A request body up to this is req.body; a bigger one is streamed with body_read()\n"
       "    grain_steps <n>                # Instructions one request may run. Default: 200000000\n"
       "    deny <status> <path-regex>\n"
+      "    env_honeypot on            # serve a traceable, powerless decoy for .env probes instead of 404\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
     return argc < 2 ? 1 : 0;
