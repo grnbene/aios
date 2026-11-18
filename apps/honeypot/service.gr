@@ -16,6 +16,8 @@ fn now_iso() { return date_format(now(), "%Y-%m-%dT%H:%M:%SZ", "utc") }
 let FLEET_TOKEN = setting("FLEET_TOKEN", "")
 let DASH_PASSWORD = setting("DASH_PASSWORD", "")
 fn is_loopback(req) {
+  // relayed by aios-webserver's honeypot_hub: the TCP peer is 127.0.0.1, but the person is wherever they are
+  if get(req.headers, "x-aios-relayed", "") != "" { return false }
   let r = get(req, "remote", "")
   return starts_with(r, "127.") or starts_with(r, "[::1]") or starts_with(r, "::1") or r == "localhost"
 }

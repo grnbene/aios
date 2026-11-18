@@ -1,94 +1,138 @@
 # Deploying the honeypot fleet
 
-One **hub** (runs the dashboard and collects everything) and any number of **nodes** (your real servers,
-trapping probes). The hub is also a node. Sample configs: [`hub.conf`](hub.conf), [`node.conf`](node.conf).
+```
+ attacker ──> nginx / Apache (your site, unchanged)
+                 │  only bait requests: .env, wp-config.php, .git/config, ../ traversal, /px/ callbacks
+                 ▼
+              aios-webserver SIDECAR on 127.0.0.1:8899   (decoy, trace, substrate record, heartbeat)
+                 │  HTTPS + fleet token
+                 ▼
+ https://your-aios-server/honeypot/ingest   (aios-webserver: honeypot_hub, your TLS)
+                 │
+                 ▼
+              dashboard app on 127.0.0.1:8577   ->   https://your-aios-server/honeypot/
+```
 
-## 0. Build (once, then copy the binaries)
+Files here:
+
+| File | What it's for |
+|---|---|
+| [`hub.conf`](hub.conf) | your aios-webserver hub |
+| [`sidecar.conf`](sidecar.conf) | the sidecar next to nginx or Apache |
+| [`nginx-honeypot.conf`](nginx-honeypot.conf) | the nginx snippet |
+| [`apache-honeypot.conf`](apache-honeypot.conf) | the Apache snippet |
+| [`node.conf`](node.conf) | a server that runs aios-webserver as its main web server |
+
+## 0. Build once, then copy the binaries
 
 ```sh
 cmake -B build && cmake --build build --target aios aios-webserver -j
 # copy build/aios and build/aios-webserver to /usr/local/bin on every box
 ```
 
-## 1. Fleet secret (once, then the same file goes on every box)
+## 1. Fleet secret: create it once, then put the same file on every box
 
 ```sh
 sudo mkdir -p /etc/aios && openssl rand -hex 24 | sudo tee /etc/aios/fleet.token >/dev/null
 sudo chmod 600 /etc/aios/fleet.token
 ```
 
-Without this secret, the hub rejects every event from other machines with a 401. Don't put the secret
-in a config file you share. It never appears in logs.
+The hub rejects any event that doesn't carry this secret. The secret never appears in any log.
 
-## 2. Hub
+## 2. The hub (your aios-webserver)
 
 ```sh
-# the dashboard app
-aios --root /var/lib/aios exec "serve port=7480" &          # the app host (keep it running: systemd below)
+# the dashboard app, on 127.0.0.1 only
+aios --root /var/lib/aios exec "serve port=7480" &           # app host (systemd unit below)
 aios --root /var/lib/aios exec "app deploy /path/to/aios/apps/honeypot"
 aios --root /var/lib/aios exec "app set honeypot FLEET_TOKEN=$(sudo cat /etc/aios/fleet.token) DASH_PASSWORD=<pick one> AIOS_NODE=hub"
-aios --root /var/lib/aios exec "app restart honeypot"       # REQUIRED: settings only apply after a restart
-
-# the hub's own trap (forwards to its own dashboard on 127.0.0.1)
-aios-webserver /etc/aios/hub.conf
+aios --root /var/lib/aios exec "app restart honeypot"        # REQUIRED: settings only apply after a restart
 ```
 
-Dashboard: `http://<hub>:8577/`. Log in with any username and `DASH_PASSWORD`.
+Add the `honeypot_hub` line to your existing aios-webserver vhost (see `hub.conf`):
 
-- If `DASH_PASSWORD` isn't set, the dashboard only answers the hub box itself.
-- If `FLEET_TOKEN` isn't set, `/ingest` only accepts events from the hub box itself.
+```
+honeypot_hub /honeypot http://127.0.0.1:8577
+```
 
-## 3. Each node
+- **Dashboard:** `https://your-aios-server/honeypot/`. Log in with any username and `DASH_PASSWORD`.
+- **Nodes report to:** `https://your-aios-server/honeypot/ingest`
 
-Copy `/etc/aios/fleet.token` from the hub. Then add the `env_honeypot_*` lines from `node.conf` to that
-server's existing vhost (or use `node.conf` as a starting point). Set `AIOS_NODE` so the node has a
-readable name on the dashboard:
+The app's own port (8577) stays on 127.0.0.1. Keep it closed in your firewall; the relay is the only way in,
+over your TLS.
+
+## 3a. A node running nginx or Apache: the sidecar
 
 ```sh
-AIOS_NODE=sstore aios-webserver /etc/aios/node.conf
+sudo mkdir -p /var/lib/aios/sidecar-empty /var/log/aios
+sudo cp sidecar.conf /etc/aios/sidecar.conf      # edit the CHANGE-ME lines: your hub URL, collect_url
+AIOS_NODE=sstore aios-webserver /etc/aios/sidecar.conf     # name it; that's what the dashboard shows
 ```
 
-Within a minute the node appears in the dashboard's **Fleet** panel as *reporting*. If it shows **NOT
-REPORTING**, or never appears, check these:
+**nginx:**
 
-- the hub URL in `env_honeypot_forward` is reachable from the node: `curl https://hub.example.com/health`
-- the token file matches the hub's `FLEET_TOKEN`. On a mismatch, the node's log says `hub ... refused this node (HTTP 401)`.
-- port 8577 is open on the hub's firewall to your nodes (and only to your nodes)
+```sh
+sudo cp nginx-honeypot.conf /etc/nginx/snippets/aios-honeypot.conf
+# inside each  server { ... }  you want trapped:
+#     include snippets/aios-honeypot.conf;
+sudo nginx -t && sudo systemctl reload nginx
+```
 
-## 4. Network: read this one
+**Apache 2.4.10+:**
 
-The dashboard and `/ingest` speak **plain HTTP** on port 8577. That means the dashboard password and the
-fleet token cross the wire unencrypted unless you do one of these:
+```sh
+sudo a2enmod proxy proxy_http rewrite headers
+sudo cp apache-honeypot.conf /etc/apache2/conf-available/aios-honeypot.conf
+# inside each  <VirtualHost ...>  you want trapped:
+#     Include conf-available/aios-honeypot.conf
+sudo apachectl configtest && sudo systemctl reload apache2
+```
 
-- **Private network (simplest):** put the hub and nodes on WireGuard or Tailscale, and point
-  `env_honeypot_forward` at the hub's private address. Keep 8577 closed to the public internet.
-- **TLS in front:** put Caddy or nginx in front of 8577 with a certificate, and use
-  `https://hub.example.com/ingest` in `env_honeypot_forward` (nodes forward over HTTPS natively).
+Your site keeps serving exactly as before. Only bait requests go to the sidecar.
 
-Don't expose 8577 to the internet with neither in place.
+Attribution: the front server writes the real client address into `X-Real-IP`, and the sidecar believes that
+header only because the request comes from 127.0.0.1. A `CF-Connecting-IP`, `X-Forwarded-For` or `X-Real-IP`
+that the attacker sends to frame someone else is kept in the record as evidence but never used as the origin.
+
+**Behind Cloudflare?** Set up nginx's `realip` module or Apache's `mod_remoteip` with Cloudflare's IP ranges,
+so the front server's own client address is the real visitor and not Cloudflare.
+
+## 3b. A node running aios-webserver itself
+
+Add the `env_honeypot_*` lines from `node.conf` to its vhost, and start it with `AIOS_NODE=<name>`.
+
+## 4. Check it
+
+Within a minute, each node appears in the dashboard's **Fleet** panel as green *reporting*. If one doesn't:
+
+- From the node: `curl https://your-aios-server/honeypot/health` should print `{"ok":true}`.
+- The node's log says `hub ... refused this node (HTTP 401)`: its `fleet.token` doesn't match the hub's
+  `FLEET_TOKEN`.
+- The node's log says `could not deliver to hub ... after 3 tries`: there's a network or URL problem.
+- To trap yourself on purpose: `curl https://<node>/.env`. It should show up on the dashboard with your
+  own IP.
 
 ## 5. Optional but worth it
 
-- **Callbacks:** point a subdomain you own (for example `cdn-assets.example.com`) at a node, and set
-  `env_honeypot_collect_url` to it. That's how an attacker's tooling testing the stolen decoy creds
-  shows up as a red callback. Without it you only see grabs.
-- **Geo + map:** `env_honeypot_geo` takes a CSV of `startIPv4int,endIPv4int,LABEL` sorted by start. The
-  label can carry `type=hosting|residential|...` and `lat=.. lon=..` tokens. Build it from GeoLite2 (free
-  MaxMind account) joined with city coordinates. Without it, the map stays empty. Everything else still
-  works, including the **identify** button (RDAP, ASN, reverse DNS, Spamhaus, Tor), which needs nothing local.
+- **Callbacks:** point a subdomain you own (for example `cdn-assets.example.com`) at a node, and set it as
+  `env_honeypot_collect_url`. That's how an attacker's tooling testing the stolen decoy credentials shows up
+  as a red callback. The nginx and Apache snippets already route `/px/` to the sidecar.
+- **Geo and map:** `env_honeypot_geo` takes a CSV of `startIPv4int,endIPv4int,LABEL`, sorted by start, where
+  the label can carry `type=` and `lat=` / `lon=` tokens (for example, built from GeoLite2). Without it the
+  map stays empty. **Identify** (RDAP, ASN, reverse DNS, Spamhaus, Tor) works without it.
 
 ## 6. Keep it running (systemd)
 
 ```ini
-# /etc/systemd/system/aios-honeypot-edge.service   (every box)
+# /etc/systemd/system/aios-honeypot-sidecar.service    (each nginx/Apache node)
 [Service]
 Environment=AIOS_NODE=sstore
-ExecStart=/usr/local/bin/aios-webserver /etc/aios/node.conf
+ExecStart=/usr/local/bin/aios-webserver /etc/aios/sidecar.conf
 Restart=always
 [Install]
 WantedBy=multi-user.target
 
-# /etc/systemd/system/aios-apphost.service          (hub only)
+# /etc/systemd/system/aios-apphost.service             (hub)
 [Service]
 ExecStart=/usr/local/bin/aios --root /var/lib/aios exec "serve port=7480"
 Restart=always
@@ -96,10 +140,10 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-`systemctl enable --now aios-honeypot-edge aios-apphost`
+`systemctl enable --now aios-honeypot-sidecar` (on nodes) / `aios-apphost` (on the hub)
 
 ## Reporting
 
-The dashboard's **incident report** and **export JSON/CSV** buttons produce the files to hand over. In the
-US, file at https://www.ic3.gov and attach both. For a specific origin, **identify** gives the network
-owner's abuse contact. Their abuse desk can act on their own customer faster than anyone else can.
+The dashboard's **incident report** and **export JSON/CSV** buttons produce the files to hand over. In the US,
+file at https://www.ic3.gov and attach both. For a specific origin, **identify** gives the network owner's
+abuse contact. Their abuse desk can act on their own customer faster than anyone else can.

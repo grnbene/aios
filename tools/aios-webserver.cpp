@@ -115,6 +115,17 @@ struct VhostConfig {
   // X-Fleet-Token header on every forward and heartbeat, so a hub only accepts events from its own nodes - an
   // open /ingest would let anyone who finds the URL plant fake grabs in evidence. Never logged.
   std::string env_honeypot_token;
+  // Behind nginx/Apache: `env_honeypot_real_ip_header X-Real-IP` takes the client address from that one header -
+  // but ONLY when the TCP peer is a trusted front proxy (loopback, or an `env_honeypot_trusted_proxy <ip>`). The
+  // front proxy overwrites that header with the address it actually saw, so an attacker can't forge their origin
+  // with a header of their own (a forged CF-Connecting-IP / X-Forwarded-For is still recorded, as a hop).
+  std::string env_honeypot_real_ip_header;
+  std::vector<std::string> env_honeypot_trusted_proxies;
+  // `honeypot_hub <prefix> <upstream>`: relay requests under <prefix> (e.g. /honeypot) to the hub dashboard app
+  // (e.g. http://127.0.0.1:8577), so nodes report to - and you open the dashboard at - this vhost's own URL, over
+  // this vhost's own TLS. The app can then stay on 127.0.0.1. Relayed requests carry X-AIOS-Relayed, so the app
+  // never mistakes them for local ones.
+  std::string hub_prefix, hub_upstream;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -296,6 +307,15 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         } else {
           std::fprintf(stderr, "[env-honeypot] cannot read env_honeypot_token_file %s\n", path.c_str());
         }
+      } else if (tok == "env_honeypot_real_ip_header") {
+        ls >> cur->env_honeypot_real_ip_header;
+      } else if (tok == "env_honeypot_trusted_proxy") {
+        std::string ip; ls >> ip;
+        if (!ip.empty()) cur->env_honeypot_trusted_proxies.push_back(ip);
+      } else if (tok == "honeypot_hub") {
+        ls >> cur->hub_prefix >> cur->hub_upstream;
+        while (cur->hub_prefix.size() > 1 && cur->hub_prefix.back() == '/') cur->hub_prefix.pop_back();
+        while (!cur->hub_upstream.empty() && cur->hub_upstream.back() == '/') cur->hub_upstream.pop_back();
       } else if (tok == "env_honeypot_forward") {
         std::string u; ls >> u;
         if (!u.empty()) cur->env_honeypot_forward.push_back(u);
@@ -654,6 +674,25 @@ EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const 
   EventInfo e;
   e.canary = canary;
   e.origin = trace_origin(head, peer);
+  bool via_front = false;
+  if (!vh.env_honeypot_real_ip_header.empty()) {
+    std::string pip = ip_clean(peer);
+    bool trusted = ip_scope(pip) == "loopback";
+    for (const auto& t : vh.env_honeypot_trusted_proxies) if (t == pip) trusted = true;
+    if (trusted) {
+      if (auto v = head.header(vh.env_honeypot_real_ip_header)) {
+        std::string ip = v->substr(0, v->find(','));
+        size_t a = ip.find_first_not_of(" \t"), b = ip.find_last_not_of(" \t");
+        // only a real address counts - a misconfigured front (e.g. an empty or "(null)" header) must not become
+        // the recorded origin; then the usual trace stands and the bad value is still kept as a hop.
+        if (a != std::string::npos && ip_scope(ip_clean(ip.substr(a, b - a + 1))) != "unknown") {
+          e.origin.best = ip.substr(a, b - a + 1);
+          e.origin.hops.push_back({"trusted:" + vh.env_honeypot_real_ip_header, e.origin.best});
+          via_front = true;
+        }
+      }
+    }
+  }
   e.origin_ip = ip_clean(e.origin.best);
   e.scope = ip_scope(e.origin_ip);
   e.family = ip_family(e.origin_ip);
@@ -663,7 +702,9 @@ EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const 
     e.lat = geo_token(e.geo, "lat=");
     e.lon = geo_token(e.geo, "lon=");
   }
-  if (head.header("cf-connecting-ip") || head.header("cf-ray")) e.via = "Cloudflare";
+  // via a trusted nginx/Apache front, any CDN headers came from the client and prove nothing (they stay in hops)
+  if (via_front) e.via = "front proxy";
+  else if (head.header("cf-connecting-ip") || head.header("cf-ray")) e.via = "Cloudflare";
   else if (head.header("fastly-client-ip")) e.via = "Fastly";
   else if (head.header("x-amz-cf-id")) e.via = "CloudFront";
   else if (head.header("x-forwarded-for")) e.via = "proxy";
@@ -847,6 +888,58 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
       "ASQL_PASSWORD=" + canary + "\n"
       "# canary " + canary + "\n";
   write_simple_response(conn, 200, "OK", body);
+}
+
+// `honeypot_hub`: relay one request under the hub prefix to the dashboard app and send its answer back. Small and
+// buffered on purpose - /ingest bodies are a few KB and dashboard responses are pages, JSON and exports - so this is
+// a relay for one app, not a general reverse proxy. The app does all the auth (fleet token, dashboard password);
+// this only adds X-AIOS-Relayed so a relayed request is never mistaken for one from the hub machine itself.
+void serve_hub_relay(hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
+                     const VhostConfig& vh, const std::string& path_only, const std::string& query, const std::string& peer) {
+  std::string rel = path_only.substr(vh.hub_prefix.size());
+  if (rel.empty()) {   // "/honeypot" -> "/honeypot/", so the page's relative api/ URLs resolve under the prefix
+    net::HttpResponseHead rh;
+    rh.status = 301; rh.status_text = "Moved Permanently";
+    rh.headers.push_back({"Location", vh.hub_prefix + "/" + (query.empty() ? "" : "?" + query)});
+    rh.headers.push_back({"Connection", "close"});
+    net::ResponseWriter w(conn, rh, 0);
+    w.write_head(); w.finish();
+    return;
+  }
+  constexpr int64_t kMaxBody = 1 << 20;
+  if (head.content_length > kMaxBody) { write_simple_response(conn, 413, "Payload Too Large", "too large"); return; }
+  std::string body;
+  while ((int64_t)body.size() < head.content_length) {
+    auto chunk = reader.read_some((size_t)(head.content_length - (int64_t)body.size()), 10000);
+    if (chunk.empty()) break;
+    body.append((const char*)chunk.data(), chunk.size());
+  }
+  auto ep = aios::channel::parse_endpoint(vh.hub_upstream + rel + (query.empty() ? "" : "?" + query));
+  if (!ep.ok()) { write_simple_response(conn, 502, "Bad Gateway", "bad honeypot_hub upstream"); return; }
+  aios::channel::HttpRequest req;
+  req.method = head.method;
+  req.endpoint = *ep;
+  req.timeout_ms = 60000;   // /api/whois does several lookups
+  req.host = &hal::process_host();
+  for (const char* name : {"content-type", "authorization", "x-fleet-token", "accept"})
+    if (auto v = head.header(name)) req.headers.push_back({name, *v});
+  req.headers.push_back({"X-AIOS-Relayed", "1"});
+  req.headers.push_back({"X-Forwarded-For", ip_clean(peer)});
+  req.body.assign(body.begin(), body.end());
+  auto r = aios::channel::http_send(req);
+  if (!r.ok()) { write_simple_response(conn, 502, "Bad Gateway", "honeypot hub app unreachable"); return; }
+  net::HttpResponseHead rh;
+  rh.status = r->status;
+  rh.status_text = r->reason.empty() ? "OK" : r->reason;
+  for (const char* name : {"content-type", "content-disposition", "www-authenticate", "cache-control"}) {
+    std::string v = r->header(name);
+    if (!v.empty()) rh.headers.push_back({name, v});
+  }
+  rh.headers.push_back({"X-Content-Type-Options", "nosniff"});
+  rh.headers.push_back({"Connection", "close"});
+  net::ResponseWriter w(conn, rh, int64_t(r->body.size()));
+  if (w.write_head() && !r->body.empty()) w.write_body_chunk(ByteSpan(r->body.data(), r->body.size()));
+  w.finish();
 }
 
 void serve_static(hal::Host& host, hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh,
@@ -1552,6 +1645,12 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       break;
     }
 
+    // The hub: relay the dashboard app (and nodes' /ingest) under this vhost's own URL and TLS.
+    if (!vh->hub_prefix.empty() && (path_only == vh->hub_prefix || path_only.rfind(vh->hub_prefix + "/", 0) == 0)) {
+      serve_hub_relay(*conn, reader, head, *vh, path_only, query, conn->peer());
+      break;
+    }
+
     // The bait's callback landing: the attacker's tooling validating the stolen creds. Record it, answer blandly.
     if (!vh->env_honeypot_collect.empty() && path_only.rfind(vh->env_honeypot_collect, 0) == 0) {
       serve_collect(*conn, reader, head, *vh, path_only, conn->peer());
@@ -1757,6 +1856,9 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot_forward <url>       # POST each event to a fleet collector (repeatable); whole-fleet view\n"
       "    env_honeypot_token <secret>      # shared fleet secret, sent as X-Fleet-Token on every forward/heartbeat\n"
       "    env_honeypot_token_file <path>   # same, read from a file (keeps the secret out of the config)\n"
+      "    env_honeypot_real_ip_header <h>  # behind nginx/Apache: client IP from header <h>, trusted only from loopback/trusted_proxy\n"
+      "    env_honeypot_trusted_proxy <ip>  # a front proxy (besides loopback) whose real-ip header is believed (repeatable)\n"
+      "    honeypot_hub <prefix> <upstream> # relay <prefix>/... to the hub dashboard app, e.g. /honeypot http://127.0.0.1:8577\n"
       "    honeypot_path <regex>            # any path matching is bait too, not just .env (repeatable)\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");

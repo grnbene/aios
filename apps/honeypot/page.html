@@ -49,9 +49,9 @@ tr[data-origin] { cursor:pointer; }
 <h1><span class="live"></span>Honeypot watch</h1>
 <p class="sub">Every <code>.env</code> grab the edge server traced — the attacker's origin through the whole proxy chain, powerless canary served, logged to the substrate. Updating live.</p>
 <div style="margin:0 0 14px">
-  <a class="expbtn" href="/api/report">📄 incident report (.txt)</a>
-  <a class="expbtn" href="/api/export?format=json">⬇ export JSON</a>
-  <a class="expbtn" href="/api/export?format=csv">⬇ export CSV</a>
+  <a class="expbtn" href="api/report">📄 incident report (.txt)</a>
+  <a class="expbtn" href="api/export?format=json">⬇ export JSON</a>
+  <a class="expbtn" href="api/export?format=csv">⬇ export CSV</a>
   <span class="muted" style="font-size:13px"> — to report this to the FBI: file at <a href="https://www.ic3.gov" target="_blank" rel="noopener" style="color:var(--accent)">ic3.gov</a> and attach the report + JSON export.</span>
 </div>
 <div class="cards">
@@ -173,7 +173,7 @@ async function identifyOrigin(origin){
   if (!box) return;
   box.innerHTML = '<span class="muted">looking up RDAP, ASN, reverse DNS, Spamhaus DROP/EDROP, Tor exit list…</span>';
   let w;
-  try { w = await (await fetch('/api/whois?ip=' + encodeURIComponent(origin))).json(); }
+  try { w = await (await fetch('api/whois?ip=' + encodeURIComponent(origin))).json(); }
   catch(e){ box.innerHTML = '<span class="muted">lookup failed: '+esc(e.message)+'</span>'; return; }
   const spoof = w.spoof_suspected;
   const html =
@@ -208,7 +208,7 @@ function rowCb(x){ const key='cb'+(x.id||x.canary||'')+x.t; const nw=!seen.has(k
     '<td class="mono">'+esc(x.method)+'</td><td class="mono">'+esc(x.path)+'</td>'+
     '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td><td class="mono" title="fingerprint '+esc(x.fp||'')+'">'+esc((x.id||'').slice(0,10))+'</td></tr>'; }
 async function tick(){
-  let j; try { j = await (await fetch('/api/grabs?limit=400')).json(); } catch(e){ $('foot').textContent='feed unreachable: '+e.message; return; }
+  let j; try { j = await (await fetch('api/grabs?limit=400')).json(); } catch(e){ $('foot').textContent='feed unreachable: '+e.message; return; }
   const dc = $('f_dc').checked;
   let g=(j.grabs||[]); let cb=(j.callbacks||[]);
   if(dc){ g=g.filter(x=>!isNoise(x)); cb=cb.filter(x=>!isNoise(x)); }
@@ -227,7 +227,7 @@ async function tick(){
 $('f_dc').addEventListener('change', tick);
 // "they all need to report back to the hub" - show every node that ever has, and flag one that's gone quiet.
 async function tickFleet(){
-  let j; try { j = await (await fetch('/api/fleet')).json(); } catch(e){ return; }
+  let j; try { j = await (await fetch('api/fleet')).json(); } catch(e){ return; }
   const nodes = j.nodes || [];
   $('fleetwrap').style.display = nodes.length ? 'block' : 'none';
   if (!nodes.length) return;
