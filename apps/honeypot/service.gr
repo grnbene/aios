@@ -79,17 +79,19 @@ fn ptr_matches_claim(ptr, claim) {
   for d in claim.domains { if ends_with(p, d) { ok = true } }
   return ok
 }
-fn ipv4_ptr_name(ip) {
+fn reverse_octets(ip) {
   let parts = split(ip, ".")
   if len(parts) != 4 { return "" }
-  return parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0] + ".in-addr.arpa"
+  return parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0]
 }
-// reverse DNS over HTTPS (Cloudflare's DoH resolver) - works from inside a sandboxed app host that has no raw
-// UDP/53 socket access; a real edge server with normal DNS can do this with a plain PTR lookup instead.
-fn reverse_dns(ip) {
-  let name = ipv4_ptr_name(ip)
-  if name == "" { return "" }
-  let r = pcall(http_get, "https://cloudflare-dns.com/dns-query?name=" + name + "&type=PTR",
+fn ipv4_ptr_name(ip) {
+  let r = reverse_octets(ip)
+  return r == "" ? "" : r + ".in-addr.arpa"
+}
+// one DNS-over-HTTPS TXT/PTR lookup (Cloudflare's resolver) - works from inside a sandboxed app host that has no
+// raw UDP/53 socket; a real edge server with normal DNS can do these with plain DNS queries instead.
+fn doh(name, type) {
+  let r = pcall(http_get, "https://cloudflare-dns.com/dns-query?name=" + name + "&type=" + type,
                 {"headers": {"accept": "application/dns-json"}, "timeout_ms": 6000})
   if not r.ok or not r.value.ok { return "" }
   let p = pcall(json_parse, r.value.body)
@@ -97,7 +99,97 @@ fn reverse_dns(ip) {
   let answers = get(p.value, "Answer", [])
   if len(answers) == 0 { return "" }
   let d = get(answers[0], "data", "")
-  return ends_with(d, ".") ? slice(d, 0, len(d) - 1) : d
+  return (starts_with(d, "\"") and ends_with(d, "\"")) ? slice(d, 1, len(d) - 1) : d
+}
+// which Autonomous System actually announces this address, via Team Cymru's public DNS whois (no key, no rate
+// limit beyond politeness) - the real network operator, independent of whatever RDAP's registration data says
+// (a block can be registered to one org and routed/operated by a very different one).
+fn asn_lookup(ip) {
+  let rev = reverse_octets(ip)
+  if rev == "" { return {} }
+  let txt = doh(rev + ".origin.asn.cymru.com", "TXT")
+  if txt == "" { return {} }
+  let parts = map(split(txt, "|"), fn(s){ return trim(s) })
+  if len(parts) < 2 { return {} }
+  let asn = parts[0]
+  let asname = ""
+  let txt2 = doh("AS" + asn + ".asn.cymru.com", "TXT")
+  if txt2 != "" {
+    let p2 = map(split(txt2, "|"), fn(s){ return trim(s) })
+    if len(p2) >= 5 { asname = p2[4] }
+  }
+  return {"asn": asn, "bgp_prefix": parts[1], "cc": len(parts) > 2 ? parts[2] : "", "asname": asname}
+}
+// reverse DNS over HTTPS. See doh() above for why not a plain PTR call.
+fn reverse_dns(ip) {
+  let name = ipv4_ptr_name(ip)
+  if name == "" { return "" }
+  let d = doh(name, "PTR")
+  return (d != "" and ends_with(d, ".")) ? slice(d, 0, len(d) - 1) : d
+}
+// --- public reputation feeds: free, no key, no probe of the origin - just checking its address against lists
+// other defenders already publish. Cached to disk, refreshed at most once a day (these lists change slowly and
+// the publishers ask to be polled politely, not on every dashboard click).
+fn today() { return slice(now_iso(), 0, 10) }
+fn ensure_blocklist(name, url) {
+  let path = "bl_" + name + ".txt"
+  let cached = pcall(read_file, path)
+  if cached.ok {
+    let lines = split(cached.value, "\n")
+    if len(lines) > 0 and lines[0] == "# " + today() { return cached.value }
+  }
+  let resp = pcall(http_get, url, {"timeout_ms": 20000})
+  if not resp.ok or not resp.value.ok or resp.value.status >= 400 {
+    return cached.ok ? cached.value : ""   // fetch failed - fall back to whatever's cached, even if stale
+  }
+  let content = "# " + today() + "\n" + resp.value.body
+  pcall(write_file, path, content)
+  return content
+}
+fn ip_to_u32(ip) {
+  let p = split(ip, ".")
+  if len(p) != 4 { return -1 }
+  return int(p[0]) * 16777216 + int(p[1]) * 65536 + int(p[2]) * 256 + int(p[3])
+}
+fn cidr_contains(ip_u32, cidr) {
+  let parts = split(trim(cidr), "/")
+  if len(parts) != 2 { return false }
+  let base = ip_to_u32(trim(parts[0]))
+  let bits = int(trim(parts[1]))
+  if base < 0 or bits < 0 or bits > 32 { return false }
+  if bits == 0 { return true }
+  let block = pow(2, 32 - bits)
+  return idiv(ip_u32, block) == idiv(base, block)
+}
+// Spamhaus DROP/EDROP: netblocks hijacked or entirely controlled by professional cybercrime operations - not a
+// spam list, a "this block should not be routed at all" list. A hit here is a strong signal on its own.
+fn check_spamhaus(ip) {
+  let ip_u32 = ip_to_u32(ip)
+  if ip_u32 < 0 { return "" }
+  let text = ensure_blocklist("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt") + "\n" +
+            ensure_blocklist("spamhaus_edrop", "https://www.spamhaus.org/drop/edrop.txt")
+  let hit = ""
+  for ln in split(text, "\n") {
+    if hit == "" {
+      let t = trim(ln)
+      if t != "" and not starts_with(t, "#") and not starts_with(t, ";") {
+        let semi = index_of(t, ";")
+        let cidr = trim(semi >= 0 ? slice(t, 0, semi) : t)
+        if index_of(cidr, "/") >= 0 and cidr_contains(ip_u32, cidr) {
+          hit = cidr + (semi >= 0 ? " (" + trim(slice(t, semi + 1, len(t))) + ")" : "")
+        }
+      }
+    }
+  }
+  return hit
+}
+// the Tor Project's own bulk exit-node list - if this address is in it, anything it sends could be any Tor user,
+// not a fixed identity; worth knowing before you spend effort trying to attribute one.
+fn check_tor(ip) {
+  let text = ensure_blocklist("tor_exits", "https://check.torproject.org/torbulkexitlist")
+  let hit = false
+  for ln in split(text, "\n") { if not hit and trim(ln) == ip { hit = true } }
+  return hit
 }
 fn vcard_email(e) {
   let va = get(e, "vcardArray", [])
@@ -177,16 +269,22 @@ fn whois_lookup(ip, ua) {
   let cached = cache_get(ip)
   if cached != nil { return cached }
   let rdap = rdap_lookup(ip)
+  let asn = asn_lookup(ip)
   let ptr = reverse_dns(ip)
   let claim = crawler_claim(ua)
   let matches = ptr_matches_claim(ptr, claim)
+  let spamhaus = check_spamhaus(ip)
+  let tor = check_tor(ip)
   let rec = {
     "ip": ip, "looked_up": now_iso(), "ptr": ptr,
     "org": get(rdap, "org", ""), "name": get(rdap, "name", ""), "handle": get(rdap, "handle", ""),
     "country": get(rdap, "country", ""), "range": get(rdap, "range", ""), "cidr": get(rdap, "cidr", ""),
     "abuse_email": get(rdap, "abuse_email", ""),
+    "asn": get(asn, "asn", ""), "asname": get(asn, "asname", ""), "asn_cc": get(asn, "cc", ""),
     "claimed_crawler": claim == nil ? "" : claim.needle,
-    "spoof_suspected": claim != nil and not matches
+    "spoof_suspected": claim != nil and not matches,
+    "spamhaus_hit": spamhaus,
+    "tor_exit": tor
   }
   append_file(WHOIS_CACHE, json_stringify(rec) + "\n")
   return rec

@@ -164,15 +164,18 @@ function showDetail(origin, keepView){
 async function identifyOrigin(origin){
   const box = $('whoisbox');
   if (!box) return;
-  box.innerHTML = '<span class="muted">looking up RDAP + reverse DNS…</span>';
+  box.innerHTML = '<span class="muted">looking up RDAP, ASN, reverse DNS, Spamhaus DROP/EDROP, Tor exit list…</span>';
   let w;
   try { w = await (await fetch('/api/whois?ip=' + encodeURIComponent(origin))).json(); }
   catch(e){ box.innerHTML = '<span class="muted">lookup failed: '+esc(e.message)+'</span>'; return; }
   const spoof = w.spoof_suspected;
   const html =
     (spoof ? '<div style="color:var(--hot);font-weight:600;margin-bottom:6px">⚠ claims "'+esc(w.claimed_crawler)+'" but its reverse DNS doesn\'t match '+esc(w.claimed_crawler)+'\'s own infrastructure — likely a spoofed user-agent, not the real crawler.</div>' : '') +
+    (w.spamhaus_hit ? '<div style="color:var(--hot);font-weight:600;margin-bottom:6px">⚠ on Spamhaus DROP/EDROP: '+esc(w.spamhaus_hit)+' — a block Spamhaus says should not be routed at all.</div>' : '') +
+    (w.tor_exit ? '<div style="color:var(--warn);font-weight:600;margin-bottom:6px">this address is a current Tor exit node — traffic from it could be any Tor user, not a fixed identity.</div>' : '') +
     '<div><b>'+esc(w.org || w.name || 'unknown registrant')+'</b></div>' +
-    (w.cidr ? '<div class="muted">block '+esc(w.cidr)+'</div>' : (w.range ? '<div class="muted">range '+esc(w.range)+'</div>' : '')) +
+    (w.asn ? '<div class="muted">AS'+esc(w.asn)+' '+esc(w.asname||'')+(w.asn_cc?' ('+esc(w.asn_cc)+')':'')+' — actual routing origin</div>' : '') +
+    (w.cidr ? '<div class="muted">registered block '+esc(w.cidr)+'</div>' : (w.range ? '<div class="muted">registered range '+esc(w.range)+'</div>' : '')) +
     (w.ptr ? '<div>resolves to <span class="mono">'+esc(w.ptr)+'</span></div>' : '<div class="muted">no reverse DNS record</div>') +
     (w.abuse_email ? '<div>abuse contact: <a href="mailto:'+esc(w.abuse_email)+'" style="color:var(--accent)">'+esc(w.abuse_email)+'</a></div>' : '');
   whoisResults[origin] = html;   // survives the next 3s auto-refresh's re-render of this panel
