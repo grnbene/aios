@@ -1,6 +1,8 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Honeypot watch</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
 :root { --bg:#0e1116; --panel:#171b22; --ink:#e7ebf0; --muted:#8b93a0; --line:#262c36; --hot:#e5484d; --warn:#e2a03f; --ok:#3fb950; --accent:#d0542a; }
 * { box-sizing:border-box; }
@@ -21,6 +23,9 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 .via { color:var(--warn); } .mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
 .new { animation:flash 2s; } @keyframes flash { from{background:rgba(224,84,43,.28)} to{background:transparent} }
 .muted { color:var(--muted); }
+#map { height:320px; border-radius:10px; border:1px solid var(--line); margin-bottom:14px; background:#0d1014; }
+.leaflet-popup-content-wrapper,.leaflet-popup-tip { background:var(--panel); color:var(--ink); }
+.leaflet-container { background:#0d1014; }
 </style></head>
 <body><main>
 <h1><span class="live"></span>Honeypot watch</h1>
@@ -34,6 +39,8 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
   <div class="card"><div class="n" id="c_top" style="font-size:16px">—</div><div class="l">top origin</div></div>
 </div>
 <div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
+<div id="map"></div>
+<p class="sub" id="mapfoot" style="margin-top:-8px"></p>
 <div id="cbwrap" style="display:none"><h2 style="font-size:16px;margin:4px 0">Bait callbacks <span class="muted" style="font-weight:400;font-size:13px">— the attacker's own tooling validated the stolen creds and connected to us</span></h2>
 <table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Canary</th></tr></thead><tbody id="cbrows"></tbody></table></div>
 <h2 style="font-size:16px;margin:14px 0 4px">Grabs <span class="muted" style="font-weight:400;font-size:13px">— .env probes served the decoy</span></h2>
@@ -50,6 +57,42 @@ function ago(iso){ const t=Date.parse(iso+(iso&&iso.endsWith('Z')?'':'Z')); if(i
 function chain(hops){ if(!hops) return ''; return hops.map(h=>{const k=Object.keys(h)[0]; return esc(k)+'='+esc(h[k]);}).join(' › '); }
 function isDC(x){ const t=(x.net_type||'').toLowerCase(); if(t) return /host|datacenter|data center|cloud|server|vps/.test(t); return x.scope==='public'; }
 function isNoise(x){ const t=(x.net_type||'').toLowerCase(); return x.scope!=='public' || /resid|mobile|cellular|isp|dsl|cable|home/.test(t); }
+// map: free OpenStreetMap tiles, no API key. One marker per distinct origin (grabs + callbacks together), colored
+// by whether we ever saw a bait callback from it. Offline geo is coarse (usually city/region centroid) - the point
+// is "which part of the world", not a street address.
+const map = L.map('map', {worldCopyJump:true}).setView([20,0], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+let markers = L.layerGroup().addTo(map);
+function renderMap(g, cb){
+  markers.clearLayers();
+  const byOrigin = {};
+  for (const x of g.concat(cb)) {
+    const lat = parseFloat(x.lat), lon = parseFloat(x.lon);
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    const o = byOrigin[x.origin] || (byOrigin[x.origin] = {lat, lon, grabs:0, cbs:0, geo:x.geo, scope:x.scope, net_type:x.net_type, node:x.node, last:x.t});
+    if (x.kind === 'honeypot.callback') o.cbs++; else o.grabs++;
+    if (x.t > o.last) o.last = x.t;
+  }
+  let plotted = 0;
+  for (const [origin, o] of Object.entries(byOrigin)) {
+    plotted++;
+    const color = o.cbs > 0 ? '#e5484d' : (o.scope === 'public' ? '#e2a03f' : '#8b93a0');
+    const m = L.circleMarker([o.lat, o.lon], {
+      radius: Math.min(6 + Math.sqrt(o.grabs + o.cbs * 2) * 2, 20),
+      color, fillColor: color, fillOpacity: 0.55, weight: 1.5
+    });
+    m.bindPopup('<b>'+esc(origin)+'</b> <span style="color:'+color+'">'+esc(o.scope||'')+'</span><br>'+
+      esc(o.geo||'—')+'<br>'+esc(o.net_type||'')+'<br>'+
+      o.grabs+' grab(s)'+(o.cbs?', <b style="color:#e5484d">'+o.cbs+' callback(s)</b>':'')+'<br>'+
+      'last seen '+esc(ago(o.last))+' · node '+esc(o.node||'—'));
+    markers.addLayer(m);
+  }
+  $('mapfoot').textContent = plotted
+    ? plotted+' origin(s) plotted (offline geo: city/region centroid, not exact) · red = sent a bait callback, amber = public, grey = private/cgnat scope'
+    : 'no origins with location data yet — configure env_honeypot_geo with lat=/lon= tokens to populate the map.';
+}
 function rowGrab(x){ const key=x.canary||(x.t+x.origin); const nw=!seen.has(key); seen.add(key);
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
   return '<tr class="'+(nw?'new':'')+'">'+
@@ -82,6 +125,7 @@ async function tick(){
   $('cbrows').innerHTML=cb.map(rowCb).join('');
   $('grabrows').innerHTML=g.length?g.map(rowGrab).join(''):'<tr><td colspan="11" class="muted">no grabs yet — the trap is armed.</td></tr>';
   $('foot').textContent='showing '+g.length+' grabs, '+cb.length+' callbacks · '+new Date().toLocaleTimeString();
+  renderMap(g, cb);
 }
 $('f_dc').addEventListener('change', tick);
 tick(); setInterval(tick, 3000);

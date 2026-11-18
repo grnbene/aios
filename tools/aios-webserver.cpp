@@ -87,7 +87,9 @@ struct VhostConfig {
   std::string env_honeypot_feed;
   // `env_honeypot_geo <file>`: an offline IP->location table (lines "startIPv4int,endIPv4int,LABEL", sorted by start)
   // for the origin's location. The LABEL may carry a "type=<hosting|residential|mobile|...>" token, read out as the
-  // origin's network type so home-router / residential noise can be filtered. Supply GeoLite2 (normalized) or similar.
+  // origin's network type so home-router / residential noise can be filtered, and optional "lat=<deg> lon=<deg>"
+  // tokens (city/region centroid is fine) so the dashboard can plot the origin on a map. Supply GeoLite2 (normalized)
+  // or similar, with lat/lon joined in from a city-centroid table if you want the map populated.
   std::string env_honeypot_geo;
   // `env_honeypot_collect_url <base>`: the bait's callback. The decoy embeds <base>/<canary> as its API endpoint, so
   // when the attacker's own tooling validates the stolen creds it connects to a URL we control - a second, usually
@@ -583,17 +585,19 @@ std::string json_escape(const std::string& s) {
 
 // What the box worked out about one inbound event, origin and all.
 struct EventInfo {
-  std::string canary, origin_ip, scope, family, geo, type, via, iso;
+  std::string canary, origin_ip, scope, family, geo, type, via, iso, lat, lon;
   Origin origin;
 };
-// the "type=..." token from a geo label (hosting / residential / mobile / ...), for filtering home-router noise
-std::string geo_type(const std::string& label) {
-  auto p = label.find("type=");
+// one "key=..." token out of a geo label, e.g. "US / Ashburn type=hosting lat=39.0438 lon=-77.4874" -> geo_token(l,"lat=")=="39.0438"
+std::string geo_token(const std::string& label, const char* key) {
+  auto p = label.find(key);
   if (p == std::string::npos) return "";
-  p += 5;
+  p += std::strlen(key);
   auto e = label.find_first_of(" ,;|", p);
   return label.substr(p, e == std::string::npos ? std::string::npos : e - p);
 }
+// the "type=..." token from a geo label (hosting / residential / mobile / ...), for filtering home-router noise
+std::string geo_type(const std::string& label) { return geo_token(label, "type="); }
 EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const std::string& peer, const std::string& canary) {
   EventInfo e;
   e.canary = canary;
@@ -601,7 +605,12 @@ EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const 
   e.origin_ip = ip_clean(e.origin.best);
   e.scope = ip_scope(e.origin_ip);
   e.family = ip_family(e.origin_ip);
-  if (!vh.env_honeypot_geo.empty()) if (GeoDb* g = geo_db(vh.env_honeypot_geo)) { e.geo = g->lookup(e.origin_ip); e.type = geo_type(e.geo); }
+  if (!vh.env_honeypot_geo.empty()) if (GeoDb* g = geo_db(vh.env_honeypot_geo)) {
+    e.geo = g->lookup(e.origin_ip);
+    e.type = geo_type(e.geo);
+    e.lat = geo_token(e.geo, "lat=");
+    e.lon = geo_token(e.geo, "lon=");
+  }
   if (head.header("cf-connecting-ip") || head.header("cf-ray")) e.via = "Cloudflare";
   else if (head.header("fastly-client-ip")) e.via = "Fastly";
   else if (head.header("x-amz-cf-id")) e.via = "CloudFront";
@@ -651,6 +660,7 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
   std::string j = "{\"kind\":\"" + std::string(kind) + "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
                   "\",\"origin\":\"" + json_escape(e.origin_ip) + "\",\"scope\":\"" + e.scope + "\",\"family\":\"" +
                   e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
+                  "\",\"lat\":\"" + json_escape(e.lat) + "\",\"lon\":\"" + json_escape(e.lon) +
                   "\",\"via\":\"" + json_escape(e.via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
                   json_escape(head.host) + "\",\"node\":\"" + json_escape(honeypot_node_name()) +
                   "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
@@ -676,6 +686,8 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
       m("origin_family", e.family);
       m("origin_type", e.type);
       m("origin_geo", e.geo);
+      m("origin_lat", e.lat);
+      m("origin_lon", e.lon);
       m("via", e.via);
       m("peer", peer);
       m("host", head.host);
@@ -1652,7 +1664,7 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot on            # serve a traceable, powerless decoy for .env probes instead of 404\n"
       "    env_honeypot_store <dir>   # record each grab (origin chain + canary) into the aios object store there\n"
       "    env_honeypot_feed <file>   # also append one JSON line per grab, for the live Grain dashboard\n"
-      "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL[ type=hosting]) for origin\n"
+      "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL[ type=hosting][ lat=.. lon=..]) for origin, map\n"
       "    env_honeypot_collect_url <base>  # decoy's bait callback: embeds <base>/<canary> as its API endpoint\n"
       "    env_honeypot_collect <prefix>    # a request under this prefix IS a callback: record its full telemetry\n"
       "    env_honeypot_forward <url>       # POST each event to a fleet collector (repeatable); whole-fleet view\n"
