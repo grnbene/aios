@@ -243,3 +243,55 @@ fn bins_occupancy(photo, focal, empty_photo, empty_cam, dims, cfg) {
   let d = image_difference(v.expected, v.actual)
   return {"changed": d.changed, "compared": d.compared * v.known, "actual": v.actual, "expected": v.expected, "camera": cam}
 }
+
+// ---- guiding the camera ---------------------------------------------------------------------------------------------
+//
+// A frame of the live camera (small: 640 or so across) judged for whether to take the photo, and what to tell the
+// person holding the phone if not. With the bin's measuring known (dims: its rect and lens), where its opening falls
+// in the frame is worked out from the marker, so the advice can say which way to move.
+// -> {ready, advice: [text ...], quality (image_quality's), marker (its corners in the frame, or nil), opening
+//    (the opening's corners in the frame, or nil)}
+fn bins_frame(photo, dims, cfg, focal) {
+  let cv = image_decode(photo)
+  let w = canvas_width(cv)
+  let h = canvas_height(cv)
+  let q = image_quality(cv)
+  let advice = []
+  # (grain past 0.02 at this size is where a dark scene the phone has brightened starts to cost accuracy)
+  if q.brightness < 0.12 or q.noise > 0.02 { push(advice, "Too dark: turn the light on, or the phone's torch") }
+  if q.clipped > 0.05 { push(advice, "Glare: tilt the phone a little, or move the light off the marker") }
+  let m = image_find_marker(cv)
+  let opening = nil
+  if m == nil {
+    push(advice, "Can't see the marker: get all of it in view")
+  } else {
+    if m.side_px < 0.035 * w { push(advice, "Closer: the marker is too small to read") }
+    if dims != nil and dims.rect != nil {
+      let f = focal != nil ? focal * 1.0 : dims.focal_px * w / dims.photo_w
+      let cam = camera_pose(marker_world(cfg), m.corners, w, h, {"focal": f})
+      let pts = []
+      for c in dims.rect.corners { push(pts, [c[0], c[1], 0.0]) }
+      opening = camera_project(cam, pts)
+      let mx = 0.03 * w
+      let my = 0.03 * h
+      let left = false
+      let right = false
+      let up = false
+      let down = false
+      for p in opening {
+        if p == nil { continue }
+        if p[0] < mx { left = true }
+        if p[0] > w - mx { right = true }
+        if p[1] < my { up = true }
+        if p[1] > h - my { down = true }
+      }
+      if (left and right) or (up and down) { push(advice, "Step back: the whole opening isn't in view") }
+      else if left { push(advice, "Aim left: the opening runs off the left") }
+      else if right { push(advice, "Aim right: the opening runs off the right") }
+      else if up { push(advice, "Aim up: the opening runs off the top") }
+      else if down { push(advice, "Aim down: the opening runs off the bottom") }
+      else if dist(opening[0], opening[1]) < 0.35 * w { push(advice, "Closer: let the opening fill more of the frame") }
+    }
+  }
+  return {"ready": len(advice) == 0, "advice": advice, "quality": q, "marker": m == nil ? nil : m.corners, "opening": opening}
+}

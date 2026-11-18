@@ -11,6 +11,8 @@
 //                               floor's back corner; else depth_mm is used), focal (the lens in px from the photo's
 //                               EXIF, or nil), empty (true: the bin is empty now, keep this photo to check against)}
 //                               -> the bin's size, saved; then its fill
+//   POST /api/frame?bin=B&focal=F  body: a small frame of the live camera -> {ready, advice, quality, marker,
+//                               opening}: whether to take the photo now, and what to tell the person if not
 //   POST /api/check?bin=B&focal=F  body: a photo of B's front: what is in it against its empty photo, and the ERP's
 //                               fill -> {changed, compared, erp_fill, verdict}
 //   POST /api/dims              {bin, width_mm, depth_mm, height_mm}: a size entered by hand
@@ -18,7 +20,7 @@
 // Sizes and photos are kept in ASQL (bin_dims, bin_photos); fill is the bin_fill Thing's (lib/bins.gr).
 
 import { q, bin_cfg, setting } from "lib/db.gr"
-import { bins_install, bins_save, bins_board, bins_contents, bins_room, bins_marker_png, bins_geometry, bins_occupancy, bins_verdict } from "lib/bins.gr"
+import { bins_install, bins_save, bins_board, bins_contents, bins_room, bins_marker_png, bins_geometry, bins_occupancy, bins_verdict, bins_frame } from "lib/bins.gr"
 
 let PAGE = app_program("page.html")
 
@@ -112,6 +114,18 @@ serve_routes({
                      "focal_from": g.focal_from, "rms_px": g.rms_px, "empty_kept": get(rec, "empty_photo_id", nil) != nil,
                      "warning": g.rms_px > 3.0 ? "the corners do not fit one rectangle on the marker's plane well: is the marker flat on the bin's front, and each corner on the opening's?" : nil,
                      "board": fill})
+  }),
+  "POST /api/frame": api(fn (req) {
+    let b = trim(get(req.query_params, "bin", ""))
+    let dims = nil
+    if b != "" {
+      let d = q("SELECT rect, focal_px, photo_w FROM bin_dims WHERE loccode = ? AND bin = ?", [bin_cfg().loccode, b])
+      if len(d) > 0 and d[0].rect != nil {
+        dims = {"rect": json_parse(d[0].rect), "focal_px": to_number(d[0].focal_px) * 1.0, "photo_w": to_number(d[0].photo_w) * 1.0}
+      }
+    }
+    let f = get(req.query_params, "focal", "")
+    return res_json(bins_frame(bytes(req.body), dims, bin_cfg(), f == "" ? nil : to_number(f) * 1.0))
   }),
   "POST /api/check": api(fn (req) {
     let b = bin_name(get(req.query_params, "bin", ""))

@@ -112,6 +112,8 @@ fn bin_truth() { return {"w": BW, "h": BH, "d": BD, "W": W, "H": H, "F": F} }
 
 // A photo as a dark, dirty warehouse gives it. opts (each off unless given):
 //   dark (0..1: how much light is missing; the phone then lifts the picture back, and its grain with it)
+//   lift (0..1: how much of the missing light the phone gives back; 1, a still photo. A live preview cannot expose
+//   long, so it gives back little: dark and grainy)
 //   cast ([r g b] multipliers: a sodium lamp's orange is [1.0, 0.72, 0.38])
 //   vignette (0..1), hotspot ([x y radius strength]: a work light's bright patch), shadow ([[x y] ...] a hard shadow
 //   polygon and how dark, [points, 0..1]), blur (pixels), grime (how many smears), seed
@@ -133,13 +135,16 @@ fn warehouse_light(jpeg, opts) {
     canvas_set_fill_color(cv, format("rgba(0, 0, 0, {:.2f})", opts.shadow[1]))
     canvas_fill_polygon(cv, opts.shadow[0])
   }
+  // shake blurs the scene before the sensor adds its grain
+  let b = get(opts, "blur", 0)
+  if b > 0 { cv = image_resample(image_resample(cv, max(1, round(w / (b + 1.0))), max(1, round(h / (b + 1.0)))), w, h) }
   let px = bytes(canvas_to_bytes(cv, "argb"))
   let dark = get(opts, "dark", 0.0)
   let cast = get(opts, "cast", [1.0, 1.0, 1.0])
   let vig = get(opts, "vignette", 0.0)
   let hs = get(opts, "hotspot", nil)
   // the phone's lift: what was (1 - dark) of the light is stretched back to the whole range, the sensor's noise with it
-  let lift = 1.0 / max(0.05, 1.0 - dark)
+  let lift = 1.0 + (1.0 / max(0.05, 1.0 - dark) - 1.0) * get(opts, "lift", 1.0)
   let noise = 3.0 + 40.0 * dark
   for y in 0..h {
     let dy = (y - h / 2.0) / (h / 2.0)
@@ -162,8 +167,6 @@ fn warehouse_light(jpeg, opts) {
   }
   let out = canvas_create(w, h)
   canvas_set_pixels(out, bytes_from_argb(px, w, h))
-  let b = get(opts, "blur", 0)
-  if b > 0 { out = image_resample(image_resample(out, max(1, round(w / (b + 1.0))), max(1, round(h / (b + 1.0)))), w, h) }
   return canvas_to_jpeg(out, 85)
 }
 

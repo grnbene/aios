@@ -1279,6 +1279,14 @@ double quad_area(const P2* q) {
   return std::fabs(a) / 2;
 }
 
+double luma_at(const std::vector<uint32_t>& px, uint32_t W, uint32_t H, double x, double y) {
+  x = std::clamp(x - 0.5, 0.0, (double)W - 1); y = std::clamp(y - 0.5, 0.0, (double)H - 1);
+  const int x0 = (int)x, y0 = (int)y, x1 = std::min<int>(x0 + 1, W - 1), y1 = std::min<int>(y0 + 1, H - 1);
+  const double tx = x - x0, ty = y - y0;
+  auto l = [&](int xx, int yy) { const uint32_t p = px[(size_t)yy * W + xx]; return 0.299 * ((p >> 16) & 255) + 0.587 * ((p >> 8) & 255) + 0.114 * (p & 255); };
+  return (l(x0, y0) * (1 - tx) + l(x1, y0) * tx) * (1 - ty) + (l(x0, y1) * (1 - tx) + l(x1, y1) * tx) * ty;
+}
+
 // A dark quadrilateral with holes in it (a printed marker of either kind): its corners in the picture's pixels,
 // clockwise from the top left, refined along each side; how much of it its holes are, how far off its centre they
 // sit, and whether they are bright (the paper's white) against it.
@@ -1481,6 +1489,38 @@ Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
   res->put("side_px", Value::real(best.side));
   res->put("score", Value::real(best.score));
   res->put("found", Value::integer((int64_t)cands.size()));
+  // how blurred the picture is, in pixels: the printed edge is a sharp step from black to white, so the distance
+  // over which the luma climbs from 10% to 90% of the step, across each side (the median of samples along it), is
+  // what shake and focus did to it - about one pixel for a steady, focused picture
+  {
+    std::vector<double> widths;
+    for (int sd = 0; sd < 4; ++sd) {
+      const P2 a = best.c[sd], b = best.c[(sd + 1) % 4];
+      const double len = std::hypot(b.x - a.x, b.y - a.y);
+      if (len < 8) continue;
+      // the outward normal (the corners run clockwise in the picture)
+      const double nx = (b.y - a.y) / len, ny = -(b.x - a.x) / len;
+      for (int k = 1; k <= 12; ++k) {
+        const double t = 0.2 + 0.6 * k / 13.0;
+        const double px0 = a.x + (b.x - a.x) * t, py0 = a.y + (b.y - a.y) * t;
+        std::vector<double> prof;
+        for (double d = -6; d <= 6.001; d += 0.25) prof.push_back(luma_at(*px, W, H, px0 + nx * d, py0 + ny * d));
+        const double lo = *std::min_element(prof.begin(), prof.end()), hi = *std::max_element(prof.begin(), prof.end());
+        if (hi - lo < 30) continue;
+        double p10 = -1, p90 = -1;
+        for (size_t i = 0; i < prof.size(); ++i) {
+          const double f = (prof[i] - lo) / (hi - lo);
+          if (p10 < 0 && f >= 0.1) p10 = i * 0.25;
+          if (p90 < 0 && f >= 0.9) { p90 = i * 0.25; break; }
+        }
+        if (p10 >= 0 && p90 >= p10) widths.push_back(p90 - p10);
+      }
+    }
+    if (!widths.empty()) {
+      std::nth_element(widths.begin(), widths.begin() + widths.size() / 2, widths.end());
+      res->put("edge_px", Value::real(widths[widths.size() / 2]));
+    }
+  }
   return Value::object(Type::Map, res);
 }
 
@@ -1525,13 +1565,6 @@ const std::vector<int>& marker_codes() {
   return codes;
 }
 
-double luma_at(const std::vector<uint32_t>& px, uint32_t W, uint32_t H, double x, double y) {
-  x = std::clamp(x - 0.5, 0.0, (double)W - 1); y = std::clamp(y - 0.5, 0.0, (double)H - 1);
-  const int x0 = (int)x, y0 = (int)y, x1 = std::min<int>(x0 + 1, W - 1), y1 = std::min<int>(y0 + 1, H - 1);
-  const double tx = x - x0, ty = y - y0;
-  auto l = [&](int xx, int yy) { const uint32_t p = px[(size_t)yy * W + xx]; return 0.299 * ((p >> 16) & 255) + 0.587 * ((p >> 8) & 255) + 0.114 * (p & 255); };
-  return (l(x0, y0) * (1 - tx) + l(x1, y0) * tx) * (1 - ty) + (l(x0, y1) * (1 - tx) + l(x1, y1) * tx) * ty;
-}
 
 Value bi_markers_find(Vm&, std::vector<Value>& args, std::string& error) {
   uint32_t W = 0, H = 0;
@@ -2783,6 +2816,78 @@ Value bi_mesh_lowest(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::list(std::move(out));
 }
 
+// image_quality(canvas) -> {brightness, dark, clipped, sharpness, noise, w, h}: what a photo is like to work from -
+// brightness: the mean lightness (0..1); dark: the share of pixels near black (under 0.08); clipped: near white (over
+// 0.98: glare, a blown-out flash); sharpness: the spread of the luma's Laplacian over the luma's own mean spread
+// (an in-focus, steady picture has crisp edges; shake and focus blur take them) - comparable between pictures of
+// one size, roughly so between sizes; noise: the sensor's grain (0..1 of full scale, Immerkaer's estimate) - a dark
+// scene a phone has brightened is grainy, not dim. For a camera guiding its user: too dark, glare, hold still.
+Value bi_image_quality(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_quality")) return Value::nil();
+  if (W < 8 || H < 8) { error = "image_quality(): the picture is smaller than 8x8"; return Value::nil(); }
+  const size_t n = (size_t)W * H;
+  std::vector<float> Y(n);
+  double sum = 0;
+  size_t dark = 0, clip = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t p = (*px)[i];
+    const float y = (0.299f * ((p >> 16) & 255) + 0.587f * ((p >> 8) & 255) + 0.114f * (p & 255)) / 255.0f;
+    Y[i] = y;
+    sum += y;
+    dark += y < 0.08f;
+    clip += y > 0.98f;
+  }
+  const double mean = sum / n;
+  // the grain (Immerkaer's estimate: the mean absolute response to a mask that cancels smooth shading and edges
+  // alike, leaving the sensor's noise) - a phone lifting a dark scene shows as heavy grain, not as darkness
+  double nsum = 0;
+  for (uint32_t y = 1; y + 1 < H; ++y)
+    for (uint32_t x = 1; x + 1 < W; ++x) {
+      const size_t i = (size_t)y * W + x;
+      const double v = Y[i - W - 1] - 2 * Y[i - W] + Y[i - W + 1] - 2 * Y[i - 1] + 4 * Y[i] - 2 * Y[i + 1] + Y[i + W - 1] - 2 * Y[i + W] + Y[i + W + 1];
+      nsum += std::fabs(v);
+    }
+  const double noise = std::sqrt(M_PI / 2.0) * nsum / (6.0 * (W - 2) * (H - 2));
+  // sharpness on the luma smoothed 3 x 3 (the grain mostly gone, real edges kept): the Laplacian's spread over the
+  // luma's own spread, so a dim picture's smaller edges are not taken for blur
+  std::vector<float> S(n);
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x) {
+      double a = 0;
+      int c = 0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int xx = (int)x + dx, yy = (int)y + dy;
+          if (xx < 0 || yy < 0 || xx >= (int)W || yy >= (int)H) continue;
+          a += Y[(size_t)yy * W + xx]; ++c;
+        }
+      S[(size_t)y * W + x] = (float)(a / c);
+    }
+  double l1 = 0, l2 = 0, v2 = 0;
+  size_t m = 0;
+  for (uint32_t y = 2; y + 2 < H; ++y)
+    for (uint32_t x = 2; x + 2 < W; ++x) {
+      const size_t i = (size_t)y * W + x;
+      const double L = 4.0 * S[i] - S[i - 2] - S[i + 2] - S[i - 2 * W] - S[i + 2 * W];
+      l1 += L; l2 += L * L;
+      v2 += (S[i] - mean) * (S[i] - mean);
+      ++m;
+    }
+  const double lap_var = l2 / m - (l1 / m) * (l1 / m);
+  const double luma_sd = std::sqrt(v2 / m);
+  auto res = std::make_shared<MapObj>();
+  res->put("brightness", Value::real(mean));
+  res->put("dark", Value::real((double)dark / n));
+  res->put("clipped", Value::real((double)clip / n));
+  res->put("sharpness", Value::real(luma_sd > 1e-6 ? std::sqrt(lap_var) / luma_sd : 0.0));
+  res->put("noise", Value::real(noise));
+  res->put("w", Value::integer(W));
+  res->put("h", Value::integer(H));
+  return Value::object(Type::Map, res);
+}
+
 // ---- tires ----------------------------------------------------------------------------------------------------
 
 Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
@@ -2838,6 +2943,7 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("camera_pose_rect", 5, 6, bi_camera_pose_rect);
   vm.define_native("box_face_views", 6, 6, bi_box_face_views);
   vm.define_native("mesh_lowest", 2, 2, bi_mesh_lowest);
+  vm.define_native("image_quality", 1, 1, bi_image_quality);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }

@@ -38,6 +38,19 @@ a { color: var(--accent); }
 <p class="lead">How full every bin is from what the ERP says is in it, and where a size still fits. Measure a bin with your phone: <a href="/marker.png" target="_blank">print the marker</a>, tape it flat on the bin's front, photograph the bin, drag the four corners onto the opening and the blue one onto the back corner of its floor. Photograph it again any time to check what is really in it.</p>
 
 <div class="card">
+  <h2>Live camera</h2>
+  <p class="muted" style="margin:0 0 6px">Point it at a bin with its marker in view. It tells you what to fix and takes the photo itself when the light, the framing and your hands are right.</p>
+  <div class="row">
+    <div><input id="lbin" placeholder="Bin, e.g. R1-01" autocomplete="off"></div>
+    <select id="lmode" style="flex:0 0 auto"><option value="check">Check it</option><option value="measure">Measure it</option></select>
+  </div>
+  <div class="row"><button class="go" id="lstart" style="margin-top:0">Start the camera</button><button id="ltorch" style="flex:0 0 auto;display:none">Torch</button></div>
+  <div id="lview" style="position:relative;display:none;margin-top:10px"><video id="lvideo" playsinline muted style="width:100%;border-radius:8px;display:block"></video><canvas id="lover" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  <div id="ladvice" style="font-size:18px;font-weight:600;min-height:1.5em;margin-top:8px"></div>
+  <div id="lstatus" class="muted"></div>
+</div>
+
+<div class="card">
   <h2>Measure a bin</h2>
   <div class="row"><div><label class="f" for="bin">Bin</label><input id="bin" placeholder="e.g. R1-01" autocomplete="off"></div>
     <div><label class="f" for="depth">Depth, mm (if not tapped)</label><input id="depth" inputmode="numeric" value="1000"></div></div>
@@ -133,22 +146,13 @@ function draw() {
   const r = Math.max(10, cv.width / 50);
   corners.forEach((p, i) => { c.beginPath(); c.arc(p[0] * k, p[1] * k, r, 0, 7); c.fillStyle = i < 4 ? 'rgba(255,106,43,.85)' : 'rgba(43,160,255,.9)'; c.fill(); });
 }
-$('photo').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  const bin = $('bin').value.trim();
-  if (!bin) { $('mstatus').textContent = 'Name the bin first.'; e.target.value = ''; return; }
-  $('mstatus').textContent = 'Finding the marker...';
-  const bmp = await createImageBitmap(f);
-  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
-  const c = document.createElement('canvas');
-  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+// a picture (a canvas) to measure: kept, its marker found, the handles put round it
+async function measureCanvas(bin, c, focal) {
   const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
-  const f35 = await exifFocal35(f);
   try {
     const j = await api('/api/photo?bin=' + encodeURIComponent(bin), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
-    shot = {img: c, photo_id: j.photo_id, marker: j.marker, w: j.w, h: j.h, focal: focalPx(f35, j.w, j.h)};
+    $('bin').value = bin;
+    shot = {img: c, photo_id: j.photo_id, marker: j.marker, w: j.w, h: j.h, focal: focal};
     // the opening's corners start a little way out from the marker: drag each onto the opening's corner
     const m = j.marker.corners, cx = j.marker.centre[0], cy = j.marker.centre[1], s = j.marker.side_px * 2.5;
     // (kept 6% inside the photo: a handle on its very edge cannot be grabbed)
@@ -160,6 +164,24 @@ $('photo').addEventListener('change', async (e) => {
     $('save').disabled = false;
     $('mstatus').textContent = 'Marker found (green). Drag the orange corners onto the bin opening\'s corners, and the blue one onto the back corner of the bin\'s floor (for its depth).' + (shot.focal ? ' Lens from the photo.' : '');
   } catch (err) { $('mstatus').textContent = err.message; }
+}
+// a photo file as a canvas at up to 2000 across, and its lens (EXIF) in pixels at that size
+async function fileCanvas(f) {
+  const bmp = await createImageBitmap(f);
+  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  return {c: c, focal: focalPx(await exifFocal35(f), c.width, c.height)};
+}
+$('photo').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const bin = $('bin').value.trim();
+  if (!bin) { $('mstatus').textContent = 'Name the bin first.'; e.target.value = ''; return; }
+  $('mstatus').textContent = 'Finding the marker...';
+  const p = await fileCanvas(f);
+  await measureCanvas(bin, p.c, p.focal);
 });
 let drag = -1;
 function at(ev) { const r = cv.getBoundingClientRect(), k = shot.w / r.width; return [(ev.clientX - r.left) * k, (ev.clientY - r.top) * k]; }
@@ -189,25 +211,110 @@ $('save').addEventListener('click', async () => {
 // ---- checking a bin ----
 const VERDICT = {agrees: 'The photo agrees with the ERP.', erp_has_more: 'The ERP has stock in this bin, but it looks empty.',
                  photo_has_more: 'Something is in this bin the ERP does not have there.', unsure: 'Too little of the bin could be compared: photograph it straighter on, with the marker in view.'};
+// a picture (a canvas) to check the bin with
+async function checkCanvas(bin, c, focal) {
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  try {
+    const j = await api('/api/check?bin=' + encodeURIComponent(bin) + (focal ? '&focal=' + focal.toFixed(1) : ''), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+    const text = bin + ': ' + Math.round(j.changed * 100) + '% of the opening shows stock; the ERP has it ' + Math.round(j.erp_fill * 100) + '% full. ' + VERDICT[j.verdict];
+    $('cstatus').textContent = text;
+    return text;
+  } catch (err) { $('cstatus').textContent = err.message; return err.message; }
+}
 $('cphoto').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   const bin = $('cbin').value.trim();
   if (!bin) { $('cstatus').textContent = 'Name the bin first.'; e.target.value = ''; return; }
   $('cstatus').textContent = 'Checking...';
-  const bmp = await createImageBitmap(f);
-  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
-  const c = document.createElement('canvas');
-  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
-  const fp = focalPx(await exifFocal35(f), c.width, c.height);
-  try {
-    const j = await api('/api/check?bin=' + encodeURIComponent(bin) + (fp ? '&focal=' + fp.toFixed(1) : ''), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
-    $('cstatus').textContent = bin + ': ' + Math.round(j.changed * 100) + '% of the opening shows stock; the ERP has it ' + Math.round(j.erp_fill * 100) + '% full. ' + VERDICT[j.verdict];
-  } catch (err) { $('cstatus').textContent = err.message; }
+  const p = await fileCanvas(f);
+  await checkCanvas(bin, p.c, p.focal);
   e.target.value = '';
 });
+
+// ---- the live camera: frames judged as they come, the photo taken when they are right ----
+let live = null;   // {stream, track, timer, busy, sharp: [recent sharpness], done}
+async function liveStart() {
+  const bin = $('lbin').value.trim();
+  if (!bin) { $('lstatus').textContent = 'Name the bin first.'; return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('lstatus').textContent = 'This browser will not open the camera here: the live camera needs the page over https (or on this machine). The photo buttons below still work.';
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', width: {ideal: 1920}, height: {ideal: 1440}}, audio: false});
+  } catch (err) { $('lstatus').textContent = 'The camera did not open: ' + err.message; return; }
+  const v = $('lvideo');
+  v.srcObject = stream;
+  await v.play();
+  $('lview').style.display = 'block';
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  $('ltorch').style.display = caps.torch ? 'inline-block' : 'none';
+  live = {stream: stream, track: track, busy: false, sharp: [], done: false, torch: false, bin: bin, mode: $('lmode').value};
+  $('lstart').textContent = 'Stop the camera';
+  live.timer = setInterval(liveTick, 400);
+}
+function liveStop() {
+  if (!live) return;
+  clearInterval(live.timer);
+  live.stream.getTracks().forEach(t => t.stop());
+  live = null;
+  $('lstart').textContent = 'Start the camera';
+}
+$('lstart').addEventListener('click', () => live ? liveStop() : liveStart());
+$('ltorch').addEventListener('click', async () => {
+  if (!live) return;
+  live.torch = !live.torch;
+  try { await live.track.applyConstraints({advanced: [{torch: live.torch}]}); } catch (err) {}
+});
+function liveDraw(j, k) {
+  const o = $('lover'), v = $('lvideo');
+  o.width = v.videoWidth; o.height = v.videoHeight;
+  const g = o.getContext('2d');
+  g.clearRect(0, 0, o.width, o.height);
+  g.lineWidth = Math.max(3, o.width / 250);
+  const path = (pts, col) => { if (!pts || pts.some(p => !p)) return; g.strokeStyle = col; g.beginPath(); pts.forEach((p, i) => i ? g.lineTo(p[0] / k, p[1] / k) : g.moveTo(p[0] / k, p[1] / k)); g.closePath(); g.stroke(); };
+  path(j.marker, '#2f9d5f');
+  path(j.opening, j.ready ? '#2f9d5f' : '#ff6a2b');
+}
+async function liveTick() {
+  if (!live || live.busy || live.done) return;
+  const v = $('lvideo');
+  if (!v.videoWidth) return;
+  live.busy = true;
+  // a small frame to judge
+  const k = 640 / v.videoWidth;
+  const s = document.createElement('canvas');
+  s.width = 640; s.height = Math.round(v.videoHeight * k);
+  s.getContext('2d').drawImage(v, 0, 0, s.width, s.height);
+  const small = await new Promise(r => s.toBlob(r, 'image/jpeg', 0.8));
+  try {
+    const j = await api('/api/frame?bin=' + encodeURIComponent(live.bin), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: small});
+    liveDraw(j, k);
+    live.sharp.push(j.quality.sharpness);
+    if (live.sharp.length > 8) live.sharp.shift();
+    // steady: as sharp as the sharpest of the last few frames (a moving hand blurs the frame it is in)
+    const steady = live.sharp.length >= 3 && j.quality.sharpness >= 0.9 * Math.max(...live.sharp);
+    const advice = j.advice.slice();
+    if (j.ready && !steady) advice.push('Hold still');
+    $('ladvice').textContent = advice.length ? advice[0] : 'Hold it there...';
+    if (j.ready && steady) {
+      live.done = true;
+      $('ladvice').textContent = 'Got it';
+      // the photo itself: the camera's full frame
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth; c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0);
+      const bin = live.bin, mode = live.mode;
+      liveStop();
+      if (mode === 'check') { $('cbin').value = bin; $('lstatus').textContent = await checkCanvas(bin, c, null); }
+      else { $('lstatus').textContent = 'Photo taken: drag the handles below onto the opening and the floor\'s back corner.'; await measureCanvas(bin, c, null); }
+    }
+  } catch (err) { $('ladvice').textContent = err.message; }
+  if (live) live.busy = false;
+}
 
 // ---- where a size fits ----
 $('find').addEventListener('click', async () => {
