@@ -3,15 +3,16 @@
 // a model in the time of a request (apps/sqldoom/lib/carve.gr builds Doom's monsters from them).
 //
 //   image_cutout(canvas[, opts])  -> {canvas, mask, w, h, bbox: {x, y, w, h}, coverage, threshold, background}
-//       The subject of a photo taken against a plainer background (paper, a wall, a table): the background's colours
-//       are learnt from the picture's border (k-means in CIELAB), each pixel scored by how far it is from the nearest
-//       of them, the threshold between the two found from the scores (Otsu's), the background grown in from the
-//       border through what is below it, and what is left kept as the subject - its largest connected piece, with
-//       its holes filled. The edge is then decided again from a colour model of the subject itself (each pixel near
-//       the edge goes to whichever model it is closer to) and feathered over one pixel.
+//       The subject of a photo, framed inside its border: GrabCut - colour models of subject and background
+//       (mixtures of Gaussians in CIELAB), and the least costly cut between them, each cell paying for its side under
+//       the models and every pair of neighbours put apart paying more the more alike they look; found as a minimum
+//       cut (Boykov-Kolmogorov) and the models learnt again from it, a few rounds. A band round the border is taken
+//       as background. Then the largest piece is kept, its holes filled, and the edge feathered over one pixel.
 //       canvas: the picture with every pixel outside the subject made transparent; mask: bytes, one 0..255 a pixel
-//       (top row first). opts: {tolerance (scales the threshold; 1), background: [r g b] (the background's colour,
-//       instead of learning it), keep: "largest" | "all" (the pieces kept), max_side (the analysis size; 512)}.
+//       (top row first). opts: {margin (the band, a share of the shorter side; 0.025), background: [r g b] (cells
+//       of about this colour joined to the border are background too), iterations (5), smoothness (50), keep:
+//       "largest" | "all", max_side (the analysis size; 512)}. A picture where nothing stands out from the border's
+//       colours is refused.
 //   image_quantize(canvas, palette[, opts]) -> {indices, mask, w, h}
 //       Each pixel's nearest colour (CIELAB distance) among palette's (bytes, 3 a colour: R G B), with Floyd-Steinberg
 //       error diffusion among the opaque pixels when opts.dither. indices: bytes, one a pixel; mask: bytes, 1 where
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <string>
@@ -264,6 +266,263 @@ std::vector<float> distance_inside(const std::vector<uint8_t>& inside, int w, in
   return out;
 }
 
+// ---- GrabCut's parts: a Gaussian mixture, and a maximum flow ------------------------------------------------
+
+// A mixture of Gaussians over CIELAB colours (full covariance): fitted by k-means and one round of assigning each
+// sample to its likeliest component; cost(c) is -log of the mixture's density at c.
+struct Gmm {
+  struct Comp { double w = 0, m[3] = {0, 0, 0}, inv[9] = {0}, logdet = 0; };
+  std::vector<Comp> comps;
+  static double v(const Lab& c, int k) { return k == 0 ? c.l : k == 1 ? c.a : c.b; }
+  double comp_cost(const Comp& q, const Lab& c) const {
+    const double d[3] = {c.l - q.m[0], c.a - q.m[1], c.b - q.m[2]};
+    double m = 0;
+    for (int r = 0; r < 3; ++r)
+      for (int k = 0; k < 3; ++k) m += d[r] * q.inv[r * 3 + k] * d[k];
+    return 0.5 * m + 0.5 * q.logdet;
+  }
+  double cost(const Lab& c) const {
+    // -log sum_k w_k N(c): with the smallest exponent factored out, so far colours do not underflow to zero
+    double best = std::numeric_limits<double>::max();
+    std::vector<double> e(comps.size());
+    for (size_t k = 0; k < comps.size(); ++k) { e[k] = comp_cost(comps[k], c) - std::log(comps[k].w); best = std::min(best, e[k]); }
+    double s = 0;
+    for (double x : e) s += std::exp(best - x);
+    return best - std::log(s);
+  }
+  void fit(const std::vector<Lab>& s, int K) {
+    // k-means on a sample for the start
+    std::vector<Lab> sample;
+    const size_t step = std::max<size_t>(1, s.size() / 20000);
+    for (size_t i = 0; i < s.size(); i += step) sample.push_back(s[i]);
+    const std::vector<Cluster> cs = kmeans(sample, K);
+    std::vector<Comp> start;
+    for (const Cluster& c : cs) {
+      Comp q;
+      q.w = 1.0 / cs.size();
+      q.m[0] = c.c.l; q.m[1] = c.c.a; q.m[2] = c.c.b;
+      for (int k = 0; k < 3; ++k) q.inv[k * 4] = 1.0;
+      start.push_back(q);
+    }
+    comps = start;
+    // each sample to its nearest centre, then each component's weight, mean and covariance from its samples
+    std::vector<double> sum(comps.size() * 3, 0), sq(comps.size() * 9, 0);
+    std::vector<size_t> cnt(comps.size(), 0);
+    for (const Lab& c : s) {
+      size_t bi = 0;
+      double bd = std::numeric_limits<double>::max();
+      for (size_t k = 0; k < comps.size(); ++k) {
+        const double dl = c.l - comps[k].m[0], da = c.a - comps[k].m[1], db = c.b - comps[k].m[2];
+        const double d = dl * dl + da * da + db * db;
+        if (d < bd) { bd = d; bi = k; }
+      }
+      ++cnt[bi];
+      for (int r = 0; r < 3; ++r) {
+        sum[bi * 3 + r] += v(c, r);
+        for (int k = 0; k < 3; ++k) sq[bi * 9 + r * 3 + k] += v(c, r) * v(c, k);
+      }
+    }
+    std::vector<Comp> out;
+    for (size_t k = 0; k < comps.size(); ++k) {
+      if (cnt[k] == 0) continue;
+      Comp q;
+      q.w = (double)cnt[k] / s.size();
+      for (int r = 0; r < 3; ++r) q.m[r] = sum[k * 3 + r] / cnt[k];
+      double C[9];
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) C[r * 3 + c] = sq[k * 9 + r * 3 + c] / cnt[k] - q.m[r] * q.m[c];
+      // a floor under each variance (one ΔE unit): a flat colour does not make a singular component
+      for (int r = 0; r < 3; ++r) C[r * 4] += 1.0;
+      const double det = C[0] * (C[4] * C[8] - C[5] * C[7]) - C[1] * (C[3] * C[8] - C[5] * C[6]) + C[2] * (C[3] * C[7] - C[4] * C[6]);
+      if (!(det > 1e-12)) continue;
+      q.inv[0] = (C[4] * C[8] - C[5] * C[7]) / det; q.inv[1] = (C[2] * C[7] - C[1] * C[8]) / det; q.inv[2] = (C[1] * C[5] - C[2] * C[4]) / det;
+      q.inv[3] = (C[5] * C[6] - C[3] * C[8]) / det; q.inv[4] = (C[0] * C[8] - C[2] * C[6]) / det; q.inv[5] = (C[2] * C[3] - C[0] * C[5]) / det;
+      q.inv[6] = (C[3] * C[7] - C[4] * C[6]) / det; q.inv[7] = (C[1] * C[6] - C[0] * C[7]) / det; q.inv[8] = (C[0] * C[4] - C[1] * C[3]) / det;
+      q.logdet = std::log(det);
+      out.push_back(q);
+    }
+    if (!out.empty()) comps = std::move(out);
+  }
+};
+
+// The maximum flow / minimum cut of a graph with a source and a sink (Boykov and Kolmogorov's algorithm: two
+// search trees grown from the terminals, augmented where they meet, orphans re-adopted), for the grid graphs of
+// vision, where it is far faster than the general algorithms.
+class Maxflow {
+ public:
+  Maxflow(size_t nodes, size_t edges_hint) : nodes_(nodes) { arcs_.reserve(edges_hint * 2); }
+  void set_tweights(int i, double to_source, double to_sink) { nodes_[(size_t)i].tr_cap = to_source - to_sink; }
+  void add_edge(int i, int j, double cap, double rev_cap) {
+    const int a = (int)arcs_.size();
+    arcs_.push_back({j, nodes_[(size_t)i].first, a + 1, cap});
+    nodes_[(size_t)i].first = a;
+    arcs_.push_back({i, nodes_[(size_t)j].first, a, rev_cap});
+    nodes_[(size_t)j].first = a + 1;
+  }
+  bool source_side(int i) const { const Node& v = nodes_[(size_t)i]; return v.parent != NONE && !v.sink; }
+  void run() {
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+      Node& v = nodes_[i];
+      if (v.tr_cap > 0) { v.sink = false; v.parent = TERMINAL; activate((int)i); v.ts = 0; v.dist = 1; }
+      else if (v.tr_cap < 0) { v.sink = true; v.parent = TERMINAL; activate((int)i); v.ts = 0; v.dist = 1; }
+      else v.parent = NONE;
+    }
+    int cur = -1;
+    while (true) {
+      // the next active node (one may have left the trees since it was queued)
+      if (cur < 0 || nodes_[(size_t)cur].parent == NONE) {
+        cur = -1;
+        while (!active_.empty()) {
+          const int i = active_.front();
+          active_.pop_front();
+          nodes_[(size_t)i].queued = false;
+          if (nodes_[(size_t)i].parent != NONE) { cur = i; break; }
+        }
+        if (cur < 0) break;
+      }
+      Node& v = nodes_[(size_t)cur];
+      int meet = -1;   // an arc from the source tree to the sink tree
+      if (!v.sink) {
+        for (int a = v.first; a >= 0; a = arcs_[(size_t)a].next) {
+          if (arcs_[(size_t)a].r_cap <= 0) continue;
+          Node& u = nodes_[(size_t)arcs_[(size_t)a].head];
+          if (u.parent == NONE) { u.sink = false; u.parent = arcs_[(size_t)a].sister; u.ts = v.ts; u.dist = v.dist + 1; activate(arcs_[(size_t)a].head); }
+          else if (u.sink) { meet = a; break; }
+          else if (u.ts <= v.ts && u.dist > v.dist) { u.parent = arcs_[(size_t)a].sister; u.ts = v.ts; u.dist = v.dist + 1; }
+        }
+      } else {
+        for (int a = v.first; a >= 0; a = arcs_[(size_t)a].next) {
+          if (arcs_[(size_t)arcs_[(size_t)a].sister].r_cap <= 0) continue;
+          Node& u = nodes_[(size_t)arcs_[(size_t)a].head];
+          if (u.parent == NONE) { u.sink = true; u.parent = arcs_[(size_t)a].sister; u.ts = v.ts; u.dist = v.dist + 1; activate(arcs_[(size_t)a].head); }
+          else if (!u.sink) { meet = arcs_[(size_t)a].sister; break; }
+          else if (u.ts <= v.ts && u.dist > v.dist) { u.parent = arcs_[(size_t)a].sister; u.ts = v.ts; u.dist = v.dist + 1; }
+        }
+      }
+      ++time_;
+      if (meet < 0) { cur = -1; continue; }
+      // keep growing from this node after the augmentation, if it is still in a tree
+      augment(meet);
+      adopt();
+      if (nodes_[(size_t)cur].parent == NONE) cur = -1;
+    }
+  }
+
+ private:
+  static constexpr int NONE = -1, TERMINAL = -2, ORPHAN = -3;
+  struct Node { int first = -1, parent = NONE, ts = 0, dist = 0; double tr_cap = 0; bool sink = false, queued = false; };
+  struct Arc { int head, next, sister; double r_cap; };
+  std::vector<Node> nodes_;
+  std::vector<Arc> arcs_;
+  std::deque<int> active_, orphans_;
+  int time_ = 0;
+
+  void activate(int i) { if (!nodes_[(size_t)i].queued) { nodes_[(size_t)i].queued = true; active_.push_back(i); } }
+  int tail(int a) const { return arcs_[(size_t)arcs_[(size_t)a].sister].head; }
+  void orphan(int i) { nodes_[(size_t)i].parent = ORPHAN; orphans_.push_back(i); }
+
+  void augment(int meet) {
+    double d = arcs_[(size_t)meet].r_cap;
+    // the bottleneck up the source tree, then down to the sink
+    for (int i = tail(meet);;) {
+      const int a = nodes_[(size_t)i].parent;
+      if (a == TERMINAL) { d = std::min(d, nodes_[(size_t)i].tr_cap); break; }
+      d = std::min(d, arcs_[(size_t)arcs_[(size_t)a].sister].r_cap);
+      i = arcs_[(size_t)a].head;
+    }
+    for (int i = arcs_[(size_t)meet].head;;) {
+      const int a = nodes_[(size_t)i].parent;
+      if (a == TERMINAL) { d = std::min(d, -nodes_[(size_t)i].tr_cap); break; }
+      d = std::min(d, arcs_[(size_t)a].r_cap);
+      i = arcs_[(size_t)a].head;
+    }
+    arcs_[(size_t)arcs_[(size_t)meet].sister].r_cap += d;
+    arcs_[(size_t)meet].r_cap -= d;
+    for (int i = tail(meet);;) {
+      const int a = nodes_[(size_t)i].parent;
+      if (a == TERMINAL) {
+        nodes_[(size_t)i].tr_cap -= d;
+        if (nodes_[(size_t)i].tr_cap <= 0) orphan(i);
+        break;
+      }
+      arcs_[(size_t)a].r_cap += d;
+      arcs_[(size_t)arcs_[(size_t)a].sister].r_cap -= d;
+      const int up = arcs_[(size_t)a].head;
+      if (arcs_[(size_t)arcs_[(size_t)a].sister].r_cap <= 0) orphan(i);
+      i = up;
+    }
+    for (int i = arcs_[(size_t)meet].head;;) {
+      const int a = nodes_[(size_t)i].parent;
+      if (a == TERMINAL) {
+        nodes_[(size_t)i].tr_cap += d;
+        if (nodes_[(size_t)i].tr_cap >= 0) orphan(i);
+        break;
+      }
+      arcs_[(size_t)arcs_[(size_t)a].sister].r_cap += d;
+      arcs_[(size_t)a].r_cap -= d;
+      const int up = arcs_[(size_t)a].head;
+      if (arcs_[(size_t)a].r_cap <= 0) orphan(i);
+      i = up;
+    }
+  }
+
+  // how far i is from its terminal through valid parents (INT_MAX: its root is an orphan), marking the path
+  int origin_dist(int j) {
+    int d = 0;
+    int k = j;
+    while (true) {
+      if (nodes_[(size_t)k].ts == time_) { d += nodes_[(size_t)k].dist; break; }
+      const int a = nodes_[(size_t)k].parent;
+      ++d;
+      if (a == TERMINAL) { nodes_[(size_t)k].ts = time_; nodes_[(size_t)k].dist = 1; break; }
+      if (a == ORPHAN || a == NONE) return std::numeric_limits<int>::max();
+      k = arcs_[(size_t)a].head;
+    }
+    // the distances along the path, for the next searches
+    int dd = d;
+    for (k = j; nodes_[(size_t)k].ts != time_; k = arcs_[(size_t)nodes_[(size_t)k].parent].head) {
+      nodes_[(size_t)k].ts = time_;
+      nodes_[(size_t)k].dist = dd--;
+    }
+    return d;
+  }
+
+  void adopt() {
+    while (!orphans_.empty()) {
+      const int i = orphans_.front();
+      orphans_.pop_front();
+      Node& v = nodes_[(size_t)i];
+      const bool sink = v.sink;
+      int best = NONE, dmin = std::numeric_limits<int>::max();
+      for (int a = v.first; a >= 0; a = arcs_[(size_t)a].next) {
+        // a parent must be able to pass flow to i (source tree) or take it from i (sink tree)
+        const double cap = sink ? arcs_[(size_t)a].r_cap : arcs_[(size_t)arcs_[(size_t)a].sister].r_cap;
+        if (cap <= 0) continue;
+        const int j = arcs_[(size_t)a].head;
+        if (nodes_[(size_t)j].sink != sink || nodes_[(size_t)j].parent == NONE) continue;
+        const int d = origin_dist(j);
+        if (d < dmin) { dmin = d; best = a; }
+      }
+      if (best != NONE) {
+        v.parent = best;
+        v.ts = time_;
+        v.dist = dmin + 1;
+        continue;
+      }
+      // no parent: i leaves its tree; its neighbours that could reach it become active, its children orphans
+      v.parent = NONE;
+      for (int a = v.first; a >= 0; a = arcs_[(size_t)a].next) {
+        const int j = arcs_[(size_t)a].head;
+        Node& u = nodes_[(size_t)j];
+        if (u.sink != sink || u.parent == NONE) continue;
+        const double cap = sink ? arcs_[(size_t)a].r_cap : arcs_[(size_t)arcs_[(size_t)a].sister].r_cap;
+        if (cap > 0) activate(j);
+        if (u.parent != TERMINAL && u.parent != ORPHAN && arcs_[(size_t)u.parent].head == i) orphan(j);
+      }
+    }
+  }
+};
+
 // ---- image_cutout ---------------------------------------------------------------------------------------------
 
 Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
@@ -272,8 +531,10 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
   if (!canvas_pixels(args[0], &W, &H, &px, error, "image_cutout")) return Value::nil();
   if (W < 8 || H < 8) { error = "image_cutout(): the picture is smaller than 8x8"; return Value::nil(); }
   MapObj* o = opts_map(args, 1);
-  const double tolerance = std::max(0.05, opt_num(o, "tolerance", 1.0));
   const int max_side = (int)std::clamp(opt_num(o, "max_side", 512), 64.0, 2048.0);
+  const int iterations = (int)std::clamp(opt_num(o, "iterations", 5), 1.0, 20.0);
+  const double gamma = std::clamp(opt_num(o, "smoothness", 50), 0.0, 1000.0);
+  const double margin = std::clamp(opt_num(o, "margin", 0.025), 0.002, 0.3);
   bool keep_all = false;
   if (o) if (const Value* k = o->find("keep"); k && k->type == Type::Str) {
     if (k->str() == "all") keep_all = true;
@@ -283,99 +544,120 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
   // the analysis picture: box-filtered down to max_side, each cell in CIELAB
   const double sc = std::max(1.0, (double)std::max(W, H) / max_side);
   const int w = std::max(8, (int)std::lround(W / sc)), h = std::max(8, (int)std::lround(H / sc));
-  std::vector<Lab> L((size_t)w * h);
+  const size_t n = (size_t)w * h;
+  std::vector<Lab> L(n);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const int x0 = (int)(x * (double)W / w), x1 = std::max(x0 + 1, (int)((x + 1) * (double)W / w));
       const int y0 = (int)(y * (double)H / h), y1 = std::max(y0 + 1, (int)((y + 1) * (double)H / h));
       double r = 0, g = 0, b = 0;
-      int n = 0;
+      int c = 0;
       for (int yy = y0; yy < std::min<int>(y1, H); ++yy)
         for (int xx = x0; xx < std::min<int>(x1, W); ++xx) {
           const uint32_t p = (*px)[(size_t)yy * W + xx];
-          r += (p >> 16) & 255; g += (p >> 8) & 255; b += p & 255; ++n;
+          r += (p >> 16) & 255; g += (p >> 8) & 255; b += p & 255; ++c;
         }
-      L[(size_t)y * w + x] = to_lab((uint8_t)(r / n + 0.5), (uint8_t)(g / n + 0.5), (uint8_t)(b / n + 0.5));
+      L[(size_t)y * w + x] = to_lab((uint8_t)(r / c + 0.5), (uint8_t)(g / c + 0.5), (uint8_t)(b / c + 0.5));
     }
 
-  // the background's colours: given, or learnt from a band around the border
-  std::vector<Cluster> bg;
-  Lab given{0, 0, 0};
-  bool have_given = false;
-  if (o) if (const Value* bv = o->find("background"); bv && bv->type == Type::List && bv->list_items().size() >= 3) {
-    const auto& it = bv->list_items();
-    given = to_lab((uint8_t)std::clamp<int64_t>(it[0].as_int(), 0, 255), (uint8_t)std::clamp<int64_t>(it[1].as_int(), 0, 255),
-                   (uint8_t)std::clamp<int64_t>(it[2].as_int(), 0, 255));
-    have_given = true;
-  }
-  const int band = std::max(2, std::min(w, h) / 40);
+  // what is certainly background: a band around the border (the subject is framed inside it), and with
+  // opts.background, every cell of about that colour joined to the border
+  const int band = std::max(1, (int)std::lround(std::min(w, h) * margin));
+  std::vector<uint8_t> sure_bg(n, 0);
   std::vector<Lab> border;
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
-      if (x < band || y < band || x >= w - band || y >= h - band) border.push_back(L[(size_t)y * w + x]);
-  if (have_given) {
-    float sp = 0;
-    for (const Lab& p : border) sp += dist2(p, given);
-    bg.push_back({given, std::sqrt(sp / border.size()), border.size()});
-  } else {
-    bg = kmeans(border, 5);
-    // a cluster holding under 3% of the border is the subject touching it, not background
-    std::vector<Cluster> kept;
-    for (const Cluster& c : bg) if (c.n * 100 >= border.size() * 3) kept.push_back(c);
-    if (!kept.empty()) bg = std::move(kept);
-  }
-  const float floor = 2.5f;   // ΔE: a background's spread is never taken as less than this
-  std::vector<float> score((size_t)w * h);
-  float smax = 0;
-  for (size_t i = 0; i < score.size(); ++i) { score[i] = cluster_distance(L[i], bg, floor); smax = std::max(smax, score[i]); }
-
-  // Otsu's threshold over the scores
-  const int NB = 256;
-  std::vector<double> hist(NB, 0);
-  const float top = std::max(smax, 1e-3f);
-  for (float s : score) hist[std::min(NB - 1, (int)(s / top * (NB - 1)))] += 1;
-  double total = (double)score.size(), sum = 0;
-  for (int i = 0; i < NB; ++i) sum += i * hist[i];
-  double wb = 0, sb = 0, best_var = -1;
-  int best_t = 0;
-  for (int t = 0; t < NB; ++t) {
-    wb += hist[t];
-    if (wb == 0) continue;
-    const double wf = total - wb;
-    if (wf == 0) break;
-    sb += t * hist[t];
-    const double mb = sb / wb, mf = (sum - sb) / wf;
-    const double var = wb * wf * (mb - mf) * (mb - mf);
-    if (var > best_var) { best_var = var; best_t = t; }
-  }
-  // never closer to the background than 3 of its spreads: a picture that is nearly all background still has one
-  float thr = std::max(3.0f, (float)((best_t + 0.5) / (NB - 1) * top));
-  thr = (float)(thr * tolerance);
-
-  // the background: grown in from the border through cells scoring under the threshold
-  std::vector<uint8_t> fg((size_t)w * h, 1);
-  {
+      if (x < band || y < band || x >= w - band || y >= h - band) { sure_bg[(size_t)y * w + x] = 1; border.push_back(L[(size_t)y * w + x]); }
+  if (o) if (const Value* bv = o->find("background"); bv && bv->type == Type::List && bv->list_items().size() >= 3) {
+    const auto& it = bv->list_items();
+    const Lab given = to_lab((uint8_t)std::clamp<int64_t>(it[0].as_int(), 0, 255), (uint8_t)std::clamp<int64_t>(it[1].as_int(), 0, 255),
+                             (uint8_t)std::clamp<int64_t>(it[2].as_int(), 0, 255));
     std::vector<int> stack;
-    auto seed = [&](int p) { if (fg[p] && score[p] < thr) { fg[p] = 0; stack.push_back(p); } };
-    for (int x = 0; x < w; ++x) { seed(x); seed((h - 1) * w + x); }
-    for (int y = 0; y < h; ++y) { seed(y * w); seed(y * w + w - 1); }
+    for (size_t i = 0; i < n; ++i) if (sure_bg[i]) stack.push_back((int)i);
     while (!stack.empty()) {
       const int p = stack.back();
       stack.pop_back();
       const int x = p % w, y = p / w;
-      if (x > 0) seed(p - 1);
-      if (x < w - 1) seed(p + 1);
-      if (y > 0) seed(p - w);
-      if (y < h - 1) seed(p + w);
+      const int nb[4] = {x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < h - 1 ? p + w : -1};
+      for (int q : nb)
+        if (q >= 0 && !sure_bg[q] && dist2(L[q], given) < 64.0f) { sure_bg[q] = 1; stack.push_back(q); }
     }
   }
-  // specks off, the subject's piece(s) kept, holes filled
-  const int open_r = std::max(1, std::min(w, h) / 256);
+
+  // whether anything stands out at all: how many cells are far (3 spreads) from every colour of the border
+  const std::vector<Cluster> border_colours = kmeans(border, 5);
+  {
+    size_t far = 0;
+    for (size_t i = 0; i < n; ++i) if (!sure_bg[i] && cluster_distance(L[i], border_colours, 2.5f) >= 3.0f) ++far;
+    if (far * 1000 < n) { error = "image_cutout(): nothing stands out from the background (a plainer background, or the subject filling more of the picture, helps)"; return Value::nil(); }
+  }
+
+  // GrabCut (Rother, Kolmogorov and Blake): colour models of the subject and the background (mixtures of five
+  // Gaussians each), and the cut between them that costs least - each cell's cost of its side under the models, and
+  // a cost for every pair of neighbours put on different sides, high where they look alike - found as a minimum cut,
+  // the models learnt again from the cut, a few times over. It starts from "everything inside the band".
+  std::vector<uint8_t> fg(n);
+  for (size_t i = 0; i < n; ++i) fg[i] = sure_bg[i] ? 0 : 1;
+  // the neighbours' weights: right, down, down-right, down-left; beta from the picture's mean contrast
+  double mean_d2 = 0;
+  size_t npairs = 0;
+  const int dx4[4] = {1, 0, 1, -1}, dy4[4] = {0, 1, 1, 1};
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+      for (int k = 0; k < 4; ++k) {
+        const int nx = x + dx4[k], ny = y + dy4[k];
+        if (nx < 0 || nx >= w || ny >= h) continue;
+        mean_d2 += dist2(L[(size_t)y * w + x], L[(size_t)ny * w + nx]);
+        ++npairs;
+      }
+  const double beta = npairs && mean_d2 > 0 ? 1.0 / (2.0 * mean_d2 / npairs) : 0.0;
+  std::vector<float> nw(n * 4, 0.0f);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+      for (int k = 0; k < 4; ++k) {
+        const int nx = x + dx4[k], ny = y + dy4[k];
+        if (nx < 0 || nx >= w || ny >= h) continue;
+        const double d2 = dist2(L[(size_t)y * w + x], L[(size_t)ny * w + nx]);
+        nw[((size_t)y * w + x) * 4 + k] = (float)(gamma / (k >= 2 ? std::sqrt(2.0) : 1.0) * std::exp(-beta * d2));
+      }
+  Gmm gfg, gbg;
+  for (int it = 0; it < iterations; ++it) {
+    std::vector<Lab> sf, sb;
+    for (size_t i = 0; i < n; ++i) (fg[i] ? sf : sb).push_back(L[i]);
+    if (sf.size() < 16 || sb.size() < 16) break;
+    gfg.fit(sf, 5);
+    gbg.fit(sb, 5);
+    Maxflow g(n, n * 4);
+    const double big = 1e9;
+    for (size_t i = 0; i < n; ++i) {
+      if (sure_bg[i]) { g.set_tweights((int)i, 0, big); continue; }
+      // the source side is the subject: its capacity is the cost of calling the cell background, and the other way
+      g.set_tweights((int)i, gbg.cost(L[i]), gfg.cost(L[i]));
+    }
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        for (int k = 0; k < 4; ++k) {
+          const int nx = x + dx4[k], ny = y + dy4[k];
+          if (nx < 0 || nx >= w || ny >= h) continue;
+          const float c = nw[((size_t)y * w + x) * 4 + k];
+          if (c > 0) g.add_edge(y * w + x, ny * w + nx, c, c);
+        }
+    g.run();
+    size_t changed = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t v = sure_bg[i] ? 0 : (g.source_side((int)i) ? 1 : 0);
+      changed += v != fg[i];
+      fg[i] = v;
+    }
+    if (changed * 2000 < n) break;   // settled
+  }
+
+  // the subject's piece(s) kept, specks of either side gone, holes filled
   auto keep_pieces = [&](std::vector<uint8_t>& m) {
     std::vector<int> lab;
     std::vector<size_t> sizes;
-    const int n = label_pieces(m, w, h, lab, sizes);
-    if (n == 0) return;
+    const int np = label_pieces(m, w, h, lab, sizes);
+    if (np == 0) return;
     const size_t biggest = *std::max_element(sizes.begin(), sizes.end());
     for (size_t i = 0; i < m.size(); ++i) {
       if (lab[i] < 0) continue;
@@ -383,40 +665,15 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
       m[i] = keep_all ? (s * 50 >= biggest ? 1 : 0) : (s == biggest ? 1 : 0);
     }
   };
+  const int open_r = std::max(1, std::min(w, h) / 256);
   morph(fg, w, h, open_r, false);
   morph(fg, w, h, open_r, true);
   keep_pieces(fg);
   fill_holes(fg, w, h);
   size_t nfg = 0;
   for (uint8_t v : fg) nfg += v;
-  if (nfg == 0) { error = "image_cutout(): nothing stands out from the background (try a plainer background, or opts.tolerance under 1)"; return Value::nil(); }
-
-  // the edge decided again: a colour model of the subject from its cells away from the edge, and every cell within a
-  // band of the edge given to the nearer model
-  {
-    std::vector<uint8_t> core = fg;
-    const int br = std::max(2, std::min(w, h) / 64);
-    morph(core, w, h, br, false);
-    std::vector<Lab> fs;
-    for (size_t i = 0; i < core.size(); ++i) if (core[i]) fs.push_back(L[i]);
-    if (fs.size() >= 64) {
-      // a sample is enough for the model
-      std::vector<Lab> sample;
-      const size_t step = std::max<size_t>(1, fs.size() / 20000);
-      for (size_t i = 0; i < fs.size(); i += step) sample.push_back(fs[i]);
-      const std::vector<Cluster> fgm = kmeans(sample, 6);
-      std::vector<uint8_t> grow = fg, shrink = fg;
-      morph(grow, w, h, br, true);
-      morph(shrink, w, h, br, false);
-      for (size_t i = 0; i < fg.size(); ++i) {
-        if (grow[i] == shrink[i]) continue;   // not near the edge
-        const float db = cluster_distance(L[i], bg, floor), df = cluster_distance(L[i], fgm, floor);
-        fg[i] = (df < db && db >= thr * 0.5f) ? 1 : 0;
-      }
-      keep_pieces(fg);
-      fill_holes(fg, w, h);
-    }
-  }
+  if (nfg == 0) { error = "image_cutout(): no subject found inside the border (a plainer background helps)"; return Value::nil(); }
+  const float thr = 3.0f;   // (reported: the score a cell had to reach to count as standing out)
 
   // the full-size mask: the analysis mask sampled bilinearly (a one-pixel feather at the analysis size)
   std::vector<uint8_t> mask((size_t)W * H);

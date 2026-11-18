@@ -1,0 +1,33 @@
+# A photo made into a monster: its model for the modern 3D view and its sprites for the classic one.
+#
+#   aios --root R grain run --steps 0 apps/sqldoom/carve.gr PHOTO [THING_TYPE [SPRITE [HEIGHT]]]
+#
+# PHOTO: a PNG or JPEG of the subject against a plainer background, the whole of it in the frame. THING_TYPE: the
+# monster type the model stands for (default 3001, the imp); SPRITE: its sprite (default TROO); HEIGHT: how tall it
+# stands in map units (default 56, the imp's). Needs the WAD loaded first (load.gr). Writes the model as
+# "carved_<sprite>" and "carved_<sprite>_far" (lib/models.gr's tables), maps the monster type to it, and renders
+# every lump of the sprite again from the model at Doom's rotations and frames (lib/carve.gr). Then play.gr draws
+# it in either view.
+#
+# CARVE_SPRITES=0 leaves the sprites alone; CARVE_ROWS sets the model's resolution (mesh rows, default 120).
+
+import { carve_model, carve_creature, carve_sprites } from "lib/carve.gr"
+
+sql("USE doom")
+
+if len(args) < 1 { error("usage: carve.gr PHOTO [THING_TYPE [SPRITE [HEIGHT]]]") }
+let photo = read_bytes(args[0])
+let thing_type = len(args) > 1 ? int(args[1]) : 3001
+let sprite = len(args) > 2 ? upper(args[2]) : "TROO"
+let height = len(args) > 3 ? float(args[3]) : 56.0
+if len(sprite) != 4 { error("SPRITE is a sprite's four-letter name, e.g. TROO") }
+
+let m = carve_model("carved_" + lower(sprite), photo, {"rows": int(env("CARVE_ROWS", "120"))})
+print(format("model {} ({} triangles, far {} with {}): the subject {}x{} pixels, {:.0f}% of the photo, in {:.0f} ms",
+             m.model, m.tris, m.far, m.far_tris, m.width, m.height, m.coverage * 100.0, m.ms))
+carve_creature(thing_type, m, {"height": height})
+print(format("monster type {} drawn as model {} in the modern view", thing_type, m.model))
+if env("CARVE_SPRITES", "1") != "0" {
+  let s = carve_sprites(sprite, m, {"height": height})
+  print(format("{} lumps of {} rendered from the model in {:.0f} ms", s.lumps, sprite, s.ms))
+}

@@ -1,0 +1,354 @@
+# Monsters carved from photos: a picture of a drawing, a toy or anything against a plainer background becomes a 3D
+# model the modern view draws (lib/models.gr's tables) and the sprites the classic view draws, rendered from that
+# model at Doom's eight rotations and every frame of the monster's animation - one asset, both renderers.
+#
+#   carve_cut(photo_bytes, opts)              -> {canvas, mask, w, h, cut}: the subject cut out and cropped to itself
+#   carve_model(name, photo_bytes, opts)      -> {model, far, tris, far_tris, depth, ms}: model rows written (replacing
+#                                                 a model of that name), with idle, walk, attack, pain and die clips
+#   carve_creature(thing_type, model, opts)   the monster type drawn as that model in the modern view
+#   carve_sprites(sprite, model, opts)        -> {lumps, ms}: every lump of `sprite` (e.g. "TROO") rendered again from
+#                                                 the model, put on the WAD's palette, written over the old one
+#
+# The model is the photo's silhouette inflated (mesh_inflate: round cross-sections the size of the silhouette's
+# widest disc at each point), textured with the photo on the front and the photo seen through on the back, standing
+# on its lowest point. It is one rigid body, so its clips move it whole: a breath, a waddling stride, a lunge, a
+# flinch, a fall onto its back.
+
+import { model_tables, model_load, model_map_creature } from "models.gr"
+import { designs_install } from "bestiary_designs.gr"
+
+fn cv_lit(v) {
+  if v == nil { return "NULL" }
+  let ty = type(v)
+  if ty == "bytes" { return "X'" + bytes_hex(v) + "'" }
+  if ty == "bool" { return v ? "TRUE" : "FALSE" }
+  if ty == "string" { return "'" + replace(v, "'", "''") + "'" }
+  if ty == "real" or ty == "decimal" {
+    let s = str(v * 1.0e0)
+    return (index_of(s, "e") >= 0 or index_of(s, "n") >= 0) ? s : s + "e0"
+  }
+  return str(v)
+}
+fn cv_insert(table, cols, vals) {
+  let lits = []
+  for v in vals { push(lits, cv_lit(v)) }
+  sql("INSERT INTO " + table + " (" + cols + ") VALUES (" + join(lits, ", ") + ")")
+}
+fn f32s(list) {
+  let b = bytes(len(list) * 4)
+  for i in range(0, len(list)) { bytes_set(b, i * 4, "f32le", list[i] * 1.0e0) }
+  return b
+}
+
+# ---- the photo ----------------------------------------------------------------------------------------------------
+
+# The subject of the photo, cut out and cropped to its bounding box with a margin of 2% (opts: image_cutout's).
+fn carve_cut(photo, opts) {
+  let src = image_decode(photo)
+  let cut = image_cutout(src, opts == nil ? {} : opts)
+  let b = cut.bbox
+  let m = max(2, idiv(max(b.w, b.h), 50))
+  let x0 = max(0, b.x - m)
+  let y0 = max(0, b.y - m)
+  let x1 = min(cut.w, b.x + b.w + m)
+  let y1 = min(cut.h, b.y + b.h + m)
+  let crop = image_resample(cut.canvas, x1 - x0, y1 - y0, {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})
+  return {"canvas": crop, "w": x1 - x0, "h": y1 - y0, "cut": cut}
+}
+
+# A canvas's alpha as a mask (one byte a pixel).
+fn alpha_mask(cv) {
+  let w = canvas_width(cv)
+  let h = canvas_height(cv)
+  let px = bytes(canvas_to_bytes(cv, "argb"))
+  let m = bytes(w * h)
+  for i in range(0, w * h) { bytes_set(m, i, "u8", bytes_get(px, i * 4 + 3, "u8")) }
+  return m
+}
+
+# ---- the model ----------------------------------------------------------------------------------------------------
+
+# a rotation of `deg` degrees about an axis (x, y or z) as a quaternion [x y z w]
+fn quat(axis, deg) {
+  let h = deg * 3.141592653589793e0 / 360.0e0
+  let s = sin(h)
+  if axis == "x" { return [s, 0.0, 0.0, cos(h)] }
+  if axis == "y" { return [0.0, s, 0.0, cos(h)] }
+  return [0.0, 0.0, s, cos(h)]
+}
+fn qmul(a, b) {
+  return [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+          a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+          a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+          a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]]
+}
+# a pose: roll (about x, forward: a side-to-side rock), pitch (about y: positive tips the top forward), yaw (about z)
+fn pose_q(roll, pitch, yaw) { return qmul(quat("z", yaw), qmul(quat("y", pitch), quat("x", roll))) }
+
+# The body's clips as keyframes on node 1 (the body; node 0 is the root at the feet): each [t, roll, pitch, yaw, sz
+# (stretch tall)]. How high the body is lifted is not a key's: ground_clip works it out so the posed body rests on
+# the floor.
+fn carve_clips() {
+  let walk = []
+  for i in range(0, 9) {
+    let t = i / 8.0e0
+    let ph = t * 6.283185307179586e0
+    # two steps a cycle: the body rocks onto the planted side and squats a little between steps
+    push(walk, [t * 0.9e0, 7.0e0 * sin(ph), 4.0e0, 3.0e0 * sin(ph), 1.0e0 - 0.03e0 * abs(cos(ph))])
+  }
+  return {
+    "idle": [[0.0, 0.0, 0.0, 0.0, 1.0], [1.2, 0.0, 1.5, 0.0, 1.025], [2.4, 0.0, 0.0, 0.0, 1.0]],
+    "walk": walk,
+    # drawn back, then thrown forward, then back to stand
+    "attack": [[0.0, 0.0, 0.0, 0.0, 1.0], [0.25, 0.0, -14.0, -6.0, 1.04], [0.4, 0.0, 18.0, 4.0, 0.97], [0.7, 0.0, 6.0, 0.0, 1.0],
+               [0.85, 0.0, 0.0, 0.0, 1.0]],
+    "pain": [[0.0, 0.0, 0.0, 0.0, 1.0], [0.08, 6.0, -12.0, 0.0, 0.95], [0.18, -5.0, -6.0, 0.0, 1.0], [0.3, 0.0, 0.0, 0.0, 1.0]],
+    # a stagger, then over onto its back
+    "die": [[0.0, 0.0, 0.0, 0.0, 1.0], [0.15, 0.0, 8.0, 0.0, 0.92], [0.6, 4.0, -55.0, 0.0, 0.9], [0.9, 0.0, -90.0, 0.0, 0.85],
+            [1.0, 0.0, -90.0, 0.0, 0.85]]
+  }
+}
+
+# A clip's keys resampled every `step` seconds (linearly between the keys), each with the lift that puts the body's
+# lowest point at the floor in that pose: [t, quat, lift, sz]. pts: the body's points (x y z, model units), a sample
+# of its vertices.
+fn ground_clip(keys, pts, step) {
+  let dur = keys[len(keys) - 1][0] * 1.0e0
+  let n = max(1, round(dur / step))
+  let out = []
+  let k = 0
+  for i in range(0, n + 1) {
+    let t = dur * i / n
+    while k + 1 < len(keys) - 1 and keys[k + 1][0] <= t { k = k + 1 }
+    let a = keys[k]
+    let b = keys[min(k + 1, len(keys) - 1)]
+    let f = b[0] > a[0] ? min(1.0e0, max(0.0e0, (t - a[0]) / (b[0] - a[0]))) : 0.0e0
+    let roll = a[1] + (b[1] - a[1]) * f
+    let pitch = a[2] + (b[2] - a[2]) * f
+    let yaw = a[3] + (b[3] - a[3]) * f
+    let sz = a[4] + (b[4] - a[4]) * f
+    let q = pose_q(roll, pitch, yaw)
+    # the rotation's third row: what a point's height becomes
+    let x = q[0]
+    let y = q[1]
+    let z = q[2]
+    let w = q[3]
+    let r0 = 2.0e0 * (x * z - w * y)
+    let r1 = 2.0e0 * (y * z + w * x)
+    let r2 = 1.0e0 - 2.0e0 * (x * x + y * y)
+    let low = 1.0e30
+    let j = 0
+    while j < len(pts) {
+      low = min(low, r0 * pts[j] + r1 * pts[j + 1] + r2 * pts[j + 2] * sz)
+      j = j + 3
+    }
+    push(out, [t, q, -low, sz])
+  }
+  return out
+}
+
+# Every `stride`th vertex of a half's positions, as a flat list.
+fn sample_points(half, stride, into) {
+  let i = 0
+  while i < half.vertex_count {
+    push(into, bytes_get(half.positions, i * 12, "f32le"), bytes_get(half.positions, i * 12 + 4, "f32le"), bytes_get(half.positions, i * 12 + 8, "f32le"))
+    i = i + stride
+  }
+  return into
+}
+
+fn delete_model(name) {
+  let old = sql("SELECT model_id FROM model WHERE name = " + cv_lit(name))
+  if len(old) == 0 { return sql("SELECT COALESCE(MAX(model_id), 0) + 1 AS n FROM model")[0].n }
+  let id = old[0].model_id
+  for tb in ["model_node", "model_joint", "model_texture", "model_prim", "model_anim", "model_channel", "model"] {
+    sql("DELETE FROM " + tb + " WHERE model_id = " + str(id))
+  }
+  return id
+}
+
+# One model of the cut-out subject at `rows` mask rows tall, written as model `name`. Returns its id and size.
+fn write_carved(name, cut, rows, opts) {
+  let id = delete_model(name)
+  let h = rows
+  let w = max(3, round(cut.w * rows / cut.h))
+  let small = image_resample(cut.canvas, w, h)
+  let mesh = mesh_inflate(alpha_mask(small), w, h, {"thickness": get(opts, "thickness", 0.8), "smooth": get(opts, "smooth", 2)})
+  # the texture: the cut-out at up to 512 pixels tall (the mesh's uvs are over the same crop)
+  let th = min(512, cut.h)
+  let tex = image_resample(cut.canvas, max(1, round(cut.w * th / cut.h)), th)
+  cv_insert("model", "model_id, name, source, up", [id, name, "carved from a photo (lib/carve.gr)", "z"])
+  cv_insert("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
+            [id, 0, nil, "root", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+  cv_insert("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
+            [id, 1, 0, "body", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+  cv_insert("model_texture", "model_id, texture_id, image", [id, 0, bytes(canvas_to_png(tex))])
+  # the front in the photo's own colours, the back (the photo seen through) a shade darker
+  let halves = [[mesh.front, 1.0], [mesh.back, 0.72]]
+  for pi in range(0, 2) {
+    let p = halves[pi][0]
+    let k = halves[pi][1]
+    cv_insert("model_prim", "model_id, prim_id, node_id, skinned, texture_id, cr, cg, cb, ca, vertex_count, positions, normals, uvs, indices",
+              [id, pi, 1, false, 0, k, k, k, 1.0, p.vertex_count, p.positions, p.normals, p.uvs, p.indices])
+  }
+  let clips = carve_clips()
+  let pts = sample_points(mesh.back, max(1, idiv(mesh.back.vertex_count, 3000)), sample_points(mesh.front, max(1, idiv(mesh.front.vertex_count, 3000)), []))
+  let ai = 0
+  for cname in ["idle", "walk", "attack", "pain", "die"] {
+    let keys = ground_clip(clips[cname], pts, 1.0e0 / 30.0e0)
+    let times = []
+    let rots = []
+    let trans = []
+    let scales = []
+    for k in keys {
+      push(times, k[0])
+      for c in k[1] { push(rots, c) }
+      push(trans, 0.0, 0.0, k[2])
+      push(scales, 1.0, 1.0, k[3])
+    }
+    let tb = f32s(times)
+    cv_insert("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals", [id, ai, 0, 1, "rotation", "LINEAR", tb, f32s(rots)])
+    cv_insert("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals", [id, ai, 1, 1, "translation", "LINEAR", tb, f32s(trans)])
+    cv_insert("model_channel", "model_id, anim_id, channel_id, node_id, path, interp, times, vals", [id, ai, 2, 1, "scale", "LINEAR", tb, f32s(scales)])
+    cv_insert("model_anim", "model_id, anim_id, name, duration", [id, ai, cname, keys[len(keys) - 1][0] * 1.0e0])
+    ai = ai + 1
+  }
+  return {"model": id, "tris": mesh.tris, "depth": mesh.depth, "height": mesh.height}
+}
+
+# The photo as model `name` (and `name`_far, coarser, for far off). opts: image_cutout's, rows (the mesh's height in
+# cells; 120), far_rows (40), thickness (0.8 of a round cross-section), smooth (2).
+fn carve_model(name, photo, opts) {
+  let t0 = clock()
+  if opts == nil { opts = {} }
+  model_tables()
+  let cut = carve_cut(photo, opts)
+  let near = write_carved(name, cut, get(opts, "rows", 120), opts)
+  let far = write_carved(name + "_far", cut, get(opts, "far_rows", 40), opts)
+  sql("FLUSH TABLES")
+  return {"model": near.model, "far": far.model, "tris": near.tris, "far_tris": far.tris, "depth": near.depth,
+          "width": cut.w, "height": cut.h, "coverage": cut.cut.coverage, "ms": clock() - t0}
+}
+
+# Monster type thing_type drawn as carved model `m` (carve_model's result) in the modern view. The bestiary is
+# installed first when it is not there yet (the renderer installs it on first use, which would put its own model
+# back over this one). opts: height (units it stands; 56), walk_speed (units a second of the walk; 40).
+fn carve_creature(thing_type, m, opts) {
+  if opts == nil { opts = {} }
+  model_tables()
+  if len(sql("SELECT thing_type FROM creature_model WHERE thing_type = 3004")) == 0 { designs_install() }
+  model_map_creature(thing_type, m.model, {"height": get(opts, "height", 56.0) * 1.0e0, "idle": "idle", "walk": "walk", "attack": "attack",
+                                           "pain": "pain", "die": "die", "walk_speed": get(opts, "walk_speed", 40.0) * 1.0e0, "far": m.far})
+}
+
+# ---- the sprites --------------------------------------------------------------------------------------------------
+
+# Which clip and when in it each of a monster's sprite frames shows (Doom's frame letters, as the imp's states use
+# them: A-D running, E-G attacking, H in pain, I-M dying, N-U blown apart).
+fn frame_pose(letter, clips) {
+  let order = "ABCDEFGHIJKLMNOPQRSTU"
+  let f = index_of(order, letter)
+  if f < 0 { return ["idle", 0.0, false] }
+  if f <= 3 { return ["walk", clips.walk * f / 4.0e0, false] }
+  if f <= 6 { return ["attack", clips.attack * (0.1e0 + 0.25e0 * (f - 4)), true] }
+  if f == 7 { return ["pain", clips.pain * 0.3e0, true] }
+  if f <= 12 { return ["die", clips.die * (f - 8) / 4.0e0, true] }
+  return ["die", clips.die * min(1.0e0, (f - 13) / 5.0e0), true]
+}
+
+# The model drawn at sprite scale (one texel a unit, as Doom's sprites are) seen from `rot` (1: from the front, then
+# round by 45 degrees a step, as Doom numbers them), posed: {indices, mask, w, h, left, top} cropped to what was
+# drawn, its origin the feet.
+fn render_view(t, R, md, scale, rot, pose) {
+  # far off and narrow, so near enough orthographic (a point 50 units behind the origin lands under half a row
+  # off): D units away, the 128-wide target spans 128 units
+  let fov = 2.0e0
+  let D = 64.0e0 / tan(fov * 3.141592653589793e0 / 360.0e0)
+  let eye_z = 40.0e0
+  let ang = 180.0e0 - 45.0e0 * (rot - 1)
+  let thing = {"model": md.model, "anim": md.anims[pose[0]], "time": pose[1], "hold": pose[2], "scale": scale,
+               "x": D, "y": 0.0e0, "z": 0.0e0, "angle": ang, "light": 255, "flags": 0}
+  let cam = {"x": 0.0e0, "y": 0.0e0, "z": eye_z, "angle": 0.0e0, "pitch": 0.0e0}
+  # drawn twice over different backgrounds: a pixel the model covers is the same in both
+  r3d_clear(t, 0xFF00FF00)
+  r3d_draw_tex(t, [], fov, cam, [thing])
+  let a = bytes(r3d_pixels(t))
+  r3d_clear(t, 0xFFFF00FF)
+  r3d_draw_tex(t, [], fov, cam, [thing])
+  let b = bytes(r3d_pixels(t))
+  let cv = canvas_create(R, R)
+  let x0 = R
+  let y0 = R
+  let x1 = -1
+  let y1 = -1
+  let px = bytes(R * R * 4)
+  for y in range(0, R) {
+    for x in range(0, R) {
+      let o = (y * R + x) * 4
+      let pa = bytes_get(a, o, "u32le")
+      if pa == bytes_get(b, o, "u32le") {
+        bytes_set(px, o, "u32le", pa | 0xFF000000)
+        x0 = min(x0, x)
+        y0 = min(y0, y)
+        x1 = max(x1, x)
+        y1 = max(y1, y)
+      }
+    }
+  }
+  if x1 < 0 { error(format("carve_sprites(): the model drew nothing at rotation {}", rot)) }
+  canvas_set_pixels(cv, px)
+  let crop = image_resample(cv, x1 - x0 + 1, y1 - y0 + 1, {"x": x0, "y": y0, "w": x1 - x0 + 1, "h": y1 - y0 + 1})
+  # the eye is level at eye_z: the feet (z = 0) are eye_z rows below the middle row
+  return {"canvas": crop, "w": x1 - x0 + 1, "h": y1 - y0 + 1, "left": idiv(R, 2) - x0, "top": idiv(R, 2) + round(eye_z) - y0}
+}
+
+# Every lump of `sprite` rendered again from carved model `m` (carve_model's), standing `height` units tall (opts:
+# height, 56; dither, false), put on palette 0 and written over the lump: its pixels and mask, its texels, and its
+# frames' sizes and offsets. Lumps keep their names and ids, so nothing else changes.
+fn carve_sprites(sprite, m, opts) {
+  let t0 = clock()
+  if opts == nil { opts = {} }
+  let pal = bytes(768)
+  for c in sql("SELECT palette_index, r, g, b FROM colormap_rgb WHERE pal = 0 AND level = 0 ORDER BY palette_index") {
+    bytes_set(pal, c.palette_index * 3, "u8", c.r)
+    bytes_set(pal, c.palette_index * 3 + 1, "u8", c.g)
+    bytes_set(pal, c.palette_index * 3 + 2, "u8", c.b)
+  }
+  let R = 128
+  let t = r3d_target(R, R)
+  r3d_options(t, {"y_scale": 1.0, "bilinear": true, "mipmaps": true})
+  let md = model_load(t, m.model, 1000)
+  let height = get(opts, "height", 56.0) * 1.0e0
+  let scale = height / max(0.001e0, md.height)
+  let clips = {}
+  for a in sql(format("SELECT name, duration FROM model_anim WHERE model_id = {}", m.model)) { clips[a.name] = a.duration }
+  let lumps = sql(format("SELECT lump_name, lump_id FROM sprite_lumps WHERE lump_name LIKE '{}%' ORDER BY lump_name", sprite))
+  if len(lumps) == 0 { error(format("carve_sprites(): no lumps of sprite {} (is the WAD loaded?)", sprite)) }
+  for l in lumps {
+    # NAMEfr[fr]: the frame letter and rotation the lump is drawn for (unflipped)
+    let frame = slice(l.lump_name, 4, 5)
+    let rot = int(slice(l.lump_name, 5, 6))
+    let v = render_view(t, R, md, scale, rot == 0 ? 1 : rot, frame_pose(frame, clips))
+    let q = image_quantize(v.canvas, pal, {"dither": get(opts, "dither", false)})
+    sql(format("UPDATE sprite_lumps SET pixels = {}, mask = {} WHERE lump_name = {}", cv_lit(q.indices), cv_lit(q.mask), cv_lit(l.lump_name)))
+    sql(format("UPDATE sprite_frames SET width = {}, height = {}, left_offset = {}, top_offset = {} WHERE lump_name = {}",
+               v.w, v.h, v.left, v.top, cv_lit(l.lump_name)))
+    sql("DELETE FROM sprite_texels WHERE lump_name = " + cv_lit(l.lump_name))
+    let rows = []
+    for y in range(0, v.h) {
+      for x in range(0, v.w) {
+        let o = y * v.w + x
+        if bytes_get(q.mask, o, "u8") == 0 { continue }
+        push(rows, "(" + str(l.lump_id * 1048576 + y * 1024 + x) + ", " + cv_lit(l.lump_name) + ", " + str(x) + ", " + str(y) + ", " +
+                   str(bytes_get(q.indices, o, "u8")) + ")")
+      }
+    }
+    let at = 0
+    while at < len(rows) {
+      sql("INSERT INTO sprite_texels (k, lump_name, u, v, palette_index) VALUES " + join(slice(rows, at, min(len(rows), at + 2000)), ", "))
+      at = at + 2000
+    }
+  }
+  sql("FLUSH TABLES")
+  return {"lumps": len(lumps), "ms": clock() - t0}
+}

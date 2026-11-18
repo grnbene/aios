@@ -63,6 +63,30 @@ CTE as rows of text before the next reads it - `fragment_union` alone is 78,000 
 floor and ceiling chain over some 56,000 rows; real time needs CTEs kept as typed columns end to end, a change to
 the engine of its own. `AIOS_CTE_MERGE_TRACE=1` prints each CTE's time, `AIOS_VX_TRACE=1` each join step's.
 
+## A monster from a photo
+
+```bash
+aios --root R grain run --steps 0 apps/sqldoom/carve.gr photo.jpg [THING_TYPE [SPRITE [HEIGHT]]]   # default: 3001 TROO 56
+aios --root R grain run --steps 0 apps/sqldoom/carve_check.gr [THING_TYPE [SPRITE [HEIGHT]]]
+```
+
+`carve.gr` makes a photo of anything - a drawing on paper, a toy, a mug - into a monster for both views
+(`lib/carve.gr`). The subject is cut from its background (`image_cutout`: GrabCut, a colour model of each side and
+a minimum cut between them), its silhouette inflated into a closed, rounded body (`mesh_inflate`), textured with the
+photo, and written as a model (`carved_troo`, and `carved_troo_far` for far off) with idle, walk, attack, pain and
+die clips; each clip is sampled 30 times a second and every sample lifted so the posed body's lowest point is on the
+floor. The monster type is mapped to it (`creature_model`), so the modern view draws it. Then every lump of the
+sprite is rendered again from that model - Doom's eight rotations of each running, attacking and pain frame, the
+death and gib frames from the front - with a near-orthographic camera at one texel a unit, put on the WAD's palette
+(`image_quantize`) and written over the lump: pixels, mask, texel rows and the frames' offsets. Lump names and ids
+stay, so the classic renderer draws the photo's monster too.
+
+The photo wants the whole subject in the frame with some background all round it: the border is taken as
+background, and a subject that runs off an edge is cut there. A photo where nothing stands out from its border
+(an object against open sky of the same tone, say) is refused rather than guessed at. `carve_check.gr` checks what
+the carve left: the monster type drawn as the carved model, standing its height with every clip, and every lump's
+texel rows, sizes and offsets agreeing with its pixels, its feet on its origin row.
+
 ## What differs from SQLDoom
 
 - **Dialect.** Enum types are inline `ENUM(...)` columns, `BYTEA` is `LONGBLOB`, `SERIAL` is `AUTO_INCREMENT`,

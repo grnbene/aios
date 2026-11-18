@@ -1,0 +1,68 @@
+# What carve.gr must leave true, checked against the database it wrote:
+#
+#   aios --root R grain run --steps 0 apps/sqldoom/carve_check.gr [THING_TYPE [SPRITE [HEIGHT]]]
+#
+# - the monster type is drawn as the carved model, whose rows load onto an r3d target and stand HEIGHT tall there
+#   once scaled, with every clip the game asks for;
+# - every lump of the sprite holds as many texel rows as its mask has opaque cells, each at its packed key and
+#   with the lump's own palette index there, and its frames' sizes are the lump's;
+# - every lump was rendered from the model (its frames' offsets put the feet at the bottom row: top_offset = height
+#   - 1 within a row, and the subject centred: left_offset within the width).
+# Exits non-zero, naming what failed.
+
+import { model_load } from "lib/models.gr"
+
+sql("USE doom")
+let thing_type = len(args) > 0 ? int(args[0]) : 3001
+let sprite = len(args) > 1 ? upper(args[1]) : "TROO"
+let height = len(args) > 2 ? float(args[2]) : 56.0
+let fails = []
+fn want(ok, what) { if not ok { push(fails, what) } }
+
+let cm = sql(format("SELECT model_id, far_model_id, height, idle, walk, attack, pain, die FROM creature_model WHERE thing_type = {}", thing_type))
+want(len(cm) == 1, format("monster type {} has a model", thing_type))
+if len(cm) == 1 {
+  let c = cm[0]
+  let name = sql(format("SELECT name FROM model WHERE model_id = {}", c.model_id))[0].name
+  want(name == "carved_" + lower(sprite), format("type {} is drawn as carved_{} (found {})", thing_type, lower(sprite), name))
+  let t = r3d_target(64, 64)
+  let L = model_load(t, c.model_id, 0)
+  want(L.tris > 0, "the model has triangles")
+  let scaled = L.height * c.height / L.height
+  want(abs(c.height - height) < 0.01 and abs(scaled - height) < 0.01, format("it stands {} tall (creature_model.height {})", height, c.height))
+  for clip in [c.idle, c.walk, c.attack, c.pain, c.die] { want(get(L.anims, clip, nil) != nil, format("it has the clip {}", clip)) }
+  want(c.far_model_id != nil and len(sql(format("SELECT 1 FROM model_prim WHERE model_id = {}", c.far_model_id))) > 0, "a far model with parts")
+}
+
+let lumps = sql(format("SELECT lump_name, lump_id, pixels, mask FROM sprite_lumps WHERE lump_name LIKE '{}%'", sprite))
+want(len(lumps) > 0, format("sprite {} has lumps", sprite))
+let checked = 0
+for l in lumps {
+  let fr = sql(format("SELECT DISTINCT width, height, left_offset, top_offset FROM sprite_frames WHERE lump_name = '{}'", l.lump_name))
+  want(len(fr) == 1, format("{}: its frames agree on one size and offset", l.lump_name))
+  if len(fr) != 1 { continue }
+  let f = fr[0]
+  let mk = bytes(l.mask)
+  let px = bytes(l.pixels)
+  want(len(mk) == f.width * f.height and len(px) == f.width * f.height, format("{}: pixels and mask are width x height", l.lump_name))
+  let opaque = {}
+  let bottom = -1
+  for y in range(0, f.height) { for x in range(0, f.width) {
+    if bytes_get(mk, y * f.width + x, "u8") != 0 { opaque[str(l.lump_id * 1048576 + y * 1024 + x)] = bytes_get(px, y * f.width + x, "u8"); bottom = max(bottom, y) }
+  } }
+  let rows = sql(format("SELECT k, u, v, palette_index FROM sprite_texels WHERE lump_name = '{}'", l.lump_name))
+  want(len(rows) == len(keys(opaque)), format("{}: {} texel rows for {} opaque cells", l.lump_name, len(rows), len(keys(opaque))))
+  for r in rows {
+    want(r.k == l.lump_id * 1048576 + r.v * 1024 + r.u, format("{}: texel ({}, {}) at its packed key", l.lump_name, r.u, r.v))
+    want(get(opaque, str(r.k), -1) == r.palette_index, format("{}: texel ({}, {}) is the lump's index", l.lump_name, r.u, r.v))
+  }
+  # the feet (the model's lowest point) on the bottom row, within a row of the origin
+  want(abs(f.top_offset - bottom) <= 1, format("{}: top_offset {} puts the feet at row {}", l.lump_name, f.top_offset, bottom))
+  want(f.left_offset > 0 and f.left_offset < f.width, format("{}: left_offset {} inside width {}", l.lump_name, f.left_offset, f.width))
+  checked = checked + 1
+}
+if len(fails) > 0 {
+  for f in slice(fails, 0, min(40, len(fails))) { print("FAIL: " + f) }
+  error(format("carve_check: {} failures", len(fails)))
+}
+print(format("PASS: carve_check - type {} drawn as the carved model; {} lumps of {} match their texels and offsets", thing_type, checked, sprite))
