@@ -15,7 +15,7 @@ import { model_load } from "lib/models.gr"
 sql("USE doom")
 let thing_type = len(args) > 0 ? int(args[0]) : 3001
 let sprite = len(args) > 1 ? upper(args[1]) : "TROO"
-let height = len(args) > 2 ? float(args[2]) : 56.0
+let height = len(args) > 2 ? to_number(args[2]) * 1.0 : 56.0
 let fails = []
 fn want(ok, what) { if not ok { push(fails, what) } }
 

@@ -19,7 +19,7 @@ if len(args) < 1 { error("usage: carve.gr PHOTO [THING_TYPE [SPRITE [HEIGHT]]]")
 let photo = read_bytes(args[0])
 let thing_type = len(args) > 1 ? int(args[1]) : 3001
 let sprite = len(args) > 2 ? upper(args[2]) : "TROO"
-let height = len(args) > 3 ? float(args[3]) : 56.0
+let height = len(args) > 3 ? to_number(args[3]) * 1.0 : 56.0
 if len(sprite) != 4 { error("SPRITE is a sprite's four-letter name, e.g. TROO") }
 
 let m = carve_model("carved_" + lower(sprite), photo, {"rows": int(env("CARVE_ROWS", "120"))})
