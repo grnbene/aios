@@ -30,6 +30,7 @@
 #include "aios/core/bytes.hpp"
 #include "aios/core/ids.hpp"
 #include "aios/crypto/x509.hpp"
+#include "aios/channel/http_client.hpp"
 #include "aios/net/ip_intel.hpp"
 #include "aios/storage/object_store.hpp"
 #include "aios/hal/host.hpp"
@@ -96,6 +97,13 @@ struct VhostConfig {
   // about the inbound connection (no action, no probe back) tied to the canary in the next path segment, and answer
   // blandly. Point the base above at a host that routes this prefix here.
   std::string env_honeypot_collect;
+  // `honeypot_path <regex>` (repeatable): any request path matching is a bait too, not just .env - add whatever junk
+  // attackers probe (/wp-login.php, /api/keys, a fake product-export URL, ...). Served the decoy and traced like .env.
+  std::vector<std::regex> honeypot_paths;
+  std::vector<std::string> honeypot_path_src;
+  // `env_honeypot_forward <url>` (repeatable): after recording locally, POST each event's JSON to this URL - the fleet
+  // collector. Every edge node forwards to one place, so the dashboard there sees the whole fleet. Fire-and-forget.
+  std::vector<std::string> env_honeypot_forward;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -264,6 +272,15 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         ls >> cur->env_honeypot_collect_url;
       } else if (tok == "env_honeypot_collect") {
         ls >> cur->env_honeypot_collect;
+      } else if (tok == "env_honeypot_forward") {
+        std::string u; ls >> u;
+        if (!u.empty()) cur->env_honeypot_forward.push_back(u);
+      } else if (tok == "honeypot_path") {
+        std::string pat; std::getline(ls, pat); pat = trim(pat);
+        if (!pat.empty()) {
+          try { cur->honeypot_paths.push_back(std::regex(pat, std::regex::ECMAScript | std::regex::icase)); cur->honeypot_path_src.push_back(pat); }
+          catch (const std::regex_error& e) { std::fprintf(stderr, "honeypot_path pattern does not compile (%s): %s\n", e.what(), pat.c_str()); }
+        }
       } else if (tok == "deny") {
         int status = 0;
         std::string pattern;
@@ -595,8 +612,34 @@ EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const 
   e.iso = iso;
   return e;
 }
-// one event (grab or callback) to the live feed and the substrate. `extra` is appended to the stored payload (the
-// callback uses it for the request body). The record carries every header verbatim - telemetry, no action.
+// which edge node this is, for the fleet view: $AIOS_NODE, else $HOSTNAME, else "edge".
+std::string honeypot_node_name() {
+  if (const char* n = std::getenv("AIOS_NODE")) if (*n) return n;
+  if (const char* h = std::getenv("HOSTNAME")) if (*h) return h;
+  return "edge";
+}
+
+// POST an event's JSON to each fleet collector, fire-and-forget: a detached thread per URL, short timeout, every
+// failure swallowed. The edge node never blocks or fails a response because a collector is slow or down.
+void forward_event(const std::vector<std::string>& urls, const std::string& json) {
+  for (const std::string& url : urls) {
+    std::thread([url, json]() {
+      auto ep = aios::channel::parse_endpoint(url);
+      if (!ep.ok()) return;
+      aios::channel::HttpRequest req;
+      req.method = "POST";
+      req.endpoint = *ep;
+      req.timeout_ms = 4000;
+      req.host = &hal::process_host();
+      req.headers.push_back({"Content-Type", "application/json"});
+      req.body.assign(json.begin(), json.end());
+      aios::channel::http_send(req);   // result ignored: telemetry forwarding is best-effort
+    }).detach();
+  }
+}
+
+// one event (grab or callback) to the live feed, the substrate, and the fleet. `extra` is appended to the stored
+// payload (the callback uses it for the request body). The record carries every header verbatim - telemetry, no action.
 void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, const net::HttpRequestHead& head,
                   const std::string& peer, const std::string& path, const std::string& extra) {
   std::fprintf(stderr, "[env-honeypot] %s canary=%s origin=%s (%s %s%s%s%s) via=%s peer=%s host=%s path=%s t=%s\n",
@@ -604,19 +647,20 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
                e.type.empty() ? "" : " ", e.type.c_str(), e.geo.empty() ? "" : (" " + e.geo).c_str(),
                e.via.empty() ? "-" : e.via.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), e.iso.c_str());
   std::fflush(stderr);
-  if (!vh.env_honeypot_feed.empty()) {
-    std::string j = "{\"kind\":\"" + std::string(kind) + "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
-                    "\",\"origin\":\"" + json_escape(e.origin_ip) + "\",\"scope\":\"" + e.scope + "\",\"family\":\"" +
-                    e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
-                    "\",\"via\":\"" + json_escape(e.via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
-                    json_escape(head.host) + "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
-                    json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
-                    json_escape(head.header("user-agent").value_or("")) + "\",\"hops\":[";
-    for (size_t i = 0; i < e.origin.hops.size(); ++i)
-      j += (i ? "," : "") + std::string("{\"") + json_escape(e.origin.hops[i].first) + "\":\"" + json_escape(e.origin.hops[i].second) + "\"}";
-    j += "]}\n";
-    hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
-  }
+  // one JSON line for this event: node names which edge node saw it, so the fleet view can group by node.
+  std::string j = "{\"kind\":\"" + std::string(kind) + "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
+                  "\",\"origin\":\"" + json_escape(e.origin_ip) + "\",\"scope\":\"" + e.scope + "\",\"family\":\"" +
+                  e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
+                  "\",\"via\":\"" + json_escape(e.via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
+                  json_escape(head.host) + "\",\"node\":\"" + json_escape(honeypot_node_name()) +
+                  "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
+                  json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
+                  json_escape(head.header("user-agent").value_or("")) + "\",\"hops\":[";
+  for (size_t i = 0; i < e.origin.hops.size(); ++i)
+    j += (i ? "," : "") + std::string("{\"") + json_escape(e.origin.hops[i].first) + "\":\"" + json_escape(e.origin.hops[i].second) + "\"}";
+  j += "]}\n";
+  if (!vh.env_honeypot_feed.empty()) hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
+  if (!vh.env_honeypot_forward.empty()) forward_event(vh.env_honeypot_forward, j);
   if (!vh.env_honeypot_store.empty()) {
     if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) {
       aios::StoredObject obj;
@@ -684,7 +728,7 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
                         const std::string& path, const std::string& peer) {
   const std::string canary = mint_canary();
   EventInfo e = enrich(head, vh, peer, canary);
-  record_event("honeypot.env_grab", e, vh, head, peer, path, "");
+  record_event(is_env_probe(path) ? "honeypot.env_grab" : "honeypot.bait", e, vh, head, peer, path, "");
   const std::string api = vh.env_honeypot_collect_url.empty()
                               ? ("https://api-" + canary.substr(0, 8) + ".aios-internal.invalid")
                               : (vh.env_honeypot_collect_url + "/" + canary);
@@ -1415,8 +1459,11 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       break;
     }
 
-    // Before the dotfile rule 404s it: a .env probe on an opted-in vhost gets the inert, traceable decoy.
-    if (vh->env_honeypot && is_env_probe(path_only)) {
+    // Before the dotfile rule 404s it: a .env probe, or any configured bait path, gets the inert, traceable decoy.
+    bool bait = vh->env_honeypot && is_env_probe(path_only);
+    // honeypot_path matches the full target (query and all), so query-based baits work too
+    if (!bait) for (const auto& re : vh->honeypot_paths) if (std::regex_search(head.target, re)) { bait = true; break; }
+    if (bait) {
       serve_env_honeypot(*conn, head, *vh, path_only, conn->peer());
       break;
     }
@@ -1608,6 +1655,8 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL[ type=hosting]) for origin\n"
       "    env_honeypot_collect_url <base>  # decoy's bait callback: embeds <base>/<canary> as its API endpoint\n"
       "    env_honeypot_collect <prefix>    # a request under this prefix IS a callback: record its full telemetry\n"
+      "    env_honeypot_forward <url>       # POST each event to a fleet collector (repeatable); whole-fleet view\n"
+      "    honeypot_path <regex>            # any path matching is bait too, not just .env (repeatable)\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
     return argc < 2 ? 1 : 0;

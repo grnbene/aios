@@ -35,9 +35,9 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 </div>
 <div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
 <div id="cbwrap" style="display:none"><h2 style="font-size:16px;margin:4px 0">Bait callbacks <span class="muted" style="font-weight:400;font-size:13px">— the attacker's own tooling validated the stolen creds and connected to us</span></h2>
-<table><thead><tr><th>When</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Canary</th></tr></thead><tbody id="cbrows"></tbody></table></div>
+<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Canary</th></tr></thead><tbody id="cbrows"></tbody></table></div>
 <h2 style="font-size:16px;margin:14px 0 4px">Grabs <span class="muted" style="font-weight:400;font-size:13px">— .env probes served the decoy</span></h2>
-<table><thead><tr><th>When</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Canary</th></tr></thead>
+<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Canary</th></tr></thead>
 <tbody id="grabrows"><tr><td colspan="9" class="muted">waiting for the feed…</td></tr></tbody></table>
 <p class="sub" id="foot" style="margin-top:12px"></p>
 </main>
@@ -54,6 +54,7 @@ function rowGrab(x){ const key=x.canary||(x.t+x.origin); const nw=!seen.has(key)
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
   return '<tr class="'+(nw?'new':'')+'">'+
     '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
+    '<td>'+esc(x.node||'—')+'</td>'+
     '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
     '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
     '<td>'+esc(x.host)+'</td><td class="mono">'+esc(x.path)+'</td>'+
@@ -63,6 +64,7 @@ function rowCb(x){ const key='cb'+(x.canary||'')+x.t; const nw=!seen.has(key); s
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
   return '<tr class="'+(nw?'new':'')+'">'+
     '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
+    '<td>'+esc(x.node||'—')+'</td>'+
     '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
     '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
     '<td class="mono">'+esc(x.method)+'</td><td class="mono">'+esc(x.path)+'</td>'+
@@ -78,7 +80,7 @@ async function tick(){
   $('c_cb').textContent=cb.length; $('c_last').textContent=g.length?ago(g[0].t):'—'; $('c_top').textContent=top?top[0]+' ×'+top[1]:'—';
   $('cbwrap').style.display=cb.length?'block':'none';
   $('cbrows').innerHTML=cb.map(rowCb).join('');
-  $('grabrows').innerHTML=g.length?g.map(rowGrab).join(''):'<tr><td colspan="10" class="muted">no grabs yet — the trap is armed.</td></tr>';
+  $('grabrows').innerHTML=g.length?g.map(rowGrab).join(''):'<tr><td colspan="11" class="muted">no grabs yet — the trap is armed.</td></tr>';
   $('foot').textContent='showing '+g.length+' grabs, '+cb.length+' callbacks · '+new Date().toLocaleTimeString();
 }
 $('f_dc').addEventListener('change', tick);

@@ -22,6 +22,15 @@ fn grabs(limit) {
 serve_routes({
   "GET /": fn (req) { return res_html(PAGE) },
   "GET /health": fn (req) { return res_json({"ok": true}) },
+  // the fleet collector: other edge nodes POST each event's JSON line here, so this node's feed is the whole fleet
+  "POST /ingest": fn (req) {
+    let line = trim(req.body)
+    if line == "" { return res_error(400, "empty") }
+    let p = pcall(json_parse, line)
+    if not p.ok { return res_error(400, "not json") }
+    append_file(FEED, line + "\n")
+    return res_json({"ok": true})
+  },
   "GET /api/grabs": fn (req) {
     let limit = int(get(req.query_params, "limit", "400"))
     let all = grabs(limit)

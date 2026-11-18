@@ -6,7 +6,7 @@ let app = {
   "kind": "web",
   "port": 8577,
   "listen": "local",
-  "settings": {"HONEYPOT_FEED": "/var/log/aios/honeypot.jsonl"},
+  "settings": {"HONEYPOT_FEED": "honeypot.jsonl"},
   "health": {"path": "/health", "ok": [200]},
   "max_steps": 0
 }
