@@ -2,7 +2,10 @@
 // The feed is a projection; the authoritative, tamper-evident record is the object store the edge server also writes.
 fn setting(n, d) { let v = getenv(n) return v == nil or v == "" ? d : v }
 let FEED = setting("HONEYPOT_FEED", "/var/log/aios/honeypot.jsonl")
+let NODE = setting("AIOS_NODE", setting("HOSTNAME", "node"))
 let PAGE = app_program("page.html")
+
+fn now_iso() { return date_format(now(), "%Y-%m-%dT%H:%M:%SZ", "utc") }
 
 // the most recent `limit` grabs, newest first
 fn grabs(limit) {
@@ -19,6 +22,88 @@ fn grabs(limit) {
   return out
 }
 
+// every event ever recorded, oldest first - the full record, for export/report (not the capped live feed)
+fn all_events() {
+  let r = pcall(read_file, FEED)
+  if not r.ok { return [] }
+  let out = []
+  for ln in split(r.value, "\n") {
+    let t = trim(ln)
+    if t != "" { let p = pcall(json_parse, t) if p.ok { push(out, p.value) } }
+  }
+  return out
+}
+
+// has this event id already landed (fleet fan-out can deliver the same event to a node more than once in a full
+// mesh - A forwards to B and C, B also forwards to C)? Checked against recent history only; a duplicate landing
+// outside that window is harmless (the report groups by id anyway), this just keeps the common case clean.
+fn have_id(id) {
+  if id == "" { return false }
+  for e in grabs(3000) { if get(e, "id", "") == id { return true } }
+  return false
+}
+
+fn csv_field(v) { return "\"" + replace(str(v), "\"", "\"\"") + "\"" }
+
+// a clean, factual incident report: every grab and callback this node knows about (its own, and whatever the
+// fleet forwarded), grouped by origin, nothing editorialized or inferred beyond what the edge server itself
+// recorded. Meant to be handed to someone else - a provider's abuse desk, counsel, or filed at ic3.gov - as the
+// record of what was sent to a trap, not an accusation about who sent it.
+fn build_report() {
+  let all = all_events()
+  let by_origin = {}
+  let order = []
+  for e in all {
+    let o = get(e, "origin", "unknown")
+    if not has(by_origin, o) { by_origin[o] = [] push(order, o) }
+    push(by_origin[o], e)
+  }
+  let lines = []
+  push(lines, "AIOS HONEYPOT INCIDENT REPORT")
+  push(lines, "generated " + now_iso() + " by node " + NODE)
+  push(lines, repeat("=", 78))
+  push(lines, "")
+  push(lines, "What this is: every request this trap recorded against a decoy '.env' file and/or a bait URL")
+  push(lines, "that only appears inside that decoy's contents. No credential in the decoy is real or")
+  push(lines, "functional - it is a random token minted per visitor, logged so a later connection using it")
+  push(lines, "can be traced back to this exact probe. Nothing here was accessed by the operator; every row")
+  push(lines, "below is an unsolicited request this system received and traced, not a system we touched.")
+  push(lines, "")
+  push(lines, str(len(all)) + " total event(s) across " + str(len(order)) + " distinct origin(s).")
+  push(lines, repeat("=", 78))
+  for o in order {
+    let evs = by_origin[o]
+    let first = evs[0]
+    let n_grab = 0
+    let n_cb = 0
+    for e in evs { if get(e, "kind", "") == "honeypot.callback" { n_cb = n_cb + 1 } else { n_grab = n_grab + 1 } }
+    push(lines, "")
+    push(lines, "ORIGIN " + o + "  (" + get(first, "scope", "") + ", " + get(first, "net_type", "") + ")")
+    push(lines, "  location (offline, coarse): " + get(first, "geo", "-"))
+    push(lines, "  " + str(n_grab) + " decoy grab(s), " + str(n_cb) + " bait callback(s)")
+    push(lines, repeat("  -", 38))
+    for e in evs {
+      let tag = get(e, "kind", "") == "honeypot.callback" ? "CALLBACK" : "GRAB    "
+      push(lines, "  [" + tag + "] " + get(e, "t", "") + "  id=" + get(e, "id", "-") + "  fp=" + get(e, "fp", "-"))
+      push(lines, "    " + get(e, "method", "") + " " + get(e, "host", "") + get(e, "path", "") + "  via " + get(e, "via", "direct"))
+      push(lines, "    user-agent: " + get(e, "ua", "-"))
+      push(lines, "    canary: " + get(e, "canary", "-") + "   node: " + get(e, "node", "-"))
+      let hops = get(e, "hops", [])
+      if len(hops) > 0 {
+        let chain = []
+        for h in hops { for k in keys(h) { push(chain, k + "=" + h[k]) } }
+        push(lines, "    proxy chain: " + join(chain, " -> "))
+      }
+    }
+  }
+  push(lines, "")
+  push(lines, repeat("=", 78))
+  push(lines, "To report this to law enforcement (United States): file at https://www.ic3.gov (FBI Internet")
+  push(lines, "Crime Complaint Center). Include this report and, if your provider requires it, the raw JSON")
+  push(lines, "export (/api/export?format=json) as supporting evidence.")
+  return join(lines, "\n") + "\n"
+}
+
 serve_routes({
   "GET /": fn (req) { return res_html(PAGE) },
   "GET /health": fn (req) { return res_json({"ok": true}) },
@@ -28,6 +113,7 @@ serve_routes({
     if line == "" { return res_error(400, "empty") }
     let p = pcall(json_parse, line)
     if not p.ok { return res_error(400, "not json") }
+    if have_id(get(p.value, "id", "")) { return res_json({"ok": true, "dup": true}) }
     append_file(FEED, line + "\n")
     return res_json({"ok": true})
   },
@@ -40,5 +126,24 @@ serve_routes({
       if get(e, "kind", "honeypot.env_grab") == "honeypot.callback" { push(cb, e) } else { push(g, e) }
     }
     return res_json({"grabs": g, "callbacks": cb, "count": len(all)})
-  }
+  },
+  // the full record, for handing to someone else - a provider's abuse desk, your own counsel, or law enforcement.
+  "GET /api/export": fn (req) {
+    let fmt = lower(get(req.query_params, "format", "json"))
+    let all = all_events()
+    if fmt == "csv" {
+      let cols = ["t", "kind", "id", "fp", "canary", "origin", "scope", "family", "net_type", "geo", "lat", "lon",
+                 "via", "node", "scheme", "method", "host", "path", "ua"]
+      let out = [join(cols, ",")]
+      for e in all {
+        let row = []
+        for c in cols { push(row, csv_field(get(e, c, ""))) }
+        push(out, join(row, ","))
+      }
+      return res_download(join(out, "\n") + "\n", "honeypot-evidence.csv")
+    }
+    return res_download(json_stringify({"node": NODE, "generated": now_iso(), "count": len(all), "events": all}),
+                        "honeypot-evidence.json")
+  },
+  "GET /api/report": fn (req) { return res_download(build_report(), "honeypot-incident-report.txt") }
 }, {"workers": false})

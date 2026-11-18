@@ -106,6 +106,10 @@ struct VhostConfig {
   std::vector<std::string> honeypot_path_src;
   // `env_honeypot_forward <url>` (repeatable): after recording locally, POST each event's JSON to this URL - the fleet
   // collector. Every edge node forwards to one place, so the dashboard there sees the whole fleet. Fire-and-forget.
+  // For every node to see every other node's events too ("joined to the fleet and back"), point each node's
+  // env_honeypot_forward at every OTHER node's own dashboard /ingest (full mesh, not a hub-and-spoke) - each
+  // dashboard then carries the whole fleet's telemetry, not just its own. /ingest dedupes by the event's own `id`
+  // (apps/honeypot/service.gr:have_id), so A -> B and A -> C -> B (through a third node) doesn't double-count.
   std::vector<std::string> env_honeypot_forward;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script

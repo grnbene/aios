@@ -23,6 +23,8 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 .via { color:var(--warn); } .mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
 .new { animation:flash 2s; } @keyframes flash { from{background:rgba(224,84,43,.28)} to{background:transparent} }
 .muted { color:var(--muted); }
+.expbtn { display:inline-block; padding:5px 11px; border-radius:7px; border:1px solid var(--line); color:var(--ink); text-decoration:none; font-size:13px; margin-right:6px; background:var(--panel); }
+.expbtn:hover { border-color:var(--accent); color:var(--accent); }
 #mapwrap { display:flex; gap:10px; margin-bottom:14px; align-items:stretch; }
 #map { height:380px; flex:1 1 auto; min-width:0; border-radius:10px; border:1px solid var(--line); background:#0d1014; cursor:pointer; }
 #detail { width:270px; flex:0 0 270px; height:380px; overflow-y:auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:13px; }
@@ -41,6 +43,12 @@ tr[data-origin] { cursor:pointer; }
 <body><main>
 <h1><span class="live"></span>Honeypot watch</h1>
 <p class="sub">Every <code>.env</code> grab the edge server traced — the attacker's origin through the whole proxy chain, powerless canary served, logged to the substrate. Updating live.</p>
+<div style="margin:0 0 14px">
+  <a class="expbtn" href="/api/report">📄 incident report (.txt)</a>
+  <a class="expbtn" href="/api/export?format=json">⬇ export JSON</a>
+  <a class="expbtn" href="/api/export?format=csv">⬇ export CSV</a>
+  <span class="muted" style="font-size:13px"> — to report this to the FBI: file at <a href="https://www.ic3.gov" target="_blank" rel="noopener" style="color:var(--accent)">ic3.gov</a> and attach the report + JSON export.</span>
+</div>
 <div class="cards">
   <div class="card"><div class="n" id="c_total">0</div><div class="l">grabs</div></div>
   <div class="card"><div class="n" id="c_ips">0</div><div class="l">distinct origins</div></div>
