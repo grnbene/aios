@@ -1,0 +1,12 @@
+// Honeypot watch: a live view of .env grabs the edge server traces (aios-webserver's env_honeypot_feed).
+let app = {
+  "name": "honeypot",
+  "description": "live view of .env honeypot grabs: who, from where, through what",
+  "main": "service.gr",
+  "kind": "web",
+  "port": 8577,
+  "listen": "local",
+  "settings": {"HONEYPOT_FEED": "/var/log/aios/honeypot.jsonl"},
+  "health": {"path": "/health", "ok": [200]},
+  "max_steps": 0
+}

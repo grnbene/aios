@@ -81,6 +81,11 @@ struct VhostConfig {
   // objects.log), the same append-only, provenance-carrying, tamper-evident log the kernel writes - so a grab is a
   // StoredObject the resident can query by AQL and join to a later credential-use. Empty = log to stderr only.
   std::string env_honeypot_store;
+  // `env_honeypot_feed <file>`: also append one JSON line per grab here, the view the live Grain dashboard tails.
+  std::string env_honeypot_feed;
+  // `env_honeypot_geo <file>`: an offline IP->location table (lines "startIPv4int,endIPv4int,LABEL", sorted by start)
+  // for the origin's location. Supply GeoLite2 or any range list normalized to that; absent = no location guessed.
+  std::string env_honeypot_geo;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -241,6 +246,10 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         cur->env_honeypot = (v == "on" || v == "true" || v == "1");
       } else if (tok == "env_honeypot_store") {
         ls >> cur->env_honeypot_store;
+      } else if (tok == "env_honeypot_feed") {
+        ls >> cur->env_honeypot_feed;
+      } else if (tok == "env_honeypot_geo") {
+        ls >> cur->env_honeypot_geo;
       } else if (tok == "deny") {
         int status = 0;
         std::string pattern;
@@ -478,6 +487,106 @@ Origin trace_origin(const net::HttpRequestHead& head, const std::string& peer) {
   return o;
 }
 
+// ---- enrichment: what the box itself can say about an address, no network call ---------------------------------
+
+// Strip brackets/port, take the first of a comma list, trim. "[2001:db8::1]:443" -> "2001:db8::1", "a, b" -> "a".
+std::string clean_ip(const std::string& in) {
+  std::string s = in.substr(0, in.find(','));
+  size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
+  if (a == std::string::npos) return "";
+  s = s.substr(a, b - a + 1);
+  if (!s.empty() && s.front() == '[') { auto e = s.find(']'); if (e != std::string::npos) return s.substr(1, e - 1); }
+  // host:port only when a single colon (IPv4 or name); IPv6 has many
+  if (std::count(s.begin(), s.end(), ':') == 1) s = s.substr(0, s.find(':'));
+  return s;
+}
+bool parse_ipv4(const std::string& s, uint32_t* out) {
+  unsigned a, b, c, d;
+  char tail;
+  if (std::sscanf(s.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
+  if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+  *out = (a << 24) | (b << 16) | (c << 8) | d;
+  return true;
+}
+// family and scope from the address itself (RFC 1918/4193/6598/3927 and loopback).
+std::string ip_family(const std::string& ip) { return ip.find(':') != std::string::npos ? "ipv6" : "ipv4"; }
+std::string ip_scope(const std::string& ip) {
+  if (ip.find(':') != std::string::npos) {
+    if (ip == "::1") return "loopback";
+    std::string p = ip.substr(0, 4);
+    if (p == "fe80" || p.substr(0, 3) == "fe8" || p.substr(0, 3) == "fe9" || p.substr(0, 3) == "fea" || p.substr(0, 3) == "feb") return "link-local";
+    char c0 = ip.empty() ? 0 : ip[0];
+    if (c0 == 'f' && ip.size() > 1 && (ip[1] == 'c' || ip[1] == 'd')) return "private";  // fc00::/7
+    return "public";
+  }
+  uint32_t v;
+  if (!parse_ipv4(ip, &v)) return "unknown";
+  if ((v >> 24) == 127) return "loopback";
+  if ((v >> 24) == 10) return "private";
+  if ((v >> 20) == 0xAC1) return "private";                 // 172.16/12
+  if ((v >> 16) == 0xC0A8) return "private";                // 192.168/16
+  if ((v >> 16) == 0xA9FE) return "link-local";             // 169.254/16
+  if ((v & 0xFFC00000u) == 0x64400000u) return "cgnat";     // 100.64/10
+  if ((v >> 24) == 0) return "unspecified";
+  return "public";
+}
+
+// An offline IP -> location table: lines "startU32,endU32,LABEL", sorted by start; range lookup by binary search.
+// One per path, loaded once.
+class GeoDb {
+ public:
+  explicit GeoDb(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) { std::fprintf(stderr, "[env-honeypot] geo file not found: %s\n", path.c_str()); return; }
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      auto c1 = line.find(','), c2 = line.find(',', c1 + 1);
+      if (c1 == std::string::npos || c2 == std::string::npos) continue;
+      Row r;
+      r.lo = std::strtoul(line.substr(0, c1).c_str(), nullptr, 10);
+      r.hi = std::strtoul(line.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
+      r.label = line.substr(c2 + 1);
+      while (!r.label.empty() && (r.label.back() == '\r' || r.label.back() == '\n')) r.label.pop_back();
+      rows_.push_back(std::move(r));
+    }
+    std::sort(rows_.begin(), rows_.end(), [](const Row& a, const Row& b) { return a.lo < b.lo; });
+  }
+  std::string lookup(const std::string& ip) const {
+    uint32_t v;
+    if (rows_.empty() || !parse_ipv4(ip, &v)) return "";
+    auto it = std::upper_bound(rows_.begin(), rows_.end(), v, [](uint32_t val, const Row& r) { return val < r.lo; });
+    if (it == rows_.begin()) return "";
+    --it;
+    return (v >= it->lo && v <= it->hi) ? it->label : "";
+  }
+ private:
+  struct Row { uint32_t lo, hi; std::string label; };
+  std::vector<Row> rows_;
+};
+GeoDb* geo_db(const std::string& path) {
+  static std::mutex m;
+  std::lock_guard<std::mutex> lk(m);
+  static std::map<std::string, std::unique_ptr<GeoDb>> dbs;
+  auto it = dbs.find(path);
+  if (it == dbs.end()) it = dbs.emplace(path, std::make_unique<GeoDb>(path)).first;
+  return it->second.get();
+}
+std::string json_escape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default: if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; } else o += c;
+    }
+  }
+  return o;
+}
+
 // Serve the decoy. Small, and powerless: every host is on the .invalid TLD (resolves nowhere), the DB points at
 // loopback, and the keys are this grab's canary — not credentials to anything. The grab is logged and, when the
 // vhost names a store, recorded into the substrate with the full origin chain, so the canary presented later ties
@@ -486,12 +595,37 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
                         const std::string& path, const std::string& peer) {
   const std::string canary = mint_canary();
   const Origin origin = trace_origin(head, peer);
+  const std::string origin_ip = clean_ip(origin.best);
+  const std::string scope = ip_scope(origin_ip), family = ip_family(origin_ip);
+  std::string geo;
+  if (!vh.env_honeypot_geo.empty()) if (GeoDb* g = geo_db(vh.env_honeypot_geo)) geo = g->lookup(origin_ip);
+  // which CDN/proxy the probe came through, from the header the proxy sets
+  std::string via;
+  if (head.header("cf-connecting-ip") || head.header("cf-ray")) via = "Cloudflare";
+  else if (head.header("fastly-client-ip")) via = "Fastly";
+  else if (head.header("x-amz-cf-id")) via = "CloudFront";
+  else if (head.header("x-forwarded-for")) via = "proxy";
   std::time_t now = std::time(nullptr);
   char iso[32] = "";
   std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
-  std::fprintf(stderr, "[env-honeypot] canary=%s origin=%s peer=%s host=%s path=%s t=%s\n",
-               canary.c_str(), origin.best.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), iso);
+  std::fprintf(stderr, "[env-honeypot] canary=%s origin=%s (%s %s%s%s) via=%s peer=%s host=%s path=%s t=%s\n",
+               canary.c_str(), origin_ip.c_str(), family.c_str(), scope.c_str(), geo.empty() ? "" : " ",
+               geo.c_str(), via.empty() ? "-" : via.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), iso);
   std::fflush(stderr);
+
+  // the live feed the Grain dashboard tails: one JSON line per grab
+  if (!vh.env_honeypot_feed.empty()) {
+    std::string j = "{\"t\":\"" + std::string(iso) + "\",\"canary\":\"" + canary + "\",\"origin\":\"" + json_escape(origin_ip) +
+                    "\",\"scope\":\"" + scope + "\",\"family\":\"" + family + "\",\"geo\":\"" + json_escape(geo) +
+                    "\",\"via\":\"" + json_escape(via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
+                    json_escape(head.host) + "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
+                    json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
+                    json_escape(head.header("user-agent").value_or("")) + "\",\"hops\":[";
+    for (size_t i = 0; i < origin.hops.size(); ++i)
+      j += (i ? "," : "") + std::string("{\"") + json_escape(origin.hops[i].first) + "\":\"" + json_escape(origin.hops[i].second) + "\"}";
+    j += "]}\n";
+    hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
+  }
 
   if (!vh.env_honeypot_store.empty()) {
     if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) {
@@ -503,7 +637,11 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
       auto m = [&](const std::string& k, const std::string& v) { obj.metadata.push_back({k, v}); };
       m("kind", "honeypot.env_grab");
       m("canary", canary);
-      m("origin", origin.best);
+      m("origin", origin_ip);
+      m("origin_scope", scope);
+      m("origin_family", family);
+      if (!geo.empty()) m("origin_geo", geo);
+      if (!via.empty()) m("via", via);
       m("peer", peer);
       m("host", head.host);
       m("scheme", vh.ssl ? "https" : "http");
@@ -1431,6 +1569,8 @@ int aios_webserver_run(int argc, char** argv) {
       "    deny <status> <path-regex>\n"
       "    env_honeypot on            # serve a traceable, powerless decoy for .env probes instead of 404\n"
       "    env_honeypot_store <dir>   # record each grab (origin chain + canary) into the aios object store there\n"
+      "    env_honeypot_feed <file>   # also append one JSON line per grab, for the live Grain dashboard\n"
+      "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL) for the origin\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
     return argc < 2 ? 1 : 0;

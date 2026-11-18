@@ -1,0 +1,30 @@
+// Reads the edge server's honeypot feed (one JSON grab per line, appended as they happen) and serves a live page.
+// The feed is a projection; the authoritative, tamper-evident record is the object store the edge server also writes.
+fn setting(n, d) { let v = getenv(n) return v == nil or v == "" ? d : v }
+let FEED = setting("HONEYPOT_FEED", "/var/log/aios/honeypot.jsonl")
+let PAGE = app_program("page.html")
+
+// the most recent `limit` grabs, newest first
+fn grabs(limit) {
+  let r = pcall(read_file, FEED)
+  if not r.ok { return [] }
+  let lines = split(r.value, "\n")
+  let out = []
+  let i = len(lines) - 1
+  while i >= 0 and len(out) < limit {
+    let ln = trim(lines[i])
+    if ln != "" { let p = pcall(json_parse, ln) if p.ok { push(out, p.value) } }
+    i = i - 1
+  }
+  return out
+}
+
+serve_routes({
+  "GET /": fn (req) { return res_html(PAGE) },
+  "GET /health": fn (req) { return res_json({"ok": true}) },
+  "GET /api/grabs": fn (req) {
+    let limit = int(get(req.query_params, "limit", "300"))
+    let g = grabs(limit)
+    return res_json({"grabs": g, "count": len(g)})
+  }
+}, {"workers": false})
