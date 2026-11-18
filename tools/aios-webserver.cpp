@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -459,10 +460,12 @@ class HoneypotStore {
     if (!opened_) std::fprintf(stderr, "[env-honeypot] could not open substrate store at %s (logging only)\n", dir.c_str());
   }
   bool ok() const { return opened_; }
-  void put(aios::StoredObject obj) {
+  // returns the object's assigned id (12 hex chars), or "" if the put failed
+  std::string put(aios::StoredObject obj) {
     std::lock_guard<std::mutex> lk(m_);
     auto r = store_.put(std::move(obj));
-    if (!r.ok()) std::fprintf(stderr, "[env-honeypot] substrate put failed: %s\n", r.error().message.c_str());
+    if (!r.ok()) { std::fprintf(stderr, "[env-honeypot] substrate put failed: %s\n", r.error().message.c_str()); return ""; }
+    return r->short_str();
   }
  private:
   std::mutex m_;
@@ -480,6 +483,34 @@ HoneypotStore* honeypot_store(const std::string& dir) {
   return it->second->ok() ? it->second.get() : nullptr;
 }
 
+// A deterministic 128-d vector from text, hash-per-dimension then L2-normalized — the exact scheme Grain's
+// embed()/compute.embed() uses (src/userland/face.cpp), so a fingerprint computed here and one computed in a Grain
+// app from the same text are bit-identical and directly comparable (cosine, or the object store's NEAR). Not a
+// semantic/learned embedding - a stable coordinate for "same text again", which is exactly what fingerprinting
+// attacker tooling (UA + path + accept headers, never the IP) needs: same tool, same vector, independent of origin.
+std::vector<float> embed128(const std::string& text) {
+  constexpr size_t kDim = 128;
+  std::vector<double> raw(kDim, 0.0);
+  double sum_sq = 0;
+  for (size_t i = 0; i < kDim; ++i) {
+    uint64_t h = 14695981039346656037ULL + i * 1099511628211ULL;
+    for (unsigned char c : text) h = (h ^ c) * 1099511628211ULL;
+    double val = std::sin((double)(h % 1000000) * 0.00001 + (double)i * 0.1);
+    raw[i] = val;
+    sum_sq += val * val;
+  }
+  double norm = std::sqrt(sum_sq);
+  std::vector<float> out(kDim);
+  for (size_t i = 0; i < kDim; ++i) out[i] = (float)(norm > 0 ? raw[i] / norm : 0.0);
+  return out;
+}
+// the behavior signature to fingerprint: how they probed, not who they are. Two different origins running the same
+// scanner/script land on the same vector here, which is the point - it survives IP rotation and botnet spread.
+std::string fingerprint_text(const net::HttpRequestHead& head, const std::string& path) {
+  auto h = [&](const char* n) { return head.header(n).value_or(""); };
+  return head.method + "|" + path + "|" + h("user-agent") + "|" + h("accept") + "|" + h("accept-language") +
+        "|" + h("accept-encoding") + "|" + h("content-type");
+}
 // FNV-1a 64, for a stable producer identity from a string.
 uint64_t fnv1a(const std::string& s, uint64_t seed) {
   uint64_t h = seed;
@@ -656,8 +687,61 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
                e.type.empty() ? "" : " ", e.type.c_str(), e.geo.empty() ? "" : (" " + e.geo).c_str(),
                e.via.empty() ? "-" : e.via.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), e.iso.c_str());
   std::fflush(stderr);
-  // one JSON line for this event: node names which edge node saw it, so the fleet view can group by node.
-  std::string j = "{\"kind\":\"" + std::string(kind) + "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
+  // The behavior fingerprint: a 128-d vector from how they probed (method/path/UA/accept headers), not who they
+  // are - same tool/script lands on the same vector across IPs, origins, even botnets. Computed unconditionally
+  // (pure CPU, no IO) so it's always in the feed, whether or not a substrate store is configured.
+  std::string fp_text = fingerprint_text(head, path);
+  std::vector<float> fp_vec = embed128(fp_text);
+  char fp_hex[17]; std::snprintf(fp_hex, sizeof fp_hex, "%016llx", (unsigned long long)fnv1a(fp_text, 0xcbf29ce484222325ull));
+
+  aios::StoredObject obj;
+  obj.timestamp_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+  obj.provenance = aios::EntityID{aios::Id128{fnv1a("aios-webserver", 0xcbf29ce484222325ull),
+                                              fnv1a("env_honeypot", 0xcbf29ce484222325ull)}};
+  obj.embedding = fp_vec;
+  auto m = [&](const std::string& k, const std::string& v) { if (!v.empty()) obj.metadata.push_back({k, v}); };
+  m("kind", kind);
+  m("canary", e.canary);
+  m("origin", e.origin_ip);
+  m("origin_scope", e.scope);
+  m("origin_family", e.family);
+  m("origin_type", e.type);
+  m("origin_geo", e.geo);
+  m("origin_lat", e.lat);
+  m("origin_lon", e.lon);
+  m("via", e.via);
+  m("peer", peer);
+  m("host", head.host);
+  m("scheme", vh.ssl ? "https" : "http");
+  m("method", head.method);
+  m("path", path);
+  m("target", head.target);
+  if (auto ua = head.header("user-agent")) m("user_agent", *ua);
+  m("t", e.iso);
+  m("fingerprint", fp_hex);
+  std::string body = std::string(kind) + " canary=" + e.canary + "\norigin=" + e.origin.best + "\ntime=" + e.iso + "\n";
+  for (auto& [k, v] : e.origin.hops) body += k + ": " + v + "\n";
+  body += "--- request headers ---\n";
+  for (const auto& h : head.headers) body += h.name + ": " + h.value + "\n";
+  if (!extra.empty()) body += "--- body ---\n" + extra + "\n";
+  obj.payload.assign(body.begin(), body.end());
+  // the substrate's own id when a store is configured (the real, queryable identity: `store query "... NEAR
+  // embedding_of(...)..."` finds this object by its embedding); otherwise a local id from the same fingerprint
+  // hash plus the canary, so every event still carries a stable, displayable id either way.
+  std::string event_id;
+  if (!vh.env_honeypot_store.empty()) if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) event_id = hs->put(obj);
+  if (event_id.empty()) {
+    char buf[13]; std::snprintf(buf, sizeof buf, "%012llx", (unsigned long long)fnv1a(e.canary + e.iso, fnv1a(fp_hex, 0)));
+    event_id = buf;
+  }
+
+  // one JSON line for this event: node names which edge node saw it, so the fleet view can group by node. `id` is
+  // this event's identity (substrate object id when stored, else a local one); `fp` is the behavior fingerprint
+  // hash (same tool => same fp, any origin); `vec` is the full 128-d embedding for client-side similarity (cosine)
+  // without a round trip to the store.
+  std::string j = "{\"id\":\"" + event_id + "\",\"fp\":\"" + fp_hex + "\",\"kind\":\"" + std::string(kind) +
+                  "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
                   "\",\"origin\":\"" + json_escape(e.origin_ip) + "\",\"scope\":\"" + e.scope + "\",\"family\":\"" +
                   e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
                   "\",\"lat\":\"" + json_escape(e.lat) + "\",\"lon\":\"" + json_escape(e.lon) +
@@ -665,47 +749,14 @@ void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, c
                   json_escape(head.host) + "\",\"node\":\"" + json_escape(honeypot_node_name()) +
                   "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
                   json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
-                  json_escape(head.header("user-agent").value_or("")) + "\",\"hops\":[";
+                  json_escape(head.header("user-agent").value_or("")) + "\",\"vec\":[";
+  for (size_t i = 0; i < fp_vec.size(); ++i) { char fb[16]; std::snprintf(fb, sizeof fb, "%.4f", fp_vec[i]); j += (i ? "," : "") + std::string(fb); }
+  j += "],\"hops\":[";
   for (size_t i = 0; i < e.origin.hops.size(); ++i)
     j += (i ? "," : "") + std::string("{\"") + json_escape(e.origin.hops[i].first) + "\":\"" + json_escape(e.origin.hops[i].second) + "\"}";
   j += "]}\n";
   if (!vh.env_honeypot_feed.empty()) hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
   if (!vh.env_honeypot_forward.empty()) forward_event(vh.env_honeypot_forward, j);
-  if (!vh.env_honeypot_store.empty()) {
-    if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) {
-      aios::StoredObject obj;
-      obj.timestamp_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::system_clock::now().time_since_epoch()).count();
-      obj.provenance = aios::EntityID{aios::Id128{fnv1a("aios-webserver", 0xcbf29ce484222325ull),
-                                                  fnv1a("env_honeypot", 0xcbf29ce484222325ull)}};
-      auto m = [&](const std::string& k, const std::string& v) { if (!v.empty()) obj.metadata.push_back({k, v}); };
-      m("kind", kind);
-      m("canary", e.canary);
-      m("origin", e.origin_ip);
-      m("origin_scope", e.scope);
-      m("origin_family", e.family);
-      m("origin_type", e.type);
-      m("origin_geo", e.geo);
-      m("origin_lat", e.lat);
-      m("origin_lon", e.lon);
-      m("via", e.via);
-      m("peer", peer);
-      m("host", head.host);
-      m("scheme", vh.ssl ? "https" : "http");
-      m("method", head.method);
-      m("path", path);
-      m("target", head.target);
-      if (auto ua = head.header("user-agent")) m("user_agent", *ua);
-      m("t", e.iso);
-      std::string body = std::string(kind) + " canary=" + e.canary + "\norigin=" + e.origin.best + "\ntime=" + e.iso + "\n";
-      for (auto& [k, v] : e.origin.hops) body += k + ": " + v + "\n";
-      body += "--- request headers ---\n";
-      for (const auto& h : head.headers) body += h.name + ": " + h.value + "\n";
-      if (!extra.empty()) body += "--- body ---\n" + extra + "\n";
-      obj.payload.assign(body.begin(), body.end());
-      hs->put(std::move(obj));
-    }
-  }
 }
 
 // The bait's callback has landed: the attacker's own tooling, validating the stolen canary creds, connected to a URL

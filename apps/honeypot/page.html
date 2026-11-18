@@ -23,9 +23,20 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 .via { color:var(--warn); } .mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
 .new { animation:flash 2s; } @keyframes flash { from{background:rgba(224,84,43,.28)} to{background:transparent} }
 .muted { color:var(--muted); }
-#map { height:320px; border-radius:10px; border:1px solid var(--line); margin-bottom:14px; background:#0d1014; }
+#mapwrap { display:flex; gap:10px; margin-bottom:14px; align-items:stretch; }
+#map { height:380px; flex:1 1 auto; min-width:0; border-radius:10px; border:1px solid var(--line); background:#0d1014; cursor:pointer; }
+#detail { width:270px; flex:0 0 270px; height:380px; overflow-y:auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:13px; }
+#detail h3 { font-size:14px; margin:0 0 6px; } #detail .row { margin-bottom:8px; }
+#detail .ph { color:var(--muted); text-align:center; padding-top:120px; }
+.simlist .sim { display:flex; align-items:center; gap:6px; padding:5px 0; border-bottom:1px solid var(--line); cursor:pointer; }
+.simlist .sim:hover { background:rgba(255,255,255,.04); }
+.simbar { height:5px; border-radius:3px; background:var(--accent); flex-shrink:0; }
+.simtrack { flex:1; height:5px; border-radius:3px; background:var(--line); overflow:hidden; }
+@media (max-width:760px) { #mapwrap { flex-direction:column; } #detail { width:auto; flex:0 0 auto; height:180px; } }
 .leaflet-popup-content-wrapper,.leaflet-popup-tip { background:var(--panel); color:var(--ink); }
 .leaflet-container { background:#0d1014; }
+tr.sel td { background:rgba(208,84,43,.18); }
+tr[data-origin] { cursor:pointer; }
 </style></head>
 <body><main>
 <h1><span class="live"></span>Honeypot watch</h1>
@@ -39,13 +50,16 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
   <div class="card"><div class="n" id="c_top" style="font-size:16px">—</div><div class="l">top origin</div></div>
 </div>
 <div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
-<div id="map"></div>
+<div id="mapwrap">
+  <div id="map"></div>
+  <div id="detail"><div class="ph">click an origin — on the map or in a table row below — to see its id, fingerprint, and which other origins share its tooling.</div></div>
+</div>
 <p class="sub" id="mapfoot" style="margin-top:-8px"></p>
 <div id="cbwrap" style="display:none"><h2 style="font-size:16px;margin:4px 0">Bait callbacks <span class="muted" style="font-weight:400;font-size:13px">— the attacker's own tooling validated the stolen creds and connected to us</span></h2>
-<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Canary</th></tr></thead><tbody id="cbrows"></tbody></table></div>
+<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Id</th></tr></thead><tbody id="cbrows"></tbody></table></div>
 <h2 style="font-size:16px;margin:14px 0 4px">Grabs <span class="muted" style="font-weight:400;font-size:13px">— .env probes served the decoy</span></h2>
-<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Canary</th></tr></thead>
-<tbody id="grabrows"><tr><td colspan="9" class="muted">waiting for the feed…</td></tr></tbody></table>
+<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Id</th></tr></thead>
+<tbody id="grabrows"><tr><td colspan="11" class="muted">waiting for the feed…</td></tr></tbody></table>
 <p class="sub" id="foot" style="margin-top:12px"></p>
 </main>
 <script>
@@ -57,6 +71,7 @@ function ago(iso){ const t=Date.parse(iso+(iso&&iso.endsWith('Z')?'':'Z')); if(i
 function chain(hops){ if(!hops) return ''; return hops.map(h=>{const k=Object.keys(h)[0]; return esc(k)+'='+esc(h[k]);}).join(' › '); }
 function isDC(x){ const t=(x.net_type||'').toLowerCase(); if(t) return /host|datacenter|data center|cloud|server|vps/.test(t); return x.scope==='public'; }
 function isNoise(x){ const t=(x.net_type||'').toLowerCase(); return x.scope!=='public' || /resid|mobile|cellular|isp|dsl|cable|home/.test(t); }
+function cosine(a, b){ if(!a||!b||a.length!==b.length) return 0; let dot=0,na=0,nb=0; for(let i=0;i<a.length;i++){dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i];} const d=Math.sqrt(na)*Math.sqrt(nb); return d>0?dot/d:0; }
 // map: free OpenStreetMap tiles, no API key. One marker per distinct origin (grabs + callbacks together), colored
 // by whether we ever saw a bait callback from it. Offline geo is coarse (usually city/region centroid) - the point
 // is "which part of the world", not a street address.
@@ -65,18 +80,24 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
 }).addTo(map);
 let markers = L.layerGroup().addTo(map);
+let markerByOrigin = {};     // origin -> L.circleMarker, so a table row click can find and focus its pin
+let byOrigin = {};           // origin -> {lat, lon, grabs, cbs, geo, scope, net_type, node, last, id, fp, vec}
+let selectedOrigin = null;
+// every event each origin has, 128-d behavior vector included, so similarity isn't limited to its latest hit.
 function renderMap(g, cb){
   markers.clearLayers();
-  const byOrigin = {};
+  markerByOrigin = {};
+  byOrigin = {};
   for (const x of g.concat(cb)) {
     const lat = parseFloat(x.lat), lon = parseFloat(x.lon);
-    if (!isFinite(lat) || !isFinite(lon)) continue;
-    const o = byOrigin[x.origin] || (byOrigin[x.origin] = {lat, lon, grabs:0, cbs:0, geo:x.geo, scope:x.scope, net_type:x.net_type, node:x.node, last:x.t});
+    const o = byOrigin[x.origin] || (byOrigin[x.origin] = {lat:NaN, lon:NaN, grabs:0, cbs:0, geo:x.geo, scope:x.scope, net_type:x.net_type, node:x.node, last:x.t, id:x.id, fp:x.fp, vec:x.vec});
+    if (isFinite(lat) && isFinite(lon) && isNaN(o.lat)) { o.lat = lat; o.lon = lon; }
     if (x.kind === 'honeypot.callback') o.cbs++; else o.grabs++;
-    if (x.t > o.last) o.last = x.t;
+    if (x.t >= o.last) { o.last = x.t; o.id = x.id; o.fp = x.fp; o.vec = x.vec; o.geo = x.geo; o.scope = x.scope; o.net_type = x.net_type; o.node = x.node; }
   }
   let plotted = 0;
   for (const [origin, o] of Object.entries(byOrigin)) {
+    if (!isFinite(o.lat) || !isFinite(o.lon)) continue;
     plotted++;
     const color = o.cbs > 0 ? '#e5484d' : (o.scope === 'public' ? '#e2a03f' : '#8b93a0');
     const m = L.circleMarker([o.lat, o.lon], {
@@ -86,32 +107,62 @@ function renderMap(g, cb){
     m.bindPopup('<b>'+esc(origin)+'</b> <span style="color:'+color+'">'+esc(o.scope||'')+'</span><br>'+
       esc(o.geo||'—')+'<br>'+esc(o.net_type||'')+'<br>'+
       o.grabs+' grab(s)'+(o.cbs?', <b style="color:#e5484d">'+o.cbs+' callback(s)</b>':'')+'<br>'+
-      'last seen '+esc(ago(o.last))+' · node '+esc(o.node||'—'));
+      'last seen '+esc(ago(o.last))+' · node '+esc(o.node||'—')+'<br>id <span class="mono">'+esc(o.id||'—')+'</span>');
+    m.on('click', () => showDetail(origin));
     markers.addLayer(m);
+    markerByOrigin[origin] = m;
   }
   $('mapfoot').textContent = plotted
-    ? plotted+' origin(s) plotted (offline geo: city/region centroid, not exact) · red = sent a bait callback, amber = public, grey = private/cgnat scope'
+    ? plotted+' origin(s) plotted (offline geo: city/region centroid, not exact) · red = sent a bait callback, amber = public, grey = private/cgnat scope · click one, or a table row, for its fingerprint'
     : 'no origins with location data yet — configure env_honeypot_geo with lat=/lon= tokens to populate the map.';
+  if (selectedOrigin && byOrigin[selectedOrigin]) showDetail(selectedOrigin, true); else if (selectedOrigin) { selectedOrigin = null; }
 }
-function rowGrab(x){ const key=x.canary||(x.t+x.origin); const nw=!seen.has(key); seen.add(key);
+// focus the map on an origin (flying to its pin if it has one) and fill the detail panel: its id/fingerprint, and
+// the other origins whose 128-d behavior vector is closest by cosine - same tool, same script, different address.
+function showDetail(origin, keepView){
+  const o = byOrigin[origin];
+  if (!o) return;
+  selectedOrigin = origin;
+  document.querySelectorAll('tr[data-origin]').forEach(r => r.classList.toggle('sel', r.dataset.origin === origin));
+  if (!keepView && isFinite(o.lat) && isFinite(o.lon)) { map.flyTo([o.lat, o.lon], Math.max(map.getZoom(), 4)); markerByOrigin[origin]?.openPopup(); }
+  const sims = Object.entries(byOrigin)
+    .filter(([or, x]) => or !== origin && x.vec && o.vec)
+    .map(([or, x]) => ({ origin: or, score: cosine(o.vec, x.vec), x }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6);
+  const color = o.cbs > 0 ? '#e5484d' : (o.scope === 'public' ? '#e2a03f' : '#8b93a0');
+  $('detail').innerHTML =
+    '<h3 style="color:'+color+'">'+esc(origin)+'</h3>'+
+    '<div class="row muted">'+esc(o.geo||'—')+(o.net_type?' · '+esc(o.net_type):'')+'</div>'+
+    '<div class="row">id <span class="mono">'+esc(o.id||'—')+'</span><br>fingerprint <span class="mono">'+esc((o.fp||'—').slice(0,16))+'</span></div>'+
+    '<div class="row">'+o.grabs+' grab(s)'+(o.cbs?', <b style="color:#e5484d">'+o.cbs+' callback(s)</b>':'')+' · last '+esc(ago(o.last))+'</div>'+
+    '<div class="row"><b>same tooling, other origins</b> <span class="muted" style="font-weight:400">— cosine on the behavior vector</span></div>'+
+    '<div class="simlist">'+(sims.length ? sims.map(s =>
+      '<div class="sim" data-origin="'+esc(s.origin)+'"><span style="width:58px">'+esc(s.origin)+'</span>'+
+      '<span class="simtrack"><span class="simbar" style="width:'+Math.max(0,Math.round(s.score*100))+'%"></span></span>'+
+      '<span class="muted" style="width:34px;text-align:right">'+Math.round(s.score*100)+'%</span></div>'
+    ).join('') : '<div class="muted" style="padding:6px 0">no other origin shares this fingerprint yet.</div>')+'</div>';
+  $('detail').querySelectorAll('.sim').forEach(el => el.addEventListener('click', () => showDetail(el.dataset.origin)));
+}
+function rowGrab(x){ const key=x.id||x.canary||(x.t+x.origin); const nw=!seen.has(key); seen.add(key);
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
-  return '<tr class="'+(nw?'new':'')+'">'+
+  return '<tr class="'+(nw?'new':'')+'" data-origin="'+esc(x.origin)+'">'+
     '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
     '<td>'+esc(x.node||'—')+'</td>'+
     '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
     '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
     '<td>'+esc(x.host)+'</td><td class="mono">'+esc(x.path)+'</td>'+
     '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td>'+
-    '<td class="mono">'+chain(x.hops)+'</td><td class="mono">'+esc((x.canary||'').slice(0,10))+'</td></tr>'; }
-function rowCb(x){ const key='cb'+(x.canary||'')+x.t; const nw=!seen.has(key); seen.add(key);
+    '<td class="mono">'+chain(x.hops)+'</td><td class="mono" title="fingerprint '+esc(x.fp||'')+'">'+esc((x.id||'').slice(0,10))+'</td></tr>'; }
+function rowCb(x){ const key='cb'+(x.id||x.canary||'')+x.t; const nw=!seen.has(key); seen.add(key);
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
-  return '<tr class="'+(nw?'new':'')+'">'+
+  return '<tr class="'+(nw?'new':'')+'" data-origin="'+esc(x.origin)+'">'+
     '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
     '<td>'+esc(x.node||'—')+'</td>'+
     '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
     '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
     '<td class="mono">'+esc(x.method)+'</td><td class="mono">'+esc(x.path)+'</td>'+
-    '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td><td class="mono">'+esc((x.canary||'').slice(0,10))+'</td></tr>'; }
+    '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td><td class="mono" title="fingerprint '+esc(x.fp||'')+'">'+esc((x.id||'').slice(0,10))+'</td></tr>'; }
 async function tick(){
   let j; try { j = await (await fetch('/api/grabs?limit=400')).json(); } catch(e){ $('foot').textContent='feed unreachable: '+e.message; return; }
   const dc = $('f_dc').checked;
@@ -126,6 +177,8 @@ async function tick(){
   $('grabrows').innerHTML=g.length?g.map(rowGrab).join(''):'<tr><td colspan="11" class="muted">no grabs yet — the trap is armed.</td></tr>';
   $('foot').textContent='showing '+g.length+' grabs, '+cb.length+' callbacks · '+new Date().toLocaleTimeString();
   renderMap(g, cb);
+  document.querySelectorAll('tr[data-origin]').forEach(r => r.addEventListener('click', () => showDetail(r.dataset.origin)));
+  if (selectedOrigin) document.querySelectorAll('tr[data-origin]').forEach(r => r.classList.toggle('sel', r.dataset.origin === selectedOrigin));
 }
 $('f_dc').addEventListener('change', tick);
 tick(); setInterval(tick, 3000);
