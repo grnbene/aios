@@ -130,6 +130,7 @@ add_test(NAME grain.lang.jpeg COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/gr
 add_test(NAME grain.lang.jpeg.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_jpeg.gr)
 add_test(NAME grain.lang.carve COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_carve.gr)
 add_test(NAME grain.lang.carve.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_carve.gr)
+add_test(NAME grain.lang.measure COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_measure.gr)
 add_test(NAME grain.lang.for_range COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_for_range.gr)
 add_test(NAME grain.lang.for_range.nojit COMMAND ${CMAKE_COMMAND} -E env GRAIN_NOJIT=1 $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_for_range.gr)
 add_test(NAME grain.lang.empty_blocks COMMAND $<TARGET_FILE:grain> ${AIOS_ROOT}/tests/grain/test_empty_blocks.gr)

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "aios/core/bytes.hpp"
+#include "grain_builtins_internal.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/kernel/kernel.hpp"
 #include "aios/node/node.hpp"
@@ -364,8 +365,18 @@ grain::Value bi_sql(grain::Vm&, std::vector<grain::Value>& args, std::string& er
   if (args[0].type != grain::Type::Str) { error = "sql() wants a statement string"; return grain::Value::nil(); }
   SqlDatabase* db = g_vm_kernel ? machine_sql(*g_vm_kernel) : nullptr;
   if (!db) { error = "sql(): the SQL engine did not open on this machine"; return grain::Value::nil(); }
+  // sql(statement, params): each ? outside quotes and comments filled with the next value as a literal, as
+  // db_query binds them - values are never pasted into the text by hand
+  std::string bound;
+  const std::string* stmt = &args[0].str();
+  if (args.size() > 1 && args[1].type != grain::Type::Nil) {
+    if (args[1].type != grain::Type::List) { error = std::string("sql() wants its parameters as a list, got a ") + grain::type_name(args[1].type); return grain::Value::nil(); }
+    std::string berr;
+    if (!grain::bind_params(args[0].str(), args[1].list_items(), bound, berr)) { error = "sql(): " + berr; return grain::Value::nil(); }
+    stmt = &bound;
+  }
   SqlDatabase::ResultColumns cols;
-  SqlQueryResult r = db->execute_local_query_columns(args[0].str(), &cols);
+  SqlQueryResult r = db->execute_local_query_columns(*stmt, &cols);
   if (!r.success) { error = "sql(): " + r.error_message; return grain::Value::nil(); }
   if (cols.filled && r.is_result_set) return to_grain_columns(r, cols);
   return to_grain(r);
@@ -382,7 +393,7 @@ grain::Value bi_sql_on(grain::Vm&, std::vector<grain::Value>& args, std::string&
 
 void install_sql_builtins(grain::Vm& vm, Kernel& k) {
   g_vm_kernel = &k;
-  vm.define_native("sql", 1, 1, bi_sql);
+  vm.define_native("sql", 1, 2, bi_sql);
   vm.define_native("sql_on", 2, 2, bi_sql_on);
 }
 

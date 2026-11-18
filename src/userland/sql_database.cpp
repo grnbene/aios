@@ -20,6 +20,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #endif
 #include "aios/core/threads.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "aios/userland/tire_fit.hpp"
 #include "aios/userland/sql_things.hpp"
 #include "aios/hal/sync.hpp"
 #include "aios/userland/sql_cells.hpp"
@@ -7387,7 +7388,7 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
           up == "YEAR"sv || up == "MONTH"sv || up == "DAY"sv || up == "DAYOFMONTH"sv || up == "HOUR"sv ||
           up == "MINUTE"sv || up == "SECOND"sv || up == "WEEK"sv || up == "QUARTER"sv ||
           up == "TIMESTAMPDIFF"sv || up == "EXTRACT"sv || up == "INSTR"sv || up == "LOCATE"sv || up == "POSITION"sv ||
-          up == "FIELD"sv || up == "FIND_IN_SET"sv || up == "ASCII"sv || up == "ORD"sv || up == "CRC32"sv ||
+          up == "FIELD"sv || up == "FIND_IN_SET"sv || up == "ASCII"sv || up == "ORD"sv || up == "CRC32"sv || up == "TIRE_FIT"sv ||
           up == "SIGN"sv || up == "BIT_COUNT"sv || up == "STRCMP"sv || up == "GET_LOCK"sv || up == "RELEASE_LOCK"sv ||
           up == "IS_FREE_LOCK"sv || up == "IS_USED_LOCK"sv || up == "PERIOD_DIFF"sv || up == "PERIOD_ADD"sv ||
           up == "DAYOFWEEK"sv || up == "DAYOFYEAR"sv || up == "WEEKDAY"sv || up == "WEEKOFYEAR"sv || up == "YEARWEEK"sv ||
@@ -7425,7 +7426,7 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
       if (up == "STD"sv || up == "STDDEV"sv || up == "STDDEV_POP"sv || up == "STDDEV_SAMP"sv || up == "VARIANCE"sv ||
           up == "VAR_POP"sv || up == "VAR_SAMP"sv)
         return SqlDataType::Real;
-      if (up == "LOG"sv || up == "LOG2"sv || up == "LOG10"sv || up == "LN"sv || up == "EXP"sv || up == "PI"sv ||
+      if (up == "TIRE_WIDTH_MM"sv || up == "TIRE_DIAMETER_MM"sv || up == "LOG"sv || up == "LOG2"sv || up == "LOG10"sv || up == "LN"sv || up == "EXP"sv || up == "PI"sv ||
           up == "RADIANS"sv || up == "DEGREES"sv || up == "SIN"sv || up == "COS"sv || up == "TAN"sv || up == "ASIN"sv ||
           up == "ACOS"sv || up == "ATAN"sv || up == "ATAN2"sv || up == "COT"sv || up == "SQRT"sv || up == "POW"sv ||
           up == "POWER"sv || up == "RAND"sv)
@@ -12890,6 +12891,31 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   if (up == "BIT_LENGTH"sv) {
     if (arg_count == 0 || a_ptr[0].null) return val_null();
     return val_num((double)(a_ptr[0].str().size() * 8));
+  }
+  // Tires as cylinders, and how many fit a bin (aios/userland/tire_fit.hpp, which grain's tire_fit shares):
+  //   TIRE_WIDTH_MM(size), TIRE_DIAMETER_MM(size)            from a size such as '225/45R17' (NULL: not a size)
+  //   TIRE_FIT(w, d, h, size) / TIRE_FIT(w, d, h, width, diam) how many fit a w x d x h bin (mm), the best of lying in
+  //                                                           stacks and standing either way; NULL for no size
+  //   TIRE_FIT_MODE(...)                                      which way that is: 'flat', 'across', 'deep' or 'none'
+  if (up == "TIRE_WIDTH_MM"sv || up == "TIRE_DIAMETER_MM"sv) {
+    if (arg_count != 1 || a_ptr[0].null) return val_null();
+    const tire::Size z = tire::parse_size(a_ptr[0].str());
+    if (!z.ok) return val_null();
+    return val_approx(up == "TIRE_WIDTH_MM"sv ? z.width_mm : z.diameter_mm);
+  }
+  if (up == "TIRE_FIT"sv || up == "TIRE_FIT_MODE"sv) {
+    if (arg_count != 4 && arg_count != 5) return val_null();
+    for (size_t k = 0; k < arg_count; ++k) if (a_ptr[k].null) return val_null();
+    double tw = 0, td = 0;
+    if (arg_count == 4) {
+      const tire::Size z = tire::parse_size(a_ptr[3].str());
+      if (!z.ok) return val_null();
+      tw = z.width_mm; td = z.diameter_mm;
+    } else {
+      tw = val_as_number(a_ptr[3]); td = val_as_number(a_ptr[4]);
+    }
+    const tire::Fit f = tire::fit(val_as_number(a_ptr[0]), val_as_number(a_ptr[1]), val_as_number(a_ptr[2]), tw, td);
+    return up == "TIRE_FIT"sv ? val_num((double)f.count) : val_text(f.mode);
   }
   if (up == "CRC32"sv) {
     if (arg_count == 0 || a_ptr[0].null) return val_null();

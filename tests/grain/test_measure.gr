@@ -1,0 +1,118 @@
+// image_find_marker / homography / homography_apply / image_rectify / tire_size / tire_fit
+// (src/userland/grain_std_carve.cpp, include/aios/userland/tire_fit.hpp). A marker is drawn through a known
+// perspective (a plane in millimetres seen at an angle); what is found and measured is checked against that truth.
+fn check(c, msg) { assert_true(c, msg) }
+fn sq2(v) { return v * v }
+
+// ---- homography: exact on its own points, and a known map recovered ----
+let sq = [[0, 0], [100, 0], [100, 100], [0, 100]]
+let seen = [[412, 233], [655, 260], [640, 498], [395, 470]]
+let H = homography(sq, seen)
+check(len(H) == 9 and H[8] == 1.0, "nine numbers, h33 = 1")
+let back = homography_apply(H, sq)
+let worst = 0.0
+for i in 0..4 { worst = max(worst, abs(back[i][0] - seen[i][0]) + abs(back[i][1] - seen[i][1])) }
+check(worst < 1e-6, format("it takes the four points onto the four: off by {}", worst))
+let Hi = homography(seen, sq)
+let round = homography_apply(Hi, homography_apply(H, [[37, 81]]))[0]
+check(abs(round[0] - 37) < 1e-6 and abs(round[1] - 81) < 1e-6, "and its inverse undoes it")
+check(!try_call(homography, sq, [[0, 0], [1, 1], [2, 2], [3, 3]]).ok, "points in a line are refused")
+
+// ---- a photo of a marker on a wall, at an angle ----
+// the plane (mm) to the picture (px): the wall seen from the left and below
+let plane = [[0, 0], [1000, 0], [1000, 700], [0, 700]]
+let pic = [[90, 60], [1110, 140], [1080, 770], [120, 860]]
+let P = homography(plane, pic)
+fn to_pic(pts) { return homography_apply(P, pts) }
+let W = 1200
+let Hh = 900
+let cv = canvas_create(W, Hh)
+canvas_set_fill_color(cv, "#6d6a63")
+canvas_fill_rect(cv, 0, 0, W, Hh)
+canvas_set_fill_color(cv, "#d8d4c8")
+canvas_fill_polygon(cv, to_pic(plane))
+// the marker: 150 mm black with a 75 mm white square in it, its corner at (300, 200) mm
+let M0 = [300, 200]
+let S = 150
+let outer = [[M0[0], M0[1]], [M0[0] + S, M0[1]], [M0[0] + S, M0[1] + S], [M0[0], M0[1] + S]]
+let inner = [[M0[0] + S / 4, M0[1] + S / 4], [M0[0] + 3 * S / 4, M0[1] + S / 4], [M0[0] + 3 * S / 4, M0[1] + 3 * S / 4], [M0[0] + S / 4, M0[1] + 3 * S / 4]]
+canvas_set_fill_color(cv, "#141414")
+canvas_fill_polygon(cv, to_pic(outer))
+canvas_set_fill_color(cv, "#e6e2d6")
+canvas_fill_polygon(cv, to_pic(inner))
+// decoys: a tire's tread from the front (a dark rectangle), a tire on its side (a dark ring), a dark square with
+// an off-centre hole
+canvas_set_fill_color(cv, "#1a1a1a")
+canvas_fill_polygon(cv, to_pic([[600, 100], [800, 100], [800, 300], [600, 300]]))
+canvas_fill_circle(cv, 900, 650, 110)
+canvas_set_fill_color(cv, "#d8d4c8")
+canvas_fill_circle(cv, 900, 650, 55)
+canvas_set_fill_color(cv, "#1a1a1a")
+canvas_fill_polygon(cv, to_pic([[100, 450], [260, 450], [260, 610], [100, 610]]))
+canvas_set_fill_color(cv, "#d8d4c8")
+canvas_fill_polygon(cv, to_pic([[110, 460], [160, 460], [160, 510], [110, 510]]))
+// grain on everything, as a phone's sensor gives
+let seed = 7
+for y in 0..Hh {
+  for x in 0..W {
+    if (x * 7 + y * 13) % 5 != 0 { continue }
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    let p = canvas_get_pixel(cv, x, y)
+    let d = seed % 25 - 12
+    let c = fn (v) { return max(0, min(255, v + d)) }
+    canvas_set_pixel(cv, x, y, 0xFF000000 + (c((p >> 16) & 255) << 16) + (c((p >> 8) & 255) << 8) + c(p & 255))
+  }
+}
+
+let m = image_find_marker(cv)
+check(m != nil, "the marker is found")
+let truth = to_pic(outer)
+let off = 0.0
+for i in 0..4 { off = max(off, sqrt(sq2(m.corners[i][0] - truth[i][0]) + sq2(m.corners[i][1] - truth[i][1]))) }
+check(off < 1.5, format("its corners within a pixel and a half of the truth, clockwise from the top left: worst {:.2f} px", off))
+
+// measuring on the wall through the marker: 150 mm a side gives the scale and the perspective
+let to_mm = homography(m.corners, [[0, 0], [S, 0], [S, S], [0, S]])
+let a = homography_apply(to_mm, to_pic([[200, 600]]))[0]
+let b = homography_apply(to_mm, to_pic([[800, 600]]))[0]
+let dist = sqrt(sq2(a[0] - b[0]) + sq2(a[1] - b[1]))
+check(abs(dist - 600) / 600 < 0.01, format("a 600 mm line elsewhere on the wall measures {:.1f} mm", dist))
+let c = homography_apply(to_mm, to_pic([[300, 650]]))[0]
+let d = homography_apply(to_mm, to_pic([[300, 100]]))[0]
+let up = sqrt(sq2(c[0] - d[0]) + sq2(c[1] - d[1]))
+check(abs(up - 550) / 550 < 0.01, format("a 550 mm upright measures {:.1f} mm", up))
+
+// nothing like a marker: nil, not a guess
+let plain = canvas_create(400, 300)
+canvas_set_fill_color(plain, "#d8d4c8")
+canvas_fill_rect(plain, 0, 0, 400, 300)
+canvas_set_fill_color(plain, "#1a1a1a")
+canvas_fill_rect(plain, 100, 100, 120, 80)
+check(image_find_marker(plain) == nil, "a dark rectangle with no hole is not a marker")
+
+// ---- image_rectify: the wall made square again ----
+let flat = image_rectify(cv, to_pic(outer), 150, 150)
+check(canvas_width(flat) == 150 and canvas_height(flat) == 150, "the size asked for")
+let centre = canvas_get_pixel(flat, 75, 75)
+let ring = canvas_get_pixel(flat, 18, 75)
+check((centre & 255) > 180 and (ring & 255) < 60, format("the marker's white middle and black ring where they belong: {} {}", color_to_hex(centre), color_to_hex(ring)))
+
+// ---- tires ----
+let t = tire_size("225/45R17")
+check(abs(t.width_mm - 225) < 0.01 and abs(t.diameter_mm - 634.3) < 0.05, format("225/45R17: 225 mm wide, 634.3 mm across: {}", t))
+let lt = tire_size("LT265/70R17 121/118S")
+check(abs(lt.diameter_mm - 802.8) < 0.05, "an LT size with its load index read past")
+let fl = tire_size("33X12.50R15LT")
+check(abs(fl.diameter_mm - 838.2) < 0.05 and abs(fl.width_mm - 317.5) < 0.05, "a flotation size in inches")
+check(tire_size("4.80-8") == nil and tire_size("banana") == nil, "what is not a size is nil")
+// a 1200 x 900 x 1000 bin of 225/45R17: lying, 4 a stack (1000 / 225) but one stack's circle (634) a floor; standing
+// across, 5 a row (1200 / 225), one row deep, one high
+let f = tire_fit(1200, 900, 1000, "225/45R17")
+check(f.count == 5 and f.mode == "across", format("1200x900x1000 holds 5 standing: {}", f))
+// a deep, low shelf: lying wins - 2400 x 1300 floor holds 3 x 2 circles of 634 (offset rows hold no more), 2 high
+let g = tire_fit(2400, 1300, 460, "225/45R17")
+check(g.count == 12 and g.mode == "flat", format("2400x1300x460 holds 12 lying: {}", g))
+check(tire_fit(100, 100, 100, "225/45R17").count == 0, "too small a bin holds none")
+check(tire_fit(1200, 900, 1000, 225, 634.3).count == 5, "width and diameter given directly")
+check(!try_call(tire_fit, 1, 1, 1, "banana").ok, "a size that is not one is refused")
+print("PASS: test_measure")

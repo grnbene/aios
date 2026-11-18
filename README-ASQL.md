@@ -372,6 +372,18 @@ ON RISE alert_triggered MAIL alerts_mailer
 
 ---
 
+### Tire and bin functions
+
+ASQL computes how many tires fit a bin, so a Thing can keep bin fill live (`apps/bin_capacity`):
+
+| Function | Returns |
+|---|---|
+| `TIRE_WIDTH_MM(size)`, `TIRE_DIAMETER_MM(size)` | a tire's section width and overall diameter from its size (`'225/45R17'` is 225 and 634.3), `NULL` for what is not a size |
+| `TIRE_FIT(w, d, h, size)` / `TIRE_FIT(w, d, h, width_mm, diameter_mm)` | how many fit a `w` x `d` x `h` mm bin: the best of lying in stacks and standing either way |
+| `TIRE_FIT_MODE(...)` | which way that is: `'flat'`, `'across'`, `'deep'` or `'none'` |
+
+The same code is grain's `tire_size` / `tire_fit` (`include/aios/userland/tire_fit.hpp`).
+
 ## Operating Modes & Write Synchronization
 
 ASQL supports three primary operational architectures and three write synchronization policies:

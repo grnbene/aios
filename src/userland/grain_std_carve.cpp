@@ -29,6 +29,20 @@
 //       front, back: {positions, normals (float32 xyz a vertex), uvs (float32 uv: the vertex's place in the
 //       picture, 0..1), indices (uint32), vertex_count} - model_prim's columns. opts: {thickness (the depth as a
 //       share of the round cross-section; 1), smooth (passes smoothing the rim and the surface; 2)}.
+//
+// Measuring from photos (a printed marker gives the scale), and tires against bins:
+//   image_find_marker(canvas[, opts]) -> {corners: [[x y] x4], centre: [x y], side_px, score} or nil
+//       The calibration marker: a black square with a white square half its side in the middle, on a lighter
+//       ground. Found by an adaptive threshold, the dark pieces with one hole of about a quarter of their area
+//       centred in them, a quadrilateral fitted to the outer edge and each side refined by a straight line through its
+//       edge pixels; corners clockwise from the top left, in the picture's pixels. opts: {max_side (1200)}.
+//   homography(from, to) -> [9 numbers]: the plane-to-plane map taking four points onto four (row by row, h33 = 1)
+//   homography_apply(H, points) -> points: [[x y] ...] mapped by H
+//   image_rectify(canvas, quad, w, h) -> canvas: the quadrilateral (four corners, clockwise from the top left) of the
+//       picture made a w x h rectangle (each pixel sampled bilinearly through the homography)
+//   tire_size(size) -> {width_mm, diameter_mm} or nil: a tire size ("225/45R17", "LT265/70R17", "33X12.50R15")
+//   tire_fit(w, d, h, size | width_mm[, diameter_mm]) -> {count, mode}: how many fit a w x d x h bin (mm), lying in
+//       stacks ("flat") or standing ("across", "deep") - aios/userland/tire_fit.hpp, as ASQL's TIRE_FIT
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +55,7 @@
 #include <vector>
 
 #include "aios/userland/grain.hpp"
+#include "aios/userland/tire_fit.hpp"
 #include "grain_builtins_internal.hpp"
 
 namespace aios::userland::grain {
@@ -1086,6 +1101,365 @@ Value bi_mesh_inflate(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, res);
 }
 
+// ---- measuring: the marker, homographies -------------------------------------------------------------------
+
+struct P2 { double x, y; };
+
+// the 3x3 homography taking a[i] to b[i] (four pairs): the 8x8 linear system solved with partial pivoting
+bool solve_homography(const P2* a, const P2* b, double H[9]) {
+  double M[8][9];
+  for (int i = 0; i < 4; ++i) {
+    const double x = a[i].x, y = a[i].y, u = b[i].x, v = b[i].y;
+    double r0[9] = {x, y, 1, 0, 0, 0, -u * x, -u * y, u};
+    double r1[9] = {0, 0, 0, x, y, 1, -v * x, -v * y, v};
+    std::memcpy(M[i * 2], r0, sizeof r0);
+    std::memcpy(M[i * 2 + 1], r1, sizeof r1);
+  }
+  for (int c = 0; c < 8; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < 8; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+    if (std::fabs(M[piv][c]) < 1e-12) return false;
+    if (piv != c) for (int k = 0; k < 9; ++k) std::swap(M[c][k], M[piv][k]);
+    for (int r = 0; r < 8; ++r) {
+      if (r == c) continue;
+      const double f = M[r][c] / M[c][c];
+      for (int k = c; k < 9; ++k) M[r][k] -= f * M[c][k];
+    }
+  }
+  for (int i = 0; i < 8; ++i) H[i] = M[i][8] / M[i][i];
+  H[8] = 1;
+  return true;
+}
+P2 apply_h(const double H[9], P2 p) {
+  const double w = H[6] * p.x + H[7] * p.y + H[8];
+  return {(H[0] * p.x + H[1] * p.y + H[2]) / w, (H[3] * p.x + H[4] * p.y + H[5]) / w};
+}
+
+bool read_points(const Value& v, std::vector<P2>& out, size_t want, std::string& error, const char* who) {
+  out.clear();
+  if (v.type != Type::List) { error = std::string(who) + "() wants a list of [x, y] points"; return false; }
+  for (const Value& p : v.list_items()) {
+    if (p.type != Type::List || p.list_items().size() < 2 || !p.list_items()[0].is_number() || !p.list_items()[1].is_number()) {
+      error = std::string(who) + "() wants each point as [x, y]";
+      return false;
+    }
+    out.push_back({p.list_items()[0].as_double(), p.list_items()[1].as_double()});
+  }
+  if (want && out.size() != want) { error = std::string(who) + "() wants " + std::to_string(want) + " points, got " + std::to_string(out.size()); return false; }
+  return true;
+}
+Value points_value(const std::vector<P2>& ps) {
+  std::vector<Value> out;
+  for (const P2& p : ps) out.push_back(Value::list({Value::real(p.x), Value::real(p.y)}));
+  return Value::list(std::move(out));
+}
+bool read_h(const Value& v, double H[9], std::string& error, const char* who) {
+  if (v.type != Type::List || v.list_items().size() != 9) { error = std::string(who) + "() wants a homography: a list of 9 numbers"; return false; }
+  for (int i = 0; i < 9; ++i) {
+    if (!v.list_items()[(size_t)i].is_number()) { error = std::string(who) + "() wants a homography: a list of 9 numbers"; return false; }
+    H[i] = v.list_items()[(size_t)i].as_double();
+  }
+  return true;
+}
+
+Value bi_homography(Vm&, std::vector<Value>& args, std::string& error) {
+  std::vector<P2> a, b;
+  if (!read_points(args[0], a, 4, error, "homography") || !read_points(args[1], b, 4, error, "homography")) return Value::nil();
+  double H[9];
+  if (!solve_homography(a.data(), b.data(), H)) { error = "homography(): the points are degenerate (three in a line)"; return Value::nil(); }
+  std::vector<Value> out;
+  for (double h : H) out.push_back(Value::real(h));
+  return Value::list(std::move(out));
+}
+
+Value bi_homography_apply(Vm&, std::vector<Value>& args, std::string& error) {
+  double H[9];
+  if (!read_h(args[0], H, error, "homography_apply")) return Value::nil();
+  std::vector<P2> ps;
+  if (!read_points(args[1], ps, 0, error, "homography_apply")) return Value::nil();
+  for (P2& p : ps) p = apply_h(H, p);
+  return points_value(ps);
+}
+
+Value bi_image_rectify(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_rectify")) return Value::nil();
+  std::vector<P2> q;
+  if (!read_points(args[1], q, 4, error, "image_rectify")) return Value::nil();
+  if (!want_number(args[2], error, "image_rectify") || !want_number(args[3], error, "image_rectify")) return Value::nil();
+  const int64_t ow = args[2].as_int(), oh = args[3].as_int();
+  if (ow < 1 || oh < 1 || ow > 8192 || oh > 8192) { error = "image_rectify(): the size is 1..8192 each way"; return Value::nil(); }
+  const P2 rect[4] = {{0, 0}, {(double)ow, 0}, {(double)ow, (double)oh}, {0, (double)oh}};
+  double M[9];
+  if (!solve_homography(rect, q.data(), M)) { error = "image_rectify(): the quadrilateral is degenerate"; return Value::nil(); }
+  std::vector<uint32_t> out((size_t)ow * oh, 0);
+  for (int64_t y = 0; y < oh; ++y)
+    for (int64_t x = 0; x < ow; ++x) {
+      const P2 s = apply_h(M, {x + 0.5, y + 0.5});
+      const double fx = s.x - 0.5, fy = s.y - 0.5;
+      if (fx < -0.5 || fy < -0.5 || fx > W - 0.5 || fy > H - 0.5) continue;
+      const int x0 = std::clamp((int)std::floor(fx), 0, (int)W - 1), y0 = std::clamp((int)std::floor(fy), 0, (int)H - 1);
+      const int x1 = std::min<int>(x0 + 1, W - 1), y1 = std::min<int>(y0 + 1, H - 1);
+      const double tx = std::clamp(fx - x0, 0.0, 1.0), ty = std::clamp(fy - y0, 0.0, 1.0);
+      uint32_t c = 0;
+      for (int sh = 0; sh < 32; sh += 8) {
+        auto ch = [&](int xx, int yy) { return (double)(((*px)[(size_t)yy * W + xx] >> sh) & 255); };
+        const double v = (ch(x0, y0) * (1 - tx) + ch(x1, y0) * tx) * (1 - ty) + (ch(x0, y1) * (1 - tx) + ch(x1, y1) * tx) * ty;
+        c |= (uint32_t)std::clamp(std::lround(v), 0L, 255L) << sh;
+      }
+      out[(size_t)y * ow + x] = c;
+    }
+  return canvas_value((uint32_t)ow, (uint32_t)oh, std::move(out));
+}
+
+// a line through points by total least squares: a point on it and its direction
+bool fit_line(const std::vector<P2>& ps, P2* at, P2* dir) {
+  if (ps.size() < 2) return false;
+  double mx = 0, my = 0;
+  for (const P2& p : ps) { mx += p.x; my += p.y; }
+  mx /= ps.size(); my /= ps.size();
+  double sxx = 0, sxy = 0, syy = 0;
+  for (const P2& p : ps) { sxx += (p.x - mx) * (p.x - mx); sxy += (p.x - mx) * (p.y - my); syy += (p.y - my) * (p.y - my); }
+  const double ang = 0.5 * std::atan2(2 * sxy, sxx - syy);
+  *at = {mx, my};
+  *dir = {std::cos(ang), std::sin(ang)};
+  return true;
+}
+bool meet(P2 a, P2 da, P2 b, P2 db, P2* out) {
+  const double den = da.x * db.y - da.y * db.x;
+  if (std::fabs(den) < 1e-9) return false;
+  const double t = ((b.x - a.x) * db.y - (b.y - a.y) * db.x) / den;
+  *out = {a.x + da.x * t, a.y + da.y * t};
+  return true;
+}
+double seg_dist(P2 p, P2 a, P2 b) {
+  const double vx = b.x - a.x, vy = b.y - a.y, l2 = vx * vx + vy * vy;
+  const double t = l2 > 0 ? std::clamp(((p.x - a.x) * vx + (p.y - a.y) * vy) / l2, 0.0, 1.0) : 0.0;
+  return std::hypot(p.x - a.x - t * vx, p.y - a.y - t * vy);
+}
+double quad_area(const P2* q) {
+  double a = 0;
+  for (int i = 0; i < 4; ++i) a += q[i].x * q[(i + 1) % 4].y - q[(i + 1) % 4].x * q[i].y;
+  return std::fabs(a) / 2;
+}
+
+Value bi_image_find_marker(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_find_marker")) return Value::nil();
+  MapObj* o = opts_map(args, 1);
+  const int max_side = (int)std::clamp(opt_num(o, "max_side", 1200), 128.0, 4096.0);
+  const double sc = std::max(1.0, (double)std::max(W, H) / max_side);
+  const int w = std::max(8, (int)std::lround(W / sc)), h = std::max(8, (int)std::lround(H / sc));
+  const size_t n = (size_t)w * h;
+  // luma, box-filtered down
+  std::vector<float> g(n);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const int x0 = (int)(x * (double)W / w), x1 = std::max(x0 + 1, (int)((x + 1) * (double)W / w));
+      const int y0 = (int)(y * (double)H / h), y1 = std::max(y0 + 1, (int)((y + 1) * (double)H / h));
+      double s = 0;
+      int c = 0;
+      for (int yy = y0; yy < std::min<int>(y1, H); ++yy)
+        for (int xx = x0; xx < std::min<int>(x1, W); ++xx) {
+          const uint32_t p = (*px)[(size_t)yy * W + xx];
+          s += 0.299 * ((p >> 16) & 255) + 0.587 * ((p >> 8) & 255) + 0.114 * (p & 255);
+          ++c;
+        }
+      g[(size_t)y * w + x] = (float)(s / c);
+    }
+  // adaptive threshold: darker than its neighbourhood's mean (an integral image)
+  std::vector<double> I((size_t)(w + 1) * (h + 1), 0);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+      I[(size_t)(y + 1) * (w + 1) + x + 1] = g[(size_t)y * w + x] + I[(size_t)y * (w + 1) + x + 1] + I[(size_t)(y + 1) * (w + 1) + x] - I[(size_t)y * (w + 1) + x];
+  const int r = std::max(7, std::min(w, h) / 12);
+  // and darker than the picture's own split between dark and light (Otsu): inside a large dark area the local mean is
+  // dark too, and the adaptive test alone would hollow it into a ring that looks like a marker
+  double otsu = 0;
+  {
+    std::vector<double> hist(256, 0);
+    for (float v : g) hist[std::clamp((int)v, 0, 255)] += 1;
+    double sum = 0, wb = 0, sb = 0, best = -1;
+    for (int i = 0; i < 256; ++i) sum += i * hist[i];
+    for (int t = 0; t < 256; ++t) {
+      wb += hist[t];
+      if (wb == 0) continue;
+      const double wf = (double)n - wb;
+      if (wf == 0) break;
+      sb += t * hist[t];
+      const double mb = sb / wb, mf = (sum - sb) / wf, var = wb * wf * (mb - mf) * (mb - mf);
+      if (var > best) { best = var; otsu = t + 0.5; }
+    }
+  }
+  std::vector<uint8_t> dark(n, 0);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const int xa = std::max(0, x - r), xb = std::min(w, x + r + 1), ya = std::max(0, y - r), yb = std::min(h, y + r + 1);
+      const double s = I[(size_t)yb * (w + 1) + xb] - I[(size_t)ya * (w + 1) + xb] - I[(size_t)yb * (w + 1) + xa] + I[(size_t)ya * (w + 1) + xa];
+      const double mean = s / ((double)(xb - xa) * (yb - ya));
+      const float v = g[(size_t)y * w + x];
+      dark[(size_t)y * w + x] = (v < mean - 12.0 && v < mean * 0.82) || v < otsu;
+    }
+  std::vector<int> lab;
+  std::vector<size_t> sizes;
+  label_pieces(dark, w, h, lab, sizes);
+  struct Cand { P2 c[4]; double score; double side; };
+  std::vector<Cand> cands;
+  for (size_t id = 0; id < sizes.size(); ++id) {
+    if (sizes[id] < std::max<size_t>(64, n / 4000)) continue;
+    // its bounding box, a cell bigger
+    int bx0 = w, by0 = h, bx1 = -1, by1 = -1;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        if (lab[(size_t)y * w + x] == (int)id) { bx0 = std::min(bx0, x); by0 = std::min(by0, y); bx1 = std::max(bx1, x); by1 = std::max(by1, y); }
+    if (bx0 <= 0 || by0 <= 0 || bx1 >= w - 1 || by1 >= h - 1) continue;   // touching the picture's edge
+    bx0 -= 1; by0 -= 1; bx1 += 1; by1 += 1;
+    const int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+    // what is not the piece, reached from the box's edge, is outside; the rest is its holes
+    std::vector<uint8_t> outside((size_t)bw * bh, 0);
+    std::vector<int> st;
+    auto in_piece = [&](int x, int y) { return lab[(size_t)(y + by0) * w + x + bx0] == (int)id; };
+    auto seed = [&](int x, int y) { if (!in_piece(x, y) && !outside[(size_t)y * bw + x]) { outside[(size_t)y * bw + x] = 1; st.push_back(y * bw + x); } };
+    for (int x = 0; x < bw; ++x) { seed(x, 0); seed(x, bh - 1); }
+    for (int y = 0; y < bh; ++y) { seed(0, y); seed(bw - 1, y); }
+    while (!st.empty()) {
+      const int p = st.back();
+      st.pop_back();
+      const int x = p % bw, y = p / bw;
+      if (x > 0) seed(x - 1, y);
+      if (x < bw - 1) seed(x + 1, y);
+      if (y > 0) seed(x, y - 1);
+      if (y < bh - 1) seed(x, y + 1);
+    }
+    double hole = 0, hx = 0, hy = 0, hole_g = 0, piece_g = 0;
+    std::vector<P2> edge;
+    double cx = 0, cy = 0;
+    for (int y = 0; y < bh; ++y)
+      for (int x = 0; x < bw; ++x) {
+        if (in_piece(x, y)) {
+          cx += x; cy += y; piece_g += g[(size_t)(y + by0) * w + x + bx0];
+          const bool rim = (x > 0 && outside[(size_t)y * bw + x - 1]) || (x < bw - 1 && outside[(size_t)y * bw + x + 1]) ||
+                           (y > 0 && outside[(size_t)(y - 1) * bw + x]) || (y < bh - 1 && outside[(size_t)(y + 1) * bw + x]);
+          if (rim) edge.push_back({x + 0.5, y + 0.5});
+        } else if (!outside[(size_t)y * bw + x]) {
+          hole += 1; hx += x; hy += y; hole_g += g[(size_t)(y + by0) * w + x + bx0];
+        }
+      }
+    if (hole < 16 || edge.size() < 16) continue;
+    cx /= sizes[id]; cy /= sizes[id]; hx /= hole; hy /= hole;
+    // the hole is the print's white: well lighter than its ring
+    if (hole_g / hole < piece_g / sizes[id] + 40.0) continue;
+    // the quadrilateral: the edge point farthest from the centre, the one farthest from it, then the farthest from
+    // that diagonal on either side
+    P2 q[4];
+    auto far_from = [&](P2 a) { size_t b = 0; double bd = -1; for (size_t i = 0; i < edge.size(); ++i) { double d = std::hypot(edge[i].x - a.x, edge[i].y - a.y); if (d > bd) { bd = d; b = i; } } return edge[b]; };
+    const P2 c0 = far_from({cx, cy}), c2 = far_from(c0);
+    double best1 = 0, best3 = 0;
+    P2 c1 = c0, c3 = c2;
+    for (const P2& p : edge) {
+      const double side = (c2.x - c0.x) * (p.y - c0.y) - (c2.y - c0.y) * (p.x - c0.x);
+      if (side > best1) { best1 = side; c1 = p; }
+      if (-side > best3) { best3 = -side; c3 = p; }
+    }
+    q[0] = c0; q[1] = c1; q[2] = c2; q[3] = c3;
+    const double qa = quad_area(q);
+    if (qa < 64) continue;
+    const double fill = (sizes[id] + hole) / qa;
+    const double hole_share = hole / qa;
+    const double off = std::hypot(hx - cx, hy - cy) / std::sqrt(qa);
+    // a filled square with a centred hole of about a quarter: not a tire, not a shadow, not text
+    if (fill < 0.85 || fill > 1.15 || hole_share < 0.13 || hole_share > 0.42 || off > 0.12) continue;
+    // each side refined: a line through the edge points nearest it, away from the corners
+    P2 at[4], dir[4];
+    bool ok = true;
+    for (int s = 0; s < 4 && ok; ++s) {
+      const P2 a = q[s], b = q[(s + 1) % 4];
+      const double len = std::hypot(b.x - a.x, b.y - a.y);
+      std::vector<P2> mine;
+      for (const P2& p : edge) {
+        double dbest = seg_dist(p, a, b);
+        bool nearest = true;
+        for (int t = 0; t < 4 && nearest; ++t) if (t != s && seg_dist(p, q[t], q[(t + 1) % 4]) < dbest) nearest = false;
+        if (!nearest) continue;
+        if (std::hypot(p.x - a.x, p.y - a.y) < 0.12 * len || std::hypot(p.x - b.x, p.y - b.y) < 0.12 * len) continue;
+        mine.push_back(p);
+      }
+      ok = fit_line(mine, &at[s], &dir[s]);
+    }
+    if (!ok) continue;
+    P2 rq[4];
+    for (int s = 0; s < 4 && ok; ++s) ok = meet(at[(s + 3) % 4], dir[(s + 3) % 4], at[s], dir[s], &rq[s]);
+    if (!ok) continue;
+    // the edge pixels' centres lie half a cell inside the edge: out by half a cell along the diagonals
+    double mx = 0, my = 0;
+    for (const P2& p : rq) { mx += p.x / 4; my += p.y / 4; }
+    for (P2& p : rq) {
+      const double dx = p.x - mx, dy = p.y - my, l = std::hypot(dx, dy);
+      if (l > 0) { p.x += dx / l * 0.7071; p.y += dy / l * 0.7071; }
+      p.x = (p.x + bx0) * sc;
+      p.y = (p.y + by0) * sc;
+    }
+    // clockwise from the top left (smallest x + y)
+    double ccx = 0, ccy = 0;
+    for (const P2& p : rq) { ccx += p.x / 4; ccy += p.y / 4; }
+    std::sort(rq, rq + 4, [&](const P2& a, const P2& b) { return std::atan2(a.y - ccy, a.x - ccx) < std::atan2(b.y - ccy, b.x - ccx); });
+    int tl = 0;
+    for (int i = 1; i < 4; ++i) if (rq[i].x + rq[i].y < rq[tl].x + rq[tl].y) tl = i;
+    Cand cd;
+    for (int i = 0; i < 4; ++i) cd.c[i] = rq[(tl + i) % 4];
+    cd.side = std::sqrt(quad_area(cd.c));
+    cd.score = (1.0 - std::fabs(fill - 1.0)) * (1.0 - std::fabs(hole_share - 0.25)) * (1.0 - off);
+    cands.push_back(cd);
+  }
+  if (cands.empty()) return Value::nil();
+  // the biggest that passed (a print fills more of the frame than anything that only looks like one)
+  const Cand& best = *std::max_element(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.side < b.side; });
+  auto res = std::make_shared<MapObj>();
+  res->put("corners", points_value(std::vector<P2>(best.c, best.c + 4)));
+  double mx = 0, my = 0;
+  for (const P2& p : best.c) { mx += p.x / 4; my += p.y / 4; }
+  res->put("centre", Value::list({Value::real(mx), Value::real(my)}));
+  res->put("side_px", Value::real(best.side));
+  res->put("score", Value::real(best.score));
+  res->put("found", Value::integer((int64_t)cands.size()));
+  return Value::object(Type::Map, res);
+}
+
+// ---- tires ----------------------------------------------------------------------------------------------------
+
+Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::Str) { error = std::string("tire_size() wants a size as a string, got a ") + type_name(args[0].type); return Value::nil(); }
+  const tire::Size z = tire::parse_size(args[0].str());
+  if (!z.ok) return Value::nil();
+  auto m = std::make_shared<MapObj>();
+  m->put("width_mm", Value::real(z.width_mm));
+  m->put("diameter_mm", Value::real(z.diameter_mm));
+  return Value::object(Type::Map, m);
+}
+
+Value bi_tire_fit(Vm&, std::vector<Value>& args, std::string& error) {
+  for (int i = 0; i < 3; ++i) if (!want_number(args[(size_t)i], error, "tire_fit")) return Value::nil();
+  double tw = 0, td = 0;
+  if (args[3].type == Type::Str) {
+    const tire::Size z = tire::parse_size(args[3].str());
+    if (!z.ok) { error = "tire_fit(): \"" + args[3].str() + "\" is not a tire size"; return Value::nil(); }
+    tw = z.width_mm; td = z.diameter_mm;
+  } else {
+    if (args.size() < 5 || !want_number(args[3], error, "tire_fit") || !want_number(args[4], error, "tire_fit")) {
+      if (error.empty()) error = "tire_fit() wants a size, or a width and a diameter (mm)";
+      return Value::nil();
+    }
+    tw = args[3].as_double(); td = args[4].as_double();
+  }
+  const tire::Fit f = tire::fit(args[0].as_double(), args[1].as_double(), args[2].as_double(), tw, td);
+  auto m = std::make_shared<MapObj>();
+  m->put("count", Value::integer(f.count));
+  m->put("mode", Value::string(f.mode));
+  return Value::object(Type::Map, m);
+}
+
 }  // namespace
 
 void install_carve_builtins(Vm& vm) {
@@ -1093,6 +1467,12 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("image_quantize", 2, 3, bi_image_quantize);
   vm.define_native("image_resample", 3, 4, bi_image_resample);
   vm.define_native("mesh_inflate", 3, 4, bi_mesh_inflate);
+  vm.define_native("image_find_marker", 1, 2, bi_image_find_marker);
+  vm.define_native("homography", 2, 2, bi_homography);
+  vm.define_native("homography_apply", 2, 2, bi_homography_apply);
+  vm.define_native("image_rectify", 4, 4, bi_image_rectify);
+  vm.define_native("tire_size", 1, 1, bi_tire_size);
+  vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }
 
 }  // namespace aios::userland::grain
