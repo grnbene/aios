@@ -33,6 +33,7 @@ static int setenv(const char* name, const char* value, int) { return ::_putenv_s
 
 
 #include "aios/userland/grain.hpp"
+#include "aios/net/ip_intel.hpp"
 #include "aios/userland/web.hpp"   // decode_image
 #include "grain_builtins_internal.hpp"
 #include "aios/userland/font_atlas.hpp"
@@ -3108,6 +3109,21 @@ Value bi_url_decode(Vm&, std::vector<Value>& args, std::string& error) {
   std::string out = url_decode_str(args[0].str(), ok);
   if (!ok) { error = "url_decode: invalid percent-encoded string"; return Value::nil(); }
   return Value::string(out);
+}
+
+// ip_scope(ip) / ip_family(ip): what the box can say about an address with no network call (aios/net/ip_intel.hpp,
+// shared with the edge server and ASQL). scope: loopback/private/cgnat/link-local/public/... ; family: ipv4/ipv6.
+Value bi_ip_scope(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "ip_scope")) return Value::nil();
+  return Value::string(aios::net::ip_scope(args[0].str()));
+}
+Value bi_ip_family(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "ip_family")) return Value::nil();
+  return Value::string(aios::net::ip_family(aios::net::ip_clean(args[0].str())));
+}
+Value bi_ip_is_public(Vm&, std::vector<Value>& args, std::string& error) {
+  if (!want_str(args[0], error, "ip_is_public")) return Value::nil();
+  return Value::boolean(aios::net::ip_is_public(args[0].str()));
 }
 
 // ---------------------------------------------------------------------------
@@ -8442,6 +8458,9 @@ void install_core_builtins(Vm& vm) {
   vm.define_native("hex_decode", 1, 1, bi_hex_decode);
   vm.define_native("url_encode", 1, 1, bi_url_encode);
   vm.define_native("url_decode", 1, 1, bi_url_decode);
+  vm.define_native("ip_scope", 1, 1, bi_ip_scope);
+  vm.define_native("ip_family", 1, 1, bi_ip_family);
+  vm.define_native("ip_is_public", 1, 1, bi_ip_is_public);
 
   // 2D Visual Rendering & Canvas Primitives
   vm.define_native("canvas_create", 2, 3, bi_canvas_create);

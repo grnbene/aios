@@ -20,6 +20,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* buf) {
 #endif
 #include "aios/core/threads.hpp"
 #include "aios/userland/sql_database.hpp"
+#include "aios/net/ip_intel.hpp"
 #include "aios/userland/tire_fit.hpp"
 #include "aios/userland/sql_things.hpp"
 #include "aios/hal/sync.hpp"
@@ -7388,7 +7389,7 @@ SqlDataType infer_item_type(const SqlExpr* e, const std::vector<QuerySource>& so
           up == "YEAR"sv || up == "MONTH"sv || up == "DAY"sv || up == "DAYOFMONTH"sv || up == "HOUR"sv ||
           up == "MINUTE"sv || up == "SECOND"sv || up == "WEEK"sv || up == "QUARTER"sv ||
           up == "TIMESTAMPDIFF"sv || up == "EXTRACT"sv || up == "INSTR"sv || up == "LOCATE"sv || up == "POSITION"sv ||
-          up == "FIELD"sv || up == "FIND_IN_SET"sv || up == "ASCII"sv || up == "ORD"sv || up == "CRC32"sv || up == "TIRE_FIT"sv ||
+          up == "FIELD"sv || up == "FIND_IN_SET"sv || up == "ASCII"sv || up == "ORD"sv || up == "CRC32"sv || up == "TIRE_FIT"sv || up == "IP_IS_PUBLIC"sv ||
           up == "SIGN"sv || up == "BIT_COUNT"sv || up == "STRCMP"sv || up == "GET_LOCK"sv || up == "RELEASE_LOCK"sv ||
           up == "IS_FREE_LOCK"sv || up == "IS_USED_LOCK"sv || up == "PERIOD_DIFF"sv || up == "PERIOD_ADD"sv ||
           up == "DAYOFWEEK"sv || up == "DAYOFYEAR"sv || up == "WEEKDAY"sv || up == "WEEKOFYEAR"sv || up == "YEARWEEK"sv ||
@@ -12897,6 +12898,16 @@ Val eval_scalar_func(const SqlExpr* e, const EvalCtx& ctx) {
   //   TIRE_FIT(w, d, h, size) / TIRE_FIT(w, d, h, width, diam) how many fit a w x d x h bin (mm), the best of lying in
   //                                                           stacks and standing either way; NULL for no size
   //   TIRE_FIT_MODE(...)                                      which way that is: 'flat', 'across', 'deep' or 'none'
+  // IP_SCOPE(x) / IP_FAMILY(x) / IP_IS_PUBLIC(x): address intel with no network call (aios/net/ip_intel.hpp, shared
+  // with grain's ip_scope/ip_family and the edge server). Filter honeypot grabs to public, non-residential origins.
+  if (up == "IP_SCOPE"sv || up == "IP_FAMILY"sv) {
+    if (arg_count != 1 || a_ptr[0].null) return val_null();
+    return val_text(up == "IP_SCOPE"sv ? aios::net::ip_scope(a_ptr[0].str()) : aios::net::ip_family(aios::net::ip_clean(a_ptr[0].str())));
+  }
+  if (up == "IP_IS_PUBLIC"sv) {
+    if (arg_count != 1 || a_ptr[0].null) return val_null();
+    return val_num(aios::net::ip_is_public(a_ptr[0].str()) ? 1 : 0);
+  }
   if (up == "TIRE_WIDTH_MM"sv || up == "TIRE_DIAMETER_MM"sv) {
     if (arg_count != 1 || a_ptr[0].null) return val_null();
     const tire::Size z = tire::parse_size(a_ptr[0].str());

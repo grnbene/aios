@@ -23,8 +23,13 @@ serve_routes({
   "GET /": fn (req) { return res_html(PAGE) },
   "GET /health": fn (req) { return res_json({"ok": true}) },
   "GET /api/grabs": fn (req) {
-    let limit = int(get(req.query_params, "limit", "300"))
-    let g = grabs(limit)
-    return res_json({"grabs": g, "count": len(g)})
+    let limit = int(get(req.query_params, "limit", "400"))
+    let all = grabs(limit)
+    let g = []
+    let cb = []
+    for e in all {
+      if get(e, "kind", "honeypot.env_grab") == "honeypot.callback" { push(cb, e) } else { push(g, e) }
+    }
+    return res_json({"grabs": g, "callbacks": cb, "count": len(all)})
   }
 }, {"workers": false})

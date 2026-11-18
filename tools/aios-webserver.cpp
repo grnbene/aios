@@ -30,6 +30,7 @@
 #include "aios/core/bytes.hpp"
 #include "aios/core/ids.hpp"
 #include "aios/crypto/x509.hpp"
+#include "aios/net/ip_intel.hpp"
 #include "aios/storage/object_store.hpp"
 #include "aios/hal/host.hpp"
 #include "aios/hal/net.hpp"
@@ -84,8 +85,17 @@ struct VhostConfig {
   // `env_honeypot_feed <file>`: also append one JSON line per grab here, the view the live Grain dashboard tails.
   std::string env_honeypot_feed;
   // `env_honeypot_geo <file>`: an offline IP->location table (lines "startIPv4int,endIPv4int,LABEL", sorted by start)
-  // for the origin's location. Supply GeoLite2 or any range list normalized to that; absent = no location guessed.
+  // for the origin's location. The LABEL may carry a "type=<hosting|residential|mobile|...>" token, read out as the
+  // origin's network type so home-router / residential noise can be filtered. Supply GeoLite2 (normalized) or similar.
   std::string env_honeypot_geo;
+  // `env_honeypot_collect_url <base>`: the bait's callback. The decoy embeds <base>/<canary> as its API endpoint, so
+  // when the attacker's own tooling validates the stolen creds it connects to a URL we control - a second, usually
+  // closer-to-origin signal than the scan source. Empty = the decoy has no callback.
+  std::string env_honeypot_collect_url;
+  // `env_honeypot_collect <path-prefix>`: a request under this prefix IS that callback landing. We record everything
+  // about the inbound connection (no action, no probe back) tied to the canary in the next path segment, and answer
+  // blandly. Point the base above at a host that routes this prefix here.
+  std::string env_honeypot_collect;
   // `grain <script>`: requests that are not a static file (or PHP) go to the script's handle(req).
   std::string grain_app;      // relative to root, or absolute; empty = no front-controller script
   bool grain_files = false;   // `grain on`: a .gr file under root is run as a page, like a .php file
@@ -250,6 +260,10 @@ std::vector<VhostConfig> parse_config(const std::string& text) {
         ls >> cur->env_honeypot_feed;
       } else if (tok == "env_honeypot_geo") {
         ls >> cur->env_honeypot_geo;
+      } else if (tok == "env_honeypot_collect_url") {
+        ls >> cur->env_honeypot_collect_url;
+      } else if (tok == "env_honeypot_collect") {
+        ls >> cur->env_honeypot_collect;
       } else if (tok == "deny") {
         int status = 0;
         std::string pattern;
@@ -489,47 +503,10 @@ Origin trace_origin(const net::HttpRequestHead& head, const std::string& peer) {
 
 // ---- enrichment: what the box itself can say about an address, no network call ---------------------------------
 
-// Strip brackets/port, take the first of a comma list, trim. "[2001:db8::1]:443" -> "2001:db8::1", "a, b" -> "a".
-std::string clean_ip(const std::string& in) {
-  std::string s = in.substr(0, in.find(','));
-  size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
-  if (a == std::string::npos) return "";
-  s = s.substr(a, b - a + 1);
-  if (!s.empty() && s.front() == '[') { auto e = s.find(']'); if (e != std::string::npos) return s.substr(1, e - 1); }
-  // host:port only when a single colon (IPv4 or name); IPv6 has many
-  if (std::count(s.begin(), s.end(), ':') == 1) s = s.substr(0, s.find(':'));
-  return s;
-}
-bool parse_ipv4(const std::string& s, uint32_t* out) {
-  unsigned a, b, c, d;
-  char tail;
-  if (std::sscanf(s.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
-  if (a > 255 || b > 255 || c > 255 || d > 255) return false;
-  *out = (a << 24) | (b << 16) | (c << 8) | d;
-  return true;
-}
-// family and scope from the address itself (RFC 1918/4193/6598/3927 and loopback).
-std::string ip_family(const std::string& ip) { return ip.find(':') != std::string::npos ? "ipv6" : "ipv4"; }
-std::string ip_scope(const std::string& ip) {
-  if (ip.find(':') != std::string::npos) {
-    if (ip == "::1") return "loopback";
-    std::string p = ip.substr(0, 4);
-    if (p == "fe80" || p.substr(0, 3) == "fe8" || p.substr(0, 3) == "fe9" || p.substr(0, 3) == "fea" || p.substr(0, 3) == "feb") return "link-local";
-    char c0 = ip.empty() ? 0 : ip[0];
-    if (c0 == 'f' && ip.size() > 1 && (ip[1] == 'c' || ip[1] == 'd')) return "private";  // fc00::/7
-    return "public";
-  }
-  uint32_t v;
-  if (!parse_ipv4(ip, &v)) return "unknown";
-  if ((v >> 24) == 127) return "loopback";
-  if ((v >> 24) == 10) return "private";
-  if ((v >> 20) == 0xAC1) return "private";                 // 172.16/12
-  if ((v >> 16) == 0xC0A8) return "private";                // 192.168/16
-  if ((v >> 16) == 0xA9FE) return "link-local";             // 169.254/16
-  if ((v & 0xFFC00000u) == 0x64400000u) return "cgnat";     // 100.64/10
-  if ((v >> 24) == 0) return "unspecified";
-  return "public";
-}
+using aios::net::ip_clean;
+using aios::net::ip_scope;
+using aios::net::ip_family;
+using aios::net::ip_parse4;
 
 // An offline IP -> location table: lines "startU32,endU32,LABEL", sorted by start; range lookup by binary search.
 // One per path, loaded once.
@@ -554,7 +531,7 @@ class GeoDb {
   }
   std::string lookup(const std::string& ip) const {
     uint32_t v;
-    if (rows_.empty() || !parse_ipv4(ip, &v)) return "";
+    if (rows_.empty() || !ip_parse4(ip, &v)) return "";
     auto it = std::upper_bound(rows_.begin(), rows_.end(), v, [](uint32_t val, const Row& r) { return val < r.lo; });
     if (it == rows_.begin()) return "";
     --it;
@@ -587,46 +564,59 @@ std::string json_escape(const std::string& s) {
   return o;
 }
 
-// Serve the decoy. Small, and powerless: every host is on the .invalid TLD (resolves nowhere), the DB points at
-// loopback, and the keys are this grab's canary — not credentials to anything. The grab is logged and, when the
-// vhost names a store, recorded into the substrate with the full origin chain, so the canary presented later ties
-// back here all the way to the true client.
-void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh,
-                        const std::string& path, const std::string& peer) {
-  const std::string canary = mint_canary();
-  const Origin origin = trace_origin(head, peer);
-  const std::string origin_ip = clean_ip(origin.best);
-  const std::string scope = ip_scope(origin_ip), family = ip_family(origin_ip);
-  std::string geo;
-  if (!vh.env_honeypot_geo.empty()) if (GeoDb* g = geo_db(vh.env_honeypot_geo)) geo = g->lookup(origin_ip);
-  // which CDN/proxy the probe came through, from the header the proxy sets
-  std::string via;
-  if (head.header("cf-connecting-ip") || head.header("cf-ray")) via = "Cloudflare";
-  else if (head.header("fastly-client-ip")) via = "Fastly";
-  else if (head.header("x-amz-cf-id")) via = "CloudFront";
-  else if (head.header("x-forwarded-for")) via = "proxy";
+// What the box worked out about one inbound event, origin and all.
+struct EventInfo {
+  std::string canary, origin_ip, scope, family, geo, type, via, iso;
+  Origin origin;
+};
+// the "type=..." token from a geo label (hosting / residential / mobile / ...), for filtering home-router noise
+std::string geo_type(const std::string& label) {
+  auto p = label.find("type=");
+  if (p == std::string::npos) return "";
+  p += 5;
+  auto e = label.find_first_of(" ,;|", p);
+  return label.substr(p, e == std::string::npos ? std::string::npos : e - p);
+}
+EventInfo enrich(const net::HttpRequestHead& head, const VhostConfig& vh, const std::string& peer, const std::string& canary) {
+  EventInfo e;
+  e.canary = canary;
+  e.origin = trace_origin(head, peer);
+  e.origin_ip = ip_clean(e.origin.best);
+  e.scope = ip_scope(e.origin_ip);
+  e.family = ip_family(e.origin_ip);
+  if (!vh.env_honeypot_geo.empty()) if (GeoDb* g = geo_db(vh.env_honeypot_geo)) { e.geo = g->lookup(e.origin_ip); e.type = geo_type(e.geo); }
+  if (head.header("cf-connecting-ip") || head.header("cf-ray")) e.via = "Cloudflare";
+  else if (head.header("fastly-client-ip")) e.via = "Fastly";
+  else if (head.header("x-amz-cf-id")) e.via = "CloudFront";
+  else if (head.header("x-forwarded-for")) e.via = "proxy";
   std::time_t now = std::time(nullptr);
   char iso[32] = "";
   std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
-  std::fprintf(stderr, "[env-honeypot] canary=%s origin=%s (%s %s%s%s) via=%s peer=%s host=%s path=%s t=%s\n",
-               canary.c_str(), origin_ip.c_str(), family.c_str(), scope.c_str(), geo.empty() ? "" : " ",
-               geo.c_str(), via.empty() ? "-" : via.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), iso);
+  e.iso = iso;
+  return e;
+}
+// one event (grab or callback) to the live feed and the substrate. `extra` is appended to the stored payload (the
+// callback uses it for the request body). The record carries every header verbatim - telemetry, no action.
+void record_event(const char* kind, const EventInfo& e, const VhostConfig& vh, const net::HttpRequestHead& head,
+                  const std::string& peer, const std::string& path, const std::string& extra) {
+  std::fprintf(stderr, "[env-honeypot] %s canary=%s origin=%s (%s %s%s%s%s) via=%s peer=%s host=%s path=%s t=%s\n",
+               kind, e.canary.c_str(), e.origin_ip.c_str(), e.family.c_str(), e.scope.c_str(),
+               e.type.empty() ? "" : " ", e.type.c_str(), e.geo.empty() ? "" : (" " + e.geo).c_str(),
+               e.via.empty() ? "-" : e.via.c_str(), peer.c_str(), head.host.c_str(), path.c_str(), e.iso.c_str());
   std::fflush(stderr);
-
-  // the live feed the Grain dashboard tails: one JSON line per grab
   if (!vh.env_honeypot_feed.empty()) {
-    std::string j = "{\"t\":\"" + std::string(iso) + "\",\"canary\":\"" + canary + "\",\"origin\":\"" + json_escape(origin_ip) +
-                    "\",\"scope\":\"" + scope + "\",\"family\":\"" + family + "\",\"geo\":\"" + json_escape(geo) +
-                    "\",\"via\":\"" + json_escape(via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
+    std::string j = "{\"kind\":\"" + std::string(kind) + "\",\"t\":\"" + e.iso + "\",\"canary\":\"" + e.canary +
+                    "\",\"origin\":\"" + json_escape(e.origin_ip) + "\",\"scope\":\"" + e.scope + "\",\"family\":\"" +
+                    e.family + "\",\"net_type\":\"" + json_escape(e.type) + "\",\"geo\":\"" + json_escape(e.geo) +
+                    "\",\"via\":\"" + json_escape(e.via) + "\",\"peer\":\"" + json_escape(peer) + "\",\"host\":\"" +
                     json_escape(head.host) + "\",\"scheme\":\"" + (vh.ssl ? "https" : "http") + "\",\"method\":\"" +
                     json_escape(head.method) + "\",\"path\":\"" + json_escape(path) + "\",\"ua\":\"" +
                     json_escape(head.header("user-agent").value_or("")) + "\",\"hops\":[";
-    for (size_t i = 0; i < origin.hops.size(); ++i)
-      j += (i ? "," : "") + std::string("{\"") + json_escape(origin.hops[i].first) + "\":\"" + json_escape(origin.hops[i].second) + "\"}";
+    for (size_t i = 0; i < e.origin.hops.size(); ++i)
+      j += (i ? "," : "") + std::string("{\"") + json_escape(e.origin.hops[i].first) + "\":\"" + json_escape(e.origin.hops[i].second) + "\"}";
     j += "]}\n";
     hal::process_host().append_file(vh.env_honeypot_feed, span_of(j));
   }
-
   if (!vh.env_honeypot_store.empty()) {
     if (HoneypotStore* hs = honeypot_store(vh.env_honeypot_store)) {
       aios::StoredObject obj;
@@ -634,14 +624,15 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
                              std::chrono::system_clock::now().time_since_epoch()).count();
       obj.provenance = aios::EntityID{aios::Id128{fnv1a("aios-webserver", 0xcbf29ce484222325ull),
                                                   fnv1a("env_honeypot", 0xcbf29ce484222325ull)}};
-      auto m = [&](const std::string& k, const std::string& v) { obj.metadata.push_back({k, v}); };
-      m("kind", "honeypot.env_grab");
-      m("canary", canary);
-      m("origin", origin_ip);
-      m("origin_scope", scope);
-      m("origin_family", family);
-      if (!geo.empty()) m("origin_geo", geo);
-      if (!via.empty()) m("via", via);
+      auto m = [&](const std::string& k, const std::string& v) { if (!v.empty()) obj.metadata.push_back({k, v}); };
+      m("kind", kind);
+      m("canary", e.canary);
+      m("origin", e.origin_ip);
+      m("origin_scope", e.scope);
+      m("origin_family", e.family);
+      m("origin_type", e.type);
+      m("origin_geo", e.geo);
+      m("via", e.via);
       m("peer", peer);
       m("host", head.host);
       m("scheme", vh.ssl ? "https" : "http");
@@ -649,22 +640,60 @@ void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head,
       m("path", path);
       m("target", head.target);
       if (auto ua = head.header("user-agent")) m("user_agent", *ua);
-      m("t", iso);
-      // the full chain and every header, verbatim, as the payload: nothing lost for a later investigation
-      std::string body = "honeypot.env_grab canary=" + canary + "\norigin=" + origin.best + "\ntime=" + iso + "\n";
-      for (auto& [k, v] : origin.hops) body += k + ": " + v + "\n";
+      m("t", e.iso);
+      std::string body = std::string(kind) + " canary=" + e.canary + "\norigin=" + e.origin.best + "\ntime=" + e.iso + "\n";
+      for (auto& [k, v] : e.origin.hops) body += k + ": " + v + "\n";
       body += "--- request headers ---\n";
       for (const auto& h : head.headers) body += h.name + ": " + h.value + "\n";
+      if (!extra.empty()) body += "--- body ---\n" + extra + "\n";
       obj.payload.assign(body.begin(), body.end());
       hs->put(std::move(obj));
     }
   }
+}
+
+// The bait's callback has landed: the attacker's own tooling, validating the stolen canary creds, connected to a URL
+// we control. We record everything about THIS inbound connection - headers, body, the origin traced through its own
+// proxy chain, which is usually the actor's validation infrastructure, closer to origin than the scan source. No
+// action, no probe back: we read, we log, we answer blandly. The canary is the last path segment.
+void serve_collect(hal::Connection& conn, net::ConnReader& reader, const net::HttpRequestHead& head,
+                   const VhostConfig& vh, const std::string& path, const std::string& peer) {
+  std::string canary = path.substr(path.find_last_of('/') + 1);
+  if (canary.size() > 64) canary = canary.substr(0, 64);
+  // the body, bounded - whatever the tool sent, captured, not acted on
+  std::string body;
+  if (head.content_length > 0) {
+    size_t want = (size_t)std::min<int64_t>(head.content_length, 16384);
+    while (body.size() < want) {
+      auto chunk = reader.read_some(want - body.size(), 5000);
+      if (chunk.empty()) break;
+      body.append((const char*)chunk.data(), chunk.size());
+    }
+  }
+  EventInfo e = enrich(head, vh, peer, canary.empty() ? mint_canary() : canary);
+  record_event("honeypot.callback", e, vh, head, peer, path, body);
+  // a bland, inert answer - looks like a quiet API, does nothing
+  write_simple_response(conn, 200, "OK", "{\"ok\":true}\n");
+}
+
+// Serve the decoy. Small, and powerless: every host is on the .invalid TLD (resolves nowhere), the DB points at
+// loopback, and the keys are this grab's canary — not credentials to anything. Recorded through record_event, so the
+// canary presented later ties back here all the way to the true client. When a callback base is set, the decoy also
+// carries a URL the attacker's tooling will hit to validate the creds - a second, closer origin signal.
+void serve_env_honeypot(hal::Connection& conn, const net::HttpRequestHead& head, const VhostConfig& vh,
+                        const std::string& path, const std::string& peer) {
+  const std::string canary = mint_canary();
+  EventInfo e = enrich(head, vh, peer, canary);
+  record_event("honeypot.env_grab", e, vh, head, peer, path, "");
+  const std::string api = vh.env_honeypot_collect_url.empty()
+                              ? ("https://api-" + canary.substr(0, 8) + ".aios-internal.invalid")
+                              : (vh.env_honeypot_collect_url + "/" + canary);
   std::string body =
       "# aios runtime environment\n"
-      "# generated " + std::string(iso) + " build " + canary.substr(0, 8) + " — do not commit\n"
+      "# generated " + e.iso + " build " + canary.substr(0, 8) + " — do not commit\n"
       "APP_ENV=production\n"
       "AIOS_NODE_ID=edge-" + canary.substr(0, 6) + "\n"
-      "AIOS_API_BASE=https://api-" + canary.substr(0, 8) + ".aios-internal.invalid\n"
+      "AIOS_API_BASE=" + api + "\n"
       "AIOS_DB_HOST=127.0.0.1\n"
       "AIOS_DB_PORT=3307\n"
       "AIOS_DB_NAME=versioneight\n"
@@ -1380,6 +1409,12 @@ void handle_http_session(hal::Host& host, std::unique_ptr<hal::Connection> conn,
       break;
     }
 
+    // The bait's callback landing: the attacker's tooling validating the stolen creds. Record it, answer blandly.
+    if (!vh->env_honeypot_collect.empty() && path_only.rfind(vh->env_honeypot_collect, 0) == 0) {
+      serve_collect(*conn, reader, head, *vh, path_only, conn->peer());
+      break;
+    }
+
     // Before the dotfile rule 404s it: a .env probe on an opted-in vhost gets the inert, traceable decoy.
     if (vh->env_honeypot && is_env_probe(path_only)) {
       serve_env_honeypot(*conn, head, *vh, path_only, conn->peer());
@@ -1570,7 +1605,9 @@ int aios_webserver_run(int argc, char** argv) {
       "    env_honeypot on            # serve a traceable, powerless decoy for .env probes instead of 404\n"
       "    env_honeypot_store <dir>   # record each grab (origin chain + canary) into the aios object store there\n"
       "    env_honeypot_feed <file>   # also append one JSON line per grab, for the live Grain dashboard\n"
-      "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL) for the origin\n"
+      "    env_honeypot_geo <file>    # offline IP->location table (startU32,endU32,LABEL[ type=hosting]) for origin\n"
+      "    env_honeypot_collect_url <base>  # decoy's bait callback: embeds <base>/<canary> as its API endpoint\n"
+      "    env_honeypot_collect <prefix>    # a request under this prefix IS a callback: record its full telemetry\n"
       "  }\n",
       argc > 0 ? argv[0] : "aios-webserver");
     return argc < 2 ? 1 : 0;

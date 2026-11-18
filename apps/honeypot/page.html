@@ -30,45 +30,58 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
   <div class="card"><div class="n" id="c_ips">0</div><div class="l">distinct origins</div></div>
   <div class="card"><div class="n" id="c_public">0</div><div class="l">public origins</div></div>
   <div class="card"><div class="n" id="c_last">—</div><div class="l">last grab</div></div>
+  <div class="card"><div class="n" id="c_cb" style="color:var(--hot)">0</div><div class="l">bait callbacks</div></div>
   <div class="card"><div class="n" id="c_top" style="font-size:16px">—</div><div class="l">top origin</div></div>
 </div>
-<table><thead><tr><th>When</th><th>Origin</th><th>Where</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Canary</th></tr></thead>
-<tbody id="rows"><tr><td colspan="9" class="muted">waiting for the feed…</td></tr></tbody></table>
+<div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
+<div id="cbwrap" style="display:none"><h2 style="font-size:16px;margin:4px 0">Bait callbacks <span class="muted" style="font-weight:400;font-size:13px">— the attacker's own tooling validated the stolen creds and connected to us</span></h2>
+<table><thead><tr><th>When</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Canary</th></tr></thead><tbody id="cbrows"></tbody></table></div>
+<h2 style="font-size:16px;margin:14px 0 4px">Grabs <span class="muted" style="font-weight:400;font-size:13px">— .env probes served the decoy</span></h2>
+<table><thead><tr><th>When</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Canary</th></tr></thead>
+<tbody id="grabrows"><tr><td colspan="9" class="muted">waiting for the feed…</td></tr></tbody></table>
 <p class="sub" id="foot" style="margin-top:12px"></p>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let seen = new Set();
-function ago(iso){ const t=Date.parse(iso+ (iso.endsWith('Z')?'':'Z')); if(isNaN(t)) return iso; const s=Math.max(0,(Date.now()-t)/1000);
+function ago(iso){ const t=Date.parse(iso+(iso&&iso.endsWith('Z')?'':'Z')); if(isNaN(t)) return iso||''; const s=Math.max(0,(Date.now()-t)/1000);
   if(s<60) return Math.floor(s)+'s ago'; if(s<3600) return Math.floor(s/60)+'m ago'; if(s<86400) return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
 function chain(hops){ if(!hops) return ''; return hops.map(h=>{const k=Object.keys(h)[0]; return esc(k)+'='+esc(h[k]);}).join(' › '); }
+function isDC(x){ const t=(x.net_type||'').toLowerCase(); if(t) return /host|datacenter|data center|cloud|server|vps/.test(t); return x.scope==='public'; }
+function isNoise(x){ const t=(x.net_type||'').toLowerCase(); return x.scope!=='public' || /resid|mobile|cellular|isp|dsl|cable|home/.test(t); }
+function rowGrab(x){ const key=x.canary||(x.t+x.origin); const nw=!seen.has(key); seen.add(key);
+  const where=[x.geo,x.family].filter(Boolean).join(' · ');
+  return '<tr class="'+(nw?'new':'')+'">'+
+    '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
+    '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
+    '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
+    '<td>'+esc(x.host)+'</td><td class="mono">'+esc(x.path)+'</td>'+
+    '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td>'+
+    '<td class="mono">'+chain(x.hops)+'</td><td class="mono">'+esc((x.canary||'').slice(0,10))+'</td></tr>'; }
+function rowCb(x){ const key='cb'+(x.canary||'')+x.t; const nw=!seen.has(key); seen.add(key);
+  const where=[x.geo,x.family].filter(Boolean).join(' · ');
+  return '<tr class="'+(nw?'new':'')+'">'+
+    '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
+    '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
+    '<td>'+esc(where||'—')+'</td><td>'+esc(x.net_type||'—')+'</td><td class="via">'+esc(x.via||'—')+'</td>'+
+    '<td class="mono">'+esc(x.method)+'</td><td class="mono">'+esc(x.path)+'</td>'+
+    '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,26))+'</td><td class="mono">'+esc((x.canary||'').slice(0,10))+'</td></tr>'; }
 async function tick(){
-  let j; try { j = await (await fetch('/api/grabs?limit=300')).json(); } catch(e){ $('foot').textContent='feed unreachable: '+e.message; return; }
-  const g = j.grabs||[];
-  const ips = new Set(g.map(x=>x.origin)); const pub = new Set(g.filter(x=>x.scope==='public').map(x=>x.origin));
-  const counts = {}; g.forEach(x=>counts[x.origin]=(counts[x.origin]||0)+1);
-  const top = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0];
+  let j; try { j = await (await fetch('/api/grabs?limit=400')).json(); } catch(e){ $('foot').textContent='feed unreachable: '+e.message; return; }
+  const dc = $('f_dc').checked;
+  let g=(j.grabs||[]); let cb=(j.callbacks||[]);
+  if(dc){ g=g.filter(x=>!isNoise(x)); cb=cb.filter(x=>!isNoise(x)); }
+  const ips=new Set(g.concat(cb).map(x=>x.origin)); const pub=new Set(g.concat(cb).filter(x=>x.scope==='public').map(x=>x.origin));
+  const counts={}; g.concat(cb).forEach(x=>counts[x.origin]=(counts[x.origin]||0)+1); const top=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0];
   $('c_total').textContent=g.length; $('c_ips').textContent=ips.size; $('c_public').textContent=pub.size;
-  $('c_last').textContent=g.length?ago(g[0].t):'—'; $('c_top').textContent=top?top[0]+' ×'+top[1]:'—';
-  const tb=$('rows');
-  if(!g.length){ tb.innerHTML='<tr><td colspan="9" class="muted">no grabs yet — the trap is armed.</td></tr>'; return; }
-  tb.innerHTML = g.map(x=>{
-    const key=x.canary||(x.t+x.origin); const isNew=!seen.has(key); seen.add(key);
-    const where = [x.geo, x.family].filter(Boolean).join(' · ');
-    return '<tr class="'+(isNew?'new':'')+'">'+
-      '<td title="'+esc(x.t)+'">'+esc(ago(x.t))+'</td>'+
-      '<td class="ip">'+esc(x.origin)+' <span class="pill '+esc(x.scope)+'">'+esc(x.scope)+'</span></td>'+
-      '<td>'+esc(where||'—')+'</td>'+
-      '<td class="via">'+esc(x.via||'—')+'</td>'+
-      '<td>'+esc(x.host)+'</td>'+
-      '<td class="mono">'+esc(x.path)+'</td>'+
-      '<td class="mono" title="'+esc(x.ua)+'">'+esc((x.ua||'').slice(0,28))+'</td>'+
-      '<td class="mono">'+chain(x.hops)+'</td>'+
-      '<td class="mono">'+esc((x.canary||'').slice(0,10))+'</td></tr>';
-  }).join('');
-  $('foot').textContent='showing '+g.length+' most recent · '+new Date().toLocaleTimeString();
+  $('c_cb').textContent=cb.length; $('c_last').textContent=g.length?ago(g[0].t):'—'; $('c_top').textContent=top?top[0]+' ×'+top[1]:'—';
+  $('cbwrap').style.display=cb.length?'block':'none';
+  $('cbrows').innerHTML=cb.map(rowCb).join('');
+  $('grabrows').innerHTML=g.length?g.map(rowGrab).join(''):'<tr><td colspan="10" class="muted">no grabs yet — the trap is armed.</td></tr>';
+  $('foot').textContent='showing '+g.length+' grabs, '+cb.length+' callbacks · '+new Date().toLocaleTimeString();
 }
+$('f_dc').addEventListener('change', tick);
 tick(); setInterval(tick, 3000);
 </script>
 </body></html>
