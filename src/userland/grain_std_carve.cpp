@@ -2888,6 +2888,344 @@ Value bi_image_quality(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, res);
 }
 
+// ---- straight lines and vanishing points: a room's own geometry as the camera's -------------------------------
+
+// image_lines(canvas[, opts]) -> [[x0, y0, x1, y1, length] ...]: the straight edges of a picture (in its pixels): the
+//   gradient's strong pixels grown into regions of one direction (each pixel's gradient within 22.5 degrees of the
+//   region's), each region a line if it is long and thin (its spread across under 1.5 pixels). opts: {max_side
+//   (1024), min_length (pixels of the picture; 3% of its longer side)}.
+Value bi_image_lines(Vm&, std::vector<Value>& args, std::string& error) {
+  uint32_t W = 0, H = 0;
+  const std::vector<uint32_t>* px = nullptr;
+  if (!canvas_pixels(args[0], &W, &H, &px, error, "image_lines")) return Value::nil();
+  MapObj* o = opts_map(args, 1);
+  const int max_side = (int)std::clamp(opt_num(o, "max_side", 1024), 128.0, 4096.0);
+  const double sc = std::max(1.0, (double)std::max(W, H) / max_side);
+  const int w = std::max(8, (int)std::lround(W / sc)), h = std::max(8, (int)std::lround(H / sc));
+  const double min_len = opt_num(o, "min_length", 0.03 * std::max(W, H)) / sc;
+  std::vector<float> g((size_t)w * h);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+      g[(size_t)y * w + x] = (float)luma_at(*px, W, H, (x + 0.5) * sc, (y + 0.5) * sc);
+  // Sobel
+  std::vector<float> mag((size_t)w * h, 0), ang((size_t)w * h, 0);
+  for (int y = 1; y + 1 < h; ++y)
+    for (int x = 1; x + 1 < w; ++x) {
+      auto G = [&](int xx, int yy) { return g[(size_t)yy * w + xx]; };
+      const float gx = (G(x + 1, y - 1) + 2 * G(x + 1, y) + G(x + 1, y + 1)) - (G(x - 1, y - 1) + 2 * G(x - 1, y) + G(x - 1, y + 1));
+      const float gy = (G(x - 1, y + 1) + 2 * G(x, y + 1) + G(x + 1, y + 1)) - (G(x - 1, y - 1) + 2 * G(x, y - 1) + G(x + 1, y - 1));
+      mag[(size_t)y * w + x] = std::sqrt(gx * gx + gy * gy);
+      ang[(size_t)y * w + x] = std::atan2(gy, gx);
+    }
+  // strong pixels, strongest first
+  std::vector<float> sorted_m;
+  for (float m : mag) if (m > 0) sorted_m.push_back(m);
+  if (sorted_m.empty()) return Value::list({});
+  std::nth_element(sorted_m.begin(), sorted_m.begin() + sorted_m.size() * 7 / 10, sorted_m.end());
+  const float thr = std::max(40.0f, sorted_m[sorted_m.size() * 7 / 10]);
+  std::vector<uint32_t> order;
+  for (size_t i = 0; i < mag.size(); ++i) if (mag[i] >= thr) order.push_back((uint32_t)i);
+  std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return mag[a] > mag[b]; });
+  std::vector<uint8_t> used((size_t)w * h, 0);
+  const double tol = M_PI / 8;
+  auto adiff = [](double a, double b) { double d = std::fabs(a - b); d = std::fmod(d, 2 * M_PI); return std::min(d, 2 * M_PI - d); };
+  std::vector<Value> out;
+  std::vector<int> region;
+  for (uint32_t seed : order) {
+    if (used[seed]) continue;
+    region.clear();
+    region.push_back((int)seed);
+    used[seed] = 1;
+    double sx = std::cos(ang[seed]), sy = std::sin(ang[seed]), ra = ang[seed];
+    for (size_t k = 0; k < region.size(); ++k) {
+      const int p = region[k], x = p % w, y = p / w;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int xx = x + dx, yy = y + dy;
+          if (xx < 1 || yy < 1 || xx >= w - 1 || yy >= h - 1) continue;
+          const size_t q = (size_t)yy * w + xx;
+          if (used[q] || mag[q] < thr * 0.5f || adiff(ang[q], ra) > tol) continue;
+          used[q] = 1;
+          region.push_back((int)q);
+          sx += std::cos(ang[q]); sy += std::sin(ang[q]);
+          ra = std::atan2(sy, sx);
+        }
+    }
+    if ((double)region.size() < min_len) continue;
+    // the region's line: its principal axis (weighted by gradient)
+    double sw = 0, mx = 0, my = 0;
+    for (int p : region) { const double m = mag[(size_t)p]; sw += m; mx += m * (p % w); my += m * (p / w); }
+    mx /= sw; my /= sw;
+    double cxx = 0, cxy = 0, cyy = 0;
+    for (int p : region) {
+      const double m = mag[(size_t)p], dx = p % w - mx, dy = p / w - my;
+      cxx += m * dx * dx; cxy += m * dx * dy; cyy += m * dy * dy;
+    }
+    cxx /= sw; cxy /= sw; cyy /= sw;
+    const double tr = cxx + cyy, det = cxx * cyy - cxy * cxy;
+    const double l1 = tr / 2 + std::sqrt(std::max(0.0, tr * tr / 4 - det)), l2 = tr / 2 - std::sqrt(std::max(0.0, tr * tr / 4 - det));
+    if (std::sqrt(std::max(0.0, l2)) > 1.5) continue;   // not thin: a corner, a blob, texture
+    const double th = 0.5 * std::atan2(2 * cxy, cxx - cyy), ux = std::cos(th), uy = std::sin(th);
+    double tmin = 1e30, tmax = -1e30;
+    for (int p : region) { const double t = (p % w - mx) * ux + (p / w - my) * uy; tmin = std::min(tmin, t); tmax = std::max(tmax, t); }
+    const double len = tmax - tmin;
+    if (len < min_len || l1 <= 0) continue;
+    const double x0 = (mx + ux * tmin + 0.5) * sc, y0 = (my + uy * tmin + 0.5) * sc, x1 = (mx + ux * tmax + 0.5) * sc, y1 = (my + uy * tmax + 0.5) * sc;
+    out.push_back(Value::list({Value::real(x0), Value::real(y0), Value::real(x1), Value::real(y1), Value::real(len * sc)}));
+  }
+  return Value::list(std::move(out));
+}
+
+// vanishing_points(lines, w, h[, opts]) -> {points: [{at: [x, y, w] (homogeneous: w 0 is a point at infinity),
+//   support (the length of the lines through it), lines (their indexes)}], vertical (the index of the one the
+//   picture's upright lines meet at), focal (pixels, from the vertical's and the strongest other's being square to
+//   each other; nil when they cannot say), rot (the world's directions in the camera: columns x (the strongest
+//   horizontal), y, z (up)), or nil}
+//   Up to three points the picture's lines meet at, found one after another by RANSAC (a pair of lines' crossing,
+//   kept if it gathers the most length of lines aimed at it within 1.5 degrees), each refined by least squares over
+//   its lines. Rooms are built square: their lines meet at three points whose directions are square to each other,
+//   which gives how the camera is turned and, when the lines converge strongly enough, the lens (focal_from:
+//   "lines"; else "default", opts.default_focal: 0.6 of the diagonal, a phone's main camera; "given": opts.focal).
+Value bi_vanishing_points(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::List) { error = "vanishing_points() wants image_lines' list"; return Value::nil(); }
+  if (!want_number(args[1], error, "vanishing_points") || !want_number(args[2], error, "vanishing_points")) return Value::nil();
+  const double W = args[1].as_double(), H = args[2].as_double(), cx = W / 2, cy = H / 2;
+  MapObj* o = opts_map(args, 3);
+  struct Seg { double x0, y0, x1, y1, len, mx, my, dx, dy; std::array<double, 3> l; };
+  std::vector<Seg> segs;
+  for (const Value& v : args[0].list_items()) {
+    if (v.type != Type::List || v.list_items().size() < 4) continue;
+    const auto& L = v.list_items();
+    Seg s{L[0].as_double(), L[1].as_double(), L[2].as_double(), L[3].as_double(), 0, 0, 0, 0, 0, {0, 0, 0}};
+    s.len = std::hypot(s.x1 - s.x0, s.y1 - s.y0);
+    if (s.len < 1) continue;
+    s.mx = (s.x0 + s.x1) / 2; s.my = (s.y0 + s.y1) / 2; s.dx = (s.x1 - s.x0) / s.len; s.dy = (s.y1 - s.y0) / s.len;
+    // the line through it, normalized (a b c with a^2 + b^2 = 1), coordinates scaled by the picture's size
+    const double S = std::max(W, H);
+    const double ax = (s.x0 - cx) / S, ay = (s.y0 - cy) / S, bx = (s.x1 - cx) / S, by = (s.y1 - cy) / S;
+    std::array<double, 3> l{ay - by, bx - ax, ax * by - bx * ay};
+    const double n = std::hypot(l[0], l[1]);
+    for (double& c : l) c /= n;
+    s.l = l;
+    segs.push_back(s);
+  }
+  const double S = std::max(W, H);
+  const double cos_tol = std::cos(1.5 * M_PI / 180);
+  auto aims = [&](const Seg& s, const std::array<double, 3>& v) {
+    // the direction from the segment's middle to v (scaled coordinates), against the segment's own
+    const double mxs = (s.mx - cx) / S, mys = (s.my - cy) / S;
+    double ex = v[0] - mxs * v[2], ey = v[1] - mys * v[2];
+    const double n = std::hypot(ex, ey);
+    if (n < 1e-12) return false;
+    return std::fabs((ex * s.dx + ey * s.dy) / n) >= cos_tol;
+  };
+  std::vector<uint8_t> taken(segs.size(), 0);
+  struct VP { std::array<double, 3> v; double support; std::vector<int> idx; };
+  std::vector<VP> vps;
+  uint32_t rs = 12345;
+  auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return rs; };
+  for (int round = 0; round < 3; ++round) {
+    std::vector<int> free_i;
+    double total = 0;
+    for (size_t i = 0; i < segs.size(); ++i) if (!taken[i]) { free_i.push_back((int)i); total += segs[i].len; }
+    if (free_i.size() < 2) break;
+    // pairs drawn with the longer lines likelier
+    std::vector<double> cum;
+    double acc = 0;
+    for (int i : free_i) { acc += segs[(size_t)i].len; cum.push_back(acc); }
+    auto pick = [&]() { const double r = (rnd() % 1000000) / 1e6 * acc; return free_i[(size_t)(std::lower_bound(cum.begin(), cum.end(), r) - cum.begin())]; };
+    VP best{{0, 0, 0}, 0, {}};
+    for (int it = 0; it < 1500; ++it) {
+      const int a = pick(), b = pick();
+      if (a == b) continue;
+      const auto& la = segs[(size_t)a].l;
+      const auto& lb = segs[(size_t)b].l;
+      std::array<double, 3> v{la[1] * lb[2] - la[2] * lb[1], la[2] * lb[0] - la[0] * lb[2], la[0] * lb[1] - la[1] * lb[0]};
+      const double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      if (n < 1e-12) continue;
+      for (double& c : v) c /= n;
+      double sup = 0;
+      for (int i : free_i) if (aims(segs[(size_t)i], v)) sup += segs[(size_t)i].len;
+      if (sup > best.support) { best.v = v; best.support = sup; }
+    }
+    if (best.support <= 0) break;
+    for (int i : free_i) if (aims(segs[(size_t)i], best.v)) best.idx.push_back(i);
+    if (best.idx.size() < 3) break;
+    // refined: the point closest to all its lines (the smallest eigenvector of the weighted sum of l l^T)
+    {
+      double M[3][3] = {{0}};
+      for (int i : best.idx) {
+        const auto& l = segs[(size_t)i].l;
+        const double wgt = segs[(size_t)i].len;
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) M[r][c] += wgt * l[r] * l[c];
+      }
+      // inverse iteration from the current point
+      std::array<double, 3> v = best.v;
+      for (int k = 0; k < 30; ++k) {
+        double A[3][4];
+        for (int r = 0; r < 3; ++r) { for (int c = 0; c < 3; ++c) A[r][c] = M[r][c] + (r == c ? 1e-9 : 0); A[r][3] = v[(size_t)r]; }
+        bool ok = true;
+        for (int c = 0; c < 3 && ok; ++c) {
+          int piv = c;
+          for (int r = c + 1; r < 3; ++r) if (std::fabs(A[r][c]) > std::fabs(A[piv][c])) piv = r;
+          if (std::fabs(A[piv][c]) < 1e-18) { ok = false; break; }
+          for (int k2 = 0; k2 < 4; ++k2) std::swap(A[c][k2], A[piv][k2]);
+          for (int r = 0; r < 3; ++r) { if (r == c) continue; const double f = A[r][c] / A[c][c]; for (int k2 = c; k2 < 4; ++k2) A[r][k2] -= f * A[c][k2]; }
+        }
+        if (!ok) break;
+        std::array<double, 3> nv{A[0][3] / A[0][0], A[1][3] / A[1][1], A[2][3] / A[2][2]};
+        const double n = std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+        if (!(n > 0)) break;
+        for (double& c : nv) c /= n;
+        v = nv;
+      }
+      best.v = v;
+    }
+    for (int i : best.idx) taken[(size_t)i] = 1;
+    vps.push_back(best);
+  }
+  // back to the picture's pixels: (x, y, w) with x = cx w + S X
+  auto to_px = [&](const std::array<double, 3>& v) { return std::array<double, 3>{v[0] * S + cx * v[2], v[1] * S + cy * v[2], v[2]}; };
+  // the upright one: its lines nearest the picture's vertical
+  int vert = -1;
+  double best_up = 0;
+  for (size_t k = 0; k < vps.size(); ++k) {
+    double up = 0, tot = 0;
+    for (int i : vps[k].idx) { up += segs[(size_t)i].len * std::fabs(segs[(size_t)i].dy); tot += segs[(size_t)i].len; }
+    up /= std::max(1e-9, tot);
+    if (up > best_up) { best_up = up; vert = (int)k; }
+  }
+  if (best_up < 0.8) vert = -1;
+  double focal = opt_num(o, "focal", 0);
+  int horiz = -1;
+  for (size_t k = 0; k < vps.size(); ++k) if ((int)k != vert && (horiz < 0 || vps[k].support > vps[(size_t)horiz].support)) horiz = (int)k;
+  if (focal <= 0 && vert >= 0) {
+    // f^2 = -(v1 - c).(v2 - c) for two finite, mutually square directions; the strongest other that gives one
+    std::vector<int> others;
+    for (size_t k = 0; k < vps.size(); ++k) if ((int)k != vert) others.push_back((int)k);
+    std::sort(others.begin(), others.end(), [&](int a, int b) { return vps[(size_t)a].support > vps[(size_t)b].support; });
+    for (int k : others) {
+      const auto a = to_px(vps[(size_t)vert].v), b = to_px(vps[(size_t)k].v);
+      if (std::fabs(a[2]) < 1e-9 || std::fabs(b[2]) < 1e-9) continue;
+      const double f2 = -((a[0] / a[2] - cx) * (b[0] / b[2] - cx) + (a[1] / a[2] - cy) * (b[1] / b[2] - cy));
+      if (f2 > 0) { focal = std::sqrt(f2); horiz = k; break; }
+    }
+  }
+  auto res = std::make_shared<MapObj>();
+  std::vector<Value> pts;
+  for (const VP& vp : vps) {
+    auto m = std::make_shared<MapObj>();
+    const auto p = to_px(vp.v);
+    m->put("at", Value::list({Value::real(p[0]), Value::real(p[1]), Value::real(p[2])}));
+    m->put("support", Value::real(vp.support));
+    std::vector<Value> ix;
+    for (int i : vp.idx) ix.push_back(Value::integer(i));
+    m->put("lines", Value::list(std::move(ix)));
+    pts.push_back(Value::object(Type::Map, m));
+  }
+  res->put("points", Value::list(std::move(pts)));
+  res->put("vertical", vert >= 0 ? Value::integer(vert) : Value::nil());
+  res->put("horizontal", horiz >= 0 ? Value::integer(horiz) : Value::nil());
+  res->put("focal", focal > 0 ? Value::real(focal) : Value::nil());
+  // with three directions, the lens from every square pair (f^2 = -(vi - c).(vj - c)), their mean
+  int third = -1;
+  for (size_t k = 0; k < vps.size(); ++k) if ((int)k != vert && (int)k != horiz) third = (int)k;
+  if (opt_num(o, "focal", 0) <= 0 && vert >= 0 && horiz >= 0 && third >= 0) {
+    double sum = 0;
+    int cnt = 0;
+    const int idx[3] = {vert, horiz, third};
+    for (int a = 0; a < 3; ++a)
+      for (int b = a + 1; b < 3; ++b) {
+        const auto p = to_px(vps[(size_t)idx[a]].v), q = to_px(vps[(size_t)idx[b]].v);
+        if (std::fabs(p[2]) < 1e-9 || std::fabs(q[2]) < 1e-9) continue;
+        const double f2 = -((p[0] / p[2] - cx) * (q[0] / q[2] - cx) + (p[1] / p[2] - cy) * (q[1] / q[2] - cy));
+        if (f2 > 0) { sum += f2; ++cnt; }
+      }
+    if (cnt > 0) focal = std::sqrt(sum / cnt);
+  }
+  // the camera's turn: up from the vertical point, x from the horizontal, made square
+  if (focal > 0 && vert >= 0 && horiz >= 0) {
+    auto dir = [&](const std::array<double, 3>& v) {
+      const auto p = to_px(v);
+      std::array<double, 3> d{(p[0] - cx * p[2]) / focal, (p[1] - cy * p[2]) / focal, p[2]};
+      const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      for (double& c : d) c /= n;
+      return d;
+    };
+    auto up = dir(vps[(size_t)vert].v);
+    if (up[1] > 0) for (double& c : up) c = -c;   // up is up the picture (y down)
+    auto xh = dir(vps[(size_t)horiz].v);
+    const double k = xh[0] * up[0] + xh[1] * up[1] + xh[2] * up[2];
+    for (int i = 0; i < 3; ++i) xh[(size_t)i] -= k * up[(size_t)i];
+    const double n = std::sqrt(xh[0] * xh[0] + xh[1] * xh[1] + xh[2] * xh[2]);
+    for (double& c : xh) c /= n;
+    // y = up x x (so x, y, up is right-handed)
+    const std::array<double, 3> yy{up[1] * xh[2] - up[2] * xh[1], up[2] * xh[0] - up[0] * xh[2], up[0] * xh[1] - up[1] * xh[0]};
+    // refined together: the turn and (unless given) the lens, so every line of each group points at the
+    // vanishing point its axis makes (the error: the sine of the angle between the line and the way to that point,
+    // weighed by the square root of its length)
+    double R0[9] = {xh[0], yy[0], up[0], xh[1], yy[1], up[1], xh[2], yy[2], up[2]};
+    struct Ln { const Seg* s; int axis; };
+    std::vector<Ln> lns;
+    for (int i : vps[(size_t)horiz].idx) lns.push_back({&segs[(size_t)i], 0});
+    if (third >= 0) for (int i : vps[(size_t)third].idx) lns.push_back({&segs[(size_t)i], 1});
+    for (int i : vps[(size_t)vert].idx) lns.push_back({&segs[(size_t)i], 2});
+    const bool free_f = opt_num(o, "focal", 0) <= 0;
+    std::vector<double> p{0, 0, 0};
+    if (free_f) p.push_back(focal);
+    auto rot_of = [&](const std::vector<double>& v, double* R) {
+      double D[9];
+      rodrigues(v.data(), D);
+      for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) { R[r * 3 + c] = 0; for (int k2 = 0; k2 < 3; ++k2) R[r * 3 + c] += D[r * 3 + k2] * R0[k2 * 3 + c]; }
+    };
+    auto residual = [&](const std::vector<double>& v, std::vector<double>& r) {
+      double R[9];
+      rot_of(v, R);
+      const double f = free_f ? v[3] : focal;
+      r.clear();
+      for (const Ln& ln : lns) {
+        // the axis's vanishing point: K times its direction in the camera (column `axis` of R)
+        const double dx = R[ln.axis], dy = R[3 + ln.axis], dz = R[6 + ln.axis];
+        const double vx = f * dx + cx * dz, vy = f * dy + cy * dz, vw = dz;
+        double ex = vx - ln.s->mx * vw, ey = vy - ln.s->my * vw;
+        const double n = std::hypot(ex, ey);
+        if (n < 1e-12) { r.push_back(0); continue; }
+        ex /= n; ey /= n;
+        r.push_back((ex * ln.s->dy - ey * ln.s->dx) * std::sqrt(ln.s->len));
+      }
+    };
+    lm_solve(p, residual, 60);
+    double R[9];
+    rot_of(p, R);
+    // the lens is only as good as the directions' convergence: a surface seen nearly square on hardly converges
+    // and says little about it. Kept when the vertical and the horizontal points are both within 4 picture sizes
+    // of the middle and the lens lands where phone lenses are (ultra-wide 0.3 to 3x tele 1.8 of the diagonal);
+    // else the lens is unknown (nil), the turn found again with opts.default_focal (a phone's main camera, 26 mm
+    // equivalent: 0.6 of the diagonal)
+    const double diag = std::hypot(W, H);
+    auto near = [&](int k) { const auto q = to_px(vps[(size_t)k].v); return std::fabs(q[2]) > 1e-9 && std::hypot(q[0] / q[2] - cx, q[1] / q[2] - cy) < 4 * S; };
+    bool trusted = !free_f;
+    if (free_f && near(vert) && near(horiz) && p[3] > 0.3 * diag && p[3] < 1.8 * diag) { focal = p[3]; trusted = true; }
+    if (!trusted) {
+      focal = opt_num(o, "default_focal", 0.6 * diag);
+      std::vector<double> q{0, 0, 0};
+      const bool keep = free_f;
+      // (the turn alone, the lens fixed)
+      auto residual_fixed = [&](const std::vector<double>& v, std::vector<double>& r) { std::vector<double> w4(v); w4.push_back(focal); residual(w4, r); };
+      if (keep) { lm_solve(q, residual_fixed, 60); rot_of(q, R); }
+    }
+    res->put("focal", Value::real(focal));
+    res->put("focal_from", Value::string(!free_f ? "given" : (trusted ? "lines" : "default")));
+    // rot: world -> camera, its columns the world's axes in the camera (x along the strongest horizontal, z up)
+    std::vector<Value> rv;
+    for (double v : R) rv.push_back(Value::real(v));
+    res->put("rot", Value::list(std::move(rv)));
+  } else {
+    res->put("rot", Value::nil());
+  }
+  return Value::object(Type::Map, res);
+}
+
 // ---- tires ----------------------------------------------------------------------------------------------------
 
 Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
@@ -2944,6 +3282,8 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("box_face_views", 6, 6, bi_box_face_views);
   vm.define_native("mesh_lowest", 2, 2, bi_mesh_lowest);
   vm.define_native("image_quality", 1, 1, bi_image_quality);
+  vm.define_native("image_lines", 1, 2, bi_image_lines);
+  vm.define_native("vanishing_points", 3, 4, bi_vanishing_points);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }

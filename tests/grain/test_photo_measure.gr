@@ -1,0 +1,93 @@
+// Measuring from one ordinary photo with no marker (apps/bin_capacity/lib/measure.gr): a counter against two walls,
+// cabinet doors below it, a kraft bag (254 x 171 x 305 mm) and a 255 mm strip on it, drawn in 3D from a known camera
+// (r3d_draw). The camera's turn comes from the scene's own lines, the scale from the strip; the bag, the counter's
+// depth and the bag's model are checked against the truth.
+import { camera_of, photo, seen } from "lib/bin_scene.gr"
+import { measure_camera, measure_scale, measure_length, measure_height, measure_box, box_model } from "../../apps/bin_capacity/lib/measure.gr"
+
+fn check(c, msg) { assert_true(c, msg) }
+fn quad(t, a, b, c, d, col) { push(t, {"p": [a, b, c], "col": col}) push(t, {"p": [a, c, d], "col": col}) }
+fn shade(col, k) { return (min(255, round(((col >> 16) & 255) * k)) << 16) + (min(255, round(((col >> 8) & 255) * k)) << 8) + min(255, round((col & 255) * k)) }
+// a wall or surface in tiles with seams (the lines a room is full of)
+fn tiles(t, o, u, v, nu, nv, col, seam) {
+  for i in 0..nu {
+    for j in 0..nv {
+      let p = fn (a, b) { return [o[0] + u[0] * a / nu + v[0] * b / nv, o[1] + u[1] * a / nu + v[1] * b / nv, o[2] + u[2] * a / nu + v[2] * b / nv] }
+      let a0 = i + 0.04
+      let a1 = i + 0.96
+      let b0 = j + 0.04
+      let b1 = j + 0.96
+      quad(t, p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1), seam)
+      quad(t, p(a0, b0), p(a1, b0), p(a1, b1), p(a0, b1), shade(col, 0.94 + 0.12 * (((i * 7 + j * 13) % 5) / 4.0)))
+    }
+  }
+}
+let CZ = 900.0
+let world = []
+// the counter top (x along it, y back to the wall at 635), its front face with cabinet doors, the back wall, the
+// right wall, the floor
+tiles(world, [0.0, 0.0, CZ], [2000.0, 0.0, 0.0], [0.0, 635.0, 0.0], 8, 3, 0x9A929C, 0x8A828C)
+tiles(world, [0.0, 0.0, 0.0], [2000.0, 0.0, 0.0], [0.0, 0.0, CZ], 5, 2, 0xE8E4DC, 0x9C988F)
+tiles(world, [0.0, 635.0, CZ], [2000.0, 0.0, 0.0], [0.0, 0.0, 1500.0], 7, 5, 0xC8CCD0, 0xB4B8BC)
+tiles(world, [2000.0, 0.0, 0.0], [0.0, 1500.0, 0.0], [0.0, 0.0, 2400.0], 5, 8, 0xC0C4C8, 0xAAAEB2)
+tiles(world, [0.0, -2500.0, 0.0], [2000.0, 0.0, 0.0], [0.0, 2500.0, 0.0], 7, 8, 0xD6D2C8, 0xB8B4AA)
+// the bag: kraft, a printed patch on its front and side; front face toward the camera (y = 300)
+let BX = 1300.0
+let BY = 300.0
+let BWd = 254.0
+let BDp = 171.0
+let BHt = 305.0
+let KRAFT = 0xA07A4E
+quad(world, [BX, BY, CZ], [BX + BWd, BY, CZ], [BX + BWd, BY, CZ + BHt], [BX, BY, CZ + BHt], KRAFT)
+quad(world, [BX + 40, BY - 0.5, CZ + 60], [BX + 214, BY - 0.5, CZ + 60], [BX + 214, BY - 0.5, CZ + 200], [BX + 40, BY - 0.5, CZ + 200], 0x1E5A48)
+quad(world, [BX + BWd, BY, CZ], [BX + BWd, BY + BDp, CZ], [BX + BWd, BY + BDp, CZ + BHt], [BX + BWd, BY, CZ + BHt], shade(KRAFT, 0.8))
+quad(world, [BX, BY, CZ], [BX, BY + BDp, CZ], [BX, BY + BDp, CZ + BHt], [BX, BY, CZ + BHt], shade(KRAFT, 0.85))
+quad(world, [BX, BY + BDp, CZ], [BX + BWd, BY + BDp, CZ], [BX + BWd, BY + BDp, CZ + BHt], [BX, BY + BDp, CZ + BHt], shade(KRAFT, 0.75))
+quad(world, [BX, BY, CZ + BHt], [BX + BWd, BY, CZ + BHt], [BX + BWd, BY + BDp, CZ + BHt], [BX, BY + BDp, CZ + BHt], 0x3A2A1C)
+// the reference: a white strip 255 mm long on the counter
+quad(world, [500.0, 150.0, CZ + 0.5], [755.0, 150.0, CZ + 0.5], [755.0, 180.0, CZ + 0.5], [500.0, 180.0, CZ + 0.5], 0xF4F4F0)
+
+let cam = camera_of([1650.0, -950.0, 1650.0], [1150.0, 300.0, CZ])
+let shot = photo(cam, world)
+let cv = image_decode(shot)
+// the lens the render used (a phone's own, as its default is for it)
+let F = (canvas_width(cv) / 2.0) / tan(60.0 * PI / 360.0)
+
+for mode in [["the lens found from the lines", {"default_focal": F}], ["the lens known", {"focal": F}]] {
+  let c = measure_camera(cv, mode[1])
+  let s = measure_scale(c, seen(cam, [500.0, 165.0, CZ]), seen(cam, [755.0, 165.0, CZ]), 255.0)
+  let b = measure_box(c, s, seen(cam, [BX, BY, CZ]), seen(cam, [BX + BWd, BY, CZ]), seen(cam, [BX + BWd, BY + BDp, CZ]), seen(cam, [BX, BY, CZ + BHt]))
+  print(format("{} ({:.0f} px, {}): bag {:.1f} x {:.1f} x {:.1f} mm, {:.2f} l", mode[0], c.focal, c.focal_from, b.width_mm, b.depth_mm, b.height_mm, b.volume_l))
+  check(abs(b.width_mm - BWd) / BWd < 0.03 and abs(b.depth_mm - BDp) / BDp < 0.05 and abs(b.height_mm - BHt) / BHt < 0.03,
+        format("{}: the bag 254 x 171 x 305: {:.1f} x {:.1f} x {:.1f}", mode[0], b.width_mm, b.depth_mm, b.height_mm))
+  let depth = measure_length(c, s, seen(cam, [300.0, 0.0, CZ]), seen(cam, [300.0, 635.0, CZ]))
+  check(abs(depth - 635) / 635 < 0.03, format("{}: the counter's depth 635: {:.1f}", mode[0], depth))
+  let h = measure_height(c, s, seen(cam, [BX + BWd, BY, CZ]), seen(cam, [BX + BWd, BY, CZ + BHt]))
+  check(abs(h - BHt) / BHt < 0.03, format("{}: the bag's right edge 305 high: {:.1f}", mode[0], h))
+}
+
+// the model: a glTF binary that reads back, its box the size measured, every face textured
+let c = measure_camera(cv, {"focal": F})
+let s = measure_scale(c, seen(cam, [500.0, 165.0, CZ]), seen(cam, [755.0, 165.0, CZ]), 255.0)
+let b = measure_box(c, s, seen(cam, [BX, BY, CZ]), seen(cam, [BX + BWd, BY, CZ]), seen(cam, [BX + BWd, BY + BDp, CZ]), seen(cam, [BX, BY, CZ + BHt]))
+let m = box_model(cv, c, b)
+let g = gltf_read(m.glb)
+check(len(g.json.meshes[0].primitives) == 6 and len(g.json.images) == 6, "six faces, six pictures")
+let lo = [1e9, 1e9, 1e9]
+let hi = [-1e9, -1e9, -1e9]
+for p in g.json.meshes[0].primitives {
+  let a = gltf_accessor(g.model, p.attributes.POSITION)
+  for i in 0..a.count { for k in 0..3 { let v = bytes_get(a.data, (i * 3 + k) * 4, "f32le") lo[k] = min(lo[k], v) hi[k] = max(hi[k], v) } }
+}
+check(abs((hi[0] - lo[0]) * 1000 - b.width_mm) < 1 and abs((hi[1] - lo[1]) * 1000 - b.height_mm) < 1 and abs((hi[2] - lo[2]) * 1000 - b.depth_mm) < 1,
+      format("the model's box is the measured one, in metres: {:.3f} x {:.3f} x {:.3f}", hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]))
+let front = gltf_image(g.model, 0)
+check(front.w > 50 and front.h > 50, format("the front's picture taken from the photo: {}x{}", front.w, front.h))
+// the printed patch is on the front picture, a third of the way up its middle: green, not kraft
+let px = bytes_get(front.rgba, ((round(front.h * 0.7)) * front.w + round(front.w / 2)) * 4, "u8")
+let gx = bytes_get(front.rgba, ((round(front.h * 0.7)) * front.w + round(front.w / 2)) * 4 + 1, "u8")
+check(gx > px, format("the front's print is where it was: r {} g {}", px, gx))
+let seen_faces = []
+for f in m.faces { if f.seen { push(seen_faces, f.name) } }
+check(index_of(join(seen_faces, ","), "front") >= 0 and index_of(join(seen_faces, ","), "top") >= 0, format("the faces the photo shows: {}", seen_faces))
+print("PASS: test_photo_measure")

@@ -1,0 +1,242 @@
+// Measuring from one ordinary photo - no marker, no lens in its EXIF: the room's own straight lines give how the
+// camera was turned and its lens (image_lines, vanishing_points), one length the person knows sets the scale, and
+// then anything on the same level surface, anything standing on it, and any box sitting on it can be measured; a box
+// can be made into a 3D model textured from the photo and written as a glTF file.
+//
+//   measure_camera(cv, opts)                     -> the camera: {focal, focal_from, rot, cx, cy}; opts.focal: the lens
+//   measure_scale(cam, a, b, length_mm)          -> mm a unit: from two points on the surface a known length apart
+//   measure_length(cam, scale, a, b)             -> mm between two points on the surface
+//   measure_height(cam, scale, base, top)        -> mm from a point on the surface up to the point above it
+//   measure_box(cam, scale, fl, fr, br, top)     -> a box standing on the surface: its bottom's front-left, front-right
+//                                                   and back-right corners and the top of its front-left edge (picture
+//                                                   points) -> {width_mm, depth_mm, height_mm, volume_l, corners}
+//   box_model(cv, cam, box)                      -> {glb (bytes), faces}: the box textured from the photo's faces
+//
+// The camera's frame: x right, y down, z ahead; the surface is level (square to the vertical the lines give) and, until
+// the scale is known, one unit below the camera. A photo looking up at the surface (a shelf above the eye) is refused:
+// pick points on a surface below the camera.
+
+fn v_dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+fn v_sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn v_add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+fn v_mul(a, k) { return [a[0] * k, a[1] * k, a[2] * k] }
+fn v_len(a) { return sqrt(v_dot(a, a)) }
+fn v_unit(a) { return v_mul(a, 1.0 / v_len(a)) }
+fn v_cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+
+fn measure_camera(cv, opts) {
+  let o = opts == nil ? {} : opts
+  let w = canvas_width(cv)
+  let h = canvas_height(cv)
+  let vo = {}
+  if get(o, "focal", nil) != nil { vo.focal = o.focal * 1.0 }
+  if get(o, "default_focal", nil) != nil { vo.default_focal = o.default_focal * 1.0 }
+  let v = vanishing_points(image_lines(cv), w, h, vo)
+  if v.rot == nil { error("the photo shows too few straight upright and level lines to tell how the phone was held: take it with a wall corner, a shelf edge or a door frame in view") }
+  return {"focal": v.focal, "focal_from": v.focal_from, "rot": v.rot, "cx": w / 2.0, "cy": h / 2.0, "w": w, "h": h}
+}
+
+fn up_of(cam) { return [cam.rot[2], cam.rot[5], cam.rot[8]] }
+fn ray_of(cam, p) { return [(p[0] - cam.cx) / cam.focal, (p[1] - cam.cy) / cam.focal, 1.0] }
+
+// a picture point on the surface (one unit below the camera), in the camera's frame
+fn on_surface(cam, p) {
+  let d = ray_of(cam, p)
+  let k = v_dot(up_of(cam), d)
+  if k >= -1e-6 { error(format("the point ({:.0f}, {:.0f}) is not on a surface below the camera (it is at or above the horizon)", p[0], p[1])) }
+  return v_mul(d, -1.0 / k)
+}
+
+fn measure_scale(cam, a, b, length_mm) {
+  let d = v_len(v_sub(on_surface(cam, a), on_surface(cam, b)))
+  if d <= 0 { error("the two points are the same") }
+  return length_mm * 1.0 / d
+}
+
+fn measure_length(cam, scale, a, b) { return scale * v_len(v_sub(on_surface(cam, a), on_surface(cam, b))) }
+
+// how far above the surface point X the ray through the picture point `top` passes nearest the vertical through X
+fn rise(cam, X, top) {
+  let u = up_of(cam)
+  let d = ray_of(cam, top)
+  // minimize |X + k u - t d|: [u.u  -u.d; u.d  -d.d] [k t] = [-u.X; -d.X]
+  let a11 = v_dot(u, u)
+  let a12 = 0.0 - v_dot(u, d)
+  let a21 = v_dot(u, d)
+  let a22 = 0.0 - v_dot(d, d)
+  let b1 = 0.0 - v_dot(u, X)
+  let b2 = 0.0 - v_dot(d, X)
+  let det = a11 * a22 - a12 * a21
+  if abs(det) < 1e-12 { error("the top point's ray runs up the vertical itself") }
+  return (b1 * a22 - a12 * b2) / det
+}
+
+fn measure_height(cam, scale, base, top) { return scale * rise(cam, on_surface(cam, base), top) }
+
+fn measure_box(cam, scale, fl, fr, br, top) {
+  let u = up_of(cam)
+  let FL = on_surface(cam, fl)
+  let FR = on_surface(cam, fr)
+  let BR = on_surface(cam, br)
+  let ex = v_sub(FR, FL)
+  let width = v_len(ex)
+  let xh = v_unit(ex)
+  // the depth: square to the width, along the surface, as far as the back corner reaches
+  let zh = v_unit(v_cross(u, xh))
+  let dd = v_dot(v_sub(BR, FR), zh)
+  if dd < 0 { zh = v_mul(zh, -1.0) dd = 0.0 - dd }
+  let hgt = rise(cam, FL, top)
+  let up = v_mul(u, hgt)
+  let BL = v_add(FL, v_mul(zh, dd))
+  let BRs = v_add(FR, v_mul(zh, dd))
+  let corners = [FL, FR, BRs, BL, v_add(FL, up), v_add(FR, up), v_add(BRs, up), v_add(BL, up)]
+  let w_mm = width * scale
+  let d_mm = dd * scale
+  let h_mm = hgt * scale
+  return {"width_mm": w_mm, "depth_mm": d_mm, "height_mm": h_mm, "volume_l": w_mm * d_mm * h_mm / 1000000.0,
+          "corners": corners, "scale": scale, "axes": {"x": xh, "z": zh, "y": u}}
+}
+
+// ---- the box as a model --------------------------------------------------------------------------------------------
+
+fn project_pt(cam, X) { return [cam.cx + cam.focal * X[0] / X[2], cam.cy + cam.focal * X[1] / X[2]] }
+
+// The box textured from the photo: each face the camera sees flattened out of it (image_rectify), each it does not
+// given the opposite face's picture. -> {glb (bytes: a glTF 2.0 binary, metres, y up), faces: [{name, seen}]}
+fn box_model(cv, cam, box) {
+  let c = box.corners
+  // the faces: four corners each, the picture's top-left first, clockwise as seen from outside
+  let faces = [
+    {"name": "front", "q": [c[4], c[5], c[1], c[0]], "opp": "back"},
+    {"name": "right", "q": [c[5], c[6], c[2], c[1]], "opp": "left"},
+    {"name": "back", "q": [c[6], c[7], c[3], c[2]], "opp": "front"},
+    {"name": "left", "q": [c[7], c[4], c[0], c[3]], "opp": "right"},
+    {"name": "top", "q": [c[7], c[6], c[5], c[4]], "opp": "bottom"},
+    {"name": "bottom", "q": [c[0], c[1], c[2], c[3]], "opp": "top"}
+  ]
+  let mm_px = 2.0
+  let pics = {}
+  let seen = {}
+  for f in faces {
+    let q = f.q
+    let mid = v_mul(v_add(v_add(q[0], q[1]), v_add(q[2], q[3])), 0.25)
+    // its outward normal: (down the picture) x (across it) - the camera's frame has y down
+    let n = v_unit(v_cross(v_sub(q[3], q[0]), v_sub(q[1], q[0])))
+    // seen when it faces the camera (at the origin)
+    let faces_cam = v_dot(n, v_mul(mid, -1.0)) > 0
+    seen[f.name] = faces_cam
+    if faces_cam {
+      let wpx = max(8, round(v_len(v_sub(q[1], q[0])) * box.scale / mm_px))
+      let hpx = max(8, round(v_len(v_sub(q[3], q[0])) * box.scale / mm_px))
+      pics[f.name] = image_rectify(cv, [project_pt(cam, q[0]), project_pt(cam, q[1]), project_pt(cam, q[2]), project_pt(cam, q[3])], wpx, hpx)
+    }
+  }
+  for f in faces {
+    if get(pics, f.name, nil) == nil {
+      let o = get(pics, f.opp, nil)
+      if o == nil { o = canvas_create(8, 8) canvas_set_fill_color(o, "#8a7a64") canvas_fill_rect(o, 0, 0, 8, 8) }
+      pics[f.name] = o
+    }
+  }
+  // into the box's own frame, metres: x along its width, y up, z = x cross y (right-handed, as glTF is: the front
+  // at z = 0 and the box behind it at negative z)
+  let ax = box.axes
+  let az = v_cross(ax.x, ax.y)
+  let o0 = c[0]
+  let k = box.scale / 1000.0
+  fn local(X) {
+    let r = v_sub(X, o0)
+    return [v_dot(r, ax.x) * k, v_dot(r, ax.y) * k, v_dot(r, az) * k]
+  }
+  let prims = []
+  for f in faces {
+    let q = []
+    for X in f.q { push(q, local(X)) }
+    push(prims, {"name": f.name, "pts": q, "png": bytes(canvas_to_png(pics[f.name]))})
+  }
+  let out = []
+  for f in faces { push(out, {"name": f.name, "seen": seen[f.name]}) }
+  return {"glb": glb_quads(prims), "faces": out}
+}
+
+// A glTF 2.0 binary of textured quads: each {name, pts: four [x y z] (top-left, top-right, bottom-right, bottom-left
+// of its picture), png}. One mesh, a primitive and a material a quad, the pictures embedded.
+fn glb_quads(quads) {
+  let st = {"bin": bytes(0)}
+  let views = []
+  let accessors = []
+  let images = []
+  let textures = []
+  let materials = []
+  let prims = []
+  fn put(data, target) {
+    // aligned to four bytes
+    let pad = (4 - len(st.bin) % 4) % 4
+    if pad > 0 { st.bin = bytes_concat([st.bin, bytes(pad)]) }
+    let v = {"buffer": 0, "byteOffset": len(st.bin), "byteLength": len(data)}
+    if target != nil { v.target = target }
+    push(views, v)
+    st.bin = bytes_concat([st.bin, data])
+    return len(views) - 1
+  }
+  for qd in quads {
+    let p = qd.pts
+    let pos = bytes(48)
+    let nrm = bytes(48)
+    let uv = bytes(32)
+    let n = v_unit(v_cross(v_sub(p[3], p[0]), v_sub(p[1], p[0])))
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    let lo = [1e9, 1e9, 1e9]
+    let hi = [-1e9, -1e9, -1e9]
+    for i in 0..4 {
+      for c in 0..3 {
+        bytes_set(pos, i * 12 + c * 4, "f32le", p[i][c])
+        bytes_set(nrm, i * 12 + c * 4, "f32le", n[c])
+        lo[c] = min(lo[c], p[i][c])
+        hi[c] = max(hi[c], p[i][c])
+      }
+      bytes_set(uv, i * 8, "f32le", uvs[i][0])
+      bytes_set(uv, i * 8 + 4, "f32le", uvs[i][1])
+    }
+    let idx = bytes(12)
+    let tri = [0, 3, 2, 0, 2, 1]
+    for i in 0..6 { bytes_set(idx, i * 2, "u16le", tri[i]) }
+    let pv = put(pos, 34962)
+    let nv = put(nrm, 34962)
+    let uvv = put(uv, 34962)
+    let iv = put(idx, 34963)
+    let iview = put(qd.png, nil)
+    push(accessors, {"bufferView": pv, "componentType": 5126, "count": 4, "type": "VEC3", "min": lo, "max": hi})
+    push(accessors, {"bufferView": nv, "componentType": 5126, "count": 4, "type": "VEC3"})
+    push(accessors, {"bufferView": uvv, "componentType": 5126, "count": 4, "type": "VEC2"})
+    push(accessors, {"bufferView": iv, "componentType": 5123, "count": 6, "type": "SCALAR"})
+    push(images, {"bufferView": iview, "mimeType": "image/png", "name": qd.name})
+    push(textures, {"source": len(images) - 1})
+    push(materials, {"name": qd.name, "pbrMetallicRoughness": {"baseColorTexture": {"index": len(textures) - 1}, "metallicFactor": 0.0, "roughnessFactor": 1.0}, "doubleSided": true})
+    let a = len(accessors) - 4
+    push(prims, {"attributes": {"POSITION": a, "NORMAL": a + 1, "TEXCOORD_0": a + 2}, "indices": a + 3, "material": len(materials) - 1})
+  }
+  let pad = (4 - len(st.bin) % 4) % 4
+  if pad > 0 { st.bin = bytes_concat([st.bin, bytes(pad)]) }
+  let bin = st.bin
+  let gltf = {"asset": {"version": "2.0", "generator": "aios measure.gr"}, "scene": 0, "scenes": [{"nodes": [0]}],
+              "nodes": [{"mesh": 0, "name": "box"}], "meshes": [{"primitives": prims}],
+              "buffers": [{"byteLength": len(bin)}], "bufferViews": views, "accessors": accessors,
+              "images": images, "textures": textures, "materials": materials, "samplers": [{}]}
+  for t in textures { t.sampler = 0 }
+  let js = json_stringify(gltf)
+  while len(js) % 4 != 0 { js = js + " " }
+  let jb = bytes(js)
+  let total = 12 + 8 + len(jb) + 8 + len(bin)
+  let head = bytes(12)
+  bytes_set(head, 0, "u32le", 0x46546C67)
+  bytes_set(head, 4, "u32le", 2)
+  bytes_set(head, 8, "u32le", total)
+  let ch1 = bytes(8)
+  bytes_set(ch1, 0, "u32le", len(jb))
+  bytes_set(ch1, 4, "u32le", 0x4E4F534A)
+  let ch2 = bytes(8)
+  bytes_set(ch2, 0, "u32le", len(bin))
+  bytes_set(ch2, 4, "u32le", 0x004E4942)
+  return bytes_concat([head, ch1, jb, ch2, bin])
+}
