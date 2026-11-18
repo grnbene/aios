@@ -1,0 +1,42 @@
+// Bins measured and checked in a dark, dirty warehouse (apps/bin_capacity/lib/bins.gr). The rendered bin (dirty,
+// rusty, scuffed: tests/grain/lib/bin_scene.gr) is photographed as the warehouse would give it - most of the light
+// missing and lifted back by the phone with its grain, a sodium lamp's orange, a vignette, smears on everything
+// (the marker too), shake - and with light added the odd way a work light adds it: a hot spot and a hard shadow
+// across the opening. The reference photo and the check are taken in different light on purpose.
+import { rack, camera_of, photo, seen, bin_truth, warehouse_light } from "lib/bin_scene.gr"
+import { bins_geometry, bins_occupancy } from "../../apps/bin_capacity/lib/bins.gr"
+
+fn check(c, msg) { assert_true(c, msg) }
+let T = bin_truth()
+let cfg = {"marker_mm": 150.0}
+let A = camera_of([250.0, -1900.0, 650.0], [600.0, 400.0, 450.0])
+let B = camera_of([800.0, -1700.0, 500.0], [600.0, 400.0, 450.0])
+let opening = [seen(A, [0.0, 0.0, T.h]), seen(A, [T.w, 0.0, T.h]), seen(A, [T.w, 0.0, 0.0]), seen(A, [0.0, 0.0, 0.0])]
+let back = seen(A, [0.0, T.d, 0.0])
+fn within(g, tol) { return abs(g.width_mm - T.w) / T.w < tol and abs(g.height_mm - T.h) / T.h < tol and abs(g.depth_mm - T.d) / T.d < tol }
+
+let SODIUM = [1.0, 0.72, 0.38]
+let dim = {"dark": 0.85, "cast": SODIUM, "vignette": 0.6, "grime": 25, "blur": 1, "seed": 3}
+let work = {"dark": 0.5, "hotspot": [900, 500, 500, 1.4], "shadow": [[[300, 1200], [700, 300], [900, 300], [700, 1200]], 0.6], "grime": 25, "seed": 9}
+
+// ---- measuring ----
+let ref = warehouse_light(photo(A, rack(false)), dim)
+let g = bins_geometry(ref, opening, back, cfg, nil)
+check(within(g, 0.01), format("dim sodium light, grime, a little shake: {:.1f} x {:.1f} x {:.1f} mm, within 1%", g.width_mm, g.height_mm, g.depth_mm))
+let gw = bins_geometry(warehouse_light(photo(A, rack(false)), work), opening, back, cfg, nil)
+check(within(gw, 0.01), format("a work light's hot spot and a hard shadow: {:.1f} x {:.1f} x {:.1f} mm, within 1%", gw.width_mm, gw.height_mm, gw.depth_mm))
+let gd = bins_geometry(warehouse_light(photo(A, rack(false)), {"dark": 0.97, "cast": SODIUM, "grime": 25, "blur": 3, "seed": 5}), opening, back, cfg, nil)
+check(within(gd, 0.015), format("3% of the light and a shaken hand: {:.1f} x {:.1f} x {:.1f} mm, within 1.5%", gd.width_mm, gd.height_mm, gd.depth_mm))
+// too dark and too shaken: refused, never a wrong size
+let too = try_call(bins_geometry, warehouse_light(photo(A, rack(false)), {"dark": 0.985, "cast": SODIUM, "grime": 25, "blur": 3, "seed": 5}), opening, back, cfg, nil)
+check(!too.ok and index_of(str(too.error), "no marker") >= 0, "1.5% of the light and shaken: refused (no marker found), not measured wrong")
+
+// ---- what is in it, checked in different light from its empty photo ----
+let empty = bins_occupancy(warehouse_light(photo(B, rack(false)), work), g.camera.focal, ref, g.camera, g, cfg)
+check(empty.changed < 0.06, format("empty, the empty photo in sodium light and this one under a work light with a hard shadow: {:.3f} changed", empty.changed))
+let full = bins_occupancy(warehouse_light(photo(B, rack(true)), work), g.camera.focal, ref, g.camera, g, cfg)
+// four tires' front is 48% of the opening
+check(full.changed > 0.35 and full.changed < 0.6, format("four tires in it, the same two lights: {:.3f} changed", full.changed))
+let full_dim = bins_occupancy(warehouse_light(photo(B, rack(true)), {"dark": 0.9, "cast": SODIUM, "grime": 30, "blur": 2, "seed": 11}), g.camera.focal, ref, g.camera, g, cfg)
+check(full_dim.changed > 0.35 and full_dim.changed < 0.6, format("four tires in it, both photos dark and dirty: {:.3f} changed", full_dim.changed))
+print("PASS: test_bin_dark")

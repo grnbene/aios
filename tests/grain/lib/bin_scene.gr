@@ -1,0 +1,181 @@
+// A rack's bin for the bin tests, drawn in 3D (r3d_draw) from cameras placed anywhere: 1200 x 1000 x 900 mm (x right,
+// y into the bin, z up; its front y = 0, its opening x 0..1200, z 0..1000), the 150 mm bin marker on the beam under it,
+// and, when asked, a stack of four tires in it. Also what a dark, dirty warehouse does to a photo (warehouse_light).
+//
+//   camera_of(C, T)        a camera at C looking at T
+//   photo(cam, world)      -> JPEG bytes of world (rack(tires)) from cam, 1600 x 1200, a 60 degree lens
+//   seen(cam, p)           where world point p is in that photo
+//   warehouse_light(jpeg, opts) -> JPEG bytes: the same photo as the warehouse would give it
+
+fn sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+fn cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+fn unit(a) { let l = sqrt(dot(a, a)) return [a[0] / l, a[1] / l, a[2] / l] }
+fn box_xz(tris, x0, x1, z0, z1, y, col) {
+  push(tris, {"p": [[x0, y, z0], [x1, y, z0], [x1, y, z1]], "col": col})
+  push(tris, {"p": [[x0, y, z0], [x1, y, z1], [x0, y, z1]], "col": col})
+}
+fn quad(tris, a, b, c, d, col) { push(tris, {"p": [a, b, c], "col": col}) push(tris, {"p": [a, c, d], "col": col}) }
+
+// ---- the rack (mm: x right, y into the bin, z up; the bin's front is y = 0, its opening x 0..1200, z 0..1000) ----
+let BW = 1200.0
+let BH = 1000.0
+let BD = 900.0
+// a colour darkened or lightened by up to `amt` (0..1) by a hash of where the tile is: the same tile always the same
+fn grime(col, i, j, k, amt) {
+  let h = ((i * 73856093) ^ (j * 19349663) ^ (k * 83492791)) % 1000
+  let f = 1.0 + amt * (abs(h) / 500.0 - 1.0)
+  return (min(255, round(((col >> 16) & 255) * f)) << 16) + (min(255, round(((col >> 8) & 255) * f)) << 8) + min(255, round((col & 255) * f))
+}
+// a rectangle on a plane in tiles of `tile` mm, each its own grime: corner o, edge vectors u and v (their lengths
+// the rectangle's sides)
+fn tiled(t, o, u, v, col, tile, amt, k) {
+  let lu = sqrt(dot(u, u))
+  let lv = sqrt(dot(v, v))
+  let nu = max(1, round(lu / tile))
+  let nv = max(1, round(lv / tile))
+  for i in 0..nu {
+    for j in 0..nv {
+      let p = fn (a, b) { return [o[0] + u[0] * a / nu + v[0] * b / nv, o[1] + u[1] * a / nu + v[1] * b / nv, o[2] + u[2] * a / nu + v[2] * b / nv] }
+      quad(t, p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1), grime(col, i, j, k, amt))
+    }
+  }
+}
+fn rack(tires) {
+  let t = []
+  // the front around the opening: uprights and beams, rusty and scuffed
+  tiled(t, [-300.0, 0.0, -500.0], [300.0, 0.0, 0.0], [0.0, 0.0, 2000.0], 0xC9632B, 50.0, 0.25, 1)
+  tiled(t, [BW, 0.0, -500.0], [300.0, 0.0, 0.0], [0.0, 0.0, 2000.0], 0xC9632B, 50.0, 0.25, 2)
+  tiled(t, [0.0, 0.0, -500.0], [BW, 0.0, 0.0], [0.0, 0.0, 500.0], 0xD07038, 50.0, 0.25, 3)
+  tiled(t, [0.0, 0.0, BH], [BW, 0.0, 0.0], [0.0, 0.0, 500.0], 0xD07038, 50.0, 0.25, 4)
+  // inside: floor, back, sides, top, each its own grey, dirty
+  tiled(t, [0.0, 0.0, 0.0], [BW, 0.0, 0.0], [0.0, BD, 0.0], 0x8C8A85, 40.0, 0.35, 5)
+  tiled(t, [0.0, BD, 0.0], [BW, 0.0, 0.0], [0.0, 0.0, BH], 0x6F6D69, 40.0, 0.35, 6)
+  tiled(t, [0.0, 0.0, 0.0], [0.0, BD, 0.0], [0.0, 0.0, BH], 0x5E5C58, 40.0, 0.35, 7)
+  tiled(t, [BW, 0.0, 0.0], [0.0, BD, 0.0], [0.0, 0.0, BH], 0x5E5C58, 40.0, 0.35, 8)
+  tiled(t, [0.0, 0.0, BH], [BW, 0.0, 0.0], [0.0, BD, 0.0], 0x4C4A47, 40.0, 0.35, 9)
+  // the marker on the beam: white paper, a 150 mm black square, a 75 mm white square in it
+  box_xz(t, 487.5, 712.5, -287.5, -62.5, -0.5, 0xEEEBE3)
+  box_xz(t, 525.0, 675.0, -250.0, -100.0, -1.0, 0x121212)
+  box_xz(t, 562.5, 637.5, -212.5, -137.5, -1.5, 0xEEEBE3)
+  // tires lying in a stack: four of 225 mm, 640 across - tread in ribs, the top sidewall in rings of lettering
+  if tires {
+    for k in 0..4 {
+      let z0 = k * 225.0
+      for r in 0..15 {
+        let zz = z0 + r * 15.0
+        quad(t, [40.0, 100.0, zz], [680.0, 100.0, zz], [680.0, 100.0, zz + 15.0], [40.0, 100.0, zz + 15.0], r % 2 == 0 ? 0x1C1C1C : 0x343434)
+      }
+      tiled(t, [40.0, 100.0, z0 + 225.0], [640.0, 0.0, 0.0], [0.0, 640.0, 0.0], 0x262626, 32.0, 0.5, 20 + k)
+    }
+  }
+  return t
+}
+let W = 1600
+let H = 1200
+let FOV = 60.0
+let F = (W / 2.0) / tan(FOV * PI / 360.0)
+fn camera_of(C, T) {
+  let f = unit(sub(T, C))
+  let r = unit(cross(f, [0.0, 0.0, 1.0]))
+  return {"C": C, "f": f, "r": r, "u": cross(r, f)}
+}
+fn photo(cam, world) {
+  let rows = []
+  for tri in world {
+    let row = {"col": tri.col}
+    for i in 0..3 {
+      let d = sub(tri.p[i], cam.C)
+      row["x" + str(i)] = dot(d, cam.r)
+      row["y" + str(i)] = dot(d, cam.u)
+      row["z" + str(i)] = dot(d, cam.f)
+    }
+    push(rows, row)
+  }
+  let t = r3d_target(W, H)
+  r3d_clear(t, 0x3A3835)
+  r3d_draw(t, rows, FOV)
+  let cv = canvas_create(W, H)
+  canvas_set_pixels(cv, r3d_pixels(t))
+  return canvas_to_jpeg(cv, 90)
+}
+// where a world point is in a photo (as r3d_draw draws it)
+fn seen(cam, p) {
+  let d = sub(p, cam.C)
+  let z = dot(d, cam.f)
+  return [W / 2.0 + F * dot(d, cam.r) / z, H / 2.0 - F * dot(d, cam.u) / z]
+}
+
+
+// the bin's size and the lens, for the tests' arithmetic
+fn bin_truth() { return {"w": BW, "h": BH, "d": BD, "W": W, "H": H, "F": F} }
+
+// A photo as a dark, dirty warehouse gives it. opts (each off unless given):
+//   dark (0..1: how much light is missing; the phone then lifts the picture back, and its grain with it)
+//   cast ([r g b] multipliers: a sodium lamp's orange is [1.0, 0.72, 0.38])
+//   vignette (0..1), hotspot ([x y radius strength]: a work light's bright patch), shadow ([[x y] ...] a hard shadow
+//   polygon and how dark, [points, 0..1]), blur (pixels), grime (how many smears), seed
+fn warehouse_light(jpeg, opts) {
+  let cv = image_decode(jpeg)
+  let w = canvas_width(cv)
+  let h = canvas_height(cv)
+  let seed = get(opts, "seed", 7)
+  let rnd = fn () {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 2147483648.0
+  }
+  // grime: smears of dirt over everything (the marker included), and a scuffed patch on the marker
+  for i in 0..get(opts, "grime", 0) {
+    canvas_set_fill_color(cv, format("rgba({}, {}, {}, {:.2f})", 40 + round(rnd() * 30), 35 + round(rnd() * 25), 25 + round(rnd() * 20), 0.15 + rnd() * 0.35))
+    canvas_fill_circle(cv, rnd() * w, rnd() * h, 6 + rnd() * 40)
+  }
+  if get(opts, "shadow", nil) != nil {
+    canvas_set_fill_color(cv, format("rgba(0, 0, 0, {:.2f})", opts.shadow[1]))
+    canvas_fill_polygon(cv, opts.shadow[0])
+  }
+  let px = bytes(canvas_to_bytes(cv, "argb"))
+  let dark = get(opts, "dark", 0.0)
+  let cast = get(opts, "cast", [1.0, 1.0, 1.0])
+  let vig = get(opts, "vignette", 0.0)
+  let hs = get(opts, "hotspot", nil)
+  // the phone's lift: what was (1 - dark) of the light is stretched back to the whole range, the sensor's noise with it
+  let lift = 1.0 / max(0.05, 1.0 - dark)
+  let noise = 3.0 + 40.0 * dark
+  for y in 0..h {
+    let dy = (y - h / 2.0) / (h / 2.0)
+    for x in 0..w {
+      let o = (y * w + x) * 4
+      let dx = (x - w / 2.0) / (w / 2.0)
+      let k = 1.0 - vig * (dx * dx + dy * dy) * 0.5
+      if hs != nil {
+        let d = sqrt((x - hs[0]) * (x - hs[0]) + (y - hs[1]) * (y - hs[1])) / hs[2]
+        if d < 1.0 { k = k * (1.0 + hs[3] * (1.0 - d * d)) }
+      }
+      let n = (rnd() + rnd() + rnd() - 1.5) * noise
+      for c in 0..3 {
+        // argb little-endian: byte 0 blue, 1 green, 2 red
+        let ch = 2 - c
+        let v = bytes_get(px, o + ch, "u8") * (1.0 - dark) * k * cast[c]
+        bytes_set(px, o + ch, "u8", max(0, min(255, round(v * lift + n))))
+      }
+    }
+  }
+  let out = canvas_create(w, h)
+  canvas_set_pixels(out, bytes_from_argb(px, w, h))
+  let b = get(opts, "blur", 0)
+  if b > 0 { out = image_resample(image_resample(out, max(1, round(w / (b + 1.0))), max(1, round(h / (b + 1.0)))), w, h) }
+  return canvas_to_jpeg(out, 85)
+}
+
+// argb words (canvas_to_bytes "argb") back into R G B A bytes, which canvas_set_pixels takes
+fn bytes_from_argb(px, w, h) {
+  let out = bytes(w * h * 4)
+  for i in 0..(w * h) {
+    let o = i * 4
+    bytes_set(out, o, "u8", bytes_get(px, o + 2, "u8"))
+    bytes_set(out, o + 1, "u8", bytes_get(px, o + 1, "u8"))
+    bytes_set(out, o + 2, "u8", bytes_get(px, o, "u8"))
+    bytes_set(out, o + 3, "u8", 255)
+  }
+  return out
+}

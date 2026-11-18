@@ -2562,9 +2562,19 @@ Value bi_visual_hull(Vm&, std::vector<Value>& args, std::string& error) {
 }
 
 // image_difference(a, b[, opts]) -> {changed, compared, gain, mask, w, h}: where two pictures of the same view (the
-// same size) differ - each blurred over 3 x 3, a's lightness scaled by the median of the pixels' ratios (a lamp on or
-// off is not a change), then CIELAB distance past opts.threshold (12) - with specks of one cell dropped; only pixels
-// both pictures have (alpha) count. changed: the share of those; compared: their share of the picture.
+// same size) show different things, under whatever light each was taken in. In order:
+//   - the light's colour: each channel of a scaled by the median ratio b / a of that channel (sodium orange against a
+//     white work light is not a change);
+//   - the light's spread: a smooth field (a quadratic in x and y, fitted to the log-brightness ratio with the outliers
+//     weighed down) divided out (a hot spot, a vignette, light falling off with distance);
+//   - then each pixel by its neighbourhood (9 x 9), against b's within opts.shift cells (3) each way, the best match
+//     kept (so a few cells of misregistration between the views do not count): where a shows texture (dirt, grain,
+//     edges), changed when no neighbourhood of b nearby shows the same pattern (normalized correlation of at least
+//     opts.ncc, 0.6) - a shadow or a patch of extra light keeps the pattern, something put there replaces it; where a
+//     is plain, changed when no plain neighbourhood of b nearby is within a factor of opts.ratio (1.6) of its
+//     brightness and opts.chroma (0.06) of its colour.
+//   Only pixels both pictures have (alpha) count; specks of one cell are dropped. changed: the share of those;
+//   compared: their share of the picture; gain: the channels' scales.
 Value bi_image_difference(Vm&, std::vector<Value>& args, std::string& error) {
   uint32_t W = 0, H = 0, W2 = 0, H2 = 0;
   const std::vector<uint32_t>* a = nullptr;
@@ -2572,44 +2582,166 @@ Value bi_image_difference(Vm&, std::vector<Value>& args, std::string& error) {
   if (!canvas_pixels(args[0], &W, &H, &a, error, "image_difference") || !canvas_pixels(args[1], &W2, &H2, &b, error, "image_difference")) return Value::nil();
   if (W != W2 || H != H2) { error = "image_difference(): the pictures are " + std::to_string(W) + "x" + std::to_string(H) + " and " + std::to_string(W2) + "x" + std::to_string(H2) + ": resample one to the other first"; return Value::nil(); }
   MapObj* o = opts_map(args, 2);
-  const double thr = std::clamp(opt_num(o, "threshold", 12), 1.0, 100.0);
+  const double ncc_min = std::clamp(opt_num(o, "ncc", 0.6), -1.0, 1.0);
+  const double ratio = std::max(1.01, opt_num(o, "ratio", 1.6));
+  const double chroma_max = std::clamp(opt_num(o, "chroma", 0.06), 0.001, 1.0);
   const size_t n = (size_t)W * H;
-  auto lab_of = [&](const std::vector<uint32_t>& px) {
-    std::vector<Lab> L(n);
+  const auto& T = lab_table();
+  // linear channels, blurred 3 x 3 (the sensor's grain)
+  auto lin = [&](const std::vector<uint32_t>& px) {
+    std::vector<float> L(n * 3);
     for (uint32_t y = 0; y < H; ++y)
       for (uint32_t x = 0; x < W; ++x) {
-        double r = 0, g = 0, bb = 0;
-        int c = 0;
+        double c[3] = {0, 0, 0};
+        int cnt = 0;
         for (int dy = -1; dy <= 1; ++dy)
           for (int dx = -1; dx <= 1; ++dx) {
             const int xx = (int)x + dx, yy = (int)y + dy;
             if (xx < 0 || yy < 0 || xx >= (int)W || yy >= (int)H) continue;
             const uint32_t p = px[(size_t)yy * W + xx];
-            r += (p >> 16) & 255; g += (p >> 8) & 255; bb += p & 255; ++c;
+            c[0] += T.lin[(p >> 16) & 255]; c[1] += T.lin[(p >> 8) & 255]; c[2] += T.lin[p & 255]; ++cnt;
           }
-        L[(size_t)y * W + x] = to_lab((uint8_t)(r / c + 0.5), (uint8_t)(g / c + 0.5), (uint8_t)(bb / c + 0.5));
+        for (int k = 0; k < 3; ++k) L[((size_t)y * W + x) * 3 + k] = (float)(c[k] / cnt);
       }
     return L;
   };
-  std::vector<Lab> A = lab_of(*a), B = lab_of(*b);
-  // only where both pictures have something (alpha): a pixel either lacks is left out of the count
+  std::vector<float> A = lin(*a), B = lin(*b);
   std::vector<uint8_t> use(n);
   size_t nuse = 0;
   for (size_t i = 0; i < n; ++i) { use[i] = ((*a)[i] >> 24) >= 128 && ((*b)[i] >> 24) >= 128; nuse += use[i]; }
   if (nuse == 0) { error = "image_difference(): the pictures have no pixel in common"; return Value::nil(); }
-  // the lighting: the median of the lightness ratios (what changed is under half, so the median is the light's)
-  std::vector<double> ratios;
-  for (size_t i = 0; i < n; ++i) if (use[i] && A[i].l > 2 && B[i].l > 2) ratios.push_back(B[i].l / A[i].l);
-  double gain = 1;
-  if (!ratios.empty()) { std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end()); gain = ratios[ratios.size() / 2]; }
-  std::vector<uint8_t> ch(n, 0);
+  const float eps = 0.004f;
+  // the light's colour: a per-channel scale (the median ratio)
+  double gain[3];
+  for (int k = 0; k < 3; ++k) {
+    std::vector<double> r;
+    r.reserve(nuse);
+    for (size_t i = 0; i < n; ++i) if (use[i]) r.push_back((B[i * 3 + k] + eps) / (A[i * 3 + k] + eps));
+    std::nth_element(r.begin(), r.begin() + r.size() / 2, r.end());
+    gain[k] = r[r.size() / 2];
+    for (size_t i = 0; i < n; ++i) A[i * 3 + k] = (float)(A[i * 3 + k] * gain[k]);
+  }
+  // log brightness, and chromaticity
+  std::vector<double> la(n), lb(n), ca(n * 2), cb(n * 2);
+  for (size_t i = 0; i < n; ++i) {
+    const double sa = A[i * 3] + A[i * 3 + 1] + A[i * 3 + 2] + 3 * eps, sb = B[i * 3] + B[i * 3 + 1] + B[i * 3 + 2] + 3 * eps;
+    la[i] = std::log(sa); lb[i] = std::log(sb);
+    ca[i * 2] = (A[i * 3] + eps) / sa; ca[i * 2 + 1] = (A[i * 3 + 1] + eps) / sa;
+    cb[i * 2] = (B[i * 3] + eps) / sb; cb[i * 2 + 1] = (B[i * 3 + 1] + eps) / sb;
+  }
+  // the light's spread: d = lb - la ~ c0 + c1 x + c2 y + c3 x^2 + c4 xy + c5 y^2, by least squares weighted against
+  // outliers (what changed) over a few rounds
+  double coef[6] = {0, 0, 0, 0, 0, 0};
+  {
+    std::vector<double> wt(n, 1.0);
+    for (int round = 0; round < 5; ++round) {
+      double M[6][7] = {{0}};
+      for (uint32_t y = 0; y < H; y += 2)
+        for (uint32_t x = 0; x < W; x += 2) {
+          const size_t i = (size_t)y * W + x;
+          if (!use[i]) continue;
+          const double u = (2.0 * x / W) - 1, v = (2.0 * y / H) - 1;
+          const double f[6] = {1, u, v, u * u, u * v, v * v};
+          const double d = lb[i] - la[i], w = wt[i];
+          for (int p = 0; p < 6; ++p) { for (int q = 0; q < 6; ++q) M[p][q] += w * f[p] * f[q]; M[p][6] += w * f[p] * d; }
+        }
+      for (int p = 0; p < 6; ++p) M[p][p] += 1e-6;
+      bool ok = true;
+      for (int c = 0; c < 6 && ok; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < 6; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-12) { ok = false; break; }
+        for (int k = 0; k < 7; ++k) std::swap(M[c][k], M[piv][k]);
+        for (int r = 0; r < 6; ++r) { if (r == c) continue; const double f = M[r][c] / M[c][c]; for (int k = c; k < 7; ++k) M[r][k] -= f * M[c][k]; }
+      }
+      if (!ok) break;
+      for (int p = 0; p < 6; ++p) coef[p] = M[p][6] / M[p][p];
+      // Tukey's weights at four times the residuals' median spread
+      std::vector<double> res;
+      for (uint32_t y = 0; y < H; y += 2)
+        for (uint32_t x = 0; x < W; x += 2) {
+          const size_t i = (size_t)y * W + x;
+          if (!use[i]) continue;
+          const double u = (2.0 * x / W) - 1, v = (2.0 * y / H) - 1;
+          res.push_back(std::fabs(lb[i] - la[i] - (coef[0] + coef[1] * u + coef[2] * v + coef[3] * u * u + coef[4] * u * v + coef[5] * v * v)));
+        }
+      std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
+      const double c4 = std::max(0.05, 4.0 * 1.4826 * res[res.size() / 2]);
+      for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+          const size_t i = (size_t)y * W + x;
+          const double u = (2.0 * x / W) - 1, v = (2.0 * y / H) - 1;
+          const double e = std::fabs(lb[i] - la[i] - (coef[0] + coef[1] * u + coef[2] * v + coef[3] * u * u + coef[4] * u * v + coef[5] * v * v)) / c4;
+          wt[i] = e < 1 ? (1 - e * e) * (1 - e * e) : 0;
+        }
+    }
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) {
+        const size_t i = (size_t)y * W + x;
+        const double u = (2.0 * x / W) - 1, v = (2.0 * y / H) - 1;
+        la[i] += coef[0] + coef[1] * u + coef[2] * v + coef[3] * u * u + coef[4] * u * v + coef[5] * v * v;
+      }
+  }
+  // the neighbourhoods (9 x 9), by summed-area tables; b's taken at every shift up to opts.shift cells (3) each way and
+  // the best match kept - where the two views' registration is a few cells out (a camera found from a small marker),
+  // what is the same still finds itself; what was put there finds nothing like it near
+  const int R = 4, SH = (int)std::clamp(opt_num(o, "shift", 3), 0.0, 8.0);
+  auto table = [&](auto f) {
+    std::vector<double> S((size_t)(W + 1) * (H + 1), 0);
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x)
+        S[(size_t)(y + 1) * (W + 1) + x + 1] = f((int)x, (int)y) + S[(size_t)y * (W + 1) + x + 1] + S[(size_t)(y + 1) * (W + 1) + x] - S[(size_t)y * (W + 1) + x];
+    return S;
+  };
+  auto ok_at = [&](int x, int y) { return x >= 0 && y >= 0 && x < (int)W && y < (int)H && use[(size_t)y * W + x]; };
+  const auto Sn = table([&](int x, int y) { return (double)ok_at(x, y); });
+  const auto Sa = table([&](int x, int y) { return ok_at(x, y) ? la[(size_t)y * W + x] : 0.0; });
+  const auto Saa = table([&](int x, int y) { return ok_at(x, y) ? la[(size_t)y * W + x] * la[(size_t)y * W + x] : 0.0; });
+  const auto Sb = table([&](int x, int y) { return ok_at(x, y) ? lb[(size_t)y * W + x] : 0.0; });
+  const auto Sbb = table([&](int x, int y) { return ok_at(x, y) ? lb[(size_t)y * W + x] * lb[(size_t)y * W + x] : 0.0; });
+  auto box = [&](const std::vector<double>& S, int x0, int y0, int x1, int y1) {
+    x0 = std::clamp(x0, 0, (int)W); x1 = std::clamp(x1, 0, (int)W); y0 = std::clamp(y0, 0, (int)H); y1 = std::clamp(y1, 0, (int)H);
+    if (x1 <= x0 || y1 <= y0) return 0.0;
+    return S[(size_t)y1 * (W + 1) + x1] - S[(size_t)y0 * (W + 1) + x1] - S[(size_t)y1 * (W + 1) + x0] + S[(size_t)y0 * (W + 1) + x0];
+  };
+  const double tex_min = 0.06, log_ratio = std::log(ratio);
+  // per pixel: the best correlation found (textured), and the smallest brightness and colour difference (plain)
+  std::vector<double> best_ncc(n, -2), best_dl(n, 1e9), best_dc(n, 1e9);
+  std::vector<uint8_t> tex_a(n, 0), tex_b_any(n, 0), plain_b_any(n, 0);
+  for (int dy = -SH; dy <= SH; ++dy)
+    for (int dx = -SH; dx <= SH; ++dx) {
+      // a(p) b(p + d)
+      const auto Sab = table([&](int x, int y) { return ok_at(x, y) && ok_at(x + dx, y + dy) ? la[(size_t)y * W + x] * lb[(size_t)(y + dy) * W + x + dx] : 0.0; });
+      for (int y = 0; y < (int)H; ++y)
+        for (int x = 0; x < (int)W; ++x) {
+          const size_t i = (size_t)y * W + x;
+          if (!use[i] || !ok_at(x + dx, y + dy)) continue;
+          const int x0 = x - R, y0 = y - R, x1 = x + R + 1, y1 = y + R + 1;
+          const double ca_n = box(Sn, x0, y0, x1, y1), cb_n = box(Sn, x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+          if (ca_n < 9 || cb_n < 9) continue;
+          const double ma = box(Sa, x0, y0, x1, y1) / ca_n, mb = box(Sb, x0 + dx, y0 + dy, x1 + dx, y1 + dy) / cb_n;
+          const double va = std::max(0.0, box(Saa, x0, y0, x1, y1) / ca_n - ma * ma);
+          const double vb = std::max(0.0, box(Sbb, x0 + dx, y0 + dy, x1 + dx, y1 + dy) / cb_n - mb * mb);
+          const bool ta = std::sqrt(va) > tex_min, tb = std::sqrt(vb) > tex_min;
+          tex_a[i] = ta;
+          if (tb) tex_b_any[i] = 1; else plain_b_any[i] = 1;
+          if (ta && tb) {
+            const double cov = box(Sab, x0, y0, x1, y1) / ca_n - ma * mb;
+            best_ncc[i] = std::max(best_ncc[i], cov / std::sqrt(va * vb));
+          }
+          if (!ta && !tb) {
+            const size_t j = (size_t)(y + dy) * W + x + dx;
+            best_dl[i] = std::min(best_dl[i], std::fabs(mb - ma));
+            best_dc[i] = std::min(best_dc[i], std::hypot(ca[i * 2] - cb[j * 2], ca[i * 2 + 1] - cb[j * 2 + 1]));
+          }
+        }
+    }
+  std::vector<uint8_t> m(n, 0);
   for (size_t i = 0; i < n; ++i) {
     if (!use[i]) continue;
-    const double dl = A[i].l * gain - B[i].l, da = A[i].a - B[i].a, db = A[i].b - B[i].b;
-    ch[i] = std::sqrt(dl * dl + da * da + db * db) > thr;
+    if (tex_a[i]) m[i] = !(tex_b_any[i] && best_ncc[i] >= ncc_min);       // a's pattern found nowhere near in b
+    else m[i] = !(plain_b_any[i] && best_dl[i] <= log_ratio && best_dc[i] <= chroma_max);
   }
-  // specks dropped: an opening by one cell
-  std::vector<uint8_t> m = ch;
   morph(m, (int)W, (int)H, 1, false);
   morph(m, (int)W, (int)H, 1, true);
   size_t cnt = 0;
@@ -2618,7 +2750,7 @@ Value bi_image_difference(Vm&, std::vector<Value>& args, std::string& error) {
   auto res = std::make_shared<MapObj>();
   res->put("changed", Value::real((double)cnt / nuse));
   res->put("compared", Value::real((double)nuse / n));
-  res->put("gain", Value::real(gain));
+  res->put("gain", Value::list({Value::real(gain[0]), Value::real(gain[1]), Value::real(gain[2])}));
   res->put("mask", Value::bytes(std::move(out)));
   res->put("w", Value::integer(W));
   res->put("h", Value::integer(H));

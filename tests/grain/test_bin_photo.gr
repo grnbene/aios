@@ -5,86 +5,15 @@
 import { bins_geometry, bins_occupancy } from "../../apps/bin_capacity/lib/bins.gr"
 
 fn check(c, msg) { assert_true(c, msg) }
-fn sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
-fn dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
-fn cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
-fn unit(a) { let l = sqrt(dot(a, a)) return [a[0] / l, a[1] / l, a[2] / l] }
-fn box_xz(tris, x0, x1, z0, z1, y, col) {
-  push(tris, {"p": [[x0, y, z0], [x1, y, z0], [x1, y, z1]], "col": col})
-  push(tris, {"p": [[x0, y, z0], [x1, y, z1], [x0, y, z1]], "col": col})
-}
-fn quad(tris, a, b, c, d, col) { push(tris, {"p": [a, b, c], "col": col}) push(tris, {"p": [a, c, d], "col": col}) }
-
-// ---- the rack (mm: x right, y into the bin, z up; the bin's front is y = 0, its opening x 0..1200, z 0..1000) ----
-let BW = 1200.0
-let BH = 1000.0
-let BD = 900.0
-fn rack(tires) {
-  let t = []
-  // the front around the opening: uprights and beams
-  box_xz(t, -300.0, 0.0, -500.0, 1500.0, 0.0, 0xC9632B)
-  box_xz(t, BW, BW + 300.0, -500.0, 1500.0, 0.0, 0xC9632B)
-  box_xz(t, 0.0, BW, -500.0, 0.0, 0.0, 0xD07038)
-  box_xz(t, 0.0, BW, BH, 1500.0, 0.0, 0xD07038)
-  // inside: floor, back, sides, top, each its own grey
-  quad(t, [0.0, 0.0, 0.0], [BW, 0.0, 0.0], [BW, BD, 0.0], [0.0, BD, 0.0], 0x8C8A85)
-  quad(t, [0.0, BD, 0.0], [BW, BD, 0.0], [BW, BD, BH], [0.0, BD, BH], 0x6F6D69)
-  quad(t, [0.0, 0.0, 0.0], [0.0, BD, 0.0], [0.0, BD, BH], [0.0, 0.0, BH], 0x5E5C58)
-  quad(t, [BW, 0.0, 0.0], [BW, BD, 0.0], [BW, BD, BH], [BW, 0.0, BH], 0x5E5C58)
-  quad(t, [0.0, 0.0, BH], [BW, 0.0, BH], [BW, BD, BH], [0.0, BD, BH], 0x4C4A47)
-  // the marker on the beam: white paper, a 150 mm black square, a 75 mm white square in it
-  box_xz(t, 487.5, 712.5, -287.5, -62.5, -0.5, 0xEEEBE3)
-  box_xz(t, 525.0, 675.0, -250.0, -100.0, -1.0, 0x121212)
-  box_xz(t, 562.5, 637.5, -212.5, -137.5, -1.5, 0xEEEBE3)
-  // tires lying in a stack: four of 225 mm, 640 across, each with its tread's lighter band
-  if tires {
-    for k in 0..4 {
-      let z0 = k * 225.0
-      quad(t, [40.0, 100.0, z0], [680.0, 100.0, z0], [680.0, 100.0, z0 + 219.0], [40.0, 100.0, z0 + 219.0], 0x1E1E1E)
-      quad(t, [40.0, 100.0, z0 + 219.0], [680.0, 100.0, z0 + 219.0], [680.0, 100.0, z0 + 225.0], [40.0, 100.0, z0 + 225.0], 0x3A3A3A)
-      quad(t, [40.0, 100.0, z0 + 225.0], [680.0, 100.0, z0 + 225.0], [680.0, 740.0, z0 + 225.0], [40.0, 740.0, z0 + 225.0], 0x262626)
-    }
-  }
-  return t
-}
-let W = 1600
-let H = 1200
-let FOV = 60.0
-let F = (W / 2.0) / tan(FOV * PI / 360.0)
-fn camera_of(C, T) {
-  let f = unit(sub(T, C))
-  let r = unit(cross(f, [0.0, 0.0, 1.0]))
-  return {"C": C, "f": f, "r": r, "u": cross(r, f)}
-}
-fn photo(cam, world) {
-  let rows = []
-  for tri in world {
-    let row = {"col": tri.col}
-    for i in 0..3 {
-      let d = sub(tri.p[i], cam.C)
-      row["x" + str(i)] = dot(d, cam.r)
-      row["y" + str(i)] = dot(d, cam.u)
-      row["z" + str(i)] = dot(d, cam.f)
-    }
-    push(rows, row)
-  }
-  let t = r3d_target(W, H)
-  r3d_clear(t, 0x3A3835)
-  r3d_draw(t, rows, FOV)
-  let cv = canvas_create(W, H)
-  canvas_set_pixels(cv, r3d_pixels(t))
-  return canvas_to_jpeg(cv, 90)
-}
-// where a world point is in a photo (as r3d_draw draws it)
-fn seen(cam, p) {
-  let d = sub(p, cam.C)
-  let z = dot(d, cam.f)
-  return [W / 2.0 + F * dot(d, cam.r) / z, H / 2.0 - F * dot(d, cam.u) / z]
-}
-
+import { rack, camera_of, photo, seen, bin_truth } from "lib/bin_scene.gr"
+let T = bin_truth()
+let BW = T.w
+let BH = T.h
+let BD = T.d
+let F = T.F
+let empty = rack(false)
 let cfg = {"marker_mm": 150.0}
 let A = camera_of([250.0, -1900.0, 650.0], [600.0, 400.0, 450.0])
-let empty = rack(false)
 let shot = photo(A, empty)
 let opening = [seen(A, [0.0, 0.0, BH]), seen(A, [BW, 0.0, BH]), seen(A, [BW, 0.0, 0.0]), seen(A, [0.0, 0.0, 0.0])]
 let back = seen(A, [0.0, BD, 0.0])
