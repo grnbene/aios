@@ -38,6 +38,32 @@ a { color: var(--accent); }
 <p class="lead">How full every bin is from what the ERP says is in it, and where a size still fits. Measure a bin with your phone: <a href="/marker.png" target="_blank">print the marker</a>, tape it flat on the bin's front, photograph the bin, drag the four corners onto the opening and the blue one onto the back corner of its floor. Photograph it again any time to check what is really in it.</p>
 
 <div class="card">
+  <h2>Measure anything in a photo</h2>
+  <p class="muted" style="margin:0 0 6px">Any photo with a wall corner, a counter or shelf edge in it - no marker needed. Then tap: something of known size for the scale, then what to measure. A box (a bag, a carton) becomes a 3D model.</p>
+  <label class="shot">Choose or take a photo<input id="sphoto" type="file" accept="image/*" capture="environment"></label>
+  <div id="sstage" style="display:none;margin-top:10px">
+    <div class="row" style="flex-wrap:wrap">
+      <button class="smode" data-mode="ref">Reference</button><button class="smode" data-mode="length">Length</button>
+      <button class="smode" data-mode="height">Height</button><button class="smode" data-mode="box">Box</button>
+      <button id="sundo" style="flex:0 0 auto">Undo</button>
+    </div>
+    <div class="row">
+      <select id="spreset">
+        <option value="255.6">Paper plate, 10 1/16 in</option><option value="279.4">Letter paper, long side 11 in</option>
+        <option value="297">A4 paper, long side 297 mm</option><option value="304.8">Floor tile, 12 in</option>
+        <option value="85.6">Credit card, long side</option><option value="">Other (mm):</option>
+      </select>
+      <input id="smm" inputmode="decimal" placeholder="mm" style="flex:0 0 90px">
+    </div>
+    <div id="shint" class="muted" style="margin-top:6px"></div>
+    <canvas id="scv" style="width:100%;margin-top:6px;border-radius:8px;touch-action:none"></canvas>
+    <div id="slist" style="margin-top:6px;font-size:14px"></div>
+    <button class="go" id="scalc" style="width:100%;margin-top:10px">Measure</button>
+    <div id="sres" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="card">
   <h2>Live camera</h2>
   <p class="muted" style="margin:0 0 6px">Point it at a bin with its marker in view. It tells you what to fix and takes the photo itself when the light, the framing and your hands are right.</p>
   <div class="row">
@@ -330,5 +356,93 @@ $('find').addEventListener('click', async () => {
 });
 board();
 setInterval(board, 15000);
+// ---- measuring anything in a photo ----
+const S3 = {img: null, id: null, w: 0, h: 0, lines: [], mode: 'ref', pending: [], ref: null, lengths: [], heights: [], boxes: []};
+const NEED = {ref: 2, length: 2, height: 2, box: 4};
+const HINT = {ref: 'Tap the two ends of the thing of known size (on the surface).', length: 'Tap two points on the surface.',
+              height: 'Tap a point on the surface, then the point straight above it.',
+              box: 'Tap the box\'s bottom front-left, bottom front-right, bottom back-right corners, then the top of its front-left edge.'};
+function sDraw() {
+  const c = $('scv'), g = c.getContext('2d');
+  g.drawImage(S3.img, 0, 0, c.width, c.height);
+  const k = c.width / S3.w;
+  g.lineWidth = Math.max(2, c.width / 500);
+  const cols = ['rgba(255,80,80,.8)', 'rgba(80,140,255,.8)', 'rgba(60,200,90,.8)'];
+  for (const l of S3.lines) if (l[4] >= 0) { g.strokeStyle = cols[l[4]]; g.beginPath(); g.moveTo(l[0] * k, l[1] * k); g.lineTo(l[2] * k, l[3] * k); g.stroke(); }
+  const dot = (p, col) => { g.fillStyle = col; g.beginPath(); g.arc(p[0] * k, p[1] * k, Math.max(5, c.width / 120), 0, 7); g.fill(); };
+  const seg = (a, b, col) => { g.strokeStyle = col; g.lineWidth = Math.max(3, c.width / 300); g.beginPath(); g.moveTo(a[0] * k, a[1] * k); g.lineTo(b[0] * k, b[1] * k); g.stroke(); };
+  if (S3.ref) { seg(S3.ref.a, S3.ref.b, '#ffd400'); dot(S3.ref.a, '#ffd400'); dot(S3.ref.b, '#ffd400'); }
+  for (const l of S3.lengths) { seg(l.a, l.b, '#ff6a2b'); }
+  for (const h of S3.heights) { seg(h.base, h.top, '#2bd0ff'); }
+  for (const b of S3.boxes) { seg(b.fl, b.fr, '#c06bff'); seg(b.fr, b.br, '#c06bff'); seg(b.fl, b.top, '#c06bff'); }
+  for (const p of S3.pending) dot(p, '#ffffff');
+}
+function sList() {
+  const items = [];
+  if (S3.ref) items.push('Reference: ' + S3.ref.mm + ' mm');
+  S3.lengths.forEach(l => items.push(l.name));
+  S3.heights.forEach(h => items.push(h.name));
+  S3.boxes.forEach(b => items.push(b.name));
+  $('slist').textContent = items.join(' | ');
+  $('shint').textContent = HINT[S3.mode] + (S3.pending.length ? ' (' + S3.pending.length + ' of ' + NEED[S3.mode] + ')' : '');
+}
+document.querySelectorAll('.smode').forEach(b => b.addEventListener('click', () => { S3.mode = b.dataset.mode; S3.pending = []; sList(); sDraw(); }));
+$('sundo').addEventListener('click', () => {
+  if (S3.pending.length) S3.pending.pop();
+  else if (S3.mode === 'box' && S3.boxes.length) S3.boxes.pop();
+  else if (S3.mode === 'height' && S3.heights.length) S3.heights.pop();
+  else if (S3.mode === 'length' && S3.lengths.length) S3.lengths.pop();
+  else if (S3.mode === 'ref') S3.ref = null;
+  sList(); sDraw();
+});
+$('sphoto').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('sres').textContent = 'Finding the room\'s lines...';
+  const p = await fileCanvas(f);
+  const blob = await new Promise(r => p.c.toBlob(r, 'image/jpeg', 0.92));
+  try {
+    const j = await api('/api/scene' + (p.focal ? '?focal=' + p.focal.toFixed(1) : ''), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+    Object.assign(S3, {img: p.c, id: j.photo_id, w: j.w, h: j.h, lines: j.lines, pending: [], ref: null, lengths: [], heights: [], boxes: [], mode: 'ref'});
+    const c = $('scv'); c.width = p.c.width; c.height = p.c.height;
+    $('sstage').style.display = 'block';
+    $('sres').textContent = 'Lines found: red and blue run level, green upright. Lens ' + Math.round(j.focal) + ' px (' + (j.focal_from === 'lines' ? 'from the lines' : j.focal_from === 'given' ? 'from the photo' : 'a phone\'s usual') + ').';
+    sList(); sDraw();
+  } catch (err) { $('sres').textContent = err.message; }
+});
+$('scv').addEventListener('pointerdown', (ev) => {
+  if (!S3.img) return;
+  const r = $('scv').getBoundingClientRect(), k = S3.w / r.width;
+  S3.pending.push([(ev.clientX - r.left) * k, (ev.clientY - r.top) * k]);
+  if (S3.pending.length === NEED[S3.mode]) {
+    const p = S3.pending;
+    if (S3.mode === 'ref') {
+      const mm = Number($('spreset').value || $('smm').value);
+      S3.ref = {a: p[0], b: p[1], mm: mm};
+    } else if (S3.mode === 'length') S3.lengths.push({name: 'Length ' + (S3.lengths.length + 1), a: p[0], b: p[1]});
+    else if (S3.mode === 'height') S3.heights.push({name: 'Height ' + (S3.heights.length + 1), base: p[0], top: p[1]});
+    else S3.boxes.push({name: 'Box ' + (S3.boxes.length + 1), fl: p[0], fr: p[1], br: p[2], top: p[3]});
+    S3.pending = [];
+  }
+  sList(); sDraw();
+});
+$('scalc').addEventListener('click', async () => {
+  const body = {photo_id: S3.id, reference: S3.ref, lengths: S3.lengths, heights: S3.heights, boxes: S3.boxes};
+  // the first two lengths are the surface's length and depth, for how many boxes fit on it
+  if (S3.lengths.length >= 2) body.surface = {length: S3.lengths[0].name, depth: S3.lengths[1].name};
+  try {
+    const j = await api('/api/scene/measure', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const mm = (v) => Math.round(v) + ' mm (' + (v / 25.4).toFixed(1) + ' in)';
+    let html = '';
+    for (const l of j.lengths) html += '<div>' + esc(l.name) + ': ' + mm(l.mm) + '</div>';
+    for (const h of j.heights) html += '<div>' + esc(h.name) + ': ' + mm(h.mm) + '</div>';
+    for (const b of j.boxes) {
+      html += '<div style="margin-top:8px"><b>' + esc(b.name) + '</b>: ' + mm(b.width_mm) + ' wide, ' + mm(b.depth_mm) + ' deep, ' + mm(b.height_mm) + ' high; holds ' + b.volume_l.toFixed(1) + ' l' +
+        (b.fit !== undefined ? '; ' + b.fit + ' of it fit the surface (' + b.surface_area_m2.toFixed(2) + ' m2)' : '') +
+        '<br><a href="' + b.model + '">3D model (.glb)</a><img src="' + b.preview + '" style="width:100%;margin-top:6px;border-radius:8px;background:#1b1d22"></div>';
+    }
+    $('sres').innerHTML = html;
+  } catch (err) { $('sres').textContent = err.message; }
+});
 </script>
 </body></html>

@@ -13,6 +13,12 @@
 //                               -> the bin's size, saved; then its fill
 //   POST /api/frame?bin=B&focal=F  body: a small frame of the live camera -> {ready, advice, quality, marker,
 //                               opening}: whether to take the photo now, and what to tell the person if not
+//   POST /api/scene?focal=F        body: any photo -> {photo_id, w, h, focal, focal_from, lines}: its camera from its
+//                               own straight lines (no marker needed), for measuring things in it
+//   POST /api/scene/measure        {photo_id, reference: {a, b, mm}, lengths: [{name, a, b}], heights: [{name, base,
+//                               top}], boxes: [{name, fl, fr, br, top}], surface: {length, depth} (names of two
+//                               lengths)} -> each in mm, each box's volume, and how many of each box fit the surface
+//   GET  /api/scene/model.glb?photo_id=P&box=N, /api/scene/model.png?...  a measured box as a 3D model / its preview
 //   POST /api/check?bin=B&focal=F  body: a photo of B's front: what is in it against its empty photo, and the ERP's
 //                               fill -> {changed, compared, erp_fill, verdict}
 //   POST /api/dims              {bin, width_mm, depth_mm, height_mm}: a size entered by hand
@@ -20,6 +26,7 @@
 // Sizes and photos are kept in ASQL (bin_dims, bin_photos); fill is the bin_fill Thing's (lib/bins.gr).
 
 import { q, bin_cfg, setting } from "lib/db.gr"
+import { measure_camera, measure_scale, measure_length, measure_height, measure_box, box_model, glb_preview } from "lib/measure.gr"
 import { bins_install, bins_save, bins_board, bins_contents, bins_room, bins_marker_png, bins_geometry, bins_occupancy, bins_verdict, bins_frame } from "lib/bins.gr"
 
 let PAGE = app_program("page.html")
@@ -47,6 +54,74 @@ fn bin_name(v) {
 }
 
 fn photo_id() { return time_ms() * 1000 + rand(0, 999) }
+
+// ---- measuring a scene -----------------------------------------------------------------------------------------
+
+let scenes = {}   // photo_id -> the last measuring's boxes (their models made on asking)
+
+fn scene_load(photo_id) {
+  let rows = q("SELECT image, marker FROM bin_photos WHERE photo_id = ? AND bin = '(scene)'", [photo_id])
+  if len(rows) == 0 { error("no scene photo " + str(photo_id) + ": upload it first") }
+  let cam = json_parse(rows[0].marker)
+  return {"photo": bytes(rows[0].image), "cam": cam}
+}
+
+fn inches(mm) { return round(mm / 25.4e0 * 10.0e0) / 10.0e0 }
+// a point or a length from the request as binary floating point (JSON's 255.6 reads as an exact decimal, which the
+// geometry's long products would overflow)
+fn fp(p) { return [p[0] * 1.0e0, p[1] * 1.0e0] }
+
+fn scene_measure(j) {
+  let sc = scene_load(j.photo_id)
+  let cam = sc.cam
+  let ref = j.reference
+  if ref == nil or ref.mm == nil or to_number(ref.mm, 0) <= 0 { error("a reference is needed: two points a known distance apart on the same surface, and that distance") }
+  let s = measure_scale(cam, fp(ref.a), fp(ref.b), to_number(ref.mm) * 1.0e0)
+  let lengths = []
+  let by_name = {}
+  for l in get(j, "lengths", []) {
+    let mm = measure_length(cam, s, fp(l.a), fp(l.b))
+    by_name[l.name] = mm
+    push(lengths, {"name": l.name, "mm": mm, "in": inches(mm)})
+  }
+  let heights = []
+  for h in get(j, "heights", []) {
+    let mm = measure_height(cam, s, fp(h.base), fp(h.top))
+    push(heights, {"name": h.name, "mm": mm, "in": inches(mm)})
+  }
+  let boxes = []
+  let models = {}
+  for b in get(j, "boxes", []) {
+    let m = measure_box(cam, s, fp(b.fl), fp(b.fr), fp(b.br), fp(b.top))
+    models[b.name] = m
+    let rec = {"name": b.name, "width_mm": m.width_mm, "depth_mm": m.depth_mm, "height_mm": m.height_mm, "volume_l": m.volume_l,
+               "inches": [inches(m.width_mm), inches(m.depth_mm), inches(m.height_mm)],
+               "model": format("/api/scene/model.glb?photo_id={}&box={}", j.photo_id, url_encode(b.name)),
+               "preview": format("/api/scene/model.png?photo_id={}&box={}", j.photo_id, url_encode(b.name))}
+    // how many of it stand on the surface, side by side (either way round)
+    let sf = get(j, "surface", nil)
+    if sf != nil and get(by_name, sf.length, nil) != nil and get(by_name, sf.depth, nil) != nil {
+      let L = by_name[sf.length]
+      let D = by_name[sf.depth]
+      rec.fit = max(floor(L / m.width_mm) * floor(D / m.depth_mm), floor(L / m.depth_mm) * floor(D / m.width_mm))
+      rec.surface_area_m2 = L * D / 1000000.0e0
+    }
+    push(boxes, rec)
+  }
+  scenes[str(j.photo_id)] = {"boxes": models, "cam": cam}
+  return {"json": {"scale_mm_per_unit": s, "focal": cam.focal, "focal_from": cam.focal_from, "lengths": lengths, "heights": heights, "boxes": boxes}}
+}
+
+fn scene_model(qp) {
+  let sc = get(scenes, str(get(qp, "photo_id", "")), nil)
+  if sc == nil { error("measure the scene first") }
+  let name = get(qp, "box", "")
+  let b = get(sc.boxes, name, nil)
+  if b == nil { error("no box named " + name) }
+  let photo = scene_load(to_number(qp.photo_id))
+  let m = box_model(image_decode(photo.photo), sc.cam, b)
+  return {"glb": m.glb, "name": name}
+}
 
 serve_routes({
   "GET /": fn (req) { return res_html(PAGE) },
@@ -126,6 +201,40 @@ serve_routes({
     }
     let f = get(req.query_params, "focal", "")
     return res_json(bins_frame(bytes(req.body), dims, bin_cfg(), f == "" ? nil : to_number(f) * 1.0))
+  }),
+  "POST /api/scene": api(fn (req) {
+    let photo = bytes(req.body)
+    let cv = image_decode(photo)
+    let f = get(req.query_params, "focal", "")
+    let lines = image_lines(cv)
+    let v = vanishing_points(lines, canvas_width(cv), canvas_height(cv), f == "" ? {} : {"focal": to_number(f) * 1.0})
+    if v.rot == nil { error("this photo shows too few straight upright and level lines to tell how the phone was held: take it with a wall corner, a counter or shelf edge, or a door frame in view") }
+    let id = photo_id()
+    let cam = {"focal": v.focal, "focal_from": v.focal_from, "rot": v.rot, "cx": canvas_width(cv) / 2.0, "cy": canvas_height(cv) / 2.0}
+    q("INSERT INTO bin_photos (photo_id, loccode, bin, taken_at, image, marker) VALUES (?, ?, ?, NOW(), ?, ?)",
+      [id, bin_cfg().loccode, "(scene)", photo, json_stringify(cam)])
+    // each line with the direction it runs (0 the strongest level one, 1 the other level, 2 upright, -1 none)
+    let group = {}
+    for k in 0..len(v.points) {
+      let g = k == v.vertical ? 2 : (k == v.horizontal ? 0 : 1)
+      for i in v.points[k].lines { group[str(i)] = g }
+    }
+    let out = []
+    for i in 0..len(lines) { let l = lines[i] push(out, [l[0], l[1], l[2], l[3], get(group, str(i), -1)]) }
+    return res_json({"photo_id": id, "w": canvas_width(cv), "h": canvas_height(cv), "focal": v.focal, "focal_from": v.focal_from, "lines": out})
+  }),
+  "POST /api/scene/measure": api(fn (req) {
+    let j = req.json
+    let r = scene_measure(j)
+    return res_json(r.json)
+  }),
+  "GET /api/scene/model.glb": api(fn (req) {
+    let m = scene_model(req.query_params)
+    return {"status": 200, "content_type": "model/gltf-binary", "headers": {"Content-Disposition": "attachment; filename=\"" + m.name + ".glb\""}, "body": m.glb}
+  }),
+  "GET /api/scene/model.png": api(fn (req) {
+    let m = scene_model(req.query_params)
+    return {"status": 200, "content_type": "image/png", "body": canvas_to_png(glb_preview(m.glb, 220))}
   }),
   "POST /api/check": api(fn (req) {
     let b = bin_name(get(req.query_params, "bin", ""))

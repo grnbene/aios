@@ -33,7 +33,7 @@ fn measure_camera(cv, opts) {
   if get(o, "default_focal", nil) != nil { vo.default_focal = o.default_focal * 1.0 }
   let v = vanishing_points(image_lines(cv), w, h, vo)
   if v.rot == nil { error("the photo shows too few straight upright and level lines to tell how the phone was held: take it with a wall corner, a shelf edge or a door frame in view") }
-  return {"focal": v.focal, "focal_from": v.focal_from, "rot": v.rot, "cx": w / 2.0, "cy": h / 2.0, "w": w, "h": h}
+  return {"focal": v.focal, "focal_from": v.focal_from, "rot": v.rot, "cx": w / 2.0e0, "cy": h / 2.0e0, "w": w, "h": h}
 }
 
 fn up_of(cam) { return [cam.rot[2], cam.rot[5], cam.rot[8]] }
@@ -93,7 +93,7 @@ fn measure_box(cam, scale, fl, fr, br, top) {
   let w_mm = width * scale
   let d_mm = dd * scale
   let h_mm = hgt * scale
-  return {"width_mm": w_mm, "depth_mm": d_mm, "height_mm": h_mm, "volume_l": w_mm * d_mm * h_mm / 1000000.0,
+  return {"width_mm": w_mm, "depth_mm": d_mm, "height_mm": h_mm, "volume_l": w_mm * d_mm * h_mm / 1000000.0e0,
           "corners": corners, "scale": scale, "axes": {"x": xh, "z": zh, "y": u}}
 }
 
@@ -239,4 +239,49 @@ fn glb_quads(quads) {
   bytes_set(ch2, 0, "u32le", len(bin))
   bytes_set(ch2, 4, "u32le", 0x004E4942)
   return bytes_concat([head, ch1, jb, ch2, bin])
+}
+
+// A glb of textured quads (glb_quads') drawn from four sides, true colour, side by side: a canvas size*4 x size.
+// Read back through gltf_read, so what is drawn is what the file holds.
+fn glb_preview(glb, size) {
+  let g = gltf_read(glb)
+  let t = r3d_target(size, size)
+  r3d_options(t, {"y_scale": 1.0, "bilinear": true, "mipmaps": true})
+  let prims = []
+  let lo = [1e9, 1e9, 1e9]
+  let hi = [-1e9, -1e9, -1e9]
+  let mats = g.json.materials
+  let k = 0
+  for p in g.json.meshes[0].primitives {
+    let pos = gltf_accessor(g.model, p.attributes.POSITION)
+    for i in 0..pos.count { for c in 0..3 { let v = bytes_get(pos.data, (i * 3 + c) * 4, "f32le") lo[c] = min(lo[c], v) hi[c] = max(hi[c], v) } }
+    let tex = mats[p.material].pbrMetallicRoughness.baseColorTexture.index
+    let img = gltf_image(g.model, g.json.textures[tex].source)
+    r3d_texture_rgba(t, 500 + k, img.w, img.h, img.rgba)
+    push(prims, {"node": 0, "skinned": false, "tex": 500 + k, "color": [1.0, 1.0, 1.0, 1.0], "positions": pos.data,
+                 "normals": gltf_accessor(g.model, p.attributes.NORMAL).data, "uvs": gltf_accessor(g.model, p.attributes.TEXCOORD_0).data,
+                 "indices": gltf_accessor(g.model, p.indices).data})
+    k = k + 1
+  }
+  // centred over its footprint, standing at 0
+  let mid = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0]
+  r3d_model(t, 1, {"nodes": [{"parent": -1, "t": [0.0 - mid[0], 0.0 - lo[1], 0.0 - mid[2]], "r": [0.0, 0.0, 0.0, 1.0], "s": [1.0, 1.0, 1.0]}],
+                   "joints": [], "inv_bind": bytes(0), "prims": prims, "up": "y", "scale": 1000.0})
+  let ext = max(hi[0] - lo[0], max(hi[1] - lo[1], hi[2] - lo[2]))
+  let strip = canvas_create(size * 4, size)
+  canvas_set_fill_color(strip, "#1b1d22")
+  canvas_fill_rect(strip, 0, 0, size * 4, size)
+  // drawn in millimetres (the renderer's units), the camera level at mid-height, the model filling most of the view
+  let fov = 30.0
+  let D = ext * 1000.0 * 1.25 / tan(fov * PI / 360.0)
+  for v in 0..4 {
+    r3d_clear(t, 0xFF1B1D22)
+    let thing = {"model": 1, "anim": -1, "time": 0.0, "hold": true, "scale": 1.0, "x": D, "y": 0.0, "z": 0.0,
+                 "angle": 135.0 + 90.0 * v, "light": 255, "flags": 0}
+    r3d_draw_tex(t, [], fov, {"x": 0.0, "y": 0.0, "z": (hi[1] - lo[1]) * 500.0, "angle": 0.0, "pitch": 0.0}, [thing])
+    let view = canvas_create(size, size)
+    canvas_set_pixels(view, r3d_pixels(t))
+    canvas_draw_image(strip, view, v * size, 0)
+  }
+  return strip
 }
