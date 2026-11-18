@@ -376,6 +376,17 @@ function sDraw() {
   for (const h of S3.heights) { seg(h.base, h.top, '#2bd0ff'); }
   for (const b of S3.boxes) { seg(b.fl, b.fr, '#c06bff'); seg(b.fr, b.br, '#c06bff'); seg(b.fl, b.top, '#c06bff'); }
   for (const p of S3.pending) dot(p, '#ffffff');
+  for (const tp of (S3.tapes || [])) {
+    for (let i = 0; i < tp.length; i++) {
+      const p = tp[i], q = tp[Math.min(i + 1, tp.length - 1)], r = tp[Math.max(i - 1, 0)];
+      // across the tape: square to its run here
+      let dx = q[0] - r[0], dy = q[1] - r[1]; const n = Math.hypot(dx, dy) || 1; dx /= n; dy /= n;
+      const big = i % 6 === 0, L = (big ? 14 : 7) * c.width / 800;
+      g.strokeStyle = '#fff200'; g.lineWidth = Math.max(1.5, c.width / 700);
+      g.beginPath(); g.moveTo((p[0] - dy * L) * k, (p[1] + dx * L) * k); g.lineTo((p[0] + dy * L) * k, (p[1] - dx * L) * k); g.stroke();
+      if (big && i > 0) { g.fillStyle = '#fff200'; g.font = Math.round(c.width / 45) + 'px system-ui'; g.fillText(i + '"', (p[0] + dy * L * 1.6) * k, (p[1] - dx * L * 1.6) * k); }
+    }
+  }
 }
 function sList() {
   const items = [];
@@ -442,6 +453,9 @@ $('scalc').addEventListener('click', async () => {
         '<br><a href="' + b.model + '">3D model (.glb)</a><img src="' + b.preview + '" style="width:100%;margin-top:6px;border-radius:8px;background:#1b1d22"></div>';
     }
     $('sres').innerHTML = html;
+    // the tape measures: a tick every inch, a long one and its number every 6
+    S3.tapes = j.lengths.concat(j.heights).map(t => t.tape);
+    sDraw();
   } catch (err) { $('sres').textContent = err.message; }
 });
 </script>

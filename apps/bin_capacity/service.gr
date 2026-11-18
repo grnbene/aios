@@ -26,7 +26,7 @@
 // Sizes and photos are kept in ASQL (bin_dims, bin_photos); fill is the bin_fill Thing's (lib/bins.gr).
 
 import { q, bin_cfg, setting } from "lib/db.gr"
-import { measure_camera, measure_scale, measure_length, measure_height, measure_box, box_model, glb_preview } from "lib/measure.gr"
+import { measure_camera, measure_scale, measure_length, measure_height, measure_box, box_model, glb_preview, on_surface, project_pt, up_of } from "lib/measure.gr"
 import { bins_install, bins_save, bins_board, bins_contents, bins_room, bins_marker_png, bins_geometry, bins_occupancy, bins_verdict, bins_frame } from "lib/bins.gr"
 
 let PAGE = app_program("page.html")
@@ -71,6 +71,18 @@ fn inches(mm) { return round(mm / 25.4e0 * 10.0e0) / 10.0e0 }
 // geometry's long products would overflow)
 fn fp(p) { return [p[0] * 1.0e0, p[1] * 1.0e0] }
 
+// a tape measure along a measured line: where each inch falls in the photo (perspective and all), from A toward B
+// (3D points in the camera's frame, `len_mm` apart)
+fn tape(cam, A, B, len_mm) {
+  let ticks = []
+  let n = floor(len_mm / 25.4e0)
+  for k in 0..(n + 1) {
+    let f = k * 25.4e0 / len_mm
+    push(ticks, project_pt(cam, [A[0] + (B[0] - A[0]) * f, A[1] + (B[1] - A[1]) * f, A[2] + (B[2] - A[2]) * f]))
+  }
+  return ticks
+}
+
 fn scene_measure(j) {
   let sc = scene_load(j.photo_id)
   let cam = sc.cam
@@ -82,12 +94,14 @@ fn scene_measure(j) {
   for l in get(j, "lengths", []) {
     let mm = measure_length(cam, s, fp(l.a), fp(l.b))
     by_name[l.name] = mm
-    push(lengths, {"name": l.name, "mm": mm, "in": inches(mm)})
+    push(lengths, {"name": l.name, "mm": mm, "in": inches(mm), "tape": tape(cam, on_surface(cam, fp(l.a)), on_surface(cam, fp(l.b)), mm)})
   }
   let heights = []
   for h in get(j, "heights", []) {
     let mm = measure_height(cam, s, fp(h.base), fp(h.top))
-    push(heights, {"name": h.name, "mm": mm, "in": inches(mm)})
+    let X = on_surface(cam, fp(h.base))
+    let T = [X[0] + up_of(cam)[0] * mm / s, X[1] + up_of(cam)[1] * mm / s, X[2] + up_of(cam)[2] * mm / s]
+    push(heights, {"name": h.name, "mm": mm, "in": inches(mm), "tape": tape(cam, X, T, mm)})
   }
   let boxes = []
   let models = {}
