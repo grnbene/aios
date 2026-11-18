@@ -167,32 +167,25 @@ fn delete_model(name) {
   return id
 }
 
-# One model of the cut-out subject at `rows` mask rows tall, written as model `name`. Returns its id and size.
-fn write_carved(name, cut, rows, opts) {
+# A rigid model written as `name`: its parts (prims: model_prim's columns, each {vertex_count, positions, normals,
+# indices, and uvs with texture 0 or colors}), a texture (PNG bytes, or nil), and the five clips, each sample lifted
+# so the body (pts: a sample of its points, x y z flat) rests on the floor. Returns its id.
+fn write_model(name, source, texture, prims, pts) {
   let id = delete_model(name)
-  let h = rows
-  let w = max(3, round(cut.w * rows / cut.h))
-  let small = image_resample(cut.canvas, w, h)
-  let mesh = mesh_inflate(alpha_mask(small), w, h, {"thickness": get(opts, "thickness", 0.8), "smooth": get(opts, "smooth", 2)})
-  # the texture: the cut-out at up to 512 pixels tall (the mesh's uvs are over the same crop)
-  let th = min(512, cut.h)
-  let tex = image_resample(cut.canvas, max(1, round(cut.w * th / cut.h)), th)
-  cv_insert("model", "model_id, name, source, up", [id, name, "carved from a photo (lib/carve.gr)", "z"])
+  cv_insert("model", "model_id, name, source, up", [id, name, source, "z"])
   cv_insert("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
             [id, 0, nil, "root", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
   cv_insert("model_node", "model_id, node_id, parent, name, tx, ty, tz, rx, ry, rz, rw, sx, sy, sz",
             [id, 1, 0, "body", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
-  cv_insert("model_texture", "model_id, texture_id, image", [id, 0, bytes(canvas_to_png(tex))])
-  # the front in the photo's own colours, the back (the photo seen through) a shade darker
-  let halves = [[mesh.front, 1.0], [mesh.back, 0.72]]
-  for pi in range(0, 2) {
-    let p = halves[pi][0]
-    let k = halves[pi][1]
-    cv_insert("model_prim", "model_id, prim_id, node_id, skinned, texture_id, cr, cg, cb, ca, vertex_count, positions, normals, uvs, indices",
-              [id, pi, 1, false, 0, k, k, k, 1.0, p.vertex_count, p.positions, p.normals, p.uvs, p.indices])
+  if texture != nil { cv_insert("model_texture", "model_id, texture_id, image", [id, 0, texture]) }
+  for pi in range(0, len(prims)) {
+    let p = prims[pi]
+    let k = get(p, "shade", 1.0)
+    cv_insert("model_prim", "model_id, prim_id, node_id, skinned, texture_id, cr, cg, cb, ca, vertex_count, positions, normals, uvs, indices, colors",
+              [id, pi, 1, false, get(p, "uvs", nil) == nil ? nil : 0, k, k, k, 1.0, p.vertex_count, p.positions, p.normals,
+               get(p, "uvs", nil), p.indices, get(p, "colors", nil)])
   }
   let clips = carve_clips()
-  let pts = sample_points(mesh.back, max(1, idiv(mesh.back.vertex_count, 3000)), sample_points(mesh.front, max(1, idiv(mesh.front.vertex_count, 3000)), []))
   let ai = 0
   for cname in ["idle", "walk", "attack", "pain", "die"] {
     let keys = ground_clip(clips[cname], pts, 1.0e0 / 30.0e0)
@@ -213,6 +206,25 @@ fn write_carved(name, cut, rows, opts) {
     cv_insert("model_anim", "model_id, anim_id, name, duration", [id, ai, cname, keys[len(keys) - 1][0] * 1.0e0])
     ai = ai + 1
   }
+  return id
+}
+
+# One model of the cut-out subject at `rows` mask rows tall, written as model `name`. Returns its id and size.
+fn write_carved(name, cut, rows, opts) {
+  let h = rows
+  let w = max(3, round(cut.w * rows / cut.h))
+  let small = image_resample(cut.canvas, w, h)
+  let mesh = mesh_inflate(alpha_mask(small), w, h, {"thickness": get(opts, "thickness", 0.8), "smooth": get(opts, "smooth", 2)})
+  # the texture: the cut-out at up to 512 pixels tall (the mesh's uvs are over the same crop)
+  let th = min(512, cut.h)
+  let tex = image_resample(cut.canvas, max(1, round(cut.w * th / cut.h)), th)
+  # the front in the photo's own colours, the back (the photo seen through) a shade darker
+  let front = mesh.front
+  front.shade = 1.0
+  let back = mesh.back
+  back.shade = 0.72
+  let pts = sample_points(mesh.back, max(1, idiv(mesh.back.vertex_count, 3000)), sample_points(mesh.front, max(1, idiv(mesh.front.vertex_count, 3000)), []))
+  let id = write_model(name, "carved from a photo (lib/carve.gr)", bytes(canvas_to_png(tex)), [front, back], pts)
   return {"model": id, "tris": mesh.tris, "depth": mesh.depth, "height": mesh.height}
 }
 
@@ -351,6 +363,143 @@ fn carve_sprites(sprite, m, opts) {
   }
   sql("FLUSH TABLES")
   return {"lumps": len(lumps), "ms": clock() - t0}
+}
+
+# ---- many photos: the thing rebuilt in 3D ----------------------------------------------------------------------
+#
+# The thing stands in the middle of the mat (carve_mat_png: A4 with coded markers 0..3 at its corners) and is
+# photographed from all round - 8 to 20 photos, from low and from high. Each photo's camera comes from the markers it
+# shows (the lens's focal length is the photos' median, then each pose again with it), its silhouette from a cut-out
+# where every pixel whose ray misses the stage above the mat is background, and the solid from carving a grid over
+# the stage by every silhouette (visual_hull): true depth and shape all round, coloured from the photos. A hollow no
+# photo sees into (the inside of a cup) is filled: silhouettes cannot show it.
+
+let MAT_MARKER_MM = 50.0
+let MAT_MARKERS = [{"id": 0, "x": -100.0, "y": 92.0}, {"id": 1, "x": 50.0, "y": 92.0}, {"id": 2, "x": 50.0, "y": -142.0}, {"id": 3, "x": -100.0, "y": -142.0}]
+
+fn mat_corners(m) {
+  let s = MAT_MARKER_MM
+  return [[m.x, m.y + s], [m.x + s, m.y + s], [m.x + s, m.y], [m.x, m.y]]
+}
+
+# The mat to print: A4 at 300 dots an inch (print at 100%; the markers are 50 mm), the stage marked in its middle.
+fn carve_mat_png() {
+  let dpmm = 300.0 / 25.4
+  let W = round(210.0 * dpmm)
+  let H = round(297.0 * dpmm)
+  let cv = canvas_create(W, H)
+  canvas_set_fill_color(cv, "#ffffff")
+  canvas_fill_rect(cv, 0, 0, W, H)
+  let side = round(MAT_MARKER_MM * dpmm)
+  for m in MAT_MARKERS {
+    let img = marker_image(m.id, side)
+    let margin = idiv(canvas_width(img) - side, 2)
+    # the page's y runs down from its top edge (148.5 mm above the middle)
+    canvas_draw_image(cv, img, round((m.x + 105.0) * dpmm) - margin, round((148.5 - m.y - MAT_MARKER_MM) * dpmm) - margin)
+  }
+  canvas_set_stroke_color(cv, "#9a9a9a")
+  canvas_set_line_width(cv, 4)
+  canvas_stroke_rect(cv, round(15.0 * dpmm), round(63.5 * dpmm), round(180.0 * dpmm), round(170.0 * dpmm))
+  canvas_set_fill_color(cv, "#7a7a7a")
+  canvas_set_font(cv, "ui", 46)
+  canvas_fill_text(cv, "stand the thing inside the box; photograph it from all round, low and high", round(20.0 * dpmm), round(150.0 * dpmm))
+  canvas_fill_text(cv, "print at 100%: each black square is 50 mm", round(20.0 * dpmm), round(158.0 * dpmm))
+  return canvas_to_png(cv)
+}
+
+# The cameras of a set of photos (bytes each): [{cam, canvas, markers} | nil a photo whose markers are too few].
+fn mat_cameras(photos) {
+  let shots = []
+  let fs = []
+  for ph in photos {
+    let cv = image_decode(ph)
+    let wp = []
+    let ip = []
+    for fm in markers_find(cv) {
+      for m in MAT_MARKERS {
+        if m.id == fm.id {
+          let wc = mat_corners(m)
+          for i in 0..4 { push(wp, wc[i]) push(ip, fm.corners[i]) }
+        }
+      }
+    }
+    if len(wp) < 8 { push(shots, nil) continue }
+    let c = camera_pose(wp, ip, canvas_width(cv), canvas_height(cv))
+    push(fs, c.focal)
+    push(shots, {"canvas": cv, "wp": wp, "ip": ip, "markers": len(wp) / 4})
+  }
+  if len(fs) == 0 { return shots }
+  let focal = sort(fs)[idiv(len(fs), 2)]
+  for s in shots {
+    if s == nil { continue }
+    s.cam = camera_pose(s.wp, s.ip, canvas_width(s.canvas), canvas_height(s.canvas), {"focal": focal})
+  }
+  return shots
+}
+
+# The thing on the mat rebuilt: {hull (visual_hull's), far (a coarser one), used, dropped, focal, ms}. opts: height
+# (the stage's, mm; 200), res (160), far_res (48), misses (0).
+fn carve_reconstruct(photos, opts) {
+  let t0 = clock()
+  if opts == nil { opts = {} }
+  let stage = {"min": [-90.0, -85.0, 0.0], "max": [90.0, 85.0, get(opts, "height", 200.0) * 1.0]}
+  let views = []
+  let dropped = 0
+  let focal = 0.0
+  for s in mat_cameras(photos) {
+    if s == nil or s.cam.rms_px > 3.0 { dropped = dropped + 1 continue }
+    focal = s.cam.focal
+    let w = canvas_width(s.canvas)
+    let h = canvas_height(s.canvas)
+    let cut = pcall(image_cutout, s.canvas, {"background_mask": camera_box_mask(s.cam, w, h, stage)})
+    if not cut.ok { dropped = dropped + 1 continue }
+    push(views, {"mask": cut.value.mask, "w": w, "h": h, "camera": s.cam, "image": s.canvas})
+  }
+  if len(views) < 4 { error(format("only {} photos show the mat's markers well enough (4 at least, 8 or more is better; {} dropped)", len(views), dropped)) }
+  let hull = visual_hull(views, stage, {"res": get(opts, "res", 160), "misses": get(opts, "misses", 0)})
+  let far = visual_hull(views, stage, {"res": get(opts, "far_res", 48), "misses": get(opts, "misses", 0)})
+  return {"hull": hull, "far": far, "used": len(views), "dropped": dropped, "focal": focal, "ms": clock() - t0}
+}
+
+# A hull (the mat's frame: x right, y away from the first photo, z up, mm) as a model: turned so its front - the side
+# toward the mat's near edge, where markers 2 and 3 are - faces +x, centred over its footprint, its feet at 0.
+fn hull_prim(h) {
+  let n = h.vertex_count
+  let cx = (h.min[0] + h.max[0]) / 2.0
+  let cy = (h.min[1] + h.max[1]) / 2.0
+  let P = bytes(n * 12)
+  let N = bytes(n * 12)
+  let pts = []
+  let stride = max(1, idiv(n, 4000))
+  for i in 0..n {
+    let x = bytes_get(h.positions, i * 12, "f32le") - cx
+    let y = bytes_get(h.positions, i * 12 + 4, "f32le") - cy
+    let z = bytes_get(h.positions, i * 12 + 8, "f32le") - h.min[2]
+    # (x, y, z) -> (-y, x, z): a quarter turn about z
+    bytes_set(P, i * 12, "f32le", -y)
+    bytes_set(P, i * 12 + 4, "f32le", x)
+    bytes_set(P, i * 12 + 8, "f32le", z)
+    bytes_set(N, i * 12, "f32le", -bytes_get(h.normals, i * 12 + 4, "f32le"))
+    bytes_set(N, i * 12 + 4, "f32le", bytes_get(h.normals, i * 12, "f32le"))
+    bytes_set(N, i * 12 + 8, "f32le", bytes_get(h.normals, i * 12 + 8, "f32le"))
+    if i % stride == 0 { push(pts, -y, x, z) }
+  }
+  return {"prim": {"vertex_count": n, "positions": P, "normals": N, "indices": h.indices, "colors": h.colors}, "pts": pts}
+}
+
+# The photos (bytes each) as model `name` and `name`_far: carve_model's result, rebuilt in 3D.
+fn carve_model_views(name, photos, opts) {
+  let t0 = clock()
+  model_tables()
+  let r = carve_reconstruct(photos, opts)
+  let near = hull_prim(r.hull)
+  let far = hull_prim(r.far)
+  let id = write_model(name, format("rebuilt in 3D from {} photos (lib/carve.gr)", r.used), nil, [near.prim], near.pts)
+  let fid = write_model(name + "_far", format("rebuilt in 3D from {} photos, coarse (lib/carve.gr)", r.used), nil, [far.prim], far.pts)
+  sql("FLUSH TABLES")
+  return {"model": id, "far": fid, "tris": r.hull.tris, "far_tris": r.far.tris, "used": r.used, "dropped": r.dropped,
+          "volume_mm3": r.hull.volume_mm3, "size_mm": [r.hull.max[0] - r.hull.min[0], r.hull.max[1] - r.hull.min[1], r.hull.max[2] - r.hull.min[2]],
+          "focal": r.focal, "ms": clock() - t0}
 }
 
 # ---- previews -----------------------------------------------------------------------------------------------------

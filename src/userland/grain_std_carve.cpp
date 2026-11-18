@@ -600,6 +600,21 @@ Value bi_image_cutout(Vm&, std::vector<Value>& args, std::string& error) {
     }
   }
 
+  // opts.background_mask: bytes at the picture's size, nonzero where it is certainly background (a cell is, when
+  // most of what it covers is)
+  if (o) if (const Value* bm = o->find("background_mask"); bm && bm->type != Type::Nil) {
+    if (bm->type != Type::Bytes || bm->bytes_data().size() != (size_t)W * H) { error = "image_cutout(): background_mask wants bytes, one a pixel of the picture"; return Value::nil(); }
+    const auto& B = bm->bytes_data();
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const int x0 = (int)(x * (double)W / w), x1 = std::max(x0 + 1, (int)((x + 1) * (double)W / w));
+        const int y0 = (int)(y * (double)H / h), y1 = std::max(y0 + 1, (int)((y + 1) * (double)H / h));
+        int on = 0, all = 0;
+        for (int yy = y0; yy < std::min<int>(y1, H); ++yy)
+          for (int xx = x0; xx < std::min<int>(x1, W); ++xx) { on += B[(size_t)yy * W + xx] != 0; ++all; }
+        if (on * 2 > all) sure_bg[(size_t)y * w + x] = 1;
+      }
+  }
   // whether anything stands out at all: how many cells are far (3 spreads) from every colour of the border
   const std::vector<Cluster> border_colours = kmeans(border, 5);
   {
@@ -1906,6 +1921,394 @@ Value bi_camera_ray(Vm&, std::vector<Value>& args, std::string& error) {
   return Value::object(Type::Map, m);
 }
 
+// ---- reconstruction: silhouettes carved into a solid ----------------------------------------------------------
+
+struct Box3 { double lo[3], hi[3]; };
+bool read_box(const Value& v, Box3& b, std::string& error, const char* who) {
+  MapObj* m = v.type == Type::Map ? static_cast<MapObj*>(v.obj.get()) : nullptr;
+  const Value* lo = m ? m->find("min") : nullptr;
+  const Value* hi = m ? m->find("max") : nullptr;
+  if (!lo || !hi || lo->type != Type::List || hi->type != Type::List || lo->list_items().size() != 3 || hi->list_items().size() != 3) {
+    error = std::string(who) + "() wants a box: {min: [x, y, z], max: [x, y, z]}";
+    return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    b.lo[i] = lo->list_items()[(size_t)i].as_double(); b.hi[i] = hi->list_items()[(size_t)i].as_double();
+    if (!(b.hi[i] > b.lo[i])) { error = std::string(who) + "(): the box's max must be past its min on every axis"; return false; }
+  }
+  return true;
+}
+
+// camera_box_mask(camera, w, h, box) -> bytes: 255 where the pixel's ray misses the box (certainly not what stands
+// in it), 0 where it passes through - image_cutout's background_mask for a photo of something inside the box
+Value bi_camera_box_mask(Vm&, std::vector<Value>& args, std::string& error) {
+  Cam c;
+  if (!read_cam(args[0], c, error, "camera_box_mask")) return Value::nil();
+  if (!want_number(args[1], error, "camera_box_mask") || !want_number(args[2], error, "camera_box_mask")) return Value::nil();
+  const int64_t w = args[1].as_int(), h = args[2].as_int();
+  if (w < 1 || h < 1 || w > 16384 || h > 16384) { error = "camera_box_mask(): the size is 1..16384 each way"; return Value::nil(); }
+  Box3 b;
+  if (!read_box(args[3], b, error, "camera_box_mask")) return Value::nil();
+  double from[3];
+  for (int i = 0; i < 3; ++i) from[i] = -(c.R[i] * c.t[0] + c.R[3 + i] * c.t[1] + c.R[6 + i] * c.t[2]);
+  std::vector<uint8_t> out((size_t)w * h, 0);
+  for (int64_t y = 0; y < h; ++y)
+    for (int64_t x = 0; x < w; ++x) {
+      const double d[3] = {(x + 0.5 - c.cx) / c.f, (y + 0.5 - c.cy) / c.f, 1};
+      double dir[3];
+      for (int i = 0; i < 3; ++i) dir[i] = c.R[i] * d[0] + c.R[3 + i] * d[1] + c.R[6 + i] * d[2];
+      // the slab test
+      double t0 = 0, t1 = 1e30;
+      for (int i = 0; i < 3 && t0 <= t1; ++i) {
+        if (std::fabs(dir[i]) < 1e-15) { if (from[i] < b.lo[i] || from[i] > b.hi[i]) t0 = 2e30; continue; }
+        double a = (b.lo[i] - from[i]) / dir[i], z = (b.hi[i] - from[i]) / dir[i];
+        if (a > z) std::swap(a, z);
+        t0 = std::max(t0, a); t1 = std::min(t1, z);
+      }
+      if (t0 > t1) out[(size_t)y * w + x] = 255;
+    }
+  return Value::bytes(std::move(out));
+}
+
+// visual_hull(views, box[, opts]) -> {positions, normals, colors, indices, vertex_count, tris, volume_mm3, voxels,
+//   cell_mm, min, max}
+//   views: [{mask (bytes, inside where >= 128), w, h, camera, image (a canvas, optional: for colour)}]; box: where
+//   the thing is, {min, max} in world units. Every cell of a grid over the box that some photo shows outside its
+//   silhouette is cut away (opts.misses of them forgiven, for a bad cut); a cell no more than half the photos see
+//   at all is cut too; what is left is the largest piece. Its surface (surface nets over the occupancy, smoothed)
+//   is a closed mesh in world units; each vertex is coloured from the photos that see it (a depth test against the
+//   mesh), weighted toward the one facing it squarest; one no photo sees (its underside) takes its neighbours'.
+//   coloured: how many vertices a photo saw. opts: {res (cells along the box's longest side; 160),
+//   misses (0), smooth (passes; 1)}.
+Value bi_visual_hull(Vm&, std::vector<Value>& args, std::string& error) {
+  if (args[0].type != Type::List || args[0].list_items().empty()) { error = "visual_hull() wants a list of views"; return Value::nil(); }
+  Box3 box;
+  if (!read_box(args[1], box, error, "visual_hull")) return Value::nil();
+  MapObj* o = opts_map(args, 2);
+  const int res = (int)std::clamp(opt_num(o, "res", 160), 16.0, 512.0);
+  const int misses = (int)std::clamp(opt_num(o, "misses", 0), 0.0, 100.0);
+  const int smooth = (int)std::clamp(opt_num(o, "smooth", 1), 0.0, 8.0);
+  struct View { Cam cam; int w = 0, h = 0; const std::vector<uint8_t>* mask = nullptr; uint32_t iw = 0, ih = 0; const std::vector<uint32_t>* img = nullptr; };
+  std::vector<View> vs;
+  for (const Value& v : args[0].list_items()) {
+    MapObj* m = v.type == Type::Map ? static_cast<MapObj*>(v.obj.get()) : nullptr;
+    if (!m) { error = "visual_hull(): each view is a map {mask, w, h, camera, image}"; return Value::nil(); }
+    View vw;
+    const Value* cam = m->find("camera");
+    if (!cam || !read_cam(*cam, vw.cam, error, "visual_hull")) return Value::nil();
+    const Value* wv = m->find("w"); const Value* hv = m->find("h"); const Value* mk = m->find("mask");
+    if (!wv || !hv || !mk || !wv->is_number() || !hv->is_number() || mk->type != Type::Bytes) { error = "visual_hull(): each view needs mask (bytes), w and h"; return Value::nil(); }
+    vw.w = (int)wv->as_int(); vw.h = (int)hv->as_int(); vw.mask = &mk->bytes_data();
+    if ((size_t)vw.w * vw.h != vw.mask->size()) { error = "visual_hull(): a view's mask is not w*h bytes"; return Value::nil(); }
+    if (const Value* im = m->find("image"); im && im->type != Type::Nil) {
+      if (!canvas_pixels(*im, &vw.iw, &vw.ih, &vw.img, error, "visual_hull")) return Value::nil();
+    }
+    vs.push_back(vw);
+  }
+  // the grid: cells of side s, one empty cell of padding all round
+  double ext = 0;
+  for (int i = 0; i < 3; ++i) ext = std::max(ext, box.hi[i] - box.lo[i]);
+  const double s = ext / res;
+  int n[3];
+  for (int i = 0; i < 3; ++i) n[i] = std::max(1, (int)std::ceil((box.hi[i] - box.lo[i]) / s)) + 2;
+  const int NX = n[0], NY = n[1], NZ = n[2];
+  const size_t N = (size_t)NX * NY * NZ;
+  auto at = [&](int x, int y, int z) { return ((size_t)z * NY + y) * NX + x; };
+  auto centre = [&](int x, int y, int z, double* X) { X[0] = box.lo[0] + (x - 0.5) * s; X[1] = box.lo[1] + (y - 0.5) * s; X[2] = box.lo[2] + (z - 0.5) * s; };
+  std::vector<uint8_t> occ(N, 0);
+  const int need_seen = std::max(1, (int)(vs.size() + 1) / 2);
+  for (int z = 1; z < NZ - 1; ++z)
+    for (int y = 1; y < NY - 1; ++y)
+      for (int x = 1; x < NX - 1; ++x) {
+        double X[3];
+        centre(x, y, z, X);
+        int miss = 0, seen = 0;
+        for (const View& v : vs) {
+          P2 q;
+          if (!project(v.cam, X, &q)) continue;
+          const int px = (int)std::floor(q.x), py = (int)std::floor(q.y);
+          if (px < 0 || py < 0 || px >= v.w || py >= v.h) continue;
+          ++seen;
+          if ((*v.mask)[(size_t)py * v.w + px] < 128 && ++miss > misses) break;
+        }
+        if (miss <= misses && seen >= need_seen) occ[at(x, y, z)] = 1;
+      }
+  // the largest piece (six-connected)
+  {
+    std::vector<int> lab(N, -1);
+    std::vector<size_t> sizes;
+    std::vector<size_t> st;
+    for (size_t i = 0; i < N; ++i) {
+      if (!occ[i] || lab[i] >= 0) continue;
+      const int id = (int)sizes.size();
+      size_t cnt = 0;
+      lab[i] = id;
+      st.push_back(i);
+      while (!st.empty()) {
+        const size_t p = st.back();
+        st.pop_back();
+        ++cnt;
+        const int x = (int)(p % NX), y = (int)((p / NX) % NY), z = (int)(p / ((size_t)NX * NY));
+        const int nb[6][3] = {{x - 1, y, z}, {x + 1, y, z}, {x, y - 1, z}, {x, y + 1, z}, {x, y, z - 1}, {x, y, z + 1}};
+        for (const auto& q : nb) {
+          if (q[0] < 0 || q[1] < 0 || q[2] < 0 || q[0] >= NX || q[1] >= NY || q[2] >= NZ) continue;
+          const size_t k = at(q[0], q[1], q[2]);
+          if (occ[k] && lab[k] < 0) { lab[k] = id; st.push_back(k); }
+        }
+      }
+      sizes.push_back(cnt);
+    }
+    if (sizes.empty()) { error = "visual_hull(): the silhouettes leave nothing in the box (are the cameras and the box right?)"; return Value::nil(); }
+    const int big = (int)(std::max_element(sizes.begin(), sizes.end()) - sizes.begin());
+    for (size_t i = 0; i < N; ++i) occ[i] = lab[i] == big;
+  }
+  size_t voxels = 0;
+  for (uint8_t v : occ) voxels += v;
+  // the field: occupancy, box-blurred along each axis
+  std::vector<float> F(N);
+  for (size_t i = 0; i < N; ++i) F[i] = occ[i];
+  for (int pass = 0; pass < smooth; ++pass)
+    for (int axis = 0; axis < 3; ++axis) {
+      std::vector<float> G(F);
+      const int step[3] = {1, NX, NX * NY};
+      for (int z = 1; z < NZ - 1; ++z)
+        for (int y = 1; y < NY - 1; ++y)
+          for (int x = 1; x < NX - 1; ++x) {
+            const size_t i = at(x, y, z);
+            G[i] = (F[i - step[axis]] + F[i] + F[i + step[axis]]) / 3.0f;
+          }
+      F.swap(G);
+    }
+  const int corner[8][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}, {0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}};
+  // no two solid samples touching only along an edge or at a corner (each makes an edge four faces share): the
+  // first empty sample of such a pair's square or cube filled, until there are none
+  for (int pass = 0; pass < 16; ++pass) {
+    size_t fixed = 0;
+    auto in = [&](int x, int y, int z) { return F[at(x, y, z)] > 0.5f; };
+    auto fill = [&](int x, int y, int z) { F[at(x, y, z)] = 0.51f; ++fixed; };
+    for (int z = 0; z + 1 < NZ; ++z)
+      for (int y = 0; y + 1 < NY; ++y)
+        for (int x = 0; x + 1 < NX; ++x) {
+          // the three squares at this sample (xy, xz, yz)
+          const int sq[3][4][3] = {{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}}, {{0, 0, 0}, {1, 0, 0}, {0, 0, 1}, {1, 0, 1}}, {{0, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 1, 1}}};
+          for (const auto& q : sq) {
+            const bool a = in(x + q[0][0], y + q[0][1], z + q[0][2]), b = in(x + q[1][0], y + q[1][1], z + q[1][2]);
+            const bool c = in(x + q[2][0], y + q[2][1], z + q[2][2]), d = in(x + q[3][0], y + q[3][1], z + q[3][2]);
+            if (a && d && !b && !c) fill(x + q[1][0], y + q[1][1], z + q[1][2]);
+            else if (b && c && !a && !d) fill(x + q[0][0], y + q[0][1], z + q[0][2]);
+          }
+          // the cube: two opposite corners solid and nothing else
+          int cnt = 0;
+          for (int k = 0; k < 8; ++k) cnt += in(x + corner[k][0], y + corner[k][1], z + corner[k][2]);
+          if (cnt == 2)
+            for (int k = 0; k < 4; ++k)
+              if (in(x + corner[k][0], y + corner[k][1], z + corner[k][2]) && in(x + corner[7 - k][0], y + corner[7 - k][1], z + corner[7 - k][2])) {
+                const int j = k == 0 ? 1 : 0;
+                fill(x + corner[j][0], y + corner[j][1], z + corner[j][2]);
+                break;
+              }
+        }
+    if (fixed == 0) break;
+  }
+  // surface nets: a vertex in each cube of eight samples the 0.5 level passes through, at the mean of where it
+  // crosses the cube's edges; a quad for each sample edge it crosses, joining the four cubes round that edge
+  std::vector<int> vid((size_t)(NX - 1) * (NY - 1) * (NZ - 1), -1);
+  auto cube = [&](int x, int y, int z) { return ((size_t)z * (NY - 1) + y) * (NX - 1) + x; };
+  std::vector<double> P;   // world positions
+  const int edges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+  for (int z = 0; z < NZ - 1; ++z)
+    for (int y = 0; y < NY - 1; ++y)
+      for (int x = 0; x < NX - 1; ++x) {
+        float v[8];
+        int inside = 0;
+        for (int k = 0; k < 8; ++k) { v[k] = F[at(x + corner[k][0], y + corner[k][1], z + corner[k][2])] - 0.5f; inside += v[k] > 0; }
+        if (inside == 0 || inside == 8) continue;
+        double sx = 0, sy = 0, sz = 0;
+        int cnt = 0;
+        for (const auto& e : edges) {
+          const float a = v[e[0]], b = v[e[1]];
+          if ((a > 0) == (b > 0)) continue;
+          const double t = a / (a - b);
+          sx += corner[e[0]][0] + t * (corner[e[1]][0] - corner[e[0]][0]);
+          sy += corner[e[0]][1] + t * (corner[e[1]][1] - corner[e[0]][1]);
+          sz += corner[e[0]][2] + t * (corner[e[1]][2] - corner[e[0]][2]);
+          ++cnt;
+        }
+        vid[cube(x, y, z)] = (int)(P.size() / 3);
+        // sample (i, j, k) sits at the centre of cell (i, j, k): box.lo + (i - 0.5) s
+        P.push_back(box.lo[0] + (x + sx / cnt - 0.5) * s);
+        P.push_back(box.lo[1] + (y + sy / cnt - 0.5) * s);
+        P.push_back(box.lo[2] + (z + sz / cnt - 0.5) * s);
+      }
+  const size_t nv = P.size() / 3;
+  // the field's gradient at a vertex (trilinear, central differences): its outward normal is minus it
+  auto field = [&](double gx, double gy, double gz) {
+    gx = std::clamp(gx, 0.0, NX - 1.001); gy = std::clamp(gy, 0.0, NY - 1.001); gz = std::clamp(gz, 0.0, NZ - 1.001);
+    const int x = (int)gx, y = (int)gy, z = (int)gz;
+    const double tx = gx - x, ty = gy - y, tz = gz - z;
+    double r = 0;
+    for (int k = 0; k < 8; ++k) {
+      const double w = (corner[k][0] ? tx : 1 - tx) * (corner[k][1] ? ty : 1 - ty) * (corner[k][2] ? tz : 1 - tz);
+      r += w * F[at(std::min(NX - 1, x + corner[k][0]), std::min(NY - 1, y + corner[k][1]), std::min(NZ - 1, z + corner[k][2]))];
+    }
+    return r;
+  };
+  std::vector<double> Nn(nv * 3);
+  for (size_t i = 0; i < nv; ++i) {
+    const double gx = (P[i * 3] - box.lo[0]) / s + 0.5, gy = (P[i * 3 + 1] - box.lo[1]) / s + 0.5, gz = (P[i * 3 + 2] - box.lo[2]) / s + 0.5;
+    double d[3] = {field(gx + 0.5, gy, gz) - field(gx - 0.5, gy, gz), field(gx, gy + 0.5, gz) - field(gx, gy - 0.5, gz), field(gx, gy, gz + 0.5) - field(gx, gy, gz - 0.5)};
+    const double l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    for (int k = 0; k < 3; ++k) Nn[i * 3 + k] = l > 0 ? -d[k] / l : 0;
+  }
+  std::vector<uint32_t> I;
+  auto emit = [&](int a, int b, int c, int d) {
+    if (a < 0 || b < 0 || c < 0 || d < 0) return;
+    // wound so the face turns the way the normals do (outward)
+    const double* pa = &P[(size_t)a * 3]; const double* pb = &P[(size_t)b * 3]; const double* pc = &P[(size_t)c * 3];
+    const double u[3] = {pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]}, w[3] = {pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]};
+    const double fn[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+    double nsum[3] = {0, 0, 0};
+    for (int q : {a, b, c, d}) for (int k = 0; k < 3; ++k) nsum[k] += Nn[(size_t)q * 3 + k];
+    if (fn[0] * nsum[0] + fn[1] * nsum[1] + fn[2] * nsum[2] < 0) { std::swap(b, d); }
+    I.insert(I.end(), {(uint32_t)a, (uint32_t)b, (uint32_t)c, (uint32_t)a, (uint32_t)c, (uint32_t)d});
+  };
+  // (from the padding layer in: a thing standing on the box's floor has its bottom on the edges from layer 0)
+  for (int z = 0; z < NZ; ++z)
+    for (int y = 0; y < NY; ++y)
+      for (int x = 0; x < NX; ++x) {
+        const bool here = F[at(x, y, z)] > 0.5f;
+        const bool yz = y >= 1 && z >= 1 && y < NY - 1 && z < NZ - 1, xz = x >= 1 && z >= 1 && x < NX - 1 && z < NZ - 1,
+                   xy = x >= 1 && y >= 1 && x < NX - 1 && y < NY - 1;
+        // the edge to the next sample along x: the four cubes round it share (y-1..y, z-1..z)
+        if (yz && x + 1 < NX && here != (F[at(x + 1, y, z)] > 0.5f))
+          emit(vid[cube(x, y - 1, z - 1)], vid[cube(x, y, z - 1)], vid[cube(x, y, z)], vid[cube(x, y - 1, z)]);
+        if (xz && y + 1 < NY && here != (F[at(x, y + 1, z)] > 0.5f))
+          emit(vid[cube(x - 1, y, z - 1)], vid[cube(x, y, z - 1)], vid[cube(x, y, z)], vid[cube(x - 1, y, z)]);
+        if (xy && z + 1 < NZ && here != (F[at(x, y, z + 1)] > 0.5f))
+          emit(vid[cube(x - 1, y - 1, z)], vid[cube(x, y - 1, z)], vid[cube(x, y, z)], vid[cube(x - 1, y, z)]);
+      }
+  if (I.empty()) { error = "visual_hull(): what is left is too small to make a surface of"; return Value::nil(); }
+  // colour: each view's depth of the mesh (a z-buffer at up to 640 across), then each vertex from the views that
+  // see it, by how squarely each faces it
+  std::vector<double> C(nv * 3, 0), Wt(nv, 0);
+  for (const View& v : vs) {
+    if (!v.img) continue;
+    const double k = std::min(1.0, 640.0 / v.w);
+    const int zw = std::max(1, (int)(v.w * k)), zh = std::max(1, (int)(v.h * k));
+    std::vector<float> zb((size_t)zw * zh, 1e30f);
+    std::vector<P2> sp(nv);
+    std::vector<double> sd(nv);
+    std::vector<uint8_t> ok(nv);
+    for (size_t i = 0; i < nv; ++i) { ok[i] = project(v.cam, &P[i * 3], &sp[i], &sd[i]); sp[i].x *= k; sp[i].y *= k; }
+    for (size_t t = 0; t + 2 < I.size(); t += 3) {
+      const uint32_t a = I[t], b = I[t + 1], c = I[t + 2];
+      if (!ok[a] || !ok[b] || !ok[c]) continue;
+      const double x0 = std::min({sp[a].x, sp[b].x, sp[c].x}), x1 = std::max({sp[a].x, sp[b].x, sp[c].x});
+      const double y0 = std::min({sp[a].y, sp[b].y, sp[c].y}), y1 = std::max({sp[a].y, sp[b].y, sp[c].y});
+      const double den = (sp[b].y - sp[c].y) * (sp[a].x - sp[c].x) + (sp[c].x - sp[b].x) * (sp[a].y - sp[c].y);
+      if (std::fabs(den) < 1e-12) continue;
+      for (int py = std::max(0, (int)std::floor(y0)); py <= std::min(zh - 1, (int)std::ceil(y1)); ++py)
+        for (int px = std::max(0, (int)std::floor(x0)); px <= std::min(zw - 1, (int)std::ceil(x1)); ++px) {
+          const double qx = px + 0.5, qy = py + 0.5;
+          const double l0 = ((sp[b].y - sp[c].y) * (qx - sp[c].x) + (sp[c].x - sp[b].x) * (qy - sp[c].y)) / den;
+          const double l1 = ((sp[c].y - sp[a].y) * (qx - sp[c].x) + (sp[a].x - sp[c].x) * (qy - sp[c].y)) / den;
+          const double l2 = 1 - l0 - l1;
+          if (l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6) continue;
+          const float d = (float)(l0 * sd[a] + l1 * sd[b] + l2 * sd[c]);
+          float& z = zb[(size_t)py * zw + px];
+          if (d < z) z = d;
+        }
+    }
+    double from[3];
+    for (int i = 0; i < 3; ++i) from[i] = -(v.cam.R[i] * v.cam.t[0] + v.cam.R[3 + i] * v.cam.t[1] + v.cam.R[6 + i] * v.cam.t[2]);
+    for (size_t i = 0; i < nv; ++i) {
+      if (!ok[i]) continue;
+      const int px = (int)sp[i].x, py = (int)sp[i].y;
+      if (px < 0 || py < 0 || px >= zw || py >= zh) continue;
+      // seen: no nearer surface within a cell and a half (a 3x3 neighbourhood, for the rasterized edges)
+      float zmin = 1e30f;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int qx = px + dx, qy = py + dy;
+          if (qx >= 0 && qy >= 0 && qx < zw && qy < zh) zmin = std::min(zmin, zb[(size_t)qy * zw + qx]);
+        }
+      if (sd[i] > zmin + 1.5 * s) continue;
+      double d[3] = {from[0] - P[i * 3], from[1] - P[i * 3 + 1], from[2] - P[i * 3 + 2]};
+      const double l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const double facing = (d[0] * Nn[i * 3] + d[1] * Nn[i * 3 + 1] + d[2] * Nn[i * 3 + 2]) / l;
+      if (facing <= 0.05) continue;
+      const double wgt = facing * facing * facing;
+      // the photo's colour there, bilinear, in the picture's own pixels
+      const double ix = sp[i].x / k - 0.5, iy = sp[i].y / k - 0.5;
+      const int x0 = std::clamp((int)std::floor(ix), 0, (int)v.iw - 1), y0 = std::clamp((int)std::floor(iy), 0, (int)v.ih - 1);
+      const int x1 = std::min<int>(x0 + 1, v.iw - 1), y1 = std::min<int>(y0 + 1, v.ih - 1);
+      const double tx = std::clamp(ix - x0, 0.0, 1.0), ty = std::clamp(iy - y0, 0.0, 1.0);
+      for (int ch = 0; ch < 3; ++ch) {
+        const int sh = 16 - ch * 8;
+        auto g = [&](int xx, int yy) { return (double)(((*v.img)[(size_t)yy * v.iw + xx] >> sh) & 255); };
+        const double val = (g(x0, y0) * (1 - tx) + g(x1, y0) * tx) * (1 - ty) + (g(x0, y1) * (1 - tx) + g(x1, y1) * tx) * ty;
+        C[i * 3 + ch] += wgt * val / 255.0;
+      }
+      Wt[i] += wgt;
+    }
+  }
+  size_t coloured = 0;
+  for (double w : Wt) coloured += w > 0;
+  // what no photo sees (the underside, on the mat) takes its neighbours' colour, spreading in from the seen
+  {
+    for (size_t i = 0; i < nv; ++i) if (Wt[i] > 0) for (int k = 0; k < 3; ++k) C[i * 3 + k] /= Wt[i];
+    std::vector<uint8_t> have(nv);
+    for (size_t i = 0; i < nv; ++i) have[i] = Wt[i] > 0;
+    std::vector<std::vector<uint32_t>> nb(nv);
+    for (size_t t = 0; t + 2 < I.size(); t += 3)
+      for (int a = 0; a < 3; ++a) nb[I[t + a]].push_back(I[t + (a + 1) % 3]);
+    bool grew = coloured > 0;
+    while (grew) {
+      grew = false;
+      std::vector<uint32_t> now;
+      for (size_t i = 0; i < nv; ++i) {
+        if (have[i]) continue;
+        double acc[3] = {0, 0, 0};
+        int cnt = 0;
+        for (uint32_t j : nb[i]) if (have[j]) { for (int k = 0; k < 3; ++k) acc[k] += C[(size_t)j * 3 + k]; ++cnt; }
+        if (cnt == 0) continue;
+        for (int k = 0; k < 3; ++k) C[i * 3 + k] = acc[k] / cnt;
+        now.push_back((uint32_t)i);
+      }
+      for (uint32_t i : now) have[i] = 1;
+      grew = !now.empty();
+    }
+    for (size_t i = 0; i < nv; ++i) if (!have[i]) for (int k = 0; k < 3; ++k) C[i * 3 + k] = 0.5;
+  }
+  std::vector<uint8_t> Pb, Nb, Cb, Ib;
+  double vol = 0;
+  for (size_t i = 0; i < nv; ++i) {
+    for (int k = 0; k < 3; ++k) { put_f32(Pb, (float)P[i * 3 + k]); put_f32(Nb, (float)Nn[i * 3 + k]); }
+    for (int k = 0; k < 3; ++k) put_f32(Cb, (float)C[i * 3 + k]);
+  }
+  for (size_t t = 0; t + 2 < I.size(); t += 3) {
+    const double* a = &P[(size_t)I[t] * 3]; const double* b = &P[(size_t)I[t + 1] * 3]; const double* c = &P[(size_t)I[t + 2] * 3];
+    vol += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+    for (int k = 0; k < 3; ++k) put_u32(Ib, I[t + k]);
+  }
+  double mn[3] = {1e30, 1e30, 1e30}, mx[3] = {-1e30, -1e30, -1e30};
+  for (size_t i = 0; i < nv; ++i) for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], P[i * 3 + k]); mx[k] = std::max(mx[k], P[i * 3 + k]); }
+  auto res_m = std::make_shared<MapObj>();
+  res_m->put("positions", Value::bytes(std::move(Pb)));
+  res_m->put("normals", Value::bytes(std::move(Nb)));
+  res_m->put("colors", Value::bytes(std::move(Cb)));
+  res_m->put("indices", Value::bytes(std::move(Ib)));
+  res_m->put("vertex_count", Value::integer((int64_t)nv));
+  res_m->put("tris", Value::integer((int64_t)(I.size() / 3)));
+  res_m->put("volume_mm3", Value::real(vol));
+  res_m->put("voxels", Value::integer((int64_t)voxels));
+  res_m->put("cell_mm", Value::real(s));
+  res_m->put("coloured", Value::integer((int64_t)coloured));
+  res_m->put("min", Value::list({Value::real(mn[0]), Value::real(mn[1]), Value::real(mn[2])}));
+  res_m->put("max", Value::list({Value::real(mx[0]), Value::real(mx[1]), Value::real(mx[2])}));
+  return Value::object(Type::Map, res_m);
+}
+
 // ---- tires ----------------------------------------------------------------------------------------------------
 
 Value bi_tire_size(Vm&, std::vector<Value>& args, std::string& error) {
@@ -1955,6 +2358,8 @@ void install_carve_builtins(Vm& vm) {
   vm.define_native("camera_pose", 4, 5, bi_camera_pose);
   vm.define_native("camera_project", 2, 2, bi_camera_project);
   vm.define_native("camera_ray", 2, 2, bi_camera_ray);
+  vm.define_native("camera_box_mask", 4, 4, bi_camera_box_mask);
+  vm.define_native("visual_hull", 2, 3, bi_visual_hull);
   vm.define_native("tire_size", 1, 1, bi_tire_size);
   vm.define_native("tire_fit", 4, 5, bi_tire_fit);
 }

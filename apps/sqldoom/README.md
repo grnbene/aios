@@ -81,6 +81,14 @@ death and gib frames from the front - with a near-orthographic camera at one tex
 (`image_quantize`) and written over the lump: pixels, mask, texel rows and the frames' offsets. Lump names and ids
 stay, so the classic renderer draws the photo's monster too.
 
+In real 3D, from photos all round: print the mat (`carve_mat_png`, or `/mat.png` on the capture page: A4 with coded
+markers 0-3 at its corners), stand the thing in its box and take 8 to 20 photos walking round it, low and high, then
+`carve.gr DIR` with the folder of photos. Each photo's camera is solved from the markers it shows (`markers_find`,
+`camera_pose`; the lens shared), its silhouette cut out with every pixel whose ray misses the stage taken as
+background (`camera_box_mask`, `image_cutout`), and the solid carved by all the silhouettes (`visual_hull`): its true
+depth and shape all round, a closed mesh coloured from the photos (vertex colours; the underside, which no photo sees,
+from round it). What no silhouette can show - a hollow, like the inside of a cup - comes back filled.
+
 From a phone: `aios --root R grain serve apps/sqldoom/capture.gr [PORT]` (default 8620) serves a page whose photo
 button opens the camera. The browser scales the picture to 1600 pixels on its long side and sends it; the page then
 shows the cut-out, the model from eight sides and every sprite rendered from it, and the monster can be any of the

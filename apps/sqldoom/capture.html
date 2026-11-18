@@ -31,8 +31,15 @@ button:disabled { opacity: .5; }
   <button class="go" id="go" disabled>Carve it</button>
   <div id="status"></div>
 </div>
+<div class="card">
+  <h2 style="font-size:17px;margin:0 0 6px">Or all round, in real 3D</h2>
+  <p class="lead" style="margin:0 0 8px"><a href="/mat.png" target="_blank" style="color:var(--accent)">Print the mat</a> (A4, at 100%), stand the thing in its box, and take 8 to 20 photos walking round it - some low, some from above - with at least two corner markers in each.</p>
+  <label class="shot">Add photos<input id="many" type="file" accept="image/*" capture="environment" multiple></label>
+  <div class="row"><button id="clear" style="flex:0 0 auto">Start again</button><button class="go" id="go3d" disabled style="margin-top:0">Build it in 3D</button></div>
+  <div id="status3d"></div>
+</div>
 <div class="card out" id="out" style="display:none">
-  <h2>Cut out</h2><img id="cutout" alt="the cut-out">
+  <h2 id="cutout_h">Cut out</h2><img id="cutout" alt="the cut-out">
   <h2>3D model, eight sides</h2><img id="model" alt="the model from eight sides">
   <h2>Sprites, rendered from the model</h2><img id="sprites" alt="the sprites">
 </div>
@@ -71,10 +78,56 @@ document.getElementById('go').addEventListener('click', async () => {
     status.textContent = m.name + ' is now your photo: ' + j.tris + ' triangles, ' + j.lumps + ' sprites, in ' + (j.ms / 1000).toFixed(1) + ' s.';
     const t = Date.now();
     for (const id of ['cutout', 'model', 'sprites']) document.getElementById(id).src = '/preview/' + id + '.png?t=' + t;
+    document.getElementById('cutout').style.display = 'block';
+    document.getElementById('cutout_h').style.display = 'block';
     document.getElementById('out').style.display = 'block';
   } catch (err) {
     status.textContent = 'Could not carve it: ' + err.message;
   }
+  go.disabled = false;
+});
+// ---- all round: photos added one by one, then the 3D build ----
+const status3d = document.getElementById('status3d');
+async function shrink(f) {
+  const img = await createImageBitmap(f);
+  const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
+}
+document.getElementById('many').addEventListener('change', async (e) => {
+  for (const f of e.target.files) {
+    status3d.textContent = 'Adding ' + f.name + '...';
+    const r = await fetch('/photos', {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: await shrink(f)});
+    const j = await r.json();
+    status3d.textContent = r.ok ? j.count + ' photos (this one shows markers ' + j.markers.join(', ') + ').' : 'Not added: ' + j.error;
+    document.getElementById('go3d').disabled = !(r.ok && j.count >= 4);
+  }
+  e.target.value = '';
+});
+document.getElementById('clear').addEventListener('click', async () => {
+  await fetch('/photos/clear', {method: 'POST'});
+  status3d.textContent = 'No photos yet.';
+  document.getElementById('go3d').disabled = true;
+});
+document.getElementById('go3d').addEventListener('click', async () => {
+  const m = MONSTERS.find(x => String(x.type) === sel.value);
+  const go = document.getElementById('go3d');
+  go.disabled = true;
+  status3d.textContent = 'Building in 3D: finding the cameras, cutting out each photo, carving the solid, rendering ' + m.sprite + '...';
+  try {
+    const r = await fetch('/carve3d?type=' + m.type + '&sprite=' + m.sprite, {method: 'POST'});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    status3d.textContent = m.name + ' rebuilt from ' + j.used + ' photos' + (j.dropped ? ' (' + j.dropped + ' left out)' : '') + ': ' +
+      j.size_mm.map(v => Math.round(v)).join(' x ') + ' mm, ' + j.tris + ' triangles, ' + j.lumps + ' sprites, in ' + (j.ms / 1000).toFixed(1) + ' s.';
+    const t = Date.now();
+    for (const id of ['model', 'sprites']) document.getElementById(id).src = '/preview/' + id + '.png?t=' + t;
+    document.getElementById('cutout').style.display = 'none';
+    document.getElementById('cutout_h').style.display = 'none';
+    document.getElementById('out').style.display = 'block';
+  } catch (err) { status3d.textContent = 'Could not build it: ' + err.message; }
   go.disabled = false;
 });
 </script>

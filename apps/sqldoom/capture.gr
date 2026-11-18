@@ -14,9 +14,13 @@
 # GET  /preview/cutout.png     the last photo's cut-out
 # GET  /preview/model.png      the last model from eight sides
 # GET  /preview/sprites.png    the sprite's lumps as they are now in the database
+# GET  /mat.png                the mat to print for photos all round (A4: four coded markers)
+# POST /photos                 body: one photo of the thing on the mat, kept -> {count, markers}
+# POST /photos/clear           start again
+# POST /carve3d?type=T&sprite=S  the kept photos rebuilt in 3D (8 to 20, from all round) and made the monster
 # Then play.gr (or render.gr) draws the new monster.
 
-import { carve_model, carve_creature, carve_sprites, carve_cut, carve_turntable, carve_sprite_sheet } from "lib/carve.gr"
+import { carve_model, carve_model_views, carve_creature, carve_sprites, carve_cut, carve_turntable, carve_sprite_sheet, carve_mat_png } from "lib/carve.gr"
 
 sql("USE doom")
 
@@ -34,6 +38,7 @@ fn monster(ty) {
 }
 
 let last = {"cutout": nil, "model": nil, "sprite": "TROO"}
+let kept = {"photos": []}
 
 fn png(cv) { return {"code": 200, "type": "image/png", "body": canvas_to_png(cv)} }
 fn json_out(code, v) { return {"code": code, "type": "application/json", "body": json_stringify(v)} }
@@ -66,10 +71,50 @@ fn carve_request(req, body) {
                         "far_tris": made.far_tris, "coverage": made.coverage, "lumps": r.value.sprites.lumps, "ms": clock() - t0})
 }
 
+fn monster_of(q) {
+  let ty = int(get(q, "type", "3001"))
+  let m = monster(ty)
+  if m == nil { error(format("type {} is not one of the monsters a photo can become", ty)) }
+  if get(q, "sprite", m.sprite) != m.sprite { error(format("type {} is drawn with {}, not {}", ty, m.sprite, q.sprite)) }
+  return m
+}
+
+fn add_photo(body) {
+  let photo = bytes(body)
+  if len(photo) < 64 { return json_out(400, {"error": "send the photo as the request body"}) }
+  let cv = image_decode(photo)
+  let seen = []
+  for fm in markers_find(cv) { if fm.id <= 3 { push(seen, fm.id) } }
+  if len(seen) < 2 { return json_out(422, {"error": format("this photo shows {} of the mat's markers; two at least (stand back, keep the mat's corners in the frame)", len(seen))}) }
+  push(kept.photos, photo)
+  return json_out(200, {"count": len(kept.photos), "markers": seen})
+}
+
+fn carve3d_request(req) {
+  let t0 = clock()
+  let r = pcall(fn () {
+    let m = monster_of(req.query)
+    if len(kept.photos) < 4 { error(format("{} photos so far: take 8 to 20 from all round, low and high", len(kept.photos))) }
+    let made = carve_model_views("carved_" + lower(m.sprite), kept.photos, {})
+    carve_creature(m.type, made, {"height": m.height})
+    let sp = carve_sprites(m.sprite, made, {"height": m.height})
+    last.cutout = nil
+    last.model = made
+    last.sprite = m.sprite
+    return {"type": m.type, "sprite": m.sprite, "model": made.model, "tris": made.tris, "used": made.used, "dropped": made.dropped,
+            "size_mm": made.size_mm, "volume_cm3": made.volume_mm3 / 1000.0, "lumps": sp.lumps, "ms": clock() - t0}
+  })
+  return r.ok ? json_out(200, r.value) : json_out(422, {"error": str(r.error)})
+}
+
 fn route(req, body) {
   let key = req.method + " " + req.path
   if key == "GET /" { return {"code": 200, "type": "text/html; charset=utf-8", "body": replace(PAGE, "__MONSTERS__", json_stringify(MONSTERS))} }
   if key == "POST /carve" { return carve_request(req, body) }
+  if key == "GET /mat.png" { return {"code": 200, "type": "image/png", "body": carve_mat_png()} }
+  if key == "POST /photos" { return add_photo(body) }
+  if key == "POST /photos/clear" { kept.photos = [] return json_out(200, {"count": 0}) }
+  if key == "POST /carve3d" { return carve3d_request(req) }
   if key == "GET /preview/cutout.png" { return last.cutout == nil ? json_out(404, {"error": "nothing carved yet"}) : png(last.cutout) }
   if key == "GET /preview/model.png" { return last.model == nil ? json_out(404, {"error": "nothing carved yet"}) : png(carve_turntable(last.model, 160)) }
   if key == "GET /preview/sprites.png" { return png(carve_sprite_sheet(last.sprite, 2)) }

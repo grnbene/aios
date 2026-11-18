@@ -1,0 +1,184 @@
+// A thing photographed all round on the marker mat, rebuilt in 3D: markers_find -> camera_pose (the lens shared)
+// -> camera_box_mask + image_cutout (its silhouette in each photo) -> visual_hull. The thing - a red block with a
+// blue ball on it - and the cameras are known, so the solid that comes back is measured against them.
+fn check(c, msg) { assert_true(c, msg) }
+fn sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+fn cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+fn unit(a) { let l = sqrt(dot(a, a)) return [a[0] / l, a[1] / l, a[2] / l] }
+fn quad(tris, a, b, c, d, col) { push(tris, {"p": [a, b, c], "col": col}) push(tris, {"p": [a, c, d], "col": col}) }
+
+// ---- the mat: A4, coded markers 0..3 (50 mm) at its corners ----
+let S = 50.0
+let MARKERS = [{"id": 0, "x": -100.0, "y": 92.0}, {"id": 1, "x": 50.0, "y": 92.0}, {"id": 2, "x": 50.0, "y": -142.0}, {"id": 3, "x": -100.0, "y": -142.0}]
+fn corners_of(m) { return [[m.x, m.y + S], [m.x + S, m.y + S], [m.x + S, m.y], [m.x, m.y]] }
+let world = []
+quad(world, [-105.0, -148.5, 0.0], [105.0, -148.5, 0.0], [105.0, 148.5, 0.0], [-105.0, 148.5, 0.0], 0xEEEBE3)
+for m in MARKERS {
+  let img = marker_image(m.id, 60)
+  let k = S / 6.0
+  for cy in 0..6 {
+    for cx in 0..6 {
+      if (canvas_get_pixel(img, 10 + cx * 10 + 5, 10 + cy * 10 + 5) & 255) > 128 { continue }
+      let x0 = m.x + cx * k
+      let y1 = m.y + S - cy * k
+      quad(world, [x0, y1 - k, 0.3], [x0 + k, y1 - k, 0.3], [x0 + k, y1, 0.3], [x0, y1, 0.3], 0x101010)
+    }
+  }
+}
+// ---- the thing: a 60 x 40 x 50 block, a ball of radius 25 on top; each face a shade of its colour ----
+fn shade(col, n) {
+  let k = 0.55 + 0.45 * max(0.0, dot(n, unit([0.3, -0.5, 0.8])))
+  return (round(((col >> 16) & 255) * k) << 16) + (round(((col >> 8) & 255) * k) << 8) + round((col & 255) * k)
+}
+let RED = 0xC83228
+let BLUE = 0x2850C8
+let bx = 30.0
+let by = 20.0
+let bz = 50.0
+quad(world, [-bx, -by, 0.0], [bx, -by, 0.0], [bx, -by, bz], [-bx, -by, bz], shade(RED, [0.0, -1.0, 0.0]))
+quad(world, [bx, by, 0.0], [-bx, by, 0.0], [-bx, by, bz], [bx, by, bz], shade(RED, [0.0, 1.0, 0.0]))
+quad(world, [bx, -by, 0.0], [bx, by, 0.0], [bx, by, bz], [bx, -by, bz], shade(RED, [1.0, 0.0, 0.0]))
+quad(world, [-bx, by, 0.0], [-bx, -by, 0.0], [-bx, -by, bz], [-bx, by, bz], shade(RED, [-1.0, 0.0, 0.0]))
+quad(world, [-bx, -by, bz], [bx, -by, bz], [bx, by, bz], [-bx, by, bz], shade(RED, [0.0, 0.0, 1.0]))
+let R = 25.0
+let cz = bz + R
+let NL = 14
+let NA = 28
+fn sph(i, j) {
+  let th = PI * i / NL
+  let ph = 2.0 * PI * j / NA
+  return [R * sin(th) * cos(ph), R * sin(th) * sin(ph), cz + R * cos(th)]
+}
+for i in 0..NL {
+  for j in 0..NA {
+    let a = sph(i, j)
+    let b = sph(i + 1, j)
+    let c = sph(i + 1, j + 1)
+    let d = sph(i, j + 1)
+    let mid = [(a[0] + c[0]) / 2.0, (a[1] + c[1]) / 2.0, (a[2] + c[2]) / 2.0 - cz]
+    quad(world, a, b, c, d, shade(BLUE, unit(mid)))
+  }
+}
+let TRUE_VOLUME = 2.0 * bx * 2.0 * by * bz + 4.0 / 3.0 * PI * R * R * R
+
+// ---- photos from all round: two rings of eight ----
+let W = 1024
+let H = 768
+let FOV = 55.0
+fn photo(C) {
+  let f = unit(sub([0.0, 0.0, 45.0], C))
+  let r = unit(cross(f, [0.0, 0.0, 1.0]))
+  let u = cross(r, f)
+  let rows = []
+  for tri in world {
+    let row = {"col": tri.col}
+    for i in 0..3 {
+      let d = sub(tri.p[i], C)
+      row["x" + str(i)] = dot(d, r)
+      row["y" + str(i)] = dot(d, u)
+      row["z" + str(i)] = dot(d, f)
+    }
+    push(rows, row)
+  }
+  let t = r3d_target(W, H)
+  r3d_clear(t, 0x6A655C)
+  r3d_draw(t, rows, FOV)
+  let cv = canvas_create(W, H)
+  canvas_set_pixels(cv, r3d_pixels(t))
+  return cv
+}
+let shots = []
+for ring in [[430.0, 250.0], [330.0, 420.0]] {
+  for k in 0..8 {
+    let a = 2.0 * PI * (k + 0.5 * (ring[1] > 300.0 ? 1 : 0)) / 8.0
+    push(shots, {"C": [ring[0] * cos(a), ring[0] * sin(a), ring[1]], "cv": photo([ring[0] * cos(a), ring[0] * sin(a), ring[1]])})
+  }
+}
+
+// ---- the cameras: every photo's markers; the lens is one lens, so its focal length is the photos' median ----
+fn points(cv) {
+  let wp = []
+  let ip = []
+  for fm in markers_find(cv) {
+    for m in MARKERS {
+      if m.id == fm.id {
+        let wc = corners_of(m)
+        for i in 0..4 { push(wp, wc[i]) push(ip, fm.corners[i]) }
+      }
+    }
+  }
+  return {"w": wp, "i": ip}
+}
+let fs = []
+for s in shots {
+  s.pts = points(s.cv)
+  check(len(s.pts.w) >= 8, format("at least two markers in every photo, the thing hiding the rest: {}", len(s.pts.w) / 4))
+  push(fs, camera_pose(s.pts.w, s.pts.i, W, H).focal)
+}
+let focal = sort(fs)[idiv(len(fs), 2)]
+let true_f = (W / 2.0) / tan(FOV * PI / 360.0)
+check(abs(focal - true_f) / true_f < 0.01, format("the shared focal length: {:.1f} px against {:.1f}", focal, true_f))
+let worst = 0.0
+for s in shots {
+  s.cam = camera_pose(s.pts.w, s.pts.i, W, H, {"focal": focal})
+  worst = max(worst, sqrt(dot(sub(s.cam.pos, s.C), sub(s.cam.pos, s.C))))
+}
+check(worst < 6.0, format("every camera within {:.1f} mm of where it was", worst))
+
+// ---- silhouettes, and the solid ----
+let stage = {"min": [-90.0, -85.0, 0.0], "max": [90.0, 85.0, 150.0]}
+let views = []
+let t0 = clock()
+for s in shots {
+  let cut = image_cutout(s.cv, {"background_mask": camera_box_mask(s.cam, W, H, stage)})
+  push(views, {"mask": cut.mask, "w": W, "h": H, "camera": s.cam, "image": s.cv})
+}
+let t1 = clock()
+let hull = visual_hull(views, stage, {"res": 128})
+let t2 = clock()
+print(format("cut-outs {:.0f} ms, hull {:.0f} ms: {} voxels at {:.2f} mm, {} triangles", t1 - t0, t2 - t1, hull.voxels, hull.cell_mm, hull.tris))
+
+check(abs(hull.min[0] + bx) < 4 and abs(hull.max[0] - bx) < 4, format("as wide as the block (60 mm): {:.1f} to {:.1f}", hull.min[0], hull.max[0]))
+// (the ball, 50 across, is deeper than the block)
+check(abs(hull.min[1] + R) < 4 and abs(hull.max[1] - R) < 4, format("as deep as the ball (50 mm): {:.1f} to {:.1f}", hull.min[1], hull.max[1]))
+check(hull.min[2] < 4 and abs(hull.max[2] - (cz + R)) < 4, format("as tall (100 mm): {:.1f} to {:.1f}", hull.min[2], hull.max[2]))
+// a visual hull holds the thing and a little more where no photo sees between (the ball's underside on the block)
+let ratio = hull.volume_mm3 / TRUE_VOLUME
+check(ratio > 0.92 and ratio < 1.2, format("its volume {:.0f} mm3 against {:.0f}: {:.3f} of it", hull.volume_mm3, TRUE_VOLUME, ratio))
+
+// closed: every edge in two triangles
+let edges = {}
+let nt = idiv(len(hull.indices), 12)
+for t in 0..nt {
+  let a = bytes_get(hull.indices, t * 12, "u32le")
+  let b = bytes_get(hull.indices, t * 12 + 4, "u32le")
+  let c = bytes_get(hull.indices, t * 12 + 8, "u32le")
+  for e in [[a, b], [b, c], [c, a]] {
+    let ek = str(min(e[0], e[1])) + "-" + str(max(e[0], e[1]))
+    edges[ek] = get(edges, ek, 0) + 1
+  }
+}
+let open_edges = 0
+for ek in keys(edges) { if edges[ek] != 2 { open_edges = open_edges + 1 } }
+check(open_edges == 0, format("the surface is closed: {} edges not in exactly two triangles", open_edges))
+
+// coloured from the photos: the ball blue, the block red
+let top_blue = 0
+let top_n = 0
+let low_red = 0
+let low_n = 0
+for i in 0..hull.vertex_count {
+  let z = bytes_get(hull.positions, i * 12 + 8, "f32le")
+  let r = bytes_get(hull.colors, i * 12, "f32le")
+  let b = bytes_get(hull.colors, i * 12 + 8, "f32le")
+  if z > cz + 5 { top_n = top_n + 1 if b > r { top_blue = top_blue + 1 } }
+  if z > 8 and z < bz - 8 { low_n = low_n + 1 if r > b { low_red = low_red + 1 } }
+}
+check(top_blue > top_n * 0.95, format("the ball comes back blue: {} of {} vertices", top_blue, top_n))
+check(low_red > low_n * 0.95, format("the block comes back red: {} of {} vertices", low_red, low_n))
+// every vertex above the mat seen by some photo; the underside only by colour spread from round it
+let above = 0
+for i in 0..hull.vertex_count { if bytes_get(hull.positions, i * 12 + 8, "f32le") > 3.0 { above = above + 1 } }
+check(hull.coloured >= above, format("seen and coloured: {} of {} vertices, all {} above the mat", hull.coloured, hull.vertex_count, above))
+print("PASS: test_reconstruct")
