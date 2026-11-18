@@ -670,14 +670,20 @@ void forward_event(const std::vector<std::string>& urls, const std::string& json
     std::thread([url, json]() {
       auto ep = aios::channel::parse_endpoint(url);
       if (!ep.ok()) return;
-      aios::channel::HttpRequest req;
-      req.method = "POST";
-      req.endpoint = *ep;
-      req.timeout_ms = 4000;
-      req.host = &hal::process_host();
-      req.headers.push_back({"Content-Type", "application/json"});
-      req.body.assign(json.begin(), json.end());
-      aios::channel::http_send(req);   // result ignored: telemetry forwarding is best-effort
+      // a hub that's briefly down or slow shouldn't silently drop the event: three tries, short backoff, still
+      // bounded and still off the response path (this whole thread is already detached, fire-and-forget).
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        aios::channel::HttpRequest req;
+        req.method = "POST";
+        req.endpoint = *ep;
+        req.timeout_ms = 4000;
+        req.host = &hal::process_host();
+        req.headers.push_back({"Content-Type", "application/json"});
+        req.body.assign(json.begin(), json.end());
+        auto r = aios::channel::http_send(req);
+        if (r.ok() && r->status < 500) return;   // delivered (2xx/4xx both mean the hub answered); 5xx/timeout -> retry
+        if (attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+      }
     }).detach();
   }
 }
@@ -1741,6 +1747,31 @@ int aios_webserver_run(int argc, char** argv) {
   // only the memory-safe kind (bytes, no ptr / extern / ffi).
   for (const auto& vh : vhosts)
     if (vh.grain_native) aios::userland::grain::set_native_policy({/*allow=*/true, /*unsafe=*/false});
+
+  // Every node configured to forward must be provably reporting, not just assumed to - a node whose forward URL
+  // is wrong, or whose hub is unreachable, should show up as missing, not silently do nothing. One heartbeat a
+  // minute per forwarding vhost, same path as a real event (forward_event, now with its own retry), so a hub
+  // that stops hearing from a node for more than a couple of minutes knows that node stopped reporting.
+  for (auto& vh : vhosts) {
+    if (!vh.env_honeypot || vh.env_honeypot_forward.empty()) continue;
+    // a raw pointer into `vhosts`, not a reference to the range-for loop variable: `vh` itself is rebound each
+    // iteration and goes out of scope at the end of this block, so capturing it by reference would dangle the
+    // instant the loop moves on. The pointee (the vector element) is what actually lives for the program's
+    // duration, so a pointer to it, captured by value, is what the detached thread needs to hold.
+    VhostConfig* vhp = &vh;
+    std::thread([vhp]() {
+      for (;;) {
+        std::time_t now = std::time(nullptr);
+        char iso[32];
+        std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
+        std::string j = "{\"kind\":\"honeypot.heartbeat\",\"t\":\"" + std::string(iso) + "\",\"node\":\"" +
+                        json_escape(honeypot_node_name()) + "\",\"forward_count\":" +
+                        std::to_string(vhp->env_honeypot_forward.size()) + "}\n";
+        forward_event(vhp->env_honeypot_forward, j);
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+      }
+    }).detach();
+  }
 
   for (auto& vh : vhosts) {
     if (!vh.ssl) continue;

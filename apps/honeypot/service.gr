@@ -43,6 +43,41 @@ fn have_id(id) {
   return false
 }
 
+// --- fleet roster: "they all need to report back to the hub" - this tracks whether they actually are. The edge
+// server sends a heartbeat every 60s to every env_honeypot_forward URL (independent of whether anything has
+// probed it); this is where those - and every real event - land, one line per node, overwritten in place so the
+// roster stays the size of the fleet, not an ever-growing log.
+let FLEET_STATUS = "fleet_status.jsonl"
+fn record_fleet_seen(node, t, kind) {
+  if node == "" { return }
+  let r = pcall(read_file, FLEET_STATUS)
+  let roster = {}
+  if r.ok {
+    for ln in split(r.value, "\n") {
+      let tl = trim(ln)
+      if tl != "" { let p = pcall(json_parse, tl) if p.ok { roster[get(p.value, "node", "")] = p.value } }
+    }
+  }
+  let prev = get(roster, node, {})
+  roster[node] = {
+    "node": node, "last_seen": t, "last_kind": kind,
+    "last_heartbeat": kind == "honeypot.heartbeat" ? t : get(prev, "last_heartbeat", "")
+  }
+  let lines = []
+  for k in keys(roster) { push(lines, json_stringify(roster[k])) }
+  pcall(write_file, FLEET_STATUS, join(lines, "\n") + "\n")
+}
+fn fleet_roster() {
+  let r = pcall(read_file, FLEET_STATUS)
+  if not r.ok { return [] }
+  let out = []
+  for ln in split(r.value, "\n") {
+    let t = trim(ln)
+    if t != "" { let p = pcall(json_parse, t) if p.ok { push(out, p.value) } }
+  }
+  return out
+}
+
 fn csv_field(v) { return "\"" + replace(str(v), "\"", "\"\"") + "\"" }
 
 // --- real identification: who actually owns this address, passively (RDAP + reverse DNS, no probe-back) --------
@@ -358,10 +393,19 @@ serve_routes({
     if line == "" { return res_error(400, "empty") }
     let p = pcall(json_parse, line)
     if not p.ok { return res_error(400, "not json") }
+    let kind = get(p.value, "kind", "")
+    let node = get(p.value, "node", "")
+    record_fleet_seen(node, get(p.value, "t", now_iso()), kind)
+    // a heartbeat proves the node is alive and forwarding works; it isn't an event, so it never joins the feed
+    // (one every 60s per node would otherwise drown real grabs out of the recent-history window over time).
+    if kind == "honeypot.heartbeat" { return res_json({"ok": true, "heartbeat": true}) }
     if have_id(get(p.value, "id", "")) { return res_json({"ok": true, "dup": true}) }
     append_file(FEED, line + "\n")
     return res_json({"ok": true})
   },
+  // the fleet roster: every node that has ever reported in, when it was last heard from, and whether it's still
+  // sending heartbeats (client decides "stale" from last_heartbeat; see stale_after_seconds).
+  "GET /api/fleet": fn (req) { return res_json({"nodes": fleet_roster(), "stale_after_seconds": 150}) },
   "GET /api/grabs": fn (req) {
     let limit = int(get(req.query_params, "limit", "400"))
     let all = grabs(limit)

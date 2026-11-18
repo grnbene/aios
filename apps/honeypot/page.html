@@ -26,6 +26,9 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 .muted { color:var(--muted); }
 .expbtn { display:inline-block; padding:5px 11px; border-radius:7px; border:1px solid var(--line); color:var(--ink); text-decoration:none; font-size:13px; margin-right:6px; background:var(--panel); }
 .expbtn:hover { border-color:var(--accent); color:var(--accent); }
+.fnode { border-color:var(--ok); } .fnode.stale { border-color:var(--hot); }
+.fnode .l { display:flex; align-items:center; gap:5px; }
+.fdot { width:7px; height:7px; border-radius:50%; background:var(--ok); flex-shrink:0; } .fnode.stale .fdot { background:var(--hot); }
 #mapwrap { display:flex; gap:10px; margin-bottom:14px; align-items:stretch; }
 #map { height:380px; flex:1 1 auto; min-width:0; border-radius:10px; border:1px solid var(--line); background:#0d1014; cursor:pointer; }
 #detail { width:270px; flex:0 0 270px; height:380px; overflow-y:auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:13px; }
@@ -58,6 +61,10 @@ tr[data-origin] { cursor:pointer; }
   <div class="card"><div class="n" id="c_last">—</div><div class="l">last grab</div></div>
   <div class="card"><div class="n" id="c_cb" style="color:var(--hot)">0</div><div class="l">bait callbacks</div></div>
   <div class="card"><div class="n" id="c_top" style="font-size:16px">—</div><div class="l">top origin</div></div>
+</div>
+<div id="fleetwrap" style="display:none">
+  <h2 style="font-size:16px;margin:4px 0">Fleet <span class="muted" style="font-weight:400;font-size:13px">— every node that forwards here, and whether it still is</span></h2>
+  <div id="fleetrows" class="cards" style="margin-bottom:14px"></div>
 </div>
 <div style="margin:0 0 10px"><label class="muted"><input type="checkbox" id="f_dc"> only datacenter / hosting origins (hide residential, mobile, cgnat, home routers)</label></div>
 <div id="mapwrap">
@@ -218,6 +225,25 @@ async function tick(){
   if (selectedOrigin) document.querySelectorAll('tr[data-origin]').forEach(r => r.classList.toggle('sel', r.dataset.origin === selectedOrigin));
 }
 $('f_dc').addEventListener('change', tick);
-tick(); setInterval(tick, 3000);
+// "they all need to report back to the hub" - show every node that ever has, and flag one that's gone quiet.
+async function tickFleet(){
+  let j; try { j = await (await fetch('/api/fleet')).json(); } catch(e){ return; }
+  const nodes = j.nodes || [];
+  $('fleetwrap').style.display = nodes.length ? 'block' : 'none';
+  if (!nodes.length) return;
+  const staleAfter = (j.stale_after_seconds || 150) * 1000;
+  $('fleetrows').innerHTML = nodes.map(n => {
+    const hb = n.last_heartbeat || '';
+    const hbAge = hb ? Date.now() - Date.parse(hb + (hb.endsWith('Z') ? '' : 'Z')) : Infinity;
+    const stale = !hb || hbAge > staleAfter;
+    return '<div class="card fnode'+(stale?' stale':'')+'">'+
+      '<div class="n" style="font-size:16px">'+esc(n.node)+'</div>'+
+      '<div class="l"><span class="fdot"></span>'+(stale ? 'NOT REPORTING' : 'reporting')+
+      (hb ? ' · heartbeat '+esc(ago(hb)) : ' · no heartbeat yet')+'</div>'+
+      (n.last_seen ? '<div class="l" style="margin-top:2px">last event '+esc(ago(n.last_seen))+' ('+esc(n.last_kind||'')+')</div>' : '')+
+      '</div>';
+  }).join('');
+}
+tick(); tickFleet(); setInterval(tick, 3000); setInterval(tickFleet, 5000);
 </script>
 </body></html>
