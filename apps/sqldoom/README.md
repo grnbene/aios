@@ -81,6 +81,12 @@ death and gib frames from the front - with a near-orthographic camera at one tex
 (`image_quantize`) and written over the lump: pixels, mask, texel rows and the frames' offsets. Lump names and ids
 stay, so the classic renderer draws the photo's monster too.
 
+From a phone: `aios --root R grain serve apps/sqldoom/capture.gr [PORT]` (default 8620) serves a page whose photo
+button opens the camera. The browser scales the picture to 1600 pixels on its long side and sends it; the page then
+shows the cut-out, the model from eight sides and every sprite rendered from it, and the monster can be any of the
+imp, zombieman, shotgun guy, demon or baron. It answers on 127.0.0.1 only; `CARVE_LISTEN=all` opens it to the
+network so a phone on the same Wi-Fi can reach it (and so can anyone else there).
+
 The photo wants the whole subject in the frame with some background all round it: the border is taken as
 background, and a subject that runs off an edge is cut there. A photo where nothing stands out from its border
 (an object against open sky of the same tone, say) is refused rather than guessed at. `carve_check.gr` checks what

@@ -352,3 +352,64 @@ fn carve_sprites(sprite, m, opts) {
   sql("FLUSH TABLES")
   return {"lumps": len(lumps), "ms": clock() - t0}
 }
+
+# ---- previews -----------------------------------------------------------------------------------------------------
+
+# The carved model seen from eight sides in true colour, standing, in two rows of four: a canvas size*4 x size*2.
+fn carve_turntable(m, size) {
+  let t = r3d_target(size, size)
+  r3d_options(t, {"y_scale": 1.0, "bilinear": true, "mipmaps": true})
+  let md = model_load(t, m.model, 1000)
+  let fov = 30.0e0
+  # the model's height fills about four fifths of the picture
+  let scale = 1.0e0
+  let D = md.height * 0.62e0 / tan(fov * 3.141592653589793e0 / 360.0e0)
+  let strip = canvas_create(size * 4, size * 2)
+  canvas_set_fill_color(strip, "#1b1d22")
+  canvas_fill_rect(strip, 0, 0, size * 4, size * 2)
+  for rot in range(1, 9) {
+    r3d_clear(t, 0xFF1B1D22)
+    let thing = {"model": md.model, "anim": md.anims["idle"], "time": 0.0e0, "hold": true, "scale": scale,
+                 "x": D, "y": 0.0e0, "z": 0.0e0, "angle": 180.0e0 - 45.0e0 * (rot - 1), "light": 255, "flags": 0}
+    r3d_draw_tex(t, [], fov, {"x": 0.0e0, "y": 0.0e0, "z": md.height * 0.5e0, "angle": 0.0e0, "pitch": 0.0e0}, [thing])
+    let view = canvas_create(size, size)
+    canvas_set_pixels(view, r3d_pixels(t))
+    canvas_draw_image(strip, view, ((rot - 1) % 4) * size, idiv(rot - 1, 4) * size)
+  }
+  return strip
+}
+
+# Every lump of `sprite` drawn through palette 0, in rows of ten, each scaled by `zoom`: a canvas.
+fn carve_sprite_sheet(sprite, zoom) {
+  let pal = {}
+  for c in sql("SELECT palette_index, r, g, b FROM colormap_rgb WHERE pal = 0 AND level = 0") { pal[str(c.palette_index)] = 0xFF000000 + (c.r << 16) + (c.g << 8) + c.b }
+  let ls = sql(format("SELECT l.lump_name, l.pixels, l.mask, MAX(f.width) AS width, MAX(f.height) AS height FROM sprite_lumps l " +
+                      "JOIN sprite_frames f ON f.lump_name = l.lump_name WHERE l.lump_name LIKE '{}%' GROUP BY l.lump_name, l.pixels, l.mask ORDER BY l.lump_name", sprite))
+  let cw = 0
+  let ch = 0
+  for l in ls { cw = max(cw, l.width); ch = max(ch, l.height) }
+  cw = cw * zoom + 6
+  ch = ch * zoom + 6
+  let cols = min(10, max(1, len(ls)))
+  let rows = max(1, idiv(len(ls) + cols - 1, cols))
+  let cv = canvas_create(cols * cw, rows * ch)
+  canvas_set_fill_color(cv, "#1b1d22")
+  canvas_fill_rect(cv, 0, 0, cols * cw, rows * ch)
+  let i = 0
+  for l in ls {
+    let ox = (i % cols) * cw + 3
+    let oy = idiv(i, cols) * ch + 3
+    let px = bytes(l.pixels)
+    let mk = bytes(l.mask)
+    for y in range(0, l.height) {
+      for x in range(0, l.width) {
+        let o = y * l.width + x
+        if bytes_get(mk, o, "u8") == 0 { continue }
+        canvas_set_fill_color(cv, pal[str(bytes_get(px, o, "u8"))])
+        canvas_fill_rect(cv, ox + x * zoom, oy + y * zoom, zoom, zoom)
+      }
+    }
+    i = i + 1
+  }
+  return cv
+}

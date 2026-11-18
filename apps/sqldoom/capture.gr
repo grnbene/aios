@@ -1,0 +1,147 @@
+# Take a photo, get a monster: a page for a phone (or any browser) that photographs something and makes it the imp -
+# or another monster - in both of the game's views, then shows the cut-out, the 3D model from eight sides and every
+# sprite rendered from it.
+#
+#   aios --root R grain serve apps/sqldoom/capture.gr [PORT]        (default 8620)
+#
+# It answers on this machine only; CARVE_LISTEN=all opens it to the network, so a phone on the same Wi-Fi can reach
+# it at http://<this machine>:PORT/ (anyone who can reach it can replace the monster).
+#
+# The WAD must be loaded into R first (load.gr). On a phone, the page's photo button opens the camera; the picture is
+# scaled to at most 1600 pixels on its long side in the browser and sent as JPEG, then carved here (lib/carve.gr):
+# GET  /                       the page
+# POST /carve?type=T&sprite=S  body: the photo (image/jpeg or image/png) -> JSON: what was made and how long it took
+# GET  /preview/cutout.png     the last photo's cut-out
+# GET  /preview/model.png      the last model from eight sides
+# GET  /preview/sprites.png    the sprite's lumps as they are now in the database
+# Then play.gr (or render.gr) draws the new monster.
+
+import { carve_model, carve_creature, carve_sprites, carve_cut, carve_turntable, carve_sprite_sheet } from "lib/carve.gr"
+
+sql("USE doom")
+
+# the monsters a photo can become: type, sprite, height (Doom's info table)
+let MONSTERS = [
+  {"type": 3001, "sprite": "TROO", "height": 56, "name": "Imp"},
+  {"type": 3004, "sprite": "POSS", "height": 56, "name": "Zombieman"},
+  {"type": 9, "sprite": "SPOS", "height": 56, "name": "Shotgun guy"},
+  {"type": 3002, "sprite": "SARG", "height": 56, "name": "Demon"},
+  {"type": 3003, "sprite": "BOSS", "height": 64, "name": "Baron of Hell"}
+]
+fn monster(ty) {
+  for m in MONSTERS { if m.type == ty { return m } }
+  return nil
+}
+
+let last = {"cutout": nil, "model": nil, "sprite": "TROO"}
+
+fn png(cv) { return {"code": 200, "type": "image/png", "body": canvas_to_png(cv)} }
+fn json_out(code, v) { return {"code": code, "type": "application/json", "body": json_stringify(v)} }
+
+# the page (capture.html), its monster list filled in when it is served
+let here = abspath(env("SQLDOOM_DIR", "apps/sqldoom"))
+let PAGE = read_file(here + "/capture.html")
+
+fn carve_request(req, body) {
+  let t0 = clock()
+  let q = req.query
+  let ty = int(get(q, "type", "3001"))
+  let m = monster(ty)
+  if m == nil { return json_out(400, {"error": format("type {} is not one of the monsters a photo can become", ty)}) }
+  if get(q, "sprite", m.sprite) != m.sprite { return json_out(400, {"error": format("type {} is drawn with {}, not {}", ty, m.sprite, q.sprite)}) }
+  let photo = bytes(body)
+  if len(photo) < 64 { return json_out(400, {"error": "send the photo as the request body (JPEG or PNG)"}) }
+  let r = pcall(fn () {
+    let made = carve_model("carved_" + lower(m.sprite), photo, {})
+    carve_creature(m.type, made, {"height": m.height})
+    let s = carve_sprites(m.sprite, made, {"height": m.height})
+    return {"made": made, "sprites": s}
+  })
+  if not r.ok { return json_out(422, {"error": str(r.error)}) }
+  let made = r.value.made
+  last.cutout = carve_cut(photo, {}).canvas
+  last.model = made
+  last.sprite = m.sprite
+  return json_out(200, {"type": m.type, "sprite": m.sprite, "model": made.model, "far": made.far, "tris": made.tris,
+                        "far_tris": made.far_tris, "coverage": made.coverage, "lumps": r.value.sprites.lumps, "ms": clock() - t0})
+}
+
+fn route(req, body) {
+  let key = req.method + " " + req.path
+  if key == "GET /" { return {"code": 200, "type": "text/html; charset=utf-8", "body": replace(PAGE, "__MONSTERS__", json_stringify(MONSTERS))} }
+  if key == "POST /carve" { return carve_request(req, body) }
+  if key == "GET /preview/cutout.png" { return last.cutout == nil ? json_out(404, {"error": "nothing carved yet"}) : png(last.cutout) }
+  if key == "GET /preview/model.png" { return last.model == nil ? json_out(404, {"error": "nothing carved yet"}) : png(carve_turntable(last.model, 160)) }
+  if key == "GET /preview/sprites.png" { return png(carve_sprite_sheet(last.sprite, 2)) }
+  return json_out(404, {"error": "no route for " + key})
+}
+
+# ---- HTTP on the machine's sockets (aios grain serve: listen / accept / read_until / read / write) ----------------
+
+let MAX_BODY = 24 * 1048576
+
+fn parse_head(raw) {
+  let lines = split(replace(raw, "\r\n", "\n"), "\n")
+  let first = split(lines[0], " ")
+  if len(first) < 2 { return nil }
+  let target = first[1]
+  let path = target
+  let query = {}
+  let qi = index_of(target, "?")
+  if qi >= 0 {
+    path = slice(target, 0, qi)
+    for pair in split(slice(target, qi + 1), "&") {
+      let eq = index_of(pair, "=")
+      if eq > 0 { query[url_decode(slice(pair, 0, eq))] = url_decode(slice(pair, eq + 1)) }
+    }
+  }
+  let headers = {}
+  for line in slice(lines, 1) {
+    let c = index_of(line, ":")
+    if c > 0 { headers[lower(trim(slice(line, 0, c)))] = trim(slice(line, c + 1)) }
+  }
+  return {"method": upper(first[0]), "path": path, "query": query, "headers": headers}
+}
+
+fn status_text(code) {
+  if code == 200 { return "OK" }
+  if code == 400 { return "Bad Request" }
+  if code == 404 { return "Not Found" }
+  if code == 413 { return "Payload Too Large" }
+  if code == 422 { return "Unprocessable Entity" }
+  return "Error"
+}
+
+fn answer(conn, r) {
+  let body = r.body
+  write(conn, "HTTP/1.1 " + str(r.code) + " " + status_text(r.code) + "\r\nContent-Type: " + r.type + "\r\nContent-Length: " +
+              str(len(body)) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)
+  return r.code
+}
+
+let port_n = len(args) > 0 ? int(args[0]) : 8620
+let open_all = env("CARVE_LISTEN", "") == "all"
+let server = listen(port_n, not open_all)
+if server == nil { error(format("could not listen on port {}", port_n)) }
+print(format("carve: http://{}:{}/ - photograph something, it becomes a monster", open_all ? "<this machine>" : "127.0.0.1", port(server)))
+
+while true {
+  let conn = accept(server, 1000)
+  if conn == nil { continue }
+  let raw = read_until(conn, "\r\n\r\n", 16384, 10000)
+  if raw == nil { close(conn); continue }
+  let req = parse_head(raw)
+  if req == nil { answer(conn, json_out(400, {"error": "unparseable request"})); close(conn); continue }
+  let n = int(get(req.headers, "content-length", "0"))
+  let code = 0
+  if n > MAX_BODY {
+    code = answer(conn, json_out(413, {"error": format("the photo is {} bytes; at most {}", n, MAX_BODY)}))
+  } else {
+    let body = n > 0 ? read(conn, n, 60000) : ""
+    if body == nil { close(conn); continue }
+    let r = pcall(route, req, body)
+    code = answer(conn, r.ok ? r.value : json_out(500, {"error": str(r.error)}))
+  }
+  print(format("carve: {} {} {} -> {}", peer(conn), req.method, req.path, code))
+  close(conn)
+}

@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carve a monster</title>
+<style>
+:root { --bg: #14161a; --panel: #1f2228; --ink: #e9e6df; --muted: #9a9890; --accent: #d0542a; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 22px; margin: 4px 0 2px; }
+p.lead { color: var(--muted); margin: 0 0 16px; }
+.card { background: var(--panel); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+label.shot { display: block; text-align: center; padding: 18px; border: 2px dashed #3a3e47; border-radius: 10px; cursor: pointer; }
+label.shot input { display: none; }
+#preview { max-width: 100%; max-height: 320px; display: none; margin: 12px auto 0; border-radius: 8px; }
+select, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #3a3e47; background: #2a2e36; color: var(--ink); }
+button.go { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; width: 100%; margin-top: 10px; }
+button:disabled { opacity: .5; }
+.row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+.row select { flex: 1; }
+#status { color: var(--muted); min-height: 1.4em; margin-top: 10px; white-space: pre-wrap; }
+.out img { width: 100%; image-rendering: pixelated; border-radius: 8px; background: #1b1d22; margin-top: 6px; }
+.out h2 { font-size: 15px; margin: 12px 0 0; color: var(--muted); font-weight: 600; }
+</style></head>
+<body><main>
+<h1>Carve a monster</h1>
+<p class="lead">Photograph a drawing, a toy or anything on a plain background, with all of it in the frame. It becomes a 3D monster in the modern view and its sprites in the classic one.</p>
+<div class="card">
+  <label class="shot">Take or choose a photo<input id="photo" type="file" accept="image/*" capture="environment"></label>
+  <img id="preview" alt="the photo">
+  <div class="row"><select id="type"></select></div>
+  <button class="go" id="go" disabled>Carve it</button>
+  <div id="status"></div>
+</div>
+<div class="card out" id="out" style="display:none">
+  <h2>Cut out</h2><img id="cutout" alt="the cut-out">
+  <h2>3D model, eight sides</h2><img id="model" alt="the model from eight sides">
+  <h2>Sprites, rendered from the model</h2><img id="sprites" alt="the sprites">
+</div>
+</main>
+<script>
+const MONSTERS = __MONSTERS__;
+const sel = document.getElementById('type');
+for (const m of MONSTERS) { const o = document.createElement('option'); o.value = m.type; o.textContent = m.name + ' (' + m.sprite + ')'; sel.appendChild(o); }
+let blob = null;
+const status = document.getElementById('status');
+document.getElementById('photo').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  status.textContent = 'Preparing the photo...';
+  const img = await createImageBitmap(f);
+  // at most 1600 pixels on the long side: enough to cut from, small enough to send from a phone
+  const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
+  const pv = document.getElementById('preview');
+  pv.src = URL.createObjectURL(blob); pv.style.display = 'block';
+  document.getElementById('go').disabled = false;
+  status.textContent = c.width + ' x ' + c.height + ', ' + Math.round(blob.size / 1024) + ' KB';
+});
+document.getElementById('go').addEventListener('click', async () => {
+  const m = MONSTERS.find(x => String(x.type) === sel.value);
+  const go = document.getElementById('go');
+  go.disabled = true;
+  status.textContent = 'Carving: cutting out, building the model, rendering ' + m.sprite + '...';
+  try {
+    const r = await fetch('/carve?type=' + m.type + '&sprite=' + m.sprite, {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    status.textContent = m.name + ' is now your photo: ' + j.tris + ' triangles, ' + j.lumps + ' sprites, in ' + (j.ms / 1000).toFixed(1) + ' s.';
+    const t = Date.now();
+    for (const id of ['cutout', 'model', 'sprites']) document.getElementById(id).src = '/preview/' + id + '.png?t=' + t;
+    document.getElementById('out').style.display = 'block';
+  } catch (err) {
+    status.textContent = 'Could not carve it: ' + err.message;
+  }
+  go.disabled = false;
+});
+</script>
+</body></html>
