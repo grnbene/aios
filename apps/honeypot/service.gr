@@ -45,6 +45,153 @@ fn have_id(id) {
 
 fn csv_field(v) { return "\"" + replace(str(v), "\"", "\"\"") + "\"" }
 
+// --- real identification: who actually owns this address, passively (RDAP + reverse DNS, no probe-back) --------
+let WHOIS_CACHE = "whois_cache.jsonl"
+// a UA claiming to be a known crawler is expected to run from that vendor's own published infrastructure; if its
+// reverse DNS doesn't land in any of these domains, the UA is very likely spoofed (a scanner borrowing a trusted
+// name to slip past naive user-agent allowlists) rather than genuinely being that crawler.
+let CRAWLER_CLAIMS = [
+  {"needle": "googlebot", "domains": ["googlebot.com", "google.com"]},
+  {"needle": "bingbot", "domains": ["search.msn.com"]},
+  {"needle": "gptbot", "domains": ["openai.com"]},
+  {"needle": "chatgpt-user", "domains": ["openai.com"]},
+  {"needle": "oai-searchbot", "domains": ["openai.com"]},
+  {"needle": "claudebot", "domains": ["anthropic.com"]},
+  {"needle": "claude-web", "domains": ["anthropic.com"]},
+  {"needle": "ccbot", "domains": ["commoncrawl.org"]},
+  {"needle": "bytespider", "domains": ["bytedance.com", "zijieapi.com"]},
+  {"needle": "petalbot", "domains": ["huawei.com", "petalsearch.com"]},
+  {"needle": "yandexbot", "domains": ["yandex.com", "yandex.ru", "yandex.net"]},
+  {"needle": "grokbot", "domains": ["x.ai"]},
+  {"needle": "applebot", "domains": ["apple.com"]},
+  {"needle": "amazonbot", "domains": ["amazon.com", "amazonaws.com"]}
+]
+fn crawler_claim(ua) {
+  let u = lower(ua)
+  let found = nil
+  for c in CRAWLER_CLAIMS { if found == nil and contains(u, c.needle) { found = c } }
+  return found
+}
+fn ptr_matches_claim(ptr, claim) {
+  if ptr == "" or claim == nil { return true }   // nothing to check against - don't flag
+  let p = lower(ptr)
+  let ok = false
+  for d in claim.domains { if ends_with(p, d) { ok = true } }
+  return ok
+}
+fn ipv4_ptr_name(ip) {
+  let parts = split(ip, ".")
+  if len(parts) != 4 { return "" }
+  return parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0] + ".in-addr.arpa"
+}
+// reverse DNS over HTTPS (Cloudflare's DoH resolver) - works from inside a sandboxed app host that has no raw
+// UDP/53 socket access; a real edge server with normal DNS can do this with a plain PTR lookup instead.
+fn reverse_dns(ip) {
+  let name = ipv4_ptr_name(ip)
+  if name == "" { return "" }
+  let r = pcall(http_get, "https://cloudflare-dns.com/dns-query?name=" + name + "&type=PTR",
+                {"headers": {"accept": "application/dns-json"}, "timeout_ms": 6000})
+  if not r.ok or not r.value.ok { return "" }
+  let p = pcall(json_parse, r.value.body)
+  if not p.ok { return "" }
+  let answers = get(p.value, "Answer", [])
+  if len(answers) == 0 { return "" }
+  let d = get(answers[0], "data", "")
+  return ends_with(d, ".") ? slice(d, 0, len(d) - 1) : d
+}
+fn vcard_email(e) {
+  let va = get(e, "vcardArray", [])
+  if len(va) < 2 { return "" }
+  let found = ""
+  for v in va[1] { if found == "" and len(v) > 0 and v[0] == "email" { found = v[3] } }
+  return found
+}
+// RDAP's entity tree is a couple of levels deep (a registrant entity holding abuse/noc/tech sub-entities); walk
+// the common two levels rather than recursing, since that's what every RIR's response actually looks like.
+fn find_abuse_email(entities) {
+  let found = ""
+  for e in entities {
+    if found == "" {
+      for r in get(e, "roles", []) { if found == "" and r == "abuse" { found = vcard_email(e) } }
+      if found == "" {
+        for e2 in get(e, "entities", []) {
+          for r in get(e2, "roles", []) { if found == "" and r == "abuse" { found = vcard_email(e2) } }
+        }
+      }
+    }
+  }
+  return found
+}
+fn org_name(entities) {
+  let found = ""
+  for e in entities {
+    if found == "" { found = vcard_fn(e) }
+  }
+  return found
+}
+fn vcard_fn(e) {
+  let va = get(e, "vcardArray", [])
+  if len(va) < 2 { return "" }
+  let found = ""
+  for v in va[1] { if found == "" and len(v) > 0 and v[0] == "fn" { found = v[3] } }
+  return found
+}
+// RDAP lookup (ownership, allocation, abuse contact) via rdap.org, which redirects to whichever RIR is
+// authoritative for the address - no API key, no probe against the origin itself, just public registry data.
+fn rdap_lookup(ip) {
+  let r = pcall(http_get, "https://rdap.org/ip/" + ip, {"timeout_ms": 8000})
+  if not r.ok or not r.value.ok or r.value.status >= 400 { return {} }
+  let p = pcall(json_parse, r.value.body)
+  if not p.ok { return {} }
+  let d = p.value
+  let cidrs = get(d, "cidr0_cidrs", [])
+  let cidr = ""
+  for c in cidrs { if cidr == "" and has(c, "v4prefix") { cidr = get(c, "v4prefix", "") + "/" + str(get(c, "length", "")) } }
+  return {
+    "name": get(d, "name", ""),
+    "handle": get(d, "handle", ""),
+    "country": get(d, "country", ""),
+    "range": get(d, "startAddress", "") + " - " + get(d, "endAddress", ""),
+    "cidr": cidr,
+    "org": org_name(get(d, "entities", [])),
+    "abuse_email": find_abuse_email(get(d, "entities", []))
+  }
+}
+fn cache_get(ip) {
+  let r = pcall(read_file, WHOIS_CACHE)
+  if not r.ok { return nil }
+  let found = nil
+  for ln in split(r.value, "\n") {
+    let t = trim(ln)
+    if t != "" and found == nil {
+      let p = pcall(json_parse, t)
+      if p.ok and get(p.value, "ip", "") == ip { found = p.value }
+    }
+  }
+  return found
+}
+// one real identification of an origin: who registered the block it's in, their abuse contact, and what it
+// actually resolves to - checked against any crawler identity its user-agent claims. Cached (RDAP/DoH are public,
+// best treated politely) so re-opening the same origin in the dashboard doesn't re-query every time.
+fn whois_lookup(ip, ua) {
+  let cached = cache_get(ip)
+  if cached != nil { return cached }
+  let rdap = rdap_lookup(ip)
+  let ptr = reverse_dns(ip)
+  let claim = crawler_claim(ua)
+  let matches = ptr_matches_claim(ptr, claim)
+  let rec = {
+    "ip": ip, "looked_up": now_iso(), "ptr": ptr,
+    "org": get(rdap, "org", ""), "name": get(rdap, "name", ""), "handle": get(rdap, "handle", ""),
+    "country": get(rdap, "country", ""), "range": get(rdap, "range", ""), "cidr": get(rdap, "cidr", ""),
+    "abuse_email": get(rdap, "abuse_email", ""),
+    "claimed_crawler": claim == nil ? "" : claim.needle,
+    "spoof_suspected": claim != nil and not matches
+  }
+  append_file(WHOIS_CACHE, json_stringify(rec) + "\n")
+  return rec
+}
+
 // a clean, factual incident report: every grab and callback this node knows about (its own, and whatever the
 // fleet forwarded), grouped by origin, nothing editorialized or inferred beyond what the edge server itself
 // recorded. Meant to be handed to someone else - a provider's abuse desk, counsel, or filed at ic3.gov - as the
@@ -63,11 +210,11 @@ fn build_report() {
   push(lines, "generated " + now_iso() + " by node " + NODE)
   push(lines, repeat("=", 78))
   push(lines, "")
-  push(lines, "What this is: every request this trap recorded against a decoy '.env' file and/or a bait URL")
-  push(lines, "that only appears inside that decoy's contents. No credential in the decoy is real or")
-  push(lines, "functional - it is a random token minted per visitor, logged so a later connection using it")
-  push(lines, "can be traced back to this exact probe. Nothing here was accessed by the operator; every row")
-  push(lines, "below is an unsolicited request this system received and traced, not a system we touched.")
+  push(lines, "What this is: every request this trap recorded against a decoy .env file, or against a bait")
+  push(lines, "URL that appears only inside that decoy file's own contents. Every credential in the decoy is")
+  push(lines, "fake - a random token minted fresh per visitor, so a later connection using that token traces")
+  push(lines, "straight back to the probe that received it. Nothing below reflects access performed by this")
+  push(lines, "system's operator: each row is a request this system received and traced, unsolicited.")
   push(lines, "")
   push(lines, str(len(all)) + " total event(s) across " + str(len(order)) + " distinct origin(s).")
   push(lines, repeat("=", 78))
@@ -81,7 +228,7 @@ fn build_report() {
     push(lines, "ORIGIN " + o + "  (" + get(first, "scope", "") + ", " + get(first, "net_type", "") + ")")
     push(lines, "  location (offline, coarse): " + get(first, "geo", "-"))
     push(lines, "  " + str(n_grab) + " decoy grab(s), " + str(n_cb) + " bait callback(s)")
-    push(lines, repeat("  -", 38))
+    push(lines, repeat("-", 78))
     for e in evs {
       let tag = get(e, "kind", "") == "honeypot.callback" ? "CALLBACK" : "GRAB    "
       push(lines, "  [" + tag + "] " + get(e, "t", "") + "  id=" + get(e, "id", "-") + "  fp=" + get(e, "fp", "-"))
@@ -145,5 +292,15 @@ serve_routes({
     return res_download(json_stringify({"node": NODE, "generated": now_iso(), "count": len(all), "events": all}),
                         "honeypot-evidence.json")
   },
-  "GET /api/report": fn (req) { return res_download(build_report(), "honeypot-incident-report.txt") }
+  "GET /api/report": fn (req) { return res_download(build_report(), "honeypot-incident-report.txt") },
+  // real identification, on demand: who registered this address's block, their abuse contact, what it actually
+  // resolves to, and whether that matches any crawler identity its user-agent claims. Passive (RDAP + reverse
+  // DNS only, nothing sent to the origin itself), and cached so re-opening an origin doesn't re-query every time.
+  "GET /api/whois": fn (req) {
+    let ip = trim(get(req.query_params, "ip", ""))
+    if ip == "" { return res_error(400, "ip required") }
+    let ua = ""
+    for e in grabs(2000) { if ua == "" and get(e, "origin", "") == ip { ua = get(e, "ua", "") } }
+    return res_json(whois_lookup(ip, ua))
+  }
 }, {"workers": false})

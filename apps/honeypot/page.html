@@ -6,8 +6,9 @@
 <style>
 :root { --bg:#0e1116; --panel:#171b22; --ink:#e7ebf0; --muted:#8b93a0; --line:#262c36; --hot:#e5484d; --warn:#e2a03f; --ok:#3fb950; --accent:#d0542a; }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,sans-serif; }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,sans-serif; overflow-x:hidden; }
 main { max-width:1100px; margin:0 auto; padding:16px; }
+.tablewrap { overflow-x:auto; max-width:100%; }
 h1 { font-size:21px; margin:2px 0 2px; } .sub { color:var(--muted); margin:0 0 14px; }
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
 .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
@@ -20,7 +21,7 @@ th { color:var(--muted); font-size:12px; font-weight:600; position:sticky; top:0
 td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 .pill { display:inline-block; padding:1px 7px; border-radius:20px; font-size:12px; border:1px solid var(--line); }
 .public { color:var(--hot); border-color:var(--hot); } .private,.loopback,.cgnat,.link-local { color:var(--muted); }
-.via { color:var(--warn); } .mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
+.via { color:var(--warn); } .mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
 .new { animation:flash 2s; } @keyframes flash { from{background:rgba(224,84,43,.28)} to{background:transparent} }
 .muted { color:var(--muted); }
 .expbtn { display:inline-block; padding:5px 11px; border-radius:7px; border:1px solid var(--line); color:var(--ink); text-decoration:none; font-size:13px; margin-right:6px; background:var(--panel); }
@@ -31,6 +32,7 @@ td.ip { font-variant-numeric:tabular-nums; font-weight:600; }
 #detail h3 { font-size:14px; margin:0 0 6px; } #detail .row { margin-bottom:8px; }
 #detail .ph { color:var(--muted); text-align:center; padding-top:120px; }
 .simlist .sim { display:flex; align-items:center; gap:6px; padding:5px 0; border-bottom:1px solid var(--line); cursor:pointer; }
+.simlist .sim span:first-child { width:62px; flex:0 0 62px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
 .simlist .sim:hover { background:rgba(255,255,255,.04); }
 .simbar { height:5px; border-radius:3px; background:var(--accent); flex-shrink:0; }
 .simtrack { flex:1; height:5px; border-radius:3px; background:var(--line); overflow:hidden; }
@@ -64,10 +66,10 @@ tr[data-origin] { cursor:pointer; }
 </div>
 <p class="sub" id="mapfoot" style="margin-top:-8px"></p>
 <div id="cbwrap" style="display:none"><h2 style="font-size:16px;margin:4px 0">Bait callbacks <span class="muted" style="font-weight:400;font-size:13px">— the attacker's own tooling validated the stolen creds and connected to us</span></h2>
-<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Id</th></tr></thead><tbody id="cbrows"></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Method</th><th>Path</th><th>Agent</th><th>Id</th></tr></thead><tbody id="cbrows"></tbody></table></div></div>
 <h2 style="font-size:16px;margin:14px 0 4px">Grabs <span class="muted" style="font-weight:400;font-size:13px">— .env probes served the decoy</span></h2>
-<table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Id</th></tr></thead>
-<tbody id="grabrows"><tr><td colspan="11" class="muted">waiting for the feed…</td></tr></tbody></table>
+<div class="tablewrap"><table><thead><tr><th>When</th><th>Node</th><th>Origin</th><th>Where</th><th>Type</th><th>Via</th><th>Host</th><th>Path</th><th>Agent</th><th>Chain</th><th>Id</th></tr></thead>
+<tbody id="grabrows"><tr><td colspan="11" class="muted">waiting for the feed…</td></tr></tbody></table></div>
 <p class="sub" id="foot" style="margin-top:12px"></p>
 </main>
 <script>
@@ -91,6 +93,7 @@ let markers = L.layerGroup().addTo(map);
 let markerByOrigin = {};     // origin -> L.circleMarker, so a table row click can find and focus its pin
 let byOrigin = {};           // origin -> {lat, lon, grabs, cbs, geo, scope, net_type, node, last, id, fp, vec}
 let selectedOrigin = null;
+let whoisResults = {};   // origin -> rendered whois HTML, so the 3s auto-refresh doesn't wipe a fetched result
 // every event each origin has, 128-d behavior vector included, so similarity isn't limited to its latest hit.
 function renderMap(g, cb){
   markers.clearLayers();
@@ -144,6 +147,8 @@ function showDetail(origin, keepView){
     '<div class="row muted">'+esc(o.geo||'—')+(o.net_type?' · '+esc(o.net_type):'')+'</div>'+
     '<div class="row">id <span class="mono">'+esc(o.id||'—')+'</span><br>fingerprint <span class="mono">'+esc((o.fp||'—').slice(0,16))+'</span></div>'+
     '<div class="row">'+o.grabs+' grab(s)'+(o.cbs?', <b style="color:#e5484d">'+o.cbs+' callback(s)</b>':'')+' · last '+esc(ago(o.last))+'</div>'+
+    '<div class="row">'+(whoisResults[origin] ? '' : '<button id="idbtn" class="expbtn" style="margin:0">🔎 identify this origin</button>')+'</div>'+
+    '<div class="row" id="whoisbox">'+(whoisResults[origin] || '')+'</div>'+
     '<div class="row"><b>same tooling, other origins</b> <span class="muted" style="font-weight:400">— cosine on the behavior vector</span></div>'+
     '<div class="simlist">'+(sims.length ? sims.map(s =>
       '<div class="sim" data-origin="'+esc(s.origin)+'"><span style="width:58px">'+esc(s.origin)+'</span>'+
@@ -151,6 +156,27 @@ function showDetail(origin, keepView){
       '<span class="muted" style="width:34px;text-align:right">'+Math.round(s.score*100)+'%</span></div>'
     ).join('') : '<div class="muted" style="padding:6px 0">no other origin shares this fingerprint yet.</div>')+'</div>';
   $('detail').querySelectorAll('.sim').forEach(el => el.addEventListener('click', () => showDetail(el.dataset.origin)));
+  $('idbtn')?.addEventListener('click', () => identifyOrigin(origin));
+}
+// passive, on-demand identification: who actually owns this address (RDAP) and what it actually resolves to
+// (reverse DNS) - nothing sent to the origin itself. Flags a crawler UA whose reverse DNS doesn't match the
+// vendor it claims to be (a generic cloud VM calling itself GrokBot/Googlebot/etc. is very likely spoofing it).
+async function identifyOrigin(origin){
+  const box = $('whoisbox');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">looking up RDAP + reverse DNS…</span>';
+  let w;
+  try { w = await (await fetch('/api/whois?ip=' + encodeURIComponent(origin))).json(); }
+  catch(e){ box.innerHTML = '<span class="muted">lookup failed: '+esc(e.message)+'</span>'; return; }
+  const spoof = w.spoof_suspected;
+  const html =
+    (spoof ? '<div style="color:var(--hot);font-weight:600;margin-bottom:6px">⚠ claims "'+esc(w.claimed_crawler)+'" but its reverse DNS doesn\'t match '+esc(w.claimed_crawler)+'\'s own infrastructure — likely a spoofed user-agent, not the real crawler.</div>' : '') +
+    '<div><b>'+esc(w.org || w.name || 'unknown registrant')+'</b></div>' +
+    (w.cidr ? '<div class="muted">block '+esc(w.cidr)+'</div>' : (w.range ? '<div class="muted">range '+esc(w.range)+'</div>' : '')) +
+    (w.ptr ? '<div>resolves to <span class="mono">'+esc(w.ptr)+'</span></div>' : '<div class="muted">no reverse DNS record</div>') +
+    (w.abuse_email ? '<div>abuse contact: <a href="mailto:'+esc(w.abuse_email)+'" style="color:var(--accent)">'+esc(w.abuse_email)+'</a></div>' : '');
+  whoisResults[origin] = html;   // survives the next 3s auto-refresh's re-render of this panel
+  if (selectedOrigin === origin) box.innerHTML = html;
 }
 function rowGrab(x){ const key=x.id||x.canary||(x.t+x.origin); const nw=!seen.has(key); seen.add(key);
   const where=[x.geo,x.family].filter(Boolean).join(' · ');
